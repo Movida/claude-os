@@ -45,3 +45,5 @@ memoire rendue : ok.
 [linux] memoire : 64 Gio reserves puis rendus d'un seul munmap : ok
 [linux] memoire : toutes les verifications : ok
 [noyau] memoire : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Memoire de claude --version rejouee : ok.
+[noyau] claude-version : termine, code de sortie 0 ; memoire rendue : ok.
