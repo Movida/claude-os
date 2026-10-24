@@ -249,4 +249,7 @@ pub fn initialiser() {
 extern "C" fn gerer_appel_systeme(cadre: &mut Cadre) {
     let arguments = [cadre.rdi, cadre.rsi, cadre.rdx, cadre.r10, cadre.r8, cadre.r9];
     cadre.rax = linux::appel(cadre.rax, arguments) as u64;
+    // Le temps du programme a pu s'épuiser pendant l'appel : l'horloge ne
+    // l'arrête pas au milieu du travail du noyau, mais ici, l'appel fini.
+    crate::tache::verifier_budget();
 }

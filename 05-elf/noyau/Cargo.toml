@@ -20,6 +20,9 @@ test-garde = []
 # Un noyau gonflé au-delà de 1 Mio : le chargeur doit le lire en entier,
 # chaque secteur à sa place.
 test-gros = []
+# Exécuter l'archive des programmes de test (fautifs, refusés...), puis
+# éteindre QEMU (isa-debug-exit).
+test-programmes = []
 
 # panic = "abort" : en cas de panique, pas de « déroulement » de la pile
 # (unwinding), qui demanderait une bibliothèque d'exécution qu'on n'a pas.

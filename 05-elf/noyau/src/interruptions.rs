@@ -23,7 +23,7 @@
 //! dans la version expérimentale (nightly) du compilateur, et elle cache ce
 //! qui se passe.
 
-use crate::{clavier, gdt, horloge, pic};
+use crate::{clavier, gdt, horloge, linux, pic, tache};
 use crate::verrou::Verrou;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
@@ -52,7 +52,11 @@ impl Entree {
         adresse_milieu: 0, adresse_haut: 0, _reserve: 0,
     };
 
-    fn new(gestionnaire: u64, ist: u8) -> Entree {
+    /// `dpl` : le niveau de privilège le plus faible qui peut déclencher le
+    /// vecteur par `int n` (0 : le noyau seul ; 3 : les programmes aussi).
+    /// Il ne compte pas pour les exceptions levées par le processeur ni
+    /// pour les interruptions matérielles.
+    fn new(gestionnaire: u64, ist: u8, dpl: u8) -> Entree {
         Entree {
             adresse_bas: gestionnaire as u16,
             selecteur: gdt::CODE_NOYAU,
@@ -60,7 +64,7 @@ impl Entree {
             // Porte d'interruption plutôt que « porte de trappe » (0xF) :
             // les interruptions sont coupées pendant le gestionnaire, ce
             // qui évite d'être interrompu avant d'avoir tout sauvegardé.
-            attributs: 0x8E,
+            attributs: 0x8E | dpl << 5,
             adresse_milieu: (gestionnaire >> 16) as u16,
             adresse_haut: (gestionnaire >> 32) as u32,
             _reserve: 0,
@@ -219,7 +223,12 @@ pub fn initialiser() {
             18 => gdt::IST_VERIFICATION_MACHINE,
             _ => 0,
         };
-        idt[vecteur] = Entree::new(adresse, ist);
+        // int3 est permis aux programmes, comme sous Linux : un débogueur y
+        // pose ses points d'arrêt (le programme reçoit SIGTRAP). Tous les
+        // autres `int n` d'un programme font une faute de protection
+        // générale, dont int 0x80 (voir gerer_interruption).
+        let dpl = if vecteur == 3 { 3 } else { 0 };
+        idt[vecteur] = Entree::new(adresse, ist, dpl);
     }
 
     #[repr(C, packed)]
@@ -237,43 +246,81 @@ pub fn initialiser() {
 }
 
 /// Appelée par le code commun pour chaque interruption.
+///
+/// Pour TOUS les vecteurs, ce qui compte d'abord est le privilège du code
+/// interrompu (les deux bits bas de CS dans le cadre) :
+///   - venue d'un programme (anneau 3), une exception est SA faute : il est
+///     arrêté, avec le signal que lui enverrait Linux, et le noyau
+///     continue. Même pour une exception qui n'est jamais une erreur dans
+///     le noyau (int3) : un `int3`, un `icebp` ou un `int 0x80` d'un
+///     programme ne doivent pas arrêter le noyau ;
+///   - venue du noyau, c'est une erreur du noyau : on s'arrête (sauf int3,
+///     le test du démarrage) ;
+///   - le NMI, la double faute et la vérification machine ne sont la faute
+///     de personne en particulier (une panne matérielle, ou le noyau dans
+///     un état incohérent) : on s'arrête, d'où qu'ils viennent.
+/// Linux fait ce même tri (user_mode(regs) dans arch/x86/kernel/traps.c).
 #[unsafe(no_mangle)]
 extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     let vecteur = cadre.vecteur as usize;
+    let depuis_programme = cadre.cs & 3 == 3;
     if vecteur >= pic::VECTEUR_BASE as usize {
         gerer_irq((vecteur - pic::VECTEUR_BASE as usize) as u8);
+        // Le programme interrompu a-t-il épuisé son temps ? Seulement s'il
+        // était en anneau 3 : interrompu au milieu d'un appel système, il
+        // sera arrêté à la fin de l'appel (appel_systeme.rs), quand le noyau
+        // aura fini ce qu'il faisait pour lui.
+        if depuis_programme {
+            tache::verifier_budget();
+        }
         return;
     }
     match vecteur {
+        2 | 8 | 18 => exception_fatale(cadre),
+        _ if depuis_programme => {
+            let cr2 = if vecteur == 14 { lire_cr2() } else { 0 };
+            let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, cr2);
+            tache::arreter(signal, raison);
+        }
         // int3 n'est pas une erreur : un débogueur s'en sert pour poser des
         // points d'arrêt. RIP désigne déjà l'instruction suivante : on
         // revient simplement.
         3 => afficherln!("[noyau] Exception 3 ({}) a RIP={:#x}, on continue.",
                          NOMS[3], cadre.rip),
-        _ => {
-            // On ne reviendra pas : libérer la console, au cas où
-            // l'exception serait survenue au milieu d'un affichage.
-            crate::console::preparer_panique();
-            afficherln!("[noyau] EXCEPTION {} ({}), code d'erreur {:#x}",
-                        vecteur, NOMS.get(vecteur).unwrap_or(&"?"), cadre.code_erreur);
-            afficherln!("        RIP={:#x} RSP={:#x} RFLAGS={:#x}", cadre.rip, cadre.rsp, cadre.rflags);
-            if vecteur == 14 || vecteur == 8 {
-                // Pour une faute de page, CR2 contient l'adresse fautive.
-                // Une double faute née d'une faute de page la laisse aussi :
-                // c'est le cas d'une pile qui déborde (la faute de page ne
-                // peut pas être empilée sur la pile qui vient de fauter).
-                let cr2: u64;
-                // SAFETY : lecture d'un registre de contrôle, sans effet.
-                unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
-                afficherln!("        adresse fautive (CR2) = {:#x}", cr2);
-                if let Some(pile) = crate::pagination::garde_touchee(cr2) {
-                    afficherln!("        debordement de {} : la page de garde a ete touchee", pile);
-                }
-            }
-            // On ne sait pas encore réparer : on arrête tout, proprement.
-            panic!("exception {} non geree", vecteur);
+        _ => exception_fatale(cadre),
+    }
+}
+
+/// L'adresse de la dernière faute de page (CR2).
+fn lire_cr2() -> u64 {
+    let cr2: u64;
+    // SAFETY : lecture d'un registre de contrôle, sans effet.
+    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
+    cr2
+}
+
+/// Une exception dont le noyau ne se relève pas : on dit tout ce qu'on
+/// sait, puis on s'arrête.
+fn exception_fatale(cadre: &Cadre) -> ! {
+    let vecteur = cadre.vecteur as usize;
+    // On ne reviendra pas : libérer la console, au cas où l'exception
+    // serait survenue au milieu d'un affichage.
+    crate::console::preparer_panique();
+    afficherln!("[noyau] EXCEPTION {} ({}), code d'erreur {:#x}",
+                vecteur, NOMS.get(vecteur).unwrap_or(&"?"), cadre.code_erreur);
+    afficherln!("        RIP={:#x} RSP={:#x} RFLAGS={:#x} CS={:#x}", cadre.rip, cadre.rsp, cadre.rflags, cadre.cs);
+    if vecteur == 14 || vecteur == 8 {
+        // Pour une faute de page, CR2 contient l'adresse fautive. Une double
+        // faute née d'une faute de page la laisse aussi : c'est le cas d'une
+        // pile qui déborde (la faute de page ne peut pas être empilée sur la
+        // pile qui vient de fauter).
+        let cr2 = lire_cr2();
+        afficherln!("        adresse fautive (CR2) = {:#x}", cr2);
+        if let Some(pile) = crate::pagination::garde_touchee(cr2) {
+            afficherln!("        debordement de {} : la page de garde a ete touchee", pile);
         }
     }
+    panic!("exception {} non geree", vecteur);
 }
 
 /// Une interruption matérielle, venue du PIC. Les interruptions sont

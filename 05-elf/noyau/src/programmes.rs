@@ -18,6 +18,7 @@ use core::fmt;
 /// Le nom d'une entrée, pour l'afficher : un nom de fichier peut contenir
 /// n'importe quel octet, que la console afficherait de travers. On montre
 /// l'ASCII imprimable tel quel, et « ? » pour le reste.
+#[derive(Clone, Copy)]
 pub struct Nom<'a>(pub &'a [u8]);
 
 impl fmt::Display for Nom<'_> {
@@ -71,7 +72,7 @@ pub fn executer_archive() {
 }
 
 /// Exécute un programme, d'après sa signature.
-fn executer(nom: Nom, octets: &[u8]) {
+fn executer(nom: Nom<'static>, octets: &[u8]) {
     match octets {
         [0, b'a', b's', b'm', ..] => executer_wasm(nom, octets),
         [0x7f, b'E', b'L', b'F', ..] => executer_elf(nom, octets),
@@ -82,7 +83,7 @@ fn executer(nom: Nom, octets: &[u8]) {
 /// Un programme Linux : on vérifie le fichier, on le charge dans un espace
 /// d'adressage neuf, puis on l'exécute, dans l'anneau 3, jusqu'à ce qu'il se
 /// termine. Son espace est alors détruit, et doit rendre toute sa mémoire.
-fn executer_elf(nom: Nom, octets: &[u8]) {
+fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
     let executable = match formats::elf::lire(octets, chargeur_elf::PERMISES) {
         Ok(x) => x,
         Err(e) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
@@ -114,7 +115,7 @@ fn executer_elf(nom: Nom, octets: &[u8]) {
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
                 programme.fin.next_multiple_of(4096), if code_ok { "ok" } else { "ECHEC" });
-    let code = tache::executer(programme.espace.pml4(), programme.entree, programme.sommet_pile);
+    let code = tache::executer(nom.0, programme.espace.pml4(), programme.entree, programme.sommet_pile);
     drop(programme);
     afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.",
                 nom, code, if pages::libres() == libres { "ok" } else { "ECHEC" });

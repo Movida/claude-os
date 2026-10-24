@@ -234,6 +234,19 @@ extern "C" fn noyau_main(infos: u64) -> ! {
 
     programmes::executer_archive();
 
+    // Le scénario des programmes de test de `make tests-qemu` : une fois
+    // l'archive exécutée, éteindre QEMU par son périphérique isa-debug-exit
+    // (présent seulement si on le demande à QEMU, à ce port-là). Jamais
+    // dans le noyau ordinaire : sur une vraie machine, ce port peut être
+    // n'importe quoi.
+    #[cfg(feature = "test-programmes")]
+    {
+        afficherln!("[noyau] Fin des tests : extinction de QEMU.");
+        // SAFETY : le port 0xf4 est celui d'isa-debug-exit dans
+        // `make tests-qemu` ; QEMU s'arrête aussitôt.
+        unsafe { port::ecrire(0xf4, 0) };
+    }
+
     // La boucle principale : afficher ce qui est tapé, et dormir quand il
     // n'y a rien. On vérifie la file interruptions coupées, puis on dort
     // avec sti;hlt (voir cpu::attendre_interruption) : une touche tapée

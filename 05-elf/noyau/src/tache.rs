@@ -35,11 +35,15 @@
 
 use core::arch::global_asm;
 use core::cell::UnsafeCell;
+use core::fmt;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicI32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use crate::interruptions::Cadre;
-use crate::{cpu, gdt, pagination};
+use crate::linux::{self, Signal};
+use crate::programmes::Nom;
+use crate::verrou::Verrou;
+use crate::{cpu, gdt, horloge, pagination};
 
 global_asm!(
     r#"
@@ -113,6 +117,22 @@ static CONTEXTES: ContextesPartages = ContextesPartages(UnsafeCell::new(Contexte
 /// Le code de sortie du dernier programme, posé par `terminer`.
 static CODE_SORTIE: AtomicI32 = AtomicI32::new(0);
 
+/// Un programme s'exécute-t-il ? (Sa tâche existe : en anneau 3, ou dans le
+/// noyau pour lui.)
+static EN_COURS: AtomicBool = AtomicBool::new(false);
+/// Son nom, pour les messages.
+static NOM: Verrou<&'static [u8]> = Verrou::new(&[]);
+/// Le tic d'horloge de son départ.
+static DEPART: AtomicU64 = AtomicU64::new(0);
+
+/// Le temps qu'un programme peut prendre : 1 s, en tics d'horloge (1 ms).
+/// C'est l'équivalent, pour les programmes Linux, du carburant des
+/// programmes WebAssembly, et de la limite RLIMIT_CPU de Linux : un
+/// programme qui boucle sans fin ne garde pas la machine. Le temps compté
+/// est le temps écoulé depuis son départ : avec un seul programme à la
+/// fois, c'est son temps de calcul, appels système compris.
+const BUDGET_TICS: u64 = horloge::HZ as u64;
+
 /// Le RFLAGS d'un programme qui démarre : IF (interruptions acceptées) et
 /// le bit 1, toujours à 1. IOPL = 0 : pas de `in`, `out`, `cli`, `sti`.
 const RFLAGS_INITIAL: u64 = 1 << 9 | 1 << 1;
@@ -120,7 +140,8 @@ const RFLAGS_INITIAL: u64 = 1 << 9 | 1 << 1;
 /// Exécute un programme : `pml4` son espace d'adressage, `entree` son point
 /// d'entrée, `pile` le sommet de sa pile. Revient quand il se termine, avec
 /// son code de sortie.
-pub fn executer(pml4: u64, entree: u64, pile: u64) -> i32 {
+pub fn executer(nom: &'static [u8], pml4: u64, entree: u64, pile: u64) -> i32 {
+    *NOM.verrouiller() = nom;
     let haut = &raw const __pile_programme_haut as u64;
     let cadre = (haut - size_of::<Cadre>() as u64) as *mut Cadre;
     let retour = cadre as u64 - 8;
@@ -146,6 +167,8 @@ pub fn executer(pml4: u64, entree: u64, pile: u64) -> i32 {
         (*CONTEXTES.0.get()).programme = depart;
     }
     let interruptions = cpu::couper_interruptions();
+    DEPART.store(horloge::tics(), Ordering::Relaxed);
+    EN_COURS.store(true, Ordering::Relaxed);
     // SAFETY : interruptions coupées ; la pile noyau du programme sera
     // prise à sa prochaine entrée dans le noyau ; son espace a la moitié
     // haute du noyau (on continue de s'exécuter après avoir changé CR3).
@@ -158,6 +181,7 @@ pub fn executer(pml4: u64, entree: u64, pile: u64) -> i32 {
         // De retour : on quitte l'espace du programme, qui va être détruit.
         pagination::activer(pagination::pml4_noyau());
     }
+    EN_COURS.store(false, Ordering::Relaxed);
     if interruptions {
         cpu::activer_interruptions();
     }
@@ -178,4 +202,22 @@ pub fn terminer(code: i32) -> ! {
         basculer(&raw mut (*contextes).programme, &raw const (*contextes).noyau);
     }
     unreachable!("un programme termine a repris la main");
+}
+
+/// Arrête le programme en cours par le signal `signal` (une exception, son
+/// temps épuisé), en disant pourquoi : le message de Linux dans son
+/// journal, puis le code de sortie 128 + signal.
+pub fn arreter(signal: Signal, raison: impl fmt::Display) -> ! {
+    let nom = *NOM.verrouiller();
+    afficherln!("[noyau] {} : {} ({})", Nom(nom), raison, signal.nom);
+    terminer(128 + signal.numero as i32)
+}
+
+/// Arrête le programme en cours s'il a dépassé son temps. Appelée au retour
+/// vers l'anneau 3 (après une interruption, à la fin d'un appel système) :
+/// le noyau n'a alors plus rien en cours pour lui.
+pub fn verifier_budget() {
+    if EN_COURS.load(Ordering::Relaxed) && horloge::tics() - DEPART.load(Ordering::Relaxed) > BUDGET_TICS {
+        arreter(linux::SIGXCPU, format_args!("temps de calcul depasse ({} ms)", BUDGET_TICS));
+    }
 }

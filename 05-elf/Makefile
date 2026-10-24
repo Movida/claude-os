@@ -111,6 +111,45 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 	mkdir -p $(LINUX)
 	gcc $(CFLAGS_LINUX) $< -o $@
 
+# Les programmes de test de `make tests-qemu` (linux/tests/) : chacun fait
+# une faute que le noyau doit arrêter, ou essaie de mauvais appels système ;
+# puis des exécutables que le noyau doit refuser :
+#   - wx : un segment W+X (ld -N) ;
+#   - derniere-page : des segments dans les dernières pages de la moitié
+#     basse (là où est la pile, et dans la page interdite) ;
+#   - et-dyn : un exécutable indépendant de la position (ld -pie) ;
+#   - tronque : les 40 premiers octets d'un exécutable.
+# Enfin bonjour-asm, pour montrer que le noyau exécute encore des
+# programmes après tout cela.
+TESTS_LINUX = pointeurs ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss recursion boucle \
+              wx derniere-page et-dyn tronque
+
+$(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
+	mkdir -p $(LINUX)/tests
+	nasm -f elf64 -i linux/tests/ $< -o $@
+
+$(LINUX)/tests/%: $(LINUX)/tests/%.o
+	ld -o $@ $<
+
+$(LINUX)/tests/wx: $(LINUX)/bonjour-asm.o
+	mkdir -p $(LINUX)/tests
+	ld -N -o $@ $< 2>/dev/null
+
+$(LINUX)/tests/derniere-page: $(LINUX)/bonjour-asm.o
+	mkdir -p $(LINUX)/tests
+	ld -Ttext=0x7ffffffff000 -o $@ $<
+
+$(LINUX)/tests/et-dyn: $(LINUX)/bonjour-asm.o
+	mkdir -p $(LINUX)/tests
+	ld -pie --no-dynamic-linker -o $@ $<
+
+$(LINUX)/tests/tronque: $(LINUX)/bonjour-asm
+	mkdir -p $(LINUX)/tests
+	head -c 40 $< > $@
+
+tests.cpio: archive.sh $(addprefix $(LINUX)/tests/,$(TESTS_LINUX)) $(LINUX)/bonjour-asm
+	sh archive.sh $@ $(filter-out archive.sh,$^)
+
 PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx bonjour-c bonjour-c-deux-segments bonjour-c-pie bonjour-c-dynamique)
 
 # L'archive de programmes, que le noyau exécute dans l'ordre (voir
@@ -219,21 +258,42 @@ $(WAST2JSON):
 #   - test-garde : déborder de la pile, que la page de garde doit arrêter
 #     net, et le dire ;
 #   - test-gros : un noyau de plus de 1 Mio, que le chargeur doit lire en
-#     entier, chaque secteur à sa place.
+#     entier, chaque secteur à sa place ;
+#   - test-programmes : l'archive des programmes de test (tests.cpio),
+#     exécutés un par un en un seul démarrage ; le noyau doit arrêter
+#     chaque programme fautif et continuer, puis éteindre QEMU (le
+#     périphérique isa-debug-exit : QEMU sort avec le code 2 x valeur + 1).
+#     Chaque ligne de tests-attendu.txt doit être dans ce qu'il affiche.
+#     Deux fois : avec le processeur par défaut (qemu64), puis avec toutes
+#     les fonctions que QEMU sait imiter (-cpu max : SMEP, SMAP, UMIP...),
+#     pour passer aussi par les chemins « si le processeur l'a ».
 QEMU_TEST = timeout 2 qemu-system-x86_64 -display none -no-reboot
+QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot \
+  -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
-tests-qemu: test-garde.bin test-gros.bin
+tests-qemu: test-garde.bin test-gros.bin test-programmes.bin
 	-$(QEMU_TEST) -drive format=raw,file=test-garde.bin -serial file:test-garde.log
 	grep -F "debordement de la pile du noyau" test-garde.log
 	-$(QEMU_TEST) -drive format=raw,file=test-gros.bin -serial file:test-gros.log
 	grep -F "chaque secteur a sa place : ok" test-gros.log
+	for cpu in qemu64 max; do \
+	  $(QEMU_PROGRAMMES) -cpu $$cpu -serial file:test-programmes-$$cpu.log; code=$$?; \
+	  [ $$code -eq 1 ] || { echo "-cpu $$cpu : QEMU n'a pas ete eteint par le noyau (code $$code)"; exit 1; }; \
+	  while IFS= read -r ligne; do \
+	    grep -qF -- "$$ligne" test-programmes-$$cpu.log || { echo "-cpu $$cpu : manque « $$ligne »"; exit 1; }; \
+	  done < tests-attendu.txt; \
+	done
+
+test-programmes.bin: tests.cpio FORCE
+	cd noyau && cargo build --release --features test-programmes --target-dir target/test-programmes 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	$(call image,noyau/target/test-programmes/x86_64-unknown-none/release/noyau,tests.cpio,test-programmes)
 
 test-%.bin: programmes.cpio FORCE
 	cd noyau && cargo build --release --features test-$* --target-dir target/test-$* 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,programmes.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin test-*.bin programmes.cpio serial.log qemu.log ecran.png test-*.log
+	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio serial.log qemu.log ecran.png test-*.log
 	rm -rf $(LINUX)
 	rm -rf $(SUITE)
 	cd noyau && cargo clean
