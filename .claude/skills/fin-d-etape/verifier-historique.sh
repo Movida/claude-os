@@ -55,7 +55,8 @@ for commit in $COMMITS; do
     # les avertissements, on construit d'abord chaque étape nous-mêmes.
     # (Pas de RUSTFLAGS="-D warnings" : cette variable remplacerait les
     # rustflags de .cargo/config.toml, dont relocation-model=static.)
-    for makefile in "$ARBRE"/copie/[0-9][0-9]-*/Makefile; do
+    # Même motif que verifier.sh : `05-elf/` comme `06a-memoire/`.
+    for makefile in "$ARBRE"/copie/[0-9][0-9]*-*/Makefile; do
         [ -f "$makefile" ] || continue
         etape=$(dirname "$makefile")
         # Une étape sans attendu.txt n'a pas d'image à construire. Ses

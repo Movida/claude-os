@@ -8,8 +8,12 @@
 #     exprès une erreur, et doit l'arrêter avec un message clair).
 # On les lance aussi.
 # Code de sortie non nul si une étape ne produit pas ce qu'on attend.
+#
+# Les dossiers d'étape : deux chiffres, puis un nom (`05-elf/`), ou une
+# lettre de sous-étape avant le nom (`06a-memoire/`) ; d'où le motif
+# [0-9][0-9]*-*/. L'ordre alphabétique est celui des étapes.
 echec=0
-for etape in [0-9][0-9]-*/; do
+for etape in [0-9][0-9]*-*/; do
     etape=${etape%/}
     [ -f "$etape/attendu.txt" ] || continue
     # make plutôt que nasm directement : depuis l'étape 3, l'image contient
@@ -32,7 +36,7 @@ for etape in [0-9][0-9]-*/; do
         fi
     done < "$etape/attendu.txt"
 done
-for etape in [0-9][0-9]-*/; do
+for etape in [0-9][0-9]*-*/; do
     etape=${etape%/}
     for cible in tests-hote tests-qemu; do
         grep -q "^$cible:" "$etape/Makefile" 2>/dev/null || continue

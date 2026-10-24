@@ -12,9 +12,10 @@ ecran.ppm
 # Compilation du noyau Rust
 target/
 
-# Suite de tests officielle de WebAssembly, téléchargée par make (étapes 4 et 5)
-04-wasm/suite/
-05-elf/suite/
+# Suite de tests officielle de WebAssembly, téléchargée par make (depuis
+# l'étape 4) : un motif plutôt qu'une ligne par étape, chaque étape en a
+# sa copie.
+*/suite/
 
-# Programmes Linux de test, construits par make (étape 5)
-05-elf/linux/construits/
+# Programmes Linux de test, construits par make (depuis l'étape 5)
+*/linux/construits/
