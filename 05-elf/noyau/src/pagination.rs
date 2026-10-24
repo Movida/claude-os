@@ -221,6 +221,24 @@ pub unsafe fn lire_table(physique: u64) -> &'static Table {
     unsafe { table(physique) }
 }
 
+/// La table de pages d'adresse physique `physique`, modifiable.
+///
+/// # Safety
+/// Comme `table` : une de nos tables, projetée, que personne d'autre ne
+/// modifie en même temps.
+pub unsafe fn table_modifiable(physique: u64) -> &'static mut Table {
+    // SAFETY : garanti par l'appelant.
+    unsafe { table(physique) }
+}
+
+/// Retire du cache des traductions (TLB) celle de la page `adresse`, dans
+/// l'espace courant : après qu'on a retiré la page ou réduit ses droits.
+pub fn invalider(adresse: u64) {
+    // SAFETY : invlpg ne fait qu'oublier une traduction ; le processeur la
+    // relira dans les tables.
+    unsafe { asm!("invlpg [{}]", in(reg) adresse, options(nostack)) };
+}
+
 /// Fait de `pml4` l'espace d'adressage courant (CR3). Écrire CR3 vide
 /// aussi le cache des traductions (TLB) de tout ce qui n'est pas global :
 /// rien de l'espace précédent ne sert plus.

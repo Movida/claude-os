@@ -23,6 +23,9 @@ test-gros = []
 # Exécuter l'archive des programmes de test (fautifs, refusés...), puis
 # éteindre QEMU (isa-debug-exit).
 test-programmes = []
+# Afficher chaque appel système des programmes Linux, à la façon de strace
+# (make trace).
+trace = []
 
 # panic = "abort" : en cas de panique, pas de « déroulement » de la pile
 # (unwinding), qui demanderait une bibliothèque d'exécution qu'on n'a pas.

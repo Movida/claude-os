@@ -55,3 +55,28 @@ pub fn arreter() -> ! {
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
     }
 }
+
+/// Le MSR de la base du segment FS : en 64 bits, le seul usage qui reste
+/// de FS est d'y ranger une adresse de base, que le programme fixe par
+/// arch_prctl. La glibc y met son bloc de « variables propres au fil
+/// d'exécution » (TLS : errno, entre autres), lu par `mov rax, fs:[...]`.
+const FS_BASE: u32 = 0xC000_0100;
+
+/// Fixe la base de FS du programme en cours.
+pub fn ecrire_base_fs(base: u64) {
+    // SAFETY : le MSR existe sur tout processeur 64 bits ; le noyau ne se
+    // sert pas de FS. L'appelant vérifie que `base` est une adresse
+    // canonique (sinon wrmsr fait une faute de protection générale).
+    unsafe {
+        asm!("wrmsr", in("ecx") FS_BASE, in("eax") base as u32, in("edx") (base >> 32) as u32,
+             options(nostack, preserves_flags));
+    }
+}
+
+/// La base de FS du programme en cours.
+pub fn lire_base_fs() -> u64 {
+    let (bas, haut): (u32, u32);
+    // SAFETY : lecture d'un MSR qui existe, sans effet.
+    unsafe { asm!("rdmsr", in("ecx") FS_BASE, out("eax") bas, out("edx") haut, options(nomem, nostack, preserves_flags)) };
+    (haut as u64) << 32 | bas as u64
+}

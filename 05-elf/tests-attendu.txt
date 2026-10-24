@@ -8,6 +8,15 @@
 [noyau] appel systeme inconnu : 9999
 [linux] appel 9999 : -ENOSYS, on continue.
 [noyau] pointeurs : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] brk : tas agrandi de 3 pages ; 300 Mio refuses (budget).
+[linux] brk : tas reduit a 1 page, on touche une page retiree.
+[noyau] tas : segfault at 
+[noyau] tas : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] mprotect W+X : code ecrit puis execute (JIT) : ok.
+[linux] mprotect d'une page absente : -ENOMEM.
+[linux] mprotect PROT_NONE, puis lecture de la page.
+[noyau] mprotect : segfault at 
+[noyau] mprotect : termine, code de sortie 139 ; memoire rendue : ok.
 [noyau] ecrire-code : segfault at 0x401000 ip 0x40101f sp 
  error 7 (SIGSEGV)
 [noyau] ecrire-code : termine, code de sortie 139 ; memoire rendue : ok.
@@ -35,6 +44,9 @@
 [noyau] recursion : termine, code de sortie 139 ; memoire rendue : ok.
 [noyau] boucle : temps de calcul depasse (1000 ms) (SIGXCPU)
 [noyau] boucle : termine, code de sortie 152 ; memoire rendue : ok.
+[linux] Test : brk qui grandit et recule sans fin.
+[noyau] brk-boucle : temps de calcul depasse (1000 ms) (SIGXCPU)
+[noyau] brk-boucle : termine, code de sortie 152 ; memoire rendue : ok.
 [noyau] wx : programme Linux refuse : segment 0 : inscriptible et executable (W+X)
 [noyau] derniere-page : programme Linux refuse : segment 0 : hors des adresses permises
 [noyau] et-dyn : programme Linux refuse : ELF ET_DYN (PIE ou bibliotheque) : pas encore pris en charge

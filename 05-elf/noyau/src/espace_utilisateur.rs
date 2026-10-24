@@ -46,6 +46,30 @@ use pagination::{ADRESSE, PRESENTE};
 
 const PAGE: u64 = 4096;
 
+/// Une page du programme rendue inaccessible (mprotect avec PROT_NONE) :
+/// le processeur ne sait pas dire « présente mais interdite » ; on retire
+/// le bit PRESENTE, et on garde le cadre dans l'entrée, marquée de ce bit
+/// que le processeur laisse au système (le bit 9 : « disponible »). C'est
+/// le _PAGE_PROTNONE de Linux. Un accès fait alors une faute de page.
+const SANS_ACCES: u64 = 1 << 9;
+
+/// Une entrée finale qui désigne un cadre du programme, accessible ou non.
+fn occupee(entree: u64) -> bool {
+    entree & (PRESENTE | SANS_ACCES) != 0
+}
+
+/// Le budget de mémoire d'un programme : au plus 256 Mio de pages (le
+/// RLIMIT_DATA et le RLIMIT_AS de Linux, réunis ; illimités par défaut sous
+/// Linux, mais notre noyau n'a pas de mémoire virtuelle à prêter), et au
+/// plus la moitié des pages libres à son lancement : sur une machine de
+/// 128 Mio, 256 Mio ne borneraient rien. Au-delà, brk échoue et le
+/// programme reçoit ENOMEM : il ne peut pas prendre toute la mémoire de la
+/// machine. Comme le budget des programmes WebAssembly
+/// (wasm::Magasin::avec_budget). Les tables de pages, elles, ne sont pas
+/// comptées (quelques centaines au plus aujourd'hui, Linux les compte à
+/// part) : à revoir avec mmap.
+pub const BUDGET_PAGES: usize = (256 << 20) / PAGE as usize;
+
 /// La plus basse adresse projetable (vm.mmap_min_addr de Linux).
 pub const ADRESSE_MIN: u64 = 0x1_0000;
 /// La fin des adresses projetables, exclue (TASK_SIZE_MAX de Linux).
@@ -82,11 +106,39 @@ pub fn adresse_permise(adresse: u64) -> bool {
     adresse % PAGE == 0 && (ADRESSE_MIN..ADRESSE_MAX).contains(&adresse)
 }
 
+/// Un cadre neuf, mis à zéro, pas encore projeté. On le prépare À PART,
+/// sans tenir aucun verrou et donc interruptions permises : mettre à zéro
+/// beaucoup de pages, verrou tenu, ferait perdre leurs tics à l'horloge
+/// (voir brk, dans linux.rs). S'il n'est finalement pas projeté, il
+/// retourne à l'allocateur tout seul (Drop).
+pub struct CadreNeuf(u64);
+
+impl CadreNeuf {
+    pub fn allouer() -> Option<CadreNeuf> {
+        let cadre = pages::allouer(0)?;
+        // SAFETY : le cadre vient d'être alloué, personne d'autre ne le voit.
+        // Il contenait ce qu'y avait laissé son précédent occupant (le noyau,
+        // un autre programme) : le donner tel quel ferait fuir ces données.
+        unsafe { core::ptr::write_bytes(espace::virtuelle(cadre) as *mut u8, 0, PAGE as usize) };
+        Some(CadreNeuf(cadre))
+    }
+}
+
+impl Drop for CadreNeuf {
+    fn drop(&mut self) {
+        pages::liberer(self.0, 0);
+    }
+}
+
 /// L'espace d'adressage d'un programme. Le détruire (le laisser sortir de
 /// portée) rend toutes ses pages et toutes ses tables.
 pub struct EspaceUtilisateur {
     /// L'adresse physique de sa PML4.
     pml4: u64,
+    /// Le nombre de pages projetées (sans compter les tables).
+    pages: usize,
+    /// Le plus de pages qu'il peut avoir (voir BUDGET_PAGES).
+    budget: usize,
 }
 
 impl EspaceUtilisateur {
@@ -101,7 +153,8 @@ impl EspaceUtilisateur {
             nouvelle[..256].fill(0);
             nouvelle[256..].copy_from_slice(&noyau[256..]);
         }
-        Ok(EspaceUtilisateur { pml4 })
+        let budget = BUDGET_PAGES.min(pages::libres() / 2);
+        Ok(EspaceUtilisateur { pml4, pages: 0, budget })
     }
 
     /// L'adresse physique de la PML4, pour CR3.
@@ -113,25 +166,114 @@ impl EspaceUtilisateur {
     /// droits `droits` (pagination::ECRITURE, pagination::non_executable()).
     /// Rend l'adresse physique du cadre, pour le remplir par la projection
     /// directe.
+    pub fn projeter_neuve(&mut self, adresse: u64, droits: u64) -> Result<u64, Erreur> {
+        let cadre = CadreNeuf::allouer().ok_or(Erreur::PlusDeMemoire)?;
+        self.projeter(adresse, cadre, droits)
+    }
+
+    /// Projette à `adresse` (une page) le cadre `cadre`, préparé à l'avance
+    /// (voir CadreNeuf), avec les droits `droits`. Rend son adresse
+    /// physique. En cas d'erreur, le cadre retourne à l'allocateur.
     ///
     /// Si l'espace est actif, la nouvelle page sert tout de suite : le
     /// processeur ne garde pas en cache les entrées absentes (manuel
     /// d'Intel, vol. 3A, 4.10.4.3), rien à invalider.
-    pub fn projeter_neuve(&mut self, adresse: u64, droits: u64) -> Result<u64, Erreur> {
+    pub fn projeter(&mut self, adresse: u64, cadre: CadreNeuf, droits: u64) -> Result<u64, Erreur> {
         if !adresse_permise(adresse) {
             return Err(Erreur::AdresseInterdite);
         }
+        if self.pages >= self.budget {
+            return Err(Erreur::PlusDeMemoire);
+        }
         let entree = pagination::entree(self.pml4, adresse).ok_or(Erreur::PlusDeMemoire)?;
-        if *entree & PRESENTE != 0 {
+        if occupee(*entree) {
             return Err(Erreur::DejaProjetee);
         }
-        let cadre = pages::allouer(0).ok_or(Erreur::PlusDeMemoire)?;
-        // SAFETY : le cadre vient d'être alloué, personne d'autre ne le voit.
-        // Il contenait ce qu'y avait laissé son précédent occupant (le noyau,
-        // un autre programme) : le donner tel quel ferait fuir ces données.
-        unsafe { core::ptr::write_bytes(espace::virtuelle(cadre) as *mut u8, 0, PAGE as usize) };
-        *entree = cadre | PRESENTE | droits | pagination::UTILISATEUR;
-        Ok(cadre)
+        // Le cadre appartient désormais à l'espace : il ne doit plus
+        // retourner seul à l'allocateur.
+        let physique = cadre.0;
+        core::mem::forget(cadre);
+        self.pages += 1;
+        *entree = physique | PRESENTE | droits | pagination::UTILISATEUR;
+        Ok(physique)
+    }
+
+    /// L'entrée finale de la page `adresse` si elle désigne un cadre du
+    /// programme (accessible ou non), sans créer de table.
+    fn entree_occupee(&mut self, adresse: u64) -> Option<&'static mut u64> {
+        let mut table = self.pml4;
+        for niveau in (1..4).rev() {
+            // SAFETY : `table` est une table de cet espace.
+            let e = unsafe { pagination::lire_table(table) }[pagination::index(adresse, niveau)];
+            if e & PRESENTE == 0 {
+                return None;
+            }
+            table = e & ADRESSE;
+        }
+        // SAFETY : `table` est une PT de cet espace, que nous possédons ;
+        // l'entrée y est modifiée sous notre seul contrôle (un processeur,
+        // un programme).
+        let entree = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, 0)] };
+        occupee(*entree).then_some(entree)
+    }
+
+    /// Le cache des traductions (TLB) ne doit plus servir l'ancienne entrée
+    /// de `adresse`, si cet espace est actif. (Inactif : le changement de
+    /// CR3 qui l'activera vide le TLB.)
+    fn invalider(&self, adresse: u64) {
+        if pagination::courante() == self.pml4 {
+            pagination::invalider(adresse);
+        }
+    }
+
+    /// Retire la page `adresse` (brk qui recule) et rend son cadre. Rien à
+    /// faire si elle n'est pas projetée.
+    pub fn retirer(&mut self, adresse: u64) {
+        let Some(entree) = self.entree_occupee(adresse) else { return };
+        let cadre = *entree & ADRESSE;
+        *entree = 0;
+        // Invalider AVANT de rendre le cadre : sinon le programme pourrait
+        // encore l'écrire, par une traduction gardée en cache, alors qu'il
+        // appartient déjà à quelqu'un d'autre.
+        self.invalider(adresse);
+        pages::liberer(cadre, 0);
+        self.pages -= 1;
+    }
+
+    /// Change les droits de toutes les pages de [debut, fin[ (mprotect) :
+    /// `lecture`, `ecriture`, `execution`. Toutes doivent être projetées,
+    /// sinon rien n'est changé (Linux rend alors ENOMEM). Le processeur ne
+    /// sait pas interdire la lecture d'une page présente : écrire ou
+    /// exécuter permet aussi de lire, et sans aucun droit, la page est
+    /// retirée du processeur (SANS_ACCES). W+X est permis, comme sous
+    /// Linux : le compilateur à la volée (JIT) de JavaScriptCore, le moteur
+    /// de Claude Code, écrit puis exécute son code dans les mêmes pages.
+    pub fn proteger(&mut self, debut: u64, fin: u64, lecture: bool, ecriture: bool, execution: bool)
+        -> Result<(), Erreur> {
+        let pages = (debut..fin).step_by(PAGE as usize);
+        if pages.clone().any(|p| self.entree_occupee(p).is_none()) {
+            return Err(Erreur::NonProjetee);
+        }
+        let mut droits = 0;
+        if ecriture {
+            droits |= pagination::ECRITURE;
+        }
+        if !execution {
+            droits |= pagination::non_executable();
+        }
+        let accessible = lecture || ecriture || execution;
+        for page in pages {
+            if let Some(entree) = self.entree_occupee(page) {
+                let cadre = *entree & ADRESSE;
+                *entree = if accessible {
+                    cadre | PRESENTE | pagination::UTILISATEUR | droits
+                } else {
+                    cadre | SANS_ACCES
+                };
+                self.invalider(page);
+            }
+        }
+        Ok(())
     }
 
     /// Écrit `octets` à partir de l'adresse `adresse` de l'espace, page par
@@ -220,7 +362,7 @@ fn rendre(table: u64, niveau: u32) {
         // SAFETY : `table` est une table de l'espace, plus utilisée par
         // personne (voir Drop).
         let e = unsafe { pagination::lire_table(table) }[i];
-        if e & PRESENTE == 0 {
+        if !(e & PRESENTE != 0 || niveau == 0 && occupee(e)) {
             continue;
         }
         let dessous = e & ADRESSE;

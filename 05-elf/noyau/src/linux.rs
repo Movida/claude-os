@@ -7,54 +7,152 @@
 //! comme -errno (-14 pour EFAULT, par exemple). La glibc le transforme en
 //! -1 et range le code dans errno.
 //!
-//! Pour l'instant, de quoi écrire et s'arrêter :
-//!   - write (1) : sur la sortie standard ou d'erreur, la console ;
-//!   - exit (60) et exit_group (231) : terminer. (exit ne termine que le
-//!     fil d'exécution, exit_group tout le programme ; avec un seul fil,
-//!     c'est pareil.)
+//! Ce qu'il faut à un programme C compilé avec `gcc -static` (la glibc
+//! 2.39 d'Ubuntu 24.04), mesuré par strace sur la machine hôte, dans
+//! l'ordre : brk, arch_prctl(ARCH_SET_FS), set_tid_address,
+//! set_robust_list, rseq, prlimit64(RLIMIT_STACK), readlinkat
+//! ("/proc/self/exe"), getrandom, brk, mprotect (RELRO), fstat(1), write,
+//! exit_group. Plus writev (les messages d'erreur fatale de la glibc),
+//! ioctl(TCGETS) (isatty), et exit.
+//!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
-//! numéro qu'il ne connaît pas, et le noyau le signale.
+//! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
+//! construit un noyau qui affiche chaque appel à la façon de strace, pour
+//! comparer avec strace sur l'hôte.
+//!
+//! Les numéros de fichier sont des `unsigned int` pour Linux : on n'en
+//! regarde que les 32 bits bas, comme lui.
 
 use core::fmt;
 
-use crate::copie_utilisateur::copier_depuis_utilisateur;
+use crate::chargeur_elf::{SOMMET_PILE, TAILLE_PILE};
+use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
+use crate::espace_utilisateur::{ADRESSE_MAX, CadreNeuf};
 use crate::interruptions::Cadre;
-use crate::{console, tache};
+use crate::{aleatoire, console, cpu, pile, processus, tache};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
+const EPERM: i64 = 1;
+const ENOENT: i64 = 2;
+const ESRCH: i64 = 3;
 const EBADF: i64 = 9;
+const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
+const EINVAL: i64 = 22;
+const ENOTTY: i64 = 25;
 const ENOSYS: i64 = 38;
 
+// Les numéros des appels.
 const WRITE: u64 = 1;
+const FSTAT: u64 = 5;
+const MPROTECT: u64 = 10;
+const BRK: u64 = 12;
+const IOCTL: u64 = 16;
+const WRITEV: u64 = 20;
 const EXIT: u64 = 60;
+const ARCH_PRCTL: u64 = 158;
+const SET_TID_ADDRESS: u64 = 218;
 const EXIT_GROUP: u64 = 231;
+const READLINKAT: u64 = 267;
+const SET_ROBUST_LIST: u64 = 273;
+const PRLIMIT64: u64 = 302;
+const GETRANDOM: u64 = 318;
+const RSEQ: u64 = 334;
 
-/// Le plus d'octets qu'un write écrit d'une fois : au-delà, il en écrit une
-/// partie et le dit (le nombre écrit), ce que POSIX permet ; la glibc
-/// recommence avec la suite. Comme pour fd_write de WASI (wasi.rs) : sur
-/// un vrai port série, 1024 octets prennent déjà 90 ms, et le noyau ne doit
-/// pas rester longtemps dans un seul appel.
+const PAGE: u64 = 4096;
+
+/// Le plus d'octets qu'un write ou un writev écrit d'une fois : au-delà, il
+/// en écrit une partie et le dit (le nombre écrit), ce que POSIX permet ; la
+/// glibc recommence avec la suite. Comme pour fd_write de WASI (wasi.rs) :
+/// sur un vrai port série, 1024 octets prennent déjà 90 ms, et le noyau ne
+/// doit pas rester longtemps dans un seul appel.
 const ECRITURE_MAX: usize = 1024;
+
+/// Le numéro de processus et de fil du programme : 1, le premier (et le
+/// seul) processus. (set_tid_address rend le numéro du fil appelant.)
+const PID: i64 = 1;
 
 /// Exécute l'appel système `numero` : un résultat, ou -errno.
 pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
-    match numero {
+    let resultat = match numero {
         WRITE => write(a[0], a[1], a[2]),
+        WRITEV => writev(a[0], a[1], a[2]),
+        FSTAT => fstat(a[0], a[1]),
+        IOCTL => ioctl(a[0], a[1]),
+        BRK => brk(a[0]),
+        MPROTECT => mprotect(a[0], a[1], a[2]),
+        ARCH_PRCTL => arch_prctl(a[0], a[1]),
+        // L'adresse où effacer le numéro du fil quand il se termine (pour
+        // pthread_join) : sans fils, rien à faire ; on rend le numéro du fil.
+        SET_TID_ADDRESS => PID,
+        // La liste des verrous « robustes » du fil (relâchés s'il meurt en
+        // les tenant) : sans fils, rien à faire. La taille de la tête de
+        // liste est fixée par l'ABI (24 octets) ; Linux refuse les autres.
+        SET_ROBUST_LIST => if a[1] == 24 { 0 } else { -EINVAL },
+        // Les « séquences redémarrables » : une optimisation des compteurs
+        // par processeur. La glibc s'en passe si le noyau ne l'a pas.
+        RSEQ => -ENOSYS,
+        PRLIMIT64 => prlimit64(a[0], a[1], a[2], a[3]),
+        // La glibc lit le lien /proc/self/exe pour connaître son propre
+        // chemin (dl_get_origin). Pas encore de système de fichiers : le
+        // lien n'existe pas.
+        READLINKAT => -ENOENT,
+        GETRANDOM => getrandom(a[0], a[1], a[2]),
         // Le code de sortie tient sur 8 bits : Linux ne garde que l'octet
         // bas (exit(256) rend 0, exit(-1) rend 255), ce que verra le futur
         // wait ; les codes 128 + N restent ceux des signaux.
-        EXIT | EXIT_GROUP => tache::terminer((a[0] & 0xff) as i32),
+        EXIT | EXIT_GROUP => {
+            tracer(numero, a, None);
+            tache::terminer((a[0] & 0xff) as i32)
+        }
         _ => {
             afficherln!("[noyau] appel systeme inconnu : {}", numero);
             -ENOSYS
         }
+    };
+    tracer(numero, a, Some(resultat));
+    resultat
+}
+
+/// Avec la fonctionnalité `trace` (make trace) : affiche l'appel, ses
+/// arguments et son résultat, comme strace. (`None` : l'appel ne revient
+/// pas.)
+fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
+    if !cfg!(feature = "trace") {
+        return;
+    }
+    let (nom, n) = match numero {
+        WRITE => ("write", 3),
+        WRITEV => ("writev", 3),
+        FSTAT => ("fstat", 2),
+        IOCTL => ("ioctl", 2),
+        BRK => ("brk", 1),
+        MPROTECT => ("mprotect", 3),
+        ARCH_PRCTL => ("arch_prctl", 2),
+        SET_TID_ADDRESS => ("set_tid_address", 1),
+        SET_ROBUST_LIST => ("set_robust_list", 2),
+        RSEQ => ("rseq", 4),
+        PRLIMIT64 => ("prlimit64", 4),
+        READLINKAT => ("readlinkat", 4),
+        GETRANDOM => ("getrandom", 3),
+        EXIT => ("exit", 1),
+        EXIT_GROUP => ("exit_group", 1),
+        _ => ("?", 6),
+    };
+    afficher!("[trace] {}(", nom);
+    for (i, x) in a[..n].iter().enumerate() {
+        afficher!("{}{:#x}", if i > 0 { ", " } else { "" }, x);
+    }
+    match resultat {
+        None => afficherln!(") = ?"),
+        Some(r) if r < 0 => afficherln!(") = -1 (errno {})", -r),
+        Some(r) => afficherln!(") = {:#x}", r),
     }
 }
 
 /// write(fichier, tampon, nombre).
 fn write(fichier: u64, tampon: u64, nombre: u64) -> i64 {
-    if fichier != 1 && fichier != 2 {
+    if fichier as u32 != 1 && fichier as u32 != 2 {
         return -EBADF;
     }
     // Les octets du programme passent par un tampon du noyau : on copie sa
@@ -67,6 +165,245 @@ fn write(fichier: u64, tampon: u64, nombre: u64) -> i64 {
     }
     console::ecrire_octets(&copie[..n]);
     n as i64
+}
+
+/// writev(fichier, morceaux, nombre) : plusieurs morceaux d'un coup, décrits
+/// par un tableau de « struct iovec » (adresse, longueur : 16 octets). Au
+/// plus 1024 morceaux (IOV_MAX). On lit les descripteurs un par un (pas de
+/// place pour 16 Kio de tableau sur la pile noyau du programme, qui en fait
+/// 16), et on écrit au plus ECRITURE_MAX octets en tout. Une faute après
+/// des octets écrits rend leur nombre ; avant, EFAULT. (Linux, lui, lit et
+/// vérifie tous les descripteurs avant d'écrire quoi que ce soit, et
+/// refuse d'emblée une longueur négative ou un pointeur hors des bornes ;
+/// ici, une telle erreur au milieu donne une écriture partielle. Sans
+/// conséquence pour la glibc, qui ne s'en sert que pour ses messages
+/// fatals.)
+fn writev(fichier: u64, morceaux: u64, nombre: u64) -> i64 {
+    if fichier as u32 != 1 && fichier as u32 != 2 {
+        return -EBADF;
+    }
+    if nombre > 1024 {
+        return -EINVAL;
+    }
+    let mut ecrits = 0usize;
+    for i in 0..nombre {
+        let mut iovec = [0u8; 16];
+        let Some(adresse) = morceaux.checked_add(16 * i) else { return -EFAULT };
+        if copier_depuis_utilisateur(&mut iovec, adresse).is_err() {
+            return if ecrits > 0 { ecrits as i64 } else { -EFAULT };
+        }
+        let base = u64::from_le_bytes(iovec[..8].try_into().unwrap_or([0; 8]));
+        let longueur = u64::from_le_bytes(iovec[8..].try_into().unwrap_or([0; 8]));
+        let n = (longueur as usize).min(ECRITURE_MAX - ecrits);
+        let mut copie = [0u8; ECRITURE_MAX];
+        if copier_depuis_utilisateur(&mut copie[..n], base).is_err() {
+            return if ecrits > 0 { ecrits as i64 } else { -EFAULT };
+        }
+        console::ecrire_octets(&copie[..n]);
+        ecrits += n;
+        if ecrits == ECRITURE_MAX {
+            break;
+        }
+    }
+    ecrits as i64
+}
+
+/// fstat(fichier, stat) : les descripteurs 0, 1 et 2 sont la console, un
+/// périphérique caractère (le 5:1 de Linux, /dev/console). La glibc s'en
+/// sert pour choisir le tampon de la sortie standard.
+fn fstat(fichier: u64, stat: u64) -> i64 {
+    if fichier as u32 > 2 {
+        return -EBADF;
+    }
+    // La « struct stat » de Linux sur x86_64 : 144 octets.
+    let mut s = [0u8; 144];
+    let mut mettre = |position: usize, valeur: u64, taille: usize| {
+        s[position..position + taille].copy_from_slice(&valeur.to_le_bytes()[..taille]);
+    };
+    mettre(16, 1, 8); // st_nlink
+    mettre(24, 0o020620, 4); // st_mode : S_IFCHR, rw--w----
+    mettre(28, pile::UTILISATEUR, 4); // st_uid
+    mettre(32, pile::GROUPE, 4); // st_gid
+    mettre(40, 5 << 8 | 1, 8); // st_rdev : 5:1
+    mettre(56, 1024, 8); // st_blksize
+    if copier_vers_utilisateur(stat, &s).is_err() {
+        return -EFAULT;
+    }
+    0
+}
+
+/// ioctl(fichier, requête) : la console n'est pas encore un terminal (pas
+/// de mode canonique, d'écho, de taille de fenêtre) : TCGETS, la question
+/// d'isatty, rend ENOTTY, comme pour un fichier ordinaire. La glibc met
+/// alors la sortie standard dans un tampon complet, vidé à la sortie.
+fn ioctl(fichier: u64, _requete: u64) -> i64 {
+    if fichier as u32 > 2 {
+        return -EBADF;
+    }
+    -ENOTTY
+}
+
+/// brk(adresse) : déplace la fin du tas, à l'octet près ; les pages sont
+/// projetées (mises à zéro) ou retirées pour suivre. Rend la nouvelle fin,
+/// ou l'ancienne en cas d'échec (c'est ainsi que Linux signale l'erreur ;
+/// brk(0) demande donc la fin actuelle). Le tas ne peut ni reculer sous
+/// son début, ni s'approcher à moins d'une page de la pile, ni dépasser le
+/// budget de mémoire du programme.
+///
+/// Le verrou du processus coupe les interruptions : on ne le prend que
+/// pour poser chaque page dans les tables, et chaque page est mise à zéro
+/// avant, hors du verrou (CadreNeuf). Mettre à zéro des dizaines de Mio
+/// interruptions coupées ferait perdre leurs tics à l'horloge (le PIT n'en
+/// garde qu'un en attente) : l'heure du noyau prendrait du retard, et un
+/// programme qui ferait grandir et reculer son tas sans fin échapperait à
+/// son budget de temps (le test brk-boucle le vérifie). Avec
+/// l'ordonnanceur, ce verrou deviendra un verrou qui dort (le mmap_lock
+/// de Linux).
+fn brk(demande: u64) -> i64 {
+    let (debut, actuelle) = processus::avec(|p| (p.debut_tas, p.fin_tas));
+    let limite = SOMMET_PILE - TAILLE_PILE - PAGE;
+    if demande < debut || demande > limite {
+        return actuelle as i64;
+    }
+    let (pages_avant, pages_apres) = (actuelle.next_multiple_of(PAGE), demande.next_multiple_of(PAGE));
+    if pages_apres > pages_avant {
+        let donnees = crate::pagination::ECRITURE | crate::pagination::non_executable();
+        for page in (pages_avant..pages_apres).step_by(PAGE as usize) {
+            let projetee = CadreNeuf::allouer()
+                .is_some_and(|cadre| processus::avec(|p| p.espace.projeter(page, cadre, donnees)).is_ok());
+            if !projetee {
+                // Tout ou rien : on rend ce qui vient d'être pris.
+                for prise in (pages_avant..page).step_by(PAGE as usize) {
+                    processus::avec(|p| p.espace.retirer(prise));
+                }
+                return actuelle as i64;
+            }
+        }
+    } else {
+        for page in (pages_apres..pages_avant).step_by(PAGE as usize) {
+            processus::avec(|p| p.espace.retirer(page));
+        }
+    }
+    processus::avec(|p| p.fin_tas = demande);
+    demande as i64
+}
+
+/// mprotect(adresse, longueur, droits) : change les droits de pages déjà
+/// projetées. La glibc statique s'en sert pour remettre en lecture seule,
+/// une fois ses adresses corrigées, ses tables sensibles (RELRO : la GOT,
+/// .init_array...). W+X est permis, comme sous Linux (voir
+/// EspaceUtilisateur::proteger).
+fn mprotect(adresse: u64, longueur: u64, droits: u64) -> i64 {
+    const PROT_READ: u64 = 1;
+    const PROT_WRITE: u64 = 2;
+    const PROT_EXEC: u64 = 4;
+    // Sans effet sur x86 : Linux l'accepte et l'ignore.
+    const PROT_SEM: u64 = 8;
+    // PROT_GROWSDOWN et PROT_GROWSUP (étendre le changement jusqu'au bout
+    // d'une pile qui grandit) : refusés, comme Linux pour une zone qui ne
+    // grandit pas, et aucune ne grandit ici.
+    if adresse % PAGE != 0 || droits & !(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM) != 0 {
+        return -EINVAL;
+    }
+    // Rien à changer : succès, quelle que soit l'adresse (Linux fait ce
+    // test avant tous les autres sur la plage).
+    if longueur == 0 {
+        return 0;
+    }
+    let Some(fin) = longueur.checked_next_multiple_of(PAGE).and_then(|l| adresse.checked_add(l)) else {
+        return -ENOMEM;
+    };
+    if fin > ADRESSE_MAX {
+        return -ENOMEM;
+    }
+    let (lecture, ecriture, execution) = (droits & PROT_READ != 0, droits & PROT_WRITE != 0, droits & PROT_EXEC != 0);
+    match processus::avec(|p| p.espace.proteger(adresse, fin, lecture, ecriture, execution)) {
+        Ok(()) => 0,
+        Err(_) => -ENOMEM,
+    }
+}
+
+/// arch_prctl(code, adresse) : la base de FS (ARCH_SET_FS, ARCH_GET_FS),
+/// où la glibc range ses variables propres au fil (TLS).
+fn arch_prctl(code: u64, adresse: u64) -> i64 {
+    const ARCH_SET_FS: u64 = 0x1002;
+    const ARCH_GET_FS: u64 = 0x1003;
+    match code {
+        // Une adresse des programmes seulement : une adresse non canonique
+        // ferait fauter wrmsr dans le noyau. Linux rend EPERM au-delà.
+        ARCH_SET_FS if adresse < ADRESSE_MAX => {
+            cpu::ecrire_base_fs(adresse);
+            0
+        }
+        ARCH_SET_FS => -EPERM,
+        ARCH_GET_FS => match copier_vers_utilisateur(adresse, &cpu::lire_base_fs().to_le_bytes()) {
+            Ok(()) => 0,
+            Err(_) => -EFAULT,
+        },
+        _ => -EINVAL,
+    }
+}
+
+/// prlimit64(processus, ressource, nouvelle, ancienne) : les limites du
+/// processus, en lecture seulement. Celles de Linux par défaut : 8 Mio de
+/// pile (que la glibc lit pour ses fils), 1024 fichiers ouverts, pas de
+/// fichier « core » ; infini pour le reste. (La pile, elle, ne fait que
+/// 128 Kio, projetés d'avance : voir chargeur_elf.rs.)
+fn prlimit64(pid: u64, ressource: u64, nouvelle: u64, ancienne: u64) -> i64 {
+    const INFINI: u64 = u64::MAX;
+    const RLIMIT_CORE: u64 = 4;
+    const RLIMIT_STACK: u64 = 3;
+    const RLIMIT_NOFILE: u64 = 7;
+    if pid != 0 && pid != PID as u64 {
+        return -ESRCH;
+    }
+    if ressource >= 16 {
+        return -EINVAL;
+    }
+    // Pas encore de limites réglables.
+    if nouvelle != 0 {
+        return -EPERM;
+    }
+    let (courante, maximale) = match ressource {
+        RLIMIT_STACK => (8 << 20, INFINI),
+        RLIMIT_CORE => (0, INFINI),
+        RLIMIT_NOFILE => (1024, 4096),
+        _ => (INFINI, INFINI),
+    };
+    if ancienne != 0 {
+        let mut octets = [0u8; 16];
+        octets[..8].copy_from_slice(&u64::to_le_bytes(courante));
+        octets[8..].copy_from_slice(&u64::to_le_bytes(maximale));
+        if copier_vers_utilisateur(ancienne, &octets).is_err() {
+            return -EFAULT;
+        }
+    }
+    0
+}
+
+/// getrandom(tampon, nombre, options) : des octets aléatoires, de la même
+/// source qu'AT_RANDOM (aleatoire.rs). Au plus 256 octets d'une fois, la
+/// taille que Linux garantit sans interruption ; au-delà, une partie
+/// (permis : le programme redemande).
+fn getrandom(tampon: u64, nombre: u64, options: u64) -> i64 {
+    const GRND_NONBLOCK: u64 = 1;
+    const GRND_RANDOM: u64 = 2;
+    const GRND_INSECURE: u64 = 4;
+    // GRND_INSECURE (« même si le générateur n'est pas prêt ») et
+    // GRND_RANDOM (« de la meilleure source ») se contredisent : Linux
+    // refuse les deux ensemble.
+    if options & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
+        || options & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE
+    {
+        return -EINVAL;
+    }
+    let mut octets = [0u8; 256];
+    let n = (nombre as usize).min(octets.len());
+    aleatoire::remplir(&mut octets[..n]);
+    match copier_vers_utilisateur(tampon, &octets[..n]) {
+        Ok(()) => n as i64,
+        Err(_) => -EFAULT,
+    }
 }
 
 /// Un signal de Linux (include/uapi/asm-generic/signal.h), par lequel un

@@ -12,7 +12,7 @@
 //! format est essayé tour à tour, et le premier qui reconnaît le fichier
 //! s'en charge. Le nom du fichier (son extension) ne compte pas.
 
-use crate::{chargeur_elf, demarrage, espace, pages, pile, tache, wasi};
+use crate::{chargeur_elf, demarrage, espace, pages, pile, processus, tache, wasi};
 
 /// L'environnement des programmes Linux : de quoi savoir où est le
 /// dossier personnel, et quel terminal les affiche (la console : un
@@ -126,8 +126,13 @@ fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
         Ok(rsp) => rsp,
         Err(e) => return afficherln!("[noyau] {} : pile initiale impossible : {}", nom, e),
     };
-    let code = tache::executer(nom.0, programme.espace.pml4(), programme.entree, rsp);
-    drop(programme);
+    // Le programme devient le processus en cours, avec un tas vide à la
+    // page qui suit son dernier segment (comme Linux sans ASLR).
+    let tas = programme.fin.next_multiple_of(4096);
+    let (pml4, entree) = (programme.espace.pml4(), programme.entree);
+    processus::installer(processus::Processus { espace: programme.espace, debut_tas: tas, fin_tas: tas });
+    let code = tache::executer(nom.0, pml4, entree, rsp);
+    drop(processus::retirer());
     afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.",
                 nom, code, if pages::libres() == libres { "ok" } else { "ECHEC" });
 }

@@ -11,6 +11,9 @@
 #   make capture -> démarre sans écran, puis enregistre l'écran dans ecran.png
 #   make gdb    -> QEMU figé au démarrage, en attente de GDB sur le port 1234
 #   make dump   -> affiche l'image octet par octet
+#   make trace  -> démarre un noyau qui affiche chaque appel système des
+#                  programmes Linux (comme strace), puis montre ceux de
+#                  bonjour-c sous Linux, sur l'hôte, avec strace, pour comparer
 #   make tests-qemu -> les scénarios dans QEMU : un noyau qui déborde exprès
 #                  de sa pile doit le dire (page de garde, double faute) ;
 #                  un noyau gonflé au-delà de 1 Mio doit être lu en entier
@@ -139,8 +142,8 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 #   - tronque : les 40 premiers octets d'un exécutable.
 # Enfin bonjour-asm, pour montrer que le noyau exécute encore des
 # programmes après tout cela.
-TESTS_LINUX = mmx-ecrit mmx-lit pointeurs ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
-              recursion boucle \
+TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
+              recursion boucle brk-boucle \
               wx derniere-page et-dyn tronque
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
@@ -173,9 +176,9 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de programmes, que le noyau exécute dans l'ordre (voir
 # archive.sh).
-programmes.cpio: archive.sh $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse FORCE
+programmes.cpio: archive.sh $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c FORCE
 	cd bonjour && cargo build --release
-	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse
+	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c
 
 FORCE:
 
@@ -308,6 +311,19 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin
 	  done < tests-attendu-$$cpu.txt; \
 	done
 
+# La trace des appels système : le noyau construit avec la fonctionnalité
+# trace (son propre dossier de compilation), l'archive ordinaire.
+trace: test-trace.bin
+	-timeout 5 qemu-system-x86_64 -display none -no-reboot -drive format=raw,file=test-trace.bin -serial file:trace.log
+	@echo "--- dans notre noyau ---"
+	@sed -n '/bonjour-c : programme/,/bonjour-c : termine/p' trace.log | grep -E '^\[(trace|linux)\]|bonjour-c :'
+	@echo "--- sous Linux, sur l'hote (strace) ---"
+	@strace ./$(LINUX)/bonjour-c 2>&1 >/dev/null | grep -v "^execve"
+
+test-trace.bin: programmes.cpio FORCE
+	cd noyau && cargo build --release --features trace --target-dir target/test-trace 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	$(call image,noyau/target/test-trace/x86_64-unknown-none/release/noyau,programmes.cpio,test-trace)
+
 test-programmes.bin: tests.cpio FORCE
 	cd noyau && cargo build --release --features test-programmes --target-dir target/test-programmes 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	$(call image,noyau/target/test-programmes/x86_64-unknown-none/release/noyau,tests.cpio,test-programmes)
@@ -317,7 +333,7 @@ test-%.bin: programmes.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,programmes.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio serial.log qemu.log ecran.png test-*.log
+	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio serial.log trace.log qemu.log ecran.png test-*.log
 	rm -rf $(LINUX)
 	rm -rf $(SUITE)
 	cd noyau && cargo clean
@@ -325,4 +341,4 @@ clean:
 	cd bonjour && cargo clean
 	cd formats && cargo clean
 
-.PHONY: run texte test debug capture gdb dump tests-hote tests-qemu suite clean FORCE
+.PHONY: run texte test debug capture gdb dump trace tests-hote tests-qemu suite clean FORCE

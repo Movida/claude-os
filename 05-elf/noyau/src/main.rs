@@ -40,6 +40,7 @@ mod pile;
 mod pages;
 mod pic;
 mod port;
+mod processus;
 mod programmes;
 mod serie;
 mod sse;
