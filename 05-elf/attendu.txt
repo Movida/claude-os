@@ -15,6 +15,7 @@ rendu puis redonne : ok.
 [noyau] Allocateur buddy :
 rendues et recollees : ok.
 [noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok.
+memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
         bonjour.wasm                 2943 octets

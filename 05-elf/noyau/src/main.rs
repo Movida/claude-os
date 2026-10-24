@@ -26,6 +26,7 @@ mod clavier;
 mod cpu;
 mod demarrage;
 mod espace;
+mod espace_utilisateur;
 mod gdt;
 mod horloge;
 mod interruptions;
@@ -198,6 +199,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
                 bilan.libres, bilan.libres >> 8, (4096 << pages::ORDRE_MAX) >> 20, bilan.taille_etats >> 10);
     tester_pages();
     tester_tas();
+    tester_espace_utilisateur();
 
     // Le scénario de panne de `make tests-qemu` : déborder exprès de la
     // pile, que la page de garde doit arrêter net.
@@ -267,6 +269,40 @@ fn tester_pages() {
     pages::liberer(c, ordre_c);
     afficherln!("[noyau] Pages allouees : {:#x} (4 Kio), {:#x} (32 Kio), {:#x} ({} Kio) ; rendues et recollees : {}.",
                 a, b, c, taille_c >> 10, if pages::libres() == libres_avant { "ok" } else { "ECHEC" });
+}
+
+/// Vérifie l'espace d'adressage d'un programme : le créer, y projeter une
+/// page, l'écrire par son adresse de programme, la relire par la projection
+/// directe, puis tout détruire. Toutes les pages (la page, les quatre
+/// tables) doivent revenir à l'allocateur, et les adresses interdites être
+/// refusées.
+fn tester_espace_utilisateur() {
+    use espace_utilisateur::{EspaceUtilisateur, Erreur, ADRESSE_MAX, ADRESSE_MIN};
+    const ADRESSE: u64 = 0x40_0000;
+    let libres_avant = pages::libres();
+    let mut e = EspaceUtilisateur::creer().expect("plus de memoire");
+    let cadre = e.projeter_neuve(ADRESSE, pagination::ECRITURE | pagination::non_executable()).expect("plus de memoire");
+    let refus = [
+        e.projeter_neuve(ADRESSE, 0) == Err(Erreur::DejaProjetee),
+        e.projeter_neuve(0, 0) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE_MIN - 4096, 0) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE_MAX, 0) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE + 1, 0) == Err(Erreur::AdresseInterdite),
+        e.traduire(ADRESSE).map(|(c, _)| c) == Some(cadre),
+    ];
+    // SAFETY : l'espace a la moitié haute du noyau (pile, code) ; la page
+    // ADRESSE y est projetée, inscriptible, et à nous. On revient sur la
+    // PML4 du noyau avant de détruire l'espace.
+    let relu = unsafe {
+        pagination::activer(e.pml4());
+        (ADRESSE as *mut u64).write_volatile(0x1234_5678);
+        pagination::activer(pagination::pml4_noyau());
+        (espace::virtuelle(cadre) as *const u64).read_volatile()
+    };
+    drop(e);
+    let ok = relu == 0x1234_5678 && refus.iter().all(|&r| r) && pages::libres() == libres_avant;
+    afficherln!("[noyau] Espace d'un programme : page {:#x} ecrite par son adresse, relue par le cadre {:#x} ; memoire rendue : {}.",
+                ADRESSE, cadre, if ok { "ok" } else { "ECHEC" });
 }
 
 /// Vérifie le tas : des collections de Rust de toutes tailles, et un objet

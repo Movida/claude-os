@@ -34,7 +34,9 @@
 //!     écrire du code par la projection directe puis l'exécuter par
 //!     l'adresse du noyau (l'attaque « ret2dir »).
 //!   - plus rien à l'identique : une adresse basse (un pointeur nul, par
-//!     exemple) fait faute de page. La moitié basse restera aux programmes.
+//!     exemple) fait faute de page. La moitié basse est aux programmes :
+//!     chacun y a ses propres tables (espace_utilisateur.rs), construites
+//!     avec les mêmes fonctions.
 //!
 //! Un rappel du format (voir ../02-mode-long/boot.asm) : quatre niveaux de
 //! tables de 512 entrées de 8 octets (PML4, PDPT, PD, PT), chacune un cadre
@@ -44,12 +46,22 @@
 //! page n'est inscriptible que si TOUTES les entrées traversées le
 //! permettent) : les entrées des tables intermédiaires donnent tout, et
 //! seule l'entrée finale restreint.
+//!
+//! Le bit U/S (« utilisateur ») suit la même règle : un programme (anneau
+//! 3) ne touche une page que si TOUTES les entrées traversées portent ce
+//! bit. On le pose donc à tous les niveaux de la moitié basse, et jamais
+//! dans la moitié haute : même une erreur dans une entrée finale du noyau
+//! ne la rendrait pas visible aux programmes, puisque son entrée de PML4
+//! ne le porte pas.
 
-use crate::{cadres, carte_memoire, espace};
+use crate::{cadres, carte_memoire, espace, pages};
 use core::arch::asm;
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-const PRESENTE: u64 = 1 << 0;
-const ECRITURE: u64 = 1 << 1;
+pub const PRESENTE: u64 = 1 << 0;
+pub const ECRITURE: u64 = 1 << 1;
+/// Accessible à l'anneau 3 (bit U/S).
+pub const UTILISATEUR: u64 = 1 << 2;
 /// Dans une PD : l'entrée désigne une page de 2 Mio, pas une PT.
 const GRANDE: u64 = 1 << 7;
 /// Défense d'exécuter (bit NX). Le processeur ne le reconnaît qu'une fois
@@ -57,9 +69,18 @@ const GRANDE: u64 = 1 << 7;
 /// processeurs 64 bits d'Intel ne l'ont pas : voir `a_le_bit_nx`.
 const NON_EXECUTABLE: u64 = 1 << 63;
 /// Les bits d'une entrée qui donnent l'adresse physique du niveau suivant.
-const ADRESSE: u64 = 0x000F_FFFF_FFFF_F000;
+pub const ADRESSE: u64 = 0x000F_FFFF_FFFF_F000;
 
 const PAGE: u64 = 4096;
+
+/// La première adresse de la moitié haute : les entrées 256 à 511 de la
+/// PML4. Tout ce qui est en dessous est aux programmes.
+pub const MOITIE_HAUTE: u64 = 0xffff_8000_0000_0000;
+
+/// L'adresse physique de la PML4 du noyau, une fois en place.
+static PML4_NOYAU: AtomicU64 = AtomicU64::new(0);
+/// Le bit NX est-il en service (EFER.NXE) ?
+static NX: AtomicBool = AtomicBool::new(false);
 const PAGE_2MIO: u64 = 2 << 20;
 
 /// Une table de pages : 512 entrées, un cadre.
@@ -96,51 +117,117 @@ unsafe fn table(physique: u64) -> &'static mut Table {
     unsafe { &mut *(espace::virtuelle(physique) as *mut Table) }
 }
 
-/// Un cadre pour une nouvelle table, mis à zéro (512 entrées absentes).
-fn nouvelle_table() -> u64 {
-    let cadre = cadres::allouer().expect("plus de memoire pour les tables de pages");
-    // L'allocateur donne d'abord les cadres les plus bas, juste après le
-    // noyau : bien sous la limite. Si ce n'était pas le cas, on ne pourrait
-    // pas l'écrire : mieux vaut le dire que fauter plus loin.
-    assert!(cadre < LIMITE_DEMARRAGE, "table de pages au-dela du 1er Gio : {cadre:#x}");
-    // SAFETY : le cadre vient d'être alloué, et il est sous la limite
-    // projetée par les tables de démarrage.
+/// Un cadre pour une nouvelle table, mis à zéro (512 entrées absentes), ou
+/// None s'il n'y a plus de mémoire.
+///
+/// Avant que l'allocateur de pages existe, les tables viennent de
+/// l'allocateur de démarrage ; ensuite, de l'allocateur de pages. Comme
+/// alloc_low_pages dans Linux, qui passe de memblock au buddy une fois
+/// celui-ci prêt (after_bootmem).
+fn nouvelle_table() -> Option<u64> {
+    let cadre = if cadres::est_cede() {
+        pages::allouer(0)?
+    } else {
+        let cadre = cadres::allouer()?;
+        // Tant que les tables de démarrage sont en place, seul le premier
+        // Gio est projeté. L'allocateur donne d'abord les cadres les plus
+        // bas, juste après le noyau : bien sous la limite. Si ce n'était pas
+        // le cas, on ne pourrait pas l'écrire : mieux vaut le dire que
+        // fauter plus loin.
+        assert!(cadre < LIMITE_DEMARRAGE, "table de pages au-dela du 1er Gio : {cadre:#x}");
+        cadre
+    };
+    // SAFETY : le cadre vient d'être alloué, et la projection directe le
+    // couvre (voir plus haut).
     let t = unsafe { table(cadre) };
     t.fill(0);
-    cadre
+    Some(cadre)
 }
 
 /// L'entrée `index` de la table `parent` désigne la table du niveau
-/// suivant : on la crée si elle est absente, et on rend son adresse.
-fn suivante(parent: u64, index: usize) -> u64 {
+/// suivant : on la crée si elle est absente (avec les droits `droits` en
+/// plus de « présente, inscriptible »), et on rend son adresse. None : plus
+/// de mémoire pour une nouvelle table.
+fn suivante(parent: u64, index: usize, droits: u64) -> Option<u64> {
     // SAFETY : `parent` est une de nos tables, créée par nouvelle_table.
     let entree = &mut unsafe { table(parent) }[index];
     if *entree & PRESENTE == 0 {
-        *entree = nouvelle_table() | PRESENTE | ECRITURE;
+        *entree = nouvelle_table()? | PRESENTE | ECRITURE | droits;
     }
     assert!(*entree & GRANDE == 0, "une grande page est deja projetee ici");
-    *entree & ADRESSE
+    Some(*entree & ADRESSE)
 }
 
-fn index(virtuelle: u64, niveau: u32) -> usize {
+pub fn index(virtuelle: u64, niveau: u32) -> usize {
     (virtuelle >> (12 + 9 * niveau) & 511) as usize
 }
 
-/// Projette la page de 4 Kio `virtuelle` sur le cadre `physique`.
-fn projeter(pml4: u64, virtuelle: u64, physique: u64, droits: u64) {
-    let pdpt = suivante(pml4, index(virtuelle, 3));
-    let pd = suivante(pdpt, index(virtuelle, 2));
-    let pt = suivante(pd, index(virtuelle, 1));
+/// L'entrée finale (dans une PT) de la page de 4 Kio `virtuelle`, en créant
+/// les tables intermédiaires qui manquent. Dans la moitié basse, elles
+/// reçoivent le bit UTILISATEUR. None : plus de mémoire pour une table.
+pub fn entree(pml4: u64, virtuelle: u64) -> Option<&'static mut u64> {
+    let u = if virtuelle < MOITIE_HAUTE { UTILISATEUR } else { 0 };
+    let pdpt = suivante(pml4, index(virtuelle, 3), u)?;
+    let pd = suivante(pdpt, index(virtuelle, 2), u)?;
+    let pt = suivante(pd, index(virtuelle, 1), u)?;
     // SAFETY : `pt` est une de nos tables.
-    let pt = unsafe { table(pt) };
-    pt[index(virtuelle, 0)] = physique | PRESENTE | droits;
+    Some(&mut unsafe { table(pt) }[index(virtuelle, 0)])
+}
+
+/// Projette la page de 4 Kio `virtuelle` sur le cadre `physique`. Dans la
+/// moitié basse, la page reçoit aussi le bit UTILISATEUR.
+pub fn projeter(pml4: u64, virtuelle: u64, physique: u64, droits: u64) -> Option<()> {
+    let u = if virtuelle < MOITIE_HAUTE { UTILISATEUR } else { 0 };
+    *entree(pml4, virtuelle)? = physique | PRESENTE | droits | u;
+    Some(())
+}
+
+/// Les droits « non exécutable » : le bit NX s'il est en service, rien
+/// sinon (sans lui, une page présente est toujours exécutable).
+pub fn non_executable() -> u64 {
+    if NX.load(Ordering::Relaxed) { NON_EXECUTABLE } else { 0 }
+}
+
+/// L'adresse physique de la PML4 du noyau.
+pub fn pml4_noyau() -> u64 {
+    PML4_NOYAU.load(Ordering::Relaxed)
+}
+
+/// La table de pages d'adresse physique `physique`, en lecture seule
+/// (pour la parcourir sans la modifier).
+///
+/// # Safety
+/// Comme `table` : une de nos tables, projetée.
+pub unsafe fn lire_table(physique: u64) -> &'static Table {
+    // SAFETY : garanti par l'appelant.
+    unsafe { table(physique) }
+}
+
+/// Fait de `pml4` l'espace d'adressage courant (CR3). Écrire CR3 vide
+/// aussi le cache des traductions (TLB) de tout ce qui n'est pas global :
+/// rien de l'espace précédent ne sert plus.
+///
+/// # Safety
+/// `pml4` doit être une PML4 complète, dont la moitié haute est celle du
+/// noyau (sinon, l'instruction suivante est introuvable).
+pub unsafe fn activer(pml4: u64) {
+    // SAFETY : garanti par l'appelant.
+    unsafe { asm!("mov cr3, {}", in(reg) pml4, options(nostack)) };
+}
+
+/// La PML4 courante (CR3, sans ses bits de contrôle).
+pub fn courante() -> u64 {
+    let cr3: u64;
+    // SAFETY : lecture d'un registre de contrôle, sans effet.
+    unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)) };
+    cr3 & ADRESSE
 }
 
 /// Projette la page de 2 Mio `virtuelle` sur `physique` (tous deux alignés
-/// sur 2 Mio).
+/// sur 2 Mio), dans la moitié haute (le noyau seul s'en sert).
 fn projeter_2mio(pml4: u64, virtuelle: u64, physique: u64, droits: u64) {
-    let pdpt = suivante(pml4, index(virtuelle, 3));
-    let pd = suivante(pdpt, index(virtuelle, 2));
+    let pdpt = suivante(pml4, index(virtuelle, 3), 0).expect(PLUS_DE_TABLES);
+    let pd = suivante(pdpt, index(virtuelle, 2), 0).expect(PLUS_DE_TABLES);
     // SAFETY : `pd` est une de nos tables.
     let pd = unsafe { table(pd) };
     pd[index(virtuelle, 1)] = physique | PRESENTE | GRANDE | droits;
@@ -200,12 +287,16 @@ fn projeter_etendue(pml4: u64, debut: u64, fin: u64, droits_2mio: u64, droits: i
             projeter_2mio(pml4, espace::virtuelle(p), p, droits_2mio);
             p += PAGE_2MIO;
         } else {
-            projeter(pml4, espace::virtuelle(p), p, droits(p));
+            projeter(pml4, espace::virtuelle(p), p, droits(p)).expect(PLUS_DE_TABLES);
             p += PAGE;
         }
     }
     fin - debut
 }
+
+/// Au démarrage, sans mémoire pour les tables du noyau, rien ne peut
+/// marcher : on s'arrête (les programmes, eux, reçoivent une erreur).
+const PLUS_DE_TABLES: &str = "plus de memoire pour les tables de pages";
 
 /// Construit les tables définitives et s'en sert.
 pub fn initialiser() -> Bilan {
@@ -215,8 +306,9 @@ pub fn initialiser() -> Bilan {
     let donnees = &raw const __donnees_debut as u64;
     let fin = &raw const __bss_fin as u64;
     let fin = fin.next_multiple_of(PAGE);
-    let pml4 = nouvelle_table();
+    let pml4 = nouvelle_table().expect(PLUS_DE_TABLES);
     let nx = a_le_bit_nx();
+    NX.store(nx, Ordering::Relaxed);
     let non_executable = if nx { NON_EXECUTABLE } else { 0 };
 
     // 1. L'image du noyau, sauf les pages de garde (sous la pile du noyau
@@ -235,7 +327,7 @@ pub fn initialiser() -> Bilan {
         } else {
             ECRITURE | non_executable
         };
-        projeter(pml4, v, espace::physique_du_noyau(v), droits);
+        projeter(pml4, v, espace::physique_du_noyau(v), droits).expect(PLUS_DE_TABLES);
     }
 
     // 2. La projection directe : le premier Mio, puis chaque étendue libre
@@ -290,5 +382,6 @@ pub fn initialiser() -> Bilan {
             options(nostack),
         );
     }
+    PML4_NOYAU.store(pml4, Ordering::Relaxed);
     Bilan { nx, pages_noyau: (fin - texte) / PAGE - gardes, projection_directe: projetes }
 }

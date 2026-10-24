@@ -239,6 +239,11 @@ pub fn libres() -> usize {
     CADRES.verrouiller().libres
 }
 
+/// L'allocateur a-t-il déjà cédé ses cadres à l'allocateur de pages ?
+pub fn est_cede() -> bool {
+    CADRES.verrouiller().cede
+}
+
 /// Le nombre de cadres de la mémoire, libres ou non.
 pub fn nombre() -> usize {
     CADRES.verrouiller().nombre
