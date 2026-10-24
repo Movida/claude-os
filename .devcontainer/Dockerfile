@@ -1,5 +1,8 @@
 # Environnement de développement de l'OS : assembleur, émulateur, débogueur,
-# et Rust pour le noyau.
+# et Rust pour le noyau. Depuis l'étape 5 : un compilateur C et la glibc
+# statique (libc.a, dans libc6-dev), pour compiler les programmes Linux de
+# test (`gcc -static`), et strace, pour comparer leurs appels système à ce
+# que voit notre noyau.
 FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
@@ -12,6 +15,9 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
         xxd \
         curl \
         ca-certificates \
+        gcc \
+        libc6-dev \
+        strace \
     && rm -rf /var/lib/apt/lists/*
 
 # rustup, pour l'utilisateur du conteneur, sans version de Rust : la version
