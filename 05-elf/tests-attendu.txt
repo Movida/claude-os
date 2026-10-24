@@ -1,3 +1,6 @@
+[linux] mmx-ecrit : mm0, mm7 et xmm0 remplis, arrondi x87 change.
+[linux] mmx-lit : registres x87, MMX et SSE a l'etat initial : ok.
+[noyau] mmx-lit : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] write(adresse du noyau) : -EFAULT, on continue.
 [linux] write(adresse non projetee) : -EFAULT, on continue.
 [linux] write(plage qui franchit la limite) : -EFAULT, on continue.

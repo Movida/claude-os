@@ -71,8 +71,9 @@ basculer:
        64 bits, un programme n'en a pas besoin) ; les bases de FS et de GS
        à 0 (MSR FS_BASE, GS_BASE et KERNEL_GS_BASE), pour qu'un programme
        ne trouve rien d'un précédent : il fixera sa base de FS lui-même
-       (arch_prctl). Puis le retour d'interruption : iretq vers le cadre
-       préparé par executer(). */
+       (arch_prctl). Le x87 et SSE à leur état initial, tous registres de
+       données à zéro (voir sse.rs). Puis le retour d'interruption : iretq vers le cadre préparé
+       par executer(). */
     .global premier_depart
 premier_depart:
     xor eax, eax
@@ -87,7 +88,22 @@ premier_depart:
     wrmsr
     mov ecx, 0xC0000102
     wrmsr
+    fxrstor [rip + etat_fpu_initial]
     jmp retour_interruption
+
+    /* L'état x87 et SSE d'un programme qui démarre, au format de fxsave
+       (512 octets, alignés sur 16) : mot de contrôle x87 0x037F (toutes
+       les exceptions masquées, double précision étendue, arrondi au plus
+       près : l'état de `fninit`), MXCSR 0x1F80 (la valeur de l'ABI), et
+       tout le reste à zéro : registres ST0-ST7 (alias MM0-MM7), XMM0-XMM15,
+       mot d'état, étiquettes. */
+    .section .rodata
+    .balign 16
+etat_fpu_initial:
+    .word 0x037F
+    .skip 22
+    .long 0x1F80
+    .skip 512 - 28
     "#
 );
 

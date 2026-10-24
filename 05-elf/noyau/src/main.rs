@@ -42,6 +42,7 @@ mod pic;
 mod port;
 mod programmes;
 mod serie;
+mod sse;
 mod tache;
 mod tas;
 mod verrou;
@@ -205,6 +206,8 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     afficherln!("[noyau] Protections contre les programmes : SMEP {}, SMAP {}, UMIP {}.",
                 oui_non(p.smep), oui_non(p.smap), oui_non(p.umip));
     afficherln!("[noyau] Alea des programmes (AT_RANDOM) : {}.", aleatoire::source());
+    sse::initialiser();
+    afficherln!("[noyau] SSE pour les programmes : FXSR, sans XSAVE (pas d'AVX).");
 
     // L'allocateur de démarrage cède la mémoire à l'allocateur de pages.
     let bilan = pages::initialiser();

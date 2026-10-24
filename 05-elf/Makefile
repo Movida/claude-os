@@ -73,6 +73,7 @@ boot.bin: programmes.cpio FORCE
 # Ils tournent aussi tels quels sous Linux, sur la machine hôte.
 #   - bonjour-asm : nasm puis ld, sans bibliothèque C ;
 #   - pile : nasm puis ld, affiche ce qu'il trouve sur sa pile initiale ;
+#   - sse : nasm puis ld, un calcul en SSE2 ;
 #   - bonjour-c : gcc -static, avec la glibc de la machine (libc.a, du
 #     paquet libc6-dev). -O2 et les avertissements, comme un programme
 #     ordinaire.
@@ -100,6 +101,13 @@ $(LINUX)/pile.o: linux/pile.asm
 $(LINUX)/pile: $(LINUX)/pile.o
 	ld -o $@ $<
 
+$(LINUX)/sse.o: linux/sse.asm
+	mkdir -p $(LINUX)
+	nasm -f elf64 $< -o $@
+
+$(LINUX)/sse: $(LINUX)/sse.o
+	ld -o $@ $<
+
 $(LINUX)/bonjour-asm-wx: $(LINUX)/bonjour-asm.o
 	ld -N -o $@ $< 2>/dev/null
 
@@ -120,7 +128,9 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 	gcc $(CFLAGS_LINUX) $< -o $@
 
 # Les programmes de test de `make tests-qemu` (linux/tests/) : chacun fait
-# une faute que le noyau doit arrêter, ou essaie de mauvais appels système ;
+# une faute que le noyau doit arrêter, ou essaie de mauvais appels système
+# (mmx-ecrit puis mmx-lit : un programme ne doit rien trouver, dans les
+# registres x87, MMX et SSE, de ce qu'y a laissé le précédent) ;
 # puis des exécutables que le noyau doit refuser :
 #   - wx : un segment W+X (ld -N) ;
 #   - derniere-page : des segments dans les dernières pages de la moitié
@@ -129,7 +139,8 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 #   - tronque : les 40 premiers octets d'un exécutable.
 # Enfin bonjour-asm, pour montrer que le noyau exécute encore des
 # programmes après tout cela.
-TESTS_LINUX = pointeurs ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt recursion boucle \
+TESTS_LINUX = mmx-ecrit mmx-lit pointeurs ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
+              recursion boucle \
               wx derniere-page et-dyn tronque
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
@@ -162,9 +173,9 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de programmes, que le noyau exécute dans l'ordre (voir
 # archive.sh).
-programmes.cpio: archive.sh $(LINUX)/bonjour-asm $(LINUX)/pile FORCE
+programmes.cpio: archive.sh $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse FORCE
 	cd bonjour && cargo build --release
-	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm $(LINUX)/pile
+	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse
 
 FORCE:
 
