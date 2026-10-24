@@ -283,14 +283,34 @@ impl Memoire {
 
     /// Donne les droits `droits` à [debut, fin[ (alignés, non vide) :
     /// mprotect. Toute la plage doit être dans des zones, sinon rien ne
-    /// change (Linux rend alors ENOMEM).
+    /// change (Linux rend alors ENOMEM). Une zone privée qui devient
+    /// inscriptible, sans MAP_NORESERVE, est promise comme par mmap : refusée
+    /// si elle est à elle seule plus grande que toute la mémoire (Linux la
+    /// marque alors VM_ACCOUNT, et ne la recompte plus ; sans ce drapeau, on
+    /// recompte une zone rendue inscriptible deux fois, ce qui ne change
+    /// rien tant qu'elle n'a pas, entre-temps, fusionné avec d'autres au-delà
+    /// de la taille de la mémoire).
     pub fn proteger(&mut self, debut: u64, fin: u64, droits: Droits) -> Result<(), Erreur> {
         if !self.zones.couverte(debut, fin) {
             return Err(Erreur::NonProjetee);
         }
+        let promise = |z: Zone| !droits.ecriture || z.droits.ecriture || z.drapeaux.sans_reserve || engagement_possible(z.taille());
+        if !self.zones.morceaux(debut, fin).all(promise) {
+            return Err(Erreur::PlusDeMemoire);
+        }
         self.zones.changer(debut, fin, |z| z.droits = droits)?;
         self.espace.proteger_plage(debut, fin, droits);
         Ok(())
+    }
+
+    /// Retire les pages de [debut, fin[ sans toucher aux zones
+    /// (MADV_DONTNEED) : elles se reliront à zéro. Les tables restent, la
+    /// zone aussi. Sans effet sur les segments du programme (voir madvise,
+    /// dans linux.rs).
+    pub fn oublier(&mut self, debut: u64, fin: u64) {
+        for z in self.zones.morceaux(debut, fin).filter(|z| z.nature != Nature::Programme) {
+            self.espace.retirer_plage(z.debut, z.fin, false);
+        }
     }
 
     /// La zone qui contient `adresse`, pour un message.

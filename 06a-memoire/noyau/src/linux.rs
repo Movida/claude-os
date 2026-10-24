@@ -14,7 +14,7 @@
 //! ("/proc/self/exe"), getrandom, brk, mprotect (RELRO), fstat(1), write,
 //! exit_group. Plus writev (les messages d'erreur fatale de la glibc),
 //! ioctl(TCGETS) (isatty), et exit ; et, pour la mémoire de `claude`
-//! (6a), mmap et munmap (de la mémoire anonyme), sysinfo.
+//! (6a), mmap, munmap et madvise (de la mémoire anonyme), sysinfo.
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -51,6 +51,7 @@ const FSTAT: u64 = 5;
 const MMAP: u64 = 9;
 const MPROTECT: u64 = 10;
 const MUNMAP: u64 = 11;
+const MADVISE: u64 = 28;
 const BRK: u64 = 12;
 const IOCTL: u64 = 16;
 const WRITEV: u64 = 20;
@@ -89,6 +90,7 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         MMAP => mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
         MUNMAP => munmap(a[0], a[1]),
         MPROTECT => mprotect(a[0], a[1], a[2]),
+        MADVISE => madvise(a[0], a[1], a[2]),
         ARCH_PRCTL => arch_prctl(a[0], a[1]),
         // L'adresse où effacer le numéro du fil quand il se termine (pour
         // pthread_join) : sans fils, rien à faire ; on rend le numéro du fil.
@@ -139,6 +141,7 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         MMAP => ("mmap", 6),
         MUNMAP => ("munmap", 2),
         MPROTECT => ("mprotect", 3),
+        MADVISE => ("madvise", 3),
         ARCH_PRCTL => ("arch_prctl", 2),
         SET_TID_ADDRESS => ("set_tid_address", 1),
         SET_ROBUST_LIST => ("set_robust_list", 2),
@@ -426,10 +429,14 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, _fichier: u64, de
 /// MADV_POPULATE_*. Une page à la fois, en rendant le verrou du processus
 /// entre deux : mettre en place des Mio, interruptions coupées, ferait
 /// perdre ses tics à l'horloge. S'arrête au premier échec, et dit lequel.
+/// Seulement dans des zones : peupler n'étend pas la pile.
 fn peupler(debut: u64, fin: u64, ecriture: bool) -> Result<(), Echec> {
     let acces = if ecriture { Acces::Ecriture } else { Acces::Lecture };
     for page in (debut..fin).step_by(PAGE as usize) {
-        processus::avec(|p| p.memoire.servir(page, acces))?;
+        processus::avec(|p| {
+            p.memoire.zones.trouver(page).ok_or(Echec::SansZone)?;
+            p.memoire.servir(page, acces)
+        })?;
     }
     Ok(())
 }
@@ -462,31 +469,183 @@ fn munmap(adresse: u64, longueur: u64) -> i64 {
 /// zones (memoire.rs), et ceux des pages qui y sont projetées. La glibc
 /// statique s'en sert pour remettre en lecture seule, une fois ses
 /// adresses corrigées, ses tables sensibles (RELRO : la GOT,
-/// .init_array...). W+X est permis, comme sous Linux (voir
-/// EspaceUtilisateur::proteger_plage).
-fn mprotect(adresse: u64, longueur: u64, droits: u64) -> i64 {
+/// .init_array...) ; JavaScriptCore, pour ouvrir et fermer sa mémoire
+/// réservée, et ses pages de code compilé. W+X est permis, comme sous
+/// Linux (voir EspaceUtilisateur::proteger_plage).
+///
+/// Les vérifications et les codes d'erreur de Linux, dans son ordre
+/// (do_mprotect_pkey, vérifiés par linux/memoire.c) : PROT_GROWSDOWN et
+/// PROT_GROWSUP ensemble, ou une adresse non alignée : EINVAL ; une
+/// longueur nulle : 0, quels que soient les droits ; une plage qui
+/// déborde : ENOMEM ; un droit inconnu : EINVAL. Puis :
+///   - PROT_GROWSDOWN : le changement part du début de la première zone de
+///     la plage, qui doit grandir vers le bas (la pile), sinon EINVAL ;
+///   - PROT_GROWSUP : aucune zone ne grandit vers le haut sur x86 :
+///     EINVAL ;
+///   - un trou dans la plage : ENOMEM, et rien ne change. (Linux change
+///     les zones d'avant le trou, puis rend ENOMEM ; POSIX ne dit rien de
+///     l'état après une erreur, aucun programme ne compte sur l'état
+///     partiel, et tout ou rien est plus simple à garantir) ;
+///   - rendre inscriptible une zone privée qui ne l'était pas, sans
+///     MAP_NORESERVE, et plus grande que toute la mémoire : ENOMEM (le
+///     surengagement, comme pour mmap).
+fn mprotect(adresse: u64, longueur: u64, prot: u64) -> i64 {
     // Sans effet sur x86 : Linux l'accepte et l'ignore.
     const PROT_SEM: u64 = 8;
-    // PROT_GROWSDOWN et PROT_GROWSUP (étendre le changement jusqu'au bout
-    // d'une pile qui grandit) : refusés, comme Linux pour une zone qui ne
-    // grandit pas, et aucune ne grandit ici.
-    if adresse % PAGE != 0 || droits & !(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM) != 0 {
+    const PROT_GROWSDOWN: u64 = 0x0100_0000;
+    const PROT_GROWSUP: u64 = 0x0200_0000;
+    let grandit = prot & (PROT_GROWSDOWN | PROT_GROWSUP);
+    let prot = prot & !grandit;
+    if grandit == PROT_GROWSDOWN | PROT_GROWSUP || adresse % PAGE != 0 {
         return -EINVAL;
     }
-    // Rien à changer : succès, quelle que soit l'adresse (Linux fait ce
-    // test avant tous les autres sur la plage).
     if longueur == 0 {
         return 0;
     }
     let Some(fin) = longueur.checked_next_multiple_of(PAGE).and_then(|l| adresse.checked_add(l)) else {
         return -ENOMEM;
     };
+    if prot & !(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM) != 0 {
+        return -EINVAL;
+    }
     if fin > ADRESSE_MAX {
         return -ENOMEM;
     }
-    match processus::avec(|p| p.memoire.proteger(adresse, fin, droits_de(droits))) {
+    processus::avec(|p| {
+        let m = &mut p.memoire;
+        // La première zone de la plage.
+        let Some(&premiere) = m.zones.suivante(adresse).filter(|z| z.debut < fin) else {
+            return -ENOMEM;
+        };
+        let debut = match grandit {
+            PROT_GROWSDOWN if !premiere.drapeaux.vers_le_bas => return -EINVAL,
+            PROT_GROWSDOWN => premiere.debut,
+            _ if premiere.debut > adresse => return -ENOMEM,
+            PROT_GROWSUP => return -EINVAL,
+            _ => adresse,
+        };
+        match m.proteger(debut, fin, droits_de(prot)) {
+            Ok(()) => 0,
+            Err(_) => -ENOMEM,
+        }
+    })
+}
+
+/// madvise(adresse, longueur, conseil) : ce que le programme dit de sa
+/// mémoire. JavaScriptCore en fait des centaines au démarrage de `claude`
+/// (MADV_DONTNEED surtout : il rend des pages, et les reprendra). Les
+/// vérifications de Linux, dans son ordre (do_madvise, vérifiées par
+/// linux/memoire.c) : conseil inconnu, adresse non alignée, plage qui
+/// déborde : EINVAL ; longueur nulle : 0. Puis le conseil s'applique à
+/// chaque partie projetée de la plage, et s'il y a des trous, l'appel rend
+/// ENOMEM à la fin (après avoir traité le reste).
+///
+/// Les conseils :
+///   - MADV_DONTNEED, MADV_DONTNEED_LOCKED : les pages sont retirées, et
+///     se reliront à zéro, SAUF dans une zone de segment du programme (les
+///     pages qui contiennent une part du fichier ; celles du .bss au-delà
+///     sont une zone anonyme, chargeur_elf.rs) : sous Linux, ces pages sont
+///     celles du fichier, projeté en privé, et le programme relirait le
+///     FICHIER. Les nôtres sont des copies sans fichier derrière : y mettre
+///     des zéros casserait en silence Bun, qui rend ainsi 54 Mo de sa propre
+///     section `.bun` (la trace de `claude --version`). Sans effet donc, en
+///     6a ; le vrai comportement avec le cache des fichiers (6b) ;
+///   - MADV_FREE : de même (il permet de garder le contenu ou de le
+///     perdre), mais seulement sur de la mémoire anonyme : EINVAL sur un
+///     segment du programme, comme Linux, avant de rien changer ;
+///   - MADV_WILLNEED, NORMAL, RANDOM, SEQUENTIAL, COLD, PAGEOUT, DONTDUMP,
+///     DODUMP : des indications pour la mémoire d'échange, la lecture
+///     anticipée ou les fichiers « core », que nous n'avons pas : acceptés,
+///     sans effet. HUGEPAGE et NOHUGEPAGE aussi : comme un Linux dont les
+///     grandes pages transparentes sont réglées sur « never » ;
+///   - MADV_POPULATE_READ, MADV_POPULATE_WRITE : les fautes servies
+///     d'avance. Une zone qui ne permet pas l'accès : EINVAL ; plus de
+///     mémoire : ENOMEM ;
+///   - MADV_DONTFORK, DOFORK, WIPEONFORK, KEEPONFORK : des drapeaux de
+///     zone, pour le futur fork (6k) ; ils coupent les zones, comme
+///     mprotect. WIPEONFORK n'a de sens que pour la mémoire anonyme :
+///     EINVAL sur un segment du programme ;
+///   - MADV_MERGEABLE, UNMERGEABLE : EINVAL, comme un Linux sans KSM (la
+///     fusion des pages identiques) ;
+///   - MADV_HWPOISON, SOFT_OFFLINE (simuler une panne de mémoire) : EPERM,
+///     réservés à root ;
+///   - les autres (MADV_REMOVE, COLLAPSE, GUARD_INSTALL...) : EINVAL.
+fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
+    const NORMAL: u64 = 0;
+    const RANDOM: u64 = 1;
+    const SEQUENTIAL: u64 = 2;
+    const WILLNEED: u64 = 3;
+    const DONTNEED: u64 = 4;
+    const FREE: u64 = 8;
+    const DONTFORK: u64 = 10;
+    const DOFORK: u64 = 11;
+    const HUGEPAGE: u64 = 14;
+    const NOHUGEPAGE: u64 = 15;
+    const DONTDUMP: u64 = 16;
+    const DODUMP: u64 = 17;
+    const WIPEONFORK: u64 = 18;
+    const KEEPONFORK: u64 = 19;
+    const COLD: u64 = 20;
+    const PAGEOUT: u64 = 21;
+    const POPULATE_READ: u64 = 22;
+    const POPULATE_WRITE: u64 = 23;
+    const DONTNEED_LOCKED: u64 = 24;
+    const HWPOISON: u64 = 100;
+    const SOFT_OFFLINE: u64 = 101;
+    let connu = matches!(conseil,
+        NORMAL | RANDOM | SEQUENTIAL | WILLNEED | DONTNEED | FREE | DONTFORK | DOFORK | HUGEPAGE | NOHUGEPAGE
+        | DONTDUMP | DODUMP | WIPEONFORK | KEEPONFORK | COLD | PAGEOUT | POPULATE_READ | POPULATE_WRITE
+        | DONTNEED_LOCKED | HWPOISON | SOFT_OFFLINE);
+    if !connu || adresse % PAGE != 0 {
+        return -EINVAL;
+    }
+    let Some(fin) = longueur.checked_next_multiple_of(PAGE).and_then(|l| adresse.checked_add(l)) else {
+        return -EINVAL;
+    };
+    if fin == adresse {
+        return 0;
+    }
+    if matches!(conseil, HWPOISON | SOFT_OFFLINE) {
+        return -EPERM;
+    }
+    // Au-delà des adresses des programmes, il n'y a aucune zone.
+    let (debut, fin_zones) = (adresse.min(ADRESSE_MAX), fin.min(ADRESSE_MAX));
+    let couverte = fin <= ADRESSE_MAX && processus::avec(|p| p.memoire.zones.couverte(debut, fin_zones));
+    let resultat = match conseil {
+        DONTNEED | FREE | DONTNEED_LOCKED => processus::avec(|p| {
+            let m = &mut p.memoire;
+            if conseil == FREE && m.zones.morceaux(debut, fin_zones).any(|z| z.nature == Nature::Programme) {
+                return Err(-EINVAL);
+            }
+            m.oublier(debut, fin_zones);
+            Ok(())
+        }),
+        POPULATE_READ | POPULATE_WRITE => match peupler(debut, fin_zones, conseil == POPULATE_WRITE) {
+            Err(Echec::AccesInterdit) => Err(-EINVAL),
+            Err(_) => Err(-ENOMEM),
+            Ok(()) => Ok(()),
+        },
+        DONTFORK | DOFORK | WIPEONFORK | KEEPONFORK => processus::avec(|p| {
+            let m = &mut p.memoire;
+            if conseil == WIPEONFORK && m.zones.morceaux(debut, fin_zones).any(|z| z.nature == Nature::Programme) {
+                return Err(-EINVAL);
+            }
+            m.zones
+                .changer(debut, fin_zones, |z| match conseil {
+                    DONTFORK => z.drapeaux.ne_pas_dupliquer = true,
+                    DOFORK => z.drapeaux.ne_pas_dupliquer = false,
+                    WIPEONFORK => z.drapeaux.effacer_au_fork = true,
+                    _ => z.drapeaux.effacer_au_fork = false,
+                })
+                .map_err(|_| -ENOMEM)
+        }),
+        // Les indications sans effet.
+        _ => Ok(()),
+    };
+    match resultat {
+        Err(erreur) => erreur,
+        Ok(()) if !couverte => -ENOMEM,
         Ok(()) => 0,
-        Err(_) => -ENOMEM,
     }
 }
 

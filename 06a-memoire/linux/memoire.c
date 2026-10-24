@@ -19,7 +19,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/random.h>
 #include <sys/sysinfo.h>
+#include <unistd.h>
 
 static int echecs;
 
@@ -177,7 +179,144 @@ static void populate(void)
     verifier(ok && munmap(p, 16 * PAGE) == 0, "MAP_POPULATE : 16 pages en place, a zero");
 }
 
-/* sysinfo : de quoi se dimensionner. */
+/* Le noyau peut-il écrire dans cette page ? getrandom y écrit 1 octet :
+ * une page en lecture seule, ou sans aucun droit, lui fait rendre EFAULT
+ * (sous Linux comme chez nous). C'est la façon de vérifier des droits sans
+ * faire de faute dans le programme lui-même. */
+static int inscriptible(char *page)
+{
+    return getrandom(page, 1, 0) == 1;
+}
+
+/* mprotect coupe une zone en trois, puis la rend à ses droits : le
+ * milieu en lecture seule refuse d'être écrit (EFAULT), les bouts non. */
+static void protections(void)
+{
+    char *p = anonyme(NULL, 3 * PAGE, 0);
+    int ok = mprotect(p + PAGE, PAGE, PROT_READ) == 0;
+    ok = ok && inscriptible(p) && !inscriptible(p + PAGE) && inscriptible(p + 2 * PAGE);
+    ok = ok && mprotect(p + PAGE, PAGE, PROT_READ | PROT_WRITE) == 0 && inscriptible(p + PAGE);
+    verifier(ok, "mprotect coupe une zone en trois, puis la rend a ses droits");
+    /* Une page de garde, sans aucun droit : ni lue, ni écrite. */
+    ok = mprotect(p + 2 * PAGE, PAGE, PROT_NONE) == 0 && !inscriptible(p + 2 * PAGE);
+    ok = ok && erreur_de(write(1, p + 2 * PAGE, 1)) == EFAULT;
+    verifier(ok, "page de garde (PROT_NONE) : ni lue, ni ecrite");
+    munmap(p, 3 * PAGE);
+}
+
+/* W+X, comme le compilateur à la volée de JavaScriptCore : du code écrit
+ * puis exécuté dans la même page (mov eax, 42 ; ret). */
+static void jit(void)
+{
+    int erreur;
+    unsigned char *p = (unsigned char *)projeter(NULL, PAGE, PROT_READ | PROT_WRITE | PROT_EXEC,
+                                                 MAP_PRIVATE | MAP_ANONYMOUS, &erreur);
+    int ok = p != MAP_FAILED;
+    if (ok) {
+        static const unsigned char code[] = { 0xb8, 42, 0, 0, 0, 0xc3 };
+        memcpy(p, code, sizeof code);
+        int (*fonction)(void) = (int (*)(void))p;
+        ok = fonction() == 42;
+        munmap(p, PAGE);
+    }
+    verifier(ok, "mmap W+X : code ecrit puis execute (JIT)");
+}
+
+/* Une zone en lecture seule, lue (la page de zéros y est en place), puis
+ * rendue inscriptible : la première écriture doit passer par la copie, et
+ * la page de zéros rester nulle pour les autres. */
+static void ecriture_apres_lecture(void)
+{
+    int erreur;
+    char *p = projeter(NULL, 2 * PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, &erreur);
+    int ok = p != MAP_FAILED && p[0] == 0 && p[PAGE] == 0;
+    ok = ok && mprotect(p, PAGE, PROT_READ | PROT_WRITE) == 0;
+    if (ok) {
+        p[0] = 'x';
+        ok = p[0] == 'x' && p[PAGE] == 0;
+    }
+    char *q = projeter(NULL, PAGE, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, &erreur);
+    ok = ok && q != MAP_FAILED && q[0] == 0;
+    verifier(ok, "lecture, mprotect en ecriture, ecriture : copie, la page de zeros reste nulle");
+    munmap(p, 2 * PAGE);
+    munmap(q, PAGE);
+}
+
+/* MADV_DONTNEED : les pages se relisent à zéro. Sur une plage avec un
+ * trou, le reste est traité, puis ENOMEM. */
+static void dontneed(void)
+{
+    char *p = anonyme(NULL, 3 * PAGE, 0);
+    memset(p, 7, 3 * PAGE);
+    int ok = madvise(p, PAGE, MADV_DONTNEED) == 0 && p[0] == 0 && p[PAGE] == 7;
+    verifier(ok, "MADV_DONTNEED : la page se relit a zero");
+    p[0] = 7;
+    munmap(p + PAGE, PAGE);
+    ok = erreur_de(madvise(p, 3 * PAGE, MADV_DONTNEED)) == ENOMEM && p[0] == 0 && p[2 * PAGE] == 0;
+    verifier(ok, "MADV_DONTNEED avec un trou : le reste traite, puis ENOMEM");
+    munmap(p, 3 * PAGE);
+}
+
+/* Le .bss, au-delà de ce qui vient du fichier : de la mémoire anonyme.
+ * MADV_DONTNEED l'y remet à zéro ; MADV_FREE y est permis. Les données
+ * initialisées, elles, viennent du fichier : MADV_FREE y est refusé
+ * (EINVAL). */
+static char bss[4 * PAGE] __attribute__((aligned(4096)));
+static char donnees[2 * PAGE] __attribute__((aligned(4096))) = { 1 };
+
+static void programme(void)
+{
+    bss[PAGE] = 7;
+    int ok = madvise(bss, sizeof bss, MADV_DONTNEED) == 0 && bss[PAGE] == 0;
+    ok = ok && madvise(bss, sizeof bss, MADV_FREE) == 0;
+    verifier(ok, "MADV_DONTNEED sur le .bss : relu a zero");
+    ok = erreur_de(madvise(donnees, PAGE, MADV_FREE)) == EINVAL && donnees[0] == 1;
+    verifier(ok, "MADV_FREE sur les donnees du programme : EINVAL");
+}
+
+/* MADV_POPULATE_WRITE : les pages en place d'avance, à zéro ; refusé
+ * (EINVAL) là où l'écriture est interdite. */
+static void populate_write(void)
+{
+    char *p = anonyme(NULL, 8 * PAGE, 0);
+    int ok = madvise(p, 8 * PAGE, MADV_POPULATE_WRITE) == 0 && p[0] == 0 && p[7 * PAGE] == 0;
+    ok = ok && mprotect(p, PAGE, PROT_READ) == 0 && erreur_de(madvise(p, PAGE, MADV_POPULATE_WRITE)) == EINVAL;
+    ok = ok && madvise(p, PAGE, MADV_POPULATE_READ) == 0;
+    verifier(ok, "MADV_POPULATE_WRITE et READ ; EINVAL sans le droit d'ecrire");
+    munmap(p, 8 * PAGE);
+}
+
+/* Les refus de mprotect et madvise, et les conseils sans effet. */
+static void erreurs_protections(void)
+{
+    char *p = anonyme(NULL, 2 * PAGE, 0);
+    verifier(erreur_de(mprotect(p + 1, PAGE, PROT_READ)) == EINVAL, "mprotect non aligne : EINVAL");
+    verifier(mprotect(p, 0, 0x7fff) == 0, "mprotect de longueur nulle : 0, quels que soient les droits");
+    verifier(erreur_de(mprotect(p, PAGE, 0x10)) == EINVAL, "mprotect, droit inconnu : EINVAL");
+    verifier(erreur_de(mprotect(p, PAGE, PROT_READ | PROT_GROWSDOWN)) == EINVAL,
+             "PROT_GROWSDOWN hors de la pile : EINVAL");
+    int local;
+    char *pile = (char *)((uintptr_t)&local & ~(PAGE - 1));
+    verifier(mprotect(pile, PAGE, PROT_READ | PROT_WRITE | PROT_GROWSDOWN) == 0, "PROT_GROWSDOWN sur la pile : accepte");
+    verifier(erreur_de(mprotect(p, (size_t)-PAGE, PROT_READ)) == ENOMEM, "mprotect qui deborde : ENOMEM");
+    munmap(p + PAGE, PAGE);
+    verifier(erreur_de(mprotect(p, 2 * PAGE, PROT_READ)) == ENOMEM, "mprotect avec un trou : ENOMEM");
+    verifier(erreur_de(madvise(p + 1, PAGE, MADV_DONTNEED)) == EINVAL, "madvise non aligne : EINVAL");
+    verifier(erreur_de(madvise(p, PAGE, 9999)) == EINVAL, "madvise, conseil inconnu : EINVAL");
+    verifier(erreur_de(madvise(p, 0, 9999)) == EINVAL && madvise(p, 0, MADV_DONTNEED) == 0,
+             "madvise de longueur nulle : 0, si le conseil existe");
+    verifier(erreur_de(madvise(p + PAGE, PAGE, MADV_WILLNEED)) == ENOMEM, "madvise ou rien n'est projete : ENOMEM");
+    verifier(erreur_de(madvise(p, (size_t)-PAGE, MADV_DONTNEED)) == EINVAL, "madvise qui deborde : EINVAL");
+    int ok = 1;
+    static const int sans_effet[] = { MADV_NORMAL, MADV_RANDOM, MADV_SEQUENTIAL, MADV_WILLNEED, MADV_HUGEPAGE,
+                                      MADV_NOHUGEPAGE, MADV_DONTDUMP, MADV_DODUMP, MADV_COLD, MADV_PAGEOUT,
+                                      MADV_DONTFORK, MADV_DOFORK, MADV_WIPEONFORK, MADV_KEEPONFORK, MADV_FREE };
+    for (size_t i = 0; i < sizeof sans_effet / sizeof *sans_effet; i++)
+        ok = ok && madvise(p, PAGE, sans_effet[i]) == 0;
+    verifier(ok, "les conseils de madvise que fait claude : acceptes");
+    munmap(p, PAGE);
+}
+
 static void informations(void)
 {
     struct sysinfo s;
@@ -193,6 +332,13 @@ int main(void)
     soixante_quatre_gio();
     coupe();
     populate();
+    protections();
+    jit();
+    ecriture_apres_lecture();
+    dontneed();
+    programme();
+    populate_write();
+    erreurs_protections();
     informations();
     printf("[linux] memoire : %s\n", echecs == 0 ? "toutes les verifications : ok" : "ECHEC");
     return echecs != 0;
