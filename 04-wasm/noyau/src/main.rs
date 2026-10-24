@@ -26,6 +26,7 @@ mod gdt;
 mod horloge;
 mod interruptions;
 mod pagination;
+mod pages;
 mod pic;
 mod port;
 mod serie;
@@ -181,6 +182,12 @@ extern "C" fn noyau_main(carte: u64) -> ! {
     }
     tester_cadres();
 
+    // L'allocateur de démarrage cède la mémoire à l'allocateur de pages.
+    let bilan = pages::initialiser();
+    afficherln!("[noyau] Allocateur buddy : {} pages libres ({} Mio), blocs de 4 Kio a {} Mio ; etat des pages : {} Kio.",
+                bilan.libres, bilan.libres >> 8, (4096 << pages::ORDRE_MAX) >> 20, bilan.taille_etats >> 10);
+    tester_pages();
+
     // Le scénario de panne de `make tests-qemu` : déborder exprès de la
     // pile, que la page de garde doit arrêter net.
     #[cfg(feature = "test-garde")]
@@ -222,6 +229,31 @@ extern "C" fn noyau_main(carte: u64) -> ! {
             afficher!("{}", c);
         }
     }
+}
+
+/// Vérifie l'allocateur de pages : des blocs alignés sur leur taille, qu'on
+/// peut écrire de bout en bout, et qui se recollent en les rendant (le
+/// nombre de pages libres revient à ce qu'il était). Le plus grand bloc
+/// possible : sur une très petite machine, il n'y a pas forcément de bloc
+/// de 4 Mio.
+fn tester_pages() {
+    let libres_avant = pages::libres();
+    let a = pages::allouer(0).expect("plus de memoire");
+    let b = pages::allouer(3).expect("plus de memoire");
+    let (c, ordre_c) = (0..=pages::ORDRE_MAX).rev().find_map(|o| pages::allouer(o).map(|c| (c, o))).expect("plus de memoire");
+    let taille_c = 4096 << ordre_c;
+    assert!(a % 4096 == 0 && b % (4096 << 3) == 0 && c % taille_c == 0);
+    // SAFETY : `c` vient d'être alloué, il est à nous, de bout en bout.
+    unsafe {
+        let debut = espace::virtuelle(c) as *mut u8;
+        debut.write_volatile(1);
+        debut.add(taille_c as usize - 1).write_volatile(2);
+    }
+    pages::liberer(b, 3);
+    pages::liberer(a, 0);
+    pages::liberer(c, ordre_c);
+    afficherln!("[noyau] Pages allouees : {:#x} (4 Kio), {:#x} (32 Kio), {:#x} ({} Kio) ; rendues et recollees : {}.",
+                a, b, c, taille_c >> 10, if pages::libres() == libres_avant { "ok" } else { "ECHEC" });
 }
 
 /// Une récursion sans fin (ou presque : la condition, jamais vraie, évite

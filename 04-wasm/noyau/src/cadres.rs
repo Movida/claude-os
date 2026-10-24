@@ -1,10 +1,13 @@
-//! L'allocateur de cadres : distribue la mémoire physique par pages de 4 Kio.
+//! L'allocateur de démarrage : distribue la mémoire physique par pages de
+//! 4 Kio, le temps que le noyau construise sa pagination.
 //!
 //! Un « cadre » (frame) est une page de mémoire PHYSIQUE : 4096 octets
-//! alignés sur 4096, la taille de page de base du processeur. Tout ce que
-//! le noyau construira ensuite en a besoin : de nouvelles tables de pages,
-//! la mémoire de chaque programme, les tampons des pilotes. Cet allocateur
-//! est le seul à savoir quels cadres sont libres.
+//! alignés sur 4096, la taille de page de base du processeur. Les tables de
+//! pages du noyau (pagination.rs) en ont besoin avant que toute la mémoire
+//! soit projetée ; une fois la pagination en place, cet allocateur cède
+//! tous ses cadres libres à l'allocateur de pages (pages.rs), et ne sert
+//! plus. C'est le rôle de memblock dans Linux : memblock_free_all donne la
+//! mémoire au buddy à la fin du démarrage.
 //!
 //! La méthode : une carte de bits (bitmap), un bit par cadre, 1 = occupé,
 //! 0 = libre. 1 Gio de mémoire = 262 144 cadres = 32 Kio de bits.
@@ -20,13 +23,11 @@
 //!     constant, mais impossible de trouver plusieurs cadres CONTIGUS, dont
 //!     les pilotes auront besoin (les files virtio de l'étape 6) ; et la
 //!     liste vit dans les cadres libres eux-mêmes, qu'il faut pouvoir lire ;
-//!   - l'allocateur « buddy » de Linux (page_alloc.c) : des blocs de 2^n
-//!     cadres, qu'on coupe en deux « copains » ou qu'on recolle. Rapide et
-//!     efficace contre l'émiettement, c'est la cible à terme ; mais il a
-//!     besoin d'une description de chaque cadre (la « struct page ») et de
-//!     voir toute la mémoire, donc d'une pagination complète du noyau. On
-//!     le construira alors, à partir de cette carte de bits, comme Linux
-//!     construit le sien à partir de memblock.
+//!   - l'allocateur « buddy » de Linux (page_alloc.c), dès le départ :
+//!     rapide et efficace contre l'émiettement, mais il a besoin d'une
+//!     description de chaque cadre et de voir toute la mémoire, donc d'une
+//!     pagination complète du noyau. Il prend la suite (pages.rs), construit
+//!     à partir de cette carte de bits.
 //!
 //! Où ranger la carte de bits ? Sa taille dépend de la mémoire de la
 //! machine : on ne peut pas la réserver d'avance dans le noyau. On la place
@@ -53,13 +54,18 @@ const DEBUT_UTILISABLE: u64 = 0x10_0000;
 struct Cadres {
     /// Un bit par cadre, du cadre 0 au cadre nombre - 1.
     bits: &'static mut [u64],
+    /// L'adresse physique de la carte de bits elle-même.
+    adresse_bits: u64,
     nombre: usize,
+    /// Les cadres ont-ils été cédés à l'allocateur de pages ?
+    cede: bool,
     libres: usize,
     /// Mot de `bits` où reprendre la recherche (« next fit »).
     prochain: usize,
 }
 
-static CADRES: Verrou<Cadres> = Verrou::new(Cadres { bits: &mut [], nombre: 0, libres: 0, prochain: 0 });
+static CADRES: Verrou<Cadres> =
+    Verrou::new(Cadres { bits: &mut [], adresse_bits: 0, nombre: 0, cede: false, libres: 0, prochain: 0 });
 
 fn arrondir_haut(x: u64) -> u64 {
     x.div_ceil(TAILLE_CADRE) * TAILLE_CADRE
@@ -156,7 +162,7 @@ pub fn initialiser(fin_noyau: u64) -> Result<Bilan, &'static str> {
         //    la réservée l'emporte (prudence, comme Linux).
         bits.fill(!0);
         let mut cadres = CADRES.verrouiller();
-        *cadres = Cadres { bits, nombre, libres: 0, prochain: 0 };
+        *cadres = Cadres { bits, adresse_bits, nombre, cede: false, libres: 0, prochain: 0 };
         for z in libres() {
             cadres.marquer_zone(z.base, z.fin(), false);
         }
@@ -175,6 +181,7 @@ pub fn initialiser(fin_noyau: u64) -> Result<Bilan, &'static str> {
 /// Son contenu est quelconque (ce qu'y a laissé le précédent occupant).
 pub fn allouer() -> Option<u64> {
     let mut cadres = CADRES.verrouiller();
+    assert!(!cadres.cede, "allocateur de demarrage deja cede");
     let nb_mots = cadres.bits.len();
     for i in 0..nb_mots {
         let mot = (cadres.prochain + i) % nb_mots;
@@ -200,6 +207,7 @@ pub fn allouer() -> Option<u64> {
 /// en silence (Linux affiche alors « Bad page state »).
 pub fn liberer(adresse: u64) {
     let mut cadres = CADRES.verrouiller();
+    assert!(!cadres.cede, "allocateur de demarrage deja cede");
     assert!(adresse % TAILLE_CADRE == 0, "cadre mal aligne : {:#x}", adresse);
     let cadre = (adresse / TAILLE_CADRE) as usize;
     assert!(cadre < cadres.nombre && cadres.est_occupe(cadre), "cadre deja libre : {:#x}", adresse);
@@ -208,4 +216,55 @@ pub fn liberer(adresse: u64) {
 
 pub fn libres() -> usize {
     CADRES.verrouiller().libres
+}
+
+/// Le nombre de cadres de la mémoire, libres ou non.
+pub fn nombre() -> usize {
+    CADRES.verrouiller().nombre
+}
+
+/// Donne `n` cadres CONTIGUS : l'adresse physique du premier. Le premier
+/// qui convient, en partant du bas (« first fit ») : ce n'est appelé que
+/// quelques fois, au démarrage.
+pub fn allouer_contigus(n: usize) -> Option<u64> {
+    let mut cadres = CADRES.verrouiller();
+    assert!(!cadres.cede, "allocateur de demarrage deja cede");
+    let mut debut = 0;
+    for cadre in 0..cadres.nombre {
+        if cadres.est_occupe(cadre) {
+            debut = cadre + 1;
+        } else if cadre + 1 - debut == n {
+            for c in debut..=cadre {
+                cadres.marquer(c, true);
+            }
+            return Some(debut as u64 * TAILLE_CADRE);
+        }
+    }
+    None
+}
+
+/// Cède tous les cadres libres à l'allocateur de pages : appelle
+/// `ceder_zone(debut, fin)` (adresses physiques) pour chaque suite de
+/// cadres libres, puis pour la carte de bits elle-même, qui ne servira
+/// plus. Après, allouer et libérer ici est une erreur.
+pub fn ceder(mut ceder_zone: impl FnMut(u64, u64)) {
+    let mut cadres = CADRES.verrouiller();
+    assert!(!cadres.cede, "allocateur de demarrage deja cede");
+    let mut debut = None;
+    for cadre in 0..=cadres.nombre {
+        let libre = cadre < cadres.nombre && !cadres.est_occupe(cadre);
+        match (libre, debut) {
+            (true, None) => debut = Some(cadre),
+            (false, Some(d)) => {
+                ceder_zone(d as u64 * TAILLE_CADRE, cadre as u64 * TAILLE_CADRE);
+                debut = None;
+            }
+            _ => {}
+        }
+    }
+    cadres.cede = true;
+    cadres.libres = 0;
+    let taille = (cadres.bits.len() * 8) as u64;
+    cadres.bits = &mut [];
+    ceder_zone(cadres.adresse_bits, cadres.adresse_bits + taille);
 }

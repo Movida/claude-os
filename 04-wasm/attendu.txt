@@ -12,3 +12,5 @@
 [noyau] Memoire libre : 
 [noyau] Pagination W^X en place
 rendu puis redonne : ok.
+[noyau] Allocateur buddy :
+rendues et recollees : ok.
