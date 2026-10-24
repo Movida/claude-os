@@ -6,15 +6,13 @@
 //! l'ordre de l'archive. Le format d'un programme se reconnaît à ses
 //! premiers octets, sa « signature » (magic number) :
 //!   - « \0asm » : un module WebAssembly, le format natif de l'OS ;
-//!   - « \x7fELF » : un exécutable Linux (sous-étapes suivantes).
+//!   - « \x7fELF » : un exécutable Linux.
 //! C'est le principe des « binfmt » de Linux (fs/binfmt_elf.c,
 //! fs/binfmt_script.c pour « #! », binfmt_misc pour le reste) : chaque
 //! format est essayé tour à tour, et le premier qui reconnaît le fichier
 //! s'en charge. Le nom du fichier (son extension) ne compte pas.
 
-use crate::demarrage;
-use crate::espace;
-use crate::wasi;
+use crate::{chargeur_elf, demarrage, espace, pages, wasi};
 use core::fmt;
 
 /// Le nom d'une entrée, pour l'afficher : un nom de fichier peut contenir
@@ -76,8 +74,50 @@ pub fn executer_archive() {
 fn executer(nom: Nom, octets: &[u8]) {
     match octets {
         [0, b'a', b's', b'm', ..] => executer_wasm(nom, octets),
+        [0x7f, b'E', b'L', b'F', ..] => executer_elf(nom, octets),
         _ => afficherln!("[noyau] {} : format inconnu, ignore.", nom),
     }
+}
+
+/// Un programme Linux : on vérifie le fichier, puis on le charge dans un
+/// espace d'adressage neuf. Pas encore d'anneau 3 pour l'exécuter : on
+/// montre ce qui a été chargé, puis on détruit l'espace, qui doit rendre
+/// toute sa mémoire.
+fn executer_elf(nom: Nom, octets: &[u8]) {
+    let executable = match formats::elf::lire(octets, chargeur_elf::PERMISES) {
+        Ok(x) => x,
+        Err(e) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
+    };
+    afficherln!("[noyau] {} : programme Linux (ELF), {} octets, point d'entree {:#x}, segments :",
+                nom, octets.len(), executable.entree());
+    for s in executable.segments() {
+        afficherln!("        {:#010x}-{:#010x} {}{}{} ({} octets du fichier)",
+                    s.adresse, s.adresse + s.taille, 'r',
+                    if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.contenu.len());
+    }
+    let libres = pages::libres();
+    let programme = match chargeur_elf::charger(&executable) {
+        Ok(p) => p,
+        Err(e) => return afficherln!("[noyau] {} : chargement impossible : {}", nom, e),
+    };
+    // Le code au point d'entrée, relu dans l'espace du programme, doit être
+    // celui du fichier.
+    // (16 octets au plus : ce qu'il reste du fichier après le point
+    // d'entrée, dans son segment.)
+    let attendu = executable
+        .segments()
+        .find_map(|s| s.contenu.get(programme.entree.checked_sub(s.adresse)? as usize..))
+        .map_or(&[][..], |reste| &reste[..reste.len().min(16)]);
+    let mut code = [0u8; 16];
+    let code = &mut code[..attendu.len()];
+    let code_ok = programme.espace.lire(programme.entree, code).is_ok() && code == attendu;
+    // Le tas commence à la page qui suit le dernier segment.
+    afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
+                programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
+                programme.fin.next_multiple_of(4096), if code_ok { "ok" } else { "ECHEC" });
+    drop(programme);
+    afficherln!("[noyau] {} : charge puis decharge (pas encore d'anneau 3) ; memoire rendue : {}.",
+                nom, if pages::libres() == libres { "ok" } else { "ECHEC" });
 }
 
 /// Un programme WebAssembly : on le décode, le valide, l'instancie avec

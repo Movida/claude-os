@@ -14,3 +14,6 @@ target/
 # Suite de tests officielle de WebAssembly, téléchargée par make (étapes 4 et 5)
 04-wasm/suite/
 05-elf/suite/
+
+# Programmes Linux de test, construits par make (étape 5)
+05-elf/linux/construits/

@@ -22,6 +22,7 @@ extern crate alloc;
 mod console;
 mod cadres;
 mod carte_memoire;
+mod chargeur_elf;
 mod clavier;
 mod cpu;
 mod demarrage;

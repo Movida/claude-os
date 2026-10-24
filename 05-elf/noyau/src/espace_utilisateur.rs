@@ -60,6 +60,20 @@ pub enum Erreur {
     DejaProjetee,
     /// Plus de mémoire pour la page ou pour une table (ENOMEM).
     PlusDeMemoire,
+    /// Rien n'est projeté à cette adresse.
+    NonProjetee,
+}
+
+// Affiché par le noyau : sans accents.
+impl core::fmt::Display for Erreur {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str(match self {
+            Erreur::AdresseInterdite => "adresse interdite",
+            Erreur::DejaProjetee => "page deja projetee",
+            Erreur::PlusDeMemoire => "plus de memoire",
+            Erreur::NonProjetee => "page non projetee",
+        })
+    }
 }
 
 /// La page `adresse` (alignée) est-elle de celles qu'un programme peut
@@ -118,6 +132,57 @@ impl EspaceUtilisateur {
         unsafe { core::ptr::write_bytes(espace::virtuelle(cadre) as *mut u8, 0, PAGE as usize) };
         *entree = cadre | PRESENTE | droits | pagination::UTILISATEUR;
         Ok(cadre)
+    }
+
+    /// Écrit `octets` à partir de l'adresse `adresse` de l'espace, page par
+    /// page, par la projection directe de leurs cadres : l'espace n'a pas
+    /// besoin d'être actif, et les droits des pages ne comptent pas (on
+    /// remplit ainsi le code d'un programme, en lecture seule pour lui).
+    /// Toutes les pages doivent être projetées ; sinon rien n'est écrit.
+    pub fn ecrire(&mut self, adresse: u64, octets: &[u8]) -> Result<(), Erreur> {
+        let fin = adresse.checked_add(octets.len() as u64).ok_or(Erreur::AdresseInterdite)?;
+        // D'abord vérifier, puis écrire : tout ou rien.
+        let mut page = adresse / PAGE * PAGE;
+        while page < fin {
+            self.traduire(page).ok_or(Erreur::NonProjetee)?;
+            page += PAGE;
+        }
+        let mut fait = 0;
+        while fait < octets.len() {
+            let a = adresse + fait as u64;
+            let decalage = (a % PAGE) as usize;
+            let n = (PAGE as usize - decalage).min(octets.len() - fait);
+            let (cadre, _) = self.traduire(a / PAGE * PAGE).ok_or(Erreur::NonProjetee)?;
+            // SAFETY : `cadre` est une page de cet espace (traduire l'a
+            // trouvée dans ses tables), que nous possédons ; on y écrit
+            // `n` octets à partir de `decalage`, sans sortir de la page.
+            unsafe {
+                let destination = (espace::virtuelle(cadre) as *mut u8).add(decalage);
+                core::ptr::copy_nonoverlapping(octets[fait..].as_ptr(), destination, n);
+            }
+            fait += n;
+        }
+        Ok(())
+    }
+
+    /// Lit `octets.len()` octets à partir de l'adresse `adresse` de
+    /// l'espace, comme `ecrire` dans l'autre sens.
+    pub fn lire(&self, adresse: u64, octets: &mut [u8]) -> Result<(), Erreur> {
+        adresse.checked_add(octets.len() as u64).ok_or(Erreur::AdresseInterdite)?;
+        let mut fait = 0;
+        while fait < octets.len() {
+            let a = adresse + fait as u64;
+            let decalage = (a % PAGE) as usize;
+            let n = (PAGE as usize - decalage).min(octets.len() - fait);
+            let (cadre, _) = self.traduire(a / PAGE * PAGE).ok_or(Erreur::NonProjetee)?;
+            // SAFETY : comme dans `ecrire`, en lecture.
+            unsafe {
+                let source = (espace::virtuelle(cadre) as *const u8).add(decalage);
+                core::ptr::copy_nonoverlapping(source, octets[fait..].as_mut_ptr(), n);
+            }
+            fait += n;
+        }
+        Ok(())
     }
 
     /// Le cadre projeté à `adresse` (une page) et les bits de son entrée,

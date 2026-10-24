@@ -15,7 +15,9 @@
 #                  de sa pile doit le dire (page de garde, double faute) ;
 #                  un noyau gonflé au-delà de 1 Mio doit être lu en entier
 #   make tests-hote -> les tests sur la machine hôte : ceux de la
-#                  bibliothèque des formats (formats/ : archive cpio) ; puis
+#                  bibliothèque des formats (formats/ : archive cpio,
+#                  exécutables ELF, essayés aussi sur de vrais programmes
+#                  Linux, dont un gcc -static) ; puis
 #                  pour l'interpréteur WebAssembly, télécharge et
 #                  convertit la suite de tests officielle si besoin, puis la
 #                  rejoue contre la bibliothèque (tableau par fichier) ;
@@ -67,11 +69,55 @@ boot.bin: programmes.cpio FORCE
 	cd noyau && cargo build --release
 	$(call image,$(NOYAU_ELF),programmes.cpio,boot)
 
+# Les programmes Linux de test (linux/), construits dans linux/construits/.
+# Ils tournent aussi tels quels sous Linux, sur la machine hôte.
+#   - bonjour-asm : nasm puis ld, sans bibliothèque C ;
+#   - bonjour-c : gcc -static, avec la glibc de la machine (libc.a, du
+#     paquet libc6-dev). -O2 et les avertissements, comme un programme
+#     ordinaire.
+# Pour les tests du lecteur ELF sur l'hôte, une variante qu'il doit
+# accepter, bonjour-c-deux-segments (gcc -static -z noseparate-code : code
+# et données dans deux segments seulement, la disposition d'avant binutils
+# 2.31), et des variantes qu'il doit refuser : bonjour-c-pie
+# (gcc -static-pie, un ET_DYN),
+# bonjour-c-dynamique (gcc sans option : ET_DYN, ld-linux et la glibc
+# partagée), bonjour-asm-wx (ld -N, un segment W+X).
+LINUX = linux/construits
+CFLAGS_LINUX = -O2 -Wall -Wextra -Werror
+
+$(LINUX)/bonjour-asm.o: linux/bonjour.asm
+	mkdir -p $(LINUX)
+	nasm -f elf64 $< -o $@
+
+$(LINUX)/bonjour-asm: $(LINUX)/bonjour-asm.o
+	ld -o $@ $<
+
+$(LINUX)/bonjour-asm-wx: $(LINUX)/bonjour-asm.o
+	ld -N -o $@ $< 2>/dev/null
+
+$(LINUX)/bonjour-c: linux/bonjour.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/bonjour-c-deux-segments: linux/bonjour.c
+	mkdir -p $(LINUX)
+	gcc -static -Wl,-z,noseparate-code $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/bonjour-c-pie: linux/bonjour.c
+	mkdir -p $(LINUX)
+	gcc -static-pie $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/bonjour-c-dynamique: linux/bonjour.c
+	mkdir -p $(LINUX)
+	gcc $(CFLAGS_LINUX) $< -o $@
+
+PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx bonjour-c bonjour-c-deux-segments bonjour-c-pie bonjour-c-dynamique)
+
 # L'archive de programmes, que le noyau exécute dans l'ordre (voir
 # archive.sh).
-programmes.cpio: archive.sh FORCE
+programmes.cpio: archive.sh $(LINUX)/bonjour-asm FORCE
 	cd bonjour && cargo build --release
-	sh archive.sh $@ $(BONJOUR)
+	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm
 
 FORCE:
 
@@ -138,7 +184,7 @@ SHELL = /bin/bash
 # sources, servirait sinon telle quelle à la construction suivante.
 .DELETE_ON_ERROR:
 
-tests-hote: $(SUITE)/.convertie
+tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE)
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -188,6 +234,7 @@ test-%.bin: programmes.cpio FORCE
 
 clean:
 	rm -f boot*.bin test-*.bin programmes.cpio serial.log qemu.log ecran.png test-*.log
+	rm -rf $(LINUX)
 	rm -rf $(SUITE)
 	cd noyau && cargo clean
 	cd wasm && cargo clean
