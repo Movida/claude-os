@@ -7,6 +7,11 @@ edition = "2024"
 
 [dependencies]
 
+# Les scénarios de panne de `make tests-qemu` : une version du noyau qui
+# provoque exprès une erreur (voir src/main.rs).
+[features]
+test-garde = []
+
 # panic = "abort" : en cas de panique, pas de « déroulement » de la pile
 # (unwinding), qui demanderait une bibliothèque d'exécution qu'on n'a pas.
 # Le noyau affiche le message et arrête le processeur.

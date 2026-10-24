@@ -1,6 +1,7 @@
 # Fichiers générés par les Makefile
 *.bin
 serial.log
+garde.log
 qemu.log
 ecran.png
 ecran.ppm

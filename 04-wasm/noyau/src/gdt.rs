@@ -10,9 +10,9 @@
 //!     64 bits elle ne sert plus qu'à ranger des adresses de PILES : celles
 //!     que le CPU prend quand une interruption arrive. On s'en sert pour
 //!     l'IST (Interrupt Stack Table) : une pile de secours pour la double
-//!     faute, comme Linux. Elle ne protégera du débordement de la pile du
-//!     noyau qu'avec une page de garde, pas encore en place (voir
-//!     interruptions.rs).
+//!     faute, comme Linux. Avec la page de garde sous la pile du noyau
+//!     (pagination.rs), elle permet d'annoncer un débordement de pile au
+//!     lieu de finir en triple faute (voir interruptions.rs).
 
 use crate::verrou::Verrou;
 use core::arch::asm;
@@ -43,10 +43,11 @@ struct Tss {
     iomap: u16,
 }
 
-/// La pile de secours : 16 Kio, alignée sur 16 octets comme l'exige l'ABI.
-#[repr(C, align(16))]
-struct Pile([u8; 16 * 1024]);
-static PILE_DOUBLE_FAUTE: Verrou<Pile> = Verrou::new(Pile([0; 16 * 1024]));
+unsafe extern "C" {
+    // Le sommet de la pile de secours, 16 Kio précédés d'une page de garde,
+    // réservés par le script d'édition de liens (linker.ld).
+    static __pile_secours_haut: u8;
+}
 
 static TSS: Verrou<Tss> = Verrou::new(Tss {
     _reserve1: 0,
@@ -73,10 +74,7 @@ const DONNEES: u64 = 0x00CF_9300_0000_FFFF;
 
 pub fn initialiser() {
     // Adresse de la pile de secours : son sommet, car une pile x86 descend.
-    let sommet = {
-        let pile = PILE_DOUBLE_FAUTE.verrouiller();
-        &raw const pile.0 as u64 + size_of::<Pile>() as u64
-    };
+    let sommet = &raw const __pile_secours_haut as u64;
     let base_tss = {
         let mut tss = TSS.verrouiller();
         tss.ist[(IST_DOUBLE_FAUTE - 1) as usize] = sommet;

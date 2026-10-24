@@ -181,6 +181,14 @@ extern "C" fn noyau_main(carte: u64) -> ! {
     }
     tester_cadres();
 
+    // Le scénario de panne de `make tests-qemu` : déborder exprès de la
+    // pile, que la page de garde doit arrêter net.
+    #[cfg(feature = "test-garde")]
+    {
+        afficherln!("[noyau] Test : debordement volontaire de la pile.");
+        deborder(0);
+    }
+
     // Les interruptions matérielles : d'abord le PIC (tout masqué), puis
     // l'horloge qui démasque son IRQ, et seulement alors sti. Dans l'autre
     // ordre, une IRQ pourrait arriver sur un vecteur d'exception.
@@ -214,6 +222,19 @@ extern "C" fn noyau_main(carte: u64) -> ! {
             afficher!("{}", c);
         }
     }
+}
+
+/// Une récursion sans fin (ou presque : la condition, jamais vraie, évite
+/// l'avertissement du compilateur). Chaque appel garde 512 octets sur la
+/// pile ; black_box empêche le compilateur de les supprimer, ou de changer
+/// la récursion en boucle.
+#[cfg(feature = "test-garde")]
+fn deborder(n: u64) -> u64 {
+    if n == u64::MAX {
+        return 0;
+    }
+    let tableau = core::hint::black_box([n; 64]);
+    deborder(n + 1) + tableau[63]
 }
 
 /// Vérifie l'allocateur : trois cadres distincts et alignés, et un cadre

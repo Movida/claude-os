@@ -50,15 +50,30 @@ SECTIONS
     /* .bss : les variables initialisées à zéro. Elle n'occupe aucune place
        dans l'image (objcopy n'écrit pas ces zéros) : c'est _start qui la
        met à zéro au démarrage, entre __bss_debut et __bss_fin. La pile du
-       noyau y est aussi, pour ne dépendre d'aucune adresse du chargeur. */
+       noyau y est aussi, pour ne dépendre d'aucune adresse du chargeur,
+       avec en dessous une page de garde que la pagination laisse sans
+       projection (src/pagination.rs) : une pile qui déborde y fait une
+       faute de page, au lieu d'écraser en silence ce qui est en dessous. */
     .bss : AT(ADDR(.bss) - BASE_NOYAU) ALIGN(4096) {
         __bss_debut = .;
         *(.bss .bss.*)
         *(COMMON)
-        . = ALIGN(16);
+        . = ALIGN(4096);
+        __garde = .;
+        . += 4K;
         __pile_bas = .;
         . += 64K;
         __pile_haut = .;
+        /* La pile de secours de la double faute (l'IST, src/gdt.rs) : 16 Kio,
+           avec sa propre page de garde. Un gestionnaire de double faute qui
+           déborderait arrête alors la machine (triple faute) au lieu
+           d'écraser en silence ce qui précède sa pile. */
+        . = ALIGN(4096);
+        __garde_secours = .;
+        . += 4K;
+        __pile_secours_bas = .;
+        . += 16K;
+        __pile_secours_haut = .;
         __bss_fin = .;
     }
 

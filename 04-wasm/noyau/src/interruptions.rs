@@ -201,12 +201,9 @@ pub fn initialiser() {
         // de garde NON PROJETÉE fait faute de page ; le CPU ne peut pas
         // empiler le cadre de cette faute sur la pile pleine, d'où une
         // double faute, que seule une autre pile permet de traiter.
-        // ATTENTION, ce n'est pas encore le cas : sous la pile du noyau, la
-        // .bss est projetée sans trou. Une pile qui déborde y descend en
-        // silence (IDT, GDT, TSS, pile de secours elle-même), et finit en
-        // triple faute. La page de garde reste à ajouter dans les tables du
-        // noyau (pagination.rs). La pile de secours sert déjà pour toute
-        // autre cause de double faute.
+        // La page de garde est en place (pagination.rs), et `make
+        // tests-qemu` vérifie le scénario à chaque fois. La pile de secours
+        // sert aussi pour toute autre cause de double faute.
         let ist = if vecteur == 8 { gdt::IST_DOUBLE_FAUTE } else { 0 };
         idt[vecteur] = Entree::new(adresse, ist);
     }
@@ -246,12 +243,18 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
             afficherln!("[noyau] EXCEPTION {} ({}), code d'erreur {:#x}",
                         vecteur, NOMS.get(vecteur).unwrap_or(&"?"), cadre.code_erreur);
             afficherln!("        RIP={:#x} RSP={:#x} RFLAGS={:#x}", cadre.rip, cadre.rsp, cadre.rflags);
-            if vecteur == 14 {
+            if vecteur == 14 || vecteur == 8 {
                 // Pour une faute de page, CR2 contient l'adresse fautive.
+                // Une double faute née d'une faute de page la laisse aussi :
+                // c'est le cas d'une pile qui déborde (la faute de page ne
+                // peut pas être empilée sur la pile qui vient de fauter).
                 let cr2: u64;
                 // SAFETY : lecture d'un registre de contrôle, sans effet.
                 unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
                 afficherln!("        adresse fautive (CR2) = {:#x}", cr2);
+                if crate::pagination::dans_la_garde(cr2) {
+                    afficherln!("        debordement de la pile du noyau : la page de garde a ete touchee");
+                }
             }
             // On ne sait pas encore réparer : on arrête tout, proprement.
             panic!("exception {} non geree", vecteur);

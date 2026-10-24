@@ -10,6 +10,8 @@
 #   make capture -> démarre sans écran, puis enregistre l'écran dans ecran.png
 #   make gdb    -> QEMU figé au démarrage, en attente de GDB sur le port 1234
 #   make dump   -> affiche l'image octet par octet
+#   make tests-qemu -> les scénarios de panne : un noyau qui déborde exprès
+#                  de sa pile doit le dire (page de garde, double faute)
 #   make tests-hote -> les tests sur la machine hôte : télécharge et
 #                  convertit la suite de tests officielle si besoin, puis la
 #                  rejoue contre la bibliothèque (tableau par fichier) ;
@@ -127,10 +129,29 @@ $(WAST2JSON):
 	tar xzf $(SUITE)/wabt.tar.gz -C $(SUITE) wabt-$(WABT_VERSION)/bin/wast2json
 	touch $@
 
+# Le scénario de panne : un noyau construit avec la fonctionnalité
+# test-garde (dans son propre dossier de compilation, pour ne pas défaire
+# celle du noyau normal) déborde exprès de sa pile. La page de garde doit
+# l'arrêter net, et le dire.
+NOYAU_GARDE_ELF = noyau/target/garde/x86_64-unknown-none/release/noyau
+
+tests-qemu: garde.bin
+	-timeout 2 qemu-system-x86_64 -drive format=raw,file=garde.bin -display none -no-reboot -serial file:garde.log
+	grep -F "debordement de la pile du noyau" garde.log
+
+garde.bin: FORCE
+	cd noyau && cargo build --release --features test-garde --target-dir target/garde 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	objcopy -O binary $(NOYAU_GARDE_ELF) noyau-garde.bin
+	truncate -s %512 noyau-garde.bin
+	nasm -f bin -D NOYAU_SECTEURS=$$(( ($$(stat -c %s noyau-garde.bin) + 511) / 512 )) \
+	  boot.asm -o chargeur-garde.bin
+	cat chargeur-garde.bin noyau-garde.bin > garde.bin
+
 clean:
 	rm -f boot.bin chargeur.bin noyau.bin serial.log qemu.log ecran.png
+	rm -f garde.bin chargeur-garde.bin noyau-garde.bin garde.log
 	rm -rf $(SUITE)
 	cd noyau && cargo clean
 	cd wasm && cargo clean
 
-.PHONY: run texte test debug capture gdb dump tests-hote suite clean FORCE
+.PHONY: run texte test debug capture gdb dump tests-hote tests-qemu suite clean FORCE
