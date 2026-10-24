@@ -35,6 +35,14 @@
 //!     unreachable  i32.add                  est valide (deux inconnus) ;
 //!     unreachable  i64.const 0  i32.add     ne l'est pas (un i64 connu).
 //! Dans la pile des types, `None` est ce type inconnu.
+//!
+//! La validation prépare aussi l'exécution. L'interpréteur (sous-étape 3)
+//! lira directement les octets du code, sans les retraduire (voir
+//! module.rs). Il lui manque alors une information que le code ne donne
+//! pas : OÙ mène un branchement. `br 1` désigne « le deuxième bloc
+//! englobant », et sortir d'un `block` mène à son `end`, plus loin, à une
+//! position que rien n'indique. Le validateur la découvre en passant, et
+//! remplit pour chaque fonction une table annexe (voir `Branchement`).
 
 use alloc::boxed::Box;
 use alloc::vec;
@@ -46,10 +54,72 @@ use crate::lecteur::Lecteur;
 use crate::limites::*;
 use crate::module::*;
 
+/// Une entrée de la table annexe des branchements : ce que fait
+/// l'interpréteur quand il prend un branchement.
+///
+/// Le choix : l'interprétation « sur place » (Ben Titzer, « A fast in-place
+/// interpreter for WebAssembly », 2022, moteur Wizard). Le code reste tel
+/// qu'il est dans le module ; le validateur, qui connaît déjà la structure
+/// des blocs, calcule au passage une petite table, une entrée par
+/// branchement. Options écartées :
+///   - chercher le `end` correspondant à chaque branchement pris : il
+///     faudrait relire tout le bloc, à chaque fois ;
+///   - retraduire le code en un format interne aux sauts résolus (wasmi,
+///     WAMR, wasm3) : l'exécution est un peu plus rapide, mais la
+///     traduction coûte au chargement, le code existe alors en deux
+///     exemplaires, et la position d'exécution ne correspond plus à rien
+///     dans le fichier (débogage, messages d'erreur) ;
+///   - compiler en code machine (wasmtime, ou Nebulet avec Cranelift) : de
+///     loin le plus rapide, et la cible à long terme de notre OS, mais un
+///     compilateur est un projet en soi.
+///
+/// Les entrées sont rangées dans l'ordre des instructions du code :
+///   - `br` et `br_if` : une entrée ;
+///   - `br_table` : une par cible, la cible par défaut en dernier ;
+///   - `if` : une, prise si la condition est fausse (vers la branche
+///     « sinon », ou vers la fin s'il n'y en a pas) ;
+///   - `else` : une, prise en arrivant au bout de la branche « alors »
+///     (vers la fin).
+/// L'interpréteur tient, à côté de la position `ip` de l'instruction en
+/// cours, l'index `stp` de l'entrée du prochain branchement. Un branchement
+/// non pris (`br_if` faux, `if` vrai) fait `stp += 1`. Un branchement pris
+/// lit son entrée (pour un `br_table`, l'entrée `stp + i`, où l'index i est
+/// ramené à la cible par défaut s'il dépasse), saute à `cible` et fait
+/// `stp = suite`. L'invariant : `stp` est toujours le nombre de
+/// branchements situés avant `ip` dans la fonction.
+///
+/// En sautant, les valeurs passées à l'étiquette (les résultats d'un bloc,
+/// les paramètres d'une boucle) restent au sommet de la pile, et ce que le
+/// bloc avait empilé en dessous disparaît : on recopie les `gardees`
+/// valeurs du sommet `retirees` cases plus bas. Ces deux nombres sont
+/// fixes : dans du code valide, la pile a toujours la même hauteur à une
+/// instruction donnée, quel que soit le chemin suivi pour y arriver. (Dans
+/// du code inaccessible, la hauteur calculée n'a pas de sens, mais ces
+/// entrées ne seront jamais lues.)
+///
+/// Wizard range des écarts relatifs ; des positions absolues sont plus
+/// simples à lire, et tiennent aussi sur 32 bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Branchement {
+    /// La position, dans les octets du module, de l'instruction à exécuter
+    /// ensuite : juste après le `end` d'un bloc, au début du corps d'une
+    /// boucle, juste après le `else` d'un `if`. Un branchement vers le corps
+    /// de la fonction mène à son `end` final, qui fait le retour.
+    pub cible: u32,
+    /// L'index de l'entrée du premier branchement situé après `cible`.
+    pub suite: u32,
+    /// Le nombre de valeurs passées à l'étiquette, gardées au sommet.
+    pub gardees: u32,
+    /// Le nombre de valeurs à retirer sous elles.
+    pub retirees: u32,
+}
+
 /// Ce que la validation a appris du corps d'une fonction, et dont
 /// l'interpréteur aura besoin.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodeValide {
+    /// La table annexe des branchements de la fonction.
+    pub branchements: Box<[Branchement]>,
     /// Nombre de variables locales déclarées, paramètres non compris.
     pub locales: u32,
     /// Hauteur maximale de la pile d'opérandes de la fonction (comme le
@@ -448,6 +518,24 @@ struct Cadre<'m> {
     /// La position du dernier `br_table` qui a vérifié les types de
     /// l'étiquette du bloc (0 : aucun ; voir BrTable).
     verifiee_par: usize,
+    /// Boucle : la position de la première instruction de son corps, et le
+    /// nombre d'entrées de la table annexe à cet endroit. C'est là que
+    /// mènent ses branchements.
+    debut: u32,
+    debut_table: u32,
+    /// Les autres genres : les branchements vers la fin du bloc, encore
+    /// inconnue, attendent dans une « chaîne de correction », la technique
+    /// des assembleurs en une passe pour les sauts vers l'avant. `attente`
+    /// vaut l'index + 1 de la dernière entrée en attente (0 : aucune), et
+    /// chaque entrée en attente garde dans son champ `cible`, en attendant
+    /// la vraie, l'index + 1 de la précédente. La chaîne traverse la table
+    /// elle-même : pas de liste à part, pas d'allocation par bloc. Au `end`,
+    /// `completer` la parcourt. (Une vraie cible ne vaut jamais 0 : la
+    /// position 0 du module est la signature \0asm.)
+    attente: u32,
+    /// Si : l'entrée du `if` lui-même (condition fausse), complétée au
+    /// `else`, ou au `end` s'il n'y en a pas.
+    saut_si: u32,
 }
 
 impl<'m> Cadre<'m> {
@@ -486,6 +574,8 @@ struct Validateur<'c, 'm> {
     pile: Vec<Option<TypeValeur>>,
     /// La pile des cadres (ctrls) ; le dernier est le bloc courant.
     cadres: Vec<Cadre<'m>>,
+    /// La table annexe des branchements, remplie au fil du code.
+    table: Vec<Branchement>,
     hauteur_max: usize,
     /// La position de l'instruction en cours, pour les erreurs.
     position: usize,
@@ -507,6 +597,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
             resultats: &type_fonction.resultats,
             pile: Vec::new(),
             cadres: Vec::new(),
+            table: Vec::new(),
             hauteur_max: 0,
             position: corps.code.debut as usize,
         };
@@ -520,10 +611,12 @@ impl<'c, 'm> Validateur<'c, 'm> {
         loop {
             v.position = l.position();
             let instruction = lire_instruction(&mut l)?;
-            let fini = v.instruction(instruction, octets)?;
+            let fini = v.instruction(instruction, l.position() as u32, octets)?;
             // Chaque instruction dépile ses opérandes AVANT d'empiler ses
             // résultats : la hauteur la plus grande est atteinte entre deux
-            // instructions, et il suffit de la mesurer ici.
+            // instructions, et il suffit de la mesurer ici. Une instruction
+            // empile au plus PARAMETRES_MAX ou RESULTATS_MAX valeurs (un
+            // bloc, un appel) : la pile ne dépasse la limite que de peu.
             v.hauteur_max = v.hauteur_max.max(v.pile.len());
             if v.hauteur_max > HAUTEUR_PILE_MAX {
                 return Err(v.erreur(Genre::LimiteDepassee(Limite::HauteurPile)));
@@ -538,7 +631,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
         if !l.fini() {
             return Err(erreur(l.position(), Genre::FinDeFonctionAttendue));
         }
-        Ok(CodeValide { locales: declarees as u32, hauteur_max: v.hauteur_max as u32 })
+        Ok(CodeValide { branchements: v.table.into(), locales: declarees as u32, hauteur_max: v.hauteur_max as u32 })
     }
 
     fn erreur(&self, genre: Genre) -> Erreur {
@@ -594,7 +687,18 @@ impl<'c, 'm> Validateur<'c, 'm> {
 
     fn ouvrir(&mut self, genre: GenreCadre, entree: &'m [TypeValeur], sortie: &'m [TypeValeur]) {
         let hauteur = self.pile.len();
-        self.cadres.push(Cadre { genre, entree, sortie, hauteur, inaccessible: false, verifiee_par: 0 });
+        self.cadres.push(Cadre {
+            genre,
+            entree,
+            sortie,
+            hauteur,
+            inaccessible: false,
+            verifiee_par: 0,
+            debut: 0,
+            debut_table: 0,
+            attente: 0,
+            saut_si: 0,
+        });
         self.empiler_types(entree);
     }
 
@@ -615,6 +719,56 @@ impl<'c, 'm> Validateur<'c, 'm> {
         let cadre = self.cadres.last_mut().expect("pile des cadres vide");
         self.pile.truncate(cadre.hauteur);
         cadre.inaccessible = true;
+    }
+
+    /// Ajoute à la table annexe l'entrée d'un branchement vers l'étiquette du
+    /// cadre `index`, pris avec la pile telle qu'elle est maintenant (la
+    /// condition d'un `br_if`, l'index d'un `br_table` déjà dépilés).
+    fn branchement(&mut self, index: usize) {
+        let numero = self.table.len();
+        let cadre = &mut self.cadres[index];
+        let gardees = cadre.etiquette().len();
+        // Dans du code inaccessible, la pile peut être plus basse que ce
+        // que l'étiquette reçoit : l'entrée ne servira pas (voir
+        // `Branchement`), mais le calcul ne doit pas déborder.
+        let retirees = self.pile.len().saturating_sub(cadre.hauteur + gardees);
+        let mut entree = Branchement { cible: 0, suite: 0, gardees: gardees as u32, retirees: retirees as u32 };
+        if cadre.genre == GenreCadre::Boucle {
+            // On a déjà passé le début de la boucle : la cible est connue.
+            entree.cible = cadre.debut;
+            entree.suite = cadre.debut_table;
+        } else {
+            entree.cible = cadre.attente;
+            cadre.attente = numero as u32 + 1;
+        }
+        self.table.push(entree);
+    }
+
+    /// Ajoute l'entrée d'un `if` ou d'un `else`, qui ne déplace aucune
+    /// valeur, et rend son index : sa cible sera complétée plus loin.
+    fn saut(&mut self) -> u32 {
+        self.table.push(Branchement { cible: 0, suite: 0, gardees: 0, retirees: 0 });
+        self.table.len() as u32 - 1
+    }
+
+    /// Ajoute l'entrée `numero` à la chaîne `attente` (voir `Cadre`), et
+    /// rend la nouvelle tête de la chaîne.
+    fn chainer(&mut self, attente: u32, numero: u32) -> u32 {
+        self.table[numero as usize].cible = attente;
+        numero + 1
+    }
+
+    /// Complète les entrées de la chaîne `attente`, qui mènent à `cible`.
+    /// La prochaine entrée créée sera celle du premier branchement après la
+    /// cible : c'est leur `suite`.
+    fn completer(&mut self, mut attente: u32, cible: u32) {
+        let suite = self.table.len() as u32;
+        while attente != 0 {
+            let entree = &mut self.table[attente as usize - 1];
+            attente = entree.cible;
+            entree.cible = cible;
+            entree.suite = suite;
+        }
     }
 
     /// L'index, dans `cadres`, du bloc désigné par l'étiquette `profondeur`
@@ -643,10 +797,11 @@ impl<'c, 'm> Validateur<'c, 'm> {
         self.locales.get(x as usize).copied().ok_or(self.erreur(Genre::IndexInconnu(Espace::Locale, x)))
     }
 
-    /// Valide une instruction. `octets` : le module, jusqu'à la fin du
-    /// corps (pour relire les cibles d'un br_table). Rend vrai au `end` qui
-    /// ferme le corps de la fonction.
-    fn instruction(&mut self, instruction: Instruction, octets: &[u8]) -> Result<bool, Erreur> {
+    /// Valide une instruction. `apres` : la position de l'instruction
+    /// suivante. `octets` : le module, jusqu'à la fin du corps (pour relire
+    /// les cibles d'un br_table). Rend vrai au `end` qui ferme le corps de
+    /// la fonction.
+    fn instruction(&mut self, instruction: Instruction, apres: u32, octets: &[u8]) -> Result<bool, Erreur> {
         use Instruction::*;
         use TypeValeur::{F32, F64, FuncRef, I32, I64};
         let p = self.position;
@@ -660,12 +815,23 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 self.depiler_types(entree)?;
                 let genre = if matches!(instruction, Block(_)) { GenreCadre::Bloc } else { GenreCadre::Boucle };
                 self.ouvrir(genre, entree, sortie);
+                if genre == GenreCadre::Boucle {
+                    let debut_table = self.table.len() as u32;
+                    let boucle = self.cadres.last_mut().expect("boucle ouverte");
+                    boucle.debut = apres;
+                    boucle.debut_table = debut_table;
+                }
             }
             If(type_bloc) => {
                 let (entree, sortie) = self.types_bloc(type_bloc)?;
                 self.depiler_type(I32)?;
                 self.depiler_types(entree)?;
+                // Si la condition est fausse, on saute la branche « alors ».
+                // Les paramètres du bloc restent sur la pile, pour la
+                // branche « sinon » : rien à déplacer.
+                let saut_si = self.saut();
                 self.ouvrir(GenreCadre::Si, entree, sortie);
+                self.cadres.last_mut().expect("if ouvert").saut_si = saut_si;
             }
             Else => {
                 // Le format binaire n'a de `else` que dans un `if` : la
@@ -678,30 +844,52 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 // La branche « alors » doit laisser les résultats du `if` ;
                 // la branche « sinon » repart de ses paramètres.
                 let si = self.fermer()?;
+                // Arrivé au `else`, l'exécution a fini la branche « alors » :
+                // elle saute à la fin. La pile contient exactement les
+                // résultats (`fermer` vient de le vérifier) : rien à
+                // déplacer.
+                let saut_else = self.saut();
+                // Si la condition est fausse, la branche « sinon » commence
+                // juste après le `else` (l'entrée du `if` est seule dans sa
+                // chaîne).
+                self.completer(si.saut_si + 1, apres);
+                // Les branchements vers la fin du `if` mènent à la fin du
+                // `else` : c'est la même. Leur chaîne passe au `else`.
+                let attente = self.chainer(si.attente, saut_else);
                 self.ouvrir(GenreCadre::Sinon, si.entree, si.sortie);
+                self.cadres.last_mut().expect("else ouvert").attente = attente;
             }
             End => {
                 // `if ... end` sans `else` abrège `if ... else end` : la
                 // branche « sinon », vide, doit transformer les paramètres
                 // du `if` en ses résultats. Ils doivent donc être les mêmes.
+                // Une condition fausse mène alors directement à la fin.
                 if self.cadre().genre == GenreCadre::Si {
                     let si = self.fermer()?;
+                    let attente = self.chainer(si.attente, si.saut_si);
                     self.ouvrir(GenreCadre::Sinon, si.entree, si.sortie);
+                    self.cadres.last_mut().expect("else ouvert").attente = attente;
                 }
                 let cadre = self.fermer()?;
                 if cadre.genre == GenreCadre::Fonction {
+                    // Les branchements vers le corps de la fonction mènent à
+                    // ce `end` final : l'exécuter fait le retour.
+                    self.completer(cadre.attente, self.position as u32);
                     return Ok(true);
                 }
+                self.completer(cadre.attente, apres);
                 self.empiler_types(cadre.sortie);
             }
             Br(profondeur) => {
                 let cible = self.etiquette(profondeur)?;
+                self.branchement(cible);
                 self.depiler_types(self.cadres[cible].etiquette())?;
                 self.inaccessible();
             }
             BrIf(profondeur) => {
                 let cible = self.etiquette(profondeur)?;
                 self.depiler_type(I32)?;
+                self.branchement(cible);
                 let types = self.cadres[cible].etiquette();
                 self.depiler_types(types)?;
                 self.empiler_types(types);
@@ -725,6 +913,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
                     if types.len() != arite {
                         return Err(self.erreur(Genre::CiblesIncompatibles));
                     }
+                    self.branchement(cible);
                     // Dépiler les types de la cible, puis rempiler ceux
                     // qu'on a TROUVÉS (push_vals(pop_vals(...))) : dans du
                     // code inaccessible, des inconnus restent des inconnus,
@@ -747,6 +936,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
                         self.empiler(t);
                     }
                 }
+                self.branchement(defaut);
                 self.depiler_types(self.cadres[defaut].etiquette())?;
                 self.inaccessible();
             }
@@ -1061,6 +1251,83 @@ mod tests {
             verdict(&module(&[], &[], &[], &code(&avant))).unwrap_err(),
             Genre::TypeInattendu { attendu: TypeValeur::F32, trouve: TypeValeur::I32 }
         );
+    }
+
+    /// La table annexe de la fonction, avec les cibles comptées depuis le
+    /// début de son code : (cible, suite, gardees, retirees).
+    fn table(parametres: &[u8], resultats: &[u8], code: &[u8]) -> Vec<(u32, u32, u32, u32)> {
+        let v = verdict(&module(parametres, resultats, &[], code)).unwrap();
+        let debut = v.module().corps[0].code.debut;
+        v.code(0).branchements.iter().map(|b| (b.cible - debut, b.suite, b.gardees, b.retirees)).collect()
+    }
+
+    #[test]
+    fn table_bloc() {
+        //  0  block (result i32)
+        //  2    i32.const 1
+        //  4    i32.const 2
+        //  6    br 0          -> 9 ; garde le 2, retire le 1
+        //  8  end
+        //  9  end
+        let code = [0x02, I32, 0x41, 1, 0x41, 2, 0x0C, 0, 0x0B];
+        assert_eq!(table(&[], &[I32], &code), [(9, 1, 1, 1)]);
+    }
+
+    #[test]
+    fn table_boucle() {
+        // Une boucle de type [i32] -> [i32] (le type 0) : brancher vers elle
+        // lui repasse son paramètre.
+        //  0  local.get 0
+        //  2  loop (type 0)
+        //  4    i32.const 1
+        //  6    i32.sub
+        //  7    local.tee 0
+        //  9    local.get 0
+        // 11    br_if 0       -> 4 (début du corps), entrée 0 ; garde 1
+        // 13  end
+        // 14  end
+        let code = [0x20, 0, 0x03, 0, 0x41, 1, 0x6B, 0x22, 0, 0x20, 0, 0x0D, 0, 0x0B];
+        assert_eq!(table(&[I32], &[I32], &code), [(4, 0, 1, 0)]);
+    }
+
+    #[test]
+    fn table_si() {
+        //  0  i32.const 1
+        //  2  if (result i32)  faux -> 7 (après else), entrée 2
+        //  4    i32.const 2
+        //  6  else             -> 10 (après end), entrée 2
+        //  7    i32.const 3
+        //  9  end
+        // 10  end
+        let code = [0x41, 1, 0x04, I32, 0x41, 2, 0x05, 0x41, 3, 0x0B];
+        assert_eq!(table(&[], &[I32], &code), [(7, 2, 0, 0), (10, 2, 0, 0)]);
+        // Sans else, le `if` et le `br` mènent tous deux à la fin.
+        //  0  i32.const 1
+        //  2  if             faux -> 7
+        //  4    br 0         -> 7
+        //  6  end
+        //  7  end
+        let code = [0x41, 1, 0x04, 0x40, 0x0C, 0, 0x0B];
+        assert_eq!(table(&[], &[], &code), [(7, 2, 0, 0), (7, 2, 0, 0)]);
+    }
+
+    #[test]
+    fn table_br_table_et_retour() {
+        // Les deux cibles reçoivent un i32 (sinon : CiblesIncompatibles).
+        //  0  block (result i32)
+        //  2    i32.const 7
+        //  4    i32.const 8
+        //  6    i32.const 0
+        //  8    br_table 0 1  cible 0 -> 13 ; garde le 8, retire le 7
+        //                     défaut (la fonction) -> 16, le `end` final
+        // 12  end
+        // 13  drop
+        // 14  i32.const 9
+        // 16  end
+        let code = [0x02, I32, 0x41, 7, 0x41, 8, 0x41, 0, 0x0E, 1, 0, 1, 0x0B, 0x1A, 0x41, 9];
+        assert_eq!(table(&[], &[I32], &code), [(13, 2, 1, 1), (16, 2, 1, 1)]);
+        let v = verdict(&module(&[], &[I32], &[], &code)).unwrap();
+        assert_eq!(v.code(0).hauteur_max, 3);
     }
 
     #[test]

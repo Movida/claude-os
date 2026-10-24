@@ -14,6 +14,7 @@
 
 mod json;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -49,7 +50,10 @@ fn rejouer(commande: &Valeur, dossier: &Path) -> Verdict {
         // instanciables » échoueront à l'instanciation (sous-étape 3).
         "module" | "assert_unlinkable" | "assert_uninstantiable" if fichier.is_some() && binaire => {
             match wasm::decoder(&lire()).and_then(wasm::valider) {
-                Ok(_) => Verdict::Reussi,
+                Ok(module) => match verifier_branchements(&module) {
+                    Ok(()) => Verdict::Reussi,
+                    Err(raison) => Verdict::Echoue(raison),
+                },
                 Err(e) if e.genre == Genre::NonPrisEnCharge => Verdict::Ignore,
                 Err(e) => Verdict::Echoue(format!("refuse a tort : {e}")),
             }
@@ -117,6 +121,43 @@ fn raison_attendue(texte: &str, genre: wasm::erreur::Genre) -> bool {
         // Un message que la table ne connaît pas encore : à y ajouter.
         _ => false,
     }
+}
+
+/// Vérifie la table annexe des branchements d'un module validé, sans
+/// refaire le travail du validateur : on relit le code, on compte les
+/// branchements (un par br, br_if, if, else ; un par cible de br_table), et
+/// chaque entrée doit mener au début d'une instruction, avec pour `suite`
+/// le nombre de branchements situés avant elle. C'est l'invariant sur
+/// lequel l'interpréteur comptera (voir validateur.rs). Que chaque saut
+/// mène au BON endroit, l'exécution le vérifiera à la sous-étape 3.
+fn verifier_branchements(valide: &wasm::ModuleValide) -> Result<(), String> {
+    use wasm::instructions::{Instruction, lire_instruction};
+    let module = valide.module();
+    for (i, corps) in module.corps.iter().enumerate() {
+        let table = &valide.code(i).branchements;
+        // Pour chaque début d'instruction : le nombre de branchements avant.
+        let mut avant = BTreeMap::new();
+        let octets = &module.octets[..corps.code.fin as usize];
+        let mut l = wasm::lecteur::Lecteur::a_partir(octets, corps.code.debut as usize);
+        let mut nombre = 0;
+        while !l.fini() {
+            avant.insert(l.position() as u32, nombre);
+            nombre += match lire_instruction(&mut l).unwrap() {
+                Instruction::Br(_) | Instruction::BrIf(_) | Instruction::If(_) | Instruction::Else => 1,
+                Instruction::BrTable { nombre, .. } => nombre + 1,
+                _ => 0,
+            };
+        }
+        if nombre as usize != table.len() {
+            return Err(format!("fonction {i} : {nombre} branchements, {} entrees", table.len()));
+        }
+        for (k, b) in table.iter().enumerate() {
+            if avant.get(&b.cible) != Some(&b.suite) {
+                return Err(format!("fonction {i}, entree {k} : cible {:#x} et suite {} incoherentes", b.cible, b.suite));
+            }
+        }
+    }
+    Ok(())
 }
 
 #[test]
