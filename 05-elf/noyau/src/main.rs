@@ -24,6 +24,7 @@ mod appel_systeme;
 mod cadres;
 mod carte_memoire;
 mod chargeur_elf;
+mod copie_utilisateur;
 mod clavier;
 mod cpu;
 mod demarrage;
@@ -197,6 +198,10 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         afficherln!("[noyau] Pagination en place, SANS le bit NX (absent du processeur) : les donnees restent executables.");
     }
     tester_cadres();
+    let p = copie_utilisateur::activer_protections();
+    let oui_non = |b: bool| if b { "oui" } else { "non (absent du processeur)" };
+    afficherln!("[noyau] Protections contre les programmes : SMEP {}, SMAP {}, UMIP {}.",
+                oui_non(p.smep), oui_non(p.smap), oui_non(p.umip));
 
     // L'allocateur de démarrage cède la mémoire à l'allocateur de pages.
     let bilan = pages::initialiser();
@@ -308,19 +313,31 @@ fn tester_espace_utilisateur() {
         e.projeter_neuve(ADRESSE + 1, 0) == Err(Erreur::AdresseInterdite),
         e.traduire(ADRESSE).map(|(c, _)| c) == Some(cadre),
     ];
-    // SAFETY : l'espace a la moitié haute du noyau (pile, code) ; la page
-    // ADRESSE y est projetée, inscriptible, et à nous. On revient sur la
-    // PML4 du noyau avant de détruire l'espace.
-    let relu = unsafe {
-        pagination::activer(e.pml4());
-        (ADRESSE as *mut u64).write_volatile(0x1234_5678);
-        pagination::activer(pagination::pml4_noyau());
-        (espace::virtuelle(cadre) as *const u64).read_volatile()
-    };
+    // On écrit par l'adresse du programme, comme un appel système : par la
+    // copie protégée (et SMAP doit refuser une lecture directe), puis on
+    // relit par la projection directe du cadre.
+    // SAFETY : l'espace a la moitié haute du noyau (pile, code) : on
+    // continue de s'exécuter après avoir changé CR3 ; on revient sur la
+    // PML4 du noyau avant de le détruire.
+    unsafe { pagination::activer(e.pml4()) };
+    let copie = copie_utilisateur::copier_vers_utilisateur(ADRESSE, &0x1234_5678u64.to_le_bytes());
+    let hors_bornes = copie_utilisateur::copier_vers_utilisateur(ADRESSE_MAX - 4, &[0; 8]);
+    let absente = copie_utilisateur::copier_vers_utilisateur(ADRESSE + 4096 - 4, &[0; 8]);
+    let smap_ok = !copie_utilisateur::SMAP_ACTIF.load(core::sync::atomic::Ordering::Relaxed)
+        || copie_utilisateur::smap_verifie(ADRESSE);
+    // SAFETY : la PML4 du noyau est complète.
+    unsafe { pagination::activer(pagination::pml4_noyau()) };
+    // SAFETY : `cadre` est la page projetée, à nous jusqu'à la destruction
+    // de l'espace.
+    let relu = unsafe { (espace::virtuelle(cadre) as *const u64).read_volatile() };
+    let refus = [refus.iter().all(|&r| r), copie.is_ok(), hors_bornes.is_err(), absente.is_err(), smap_ok];
     drop(e);
     let ok = relu == 0x1234_5678 && refus.iter().all(|&r| r) && pages::libres() == libres_avant;
-    afficherln!("[noyau] Espace d'un programme : page {:#x} ecrite par son adresse, relue par le cadre {:#x} ; memoire rendue : {}.",
+    afficherln!("[noyau] Espace d'un programme : page {:#x} ecrite par son adresse (copie protegee), relue par le cadre {:#x} ; memoire rendue : {}.",
                 ADRESSE, cadre, if ok { "ok" } else { "ECHEC" });
+    if copie_utilisateur::SMAP_ACTIF.load(core::sync::atomic::Ordering::Relaxed) && smap_ok {
+        afficherln!("[noyau] SMAP verifie : une lecture directe de la memoire d'un programme fait faute.");
+    }
 }
 
 /// Vérifie le tas : des collections de Rust de toutes tailles, et un objet

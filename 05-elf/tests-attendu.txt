@@ -1,6 +1,7 @@
 [linux] write(adresse du noyau) : -EFAULT, on continue.
 [linux] write(adresse non projetee) : -EFAULT, on continue.
 [linux] write(plage qui franchit la limite) : -EFAULT, on continue.
+[linux] write(plage a cheval sur une page absente) : -EFAULT, on continue.
 [noyau] appel systeme inconnu : 9999
 [linux] appel 9999 : -ENOSYS, on continue.
 [noyau] pointeurs : termine, code de sortie 0 ; memoire rendue : ok.

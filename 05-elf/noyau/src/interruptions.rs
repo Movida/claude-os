@@ -23,7 +23,7 @@
 //! dans la version expérimentale (nightly) du compilateur, et elle cache ce
 //! qui se passe.
 
-use crate::{clavier, gdt, horloge, linux, pic, tache};
+use crate::{clavier, copie_utilisateur, gdt, horloge, linux, pic, tache};
 use crate::verrou::Verrou;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
@@ -83,11 +83,26 @@ const NB_TALONS: usize = 48;
 // Les talons, générés par une macro de l'assembleur pour chaque vecteur.
 // Les exceptions 8, 10-14, 17, 21, 29 et 30 empilent déjà un code
 // d'erreur ; pour les autres, on en empile un nul.
+//
+// Chaque talon commence par `clac` (si le processeur a SMAP) : le
+// processeur ne remet PAS le drapeau AC à zéro en entrant dans une
+// interruption, et AC = 1 en anneau 0 suspend SMAP. Une interruption qui
+// tombe pendant une copie vers un programme (stac ... clac, voir
+// copie_utilisateur.rs), ou un programme qui a lui-même mis AC à 1 avant
+// d'être interrompu, laisserait sinon tout le gestionnaire sans SMAP.
+// iretq rétablit AC tel qu'il était. C'est l'ASM_CLAC en tête des
+// idtentry de Linux. (L'entrée de `syscall`, elle, efface AC par son
+// masque FMASK.) Le test d'un octet ne touche que les drapeaux, que le
+// processeur a déjà sauvés dans le cadre.
 global_asm!(
     r#"
     .macro TALON num
     .align 16
 talon_\num:
+    cmp byte ptr [rip + SMAP_ACTIF], 0
+    je 1f
+    clac
+1:
     .if \num == 8 || (\num >= 10 && \num <= 14) || \num == 17 || \num == 21 || \num == 29 || \num == 30
     .else
         push 0
@@ -277,6 +292,13 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     }
     match vecteur {
         2 | 8 | 18 => exception_fatale(cadre),
+        // Une faute du noyau prévue : une copie depuis ou vers la mémoire
+        // d'un programme qui touche une page absente (ou interdite). On
+        // reprend à l'adresse prévue par la table d'exceptions, qui fera
+        // rendre EFAULT à l'appel système.
+        14 if !depuis_programme && copie_utilisateur::reprise(cadre.rip).is_some() => {
+            cadre.rip = copie_utilisateur::reprise(cadre.rip).unwrap_or(cadre.rip);
+        }
         _ if depuis_programme => {
             let cr2 = if vecteur == 14 { lire_cr2() } else { 0 };
             let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, cr2);

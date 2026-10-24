@@ -33,6 +33,14 @@ SECTIONS
     .rodata : AT(ADDR(.rodata) - BASE_NOYAU) ALIGN(4096) {
         __lecture_seule_debut = .;
         *(.rodata .rodata.*)
+        /* La table d'exceptions (src/copie_utilisateur.rs) : des paires
+           d'adresses (instruction qui peut fauter, adresse de reprise),
+           lues par le gestionnaire de faute de page. En lecture seule :
+           une erreur du noyau ne doit pas pouvoir y ajouter de reprise. */
+        . = ALIGN(8);
+        __debut_ex_table = .;
+        KEEP(*(__ex_table))
+        __fin_ex_table = .;
     }
 
     .data : AT(ADDR(.data) - BASE_NOYAU) ALIGN(4096) {

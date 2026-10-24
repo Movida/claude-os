@@ -17,7 +17,7 @@
 
 use core::fmt;
 
-use crate::espace_utilisateur;
+use crate::copie_utilisateur::copier_depuis_utilisateur;
 use crate::interruptions::Cadre;
 use crate::{console, tache};
 
@@ -57,12 +57,12 @@ fn write(fichier: u64, tampon: u64, nombre: u64) -> i64 {
     if fichier != 1 && fichier != 2 {
         return -EBADF;
     }
-    // Les octets du programme passent par un tampon du noyau : on lit sa
-    // mémoire d'abord, sans rien tenir, puis on écrit sur la console (qui,
-    // elle, prend son verrou).
+    // Les octets du programme passent par un tampon du noyau : on copie sa
+    // mémoire d'abord, sans rien tenir (une copie peut fauter), puis on
+    // écrit sur la console (qui, elle, prend son verrou).
     let mut copie = [0u8; ECRITURE_MAX];
     let n = (nombre as usize).min(ECRITURE_MAX);
-    if espace_utilisateur::lire_courant(tampon, &mut copie[..n]).is_err() {
+    if copier_depuis_utilisateur(&mut copie[..n], tampon).is_err() {
         return -EFAULT;
     }
     console::ecrire_octets(&copie[..n]);

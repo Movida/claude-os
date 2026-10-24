@@ -121,7 +121,7 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 #   - tronque : les 40 premiers octets d'un exécutable.
 # Enfin bonjour-asm, pour montrer que le noyau exécute encore des
 # programmes après tout cela.
-TESTS_LINUX = pointeurs ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss recursion boucle \
+TESTS_LINUX = pointeurs ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt recursion boucle \
               wx derniere-page et-dyn tronque
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
@@ -266,7 +266,9 @@ $(WAST2JSON):
 #     Chaque ligne de tests-attendu.txt doit être dans ce qu'il affiche.
 #     Deux fois : avec le processeur par défaut (qemu64), puis avec toutes
 #     les fonctions que QEMU sait imiter (-cpu max : SMEP, SMAP, UMIP...),
-#     pour passer aussi par les chemins « si le processeur l'a ».
+#     pour passer aussi par les chemins « si le processeur l'a » ; avec, en
+#     plus, les lignes propres à chacun (tests-attendu-qemu64.txt,
+#     tests-attendu-max.txt).
 QEMU_TEST = timeout 2 qemu-system-x86_64 -display none -no-reboot
 QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
@@ -282,6 +284,9 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin
 	  while IFS= read -r ligne; do \
 	    grep -qF -- "$$ligne" test-programmes-$$cpu.log || { echo "-cpu $$cpu : manque « $$ligne »"; exit 1; }; \
 	  done < tests-attendu.txt; \
+	  while IFS= read -r ligne; do \
+	    grep -qF -- "$$ligne" test-programmes-$$cpu.log || { echo "-cpu $$cpu : manque « $$ligne »"; exit 1; }; \
+	  done < tests-attendu-$$cpu.txt; \
 	done
 
 test-programmes.bin: tests.cpio FORCE

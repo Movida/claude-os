@@ -19,7 +19,7 @@
 //!
 //! La copie passe par la projection directe des cadres (voir
 //! EspaceUtilisateur::ecrire) : le noyau n'écrit jamais par les adresses
-//! du programme, il n'a donc rien à ouvrir côté SMAP (sous-étape 7).
+//! du programme, il n'a donc rien à ouvrir côté SMAP (copie_utilisateur.rs).
 
 use crate::espace_utilisateur::{self, EspaceUtilisateur};
 use crate::pagination;

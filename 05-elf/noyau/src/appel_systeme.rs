@@ -68,7 +68,7 @@ const EFER_SCE: u64 = 1 << 0;
 ///   - TF : pas de pas-à-pas dans le noyau ;
 ///   - DF : le sens des copies (`rep movsb`) attendu par le compilateur ;
 ///   - AC : l'alignement contrôlé, et surtout, avec SMAP, la permission de
-///     toucher la mémoire du programme (sous-étape 7) ;
+///     toucher la mémoire du programme (copie_utilisateur.rs) ;
 ///   - NT et IOPL : des restes du 32 bits, qu'un programme pourrait
 ///     armer pour tromper un `iret` ou un `in`/`out` ;
 ///   - RF, ID, et les drapeaux arithmétiques (CF, PF, AF, ZF, SF, OF) :
