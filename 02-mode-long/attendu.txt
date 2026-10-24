@@ -1,2 +1,4 @@
 [16 bits] 1er etage : lecture de la suite sur le disque
 [16 bits] 2e etage charge depuis le disque
+[32 bits] Mode protege actif
+[32 bits] Le processeur sait passer en 64 bits
