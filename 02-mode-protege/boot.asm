@@ -286,14 +286,51 @@ gdt_null:
     dq 0
 
 gdt_code:
-    ; Segment de CODE noyau (sélecteur 0x08) : décrit au commit suivant.
-    ; Tant qu'il vaut 0, le CPU le voit « absent » et le saut lointain
-    ; provoque une faute, puis un redémarrage.
-    dq 0
+    ; Segment de CODE noyau (sélecteur 0x08), modèle « plat » :
+    ; base 0, limite maximale, donc il couvre les 4 Gio.
+    ;
+    ; Pourquoi le modèle plat ? C'est le choix de Linux, de Windows et de
+    ; tous les noyaux modernes :
+    ;   - la protection mémoire viendra de la PAGINATION (étape 3), plus fine
+    ;     (pages de 4 Kio) et la seule qui existe encore en 64 bits ;
+    ;   - en mode long, le CPU ignore base et limite des segments de code et
+    ;     de données : investir dans la segmentation serait du travail perdu ;
+    ;   - un compilateur C suppose qu'un pointeur est une simple adresse,
+    ;     identique quel que soit le segment : c'est vrai seulement si tous
+    ;     les segments commencent à 0.
+    dw 0xFFFF           ; Limite, bits 0-15.
+    dw 0x0000           ; Base, bits 0-15.
+    db 0x00             ; Base, bits 16-23.
+    db 10011011b        ; Accès : P=1 (présent), DPL=00 (noyau), S=1,
+                        ;   E=1 (code), DC=0 (non « conforming » : un code
+                        ;   moins privilégié ne peut pas sauter ici),
+                        ;   RW=1 (lisible : permet de lire des constantes
+                        ;   rangées au milieu du code), A=1.
+                        ; A=1 d'avance, comme le fait Linux : sinon le CPU
+                        ; écrit lui-même ce bit dans la table au premier
+                        ; chargement, ce qui échoue si la GDT est en mémoire
+                        ; protégée en lecture seule.
+    db 11001111b        ; Flags G=1 (limite en blocs de 4 Kio), DB=1
+                        ;   (32 bits), L=0, puis limite bits 16-19 = 0xF.
+                        ; Limite 0xFFFFF x 4 Kio = 4 Gio : tout l'espace 32 bits.
+    db 0x00             ; Base, bits 24-31.
 
 gdt_data:
-    ; Segment de DONNÉES noyau (sélecteur 0x10) : décrit au commit suivant.
-    dq 0
+    ; Segment de DONNÉES noyau (sélecteur 0x10) : le jumeau du code, même
+    ; base, même limite, mêmes flags. Seul l'octet d'accès change.
+    dw 0xFFFF
+    dw 0x0000
+    db 0x00
+    db 10010011b        ; Accès : P=1, DPL=00, S=1, E=0 (données),
+                        ;   DC=0 (croît vers le haut, le cas normal),
+                        ;   RW=1 (inscriptible : indispensable pour la pile
+                        ;   et les variables), A=1.
+    db 11001111b        ; Pour des données, DB=1 veut dire que la pile
+                        ;   utilise esp (32 bits) et non sp.
+    db 0x00
+
+; Pas encore de segments utilisateur (DPL=3) ni de TSS : ils arriveront avec
+; les processus. Le mode 64 bits demandera un descripteur de code avec L=1.
 
 gdt_end:
 
