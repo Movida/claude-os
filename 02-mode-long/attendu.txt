@@ -2,3 +2,4 @@
 [16 bits] 2e etage charge depuis le disque
 [32 bits] Mode protege actif
 [32 bits] Le processeur sait passer en 64 bits
+[32 bits] Pagination active, mode long actif

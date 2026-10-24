@@ -278,6 +278,97 @@ pm_entry:
     mov esi, msg_cpu64
     mov edi, 0xB8000 + 3 * 80 * 2
     call print32
+
+    ; --- Les tables de pages ------------------------------------------------------
+    ; En mode long, la pagination est OBLIGATOIRE : chaque adresse que manipule
+    ; le code (adresse « virtuelle ») est traduite par le CPU en adresse
+    ; physique, en descendant un arbre de tables. Chaque table fait 4 Kio et
+    ; contient 512 entrées de 8 octets ; chaque niveau consomme 9 bits de
+    ; l'adresse virtuelle :
+    ;
+    ;   bits 47-39 -> entrée de la PML4  -> adresse d'une PDPT
+    ;   bits 38-30 -> entrée de la PDPT  -> adresse d'une PD
+    ;   bits 29-21 -> entrée de la PD    -> une page de 2 Mio (bit PS = 1)
+    ;   bits 20-0  -> position dans cette page de 2 Mio
+    ;
+    ; Nos choix :
+    ;   - correspondance IDENTITÉ (adresse virtuelle = adresse physique) : le
+    ;     code qui active la pagination continue de s'exécuter à la même
+    ;     adresse, sans quoi l'instruction suivante serait introuvable. Le
+    ;     noyau mettra plus tard sa propre organisation (noyau dans la moitié
+    ;     haute de l'espace d'adresses, comme Linux) ;
+    ;   - pages de 2 Mio : un seul niveau de moins à remplir. Des pages de
+    ;     4 Kio couvriraient 1 Gio avec 512 tables de plus (2 Mio de tables) ;
+    ;     des pages de 1 Gio n'existent pas sur tous les CPU (cpuid pdpe1gb),
+    ;     et QEMU ne les propose pas par défaut. Linux fait comme nous au
+    ;     démarrage ;
+    ;   - 1 Gio couvert : une seule PD suffit (512 x 2 Mio), et c'est
+    ;     largement assez pour le chargeur, la mémoire vidéo et un noyau.
+    ;
+    ; Où les ranger ? Dans la mémoire basse libre (0x1000-0x3FFF), comme tout
+    ; ce que notre chargeur utilise. Chaque table doit être alignée sur 4 Kio :
+    ; une entrée ne stocke que les bits hauts de l'adresse de la table suivante.
+    ; (Les mettre dans l'image disque coûterait 12 Kio de zéros à lire.)
+    mov edi, PML4
+    xor eax, eax
+    mov ecx, 3 * 4096 / 4
+    rep stosd               ; Trois tables à zéro : entrée nulle = « absente ».
+
+    ; Bits bas d'une entrée : bit 0 = P (présente), bit 1 = RW (inscriptible).
+    ; Bit 2 = U/S reste à 0 : réservé au noyau, inaccessible en mode utilisateur.
+    mov dword [PML4], PDPT | 0x03   ; PML4[0] -> PDPT : couvre 0 à 512 Gio.
+    mov dword [PDPT], PD   | 0x03   ; PDPT[0] -> PD   : couvre 0 à 1 Gio.
+
+    ; PD[i] = page de 2 Mio commençant à i x 2 Mio. 0x83 = P + RW + PS (bit 7,
+    ; « page de grande taille » : l'entrée désigne la page elle-même, pas une
+    ; table de niveau inférieur).
+    mov edi, PD
+    mov eax, 0x83
+    mov ecx, 512
+.remplir_pd:
+    mov [edi], eax          ; Les 4 octets hauts de l'entrée restent à 0 :
+    add eax, 0x200000       ; nos adresses physiques tiennent sous 4 Gio.
+    add edi, 8
+    loop .remplir_pd
+
+    ; --- Activer le mode long -----------------------------------------------------
+    ; Trois interrupteurs, dans un ordre imposé par le manuel d'Intel :
+    ; 1. CR4.PAE (bit 5) : entrées de pages de 8 octets (au lieu de 4 en
+    ;    32 bits classique). Le mode long n'existe qu'avec ce format.
+    mov eax, cr4
+    or eax, 1 << 5
+    mov cr4, eax
+
+    ; 2. CR3 = adresse physique de la racine de l'arbre (la PML4).
+    mov eax, PML4
+    mov cr3, eax
+
+    ; 3. EFER.LME (bit 8) : « je veux le mode long ». EFER n'est pas un
+    ;    registre ordinaire mais un MSR (Model Specific Register), qu'on lit
+    ;    et écrit avec rdmsr/wrmsr ; son numéro va dans ecx, sa valeur dans
+    ;    edx:eax.
+    mov ecx, EFER
+    rdmsr
+    or eax, 1 << 8
+    wrmsr
+
+    ; 4. CR0.PG (bit 31) : la pagination démarre, et avec LME le CPU entre
+    ;    en mode long. Le bit EFER.LMA (« Long Mode Active ») passe à 1 tout
+    ;    seul. Comme CS désigne encore un segment 32 bits (L=0), le CPU est
+    ;    dans le sous-mode « compatibilité » : celui qui permettra aussi de
+    ;    faire tourner des programmes 32 bits sous un noyau 64 bits.
+    mov eax, cr0
+    or eax, 1 << 31
+    mov cr0, eax
+
+    ; On ne se fie pas à l'absence de plantage : on relit EFER.LMA (bit 10).
+    mov ecx, EFER
+    rdmsr
+    test eax, 1 << 10
+    jz halt32
+    mov esi, msg_compat
+    mov edi, 0xB8000 + 4 * 80 * 2
+    call print32
     jmp halt32
 
 .pas_de_64:
@@ -379,7 +470,7 @@ gdt_code:
     ;
     ; Pourquoi le modèle plat ? C'est le choix de Linux, de Windows et de
     ; tous les noyaux modernes :
-    ;   - la protection mémoire viendra de la PAGINATION (étape 3), plus fine
+    ;   - la protection mémoire viendra de la PAGINATION (plus bas dans ce fichier), plus fine
     ;     (pages de 4 Kio) et la seule qui existe encore en 64 bits ;
     ;   - en mode long, le CPU ignore base et limite des segments de code et
     ;     de données : investir dans la segmentation serait du travail perdu ;
@@ -430,6 +521,13 @@ gdt_descriptor:
 CODE_SEL equ gdt_code - gdt_start   ; = 0x08
 DATA_SEL equ gdt_data - gdt_start   ; = 0x10
 
+; Les trois tables de pages, en mémoire basse libre, alignées sur 4 Kio.
+PML4 equ 0x1000
+PDPT equ 0x2000
+PD   equ 0x3000
+
+EFER equ 0xC0000080     ; Numéro du MSR « Extended Feature Enable Register ».
+
 
 ; -----------------------------------------------------------------------------
 ;  Messages du 2e étage
@@ -438,6 +536,7 @@ msg_etage2:  db "[16 bits] 2e etage charge depuis le disque.", 13, 10, 0
 msg_a20_ko:  db "[16 bits] ERREUR : la ligne A20 refuse de s'activer.", 13, 10, 0
 msg_protege: db "[32 bits] Mode protege actif.", 13, 10, 0
 msg_cpu64:   db "[32 bits] Le processeur sait passer en 64 bits (cpuid, bit LM).", 13, 10, 0
+msg_compat:  db "[32 bits] Pagination active, mode long actif (sous-mode compatibilite).", 13, 10, 0
 msg_pas_64:  db "[32 bits] ERREUR : ce processeur n'a pas de mode 64 bits.", 13, 10, 0
 
 fin_image:
