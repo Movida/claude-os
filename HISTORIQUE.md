@@ -32,7 +32,7 @@ Ce fichier reprend la conversation de départ du projet (24 octobre 2026), pour 
 6. **Compatibilité :** elle dépend des interfaces respectées, pas du langage (l'interface binaire du C, les appels système de Linux). Piste évoquée : **WebAssembly + WASI**, un noyau qui embarque un moteur Wasm et fait tourner tous les programmes dedans (exemple historique : le projet expérimental Nebulet). David trouve cette piste très intéressante.
 7. **Problème :** Claude Code est un binaire natif x86_64, pas du WebAssembly. Deux options : une couche de compatibilité Linux dans le noyau, ou un agent maison qui appelle l'API Claude.
 8. David préférait l'agent maison, **mais veut utiliser son abonnement Claude**. Or l'abonnement est réservé aux applications officielles comme Claude Code : un agent maison qui s'y connecterait sortirait des conditions d'utilisation d'Anthropic.
-9. **Décision :** faire tourner **le vrai Claude Code**, grâce à une **couche de compatibilité Linux** dans notre noyau. (WebAssembly reste une piste annexe possible, sans décision.)
+9. **Décision :** faire tourner **le vrai Claude Code**, grâce à une **couche de compatibilité Linux** dans notre noyau. (WebAssembly reste une piste annexe possible, sans décision. Revu le 24 octobre 2026 : voir la section 8.)
 10. **Premier objectif concret :** que le noyau charge et exécute un petit programme Linux statique (un « bonjour » compilé normalement). Ça oblige à lire le format ELF et à implémenter les premiers appels système, `write` et `exit`. On montera ensuite petit à petit jusqu'à ce qu'il faut pour Claude Code.
 
 ## 3. Étape 1 réalisée : le secteur de démarrage
@@ -74,11 +74,29 @@ David préfère apprendre en lisant le code et les commentaires plutôt qu'en fa
 
 **Vérifié dans QEMU** : chaque sous-étape avec `verifier.sh`, le moniteur QEMU (EFER = 0x500, CR3 = 0x1000, CS 64 bits) et le cas d'erreur d'un processeur 32 bits (`-cpu qemu32`).
 
-## 8. Questions ouvertes
+## 8. Architecture hybride : WebAssembly et compatibilité Linux (24 octobre 2026)
+
+**Point de départ :** David voulait faire de WebAssembly la voie principale.
+
+**Vérification :** Claude Code 2.1.310 n'est livré qu'en binaire natif ELF x86_64, construit avec Bun. Il pèse environ 290 Mo, est lié dynamiquement à la glibc et est publié sous « All rights reserved ». Il n'y a pas de JavaScript séparé à récupérer. L'option « faire tourner le JavaScript de Claude Code sur un moteur JavaScript compilé en Wasm » est donc écartée : ce serait fragile (il faudrait imiter les API propres à Bun), et ce ne serait plus l'application officielle.
+
+**Décision de David : une architecture hybride.**
+
+- **WebAssembly devient le format natif des programmes de l'OS.** Chaque programme tourne dans le bac à sable Wasm, qui assure l'isolation (à la façon de Nebulet), avec WASI comme interface système.
+- **Une couche de compatibilité Linux minimale** sert uniquement à exécuter le binaire `claude` tel quel. Comme c'est un ELF dynamique, il faudra aussi charger ld-linux et la glibc.
+- **Le socle natif** reste en assembleur, puis dans le langage du noyau à choisir.
+
+**Nouvelle feuille de route :**
+
+3. Mémoire, interruptions, clavier.
+4. Interpréteur Wasm dans le noyau : d'abord une bibliothèque testée sur l'hôte avec la suite de tests officielle, puis WASI minimal (`fd_write`, `proc_exit`).
+5. Chargeur ELF et premiers appels système Linux (`write`, `exit`).
+6. Processus, fichiers, réseau virtio, TLS, jusqu'à Claude Code.
+
+## 9. Questions ouvertes
 
 - Le langage du noyau (C recommandé ; Rust ou Zig possibles), à trancher maintenant : la suite du travail se fera dans un vrai noyau chargé par notre chargeur.
-- La place de WebAssembly dans l'architecture.
 
-## 9. Prochaine étape
+## 10. Prochaine étape
 
 Étape 3 : mémoire, interruptions, clavier. Une table d'interruptions (IDT) pour attraper les exceptions du processeur au lieu de redémarrer, l'horloge, puis le clavier. C'est aussi le moment de charger un vrai noyau, écrit dans le langage retenu.

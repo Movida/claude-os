@@ -1,8 +1,14 @@
 # OS minimal pour Claude Code
 
-Projet d'apprentissage : écrire soi-même, brique par brique, un OS x86 qui démarre sur du vrai matériel comme en VM, et qui fera tourner à terme le vrai Claude Code grâce à une couche de compatibilité Linux (format ELF, appels système).
+Projet d'apprentissage : écrire soi-même, brique par brique, un OS x86 qui démarre sur du vrai matériel comme en VM, et qui fera tourner à terme le vrai Claude Code.
 
-Le vrai Claude Code plutôt qu'un agent maison, parce que David veut utiliser son abonnement Claude, réservé aux applications officielles. Le détail des décisions et les questions ouvertes sont dans `HISTORIQUE.md`.
+Architecture hybride :
+
+- **WebAssembly est le format natif des programmes de l'OS.** Le noyau embarque un moteur Wasm, et chaque programme tourne dans le bac à sable Wasm (isolation à la façon de Nebulet), avec WASI comme interface système.
+- **Une couche de compatibilité Linux minimale** sert uniquement à exécuter le binaire `claude` tel quel : un ELF x86_64 dynamique, qui demande aussi ld-linux et la glibc.
+- Le socle natif (démarrage, mémoire, interruptions, pilotes) est en assembleur, puis dans le langage du noyau, encore à choisir.
+
+Le vrai Claude Code plutôt qu'un agent maison, parce que David veut utiliser son abonnement Claude, réservé aux applications officielles. Et il n'existe qu'en binaire natif : d'où la couche Linux à côté de Wasm. Le détail des décisions et les questions ouvertes sont dans `HISTORIQUE.md`.
 
 ## Façon de travailler
 
@@ -43,7 +49,8 @@ Puis lire `serial.log`. Pour une capture de l'écran, envoyer `screendump ecran.
 1. Secteur de démarrage 16 bits, démarrage BIOS legacy (fait)
 2. Passage en mode protégé 32 bits, puis en mode long 64 bits (fait)
 3. Mémoire, interruptions, clavier
-4. Chargement d'un exécutable ELF statique et premiers appels système Linux (`write`, `exit`)
-5. Processus, système de fichiers, réseau (virtio), TLS… jusqu'à Claude Code
+4. Interpréteur WebAssembly dans le noyau (d'abord une bibliothèque testée sur l'hôte avec la suite de tests officielle de Wasm), puis WASI minimal (`fd_write`, `proc_exit`)
+5. Chargeur ELF et premiers appels système Linux (`write`, `exit`)
+6. Processus, système de fichiers, réseau (virtio), TLS… jusqu'à Claude Code
 
 Plus tard : un chargeur UEFI, nécessaire pour démarrer sur les PC récents sans mode Legacy/CSM.
