@@ -9,23 +9,30 @@
 //!
 //! Lancer : `make tests-hote` dans 04-wasm (ou `cargo test -- --nocapture` dans
 //! 04-wasm/wasm une fois la suite convertie). Le tableau affiché donne, par
-//! fichier, les commandes réussies, échouées et pas encore prises en charge :
-//! à chaque sous-étape, des commandes « ignorées » deviennent « réussies ».
+//! fichier, les commandes réussies, échouées et ignorées. Restent ignorés
+//! les modules au format texte (wast2json n'en fait pas des .wasm : ils
+//! testent l'analyseur de texte, que nous n'avons pas) et ceux qui
+//! utilisent SIMD.
 
 mod json;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use json::Valeur;
+use wasm::erreur::Genre;
+use wasm::module::{Limites, TypeFonction, TypeGlobale, TypeTable, TypeValeur};
+use wasm::validateur::ModuleValide;
+use wasm::{ErreurInstanciation, Externe, Hote, Magasin, Piege, Valeur as ValeurWasm};
 
 /// Le résultat d'une commande.
 enum Verdict {
     Reussi,
     Echoue(String),
-    /// Pas encore testable : la fonctionnalité viendra à une sous-étape
-    /// suivante (validation, exécution), ou le module est au format texte.
+    /// Pas testable ici : le module est au format texte (nous ne lisons que
+    /// le binaire), ou utilise SIMD.
     Ignore,
 }
 
@@ -36,51 +43,295 @@ fn dossier_suite() -> PathBuf {
     }
 }
 
-/// Rejoue une commande. `dossier` : où sont les .wasm du fichier.
-fn rejouer(commande: &Valeur, dossier: &Path) -> Verdict {
-    use wasm::erreur::Genre;
-    let genre = commande.champ("type").texte().unwrap_or("");
-    let fichier = commande.champ("filename").texte();
-    let binaire = commande.champ("module_type").texte() != Some("text");
-    let attendu = commande.champ("text").texte().unwrap_or("?");
-    let lire = || fs::read(dossier.join(fichier.unwrap())).expect("module de la suite illisible");
-    match genre {
-        // Ces modules sont bien formés et valides : ils doivent se décoder
-        // et passer la validation. Les « non liables » et « non
-        // instanciables » échoueront à l'instanciation (sous-étape 3).
-        "module" | "assert_unlinkable" | "assert_uninstantiable" if fichier.is_some() && binaire => {
-            match wasm::decoder(&lire()).and_then(wasm::valider) {
-                Ok(module) => match verifier_branchements(&module) {
-                    Ok(()) => Verdict::Reussi,
-                    Err(raison) => Verdict::Echoue(raison),
+/// L'hôte du banc : les fonctions du module « spectest » (print_i32...),
+/// qui n'affichent rien.
+struct Spectest;
+
+impl Hote for Spectest {
+    fn appeler(&mut self, _: u32, _: &[ValeurWasm], _: &mut [ValeurWasm], _: Option<&mut [u8]>) -> Result<(), Piege> {
+        Ok(())
+    }
+}
+
+/// Le module « spectest » que la suite importe, celui de l'interpréteur de
+/// référence : des fonctions print, quatre globales valant 666 (ou 666,6),
+/// une table de 10 à 20 éléments, une mémoire de 1 à 2 pages.
+fn spectest(m: &mut Magasin) -> BTreeMap<&'static str, Externe> {
+    use TypeValeur::*;
+    let mut s = BTreeMap::new();
+    let fonctions: [(&str, &[TypeValeur]); 7] = [
+        ("print", &[]),
+        ("print_i32", &[I32]),
+        ("print_i64", &[I64]),
+        ("print_f32", &[F32]),
+        ("print_f64", &[F64]),
+        ("print_i32_f32", &[I32, F32]),
+        ("print_f64_f64", &[F64, F64]),
+    ];
+    for (nom, parametres) in fonctions {
+        let t = TypeFonction { parametres: parametres.into(), resultats: Box::new([]) };
+        s.insert(nom, m.ajouter_fonction_hote(t, 0));
+    }
+    let globales = [
+        ("global_i32", ValeurWasm::I32(666)),
+        ("global_i64", ValeurWasm::I64(666)),
+        ("global_f32", ValeurWasm::F32(666.6f32.to_bits())),
+        ("global_f64", ValeurWasm::F64(666.6f64.to_bits())),
+    ];
+    for (nom, v) in globales {
+        let t = TypeGlobale { valeur: v.type_valeur(), modifiable: false };
+        s.insert(nom, m.ajouter_globale(t, v).unwrap());
+    }
+    let table = TypeTable { element: FuncRef, limites: Limites { min: 10, max: Some(20) } };
+    s.insert("table", m.ajouter_table(table).unwrap());
+    s.insert("memory", m.ajouter_memoire(Limites { min: 1, max: Some(2) }).unwrap());
+    s
+}
+
+/// Une valeur de la suite : {"type": "i32", "value": "42"}. Les entiers
+/// sont écrits sans signe, les flottants par leurs bits, les références
+/// par leur numéro ou « null ».
+fn valeur(v: &Valeur) -> Option<ValeurWasm> {
+    let texte = v.champ("value").texte()?;
+    let reference = || if texte == "null" { Some(None) } else { texte.parse().ok().map(Some) };
+    Some(match v.champ("type").texte()? {
+        "i32" => ValeurWasm::I32(texte.parse().ok()?),
+        "i64" => ValeurWasm::I64(texte.parse().ok()?),
+        "f32" => ValeurWasm::F32(texte.parse().ok()?),
+        "f64" => ValeurWasm::F64(texte.parse().ok()?),
+        "externref" => ValeurWasm::ExternRef(reference()?),
+        "funcref" => ValeurWasm::FuncRef(reference()?),
+        _ => return None,
+    })
+}
+
+/// Le résultat obtenu est-il celui qu'attend la suite ? Pour un NaN, elle
+/// n'attend pas des bits précis mais une forme : « canonique » (seul le
+/// bit silencieux de la mantisse à 1, signe quelconque) ou « arithmétique »
+/// (le bit silencieux à 1, le reste quelconque).
+fn conforme(attendu: &Valeur, obtenu: ValeurWasm) -> bool {
+    match (attendu.champ("value").texte(), obtenu) {
+        (Some("nan:canonical"), ValeurWasm::F32(b)) => b & 0x7FFF_FFFF == 0x7FC0_0000,
+        (Some("nan:arithmetic"), ValeurWasm::F32(b)) => b & 0x7FC0_0000 == 0x7FC0_0000,
+        (Some("nan:canonical"), ValeurWasm::F64(b)) => b & 0x7FFF_FFFF_FFFF_FFFF == 0x7FF8_0000_0000_0000,
+        (Some("nan:arithmetic"), ValeurWasm::F64(b)) => b & 0x7FF8_0000_0000_0000 == 0x7FF8_0000_0000_0000,
+        _ => valeur(attendu) == Some(obtenu),
+    }
+}
+
+/// Le piège obtenu est-il celui qu'attend la suite ?
+fn piege_attendu(texte: &str, p: Piege) -> bool {
+    use Piege::*;
+    p == match texte.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end() {
+        "unreachable" => Inatteignable,
+        "out of bounds memory access" => AccesMemoireHorsLimites,
+        "out of bounds table access" => AccesTableHorsLimites,
+        "undefined element" => ElementIndefini,
+        "uninitialized element" => ElementNonInitialise,
+        "indirect call type mismatch" => TypeDAppelIndirect,
+        "integer divide by zero" => DivisionParZero,
+        "integer overflow" => DebordementEntier,
+        "invalid conversion to integer" => ConversionInvalide,
+        "call stack exhausted" => PileEpuisee,
+        // Un message que la table ne connaît pas encore : à y ajouter.
+        _ => return false,
+    }
+}
+
+/// L'état du banc pendant un fichier de la suite. Chaque fichier repart
+/// d'un magasin neuf, comme avec l'interpréteur de référence.
+struct Banc {
+    dossier: PathBuf,
+    magasin: Magasin,
+    spectest: BTreeMap<&'static str, Externe>,
+    /// Les modules nommés dans le .wast ($M), le dernier chargé (celui des
+    /// actions qui ne nomment pas de module), et ceux enregistrés sous un
+    /// nom de module (register), que les suivants peuvent importer.
+    noms: BTreeMap<String, u32>,
+    dernier: Option<u32>,
+    enregistres: BTreeMap<String, u32>,
+}
+
+impl Banc {
+    fn new(dossier: &Path) -> Banc {
+        let mut magasin = Magasin::new();
+        let spectest = spectest(&mut magasin);
+        Banc {
+            dossier: dossier.to_path_buf(),
+            magasin,
+            spectest,
+            noms: BTreeMap::new(),
+            dernier: None,
+            enregistres: BTreeMap::new(),
+        }
+    }
+
+    /// Décode et valide le module d'une commande. Un module SIMD est ignoré.
+    fn charger(&self, commande: &Valeur) -> Result<Arc<ModuleValide>, Verdict> {
+        let fichier = commande.champ("filename").texte().expect("commande sans module");
+        let octets = fs::read(self.dossier.join(fichier)).expect("module de la suite illisible");
+        let module = wasm::decoder(&octets).and_then(wasm::valider).map_err(|e| match e.genre {
+            Genre::NonPrisEnCharge => Verdict::Ignore,
+            _ => Verdict::Echoue(format!("refuse a tort : {e}")),
+        })?;
+        verifier_branchements(&module).map_err(Verdict::Echoue)?;
+        Ok(Arc::new(module))
+    }
+
+    /// Ce que le banc, qui joue l'environnement, donne aux imports d'un
+    /// module : spectest, ou ce qu'exporte un module enregistré.
+    fn imports(&self, module: &ModuleValide) -> Result<Vec<Externe>, String> {
+        module
+            .module()
+            .imports
+            .iter()
+            .map(|i| {
+                let trouve = if i.module == "spectest" {
+                    self.spectest.get(i.nom.as_str()).copied()
+                } else {
+                    self.enregistres.get(&i.module).and_then(|&n| self.magasin.exporte(n, &i.nom))
+                };
+                trouve.ok_or_else(|| format!("import inconnu : {} {}", i.module, i.nom))
+            })
+            .collect()
+    }
+
+    /// Une action : appeler une fonction exportée, ou lire une globale
+    /// exportée. L'erreur extérieure est celle du banc (module ou export
+    /// absent), l'intérieure un piège.
+    fn action(&mut self, action: &Valeur) -> Result<Result<Vec<ValeurWasm>, Piege>, Verdict> {
+        let instance = match action.champ("module").texte() {
+            Some(nom) => self.noms.get(nom).copied(),
+            None => self.dernier,
+        };
+        // Pas de module : il était ignoré (SIMD), ou son échec est déjà
+        // compté.
+        let instance = instance.ok_or(Verdict::Ignore)?;
+        let champ = action.champ("field").texte().unwrap_or("");
+        match (action.champ("type").texte(), self.magasin.exporte(instance, champ)) {
+            (Some("invoke"), Some(Externe::Fonction(f))) => {
+                let arguments: Option<Vec<ValeurWasm>> = action.champ("args").tableau().iter().map(valeur).collect();
+                let arguments = arguments.ok_or(Verdict::Echoue("argument illisible".into()))?;
+                Ok(self.magasin.invoquer(&mut Spectest, f, &arguments))
+            }
+            (Some("get"), Some(Externe::Globale(g))) => Ok(Ok(vec![self.magasin.valeur_globale(g).unwrap()])),
+            _ => Err(Verdict::Echoue(format!("export introuvable : {champ}"))),
+        }
+    }
+
+    /// Rejoue une commande.
+    fn rejouer(&mut self, commande: &Valeur) -> Verdict {
+        let genre = commande.champ("type").texte().unwrap_or("");
+        let binaire = commande.champ("module_type").texte() != Some("text");
+        let attendu = commande.champ("text").texte().unwrap_or("?");
+        let lire = || fs::read(self.dossier.join(commande.champ("filename").texte().unwrap())).expect("module illisible");
+        macro_rules! essayer {
+            ($e:expr) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(verdict) => return verdict,
+                }
+            };
+        }
+        match genre {
+            "module" if binaire => {
+                self.dernier = None;
+                let module = essayer!(self.charger(commande));
+                let imports = essayer!(self.imports(&module).map_err(Verdict::Echoue));
+                match self.magasin.instancier(module, &imports, &mut Spectest) {
+                    Ok(n) => {
+                        self.dernier = Some(n);
+                        if let Some(nom) = commande.champ("name").texte() {
+                            self.noms.insert(nom.into(), n);
+                        }
+                        Verdict::Reussi
+                    }
+                    Err(e) => Verdict::Echoue(format!("instanciation : {e}")),
+                }
+            }
+            "register" => {
+                let instance = match commande.champ("name").texte() {
+                    Some(nom) => self.noms.get(nom).copied(),
+                    None => self.dernier,
+                };
+                let Some(instance) = instance else { return Verdict::Ignore };
+                self.enregistres.insert(commande.champ("as").texte().unwrap().into(), instance);
+                Verdict::Reussi
+            }
+            "action" => match essayer!(self.action(commande.champ("action"))) {
+                Ok(_) => Verdict::Reussi,
+                Err(p) => Verdict::Echoue(format!("piege inattendu : {p}")),
+            },
+            "assert_return" => match essayer!(self.action(commande.champ("action"))) {
+                Err(p) => Verdict::Echoue(format!("piege inattendu : {p}")),
+                Ok(resultats) => {
+                    let attendus = commande.champ("expected").tableau();
+                    if attendus.len() == resultats.len() && attendus.iter().zip(&resultats).all(|(a, &r)| conforme(a, r)) {
+                        Verdict::Reussi
+                    } else {
+                        let attendus: Vec<String> = attendus
+                            .iter()
+                            .map(|a| format!("{}:{}", a.champ("type").texte().unwrap_or("?"), a.champ("value").texte().unwrap_or("?")))
+                            .collect();
+                        Verdict::Echoue(format!("{resultats:?} rendu, {attendus:?} attendu"))
+                    }
+                }
+            },
+            "assert_trap" | "assert_exhaustion" => match essayer!(self.action(commande.champ("action"))) {
+                Ok(resultats) => Verdict::Echoue(format!("{resultats:?} rendu, piege attendu : {attendu}")),
+                Err(p) if piege_attendu(attendu, p) => Verdict::Reussi,
+                Err(p) => Verdict::Echoue(format!("piege « {p} », attendu : {attendu}")),
+            },
+            // Des modules valides, que l'instanciation doit refuser : un
+            // import inconnu (le banc ne trouve rien à lui donner) ou d'un
+            // type incompatible ; ou un piège pendant l'initialisation.
+            "assert_unlinkable" if binaire => {
+                let module = essayer!(self.charger(commande));
+                match (self.imports(&module), attendu) {
+                    (Err(_), "unknown import") => Verdict::Reussi,
+                    (Err(e), _) => Verdict::Echoue(e),
+                    (Ok(imports), _) => match self.magasin.instancier(module, &imports, &mut Spectest) {
+                        Err(ErreurInstanciation::ImportIncompatible(_)) if attendu == "incompatible import type" => {
+                            Verdict::Reussi
+                        }
+                        Err(e) => Verdict::Echoue(format!("refuse pour une autre raison : {e} (attendu : {attendu})")),
+                        Ok(_) => Verdict::Echoue(format!("instancie a tort (attendu : {attendu})")),
+                    },
+                }
+            }
+            "assert_uninstantiable" if binaire => {
+                let module = essayer!(self.charger(commande));
+                let imports = essayer!(self.imports(&module).map_err(Verdict::Echoue));
+                match self.magasin.instancier(module, &imports, &mut Spectest) {
+                    Err(ErreurInstanciation::Piege(p)) if piege_attendu(attendu, p) => Verdict::Reussi,
+                    Err(e) => Verdict::Echoue(format!("refuse pour une autre raison : {e} (attendu : {attendu})")),
+                    Ok(_) => Verdict::Echoue(format!("instancie a tort (attendu : {attendu})")),
+                }
+            }
+            // Bien formés, mais invalides : le décodeur doit les accepter, et
+            // le validateur les refuser.
+            "assert_invalid" if binaire => match wasm::decoder(&lire()) {
+                Ok(module) => match wasm::valider(module) {
+                    Ok(_) => Verdict::Echoue(format!("accepte a tort (attendu : {attendu})")),
+                    Err(e) if raison_attendue(attendu, e.genre) => Verdict::Reussi,
+                    Err(e) => Verdict::Echoue(format!("refuse pour une autre raison : {e} (attendu : {attendu})")),
                 },
                 Err(e) if e.genre == Genre::NonPrisEnCharge => Verdict::Ignore,
-                Err(e) => Verdict::Echoue(format!("refuse a tort : {e}")),
-            }
-        }
-        // Bien formés, mais invalides : le décodeur doit les accepter, et
-        // le validateur les refuser.
-        "assert_invalid" if binaire => match wasm::decoder(&lire()) {
-            Ok(module) => match wasm::valider(module) {
-                Ok(_) => Verdict::Echoue(format!("accepte a tort (attendu : {attendu})")),
-                Err(e) if raison_attendue(attendu, e.genre) => Verdict::Reussi,
-                Err(e) => Verdict::Echoue(format!("refuse pour une autre raison : {e} (attendu : {attendu})")),
+                // Un artefact de la conversion : dans le .wast, un module
+                // texte sans segment de données qui fait data.drop 0 ou
+                // memory.init 1 est invalide (segment ou mémoire inconnus).
+                // wast2json l'écrit en binaire sans section 12, ce qui le
+                // rend mal formé (voir decodeur.rs). Il est refusé dans les
+                // deux cas.
+                Err(e) if e.genre == Genre::SectionDeNombreDeDonneesRequise => Verdict::Reussi,
+                Err(e) => Verdict::Echoue(format!("mal forme au lieu d'invalide : {e}")),
             },
-            Err(e) if e.genre == Genre::NonPrisEnCharge => Verdict::Ignore,
-            // Un artefact de la conversion : dans le .wast, un module
-            // texte sans segment de données qui fait data.drop 0 ou
-            // memory.init 1 est invalide (segment ou mémoire inconnus).
-            // wast2json l'écrit en binaire sans section 12, ce qui le
-            // rend mal formé (voir decodeur.rs). Il est refusé dans les
-            // deux cas.
-            Err(e) if e.genre == Genre::SectionDeNombreDeDonneesRequise => Verdict::Reussi,
-            Err(e) => Verdict::Echoue(format!("mal forme au lieu d'invalide : {e}")),
-        },
-        "assert_malformed" if binaire => match wasm::decoder(&lire()) {
-            Ok(_) => Verdict::Echoue(format!("accepte a tort (attendu : {attendu})")),
-            Err(_) => Verdict::Reussi,
-        },
-        _ => Verdict::Ignore,
+            "assert_malformed" if binaire => match wasm::decoder(&lire()) {
+                Ok(_) => Verdict::Echoue(format!("accepte a tort (attendu : {attendu})")),
+                Err(_) => Verdict::Reussi,
+            },
+            _ => Verdict::Ignore,
+        }
     }
 }
 
@@ -180,8 +431,9 @@ fn suite_officielle() {
         let texte = fs::read_to_string(chemin).unwrap();
         let racine = json::analyser(&texte).unwrap_or_else(|e| panic!("{} : {e}", chemin.display()));
         let (mut reussis, mut echecs, mut ignores) = (0, 0, 0);
+        let mut banc = Banc::new(&dossier);
         for commande in racine.champ("commands").tableau() {
-            match rejouer(commande, &dossier) {
+            match banc.rejouer(commande) {
                 Verdict::Reussi => reussis += 1,
                 Verdict::Ignore => ignores += 1,
                 Verdict::Echoue(raison) => {

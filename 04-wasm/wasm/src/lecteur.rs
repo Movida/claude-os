@@ -44,6 +44,14 @@ impl<'a> Lecteur<'a> {
         self.origine + self.position
     }
 
+    /// Se place à `position` (absolue, comme celle que rend `position`),
+    /// pour continuer la lecture ailleurs : l'interpréteur saute ainsi à la
+    /// cible d'un branchement. La position doit être entre le début et la
+    /// fin des octets du lecteur.
+    pub fn aller(&mut self, position: usize) {
+        self.position = position - self.origine;
+    }
+
     pub fn fini(&self) -> bool {
         self.position == self.octets.len()
     }

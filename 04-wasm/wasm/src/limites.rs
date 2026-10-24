@@ -49,6 +49,35 @@ pub const LOCALES_MAX: usize = 50_000;
 /// code des compilateurs dépasse rarement quelques centaines.
 pub const HAUTEUR_PILE_MAX: usize = 1 << 16;
 
+// Les limites de l'exécution, elles aussi les nôtres.
+
+/// Taille maximale de la pile des valeurs d'une exécution : 2^20 cases de
+/// 8 octets, 8 Mio, la taille par défaut de la pile d'un programme sous
+/// Linux (`ulimit -s`). La dépasser déclenche le piège « pile épuisée ».
+pub const PILE_VALEURS_MAX: usize = 1 << 20;
+
+/// Nombre maximal d'appels imbriqués. Une fonction sans variable locale qui
+/// s'appelle elle-même n'use pas la pile des valeurs : il faut aussi borner
+/// la pile des appels (les navigateurs s'arrêtent vers quelques dizaines de
+/// milliers d'appels).
+pub const APPELS_MAX: usize = 1 << 16;
+
+/// Taille maximale d'une mémoire, en pages de 64 Kio : 16 384 pages, 1 Gio.
+/// Au-delà, memory.grow rend -1, ce que la spécification permet toujours.
+/// Le noyau n'aura pas plus à donner à un programme.
+pub const PAGES_MEMOIRE_MAX: u32 = 1 << 14;
+
+/// Nombre maximal d'éléments d'une table (comme l'interface JavaScript).
+pub const ELEMENTS_TABLE_MAX: u32 = 10_000_000;
+
+/// Le budget par défaut d'un magasin pour ses tables et ses mémoires : 1 Gio.
+/// Chaque table et chaque mémoire est bornée, mais un module peut déclarer
+/// beaucoup de tables, pour quelques octets chacune : 80 Mo par table de
+/// 10 millions d'éléments. Le budget borne le total, comme la limite de
+/// mémoire d'un processus sous Linux (les cgroups) ; le noyau donnera le
+/// sien à chaque programme (`Magasin::avec_budget`).
+pub const BUDGET_MAGASIN: usize = 1 << 30;
+
 /// Une limite dépassée.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limite {
