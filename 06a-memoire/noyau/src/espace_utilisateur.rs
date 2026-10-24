@@ -319,25 +319,45 @@ impl EspaceUtilisateur {
     }
 
     /// Retire les pages de [debut, fin[ (alignés) et rend leurs cadres :
-    /// brk qui recule. Les adresses où rien n'est projeté ne coûtent rien
-    /// (voir `parcourir`).
-    pub fn retirer_plage(&mut self, debut: u64, fin: u64) {
+    /// munmap, brk qui recule. Les adresses où rien n'est projeté ne
+    /// coûtent rien (voir `parcourir`). Avec `rendre_tables`, une table
+    /// devenue vide est rendue aussi (le free_pgtables de Linux) : sans
+    /// cela, un programme qui réserve et rend sans cesse des Gio de mémoire
+    /// (le ramasse-miettes de `claude`) laisserait derrière lui des tables
+    /// vides par milliers. On le sait en regardant ses 512 entrées : plus
+    /// simple que les bornes de la zone précédente et de la suivante qu'en
+    /// tire Linux, et toujours juste (une entrée occupée n'existe que dans
+    /// une zone). MADV_DONTNEED, lui, garde les tables : la zone reste, ses
+    /// pages reviendront.
+    pub fn retirer_plage(&mut self, debut: u64, fin: u64, rendre_tables: bool) {
         let mut lot = Lot::new(self.actif());
-        let mut retirees = 0;
+        let (mut pages, mut tables) = (0, 0);
         let zeros = page_de_zeros();
-        parcourir(self.pml4, debut, fin, &mut |adresse, entree| {
-            let cadre = *entree & ADRESSE;
-            *entree = 0;
-            lot.invalider(adresse);
-            // La page de zéros reste au noyau.
-            if cadre != zeros {
-                lot.rendre(cadre);
-                retirees += 1;
+        parcourir(self.pml4, debut, fin, &mut |visite| match visite {
+            Visite::Page(adresse, entree) => {
+                let cadre = *entree & ADRESSE;
+                *entree = 0;
+                lot.invalider(adresse);
+                // La page de zéros reste au noyau.
+                if cadre != zeros {
+                    lot.rendre(cadre);
+                    pages += 1;
+                }
+            }
+            Visite::Table(entree) => {
+                let table = *entree & ADRESSE;
+                // SAFETY : une table de cet espace, que nous possédons.
+                if rendre_tables && unsafe { pagination::lire_table(table) }.iter().all(|&e| e == 0) {
+                    *entree = 0;
+                    lot.rendre_table(table);
+                    tables += 1;
+                }
             }
         });
         // Le lot se vide en sortant : le TLB d'abord, les cadres ensuite.
         drop(lot);
-        self.pages -= retirees;
+        self.pages -= pages;
+        self.tables -= tables;
     }
 
     /// Donne les droits `droits` à toutes les pages projetées de [debut,
@@ -349,13 +369,16 @@ impl EspaceUtilisateur {
     /// code dans les mêmes pages.
     pub fn proteger_plage(&mut self, debut: u64, fin: u64, droits: Droits) {
         let mut lot = Lot::new(self.actif());
-        parcourir(self.pml4, debut, fin, &mut |adresse, entree| {
-            *entree = entree_finale(*entree & ADRESSE, droits);
-            // Des droits retirés : l'ancienne traduction ne doit plus
-            // servir. Des droits ajoutés : le processeur relirait l'entrée
-            // de lui-même après une faute (manuel d'Intel, vol. 3A,
-            // 4.10.4.3), mais tout invalider est plus simple à relire.
-            lot.invalider(adresse);
+        parcourir(self.pml4, debut, fin, &mut |visite| {
+            if let Visite::Page(adresse, entree) = visite {
+                *entree = entree_finale(*entree & ADRESSE, droits);
+                // Des droits retirés : l'ancienne traduction ne doit plus
+                // servir. Des droits ajoutés : le processeur relirait
+                // l'entrée de lui-même après une faute (manuel d'Intel,
+                // vol. 3A, 4.10.4.3), mais tout invalider est plus simple à
+                // relire.
+                lot.invalider(adresse);
+            }
         });
     }
 
@@ -444,13 +467,22 @@ impl EspaceUtilisateur {
 /// de 2 Gio (`claude` en fait), seize millions pour 64 Gio : des secondes
 /// dans QEMU. C'est le parcours de zap_page_range et de change_protection
 /// dans Linux.
-fn parcourir(pml4: u64, debut: u64, fin: u64, f: &mut impl FnMut(u64, &mut u64)) {
+fn parcourir(pml4: u64, debut: u64, fin: u64, f: &mut impl FnMut(Visite)) {
     parcourir_table(pml4, 3, debut, fin, f);
+}
+
+/// Ce que `parcourir` montre à sa fonction.
+enum Visite<'a> {
+    /// Une entrée finale occupée, et l'adresse de sa page.
+    Page(u64, &'a mut u64),
+    /// L'entrée d'une table de niveau supérieur, une fois parcourue la
+    /// table qu'elle désigne (pour la rendre si elle est devenue vide).
+    Table(&'a mut u64),
 }
 
 /// Le parcours dans la table `table` de niveau `niveau` (3 : la PML4),
 /// restreint à [debut, fin[.
-fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl FnMut(u64, &mut u64)) {
+fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl FnMut(Visite)) {
     // Ce que couvre une entrée de ce niveau : 4 Kio, 2 Mio, 1 Gio, 512 Gio.
     // Les adresses restent sous 2^47 : pas de débordement.
     let couverture = PAGE << (9 * niveau);
@@ -464,10 +496,11 @@ fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl F
         let entree = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, niveau)] };
         if niveau == 0 {
             if occupee(*entree) {
-                f(adresse, entree);
+                f(Visite::Page(adresse, entree));
             }
         } else if *entree & PRESENTE != 0 {
             parcourir_table(*entree & ADRESSE, niveau - 1, adresse, suivante.min(fin), f);
+            f(Visite::Table(entree));
         }
         adresse = suivante;
     }
@@ -519,6 +552,21 @@ impl Lot {
         }
         self.cadres[self.nombre_cadres] = cadre;
         self.nombre_cadres += 1;
+    }
+
+    /// La table `table` est à rendre ; l'entrée qui la désignait est déjà
+    /// effacée. Le processeur garde en cache, en plus des traductions, des
+    /// entrées des tables de niveau supérieur (les « paging-structure
+    /// caches », manuel d'Intel, vol. 3A, 4.10.3) : une entrée périmée le
+    /// ferait encore descendre dans cette table, devenue la page de
+    /// quelqu'un d'autre. On videra donc tout le TLB (recharger CR3 vide
+    /// aussi ces caches) avant de la rendre. (Un invlpg les viderait aussi
+    /// tous, 4.10.4.1 ; le rechargement est plus simple à relire, et rendre
+    /// une table est rare.) Dans cet ordre : `rendre` peut vider le lot
+    /// s'il est plein, ce qui remet `tout` à faux.
+    fn rendre_table(&mut self, table: u64) {
+        self.rendre(table);
+        self.tout = true;
     }
 
     /// Vide le TLB de ce qu'on a noté, puis rend les cadres.

@@ -41,3 +41,7 @@ memoire rendue : ok.
 [linux] Somme des 10000 premiers carres (malloc) : 333283335000
 [linux] Taille de page (AT_PAGESZ) : 4096
 [noyau] bonjour-c : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] memoire : 8 Gio reserves (MAP_NORESERVE), trois pages ecrites loin l'une de l'autre, rendus : ok
+[linux] memoire : 64 Gio reserves puis rendus d'un seul munmap : ok
+[linux] memoire : toutes les verifications : ok
+[noyau] memoire : termine, code de sortie 0 ; memoire rendue : ok.

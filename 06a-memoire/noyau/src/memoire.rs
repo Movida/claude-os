@@ -40,7 +40,7 @@ use core::fmt;
 
 use crate::espace_utilisateur::{self, Erreur, EspaceUtilisateur};
 use crate::programmes::Nom;
-use zones::{Droits, Nature, Zone, Zones};
+use zones::{Droits, Nature, Sens, Zone, Zones};
 
 const PAGE: u64 = 4096;
 
@@ -230,12 +230,54 @@ impl Memoire {
         self.espace.ecrire(adresse, octets)
     }
 
-    /// Retire [debut, fin[ (alignés) de la carte, puis des tables : brk qui
-    /// recule. Échoue, sans rien changer, si une zone doit être coupée en
-    /// deux et que la carte n'a plus de place.
+    /// Retire [debut, fin[ (alignés) de la carte, puis des tables, dont
+    /// celles devenues vides : munmap, brk qui recule. Échoue, sans rien
+    /// changer, si une zone doit être coupée en deux et que la carte n'a
+    /// plus de place (ENOMEM).
     pub fn retirer(&mut self, debut: u64, fin: u64) -> Result<(), Erreur> {
         self.zones.retirer(debut, fin, |_| ())?;
-        self.espace.retirer_plage(debut, fin);
+        self.espace.retirer_plage(debut, fin, true);
+        Ok(())
+    }
+
+    /// Où placer une nouvelle projection de `taille` octets (alignée, non
+    /// nulle) : à l'adresse suggérée `suggestion` si elle est libre (écart
+    /// de garde de la pile compris), sinon dans le trou le plus haut sous
+    /// la base des projections, sinon dans le plus bas au-dessus du tiers
+    /// des adresses. C'est la disposition de Linux sur x86_64
+    /// (arch_get_unmapped_area_topdown) : les projections s'empilent sous
+    /// la pile, vers le bas, loin du tas qui monte. La suggestion est
+    /// arrondie à la page INFÉRIEURE, et ramenée à ADRESSE_MIN si elle est
+    /// en dessous (round_hint_to_min), comme Linux (mesuré : 0x30000123
+    /// donne 0x30000000, 0x1234 donne 0x10000).
+    pub fn chercher_place(&self, taille: u64, suggestion: u64) -> Option<u64> {
+        use espace_utilisateur::{ADRESSE_MAX, ADRESSE_MIN};
+        if suggestion != 0 {
+            let a = (suggestion & !(PAGE - 1)).max(ADRESSE_MIN);
+            if a.checked_add(taille).is_some_and(|fin| fin <= ADRESSE_MAX) && self.zones.libre(a, a + taille, ECART_GARDE) {
+                return Some(a);
+            }
+        }
+        // Le TASK_UNMAPPED_BASE de Linux : le tiers des adresses.
+        let base_ascendante = (ADRESSE_MAX / 3).next_multiple_of(PAGE);
+        self.zones
+            .trou(taille, ADRESSE_MIN, disposition().base_mmap, ECART_GARDE, Sens::DuHaut)
+            .or_else(|| self.zones.trou(taille, base_ascendante, ADRESSE_MAX, ECART_GARDE, Sens::DuBas))
+    }
+
+    /// Ajoute la zone `zone` (mmap). Avec `remplacer` (MAP_FIXED), ce qui
+    /// était à sa place est retiré d'abord. Tout ou rien : la place de deux
+    /// zones (une coupée par le retrait, la nouvelle) est réservée avant de
+    /// toucher à quoi que ce soit ; une carte à une zone du maximum est
+    /// donc refusée même si les fusions l'auraient fait tenir. Linux,
+    /// depuis 6.12, défait un retrait déjà fait ; c'est plus long à écrire
+    /// et à relire.
+    pub fn ajouter(&mut self, zone: Zone, remplacer: bool) -> Result<(), Erreur> {
+        if remplacer {
+            self.zones.reserver(2)?;
+            self.retirer(zone.debut, zone.fin)?;
+        }
+        self.zones.inserer(zone)?;
         Ok(())
     }
 

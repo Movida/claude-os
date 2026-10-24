@@ -29,7 +29,9 @@
 #                  convertit la suite de tests officielle si besoin, puis la
 #                  rejoue contre la bibliothèque (tableau par fichier) ;
 #                  vérifie aussi que les trois bibliothèques se compilent
-#                  pour le noyau (no_std), sans avertissement
+#                  pour le noyau (no_std), sans avertissement ; enfin
+#                  lance linux/memoire sur l'hôte : nos codes d'erreur de
+#                  mmap & co. doivent être ceux du vrai Linux
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -83,7 +85,10 @@ boot.bin: programmes.cpio FORCE
 #   - sse : nasm puis ld, un calcul en SSE2 ;
 #   - bonjour-c : gcc -static, avec la glibc de la machine (libc.a, du
 #     paquet libc6-dev). -O2 et les avertissements, comme un programme
-#     ordinaire.
+#     ordinaire ;
+#   - memoire : gcc -static, les appels de la mémoire (mmap, munmap,
+#     mprotect, madvise) contre ce qu'en fait Linux : make tests-hote le
+#     lance aussi sur l'hôte, où chaque vérification doit dire « ok ».
 # Pour les tests du lecteur ELF sur l'hôte, une variante qu'il doit
 # accepter, bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -119,6 +124,10 @@ $(LINUX)/bonjour-asm-wx: $(LINUX)/bonjour-asm.o
 	ld -N -o $@ $< 2>/dev/null
 
 $(LINUX)/bonjour-c: linux/bonjour.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/memoire: linux/memoire.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -184,9 +193,9 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de programmes, que le noyau exécute dans l'ordre (voir
 # archive.sh).
-programmes.cpio: archive.sh $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c FORCE
+programmes.cpio: archive.sh $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire FORCE
 	cd bonjour && cargo build --release
-	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c
+	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire
 
 FORCE:
 
@@ -253,7 +262,7 @@ SHELL = /bin/bash
 # sources, servirait sinon telle quelle à la construction suivante.
 .DELETE_ON_ERROR:
 
-tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE)
+tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -261,6 +270,7 @@ tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE)
 	cd wasm && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo test --release -q -- --nocapture suite_officielle 2>/dev/null | grep -v '^running\|^test \|^$$'
+	./$(LINUX)/memoire | tee /dev/stderr | (! grep -q ECHEC)
 
 suite: $(SUITE)/.convertie
 

@@ -14,7 +14,7 @@
 //! ("/proc/self/exe"), getrandom, brk, mprotect (RELRO), fstat(1), write,
 //! exit_group. Plus writev (les messages d'erreur fatale de la glibc),
 //! ioctl(TCGETS) (isatty), et exit ; et, pour la mémoire de `claude`
-//! (6a), sysinfo.
+//! (6a), mmap et munmap (de la mémoire anonyme), sysinfo.
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -28,9 +28,9 @@ use core::fmt;
 
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::espace_utilisateur::ADRESSE_MAX;
-use crate::memoire::{ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
-use zones::{Drapeaux, Droits, Nature, Zone};
 use crate::interruptions::Cadre;
+use crate::memoire::{Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
+use zones::{Drapeaux, Droits, Nature, Zone};
 use crate::{aleatoire, console, cpu, horloge, pages, pile, processus, tache};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
@@ -40,6 +40,7 @@ const ESRCH: i64 = 3;
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
+const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const ENOTTY: i64 = 25;
 const ENOSYS: i64 = 38;
@@ -47,7 +48,9 @@ const ENOSYS: i64 = 38;
 // Les numéros des appels.
 const WRITE: u64 = 1;
 const FSTAT: u64 = 5;
+const MMAP: u64 = 9;
 const MPROTECT: u64 = 10;
+const MUNMAP: u64 = 11;
 const BRK: u64 = 12;
 const IOCTL: u64 = 16;
 const WRITEV: u64 = 20;
@@ -83,6 +86,8 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         FSTAT => fstat(a[0], a[1]),
         IOCTL => ioctl(a[0], a[1]),
         BRK => brk(a[0]),
+        MMAP => mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
+        MUNMAP => munmap(a[0], a[1]),
         MPROTECT => mprotect(a[0], a[1], a[2]),
         ARCH_PRCTL => arch_prctl(a[0], a[1]),
         // L'adresse où effacer le numéro du fil quand il se termine (pour
@@ -131,6 +136,8 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         FSTAT => ("fstat", 2),
         IOCTL => ("ioctl", 2),
         BRK => ("brk", 1),
+        MMAP => ("mmap", 6),
+        MUNMAP => ("munmap", 2),
         MPROTECT => ("mprotect", 3),
         ARCH_PRCTL => ("arch_prctl", 2),
         SET_TID_ADDRESS => ("set_tid_address", 1),
@@ -293,6 +300,164 @@ fn brk(demande: u64) -> i64 {
     })
 }
 
+/// Les droits demandés par `prot` (mmap, mprotect).
+const PROT_READ: u64 = 1;
+const PROT_WRITE: u64 = 2;
+const PROT_EXEC: u64 = 4;
+
+fn droits_de(prot: u64) -> Droits {
+    Droits { lecture: prot & PROT_READ != 0, ecriture: prot & PROT_WRITE != 0, execution: prot & PROT_EXEC != 0 }
+}
+
+/// mmap(adresse, longueur, droits, drapeaux, fichier, décalage) : une
+/// nouvelle zone de mémoire ANONYME, privée (les fichiers viendront avec
+/// 6b). Ses pages ne viennent qu'à la faute (memoire.rs). Les codes
+/// d'erreur sont ceux de Linux, dans son ordre, vérifiés par
+/// linux/memoire.c, qui tourne aussi sur l'hôte :
+///   - décalage non aligné : EINVAL ; pas de MAP_ANONYMOUS : EBADF (pas
+///     encore de fichiers) ; longueur nulle, ni MAP_PRIVATE ni MAP_SHARED :
+///     EINVAL ; trop grand : ENOMEM ;
+///   - MAP_FIXED : l'adresse telle quelle, ce qui y était est retiré
+///     (tout ou rien). Hors des adresses : ENOMEM ; non alignée : EINVAL ;
+///     sous 64 Kio : EPERM. MAP_FIXED_NOREPLACE : de même, mais EEXIST si
+///     quelque chose y est déjà ;
+///   - sinon, une adresse suggérée est suivie si la place est libre,
+///     ignorée sinon (Memoire::chercher_place) ; plus de place : ENOMEM ;
+///   - une zone privée inscriptible sans MAP_NORESERVE plus grande que
+///     toute la mémoire : ENOMEM (le surengagement, memoire.rs) ; trop de
+///     zones : ENOMEM ;
+///   - MAP_POPULATE : les pages sont mises en place d'avance, au mieux (un
+///     échec est ignoré, comme dans Linux : la faute le redira) ;
+///   - MAP_STACK, MAP_DENYWRITE, MAP_EXECUTABLE, MAP_LOCKED, MAP_NONBLOCK
+///     et les drapeaux inconnus : sans effet, comme Linux (sans mémoire
+///     d'échange, toute page est de fait « verrouillée » ; Linux ignore
+///     les drapeaux qu'il ne connaît pas, sauf avec MAP_SHARED_VALIDATE).
+///     Les droits inconnus aussi : mmap, au contraire de mprotect, ne les
+///     vérifie pas ;
+///   - MAP_SHARED, MAP_GROWSDOWN, MAP_HUGETLB, MAP_32BIT, MAP_SYNC :
+///     refusés (EINVAL), avec un message du noyau qui le dit ; `claude` ne
+///     s'en sert pas. (Linux, lui, les accepte.)
+fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, _fichier: u64, decalage: u64) -> i64 {
+    const MAP_SHARED: u64 = 0x01;
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_TYPE: u64 = 0x0f;
+    const MAP_FIXED: u64 = 0x10;
+    const MAP_ANONYMOUS: u64 = 0x20;
+    const MAP_32BIT: u64 = 0x40;
+    const MAP_GROWSDOWN: u64 = 0x100;
+    const MAP_NORESERVE: u64 = 0x4000;
+    const MAP_POPULATE: u64 = 0x8000;
+    const MAP_HUGETLB: u64 = 0x4_0000;
+    const MAP_SYNC: u64 = 0x8_0000;
+    const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+    use crate::espace_utilisateur::ADRESSE_MIN;
+
+    if decalage % PAGE != 0 {
+        return -EINVAL;
+    }
+    if drapeaux & MAP_ANONYMOUS == 0 {
+        return -EBADF;
+    }
+    if longueur == 0 {
+        return -EINVAL;
+    }
+    match drapeaux & MAP_TYPE {
+        MAP_PRIVATE => {}
+        MAP_SHARED | 0x03 => {
+            afficherln!("[noyau] mmap : MAP_SHARED pas encore pris en charge");
+            return -EINVAL;
+        }
+        _ => return -EINVAL,
+    }
+    for (bit, nom) in [(MAP_GROWSDOWN, "MAP_GROWSDOWN"), (MAP_HUGETLB, "MAP_HUGETLB"), (MAP_32BIT, "MAP_32BIT"), (MAP_SYNC, "MAP_SYNC")] {
+        if drapeaux & bit != 0 {
+            afficherln!("[noyau] mmap : {} pas pris en charge", nom);
+            return -EINVAL;
+        }
+    }
+    let Some(taille) = longueur.checked_next_multiple_of(PAGE).filter(|&t| t <= ADRESSE_MAX - ADRESSE_MIN) else {
+        return -ENOMEM;
+    };
+    let fixe = drapeaux & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
+    if fixe {
+        if adresse > ADRESSE_MAX - taille {
+            return -ENOMEM;
+        }
+        if adresse % PAGE != 0 {
+            return -EINVAL;
+        }
+        if adresse < ADRESSE_MIN {
+            return -EPERM;
+        }
+    }
+    let droits = droits_de(prot);
+    let sans_reserve = drapeaux & MAP_NORESERVE != 0;
+    if droits.ecriture && !sans_reserve && !engagement_possible(taille) {
+        return -ENOMEM;
+    }
+    let resultat = processus::avec(|p| {
+        let m = &mut p.memoire;
+        let debut = if fixe {
+            if drapeaux & MAP_FIXED_NOREPLACE != 0 && !m.zones.libre(adresse, adresse + taille, 0) {
+                return Err(-EEXIST);
+            }
+            adresse
+        } else {
+            m.chercher_place(taille, adresse).ok_or(-ENOMEM)?
+        };
+        let drapeaux = Drapeaux { sans_reserve, ..Drapeaux::default() };
+        let zone = Zone { debut, fin: debut + taille, droits, nature: Nature::Anonyme, drapeaux };
+        m.ajouter(zone, fixe).map_err(|_| -ENOMEM)?;
+        Ok(debut)
+    });
+    let debut = match resultat {
+        Ok(debut) => debut,
+        Err(erreur) => return erreur,
+    };
+    if drapeaux & MAP_POPULATE != 0 {
+        // Au mieux : un échec (plus de mémoire) est ignoré.
+        let _ = peupler(debut, debut + taille, droits.ecriture);
+    }
+    debut as i64
+}
+
+/// Met en place d'avance les pages de [debut, fin[, comme si le programme
+/// les avait touchées (en écriture si `ecriture`) : MAP_POPULATE,
+/// MADV_POPULATE_*. Une page à la fois, en rendant le verrou du processus
+/// entre deux : mettre en place des Mio, interruptions coupées, ferait
+/// perdre ses tics à l'horloge. S'arrête au premier échec, et dit lequel.
+fn peupler(debut: u64, fin: u64, ecriture: bool) -> Result<(), Echec> {
+    let acces = if ecriture { Acces::Ecriture } else { Acces::Lecture };
+    for page in (debut..fin).step_by(PAGE as usize) {
+        processus::avec(|p| p.memoire.servir(page, acces))?;
+    }
+    Ok(())
+}
+
+/// munmap(adresse, longueur) : retire les zones de la plage, et leurs
+/// pages. Comme Linux : adresse non alignée, longueur nulle, ou plage qui
+/// sort des adresses des programmes : EINVAL ; une plage où il n'y a rien
+/// n'est pas une erreur ; couper une zone en deux quand la carte est
+/// pleine : ENOMEM. Les pages touchées sont rendues verrou du processus
+/// tenu, donc interruptions coupées : une centaine de nanosecondes par
+/// page, des tics d'horloge perdus pour un munmap de centaines de Mio
+/// touchés (le mmap_lock qui dort, avec l'ordonnanceur, y remédiera).
+fn munmap(adresse: u64, longueur: u64) -> i64 {
+    if adresse % PAGE != 0 || longueur == 0 {
+        return -EINVAL;
+    }
+    let Some(fin) = longueur.checked_next_multiple_of(PAGE).and_then(|l| adresse.checked_add(l)) else {
+        return -EINVAL;
+    };
+    if fin > ADRESSE_MAX {
+        return -EINVAL;
+    }
+    match processus::avec(|p| p.memoire.retirer(adresse, fin)) {
+        Ok(()) => 0,
+        Err(_) => -ENOMEM,
+    }
+}
+
 /// mprotect(adresse, longueur, droits) : change les droits d'une plage de
 /// zones (memoire.rs), et ceux des pages qui y sont projetées. La glibc
 /// statique s'en sert pour remettre en lecture seule, une fois ses
@@ -300,9 +465,6 @@ fn brk(demande: u64) -> i64 {
 /// .init_array...). W+X est permis, comme sous Linux (voir
 /// EspaceUtilisateur::proteger_plage).
 fn mprotect(adresse: u64, longueur: u64, droits: u64) -> i64 {
-    const PROT_READ: u64 = 1;
-    const PROT_WRITE: u64 = 2;
-    const PROT_EXEC: u64 = 4;
     // Sans effet sur x86 : Linux l'accepte et l'ignore.
     const PROT_SEM: u64 = 8;
     // PROT_GROWSDOWN et PROT_GROWSUP (étendre le changement jusqu'au bout
@@ -322,8 +484,7 @@ fn mprotect(adresse: u64, longueur: u64, droits: u64) -> i64 {
     if fin > ADRESSE_MAX {
         return -ENOMEM;
     }
-    let droits = Droits { lecture: droits & PROT_READ != 0, ecriture: droits & PROT_WRITE != 0, execution: droits & PROT_EXEC != 0 };
-    match processus::avec(|p| p.memoire.proteger(adresse, fin, droits)) {
+    match processus::avec(|p| p.memoire.proteger(adresse, fin, droits_de(droits))) {
         Ok(()) => 0,
         Err(_) => -ENOMEM,
     }

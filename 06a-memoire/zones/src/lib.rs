@@ -341,6 +341,15 @@ impl Zones {
         Ok(())
     }
 
+    /// Vérifie qu'on peut ajouter `n` zones, et réserve leur place : les
+    /// `n` prochaines zones ajoutées ne pourront pas échouer. Pour une
+    /// opération du noyau faite de plusieurs opérations de la carte (un
+    /// mmap avec MAP_FIXED : retirer ce qui est là, puis insérer), qui doit
+    /// être tout ou rien.
+    pub fn reserver(&mut self, n: usize) -> Result<(), Erreur> {
+        self.place_pour(n)
+    }
+
     /// Vérifie qu'on peut ajouter `n` zones, et réserve leur place.
     fn place_pour(&mut self, n: usize) -> Result<(), Erreur> {
         if self.zones.len() + n > self.maximum {
@@ -699,6 +708,9 @@ mod tests {
         assert_eq!(pages(&c), [(10, 45), (50, 60)]);
         // Un changement d'une zone entière ne coupe rien.
         c.changer(50 * PAGE, 60 * PAGE, |z| z.droits = R).unwrap();
+        // Plus de place pour une zone de plus.
+        assert_eq!(c.reserver(1), Err(Erreur::TropDeZones));
+        assert_eq!(c.reserver(0), Ok(()));
         // Une coupe dont le morceau rejoint sa voisine : le compte ne
         // change pas, c'est permis.
         let mut c = Zones::avec_maximum(2);
