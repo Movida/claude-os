@@ -24,6 +24,7 @@ pub fn initialiser() {
 /// on force la libération : le code interrompu ne reprendra jamais, au pire
 /// l'écran montrera une ligne à moitié écrite.
 pub fn preparer_panique() {
+    crate::cpu::couper_interruptions();
     // SAFETY : on ne revient pas de la panique, le détenteur éventuel du
     // verrou ne reprendra jamais la main.
     unsafe { ECRAN.forcer_liberation() };

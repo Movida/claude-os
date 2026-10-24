@@ -14,6 +14,7 @@
 
 #[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
 mod console;
+mod cpu;
 mod gdt;
 mod interruptions;
 mod port;
@@ -72,18 +73,7 @@ extern "C" fn noyau_main() -> ! {
     // SAFETY : int3 ne fait qu'appeler notre gestionnaire, qui revient.
     unsafe { asm!("int3") };
     afficherln!("[noyau] Retour apres int3 : les exceptions sont gerees.");
-    arreter()
-}
-
-/// Arrête le processeur pour de bon : interruptions coupées, puis `hlt`.
-/// La boucle reprend l'arrêt si une interruption non masquable (NMI) le
-/// réveille.
-fn arreter() -> ! {
-    loop {
-        // SAFETY : cli et hlt n'ont pas d'autre effet que d'arrêter le
-        // processeur, ce qu'on veut ici.
-        unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
-    }
+    cpu::arreter()
 }
 
 /// Appelé par Rust en cas d'erreur fatale (indice hors d'un tableau,
@@ -96,9 +86,9 @@ fn panique(info: &PanicInfo) -> ! {
     // s'arrête sans rien dire.
     static EN_PANIQUE: AtomicBool = AtomicBool::new(false);
     if EN_PANIQUE.swap(true, Ordering::Relaxed) {
-        arreter();
+        cpu::arreter();
     }
     console::preparer_panique();
     afficherln!("[noyau] PANIQUE : {}", info);
-    arreter()
+    cpu::arreter()
 }
