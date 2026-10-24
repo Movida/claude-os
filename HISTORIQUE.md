@@ -124,7 +124,13 @@ Dossier `03-noyau-rust/` : le chargeur de l'étape 02b lit aussi le noyau sur le
 
 **Vérifié dans QEMU** avec `verifier.sh` (chaque commit), des touches envoyées par le moniteur QEMU (`sendkey`), une capture d'écran, et la carte mémoire avec `-m 2G` et `-m 6G`.
 
-## 11. Reste à faire
+## 11. Relecture avant de clore une étape (24 octobre 2026)
+
+**Constat :** l'étape 3 a été poussée et taguée, puis deux relectures ont trouvé huit défauts. Le plus sérieux : la pile du chargeur descendait dans le tampon du noyau. Les autres : une panique au milieu d'un affichage figeait la machine sans un mot ; un commentaire affirmait que l'IST protégeait du débordement de pile, ce qui était faux sans page de garde ; un débordement possible dans l'allocateur ; deux détails du clavier ; un reste d'en-tête dans le chargeur ; la GOT placée hors du script d'édition de liens. Pour que l'historique se lise toujours comme si tout avait été bien fait du premier coup, il a fallu le réécrire alors qu'il était déjà publié : push forcé, et les quatre tags recréés.
+
+**Décision :** relecture de fond AVANT le premier push de chaque étape, en effort élevé, avec les cas d'erreur déclenchés volontairement. Les corrections sont repliées (`git commit --fixup`, puis `rebase --autosquash`) tant que rien n'est publié. La marche à suivre, et le cas exceptionnel d'un historique déjà poussé, sont dans le skill `.claude/skills/fin-d-etape/`, avec un script qui vérifie chaque commit.
+
+## 12. Reste à faire
 
 **Dans le noyau**
 
@@ -134,10 +140,10 @@ Dossier `03-noyau-rust/` : le chargeur de l'étape 02b lit aussi le noyau sur le
 
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 12. Questions ouvertes
+## 13. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 13. Prochaine étape
+## 14. Prochaine étape
 
 Étape 4 : l'interpréteur WebAssembly. D'abord une bibliothèque Rust `no_std` testée sur l'hôte avec la suite de tests officielle de Wasm, puis intégrée au noyau avec un WASI minimal (`fd_write`, `proc_exit`). Il lui faudra un tas (allocation dynamique), construit sur l'allocateur de cadres, et donc une pagination gérée par le noyau lui-même.
