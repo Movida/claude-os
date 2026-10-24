@@ -32,6 +32,7 @@ Le dépôt (github.com/Movida/claude-os) doit se lire étape par étape.
 ## Outils
 
 - `nasm` et `qemu-system-x86_64` (`sudo apt install nasm qemu-system-x86`).
+- Rust, via `rustup` (installé par le devcontainer). La version exacte est figée dans `03-noyau-rust/noyau/rust-toolchain.toml` ; `rustup` l'installe à la première commande `cargo`.
 - Dans chaque étape : `make` pour construire, `make run` pour démarrer dans QEMU, `make dump` pour inspecter l'image.
 
 ## Tester sans écran

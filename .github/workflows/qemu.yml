@@ -12,5 +12,9 @@ jobs:
       - uses: actions/checkout@v4
       - name: Installer nasm et QEMU
         run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86
+      # rustup est préinstallé sur les machines de GitHub ; il installe la
+      # version de Rust figée dans rust-toolchain.toml, avec la cible du noyau.
+      - name: Installer Rust
+        run: cd 03-noyau-rust/noyau && rustup toolchain install
       - name: Tester chaque etape
         run: ./verifier.sh

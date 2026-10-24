@@ -1,0 +1,4 @@
+[16 bits] Noyau lu sur le disque
+[64 bits] Mode long actif !
+[noyau] Bonjour depuis le noyau Rust !
+[noyau] Mode long 64 bits, point d'entree a 0x100000

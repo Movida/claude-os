@@ -4,3 +4,6 @@ serial.log
 qemu.log
 ecran.png
 ecran.ppm
+
+# Compilation du noyau Rust
+target/

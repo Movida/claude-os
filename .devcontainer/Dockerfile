@@ -1,4 +1,5 @@
-# Environnement de développement de l'OS : assembleur, émulateur, débogueur.
+# Environnement de développement de l'OS : assembleur, émulateur, débogueur,
+# et Rust pour le noyau.
 FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
@@ -9,4 +10,14 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
         make \
         netcat-openbsd \
         xxd \
+        curl \
+        ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# rustup, pour l'utilisateur du conteneur, sans version de Rust : la version
+# exacte est figée dans 03-noyau-rust/noyau/rust-toolchain.toml, et rustup
+# l'installe à la première commande cargo lancée dans ce dossier.
+USER vscode
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+ENV PATH="/home/vscode/.cargo/bin:${PATH}"
+USER root
