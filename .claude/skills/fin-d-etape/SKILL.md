@@ -45,6 +45,17 @@ avec les commandes données à la fin.
      32 bits (`-cpu qemu32`), mémoire de 128 Mio à plusieurs Gio (`-m`).
      `make debug` ou `-d int,cpu_reset -D qemu.log` montrent la chaîne des
      exceptions.
+   - **Pour une bibliothèque testée sur l'hôte** (étape 4) : faire échouer
+     un test exprès pour vérifier que `make tests-hote` le signale ; faire « muter »
+     le code (un décalage de un) pour vérifier qu'un contrôle le détecte ;
+     fuzzer décodeur et validateur avec des millions de modules corrompus,
+     dans une crate temporaire du brouillon qui dépend de la bibliothèque
+     par son chemin (`overflow-checks = true` dans son profil, et un
+     allocateur qui mesure le pic de mémoire). Rien de cela n'est commité.
+     Après une mutation, restaurer le fichier avec une date NEUVE (`cp`
+     sans `-p`, ou `touch`) : `mv` et `shutil.move` gardent l'ancienne
+     date, plus vieille que le binaire compilé avec la mutation, et cargo
+     ne recompile pas (on teste alors encore le code muté).
 2. **Présenter les constats à David** (ce qui est faux, pourquoi, la
    correction proposée), puis corriger.
 3. **Chaque correction devient un `fixup` du commit fautif** :
@@ -145,5 +156,13 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   remplace les `rustflags` de `.cargo/config.toml` (dont
   `relocation-model=static`), et on testerait un autre noyau. Détecter les
   avertissements en cherchant `^warning` dans la sortie de make ou cargo.
+- `cargo test | tee ... | grep` rend le code de sortie de `grep` : un test
+  en échec passait inaperçu, et la CI serait restée verte. Toute recette de
+  Makefile avec un tuyau : `SHELL = /bin/bash` et `.SHELLFLAGS = -o pipefail -c`.
+- Un relecteur indépendant (un agent lancé sans nos conclusions, avec le
+  code et la spécification) a trouvé à l'étape 4 ce que la suite officielle
+  et notre fuzzing ne voyaient pas : une réservation mémoire 64 fois trop
+  grosse, un type de bloc mal formé accepté. Vérifier chacun de ses constats
+  avant de corriger.
 - Pas de `rm -rf "$VARIABLE"` dans les commandes : la protection de Claude Code
   les bloque ; utiliser `git worktree remove` et des chemins écrits en entier.
