@@ -6,6 +6,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# L'interpréteur WebAssembly de l'étape 4, notre propre bibliothèque.
+wasm = { path = "../wasm" }
 
 # Les scénarios de panne de `make tests-qemu` : une version du noyau qui
 # provoque exprès une erreur (voir src/main.rs).

@@ -25,6 +25,9 @@
 QEMU = qemu-system-x86_64 -drive format=raw,file=boot.bin
 MON  = /tmp/qemu-mon-os.sock
 NOYAU_ELF = noyau/target/x86_64-unknown-none/release/noyau
+# Le programme WebAssembly que le noyau embarque (bonjour/, compilé par
+# rustc pour la cible wasm32-unknown-unknown).
+BONJOUR = bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm
 
 boot.bin: chargeur.bin noyau.bin
 	cat chargeur.bin noyau.bin > boot.bin
@@ -39,6 +42,7 @@ chargeur.bin: boot.asm noyau.bin
 # objcopy -O binary retire les en-têtes ELF et ne garde que les octets à
 # copier en mémoire, à partir de 0x100000 ; truncate complète au secteur.
 noyau.bin: FORCE
+	cd bonjour && cargo build --release
 	cd noyau && cargo build --release
 	objcopy -O binary $(NOYAU_ELF) noyau.bin
 	truncate -s %512 noyau.bin
@@ -140,6 +144,7 @@ tests-qemu: garde.bin
 	grep -F "debordement de la pile du noyau" garde.log
 
 garde.bin: FORCE
+	cd bonjour && cargo build --release
 	cd noyau && cargo build --release --features test-garde --target-dir target/garde 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	objcopy -O binary $(NOYAU_GARDE_ELF) noyau-garde.bin
 	truncate -s %512 noyau-garde.bin
@@ -153,5 +158,6 @@ clean:
 	rm -rf $(SUITE)
 	cd noyau && cargo clean
 	cd wasm && cargo clean
+	cd bonjour && cargo clean
 
 .PHONY: run texte test debug capture gdb dump tests-hote tests-qemu suite clean FORCE

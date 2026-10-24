@@ -36,6 +36,7 @@ mod serie;
 mod tas;
 mod verrou;
 mod vga;
+mod wasi;
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
@@ -219,6 +220,8 @@ extern "C" fn noyau_main(carte: u64) -> ! {
         Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
     }
 
+    executer_bonjour();
+
     // La boucle principale : afficher ce qui est tapé, et dormir quand il
     // n'y a rien. On vérifie la file interruptions coupées, puis on dort
     // avec sti;hlt (voir cpu::attendre_interruption) : une touche tapée
@@ -259,6 +262,68 @@ fn tester_pages() {
     pages::liberer(c, ordre_c);
     afficherln!("[noyau] Pages allouees : {:#x} (4 Kio), {:#x} (32 Kio), {:#x} ({} Kio) ; rendues et recollees : {}.",
                 a, b, c, taille_c >> 10, if pages::libres() == libres_avant { "ok" } else { "ECHEC" });
+}
+
+/// Le premier programme WebAssembly : bonjour, compilé par rustc
+/// (../bonjour), embarqué dans l'image du noyau. On le décode, le valide,
+/// l'instancie avec WASI, puis on appelle son point d'entrée _start par
+/// tranches de carburant : entre deux tranches, le noyau pourrait faire
+/// autre chose (exécuter un autre programme). Les interruptions de
+/// l'horloge et du clavier, elles, continuent d'arriver pendant tout ce
+/// temps, même pendant une écriture du programme (la console écrit par
+/// petits paquets).
+fn executer_bonjour() {
+    use alloc::sync::Arc;
+    use wasm::{Etat, Externe, Magasin, Piege};
+
+    static BONJOUR: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm"));
+    const TRANCHE: u64 = 1000;
+
+    let module = match wasm::decoder(BONJOUR).and_then(wasm::valider) {
+        Ok(m) => Arc::new(m),
+        Err(e) => return afficherln!("[noyau] Programme WebAssembly refuse : {}", e),
+    };
+    afficherln!("[noyau] Programme WebAssembly : {} octets, decode et valide.", BONJOUR.len());
+    // Son budget de mémoire : 16 Mio pour ses tables et sa mémoire, chacune
+    // d'au plus 4 Mio (un bloc du tas, voir tas.rs).
+    let mut magasin = Magasin::avec_budget(16 << 20);
+    let imports = match wasi::imports(&mut magasin, &module) {
+        Ok(i) => i,
+        Err(e) => return afficherln!("[noyau] Programme non liable : {}", e),
+    };
+    let instance = match magasin.instancier(module, &imports) {
+        Ok(i) if i.demarrage.is_none() => i.instance,
+        Ok(_) => return afficherln!("[noyau] Programme refuse : fonction de demarrage inattendue"),
+        Err(e) => return afficherln!("[noyau] Programme non instanciable : {}", e),
+    };
+    let Some(Externe::Fonction(debut)) = magasin.exporte(instance, "_start") else {
+        return afficherln!("[noyau] Programme sans _start");
+    };
+    // WASI veut un _start de type [] -> [] : un programme qui en attend des
+    // arguments est refusé, comme le reste, sans que le noyau s'arrête.
+    let Ok(mut execution) = magasin.preparer(debut, &[]) else {
+        return afficherln!("[noyau] Programme refuse : _start doit etre de type [] -> []");
+    };
+    let (mut tranches, mut consomme) = (0u64, 0u64);
+    let fin = loop {
+        let mut carburant = TRANCHE;
+        let etat = execution.reprendre(&mut magasin, &mut wasi::Wasi, &mut carburant);
+        tranches += 1;
+        consomme += TRANCHE - carburant;
+        match etat {
+            Ok(Etat::Interrompue) => continue,
+            autre => break autre,
+        }
+    };
+    let code = match fin {
+        // proc_exit(code), ou _start qui revient sans l'appeler : code 0.
+        Err(Piege::Hote(code)) => code,
+        Ok(_) => 0,
+        Err(p) => return afficherln!("[noyau] Programme arrete par un piege : {}", p),
+    };
+    afficherln!("[noyau] Programme termine : code de sortie {}, {} unites de carburant en {} tranches.",
+                code, consomme, tranches);
 }
 
 /// Vérifie le tas : des collections de Rust de toutes tailles, et un objet

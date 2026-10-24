@@ -39,6 +39,21 @@ pub fn _afficher(args: fmt::Arguments) {
     let _ = ecran.write_fmt(args);
 }
 
+/// Écrit des octets tels quels, la sortie d'un programme par exemple : ils
+/// ne sont pas forcément du texte valide, on ne les interprète pas. Par
+/// paquets de 8 octets, en rendant le verrou (et donc les interruptions)
+/// entre deux : sur un vrai port série, chaque octet fait attendre 87 µs,
+/// et l'horloge ne doit pas manquer ses tics (un par milliseconde).
+pub fn ecrire_octets(octets: &[u8]) {
+    for paquet in octets.chunks(8) {
+        let mut ecran = ECRAN.verrouiller();
+        for &octet in paquet {
+            crate::serie::ecrire_octet(octet);
+            ecran.ecrire_octet(octet);
+        }
+    }
+}
+
 /// Comme print! de la bibliothèque standard, qu'on n'a pas.
 #[macro_export]
 macro_rules! afficher {
