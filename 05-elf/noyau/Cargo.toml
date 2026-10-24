@@ -1,0 +1,30 @@
+# Le noyau : un programme Rust sans système d'exploitation en dessous.
+# Aucune dépendance : tout ce qui touche le matériel est écrit ici.
+[package]
+name = "noyau"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# L'interpréteur WebAssembly de l'étape 4, notre propre bibliothèque.
+wasm = { path = "../wasm" }
+
+# Les scénarios de `make tests-qemu` : des versions du noyau qui
+# provoquent exprès une situation à tester (voir src/main.rs).
+[features]
+# Déborder de la pile du noyau : la page de garde doit l'arrêter.
+test-garde = []
+# Un noyau gonflé au-delà de 1 Mio : le chargeur doit le lire en entier,
+# chaque secteur à sa place.
+test-gros = []
+
+# panic = "abort" : en cas de panique, pas de « déroulement » de la pile
+# (unwinding), qui demanderait une bibliothèque d'exécution qu'on n'a pas.
+# Le noyau affiche le message et arrête le processeur.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"     # Optimise pour la taille : moins de secteurs à lire au démarrage.
+debug = false

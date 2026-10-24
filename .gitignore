@@ -2,6 +2,7 @@
 *.bin
 serial.log
 garde.log
+test-*.log
 qemu.log
 ecran.png
 ecran.ppm
@@ -9,5 +10,6 @@ ecran.ppm
 # Compilation du noyau Rust
 target/
 
-# Suite de tests officielle de WebAssembly, téléchargée par make (étape 4)
+# Suite de tests officielle de WebAssembly, téléchargée par make (étapes 4 et 5)
 04-wasm/suite/
+05-elf/suite/
