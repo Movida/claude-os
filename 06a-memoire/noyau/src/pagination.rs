@@ -239,6 +239,15 @@ pub fn invalider(adresse: u64) {
     unsafe { asm!("invlpg [{}]", in(reg) adresse, options(nostack)) };
 }
 
+/// Vide tout le cache des traductions (TLB) de l'espace courant, en
+/// rechargeant CR3 avec la même PML4 : plus rapide que des dizaines
+/// d'invlpg (voir espace_utilisateur.rs, Lot).
+pub fn vider_tlb() {
+    // SAFETY : on recharge la PML4 déjà en service : rien ne change, sinon
+    // que le processeur relira les tables.
+    unsafe { asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack)) };
+}
+
 /// Fait de `pml4` l'espace d'adressage courant (CR3). Écrire CR3 vide
 /// aussi le cache des traductions (TLB) de tout ce qui n'est pas global :
 /// rien de l'espace précédent ne sert plus.

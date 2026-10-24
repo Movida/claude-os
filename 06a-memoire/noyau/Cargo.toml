@@ -11,6 +11,9 @@ wasm = { path = "../wasm" }
 # La lecture des formats de fichiers : l'archive de programmes (cpio), et
 # bientôt les exécutables ELF. Notre propre bibliothèque, sans unsafe.
 formats = { path = "../formats" }
+# La carte des zones des programmes, notre propre bibliothèque, sans
+# unsafe, testée sur l'hôte.
+zones = { path = "../zones" }
 
 # Les scénarios de `make tests-qemu` : des versions du noyau qui
 # provoquent exprès une situation à tester (voir src/main.rs).

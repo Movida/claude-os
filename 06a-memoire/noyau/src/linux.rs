@@ -25,9 +25,9 @@
 
 use core::fmt;
 
-use crate::chargeur_elf::{SOMMET_PILE, TAILLE_PILE};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::espace_utilisateur::{ADRESSE_MAX, CadreNeuf};
+use zones::{Drapeaux, Droits, Nature, Zone};
 use crate::interruptions::Cadre;
 use crate::{aleatoire, console, cpu, pile, processus, tache};
 
@@ -243,12 +243,13 @@ fn ioctl(fichier: u64, _requete: u64) -> i64 {
     -ENOTTY
 }
 
-/// brk(adresse) : déplace la fin du tas, à l'octet près ; les pages sont
-/// projetées (mises à zéro) ou retirées pour suivre. Rend la nouvelle fin,
-/// ou l'ancienne en cas d'échec (c'est ainsi que Linux signale l'erreur ;
-/// brk(0) demande donc la fin actuelle). Le tas ne peut ni reculer sous
-/// son début, ni s'approcher à moins d'une page de la pile, ni dépasser le
-/// budget de mémoire du programme.
+/// brk(adresse) : déplace la fin du tas, à l'octet près ; la zone du tas
+/// (memoire.rs) grandit ou recule, et ses pages sont projetées (mises à
+/// zéro) ou retirées pour suivre. Rend la nouvelle fin, ou l'ancienne en
+/// cas d'échec (c'est ainsi que Linux signale l'erreur ; brk(0) demande
+/// donc la fin actuelle). Le tas ne peut ni reculer sous son début, ni
+/// s'approcher à moins d'une page de la zone suivante (la pile), ni
+/// dépasser le budget de mémoire du programme.
 ///
 /// Le verrou du processus coupe les interruptions : on ne le prend que
 /// pour poser chaque page dans les tables, et chaque page est mise à zéro
@@ -260,39 +261,50 @@ fn ioctl(fichier: u64, _requete: u64) -> i64 {
 /// l'ordonnanceur, ce verrou deviendra un verrou qui dort (le mmap_lock
 /// de Linux).
 fn brk(demande: u64) -> i64 {
-    let (debut, actuelle) = processus::avec(|p| (p.debut_tas, p.fin_tas));
-    let limite = SOMMET_PILE - TAILLE_PILE - PAGE;
-    if demande < debut || demande > limite {
+    let (debut, actuelle) = processus::avec(|p| (p.memoire.debut_tas, p.memoire.fin_tas));
+    if demande < debut || demande >= ADRESSE_MAX {
         return actuelle as i64;
     }
     let (pages_avant, pages_apres) = (actuelle.next_multiple_of(PAGE), demande.next_multiple_of(PAGE));
     if pages_apres > pages_avant {
-        let donnees = crate::pagination::ECRITURE | crate::pagination::non_executable();
+        // La zone d'abord (elle se fond dans celle du tas), à une page au
+        // moins de la zone suivante.
+        let zone = Zone {
+            debut: pages_avant,
+            fin: pages_apres,
+            droits: Droits { lecture: true, ecriture: true, execution: false },
+            nature: Nature::Tas,
+            drapeaux: Drapeaux::default(),
+        };
+        let ajoutee = processus::avec(|p| {
+            p.memoire.zones.libre(pages_avant, pages_apres + PAGE, 0) && p.memoire.zones.inserer(zone).is_ok()
+        });
+        if !ajoutee {
+            return actuelle as i64;
+        }
         for page in (pages_avant..pages_apres).step_by(PAGE as usize) {
-            let projetee = CadreNeuf::allouer()
-                .is_some_and(|cadre| processus::avec(|p| p.espace.projeter(page, cadre, donnees)).is_ok());
+            let projetee = CadreNeuf::allouer().is_some_and(|cadre| processus::avec(|p| p.memoire.projeter(page, cadre)).is_ok());
             if !projetee {
-                // Tout ou rien : on rend ce qui vient d'être pris.
-                for prise in (pages_avant..page).step_by(PAGE as usize) {
-                    processus::avec(|p| p.espace.retirer(prise));
-                }
+                // Tout ou rien : on rend ce qui vient d'être pris. (Le
+                // retrait du haut de la zone du tas ne la coupe pas en deux :
+                // il ne peut pas échouer.)
+                let _ = processus::avec(|p| p.memoire.retirer(pages_avant, pages_apres));
                 return actuelle as i64;
             }
         }
-    } else {
-        for page in (pages_apres..pages_avant).step_by(PAGE as usize) {
-            processus::avec(|p| p.espace.retirer(page));
-        }
+    } else if pages_apres < pages_avant && processus::avec(|p| p.memoire.retirer(pages_apres, pages_avant)).is_err() {
+        return actuelle as i64;
     }
-    processus::avec(|p| p.fin_tas = demande);
+    processus::avec(|p| p.memoire.fin_tas = demande);
     demande as i64
 }
 
-/// mprotect(adresse, longueur, droits) : change les droits de pages déjà
-/// projetées. La glibc statique s'en sert pour remettre en lecture seule,
-/// une fois ses adresses corrigées, ses tables sensibles (RELRO : la GOT,
+/// mprotect(adresse, longueur, droits) : change les droits d'une plage de
+/// zones (memoire.rs), et ceux des pages qui y sont projetées. La glibc
+/// statique s'en sert pour remettre en lecture seule, une fois ses
+/// adresses corrigées, ses tables sensibles (RELRO : la GOT,
 /// .init_array...). W+X est permis, comme sous Linux (voir
-/// EspaceUtilisateur::proteger).
+/// EspaceUtilisateur::proteger_plage).
 fn mprotect(adresse: u64, longueur: u64, droits: u64) -> i64 {
     const PROT_READ: u64 = 1;
     const PROT_WRITE: u64 = 2;
@@ -316,8 +328,8 @@ fn mprotect(adresse: u64, longueur: u64, droits: u64) -> i64 {
     if fin > ADRESSE_MAX {
         return -ENOMEM;
     }
-    let (lecture, ecriture, execution) = (droits & PROT_READ != 0, droits & PROT_WRITE != 0, droits & PROT_EXEC != 0);
-    match processus::avec(|p| p.espace.proteger(adresse, fin, lecture, ecriture, execution)) {
+    let droits = Droits { lecture: droits & PROT_READ != 0, ecriture: droits & PROT_WRITE != 0, execution: droits & PROT_EXEC != 0 };
+    match processus::avec(|p| p.memoire.proteger(adresse, fin, droits)) {
         Ok(()) => 0,
         Err(_) => -ENOMEM,
     }

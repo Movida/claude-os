@@ -3,7 +3,8 @@
 //!
 //! Chaque programme a sa propre PML4 (la racine de ses tables de pages) :
 //!   - les entrées 0 à 255 (la moitié basse, 128 Tio) sont à lui, vides au
-//!     départ ; on y projette ses pages une à une, chacune un cadre neuf ;
+//!     départ ; on y projette ses pages, chacune un cadre neuf, dans les
+//!     zones que lui permet sa carte (memoire.rs) ;
 //!   - les entrées 256 à 511 (la moitié haute) sont une COPIE de celles du
 //!     noyau : elles désignent les mêmes tables, donc le noyau est visible
 //!     au même endroit dans tous les espaces. Un appel système ou une
@@ -43,6 +44,7 @@
 
 use crate::{espace, pages, pagination};
 use pagination::{ADRESSE, PRESENTE};
+use zones::Droits;
 
 const PAGE: u64 = 4096;
 
@@ -50,12 +52,31 @@ const PAGE: u64 = 4096;
 /// le processeur ne sait pas dire « présente mais interdite » ; on retire
 /// le bit PRESENTE, et on garde le cadre dans l'entrée, marquée de ce bit
 /// que le processeur laisse au système (le bit 9 : « disponible »). C'est
-/// le _PAGE_PROTNONE de Linux. Un accès fait alors une faute de page.
+/// l'équivalent du _PAGE_PROTNONE de Linux, qui prend, lui, le bit 8 (le
+/// bit « global », que le processeur ignore aussi quand la page n'est pas
+/// présente) : on le garde libre pour les pages globales du noyau. Un
+/// accès fait alors une faute de page.
 const SANS_ACCES: u64 = 1 << 9;
 
 /// Une entrée finale qui désigne un cadre du programme, accessible ou non.
 fn occupee(entree: u64) -> bool {
     entree & (PRESENTE | SANS_ACCES) != 0
+}
+
+/// L'entrée finale qui donne au programme le cadre `cadre` avec les
+/// droits `droits` (ceux de sa zone).
+pub fn entree_finale(cadre: u64, droits: Droits) -> u64 {
+    if !droits.accessible() {
+        return cadre | SANS_ACCES;
+    }
+    let mut bits = cadre | PRESENTE | pagination::UTILISATEUR;
+    if droits.ecriture {
+        bits |= pagination::ECRITURE;
+    }
+    if !droits.execution {
+        bits |= pagination::non_executable();
+    }
+    bits
 }
 
 /// Le budget de mémoire d'un programme : au plus 256 Mio de pages (le
@@ -163,10 +184,9 @@ impl EspaceUtilisateur {
     }
 
     /// Projette à `adresse` (une page) un cadre neuf, mis à zéro, avec les
-    /// droits `droits` (pagination::ECRITURE, pagination::non_executable()).
-    /// Rend l'adresse physique du cadre, pour le remplir par la projection
-    /// directe.
-    pub fn projeter_neuve(&mut self, adresse: u64, droits: u64) -> Result<u64, Erreur> {
+    /// droits `droits`. Rend l'adresse physique du cadre, pour le remplir
+    /// par la projection directe.
+    pub fn projeter_neuve(&mut self, adresse: u64, droits: Droits) -> Result<u64, Erreur> {
         let cadre = CadreNeuf::allouer().ok_or(Erreur::PlusDeMemoire)?;
         self.projeter(adresse, cadre, droits)
     }
@@ -178,7 +198,7 @@ impl EspaceUtilisateur {
     /// Si l'espace est actif, la nouvelle page sert tout de suite : le
     /// processeur ne garde pas en cache les entrées absentes (manuel
     /// d'Intel, vol. 3A, 4.10.4.3), rien à invalider.
-    pub fn projeter(&mut self, adresse: u64, cadre: CadreNeuf, droits: u64) -> Result<u64, Erreur> {
+    pub fn projeter(&mut self, adresse: u64, cadre: CadreNeuf, droits: Droits) -> Result<u64, Erreur> {
         if !adresse_permise(adresse) {
             return Err(Erreur::AdresseInterdite);
         }
@@ -194,86 +214,51 @@ impl EspaceUtilisateur {
         let physique = cadre.0;
         core::mem::forget(cadre);
         self.pages += 1;
-        *entree = physique | PRESENTE | droits | pagination::UTILISATEUR;
+        *entree = entree_finale(physique, droits);
         Ok(physique)
     }
 
-    /// L'entrée finale de la page `adresse` si elle désigne un cadre du
-    /// programme (accessible ou non), sans créer de table.
-    fn entree_occupee(&mut self, adresse: u64) -> Option<&'static mut u64> {
-        let mut table = self.pml4;
-        for niveau in (1..4).rev() {
-            // SAFETY : `table` est une table de cet espace.
-            let e = unsafe { pagination::lire_table(table) }[pagination::index(adresse, niveau)];
-            if e & PRESENTE == 0 {
-                return None;
-            }
-            table = e & ADRESSE;
-        }
-        // SAFETY : `table` est une PT de cet espace, que nous possédons ;
-        // l'entrée y est modifiée sous notre seul contrôle (un processeur,
-        // un programme).
-        let entree = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, 0)] };
-        occupee(*entree).then_some(entree)
+    /// Cet espace est-il celui du processeur (CR3) ? Sinon, il n'y a rien
+    /// à invalider : le changement de CR3 qui l'activera vide le TLB.
+    fn actif(&self) -> bool {
+        pagination::courante() == self.pml4
     }
 
-    /// Le cache des traductions (TLB) ne doit plus servir l'ancienne entrée
-    /// de `adresse`, si cet espace est actif. (Inactif : le changement de
-    /// CR3 qui l'activera vide le TLB.)
-    fn invalider(&self, adresse: u64) {
-        if pagination::courante() == self.pml4 {
-            pagination::invalider(adresse);
-        }
+    /// Retire les pages de [debut, fin[ (alignés) et rend leurs cadres :
+    /// brk qui recule. Les adresses où rien n'est projeté ne coûtent rien
+    /// (voir `parcourir`).
+    pub fn retirer_plage(&mut self, debut: u64, fin: u64) {
+        let mut lot = Lot::new(self.actif());
+        let mut retirees = 0;
+        parcourir(self.pml4, debut, fin, &mut |adresse, entree| {
+            let cadre = *entree & ADRESSE;
+            *entree = 0;
+            lot.invalider(adresse);
+            lot.rendre(cadre);
+            retirees += 1;
+        });
+        // Le lot se vide en sortant : le TLB d'abord, les cadres ensuite.
+        drop(lot);
+        self.pages -= retirees;
     }
 
-    /// Retire la page `adresse` (brk qui recule) et rend son cadre. Rien à
-    /// faire si elle n'est pas projetée.
-    pub fn retirer(&mut self, adresse: u64) {
-        let Some(entree) = self.entree_occupee(adresse) else { return };
-        let cadre = *entree & ADRESSE;
-        *entree = 0;
-        // Invalider AVANT de rendre le cadre : sinon le programme pourrait
-        // encore l'écrire, par une traduction gardée en cache, alors qu'il
-        // appartient déjà à quelqu'un d'autre.
-        self.invalider(adresse);
-        pages::liberer(cadre, 0);
-        self.pages -= 1;
-    }
-
-    /// Change les droits de toutes les pages de [debut, fin[ (mprotect) :
-    /// `lecture`, `ecriture`, `execution`. Toutes doivent être projetées,
-    /// sinon rien n'est changé (Linux rend alors ENOMEM). Le processeur ne
-    /// sait pas interdire la lecture d'une page présente : écrire ou
-    /// exécuter permet aussi de lire, et sans aucun droit, la page est
-    /// retirée du processeur (SANS_ACCES). W+X est permis, comme sous
-    /// Linux : le compilateur à la volée (JIT) de JavaScriptCore, le moteur
-    /// de Claude Code, écrit puis exécute son code dans les mêmes pages.
-    pub fn proteger(&mut self, debut: u64, fin: u64, lecture: bool, ecriture: bool, execution: bool)
-        -> Result<(), Erreur> {
-        let pages = (debut..fin).step_by(PAGE as usize);
-        if pages.clone().any(|p| self.entree_occupee(p).is_none()) {
-            return Err(Erreur::NonProjetee);
-        }
-        let mut droits = 0;
-        if ecriture {
-            droits |= pagination::ECRITURE;
-        }
-        if !execution {
-            droits |= pagination::non_executable();
-        }
-        let accessible = lecture || ecriture || execution;
-        for page in pages {
-            if let Some(entree) = self.entree_occupee(page) {
-                let cadre = *entree & ADRESSE;
-                *entree = if accessible {
-                    cadre | PRESENTE | pagination::UTILISATEUR | droits
-                } else {
-                    cadre | SANS_ACCES
-                };
-                self.invalider(page);
-            }
-        }
-        Ok(())
+    /// Donne les droits `droits` à toutes les pages projetées de [debut,
+    /// fin[ (mprotect). Le processeur ne sait pas interdire la lecture
+    /// d'une page présente : écrire ou exécuter permet aussi de lire, et
+    /// sans aucun droit, la page est retirée du processeur (SANS_ACCES).
+    /// W+X est permis, comme sous Linux : le compilateur à la volée (JIT)
+    /// de JavaScriptCore, le moteur de Claude Code, écrit puis exécute son
+    /// code dans les mêmes pages.
+    pub fn proteger_plage(&mut self, debut: u64, fin: u64, droits: Droits) {
+        let mut lot = Lot::new(self.actif());
+        parcourir(self.pml4, debut, fin, &mut |adresse, entree| {
+            *entree = entree_finale(*entree & ADRESSE, droits);
+            // Des droits retirés : l'ancienne traduction ne doit plus
+            // servir. Des droits ajoutés : le processeur relirait l'entrée
+            // de lui-même après une faute (manuel d'Intel, vol. 3A,
+            // 4.10.4.3), mais tout invalider est plus simple à relire.
+            lot.invalider(adresse);
+        });
     }
 
     /// Écrit `octets` à partir de l'adresse `adresse` de l'espace, page par
@@ -350,6 +335,112 @@ impl EspaceUtilisateur {
             table = e & ADRESSE;
         }
         None
+    }
+}
+
+/// Appelle `f` pour chaque entrée finale occupée de [debut, fin[ (alignés,
+/// dans la moitié basse), avec l'adresse de sa page, en descendant l'arbre
+/// des tables de `pml4` et en SAUTANT toute table absente : le coût suit
+/// les pages réellement projetées, pas la taille de la plage. Une boucle
+/// page par page ferait 524 288 descentes de quatre niveaux pour un munmap
+/// de 2 Gio (`claude` en fait), seize millions pour 64 Gio : des secondes
+/// dans QEMU. C'est le parcours de zap_page_range et de change_protection
+/// dans Linux.
+fn parcourir(pml4: u64, debut: u64, fin: u64, f: &mut impl FnMut(u64, &mut u64)) {
+    parcourir_table(pml4, 3, debut, fin, f);
+}
+
+/// Le parcours dans la table `table` de niveau `niveau` (3 : la PML4),
+/// restreint à [debut, fin[.
+fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl FnMut(u64, &mut u64)) {
+    // Ce que couvre une entrée de ce niveau : 4 Kio, 2 Mio, 1 Gio, 512 Gio.
+    // Les adresses restent sous 2^47 : pas de débordement.
+    let couverture = PAGE << (9 * niveau);
+    let mut adresse = debut;
+    while adresse < fin {
+        let suivante = (adresse / couverture + 1) * couverture;
+        // SAFETY : `table` est une table de cet espace (la PML4, ou une
+        // table que désigne une entrée présente), que nous possédons ; un
+        // seul processeur, un seul programme : personne ne la change en
+        // même temps.
+        let entree = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, niveau)] };
+        if niveau == 0 {
+            if occupee(*entree) {
+                f(adresse, entree);
+            }
+        } else if *entree & PRESENTE != 0 {
+            parcourir_table(*entree & ADRESSE, niveau - 1, adresse, suivante.min(fin), f);
+        }
+        adresse = suivante;
+    }
+}
+
+/// Le plus de pages invalidées une à une (invlpg) avant de préférer vider
+/// tout le TLB (recharger CR3) : le tlb_single_page_flush_ceiling de
+/// Linux. Au-delà, chaque invlpg coûte plus que de recharger ensuite les
+/// traductions dont on a vraiment besoin.
+const PLAFOND_INVLPG: usize = 33;
+
+/// Ce qu'un parcours des tables laisse à faire : des traductions à retirer
+/// du TLB, puis des cadres à rendre (le mmu_gather de Linux). L'ordre
+/// compte : un cadre rendu alors qu'une traduction vers lui reste dans le
+/// TLB pourrait encore être écrit par le programme, alors qu'il appartient
+/// déjà à quelqu'un d'autre. Le lot vide donc toujours le TLB AVANT de
+/// rendre ses cadres, et se vide de lui-même en disparaissant (Drop).
+struct Lot {
+    /// L'espace parcouru est-il actif ? Sinon, rien à invalider.
+    actif: bool,
+    pages: [u64; PLAFOND_INVLPG],
+    nombre_pages: usize,
+    /// Plus de PLAFOND_INVLPG pages : on videra tout le TLB.
+    tout: bool,
+    cadres: [u64; 64],
+    nombre_cadres: usize,
+}
+
+impl Lot {
+    fn new(actif: bool) -> Lot {
+        Lot { actif, pages: [0; PLAFOND_INVLPG], nombre_pages: 0, tout: false, cadres: [0; 64], nombre_cadres: 0 }
+    }
+
+    /// La traduction de la page `adresse` ne doit plus servir.
+    fn invalider(&mut self, adresse: u64) {
+        if self.nombre_pages < PLAFOND_INVLPG {
+            self.pages[self.nombre_pages] = adresse;
+            self.nombre_pages += 1;
+        } else {
+            self.tout = true;
+        }
+    }
+
+    /// Le cadre `cadre` est à rendre, une fois le TLB vidé. Toute page qui
+    /// le désignait doit déjà avoir été passée à `invalider`.
+    fn rendre(&mut self, cadre: u64) {
+        if self.nombre_cadres == self.cadres.len() {
+            self.vider();
+        }
+        self.cadres[self.nombre_cadres] = cadre;
+        self.nombre_cadres += 1;
+    }
+
+    /// Vide le TLB de ce qu'on a noté, puis rend les cadres.
+    fn vider(&mut self) {
+        if self.actif {
+            if self.tout {
+                pagination::vider_tlb();
+            } else {
+                self.pages[..self.nombre_pages].iter().for_each(|&p| pagination::invalider(p));
+            }
+        }
+        (self.nombre_pages, self.tout) = (0, false);
+        self.cadres[..self.nombre_cadres].iter().for_each(|&c| pages::liberer(c, 0));
+        self.nombre_cadres = 0;
+    }
+}
+
+impl Drop for Lot {
+    fn drop(&mut self) {
+        self.vider();
     }
 }
 

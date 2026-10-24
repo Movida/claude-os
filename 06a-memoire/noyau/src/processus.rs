@@ -1,6 +1,6 @@
 //! Le processus en cours : ce que les appels système d'un programme Linux
-//! doivent pouvoir modifier (son espace d'adressage, son tas). C'est une
-//! toute petite partie de la task_struct et de la mm_struct de Linux.
+//! doivent pouvoir modifier (sa mémoire : zones, tables de pages, tas).
+//! C'est une toute petite partie de la task_struct de Linux.
 //!
 //! Le noyau le range ici le temps de l'exécution (tache::executer), et le
 //! reprend ensuite pour le détruire. Un seul processus à la fois : un
@@ -10,16 +10,12 @@
 //! verrou (une copie peut fauter, et plus tard attendre le disque). On y
 //! lit ou change l'état, on rend le verrou, puis on copie.
 
-use crate::espace_utilisateur::EspaceUtilisateur;
+use crate::memoire::Memoire;
 use crate::verrou::Verrou;
 
 pub struct Processus {
-    pub espace: EspaceUtilisateur,
-    /// Le début du tas : la page qui suit le dernier segment (le .bss).
-    pub debut_tas: u64,
-    /// La fin du tas, à l'octet près (le « program break » de brk) ; les
-    /// pages sont projetées jusqu'à la page qui la contient.
-    pub fin_tas: u64,
+    /// Sa mémoire (la mm_struct de Linux, voir memoire.rs).
+    pub memoire: Memoire,
 }
 
 static COURANT: Verrou<Option<Processus>> = Verrou::new(None);

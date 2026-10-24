@@ -35,6 +35,7 @@ mod gdt;
 mod horloge;
 mod interruptions;
 mod linux;
+mod memoire;
 mod pagination;
 mod pile;
 mod pages;
@@ -311,13 +312,15 @@ fn tester_espace_utilisateur() {
     const ADRESSE: u64 = 0x40_0000;
     let libres_avant = pages::libres();
     let mut e = EspaceUtilisateur::creer().expect("plus de memoire");
-    let cadre = e.projeter_neuve(ADRESSE, pagination::ECRITURE | pagination::non_executable()).expect("plus de memoire");
+    let rw = zones::Droits { lecture: true, ecriture: true, execution: false };
+    let r = zones::Droits { lecture: true, ..zones::Droits::AUCUN };
+    let cadre = e.projeter_neuve(ADRESSE, rw).expect("plus de memoire");
     let refus = [
-        e.projeter_neuve(ADRESSE, 0) == Err(Erreur::DejaProjetee),
-        e.projeter_neuve(0, 0) == Err(Erreur::AdresseInterdite),
-        e.projeter_neuve(ADRESSE_MIN - 4096, 0) == Err(Erreur::AdresseInterdite),
-        e.projeter_neuve(ADRESSE_MAX, 0) == Err(Erreur::AdresseInterdite),
-        e.projeter_neuve(ADRESSE + 1, 0) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE, r) == Err(Erreur::DejaProjetee),
+        e.projeter_neuve(0, r) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE_MIN - 4096, r) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE_MAX, r) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE + 1, r) == Err(Erreur::AdresseInterdite),
         e.traduire(ADRESSE).map(|(c, _)| c) == Some(cadre),
     ];
     // On écrit par l'adresse du programme, comme un appel système : par la

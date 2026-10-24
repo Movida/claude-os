@@ -115,7 +115,7 @@ fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
         .map_or(&[][..], |reste| &reste[..reste.len().min(16)]);
     let mut code = [0u8; 16];
     let code = &mut code[..attendu.len()];
-    let code_ok = programme.espace.lire(programme.entree, code).is_ok() && code == attendu;
+    let code_ok = programme.memoire.espace.lire(programme.entree, code).is_ok() && code == attendu;
     // Le tas commence à la page qui suit le dernier segment.
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
@@ -126,11 +126,9 @@ fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
         Ok(rsp) => rsp,
         Err(e) => return afficherln!("[noyau] {} : pile initiale impossible : {}", nom, e),
     };
-    // Le programme devient le processus en cours, avec un tas vide à la
-    // page qui suit son dernier segment (comme Linux sans ASLR).
-    let tas = programme.fin.next_multiple_of(4096);
-    let (pml4, entree) = (programme.espace.pml4(), programme.entree);
-    processus::installer(processus::Processus { espace: programme.espace, debut_tas: tas, fin_tas: tas });
+    // Le programme devient le processus en cours.
+    let (pml4, entree) = (programme.memoire.espace.pml4(), programme.entree);
+    processus::installer(processus::Processus { memoire: programme.memoire });
     let code = tache::executer(nom.0, pml4, entree, rsp);
     drop(processus::retirer());
     afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.",

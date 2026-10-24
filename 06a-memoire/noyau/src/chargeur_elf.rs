@@ -4,11 +4,12 @@
 //!
 //! Le fichier a été vérifié par la bibliothèque des formats
 //! (../formats/src/elf.rs) : segments dans les adresses permises,
-//! croissants, sans page commune, jamais W+X. Il reste à donner à chaque
-//! page de chaque segment un cadre neuf, mis à zéro, avec les droits du
-//! segment, et à y copier la part du fichier qui lui revient. Le reste de
-//! la page reste à zéro : c'est ainsi que le .bss (la partie d'un segment
-//! qui n'est pas dans le fichier) est nul d'office.
+//! croissants, sans page commune, jamais W+X. Chaque segment devient une
+//! zone de la mémoire du programme (memoire.rs), avec ses droits ; il
+//! reste à donner à chacune de ses pages un cadre neuf, mis à zéro, et à
+//! y copier la part du fichier qui lui revient. Le reste de la page reste
+//! à zéro : c'est ainsi que le .bss (la partie d'un segment qui n'est pas
+//! dans le fichier) est nul d'office.
 //!
 //! Linux fait autrement : il projette le FICHIER lui-même (mmap), et les
 //! pages ne sont lues qu'au premier accès (pagination à la demande). Il
@@ -21,9 +22,10 @@
 //! EspaceUtilisateur::ecrire) : le noyau n'écrit jamais par les adresses
 //! du programme, il n'a donc rien à ouvrir côté SMAP (copie_utilisateur.rs).
 
-use crate::espace_utilisateur::{self, EspaceUtilisateur};
-use crate::pagination;
+use crate::espace_utilisateur;
+use crate::memoire::Memoire;
 use formats::elf::{Executable, Plage};
+use zones::{Drapeaux, Droits, Nature, Zone};
 
 /// Les adresses que les segments d'un programme ont le droit d'occuper,
 /// pour la vérification du fichier : celles des programmes (voir
@@ -36,14 +38,14 @@ pub const PERMISES: Plage = Plage { debut: espace_utilisateur::ADRESSE_MIN, fin:
 
 /// Un programme chargé, prêt à partir.
 pub struct Programme {
-    pub espace: EspaceUtilisateur,
+    pub memoire: Memoire,
     /// Le point d'entrée.
     pub entree: u64,
     /// Pour le vecteur auxiliaire (AT_PHDR, AT_PHNUM, AT_PHENT).
     pub adresse_entetes: Option<u64>,
     pub nombre_entetes: usize,
     pub taille_entete: usize,
-    /// La fin du dernier segment : le début du tas (brk).
+    /// La fin du dernier segment (le tas commence à la page suivante).
     pub fin: u64,
     /// Le sommet de sa pile.
     pub sommet_pile: u64,
@@ -64,27 +66,29 @@ pub const SOMMET_PILE: u64 = espace_utilisateur::ADRESSE_MAX;
 /// En cas d'échec (plus de mémoire), tout ce qui a été pris est rendu
 /// (l'espace est détruit en sortant de la fonction).
 pub fn charger(executable: &Executable) -> Result<Programme, espace_utilisateur::Erreur> {
-    let mut espace = EspaceUtilisateur::creer()?;
+    let mut memoire = Memoire::creer()?;
     for segment in executable.segments() {
-        let mut droits = 0;
-        if segment.ecriture {
-            droits |= pagination::ECRITURE;
-        }
-        if !segment.execution {
-            droits |= pagination::non_executable();
-        }
+        let droits = Droits { lecture: true, ecriture: segment.ecriture, execution: segment.execution };
         let (debut, fin) = segment.pages();
-        for page in (debut..fin).step_by(4096) {
-            espace.projeter_neuve(page, droits)?;
-        }
-        espace.ecrire(segment.adresse, segment.contenu)?;
+        memoire.ajouter_projetee(Zone { debut, fin, droits, nature: Nature::Programme, drapeaux: Drapeaux::default() })?;
+        memoire.espace.ecrire(segment.adresse, segment.contenu)?;
     }
-    // La pile : inscriptible, jamais exécutable.
-    for page in (SOMMET_PILE - TAILLE_PILE..SOMMET_PILE).step_by(4096) {
-        espace.projeter_neuve(page, pagination::ECRITURE | pagination::non_executable())?;
-    }
+    // La pile : inscriptible, jamais exécutable. Elle est marquée comme une
+    // zone qui grandit vers le bas, même si elle ne grandit pas encore.
+    let pile = Zone {
+        debut: SOMMET_PILE - TAILLE_PILE,
+        fin: SOMMET_PILE,
+        droits: Droits { lecture: true, ecriture: true, execution: false },
+        nature: Nature::Pile,
+        drapeaux: Drapeaux { vers_le_bas: true, ..Drapeaux::default() },
+    };
+    memoire.ajouter_projetee(pile)?;
+    // Un tas vide, à la page qui suit le dernier segment (comme Linux sans
+    // ASLR).
+    let tas = executable.fin().next_multiple_of(4096);
+    (memoire.debut_tas, memoire.fin_tas) = (tas, tas);
     Ok(Programme {
-        espace,
+        memoire,
         entree: executable.entree(),
         adresse_entetes: executable.adresse_entetes(),
         nombre_entetes: executable.nombre_entetes(),

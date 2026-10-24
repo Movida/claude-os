@@ -109,7 +109,7 @@ impl Curseur<'_> {
             return Err(Erreur::TropLong);
         }
         self.sp -= n;
-        self.programme.espace.ecrire(self.sp, octets)?;
+        self.programme.memoire.espace.ecrire(self.sp, octets)?;
         Ok(self.sp)
     }
 
