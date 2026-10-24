@@ -28,7 +28,7 @@ Ce fichier reprend la conversation de départ du projet (24 octobre 2026), pour 
    4. pilote réseau virtio, puis petite pile TCP/IP.
 
    Ressources : le wiki OSDev (wiki.osdev.org) et « Writing an OS in Rust » de Philipp Oppermann (os.phil-opp.com).
-5. **Langage :** C, Rust, Zig, assembleur pur, C++ et Ada ont été évoqués. Recommandation : le C, parce que presque toute la documentation OSDev est en C. **Pas encore tranché.**
+5. **Langage :** C, Rust, Zig, assembleur pur, C++ et Ada ont été évoqués. Recommandation : le C, parce que presque toute la documentation OSDev est en C. Tranché le 24 octobre 2026 : **Rust** (voir la section 9).
 6. **Compatibilité :** elle dépend des interfaces respectées, pas du langage (l'interface binaire du C, les appels système de Linux). Piste évoquée : **WebAssembly + WASI**, un noyau qui embarque un moteur Wasm et fait tourner tous les programmes dedans (exemple historique : le projet expérimental Nebulet). David trouve cette piste très intéressante.
 7. **Problème :** Claude Code est un binaire natif x86_64, pas du WebAssembly. Deux options : une couche de compatibilité Linux dans le noyau, ou un agent maison qui appelle l'API Claude.
 8. David préférait l'agent maison, **mais veut utiliser son abonnement Claude**. Or l'abonnement est réservé aux applications officielles comme Claude Code : un agent maison qui s'y connecterait sortirait des conditions d'utilisation d'Anthropic.
@@ -93,10 +93,27 @@ David préfère apprendre en lisant le code et les commentaires plutôt qu'en fa
 5. Chargeur ELF et premiers appels système Linux (`write`, `exit`).
 6. Processus, fichiers, réseau virtio, TLS, jusqu'à Claude Code.
 
-## 9. Questions ouvertes
+## 9. Le noyau sera écrit en Rust (24 octobre 2026)
 
-- Le langage du noyau (C recommandé ; Rust ou Zig possibles), à trancher maintenant : la suite du travail se fera dans un vrai noyau chargé par notre chargeur.
+**Question :** C ou Rust pour le noyau, maintenant que le chargeur amène le processeur en 64 bits. Claude recommandait le C ; **David a choisi Rust.**
 
-## 10. Prochaine étape
+**Pourquoi Rust :**
 
-Étape 3 : mémoire, interruptions, clavier. Une table d'interruptions (IDT) pour attraper les exceptions du processeur au lieu de redémarrer, l'horloge, puis le clavier. C'est aussi le moment de charger un vrai noyau, écrit dans le langage retenu.
+- **Sûreté mémoire.** Le compilateur refuse les pointeurs invalides, les accès hors des tableaux et les données partagées sans protection, les erreurs qui font la majorité des failles des noyaux écrits en C.
+- **`unsafe` localisé au matériel.** Les seules opérations que le compilateur ne peut pas vérifier (ports d'entrée-sortie, mémoire vidéo, registres du processeur) sont isolées dans quelques fonctions marquées `unsafe`, faciles à relire. Le reste du noyau est vérifié.
+- Linux accepte lui aussi du Rust pour ses pilotes depuis 2022.
+
+**Contreparties acceptées :**
+
+- Moins de documentation OSDev : presque tout est écrit pour le C, il faudra transposer.
+- Plus de plomberie de départ : pas de bibliothèque standard (`no_std`), une cible sans système (`x86_64-unknown-none`), un script d'édition de liens et un gestionnaire d'erreur (`panic`) à écrire soi-même.
+
+**Règle :** aucune crate qui fait le travail à notre place. Le noyau n'utilise que `core`, et c'est notre chargeur de l'étape 02b qui le charge et lui passe la main en 64 bits.
+
+## 10. Questions ouvertes
+
+- Aucune pour l'instant.
+
+## 11. Prochaine étape
+
+Étape 3 : mémoire, interruptions, clavier. Une table d'interruptions (IDT) pour attraper les exceptions du processeur au lieu de redémarrer, l'horloge, puis le clavier. C'est aussi le moment de charger un vrai noyau, écrit en Rust, depuis notre chargeur.

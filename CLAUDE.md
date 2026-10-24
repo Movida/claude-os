@@ -6,7 +6,7 @@ Architecture hybride :
 
 - **WebAssembly est le format natif des programmes de l'OS.** Le noyau embarque un moteur Wasm, et chaque programme tourne dans le bac à sable Wasm (isolation à la façon de Nebulet), avec WASI comme interface système.
 - **Une couche de compatibilité Linux minimale** sert uniquement à exécuter le binaire `claude` tel quel : un ELF x86_64 dynamique, qui demande aussi ld-linux et la glibc.
-- Le socle natif (démarrage, mémoire, interruptions, pilotes) est en assembleur, puis dans le langage du noyau, encore à choisir.
+- Le socle natif est écrit en assembleur pour le démarrage (notre propre chargeur), puis en **Rust** pour le noyau (mémoire, interruptions, pilotes).
 
 Le vrai Claude Code plutôt qu'un agent maison, parce que David veut utiliser son abonnement Claude, réservé aux applications officielles. Et il n'existe qu'en binaire natif : d'où la couche Linux à côté de Wasm. Le détail des décisions et les questions ouvertes sont dans `HISTORIQUE.md`.
 
@@ -15,6 +15,7 @@ Le vrai Claude Code plutôt qu'un agent maison, parce que David veut utiliser so
 - Le but est d'apprendre, pas d'aller vite. David apprend en lisant le code et ses commentaires, sans exercices pratiques : Claude écrit tout, y compris les morceaux qui comportent un vrai choix de conception.
 - Pour chaque choix de conception, Claude retient l'option qui mène au meilleur noyau à terme (celle des noyaux modernes comme Linux, sauf raison contraire) et explique en commentaire les options écartées et pourquoi. Pas de `TODO(human)`.
 - Le code est commenté en français et explique le *pourquoi*, pas seulement le *quoi*.
+- Au plus bas niveau : aucune crate Rust qui fait le travail à notre place (pas de `bootloader`, `x86_64`, `pic8259`, `uart_16550`…). Le noyau n'utilise que `core` ; tout accès au matériel passe par notre code, avec `unsafe` cantonné aux quelques fonctions qui touchent le matériel.
 - Les messages affichés par l'OS n'ont pas d'accents : la police du BIOS utilise la page de code 437, pas l'UTF-8.
 - Une étape = un dossier numéroté (`01-boot/`, `02-…/`), chacun avec son propre Makefile.
 
