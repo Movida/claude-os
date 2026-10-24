@@ -10,4 +10,5 @@
 [noyau] Clavier PS/2 pret : tapez du texte.
 [noyau] Carte de la memoire (E820)
 [noyau] Memoire libre : 
+[noyau] Pagination W^X en place
 rendu puis redonne : ok.

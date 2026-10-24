@@ -103,6 +103,36 @@ pub unsafe fn recopier(adresse: u64) -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Appelle `f(debut, fin)` pour chaque étendue de mémoire libre, dans
+/// l'ordre des adresses : les zones libres qui se chevauchent ou se
+/// touchent ne font qu'une (le BIOS ne promet pas de zones disjointes,
+/// Linux les fusionne aussi, dans e820__update_table).
+pub fn etendues_libres(mut f: impl FnMut(u64, u64)) {
+    lire(|carte| {
+        let mut libres = [(0u64, 0u64); MAX_ZONES];
+        let mut n = 0;
+        for z in carte.zones().iter().filter(|z| z.genre == LIBRE) {
+            libres[n] = (z.base, z.fin());
+            n += 1;
+        }
+        libres[..n].sort_unstable();
+        let mut courante: Option<(u64, u64)> = None;
+        for &(debut, fin) in &libres[..n] {
+            courante = match courante {
+                Some((d, f_)) if debut <= f_ => Some((d, f_.max(fin))),
+                Some((d, f_)) => {
+                    f(d, f_);
+                    Some((debut, fin))
+                }
+                None => Some((debut, fin)),
+            };
+        }
+        if let Some((d, f_)) = courante {
+            f(d, f_);
+        }
+    });
+}
+
 /// Donne accès à la carte (en lecture) le temps d'un calcul.
 pub fn lire<R>(f: impl FnOnce(&Carte) -> R) -> R {
     f(&CARTE.verrouiller())

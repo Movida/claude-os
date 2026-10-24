@@ -38,11 +38,11 @@ use crate::verrou::Verrou;
 
 pub const TAILLE_CADRE: u64 = 4096;
 
-/// Les tables de démarrage (main.rs) ne projettent que le premier Gio : au
-/// delà, le noyau ne peut rien lire ni écrire. On ne distribue donc que les
-/// cadres situés en dessous, pour l'instant ; la mémoire au-dessus sera
-/// prise en compte quand la projection directe couvrira toute la mémoire.
-const LIMITE_PROJETEE: u64 = 1 << 30;
+/// Les tables de démarrage (main.rs) ne projettent que le premier Gio : la
+/// carte de bits doit y être, pour qu'on puisse l'écrire dès maintenant.
+/// Les cadres, eux, sont comptés dans toute la mémoire ; ceux du dessus ne
+/// servent qu'une fois la projection directe complète (pagination.rs).
+const LIMITE_DEMARRAGE: u64 = 1 << 30;
 
 /// La mémoire sous 1 Mio reste réservée : vecteurs d'interruption du mode
 /// réel, données du BIOS, mémoire vidéo, nos propres tables du chargeur.
@@ -112,7 +112,6 @@ impl Cadres {
 /// Ce que l'initialisation a trouvé, pour l'afficher.
 pub struct Bilan {
     pub libres: usize,
-    pub au_dela: u64,
     pub adresse_bits: u64,
     pub taille_bits: u64,
 }
@@ -124,12 +123,8 @@ pub fn initialiser(fin_noyau: u64) -> Result<Bilan, &'static str> {
         let zones = carte.zones();
         let libres = || zones.iter().filter(|z| z.genre == LIBRE);
 
-        // 1. Jusqu'où va la mémoire libre qu'on peut atteindre ?
+        // 1. Jusqu'où va la mémoire libre ?
         let fin_memoire = libres().map(|z| z.fin()).max().ok_or("aucune zone libre")?;
-        let au_dela: u64 = libres()
-            .map(|z| z.fin().saturating_sub(z.base.max(LIMITE_PROJETEE)))
-            .sum();
-        let fin_memoire = fin_memoire.min(LIMITE_PROJETEE);
         let nombre = (fin_memoire / TAILLE_CADRE) as usize;
         let taille_bits = arrondir_haut(nombre.div_ceil(64) as u64 * 8);
 
@@ -138,8 +133,8 @@ pub fn initialiser(fin_noyau: u64) -> Result<Bilan, &'static str> {
         //    chevaucher, le BIOS ne promet rien).
         let plancher = arrondir_haut(fin_noyau.max(DEBUT_UTILISABLE));
         let adresse_bits = libres()
-            .filter(|z| z.base < fin_memoire)
-            .map(|z| (arrondir_haut(z.base.max(plancher)), z.fin().min(fin_memoire)))
+            .filter(|z| z.base < LIMITE_DEMARRAGE)
+            .map(|z| (arrondir_haut(z.base.max(plancher)), z.fin().min(LIMITE_DEMARRAGE)))
             .find(|&(debut, fin)| {
                 debut + taille_bits <= fin
                     && zones.iter().all(|r| r.genre == LIBRE || r.fin() <= debut || r.base >= debut + taille_bits)
@@ -172,7 +167,7 @@ pub fn initialiser(fin_noyau: u64) -> Result<Bilan, &'static str> {
         cadres.marquer_zone(DEBUT_UTILISABLE, fin_noyau, true);
         cadres.marquer_zone(adresse_bits, adresse_bits + taille_bits, true);
 
-        Ok(Bilan { libres: cadres.libres, au_dela, adresse_bits, taille_bits })
+        Ok(Bilan { libres: cadres.libres, adresse_bits, taille_bits })
     })
 }
 

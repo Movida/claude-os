@@ -25,6 +25,7 @@ mod espace;
 mod gdt;
 mod horloge;
 mod interruptions;
+mod pagination;
 mod pic;
 mod port;
 mod serie;
@@ -165,11 +166,18 @@ extern "C" fn noyau_main(carte: u64) -> ! {
                         bilan.libres, bilan.libres as u64 * cadres::TAILLE_CADRE >> 20);
             afficherln!("        Carte de bits : {} Kio a {:#x}, apres le noyau (fin a {:#x}).",
                         bilan.taille_bits >> 10, bilan.adresse_bits, fin_noyau);
-            if bilan.au_dela > 0 {
-                afficherln!("        {} Mio au-dela du 1er Gio, pas encore projetes.", bilan.au_dela >> 20);
-            }
         }
         Err(e) => panic!("allocateur de cadres : {}", e),
+    }
+
+    // Les tables de pages définitives : jusqu'ici, seul le premier Gio est
+    // projeté, sans protection.
+    let bilan = pagination::initialiser();
+    if bilan.nx {
+        afficherln!("[noyau] Pagination W^X en place : noyau en {} pages de 4 Kio, {} Mio en projection directe.",
+                    bilan.pages_noyau, bilan.projection_directe >> 20);
+    } else {
+        afficherln!("[noyau] Pagination en place, SANS le bit NX (absent du processeur) : les donnees restent executables.");
     }
     tester_cadres();
 

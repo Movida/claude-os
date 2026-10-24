@@ -22,18 +22,21 @@ SECTIONS
     . = BASE_NOYAU + 0x100000;
 
     .text : AT(ADDR(.text) - BASE_NOYAU) {
+        __texte_debut = .;
         KEEP(*(.text.debut))
         *(.text .text.*)
     }
 
-    /* Chaque sorte de données commence sur une page de 4 Kio : plus tard,
-       la pagination pourra interdire l'écriture dans le code et l'exécution
-       des données, page par page (comme Linux). */
+    /* Chaque sorte de données commence sur une page de 4 Kio : la
+       pagination interdit ainsi l'écriture dans le code et les constantes,
+       et l'exécution des données, page par page (voir src/pagination.rs). */
     .rodata : AT(ADDR(.rodata) - BASE_NOYAU) ALIGN(4096) {
+        __lecture_seule_debut = .;
         *(.rodata .rodata.*)
     }
 
     .data : AT(ADDR(.data) - BASE_NOYAU) ALIGN(4096) {
+        __donnees_debut = .;
         *(.data .data.*)
         /* La GOT (Global Offset Table) : une table d'adresses par laquelle
            passe le code « indépendant de la position », que produit la

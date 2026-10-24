@@ -201,14 +201,12 @@ pub fn initialiser() {
         // de garde NON PROJETÉE fait faute de page ; le CPU ne peut pas
         // empiler le cadre de cette faute sur la pile pleine, d'où une
         // double faute, que seule une autre pile permet de traiter.
-        // ATTENTION, ce n'est pas encore le cas : le chargeur projette tout
-        // le premier Gio en pages de 2 Mio, sans trou. Une pile qui déborde
-        // descend aujourd'hui en silence dans la .bss (IDT, GDT, TSS, pile
-        // de secours elle-même), puis dans le code du noyau, et finit en
-        // triple faute. La page de garde viendra à l'étape 4, quand le
-        // noyau aura ses propres tables de pages, en pages de 4 Kio (voir
-        // HISTORIQUE.md). La pile de secours sert déjà pour toute autre
-        // cause de double faute.
+        // ATTENTION, ce n'est pas encore le cas : sous la pile du noyau, la
+        // .bss est projetée sans trou. Une pile qui déborde y descend en
+        // silence (IDT, GDT, TSS, pile de secours elle-même), et finit en
+        // triple faute. La page de garde reste à ajouter dans les tables du
+        // noyau (pagination.rs). La pile de secours sert déjà pour toute
+        // autre cause de double faute.
         let ist = if vecteur == 8 { gdt::IST_DOUBLE_FAUTE } else { 0 };
         idt[vecteur] = Entree::new(adresse, ist);
     }
