@@ -64,16 +64,41 @@ SECTIONS
         __pile_bas = .;
         . += 64K;
         __pile_haut = .;
-        /* La pile de secours de la double faute (l'IST, src/gdt.rs) : 16 Kio,
-           avec sa propre page de garde. Un gestionnaire de double faute qui
-           déborderait arrête alors la machine (triple faute) au lieu
-           d'écraser en silence ce qui précède sa pile. */
+        /* Les piles de l'IST (src/gdt.rs), chacune avec sa propre page de
+           garde : la double faute (16 Kio), puis le NMI, le débogage (#DB)
+           et la vérification machine (#MC), 8 Kio chacune. Ces exceptions
+           peuvent tomber à un instant où la pile courante n'est pas sûre
+           (voir src/gdt.rs) ; un gestionnaire qui déborderait arrête alors
+           la machine (triple faute) au lieu d'écraser en silence ce qui
+           précède sa pile. */
         . = ALIGN(4096);
         __garde_secours = .;
         . += 4K;
         __pile_secours_bas = .;
         . += 16K;
         __pile_secours_haut = .;
+        __garde_nmi = .;
+        . += 4K;
+        . += 8K;
+        __pile_nmi_haut = .;
+        __garde_debogage = .;
+        . += 4K;
+        . += 8K;
+        __pile_debogage_haut = .;
+        __garde_mc = .;
+        . += 4K;
+        . += 8K;
+        __pile_mc_haut = .;
+        /* La pile noyau du programme : celle que prend le processeur quand
+           le programme (anneau 3) entre dans le noyau, par un appel système
+           ou une interruption (TSS.RSP0). 16 Kio, le THREAD_SIZE de Linux
+           sur x86_64. Une seule : un seul programme à la fois, jusqu'à
+           l'ordonnanceur de l'étape 6, où chaque tâche aura la sienne. */
+        __garde_programme = .;
+        . += 4K;
+        __pile_programme_bas = .;
+        . += 16K;
+        __pile_programme_haut = .;
         __bss_fin = .;
     }
 

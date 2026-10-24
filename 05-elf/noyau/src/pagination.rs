@@ -10,9 +10,10 @@
 //!         code (.text)            lecture, exécution
 //!         constantes (.rodata)    lecture seule
 //!         données, pile (.data, .bss)  lecture, écriture
-//!     sauf les pages de garde, sous la pile du noyau et sous sa pile de
-//!     secours (gdt.rs), laissées sans projection : un débordement de la
-//!     pile y fait faute de page. (Leurs cadres physiques, 4 Kio chacun,
+//!     sauf les pages de garde, sous la pile du noyau, sous ses piles de
+//!     secours (l'IST, gdt.rs) et sous la pile noyau du programme,
+//!     laissées sans projection : un débordement de la pile y fait faute
+//!     de page. (Leurs cadres physiques, 4 Kio chacun,
 //!     sont perdus : Linux, avec VMAP_STACK, place les piles dans une zone
 //!     virtuelle à part, où les gardes ne coûtent que des adresses.)
 //!     Une erreur du noyau qui écrirait dans son code, ou un attaquant qui
@@ -97,13 +98,30 @@ unsafe extern "C" {
     static __donnees_debut: u8;
     static __garde: u8;
     static __garde_secours: u8;
+    static __garde_nmi: u8;
+    static __garde_debogage: u8;
+    static __garde_mc: u8;
+    static __garde_programme: u8;
     static __bss_fin: u8;
 }
 
-/// L'adresse fait-elle partie de la page de garde, sous la pile du noyau ?
-pub fn dans_la_garde(adresse: u64) -> bool {
-    let garde = &raw const __garde as u64;
-    (garde..garde + PAGE).contains(&adresse)
+/// Les pages de garde, et le nom de la pile que chacune protège (pour le
+/// message d'un débordement).
+fn gardes() -> [(u64, &'static str); 6] {
+    [
+        (&raw const __garde as u64, "la pile du noyau"),
+        (&raw const __garde_secours as u64, "la pile de la double faute"),
+        (&raw const __garde_nmi as u64, "la pile du NMI"),
+        (&raw const __garde_debogage as u64, "la pile du debogage"),
+        (&raw const __garde_mc as u64, "la pile de la verification machine"),
+        (&raw const __garde_programme as u64, "la pile noyau du programme"),
+    ]
+}
+
+/// Si l'adresse est dans une page de garde : le nom de la pile qui a
+/// débordé.
+pub fn garde_touchee(adresse: u64) -> Option<&'static str> {
+    gardes().into_iter().find(|&(g, _)| (g..g + PAGE).contains(&adresse)).map(|(_, nom)| nom)
 }
 
 /// La table de pages d'adresse physique `physique`, vue par la projection
@@ -311,12 +329,10 @@ pub fn initialiser() -> Bilan {
     NX.store(nx, Ordering::Relaxed);
     let non_executable = if nx { NON_EXECUTABLE } else { 0 };
 
-    // 1. L'image du noyau, sauf les pages de garde (sous la pile du noyau
-    // et sous la pile de secours de la double faute).
-    let garde_secours = &raw const __garde_secours as u64;
+    // 1. L'image du noyau, sauf les pages de garde.
     let mut gardes = 0;
     for v in (texte..fin).step_by(PAGE as usize) {
-        if dans_la_garde(v) || v == garde_secours {
+        if garde_touchee(v).is_some() {
             gardes += 1;
             continue;
         }

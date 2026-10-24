@@ -25,9 +25,14 @@ use crate::espace_utilisateur::{self, EspaceUtilisateur};
 use crate::pagination;
 use formats::elf::{Executable, Plage};
 
-/// Les adresses qu'un programme a le droit d'occuper (voir
-/// espace_utilisateur.rs), pour la vérification du fichier.
-pub const PERMISES: Plage = Plage { debut: espace_utilisateur::ADRESSE_MIN, fin: espace_utilisateur::ADRESSE_MAX };
+/// Les adresses que les segments d'un programme ont le droit d'occuper,
+/// pour la vérification du fichier : celles des programmes (voir
+/// espace_utilisateur.rs), sauf la pile, tout en haut, et une page
+/// d'écart sous elle. Un fichier qui voudrait y mettre un segment est
+/// refusé d'emblée, avec un message qui le dit (« hors des adresses
+/// permises »), plutôt que d'échouer au chargement sur une page « déjà
+/// projetée ».
+pub const PERMISES: Plage = Plage { debut: espace_utilisateur::ADRESSE_MIN, fin: SOMMET_PILE - TAILLE_PILE - 4096 };
 
 /// Un programme chargé, prêt à partir.
 pub struct Programme {
@@ -40,7 +45,20 @@ pub struct Programme {
     pub taille_entete: usize,
     /// La fin du dernier segment : le début du tas (brk).
     pub fin: u64,
+    /// Le sommet de sa pile.
+    pub sommet_pile: u64,
 }
+
+/// La pile du programme : 128 Kio projetés d'avance, juste sous la fin des
+/// adresses permises, rien en dessous. Linux, lui, la fait grandir à la
+/// demande (une faute de page sous la pile l'étend), jusqu'à 8 Mio par
+/// défaut (RLIMIT_STACK) : il faut la pagination à la demande (étape 6).
+/// 128 Kio, c'est ce que Linux projette d'avance lui aussi au lancement
+/// (stack_guard_gap mis à part), et bien plus qu'un programme C ordinaire
+/// n'en utilise. Un programme qui déborde fait une faute de page sous la
+/// pile, et il est arrêté.
+pub const TAILLE_PILE: u64 = 128 << 10;
+pub const SOMMET_PILE: u64 = espace_utilisateur::ADRESSE_MAX;
 
 /// Charge l'exécutable vérifié `executable` dans un espace d'adressage neuf.
 /// En cas d'échec (plus de mémoire), tout ce qui a été pris est rendu
@@ -61,6 +79,10 @@ pub fn charger(executable: &Executable) -> Result<Programme, espace_utilisateur:
         }
         espace.ecrire(segment.adresse, segment.contenu)?;
     }
+    // La pile : inscriptible, jamais exécutable.
+    for page in (SOMMET_PILE - TAILLE_PILE..SOMMET_PILE).step_by(4096) {
+        espace.projeter_neuve(page, pagination::ECRITURE | pagination::non_executable())?;
+    }
     Ok(Programme {
         espace,
         entree: executable.entree(),
@@ -68,5 +90,6 @@ pub fn charger(executable: &Executable) -> Result<Programme, espace_utilisateur:
         nombre_entetes: executable.nombre_entetes(),
         taille_entete: executable.taille_entete(),
         fin: executable.fin(),
+        sommet_pile: SOMMET_PILE,
     })
 }

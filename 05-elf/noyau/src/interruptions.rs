@@ -126,6 +126,11 @@ interruption_commune:
     mov rdi, rsp
     cld
     call gerer_interruption
+    /* Le retour par iretq, partagé : la sortie d'un appel système qui ne
+       peut pas prendre sysretq, et le premier départ d'un programme
+       (tache.rs), y sautent aussi, RSP sur un cadre complet. */
+    .global retour_interruption
+retour_interruption:
     pop r15
     pop r14
     pop r13
@@ -204,7 +209,16 @@ pub fn initialiser() {
         // La page de garde est en place (pagination.rs), et `make
         // tests-qemu` vérifie le scénario à chaque fois. La pile de secours
         // sert aussi pour toute autre cause de double faute.
-        let ist = if vecteur == 8 { gdt::IST_DOUBLE_FAUTE } else { 0 };
+        // NMI, #DB et #MC ont aussi chacun la leur : ils peuvent tomber
+        // juste après `syscall`, avant que l'entrée ait quitté la pile du
+        // programme (voir gdt.rs et appel_systeme.rs).
+        let ist = match vecteur {
+            1 => gdt::IST_DEBOGAGE,
+            2 => gdt::IST_NMI,
+            8 => gdt::IST_DOUBLE_FAUTE,
+            18 => gdt::IST_VERIFICATION_MACHINE,
+            _ => 0,
+        };
         idt[vecteur] = Entree::new(adresse, ist);
     }
 
@@ -252,8 +266,8 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
                 // SAFETY : lecture d'un registre de contrôle, sans effet.
                 unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
                 afficherln!("        adresse fautive (CR2) = {:#x}", cr2);
-                if crate::pagination::dans_la_garde(cr2) {
-                    afficherln!("        debordement de la pile du noyau : la page de garde a ete touchee");
+                if let Some(pile) = crate::pagination::garde_touchee(cr2) {
+                    afficherln!("        debordement de {} : la page de garde a ete touchee", pile);
                 }
             }
             // On ne sait pas encore réparer : on arrête tout, proprement.

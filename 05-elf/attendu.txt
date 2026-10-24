@@ -2,7 +2,7 @@
 [64 bits] Mode long actif !
 [noyau] Bonjour depuis le noyau Rust !
 [noyau] Mode long 64 bits, noyau a 0xffffffff80100000 (charge a 0x100000).
-[noyau] GDT, TSS et IDT du noyau en place.
+[noyau] GDT, TSS et IDT du noyau en place ; syscall pret.
 [noyau] Exception 3 (point d'arret (int3)) a RIP=
 [noyau] Retour apres int3 : les exceptions sont gerees.
 [noyau] PIC remappe sur les vecteurs 32-47, horloge a 1000 Hz.
@@ -27,4 +27,5 @@ memoire rendue : ok.
 [noyau] bonjour-asm : programme Linux (ELF), 
         0x00401000-0x00401024 r-x (36 octets du fichier)
         en-tetes de programme a 0x400040 (3 de 56 octets), tas a partir de 0x403000, code en place : ok.
-[noyau] bonjour-asm : charge puis decharge (pas encore d'anneau 3) ; memoire rendue : ok.
+[linux] Bonjour depuis l'anneau 3
+[noyau] bonjour-asm : termine, code de sortie 42 ; memoire rendue : ok.

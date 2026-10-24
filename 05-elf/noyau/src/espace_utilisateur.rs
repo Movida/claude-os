@@ -211,6 +211,53 @@ impl EspaceUtilisateur {
     }
 }
 
+/// Lit `octets.len()` octets à l'adresse `adresse` du programme en cours
+/// (l'espace d'adressage actif, CR3), en parcourant ses tables : chaque
+/// page doit être présente et accessible au programme (bit UTILISATEUR à
+/// tous les niveaux), dans les adresses permises. Sinon, rien n'est lu
+/// (EFAULT pour l'appel système). On lit par la projection directe des
+/// cadres, jamais par l'adresse du programme : une page absente ne fait pas
+/// de faute dans le noyau.
+///
+/// Ce parcours coûte quatre lectures de tables par page ; la sous-étape 7
+/// le remplacera par une copie du processeur lui-même, protégée par la
+/// table d'exceptions.
+pub fn lire_courant(adresse: u64, octets: &mut [u8]) -> Result<(), Erreur> {
+    let fin = adresse.checked_add(octets.len() as u64).ok_or(Erreur::AdresseInterdite)?;
+    if adresse < ADRESSE_MIN || fin > ADRESSE_MAX {
+        return Err(Erreur::AdresseInterdite);
+    }
+    let pml4 = pagination::courante();
+    let cadre_de = |page: u64| {
+        let mut table = pml4;
+        for niveau in (0..4).rev() {
+            // SAFETY : `table` est la PML4 active, puis une table qu'elle
+            // désigne : des tables de pages en place.
+            let e = unsafe { pagination::lire_table(table) }[pagination::index(page, niveau)];
+            if e & PRESENTE == 0 || e & pagination::UTILISATEUR == 0 {
+                return None;
+            }
+            table = e & ADRESSE;
+        }
+        Some(table)
+    };
+    let mut fait = 0;
+    while fait < octets.len() {
+        let a = adresse + fait as u64;
+        let decalage = (a % PAGE) as usize;
+        let n = (PAGE as usize - decalage).min(octets.len() - fait);
+        let cadre = cadre_de(a / PAGE * PAGE).ok_or(Erreur::NonProjetee)?;
+        // SAFETY : `cadre` est une page du programme, projetée ; on y lit
+        // `n` octets sans sortir de la page.
+        unsafe {
+            let source = (espace::virtuelle(cadre) as *const u8).add(decalage);
+            core::ptr::copy_nonoverlapping(source, octets[fait..].as_mut_ptr(), n);
+        }
+        fait += n;
+    }
+    Ok(())
+}
+
 /// Rend les cadres de la moitié basse sous la table `table` de niveau
 /// `niveau` (3 = PML4 : seulement ses 256 premières entrées), puis les
 /// tables elles-mêmes, sauf la racine.

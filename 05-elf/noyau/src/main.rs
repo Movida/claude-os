@@ -20,6 +20,7 @@ extern crate alloc;
 
 #[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
 mod console;
+mod appel_systeme;
 mod cadres;
 mod carte_memoire;
 mod chargeur_elf;
@@ -31,12 +32,14 @@ mod espace_utilisateur;
 mod gdt;
 mod horloge;
 mod interruptions;
+mod linux;
 mod pagination;
 mod pages;
 mod pic;
 mod port;
 mod programmes;
 mod serie;
+mod tache;
 mod tas;
 mod verrou;
 mod vga;
@@ -156,7 +159,8 @@ extern "C" fn noyau_main(infos: u64) -> ! {
 
     gdt::initialiser();
     interruptions::initialiser();
-    afficherln!("[noyau] GDT, TSS et IDT du noyau en place.");
+    appel_systeme::initialiser();
+    afficherln!("[noyau] GDT, TSS et IDT du noyau en place ; syscall pret.");
 
     // Test volontaire : int3 déclenche l'exception 3. Si l'IDT est fausse,
     // c'est une triple faute et QEMU redémarre ; sinon, on revient ici.

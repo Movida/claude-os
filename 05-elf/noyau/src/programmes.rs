@@ -12,7 +12,7 @@
 //! format est essayé tour à tour, et le premier qui reconnaît le fichier
 //! s'en charge. Le nom du fichier (son extension) ne compte pas.
 
-use crate::{chargeur_elf, demarrage, espace, pages, wasi};
+use crate::{chargeur_elf, demarrage, espace, pages, tache, wasi};
 use core::fmt;
 
 /// Le nom d'une entrée, pour l'afficher : un nom de fichier peut contenir
@@ -79,10 +79,9 @@ fn executer(nom: Nom, octets: &[u8]) {
     }
 }
 
-/// Un programme Linux : on vérifie le fichier, puis on le charge dans un
-/// espace d'adressage neuf. Pas encore d'anneau 3 pour l'exécuter : on
-/// montre ce qui a été chargé, puis on détruit l'espace, qui doit rendre
-/// toute sa mémoire.
+/// Un programme Linux : on vérifie le fichier, on le charge dans un espace
+/// d'adressage neuf, puis on l'exécute, dans l'anneau 3, jusqu'à ce qu'il se
+/// termine. Son espace est alors détruit, et doit rendre toute sa mémoire.
 fn executer_elf(nom: Nom, octets: &[u8]) {
     let executable = match formats::elf::lire(octets, chargeur_elf::PERMISES) {
         Ok(x) => x,
@@ -115,9 +114,10 @@ fn executer_elf(nom: Nom, octets: &[u8]) {
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
                 programme.fin.next_multiple_of(4096), if code_ok { "ok" } else { "ECHEC" });
+    let code = tache::executer(programme.espace.pml4(), programme.entree, programme.sommet_pile);
     drop(programme);
-    afficherln!("[noyau] {} : charge puis decharge (pas encore d'anneau 3) ; memoire rendue : {}.",
-                nom, if pages::libres() == libres { "ok" } else { "ECHEC" });
+    afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.",
+                nom, code, if pages::libres() == libres { "ok" } else { "ECHEC" });
 }
 
 /// Un programme WebAssembly : on le décode, le valide, l'instancie avec
