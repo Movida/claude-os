@@ -15,7 +15,10 @@ rendu puis redonne : ok.
 [noyau] Allocateur buddy :
 rendues et recollees : ok.
 [noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok.
-octets, decode et valide.
+[16 bits] Archive de programmes lue, placee apres le noyau.
+[noyau] Archive de programmes : 
+        bonjour.wasm                 2943 octets
+[noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
-[noyau] Programme termine : code de sortie 0
+[noyau] bonjour.wasm : termine, code de sortie 0

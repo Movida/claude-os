@@ -1,7 +1,8 @@
 # Étape 5 : exécuter un binaire Linux. Le noyau (noyau/) garde
 # l'interpréteur WebAssembly de l'étape 4 (wasm/) ; il est lancé par notre
 # chargeur (boot.asm), qui le lit par morceaux, en mode irréel.
-#   make        -> compile le noyau, assemble le chargeur, colle les deux dans boot.bin
+#   make        -> compile le noyau et les programmes, fabrique l'archive,
+#                  assemble le chargeur, colle les trois dans boot.bin
 #   make run    -> démarre dans QEMU avec une fenêtre (port série dans le terminal)
 #   make texte  -> même chose, mais l'écran VGA s'affiche dans le terminal
 #                  (pratique dans un conteneur sans fenêtre ; quitter : Echap puis 2, puis « quit »)
@@ -13,40 +14,64 @@
 #   make tests-qemu -> les scénarios dans QEMU : un noyau qui déborde exprès
 #                  de sa pile doit le dire (page de garde, double faute) ;
 #                  un noyau gonflé au-delà de 1 Mio doit être lu en entier
-#   make tests-hote -> les tests sur la machine hôte : télécharge et
+#   make tests-hote -> les tests sur la machine hôte : ceux de la
+#                  bibliothèque des formats (formats/ : archive cpio) ; puis
+#                  pour l'interpréteur WebAssembly, télécharge et
 #                  convertit la suite de tests officielle si besoin, puis la
 #                  rejoue contre la bibliothèque (tableau par fichier) ;
-#                  vérifie aussi que la bibliothèque se compile pour le
-#                  noyau (no_std), sans avertissement
+#                  vérifie aussi que les deux bibliothèques se compilent
+#                  pour le noyau (no_std), sans avertissement
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
-# L'image disque : secteur 0 = 1er étage, puis le 2e étage, puis le noyau.
+# L'image disque : secteur 0 = 1er étage, puis le 2e étage, puis le noyau,
+# puis l'archive de programmes, chacun complété au secteur.
 
 QEMU = qemu-system-x86_64 -drive format=raw,file=boot.bin
 MON  = /tmp/qemu-mon-os.sock
 NOYAU_ELF = noyau/target/x86_64-unknown-none/release/noyau
-# Le programme WebAssembly que le noyau embarque (bonjour/, compilé par
-# rustc pour la cible wasm32-unknown-unknown).
+# Le programme WebAssembly de l'archive (bonjour/, compilé par rustc pour
+# la cible wasm32-unknown-unknown).
 BONJOUR = bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm
 
-boot.bin: chargeur.bin noyau.bin
-	cat chargeur.bin noyau.bin > boot.bin
-
-# Le chargeur doit savoir combien de secteurs lire : on le calcule à partir
-# de la taille du noyau compilé, arrondie au secteur supérieur.
-chargeur.bin: boot.asm noyau.bin
-	nasm -f bin -D NOYAU_SECTEURS=$$(( ($$(stat -c %s noyau.bin) + 511) / 512 )) \
-	  boot.asm -o chargeur.bin
+# Assemble une image disque : $(call image,ELF du noyau,archive,NOM) écrit
+# NOM.bin, en passant par NOM-noyau.bin, NOM-archive.bin et
+# NOM-chargeur.bin.
+#   - objcopy -O binary retire les en-têtes ELF du noyau et ne garde que
+#     les octets à recopier en mémoire, à partir de 1 Mio ; truncate
+#     complète au secteur ;
+#   - le chargeur doit savoir combien de secteurs lire (NOYAU_SECTEURS),
+#     où s'arrête le noyau en mémoire une fois sa .bss et ses piles
+#     comptées (NOYAU_MEMOIRE, l'adresse du symbole __bss_fin de
+#     linker.ld, moins celle du début du noyau), et la taille de
+#     l'archive (ARCHIVE_OCTETS). Si nm ne trouve pas __bss_fin (le
+#     symbole renommé, un noyau dépouillé), on s'arrête : bash calculerait
+#     sans broncher 0x - 0xffffffff80100000, près de 2 Gio.
+define image
+	objcopy -O binary $(1) $(3)-noyau.bin
+	truncate -s %512 $(3)-noyau.bin
+	cp $(2) $(3)-archive.bin
+	truncate -s %512 $(3)-archive.bin
+	fin=$$(nm -P $(1) | awk '$$1 == "__bss_fin" { print $$3 }'); \
+	test -n "$$fin" || { echo "__bss_fin introuvable dans $(1)"; exit 1; }; \
+	nasm -f bin \
+	  -D NOYAU_SECTEURS=$$(( $$(stat -c %s $(3)-noyau.bin) / 512 )) \
+	  -D NOYAU_MEMOIRE=$$(( 0x$$fin - 0xffffffff80100000 )) \
+	  -D ARCHIVE_OCTETS=$$(stat -c %s $(2)) \
+	  boot.asm -o $(3)-chargeur.bin
+	cat $(3)-chargeur.bin $(3)-noyau.bin $(3)-archive.bin > $(3).bin
+endef
 
 # cargo décide lui-même s'il faut recompiler : on l'appelle à chaque fois.
-# objcopy -O binary retire les en-têtes ELF et ne garde que les octets à
-# copier en mémoire, à partir de 0x100000 ; truncate complète au secteur.
-noyau.bin: FORCE
-	cd bonjour && cargo build --release
+boot.bin: programmes.cpio FORCE
 	cd noyau && cargo build --release
-	objcopy -O binary $(NOYAU_ELF) noyau.bin
-	truncate -s %512 noyau.bin
+	$(call image,$(NOYAU_ELF),programmes.cpio,boot)
+
+# L'archive de programmes, que le noyau exécute dans l'ordre (voir
+# archive.sh).
+programmes.cpio: archive.sh FORCE
+	cd bonjour && cargo build --release
+	sh archive.sh $@ $(BONJOUR)
 
 FORCE:
 
@@ -108,7 +133,14 @@ WAST2JSON = $(SUITE)/wabt-$(WABT_VERSION)/bin/wast2json
 SHELL = /bin/bash
 .SHELLFLAGS = -o pipefail -c
 
+# Une recette qui échoue efface ce qu'elle a commencé d'écrire : une
+# archive à moitié écrite (archive.sh interrompu), plus récente que ses
+# sources, servirait sinon telle quelle à la construction suivante.
+.DELETE_ON_ERROR:
+
 tests-hote: $(SUITE)/.convertie
+	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	cd formats && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo test --release -q -- --nocapture suite_officielle 2>/dev/null | grep -v '^running\|^test \|^$$'
@@ -150,21 +182,16 @@ tests-qemu: test-garde.bin test-gros.bin
 	-$(QEMU_TEST) -drive format=raw,file=test-gros.bin -serial file:test-gros.log
 	grep -F "chaque secteur a sa place : ok" test-gros.log
 
-test-%.bin: FORCE
-	cd bonjour && cargo build --release
+test-%.bin: programmes.cpio FORCE
 	cd noyau && cargo build --release --features test-$* --target-dir target/test-$* 2>&1 | tee /dev/stderr | (! grep -q '^warning')
-	objcopy -O binary noyau/target/test-$*/x86_64-unknown-none/release/noyau noyau-test-$*.bin
-	truncate -s %512 noyau-test-$*.bin
-	nasm -f bin -D NOYAU_SECTEURS=$$(( ($$(stat -c %s noyau-test-$*.bin) + 511) / 512 )) \
-	  boot.asm -o chargeur-test-$*.bin
-	cat chargeur-test-$*.bin noyau-test-$*.bin > $@
+	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,programmes.cpio,test-$*)
 
 clean:
-	rm -f boot.bin chargeur.bin noyau.bin serial.log qemu.log ecran.png
-	rm -f test-*.bin chargeur-test-*.bin noyau-test-*.bin test-*.log
+	rm -f boot*.bin test-*.bin programmes.cpio serial.log qemu.log ecran.png test-*.log
 	rm -rf $(SUITE)
 	cd noyau && cargo clean
 	cd wasm && cargo clean
 	cd bonjour && cargo clean
+	cd formats && cargo clean
 
 .PHONY: run texte test debug capture gdb dump tests-hote tests-qemu suite clean FORCE

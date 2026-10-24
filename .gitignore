@@ -1,5 +1,6 @@
 # Fichiers générés par les Makefile
 *.bin
+*.cpio
 serial.log
 garde.log
 test-*.log

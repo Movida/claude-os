@@ -24,19 +24,29 @@
 ;  son initramfs depuis le BIOS, avant le moindre pilote de disque.
 ;
 ;  Le noyau est une image « plate » (objcopy -O binary) : son point
-;  d'entrée est son premier octet. Les programmes, eux, sont de vrais
-;  fichiers ELF, que lit le noyau (étape 5).
+;  d'entrée est son premier octet.
+;
+;  Derrière le noyau, sur le disque, vient l'ARCHIVE DE PROGRAMMES : une
+;  archive cpio, comme l'initramfs de Linux (voir formats/src/cpio.rs). Le
+;  chargeur la dépose en mémoire juste après la place qu'occupe le noyau
+;  une fois lancé (son fichier, puis sa .bss et ses piles, que le Makefile
+;  mesure, comme le champ init_size du protocole de démarrage de Linux), et
+;  dit au noyau où elle est dans les INFORMATIONS DE DÉMARRAGE (voir INFOS).
 ;
 ;  Plan de la mémoire basse :
 ;    0x01000-0x03FFF  tables de pages
-;    0x04000-0x04C07  carte de la mémoire, transmise au noyau
-;    0x04C08-0x07BFF  pile du chargeur (12 Kio), dans tous les modes
+;    0x04000-0x04C1F  informations de démarrage, transmises au noyau
+;    0x04C20-0x07BFF  pile du chargeur (près de 12 Kio), dans tous les modes
 ;    0x07C00-...      1er puis 2e étage (au plus jusqu'au tampon)
 ;    0x10000-0x17FFF  tampon de lecture : un morceau de 32 Kio
 ;  Puis, au-dessus de 1 Mio :
-;    0x100000-...     le noyau, recopié morceau par morceau
+;    0x100000-...     le noyau, recopié morceau par morceau, puis sa .bss
+;                     et ses piles (que le noyau met lui-même à zéro)
+;    page suivante    l'archive de programmes
 ;
-;  Assemblage : par le Makefile, qui passe NOYAU_SECTEURS à NASM.
+;  Assemblage : par le Makefile, qui passe à NASM la taille du noyau
+;  (NOYAU_SECTEURS sur le disque, NOYAU_MEMOIRE en mémoire) et celle de
+;  l'archive (ARCHIVE_OCTETS).
 ; -----------------------------------------------------------------------------
 
 [org 0x7C00]
@@ -48,13 +58,36 @@ COM1 equ 0x3F8          ; Registres de l'UART 16550 : 0x3F8 à 0x3FF.
 ; code : on n'a jamais à le tenir à jour à la main.
 NB_SECTEURS equ (fin_image - etage2 + 511) / 512
 
-; Taille du noyau en secteurs : connue seulement après sa compilation, donc
-; fournie par le Makefile (nasm -D NOYAU_SECTEURS=...).
+; Tailles du noyau et de l'archive : connues seulement après leur
+; construction, donc fournies par le Makefile (nasm -D NOM=valeur) :
+;   NOYAU_SECTEURS  le fichier du noyau, en secteurs ;
+;   NOYAU_MEMOIRE   la place qu'il occupe en mémoire une fois lancé, en
+;                   octets : son fichier, puis sa .bss et ses piles ;
+;   ARCHIVE_OCTETS  l'archive de programmes, en octets (0 : pas d'archive).
 %ifndef NOYAU_SECTEURS
   %error "NOYAU_SECTEURS manquant : construire avec make"
 %endif
+%ifndef NOYAU_MEMOIRE
+  %error "NOYAU_MEMOIRE manquant : construire avec make"
+%endif
+%ifndef ARCHIVE_OCTETS
+  %error "ARCHIVE_OCTETS manquant : construire avec make"
+%endif
+%if NOYAU_MEMOIRE < NOYAU_SECTEURS * 512
+  %error "NOYAU_MEMOIRE plus petit que le fichier du noyau"
+%endif
+; Une borne de bon sens : le noyau, sa .bss et ses piles tiennent en
+; quelques Mio. Une valeur énorme vient d'un calcul raté dans le Makefile.
+%if NOYAU_MEMOIRE > 256 * 1024 * 1024
+  %error "NOYAU_MEMOIRE invraisemblable (plus de 256 Mio)"
+%endif
 
 NOYAU_ADRESSE  equ 0x100000     ; Où le noyau s'exécute (1 Mio).
+; L'archive : à la page qui suit la place du noyau. Le noyau la lit par sa
+; projection directe, page par page : rien ne l'oblige à être alignée,
+; mais la réserver ou la rendre se fait par pages entières.
+ARCHIVE_ADRESSE  equ (NOYAU_ADRESSE + NOYAU_MEMOIRE + 0xFFF) & ~0xFFF
+ARCHIVE_SECTEURS equ (ARCHIVE_OCTETS + 511) / 512
 
 ; Le tampon où le BIOS dépose chaque morceau, et la taille d'un morceau.
 ; 64 secteurs : certains BIOS refusent plus de 127 secteurs par appel, et
@@ -64,22 +97,37 @@ TAMPON         equ 0x10000
 MORCEAU        equ 64
 TAMPON_FIN     equ TAMPON + MORCEAU * 512
 
-; La pile du chargeur, sous le 1er étage : de 0x7C00 vers le bas, jusqu'à
-; la carte de la mémoire (0x4C08), soit 12 Kio. Le chargeur n'en utilise
+; La pile du chargeur, sous le 1er étage : de 0x7C00 vers le bas, jusqu'aux
+; informations de démarrage (0x4C20), soit près de 12 Kio. Le chargeur n'en utilise
 ; que quelques dizaines d'octets. Elle sert dans les trois modes : on
 ; n'a pas à se demander si une autre zone est libre.
 PILE_CHARGEUR  equ 0x7C00
 
-; La carte de la mémoire transmise au noyau. Son format est un contrat
-; entre le chargeur et le noyau (voir noyau/src/carte_memoire.rs) :
-;   +0  dword  signature CARTE_SIGNATURE, preuve que la carte est là
-;   +4  dword  nombre de zones
-;   +8  zones de 24 octets : base (qword), taille (qword), type (dword),
-;       4 octets inutilisés
-CARTE          equ 0x4000
-CARTE_ZONES    equ CARTE + 8
+; Les informations de démarrage, que le chargeur transmet au noyau : ce
+; que seul le chargeur sait (la carte de la mémoire, qu'on ne peut
+; demander au BIOS qu'en mode réel ; où il a mis l'archive). C'est le rôle
+; des « boot_params » de Linux (la « zero page »). Leur format est un
+; contrat entre le chargeur et le noyau (voir noyau/src/demarrage.rs) :
+;   +0x00  dword  signature INFOS_SIGNATURE, preuve que c'est bien nous
+;   +0x04  dword  taille de la structure, en octets
+;   +0x08  qword  adresse physique de l'archive de programmes
+;   +0x10  qword  taille de l'archive, en octets (0 : pas d'archive)
+;   +0x18  dword  nombre de zones de la carte de la mémoire
+;   +0x1C  dword  inutilisé
+;   +0x20  zones de 24 octets : base (qword), taille (qword), type (dword),
+;          4 octets inutilisés
+; La taille sert de numéro de version, comme le champ « version » du
+; protocole de Linux : un chargeur plus récent ajoutera ses champs à la
+; fin (ligne de commande, tables ACPI, informations d'UEFI...), et un
+; noyau saura, à la taille, s'ils sont là.
+INFOS          equ 0x4000
+INFOS_SIGNATURE equ 'INFO'      ; NASM range les 4 caractères dans l'ordre.
+INFOS_ARCHIVE  equ INFOS + 0x08
+INFOS_ARCHIVE_TAILLE equ INFOS + 0x10
+CARTE_NOMBRE   equ INFOS + 0x18
+CARTE_ZONES    equ INFOS + 0x20
 CARTE_MAX      equ 128          ; Comme Linux (E820_MAX_ENTRIES_ZEROPAGE).
-CARTE_SIGNATURE equ 'E820'      ; NASM range les 4 caractères dans l'ordre.
+INFOS_TAILLE   equ 0x20 + CARTE_MAX * 24
 SMAP           equ 0x534D4150   ; « SMAP », mot de passe de l'appel E820.
 E820_LIBRE     equ 1            ; Type d'une zone de mémoire vive libre.
 
@@ -290,8 +338,7 @@ etage2:
     ;   - un BIOS qui cesse de répondre « SMAP » au milieu de la liste
     ;     donne une carte peut-être partielle, peut-être fausse : on la
     ;     jette toute, plutôt que de s'y fier.
-    mov dword [CARTE], CARTE_SIGNATURE
-    mov dword [CARTE + 4], 0
+    mov dword [CARTE_NOMBRE], 0
     mov di, CARTE_ZONES             ; Où recopier la prochaine zone.
     xor ebx, ebx
 .e820_suivante:
@@ -316,16 +363,16 @@ etage2:
     rep movsb
     xor eax, eax
     stosd
-    inc dword [CARTE + 4]
-    cmp dword [CARTE + 4], CARTE_MAX
+    inc dword [CARTE_NOMBRE]
+    cmp dword [CARTE_NOMBRE], CARTE_MAX
     jae .e820_fin
     test ebx, ebx
     jnz .e820_suivante
     jmp .e820_fin
 .e820_perdue:
-    mov dword [CARTE + 4], 0
+    mov dword [CARTE_NOMBRE], 0
 .e820_fin:
-    cmp dword [CARTE + 4], 0
+    cmp dword [CARTE_NOMBRE], 0
     jne .e820_ok
     mov si, msg_e820_ko
     call print16
@@ -353,14 +400,39 @@ etage2:
 
     ; --- Lire le noyau ------------------------------------------------------------
     ; Il suit le 2e étage sur le disque, et va à 1 Mio, l'adresse pour
-    ; laquelle il a été lié.
+    ; laquelle il a été lié. Toute la place qu'il occupera une fois lancé
+    ; doit être libre, pas seulement celle de son fichier : sa .bss et ses
+    ; piles suivent.
+    mov eax, NOYAU_ADRESSE
+    mov edx, NOYAU_ADRESSE + NOYAU_MEMOIRE
+    call zone_libre
+    jc charger.pas_de_place
     mov dword [charge_lba], 1 + NB_SECTEURS
     mov dword [charge_secteurs], NOYAU_SECTEURS
     mov dword [charge_destination], NOYAU_ADRESSE
     call charger
-
     mov si, msg_noyau_lu
     call print16
+
+    ; --- Lire l'archive de programmes -----------------------------------------
+    ; Elle suit le noyau sur le disque, et va à la page qui suit sa place
+    ; en mémoire.
+    mov dword [charge_lba], 1 + NB_SECTEURS + NOYAU_SECTEURS
+    mov dword [charge_secteurs], ARCHIVE_SECTEURS
+    mov dword [charge_destination], ARCHIVE_ADRESSE
+    call charger
+    mov si, msg_archive_lue
+    call print16
+
+    ; --- Les informations de démarrage --------------------------------------------
+    ; La carte de la mémoire y est déjà (écrite par l'appel E820) : on
+    ; complète l'en-tête.
+    mov dword [INFOS], INFOS_SIGNATURE
+    mov dword [INFOS + 4], INFOS_TAILLE
+    mov dword [INFOS_ARCHIVE], ARCHIVE_ADRESSE
+    mov dword [INFOS_ARCHIVE + 4], 0
+    mov dword [INFOS_ARCHIVE_TAILLE], ARCHIVE_OCTETS
+    mov dword [INFOS_ARCHIVE_TAILLE + 4], 0
 
     ; --- Bascule en mode protégé ----------------------------------------------
     ; cli AVANT tout : une interruption maintenant ferait chercher au CPU une
@@ -583,7 +655,7 @@ zone_libre:
     mov [zone_debut], eax
     mov [zone_fin], edx
     xor bp, bp                      ; bp = 1 : une zone libre la contient.
-    mov cx, [CARTE + 4]
+    mov cx, [CARTE_NOMBRE]
     mov si, CARTE_ZONES
 .zone:
     jcxz .bilan
@@ -877,11 +949,11 @@ lm_entry:
     ; une fois sa propre table d'interruptions en place. On saute par un
     ; registre : un saut relatif ne peut pas encoder une adresse aussi
     ; éloignée de façon lisible, et c'est ainsi que les chargeurs le font.
-    ; L'adresse de la carte de la mémoire va dans rdi : c'est là que la
-    ; convention d'appel des systèmes Unix 64 bits (System V) met le 1er
+    ; L'adresse des informations de démarrage va dans rdi : c'est là que
+    ; la convention d'appel des systèmes Unix 64 bits (System V) met le 1er
     ; argument d'une fonction. Le noyau la reçoit comme un paramètre.
     ; (Linux reçoit de même ses « boot_params » dans rsi.)
-    mov rdi, CARTE
+    mov rdi, INFOS
     mov rax, NOYAU_ADRESSE
     jmp rax
 
@@ -1055,7 +1127,8 @@ msg_cpu64:   db "[32 bits] Le processeur sait passer en 64 bits (cpuid, bit LM).
 msg_compat:  db "[32 bits] Pagination active, mode long actif (sous-mode compatibilite).", 13, 10, 0
 msg_noyau_lu: db "[16 bits] Noyau lu sur le disque, recopie a 1 Mio en mode irreel.", 13, 10, 0
 msg_ebda:    db "[16 bits] ERREUR : le tampon de lecture deborde sur la zone du BIOS (EBDA).", 13, 10, 0
-msg_pas_de_place: db "[16 bits] ERREUR : pas assez de memoire libre pour le noyau (E820).", 13, 10, 0
+msg_pas_de_place: db "[16 bits] ERREUR : pas assez de memoire libre pour le noyau et l'archive (E820).", 13, 10, 0
+msg_archive_lue: db "[16 bits] Archive de programmes lue, placee apres le noyau.", 13, 10, 0
 msg_e820_ko: db "[16 bits] ERREUR : le BIOS ne donne pas de carte memoire (E820).", 13, 10, 0
 msg_long:    db "[64 bits] Mode long actif ! Le processeur execute du code 64 bits.", 13, 10, 0
 msg_pas_64:  db "[32 bits] ERREUR : ce processeur n'a pas de mode 64 bits.", 13, 10, 0

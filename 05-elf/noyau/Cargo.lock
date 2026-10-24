@@ -3,9 +3,14 @@
 version = 4
 
 [[package]]
+name = "formats"
+version = "0.1.0"
+
+[[package]]
 name = "noyau"
 version = "0.1.0"
 dependencies = [
+ "formats",
  "wasm",
 ]
 

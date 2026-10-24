@@ -8,6 +8,9 @@ edition = "2024"
 [dependencies]
 # L'interpréteur WebAssembly de l'étape 4, notre propre bibliothèque.
 wasm = { path = "../wasm" }
+# La lecture des formats de fichiers : l'archive de programmes (cpio), et
+# bientôt les exécutables ELF. Notre propre bibliothèque, sans unsafe.
+formats = { path = "../formats" }
 
 # Les scénarios de `make tests-qemu` : des versions du noyau qui
 # provoquent exprès une situation à tester (voir src/main.rs).

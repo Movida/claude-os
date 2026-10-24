@@ -31,10 +31,12 @@
 //!
 //! Où ranger la carte de bits ? Sa taille dépend de la mémoire de la
 //! machine : on ne peut pas la réserver d'avance dans le noyau. On la place
-//! dans la première zone libre assez grande, après le noyau, puis on marque
-//! ses propres cadres comme occupés.
+//! dans la première place libre assez grande, après le noyau et hors de
+//! l'archive de programmes, puis on marque ses propres cadres comme
+//! occupés.
 
 use crate::carte_memoire::{self, LIBRE};
+use crate::demarrage::Etendue;
 use crate::verrou::Verrou;
 
 pub const TAILLE_CADRE: u64 = 4096;
@@ -123,8 +125,10 @@ pub struct Bilan {
 }
 
 /// Construit la carte de bits à partir de la carte de la mémoire.
-/// `fin_noyau` : première adresse après le noyau (code, données, pile).
-pub fn initialiser(fin_noyau: u64) -> Result<Bilan, &'static str> {
+/// `fin_noyau` : première adresse après le noyau (code, données, pile) ;
+/// `archive` : l'archive de programmes déposée par le chargeur, réservée
+/// elle aussi (comme l'initramfs de Linux, que memblock réserve).
+pub fn initialiser(fin_noyau: u64, archive: Option<Etendue>) -> Result<Bilan, &'static str> {
     carte_memoire::lire(|carte| {
         let zones = carte.zones();
         let libres = || zones.iter().filter(|z| z.genre == LIBRE);
@@ -135,17 +139,31 @@ pub fn initialiser(fin_noyau: u64) -> Result<Bilan, &'static str> {
         let taille_bits = arrondir_haut(nombre.div_ceil(64) as u64 * 8);
 
         // 2. Une place pour la carte de bits : dans une zone libre, après le
-        //    noyau, sans toucher une zone réservée (des zones peuvent se
-        //    chevaucher, le BIOS ne promet rien).
-        let plancher = arrondir_haut(fin_noyau.max(DEBUT_UTILISABLE));
+        //    début utilisable, sans toucher une zone réservée (des zones
+        //    peuvent se chevaucher, le BIOS ne promet rien), ni le noyau, ni
+        //    l'archive. Les débuts possibles : le début d'une zone libre, ou
+        //    la fin d'une étendue occupée ; on prend le plus bas qui
+        //    convient.
+        let occupees = [
+            Etendue { debut: DEBUT_UTILISABLE, fin: fin_noyau },
+            archive.unwrap_or(Etendue { debut: 0, fin: 0 }),
+        ];
+        let convient = |debut: u64| {
+            let fin = debut + taille_bits;
+            fin <= LIMITE_DEMARRAGE
+                && libres().any(|z| z.base <= debut && fin <= z.fin())
+                && zones.iter().all(|r| r.genre == LIBRE || r.fin() <= debut || r.base >= fin)
+                && occupees.iter().all(|o| o.fin <= debut || o.debut >= fin)
+        };
         let adresse_bits = libres()
-            .filter(|z| z.base < LIMITE_DEMARRAGE)
-            .map(|z| (arrondir_haut(z.base.max(plancher)), z.fin().min(LIMITE_DEMARRAGE)))
-            .find(|&(debut, fin)| {
-                debut + taille_bits <= fin
-                    && zones.iter().all(|r| r.genre == LIBRE || r.fin() <= debut || r.base >= debut + taille_bits)
-            })
-            .map(|(debut, _)| debut)
+            .map(|z| z.base)
+            .chain(occupees.iter().map(|o| o.fin))
+            // Borner avant d'arrondir : une adresse proche de 2^64
+            // déborderait en silence.
+            .filter(|&d| d < LIMITE_DEMARRAGE)
+            .map(|d| arrondir_haut(d.max(DEBUT_UTILISABLE)))
+            .filter(|&d| convient(d))
+            .min()
             .ok_or("pas de place pour la carte de bits")?;
 
         // SAFETY : cette plage est de la mémoire libre d'après le BIOS,
@@ -171,6 +189,9 @@ pub fn initialiser(fin_noyau: u64) -> Result<Bilan, &'static str> {
         }
         cadres.marquer_zone(0, DEBUT_UTILISABLE, true);
         cadres.marquer_zone(DEBUT_UTILISABLE, fin_noyau, true);
+        if let Some(a) = archive {
+            cadres.marquer_zone(a.debut, a.fin, true);
+        }
         cadres.marquer_zone(adresse_bits, adresse_bits + taille_bits, true);
 
         Ok(Bilan { libres: cadres.libres, adresse_bits, taille_bits })

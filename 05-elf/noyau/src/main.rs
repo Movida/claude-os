@@ -24,6 +24,7 @@ mod cadres;
 mod carte_memoire;
 mod clavier;
 mod cpu;
+mod demarrage;
 mod espace;
 mod gdt;
 mod horloge;
@@ -32,6 +33,7 @@ mod pagination;
 mod pages;
 mod pic;
 mod port;
+mod programmes;
 mod serie;
 mod tas;
 mod verrou;
@@ -68,7 +70,7 @@ use core::sync::atomic::{AtomicBool, Ordering};
 // Ce sont des tables provisoires, à grosses pages, sans protection : le
 // noyau les remplacera par les siennes, page par page.
 //
-// Le chargeur passe l'adresse de la carte de la mémoire dans rdi ; or
+// Le chargeur passe l'adresse des informations de démarrage dans rdi ; or
 // rep stosb se sert de rdi : on la met de côté dans r15, puis on la rend à
 // rdi, 1er argument de noyau_main.
 global_asm!(
@@ -142,7 +144,7 @@ unsafe extern "C" {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn noyau_main(carte: u64) -> ! {
+extern "C" fn noyau_main(infos: u64) -> ! {
     console::initialiser();
     afficherln!("[noyau] Bonjour depuis le noyau Rust !");
     let debut = &raw const _start as u64;
@@ -160,15 +162,16 @@ extern "C" fn noyau_main(carte: u64) -> ! {
     unsafe { asm!("int3") };
     afficherln!("[noyau] Retour apres int3 : les exceptions sont gerees.");
 
-    // La mémoire physique : la carte du BIOS, puis l'allocateur de cadres.
-    // SAFETY : `carte` est l'adresse passée par notre chargeur, et rien n'a
+    // La mémoire physique : les informations du chargeur (dont la carte du
+    // BIOS), puis l'allocateur de cadres.
+    // SAFETY : `infos` est l'adresse passée par notre chargeur, et rien n'a
     // encore réutilisé la mémoire basse.
-    if let Err(e) = unsafe { carte_memoire::recopier(carte) } {
-        panic!("carte de la memoire illisible ({})", e);
+    if let Err(e) = unsafe { demarrage::recopier(infos) } {
+        panic!("informations de demarrage illisibles ({})", e);
     }
     carte_memoire::afficher();
     let fin_noyau = espace::physique_du_noyau(&raw const __bss_fin as u64);
-    match cadres::initialiser(fin_noyau) {
+    match cadres::initialiser(fin_noyau, demarrage::archive()) {
         Ok(bilan) => {
             afficherln!("[noyau] Memoire libre : {} cadres de 4 Kio ({} Mio).",
                         bilan.libres, bilan.libres as u64 * cadres::TAILLE_CADRE >> 20);
@@ -222,7 +225,7 @@ extern "C" fn noyau_main(carte: u64) -> ! {
         Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
     }
 
-    executer_bonjour();
+    programmes::executer_archive();
 
     // La boucle principale : afficher ce qui est tapé, et dormir quand il
     // n'y a rien. On vérifie la file interruptions coupées, puis on dort
@@ -264,68 +267,6 @@ fn tester_pages() {
     pages::liberer(c, ordre_c);
     afficherln!("[noyau] Pages allouees : {:#x} (4 Kio), {:#x} (32 Kio), {:#x} ({} Kio) ; rendues et recollees : {}.",
                 a, b, c, taille_c >> 10, if pages::libres() == libres_avant { "ok" } else { "ECHEC" });
-}
-
-/// Le premier programme WebAssembly : bonjour, compilé par rustc
-/// (../bonjour), embarqué dans l'image du noyau. On le décode, le valide,
-/// l'instancie avec WASI, puis on appelle son point d'entrée _start par
-/// tranches de carburant : entre deux tranches, le noyau pourrait faire
-/// autre chose (exécuter un autre programme). Les interruptions de
-/// l'horloge et du clavier, elles, continuent d'arriver pendant tout ce
-/// temps, même pendant une écriture du programme (la console écrit par
-/// petits paquets).
-fn executer_bonjour() {
-    use alloc::sync::Arc;
-    use wasm::{Etat, Externe, Magasin, Piege};
-
-    static BONJOUR: &[u8] =
-        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/../bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm"));
-    const TRANCHE: u64 = 1000;
-
-    let module = match wasm::decoder(BONJOUR).and_then(wasm::valider) {
-        Ok(m) => Arc::new(m),
-        Err(e) => return afficherln!("[noyau] Programme WebAssembly refuse : {}", e),
-    };
-    afficherln!("[noyau] Programme WebAssembly : {} octets, decode et valide.", BONJOUR.len());
-    // Son budget de mémoire : 16 Mio pour ses tables et sa mémoire, chacune
-    // d'au plus 4 Mio (un bloc du tas, voir tas.rs).
-    let mut magasin = Magasin::avec_budget(16 << 20);
-    let imports = match wasi::imports(&mut magasin, &module) {
-        Ok(i) => i,
-        Err(e) => return afficherln!("[noyau] Programme non liable : {}", e),
-    };
-    let instance = match magasin.instancier(module, &imports) {
-        Ok(i) if i.demarrage.is_none() => i.instance,
-        Ok(_) => return afficherln!("[noyau] Programme refuse : fonction de demarrage inattendue"),
-        Err(e) => return afficherln!("[noyau] Programme non instanciable : {}", e),
-    };
-    let Some(Externe::Fonction(debut)) = magasin.exporte(instance, "_start") else {
-        return afficherln!("[noyau] Programme sans _start");
-    };
-    // WASI veut un _start de type [] -> [] : un programme qui en attend des
-    // arguments est refusé, comme le reste, sans que le noyau s'arrête.
-    let Ok(mut execution) = magasin.preparer(debut, &[]) else {
-        return afficherln!("[noyau] Programme refuse : _start doit etre de type [] -> []");
-    };
-    let (mut tranches, mut consomme) = (0u64, 0u64);
-    let fin = loop {
-        let mut carburant = TRANCHE;
-        let etat = execution.reprendre(&mut magasin, &mut wasi::Wasi, &mut carburant);
-        tranches += 1;
-        consomme += TRANCHE - carburant;
-        match etat {
-            Ok(Etat::Interrompue) => continue,
-            autre => break autre,
-        }
-    };
-    let code = match fin {
-        // proc_exit(code), ou _start qui revient sans l'appeler : code 0.
-        Err(Piege::Hote(code)) => code,
-        Ok(_) => 0,
-        Err(p) => return afficherln!("[noyau] Programme arrete par un piege : {}", p),
-    };
-    afficherln!("[noyau] Programme termine : code de sortie {}, {} unites de carburant en {} tranches.",
-                code, consomme, tranches);
 }
 
 /// Vérifie le tas : des collections de Rust de toutes tailles, et un objet

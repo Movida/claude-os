@@ -13,19 +13,10 @@
 //! n'apparaissent même pas. Utiliser une adresse hors des zones « libres »,
 //! c'est écrire dans le BIOS, l'ACPI ou un périphérique.
 //!
-//! Le chargeur a rangé la carte en mémoire basse (0x4000) et nous a donné
-//! son adresse. On la recopie ici dès le début : la mémoire du chargeur
-//! n'est pas à nous, et le noyau ne doit dépendre de rien qui y reste.
+//! Le chargeur l'a rangée dans les informations de démarrage, que
+//! demarrage.rs recopie dès le début, en nous passant les zones.
 
 use crate::verrou::Verrou;
-
-/// Le format écrit par le chargeur (voir CARTE dans ../boot.asm).
-#[repr(C)]
-struct CarteChargeur {
-    signature: [u8; 4],
-    nombre: u32,
-    zones: [Zone; MAX_ZONES],
-}
 
 /// Une zone de la carte. Le format est celui de l'appel E820 lui-même.
 #[repr(C)]
@@ -40,7 +31,8 @@ pub struct Zone {
 /// Le seul type de zone qu'on a le droit d'utiliser librement.
 pub const LIBRE: u32 = 1;
 
-const MAX_ZONES: usize = 128;
+/// Le plus de zones que le chargeur transmet (CARTE_MAX dans ../boot.asm).
+pub const MAX_ZONES: usize = 128;
 
 impl Zone {
     pub fn fin(&self) -> u64 {
@@ -80,27 +72,15 @@ static CARTE: Verrou<Carte> = Verrou::new(Carte {
     nombre: 0,
 });
 
-/// Recopie la carte laissée par le chargeur à l'adresse `adresse`.
-///
-/// # Safety
-/// `adresse` doit être celle que le chargeur a passée au noyau dans rdi,
-/// et la mémoire basse ne doit pas encore avoir été réutilisée.
-pub unsafe fn recopier(adresse: u64) -> Result<(), &'static str> {
-    // SAFETY : garanti par l'appelant ; la mémoire basse est vue par la
-    // projection directe.
-    let source = unsafe { &*(crate::espace::virtuelle(adresse) as *const CarteChargeur) };
-    if &source.signature != b"E820" {
-        return Err("signature absente : ce n'est pas notre chargeur");
-    }
-    let nombre = (source.nombre as usize).min(MAX_ZONES);
+/// Garde les zones de la carte transmise par le chargeur.
+pub fn installer(zones: &[Zone]) {
     let mut carte = CARTE.verrouiller();
     // On écarte les zones vides : certains BIOS en rendent.
-    for zone in source.zones[..nombre].iter().filter(|z| z.taille > 0) {
+    for zone in zones.iter().filter(|z| z.taille > 0).take(MAX_ZONES) {
         let n = carte.nombre;
         carte.zones[n] = *zone;
         carte.nombre += 1;
     }
-    Ok(())
 }
 
 /// Appelle `f(debut, fin)` pour chaque étendue de mémoire libre, dans
