@@ -1,6 +1,7 @@
 # Intégration continue : à chaque envoi, chaque étape est assemblée puis
 # démarrée dans QEMU sans écran ; on vérifie que serial.log contient bien
-# chaque ligne de son fichier attendu.txt.
+# chaque ligne de son fichier attendu.txt. Une étape qui a des tests sur la
+# machine hôte les passe aussi (`make tests-hote`, voir verifier.sh).
 name: QEMU
 
 on: [push, pull_request]

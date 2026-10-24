@@ -58,6 +58,10 @@ for commit in $COMMITS; do
     for makefile in "$ARBRE"/copie/[0-9][0-9]-*/Makefile; do
         [ -f "$makefile" ] || continue
         etape=$(dirname "$makefile")
+        # Une étape sans attendu.txt n'a pas d'image à construire. Ses
+        # tests sur la machine hôte (`make tests-hote`), verifier.sh les
+        # lance, et ils refusent eux-mêmes les avertissements.
+        [ -f "$etape/attendu.txt" ] || continue
         if ! sortie=$(make -C "$etape" boot.bin 2>&1); then
             raison="$raison construction de $(basename "$etape") ;"
         elif echo "$sortie" | grep -q '^warning'; then
