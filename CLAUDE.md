@@ -50,7 +50,7 @@ Puis lire `serial.log`. Pour une capture de l'écran, envoyer `screendump ecran.
 
 1. Secteur de démarrage 16 bits, démarrage BIOS legacy (fait)
 2. Passage en mode protégé 32 bits, puis en mode long 64 bits (fait)
-3. Mémoire, interruptions, clavier
+3. Noyau Rust : interruptions, horloge, clavier, mémoire physique (fait)
 4. Interpréteur WebAssembly dans le noyau (d'abord une bibliothèque testée sur l'hôte avec la suite de tests officielle de Wasm), puis WASI minimal (`fd_write`, `proc_exit`)
 5. Chargeur ELF et premiers appels système Linux (`write`, `exit`)
 6. Processus, système de fichiers, réseau (virtio), TLS… jusqu'à Claude Code

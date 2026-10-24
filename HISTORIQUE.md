@@ -110,10 +110,34 @@ David préfère apprendre en lisant le code et les commentaires plutôt qu'en fa
 
 **Règle :** aucune crate qui fait le travail à notre place. Le noyau n'utilise que `core`, et c'est notre chargeur de l'étape 02b qui le charge et lui passe la main en 64 bits.
 
-## 10. Questions ouvertes
+## 10. Étape 3 réalisée : un noyau Rust, ses interruptions, le clavier et la mémoire
+
+Dossier `03-noyau-rust/` : le chargeur de l'étape 02b lit aussi le noyau sur le disque, le recopie à 1 Mio et y saute en 64 bits. Le noyau n'utilise que `core`. Un commit par morceau :
+
+1. **Chaîne d'outils** : Rust figé par `rust-toolchain.toml`, cible `x86_64-unknown-none`, script d'édition de liens, console (écran VGA + COM1), verrou à attente active.
+2. **GDT, TSS et IDT du noyau** : talons en assembleur pour les 32 exceptions, cadre de pile commun, gestionnaire Rust qui affiche l'exception (avec CR2 pour une faute de page). Pile de secours (IST) pour la double faute. Test : `int3`, puis reprise.
+3. **Verrou qui coupe les interruptions** (comme `spin_lock_irqsave`), pour qu'un gestionnaire d'interruption ne bloque jamais sur un verrou tenu par le code qu'il interrompt.
+4. **PIC 8259 remappé sur 32-47 et PIT à 1000 Hz** : compteur de tics, attente avec `sti; hlt`, IRQ fantômes 7 et 15 reconnues.
+5. **Clavier PS/2** : 8042 reconfiguré, IRQ 1 qui range les codes dans une file, traduction du jeu 1 en AZERTY (Maj, AltGr, Verr Maj ; QWERTY en option), écho à l'écran avec les accents (page de code 437) et curseur matériel.
+6. **Carte mémoire E820** lue par le chargeur en mode réel, passée au noyau dans `rdi`, recopiée et affichée.
+7. **Allocateur de cadres** de 4 Kio à carte de bits, placée dans la mémoire libre après le noyau. Le premier Mio reste réservé ; au-delà du premier Gio (seul projeté par le chargeur), la mémoire est comptée mais pas encore distribuée. L'allocateur « buddy » de Linux est la cible à terme, une fois la pagination du noyau en place.
+
+**Vérifié dans QEMU** avec `verifier.sh` (chaque commit), des touches envoyées par le moniteur QEMU (`sendkey`), une capture d'écran, et la carte mémoire avec `-m 2G` et `-m 6G`.
+
+## 11. Reste à faire
+
+**Dans le noyau**
+
+- **Page de garde sous la pile du noyau** (étape 4, avec la pagination du noyau). Le chargeur projette le premier Gio en pages de 2 Mio, sans trou : une pile qui déborde descend en silence dans la .bss (IDT, GDT, TSS, pile de secours), puis dans le code, et finit en triple faute (vérifié avec une récursion infinie). Il faut des pages de 4 Kio pour le noyau et une page non projetée sous la pile : le débordement deviendra une faute de page, puis une double faute traitée sur la pile de secours (IST), avec un message clair.
+
+**Pour le vrai matériel**
+
+- **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
+
+## 12. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 11. Prochaine étape
+## 13. Prochaine étape
 
-Étape 3 : mémoire, interruptions, clavier. Une table d'interruptions (IDT) pour attraper les exceptions du processeur au lieu de redémarrer, l'horloge, puis le clavier. C'est aussi le moment de charger un vrai noyau, écrit en Rust, depuis notre chargeur.
+Étape 4 : l'interpréteur WebAssembly. D'abord une bibliothèque Rust `no_std` testée sur l'hôte avec la suite de tests officielle de Wasm, puis intégrée au noyau avec un WASI minimal (`fd_write`, `proc_exit`). Il lui faudra un tas (allocation dynamique), construit sur l'allocateur de cadres, et donc une pagination gérée par le noyau lui-même.
