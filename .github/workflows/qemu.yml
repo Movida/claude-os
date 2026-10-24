@@ -1,0 +1,16 @@
+# Intégration continue : à chaque envoi, chaque étape est assemblée puis
+# démarrée dans QEMU sans écran ; on vérifie que serial.log contient bien
+# chaque ligne de son fichier attendu.txt.
+name: QEMU
+
+on: [push, pull_request]
+
+jobs:
+  etapes:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Installer nasm et QEMU
+        run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86
+      - name: Tester chaque etape
+        run: ./verifier.sh
