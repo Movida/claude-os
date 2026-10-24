@@ -41,10 +41,22 @@ impl fmt::Write for Serie {
     fn write_str(&mut self, texte: &str) -> fmt::Result {
         for octet in texte.bytes() {
             // Un terminal attend « retour chariot » puis « saut de ligne ».
-            if octet == b'\n' {
-                ecrire_octet(b'\r');
+            // Les caractères non ASCII partent en UTF-8, tels quels : un
+            // terminal moderne les affiche correctement.
+            match octet {
+                b'\n' => {
+                    ecrire_octet(b'\r');
+                    ecrire_octet(b'\n');
+                }
+                // Retour arrière : le terminal recule seulement ; pour
+                // effacer, on recule, on écrit une espace, on recule.
+                0x08 => {
+                    ecrire_octet(0x08);
+                    ecrire_octet(b' ');
+                    ecrire_octet(0x08);
+                }
+                _ => ecrire_octet(octet),
             }
-            ecrire_octet(octet);
         }
         Ok(())
     }

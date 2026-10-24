@@ -23,7 +23,7 @@
 //! dans la version expérimentale (nightly) du compilateur, et elle cache ce
 //! qui se passe.
 
-use crate::{gdt, horloge, pic};
+use crate::{clavier, gdt, horloge, pic};
 use crate::verrou::Verrou;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
@@ -272,6 +272,7 @@ fn gerer_irq(irq: u8) {
     }
     match irq {
         horloge::IRQ => horloge::tic(),
+        clavier::IRQ => clavier::interruption(),
         _ => {}
     }
     // L'EOI en dernier : avant, le PIC pourrait nous renvoyer la même IRQ

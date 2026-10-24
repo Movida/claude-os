@@ -2,6 +2,7 @@
 //! Chaque case fait 2 octets : le caractère (page de code 437), puis la
 //! couleur (4 bits de fond, 4 bits de texte).
 
+use crate::port;
 use core::fmt;
 use core::ptr;
 
@@ -72,6 +73,21 @@ impl Ecran {
     pub fn ecrire_octet(&mut self, octet: u8) {
         match octet {
             b'\n' => self.nouvelle_ligne(),
+            // Retour arrière : on recule et on efface la case. On ne remonte
+            // pas à la ligne précédente : un terminal ne le fait pas non plus.
+            0x08 => {
+                if self.colonne > 0 {
+                    self.colonne -= 1;
+                    self.case(self.ligne, self.colonne, COULEUR << 8 | b' ' as u16);
+                }
+            }
+            // Tabulation : jusqu'à la prochaine colonne multiple de 8.
+            b'\t' => {
+                self.ecrire_octet(b' ');
+                while self.colonne % 8 != 0 {
+                    self.ecrire_octet(b' ');
+                }
+            }
             octet => {
                 if self.colonne == LARGEUR {
                     self.nouvelle_ligne();
@@ -81,18 +97,46 @@ impl Ecran {
             }
         }
     }
+
+    /// Place le curseur clignotant (dessiné par la carte, pas par nous)
+    /// sur la prochaine case à écrire. Il se règle par deux registres du
+    /// contrôleur CRT de la carte VGA, derrière les ports 0x3D4 (numéro du
+    /// registre) et 0x3D5 (sa valeur) : 0x0E et 0x0F, octets haut et bas de
+    /// la position, comptée en cases depuis le coin haut gauche.
+    fn placer_curseur(&self) {
+        let position = (self.ligne * LARGEUR + self.colonne.min(LARGEUR - 1)) as u16;
+        // SAFETY : registres documentés du contrôleur CRT ; ils ne règlent
+        // que la position du curseur.
+        unsafe {
+            port::ecrire(0x3D4, 0x0F);
+            port::ecrire(0x3D5, position as u8);
+            port::ecrire(0x3D4, 0x0E);
+            port::ecrire(0x3D5, (position >> 8) as u8);
+        }
+    }
+}
+
+/// Le caractère de la page de code 437 (la police gravée dans la carte
+/// VGA) qui correspond à un caractère Unicode. Rust manipule du texte en
+/// UTF-8, la carte des octets de 0 à 255 : il faut traduire. On ne garde
+/// que ce qu'un clavier français peut taper ; le reste devient un carré.
+fn cp437(c: char) -> u8 {
+    match c {
+        '\n' | '\t' | '\u{8}' | ' '..='~' => c as u8,
+        'ç' => 0x87, 'é' => 0x82, 'â' => 0x83, 'à' => 0x85, 'ê' => 0x88,
+        'ë' => 0x89, 'è' => 0x8A, 'ï' => 0x8B, 'î' => 0x8C, 'ô' => 0x93,
+        'û' => 0x96, 'ù' => 0x97, '£' => 0x9C, '§' => 0x15, 'µ' => 0xE6,
+        '°' => 0xF8, '²' => 0xFD,
+        _ => 0xFE,
+    }
 }
 
 impl fmt::Write for Ecran {
     fn write_str(&mut self, texte: &str) -> fmt::Result {
-        for octet in texte.bytes() {
-            // Hors ASCII imprimable, la police du BIOS afficherait un
-            // caractère de la page 437 sans rapport : on met un carré.
-            match octet {
-                b'\n' | 0x20..=0x7E => self.ecrire_octet(octet),
-                _ => self.ecrire_octet(0xFE),
-            }
+        for c in texte.chars() {
+            self.ecrire_octet(cp437(c));
         }
+        self.placer_curseur();
         Ok(())
     }
 }

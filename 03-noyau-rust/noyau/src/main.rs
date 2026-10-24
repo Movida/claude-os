@@ -14,6 +14,7 @@
 
 #[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
 mod console;
+mod clavier;
 mod cpu;
 mod gdt;
 mod horloge;
@@ -89,9 +90,25 @@ extern "C" fn noyau_main() -> ! {
     horloge::attendre_ms(100);
     afficherln!("[noyau] 100 ms plus tard : {} tics comptes.", horloge::tics());
 
-    // Plus rien à faire : le processeur dort entre deux interruptions.
+    match clavier::initialiser() {
+        Ok(()) => afficherln!("[noyau] Clavier PS/2 pret : tapez du texte."),
+        Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
+    }
+
+    // La boucle principale : afficher ce qui est tapé, et dormir quand il
+    // n'y a rien. On vérifie la file interruptions coupées, puis on dort
+    // avec sti;hlt (voir cpu::attendre_interruption) : une touche tapée
+    // entre les deux ne peut pas passer inaperçue.
     loop {
-        cpu::attendre_interruption();
+        cpu::couper_interruptions();
+        if !clavier::en_attente() {
+            cpu::attendre_interruption();
+            continue;
+        }
+        cpu::activer_interruptions();
+        while let Some(c) = clavier::lire_caractere() {
+            afficher!("{}", c);
+        }
     }
 }
 
