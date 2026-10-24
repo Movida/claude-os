@@ -45,6 +45,20 @@ avec les commandes données à la fin.
      32 bits (`-cpu qemu32`), mémoire de 128 Mio à plusieurs Gio (`-m`).
      `make debug` ou `-d int,cpu_reset -D qemu.log` montrent la chaîne des
      exceptions.
+   - **Chaque chemin d'entrée dans le noyau et de sortie** (depuis
+     l'étape 5 : `syscall`, interruption venue de l'anneau 3 ou 0, pile
+     IST, premier départ d'un programme, `sysretq` et `iretq`) : faire un
+     tableau, chemin par chemin, avec l'état de IF et d'AC (`clac` fait ?),
+     la pile utilisée à chaque instruction (un instant sur la pile du
+     programme ?), le privilège d'origine (`CS & 3`) et ce qu'on en décide,
+     et les registres qui pourraient fuir vers le programme : généraux,
+     mais aussi x87/MMX/SSE (`fninit` n'efface pas ST0-ST7) et les bases de
+     FS et GS. Essayer chaque fois depuis un programme : `int n`, `icebp`,
+     TF avant `syscall`, `mov ss` puis `syscall`, NMI injecté par le
+     moniteur QEMU (`nmi`) pendant qu'il tourne.
+   - **Le temps** : une boucle d'appels système coûteux doit, elle aussi,
+     épuiser le budget de temps d'un programme. Pas de gros travail
+     interruptions coupées (les tics de l'horloge se perdent).
    - **Pour une bibliothèque testée sur l'hôte** (étape 4) : faire échouer
      un test exprès pour vérifier que `make tests-hote` le signale ; faire « muter »
      le code (un décalage de un) pour vérifier qu'un contrôle le détecte ;
@@ -166,3 +180,39 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   avant de corriger.
 - Pas de `rm -rf "$VARIABLE"` dans les commandes : la protection de Claude Code
   les bloque ; utiliser `git worktree remove` et des chemins écrits en entier.
+
+## Pièges rencontrés à l'étape 5 (24 octobre 2026)
+
+- Ne jamais enchaîner `verifier.sh ... ; git commit` dans une même commande
+  sans lire le résultat : un commit est parti alors que `tests-qemu`
+  échouait. Commiter seulement après avoir lu « verifier : 0 ».
+- Une ligne attendue ne doit pas contenir de valeur qui dépend d'autre chose
+  que de ce qu'elle teste (la valeur de RSP dans un message de faute :
+  elle a changé quand la pile initiale s'est remplie). Garder le début et
+  la fin du message.
+- Un test doit vérifier la RAISON d'un refus, pas seulement qu'il y a refus :
+  un cas « page partagée avec le segment précédent » était en fait refusé
+  parce que le segment sortait du fichier.
+- QEMU sans accélération (TCG) n'est pas un vrai processeur :
+  `icebp` y est une instruction invalide (#UD, pas #DB) ; après `mov ss`, un
+  pas-à-pas y tombe avant l'instruction suivante au lieu d'après ; et les
+  interruptions n'y sont délivrées qu'entre deux blocs traduits : une
+  fenêtre `sti ... cli` de quelques instructions peut ne jamais en laisser
+  passer. Écrire les tests pour qu'ils acceptent les deux comportements,
+  le dire en commentaire, et comparer avec le même programme sous Linux sur
+  l'hôte.
+- Provoquer une erreur de lecture disque : `-drive
+  driver=blkdebug,config=...,image.driver=file,image.filename=boot.bin,if=ide`
+  avec une règle `[inject-error]` (`event = "none"`, `iotype = "read"`,
+  `sector`, `once`). Injecter un NMI : `nmi` sur la socket du moniteur.
+- Pendant `rebase --autosquash`, chaque fixup d'un fichier que les commits
+  suivants modifient aussi provoque des conflits en chaîne. Pour un fichier
+  que plus aucun commit ne touche après le fixup, prendre directement sa
+  version finale dans la sauvegarde (`git show sauvegarde-...:fichier`),
+  moins ce que les fixups restants ajouteront. Pour les motifs qui
+  reviennent (une liste de dépendances, une ligne de tests), un petit script
+  de résolution dans le brouillon. Construire et tester l'état de chaque
+  commit résolu avant `rebase --continue`.
+- Pendant le rebase, les fichiers construits par les commits suivants
+  apparaissent comme non suivis (le `.gitignore` de l'époque ne les connaît
+  pas encore) : ne jamais `git add -A`, nommer les fichiers.

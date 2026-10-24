@@ -153,7 +153,24 @@ Dossier `04-wasm/`, en quatre sous-étapes.
 
 **Relectures :** trois relecteurs indépendants (des agents lancés sans nos conclusions, un par sous-ensemble), du fuzzing (dizaines de millions de modules corrompus, exécutés d'une traite puis par tranches), des mutations volontaires pour vérifier que les tests mordent, et les fautes provoquées dans QEMU (écriture dans le code, exécution des données, débordement de pile, 128 Mio à 6 Gio, processeur sans NX). Chaque défaut trouvé a été replié dans le commit qui l'avait introduit.
 
-## 13. Reste à faire
+## 13. Étape 5 réalisée : un programme Linux dans l'anneau 3
+
+Dossier `05-elf/`, en onze commits (outillage compris), d'après un plan relu à l'avance contre le code et contre un vrai `gcc -static` tracé par `strace`. Un programme C ordinaire (`linux/bonjour.c` : `printf`, `malloc`, `getauxval`), compilé par `gcc -static` avec la glibc d'Ubuntu, tourne dans le noyau à côté du bonjour WebAssembly.
+
+1. **Chargeur en mode irréel.** Le noyau et ses programmes ne tiennent plus dans les 576 Kio de mémoire basse : le chargeur lit 32 Kio à la fois dans un petit tampon, puis recopie chaque morceau au-dessus de 1 Mio (`a32 rep movsd`, DS et ES gardant une limite de 4 Gio après un passage éclair en mode protégé, refait avant chaque copie, interruptions coupées jusqu'à la fin de la copie). Destination vérifiée dans la carte E820 (lue par un tampon fixe, jetée si le BIOS cesse de répondre « SMAP », comme Linux) ; trois essais par lecture ; comptes de secteurs sur 32 bits, pour les 600 000 secteurs de `claude`.
+2. **Archive de programmes**, au format de l'initramfs de Linux (cpio newc), fabriquée par `archive.sh` et déposée après la place du noyau en mémoire (mesurée comme `init_size`). Le chargeur passe au noyau une structure d'informations de démarrage (les `boot_params` de Linux, versionnée par sa taille). Le noyau exécute chaque fichier, reconnu à sa signature (les binfmt de Linux).
+3. **Un espace d'adressage par programme** : sa moitié basse, la moitié haute du noyau en copie ; bit U à tous les niveaux en bas, jamais en haut ; tables prises au buddy ; adresses de 64 Kio à `0x7fff_ffff_f000` (`mmap_min_addr`, `TASK_SIZE_MAX`) ; toute allocation pour un programme faillible.
+4. **Chargeur ELF** : validation complète par une bibliothèque `no_std` sans `unsafe` (`formats/`, avec la lecture cpio), testée sur l'hôte contre de vrais binaires (gcc statique, PIE, dynamique, `ld -N`) et des variantes abîmées. ET_EXEC seulement, jamais W+X.
+5. **Anneau 3 et `syscall`** (choix de conception) : GDT dans l'ordre de STAR, entrée qui range le RSP du programme dans `TSS.rsp2` et construit le même cadre que les interruptions, retour par `sysretq` seulement si RIP est dans la moitié basse (CVE-2012-0217), sinon `iretq`. Pas de `swapgs` avant le multiprocesseur. NMI, #DB, #MC et double faute sur leur pile IST. Le programme est une tâche : sa pile noyau, un contexte, `basculer` (`__switch_to_asm`).
+6. **Un programme fautif est arrêté, le noyau continue** : décision d'après `CS & 3` pour tous les vecteurs, signal de Linux et code de sortie 128 + N ; budget de temps de 1 s (SIGXCPU). `make tests-qemu` démarre une archive de programmes fautifs (une vingtaine, nasm + ld, qui font la même faute sous Linux sur l'hôte) avec qemu64 puis `-cpu max`, et le noyau éteint QEMU à la fin.
+7. **Copies vers et depuis les programmes** : bornes d'abord, puis `stac ; rep movsb ; clac` protégé par une table d'exceptions (`__ex_table`) ; SMEP, SMAP, UMIP quand le processeur les a ; `clac` en tête de chaque talon d'interruption.
+8. **Pile initiale** : argv, envp, vecteur auxiliaire (AT_PHDR, AT_RANDOM...), RSP aligné sur 16. Identité : l'utilisateur 1000, pas root. Aléa : RDRAND, sinon le compteur de cycles brassé (non cryptographique, et le noyau le dit).
+9. **SSE pour les programmes, sans XSAVE** (choix de conception) : FXSR seulement, pas d'AVX promis ; chaque programme part d'un état x87/SSE propre (`fxrstor` d'une image initiale).
+10. **Appels système de la glibc statique** : brk (vrai tas, budget de mémoire), arch_prctl, mprotect réel (W+X permis, PROT_NONE), fstat, getrandom, prlimit64... `make trace` affiche la même suite d'appels que `strace` sur l'hôte.
+
+**Relecture de fond :** quatre relecteurs indépendants, 60 millions d'ELF et 40 millions d'archives abîmés (aucune panique, invariants vérifiés), des mutations, des cas provoqués (`-cpu qemu32`, 128 Mio à 6 Gio, sans NX, image tronquée, erreurs disque injectées par `blkdebug`, NMI injecté pendant un programme). Deux vrais défauts, repliés dans leurs commits : les registres x87/MMX passaient d'un programme au suivant (`fninit` ne les efface pas), et un programme échappait à son budget de temps par `brk` (pages mises à zéro interruptions coupées, tics perdus). Plus une série de points de robustesse (chargeur sur vrai matériel, Makefile, petits écarts avec Linux).
+
+## 14. Reste à faire
 
 **Dans le noyau**
 
@@ -162,17 +179,26 @@ Dossier `04-wasm/`, en quatre sous-étapes.
 - **Validation sous carburant.** Valider un module piégé coûte jusqu'à environ 1 s par Mio (le facteur 1000 de l'algorithme de la spécification) ; l'instanciation copie les segments actifs sans carburant (linéaire en la taille du module). À rendre interruptible avec l'ordonnanceur.
 - **Console non bloquante.** Le port série fait attendre activement (87 µs par octet sur du vrai matériel) : un pilote à interruptions et une file d'attente, comme le tty de Linux.
 - **Registres des périphériques** (ACPI, APIC…) : les projeter à la demande, sans cache (`ioremap`) ; la projection directe ne couvre que la mémoire vive.
-- **Pages globales** (CR4.PGE) pour le noyau, quand il y aura un espace d'adressage par programme (étape 6).
+- **Pages globales** (CR4.PGE) pour le noyau, maintenant qu'il y a un espace d'adressage par programme ; KPTI et PCID quand on saura sur quels processeurs on tourne.
+- **Copie de la moitié haute des espaces d'adressage** : elle suppose que la PML4 du noyau ne change plus. Avec `vmalloc`, créer d'avance toutes les tables de second niveau de la moitié haute (`preallocate_vmalloc_pages` de Linux).
+- **`iretq` qui fauterait** (un RIP non canonique écrit par le noyau, pour exec ou les signaux) : une entrée de la table d'exceptions qui transforme la faute en signal pour le programme (`bad_iret` de Linux). Inatteignable aujourd'hui : le RIP d'un cadre vient toujours du programme.
+- **Budget de temps au compteur de cycles** : compté en tics d'horloge, il se laisse un peu tromper sous QEMU sans accélération (tics perdus dans de courtes sections critiques). Avec une horloge fine (TSC, HPET), mesurer le temps réel.
+- **Tables de pages hors budget** de mémoire d'un programme : les compter, comme Linux (`pgtables_bytes`), avant mmap.
+- **Lecture des formats** : `formats/` relit les octets après les avoir validés. Sans risque tant qu'ils viennent de l'archive en lecture seule ; valider une copie le jour où ils viendront d'une mémoire modifiable (le cache des fichiers, execve).
+- **Archive cpio** : liens physiques (nlink > 1, contenu dans la dernière entrée), archives concaténées et compressées.
+- **PT_GNU_STACK exécutable** : ignoré, la pile reste NX ; un programme qui l'exige (fonctions imbriquées de gcc) plante au lieu d'être refusé avec un message.
+- **writev** : vérifier tous les morceaux avant d'écrire, comme Linux.
 - **Tas :** rendre au buddy les pages vides des classes ; des listes par processeur pour le multiprocesseur.
 
 **Pour le vrai matériel**
 
+- **NMI pendant le passage éclair en mode protégé du chargeur** : non masqué (Linux le masque par le port 0x70 pour son passage définitif). Risque infime, à revoir si un essai sur vrai matériel le montre.
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 14. Questions ouvertes
+## 15. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 15. Prochaine étape
+## 16. Prochaine étape
 
-Étape 5 : un chargeur ELF et les premiers appels système Linux (`write`, `exit`), pour faire tourner un programme Linux statique, compilé normalement, à côté des programmes WebAssembly. Il y faudra le mode utilisateur (anneau 3), l'instruction `syscall`, et un espace d'adressage par programme, dans la moitié basse que le noyau a laissée libre.
+Étape 6 : vers Claude Code. Le plan de l'étape 5 en a reporté la liste : ET_DYN, ld-linux et la glibc partagée (`claude` est dynamique) ; mmap et la pagination à la demande ; l'ordonnanceur, les fils d'exécution, la sauvegarde XSAVE à chaque bascule ; un vrai tty ; un vrai générateur aléatoire ; un système de fichiers en mémoire rempli depuis l'archive, et /proc/self/exe ; KPTI, PCID, pages globales ; ASLR ; vDSO. Puis le réseau (virtio) et TLS.
