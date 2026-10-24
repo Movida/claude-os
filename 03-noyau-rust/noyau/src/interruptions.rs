@@ -23,7 +23,7 @@
 //! dans la version expérimentale (nightly) du compilateur, et elle cache ce
 //! qui se passe.
 
-use crate::gdt;
+use crate::{gdt, horloge, pic};
 use crate::verrou::Verrou;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
@@ -70,8 +70,11 @@ impl Entree {
 
 static IDT: Verrou<[Entree; 256]> = Verrou::new([Entree::ABSENTE; 256]);
 
-/// Nombre de vecteurs pour lesquels on a écrit un talon.
-const NB_TALONS: usize = 32;
+/// Nombre de vecteurs pour lesquels on a écrit un talon : les 32
+/// exceptions, puis les 16 IRQ du PIC (vecteurs 32 à 47, voir pic.rs).
+/// Les autres entrées restent absentes : les déclencher provoquerait une
+/// protection générale, qu'on afficherait.
+const NB_TALONS: usize = 48;
 
 // Les talons, générés par une macro de l'assembleur pour chaque vecteur.
 // Les exceptions 8, 10-14, 17, 21, 29 et 30 empilent déjà un code
@@ -96,7 +99,7 @@ talon_\num:
     .section .text
     .altmacro
     .set i, 0
-    .rept 32
+    .rept 48
         TALON %i
         .set i, i + 1
     .endr
@@ -147,7 +150,7 @@ interruption_commune:
     .global adresses_talons
 adresses_talons:
     .set i, 0
-    .rept 32
+    .rept 48
         ADRESSE %i
         .set i, i + 1
     .endr
@@ -228,6 +231,10 @@ pub fn initialiser() {
 #[unsafe(no_mangle)]
 extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     let vecteur = cadre.vecteur as usize;
+    if vecteur >= pic::VECTEUR_BASE as usize {
+        gerer_irq((vecteur - pic::VECTEUR_BASE as usize) as u8);
+        return;
+    }
     match vecteur {
         // int3 n'est pas une erreur : un débogueur s'en sert pour poser des
         // points d'arrêt. RIP désigne déjà l'instruction suivante : on
@@ -252,4 +259,24 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
             panic!("exception {} non geree", vecteur);
         }
     }
+}
+
+/// Une interruption matérielle, venue du PIC. Les interruptions sont
+/// coupées pendant tout le traitement (porte d'interruption) : il doit être
+/// court. Linux découpe le travail en deux, une « moitié haute » minimale
+/// ici, et le reste plus tard, interruptions actives (softirq, workqueue) ;
+/// pour nous, tout tient dans la moitié haute.
+fn gerer_irq(irq: u8) {
+    if pic::est_fantome(irq) {
+        return;
+    }
+    match irq {
+        horloge::IRQ => horloge::tic(),
+        _ => {}
+    }
+    // L'EOI en dernier : avant, le PIC pourrait nous renvoyer la même IRQ
+    // pendant qu'on la traite encore. (Les interruptions étant coupées, elle
+    // attendrait l'iretq ; mais l'habitude est la bonne pour le jour où on
+    // les réactivera pendant un traitement.)
+    pic::fin_interruption(irq);
 }

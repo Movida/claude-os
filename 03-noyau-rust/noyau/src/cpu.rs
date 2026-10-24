@@ -31,6 +31,20 @@ pub fn activer_interruptions() {
     unsafe { asm!("sti", options(nostack)) };
 }
 
+/// Active les interruptions et endort le CPU jusqu'à la prochaine.
+///
+/// `sti` et `hlt` sont collés exprès : `sti` ne prend effet qu'APRÈS
+/// l'instruction qui le suit. Une interruption ne peut donc pas tomber
+/// entre les deux. Sans cette garantie, ce code serait faux :
+///     cli ; if rien_a_faire { sti ; <IRQ ici, qui crée du travail> ; hlt }
+/// le CPU dormirait alors avec du travail en attente. L'appelant coupe les
+/// interruptions, vérifie s'il a quelque chose à faire, et sinon appelle
+/// cette fonction : c'est la boucle d'attente de Linux (safe_halt).
+pub fn attendre_interruption() {
+    // SAFETY : comme activer_interruptions ; hlt ne fait qu'attendre.
+    unsafe { asm!("sti", "hlt", options(nostack)) };
+}
+
 /// Arrête le processeur pour de bon : interruptions coupées, puis `hlt`.
 /// La boucle reprend l'arrêt si une interruption non masquable (NMI) le
 /// réveille.

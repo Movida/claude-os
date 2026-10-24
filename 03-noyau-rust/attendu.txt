@@ -5,3 +5,5 @@
 [noyau] GDT, TSS et IDT du noyau en place.
 [noyau] Exception 3 (point d'arret (int3)) a RIP=
 [noyau] Retour apres int3 : les exceptions sont gerees.
+[noyau] PIC remappe sur les vecteurs 32-47, horloge a 1000 Hz.
+[noyau] 100 ms plus tard : 

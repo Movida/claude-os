@@ -16,7 +16,9 @@
 mod console;
 mod cpu;
 mod gdt;
+mod horloge;
 mod interruptions;
+mod pic;
 mod port;
 mod serie;
 mod verrou;
@@ -73,7 +75,24 @@ extern "C" fn noyau_main() -> ! {
     // SAFETY : int3 ne fait qu'appeler notre gestionnaire, qui revient.
     unsafe { asm!("int3") };
     afficherln!("[noyau] Retour apres int3 : les exceptions sont gerees.");
-    cpu::arreter()
+
+    // Les interruptions matérielles : d'abord le PIC (tout masqué), puis
+    // l'horloge qui démasque son IRQ, et seulement alors sti. Dans l'autre
+    // ordre, une IRQ pourrait arriver sur un vecteur d'exception.
+    pic::initialiser();
+    horloge::initialiser();
+    cpu::activer_interruptions();
+    afficherln!("[noyau] PIC remappe sur les vecteurs {}-{}, horloge a {} Hz.",
+                pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1, horloge::HZ);
+    // Le compte affiché vaut 100, parfois 101 : un tic peut tomber entre
+    // le réveil et la lecture du compteur.
+    horloge::attendre_ms(100);
+    afficherln!("[noyau] 100 ms plus tard : {} tics comptes.", horloge::tics());
+
+    // Plus rien à faire : le processeur dort entre deux interruptions.
+    loop {
+        cpu::attendre_interruption();
+    }
 }
 
 /// Appelé par Rust en cas d'erreur fatale (indice hors d'un tableau,
