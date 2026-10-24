@@ -110,6 +110,8 @@ David préfère apprendre en lisant le code et les commentaires plutôt qu'en fa
 
 **Règle :** aucune crate qui fait le travail à notre place. Le noyau n'utilise que `core`, et c'est notre chargeur de l'étape 02b qui le charge et lui passe la main en 64 bits.
 
+**Révisé à l'étape 4 :** le noyau utilise aussi `alloc` (`Vec`, `Box`, `String`), servi par notre propre allocateur (buddy, puis tas par classes de taille), pour faire tourner l'interpréteur WebAssembly (section 12). `alloc` ne fournit que les structures de données ; la mémoire, c'est notre code qui la donne.
+
 ## 10. Étape 3 réalisée : un noyau Rust, ses interruptions, le clavier et la mémoire
 
 Dossier `03-noyau-rust/` : le chargeur de l'étape 02b lit aussi le noyau sur le disque, le recopie à 1 Mio et y saute en 64 bits. Le noyau n'utilise que `core`. Un commit par morceau :
@@ -130,20 +132,47 @@ Dossier `03-noyau-rust/` : le chargeur de l'étape 02b lit aussi le noyau sur le
 
 **Décision :** relecture de fond AVANT le premier push de chaque étape, en effort élevé, avec les cas d'erreur déclenchés volontairement. Les corrections sont repliées (`git commit --fixup`, puis `rebase --autosquash`) tant que rien n'est publié. La marche à suivre, et le cas exceptionnel d'un historique déjà poussé, sont dans le skill `.claude/skills/fin-d-etape/`, avec un script qui vérifie chaque commit.
 
-## 12. Reste à faire
+## 12. Étape 4 réalisée : un interpréteur WebAssembly, dans le noyau
+
+Dossier `04-wasm/`, en quatre sous-étapes.
+
+**1. Décodeur et banc d'essai** (`wasm/`, une bibliothèque `no_std` + `alloc`). Lit un module `.wasm` 2.0 sans SIMD ; le code n'est pas traduit, on garde la plage de chaque corps de fonction. Le banc rejoue la suite officielle de la spécification (tag wg-2.0), convertie par `wast2json`. **Décision de David :** wabt 1.0.39, téléchargé comme la suite par le Makefile, à une version figée vérifiée par SHA-256 (wabt 1.0.34 d'Ubuntu ne lisait pas deux fichiers de la suite) ; le paquet `apt` n'est plus nécessaire. Limites d'implémentation (`limites.rs`), celles des navigateurs : module de 1 Gio, corps de fonction de 7,6 Mo, 1000 paramètres et 1000 résultats, 50 000 locales.
+
+**2. Validateur.** L'algorithme de l'annexe de la spécification (pile de types, pile de cadres, une seule passe, pile polymorphe dans le code inaccessible). `valider` rend un `ModuleValide` aux champs privés : impossible d'exécuter un module non validé. Il ne suppose rien du `Module` reçu. Il calcule aussi la **table annexe des branchements** : l'interpréteur lit les octets du code tels quels (« interprétation sur place », Titzer 2022, moteur Wizard), la table lui dit où mène chaque branchement.
+
+**3. Interpréteur.** Cases de pile de 64 bits non typées, pile d'appels explicite sur le tas (non récursif : une récursion WebAssembly ne touche jamais la pile du noyau), **carburant** (une exécution s'interrompt après N unités et se reprend au même point ; une instruction qui touche beaucoup d'octets, ou l'hôte, ajoute une dette). Flottants exacts en arithmétique entière, NaN canoniques : résultats identiques sur l'hôte et dans le noyau. Un magasin avec un budget mémoire ; une instanciation qui échoue ne laisse rien ; la fonction de démarrage est rendue comme une `Execution`, à faire tourner au carburant. Suite officielle : **27 437 commandes réussies, 0 échec** (581 modules au format texte ignorés).
+
+**4. Dans le noyau.**
+- Noyau dans la moitié haute (`0xffffffff80100000`, chargé à 1 Mio par `AT()`) ; `_start` construit ses tables de démarrage comme `head_64.S` de Linux, le chargeur n'a rien de plus à fournir (un chargeur UEFI non plus).
+- Tables définitives : pages de 4 Kio W^X pour le noyau (EFER.NXE, CR0.WP), projection directe de la mémoire vive seule (`0xffff888000000000`), alias du code en lecture seule, plus d'identité. Sans NX (ou NX caché par le BIOS d'un Intel, qu'on démasque comme Linux), le noyau s'en passe et le dit.
+- Pages de garde sous la pile du noyau et sous la pile de secours de la double faute.
+- La carte de bits de l'étape 3 devient l'allocateur de démarrage (`memblock`) et cède la mémoire à un **allocateur buddy** ; un **tas** par classes de 16 à 2048 octets (SLUB simplifié) sert `alloc`.
+- **WASI minimal** (`fd_write`, `proc_exit`) ; un programme écrit en Rust et compilé par `rustc` (`bonjour/`, 2943 octets) affiche un bonjour et dix nombres premiers, exécuté par tranches de carburant. Le noyau pèse 157 Kio.
+
+**Outillage :** `verifier.sh` lance aussi `make tests-hote` (les tests sur la machine hôte) et `make tests-qemu` (des scénarios de panne : un noyau qui déborde exprès de sa pile doit le dire). `make test` garde partout le sens « démarrer dans QEMU ». Les tuyaux des Makefile passent par `pipefail` (un test en échec passait inaperçu).
+
+**Relectures :** trois relecteurs indépendants (des agents lancés sans nos conclusions, un par sous-ensemble), du fuzzing (dizaines de millions de modules corrompus, exécutés d'une traite puis par tranches), des mutations volontaires pour vérifier que les tests mordent, et les fautes provoquées dans QEMU (écriture dans le code, exécution des données, débordement de pile, 128 Mio à 6 Gio, processeur sans NX). Chaque défaut trouvé a été replié dans le commit qui l'avait introduit.
+
+## 13. Reste à faire
 
 **Dans le noyau**
 
-- **Page de garde sous la pile du noyau** (étape 4, avec la pagination du noyau). Le chargeur projette le premier Gio en pages de 2 Mio, sans trou : une pile qui déborde descend en silence dans la .bss (IDT, GDT, TSS, pile de secours), puis dans le code, et finit en triple faute (vérifié avec une récursion infinie). Il faut des pages de 4 Kio pour le noyau et une page non projetée sous la pile : le débordement deviendra une faute de page, puis une double faute traitée sur la pile de secours (IST), avec un message clair.
+- **Allocations faillibles.** Une allocation impossible, hors de `try_reserve`, fait paniquer le noyau. Rust pour Linux n'utilise que des allocations qui rendent une erreur : à généraliser avant que des programmes puissent en abuser.
+- **Grandes allocations.** Un bloc du tas ne dépasse pas 4 Mio (l'ordre maximal du buddy) : il faudra projeter des pages éparses d'un seul tenant (`vmalloc`). Pour les mémoires WebAssembly, réserver 4 Gio d'adresses suivies de pages de garde (comme wasmtime), ce qui supprimera aussi le contrôle des bornes une fois le code compilé.
+- **Validation sous carburant.** Valider un module piégé coûte jusqu'à environ 1 s par Mio (le facteur 1000 de l'algorithme de la spécification) ; l'instanciation copie les segments actifs sans carburant (linéaire en la taille du module). À rendre interruptible avec l'ordonnanceur.
+- **Console non bloquante.** Le port série fait attendre activement (87 µs par octet sur du vrai matériel) : un pilote à interruptions et une file d'attente, comme le tty de Linux.
+- **Registres des périphériques** (ACPI, APIC…) : les projeter à la demande, sans cache (`ioremap`) ; la projection directe ne couvre que la mémoire vive.
+- **Pages globales** (CR4.PGE) pour le noyau, quand il y aura un espace d'adressage par programme (étape 6).
+- **Tas :** rendre au buddy les pages vides des classes ; des listes par processeur pour le multiprocesseur.
 
 **Pour le vrai matériel**
 
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 13. Questions ouvertes
+## 14. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 14. Prochaine étape
+## 15. Prochaine étape
 
-Étape 4 : l'interpréteur WebAssembly. D'abord une bibliothèque Rust `no_std` testée sur l'hôte avec la suite de tests officielle de Wasm, puis intégrée au noyau avec un WASI minimal (`fd_write`, `proc_exit`). Il lui faudra un tas (allocation dynamique), construit sur l'allocateur de cadres, et donc une pagination gérée par le noyau lui-même.
+Étape 5 : un chargeur ELF et les premiers appels système Linux (`write`, `exit`), pour faire tourner un programme Linux statique, compilé normalement, à côté des programmes WebAssembly. Il y faudra le mode utilisateur (anneau 3), l'instruction `syscall`, et un espace d'adressage par programme, dans la moitié basse que le noyau a laissée libre.

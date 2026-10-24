@@ -35,7 +35,7 @@ Le dépôt (github.com/Movida/claude-os) doit se lire étape par étape.
 - `nasm` et `qemu-system-x86_64` (`sudo apt install nasm qemu-system-x86`).
 - Étape 4 : `make tests-hote` télécharge la suite de tests officielle de WebAssembly et `wast2json` (wabt 1.0.39, binaire officiel pour Linux x86_64), qui la convertit, à des versions figées vérifiées par SHA-256.
 - Rust, via `rustup` (installé par le devcontainer). La version exacte est figée dans `03-noyau-rust/noyau/rust-toolchain.toml` ; `rustup` l'installe à la première commande `cargo`.
-- Dans chaque étape : `make` pour construire, `make run` pour démarrer dans QEMU, `make dump` pour inspecter l'image ; `make tests-hote` pour les tests qui tournent sur la machine hôte, quand l'étape en a.
+- Dans chaque étape : `make` pour construire, `make run` pour démarrer dans QEMU, `make dump` pour inspecter l'image ; `make tests-hote` pour les tests qui tournent sur la machine hôte, et `make tests-qemu` pour les scénarios de panne, quand l'étape en a.
 
 ## Tester sans écran
 
@@ -53,7 +53,7 @@ Puis lire `serial.log`. Pour une capture de l'écran, envoyer `screendump ecran.
 1. Secteur de démarrage 16 bits, démarrage BIOS legacy (fait)
 2. Passage en mode protégé 32 bits, puis en mode long 64 bits (fait)
 3. Noyau Rust : interruptions, horloge, clavier, mémoire physique (fait)
-4. Interpréteur WebAssembly dans le noyau (d'abord une bibliothèque testée sur l'hôte avec la suite de tests officielle de Wasm), puis WASI minimal (`fd_write`, `proc_exit`)
+4. Interpréteur WebAssembly dans le noyau (d'abord une bibliothèque testée sur l'hôte avec la suite de tests officielle de Wasm), puis WASI minimal (`fd_write`, `proc_exit`) (fait)
 5. Chargeur ELF et premiers appels système Linux (`write`, `exit`)
 6. Processus, système de fichiers, réseau (virtio), TLS… jusqu'à Claude Code
 
