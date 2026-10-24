@@ -1,0 +1,19 @@
+# Le noyau : un programme Rust sans système d'exploitation en dessous.
+# Aucune dépendance : tout ce qui touche le matériel est écrit ici.
+[package]
+name = "noyau"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+# panic = "abort" : en cas de panique, pas de « déroulement » de la pile
+# (unwinding), qui demanderait une bibliothèque d'exécution qu'on n'a pas.
+# Le noyau affiche le message et arrête le processeur.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"     # Optimise pour la taille : le noyau doit tenir en mémoire basse (voir ../boot.asm).
+debug = false
