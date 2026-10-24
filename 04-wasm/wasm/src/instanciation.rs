@@ -14,6 +14,12 @@
 //! Un piège pendant l'étape 3 fait échouer l'instanciation, mais ce qui a
 //! déjà été écrit reste écrit : si la table ou la mémoire est importée,
 //! d'autres modules le voient (linking.wast le vérifie).
+//!
+//! La fonction de démarrage est du code du module, qui peut boucler sans
+//! fin : `instancier` ne l'exécute pas lui-même, il rend son appel, une
+//! `Execution` que l'environnement fait tourner avec du carburant, comme
+//! tout autre appel (voir interpreteur.rs). Aucun code WebAssembly ne
+//! s'exécute donc jamais sans limite.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -21,9 +27,21 @@ use core::fmt;
 
 use crate::instructions::{Instruction, lire_instruction};
 use crate::lecteur::Lecteur;
+use crate::interpreteur::Execution;
 use crate::magasin::*;
 use crate::module::{DescriptionImport, Element, Limites, ModeSegment, Module, Plage};
 use crate::validateur::ModuleValide;
+
+/// Une instance créée, pas encore démarrée.
+#[must_use = "la fonction de demarrage doit s'executer avant d'utiliser l'instance"]
+pub struct Instanciation {
+    /// Le numéro de la nouvelle instance.
+    pub instance: u32,
+    /// L'appel de la fonction de démarrage du module, s'il en a une : à
+    /// mener à son terme (`Execution::reprendre`) avant de se servir de
+    /// l'instance. S'il piège, l'instanciation a échoué.
+    pub demarrage: Option<Execution>,
+}
 
 /// Pourquoi une instanciation a échoué.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,14 +117,8 @@ impl Magasin {
     }
 
     /// Instancie `module` avec `imports` (dans l'ordre de ses imports), et
-    /// rend le numéro de la nouvelle instance. `hote` sert à la fonction de
-    /// démarrage, si elle appelle l'hôte.
-    pub fn instancier(
-        &mut self,
-        module: Arc<ModuleValide>,
-        imports: &[Externe],
-        hote: &mut dyn Hote,
-    ) -> Result<u32, ErreurInstanciation> {
+    /// rend la nouvelle instance, avec l'appel de sa fonction de démarrage.
+    pub fn instancier(&mut self, module: Arc<ModuleValide>, imports: &[Externe]) -> Result<Instanciation, ErreurInstanciation> {
         let md = module.module();
 
         // 1. La liaison.
@@ -195,7 +207,8 @@ impl Magasin {
             self.donnees.push(InstanceDonnees { module: module.clone(), plage: segment.octets });
         }
 
-        // 3. L'initialisation, puis le démarrage.
+        // 3. L'initialisation, puis l'appel du démarrage, que l'appelant
+        // exécutera.
         let piege = ErreurInstanciation::Piege;
         for (x, segment) in md.elements.iter().enumerate() {
             let adresse = self.instances[numero].elements[x] as usize;
@@ -230,11 +243,12 @@ impl Magasin {
                 self.donnees[adresse].plage = Plage { debut: 0, fin: 0 };
             }
         }
-        if let Some(x) = md.demarrage {
+        let demarrage = md.demarrage.map(|x| {
             let f = self.instances[numero].fonctions[x as usize];
-            self.invoquer(hote, f, &[]).map_err(piege)?;
-        }
-        Ok(numero as u32)
+            // Sans argument : la validation a vérifié son type, [] -> [].
+            self.preparer(f, &[]).expect("type de demarrage valide")
+        });
+        Ok(Instanciation { instance: numero as u32, demarrage })
     }
 }
 
@@ -246,7 +260,7 @@ mod tests {
 
     struct SansHote;
     impl Hote for SansHote {
-        fn appeler(&mut self, _: u32, _: &[Valeur], _: &mut [Valeur], _: Option<&mut [u8]>) -> Result<(), Piege> {
+        fn appeler(&mut self, _: u32, _: &[Valeur], _: &mut [Valeur], _: Option<&mut [u8]>, _: &mut u64) -> Result<(), Piege> {
             unreachable!("les modules n'importent rien")
         }
     }
@@ -274,12 +288,12 @@ mod tests {
     #[test]
     fn un_echec_ne_laisse_rien_dans_le_magasin() {
         let mut m = Magasin::new();
-        let erreur = m.instancier(valide(TROP_GRAND), &[], &mut SansHote);
+        let erreur = m.instancier(valide(TROP_GRAND), &[]).map(|i| i.instance);
         assert_eq!(erreur, Err(ErreurInstanciation::Ressources));
         // Ni fonction, ni instance : la fonction de TROP_GRAND ne doit pas
         // se retrouver attachée à l'instance suivante.
         assert!(m.fonctions.is_empty() && m.instances.is_empty() && m.memoires.is_empty());
-        let n = m.instancier(valide(LECTEUR), &[], &mut SansHote).unwrap();
+        let n = m.instancier(valide(LECTEUR), &[]).unwrap().instance;
         assert_eq!(m.fonctions.len(), 1);
         let Some(Externe::Fonction(f)) = m.exporte(n, "f") else { panic!("export f") };
         assert_eq!(m.invoquer(&mut SansHote, f, &[]), Ok(vec![Valeur::I32(42)]));
@@ -290,7 +304,8 @@ mod tests {
         // (module (table 200000 funcref)) : 1,6 Mo de références.
         let tables = [0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x04, 0x06, 0x01, 0x70, 0x00, 0xc0, 0x9a, 0x0c];
         let mut m = Magasin::avec_budget(1 << 20);
-        assert_eq!(m.instancier(valide(&tables), &[], &mut SansHote), Err(ErreurInstanciation::Ressources));
+        let erreur = m.instancier(valide(&tables), &[]).map(|i| i.instance);
+        assert_eq!(erreur, Err(ErreurInstanciation::Ressources));
         assert_eq!(m.budget, 1 << 20);
         // (module (memory 0) (func (export "f") (param i32) (result i32)
         //   (memory.grow (local.get 0)))), avec un budget de deux pages.
@@ -300,7 +315,7 @@ mod tests {
             0x00, 0x20, 0x00, 0x40, 0x00, 0x0b,
         ];
         let mut m = Magasin::avec_budget(2 * PAGE);
-        let n = m.instancier(valide(&grandir), &[], &mut SansHote).unwrap();
+        let n = m.instancier(valide(&grandir), &[]).unwrap().instance;
         let Some(Externe::Fonction(f)) = m.exporte(n, "f") else { panic!("export f") };
         let mut grandir = |pages| m.invoquer(&mut SansHote, f, &[Valeur::I32(pages)]);
         assert_eq!(grandir(3), Ok(vec![Valeur::I32(u32::MAX)])); // -1 : au-delà du budget

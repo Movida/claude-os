@@ -18,11 +18,11 @@
 //!    WebAssembly, même profonde, ne consomme donc jamais la pile du
 //!    noyau, qui est petite et dont le débordement serait fatal ; sa
 //!    profondeur est bornée par nos limites (le piège « pile épuisée »).
-//!    Et tout l'état d'une exécution tient dans deux Vec : on pourra
-//!    l'interrompre, puis la reprendre (le « carburant », pour un noyau qui
-//!    partage le processeur entre ses programmes). Option écartée : un
-//!    interpréteur qui s'appelle lui-même à chaque appel WebAssembly, plus
-//!    court à écrire, mais lié à la pile du noyau.
+//!    Et tout l'état d'une exécution tient dans deux Vec : on peut
+//!    l'interrompre, puis la reprendre (voir `Execution::reprendre`).
+//!    Option écartée : un interpréteur qui s'appelle lui-même à chaque
+//!    appel WebAssembly, plus court à écrire, mais lié à la pile du noyau,
+//!    et qu'on ne peut pas arrêter au milieu sans perdre son état.
 //!
 //! Les variables locales d'une fonction vivent dans la pile des valeurs,
 //! au début de son cadre : l'appelant y a empilé les arguments, qui
@@ -36,13 +36,14 @@
 //! transformerait l'accès fautif en panique, jamais en lecture hors
 //! limites : au pire on perd la disponibilité, jamais l'isolation.
 
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 
 use crate::instructions::{Acces as GenreAcces, Instruction, lire_instruction};
 use crate::lecteur::Lecteur;
 use crate::limites::{APPELS_MAX, PILE_VALEURS_MAX};
 use crate::magasin::*;
-use crate::module::Plage;
+use crate::module::{Plage, TypeValeur};
 use crate::numerique::operation;
 use crate::validateur::Branchement;
 
@@ -62,16 +63,58 @@ struct Cadre {
     stp: usize,
 }
 
-/// Une exécution : la pile des valeurs et celle des appels.
-struct Execution {
+/// Une exécution : l'appel d'une fonction, avec tout ce qu'il a lui-même
+/// appelé, et qu'on peut interrompre puis reprendre.
+///
+/// C'est la base de la préemption. Un programme WebAssembly peut boucler
+/// sans fin ; le noyau ne doit pas pour autant lui céder le processeur pour
+/// toujours. `reprendre` exécute au plus un nombre donné d'instructions, le
+/// « carburant », puis rend la main : l'état de l'exécution (ses deux
+/// piles, où reprendre chaque appel) reste dans l'`Execution`, et un
+/// nouvel appel à `reprendre` continue exactement au même point. Entre les
+/// deux, le noyau peut faire tourner autre chose. (C'est l'idée du
+/// carburant de wasmtime ; un interrupteur matériel, l'horloge, qui arrête
+/// un programme n'importe où, viendra avec du code compilé.)
+///
+/// Une instruction coûte une unité, plus une par 256 octets qu'elle touche
+/// (memory.fill, la mise à zéro des locales d'un appel...) : le carburant
+/// mesure à peu près le temps. Une instruction ne peut pas s'arrêter au
+/// milieu (un memory.fill fait à moitié changerait sa sémantique) : si la
+/// tranche n'y suffit pas, elle se fait quand même, et le reste devient une
+/// dette, payée au début des tranches suivantes. Le total consommé reste
+/// exact, et un programme qui a beaucoup travaillé attend son tour.
+pub struct Execution {
     pile: Vec<u64>,
     cadres: Vec<Cadre>,
+    /// La fonction appelée, tant que l'appel n'a pas commencé.
+    a_appeler: Option<u32>,
+    /// Les types de ses résultats.
+    resultats: Box<[TypeValeur]>,
+    /// Le carburant dû par les instructions déjà faites.
+    dette: u64,
+    /// Le piège qui a arrêté l'exécution, s'il y en a eu un : elle est
+    /// alors finie, et chaque reprise le rend à nouveau.
+    piege: Option<Piege>,
+}
+
+/// Le carburant de plus qu'une instruction doit pour `octets` touchés.
+fn cout(octets: u64) -> u64 {
+    octets / 256
+}
+
+/// Où en est une exécution après `reprendre`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Etat {
+    /// La fonction a retourné ces résultats.
+    Terminee(Vec<Valeur>),
+    /// Le carburant est épuisé : `reprendre` continuera.
+    Interrompue,
 }
 
 impl Magasin {
-    /// Appelle la fonction d'adresse `fonction` avec `arguments`, et rend
-    /// ses résultats, ou le piège qui l'a arrêtée.
-    pub fn invoquer(&mut self, hote: &mut dyn Hote, fonction: u32, arguments: &[Valeur]) -> Result<Vec<Valeur>, Piege> {
+    /// Prépare l'appel de la fonction d'adresse `fonction` avec
+    /// `arguments`, sans rien exécuter encore.
+    pub fn preparer(&self, fonction: u32, arguments: &[Valeur]) -> Result<Execution, Piege> {
         let f = self.fonctions.get(fonction as usize).ok_or(Piege::ValeursIncoherentes)?;
         let t = f.type_fonction();
         if arguments.len() != t.parametres.len()
@@ -79,19 +122,34 @@ impl Magasin {
         {
             return Err(Piege::ValeursIncoherentes);
         }
-        let types_resultats = t.resultats.clone();
-        let mut e = Execution { pile: arguments.iter().map(|v| v.en_case()).collect(), cadres: Vec::new() };
-        if e.appeler(self, hote, fonction, None)? {
-            e.executer(self, hote)?;
+        Ok(Execution {
+            pile: arguments.iter().map(|v| v.en_case()).collect(),
+            cadres: Vec::new(),
+            a_appeler: Some(fonction),
+            resultats: t.resultats.clone(),
+            dette: 0,
+            piege: None,
+        })
+    }
+
+    /// Appelle la fonction d'adresse `fonction` avec `arguments`, jusqu'au
+    /// bout, et rend ses résultats, ou le piège qui l'a arrêtée.
+    pub fn invoquer(&mut self, hote: &mut dyn Hote, fonction: u32, arguments: &[Valeur]) -> Result<Vec<Valeur>, Piege> {
+        let mut e = self.preparer(fonction, arguments)?;
+        // 2^64 instructions : des siècles, autant dire sans limite.
+        let mut carburant = u64::MAX;
+        loop {
+            if let Etat::Terminee(resultats) = e.reprendre(self, hote, &mut carburant)? {
+                return Ok(resultats);
+            }
         }
-        Ok(types_resultats.iter().zip(&e.pile).map(|(&t, &c)| Valeur::depuis_case(t, c)).collect())
     }
 
     /// Une valeur venue de l'environnement a-t-elle le type attendu, et,
     /// si c'est une fonction, désigne-t-elle une fonction qui existe ? (Une
     /// référence inventée, rangée dans une table puis appelée, ferait
     /// sinon paniquer l'interpréteur.)
-    pub(crate) fn valeur_acceptable(&self, v: Valeur, t: crate::module::TypeValeur) -> bool {
+    pub(crate) fn valeur_acceptable(&self, v: Valeur, t: TypeValeur) -> bool {
         v.type_valeur() == t && !matches!(v, Valeur::FuncRef(Some(a)) if a as usize >= self.fonctions.len())
     }
 }
@@ -139,6 +197,43 @@ fn deux_tables(tables: &mut [InstanceTable], destination: usize, source: usize) 
 }
 
 impl Execution {
+    /// Continue l'exécution, avec au plus `*carburant` unités de carburant ;
+    /// le carburant restant y est noté (l'hôte sait ainsi ce que le
+    /// programme a consommé). Après un piège, l'exécution est finie, et
+    /// chaque reprise rend le même piège.
+    pub fn reprendre(&mut self, m: &mut Magasin, hote: &mut dyn Hote, carburant: &mut u64) -> Result<Etat, Piege> {
+        if let Some(p) = self.piege {
+            return Err(p);
+        }
+        let etat = self.continuer(m, hote, carburant);
+        if let Err(p) = etat {
+            self.piege = Some(p);
+        }
+        etat
+    }
+
+    fn continuer(&mut self, m: &mut Magasin, hote: &mut dyn Hote, carburant: &mut u64) -> Result<Etat, Piege> {
+        if let Some(f) = self.a_appeler.take() {
+            self.appeler(m, hote, f, None)?;
+        }
+        let fini = self.executer(m, hote, carburant)?;
+        // Ce que la dernière instruction devait encore : tant qu'il en
+        // reste, le résultat attend la reprise suivante.
+        self.payer(carburant);
+        if !fini || self.dette > 0 {
+            return Ok(Etat::Interrompue);
+        }
+        let resultats = self.resultats.iter().zip(&self.pile).map(|(&t, &c)| Valeur::depuis_case(t, c)).collect();
+        Ok(Etat::Terminee(resultats))
+    }
+
+    /// Paie la dette avec ce qu'il reste de carburant.
+    fn payer(&mut self, carburant: &mut u64) {
+        let paye = self.dette.min(*carburant);
+        self.dette -= paye;
+        *carburant -= paye;
+    }
+
     fn depiler(&mut self) -> u64 {
         self.pile.pop().expect(VALIDE)
     }
@@ -176,7 +271,8 @@ impl Execution {
                 let mut resultats: Vec<Valeur> = type_fonction.resultats.iter().map(|&t| Valeur::defaut(t)).collect();
                 self.pile.truncate(debut);
                 let memoire = memoire.map(|a| &mut m.memoires[a as usize].octets[..]);
-                hote.appeler(*numero, &arguments, &mut resultats, memoire)?;
+                // Le travail de l'hôte s'ajoute à la dette (voir Execution).
+                hote.appeler(*numero, &arguments, &mut resultats, memoire, &mut self.dette)?;
                 // L'hôte n'est pas validé : on vérifie ce qu'il rend.
                 for (&v, &t) in resultats.iter().zip(type_fonction.resultats.iter()) {
                     if v.type_valeur() != t || matches!(v, Valeur::FuncRef(Some(a)) if a as usize >= m.fonctions.len()) {
@@ -196,6 +292,7 @@ impl Execution {
                 if self.cadres.len() >= APPELS_MAX || locales + code.hauteur_max as usize > PILE_VALEURS_MAX {
                     return Err(Piege::PileEpuisee);
                 }
+                self.dette += cout(code.locales as u64 * 8);
                 self.pile.resize(locales, 0);
                 self.pile.reserve(code.hauteur_max as usize);
                 self.cadres.push(Cadre { fonction: f, base, ip: debut_code, stp: 0 });
@@ -213,8 +310,9 @@ impl Execution {
         self.cadres.pop();
     }
 
-    /// Exécute jusqu'à ce que la pile des appels soit vide.
-    fn executer(&mut self, m: &mut Magasin, hote: &mut dyn Hote) -> Result<(), Piege> {
+    /// Exécute jusqu'à ce que la pile des appels soit vide (rend vrai), ou
+    /// que le carburant soit épuisé (rend faux).
+    fn executer(&mut self, m: &mut Magasin, hote: &mut dyn Hote, carburant: &mut u64) -> Result<bool, Piege> {
         use Instruction::*;
         // À chaque changement de cadre (appel, retour), on prépare de quoi
         // exécuter le code de celui du sommet.
@@ -244,6 +342,14 @@ impl Execution {
             }
 
             loop {
+                // La dette d'abord, puis une unité par instruction. À sec, on
+                // note où reprendre, comme pour un appel.
+                self.payer(carburant);
+                if *carburant == 0 {
+                    self.noter(l.position(), stp);
+                    return Ok(false);
+                }
+                *carburant -= 1;
                 // br_table : `lire_instruction` relirait toutes ses cibles,
                 // pour trouver la fin de l'instruction. Inutile ici : la
                 // table annexe dit où aller. On ne lit que leur nombre.
@@ -373,6 +479,9 @@ impl Execution {
                         let n = self.depiler32();
                         let v = self.depiler();
                         let ancienne = m.tables[adresse!(tables, x)].grandir(n, v, &mut m.budget);
+                        if ancienne.is_some() {
+                            self.dette += cout(n as u64 * 8);
+                        }
                         self.pile.push(ancienne.unwrap_or(u32::MAX) as u64);
                     }
                     TableFill(x) => {
@@ -384,6 +493,7 @@ impl Execution {
                             return Err(Piege::AccesTableHorsLimites);
                         }
                         elements[i as usize..(i + n) as usize].fill(v);
+                        self.dette += cout(n as u64 * 8);
                     }
                     TableCopy { destination, source } => {
                         let n = self.depiler32();
@@ -405,6 +515,7 @@ impl Execution {
                             }
                             vers.elements[d..d + n].copy_from_slice(&depuis.elements[s..s + n]);
                         }
+                        self.dette += cout(n as u64 * 8);
                     }
                     TableInit { segment, table: t } => {
                         let n = self.depiler32();
@@ -417,6 +528,7 @@ impl Execution {
                         }
                         let (s, d, n) = (s as usize, d as usize, n as usize);
                         elements[d..d + n].copy_from_slice(&source[s..s + n]);
+                        self.dette += cout(n as u64 * 8);
                     }
                     ElemDrop(x) => m.elements[adresse!(elements, x)].references = Vec::new(),
 
@@ -450,6 +562,9 @@ impl Execution {
                     MemoryGrow => {
                         let n = self.depiler32();
                         let anciennes = m.memoires[memoire.expect(VALIDE) as usize].grandir(n, &mut m.budget);
+                        if anciennes.is_some() {
+                            self.dette += cout(n as u64 * PAGE as u64);
+                        }
                         self.pile.push(anciennes.unwrap_or(u32::MAX) as u64);
                     }
                     MemoryInit(x) => {
@@ -463,6 +578,7 @@ impl Execution {
                         }
                         let (s, d, n) = (s as usize, d as usize, n as usize);
                         octets_memoire[d..d + n].copy_from_slice(&source[s..s + n]);
+                        self.dette += cout(n as u64);
                     }
                     DataDrop(x) => m.donnees[adresse!(donnees, x)].plage = Plage { debut: 0, fin: 0 },
                     MemoryCopy => {
@@ -475,6 +591,7 @@ impl Execution {
                         }
                         let (s, d, n) = (s as usize, d as usize, n as usize);
                         octets_memoire.copy_within(s..s + n, d);
+                        self.dette += cout(n as u64);
                     }
                     MemoryFill => {
                         let n = self.depiler32();
@@ -485,6 +602,7 @@ impl Execution {
                             return Err(Piege::AccesMemoireHorsLimites);
                         }
                         octets_memoire[d as usize..(d + n) as usize].fill(v as u8);
+                        self.dette += cout(n as u64);
                     }
 
                     // Constantes et opérations numériques
@@ -496,7 +614,7 @@ impl Execution {
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -509,7 +627,7 @@ mod tests {
 
     struct SansHote;
     impl Hote for SansHote {
-        fn appeler(&mut self, _: u32, _: &[Valeur], _: &mut [Valeur], _: Option<&mut [u8]>) -> Result<(), Piege> {
+        fn appeler(&mut self, _: u32, _: &[Valeur], _: &mut [Valeur], _: Option<&mut [u8]>, _: &mut u64) -> Result<(), Piege> {
             unreachable!("le module n'importe rien")
         }
     }
@@ -533,15 +651,138 @@ mod tests {
         m
     }
 
+    /// Instancie un module et rend son magasin et l'adresse de son export
+    /// « f ».
+    fn instancier(octets: &[u8]) -> (Magasin, u32) {
+        let module = crate::decoder(octets).and_then(crate::valider).unwrap();
+        let mut m = Magasin::new();
+        let instance = m.instancier(Arc::new(module), &[]).unwrap().instance;
+        let Some(Externe::Fonction(f)) = m.exporte(instance, "f") else { panic!("export f") };
+        (m, f)
+    }
+
+    #[test]
+    fn interrompre_puis_reprendre() {
+        let (mut m, f) = instancier(&module_recursif());
+        let arguments = [Valeur::I32(1000)];
+        // D'une traite : on note le carburant consommé.
+        let mut carburant = u64::MAX;
+        let etat = m.preparer(f, &arguments).unwrap().reprendre(&mut m, &mut SansHote, &mut carburant);
+        assert_eq!(etat, Ok(Etat::Terminee(vec![Valeur::I32(1000)])));
+        let consomme = u64::MAX - carburant;
+        // Par tranches de 7 instructions : même résultat, même consommation
+        // (la reprise ne perd ni ne recompte rien).
+        let mut e = m.preparer(f, &arguments).unwrap();
+        let (mut tranches, mut total) = (0, 0);
+        let resultat = loop {
+            let mut carburant = 7;
+            let etat = e.reprendre(&mut m, &mut SansHote, &mut carburant).unwrap();
+            tranches += 1;
+            total += 7 - carburant;
+            if let Etat::Terminee(r) = etat {
+                break r;
+            }
+        };
+        assert_eq!(resultat, vec![Valeur::I32(1000)]);
+        assert_eq!(total, consomme);
+        assert!(tranches as u64 >= consomme / 7);
+    }
+
+    #[test]
+    fn boucle_sans_fin() {
+        // f : loop br 0 end
+        let mut octets = b"\0asm\x01\0\0\0".to_vec();
+        octets.extend_from_slice(&[1, 4, 1, 0x60, 0, 0, 3, 2, 1, 0, 7, 5, 1, 1, b'f', 0, 0]);
+        octets.extend_from_slice(&[10, 9, 1, 7, 0, 0x03, 0x40, 0x0C, 0, 0x0B, 0x0B]);
+        let (mut m, f) = instancier(&octets);
+        let mut e = m.preparer(f, &[]).unwrap();
+        for _ in 0..3 {
+            let mut carburant = 1000;
+            assert_eq!(e.reprendre(&mut m, &mut SansHote, &mut carburant), Ok(Etat::Interrompue));
+            assert_eq!(carburant, 0);
+        }
+    }
+
+    #[test]
+    fn dette_de_carburant() {
+        // (module (memory 16) (func (export "f")
+        //   (memory.fill (i32.const 0) (i32.const 1) (i32.const 1048576))))
+        let octets = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00,
+            0x05, 0x03, 0x01, 0x00, 0x10, 0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00, 0x0a, 0x10, 0x01, 0x0e, 0x00, 0x41,
+            0x00, 0x41, 0x01, 0x41, 0x80, 0x80, 0xc0, 0x00, 0xfc, 0x0b, 0x00, 0x0b,
+        ];
+        // Cinq instructions (trois constantes, memory.fill, end), plus une
+        // unité par 256 octets remplis : 5 + 4096.
+        let (mut m, f) = instancier(&octets);
+        let mut carburant = u64::MAX;
+        let etat = m.preparer(f, &[]).unwrap().reprendre(&mut m, &mut SansHote, &mut carburant);
+        assert_eq!((etat, u64::MAX - carburant), (Ok(Etat::Terminee(vec![])), 4101));
+        // Par tranches de 10 : memory.fill se fait d'un coup, dans la
+        // deuxième tranche, puis l'exécution paie sa dette sur les
+        // suivantes avant de finir.
+        let (mut m, f) = instancier(&octets);
+        let mut e = m.preparer(f, &[]).unwrap();
+        let mut tranches = 0;
+        loop {
+            let mut carburant = 10;
+            tranches += 1;
+            if e.reprendre(&mut m, &mut SansHote, &mut carburant).unwrap() != Etat::Interrompue {
+                break;
+            }
+        }
+        assert_eq!(tranches, 4101_u32.div_ceil(10));
+        assert!(m.memoire(0).unwrap()[..1 << 20].iter().all(|&o| o == 1));
+    }
+
+    #[test]
+    fn cout_de_l_hote() {
+        // (module (import "" "h" (func $h)) (func (export "f") (call $h)))
+        let octets = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x02, 0x06, 0x01, 0x00,
+            0x01, 0x68, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00, 0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x01, 0x0a, 0x06, 0x01,
+            0x04, 0x00, 0x10, 0x00, 0x0b,
+        ];
+        // Un hôte dont la fonction vaut 1000 unités de travail.
+        struct Couteux;
+        impl Hote for Couteux {
+            fn appeler(&mut self, _: u32, _: &[Valeur], _: &mut [Valeur], _: Option<&mut [u8]>, cout: &mut u64) -> Result<(), Piege> {
+                *cout += 1000;
+                Ok(())
+            }
+        }
+        let module = crate::decoder(&octets).and_then(crate::valider).unwrap();
+        let mut m = Magasin::new();
+        let t = crate::module::TypeFonction { parametres: Box::new([]), resultats: Box::new([]) };
+        let h = m.ajouter_fonction_hote(t, 0);
+        let instance = m.instancier(Arc::new(module), &[h]).unwrap().instance;
+        let Some(Externe::Fonction(f)) = m.exporte(instance, "f") else { panic!("export f") };
+        // call et end : deux instructions, plus les 1000 unités de l'hôte.
+        let mut carburant = u64::MAX;
+        let etat = m.preparer(f, &[]).unwrap().reprendre(&mut m, &mut Couteux, &mut carburant);
+        assert_eq!((etat, u64::MAX - carburant), (Ok(Etat::Terminee(vec![])), 1002));
+    }
+
+    #[test]
+    fn un_piege_est_definitif() {
+        // (module (func (export "f") unreachable))
+        let octets = [
+            0x00, 0x61, 0x73, 0x6d, 0x01, 0x00, 0x00, 0x00, 0x01, 0x04, 0x01, 0x60, 0x00, 0x00, 0x03, 0x02, 0x01, 0x00,
+            0x07, 0x05, 0x01, 0x01, 0x66, 0x00, 0x00, 0x0a, 0x05, 0x01, 0x03, 0x00, 0x00, 0x0b,
+        ];
+        let (mut m, f) = instancier(&octets);
+        let mut e = m.preparer(f, &[]).unwrap();
+        for _ in 0..2 {
+            assert_eq!(e.reprendre(&mut m, &mut SansHote, &mut 100), Err(Piege::Inatteignable));
+        }
+    }
+
     #[test]
     fn la_recursion_n_use_pas_la_pile_de_rust() {
         // 64 Kio de pile pour le fil : un interpréteur récursif y
         // déborderait après quelques centaines d'appels WebAssembly.
         let fil = std::thread::Builder::new().stack_size(64 * 1024).spawn(|| {
-            let module = crate::decoder(&module_recursif()).and_then(crate::valider).unwrap();
-            let mut m = Magasin::new();
-            let instance = m.instancier(Arc::new(module), &[], &mut SansHote).unwrap();
-            let Some(Externe::Fonction(f)) = m.exporte(instance, "f") else { panic!("export f") };
+            let (mut m, f) = instancier(&module_recursif());
             let profond = m.invoquer(&mut SansHote, f, &[Valeur::I32(50_000)]);
             let trop_profond = m.invoquer(&mut SansHote, f, &[Valeur::I32(100_000)]);
             (profond, trop_profond)

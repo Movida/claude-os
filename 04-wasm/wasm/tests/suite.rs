@@ -25,7 +25,7 @@ use json::Valeur;
 use wasm::erreur::Genre;
 use wasm::module::{Limites, TypeFonction, TypeGlobale, TypeTable, TypeValeur};
 use wasm::validateur::ModuleValide;
-use wasm::{ErreurInstanciation, Externe, Hote, Magasin, Piege, Valeur as ValeurWasm};
+use wasm::{ErreurInstanciation, Etat, Externe, Hote, Magasin, Piege, Valeur as ValeurWasm};
 
 /// Le résultat d'une commande.
 enum Verdict {
@@ -48,7 +48,14 @@ fn dossier_suite() -> PathBuf {
 struct Spectest;
 
 impl Hote for Spectest {
-    fn appeler(&mut self, _: u32, _: &[ValeurWasm], _: &mut [ValeurWasm], _: Option<&mut [u8]>) -> Result<(), Piege> {
+    fn appeler(
+        &mut self,
+        _: u32,
+        _: &[ValeurWasm],
+        _: &mut [ValeurWasm],
+        _: Option<&mut [u8]>,
+        _: &mut u64,
+    ) -> Result<(), Piege> {
         Ok(())
     }
 }
@@ -138,6 +145,13 @@ fn piege_attendu(texte: &str, p: Piege) -> bool {
     }
 }
 
+/// Le carburant d'une action (ou d'une fonction de démarrage) : 2^26
+/// unités, plus de cinquante fois l'action la plus longue de la suite
+/// (environ 1,2 million, affiché à la fin). Une boucle sans fin, un défaut
+/// de l'interpréteur par exemple, échoue alors en une fraction de seconde
+/// au lieu de bloquer le banc.
+const CARBURANT: u64 = 1 << 26;
+
 /// L'état du banc pendant un fichier de la suite. Chaque fichier repart
 /// d'un magasin neuf, comme avec l'interpréteur de référence.
 struct Banc {
@@ -150,6 +164,8 @@ struct Banc {
     noms: BTreeMap<String, u32>,
     dernier: Option<u32>,
     enregistres: BTreeMap<String, u32>,
+    /// Le plus de carburant qu'une action ait consommé.
+    consommation_max: u64,
 }
 
 impl Banc {
@@ -163,6 +179,7 @@ impl Banc {
             noms: BTreeMap::new(),
             dernier: None,
             enregistres: BTreeMap::new(),
+            consommation_max: 0,
         }
     }
 
@@ -196,6 +213,22 @@ impl Banc {
             .collect()
     }
 
+    /// Instancie un module, puis exécute sa fonction de démarrage avec le
+    /// carburant d'une action. Un piège au démarrage fait échouer
+    /// l'instanciation, comme un piège pendant l'initialisation.
+    fn instancier(&mut self, module: Arc<ModuleValide>, imports: &[Externe]) -> Result<u32, String> {
+        let instanciation = self.magasin.instancier(module, imports).map_err(|e| e.to_string())?;
+        if let Some(mut demarrage) = instanciation.demarrage {
+            let mut carburant = CARBURANT;
+            match demarrage.reprendre(&mut self.magasin, &mut Spectest, &mut carburant) {
+                Ok(Etat::Terminee(_)) => {}
+                Ok(Etat::Interrompue) => return Err(format!("demarrage : carburant epuise ({CARBURANT} unites)")),
+                Err(p) => return Err(format!("piege au demarrage : {p}")),
+            }
+        }
+        Ok(instanciation.instance)
+    }
+
     /// Une action : appeler une fonction exportée, ou lire une globale
     /// exportée. L'erreur extérieure est celle du banc (module ou export
     /// absent), l'intérieure un piège.
@@ -212,7 +245,18 @@ impl Banc {
             (Some("invoke"), Some(Externe::Fonction(f))) => {
                 let arguments: Option<Vec<ValeurWasm>> = action.champ("args").tableau().iter().map(valeur).collect();
                 let arguments = arguments.ok_or(Verdict::Echoue("argument illisible".into()))?;
-                Ok(self.magasin.invoquer(&mut Spectest, f, &arguments))
+                let mut execution = match self.magasin.preparer(f, &arguments) {
+                    Ok(e) => e,
+                    Err(p) => return Ok(Err(p)),
+                };
+                let mut carburant = CARBURANT;
+                let etat = execution.reprendre(&mut self.magasin, &mut Spectest, &mut carburant);
+                self.consommation_max = self.consommation_max.max(CARBURANT - carburant);
+                match etat {
+                    Ok(Etat::Terminee(resultats)) => Ok(Ok(resultats)),
+                    Ok(Etat::Interrompue) => Err(Verdict::Echoue(format!("carburant epuise ({CARBURANT} unites)"))),
+                    Err(p) => Ok(Err(p)),
+                }
             }
             (Some("get"), Some(Externe::Globale(g))) => Ok(Ok(vec![self.magasin.valeur_globale(g).unwrap()])),
             _ => Err(Verdict::Echoue(format!("export introuvable : {champ}"))),
@@ -238,7 +282,7 @@ impl Banc {
                 self.dernier = None;
                 let module = essayer!(self.charger(commande));
                 let imports = essayer!(self.imports(&module).map_err(Verdict::Echoue));
-                match self.magasin.instancier(module, &imports, &mut Spectest) {
+                match self.instancier(module, &imports) {
                     Ok(n) => {
                         self.dernier = Some(n);
                         if let Some(nom) = commande.champ("name").texte() {
@@ -290,7 +334,7 @@ impl Banc {
                 match (self.imports(&module), attendu) {
                     (Err(_), "unknown import") => Verdict::Reussi,
                     (Err(e), _) => Verdict::Echoue(e),
-                    (Ok(imports), _) => match self.magasin.instancier(module, &imports, &mut Spectest) {
+                    (Ok(imports), _) => match self.magasin.instancier(module, &imports).map(|i| i.instance) {
                         Err(ErreurInstanciation::ImportIncompatible(_)) if attendu == "incompatible import type" => {
                             Verdict::Reussi
                         }
@@ -302,10 +346,21 @@ impl Banc {
             "assert_uninstantiable" if binaire => {
                 let module = essayer!(self.charger(commande));
                 let imports = essayer!(self.imports(&module).map_err(Verdict::Echoue));
-                match self.magasin.instancier(module, &imports, &mut Spectest) {
-                    Err(ErreurInstanciation::Piege(p)) if piege_attendu(attendu, p) => Verdict::Reussi,
-                    Err(e) => Verdict::Echoue(format!("refuse pour une autre raison : {e} (attendu : {attendu})")),
-                    Ok(_) => Verdict::Echoue(format!("instancie a tort (attendu : {attendu})")),
+                // Le piège peut venir de l'initialisation des segments ou de
+                // la fonction de démarrage.
+                let instanciation = match self.magasin.instancier(module, &imports) {
+                    Ok(i) => i,
+                    Err(ErreurInstanciation::Piege(p)) if piege_attendu(attendu, p) => return Verdict::Reussi,
+                    Err(e) => return Verdict::Echoue(format!("refuse pour une autre raison : {e} (attendu : {attendu})")),
+                };
+                let Some(mut demarrage) = instanciation.demarrage else {
+                    return Verdict::Echoue(format!("instancie a tort (attendu : {attendu})"));
+                };
+                let mut carburant = CARBURANT;
+                match demarrage.reprendre(&mut self.magasin, &mut Spectest, &mut carburant) {
+                    Err(p) if piege_attendu(attendu, p) => Verdict::Reussi,
+                    Err(p) => Verdict::Echoue(format!("piege « {p} », attendu : {attendu}")),
+                    Ok(etat) => Verdict::Echoue(format!("demarrage {etat:?} (attendu : {attendu})")),
                 }
             }
             // Bien formés, mais invalides : le décodeur doit les accepter, et
@@ -425,6 +480,7 @@ fn suite_officielle() {
     assert!(!fichiers.is_empty(), "suite vide : lancer `make suite` dans 04-wasm");
 
     let (mut total_reussis, mut total_echecs, mut total_ignores) = (0, 0, 0);
+    let mut consommation_max = 0;
     let mut details = Vec::new();
     println!("{:<28} {:>8} {:>8} {:>8}", "fichier", "reussis", "echoues", "ignores");
     for chemin in &fichiers {
@@ -444,6 +500,7 @@ fn suite_officielle() {
                 }
             }
         }
+        consommation_max = consommation_max.max(banc.consommation_max);
         let nom = chemin.file_stem().unwrap().to_string_lossy();
         println!("{nom:<28} {reussis:>8} {echecs:>8} {ignores:>8}");
         total_reussis += reussis;
@@ -451,6 +508,7 @@ fn suite_officielle() {
         total_ignores += ignores;
     }
     println!("{:<28} {total_reussis:>8} {total_echecs:>8} {total_ignores:>8}", "TOTAL");
+    println!("action la plus longue : {consommation_max} unites de carburant");
     for d in details.iter().take(50) {
         println!("  {d}");
     }

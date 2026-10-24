@@ -28,7 +28,7 @@ pub mod erreur;
 pub mod flottants;
 pub mod instanciation;
 pub mod instructions;
-mod interpreteur;
+pub mod interpreteur;
 pub mod lecteur;
 pub mod limites;
 pub mod magasin;
@@ -38,7 +38,8 @@ pub mod validateur;
 
 pub use decodeur::decoder;
 pub use erreur::Erreur;
-pub use instanciation::ErreurInstanciation;
+pub use instanciation::{ErreurInstanciation, Instanciation};
+pub use interpreteur::{Etat, Execution};
 pub use magasin::{Externe, Hote, Magasin, Piege, Valeur};
 pub use module::Module;
 pub use validateur::{ModuleValide, valider};

@@ -161,13 +161,17 @@ pub trait Hote {
     /// Exécute la fonction hôte `numero`. `arguments` ont les types de ses
     /// paramètres ; `resultats` arrive rempli des valeurs par défaut des
     /// types de ses résultats, que l'hôte remplace. `memoire` : la mémoire
-    /// du module appelant, s'il en a une (WASI y lit et y écrit).
+    /// du module appelant, s'il en a une (WASI y lit et y écrit). `cout` :
+    /// l'hôte y ajoute le carburant que vaut son travail (voir
+    /// interpreteur.rs, Execution), au-delà de l'unité de l'appel ; sinon,
+    /// un appel qui écrit des mégaoctets échapperait au compte.
     fn appeler(
         &mut self,
         numero: u32,
         arguments: &[Valeur],
         resultats: &mut [Valeur],
         memoire: Option<&mut [u8]>,
+        cout: &mut u64,
     ) -> Result<(), Piege>;
 }
 
