@@ -241,10 +241,16 @@ pub fn arreter(signal: Signal, raison: impl fmt::Display) -> ! {
 /// avant d'arrêter : `terminer` ne revient pas, et un verrou emporté dans
 /// une tâche abandonnée ne serait jamais rendu.
 pub fn arreter_plus_de_memoire() -> ! {
-    let (virtuelle, en_place) = processus::avec(|p| (p.memoire.taille_virtuelle(), p.memoire.espace.pages() as u64 * 4096));
+    let (virtuelle, en_place, tables) = processus::avec(|p| {
+        let e = &p.memoire.espace;
+        (p.memoire.taille_virtuelle(), e.pages() as u64 * 4096, e.tables() as u64 * 4096)
+    });
+    // Le message de Linux : « Out of memory: Killed process 1234 (a.out)
+    // total-vm:...kB, anon-rss:...kB, ... pgtables:...kB ».
     arreter(
         linux::SIGKILL,
-        format_args!("plus de memoire : tue, memoire virtuelle {} Kio, en place {} Kio", virtuelle >> 10, en_place >> 10),
+        format_args!("plus de memoire : tue, memoire virtuelle {} Kio, en place {} Kio, tables {} Kio",
+                     virtuelle >> 10, en_place >> 10, tables >> 10),
     )
 }
 

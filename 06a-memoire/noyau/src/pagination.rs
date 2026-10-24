@@ -183,7 +183,7 @@ pub fn index(virtuelle: u64, niveau: u32) -> usize {
 /// L'entrée finale (dans une PT) de la page de 4 Kio `virtuelle`, en créant
 /// les tables intermédiaires qui manquent. Dans la moitié basse, elles
 /// reçoivent le bit UTILISATEUR. None : plus de mémoire pour une table.
-pub fn entree(pml4: u64, virtuelle: u64) -> Option<&'static mut u64> {
+fn entree(pml4: u64, virtuelle: u64) -> Option<&'static mut u64> {
     let u = if virtuelle < MOITIE_HAUTE { UTILISATEUR } else { 0 };
     let pdpt = suivante(pml4, index(virtuelle, 3), u)?;
     let pd = suivante(pdpt, index(virtuelle, 2), u)?;

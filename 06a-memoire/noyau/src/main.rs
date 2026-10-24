@@ -216,6 +216,8 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     let bilan = pages::initialiser();
     afficherln!("[noyau] Allocateur buddy : {} pages libres ({} Mio), blocs de 4 Kio a {} Mio ; etat des pages : {} Kio.",
                 bilan.libres, bilan.libres >> 8, (4096 << pages::ORDRE_MAX) >> 20, bilan.taille_etats >> 10);
+    afficherln!("[noyau] Memoire des programmes : surengagement (OVERCOMMIT_GUESS), reserve du noyau de {} Kio.",
+                bilan.reserve * 4);
     tester_pages();
     tester_tas();
     tester_espace_utilisateur();

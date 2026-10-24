@@ -8,7 +8,8 @@
 [noyau] appel systeme inconnu : 9999
 [linux] appel 9999 : -ENOSYS, on continue.
 [noyau] pointeurs : termine, code de sortie 0 ; memoire rendue : ok.
-[linux] brk : tas agrandi de 3 pages ; 300 Mio refuses (budget).
+[linux] brk : tas agrandi de 3 pages, puis 2 x 100 Mio, plus que la machine : acceptes.
+[linux] brk : 1 Tio de plus, plus que toute la memoire : refuse.
 [linux] brk : tas reduit a 1 page, on touche une page retiree.
 [noyau] tas : segfault at 
  error 4 (pas de zone) dans tas[401000+1000] (SIGSEGV)
@@ -55,6 +56,10 @@
 [noyau] grande-pile : segfault at 
  error 6 (pas de zone) dans grande-pile[401000+1000] (SIGSEGV)
 [noyau] grande-pile : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : 256 Mio de tas ecrits page par page.
+[noyau] oom : plus de memoire : tue, memoire virtuelle 
+ Kio (SIGKILL)
+[noyau] oom : termine, code de sortie 137 ; memoire rendue : ok.
 [noyau] boucle : temps de calcul depasse (1000 ms) (SIGXCPU)
 [noyau] boucle : termine, code de sortie 152 ; memoire rendue : ok.
 [linux] Test : brk qui grandit et recule sans fin.

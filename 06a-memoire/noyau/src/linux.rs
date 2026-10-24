@@ -13,7 +13,8 @@
 //! set_robust_list, rseq, prlimit64(RLIMIT_STACK), readlinkat
 //! ("/proc/self/exe"), getrandom, brk, mprotect (RELRO), fstat(1), write,
 //! exit_group. Plus writev (les messages d'erreur fatale de la glibc),
-//! ioctl(TCGETS) (isatty), et exit.
+//! ioctl(TCGETS) (isatty), et exit ; et, pour la mémoire de `claude`
+//! (6a), sysinfo.
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -27,10 +28,10 @@ use core::fmt;
 
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::espace_utilisateur::ADRESSE_MAX;
-use crate::memoire::{ECART_GARDE, Echec, ZoneDuCode};
+use crate::memoire::{ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Zone};
 use crate::interruptions::Cadre;
-use crate::{aleatoire, console, cpu, pile, processus, tache};
+use crate::{aleatoire, console, cpu, horloge, pages, pile, processus, tache};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
@@ -51,6 +52,7 @@ const BRK: u64 = 12;
 const IOCTL: u64 = 16;
 const WRITEV: u64 = 20;
 const EXIT: u64 = 60;
+const SYSINFO: u64 = 99;
 const ARCH_PRCTL: u64 = 158;
 const SET_TID_ADDRESS: u64 = 218;
 const EXIT_GROUP: u64 = 231;
@@ -99,6 +101,7 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         // lien n'existe pas.
         READLINKAT => -ENOENT,
         GETRANDOM => getrandom(a[0], a[1], a[2]),
+        SYSINFO => sysinfo(a[0]),
         // Le code de sortie tient sur 8 bits : Linux ne garde que l'octet
         // bas (exit(256) rend 0, exit(-1) rend 255), ce que verra le futur
         // wait ; les codes 128 + N restent ceux des signaux.
@@ -136,6 +139,7 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         PRLIMIT64 => ("prlimit64", 4),
         READLINKAT => ("readlinkat", 4),
         GETRANDOM => ("getrandom", 3),
+        SYSINFO => ("sysinfo", 1),
         EXIT => ("exit", 1),
         EXIT_GROUP => ("exit_group", 1),
         _ => ("?", 6),
@@ -249,9 +253,9 @@ fn ioctl(fichier: u64, _requete: u64) -> i64 {
 /// cas d'échec (c'est ainsi que Linux signale l'erreur ; brk(0) demande
 /// donc la fin actuelle). Le tas ne peut ni reculer sous son début, ni
 /// s'approcher à moins d'une page de la zone suivante (de plus l'écart de
-/// garde si c'est la pile, comme Linux), ni dépasser le budget de mémoire
-/// du programme (compté sur sa taille : ses pages, elles, ne viennent
-/// qu'à la faute).
+/// garde si c'est la pile, comme Linux). Une extension plus grande que
+/// toute la mémoire est refusée (memoire::engagement_possible) ; le reste
+/// est promis, et ses pages ne viennent qu'à la faute.
 ///
 /// Rien n'est mis à zéro d'avance : agrandir le tas ne coûte que la zone.
 /// Le reculer rend les pages que le programme avait touchées, verrou du
@@ -274,9 +278,11 @@ fn brk(demande: u64) -> i64 {
                 nature: Nature::Tas,
                 drapeaux: Drapeaux::default(),
             };
-            let dans_le_budget = (pages_apres - m.debut_tas) / PAGE <= m.espace.budget() as u64;
             // La zone se fond dans celle du tas.
-            if !dans_le_budget || !m.zones.libre(pages_avant, pages_apres + PAGE, ECART_GARDE) || m.zones.inserer(zone).is_err() {
+            if !engagement_possible(pages_apres - pages_avant)
+                || !m.zones.libre(pages_avant, pages_apres + PAGE, ECART_GARDE)
+                || m.zones.inserer(zone).is_err()
+            {
                 return actuelle;
             }
         } else if pages_apres < pages_avant && m.retirer(pages_apres, pages_avant).is_err() {
@@ -402,6 +408,29 @@ fn getrandom(tampon: u64, nombre: u64, options: u64) -> i64 {
     aleatoire::remplir(&mut octets[..n]);
     match copier_vers_utilisateur(tampon, &octets[..n]) {
         Ok(()) => n as i64,
+        Err(_) => -EFAULT,
+    }
+}
+
+/// sysinfo(info) : la mémoire de la machine, et le temps depuis le
+/// démarrage. `claude` (JavaScriptCore) et la glibc s'en servent pour se
+/// dimensionner (la taille du tas du ramasse-miettes, par exemple). La
+/// « struct sysinfo » de Linux sur x86_64 : 112 octets, les tailles en
+/// unités de mem_unit (1 : en octets). Pas de mémoire d'échange, ni de
+/// mémoire « haute » (une notion des machines 32 bits), ni de charge
+/// mesurée.
+fn sysinfo(info: u64) -> i64 {
+    let mut s = [0u8; 112];
+    let mut mettre = |position: usize, valeur: u64, taille: usize| {
+        s[position..position + taille].copy_from_slice(&valeur.to_le_bytes()[..taille]);
+    };
+    mettre(0, horloge::tics() / horloge::HZ as u64, 8); // uptime, en secondes
+    mettre(32, pages::total() as u64 * PAGE, 8); // totalram
+    mettre(40, pages::libres() as u64 * PAGE, 8); // freeram
+    mettre(80, 1, 2); // procs : un seul processus
+    mettre(104, 1, 4); // mem_unit
+    match copier_vers_utilisateur(info, &s) {
+        Ok(()) => 0,
         Err(_) => -EFAULT,
     }
 }

@@ -53,9 +53,15 @@ struct Pages {
     listes: [u64; ORDRE_MAX as usize + 1],
     /// Pages libres, au total.
     libres: usize,
+    /// Pages confiées à l'allocateur au démarrage : toute la mémoire dont
+    /// il dispose (le totalram_pages de Linux).
+    total: usize,
+    /// La réserve du noyau, en pages (voir `allouer_pour_programme`).
+    reserve: usize,
 }
 
-static PAGES: Verrou<Pages> = Verrou::new(Pages { etats: &mut [], listes: [0; ORDRE_MAX as usize + 1], libres: 0 });
+static PAGES: Verrou<Pages> =
+    Verrou::new(Pages { etats: &mut [], listes: [0; ORDRE_MAX as usize + 1], libres: 0, total: 0, reserve: 0 });
 
 /// Les liens d'un bloc libre dans sa liste, rangés au début du bloc.
 #[repr(C)]
@@ -152,6 +158,18 @@ impl Pages {
 pub struct Bilan {
     pub libres: usize,
     pub taille_etats: usize,
+    /// La réserve du noyau, en pages.
+    pub reserve: usize,
+}
+
+/// La réserve du noyau pour `total` pages de mémoire : le min_free_kbytes
+/// de Linux (mm/page_alloc.c), √(16 × la mémoire en Kio), entre 128 Kio et
+/// 256 Mio. Environ 1,4 Mio pour 128 Mio, 5,7 Mio pour 2 Gio : elle croît
+/// moins vite que la mémoire, parce que ce dont le noyau a besoin en
+/// urgence (des tables, des tampons) croît moins vite aussi.
+fn reserve_pour(total: usize) -> usize {
+    let kio = (total as u64 * (PAGE >> 10)).saturating_mul(16).isqrt().clamp(128, 256 << 10);
+    (kio / (PAGE >> 10)) as usize
 }
 
 /// Construit l'allocateur à partir de l'allocateur de démarrage, qui lui
@@ -166,9 +184,10 @@ pub fn initialiser() -> Bilan {
     let etats = unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(adresse) as *mut u8, nombre) };
     etats.fill(AUCUN);
     let mut pages = PAGES.verrouiller();
-    *pages = Pages { etats, listes: [0; ORDRE_MAX as usize + 1], libres: 0 };
+    *pages = Pages { etats, listes: [0; ORDRE_MAX as usize + 1], libres: 0, total: 0, reserve: 0 };
     cadres::ceder(|debut, fin| pages.ajouter_zone(debut, fin));
-    Bilan { libres: pages.libres, taille_etats }
+    (pages.total, pages.reserve) = (pages.libres, reserve_pour(pages.libres));
+    Bilan { libres: pages.libres, taille_etats, reserve: pages.reserve }
 }
 
 /// Donne un bloc de 2^ordre pages contiguës, aligné sur sa taille :
@@ -176,6 +195,27 @@ pub fn initialiser() -> Bilan {
 pub fn allouer(ordre: u32) -> Option<u64> {
     assert!(ordre <= ORDRE_MAX, "ordre {ordre} trop grand");
     PAGES.verrouiller().allouer(ordre)
+}
+
+/// Donne une page pour un programme (une page à la faute, une table de son
+/// espace) : seulement s'il reste plus que la réserve du noyau. Le noyau,
+/// lui (`allouer`), peut y puiser : c'est ce qui lui permet de finir ce
+/// qu'il a commencé (rendre la mémoire d'un programme tué, par exemple)
+/// quand un programme a tout pris. C'est la ligne de flottaison « min »
+/// de Linux, sous laquelle seules les allocations du noyau qui ne peuvent
+/// pas attendre descendent. Sans réserve, un programme qui touche toute sa
+/// mémoire laisserait le noyau sans une page.
+pub fn allouer_pour_programme() -> Option<u64> {
+    let mut pages = PAGES.verrouiller();
+    if pages.libres <= pages.reserve {
+        return None;
+    }
+    pages.allouer(0)
+}
+
+/// Toute la mémoire de l'allocateur, en pages.
+pub fn total() -> usize {
+    PAGES.verrouiller().total
 }
 
 /// Rend un bloc, avec l'ordre qu'il avait à l'allocation. Rendre ce qui

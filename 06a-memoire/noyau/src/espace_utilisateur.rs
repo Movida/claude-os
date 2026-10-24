@@ -40,7 +40,14 @@
 //!     page supprime le cas.
 //!
 //! Toute allocation faite pour un programme est faillible : sans mémoire,
-//! il reçoit une erreur (ENOMEM), le noyau ne panique jamais.
+//! il reçoit une erreur (ENOMEM), ou il est tué à la faute (le tueur OOM,
+//! memoire.rs) ; le noyau ne panique jamais. Pages et tables d'un
+//! programme sont prises au-dessus de la réserve du noyau
+//! (pages::allouer_pour_programme), et comptées. Sa carte des zones, elle,
+//! vient du tas du noyau, qui peut puiser dans la réserve : 2 Mio au plus
+//! pour 65 530 zones, 3 Mio le temps de l'agrandir (Linux, lui, prend ses
+//! vm_area_struct au-dessus du seuil ; à faire avec les allocations
+//! faillibles du noyau).
 
 use crate::{espace, pages, pagination};
 use pagination::{ADRESSE, PRESENTE};
@@ -112,18 +119,6 @@ pub fn entree_finale(cadre: u64, droits: Droits) -> u64 {
     bits
 }
 
-/// Le budget de mémoire d'un programme : au plus 256 Mio de pages (le
-/// RLIMIT_DATA et le RLIMIT_AS de Linux, réunis ; illimités par défaut sous
-/// Linux, mais notre noyau n'a pas de mémoire virtuelle à prêter), et au
-/// plus la moitié des pages libres à son lancement : sur une machine de
-/// 128 Mio, 256 Mio ne borneraient rien. Au-delà, brk échoue et le
-/// programme reçoit ENOMEM : il ne peut pas prendre toute la mémoire de la
-/// machine. Comme le budget des programmes WebAssembly
-/// (wasm::Magasin::avec_budget). Les tables de pages, elles, ne sont pas
-/// comptées (quelques centaines au plus aujourd'hui, Linux les compte à
-/// part) : à revoir avec mmap.
-pub const BUDGET_PAGES: usize = (256 << 20) / PAGE as usize;
-
 /// La plus basse adresse projetable (vm.mmap_min_addr de Linux).
 pub const ADRESSE_MIN: u64 = 0x1_0000;
 /// La fin des adresses projetables, exclue (TASK_SIZE_MAX de Linux).
@@ -160,9 +155,11 @@ pub fn adresse_permise(adresse: u64) -> bool {
     adresse % PAGE == 0 && (ADRESSE_MIN..ADRESSE_MAX).contains(&adresse)
 }
 
-/// Un cadre neuf, mis à zéro, pour une page d'un programme.
+/// Un cadre neuf, mis à zéro, pour une page d'un programme ou une table de
+/// son espace : pris au-dessus de la réserve du noyau
+/// (pages::allouer_pour_programme).
 fn cadre_neuf() -> Option<u64> {
-    let cadre = pages::allouer(0)?;
+    let cadre = pages::allouer_pour_programme()?;
     // SAFETY : le cadre vient d'être alloué, personne d'autre ne le voit.
     // Il contenait ce qu'y avait laissé son précédent occupant (le noyau,
     // un autre programme) : le donner tel quel ferait fuir ces données.
@@ -178,14 +175,16 @@ pub struct EspaceUtilisateur {
     /// Le nombre de cadres projetés, à lui (sans compter les tables, ni la
     /// page de zéros).
     pages: usize,
-    /// Le plus de pages qu'il peut avoir (voir BUDGET_PAGES).
-    budget: usize,
+    /// Le nombre de tables de pages de sa moitié basse, PML4 comprise (le
+    /// pgtables_bytes de Linux) : elles aussi sont de la mémoire prise pour
+    /// lui. 8 Gio touchés page à page en demandent 16 Mio.
+    tables: usize,
 }
 
 impl EspaceUtilisateur {
     /// Un espace neuf : moitié basse vide, moitié haute du noyau.
     pub fn creer() -> Result<EspaceUtilisateur, Erreur> {
-        let pml4 = pages::allouer(0).ok_or(Erreur::PlusDeMemoire)?;
+        let pml4 = pages::allouer_pour_programme().ok_or(Erreur::PlusDeMemoire)?;
         // SAFETY : `pml4` vient d'être alloué, il est à nous ; la PML4 du
         // noyau est une table en place, qu'on ne fait que lire.
         unsafe {
@@ -194,8 +193,7 @@ impl EspaceUtilisateur {
             nouvelle[..256].fill(0);
             nouvelle[256..].copy_from_slice(&noyau[256..]);
         }
-        let budget = BUDGET_PAGES.min(pages::libres() / 2);
-        Ok(EspaceUtilisateur { pml4, pages: 0, budget })
+        Ok(EspaceUtilisateur { pml4, pages: 0, tables: 1 })
     }
 
     /// L'adresse physique de la PML4, pour CR3.
@@ -208,9 +206,31 @@ impl EspaceUtilisateur {
         self.pages
     }
 
-    /// Le plus de cadres qu'il peut avoir (voir BUDGET_PAGES).
-    pub fn budget(&self) -> usize {
-        self.budget
+    /// Le nombre de tables de pages de sa moitié basse.
+    pub fn tables(&self) -> usize {
+        self.tables
+    }
+
+    /// L'entrée finale (dans une PT) de la page `adresse` (permise), en
+    /// créant les tables intermédiaires qui manquent, prises au-dessus de la
+    /// réserve du noyau et comptées. Toutes reçoivent le bit UTILISATEUR
+    /// (voir pagination.rs).
+    fn entree(&mut self, adresse: u64) -> Result<&'static mut u64, Erreur> {
+        let mut table = self.pml4;
+        for niveau in (1..4).rev() {
+            // SAFETY : `table` est une table de cet espace (la PML4, ou une
+            // table que désigne une entrée présente), que nous possédons.
+            let e = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, niveau)] };
+            if *e & PRESENTE == 0 {
+                // Une table neuve : 512 entrées absentes.
+                let nouvelle = cadre_neuf().ok_or(Erreur::PlusDeMemoire)?;
+                self.tables += 1;
+                *e = nouvelle | PRESENTE | pagination::ECRITURE | pagination::UTILISATEUR;
+            }
+            table = *e & ADRESSE;
+        }
+        // SAFETY : `table` est maintenant une PT de cet espace.
+        Ok(unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, 0)] })
     }
 
     /// Sert une faute de page à `page` (alignée), dans une zone qui permet
@@ -240,7 +260,7 @@ impl EspaceUtilisateur {
         if !adresse_permise(page) {
             return Err(Erreur::AdresseInterdite);
         }
-        let entree = pagination::entree(self.pml4, page).ok_or(Erreur::PlusDeMemoire)?;
+        let entree = self.entree(page)?;
         let cadre = *entree & ADRESSE;
         let zeros = page_de_zeros();
         if !occupee(*entree) || (cadre == zeros && ecriture) {
@@ -276,7 +296,7 @@ impl EspaceUtilisateur {
         if !adresse_permise(adresse) {
             return Err(Erreur::AdresseInterdite);
         }
-        let entree = pagination::entree(self.pml4, adresse).ok_or(Erreur::PlusDeMemoire)?;
+        let entree = self.entree(adresse)?;
         if occupee(*entree) {
             return Err(Erreur::DejaProjetee);
         }
@@ -285,11 +305,8 @@ impl EspaceUtilisateur {
         Ok(cadre)
     }
 
-    /// Un cadre neuf pour l'espace, dans son budget, compté.
+    /// Un cadre neuf pour une page de l'espace, compté.
     fn prendre_cadre(&mut self) -> Result<u64, Erreur> {
-        if self.pages >= self.budget {
-            return Err(Erreur::PlusDeMemoire);
-        }
         let cadre = cadre_neuf().ok_or(Erreur::PlusDeMemoire)?;
         self.pages += 1;
         Ok(cadre)

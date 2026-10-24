@@ -13,6 +13,28 @@
 //! donne la page (`servir`) et le programme reprend son instruction, sans
 //! rien savoir. Une réservation de 8 Gio ne coûte donc que ce que le
 //! programme touche vraiment.
+//!
+//! La politique de la mémoire est celle de Linux (choix de conception) :
+//!   - PROMETTRE plus qu'on n'a (le « surengagement ») : une zone n'est
+//!     pas de la mémoire, seulement le droit d'en demander. Une demande
+//!     n'est refusée que si elle est manifestement impossible : à elle
+//!     seule plus grande que toute la mémoire de la machine
+//!     (`engagement_possible`, l'heuristique OVERCOMMIT_GUESS, le réglage
+//!     par défaut de Linux) ;
+//!   - garder une RÉSERVE au noyau : les pages et les tables d'un
+//!     programme ne sont prises que s'il reste plus que min_free_kbytes
+//!     (pages.rs) ;
+//!   - quand une page manque vraiment à la faute, TUER le programme
+//!     (SIGKILL, le tueur OOM, tache::arreter_plus_de_memoire). Linux
+//!     choisit le plus gros processus ; avec un seul programme, c'est lui.
+//! Options écartées :
+//!   - un budget fixe par programme (celui de l'étape 5 : 256 Mio, ou la
+//!     moitié de la mémoire libre) : `claude` occupe 169 Mo à l'accueil et
+//!     en réserve 9 Gio, un budget le bloquerait ; et Linux ne plafonne pas
+//!     un processus par défaut (RLIMIT_AS et RLIMIT_DATA sont infinis) ;
+//!   - tout compter, sans promettre (OVERCOMMIT_NEVER, `vm.overcommit_memory
+//!     = 2`) : les 8 Gio réservés par JavaScriptCore seraient refusés sur
+//!     toute machine ordinaire.
 
 use core::fmt;
 
@@ -58,6 +80,17 @@ pub const fn disposition() -> Disposition {
     let ecart = PILE_MAX + ECART_GARDE;
     let ecart = if ecart < 128 << 20 { 128 << 20 } else { ecart };
     Disposition { sommet_pile, base_mmap: sommet_pile - ecart }
+}
+
+/// Une zone privée inscriptible de `octets` octets peut-elle être promise ?
+/// Seulement si elle ne dépasse pas, à elle seule, toute la mémoire de la
+/// machine (le __vm_enough_memory de Linux, en OVERCOMMIT_GUESS, sans
+/// mémoire d'échange). Le reste est promis sans être compté : la sonde
+/// l'a vérifié sous Linux, deux fois la mémoire en lecture et écriture est
+/// refusé, la même chose sans réservation (MAP_NORESERVE), ou en lecture
+/// seule, est accepté.
+pub fn engagement_possible(octets: u64) -> bool {
+    octets / PAGE <= crate::pages::total() as u64
 }
 
 impl From<zones::Erreur> for Erreur {

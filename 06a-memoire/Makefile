@@ -140,7 +140,9 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 # registres x87, MMX et SSE, de ce qu'y a laissé le précédent) ; zero et
 # grande-pile font au contraire des fautes que le noyau doit SERVIR (la
 # page de zéros et la copie à l'écriture, la pile qui grandit jusqu'à
-# 8 Mio) ; puis des exécutables que le noyau doit refuser :
+# 8 Mio) ; oom touche plus de mémoire que la machine n'en a, et doit être
+# tué par le noyau, qui doit ensuite tout récupérer ; puis des
+# exécutables que le noyau doit refuser :
 #   - wx : un segment W+X (ld -N) ;
 #   - derniere-page : des segments dans les dernières pages de la moitié
 #     basse (là où est la pile, et dans la page interdite) ;
@@ -149,7 +151,7 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 # Enfin bonjour-asm, pour montrer que le noyau exécute encore des
 # programmes après tout cela.
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
-              zero grande-pile recursion boucle brk-boucle \
+              zero grande-pile recursion oom boucle brk-boucle \
               wx derniere-page et-dyn tronque
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
