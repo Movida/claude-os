@@ -23,6 +23,7 @@ extern crate alloc;
 
 pub mod decodeur;
 pub mod erreur;
+pub mod flottants;
 pub mod instructions;
 pub mod lecteur;
 pub mod limites;
