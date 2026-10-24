@@ -101,7 +101,7 @@ fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
                     if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.contenu.len());
     }
     let libres = pages::libres();
-    let mut programme = match chargeur_elf::charger(&executable) {
+    let mut programme = match chargeur_elf::charger(&executable, nom.0) {
         Ok(p) => p,
         Err(e) => return afficherln!("[noyau] {} : chargement impossible : {}", nom, e),
     };

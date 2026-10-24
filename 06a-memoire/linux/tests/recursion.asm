@@ -1,6 +1,6 @@
-; Une récursion sans fin : la pile (128 Kio projetés) déborde sur la page
-; en dessous, absente. Faute de page, code d'erreur 6 (absente, écriture,
-; anneau 3) : SIGSEGV.
+; Une récursion sans fin : la pile grandit à la faute jusqu'à 8 Mio
+; (RLIMIT_STACK), puis la faute suivante n'est plus servie. Faute de page,
+; code d'erreur 6 (absente, écriture, anneau 3), pas de zone : SIGSEGV.
 %include "commun.inc"
 _start:
     ECRIRE debut

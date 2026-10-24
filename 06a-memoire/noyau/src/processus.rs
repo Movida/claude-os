@@ -37,3 +37,9 @@ pub fn avec<R>(f: impl FnOnce(&mut Processus) -> R) -> R {
     let mut courant = COURANT.verrouiller();
     f(courant.as_mut().expect("appel systeme sans processus en cours"))
 }
+
+/// Comme `avec`, s'il y a un processus en cours : une faute de page du
+/// noyau peut arriver sans lui (le test du démarrage, dans main.rs).
+pub fn essayer_avec<R>(f: impl FnOnce(&mut Processus) -> R) -> Option<R> {
+    COURANT.verrouiller().as_mut().map(f)
+}

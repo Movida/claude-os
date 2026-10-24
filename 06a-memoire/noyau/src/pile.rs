@@ -28,9 +28,10 @@
 //! pages, son point d'entrée, ses identités, les fonctions du processeur...
 //! La glibc le lit avant même main (_dl_aux_init), et getauxval() le rend.
 
-use crate::aleatoire;
 use crate::chargeur_elf::{self, Programme};
-use crate::espace_utilisateur;
+use crate::{aleatoire, espace_utilisateur, memoire};
+
+const PAGE: u64 = 4096;
 
 // Les types de l'auxv (include/uapi/linux/auxvec.h).
 const AT_NULL: u64 = 0;
@@ -70,7 +71,7 @@ pub const USER_HZ: u64 = 100;
 /// Au plus un quart de la pile pour les chaînes et les tables, comme
 /// Linux (un quart de RLIMIT_STACK) : le programme doit garder de la
 /// place pour lui.
-const PLACE_MAX: u64 = chargeur_elf::TAILLE_PILE / 4;
+const PLACE_MAX: u64 = chargeur_elf::PLACE_ARGUMENTS;
 
 /// Pourquoi la pile n'a pas pu être construite.
 #[derive(Debug)]
@@ -109,7 +110,7 @@ impl Curseur<'_> {
             return Err(Erreur::TropLong);
         }
         self.sp -= n;
-        self.programme.memoire.espace.ecrire(self.sp, octets)?;
+        self.programme.memoire.ecrire(self.sp, octets)?;
         Ok(self.sp)
     }
 
@@ -125,9 +126,11 @@ impl Curseur<'_> {
 /// chemin du fichier exécuté, pour AT_EXECFN). Aucune chaîne ne doit
 /// contenir d'octet nul. Rend la valeur de RSP au départ.
 ///
-/// Le noyau écrit par la projection directe des cadres
-/// (EspaceUtilisateur::ecrire) : l'espace du programme n'a pas besoin
-/// d'être actif.
+/// Le noyau écrit par la projection directe des cadres (Memoire::ecrire),
+/// en faisant venir chaque page qu'il touche : l'espace du programme n'a
+/// pas besoin d'être actif. Puis la zone de pile est ramenée à ce qui est
+/// occupé, plus PILE_INITIALE (le setup_arg_pages de Linux) ; elle
+/// grandira à la faute.
 pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom: &[u8]) -> Result<u64, Erreur> {
     let sommet = programme.sommet_pile;
     let mut c = Curseur { programme, sp: sommet };
@@ -208,5 +211,14 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
     c.empiler(&[0; 16][..(c.sp - octets.len() as u64 - rsp) as usize])?;
     let debut = c.empiler(octets)?;
     debug_assert_eq!(debut, rsp);
+    // La zone de pile ne garde que ce qui est occupé, plus PILE_INITIALE.
+    // Ce qu'on retire est sous tout ce qui a été écrit : aucune page à
+    // rendre, et la zone n'est pas coupée en deux (le retrait ne peut pas
+    // échouer). Des arguments qui occupent presque toute leur place (plus
+    // de 1,875 Mio) : la zone garde ses 2 Mio, et grandira à la faute.
+    let bas = (rsp & !(PAGE - 1)) - memoire::PILE_INITIALE;
+    if bas > sommet - PLACE_MAX {
+        c.programme.memoire.retirer(sommet - PLACE_MAX, bas)?;
+    }
     Ok(rsp)
 }

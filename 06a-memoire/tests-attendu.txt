@@ -11,26 +11,28 @@
 [linux] brk : tas agrandi de 3 pages ; 300 Mio refuses (budget).
 [linux] brk : tas reduit a 1 page, on touche une page retiree.
 [noyau] tas : segfault at 
+ error 4 (pas de zone) dans tas[401000+1000] (SIGSEGV)
 [noyau] tas : termine, code de sortie 139 ; memoire rendue : ok.
 [linux] mprotect W+X : code ecrit puis execute (JIT) : ok.
 [linux] mprotect d'une page absente : -ENOMEM.
 [linux] mprotect PROT_NONE, puis lecture de la page.
 [noyau] mprotect : segfault at 
+ error 4 (acces interdit) dans mprotect[401000+1000] (SIGSEGV)
 [noyau] mprotect : termine, code de sortie 139 ; memoire rendue : ok.
 [noyau] ecrire-code : segfault at 0x401000 ip 0x40101f sp 
- error 7 (SIGSEGV)
+ error 7 (acces interdit) dans ecrire-code[401000+1000] (SIGSEGV)
 [noyau] ecrire-code : termine, code de sortie 139 ; memoire rendue : ok.
- error 15 (SIGSEGV)
+ error 15 (acces interdit) dans [pile][
 [noyau] executer-pile : termine, code de sortie 139 ; memoire rendue : ok.
 [noyau] lire-noyau : segfault at 0xffffffff80100000 ip 0x40101f sp 
- error 5 (SIGSEGV)
+ error 5 (pas de zone) dans lire-noyau[401000+1000] (SIGSEGV)
 [noyau] lire-noyau : termine, code de sortie 139 ; memoire rendue : ok.
 [noyau] lire-zero : segfault at 0x0 ip 0x40101a sp 
- error 4 (SIGSEGV)
+ error 4 (pas de zone) dans lire-zero[401000+1000] (SIGSEGV)
 [noyau] lire-zero : termine, code de sortie 139 ; memoire rendue : ok.
 [noyau] hlt : general protection fault ip 0x401018 sp 
 [noyau] hlt : termine, code de sortie 139 ; memoire rendue : ok.
-[noyau] int80 : int 0x80 : ABI 32 bits non prise en charge, ip 0x40101f (SIGSEGV)
+[noyau] int80 : int 0x80 : ABI 32 bits non prise en charge, ip 0x40101f dans int80[401000+1000] (SIGSEGV)
 [noyau] int80 : termine, code de sortie 139 ; memoire rendue : ok.
 [noyau] icebp : trap 
 [noyau] icebp : termine, code de sortie 13
@@ -40,8 +42,19 @@
 [linux] Test : mov ss, puis syscall, avec TF.
 [noyau] mov-ss : trap debug (int1 ou pas-a-pas) ip 
 [noyau] mov-ss : termine, code de sortie 133 ; memoire rendue : ok.
- error 6 (SIGSEGV)
+[noyau] recursion : segfault at 0x7fffff7f
+ error 6 (pas de zone) dans recursion[401000+1000] (SIGSEGV)
 [noyau] recursion : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] zero : une page jamais ecrite se lit a zero.
+[linux] zero : getrandom y a ecrit (copie a l'ecriture faite par le noyau) : ok.
+[linux] zero : writev d'un tableau jamais ecrit : des morceaux vides, 0 octet.
+[linux] zero : la page de zeros est restee nulle : ok.
+[noyau] zero : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Test : pile de 7 Mio, puis de 9 Mio.
+[linux] Pile de 7 Mio : ok.
+[noyau] grande-pile : segfault at 
+ error 6 (pas de zone) dans grande-pile[401000+1000] (SIGSEGV)
+[noyau] grande-pile : termine, code de sortie 139 ; memoire rendue : ok.
 [noyau] boucle : temps de calcul depasse (1000 ms) (SIGXCPU)
 [noyau] boucle : termine, code de sortie 152 ; memoire rendue : ok.
 [linux] Test : brk qui grandit et recule sans fin.

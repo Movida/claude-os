@@ -6,9 +6,11 @@
 //! (horloge, clavier) ou plusieurs processeurs, deux morceaux de code
 //! peuvent y écrire en même temps. Le verrou garantit qu'un seul à la fois y accède.
 //!
-//! Principe : un booléen atomique. `verrouiller` essaie de le faire passer
-//! de false à true en une seule instruction indivisible (compare_exchange,
-//! `lock cmpxchg` en x86) ; tant que quelqu'un d'autre le tient, on boucle.
+//! Principe : un booléen atomique. `verrouiller` le fait passer de false à
+//! true en une seule instruction indivisible (compare_exchange, `lock
+//! cmpxchg` en x86). Avec plusieurs processeurs, on bouclerait tant que
+//! quelqu'un d'autre le tient ; sur un seul, ce serait attendre pour
+//! toujours (voir `verrouiller`).
 //!
 //! Piège des interruptions : si le noyau tient le verrou de la console et
 //! qu'une interruption d'horloge arrive, et que son gestionnaire veut
@@ -45,16 +47,23 @@ impl<T> Verrou<T> {
         Verrou { pris: AtomicBool::new(false), donnee: UnsafeCell::new(donnee) }
     }
 
+    /// Prend le verrou. Sur un seul processeur, un verrou déjà pris ne sera
+    /// JAMAIS rendu : son détenteur a coupé les interruptions, rien n'a pu
+    /// l'interrompre pour venir ici, sauf une exception (une faute de page
+    /// sous le verrou, par exemple) ou un NMI, qui ne lui rendront pas la
+    /// main avant d'avoir fini. Boucler serait un interblocage silencieux :
+    /// on le dit par une panique, avec l'endroit de l'appel
+    /// (#[track_caller]). La panique peut toujours afficher : elle force
+    /// d'abord le verrou de la console (console::preparer_panique). Avec
+    /// plusieurs processeurs, un verrou pris par un autre cœur se libère :
+    /// il faudra de nouveau attendre (la boucle des spinlocks).
+    #[track_caller]
     pub fn verrouiller(&self) -> Garde<'_, T> {
         let interruptions_actives = cpu::couper_interruptions();
         // Acquire / Release : les écritures faites sous le verrou sont
         // visibles par le prochain qui le prend (ordre mémoire).
-        while self
-            .pris
-            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            core::hint::spin_loop(); // Instruction `pause` : boucle économe.
+        if self.pris.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            panic!("verrou deja pris : interblocage");
         }
         Garde { verrou: self, interruptions_actives }
     }

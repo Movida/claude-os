@@ -31,6 +31,7 @@ mod cpu;
 mod demarrage;
 mod espace;
 mod espace_utilisateur;
+mod faute_de_page;
 mod gdt;
 mod horloge;
 mod interruptions;

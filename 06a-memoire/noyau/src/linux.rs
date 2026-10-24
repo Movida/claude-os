@@ -26,7 +26,8 @@
 use core::fmt;
 
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
-use crate::espace_utilisateur::{ADRESSE_MAX, CadreNeuf};
+use crate::espace_utilisateur::ADRESSE_MAX;
+use crate::memoire::{ECART_GARDE, Echec, ZoneDuCode};
 use zones::{Drapeaux, Droits, Nature, Zone};
 use crate::interruptions::Cadre;
 use crate::{aleatoire, console, cpu, pile, processus, tache};
@@ -243,60 +244,47 @@ fn ioctl(fichier: u64, _requete: u64) -> i64 {
     -ENOTTY
 }
 
-/// brk(adresse) : déplace la fin du tas, à l'octet près ; la zone du tas
-/// (memoire.rs) grandit ou recule, et ses pages sont projetées (mises à
-/// zéro) ou retirées pour suivre. Rend la nouvelle fin, ou l'ancienne en
+/// brk(adresse) : déplace la fin du tas, à l'octet près : la zone du tas
+/// (memoire.rs) grandit ou recule. Rend la nouvelle fin, ou l'ancienne en
 /// cas d'échec (c'est ainsi que Linux signale l'erreur ; brk(0) demande
 /// donc la fin actuelle). Le tas ne peut ni reculer sous son début, ni
-/// s'approcher à moins d'une page de la zone suivante (la pile), ni
-/// dépasser le budget de mémoire du programme.
+/// s'approcher à moins d'une page de la zone suivante (de plus l'écart de
+/// garde si c'est la pile, comme Linux), ni dépasser le budget de mémoire
+/// du programme (compté sur sa taille : ses pages, elles, ne viennent
+/// qu'à la faute).
 ///
-/// Le verrou du processus coupe les interruptions : on ne le prend que
-/// pour poser chaque page dans les tables, et chaque page est mise à zéro
-/// avant, hors du verrou (CadreNeuf). Mettre à zéro des dizaines de Mio
-/// interruptions coupées ferait perdre leurs tics à l'horloge (le PIT n'en
-/// garde qu'un en attente) : l'heure du noyau prendrait du retard, et un
-/// programme qui ferait grandir et reculer son tas sans fin échapperait à
-/// son budget de temps (le test brk-boucle le vérifie). Avec
-/// l'ordonnanceur, ce verrou deviendra un verrou qui dort (le mmap_lock
-/// de Linux).
+/// Rien n'est mis à zéro d'avance : agrandir le tas ne coûte que la zone.
+/// Le reculer rend les pages que le programme avait touchées, verrou du
+/// processus tenu, donc interruptions coupées : une page rendue prend une
+/// centaine de nanosecondes. Avec l'ordonnanceur, ce verrou deviendra un
+/// verrou qui dort (le mmap_lock de Linux).
 fn brk(demande: u64) -> i64 {
-    let (debut, actuelle) = processus::avec(|p| (p.memoire.debut_tas, p.memoire.fin_tas));
-    if demande < debut || demande >= ADRESSE_MAX {
-        return actuelle as i64;
-    }
-    let (pages_avant, pages_apres) = (actuelle.next_multiple_of(PAGE), demande.next_multiple_of(PAGE));
-    if pages_apres > pages_avant {
-        // La zone d'abord (elle se fond dans celle du tas), à une page au
-        // moins de la zone suivante.
-        let zone = Zone {
-            debut: pages_avant,
-            fin: pages_apres,
-            droits: Droits { lecture: true, ecriture: true, execution: false },
-            nature: Nature::Tas,
-            drapeaux: Drapeaux::default(),
-        };
-        let ajoutee = processus::avec(|p| {
-            p.memoire.zones.libre(pages_avant, pages_apres + PAGE, 0) && p.memoire.zones.inserer(zone).is_ok()
-        });
-        if !ajoutee {
-            return actuelle as i64;
+    processus::avec(|p| {
+        let m = &mut p.memoire;
+        let actuelle = m.fin_tas as i64;
+        if demande < m.debut_tas || demande >= ADRESSE_MAX {
+            return actuelle;
         }
-        for page in (pages_avant..pages_apres).step_by(PAGE as usize) {
-            let projetee = CadreNeuf::allouer().is_some_and(|cadre| processus::avec(|p| p.memoire.projeter(page, cadre)).is_ok());
-            if !projetee {
-                // Tout ou rien : on rend ce qui vient d'être pris. (Le
-                // retrait du haut de la zone du tas ne la coupe pas en deux :
-                // il ne peut pas échouer.)
-                let _ = processus::avec(|p| p.memoire.retirer(pages_avant, pages_apres));
-                return actuelle as i64;
+        let (pages_avant, pages_apres) = (m.fin_tas.next_multiple_of(PAGE), demande.next_multiple_of(PAGE));
+        if pages_apres > pages_avant {
+            let zone = Zone {
+                debut: pages_avant,
+                fin: pages_apres,
+                droits: Droits { lecture: true, ecriture: true, execution: false },
+                nature: Nature::Tas,
+                drapeaux: Drapeaux::default(),
+            };
+            let dans_le_budget = (pages_apres - m.debut_tas) / PAGE <= m.espace.budget() as u64;
+            // La zone se fond dans celle du tas.
+            if !dans_le_budget || !m.zones.libre(pages_avant, pages_apres + PAGE, ECART_GARDE) || m.zones.inserer(zone).is_err() {
+                return actuelle;
             }
+        } else if pages_apres < pages_avant && m.retirer(pages_apres, pages_avant).is_err() {
+            return actuelle;
         }
-    } else if pages_apres < pages_avant && processus::avec(|p| p.memoire.retirer(pages_apres, pages_avant)).is_err() {
-        return actuelle as i64;
-    }
-    processus::avec(|p| p.memoire.fin_tas = demande);
-    demande as i64
+        m.fin_tas = demande;
+        demande as i64
+    })
 }
 
 /// mprotect(adresse, longueur, droits) : change les droits d'une plage de
@@ -359,8 +347,8 @@ fn arch_prctl(code: u64, adresse: u64) -> i64 {
 /// prlimit64(processus, ressource, nouvelle, ancienne) : les limites du
 /// processus, en lecture seulement. Celles de Linux par défaut : 8 Mio de
 /// pile (que la glibc lit pour ses fils), 1024 fichiers ouverts, pas de
-/// fichier « core » ; infini pour le reste. (La pile, elle, ne fait que
-/// 128 Kio, projetés d'avance : voir chargeur_elf.rs.)
+/// fichier « core » ; infini pour le reste. La pile grandit bien jusqu'à
+/// 8 Mio (memoire.rs, PILE_MAX).
 fn prlimit64(pid: u64, ressource: u64, nouvelle: u64, ancienne: u64) -> i64 {
     const INFINI: u64 = u64::MAX;
     const RLIMIT_CORE: u64 = 4;
@@ -432,6 +420,7 @@ pub const SIGILL: Signal = Signal { numero: 4, nom: "SIGILL" };
 pub const SIGTRAP: Signal = Signal { numero: 5, nom: "SIGTRAP" };
 pub const SIGBUS: Signal = Signal { numero: 7, nom: "SIGBUS" };
 pub const SIGFPE: Signal = Signal { numero: 8, nom: "SIGFPE" };
+pub const SIGKILL: Signal = Signal { numero: 9, nom: "SIGKILL" };
 pub const SIGSEGV: Signal = Signal { numero: 11, nom: "SIGSEGV" };
 pub const SIGXCPU: Signal = Signal { numero: 24, nom: "SIGXCPU" };
 
@@ -444,36 +433,48 @@ pub struct Raison {
     rsp: u64,
     code: u64,
     cr2: u64,
+    /// Pour une faute de page : pourquoi elle n'a pas été servie.
+    cause: Option<Echec>,
+    /// La zone où était RIP, s'il y en a une.
+    zone: Option<ZoneDuCode>,
 }
 
 impl fmt::Display for Raison {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let Raison { vecteur, rip, rsp, code, cr2 } = *self;
+        let Raison { vecteur, rip, rsp, code, cr2, cause, zone } = *self;
         match vecteur {
             // Le code d'erreur d'une faute de page : bit 0 page présente
             // (sinon absente), bit 1 écriture, bit 2 venue de l'anneau 3,
             // bit 4 lecture d'instruction (NX).
-            14 => write!(f, "segfault at {cr2:#x} ip {rip:#x} sp {rsp:#x} error {code:x}"),
+            14 => write!(f, "segfault at {cr2:#x} ip {rip:#x} sp {rsp:#x} error {code:x}")?,
             // `int n` vers une entrée de l'IDT interdite aux programmes : le
             // code d'erreur désigne l'entrée (n x 8, plus 2 pour « IDT »).
             // int 0x80, c'est l'ABI 32 bits de Linux.
-            13 if code == 0x80 << 3 | 2 => {
-                write!(f, "int 0x80 : ABI 32 bits non prise en charge, ip {rip:#x}")
-            }
-            13 => write!(f, "general protection fault ip {rip:#x} sp {rsp:#x} error {code:x}"),
-            0 => write!(f, "trap divide error ip {rip:#x} sp {rsp:#x}"),
-            1 => write!(f, "trap debug (int1 ou pas-a-pas) ip {rip:#x} sp {rsp:#x}"),
-            3 => write!(f, "trap int3 ip {rip:#x} sp {rsp:#x}"),
-            6 => write!(f, "trap invalid opcode ip {rip:#x} sp {rsp:#x}"),
-            _ => write!(f, "exception {vecteur} ip {rip:#x} sp {rsp:#x} error {code:x}"),
+            13 if code == 0x80 << 3 | 2 => write!(f, "int 0x80 : ABI 32 bits non prise en charge, ip {rip:#x}")?,
+            13 => write!(f, "general protection fault ip {rip:#x} sp {rsp:#x} error {code:x}")?,
+            0 => write!(f, "trap divide error ip {rip:#x} sp {rsp:#x}")?,
+            1 => write!(f, "trap debug (int1 ou pas-a-pas) ip {rip:#x} sp {rsp:#x}")?,
+            3 => write!(f, "trap int3 ip {rip:#x} sp {rsp:#x}")?,
+            6 => write!(f, "trap invalid opcode ip {rip:#x} sp {rsp:#x}")?,
+            _ => write!(f, "exception {vecteur} ip {rip:#x} sp {rsp:#x} error {code:x}")?,
         }
+        if let Some(cause) = cause {
+            write!(f, " ({})", cause.texte())?;
+        }
+        // Comme Linux : « ... error 6 in a.out[401000+1000] ».
+        if let Some(zone) = zone {
+            write!(f, " dans {zone}")?;
+        }
+        Ok(())
     }
 }
 
 /// Le signal qu'envoie Linux pour l'exception `vecteur` venue d'un
 /// programme (arch/x86/kernel/traps.c), et de quoi l'expliquer. `cr2` :
-/// l'adresse fautive d'une faute de page.
-pub fn signal_de_l_exception(vecteur: usize, cadre: &Cadre, cr2: u64) -> (Signal, Raison) {
+/// l'adresse fautive d'une faute de page, et `cause` pourquoi elle n'a
+/// pas été servie ; `zone` : celle où était RIP.
+pub fn signal_de_l_exception(vecteur: usize, cadre: &Cadre, cr2: u64, cause: Option<Echec>, zone: Option<ZoneDuCode>)
+    -> (Signal, Raison) {
     let signal = match vecteur {
         0 | 16 | 19 => SIGFPE, // division, x87, SIMD
         1 | 3 => SIGTRAP,      // débogage, int3
@@ -482,5 +483,5 @@ pub fn signal_de_l_exception(vecteur: usize, cadre: &Cadre, cr2: u64) -> (Signal
         17 => SIGBUS,          // alignement
         _ => SIGSEGV,          // pages, protection générale, segments
     };
-    (signal, Raison { vecteur, rip: cadre.rip, rsp: cadre.rsp, code: cadre.code_erreur, cr2 })
+    (signal, Raison { vecteur, rip: cadre.rip, rsp: cadre.rsp, code: cadre.code_erreur, cr2, cause, zone })
 }

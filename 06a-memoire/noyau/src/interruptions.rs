@@ -23,7 +23,7 @@
 //! dans la version expérimentale (nightly) du compilateur, et elle cache ce
 //! qui se passe.
 
-use crate::{clavier, copie_utilisateur, gdt, horloge, linux, pic, tache};
+use crate::{clavier, faute_de_page, gdt, horloge, linux, pic, processus, tache};
 use crate::verrou::Verrou;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
@@ -292,16 +292,15 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     }
     match vecteur {
         2 | 8 | 18 => exception_fatale(cadre),
-        // Une faute du noyau prévue : une copie depuis ou vers la mémoire
-        // d'un programme qui touche une page absente (ou interdite). On
-        // reprend à l'adresse prévue par la table d'exceptions, qui fera
-        // rendre EFAULT à l'appel système.
-        14 if !depuis_programme && copie_utilisateur::reprise(cadre.rip).is_some() => {
-            cadre.rip = copie_utilisateur::reprise(cadre.rip).unwrap_or(cadre.rip);
-        }
+        // La faute de page, d'où qu'elle vienne : le plus souvent servie
+        // (la pagination à la demande), sinon le programme est arrêté, ou
+        // la copie du noyau rend EFAULT (faute_de_page.rs).
+        14 => faute_de_page::gerer(cadre),
         _ if depuis_programme => {
-            let cr2 = if vecteur == 14 { lire_cr2() } else { 0 };
-            let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, cr2);
+            // Le verrou du processus est rendu avant d'arrêter le
+            // programme (tache::arreter ne revient pas).
+            let zone = processus::essayer_avec(|p| p.memoire.zone_du_code(cadre.rip)).flatten();
+            let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, 0, None, zone);
             tache::arreter(signal, raison);
         }
         // int3 n'est pas une erreur : un débogueur s'en sert pour poser des
@@ -314,7 +313,7 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
 }
 
 /// L'adresse de la dernière faute de page (CR2).
-fn lire_cr2() -> u64 {
+pub fn lire_cr2() -> u64 {
     let cr2: u64;
     // SAFETY : lecture d'un registre de contrôle, sans effet.
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
@@ -323,7 +322,7 @@ fn lire_cr2() -> u64 {
 
 /// Une exception dont le noyau ne se relève pas : on dit tout ce qu'on
 /// sait, puis on s'arrête.
-fn exception_fatale(cadre: &Cadre) -> ! {
+pub fn exception_fatale(cadre: &Cadre) -> ! {
     let vecteur = cadre.vecteur as usize;
     // On ne reviendra pas : libérer la console, au cas où l'exception
     // serait survenue au milieu d'un affichage.

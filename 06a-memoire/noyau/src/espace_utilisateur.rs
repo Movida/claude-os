@@ -24,8 +24,8 @@
 //!     des machines sans pagination) : plus d'isolation entre eux ;
 //!   - une moitié haute sans le noyau (KPTI, la parade de Linux contre
 //!     Meltdown, 2018) : à chaque entrée dans le noyau, il faut changer de
-//!     CR3, et sans PCID chaque changement vide le TLB. À l'étape 6, quand
-//!     on saura sur quels processeurs on tourne.
+//!     CR3, et sans PCID chaque changement vide le TLB. En 6m, avec PCID
+//!     (Meltdown touche les Intel d'avant 2018).
 //!
 //! Adresses permises : de 64 Kio à la dernière page de la moitié basse,
 //! exclue, comme Linux :
@@ -58,14 +58,47 @@ const PAGE: u64 = 4096;
 /// accès fait alors une faute de page.
 const SANS_ACCES: u64 = 1 << 9;
 
+/// La page de zéros : une page du noyau, toujours nulle, que reçoit en
+/// lecture seule toute page d'un programme LUE avant d'avoir été écrite
+/// (la ZERO_PAGE de Linux). Une seule pour tous les programmes et toutes
+/// les adresses : une zone lue sans être écrite (un tableau qu'on parcourt
+/// avant de le remplir, une réservation qu'on sonde) ne coûte aucune
+/// mémoire. La première écriture fait une faute (la page est en lecture
+/// seule), et le noyau donne alors une page neuve à la place : la COPIE À
+/// L'ÉCRITURE, le mécanisme qui servira aussi aux fichiers projetés en
+/// privé (6b) et à fork (6k).
+///
+/// Elle est dans les constantes du noyau (.rodata) : la pagination W^X la
+/// projette en lecture seule pour le noyau aussi, y compris par la
+/// projection directe ; personne ne peut l'écrire, même par erreur. Elle ne
+/// vient pas de l'allocateur de pages : on ne la lui rend jamais (le
+/// parcours qui rend les cadres la reconnaît et la saute).
+///
+/// Options écartées : une page neuve, mise à zéro, à chaque faute de
+/// lecture (plus simple, sans copie à l'écriture, mais chaque page lue
+/// coûte 4 Kio pour rien) ; une page de zéros par programme (rien à
+/// gagner : elle n'est jamais écrite).
+#[repr(C, align(4096))]
+struct PageDeZeros([u8; 4096]);
+
+#[unsafe(link_section = ".rodata.page_de_zeros")]
+static PAGE_DE_ZEROS: PageDeZeros = PageDeZeros([0; 4096]);
+
+/// L'adresse physique de la page de zéros.
+pub fn page_de_zeros() -> u64 {
+    espace::physique_du_noyau(&raw const PAGE_DE_ZEROS as u64)
+}
+
 /// Une entrée finale qui désigne un cadre du programme, accessible ou non.
 fn occupee(entree: u64) -> bool {
     entree & (PRESENTE | SANS_ACCES) != 0
 }
 
 /// L'entrée finale qui donne au programme le cadre `cadre` avec les
-/// droits `droits` (ceux de sa zone).
+/// droits `droits` (ceux de sa zone). La page de zéros n'est jamais
+/// inscriptible : la prochaine écriture passera par la copie.
 pub fn entree_finale(cadre: u64, droits: Droits) -> u64 {
+    let droits = if cadre == page_de_zeros() { Droits { ecriture: false, ..droits } } else { droits };
     if !droits.accessible() {
         return cadre | SANS_ACCES;
     }
@@ -127,28 +160,14 @@ pub fn adresse_permise(adresse: u64) -> bool {
     adresse % PAGE == 0 && (ADRESSE_MIN..ADRESSE_MAX).contains(&adresse)
 }
 
-/// Un cadre neuf, mis à zéro, pas encore projeté. On le prépare À PART,
-/// sans tenir aucun verrou et donc interruptions permises : mettre à zéro
-/// beaucoup de pages, verrou tenu, ferait perdre leurs tics à l'horloge
-/// (voir brk, dans linux.rs). S'il n'est finalement pas projeté, il
-/// retourne à l'allocateur tout seul (Drop).
-pub struct CadreNeuf(u64);
-
-impl CadreNeuf {
-    pub fn allouer() -> Option<CadreNeuf> {
-        let cadre = pages::allouer(0)?;
-        // SAFETY : le cadre vient d'être alloué, personne d'autre ne le voit.
-        // Il contenait ce qu'y avait laissé son précédent occupant (le noyau,
-        // un autre programme) : le donner tel quel ferait fuir ces données.
-        unsafe { core::ptr::write_bytes(espace::virtuelle(cadre) as *mut u8, 0, PAGE as usize) };
-        Some(CadreNeuf(cadre))
-    }
-}
-
-impl Drop for CadreNeuf {
-    fn drop(&mut self) {
-        pages::liberer(self.0, 0);
-    }
+/// Un cadre neuf, mis à zéro, pour une page d'un programme.
+fn cadre_neuf() -> Option<u64> {
+    let cadre = pages::allouer(0)?;
+    // SAFETY : le cadre vient d'être alloué, personne d'autre ne le voit.
+    // Il contenait ce qu'y avait laissé son précédent occupant (le noyau,
+    // un autre programme) : le donner tel quel ferait fuir ces données.
+    unsafe { core::ptr::write_bytes(espace::virtuelle(cadre) as *mut u8, 0, PAGE as usize) };
+    Some(cadre)
 }
 
 /// L'espace d'adressage d'un programme. Le détruire (le laisser sortir de
@@ -156,7 +175,8 @@ impl Drop for CadreNeuf {
 pub struct EspaceUtilisateur {
     /// L'adresse physique de sa PML4.
     pml4: u64,
-    /// Le nombre de pages projetées (sans compter les tables).
+    /// Le nombre de cadres projetés, à lui (sans compter les tables, ni la
+    /// page de zéros).
     pages: usize,
     /// Le plus de pages qu'il peut avoir (voir BUDGET_PAGES).
     budget: usize,
@@ -183,39 +203,96 @@ impl EspaceUtilisateur {
         self.pml4
     }
 
-    /// Projette à `adresse` (une page) un cadre neuf, mis à zéro, avec les
-    /// droits `droits`. Rend l'adresse physique du cadre, pour le remplir
-    /// par la projection directe.
-    pub fn projeter_neuve(&mut self, adresse: u64, droits: Droits) -> Result<u64, Erreur> {
-        let cadre = CadreNeuf::allouer().ok_or(Erreur::PlusDeMemoire)?;
-        self.projeter(adresse, cadre, droits)
+    /// Le nombre de cadres projetés (la mémoire « résidente »).
+    pub fn pages(&self) -> usize {
+        self.pages
     }
 
-    /// Projette à `adresse` (une page) le cadre `cadre`, préparé à l'avance
-    /// (voir CadreNeuf), avec les droits `droits`. Rend son adresse
-    /// physique. En cas d'erreur, le cadre retourne à l'allocateur.
+    /// Le plus de cadres qu'il peut avoir (voir BUDGET_PAGES).
+    pub fn budget(&self) -> usize {
+        self.budget
+    }
+
+    /// Sert une faute de page à `page` (alignée), dans une zone qui permet
+    /// l'accès, avec les droits `droits` de la zone ; `ecriture` : la faute
+    /// vient d'une écriture. Le contrôle des droits est fait par
+    /// l'appelant (memoire.rs) : ici, on met en place ce qu'il faut pour
+    /// que l'instruction, reprise, réussisse.
+    ///   - Rien n'est projeté : une lecture reçoit la page de zéros (en
+    ///     lecture seule), une écriture une page neuve à zéro (le
+    ///     do_anonymous_page de Linux). Le processeur ne garde pas en cache
+    ///     les entrées absentes : rien à invalider.
+    ///   - La page de zéros, et une écriture : une page neuve à sa place (la
+    ///     copie à l'écriture, do_wp_page). L'ancienne traduction peut être
+    ///     dans le TLB : invlpg.
+    ///   - Une page à lui : l'entrée est refaite d'après les droits de la
+    ///     zone. C'est le cas d'une page restée en lecture seule dans une
+    ///     zone inscriptible (do_wp_page la « réutilise » : personne d'autre
+    ///     ne la voit), ou d'une faute « fantôme », quand l'entrée permet
+    ///     déjà l'accès mais que le TLB gardait une traduction plus ancienne
+    ///     (manuel d'Intel, vol. 3A, 4.10.4.3). invlpg, et on reprend.
+    ///
+    /// Le cadre neuf est mis à zéro ici, interruptions coupées (on tient le
+    /// verrou du processus) : 4 Kio, une microseconde. (Linux rouvre les
+    /// interruptions pendant une faute, parce qu'elle peut attendre un
+    /// disque ; ce sera le cas avec le disque de 6l.)
+    pub fn servir(&mut self, page: u64, droits: Droits, ecriture: bool) -> Result<(), Erreur> {
+        if !adresse_permise(page) {
+            return Err(Erreur::AdresseInterdite);
+        }
+        let entree = pagination::entree(self.pml4, page).ok_or(Erreur::PlusDeMemoire)?;
+        let cadre = *entree & ADRESSE;
+        let zeros = page_de_zeros();
+        if !occupee(*entree) || (cadre == zeros && ecriture) {
+            let neuve = if ecriture { self.prendre_cadre()? } else { zeros };
+            let remplacee = occupee(*entree);
+            *entree = entree_finale(neuve, droits);
+            if remplacee {
+                self.invalider(page);
+            }
+        } else {
+            *entree = entree_finale(cadre, droits);
+            self.invalider(page);
+        }
+        Ok(())
+    }
+
+    /// La traduction de `page` ne doit plus servir, si cet espace est actif.
+    fn invalider(&self, page: u64) {
+        if self.actif() {
+            pagination::invalider(page);
+        }
+    }
+
+    /// Projette à `adresse` (une page) un cadre neuf, mis à zéro, avec les
+    /// droits `droits`. Rend l'adresse physique du cadre, pour le remplir
+    /// par la projection directe. (Pour le test du démarrage, main.rs ; un
+    /// programme, lui, reçoit ses pages à la faute : `servir`.)
     ///
     /// Si l'espace est actif, la nouvelle page sert tout de suite : le
     /// processeur ne garde pas en cache les entrées absentes (manuel
     /// d'Intel, vol. 3A, 4.10.4.3), rien à invalider.
-    pub fn projeter(&mut self, adresse: u64, cadre: CadreNeuf, droits: Droits) -> Result<u64, Erreur> {
+    pub fn projeter_neuve(&mut self, adresse: u64, droits: Droits) -> Result<u64, Erreur> {
         if !adresse_permise(adresse) {
             return Err(Erreur::AdresseInterdite);
-        }
-        if self.pages >= self.budget {
-            return Err(Erreur::PlusDeMemoire);
         }
         let entree = pagination::entree(self.pml4, adresse).ok_or(Erreur::PlusDeMemoire)?;
         if occupee(*entree) {
             return Err(Erreur::DejaProjetee);
         }
-        // Le cadre appartient désormais à l'espace : il ne doit plus
-        // retourner seul à l'allocateur.
-        let physique = cadre.0;
-        core::mem::forget(cadre);
+        let cadre = self.prendre_cadre()?;
+        *entree = entree_finale(cadre, droits);
+        Ok(cadre)
+    }
+
+    /// Un cadre neuf pour l'espace, dans son budget, compté.
+    fn prendre_cadre(&mut self) -> Result<u64, Erreur> {
+        if self.pages >= self.budget {
+            return Err(Erreur::PlusDeMemoire);
+        }
+        let cadre = cadre_neuf().ok_or(Erreur::PlusDeMemoire)?;
         self.pages += 1;
-        *entree = entree_finale(physique, droits);
-        Ok(physique)
+        Ok(cadre)
     }
 
     /// Cet espace est-il celui du processeur (CR3) ? Sinon, il n'y a rien
@@ -230,12 +307,16 @@ impl EspaceUtilisateur {
     pub fn retirer_plage(&mut self, debut: u64, fin: u64) {
         let mut lot = Lot::new(self.actif());
         let mut retirees = 0;
+        let zeros = page_de_zeros();
         parcourir(self.pml4, debut, fin, &mut |adresse, entree| {
             let cadre = *entree & ADRESSE;
             *entree = 0;
             lot.invalider(adresse);
-            lot.rendre(cadre);
-            retirees += 1;
+            // La page de zéros reste au noyau.
+            if cadre != zeros {
+                lot.rendre(cadre);
+                retirees += 1;
+            }
         });
         // Le lot se vide en sortant : le TLB d'abord, les cadres ensuite.
         drop(lot);
@@ -459,6 +540,9 @@ fn rendre(table: u64, niveau: u32) {
         let dessous = e & ADRESSE;
         if niveau > 0 {
             rendre(dessous, niveau - 1);
+        } else if dessous == page_de_zeros() {
+            // La page de zéros est au noyau : on la saute.
+            continue;
         }
         // Un cadre de page (niveau 0) ou une table (au-dessus) : tous des
         // blocs d'une page, pris au buddy. (Le jour où des pages seront

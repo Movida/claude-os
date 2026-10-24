@@ -20,12 +20,13 @@
 //!      faute de page : l'adresse de l'instruction de copie est rangée
 //!      dans la TABLE D'EXCEPTIONS (la section __ex_table), avec une
 //!      adresse de reprise. Le gestionnaire de faute de page, quand une
-//!      faute du noyau tombe sur une instruction de la table, reprend
+//!      faute du noyau tombe sur une instruction de la table, SERT la
+//!      faute si une zone du programme la permet (la pagination à la
+//!      demande : une page jamais touchée, la copie à l'écriture de la page
+//!      de zéros), et la copie reprend où elle en était ; sinon, il reprend
 //!      l'exécution à l'adresse de reprise au lieu de paniquer
-//!      (interruptions.rs). La copie s'arrête là, et l'appel rend EFAULT.
-//!      C'est le mécanisme de Linux (arch/x86/mm/extable.c), qui servira
-//!      aussi à la pagination à la demande : la faute pourra alors être
-//!      SERVIE (la page lue sur le disque), et la copie reprendre.
+//!      (faute_de_page.rs) : la copie s'arrête là, et l'appel rend EFAULT.
+//!      C'est le mécanisme de Linux (arch/x86/mm/extable.c).
 //!
 //! Une seule routine, `rep movsb`, pour les deux sens : elle copie RCX
 //! octets de [RSI] vers [RDI] ; interrompue par une faute, elle laisse
@@ -46,8 +47,9 @@
 //! démarrage (les « alternatives ») pour ne garder que les instructions
 //! utiles : plus rapide, mais un mécanisme entier pour quelques cycles.
 //!
-//! Jamais sous un verrou : une copie peut fauter (et, plus tard, attendre
-//! le disque). On copie dans un tampon du noyau, puis on s'en sert.
+//! Jamais sous un verrou : une copie peut fauter, et servir la faute prend
+//! le verrou du processus (et, plus tard, attendra le disque). On copie
+//! dans un tampon du noyau, puis on s'en sert.
 
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicBool, Ordering};

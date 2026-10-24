@@ -43,7 +43,7 @@ use crate::interruptions::Cadre;
 use crate::linux::{self, Signal};
 use crate::programmes::Nom;
 use crate::verrou::Verrou;
-use crate::{cpu, gdt, horloge, pagination};
+use crate::{cpu, gdt, horloge, pagination, processus};
 
 global_asm!(
     r#"
@@ -140,6 +140,12 @@ static EN_COURS: AtomicBool = AtomicBool::new(false);
 static NOM: Verrou<&'static [u8]> = Verrou::new(&[]);
 /// Le tic d'horloge de son départ.
 static DEPART: AtomicU64 = AtomicU64::new(0);
+/// Le programme est à tuer, faute de mémoire, dès qu'il retourne vers
+/// l'anneau 3 : une page lui a manqué pendant une copie du noyau (un appel
+/// système qui écrit dans sa mémoire). L'appel ne peut pas s'arrêter au
+/// milieu de ce qu'il fait : il rend EFAULT, et le programme est tué au
+/// retour (Linux lui envoie de même un SIGKILL, délivré au retour).
+static A_TUER: AtomicBool = AtomicBool::new(false);
 
 /// Le temps qu'un programme peut prendre : 1 s, en tics d'horloge (1 ms).
 /// C'est l'équivalent, pour les programmes Linux, du carburant des
@@ -184,6 +190,7 @@ pub fn executer(nom: &'static [u8], pml4: u64, entree: u64, pile: u64) -> i32 {
     }
     let interruptions = cpu::couper_interruptions();
     DEPART.store(horloge::tics(), Ordering::Relaxed);
+    A_TUER.store(false, Ordering::Relaxed);
     EN_COURS.store(true, Ordering::Relaxed);
     // SAFETY : interruptions coupées ; la pile noyau du programme sera
     // prise à sa prochaine entrée dans le noyau ; son espace a la moitié
@@ -229,11 +236,36 @@ pub fn arreter(signal: Signal, raison: impl fmt::Display) -> ! {
     terminer(128 + signal.numero as i32)
 }
 
-/// Arrête le programme en cours s'il a dépassé son temps. Appelée au retour
-/// vers l'anneau 3 (après une interruption, à la fin d'un appel système) :
-/// le noyau n'a alors plus rien en cours pour lui.
+/// Arrête le programme en cours faute de mémoire (SIGKILL, le tueur OOM de
+/// Linux), en disant ce qu'il occupait. Le verrou du processus est rendu
+/// avant d'arrêter : `terminer` ne revient pas, et un verrou emporté dans
+/// une tâche abandonnée ne serait jamais rendu.
+pub fn arreter_plus_de_memoire() -> ! {
+    let (virtuelle, en_place) = processus::avec(|p| (p.memoire.taille_virtuelle(), p.memoire.espace.pages() as u64 * 4096));
+    arreter(
+        linux::SIGKILL,
+        format_args!("plus de memoire : tue, memoire virtuelle {} Kio, en place {} Kio", virtuelle >> 10, en_place >> 10),
+    )
+}
+
+/// Le programme en cours sera tué faute de mémoire à son retour vers
+/// l'anneau 3 (voir A_TUER).
+pub fn tuer_au_retour() {
+    A_TUER.store(true, Ordering::Relaxed);
+}
+
+/// Arrête le programme en cours s'il doit être tué faute de mémoire, ou
+/// s'il a dépassé son temps. Appelée au retour vers l'anneau 3 (après une
+/// interruption, à la fin d'un appel système) : le noyau n'a alors plus
+/// rien en cours pour lui.
 pub fn verifier_budget() {
-    if EN_COURS.load(Ordering::Relaxed) && horloge::tics() - DEPART.load(Ordering::Relaxed) > BUDGET_TICS {
+    if !EN_COURS.load(Ordering::Relaxed) {
+        return;
+    }
+    if A_TUER.load(Ordering::Relaxed) {
+        arreter_plus_de_memoire();
+    }
+    if horloge::tics() - DEPART.load(Ordering::Relaxed) > BUDGET_TICS {
         arreter(linux::SIGXCPU, format_args!("temps de calcul depasse ({} ms)", BUDGET_TICS));
     }
 }
