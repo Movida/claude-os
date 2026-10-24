@@ -15,6 +15,9 @@
 // Le point d'entrée est _start, ci-dessous.
 #![no_main]
 
+// Les collections de Rust (Box, Vec, String), servies par notre tas (tas.rs).
+extern crate alloc;
+
 #[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
 mod console;
 mod cadres;
@@ -30,6 +33,7 @@ mod pages;
 mod pic;
 mod port;
 mod serie;
+mod tas;
 mod verrou;
 mod vga;
 
@@ -187,6 +191,7 @@ extern "C" fn noyau_main(carte: u64) -> ! {
     afficherln!("[noyau] Allocateur buddy : {} pages libres ({} Mio), blocs de 4 Kio a {} Mio ; etat des pages : {} Kio.",
                 bilan.libres, bilan.libres >> 8, (4096 << pages::ORDRE_MAX) >> 20, bilan.taille_etats >> 10);
     tester_pages();
+    tester_tas();
 
     // Le scénario de panne de `make tests-qemu` : déborder exprès de la
     // pile, que la page de garde doit arrêter net.
@@ -254,6 +259,30 @@ fn tester_pages() {
     pages::liberer(c, ordre_c);
     afficherln!("[noyau] Pages allouees : {:#x} (4 Kio), {:#x} (32 Kio), {:#x} ({} Kio) ; rendues et recollees : {}.",
                 a, b, c, taille_c >> 10, if pages::libres() == libres_avant { "ok" } else { "ECHEC" });
+}
+
+/// Vérifie le tas : des collections de Rust de toutes tailles, et un objet
+/// rendu qui sert à nouveau.
+fn tester_tas() {
+    use alloc::{boxed::Box, format, vec, vec::Vec};
+    // Un Vec qui grandit : il passe par plusieurs classes, puis par des
+    // pages (8000 octets à la fin).
+    let carres: Vec<u64> = (0..1000).map(|i| i * i).collect();
+    let somme: u64 = carres.iter().sum();
+    let texte = format!("Vec de {} carres (somme {})", carres.len(), somme);
+    let grand = vec![1u8; 1 << 20];
+    // L'objet rendu doit être le prochain donné. black_box cache les
+    // adresses à l'optimiseur : sans lui, le compilateur, qui sait que deux
+    // allocations distinctes n'ont jamais la même adresse, remplace la
+    // comparaison par « faux » sans l'exécuter.
+    let a = Box::into_raw(Box::new(1u32));
+    let adresse_a = core::hint::black_box(a as usize);
+    // SAFETY : `a` vient de Box::into_raw, rendu une seule fois.
+    drop(unsafe { Box::from_raw(a) });
+    let b = Box::new(2u32);
+    let reutilise = core::hint::black_box(&*b as *const u32 as usize) == adresse_a;
+    afficherln!("[noyau] Tas : {}, Box, String, 1 Mio d'un bloc ({} octets a 1) : {}.",
+                texte, grand.iter().filter(|&&o| o == 1).count(), if reutilise { "ok" } else { "ECHEC" });
 }
 
 /// Une récursion sans fin (ou presque : la condition, jamais vraie, évite

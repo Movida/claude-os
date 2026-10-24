@@ -42,6 +42,11 @@ pub const fn virtuelle(physique: u64) -> u64 {
     PROJECTION_DIRECTE + physique
 }
 
+/// L'adresse physique d'une adresse de la projection directe.
+pub const fn physique(virtuelle: u64) -> u64 {
+    virtuelle - PROJECTION_DIRECTE
+}
+
 /// L'adresse physique d'une adresse du noyau (son code, ses données, sa
 /// pile).
 pub fn physique_du_noyau(virtuelle: u64) -> u64 {
