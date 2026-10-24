@@ -3,9 +3,9 @@
 //! La spécification distingue trois sortes de modules refusés, que la suite
 //! de tests vérifie séparément :
 //!   - mal formé (malformed) : les octets ne respectent pas le format binaire
-//!     (c'est ce module) ;
-//!   - invalide (invalid) : bien formé, mais les types ne collent pas
-//!     (le validateur, sous-étape 2) ;
+//!     (le décodeur) ;
+//!   - invalide (invalid) : bien formé, mais les types ne collent pas, ou un
+//!     index ne désigne rien (le validateur) ;
 //!   - non liable (unlinkable) : les imports ne correspondent pas à ce que
 //!     l'environnement fournit (l'instanciation, sous-étape 3).
 //!
@@ -15,10 +15,13 @@
 use core::fmt;
 
 use crate::limites::Limite;
+use crate::module::TypeValeur;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Erreur {
-    /// Position de l'octet fautif dans le module.
+    /// Position de l'octet fautif dans le module. Pour une déclaration dont
+    /// le décodeur n'a pas gardé la position (un import, un export, une
+    /// limite...), celle du début de sa section.
     pub position: usize,
     pub genre: Genre,
 }
@@ -57,6 +60,72 @@ pub enum Genre {
     NonPrisEnCharge,
     /// Au-delà d'une limite de notre implémentation (limites.rs).
     LimiteDepassee(Limite),
+
+    // Les genres suivants sont ceux d'un module bien formé mais invalide
+    // (validateur.rs).
+    /// Un index qui ne désigne rien.
+    IndexInconnu(Espace, u32),
+    /// Une instruction ne trouve pas sur la pile le type qu'elle attend.
+    TypeInattendu { attendu: TypeValeur, trouve: TypeValeur },
+    /// Une instruction attend une valeur, mais la pile du bloc est vide.
+    PileVide,
+    /// Un bloc, une fonction ou une expression constante se termine avec
+    /// des valeurs en trop sur la pile.
+    ValeursEnTrop,
+    /// ref.is_null sur une valeur qui n'est pas une référence.
+    ReferenceRequise(TypeValeur),
+    /// select sans type sur une valeur qui n'est pas un nombre.
+    NombreRequis(TypeValeur),
+    /// select t* : la liste doit contenir exactement un type.
+    TypesDuSelect(u32),
+    /// br_table : toutes les cibles doivent recevoir autant de valeurs.
+    CiblesIncompatibles,
+    ElseSansIf,
+    /// L'alignement promis dépasse la taille de l'accès.
+    AlignementTropGrand,
+    ExpressionNonConstante,
+    GlobaleNonModifiable(u32),
+    /// ref.func d'une fonction qui n'est mentionnée nulle part hors du code.
+    ReferenceNonDeclaree(u32),
+    PlusieursMemoires,
+    MemoireTropGrande,
+    LimitesInversees,
+    /// L'export de cet index porte le nom d'un export précédent.
+    ExportEnDouble(u32),
+    FonctionDeDemarrage,
+}
+
+/// Les espaces d'index d'un module : chaque genre de déclaration est
+/// numéroté à part (la fonction 3 et la table 3 n'ont rien à voir).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Espace {
+    Type,
+    Fonction,
+    Table,
+    Memoire,
+    Globale,
+    Locale,
+    /// Les étiquettes des blocs englobants, numérotées de l'intérieur
+    /// (0 = le bloc le plus proche).
+    Etiquette,
+    Elements,
+    Donnees,
+}
+
+impl fmt::Display for Espace {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            Espace::Type => "type",
+            Espace::Fonction => "fonction",
+            Espace::Table => "table",
+            Espace::Memoire => "memoire",
+            Espace::Globale => "globale",
+            Espace::Locale => "variable locale",
+            Espace::Etiquette => "etiquette",
+            Espace::Elements => "segment d'elements",
+            Espace::Donnees => "segment de donnees",
+        })
+    }
 }
 
 impl fmt::Display for Genre {
@@ -92,6 +161,24 @@ impl fmt::Display for Genre {
             Genre::SectionDeNombreDeDonneesRequise => write!(f, "section du nombre de donnees requise"),
             Genre::NonPrisEnCharge => write!(f, "fonctionnalite non prise en charge (SIMD)"),
             Genre::LimiteDepassee(limite) => write!(f, "limite de l'interpreteur depassee : {limite}"),
+            Genre::IndexInconnu(espace, index) => write!(f, "index {index} inconnu ({espace})"),
+            Genre::TypeInattendu { attendu, trouve } => write!(f, "{attendu} attendu, {trouve} trouve"),
+            Genre::PileVide => write!(f, "pile vide : il manque une valeur"),
+            Genre::ValeursEnTrop => write!(f, "valeurs en trop sur la pile en fin de bloc"),
+            Genre::ReferenceRequise(t) => write!(f, "reference attendue, {t} trouve"),
+            Genre::NombreRequis(t) => write!(f, "select sans type : nombre attendu, {t} trouve"),
+            Genre::TypesDuSelect(n) => write!(f, "select : un seul type attendu, {n} donnes"),
+            Genre::CiblesIncompatibles => write!(f, "br_table : cibles qui recoivent des nombres de valeurs differents"),
+            Genre::ElseSansIf => write!(f, "else sans if"),
+            Genre::AlignementTropGrand => write!(f, "alignement plus grand que la taille de l'acces"),
+            Genre::ExpressionNonConstante => write!(f, "expression constante requise"),
+            Genre::GlobaleNonModifiable(index) => write!(f, "globale {index} non modifiable"),
+            Genre::ReferenceNonDeclaree(index) => write!(f, "ref.func {index} : fonction non declaree hors du code"),
+            Genre::PlusieursMemoires => write!(f, "plus d'une memoire (une seule en WebAssembly 2.0)"),
+            Genre::MemoireTropGrande => write!(f, "memoire de plus de 65536 pages (4 Gio)"),
+            Genre::LimitesInversees => write!(f, "limites : minimum plus grand que le maximum"),
+            Genre::ExportEnDouble(index) => write!(f, "export {index} : nom deja exporte"),
+            Genre::FonctionDeDemarrage => write!(f, "fonction de demarrage : type [] -> [] attendu"),
         }
     }
 }

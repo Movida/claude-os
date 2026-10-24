@@ -15,6 +15,7 @@
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 
 /// Les types de valeurs de WebAssembly 2.0 (sans SIMD).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,6 +28,26 @@ pub enum TypeValeur {
     FuncRef,
     /// Référence à un objet de l'environnement, opaque pour le programme.
     ExternRef,
+}
+
+impl TypeValeur {
+    pub fn est_reference(self) -> bool {
+        matches!(self, TypeValeur::FuncRef | TypeValeur::ExternRef)
+    }
+}
+
+/// Les noms du format texte, pour les messages d'erreur.
+impl fmt::Display for TypeValeur {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.write_str(match self {
+            TypeValeur::I32 => "i32",
+            TypeValeur::I64 => "i64",
+            TypeValeur::F32 => "f32",
+            TypeValeur::F64 => "f64",
+            TypeValeur::FuncRef => "funcref",
+            TypeValeur::ExternRef => "externref",
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +187,10 @@ pub struct Module {
     pub nombre_donnees: Option<u32>,
     pub corps: Vec<Corps>,
     pub donnees: Vec<SegmentDonnees>,
+    /// La position de chaque section, indexée par son numéro (0 si elle est
+    /// absente). Le validateur s'en sert pour situer ses erreurs sur les
+    /// déclarations, dont on ne garde pas la position une à une.
+    pub sections: [u32; 13],
 }
 
 impl Module {

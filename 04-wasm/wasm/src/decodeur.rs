@@ -64,6 +64,7 @@ pub fn decoder(octets: &[u8]) -> Result<Module, Erreur> {
                 return Err(Erreur { position, genre: Genre::SectionDansLeDesordre(id) });
             }
             dernier_rang = rang;
+            module.sections[id as usize] = position as u32;
         }
         match id {
             0 => {

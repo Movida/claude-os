@@ -37,42 +37,85 @@ fn dossier_suite() -> PathBuf {
 
 /// Rejoue une commande. `dossier` : où sont les .wasm du fichier.
 fn rejouer(commande: &Valeur, dossier: &Path) -> Verdict {
+    use wasm::erreur::Genre;
     let genre = commande.champ("type").texte().unwrap_or("");
     let fichier = commande.champ("filename").texte();
     let binaire = commande.champ("module_type").texte() != Some("text");
+    let attendu = commande.champ("text").texte().unwrap_or("?");
     let lire = || fs::read(dossier.join(fichier.unwrap())).expect("module de la suite illisible");
     match genre {
-        // Ces modules sont bien formés : ils doivent se décoder. Les
-        // « invalides » le sont au sens du validateur (sous-étape 2), les
-        // « non liables » et « non instanciables » à l'instanciation (3).
-        "module" | "assert_invalid" | "assert_unlinkable" | "assert_uninstantiable"
-            if fichier.is_some() && binaire =>
-        {
-            match wasm::decoder(&lire()) {
+        // Ces modules sont bien formés et valides : ils doivent se décoder
+        // et passer la validation. Les « non liables » et « non
+        // instanciables » échoueront à l'instanciation (sous-étape 3).
+        "module" | "assert_unlinkable" | "assert_uninstantiable" if fichier.is_some() && binaire => {
+            match wasm::decoder(&lire()).and_then(wasm::valider) {
                 Ok(_) => Verdict::Reussi,
-                Err(e) if e.genre == wasm::erreur::Genre::NonPrisEnCharge => Verdict::Ignore,
-                // Un artefact de la conversion : dans le .wast, un module
-                // texte sans segment de données qui fait data.drop 0 ou
-                // memory.init 1 est invalide (segment ou mémoire inconnus).
-                // wast2json l'écrit en binaire sans section 12, ce qui le
-                // rend mal formé (voir decodeur.rs). Il est refusé dans les
-                // deux cas.
-                Err(e) if genre == "assert_invalid"
-                    && e.genre == wasm::erreur::Genre::SectionDeNombreDeDonneesRequise =>
-                {
-                    Verdict::Reussi
-                }
+                Err(e) if e.genre == Genre::NonPrisEnCharge => Verdict::Ignore,
                 Err(e) => Verdict::Echoue(format!("refuse a tort : {e}")),
             }
         }
+        // Bien formés, mais invalides : le décodeur doit les accepter, et
+        // le validateur les refuser.
+        "assert_invalid" if binaire => match wasm::decoder(&lire()) {
+            Ok(module) => match wasm::valider(module) {
+                Ok(_) => Verdict::Echoue(format!("accepte a tort (attendu : {attendu})")),
+                Err(e) if raison_attendue(attendu, e.genre) => Verdict::Reussi,
+                Err(e) => Verdict::Echoue(format!("refuse pour une autre raison : {e} (attendu : {attendu})")),
+            },
+            Err(e) if e.genre == Genre::NonPrisEnCharge => Verdict::Ignore,
+            // Un artefact de la conversion : dans le .wast, un module
+            // texte sans segment de données qui fait data.drop 0 ou
+            // memory.init 1 est invalide (segment ou mémoire inconnus).
+            // wast2json l'écrit en binaire sans section 12, ce qui le
+            // rend mal formé (voir decodeur.rs). Il est refusé dans les
+            // deux cas.
+            Err(e) if e.genre == Genre::SectionDeNombreDeDonneesRequise => Verdict::Reussi,
+            Err(e) => Verdict::Echoue(format!("mal forme au lieu d'invalide : {e}")),
+        },
         "assert_malformed" if binaire => match wasm::decoder(&lire()) {
-            Ok(_) => Verdict::Echoue(format!(
-                "accepte a tort (attendu : {})",
-                commande.champ("text").texte().unwrap_or("?")
-            )),
+            Ok(_) => Verdict::Echoue(format!("accepte a tort (attendu : {attendu})")),
             Err(_) => Verdict::Reussi,
         },
         _ => Verdict::Ignore,
+    }
+}
+
+/// Le validateur refuse-t-il pour la raison qu'attend la suite ? Refuser un
+/// module invalide pour une autre raison pourrait cacher un défaut : la
+/// vraie erreur passerait inaperçue. On fait correspondre à chaque message
+/// de la suite (sans l'index qui le termine parfois : « unknown global 1 »)
+/// les genres d'erreur qui l'expriment.
+fn raison_attendue(texte: &str, genre: wasm::erreur::Genre) -> bool {
+    use wasm::erreur::{Espace, Genre::*};
+    let index_inconnu = |espace| matches!(genre, IndexInconnu(e, _) if e == espace);
+    match texte.trim_end_matches(|c: char| c.is_ascii_digit()).trim_end() {
+        "type mismatch" => matches!(
+            genre,
+            TypeInattendu { .. } | PileVide | ValeursEnTrop | ReferenceRequise(_) | NombreRequis(_) | CiblesIncompatibles
+        ),
+        "unknown type" => index_inconnu(Espace::Type),
+        "unknown function" => index_inconnu(Espace::Fonction),
+        "unknown table" => index_inconnu(Espace::Table),
+        "unknown memory" => index_inconnu(Espace::Memoire),
+        "unknown global" => index_inconnu(Espace::Globale),
+        "unknown local" => index_inconnu(Espace::Locale),
+        "unknown label" => index_inconnu(Espace::Etiquette),
+        "unknown elem segment" => index_inconnu(Espace::Elements),
+        "unknown data segment" => index_inconnu(Espace::Donnees),
+        // Un artefact de plus : wast2json écrit `select (result)`, sans
+        // type, comme le `select` sans type, qui trouve alors la pile vide.
+        "invalid result arity" => matches!(genre, TypesDuSelect(_) | PileVide),
+        "alignment must not be larger than natural" => genre == AlignementTropGrand,
+        "constant expression required" => genre == ExpressionNonConstante,
+        "global is immutable" => matches!(genre, GlobaleNonModifiable(_)),
+        "undeclared function reference" => matches!(genre, ReferenceNonDeclaree(_)),
+        "duplicate export name" => matches!(genre, ExportEnDouble(_)),
+        "multiple memories" => genre == PlusieursMemoires,
+        "memory size must be at most 65536 pages (4GiB)" => genre == MemoireTropGrande,
+        "size minimum must not be greater than maximum" => genre == LimitesInversees,
+        "start function" => genre == FonctionDeDemarrage,
+        // Un message que la table ne connaît pas encore : à y ajouter.
+        _ => false,
     }
 }
 
