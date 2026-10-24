@@ -7,3 +7,6 @@ ecran.ppm
 
 # Compilation du noyau Rust
 target/
+
+# Suite de tests officielle de WebAssembly, téléchargée par make (étape 4)
+04-wasm/suite/
