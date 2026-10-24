@@ -1,0 +1,12 @@
+# La carte des zones d'un programme (les vm_area_struct de Linux) : quelles
+# plages d'adresses il a le droit de toucher, avec quels droits. Comme
+# l'interpréteur WebAssembly (../wasm) et les formats (../formats), une
+# bibliothèque sans bibliothèque standard (no_std), sans dépendance et sans
+# `unsafe`, testée sur la machine hôte (`make tests-hote`), puis compilée
+# dans le noyau. Elle a besoin d'`alloc` : la carte est un `Vec`.
+[package]
+name = "zones"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

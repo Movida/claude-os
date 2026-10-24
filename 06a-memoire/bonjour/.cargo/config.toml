@@ -1,0 +1,4 @@
+[build]
+# WebAssembly « nu » : sans système (wasm32-wasip1 lierait une libc WASI
+# entière, alors qu'on n'appelle que deux fonctions, déclarées à la main).
+target = "wasm32-unknown-unknown"

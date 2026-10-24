@@ -1,0 +1,56 @@
+[linux] mmx-ecrit : mm0, mm7 et xmm0 remplis, arrondi x87 change.
+[linux] mmx-lit : registres x87, MMX et SSE a l'etat initial : ok.
+[noyau] mmx-lit : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] write(adresse du noyau) : -EFAULT, on continue.
+[linux] write(adresse non projetee) : -EFAULT, on continue.
+[linux] write(plage qui franchit la limite) : -EFAULT, on continue.
+[linux] write(plage a cheval sur une page absente) : -EFAULT, on continue.
+[noyau] appel systeme inconnu : 9999
+[linux] appel 9999 : -ENOSYS, on continue.
+[noyau] pointeurs : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] brk : tas agrandi de 3 pages ; 300 Mio refuses (budget).
+[linux] brk : tas reduit a 1 page, on touche une page retiree.
+[noyau] tas : segfault at 
+[noyau] tas : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] mprotect W+X : code ecrit puis execute (JIT) : ok.
+[linux] mprotect d'une page absente : -ENOMEM.
+[linux] mprotect PROT_NONE, puis lecture de la page.
+[noyau] mprotect : segfault at 
+[noyau] mprotect : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] ecrire-code : segfault at 0x401000 ip 0x40101f sp 
+ error 7 (SIGSEGV)
+[noyau] ecrire-code : termine, code de sortie 139 ; memoire rendue : ok.
+ error 15 (SIGSEGV)
+[noyau] executer-pile : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] lire-noyau : segfault at 0xffffffff80100000 ip 0x40101f sp 
+ error 5 (SIGSEGV)
+[noyau] lire-noyau : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] lire-zero : segfault at 0x0 ip 0x40101a sp 
+ error 4 (SIGSEGV)
+[noyau] lire-zero : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] hlt : general protection fault ip 0x401018 sp 
+[noyau] hlt : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] int80 : int 0x80 : ABI 32 bits non prise en charge, ip 0x40101f (SIGSEGV)
+[noyau] int80 : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] icebp : trap 
+[noyau] icebp : termine, code de sortie 13
+[linux] Test : pas-a-pas (TF) a travers un appel systeme.
+[noyau] pas-a-pas : trap debug (int1 ou pas-a-pas) ip 0x401023 sp 
+[noyau] pas-a-pas : termine, code de sortie 133 ; memoire rendue : ok.
+[linux] Test : mov ss, puis syscall, avec TF.
+[noyau] mov-ss : trap debug (int1 ou pas-a-pas) ip 
+[noyau] mov-ss : termine, code de sortie 133 ; memoire rendue : ok.
+ error 6 (SIGSEGV)
+[noyau] recursion : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] boucle : temps de calcul depasse (1000 ms) (SIGXCPU)
+[noyau] boucle : termine, code de sortie 152 ; memoire rendue : ok.
+[linux] Test : brk qui grandit et recule sans fin.
+[noyau] brk-boucle : temps de calcul depasse (1000 ms) (SIGXCPU)
+[noyau] brk-boucle : termine, code de sortie 152 ; memoire rendue : ok.
+[noyau] wx : programme Linux refuse : segment 0 : inscriptible et executable (W+X)
+[noyau] derniere-page : programme Linux refuse : segment 0 : hors des adresses permises
+[noyau] et-dyn : programme Linux refuse : ELF ET_DYN (PIE ou bibliotheque) : pas encore pris en charge
+[noyau] tronque : programme Linux refuse : fichier ELF tronque
+[linux] Bonjour depuis l'anneau 3
+[noyau] bonjour-asm : termine, code de sortie 42 ; memoire rendue : ok.
+[noyau] Fin des tests : extinction de QEMU.
