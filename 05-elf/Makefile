@@ -72,6 +72,7 @@ boot.bin: programmes.cpio FORCE
 # Les programmes Linux de test (linux/), construits dans linux/construits/.
 # Ils tournent aussi tels quels sous Linux, sur la machine hôte.
 #   - bonjour-asm : nasm puis ld, sans bibliothèque C ;
+#   - pile : nasm puis ld, affiche ce qu'il trouve sur sa pile initiale ;
 #   - bonjour-c : gcc -static, avec la glibc de la machine (libc.a, du
 #     paquet libc6-dev). -O2 et les avertissements, comme un programme
 #     ordinaire.
@@ -90,6 +91,13 @@ $(LINUX)/bonjour-asm.o: linux/bonjour.asm
 	nasm -f elf64 $< -o $@
 
 $(LINUX)/bonjour-asm: $(LINUX)/bonjour-asm.o
+	ld -o $@ $<
+
+$(LINUX)/pile.o: linux/pile.asm
+	mkdir -p $(LINUX)
+	nasm -f elf64 $< -o $@
+
+$(LINUX)/pile: $(LINUX)/pile.o
 	ld -o $@ $<
 
 $(LINUX)/bonjour-asm-wx: $(LINUX)/bonjour-asm.o
@@ -154,9 +162,9 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de programmes, que le noyau exécute dans l'ordre (voir
 # archive.sh).
-programmes.cpio: archive.sh $(LINUX)/bonjour-asm FORCE
+programmes.cpio: archive.sh $(LINUX)/bonjour-asm $(LINUX)/pile FORCE
 	cd bonjour && cargo build --release
-	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm
+	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm $(LINUX)/pile
 
 FORCE:
 

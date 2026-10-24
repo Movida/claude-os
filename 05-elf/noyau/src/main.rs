@@ -20,6 +20,7 @@ extern crate alloc;
 
 #[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
 mod console;
+mod aleatoire;
 mod appel_systeme;
 mod cadres;
 mod carte_memoire;
@@ -35,6 +36,7 @@ mod horloge;
 mod interruptions;
 mod linux;
 mod pagination;
+mod pile;
 mod pages;
 mod pic;
 mod port;
@@ -202,6 +204,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     let oui_non = |b: bool| if b { "oui" } else { "non (absent du processeur)" };
     afficherln!("[noyau] Protections contre les programmes : SMEP {}, SMAP {}, UMIP {}.",
                 oui_non(p.smep), oui_non(p.smap), oui_non(p.umip));
+    afficherln!("[noyau] Alea des programmes (AT_RANDOM) : {}.", aleatoire::source());
 
     // L'allocateur de démarrage cède la mémoire à l'allocateur de pages.
     let bilan = pages::initialiser();

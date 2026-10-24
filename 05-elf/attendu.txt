@@ -30,3 +30,6 @@ memoire rendue : ok.
         en-tetes de programme a 0x400040 (3 de 56 octets), tas a partir de 0x403000, code en place : ok.
 [linux] Bonjour depuis l'anneau 3
 [noyau] bonjour-asm : termine, code de sortie 42 ; memoire rendue : ok.
+[linux] argc = 1, argv[0] = pile
+[linux] Pile alignee sur 16, AT_PAGESZ = 4096, AT_ENTRY = _start : ok.
+[noyau] pile : termine, code de sortie 0 ; memoire rendue : ok.

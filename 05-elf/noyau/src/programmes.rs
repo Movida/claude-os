@@ -12,7 +12,12 @@
 //! format est essayé tour à tour, et le premier qui reconnaît le fichier
 //! s'en charge. Le nom du fichier (son extension) ne compte pas.
 
-use crate::{chargeur_elf, demarrage, espace, pages, tache, wasi};
+use crate::{chargeur_elf, demarrage, espace, pages, pile, tache, wasi};
+
+/// L'environnement des programmes Linux : de quoi savoir où est le
+/// dossier personnel, et quel terminal les affiche (la console : un
+/// terminal « linux », comme la console de Linux).
+const ENVIRONNEMENT: &[&[u8]] = &[b"HOME=/", b"TERM=linux"];
 use core::fmt;
 
 /// Le nom d'une entrée, pour l'afficher : un nom de fichier peut contenir
@@ -96,7 +101,7 @@ fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
                     if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.contenu.len());
     }
     let libres = pages::libres();
-    let programme = match chargeur_elf::charger(&executable) {
+    let mut programme = match chargeur_elf::charger(&executable) {
         Ok(p) => p,
         Err(e) => return afficherln!("[noyau] {} : chargement impossible : {}", nom, e),
     };
@@ -115,7 +120,13 @@ fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
                 programme.fin.next_multiple_of(4096), if code_ok { "ok" } else { "ECHEC" });
-    let code = tache::executer(nom.0, programme.espace.pml4(), programme.entree, programme.sommet_pile);
+    // Sa pile initiale : son nom pour seul argument, un petit
+    // environnement.
+    let rsp = match pile::construire(&mut programme, &[nom.0], ENVIRONNEMENT, nom.0) {
+        Ok(rsp) => rsp,
+        Err(e) => return afficherln!("[noyau] {} : pile initiale impossible : {}", nom, e),
+    };
+    let code = tache::executer(nom.0, programme.espace.pml4(), programme.entree, rsp);
     drop(programme);
     afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.",
                 nom, code, if pages::libres() == libres { "ok" } else { "ECHEC" });
