@@ -40,6 +40,15 @@ impl<T> Verrou<T> {
         }
         Garde { verrou: self }
     }
+
+    /// Libère le verrou de force, même si quelqu'un le tient.
+    ///
+    /// # Safety
+    /// Seulement quand le détenteur ne reprendra jamais la main : en cas de
+    /// panique, juste avant d'arrêter le processeur (voir console.rs).
+    pub unsafe fn forcer_liberation(&self) {
+        self.pris.store(false, Ordering::Release);
+    }
 }
 
 /// Tant qu'elle existe, on tient le verrou ; il se libère tout seul quand

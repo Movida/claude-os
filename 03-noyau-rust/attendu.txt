@@ -2,3 +2,6 @@
 [64 bits] Mode long actif !
 [noyau] Bonjour depuis le noyau Rust !
 [noyau] Mode long 64 bits, point d'entree a 0x100000
+[noyau] GDT, TSS et IDT du noyau en place.
+[noyau] Exception 3 (point d'arret (int3)) a RIP=
+[noyau] Retour apres int3 : les exceptions sont gerees.

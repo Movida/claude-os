@@ -12,7 +12,10 @@
 // Le point d'entrée est _start, ci-dessous.
 #![no_main]
 
+#[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
 mod console;
+mod gdt;
+mod interruptions;
 mod port;
 mod serie;
 mod verrou;
@@ -20,6 +23,7 @@ mod vga;
 
 use core::arch::{asm, global_asm};
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 // Le point d'entrée, en assembleur : avant de pouvoir exécuter du Rust, il
 // faut une pile (le code compilé y range variables et adresses de retour)
@@ -58,6 +62,16 @@ extern "C" fn noyau_main() -> ! {
     console::initialiser();
     afficherln!("[noyau] Bonjour depuis le noyau Rust !");
     afficherln!("[noyau] Mode long 64 bits, point d'entree a {:#x}.", &raw const _start as usize);
+
+    gdt::initialiser();
+    interruptions::initialiser();
+    afficherln!("[noyau] GDT, TSS et IDT du noyau en place.");
+
+    // Test volontaire : int3 déclenche l'exception 3. Si l'IDT est fausse,
+    // c'est une triple faute et QEMU redémarre ; sinon, on revient ici.
+    // SAFETY : int3 ne fait qu'appeler notre gestionnaire, qui revient.
+    unsafe { asm!("int3") };
+    afficherln!("[noyau] Retour apres int3 : les exceptions sont gerees.");
     arreter()
 }
 
@@ -77,6 +91,14 @@ fn arreter() -> ! {
 /// on affiche ce qu'on sait et on arrête tout.
 #[panic_handler]
 fn panique(info: &PanicInfo) -> ! {
+    // Une panique pendant l'affichage de la panique (un bogue dans la
+    // console elle-même) recommencerait sans fin : la deuxième fois, on
+    // s'arrête sans rien dire.
+    static EN_PANIQUE: AtomicBool = AtomicBool::new(false);
+    if EN_PANIQUE.swap(true, Ordering::Relaxed) {
+        arreter();
+    }
+    console::preparer_panique();
     afficherln!("[noyau] PANIQUE : {}", info);
     arreter()
 }

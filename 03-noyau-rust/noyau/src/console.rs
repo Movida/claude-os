@@ -15,6 +15,20 @@ pub fn initialiser() {
     ECRAN.verrouiller().effacer();
 }
 
+/// Prépare la console pour le message d'une panique.
+///
+/// Si la panique (ou l'exception fatale) est survenue PENDANT un affichage,
+/// le verrou de l'écran est encore pris par le code qui a planté : le
+/// message de panique l'attendrait pour toujours, et la machine se
+/// figerait sans un mot. Comme Linux pendant un « oops » (bust_spinlocks),
+/// on force la libération : le code interrompu ne reprendra jamais, au pire
+/// l'écran montrera une ligne à moitié écrite.
+pub fn preparer_panique() {
+    // SAFETY : on ne revient pas de la panique, le détenteur éventuel du
+    // verrou ne reprendra jamais la main.
+    unsafe { ECRAN.forcer_liberation() };
+}
+
 /// Appelée par les macros afficher! et afficherln!.
 pub fn _afficher(args: fmt::Arguments) {
     let mut ecran = ECRAN.verrouiller();
