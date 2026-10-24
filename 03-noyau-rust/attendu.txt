@@ -8,3 +8,4 @@
 [noyau] PIC remappe sur les vecteurs 32-47, horloge a 1000 Hz.
 [noyau] 100 ms plus tard : 
 [noyau] Clavier PS/2 pret : tapez du texte.
+[noyau] Carte de la memoire (E820)

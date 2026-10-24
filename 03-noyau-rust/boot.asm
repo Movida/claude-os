@@ -8,8 +8,11 @@
 ;    - le 2e étage lit aussi le NOYAU sur le disque, toujours via le BIOS
 ;      (donc en mode réel, avant de quitter le 16 bits), dans une zone
 ;      tampon en mémoire basse (0x10000) ;
-;    - une fois en 64 bits, il le recopie à 1 Mio (0x100000), l'adresse pour
-;      laquelle le noyau a été lié, et saute dessus.
+;    - il demande au BIOS la carte de la mémoire (E820), que le noyau ne
+;      pourra plus obtenir une fois le BIOS quitté ;
+;    - une fois en 64 bits, il recopie le noyau à 1 Mio (0x100000),
+;      l'adresse pour laquelle il a été lié, et saute dessus, avec dans rdi
+;      l'adresse de la carte de la mémoire.
 ;
 ;  Pourquoi ce détour par un tampon ? En mode réel, le BIOS ne sait écrire
 ;  que sous 1 Mio (segment:offset). Or 1 Mio est l'adresse classique d'un
@@ -23,7 +26,8 @@
 ;
 ;  Plan de la mémoire basse :
 ;    0x01000-0x03FFF  tables de pages
-;    0x04000-0x07BFF  pile du chargeur (15 Kio), dans tous les modes
+;    0x04000-0x04C07  carte de la mémoire, transmise au noyau
+;    0x04C08-0x07BFF  pile du chargeur (12 Kio), dans tous les modes
 ;    0x07C00-...      1er puis 2e étage
 ;    0x10000-...      tampon du noyau, jusqu'au début de l'EBDA au plus
 ;
@@ -57,14 +61,26 @@ NOYAU_KIO      equ (NOYAU_SECTEURS + 1) / 2
   %error "noyau trop gros pour la memoire basse (640 Kio)"
 %endif
 
-; La pile du chargeur, sous le 1er étage : de 0x7C00 vers le bas, jusqu'aux
-; tables de pages (0x4000), soit 15 Kio. Le chargeur n'en utilise
+; La pile du chargeur, sous le 1er étage : de 0x7C00 vers le bas, jusqu'à
+; la carte de la mémoire (0x4C08), soit 12 Kio. Le chargeur n'en utilise
 ; que quelques dizaines d'octets. Elle sert dans les trois modes : on
 ; n'a pas à se demander si une autre zone est libre. (À l'étape 2b, en
 ; 32 et 64 bits, elle partait de 0x90000 : ici, elle descendrait dans le
 ; tampon du noyau, et un gros noyau verrait ses derniers octets écrasés
 ; avant même d'être recopié.)
 PILE_CHARGEUR  equ 0x7C00
+
+; La carte de la mémoire transmise au noyau. Son format est un contrat
+; entre le chargeur et le noyau (voir noyau/src/carte_memoire.rs) :
+;   +0  dword  signature CARTE_SIGNATURE, preuve que la carte est là
+;   +4  dword  nombre de zones
+;   +8  zones de 24 octets : base (qword), taille (qword), type (dword),
+;       4 octets inutilisés
+CARTE          equ 0x4000
+CARTE_ZONES    equ CARTE + 8
+CARTE_MAX      equ 128          ; Comme Linux (E820_MAX_ENTRIES_ZEROPAGE).
+CARTE_SIGNATURE equ 'E820'      ; NASM range les 4 caractères dans l'ordre.
+SMAP           equ 0x534D4150   ; « SMAP », mot de passe de l'appel E820.
 
 
 ; =============================================================================
@@ -269,6 +285,53 @@ etage2:
 
     mov si, msg_noyau_lu
     call print16
+
+    ; --- Carte de la mémoire (E820) ------------------------------------------------
+    ; Le noyau doit savoir où est la mémoire vive : elle n'est pas d'un seul
+    ; tenant. Il y a des trous (la mémoire vidéo à 0xA0000, le BIOS vers
+    ; 0xF0000, les périphériques PCI sous 4 Gio...) et des zones que le
+    ; firmware garde pour lui (tables ACPI). Seul le firmware le sait, et
+    ; on ne peut le lui demander qu'en mode réel : c'est maintenant ou
+    ; jamais.
+    ;
+    ; L'appel « E820 » (int 0x15, eax = 0xE820), disponible depuis 1996 et
+    ; utilisé par Linux, rend une zone par appel : base, taille, type
+    ; (1 = mémoire libre, 2 = réservée, 3 et 4 = ACPI, 5 = défectueuse).
+    ; ebx sert de marque-page : 0 au premier appel, puis la valeur rendue
+    ; par le BIOS, jusqu'à ce qu'il rende 0 (c'était la dernière zone).
+    ;
+    ; Options écartées : les appels plus anciens, int 0x15 ax=0xE801 et
+    ; ah=0x88, qui ne donnent qu'une taille totale, sans les trous (Linux
+    ; ne s'en sert qu'en secours, pour des machines d'avant 2000).
+    mov dword [CARTE], CARTE_SIGNATURE
+    mov dword [CARTE + 4], 0
+    mov di, CARTE_ZONES             ; es:di -> où le BIOS écrit la zone.
+    xor ebx, ebx
+.e820_suivante:
+    ; ecx = 20 : on demande le format d'origine, sans le 5e champ
+    ; « attributs étendus » de l'ACPI 3.0. Comme Linux : des BIOS le
+    ; remplissent mal, et l'ACPI 4.0 l'a rendu inutile. On garde des cases
+    ; de 24 octets pour que le noyau lise des champs de 8 octets alignés.
+    mov eax, 0xE820
+    mov edx, SMAP
+    mov ecx, 20
+    int 0x15
+    jc .e820_fin                    ; CF = 1 : plus de zone (ou pas d'E820).
+    cmp eax, SMAP                   ; Le BIOS répond « SMAP » s'il a compris.
+    jne .e820_fin
+    inc dword [CARTE + 4]
+    add di, 24
+    cmp dword [CARTE + 4], CARTE_MAX
+    jae .e820_fin
+    test ebx, ebx
+    jnz .e820_suivante
+.e820_fin:
+    cmp dword [CARTE + 4], 0
+    jne .e820_ok
+    mov si, msg_e820_ko
+    call print16
+    jmp halt16
+.e820_ok:
 
     ; --- Ligne A20 -----------------------------------------------------------
     ; Héritage du 8086 : son bus d'adresses n'avait que 20 fils (A0..A19), donc
@@ -561,6 +624,11 @@ lm_entry:
     ; une fois sa propre table d'interruptions en place. On saute par un
     ; registre : un saut relatif ne peut pas encoder une adresse aussi
     ; éloignée de façon lisible, et c'est ainsi que les chargeurs le font.
+    ; L'adresse de la carte de la mémoire va dans rdi : c'est là que la
+    ; convention d'appel des systèmes Unix 64 bits (System V) met le 1er
+    ; argument d'une fonction. Le noyau la reçoit comme un paramètre.
+    ; (Linux reçoit de même ses « boot_params » dans rsi.)
+    mov rdi, CARTE
     mov rax, NOYAU_ADRESSE
     jmp rax
 
@@ -734,6 +802,7 @@ msg_cpu64:   db "[32 bits] Le processeur sait passer en 64 bits (cpuid, bit LM).
 msg_compat:  db "[32 bits] Pagination active, mode long actif (sous-mode compatibilite).", 13, 10, 0
 msg_noyau_lu: db "[16 bits] Noyau lu sur le disque.", 13, 10, 0
 msg_trop_gros: db "[16 bits] ERREUR : le noyau ne tient pas sous la zone du BIOS (EBDA).", 13, 10, 0
+msg_e820_ko: db "[16 bits] ERREUR : le BIOS ne donne pas de carte memoire (E820).", 13, 10, 0
 msg_long:    db "[64 bits] Mode long actif ! Le processeur execute du code 64 bits.", 13, 10, 0
 msg_pas_64:  db "[32 bits] ERREUR : ce processeur n'a pas de mode 64 bits.", 13, 10, 0
 

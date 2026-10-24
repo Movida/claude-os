@@ -14,6 +14,7 @@
 
 #[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
 mod console;
+mod carte_memoire;
 mod clavier;
 mod cpu;
 mod gdt;
@@ -35,12 +36,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 // initialisées à zéro le sont vraiment). Placé dans .text.debut, que le
 // script d'édition de liens met en tête de l'image : c'est là que le
 // chargeur saute.
+// Le chargeur passe l'adresse de la carte de la mémoire dans rdi ; or
+// rep stosb se sert de rdi : on la met de côté dans r15 le temps
+// d'effacer la .bss, puis on la rend à rdi, 1er argument de noyau_main.
 global_asm!(
     r#"
     .section .text.debut, "ax"
     .global _start
 _start:
     lea rsp, [rip + __pile_haut]
+    mov r15, rdi
 
     lea rdi, [rip + __bss_debut]
     lea rcx, [rip + __bss_fin]
@@ -49,6 +54,7 @@ _start:
     cld
     rep stosb
 
+    mov rdi, r15
     call noyau_main
 2:  cli
     hlt
@@ -62,7 +68,7 @@ unsafe extern "C" {
 }
 
 #[unsafe(no_mangle)]
-extern "C" fn noyau_main() -> ! {
+extern "C" fn noyau_main(carte: u64) -> ! {
     console::initialiser();
     afficherln!("[noyau] Bonjour depuis le noyau Rust !");
     afficherln!("[noyau] Mode long 64 bits, point d'entree a {:#x}.", &raw const _start as usize);
@@ -76,6 +82,14 @@ extern "C" fn noyau_main() -> ! {
     // SAFETY : int3 ne fait qu'appeler notre gestionnaire, qui revient.
     unsafe { asm!("int3") };
     afficherln!("[noyau] Retour apres int3 : les exceptions sont gerees.");
+
+    // La mémoire physique : la carte du BIOS.
+    // SAFETY : `carte` est l'adresse passée par notre chargeur, et rien n'a
+    // encore réutilisé la mémoire basse.
+    if let Err(e) = unsafe { carte_memoire::recopier(carte) } {
+        panic!("carte de la memoire illisible ({})", e);
+    }
+    carte_memoire::afficher();
 
     // Les interruptions matérielles : d'abord le PIC (tout masqué), puis
     // l'horloge qui démasque son IRQ, et seulement alors sti. Dans l'autre
