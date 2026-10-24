@@ -369,7 +369,13 @@ pm_entry:
     mov esi, msg_compat
     mov edi, 0xB8000 + 4 * 80 * 2
     call print32
-    jmp halt32
+
+    ; --- Dernier saut lointain : vers le vrai 64 bits ------------------------------
+    ; Comme pour l'entrée en mode protégé, c'est le descripteur chargé dans
+    ; CS qui décide comment le CPU décode les instructions : on saute vers
+    ; un segment dont le bit L vaut 1. Le jeu d'instructions change : pour
+    ; NASM, c'est [bits 64] à partir de lm_entry.
+    jmp CODE64_SEL:lm_entry
 
 .pas_de_64:
     ; Message clair plutôt qu'une triple faute (redémarrage en boucle)
@@ -427,6 +433,70 @@ serial_putc:
 
 
 ; -----------------------------------------------------------------------------
+;  Code 64 bits
+; -----------------------------------------------------------------------------
+[bits 64]
+lm_entry:
+    ; En mode 64 bits, le CPU ignore la base et la limite de ds, es et ss
+    ; (fs et gs gardent une base, qui servira aux données propres à chaque
+    ; processeur et à chaque thread). On y met quand même notre segment de
+    ; données plutôt que des valeurs restées du mode 32 bits : c'est ce que
+    ; fait Linux, et une interruption qui reviendrait ici trouverait des
+    ; sélecteurs valides.
+    mov ax, DATA_SEL
+    mov ds, ax
+    mov es, ax
+    mov fs, ax
+    mov gs, ax
+    mov ss, ax
+    mov rsp, 0x90000    ; Même pile, désormais en 64 bits.
+
+    mov rsi, msg_long
+    mov rdi, 0xB8000 + 5 * 80 * 2
+    call print64
+
+halt64:
+    ; Pas encore de table d'interruptions (IDT) : les interruptions restent
+    ; coupées depuis le cli du 2e étage. Ce sera l'étape suivante.
+    cli
+    hlt
+    jmp halt64
+
+; print64 et serial_putc64 : les mêmes que print32 et serial_putc, en 64 bits.
+; Encore une copie : les registres s'appellent rsi, rdi... et l'encodage des
+; instructions change (préfixes REX). Le jour où le noyau sera en C, il
+; n'y aura plus qu'une seule version de chaque fonction.
+print64:
+    lodsb
+    test al, al
+    jz .fin
+    cmp al, ' '
+    jb .serie
+    mov ah, 0x0A
+    mov [rdi], ax
+    add rdi, 2
+.serie:
+    call serial_putc64
+    jmp print64
+.fin:
+    ret
+
+serial_putc64:
+    push rdx
+    push rax
+    mov dx, COM1 + 5
+.attente:
+    in al, dx
+    test al, 0x20
+    jz .attente
+    pop rax
+    mov dx, COM1
+    out dx, al
+    pop rdx
+    ret
+
+
+; -----------------------------------------------------------------------------
 ;  La GDT (Global Descriptor Table), reprise de l'étape 2a
 ; -----------------------------------------------------------------------------
 ;  Une table de descripteurs de 8 octets. Chaque descripteur dit au CPU :
@@ -450,7 +520,7 @@ serial_putc:
 ;    octet  6   : FLAGS (4 bits hauts) G DB L 0  |  limite, bits 16-19 (bas)
 ;                   G   = granularité : 0 -> limite en octets, 1 -> en 4 Kio
 ;                   DB  = 1 : segment 32 bits (0 : 16 bits)
-;                   L   = 1 : code 64 bits (pour plus tard, 0 ici)
+;                   L   = 1 : code 64 bits (alors DB doit valoir 0)
 ;    octet  7   : base, bits 24-31
 ;
 ;  L'ordre éclaté base/limite est un héritage du 80286 (descripteurs 16 bits
@@ -508,8 +578,25 @@ gdt_data:
                         ;   utilise esp (32 bits) et non sp.
     db 0x00
 
+gdt_code64:
+    ; Segment de CODE noyau 64 bits (sélecteur 0x18). En mode 64 bits, le
+    ; CPU ignore base et limite : seuls comptent l'octet d'accès et les bits
+    ; L et DB. On garde quand même base 0 et limite maximale, comme Linux,
+    ; pour qu'un outil qui lit la table voie un segment « plat » cohérent.
+    ; On ajoute ce descripteur au lieu de modifier gdt_code : le saut en
+    ; mode protégé a besoin d'un segment 32 bits, et le sous-mode
+    ; compatibilité en aura besoin pour des programmes 32 bits.
+    dw 0xFFFF
+    dw 0x0000
+    db 0x00
+    db 10011011b        ; Accès : identique au code 32 bits (noyau, lisible).
+    db 10101111b        ; Flags G=1, DB=0, L=1 : code 64 bits ; limite 0xF.
+                        ; DB=1 avec L=1 est interdit (réservé par Intel).
+    db 0x00
+
+; Le segment de données 0x10 sert aussi en 64 bits : seul y compte le bit P.
 ; Pas encore de segments utilisateur (DPL=3) ni de TSS : ils arriveront avec
-; les processus. Le mode 64 bits demandera un descripteur de code avec L=1.
+; les processus.
 
 gdt_end:
 
@@ -520,6 +607,7 @@ gdt_descriptor:
 
 CODE_SEL equ gdt_code - gdt_start   ; = 0x08
 DATA_SEL equ gdt_data - gdt_start   ; = 0x10
+CODE64_SEL equ gdt_code64 - gdt_start ; = 0x18
 
 ; Les trois tables de pages, en mémoire basse libre, alignées sur 4 Kio.
 PML4 equ 0x1000
@@ -537,6 +625,7 @@ msg_a20_ko:  db "[16 bits] ERREUR : la ligne A20 refuse de s'activer.", 13, 10, 
 msg_protege: db "[32 bits] Mode protege actif.", 13, 10, 0
 msg_cpu64:   db "[32 bits] Le processeur sait passer en 64 bits (cpuid, bit LM).", 13, 10, 0
 msg_compat:  db "[32 bits] Pagination active, mode long actif (sous-mode compatibilite).", 13, 10, 0
+msg_long:    db "[64 bits] Mode long actif ! Le processeur execute du code 64 bits.", 13, 10, 0
 msg_pas_64:  db "[32 bits] ERREUR : ce processeur n'a pas de mode 64 bits.", 13, 10, 0
 
 fin_image:

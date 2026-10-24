@@ -61,12 +61,24 @@ Un émulateur de machine : il simule un PC complet (processeur, mémoire, BIOS, 
 
 David préfère apprendre en lisant le code et les commentaires plutôt qu'en faisant des exercices, et ne se sent pas en mesure de trancher entre les options techniques. **Décision :** plus de `TODO(human)`. Claude écrit tout et retient, pour chaque choix, l'option qui mène au meilleur noyau à terme, en expliquant en commentaire ce qui a été écarté. Premier exemple : la GDT de l'étape 02a, en modèle « plat » comme Linux. Le style de sortie de Claude Code passe de « Learning » à « Explanatory » (explications conservées, sans demande de contribution).
 
-## 7. Questions ouvertes
+## 7. Étape 2 réalisée : mode protégé, puis mode long 64 bits
 
-- Le langage du noyau (C recommandé ; Rust ou Zig possibles), à trancher avant de charger un vrai noyau après le passage en 32 bits.
+**Étape 02a** (`02-mode-protege/`) : ligne A20, GDT en modèle « plat » (base 0, limite 4 Gio, comme Linux), bit PE de CR0, saut lointain, puis écriture directe en mémoire vidéo 0xB8000 et sur COM1.
+
+**Étape 02b** (`02-mode-long/`), en quatre commits :
+
+1. **Chargeur en deux temps.** Le passage en 64 bits ne tient plus dans les 512 octets chargés par le BIOS. Le 1er étage garde le numéro de disque (`dl`), lit les secteurs suivants en LBA (`int 0x13`, `ah=0x42`) à l'adresse 0x7E00 et y saute.
+2. **Mode protégé dans le 2e étage**, puis `cpuid` (bit LM) pour vérifier que le processeur a un mode 64 bits, avec un message clair sinon.
+3. **Pagination** : PML4, PDPT et PD en mémoire basse, 1 Gio en correspondance identité avec des pages de 2 Mio, puis CR4.PAE, CR3, EFER.LME et CR0.PG.
+4. **Descripteur de code 64 bits** (bit L) et saut lointain : le code s'exécute en 64 bits.
+
+**Vérifié dans QEMU** : chaque sous-étape avec `verifier.sh`, le moniteur QEMU (EFER = 0x500, CR3 = 0x1000, CS 64 bits) et le cas d'erreur d'un processeur 32 bits (`-cpu qemu32`).
+
+## 8. Questions ouvertes
+
+- Le langage du noyau (C recommandé ; Rust ou Zig possibles), à trancher maintenant : la suite du travail se fera dans un vrai noyau chargé par notre chargeur.
 - La place de WebAssembly dans l'architecture.
-- Mettre le projet dans un dépôt GitHub (proposé, sans réponse pour l'instant).
 
-## 8. Prochaine étape
+## 9. Prochaine étape
 
-Passer du mode réel 16 bits au **mode protégé 32 bits** (table GDT, bit PE du registre CR0, saut lointain), puis au **mode long 64 bits**, indispensable puisque Claude Code est un binaire x86_64.
+Étape 3 : mémoire, interruptions, clavier. Une table d'interruptions (IDT) pour attraper les exceptions du processeur au lieu de redémarrer, l'horloge, puis le clavier. C'est aussi le moment de charger un vrai noyau, écrit dans le langage retenu.

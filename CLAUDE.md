@@ -41,7 +41,7 @@ Puis lire `serial.log`. Pour une capture de l'écran, envoyer `screendump ecran.
 ## Feuille de route
 
 1. Secteur de démarrage 16 bits, démarrage BIOS legacy (fait)
-2. Passage en mode protégé 32 bits, puis en mode long 64 bits
+2. Passage en mode protégé 32 bits, puis en mode long 64 bits (fait)
 3. Mémoire, interruptions, clavier
 4. Chargement d'un exécutable ELF statique et premiers appels système Linux (`write`, `exit`)
 5. Processus, système de fichiers, réseau (virtio), TLS… jusqu'à Claude Code
