@@ -85,13 +85,17 @@ pub fn charger(executable: &Executable, nom: &'static [u8]) -> Result<Programme,
         }
         memoire.ecrire(segment.adresse, segment.contenu)?;
     }
-    // La pile : inscriptible, jamais exécutable, une zone qui grandit vers
-    // le bas. Aucune page tant que le noyau n'y a rien écrit.
+    // La pile : inscriptible, une zone qui grandit vers le bas. Aucune page
+    // tant que le noyau n'y a rien écrit. Exécutable seulement si le
+    // programme le demande (PT_GNU_STACK avec PF_X) : Linux l'accepte, et
+    // un vieux programme qui pose du code sur sa pile (les « trampolines »
+    // de gcc pour les fonctions imbriquées) planterait sinon sans
+    // explication. Le refuser serait plus sûr, mais pas Linux.
     let sommet_pile = memoire::disposition().sommet_pile;
     let pile = Zone {
         debut: sommet_pile - PLACE_ARGUMENTS,
         fin: sommet_pile,
-        droits: Droits { lecture: true, ecriture: true, execution: false },
+        droits: Droits { lecture: true, ecriture: true, execution: executable.pile_executable() },
         nature: Nature::Pile,
         drapeaux: Drapeaux { vers_le_bas: true, ..Drapeaux::default() },
     };

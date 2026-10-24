@@ -47,6 +47,9 @@ const ET_DYN: u16 = 3;
 const EM_X86_64: u16 = 62;
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
+/// La pile du programme doit-elle être exécutable ? (Une extension GNU,
+/// que gcc et ld écrivent toujours ; PF_X la demande exécutable.)
+const PT_GNU_STACK: u32 = 0x6474_e551;
 const PF_X: u32 = 1;
 const PF_W: u32 = 2;
 
@@ -229,6 +232,21 @@ impl<'a> Executable<'a> {
                 execution: e.drapeaux & PF_X != 0,
             })
         })
+    }
+
+    /// La pile doit-elle être exécutable ? Oui si un en-tête PT_GNU_STACK
+    /// porte PF_X (`ld -z execstack`, ou un objet assemblé sans la note
+    /// .note.GNU-stack, quand l'éditeur de liens en déduit une pile
+    /// exécutable) ; non sans PT_GNU_STACK, comme Linux pour un programme
+    /// 64 bits (EXSTACK_DEFAULT : sur x86_64, pas de « lecture implique
+    /// exécution »). Le dernier en-tête l'emporte, comme dans Linux
+    /// (load_elf_binary).
+    pub fn pile_executable(&self) -> bool {
+        (0..self.nombre_entetes)
+            .map(|i| self.entete(i))
+            .filter(|e| e.genre == PT_GNU_STACK)
+            .last()
+            .is_some_and(|e| e.drapeaux & PF_X != 0)
     }
 
     /// La fin du dernier segment (son adresse plus sa taille en mémoire) :
@@ -415,6 +433,22 @@ mod tests {
         assert_eq!(x.fin(), 0x402100);
         // Les en-têtes (position 64) ne sont dans aucun segment.
         assert_eq!(x.adresse_entetes(), None);
+        // Sans PT_GNU_STACK : pile non exécutable.
+        assert!(!x.pile_executable());
+    }
+
+    #[test]
+    fn pile_executable() {
+        let mut o = exemple();
+        o[56..58].copy_from_slice(&3u16.to_le_bytes());
+        entete(&mut o, 2, PT_GNU_STACK, 6, 0, 0, 0, 0);
+        assert!(!lire(&o, PERMISES).unwrap().pile_executable());
+        entete(&mut o, 2, PT_GNU_STACK, 7, 0, 0, 0, 0);
+        assert!(lire(&o, PERMISES).unwrap().pile_executable());
+        // Deux en-têtes : le dernier l'emporte.
+        o[56..58].copy_from_slice(&4u16.to_le_bytes());
+        entete(&mut o, 3, PT_GNU_STACK, 6, 0, 0, 0, 0);
+        assert!(!lire(&o, PERMISES).unwrap().pile_executable());
     }
 
     #[test]

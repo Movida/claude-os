@@ -95,7 +95,9 @@ boot.bin: programmes.cpio FORCE
 # 2.31), et des variantes qu'il doit refuser : bonjour-c-pie
 # (gcc -static-pie, un ET_DYN),
 # bonjour-c-dynamique (gcc sans option : ET_DYN, ld-linux et la glibc
-# partagée), bonjour-asm-wx (ld -N, un segment W+X).
+# partagée), bonjour-asm-wx (ld -N, un segment W+X) ; et
+# bonjour-asm-pile-executable (ld -z execstack), dont il doit lire le
+# PT_GNU_STACK.
 LINUX = linux/construits
 CFLAGS_LINUX = -O2 -Wall -Wextra -Werror
 
@@ -123,6 +125,9 @@ $(LINUX)/sse: $(LINUX)/sse.o
 $(LINUX)/bonjour-asm-wx: $(LINUX)/bonjour-asm.o
 	ld -N -o $@ $< 2>/dev/null
 
+$(LINUX)/bonjour-asm-pile-executable: $(LINUX)/bonjour-asm.o
+	ld -z execstack -o $@ $<
+
 $(LINUX)/bonjour-c: linux/bonjour.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
@@ -149,7 +154,8 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 # registres x87, MMX et SSE, de ce qu'y a laissé le précédent) ; zero et
 # grande-pile font au contraire des fautes que le noyau doit SERVIR (la
 # page de zéros et la copie à l'écriture, la pile qui grandit jusqu'à
-# 8 Mio) ; oom touche plus de mémoire que la machine n'en a, et doit être
+# 8 Mio), pile-executable (lié avec ld -z execstack) exécute du code posé
+# sur sa pile ; oom touche plus de mémoire que la machine n'en a, et doit être
 # tué par le noyau, qui doit ensuite tout récupérer ; puis des
 # exécutables que le noyau doit refuser :
 #   - wx : un segment W+X (ld -N) ;
@@ -160,7 +166,7 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 # Enfin bonjour-asm, pour montrer que le noyau exécute encore des
 # programmes après tout cela.
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
-              zero grande-pile recursion oom boucle brk-boucle \
+              zero grande-pile pile-executable recursion oom boucle brk-boucle \
               wx derniere-page et-dyn tronque
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
@@ -169,6 +175,9 @@ $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
 
 $(LINUX)/tests/%: $(LINUX)/tests/%.o
 	ld -o $@ $<
+
+$(LINUX)/tests/pile-executable: $(LINUX)/tests/pile-executable.o
+	ld -z execstack -o $@ $<
 
 $(LINUX)/tests/wx: $(LINUX)/bonjour-asm.o
 	mkdir -p $(LINUX)/tests
@@ -189,7 +198,7 @@ $(LINUX)/tests/tronque: $(LINUX)/bonjour-asm
 tests.cpio: archive.sh $(addprefix $(LINUX)/tests/,$(TESTS_LINUX)) $(LINUX)/bonjour-asm
 	sh archive.sh $@ $(filter-out archive.sh,$^)
 
-PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx bonjour-c bonjour-c-deux-segments bonjour-c-pie bonjour-c-dynamique)
+PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx bonjour-asm-pile-executable bonjour-c bonjour-c-deux-segments bonjour-c-pie bonjour-c-dynamique)
 
 # L'archive de programmes, que le noyau exécute dans l'ordre (voir
 # archive.sh).

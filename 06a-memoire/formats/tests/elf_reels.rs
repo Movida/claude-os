@@ -51,6 +51,17 @@ fn gcc_statique() {
     // Le .bss : plus grand en mémoire que dans le fichier.
     assert!(segments[3].taille > segments[3].contenu.len() as u64);
     assert_eq!(x.fin(), segments[3].adresse + segments[3].taille);
+    // gcc écrit un PT_GNU_STACK sans PF_X : pile non exécutable.
+    assert!(!x.pile_executable());
+}
+
+#[test]
+fn pile_executable_demandee() {
+    let o = lire_programme("bonjour-asm-pile-executable");
+    let x = elf::lire(&o, PERMISES).expect("ld -z execstack refuse");
+    assert!(x.pile_executable());
+    // Assemblé par nasm et lié par ld sans option : pas de PT_GNU_STACK.
+    assert!(!elf::lire(&lire_programme("bonjour-asm"), PERMISES).unwrap().pile_executable());
 }
 
 #[test]

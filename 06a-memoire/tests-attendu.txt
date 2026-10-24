@@ -56,6 +56,8 @@
 [noyau] grande-pile : segfault at 
  error 6 (pas de zone) dans grande-pile[401000+1000] (SIGSEGV)
 [noyau] grande-pile : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Pile executable (PT_GNU_STACK) : code pose sur la pile puis execute : ok.
+[noyau] pile-executable : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] Test : 256 Mio de tas ecrits page par page.
 [noyau] oom : plus de memoire : tue, memoire virtuelle 
  Kio (SIGKILL)
