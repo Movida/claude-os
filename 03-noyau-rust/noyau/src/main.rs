@@ -14,6 +14,7 @@
 
 #[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
 mod console;
+mod cadres;
 mod carte_memoire;
 mod clavier;
 mod cpu;
@@ -65,6 +66,9 @@ _start:
 unsafe extern "C" {
     // Défini dans le global_asm! ci-dessus : seule son adresse nous intéresse.
     static _start: u8;
+    // Défini par le script d'édition de liens : la fin du noyau en mémoire
+    // (après la .bss et la pile).
+    static __bss_fin: u8;
 }
 
 #[unsafe(no_mangle)]
@@ -83,13 +87,27 @@ extern "C" fn noyau_main(carte: u64) -> ! {
     unsafe { asm!("int3") };
     afficherln!("[noyau] Retour apres int3 : les exceptions sont gerees.");
 
-    // La mémoire physique : la carte du BIOS.
+    // La mémoire physique : la carte du BIOS, puis l'allocateur de cadres.
     // SAFETY : `carte` est l'adresse passée par notre chargeur, et rien n'a
     // encore réutilisé la mémoire basse.
     if let Err(e) = unsafe { carte_memoire::recopier(carte) } {
         panic!("carte de la memoire illisible ({})", e);
     }
     carte_memoire::afficher();
+    let fin_noyau = &raw const __bss_fin as u64;
+    match cadres::initialiser(fin_noyau) {
+        Ok(bilan) => {
+            afficherln!("[noyau] Memoire libre : {} cadres de 4 Kio ({} Mio).",
+                        bilan.libres, bilan.libres as u64 * cadres::TAILLE_CADRE >> 20);
+            afficherln!("        Carte de bits : {} Kio a {:#x}, apres le noyau (fin a {:#x}).",
+                        bilan.taille_bits >> 10, bilan.adresse_bits, fin_noyau);
+            if bilan.au_dela > 0 {
+                afficherln!("        {} Mio au-dela du 1er Gio, pas encore projetes.", bilan.au_dela >> 20);
+            }
+        }
+        Err(e) => panic!("allocateur de cadres : {}", e),
+    }
+    tester_cadres();
 
     // Les interruptions matérielles : d'abord le PIC (tout masqué), puis
     // l'horloge qui démasque son IRQ, et seulement alors sti. Dans l'autre
@@ -124,6 +142,27 @@ extern "C" fn noyau_main(carte: u64) -> ! {
             afficher!("{}", c);
         }
     }
+}
+
+/// Vérifie l'allocateur : trois cadres distincts et alignés, et un cadre
+/// rendu est bien redonné ensuite.
+fn tester_cadres() {
+    let libres_avant = cadres::libres();
+    let a = cadres::allouer().expect("plus de memoire");
+    let b = cadres::allouer().expect("plus de memoire");
+    let c = cadres::allouer().expect("plus de memoire");
+    assert!(a != b && b != c && a != c && (a | b | c) % cadres::TAILLE_CADRE == 0);
+    // On écrit dans un cadre : il est bien projeté et à nous.
+    // SAFETY : `b` vient d'être alloué, personne d'autre ne s'en sert.
+    unsafe { core::ptr::write_bytes(b as *mut u8, 0, cadres::TAILLE_CADRE as usize) };
+    cadres::liberer(b);
+    let d = cadres::allouer().expect("plus de memoire");
+    cadres::liberer(a);
+    cadres::liberer(c);
+    cadres::liberer(d);
+    assert!(cadres::libres() == libres_avant);
+    afficherln!("[noyau] Cadres alloues : {:#x} {:#x} {:#x} ; {:#x} rendu puis redonne : {}.",
+                a, b, c, b, if d == b { "ok" } else { "ECHEC" });
 }
 
 /// Appelé par Rust en cas d'erreur fatale (indice hors d'un tableau,
