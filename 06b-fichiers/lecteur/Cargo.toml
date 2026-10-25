@@ -1,0 +1,22 @@
+# Un programme WebAssembly qui lit des fichiers, par WASI (6b) : écrit en
+# Rust sans bibliothèque standard, compilé en WebAssembly par rustc, il
+# déclare à la main les quelques fonctions de WASI dont il se sert. Le noyau
+# l'embarque et l'exécute (../noyau/src/wasi.rs).
+[package]
+name = "lecteur"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# Une bibliothèque « C » : rustc produit alors un module .wasm, avec les
+# fonctions marquées no_mangle pour exports.
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+debug = false
+strip = true

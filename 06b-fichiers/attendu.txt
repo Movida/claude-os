@@ -21,7 +21,7 @@ rendues et recollees : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
-[noyau] Archive deballee : dossiers 5, fichiers 13, liens symboliques 1, liens physiques 1 ; archive rendue (
+[noyau] Archive deballee : dossiers 5, fichiers 14, liens symboliques 2, liens physiques 1 ; archive rendue (
 [noyau] Programmes de /bin :
         bonjour.wasm                 2943 octets
         bonjour-asm
@@ -29,6 +29,15 @@ memoire rendue : ok.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
 [noyau] bonjour.wasm : termine, code de sortie 0
+[wasm] lecteur : dossier pre-ouvert 3 : ok
+[wasm] lecteur : /etc/bonjour.txt : Bonjour depuis un fichier de /etc !
+[wasm] lecteur : /etc/lien-bonjour : Bonjour depuis un fichier de /etc !
+[wasm] lecteur : /etc contient : . .. lien-absolu lien-bonjour salut.txt bonjour.txt
+[wasm] lecteur : ecrire puis relire /tmp/lecteur.txt : ok
+[wasm] lecteur : ../../etc/bonjour.txt refuse (EPERM) : ok
+[wasm] lecteur : etc/lien-absolu refuse (EPERM) : ok
+[wasm] lecteur : le 3 ferme puis repris n'est plus pre-ouvert : ok
+[noyau] lecteur.wasm : termine, code de sortie 0
 [noyau] bonjour-asm : programme Linux (ELF), 
         0x00401000-0x00401024 r-x (36 octets du fichier)
         en-tetes de programme a 0x400040 (3 de 56 octets), tas a partir de 0x403000, code en place : ok.

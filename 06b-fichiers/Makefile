@@ -246,6 +246,7 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 # puis exécute les programmes de /bin dans l'ordre (voir archive.sh).
 programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
 	cd bonjour && cargo build --release
+	cd lecteur && cargo build --release
 	sh archive.sh $@ archive.txt
 
 FORCE:
@@ -425,6 +426,7 @@ clean:
 	cd noyau && cargo clean
 	cd wasm && cargo clean
 	cd bonjour && cargo clean
+	cd lecteur && cargo clean
 	cd formats && cargo clean
 	cd zones && cargo clean
 	cd fichiers && cargo clean

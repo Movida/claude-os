@@ -7,6 +7,7 @@
 # Les programmes, à root, exécutables par tous.
 dir   /bin 755 0 0
 file  /bin/bonjour.wasm    bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm 755 0 0
+file  /bin/lecteur.wasm    lecteur/target/wasm32-unknown-unknown/release/lecteur.wasm 755 0 0
 file  /bin/bonjour-asm     linux/construits/bonjour-asm 755 0 0
 file  /bin/pile            linux/construits/pile 755 0 0
 file  /bin/sse             linux/construits/sse 755 0 0
@@ -22,10 +23,13 @@ file  /bin/arbre           linux/construits/arbre 755 0 0
 file  /bin/segments        linux/construits/segments 755 0 0
 
 # Quelques fichiers à lire : un texte, un second nom (un lien physique),
-# et un lien symbolique.
+# et des liens symboliques.
 dir   /etc 755 0 0
 file  /etc/bonjour.txt     racine/etc/bonjour.txt 644 0 0 /etc/salut.txt
 slink /etc/lien-bonjour    bonjour.txt 777 0 0
+# Un lien absolu : un programme WebAssembly ne doit pas pouvoir le suivre
+# (il sortirait de son dossier pré-ouvert, voir noyau/src/wasi.rs).
+slink /etc/lien-absolu     /etc/bonjour.txt 777 0 0
 
 # /tmp, ouvert à tous mais « sticky » : chacun n'y efface que ses fichiers.
 # Un fichier de root s'y trouve, que l'utilisateur 1000 ne doit pas pouvoir

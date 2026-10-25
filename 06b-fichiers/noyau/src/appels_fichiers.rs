@@ -1247,14 +1247,15 @@ pub fn rmdir(adresse: u64) -> i64 {
     unlinkat(AT_FDCWD as u64, adresse, AT_REMOVEDIR)
 }
 
-/// Ouvre en lecture le fichier `n` (de chemin `chemin`), pour le noyau :
-/// le programme à exécuter, que ses zones projetteront (le `bprm->file` de
-/// Linux). Rend le fichier ouvert, tenu une fois.
-pub fn ouvrir_inode(n: Numero, chemin: &[u8]) -> Result<Fichier, Erreur> {
+/// Ouvre en lecture l'inode `n` (de chemin `chemin`, et de sorte `sorte`),
+/// pour le noyau : le programme à exécuter, que ses zones projetteront (le
+/// `bprm->file` de Linux), ou le dossier pré-ouvert d'un programme WASI.
+/// Rend le fichier ouvert, tenu une fois.
+pub fn ouvrir_inode(n: Numero, chemin: &[u8], sorte: Sorte) -> Result<Fichier, Erreur> {
     vfs::avec_systeme(|s, cadres| {
         s.fs.prendre(n);
         let ouvert = fichiers::tmpfs::Ouvert { numero: n, cree: false, tronquer: false, ecrivain: false };
-        let fichier = FichierOuvert::new(Sorte::Fichier, ouvert, true, false, (O_RDONLY | O_LARGEFILE) as u32, chemin);
+        let fichier = FichierOuvert::new(sorte, ouvert, true, false, (O_RDONLY | O_LARGEFILE) as u32, chemin);
         s.ouverts.ajouter(fichier).map_err(|f| {
             s.fs.fermer(&f.ouvert, cadres);
             Erreur::ENOMEM

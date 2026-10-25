@@ -188,7 +188,7 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
     let libres = pages::libres();
     // Le fichier ouvert que projetteront ses segments : chaque zone le
     // tiendra ; l'ouverture du chargeur est lâchée ensuite.
-    let fichier = match appels_fichiers::ouvrir_inode(n, chemin) {
+    let fichier = match appels_fichiers::ouvrir_inode(n, chemin, crate::descripteurs::Sorte::Fichier) {
         Ok(f) => f,
         Err(e) => return afficherln!("[noyau] {} : ouverture impossible (errno {})", nom, e.errno()),
     };
@@ -303,6 +303,11 @@ fn executer_wasm(nom: NomCourt, n: Numero) {
     // Son budget de mémoire : 16 Mio pour ses tables et sa mémoire, chacune
     // d'au plus 4 Mio (un bloc du tas, voir tas.rs).
     let mut magasin = Magasin::avec_budget(16 << 20);
+    // Ses descripteurs : la console, et la racine pré-ouverte.
+    let mut hote = match wasi::Wasi::new() {
+        Ok(h) => h,
+        Err(e) => return afficherln!("[noyau] {} : pas de descripteurs (errno {})", nom, e.errno()),
+    };
     let imports = match wasi::imports(&mut magasin, &module) {
         Ok(i) => i,
         Err(e) => return afficherln!("[noyau] {} : programme non liable : {}", nom, e),
@@ -323,7 +328,7 @@ fn executer_wasm(nom: NomCourt, n: Numero) {
     let (mut tranches, mut consomme) = (0u64, 0u64);
     let fin = loop {
         let mut carburant = TRANCHE;
-        let etat = execution.reprendre(&mut magasin, &mut wasi::Wasi, &mut carburant);
+        let etat = execution.reprendre(&mut magasin, &mut hote, &mut carburant);
         tranches += 1;
         consomme += TRANCHE - carburant;
         match etat {
