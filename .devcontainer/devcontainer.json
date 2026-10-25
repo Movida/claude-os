@@ -1,6 +1,10 @@
 {
   "name": "OS x86 + Wasm",
   "build": { "dockerfile": "Dockerfile" },
+  // Plafonne la mémoire du conteneur à 8 Go, sans swap (--memory seul en
+  // laisserait autant) : un programme qui s'emballe est tué dans le conteneur
+  // au lieu d'épuiser la mémoire de WSL, qui se fige avec Docker et VS Code.
+  "runArgs": ["--memory=8g", "--memory-swap=8g"],
   "features": {
     // Node.js, puis Claude Code lui-même dans le conteneur.
     "ghcr.io/devcontainers/features/node:1": {},
