@@ -247,3 +247,34 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   quart de seconde par Mio sous QEMU ; `verifier.sh` laisse 2 s. Mesurer
   (une ligne datée par message du port série) avant d'ajouter un gros
   programme à l'archive ordinaire.
+
+## Pièges rencontrés en 6b (25 octobre 2026)
+
+- **Les relecteurs meurent avec le tour qui les a lancés** : un message de
+  David arrivé pendant la relecture (en Remote Control) a interrompu les
+  trois agents en arrière-plan, sans rien dire. Leur demander d'écrire
+  chaque constat dans un fichier de leur brouillon dès qu'il est vérifié,
+  et vérifier qu'ils tournent encore (la date de leur journal) avant de
+  dire qu'ils travaillent.
+- **La signature des commits passe par l'agent SSH de Windows**, que VS
+  Code fait suivre au conteneur (`/tmp/vscode-ssh-auth-*.sock`). Après un
+  changement du code Windows Hello, ou un redémarrage, l'agent peut ne plus
+  répondre (une minute d'attente, puis « communication with agent
+  failed ») ou ne plus être suivi du tout. Essayer une signature
+  (`ssh-keygen -Y sign`) AVANT de lancer un rebase ; la prise la plus
+  récente est la bonne (`ls -t`), à passer dans SSH_AUTH_SOCK.
+- **Un rebase interrompu se reprend** : son état est dans `.git`, et
+  survit au redémarrage du conteneur. Le brouillon de la session, lui, peut
+  disparaître : y garder des copies, pas l'unique version d'un fichier.
+- **Un fixup qui ajoute un test dans un fichier que des commits suivants
+  modifient** : vérifier que le test compile à l'état du commit visé (une
+  fonction, un `#include`, un appel système qui n'existent qu'après).
+  Construire le programme de test à chaque commit résolu, pas seulement
+  le noyau.
+- **`ulimit -v` fausse les tests de la mémoire** sur l'hôte
+  (`linux/memoire` réserve 64 Gio) : le garder pour cargo et les sondes, pas
+  pour `make tests-hote` (le plafond du conteneur suffit).
+- **Un terminal n'est pas un fichier** : une faute au milieu du tampon
+  rend ce qui a été écrit pour un fichier, mais EFAULT pour une console
+  (`iterate_tty_write` copie chaque morceau en entier). Un test de l'étape 5
+  l'a rappelé.
