@@ -43,7 +43,8 @@
 #                  mmap & co. doivent être ceux du vrai Linux ; et
 #                  linux/claude-version, qui doit y réussir aussi, comme
 #                  linux/temps (les horloges) et linux/fichiers (nos codes
-#                  d'erreur des fichiers doivent être ceux de Linux)
+#                  d'erreur des fichiers doivent être ceux de Linux), et
+#                  linux/dynamique (ld-linux, la glibc partagée, dlopen)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -101,6 +102,10 @@ boot.bin: programmes.cpio FORCE
 #   - bonjour-c-pie : le même en gcc -static-pie, un ET_DYN sans
 #     interpréteur, qui se reloge lui-même (6c) ; bonjour-c-dynamique, le
 #     même en gcc sans option, qui demande ld-linux et la glibc partagée ;
+#   - dynamique : lié aux cinq bibliothèques de claude, il vérifie ce que
+#     font ld-linux et la glibc partagée, et charge libessai.so (dlopen),
+#     une bibliothèque à nous (linux/essai.c), installée dans
+#     /usr/local/lib ; sur l'hôte aussi (LD_LIBRARY_PATH pour libessai) ;
 #   - memoire : gcc -static, les appels de la mémoire (mmap, munmap,
 #     mprotect, madvise) contre ce qu'en fait Linux : make tests-hote le
 #     lance aussi sur l'hôte, où chaque vérification doit dire « ok » ;
@@ -125,7 +130,10 @@ boot.bin: programmes.cpio FORCE
 LINUX = linux/construits
 # La glibc partagée de la machine, copiée dans glibc/ (voir $(GLIBC)/.copiee).
 GLIBC_HOTE = /usr/lib/x86_64-linux-gnu
-GLIBC_FICHIERS = ld-linux-x86-64.so.2 libc.so.6
+# ld-linux, la glibc, et les quatre autres bibliothèques de `claude`
+# (depuis la glibc 2.34, libpthread, libdl et librt sont des coquilles
+# presque vides : tout est dans libc.so.6, mais claude les demande).
+GLIBC_FICHIERS = ld-linux-x86-64.so.2 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1
 GLIBC = glibc
 CFLAGS_LINUX = -O2 -Wall -Wextra -Werror
 
@@ -196,6 +204,18 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 	mkdir -p $(LINUX)
 	gcc $(CFLAGS_LINUX) $< -o $@
 
+$(LINUX)/libessai.so: linux/essai.c
+	mkdir -p $(LINUX)
+	gcc -shared -fPIC -Wl,-soname,libessai.so $(CFLAGS_LINUX) $< -o $@
+
+# --no-as-needed : garder les NEEDED des bibliothèques dont le programme
+# n'appelle rien, comme claude ; -l: nomme le fichier exact, parce que
+# depuis la glibc 2.34, -lpthread, -ldl et -lrt ne trouvent que des
+# archives vides (mesuré : aucun NEEDED).
+$(LINUX)/dynamique: linux/dynamique.c
+	mkdir -p $(LINUX)
+	gcc $(CFLAGS_LINUX) $< -o $@ -Wl,--no-as-needed -lm -l:libpthread.so.0 -l:libdl.so.2 -l:librt.so.1
+
 # Les programmes de test de `make tests-qemu` (linux/tests/) : chacun fait
 # une faute que le noyau doit arrêter, ou essaie de mauvais appels système
 # (mmx-ecrit puis mmx-lit : un programme ne doit rien trouver, dans les
@@ -222,7 +242,7 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 # montrer que le noyau exécute encore des programmes après tout cela.
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle \
-              wx derniere-page et-dyn tronque bus-fichier
+              wx derniere-page et-dyn tronque bus-fichier faute-libc
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
 	mkdir -p $(LINUX)/tests
@@ -249,6 +269,11 @@ $(LINUX)/tests/et-dyn: $(LINUX)/bonjour-asm.o
 $(LINUX)/tests/tronque: $(LINUX)/bonjour-asm
 	mkdir -p $(LINUX)/tests
 	head -c 40 $< > $@
+
+# Un programme dynamique qui fait une faute dans la glibc partagée.
+$(LINUX)/tests/faute-libc: linux/tests/faute-libc.c
+	mkdir -p $(LINUX)/tests
+	gcc $(CFLAGS_LINUX) $< -o $@
 
 # Les programmes au mauvais interpréteur (6c). Les premiers, un programme C
 # qui ne doit jamais tourner (linux/tests/interp.c), liés par gcc avec un
@@ -338,7 +363,8 @@ $(LINUX)/tests/interpreteurs/gros: linux/tests/interpreteur-gros.asm
 # que demandent nos programmes dynamiques, copiées dans glibc/racine aux
 # chemins d'Ubuntu (/usr fusionné), avec un /etc/ld.so.cache fabriqué
 # par ldconfig sur cette racine de préparation (-r : sans root ; -X : sans
-# toucher aux liens des bibliothèques). Jamais commitées
+# toucher aux liens des bibliothèques), et notre libessai.so dans
+# /usr/local/lib, que le cache doit connaître aussi. Jamais commitées
 # (.gitignore) : ce sont les fichiers de la machine qui construit, copiés
 # de nouveau chaque fois que leur CONTENU change. Pas leur date : dpkg
 # garde celle de la construction du paquet, et une glibc installée par apt
@@ -356,8 +382,8 @@ $(LINUX)/tests/interpreteurs/gros: linux/tests/interpreteur-gros.asm
 #     révision, sans rien changer au format.
 # (GLIBC, GLIBC_HOTE et GLIBC_FICHIERS sont définis plus haut, avec LINUX :
 # make lit les prérequis d'une règle dès qu'il la rencontre.)
-COPIE_GLIBC = $(addprefix $(GLIBC_HOTE)/,$(GLIBC_FICHIERS)) racine/etc/ld.so.conf
-$(GLIBC)/.copiee: FORCE
+COPIE_GLIBC = $(addprefix $(GLIBC_HOTE)/,$(GLIBC_FICHIERS)) racine/etc/ld.so.conf $(LINUX)/libessai.so
+$(GLIBC)/.copiee: $(LINUX)/libessai.so FORCE
 	@empreinte=$$(sha256sum $(COPIE_GLIBC) | sha256sum | cut -d ' ' -f 1); \
 	test "$$(cat $@ 2>/dev/null)" != "$$empreinte" || exit 0; \
 	set -ex; \
@@ -366,8 +392,9 @@ $(GLIBC)/.copiee: FORCE
 	v2=$$($(GLIBC_HOTE)/ld-linux-x86-64.so.2 --version | sed -n '1s/.* \([0-9][0-9.]*[0-9]\)\.\{0,1\}$$/\1/p'); \
 	test -n "$$v1" && test "$$v1" = "$$v2" || { echo "ldconfig ($$v1) et ld-linux ($$v2) : deux glibc differentes"; exit 1; }; \
 	rm -rf $(GLIBC); \
-	mkdir -p $(GLIBC)/racine/usr/lib/x86_64-linux-gnu $(GLIBC)/racine/etc; \
+	mkdir -p $(GLIBC)/racine/usr/lib/x86_64-linux-gnu $(GLIBC)/racine/usr/local/lib $(GLIBC)/racine/etc; \
 	cp $(addprefix $(GLIBC_HOTE)/,$(GLIBC_FICHIERS)) $(GLIBC)/racine/usr/lib/x86_64-linux-gnu/; \
+	cp $(LINUX)/libessai.so $(GLIBC)/racine/usr/local/lib/; \
 	ln -s usr/lib $(GLIBC)/racine/lib; \
 	cp racine/etc/ld.so.conf $(GLIBC)/racine/etc/; \
 	/sbin/ldconfig -X -r $(GLIBC)/racine -C /etc/ld.so.cache -f /etc/ld.so.conf; \
@@ -424,7 +451,7 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
 # puis lance ce que dit son /etc/demarrage (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
 	sh archive.sh $@ archive.txt
@@ -506,7 +533,7 @@ SHELL = /bin/bash
 # sources, servirait sinon telle quelle à la construction suivante.
 .DELETE_ON_ERROR:
 
-tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments
+tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -521,6 +548,7 @@ tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/cla
 	./$(LINUX)/temps | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/fichiers | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/segments | tee /dev/stderr | (! grep -q ECHEC)
+	LD_LIBRARY_PATH=$(LINUX) ./$(LINUX)/dynamique | tee /dev/stderr | (! grep -q ECHEC)
 
 suite: $(SUITE)/.convertie
 

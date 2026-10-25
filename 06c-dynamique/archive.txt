@@ -14,6 +14,7 @@ file  /bin/sse             linux/construits/sse 755 0 0
 file  /bin/bonjour-c       linux/construits/bonjour-c 755 0 0
 file  /bin/bonjour-c-pie   linux/construits/bonjour-c-pie 755 0 0
 file  /bin/bonjour-c-dynamique linux/construits/bonjour-c-dynamique 755 0 0
+file  /bin/dynamique       linux/construits/dynamique 755 0 0
 file  /bin/memoire         linux/construits/memoire 755 0 0
 file  /bin/claude-version  linux/construits/claude-version 755 0 0
 file  /bin/temps           linux/construits/temps 755 0 0
@@ -62,7 +63,18 @@ dir   /usr/lib 755 0 0
 dir   /usr/lib/x86_64-linux-gnu 755 0 0
 file  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 glibc/racine/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 755 0 0
 file  /usr/lib/x86_64-linux-gnu/libc.so.6 glibc/racine/usr/lib/x86_64-linux-gnu/libc.so.6 755 0 0
+# Les quatre autres bibliothèques de claude, avec les droits d'Ubuntu.
+file  /usr/lib/x86_64-linux-gnu/libm.so.6 glibc/racine/usr/lib/x86_64-linux-gnu/libm.so.6 644 0 0
+file  /usr/lib/x86_64-linux-gnu/libpthread.so.0 glibc/racine/usr/lib/x86_64-linux-gnu/libpthread.so.0 644 0 0
+file  /usr/lib/x86_64-linux-gnu/libdl.so.2 glibc/racine/usr/lib/x86_64-linux-gnu/libdl.so.2 644 0 0
+file  /usr/lib/x86_64-linux-gnu/librt.so.1 glibc/racine/usr/lib/x86_64-linux-gnu/librt.so.1 644 0 0
 dir   /usr/lib64 755 0 0
 slink /usr/lib64/ld-linux-x86-64.so.2 ../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 777 0 0
 slink /lib                 usr/lib 777 0 0
 slink /lib64               usr/lib64 777 0 0
+# Une bibliothèque à nous, là où s'installe ce qui ne vient pas de la
+# distribution : linux/dynamique la charge par dlopen, ld-linux la trouve
+# par son cache (/usr/local/lib est dans ld.so.conf).
+dir   /usr/local 755 0 0
+dir   /usr/local/lib 755 0 0
+file  /usr/local/lib/libessai.so linux/construits/libessai.so 644 0 0

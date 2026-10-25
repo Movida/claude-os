@@ -102,5 +102,9 @@
 [noyau] interp-hors-fic : programme Linux refuse : chemin de l'interpreteur (PT_INTERP) hors du fichier
 [linux] interp-milieu : un zero au milieu du PT_INTERP, ld-linux lance quand meme (AT_BASE non nul) : ok.
 [noyau] interp-milieu : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] faute-libc : strlen(NULL), dans la glibc partagee.
+[noyau] faute-libc : segfault at 0x0 ip 
+ error 4 (pas de zone) dans libc.so.6[
+[noyau] faute-libc : termine, code de sortie 139 ; memoire rendue : ok.
 [linux] interp-gros : un interpreteur de 48 en-tetes de programme a tourne.
 [noyau] interp-gros : termine, code de sortie 0 ; memoire rendue : ok.
