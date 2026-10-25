@@ -1,0 +1,13 @@
+# Le système de fichiers en mémoire (le tmpfs de Linux) et la résolution des
+# chemins (le namei de Linux) : l'arborescence, les dossiers, les liens, les
+# droits Unix, l'index des pages de chaque fichier. Comme la carte des zones
+# (../zones) et les formats (../formats), une bibliothèque sans bibliothèque
+# standard (no_std), sans dépendance et sans `unsafe`, testée sur la machine
+# hôte (`make tests-hote`), puis compilée dans le noyau. Elle a besoin
+# d'`alloc` : les tables d'inodes, les dossiers et les index sont des `Vec`.
+[package]
+name = "fichiers"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

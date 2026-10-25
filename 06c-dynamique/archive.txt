@@ -1,0 +1,41 @@
+# L'archive de démarrage : ce que le noyau déballe dans son système de
+# fichiers (voir archive.sh pour le format, celui de gen_init_cpio). Les
+# programmes de /bin sont exécutés dans l'ordre où ils sont ici. Les
+# chemins sources sont relatifs au dossier de l'étape (make les construit
+# d'abord).
+
+# Les programmes, à root, exécutables par tous.
+dir   /bin 755 0 0
+file  /bin/bonjour.wasm    bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm 755 0 0
+file  /bin/lecteur.wasm    lecteur/target/wasm32-unknown-unknown/release/lecteur.wasm 755 0 0
+file  /bin/bonjour-asm     linux/construits/bonjour-asm 755 0 0
+file  /bin/pile            linux/construits/pile 755 0 0
+file  /bin/sse             linux/construits/sse 755 0 0
+file  /bin/bonjour-c       linux/construits/bonjour-c 755 0 0
+file  /bin/memoire         linux/construits/memoire 755 0 0
+file  /bin/claude-version  linux/construits/claude-version 755 0 0
+file  /bin/temps           linux/construits/temps 755 0 0
+# Celui-ci est à l'utilisateur 1000 : il vérifie qu'il ne peut pas écrire
+# son propre binaire pendant qu'il tourne (ETXTBSY), ce que les droits
+# d'un fichier de root refuseraient avant (EACCES).
+file  /bin/fichiers        linux/construits/fichiers 755 1000 1000
+file  /bin/arbre           linux/construits/arbre 755 0 0
+file  /bin/segments        linux/construits/segments 755 0 0
+
+# Quelques fichiers à lire : un texte, un second nom (un lien physique),
+# et des liens symboliques.
+dir   /etc 755 0 0
+file  /etc/bonjour.txt     racine/etc/bonjour.txt 644 0 0 /etc/salut.txt
+slink /etc/lien-bonjour    bonjour.txt 777 0 0
+# Un lien absolu : un programme WebAssembly ne doit pas pouvoir le suivre
+# (il sortirait de son dossier pré-ouvert, voir noyau/src/wasi.rs).
+slink /etc/lien-absolu     /etc/bonjour.txt 777 0 0
+
+# /tmp, ouvert à tous mais « sticky » : chacun n'y efface que ses fichiers.
+# Un fichier de root s'y trouve, que l'utilisateur 1000 ne doit pas pouvoir
+# effacer, bien qu'il puisse l'écrire (le test de linux/fichiers).
+dir   /tmp 1777 0 0
+file  /tmp/a-root          racine/etc/bonjour.txt 666 0 0
+# Le dossier personnel de l'utilisateur 1000, celui des programmes (HOME).
+dir   /home 755 0 0
+dir   /home/utilisateur 755 1000 1000

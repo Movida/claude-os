@@ -1,0 +1,45 @@
+# Le noyau : un programme Rust sans système d'exploitation en dessous.
+# Aucune dépendance : tout ce qui touche le matériel est écrit ici.
+[package]
+name = "noyau"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# L'interpréteur WebAssembly de l'étape 4, notre propre bibliothèque.
+wasm = { path = "../wasm" }
+# La lecture des formats de fichiers : l'archive de programmes (cpio), et
+# bientôt les exécutables ELF. Notre propre bibliothèque, sans unsafe.
+formats = { path = "../formats" }
+# La carte des zones des programmes, notre propre bibliothèque, sans
+# unsafe, testée sur l'hôte.
+zones = { path = "../zones" }
+# Le système de fichiers en mémoire (le tmpfs) et la résolution des
+# chemins, notre propre bibliothèque, sans unsafe, testée sur l'hôte.
+fichiers = { path = "../fichiers" }
+
+# Les scénarios de `make tests-qemu` : des versions du noyau qui
+# provoquent exprès une situation à tester (voir src/main.rs).
+[features]
+# Déborder de la pile du noyau : la page de garde doit l'arrêter.
+test-garde = []
+# Un noyau gonflé au-delà de 1 Mio : le chargeur doit le lire en entier,
+# chaque secteur à sa place.
+test-gros = []
+# Exécuter l'archive des programmes de test (fautifs, refusés...), puis
+# éteindre QEMU (isa-debug-exit).
+test-programmes = []
+# Afficher chaque appel système des programmes Linux, à la façon de strace
+# (make trace).
+trace = []
+
+# panic = "abort" : en cas de panique, pas de « déroulement » de la pile
+# (unwinding), qui demanderait une bibliothèque d'exécution qu'on n'a pas.
+# Le noyau affiche le message et arrête le processeur.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"     # Optimise pour la taille : moins de secteurs à lire au démarrage.
+debug = false

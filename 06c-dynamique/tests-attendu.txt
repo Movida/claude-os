@@ -1,0 +1,80 @@
+[linux] mmx-ecrit : mm0, mm7 et xmm0 remplis, arrondi x87 change.
+[linux] mmx-lit : registres x87, MMX et SSE a l'etat initial : ok.
+[noyau] mmx-lit : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] write(adresse du noyau) : -EFAULT, on continue.
+[linux] write(adresse non projetee) : -EFAULT, on continue.
+[linux] write(plage qui franchit la limite) : -EFAULT, on continue.
+[linux] write(plage a cheval sur une page absente) : -EFAULT, on continue.
+[noyau] appel systeme inconnu : 9999
+[linux] appel 9999 : -ENOSYS, on continue.
+[noyau] pointeurs : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] brk : tas agrandi de 3 pages, puis 2 x 100 Mio, plus que la machine : acceptes.
+[linux] brk : 1 Tio de plus, plus que toute la memoire : refuse.
+[linux] brk : tas reduit a 1 page, on touche une page retiree.
+[noyau] tas : segfault at 
+ error 4 (pas de zone) dans tas[401000+1000] (SIGSEGV)
+[noyau] tas : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] mprotect W+X : code ecrit puis execute (JIT) : ok.
+[linux] mprotect d'une page absente : -ENOMEM.
+[linux] mprotect PROT_NONE, puis lecture de la page.
+[noyau] mprotect : segfault at 
+ error 4 (acces interdit) dans mprotect[401000+1000] (SIGSEGV)
+[noyau] mprotect : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] ecrire-code : segfault at 0x401000 ip 0x40101f sp 
+ error 7 (acces interdit) dans ecrire-code[401000+1000] (SIGSEGV)
+[noyau] ecrire-code : termine, code de sortie 139 ; memoire rendue : ok.
+ error 15 (acces interdit) dans [pile][
+[noyau] executer-pile : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] lire-noyau : segfault at 0xffffffff80100000 ip 0x40101f sp 
+ error 5 (pas de zone) dans lire-noyau[401000+1000] (SIGSEGV)
+[noyau] lire-noyau : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] lire-zero : segfault at 0x0 ip 0x40101a sp 
+ error 4 (pas de zone) dans lire-zero[401000+1000] (SIGSEGV)
+[noyau] lire-zero : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] hlt : general protection fault ip 0x401018 sp 
+[noyau] hlt : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] int80 : int 0x80 : ABI 32 bits non prise en charge, ip 0x40101f dans int80[401000+1000] (SIGSEGV)
+[noyau] int80 : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] icebp : trap 
+[noyau] icebp : termine, code de sortie 13
+[linux] Test : pas-a-pas (TF) a travers un appel systeme.
+[noyau] pas-a-pas : trap debug (int1 ou pas-a-pas) ip 0x401023 sp 
+[noyau] pas-a-pas : termine, code de sortie 133 ; memoire rendue : ok.
+[linux] Test : mov ss, puis syscall, avec TF.
+[noyau] mov-ss : trap debug (int1 ou pas-a-pas) ip 
+[noyau] mov-ss : termine, code de sortie 133 ; memoire rendue : ok.
+[noyau] recursion : segfault at 0x7fffff7f
+ error 6 (pas de zone) dans recursion[401000+1000] (SIGSEGV)
+[noyau] recursion : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] zero : une page jamais ecrite se lit a zero.
+[linux] zero : getrandom y a ecrit (copie a l'ecriture faite par le noyau) : ok.
+[linux] zero : writev d'un tableau jamais ecrit : des morceaux vides, 0 octet.
+[linux] zero : la page de zeros est restee nulle : ok.
+[noyau] zero : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Test : pile de 7 Mio, puis de 9 Mio.
+[linux] Pile de 7 Mio : ok.
+[noyau] grande-pile : segfault at 
+ error 6 (pas de zone) dans grande-pile[401000+1000] (SIGSEGV)
+[noyau] grande-pile : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Pile executable (PT_GNU_STACK) : code pose sur la pile puis execute : ok.
+[noyau] pile-executable : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Test : 256 Mio de tas ecrits page par page.
+[noyau] oom : plus de memoire : tue, memoire virtuelle 
+ Kio (SIGKILL)
+[noyau] oom : termine, code de sortie 137 ; memoire rendue : ok.
+[noyau] boucle : temps de calcul depasse (1000 ms) (SIGXCPU)
+[noyau] boucle : termine, code de sortie 152 ; memoire rendue : ok.
+[linux] Test : brk qui grandit et recule sans fin.
+[noyau] brk-boucle : temps de calcul depasse (1000 ms) (SIGXCPU)
+[noyau] brk-boucle : termine, code de sortie 152 ; memoire rendue : ok.
+[noyau] wx : programme Linux refuse : segment 0 : inscriptible et executable (W+X)
+[noyau] derniere-page : programme Linux refuse : segment 0 : hors des adresses permises
+[noyau] et-dyn : programme Linux refuse : ELF ET_DYN : pas encore pris en charge
+[noyau] tronque : programme Linux refuse : fichier ELF tronque
+[linux] Bonjour depuis l'anneau 3
+[noyau] bonjour-asm : termine, code de sortie 42 ; memoire rendue : ok.
+[noyau] Fin des tests : extinction de QEMU.
+[linux] Test : lire une projection au-dela de la fin du fichier.
+[noyau] bus-fichier : bus error at 0x
+ error 4 (au-dela de la fin du fichier) dans bus-fichier[401000+1000] (SIGBUS)
+[noyau] bus-fichier : termine, code de sortie 135 ; memoire rendue : ok.
