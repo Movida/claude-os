@@ -278,3 +278,32 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   rend ce qui a été écrit pour un fichier, mais EFAULT pour une console
   (`iterate_tty_write` copie chaque morceau en entier). Un test de l'étape 5
   l'a rappelé.
+
+## Pièges rencontrés en 6c (25 octobre 2026)
+
+- **Trois relecteurs en même temps saturent la machine** (une charge de 16
+  sur 12 cœurs) : le démarrage passe de 3 à 15 s, et les délais fixes
+  (`DUREE`, les 2 s par défaut de `verifier.sh`) font échouer des commits
+  justes dans `verifier-historique.sh`. Relancer seul un commit en échec
+  avant d'y croire ; lancer la vérification de l'historique quand les
+  relecteurs ont fini.
+- **Un test qui écrit « ok » quoi qu'il arrive ne prouve rien** :
+  `interp-milieu` affichait sa ligne même sans ld-linux, et « la
+  bibliothèque n'est plus projetée » ne demandait qu'à ld-linux (dladdr).
+  Chaque vérification doit passer par ce que fait le NOYAU (AT_BASE dans
+  le vecteur auxiliaire, `madvise` qui rend ENOMEM), et doit échouer
+  quand on casse ce qu'elle vérifie : l'essayer sur une copie.
+- **make décide par les dates, dpkg garde celle de la construction du
+  paquet** : un fichier de la machine mis à jour par apt peut paraître
+  plus ancien que notre copie. Copier ce qui vient du système d'après une
+  empreinte du contenu, recalculée à chaque construction.
+- **Une vérification de version doit porter sur ce qui compte** : le
+  format du cache de ld-linux dépend de 2.39, pas de la révision d'Ubuntu
+  (2.39-0ubuntu8.9), et `ldconfig` est dans un autre paquet que libc6.
+- **Replier des fixups dans des commits que les suivants réécrivent** :
+  pour un commit dont les fichiers ne bougent plus ensuite, prendre la
+  version de la sauvegarde ; sinon, la sauvegarde moins le diff des
+  commits suivants (`diff -u` de leurs versions, puis `patch -R` sur la
+  sauvegarde), et finir à la main les morceaux refusés. Construire et
+  tester chaque état résolu ; l'arbre final doit être celui de la
+  sauvegarde (`git diff sauvegarde HEAD` vide).
