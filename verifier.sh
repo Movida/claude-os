@@ -25,7 +25,11 @@ for etape in [0-9][0-9]*-*/; do
         continue
     fi
     rm -f "$etape/serial.log"
-    timeout 2 qemu-system-x86_64 -drive format=raw,file="$etape/boot.bin" \
+    # Le temps laissé au démarrage : 2 s, ou ce que dit l'étape (`make
+    # duree`), quand elle a plus à faire (l'archive de l'étape 6, que le
+    # BIOS lit secteur par secteur, grossit à chaque sous-étape).
+    duree=$(make -s -C "$etape" duree 2>/dev/null) || duree=2
+    timeout "$duree" qemu-system-x86_64 -drive format=raw,file="$etape/boot.bin" \
         -display none -no-reboot -serial file:"$etape/serial.log" 2>/dev/null
     while IFS= read -r ligne; do
         if grep -qF -- "$ligne" "$etape/serial.log"; then
