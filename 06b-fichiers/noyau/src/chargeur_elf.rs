@@ -31,6 +31,7 @@ use core::fmt;
 
 use crate::espace_utilisateur;
 use crate::memoire::{self, Memoire};
+use crate::programmes::NomCourt;
 use formats::elf::{Entete, Executable, Plage};
 use zones::{Drapeaux, Droits, Nature, Zone};
 
@@ -108,7 +109,7 @@ pub fn verifier(taille: u64, lire: impl Fn(u64, &mut [u8]) -> bool) -> Result<(E
 /// ; `lire` lit le fichier (voir `verifier`). En cas d'échec (plus de
 /// mémoire), tout ce qui a été pris est rendu (l'espace est détruit en
 /// sortant de la fonction).
-pub fn charger(executable: &Executable, nom: &'static [u8], lire: impl Fn(u64, &mut [u8]) -> bool)
+pub fn charger(executable: &Executable, nom: NomCourt, lire: impl Fn(u64, &mut [u8]) -> bool)
     -> Result<Programme, espace_utilisateur::Erreur> {
     let mut memoire = Memoire::creer(nom)?;
     for segment in executable.segments() {

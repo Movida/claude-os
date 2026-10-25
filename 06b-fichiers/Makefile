@@ -214,16 +214,20 @@ $(LINUX)/tests/tronque: $(LINUX)/bonjour-asm
 	mkdir -p $(LINUX)/tests
 	head -c 40 $< > $@
 
+# L'archive des programmes de test : sa description est fabriquée ici, une
+# ligne par programme (voir archive.sh).
 tests.cpio: archive.sh $(addprefix $(LINUX)/tests/,$(TESTS_LINUX)) $(LINUX)/bonjour-asm
-	sh archive.sh $@ $(filter-out archive.sh,$^)
+	{ echo "dir /bin 755 0 0"; \
+	  for p in $(TESTS_LINUX); do echo "file /bin/$$p $(LINUX)/tests/$$p 755 0 0"; done; \
+	  echo "file /bin/bonjour-asm $(LINUX)/bonjour-asm 755 0 0"; } | sh archive.sh $@ -
 
 PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx bonjour-asm-pile-executable bonjour-c bonjour-c-deux-segments bonjour-c-pie bonjour-c-dynamique)
 
-# L'archive de programmes, que le noyau exécute dans l'ordre (voir
-# archive.sh).
-programmes.cpio: archive.sh $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps FORCE
+# L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
+# puis exécute les programmes de /bin dans l'ordre (voir archive.sh).
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps FORCE
 	cd bonjour && cargo build --release
-	sh archive.sh $@ $(BONJOUR) $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps
+	sh archive.sh $@ archive.txt
 
 FORCE:
 

@@ -28,11 +28,13 @@
 //!
 //! On ignore ce qui suit l'entrée de fin (des zéros de remplissage, en
 //! général). Ce qu'on ne fait pas encore : les archives concaténées
-//! (Linux lit ce qui suit la fin) et compressées, la marque « 070702 »
-//! (avec somme de contrôle), et les liens physiques (un fichier à
-//! plusieurs noms, dont GNU cpio n'écrit le contenu qu'avec le dernier ;
-//! les précédents apparaissent ici vides). Notre script de construction
-//! n'écrit rien de tout cela.
+//! (Linux lit ce qui suit la fin) et compressées, et la marque « 070702 »
+//! (avec somme de contrôle). Notre script de construction n'écrit ni l'un
+//! ni l'autre. Les liens physiques (un fichier à plusieurs noms : le même
+//! numéro d'inode, un nombre de liens d'au moins 2, et le contenu
+//! seulement dans la dernière de ses entrées, comme l'écrivent GNU cpio et
+//! le gen_init_cpio de Linux) sont lus tels quels : c'est à qui déballe
+//! l'archive de les relier (6b).
 
 use core::fmt;
 
@@ -56,25 +58,56 @@ const CHAMPS: [&str; 13] = [
     "inode", "mode", "uid", "gid", "liens", "date", "taille",
     "majeur", "mineur", "rmajeur", "rmineur", "taille du nom", "somme",
 ];
+const CHAMP_INODE: usize = 0;
 const CHAMP_MODE: usize = 1;
+const CHAMP_UID: usize = 2;
+const CHAMP_GID: usize = 3;
+const CHAMP_LIENS: usize = 4;
+const CHAMP_DATE: usize = 5;
 const CHAMP_TAILLE: usize = 6;
+const CHAMP_RMAJEUR: usize = 9;
+const CHAMP_RMINEUR: usize = 10;
 const CHAMP_TAILLE_NOM: usize = 11;
 
-/// Une entrée de l'archive : des tranches des octets de l'archive.
+const DOSSIER: u32 = 0o040000;
+const LIEN: u32 = 0o120000;
+
+/// Une entrée de l'archive : ses champs, et des tranches des octets de
+/// l'archive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Entree<'a> {
-    /// Le nom, sans le zéro final.
+    /// Le nom, sans le zéro final (un chemin, sans « / » au début chez
+    /// gen_init_cpio).
     pub nom: &'a [u8],
+    /// Le numéro d'inode dans l'archive : le même pour les liens physiques
+    /// d'un fichier.
+    pub inode: u32,
     /// Le type et les droits, comme st_mode.
     pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Le nombre de liens physiques.
+    pub liens: u32,
+    /// La date de modification, en secondes depuis 1970.
+    pub date: u32,
+    /// Le périphérique désigné, pour un nœud de périphérique.
+    pub rdev: (u32, u32),
+    /// Le contenu : celui d'un fichier, ou la cible d'un lien symbolique.
     pub contenu: &'a [u8],
 }
 
 impl Entree<'_> {
-    /// Un fichier ordinaire ? (Les autres : dossiers, liens symboliques,
-    /// périphériques, que le noyau ne sait pas encore créer.)
+    /// Un fichier ordinaire ?
     pub fn est_fichier(&self) -> bool {
         self.mode & TYPE == FICHIER
+    }
+
+    pub fn est_dossier(&self) -> bool {
+        self.mode & TYPE == DOSSIER
+    }
+
+    pub fn est_lien(&self) -> bool {
+        self.mode & TYPE == LIEN
     }
 }
 
@@ -164,6 +197,9 @@ impl<'a> Archive<'a> {
             champ(i)?;
         }
         let mode = champ(CHAMP_MODE)?;
+        let (inode, uid, gid, liens, date) =
+            (champ(CHAMP_INODE)?, champ(CHAMP_UID)?, champ(CHAMP_GID)?, champ(CHAMP_LIENS)?, champ(CHAMP_DATE)?);
+        let rdev = (champ(CHAMP_RMAJEUR)?, champ(CHAMP_RMINEUR)?);
         let taille = champ(CHAMP_TAILLE)? as usize;
         let taille_nom = champ(CHAMP_TAILLE_NOM)? as usize;
         if taille_nom == 0 || taille_nom > NOM_MAX {
@@ -189,7 +225,7 @@ impl<'a> Archive<'a> {
         // position suivante est alors hors de l'archive, et l'entrée
         // suivante sera « tronquée » (ou ce sera la fin).
         let suivante = aligner4(fin_contenu).ok_or(tronquee)?;
-        Ok((Entree { nom, mode, contenu }, suivante))
+        Ok((Entree { nom, inode, mode, uid, gid, liens, date, rdev, contenu }, suivante))
     }
 }
 
@@ -225,7 +261,13 @@ mod tests {
 
     /// Ajoute une entrée à l'archive en construction, comme ../archive.sh.
     fn ajouter(archive: &mut Vec<u8>, nom: &[u8], mode: u32, contenu: &[u8]) {
-        let champs = [1, mode, 0, 0, 1, 0, contenu.len() as u32, 0, 0, 0, 0, nom.len() as u32 + 1, 0];
+        ajouter_avec(archive, nom, [1, mode, 0, 0, 1, 0, 0, 0, 0, 0, 0], contenu);
+    }
+
+    /// Avec tous les champs : inode, mode, uid, gid, liens, date, (taille),
+    /// majeur, mineur, rmajeur, rmineur.
+    fn ajouter_avec(archive: &mut Vec<u8>, nom: &[u8], c: [u32; 11], contenu: &[u8]) {
+        let champs = [c[0], c[1], c[2], c[3], c[4], c[5], contenu.len() as u32, c[7], c[8], c[9], c[10], nom.len() as u32 + 1, 0];
         archive.extend_from_slice(MAGIQUE);
         for c in champs {
             archive.extend_from_slice(std::format!("{c:08X}").as_bytes());
@@ -268,8 +310,21 @@ mod tests {
         assert_eq!(entrees[0].contenu, b"\0asm\x01\0\0\0");
         assert!(entrees[0].est_fichier());
         assert_eq!(entrees[1].nom, b"bin");
-        assert!(!entrees[1].est_fichier());
+        assert!(!entrees[1].est_fichier() && entrees[1].est_dossier());
         assert_eq!(entrees[2].contenu, b"\x7fELF...");
+    }
+
+    #[test]
+    fn tous_les_champs() {
+        let mut a = Vec::new();
+        ajouter_avec(&mut a, b"dev/console", [7, 0o020620, 1000, 5, 2, 123, 0, 0, 0, 5, 1], &[]);
+        ajouter_avec(&mut a, b"lien", [8, 0o120777, 0, 0, 1, 0, 0, 0, 0, 0, 0], b"cible");
+        fin(&mut a);
+        let e = tout(&a).unwrap();
+        assert_eq!((e[0].inode, e[0].mode, e[0].uid, e[0].gid, e[0].liens, e[0].date, e[0].rdev), (7, 0o020620, 1000, 5, 2, 123, (5, 1)));
+        assert!(!e[0].est_fichier() && !e[0].est_dossier() && !e[0].est_lien());
+        assert!(e[1].est_lien());
+        assert_eq!(e[1].contenu, b"cible");
     }
 
     #[test]

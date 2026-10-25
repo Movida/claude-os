@@ -39,7 +39,7 @@
 use core::fmt;
 
 use crate::espace_utilisateur::{self, Erreur, EspaceUtilisateur};
-use crate::programmes::Nom;
+use crate::programmes::NomCourt;
 use zones::{Droits, Nature, Sens, Zone, Zones};
 
 const PAGE: u64 = 4096;
@@ -141,7 +141,7 @@ impl Echec {
 /// la volée...
 #[derive(Clone, Copy)]
 pub struct ZoneDuCode {
-    nom: &'static [u8],
+    nom: NomCourt,
     nature: Nature,
     debut: u64,
     taille: u64,
@@ -150,7 +150,7 @@ pub struct ZoneDuCode {
 impl fmt::Display for ZoneDuCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.nature {
-            Nature::Programme => write!(f, "{}", Nom(self.nom))?,
+            Nature::Programme => write!(f, "{}", self.nom)?,
             Nature::Tas => f.write_str("[tas]")?,
             Nature::Pile => f.write_str("[pile]")?,
             Nature::Anonyme => f.write_str("[anonyme]")?,
@@ -168,13 +168,13 @@ pub struct Memoire {
     /// zone du tas va de son début à la page qui contient sa fin.
     pub fin_tas: u64,
     /// Le nom du programme, pour les messages.
-    pub nom: &'static [u8],
+    pub nom: NomCourt,
 }
 
 impl Memoire {
     /// Une mémoire vide : pas de zones, un espace neuf. Le tas est placé
     /// par le chargeur.
-    pub fn creer(nom: &'static [u8]) -> Result<Memoire, Erreur> {
+    pub fn creer(nom: NomCourt) -> Result<Memoire, Erreur> {
         // La carte occupe d'emblée une page entière (170 zones), et
         // grandit en blocs de pages : le tas du noyau prend les blocs de
         // plus de 2 Kio directement à l'allocateur de pages, et les lui

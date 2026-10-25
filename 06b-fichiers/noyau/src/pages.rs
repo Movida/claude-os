@@ -314,6 +314,17 @@ pub fn references(cadre: u64) -> u32 {
 }
 
 
+/// Donne à l'allocateur la mémoire [debut, fin[ (alignés sur la page), qui
+/// ne servait plus à personne : l'archive de démarrage, une fois déballée
+/// (le `free_initrd_mem` de Linux). Elle compte désormais dans toute la
+/// mémoire.
+pub fn ajouter_memoire(debut: u64, fin: u64) {
+    let mut pages = PAGES.verrouiller();
+    let avant = pages.libres;
+    pages.ajouter_zone(debut, fin);
+    pages.total += pages.libres - avant;
+}
+
 /// Le nombre de pages libres.
 pub fn libres() -> usize {
     PAGES.verrouiller().libres

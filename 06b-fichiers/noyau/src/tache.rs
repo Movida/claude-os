@@ -41,7 +41,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use crate::interruptions::Cadre;
 use crate::linux::{self, Signal};
-use crate::programmes::Nom;
+use crate::programmes::NomCourt;
 use crate::verrou::Verrou;
 use crate::{cpu, gdt, horloge, pagination, processus};
 
@@ -137,7 +137,7 @@ static CODE_SORTIE: AtomicI32 = AtomicI32::new(0);
 /// noyau pour lui.)
 static EN_COURS: AtomicBool = AtomicBool::new(false);
 /// Son nom, pour les messages.
-static NOM: Verrou<&'static [u8]> = Verrou::new(&[]);
+static NOM: Verrou<NomCourt> = Verrou::new(NomCourt::VIDE);
 /// Le tic d'horloge de son départ.
 static DEPART: AtomicU64 = AtomicU64::new(0);
 /// Le programme est à tuer, faute de mémoire, dès qu'il retourne vers
@@ -162,7 +162,7 @@ const RFLAGS_INITIAL: u64 = 1 << 9 | 1 << 1;
 /// Exécute un programme : `pml4` son espace d'adressage, `entree` son point
 /// d'entrée, `pile` le sommet de sa pile. Revient quand il se termine, avec
 /// son code de sortie.
-pub fn executer(nom: &'static [u8], pml4: u64, entree: u64, pile: u64) -> i32 {
+pub fn executer(nom: NomCourt, pml4: u64, entree: u64, pile: u64) -> i32 {
     *NOM.verrouiller() = nom;
     let haut = &raw const __pile_programme_haut as u64;
     let cadre = (haut - size_of::<Cadre>() as u64) as *mut Cadre;
@@ -232,7 +232,7 @@ pub fn terminer(code: i32) -> ! {
 /// journal, puis le code de sortie 128 + signal.
 pub fn arreter(signal: Signal, raison: impl fmt::Display) -> ! {
     let nom = *NOM.verrouiller();
-    afficherln!("[noyau] {} : {} ({})", Nom(nom), raison, signal.nom);
+    afficherln!("[noyau] {} : {} ({})", nom, raison, signal.nom);
     terminer(128 + signal.numero as i32)
 }
 

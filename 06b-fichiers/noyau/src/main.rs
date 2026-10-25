@@ -50,6 +50,7 @@ mod tache;
 mod tas;
 mod temps;
 mod verrou;
+mod vfs;
 mod vga;
 mod wasi;
 
@@ -255,7 +256,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
     }
 
-    programmes::executer_archive();
+    programmes::demarrer();
 
     // Le scénario des programmes de test de `make tests-qemu` : une fois
     // l'archive exécutée, éteindre QEMU par son périphérique isa-debug-exit
