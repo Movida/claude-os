@@ -38,3 +38,6 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/evenements
 # /proc et /sys (6d) : ce qu'y lit Bun, maps, statm, exe, /proc/sys/vm, cpu/online.
 /bin/proc
+# Et le jalon de 6d : le vrai Claude Code, en dernier (ce qui précède a déjà
+# dit si le noyau va bien).
+/usr/local/bin/claude --version

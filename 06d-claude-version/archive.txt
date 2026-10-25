@@ -82,3 +82,7 @@ slink /lib64               usr/lib64 777 0 0
 dir   /usr/local 755 0 0
 dir   /usr/local/lib 755 0 0
 file  /usr/local/lib/libessai.so linux/construits/libessai.so 644 0 0
+# Claude Code lui-même (6d), en /usr/local/bin/claude : le Makefile ajoute
+# sa ligne, avec le chemin du binaire téléchargé (hors du dépôt, que cette
+# description ne peut pas nommer).
+dir   /usr/local/bin 755 0 0

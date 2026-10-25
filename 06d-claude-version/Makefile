@@ -18,13 +18,14 @@
 #                  et make qemu-disque, make qemu-options : la machine
 #                  (un disque virtio, un processeur Nehalem, 2 Gio)
 #   make debug  -> sans écran, journalise exceptions et reset du CPU dans qemu.log
-#   make capture -> démarre sans écran, puis enregistre l'écran dans ecran.png
+#   make capture -> démarre sans écran, et enregistre l'écran dans ecran.png
+#                  une fois claude terminé
 #   make gdb    -> QEMU figé au démarrage, en attente de GDB sur le port 1234
 #   make dump   -> affiche l'image octet par octet
 #   make trace  -> démarre un noyau qui affiche chaque appel système des
 #                  programmes Linux (comme strace), puis montre ceux de
-#                  bonjour-c-dynamique (ld-linux et la glibc partagée) sous
-#                  Linux, sur l'hôte, avec strace, pour comparer
+#                  claude --version, et leurs noms sous Linux, sur l'hôte,
+#                  avec strace, pour comparer
 #   make tests-qemu -> les scénarios dans QEMU : un noyau qui déborde exprès
 #                  de sa pile doit le dire (page de garde, double faute) ;
 #                  un noyau gonflé au-delà de 1 Mio doit être lu en entier
@@ -90,7 +91,7 @@ BONJOUR = bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm
 #     sans broncher 0x - 0xffffffff80100000, près de 2 Gio ;
 #   - l'archive va telle quelle au bout de l'image, complétée au secteur
 #     sur l'image elle-même : pas de copie intermédiaire (300 Mo de plus
-#     par image, quand l'archive portera claude).
+#     par image, depuis que l'archive porte claude).
 define image
 	objcopy -O binary $(1) $(3)-noyau.bin
 	truncate -s %512 $(3)-noyau.bin
@@ -547,12 +548,15 @@ $(CLAUDE):
 	echo "$(CLAUDE_SHA256)  $$tmp" | sha256sum -c --quiet && \
 	chmod 755 "$$tmp" && mv "$$tmp" $@
 
-# L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
-# puis lance ce que dit son /etc/demarrage (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc FORCE
+# L'archive de démarrage, décrite par archive.txt, et le binaire de claude
+# (son chemin est celui du cache, que la description ne peut pas nommer :
+# le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
+# son /etc/demarrage (voir archive.sh).
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc FORCE
+	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
-	sh archive.sh $@ archive.txt
+	{ cat archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } | sh archive.sh $@ -
 
 FORCE:
 
@@ -563,13 +567,14 @@ texte: boot.bin
 	$(QEMU) -display curses -serial file:serial.log
 
 # Le temps que met l'étape à démarrer et à exécuter toute son archive,
-# sous QEMU sans accélération, avec de la marge (le BIOS lit l'archive
-# secteur par secteur, et l'archive porte la glibc depuis 6c : de 1,3 à
-# 3,8 s mesurées ici sur une machine tranquille, contre 2,5 s en 6b ; mais
-# jusqu'à 14,6 s quand trois relectures se partageaient les 12 cœurs de la
-# machine, d'où la marge). verifier.sh le demande par `make duree` ; ne
+# sous QEMU sans accélération, avec de la marge. Depuis 6d, l'archive porte
+# claude (307 Mo) : lue en 3,8 s (sur un disque virtio), déballée en 1 s,
+# puis tous les programmes, claude --version compris (0,45 s), 7,9 s en
+# tout, mesurées sur une machine tranquille. En 6c, 3,8 s devenaient
+# 14,6 s quand trois relectures se partageaient les 12 cœurs de la
+# machine : d'où la marge. verifier.sh le demande par `make duree` ; ne
 # pas le lancer sur une machine saturée.
-DUREE = 12
+DUREE = 30
 
 duree:
 	@echo $(DUREE)
@@ -609,11 +614,12 @@ define attendre
 	$(4); kill $$q 2>/dev/null; wait $$q 2>/dev/null; grep -F -- $(3) $(2)
 endef
 
+# L'écran une fois claude terminé : la lecture de l'archive (3,8 s) le
+# laisserait sinon au chargeur.
 capture: boot.bin
 	rm -f $(MON) ecran.png
-	-timeout 3 $(QEMU) -display none -serial null \
-	  -monitor unix:$(MON),server,nowait & \
-	sleep 1.5; echo "screendump ecran.png -f png" | nc -U -q1 $(MON) >/dev/null; wait
+	$(call attendre,$(QEMU) -display none -serial file:capture.log -monitor unix:$(MON)$(,)server$(,)nowait,capture.log,"claude : termine",\
+	  echo "screendump ecran.png -f png" | nc -U -q1 $(MON) >/dev/null)
 	@ls ecran.png
 
 gdb: boot.bin
@@ -737,13 +743,29 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin
 	done
 
 # La trace des appels système : le noyau construit avec la fonctionnalité
-# trace (son propre dossier de compilation), l'archive ordinaire.
-trace: test-trace.bin
-	-timeout $(DUREE) qemu-system-x86_64 -display none -no-reboot -drive format=raw,file=test-trace.bin -serial file:trace.log
+# trace (son propre dossier de compilation), l'archive ordinaire, sur la
+# machine de l'étape. Celle de claude --version dans notre noyau (elle
+# n'affiche que des nombres : les registres de chaque appel), puis les
+# NOMS des appels du même claude sous Linux, sur l'hôte : jamais une trace
+# de claude qui pourrait contenir un jeton. Il est lancé sans
+# environnement (env -i), avec un HOME neuf et vide : il n'a rien à lire ;
+# la sortie de strace va dans un tuyau qui ne garde que le nom de chaque
+# appel (`-o /dev/fd/3`), jamais au terminal ; ce qu'écrit claude, à
+# /dev/null. Sous Linux, les horloges (clock_gettime...) passent par le
+# vDSO, sans appel système : notre trace en a de plus (pas de vDSO avant
+# 6m).
+trace: test-trace.bin $(CLAUDE)
+	-timeout $(DUREE) qemu-system-x86_64 -display none -no-reboot -drive format=raw,file=test-trace.bin,if=$(QEMU_DISQUE) \
+	  $(QEMU_OPTIONS) -serial file:trace.log
 	@echo "--- dans notre noyau ---"
-	@sed -n '/bonjour-c-dynam : programme/,/bonjour-c-dynam : termine/p' trace.log | grep -E '^\[(trace|linux)\]|bonjour-c-dynam :'
-	@echo "--- sous Linux, sur l'hote (strace) ---"
-	@strace ./$(LINUX)/bonjour-c-dynamique 2>&1 >/dev/null | grep -v "^execve"
+	@sed -n '/claude : programme/,/claude : termine/p' trace.log | grep -E '^\[(trace|linux)\]|claude :|Claude Code'
+	@echo "--- sous Linux, sur l'hote (strace : les noms des appels seulement) ---"
+	@command -v strace >/dev/null || { echo "strace manque (sudo apt install strace)"; exit 1; }
+	@vide=$$(mktemp -d); \
+	env -i HOME=$$vide strace -f -qq -o /dev/fd/3 $(CLAUDE) --version 3>&1 >/dev/null 2>&1 \
+	  | sed -nE 's/^([0-9]+ +)?([a-z0-9_]+)\(.*/\2/p'; code=$${PIPESTATUS[0]}; \
+	rm -rf $$vide; \
+	test $$code -eq 0 || { echo "strace ou claude : code $$code (ptrace refuse ?)"; exit 1; }
 
 test-trace.bin: programmes.cpio FORCE
 	cd noyau && cargo build --release --features trace --target-dir target/test-trace 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -765,7 +787,7 @@ test-%.bin: vide.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio vide.cpio tests-demarrage.txt serial.log trace.log qemu.log ecran.png test-*.log
+	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio vide.cpio tests-demarrage.txt serial.log trace.log capture.log qemu.log ecran.png test-*.log
 	rm -rf $(LINUX)
 	rm -rf $(GLIBC)
 	rm -rf $(SUITE)

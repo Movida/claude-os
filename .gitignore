@@ -6,6 +6,7 @@ serial.log
 garde.log
 test-*.log
 trace.log
+capture.log
 qemu.log
 ecran.png
 ecran.ppm
