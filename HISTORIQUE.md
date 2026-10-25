@@ -192,7 +192,35 @@ Dossier `06a-memoire/`, en dix commits (outillage compris) :
 
 **Relecture de fond :** un relecteur indépendant (aucun défaut grave ; deux écarts avec Linux corrigés : MADV_FREE refusé sur les pages du fichier, le .bss en zone anonyme ; la pile initiale quand arguments et environnement frôlent leurs 2 Mio ; deux commentaires), des cas provoqués (64 Mio à 5 Gio, interblocage, copie du noyau sans mémoire, écart de garde de la pile) et 24 000 opérations mémoire au hasard, identiques sous Linux et chez nous, avec qemu64 et `-cpu max`.
 
-## 15. Reste à faire
+## 15. Sous-étape 6b réalisée : les fichiers
+
+Dossier `06b-fichiers/`, en treize commits (et un d'outillage), d'après le plan écrit et relu au début de son fil (`plan-6b.md` dans les fichiers du projet) :
+
+1. **La bibliothèque des fichiers** (`fichiers/`, `no_std` sans `unsafe`, testée sur l'hôte) : le tmpfs de Linux (inodes dans une table à deux niveaux, dossiers lus du plus récent au plus ancien avec des positions stables, l'ordre de Linux 6.18), l'index des pages d'un fichier (un arbre à 512 branches, comme les tables de pages : un fichier creux ne coûte que ses pages écrites), la résolution des chemins (le `namei` de Linux, sans récursion, avec la résolution « sous » un dossier pour WASI). Chaque opération fait les vérifications de Linux dans son ordre, tout ou rien. Des milliers d'opérations au hasard comparées à un modèle naïf.
+2. **Un descripteur par cadre** (choix de conception) : 8 octets par cadre, la `struct page` de Linux réduite à l'état du buddy, un compteur de références, des drapeaux et les objets occupés d'une page du tas.
+3. **Le tas rend ses pages vides** (le `inuse` du slab), un point de « Reste à faire » devenu nécessaire : sans lui, le premier programme qui crée des fichiers aurait fait mentir « mémoire rendue ».
+4. **L'heure, de l'horloge CMOS**, lue une fois au démarrage, puis avancée avec les tics à leur durée exacte ; les horloges de `clock_gettime`.
+5. **Les exécutables lus par leurs en-têtes** : `formats::elf` vérifie une copie de l'en-tête et de la table, plus jamais le fichier entier (un point de « Reste à faire »).
+6. **Le système de fichiers en mémoire**, monté à la racine et déballé de l'archive cpio (liens physiques compris), `/dev` comme le devtmpfs ; les programmes sont les fichiers de `/bin`.
+7. **Les descripteurs de fichiers** : le fichier ouvert et la table de chaque processus, comme Linux ; une cinquantaine d'appels (open, read, write, lseek, stat, dup, fcntl, ioctl...) ; la console devient `/dev/console`.
+8. **L'arborescence par les appels système** : mkdir, liens, rename, getdents64, getcwd, chdir, truncate, chmod, chown, utimensat...
+9. **Les zones apprennent les fichiers** : une zone tient le fichier qu'elle projette, et les fusions suivent les pages du fichier.
+10. **mmap de fichiers, en privé** (choix de conception) : la page du fichier elle-même en lecture seule, copiée à la première écriture ; SIGBUS au-delà de la fin ; MADV_DONTNEED fait relire le fichier.
+11. **Le chargeur ELF projette le fichier** : il ne copie plus rien, les segments viennent à la faute ; le .bss aux règles de Linux.
+12. **WASI, les fichiers** : `path_open`, `fd_read`, `fd_readdir`..., chaque chemin enfermé sous le dossier pré-ouvert (EPERM, comme wasmtime). Le format natif de l'OS voit le même arbre que les programmes Linux.
+
+`linux/fichiers.c` vérifie près de deux cents comportements, dans notre noyau et sur l'hôte (`make tests-hote`), sans rien supposer du système de fichiers de l'hôte.
+
+**Une panne en route :** un test parti en boucle infinie a rempli toute la mémoire de WSL, qui s'est figé avec Docker et VS Code. Le conteneur est maintenant plafonné à 8 Go (commit d'outillage), et les tests qui peuvent s'emballer se lancent avec `ulimit -v` et `timeout`.
+
+**Relecture de fond :** trois relecteurs indépendants (la bibliothèque, les appels système, la mémoire avec ELF et WASI), chaque constat mesuré par une sonde C sur l'hôte et dans notre noyau. Le cœur mémoire tenait (aucun cadre rendu encore projeté, aucune fuite des octets d'après la fin d'un fichier) ; 29 constats corrigés, chacun avec un test, repliés dans leurs commits :
+- read et write qui font une faute au milieu du tampon rendent ce qu'ils ont transféré (les octets étaient écrits, l'appel disait EFAULT) ; la plage entière du tampon est vérifiée d'abord (access_ok), et la position plus la longueur reste sous 2^63 ;
+- un exécutable setgid créé dans le dossier setgid d'un groupe étranger perd son bit (la faille CVE-2018-13405) ; chown et utimensat suivent les règles de Linux pour les bits spéciaux et les dates ;
+- l'horloge CMOS est attendue 10 ms au plus (sans horloge, le démarrage se figeait) ;
+- la carte des zones ne double plus au-delà de son maximum (3 Mio au lieu de 4) ;
+- une vingtaine d'écarts de codes d'erreur ou d'ordre des vérifications (open, utimensat, fcntl et ses verrous, FIONREAD, lseek, readv, prlimit64...), et des commentaires devenus faux.
+
+## 16. Reste à faire
 
 **Dans le noyau**
 
@@ -205,24 +233,28 @@ Dossier `06a-memoire/`, en dix commits (outillage compris) :
 - **Copie de la moitié haute des espaces d'adressage** : elle suppose que la PML4 du noyau ne change plus. Avec `vmalloc`, créer d'avance toutes les tables de second niveau de la moitié haute (`preallocate_vmalloc_pages` de Linux).
 - **`iretq` qui fauterait** (un RIP non canonique écrit par le noyau, pour exec ou les signaux) : une entrée de la table d'exceptions qui transforme la faute en signal pour le programme (`bad_iret` de Linux). Inatteignable aujourd'hui : le RIP d'un cadre vient toujours du programme.
 - **Budget de temps au compteur de cycles** : compté en tics d'horloge, il se laisse un peu tromper sous QEMU sans accélération (tics perdus dans de courtes sections critiques). Avec une horloge fine (TSC, HPET), mesurer le temps réel.
-- **La carte des zones et la réserve** : la carte d'un programme vient du tas du noyau, qui peut puiser dans la réserve (2 à 3 Mio au plus) ; Linux prend ses `vm_area_struct` au-dessus du seuil. Avec les allocations faillibles.
+- **La carte des zones et la réserve** : la carte d'un programme vient du tas du noyau, qui peut puiser dans la réserve (3 Mio au plus, 5 le temps de l'agrandir) ; Linux prend ses `vm_area_struct` au-dessus du seuil. Avec les allocations faillibles.
 - **Le verrou du processus coupe les interruptions** : un munmap ou la fin d'un programme qui a touché des centaines de Mio rend ses cadres d'un trait, et des tics d'horloge se perdent. Avec l'ordonnanceur, un verrou qui dort (le `mmap_lock` de Linux).
-- **MADV_DONTNEED sur les pages du fichier** est sans effet, faute de fichier derrière : le vrai comportement (relire le fichier) avec le cache des pages (6b). De même MAP_SHARED, refusé jusque-là.
+- **MAP_SHARED d'un fichier** reste refusé : il faudra écrire les pages dans le fichier, et les retrouver dans chaque processus qui le projette (la carte inverse `i_mmap`, avec l'ordonnanceur, 6e). Pour la même raison, raccourcir un fichier ne retire ses pages que des projections du processus en cours.
+- **Les verrous de fichiers** (fcntl, flock) sont vérifiés mais toujours accordés : avec un seul processus, personne ne peut gêner. Une vraie table des verrous avec plusieurs processus (6k).
+- **Les limites de ressources** autres que celle des descripteurs sont gardées et rendues, pas appliquées (la pile reste à 8 Mio quoi qu'on demande).
+- **Un seul utilisateur** (1000, root pour le noyau), sans groupes supplémentaires ni setuid : `protected_symlinks` et `protected_regular` ne sont pas suivis, ils ne protégeraient de rien.
+- **Le siècle de l'horloge CMOS** est dans un registre que désigne la table ACPI FADT (6e) ; d'ici là, une année avant 70 est dans les années 2000, comme Linux.
+- **O_TMPFILE et RENAME_WHITEOUT** : refusés (EOPNOTSUPP, EINVAL) ; le premier pour des fichiers sans nom, le second pour overlayfs.
+- **La recherche d'un nom dans un dossier** parcourt ses entrées ; une table de hachage (le dcache de Linux) si une mesure le demande.
 - **Écarts voulus avec Linux**, écrits en commentaire : mprotect sur une plage avec un trou ne change rien (Linux change ce qui précède le trou) ; MAP_FIXED est refusé à une zone du maximum même quand les fusions l'auraient fait tenir ; une zone rendue inscriptible deux fois est recomptée (pas de VM_ACCOUNT).
-- **Lecture des formats** : `formats/` relit les octets après les avoir validés. Sans risque tant qu'ils viennent de l'archive en lecture seule ; valider une copie le jour où ils viendront d'une mémoire modifiable (le cache des fichiers, execve).
-- **Archive cpio** : liens physiques (nlink > 1, contenu dans la dernière entrée), archives concaténées et compressées.
-- **writev** : vérifier tous les morceaux avant d'écrire, comme Linux.
-- **Tas :** rendre au buddy les pages vides des classes ; des listes par processeur pour le multiprocesseur.
+- **Archive cpio** : archives concaténées et compressées.
+- **Tas :** des listes par processeur pour le multiprocesseur.
 
 **Pour le vrai matériel**
 
 - **NMI pendant le passage éclair en mode protégé du chargeur** : non masqué (Linux le masque par le port 0x70 pour son passage définitif). Risque infime, à revoir si un essai sur vrai matériel le montre.
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 16. Questions ouvertes
+## 17. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 17. Prochaine étape
+## 18. Prochaine étape
 
-Sous-étape 6b : un système de fichiers en mémoire (le tmpfs de Linux), déballé depuis l'archive, les descripteurs de fichiers, un compteur de références par cadre et le cache des pages, mmap de fichiers en privé (copie à l'écriture, qui donnera enfin à MADV_DONTNEED son vrai effet sur les segments), le chargeur ELF qui ne copie plus rien. Son plan sera écrit et relu au début de son fil, avec ce que 6a a appris.
+Sous-étape 6c : les programmes dynamiques. Le noyau charge l'interpréteur que demande un exécutable (PT_INTERP : ld-linux), qui projette lui-même la glibc partagée depuis le système de fichiers, avec mmap de fichiers et les appels qu'il lui faut. Son plan sera écrit et relu au début de son fil, avec ce que 6b a appris.
