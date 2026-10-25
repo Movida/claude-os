@@ -106,6 +106,19 @@ pub fn references(fichier: u32, delta: i32) {
     vfs::avec_systeme(|s, cadres| if delta > 0 { s.ouverts.prendre(f) } else { s.lacher(f, cadres) });
 }
 
+impl Drop for Memoire {
+    /// La fin de la mémoire d'un programme : chaque zone de fichier lâche
+    /// son fichier ouvert (ses pages sont rendues par l'espace, qui
+    /// disparaît ensuite).
+    fn drop(&mut self) {
+        for z in self.zones.zones() {
+            if let Some(p) = z.fichier {
+                references(p.fichier, -1);
+            }
+        }
+    }
+}
+
 impl From<zones::Erreur> for Erreur {
     fn from(e: zones::Erreur) -> Erreur {
         match e {
@@ -235,35 +248,46 @@ impl Memoire {
         if !permis {
             return Err(Echec::AccesInterdit);
         }
-        // Une zone de fichier dont la page n'est pas encore là : la page du
-        // fichier, en lecture seule (entree_finale), tenue une fois de plus.
-        // Puis, pour une écriture, la copie à l'écriture la remplace par une
-        // page à lui (le `do_cow_fault` de Linux, en deux temps).
-        if let Some(projection) = zone.fichier
-            && !self.espace.occupee(page)
-        {
-            let index = zone.page_de(page).unwrap_or(0);
-            let cadre = vfs::page_projetee(Fichier::de(projection.fichier), index)?;
-            self.espace.poser_fichier(page, cadre, zone.droits).map_err(|_| Echec::PlusDeMemoire)?;
-            if acces != Acces::Ecriture {
-                return Ok(());
-            }
+        if self.poser_page_du_fichier(page, &zone)? && acces != Acces::Ecriture {
+            return Ok(());
         }
         self.espace.servir(page, zone.droits, acces == Acces::Ecriture).map_err(|_| Echec::PlusDeMemoire)
     }
 
+    /// Dans une zone de fichier dont la page n'est pas encore là : la page
+    /// du fichier, en lecture seule (entree_finale), tenue une fois de plus.
+    /// Rend vrai si elle a été posée. Pour une écriture, la copie à
+    /// l'écriture la remplacera ensuite par une page à lui (le
+    /// `do_cow_fault` de Linux, en deux temps).
+    fn poser_page_du_fichier(&mut self, page: u64, zone: &Zone) -> Result<bool, Echec> {
+        let Some(projection) = zone.fichier else { return Ok(false) };
+        if self.espace.occupee(page) {
+            return Ok(false);
+        }
+        let index = zone.page_de(page).unwrap_or(0);
+        let cadre = vfs::page_projetee(Fichier::de(projection.fichier), index)?;
+        self.espace.poser_fichier(page, cadre, zone.droits).map_err(|_| Echec::PlusDeMemoire)?;
+        Ok(true)
+    }
+
     /// Écrit `octets` à l'adresse `adresse` du programme, par la projection
-    /// directe des cadres, en faisant d'abord venir chaque page (une page
-    /// neuve, à lui) : le noyau qui remplit les segments du programme ou sa
-    /// pile initiale. Les pages doivent être dans des zones, mais leurs
-    /// droits ne comptent pas (le noyau remplit ainsi du code en lecture
-    /// seule pour le programme).
+    /// directe des cadres, en faisant d'abord venir chaque page (une page à
+    /// lui, copie de celle du fichier dans une zone de fichier) : le noyau
+    /// qui remplit la pile initiale, ou met à zéro la fin d'un segment
+    /// (padzero, chargeur_elf.rs). Les pages doivent être dans des zones,
+    /// mais leurs droits ne comptent pas.
     pub fn ecrire(&mut self, adresse: u64, octets: &[u8]) -> Result<(), Erreur> {
         let fin = adresse.checked_add(octets.len() as u64).ok_or(Erreur::AdresseInterdite)?;
         let mut page = adresse & !(PAGE - 1);
         while page < fin {
-            let droits = self.zones.trouver(page).ok_or(Erreur::NonProjetee)?.droits;
-            self.espace.servir(page, droits, true)?;
+            let zone = *self.zones.trouver(page).ok_or(Erreur::NonProjetee)?;
+            // La page d'un fichier d'abord, puis sa copie : on n'écrit
+            // jamais dans le fichier (padzero).
+            self.poser_page_du_fichier(page, &zone).map_err(|e| match e {
+                Echec::PlusDeMemoire => Erreur::PlusDeMemoire,
+                _ => Erreur::NonProjetee,
+            })?;
+            self.espace.servir(page, zone.droits, true)?;
             page += PAGE;
         }
         self.espace.ecrire(adresse, octets)
@@ -344,11 +368,10 @@ impl Memoire {
 
     /// Retire les pages de [debut, fin[ sans toucher aux zones
     /// (MADV_DONTNEED) : elles se reliront à zéro, ou depuis le fichier
-    /// projeté. Les tables restent, la zone aussi. Sans effet sur un segment
-    /// du programme copié sans fichier derrière (voir madvise, dans
-    /// linux.rs).
+    /// projeté (les segments du programme compris). Les tables restent, la
+    /// zone aussi.
     pub fn oublier(&mut self, debut: u64, fin: u64) {
-        for z in self.zones.morceaux(debut, fin).filter(|z| z.fichier.is_some() || z.nature != Nature::Programme) {
+        for z in self.zones.morceaux(debut, fin) {
             self.espace.retirer_plage(z.debut, z.fin, false);
         }
     }

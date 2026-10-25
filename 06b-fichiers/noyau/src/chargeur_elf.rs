@@ -7,33 +7,43 @@
 //! des en-têtes de programme (`verifier`), comme `load_elf_phdrs` : la
 //! bibliothèque ne voit jamais le fichier entier, que le noyau lit par
 //! morceaux. Segments dans les adresses permises, croissants, sans page
-//! commune, jamais W+X. Chaque segment devient une
-//! zone de la mémoire du programme (memoire.rs), avec ses droits ; les
-//! pages qui contiennent une part du fichier reçoivent chacune un cadre
-//! neuf, mis à zéro, où l'on copie cette part. Le reste d'une telle page
-//! reste à zéro, et les pages entières du .bss (la partie d'un segment qui
-//! n'est pas dans le fichier) forment une zone anonyme, comme sous Linux,
-//! sans aucune page : la première faute leur donnera la page de zéros,
-//! puis une page neuve à la première écriture.
+//! commune, jamais W+X.
 //!
-//! Linux fait plus : il projette le FICHIER lui-même (mmap), et les pages
-//! du code ne sont lues qu'au premier accès. Il faut pour cela un cache
-//! des fichiers (6b). Copier d'avance ce qui vient du fichier coûte de la
-//! mémoire (le code de `claude` pèse près de 100 Mo) mais n'a besoin de
-//! rien d'autre.
+//! Comme Linux (`elf_map`, puis `elf_load`), le chargeur ne copie rien : il
+//! PROJETTE le fichier (6b). Chaque segment devient une zone de fichier,
+//! en privé, avec ses droits : ses pages sont celles du fichier, données à
+//! la faute, en lecture seule, et copiées à la première écriture (memoire.rs,
+//! espace_utilisateur.rs). Pour `claude` (291 Mo, dont 86 Mo de code),
+//! seul ce que le programme touche est en place, et une page de code est
+//! la même pour tous les programmes qui l'exécutent.
 //!
-//! La copie passe par la projection directe des cadres (voir
-//! Memoire::ecrire) : le noyau n'écrit jamais par les adresses du
-//! programme, il n'a donc rien à ouvrir côté SMAP (copie_utilisateur.rs).
+//! Le .bss : la partie d'un segment qui n'est pas dans le fichier, à zéro.
+//!   - la fin de la dernière page du fichier, au-delà de `p_filesz`,
+//!     contient les octets qui suivent dans le fichier : le noyau la met à
+//!     zéro (le `padzero` de Linux), seulement si le segment a un .bss
+//!     (`p_memsz > p_filesz`) et s'il est inscriptible (Linux ignore
+//!     l'échec sinon) ; c'est une écriture, donc une copie de cette seule
+//!     page ;
+//!   - les pages entières au-delà forment une zone anonyme, comme sous
+//!     Linux (`vm_brk_flags`) : en lecture et écriture, et exécutable si le
+//!     segment l'est, quels que soient ses autres droits.
+//! La différence compte : MADV_DONTNEED fait relire le FICHIER aux pages
+//! du segment, et des zéros à celles du .bss (le cas de Bun et de sa
+//! section `.bun`).
+//!
+//! Le noyau écrit (padzero, la pile initiale) par la projection directe
+//! des cadres (voir Memoire::ecrire) : il n'écrit jamais par les adresses
+//! du programme, il n'a donc rien à ouvrir côté SMAP (copie_utilisateur.rs).
 
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::descripteurs::Fichier;
 use crate::espace_utilisateur;
 use crate::memoire::{self, Memoire};
 use crate::programmes::NomCourt;
 use formats::elf::{Entete, Executable, Plage};
-use zones::{Drapeaux, Droits, Nature, Zone};
+use zones::{Drapeaux, Droits, Nature, Projection, Zone};
 
 /// Les adresses que les segments d'un programme ont le droit d'occuper,
 /// pour la vérification du fichier : celles des programmes (voir
@@ -105,46 +115,47 @@ pub fn verifier(taille: u64, lire: impl Fn(u64, &mut [u8]) -> bool) -> Result<(E
     Ok((entete, table))
 }
 
-/// Charge l'exécutable vérifié `executable` dans un espace d'adressage neuf
-/// ; `lire` lit le fichier (voir `verifier`). En cas d'échec (plus de
-/// mémoire), tout ce qui a été pris est rendu (l'espace est détruit en
-/// sortant de la fonction).
-pub fn charger(executable: &Executable, nom: NomCourt, lire: impl Fn(u64, &mut [u8]) -> bool)
-    -> Result<Programme, espace_utilisateur::Erreur> {
+/// Charge l'exécutable vérifié `executable`, du fichier ouvert `fichier`,
+/// dans un espace d'adressage neuf : chaque zone de segment tient le
+/// fichier (une référence). En cas d'échec (plus de mémoire), tout ce qui a
+/// été pris est rendu (l'espace et ses zones sont détruits en sortant de la
+/// fonction).
+pub fn charger(executable: &Executable, nom: NomCourt, fichier: Fichier) -> Result<Programme, espace_utilisateur::Erreur> {
     let mut memoire = Memoire::creer(nom)?;
     for segment in executable.segments() {
         let droits = Droits { lecture: true, ecriture: segment.ecriture, execution: segment.execution };
         let (debut, fin) = segment.pages();
         // Les pages qui contiennent une part du fichier : une zone du
-        // programme. Les pages entières du .bss, au-delà : une zone
-        // anonyme à part, comme Linux (vm_brk_flags dans load_elf_binary).
-        // La différence compte : sous Linux, MADV_DONTNEED fait relire le
-        // FICHIER aux premières, et des zéros aux secondes (voir madvise,
-        // dans linux.rs).
+        // fichier, à partir de la page qui contient `p_offset` (la
+        // bibliothèque a vérifié qu'il a la même place dans sa page que
+        // `p_vaddr`). Les pages entières du .bss, au-delà : une zone
+        // anonyme à part (voir l'en-tête).
         let fin_fichier = match segment.taille_fichier {
             0 => debut,
             n => (segment.adresse + n).next_multiple_of(4096),
         };
         let drapeaux = Drapeaux::default();
         if fin_fichier > debut {
-            let zone = Zone { debut, fin: fin_fichier, droits, nature: Nature::Programme, drapeaux, fichier: None };
+            let projection = Projection { fichier: fichier.numero(), page: segment.position / 4096 };
+            let zone = Zone { debut, fin: fin_fichier, droits, nature: Nature::Programme, drapeaux, fichier: Some(projection) };
             memoire.zones.inserer(zone, &mut memoire::references)?;
         }
         if fin > fin_fichier {
-            let zone = Zone { debut: fin_fichier, fin, droits, nature: Nature::Anonyme, drapeaux, fichier: None };
+            let bss = Droits { lecture: true, ecriture: true, execution: segment.execution };
+            let zone = Zone { debut: fin_fichier, fin, droits: bss, nature: Nature::Anonyme, drapeaux, fichier: None };
             memoire.zones.inserer(zone, &mut memoire::references)?;
         }
-        // La part du fichier, copiée par morceaux (la bibliothèque a
-        // vérifié qu'elle est dans le fichier).
-        let mut morceau = [0u8; 512];
-        let mut fait = 0;
-        while fait < segment.taille_fichier {
-            let n = (segment.taille_fichier - fait).min(morceau.len() as u64) as usize;
-            if !lire(segment.position + fait, &mut morceau[..n]) {
-                return Err(espace_utilisateur::Erreur::NonProjetee);
+        // padzero : la fin de la dernière page du fichier, s'il y a un .bss
+        // et que le segment est inscriptible.
+        let fin_contenu = segment.adresse + segment.taille_fichier;
+        if segment.taille > segment.taille_fichier && segment.ecriture && segment.taille_fichier > 0 && fin_contenu % 4096 != 0 {
+            let zeros = [0u8; 512];
+            let mut a = fin_contenu;
+            while a < fin_fichier {
+                let n = ((fin_fichier - a) as usize).min(zeros.len());
+                memoire.ecrire(a, &zeros[..n])?;
+                a += n as u64;
             }
-            memoire.ecrire(segment.adresse + fait, &morceau[..n])?;
-            fait += n as u64;
         }
     }
     // La pile : inscriptible, une zone qui grandit vers le bas. Aucune page

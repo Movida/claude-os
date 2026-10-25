@@ -686,16 +686,13 @@ fn mprotect(adresse: u64, longueur: u64, prot: u64) -> i64 {
 /// Les conseils :
 ///   - MADV_DONTNEED, MADV_DONTNEED_LOCKED : les pages sont retirées. Dans
 ///     une zone anonyme, elles se reliront à zéro ; dans une projection de
-///     fichier, le programme relira le FICHIER (ses copies privées sont
-///     perdues) : c'est ce que fait Bun, qui rend ainsi 54 Mo de sa propre
-///     section `.bun` (la trace de `claude --version`). Sans effet, encore,
-///     sur un segment du programme que le chargeur a copié sans fichier
-///     derrière (chargeur_elf.rs) : y mettre des zéros casserait le
-///     programme en silence ;
+///     fichier (les segments du programme compris, chargeur_elf.rs), le
+///     programme relira le FICHIER (ses copies privées sont perdues) :
+///     c'est ce que fait Bun, qui rend ainsi 54 Mo de sa propre section
+///     `.bun` (la trace de `claude --version`) ;
 ///   - MADV_FREE : de même (il permet de garder le contenu ou de le
 ///     perdre), mais seulement sur de la mémoire anonyme : EINVAL sur un
-///     fichier ou un segment du programme, comme Linux, avant de rien
-///     changer ;
+///     fichier, comme Linux, avant de rien changer ;
 ///   - MADV_WILLNEED, NORMAL, RANDOM, SEQUENTIAL, COLD, PAGEOUT, DONTDUMP,
 ///     DODUMP : des indications pour la mémoire d'échange, la lecture
 ///     anticipée ou les fichiers « core », que nous n'avons pas : acceptés,
@@ -707,7 +704,7 @@ fn mprotect(adresse: u64, longueur: u64, prot: u64) -> i64 {
 ///   - MADV_DONTFORK, DOFORK, WIPEONFORK, KEEPONFORK : des drapeaux de
 ///     zone, pour le futur fork (6k) ; ils coupent les zones, comme
 ///     mprotect. WIPEONFORK n'a de sens que pour la mémoire anonyme :
-///     EINVAL sur un segment du programme ;
+///     EINVAL sur un fichier ;
 ///   - MADV_MERGEABLE, UNMERGEABLE : EINVAL, comme un Linux sans KSM (la
 ///     fusion des pages identiques) ;
 ///   - MADV_HWPOISON, SOFT_OFFLINE (simuler une panne de mémoire) : EPERM,
@@ -757,7 +754,7 @@ fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
     let resultat = match conseil {
         DONTNEED | FREE | DONTNEED_LOCKED => processus::avec(|p| {
             let m = &mut p.memoire;
-            if conseil == FREE && m.zones.morceaux(debut, fin_zones).any(|z| z.fichier.is_some() || z.nature == Nature::Programme) {
+            if conseil == FREE && m.zones.morceaux(debut, fin_zones).any(|z| z.fichier.is_some()) {
                 return Err(-EINVAL);
             }
             m.oublier(debut, fin_zones);
@@ -774,7 +771,7 @@ fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
         },
         DONTFORK | DOFORK | WIPEONFORK | KEEPONFORK => processus::avec(|p| {
             let m = &mut p.memoire;
-            if conseil == WIPEONFORK && m.zones.morceaux(debut, fin_zones).any(|z| z.fichier.is_some() || z.nature == Nature::Programme) {
+            if conseil == WIPEONFORK && m.zones.morceaux(debut, fin_zones).any(|z| z.fichier.is_some()) {
                 return Err(-EINVAL);
             }
             m.zones

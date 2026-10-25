@@ -21,7 +21,7 @@ rendues et recollees : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
-[noyau] Archive deballee : dossiers 5, fichiers 12, liens symboliques 1, liens physiques 1 ; archive rendue (
+[noyau] Archive deballee : dossiers 5, fichiers 13, liens symboliques 1, liens physiques 1 ; archive rendue (
 [noyau] Programmes de /bin :
         bonjour.wasm                 2943 octets
         bonjour-asm
@@ -61,3 +61,5 @@ memoire rendue : ok.
 [linux] arbre : c 0620 1000 1000   5,   1 /dev/console
 [linux] arbre : c 0666    0    0   1,   3 /dev/null
 [noyau] arbre : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] segments : toutes les verifications : ok
+[noyau] segments : termine, code de sortie 0 ; memoire rendue : ok.

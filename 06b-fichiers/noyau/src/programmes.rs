@@ -16,6 +16,7 @@
 //! s'en charge. Le nom du fichier (son extension) ne compte pas.
 
 use crate::descripteurs::Descripteurs;
+use crate::memoire::Acces;
 use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, processus, tache, vfs, wasi};
 use fichiers::Identite;
 use alloc::vec::Vec;
@@ -180,8 +181,20 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
                     s.adresse, s.adresse + s.taille, 'r',
                     if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.taille_fichier);
     }
+    let identite = Identite { uid: pile::UTILISATEUR as u32, gid: pile::GROUPE as u32 };
+    if vfs::avec(|fs, _| fs.peut_executer(identite, n)).is_err() {
+        return afficherln!("[noyau] {} : pas le droit de l'executer (EACCES)", nom);
+    }
     let libres = pages::libres();
-    let mut programme = match chargeur_elf::charger(&executable, nom, lire) {
+    // Le fichier ouvert que projetteront ses segments : chaque zone le
+    // tiendra ; l'ouverture du chargeur est lâchée ensuite.
+    let fichier = match appels_fichiers::ouvrir_inode(n, chemin) {
+        Ok(f) => f,
+        Err(e) => return afficherln!("[noyau] {} : ouverture impossible (errno {})", nom, e.errno()),
+    };
+    let charge = chargeur_elf::charger(&executable, nom, fichier);
+    vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
+    let mut programme = match charge {
         Ok(p) => p,
         Err(e) => return afficherln!("[noyau] {} : chargement impossible : {}", nom, e),
     };
@@ -198,8 +211,11 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
             lire(s.position + decalage, &mut attendu[..longueur]).then_some(longueur)
         })
         .unwrap_or(0);
+    // La page du point d'entrée vient d'abord, comme le ferait la première
+    // instruction du programme (elle n'est en place qu'à la faute).
     let mut code = [0u8; 16];
-    let code_ok = programme.memoire.espace.lire(programme.entree, &mut code[..longueur]).is_ok()
+    let code_ok = programme.memoire.servir(programme.entree, Acces::Lecture).is_ok()
+        && programme.memoire.espace.lire(programme.entree, &mut code[..longueur]).is_ok()
         && code[..longueur] == attendu[..longueur];
     // Le tas commence à la page qui suit le dernier segment.
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
@@ -225,7 +241,6 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
         fs.prendre(r);
         r
     });
-    let identite = Identite { uid: pile::UTILISATEUR as u32, gid: pile::GROUPE as u32 };
     let (pml4, entree) = (programme.memoire.espace.pml4(), programme.entree);
     processus::installer(processus::Processus {
         memoire: programme.memoire,

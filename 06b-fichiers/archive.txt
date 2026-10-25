@@ -19,6 +19,7 @@ file  /bin/temps           linux/construits/temps 755 0 0
 # d'un fichier de root refuseraient avant (EACCES).
 file  /bin/fichiers        linux/construits/fichiers 755 1000 1000
 file  /bin/arbre           linux/construits/arbre 755 0 0
+file  /bin/segments        linux/construits/segments 755 0 0
 
 # Quelques fichiers à lire : un texte, un second nom (un lien physique),
 # et un lien symbolique.
