@@ -89,6 +89,12 @@
 [linux] xcpu-ignore : SIGXCPU ignore, limite courante relevee a 2 s apres 1 s de calcul : ok
 [noyau] xcpu-ignore : limite dure de temps de calcul atteinte (RLIMIT_CPU 2 s) (SIGKILL)
 [noyau] xcpu-ignore : termine, code de sortie 137 ; memoire rendue : ok.
+[linux] Test : futex WAIT sans delai, que personne ne reveillera.
+[noyau] futex-sans-fin : attente sans fin d'un futex : un seul fil, rien ne peut la terminer (SIGKILL)
+[noyau] futex-sans-fin : termine, code de sortie 137 ; memoire rendue : ok.
+[linux] Test : PR_SET_NAME, puis une faute.
+[noyau] nouveau-nom : segfault at 0x0 ip 
+[noyau] nom-faute : termine, code de sortie 139 ; memoire rendue : ok.
 [noyau] wx : programme Linux refuse : segment 0 : inscriptible et executable (W+X)
 [noyau] derniere-page : programme Linux refuse : segment 0 : hors des adresses permises
 [noyau] et-dyn : programme Linux (ELF ET_DYN), 

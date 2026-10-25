@@ -18,7 +18,8 @@
 //! l'heure (6b) : clock_gettime, clock_getres, gettimeofday, time ; et les
 //! fichiers (6b), dans appels_fichiers.rs ; et les signaux (6d), dans
 //! signaux.rs : rt_sigaction, rt_sigprocmask, rt_sigpending, sigaltstack,
-//! kill, tkill, tgkill.
+//! kill, tkill, tgkill ; et ce que `claude --version` demande encore (6d) :
+//! futex (futex.rs), uname, sched_getaffinity, sched_yield, prctl.
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -36,7 +37,7 @@ use crate::interruptions::Cadre;
 use crate::memoire::{self, Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Projection, Zone};
 use crate::appels_fichiers as f;
-use crate::{aleatoire, cpu, horloge, pages, processus, signaux, tache, temps};
+use crate::{aleatoire, cpu, futex, horloge, pages, processus, signaux, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
@@ -134,6 +135,11 @@ const CLOSE_RANGE: u64 = 436;
 const FACCESSAT2: u64 = 439;
 const SET_ROBUST_LIST: u64 = 273;
 const PRLIMIT64: u64 = 302;
+const SCHED_YIELD: u64 = 24;
+const UNAME: u64 = 63;
+const PRCTL: u64 = 157;
+const FUTEX: u64 = 202;
+const SCHED_GETAFFINITY: u64 = 204;
 const RT_SIGACTION: u64 = 13;
 const RT_SIGPROCMASK: u64 = 14;
 const KILL: u64 = 62;
@@ -202,6 +208,12 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         // par processeur. La glibc s'en passe si le noyau ne l'a pas.
         RSEQ => -ENOSYS,
         PRLIMIT64 => prlimit64(a[0], a[1], a[2], a[3]),
+        FUTEX => futex::futex(a[0], a[1], a[2], a[3], a[4], a[5]),
+        UNAME => uname(a[0]),
+        SCHED_GETAFFINITY => sched_getaffinity(a[0], a[1], a[2]),
+        // Céder le processeur : il n'y a personne d'autre à qui le donner.
+        SCHED_YIELD => 0,
+        PRCTL => prctl(a[0], a[1]),
         RT_SIGACTION => signaux::rt_sigaction(a[0], a[1], a[2], a[3]),
         RT_SIGPROCMASK => signaux::rt_sigprocmask(a[0], a[1], a[2], a[3]),
         RT_SIGPENDING => signaux::rt_sigpending(a[0], a[1]),
@@ -317,6 +329,11 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         SET_ROBUST_LIST => ("set_robust_list", 2),
         RSEQ => ("rseq", 4),
         PRLIMIT64 => ("prlimit64", 4),
+        FUTEX => ("futex", 6),
+        UNAME => ("uname", 1),
+        SCHED_GETAFFINITY => ("sched_getaffinity", 3),
+        SCHED_YIELD => ("sched_yield", 0),
+        PRCTL => ("prctl", 5),
         RT_SIGACTION => ("rt_sigaction", 4),
         RT_SIGPROCMASK => ("rt_sigprocmask", 4),
         RT_SIGPENDING => ("rt_sigpending", 2),
@@ -895,6 +912,98 @@ fn prlimit64(pid: u64, ressource: u64, nouvelle: u64, ancienne: u64) -> i64 {
         }
     }
     0
+}
+
+/// uname(tampon) : qui est le système, en six chaînes de 65 octets (la
+/// `struct new_utsname`). On annonce la version de Linux dont on imite le
+/// comportement (6.18, celle des sondes de chaque sous-étape), suivie de
+/// qui l'a construit, comme le fait WSL (« 6.18.33.2-microsoft-standard-
+/// WSL2 », mesuré) : les programmes testent `sysname` et lisent `release`
+/// pour choisir des fonctions. Le nom de la machine et le domaine :
+/// « (none) », ceux de Linux tant que personne n'a appelé `sethostname`
+/// (UTS_NODENAME) ; notre lanceur, qui tient le rôle d'init, n'a aucune
+/// raison de le faire.
+fn uname(tampon: u64) -> i64 {
+    const CHAMPS: [&[u8]; 6] = [b"Linux", b"(none)", b"6.18.0-claude-os", b"#1", b"x86_64", b"(none)"];
+    let mut u = [0u8; 6 * 65];
+    for (i, champ) in CHAMPS.iter().enumerate() {
+        u[i * 65..i * 65 + champ.len()].copy_from_slice(champ);
+    }
+    match copier_vers_utilisateur(tampon, &u) {
+        Ok(()) => 0,
+        Err(_) => -EFAULT,
+    }
+}
+
+/// Le masque des processeurs du noyau, en octets (le `cpumask_size` de
+/// Linux) : un `unsigned long` suffit jusqu'à 64 processeurs.
+const MASQUE_PROCESSEURS: u64 = 8;
+
+/// sched_getaffinity(pid, longueur, masque) : sur quels processeurs le
+/// programme peut tourner. Un seul processeur, le 0 (pas de multiprocesseur
+/// dans l'étape 6). Dans l'ordre de Linux : la longueur d'abord (au moins
+/// le masque du noyau, et un multiple de 8 : EINVAL, avant même de chercher
+/// le processus), puis le processus (0 ou le nôtre, sinon ESRCH) ; on écrit
+/// au plus le masque du noyau, et on rend sa taille (mesuré : 8 sur une
+/// machine de 12 processeurs, autant que pour un).
+fn sched_getaffinity(pid: u64, longueur: u64, masque: u64) -> i64 {
+    let longueur = longueur as u32 as u64;
+    if longueur < MASQUE_PROCESSEURS || longueur % 8 != 0 {
+        return -EINVAL;
+    }
+    let pid = pid as u32 as i32;
+    if pid != 0 && pid as i64 != self::pid() {
+        return -ESRCH;
+    }
+    match copier_vers_utilisateur(masque, &1u64.to_le_bytes()) {
+        Ok(()) => MASQUE_PROCESSEURS as i64,
+        Err(_) => -EFAULT,
+    }
+}
+
+/// prctl(option, argument, ...) : des réglages du processus. Ceux que
+/// demandent nos programmes :
+///   - PR_SET_NAME, PR_GET_NAME : le nom du programme, 15 octets au plus
+///     (le `comm` de Linux), celui que portent les messages du noyau ;
+///   - PR_SET_VMA (nommer une zone, « JSJITCode » pour Bun) : EINVAL, comme
+///     un Linux construit sans CONFIG_ANON_VMA_NAME (celui de la trace de
+///     claude --version, qui continue sans) ; il faudrait un nom par zone
+///     dans zones/, comparé à chaque fusion : utile au débogage, pas à
+///     claude.
+/// Le reste : EINVAL, comme Linux pour une option qu'il ne connaît pas, et
+/// un message.
+fn prctl(option: u64, argument: u64) -> i64 {
+    const PR_SET_NAME: u64 = 15;
+    const PR_GET_NAME: u64 = 16;
+    const PR_SET_VMA: u64 = 0x5356_4d41;
+    match option as u32 as u64 {
+        PR_SET_NAME => {
+            // strncpy_from_user de 15 octets au plus, jusqu'au premier zéro.
+            let mut nom = [0u8; 15];
+            let lus = crate::copie_utilisateur::copier_depuis_utilisateur_partiel(&mut nom, argument);
+            let nom = &nom[..lus];
+            let fin = nom.iter().position(|&o| o == 0);
+            if fin.is_none() && lus < 15 {
+                return -EFAULT;
+            }
+            tache::renommer(crate::programmes::NomCourt::de(&nom[..fin.unwrap_or(lus)]));
+            0
+        }
+        PR_GET_NAME => {
+            let mut nom = [0u8; 16];
+            let n = tache::nom();
+            nom[..n.octets().len()].copy_from_slice(n.octets());
+            match copier_vers_utilisateur(argument, &nom) {
+                Ok(()) => 0,
+                Err(_) => -EFAULT,
+            }
+        }
+        PR_SET_VMA => -EINVAL,
+        o => {
+            afficherln!("[noyau] prctl : option {:#x} pas prise en charge", o);
+            -EINVAL
+        }
+    }
 }
 
 /// getrandom(tampon, nombre, options) : des octets aléatoires, de la même

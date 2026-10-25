@@ -251,17 +251,52 @@ pub fn arreter_plus_de_memoire() -> ! {
     )
 }
 
+/// Le nom du programme en cours (PR_GET_NAME).
+pub fn nom() -> NomCourt {
+    *NOM.verrouiller()
+}
+
+/// Change le nom du programme en cours (PR_SET_NAME) : celui des messages
+/// du noyau, comme le `comm` de Linux, que montre aussi son tueur OOM.
+pub fn renommer(nom: NomCourt) {
+    *NOM.verrouiller() = nom;
+}
+
+/// Le programme en cours dort-il (un futex qui attend son délai) ? Ce
+/// temps-là n'est pas du calcul.
+static DORT: AtomicBool = AtomicBool::new(false);
+
 /// Un tic a été compté depuis la dernière vérification de RLIMIT_CPU.
 static TEMPS_A_VERIFIER: AtomicBool = AtomicBool::new(false);
 
 /// Appelée à chaque tic d'horloge, interruptions coupées : le programme en
-/// cours, s'il y en a un, a calculé un tic de plus, et sa limite de temps
-/// de calcul sera vérifiée à son retour vers l'anneau 3.
+/// cours, s'il y en a un et qu'il ne dort pas, a calculé un tic de plus, et
+/// sa limite de temps de calcul sera vérifiée à son retour vers l'anneau 3.
 pub fn tic() {
-    if EN_COURS.load(Ordering::Relaxed) {
+    if EN_COURS.load(Ordering::Relaxed) && !DORT.load(Ordering::Relaxed) {
         CALCUL.fetch_add(1, Ordering::Relaxed);
         TEMPS_A_VERIFIER.store(true, Ordering::Relaxed);
     }
+}
+
+/// Le programme en cours dort, dans un appel système, jusqu'à ce que
+/// `fini` le dise (vérifié à chaque interruption) : `sti ; hlt` entre deux,
+/// et ce temps ne compte pas dans son temps de calcul. Sans ordonnanceur
+/// (6e), le processeur n'a rien d'autre à faire : il attend.
+pub fn dormir_jusqu_a(fini: impl Fn() -> bool) {
+    DORT.store(true, Ordering::Relaxed);
+    loop {
+        // Vérifier interruptions coupées, puis dormir : voir pourquoi dans
+        // cpu::attendre_interruption.
+        cpu::couper_interruptions();
+        if fini() {
+            break;
+        }
+        cpu::attendre_interruption();
+    }
+    DORT.store(false, Ordering::Relaxed);
+    // Un appel système s'exécute interruptions actives.
+    cpu::activer_interruptions();
 }
 
 /// Le temps de calcul du programme en cours, en tics

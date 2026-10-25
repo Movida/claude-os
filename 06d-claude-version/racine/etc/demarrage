@@ -32,3 +32,5 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/segments
 # Les signaux (6d) : enregistrés et rendus comme Linux, pas encore livrés.
 /bin/signaux
+# Les petits appels de claude (6d) : uname, sched_getaffinity, futex, prctl.
+/bin/systeme

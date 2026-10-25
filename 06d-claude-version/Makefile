@@ -45,7 +45,8 @@
 #                  linux/temps (les horloges) et linux/fichiers (nos codes
 #                  d'erreur des fichiers doivent être ceux de Linux), et
 #                  linux/dynamique (ld-linux, la glibc partagée, dlopen),
-#                  et linux/signaux (nos codes d'erreur des signaux)
+#                  linux/signaux (nos codes d'erreur des signaux) et
+#                  linux/systeme (uname, futex, prctl...)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -121,7 +122,9 @@ boot.bin: programmes.cpio FORCE
 #     fichier (MADV_DONTNEED relit le fichier) ; sur l'hôte aussi ;
 #   - signaux : gcc -static, les signaux enregistrés (rt_sigaction,
 #     rt_sigprocmask, sigaltstack, kill...) contre ce qu'en fait Linux ;
-#     sur l'hôte aussi.
+#     sur l'hôte aussi ;
+#   - systeme : gcc -static, les petits appels de claude (uname,
+#     sched_getaffinity, futex, prctl) ; sur l'hôte aussi.
 # Pour les tests du lecteur ELF sur l'hôte, des variantes qu'il doit
 # accepter : bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -200,6 +203,10 @@ $(LINUX)/signaux: linux/signaux.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
+$(LINUX)/systeme: linux/systeme.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
 $(LINUX)/bonjour-c-deux-segments: linux/bonjour.c
 	mkdir -p $(LINUX)
 	gcc -static -Wl,-z,noseparate-code $(CFLAGS_LINUX) $< -o $@
@@ -241,7 +248,10 @@ $(LINUX)/dynamique: linux/dynamique.c
 # action par défaut), un gestionnaire que le noyau n'appelle pas encore
 # (sig-gestion, et sig-faute pour une faute : arrêtés, le message le dit,
 # alors que Linux appelle le gestionnaire), SIGXCPU ignoré jusqu'à la
-# limite dure (xcpu-ignore : SIGKILL) ; puis des
+# limite dure (xcpu-ignore : SIGKILL) ; un futex attendu sans délai, que
+# rien ne peut réveiller (futex-sans-fin : arrêté, le message le dit), un
+# programme qui change de nom (PR_SET_NAME) puis fait une faute
+# (nom-faute : le message porte le nouveau nom) ; puis des
 # exécutables que le noyau doit refuser :
 #   - wx : un segment W+X (ld -N) ;
 #   - derniere-page : des segments dans les dernières pages de la moitié
@@ -259,7 +269,7 @@ $(LINUX)/dynamique: linux/dynamique.c
 # montrer que le noyau exécute encore des programmes après tout cela.
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle calcul-long limite-egale \
-              sig-term sig-abort sig-gestion sig-faute xcpu-ignore \
+              sig-term sig-abort sig-gestion sig-faute xcpu-ignore futex-sans-fin nom-faute \
               wx derniere-page et-dyn tronque bus-fichier faute-libc
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
@@ -269,7 +279,8 @@ $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
 $(LINUX)/tests/%: $(LINUX)/tests/%.o
 	ld -o $@ $<
 
-# Les programmes de test écrits en C (sig-*, xcpu-ignore), statiques
+# Les programmes de test écrits en C (sig-*, xcpu-ignore, futex-sans-fin,
+# nom-faute), statiques
 # comme bonjour-c. (Une règle explicite l'emporte : faute-libc et les
 # interp-* ont la leur.)
 $(LINUX)/tests/%: linux/tests/%.c
@@ -476,7 +487,7 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
 # puis lance ce que dit son /etc/demarrage (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux FORCE
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme FORCE
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
 	sh archive.sh $@ archive.txt
@@ -559,7 +570,7 @@ SHELL = /bin/bash
 .DELETE_ON_ERROR:
 
 tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
-            $(LINUX)/signaux
+            $(LINUX)/signaux $(LINUX)/systeme
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -576,6 +587,7 @@ tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/cla
 	./$(LINUX)/segments | tee /dev/stderr | (! grep -q ECHEC)
 	LD_LIBRARY_PATH=$(LINUX) ./$(LINUX)/dynamique | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/signaux | tee /dev/stderr | (! grep -q ECHEC)
+	./$(LINUX)/systeme | tee /dev/stderr | (! grep -q ECHEC)
 
 suite: $(SUITE)/.convertie
 

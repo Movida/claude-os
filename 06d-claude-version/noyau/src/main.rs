@@ -34,6 +34,7 @@ mod descripteurs;
 mod espace;
 mod espace_utilisateur;
 mod faute_de_page;
+mod futex;
 mod gdt;
 mod horloge;
 mod interruptions;
