@@ -2,8 +2,8 @@
 # Fabrique l'archive que le chargeur dépose à côté du noyau : une archive
 # cpio au format « newc », celui de l'initramfs de Linux (voir
 # formats/src/cpio.rs pour le format, et pourquoi lui). Le noyau la
-# déballe dans son système de fichiers en mémoire (6b), puis exécute les
-# programmes de /bin, dans l'ordre de l'archive.
+# déballe dans son système de fichiers en mémoire (6b), puis lance ce que
+# dit son /etc/demarrage (6c).
 #
 #   sh archive.sh SORTIE DESCRIPTION
 #

@@ -78,3 +78,13 @@
 [noyau] bus-fichier : bus error at 0x
  error 4 (au-dela de la fin du fichier) dans bus-fichier[401000+1000] (SIGBUS)
 [noyau] bus-fichier : termine, code de sortie 135 ; memoire rendue : ok.
+[wasm] lecteur : argc = 1, argv = /bin/lecteur.wasm
+[wasm] lecteur : aucun dossier pre-ouvert.
+[noyau] lecteur.wasm : termine, code de sortie 0
+[noyau] /etc/demarrage, ligne 2 : refusee : guillemet non ferme
+[noyau] /etc/demarrage, ligne 3 : refusee : --dir= pour un programme Linux
+[noyau] /etc/demarrage, ligne 4 : refusee : le programme doit etre donne par son chemin absolu
+[noyau] /etc/demarrage, ligne 5 : refusee : /bin/absent : introuvable (errno 2)
+[noyau] bin : pas le droit de l'executer (errno 13)
+[noyau] /etc/demarrage, ligne 7 : refusee : /bin/bonjour-asm/ : introuvable (errno 20)
+[noyau] demarrage : pas le droit de l'executer (errno 13)

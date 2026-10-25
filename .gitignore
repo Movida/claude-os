@@ -1,6 +1,7 @@
 # Fichiers générés par les Makefile
 *.bin
 *.cpio
+tests-demarrage.txt
 serial.log
 garde.log
 test-*.log

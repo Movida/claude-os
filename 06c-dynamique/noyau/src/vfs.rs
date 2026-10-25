@@ -173,9 +173,6 @@ pub struct Bilan {
     pub liens_physiques: usize,
     /// Les entrées refusées (le noyau a dit pourquoi).
     pub refusees: usize,
-    /// Les programmes de /bin, dans l'ordre de l'archive : leur inode (tenu
-    /// une fois, à lâcher après usage) et leur chemin.
-    pub programmes: Vec<(Numero, Vec<u8>)>,
 }
 
 /// Une date de l'archive (en secondes).
@@ -287,13 +284,8 @@ fn deballer_entree(entree: &formats::cpio::Entree, chemin: &[u8], vus: &mut Vec<
         }
         Ok(Some(n))
     })?;
-    // Un nom que l'archive répète : le dernier compte, comme pour Linux. Si
-    // l'ancien était un programme, il sort de la liste, et sa référence
-    // est rendue (voir plus bas).
-    if let Some(i) = bilan.programmes.iter().position(|(_, c)| c.as_slice() == chemin) {
-        let (ancien, _) = bilan.programmes.remove(i);
-        avec(|fs, cadres| fs.lacher(ancien, cadres));
-    }
+    // (Un nom que l'archive répète : le dernier compte, comme pour Linux ;
+    // l'ancien a été effacé plus haut.)
     let Some(n) = numero else { return Ok(()) };
     // Le contenu d'un fichier, page à page, en rendant le verrou entre
     // deux : copier des centaines de Mio d'un coup, interruptions coupées,
@@ -306,21 +298,7 @@ fn deballer_entree(entree: &formats::cpio::Entree, chemin: &[u8], vus: &mut Vec<
             fait += ecrits;
         }
     }
-    avec(|fs, _| proprietes(fs, n, entree, maintenant))?;
-    // Les programmes : les fichiers ordinaires de /bin, dans l'ordre de
-    // l'archive. La liste tient chaque inode (une poignée tient une
-    // référence, tmpfs.rs) dès qu'il y entre : sinon, un nom répété
-    // effacerait le fichier d'avant, qui disparaîtrait et laisserait son
-    // numéro au suivant (la liste désignerait alors un autre fichier).
-    if entree.mode & S_IFMT == S_IFREG && chemin.starts_with(b"/bin/") && !chemin[5..].contains(&b'/') {
-        let mut copie = Vec::new();
-        copie.try_reserve_exact(chemin.len()).map_err(|_| Erreur::ENOMEM)?;
-        copie.extend_from_slice(chemin);
-        bilan.programmes.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
-        avec(|fs, _| fs.prendre(n));
-        bilan.programmes.push((n, copie));
-    }
-    Ok(())
+    avec(|fs, _| proprietes(fs, n, entree, maintenant))
 }
 
 /// Le propriétaire, les droits et la date de l'archive (dans cet ordre :

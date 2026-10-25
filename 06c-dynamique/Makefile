@@ -203,8 +203,10 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 #     basse (là où est la pile, et dans la page interdite) ;
 #   - et-dyn : un exécutable indépendant de la position (ld -pie) ;
 #   - tronque : les 40 premiers octets d'un exécutable.
-# Enfin bonjour-asm, pour montrer que le noyau exécute encore des
-# programmes après tout cela.
+# Puis le lanceur (/etc/demarrage) : lecteur.wasm sans dossier pré-ouvert
+# (il doit le dire) ; ses lignes refusées, chacune avec son numéro, sont
+# en tête du fichier (voir tests-demarrage.txt). Enfin bonjour-asm, pour
+# montrer que le noyau exécute encore des programmes après tout cela.
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle \
               wx derniere-page et-dyn tronque bus-fichier
@@ -236,17 +238,43 @@ $(LINUX)/tests/tronque: $(LINUX)/bonjour-asm
 	head -c 40 $< > $@
 
 # L'archive des programmes de test : sa description est fabriquée ici, une
-# ligne par programme (voir archive.sh).
-tests.cpio: archive.sh $(addprefix $(LINUX)/tests/,$(TESTS_LINUX)) $(LINUX)/bonjour-asm
+# ligne par programme (voir archive.sh), avec son /etc/demarrage
+# (tests-demarrage.txt), qui les lance l'un après l'autre.
+LECTEUR = lecteur/target/wasm32-unknown-unknown/release/lecteur.wasm
+tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_LINUX)) $(LINUX)/bonjour-asm FORCE
+	cd lecteur && cargo build --release
 	{ echo "dir /bin 755 0 0"; \
 	  for p in $(TESTS_LINUX); do echo "file /bin/$$p $(LINUX)/tests/$$p 755 0 0"; done; \
-	  echo "file /bin/bonjour-asm $(LINUX)/bonjour-asm 755 0 0"; } | sh archive.sh $@ -
+	  echo "file /bin/lecteur.wasm $(LECTEUR) 755 0 0"; \
+	  echo "file /bin/bonjour-asm $(LINUX)/bonjour-asm 755 0 0"; \
+	  echo "dir /etc 755 0 0"; \
+	  echo "file /etc/demarrage tests-demarrage.txt 644 0 0"; } | sh archive.sh $@ -
+
+# Le /etc/demarrage des tests : d'abord les lignes que le lanceur doit
+# refuser, chacune à un numéro qui ne bouge pas quand on ajoute des
+# programmes (ligne 2 : un guillemet non fermé ; 3 : --dir= devant un
+# programme Linux ; 4 : un chemin relatif ; 5 : un programme absent ; 6 :
+# un dossier ; 7 : une barre finale après un fichier ; 8 : un fichier sans
+# le droit d'exécution) ; puis chaque programme de TESTS_LINUX,
+# lecteur.wasm sans dossier pré-ouvert, et bonjour-asm.
+tests-demarrage.txt: Makefile
+	{ echo "# Fabrique par le Makefile (tests.cpio)."; \
+	  echo "/bin/bonjour-asm \"pas ferme"; \
+	  echo "--dir=/ /bin/bonjour-asm"; \
+	  echo "bin/bonjour-asm"; \
+	  echo "/bin/absent"; \
+	  echo "/bin"; \
+	  echo "/bin/bonjour-asm/"; \
+	  echo "/etc/demarrage"; \
+	  for p in $(TESTS_LINUX); do echo "/bin/$$p"; done; \
+	  echo "/bin/lecteur.wasm"; \
+	  echo "/bin/bonjour-asm"; } > $@
 
 PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx bonjour-asm-pile-executable bonjour-c bonjour-c-deux-segments bonjour-c-pie bonjour-c-dynamique)
 
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
-# puis exécute les programmes de /bin dans l'ordre (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
+# puis lance ce que dit son /etc/demarrage (voir archive.sh).
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
 	sh archive.sh $@ archive.txt
@@ -422,7 +450,7 @@ test-%.bin: programmes.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,programmes.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio serial.log trace.log qemu.log ecran.png test-*.log
+	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio tests-demarrage.txt serial.log trace.log qemu.log ecran.png test-*.log
 	rm -rf $(LINUX)
 	rm -rf $(SUITE)
 	cd noyau && cargo clean

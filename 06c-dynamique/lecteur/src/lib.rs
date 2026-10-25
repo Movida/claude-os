@@ -1,11 +1,13 @@
 //! Lecteur : un programme WebAssembly qui se sert des fichiers, par WASI.
 //!
-//! Il ne voit du système que son dossier « pré-ouvert » (le descripteur 3,
-//! « / ») : chaque chemin part de là, et n'a pas le droit d'en sortir (le
-//! noyau refuse « .. » au-dessus du dossier, et un lien symbolique absolu).
-//! Il lit /etc/bonjour.txt, directement puis par un lien, liste /etc,
-//! écrit puis relit un fichier dans /tmp, et vérifie qu'il ne peut pas
-//! s'échapper. Chaque ligne affichée dit ce qu'il a vu.
+//! Il affiche ses arguments (ceux de sa ligne de /etc/demarrage), puis ne
+//! voit du système que son dossier « pré-ouvert » (le descripteur 3, « / »,
+//! donné par `--dir=/`) : chaque chemin part de là, et n'a pas le droit
+//! d'en sortir (le noyau refuse « .. » au-dessus du dossier, et un lien
+//! symbolique absolu). Il lit /etc/bonjour.txt, directement puis par un
+//! lien, liste /etc, écrit puis relit un fichier dans /tmp, et vérifie
+//! qu'il ne peut pas s'échapper. Chaque ligne affichée dit ce qu'il a vu.
+//! Lancé sans `--dir=`, il n'a aucun dossier, le dit, et s'arrête.
 
 #![no_std]
 
@@ -42,6 +44,8 @@ unsafe extern "C" {
     fn path_open(dossier: u32, drapeaux: u32, chemin: *const u8, longueur: usize, oflags: u32, droits: u64,
                  droits_herites: u64, fdflags: u32, fichier: *mut u32) -> u16;
     fn fd_readdir(dossier: u32, tampon: *mut u8, longueur: usize, cookie: u64, utilises: *mut usize) -> u16;
+    fn args_sizes_get(nombre: *mut usize, taille: *mut usize) -> u16;
+    fn args_get(pointeurs: *mut *const u8, chaines: *mut u8) -> u16;
     fn proc_exit(code: u32) -> !;
 }
 
@@ -93,13 +97,52 @@ fn texte(octets: &[u8]) -> &str {
     core::str::from_utf8(octets).unwrap_or("?").trim_end_matches('\n')
 }
 
+/// Affiche ses arguments sur une ligne : « argc = 2, argv = /bin/lecteur.wasm
+/// ... » (argc d'abord : un argument en trop ne passerait pas inaperçu).
+/// Rend faux si WASI ne les donne pas.
+fn afficher_arguments(s: &mut Sortie) -> bool {
+    let (mut nombre, mut taille) = (0, 0);
+    let mut pointeurs = [core::ptr::null::<u8>(); 8];
+    let mut chaines = [0u8; 256];
+    // SAFETY : tout est dans notre mémoire ; args_get n'écrit que si les
+    // tailles annoncées tiennent dans nos tableaux (vérifié avant).
+    let lus = unsafe {
+        args_sizes_get(&mut nombre, &mut taille) == 0
+            && nombre <= pointeurs.len()
+            && taille <= chaines.len()
+            && args_get(pointeurs.as_mut_ptr(), chaines.as_mut_ptr()) == 0
+    };
+    if !lus {
+        let _ = writeln!(s, "[wasm] lecteur : argv : ECHEC");
+        return false;
+    }
+    let _ = write!(s, "[wasm] lecteur : argc = {nombre}, argv =");
+    // Chaque argument : de son adresse au zéro qui le termine, dans
+    // `chaines`.
+    for p in &pointeurs[..nombre] {
+        let debut = (*p as usize).wrapping_sub(chaines.as_ptr() as usize);
+        let Some(reste) = chaines.get(debut..taille) else { return false };
+        let fin = reste.iter().position(|&o| o == 0).unwrap_or(reste.len());
+        let _ = write!(s, " {}", texte(&reste[..fin]));
+    }
+    let _ = writeln!(s);
+    true
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() {
     let mut s = Sortie;
-    let mut ok = true;
+    let mut ok = afficher_arguments(&mut s);
     let mut prestat = [0u32; 2];
     // SAFETY : `prestat` est dans notre mémoire.
-    let preouvert = unsafe { fd_prestat_get(PREOUVERT, &mut prestat) } == 0 && prestat[1] == 1;
+    let code = unsafe { fd_prestat_get(PREOUVERT, &mut prestat) };
+    if code == EBADF {
+        // Lancé sans --dir= : rien à lire, et c'est ce qu'on attendait.
+        let _ = writeln!(s, "[wasm] lecteur : aucun dossier pre-ouvert.");
+        // SAFETY : proc_exit ne revient pas.
+        unsafe { proc_exit(if ok { 0 } else { 1 }) }
+    }
+    let preouvert = code == 0 && prestat[1] == 1;
     let _ = writeln!(s, "[wasm] lecteur : dossier pre-ouvert 3 : {}", if preouvert { "ok" } else { "ECHEC" });
     ok &= preouvert;
 

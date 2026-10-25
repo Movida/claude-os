@@ -21,14 +21,13 @@ rendues et recollees : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
-[noyau] Archive deballee : dossiers 5, fichiers 14, liens symboliques 2, liens physiques 1 ; archive rendue (
-[noyau] Programmes de /bin :
-        bonjour.wasm                 2943 octets
-        bonjour-asm
+[noyau] Archive deballee : dossiers 5, fichiers 15, liens symboliques 2, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 12 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
 [noyau] bonjour.wasm : termine, code de sortie 0
+[wasm] lecteur : argc = 2, argv = /bin/lecteur.wasm un-argument
 [wasm] lecteur : dossier pre-ouvert 3 : ok
 [wasm] lecteur : /etc/bonjour.txt : Bonjour depuis un fichier de /etc !
 [wasm] lecteur : /etc/lien-bonjour : Bonjour depuis un fichier de /etc !
@@ -43,7 +42,13 @@ memoire rendue : ok.
         en-tetes de programme a 0x400040 (3 de 56 octets), tas a partir de 0x403000, code en place : ok.
 [linux] Bonjour depuis l'anneau 3
 [noyau] bonjour-asm : termine, code de sortie 42 ; memoire rendue : ok.
-[linux] argc = 1, argv[0] = /bin/pile
+[linux] argc = 3, argv[0] = /bin/pile
+[linux] argv[1] = un
+[linux] argv[2] = deux mots
+[linux] envp[0] = HOME=/tmp
+[linux] envp[1] = TERM=linux
+[linux] envp[2] = LANG=C.UTF-8
+[linux] Environnement : 3 variables.
 [linux] Pile alignee sur 16, AT_PAGESZ = 4096, AT_ENTRY = _start : ok.
 [noyau] pile : termine, code de sortie 0 ; memoire rendue : ok.
 [noyau] SSE pour les programmes : FXSR, sans XSAVE (pas d'AVX).

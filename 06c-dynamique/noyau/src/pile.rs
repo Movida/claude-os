@@ -28,6 +28,8 @@
 //! pages, son point d'entrée, ses identités, les fonctions du processeur...
 //! La glibc le lit avant même main (_dl_aux_init), et getauxval() le rend.
 
+use alloc::vec::Vec;
+
 use crate::chargeur_elf::{self, Programme};
 use crate::{aleatoire, espace_utilisateur, memoire};
 
@@ -70,21 +72,31 @@ pub const USER_HZ: u64 = 100;
 
 /// Au plus un quart de la pile pour les chaînes et les tables, comme
 /// Linux (un quart de RLIMIT_STACK) : le programme doit garder de la
-/// place pour lui.
+/// place pour lui. Les tables de pointeurs comptent aussi (Linux les
+/// compte d'avance, dans bprm_stack_limits ; ici, elles sont écrites dans
+/// la même place, et la même vérification les couvre).
 const PLACE_MAX: u64 = chargeur_elf::PLACE_ARGUMENTS;
+
+/// La longueur maximale d'une chaîne d'argv ou d'envp, zéro final compris :
+/// 32 pages, le MAX_ARG_STRLEN de Linux (E2BIG au-delà). Il n'y a pas de
+/// limite sur leur NOMBRE : seulement la place qu'elles prennent.
+const CHAINE_MAX: usize = 32 * PAGE as usize;
 
 /// Pourquoi la pile n'a pas pu être construite.
 #[derive(Debug)]
 pub enum Erreur {
     /// Arguments et environnement trop longs (E2BIG).
     TropLong,
+    /// Plus de mémoire pour les tables du noyau.
+    PlusDeMemoire,
     Espace(espace_utilisateur::Erreur),
 }
 
 impl core::fmt::Display for Erreur {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         match self {
-            Erreur::TropLong => f.write_str("arguments et environnement trop longs"),
+            Erreur::TropLong => f.write_str("arguments et environnement trop longs (E2BIG)"),
+            Erreur::PlusDeMemoire => f.write_str("plus de memoire pour la pile initiale"),
             Erreur::Espace(e) => write!(f, "{e}"),
         }
     }
@@ -116,6 +128,9 @@ impl Curseur<'_> {
 
     /// Une chaîne et son zéro final.
     fn chaine(&mut self, texte: &[u8]) -> Result<u64, Erreur> {
+        if texte.len() >= CHAINE_MAX {
+            return Err(Erreur::TropLong);
+        }
         self.empiler(&[0])?;
         self.empiler(texte)
     }
@@ -138,11 +153,20 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
     // Du haut vers le bas : le marqueur de fin, les chaînes, l'aléa.
     c.empiler(&[0; 8])?;
     let execfn = c.chaine(nom)?;
-    let mut adresses_envp = [0u64; 32];
-    let mut adresses_argv = [0u64; 32];
-    if envp.len() > adresses_envp.len() || argv.len() > adresses_argv.len() {
+    // Les adresses des chaînes, puis les tables : dans des blocs du tas,
+    // pas sur la pile du noyau (16 Kio), et sans limite sur le nombre
+    // d'arguments autre que la place (comme Linux). Un nombre absurde est
+    // refusé avant d'allouer quoi que ce soit : chaque chaîne prend au
+    // moins un octet, et la place est bornée.
+    if (argv.len() + envp.len()) as u64 > PLACE_MAX {
         return Err(Erreur::TropLong);
     }
+    let mut adresses_envp = Vec::new();
+    let mut adresses_argv = Vec::new();
+    adresses_envp.try_reserve_exact(envp.len()).map_err(|_| Erreur::PlusDeMemoire)?;
+    adresses_argv.try_reserve_exact(argv.len()).map_err(|_| Erreur::PlusDeMemoire)?;
+    adresses_envp.resize(envp.len(), 0);
+    adresses_argv.resize(argv.len(), 0);
     for (i, e) in envp.iter().enumerate().rev() {
         adresses_envp[i] = c.chaine(e)?;
     }
@@ -184,27 +208,21 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
         (AT_EXECFN, execfn),
         (AT_NULL, 0),
     ];
-    let mut table = [0u64; 1 + 33 + 33 + 2 * 19];
-    let mut n = 0;
-    let mut mettre = |valeur: u64| {
-        table[n] = valeur;
-        n += 1;
-    };
+    // Ses octets, dans l'ordre du processeur (petit-boutiste).
+    let mots = 1 + argv.len() + 1 + envp.len() + 1 + 2 * auxv.len();
+    let mut octets = Vec::new();
+    octets.try_reserve_exact(8 * mots).map_err(|_| Erreur::PlusDeMemoire)?;
+    let mut mettre = |valeur: u64| octets.extend_from_slice(&valeur.to_le_bytes());
     mettre(argv.len() as u64);
-    adresses_argv[..argv.len()].iter().for_each(|&a| mettre(a));
+    adresses_argv.iter().for_each(|&a| mettre(a));
     mettre(0);
-    adresses_envp[..envp.len()].iter().for_each(|&a| mettre(a));
+    adresses_envp.iter().for_each(|&a| mettre(a));
     mettre(0);
     for (genre, valeur) in auxv {
         mettre(genre);
         mettre(valeur);
     }
-    // Ses octets, dans l'ordre du processeur (petit-boutiste).
-    let mut octets = [0u8; 8 * (1 + 33 + 33 + 2 * 19)];
-    for (i, mot) in table[..n].iter().enumerate() {
-        octets[8 * i..8 * i + 8].copy_from_slice(&mot.to_le_bytes());
-    }
-    let octets = &octets[..8 * n];
+    let octets = &octets[..];
     // RSP aligné sur 16 : on place la table pour que son début (argc) le
     // soit.
     let rsp = (c.sp - octets.len() as u64) & !15;

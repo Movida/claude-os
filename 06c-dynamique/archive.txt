@@ -1,8 +1,8 @@
 # L'archive de démarrage : ce que le noyau déballe dans son système de
-# fichiers (voir archive.sh pour le format, celui de gen_init_cpio). Les
-# programmes de /bin sont exécutés dans l'ordre où ils sont ici. Les
-# chemins sources sont relatifs au dossier de l'étape (make les construit
-# d'abord).
+# fichiers (voir archive.sh pour le format, celui de gen_init_cpio). Ce
+# qu'il lance ensuite, et dans quel ordre, c'est /etc/demarrage qui le
+# dit. Les chemins sources sont relatifs au dossier de l'étape (make les
+# construit d'abord).
 
 # Les programmes, à root, exécutables par tous.
 dir   /bin 755 0 0
@@ -22,9 +22,15 @@ file  /bin/fichiers        linux/construits/fichiers 755 1000 1000
 file  /bin/arbre           linux/construits/arbre 755 0 0
 file  /bin/segments        linux/construits/segments 755 0 0
 
+# Les commandes que lance le noyau (formats/src/commande.rs). Écrit avant
+# les autres fichiers de /etc : un dossier se lit du plus récent au plus
+# ancien (6b), lecteur.wasm le verra donc en dernier, après ceux qu'il
+# s'attend à trouver.
+dir   /etc 755 0 0
+file  /etc/demarrage       racine/etc/demarrage 644 0 0
+
 # Quelques fichiers à lire : un texte, un second nom (un lien physique),
 # et des liens symboliques.
-dir   /etc 755 0 0
 file  /etc/bonjour.txt     racine/etc/bonjour.txt 644 0 0 /etc/salut.txt
 slink /etc/lien-bonjour    bonjour.txt 777 0 0
 # Un lien absolu : un programme WebAssembly ne doit pas pouvoir le suivre

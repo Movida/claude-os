@@ -1,13 +1,18 @@
-//! Les programmes de l'archive de démarrage : les déballer, reconnaître
-//! leur format, les exécuter.
+//! Les programmes de l'archive de démarrage : la déballer, lancer ce que
+//! dit /etc/demarrage, reconnaître le format de chaque programme, les
+//! exécuter.
 //!
 //! Le chargeur a déposé à côté du noyau une archive cpio (voir
 //! ../formats/src/cpio.rs) ; le noyau la déballe dans son système de
-//! fichiers (vfs.rs), puis exécute chacun des fichiers de /bin, dans
-//! l'ordre de l'archive. Le premier programme lancé par son chemin, qui
-//! lance les autres (le /init de Linux), c'est pour 6c. Le format d'un
-//! programme se reconnaît à ses
-//! premiers octets, sa « signature » (magic number) :
+//! fichiers (vfs.rs), puis lit /etc/demarrage : une commande par ligne,
+//! avec ses arguments et son environnement, lancées l'une après l'autre
+//! (la syntaxe : ../formats/src/commande.rs). Sans `fork` ni `execve`
+//! (6k), aucun programme ne peut en lancer un autre : le noyau joue le
+//! rôle d'`init` en attendant. En 6k, un vrai /init, lancé par son chemin
+//! comme sous Linux, lancera un shell, et ce fichier deviendra un script.
+//!
+//! Le format d'un programme se reconnaît à ses premiers octets, sa
+//! « signature » (magic number) :
 //!   - « \0asm » : un module WebAssembly, le format natif de l'OS ;
 //!   - « \x7fELF » : un exécutable Linux.
 //! C'est le principe des « binfmt » de Linux (fs/binfmt_elf.c,
@@ -23,11 +28,21 @@ use alloc::vec::Vec;
 use core::fmt;
 use fichiers::tmpfs::Numero;
 
-/// L'environnement des programmes Linux : de quoi savoir où est le
-/// dossier personnel (/home/utilisateur, à l'utilisateur 1000, voir
-/// archive.txt), et quel terminal les affiche (la console : un terminal
-/// « linux », comme la console de Linux).
+/// L'environnement des programmes : de quoi savoir où est le dossier
+/// personnel (/home/utilisateur, à l'utilisateur 1000, voir archive.txt),
+/// et quel terminal les affiche (la console : un terminal « linux », comme
+/// la console de Linux). Une ligne de /etc/demarrage peut en remplacer une
+/// variable, ou en ajouter (`NOM=valeur` en tête, comme le shell).
 const ENVIRONNEMENT: &[&[u8]] = &[b"HOME=/home/utilisateur", b"TERM=linux"];
+
+/// Le fichier des commandes à lancer, et sa taille maximale : une page
+/// suffit à des dizaines de lignes ; 64 Kio laissent de la marge sans
+/// laisser un fichier géant remplir le tas du noyau.
+const DEMARRAGE: &[u8] = b"/etc/demarrage";
+const DEMARRAGE_MAX: u64 = 64 << 10;
+
+/// L'identité des programmes : l'utilisateur 1000 (pile.rs).
+const IDENTITE: Identite = Identite { uid: pile::UTILISATEUR as u32, gid: pile::GROUPE as u32 };
 
 /// Le nom d'un programme en cours, pour les messages : le nom de base de
 /// son fichier, coupé à 15 octets, comme le `comm` de la task_struct de
@@ -100,9 +115,9 @@ fn archive() -> Option<&'static [u8]> {
 }
 
 /// Déballe l'archive de démarrage dans le système de fichiers de la racine
-/// (vfs.rs), rend sa mémoire, puis exécute les programmes de /bin, dans
-/// l'ordre de l'archive. Une archive mal formée est refusée en entier,
-/// avant de rien déballer : on ne lance pas la moitié d'un système.
+/// (vfs.rs), rend sa mémoire, puis lance les commandes de /etc/demarrage.
+/// Une archive mal formée est refusée en entier, avant de rien déballer :
+/// on ne lance pas la moitié d'un système.
 pub fn demarrer() {
     let octets = archive();
     let mut valide = octets;
@@ -134,26 +149,136 @@ pub fn demarrer() {
                     bilan.dossiers, bilan.fichiers, bilan.liens_symboliques, bilan.liens_physiques,
                     if bilan.refusees > 0 { " (des entrees refusees)" } else { "" }, rendus >> 10);
     }
-    afficherln!("[noyau] Programmes de /bin :");
-    for (n, chemin) in &bilan.programmes {
-        let taille = vfs::avec(|fs, _| fs.attributs(*n).taille);
-        afficherln!("        {:<24} {:>8} octets", Nom(&chemin[5..]), taille);
-    }
-    for (n, chemin) in &bilan.programmes {
-        executer(*n, chemin);
-        vfs::avec(|fs, cadres| fs.lacher(*n, cadres));
+    let texte = match lire_demarrage() {
+        Ok(t) => t,
+        // Linux, sans init, panique (« No working init found ») : ici, le
+        // noyau le dit et continue (il n'a plus rien à faire, mais le
+        // clavier marche encore).
+        Err(e) => return afficherln!("[noyau] {} illisible (errno {}) : rien a lancer.", Nom(DEMARRAGE), e.errno()),
+    };
+    // Les lignes qui ont une commande (ou une erreur) : les autres sont
+    // vides, ou des commentaires.
+    let commandes = formats::commande::lignes(&texte)
+        .filter(|(_, l)| tampon_pour(l).is_none_or(|mut t| !matches!(formats::commande::decouper(l, &mut t), Ok(None))))
+        .count();
+    afficherln!("[noyau] Lancement : {}, {} commandes.", Nom(DEMARRAGE), commandes);
+    for (numero, ligne) in formats::commande::lignes(&texte) {
+        let Some(mut tampon) = tampon_pour(ligne) else {
+            afficherln!("[noyau] {}, ligne {} : plus de memoire pour la lire", Nom(DEMARRAGE), numero);
+            continue;
+        };
+        match formats::commande::decouper(ligne, &mut tampon) {
+            Ok(None) => {}
+            Ok(Some(commande)) => lancer(numero, &commande),
+            Err(e) => afficherln!("[noyau] {}, ligne {} : refusee : {}", Nom(DEMARRAGE), numero, e),
+        }
     }
 }
 
-/// Exécute le programme du fichier `n`, de chemin `chemin`, d'après sa
-/// signature.
-fn executer(n: Numero, chemin: &[u8]) {
+/// Le tampon où découper `ligne` (formats::commande), s'il y a la place.
+fn tampon_pour(ligne: &[u8]) -> Option<Vec<u8>> {
+    let mut tampon = Vec::new();
+    tampon.try_reserve_exact(formats::commande::taille_tampon(ligne)).ok()?;
+    tampon.resize(formats::commande::taille_tampon(ligne), 0);
+    Some(tampon)
+}
+
+/// Le contenu de /etc/demarrage, lu en root (comme `init` lit son
+/// `inittab`), dans un bloc du tas.
+fn lire_demarrage() -> Result<Vec<u8>, fichiers::Erreur> {
+    let n = appels_fichiers::trouver_pour(Identite::ROOT, DEMARRAGE)?;
+    let (mode, taille) = vfs::avec(|fs, _| {
+        let a = fs.attributs(n);
+        (a.mode, a.taille)
+    });
+    let mut texte = Vec::new();
+    // Un fichier ordinaire seulement : vfs::lire ne sait lire que lui.
+    let lu = if mode & fichiers::S_IFMT == fichiers::S_IFDIR {
+        Err(fichiers::Erreur::EISDIR)
+    } else if mode & fichiers::S_IFMT != fichiers::S_IFREG {
+        Err(fichiers::Erreur::EINVAL)
+    } else if taille > DEMARRAGE_MAX {
+        Err(fichiers::Erreur::EFBIG)
+    } else if texte.try_reserve_exact(taille as usize).is_err() {
+        Err(fichiers::Erreur::ENOMEM)
+    } else {
+        texte.resize(taille as usize, 0);
+        let lus = vfs::lire(n, 0, &mut texte);
+        texte.truncate(lus);
+        Ok(texte)
+    };
+    vfs::avec(|fs, cadres| fs.lacher(n, cadres));
+    lu
+}
+
+/// Lance la commande de la ligne `numero` : son environnement (celui du
+/// noyau, remplacé ou complété par ses affectations), son programme
+/// (résolu comme `execve`, sans `PATH`, avec les droits de l'utilisateur
+/// 1000), ses arguments.
+fn lancer(numero: usize, commande: &formats::commande::Commande) {
+    let programme = commande.programme();
+    let refus = |raison: &dyn fmt::Display| afficherln!("[noyau] {}, ligne {} : refusee : {}", Nom(DEMARRAGE), numero, raison);
+    let (mut environnement, mut arguments, mut dossiers) = (Vec::new(), Vec::new(), Vec::new());
+    let place = ENVIRONNEMENT.len() + commande.affectations().count();
+    if environnement.try_reserve_exact(place).is_err()
+        || arguments.try_reserve_exact(commande.arguments().count()).is_err()
+        || dossiers.try_reserve_exact(commande.dossiers().count()).is_err()
+    {
+        return refus(&"plus de memoire");
+    }
+    environnement.extend_from_slice(ENVIRONNEMENT);
+    for affectation in commande.affectations() {
+        // « NOM=... » remplace la variable NOM du noyau, comme le shell.
+        let nom = &affectation[..=affectation.iter().position(|&o| o == b'=').unwrap_or(0)];
+        match environnement.iter().position(|v| v.starts_with(nom)) {
+            Some(i) => environnement[i] = affectation,
+            None => environnement.push(affectation),
+        }
+    }
+    arguments.extend(commande.arguments());
+    dossiers.extend(commande.dossiers());
+    let n = match appels_fichiers::trouver_pour(IDENTITE, programme) {
+        Ok(n) => n,
+        Err(e) => return refus(&format_args!("{} : introuvable (errno {})", Nom(programme), e.errno())),
+    };
+    let lancement = Lancement { chemin: programme, arguments: &arguments, environnement: &environnement, dossiers: &dossiers };
+    executer(numero, n, &lancement);
+    vfs::avec(|fs, cadres| fs.lacher(n, cadres));
+}
+
+/// Ce qu'une ligne de /etc/demarrage donne au programme.
+struct Lancement<'a> {
+    /// Son chemin (AT_EXECFN), tel qu'écrit.
+    chemin: &'a [u8],
+    /// argv : le chemin, puis les arguments.
+    arguments: &'a [&'a [u8]],
+    /// envp : des « NOM=valeur ».
+    environnement: &'a [&'a [u8]],
+    /// Les dossiers pré-ouverts d'un programme WebAssembly.
+    dossiers: &'a [&'a [u8]],
+}
+
+/// Exécute le programme du fichier `n`, d'après sa signature.
+fn executer(numero: usize, n: Numero, lancement: &Lancement) {
+    let chemin = lancement.chemin;
     let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').next().unwrap_or(chemin));
+    // Le droit de l'exécuter d'abord, quel que soit son format : un fichier
+    // ordinaire, avec le bit x pour l'utilisateur 1000 (EACCES sinon, pour
+    // un dossier ou un périphérique aussi, comme do_open_execat). Avant de
+    // rien lire : vfs::lire ne sait lire qu'un fichier ordinaire.
+    if let Err(e) = vfs::avec(|fs, _| fs.peut_executer(IDENTITE, n)) {
+        return afficherln!("[noyau] {} : pas le droit de l'executer (errno {})", nom, e.errno());
+    }
     let mut signature = [0u8; 4];
     let lus = vfs::lire(n, 0, &mut signature);
     match &signature[..lus] {
-        [0, b'a', b's', b'm'] => executer_wasm(nom, n),
-        [0x7f, b'E', b'L', b'F'] => executer_elf(nom, n, chemin),
+        [0, b'a', b's', b'm'] => executer_wasm(nom, n, lancement),
+        // Les dossiers pré-ouverts sont une affaire de WebAssembly : un
+        // programme Linux voit tout l'arbre, avec ses droits.
+        [0x7f, b'E', b'L', b'F'] if !lancement.dossiers.is_empty() => {
+            afficherln!("[noyau] {}, ligne {} : refusee : --dir= pour un programme Linux", Nom(DEMARRAGE), numero)
+        }
+        [0x7f, b'E', b'L', b'F'] => executer_elf(nom, n, lancement),
         _ => afficherln!("[noyau] {} : format inconnu, ignore.", nom),
     }
 }
@@ -161,7 +286,8 @@ fn executer(n: Numero, chemin: &[u8]) {
 /// Un programme Linux : on vérifie le fichier, on le charge dans un espace
 /// d'adressage neuf, puis on l'exécute, dans l'anneau 3, jusqu'à ce qu'il se
 /// termine. Son espace est alors détruit, et doit rendre toute sa mémoire.
-fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
+fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
+    let chemin = lancement.chemin;
     // Le fichier, lu par morceaux : la bibliothèque des formats ne voit que
     // des copies (chargeur_elf::verifier).
     let lire = |position: u64, tampon: &mut [u8]| vfs::lire(n, position, tampon) == tampon.len();
@@ -178,15 +304,15 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
     // fichier (hors de la table des en-têtes), dans un bloc du tas (4 Kio
     // au plus : la pile du noyau ne fait que 16 Kio).
     if let Some((position, longueur)) = executable.interpreteur() {
-        let mut chemin = Vec::new();
-        if chemin.try_reserve_exact(longueur).is_err() {
+        let mut interpreteur = Vec::new();
+        if interpreteur.try_reserve_exact(longueur).is_err() {
             return afficherln!("[noyau] {} : plus de memoire pour le chemin de l'interpreteur", nom);
         }
-        chemin.resize(longueur, 0);
-        if !lire(position, &mut chemin) {
+        interpreteur.resize(longueur, 0);
+        if !lire(position, &mut interpreteur) {
             return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, formats::elf::Erreur::InterpreteurHorsDuFichier);
         }
-        return match formats::elf::chemin_interpreteur(&chemin) {
+        return match formats::elf::chemin_interpreteur(&interpreteur) {
             Ok(c) => afficherln!("[noyau] {} : programme dynamique (PT_INTERP {}) : pas encore pris en charge", nom, Nom(c)),
             Err(e) => afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
         };
@@ -206,10 +332,7 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
                     s.adresse, s.adresse + s.taille, 'r',
                     if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.taille_fichier);
     }
-    let identite = Identite { uid: pile::UTILISATEUR as u32, gid: pile::GROUPE as u32 };
-    if vfs::avec(|fs, _| fs.peut_executer(identite, n)).is_err() {
-        return afficherln!("[noyau] {} : pas le droit de l'executer (EACCES)", nom);
-    }
+    let identite = IDENTITE;
     let libres = pages::libres();
     // Le fichier ouvert que projetteront ses segments : chaque zone le
     // tiendra ; l'ouverture du chargeur est lâchée ensuite.
@@ -246,9 +369,9 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
                 programme.fin.next_multiple_of(4096), if code_ok { "ok" } else { "ECHEC" });
-    // Sa pile initiale : son chemin pour seul argument (argv[0] et
-    // AT_EXECFN, comme Linux), un petit environnement.
-    let rsp = match pile::construire(&mut programme, &[chemin], ENVIRONNEMENT, chemin) {
+    // Sa pile initiale : les arguments et l'environnement de sa ligne,
+    // son chemin pour AT_EXECFN (comme Linux, le chemin donné à execve).
+    let rsp = match pile::construire(&mut programme, lancement.arguments, lancement.environnement, chemin) {
         Ok(rsp) => rsp,
         Err(e) => return afficherln!("[noyau] {} : pile initiale impossible : {}", nom, e),
     };
@@ -300,7 +423,7 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
 /// (exécuter un autre programme). Les interruptions de l'horloge et du
 /// clavier, elles, continuent d'arriver pendant tout ce temps, même pendant
 /// une écriture du programme (la console écrit par petits paquets).
-fn executer_wasm(nom: NomCourt, n: Numero) {
+fn executer_wasm(nom: NomCourt, n: Numero, lancement: &Lancement) {
     use alloc::sync::Arc;
     use wasm::{Etat, Externe, Magasin, Piege};
 
@@ -328,10 +451,14 @@ fn executer_wasm(nom: NomCourt, n: Numero) {
     // Son budget de mémoire : 16 Mio pour ses tables et sa mémoire, chacune
     // d'au plus 4 Mio (un bloc du tas, voir tas.rs).
     let mut magasin = Magasin::avec_budget(16 << 20);
-    // Ses descripteurs : la console, et la racine pré-ouverte.
-    let mut hote = match wasi::Wasi::new() {
+    // Ses descripteurs : la console, et les dossiers pré-ouverts de sa
+    // ligne ; ses arguments et son environnement.
+    let mut hote = match wasi::Wasi::new(IDENTITE, lancement.dossiers, lancement.arguments, lancement.environnement) {
         Ok(h) => h,
-        Err(e) => return afficherln!("[noyau] {} : pas de descripteurs (errno {})", nom, e.errno()),
+        Err((e, Some(dossier))) => {
+            return afficherln!("[noyau] {} : --dir={} impossible (errno {})", nom, Nom(dossier), e.errno());
+        }
+        Err((e, None)) => return afficherln!("[noyau] {} : pas de descripteurs (errno {})", nom, e.errno()),
     };
     let imports = match wasi::imports(&mut magasin, &module) {
         Ok(i) => i,

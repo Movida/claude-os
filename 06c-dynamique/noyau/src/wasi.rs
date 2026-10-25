@@ -8,7 +8,9 @@
 //!   - fd_write, fd_read, fd_seek, fd_tell, fd_close : lire et écrire ses
 //!     descripteurs (la console, des fichiers) ;
 //!   - fd_prestat_get, fd_prestat_dir_name : les dossiers « pré-ouverts »
-//!     qu'on lui donne ;
+//!     qu'on lui donne (les `--dir=` de sa ligne de /etc/demarrage) ;
+//!   - args_sizes_get, args_get, environ_sizes_get, environ_get : ses
+//!     arguments et son environnement, ceux de sa ligne ;
 //!   - path_open, path_filestat_get, fd_filestat_get, fd_fdstat_get,
 //!     fd_readdir : les fichiers et les dossiers, sur le même système de
 //!     fichiers que les programmes Linux (vfs.rs) ;
@@ -24,8 +26,10 @@
 //!
 //! Il tient aussi pour les fichiers (l'isolation à la façon de Nebulet,
 //! voir CLAUDE.md) : un programme WASI n'a pas de racine ni de dossier
-//! courant, seulement des dossiers pré-ouverts (le descripteur 3, ici
-//! « / ») ; chaque chemin part de l'un d'eux, et ne doit jamais en sortir.
+//! courant, seulement des dossiers pré-ouverts (les descripteurs 3, 4...,
+//! dans l'ordre des `--dir=` de sa ligne, comme `wasmtime --dir` ; aucun
+//! sans option) ; chaque chemin part de l'un d'eux, et ne doit jamais en
+//! sortir.
 //! La résolution « sous » un dossier (../fichiers/src/chemins.rs, le
 //! RESOLVE_BENEATH de Linux) refuse un « .. » qui remonterait au-dessus, un
 //! chemin absolu, un lien symbolique absolu : EPERM, comme wasmtime. Les
@@ -48,7 +52,7 @@ use wasm::validateur::ModuleValide;
 use wasm::{Externe, Hote, Magasin, Piege, Valeur};
 
 use crate::descripteurs::{Descripteur, Descripteurs, FichierOuvert, Sorte};
-use crate::{appels_fichiers, console, pile, temps, vfs};
+use crate::{appels_fichiers, console, temps, vfs};
 use fichiers::chemins::{Depart, resoudre};
 use fichiers::tmpfs::{Numero, Ouverture, suivre_pour};
 use fichiers::{Erreur, Identite, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, Temps};
@@ -121,6 +125,10 @@ const FD_FILESTAT_GET: u32 = 10;
 const PATH_FILESTAT_GET: u32 = 11;
 const FD_READDIR: u32 = 12;
 const CLOCK_TIME_GET: u32 = 13;
+const ARGS_SIZES_GET: u32 = 14;
+const ARGS_GET: u32 = 15;
+const ENVIRON_SIZES_GET: u32 = 16;
+const ENVIRON_GET: u32 = 17;
 
 /// Le plus de morceaux qu'un fd_write ou un fd_read peut décrire : l'IOV_MAX
 /// de POSIX, que Linux impose aussi (UIO_MAXIOV). Au-delà : EINVAL.
@@ -132,36 +140,87 @@ const MORCEAUX_MAX: u32 = 1024;
 /// bauds, 1024 octets prennent déjà 90 ms.
 const TRANSFERT_MAX: u32 = 1024;
 
-/// Le descripteur du dossier pré-ouvert, et son nom (« / »).
-const PREOUVERT: u64 = 3;
+/// Le premier descripteur pré-ouvert (après la console, 0, 1 et 2).
+const PREMIER_PREOUVERT: u64 = 3;
+
+/// Un dossier pré-ouvert : son descripteur, et le nom que voit le
+/// programme (le chemin donné à `--dir=`).
+struct Preouvert {
+    fd: u64,
+    nom: Vec<u8>,
+}
 
 /// L'hôte des programmes WASI : ses descripteurs, comme un processus
-/// Linux (la même table, sur les mêmes fichiers ouverts).
+/// Linux (la même table, sur les mêmes fichiers ouverts), ses dossiers
+/// pré-ouverts, ses arguments et son environnement.
 pub struct Wasi {
     descripteurs: Descripteurs,
     /// Qui il est, pour les droits des fichiers.
     identite: Identite,
-    /// Le descripteur PREOUVERT est-il encore le dossier pré-ouvert ?
-    /// Fermé, son numéro peut être repris par path_open : ce n'est plus
-    /// lui (wasmtime garde de même, dans sa table, quels descripteurs sont
+    /// Les dossiers pré-ouverts encore ouverts. Fermé, un descripteur en
+    /// sort : son numéro peut être repris par path_open, ce n'est plus lui
+    /// (wasmtime garde de même, dans sa table, quels descripteurs sont
     /// pré-ouverts).
-    preouvert: bool,
+    preouverts: Vec<Preouvert>,
+    /// argv et envp, chacun d'un bloc : les chaînes à la suite, chacune
+    /// avec son zéro final (ce que args_get écrit tel quel).
+    arguments: (Vec<u8>, u32),
+    environnement: (Vec<u8>, u32),
+}
+
+/// Des chaînes mises à la suite, chacune avec son zéro final, et leur
+/// nombre ; ENOMEM si la place manque. (Aucune ne contient de zéro :
+/// formats::commande les refuse.)
+fn a_la_suite(chaines: &[&[u8]]) -> Result<(Vec<u8>, u32), Erreur> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(chaines.iter().map(|c| c.len() + 1).sum()).map_err(|_| Erreur::ENOMEM)?;
+    for c in chaines {
+        v.extend_from_slice(c);
+        v.push(0);
+    }
+    Ok((v, chaines.len() as u32))
 }
 
 impl Wasi {
-    /// Un hôte neuf : la console en 0, 1 et 2, et la racine pré-ouverte en
-    /// 3.
-    pub fn new() -> Result<Wasi, Erreur> {
+    /// Un hôte neuf pour l'identité `identite` : la console en 0, 1 et 2,
+    /// puis les `dossiers` pré-ouverts en 3, 4... (ouverts avec ses droits :
+    /// il doit pouvoir les traverser et les lire), ses `arguments` et son
+    /// `environnement`. En cas d'échec, l'erreur, et le dossier en cause
+    /// (aucun pour la console ou la mémoire) ; rien ne reste ouvert.
+    pub fn new<'a>(identite: Identite, dossiers: &[&'a [u8]], arguments: &[&[u8]], environnement: &[&[u8]])
+        -> Result<Wasi, (Erreur, Option<&'a [u8]>)> {
+        // Les chaînes d'abord : rien n'est encore ouvert si la place
+        // manque (Descripteurs ne ferme rien en disparaissant).
+        let (arguments, environnement) = match (a_la_suite(arguments), a_la_suite(environnement)) {
+            (Ok(a), Ok(e)) => (a, e),
+            _ => return Err((Erreur::ENOMEM, None)),
+        };
         let mut descripteurs = Descripteurs::new();
-        appels_fichiers::ouvrir_console(&mut descripteurs)?;
-        let racine = vfs::avec(|fs, _| fs.racine());
-        let f = appels_fichiers::ouvrir_inode(racine, b"/", Sorte::Dossier)?;
-        if descripteurs.installer(PREOUVERT, Descripteur { fichier: f, fermer_a_l_exec: false }).is_err() {
-            vfs::avec_systeme(|s, cadres| s.lacher(f, cadres));
-            return Err(Erreur::ENOMEM);
+        appels_fichiers::ouvrir_console(&mut descripteurs).map_err(|e| (e, None))?;
+        let mut wasi = Wasi { descripteurs, identite, preouverts: Vec::new(), arguments, environnement };
+        if wasi.preouverts.try_reserve_exact(dossiers.len()).is_err() {
+            return Err((Erreur::ENOMEM, None));
         }
-        let identite = Identite { uid: pile::UTILISATEUR as u32, gid: pile::GROUPE as u32 };
-        Ok(Wasi { descripteurs, identite, preouvert: true })
+        for (i, &dossier) in dossiers.iter().enumerate() {
+            let fd = PREMIER_PREOUVERT + i as u64;
+            let mut nom = Vec::new();
+            nom.try_reserve_exact(dossier.len()).map_err(|_| (Erreur::ENOMEM, None))?;
+            nom.extend_from_slice(dossier);
+            // `wasi` est rendu en cas d'erreur : son Drop ferme ce qui est
+            // déjà ouvert.
+            let f = appels_fichiers::ouvrir_pour(identite, dossier, true, false, true).map_err(|e| (e, Some(dossier)))?;
+            if wasi.descripteurs.installer(fd, Descripteur { fichier: f, fermer_a_l_exec: false }).is_err() {
+                vfs::avec_systeme(|s, cadres| s.lacher(f, cadres));
+                return Err((Erreur::ENOMEM, None));
+            }
+            wasi.preouverts.push(Preouvert { fd, nom });
+        }
+        Ok(wasi)
+    }
+
+    /// Le dossier pré-ouvert du descripteur `fd`, s'il en est un.
+    fn preouvert(&self, fd: u32) -> Option<&Preouvert> {
+        self.preouverts.iter().find(|p| p.fd == fd as u64)
     }
 }
 
@@ -217,6 +276,14 @@ pub fn imports(magasin: &mut Magasin, module: &ModuleValide) -> Result<Vec<Exter
             "fd_readdir" => (FD_READDIR, &[I32, I32, I32, I64, I32], &[I32]),
             // clock_time_get(horloge, precision, temps) -> errno
             "clock_time_get" => (CLOCK_TIME_GET, &[I32, I64, I32], &[I32]),
+            // args_sizes_get(nombre, taille) -> errno
+            "args_sizes_get" => (ARGS_SIZES_GET, &[I32, I32], &[I32]),
+            // args_get(pointeurs, chaines) -> errno
+            "args_get" => (ARGS_GET, &[I32, I32], &[I32]),
+            // environ_sizes_get(nombre, taille) -> errno
+            "environ_sizes_get" => (ENVIRON_SIZES_GET, &[I32, I32], &[I32]),
+            // environ_get(pointeurs, chaines) -> errno
+            "environ_get" => (ENVIRON_GET, &[I32, I32], &[I32]),
             // proc_exit(code)
             "proc_exit" => (PROC_EXIT, &[I32], &[]),
             _ => return Err(format!("import inconnu : {} {}", import.module, import.nom)),
@@ -271,11 +338,48 @@ impl Hote for Wasi {
             PATH_FILESTAT_GET => self.path_filestat_get(a(0), a(1), a(2), a(3), a(4), m),
             FD_READDIR => self.fd_readdir(a(0), a(1), a(2), a64(3), a(4), m, cout),
             CLOCK_TIME_GET => clock_time_get(a(0), a(2), m),
+            ARGS_SIZES_GET => tailles(&self.arguments, a(0), a(1), m),
+            ARGS_GET => chaines(&self.arguments, a(0), a(1), m, cout),
+            ENVIRON_SIZES_GET => tailles(&self.environnement, a(0), a(1), m),
+            ENVIRON_GET => chaines(&self.environnement, a(0), a(1), m, cout),
             _ => unreachable!("fonction hote inconnue"),
         };
         resultats[0] = Valeur::I32(errno);
         Ok(())
     }
+}
+
+/// args_sizes_get, environ_sizes_get : le nombre de chaînes, et la place
+/// qu'elles prennent (zéros finaux compris).
+fn tailles(chaines: &(Vec<u8>, u32), nombre: u32, taille: u32, m: &mut [u8]) -> u32 {
+    match ecrire(m, nombre, &chaines.1.to_le_bytes()).and_then(|()| ecrire(m, taille, &(chaines.0.len() as u32).to_le_bytes())) {
+        Ok(()) => SUCCES,
+        Err(e) => e,
+    }
+}
+
+/// args_get, environ_get : les chaînes à `tampon`, à la suite, et l'adresse
+/// de chacune dans le tableau `pointeurs` (des adresses de 32 bits). Tout
+/// est vérifié avant d'écrire : un tableau hors de la mémoire ne laisse
+/// rien d'écrit à moitié. Le travail, proportionnel aux octets, est compté
+/// en carburant.
+fn chaines(chaines: &(Vec<u8>, u32), pointeurs: u32, tampon: u32, m: &mut [u8], cout: &mut u64) -> u32 {
+    let (octets, nombre) = (&chaines.0, chaines.1);
+    let taille_tableau = nombre.checked_mul(4);
+    if taille_tableau.and_then(|t| plage(m, pointeurs, t)).is_none() || plage(m, tampon, octets.len() as u32).is_none() {
+        return EFAULT;
+    }
+    *cout += octets.len() as u64 + nombre as u64;
+    let mut adresse = tampon;
+    let mut i = 0;
+    for chaine in octets.split_inclusive(|&o| o == 0) {
+        // Vérifiés plus haut : ces écritures tiennent dans la mémoire.
+        let _ = ecrire(m, pointeurs + 4 * i, &adresse.to_le_bytes());
+        adresse += chaine.len() as u32;
+        i += 1;
+    }
+    let _ = ecrire(m, tampon, octets);
+    SUCCES
 }
 
 /// Les `longueur` octets de la mémoire du programme à partir de `adresse`,
@@ -490,26 +594,23 @@ impl Wasi {
         match self.descripteurs.retirer(fd as u64) {
             Some(d) => {
                 vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
-                if fd as u64 == PREOUVERT {
-                    self.preouvert = false;
-                }
+                self.preouverts.retain(|p| p.fd != fd as u64);
                 SUCCES
             }
             None => EBADF,
         }
     }
 
-    /// fd_prestat_get : le descripteur 3 est un dossier pré-ouvert, de nom
-    /// « / », tant qu'il n'a pas été fermé ; les autres n'en sont pas
-    /// (EBADF : wasi-libc s'arrête là).
+    /// fd_prestat_get : les descripteurs des dossiers pré-ouverts, tant
+    /// qu'ils n'ont pas été fermés ; les autres n'en sont pas (EBADF :
+    /// wasi-libc parcourt 3, 4... et s'arrête au premier EBADF).
     fn fd_prestat_get(&self, fd: u32, adresse: u32, m: &mut [u8]) -> u32 {
-        if fd as u64 != PREOUVERT || !self.preouvert {
-            return EBADF;
-        }
+        let Some(p) = self.preouvert(fd) else { return EBADF };
         // Le « prestat » : une étiquette (0 : un dossier), puis la longueur
         // de son nom sur 32 bits.
+        let longueur = p.nom.len() as u32;
         let mut p = [0u8; 8];
-        p[4..].copy_from_slice(&1u32.to_le_bytes());
+        p[4..].copy_from_slice(&longueur.to_le_bytes());
         match ecrire(m, adresse, &p) {
             Ok(()) => SUCCES,
             Err(e) => e,
@@ -519,13 +620,11 @@ impl Wasi {
     /// fd_prestat_dir_name : le nom du dossier pré-ouvert. Une place trop
     /// petite pour le nom : ENAMETOOLONG, comme wasmtime.
     fn fd_prestat_dir_name(&self, fd: u32, adresse: u32, longueur: u32, m: &mut [u8]) -> u32 {
-        if fd as u64 != PREOUVERT || !self.preouvert {
-            return EBADF;
-        }
-        if longueur < 1 {
+        let Some(p) = self.preouvert(fd) else { return EBADF };
+        if (longueur as usize) < p.nom.len() {
             return ENAMETOOLONG;
         }
-        match ecrire(m, adresse, b"/") {
+        match ecrire(m, adresse, &p.nom) {
             Ok(()) => SUCCES,
             Err(e) => e,
         }

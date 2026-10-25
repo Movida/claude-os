@@ -20,5 +20,6 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod commande;
 pub mod cpio;
 pub mod elf;

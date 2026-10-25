@@ -167,22 +167,47 @@ fn sorte(mode: u32, rdev: (u32, u32)) -> Result<Sorte, i64> {
 /// Ouvre `chemin` pour le noyau lui-même, en root : la console des
 /// programmes (le `console_on_rootfs` de Linux). Rend le fichier ouvert.
 pub fn ouvrir_pour_le_noyau(chemin: &[u8], lecture: bool, ecriture: bool) -> Result<Fichier, Erreur> {
+    ouvrir_pour(fichiers::Identite::ROOT, chemin, lecture, ecriture, false)
+}
+
+/// Ouvre `chemin`, absolu, depuis la racine, comme le ferait `qui` : avec
+/// ses droits (traverser chaque dossier, lire ou écrire l'objet). Pour le
+/// noyau, avant qu'un programme existe : les dossiers pré-ouverts d'un
+/// programme WebAssembly (`dossier` : il doit en être un, ENOTDIR sinon).
+pub fn ouvrir_pour(qui: fichiers::Identite, chemin: &[u8], lecture: bool, ecriture: bool, dossier: bool)
+    -> Result<Fichier, Erreur> {
     vfs::avec_systeme(|s, cadres| {
         let racine = s.fs.racine();
-        let depart = Depart { racine, dossier: racine, qui: fichiers::Identite::ROOT, sous: false };
+        let depart = Depart { racine, dossier: racine, qui, sous: false };
         let fin = resoudre(&s.fs, &depart, chemin, Suivre::Toujours)?;
-        let o = Ouverture { lecture, ecriture, ..Ouverture::default() };
-        let ouvert = s.fs.ouvrir(fichiers::Identite::ROOT, &fin, &o, temps::maintenant())?;
+        let o = Ouverture { lecture, ecriture, dossier, ..Ouverture::default() };
+        let ouvert = s.fs.ouvrir(qui, &fin, &o, temps::maintenant())?;
         let a = s.fs.attributs(ouvert.numero);
         let Ok(sorte) = sorte(a.mode, a.rdev) else {
             s.fs.fermer(&ouvert, cadres);
             return Err(Erreur::ENXIO);
         };
-        let drapeaux = O_LARGEFILE | if ecriture && lecture { 2 } else if ecriture { O_WRONLY } else { O_RDONLY };
+        let drapeaux = O_LARGEFILE
+            | if ecriture && lecture { 2 } else if ecriture { O_WRONLY } else { O_RDONLY }
+            | if dossier { O_DIRECTORY } else { 0 };
         s.ouverts.ajouter(FichierOuvert::new(sorte, ouvert, lecture, ecriture, drapeaux as u32, chemin)).map_err(|f| {
             s.fs.fermer(&f.ouvert, cadres);
             Erreur::ENOMEM
         })
+    })
+}
+
+/// Le fichier que désigne `chemin`, absolu, depuis la racine, résolu comme
+/// `execve` le ferait pour `qui` (liens suivis, droit de traverser chaque
+/// dossier, ENOTDIR pour une barre finale après autre chose qu'un
+/// dossier). L'inode est tenu une fois : à lâcher après usage.
+pub fn trouver_pour(qui: fichiers::Identite, chemin: &[u8]) -> Result<Numero, Erreur> {
+    vfs::avec(|fs, _| {
+        let racine = fs.racine();
+        let depart = Depart { racine, dossier: racine, qui, sous: false };
+        let n = fichiers::chemins::trouver(fs, &depart, chemin, true)?;
+        fs.prendre(n);
+        Ok(n)
     })
 }
 
