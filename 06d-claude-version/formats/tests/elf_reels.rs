@@ -10,7 +10,9 @@
 //!     disposition d'avant binutils 2.31 : code et en-têtes dans un seul
 //!     segment, données dans un second qui commence au milieu d'une page.
 //! Et contre ld-linux et la glibc partagée de la machine, lus là où Ubuntu
-//! les installe (/usr/lib/x86_64-linux-gnu), jamais copiés dans le dépôt.
+//! les installe (/usr/lib/x86_64-linux-gnu), jamais copiés dans le dépôt ;
+//! et contre le vrai `claude` (6d), que le Makefile télécharge à une
+//! version figée hors du dépôt, et dont il donne le chemin (CLAUDE_BINAIRE).
 //! Ces fichiers changent d'une révision de la glibc à l'autre (la CI peut
 //! en avoir une autre que la machine de développement) : on vérifie des
 //! PROPRIÉTÉS (le genre, l'interpréteur, un point d'entrée exécutable...),
@@ -158,6 +160,24 @@ fn gcc_static_pie() {
     let taille = x.etendue().1;
     assert!(x.placer(PERMISES.fin - taille, PERMISES).is_ok());
     assert!(x.placer(PERMISES.fin - taille + 4096, PERMISES).is_err());
+}
+
+/// Le vrai `claude` 2.1.310 (Bun) : un ET_EXEC à 0x200000, dynamique, de
+/// trois PT_LOAD (R 27 Mo, R+X 86 Mo, R+W 178 Mo, mesurés par readelf),
+/// que le noyau doit accepter. Des propriétés seulement : une autre version
+/// garderait la forme, pas les tailles.
+#[test]
+fn claude() {
+    let chemin = std::env::var_os("CLAUDE_BINAIRE").expect("CLAUDE_BINAIRE : lancer `make tests-hote`");
+    let o = lire_fichier(Path::new(&chemin));
+    let x = placer_fixe(&o).expect("claude refuse");
+    assert_eq!(x.executable().genre(), Genre::Fixe);
+    assert_eq!(interpreteur(&o, x.executable()), Some(INTERPRETEUR));
+    let segments: Vec<_> = x.segments().collect();
+    assert_eq!(segments.len(), 3);
+    assert!(segments[1].execution && !segments[1].ecriture && segments[2].ecriture && !segments[2].execution);
+    assert_eq!(x.etendue().0, 0x200000);
+    verifier_image(&x);
 }
 
 /// `gcc` sans option : un PIE qui demande ld-linux.

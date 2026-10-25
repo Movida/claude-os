@@ -514,6 +514,39 @@ tests-demarrage.txt: Makefile
 
 PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx bonjour-asm-pile-executable bonjour-c bonjour-c-deux-segments bonjour-c-pie bonjour-c-dynamique)
 
+# Le vrai `claude` (6d), Claude Code 2.1.310 : le binaire du paquet npm
+# officiel de la plateforme (@anthropic-ai/claude-code-linux-x64, celui que
+# la fonctionnalité claude-code du devcontainer installe), téléchargé une
+# fois, à une version figée, et vérifié par l'empreinte SHA-256 DU BINAIRE
+# (c'est lui qu'on exécute), comme wabt. Gardé hors du dépôt, dans un cache
+# que partagent les sous-étapes suivantes : jamais commité ni publié (« All
+# rights reserved ») ; l'image boot.bin qui le contient ne l'est pas non
+# plus (*.bin). L'archive npm est lue en flux : seul package/claude en
+# sort, dans un fichier temporaire, renommé une fois la somme vérifiée
+# (une copie à moitié écrite ne sert jamais). Ce fichier a un nom à lui
+# (mktemp) : deux constructions qui téléchargent en même temps (le dossier
+# de travail et un worktree de verifier-historique, qui partagent le
+# cache) n'écrivent pas le même ; et il est effacé quoi qu'il arrive
+# (trap), même par un Ctrl+C pendant curl. Le nom du binaire porte son
+# empreinte : une autre empreinte est un autre fichier, téléchargé à son
+# tour. Et l'empreinte est revérifiée à chaque construction de l'archive
+# (une demi-seconde) : un fichier du cache abîmé ou remplacé n'entre
+# jamais dans l'image. Pas de cache de la CI pour lui (`actions/cache` se
+# lit depuis une demande de fusion venue d'une copie du dépôt) : la CI le
+# télécharge à chaque fois.
+CLAUDE_VERSION = 2.1.310
+CLAUDE_URL     = https://registry.npmjs.org/@anthropic-ai/claude-code-linux-x64/-/claude-code-linux-x64-$(CLAUDE_VERSION).tgz
+CLAUDE_SHA256  = b73676430af12f97316a798b8371f81d640f90a58bdcb8f3ce56a835bb47df56
+CLAUDE_CACHE   = $(HOME)/.cache/claude-os
+CLAUDE         = $(CLAUDE_CACHE)/claude-$(CLAUDE_VERSION)-$(CLAUDE_SHA256)
+
+$(CLAUDE):
+	mkdir -p $(CLAUDE_CACHE)
+	tmp=$$(mktemp $(CLAUDE_CACHE)/.telechargement.XXXXXX) && trap 'rm -f "$$tmp"' EXIT && \
+	curl -sSfL $(CLAUDE_URL) | tar -xzO package/claude > "$$tmp" && \
+	echo "$(CLAUDE_SHA256)  $$tmp" | sha256sum -c --quiet && \
+	chmod 755 "$$tmp" && mv "$$tmp" $@
+
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
 # puis lance ce que dit son /etc/demarrage (voir archive.sh).
 programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc FORCE
@@ -622,10 +655,10 @@ SHELL = /bin/bash
 # sources, servirait sinon telle quelle à la construction suivante.
 .DELETE_ON_ERROR:
 
-tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
+tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
-	cd formats && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd fichiers && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
