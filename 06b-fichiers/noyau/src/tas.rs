@@ -7,22 +7,38 @@
 //! de Linux (mm/slub.c), on range les petites par CLASSES de taille :
 //! 16, 32, 64... jusqu'à 2048 octets. Chaque classe découpe des pages en
 //! objets de sa taille, et garde la liste de ses objets libres, chaînés à
-//! travers eux-mêmes (un objet libre contient l'adresse du suivant).
-//! Allouer : prendre le premier de la liste (et, si elle est vide, découper
-//! une nouvelle page). Libérer : le remettre en tête. Les deux en temps
-//! constant, sans chercher. Au-delà de 2048 octets, l'allocation prend
-//! directement un bloc de pages.
+//! travers eux-mêmes (un objet libre contient l'adresse du suivant et du
+//! précédent). Allouer : prendre le premier de la liste (et, si elle est
+//! vide, découper une nouvelle page). Libérer : le remettre en tête. Les
+//! deux en temps constant, sans chercher. Au-delà de 2048 octets,
+//! l'allocation prend directement un bloc de pages.
+//!
+//! Une page VIDE retourne à l'allocateur de pages (6b) : le descripteur de
+//! chaque cadre (pages.rs) compte les objets occupés de la page, comme le
+//! `inuse` du slab de Linux. Quand le dernier est rendu, tous les objets de
+//! la page sont dans la liste de la classe ; la liste est doublement
+//! chaînée, on les en retire donc chacun en temps constant (on connaît
+//! leurs adresses : la page découpée à la taille de la classe), et la page
+//! est rendue. Sans cela, la mémoire prise un jour par une classe ne
+//! revenait jamais : un programme qui crée cent fichiers puis les efface
+//! (des noms de quelques octets, des entrées de dossier) laissait derrière
+//! lui des pages qui ne servaient plus, et la vérification « memoire
+//! rendue » de chaque programme ne pouvait plus rien dire.
 //!
 //! Ce qui est plus simple que dans SLUB :
-//!   - aucune description par objet ni par page : Rust donne la taille de
-//!     l'objet à la libération (le `Layout`), d'où l'on retrouve sa classe.
-//!     Linux, dont kfree ne connaît que l'adresse, doit la chercher dans la
-//!     struct page ;
-//!   - une page découpée pour une classe y reste, même vide : SLUB compte
-//!     les objets de chaque page pour rendre les pages vides à l'allocateur
-//!     de pages ;
-//!   - une seule liste, sous un seul verrou : SLUB en a une par processeur,
-//!     pour ne pas se disputer le verrou (on n'a qu'un processeur).
+//!   - aucune description par objet : Rust donne la taille de l'objet à la
+//!     libération (le `Layout`), d'où l'on retrouve sa classe. Linux, dont
+//!     kfree ne connaît que l'adresse, doit la chercher dans la struct page ;
+//!   - une seule liste d'objets libres par classe, au lieu d'une par page :
+//!     SLUB sert les objets page par page, pour qu'ils restent groupés (et
+//!     que les pages se vident plus souvent) ; ici une page ne se vide que
+//!     si tous ses objets sont rendus, dans n'importe quel ordre ;
+//!   - aucune page vide gardée en réserve : SLUB en garde quelques-unes par
+//!     classe (`min_partial`), pour ne pas rendre puis reprendre sans cesse
+//!     une page au buddy. Rendre tout de suite coûte de redécouper une page
+//!     de temps en temps, et garde exact le compte de la mémoire ;
+//!   - un seul verrou : SLUB a des listes par processeur, pour ne pas se
+//!     disputer le verrou (on n'a qu'un processeur).
 //!
 //! Un seul bloc ne dépasse pas 4 Mio (pages::ORDRE_MAX) : au-delà, une
 //! allocation échoue. `try_reserve` le dit proprement (memory.grow d'un
@@ -46,6 +62,29 @@ struct Tas {
     /// Pour chaque classe, le premier objet libre (adresse virtuelle), 0
     /// si la liste est vide.
     libres: [usize; CLASSES],
+}
+
+/// Les liens d'un objet libre dans la liste de sa classe, rangés au début de
+/// l'objet (16 octets : la plus petite classe).
+#[repr(C)]
+struct Liens {
+    suivant: usize,
+    precedent: usize,
+}
+
+/// Les liens de l'objet libre `objet`.
+///
+/// # Safety
+/// `objet` doit être un objet libre du tas (personne d'autre ne s'en sert),
+/// d'au moins 16 octets, aligné sur 8.
+unsafe fn liens(objet: usize) -> &'static mut Liens {
+    // SAFETY : garanti par l'appelant.
+    unsafe { &mut *(objet as *mut Liens) }
+}
+
+/// La page (adresse physique) qui contient l'objet `objet`.
+fn page_de(objet: usize) -> u64 {
+    espace::physique((objet & !(PAGE - 1)) as u64)
 }
 
 static TAS: Verrou<Tas> = Verrou::new(Tas { libres: [0; CLASSES] });
@@ -78,9 +117,9 @@ impl Tas {
             return null_mut();
         }
         let objet = self.libres[c];
-        // SAFETY : `objet` est un objet libre de la classe, qui contient
-        // l'adresse du suivant.
-        self.libres[c] = unsafe { *(objet as *const usize) };
+        // SAFETY : `objet` est le premier objet libre de la classe.
+        unsafe { self.retirer(c, objet) };
+        pages::compter_objets(page_de(objet), true);
         objet as *mut u8
     }
 
@@ -88,20 +127,67 @@ impl Tas {
     /// `objet` doit avoir été alloué dans la classe `c`, et n'être plus
     /// utilisé.
     unsafe fn liberer(&mut self, c: usize, objet: *mut u8) {
-        // SAFETY : garanti par l'appelant ; l'objet fait au moins 16
-        // octets, assez pour l'adresse du suivant.
-        unsafe { *(objet as *mut usize) = self.libres[c] };
-        self.libres[c] = objet as usize;
+        let objet = objet as usize;
+        // SAFETY : garanti par l'appelant.
+        unsafe { self.inserer(c, objet) };
+        let page = page_de(objet);
+        if pages::compter_objets(page, false) == 0 {
+            // La page est vide : tous ses objets sont dans la liste. On les
+            // en retire, et la page retourne à l'allocateur de pages.
+            let debut = objet & !(PAGE - 1);
+            for o in (debut..debut + PAGE).step_by(PLUS_PETITE << c) {
+                // SAFETY : un objet de la page vide, donc libre.
+                unsafe { self.retirer(c, o) };
+            }
+            pages::liberer(page, 0);
+        }
     }
 
-    /// Découpe une nouvelle page en objets libres de la classe `c`.
+    /// Met `objet` en tête de la liste de la classe `c`.
+    ///
+    /// # Safety
+    /// `objet` doit être un objet de la classe `c` que personne n'utilise,
+    /// hors de la liste.
+    unsafe fn inserer(&mut self, c: usize, objet: usize) {
+        let tete = self.libres[c];
+        // SAFETY : `objet` est libre (l'appelant), `tete` aussi.
+        unsafe {
+            *liens(objet) = Liens { suivant: tete, precedent: 0 };
+            if tete != 0 {
+                liens(tete).precedent = objet;
+            }
+        }
+        self.libres[c] = objet;
+    }
+
+    /// Retire `objet` de la liste de la classe `c`.
+    ///
+    /// # Safety
+    /// `objet` doit être dans cette liste.
+    unsafe fn retirer(&mut self, c: usize, objet: usize) {
+        // SAFETY : `objet` et ses voisins sont des objets libres de la liste.
+        unsafe {
+            let Liens { suivant, precedent } = *liens(objet);
+            if precedent == 0 {
+                self.libres[c] = suivant;
+            } else {
+                liens(precedent).suivant = suivant;
+            }
+            if suivant != 0 {
+                liens(suivant).precedent = precedent;
+            }
+        }
+    }
+
+    /// Découpe une nouvelle page en objets libres de la classe `c`. Aucun
+    /// n'est encore occupé.
     fn decouper(&mut self, c: usize) -> bool {
         let Some(page) = pages::allouer(0) else { return false };
         let debut = espace::virtuelle(page) as usize;
         // À l'envers, pour que la liste les donne ensuite dans l'ordre.
         for objet in (debut..debut + PAGE).step_by(PLUS_PETITE << c).rev() {
             // SAFETY : la page vient d'être allouée, ses objets sont à nous.
-            unsafe { self.liberer(c, objet as *mut u8) };
+            unsafe { self.inserer(c, objet) };
         }
         true
     }

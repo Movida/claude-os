@@ -179,10 +179,11 @@ impl Memoire {
         // grandit en blocs de pages : le tas du noyau prend les blocs de
         // plus de 2 Kio directement à l'allocateur de pages, et les lui
         // rend à la destruction du programme. Une petite carte, elle,
-        // viendrait des classes du tas, qui gardent leurs pages même
-        // vides (tas.rs) : la mémoire du premier programme qui atteint une
-        // taille de carte ne reviendrait jamais à l'allocateur de pages, et
-        // la vérification « memoire rendue » ne pourrait plus rien dire.
+        // viendrait des classes du tas (tas.rs), et partagerait sa page
+        // avec d'autres objets du noyau pris pendant le programme (le nom
+        // d'un fichier qu'il crée et laisse) : la page ne reviendrait
+        // qu'avec le dernier d'entre eux, et la vérification « memoire
+        // rendue » de chaque programme se tromperait.
         let zones = Zones::avec_capacite(PAGE as usize / size_of::<Zone>())?;
         Ok(Memoire { espace: EspaceUtilisateur::creer()?, zones, debut_tas: 0, fin_tas: 0, nom })
     }

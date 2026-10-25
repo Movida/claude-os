@@ -16,7 +16,7 @@ rendu puis redonne : ok.
 [noyau] Allocateur buddy :
 [noyau] Memoire des programmes : surengagement (OVERCOMMIT_GUESS), reserve du noyau de 
 rendues et recollees : ok.
-[noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok.
+[noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 

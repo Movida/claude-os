@@ -299,6 +299,15 @@ pub fn lacher(cadre: u64) -> bool {
     true
 }
 
+/// Un objet de plus (`plus`) ou de moins occupé dans la page du tas
+/// `cadre` (tas.rs) : rend le nouveau compte.
+pub fn compter_objets(cadre: u64, plus: bool) -> u16 {
+    let mut pages = PAGES.verrouiller();
+    let d = bloc_alloue(&mut pages, cadre, 0);
+    d.objets = if plus { d.objets + 1 } else { d.objets - 1 };
+    d.objets
+}
+
 /// Combien de fois le cadre `cadre` (une page allouée) est pris.
 pub fn references(cadre: u64) -> u32 {
     bloc_alloue(&mut PAGES.verrouiller(), cadre, 0).references

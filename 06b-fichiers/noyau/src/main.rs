@@ -375,8 +375,18 @@ fn tester_tas() {
     drop(unsafe { Box::from_raw(a) });
     let b = Box::new(2u32);
     let reutilise = core::hint::black_box(&*b as *const u32 as usize) == adresse_a;
-    afficherln!("[noyau] Tas : {}, Box, String, 1 Mio d'un bloc ({} octets a 1) : {}.",
-                texte, grand.iter().filter(|&&o| o == 1).count(), if reutilise { "ok" } else { "ECHEC" });
+    // Mille objets de 100 octets (la classe de 128 : 32 par page), rendus :
+    // les pages découpées pour eux reviennent à l'allocateur de pages. Le
+    // tableau des boîtes (8000 octets) prend, lui, un bloc de pages, rendu
+    // aussi.
+    let libres = pages::libres();
+    let boites: Vec<Box<[u8; 100]>> = (0..1000).map(|_| Box::new([7; 100])).collect();
+    let prises = libres - pages::libres();
+    drop(boites);
+    let rendues = prises >= 1000 / 32 && pages::libres() == libres;
+    afficherln!("[noyau] Tas : {}, Box, String, 1 Mio d'un bloc ({} octets a 1) : {} ; pages vides rendues : {}.",
+                texte, grand.iter().filter(|&&o| o == 1).count(), if reutilise { "ok" } else { "ECHEC" },
+                if rendues { "ok" } else { "ECHEC" });
 }
 
 /// Une récursion sans fin (ou presque : la condition, jamais vraie, évite
