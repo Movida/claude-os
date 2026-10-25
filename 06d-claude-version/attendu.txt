@@ -22,6 +22,7 @@ memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
+[noyau] sysfs monte sur /sys.
 [noyau] Archive deballee : dossiers 11, fichiers 31, liens symboliques 5, liens physiques 1 ; archive rendue (
 [noyau] Lancement : /etc/demarrage, 20 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.

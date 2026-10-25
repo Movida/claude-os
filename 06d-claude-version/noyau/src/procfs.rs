@@ -32,7 +32,7 @@ use core::fmt::{self, Write};
 
 use crate::descripteurs::{Donnees, Fichier, Lecture};
 use crate::espace_utilisateur::ADRESSE_MIN;
-use crate::{appels_fichiers, processus, vfs};
+use crate::{appels_fichiers, processus, sysfs, vfs};
 use fichiers::montages::Monte;
 use fichiers::noyaufs::{Cible, Contenu, Enregistrement, Genre, NoyauFs};
 use fichiers::{Erreur, Temps};
@@ -108,7 +108,8 @@ pub fn retirer_processus(pid: u32) {
     })
 }
 
-/// Comment se lit la source `source` d'un système du noyau.
+/// Comment se lit la source `source` d'un système du noyau : les
+/// séquences et les valeurs de /proc, les attributs de /sys.
 pub fn lecture(source: u32) -> Lecture {
     match source {
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR => Lecture::Valeur,
@@ -210,8 +211,18 @@ fn valeur(source: u32) -> Result<Vec<u8>, Erreur> {
 }
 
 /// L'enregistrement de la source `source` (pour le processus `argument`)
-/// qui suit `curseur`.
+/// qui suit `curseur` : celles de /proc ici, celles de /sys (un seul
+/// enregistrement, sa valeur) dans sysfs.rs.
 fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, Erreur> {
+    if let Some(valeur) = sysfs::attribut(source) {
+        if curseur > 0 {
+            return Ok(None);
+        }
+        let mut v = Vec::new();
+        v.try_reserve_exact(valeur.len()).map_err(|_| Erreur::ENOMEM)?;
+        v.extend_from_slice(valeur);
+        return Ok(Some((v, 1)));
+    }
     // Le dossier d'un processus terminé a été retiré avec ses fichiers ;
     // avec un seul processus à la fois, celui qu'on lit est le processus en
     // cours.

@@ -51,6 +51,7 @@ mod processus;
 mod programmes;
 mod serie;
 mod signaux;
+mod sysfs;
 mod sse;
 mod tache;
 mod tas;

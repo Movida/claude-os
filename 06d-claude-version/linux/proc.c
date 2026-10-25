@@ -1,11 +1,12 @@
 /*
- * /proc (6d) : ce qu'y lit Bun (maps, statm, /proc/sys/vm), et ce qu'en dit
+ * /proc et /sys (6d) : ce qu'y lit Bun (maps, statm, /proc/sys/vm, le
+ * nombre de processeurs, le réglage des grandes pages), et ce qu'en dit
  * Linux 6.18 (mesuré). Il tourne dans notre noyau et sur l'hôte (make
  * tests-hote) : chaque ligne doit dire « ok » des deux côtés. Ce qui dépend
  * de la machine (les valeurs des réglages, le nombre exact de pages
  * résidentes, ce que contient /proc en plus) n'est vérifié exactement que
  * chez nous ; sur l'hôte, aucune écriture n'est essayée sous /proc/sys
- * (montée en lecture seule dans un conteneur).
+ * ni sous /sys (montés en lecture seule dans un conteneur).
  */
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -22,7 +23,9 @@
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
+#include <sched.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <sys/sysmacros.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -403,6 +406,86 @@ static void modifications(void)
     unlink(fichier);
 }
 
+/* Le nombre de processeurs d'une liste de Linux (« 0-3,5 »). */
+static int compter(const char *liste)
+{
+    int n = 0, a, b;
+    const char *p = liste;
+    while (*p && *p != '\n') {
+        int lu = 0;
+        if (sscanf(p, "%d-%d%n", &a, &b, &lu) == 2)
+            n += b - a + 1;
+        else if (sscanf(p, "%d%n", &a, &lu) == 1)
+            n += 1;
+        else
+            return -1;
+        p += lu;
+        if (*p == ',')
+            p++;
+    }
+    return n;
+}
+
+static void sys(void)
+{
+    char online[64] = { 0 }, possible[64] = { 0 }, present[64] = { 0 }, thp[128] = { 0 };
+    lire_tout("/sys/devices/system/cpu/online", online, sizeof online, sizeof online);
+    lire_tout("/sys/devices/system/cpu/possible", possible, sizeof possible, sizeof possible);
+    lire_tout("/sys/devices/system/cpu/present", present, sizeof present, sizeof present);
+    cpu_set_t c;
+    sched_getaffinity(0, sizeof c, &c);
+    verifier(compter(online) >= CPU_COUNT(&c) && compter(online) == get_nprocs() && compter(possible) == get_nprocs_conf()
+             && compter(present) >= 1, "cpu/online, possible, present : des listes de Linux, celles de get_nprocs et get_nprocs_conf");
+    if (chez_nous)
+        verifier(!strcmp(online, "0\n") && !strcmp(possible, "0\n") && !strcmp(present, "0\n") && get_nprocs() == 1
+                 && get_nprocs_conf() == 1, "chez nous : le processeur 0 seul");
+    lire_tout("/sys/kernel/mm/transparent_hugepage/enabled", thp, sizeof thp, sizeof thp);
+    const char *ouvre = strchr(thp, '['), *ferme = strchr(thp, ']');
+    verifier(ouvre && ferme > ouvre && strchr(ouvre + 1, '[') == NULL, "transparent_hugepage/enabled : un choix entre crochets");
+    if (chez_nous)
+        verifier(!strcmp(thp, "always madvise [never]\n"), "chez nous : always madvise [never]");
+    struct stat s, r, p;
+    stat("/sys/devices/system/cpu/online", &s);
+    verifier(s.st_size == 4096 && s.st_blksize == 4096 && (s.st_mode & 07777) == 0444 && s.st_uid == 0,
+             "fstat de cpu/online : une page, blocs de 4096, 0444, a root");
+    stat("/sys/kernel/mm/transparent_hugepage/enabled", &s);
+    verifier((s.st_mode & 07777) == 0644, "transparent_hugepage/enabled : 0644");
+    stat("/sys/devices/system/cpu", &s);
+    stat("/", &r);
+    stat("/proc", &p);
+    verifier(S_ISDIR(s.st_mode) && (s.st_mode & 07777) == 0755 && s.st_dev != r.st_dev && s.st_dev != p.st_dev,
+             "/sys/devices/system/cpu : 0755, un systeme a lui");
+    /* Un attribut se lit comme un seq_file, et se déplace comme un fichier
+     * d'une page. */
+    char un[64] = { 0 }, morceaux_[64] = { 0 };
+    lire_tout("/sys/devices/system/cpu/online", morceaux_, sizeof morceaux_, 1);
+    lire_tout("/sys/devices/system/cpu/online", un, sizeof un, sizeof un);
+    verifier(!strcmp(un, morceaux_), "lu octet par octet : la meme valeur");
+    int fd = open("/sys/devices/system/cpu/online", O_RDONLY);
+    char x;
+    verifier(pread(fd, &x, 1, 1) == 1 && x == un[1], "pread a la position 1");
+    verifier(lseek(fd, 0, SEEK_END) == 4096 && lseek(fd, 0, SEEK_DATA) == 0 && lseek(fd, 0, SEEK_HOLE) == 4096
+             && erreur(lseek(fd, 5000, SEEK_DATA)) == ENXIO, "lseek : SEEK_END 4096, SEEK_DATA 0, SEEK_HOLE 4096, au-dela ENXIO");
+    verifier(erreur(lseek(fd, -5, SEEK_DATA)) == ENXIO && erreur(lseek(fd, -5, SEEK_HOLE)) == ENXIO,
+             "SEEK_DATA et SEEK_HOLE a -5 : ENXIO (compare sans signe)");
+    int reste = 7;
+    verifier(lseek(fd, 3, SEEK_SET) == 3 && ioctl(fd, FIONREAD, &reste) == 0 && reste == 4093 && fsync(fd) == 0,
+             "FIONREAD a la position 3 : 4093 ; fsync : 0 (sysfs en a un)");
+    int ep = epoll_create1(0);
+    struct epoll_event ev = { .events = EPOLLIN };
+    verifier(epoll_ctl(ep, EPOLL_CTL_ADD, fd, &ev) == 0, "epoll d'un attribut : accepte");
+    close(ep);
+    close(fd);
+    fd = open("/sys/devices", O_RDONLY);
+    verifier(erreur(fsync(fd)) == EINVAL, "fsync d'un dossier de /sys : EINVAL");
+    close(fd);
+    verifier(erreur(symlink("x", "/sys/x/")) == ENOENT, "symlink vers un nom de /sys avec une barre finale : ENOENT");
+    if (chez_nous)
+        verifier(erreur(access("/sys/devices/system/node/node1", R_OK)) == ENOENT
+                 && erreur(open("/sys/kernel/mm/transparent_hugepage/enabled", O_WRONLY)) == EACCES
+                 && erreur(mkdir("/sys/x", 0755)) == EACCES, "chez nous : pas de NUMA, rien a ecrire (EACCES)");
+}
+
 int main(void)
 {
     chez_nous = access("/etc/bonjour.txt", F_OK) == 0;
@@ -412,6 +495,7 @@ int main(void)
     memoire();
     arborescence();
     modifications();
+    sys();
     printf("[linux] proc : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

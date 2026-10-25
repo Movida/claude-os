@@ -99,7 +99,7 @@ pub struct Systeme {
     pub montes: Vec<(Numero, NoyauFs)>,
 }
 
-/// La place de procfs dans la table des montages.
+/// La place de procfs dans la table des montages (sysfs est la suivante).
 pub const PROC: usize = 0;
 
 impl Systeme {
@@ -253,6 +253,7 @@ pub fn initialiser(archive: Option<&[u8]>) -> Result<Bilan, Erreur> {
     }
     creer_dev()?;
     monter("procfs", b"/proc", crate::procfs::creer)?;
+    monter("sysfs", b"/sys", crate::sysfs::creer)?;
     Ok(bilan)
 }
 

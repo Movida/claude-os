@@ -1,6 +1,6 @@
 # Sous-étape 6d : claude --version, le vrai binaire de Claude Code. Le
 # noyau applique la limite de temps de calcul de Linux (RLIMIT_CPU),
-# enregistre les signaux, monte /proc (fichiers/src/noyaufs.rs). Le
+# enregistre les signaux, monte /proc et /sys (fichiers/src/noyaufs.rs). Le
 # reste vient de 6c (les programmes dynamiques : ld-linux et la glibc
 # partagée, le lanceur /etc/demarrage), de 6b (le système de fichiers en
 # mémoire, fichiers/, et les fichiers projetés), de 6a (la mémoire
@@ -128,8 +128,8 @@ boot.bin: programmes.cpio FORCE
 #   - systeme : gcc -static, les petits appels de claude (uname,
 #     sched_getaffinity, futex, prctl) ; sur l'hôte aussi ;
 #   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi ;
-#   - proc : gcc -static, /proc (maps, statm, exe, /proc/sys) ; sur l'hôte
-#     aussi.
+#   - proc : gcc -static, /proc (maps, statm, exe, /proc/sys) et /sys
+#     (cpu/online, transparent_hugepage) ; sur l'hôte aussi.
 # Pour les tests du lecteur ELF sur l'hôte, des variantes qu'il doit
 # accepter : bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils

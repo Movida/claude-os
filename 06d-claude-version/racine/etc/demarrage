@@ -36,5 +36,5 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/systeme
 # eventfd et epoll (6d) : la boucle d'événements de Bun, créée mais pas encore attendue.
 /bin/evenements
-# /proc (6d) : ce qu'y lit Bun, maps, statm, exe, /proc/sys/vm.
+# /proc et /sys (6d) : ce qu'y lit Bun, maps, statm, exe, /proc/sys/vm, cpu/online.
 /bin/proc
