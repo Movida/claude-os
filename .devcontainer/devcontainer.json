@@ -14,6 +14,15 @@
   "mounts": [
     "source=claude-code-config,target=/home/vscode/.claude,type=volume"
   ],
+  // Claude Code range aussi .claude.json (la confiance dans chaque dossier,
+  // l'accord pour Remote Control) dans ce volume, et non dans ~ où une
+  // reconstruction l'effaçait : Remote Control ne pouvait plus démarrer sans
+  // qu'on relance `claude` à la main. Le dossier est celui que Claude Code
+  // prend déjà par défaut ; seul .claude.json change de place (le script de
+  // Remote Control l'y reprend la première fois).
+  "containerEnv": {
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+  },
   // Démarre Claude Code en mode Remote Control (voir le script).
   "postStartCommand": "bash .devcontainer/remote-control.sh ${containerWorkspaceFolder}",
   "customizations": {
