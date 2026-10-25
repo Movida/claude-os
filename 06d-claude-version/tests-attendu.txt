@@ -72,6 +72,23 @@
 [linux] Test : boucle sans fin sous RLIMIT_CPU (1 s, 1 s).
 [noyau] limite-egale : limite dure de temps de calcul atteinte (RLIMIT_CPU 1 s) (SIGKILL)
 [noyau] limite-egale : termine, code de sortie 137 ; memoire rendue : ok.
+[linux] Test : kill(SIGHUP) puis raise(SIGTERM), bloques, puis debloques.
+[noyau] sig-term : arrete par un signal (SIGTERM)
+[noyau] sig-term : termine, code de sortie 143 ; memoire rendue : ok.
+[linux] Test : abort().
+[noyau] sig-abort : arrete par un signal (SIGABRT)
+[noyau] sig-abort : termine, code de sortie 134 ; memoire rendue : ok.
+[linux] Test : un gestionnaire de SIGUSR1, puis raise(SIGUSR1).
+[noyau] sig-gestion : gestionnaire enregistre, pas encore appele (livraison des signaux en 6f) (SIGUSR1)
+[noyau] sig-gestion : termine, code de sortie 138 ; memoire rendue : ok.
+[linux] Test : un gestionnaire de SIGSEGV, puis une faute.
+[noyau] sig-faute : segfault at 0x0 ip 
+ ; gestionnaire enregistre, pas encore appele (livraison des signaux en 6f) (SIGSEGV)
+[noyau] sig-faute : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : SIGXCPU ignore, sous RLIMIT_CPU (1 s, 2 s).
+[linux] xcpu-ignore : SIGXCPU ignore, limite courante relevee a 2 s apres 1 s de calcul : ok
+[noyau] xcpu-ignore : limite dure de temps de calcul atteinte (RLIMIT_CPU 2 s) (SIGKILL)
+[noyau] xcpu-ignore : termine, code de sortie 137 ; memoire rendue : ok.
 [noyau] wx : programme Linux refuse : segment 0 : inscriptible et executable (W+X)
 [noyau] derniere-page : programme Linux refuse : segment 0 : hors des adresses permises
 [noyau] et-dyn : programme Linux (ELF ET_DYN), 

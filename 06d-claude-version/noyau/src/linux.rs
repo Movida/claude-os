@@ -16,7 +16,9 @@
 //! ioctl(TCGETS) (isatty), et exit ; et, pour la mémoire de `claude`
 //! (6a), mmap, munmap et madvise (de la mémoire anonyme), sysinfo ; et
 //! l'heure (6b) : clock_gettime, clock_getres, gettimeofday, time ; et les
-//! fichiers (6b), dans appels_fichiers.rs.
+//! fichiers (6b), dans appels_fichiers.rs ; et les signaux (6d), dans
+//! signaux.rs : rt_sigaction, rt_sigprocmask, rt_sigpending, sigaltstack,
+//! kill, tkill, tgkill.
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -34,7 +36,7 @@ use crate::interruptions::Cadre;
 use crate::memoire::{self, Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Projection, Zone};
 use crate::appels_fichiers as f;
-use crate::{aleatoire, cpu, horloge, pages, processus, tache, temps};
+use crate::{aleatoire, cpu, horloge, pages, processus, signaux, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
@@ -132,15 +134,24 @@ const CLOSE_RANGE: u64 = 436;
 const FACCESSAT2: u64 = 439;
 const SET_ROBUST_LIST: u64 = 273;
 const PRLIMIT64: u64 = 302;
+const RT_SIGACTION: u64 = 13;
+const RT_SIGPROCMASK: u64 = 14;
+const KILL: u64 = 62;
+const RT_SIGPENDING: u64 = 127;
+const SIGALTSTACK: u64 = 131;
+const TKILL: u64 = 200;
+const TGKILL: u64 = 234;
 const GETRANDOM: u64 = 318;
 const RSEQ: u64 = 334;
 
 const PAGE: u64 = 4096;
 
 
-/// Le numéro de processus et de fil du programme : 1, le premier (et le
-/// seul) processus. (set_tid_address rend le numéro du fil appelant.)
-const PID: i64 = 1;
+/// Le numéro du processus en cours, qui est aussi celui de son seul fil
+/// (processus::numero_neuf).
+fn pid() -> i64 {
+    processus::avec(|p| p.pid) as i64
+}
 
 /// Exécute l'appel système `numero` : un résultat, ou -errno.
 pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
@@ -182,7 +193,7 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         ARCH_PRCTL => arch_prctl(a[0], a[1]),
         // L'adresse où effacer le numéro du fil quand il se termine (pour
         // pthread_join) : sans fils, rien à faire ; on rend le numéro du fil.
-        SET_TID_ADDRESS => PID,
+        SET_TID_ADDRESS => pid(),
         // La liste des verrous « robustes » du fil (relâchés s'il meurt en
         // les tenant) : sans fils, rien à faire. La taille de la tête de
         // liste est fixée par l'ABI (24 octets) ; Linux refuse les autres.
@@ -191,6 +202,13 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         // par processeur. La glibc s'en passe si le noyau ne l'a pas.
         RSEQ => -ENOSYS,
         PRLIMIT64 => prlimit64(a[0], a[1], a[2], a[3]),
+        RT_SIGACTION => signaux::rt_sigaction(a[0], a[1], a[2], a[3]),
+        RT_SIGPROCMASK => signaux::rt_sigprocmask(a[0], a[1], a[2], a[3]),
+        RT_SIGPENDING => signaux::rt_sigpending(a[0], a[1]),
+        SIGALTSTACK => signaux::sigaltstack(a[0], a[1]),
+        KILL => signaux::kill(a[0], a[1]),
+        TKILL => signaux::tkill(a[0], a[1]),
+        TGKILL => signaux::tgkill(a[0], a[1], a[2]),
         // La glibc lit le lien /proc/self/exe pour connaître son propre
         // chemin (dl_get_origin) : /proc viendra en 6d, ENOENT d'ici là.
         READLINKAT => f::readlinkat(a[0], a[1], a[2], a[3]),
@@ -225,11 +243,11 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         UTIMENSAT => f::utimensat(a[0], a[1], a[2], a[3]),
         GETRANDOM => getrandom(a[0], a[1], a[2]),
         SYSINFO => sysinfo(a[0]),
-        // Qui est le programme : le processus 1, le seul (son parent, le
-        // noyau, n'a pas de numéro : 0, comme le parent de l'init de
-        // Linux), un seul fil, l'utilisateur et le groupe 1000.
-        GETPID | GETTID => PID,
-        GETPPID => 0,
+        // Qui est le programme : son numéro, celui de son seul fil ; son
+        // parent, le noyau qui tient le rôle d'init (1) ; l'utilisateur et
+        // le groupe 1000.
+        GETPID | GETTID => pid(),
+        GETPPID => 1,
         GETUID | GETEUID => processus::avec(|p| p.identite.uid) as i64,
         GETGID | GETEGID => processus::avec(|p| p.identite.gid) as i64,
         CLOCK_GETTIME => clock_gettime(a[0], a[1]),
@@ -299,6 +317,13 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         SET_ROBUST_LIST => ("set_robust_list", 2),
         RSEQ => ("rseq", 4),
         PRLIMIT64 => ("prlimit64", 4),
+        RT_SIGACTION => ("rt_sigaction", 4),
+        RT_SIGPROCMASK => ("rt_sigprocmask", 4),
+        RT_SIGPENDING => ("rt_sigpending", 2),
+        SIGALTSTACK => ("sigaltstack", 2),
+        KILL => ("kill", 2),
+        TKILL => ("tkill", 2),
+        TGKILL => ("tgkill", 3),
         READLINKAT => ("readlinkat", 4),
         READLINK => ("readlink", 3),
         MKDIR => ("mkdir", 2),
@@ -824,7 +849,7 @@ fn arch_prctl(code: u64, adresse: u64) -> i64 {
 /// telle qu'elle était avant le changement. Bun relève RLIMIT_NOFILE au
 /// démarrage ; d'autres programmes baissent RLIMIT_CORE.
 fn prlimit64(pid: u64, ressource: u64, nouvelle: u64, ancienne: u64) -> i64 {
-    if pid != 0 && pid != PID as u64 {
+    if pid != 0 && pid != self::pid() as u64 {
         return -ESRCH;
     }
     if ressource >= processus::LIMITES as u64 {

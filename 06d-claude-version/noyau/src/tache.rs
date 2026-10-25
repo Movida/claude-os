@@ -43,7 +43,7 @@ use crate::interruptions::Cadre;
 use crate::linux::{self, Signal};
 use crate::programmes::NomCourt;
 use crate::verrou::Verrou;
-use crate::{cpu, gdt, pagination, processus, temps};
+use crate::{cpu, gdt, pagination, processus, signaux, temps};
 
 global_asm!(
     r#"
@@ -223,9 +223,10 @@ pub fn terminer(code: i32) -> ! {
     unreachable!("un programme termine a repris la main");
 }
 
-/// Arrête le programme en cours par le signal `signal` (une exception, son
-/// temps épuisé), en disant pourquoi : le message de Linux dans son
-/// journal, puis le code de sortie 128 + signal.
+/// Arrête le programme en cours par le signal `signal` (une exception, sa
+/// limite de temps de calcul, un signal qu'il s'est envoyé), en disant
+/// pourquoi : le message de Linux dans son journal, puis le code de sortie
+/// 128 + signal.
 pub fn arreter(signal: Signal, raison: impl fmt::Display) -> ! {
     let nom = *NOM.verrouiller();
     afficherln!("[noyau] {} : {} ({})", nom, raison, signal.nom);
@@ -297,9 +298,13 @@ pub fn tuer_au_retour() {
 ///     mesuré) : un programme qui ignore SIGXCPU en reçoit un autre la
 ///     seconde suivante, jusqu'à la limite dure. Une courante égale à la
 ///     dure tue donc directement par SIGKILL (mesuré : 137, pas 152).
-/// L'action de SIGXCPU par défaut est d'arrêter le programme (avec image
-/// mémoire) : c'est ce qui se passe aujourd'hui, en attendant que les
-/// programmes puissent régler leurs signaux.
+/// SIGXCPU est un signal comme un autre (signaux.rs) : ignoré, il est jeté ;
+/// bloqué, il attend ; laissé à son action par défaut, il arrête le
+/// programme. SIGKILL, lui, ne se bloque ni ne s'ignore.
+///
+/// Puis les signaux en attente et non bloqués sont livrés (le `get_signal`
+/// de Linux, au même endroit : le retour vers l'anneau 3) : ceux que le
+/// programme s'est envoyés, et SIGXCPU.
 ///
 /// Options écartées :
 ///   - le budget fixe d'une seconde des étapes 5 à 6c : il n'existe pas
@@ -317,25 +322,70 @@ pub fn verifier_au_retour() {
     }
     let calcul = temps::nanosecondes(CALCUL.load(Ordering::Relaxed));
     let verifier_temps = TEMPS_A_VERIFIER.swap(false, Ordering::Relaxed);
-    let atteinte = processus::essayer_avec(|p| {
+    let fin = processus::essayer_avec(|p| {
         let (courante, dure) = p.limite(processus::RLIMIT_CPU);
-        if !verifier_temps || courante == processus::INFINI {
-            return None;
-        }
         let atteinte = |secondes: u64| calcul as u128 >= secondes as u128 * 1_000_000_000;
-        if dure != processus::INFINI && atteinte(dure) {
-            return Some((linux::SIGKILL, "limite dure", dure));
+        let mut xcpu = None;
+        if verifier_temps && courante != processus::INFINI {
+            if dure != processus::INFINI && atteinte(dure) {
+                return Some(Arret::LimiteDure(dure));
+            }
+            if atteinte(courante) {
+                // Ici courante < dure (égales, la dure l'aurait emporté) :
+                // relevée, elle ne la dépasse pas.
+                p.changer_limite(processus::RLIMIT_CPU, (courante + 1, dure));
+                // Au processus, comme Linux (`check_process_timers`).
+                signaux::envoyer(p, linux::SIGXCPU.numero as u64, signaux::Destinataire::Processus);
+                xcpu = Some(courante);
+            }
         }
-        if atteinte(courante) {
-            // Ici courante < dure (égales, la dure l'aurait emporté) :
-            // relevée, elle ne la dépasse pas.
-            p.changer_limite(processus::RLIMIT_CPU, (courante + 1, dure));
-            return Some((linux::SIGXCPU, "limite", courante));
-        }
-        None
+        signaux::a_livrer(p).map(|(sig, comment)| match (comment, xcpu) {
+            (signaux::Fin::ParDefaut, Some(secondes)) if sig == linux::SIGXCPU.numero as u64 => Arret::Limite(secondes),
+            _ => Arret::Signal(sig, comment),
+        })
     }).flatten();
     // Le verrou du processus est rendu : `arreter` ne revient pas.
-    if let Some((signal, quelle, secondes)) = atteinte {
-        arreter(signal, format_args!("{} de temps de calcul atteinte (RLIMIT_CPU {} s)", quelle, secondes));
+    match fin {
+        None => {}
+        Some(Arret::LimiteDure(secondes)) => {
+            arreter(linux::SIGKILL, format_args!("limite dure de temps de calcul atteinte (RLIMIT_CPU {} s)", secondes))
+        }
+        Some(Arret::Limite(secondes)) => {
+            arreter(linux::SIGXCPU, format_args!("limite de temps de calcul atteinte (RLIMIT_CPU {} s)", secondes))
+        }
+        Some(Arret::Signal(sig, signaux::Fin::ParDefaut)) => arreter(signaux::signal(sig), "arrete par un signal"),
+        Some(Arret::Signal(sig, signaux::Fin::Suspendu)) => arreter(
+            signaux::signal(sig),
+            "suspendu par un signal ; sans controle des taches (6k), personne ne pourrait le relancer : termine",
+        ),
+        Some(Arret::Signal(sig, signaux::Fin::Gestionnaire)) => arreter(signaux::signal(sig), GESTIONNAIRE_EN_6F),
+    }
+}
+
+/// Pourquoi `verifier_au_retour` arrête le programme.
+enum Arret {
+    /// RLIMIT_CPU : la limite dure (SIGKILL), ou la courante (SIGXCPU,
+    /// laissé à son action par défaut), en secondes.
+    LimiteDure(u64),
+    Limite(u64),
+    /// Un signal livré.
+    Signal(u64, signaux::Fin),
+}
+
+/// Le message d'un signal qui devrait appeler un gestionnaire.
+const GESTIONNAIRE_EN_6F: &str = "gestionnaire enregistre, pas encore appele (livraison des signaux en 6f)";
+
+/// Arrête le programme en cours pour une exception (une faute de page, une
+/// instruction invalide...) : `signal` et le message de Linux, `raison`.
+/// S'il a un gestionnaire pour ce signal, et ne le bloque pas, Linux
+/// l'appellerait : le message le dit. Sinon, comme Linux, une faute tue
+/// le programme même s'il ignore ou bloque son signal
+/// (`force_sig_info_to_task`).
+pub fn arreter_par_faute(signal: Signal, raison: impl fmt::Display) -> ! {
+    let gestionnaire = processus::essayer_avec(|p| p.signaux.gestionnaire_pour_faute(signal.numero as u64)) == Some(true);
+    if gestionnaire {
+        arreter(signal, format_args!("{} ; {}", raison, GESTIONNAIRE_EN_6F))
+    } else {
+        arreter(signal, raison)
     }
 }

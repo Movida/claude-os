@@ -479,6 +479,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     });
     let (pml4, depart) = (programme.memoire.espace.pml4(), programme.depart);
     processus::installer(processus::Processus {
+        pid: processus::numero_neuf(),
         memoire: programme.memoire,
         descripteurs,
         dossier: racine,
@@ -486,6 +487,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
         umask: 0o022,
         identite,
         limites: processus::LIMITES_PAR_DEFAUT,
+        signaux: crate::signaux::Signaux::new(),
     });
     // Plus personne ne peut écrire le fichier tant qu'il s'exécute
     // (ETXTBSY) : ses pages seront bientôt celles du programme.

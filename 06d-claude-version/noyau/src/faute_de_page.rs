@@ -77,7 +77,7 @@ fn faute_du_programme(cadre: &Cadre, cr2: u64, acces: Acces) {
         Err(cause) => {
             let zone = processus::avec(|p| p.memoire.zone_du_code(cadre.rip));
             let (signal, raison) = linux::signal_de_l_exception(14, cadre, cr2, Some(cause), zone);
-            tache::arreter(signal, raison)
+            tache::arreter_par_faute(signal, raison)
         }
     }
 }

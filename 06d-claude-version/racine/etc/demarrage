@@ -30,3 +30,5 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/fichiers
 /bin/arbre
 /bin/segments
+# Les signaux (6d) : enregistrés et rendus comme Linux, pas encore livrés.
+/bin/signaux

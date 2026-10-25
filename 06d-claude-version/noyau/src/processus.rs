@@ -11,14 +11,20 @@
 //! verrou (une copie peut fauter, et plus tard attendre le disque). On y
 //! lit ou change l'état, on rend le verrou, puis on copie.
 
+use core::sync::atomic::{AtomicU32, Ordering};
+
 use crate::descripteurs::{Descripteurs, LIMITE_DESCRIPTEURS};
 use crate::memoire::Memoire;
+use crate::signaux::Signaux;
 use crate::verrou::Verrou;
 use crate::vfs;
 use fichiers::Identite;
 use fichiers::tmpfs::Numero;
 
 pub struct Processus {
+    /// Son numéro (pid), qui est aussi celui de son seul fil et de son
+    /// groupe de processus (voir `numero_neuf`).
+    pub pid: u32,
     /// Sa mémoire (la mm_struct de Linux, voir memoire.rs).
     pub memoire: Memoire,
     /// Ses descripteurs de fichiers (la files_struct, descripteurs.rs).
@@ -35,6 +41,28 @@ pub struct Processus {
     /// Ses limites de ressources (getrlimit, prlimit64), sauf celle des
     /// descripteurs, que garde leur table (`Descripteurs::limite`).
     pub limites: [(u64, u64); LIMITES],
+    /// Ses signaux : actions, masque, signaux en attente, pile de secours
+    /// (signaux.rs).
+    pub signaux: Signaux,
+}
+
+/// Le numéro du prochain programme lancé.
+static PROCHAIN: AtomicU32 = AtomicU32::new(2);
+
+/// Un numéro de processus neuf : 2, puis 3, 4... Le 1 est celui de l'init,
+/// dont le noyau tient le rôle tant qu'il n'y a pas de `/init` (6k) : il
+/// lance chaque ligne de /etc/demarrage, comme un init lance ses
+/// services, et `getppid` rend 1. Option écartée : donner le 1 à chaque
+/// programme (ce que faisaient les étapes 5 à 6c). Sous Linux, le pid 1
+/// est à part : il ne reçoit pas les signaux à action par défaut qu'il
+/// s'envoie (SIGNAL_UNKILLABLE, `raise(SIGTERM)` n'y fait rien), et des
+/// programmes le traitent autrement (Node et Bun, dans un conteneur). Le
+/// processus mène aussi son propre groupe et sa session, comme une
+/// commande lancée par un shell. Pas de recyclage des numéros avant
+/// pid_max (4 194 304 sous Linux) : avec un programme à la fois, il ne
+/// sera jamais atteint.
+pub fn numero_neuf() -> u32 {
+    PROCHAIN.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Le nombre de limites de ressources de Linux (RLIM_NLIMITS).

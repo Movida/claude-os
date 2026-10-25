@@ -44,7 +44,8 @@
 #                  linux/claude-version, qui doit y réussir aussi, comme
 #                  linux/temps (les horloges) et linux/fichiers (nos codes
 #                  d'erreur des fichiers doivent être ceux de Linux), et
-#                  linux/dynamique (ld-linux, la glibc partagée, dlopen)
+#                  linux/dynamique (ld-linux, la glibc partagée, dlopen),
+#                  et linux/signaux (nos codes d'erreur des signaux)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -117,7 +118,10 @@ boot.bin: programmes.cpio FORCE
 #     Linux, comme memoire ; sur l'hôte aussi ;
 #   - arbre : gcc -static, liste /etc, /home et /dev ;
 #   - segments : gcc -static, ses propres segments projetés depuis son
-#     fichier (MADV_DONTNEED relit le fichier) ; sur l'hôte aussi.
+#     fichier (MADV_DONTNEED relit le fichier) ; sur l'hôte aussi ;
+#   - signaux : gcc -static, les signaux enregistrés (rt_sigaction,
+#     rt_sigprocmask, sigaltstack, kill...) contre ce qu'en fait Linux ;
+#     sur l'hôte aussi.
 # Pour les tests du lecteur ELF sur l'hôte, des variantes qu'il doit
 # accepter : bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -192,6 +196,10 @@ $(LINUX)/segments: linux/segments.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
+$(LINUX)/signaux: linux/signaux.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
 $(LINUX)/bonjour-c-deux-segments: linux/bonjour.c
 	mkdir -p $(LINUX)
 	gcc -static -Wl,-z,noseparate-code $(CFLAGS_LINUX) $< -o $@
@@ -228,7 +236,12 @@ $(LINUX)/dynamique: linux/dynamique.c
 # se donnent une seconde de calcul (RLIMIT_CPU), et doivent être arrêtés
 # par SIGXCPU, limite-egale par SIGKILL (sa limite courante est égale à la
 # dure), et calcul-long, qui ne pose aucune limite, doit finir : par
-# défaut, le temps de calcul est infini, comme sous Linux ; puis des
+# défaut, le temps de calcul est infini, comme sous Linux ; des signaux
+# qu'un programme s'envoie (sig-term, sig-abort : terminés par leur
+# action par défaut), un gestionnaire que le noyau n'appelle pas encore
+# (sig-gestion, et sig-faute pour une faute : arrêtés, le message le dit,
+# alors que Linux appelle le gestionnaire), SIGXCPU ignoré jusqu'à la
+# limite dure (xcpu-ignore : SIGKILL) ; puis des
 # exécutables que le noyau doit refuser :
 #   - wx : un segment W+X (ld -N) ;
 #   - derniere-page : des segments dans les dernières pages de la moitié
@@ -246,6 +259,7 @@ $(LINUX)/dynamique: linux/dynamique.c
 # montrer que le noyau exécute encore des programmes après tout cela.
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle calcul-long limite-egale \
+              sig-term sig-abort sig-gestion sig-faute xcpu-ignore \
               wx derniere-page et-dyn tronque bus-fichier faute-libc
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
@@ -254,6 +268,13 @@ $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
 
 $(LINUX)/tests/%: $(LINUX)/tests/%.o
 	ld -o $@ $<
+
+# Les programmes de test écrits en C (sig-*, xcpu-ignore), statiques
+# comme bonjour-c. (Une règle explicite l'emporte : faute-libc et les
+# interp-* ont la leur.)
+$(LINUX)/tests/%: linux/tests/%.c
+	mkdir -p $(LINUX)/tests
+	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/tests/pile-executable: $(LINUX)/tests/pile-executable.o
 	ld -z execstack -o $@ $<
@@ -455,7 +476,7 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
 # puis lance ce que dit son /etc/demarrage (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux FORCE
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
 	sh archive.sh $@ archive.txt
@@ -537,7 +558,8 @@ SHELL = /bin/bash
 # sources, servirait sinon telle quelle à la construction suivante.
 .DELETE_ON_ERROR:
 
-tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so
+tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
+            $(LINUX)/signaux
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -553,6 +575,7 @@ tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/cla
 	./$(LINUX)/fichiers | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/segments | tee /dev/stderr | (! grep -q ECHEC)
 	LD_LIBRARY_PATH=$(LINUX) ./$(LINUX)/dynamique | tee /dev/stderr | (! grep -q ECHEC)
+	./$(LINUX)/signaux | tee /dev/stderr | (! grep -q ECHEC)
 
 suite: $(SUITE)/.convertie
 

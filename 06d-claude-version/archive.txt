@@ -24,6 +24,7 @@ file  /bin/temps           linux/construits/temps 755 0 0
 file  /bin/fichiers        linux/construits/fichiers 755 1000 1000
 file  /bin/arbre           linux/construits/arbre 755 0 0
 file  /bin/segments        linux/construits/segments 755 0 0
+file  /bin/signaux         linux/construits/signaux 755 0 0
 
 # Les commandes que lance le noyau (formats/src/commande.rs). Écrit avant
 # les autres fichiers de /etc : un dossier se lit du plus récent au plus

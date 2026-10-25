@@ -302,7 +302,7 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
             // programme (tache::arreter ne revient pas).
             let zone = processus::essayer_avec(|p| p.memoire.zone_du_code(cadre.rip)).flatten();
             let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, 0, None, zone);
-            tache::arreter(signal, raison);
+            tache::arreter_par_faute(signal, raison);
         }
         // int3 n'est pas une erreur : un débogueur s'en sert pour poser des
         // points d'arrêt. RIP désigne déjà l'instruction suivante : on

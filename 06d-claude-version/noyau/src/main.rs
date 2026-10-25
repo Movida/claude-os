@@ -47,6 +47,7 @@ mod port;
 mod processus;
 mod programmes;
 mod serie;
+mod signaux;
 mod sse;
 mod tache;
 mod tas;
