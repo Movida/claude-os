@@ -29,7 +29,17 @@ for etape in [0-9][0-9]*-*/; do
     # duree`), quand elle a plus à faire (l'archive de l'étape 6, que le
     # BIOS lit secteur par secteur, grossit à chaque sous-étape).
     duree=$(make -s -C "$etape" duree 2>/dev/null) || duree=2
-    timeout "$duree" qemu-system-x86_64 -drive format=raw,file="$etape/boot.bin" \
+    # Le disque et la machine : ceux de l'étape, quand elle en demande
+    # d'autres que ceux de QEMU par défaut (un disque IDE, 128 Mio, le
+    # processeur qemu64). Depuis 6d, `make qemu-disque` rend l'interface du
+    # disque (virtio : le BIOS de QEMU lit un disque IDE mot par mot, 74 s
+    # pour les 307 Mo de l'archive de claude, contre 3,8 s en virtio), et
+    # `make qemu-options` les autres options (le processeur, la mémoire).
+    # Sans chemin : QEMU est lancé d'ici, pas du dossier de l'étape.
+    disque=$(make -s -C "$etape" qemu-disque 2>/dev/null) && disque=",if=$disque" || disque=
+    options=$(make -s -C "$etape" qemu-options 2>/dev/null) || options=
+    # $options sans guillemets : plusieurs mots, un argument chacun.
+    timeout "$duree" qemu-system-x86_64 -drive format=raw,file="$etape/boot.bin$disque" $options \
         -display none -no-reboot -serial file:"$etape/serial.log" 2>/dev/null
     while IFS= read -r ligne; do
         if grep -qF -- "$ligne" "$etape/serial.log"; then
