@@ -9,12 +9,16 @@
 //!     les liens symboliques, les droits de traverser, la barre finale. Elle
 //!     ne connaît d'un système de fichiers que ce que dit le trait `Arbre`
 //!     (chercher un nom dans un dossier, le parent, la cible d'un lien) :
-//!     c'est ainsi qu'elle traversera les points de montage, quand `/proc`
-//!     sera monté à côté du tmpfs (6d), sans changer d'une ligne ;
+//!     c'est ainsi qu'elle traverse les points de montage (`montages`, 6d)
+//!     sans avoir changé d'une ligne ;
 //!   - `tmpfs` : l'arborescence elle-même (inodes, dossiers, liens), et les
 //!     opérations des appels système (créer, effacer, renommer, ouvrir...),
 //!     avec les vérifications et les codes d'erreur de Linux, dans son
-//!     ordre.
+//!     ordre ;
+//!   - `montages` (6d) : les systèmes de fichiers montés sur des dossiers du
+//!     tmpfs (/proc, /sys), la vue de tous les systèmes que parcourt la
+//!     résolution, et les règles de Linux pour ce qui passe d'un système à
+//!     l'autre.
 //!
 //! La bibliothèque ne sait rien des cadres de la mémoire, des processus ni
 //! des copies depuis ou vers un programme : c'est le noyau qui les fait.
@@ -32,6 +36,7 @@ extern crate alloc;
 
 pub mod chemins;
 pub mod index;
+pub mod montages;
 pub mod tmpfs;
 
 /// La taille d'une page.

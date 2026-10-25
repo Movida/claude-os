@@ -29,7 +29,8 @@
 use alloc::vec::Vec;
 
 use crate::programmes::NomCourt;
-use fichiers::tmpfs::Ouvert;
+use fichiers::montages::Objet;
+use fichiers::tmpfs::{Numero, Ouvert};
 
 /// Ce que font les appels sur un fichier ouvert (les file_operations).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,12 +56,20 @@ pub enum Sorte {
     Console,
 }
 
+/// Ce que tient un fichier ouvert : un inode du tmpfs, avec ce qu'a rendu
+/// son ouverture (s'il compte parmi ses écrivains), ou un objet d'un
+/// système de fichiers du noyau (6d : rien à rendre, ses inodes sont au
+/// noyau).
+#[derive(Clone, Copy, Debug)]
+pub enum Tenu {
+    Tmpfs(Ouvert),
+    Noyau(Objet),
+}
+
 /// Un fichier ouvert (la `struct file`).
 pub struct FichierOuvert {
     pub sorte: Sorte,
-    /// Ce qu'a rendu le tmpfs : l'inode, et si l'ouverture compte parmi ses
-    /// écrivains.
-    pub ouvert: Ouvert,
+    pub tenu: Tenu,
     pub lecture: bool,
     pub ecriture: bool,
     /// Les drapeaux d'état qui restent (O_APPEND, O_NONBLOCK...), comme
@@ -78,9 +87,32 @@ pub struct FichierOuvert {
 }
 
 impl FichierOuvert {
-    pub fn new(sorte: Sorte, ouvert: Ouvert, lecture: bool, ecriture: bool, drapeaux: u32, chemin: &[u8]) -> FichierOuvert {
+    pub fn new(sorte: Sorte, tenu: Tenu, lecture: bool, ecriture: bool, drapeaux: u32, chemin: &[u8]) -> FichierOuvert {
         let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').find(|n| !n.is_empty()).unwrap_or(chemin));
-        FichierOuvert { sorte, ouvert, lecture, ecriture, drapeaux, position: 0, nom, references: 1 }
+        FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, nom, references: 1 }
+    }
+
+    /// L'objet ouvert, dans la vue de tous les systèmes de fichiers.
+    pub fn objet(&self) -> Objet {
+        match self.tenu {
+            Tenu::Tmpfs(o) => Objet::Tmpfs(o.numero),
+            Tenu::Noyau(o) => o,
+        }
+    }
+
+    /// Son inode du tmpfs, s'il en est un.
+    pub fn numero(&self) -> Option<Numero> {
+        match self.tenu {
+            Tenu::Tmpfs(o) => Some(o.numero),
+            Tenu::Noyau(_) => None,
+        }
+    }
+
+    /// L'inode du tmpfs d'un fichier dont la sorte ne vient que du tmpfs (un
+    /// fichier ordinaire, un périphérique de /dev) : l'ouverture l'a choisie
+    /// ainsi (appels_fichiers::sorte).
+    pub fn inode(&self) -> Numero {
+        self.numero().expect("une sorte du tmpfs sur un objet d'un systeme monte")
     }
 }
 

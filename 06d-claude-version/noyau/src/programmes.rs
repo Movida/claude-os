@@ -26,6 +26,7 @@ use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, proce
 use fichiers::Identite;
 use alloc::vec::Vec;
 use core::fmt;
+use fichiers::montages::Objet;
 use fichiers::tmpfs::Numero;
 
 /// L'environnement des programmes : de quoi savoir où est le dossier
@@ -482,8 +483,8 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
         pid: processus::numero_neuf(),
         memoire: programme.memoire,
         descripteurs,
-        dossier: racine,
-        racine,
+        dossier: Objet::Tmpfs(racine),
+        racine: Objet::Tmpfs(racine),
         umask: 0o022,
         identite,
         limites: processus::LIMITES_PAR_DEFAUT,

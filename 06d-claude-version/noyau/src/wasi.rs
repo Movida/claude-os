@@ -53,7 +53,9 @@ use wasm::{Externe, Hote, Magasin, Piege, Valeur};
 
 use crate::descripteurs::{Descripteur, Descripteurs, FichierOuvert, Sorte};
 use crate::{appels_fichiers, console, temps, vfs};
-use fichiers::chemins::{Depart, resoudre};
+use crate::descripteurs::Tenu;
+use fichiers::chemins::Depart;
+use fichiers::montages::{Creation, Modification, Objet, en_tmpfs};
 use fichiers::tmpfs::{Numero, Ouverture, suivre_pour};
 use fichiers::{Erreur, Identite, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, Temps};
 
@@ -446,11 +448,19 @@ fn nanosecondes(t: Temps) -> u64 {
     (t.secondes.max(0) as u64).saturating_mul(1_000_000_000).saturating_add(t.nanosecondes as u64)
 }
 
-/// Le « filestat » de WASI (64 octets) de l'inode `n`.
-fn filestat(n: Numero) -> [u8; 64] {
-    let a = vfs::avec(|fs, _| fs.attributs(n));
+/// L'inode du tmpfs d'un fichier ordinaire : sa sorte (Sorte::Fichier) ne
+/// vient que du tmpfs.
+fn inode(o: Objet) -> Numero {
+    o.tmpfs().expect("un fichier ordinaire hors du tmpfs")
+}
+
+/// Le « filestat » de WASI (64 octets) de l'objet `o`.
+fn filestat(o: Objet) -> [u8; 64] {
+    let a = appels_fichiers::attributs(o);
+    let (dev, _) = appels_fichiers::systeme_de(o);
     let mut s = [0u8; 64];
-    s[0..8].copy_from_slice(&20u64.to_le_bytes()); // dev : celui de la racine
+    // dev : celui de son système de fichiers, codé comme st_dev.
+    s[0..8].copy_from_slice(&appels_fichiers::encoder_peripherique(dev).to_le_bytes());
     s[8..16].copy_from_slice(&(a.numero.0 as u64).to_le_bytes());
     s[16] = type_wasi(a.mode);
     s[24..32].copy_from_slice(&(a.nlink as u64).to_le_bytes());
@@ -479,11 +489,11 @@ fn clock_time_get(horloge: u32, adresse: u32, m: &mut [u8]) -> u32 {
 
 impl Wasi {
     /// Le fichier ouvert du descripteur `fd`, et ce qu'il faut en savoir.
-    fn ouvert(&self, fd: u32) -> Result<(Descripteur, Sorte, Numero, bool, bool, u32, u64), u32> {
+    fn ouvert(&self, fd: u32) -> Result<(Descripteur, Sorte, Objet, bool, bool, u32, u64), u32> {
         let d = self.descripteurs.get(fd as u64).ok_or(EBADF)?;
         Ok(vfs::avec_systeme(|s, _| {
             let f = s.ouverts.fichier(d.fichier);
-            (d, f.sorte, f.ouvert.numero, f.lecture, f.ecriture, f.drapeaux, f.position)
+            (d, f.sorte, f.objet(), f.lecture, f.ecriture, f.drapeaux, f.position)
         }))
     }
 
@@ -494,10 +504,12 @@ impl Wasi {
     /// O_APPEND), qui avance d'autant.
     #[allow(clippy::too_many_arguments)]
     fn fd_rw(&mut self, fd: u32, morceaux: u32, nombre: u32, total: u32, m: &mut [u8], cout: &mut u64, ecriture: bool) -> u32 {
-        let (d, sorte, n, lecture, ecrit, drapeaux, position) = match self.ouvert(fd) {
+        let (d, sorte, objet, lecture, ecrit, drapeaux, position) = match self.ouvert(fd) {
             Ok(o) => o,
             Err(e) => return e,
         };
+        // Un fichier ordinaire est un inode du tmpfs (sa sorte vient de lui).
+        let n = || inode(objet);
         if (ecriture && !ecrit) || (!ecriture && !lecture) {
             return EBADF;
         }
@@ -510,7 +522,7 @@ impl Wasi {
         const O_APPEND: u32 = 0o2000;
         let maintenant = temps::maintenant();
         let mut ici = if ecriture && drapeaux & O_APPEND != 0 && sorte == Sorte::Fichier {
-            vfs::avec(|fs, _| fs.attributs(n).taille)
+            vfs::avec(|fs, _| fs.attributs(n()).taille)
         } else {
             position
         };
@@ -526,8 +538,8 @@ impl Wasi {
                 }
                 (Sorte::Null | Sorte::Zero | Sorte::Aleatoire, true) => Ok(octets.len()),
                 (Sorte::Plein, true) => Err(ENOSPC),
-                (Sorte::Fichier, true) => vfs::avec(|fs, cadres| fs.ecrire(n, ici, octets, maintenant, cadres)).map_err(errno),
-                (Sorte::Fichier, false) => Ok(vfs::avec(|fs, cadres| fs.lire(n, ici, octets, cadres))),
+                (Sorte::Fichier, true) => vfs::avec(|fs, cadres| fs.ecrire(n(), ici, octets, maintenant, cadres)).map_err(errno),
+                (Sorte::Fichier, false) => Ok(vfs::avec(|fs, cadres| fs.lire(n(), ici, octets, cadres))),
                 (Sorte::Null | Sorte::Console, false) => Ok(0),
                 (Sorte::Zero | Sorte::Plein, false) => {
                     octets.fill(0);
@@ -555,7 +567,7 @@ impl Wasi {
         if sorte == Sorte::Fichier {
             vfs::avec_systeme(|s, _| s.ouverts.fichier(d.fichier).position = ici);
             if !ecriture {
-                vfs::avec(|fs, _| fs.acceder(n, maintenant));
+                vfs::avec(|fs, _| fs.acceder(n(), maintenant));
             }
         }
         // Le travail : une unité de carburant par octet, et par morceau lu.
@@ -569,7 +581,7 @@ impl Wasi {
     /// fd_seek(fd, décalage, d'où, nouvelle) et fd_tell : SET (0), CUR (1),
     /// END (2) ; une position négative : EINVAL ; la console : ESPIPE.
     fn fd_seek(&mut self, fd: u32, decalage: i64, depuis: u32, adresse: u32, m: &mut [u8]) -> u32 {
-        let (d, sorte, n, _, _, _, position) = match self.ouvert(fd) {
+        let (d, sorte, objet, _, _, _, position) = match self.ouvert(fd) {
             Ok(o) => o,
             Err(e) => return e,
         };
@@ -578,7 +590,7 @@ impl Wasi {
             (Sorte::Chemin, _) => return EBADF,
             (_, 0) => 0,
             (_, 1) => position as i64,
-            (Sorte::Fichier, 2) => vfs::avec(|fs, _| fs.attributs(n).taille) as i64,
+            (Sorte::Fichier, 2) => vfs::avec(|fs, _| fs.attributs(inode(objet)).taille) as i64,
             _ => return EINVAL,
         };
         let Some(nouvelle) = base.checked_add(decalage).filter(|&p| p >= 0) else { return EINVAL };
@@ -671,10 +683,25 @@ impl Wasi {
         };
         let qui = self.identite;
         let maintenant = temps::maintenant();
+        let drapeaux = if fdflags & 1 != 0 { 0o2000 } else { 0 };
         let ouvert = vfs::avec_systeme(|s, cadres| {
-            let racine = s.fs.racine();
+            let racine = s.racine();
             let depart = Depart { racine, dossier: base, qui, sous: true };
-            let fin = resoudre(&s.fs, &depart, &chemin, suivre_pour(&o, suivre & 1 == 0)).map_err(errno)?;
+            let fin = s.resoudre(0, &depart, &chemin, suivre_pour(&o, suivre & 1 == 0)).map_err(errno)?;
+            // Un programme WebAssembly voit les systèmes montés comme un
+            // programme Linux.
+            let fin = match en_tmpfs(fin) {
+                Ok(fin) => fin,
+                Err(fin) => {
+                    let Some(objet) = fin.objet else {
+                        let e = if o.creer { s.avec_vue(0, |vue| vue.refus(qui, Modification::Creer(&fin, Creation::Ouvrir))) } else { Erreur::ENOENT };
+                        return Err(errno(e));
+                    };
+                    let sorte = s.avec_vue(0, |vue| appels_fichiers::sorte_montee(vue, qui, objet, &o)).map_err(errno)?;
+                    let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), o.lecture, o.ecriture, drapeaux, &chemin);
+                    return s.ouverts.ajouter(f).map_err(|_| ENOMEM);
+                }
+            };
             let ouvert = s.fs.ouvrir(qui, &fin, &o, maintenant).map_err(errno)?;
             let a = s.fs.attributs(ouvert.numero);
             let sorte = match a.mode & S_IFMT {
@@ -693,11 +720,10 @@ impl Wasi {
             if ouvert.tronquer {
                 let _ = s.fs.tronquer(ouvert.numero, 0, maintenant, cadres);
             }
-            let drapeaux = if fdflags & 1 != 0 { 0o2000 } else { 0 };
             s.ouverts
-                .ajouter(FichierOuvert::new(sorte, ouvert, o.lecture, o.ecriture, drapeaux, &chemin))
-                .map_err(|f| {
-                    s.fs.fermer(&f.ouvert, cadres);
+                .ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, drapeaux, &chemin))
+                .map_err(|_| {
+                    s.fs.fermer(&ouvert, cadres);
                     ENOMEM
                 })
         });
@@ -719,13 +745,13 @@ impl Wasi {
     /// droits : tous, sauf se déplacer pour la console (c'est ce qui dit à
     /// wasi-libc que c'est un terminal, pour isatty).
     fn fd_fdstat_get(&self, fd: u32, adresse: u32, m: &mut [u8]) -> u32 {
-        let (_, sorte, n, _, _, drapeaux, _) = match self.ouvert(fd) {
+        let (_, sorte, objet, _, _, drapeaux, _) = match self.ouvert(fd) {
             Ok(o) => o,
             Err(e) => return e,
         };
         const SE_DEPLACER: u64 = (1 << 2) | (1 << 5); // FD_SEEK, FD_TELL
         let mut s = [0u8; 24];
-        s[0] = type_wasi(vfs::avec(|fs, _| fs.mode(n)));
+        s[0] = type_wasi(appels_fichiers::attributs(objet).mode);
         s[2..4].copy_from_slice(&(if drapeaux & 0o2000 != 0 { 1u16 } else { 0 }).to_le_bytes());
         let droits = if sorte == Sorte::Console { u64::MAX & !SE_DEPLACER } else { u64::MAX };
         s[8..16].copy_from_slice(&droits.to_le_bytes());
@@ -739,7 +765,7 @@ impl Wasi {
     /// fd_filestat_get.
     fn fd_filestat_get(&self, fd: u32, adresse: u32, m: &mut [u8]) -> u32 {
         match self.ouvert(fd) {
-            Ok((_, _, n, ..)) => match ecrire(m, adresse, &filestat(n)) {
+            Ok((_, _, objet, ..)) => match ecrire(m, adresse, &filestat(objet)) {
                 Ok(()) => SUCCES,
                 Err(e) => e,
             },
@@ -762,12 +788,12 @@ impl Wasi {
             Err(e) => return e,
         };
         let qui = self.identite;
-        let n = vfs::avec(|fs, _| {
-            let depart = Depart { racine: fs.racine(), dossier: base, qui, sous: true };
-            fichiers::chemins::trouver(fs, &depart, &chemin, suivre & 1 != 0)
+        let o = vfs::avec_systeme(|s, _| {
+            let depart = Depart { racine: s.racine(), dossier: base, qui, sous: true };
+            s.avec_vue(0, |vue| fichiers::chemins::trouver(vue, &depart, &chemin, suivre & 1 != 0))
         });
-        match n {
-            Ok(n) => match ecrire(m, sortie, &filestat(n)) {
+        match o {
+            Ok(o) => match ecrire(m, sortie, &filestat(o)) {
                 Ok(()) => SUCCES,
                 Err(e) => e,
             },
@@ -784,7 +810,7 @@ impl Wasi {
     #[allow(clippy::too_many_arguments)]
     fn fd_readdir(&self, dossier: u32, tampon: u32, longueur: u32, cookie: u64, utilises: u32, m: &mut [u8],
                   cout: &mut u64) -> u32 {
-        let (_, sorte, n, ..) = match self.ouvert(dossier) {
+        let (_, sorte, objet, ..) = match self.ouvert(dossier) {
             Ok(o) => o,
             Err(e) => return e,
         };
@@ -795,14 +821,14 @@ impl Wasi {
             return EFAULT;
         }
         let mut fait: u32 = 0;
-        let r = vfs::avec(|fs, _| {
-            fs.lire_dossier(n, cookie, |nom, numero, genre, suivante| {
+        let r = vfs::avec_systeme(|s, _| {
+            s.avec_vue(0, |vue| vue.lire_dossier(objet, cookie, |nom, numero, genre, suivante| {
                 if fait >= longueur {
                     return false;
                 }
                 let mut entree = [0u8; 24];
                 entree[0..8].copy_from_slice(&suivante.to_le_bytes());
-                entree[8..16].copy_from_slice(&(numero.0 as u64).to_le_bytes());
+                entree[8..16].copy_from_slice(&numero.to_le_bytes());
                 entree[16..20].copy_from_slice(&(nom.len() as u32).to_le_bytes());
                 entree[20] = match genre {
                     fichiers::tmpfs::DT_DIR => TYPE_DOSSIER,
@@ -817,7 +843,7 @@ impl Wasi {
                     fait += n;
                 }
                 true
-            })
+            }))
         });
         if let Err(e) = r {
             return errno(e);

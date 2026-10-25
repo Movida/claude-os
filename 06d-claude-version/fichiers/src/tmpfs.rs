@@ -485,7 +485,7 @@ impl Tmpfs {
     /// Peut-on créer une entrée dans le dossier `dossier` (le `may_create`
     /// de Linux) ? Pas dans un dossier effacé (ENOENT), et il faut le droit
     /// d'y écrire et de le traverser (EACCES).
-    fn peut_creer(&self, qui: Identite, dossier: Numero) -> Result<(), Erreur> {
+    pub(crate) fn peut_creer(&self, qui: Identite, dossier: Numero) -> Result<(), Erreur> {
         let d = self.inode(dossier);
         if d.nlink == 0 {
             return Err(Erreur::ENOENT);
@@ -611,7 +611,8 @@ impl Tmpfs {
     /// du fichier ou du dossier (ou root) le peut (EPERM) ; puis le type :
     /// `dossier` attendu et ce n'en est pas un (ENOTDIR), ou l'inverse
     /// (EISDIR).
-    fn peut_effacer(&self, qui: Identite, dossier: Numero, victime: Numero, dossier_attendu: bool) -> Result<(), Erreur> {
+    pub(crate) fn peut_effacer(&self, qui: Identite, dossier: Numero, victime: Numero, dossier_attendu: bool)
+        -> Result<(), Erreur> {
         let d = self.inode(dossier);
         let v = self.inode(victime);
         if !d.permis(qui, ECRIRE | EXECUTER) {

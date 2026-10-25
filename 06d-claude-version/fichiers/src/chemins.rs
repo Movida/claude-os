@@ -27,8 +27,8 @@
 //! Traverser un point de montage, c'est à son implémentation de le faire :
 //! chercher un nom dont l'inode est un point de montage rend la racine du
 //! système monté, et le parent de cette racine est le parent du point de
-//! montage. C'est ce que fera le noyau quand `/proc` sera monté (6d) ; la
-//! résolution, elle, ne changera pas.
+//! montage. C'est ce que fait la `Vue` de montages.rs (6d) ; la
+//! résolution, elle, n'a pas changé.
 //!
 //! Sans récursion : les liens en cours sont dans une pile explicite (prise
 //! au tas, faillible), comme le `nd->stack` de Linux. La pile du noyau ne

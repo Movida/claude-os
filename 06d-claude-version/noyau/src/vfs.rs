@@ -31,18 +31,20 @@
 //!     le premier et prendra le second) ;
 //!   - jamais de copie depuis ou vers un programme sous ce verrou : une
 //!     copie peut faire une faute de page.
-//! Une seule racine pour l'instant : /proc et /sys se monteront à côté
-//! (6d) ; la résolution des chemins (../fichiers/src/chemins.rs) les
-//! traversera par son trait `Arbre`.
+//! D'autres systèmes de fichiers se montent sur des dossiers du tmpfs
+//! (../fichiers/src/montages.rs, 6d) : la résolution des chemins parcourt
+//! une `Vue` de tous (`Systeme::avec_vue`), qui traverse les points de
+//! montage.
 
 use alloc::vec::Vec;
 use core::fmt;
 
-use crate::descripteurs::{Fichier, Ouverts};
+use crate::descripteurs::{Fichier, Ouverts, Tenu};
 use crate::memoire::Echec;
 use crate::verrou::Verrou;
 use crate::{espace, pages, pile, temps};
-use fichiers::chemins::{Depart, Suivre, resoudre};
+use fichiers::chemins::{Depart, Fin, Suivre, resoudre};
+use fichiers::montages::{Monte, Objet, Vue};
 use fichiers::tmpfs::{Cadres, Horodatage, Limites, Numero, Tmpfs};
 use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Temps};
 
@@ -98,10 +100,44 @@ impl Systeme {
     /// fermé : le tmpfs rend son inode (et ses pages, si plus rien ne le
     /// tient).
     pub fn lacher(&mut self, f: Fichier, cadres: &mut CadresDuNoyau) {
-        if let Some(ferme) = self.ouverts.lacher(f) {
-            self.fs.fermer(&ferme.ouvert, cadres);
+        if let Some(ferme) = self.ouverts.lacher(f)
+            && let Tenu::Tmpfs(ouvert) = ferme.tenu
+        {
+            self.fs.fermer(&ouvert, cadres);
         }
     }
+
+    /// Appelle `f` avec la vue de tous les systèmes de fichiers, telle que
+    /// la voit le processus `pid` (pour /proc/self ; 0 : le noyau, ou un
+    /// programme WebAssembly, qui n'est pas un processus Linux).
+    pub fn avec_vue<R>(&self, pid: u32, f: impl FnOnce(&Vue) -> R) -> R {
+        let mut texte = [0u8; 10];
+        let lecteur = decimal(pid, &mut texte);
+        let montes: [(Numero, &dyn Monte); 0] = [];
+        f(&Vue { fs: &self.fs, montes: &montes, lecteur })
+    }
+
+    /// Résout `chemin` depuis `depart`, pour le processus `pid`, à travers
+    /// les montages (fichiers::montages).
+    pub fn resoudre(&self, pid: u32, depart: &Depart<Objet>, chemin: &[u8], suivre: Suivre) -> Result<Fin<Objet>, Erreur> {
+        self.avec_vue(pid, |vue| resoudre(vue, depart, chemin, suivre))
+    }
+
+    /// La racine de l'arborescence (celle du tmpfs).
+    pub fn racine(&self) -> Objet {
+        Objet::Tmpfs(self.fs.racine())
+    }
+}
+
+/// `n` en décimal, dans `texte` (rien pour 0).
+fn decimal(mut n: u32, texte: &mut [u8; 10]) -> &[u8] {
+    let mut i = texte.len();
+    while n > 0 {
+        i -= 1;
+        texte[i] = b'0' + (n % 10) as u8;
+        n /= 10;
+    }
+    &texte[i..]
 }
 
 static RACINE: Verrou<Option<Systeme>> = Verrou::new(None);
@@ -145,7 +181,7 @@ pub fn octets_mut(cadre: u64) -> &'static mut [u8] {
 /// tueur OOM).
 pub fn page_projetee(f: Fichier, index: u64) -> Result<u64, Echec> {
     avec_systeme(|s, cadres| {
-        let n = s.ouverts.fichier(f).ouvert.numero;
+        let n = s.ouverts.fichier(f).inode();
         if index >= s.fs.attributs(n).taille.div_ceil(PAGE) {
             return Err(Echec::HorsDuFichier);
         }

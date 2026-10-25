@@ -19,7 +19,7 @@ use crate::signaux::Signaux;
 use crate::verrou::Verrou;
 use crate::vfs;
 use fichiers::Identite;
-use fichiers::tmpfs::Numero;
+use fichiers::montages::Objet;
 
 pub struct Processus {
     /// Son numéro (pid), qui est aussi celui de son seul fil et de son
@@ -29,10 +29,12 @@ pub struct Processus {
     pub memoire: Memoire,
     /// Ses descripteurs de fichiers (la files_struct, descripteurs.rs).
     pub descripteurs: Descripteurs,
-    /// Son dossier courant (l'inode est tenu), d'où partent les chemins
-    /// relatifs ; et sa racine (chroot), d'où partent les chemins absolus.
-    pub dossier: Numero,
-    pub racine: Numero,
+    /// Son dossier courant, d'où partent les chemins relatifs ; et sa
+    /// racine (chroot), d'où partent les chemins absolus. Des objets de la
+    /// vue de tous les systèmes de fichiers (un dossier courant peut être
+    /// dans /proc) ; un inode du tmpfs est tenu.
+    pub dossier: Objet,
+    pub racine: Objet,
     /// Son masque de création (umask) : les droits à retirer de tout
     /// fichier qu'il crée. 022 par défaut, comme Linux.
     pub umask: u32,
@@ -124,8 +126,11 @@ impl Drop for Processus {
             }
         }
         vfs::avec(|fs, cadres| {
-            fs.lacher(self.dossier, cadres);
-            fs.lacher(self.racine, cadres);
+            for o in [self.dossier, self.racine] {
+                if let Some(n) = o.tmpfs() {
+                    fs.lacher(n, cadres);
+                }
+            }
         });
     }
 }
