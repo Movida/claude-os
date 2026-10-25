@@ -216,3 +216,34 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
 - Pendant le rebase, les fichiers construits par les commits suivants
   apparaissent comme non suivis (le `.gitignore` de l'époque ne les connaît
   pas encore) : ne jamais `git add -A`, nommer les fichiers.
+
+## Pièges rencontrés en 6a (25 octobre 2026)
+
+- **La faute servie.** CR2 se lit en tout premier. Une faute du noyau sur
+  une adresse de programme n'est servie que dans une copie de la table
+  d'exceptions, avec AC à 1 si SMAP est actif (sinon le test de SMAP du
+  démarrage, sans `stac`, serait servi sans fin), et un processus en
+  cours. Le verrou du processus est rendu AVANT `tache::arreter` ou
+  `terminer`, qui ne reviennent pas. La page de zéros n'est jamais rendue
+  (`pages::liberer` paniquerait) ; une table rendue l'est après le vidage
+  complet du TLB (caches des tables, Intel vol. 3A 4.10.3).
+- **Les petites allocations du tas du noyau gardent leurs pages** :
+  une structure par programme qui passe par les classes du tas fait
+  mentir « memoire rendue » au premier programme qui l'agrandit. La
+  carte des zones prend donc d'emblée une page entière.
+- **Un test sur l'hôte ne doit dépendre d'aucun réglage** : le
+  devcontainer a `vm.overcommit_memory = 1` (« toujours »), un conteneur
+  `mmap_min_addr = 4096`. Les cas qui en dépendent restent dans QEMU.
+- **Vérifier une affirmation du plan contre Linux avant de l'écrire en
+  test** : le plan voulait 300 Mio accordés d'un coup sur 128 Mio, ce que
+  Linux refuse ; il disait l'adresse suggérée arrondie au-dessus, elle
+  l'est au-dessous. Une sonde C sur l'hôte tranche en une minute.
+- **`pkill -f motif` tue aussi le shell qui le lance** (sa ligne de
+  commande contient le motif) : viser le numéro de processus
+  (`pgrep -a`, puis `kill`). Un QEMU resté en marche garde le verrou
+  d'écriture de son image : les QEMU suivants échouent en silence.
+  Démarrer une COPIE de l'image pour les essais à la main.
+- **Le temps du démarrage** : le chargeur lit l'archive par le BIOS, un
+  quart de seconde par Mio sous QEMU ; `verifier.sh` laisse 2 s. Mesurer
+  (une ligne datée par message du port série) avant d'ajouter un gros
+  programme à l'archive ordinaire.

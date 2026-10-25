@@ -17,7 +17,7 @@ Le vrai Claude Code plutôt qu'un agent maison, parce que David veut utiliser so
 - Le code est commenté en français et explique le *pourquoi*, pas seulement le *quoi*.
 - Au plus bas niveau : aucune crate Rust qui fait le travail à notre place (pas de `bootloader`, `x86_64`, `pic8259`, `uart_16550`…). Le noyau n'utilise que `core` et `alloc` (les collections de Rust : `Vec`, `Box`, `String`…), avec notre propre allocateur ; tout accès au matériel passe par notre code, avec `unsafe` cantonné aux quelques fonctions qui touchent le matériel.
 - Les messages affichés par l'OS n'ont pas d'accents : la police du BIOS utilise la page de code 437, pas l'UTF-8.
-- Une étape = un dossier numéroté (`01-boot/`, `02-…/`), chacun avec son propre Makefile.
+- Une étape = un dossier numéroté (`01-boot/`, `02-…/`), chacun avec son propre Makefile. Une sous-étape porte sa lettre (`06a-memoire/`, `06b-…/`), avec son tag (`etape-06a`) et son propre fil de discussion.
 
 ## Historique git
 
@@ -33,8 +33,9 @@ Le dépôt (github.com/Movida/claude-os) doit se lire étape par étape.
 ## Outils
 
 - `nasm` et `qemu-system-x86_64` (`sudo apt install nasm qemu-system-x86`).
-- Étapes 4 et 5 : `make tests-hote` télécharge la suite de tests officielle de WebAssembly et `wast2json` (wabt 1.0.39, binaire officiel pour Linux x86_64), qui la convertit, à des versions figées vérifiées par SHA-256.
+- Depuis l'étape 4 : `make tests-hote` télécharge la suite de tests officielle de WebAssembly et `wast2json` (wabt 1.0.39, binaire officiel pour Linux x86_64), qui la convertit, à des versions figées vérifiées par SHA-256.
 - Étape 5 : `gcc`, `libc6-dev` (la glibc statique, pour `gcc -static`) et `strace` (installés par le Dockerfile). Les programmes Linux de test (`05-elf/linux/`) tournent aussi tels quels sur la machine hôte. `make trace` montre les appels système d'un programme C dans notre noyau, à côté de `strace` sur l'hôte.
+- Depuis 6a : `make tests-hote` lance aussi `linux/memoire` et `linux/claude-version` sur l'hôte : nos appels de la mémoire (mmap, munmap, mprotect, madvise) doivent s'y comporter comme sous le vrai Linux.
 - Rust, via `rustup` (installé par le devcontainer). La version exacte est figée dans `03-noyau-rust/noyau/rust-toolchain.toml` ; `rustup` l'installe à la première commande `cargo`.
 - Dans chaque étape : `make` pour construire, `make run` pour démarrer dans QEMU, `make dump` pour inspecter l'image ; `make tests-hote` pour les tests qui tournent sur la machine hôte, et `make tests-qemu` pour les scénarios dans QEMU (pannes provoquées, programmes fautifs), quand l'étape en a.
 
@@ -56,6 +57,19 @@ Puis lire `serial.log`. Pour une capture de l'écran, envoyer `screendump ecran.
 3. Noyau Rust : interruptions, horloge, clavier, mémoire physique (fait)
 4. Interpréteur WebAssembly dans le noyau (d'abord une bibliothèque testée sur l'hôte avec la suite de tests officielle de Wasm), puis WASI minimal (`fd_write`, `proc_exit`) (fait)
 5. Chargeur ELF et premiers appels système Linux : un programme C compilé par `gcc -static` tourne dans l'anneau 3 (fait)
-6. Processus, système de fichiers, réseau (virtio), TLS… jusqu'à Claude Code
+6. Jusqu'à Claude Code, en treize sous-étapes (le découpage et le plan de chacune : `etape-06/plan.md` dans les fichiers du projet) :
+   - 6a. Mémoire virtuelle à la demande : zones, fautes de page servies, page de zéros, pile qui grandit, surengagement et OOM, mmap/munmap/mprotect/madvise anonymes (fait)
+   - 6b. Système de fichiers en mémoire, descripteurs, cache des pages, mmap de fichiers
+   - 6c. Programmes dynamiques : ld-linux et la glibc partagée
+   - 6d. `claude --version`
+   - 6e. Ordonnanceur, APIC et IO-APIC, fils (`clone3`, `futex`)
+   - 6f. Signaux, `epoll`, `eventfd`, tubes
+   - 6g. PCI, virtio-net, Ethernet, IPv4, UDP, DNS
+   - 6h. TCP, sockets, générateur aléatoire (ChaCha20)
+   - 6i. `claude -p "bonjour"` : la première réponse de Claude
+   - 6j. Le port série devient un vrai terminal (termios, `/dev/tty`)
+   - 6k. `fork`, `execve`, un shell : l'outil Bash de Claude Code
+   - 6l. virtio-blk et un système de fichiers persistant
+   - 6m. Durcissement : KPTI, PCID, pages globales, ASLR, vDSO
 
 Plus tard : un chargeur UEFI, nécessaire pour démarrer sur les PC récents sans mode Legacy/CSM.

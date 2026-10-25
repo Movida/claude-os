@@ -170,7 +170,29 @@ Dossier `05-elf/`, en onze commits (outillage compris), d'après un plan relu à
 
 **Relecture de fond :** quatre relecteurs indépendants, 60 millions d'ELF et 40 millions d'archives abîmés (aucune panique, invariants vérifiés), des mutations, des cas provoqués (`-cpu qemu32`, 128 Mio à 6 Gio, sans NX, image tronquée, erreurs disque injectées par `blkdebug`, NMI injecté pendant un programme). Deux vrais défauts, repliés dans leurs commits : les registres x87/MMX passaient d'un programme au suivant (`fninit` ne les efface pas), et un programme échappait à son budget de temps par `brk` (pages mises à zéro interruptions coupées, tics perdus). Plus une série de points de robustesse (chargeur sur vrai matériel, Makefile, petits écarts avec Linux).
 
-## 14. Reste à faire
+## 14. Sous-étape 6a réalisée : la mémoire virtuelle à la demande
+
+L'étape 6 se découpe en treize sous-étapes (voir `CLAUDE.md`), chacune dans son dossier, avec son plan écrit et relu au début de son fil, d'après le vrai binaire `claude` 2.1.310 (lu par `readelf`, tracé par `strace`, essayé sous `qemu-x86_64` : Nehalem suffit, pas besoin d'AVX ni de XSAVE ; TLS est fait par Bun, pas par le noyau). `claude` réserve 8 Gio pour n'en toucher que quelques Mio : rien ne peut plus être projeté d'avance.
+
+Dossier `06a-memoire/`, en dix commits (outillage compris) :
+
+0. **Outillage** : `verifier.sh` et `verifier-historique.sh` voient les dossiers de sous-étapes (`[0-9][0-9]*-*/`), le `.gitignore` passe à des motifs.
+1. **La carte des zones** (`zones/`, les `vm_area_struct` de Linux), bibliothèque `no_std` sans `unsafe` : un `Vec` trié plutôt qu'un arbre (78 zones mesurées pour `claude`, et un `Vec` sait échouer proprement), voisines du même genre toujours fusionnées, au plus 65 530 zones, toute opération tout ou rien. Testée par des cas à la main et 400 000 opérations au hasard comparées à un modèle page par page, qui a trouvé un vrai défaut (une plage vide au milieu d'une zone la coupait).
+2. **Chaque programme a sa mémoire** (`memoire.rs`, la `mm_struct`) : segments, pile et tas deviennent des zones ; les tables se parcourent par plages en sautant les tables absentes (un munmap de 64 Gio ne coûte que ce qui est projeté) ; un lot vide le TLB avant de rendre les cadres (33 invlpg au plus, sinon CR3). Comportement inchangé.
+3. **Fautes de page servies** (choix de conception) : dans l'ordre de `do_user_addr_fault` ; la page de zéros dans `.rodata`, la copie à l'écriture ; la pile qui grandit jusqu'à 8 Mio avec l'écart de garde de 1 Mio ; le .bss (zone anonyme à part, comme Linux) et le tas paresseux ; les copies du noyau servies puis reprises, seulement avec AC à 1 si SMAP est actif ; les messages disent la zone de RIP (« dans recursion[401000+1000] ») ; un verrou déjà pris panique au lieu de boucler.
+4. **La politique de Linux** (choix de conception) remplace le budget fixe : surengagement (`OVERCOMMIT_GUESS`), réserve du noyau (`min_free_kbytes`), tueur OOM (SIGKILL), tables comptées, `sysinfo`.
+5. **mmap et munmap anonymes** : placement de Linux (adresse suggérée arrondie à la page inférieure, puis du haut vers le bas sous la base des projections), MAP_FIXED tout ou rien, tables vides rendues après le vidage du TLB.
+6. **mprotect et madvise** sur les zones, dans l'ordre et avec les codes d'erreur de Linux ; MADV_DONTNEED sans effet sur les pages du fichier (Bun y rend 54 Mo de sa section `.bun`) jusqu'au cache des fichiers.
+7. **Pile exécutable** si le programme la demande (PT_GNU_STACK avec PF_X).
+8. **La mémoire de `claude --version` rejouée** par un programme C, dans le même ordre et avec les mêmes tailles : « Memoire de claude --version rejouee : ok. » sur 128 Mio.
+
+`linux/memoire.c` vérifie une quarantaine de comportements ligne par ligne, dans notre noyau et sur l'hôte (`make tests-hote`) : nos codes d'erreur sont ceux du vrai Linux, sans dépendre des réglages de l'hôte.
+
+**Ce que le plan avait de faux, corrigé en route :** une seule demande de 300 Mio sur une machine de 128 Mio, que le plan voulait accepter, serait refusée par Linux lui-même (une demande plus grande que toute la mémoire) ; le test promet donc 2 × 100 Mio. L'adresse suggérée à mmap est arrondie à la page inférieure, pas supérieure (mesuré). `MADV_HUGEPAGE` est accepté comme sur un Linux dont les grandes pages sont réglées sur « never ».
+
+**Relecture de fond :** un relecteur indépendant (aucun défaut grave ; deux écarts avec Linux corrigés : MADV_FREE refusé sur les pages du fichier, le .bss en zone anonyme ; la pile initiale quand arguments et environnement frôlent leurs 2 Mio ; deux commentaires), des cas provoqués (64 Mio à 5 Gio, interblocage, copie du noyau sans mémoire, écart de garde de la pile) et 24 000 opérations mémoire au hasard, identiques sous Linux et chez nous, avec qemu64 et `-cpu max`.
+
+## 15. Reste à faire
 
 **Dans le noyau**
 
@@ -179,14 +201,16 @@ Dossier `05-elf/`, en onze commits (outillage compris), d'après un plan relu à
 - **Validation sous carburant.** Valider un module piégé coûte jusqu'à environ 1 s par Mio (le facteur 1000 de l'algorithme de la spécification) ; l'instanciation copie les segments actifs sans carburant (linéaire en la taille du module). À rendre interruptible avec l'ordonnanceur.
 - **Console non bloquante.** Le port série fait attendre activement (87 µs par octet sur du vrai matériel) : un pilote à interruptions et une file d'attente, comme le tty de Linux.
 - **Registres des périphériques** (ACPI, APIC…) : les projeter à la demande, sans cache (`ioremap`) ; la projection directe ne couvre que la mémoire vive.
-- **Pages globales** (CR4.PGE) pour le noyau, maintenant qu'il y a un espace d'adressage par programme ; KPTI et PCID quand on saura sur quels processeurs on tourne.
+- **Pages globales** (CR4.PGE) pour le noyau, maintenant qu'il y a un espace d'adressage par programme ; KPTI et PCID : en 6m.
 - **Copie de la moitié haute des espaces d'adressage** : elle suppose que la PML4 du noyau ne change plus. Avec `vmalloc`, créer d'avance toutes les tables de second niveau de la moitié haute (`preallocate_vmalloc_pages` de Linux).
 - **`iretq` qui fauterait** (un RIP non canonique écrit par le noyau, pour exec ou les signaux) : une entrée de la table d'exceptions qui transforme la faute en signal pour le programme (`bad_iret` de Linux). Inatteignable aujourd'hui : le RIP d'un cadre vient toujours du programme.
 - **Budget de temps au compteur de cycles** : compté en tics d'horloge, il se laisse un peu tromper sous QEMU sans accélération (tics perdus dans de courtes sections critiques). Avec une horloge fine (TSC, HPET), mesurer le temps réel.
-- **Tables de pages hors budget** de mémoire d'un programme : les compter, comme Linux (`pgtables_bytes`), avant mmap.
+- **La carte des zones et la réserve** : la carte d'un programme vient du tas du noyau, qui peut puiser dans la réserve (2 à 3 Mio au plus) ; Linux prend ses `vm_area_struct` au-dessus du seuil. Avec les allocations faillibles.
+- **Le verrou du processus coupe les interruptions** : un munmap ou la fin d'un programme qui a touché des centaines de Mio rend ses cadres d'un trait, et des tics d'horloge se perdent. Avec l'ordonnanceur, un verrou qui dort (le `mmap_lock` de Linux).
+- **MADV_DONTNEED sur les pages du fichier** est sans effet, faute de fichier derrière : le vrai comportement (relire le fichier) avec le cache des pages (6b). De même MAP_SHARED, refusé jusque-là.
+- **Écarts voulus avec Linux**, écrits en commentaire : mprotect sur une plage avec un trou ne change rien (Linux change ce qui précède le trou) ; MAP_FIXED est refusé à une zone du maximum même quand les fusions l'auraient fait tenir ; une zone rendue inscriptible deux fois est recomptée (pas de VM_ACCOUNT).
 - **Lecture des formats** : `formats/` relit les octets après les avoir validés. Sans risque tant qu'ils viennent de l'archive en lecture seule ; valider une copie le jour où ils viendront d'une mémoire modifiable (le cache des fichiers, execve).
 - **Archive cpio** : liens physiques (nlink > 1, contenu dans la dernière entrée), archives concaténées et compressées.
-- **PT_GNU_STACK exécutable** : ignoré, la pile reste NX ; un programme qui l'exige (fonctions imbriquées de gcc) plante au lieu d'être refusé avec un message.
 - **writev** : vérifier tous les morceaux avant d'écrire, comme Linux.
 - **Tas :** rendre au buddy les pages vides des classes ; des listes par processeur pour le multiprocesseur.
 
@@ -195,10 +219,10 @@ Dossier `05-elf/`, en onze commits (outillage compris), d'après un plan relu à
 - **NMI pendant le passage éclair en mode protégé du chargeur** : non masqué (Linux le masque par le port 0x70 pour son passage définitif). Risque infime, à revoir si un essai sur vrai matériel le montre.
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 15. Questions ouvertes
+## 16. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 16. Prochaine étape
+## 17. Prochaine étape
 
-Étape 6 : vers Claude Code. Le plan de l'étape 5 en a reporté la liste : ET_DYN, ld-linux et la glibc partagée (`claude` est dynamique) ; mmap et la pagination à la demande ; l'ordonnanceur, les fils d'exécution, la sauvegarde XSAVE à chaque bascule ; un vrai tty ; un vrai générateur aléatoire ; un système de fichiers en mémoire rempli depuis l'archive, et /proc/self/exe ; KPTI, PCID, pages globales ; ASLR ; vDSO. Puis le réseau (virtio) et TLS.
+Sous-étape 6b : un système de fichiers en mémoire (le tmpfs de Linux), déballé depuis l'archive, les descripteurs de fichiers, un compteur de références par cadre et le cache des pages, mmap de fichiers en privé (copie à l'écriture, qui donnera enfin à MADV_DONTNEED son vrai effet sur les segments), le chargeur ELF qui ne copie plus rien. Son plan sera écrit et relu au début de son fil, avec ce que 6a a appris.
