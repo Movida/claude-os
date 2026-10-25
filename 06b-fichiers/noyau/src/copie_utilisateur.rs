@@ -118,16 +118,17 @@ unsafe extern "C" {
 }
 
 /// La plage [adresse, adresse + n[ est-elle dans les adresses des
-/// programmes ? (access_ok de Linux.)
-fn dans_les_bornes(adresse: u64, n: usize) -> bool {
-    adresse.checked_add(n as u64).is_some_and(|fin| fin <= ADRESSE_MAX)
+/// programmes ? (access_ok de Linux.) Même vide : une adresse du noyau
+/// reste refusée, comme Linux (read(fd, adresse_du_noyau, 0) : EFAULT).
+pub fn dans_les_bornes(adresse: u64, n: u64) -> bool {
+    adresse.checked_add(n).is_some_and(|fin| fin <= ADRESSE_MAX)
 }
 
 /// Copie `destination.len()` octets depuis l'adresse `source` du programme
 /// en cours. En cas de faute, une partie a pu être copiée : le contenu de
 /// `destination` n'a alors pas de sens.
 pub fn copier_depuis_utilisateur(destination: &mut [u8], source: u64) -> Result<(), Faute> {
-    if !dans_les_bornes(source, destination.len()) {
+    if !dans_les_bornes(source, destination.len() as u64) {
         return Err(Faute);
     }
     // SAFETY : `destination` est à nous ; la source est dans les adresses
@@ -140,7 +141,7 @@ pub fn copier_depuis_utilisateur(destination: &mut [u8], source: u64) -> Result<
 
 /// Copie `source` à l'adresse `destination` du programme en cours.
 pub fn copier_vers_utilisateur(destination: u64, source: &[u8]) -> Result<(), Faute> {
-    if !dans_les_bornes(destination, source.len()) {
+    if !dans_les_bornes(destination, source.len() as u64) {
         return Err(Faute);
     }
     // SAFETY : comme copier_depuis_utilisateur, dans l'autre sens. Les
@@ -148,6 +149,33 @@ pub fn copier_vers_utilisateur(destination: u64, source: &[u8]) -> Result<(), Fa
     // respecte les droits des pages).
     let reste = unsafe { copie_brute(destination as *mut u8, source.as_ptr(), source.len()) };
     if reste == 0 { Ok(()) } else { Err(Faute) }
+}
+
+/// Comme `copier_depuis_utilisateur`, mais ce qui a été copié avant une
+/// faute compte : rend le nombre d'octets copiés (tous, sans faute ; 0 hors
+/// des bornes). Pour read et write, qui rendent ce qu'ils ont transféré
+/// (pour POSIX, un transfert partiel n'est pas une erreur : un programme
+/// qui écrit 300 octets dont les 100 premiers sont valides apprend que 100
+/// sont écrits, et ils le sont). `rep movsb` laisse dans RCX ce qui reste :
+/// la copie s'est arrêtée exactement à la première page absente.
+pub fn copier_depuis_utilisateur_partiel(destination: &mut [u8], source: u64) -> usize {
+    if !dans_les_bornes(source, destination.len() as u64) {
+        return 0;
+    }
+    // SAFETY : comme copier_depuis_utilisateur.
+    let reste = unsafe { copie_brute(destination.as_mut_ptr(), source as *const u8, destination.len()) };
+    destination.len() - reste
+}
+
+/// Copie `source` à l'adresse `destination` du programme, comme
+/// `copier_depuis_utilisateur_partiel` : rend le nombre d'octets copiés.
+pub fn copier_vers_utilisateur_partiel(destination: u64, source: &[u8]) -> usize {
+    if !dans_les_bornes(destination, source.len() as u64) {
+        return 0;
+    }
+    // SAFETY : comme copier_vers_utilisateur.
+    let reste = unsafe { copie_brute(destination as *mut u8, source.as_ptr(), source.len()) };
+    source.len() - reste
 }
 
 /// L'adresse de reprise prévue pour une faute du noyau à l'adresse `rip`,
@@ -218,4 +246,39 @@ pub fn smap_verifie(adresse: u64) -> bool {
     // SAFETY : la lecture est protégée par la table d'exceptions ;
     // `adresse` est une page projetée de l'espace actif.
     unsafe { lire_octet_direct(adresse) == -1 }
+}
+
+/// Copie la chaîne terminée par un octet nul à l'adresse `source` du
+/// programme (un chemin, le plus souvent), dans un bloc du tas : au plus
+/// `max` octets, zéro compris (PATH_MAX pour un chemin). Rend ses octets,
+/// sans le zéro. La copie avance page par page et s'arrête au zéro : elle
+/// ne touche jamais une page au-delà, qui pourrait ne pas exister (le
+/// `strncpy_from_user` de Linux).
+pub fn chaine_depuis_utilisateur(source: u64, max: usize) -> Result<alloc::vec::Vec<u8>, ErreurChaine> {
+    let mut chaine = alloc::vec::Vec::new();
+    chaine.try_reserve_exact(max).map_err(|_| ErreurChaine::PlusDeMemoire)?;
+    let mut adresse = source;
+    while chaine.len() < max {
+        // Jusqu'à la fin de la page, ou de la place.
+        let n = ((4096 - adresse % 4096) as usize).min(max - chaine.len());
+        let debut = chaine.len();
+        chaine.resize(debut + n, 0);
+        copier_depuis_utilisateur(&mut chaine[debut..], adresse).map_err(|_| ErreurChaine::Faute)?;
+        if let Some(zero) = chaine[debut..].iter().position(|&o| o == 0) {
+            chaine.truncate(debut + zero);
+            return Ok(chaine);
+        }
+        adresse += n as u64;
+    }
+    Err(ErreurChaine::TropLongue)
+}
+
+/// Pourquoi une chaîne n'a pas pu être copiée.
+pub enum ErreurChaine {
+    /// Une adresse invalide (EFAULT).
+    Faute,
+    /// Pas de zéro dans les `max` premiers octets (ENAMETOOLONG).
+    TropLongue,
+    /// Pas de mémoire pour la copie (ENOMEM).
+    PlusDeMemoire,
 }

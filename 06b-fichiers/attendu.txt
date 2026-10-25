@@ -21,7 +21,7 @@ rendues et recollees : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
-[noyau] Archive deballee : dossiers 5, fichiers 9, liens symboliques 1, liens physiques 1 ; archive rendue (
+[noyau] Archive deballee : dossiers 5, fichiers 10, liens symboliques 1, liens physiques 1 ; archive rendue (
 [noyau] Programmes de /bin :
         bonjour.wasm                 2943 octets
         bonjour-asm
@@ -52,3 +52,5 @@ memoire rendue : ok.
 [noyau] claude-version : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] temps : toutes les verifications : ok
 [noyau] temps : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] fichiers : toutes les verifications : ok
+[noyau] fichiers : termine, code de sortie 0 ; memoire rendue : ok.

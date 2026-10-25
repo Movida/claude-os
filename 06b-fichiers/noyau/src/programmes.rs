@@ -15,7 +15,9 @@
 //! format est essayé tour à tour, et le premier qui reconnaît le fichier
 //! s'en charge. Le nom du fichier (son extension) ne compte pas.
 
-use crate::{chargeur_elf, demarrage, espace, pages, pile, processus, tache, vfs, wasi};
+use crate::descripteurs::Descripteurs;
+use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, processus, tache, vfs, wasi};
+use fichiers::Identite;
 use alloc::vec::Vec;
 use core::fmt;
 use fichiers::tmpfs::Numero;
@@ -188,16 +190,17 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
     // (16 octets au plus : ce qu'il reste du fichier après le point
     // d'entrée, dans son segment.)
     let mut attendu = [0u8; 16];
-    let n = executable
+    let longueur = executable
         .segments()
         .find_map(|s| {
             let decalage = programme.entree.checked_sub(s.adresse).filter(|&d| d < s.taille_fichier)?;
-            let n = (s.taille_fichier - decalage).min(16) as usize;
-            lire(s.position + decalage, &mut attendu[..n]).then_some(n)
+            let longueur = (s.taille_fichier - decalage).min(16) as usize;
+            lire(s.position + decalage, &mut attendu[..longueur]).then_some(longueur)
         })
         .unwrap_or(0);
     let mut code = [0u8; 16];
-    let code_ok = programme.memoire.espace.lire(programme.entree, &mut code[..n]).is_ok() && code[..n] == attendu[..n];
+    let code_ok = programme.memoire.espace.lire(programme.entree, &mut code[..longueur]).is_ok()
+        && code[..longueur] == attendu[..longueur];
     // Le tas commence à la page qui suit le dernier segment.
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
@@ -208,10 +211,44 @@ fn executer_elf(nom: NomCourt, n: Numero, chemin: &[u8]) {
         Ok(rsp) => rsp,
         Err(e) => return afficherln!("[noyau] {} : pile initiale impossible : {}", nom, e),
     };
-    // Le programme devient le processus en cours.
+    // Le programme devient le processus en cours : avec la console en 0,
+    // 1 et 2, la racine pour dossier courant, l'umask de Linux, et
+    // l'identité de l'utilisateur 1000.
+    let mut descripteurs = Descripteurs::new();
+    if let Err(e) = appels_fichiers::ouvrir_console(&mut descripteurs) {
+        return afficherln!("[noyau] {} : pas de console (errno {})", nom, e.errno());
+    }
+    let racine = vfs::avec(|fs, _| {
+        let r = fs.racine();
+        // Le dossier courant et la racine tiennent chacun l'inode.
+        fs.prendre(r);
+        fs.prendre(r);
+        r
+    });
+    let identite = Identite { uid: pile::UTILISATEUR as u32, gid: pile::GROUPE as u32 };
     let (pml4, entree) = (programme.memoire.espace.pml4(), programme.entree);
-    processus::installer(processus::Processus { memoire: programme.memoire });
-    let code = tache::executer(nom, pml4, entree, rsp);
+    processus::installer(processus::Processus {
+        memoire: programme.memoire,
+        descripteurs,
+        dossier: racine,
+        racine,
+        umask: 0o022,
+        identite,
+        limites: processus::LIMITES_PAR_DEFAUT,
+    });
+    // Plus personne ne peut écrire le fichier tant qu'il s'exécute
+    // (ETXTBSY) : ses pages seront bientôt celles du programme.
+    let code = match vfs::avec(|fs, _| fs.refuser_ecriture(n)) {
+        Ok(()) => {
+            let code = tache::executer(nom, pml4, entree, rsp);
+            vfs::avec(|fs, _| fs.permettre_ecriture(n));
+            code
+        }
+        Err(_) => {
+            afficherln!("[noyau] {} : ouvert en ecriture, ne peut pas etre execute (ETXTBSY)", nom);
+            -1
+        }
+    };
     drop(processus::retirer());
     afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.",
                 nom, code, if pages::libres() == libres { "ok" } else { "ECHEC" });

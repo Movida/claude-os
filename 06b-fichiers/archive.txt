@@ -14,6 +14,10 @@ file  /bin/bonjour-c       linux/construits/bonjour-c 755 0 0
 file  /bin/memoire         linux/construits/memoire 755 0 0
 file  /bin/claude-version  linux/construits/claude-version 755 0 0
 file  /bin/temps           linux/construits/temps 755 0 0
+# Celui-ci est à l'utilisateur 1000 : il vérifie qu'il ne peut pas écrire
+# son propre binaire pendant qu'il tourne (ETXTBSY), ce que les droits
+# d'un fichier de root refuseraient avant (EACCES).
+file  /bin/fichiers        linux/construits/fichiers 755 1000 1000
 
 # Quelques fichiers à lire : un texte, un second nom (un lien physique),
 # et un lien symbolique.

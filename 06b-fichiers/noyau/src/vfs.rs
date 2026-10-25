@@ -38,6 +38,7 @@
 use alloc::vec::Vec;
 use core::fmt;
 
+use crate::descripteurs::{Fichier, Ouverts};
 use crate::verrou::Verrou;
 use crate::{espace, pages, pile, temps};
 use fichiers::chemins::{Depart, Suivre, resoudre};
@@ -81,14 +82,54 @@ impl Cadres for CadresDuNoyau {
     }
 }
 
-/// Le système de fichiers de la racine.
-static RACINE: Verrou<Option<Tmpfs>> = Verrou::new(None);
+/// Ce que garde le verrou des fichiers : le système de fichiers de la
+/// racine, et la table des fichiers ouverts (descripteurs.rs).
+pub struct Systeme {
+    pub fs: Tmpfs,
+    pub ouverts: Ouverts,
+}
+
+impl Systeme {
+    /// Le fichier ouvert `f` est tenu une fois de moins ; au dernier, il est
+    /// fermé : le tmpfs rend son inode (et ses pages, si plus rien ne le
+    /// tient).
+    pub fn lacher(&mut self, f: Fichier, cadres: &mut CadresDuNoyau) {
+        if let Some(ferme) = self.ouverts.lacher(f) {
+            self.fs.fermer(&ferme.ouvert, cadres);
+        }
+    }
+}
+
+static RACINE: Verrou<Option<Systeme>> = Verrou::new(None);
 
 /// Exécute `f` sur le système de fichiers, verrou tenu : court, et sans
 /// copie depuis ou vers un programme.
 pub fn avec<R>(f: impl FnOnce(&mut Tmpfs, &mut CadresDuNoyau) -> R) -> R {
+    avec_systeme(|s, cadres| f(&mut s.fs, cadres))
+}
+
+/// Comme `avec`, avec aussi la table des fichiers ouverts.
+pub fn avec_systeme<R>(f: impl FnOnce(&mut Systeme, &mut CadresDuNoyau) -> R) -> R {
     let mut racine = RACINE.verrouiller();
     f(racine.as_mut().expect("systeme de fichiers pas encore monte"), &mut CadresDuNoyau)
+}
+
+/// La page `cadre` d'un fichier, que l'appelant tient (pages::prendre),
+/// vue par la projection directe : pour la copier vers un programme.
+pub fn octets(cadre: u64) -> &'static [u8] {
+    // SAFETY : le cadre est une page allouée, tenue par l'appelant : elle ne
+    // sera pas rendue tant qu'il ne l'a pas lâchée. Un seul processeur :
+    // personne ne l'écrit pendant qu'on la lit.
+    unsafe { core::slice::from_raw_parts(espace::virtuelle(cadre) as *const u8, PAGE as usize) }
+}
+
+/// La même, pour y écrire (write) : l'appelant la tient, et elle est à un
+/// fichier, pas projetée en écriture chez un programme.
+#[allow(clippy::mut_from_ref)]
+pub fn octets_mut(cadre: u64) -> &'static mut [u8] {
+    // SAFETY : comme `octets` ; la page n'est vue que par le noyau, qui
+    // l'écrit ici, et les projections en lecture des programmes.
+    unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(cadre) as *mut u8, PAGE as usize) }
 }
 
 /// Lit le fichier `n` à partir de `position` dans `tampon` (pour le
@@ -141,7 +182,7 @@ impl fmt::Display for Chemin<'_> {
 pub fn initialiser(archive: Option<&[u8]>) -> Result<Bilan, Erreur> {
     let total = pages::total() as u64;
     let limites = Limites { inodes: (total / 2).min(u32::MAX as u64) as u32, pages: total / 2 };
-    *RACINE.verrouiller() = Some(Tmpfs::new(limites, temps::maintenant())?);
+    *RACINE.verrouiller() = Some(Systeme { fs: Tmpfs::new(limites, temps::maintenant())?, ouverts: Ouverts::default() });
     let mut bilan = Bilan::default();
     if let Some(octets) = archive {
         deballer(octets, &mut bilan)?;

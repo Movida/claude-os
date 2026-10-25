@@ -15,7 +15,8 @@
 //! exit_group. Plus writev (les messages d'erreur fatale de la glibc),
 //! ioctl(TCGETS) (isatty), et exit ; et, pour la mémoire de `claude`
 //! (6a), mmap, munmap et madvise (de la mémoire anonyme), sysinfo ; et
-//! l'heure (6b) : clock_gettime, clock_getres, gettimeofday, time.
+//! l'heure (6b) : clock_gettime, clock_getres, gettimeofday, time ; et les
+//! fichiers (6b), dans appels_fichiers.rs.
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -32,7 +33,8 @@ use crate::espace_utilisateur::ADRESSE_MAX;
 use crate::interruptions::Cadre;
 use crate::memoire::{Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Zone};
-use crate::{aleatoire, console, cpu, horloge, pages, pile, processus, tache, temps};
+use crate::appels_fichiers as f;
+use crate::{aleatoire, cpu, horloge, pages, processus, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
@@ -43,29 +45,60 @@ const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
-const ENOTTY: i64 = 25;
 const ENOSYS: i64 = 38;
 
 // Les numéros des appels.
+const READ: u64 = 0;
 const WRITE: u64 = 1;
+const OPEN: u64 = 2;
+const CLOSE: u64 = 3;
+const STAT: u64 = 4;
 const FSTAT: u64 = 5;
+const LSTAT: u64 = 6;
+const LSEEK: u64 = 8;
 const MMAP: u64 = 9;
 const MPROTECT: u64 = 10;
 const MUNMAP: u64 = 11;
 const MADVISE: u64 = 28;
 const BRK: u64 = 12;
 const IOCTL: u64 = 16;
+const PREAD64: u64 = 17;
+const PWRITE64: u64 = 18;
+const READV: u64 = 19;
 const WRITEV: u64 = 20;
+const ACCESS: u64 = 21;
+const DUP: u64 = 32;
+const DUP2: u64 = 33;
+const GETPID: u64 = 39;
 const EXIT: u64 = 60;
+const FCNTL: u64 = 72;
+const FLOCK: u64 = 73;
+const RMDIR: u64 = 84;
+const CREAT: u64 = 85;
+const UNLINK: u64 = 87;
 const GETTIMEOFDAY: u64 = 96;
 const SYSINFO: u64 = 99;
+const GETUID: u64 = 102;
+const GETGID: u64 = 104;
+const GETEUID: u64 = 107;
+const GETEGID: u64 = 108;
+const GETPPID: u64 = 110;
+const GETTID: u64 = 186;
 const ARCH_PRCTL: u64 = 158;
 const TIME: u64 = 201;
 const SET_TID_ADDRESS: u64 = 218;
 const CLOCK_GETTIME: u64 = 228;
 const CLOCK_GETRES: u64 = 229;
 const EXIT_GROUP: u64 = 231;
+const OPENAT: u64 = 257;
+const NEWFSTATAT: u64 = 262;
+const UNLINKAT: u64 = 263;
 const READLINKAT: u64 = 267;
+const FACCESSAT: u64 = 269;
+const DUP3: u64 = 292;
+const STATX: u64 = 332;
+const CLOSE_RANGE: u64 = 436;
+const FACCESSAT2: u64 = 439;
 const SET_ROBUST_LIST: u64 = 273;
 const PRLIMIT64: u64 = 302;
 const GETRANDOM: u64 = 318;
@@ -73,12 +106,6 @@ const RSEQ: u64 = 334;
 
 const PAGE: u64 = 4096;
 
-/// Le plus d'octets qu'un write ou un writev écrit d'une fois : au-delà, il
-/// en écrit une partie et le dit (le nombre écrit), ce que POSIX permet ; la
-/// glibc recommence avec la suite. Comme pour fd_write de WASI (wasi.rs) :
-/// sur un vrai port série, 1024 octets prennent déjà 90 ms, et le noyau ne
-/// doit pas rester longtemps dans un seul appel.
-const ECRITURE_MAX: usize = 1024;
 
 /// Le numéro de processus et de fil du programme : 1, le premier (et le
 /// seul) processus. (set_tid_address rend le numéro du fil appelant.)
@@ -87,10 +114,35 @@ const PID: i64 = 1;
 /// Exécute l'appel système `numero` : un résultat, ou -errno.
 pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
     let resultat = match numero {
-        WRITE => write(a[0], a[1], a[2]),
-        WRITEV => writev(a[0], a[1], a[2]),
-        FSTAT => fstat(a[0], a[1]),
-        IOCTL => ioctl(a[0], a[1]),
+        READ => f::read(a[0], a[1], a[2]),
+        WRITE => f::write(a[0], a[1], a[2]),
+        OPEN => f::open(a[0], a[1], a[2]),
+        OPENAT => f::openat(a[0], a[1], a[2], a[3]),
+        CREAT => f::creat(a[0], a[1]),
+        CLOSE => f::close(a[0]),
+        CLOSE_RANGE => f::close_range(a[0], a[1], a[2]),
+        STAT => f::stat(a[0], a[1], true),
+        LSTAT => f::stat(a[0], a[1], false),
+        FSTAT => f::fstat(a[0], a[1]),
+        NEWFSTATAT => f::newfstatat(a[0], a[1], a[2], a[3]),
+        STATX => f::statx(a[0], a[1], a[2], a[3], a[4]),
+        LSEEK => f::lseek(a[0], a[1], a[2]),
+        PREAD64 => f::pread64(a[0], a[1], a[2], a[3]),
+        PWRITE64 => f::pwrite64(a[0], a[1], a[2], a[3]),
+        READV => f::readv(a[0], a[1], a[2]),
+        WRITEV => f::writev(a[0], a[1], a[2]),
+        ACCESS => f::access(a[0], a[1]),
+        FACCESSAT => f::faccessat2(a[0], a[1], a[2], 0),
+        FACCESSAT2 => f::faccessat2(a[0], a[1], a[2], a[3]),
+        DUP => f::dup(a[0]),
+        DUP2 => f::dup2(a[0], a[1]),
+        DUP3 => f::dup3(a[0], a[1], a[2]),
+        FCNTL => f::fcntl(a[0], a[1], a[2]),
+        FLOCK => f::flock(a[0], a[1]),
+        IOCTL => f::ioctl(a[0], a[1], a[2]),
+        UNLINK => f::unlink(a[0]),
+        UNLINKAT => f::unlinkat(a[0], a[1], a[2]),
+        RMDIR => f::rmdir(a[0]),
         BRK => brk(a[0]),
         MMAP => mmap(a[0], a[1], a[2], a[3], a[4], a[5]),
         MUNMAP => munmap(a[0], a[1]),
@@ -114,6 +166,13 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         READLINKAT => -ENOENT,
         GETRANDOM => getrandom(a[0], a[1], a[2]),
         SYSINFO => sysinfo(a[0]),
+        // Qui est le programme : le processus 1, le seul (son parent, le
+        // noyau, n'a pas de numéro : 0, comme le parent de l'init de
+        // Linux), un seul fil, l'utilisateur et le groupe 1000.
+        GETPID | GETTID => PID,
+        GETPPID => 0,
+        GETUID | GETEUID => processus::avec(|p| p.identite.uid) as i64,
+        GETGID | GETEGID => processus::avec(|p| p.identite.gid) as i64,
         CLOCK_GETTIME => clock_gettime(a[0], a[1]),
         CLOCK_GETRES => clock_getres(a[0], a[1]),
         GETTIMEOFDAY => gettimeofday(a[0], a[1]),
@@ -142,10 +201,35 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         return;
     }
     let (nom, n) = match numero {
+        READ => ("read", 3),
         WRITE => ("write", 3),
-        WRITEV => ("writev", 3),
+        OPEN => ("open", 3),
+        OPENAT => ("openat", 4),
+        CREAT => ("creat", 2),
+        CLOSE => ("close", 1),
+        CLOSE_RANGE => ("close_range", 3),
+        STAT => ("stat", 2),
+        LSTAT => ("lstat", 2),
         FSTAT => ("fstat", 2),
-        IOCTL => ("ioctl", 2),
+        NEWFSTATAT => ("newfstatat", 4),
+        STATX => ("statx", 5),
+        LSEEK => ("lseek", 3),
+        PREAD64 => ("pread64", 4),
+        PWRITE64 => ("pwrite64", 4),
+        READV => ("readv", 3),
+        WRITEV => ("writev", 3),
+        ACCESS => ("access", 2),
+        FACCESSAT => ("faccessat", 3),
+        FACCESSAT2 => ("faccessat2", 4),
+        DUP => ("dup", 1),
+        DUP2 => ("dup2", 2),
+        DUP3 => ("dup3", 3),
+        FCNTL => ("fcntl", 3),
+        FLOCK => ("flock", 2),
+        IOCTL => ("ioctl", 3),
+        UNLINK => ("unlink", 1),
+        UNLINKAT => ("unlinkat", 3),
+        RMDIR => ("rmdir", 1),
         BRK => ("brk", 1),
         MMAP => ("mmap", 6),
         MUNMAP => ("munmap", 2),
@@ -159,6 +243,13 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         READLINKAT => ("readlinkat", 4),
         GETRANDOM => ("getrandom", 3),
         SYSINFO => ("sysinfo", 1),
+        GETPID => ("getpid", 0),
+        GETTID => ("gettid", 0),
+        GETPPID => ("getppid", 0),
+        GETUID => ("getuid", 0),
+        GETEUID => ("geteuid", 0),
+        GETGID => ("getgid", 0),
+        GETEGID => ("getegid", 0),
         CLOCK_GETTIME => ("clock_gettime", 2),
         CLOCK_GETRES => ("clock_getres", 2),
         GETTIMEOFDAY => ("gettimeofday", 2),
@@ -176,99 +267,6 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         Some(r) if r < 0 => afficherln!(") = -1 (errno {})", -r),
         Some(r) => afficherln!(") = {:#x}", r),
     }
-}
-
-/// write(fichier, tampon, nombre).
-fn write(fichier: u64, tampon: u64, nombre: u64) -> i64 {
-    if fichier as u32 != 1 && fichier as u32 != 2 {
-        return -EBADF;
-    }
-    // Les octets du programme passent par un tampon du noyau : on copie sa
-    // mémoire d'abord, sans rien tenir (une copie peut fauter), puis on
-    // écrit sur la console (qui, elle, prend son verrou).
-    let mut copie = [0u8; ECRITURE_MAX];
-    let n = (nombre as usize).min(ECRITURE_MAX);
-    if copier_depuis_utilisateur(&mut copie[..n], tampon).is_err() {
-        return -EFAULT;
-    }
-    console::ecrire_octets(&copie[..n]);
-    n as i64
-}
-
-/// writev(fichier, morceaux, nombre) : plusieurs morceaux d'un coup, décrits
-/// par un tableau de « struct iovec » (adresse, longueur : 16 octets). Au
-/// plus 1024 morceaux (IOV_MAX). On lit les descripteurs un par un (pas de
-/// place pour 16 Kio de tableau sur la pile noyau du programme, qui en fait
-/// 16), et on écrit au plus ECRITURE_MAX octets en tout. Une faute après
-/// des octets écrits rend leur nombre ; avant, EFAULT. (Linux, lui, lit et
-/// vérifie tous les descripteurs avant d'écrire quoi que ce soit, et
-/// refuse d'emblée une longueur négative ou un pointeur hors des bornes ;
-/// ici, une telle erreur au milieu donne une écriture partielle. Sans
-/// conséquence pour la glibc, qui ne s'en sert que pour ses messages
-/// fatals.)
-fn writev(fichier: u64, morceaux: u64, nombre: u64) -> i64 {
-    if fichier as u32 != 1 && fichier as u32 != 2 {
-        return -EBADF;
-    }
-    if nombre > 1024 {
-        return -EINVAL;
-    }
-    let mut ecrits = 0usize;
-    for i in 0..nombre {
-        let mut iovec = [0u8; 16];
-        let Some(adresse) = morceaux.checked_add(16 * i) else { return -EFAULT };
-        if copier_depuis_utilisateur(&mut iovec, adresse).is_err() {
-            return if ecrits > 0 { ecrits as i64 } else { -EFAULT };
-        }
-        let base = u64::from_le_bytes(iovec[..8].try_into().unwrap_or([0; 8]));
-        let longueur = u64::from_le_bytes(iovec[8..].try_into().unwrap_or([0; 8]));
-        let n = (longueur as usize).min(ECRITURE_MAX - ecrits);
-        let mut copie = [0u8; ECRITURE_MAX];
-        if copier_depuis_utilisateur(&mut copie[..n], base).is_err() {
-            return if ecrits > 0 { ecrits as i64 } else { -EFAULT };
-        }
-        console::ecrire_octets(&copie[..n]);
-        ecrits += n;
-        if ecrits == ECRITURE_MAX {
-            break;
-        }
-    }
-    ecrits as i64
-}
-
-/// fstat(fichier, stat) : les descripteurs 0, 1 et 2 sont la console, un
-/// périphérique caractère (le 5:1 de Linux, /dev/console). La glibc s'en
-/// sert pour choisir le tampon de la sortie standard.
-fn fstat(fichier: u64, stat: u64) -> i64 {
-    if fichier as u32 > 2 {
-        return -EBADF;
-    }
-    // La « struct stat » de Linux sur x86_64 : 144 octets.
-    let mut s = [0u8; 144];
-    let mut mettre = |position: usize, valeur: u64, taille: usize| {
-        s[position..position + taille].copy_from_slice(&valeur.to_le_bytes()[..taille]);
-    };
-    mettre(16, 1, 8); // st_nlink
-    mettre(24, 0o020620, 4); // st_mode : S_IFCHR, rw--w----
-    mettre(28, pile::UTILISATEUR, 4); // st_uid
-    mettre(32, pile::GROUPE, 4); // st_gid
-    mettre(40, 5 << 8 | 1, 8); // st_rdev : 5:1
-    mettre(56, 1024, 8); // st_blksize
-    if copier_vers_utilisateur(stat, &s).is_err() {
-        return -EFAULT;
-    }
-    0
-}
-
-/// ioctl(fichier, requête) : la console n'est pas encore un terminal (pas
-/// de mode canonique, d'écho, de taille de fenêtre) : TCGETS, la question
-/// d'isatty, rend ENOTTY, comme pour un fichier ordinaire. La glibc met
-/// alors la sortie standard dans un tampon complet, vidé à la sortie.
-fn ioctl(fichier: u64, _requete: u64) -> i64 {
-    if fichier as u32 > 2 {
-        return -EBADF;
-    }
-    -ENOTTY
 }
 
 /// brk(adresse) : déplace la fin du tas, à l'octet près : la zone du tas
@@ -684,30 +682,50 @@ fn arch_prctl(code: u64, adresse: u64) -> i64 {
 }
 
 /// prlimit64(processus, ressource, nouvelle, ancienne) : les limites du
-/// processus, en lecture seulement. Celles de Linux par défaut : 8 Mio de
-/// pile (que la glibc lit pour ses fils), 1024 fichiers ouverts, pas de
-/// fichier « core » ; infini pour le reste. La pile grandit bien jusqu'à
-/// 8 Mio (memoire.rs, PILE_MAX).
+/// processus (processus::LIMITES_PAR_DEFAUT). Dans l'ordre de `do_prlimit`
+/// : la nouvelle lue ; courante au-delà de la dure : EINVAL ; plus de
+/// descripteurs que Linux n'en permet (nr_open, 2^20) : EPERM ; la dure
+/// relevée sans être root (CAP_SYS_RESOURCE) : EPERM. Baisser, ou relever
+/// la courante sous la dure, est permis pour toutes. Puis l'ancienne,
+/// telle qu'elle était avant le changement. Bun relève RLIMIT_NOFILE au
+/// démarrage ; d'autres programmes baissent RLIMIT_CORE.
 fn prlimit64(pid: u64, ressource: u64, nouvelle: u64, ancienne: u64) -> i64 {
-    const INFINI: u64 = u64::MAX;
-    const RLIMIT_CORE: u64 = 4;
-    const RLIMIT_STACK: u64 = 3;
-    const RLIMIT_NOFILE: u64 = 7;
     if pid != 0 && pid != PID as u64 {
         return -ESRCH;
     }
-    if ressource >= 16 {
+    if ressource >= processus::LIMITES as u64 {
         return -EINVAL;
     }
-    // Pas encore de limites réglables.
+    let ressource = ressource as usize;
+    let mut regle = None;
     if nouvelle != 0 {
-        return -EPERM;
+        let mut octets = [0u8; 16];
+        if copier_depuis_utilisateur(&mut octets, nouvelle).is_err() {
+            return -EFAULT;
+        }
+        let (c, m) = (u64::from_le_bytes(octets[..8].try_into().unwrap_or([0; 8])),
+                      u64::from_le_bytes(octets[8..].try_into().unwrap_or([0; 8])));
+        if c > m {
+            return -EINVAL;
+        }
+        if ressource == processus::RLIMIT_NOFILE && m > 1 << 20 {
+            return -EPERM;
+        }
+        regle = Some((c, m));
     }
-    let (courante, maximale) = match ressource {
-        RLIMIT_STACK => (8 << 20, INFINI),
-        RLIMIT_CORE => (0, INFINI),
-        RLIMIT_NOFILE => (1024, 4096),
-        _ => (INFINI, INFINI),
+    let avant = processus::avec(|p| {
+        let avant = p.limite(ressource);
+        if let Some(limite) = regle {
+            if limite.1 > avant.1 && !p.identite.root() {
+                return Err(-EPERM);
+            }
+            p.changer_limite(ressource, limite);
+        }
+        Ok(avant)
+    });
+    let (courante, maximale) = match avant {
+        Ok(a) => a,
+        Err(e) => return e,
     };
     if ancienne != 0 {
         let mut octets = [0u8; 16];

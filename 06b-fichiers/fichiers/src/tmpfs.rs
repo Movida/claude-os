@@ -57,7 +57,7 @@
 //! contient que des zéros. Sans elle, raccourcir un fichier puis le
 //! rallonger ferait réapparaître ses anciens octets.
 
-use crate::chemins::{Arbre, Dernier, Fin, PATH_MAX};
+use crate::chemins::{Arbre, Dernier, Fin, PATH_MAX, Suivre};
 use crate::index::{ErreurIndex, INDEX_MAX, IndexPages};
 use crate::{
     ECRIRE, EXECUTER, Erreur, Identite, LIRE, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, S_ISGID, S_ISUID,
@@ -158,6 +158,22 @@ pub fn limite_ecriture(position: u64, longueur: usize) -> Result<usize, Erreur> 
         return Err(Erreur::EFBIG);
     }
     Ok((longueur as u64).min(TAILLE_MAX.saturating_sub(position)) as usize)
+}
+
+/// Comment résoudre le chemin d'un `open` : le dernier composant est
+/// suivi s'il est un lien, sauf avec O_NOFOLLOW ou O_EXCL (Linux ajoute
+/// O_NOFOLLOW à O_CREAT | O_EXCL) ; une barre finale le fait suivre quand
+/// même. Avec O_CREAT, au contraire, un dernier composant suivi d'une barre
+/// n'est jamais suivi : `ouvrir` le refuse (EISDIR) avant de regarder où
+/// mène le lien, comme `open_last_lookups` de Linux (« lien/ » vers rien
+/// ou vers une boucle : EISDIR, pas ENOENT ni ELOOP).
+pub fn suivre_pour(o: &Ouverture, nofollow: bool) -> Suivre {
+    match (nofollow || (o.creer && o.exclusif), o.creer) {
+        (false, false) => Suivre::Toujours,
+        (false, true) => Suivre::SaufBarre,
+        (true, false) => Suivre::AvecBarre,
+        (true, true) => Suivre::Jamais,
+    }
 }
 
 /// Un horodatage à poser (utimensat).
@@ -1144,6 +1160,25 @@ impl Tmpfs {
         }
     }
 
+    /// Remet en ordre le fichier `n` après une écriture interrompue (une
+    /// faute dans le tampon du programme) : les pages créées au-delà de la
+    /// taille sont rendues, et la fin de la dernière, au-delà de la taille,
+    /// remise à zéro (la règle de l'en-tête). Les dates ne changent pas.
+    pub fn rogner(&mut self, n: Numero, cadres: &mut impl Cadres) {
+        let taille = self.inode(n).taille;
+        let Contenu::Fichier(index) = &mut self.inode_mut(n).contenu else {
+            return;
+        };
+        let avant = index.pages();
+        index.retirer_depuis(taille.div_ceil(PAGE), |p| cadres.lacher(p));
+        let rendues = avant - index.pages();
+        let partielle = index.trouver(taille / PAGE).filter(|_| taille % PAGE != 0);
+        self.pages -= rendues;
+        if let Some(p) = partielle {
+            cadres.effacer(p, (taille % PAGE) as usize, PAGE as usize);
+        }
+    }
+
     /// `truncate` par un chemin : un dossier (EISDIR), autre chose qu'un
     /// fichier (EINVAL), pas le droit d'écrire (EACCES), un programme en
     /// cours d'exécution (ETXTBSY), dans l'ordre de `vfs_truncate`.
@@ -1185,19 +1220,8 @@ impl Tmpfs {
         i.taille = taille;
         i.mtime = maintenant;
         i.ctime = maintenant;
-        if taille >= ancienne {
-            return Ok(());
-        }
-        let Contenu::Fichier(index) = &mut i.contenu else {
-            panic!("tmpfs : un fichier attendu");
-        };
-        let avant = index.pages();
-        index.retirer_depuis(taille.div_ceil(PAGE), |p| cadres.lacher(p));
-        let rendues = avant - index.pages();
-        let partielle = index.trouver(taille / PAGE).filter(|_| taille % PAGE != 0);
-        self.pages -= rendues;
-        if let Some(p) = partielle {
-            cadres.effacer(p, (taille % PAGE) as usize, PAGE as usize);
+        if taille < ancienne {
+            self.rogner(n, cadres);
         }
         Ok(())
     }
@@ -1498,7 +1522,7 @@ impl Arbre for Tmpfs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chemins::{Depart, Suivre, resoudre, trouver};
+    use crate::chemins::{Depart, resoudre, trouver};
     use alloc::boxed::Box;
     use alloc::vec;
 
@@ -1575,9 +1599,7 @@ mod tests {
         /// open, comme Linux résout le dernier composant : suivi, sauf
         /// O_NOFOLLOW ou O_EXCL.
         fn ouvrir(&mut self, p: &[u8], o: Ouverture, nofollow: bool) -> Result<Ouvert, Erreur> {
-            let suivre = if nofollow || o.exclusif { Suivre::AvecBarre } else { Suivre::Toujours };
-            let suivre = if o.creer && suivre == Suivre::AvecBarre { Suivre::Jamais } else { suivre };
-            let f = self.fin(p, suivre)?;
+            let f = self.fin(p, suivre_pour(&o, nofollow))?;
             self.fs.ouvrir(self.qui, &f, &o, T0)
         }
         /// Crée un fichier et le referme.
@@ -1661,6 +1683,14 @@ mod tests {
         assert_eq!(t.ouvrir(b"/tmp/d/..", excl, false), Err(EEXIST));
         assert_eq!(t.ouvrir(b"/tmp/d/", excl, false), Err(EISDIR));
         assert_eq!(t.ouvrir(b"/tmp/.", creer, false), Err(EISDIR));
+        // « lien/ » avec O_CREAT : EISDIR avant de suivre le lien, qu'il
+        // mène nulle part ou dans une boucle.
+        t.symlink(b"nulle/part", b"/tmp/pendant").unwrap();
+        t.symlink(b"boucle", b"/tmp/boucle").unwrap();
+        assert_eq!(t.ouvrir(b"/tmp/pendant/", creer, false), Err(EISDIR));
+        assert_eq!(t.ouvrir(b"/tmp/boucle/", creer, false), Err(EISDIR));
+        // Sans O_CREAT, la barre fait suivre : la boucle se voit.
+        assert_eq!(t.ouvrir(b"/tmp/boucle/", lecture(), false), Err(ELOOP));
         // Pas de droit d'écrire dans /, mais EEXIST passe avant (Linux
         // cherche le nom d'abord) ; un nom neuf : EACCES.
         assert_eq!(t.mkdir(b"/tmp"), Err(EEXIST));

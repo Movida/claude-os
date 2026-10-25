@@ -38,7 +38,8 @@
 #                  lance linux/memoire sur l'hôte : nos codes d'erreur de
 #                  mmap & co. doivent être ceux du vrai Linux ; et
 #                  linux/claude-version, qui doit y réussir aussi, comme
-#                  linux/temps (les horloges)
+#                  linux/temps (les horloges) et linux/fichiers (nos codes
+#                  d'erreur des fichiers doivent être ceux de Linux)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -99,7 +100,9 @@ boot.bin: programmes.cpio FORCE
 #   - claude-version : gcc -static, la séquence mémoire de
 #     `claude --version` (relevée par strace), rejouée ; sur l'hôte aussi ;
 #   - temps : gcc -static, les horloges (clock_gettime...), sur l'hôte
-#     aussi.
+#     aussi ;
+#   - fichiers : gcc -static, les appels des fichiers contre ce qu'en fait
+#     Linux, comme memoire ; sur l'hôte aussi.
 # Pour les tests du lecteur ELF sur l'hôte, une variante qu'il doit
 # accepter, bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -152,6 +155,10 @@ $(LINUX)/claude-version: linux/claude-version.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/temps: linux/temps.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/fichiers: linux/fichiers.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -225,7 +232,7 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
 # puis exécute les programmes de /bin dans l'ordre (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps FORCE
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers FORCE
 	cd bonjour && cargo build --release
 	sh archive.sh $@ archive.txt
 
@@ -294,7 +301,7 @@ SHELL = /bin/bash
 # sources, servirait sinon telle quelle à la construction suivante.
 .DELETE_ON_ERROR:
 
-tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps
+tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -307,6 +314,7 @@ tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/cla
 	./$(LINUX)/memoire | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/claude-version | tee /dev/stderr | grep -q "rejouee : ok"
 	./$(LINUX)/temps | tee /dev/stderr | (! grep -q ECHEC)
+	./$(LINUX)/fichiers | tee /dev/stderr | (! grep -q ECHEC)
 
 suite: $(SUITE)/.convertie
 
