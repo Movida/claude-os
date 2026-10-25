@@ -17,6 +17,11 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/bonjour-c
 # Le même, en ET_DYN : gcc -static-pie, qui se reloge lui-même.
 /bin/bonjour-c-pie
+# Et en programme dynamique (gcc sans option) : le noyau charge aussi
+# ld-linux, son interpréteur, qui projette la glibc partagée. Puis ld-linux
+# lancé à la main, qui charge lui-même le programme.
+/bin/bonjour-c-dynamique
+/lib64/ld-linux-x86-64.so.2 /bin/bonjour-c-dynamique
 /bin/memoire
 /bin/claude-version
 /bin/temps

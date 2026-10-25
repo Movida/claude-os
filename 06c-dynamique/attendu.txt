@@ -21,8 +21,8 @@ rendues et recollees : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
-[noyau] Archive deballee : dossiers 5, fichiers 16, liens symboliques 2, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 13 commandes.
+[noyau] Archive deballee : dossiers 9, fichiers 21, liens symboliques 5, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 15 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -65,6 +65,15 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c-pie
 [linux] /bin/bonjour-c-pie : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
 [noyau] bonjour-c-pie : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] bonjour-c-dynam : programme Linux (ELF ET_DYN), 
+        image a 0x555555554000-
+, tout en haut sous la base des projections : ok, point d'entree 0x
+[linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c-dynamique
+[linux] /bin/bonjour-c-dynamique : AT_BASE non nul (interpreteur charge par le noyau), AT_ENTRY = _start : ok.
+[noyau] bonjour-c-dynam : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] ld-linux-x86-64 : programme Linux (ELF ET_DYN), 
+[linux] /bin/bonjour-c-dynamique : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
+[noyau] ld-linux-x86-64 : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] memoire : 8 Gio reserves (MAP_NORESERVE), trois pages ecrites loin l'une de l'autre, rendus : ok
 [linux] memoire : 64 Gio reserves puis rendus d'un seul munmap : ok
 [linux] memoire : toutes les verifications : ok

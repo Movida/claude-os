@@ -20,7 +20,8 @@
 #   make dump   -> affiche l'image octet par octet
 #   make trace  -> démarre un noyau qui affiche chaque appel système des
 #                  programmes Linux (comme strace), puis montre ceux de
-#                  bonjour-c sous Linux, sur l'hôte, avec strace, pour comparer
+#                  bonjour-c-dynamique (ld-linux et la glibc partagée) sous
+#                  Linux, sur l'hôte, avec strace, pour comparer
 #   make tests-qemu -> les scénarios dans QEMU : un noyau qui déborde exprès
 #                  de sa pile doit le dire (page de garde, double faute) ;
 #                  un noyau gonflé au-delà de 1 Mio doit être lu en entier
@@ -98,7 +99,8 @@ boot.bin: programmes.cpio FORCE
 #     paquet libc6-dev). -O2 et les avertissements, comme un programme
 #     ordinaire ;
 #   - bonjour-c-pie : le même en gcc -static-pie, un ET_DYN sans
-#     interpréteur, qui se reloge lui-même (6c) ;
+#     interpréteur, qui se reloge lui-même (6c) ; bonjour-c-dynamique, le
+#     même en gcc sans option, qui demande ld-linux et la glibc partagée ;
 #   - memoire : gcc -static, les appels de la mémoire (mmap, munmap,
 #     mprotect, madvise) contre ce qu'en fait Linux : make tests-hote le
 #     lance aussi sur l'hôte, où chaque vérification doit dire « ok » ;
@@ -121,6 +123,10 @@ boot.bin: programmes.cpio FORCE
 # doit lire le PT_GNU_STACK. Les tests lisent aussi ld-linux et la glibc
 # partagée de la machine, là où Ubuntu les installe.
 LINUX = linux/construits
+# La glibc partagée de la machine, copiée dans glibc/ (voir $(GLIBC)/.copiee).
+GLIBC_HOTE = /usr/lib/x86_64-linux-gnu
+GLIBC_FICHIERS = ld-linux-x86-64.so.2 libc.so.6
+GLIBC = glibc
 CFLAGS_LINUX = -O2 -Wall -Wextra -Werror
 
 $(LINUX)/bonjour-asm.o: linux/bonjour.asm
@@ -207,7 +213,10 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 # et un qu'il refusait jusqu'en 6b, et doit maintenant placer lui-même :
 #   - et-dyn : un exécutable indépendant de la position, sans
 #     interpréteur ni relocations (ld -pie --no-dynamic-linker).
-# Puis le lanceur (/etc/demarrage) : lecteur.wasm sans dossier pré-ouvert
+# Puis des programmes dynamiques dont l'interpréteur (PT_INTERP) ne va
+# pas, chacun refusé avec l'errno de Linux (TESTS_INTERP, ci-dessous) ;
+# un seul doit tourner, interp-milieu (un zéro au milieu du chemin : Linux
+# n'en lit que le début). Puis le lanceur (/etc/demarrage) : lecteur.wasm sans dossier pré-ouvert
 # (il doit le dire) ; ses lignes refusées, chacune avec son numéro, sont
 # en tête du fichier (voir tests-demarrage.txt). Enfin bonjour-asm, pour
 # montrer que le noyau exécute encore des programmes après tout cela.
@@ -241,26 +250,163 @@ $(LINUX)/tests/tronque: $(LINUX)/bonjour-asm
 	mkdir -p $(LINUX)/tests
 	head -c 40 $< > $@
 
+# Les programmes au mauvais interpréteur (6c). Les premiers, un programme C
+# qui ne doit jamais tourner (linux/tests/interp.c), liés par gcc avec un
+# autre interpréteur, rangé dans /interp de l'archive des tests :
+#   - interp-absent : un chemin qui n'existe pas (ENOENT) ;
+#   - interp-dossier : un dossier (EACCES) ;
+#   - interp-non-exec : un fichier sans le droit d'exécution (EACCES) ;
+#   - interp-pas-elf : 200 octets qui ne sont pas un ELF (ELIBBAD) ;
+#   - interp-court : 8 octets, moins que l'en-tête ELF (EIO) ;
+#   - interp-coupe : les 200 premiers octets de ld-linux, sa table des
+#     en-têtes coupée (ELIBBAD) ;
+#   - interp-core : ld-linux devenu un ET_CORE (refusé ; Linux le tuerait
+#     par SIGSEGV après le point de non-retour) ;
+#   - interp-objet : un fichier objet .o, ET_REL (ELIBBAD) ;
+#   - interp-chevauche : un programme ET_EXEC à 0x400000 (gcc -no-pie)
+#     dont l'interpréteur est bonjour-asm, un ET_EXEC aux mêmes adresses
+#     (refusé ; Linux le poserait par-dessus le programme).
+# Puis des ELF écrits à la main (linux/tests/interp.asm), pour ce que gcc
+# ne sait pas produire : interp-sans-zero (ENOEXEC), interp-hors-fichier
+# (EIO), et interp-milieu, qui doit tourner. Enfin interp-gros, qui doit
+# tourner aussi : son interpréteur (linux/tests/interpreteur-gros.asm) a
+# 48 en-têtes de programme, une table que le noyau copie dans un bloc de
+# plus de 2 Kio, et qu'il doit rendre avant de compter la mémoire.
+TESTS_INTERP = interp-absent interp-dossier interp-non-exec interp-pas-elf interp-court interp-coupe \
+               interp-core interp-objet interp-chevauche interp-sans-zero interp-hors-fichier interp-milieu \
+               interp-gros
+INTERP_absent = /lib/absent
+INTERP_dossier = /tmp
+INTERP_non-exec = /etc/demarrage
+INTERP_pas-elf = /interp/pas-elf
+INTERP_court = /interp/court
+INTERP_coupe = /interp/coupe
+INTERP_core = /interp/core
+INTERP_objet = /interp/objet
+INTERP_gros = /interp/gros
+
+$(addprefix $(LINUX)/tests/interp-,absent dossier non-exec pas-elf court coupe core objet gros): $(LINUX)/tests/interp-%: linux/tests/interp.c
+	mkdir -p $(LINUX)/tests
+	gcc $(CFLAGS_LINUX) -Wl,--dynamic-linker=$(INTERP_$*) $< -o $@
+
+$(LINUX)/tests/interp-chevauche: linux/tests/interp.c
+	mkdir -p $(LINUX)/tests
+	gcc -no-pie $(CFLAGS_LINUX) -Wl,--dynamic-linker=/bin/bonjour-asm $< -o $@
+
+$(LINUX)/tests/interp-sans-zero: linux/tests/interp.asm
+	mkdir -p $(LINUX)/tests
+	nasm -f bin -D SANS_ZERO $< -o $@
+
+$(LINUX)/tests/interp-hors-fichier: linux/tests/interp.asm
+	mkdir -p $(LINUX)/tests
+	nasm -f bin -D HORS_FICHIER $< -o $@
+
+$(LINUX)/tests/interp-milieu: linux/tests/interp.asm
+	mkdir -p $(LINUX)/tests
+	nasm -f bin -D MILIEU $< -o $@
+
+# Les faux interpréteurs, rangés dans /interp de l'archive des tests.
+INTERPRETEURS = $(addprefix $(LINUX)/tests/interpreteurs/,pas-elf court coupe core objet gros)
+
+$(LINUX)/tests/interpreteurs/pas-elf:
+	mkdir -p $(@D)
+	head -c 200 /dev/zero | tr '\0' a > $@
+
+$(LINUX)/tests/interpreteurs/court:
+	mkdir -p $(@D)
+	printf 'pas elf\n' > $@
+
+$(LINUX)/tests/interpreteurs/coupe: $(GLIBC)/.copiee
+	mkdir -p $(@D)
+	head -c 200 $(GLIBC)/racine/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 > $@
+
+# e_type, l'octet 16 de l'en-tête : 4, ET_CORE.
+$(LINUX)/tests/interpreteurs/core: $(GLIBC)/.copiee
+	mkdir -p $(@D)
+	cp $(GLIBC)/racine/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 $@
+	printf '\004' | dd of=$@ bs=1 seek=16 conv=notrunc status=none
+
+$(LINUX)/tests/interpreteurs/objet: $(LINUX)/bonjour-asm.o
+	mkdir -p $(@D)
+	cp $< $@
+
+$(LINUX)/tests/interpreteurs/gros: linux/tests/interpreteur-gros.asm
+	mkdir -p $(@D)
+	nasm -f bin $< -o $@
+
+# La glibc partagée de la machine (6c) : ld-linux, et les bibliothèques
+# que demandent nos programmes dynamiques, copiées dans glibc/racine aux
+# chemins d'Ubuntu (/usr fusionné), avec un /etc/ld.so.cache fabriqué
+# par ldconfig sur cette racine de préparation (-r : sans root ; -X : sans
+# toucher aux liens des bibliothèques). Jamais commitées
+# (.gitignore) : ce sont les fichiers de la machine qui construit, copiés
+# de nouveau chaque fois que leur CONTENU change. Pas leur date : dpkg
+# garde celle de la construction du paquet, et une glibc installée par apt
+# après notre copie peut avoir une date plus ancienne qu'elle. D'où une
+# empreinte (sha256) de tout ce qui entre dans la copie, recalculée à
+# chaque construction (FORCE) et gardée dans .copiee : la copie n'est
+# refaite, et .copiee touché, que si elle a changé. Deux vérifications
+# avant de copier :
+#   - le PT_INTERP de nos programmes (/lib64/ld-linux-x86-64.so.2) mène
+#     bien, sur cette machine, au ld-linux qu'on copie ;
+#   - ldconfig est de la même version de la glibc que lui (2.39) : le
+#     format du cache en dépend. La version amont seulement, pas la
+#     révision d'Ubuntu (2.39-0ubuntu8.9) : ldconfig est dans un autre
+#     paquet (libc-bin), qu'une mise à jour de libc6 seule laisse à sa
+#     révision, sans rien changer au format.
+# (GLIBC, GLIBC_HOTE et GLIBC_FICHIERS sont définis plus haut, avec LINUX :
+# make lit les prérequis d'une règle dès qu'il la rencontre.)
+COPIE_GLIBC = $(addprefix $(GLIBC_HOTE)/,$(GLIBC_FICHIERS)) racine/etc/ld.so.conf
+$(GLIBC)/.copiee: FORCE
+	@empreinte=$$(sha256sum $(COPIE_GLIBC) | sha256sum | cut -d ' ' -f 1); \
+	test "$$(cat $@ 2>/dev/null)" != "$$empreinte" || exit 0; \
+	set -ex; \
+	test "$$(readlink -f /lib64/ld-linux-x86-64.so.2)" = $(GLIBC_HOTE)/ld-linux-x86-64.so.2; \
+	v1=$$(/sbin/ldconfig --version | sed -n '1s/.* \([0-9][0-9.]*[0-9]\)\.\{0,1\}$$/\1/p'); \
+	v2=$$($(GLIBC_HOTE)/ld-linux-x86-64.so.2 --version | sed -n '1s/.* \([0-9][0-9.]*[0-9]\)\.\{0,1\}$$/\1/p'); \
+	test -n "$$v1" && test "$$v1" = "$$v2" || { echo "ldconfig ($$v1) et ld-linux ($$v2) : deux glibc differentes"; exit 1; }; \
+	rm -rf $(GLIBC); \
+	mkdir -p $(GLIBC)/racine/usr/lib/x86_64-linux-gnu $(GLIBC)/racine/etc; \
+	cp $(addprefix $(GLIBC_HOTE)/,$(GLIBC_FICHIERS)) $(GLIBC)/racine/usr/lib/x86_64-linux-gnu/; \
+	ln -s usr/lib $(GLIBC)/racine/lib; \
+	cp racine/etc/ld.so.conf $(GLIBC)/racine/etc/; \
+	/sbin/ldconfig -X -r $(GLIBC)/racine -C /etc/ld.so.cache -f /etc/ld.so.conf; \
+	echo "$$empreinte" > $@
+
 # L'archive des programmes de test : sa description est fabriquée ici, une
 # ligne par programme (voir archive.sh), avec son /etc/demarrage
 # (tests-demarrage.txt), qui les lance l'un après l'autre.
 LECTEUR = lecteur/target/wasm32-unknown-unknown/release/lecteur.wasm
-tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_LINUX)) $(LINUX)/bonjour-asm FORCE
+tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_LINUX) $(TESTS_INTERP)) $(INTERPRETEURS) \
+            $(LINUX)/bonjour-asm $(GLIBC)/.copiee FORCE
 	cd lecteur && cargo build --release
 	{ echo "dir /bin 755 0 0"; \
-	  for p in $(TESTS_LINUX); do echo "file /bin/$$p $(LINUX)/tests/$$p 755 0 0"; done; \
+	  for p in $(TESTS_LINUX) $(TESTS_INTERP); do echo "file /bin/$$p $(LINUX)/tests/$$p 755 0 0"; done; \
 	  echo "file /bin/lecteur.wasm $(LECTEUR) 755 0 0"; \
 	  echo "file /bin/bonjour-asm $(LINUX)/bonjour-asm 755 0 0"; \
 	  echo "dir /etc 755 0 0"; \
-	  echo "file /etc/demarrage tests-demarrage.txt 644 0 0"; } | sh archive.sh $@ -
+	  echo "file /etc/demarrage tests-demarrage.txt 644 0 0"; \
+	  echo "file /etc/ld.so.conf racine/etc/ld.so.conf 644 0 0"; \
+	  echo "file /etc/ld.so.cache $(GLIBC)/racine/etc/ld.so.cache 644 0 0"; \
+	  echo "dir /tmp 1777 0 0"; \
+	  echo "dir /interp 755 0 0"; \
+	  for i in $(INTERPRETEURS); do echo "file /interp/$${i##*/} $$i 755 0 0"; done; \
+	  echo "dir /usr 755 0 0"; \
+	  echo "dir /usr/lib 755 0 0"; \
+	  echo "dir /usr/lib/x86_64-linux-gnu 755 0 0"; \
+	  for f in $(GLIBC_FICHIERS); do echo "file /usr/lib/x86_64-linux-gnu/$$f $(GLIBC)/racine/usr/lib/x86_64-linux-gnu/$$f 755 0 0"; done; \
+	  echo "dir /usr/lib64 755 0 0"; \
+	  echo "slink /usr/lib64/ld-linux-x86-64.so.2 ../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 777 0 0"; \
+	  echo "slink /lib usr/lib 777 0 0"; \
+	  echo "slink /lib64 usr/lib64 777 0 0"; } | sh archive.sh $@ -
 
 # Le /etc/demarrage des tests : d'abord les lignes que le lanceur doit
 # refuser, chacune à un numéro qui ne bouge pas quand on ajoute des
 # programmes (ligne 2 : un guillemet non fermé ; 3 : --dir= devant un
 # programme Linux ; 4 : un chemin relatif ; 5 : un programme absent ; 6 :
 # un dossier ; 7 : une barre finale après un fichier ; 8 : un fichier sans
-# le droit d'exécution) ; puis chaque programme de TESTS_LINUX,
-# lecteur.wasm sans dossier pré-ouvert, et bonjour-asm.
+# le droit d'exécution) ; puis chaque programme de TESTS_LINUX et de
+# TESTS_INTERP, lecteur.wasm sans dossier pré-ouvert, et bonjour-asm.
 tests-demarrage.txt: Makefile
 	{ echo "# Fabrique par le Makefile (tests.cpio)."; \
 	  echo "/bin/bonjour-asm \"pas ferme"; \
@@ -270,7 +416,7 @@ tests-demarrage.txt: Makefile
 	  echo "/bin"; \
 	  echo "/bin/bonjour-asm/"; \
 	  echo "/etc/demarrage"; \
-	  for p in $(TESTS_LINUX); do echo "/bin/$$p"; done; \
+	  for p in $(TESTS_LINUX) $(TESTS_INTERP); do echo "/bin/$$p"; done; \
 	  echo "/bin/lecteur.wasm"; \
 	  echo "/bin/bonjour-asm"; } > $@
 
@@ -278,7 +424,7 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
 # puis lance ce que dit son /etc/demarrage (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
 	sh archive.sh $@ archive.txt
@@ -293,9 +439,12 @@ texte: boot.bin
 
 # Le temps que met l'étape à démarrer et à exécuter toute son archive,
 # sous QEMU sans accélération, avec de la marge (le BIOS lit l'archive
-# secteur par secteur : 2,5 s mesurées ici en 6b). verifier.sh le demande
-# par `make duree`.
-DUREE = 5
+# secteur par secteur, et l'archive porte la glibc depuis 6c : de 1,3 à
+# 3,8 s mesurées ici sur une machine tranquille, contre 2,5 s en 6b ; mais
+# jusqu'à 14,6 s quand trois relectures se partageaient les 12 cœurs de la
+# machine, d'où la marge). verifier.sh le demande par `make duree` ; ne
+# pas le lancer sur une machine saturée.
+DUREE = 12
 
 duree:
 	@echo $(DUREE)
@@ -435,11 +584,11 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin
 # La trace des appels système : le noyau construit avec la fonctionnalité
 # trace (son propre dossier de compilation), l'archive ordinaire.
 trace: test-trace.bin
-	-timeout 5 qemu-system-x86_64 -display none -no-reboot -drive format=raw,file=test-trace.bin -serial file:trace.log
+	-timeout $(DUREE) qemu-system-x86_64 -display none -no-reboot -drive format=raw,file=test-trace.bin -serial file:trace.log
 	@echo "--- dans notre noyau ---"
-	@sed -n '/bonjour-c : programme/,/bonjour-c : termine/p' trace.log | grep -E '^\[(trace|linux)\]|bonjour-c :'
+	@sed -n '/bonjour-c-dynam : programme/,/bonjour-c-dynam : termine/p' trace.log | grep -E '^\[(trace|linux)\]|bonjour-c-dynam :'
 	@echo "--- sous Linux, sur l'hote (strace) ---"
-	@strace ./$(LINUX)/bonjour-c 2>&1 >/dev/null | grep -v "^execve"
+	@strace ./$(LINUX)/bonjour-c-dynamique 2>&1 >/dev/null | grep -v "^execve"
 
 test-trace.bin: programmes.cpio FORCE
 	cd noyau && cargo build --release --features trace --target-dir target/test-trace 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -456,6 +605,7 @@ test-%.bin: programmes.cpio FORCE
 clean:
 	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio tests-demarrage.txt serial.log trace.log qemu.log ecran.png test-*.log
 	rm -rf $(LINUX)
+	rm -rf $(GLIBC)
 	rm -rf $(SUITE)
 	cd noyau && cargo clean
 	cd wasm && cargo clean

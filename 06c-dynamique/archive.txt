@@ -13,6 +13,7 @@ file  /bin/pile            linux/construits/pile 755 0 0
 file  /bin/sse             linux/construits/sse 755 0 0
 file  /bin/bonjour-c       linux/construits/bonjour-c 755 0 0
 file  /bin/bonjour-c-pie   linux/construits/bonjour-c-pie 755 0 0
+file  /bin/bonjour-c-dynamique linux/construits/bonjour-c-dynamique 755 0 0
 file  /bin/memoire         linux/construits/memoire 755 0 0
 file  /bin/claude-version  linux/construits/claude-version 755 0 0
 file  /bin/temps           linux/construits/temps 755 0 0
@@ -29,6 +30,10 @@ file  /bin/segments        linux/construits/segments 755 0 0
 # s'attend à trouver.
 dir   /etc 755 0 0
 file  /etc/demarrage       racine/etc/demarrage 644 0 0
+# Où ld-linux cherche les bibliothèques (ld.so.conf), et ce qu'il y a
+# trouvé, fabriqué par ldconfig (le cache : voir le Makefile).
+file  /etc/ld.so.conf      racine/etc/ld.so.conf 644 0 0
+file  /etc/ld.so.cache     glibc/racine/etc/ld.so.cache 644 0 0
 
 # Quelques fichiers à lire : un texte, un second nom (un lien physique),
 # et des liens symboliques.
@@ -46,3 +51,18 @@ file  /tmp/a-root          racine/etc/bonjour.txt 666 0 0
 # Le dossier personnel de l'utilisateur 1000, celui des programmes (HOME).
 dir   /home 755 0 0
 dir   /home/utilisateur 755 1000 1000
+
+# La glibc partagée de la machine (6c), copiée par le Makefile dans
+# glibc/ (jamais commitée), aux chemins d'Ubuntu : les fichiers dans
+# /usr/lib/x86_64-linux-gnu, et /lib, /lib64 des liens vers /usr (le
+# « /usr fusionné »). Le PT_INTERP des programmes dynamiques,
+# /lib64/ld-linux-x86-64.so.2, passe ainsi par deux liens symboliques.
+dir   /usr 755 0 0
+dir   /usr/lib 755 0 0
+dir   /usr/lib/x86_64-linux-gnu 755 0 0
+file  /usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 glibc/racine/usr/lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 755 0 0
+file  /usr/lib/x86_64-linux-gnu/libc.so.6 glibc/racine/usr/lib/x86_64-linux-gnu/libc.so.6 755 0 0
+dir   /usr/lib64 755 0 0
+slink /usr/lib64/ld-linux-x86-64.so.2 ../lib/x86_64-linux-gnu/ld-linux-x86-64.so.2 777 0 0
+slink /lib                 usr/lib 777 0 0
+slink /lib64               usr/lib64 777 0 0

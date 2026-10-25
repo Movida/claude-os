@@ -89,3 +89,18 @@
 [noyau] bin : pas le droit de l'executer (errno 13)
 [noyau] /etc/demarrage, ligne 7 : refusee : /bin/bonjour-asm/ : introuvable (errno 20)
 [noyau] demarrage : pas le droit de l'executer (errno 13)
+[noyau] interp-absent : interpreteur /lib/absent : introuvable (errno 2)
+[noyau] interp-dossier : interpreteur /tmp : pas le droit de l'executer (errno 13)
+[noyau] interp-non-exec : interpreteur /etc/demarrage : pas le droit de l'executer (errno 13)
+[noyau] interp-pas-elf : interpreteur /interp/pas-elf : refuse : pas un fichier ELF (errno 80)
+[noyau] interp-court : interpreteur /interp/court : refuse : fichier ELF tronque (errno 5)
+[noyau] interp-coupe : interpreteur /interp/coupe : refuse : table des en-tetes de programme hors du fichier (errno 80)
+[noyau] interp-core : interpreteur /interp/core : refuse : ELF de type 4 : pas un executable (errno 80)
+[noyau] interp-objet : interpreteur /interp/objet : refuse : ELF de type 1 : pas un executable (errno 80)
+[noyau] interp-chevauch : interpreteur /bin/bonjour-asm : refuse : l'image de l'interpreteur chevauche celle du programme
+[noyau] interp-sans-zer : programme Linux refuse : chemin de l'interpreteur (PT_INTERP) sans zero final
+[noyau] interp-hors-fic : programme Linux refuse : chemin de l'interpreteur (PT_INTERP) hors du fichier
+[linux] interp-milieu : un zero au milieu du PT_INTERP, ld-linux lance quand meme (AT_BASE non nul) : ok.
+[noyau] interp-milieu : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] interp-gros : un interpreteur de 48 en-tetes de programme a tourne.
+[noyau] interp-gros : termine, code de sortie 0 ; memoire rendue : ok.

@@ -20,3 +20,7 @@ target/
 
 # Programmes Linux de test, construits par make (depuis l'étape 5)
 */linux/construits/
+
+# La glibc de la machine, copiée par make avec sa racine de préparation
+# (depuis 6c) : des binaires que nous n'avons pas écrits, jamais commités.
+*/glibc/

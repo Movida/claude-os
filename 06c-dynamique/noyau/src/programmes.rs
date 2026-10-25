@@ -303,38 +303,73 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     // Un programme dynamique : le chemin de son interpréteur, lu dans le
     // fichier (hors de la table des en-têtes), dans un bloc du tas (4 Kio
     // au plus : la pile du noyau ne fait que 16 Kio).
+    let mut chemin_interpreteur = Vec::new();
     if let Some((position, longueur)) = executable.interpreteur() {
-        let mut interpreteur = Vec::new();
-        if interpreteur.try_reserve_exact(longueur).is_err() {
+        if chemin_interpreteur.try_reserve_exact(longueur).is_err() {
             return afficherln!("[noyau] {} : plus de memoire pour le chemin de l'interpreteur", nom);
         }
-        interpreteur.resize(longueur, 0);
-        if !lire(position, &mut interpreteur) {
+        chemin_interpreteur.resize(longueur, 0);
+        if !lire(position, &mut chemin_interpreteur) {
             return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, formats::elf::Erreur::InterpreteurHorsDuFichier);
         }
-        return match formats::elf::chemin_interpreteur(&interpreteur) {
-            Ok(c) => afficherln!("[noyau] {} : programme dynamique (PT_INTERP {}) : pas encore pris en charge", nom, Nom(c)),
-            Err(e) => afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
-        };
+        match formats::elf::chemin_interpreteur(&chemin_interpreteur) {
+            Ok(c) => {
+                let longueur = c.len();
+                chemin_interpreteur.truncate(longueur);
+            }
+            Err(e) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
+        }
     }
     let identite = IDENTITE;
     let libres = pages::libres();
+    // L'interpréteur : trouvé, vérifié, son fichier ouvert (voir
+    // `ouvrir_interpreteur`). Il reste protégé contre l'écriture jusqu'à
+    // la fin du chargement, comme chez Linux.
+    let interpreteur = match executable.interpreteur() {
+        None => None,
+        Some(_) => match ouvrir_interpreteur(&chemin_interpreteur) {
+            Ok(i) => Some(i),
+            Err(e) => {
+                return afficherln!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno());
+            }
+        },
+    };
+    let executable_interpreteur = match &interpreteur {
+        None => None,
+        Some(i) => match formats::elf::lire_entetes(&i.entete, &i.table, i.taille) {
+            Ok(x) => Some((x, i.fichier)),
+            Err(e) => {
+                let e = EchecInterpreteur::Format(chargeur_elf::Refus::Format(e));
+                fermer_interpreteur(interpreteur.as_ref());
+                return afficherln!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno());
+            }
+        },
+    };
     // Le fichier ouvert que projetteront ses segments : chaque zone le
     // tiendra ; l'ouverture du chargeur est lâchée ensuite.
     let fichier = match appels_fichiers::ouvrir_inode(n, chemin, crate::descripteurs::Sorte::Fichier) {
         Ok(f) => f,
-        Err(e) => return afficherln!("[noyau] {} : ouverture impossible (errno {})", nom, e.errno()),
+        Err(e) => {
+            fermer_interpreteur(interpreteur.as_ref());
+            return afficherln!("[noyau] {} : ouverture impossible (errno {})", nom, e.errno());
+        }
     };
-    let charge = chargeur_elf::charger(&executable, nom, fichier);
+    let charge = chargeur_elf::charger(&executable, nom, fichier, executable_interpreteur.as_ref().map(|(x, f)| (x, *f)));
     vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
-    let (mut programme, image) = match charge {
+    let (mut programme, images) = match charge {
         Ok(p) => p,
-        Err(chargeur_elf::Refus::Format(e)) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
-        Err(e) => return afficherln!("[noyau] {} : chargement impossible : {}", nom, e),
+        Err(e) => {
+            fermer_interpreteur(interpreteur.as_ref());
+            return match e {
+                chargeur_elf::Refus::Format(e) => afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
+                chargeur_elf::Refus::Chevauchement => {
+                    afficherln!("[noyau] {} : interpreteur {} : refuse : {}", nom, Nom(&chemin_interpreteur), e)
+                }
+                e => afficherln!("[noyau] {} : chargement impossible : {}", nom, e),
+            };
+        }
     };
-    // Ce qui a été chargé, et où. Un ET_DYN sans interpréteur est la
-    // première projection de son espace : il doit être tout en haut, sous
-    // la base des projections (à son alignement près).
+    let image = images.programme;
     let (debut, fin) = image.etendue();
     let genre = match executable.genre() {
         formats::elf::Genre::Fixe => "ET_EXEC",
@@ -347,17 +382,35 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
                     s.adresse, s.adresse + s.taille, 'r',
                     if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.taille_fichier);
     }
-    if executable.genre() == formats::elf::Genre::Relogeable {
-        let base = crate::memoire::disposition().base_mmap;
-        if executable.etendue().0 != 0 && debut == executable.etendue().0 {
-            // Posé à l'adresse que suggérait son fichier (sa première
-            // adresse, si elle n'est pas 0, et libre) : rien à vérifier de
-            // plus.
-            afficherln!("        image a {:#x}-{:#x}, a l'adresse que suggere son fichier.", debut, fin);
-        } else {
-            let en_haut = fin <= base && base - fin < executable.alignement();
+    // Un ET_DYN sans interpréteur, ou un interpréteur : la première
+    // projection de l'espace, elle doit être tout en haut sous la base des
+    // projections (à son alignement près). Un PIE : à ELF_ET_DYN_BASE.
+    let base = crate::memoire::disposition().base_mmap;
+    let en_haut = |fin: u64, alignement: u64| if fin <= base && base - fin < alignement { "ok" } else { "ECHEC" };
+    match (executable.genre(), &images.interpreteur) {
+        // Posé à l'adresse que suggérait son fichier (sa première adresse,
+        // si elle n'est pas 0, et libre) : rien à vérifier de plus.
+        (formats::elf::Genre::Relogeable, None) if executable.etendue().0 != 0 && debut == executable.etendue().0 => {
+            afficherln!("        image a {:#x}-{:#x}, a l'adresse que suggere son fichier.", debut, fin)
+        }
+        (formats::elf::Genre::Relogeable, None) => {
             afficherln!("        image a {:#x}-{:#x}, tout en haut sous la base des projections : {}.",
-                        debut, fin, if en_haut { "ok" } else { "ECHEC" });
+                        debut, fin, en_haut(fin, executable.alignement()))
+        }
+        (formats::elf::Genre::Relogeable, Some(_)) => afficherln!("        image a {:#x}-{:#x} (ELF_ET_DYN_BASE).", debut, fin),
+        (formats::elf::Genre::Fixe, _) => {}
+    }
+    if let Some(i) = &images.interpreteur {
+        // Un ET_DYN posé sans suggestion (ld-linux : ses adresses partent
+        // de 0) est tout en haut ; un ET_EXEC, à ses propres adresses.
+        let (debut, fin) = i.etendue();
+        let interpreteur = Nom(&chemin_interpreteur);
+        if i.executable().genre() == formats::elf::Genre::Relogeable && debut != i.executable().etendue().0 {
+            afficherln!("        interpreteur {} : image a {:#x}-{:#x}, tout en haut sous la base des projections : {}, point d'entree {:#x}.",
+                        interpreteur, debut, fin, en_haut(fin, 4096), i.entree());
+        } else {
+            afficherln!("        interpreteur {} : image a {:#x}-{:#x}, a ses propres adresses, point d'entree {:#x}.",
+                        interpreteur, debut, fin, i.entree());
         }
     }
     // Le code au point d'entrée, relu dans l'espace du programme, doit être
@@ -376,9 +429,31 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     // La page du point d'entrée vient d'abord, comme le ferait la première
     // instruction du programme (elle n'est en place qu'à la faute).
     let mut code = [0u8; 16];
-    let code_ok = programme.memoire.servir(programme.entree, Acces::Lecture).is_ok()
+    let mut code_ok = programme.memoire.servir(programme.entree, Acces::Lecture).is_ok()
         && programme.memoire.espace.lire(programme.entree, &mut code[..longueur]).is_ok()
         && code[..longueur] == attendu[..longueur];
+    // Et celui de l'interpréteur, par où le programme commence : relu dans
+    // l'espace, comparé à son fichier.
+    if let (Some(i), Some(ouvert)) = (&images.interpreteur, &interpreteur) {
+        let lire = |position: u64, tampon: &mut [u8]| vfs::lire(ouvert.numero, position, tampon) == tampon.len();
+        let mut attendu = [0u8; 16];
+        let longueur = i
+            .segments()
+            .find_map(|s| {
+                let decalage = programme.depart.checked_sub(s.adresse).filter(|&d| d < s.taille_fichier)?;
+                let longueur = (s.taille_fichier - decalage).min(16) as usize;
+                lire(s.position + decalage, &mut attendu[..longueur]).then_some(longueur)
+            })
+            .unwrap_or(0);
+        code_ok &= longueur > 0
+            && programme.memoire.servir(programme.depart, Acces::Lecture).is_ok()
+            && programme.memoire.espace.lire(programme.depart, &mut code[..longueur]).is_ok()
+            && code[..longueur] == attendu[..longueur];
+    }
+    fermer_interpreteur(interpreteur.as_ref());
+    // La copie de sa table des en-têtes, prise après `libres`, est rendue
+    // tout de suite : sinon « memoire rendue » la compterait.
+    drop(interpreteur);
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
                 programme.memoire.debut_tas, if code_ok { "ok" } else { "ECHEC" });
@@ -428,6 +503,108 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     drop(processus::retirer());
     afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.",
                 nom, code, if pages::libres() == libres { "ok" } else { "ECHEC" });
+}
+
+/// Un interpréteur trouvé et vérifié (en-tête et table), en attendant
+/// d'être chargé : son inode (tenu), son fichier ouvert (que tiendront
+/// ses zones), sa taille, son en-tête et la copie de sa table.
+struct Interpreteur {
+    numero: Numero,
+    fichier: crate::descripteurs::Fichier,
+    taille: u64,
+    entete: formats::elf::Entete,
+    table: Vec<u8>,
+}
+
+/// Pourquoi un interpréteur ne peut pas servir.
+enum EchecInterpreteur {
+    /// Le trouver, l'exécuter, le protéger, l'ouvrir : l'erreur du système
+    /// de fichiers, et ce qu'on essayait.
+    Fichier(&'static str, fichiers::Erreur),
+    /// Le lire : ce que dit le chargeur.
+    Format(chargeur_elf::Refus),
+}
+
+impl EchecInterpreteur {
+    /// L'errno que Linux rendrait (load_elf_binary) : celui du système de
+    /// fichiers ; EIO si l'en-tête de 64 octets ne se lit pas en entier
+    /// (elf_read) ; ELIBBAD pour le reste (pas ELF, autre machine, table
+    /// des en-têtes illisible). Ce que Linux ne vérifie qu'après le point
+    /// de non-retour (le genre, les segments : le processus est alors tué
+    /// par SIGSEGV), ELIBBAD aussi : ici, tout est vérifié avant de rien
+    /// charger, un écart voulu.
+    fn errno(&self) -> i64 {
+        match self {
+            EchecInterpreteur::Fichier(_, e) => e.errno(),
+            EchecInterpreteur::Format(chargeur_elf::Refus::Format(formats::elf::Erreur::Tronque)) => 5,
+            EchecInterpreteur::Format(chargeur_elf::Refus::PlusDeMemoire) => 12,
+            EchecInterpreteur::Format(_) => 80,
+        }
+    }
+}
+
+// Affiché par le noyau : sans accents.
+impl fmt::Display for EchecInterpreteur {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            EchecInterpreteur::Fichier(quoi, _) => f.write_str(quoi),
+            EchecInterpreteur::Format(e) => write!(f, "refuse : {e}"),
+        }
+    }
+}
+
+/// Trouve l'interpréteur `chemin`, comme Linux (open_exec) : résolu depuis
+/// la racine (le dossier courant du programme, aussi la racine), avec les
+/// droits de l'utilisateur 1000 (traverser, exécuter : EACCES sinon, et
+/// pour un dossier), protégé contre l'écriture (ETXTBSY s'il est ouvert en
+/// écriture), puis lu par ses en-têtes. En cas d'échec, pourquoi ; rien ne
+/// reste tenu.
+fn ouvrir_interpreteur(chemin: &[u8]) -> Result<Interpreteur, EchecInterpreteur> {
+    use EchecInterpreteur::Fichier;
+    let n = appels_fichiers::trouver_pour(IDENTITE, chemin).map_err(|e| Fichier("introuvable", e))?;
+    let lacher = || vfs::avec(|fs, cadres| fs.lacher(n, cadres));
+    if let Err(e) = vfs::avec(|fs, _| fs.peut_executer(IDENTITE, n)) {
+        lacher();
+        return Err(Fichier("pas le droit de l'executer", e));
+    }
+    if let Err(e) = vfs::avec(|fs, _| fs.refuser_ecriture(n)) {
+        lacher();
+        return Err(Fichier("ouvert en ecriture", e));
+    }
+    let relacher = || {
+        vfs::avec(|fs, _| fs.permettre_ecriture(n));
+        lacher();
+    };
+    let taille = vfs::avec(|fs, _| fs.attributs(n).taille);
+    let lire = |position: u64, tampon: &mut [u8]| vfs::lire(n, position, tampon) == tampon.len();
+    let (entete, table) = match chargeur_elf::verifier(taille, lire) {
+        Ok(v) => v,
+        Err(e) => {
+            relacher();
+            return Err(EchecInterpreteur::Format(e));
+        }
+    };
+    let fichier = match appels_fichiers::ouvrir_inode(n, chemin, crate::descripteurs::Sorte::Fichier) {
+        Ok(f) => f,
+        Err(e) => {
+            relacher();
+            return Err(Fichier("ouverture impossible", e));
+        }
+    };
+    Ok(Interpreteur { numero: n, fichier, taille, entete, table })
+}
+
+/// La fin du chargement de l'interpréteur : son fichier ouvert lâché (ses
+/// zones le tiennent), l'écriture de nouveau permise (seul le programme
+/// reste protégé pendant qu'il tourne, comme chez Linux), son inode lâché.
+fn fermer_interpreteur(interpreteur: Option<&Interpreteur>) {
+    if let Some(i) = interpreteur {
+        vfs::avec_systeme(|s, cadres| s.lacher(i.fichier, cadres));
+        vfs::avec(|fs, cadres| {
+            fs.permettre_ecriture(i.numero);
+            fs.lacher(i.numero, cadres);
+        });
+    }
 }
 
 /// Un programme WebAssembly : on le décode, le valide, l'instancie avec

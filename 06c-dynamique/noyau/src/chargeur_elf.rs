@@ -9,6 +9,16 @@
 //! morceaux. Segments dans les adresses permises, croissants, sans page
 //! commune, jamais W+X.
 //!
+//! Un programme dynamique (6c) nomme son INTERPRÉTEUR (PT_INTERP) :
+//! ld-linux, l'éditeur de liens dynamique. Le noyau ne charge que ces deux
+//! fichiers, le programme et son interpréteur, dans le même espace, puis
+//! donne la main à l'interpréteur ; c'est lui qui trouve et projette la
+//! glibc partagée, par des appels système ordinaires (openat, mmap du
+//! fichier, mprotect), et fait les relocations. Mettre un éditeur de liens
+//! dans le noyau serait plus de code privilégié pour rien : Linux non plus
+//! ne le fait pas. Le vecteur auxiliaire dit à l'interpréteur où est le
+//! programme (AT_PHDR, AT_ENTRY) et où il est lui-même (AT_BASE).
+//!
 //! Comme Linux (`elf_map`, puis `elf_load`), le chargeur ne copie rien : il
 //! PROJETTE le fichier (6b). Chaque segment devient une zone de fichier,
 //! en privé, avec ses droits : ses pages sont celles du fichier, données à
@@ -88,6 +98,11 @@ pub enum Refus {
     PlusDeMemoire,
     /// Aucune place libre pour l'image d'un ET_DYN (ENOMEM).
     PasDePlace,
+    /// L'image de l'interpréteur chevaucherait celle du programme (un
+    /// ET_EXEC qui a les mêmes adresses). Linux pose l'interpréteur
+    /// par-dessus (MAP_FIXED) : le programme est alors écrasé, et ce qui
+    /// s'exécute n'est plus ce qu'on croit ; on refuse plutôt.
+    Chevauchement,
     /// L'espace du programme : plus de mémoire pour ses tables ou ses
     /// zones.
     Espace(espace_utilisateur::Erreur),
@@ -106,6 +121,7 @@ impl fmt::Display for Refus {
             Refus::Format(e) => write!(f, "{e}"),
             Refus::PlusDeMemoire => f.write_str("plus de memoire pour la table des en-tetes"),
             Refus::PasDePlace => f.write_str("pas de place pour l'image (ENOMEM)"),
+            Refus::Chevauchement => f.write_str("l'image de l'interpreteur chevauche celle du programme"),
             Refus::Espace(e) => write!(f, "{e}"),
         }
     }
@@ -136,6 +152,10 @@ pub fn verifier(taille: u64, lire: impl Fn(u64, &mut [u8]) -> bool) -> Result<(E
 /// Où poser l'image d'un exécutable vérifié, dans l'espace `memoire` (le
 /// `load_bias` de Linux, load_elf_binary), et l'image posée :
 ///   - un ET_EXEC : à ses propres adresses ;
+///   - un ET_DYN qui a un interpréteur (un PIE ordinaire) : à
+///     ELF_ET_DYN_BASE, arrondi en dessous à son alignement (`p_align`) et
+///     à la page : 0x555555554000, l'adresse que tout développeur
+///     reconnaît dans GDB (sans ASLR, 6m) ;
 ///   - un ET_DYN sans interpréteur (un `gcc -static-pie`, ou ld-linux
 ///     lancé directement) : comme une projection, du haut vers le bas sous
 ///     la base des projections, à une adresse multiple de son alignement,
@@ -149,16 +169,42 @@ pub fn verifier(taille: u64, lire: impl Fn(u64, &mut [u8]) -> bool) -> Result<(E
 /// L'étendue entière est cherchée d'un bloc (le `total_mapping_size` de
 /// Linux) : les écarts entre segments ne bougent pas, et les trous entre
 /// eux restent vides.
-fn placer<'a>(memoire: &Memoire, executable: &Executable<'a>) -> Result<Image<'a>, Refus> {
+fn placer<'a>(memoire: &Memoire, executable: &Executable<'a>, interprete: bool) -> Result<Image<'a>, Refus> {
     let (premiere, fin) = executable.etendue();
-    let debut = match executable.genre() {
-        Genre::Fixe => premiere,
-        Genre::Relogeable => {
+    let debut = match (executable.genre(), interprete) {
+        (Genre::Fixe, _) => premiere,
+        (Genre::Relogeable, true) => memoire::disposition().base_pie & !(executable.alignement() - 1) & !(4096 - 1),
+        (Genre::Relogeable, false) => {
             let suggestion = if fin <= PERMISES.fin { premiere } else { 0 };
             memoire.chercher_place_alignee(fin - premiere, suggestion, executable.alignement()).ok_or(Refus::PasDePlace)?
         }
     };
     executable.placer(debut, PERMISES).map_err(Refus::Format)
+}
+
+/// Où poser l'interpréteur, dans l'espace qui a déjà le programme : un
+/// ET_EXEC à ses adresses (refusé s'il chevauche le programme) ; un ET_DYN
+/// comme une projection, du haut vers le bas, SANS son alignement (Linux,
+/// load_elf_interp, ne l'applique pas), avec pour suggestion sa première
+/// adresse si le programme est un ET_EXEC, rien sinon (le `no_base` de
+/// load_elf_interp).
+fn placer_interpreteur<'b>(memoire: &Memoire, interpreteur: &Executable<'b>, programme: Genre) -> Result<Image<'b>, Refus> {
+    let (premiere, fin) = interpreteur.etendue();
+    let debut = match interpreteur.genre() {
+        Genre::Fixe => premiere,
+        Genre::Relogeable => {
+            // (Et seulement si l'image y tient dans les adresses permises,
+            // comme pour le programme, voir `placer`.)
+            let suggestion = if programme == Genre::Fixe && fin <= PERMISES.fin { premiere } else { 0 };
+            memoire.chercher_place_alignee(fin - premiere, suggestion, 4096).ok_or(Refus::PasDePlace)?
+        }
+    };
+    let image = interpreteur.placer(debut, PERMISES).map_err(Refus::Format)?;
+    let (debut, fin) = image.etendue();
+    if !memoire.zones.libre(debut, fin, 0) {
+        return Err(Refus::Chevauchement);
+    }
+    Ok(image)
 }
 
 /// Pose les segments de l'image `image`, du fichier ouvert `fichier`, dans
@@ -203,15 +249,32 @@ fn poser(memoire: &mut Memoire, image: &Image, fichier: Fichier) -> Result<(), e
     Ok(())
 }
 
+/// Ce que `charger` a posé : les images du programme et de son
+/// interpréteur, à leurs adresses absolues.
+pub struct Images<'a, 'b> {
+    pub programme: Image<'a>,
+    pub interpreteur: Option<Image<'b>>,
+}
+
 /// Charge l'exécutable vérifié `executable`, du fichier ouvert `fichier`,
-/// dans un espace d'adressage neuf : son image posée (voir `placer`), sa
-/// pile, son tas. Rend le programme, et l'image (ses adresses absolues).
-/// En cas d'échec, tout ce qui a été pris est rendu (l'espace et ses zones
-/// sont détruits en sortant de la fonction).
-pub fn charger<'a>(executable: &Executable<'a>, nom: NomCourt, fichier: Fichier) -> Result<(Programme, Image<'a>), Refus> {
+/// et son interpréteur s'il en a un (vérifié, et son fichier ouvert), dans
+/// un espace d'adressage neuf : leurs images posées (voir `placer`), la
+/// pile, le tas. Rend le programme, et les images. En cas d'échec, tout ce
+/// qui a été pris est rendu (l'espace et ses zones sont détruits en sortant
+/// de la fonction, celles du programme comme celles de l'interpréteur).
+pub fn charger<'a, 'b>(executable: &Executable<'a>, nom: NomCourt, fichier: Fichier,
+                       interpreteur: Option<(&Executable<'b>, Fichier)>) -> Result<(Programme, Images<'a, 'b>), Refus> {
     let mut memoire = Memoire::creer(nom)?;
-    let image = placer(&memoire, executable)?;
+    let image = placer(&memoire, executable, interpreteur.is_some())?;
     poser(&mut memoire, &image, fichier)?;
+    let image_interpreteur = match interpreteur {
+        Some((x, f)) => {
+            let i = placer_interpreteur(&memoire, x, executable.genre())?;
+            poser(&mut memoire, &i, f)?;
+            Some(i)
+        }
+        None => None,
+    };
     // La pile : inscriptible, une zone qui grandit vers le bas. Aucune page
     // tant que le noyau n'y a rien écrit. Exécutable seulement si le
     // programme le demande (PT_GNU_STACK avec PF_X) : Linux l'accepte, et
@@ -236,20 +299,23 @@ pub fn charger<'a>(executable: &Executable<'a>, nom: NomCourt, fichier: Fichier)
     // load_elf_binary : `if (!IS_ENABLED(CONFIG_COMPAT_BRK) &&
     // IS_ENABLED(CONFIG_ARCH_HAS_ELF_RANDOMIZE) && elf_ex->e_type == ET_DYN
     // && !interpreter) elf_brk = ELF_ET_DYN_BASE;`), avec ou sans ASLR.
-    let tas = match executable.genre() {
-        Genre::Relogeable => memoire::disposition().base_pie.next_multiple_of(4096),
-        Genre::Fixe => image.fin().next_multiple_of(4096),
+    let tas = match (executable.genre(), &image_interpreteur) {
+        (Genre::Relogeable, None) => memoire::disposition().base_pie.next_multiple_of(4096),
+        _ => image.fin().next_multiple_of(4096),
     };
     (memoire.debut_tas, memoire.fin_tas) = (tas, tas);
     let programme = Programme {
         memoire,
-        depart: image.entree(),
+        // L'interpréteur commence, le programme le suit.
+        depart: image_interpreteur.as_ref().map_or(image.entree(), |i| i.entree()),
         entree: image.entree(),
-        base_interpreteur: 0,
+        // AT_BASE : le décalage de l'interpréteur (son load_bias), qui est
+        // son adresse pour ld-linux (ses adresses partent de 0).
+        base_interpreteur: image_interpreteur.as_ref().map_or(0, |i| i.decalage()),
         adresse_entetes: image.adresse_entetes(),
         nombre_entetes: executable.nombre_entetes(),
         taille_entete: executable.taille_entete(),
         sommet_pile,
     };
-    Ok((programme, image))
+    Ok((programme, Images { programme: image, interpreteur: image_interpreteur }))
 }
