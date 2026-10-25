@@ -544,8 +544,9 @@ impl Lot {
         }
     }
 
-    /// Le cadre `cadre` est à rendre, une fois le TLB vidé. Toute page qui
-    /// le désignait doit déjà avoir été passée à `invalider`.
+    /// Le cadre `cadre` est à lâcher, une fois le TLB vidé (il ne sera rendu
+    /// que si personne d'autre ne le tient, pages.rs). Toute page qui le
+    /// désignait doit déjà avoir été passée à `invalider`.
     fn rendre(&mut self, cadre: u64) {
         if self.nombre_cadres == self.cadres.len() {
             self.vider();
@@ -569,7 +570,7 @@ impl Lot {
         self.tout = true;
     }
 
-    /// Vide le TLB de ce qu'on a noté, puis rend les cadres.
+    /// Vide le TLB de ce qu'on a noté, puis lâche les cadres.
     fn vider(&mut self) {
         if self.actif {
             if self.tout {
@@ -579,7 +580,9 @@ impl Lot {
             }
         }
         (self.nombre_pages, self.tout) = (0, false);
-        self.cadres[..self.nombre_cadres].iter().for_each(|&c| pages::liberer(c, 0));
+        self.cadres[..self.nombre_cadres].iter().for_each(|&c| {
+            pages::lacher(c);
+        });
         self.nombre_cadres = 0;
     }
 }
@@ -609,11 +612,14 @@ fn rendre(table: u64, niveau: u32) {
             // La page de zéros est au noyau : on la saute.
             continue;
         }
-        // Un cadre de page (niveau 0) ou une table (au-dessus) : tous des
-        // blocs d'une page, pris au buddy. (Le jour où des pages seront
-        // partagées entre programmes, il faudra un compteur de références,
-        // comme le _refcount de la struct page de Linux.)
-        pages::liberer(dessous, 0);
+        // Un cadre de page (niveau 0) : lâché, il peut être tenu ailleurs
+        // (une page de fichier, pages.rs). Une table (au-dessus) n'est qu'à
+        // cet espace : rendue.
+        if niveau == 0 {
+            pages::lacher(dessous);
+        } else {
+            pages::liberer(dessous, 0);
+        }
     }
 }
 

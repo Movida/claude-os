@@ -19,15 +19,35 @@
 //! contiguës (les files des pilotes virtio, à l'étape 6), ce qu'une simple
 //! liste de pages libres ne sait pas faire.
 //!
-//! Ce qu'il faut savoir de chaque cadre : est-il le début d'un bloc libre,
-//! ou d'un bloc alloué, et de quel ordre ? Linux le range dans la « struct
-//! page » (64 octets par cadre, qui décrivent aussi bien d'autres choses) ;
-//! il nous suffit d'un octet par cadre, la table `etats`. Savoir où
-//! commencent les blocs alloués permet de refuser une libération fausse
-//! (un bloc déjà libre, ou rendu avec un autre ordre que le sien). Les listes, elles, sont rangées dans
-//! les blocs libres eux-mêmes (les deux premiers mots de chacun : le
-//! suivant et le précédent) : un bloc libre ne contient rien d'utile, et
-//! la projection directe permet de l'écrire.
+//! Ce qu'il faut savoir de chaque cadre tient dans son DESCRIPTEUR, une
+//! table de 8 octets par cadre (le `mem_map` de Linux, un tableau de
+//! « struct page ») :
+//!   - est-il le début d'un bloc libre, ou d'un bloc alloué, et de quel
+//!     ordre ? Savoir où commencent les blocs alloués permet de refuser une
+//!     libération fausse (un bloc déjà libre, ou rendu avec un autre ordre
+//!     que le sien) ;
+//!   - combien de fois est-il PRIS (son compteur de références, le
+//!     `_refcount` de Linux) ? Une page d'un fichier (6b) est tenue par le
+//!     fichier, par chaque projection qui la montre à un programme, et par
+//!     une lecture en cours qui la copie : elle n'est rendue qu'au dernier
+//!     qui la lâche (`prendre`, `lacher`). Un bloc alloué l'est une fois ;
+//!   - des drapeaux : la page appartient-elle à un fichier ? Une page d'un
+//!     fichier ne doit JAMAIS devenir inscriptible dans la projection
+//!     privée d'un programme : il écrirait dans le fichier ;
+//!   - pour une page du tas du noyau, le nombre de ses objets occupés.
+//! Options écartées :
+//!   - la `struct page` entière de Linux : 64 octets par cadre (1,6 % de la
+//!     mémoire), parce qu'elle sert à tout (listes du cache, carte inverse,
+//!     compteur des projections à part, verrou...). La nôtre en fait 8 (0,2
+//!     %) ; elle grandira avec ce qui en aura besoin ;
+//!   - une table à part pour les compteurs, et les drapeaux dans les bits
+//!     libres des entrées de pages : les drapeaux disent ce qu'est le cadre,
+//!     pas ce qu'est une de ses projections ; et trois tables par cadre
+//!     coûteraient trois accès au lieu d'un.
+//! Les listes, elles, sont rangées dans les blocs libres eux-mêmes (les
+//! deux premiers mots de chacun : le suivant et le précédent) : un bloc
+//! libre ne contient rien d'utile, et la projection directe permet de
+//! l'écrire.
 
 use crate::verrou::Verrou;
 use crate::{cadres, espace};
@@ -38,15 +58,31 @@ pub const ORDRE_MAX: u32 = 10;
 
 const PAGE: u64 = 4096;
 
-/// Dans `etats` : le cadre n'est le début d'aucun bloc (il est réservé, ou
-/// au milieu d'un bloc). Le début d'un bloc libre vaut son ordre ; celui
-/// d'un bloc alloué, ALLOUE | son ordre.
+/// Dans `Descripteur::etat` : le cadre n'est le début d'aucun bloc (il est
+/// réservé, ou au milieu d'un bloc). Le début d'un bloc libre vaut son
+/// ordre ; celui d'un bloc alloué, ALLOUE | son ordre.
 const AUCUN: u8 = 0xFF;
 const ALLOUE: u8 = 0x80;
 
+/// Le descripteur d'un cadre (la « struct page » de Linux, en 8 octets).
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Descripteur {
+    /// Ce qui commence à ce cadre (voir AUCUN).
+    etat: u8,
+    /// Ce qu'est le cadre : une page d'un fichier, par exemple (6b).
+    drapeaux: u8,
+    /// Pour une page du tas : ses objets occupés (tas.rs).
+    objets: u16,
+    /// Combien de fois le bloc qui commence ici est pris (0 s'il est libre).
+    references: u32,
+}
+
+const VIERGE: Descripteur = Descripteur { etat: AUCUN, drapeaux: 0, objets: 0, references: 0 };
+
 struct Pages {
-    /// Pour chaque cadre, ce qui y commence (voir AUCUN).
-    etats: &'static mut [u8],
+    /// Le descripteur de chaque cadre.
+    cadres: &'static mut [Descripteur],
     /// Le premier bloc libre de chaque ordre (adresse physique), 0 si la
     /// liste est vide. Le cadre 0 n'est jamais libre (le premier Mio est
     /// réservé) : 0 ne désigne aucun bloc.
@@ -61,7 +97,7 @@ struct Pages {
 }
 
 static PAGES: Verrou<Pages> =
-    Verrou::new(Pages { etats: &mut [], listes: [0; ORDRE_MAX as usize + 1], libres: 0, total: 0, reserve: 0 });
+    Verrou::new(Pages { cadres: &mut [], listes: [0; ORDRE_MAX as usize + 1], libres: 0, total: 0, reserve: 0 });
 
 /// Les liens d'un bloc libre dans sa liste, rangés au début du bloc.
 #[repr(C)]
@@ -91,7 +127,7 @@ impl Pages {
             }
         }
         self.listes[ordre as usize] = bloc;
-        self.etats[(bloc / PAGE) as usize] = ordre as u8;
+        self.cadres[(bloc / PAGE) as usize] = Descripteur { etat: ordre as u8, ..VIERGE };
     }
 
     fn retirer(&mut self, bloc: u64, ordre: u32) {
@@ -108,7 +144,7 @@ impl Pages {
                 liens(suivant).precedent = precedent;
             }
         }
-        self.etats[(bloc / PAGE) as usize] = AUCUN;
+        self.cadres[(bloc / PAGE) as usize].etat = AUCUN;
     }
 
     fn allouer(&mut self, ordre: u32) -> Option<u64> {
@@ -119,18 +155,18 @@ impl Pages {
         for j in (ordre..k).rev() {
             self.inserer(bloc + (PAGE << j), j);
         }
-        self.etats[(bloc / PAGE) as usize] = ALLOUE | ordre as u8;
+        self.cadres[(bloc / PAGE) as usize] = Descripteur { etat: ALLOUE | ordre as u8, references: 1, ..VIERGE };
         self.libres -= 1 << ordre;
         Some(bloc)
     }
 
     fn liberer(&mut self, mut bloc: u64, mut ordre: u32) {
-        self.etats[(bloc / PAGE) as usize] = AUCUN;
+        self.cadres[(bloc / PAGE) as usize] = VIERGE;
         self.libres += 1 << ordre;
         while ordre < ORDRE_MAX {
             let copain = bloc ^ (PAGE << ordre);
             let i = (copain / PAGE) as usize;
-            if i >= self.etats.len() || self.etats[i] != ordre as u8 {
+            if i >= self.cadres.len() || self.cadres[i].etat != ordre as u8 {
                 break;
             }
             self.retirer(copain, ordre);
@@ -157,7 +193,8 @@ impl Pages {
 /// Ce que l'initialisation a fait, pour l'afficher.
 pub struct Bilan {
     pub libres: usize,
-    pub taille_etats: usize,
+    /// La place des descripteurs des cadres, en octets.
+    pub taille_descripteurs: usize,
     /// La réserve du noyau, en pages.
     pub reserve: usize,
 }
@@ -177,21 +214,23 @@ fn reserve_pour(total: usize) -> usize {
 /// mémoire doit être projetée.
 pub fn initialiser() -> Bilan {
     let nombre = cadres::nombre();
-    let taille_etats = nombre.next_multiple_of(PAGE as usize);
-    let adresse = cadres::allouer_contigus(taille_etats / PAGE as usize).expect("pas de place pour l'etat des pages");
+    let taille = (nombre * size_of::<Descripteur>()).next_multiple_of(PAGE as usize);
+    let adresse = cadres::allouer_contigus(taille / PAGE as usize).expect("pas de place pour les descripteurs des cadres");
     // SAFETY : ces cadres viennent d'être alloués, d'un seul tenant, et la
-    // projection directe couvre toute la mémoire.
-    let etats = unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(adresse) as *mut u8, nombre) };
-    etats.fill(AUCUN);
+    // projection directe couvre toute la mémoire ; l'adresse est alignée
+    // sur la page, donc sur un descripteur.
+    let descripteurs = unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(adresse) as *mut Descripteur, nombre) };
+    descripteurs.fill(VIERGE);
     let mut pages = PAGES.verrouiller();
-    *pages = Pages { etats, listes: [0; ORDRE_MAX as usize + 1], libres: 0, total: 0, reserve: 0 };
+    *pages = Pages { cadres: descripteurs, listes: [0; ORDRE_MAX as usize + 1], libres: 0, total: 0, reserve: 0 };
     cadres::ceder(|debut, fin| pages.ajouter_zone(debut, fin));
     (pages.total, pages.reserve) = (pages.libres, reserve_pour(pages.libres));
-    Bilan { libres: pages.libres, taille_etats, reserve: pages.reserve }
+    Bilan { libres: pages.libres, taille_descripteurs: taille, reserve: pages.reserve }
 }
 
 /// Donne un bloc de 2^ordre pages contiguës, aligné sur sa taille :
-/// l'adresse physique de sa première page. Son contenu est quelconque.
+/// l'adresse physique de sa première page, pris une fois. Son contenu est
+/// quelconque.
 pub fn allouer(ordre: u32) -> Option<u64> {
     assert!(ordre <= ORDRE_MAX, "ordre {ordre} trop grand");
     PAGES.verrouiller().allouer(ordre)
@@ -218,20 +257,53 @@ pub fn total() -> usize {
     PAGES.verrouiller().total
 }
 
-/// Rend un bloc, avec l'ordre qu'il avait à l'allocation. Rendre ce qui
-/// n'est pas un bloc alloué de cet ordre (déjà libre, rendu deux fois, avec
-/// un autre ordre, ou jamais donné par cet allocateur) est une erreur grave
-/// (deux propriétaires pour une même mémoire) : on s'arrête tout de suite.
+/// Le descripteur du bloc alloué d'ordre `ordre` qui commence à `bloc`.
+/// Ce qui n'en est pas un (déjà libre, rendu deux fois, avec un autre
+/// ordre, ou jamais donné par cet allocateur) est une erreur grave (deux
+/// propriétaires pour une même mémoire) : on s'arrête tout de suite.
+fn bloc_alloue(pages: &mut Pages, bloc: u64, ordre: u32) -> &mut Descripteur {
+    let i = (bloc / PAGE) as usize;
+    match pages.cadres.get_mut(i) {
+        Some(d) if ordre <= ORDRE_MAX && bloc % PAGE == 0 && d.etat == ALLOUE | ordre as u8 => d,
+        _ => panic!("pas un bloc alloue d'ordre {ordre} : {bloc:#x}"),
+    }
+}
+
+/// Rend un bloc, avec l'ordre qu'il avait à l'allocation. Il ne doit être
+/// pris qu'une fois : un bloc encore tenu ailleurs se rend par `lacher`.
 pub fn liberer(bloc: u64, ordre: u32) {
     let mut pages = PAGES.verrouiller();
-    let i = (bloc / PAGE) as usize;
-    let attendu = ALLOUE | ordre as u8;
-    assert!(
-        ordre <= ORDRE_MAX && bloc % PAGE == 0 && pages.etats.get(i) == Some(&attendu),
-        "pas un bloc alloue d'ordre {ordre} : {bloc:#x}"
-    );
+    let references = bloc_alloue(&mut pages, bloc, ordre).references;
+    assert!(references == 1, "bloc {bloc:#x} rendu alors qu'il est pris {references} fois");
     pages.liberer(bloc, ordre);
 }
+
+/// Le cadre `cadre` (une page allouée) est pris une fois de plus : une
+/// projection de plus, une lecture en cours.
+pub fn prendre(cadre: u64) {
+    let mut pages = PAGES.verrouiller();
+    let d = bloc_alloue(&mut pages, cadre, 0);
+    d.references = d.references.checked_add(1).expect("compteur de references d'un cadre plein");
+}
+
+/// Le cadre `cadre` est pris une fois de moins ; il est rendu au dernier.
+/// Rend vrai s'il l'a été.
+pub fn lacher(cadre: u64) -> bool {
+    let mut pages = PAGES.verrouiller();
+    let d = bloc_alloue(&mut pages, cadre, 0);
+    d.references -= 1;
+    if d.references > 0 {
+        return false;
+    }
+    pages.liberer(cadre, 0);
+    true
+}
+
+/// Combien de fois le cadre `cadre` (une page allouée) est pris.
+pub fn references(cadre: u64) -> u32 {
+    bloc_alloue(&mut PAGES.verrouiller(), cadre, 0).references
+}
+
 
 /// Le nombre de pages libres.
 pub fn libres() -> usize {

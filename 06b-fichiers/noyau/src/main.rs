@@ -214,8 +214,8 @@ extern "C" fn noyau_main(infos: u64) -> ! {
 
     // L'allocateur de démarrage cède la mémoire à l'allocateur de pages.
     let bilan = pages::initialiser();
-    afficherln!("[noyau] Allocateur buddy : {} pages libres ({} Mio), blocs de 4 Kio a {} Mio ; etat des pages : {} Kio.",
-                bilan.libres, bilan.libres >> 8, (4096 << pages::ORDRE_MAX) >> 20, bilan.taille_etats >> 10);
+    afficherln!("[noyau] Allocateur buddy : {} pages libres ({} Mio), blocs de 4 Kio a {} Mio ; descripteurs des cadres : {} Kio.",
+                bilan.libres, bilan.libres >> 8, (4096 << pages::ORDRE_MAX) >> 20, bilan.taille_descripteurs >> 10);
     afficherln!("[noyau] Memoire des programmes : surengagement (OVERCOMMIT_GUESS), reserve du noyau de {} Kio.",
                 bilan.reserve * 4);
     tester_pages();
@@ -284,7 +284,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
 /// peut écrire de bout en bout, et qui se recollent en les rendant (le
 /// nombre de pages libres revient à ce qu'il était). Le plus grand bloc
 /// possible : sur une très petite machine, il n'y a pas forcément de bloc
-/// de 4 Mio.
+/// de 4 Mio. Une page prise deux fois n'est rendue qu'au second `lacher`.
 fn tester_pages() {
     let libres_avant = pages::libres();
     let a = pages::allouer(0).expect("plus de memoire");
@@ -298,11 +298,13 @@ fn tester_pages() {
         debut.write_volatile(1);
         debut.add(taille_c as usize - 1).write_volatile(2);
     }
+    pages::prendre(a);
+    let compteur = pages::references(a) == 2 && !pages::lacher(a) && pages::lacher(a);
     pages::liberer(b, 3);
-    pages::liberer(a, 0);
     pages::liberer(c, ordre_c);
-    afficherln!("[noyau] Pages allouees : {:#x} (4 Kio), {:#x} (32 Kio), {:#x} ({} Kio) ; rendues et recollees : {}.",
-                a, b, c, taille_c >> 10, if pages::libres() == libres_avant { "ok" } else { "ECHEC" });
+    afficherln!("[noyau] Pages allouees : {:#x} (4 Kio), {:#x} (32 Kio), {:#x} ({} Kio) ; prise deux fois, rendue au second lacher : {} ; rendues et recollees : {}.",
+                a, b, c, taille_c >> 10, if compteur { "ok" } else { "ECHEC" },
+                if pages::libres() == libres_avant { "ok" } else { "ECHEC" });
 }
 
 /// Vérifie l'espace d'adressage d'un programme : le créer, y projeter une
