@@ -33,6 +33,7 @@ mod demarrage;
 mod descripteurs;
 mod espace;
 mod espace_utilisateur;
+mod evenements;
 mod faute_de_page;
 mod futex;
 mod gdt;

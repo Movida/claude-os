@@ -19,7 +19,8 @@
 //! fichiers (6b), dans appels_fichiers.rs ; et les signaux (6d), dans
 //! signaux.rs : rt_sigaction, rt_sigprocmask, rt_sigpending, sigaltstack,
 //! kill, tkill, tgkill ; et ce que `claude --version` demande encore (6d) :
-//! futex (futex.rs), uname, sched_getaffinity, sched_yield, prctl.
+//! futex (futex.rs), uname, sched_getaffinity, sched_yield, prctl ;
+//! eventfd et epoll (evenements.rs).
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -37,7 +38,7 @@ use crate::interruptions::Cadre;
 use crate::memoire::{self, Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Projection, Zone};
 use crate::appels_fichiers as f;
-use crate::{aleatoire, cpu, futex, horloge, pages, processus, signaux, tache, temps};
+use crate::{aleatoire, cpu, evenements, futex, horloge, pages, processus, signaux, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
@@ -136,6 +137,14 @@ const FACCESSAT2: u64 = 439;
 const SET_ROBUST_LIST: u64 = 273;
 const PRLIMIT64: u64 = 302;
 const SCHED_YIELD: u64 = 24;
+const EPOLL_CREATE: u64 = 213;
+const EPOLL_WAIT: u64 = 232;
+const EPOLL_CTL: u64 = 233;
+const EPOLL_PWAIT: u64 = 281;
+const EVENTFD: u64 = 284;
+const EVENTFD2: u64 = 290;
+const EPOLL_CREATE1: u64 = 291;
+const EPOLL_PWAIT2: u64 = 441;
 const UNAME: u64 = 63;
 const PRCTL: u64 = 157;
 const FUTEX: u64 = 202;
@@ -209,6 +218,12 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         RSEQ => -ENOSYS,
         PRLIMIT64 => prlimit64(a[0], a[1], a[2], a[3]),
         FUTEX => futex::futex(a[0], a[1], a[2], a[3], a[4], a[5]),
+        EVENTFD => evenements::eventfd(a[0]),
+        EVENTFD2 => evenements::eventfd2(a[0], a[1]),
+        EPOLL_CREATE => evenements::epoll_create(a[0]),
+        EPOLL_CREATE1 => evenements::epoll_create1(a[0]),
+        EPOLL_CTL => evenements::epoll_ctl(a[0], a[1], a[2], a[3]),
+        EPOLL_WAIT | EPOLL_PWAIT | EPOLL_PWAIT2 => evenements::epoll_wait(),
         UNAME => uname(a[0]),
         SCHED_GETAFFINITY => sched_getaffinity(a[0], a[1], a[2]),
         // Céder le processeur : il n'y a personne d'autre à qui le donner.
@@ -330,6 +345,14 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         RSEQ => ("rseq", 4),
         PRLIMIT64 => ("prlimit64", 4),
         FUTEX => ("futex", 6),
+        EVENTFD => ("eventfd", 1),
+        EVENTFD2 => ("eventfd2", 2),
+        EPOLL_CREATE => ("epoll_create", 1),
+        EPOLL_CREATE1 => ("epoll_create1", 1),
+        EPOLL_CTL => ("epoll_ctl", 4),
+        EPOLL_WAIT => ("epoll_wait", 4),
+        EPOLL_PWAIT => ("epoll_pwait", 6),
+        EPOLL_PWAIT2 => ("epoll_pwait2", 6),
         UNAME => ("uname", 1),
         SCHED_GETAFFINITY => ("sched_getaffinity", 3),
         SCHED_YIELD => ("sched_yield", 0),

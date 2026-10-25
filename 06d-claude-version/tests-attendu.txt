@@ -95,6 +95,9 @@
 [linux] Test : PR_SET_NAME, puis une faute.
 [noyau] nouveau-nom : segfault at 0x0 ip 
 [noyau] nom-faute : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : read bloquant d'un eventfd vide.
+[noyau] eventfd-bloque : attente sans fin d'un eventfd : un seul fil, rien ne peut la terminer (SIGKILL)
+[noyau] eventfd-bloque : termine, code de sortie 137 ; memoire rendue : ok.
 [noyau] wx : programme Linux refuse : segment 0 : inscriptible et executable (W+X)
 [noyau] derniere-page : programme Linux refuse : segment 0 : hors des adresses permises
 [noyau] et-dyn : programme Linux (ELF ET_DYN), 

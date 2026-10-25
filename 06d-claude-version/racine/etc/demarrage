@@ -34,3 +34,5 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/signaux
 # Les petits appels de claude (6d) : uname, sched_getaffinity, futex, prctl.
 /bin/systeme
+# eventfd et epoll (6d) : la boucle d'événements de Bun, créée mais pas encore attendue.
+/bin/evenements

@@ -83,6 +83,7 @@ const ENOMEM: u32 = 48;
 const ENOSPC: u32 = 51;
 const ENOTDIR: u32 = 54;
 const ENOTEMPTY: u32 = 55;
+const ENOTSUP: u32 = 58;
 const ENXIO: u32 = 60;
 const EPERM: u32 = 63;
 const ESPIPE: u32 = 70;
@@ -109,6 +110,7 @@ fn errno(e: Erreur) -> u32 {
         Erreur::ENAMETOOLONG => ENAMETOOLONG,
         Erreur::ENOTEMPTY => ENOTEMPTY,
         Erreur::ELOOP => ELOOP,
+        Erreur::EOPNOTSUPP => ENOTSUP,
     }
 }
 
@@ -536,7 +538,7 @@ impl Wasi {
                     console::ecrire_octets(octets);
                     Ok(octets.len())
                 }
-                (Sorte::Null | Sorte::Zero | Sorte::Aleatoire, true) => Ok(octets.len()),
+                (Sorte::Null | Sorte::Zero | Sorte::Aleatoire { .. }, true) => Ok(octets.len()),
                 (Sorte::Plein, true) => Err(ENOSPC),
                 (Sorte::Fichier, true) => vfs::avec(|fs, cadres| fs.ecrire(n(), ici, octets, maintenant, cadres)).map_err(errno),
                 (Sorte::Fichier, false) => Ok(vfs::avec(|fs, cadres| fs.lire(n(), ici, octets, cadres))),
@@ -545,12 +547,14 @@ impl Wasi {
                     octets.fill(0);
                     Ok(octets.len())
                 }
-                (Sorte::Aleatoire, false) => {
+                (Sorte::Aleatoire { .. }, false) => {
                     crate::aleatoire::remplir(octets);
                     Ok(octets.len())
                 }
                 (Sorte::Dossier, _) => Err(EISDIR),
-                (Sorte::Chemin, _) => Err(EBADF),
+                // Un programme WebAssembly n'a ni eventfd ni epoll : ce
+                // descripteur ne peut pas être à lui.
+                (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll, _) => Err(EBADF),
             };
             match r {
                 Ok(k) => {
@@ -710,7 +714,8 @@ impl Wasi {
                 S_IFCHR if a.rdev == vfs::NULL => Sorte::Null,
                 S_IFCHR if a.rdev == vfs::ZERO => Sorte::Zero,
                 S_IFCHR if a.rdev == vfs::CONSOLE => Sorte::Console,
-                S_IFCHR if a.rdev == vfs::RANDOM || a.rdev == vfs::URANDOM => Sorte::Aleatoire,
+                S_IFCHR if a.rdev == vfs::RANDOM => Sorte::Aleatoire { random: true },
+                S_IFCHR if a.rdev == vfs::URANDOM => Sorte::Aleatoire { random: false },
                 S_IFCHR if a.rdev == vfs::FULL => Sorte::Plein,
                 _ => {
                     s.fs.fermer(&ouvert, cadres);

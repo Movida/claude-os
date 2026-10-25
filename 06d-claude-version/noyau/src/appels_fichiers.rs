@@ -26,7 +26,7 @@ use crate::copie_utilisateur::{
 };
 use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Sorte, Tenu};
 use crate::vfs::{self, CadresDuNoyau, Systeme};
-use crate::{aleatoire, console, pages, processus, temps};
+use crate::{aleatoire, console, evenements, pages, processus, temps};
 use fichiers::chemins::{Arbre, Depart, Fin, PATH_MAX, Suivre};
 use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_tmpfs};
 use fichiers::tmpfs::{Attributs, Numero, Ouverture, limite_ecriture, suivre_pour};
@@ -169,7 +169,8 @@ fn sorte(mode: u32, rdev: (u32, u32)) -> Result<Sorte, i64> {
             vfs::NULL => Sorte::Null,
             vfs::ZERO => Sorte::Zero,
             vfs::FULL => Sorte::Plein,
-            vfs::RANDOM | vfs::URANDOM => Sorte::Aleatoire,
+            vfs::RANDOM => Sorte::Aleatoire { random: true },
+            vfs::URANDOM => Sorte::Aleatoire { random: false },
             vfs::CONSOLE => Sorte::Console,
             _ => return Err(errno(Erreur::ENXIO)),
         },
@@ -401,6 +402,23 @@ fn fermer_descripteur(fd: u64) -> Result<(), i64> {
     Ok(())
 }
 
+/// Range un fichier ouvert neuf (eventfd, epoll : sans chemin) au plus petit
+/// numéro libre, avec FD_CLOEXEC si demandé : rend le numéro, EMFILE s'il
+/// n'y en a plus, ENOMEM si une table ne peut pas grandir (rien ne reste).
+pub fn installer_fichier(f: FichierOuvert, fermer_a_l_exec: bool) -> i64 {
+    let Some(fd) = processus::avec(|p| p.descripteurs.libre(0)) else { return -EMFILE };
+    let fichier = match vfs::avec_systeme(|s, _| s.ouverts.ajouter(f)) {
+        Ok(fichier) => fichier,
+        Err(_) => return -ENOMEM,
+    };
+    let d = Descripteur { fichier, fermer_a_l_exec };
+    if processus::avec(|p| p.descripteurs.installer(fd, d)).is_err() {
+        vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
+        return -ENOMEM;
+    }
+    fd as i64
+}
+
 /// close(fd).
 pub fn close(fd: u64) -> i64 {
     match fermer_descripteur(fd) {
@@ -613,6 +631,14 @@ fn verifier_transfert(tampon: u64, longueur: u64, position: u64) -> Result<u64, 
 /// Lire, selon la sorte du fichier, `longueur` octets à `position` (ou à
 /// la position du fichier, `None`).
 fn lire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
+    // Un eventfd ou un epoll n'a pas de position : pread rend ESPIPE avant
+    // tout (FMODE_PREAD n'est pas mis) ; un epoll ne se lit pas (pas
+    // d'opération read : EINVAL, avant de regarder le tampon).
+    match o.sorte {
+        Sorte::EventFd | Sorte::Epoll if position.is_some() => return Err(-ESPIPE),
+        Sorte::Epoll => return Err(-EINVAL),
+        _ => {}
+    }
     if !o.lecture {
         return Err(-EBADF);
     }
@@ -630,13 +656,21 @@ fn lire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) ->
         // La console n'est pas encore un terminal (6j) : rien à lire.
         Sorte::Null | Sorte::Console => Ok(0),
         Sorte::Zero | Sorte::Plein => produire(tampon, longueur, |m| m.fill(0)),
-        Sorte::Aleatoire => produire(tampon, longueur, aleatoire::remplir),
+        Sorte::Aleatoire { .. } => produire(tampon, longueur, aleatoire::remplir),
         Sorte::Chemin => Err(-EBADF),
+        Sorte::EventFd => evenements::lire(o.fichier, o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::Epoll => Err(-EINVAL),
     }
 }
 
 /// Écrire, selon la sorte du fichier.
 fn ecrire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
+    // Comme pour lire : ESPIPE, puis EINVAL pour un epoll.
+    match o.sorte {
+        Sorte::EventFd | Sorte::Epoll if position.is_some() => return Err(-ESPIPE),
+        Sorte::Epoll => return Err(-EINVAL),
+        _ => {}
+    }
     if !o.ecriture {
         return Err(-EBADF);
     }
@@ -672,9 +706,11 @@ fn ecrire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) 
         // Dans le vide, sans même lire le tampon (comme le write_null de
         // Linux). L'aléa écrit dans /dev/random ne nourrit rien : notre
         // générateur n'a pas encore de réserve à brasser (6h).
-        Sorte::Null | Sorte::Zero | Sorte::Aleatoire => Ok(longueur),
+        Sorte::Null | Sorte::Zero | Sorte::Aleatoire { .. } => Ok(longueur),
         Sorte::Plein => Err(-ENOSPC),
         Sorte::Dossier | Sorte::Chemin => Err(-EBADF),
+        Sorte::EventFd => evenements::ecrire(o.fichier, o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::Epoll => Err(-EINVAL),
     }
 }
 
@@ -767,6 +803,13 @@ fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
         Ok(m) => m,
         Err(e) => return e,
     };
+    // Un eventfd se lit d'un coup, sur tous les morceaux (evenements.rs).
+    if !ecrire && o.sorte == Sorte::EventFd {
+        return match evenements::lire_morceaux(o.fichier, o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux) {
+            Ok(n) => n as i64,
+            Err(e) => e,
+        };
+    }
     let mut total = 0u64;
     for (base, longueur) in morceaux {
         if longueur == 0 {
@@ -828,7 +871,9 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
     let nouvelle = match (o.sorte, depuis) {
         (Sorte::Chemin, _) => return -EBADF,
         (Sorte::Console, _) => return -ESPIPE,
-        (Sorte::Null | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire, _) => return 0,
+        (Sorte::Null | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. }, _) => return 0,
+        // Ni position ni taille : `noop_llseek`, qui rend la position, nulle.
+        (Sorte::EventFd | Sorte::Epoll, _) => return o.position as i64,
         (_, SEEK_SET) => Some(decalage),
         (_, SEEK_CUR) => (o.position as i64).checked_add(decalage),
         (Sorte::Fichier, SEEK_END) => {
@@ -1280,6 +1325,8 @@ pub fn flock(fd: u64, operation: u64) -> i64 {
 ///     fin, en `int` (négatif si la position est au-delà : Linux ne borne
 ///     pas) ; pour le reste, c'est au pilote d'y répondre, et aucun des
 ///     nôtres ne le fait : ENOTTY (un terminal le fera, 6j) ;
+///   - un epoll répond lui-même à toute autre requête : EINVAL
+///     (`ep_eventpoll_ioctl`, mesuré) ;
 ///   - les requêtes des terminaux (TCGETS, la question d'isatty, et les
 ///     autres) : ENOTTY, la console n'en est pas encore un (6j). La glibc
 ///     met alors la sortie standard dans un tampon complet, vidé à la
@@ -1324,6 +1371,7 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
                 Err(_) => -EFAULT,
             }
         }
+        _ if o.sorte == Sorte::Epoll => -EINVAL,
         _ => -ENOTTY,
     }
 }

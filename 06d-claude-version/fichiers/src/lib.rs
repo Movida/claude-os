@@ -134,6 +134,9 @@ pub enum Erreur {
     /// Trop de liens symboliques à suivre (une boucle), ou un lien là où on
     /// n'en voulait pas (O_NOFOLLOW).
     ELOOP,
+    /// Une opération que ce système ne sait pas faire (changer les
+    /// attributs de l'inode anonyme).
+    EOPNOTSUPP,
 }
 
 impl Erreur {
@@ -158,6 +161,7 @@ impl Erreur {
             Erreur::ENAMETOOLONG => 36,
             Erreur::ENOTEMPTY => 39,
             Erreur::ELOOP => 40,
+            Erreur::EOPNOTSUPP => 95,
         }
     }
 }

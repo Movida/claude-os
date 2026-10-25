@@ -39,27 +39,56 @@ use alloc::vec::Vec;
 pub struct Systeme(pub u8);
 
 /// Un objet de l'arborescence : un inode du tmpfs de la racine, ou d'un
-/// système monté (le numéro de l'inode dans ce système).
+/// système monté (le numéro de l'inode dans ce système). Ou l'inode
+/// anonyme : celui des fichiers ouverts qui n'ont pas de nom (eventfd,
+/// epoll), le seul inode de l'anon_inodefs de Linux (fs/anon_inodes.c),
+/// un système du noyau qui n'est monté nulle part ; jamais dans
+/// l'arborescence.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Objet {
     Tmpfs(Numero),
     Monte(Systeme, u32),
+    Anonyme,
 }
+
+/// Ce que dit `stat` de l'inode anonyme (mesuré sous Linux 6.18) : ni
+/// fichier ni dossier (mode 0600, sans bits de type), à root, un seul
+/// lien, une taille nulle. Le même pour tous les fichiers qui le
+/// tiennent : un eventfd et un epoll ont le même numéro d'inode.
+pub const ANONYME: Attributs = Attributs {
+    numero: Numero(1),
+    mode: 0o600,
+    nlink: 1,
+    uid: 0,
+    gid: 0,
+    rdev: (0, 0),
+    taille: 0,
+    blocs: 0,
+    atime: crate::Temps { secondes: 0, nanosecondes: 0 },
+    mtime: crate::Temps { secondes: 0, nanosecondes: 0 },
+    ctime: crate::Temps { secondes: 0, nanosecondes: 0 },
+};
+
+/// Le périphérique de l'anon_inodefs (mesuré : 0:16) et sa taille de bloc.
+pub const ANONYME_PERIPHERIQUE: ((u32, u32), u64) = ((0, 16), 4096);
 
 impl Objet {
     /// L'inode du tmpfs, si c'en est un.
     pub fn tmpfs(self) -> Option<Numero> {
         match self {
             Objet::Tmpfs(n) => Some(n),
-            Objet::Monte(..) => None,
+            Objet::Monte(..) | Objet::Anonyme => None,
         }
     }
 
-    /// Le système de l'objet : None pour le tmpfs.
-    fn systeme(self) -> Option<Systeme> {
+    /// Le système de l'objet (le vfsmount de Linux), pour savoir si deux
+    /// objets en partagent un : 0 pour le tmpfs, 1 et plus pour un système
+    /// monté, u16::MAX pour l'anon_inodefs.
+    fn monture(self) -> u16 {
         match self {
-            Objet::Tmpfs(_) => None,
-            Objet::Monte(s, _) => Some(s),
+            Objet::Tmpfs(_) => 0,
+            Objet::Monte(s, _) => 1 + s.0 as u16,
+            Objet::Anonyme => u16::MAX,
         }
     }
 }
@@ -182,8 +211,11 @@ impl<'a> Vue<'a> {
     /// Le périphérique et la taille de bloc du système d'un objet monté
     /// (None pour le tmpfs, que le noyau connaît).
     pub fn peripherique(&self, o: Objet) -> Option<((u32, u32), u64)> {
-        let s = o.systeme()?;
-        Some((self.monte(s).peripherique(), self.monte(s).taille_de_bloc()))
+        match o {
+            Objet::Tmpfs(_) => None,
+            Objet::Monte(s, _) => Some((self.monte(s).peripherique(), self.monte(s).taille_de_bloc())),
+            Objet::Anonyme => Some(ANONYME_PERIPHERIQUE),
+        }
     }
 
     /// Ce que dit `stat` de l'objet.
@@ -191,6 +223,7 @@ impl<'a> Vue<'a> {
         match o {
             Objet::Tmpfs(n) => self.fs.attributs(n),
             Objet::Monte(s, n) => self.monte(s).attributs(n),
+            Objet::Anonyme => ANONYME,
         }
     }
 
@@ -204,6 +237,7 @@ impl<'a> Vue<'a> {
                 entree(nom, numero.0 as u64, genre, suivante)
             }),
             Objet::Monte(s, n) => self.monte(s).lire_dossier(n, position, &mut entree),
+            Objet::Anonyme => Err(Erreur::ENOTDIR),
         }
     }
 
@@ -215,6 +249,7 @@ impl<'a> Vue<'a> {
         let (s, mut n) = match o {
             Objet::Tmpfs(n) => return self.fs.chemin(n),
             Objet::Monte(s, n) => (s, n),
+            Objet::Anonyme => return Err(Erreur::ENOENT),
         };
         let m = self.monte(s);
         let mut chemin = self.fs.chemin(self.point(s))?;
@@ -285,7 +320,9 @@ impl<'a> Vue<'a> {
                     }
                     // Le dossier est dans le tmpfs, le nom est absent : rien ne
                     // touche un système monté (l'appelant ne vient pas ici).
+                    // L'inode anonyme n'est pas un dossier.
                     Objet::Tmpfs(_) => Erreur::EINVAL,
+                    Objet::Anonyme => Erreur::ENOTDIR,
                 }
             }
             Modification::Effacer(fin, rmdir) => {
@@ -317,12 +354,12 @@ impl<'a> Vue<'a> {
                 if nouveau.objet.is_some() {
                     return Erreur::EEXIST;
                 }
-                if source.systeme() != nouveau.dossier.systeme() {
+                if source.monture() != nouveau.dossier.monture() {
                     return Erreur::EXDEV;
                 }
                 match source {
                     Objet::Monte(s, n) => self.monte(s).refuser(qui, Interne::Lier { source: n }),
-                    Objet::Tmpfs(_) => Erreur::EINVAL,
+                    Objet::Tmpfs(_) | Objet::Anonyme => Erreur::EINVAL,
                 }
             }
             Modification::ChangerMode(o) => self.interne(qui, o, |n| Interne::ChangerMode { objet: n }),
@@ -387,7 +424,7 @@ impl<'a> Vue<'a> {
     fn renommer(&self, qui: Identite, ancien: &Fin<Objet>, nouveau: &Fin<Objet>, drapeaux: u32) -> Erreur {
         let echange = drapeaux & RENAME_EXCHANGE != 0;
         let sans_ecraser = drapeaux & RENAME_NOREPLACE != 0;
-        if ancien.dossier.systeme() != nouveau.dossier.systeme() {
+        if ancien.dossier.monture() != nouveau.dossier.monture() {
             return Erreur::EXDEV;
         }
         if ancien.dernier != Dernier::Nom {
@@ -427,19 +464,20 @@ impl<'a> Vue<'a> {
         // tmpfs : l'objet du tmpfs d'un point de montage est le dossier
         // qu'il cache.
         let dans_le_tmpfs = |o: Objet| match o {
-            Objet::Tmpfs(n) => n,
-            Objet::Monte(s, _) => self.point(s),
+            Objet::Tmpfs(n) => Some(n),
+            Objet::Monte(s, _) => Some(self.point(s)),
+            Objet::Anonyme => None,
         };
-        if let Objet::Tmpfs(d) = ancien.dossier
-            && let Err(e) = self.fs.peut_effacer(qui, d, dans_le_tmpfs(source), dossier_source)
+        if let (Objet::Tmpfs(d), Some(n)) = (ancien.dossier, dans_le_tmpfs(source))
+            && let Err(e) = self.fs.peut_effacer(qui, d, n, dossier_source)
         {
             return e;
         }
         if let Objet::Tmpfs(d) = nouveau.dossier {
-            let r = match cible {
-                Some(c) => {
-                    let attendu = if echange { est_dossier(self, c) } else { dossier_source };
-                    self.fs.peut_effacer(qui, d, dans_le_tmpfs(c), attendu)
+            let r = match cible.and_then(dans_le_tmpfs) {
+                Some(n) => {
+                    let attendu = if echange { est_dossier(self, cible.unwrap_or(source)) } else { dossier_source };
+                    self.fs.peut_effacer(qui, d, n, attendu)
                 }
                 None => self.fs.peut_creer(qui, d),
             };
@@ -453,7 +491,7 @@ impl<'a> Vue<'a> {
             (Objet::Monte(s, _), Objet::Monte(_, a)) => {
                 let n = cible.and_then(|o| match o {
                     Objet::Monte(_, n) => Some(n),
-                    Objet::Tmpfs(_) => None,
+                    Objet::Tmpfs(_) | Objet::Anonyme => None,
                 });
                 self.monte(s).refuser(qui, Interne::Renommer { ancien: a, nouveau: n })
             }
@@ -475,6 +513,16 @@ impl<'a> Vue<'a> {
     fn interne(&self, qui: Identite, o: Objet, m: impl FnOnce(u32) -> Interne) -> Erreur {
         match o {
             Objet::Monte(s, n) => self.monte(s).refuser(qui, m(n)),
+            // L'inode anonyme : Linux 6.18 refuse d'en changer les
+            // attributs (`anon_inode_setattr` : EOPNOTSUPP), pour root
+            // aussi (mesuré). Seules les dates à maintenant passent avant
+            // par `may_setattr`, qui demande d'y écrire ou d'en être le
+            // propriétaire : il est à root, en 0600 (EACCES). Tronquer ne
+            // vient pas ici (pas un fichier ordinaire : EINVAL plus haut).
+            Objet::Anonyme => match m(0) {
+                Interne::ChangerTemps { maintenant: true, .. } if !qui.root() => Erreur::EACCES,
+                _ => Erreur::EOPNOTSUPP,
+            },
             Objet::Tmpfs(_) => Erreur::EINVAL,
         }
     }
@@ -509,6 +557,7 @@ impl Arbre for Vue<'_> {
         match o {
             Objet::Tmpfs(n) => self.fs.mode(n),
             Objet::Monte(s, n) => self.monte(s).attributs(n).mode,
+            Objet::Anonyme => ANONYME.mode,
         }
     }
 
@@ -519,6 +568,7 @@ impl Arbre for Vue<'_> {
                 let a = self.monte(s).attributs(n);
                 (a.uid, a.gid)
             }
+            Objet::Anonyme => (ANONYME.uid, ANONYME.gid),
         }
     }
 
@@ -526,6 +576,7 @@ impl Arbre for Vue<'_> {
         match dossier {
             Objet::Tmpfs(d) => <Tmpfs as Arbre>::chercher(self.fs, d, nom).map(|n| self.par_dessus(n)),
             Objet::Monte(s, d) => self.monte(s).chercher(d, nom).map(|n| Objet::Monte(s, n)),
+            Objet::Anonyme => None,
         }
     }
 
@@ -536,6 +587,7 @@ impl Arbre for Vue<'_> {
                 self.par_dessus(<Tmpfs as Arbre>::parent(self.fs, self.point(s)))
             }
             Objet::Monte(s, d) => Objet::Monte(s, self.monte(s).parent(d)),
+            Objet::Anonyme => Objet::Anonyme,
         }
     }
 
@@ -543,6 +595,7 @@ impl Arbre for Vue<'_> {
         match lien {
             Objet::Tmpfs(n) => <Tmpfs as Arbre>::cible(self.fs, n),
             Objet::Monte(s, n) => self.monte(s).cible(n, self.lecteur),
+            Objet::Anonyme => &[],
         }
     }
 }
@@ -693,6 +746,8 @@ mod tests {
         assert_eq!(vue.attributs(Objet::Monte(p, 2)).mode, S_IFREG | 0o444);
         assert_eq!(vue.peripherique(Objet::Monte(p, 2)), Some(((0, 21), 1024)));
         assert_eq!(vue.peripherique(Objet::Tmpfs(fs.racine())), None);
+        assert_eq!(vue.attributs(Objet::Anonyme).mode, 0o600);
+        assert!(!est_dossier(&vue, Objet::Anonyme));
         assert!(est_dossier(&vue, Objet::Monte(p, 1)));
         let mut noms = vec![];
         vue.lire_dossier(Objet::Monte(p, 0), 0, |nom, _, _, _| {
@@ -806,6 +861,16 @@ mod tests {
         assert_eq!(refus(&fs, Identite::ROOT, Modification::Renommer(&fichier_root, &point_root, 0)), Erreur::EISDIR);
         // Lier vers un nom qui existe : EEXIST.
         assert_eq!(refus(&fs, DAVID, Modification::Lier(existe.objet.unwrap(), &existe)), Erreur::EEXIST);
+        // L'inode anonyme : ses attributs ne changent pas (EOPNOTSUPP), sauf
+        // les dates à maintenant, refusées avant par les droits (EACCES,
+        // root passe) ; lié dans le tmpfs, EXDEV ; tronqué, EINVAL.
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerMode(Objet::Anonyme)), Erreur::EOPNOTSUPP);
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerProprietaire(Objet::Anonyme, None, None)), Erreur::EOPNOTSUPP);
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerTemps(Objet::Anonyme, true)), Erreur::EACCES);
+        assert_eq!(refus(&fs, Identite::ROOT, Modification::ChangerTemps(Objet::Anonyme, true)), Erreur::EOPNOTSUPP);
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerTemps(Objet::Anonyme, false)), Erreur::EOPNOTSUPP);
+        assert_eq!(refus(&fs, DAVID, Modification::Lier(Objet::Anonyme, &tmp)), Erreur::EXDEV);
+        assert_eq!(refus(&fs, DAVID, Modification::Tronquer(Objet::Anonyme)), Erreur::EINVAL);
         // en_tmpfs : seulement ce qui est entièrement dans le tmpfs.
         assert!(dans_le_tmpfs(&fin(&fs, DAVID, b"/tmp/x")) && !dans_le_tmpfs(&fin(&fs, DAVID, b"/proc")));
         assert!(en_tmpfs(fin(&fs, DAVID, b"/tmp/x")).is_ok());
