@@ -1,0 +1,5 @@
+[noyau] Alea des programmes (AT_RANDOM) : RDRAND.
+[noyau] Protections contre les programmes : SMEP oui, SMAP oui, UMIP oui.
+[noyau] SMAP verifie : une lecture directe de la memoire d'un programme fait faute.
+[noyau] sgdt : general protection fault
+[noyau] sgdt : termine, code de sortie 139 ; memoire rendue : ok.
