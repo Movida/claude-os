@@ -122,9 +122,9 @@ fn debut_de_zone(m: &Modele, p: u64) -> u64 {
     zones_du_modele(m).into_iter().find(|&(d, f, _, _)| (d..f).contains(&p)).map_or(p, |(d, ..)| d)
 }
 
-/// Le trou attendu, cherché page par page.
-fn trou_du_modele(m: &Modele, taille: u64, plancher: u64, plafond: u64, sens: Sens) -> Option<u64> {
-    let libre = |a: u64| libre_du_modele(m, a, a + taille);
+/// Le trou attendu, cherché page par page (`alignement` en pages).
+fn trou_du_modele(m: &Modele, taille: u64, plancher: u64, plafond: u64, alignement: u64, sens: Sens) -> Option<u64> {
+    let libre = |a: u64| a % alignement == 0 && libre_du_modele(m, a, a + taille);
     let candidats = plancher..=plafond.saturating_sub(taille);
     if taille == 0 || plafond < plancher + taille {
         return None;
@@ -273,8 +273,10 @@ fn jouer(graine: u64, operations: usize, maximum: usize) {
             _ => {
                 let taille = h.moins_de(16);
                 let sens = if h.booleen() { Sens::DuHaut } else { Sens::DuBas };
-                let attendu = trou_du_modele(&m, taille, debut, fin, sens).map(|p| p * PAGE);
-                assert_eq!(c.trou(taille * PAGE, a, b, ECART, sens), attendu, "{contexte} : trou de {taille} dans {debut}..{fin}");
+                let alignement = 1 << h.moins_de(4);
+                let attendu = trou_du_modele(&m, taille, debut, fin, alignement, sens).map(|p| p * PAGE);
+                assert_eq!(c.trou(taille * PAGE, a, b, ECART, alignement * PAGE, sens), attendu,
+                           "{contexte} : trou de {taille} aligne sur {alignement} dans {debut}..{fin}");
                 if fin > debut {
                     assert_eq!(c.libre(a, b, ECART), libre_du_modele(&m, debut, fin), "{contexte} : libre {debut}..{fin}");
                 }

@@ -187,9 +187,11 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
         (AT_PHENT, p.taille_entete as u64),
         (AT_PHNUM, p.nombre_entetes as u64),
         (AT_PAGESZ, 4096),
-        // Pas d'interpréteur (ld-linux) : il serait chargé à AT_BASE.
-        (AT_BASE, 0),
+        // Où est l'interpréteur (ld-linux), 0 sans lui.
+        (AT_BASE, p.base_interpreteur),
         (AT_FLAGS, 0),
+        // Le point d'entrée du programme, même quand il commence par son
+        // interpréteur.
         (AT_ENTRY, p.entree),
         (AT_UID, UTILISATEUR),
         (AT_EUID, UTILISATEUR),
@@ -206,6 +208,11 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
         (AT_CLKTCK, USER_HZ),
         (AT_PLATFORM, plateforme),
         (AT_EXECFN, execfn),
+        // Linux 6.18 donne en plus AT_SYSINFO_EHDR (l'adresse du vDSO, 6m),
+        // AT_MINSIGSTKSZ (la taille minimale d'une pile de signal, 6f) et
+        // AT_RSEQ_FEATURE_SIZE, AT_RSEQ_ALIGN (rseq, que nous n'avons pas) :
+        // la glibc a un repli pour chacune (vrais appels de clock_gettime,
+        // une taille par défaut, rseq désactivé).
         (AT_NULL, 0),
     ];
     // Ses octets, dans l'ordre du processeur (petit-boutiste).

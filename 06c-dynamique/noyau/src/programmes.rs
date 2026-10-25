@@ -317,21 +317,6 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
             Err(e) => afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
         };
     }
-    if executable.genre() == formats::elf::Genre::Relogeable {
-        return afficherln!("[noyau] {} : programme Linux refuse : ELF ET_DYN : pas encore pris en charge", nom);
-    }
-    // Un ET_EXEC : à ses propres adresses, qui doivent être permises.
-    let executable = match executable.placer(executable.etendue().0, chargeur_elf::PERMISES) {
-        Ok(x) => x,
-        Err(e) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
-    };
-    afficherln!("[noyau] {} : programme Linux (ELF), {} octets, point d'entree {:#x}, segments :",
-                nom, taille, executable.entree());
-    for s in executable.segments() {
-        afficherln!("        {:#010x}-{:#010x} {}{}{} ({} octets du fichier)",
-                    s.adresse, s.adresse + s.taille, 'r',
-                    if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.taille_fichier);
-    }
     let identite = IDENTITE;
     let libres = pages::libres();
     // Le fichier ouvert que projetteront ses segments : chaque zone le
@@ -342,16 +327,45 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     };
     let charge = chargeur_elf::charger(&executable, nom, fichier);
     vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
-    let mut programme = match charge {
+    let (mut programme, image) = match charge {
         Ok(p) => p,
+        Err(chargeur_elf::Refus::Format(e)) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
         Err(e) => return afficherln!("[noyau] {} : chargement impossible : {}", nom, e),
     };
+    // Ce qui a été chargé, et où. Un ET_DYN sans interpréteur est la
+    // première projection de son espace : il doit être tout en haut, sous
+    // la base des projections (à son alignement près).
+    let (debut, fin) = image.etendue();
+    let genre = match executable.genre() {
+        formats::elf::Genre::Fixe => "ET_EXEC",
+        formats::elf::Genre::Relogeable => "ET_DYN",
+    };
+    afficherln!("[noyau] {} : programme Linux (ELF {}), {} octets, point d'entree {:#x}, segments :",
+                nom, genre, taille, image.entree());
+    for s in image.segments() {
+        afficherln!("        {:#010x}-{:#010x} {}{}{} ({} octets du fichier)",
+                    s.adresse, s.adresse + s.taille, 'r',
+                    if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.taille_fichier);
+    }
+    if executable.genre() == formats::elf::Genre::Relogeable {
+        let base = crate::memoire::disposition().base_mmap;
+        if executable.etendue().0 != 0 && debut == executable.etendue().0 {
+            // Posé à l'adresse que suggérait son fichier (sa première
+            // adresse, si elle n'est pas 0, et libre) : rien à vérifier de
+            // plus.
+            afficherln!("        image a {:#x}-{:#x}, a l'adresse que suggere son fichier.", debut, fin);
+        } else {
+            let en_haut = fin <= base && base - fin < executable.alignement();
+            afficherln!("        image a {:#x}-{:#x}, tout en haut sous la base des projections : {}.",
+                        debut, fin, if en_haut { "ok" } else { "ECHEC" });
+        }
+    }
     // Le code au point d'entrée, relu dans l'espace du programme, doit être
     // celui du fichier.
     // (16 octets au plus : ce qu'il reste du fichier après le point
     // d'entrée, dans son segment.)
     let mut attendu = [0u8; 16];
-    let longueur = executable
+    let longueur = image
         .segments()
         .find_map(|s| {
             let decalage = programme.entree.checked_sub(s.adresse).filter(|&d| d < s.taille_fichier)?;
@@ -365,10 +379,9 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     let code_ok = programme.memoire.servir(programme.entree, Acces::Lecture).is_ok()
         && programme.memoire.espace.lire(programme.entree, &mut code[..longueur]).is_ok()
         && code[..longueur] == attendu[..longueur];
-    // Le tas commence à la page qui suit le dernier segment.
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
-                programme.fin.next_multiple_of(4096), if code_ok { "ok" } else { "ECHEC" });
+                programme.memoire.debut_tas, if code_ok { "ok" } else { "ECHEC" });
     // Sa pile initiale : les arguments et l'environnement de sa ligne,
     // son chemin pour AT_EXECFN (comme Linux, le chemin donné à execve).
     let rsp = match pile::construire(&mut programme, lancement.arguments, lancement.environnement, chemin) {
@@ -389,7 +402,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
         fs.prendre(r);
         r
     });
-    let (pml4, entree) = (programme.memoire.espace.pml4(), programme.entree);
+    let (pml4, depart) = (programme.memoire.espace.pml4(), programme.depart);
     processus::installer(processus::Processus {
         memoire: programme.memoire,
         descripteurs,
@@ -403,7 +416,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     // (ETXTBSY) : ses pages seront bientôt celles du programme.
     let code = match vfs::avec(|fs, _| fs.refuser_ecriture(n)) {
         Ok(()) => {
-            let code = tache::executer(nom, pml4, entree, rsp);
+            let code = tache::executer(nom, pml4, depart, rsp);
             vfs::avec(|fs, _| fs.permettre_ecriture(n));
             code
         }

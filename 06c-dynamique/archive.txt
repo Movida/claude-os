@@ -12,6 +12,7 @@ file  /bin/bonjour-asm     linux/construits/bonjour-asm 755 0 0
 file  /bin/pile            linux/construits/pile 755 0 0
 file  /bin/sse             linux/construits/sse 755 0 0
 file  /bin/bonjour-c       linux/construits/bonjour-c 755 0 0
+file  /bin/bonjour-c-pie   linux/construits/bonjour-c-pie 755 0 0
 file  /bin/memoire         linux/construits/memoire 755 0 0
 file  /bin/claude-version  linux/construits/claude-version 755 0 0
 file  /bin/temps           linux/construits/temps 755 0 0

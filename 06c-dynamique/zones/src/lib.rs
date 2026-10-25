@@ -332,11 +332,20 @@ impl Zones {
 
     /// Un trou d'au moins `taille` octets (multiple de la page, non nul)
     /// dans [plancher, plafond[, en laissant l'écart de garde sous les
-    /// zones qui grandissent vers le bas. Du haut : l'adresse la plus haute
-    /// possible ; du bas : la plus basse. C'est le `vm_unmapped_area` de
-    /// Linux, sans contrainte d'alignement.
-    pub fn trou(&self, taille: u64, plancher: u64, plafond: u64, ecart: u64, sens: Sens) -> Option<u64> {
-        if taille == 0 || !alignee(taille) || plafond < plancher || plafond - plancher < taille {
+    /// zones qui grandissent vers le bas, à une adresse multiple de
+    /// `alignement` (une puissance de deux, une page au moins). Du haut :
+    /// l'adresse la plus haute possible ; du bas : la plus basse. C'est le
+    /// `vm_unmapped_area` de Linux et son `align_mask` (qui sert aux
+    /// grandes pages, et aux exécutables qui demandent un alignement :
+    /// `p_align`, 6c).
+    pub fn trou(&self, taille: u64, plancher: u64, plafond: u64, ecart: u64, alignement: u64, sens: Sens) -> Option<u64> {
+        if taille == 0
+            || !alignee(taille)
+            || alignement < PAGE
+            || !alignement.is_power_of_two()
+            || plafond < plancher
+            || plafond - plancher < taille
+        {
             return None;
         }
         // Le trou sous la zone i va de la fin de la zone i - 1 (ou de 0)
@@ -347,17 +356,28 @@ impl Zones {
             let haut = self.zones.get(i).map_or(u64::MAX, |z| z.debut_garde(ecart));
             (bas.max(plancher), haut.min(plafond))
         };
-        let assez = |(bas, haut): (u64, u64)| haut > bas && haut - bas >= taille;
+        // La place qui convient dans le trou [bas, haut[ : la plus haute ou
+        // la plus basse adresse alignée où `taille` octets tiennent.
+        let place = |(bas, haut): (u64, u64)| -> Option<u64> {
+            if haut <= bas || haut - bas < taille {
+                return None;
+            }
+            let a = match sens {
+                Sens::DuHaut => (haut - taille) & !(alignement - 1),
+                Sens::DuBas => bas.checked_next_multiple_of(alignement)?,
+            };
+            (a >= bas && a.checked_add(taille)? <= haut).then_some(a)
+        };
         match sens {
             Sens::DuHaut => {
                 // Le premier trou à regarder est sous la première zone qui
                 // finit après le plafond.
                 let premier = self.indice_apres(plafond);
-                (0..=premier).rev().map(bornes).find(|&b| assez(b)).map(|(_, haut)| haut - taille)
+                (0..=premier).rev().map(bornes).find_map(place)
             }
             Sens::DuBas => {
                 let premier = self.indice_apres(plancher);
-                (premier..=self.zones.len()).map(bornes).find(|&b| assez(b)).map(|(bas, _)| bas)
+                (premier..=self.zones.len()).map(bornes).find_map(place)
             }
         }
     }
@@ -922,20 +942,41 @@ mod tests {
         let c = carte(&[anonyme(10, 20, RW), anonyme(30, 40, RW), pile(90, 100)]);
         // Du haut, sous un plafond de 100 pages : la pile réserve 4 pages
         // sous elle, le trou le plus haut finit donc à 86.
-        assert_eq!(c.trou(5 * PAGE, 0, 100 * PAGE, ecart, Sens::DuHaut), Some(81 * PAGE));
+        assert_eq!(c.trou(5 * PAGE, 0, 100 * PAGE, ecart, PAGE, Sens::DuHaut), Some(81 * PAGE));
         // Un trou de 10 pages tient tout juste entre 20 et 30.
-        assert_eq!(c.trou(10 * PAGE, 0, 30 * PAGE, ecart, Sens::DuHaut), Some(20 * PAGE));
+        assert_eq!(c.trou(10 * PAGE, 0, 30 * PAGE, ecart, PAGE, Sens::DuHaut), Some(20 * PAGE));
         // 11 pages : nulle part sous 30 ; 10 pages sous 20 : seulement
         // tout en bas, et plus du tout au-dessus d'un plancher.
-        assert_eq!(c.trou(11 * PAGE, 0, 30 * PAGE, ecart, Sens::DuHaut), None);
-        assert_eq!(c.trou(10 * PAGE, 0, 20 * PAGE, ecart, Sens::DuHaut), Some(0));
-        assert_eq!(c.trou(10 * PAGE, PAGE, 20 * PAGE, ecart, Sens::DuHaut), None);
+        assert_eq!(c.trou(11 * PAGE, 0, 30 * PAGE, ecart, PAGE, Sens::DuHaut), None);
+        assert_eq!(c.trou(10 * PAGE, 0, 20 * PAGE, ecart, PAGE, Sens::DuHaut), Some(0));
+        assert_eq!(c.trou(10 * PAGE, PAGE, 20 * PAGE, ecart, PAGE, Sens::DuHaut), None);
         // Du bas, au-dessus d'un plancher.
-        assert_eq!(c.trou(5 * PAGE, 12 * PAGE, 100 * PAGE, ecart, Sens::DuBas), Some(20 * PAGE));
-        assert_eq!(c.trou(20 * PAGE, 12 * PAGE, 100 * PAGE, ecart, Sens::DuBas), Some(40 * PAGE));
+        assert_eq!(c.trou(5 * PAGE, 12 * PAGE, 100 * PAGE, ecart, PAGE, Sens::DuBas), Some(20 * PAGE));
+        assert_eq!(c.trou(20 * PAGE, 12 * PAGE, 100 * PAGE, ecart, PAGE, Sens::DuBas), Some(40 * PAGE));
         // Au-dessus de la pile : pas d'écart à garder.
-        assert_eq!(c.trou(PAGE, 95 * PAGE, 200 * PAGE, ecart, Sens::DuBas), Some(100 * PAGE));
-        assert_eq!(c.trou(0, 0, 200 * PAGE, ecart, Sens::DuBas), None);
+        assert_eq!(c.trou(PAGE, 95 * PAGE, 200 * PAGE, ecart, PAGE, Sens::DuBas), Some(100 * PAGE));
+        assert_eq!(c.trou(0, 0, 200 * PAGE, ecart, PAGE, Sens::DuBas), None);
+        // Alignés : du haut, sous 86 pages, un trou de 5 pages aligné sur 8
+        // pages commence à 80 ; sur 64 pages, à 64 ; entre 20 et 30, un
+        // trou de 2 pages aligné sur 8 : 24 ; de 4 pages sur 16 : aucun
+        // dans ce trou (16 et 32 n'y sont pas), 0 en dessous.
+        assert_eq!(c.trou(5 * PAGE, 0, 100 * PAGE, ecart, 8 * PAGE, Sens::DuHaut), Some(80 * PAGE));
+        assert_eq!(c.trou(5 * PAGE, 0, 100 * PAGE, ecart, 64 * PAGE, Sens::DuHaut), Some(64 * PAGE));
+        assert_eq!(c.trou(2 * PAGE, 0, 30 * PAGE, ecart, 8 * PAGE, Sens::DuHaut), Some(24 * PAGE));
+        assert_eq!(c.trou(4 * PAGE, 0, 30 * PAGE, ecart, 16 * PAGE, Sens::DuHaut), Some(0));
+        // Du bas : au-dessus de 12, aligné sur 8 pages : 24 (20 ne l'est pas).
+        assert_eq!(c.trou(5 * PAGE, 12 * PAGE, 100 * PAGE, ecart, 8 * PAGE, Sens::DuBas), Some(24 * PAGE));
+        // Un alignement qui n'est pas une puissance de deux, ou plus petit
+        // qu'une page : refusé.
+        assert_eq!(c.trou(PAGE, 0, 100 * PAGE, ecart, 3 * PAGE, Sens::DuHaut), None);
+        assert_eq!(c.trou(PAGE, 0, 100 * PAGE, ecart, PAGE / 2, Sens::DuHaut), None);
+        // Un alignement immense : du haut, la seule adresse alignée sous le
+        // plafond, 0, si elle est libre ; du bas, 2^63, la première au-dessus
+        // du plancher ; et rien au-dessus de 2^63 : l'arrondi suivant
+        // déborderait (il est vérifié, il ne fait pas le tour de 2^64).
+        assert_eq!(c.trou(PAGE, 0, 100 * PAGE, ecart, 1 << 63, Sens::DuHaut), Some(0));
+        assert_eq!(c.trou(PAGE, PAGE, u64::MAX / PAGE * PAGE, ecart, 1 << 63, Sens::DuBas), Some(1 << 63));
+        assert_eq!(c.trou(PAGE, (1 << 63) + PAGE, u64::MAX / PAGE * PAGE, ecart, 1 << 63, Sens::DuBas), None);
         assert!(c.libre(80 * PAGE, 86 * PAGE, ecart));
         assert!(!c.libre(80 * PAGE, 87 * PAGE, ecart));
         assert!(!c.libre(15 * PAGE, 16 * PAGE, ecart));

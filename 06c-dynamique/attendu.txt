@@ -21,8 +21,8 @@ rendues et recollees : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
-[noyau] Archive deballee : dossiers 5, fichiers 15, liens symboliques 2, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 12 commandes.
+[noyau] Archive deballee : dossiers 5, fichiers 16, liens symboliques 2, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 13 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -37,7 +37,7 @@ memoire rendue : ok.
 [wasm] lecteur : etc/lien-absolu refuse (EPERM) : ok
 [wasm] lecteur : le 3 ferme puis repris n'est plus pre-ouvert : ok
 [noyau] lecteur.wasm : termine, code de sortie 0
-[noyau] bonjour-asm : programme Linux (ELF), 
+[noyau] bonjour-asm : programme Linux (ELF ET_EXEC), 
         0x00401000-0x00401024 r-x (36 octets du fichier)
         en-tetes de programme a 0x400040 (3 de 56 octets), tas a partir de 0x403000, code en place : ok.
 [linux] Bonjour depuis l'anneau 3
@@ -57,7 +57,14 @@ memoire rendue : ok.
 [linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c
 [linux] Somme des 10000 premiers carres (malloc) : 333283335000
 [linux] Taille de page (AT_PAGESZ) : 4096
+[linux] /bin/bonjour-c : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
 [noyau] bonjour-c : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] bonjour-c-pie : programme Linux (ELF ET_DYN), 
+tout en haut sous la base des projections : ok.
+tas a partir de 0x555555555000, code en place : ok.
+[linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c-pie
+[linux] /bin/bonjour-c-pie : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
+[noyau] bonjour-c-pie : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] memoire : 8 Gio reserves (MAP_NORESERVE), trois pages ecrites loin l'une de l'autre, rendus : ok
 [linux] memoire : 64 Gio reserves puis rendus d'un seul munmap : ok
 [linux] memoire : toutes les verifications : ok

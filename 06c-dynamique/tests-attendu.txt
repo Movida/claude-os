@@ -69,7 +69,8 @@
 [noyau] brk-boucle : termine, code de sortie 152 ; memoire rendue : ok.
 [noyau] wx : programme Linux refuse : segment 0 : inscriptible et executable (W+X)
 [noyau] derniere-page : programme Linux refuse : segment 0 : hors des adresses permises
-[noyau] et-dyn : programme Linux refuse : ELF ET_DYN : pas encore pris en charge
+[noyau] et-dyn : programme Linux (ELF ET_DYN), 
+[noyau] et-dyn : termine, code de sortie 42 ; memoire rendue : ok.
 [noyau] tronque : programme Linux refuse : fichier ELF tronque
 [linux] Bonjour depuis l'anneau 3
 [noyau] bonjour-asm : termine, code de sortie 42 ; memoire rendue : ok.

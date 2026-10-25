@@ -42,7 +42,7 @@ use crate::descripteurs::Fichier;
 use crate::espace_utilisateur;
 use crate::memoire::{self, Memoire};
 use crate::programmes::NomCourt;
-use formats::elf::{Entete, Image, Plage};
+use formats::elf::{Entete, Executable, Genre, Image, Plage};
 use zones::{Drapeaux, Droits, Nature, Projection, Zone};
 
 /// Les adresses que les segments d'un programme ont le droit d'occuper,
@@ -57,14 +57,19 @@ pub const PERMISES: Plage = Plage { debut: espace_utilisateur::ADRESSE_MIN, fin:
 /// Un programme chargé, prêt à partir.
 pub struct Programme {
     pub memoire: Memoire,
-    /// Le point d'entrée.
+    /// Où il commence (le RIP de départ) : le point d'entrée du programme,
+    /// ou celui de son interpréteur s'il en a un (6c).
+    pub depart: u64,
+    /// Le point d'entrée du programme lui-même (AT_ENTRY) : ld-linux s'en
+    /// sert pour lui donner la main ; il reconnaît aussi à lui qu'on l'a
+    /// lancé directement (AT_ENTRY est alors son propre point d'entrée).
     pub entree: u64,
+    /// Où est posé l'interpréteur (AT_BASE), 0 sans interpréteur.
+    pub base_interpreteur: u64,
     /// Pour le vecteur auxiliaire (AT_PHDR, AT_PHNUM, AT_PHENT).
     pub adresse_entetes: Option<u64>,
     pub nombre_entetes: usize,
     pub taille_entete: usize,
-    /// La fin du dernier segment (le tas commence à la page suivante).
-    pub fin: u64,
     /// Le sommet de sa pile.
     pub sommet_pile: u64,
 }
@@ -75,12 +80,23 @@ pub struct Programme {
 /// est ramenée à ce qui est occupé, plus PILE_INITIALE.
 pub const PLACE_ARGUMENTS: u64 = memoire::PILE_MAX / 4;
 
-/// Pourquoi un fichier n'a pas pu être vérifié.
+/// Pourquoi un fichier n'a pas pu être vérifié, ou chargé.
 pub enum Refus {
     /// Ce que dit la bibliothèque des formats.
     Format(formats::elf::Erreur),
     /// Plus de mémoire pour la copie de la table.
     PlusDeMemoire,
+    /// Aucune place libre pour l'image d'un ET_DYN (ENOMEM).
+    PasDePlace,
+    /// L'espace du programme : plus de mémoire pour ses tables ou ses
+    /// zones.
+    Espace(espace_utilisateur::Erreur),
+}
+
+impl From<espace_utilisateur::Erreur> for Refus {
+    fn from(e: espace_utilisateur::Erreur) -> Self {
+        Refus::Espace(e)
+    }
 }
 
 // Affiché par le noyau : sans accents.
@@ -89,6 +105,8 @@ impl fmt::Display for Refus {
         match self {
             Refus::Format(e) => write!(f, "{e}"),
             Refus::PlusDeMemoire => f.write_str("plus de memoire pour la table des en-tetes"),
+            Refus::PasDePlace => f.write_str("pas de place pour l'image (ENOMEM)"),
+            Refus::Espace(e) => write!(f, "{e}"),
         }
     }
 }
@@ -115,14 +133,38 @@ pub fn verifier(taille: u64, lire: impl Fn(u64, &mut [u8]) -> bool) -> Result<(E
     Ok((entete, table))
 }
 
-/// Charge l'exécutable vérifié et placé `executable`, du fichier ouvert `fichier`,
-/// dans un espace d'adressage neuf : chaque zone de segment tient le
-/// fichier (une référence). En cas d'échec (plus de mémoire), tout ce qui a
-/// été pris est rendu (l'espace et ses zones sont détruits en sortant de la
-/// fonction).
-pub fn charger(executable: &Image, nom: NomCourt, fichier: Fichier) -> Result<Programme, espace_utilisateur::Erreur> {
-    let mut memoire = Memoire::creer(nom)?;
-    for segment in executable.segments() {
+/// Où poser l'image d'un exécutable vérifié, dans l'espace `memoire` (le
+/// `load_bias` de Linux, load_elf_binary), et l'image posée :
+///   - un ET_EXEC : à ses propres adresses ;
+///   - un ET_DYN sans interpréteur (un `gcc -static-pie`, ou ld-linux
+///     lancé directement) : comme une projection, du haut vers le bas sous
+///     la base des projections, à une adresse multiple de son alignement,
+///     la première adresse de son fichier pour suggestion si l'image y
+///     tient dans les adresses permises (Linux : un `load_bias` de 0,
+///     l'adresse laissée à mmap ; chez lui, une suggestion dans la région
+///     de la pile tombe sur la pile, déjà là, et mmap passe au trou du
+///     haut ; ici, la pile n'est posée qu'après, d'où la condition). Linux le fait ainsi
+///     pour qu'ld-linux, lancé à la main, ne tombe pas là où il posera
+///     ensuite le programme.
+/// L'étendue entière est cherchée d'un bloc (le `total_mapping_size` de
+/// Linux) : les écarts entre segments ne bougent pas, et les trous entre
+/// eux restent vides.
+fn placer<'a>(memoire: &Memoire, executable: &Executable<'a>) -> Result<Image<'a>, Refus> {
+    let (premiere, fin) = executable.etendue();
+    let debut = match executable.genre() {
+        Genre::Fixe => premiere,
+        Genre::Relogeable => {
+            let suggestion = if fin <= PERMISES.fin { premiere } else { 0 };
+            memoire.chercher_place_alignee(fin - premiere, suggestion, executable.alignement()).ok_or(Refus::PasDePlace)?
+        }
+    };
+    executable.placer(debut, PERMISES).map_err(Refus::Format)
+}
+
+/// Pose les segments de l'image `image`, du fichier ouvert `fichier`, dans
+/// `memoire` : chaque zone de segment tient le fichier (une référence).
+fn poser(memoire: &mut Memoire, image: &Image, fichier: Fichier) -> Result<(), espace_utilisateur::Erreur> {
+    for segment in image.segments() {
         let droits = Droits { lecture: true, ecriture: segment.ecriture, execution: segment.execution };
         let (debut, fin) = segment.pages();
         // Les pages qui contiennent une part du fichier : une zone du
@@ -158,6 +200,18 @@ pub fn charger(executable: &Image, nom: NomCourt, fichier: Fichier) -> Result<Pr
             }
         }
     }
+    Ok(())
+}
+
+/// Charge l'exécutable vérifié `executable`, du fichier ouvert `fichier`,
+/// dans un espace d'adressage neuf : son image posée (voir `placer`), sa
+/// pile, son tas. Rend le programme, et l'image (ses adresses absolues).
+/// En cas d'échec, tout ce qui a été pris est rendu (l'espace et ses zones
+/// sont détruits en sortant de la fonction).
+pub fn charger<'a>(executable: &Executable<'a>, nom: NomCourt, fichier: Fichier) -> Result<(Programme, Image<'a>), Refus> {
+    let mut memoire = Memoire::creer(nom)?;
+    let image = placer(&memoire, executable)?;
+    poser(&mut memoire, &image, fichier)?;
     // La pile : inscriptible, une zone qui grandit vers le bas. Aucune page
     // tant que le noyau n'y a rien écrit. Exécutable seulement si le
     // programme le demande (PT_GNU_STACK avec PF_X) : Linux l'accepte, et
@@ -168,23 +222,34 @@ pub fn charger(executable: &Image, nom: NomCourt, fichier: Fichier) -> Result<Pr
     let pile = Zone {
         debut: sommet_pile - PLACE_ARGUMENTS,
         fin: sommet_pile,
-        droits: Droits { lecture: true, ecriture: true, execution: executable.executable().pile_executable() },
+        droits: Droits { lecture: true, ecriture: true, execution: executable.pile_executable() },
         nature: Nature::Pile,
         drapeaux: Drapeaux { vers_le_bas: true, ..Drapeaux::default() },
         fichier: None,
     };
-    memoire.zones.inserer(pile, &mut memoire::references)?;
+    memoire.zones.inserer(pile, &mut memoire::references).map_err(espace_utilisateur::Erreur::from)?;
     // Un tas vide, à la page qui suit le dernier segment (comme Linux sans
-    // ASLR).
-    let tas = executable.fin().next_multiple_of(4096);
+    // ASLR) ; mais pour un ET_DYN sans interpréteur, posé en haut parmi les
+    // projections, à ELF_ET_DYN_BASE arrondi à la page supérieure
+    // (0x555555555000) : juste au-dessus de lui, le tas buterait vite
+    // contre la pile. C'est ce que fait Linux 6.18 (fs/binfmt_elf.c,
+    // load_elf_binary : `if (!IS_ENABLED(CONFIG_COMPAT_BRK) &&
+    // IS_ENABLED(CONFIG_ARCH_HAS_ELF_RANDOMIZE) && elf_ex->e_type == ET_DYN
+    // && !interpreter) elf_brk = ELF_ET_DYN_BASE;`), avec ou sans ASLR.
+    let tas = match executable.genre() {
+        Genre::Relogeable => memoire::disposition().base_pie.next_multiple_of(4096),
+        Genre::Fixe => image.fin().next_multiple_of(4096),
+    };
     (memoire.debut_tas, memoire.fin_tas) = (tas, tas);
-    Ok(Programme {
+    let programme = Programme {
         memoire,
-        entree: executable.entree(),
-        adresse_entetes: executable.adresse_entetes(),
-        nombre_entetes: executable.executable().nombre_entetes(),
-        taille_entete: executable.executable().taille_entete(),
-        fin: executable.fin(),
+        depart: image.entree(),
+        entree: image.entree(),
+        base_interpreteur: 0,
+        adresse_entetes: image.adresse_entetes(),
+        nombre_entetes: executable.nombre_entetes(),
+        taille_entete: executable.taille_entete(),
         sommet_pile,
-    })
+    };
+    Ok((programme, image))
 }

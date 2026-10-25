@@ -75,13 +75,21 @@ pub struct Disposition {
     /// moins 128 Mio : ici 8 + 1 Mio, donc 128 Mio. La pile peut toujours
     /// grandir jusqu'à sa limite sans rencontrer personne.
     pub base_mmap: u64,
+    /// Où vont les exécutables ET_DYN qui ont un interpréteur (les PIE),
+    /// et le tas de ceux qui n'en ont pas (static-pie, ld-linux lancé
+    /// directement) : les deux tiers des adresses, l'ELF_ET_DYN_BASE de
+    /// Linux (DEFAULT_MAP_WINDOW / 3 * 2, soit 0x555555554aaa : ni arrondi
+    /// à la page, Linux l'arrondit à l'usage). Loin sous les projections,
+    /// loin au-dessus des ET_EXEC (0x400000) : un programme et ld-linux
+    /// lancé à la main ne se marchent pas dessus.
+    pub base_pie: u64,
 }
 
 pub const fn disposition() -> Disposition {
     let sommet_pile = espace_utilisateur::ADRESSE_MAX;
     let ecart = PILE_MAX + ECART_GARDE;
     let ecart = if ecart < 128 << 20 { 128 << 20 } else { ecart };
-    Disposition { sommet_pile, base_mmap: sommet_pile - ecart }
+    Disposition { sommet_pile, base_mmap: sommet_pile - ecart, base_pie: sommet_pile / 3 * 2 }
 }
 
 /// Une zone privée inscriptible de `octets` octets peut-elle être promise ?
@@ -314,18 +322,33 @@ impl Memoire {
     /// en dessous (round_hint_to_min), comme Linux (mesuré : 0x30000123
     /// donne 0x30000000, 0x1234 donne 0x10000).
     pub fn chercher_place(&self, taille: u64, suggestion: u64) -> Option<u64> {
+        self.chercher_place_alignee(taille, suggestion, PAGE)
+    }
+
+    /// La même, à une adresse multiple de `alignement` (une puissance de
+    /// deux, une page au moins) : pour un exécutable ET_DYN qui demande un
+    /// alignement (son `p_align`, 6c). Une suggestion qui n'est pas alignée
+    /// est ignorée. (Linux, pour un static-pie aligné, projette l'image où
+    /// mmap la met, puis arrondit l'adresse en dessous et la reprojette en
+    /// MAP_FIXED_NOREPLACE, ce qui échoue si l'arrondi tombe sur une autre
+    /// zone ; chercher d'emblée un trou aligné, comme le fait mmap pour les
+    /// grandes pages, ne peut pas échouer ainsi.)
+    pub fn chercher_place_alignee(&self, taille: u64, suggestion: u64, alignement: u64) -> Option<u64> {
         use espace_utilisateur::{ADRESSE_MAX, ADRESSE_MIN};
         if suggestion != 0 {
             let a = (suggestion & !(PAGE - 1)).max(ADRESSE_MIN);
-            if a.checked_add(taille).is_some_and(|fin| fin <= ADRESSE_MAX) && self.zones.libre(a, a + taille, ECART_GARDE) {
+            if a % alignement == 0
+                && a.checked_add(taille).is_some_and(|fin| fin <= ADRESSE_MAX)
+                && self.zones.libre(a, a + taille, ECART_GARDE)
+            {
                 return Some(a);
             }
         }
         // Le TASK_UNMAPPED_BASE de Linux : le tiers des adresses.
         let base_ascendante = (ADRESSE_MAX / 3).next_multiple_of(PAGE);
         self.zones
-            .trou(taille, ADRESSE_MIN, disposition().base_mmap, ECART_GARDE, Sens::DuHaut)
-            .or_else(|| self.zones.trou(taille, base_ascendante, ADRESSE_MAX, ECART_GARDE, Sens::DuBas))
+            .trou(taille, ADRESSE_MIN, disposition().base_mmap, ECART_GARDE, alignement, Sens::DuHaut)
+            .or_else(|| self.zones.trou(taille, base_ascendante, ADRESSE_MAX, ECART_GARDE, alignement, Sens::DuBas))
     }
 
     /// Ajoute la zone `zone` (mmap). Avec `remplacer` (MAP_FIXED), ce qui

@@ -97,6 +97,8 @@ boot.bin: programmes.cpio FORCE
 #   - bonjour-c : gcc -static, avec la glibc de la machine (libc.a, du
 #     paquet libc6-dev). -O2 et les avertissements, comme un programme
 #     ordinaire ;
+#   - bonjour-c-pie : le même en gcc -static-pie, un ET_DYN sans
+#     interpréteur, qui se reloge lui-même (6c) ;
 #   - memoire : gcc -static, les appels de la mémoire (mmap, munmap,
 #     mprotect, madvise) contre ce qu'en fait Linux : make tests-hote le
 #     lance aussi sur l'hôte, où chaque vérification doit dire « ok » ;
@@ -201,8 +203,10 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 #   - wx : un segment W+X (ld -N) ;
 #   - derniere-page : des segments dans les dernières pages de la moitié
 #     basse (là où est la pile, et dans la page interdite) ;
-#   - et-dyn : un exécutable indépendant de la position (ld -pie) ;
-#   - tronque : les 40 premiers octets d'un exécutable.
+#   - tronque : les 40 premiers octets d'un exécutable ;
+# et un qu'il refusait jusqu'en 6b, et doit maintenant placer lui-même :
+#   - et-dyn : un exécutable indépendant de la position, sans
+#     interpréteur ni relocations (ld -pie --no-dynamic-linker).
 # Puis le lanceur (/etc/demarrage) : lecteur.wasm sans dossier pré-ouvert
 # (il doit le dire) ; ses lignes refusées, chacune avec son numéro, sont
 # en tête du fichier (voir tests-demarrage.txt). Enfin bonjour-asm, pour
@@ -274,7 +278,7 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
 # puis lance ce que dit son /etc/demarrage (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments FORCE
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
 	sh archive.sh $@ archive.txt
