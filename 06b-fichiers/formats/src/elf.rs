@@ -25,6 +25,17 @@
 //! fichier piégé ne doit ni faire lire le noyau hors du fichier, ni lui
 //! faire projeter une page hors des adresses permises (la moitié haute est
 //! au noyau !), ni écraser une page par une autre.
+//!
+//! La bibliothèque ne voit jamais le fichier entier (6b) : il peut faire
+//! 291 Mo (`claude`), et il est fait des pages éparses du système de
+//! fichiers. Comme Linux (`load_elf_binary`, puis `load_elf_phdrs`), on lit
+//! en deux temps : l'en-tête de 64 octets (`lire_entete`), qui dit où est
+//! la table des en-têtes de programme ; puis cette table, avec la taille du
+//! fichier pour borner les segments (`lire_entetes`). Le noyau lit chaque
+//! morceau dans un tampon à lui : la vérification porte sur une COPIE, que
+//! personne ne peut changer ensuite (un fichier, lui, peut être réécrit
+//! entre la vérification et l'usage). Un segment dit seulement où sont ses
+//! octets dans le fichier ; c'est le noyau qui les lit, ou les projette.
 
 use core::fmt;
 
@@ -115,19 +126,22 @@ impl fmt::Display for Erreur {
 
 /// Un segment à charger (PT_LOAD), vérifié.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Segment<'a> {
+pub struct Segment {
     /// Son adresse (pas forcément alignée sur une page).
     pub adresse: u64,
     /// Sa taille en mémoire (au moins celle de son contenu ; le reste est
     /// à zéro).
     pub taille: u64,
-    /// La part du fichier à copier à `adresse`.
-    pub contenu: &'a [u8],
+    /// La part du fichier qui va à `adresse` : `taille_fichier` octets à la
+    /// position `position` (dans le fichier, vérifié ; même place dans la
+    /// page que `adresse`).
+    pub position: u64,
+    pub taille_fichier: u64,
     pub ecriture: bool,
     pub execution: bool,
 }
 
-impl Segment<'_> {
+impl Segment {
     /// La première page du segment, et la fin de sa dernière page (exclue).
     pub fn pages(&self) -> (u64, u64) {
         // Pas de débordement : vérifié par `lire` (la fin est sous la
@@ -136,12 +150,29 @@ impl Segment<'_> {
     }
 }
 
-/// Un exécutable vérifié.
+/// L'en-tête d'un exécutable, vérifié : où lire sa table des en-têtes de
+/// programme.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Entete {
+    entree: u64,
+    position_entetes: u64,
+    nombre_entetes: usize,
+}
+
+impl Entete {
+    /// La position de la table des en-têtes de programme dans le fichier,
+    /// et sa taille (au plus 64 Kio).
+    pub fn table(&self) -> (u64, usize) {
+        (self.position_entetes, self.nombre_entetes * TAILLE_ENTETE_PROGRAMME)
+    }
+}
+
+/// Un exécutable vérifié : son en-tête, et (une copie de) sa table des
+/// en-têtes de programme.
 #[derive(Debug, Clone, Copy)]
 pub struct Executable<'a> {
-    octets: &'a [u8],
+    table: &'a [u8],
     entree: u64,
-    position_entetes: usize,
     nombre_entetes: usize,
     adresse_entetes: Option<u64>,
 }
@@ -168,10 +199,10 @@ struct EnteteProgramme {
 }
 
 impl Executable<'_> {
-    /// Le i-ième en-tête de programme. Sa place dans le fichier a été
-    /// vérifiée par `lire`.
+    /// Le i-ième en-tête de programme (la taille de la table a été
+    /// vérifiée par `lire_entetes`).
     fn entete(&self, i: usize) -> EnteteProgramme {
-        let o = &self.octets[self.position_entetes + i * TAILLE_ENTETE_PROGRAMME..][..TAILLE_ENTETE_PROGRAMME];
+        let o = &self.table[i * TAILLE_ENTETE_PROGRAMME..][..TAILLE_ENTETE_PROGRAMME];
         let champ32 = |j| u32_a(o, j).unwrap_or(0);
         let champ64 = |j| u64_a(o, j).unwrap_or(0);
         EnteteProgramme {
@@ -211,23 +242,20 @@ impl<'a> Executable<'a> {
     /// Les segments à charger, dans l'ordre croissant des adresses, sans
     /// page commune. (Les PT_LOAD de taille nulle, qui n'occupent rien,
     /// sont omis.)
-    pub fn segments(&self) -> impl Iterator<Item = Segment<'a>> + '_ {
+    pub fn segments(&self) -> impl Iterator<Item = Segment> + '_ {
         (0..self.nombre_entetes).filter_map(move |i| {
             let e = self.entete(i);
             if e.genre != PT_LOAD || e.taille_memoire == 0 {
                 return None;
             }
-            // Bornes vérifiées par `lire` (sauf pour un segment sans octets
-            // du fichier, dont la position ne compte pas).
-            let octets: &'a [u8] = self.octets;
-            let contenu = match e.taille_fichier {
-                0 => &[][..],
-                n => &octets[e.position as usize..(e.position + n) as usize],
-            };
+            // Bornes vérifiées par `lire_entetes`. Un segment sans octets du
+            // fichier (que du .bss) : sa position ne compte pas, on la met à
+            // 0.
             Some(Segment {
                 adresse: e.adresse,
                 taille: e.taille_memoire,
-                contenu,
+                position: if e.taille_fichier == 0 { 0 } else { e.position },
+                taille_fichier: e.taille_fichier,
                 ecriture: e.drapeaux & PF_W != 0,
                 execution: e.drapeaux & PF_X != 0,
             })
@@ -256,9 +284,24 @@ impl<'a> Executable<'a> {
     }
 }
 
-/// Vérifie l'exécutable `octets`, destiné aux adresses `permises`.
+/// Vérifie l'exécutable `octets`, en entier en mémoire, destiné aux
+/// adresses `permises` : `lire_entete` puis `lire_entetes`, sur les
+/// morceaux du fichier. (Pour les tests, et pour qui a le fichier d'un
+/// seul tenant.)
 pub fn lire(octets: &[u8], permises: Plage) -> Result<Executable<'_>, Erreur> {
-    let entete = octets.get(..TAILLE_ENTETE).ok_or(Erreur::Tronque)?;
+    let entete = lire_entete(octets)?;
+    let (position, taille) = entete.table();
+    let table = usize::try_from(position)
+        .ok()
+        .and_then(|p| octets.get(p..p.checked_add(taille)?))
+        .ok_or(Erreur::Tronque)?;
+    lire_entetes(&entete, table, octets.len() as u64, permises)
+}
+
+/// Vérifie l'en-tête d'un exécutable : `premiers`, les premiers octets du
+/// fichier (au moins 64). Rend où lire la table des en-têtes de programme.
+pub fn lire_entete(premiers: &[u8]) -> Result<Entete, Erreur> {
+    let entete = premiers.get(..TAILLE_ENTETE).ok_or(Erreur::Tronque)?;
     if entete[..4] != *b"\x7fELF" {
         return Err(Erreur::PasElf);
     }
@@ -294,21 +337,29 @@ pub fn lire(octets: &[u8], permises: Plage) -> Result<Executable<'_>, Erreur> {
     {
         return Err(Erreur::EntetesProgramme);
     }
-    // La table entière doit être dans le fichier.
-    let taille_table = nombre_entetes * TAILLE_ENTETE_PROGRAMME;
-    let position_entetes = usize::try_from(position_entetes).map_err(|_| Erreur::Tronque)?;
-    let fin_table = position_entetes.checked_add(taille_table).ok_or(Erreur::Tronque)?;
-    if fin_table > octets.len() {
+    Ok(Entete { entree, position_entetes, nombre_entetes })
+}
+
+/// Vérifie les en-têtes de programme de l'exécutable d'en-tête `entete` :
+/// `table`, une copie de la table qu'il désigne, lue dans un fichier de
+/// `taille_fichier` octets. Les segments doivent être dans le fichier et
+/// dans les adresses `permises`.
+pub fn lire_entetes<'a>(entete: &Entete, table: &'a [u8], taille_fichier: u64, permises: Plage)
+    -> Result<Executable<'a>, Erreur> {
+    let (position_entetes, taille_table) = entete.table();
+    // La table entière doit être dans le fichier, et c'est elle qu'on a.
+    let fin_table = position_entetes.checked_add(taille_table as u64).ok_or(Erreur::Tronque)?;
+    if fin_table > taille_fichier || table.len() != taille_table {
         return Err(Erreur::Tronque);
     }
-    let mut executable =
-        Executable { octets, entree, position_entetes, nombre_entetes, adresse_entetes: None };
+    let entree = entete.entree;
+    let mut executable = Executable { table, entree, nombre_entetes: entete.nombre_entetes, adresse_entetes: None };
 
     // Les segments, un par un.
     let mut fin_precedent = 0u64; // Fin (arrondie à la page) du PT_LOAD précédent.
     let mut entree_trouvee = false;
     let mut segments = 0;
-    for numero in 0..nombre_entetes {
+    for numero in 0..entete.nombre_entetes {
         let e = executable.entete(numero);
         if e.genre == PT_INTERP {
             return Err(Erreur::Interpreteur);
@@ -325,7 +376,7 @@ pub fn lire(octets: &[u8], permises: Plage) -> Result<Executable<'_>, Erreur> {
         // deux vérifications qui suivent ne valent que pour les autres.
         let fin_fichier = match e.position.checked_add(e.taille_fichier) {
             _ if e.taille_fichier == 0 => 0,
-            Some(f) if f <= octets.len() as u64 => f,
+            Some(f) if f <= taille_fichier => f,
             _ => return refus("hors du fichier"),
         };
         if e.taille_memoire == 0 {
@@ -363,8 +414,8 @@ pub fn lire(octets: &[u8], permises: Plage) -> Result<Executable<'_>, Erreur> {
             entree_trouvee = true;
         }
         // Les en-têtes de programme sont-ils chargés par ce segment ?
-        if e.position <= position_entetes as u64 && fin_table as u64 <= fin_fichier {
-            executable.adresse_entetes = Some(e.adresse + (position_entetes as u64 - e.position));
+        if e.position <= position_entetes && fin_table <= fin_fichier {
+            executable.adresse_entetes = Some(e.adresse + (position_entetes - e.position));
         }
         fin_precedent = fin;
         segments += 1;
@@ -427,8 +478,10 @@ mod tests {
         assert_eq!(x.entree(), 0x401004);
         let s: Vec<_> = x.segments().collect();
         assert_eq!(s.len(), 2);
-        assert_eq!((s[0].adresse, s[0].taille, s[0].contenu.len(), s[0].ecriture, s[0].execution), (0x401000, 16, 16, false, true));
-        assert_eq!((s[1].adresse, s[1].taille, s[1].contenu.len(), s[1].ecriture, s[1].execution), (0x402000, 0x100, 8, true, false));
+        assert_eq!((s[0].adresse, s[0].taille, s[0].position, s[0].taille_fichier, s[0].ecriture, s[0].execution),
+                   (0x401000, 16, 0x1000, 16, false, true));
+        assert_eq!((s[1].adresse, s[1].taille, s[1].position, s[1].taille_fichier, s[1].ecriture, s[1].execution),
+                   (0x402000, 0x100, 0x2000, 8, true, false));
         assert_eq!(s[1].pages(), (0x402000, 0x403000));
         assert_eq!(x.fin(), 0x402100);
         // Les en-têtes (position 64) ne sont dans aucun segment.
@@ -555,7 +608,7 @@ mod tests {
             entete(&mut o, 1, PT_LOAD, 6, position, 0x402000, 0, 0x100);
             let x = lire(&o, PERMISES).unwrap();
             let s: Vec<_> = x.segments().collect();
-            assert_eq!((s[1].adresse, s[1].taille, s[1].contenu.len()), (0x402000, 0x100, 0));
+            assert_eq!((s[1].adresse, s[1].taille, s[1].position, s[1].taille_fichier), (0x402000, 0x100, 0, 0));
         }
         // Un PT_LOAD de taille nulle en mémoire n'occupe rien : omis, où
         // qu'il prétende être.
@@ -608,6 +661,28 @@ mod tests {
         let mut o = exemple();
         entete(&mut o, 1, PT_LOAD, 6, 0, 0x402000, 0x200, 0x200);
         assert_eq!(lire(&o, PERMISES).unwrap().adresse_entetes(), Some(0x402040));
+    }
+
+    /// Le noyau lit l'en-tête, puis une copie de la table, avec la taille du
+    /// fichier : les segments sont bornés par elle, et la table doit être
+    /// celle que désigne l'en-tête.
+    #[test]
+    fn en_deux_temps() {
+        let o = exemple();
+        assert_eq!(lire_entete(&o[..63]), Err(Erreur::Tronque));
+        let e = lire_entete(&o[..64]).unwrap();
+        assert_eq!(e.table(), (64, 2 * 56));
+        let table = &o[64..64 + 112];
+        let x = lire_entetes(&e, table, o.len() as u64, PERMISES).unwrap();
+        assert_eq!(x.segments().count(), 2);
+        // Une table plus courte ou plus longue que celle de l'en-tête.
+        assert_eq!(lire_entetes(&e, &o[64..64 + 111], o.len() as u64, PERMISES).map(|_| ()), Err(Erreur::Tronque));
+        assert_eq!(lire_entetes(&e, &o[64..64 + 113], o.len() as u64, PERMISES).map(|_| ()), Err(Erreur::Tronque));
+        // Un fichier qui s'arrête avant la fin du segment de données
+        // (0x2008), ou avant la fin de la table.
+        assert!(matches!(lire_entetes(&e, table, 0x2007, PERMISES), Err(Erreur::Segment { numero: 1, .. })));
+        assert_eq!(lire_entetes(&e, table, 100, PERMISES).map(|_| ()), Err(Erreur::Tronque));
+        assert!(lire_entetes(&e, table, 0x2008, PERMISES).is_ok());
     }
 
     #[test]

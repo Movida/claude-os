@@ -89,7 +89,24 @@ fn executer(nom: Nom<'static>, octets: &[u8]) {
 /// d'adressage neuf, puis on l'exécute, dans l'anneau 3, jusqu'à ce qu'il se
 /// termine. Son espace est alors détruit, et doit rendre toute sa mémoire.
 fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
-    let executable = match formats::elf::lire(octets, chargeur_elf::PERMISES) {
+    // Le fichier, lu par morceaux : la bibliothèque des formats ne voit que
+    // des copies (chargeur_elf::verifier).
+    let lire = |position: u64, tampon: &mut [u8]| {
+        let debut = position as usize;
+        match octets.get(debut..debut + tampon.len()) {
+            Some(morceau) => {
+                tampon.copy_from_slice(morceau);
+                true
+            }
+            None => false,
+        }
+    };
+    let taille = octets.len() as u64;
+    let (entete, table) = match chargeur_elf::verifier(taille, lire) {
+        Ok(v) => v,
+        Err(e) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
+    };
+    let executable = match formats::elf::lire_entetes(&entete, &table, taille, chargeur_elf::PERMISES) {
         Ok(x) => x,
         Err(e) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
     };
@@ -98,10 +115,10 @@ fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
     for s in executable.segments() {
         afficherln!("        {:#010x}-{:#010x} {}{}{} ({} octets du fichier)",
                     s.adresse, s.adresse + s.taille, 'r',
-                    if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.contenu.len());
+                    if s.ecriture { 'w' } else { '-' }, if s.execution { 'x' } else { '-' }, s.taille_fichier);
     }
     let libres = pages::libres();
-    let mut programme = match chargeur_elf::charger(&executable, nom.0) {
+    let mut programme = match chargeur_elf::charger(&executable, nom.0, lire) {
         Ok(p) => p,
         Err(e) => return afficherln!("[noyau] {} : chargement impossible : {}", nom, e),
     };
@@ -109,13 +126,17 @@ fn executer_elf(nom: Nom<'static>, octets: &[u8]) {
     // celui du fichier.
     // (16 octets au plus : ce qu'il reste du fichier après le point
     // d'entrée, dans son segment.)
-    let attendu = executable
+    let mut attendu = [0u8; 16];
+    let n = executable
         .segments()
-        .find_map(|s| s.contenu.get(programme.entree.checked_sub(s.adresse)? as usize..))
-        .map_or(&[][..], |reste| &reste[..reste.len().min(16)]);
+        .find_map(|s| {
+            let decalage = programme.entree.checked_sub(s.adresse).filter(|&d| d < s.taille_fichier)?;
+            let n = (s.taille_fichier - decalage).min(16) as usize;
+            lire(s.position + decalage, &mut attendu[..n]).then_some(n)
+        })
+        .unwrap_or(0);
     let mut code = [0u8; 16];
-    let code = &mut code[..attendu.len()];
-    let code_ok = programme.memoire.espace.lire(programme.entree, code).is_ok() && code == attendu;
+    let code_ok = programme.memoire.espace.lire(programme.entree, &mut code[..n]).is_ok() && code[..n] == attendu[..n];
     // Le tas commence à la page qui suit le dernier segment.
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,

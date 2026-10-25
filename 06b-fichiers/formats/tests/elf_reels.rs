@@ -49,7 +49,7 @@ fn gcc_statique() {
     assert_eq!(x.adresse_entetes(), Some(segments[0].adresse + 64));
     assert_eq!(x.nombre_entetes(), u16::from_le_bytes([o[56], o[57]]) as usize);
     // Le .bss : plus grand en mémoire que dans le fichier.
-    assert!(segments[3].taille > segments[3].contenu.len() as u64);
+    assert!(segments[3].taille > segments[3].taille_fichier);
     assert_eq!(x.fin(), segments[3].adresse + segments[3].taille);
     // gcc écrit un PT_GNU_STACK sans PF_X : pile non exécutable.
     assert!(!x.pile_executable());
