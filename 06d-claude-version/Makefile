@@ -14,7 +14,9 @@
 #   make texte  -> même chose, mais l'écran VGA s'affiche dans le terminal
 #                  (pratique dans un conteneur sans fenêtre ; quitter : Echap puis 2, puis « quit »)
 #   make test   -> démarre sans écran (DUREE secondes), puis affiche serial.log
-#   make duree  -> le temps qu'il faut laisser au démarrage (pour verifier.sh)
+#   make duree  -> le temps qu'il faut laisser au démarrage (pour verifier.sh),
+#                  et make qemu-disque, make qemu-options : la machine
+#                  (un disque virtio, un processeur Nehalem, 2 Gio)
 #   make debug  -> sans écran, journalise exceptions et reset du CPU dans qemu.log
 #   make capture -> démarre sans écran, puis enregistre l'écran dans ecran.png
 #   make gdb    -> QEMU figé au démarrage, en attente de GDB sur le port 1234
@@ -55,7 +57,18 @@
 # L'image disque : secteur 0 = 1er étage, puis le 2e étage, puis le noyau,
 # puis l'archive de programmes, chacun complété au secteur.
 
-QEMU = qemu-system-x86_64 -drive format=raw,file=boot.bin
+# La machine de l'étape : `claude` demande un processeur qui a SSE4.2 et
+# POPCNT (qemu64 n'en a pas : SIGILL, mesuré en 6a ; Nehalem suffit, sans
+# AVX) et de la mémoire (le tmpfs a droit à la moitié de la machine, et
+# claude pèse 291 Mo : 1 Gio suffit, mesuré, 2 laissent de la marge). Le
+# disque en virtio : le BIOS de QEMU lit un disque IDE mot par mot, 74 s
+# pour les 307 Mo de l'archive, contre 3,8 s en virtio (mesuré sur une
+# machine tranquille, du lancement de QEMU à la dernière ligne du
+# chargeur) ; le chargeur (int 0x13) ne change pas. verifier.sh les demande par
+# `make qemu-disque` et `make qemu-options`.
+QEMU_DISQUE = virtio
+QEMU_OPTIONS = -cpu Nehalem -m 2G
+QEMU = qemu-system-x86_64 -drive format=raw,file=boot.bin,if=$(QEMU_DISQUE) $(QEMU_OPTIONS)
 MON  = /tmp/qemu-mon-os.sock
 NOYAU_ELF = noyau/target/x86_64-unknown-none/release/noyau
 # Le programme WebAssembly de l'archive (bonjour/, compilé par rustc pour
@@ -63,8 +76,8 @@ NOYAU_ELF = noyau/target/x86_64-unknown-none/release/noyau
 BONJOUR = bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm
 
 # Assemble une image disque : $(call image,ELF du noyau,archive,NOM) écrit
-# NOM.bin, en passant par NOM-noyau.bin, NOM-archive.bin et
-# NOM-chargeur.bin.
+# NOM.bin, en passant par NOM-noyau.bin et NOM-chargeur.bin ; l'archive y
+# est recopiée directement, au bout.
 #   - objcopy -O binary retire les en-têtes ELF du noyau et ne garde que
 #     les octets à recopier en mémoire, à partir de 1 Mio ; truncate
 #     complète au secteur ;
@@ -74,12 +87,13 @@ BONJOUR = bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm
 #     linker.ld, moins celle du début du noyau), et la taille de
 #     l'archive (ARCHIVE_OCTETS). Si nm ne trouve pas __bss_fin (le
 #     symbole renommé, un noyau dépouillé), on s'arrête : bash calculerait
-#     sans broncher 0x - 0xffffffff80100000, près de 2 Gio.
+#     sans broncher 0x - 0xffffffff80100000, près de 2 Gio ;
+#   - l'archive va telle quelle au bout de l'image, complétée au secteur
+#     sur l'image elle-même : pas de copie intermédiaire (300 Mo de plus
+#     par image, quand l'archive portera claude).
 define image
 	objcopy -O binary $(1) $(3)-noyau.bin
 	truncate -s %512 $(3)-noyau.bin
-	cp $(2) $(3)-archive.bin
-	truncate -s %512 $(3)-archive.bin
 	fin=$$(nm -P $(1) | awk '$$1 == "__bss_fin" { print $$3 }'); \
 	test -n "$$fin" || { echo "__bss_fin introuvable dans $(1)"; exit 1; }; \
 	nasm -f bin \
@@ -87,7 +101,8 @@ define image
 	  -D NOYAU_MEMOIRE=$$(( 0x$$fin - 0xffffffff80100000 )) \
 	  -D ARCHIVE_OCTETS=$$(stat -c %s $(2)) \
 	  boot.asm -o $(3)-chargeur.bin
-	cat $(3)-chargeur.bin $(3)-noyau.bin $(3)-archive.bin > $(3).bin
+	cat $(3)-chargeur.bin $(3)-noyau.bin $(2) > $(3).bin
+	truncate -s %512 $(3).bin
 endef
 
 # cargo décide lui-même s'il faut recompiler : on l'appelle à chaque fois.
@@ -526,6 +541,13 @@ DUREE = 12
 duree:
 	@echo $(DUREE)
 
+# Pour verifier.sh : l'interface du disque, et les autres options de QEMU.
+qemu-disque:
+	@echo $(QEMU_DISQUE)
+
+qemu-options:
+	@echo $(QEMU_OPTIONS)
+
 test: boot.bin
 	-timeout $(DUREE) $(QEMU) -display none -no-reboot -serial file:serial.log
 	@cat serial.log
@@ -536,6 +558,23 @@ debug: boot.bin
 	@cat serial.log
 	@echo "--- exceptions (v=numero, e=code d'erreur) ---"
 	@grep -E "^ *[0-9]+: v=|Triple fault" qemu.log | grep -v "v=08 e=0000 i=1" | head -20 || true
+
+# Une virgule, à passer dans un argument de $(call), qui les sépare.
+, := ,
+
+# Lance QEMU ($(1), en arrière-plan) et attend que le fichier $(2) (son
+# port série) contienne la ligne $(3), au plus DUREE secondes, puis
+# l'arrête (par son numéro de processus) ; $(4) s'exécute juste avant. Le
+# code de sortie dit si la ligne est venue. Plutôt qu'un délai fixe : un
+# démarrage plus lent (une machine chargée) attend plus, un plus rapide
+# n'attend pas pour rien.
+define attendre
+	rm -f $(2); $(1) & q=$$!; \
+	for i in $$(seq $$(( $(DUREE) * 10 ))); do \
+	  grep -qF -- $(3) $(2) 2>/dev/null && break; kill -0 $$q 2>/dev/null || break; sleep 0.1; \
+	done; \
+	$(4); kill $$q 2>/dev/null; wait $$q 2>/dev/null; grep -F -- $(3) $(2)
+endef
 
 capture: boot.bin
 	rm -f $(MON) ecran.png
@@ -644,15 +683,15 @@ $(WAST2JSON):
 #     pour passer aussi par les chemins « si le processeur l'a » ; avec, en
 #     plus, les lignes propres à chacun (tests-attendu-qemu64.txt,
 #     tests-attendu-max.txt).
-QEMU_TEST = timeout $(DUREE) qemu-system-x86_64 -display none -no-reboot
+#   test-garde et test-gros ne s'éteignent pas : QEMU est arrêté dès que
+#   la ligne cherchée est venue (`attendre`), au lieu d'attendre DUREE.
+QEMU_TEST = qemu-system-x86_64 -display none -no-reboot
 QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
 tests-qemu: test-garde.bin test-gros.bin test-programmes.bin
-	-$(QEMU_TEST) -drive format=raw,file=test-garde.bin -serial file:test-garde.log
-	grep -F "debordement de la pile du noyau" test-garde.log
-	-$(QEMU_TEST) -drive format=raw,file=test-gros.bin -serial file:test-gros.log
-	grep -F "chaque secteur a sa place : ok" test-gros.log
+	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile du noyau",:)
+	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-gros.bin -serial file:test-gros.log,test-gros.log,"chaque secteur a sa place : ok",:)
 	for cpu in qemu64 max; do \
 	  $(QEMU_PROGRAMMES) -cpu $$cpu -serial file:test-programmes-$$cpu.log; code=$$?; \
 	  [ $$code -eq 1 ] || { echo "-cpu $$cpu : QEMU n'a pas ete eteint par le noyau (code $$code)"; exit 1; }; \
@@ -681,12 +720,19 @@ test-programmes.bin: tests.cpio FORCE
 	cd noyau && cargo build --release --features test-programmes --target-dir target/test-programmes 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	$(call image,noyau/target/test-programmes/x86_64-unknown-none/release/noyau,tests.cpio,test-programmes)
 
-test-%.bin: programmes.cpio FORCE
+# Les noyaux de test-garde et test-gros n'ont besoin d'aucun programme :
+# une archive vide, un /etc/demarrage sans commande (celle de démarrage
+# porte claude, 307 Mo, que ces scénarios liraient sur IDE avec 128 Mio ;
+# celle des tests ferait tourner toute la suite pour rien).
+vide.cpio: archive.sh
+	printf 'dir /etc 755 0 0\nfile /etc/demarrage /dev/null 644 0 0\n' | sh archive.sh $@ -
+
+test-%.bin: vide.cpio FORCE
 	cd noyau && cargo build --release --features test-$* --target-dir target/test-$* 2>&1 | tee /dev/stderr | (! grep -q '^warning')
-	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,programmes.cpio,test-$*)
+	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio tests-demarrage.txt serial.log trace.log qemu.log ecran.png test-*.log
+	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio vide.cpio tests-demarrage.txt serial.log trace.log qemu.log ecran.png test-*.log
 	rm -rf $(LINUX)
 	rm -rf $(GLIBC)
 	rm -rf $(SUITE)
@@ -698,4 +744,4 @@ clean:
 	cd zones && cargo clean
 	cd fichiers && cargo clean
 
-.PHONY: run texte test duree debug capture gdb dump trace tests-hote tests-qemu suite clean FORCE
+.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace tests-hote tests-qemu suite clean FORCE
