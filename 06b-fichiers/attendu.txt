@@ -7,6 +7,7 @@
 [noyau] Retour apres int3 : les exceptions sont gerees.
 [noyau] PIC remappe sur les vecteurs 32-47, horloge a 1000 Hz.
 [noyau] 100 ms plus tard : 
+[noyau] Heure (UTC) : 20
 [noyau] Clavier PS/2 pret : tapez du texte.
 [noyau] Carte de la memoire (E820)
 [noyau] Memoire libre : 
@@ -47,3 +48,5 @@ memoire rendue : ok.
 [noyau] memoire : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] Memoire de claude --version rejouee : ok.
 [noyau] claude-version : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] temps : toutes les verifications : ok
+[noyau] temps : termine, code de sortie 0 ; memoire rendue : ok.

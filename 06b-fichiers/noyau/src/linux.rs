@@ -14,7 +14,8 @@
 //! ("/proc/self/exe"), getrandom, brk, mprotect (RELRO), fstat(1), write,
 //! exit_group. Plus writev (les messages d'erreur fatale de la glibc),
 //! ioctl(TCGETS) (isatty), et exit ; et, pour la mémoire de `claude`
-//! (6a), mmap, munmap et madvise (de la mémoire anonyme), sysinfo.
+//! (6a), mmap, munmap et madvise (de la mémoire anonyme), sysinfo ; et
+//! l'heure (6b) : clock_gettime, clock_getres, gettimeofday, time.
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -31,7 +32,7 @@ use crate::espace_utilisateur::ADRESSE_MAX;
 use crate::interruptions::Cadre;
 use crate::memoire::{Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Zone};
-use crate::{aleatoire, console, cpu, horloge, pages, pile, processus, tache};
+use crate::{aleatoire, console, cpu, horloge, pages, pile, processus, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
@@ -56,9 +57,13 @@ const BRK: u64 = 12;
 const IOCTL: u64 = 16;
 const WRITEV: u64 = 20;
 const EXIT: u64 = 60;
+const GETTIMEOFDAY: u64 = 96;
 const SYSINFO: u64 = 99;
 const ARCH_PRCTL: u64 = 158;
+const TIME: u64 = 201;
 const SET_TID_ADDRESS: u64 = 218;
+const CLOCK_GETTIME: u64 = 228;
+const CLOCK_GETRES: u64 = 229;
 const EXIT_GROUP: u64 = 231;
 const READLINKAT: u64 = 267;
 const SET_ROBUST_LIST: u64 = 273;
@@ -109,6 +114,10 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         READLINKAT => -ENOENT,
         GETRANDOM => getrandom(a[0], a[1], a[2]),
         SYSINFO => sysinfo(a[0]),
+        CLOCK_GETTIME => clock_gettime(a[0], a[1]),
+        CLOCK_GETRES => clock_getres(a[0], a[1]),
+        GETTIMEOFDAY => gettimeofday(a[0], a[1]),
+        TIME => time(a[0]),
         // Le code de sortie tient sur 8 bits : Linux ne garde que l'octet
         // bas (exit(256) rend 0, exit(-1) rend 255), ce que verra le futur
         // wait ; les codes 128 + N restent ceux des signaux.
@@ -150,6 +159,10 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         READLINKAT => ("readlinkat", 4),
         GETRANDOM => ("getrandom", 3),
         SYSINFO => ("sysinfo", 1),
+        CLOCK_GETTIME => ("clock_gettime", 2),
+        CLOCK_GETRES => ("clock_getres", 2),
+        GETTIMEOFDAY => ("gettimeofday", 2),
+        TIME => ("time", 1),
         EXIT => ("exit", 1),
         EXIT_GROUP => ("exit_group", 1),
         _ => ("?", 6),
@@ -753,6 +766,73 @@ fn sysinfo(info: u64) -> i64 {
         Ok(()) => 0,
         Err(_) => -EFAULT,
     }
+}
+
+/// Écrit un `struct timespec` (secondes, nanosecondes : deux entiers de 64
+/// bits) à l'adresse `adresse` du programme.
+fn ecrire_timespec(adresse: u64, t: fichiers::Temps) -> Result<(), ()> {
+    let mut octets = [0u8; 16];
+    octets[..8].copy_from_slice(&t.secondes.to_le_bytes());
+    octets[8..].copy_from_slice(&(t.nanosecondes as i64).to_le_bytes());
+    copier_vers_utilisateur(adresse, &octets).map_err(|_| ())
+}
+
+/// clock_gettime(horloge, temps) : l'heure d'une des horloges de Linux
+/// (temps.rs). Une horloge inconnue : EINVAL. Sous Linux, la glibc passe
+/// d'ordinaire par le vDSO, une page du noyau projetée chez le programme
+/// qui lit l'heure sans appel système ; sans vDSO (6m), elle fait l'appel.
+fn clock_gettime(horloge: u64, adresse: u64) -> i64 {
+    let Some(t) = temps::horloge(horloge) else { return -EINVAL };
+    match ecrire_timespec(adresse, t) {
+        Ok(()) => 0,
+        Err(()) => -EFAULT,
+    }
+}
+
+/// clock_getres(horloge, resolution) : la finesse de l'horloge, la durée
+/// d'un tic d'horloge pour toutes (Linux rend une nanoseconde pour ses
+/// horloges fines, la durée d'un tic pour les _COARSE). Le résultat peut
+/// ne pas être demandé (adresse nulle).
+fn clock_getres(horloge: u64, adresse: u64) -> i64 {
+    if temps::horloge(horloge).is_none() {
+        return -EINVAL;
+    }
+    if adresse == 0 {
+        return 0;
+    }
+    match ecrire_timespec(adresse, temps::resolution()) {
+        Ok(()) => 0,
+        Err(()) => -EFAULT,
+    }
+}
+
+/// gettimeofday(temps, fuseau) : la date, en secondes et microsecondes.
+/// Le fuseau (une notion abandonnée, que Linux garde à zéro par défaut) est
+/// rendu à zéro s'il est demandé.
+fn gettimeofday(adresse: u64, fuseau: u64) -> i64 {
+    if adresse != 0 {
+        let t = temps::maintenant();
+        let mut octets = [0u8; 16];
+        octets[..8].copy_from_slice(&t.secondes.to_le_bytes());
+        octets[8..].copy_from_slice(&(t.nanosecondes as i64 / 1000).to_le_bytes());
+        if copier_vers_utilisateur(adresse, &octets).is_err() {
+            return -EFAULT;
+        }
+    }
+    if fuseau != 0 && copier_vers_utilisateur(fuseau, &[0u8; 8]).is_err() {
+        return -EFAULT;
+    }
+    0
+}
+
+/// time(adresse) : la date en secondes, rendue, et écrite à `adresse` si
+/// elle n'est pas nulle.
+fn time(adresse: u64) -> i64 {
+    let secondes = temps::maintenant().secondes;
+    if adresse != 0 && copier_vers_utilisateur(adresse, &secondes.to_le_bytes()).is_err() {
+        return -EFAULT;
+    }
+    secondes
 }
 
 /// Un signal de Linux (include/uapi/asm-generic/signal.h), par lequel un

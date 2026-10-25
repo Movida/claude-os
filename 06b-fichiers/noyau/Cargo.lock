@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "fichiers"
+version = "0.1.0"
+
+[[package]]
 name = "formats"
 version = "0.1.0"
 
@@ -10,6 +14,7 @@ version = "0.1.0"
 name = "noyau"
 version = "0.1.0"
 dependencies = [
+ "fichiers",
  "formats",
  "wasm",
  "zones",

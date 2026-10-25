@@ -14,6 +14,9 @@ formats = { path = "../formats" }
 # La carte des zones des programmes, notre propre bibliothèque, sans
 # unsafe, testée sur l'hôte.
 zones = { path = "../zones" }
+# Le système de fichiers en mémoire (le tmpfs) et la résolution des
+# chemins, notre propre bibliothèque, sans unsafe, testée sur l'hôte.
+fichiers = { path = "../fichiers" }
 
 # Les scénarios de `make tests-qemu` : des versions du noyau qui
 # provoquent exprès une situation à tester (voir src/main.rs).

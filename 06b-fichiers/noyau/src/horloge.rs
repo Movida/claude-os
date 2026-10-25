@@ -34,13 +34,13 @@ use core::sync::atomic::{AtomicU64, Ordering};
 pub const IRQ: u8 = 0;
 
 /// Fréquence du quartz du PIT, en Hz.
-const FREQUENCE_PIT: u32 = 1_193_182;
+pub const FREQUENCE_PIT: u32 = 1_193_182;
 /// Fréquence voulue des tics.
 pub const HZ: u32 = 1000;
 /// 1 193 182 / 1000 = 1193 (arrondi) : en réalité 1000,15 Hz, une dérive
 /// d'environ 13 secondes par jour. Sans importance pour mesurer des
-/// durées courtes ; l'heure du jour viendra plus tard d'une autre source.
-const DIVISEUR: u16 = ((FREQUENCE_PIT + HZ / 2) / HZ) as u16;
+/// durées courtes ; temps.rs compte avec la durée exacte d'un tic.
+pub const DIVISEUR: u16 = ((FREQUENCE_PIT + HZ / 2) / HZ) as u16;
 
 const PIT_CANAL0: u16 = 0x40;
 const PIT_COMMANDE: u16 = 0x43;

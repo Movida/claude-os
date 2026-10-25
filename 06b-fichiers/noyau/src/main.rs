@@ -48,6 +48,7 @@ mod serie;
 mod sse;
 mod tache;
 mod tas;
+mod temps;
 mod verrou;
 mod vga;
 mod wasi;
@@ -242,6 +243,12 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // le réveil et la lecture du compteur.
     horloge::attendre_ms(100);
     afficherln!("[noyau] 100 ms plus tard : {} tics comptes.", horloge::tics());
+    match temps::initialiser() {
+        Some((annee, mois, jour, heure, minute, seconde)) => afficherln!(
+            "[noyau] Heure (UTC) : {annee:04}-{mois:02}-{jour:02} {heure:02}:{minute:02}:{seconde:02}, de l'horloge CMOS."
+        ),
+        None => afficherln!("[noyau] Pas d'horloge CMOS lisible : la date part du 1er janvier 1970."),
+    }
 
     match clavier::initialiser() {
         Ok(()) => afficherln!("[noyau] Clavier PS/2 pret : tapez du texte."),

@@ -254,6 +254,16 @@ pub fn arreter_plus_de_memoire() -> ! {
     )
 }
 
+/// Les tics d'horloge passés depuis le départ du programme en cours : son
+/// temps de calcul (CLOCK_PROCESS_CPUTIME_ID, temps.rs). 0 sans
+/// programme.
+pub fn tics_du_programme() -> u64 {
+    if !EN_COURS.load(Ordering::Relaxed) {
+        return 0;
+    }
+    horloge::tics() - DEPART.load(Ordering::Relaxed)
+}
+
 /// Le programme en cours sera tué faute de mémoire à son retour vers
 /// l'anneau 3 (voir A_TUER).
 pub fn tuer_au_retour() {
