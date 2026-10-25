@@ -692,6 +692,7 @@ impl Wasi {
             let racine = s.racine();
             let depart = Depart { racine, dossier: base, qui, sous: true };
             let fin = s.resoudre(0, &depart, &chemin, suivre_pour(&o, suivre & 1 == 0)).map_err(errno)?;
+            let complet = s.avec_vue(0, |vue| vue.chemin_de(&fin)).unwrap_or_default();
             // Un programme WebAssembly voit les systèmes montés comme un
             // programme Linux.
             let fin = match en_tmpfs(fin) {
@@ -702,7 +703,7 @@ impl Wasi {
                         return Err(errno(e));
                     };
                     let sorte = s.avec_vue(0, |vue| appels_fichiers::sorte_montee(vue, qui, objet, &o)).map_err(errno)?;
-                    let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), o.lecture, o.ecriture, drapeaux, &chemin);
+                    let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), o.lecture, o.ecriture, drapeaux, &chemin).avec_chemin(complet);
                     return s.ouverts.ajouter(f).map_err(|_| ENOMEM);
                 }
             };
@@ -726,7 +727,7 @@ impl Wasi {
                 let _ = s.fs.tronquer(ouvert.numero, 0, maintenant, cadres);
             }
             s.ouverts
-                .ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, drapeaux, &chemin))
+                .ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, drapeaux, &chemin).avec_chemin(complet))
                 .map_err(|_| {
                     s.fs.fermer(&ouvert, cadres);
                     ENOMEM

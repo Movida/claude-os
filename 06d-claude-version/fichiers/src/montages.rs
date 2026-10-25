@@ -279,6 +279,30 @@ impl<'a> Vue<'a> {
         Ok(chemin)
     }
 
+    /// Le chemin absolu et canonique de ce que désigne `fin` (le `d_path` de
+    /// Linux) : celui de son dossier, à travers les montages, puis son nom ;
+    /// les liens y sont déjà résolus (`fin` vient d'une résolution qui les
+    /// a suivis), « . » et « .. » aussi. Un nom absent (un fichier que
+    /// l'appel va créer) : là où il sera. Pour « . », « .. » et la racine,
+    /// celui du dossier qu'ils désignent. ENAMETOOLONG au-delà de PATH_MAX,
+    /// ENOMEM.
+    pub fn chemin_de(&self, fin: &Fin<Objet>) -> Result<Vec<u8>, Erreur> {
+        if fin.dernier != Dernier::Nom {
+            return self.chemin(fin.objet.unwrap_or(fin.dossier));
+        }
+        let mut chemin = self.chemin(fin.dossier)?;
+        let barre = chemin != b"/";
+        if chemin.len() + barre as usize + fin.nom.len() >= PATH_MAX {
+            return Err(Erreur::ENAMETOOLONG);
+        }
+        chemin.try_reserve_exact(barre as usize + fin.nom.len()).map_err(|_| Erreur::ENOMEM)?;
+        if barre {
+            chemin.push(b'/');
+        }
+        chemin.extend_from_slice(&fin.nom);
+        Ok(chemin)
+    }
+
     /// L'erreur d'une modification qui touche un système monté (`fin` ou un
     /// objet qui n'est pas dans le tmpfs, ou un point de montage), dans
     /// l'ordre de Linux (mesuré sous Linux 6.18) :
@@ -743,6 +767,17 @@ mod tests {
         assert_eq!(vue.chemin(Objet::Monte(p, 0)).unwrap(), b"/proc");
         assert_eq!(vue.chemin(Objet::Monte(p, 1)).unwrap(), b"/proc/d");
         assert_eq!(vue.chemin(Objet::Tmpfs(fs.racine())).unwrap(), b"/");
+        // Le chemin canonique d'une résolution : les liens suivis, « .. »
+        // résolu, à travers le montage.
+        let racine = Objet::Tmpfs(fs.racine());
+        let depart = Depart { racine, dossier: racine, qui: DAVID, sous: false };
+        let canonique = |chemin: &[u8]| vue.chemin_de(&resoudre(&vue, &depart, chemin, Suivre::Toujours).unwrap());
+        assert_eq!(canonique(b"/lien-proc/f").unwrap(), b"/proc/d/f");
+        assert_eq!(canonique(b"//tmp/../proc/./d/").unwrap(), b"/proc/d");
+        assert_eq!(canonique(b"/proc/d/..").unwrap(), b"/proc");
+        assert_eq!(canonique(b"/tmp").unwrap(), b"/tmp");
+        assert_eq!(canonique(b"/").unwrap(), b"/");
+        assert_eq!(canonique(b"/tmp/absent").unwrap(), b"/tmp/absent");
         assert_eq!(vue.attributs(Objet::Monte(p, 2)).mode, S_IFREG | 0o444);
         assert_eq!(vue.peripherique(Objet::Monte(p, 2)), Some(((0, 21), 1024)));
         assert_eq!(vue.peripherique(Objet::Tmpfs(fs.racine())), None);

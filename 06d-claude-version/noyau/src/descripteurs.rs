@@ -122,9 +122,16 @@ pub struct FichierOuvert {
     /// Ce qui est propre à sa sorte (eventfd, epoll).
     pub donnees: Donnees,
     /// Le nom de base du chemin par lequel il a été ouvert, pour les
-    /// messages (« dans libc.so.6[...] »). Le chemin entier servira à
-    /// /proc/self/maps (6d).
+    /// messages (« dans libc.so.6[...] »).
     pub nom: NomCourt,
+    /// Son chemin absolu et canonique (le `d_path` de Linux), calculé à
+    /// l'ouverture : celui que montre /proc/self/maps. Vide s'il n'a pas pu
+    /// l'être (plus de PATH_MAX octets, plus de mémoire) : ouvrir ne doit
+    /// pas échouer pour un nom. Linux le recalcule à chaque lecture (un
+    /// renommage s'y voit) ; nous gardons celui de l'ouverture, un écart
+    /// voulu : il faudrait au tmpfs le parent de chaque fichier, qu'un lien
+    /// physique rend ambigu (Linux tient le `dentry` de l'ouverture).
+    pub chemin: Vec<u8>,
     /// Combien le tiennent : ses descripteurs, et les zones qui le
     /// projettent.
     references: u32,
@@ -133,7 +140,13 @@ pub struct FichierOuvert {
 impl FichierOuvert {
     pub fn new(sorte: Sorte, tenu: Tenu, lecture: bool, ecriture: bool, drapeaux: u32, chemin: &[u8]) -> FichierOuvert {
         let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').find(|n| !n.is_empty()).unwrap_or(chemin));
-        FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, donnees: Donnees::Aucune, nom, references: 1 }
+        FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, donnees: Donnees::Aucune, nom, chemin: Vec::new(), references: 1 }
+    }
+
+    /// Le même, avec son chemin canonique.
+    pub fn avec_chemin(mut self, chemin: Vec<u8>) -> FichierOuvert {
+        self.chemin = chemin;
+        self
     }
 
     /// L'objet ouvert, dans la vue de tous les systèmes de fichiers.

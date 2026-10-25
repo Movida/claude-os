@@ -187,7 +187,7 @@ fn tampon_pour(ligne: &[u8]) -> Option<Vec<u8>> {
 /// Le contenu de /etc/demarrage, lu en root (comme `init` lit son
 /// `inittab`), dans un bloc du tas.
 fn lire_demarrage() -> Result<Vec<u8>, fichiers::Erreur> {
-    let n = appels_fichiers::trouver_pour(Identite::ROOT, DEMARRAGE)?;
+    let (n, _) = appels_fichiers::trouver_pour(Identite::ROOT, DEMARRAGE)?;
     let (mode, taille) = vfs::avec(|fs, _| {
         let a = fs.attributs(n);
         (a.mode, a.taille)
@@ -238,19 +238,33 @@ fn lancer(numero: usize, commande: &formats::commande::Commande) {
     }
     arguments.extend(commande.arguments());
     dossiers.extend(commande.dossiers());
-    let n = match appels_fichiers::trouver_pour(IDENTITE, programme) {
+    let (n, complet) = match appels_fichiers::trouver_pour(IDENTITE, programme) {
         Ok(n) => n,
         Err(e) => return refus(&format_args!("{} : introuvable (errno {})", Nom(programme), e.errno())),
     };
-    let lancement = Lancement { chemin: programme, arguments: &arguments, environnement: &environnement, dossiers: &dossiers };
+    let lancement = Lancement { chemin: programme, complet: &complet, arguments: &arguments, environnement: &environnement, dossiers: &dossiers };
     executer(numero, n, &lancement);
     vfs::avec(|fs, cadres| fs.lacher(n, cadres));
+}
+
+/// Une copie de `octets` dans un bloc du tas, vide s'il n'y a pas la place
+/// (pour un chemin canonique, qui ne doit jamais faire échouer un
+/// lancement).
+fn copie(octets: &[u8]) -> Vec<u8> {
+    let mut v = Vec::new();
+    if v.try_reserve_exact(octets.len()).is_ok() {
+        v.extend_from_slice(octets);
+    }
+    v
 }
 
 /// Ce qu'une ligne de /etc/demarrage donne au programme.
 struct Lancement<'a> {
     /// Son chemin (AT_EXECFN), tel qu'écrit.
     chemin: &'a [u8],
+    /// Son chemin canonique (liens résolus), vide s'il n'a pas pu être
+    /// calculé : celui de son fichier ouvert (FichierOuvert::chemin).
+    complet: &'a [u8],
     /// argv : le chemin, puis les arguments.
     arguments: &'a [&'a [u8]],
     /// envp : des « NOM=valeur ».
@@ -348,7 +362,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     };
     // Le fichier ouvert que projetteront ses segments : chaque zone le
     // tiendra ; l'ouverture du chargeur est lâchée ensuite.
-    let fichier = match appels_fichiers::ouvrir_inode(n, chemin, crate::descripteurs::Sorte::Fichier) {
+    let fichier = match appels_fichiers::ouvrir_inode(n, chemin, copie(lancement.complet), crate::descripteurs::Sorte::Fichier) {
         Ok(f) => f,
         Err(e) => {
             fermer_interpreteur(interpreteur.as_ref());
@@ -564,7 +578,7 @@ impl fmt::Display for EchecInterpreteur {
 /// reste tenu.
 fn ouvrir_interpreteur(chemin: &[u8]) -> Result<Interpreteur, EchecInterpreteur> {
     use EchecInterpreteur::Fichier;
-    let n = appels_fichiers::trouver_pour(IDENTITE, chemin).map_err(|e| Fichier("introuvable", e))?;
+    let (n, complet) = appels_fichiers::trouver_pour(IDENTITE, chemin).map_err(|e| Fichier("introuvable", e))?;
     let lacher = || vfs::avec(|fs, cadres| fs.lacher(n, cadres));
     if let Err(e) = vfs::avec(|fs, _| fs.peut_executer(IDENTITE, n)) {
         lacher();
@@ -587,7 +601,7 @@ fn ouvrir_interpreteur(chemin: &[u8]) -> Result<Interpreteur, EchecInterpreteur>
             return Err(EchecInterpreteur::Format(e));
         }
     };
-    let fichier = match appels_fichiers::ouvrir_inode(n, chemin, crate::descripteurs::Sorte::Fichier) {
+    let fichier = match appels_fichiers::ouvrir_inode(n, chemin, complet, crate::descripteurs::Sorte::Fichier) {
         Ok(f) => f,
         Err(e) => {
             relacher();

@@ -135,6 +135,12 @@ fn refus(s: &Systeme, pid: u32, qui: Identite, m: Modification) -> i64 {
     errno(s.avec_vue(pid, |vue| vue.refus(qui, m)))
 }
 
+/// Le chemin canonique de ce que désigne `fin` (pour le fichier ouvert,
+/// `FichierOuvert::chemin`), vide s'il ne peut pas être calculé.
+fn canonique(s: &Systeme, pid: u32, fin: &Fin<Objet>) -> Vec<u8> {
+    s.avec_vue(pid, |vue| vue.chemin_de(fin)).unwrap_or_default()
+}
+
 /// L'objet désigné par `chemin` depuis `dirfd`, qui doit exister (stat,
 /// access...). Avec AT_EMPTY_PATH, un chemin vide désigne `dirfd`
 /// lui-même.
@@ -199,12 +205,13 @@ pub fn ouvrir_pour(qui: fichiers::Identite, chemin: &[u8], lecture: bool, ecritu
         let drapeaux = O_LARGEFILE
             | if ecriture && lecture { 2 } else if ecriture { O_WRONLY } else { O_RDONLY }
             | if dossier { O_DIRECTORY } else { 0 };
+        let complet = canonique(s, 0, &fin);
         let fin = match en_tmpfs(fin) {
             Ok(fin) => fin,
             Err(fin) => {
                 let objet = fin.objet.ok_or(Erreur::ENOENT)?;
                 let sorte = s.avec_vue(0, |vue| sorte_montee(vue, qui, objet, &o))?;
-                let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), lecture, ecriture, drapeaux as u32, chemin);
+                let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), lecture, ecriture, drapeaux as u32, chemin).avec_chemin(complet);
                 return s.ouverts.ajouter(f).map_err(|_| Erreur::ENOMEM);
             }
         };
@@ -214,7 +221,7 @@ pub fn ouvrir_pour(qui: fichiers::Identite, chemin: &[u8], lecture: bool, ecritu
             s.fs.fermer(&ouvert, cadres);
             return Err(Erreur::ENXIO);
         };
-        s.ouverts.ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), lecture, ecriture, drapeaux as u32, chemin))
+        s.ouverts.ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), lecture, ecriture, drapeaux as u32, chemin).avec_chemin(complet))
             .map_err(|f| {
                 if let Tenu::Tmpfs(ouvert) = f.tenu {
                     s.fs.fermer(&ouvert, cadres);
@@ -257,18 +264,24 @@ pub fn sorte_montee(vue: &Vue, qui: Identite, objet: Objet, o: &Ouverture) -> Re
 /// Le fichier que désigne `chemin`, absolu, depuis la racine, résolu comme
 /// `execve` le ferait pour `qui` (liens suivis, droit de traverser chaque
 /// dossier, ENOTDIR pour une barre finale après autre chose qu'un
-/// dossier). L'inode est tenu une fois : à lâcher après usage. Seul un
-/// fichier du tmpfs peut être un programme : ce qu'on trouve dans un
-/// système monté n'est pas exécutable (EACCES, comme `do_open_execat` pour
-/// un fichier sans le droit x).
-pub fn trouver_pour(qui: fichiers::Identite, chemin: &[u8]) -> Result<Numero, Erreur> {
+/// dossier), et son chemin canonique (vide s'il ne peut pas être calculé).
+/// L'inode est tenu une fois : à lâcher après usage. Seul un fichier du
+/// tmpfs peut être un programme : ce qu'on trouve dans un système monté
+/// n'est pas exécutable (EACCES, comme `do_open_execat` pour un fichier
+/// sans le droit x).
+pub fn trouver_pour(qui: fichiers::Identite, chemin: &[u8]) -> Result<(Numero, Vec<u8>), Erreur> {
     vfs::avec_systeme(|s, _| {
         let racine = s.racine();
         let depart = Depart { racine, dossier: racine, qui, sous: false };
-        let o = s.avec_vue(0, |vue| fichiers::chemins::trouver(vue, &depart, chemin, true))?;
+        let fin = s.resoudre(0, &depart, chemin, Suivre::Toujours)?;
+        let o = fin.objet.ok_or(Erreur::ENOENT)?;
+        if fin.barre && !s.avec_vue(0, |vue| fichiers::montages::est_dossier(vue, o)) {
+            return Err(Erreur::ENOTDIR);
+        }
         let n = o.tmpfs().ok_or(Erreur::EACCES)?;
+        let complet = canonique(s, 0, &fin);
         s.fs.prendre(n);
-        Ok(n)
+        Ok((n, complet))
     })
 }
 
@@ -333,6 +346,7 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
     let largefile = if chemin_seul { 0 } else { O_LARGEFILE };
     let gardes = (drapeaux & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC)) | largefile;
     let fichier = avec_fin(dirfd, &chemin, suivre_pour(&o, drapeaux & O_NOFOLLOW != 0), |s, cadres, fin, depart, pid| {
+        let complet = canonique(s, pid, &fin);
         let fin = match en_tmpfs(fin) {
             Ok(fin) => fin,
             Err(fin) => {
@@ -342,7 +356,7 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
                     return Err(if o.creer { refus(s, pid, depart.qui, Modification::Creer(&fin, Creation::Ouvrir)) } else { errno(Erreur::ENOENT) });
                 };
                 let sorte = s.avec_vue(pid, |vue| sorte_montee(vue, depart.qui, objet, &o)).map_err(errno)?;
-                let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), o.lecture, o.ecriture, gardes as u32, &chemin);
+                let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), o.lecture, o.ecriture, gardes as u32, &chemin).avec_chemin(complet);
                 return Ok((s.ouverts.ajouter(f).map_err(|_| -ENOMEM)?, None));
             }
         };
@@ -355,7 +369,7 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
                 return Err(e);
             }
         };
-        let fichier = s.ouverts.ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, gardes as u32, &chemin))
+        let fichier = s.ouverts.ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, gardes as u32, &chemin).avec_chemin(complet))
             .map_err(|f| {
                 if let Tenu::Tmpfs(ouvert) = f.tenu {
                     s.fs.fermer(&ouvert, cadres);
@@ -1413,15 +1427,16 @@ pub fn rmdir(adresse: u64) -> i64 {
     unlinkat(AT_FDCWD as u64, adresse, AT_REMOVEDIR)
 }
 
-/// Ouvre en lecture l'inode `n` (de chemin `chemin`, et de sorte `sorte`),
-/// pour le noyau : le programme à exécuter, que ses zones projetteront (le
-/// `bprm->file` de Linux), ou le dossier pré-ouvert d'un programme WASI.
-/// Rend le fichier ouvert, tenu une fois.
-pub fn ouvrir_inode(n: Numero, chemin: &[u8], sorte: Sorte) -> Result<Fichier, Erreur> {
+/// Ouvre en lecture l'inode `n` (de chemin `chemin`, tel que donné, et
+/// `complet`, canonique, et de sorte `sorte`), pour le noyau : le programme
+/// à exécuter, que ses zones projetteront (le `bprm->file` de Linux), ou
+/// son interpréteur. Rend le fichier ouvert, tenu une fois.
+pub fn ouvrir_inode(n: Numero, chemin: &[u8], complet: Vec<u8>, sorte: Sorte) -> Result<Fichier, Erreur> {
     vfs::avec_systeme(|s, cadres| {
         s.fs.prendre(n);
         let ouvert = fichiers::tmpfs::Ouvert { numero: n, cree: false, tronquer: false, ecrivain: false };
-        let fichier = FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), true, false, (O_RDONLY | O_LARGEFILE) as u32, chemin);
+        let fichier = FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), true, false, (O_RDONLY | O_LARGEFILE) as u32, chemin)
+            .avec_chemin(complet);
         s.ouverts.ajouter(fichier).map_err(|_| {
             s.fs.fermer(&ouvert, cadres);
             Erreur::ENOMEM

@@ -51,8 +51,19 @@ pub fn eventfd2(initiale: u64, drapeaux: u64) -> i64 {
     }
     let mut f = FichierOuvert::new(Sorte::EventFd, Tenu::Noyau(Objet::Anonyme), true, true,
                                    O_RDWR | (drapeaux & O_NONBLOCK) as u32, b"anon_inode:[eventfd]");
+    f.chemin = nom_anonyme(b"anon_inode:[eventfd]");
     f.donnees = Donnees::EventFd { compteur: initiale as u32 as u64, semaphore: drapeaux & EFD_SEMAPHORE != 0 };
     installer_fichier(f, drapeaux & O_CLOEXEC != 0)
+}
+
+/// Le « chemin » d'un fichier anonyme, celui que Linux montre dans
+/// /proc/self/fd (vide s'il n'y a pas la place de le copier).
+fn nom_anonyme(nom: &[u8]) -> alloc::vec::Vec<u8> {
+    let mut v = alloc::vec::Vec::new();
+    if v.try_reserve_exact(nom.len()).is_ok() {
+        v.extend_from_slice(nom);
+    }
+    v
 }
 
 /// eventfd(valeur initiale) : eventfd2 sans drapeaux.
@@ -160,6 +171,7 @@ pub fn epoll_create1(drapeaux: u64) -> i64 {
         return -EINVAL;
     }
     let mut f = FichierOuvert::new(Sorte::Epoll, Tenu::Noyau(Objet::Anonyme), true, true, O_RDWR, b"anon_inode:[eventpoll]");
+    f.chemin = nom_anonyme(b"anon_inode:[eventpoll]");
     f.donnees = Donnees::Epoll(alloc::vec::Vec::new());
     installer_fichier(f, drapeaux & O_CLOEXEC != 0)
 }
