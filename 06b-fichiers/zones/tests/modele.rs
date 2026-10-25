@@ -1,14 +1,18 @@
 //! La carte des zones contre un modèle : des milliers d'opérations au
 //! hasard sur un petit espace de 256 pages, appliquées à la fois à la carte
-//! et à un tableau qui décrit chaque page une à une (son genre, ou rien).
+//! et à un tableau qui décrit chaque page une à une (son genre, et pour une
+//! projection de fichier, la page du fichier qu'elle montre ; ou rien).
 //! Le tableau est trop simple pour se tromper : après chaque opération, la
 //! carte doit dire exactement la même chose que lui, et respecter ses
-//! invariants.
+//! invariants. Les références aux fichiers annoncées par la carte (+1, -1)
+//! doivent toujours faire, pour chaque fichier, le nombre de ses zones.
 //!
 //! Le hasard vient d'un générateur xorshift écrit ici, avec des graines
 //! fixes : un échec se rejoue à l'identique.
 
-use zones::{Drapeaux, Droits, Erreur, Nature, Sens, Zone, Zones, PAGE};
+use std::collections::BTreeMap;
+
+use zones::{Drapeaux, Droits, Erreur, Nature, Projection, Sens, Zone, Zones, PAGE};
 
 const PAGES: u64 = 256;
 const ECART: u64 = 3 * PAGE;
@@ -19,13 +23,22 @@ struct Genre {
     droits: Droits,
     nature: Nature,
     drapeaux: Drapeaux,
+    fichier: Option<u32>,
 }
 
 fn genre(z: &Zone) -> Genre {
-    Genre { droits: z.droits, nature: z.nature, drapeaux: z.drapeaux }
+    Genre { droits: z.droits, nature: z.nature, drapeaux: z.drapeaux, fichier: z.fichier.map(|p| p.fichier) }
 }
 
-type Modele = [Option<Genre>; PAGES as usize];
+/// Le genre de la page, et la page du fichier qu'elle montre (0 pour de
+/// l'anonyme).
+type Page = (Genre, u64);
+type Modele = [Option<Page>; PAGES as usize];
+
+/// Ce que dit la carte de la page de la zone `z` à l'adresse `a`.
+fn page_de(z: &Zone, a: u64) -> Page {
+    (genre(z), z.page_de(a).unwrap_or(0))
+}
 
 /// xorshift64 (Marsaglia, 2003).
 struct Hasard(u64);
@@ -62,39 +75,51 @@ impl Hasard {
         ][self.moins_de(3) as usize];
         let nature = [Nature::Anonyme, Nature::Pile, Nature::Tas][self.moins_de(3) as usize];
         let vers_le_bas = nature == Nature::Pile;
-        Genre { droits, nature, drapeaux: Drapeaux { vers_le_bas, sans_reserve: self.moins_de(4) == 0, ..Drapeaux::default() } }
+        // Un fichier sur trois, pas pour une pile (MAP_GROWSDOWN est refusé
+        // par le noyau).
+        let fichier = (nature != Nature::Pile && self.moins_de(3) == 0).then(|| 1 + self.moins_de(2) as u32);
+        Genre {
+            droits,
+            nature,
+            drapeaux: Drapeaux { vers_le_bas, sans_reserve: self.moins_de(4) == 0, ..Drapeaux::default() },
+            fichier,
+        }
     }
 }
 
 /// Les zones que décrit le modèle : ses suites maximales de pages du même
-/// genre.
-fn zones_du_modele(m: &Modele) -> Vec<(u64, u64, Genre)> {
-    let mut zones: Vec<(u64, u64, Genre)> = Vec::new();
-    for (p, g) in m.iter().enumerate() {
-        let Some(g) = *g else { continue };
+/// genre (et, pour un fichier, de pages du fichier qui se suivent), avec
+/// leur page du fichier de début.
+fn zones_du_modele(m: &Modele) -> Vec<(u64, u64, Genre, u64)> {
+    let mut zones: Vec<(u64, u64, Genre, u64)> = Vec::new();
+    for (p, page) in m.iter().enumerate() {
+        let Some((g, pf)) = *page else { continue };
         let p = p as u64;
         match zones.last_mut() {
-            Some((_, fin, h)) if *fin == p && *h == g => *fin += 1,
-            _ => zones.push((p, p + 1, g)),
+            Some((debut, fin, h, pd)) if *fin == p && *h == g && (g.fichier.is_none() || *pd + (p - *debut) == pf) => *fin += 1,
+            _ => zones.push((p, p + 1, g, if g.fichier.is_some() { pf } else { 0 })),
         }
     }
     zones
 }
 
-fn comparer(c: &Zones, m: &Modele, contexte: &str) {
+fn comparer(c: &Zones, m: &Modele, references: &BTreeMap<u32, i32>, contexte: &str) {
     c.invariants().unwrap_or_else(|e| panic!("{contexte} : {e}"));
-    let carte: Vec<_> = c.zones().iter().map(|z| (z.debut / PAGE, z.fin / PAGE, genre(z))).collect();
+    let carte: Vec<_> = c
+        .zones()
+        .iter()
+        .map(|z| (z.debut / PAGE, z.fin / PAGE, genre(z), z.fichier.map_or(0, |p| p.page)))
+        .collect();
     assert_eq!(carte, zones_du_modele(m), "{contexte}");
+    for f in 1..=2 {
+        let zones = c.zones().iter().filter(|z| z.fichier.map(|p| p.fichier) == Some(f)).count() as i32;
+        assert_eq!(references.get(&f).copied().unwrap_or(0), zones, "{contexte} : references du fichier {f}");
+    }
 }
 
 /// La page de début de la zone qui contient la page `p` dans le modèle.
 fn debut_de_zone(m: &Modele, p: u64) -> u64 {
-    let g = m[p as usize];
-    let mut d = p;
-    while d > 0 && m[d as usize - 1] == g {
-        d -= 1;
-    }
-    d
+    zones_du_modele(m).into_iter().find(|&(d, f, _, _)| (d..f).contains(&p)).map_or(p, |(d, ..)| d)
 }
 
 /// Le trou attendu, cherché page par page.
@@ -120,7 +145,7 @@ fn libre_du_modele(m: &Modele, debut: u64, fin: u64) -> bool {
     if q < fin {
         return false;
     }
-    let ecart = if g.drapeaux.vers_le_bas { ECART / PAGE } else { 0 };
+    let ecart = if g.0.drapeaux.vers_le_bas { ECART / PAGE } else { 0 };
     fin <= q.saturating_sub(ecart)
 }
 
@@ -133,11 +158,11 @@ fn etendre_du_modele(m: &Modele, adresse: u64, taille_max: u64) -> Option<Modele
     let q = (adresse..PAGES).find(|&p| m[p as usize].is_some())?;
     let g = m[q as usize].unwrap();
     let fin = (q..PAGES).find(|&p| m[p as usize] != Some(g)).unwrap_or(PAGES);
-    if !g.drapeaux.vers_le_bas || fin - adresse > taille_max {
+    if !g.0.drapeaux.vers_le_bas || fin - adresse > taille_max {
         return None;
     }
     if let Some(p) = (0..adresse).rev().find(|&p| m[p as usize].is_some()) {
-        let h = m[p as usize].unwrap();
+        let h = m[p as usize].unwrap().0;
         if h.droits.accessible() && !h.drapeaux.vers_le_bas && adresse - (p + 1) < ECART / PAGE {
             return None;
         }
@@ -151,6 +176,7 @@ fn jouer(graine: u64, operations: usize, maximum: usize) {
     let mut h = Hasard(graine);
     let mut c = Zones::avec_maximum(maximum);
     let mut m: Modele = [None; PAGES as usize];
+    let mut references: BTreeMap<u32, i32> = BTreeMap::new();
     for numero in 0..operations {
         let contexte = format!("graine {graine}, operation {numero}");
         let (debut, fin) = h.plage();
@@ -159,9 +185,17 @@ fn jouer(graine: u64, operations: usize, maximum: usize) {
             // Insérer une zone.
             0 => {
                 let g = h.genre();
-                let zone = Zone { debut: a, fin: b, droits: g.droits, nature: g.nature, drapeaux: g.drapeaux };
+                // La page du fichier de début : le plus souvent celle qui a
+                // le numéro de l'adresse (des zones voisines du même fichier
+                // se suivent alors dans le fichier, et fusionnent), parfois
+                // n'importe laquelle.
+                let page = if h.booleen() { debut } else { h.moins_de(1000) };
+                let fichier = g.fichier.map(|f| Projection { fichier: f, page });
+                let zone = Zone { debut: a, fin: b, droits: g.droits, nature: g.nature, drapeaux: g.drapeaux, fichier };
                 let mut n = m;
-                n[debut as usize..fin as usize].fill(Some(g));
+                for (k, p) in n[debut as usize..fin as usize].iter_mut().enumerate() {
+                    *p = Some((g, if fichier.is_some() { page + k as u64 } else { 0 }));
+                }
                 let attendu = if debut == fin {
                     Err(Erreur::PlageInvalide)
                 } else if m[debut as usize..fin as usize].iter().any(Option::is_some) {
@@ -171,7 +205,8 @@ fn jouer(graine: u64, operations: usize, maximum: usize) {
                 } else {
                     Ok(())
                 };
-                assert_eq!(c.inserer(zone), attendu, "{contexte} : inserer {debut}..{fin}");
+                let r = c.inserer(zone, &mut |f, d| *references.entry(f).or_default() += d);
+                assert_eq!(r, attendu, "{contexte} : inserer {debut}..{fin}");
                 if attendu.is_ok() {
                     m = n;
                 }
@@ -182,13 +217,15 @@ fn jouer(graine: u64, operations: usize, maximum: usize) {
                 let mut n = m;
                 n[debut as usize..fin as usize].fill(None);
                 let attendu = if zones_du_modele(&n).len() > maximum { Err(Erreur::TropDeZones) } else { Ok(()) };
-                let mut annonces: Vec<Option<Genre>> = vec![None; PAGES as usize];
+                let mut annonces: Vec<Option<Page>> = vec![None; PAGES as usize];
                 let mut prochain = 0;
                 let r = c.retirer(a, b, |z| {
                     assert!(z.debut >= prochain && z.debut >= a && z.fin <= b, "{contexte} : morceau {z:?}");
                     prochain = z.fin;
-                    annonces[(z.debut / PAGE) as usize..(z.fin / PAGE) as usize].fill(Some(genre(z)));
-                });
+                    for q in z.debut / PAGE..z.fin / PAGE {
+                        annonces[q as usize] = Some(page_de(z, q * PAGE));
+                    }
+                }, &mut |f, d| *references.entry(f).or_default() += d);
                 assert_eq!(r, attendu, "{contexte} : retirer {debut}..{fin}");
                 if r.is_ok() {
                     assert_eq!(annonces[debut as usize..fin as usize], m[debut as usize..fin as usize], "{contexte}");
@@ -209,7 +246,7 @@ fn jouer(graine: u64, operations: usize, maximum: usize) {
                     }
                 };
                 let mut n = m;
-                for g in n[debut as usize..fin as usize].iter_mut().flatten() {
+                for (g, _) in n[debut as usize..fin as usize].iter_mut().flatten() {
                     change(g);
                 }
                 let attendu = if zones_du_modele(&n).len() > maximum { Err(Erreur::TropDeZones) } else { Ok(()) };
@@ -217,7 +254,7 @@ fn jouer(graine: u64, operations: usize, maximum: usize) {
                     let mut g = genre(z);
                     change(&mut g);
                     (z.droits, z.drapeaux) = (g.droits, g.drapeaux);
-                });
+                }, &mut |f, d| *references.entry(f).or_default() += d);
                 assert_eq!(r, attendu, "{contexte} : changer {debut}..{fin}");
                 if r.is_ok() {
                     m = n;
@@ -245,13 +282,13 @@ fn jouer(graine: u64, operations: usize, maximum: usize) {
                 assert_eq!(c.couverte(a, b), couverte, "{contexte} : couverte {debut}..{fin}");
                 let p = h.moins_de(PAGES);
                 let trouvee = c.trouver(p * PAGE + h.moins_de(PAGE));
-                assert_eq!(trouvee.map(genre), m[p as usize], "{contexte} : trouver {p}");
+                assert_eq!(trouvee.map(|z| page_de(z, p * PAGE)), m[p as usize], "{contexte} : trouver {p}");
                 if let Some(z) = trouvee {
                     assert_eq!(z.debut / PAGE, debut_de_zone(&m, p), "{contexte} : debut de la zone de {p}");
                 }
             }
         }
-        comparer(&c, &m, &contexte);
+        comparer(&c, &m, &references, &contexte);
     }
 }
 

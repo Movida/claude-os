@@ -67,8 +67,8 @@ pub struct FichierOuvert {
     pub drapeaux: u32,
     /// La position (pour un dossier : celle de `lire_dossier`).
     pub position: u64,
-    /// Combien le tiennent : ses descripteurs, et plus tard les zones qui
-    /// le projettent.
+    /// Combien le tiennent : ses descripteurs, et les zones qui le
+    /// projettent.
     references: u32,
 }
 
@@ -81,6 +81,13 @@ impl FichierOuvert {
 /// Le numéro d'un fichier ouvert dans la table du noyau.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fichier(u32);
+
+impl Fichier {
+    /// Le numéro tel que le garde une zone de fichier (../zones).
+    pub fn de(numero: u32) -> Fichier {
+        Fichier(numero)
+    }
+}
 
 /// La table des fichiers ouverts, sous le verrou du système de fichiers
 /// (vfs.rs).

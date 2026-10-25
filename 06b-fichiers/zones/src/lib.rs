@@ -26,6 +26,20 @@
 //!     (`mprotect`), émietterait la carte en milliers de zones ;
 //!   - il y en a au plus `ZONES_MAX`.
 //!
+//! Une zone peut PROJETER UN FICHIER (6b) : elle dit alors quel fichier
+//! ouvert, et quelle page du fichier est à son début (le `vm_file` et le
+//! `vm_pgoff` de Linux). Deux voisines ne fusionnent que si elles projettent
+//! le même fichier à des pages qui se suivent ; couper une zone fait
+//! avancer la page de son morceau de droite. Chaque zone de fichier TIENT
+//! son fichier ouvert (une référence) : c'est ce qui garde le fichier en
+//! vie après son `close`. Or les coupes et les fusions se font ici, sur des
+//! valeurs copiées : les opérations qui en font prennent une fonction
+//! `references(fichier, delta)`, qu'elles appellent avec +1 pour chaque
+//! zone de fichier qui apparaît et -1 pour chaque zone qui disparaît (le
+//! `get_file` de `__split_vma` et le `fput` de `vma_merge`). Le noyau tient
+//! ainsi exactement une référence par zone (vérifié par le modèle des
+//! tests).
+//!
 //! Toute opération qui peut ajouter des zones réserve d'abord la place
 //! (`try_reserve`) et vérifie le maximum : en cas d'échec, RIEN n'a changé.
 //! Le noyau n'a ainsi jamais à défaire une opération à moitié faite.
@@ -125,6 +139,16 @@ pub struct Drapeaux {
     pub effacer_au_fork: bool,
 }
 
+/// Ce que projette une zone de fichier (6b) : le fichier ouvert (son numéro
+/// dans la table du noyau : le `vm_file` de Linux), et la page du fichier
+/// qui est au début de la zone (le `vm_pgoff`). La page à l'adresse a est
+/// donc `page + (a - debut) / PAGE`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Projection {
+    pub fichier: u32,
+    pub page: u64,
+}
+
 /// Une zone : les adresses [debut, fin[, alignées sur la page.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Zone {
@@ -133,6 +157,8 @@ pub struct Zone {
     pub droits: Droits,
     pub nature: Nature,
     pub drapeaux: Drapeaux,
+    /// Le fichier projeté, s'il y en a un (sinon : de la mémoire anonyme).
+    pub fichier: Option<Projection>,
 }
 
 impl Zone {
@@ -144,10 +170,34 @@ impl Zone {
         (self.debut..self.fin).contains(&adresse)
     }
 
-    /// Les deux zones ont-elles les mêmes droits, la même nature et les
-    /// mêmes drapeaux ? Contiguës, elles n'en font alors qu'une.
+    /// Les deux zones ont-elles les mêmes droits, la même nature, les mêmes
+    /// drapeaux, et projettent-elles le même fichier (ou aucun) ?
     pub fn meme_genre(&self, autre: &Zone) -> bool {
-        self.droits == autre.droits && self.nature == autre.nature && self.drapeaux == autre.drapeaux
+        self.droits == autre.droits
+            && self.nature == autre.nature
+            && self.drapeaux == autre.drapeaux
+            && self.fichier.map(|p| p.fichier) == autre.fichier.map(|p| p.fichier)
+    }
+
+    /// `suivante` commence-t-elle juste où finit cette zone, du même genre,
+    /// et, pour un fichier, à la page du fichier qui suit (le `pgoff` de
+    /// `vma_merge`) ? Les deux n'en font alors qu'une.
+    pub fn fusionnable(&self, suivante: &Zone) -> bool {
+        self.fin == suivante.debut
+            && self.meme_genre(suivante)
+            && self.fichier.zip(suivante.fichier).is_none_or(|(a, b)| a.page + self.taille() / PAGE == b.page)
+    }
+
+    /// La page du fichier projetée à l'adresse `adresse` (dans la zone).
+    pub fn page_de(&self, adresse: u64) -> Option<u64> {
+        self.fichier.map(|p| p.page + (adresse - self.debut) / PAGE)
+    }
+
+    /// Le morceau [debut, fin[ de la zone (dans ses bornes) : pour un
+    /// fichier, sa page de début avance d'autant que son adresse.
+    pub fn coupe(&self, debut: u64, fin: u64) -> Zone {
+        let fichier = self.fichier.map(|p| Projection { page: p.page + (debut - self.debut) / PAGE, ..p });
+        Zone { debut, fin, fichier, ..*self }
     }
 
     /// Le début de la zone, écart de garde compris : une zone qui grandit
@@ -253,7 +303,7 @@ impl Zones {
         self.zones[self.indice_apres(debut)..]
             .iter()
             .take_while(move |z| z.debut < fin)
-            .map(move |z| Zone { debut: z.debut.max(debut), fin: z.fin.min(fin), ..*z })
+            .map(move |z| z.coupe(z.debut.max(debut), z.fin.min(fin)))
     }
 
     /// Les zones couvrent-elles [debut, fin[ sans trou ? (Une plage vide
@@ -313,8 +363,10 @@ impl Zones {
     }
 
     /// Ajoute une zone, là où il n'y a rien. Elle fusionne avec ses
-    /// voisines contiguës du même genre.
-    pub fn inserer(&mut self, zone: Zone) -> Result<(), Erreur> {
+    /// voisines contiguës du même genre. `references` apprend chaque zone
+    /// de fichier qui apparaît (+1 : la nouvelle, si elle reste seule) ou
+    /// disparaît (-1 : fondue dans une voisine) : voir `Zones`.
+    pub fn inserer(&mut self, zone: Zone, references: &mut impl FnMut(u32, i32)) -> Result<(), Erreur> {
         if !alignee(zone.debut) || !alignee(zone.fin) || zone.debut >= zone.fin {
             return Err(Erreur::PlageInvalide);
         }
@@ -322,21 +374,39 @@ impl Zones {
         if self.zones.get(i).is_some_and(|z| z.debut < zone.fin) {
             return Err(Erreur::Chevauchement);
         }
-        let avec_avant = i > 0 && self.zones[i - 1].fin == zone.debut && self.zones[i - 1].meme_genre(&zone);
-        let avec_apres = self.zones.get(i).is_some_and(|z| z.debut == zone.fin && z.meme_genre(&zone));
+        let avec_avant = i > 0 && self.zones[i - 1].fusionnable(&zone);
+        let avec_apres = self.zones.get(i).is_some_and(|z| zone.fusionnable(z));
+        if !avec_avant && !avec_apres {
+            self.place_pour(1)?;
+        }
+        // La nouvelle compte d'abord ; chaque fusion retire une zone.
+        let fichier = zone.fichier.map(|p| p.fichier);
+        let mut compter = |delta| {
+            if let Some(f) = fichier {
+                references(f, delta);
+            }
+        };
+        compter(1);
         match (avec_avant, avec_apres) {
             // Elle comble le trou entre deux zones de son genre : les trois
             // n'en font plus qu'une, il y a une zone de moins.
             (true, true) => {
                 self.zones[i - 1].fin = self.zones[i].fin;
                 self.zones.remove(i);
+                compter(-1);
+                compter(-1);
             }
-            (true, false) => self.zones[i - 1].fin = zone.fin,
-            (false, true) => self.zones[i].debut = zone.debut,
-            (false, false) => {
-                self.place_pour(1)?;
-                self.zones.insert(i, zone);
+            (true, false) => {
+                self.zones[i - 1].fin = zone.fin;
+                compter(-1);
             }
+            // Fondue au début de la suivante : la zone commence là, avec la
+            // page du fichier de la nouvelle.
+            (false, true) => {
+                self.zones[i] = Zone { fin: self.zones[i].fin, ..zone };
+                compter(-1);
+            }
+            (false, false) => self.zones.insert(i, zone),
         }
         Ok(())
     }
@@ -355,7 +425,23 @@ impl Zones {
         if self.zones.len() + n > self.maximum {
             return Err(Erreur::TropDeZones);
         }
-        self.zones.try_reserve(n).map_err(|_| Erreur::PlusDeMemoire)
+        self.agrandir(n)
+    }
+
+    /// Réserve la place de `n` zones de plus. Comme `Vec`, la capacité
+    /// double (des ajouts un à un restent en temps constant, en moyenne),
+    /// mais sans dépasser le maximum : la carte entière tient alors en un
+    /// bloc de 3 Mio (65 530 zones de 48 octets), quand le doublement seul,
+    /// parti d'une page (85 zones), la porterait à 87 040 cases : 4 Mio, la
+    /// taille du plus gros bloc du tas du noyau, qu'une zone d'un octet de
+    /// plus dépasserait.
+    fn agrandir(&mut self, n: usize) -> Result<(), Erreur> {
+        let besoin = self.zones.len() + n;
+        if besoin <= self.zones.capacity() {
+            return Ok(());
+        }
+        let capacite = (self.zones.capacity() * 2).max(besoin).min(self.maximum.max(besoin));
+        self.zones.try_reserve_exact(capacite - self.zones.len()).map_err(|_| Erreur::PlusDeMemoire)
     }
 
     /// Retire de la carte tout ce qui est dans [debut, fin[, en coupant les
@@ -365,8 +451,10 @@ impl Zones {
     ///
     /// Couper une zone en son milieu en fait deux : c'est la seule façon
     /// dont un retrait ajoute une zone, et il peut alors échouer (Linux
-    /// rend ENOMEM à munmap dans ce cas).
-    pub fn retirer(&mut self, debut: u64, fin: u64, mut retire: impl FnMut(&Zone)) -> Result<(), Erreur> {
+    /// rend ENOMEM à munmap dans ce cas). `references` apprend les zones de
+    /// fichier qui apparaissent (une coupe) ou disparaissent.
+    pub fn retirer(&mut self, debut: u64, fin: u64, mut retire: impl FnMut(&Zone), references: &mut impl FnMut(u32, i32))
+        -> Result<(), Erreur> {
         if !alignee(debut) || !alignee(fin) || debut > fin {
             return Err(Erreur::PlageInvalide);
         }
@@ -382,9 +470,12 @@ impl Zones {
         if premiere.debut < debut && premiere.fin > fin {
             // Un trou au milieu d'une zone : elle devient deux.
             self.place_pour(1)?;
-            retire(&Zone { debut, fin, ..premiere });
+            retire(&premiere.coupe(debut, fin));
             self.zones[i].fin = debut;
-            self.zones.insert(i + 1, Zone { debut: fin, ..premiere });
+            self.zones.insert(i + 1, premiere.coupe(fin, premiere.fin));
+            if let Some(p) = premiere.fichier {
+                references(p.fichier, 1);
+            }
             return Ok(());
         }
         // Sinon, de i à j (exclu) les zones qui touchent la plage : la
@@ -392,7 +483,7 @@ impl Zones {
         // disparaissent en entier.
         let j = i + self.zones[i..].iter().take_while(|z| z.debut < fin).count();
         for z in &self.zones[i..j] {
-            retire(&Zone { debut: z.debut.max(debut), fin: z.fin.min(fin), ..*z });
+            retire(&z.coupe(z.debut.max(debut), z.fin.min(fin)));
         }
         let mut garde_debut = 0;
         if self.zones[i].debut < debut {
@@ -401,10 +492,15 @@ impl Zones {
         }
         let mut garde_fin = 0;
         if self.zones[j - 1].fin > fin && j - 1 >= i + garde_debut {
-            self.zones[j - 1].debut = fin;
+            let z = self.zones[j - 1];
+            self.zones[j - 1] = z.coupe(fin, z.fin);
             garde_fin = 1;
         }
-        self.zones.drain(i + garde_debut..j - garde_fin);
+        for z in self.zones.drain(i + garde_debut..j - garde_fin) {
+            if let Some(p) = z.fichier {
+                references(p.fichier, -1);
+            }
+        }
         Ok(())
     }
 
@@ -417,8 +513,11 @@ impl Zones {
     /// Une zone que `change` laisse telle quelle n'est pas coupée (comme
     /// Linux, qui ne touche pas une zone dont les droits ne changent pas).
     /// Couper ajoute au plus deux zones, et les fusions en retirent : si le
-    /// compte final dépasse le maximum, rien ne change.
-    pub fn changer(&mut self, debut: u64, fin: u64, change: impl Fn(&mut Zone)) -> Result<(), Erreur> {
+    /// compte final dépasse le maximum, rien ne change. `change` ne touche
+    /// pas au fichier projeté (il est remis) ; `references` apprend les
+    /// coupes et les fusions des zones de fichier.
+    pub fn changer(&mut self, debut: u64, fin: u64, change: impl Fn(&mut Zone), references: &mut impl FnMut(u32, i32))
+        -> Result<(), Erreur> {
         if !alignee(debut) || !alignee(fin) || debut > fin {
             return Err(Erreur::PlageInvalide);
         }
@@ -428,7 +527,7 @@ impl Zones {
         let changee = |z: &Zone| {
             let mut copie = *z;
             change(&mut copie);
-            Zone { debut: z.debut, fin: z.fin, ..copie }
+            Zone { debut: z.debut, fin: z.fin, fichier: z.fichier, ..copie }
         };
         let i = self.indice_apres(debut);
         let j = i + self.zones[i..].iter().take_while(|z| z.debut < fin).count();
@@ -450,23 +549,23 @@ impl Zones {
         let mut fusions = 0;
         let mut derniere: Option<Zone> = i.checked_sub(1).map(|k| self.zones[k]);
         let mut voir = |z: Zone| {
-            if derniere.is_some_and(|d| d.fin == z.debut && d.meme_genre(&z)) {
+            if derniere.is_some_and(|d| d.fusionnable(&z)) {
                 fusions += 1;
             }
             derniere = Some(z);
         };
         if coupe_debut {
-            voir(Zone { fin: debut, ..self.zones[i] });
+            voir(self.zones[i].coupe(self.zones[i].debut, debut));
         }
         for k in i..j {
             let z = self.zones[k];
             let bas = if k == i && coupe_debut { debut } else { z.debut };
             let haut = if k == j - 1 && coupe_fin { fin } else { z.fin };
-            let morceau = Zone { debut: bas, fin: haut, ..z };
+            let morceau = z.coupe(bas, haut);
             voir(if bas >= debut && haut <= fin { changee(&morceau) } else { morceau });
         }
         if coupe_fin {
-            voir(Zone { debut: fin, ..self.zones[j - 1] });
+            voir(self.zones[j - 1].coupe(fin, self.zones[j - 1].fin));
         }
         if let Some(&apres) = self.zones.get(j) {
             voir(apres);
@@ -475,19 +574,25 @@ impl Zones {
             return Err(Erreur::TropDeZones);
         }
         // La place des coupes, avant les fusions qui la rendront.
-        self.zones.try_reserve(coupes).map_err(|_| Erreur::PlusDeMemoire)?;
+        self.agrandir(coupes)?;
         // Les coupes, de la fin vers le début : les indices de la plage ne
         // bougent qu'après.
         let (mut i, mut j) = (i, j);
         if coupe_fin {
             let z = self.zones[j - 1];
             self.zones[j - 1].fin = fin;
-            self.zones.insert(j, Zone { debut: fin, ..z });
+            self.zones.insert(j, z.coupe(fin, z.fin));
+            if let Some(p) = z.fichier {
+                references(p.fichier, 1);
+            }
         }
         if coupe_debut {
             let z = self.zones[i];
             self.zones[i].fin = debut;
-            self.zones.insert(i + 1, Zone { debut, ..z });
+            self.zones.insert(i + 1, z.coupe(debut, z.fin));
+            if let Some(p) = z.fichier {
+                references(p.fichier, 1);
+            }
             i += 1;
             j += 1;
         }
@@ -499,20 +604,24 @@ impl Zones {
             }
         }
         // Les fusions : dans la plage, et avec la voisine de chaque côté.
-        self.fusionner(i.saturating_sub(1), (j + 1).min(self.zones.len()));
+        self.fusionner(i.saturating_sub(1), (j + 1).min(self.zones.len()), references);
         Ok(())
     }
 
-    /// Fusionne les voisines contiguës du même genre parmi les zones
-    /// d'indices [de, a[.
-    fn fusionner(&mut self, de: usize, a: usize) {
+    /// Fusionne les voisines fusionnables parmi les zones d'indices
+    /// [de, a[ : chaque zone de fichier fondue dans sa voisine est une zone
+    /// de moins pour `references`.
+    fn fusionner(&mut self, de: usize, a: usize, references: &mut impl FnMut(u32, i32)) {
         let mut k = de + 1;
         let mut a = a;
         while k < a {
             let (avant, z) = (self.zones[k - 1], self.zones[k]);
-            if avant.fin == z.debut && avant.meme_genre(&z) {
+            if avant.fusionnable(&z) {
                 self.zones[k - 1].fin = z.fin;
                 self.zones.remove(k);
+                if let Some(p) = z.fichier {
+                    references(p.fichier, -1);
+                }
                 a -= 1;
             } else {
                 k += 1;
@@ -546,10 +655,14 @@ impl Zones {
         {
             return false;
         }
+        // Une pile ne projette jamais de fichier (MAP_GROWSDOWN est refusé) :
+        // reculer son début ne change aucune page de fichier.
+        debug_assert!(self.zones[i].fichier.is_none());
         self.zones[i].debut = adresse;
         // Collée à la zone d'en dessous (sans droits, ou un écart nul) :
-        // elles ne fusionnent que si elles sont du même genre.
-        self.fusionner(i.saturating_sub(1), i + 1);
+        // elles ne fusionnent que si elles sont du même genre, donc pas avec
+        // un fichier.
+        self.fusionner(i.saturating_sub(1), i + 1, &mut |_, _| ());
         true
     }
 
@@ -571,7 +684,7 @@ impl Zones {
             if paire[0].fin > paire[1].debut {
                 return Err("zones non triees ou qui se chevauchent");
             }
-            if paire[0].fin == paire[1].debut && paire[0].meme_genre(&paire[1]) {
+            if paire[0].fusionnable(&paire[1]) {
                 return Err("voisines du meme genre non fusionnees");
             }
         }
@@ -589,7 +702,7 @@ mod tests {
     const RX: Droits = Droits { lecture: true, ecriture: false, execution: true };
 
     fn anonyme(debut: u64, fin: u64, droits: Droits) -> Zone {
-        Zone { debut: debut * PAGE, fin: fin * PAGE, droits, nature: Nature::Anonyme, drapeaux: Drapeaux::default() }
+        Zone { debut: debut * PAGE, fin: fin * PAGE, droits, nature: Nature::Anonyme, drapeaux: Drapeaux::default(), fichier: None }
     }
 
     fn pile(debut: u64, fin: u64) -> Zone {
@@ -604,7 +717,7 @@ mod tests {
     fn carte(zones: &[Zone]) -> Zones {
         let mut c = Zones::new();
         for &z in zones {
-            c.inserer(z).unwrap();
+            c.inserer(z, &mut |_, _| ()).unwrap();
         }
         c.invariants().unwrap();
         c
@@ -613,17 +726,17 @@ mod tests {
     #[test]
     fn insertion_et_fusion() {
         let mut c = carte(&[anonyme(10, 20, RW), anonyme(30, 40, RW)]);
-        assert_eq!(c.inserer(anonyme(15, 25, RW)), Err(Erreur::Chevauchement));
-        assert_eq!(c.inserer(anonyme(5, 11, RW)), Err(Erreur::Chevauchement));
-        assert_eq!(c.inserer(anonyme(39, 41, RW)), Err(Erreur::Chevauchement));
-        assert_eq!(c.inserer(Zone { fin: 20 * PAGE + 1, ..anonyme(20, 21, RW) }), Err(Erreur::PlageInvalide));
-        assert_eq!(c.inserer(anonyme(20, 20, RW)), Err(Erreur::PlageInvalide));
+        assert_eq!(c.inserer(anonyme(15, 25, RW), &mut |_, _| ()), Err(Erreur::Chevauchement));
+        assert_eq!(c.inserer(anonyme(5, 11, RW), &mut |_, _| ()), Err(Erreur::Chevauchement));
+        assert_eq!(c.inserer(anonyme(39, 41, RW), &mut |_, _| ()), Err(Erreur::Chevauchement));
+        assert_eq!(c.inserer(Zone { fin: 20 * PAGE + 1, ..anonyme(20, 21, RW) }, &mut |_, _| ()), Err(Erreur::PlageInvalide));
+        assert_eq!(c.inserer(anonyme(20, 20, RW), &mut |_, _| ()), Err(Erreur::PlageInvalide));
         // Contiguë des deux côtés, du même genre : une seule zone.
-        c.inserer(anonyme(20, 30, RW)).unwrap();
+        c.inserer(anonyme(20, 30, RW), &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 40)]);
         // Contiguë mais d'un autre genre : pas de fusion.
-        c.inserer(anonyme(40, 50, R)).unwrap();
-        c.inserer(Zone { nature: Nature::Tas, ..anonyme(50, 60, R) }).unwrap();
+        c.inserer(anonyme(40, 50, R), &mut |_, _| ()).unwrap();
+        c.inserer(Zone { nature: Nature::Tas, ..anonyme(50, 60, R) }, &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 40), (40, 50), (50, 60)]);
         c.invariants().unwrap();
         assert_eq!(c.trouver(10 * PAGE).map(|z| z.fin), Some(40 * PAGE));
@@ -640,83 +753,154 @@ mod tests {
         let mut c = carte(&[anonyme(10, 20, RW), anonyme(30, 40, R), anonyme(50, 60, RX)]);
         let mut retires = Vec::new();
         // Au milieu d'une zone : elle devient deux.
-        c.retirer(12 * PAGE, 14 * PAGE, |z| retires.push((z.debut / PAGE, z.fin / PAGE))).unwrap();
+        c.retirer(12 * PAGE, 14 * PAGE, |z| retires.push((z.debut / PAGE, z.fin / PAGE)), &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 12), (14, 20), (30, 40), (50, 60)]);
         // À cheval sur trois zones : un bout de chaque côté, une en entier.
-        c.retirer(15 * PAGE, 55 * PAGE, |z| retires.push((z.debut / PAGE, z.fin / PAGE))).unwrap();
+        c.retirer(15 * PAGE, 55 * PAGE, |z| retires.push((z.debut / PAGE, z.fin / PAGE)), &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 12), (14, 15), (55, 60)]);
         assert_eq!(retires, [(12, 14), (15, 20), (30, 40), (50, 55)]);
         // Rien dans la plage : pas d'erreur, rien de retiré. Une plage vide
         // au milieu d'une zone ne la coupe pas.
-        c.retirer(20 * PAGE, 50 * PAGE, |_| panic!("rien a retirer")).unwrap();
-        c.retirer(11 * PAGE, 11 * PAGE, |_| panic!("rien a retirer")).unwrap();
-        c.retirer(PAGE, PAGE, |_| panic!("rien a retirer")).unwrap();
+        c.retirer(20 * PAGE, 50 * PAGE, |_| panic!("rien a retirer"), &mut |_, _| ()).unwrap();
+        c.retirer(11 * PAGE, 11 * PAGE, |_| panic!("rien a retirer"), &mut |_, _| ()).unwrap();
+        c.retirer(PAGE, PAGE, |_| panic!("rien a retirer"), &mut |_, _| ()).unwrap();
         // Exactement une zone ; puis tout.
-        c.retirer(14 * PAGE, 15 * PAGE, |_| ()).unwrap();
+        c.retirer(14 * PAGE, 15 * PAGE, |_| (), &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 12), (55, 60)]);
-        c.retirer(0, 100 * PAGE, |_| ()).unwrap();
+        c.retirer(0, 100 * PAGE, |_| (), &mut |_, _| ()).unwrap();
         assert!(c.zones().is_empty());
-        assert_eq!(c.retirer(1, PAGE, |_| ()), Err(Erreur::PlageInvalide));
+        assert_eq!(c.retirer(1, PAGE, |_| (), &mut |_, _| ()), Err(Erreur::PlageInvalide));
     }
 
     #[test]
     fn changement_de_droits() {
         let mut c = carte(&[anonyme(10, 40, RW)]);
         // Le milieu en lecture seule : trois zones.
-        c.changer(20 * PAGE, 30 * PAGE, |z| z.droits = R).unwrap();
+        c.changer(20 * PAGE, 30 * PAGE, |z| z.droits = R, &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 20), (20, 30), (30, 40)]);
         // Rendu à ses droits : une seule zone de nouveau.
-        c.changer(20 * PAGE, 30 * PAGE, |z| z.droits = RW).unwrap();
+        c.changer(20 * PAGE, 30 * PAGE, |z| z.droits = RW, &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 40)]);
         // Sans changement, ou sur une plage vide : pas de coupe.
-        c.changer(15 * PAGE, 25 * PAGE, |z| z.droits = RW).unwrap();
-        c.changer(15 * PAGE, 15 * PAGE, |z| z.droits = R).unwrap();
+        c.changer(15 * PAGE, 25 * PAGE, |z| z.droits = RW, &mut |_, _| ()).unwrap();
+        c.changer(15 * PAGE, 15 * PAGE, |z| z.droits = R, &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 40)]);
         // Une plage plus large que la zone, avec des trous : seules les
         // parties projetées changent.
-        c.inserer(anonyme(50, 60, RX)).unwrap();
-        c.changer(0, 100 * PAGE, |z| z.droits = R).unwrap();
+        c.inserer(anonyme(50, 60, RX), &mut |_, _| ()).unwrap();
+        c.changer(0, 100 * PAGE, |z| z.droits = R, &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 40), (50, 60)]);
         assert!(c.zones().iter().all(|z| z.droits == R));
         // Devenues du même genre et contiguës : elles fusionnent.
-        c.inserer(anonyme(40, 50, RW)).unwrap();
-        c.changer(40 * PAGE, 50 * PAGE, |z| z.droits = R).unwrap();
+        c.inserer(anonyme(40, 50, RW), &mut |_, _| ()).unwrap();
+        c.changer(40 * PAGE, 50 * PAGE, |z| z.droits = R, &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 60)]);
         // Les bornes, si `change` les touche, sont remises.
         c.changer(10 * PAGE, 20 * PAGE, |z| {
             z.debut = 0;
             z.droits = RW;
-        }).unwrap();
+        }, &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 20), (20, 60)]);
+        c.invariants().unwrap();
+    }
+
+    /// Une zone qui projette le fichier `fichier` à partir de sa page `page`.
+    fn de_fichier(debut: u64, fin: u64, fichier: u32, page: u64) -> Zone {
+        Zone { fichier: Some(Projection { fichier, page }), ..anonyme(debut, fin, R) }
+    }
+
+    #[test]
+    fn taille_d_une_zone() {
+        // Le noyau compte sur elle pour borner sa carte : 65 530 zones de 48
+        // octets font 3 Mio (memoire.rs, espace_utilisateur.rs).
+        assert_eq!(size_of::<Zone>(), 48);
+    }
+
+    #[test]
+    fn la_carte_ne_depasse_pas_son_maximum() {
+        // Partie d'une page, comme dans le noyau : la capacité double,
+        // puis s'arrête au maximum (pas à la puissance de deux d'après).
+        let mut c = Zones::avec_capacite(85).unwrap();
+        c.maximum = 1000;
+        for i in 0..1000 {
+            c.inserer(anonyme(2 * i, 2 * i + 1, RW), &mut |_, _| ()).unwrap();
+        }
+        assert_eq!(c.zones.capacity(), 1000);
+        assert_eq!(c.inserer(anonyme(5000, 5001, RW), &mut |_, _| ()), Err(Erreur::TropDeZones));
+    }
+
+    #[test]
+    fn zones_de_fichier() {
+        // Les références : (fichier, total des +1 et -1).
+        let refs: [core::cell::Cell<i32>; 4] = Default::default();
+        let mut compter = |f: u32, d: i32| refs[f as usize].set(refs[f as usize].get() + d);
+        let r = |f: usize| refs[f].get();
+        let mut c = Zones::new();
+        // Pages du fichier 1 : 0..10 à l'adresse 10, puis 10..20 à 20 :
+        // contiguës dans le fichier aussi, une seule zone.
+        c.inserer(de_fichier(10, 20, 1, 0), &mut compter).unwrap();
+        c.inserer(de_fichier(20, 30, 1, 10), &mut compter).unwrap();
+        assert_eq!(pages(&c), [(10, 30)]);
+        // La page 50 du même fichier juste après : pas contiguë dans le
+        // fichier, deux zones. Un autre fichier, ou de l'anonyme : non plus.
+        c.inserer(de_fichier(30, 35, 1, 50), &mut compter).unwrap();
+        c.inserer(de_fichier(35, 40, 2, 25), &mut compter).unwrap();
+        c.inserer(anonyme(40, 45, R), &mut compter).unwrap();
+        assert_eq!(pages(&c), [(10, 30), (30, 35), (35, 40), (40, 45)]);
+        assert_eq!((r(1), r(2)), (2, 1));
+        // Combler un trou entre deux morceaux contigus du fichier : trois
+        // zones en une.
+        c.inserer(de_fichier(60, 70, 3, 0), &mut compter).unwrap();
+        c.inserer(de_fichier(80, 90, 3, 20), &mut compter).unwrap();
+        c.inserer(de_fichier(70, 80, 3, 10), &mut compter).unwrap();
+        assert_eq!(r(3), 1);
+        // Couper au milieu : le morceau de droite commence plus loin dans
+        // le fichier, et c'est une référence de plus.
+        c.retirer(65 * PAGE, 70 * PAGE, |z| assert_eq!(z.fichier.map(|p| p.page), Some(5)), &mut compter).unwrap();
+        let droite = *c.trouver(70 * PAGE).unwrap();
+        assert_eq!((droite.debut / PAGE, droite.fichier.map(|p| p.page), r(3)), (70, Some(10), 2));
+        assert_eq!(droite.page_de(75 * PAGE), Some(15));
+        // mprotect au milieu, puis retour : coupée en trois, puis refondue.
+        c.changer(72 * PAGE, 74 * PAGE, |z| z.droits = RW, &mut compter).unwrap();
+        assert_eq!(c.trouver(72 * PAGE).unwrap().fichier.map(|p| p.page), Some(12));
+        assert_eq!(r(3), 4);
+        c.changer(72 * PAGE, 74 * PAGE, |z| z.droits = R, &mut compter).unwrap();
+        assert_eq!(r(3), 2);
+        // Les morceaux d'une plage gardent leur page.
+        let m: Vec<_> = c.morceaux(75 * PAGE, 85 * PAGE).map(|z| z.fichier.unwrap().page).collect();
+        assert_eq!(m, [15]);
+        // Tout retirer : plus aucune référence.
+        c.retirer(0, 100 * PAGE, |_| (), &mut compter).unwrap();
+        assert!((0..4).all(|f| r(f) == 0));
         c.invariants().unwrap();
     }
 
     #[test]
     fn maximum_de_zones() {
         let mut c = Zones::avec_maximum(2);
-        c.inserer(anonyme(10, 20, RW)).unwrap();
-        c.inserer(anonyme(30, 40, RW)).unwrap();
-        assert_eq!(c.inserer(anonyme(50, 60, RW)), Err(Erreur::TropDeZones));
+        c.inserer(anonyme(10, 20, RW), &mut |_, _| ()).unwrap();
+        c.inserer(anonyme(30, 40, RW), &mut |_, _| ()).unwrap();
+        assert_eq!(c.inserer(anonyme(50, 60, RW), &mut |_, _| ()), Err(Erreur::TropDeZones));
         // Une insertion qui fusionne n'ajoute pas de zone : permise.
-        c.inserer(anonyme(40, 45, RW)).unwrap();
-        c.inserer(anonyme(20, 30, RW)).unwrap();
+        c.inserer(anonyme(40, 45, RW), &mut |_, _| ()).unwrap();
+        c.inserer(anonyme(20, 30, RW), &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 45)]);
-        c.inserer(anonyme(50, 60, RW)).unwrap();
+        c.inserer(anonyme(50, 60, RW), &mut |_, _| ()).unwrap();
         // Couper en deux ferait une troisième zone : refusé, rien ne change.
-        assert_eq!(c.retirer(12 * PAGE, 13 * PAGE, |_| panic!("rien ne doit etre retire")), Err(Erreur::TropDeZones));
-        assert_eq!(c.changer(12 * PAGE, 13 * PAGE, |z| z.droits = R), Err(Erreur::TropDeZones));
+        assert_eq!(c.retirer(12 * PAGE, 13 * PAGE, |_| panic!("rien ne doit etre retire"), &mut |_, _| ()), Err(Erreur::TropDeZones));
+        assert_eq!(c.changer(12 * PAGE, 13 * PAGE, |z| z.droits = R, &mut |_, _| ()), Err(Erreur::TropDeZones));
         assert_eq!(pages(&c), [(10, 45), (50, 60)]);
         // Un changement d'une zone entière ne coupe rien.
-        c.changer(50 * PAGE, 60 * PAGE, |z| z.droits = R).unwrap();
+        c.changer(50 * PAGE, 60 * PAGE, |z| z.droits = R, &mut |_, _| ()).unwrap();
         // Plus de place pour une zone de plus.
         assert_eq!(c.reserver(1), Err(Erreur::TropDeZones));
         assert_eq!(c.reserver(0), Ok(()));
         // Une coupe dont le morceau rejoint sa voisine : le compte ne
         // change pas, c'est permis.
         let mut c = Zones::avec_maximum(2);
-        c.inserer(anonyme(10, 20, RW)).unwrap();
-        c.inserer(anonyme(20, 30, R)).unwrap();
-        c.changer(15 * PAGE, 20 * PAGE, |z| z.droits = R).unwrap();
+        c.inserer(anonyme(10, 20, RW), &mut |_, _| ()).unwrap();
+        c.inserer(anonyme(20, 30, R), &mut |_, _| ()).unwrap();
+        c.changer(15 * PAGE, 20 * PAGE, |z| z.droits = R, &mut |_, _| ()).unwrap();
         assert_eq!(pages(&c), [(10, 15), (15, 30)]);
     }
 

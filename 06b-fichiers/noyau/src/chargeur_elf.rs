@@ -127,10 +127,12 @@ pub fn charger(executable: &Executable, nom: NomCourt, lire: impl Fn(u64, &mut [
         };
         let drapeaux = Drapeaux::default();
         if fin_fichier > debut {
-            memoire.zones.inserer(Zone { debut, fin: fin_fichier, droits, nature: Nature::Programme, drapeaux })?;
+            let zone = Zone { debut, fin: fin_fichier, droits, nature: Nature::Programme, drapeaux, fichier: None };
+            memoire.zones.inserer(zone, &mut memoire::references)?;
         }
         if fin > fin_fichier {
-            memoire.zones.inserer(Zone { debut: fin_fichier, fin, droits, nature: Nature::Anonyme, drapeaux })?;
+            let zone = Zone { debut: fin_fichier, fin, droits, nature: Nature::Anonyme, drapeaux, fichier: None };
+            memoire.zones.inserer(zone, &mut memoire::references)?;
         }
         // La part du fichier, copiée par morceaux (la bibliothèque a
         // vérifié qu'elle est dans le fichier).
@@ -158,8 +160,9 @@ pub fn charger(executable: &Executable, nom: NomCourt, lire: impl Fn(u64, &mut [
         droits: Droits { lecture: true, ecriture: true, execution: executable.pile_executable() },
         nature: Nature::Pile,
         drapeaux: Drapeaux { vers_le_bas: true, ..Drapeaux::default() },
+        fichier: None,
     };
-    memoire.zones.inserer(pile)?;
+    memoire.zones.inserer(pile, &mut memoire::references)?;
     // Un tas vide, à la page qui suit le dernier segment (comme Linux sans
     // ASLR).
     let tas = executable.fin().next_multiple_of(4096);

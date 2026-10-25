@@ -31,7 +31,7 @@ use core::fmt;
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::espace_utilisateur::ADRESSE_MAX;
 use crate::interruptions::Cadre;
-use crate::memoire::{Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
+use crate::memoire::{self, Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Zone};
 use crate::appels_fichiers as f;
 use crate::{aleatoire, cpu, horloge, pages, processus, tache, temps};
@@ -384,11 +384,12 @@ fn brk(demande: u64) -> i64 {
                 droits: Droits { lecture: true, ecriture: true, execution: false },
                 nature: Nature::Tas,
                 drapeaux: Drapeaux::default(),
+                fichier: None,
             };
             // La zone se fond dans celle du tas.
             if !engagement_possible(pages_apres - pages_avant)
                 || !m.zones.libre(pages_avant, pages_apres + PAGE, ECART_GARDE)
-                || m.zones.inserer(zone).is_err()
+                || m.zones.inserer(zone, &mut memoire::references).is_err()
             {
                 return actuelle;
             }
@@ -506,7 +507,7 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, _fichier: u64, de
             m.chercher_place(taille, adresse).ok_or(-ENOMEM)?
         };
         let drapeaux = Drapeaux { sans_reserve, ..Drapeaux::default() };
-        let zone = Zone { debut, fin: debut + taille, droits, nature: Nature::Anonyme, drapeaux };
+        let zone = Zone { debut, fin: debut + taille, droits, nature: Nature::Anonyme, drapeaux, fichier: None };
         m.ajouter(zone, fixe).map_err(|_| -ENOMEM)?;
         Ok(debut)
     });
@@ -733,7 +734,7 @@ fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
                     DOFORK => z.drapeaux.ne_pas_dupliquer = false,
                     WIPEONFORK => z.drapeaux.effacer_au_fork = true,
                     _ => z.drapeaux.effacer_au_fork = false,
-                })
+                }, &mut memoire::references)
                 .map_err(|_| -ENOMEM)
         }),
         // Les indications sans effet.

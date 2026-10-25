@@ -38,7 +38,9 @@
 
 use core::fmt;
 
+use crate::descripteurs::Fichier;
 use crate::espace_utilisateur::{self, Erreur, EspaceUtilisateur};
+use crate::vfs;
 use crate::programmes::NomCourt;
 use zones::{Droits, Nature, Sens, Zone, Zones};
 
@@ -91,6 +93,17 @@ pub const fn disposition() -> Disposition {
 /// seule, est accepté.
 pub fn engagement_possible(octets: u64) -> bool {
     octets / PAGE <= crate::pages::total() as u64
+}
+
+/// Une zone de fichier apparaît (+1, une coupe) ou disparaît (-1, une
+/// fusion, un retrait) : son fichier ouvert est tenu une fois de plus, ou
+/// de moins (descripteurs.rs). Chaque zone de fichier tient ainsi son
+/// fichier, qui survit à `close` tant qu'il est projeté (voir ../zones).
+/// Appelée sous le verrou du processus : prend celui des fichiers, dans
+/// l'ordre permis.
+pub fn references(fichier: u32, delta: i32) {
+    let f = Fichier::de(fichier);
+    vfs::avec_systeme(|s, cadres| if delta > 0 { s.ouverts.prendre(f) } else { s.lacher(f, cadres) });
 }
 
 impl From<zones::Erreur> for Erreur {
@@ -175,7 +188,7 @@ impl Memoire {
     /// Une mémoire vide : pas de zones, un espace neuf. Le tas est placé
     /// par le chargeur.
     pub fn creer(nom: NomCourt) -> Result<Memoire, Erreur> {
-        // La carte occupe d'emblée une page entière (170 zones), et
+        // La carte occupe d'emblée une page entière (85 zones), et
         // grandit en blocs de pages : le tas du noyau prend les blocs de
         // plus de 2 Kio directement à l'allocateur de pages, et les lui
         // rend à la destruction du programme. Une petite carte, elle,
@@ -236,7 +249,7 @@ impl Memoire {
     /// changer, si une zone doit être coupée en deux et que la carte n'a
     /// plus de place (ENOMEM).
     pub fn retirer(&mut self, debut: u64, fin: u64) -> Result<(), Erreur> {
-        self.zones.retirer(debut, fin, |_| ())?;
+        self.zones.retirer(debut, fin, |_| (), &mut references)?;
         self.espace.retirer_plage(debut, fin, true);
         Ok(())
     }
@@ -278,7 +291,7 @@ impl Memoire {
             self.zones.reserver(2)?;
             self.retirer(zone.debut, zone.fin)?;
         }
-        self.zones.inserer(zone)?;
+        self.zones.inserer(zone, &mut references)?;
         Ok(())
     }
 
@@ -299,7 +312,7 @@ impl Memoire {
         if !self.zones.morceaux(debut, fin).all(promise) {
             return Err(Erreur::PlusDeMemoire);
         }
-        self.zones.changer(debut, fin, |z| z.droits = droits)?;
+        self.zones.changer(debut, fin, |z| z.droits = droits, &mut references)?;
         self.espace.proteger_plage(debut, fin, droits);
         Ok(())
     }
