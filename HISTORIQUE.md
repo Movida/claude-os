@@ -220,7 +220,25 @@ Dossier `06b-fichiers/`, en treize commits (et un d'outillage), d'après le plan
 - la carte des zones ne double plus au-delà de son maximum (3 Mio au lieu de 4) ;
 - une vingtaine d'écarts de codes d'erreur ou d'ordre des vérifications (open, utimensat, fcntl et ses verrous, FIONREAD, lseek, readv, prlimit64...), et des commentaires devenus faux.
 
-## 16. Reste à faire
+## 16. Sous-étape 6c réalisée : les programmes dynamiques
+
+Dossier `06c-dynamique/`, en cinq commits, d'après le plan écrit au début de son fil et relu deux fois par des relecteurs indépendants, la seconde en effort élevé (`plan-6c.md` dans les fichiers du projet ; 18 puis 11 constats intégrés avant de coder). **Décision de David :** copier la glibc de la machine dans l'archive de démarrage (rien n'est téléchargé ni commité), et le lanceur `/etc/demarrage`.
+
+1. **Les exécutables ET_DYN et PT_INTERP, lus par `formats::elf`** : la disposition relative des segments d'abord, puis `Executable::placer` pose l'image à l'adresse choisie par le noyau (le `load_bias` de Linux) ; seule l'image placée donne des adresses absolues. PT_INTERP (le premier, de 2 à 4096 octets, le préfixe jusqu'au premier zéro, comme Linux), l'alignement (`maximum_alignment`), l'étendue (`total_mapping_size`). Testé sur de vrais fichiers par des propriétés, et par 20 000 mutations à graine fixe contrôlées par un second calcul indépendant.
+2. **Le lanceur, `/etc/demarrage`** (choix de conception) : sans `fork` ni `execve` (6k), le noyau joue le rôle d'`init` et lance une commande par ligne, avec ses arguments et son environnement. Un sous-ensemble strict de la syntaxe du `sh` de POSIX (dash), vérifié contre le `sh` de la machine : le programme par son chemin absolu, `NOM=valeur` en tête, et une seule entorse, `--dir=` pour les dossiers pré-ouverts d'un programme WebAssembly. Le droit d'exécuter vérifié avant tout, pour tous les formats ; plus de limite de 32 arguments (celles de Linux : la place, 128 Kio par chaîne) ; WASI apprend une table des dossiers pré-ouverts, `args_get` et `environ_get`.
+3. **Les ET_DYN placés par le noyau** : un `gcc -static-pie` posé comme une projection, du haut vers le bas, à son alignement (`Zones::trou` apprend l'alignement) ; son tas à `ELF_ET_DYN_BASE` (0x555555555000), comme Linux 6.18, pour ne pas buter contre la pile.
+4. **PT_INTERP : le noyau charge ld-linux** (choix de conception : le noyau ne charge que le programme et son interpréteur ; ld-linux projette lui-même la glibc). Un PIE à 0x555555554000, ld-linux tout en haut des projections, AT_BASE, AT_ENTRY, le départ à l'entrée de l'interpréteur ; l'interpréteur protégé contre l'écriture le temps du chargement seulement, ses erreurs avec l'errno de Linux (ENOENT, EACCES, EIO, ELIBBAD, ENOEXEC). La glibc de la machine copiée dans `glibc/` aux chemins d'Ubuntu (`/usr` fusionné), avec un `/etc/ld.so.cache` fabriqué par `ldconfig -r`. `bonjour-c-dynamique` tourne, lancé par le noyau comme par ld-linux à la main ; `make trace` montre les mêmes appels que `strace` sur l'hôte (sauf `rseq`, ENOSYS, et une allocation de ld-linux qui dépend des glibc-hwcaps du processeur).
+5. **Les bibliothèques de `claude`, et `dlopen`** : `libm`, `libpthread`, `libdl`, `librt` ; `linux/dynamique.c`, lié aux cinq (`-l:libpthread.so.0`... : depuis la glibc 2.34, `-lpthread` ne lie plus rien), charge une bibliothèque à nous de `/usr/local/lib` (constructeur, destructeur, variable `__thread` : le TLS dynamique), sur l'hôte comme chez nous. Aucun appel système nouveau : 6b avait tout ce que demandent ld-linux, `dlopen` et le TLS.
+
+**Relecture de fond :** trois relecteurs indépendants en effort élevé (les bibliothèques, le noyau, la construction et l'historique). Bibliothèques sans défaut grave sur 80 millions d'ELF comparés à un modèle en u128, 12 millions de mutations de vrais fichiers, 300 000 lignes comparées à dash ; aucune fuite de référence sur 45 lignes piégées. 25 constats, repliés dans leurs commits, chacun avec un test :
+- **une panique du noyau** : une ligne de `/etc/demarrage` qui désigne un dossier (la signature était lue avant de vérifier le droit d'exécuter) ;
+- une barre finale ignorée (`/bin/x/` exécutait le fichier, Linux dit ENOTDIR), une fuite de la console quand WASI manque de place, « memoire rendue : ECHEC » à tort pour un interpréteur à grosse table, un static-pie refusé quand sa première adresse tombait dans la région de la pile ;
+- des tests qui ne mordaient pas : `interp-milieu` écrivait sa ligne sans ld-linux, la fin de `dlclose` était vérifiée par ld-linux et non par le noyau, des lignes refusées attendues sans leur numéro, un `argv` vérifié par un préfixe, quatre mutations survivantes ;
+- la copie de la glibc décidée par la date (dpkg garde celle de la construction du paquet) : par le contenu désormais ; la vérification de version trop stricte pour la CI (la révision d'Ubuntu, au lieu de 2.39) ;
+- la promesse « sous-ensemble strict de sh », fausse pour un mot réservé en tête (`if /bin/x`) : le chemin absolu exigé par la bibliothèque ;
+- des écarts avec Linux écrits en commentaire, des commentaires faux, `DUREE` portée à 12 s (14,6 s mesurées sur une machine saturée par les trois relectures, dont les délais fixes faisaient échouer `verifier-historique.sh` à tort).
+
+## 17. Reste à faire
 
 **Dans le noyau**
 
@@ -242,8 +260,11 @@ Dossier `06b-fichiers/`, en treize commits (et un d'outillage), d'après le plan
 - **Le siècle de l'horloge CMOS** est dans un registre que désigne la table ACPI FADT (6e) ; d'ici là, une année avant 70 est dans les années 2000, comme Linux.
 - **O_TMPFILE et RENAME_WHITEOUT** : refusés (EOPNOTSUPP, EINVAL) ; le premier pour des fichiers sans nom, le second pour overlayfs.
 - **La recherche d'un nom dans un dossier** parcourt ses entrées ; une table de hachage (le dcache de Linux) si une mesure le demande.
-- **Écarts voulus avec Linux**, écrits en commentaire : mprotect sur une plage avec un trou ne change rien (Linux change ce qui précède le trou) ; MAP_FIXED est refusé à une zone du maximum même quand les fusions l'auraient fait tenir ; une zone rendue inscriptible deux fois est recomptée (pas de VM_ACCOUNT).
+- **Écarts voulus avec Linux**, écrits en commentaire : un interpréteur passe par toutes les vérifications du programme (Linux ne vérifie son genre et ses segments qu'après le point de non-retour, et tue le processus), et un interpréteur qui chevauche le programme est refusé (Linux le pose par-dessus) ; un ET_DYN dont un `p_vaddr` relatif dépasse TASK_SIZE est accepté si l'image posée est permise ; mprotect sur une plage avec un trou ne change rien (Linux change ce qui précède le trou) ; MAP_FIXED est refusé à une zone du maximum même quand les fusions l'auraient fait tenir ; une zone rendue inscriptible deux fois est recomptée (pas de VM_ACCOUNT).
 - **Archive cpio** : archives concaténées et compressées.
+- **La console écrit au plus 1024 octets par appel**, et ld-linux ne reprend pas une écriture courte (`ld.so --help` est coupé ; stdio et Bun reprennent). Linux n'écrit jamais court sur un terminal, mais il peut attendre et être interrompu ; notre port série fait attendre activement : le terminal à interruptions et sa file (6j).
+- **Le lanceur `/etc/demarrage`** cède la place à un vrai `/init` et à un shell avec `fork` et `execve` (6k) ; son dossier courant est `/`, que l'utilisateur 1000 ne peut pas écrire (à revoir pour `claude`, 6i). Un budget de temps par ligne (RLIMIT_CPU) viendra avec 6d.
+- **Le vecteur auxiliaire** n'a pas AT_SYSINFO_EHDR (le vDSO, 6m), AT_MINSIGSTKSZ (6f), AT_RSEQ_* ; `rseq` rend ENOSYS : la glibc a un repli pour chacun.
 - **Tas :** des listes par processeur pour le multiprocesseur.
 
 **Pour le vrai matériel**
@@ -251,10 +272,10 @@ Dossier `06b-fichiers/`, en treize commits (et un d'outillage), d'après le plan
 - **NMI pendant le passage éclair en mode protégé du chargeur** : non masqué (Linux le masque par le port 0x70 pour son passage définitif). Risque infime, à revoir si un essai sur vrai matériel le montre.
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 17. Questions ouvertes
+## 18. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 18. Prochaine étape
+## 19. Prochaine étape
 
-Sous-étape 6c : les programmes dynamiques. Le noyau charge l'interpréteur que demande un exécutable (PT_INTERP : ld-linux), qui projette lui-même la glibc partagée depuis le système de fichiers, avec mmap de fichiers et les appels qu'il lui faut. Son plan sera écrit et relu au début de son fil, avec ce que 6b a appris.
+Sous-étape 6d : `claude --version`. Le binaire (jamais dans le dépôt, « All rights reserved ») dans l'archive, 291 Mo lus par le chargeur, `-cpu Nehalem`, `-m 2G` ; `/proc/self/maps`, `statm`, `cgroup`, `/sys/devices/system/cpu/online` ; `rt_sigaction`, `epoll`, `eventfd`, `uname`... ; RLIMIT_CPU infini par défaut, et le budget de temps par ligne de `/etc/demarrage`. **Il faudra l'accord écrit de David** pour qu'une session télécharge et exécute `claude`. Son plan sera écrit et relu au début de son fil, avec ce que 6c a appris.
