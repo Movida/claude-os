@@ -64,6 +64,12 @@ const PAGE: u64 = 4096;
 const AUCUN: u8 = 0xFF;
 const ALLOUE: u8 = 0x80;
 
+// Les drapeaux d'un cadre (`Descripteur::drapeaux`).
+/// La page appartient à un fichier (son cache des pages, vfs.rs) : elle ne
+/// devient jamais inscriptible dans la projection privée d'un programme
+/// (espace_utilisateur.rs).
+pub const FICHIER: u8 = 1 << 0;
+
 /// Le descripteur d'un cadre (la « struct page » de Linux, en 8 octets).
 #[derive(Clone, Copy)]
 #[repr(C)]
@@ -306,6 +312,17 @@ pub fn compter_objets(cadre: u64, plus: bool) -> u16 {
     let d = bloc_alloue(&mut pages, cadre, 0);
     d.objets = if plus { d.objets + 1 } else { d.objets - 1 };
     d.objets
+}
+
+/// Les drapeaux du cadre `cadre` (une page allouée).
+pub fn drapeaux(cadre: u64) -> u8 {
+    bloc_alloue(&mut PAGES.verrouiller(), cadre, 0).drapeaux
+}
+
+/// Pose les drapeaux `drapeaux` sur le cadre `cadre` (une page allouée).
+/// Ils tombent quand le cadre est rendu.
+pub fn marquer(cadre: u64, drapeaux: u8) {
+    bloc_alloue(&mut PAGES.verrouiller(), cadre, 0).drapeaux |= drapeaux;
 }
 
 /// Combien de fois le cadre `cadre` (une page allouée) est pris.

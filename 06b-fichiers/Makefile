@@ -199,7 +199,7 @@ $(LINUX)/bonjour-c-dynamique: linux/bonjour.c
 # programmes après tout cela.
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle \
-              wx derniere-page et-dyn tronque
+              wx derniere-page et-dyn tronque bus-fichier
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
 	mkdir -p $(LINUX)/tests

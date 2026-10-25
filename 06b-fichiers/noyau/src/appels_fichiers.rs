@@ -10,7 +10,8 @@
 //!      des fichiers (vfs.rs), le fichier ouvert, l'inode, la page ;
 //!   3. rendre les verrous, puis seulement copier entre la page et le
 //!      programme : une copie peut faire une faute de page, qui prend le
-//!      verrou du processus (et bientôt celui des fichiers). La page est
+//!      verrou du processus, et celui des fichiers pour une page projetée
+//!      d'un fichier (memoire.rs). La page est
 //!      tenue (pages::prendre) pendant la copie : elle ne peut pas
 //!      disparaître sous elle, comme dans le `filemap_read` de Linux.
 //! Un seul fil par programme : personne ne peut fermer un descripteur
@@ -178,7 +179,7 @@ pub fn ouvrir_pour_le_noyau(chemin: &[u8], lecture: bool, ecriture: bool) -> Res
             return Err(Erreur::ENXIO);
         };
         let drapeaux = O_LARGEFILE | if ecriture && lecture { 2 } else if ecriture { O_WRONLY } else { O_RDONLY };
-        s.ouverts.ajouter(FichierOuvert::new(sorte, ouvert, lecture, ecriture, drapeaux as u32)).map_err(|f| {
+        s.ouverts.ajouter(FichierOuvert::new(sorte, ouvert, lecture, ecriture, drapeaux as u32, chemin)).map_err(|f| {
             s.fs.fermer(&f.ouvert, cadres);
             Erreur::ENOMEM
         })
@@ -250,21 +251,26 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
                 return Err(e);
             }
         };
-        if ouvert.tronquer {
-            // Le fichier a été ouvert : vider ne peut plus échouer (une
-            // taille nulle n'est jamais trop grande).
-            let _ = s.fs.tronquer(ouvert.numero, 0, maintenant, cadres);
-        }
         // Ce que rendra F_GETFL : les drapeaux d'état, O_LARGEFILE toujours
         // (un noyau 64 bits l'impose), sauf pour O_PATH, dont Linux ne garde
         // que les drapeaux d'O_PATH ; pas ceux qui ne servent qu'à open.
         let largefile = if chemin_seul { 0 } else { O_LARGEFILE };
         let gardes = (drapeaux & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC)) | largefile;
-        s.ouverts.ajouter(FichierOuvert::new(sorte, ouvert, o.lecture, o.ecriture, gardes as u32)).map_err(|f| {
-            s.fs.fermer(&f.ouvert, cadres);
-            -ENOMEM
-        })
+        let fichier = s.ouverts.ajouter(FichierOuvert::new(sorte, ouvert, o.lecture, o.ecriture, gardes as u32, &chemin))
+            .map_err(|f| {
+                s.fs.fermer(&f.ouvert, cadres);
+                -ENOMEM
+            })?;
+        Ok((fichier, ouvert))
     })?;
+    let (fichier, ouvert) = fichier;
+    // O_TRUNC, hors du verrou des fichiers : il faut d'abord retirer les
+    // pages des projections, sous celui du processus (`tronquer`). Le
+    // fichier est ouvert : vider ne peut plus échouer (une taille nulle
+    // n'est jamais trop grande).
+    if ouvert.tronquer {
+        tronquer(ouvert.numero, 0);
+    }
     let d = Descripteur { fichier, fermer_a_l_exec: drapeaux & O_CLOEXEC != 0 };
     if processus::avec(|p| p.descripteurs.installer(fd, d)).is_err() {
         vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
@@ -737,6 +743,25 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
         }
         _ => -EINVAL,
     }
+}
+
+/// Ce que mmap doit savoir du fichier du descripteur `fd` : le fichier
+/// ouvert, sa sorte, et s'il a été ouvert en lecture et en écriture. Un
+/// descripteur invalide ou O_PATH : EBADF (le `fget` de Linux ne rend pas
+/// les fichiers O_PATH).
+pub struct PourProjeter {
+    pub fichier: Fichier,
+    pub sorte: Sorte,
+    pub lecture: bool,
+    pub ecriture: bool,
+}
+
+pub fn pour_projeter(fd: u64) -> Result<PourProjeter, i64> {
+    let o = ouvert(fd)?;
+    if o.sorte == Sorte::Chemin {
+        return Err(-EBADF);
+    }
+    Ok(PourProjeter { fichier: o.fichier, sorte: o.sorte, lecture: o.lecture, ecriture: o.ecriture })
 }
 
 /// La « struct stat » de Linux sur x86_64 (144 octets), d'après les
@@ -1543,11 +1568,42 @@ pub fn fchdir(fd: u64) -> i64 {
 }
 
 /// Ramène le fichier `n` à `taille` octets.
+///
+/// Les pages qui disparaissent sont d'abord retirées des projections du
+/// processus, copies privées comprises (mesuré sous Linux : une page
+/// copiée puis le fichier raccourci et rallongé se relit à zéro), comme
+/// `truncate_pagecache` : un accès au-delà de la nouvelle fin fera SIGBUS.
+/// Le tmpfs ne lâche ses pages qu'ensuite. Il faudrait le faire dans
+/// chaque processus qui projette le fichier (la carte inverse `i_mmap` de
+/// Linux) : avec un seul processus à la fois, c'est le processus en cours
+/// (à généraliser avec l'ordonnanceur, 6e).
 fn tronquer(n: Numero, taille: u64) -> i64 {
+    retirer_projections(n, taille.div_ceil(PAGE));
     match vfs::avec(|fs, cadres| fs.tronquer(n, taille, temps::maintenant(), cadres)) {
         Ok(()) => 0,
         Err(e) => errno(e),
     }
+}
+
+/// Retire des projections du processus en cours les pages du fichier `n`
+/// de numéro `premiere` ou plus (le `unmap_mapping_range` de Linux, copies
+/// comprises). Les zones restent : un accès y refera une faute.
+fn retirer_projections(n: Numero, premiere: u64) {
+    processus::essayer_avec(|p| {
+        let m = &mut p.memoire;
+        let mut i = 0;
+        while let Some(z) = m.zones.zones().get(i).copied() {
+            i += 1;
+            let Some(projection) = z.fichier else { continue };
+            let numero = vfs::avec_systeme(|s, _| s.ouverts.fichier(Fichier::de(projection.fichier)).ouvert.numero);
+            let fin = projection.page + z.taille() / PAGE;
+            if numero != n || fin <= premiere {
+                continue;
+            }
+            let debut = z.debut + premiere.saturating_sub(projection.page) * PAGE;
+            m.espace.retirer_plage(debut, z.fin, false);
+        }
+    });
 }
 
 /// truncate(chemin, taille) : une taille négative : EINVAL ; les

@@ -74,3 +74,7 @@
 [linux] Bonjour depuis l'anneau 3
 [noyau] bonjour-asm : termine, code de sortie 42 ; memoire rendue : ok.
 [noyau] Fin des tests : extinction de QEMU.
+[linux] Test : lire une projection au-dela de la fin du fichier.
+[noyau] bus-fichier : bus error at 0x
+ error 4 (au-dela de la fin du fichier) dans bus-fichier[401000+1000] (SIGBUS)
+[noyau] bus-fichier : termine, code de sortie 135 ; memoire rendue : ok.

@@ -28,6 +28,7 @@
 
 use alloc::vec::Vec;
 
+use crate::programmes::NomCourt;
 use fichiers::tmpfs::Ouvert;
 
 /// Ce que font les appels sur un fichier ouvert (les file_operations).
@@ -67,14 +68,19 @@ pub struct FichierOuvert {
     pub drapeaux: u32,
     /// La position (pour un dossier : celle de `lire_dossier`).
     pub position: u64,
+    /// Le nom de base du chemin par lequel il a été ouvert, pour les
+    /// messages (« dans libc.so.6[...] »). Le chemin entier servira à
+    /// /proc/self/maps (6d).
+    pub nom: NomCourt,
     /// Combien le tiennent : ses descripteurs, et les zones qui le
     /// projettent.
     references: u32,
 }
 
 impl FichierOuvert {
-    pub fn new(sorte: Sorte, ouvert: Ouvert, lecture: bool, ecriture: bool, drapeaux: u32) -> FichierOuvert {
-        FichierOuvert { sorte, ouvert, lecture, ecriture, drapeaux, position: 0, references: 1 }
+    pub fn new(sorte: Sorte, ouvert: Ouvert, lecture: bool, ecriture: bool, drapeaux: u32, chemin: &[u8]) -> FichierOuvert {
+        let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').find(|n| !n.is_empty()).unwrap_or(chemin));
+        FichierOuvert { sorte, ouvert, lecture, ecriture, drapeaux, position: 0, nom, references: 1 }
     }
 }
 
@@ -86,6 +92,10 @@ impl Fichier {
     /// Le numéro tel que le garde une zone de fichier (../zones).
     pub fn de(numero: u32) -> Fichier {
         Fichier(numero)
+    }
+
+    pub fn numero(self) -> u32 {
+        self.0
     }
 }
 

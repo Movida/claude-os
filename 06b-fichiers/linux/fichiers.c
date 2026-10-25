@@ -25,6 +25,7 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <sys/uio.h>
 #include <unistd.h>
 
@@ -709,6 +710,140 @@ static void arborescence_bornes(void)
     verifier(rmdir(d) == 0, "tout effacer (bornes)");
 }
 
+/* Les projections de fichiers, en privé : les comportements mesurés sous
+ * Linux (le plan de 6b). */
+static void projections(void)
+{
+    char p_nom[64];
+    nom(p_nom, "p");
+    int fd = open(p_nom, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    char page[4096];
+    memset(page, 'a', sizeof page);
+    verifier(write(fd, page, sizeof page) == sizeof page && write(fd, "bonjour", 7) == 7, "un fichier de 4103 octets");
+
+    /* En lecture : le contenu du fichier ; au-delà de la fin, dans la
+     * dernière page, des zéros. */
+    char *p = mmap(NULL, 8192, PROT_READ, MAP_PRIVATE, fd, 0);
+    verifier(p != MAP_FAILED && p[0] == 'a' && memcmp(p + 4096, "bonjour", 7) == 0 && p[4103] == 0 && p[8191] == 0,
+             "projection en lecture : le fichier, puis des zeros dans la derniere page");
+    /* Une page pas encore copiée voit ce qu'on écrit dans le fichier. */
+    verifier(pwrite(fd, "B", 1, 4096) == 1 && p[4096] == 'B', "la projection voit une ecriture dans le fichier");
+    munmap(p, 8192);
+
+    /* En écriture privée : la copie à l'écriture, le fichier ne change pas. */
+    p = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    p[1] = 'Z';
+    char lu[8];
+    verifier(pread(fd, lu, 2, 0) == 2 && lu[1] == 'a' && p[1] == 'Z', "ecrire dans une projection privee ne change pas le fichier");
+    verifier(pwrite(fd, "Y", 1, 1) == 1 && p[1] == 'Z', "une page copiee ne voit plus le fichier");
+    verifier(madvise(p, 4096, MADV_DONTNEED) == 0 && p[1] == 'Y', "MADV_DONTNEED : le contenu du fichier revient");
+    munmap(p, 8192);
+
+    /* mprotect qui ajoute l'écriture : la page du fichier n'est toujours
+     * pas écrite, elle est copiée. */
+    p = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    char avant = p[2];
+    verifier(mprotect(p, 4096, PROT_READ | PROT_WRITE) == 0, "mprotect ajoute l'ecriture");
+    p[2] = 'Q';
+    verifier(pread(fd, lu, 1, 2) == 1 && lu[0] == avant, "apres mprotect, l'ecriture est encore une copie");
+    munmap(p, 4096);
+
+    /* Une projection survit à close et à unlink. */
+    p = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, fd, 0);
+    int ro = open(p_nom, O_RDONLY);
+    close(fd);
+    unlink(p_nom);
+    verifier(p[3] == 'a', "la projection survit a close et a unlink");
+    munmap(p, 4096);
+
+    /* Les erreurs, dans l'ordre de Linux. */
+    errno = 0;
+    verifier(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, ro, 1) == MAP_FAILED && errno == EINVAL, "decalage non aligne : EINVAL");
+    errno = 0;
+    verifier(mmap(NULL, 0, PROT_READ, MAP_PRIVATE, 999, 0) == MAP_FAILED && errno == EBADF,
+             "descripteur invalide, meme avec une longueur nulle : EBADF");
+    errno = 0;
+    verifier(mmap(NULL, 0, PROT_READ, MAP_PRIVATE, ro, 0) == MAP_FAILED && errno == EINVAL, "longueur nulle : EINVAL");
+    errno = 0;
+    verifier(mmap(NULL, 8192, PROT_READ, MAP_PRIVATE, ro, 0x7ffffffffffff000L) == MAP_FAILED && errno == EOVERFLOW,
+             "au-dela de la plus grande taille de fichier : EOVERFLOW");
+    /* La dernière page permise finit juste sous 2^63 octets : à 2^51 - 2
+     * pages, une page tient ; à 2^51 - 1, plus. */
+    char *bord = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, ro, ((1L << 51) - 2) * 4096);
+    errno = 0;
+    verifier(bord != MAP_FAILED && mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, ro, ((1L << 51) - 1) * 4096) == MAP_FAILED
+             && errno == EOVERFLOW, "la derniere page sous 2^63 octets : permise, la suivante : EOVERFLOW");
+    munmap(bord, 4096);
+    /* MADV_POPULATE_READ au-delà de la fin du fichier : la faute ferait
+     * SIGBUS, madvise rend EFAULT. */
+    char *peuple = mmap(NULL, 3 * 4096, PROT_READ, MAP_PRIVATE, ro, 0);
+    errno = 0;
+    verifier(madvise(peuple, 2 * 4096, MADV_POPULATE_READ) == 0 && madvise(peuple, 3 * 4096, MADV_POPULATE_READ) == -1
+             && errno == EFAULT, "MADV_POPULATE_READ : jusqu'a la fin du fichier, puis EFAULT");
+    munmap(peuple, 3 * 4096);
+    char *loin = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, ro, 1L << 30);
+    verifier(loin != MAP_FAILED, "un decalage au-dela de la fin est permis (l'acces fera SIGBUS)");
+    munmap(loin, 4096);
+    char *ecrire = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, ro, 0);
+    verifier(ecrire != MAP_FAILED, "PROT_WRITE en prive d'un fichier en lecture seule : permis");
+    munmap(ecrire, 4096);
+    errno = 0;
+    verifier(mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, ro, 0) == MAP_FAILED && errno == EACCES,
+             "MAP_SHARED et PROT_WRITE d'un fichier en lecture seule : EACCES");
+    close(ro);
+    char w_nom[64];
+    int w = open(nom(w_nom, "w"), O_CREAT | O_WRONLY, 0644);
+    errno = 0;
+    verifier(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, w, 0) == MAP_FAILED && errno == EACCES,
+             "un fichier ouvert en ecriture seule : EACCES");
+    close(w);
+    unlink(w_nom);
+    int d = open("/tmp", O_RDONLY | O_DIRECTORY);
+    errno = 0;
+    verifier(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, d, 0) == MAP_FAILED && errno == ENODEV, "un dossier : ENODEV");
+    close(d);
+    int null = open("/dev/null", O_RDWR);
+    errno = 0;
+    verifier(mmap(NULL, 4096, PROT_READ, MAP_PRIVATE, null, 0) == MAP_FAILED && errno == ENODEV, "/dev/null : ENODEV");
+    close(null);
+    int zero = open("/dev/zero", O_RDWR);
+    char *z = mmap(NULL, 8192, PROT_READ | PROT_WRITE, MAP_PRIVATE, zero, 0);
+    verifier(z != MAP_FAILED && z[0] == 0 && (z[4096] = 1) == 1, "/dev/zero en prive : de la memoire anonyme");
+    munmap(z, 8192);
+    close(zero);
+
+    /* Une page copiée, puis le fichier raccourci à zéro et rallongé : la
+     * copie est perdue, la page se relit à zéro (truncate_pagecache retire
+     * aussi les copies). */
+    fd = open(p_nom, O_CREAT | O_RDWR | O_TRUNC, 0644);
+    if (ftruncate(fd, 10) != 0)
+        verifier(0, "ftruncate");
+    p = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+    p[0] = 'a';
+    verifier(ftruncate(fd, 0) == 0 && ftruncate(fd, 10) == 0 && p[0] == 0,
+             "ftruncate retire aussi les pages copiees des projections");
+    munmap(p, 4096);
+
+    /* Un fichier de 64 Mio, creux, projeté en entier : n'en toucher qu'une
+     * page ne coûte qu'une page (et quelques tables). Mesuré par sysinfo,
+     * ce qui n'a de sens que chez nous : sur l'hôte, d'autres programmes
+     * prennent et rendent de la mémoire en même temps. */
+    if (access("/etc/bonjour.txt", F_OK) == 0) {
+        struct sysinfo avant, apres;
+        verifier(ftruncate(fd, 64 << 20) == 0, "un fichier creux de 64 Mio");
+        p = mmap(NULL, 64 << 20, PROT_READ, MAP_PRIVATE, fd, 0);
+        sysinfo(&avant);
+        volatile char c = p[32 << 20];
+        (void)c;
+        sysinfo(&apres);
+        long prises = (long)(avant.freeram - apres.freeram) / 4096;
+        verifier(p != MAP_FAILED && prises >= 1 && prises <= 8, "64 Mio projetes, une page touchee : quelques pages prises");
+        munmap(p, 64 << 20);
+    }
+    close(fd);
+    unlink(p_nom);
+}
+
 /* Le sticky de /tmp : on n'y efface pas le fichier d'un autre. Il faut un
  * fichier d'un autre utilisateur : notre archive en met un (/tmp/a-root) ;
  * sur l'hôte, le cas est sauté. */
@@ -744,6 +879,7 @@ int main(int argc, char **argv)
     programme_en_cours(argv[0]);
     arborescence();
     arborescence_bornes();
+    projections();
     sticky();
     struct stat st;
     verifier(unlink(nom_a) == 0 && stat(nom_a, &st) == -1 && errno == ENOENT, "effacer le fichier");

@@ -102,11 +102,21 @@ fn occupee(entree: u64) -> bool {
     entree & (PRESENTE | SANS_ACCES) != 0
 }
 
+/// Le cadre est-il partagé : une page d'un fichier, ou une page tenue
+/// ailleurs aussi (plus tard, par un fork) ? Il ne doit alors jamais être
+/// écrit par une projection privée : la première écriture le copie.
+fn partage(cadre: u64) -> bool {
+    pages::drapeaux(cadre) & pages::FICHIER != 0 || pages::references(cadre) > 1
+}
+
 /// L'entrée finale qui donne au programme le cadre `cadre` avec les
-/// droits `droits` (ceux de sa zone). La page de zéros n'est jamais
-/// inscriptible : la prochaine écriture passera par la copie.
+/// droits `droits` (ceux de sa zone). La page de zéros et les pages
+/// partagées (celles des fichiers, voir `partage`) ne sont jamais
+/// inscriptibles : la prochaine écriture passera par la copie. C'est vrai
+/// aussi pour mprotect, qui refait les entrées par ici.
 pub fn entree_finale(cadre: u64, droits: Droits) -> u64 {
-    let droits = if cadre == page_de_zeros() { Droits { ecriture: false, ..droits } } else { droits };
+    let protegee = cadre == page_de_zeros() || (droits.ecriture && partage(cadre));
+    let droits = if protegee { Droits { ecriture: false, ..droits } } else { droits };
     if !droits.accessible() {
         return cadre | SANS_ACCES;
     }
@@ -174,8 +184,12 @@ pub struct EspaceUtilisateur {
     /// L'adresse physique de sa PML4.
     pml4: u64,
     /// Le nombre de cadres projetés, à lui (sans compter les tables, ni la
-    /// page de zéros).
+    /// page de zéros, ni les pages des fichiers) : le MM_ANONPAGES de Linux.
     pages: usize,
+    /// Le nombre de pages de fichiers projetées (MM_FILEPAGES). Les deux
+    /// font ce qu'il a « en place » (le RSS) ; /proc/self/statm les dira à
+    /// part (6d).
+    pages_fichier: usize,
     /// Le nombre de tables de pages de sa moitié basse, PML4 comprise (le
     /// pgtables_bytes de Linux) : elles aussi sont de la mémoire prise pour
     /// lui. 8 Gio touchés page à page en demandent 16 Mio.
@@ -194,7 +208,7 @@ impl EspaceUtilisateur {
             nouvelle[..256].fill(0);
             nouvelle[256..].copy_from_slice(&noyau[256..]);
         }
-        Ok(EspaceUtilisateur { pml4, pages: 0, tables: 1 })
+        Ok(EspaceUtilisateur { pml4, pages: 0, pages_fichier: 0, tables: 1 })
     }
 
     /// L'adresse physique de la PML4, pour CR3.
@@ -202,9 +216,15 @@ impl EspaceUtilisateur {
         self.pml4
     }
 
-    /// Le nombre de cadres projetés (la mémoire « résidente »).
+    /// Le nombre de cadres projetés à lui (la mémoire « résidente »
+    /// anonyme).
     pub fn pages(&self) -> usize {
         self.pages
+    }
+
+    /// Le nombre de pages de fichiers projetées.
+    pub fn pages_fichier(&self) -> usize {
+        self.pages_fichier
     }
 
     /// Le nombre de tables de pages de sa moitié basse.
@@ -243,15 +263,21 @@ impl EspaceUtilisateur {
     ///     lecture seule), une écriture une page neuve à zéro (le
     ///     do_anonymous_page de Linux). Le processeur ne garde pas en cache
     ///     les entrées absentes : rien à invalider.
-    ///   - La page de zéros, et une écriture : une page neuve à sa place (la
-    ///     copie à l'écriture, do_wp_page). L'ancienne traduction peut être
-    ///     dans le TLB : invlpg.
+    ///   - La page de zéros, ou une page partagée (celle d'un fichier, voir
+    ///     `partage`), et une écriture : une page neuve à sa place, copie de
+    ///     l'ancienne (la copie à l'écriture, do_wp_page). L'ancienne
+    ///     traduction peut être dans le TLB : invlpg, puis l'ancienne page
+    ///     est lâchée.
     ///   - Une page à lui : l'entrée est refaite d'après les droits de la
     ///     zone. C'est le cas d'une page restée en lecture seule dans une
     ///     zone inscriptible (do_wp_page la « réutilise » : personne d'autre
     ///     ne la voit), ou d'une faute « fantôme », quand l'entrée permet
     ///     déjà l'accès mais que le TLB gardait une traduction plus ancienne
-    ///     (manuel d'Intel, vol. 3A, 4.10.4.3). invlpg, et on reprend.
+    ///     (manuel d'Intel, vol. 3A, 4.10.4.3). invlpg, et on reprend. Une
+    ///     page partagée lue reste en lecture seule (entree_finale).
+    ///
+    /// La page d'un fichier qui n'est pas encore là est posée avant, par
+    /// `poser_fichier` (memoire.rs) : `servir` ne sait rien des fichiers.
     ///
     /// Le cadre neuf est mis à zéro ici, interruptions coupées (on tient le
     /// verrou du processus) : 4 Kio, une microseconde. (Linux rouvre les
@@ -264,17 +290,74 @@ impl EspaceUtilisateur {
         let entree = self.entree(page)?;
         let cadre = *entree & ADRESSE;
         let zeros = page_de_zeros();
-        if !occupee(*entree) || (cadre == zeros && ecriture) {
+        let present = occupee(*entree);
+        let a_copier = present && cadre != zeros && partage(cadre);
+        if !present || (ecriture && (cadre == zeros || a_copier)) {
             let neuve = if ecriture { self.prendre_cadre()? } else { zeros };
-            let remplacee = occupee(*entree);
+            if ecriture && a_copier {
+                // SAFETY : `neuve` vient d'être allouée, à nous ; `cadre` est
+                // tenu par cette entrée (il ne sera lâché qu'après) : deux
+                // pages distinctes, entières, dans la projection directe.
+                unsafe {
+                    core::ptr::copy_nonoverlapping(espace::virtuelle(cadre) as *const u8,
+                                                   espace::virtuelle(neuve) as *mut u8, PAGE as usize);
+                }
+            }
             *entree = entree_finale(neuve, droits);
-            if remplacee {
+            if present {
                 self.invalider(page);
+            }
+            if a_copier {
+                // Après l'invalidation : plus aucune traduction ne mène à
+                // l'ancienne page par cette entrée.
+                if pages::drapeaux(cadre) & pages::FICHIER != 0 {
+                    self.pages_fichier -= 1;
+                } else {
+                    self.pages -= 1;
+                }
+                pages::lacher(cadre);
             }
         } else {
             *entree = entree_finale(cadre, droits);
             self.invalider(page);
         }
+        Ok(())
+    }
+
+    /// Une entrée occupe-t-elle la page `page` (présente, ou rendue
+    /// inaccessible par PROT_NONE) ?
+    pub fn occupee(&self, page: u64) -> bool {
+        if !adresse_permise(page) {
+            return false;
+        }
+        let mut table = self.pml4;
+        for niveau in (1..4).rev() {
+            // SAFETY : `table` est une de nos tables.
+            let e = unsafe { pagination::lire_table(table) }[pagination::index(page, niveau)];
+            if e & PRESENTE == 0 {
+                return false;
+            }
+            table = e & ADRESSE;
+        }
+        // SAFETY : une PT de cet espace.
+        occupee(unsafe { pagination::lire_table(table) }[pagination::index(page, 0)])
+    }
+
+    /// Pose à `page` (où il n'y a rien) la page `cadre` d'un fichier, avec
+    /// les droits de la zone, sans jamais celui d'écrire (entree_finale) :
+    /// le cadre est pris une fois de plus, par cette entrée. Le processeur
+    /// ne garde pas en cache les entrées absentes : rien à invalider.
+    pub fn poser_fichier(&mut self, page: u64, cadre: u64, droits: Droits) -> Result<(), Erreur> {
+        if !adresse_permise(page) {
+            return Err(Erreur::AdresseInterdite);
+        }
+        let entree = self.entree(page)?;
+        if occupee(*entree) {
+            return Err(Erreur::DejaProjetee);
+        }
+        pages::prendre(cadre);
+        *entree = entree_finale(cadre, droits);
+        self.pages_fichier += 1;
         Ok(())
     }
 
@@ -332,17 +415,22 @@ impl EspaceUtilisateur {
     /// pages reviendront.
     pub fn retirer_plage(&mut self, debut: u64, fin: u64, rendre_tables: bool) {
         let mut lot = Lot::new(self.actif());
-        let (mut pages, mut tables) = (0, 0);
+        let (mut pages, mut pages_fichier, mut tables) = (0, 0, 0);
         let zeros = page_de_zeros();
         parcourir(self.pml4, debut, fin, &mut |visite| match visite {
             Visite::Page(adresse, entree) => {
                 let cadre = *entree & ADRESSE;
                 *entree = 0;
                 lot.invalider(adresse);
-                // La page de zéros reste au noyau.
+                // La page de zéros reste au noyau ; une page de fichier reste
+                // aussi au fichier (lâchée, pas rendue : pages.rs).
                 if cadre != zeros {
+                    if pages::drapeaux(cadre) & pages::FICHIER != 0 {
+                        pages_fichier += 1;
+                    } else {
+                        pages += 1;
+                    }
                     lot.rendre(cadre);
-                    pages += 1;
                 }
             }
             Visite::Table(entree) => {
@@ -358,6 +446,7 @@ impl EspaceUtilisateur {
         // Le lot se vide en sortant : le TLB d'abord, les cadres ensuite.
         drop(lot);
         self.pages -= pages;
+        self.pages_fichier -= pages_fichier;
         self.tables -= tables;
     }
 
@@ -388,12 +477,16 @@ impl EspaceUtilisateur {
     /// besoin d'être actif, et les droits des pages ne comptent pas (on
     /// remplit ainsi le code d'un programme, en lecture seule pour lui).
     /// Toutes les pages doivent être projetées ; sinon rien n'est écrit.
+    /// Aucune ne doit être partagée (la page d'un fichier) : on écrirait
+    /// dans le fichier. Memoire::ecrire les fait d'abord copier (servir en
+    /// écriture) ; une page partagée ici est une erreur du noyau.
     pub fn ecrire(&mut self, adresse: u64, octets: &[u8]) -> Result<(), Erreur> {
         let fin = adresse.checked_add(octets.len() as u64).ok_or(Erreur::AdresseInterdite)?;
         // D'abord vérifier, puis écrire : tout ou rien.
         let mut page = adresse / PAGE * PAGE;
         while page < fin {
-            self.traduire(page).ok_or(Erreur::NonProjetee)?;
+            let (cadre, _) = self.traduire(page).ok_or(Erreur::NonProjetee)?;
+            assert!(cadre != page_de_zeros() && !partage(cadre), "le noyau ecrirait dans une page partagee a {page:#x}");
             page += PAGE;
         }
         let mut fait = 0;

@@ -134,6 +134,12 @@ pub enum Echec {
     AccesInterdit,
     /// Plus de mémoire pour la page ou pour une table.
     PlusDeMemoire,
+    /// Une page d'une projection de fichier au-delà de la fin du fichier
+    /// (SIGBUS, BUS_ADRERR).
+    HorsDuFichier,
+    /// Une page de trou d'une projection de fichier, et plus de place dans
+    /// le système de fichiers (SIGBUS, comme Linux).
+    PlusDePlace,
 }
 
 impl Echec {
@@ -143,6 +149,8 @@ impl Echec {
             Echec::SansZone => "pas de zone",
             Echec::AccesInterdit => "acces interdit",
             Echec::PlusDeMemoire => "plus de memoire",
+            Echec::HorsDuFichier => "au-dela de la fin du fichier",
+            Echec::PlusDePlace => "plus de place pour le fichier",
         }
     }
 }
@@ -156,6 +164,8 @@ impl Echec {
 pub struct ZoneDuCode {
     nom: NomCourt,
     nature: Nature,
+    /// La zone projette un fichier : `nom` est le sien.
+    fichier: bool,
     debut: u64,
     taille: u64,
 }
@@ -163,6 +173,7 @@ pub struct ZoneDuCode {
 impl fmt::Display for ZoneDuCode {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self.nature {
+            _ if self.fichier => write!(f, "{}", self.nom)?,
             Nature::Programme => write!(f, "{}", self.nom)?,
             Nature::Tas => f.write_str("[tas]")?,
             Nature::Pile => f.write_str("[pile]")?,
@@ -223,6 +234,20 @@ impl Memoire {
         };
         if !permis {
             return Err(Echec::AccesInterdit);
+        }
+        // Une zone de fichier dont la page n'est pas encore là : la page du
+        // fichier, en lecture seule (entree_finale), tenue une fois de plus.
+        // Puis, pour une écriture, la copie à l'écriture la remplace par une
+        // page à lui (le `do_cow_fault` de Linux, en deux temps).
+        if let Some(projection) = zone.fichier
+            && !self.espace.occupee(page)
+        {
+            let index = zone.page_de(page).unwrap_or(0);
+            let cadre = vfs::page_projetee(Fichier::de(projection.fichier), index)?;
+            self.espace.poser_fichier(page, cadre, zone.droits).map_err(|_| Echec::PlusDeMemoire)?;
+            if acces != Acces::Ecriture {
+                return Ok(());
+            }
         }
         self.espace.servir(page, zone.droits, acces == Acces::Ecriture).map_err(|_| Echec::PlusDeMemoire)
     }
@@ -318,11 +343,12 @@ impl Memoire {
     }
 
     /// Retire les pages de [debut, fin[ sans toucher aux zones
-    /// (MADV_DONTNEED) : elles se reliront à zéro. Les tables restent, la
-    /// zone aussi. Sans effet sur les segments du programme (voir madvise,
-    /// dans linux.rs).
+    /// (MADV_DONTNEED) : elles se reliront à zéro, ou depuis le fichier
+    /// projeté. Les tables restent, la zone aussi. Sans effet sur un segment
+    /// du programme copié sans fichier derrière (voir madvise, dans
+    /// linux.rs).
     pub fn oublier(&mut self, debut: u64, fin: u64) {
-        for z in self.zones.morceaux(debut, fin).filter(|z| z.nature != Nature::Programme) {
+        for z in self.zones.morceaux(debut, fin).filter(|z| z.fichier.is_some() || z.nature != Nature::Programme) {
             self.espace.retirer_plage(z.debut, z.fin, false);
         }
     }
@@ -330,7 +356,10 @@ impl Memoire {
     /// La zone qui contient `adresse`, pour un message.
     pub fn zone_du_code(&self, adresse: u64) -> Option<ZoneDuCode> {
         let z = self.zones.trouver(adresse)?;
-        Some(ZoneDuCode { nom: self.nom, nature: z.nature, debut: z.debut, taille: z.taille() })
+        // Le nom du fichier projeté, s'il y en a un (sous le verrou des
+        // fichiers, pris après celui du processus).
+        let nom = z.fichier.map_or(self.nom, |p| vfs::avec_systeme(|s, _| s.ouverts.fichier(Fichier::de(p.fichier)).nom));
+        Some(ZoneDuCode { nom, nature: z.nature, fichier: z.fichier.is_some(), debut: z.debut, taille: z.taille() })
     }
 
     /// La taille de toutes ses zones, en octets (la « mémoire virtuelle »,

@@ -39,6 +39,7 @@ use alloc::vec::Vec;
 use core::fmt;
 
 use crate::descripteurs::{Fichier, Ouverts};
+use crate::memoire::Echec;
 use crate::verrou::Verrou;
 use crate::{espace, pages, pile, temps};
 use fichiers::chemins::{Depart, Suivre, resoudre};
@@ -55,6 +56,9 @@ impl Cadres for CadresDuNoyau {
         // SAFETY : le cadre vient d'être alloué, personne d'autre ne le
         // voit ; il contenait ce qu'y avait laissé son précédent occupant.
         unsafe { core::ptr::write_bytes(espace::virtuelle(cadre) as *mut u8, 0, PAGE as usize) };
+        // Une page de fichier : jamais inscriptible dans une projection
+        // privée (espace_utilisateur.rs, entree_finale).
+        pages::marquer(cadre, pages::FICHIER);
         Some(cadre)
     }
 
@@ -130,6 +134,27 @@ pub fn octets_mut(cadre: u64) -> &'static mut [u8] {
     // SAFETY : comme `octets` ; la page n'est vue que par le noyau, qui
     // l'écrit ici, et les projections en lecture des programmes.
     unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(cadre) as *mut u8, PAGE as usize) }
+}
+
+/// La page numéro `index` du fichier ouvert `f`, pour une faute de page
+/// dans une zone qui le projette : créée si c'est un trou (comme le
+/// `shmem_fault` de Linux, pour qu'une page privée pas encore copiée soit
+/// toujours la page du fichier). Au-delà de la fin du fichier (à la page
+/// près) : `HorsDuFichier` (SIGBUS) ; le tmpfs plein : `PlusDePlace`
+/// (SIGBUS aussi, comme Linux) ; plus de mémoire : `PlusDeMemoire` (le
+/// tueur OOM).
+pub fn page_projetee(f: Fichier, index: u64) -> Result<u64, Echec> {
+    avec_systeme(|s, cadres| {
+        let n = s.ouverts.fichier(f).ouvert.numero;
+        if index >= s.fs.attributs(n).taille.div_ceil(PAGE) {
+            return Err(Echec::HorsDuFichier);
+        }
+        s.fs.page_pour_ecrire(n, index, cadres).map_err(|e| match e {
+            Erreur::ENOSPC => Echec::PlusDePlace,
+            Erreur::ENOMEM => Echec::PlusDeMemoire,
+            _ => Echec::HorsDuFichier,
+        })
+    })
 }
 
 /// Lit le fichier `n` à partir de `position` dans `tampon` (pour le

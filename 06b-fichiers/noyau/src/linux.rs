@@ -32,19 +32,21 @@ use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateu
 use crate::espace_utilisateur::ADRESSE_MAX;
 use crate::interruptions::Cadre;
 use crate::memoire::{self, Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
-use zones::{Drapeaux, Droits, Nature, Zone};
+use zones::{Drapeaux, Droits, Nature, Projection, Zone};
 use crate::appels_fichiers as f;
 use crate::{aleatoire, cpu, horloge, pages, processus, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
 const ESRCH: i64 = 3;
-const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
+const EACCES: i64 = 13;
 const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
+const ENODEV: i64 = 19;
+const EOVERFLOW: i64 = 75;
 
 // Les numéros des appels.
 const FSYNC: u64 = 74;
@@ -411,17 +413,25 @@ fn droits_de(prot: u64) -> Droits {
 }
 
 /// mmap(adresse, longueur, droits, drapeaux, fichier, décalage) : une
-/// nouvelle zone de mémoire ANONYME, privée (les fichiers viendront avec
-/// 6b). Ses pages ne viennent qu'à la faute (memoire.rs). Les codes
-/// d'erreur sont ceux de Linux, dans son ordre, vérifiés par
-/// linux/memoire.c, qui tourne aussi sur l'hôte :
-///   - décalage non aligné : EINVAL ; pas de MAP_ANONYMOUS : EBADF (pas
-///     encore de fichiers) ; longueur nulle, ni MAP_PRIVATE ni MAP_SHARED :
-///     EINVAL ; trop grand : ENOMEM ;
+/// nouvelle zone, de mémoire anonyme ou d'un fichier projeté en privé (6b).
+/// Ses pages ne viennent qu'à la faute (memoire.rs) ; celles d'un fichier
+/// sont ses pages à lui, en lecture seule, copiées à la première écriture
+/// (espace_utilisateur.rs). Les codes d'erreur sont ceux de Linux, vérifiés
+/// par linux/memoire.c et linux/fichiers.c, qui tournent aussi sur l'hôte :
+///   - décalage non aligné : EINVAL ; pas de MAP_ANONYMOUS, et un
+///     descripteur qui n'en est pas un (ou O_PATH) : EBADF ; longueur nulle,
+///     ni MAP_PRIVATE ni MAP_SHARED : EINVAL ; trop grand : ENOMEM ; la page
+///     du fichier plus la longueur au-delà de la plus grande taille de
+///     fichier : EOVERFLOW ;
 ///   - MAP_FIXED : l'adresse telle quelle, ce qui y était est retiré
 ///     (tout ou rien). Hors des adresses : ENOMEM ; non alignée : EINVAL ;
 ///     sous 64 Kio : EPERM. MAP_FIXED_NOREPLACE : de même, mais EEXIST si
 ///     quelque chose y est déjà ;
+///   - un fichier : il faut l'avoir ouvert en lecture (EACCES), et que sa
+///     sorte se projette : un fichier ordinaire ; /dev/zero en privé donne
+///     de la mémoire anonyme, comme Linux ; un dossier, /dev/null, la
+///     console : ENODEV. Un décalage au-delà de la fin du fichier est
+///     permis : l'accès fera SIGBUS ;
 ///   - sinon, une adresse suggérée est suivie si la place est libre,
 ///     ignorée sinon (Memoire::chercher_place) ; plus de place : ENOMEM ;
 ///   - une zone privée inscriptible sans MAP_NORESERVE plus grande que
@@ -435,10 +445,11 @@ fn droits_de(prot: u64) -> Droits {
 ///     les drapeaux qu'il ne connaît pas, sauf avec MAP_SHARED_VALIDATE).
 ///     Les droits inconnus aussi : mmap, au contraire de mprotect, ne les
 ///     vérifie pas ;
-///   - MAP_SHARED, MAP_GROWSDOWN, MAP_HUGETLB, MAP_32BIT, MAP_SYNC :
-///     refusés (EINVAL), avec un message du noyau qui le dit ; `claude` ne
-///     s'en sert pas. (Linux, lui, les accepte.)
-fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, _fichier: u64, decalage: u64) -> i64 {
+///   - MAP_SHARED (après ses vérifications de droits : écrire demande un
+///     descripteur ouvert en écriture, EACCES), MAP_GROWSDOWN, MAP_HUGETLB,
+///     MAP_32BIT, MAP_SYNC : refusés (EINVAL), avec un message du noyau qui
+///     le dit ; `claude` ne s'en sert pas, fork (6k) en aura besoin.
+fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage: u64) -> i64 {
     const MAP_SHARED: u64 = 0x01;
     const MAP_PRIVATE: u64 = 0x02;
     const MAP_TYPE: u64 = 0x0f;
@@ -451,25 +462,29 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, _fichier: u64, de
     const MAP_HUGETLB: u64 = 0x4_0000;
     const MAP_SYNC: u64 = 0x8_0000;
     const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+    use crate::descripteurs::Sorte;
     use crate::espace_utilisateur::ADRESSE_MIN;
 
     if decalage % PAGE != 0 {
         return -EINVAL;
     }
-    if drapeaux & MAP_ANONYMOUS == 0 {
-        return -EBADF;
-    }
+    // Le fichier projeté, s'il y en a un (fget, avant même la longueur).
+    let fichier = if drapeaux & MAP_ANONYMOUS == 0 {
+        match f::pour_projeter(fd) {
+            Ok(p) => Some(p),
+            Err(e) => return e,
+        }
+    } else {
+        None
+    };
     if longueur == 0 {
         return -EINVAL;
     }
-    match drapeaux & MAP_TYPE {
-        MAP_PRIVATE => {}
-        MAP_SHARED | 0x03 => {
-            afficherln!("[noyau] mmap : MAP_SHARED pas encore pris en charge");
-            return -EINVAL;
-        }
+    let partagee = match drapeaux & MAP_TYPE {
+        MAP_PRIVATE => false,
+        MAP_SHARED | 0x03 => true,
         _ => return -EINVAL,
-    }
+    };
     for (bit, nom) in [(MAP_GROWSDOWN, "MAP_GROWSDOWN"), (MAP_HUGETLB, "MAP_HUGETLB"), (MAP_32BIT, "MAP_32BIT"), (MAP_SYNC, "MAP_SYNC")] {
         if drapeaux & bit != 0 {
             afficherln!("[noyau] mmap : {} pas pris en charge", nom);
@@ -479,6 +494,13 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, _fichier: u64, de
     let Some(taille) = longueur.checked_next_multiple_of(PAGE).filter(|&t| t <= ADRESSE_MAX - ADRESSE_MIN) else {
         return -ENOMEM;
     };
+    let page = decalage / PAGE;
+    // La fin de la projection sous la plus grande taille de fichier, 2^63 - 1
+    // octets (`file_mmap_ok`) : sa dernière page est au plus la page
+    // 2^51 - 1, la fin (exclue) au plus INDEX_MAX = 2^51.
+    if fichier.is_some() && page.checked_add(taille / PAGE).is_none_or(|fin| fin >= fichiers::index::INDEX_MAX) {
+        return -EOVERFLOW;
+    }
     let fixe = drapeaux & (MAP_FIXED | MAP_FIXED_NOREPLACE) != 0;
     if fixe {
         if adresse > ADRESSE_MAX - taille {
@@ -492,6 +514,29 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, _fichier: u64, de
         }
     }
     let droits = droits_de(prot);
+    // Ce que projette la zone : le fichier (sa page de début), ou rien
+    // (/dev/zero en privé est de la mémoire anonyme).
+    let projection = match fichier {
+        None => None,
+        Some(p) => {
+            if partagee && droits.ecriture && !p.ecriture {
+                return -EACCES;
+            }
+            if !p.lecture {
+                return -EACCES;
+            }
+            match p.sorte {
+                Sorte::Fichier if partagee => None,
+                Sorte::Fichier => Some(Projection { fichier: p.fichier.numero(), page }),
+                Sorte::Zero => None,
+                _ => return -ENODEV,
+            }
+        }
+    };
+    if partagee {
+        afficherln!("[noyau] mmap : MAP_SHARED pas encore pris en charge");
+        return -EINVAL;
+    }
     let sans_reserve = drapeaux & MAP_NORESERVE != 0;
     if droits.ecriture && !sans_reserve && !engagement_possible(taille) {
         return -ENOMEM;
@@ -507,7 +552,7 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, _fichier: u64, de
             m.chercher_place(taille, adresse).ok_or(-ENOMEM)?
         };
         let drapeaux = Drapeaux { sans_reserve, ..Drapeaux::default() };
-        let zone = Zone { debut, fin: debut + taille, droits, nature: Nature::Anonyme, drapeaux, fichier: None };
+        let zone = Zone { debut, fin: debut + taille, droits, nature: Nature::Anonyme, drapeaux, fichier: projection };
         m.ajouter(zone, fixe).map_err(|_| -ENOMEM)?;
         Ok(debut)
     });
@@ -639,18 +684,18 @@ fn mprotect(adresse: u64, longueur: u64, prot: u64) -> i64 {
 /// ENOMEM à la fin (après avoir traité le reste).
 ///
 /// Les conseils :
-///   - MADV_DONTNEED, MADV_DONTNEED_LOCKED : les pages sont retirées, et
-///     se reliront à zéro, SAUF dans une zone de segment du programme (les
-///     pages qui contiennent une part du fichier ; celles du .bss au-delà
-///     sont une zone anonyme, chargeur_elf.rs) : sous Linux, ces pages sont
-///     celles du fichier, projeté en privé, et le programme relirait le
-///     FICHIER. Les nôtres sont des copies sans fichier derrière : y mettre
-///     des zéros casserait en silence Bun, qui rend ainsi 54 Mo de sa propre
-///     section `.bun` (la trace de `claude --version`). Sans effet donc, en
-///     6a ; le vrai comportement avec le cache des fichiers (6b) ;
+///   - MADV_DONTNEED, MADV_DONTNEED_LOCKED : les pages sont retirées. Dans
+///     une zone anonyme, elles se reliront à zéro ; dans une projection de
+///     fichier, le programme relira le FICHIER (ses copies privées sont
+///     perdues) : c'est ce que fait Bun, qui rend ainsi 54 Mo de sa propre
+///     section `.bun` (la trace de `claude --version`). Sans effet, encore,
+///     sur un segment du programme que le chargeur a copié sans fichier
+///     derrière (chargeur_elf.rs) : y mettre des zéros casserait le
+///     programme en silence ;
 ///   - MADV_FREE : de même (il permet de garder le contenu ou de le
 ///     perdre), mais seulement sur de la mémoire anonyme : EINVAL sur un
-///     segment du programme, comme Linux, avant de rien changer ;
+///     fichier ou un segment du programme, comme Linux, avant de rien
+///     changer ;
 ///   - MADV_WILLNEED, NORMAL, RANDOM, SEQUENTIAL, COLD, PAGEOUT, DONTDUMP,
 ///     DODUMP : des indications pour la mémoire d'échange, la lecture
 ///     anticipée ou les fichiers « core », que nous n'avons pas : acceptés,
@@ -712,7 +757,7 @@ fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
     let resultat = match conseil {
         DONTNEED | FREE | DONTNEED_LOCKED => processus::avec(|p| {
             let m = &mut p.memoire;
-            if conseil == FREE && m.zones.morceaux(debut, fin_zones).any(|z| z.nature == Nature::Programme) {
+            if conseil == FREE && m.zones.morceaux(debut, fin_zones).any(|z| z.fichier.is_some() || z.nature == Nature::Programme) {
                 return Err(-EINVAL);
             }
             m.oublier(debut, fin_zones);
@@ -720,12 +765,16 @@ fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
         }),
         POPULATE_READ | POPULATE_WRITE => match peupler(debut, fin_zones, conseil == POPULATE_WRITE) {
             Err(Echec::AccesInterdit) => Err(-EINVAL),
+            // Une page au-delà de la fin du fichier, ou un trou que le tmpfs
+            // n'a plus la place de remplir : la faute ferait SIGBUS, madvise
+            // rend EFAULT (`faultin_page`, VM_FAULT_SIGBUS).
+            Err(Echec::HorsDuFichier | Echec::PlusDePlace) => Err(-EFAULT),
             Err(_) => Err(-ENOMEM),
             Ok(()) => Ok(()),
         },
         DONTFORK | DOFORK | WIPEONFORK | KEEPONFORK => processus::avec(|p| {
             let m = &mut p.memoire;
-            if conseil == WIPEONFORK && m.zones.morceaux(debut, fin_zones).any(|z| z.nature == Nature::Programme) {
+            if conseil == WIPEONFORK && m.zones.morceaux(debut, fin_zones).any(|z| z.fichier.is_some() || z.nature == Nature::Programme) {
                 return Err(-EINVAL);
             }
             m.zones
@@ -980,6 +1029,9 @@ impl fmt::Display for Raison {
             // Le code d'erreur d'une faute de page : bit 0 page présente
             // (sinon absente), bit 1 écriture, bit 2 venue de l'anneau 3,
             // bit 4 lecture d'instruction (NX).
+            14 if matches!(cause, Some(Echec::HorsDuFichier | Echec::PlusDePlace)) => {
+                write!(f, "bus error at {cr2:#x} ip {rip:#x} sp {rsp:#x} error {code:x}")?
+            }
             14 => write!(f, "segfault at {cr2:#x} ip {rip:#x} sp {rsp:#x} error {code:x}")?,
             // `int n` vers une entrée de l'IDT interdite aux programmes : le
             // code d'erreur désigne l'entrée (n x 8, plus 2 pour « IDT »).
@@ -1010,6 +1062,10 @@ impl fmt::Display for Raison {
 pub fn signal_de_l_exception(vecteur: usize, cadre: &Cadre, cr2: u64, cause: Option<Echec>, zone: Option<ZoneDuCode>)
     -> (Signal, Raison) {
     let signal = match vecteur {
+        // Une projection de fichier au-delà de sa fin, ou un trou qu'un
+        // système de fichiers plein ne peut pas remplir : SIGBUS (BUS_ADRERR),
+        // comme Linux.
+        14 if matches!(cause, Some(Echec::HorsDuFichier | Echec::PlusDePlace)) => SIGBUS,
         0 | 16 | 19 => SIGFPE, // division, x87, SIMD
         1 | 3 => SIGTRAP,      // débogage, int3
         6 => SIGILL,           // instruction invalide
