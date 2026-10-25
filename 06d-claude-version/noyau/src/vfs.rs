@@ -44,7 +44,8 @@ use crate::memoire::Echec;
 use crate::verrou::Verrou;
 use crate::{espace, pages, pile, temps};
 use fichiers::chemins::{Depart, Fin, Suivre, resoudre};
-use fichiers::montages::{Monte, Objet, Vue};
+use fichiers::montages::{Objet, Vue};
+use fichiers::noyaufs::NoyauFs;
 use fichiers::tmpfs::{Cadres, Horodatage, Limites, Numero, Tmpfs};
 use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Temps};
 
@@ -89,11 +90,17 @@ impl Cadres for CadresDuNoyau {
 }
 
 /// Ce que garde le verrou des fichiers : le système de fichiers de la
-/// racine, et la table des fichiers ouverts (descripteurs.rs).
+/// racine, la table des fichiers ouverts (descripteurs.rs), et les systèmes
+/// montés, chacun avec son point de montage (un dossier du tmpfs, tenu) :
+/// procfs sur /proc (le premier, `PROC`), sysfs sur /sys.
 pub struct Systeme {
     pub fs: Tmpfs,
     pub ouverts: Ouverts,
+    pub montes: Vec<(Numero, NoyauFs)>,
 }
+
+/// La place de procfs dans la table des montages.
+pub const PROC: usize = 0;
 
 impl Systeme {
     /// Le fichier ouvert `f` est tenu une fois de moins ; au dernier, il est
@@ -110,11 +117,10 @@ impl Systeme {
     /// Appelle `f` avec la vue de tous les systèmes de fichiers, telle que
     /// la voit le processus `pid` (pour /proc/self ; 0 : le noyau, ou un
     /// programme WebAssembly, qui n'est pas un processus Linux).
-    pub fn avec_vue<R>(&self, pid: u32, f: impl FnOnce(&Vue) -> R) -> R {
+    pub fn avec_vue<R>(&self, pid: u32, f: impl FnOnce(&Vue<NoyauFs>) -> R) -> R {
         let mut texte = [0u8; 10];
         let lecteur = decimal(pid, &mut texte);
-        let montes: [(Numero, &dyn Monte); 0] = [];
-        f(&Vue { fs: &self.fs, montes: &montes, lecteur })
+        f(&Vue { fs: &self.fs, montes: &self.montes, lecteur })
     }
 
     /// Résout `chemin` depuis `depart`, pour le processus `pid`, à travers
@@ -130,7 +136,7 @@ impl Systeme {
 }
 
 /// `n` en décimal, dans `texte` (rien pour 0).
-fn decimal(mut n: u32, texte: &mut [u8; 10]) -> &[u8] {
+pub fn decimal(mut n: u32, texte: &mut [u8; 10]) -> &[u8] {
     let mut i = texte.len();
     while n > 0 {
         i -= 1;
@@ -240,13 +246,40 @@ impl fmt::Display for Chemin<'_> {
 pub fn initialiser(archive: Option<&[u8]>) -> Result<Bilan, Erreur> {
     let total = pages::total() as u64;
     let limites = Limites { inodes: (total / 2).min(u32::MAX as u64) as u32, pages: total / 2 };
-    *RACINE.verrouiller() = Some(Systeme { fs: Tmpfs::new(limites, temps::maintenant())?, ouverts: Ouverts::default() });
+    *RACINE.verrouiller() = Some(Systeme { fs: Tmpfs::new(limites, temps::maintenant())?, ouverts: Ouverts::default(), montes: Vec::new() });
     let mut bilan = Bilan::default();
     if let Some(octets) = archive {
         deballer(octets, &mut bilan)?;
     }
     creer_dev()?;
+    monter("procfs", b"/proc", crate::procfs::creer)?;
     Ok(bilan)
+}
+
+/// Monte le système que fabrique `creer` sur le dossier `chemin` du tmpfs,
+/// créé s'il n'existe pas (0555, à root, comme /proc et /sys dans une
+/// distribution), comme le fait un init (« mount -t proc proc /proc ») :
+/// ici, le noyau en tient le rôle. Le dossier est tenu tant que le système
+/// y est monté.
+fn monter(nom: &str, chemin: &[u8], creer: fn(Temps) -> Result<NoyauFs, Erreur>) -> Result<(), Erreur> {
+    let maintenant = temps::maintenant();
+    let systeme = creer(maintenant)?;
+    avec_systeme(|s, _| {
+        s.montes.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
+        let racine = s.fs.racine();
+        let depart = Depart { racine, dossier: racine, qui: Identite::ROOT, sous: false };
+        let fin = resoudre(&s.fs, &depart, chemin, Suivre::Jamais)?;
+        let point = match fin.objet {
+            Some(n) if s.fs.mode(n) & S_IFMT == S_IFDIR => n,
+            Some(_) => return Err(Erreur::ENOTDIR),
+            None => s.fs.creer(Identite::ROOT, &fin, S_IFDIR | 0o555, (0, 0), &[], maintenant)?,
+        };
+        s.fs.prendre(point);
+        s.montes.push((point, systeme));
+        Ok(())
+    })?;
+    afficherln!("[noyau] {} monte sur {}.", nom, Chemin(chemin));
+    Ok(())
 }
 
 /// Le déballage, entrée par entrée. Une entrée refusée (un dossier parent

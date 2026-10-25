@@ -214,6 +214,10 @@ pub struct Memoire {
     pub fin_tas: u64,
     /// Le nom du programme, pour les messages.
     pub nom: NomCourt,
+    /// Le début et la fin de son code : du plus petit début au plus grand
+    /// bout du fichier de ses segments exécutables (les `start_code` et
+    /// `end_code` de Linux), pour /proc/<pid>/statm. (0, 0) sans code.
+    pub code: (u64, u64),
 }
 
 impl Memoire {
@@ -230,7 +234,7 @@ impl Memoire {
         // qu'avec le dernier d'entre eux, et la vérification « memoire
         // rendue » de chaque programme se tromperait.
         let zones = Zones::avec_capacite(PAGE as usize / size_of::<Zone>())?;
-        Ok(Memoire { espace: EspaceUtilisateur::creer()?, zones, debut_tas: 0, fin_tas: 0, nom })
+        Ok(Memoire { espace: EspaceUtilisateur::creer()?, zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0) })
     }
 
     /// Sert une faute de page à `adresse`, pour l'accès `acces` : la page

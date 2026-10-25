@@ -22,15 +22,17 @@
 //!   - des `Rc` pour les fichiers ouverts : leur allocation ne sait pas
 //!     échouer, et une allocation demandée par un programme doit pouvoir
 //!     rendre ENOMEM. Une table à index, avec un compteur explicite.
-//! Les sortes à venir : les tubes (6f), les sockets (6h), les fichiers de
-//! /proc (6d). Une sorte de plus, ce sera une ligne de plus dans chaque
-//! `match` des appels (appels_fichiers.rs). Certaines ont des données à
-//! elles (le compteur d'un eventfd, la liste d'un epoll : `Donnees`).
+//! Les sortes à venir : les tubes (6f), les sockets (6h). Une sorte de
+//! plus, ce sera une ligne de plus dans chaque `match` des appels
+//! (appels_fichiers.rs). Certaines ont des données à elles (le compteur
+//! d'un eventfd, la liste d'un epoll, la source d'un fichier de /proc :
+//! `Donnees`).
 
 use alloc::vec::Vec;
 
 use crate::programmes::NomCourt;
 use fichiers::montages::Objet;
+use fichiers::noyaufs::Sequence;
 use fichiers::tmpfs::{Numero, Ouvert};
 
 /// Ce que font les appels sur un fichier ouvert (les file_operations).
@@ -61,6 +63,28 @@ pub enum Sorte {
     EventFd,
     /// Une liste de fichiers à surveiller (epoll, 6d) : `Donnees::Epoll`.
     Epoll,
+    /// Un fichier d'un système du noyau (/proc, /sys, 6d), dont le contenu
+    /// est fabriqué à la lecture (`Donnees::Noyau`), d'une des trois façons
+    /// de Linux.
+    Noyau { lecture: Lecture },
+}
+
+/// Comment se lit un fichier d'un système du noyau (mesuré sous Linux
+/// 6.18 : trois comportements).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Lecture {
+    /// Des enregistrements, comme le `seq_file` de Linux (/proc/<pid>/maps,
+    /// statm) : se lit par morceaux, à toute position ; lseek SEEK_SET et
+    /// SEEK_CUR seulement.
+    Sequence,
+    /// Une valeur de /proc/sys (`proc_dointvec`) : tout d'un coup à la
+    /// position 0, rien ailleurs ; lseek de `default_llseek`, d'un fichier
+    /// de taille nulle.
+    Valeur,
+    /// Un attribut de sysfs (kernfs) : comme une séquence d'un seul
+    /// enregistrement, mais lseek de `generic_file_llseek`, d'un fichier
+    /// d'une page.
+    Attribut,
 }
 
 impl Sorte {
@@ -71,7 +95,8 @@ impl Sorte {
     /// Linux 6.18 : /dev/null, /dev/zero, /dev/full et /dev/urandom refusés,
     /// /dev/random et les terminaux acceptés.
     pub fn sait_attendre(self) -> bool {
-        matches!(self, Sorte::Aleatoire { random: true } | Sorte::Console | Sorte::EventFd | Sorte::Epoll)
+        matches!(self, Sorte::Aleatoire { random: true } | Sorte::Console | Sorte::EventFd | Sorte::Epoll
+                       | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
     }
 }
 
@@ -83,6 +108,9 @@ pub enum Donnees {
     EventFd { compteur: u64, semaphore: bool },
     /// Ce que surveille un epoll.
     Epoll(Vec<Interet>),
+    /// D'où vient le contenu d'un fichier d'un système du noyau (une source
+    /// du noyau et son argument : procfs.rs), et où en est sa lecture.
+    Noyau { source: u32, argument: u32, sequence: Sequence },
 }
 
 /// Une inscription dans un epoll (l'`epitem` de Linux) : le couple (fichier

@@ -121,11 +121,17 @@ pub trait Monte {
     /// tant qu'elle rend vrai.
     fn lire_dossier(&self, dossier: u32, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
         -> Result<(), Erreur>;
+    /// D'où vient le contenu du fichier `n` (une source et son argument,
+    /// que le noyau sait fabriquer : noyaufs.rs), None pour ce qui n'est pas
+    /// un fichier.
+    fn contenu(&self, n: u32) -> Option<(u32, u32)>;
     /// Ce que ce système répond à une modification de son arborescence ou
     /// de ses inodes, qui y reste entièrement (ce qui en sort a déjà été
-    /// refusé par la `Vue`). Rien ne s'y modifie : c'est toujours une
-    /// erreur, mais laquelle dépend du système (procfs, sysfs).
-    fn refuser(&self, qui: Identite, m: Interne) -> Erreur;
+    /// refusé par la `Vue`). Rien ne s'y modifie : c'est une erreur, qui
+    /// dépend du système (procfs, sysfs), ou un succès sans effet (Linux
+    /// permet au propriétaire d'un fichier de /proc d'en changer les dates,
+    /// sans les garder longtemps).
+    fn refuser(&self, qui: Identite, m: Interne) -> Result<(), Erreur>;
 }
 
 /// Une modification qui reste dans un système monté, pour `Monte::refuser`.
@@ -182,17 +188,18 @@ pub enum Modification<'a> {
 
 /// Tous les systèmes, vus d'un processus : le tmpfs de la racine, et les
 /// systèmes montés avec leur point de montage (un dossier du tmpfs, que le
-/// montage tient). `lecteur` : le numéro du processus qui résout, écrit
-/// en décimal.
-pub struct Vue<'a> {
+/// montage tient), tous du même type `M` (dans le noyau, ceux du noyau :
+/// noyaufs.rs). `lecteur` : le numéro du processus qui résout, écrit en
+/// décimal.
+pub struct Vue<'a, M: Monte> {
     pub fs: &'a Tmpfs,
-    pub montes: &'a [(Numero, &'a dyn Monte)],
+    pub montes: &'a [(Numero, M)],
     pub lecteur: &'a [u8],
 }
 
-impl<'a> Vue<'a> {
-    fn monte(&self, s: Systeme) -> &'a dyn Monte {
-        self.montes[s.0 as usize].1
+impl<'a, M: Monte> Vue<'a, M> {
+    fn monte(&self, s: Systeme) -> &'a M {
+        &self.montes[s.0 as usize].1
     }
 
     fn point(&self, s: Systeme) -> Numero {
@@ -215,6 +222,15 @@ impl<'a> Vue<'a> {
             Objet::Tmpfs(_) => None,
             Objet::Monte(s, _) => Some((self.monte(s).peripherique(), self.monte(s).taille_de_bloc())),
             Objet::Anonyme => Some(ANONYME_PERIPHERIQUE),
+        }
+    }
+
+    /// D'où vient le contenu de l'objet, s'il est un fichier d'un système
+    /// monté (`Monte::contenu`).
+    pub fn contenu(&self, o: Objet) -> Option<(u32, u32)> {
+        match o {
+            Objet::Monte(s, n) => self.monte(s).contenu(n),
+            Objet::Tmpfs(_) | Objet::Anonyme => None,
         }
     }
 
@@ -303,9 +319,10 @@ impl<'a> Vue<'a> {
         Ok(chemin)
     }
 
-    /// L'erreur d'une modification qui touche un système monté (`fin` ou un
-    /// objet qui n'est pas dans le tmpfs, ou un point de montage), dans
-    /// l'ordre de Linux (mesuré sous Linux 6.18) :
+    /// Ce que devient une modification qui touche un système monté (`fin` ou
+    /// un objet qui n'est pas dans le tmpfs, ou un point de montage) : une
+    /// erreur, ou un succès sans effet, dans l'ordre de Linux (mesuré sous
+    /// Linux 6.18) :
     ///   - créer : un nom qui existe, EEXIST (même un point de montage,
     ///     mkdir("/proc")) ; une barre finale pour autre chose que mkdir,
     ///     ENOENT (`filename_create` ne crée alors pas) ; sinon le système
@@ -320,23 +337,24 @@ impl<'a> Vue<'a> {
     ///     (`do_renameat2` le fait dès qu'il a les deux dossiers, avant même
     ///     de chercher les noms) ; puis les vérifications de `do_renameat2`,
     ///     dans l'ordre de `Tmpfs::renommer`, avec les drapeaux ; puis
-    ///     celles de `vfs_rename` : `may_delete` de l'ancien, `may_delete`
-    ///     ou `may_create` du nouveau quand leur dossier est dans le tmpfs,
-    ///     puis EBUSY pour un point de montage, et le système pour le reste ;
+    ///     celles de `vfs_rename` : le même objet des deux côtés, succès ;
+    ///     `may_delete` de l'ancien, `may_delete` ou `may_create` du nouveau
+    ///     quand leur dossier est dans le tmpfs, puis EBUSY pour un point de
+    ///     montage, et le système pour le reste ;
     ///   - lier : EEXIST, puis EXDEV (`do_linkat`, après avoir préparé le
     ///     nouveau nom, qu'un procfs refuse d'abord) ;
     ///   - tronquer : un dossier, EISDIR ; autre chose qu'un fichier
     ///     ordinaire, EINVAL (`vfs_truncate`) ; puis le système ;
     ///   - les autres attributs (droits, propriétaire, dates) : le
     ///     système répond.
-    pub fn refus(&self, qui: Identite, m: Modification) -> Erreur {
+    pub fn refus(&self, qui: Identite, m: Modification) -> Result<(), Erreur> {
         match m {
             Modification::Creer(fin, creation) => {
                 if fin.objet.is_some() || fin.dernier != Dernier::Nom {
-                    return Erreur::EEXIST;
+                    return Err(Erreur::EEXIST);
                 }
                 if fin.barre && creation != Creation::Dossier {
-                    return Erreur::ENOENT;
+                    return Err(Erreur::ENOENT);
                 }
                 match fin.dossier {
                     Objet::Monte(s, d) => {
@@ -345,45 +363,45 @@ impl<'a> Vue<'a> {
                     // Le dossier est dans le tmpfs, le nom est absent : rien ne
                     // touche un système monté (l'appelant ne vient pas ici).
                     // L'inode anonyme n'est pas un dossier.
-                    Objet::Tmpfs(_) => Erreur::EINVAL,
-                    Objet::Anonyme => Erreur::ENOTDIR,
+                    Objet::Tmpfs(_) => Err(Erreur::EINVAL),
+                    Objet::Anonyme => Err(Erreur::ENOTDIR),
                 }
             }
             Modification::Effacer(fin, rmdir) => {
                 // « . », « .. », la racine : comme `Tmpfs::effacer`.
                 match (fin.dernier, rmdir) {
                     (Dernier::Nom, _) => {}
-                    (_, false) => return Erreur::EISDIR,
-                    (Dernier::Point, true) => return Erreur::EINVAL,
-                    (Dernier::PointPoint, true) => return Erreur::ENOTEMPTY,
-                    (Dernier::Racine, true) => return Erreur::EBUSY,
+                    (_, false) => return Err(Erreur::EISDIR),
+                    (Dernier::Point, true) => return Err(Erreur::EINVAL),
+                    (Dernier::PointPoint, true) => return Err(Erreur::ENOTEMPTY),
+                    (Dernier::Racine, true) => return Err(Erreur::EBUSY),
                 }
-                let Some(objet) = fin.objet else { return Erreur::ENOENT };
+                let Some(objet) = fin.objet else { return Err(Erreur::ENOENT) };
                 if !rmdir && fin.barre {
-                    return if est_dossier(self, objet) { Erreur::EISDIR } else { Erreur::ENOTDIR };
+                    return Err(if est_dossier(self, objet) { Erreur::EISDIR } else { Erreur::ENOTDIR });
                 }
                 match (fin.dossier, objet) {
                     (Objet::Tmpfs(d), Objet::Monte(s, _)) => self.point_occupe(qui, d, s, rmdir),
                     (Objet::Monte(s, d), Objet::Monte(_, n)) => {
                         self.monte(s).refuser(qui, Interne::Effacer { dossier: d, objet: n, rmdir })
                     }
-                    _ => Erreur::EINVAL,
+                    _ => Err(Erreur::EINVAL),
                 }
             }
             Modification::Renommer(ancien, nouveau, drapeaux) => self.renommer(qui, ancien, nouveau, drapeaux),
             Modification::Lier(source, nouveau) => {
                 if self.nom_refuse(qui, nouveau) {
-                    return Erreur::ENOENT;
+                    return Err(Erreur::ENOENT);
                 }
                 if nouveau.objet.is_some() {
-                    return Erreur::EEXIST;
+                    return Err(Erreur::EEXIST);
                 }
                 if source.monture() != nouveau.dossier.monture() {
-                    return Erreur::EXDEV;
+                    return Err(Erreur::EXDEV);
                 }
                 match source {
                     Objet::Monte(s, n) => self.monte(s).refuser(qui, Interne::Lier { source: n }),
-                    Objet::Tmpfs(_) | Objet::Anonyme => Erreur::EINVAL,
+                    Objet::Tmpfs(_) | Objet::Anonyme => Err(Erreur::EINVAL),
                 }
             }
             Modification::ChangerMode(o) => self.interne(qui, o, |n| Interne::ChangerMode { objet: n }),
@@ -396,10 +414,10 @@ impl<'a> Vue<'a> {
             Modification::Tronquer(o) => {
                 let mode = self.mode(o) & S_IFMT;
                 if mode == S_IFDIR {
-                    return Erreur::EISDIR;
+                    return Err(Erreur::EISDIR);
                 }
                 if mode != S_IFREG {
-                    return Erreur::EINVAL;
+                    return Err(Erreur::EINVAL);
                 }
                 self.interne(qui, o, |n| Interne::Tronquer { objet: n })
             }
@@ -413,7 +431,7 @@ impl<'a> Vue<'a> {
     fn nom_refuse(&self, qui: Identite, fin: &Fin<Objet>) -> bool {
         match (fin.dossier, fin.objet) {
             (Objet::Monte(s, d), None) => {
-                self.monte(s).refuser(qui, Interne::Creer { dossier: d, ouvrir: false }) == Erreur::ENOENT
+                self.monte(s).refuser(qui, Interne::Creer { dossier: d, ouvrir: false }) == Err(Erreur::ENOENT)
             }
             _ => false,
         }
@@ -445,44 +463,47 @@ impl<'a> Vue<'a> {
 
     /// rename dans un système monté, ou d'un point de montage (voir
     /// `refus`) : l'ordre de `do_renameat2`, puis de `vfs_rename`.
-    fn renommer(&self, qui: Identite, ancien: &Fin<Objet>, nouveau: &Fin<Objet>, drapeaux: u32) -> Erreur {
+    fn renommer(&self, qui: Identite, ancien: &Fin<Objet>, nouveau: &Fin<Objet>, drapeaux: u32) -> Result<(), Erreur> {
         let echange = drapeaux & RENAME_EXCHANGE != 0;
         let sans_ecraser = drapeaux & RENAME_NOREPLACE != 0;
         if ancien.dossier.monture() != nouveau.dossier.monture() {
-            return Erreur::EXDEV;
+            return Err(Erreur::EXDEV);
         }
         if ancien.dernier != Dernier::Nom {
-            return Erreur::EBUSY;
+            return Err(Erreur::EBUSY);
         }
         if nouveau.dernier != Dernier::Nom {
-            return if sans_ecraser { Erreur::EEXIST } else { Erreur::EBUSY };
+            return Err(if sans_ecraser { Erreur::EEXIST } else { Erreur::EBUSY });
         }
-        let Some(source) = ancien.objet else { return Erreur::ENOENT };
+        let source = ancien.objet.ok_or(Erreur::ENOENT)?;
         if self.nom_refuse(qui, nouveau) {
-            return Erreur::ENOENT;
+            return Err(Erreur::ENOENT);
         }
         let cible = nouveau.objet;
         if sans_ecraser && cible.is_some() {
-            return Erreur::EEXIST;
+            return Err(Erreur::EEXIST);
         }
         if echange {
-            let Some(c) = cible else { return Erreur::ENOENT };
+            let c = cible.ok_or(Erreur::ENOENT)?;
             if !est_dossier(self, c) && nouveau.barre {
-                return Erreur::ENOTDIR;
+                return Err(Erreur::ENOTDIR);
             }
         }
         let dossier_source = est_dossier(self, source);
         if !dossier_source && (ancien.barre || (!echange && nouveau.barre)) {
-            return Erreur::ENOTDIR;
+            return Err(Erreur::ENOTDIR);
         }
         if dossier_source && self.ancetre(source, nouveau.dossier) {
-            return Erreur::EINVAL;
+            return Err(Erreur::EINVAL);
         }
         if let Some(c) = cible
             && est_dossier(self, c)
             && self.ancetre(c, ancien.dossier)
         {
-            return if echange { Erreur::EINVAL } else { Erreur::ENOTEMPTY };
+            return Err(if echange { Erreur::EINVAL } else { Erreur::ENOTEMPTY });
+        }
+        if Some(source) == cible {
+            return Ok(());
         }
         // `may_delete` et `may_create`, pour ce qui est dans un dossier du
         // tmpfs : l'objet du tmpfs d'un point de montage est le dossier
@@ -492,26 +513,21 @@ impl<'a> Vue<'a> {
             Objet::Monte(s, _) => Some(self.point(s)),
             Objet::Anonyme => None,
         };
-        if let (Objet::Tmpfs(d), Some(n)) = (ancien.dossier, dans_le_tmpfs(source))
-            && let Err(e) = self.fs.peut_effacer(qui, d, n, dossier_source)
-        {
-            return e;
+        if let (Objet::Tmpfs(d), Some(n)) = (ancien.dossier, dans_le_tmpfs(source)) {
+            self.fs.peut_effacer(qui, d, n, dossier_source)?;
         }
         if let Objet::Tmpfs(d) = nouveau.dossier {
-            let r = match cible.and_then(dans_le_tmpfs) {
+            match cible.and_then(dans_le_tmpfs) {
                 Some(n) => {
                     let attendu = if echange { est_dossier(self, cible.unwrap_or(source)) } else { dossier_source };
-                    self.fs.peut_effacer(qui, d, n, attendu)
+                    self.fs.peut_effacer(qui, d, n, attendu)?;
                 }
-                None => self.fs.peut_creer(qui, d),
-            };
-            if let Err(e) = r {
-                return e;
+                None => self.fs.peut_creer(qui, d)?,
             }
         }
         match (ancien.dossier, source) {
             // Un point de montage, d'un côté ou de l'autre.
-            (Objet::Tmpfs(_), _) => Erreur::EBUSY,
+            (Objet::Tmpfs(_), _) => Err(Erreur::EBUSY),
             (Objet::Monte(s, _), Objet::Monte(_, a)) => {
                 let n = cible.and_then(|o| match o {
                     Objet::Monte(_, n) => Some(n),
@@ -519,7 +535,7 @@ impl<'a> Vue<'a> {
                 });
                 self.monte(s).refuser(qui, Interne::Renommer { ancien: a, nouveau: n })
             }
-            _ => Erreur::EINVAL,
+            _ => Err(Erreur::EINVAL),
         }
     }
 
@@ -527,14 +543,12 @@ impl<'a> Vue<'a> {
     /// que contient `d`) : `may_delete` d'abord (le droit d'écrire dans `d`,
     /// EACCES ; son bit collant, EPERM ; unlink d'un dossier, EISDIR), puis
     /// il est occupé (EBUSY), comme `is_local_mountpoint` dans Linux.
-    fn point_occupe(&self, qui: Identite, d: Numero, s: Systeme, rmdir: bool) -> Erreur {
-        match self.fs.peut_effacer(qui, d, self.point(s), rmdir) {
-            Err(e) => e,
-            Ok(()) => Erreur::EBUSY,
-        }
+    fn point_occupe(&self, qui: Identite, d: Numero, s: Systeme, rmdir: bool) -> Result<(), Erreur> {
+        self.fs.peut_effacer(qui, d, self.point(s), rmdir)?;
+        Err(Erreur::EBUSY)
     }
 
-    fn interne(&self, qui: Identite, o: Objet, m: impl FnOnce(u32) -> Interne) -> Erreur {
+    fn interne(&self, qui: Identite, o: Objet, m: impl FnOnce(u32) -> Interne) -> Result<(), Erreur> {
         match o {
             Objet::Monte(s, n) => self.monte(s).refuser(qui, m(n)),
             // L'inode anonyme : Linux 6.18 refuse d'en changer les
@@ -544,10 +558,10 @@ impl<'a> Vue<'a> {
             // propriétaire : il est à root, en 0600 (EACCES). Tronquer ne
             // vient pas ici (pas un fichier ordinaire : EINVAL plus haut).
             Objet::Anonyme => match m(0) {
-                Interne::ChangerTemps { maintenant: true, .. } if !qui.root() => Erreur::EACCES,
-                _ => Erreur::EOPNOTSUPP,
+                Interne::ChangerTemps { maintenant: true, .. } if !qui.root() => Err(Erreur::EACCES),
+                _ => Err(Erreur::EOPNOTSUPP),
             },
-            Objet::Tmpfs(_) => Erreur::EINVAL,
+            Objet::Tmpfs(_) => Err(Erreur::EINVAL),
         }
     }
 }
@@ -574,7 +588,7 @@ pub fn en_tmpfs(fin: Fin<Objet>) -> Result<Fin<Numero>, Fin<Objet>> {
     }
 }
 
-impl Arbre for Vue<'_> {
+impl<M: Monte> Arbre for Vue<'_, M> {
     type Objet = Objet;
 
     fn mode(&self, o: Objet) -> u32 {
@@ -625,7 +639,7 @@ impl Arbre for Vue<'_> {
 }
 
 /// Le dossier `o` est-il un dossier ? (Pour la couche commune.)
-pub fn est_dossier(vue: &Vue, o: Objet) -> bool {
+pub fn est_dossier<M: Monte>(vue: &Vue<M>, o: Objet) -> bool {
     vue.mode(o) & S_IFMT == S_IFDIR
 }
 
@@ -693,11 +707,14 @@ mod tests {
             }
             Ok(())
         }
-        fn refuser(&self, _: Identite, m: Interne) -> Erreur {
-            match m {
+        fn contenu(&self, n: u32) -> Option<(u32, u32)> {
+            (n == 2).then_some((7, 0))
+        }
+        fn refuser(&self, _: Identite, m: Interne) -> Result<(), Erreur> {
+            Err(match m {
                 Interne::Creer { .. } => Erreur::ENOENT,
                 _ => Erreur::EPERM,
-            }
+            })
         }
     }
 
@@ -722,8 +739,7 @@ mod tests {
     #[test]
     fn traverser_le_montage() {
         let (fs, point) = arbre();
-        let petit = Petit;
-        let montes: [(Numero, &dyn Monte); 1] = [(point, &petit)];
+        let montes = [(point, Petit)];
         let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42" };
         let racine = Objet::Tmpfs(fs.racine());
         let depart = Depart { racine, dossier: racine, qui: DAVID, sous: false };
@@ -760,8 +776,7 @@ mod tests {
     #[test]
     fn chemins_et_attributs() {
         let (fs, point) = arbre();
-        let petit = Petit;
-        let montes: [(Numero, &dyn Monte); 1] = [(point, &petit)];
+        let montes = [(point, Petit)];
         let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42" };
         let p = Systeme(0);
         assert_eq!(vue.chemin(Objet::Monte(p, 0)).unwrap(), b"/proc");
@@ -807,17 +822,16 @@ mod tests {
     #[test]
     fn modifications_refusees() {
         let (fs, point) = arbre();
-        let petit = Petit;
         let racine = Objet::Tmpfs(fs.racine());
         let fin = |fs: &Tmpfs, qui: Identite, chemin: &[u8]| {
-            let montes: [(Numero, &dyn Monte); 1] = [(point, &petit)];
+            let montes = [(point, Petit)];
             let vue = Vue { fs, montes: &montes, lecteur: b"42" };
             let depart = Depart { racine, dossier: racine, qui, sous: false };
             resoudre(&vue, &depart, chemin, Suivre::Jamais).unwrap()
         };
         let refus = |fs: &Tmpfs, qui: Identite, m: Modification| {
-            let montes: [(Numero, &dyn Monte); 1] = [(point, &petit)];
-            Vue { fs, montes: &montes, lecteur: b"42" }.refus(qui, m)
+            let montes = [(point, Petit)];
+            Vue { fs, montes: &montes, lecteur: b"42" }.refus(qui, m).unwrap_err()
         };
         let dans = fin(&fs, DAVID, b"/proc/d/neuf");
         let existe = fin(&fs, DAVID, b"/proc/d/f");
@@ -853,6 +867,16 @@ mod tests {
         assert_eq!(refus(&fs, Identite::ROOT, Modification::Renommer(&point_root, &tmp_root, 0)), Erreur::EBUSY);
         // Les attributs : le système répond.
         assert_eq!(refus(&fs, DAVID, Modification::ChangerMode(existe.objet.unwrap())), Erreur::EPERM);
+        // L'inode anonyme : ses attributs ne changent pas (EOPNOTSUPP), sauf
+        // les dates à maintenant, refusées avant par les droits (EACCES,
+        // root passe) ; lié dans le tmpfs, EXDEV ; tronqué, EINVAL.
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerMode(Objet::Anonyme)), Erreur::EOPNOTSUPP);
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerProprietaire(Objet::Anonyme, None, None)), Erreur::EOPNOTSUPP);
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerTemps(Objet::Anonyme, true)), Erreur::EACCES);
+        assert_eq!(refus(&fs, Identite::ROOT, Modification::ChangerTemps(Objet::Anonyme, true)), Erreur::EOPNOTSUPP);
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerTemps(Objet::Anonyme, false)), Erreur::EOPNOTSUPP);
+        assert_eq!(refus(&fs, DAVID, Modification::Lier(Objet::Anonyme, &tmp)), Erreur::EXDEV);
+        assert_eq!(refus(&fs, DAVID, Modification::Tronquer(Objet::Anonyme)), Erreur::EINVAL);
         // Tronquer un dossier monté : EISDIR, avant le système.
         assert_eq!(refus(&fs, DAVID, Modification::Tronquer(Objet::Monte(Systeme(0), 1))), Erreur::EISDIR);
         // Une barre finale, pour unlink : un fichier, ENOTDIR ; un dossier
@@ -879,7 +903,7 @@ mod tests {
         // EEXIST avec NOREPLACE pour le nouveau) ; l'ancien absent, ENOENT ;
         // un nouveau qui existe et NOREPLACE, EEXIST ; EXCHANGE sans
         // nouveau, ENOENT ; une barre finale sur un fichier, ENOTDIR ; un
-        // dossier dans son propre sous-arbre, EINVAL.
+        // dossier dans son propre sous-arbre, EINVAL ; le même objet, 0.
         let soi = fin(&fs, DAVID, b"/proc/soi");
         assert_eq!(refus(&fs, DAVID, Modification::Renommer(&point_d, &soi, 0)), Erreur::EBUSY);
         assert_eq!(refus(&fs, DAVID, Modification::Renommer(&existe, &point_d, 0)), Erreur::EBUSY);
@@ -890,22 +914,24 @@ mod tests {
         assert_eq!(refus(&fs, DAVID, Modification::Renommer(&f_barre, &soi, 0)), Erreur::ENOTDIR);
         let d = fin(&fs, DAVID, b"/proc/d");
         assert_eq!(refus(&fs, DAVID, Modification::Renommer(&d, &existe, 0)), Erreur::EINVAL);
+        {
+            let montes = [(point, Petit)];
+            let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42" };
+            assert_eq!(vue.refus(DAVID, Modification::Renommer(&existe, &existe, 0)), Ok(()));
+        }
         // Renommer un fichier du tmpfs sur le point de montage : `may_delete`
         // du nouveau d'abord (root : un dossier attendu fichier, EISDIR).
         let fichier_root = fin(&fs, Identite::ROOT, b"/lien-proc");
         assert_eq!(refus(&fs, Identite::ROOT, Modification::Renommer(&fichier_root, &point_root, 0)), Erreur::EISDIR);
         // Lier vers un nom qui existe : EEXIST.
         assert_eq!(refus(&fs, DAVID, Modification::Lier(existe.objet.unwrap(), &existe)), Erreur::EEXIST);
-        // L'inode anonyme : ses attributs ne changent pas (EOPNOTSUPP), sauf
-        // les dates à maintenant, refusées avant par les droits (EACCES,
-        // root passe) ; lié dans le tmpfs, EXDEV ; tronqué, EINVAL.
-        assert_eq!(refus(&fs, DAVID, Modification::ChangerMode(Objet::Anonyme)), Erreur::EOPNOTSUPP);
-        assert_eq!(refus(&fs, DAVID, Modification::ChangerProprietaire(Objet::Anonyme, None, None)), Erreur::EOPNOTSUPP);
-        assert_eq!(refus(&fs, DAVID, Modification::ChangerTemps(Objet::Anonyme, true)), Erreur::EACCES);
-        assert_eq!(refus(&fs, Identite::ROOT, Modification::ChangerTemps(Objet::Anonyme, true)), Erreur::EOPNOTSUPP);
-        assert_eq!(refus(&fs, DAVID, Modification::ChangerTemps(Objet::Anonyme, false)), Erreur::EOPNOTSUPP);
-        assert_eq!(refus(&fs, DAVID, Modification::Lier(Objet::Anonyme, &tmp)), Erreur::EXDEV);
-        assert_eq!(refus(&fs, DAVID, Modification::Tronquer(Objet::Anonyme)), Erreur::EINVAL);
+        // L'inode anonyme n'est pas un dossier ; son périphérique.
+        {
+            let montes = [(point, Petit)];
+            let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42" };
+            assert_eq!(vue.lire_dossier(Objet::Anonyme, 0, |_, _, _, _| true), Err(Erreur::ENOTDIR));
+            assert_eq!(vue.peripherique(Objet::Anonyme), Some(ANONYME_PERIPHERIQUE));
+        }
         // en_tmpfs : seulement ce qui est entièrement dans le tmpfs.
         assert!(dans_le_tmpfs(&fin(&fs, DAVID, b"/tmp/x")) && !dans_le_tmpfs(&fin(&fs, DAVID, b"/proc")));
         assert!(en_tmpfs(fin(&fs, DAVID, b"/tmp/x")).is_ok());

@@ -46,6 +46,7 @@ mod pile;
 mod pages;
 mod pic;
 mod port;
+mod procfs;
 mod processus;
 mod programmes;
 mod serie;

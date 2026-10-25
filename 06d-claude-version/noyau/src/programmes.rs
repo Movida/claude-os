@@ -22,7 +22,7 @@
 
 use crate::descripteurs::Descripteurs;
 use crate::memoire::Acces;
-use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, processus, tache, vfs, wasi};
+use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, processus, procfs, tache, vfs, wasi};
 use fichiers::Identite;
 use alloc::vec::Vec;
 use core::fmt;
@@ -493,8 +493,11 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
         r
     });
     let (pml4, depart) = (programme.memoire.espace.pml4(), programme.depart);
+    // Son dossier de /proc, à lui, avec le lien vers son exécutable.
+    let pid = processus::numero_neuf();
+    procfs::ajouter_processus(pid, (identite.uid, identite.gid), lancement.complet);
     processus::installer(processus::Processus {
-        pid: processus::numero_neuf(),
+        pid,
         memoire: programme.memoire,
         descripteurs,
         dossier: Objet::Tmpfs(racine),
@@ -518,6 +521,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
         }
     };
     drop(processus::retirer());
+    procfs::retirer_processus(pid);
     afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.",
                 nom, code, if pages::libres() == libres { "ok" } else { "ECHEC" });
 }

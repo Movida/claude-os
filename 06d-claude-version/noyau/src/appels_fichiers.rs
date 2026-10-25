@@ -24,11 +24,12 @@ use crate::copie_utilisateur::{
     ErreurChaine, chaine_depuis_utilisateur, copier_depuis_utilisateur, copier_depuis_utilisateur_partiel,
     copier_vers_utilisateur, copier_vers_utilisateur_partiel, dans_les_bornes,
 };
-use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Sorte, Tenu};
+use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Sorte, Tenu};
 use crate::vfs::{self, CadresDuNoyau, Systeme};
-use crate::{aleatoire, console, evenements, pages, processus, temps};
+use crate::{aleatoire, console, evenements, pages, processus, procfs, temps};
 use fichiers::chemins::{Arbre, Depart, Fin, PATH_MAX, Suivre};
 use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_tmpfs};
+use fichiers::noyaufs::NoyauFs;
 use fichiers::tmpfs::{Attributs, Numero, Ouverture, limite_ecriture, suivre_pour};
 use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, permis};
 
@@ -132,7 +133,11 @@ fn avec_fin<R>(dirfd: u64, chemin: &[u8], suivre: Suivre,
 /// Le refus d'une modification qui touche un système monté
 /// (fichiers::montages::Vue::refus), vue par le processus `pid`.
 fn refus(s: &Systeme, pid: u32, qui: Identite, m: Modification) -> i64 {
-    errno(s.avec_vue(pid, |vue| vue.refus(qui, m)))
+    match s.avec_vue(pid, |vue| vue.refus(qui, m)) {
+        // Permise, et sans effet (les dates d'un fichier de /proc).
+        Ok(()) => 0,
+        Err(e) => errno(e),
+    }
 }
 
 /// Le chemin canonique de ce que désigne `fin` (pour le fichier ouvert,
@@ -210,9 +215,8 @@ pub fn ouvrir_pour(qui: fichiers::Identite, chemin: &[u8], lecture: bool, ecritu
             Ok(fin) => fin,
             Err(fin) => {
                 let objet = fin.objet.ok_or(Erreur::ENOENT)?;
-                let sorte = s.avec_vue(0, |vue| sorte_montee(vue, qui, objet, &o))?;
-                let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), lecture, ecriture, drapeaux as u32, chemin).avec_chemin(complet);
-                return s.ouverts.ajouter(f).map_err(|_| Erreur::ENOMEM);
+                let f = s.avec_vue(0, |vue| ouvrir_monte(vue, qui, objet, &o, drapeaux as u32, chemin))?;
+                return s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| Erreur::ENOMEM);
             }
         };
         let ouvert = s.fs.ouvrir(qui, &fin, &o, temps::maintenant())?;
@@ -231,34 +235,57 @@ pub fn ouvrir_pour(qui: fichiers::Identite, chemin: &[u8], lecture: bool, ecritu
     })
 }
 
-/// La sorte d'un objet d'un système monté qu'on ouvre (`o` : comment), avec
-/// les vérifications de `may_open` et `do_open` de Linux, dans leur ordre :
-/// O_EXCL avec O_CREAT sur ce qui existe, EEXIST ; O_PATH, rien d'autre à
-/// vérifier ; O_DIRECTORY sur ce qui n'est pas un dossier, ENOTDIR ; un
-/// dossier ouvert pour écrire, EISDIR ; puis les droits demandés, EACCES.
-/// Aucun système monté n'a encore de fichiers à lire (rien n'est monté) :
-/// un objet qui n'est pas un dossier ne s'ouvre qu'en O_PATH (ENXIO, celle
-/// d'un périphérique sans pilote, sinon).
-pub fn sorte_montee(vue: &Vue, qui: Identite, objet: Objet, o: &Ouverture) -> Result<Sorte, Erreur> {
-    if o.creer && o.exclusif {
-        return Err(Erreur::EEXIST);
-    }
+/// Le fichier ouvert d'un objet d'un système monté qu'on ouvre (`o` :
+/// comment ; `drapeaux` : ceux que gardera F_GETFL ; `chemin` : tel que
+/// donné), avec les vérifications de `do_open` et `may_open` de Linux,
+/// dans leur ordre (mesuré sous Linux 6.18 sur /proc) : O_PATH, rien à
+/// vérifier (O_CREAT et O_EXCL ont été retirés) ; avec O_CREAT, sur ce qui
+/// existe : O_EXCL, EEXIST, puis un dossier, EISDIR ; O_DIRECTORY sur ce
+/// qui n'est pas un dossier, ENOTDIR ; un lien (O_NOFOLLOW l'a laissé au
+/// bout du chemin), ELOOP ; un dossier ouvert pour écrire, ou avec
+/// O_TRUNC, EISDIR ; puis les droits demandés, EACCES, O_TRUNC demandant
+/// celui d'écrire (`build_open_flags`). Un fichier d'un système du noyau a une source (son
+/// contenu est fabriqué à la lecture, procfs.rs) ; aucun ne s'écrit encore
+/// (un réglage de /proc/sys, en 0644 à root : EACCES pour root aussi, nos
+/// programmes ne le sont jamais).
+pub fn ouvrir_monte(vue: &Vue<NoyauFs>, qui: Identite, objet: Objet, o: &Ouverture, drapeaux: u32, chemin: &[u8])
+    -> Result<FichierOuvert, Erreur> {
+    let ouvrir = |sorte| FichierOuvert::new(sorte, Tenu::Noyau(objet), o.lecture, o.ecriture, drapeaux, chemin);
     if o.chemin_seul {
-        return Ok(Sorte::Chemin);
+        return Ok(ouvrir(Sorte::Chemin));
     }
     let a = vue.attributs(objet);
     let dossier = a.mode & S_IFMT == S_IFDIR;
+    if o.creer && o.exclusif {
+        return Err(Erreur::EEXIST);
+    }
+    if o.creer && dossier {
+        return Err(Erreur::EISDIR);
+    }
     if o.dossier && !dossier {
         return Err(Erreur::ENOTDIR);
     }
-    if dossier && o.ecriture {
+    if a.mode & S_IFMT == S_IFLNK {
+        return Err(Erreur::ELOOP);
+    }
+    let ecrire = o.ecriture || o.tronquer;
+    if dossier && ecrire {
         return Err(Erreur::EISDIR);
     }
-    let masque = if o.lecture { fichiers::LIRE } else { 0 } | if o.ecriture { fichiers::ECRIRE } else { 0 };
+    let masque = if o.lecture { fichiers::LIRE } else { 0 } | if ecrire { fichiers::ECRIRE } else { 0 };
     if !permis(a.mode, a.uid, a.gid, qui, masque) {
         return Err(Erreur::EACCES);
     }
-    if dossier { Ok(Sorte::Dossier) } else { Err(Erreur::ENXIO) }
+    if dossier {
+        return Ok(ouvrir(Sorte::Dossier));
+    }
+    let Some((source, argument)) = vue.contenu(objet) else { return Err(Erreur::ENXIO) };
+    if o.ecriture {
+        return Err(Erreur::EACCES);
+    }
+    let mut f = ouvrir(Sorte::Noyau { lecture: procfs::lecture(source) });
+    f.donnees = procfs::donnees(source, argument);
+    Ok(f)
 }
 
 /// Le fichier que désigne `chemin`, absolu, depuis la racine, résolu comme
@@ -351,13 +378,19 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
             Ok(fin) => fin,
             Err(fin) => {
                 // Dans un système monté : créer y est refusé, le reste est
-                // ouvert comme le dit sa sorte.
+                // ouvert comme le dit sa sorte. O_CREAT et une barre finale :
+                // EISDIR, avant même de chercher le nom, comme
+                // `open_last_lookups` (mesuré : open("/proc/self/x/",
+                // O_CREAT) rend EISDIR, pas ENOENT).
+                if o.creer && fin.barre {
+                    return Err(errno(Erreur::EISDIR));
+                }
                 let Some(objet) = fin.objet else {
-                    return Err(if o.creer { refus(s, pid, depart.qui, Modification::Creer(&fin, Creation::Ouvrir)) } else { errno(Erreur::ENOENT) });
+                    let e = if o.creer { refus(s, pid, depart.qui, Modification::Creer(&fin, Creation::Ouvrir)) } else { 0 };
+                    return Err(if e == 0 { errno(Erreur::ENOENT) } else { e });
                 };
-                let sorte = s.avec_vue(pid, |vue| sorte_montee(vue, depart.qui, objet, &o)).map_err(errno)?;
-                let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), o.lecture, o.ecriture, gardes as u32, &chemin).avec_chemin(complet);
-                return Ok((s.ouverts.ajouter(f).map_err(|_| -ENOMEM)?, None));
+                let f = s.avec_vue(pid, |vue| ouvrir_monte(vue, depart.qui, objet, &o, gardes as u32, &chemin)).map_err(errno)?;
+                return Ok((s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| -ENOMEM)?, None));
             }
         };
         let ouvert = s.fs.ouvrir(depart.qui, &fin, &o, maintenant).map_err(errno)?;
@@ -674,6 +707,18 @@ fn lire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) ->
         Sorte::Chemin => Err(-EBADF),
         Sorte::EventFd => evenements::lire(o.fichier, o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Epoll => Err(-EINVAL),
+        Sorte::Noyau { .. } => {
+            let ici = position.unwrap_or(o.position);
+            let contenu = procfs::lire(o.fichier, ici, longueur)?;
+            let copies = copier_vers_utilisateur_partiel(tampon, &contenu) as u64;
+            if copies == 0 && !contenu.is_empty() {
+                return Err(-EFAULT);
+            }
+            if position.is_none() {
+                changer_position(o.fichier, ici + copies);
+            }
+            Ok(copies)
+        }
     }
 }
 
@@ -725,6 +770,8 @@ fn ecrire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) 
         Sorte::Dossier | Sorte::Chemin => Err(-EBADF),
         Sorte::EventFd => evenements::ecrire(o.fichier, o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Epoll => Err(-EINVAL),
+        // Jamais ouvert pour écrire (ouvrir_monte).
+        Sorte::Noyau { .. } => Err(-EBADF),
     }
 }
 
@@ -888,6 +935,10 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
         (Sorte::Null | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. }, _) => return 0,
         // Ni position ni taille : `noop_llseek`, qui rend la position, nulle.
         (Sorte::EventFd | Sorte::Epoll, _) => return o.position as i64,
+        (Sorte::Noyau { lecture }, _) => match procfs::deplacer(lecture, o.position, decalage, depuis) {
+            p if p >= 0 => Some(p),
+            e => return e,
+        },
         (_, SEEK_SET) => Some(decalage),
         (_, SEEK_CUR) => (o.position as i64).checked_add(decalage),
         (Sorte::Fichier, SEEK_END) => {
@@ -1335,10 +1386,13 @@ pub fn flock(fd: u64, operation: u64) -> i64 {
 /// les fichiers (`do_vfs_ioctl`) :
 ///   - FIOCLEX, FIONCLEX : le drapeau « fermer à l'exec » ;
 ///   - FIONBIO : O_NONBLOCK, d'après l'entier à `argument` ;
-///   - FIONREAD, pour un fichier ordinaire seulement : de la position à la
-///     fin, en `int` (négatif si la position est au-delà : Linux ne borne
-///     pas) ; pour le reste, c'est au pilote d'y répondre, et aucun des
-///     nôtres ne le fait : ENOTTY (un terminal le fera, 6j) ;
+///   - FIONREAD, pour un inode de fichier ordinaire (S_IFREG) : de la
+///     position à la taille, en `int` (négatif si la position est au-delà :
+///     Linux ne borne pas). Les fichiers de /proc et de /sys en sont : ce
+///     qu'en dit stat, 0 ou une page, moins la position (mesuré : -3 après
+///     avoir lu 3 octets de maps). Pour le reste, c'est au pilote d'y
+///     répondre, et aucun des nôtres ne le fait : ENOTTY (un terminal le
+///     fera, 6j) ;
 ///   - un epoll répond lui-même à toute autre requête : EINVAL
 ///     (`ep_eventpoll_ioctl`, mesuré) ;
 ///   - les requêtes des terminaux (TCGETS, la question d'isatty, et les
@@ -1377,8 +1431,8 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
             });
             0
         }
-        FIONREAD if o.sorte == Sorte::Fichier => {
-            let taille = vfs::avec(|fs, _| fs.attributs(o.numero()).taille);
+        FIONREAD if attributs(o.objet).mode & S_IFMT == S_IFREG => {
+            let taille = attributs(o.objet).taille;
             let reste = (taille as i64).wrapping_sub(o.position as i64) as i32;
             match copier_vers_utilisateur(argument, &reste.to_le_bytes()) {
                 Ok(()) => 0,
@@ -1876,13 +1930,16 @@ pub fn ftruncate(fd: u64, taille: u64) -> i64 {
 /// sur un disque (il viendra en 6l). Le descripteur doit exister (EBADF),
 /// et ne pas être O_PATH. Puis, comme `vfs_fsync_range`, le fichier doit
 /// avoir une opération fsync, sinon EINVAL. Mesuré sous Linux 6.18 : les
-/// fichiers et dossiers du tmpfs en ont une (`noop_fsync`) ; pas les
-/// périphériques de /dev, ni un terminal.
+/// fichiers et dossiers du tmpfs en ont une (`noop_fsync`), et les
+/// attributs de /sys ; pas les périphériques de /dev, ni un terminal, ni
+/// un eventfd ou un epoll, ni les fichiers et dossiers de /proc, ni les
+/// dossiers de /sys.
 pub fn fsync(fd: u64) -> i64 {
     match ouvert(fd) {
         Ok(o) => match o.sorte {
             Sorte::Chemin => -EBADF,
-            Sorte::Fichier | Sorte::Dossier => 0,
+            Sorte::Fichier | Sorte::Noyau { lecture: Lecture::Attribut } => 0,
+            Sorte::Dossier if o.objet.tmpfs().is_some() => 0,
             _ => -EINVAL,
         },
         Err(e) => e,

@@ -18,7 +18,11 @@
 //!   - `montages` (6d) : les systèmes de fichiers montés sur des dossiers du
 //!     tmpfs (/proc, /sys), la vue de tous les systèmes que parcourt la
 //!     résolution, et les règles de Linux pour ce qui passe d'un système à
-//!     l'autre.
+//!     l'autre ;
+//!   - `noyaufs` (6d) : les systèmes de fichiers du noyau (procfs, sysfs),
+//!     dont le noyau décrit l'arborescence et fabrique le contenu, et la
+//!     lecture d'un contenu fait d'enregistrements (le `seq_file` de
+//!     Linux).
 //!
 //! La bibliothèque ne sait rien des cadres de la mémoire, des processus ni
 //! des copies depuis ou vers un programme : c'est le noyau qui les fait.
@@ -37,6 +41,7 @@ extern crate alloc;
 pub mod chemins;
 pub mod index;
 pub mod montages;
+pub mod noyaufs;
 pub mod tmpfs;
 
 /// La taille d'une page.

@@ -267,6 +267,15 @@ pub fn charger<'a, 'b>(executable: &Executable<'a>, nom: NomCourt, fichier: Fich
     let mut memoire = Memoire::creer(nom)?;
     let image = placer(&memoire, executable, interpreteur.is_some())?;
     poser(&mut memoire, &image, fichier)?;
+    // Le code du programme (pas celui de l'interpréteur), comme
+    // load_elf_binary : `start_code` le plus petit p_vaddr d'un segment
+    // exécutable, `end_code` le plus grand p_vaddr + p_filesz.
+    memoire.code = image.segments().filter(|s| s.execution).fold((u64::MAX, 0), |(debut, fin), s| {
+        (debut.min(s.adresse), fin.max(s.adresse + s.taille_fichier))
+    });
+    if memoire.code.0 > memoire.code.1 {
+        memoire.code = (0, 0);
+    }
     let image_interpreteur = match interpreteur {
         Some((x, f)) => {
             let i = placer_interpreteur(&memoire, x, executable.genre())?;

@@ -555,6 +555,16 @@ impl Wasi {
                 // Un programme WebAssembly n'a ni eventfd ni epoll : ce
                 // descripteur ne peut pas être à lui.
                 (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll, _) => Err(EBADF),
+                // Un fichier de /proc ou de /sys : son contenu fabriqué à la
+                // lecture, comme pour un programme Linux (seule une mémoire
+                // qui manque peut échouer) ; il ne s'écrit pas.
+                (Sorte::Noyau { .. }, false) => crate::procfs::lire(d.fichier, ici, octets.len() as u64)
+                    .map(|v| {
+                        octets[..v.len()].copy_from_slice(&v);
+                        v.len()
+                    })
+                    .map_err(|_| ENOMEM),
+                (Sorte::Noyau { .. }, true) => Err(EBADF),
             };
             match r {
                 Ok(k) => {
@@ -568,9 +578,9 @@ impl Wasi {
                 Err(_) => break,
             }
         }
-        if sorte == Sorte::Fichier {
+        if sorte == Sorte::Fichier || matches!(sorte, Sorte::Noyau { .. }) {
             vfs::avec_systeme(|s, _| s.ouverts.fichier(d.fichier).position = ici);
-            if !ecriture {
+            if !ecriture && sorte == Sorte::Fichier {
                 vfs::avec(|fs, _| fs.acceder(n(), maintenant));
             }
         }
@@ -698,13 +708,17 @@ impl Wasi {
             let fin = match en_tmpfs(fin) {
                 Ok(fin) => fin,
                 Err(fin) => {
+                    // O_CREAT et une barre finale : EISDIR, avant de
+                    // chercher le nom (`open_last_lookups`).
+                    if o.creer && fin.barre {
+                        return Err(errno(Erreur::EISDIR));
+                    }
                     let Some(objet) = fin.objet else {
-                        let e = if o.creer { s.avec_vue(0, |vue| vue.refus(qui, Modification::Creer(&fin, Creation::Ouvrir))) } else { Erreur::ENOENT };
-                        return Err(errno(e));
+                        let refus = s.avec_vue(0, |vue| vue.refus(qui, Modification::Creer(&fin, Creation::Ouvrir)));
+                        return Err(errno(if o.creer { refus.err().unwrap_or(Erreur::ENOENT) } else { Erreur::ENOENT }));
                     };
-                    let sorte = s.avec_vue(0, |vue| appels_fichiers::sorte_montee(vue, qui, objet, &o)).map_err(errno)?;
-                    let f = FichierOuvert::new(sorte, Tenu::Noyau(objet), o.lecture, o.ecriture, drapeaux, &chemin).avec_chemin(complet);
-                    return s.ouverts.ajouter(f).map_err(|_| ENOMEM);
+                    let f = s.avec_vue(0, |vue| appels_fichiers::ouvrir_monte(vue, qui, objet, &o, drapeaux, &chemin)).map_err(errno)?;
+                    return s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| ENOMEM);
                 }
             };
             let ouvert = s.fs.ouvrir(qui, &fin, &o, maintenant).map_err(errno)?;

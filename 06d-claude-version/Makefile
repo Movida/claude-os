@@ -1,5 +1,6 @@
 # Sous-étape 6d : claude --version, le vrai binaire de Claude Code. Le
-# noyau applique la limite de temps de calcul de Linux (RLIMIT_CPU). Le
+# noyau applique la limite de temps de calcul de Linux (RLIMIT_CPU),
+# enregistre les signaux, monte /proc (fichiers/src/noyaufs.rs). Le
 # reste vient de 6c (les programmes dynamiques : ld-linux et la glibc
 # partagée, le lanceur /etc/demarrage), de 6b (le système de fichiers en
 # mémoire, fichiers/, et les fichiers projetés), de 6a (la mémoire
@@ -46,8 +47,8 @@
 #                  d'erreur des fichiers doivent être ceux de Linux), et
 #                  linux/dynamique (ld-linux, la glibc partagée, dlopen),
 #                  linux/signaux (nos codes d'erreur des signaux),
-#                  linux/systeme (uname, futex, prctl...) et
-#                  linux/evenements (eventfd, epoll)
+#                  linux/systeme (uname, futex, prctl...),
+#                  linux/evenements (eventfd, epoll) et linux/proc
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -126,7 +127,9 @@ boot.bin: programmes.cpio FORCE
 #     sur l'hôte aussi ;
 #   - systeme : gcc -static, les petits appels de claude (uname,
 #     sched_getaffinity, futex, prctl) ; sur l'hôte aussi ;
-#   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi.
+#   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi ;
+#   - proc : gcc -static, /proc (maps, statm, exe, /proc/sys) ; sur l'hôte
+#     aussi.
 # Pour les tests du lecteur ELF sur l'hôte, des variantes qu'il doit
 # accepter : bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -210,6 +213,10 @@ $(LINUX)/systeme: linux/systeme.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/evenements: linux/evenements.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/proc: linux/proc.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -494,7 +501,7 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
 # puis lance ce que dit son /etc/demarrage (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements FORCE
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc FORCE
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
 	sh archive.sh $@ archive.txt
@@ -577,7 +584,7 @@ SHELL = /bin/bash
 .DELETE_ON_ERROR:
 
 tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
-            $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements
+            $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -596,6 +603,7 @@ tests-hote: $(SUITE)/.convertie $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/cla
 	./$(LINUX)/signaux | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/systeme | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/evenements | tee /dev/stderr | (! grep -q ECHEC)
+	./$(LINUX)/proc | tee /dev/stderr | (! grep -q ECHEC)
 
 suite: $(SUITE)/.convertie
 
