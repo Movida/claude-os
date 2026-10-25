@@ -18,6 +18,7 @@ file  /bin/temps           linux/construits/temps 755 0 0
 # son propre binaire pendant qu'il tourne (ETXTBSY), ce que les droits
 # d'un fichier de root refuseraient avant (EACCES).
 file  /bin/fichiers        linux/construits/fichiers 755 1000 1000
+file  /bin/arbre           linux/construits/arbre 755 0 0
 
 # Quelques fichiers à lire : un texte, un second nom (un lien physique),
 # et un lien symbolique.
@@ -26,7 +27,10 @@ file  /etc/bonjour.txt     racine/etc/bonjour.txt 644 0 0 /etc/salut.txt
 slink /etc/lien-bonjour    bonjour.txt 777 0 0
 
 # /tmp, ouvert à tous mais « sticky » : chacun n'y efface que ses fichiers.
+# Un fichier de root s'y trouve, que l'utilisateur 1000 ne doit pas pouvoir
+# effacer, bien qu'il puisse l'écrire (le test de linux/fichiers).
 dir   /tmp 1777 0 0
+file  /tmp/a-root          racine/etc/bonjour.txt 666 0 0
 # Le dossier personnel de l'utilisateur 1000, celui des programmes (HOME).
 dir   /home 755 0 0
 dir   /home/utilisateur 755 1000 1000

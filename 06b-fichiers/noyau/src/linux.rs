@@ -38,7 +38,6 @@ use crate::{aleatoire, cpu, horloge, pages, processus, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
-const ENOENT: i64 = 2;
 const ESRCH: i64 = 3;
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
@@ -48,6 +47,36 @@ const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
 
 // Les numéros des appels.
+const FSYNC: u64 = 74;
+const FDATASYNC: u64 = 75;
+const TRUNCATE: u64 = 76;
+const FTRUNCATE: u64 = 77;
+const GETCWD: u64 = 79;
+const CHDIR: u64 = 80;
+const FCHDIR: u64 = 81;
+const RENAME: u64 = 82;
+const MKDIR: u64 = 83;
+const LINK: u64 = 86;
+const SYMLINK: u64 = 88;
+const READLINK: u64 = 89;
+const CHMOD: u64 = 90;
+const FCHMOD: u64 = 91;
+const CHOWN: u64 = 92;
+const FCHOWN: u64 = 93;
+const LCHOWN: u64 = 94;
+const UMASK: u64 = 95;
+const SYNC: u64 = 162;
+const GETDENTS64: u64 = 217;
+const MKDIRAT: u64 = 258;
+const FCHOWNAT: u64 = 260;
+const RENAMEAT: u64 = 264;
+const LINKAT: u64 = 265;
+const SYMLINKAT: u64 = 266;
+const FCHMODAT: u64 = 268;
+const UTIMENSAT: u64 = 280;
+const SYNCFS: u64 = 306;
+const RENAMEAT2: u64 = 316;
+const FCHMODAT2: u64 = 452;
 const READ: u64 = 0;
 const WRITE: u64 = 1;
 const OPEN: u64 = 2;
@@ -161,9 +190,36 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         RSEQ => -ENOSYS,
         PRLIMIT64 => prlimit64(a[0], a[1], a[2], a[3]),
         // La glibc lit le lien /proc/self/exe pour connaître son propre
-        // chemin (dl_get_origin). Pas encore de système de fichiers : le
-        // lien n'existe pas.
-        READLINKAT => -ENOENT,
+        // chemin (dl_get_origin) : /proc viendra en 6d, ENOENT d'ici là.
+        READLINKAT => f::readlinkat(a[0], a[1], a[2], a[3]),
+        READLINK => f::readlink(a[0], a[1], a[2]),
+        MKDIR => f::mkdir(a[0], a[1]),
+        MKDIRAT => f::mkdirat(a[0], a[1], a[2]),
+        SYMLINK => f::symlink(a[0], a[1]),
+        SYMLINKAT => f::symlinkat(a[0], a[1], a[2]),
+        LINK => f::link(a[0], a[1]),
+        LINKAT => f::linkat(a[0], a[1], a[2], a[3], a[4]),
+        RENAME => f::rename(a[0], a[1]),
+        RENAMEAT => f::renameat2(a[0], a[1], a[2], a[3], 0),
+        RENAMEAT2 => f::renameat2(a[0], a[1], a[2], a[3], a[4]),
+        GETDENTS64 => f::getdents64(a[0], a[1], a[2]),
+        GETCWD => f::getcwd(a[0], a[1]),
+        CHDIR => f::chdir(a[0]),
+        FCHDIR => f::fchdir(a[0]),
+        TRUNCATE => f::truncate(a[0], a[1]),
+        FTRUNCATE => f::ftruncate(a[0], a[1]),
+        FSYNC | FDATASYNC | SYNCFS => f::fsync(a[0]),
+        SYNC => 0,
+        UMASK => f::umask(a[0]),
+        CHMOD => f::chmod(a[0], a[1]),
+        FCHMOD => f::fchmod(a[0], a[1]),
+        FCHMODAT => f::fchmodat2(a[0], a[1], a[2], 0),
+        FCHMODAT2 => f::fchmodat2(a[0], a[1], a[2], a[3]),
+        CHOWN => f::fchownat(-100i64 as u64, a[0], a[1], a[2], 0),
+        LCHOWN => f::fchownat(-100i64 as u64, a[0], a[1], a[2], 0x100),
+        FCHOWN => f::fchown(a[0], a[1], a[2]),
+        FCHOWNAT => f::fchownat(a[0], a[1], a[2], a[3], a[4]),
+        UTIMENSAT => f::utimensat(a[0], a[1], a[2], a[3]),
         GETRANDOM => getrandom(a[0], a[1], a[2]),
         SYSINFO => sysinfo(a[0]),
         // Qui est le programme : le processus 1, le seul (son parent, le
@@ -241,6 +297,36 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         RSEQ => ("rseq", 4),
         PRLIMIT64 => ("prlimit64", 4),
         READLINKAT => ("readlinkat", 4),
+        READLINK => ("readlink", 3),
+        MKDIR => ("mkdir", 2),
+        MKDIRAT => ("mkdirat", 3),
+        SYMLINK => ("symlink", 2),
+        SYMLINKAT => ("symlinkat", 3),
+        LINK => ("link", 2),
+        LINKAT => ("linkat", 5),
+        RENAME => ("rename", 2),
+        RENAMEAT => ("renameat", 4),
+        RENAMEAT2 => ("renameat2", 5),
+        GETDENTS64 => ("getdents64", 3),
+        GETCWD => ("getcwd", 2),
+        CHDIR => ("chdir", 1),
+        FCHDIR => ("fchdir", 1),
+        TRUNCATE => ("truncate", 2),
+        FTRUNCATE => ("ftruncate", 2),
+        FSYNC => ("fsync", 1),
+        FDATASYNC => ("fdatasync", 1),
+        SYNCFS => ("syncfs", 1),
+        SYNC => ("sync", 0),
+        UMASK => ("umask", 1),
+        CHMOD => ("chmod", 2),
+        FCHMOD => ("fchmod", 2),
+        FCHMODAT => ("fchmodat", 3),
+        FCHMODAT2 => ("fchmodat2", 4),
+        CHOWN => ("chown", 3),
+        LCHOWN => ("lchown", 3),
+        FCHOWN => ("fchown", 3),
+        FCHOWNAT => ("fchownat", 5),
+        UTIMENSAT => ("utimensat", 4),
         GETRANDOM => ("getrandom", 3),
         SYSINFO => ("sysinfo", 1),
         GETPID => ("getpid", 0),

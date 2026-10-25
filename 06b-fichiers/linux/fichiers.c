@@ -387,6 +387,342 @@ static void notre_archive(void)
     verifier(a.st_uid == 0 && (a.st_mode & 0777) == 0644, "/etc/bonjour.txt : a root, 0644");
 }
 
+/* Les entrées d'un dossier, par getdents64 directement, avec un tampon
+ * de `taille` octets : leurs noms, dans le tableau `noms`. */
+struct entree64 {
+    unsigned long long ino;
+    long long suivante;
+    unsigned short taille;
+    unsigned char genre;
+    char nom[];
+};
+
+static int compter(int fd, char noms[][16], int max, int taille)
+{
+    char tampon[1024];
+    int n = 0;
+    long lus;
+    while ((lus = syscall(SYS_getdents64, fd, tampon, taille)) > 0) {
+        for (long p = 0; p < lus;) {
+            struct entree64 *e = (struct entree64 *)(tampon + p);
+            if (n < max)
+                snprintf(noms[n++], 16, "%.15s", e->nom);
+            p += e->taille;
+        }
+    }
+    return n;
+}
+
+static int contient(char noms[][16], int n, const char *nom)
+{
+    for (int i = 0; i < n; i++)
+        if (strcmp(noms[i], nom) == 0)
+            return 1;
+    return 0;
+}
+
+static void arborescence(void)
+{
+    char d[64], c[96], e[96];
+    nom(d, "d");
+    verifier(mkdir(d, 0755) == 0, "mkdir");
+    errno = 0;
+    verifier(ERREUR(mkdir(d, 0755), EEXIST), "mkdir d'un dossier qui existe : EEXIST");
+    snprintf(c, sizeof c, "%s/sous/", d);
+    verifier(mkdir(c, 0755) == 0, "mkdir avec une barre finale");
+    struct stat st;
+    verifier(stat(d, &st) == 0 && S_ISDIR(st.st_mode) && st.st_nlink == 3, "un dossier et un sous-dossier : 3 liens");
+    errno = 0;
+    verifier(ERREUR(rmdir(d), ENOTEMPTY), "rmdir d'un dossier non vide : ENOTEMPTY");
+    errno = 0;
+    verifier(ERREUR(unlink(d), EISDIR), "unlink d'un dossier : EISDIR");
+    snprintf(e, sizeof e, "%s/.", d);
+    errno = 0;
+    verifier(ERREUR(rmdir(e), EINVAL), "rmdir de d/. : EINVAL");
+    snprintf(e, sizeof e, "%s/..", d);
+    errno = 0;
+    verifier(ERREUR(rmdir(e), ENOTEMPTY), "rmdir de d/.. : ENOTEMPTY");
+
+    /* Des fichiers dans le dossier, listés par getdents64 avec un petit
+     * tampon (deux entrées par appel), en effaçant pendant la lecture :
+     * aucune autre entrée n'est sautée ni répétée (POSIX). */
+    const char *noms_fichiers[] = {"f1", "f2", "f3", "f4", "f5"};
+    for (int i = 0; i < 5; i++) {
+        snprintf(e, sizeof e, "%s/%s", d, noms_fichiers[i]);
+        close(open(e, O_CREAT | O_WRONLY, 0644));
+    }
+    int fd = open(d, O_RDONLY | O_DIRECTORY);
+    char noms[16][16];
+    int n = compter(fd, noms, 16, 1024);
+    verifier(n == 8 && contient(noms, n, ".") && contient(noms, n, "..") && contient(noms, n, "sous")
+             && contient(noms, n, "f1") && contient(noms, n, "f5"), "getdents64 : les 8 entrees");
+    errno = 0;
+    lseek(fd, 0, SEEK_SET);
+    char petit[16];
+    verifier(syscall(SYS_getdents64, fd, petit, sizeof petit) == -1 && errno == EINVAL,
+             "getdents64, tampon trop petit : EINVAL");
+    /* Une première lecture de 64 octets (deux ou trois petites entrées),
+     * puis on efface un fichier pas encore vu, puis on lit le reste. */
+    lseek(fd, 0, SEEK_SET);
+    char tampon[64];
+    char vus[16][16];
+    int nvus = 0;
+    long l = syscall(SYS_getdents64, fd, tampon, sizeof tampon);
+    for (long p = 0; p < l && nvus < 16;) {
+        struct entree64 *x = (struct entree64 *)(tampon + p);
+        snprintf(vus[nvus++], 16, "%.15s", x->nom);
+        p += x->taille;
+    }
+    const char *efface = NULL;
+    for (int i = 0; i < 5 && !efface; i++)
+        if (!contient(vus, nvus, noms_fichiers[i]))
+            efface = noms_fichiers[i];
+    if (efface) {
+        snprintf(e, sizeof e, "%s/%s", d, efface);
+        unlink(e);
+    }
+    char suite[16][16];
+    int nsuite = compter(fd, suite, 16, 64), doubles = 0;
+    for (int i = 0; i < nsuite; i++) {
+        doubles += contient(vus, nvus, suite[i]);
+        if (nvus < 16)
+            snprintf(vus[nvus++], 16, "%.15s", suite[i]);
+    }
+    int tous = 1;
+    for (int i = 0; i < 5; i++)
+        if (noms_fichiers[i] != efface)
+            tous &= contient(vus, nvus, noms_fichiers[i]);
+    verifier(efface && doubles == 0 && tous, "effacer pendant la lecture : rien de saute ni de repete");
+    close(fd);
+    fd = open(nom_a, O_RDONLY);
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_getdents64, fd, tampon, sizeof tampon), ENOTDIR), "getdents64 d'un fichier : ENOTDIR");
+    close(fd);
+
+    /* Renommer. */
+    char f1[96], f2[96], g[96];
+    snprintf(f1, sizeof f1, "%s/f1", d);
+    snprintf(f2, sizeof f2, "%s/f2", d);
+    snprintf(g, sizeof g, "%s/sous/g", d);
+    /* Le fichier effacé pendant la lecture revient, s'il servait ensuite. */
+    if (efface && strcmp(efface, "f1") == 0)
+        close(open(f1, O_CREAT | O_WRONLY, 0644));
+    if (efface && strcmp(efface, "f2") == 0)
+        close(open(f2, O_CREAT | O_WRONLY, 0644));
+    struct stat a1, a2;
+    stat(f1, &a1);
+    verifier(rename(f1, f2) == 0 && stat(f2, &a2) == 0 && a2.st_ino == a1.st_ino && stat(f1, &a2) == -1,
+             "rename par-dessus un fichier : l'ancien disparait");
+    snprintf(e, sizeof e, "%s/sous", d);
+    errno = 0;
+    verifier(ERREUR(rename(f2, e), EISDIR), "rename d'un fichier sur un dossier : EISDIR");
+    errno = 0;
+    verifier(ERREUR(rename(e, f2), ENOTDIR), "rename d'un dossier sur un fichier : ENOTDIR");
+    snprintf(c, sizeof c, "%s/sous/x", d);
+    errno = 0;
+    verifier(ERREUR(rename(d, c), EINVAL), "rename d'un dossier dans lui-meme : EINVAL");
+    errno = 0;
+    verifier(ERREUR(rename(f2, "/tmp/fichiers-inexistant/"), ENOTDIR) || errno == ENOENT,
+             "rename vers un nom avec une barre finale");
+    close(open(g, O_CREAT | O_WRONLY, 0644));
+    errno = 0;
+    verifier(ERREUR(renameat2(AT_FDCWD, f2, AT_FDCWD, g, RENAME_NOREPLACE), EEXIST), "RENAME_NOREPLACE : EEXIST");
+    struct stat s_f2, s_g;
+    stat(f2, &s_f2);
+    stat(g, &s_g);
+    verifier(renameat2(AT_FDCWD, f2, AT_FDCWD, g, RENAME_EXCHANGE) == 0 && stat(f2, &a1) == 0 && stat(g, &a2) == 0
+             && a1.st_ino == s_g.st_ino && a2.st_ino == s_f2.st_ino, "RENAME_EXCHANGE echange les deux");
+
+    /* Les liens. */
+    char lien[96], dur[96];
+    snprintf(lien, sizeof lien, "%s/lien", d);
+    snprintf(dur, sizeof dur, "%s/dur", d);
+    verifier(link(f2, dur) == 0 && stat(dur, &a1) == 0 && stat(f2, &a2) == 0 && a1.st_ino == a2.st_ino && a1.st_nlink == 2,
+             "link : un second nom, 2 liens");
+    errno = 0;
+    verifier(ERREUR(link(d, lien), EPERM), "link d'un dossier : EPERM");
+    char cible[64] = {0};
+    verifier(symlink("f2", lien) == 0 && readlink(lien, cible, sizeof cible) == 2 && memcmp(cible, "f2", 2) == 0,
+             "symlink puis readlink");
+    errno = 0;
+    verifier(ERREUR(readlink(f2, cible, sizeof cible), EINVAL), "readlink de ce qui n'est pas un lien : EINVAL");
+    char pendant[96], cree[96];
+    snprintf(pendant, sizeof pendant, "%s/pendant", d);
+    snprintf(cree, sizeof cree, "%s/cree", d);
+    verifier(symlink("cree", pendant) == 0, "un lien pendant");
+    errno = 0;
+    verifier(ERREUR(open(pendant, O_CREAT | O_EXCL | O_WRONLY, 0644), EEXIST), "O_CREAT | O_EXCL sur un lien pendant : EEXIST");
+    fd = open(pendant, O_CREAT | O_WRONLY, 0644);
+    verifier(fd >= 0 && stat(cree, &a1) == 0, "O_CREAT sur un lien pendant cree sa cible");
+    close(fd);
+    errno = 0;
+    verifier(ERREUR(open(lien, O_RDONLY | O_NOFOLLOW), ELOOP), "O_NOFOLLOW sur un lien : ELOOP");
+
+    /* Le dossier courant. */
+    char ici[128];
+    verifier(chdir(d) == 0 && getcwd(ici, sizeof ici) && strcmp(ici, d) == 0, "chdir puis getcwd");
+    verifier(access("f2", R_OK) == 0 && chdir("sous") == 0 && access("../f2", R_OK) == 0 && chdir("..") == 0,
+             "des chemins relatifs au dossier courant");
+    errno = 0;
+    verifier(ERREUR(chdir("f2"), ENOTDIR), "chdir vers un fichier : ENOTDIR");
+    errno = 0;
+    verifier(getcwd(ici, 4) == NULL && errno == ERANGE, "getcwd, tampon trop petit : ERANGE");
+    fd = open("/", O_RDONLY | O_DIRECTORY);
+    verifier(fchdir(fd) == 0 && getcwd(ici, sizeof ici) && strcmp(ici, "/") == 0, "fchdir");
+    close(fd);
+
+    /* Tronquer : raccourcir puis rallonger relit des zéros. */
+    fd = open(f2, O_RDWR | O_TRUNC);
+    char lu[8];
+    verifier(write(fd, "abcdefgh", 8) == 8 && ftruncate(fd, 3) == 0 && ftruncate(fd, 8) == 0
+             && pread(fd, lu, 8, 0) == 8 && memcmp(lu, "abc\0\0\0\0\0", 8) == 0,
+             "ftruncate qui raccourcit puis rallonge : des zeros");
+    close(fd);
+    fd = open(f2, O_RDONLY);
+    errno = 0;
+    verifier(ERREUR(ftruncate(fd, 0), EINVAL), "ftruncate en lecture seule : EINVAL");
+    close(fd);
+    errno = 0;
+    verifier(ERREUR(truncate(f2, -1), EINVAL) && truncate(f2, 100) == 0 && stat(f2, &a1) == 0 && a1.st_size == 100,
+             "truncate : -1 refuse, 100 accepte");
+    errno = 0;
+    verifier(ERREUR(truncate(d, 0), EISDIR), "truncate d'un dossier : EISDIR");
+    fd = open(f2, O_RDONLY);
+    verifier(fsync(fd) == 0 && fdatasync(fd) == 0, "fsync et fdatasync");
+    close(fd);
+
+    /* Les droits et les dates. */
+    mode_t ancien = umask(077);
+    snprintf(e, sizeof e, "%s/prive", d);
+    fd = open(e, O_CREAT | O_WRONLY, 0666);
+    verifier(fstat(fd, &a1) == 0 && (a1.st_mode & 0777) == 0600 && umask(ancien) == 077, "umask 077 : 0666 devient 0600");
+    close(fd);
+    verifier(chmod(e, 0640) == 0 && stat(e, &a1) == 0 && (a1.st_mode & 07777) == 0640, "chmod");
+    verifier(chown(e, getuid(), getgid()) == 0, "chown vers soi-meme");
+    struct timespec dates[2] = {{0, UTIME_OMIT}, {1000000000, 5}};
+    verifier(utimensat(AT_FDCWD, e, dates, 0) == 0 && stat(e, &a1) == 0 && a1.st_mtim.tv_sec == 1000000000
+             && a1.st_mtim.tv_nsec == 5, "utimensat pose la date de modification");
+    if (getuid() != 0) {
+        errno = 0;
+        verifier(ERREUR(chown(e, 0, 0), EPERM), "chown vers root, sans l'etre : EPERM");
+        chmod(e, 0);
+        errno = 0;
+        verifier(ERREUR(open(e, O_RDONLY), EACCES), "un fichier 0000 : EACCES");
+    }
+
+    /* Tout effacer. */
+    const char *a_effacer[] = {"f2", "dur", "lien", "pendant", "cree", "prive", "sous/g", "f3", "f4", "f5"};
+    int efface_ok = 1;
+    for (unsigned i = 0; i < sizeof a_effacer / sizeof *a_effacer; i++) {
+        snprintf(e, sizeof e, "%s/%s", d, a_effacer[i]);
+        if (unlink(e) != 0 && errno != ENOENT)
+            efface_ok = 0;
+    }
+    snprintf(e, sizeof e, "%s/sous", d);
+    verifier(efface_ok && rmdir(e) == 0 && rmdir(d) == 0, "tout effacer");
+}
+
+/* L'arborescence : les cas où Linux vérifie dans un ordre précis, ou
+ * répond autrement qu'on l'attendrait. */
+static void arborescence_bornes(void)
+{
+    char d[64], e[96], f[96];
+    nom(d, "bornes");
+    mkdir(d, 0755);
+    snprintf(f, sizeof f, "%s/f", d);
+    int fd = open(f, O_CREAT | O_RDWR, 0644);
+    /* utimensat : les deux dates à UTIME_OMIT, rien à faire, même sur un
+     * chemin absent ; un chemin nul désigne le descripteur. */
+    struct timespec omit[2] = {{0, UTIME_OMIT}, {0, UTIME_OMIT}};
+    verifier(utimensat(AT_FDCWD, "/tmp/fichiers-absent/x", omit, 0) == 0, "utimensat(OMIT, OMIT) sur un chemin absent : 0");
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_utimensat, fd, NULL, NULL, AT_SYMLINK_NOFOLLOW), EINVAL),
+             "utimensat, chemin nul et un drapeau : EINVAL");
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_utimensat, AT_FDCWD, NULL, NULL, 0), EFAULT), "utimensat(AT_FDCWD, NULL) : EFAULT");
+    int chemin = open(f, O_PATH);
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_utimensat, chemin, NULL, NULL, 0), EBADF), "utimensat sur un descripteur O_PATH : EBADF");
+    struct timespec faux[2] = {{0, UTIME_OMIT}, {0, 2000000000}};
+    errno = 0;
+    verifier(ERREUR(utimensat(AT_FDCWD, "/tmp/fichiers-absent/x", faux, 0), ENOENT) && ERREUR(utimensat(AT_FDCWD, f, faux, 0), EINVAL),
+             "utimensat, une date fausse : le chemin d'abord (ENOENT), puis EINVAL");
+    /* readlinkat d'un chemin vide qui n'est pas un lien : ENOENT. */
+    char lu[16];
+    errno = 0;
+    verifier(ERREUR(readlinkat(fd, "", lu, sizeof lu), ENOENT), "readlinkat(fichier, \"\") : ENOENT");
+    /* linkat avec AT_EMPTY_PATH (Linux 6.10 et plus) : un nom pour le
+     * fichier d'un descripteur, ouvert par nous. */
+    snprintf(e, sizeof e, "%s/autre-nom", d);
+    struct stat a, b;
+    verifier(linkat(fd, "", AT_FDCWD, e, AT_EMPTY_PATH) == 0 && stat(e, &a) == 0 && fstat(fd, &b) == 0 && a.st_ino == b.st_ino,
+             "linkat(fd, \"\", AT_EMPTY_PATH) : un nom de plus");
+    unlink(e);
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_renameat2, AT_FDCWD, NULL, AT_FDCWD, e, 0xff), EINVAL),
+             "renameat2, drapeaux inconnus : EINVAL avant les chemins");
+    errno = 0;
+    verifier(ERREUR(symlink("", f), ENOENT), "symlink vers \"\" sur un nom qui existe : ENOENT");
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_ftruncate, 999, -1L), EINVAL), "ftruncate(999, -1) : EINVAL d'abord");
+    /* open avec O_CREAT : la barre finale, avant de suivre le lien. */
+    snprintf(e, sizeof e, "%s/pendant", d);
+    int lien = symlink("nulle/part", e);
+    strcat(e, "/");
+    errno = 0;
+    verifier(lien == 0 && ERREUR(open(e, O_CREAT | O_WRONLY, 0644), EISDIR), "O_CREAT sur \"lien/\" qui ne mene a rien : EISDIR");
+    errno = 0;
+    verifier(ERREUR(open(d, O_CREAT | O_EXCL | O_WRONLY, 0644), EEXIST), "O_CREAT | O_EXCL sur un dossier : EEXIST");
+    /* chown(-1, -1) retire le setuid, même à son propriétaire. */
+    fchmod(fd, 04755);
+    verifier(fchown(fd, -1, -1) == 0 && fstat(fd, &a) == 0 && (a.st_mode & 07777) == 0755, "chown(-1, -1) retire S_ISUID");
+    /* Un dossier effacé, encore ouvert : rien à y lire (ENOENT). */
+    snprintf(e, sizeof e, "%s/efface", d);
+    mkdir(e, 0755);
+    int mort = open(e, O_RDONLY | O_DIRECTORY);
+    rmdir(e);
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_getdents64, mort, lu, sizeof lu), ENOENT), "getdents64 d'un dossier efface : ENOENT");
+    close(mort);
+    /* getcwd au-delà de PATH_MAX : ENAMETOOLONG (la glibc se rabat alors
+     * sur sa propre méthode). 21 dossiers de 200 caractères. */
+    char long_nom[201];
+    memset(long_nom, 'n', 200);
+    long_nom[200] = 0;
+    int ici = open(".", O_RDONLY | O_DIRECTORY), profondeur = 0, retour = chdir(d) == 0;
+    while (profondeur < 21 && mkdir(long_nom, 0755) == 0 && chdir(long_nom) == 0)
+        profondeur++;
+    char *grand = malloc(8192);
+    errno = 0;
+    verifier(retour && profondeur == 21 && ERREUR(syscall(SYS_getcwd, grand, 8192), ENAMETOOLONG),
+             "getcwd au-dela de 4096 octets : ENAMETOOLONG");
+    free(grand);
+    while (profondeur-- > 0)
+        retour &= chdir("..") == 0 && rmdir(long_nom) == 0;
+    verifier(retour && fchdir(ici) == 0, "remonter, effacer les dossiers longs");
+    close(ici);
+    close(chemin);
+    close(fd);
+    unlink(f);
+    snprintf(e, sizeof e, "%s/pendant", d);
+    unlink(e);
+    verifier(rmdir(d) == 0, "tout effacer (bornes)");
+}
+
+/* Le sticky de /tmp : on n'y efface pas le fichier d'un autre. Il faut un
+ * fichier d'un autre utilisateur : notre archive en met un (/tmp/a-root) ;
+ * sur l'hôte, le cas est sauté. */
+static void sticky(void)
+{
+    struct stat st;
+    if (getuid() == 0 || stat("/tmp/a-root", &st) != 0 || st.st_uid == getuid()) {
+        printf("[linux] fichiers : pas de fichier d'un autre dans /tmp : sticky saute\n");
+        return;
+    }
+    errno = 0;
+    verifier(ERREUR(unlink("/tmp/a-root"), EPERM), "/tmp sticky : effacer le fichier d'un autre : EPERM");
+}
+
 static void programme_en_cours(const char *moi)
 {
     /* Le binaire de ce programme, en cours d'exécution : personne ne peut
@@ -406,6 +742,9 @@ int main(int argc, char **argv)
     peripheriques();
     notre_archive();
     programme_en_cours(argv[0]);
+    arborescence();
+    arborescence_bornes();
+    sticky();
     struct stat st;
     verifier(unlink(nom_a) == 0 && stat(nom_a, &st) == -1 && errno == ENOENT, "effacer le fichier");
     printf("[linux] fichiers : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");

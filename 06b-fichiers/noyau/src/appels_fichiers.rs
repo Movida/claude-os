@@ -1247,3 +1247,517 @@ pub fn ouvrir_console(descripteurs: &mut crate::descripteurs::Descripteurs) -> R
     }
     Ok(())
 }
+
+// ----- L'arborescence -----
+
+const ERANGE: i64 = 34;
+
+/// mkdirat(dossier, chemin, droits) : les droits passent par l'umask (et
+/// le bit sticky est gardé, comme Linux). Les vérifications sont celles du
+/// tmpfs (`Tmpfs::creer`).
+pub fn mkdirat(dirfd: u64, adresse: u64, mode: u64) -> i64 {
+    let chemin = match chemin(adresse) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let umask = processus::avec(|p| p.umask);
+    let droits = (mode as u32 & 0o1777) & !umask;
+    let r = avec_fin(dirfd, &chemin, Suivre::Jamais, |s, _, fin, depart| {
+        s.fs.creer(depart.qui, &fin, S_IFDIR | droits, (0, 0), &[], temps::maintenant()).map_err(errno)
+    });
+    match r {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// mkdir(chemin, droits).
+pub fn mkdir(adresse: u64, mode: u64) -> i64 {
+    mkdirat(AT_FDCWD as u64, adresse, mode)
+}
+
+/// symlinkat(cible, dossier, chemin) : un lien symbolique de contenu
+/// `cible` (une chaîne quelconque, qui n'a pas à exister ; vide : ENOENT,
+/// avant même de résoudre le chemin, comme le `getname` de Linux).
+pub fn symlinkat(cible: u64, dirfd: u64, adresse: u64) -> i64 {
+    let (cible, chemin) = match (chemin(cible), chemin(adresse)) {
+        (Ok(c), Ok(p)) => (c, p),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    if cible.is_empty() {
+        return errno(Erreur::ENOENT);
+    }
+    let r = avec_fin(dirfd, &chemin, Suivre::Jamais, |s, _, fin, depart| {
+        s.fs.creer(depart.qui, &fin, fichiers::S_IFLNK | 0o777, (0, 0), &cible, temps::maintenant()).map_err(errno)
+    });
+    match r {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// symlink(cible, chemin).
+pub fn symlink(cible: u64, adresse: u64) -> i64 {
+    symlinkat(cible, AT_FDCWD as u64, adresse)
+}
+
+/// readlinkat(dossier, chemin, tampon, taille) : le contenu du lien, sans
+/// zéro final, coupé à `taille` octets. Une taille nulle ou négative, ou
+/// ce qui n'est pas un lien : EINVAL. Un chemin vide désigne le
+/// descripteur (ouvert avec O_PATH | O_NOFOLLOW sur le lien) ; s'il n'est
+/// pas un lien : ENOENT, comme `do_readlinkat` (le chemin vide ne désigne
+/// alors rien qu'on puisse lire).
+pub fn readlinkat(dirfd: u64, adresse: u64, tampon: u64, taille: u64) -> i64 {
+    if (taille as i32) <= 0 {
+        return -EINVAL;
+    }
+    let chemin = match chemin(adresse) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let n = match objet(dirfd, &chemin, false, true) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let vide = chemin.is_empty();
+    let contenu = vfs::avec(|fs, _| -> Result<Vec<u8>, i64> {
+        let cible = fs.lire_lien(n).map_err(|e| if vide { errno(Erreur::ENOENT) } else { errno(e) })?;
+        let mut copie = Vec::new();
+        copie.try_reserve_exact(cible.len()).map_err(|_| -ENOMEM)?;
+        copie.extend_from_slice(cible);
+        fs.acceder(n, temps::maintenant());
+        Ok(copie)
+    });
+    match contenu {
+        Ok(c) => {
+            let n = c.len().min(taille as u32 as usize);
+            match copier_vers_utilisateur(tampon, &c[..n]) {
+                Ok(()) => n as i64,
+                Err(_) => -EFAULT,
+            }
+        }
+        Err(e) => e,
+    }
+}
+
+/// readlink(chemin, tampon, taille).
+pub fn readlink(adresse: u64, tampon: u64, taille: u64) -> i64 {
+    readlinkat(AT_FDCWD as u64, adresse, tampon, taille)
+}
+
+/// linkat(ancien dossier, ancien chemin, nouveau dossier, nouveau chemin,
+/// drapeaux) : un nom de plus. L'ancien chemin n'est suivi qu'avec
+/// AT_SYMLINK_FOLLOW (sinon on lie le lien lui-même, comme Linux).
+/// AT_EMPTY_PATH (donner un nom au fichier d'un descripteur) : depuis Linux
+/// 6.10, permis si le fichier a été ouvert sous la même identité que celle
+/// qui le lie (sinon, sans CAP_DAC_READ_SEARCH : ENOENT) ; avec un seul
+/// utilisateur et sans setuid, c'est toujours le cas. Un autre drapeau :
+/// EINVAL.
+pub fn linkat(ancien_dossier: u64, ancien: u64, nouveau_dossier: u64, nouveau: u64, drapeaux: u64) -> i64 {
+    const AT_SYMLINK_FOLLOW: u64 = 0x400;
+    if drapeaux & !(AT_SYMLINK_FOLLOW | AT_EMPTY_PATH) != 0 {
+        return -EINVAL;
+    }
+    let (ancien, nouveau) = match (chemin(ancien), chemin(nouveau)) {
+        (Ok(a), Ok(n)) => (a, n),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    let source = match objet(ancien_dossier, &ancien, drapeaux & AT_SYMLINK_FOLLOW != 0, drapeaux & AT_EMPTY_PATH != 0) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let r = avec_fin(nouveau_dossier, &nouveau, Suivre::Jamais, |s, _, fin, depart| {
+        s.fs.lier(depart.qui, source, &fin, temps::maintenant()).map_err(errno)
+    });
+    match r {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
+}
+
+/// link(ancien, nouveau).
+pub fn link(ancien: u64, nouveau: u64) -> i64 {
+    linkat(AT_FDCWD as u64, ancien, AT_FDCWD as u64, nouveau, 0)
+}
+
+/// renameat2(ancien dossier, ancien chemin, nouveau dossier, nouveau
+/// chemin, drapeaux) : avec RENAME_NOREPLACE et RENAME_EXCHANGE. Les deux
+/// chemins sont résolus sous le même verrou ; les vérifications sont
+/// celles du tmpfs (`Tmpfs::renommer`), les drapeaux d'abord, avant même
+/// les chemins (`do_renameat2`). `claude` réécrit ainsi ~/.claude.json :
+/// écrit à côté, puis renommé par-dessus.
+pub fn renameat2(ancien_dossier: u64, ancien: u64, nouveau_dossier: u64, nouveau: u64, drapeaux: u64) -> i64 {
+    if let Err(e) = fichiers::tmpfs::verifier_renommage(drapeaux as u32) {
+        return errno(e);
+    }
+    let (ancien, nouveau) = match (chemin(ancien), chemin(nouveau)) {
+        (Ok(a), Ok(n)) => (a, n),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    let (depart_ancien, depart_nouveau) = match (depart(ancien_dossier, &ancien), depart(nouveau_dossier, &nouveau)) {
+        (Ok(a), Ok(n)) => (a, n),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    let r = vfs::avec_systeme(|s, cadres| {
+        let fa = resoudre(&s.fs, &depart_ancien, &ancien, Suivre::Jamais)?;
+        let fn_ = resoudre(&s.fs, &depart_nouveau, &nouveau, Suivre::Jamais)?;
+        s.fs.renommer(depart_ancien.qui, &fa, &fn_, drapeaux as u32, temps::maintenant(), cadres)
+    });
+    match r {
+        Ok(()) => 0,
+        Err(e) => errno(e),
+    }
+}
+
+/// rename(ancien, nouveau), renameat(...).
+pub fn rename(ancien: u64, nouveau: u64) -> i64 {
+    renameat2(AT_FDCWD as u64, ancien, AT_FDCWD as u64, nouveau, 0)
+}
+
+/// getdents64(fd, tampon, taille) : les entrées d'un dossier, à partir de
+/// sa position, au format `struct linux_dirent64` : le numéro d'inode, la
+/// position de l'entrée suivante, la taille de l'entrée, son type, et son
+/// nom terminé par un zéro, le tout arrondi à 8 octets. Autant d'entrées
+/// qu'il en tient ; 0 à la fin du dossier. Pas un dossier : ENOTDIR ; un
+/// tampon trop petit pour la première entrée : EINVAL. Les entrées sont
+/// préparées dans un bloc du tas (64 Kio au plus par appel), puis copiées.
+pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
+    let o = match ouvert(fd) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    if o.sorte == Sorte::Chemin {
+        return -EBADF;
+    }
+    if o.sorte != Sorte::Dossier {
+        return errno(Erreur::ENOTDIR);
+    }
+    let taille = (taille as u32 as usize).min(64 << 10);
+    let mut entrees = Vec::new();
+    if entrees.try_reserve_exact(taille).is_err() {
+        return -ENOMEM;
+    }
+    let mut position = o.position;
+    let lu = vfs::avec(|fs, _| {
+        let r = fs.lire_dossier(o.numero, o.position, |nom, n, genre, suivante| {
+            let longueur = (8 + 8 + 2 + 1 + nom.len() + 1).next_multiple_of(8);
+            if entrees.len() + longueur > taille {
+                return false;
+            }
+            entrees.extend_from_slice(&(n.0 as u64).to_le_bytes());
+            entrees.extend_from_slice(&suivante.to_le_bytes());
+            entrees.extend_from_slice(&(longueur as u16).to_le_bytes());
+            entrees.push(genre);
+            entrees.extend_from_slice(nom);
+            entrees.resize(entrees.len() + longueur - (19 + nom.len()), 0);
+            position = suivante;
+            true
+        });
+        fs.acceder(o.numero, temps::maintenant());
+        r
+    });
+    if let Err(e) = lu {
+        return errno(e);
+    }
+    if entrees.is_empty() {
+        // Fin du dossier, ou la première entrée ne tient pas : on les
+        // distingue en regardant s'il restait une entrée à lire.
+        let reste = vfs::avec(|fs, _| {
+            let mut une = false;
+            let _ = fs.lire_dossier(o.numero, o.position, |_, _, _, _| {
+                une = true;
+                false
+            });
+            une
+        });
+        return if reste { -EINVAL } else { 0 };
+    }
+    if copier_vers_utilisateur(tampon, &entrees).is_err() {
+        return -EFAULT;
+    }
+    changer_position(o.fichier, position);
+    entrees.len() as i64
+}
+
+/// getcwd(tampon, taille) : le chemin du dossier courant, avec son zéro
+/// final ; rend sa longueur, zéro compris. Trop petit : ERANGE ; un dossier
+/// courant effacé : ENOENT.
+pub fn getcwd(tampon: u64, taille: u64) -> i64 {
+    let dossier = processus::avec(|p| p.dossier);
+    let mut chemin = match vfs::avec(|fs, _| fs.chemin(dossier)) {
+        Ok(c) => c,
+        Err(e) => return errno(e),
+    };
+    if chemin.try_reserve_exact(1).is_err() {
+        return -ENOMEM;
+    }
+    chemin.push(0);
+    if (taille as usize) < chemin.len() {
+        return -ERANGE;
+    }
+    match copier_vers_utilisateur(tampon, &chemin) {
+        Ok(()) => chemin.len() as i64,
+        Err(_) => -EFAULT,
+    }
+}
+
+/// Le dossier `n` devient le dossier courant : un dossier (ENOTDIR) qu'on
+/// a le droit de traverser (EACCES), comme `set_fs_pwd` après la
+/// vérification de chdir.
+fn changer_de_dossier(n: Numero) -> i64 {
+    let qui = processus::avec(|p| p.identite);
+    let r = vfs::avec(|fs, _| {
+        if fs.mode(n) & S_IFMT != S_IFDIR {
+            return Err(Erreur::ENOTDIR);
+        }
+        fs.acces(qui, n, fichiers::EXECUTER)?;
+        fs.prendre(n);
+        Ok(())
+    });
+    if let Err(e) = r {
+        return errno(e);
+    }
+    let ancien = processus::avec(|p| core::mem::replace(&mut p.dossier, n));
+    vfs::avec(|fs, cadres| fs.lacher(ancien, cadres));
+    0
+}
+
+/// chdir(chemin).
+pub fn chdir(adresse: u64) -> i64 {
+    let chemin = match chemin(adresse) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match objet(AT_FDCWD as u64, &chemin, true, false) {
+        Ok(n) => changer_de_dossier(n),
+        Err(e) => e,
+    }
+}
+
+/// fchdir(fd).
+pub fn fchdir(fd: u64) -> i64 {
+    match ouvert(fd) {
+        Ok(o) => changer_de_dossier(o.numero),
+        Err(e) => e,
+    }
+}
+
+/// Ramène le fichier `n` à `taille` octets.
+fn tronquer(n: Numero, taille: u64) -> i64 {
+    match vfs::avec(|fs, cadres| fs.tronquer(n, taille, temps::maintenant(), cadres)) {
+        Ok(()) => 0,
+        Err(e) => errno(e),
+    }
+}
+
+/// truncate(chemin, taille) : une taille négative : EINVAL ; les
+/// vérifications de `vfs_truncate` (Tmpfs::verifier_tronquer).
+pub fn truncate(adresse: u64, taille: u64) -> i64 {
+    if (taille as i64) < 0 {
+        return -EINVAL;
+    }
+    let chemin = match chemin(adresse) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let n = match objet(AT_FDCWD as u64, &chemin, true, false) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    let qui = processus::avec(|p| p.identite);
+    if let Err(e) = vfs::avec(|fs, _| fs.verifier_tronquer(qui, n)) {
+        return errno(e);
+    }
+    tronquer(n, taille)
+}
+
+/// ftruncate(fd, taille) : une taille négative, EINVAL avant même le
+/// descripteur (`do_sys_ftruncate`) ; O_PATH : EBADF ; un fichier ordinaire
+/// ouvert en écriture, sinon EINVAL (mesuré : un descripteur en lecture
+/// seule, un dossier).
+pub fn ftruncate(fd: u64, taille: u64) -> i64 {
+    if (taille as i64) < 0 {
+        return -EINVAL;
+    }
+    let o = match ouvert(fd) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    if o.sorte == Sorte::Chemin {
+        return -EBADF;
+    }
+    if o.sorte != Sorte::Fichier || !o.ecriture {
+        return -EINVAL;
+    }
+    tronquer(o.numero, taille)
+}
+
+/// fsync(fd), fdatasync(fd), syncfs(fd) : tout est déjà en mémoire, rien à
+/// écrire sur un disque (il viendra en 6l). Le descripteur doit exister
+/// (EBADF), et ne pas être O_PATH.
+pub fn fsync(fd: u64) -> i64 {
+    match ouvert(fd) {
+        Ok(o) if o.sorte != Sorte::Chemin => 0,
+        Ok(_) => -EBADF,
+        Err(e) => e,
+    }
+}
+
+/// umask(masque) : le nouveau masque (ses 9 bits de droits), rend
+/// l'ancien.
+pub fn umask(masque: u64) -> i64 {
+    processus::avec(|p| core::mem::replace(&mut p.umask, masque as u32 & 0o777)) as i64
+}
+
+/// Change les droits de `n` (chmod et ses voisins) : Tmpfs::changer_mode.
+fn changer_mode(n: Numero, mode: u64) -> i64 {
+    let qui = processus::avec(|p| p.identite);
+    match vfs::avec(|fs, _| fs.changer_mode(qui, n, mode as u32, temps::maintenant())) {
+        Ok(()) => 0,
+        Err(e) => errno(e),
+    }
+}
+
+/// fchmodat2(dossier, chemin, droits, drapeaux) : AT_SYMLINK_NOFOLLOW
+/// (changer les droits d'un lien, qui n'en a pas sous Linux : EOPNOTSUPP)
+/// et AT_EMPTY_PATH ; un autre drapeau : EINVAL. fchmodat, chmod, fchmod :
+/// sans drapeaux.
+pub fn fchmodat2(dirfd: u64, adresse: u64, mode: u64, drapeaux: u64) -> i64 {
+    if drapeaux & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return -EINVAL;
+    }
+    let chemin = match chemin(adresse) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let n = match objet(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
+        Ok(n) => n,
+        Err(e) => return e,
+    };
+    if vfs::avec(|fs, _| fs.mode(n) & S_IFMT) == fichiers::S_IFLNK {
+        return -EOPNOTSUPP;
+    }
+    changer_mode(n, mode)
+}
+
+/// chmod(chemin, droits).
+pub fn chmod(adresse: u64, mode: u64) -> i64 {
+    fchmodat2(AT_FDCWD as u64, adresse, mode, 0)
+}
+
+/// fchmod(fd, droits).
+pub fn fchmod(fd: u64, mode: u64) -> i64 {
+    match ouvert(fd) {
+        Ok(o) if o.sorte != Sorte::Chemin => changer_mode(o.numero, mode),
+        Ok(_) => -EBADF,
+        Err(e) => e,
+    }
+}
+
+/// Un uid ou un gid de chown : -1 (en 32 bits) veut dire « sans
+/// changement ».
+fn identifiant(valeur: u64) -> Option<u32> {
+    (valeur as u32 != u32::MAX).then_some(valeur as u32)
+}
+
+fn changer_proprietaire(n: Numero, uid: u64, gid: u64) -> i64 {
+    let qui = processus::avec(|p| p.identite);
+    match vfs::avec(|fs, _| fs.changer_proprietaire(qui, n, identifiant(uid), identifiant(gid), temps::maintenant())) {
+        Ok(()) => 0,
+        Err(e) => errno(e),
+    }
+}
+
+/// fchownat(dossier, chemin, uid, gid, drapeaux) : Tmpfs::changer_proprietaire
+/// (seul root change le propriétaire). chown suit un lien, lchown non.
+pub fn fchownat(dirfd: u64, adresse: u64, uid: u64, gid: u64, drapeaux: u64) -> i64 {
+    if drapeaux & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return -EINVAL;
+    }
+    let chemin = match chemin(adresse) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    match objet(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
+        Ok(n) => changer_proprietaire(n, uid, gid),
+        Err(e) => e,
+    }
+}
+
+/// fchown(fd, uid, gid).
+pub fn fchown(fd: u64, uid: u64, gid: u64) -> i64 {
+    match ouvert(fd) {
+        Ok(o) if o.sorte != Sorte::Chemin => changer_proprietaire(o.numero, uid, gid),
+        Ok(_) => -EBADF,
+        Err(e) => e,
+    }
+}
+
+/// utimensat(dossier, chemin, dates, drapeaux) : les dates d'accès et de
+/// modification (deux `struct timespec`). Pas de dates : les deux à
+/// maintenant ; un tv_nsec de UTIME_NOW : maintenant, de UTIME_OMIT : sans
+/// changement. Un chemin nul (pas vide : nul) désigne le descripteur
+/// lui-même (futimens). Dans l'ordre de `sys_utimensat` et `do_utimes` :
+///   - les dates copiées (EFAULT) ; les deux à UTIME_OMIT : rien à faire,
+///     succès, sans même regarder le chemin ;
+///   - un chemin nul : pas de drapeaux (EINVAL), un descripteur ouvert
+///     autrement qu'O_PATH (EBADF) ; avec AT_FDCWD, c'est un chemin, que
+///     l'adresse nulle rend EFAULT ;
+///   - sinon : les drapeaux (EINVAL), puis le chemin ;
+///   - un tv_nsec au-delà d'une seconde (ni NOW ni OMIT) : EINVAL, une fois
+///     l'objet trouvé ;
+///   - les droits : Tmpfs::changer_temps.
+pub fn utimensat(dirfd: u64, adresse: u64, dates: u64, drapeaux: u64) -> i64 {
+    use fichiers::Temps;
+    use fichiers::tmpfs::Horodatage;
+    const UTIME_NOW: i64 = (1 << 30) - 1;
+    const UTIME_OMIT: i64 = (1 << 30) - 2;
+    let mut lues = [(0i64, UTIME_NOW); 2];
+    if dates != 0 {
+        let mut octets = [0u8; 32];
+        if copier_depuis_utilisateur(&mut octets, dates).is_err() {
+            return -EFAULT;
+        }
+        let mot = |i: usize| i64::from_le_bytes(octets[i..i + 8].try_into().unwrap_or([0; 8]));
+        lues = [(mot(0), mot(8)), (mot(16), mot(24))];
+        if lues[0].1 == UTIME_OMIT && lues[1].1 == UTIME_OMIT {
+            return 0;
+        }
+    }
+    let n = if adresse == 0 && dirfd as i32 != AT_FDCWD {
+        if drapeaux != 0 {
+            return -EINVAL;
+        }
+        match ouvert(dirfd) {
+            Ok(o) if o.sorte != Sorte::Chemin => o.numero,
+            Ok(_) => return -EBADF,
+            Err(e) => return e,
+        }
+    } else {
+        if drapeaux & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+            return -EINVAL;
+        }
+        let chemin = match chemin(adresse) {
+            Ok(c) => c,
+            Err(e) => return e,
+        };
+        match objet(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
+            Ok(n) => n,
+            Err(e) => return e,
+        }
+    };
+    let horodatage = |(secondes, nano): (i64, i64)| match nano {
+        UTIME_NOW => Some(Horodatage::Maintenant),
+        UTIME_OMIT => Some(Horodatage::Garder),
+        0..=999_999_999 => Some(Horodatage::Valeur(Temps { secondes, nanosecondes: nano as u32 })),
+        _ => None,
+    };
+    let (Some(acces), Some(modification)) = (horodatage(lues[0]), horodatage(lues[1])) else {
+        return -EINVAL;
+    };
+    let qui = processus::avec(|p| p.identite);
+    match vfs::avec(|fs, _| fs.changer_temps(qui, n, acces, modification, temps::maintenant())) {
+        Ok(()) => 0,
+        Err(e) => errno(e),
+    }
+}

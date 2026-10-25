@@ -10,7 +10,8 @@
 #   make run    -> démarre dans QEMU avec une fenêtre (port série dans le terminal)
 #   make texte  -> même chose, mais l'écran VGA s'affiche dans le terminal
 #                  (pratique dans un conteneur sans fenêtre ; quitter : Echap puis 2, puis « quit »)
-#   make test   -> démarre sans écran pendant 2 s, puis affiche serial.log
+#   make test   -> démarre sans écran (DUREE secondes), puis affiche serial.log
+#   make duree  -> le temps qu'il faut laisser au démarrage (pour verifier.sh)
 #   make debug  -> sans écran, journalise exceptions et reset du CPU dans qemu.log
 #   make capture -> démarre sans écran, puis enregistre l'écran dans ecran.png
 #   make gdb    -> QEMU figé au démarrage, en attente de GDB sur le port 1234
@@ -102,7 +103,8 @@ boot.bin: programmes.cpio FORCE
 #   - temps : gcc -static, les horloges (clock_gettime...), sur l'hôte
 #     aussi ;
 #   - fichiers : gcc -static, les appels des fichiers contre ce qu'en fait
-#     Linux, comme memoire ; sur l'hôte aussi.
+#     Linux, comme memoire ; sur l'hôte aussi ;
+#   - arbre : gcc -static, liste /etc, /home et /dev.
 # Pour les tests du lecteur ELF sur l'hôte, une variante qu'il doit
 # accepter, bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -159,6 +161,10 @@ $(LINUX)/temps: linux/temps.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/fichiers: linux/fichiers.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/arbre: linux/arbre.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -232,7 +238,7 @@ PROGRAMMES_HOTE = $(addprefix $(LINUX)/,bonjour-asm bonjour-asm.o bonjour-asm-wx
 
 # L'archive de démarrage, décrite par archive.txt : le noyau la déballe,
 # puis exécute les programmes de /bin dans l'ordre (voir archive.sh).
-programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers FORCE
+programmes.cpio: archive.sh archive.txt racine/etc/bonjour.txt $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre FORCE
 	cd bonjour && cargo build --release
 	sh archive.sh $@ archive.txt
 
@@ -244,12 +250,21 @@ run: boot.bin
 texte: boot.bin
 	$(QEMU) -display curses -serial file:serial.log
 
+# Le temps que met l'étape à démarrer et à exécuter toute son archive,
+# sous QEMU sans accélération, avec de la marge (le BIOS lit l'archive
+# secteur par secteur : 2,5 s mesurées ici en 6b). verifier.sh le demande
+# par `make duree`.
+DUREE = 5
+
+duree:
+	@echo $(DUREE)
+
 test: boot.bin
-	-timeout 2 $(QEMU) -display none -no-reboot -serial file:serial.log
+	-timeout $(DUREE) $(QEMU) -display none -no-reboot -serial file:serial.log
 	@cat serial.log
 
 debug: boot.bin
-	-timeout 2 $(QEMU) -display none -no-reboot -serial file:serial.log \
+	-timeout $(DUREE) $(QEMU) -display none -no-reboot -serial file:serial.log \
 	  -d int,cpu_reset -D qemu.log
 	@cat serial.log
 	@echo "--- exceptions (v=numero, e=code d'erreur) ---"
@@ -355,7 +370,7 @@ $(WAST2JSON):
 #     pour passer aussi par les chemins « si le processeur l'a » ; avec, en
 #     plus, les lignes propres à chacun (tests-attendu-qemu64.txt,
 #     tests-attendu-max.txt).
-QEMU_TEST = timeout 2 qemu-system-x86_64 -display none -no-reboot
+QEMU_TEST = timeout $(DUREE) qemu-system-x86_64 -display none -no-reboot
 QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
@@ -407,4 +422,4 @@ clean:
 	cd zones && cargo clean
 	cd fichiers && cargo clean
 
-.PHONY: run texte test debug capture gdb dump trace tests-hote tests-qemu suite clean FORCE
+.PHONY: run texte test duree debug capture gdb dump trace tests-hote tests-qemu suite clean FORCE
