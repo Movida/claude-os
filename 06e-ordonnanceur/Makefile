@@ -315,8 +315,10 @@ $(LINUX)/dynamique: linux/dynamique.c
 # arguments, après les autres : deux qui écrivent 200 lignes longues sur la
 # console (lignes : make tests-qemu compte les lignes entières de chacun),
 # une cible qui dort 10 s et un programme qui lui envoie SIGTERM
-# (signaler), qui doit la réveiller.
-TESTS_PARALLELES = lignes cible signaler
+# (signaler), qui doit la réveiller ; deux qui remplissent leurs registres
+# vectoriels (YMM avec AVX, XMM sinon), MXCSR et x87, se préemptent, et
+# doivent les retrouver intacts (avx).
+TESTS_PARALLELES = lignes cible signaler avx
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle calcul-long limite-egale \
               sig-term sig-abort sig-gestion sig-faute xcpu-ignore futex-sans-fin nom-faute eventfd-bloque \
@@ -535,6 +537,9 @@ tests-demarrage.txt: Makefile
 	  echo "wait"; \
 	  echo "/bin/cible &"; \
 	  echo "/bin/signaler"; \
+	  echo "wait"; \
+	  echo "/bin/avx a b &"; \
+	  echo "/bin/avx b a &"; \
 	  echo "wait"; \
 	  echo "/bin/lecteur.wasm"; \
 	  echo "/bin/bonjour-asm"; } > $@

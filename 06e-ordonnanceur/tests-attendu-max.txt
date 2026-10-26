@@ -3,3 +3,6 @@
 [noyau] SMAP verifie : une lecture directe de la memoire d'un programme fait faute.
 [noyau] sgdt : general protection fault
 [noyau] sgdt : termine, code de sortie 139 ; memoire rendue : ok.
+[noyau] SSE pour les programmes : XSAVE (x87, SSE, AVX), 832 octets par tache.
+[linux] avx a : YMM0-YMM15, MXCSR et x87 intacts apres 300 sched_yield : ok
+[linux] avx b : YMM0-YMM15, MXCSR et x87 intacts apres 300 sched_yield : ok

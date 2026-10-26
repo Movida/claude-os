@@ -2,3 +2,6 @@
 [noyau] Protections contre les programmes : SMEP non (absent du processeur), SMAP non (absent du processeur), UMIP non (absent du processeur).
 [linux] sgdt permis : le processeur n'a pas UMIP.
 [noyau] sgdt : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] SSE pour les programmes : FXSAVE (x87, SSE, pas d'AVX), 512 octets par tache.
+[linux] avx a : XMM0-XMM15, MXCSR et x87 intacts apres 300 sched_yield : ok
+[linux] avx b : XMM0-XMM15, MXCSR et x87 intacts apres 300 sched_yield : ok

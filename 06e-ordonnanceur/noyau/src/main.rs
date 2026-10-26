@@ -226,8 +226,13 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     afficherln!("[noyau] Protections contre les programmes : SMEP {}, SMAP {}, UMIP {}.",
                 oui_non(p.smep), oui_non(p.smap), oui_non(p.umip));
     afficherln!("[noyau] Alea des programmes (AT_RANDOM) : {}.", aleatoire::source());
-    sse::initialiser();
-    afficherln!("[noyau] SSE pour les programmes : FXSR, sans XSAVE (pas d'AVX).");
+    let fpu = sse::initialiser();
+    if fpu.xsave {
+        afficherln!("[noyau] SSE pour les programmes : XSAVE (x87, SSE{}), {} octets par tache.",
+                    if fpu.avx { ", AVX" } else { "" }, fpu.taille);
+    } else {
+        afficherln!("[noyau] SSE pour les programmes : FXSAVE (x87, SSE, pas d'AVX), {} octets par tache.", fpu.taille);
+    }
 
     // L'allocateur de démarrage cède la mémoire à l'allocateur de pages.
     let bilan = pages::initialiser();

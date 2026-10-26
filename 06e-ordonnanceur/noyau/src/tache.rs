@@ -12,7 +12,8 @@
 //! (vmalloc.rs). On passe le processeur d'une tâche à l'autre en BASCULANT
 //! (`basculer_vers`, le `__switch_to` de Linux), interruptions coupées :
 //!   1. ce que les registres généraux ne disent pas, mais que le programme
-//!      a pu changer : l'état x87 et SSE (FXSAVE), les sélecteurs de
+//!      a pu changer : l'état x87, SSE et AVX (XSAVE, ou FXSAVE : sse.rs),
+//!      les sélecteurs de
 //!      segments et la base de FS (arch_prctl), sauvés pour l'ancienne
 //!      tâche si c'est un programme, et rétablis pour la nouvelle ; le
 //!      noyau, lui, ne s'en sert jamais (il est compilé sans SSE) ;
@@ -143,9 +144,8 @@ unsafe extern "C" {
     static etat_fpu_initial: EtatFpu;
 }
 
-/// L'état x87 et SSE d'un programme, au format de FXSAVE.
+/// L'état x87 et SSE initial d'un programme, au format de FXSAVE.
 #[repr(C, align(16))]
-#[derive(Clone)]
 pub struct EtatFpu([u8; 512]);
 
 /// Ce que le noyau sait d'une tâche.
@@ -218,7 +218,7 @@ pub struct Tache {
 
 /// Ce qu'un programme a de plus qu'une tâche du noyau.
 struct EtatProgramme {
-    fpu: EtatFpu,
+    fpu: crate::sse::ZoneFpu,
     selecteurs: [u16; 4],
     base_fs: u64,
 }
@@ -238,7 +238,7 @@ impl Tache {
         let haut = pile.haut();
         let programme = if programme {
             // SAFETY : l'image de l'état initial, une constante.
-            let fpu = unsafe { etat_fpu_initial.clone() };
+            let fpu = crate::sse::ZoneFpu::neuve(unsafe { &etat_fpu_initial.0 })?;
             Some(UnsafeCell::new(EtatProgramme { fpu, selecteurs: [0; 4], base_fs: 0 }))
         } else {
             None
@@ -553,7 +553,7 @@ pub fn basculer_vers(nouvelle: &Tache) {
     unsafe {
         if let Some(p) = &ancienne.programme {
             let p = &mut *p.get();
-            asm!("fxsave64 [{}]", in(reg) &mut p.fpu, options(nostack));
+            p.fpu.sauver();
             asm!("mov {0:x}, ds", "mov {1:x}, es", "mov {2:x}, fs", "mov {3:x}, gs",
                  out(reg) p.selecteurs[0], out(reg) p.selecteurs[1], out(reg) p.selecteurs[2], out(reg) p.selecteurs[3],
                  options(nomem, nostack, preserves_flags));
@@ -561,7 +561,7 @@ pub fn basculer_vers(nouvelle: &Tache) {
         }
         if let Some(p) = &nouvelle.programme {
             let p = &*p.get();
-            asm!("fxrstor64 [{}]", in(reg) &p.fpu, options(nostack));
+            p.fpu.retablir();
             // Le sélecteur avant la base : charger FS remet sa base à celle
             // du descripteur (comme Linux, `load_seg_legacy`).
             asm!("mov ds, {0:x}", "mov es, {1:x}", "mov fs, {2:x}", "mov gs, {3:x}",

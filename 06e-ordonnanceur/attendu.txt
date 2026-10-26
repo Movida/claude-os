@@ -66,7 +66,7 @@ memoire rendue : ok.
 [linux] Environnement : 3 variables.
 [linux] Pile alignee sur 16, AT_PAGESZ = 4096, AT_ENTRY = _start : ok.
 [noyau] pile : termine, code de sortie 0 ; memoire rendue : ok.
-[noyau] SSE pour les programmes : FXSR, sans XSAVE (pas d'AVX).
+[noyau] SSE pour les programmes : FXSAVE (x87, SSE, pas d'AVX), 512 octets par tache.
 [linux] SSE2 : racine de 2 x 1000000 = 1414213, (1,2,3,4) + (10,20,30,40) = (11,22,33,44) : ok.
 [noyau] sse : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c
