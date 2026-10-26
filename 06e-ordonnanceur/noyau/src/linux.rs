@@ -547,7 +547,8 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage
     if decalage % PAGE != 0 {
         return -EINVAL;
     }
-    // Le fichier projeté, s'il y en a un (fget, avant même la longueur).
+    // Le fichier projeté, s'il y en a un (fget, avant même la longueur),
+    // tenu jusqu'à la fin de l'appel : la zone prend sa propre référence.
     let fichier = if drapeaux & MAP_ANONYMOUS == 0 {
         match f::pour_projeter(fd) {
             Ok(p) => Some(p),
@@ -595,7 +596,7 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage
     let droits = droits_de(prot);
     // Ce que projette la zone : le fichier (sa page de début), ou rien
     // (/dev/zero en privé est de la mémoire anonyme).
-    let projection = match fichier {
+    let projection = match &fichier {
         None => None,
         Some(p) => {
             if partagee && droits.ecriture && !p.ecriture {
@@ -606,7 +607,7 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage
             }
             match p.sorte {
                 Sorte::Fichier if partagee => None,
-                Sorte::Fichier => Some(Projection { fichier: p.fichier.numero(), page }),
+                Sorte::Fichier => Some(Projection { fichier: p.fichier().numero(), page }),
                 Sorte::Zero => None,
                 _ => return -ENODEV,
             }

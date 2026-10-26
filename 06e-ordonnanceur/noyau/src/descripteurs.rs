@@ -15,6 +15,10 @@
 //!     seul drapeau à lui, « fermer à l'exec » (FD_CLOEXEC). Le plus petit
 //!     numéro libre est toujours pris, comme le veut POSIX : c'est ce qui
 //!     permet le vieux `close(1); open(...)` des shells.
+//! Un appel système qui se sert d'un descripteur TIENT son fichier ouvert
+//! jusqu'à sa fin (appels_fichiers::FichierTenu, le `fdget` de Linux) : un
+//! autre fil du programme peut fermer le descripteur pendant ce temps, le
+//! fichier ne disparaîtra qu'à la fin de l'appel.
 //! Options écartées :
 //!   - un seul étage (le numéro désigne directement l'inode et la
 //!     position) : `dup` ne partagerait pas la position, ce que POSIX
@@ -160,8 +164,8 @@ pub struct FichierOuvert {
     /// voulu : il faudrait au tmpfs le parent de chaque fichier, qu'un lien
     /// physique rend ambigu (Linux tient le `dentry` de l'ouverture).
     pub chemin: Vec<u8>,
-    /// Combien le tiennent : ses descripteurs, et les zones qui le
-    /// projettent.
+    /// Combien le tiennent : ses descripteurs, les zones qui le projettent,
+    /// et les appels système qui s'en servent (appels_fichiers::FichierTenu).
     references: u32,
 }
 
@@ -368,9 +372,43 @@ pub struct Descripteur {
 /// : 1024, que le programme peut relever jusqu'à 4096 (la limite dure).
 pub const LIMITE_DESCRIPTEURS: (u64, u64) = (1024, 4096);
 
+/// Une case de la table des descripteurs.
+#[derive(Clone, Copy, Debug)]
+enum Case {
+    Libre,
+    /// Prise par un appel en cours (openat, dup, eventfd...), qui y
+    /// installera son fichier : le numéro n'est plus libre, mais rien ne s'y
+    /// lit encore. C'est l'état d'un numéro entre le `get_unused_fd_flags` et
+    /// le `fd_install` de Linux : un autre fil qui s'en sert entre les deux
+    /// reçoit EBADF (pas de fichier), et un `dup2` vers lui EBUSY.
+    Reservee,
+    Ouverte(Descripteur),
+}
+
+/// Pourquoi la table refuse.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Refus {
+    /// Plus de numéro libre sous la limite (EMFILE).
+    PlusDeNumero,
+    /// La table ne peut pas grandir (ENOMEM).
+    PlusDeMemoire,
+    /// Le numéro est réservé par un appel en cours (EBUSY, pour dup2).
+    Reserve,
+}
+
 /// Les descripteurs d'un processus (la `files_struct` de Linux).
+///
+/// Un numéro s'obtient en deux temps, comme dans Linux : RÉSERVÉ
+/// (`reserver`, le plus petit libre, la table agrandie s'il le faut), puis
+/// le fichier INSTALLÉ (`installer`, qui ne peut plus échouer). Entre les
+/// deux, l'appel fait ce qui peut échouer (résoudre un chemin, ouvrir), et
+/// rend le numéro s'il échoue (`liberer`). Choisir le numéro et l'occuper
+/// dans la même section est ce qui empêche deux fils qui ouvrent en même
+/// temps de recevoir le même. Option écartée : chercher un numéro libre
+/// (sans le prendre) au début, et installer à la fin, comme jusqu'à 6d ;
+/// avec un seul fil, personne ne pouvait le prendre entre les deux.
 pub struct Descripteurs {
-    cases: Vec<Option<Descripteur>>,
+    cases: Vec<Case>,
     /// RLIMIT_NOFILE : (courante, dure). Aucun descripteur à cette valeur
     /// ou au-delà.
     pub limite: (u64, u64),
@@ -381,51 +419,104 @@ impl Descripteurs {
         Descripteurs { cases: Vec::new(), limite: LIMITE_DESCRIPTEURS }
     }
 
-    /// Le descripteur `fd`, s'il est ouvert. Linux ne regarde que les 32
-    /// bits bas (un `unsigned int`).
+    /// La case `fd` (libre au-delà de la fin de la table). Linux ne regarde
+    /// que les 32 bits bas d'un numéro (un `unsigned int`).
+    fn case(&self, fd: u64) -> Case {
+        self.cases.get(fd as u32 as usize).copied().unwrap_or(Case::Libre)
+    }
+
+    /// Le descripteur `fd`, s'il est ouvert (pas s'il est seulement réservé).
     pub fn get(&self, fd: u64) -> Option<Descripteur> {
-        self.cases.get(fd as u32 as usize).copied().flatten()
+        match self.case(fd) {
+            Case::Ouverte(d) => Some(d),
+            Case::Libre | Case::Reservee => None,
+        }
     }
 
     pub fn get_mut(&mut self, fd: u64) -> Option<&mut Descripteur> {
-        self.cases.get_mut(fd as u32 as usize).and_then(Option::as_mut)
+        match self.cases.get_mut(fd as u32 as usize) {
+            Some(Case::Ouverte(d)) => Some(d),
+            _ => None,
+        }
     }
 
-    /// Le plus petit numéro libre, `minimum` ou au-delà, sous la limite.
-    pub fn libre(&self, minimum: u64) -> Option<u64> {
-        (minimum..self.limite.0).find(|&fd| self.get(fd).is_none())
-    }
-
-    /// Range `d` au numéro `fd` (libre, sous la limite). ENOMEM si la
-    /// table ne peut pas grandir : rien n'a changé.
-    pub fn installer(&mut self, fd: u64, d: Descripteur) -> Result<(), ()> {
-        let ancien = self.remplacer(fd, d)?;
-        debug_assert!(ancien.is_none(), "installer sur un descripteur ouvert");
+    /// La table, assez grande pour la case `fd` ; ENOMEM si elle ne peut pas
+    /// grandir (rien n'a changé).
+    fn agrandir(&mut self, fd: u64) -> Result<(), Refus> {
+        let i = fd as usize;
+        if i >= self.cases.len() {
+            self.cases.try_reserve(i + 1 - self.cases.len()).map_err(|_| Refus::PlusDeMemoire)?;
+            self.cases.resize(i + 1, Case::Libre);
+        }
         Ok(())
     }
 
-    /// Range `d` au numéro `fd` (sous la limite), à la place de celui qui y
-    /// était, rendu : à l'appelant de lâcher son fichier (dup2). ENOMEM si
-    /// la table ne peut pas grandir : rien n'a changé.
-    pub fn remplacer(&mut self, fd: u64, d: Descripteur) -> Result<Option<Descripteur>, ()> {
-        let i = fd as usize;
-        if i >= self.cases.len() {
-            self.cases.try_reserve(i + 1 - self.cases.len()).map_err(|_| ())?;
-            self.cases.resize(i + 1, None);
-        }
-        Ok(self.cases[i].replace(d))
+    /// Réserve le plus petit numéro libre, `minimum` ou au-delà, sous la
+    /// limite (le `alloc_fd` de Linux) : EMFILE s'il n'y en a plus, ENOMEM si
+    /// la table ne peut pas grandir.
+    pub fn reserver(&mut self, minimum: u64) -> Result<u64, Refus> {
+        let fd = (minimum..self.limite.0).find(|&fd| matches!(self.case(fd), Case::Libre)).ok_or(Refus::PlusDeNumero)?;
+        self.agrandir(fd)?;
+        self.cases[fd as usize] = Case::Reservee;
+        Ok(fd)
     }
 
-    /// Retire le descripteur `fd` : à l'appelant de lâcher son fichier.
+    /// Installe `d` au numéro `fd`, réservé par `reserver` (le `fd_install`
+    /// de Linux) : la table a déjà sa place, rien ne peut échouer. Sur une
+    /// case qui n'est pas réservée, c'est une erreur du noyau : on s'arrête
+    /// (le `BUG_ON` de Linux), plutôt que d'écraser un descripteur ouvert
+    /// dont le fichier ne serait jamais lâché.
+    pub fn installer(&mut self, fd: u64, d: Descripteur) {
+        let case = &mut self.cases[fd as usize];
+        assert!(matches!(case, Case::Reservee), "installer sur un numero non reserve");
+        *case = Case::Ouverte(d);
+    }
+
+    /// Rend le numéro réservé `fd`, sans fichier installé (l'appel a échoué
+    /// : le `put_unused_fd` de Linux).
+    pub fn liberer(&mut self, fd: u64) {
+        let case = &mut self.cases[fd as usize];
+        assert!(matches!(case, Case::Reservee), "liberer un numero non reserve");
+        *case = Case::Libre;
+        self.rogner();
+    }
+
+    /// Range `d` au numéro `fd` (sous la limite), à la place de celui qui y
+    /// était, rendu : à l'appelant de lâcher son fichier (dup2). Un numéro
+    /// réservé par un autre appel : EBUSY (le `do_dup2` de Linux) ; ENOMEM si
+    /// la table ne peut pas grandir. Rien n'a changé en cas de refus.
+    pub fn remplacer(&mut self, fd: u64, d: Descripteur) -> Result<Option<Descripteur>, Refus> {
+        self.agrandir(fd)?;
+        let case = &mut self.cases[fd as usize];
+        match core::mem::replace(case, Case::Ouverte(d)) {
+            Case::Libre => Ok(None),
+            Case::Ouverte(ancien) => Ok(Some(ancien)),
+            Case::Reservee => {
+                *case = Case::Reservee;
+                Err(Refus::Reserve)
+            }
+        }
+    }
+
+    /// Retire le descripteur ouvert `fd` (pas un numéro seulement réservé :
+    /// close y voit EBADF, comme Linux) : à l'appelant de lâcher son fichier.
     pub fn retirer(&mut self, fd: u64) -> Option<Descripteur> {
-        let d = self.cases.get_mut(fd as u32 as usize)?.take();
-        while self.cases.last().is_some_and(Option::is_none) {
+        let case = self.cases.get_mut(fd as u32 as usize)?;
+        let Case::Ouverte(d) = *case else { return None };
+        *case = Case::Libre;
+        self.rogner();
+        Some(d)
+    }
+
+    /// Les cases libres de la fin rendues ; une table vide rend sa mémoire
+    /// (le contrôle « memoire rendue » des programmes le verrait).
+    fn rogner(&mut self) {
+        while self.cases.last().is_some_and(|c| matches!(c, Case::Libre)) {
             self.cases.pop();
         }
         if self.cases.is_empty() {
             self.cases = Vec::new();
         }
-        d
     }
 
     /// Les numéros des descripteurs ouverts dans [premier, dernier].

@@ -51,7 +51,7 @@ use wasm::module::{DescriptionImport, TypeFonction, TypeValeur};
 use wasm::validateur::ModuleValide;
 use wasm::{Externe, Hote, Magasin, Piege, Valeur};
 
-use crate::descripteurs::{Descripteur, Descripteurs, FichierOuvert, Sorte};
+use crate::descripteurs::{Descripteur, Descripteurs, FichierOuvert, Refus, Sorte};
 use crate::{appels_fichiers, console, temps, vfs};
 use crate::descripteurs::Tenu;
 use fichiers::chemins::Depart;
@@ -213,7 +213,7 @@ impl Wasi {
             // `wasi` est rendu en cas d'erreur : son Drop ferme ce qui est
             // déjà ouvert.
             let f = appels_fichiers::ouvrir_pour(identite, dossier, true, false, true).map_err(|e| (e, Some(dossier)))?;
-            if wasi.descripteurs.installer(fd, Descripteur { fichier: f, fermer_a_l_exec: false }).is_err() {
+            if wasi.descripteurs.remplacer(fd, Descripteur { fichier: f, fermer_a_l_exec: false }).is_err() {
                 vfs::avec_systeme(|s, cadres| s.lacher(f, cadres));
                 return Err((Erreur::ENOMEM, None));
             }
@@ -490,7 +490,10 @@ fn clock_time_get(horloge: u32, adresse: u32, m: &mut [u8]) -> u32 {
 }
 
 impl Wasi {
-    /// Le fichier ouvert du descripteur `fd`, et ce qu'il faut en savoir.
+    /// Le fichier ouvert du descripteur `fd`, et ce qu'il faut en savoir. Sans
+    /// le tenir (`appels_fichiers::FichierTenu`) : les descripteurs d'un
+    /// programme WebAssembly ne sont qu'à lui, une seule tâche (WASI preview
+    /// 1 n'a pas de fils), personne ne peut les fermer pendant un appel.
     fn ouvert(&self, fd: u32) -> Result<(Descripteur, Sorte, Objet, bool, bool, u32, u64), u32> {
         let d = self.descripteurs.get(fd as u64).ok_or(EBADF)?;
         Ok(vfs::avec_systeme(|s, _| {
@@ -686,7 +689,13 @@ impl Wasi {
             Ok(c) => c,
             Err(e) => return e,
         };
-        let Some(fd) = self.descripteurs.libre(0) else { return EMFILE };
+        // Réservé d'abord, comme pour un programme Linux : EMFILE avant de
+        // regarder le chemin.
+        let fd = match self.descripteurs.reserver(0) {
+            Ok(fd) => fd,
+            Err(Refus::PlusDeMemoire) => return ENOMEM,
+            Err(_) => return EMFILE,
+        };
         let ecriture = droits & ECRIRE != 0;
         let o = Ouverture {
             lecture: droits & (LIRE | LIRE_DOSSIER) != 0 || !ecriture,
@@ -752,12 +761,12 @@ impl Wasi {
         });
         let fichier = match ouvert {
             Ok(f) => f,
-            Err(e) => return e,
+            Err(e) => {
+                self.descripteurs.liberer(fd);
+                return e;
+            }
         };
-        if self.descripteurs.installer(fd, Descripteur { fichier, fermer_a_l_exec: false }).is_err() {
-            vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
-            return ENOMEM;
-        }
+        self.descripteurs.installer(fd, Descripteur { fichier, fermer_a_l_exec: false });
         match ecrire(m, sortie, &(fd as u32).to_le_bytes()) {
             Ok(()) => SUCCES,
             Err(e) => e,

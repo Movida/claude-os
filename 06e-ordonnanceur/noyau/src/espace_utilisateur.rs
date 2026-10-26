@@ -584,9 +584,10 @@ fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl F
     while adresse < fin {
         let suivante = (adresse / couverture + 1) * couverture;
         // SAFETY : `table` est une table de cet espace (la PML4, ou une
-        // table que désigne une entrée présente), que nous possédons ; un
-        // seul processeur, un seul programme : personne ne la change en
-        // même temps.
+        // table que désigne une entrée présente), que nous possédons ;
+        // l'espace n'est changé que sous le verrou de son processus, que
+        // tient l'appelant (ou par sa dernière tâche, qui l'a retiré de la
+        // table pour le rendre) : personne ne la change en même temps.
         let entree = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, niveau)] };
         if niveau == 0 {
             if occupee(*entree) {

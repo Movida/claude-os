@@ -26,7 +26,10 @@
 //!     (pages.rs) ;
 //!   - quand une page manque vraiment à la faute, TUER le programme
 //!     (SIGKILL, le tueur OOM, tache::arreter_plus_de_memoire). Linux
-//!     choisit le plus gros processus ; avec un seul programme, c'est lui.
+//!     choisit le plus gros processus ; nous, celui qui faute. Avec un seul
+//!     programme à la fois, c'était le même ; depuis que plusieurs tournent
+//!     ensemble (`&`, 6e), un petit peut payer pour un gros : un écart, noté
+//!     dans « Reste à faire ».
 //! Options écartées :
 //!   - un budget fixe par programme (celui de l'étape 5 : 256 Mio, ou la
 //!     moitié de la mémoire libre) : `claude` occupe 169 Mo à l'accueil et

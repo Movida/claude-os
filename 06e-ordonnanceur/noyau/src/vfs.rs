@@ -42,7 +42,7 @@ use core::fmt;
 use crate::descripteurs::{Fichier, Ouverts, Tenu};
 use crate::memoire::Echec;
 use crate::verrou::Verrou;
-use crate::{espace, pages, pile, temps};
+use crate::{copie_utilisateur, espace, pages, pile, temps};
 use fichiers::chemins::{Depart, Fin, Suivre, resoudre};
 use fichiers::montages::{Objet, Vue};
 use fichiers::noyaufs::NoyauFs;
@@ -160,22 +160,40 @@ pub fn avec_systeme<R>(f: impl FnOnce(&mut Systeme, &mut CadresDuNoyau) -> R) ->
     f(racine.as_mut().expect("systeme de fichiers pas encore monte"), &mut CadresDuNoyau)
 }
 
-/// La page `cadre` d'un fichier, que l'appelant tient (pages::prendre),
-/// vue par la projection directe : pour la copier vers un programme.
-pub fn octets(cadre: u64) -> &'static [u8] {
-    // SAFETY : le cadre est une page allouée, tenue par l'appelant : elle ne
-    // sera pas rendue tant qu'il ne l'a pas lâchée. Un seul processeur :
-    // personne ne l'écrit pendant qu'on la lit.
-    unsafe { core::slice::from_raw_parts(espace::virtuelle(cadre) as *const u8, PAGE as usize) }
+/// Copie `n` octets de la page `cadre` d'un fichier, que l'appelant tient
+/// (pages::prendre), à partir de `decalage`, vers l'adresse `destination`
+/// du programme : rend le nombre d'octets copiés (moins à une faute, voir
+/// copie_utilisateur).
+///
+/// Par un pointeur brut, jamais une tranche (`&[u8]`) : une tranche
+/// promettrait au compilateur que personne n'écrit la page tant qu'elle
+/// existe, et c'est faux depuis 6e : une autre tâche peut écrire le même
+/// fichier pendant la copie (une lecture n'attend pas les écritures, comme
+/// sous Linux : elle peut en voir une à moitié faite). La copie elle-même
+/// est `rep movsb`, qui ne suppose rien de ce qu'elle lit. Option écartée,
+/// celle de 6b à 6d : la tranche, juste avec un seul programme à la fois
+/// (personne ne pouvait écrire la page pendant la copie).
+pub fn copier_vers_programme(cadre: u64, decalage: usize, n: usize, destination: u64) -> usize {
+    assert!(decalage + n <= PAGE as usize);
+    let source = (espace::virtuelle(cadre) as *const u8).wrapping_add(decalage);
+    // SAFETY : le cadre est une page allouée, vue par la projection directe,
+    // et tenue par l'appelant : elle ne sera pas rendue pendant la copie ; on
+    // reste dans la page (vérifié).
+    unsafe { copie_utilisateur::copier_vers_utilisateur_brut(destination, source, n) }
 }
 
-/// La même, pour y écrire (write) : l'appelant la tient, et elle est à un
-/// fichier, pas projetée en écriture chez un programme.
-#[allow(clippy::mut_from_ref)]
-pub fn octets_mut(cadre: u64) -> &'static mut [u8] {
-    // SAFETY : comme `octets` ; la page n'est vue que par le noyau, qui
-    // l'écrit ici, et les projections en lecture des programmes.
-    unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(cadre) as *mut u8, PAGE as usize) }
+/// Copie `n` octets depuis l'adresse `source` du programme dans la page
+/// `cadre` d'un fichier, que l'appelant tient, à `decalage` (write) : rend
+/// le nombre d'octets copiés. La page est à un fichier, jamais projetée en
+/// écriture chez un programme (une projection privée la voit en lecture
+/// seule, et MAP_SHARED n'existe pas encore).
+/// Par un pointeur brut, comme `copier_vers_programme` : une lecture du même
+/// fichier peut la lire en même temps.
+pub fn copier_depuis_programme(cadre: u64, decalage: usize, n: usize, source: u64) -> usize {
+    assert!(decalage + n <= PAGE as usize);
+    let destination = (espace::virtuelle(cadre) as *mut u8).wrapping_add(decalage);
+    // SAFETY : comme `copier_vers_programme`, en écriture.
+    unsafe { copie_utilisateur::copier_depuis_utilisateur_brut(destination, source, n) }
 }
 
 /// La page numéro `index` du fichier ouvert `f`, pour une faute de page

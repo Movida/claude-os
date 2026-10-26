@@ -36,7 +36,7 @@ use crate::{appels_fichiers, processus, sysfs, vfs};
 use fichiers::montages::Monte;
 use fichiers::noyaufs::{Cible, Contenu, Enregistrement, Genre, NoyauFs};
 use fichiers::{Erreur, Temps};
-use zones::Nature;
+use zones::{Nature, Zone};
 
 const ESRCH: i64 = 3;
 
@@ -273,6 +273,23 @@ fn statm(pid: u32) -> Result<Vec<u8>, Erreur> {
     Ok(t.0)
 }
 
+/// Ce que montre maps du fichier que projette la zone `z` (s'il y en a un) :
+/// son chemin, son inode, s'il est effacé, et le décalage de la projection
+/// en octets. Sous le verrou du processus de la zone (`ligne_maps`).
+fn fichier_de_zone(z: &Zone) -> Result<Option<(Vec<u8>, u32, bool, u64)>, Erreur> {
+    let Some(projection) = z.fichier else { return Ok(None) };
+    vfs::avec_systeme(|s, _| {
+        let f = s.ouverts.fichier(Fichier::de(projection.fichier));
+        let mut chemin = Vec::new();
+        let source = if f.chemin.is_empty() { f.nom.octets() } else { &f.chemin[..] };
+        chemin.try_reserve_exact(source.len()).map_err(|_| Erreur::ENOMEM)?;
+        chemin.extend_from_slice(source);
+        let numero = f.numero();
+        let efface = numero.is_some_and(|n| s.fs.attributs(n).nlink == 0);
+        Ok(Some((chemin, numero.map_or(0, |n| n.0), efface, projection.page * 4096)))
+    })
+}
+
 /// La ligne de /proc/<pid>/maps du processus `pid` de la première zone qui finit après
 /// `curseur`, et le curseur suivant (sa fin). Le format de Linux
 /// (`show_map_vma`, mesuré) :
@@ -285,24 +302,21 @@ fn statm(pid: u32) -> Result<Vec<u8>, Erreur> {
 ///   le tas, [stack] pour la pile. Une zone anonyme sans nom garde
 ///   l'espace qui suit l'inode, 0.
 fn ligne_maps(pid: u32, curseur: u64) -> Result<Enregistrement, Erreur> {
-    let Some(z) = processus::avec_pid(pid, |p| p.memoire.zones.zones().iter().find(|z| z.fin > curseur).copied()).flatten() else {
+    // La zone, et le fichier qu'elle projette : son chemin (copié : les
+    // verrous ne restent pas pris), son inode, s'il a encore un nom. Lus
+    // sous le verrou du processus, celui des fichiers pris dedans : la zone
+    // tient son fichier tant qu'elle existe, mais le processus peut la
+    // retirer (munmap) dès qu'on rend son verrou, et le numéro du fichier
+    // servir à un autre. Linux lit de même maps sous le verrou de la
+    // mémoire du processus (`mmap_read_lock`).
+    let Some(lu) = processus::avec_pid(pid, |p| {
+        let z = p.memoire.zones.zones().iter().find(|z| z.fin > curseur).copied()?;
+        Some(fichier_de_zone(&z).map(|fichier| (z, fichier)))
+    })
+    .flatten() else {
         return Ok(None);
     };
-    // Le fichier projeté : son chemin (copié : le verrou des fichiers ne
-    // reste pas pris), son inode, s'il a encore un nom.
-    let fichier = match z.fichier {
-        None => None,
-        Some(projection) => Some(vfs::avec_systeme(|s, _| -> Result<_, Erreur> {
-            let f = s.ouverts.fichier(Fichier::de(projection.fichier));
-            let mut chemin = Vec::new();
-            let source = if f.chemin.is_empty() { f.nom.octets() } else { &f.chemin[..] };
-            chemin.try_reserve_exact(source.len()).map_err(|_| Erreur::ENOMEM)?;
-            chemin.extend_from_slice(source);
-            let numero = f.numero();
-            let efface = numero.is_some_and(|n| s.fs.attributs(n).nlink == 0);
-            Ok((chemin, numero.map_or(0, |n| n.0), efface, projection.page * 4096))
-        })?),
-    };
+    let (z, fichier) = lu?;
     let lettre = |oui: bool, c: char| if oui { c } else { '-' };
     let (dev, inode, decalage) = match &fichier {
         Some((_, inode, _, decalage)) => (appels_fichiers::DEV_RACINE, *inode, *decalage),

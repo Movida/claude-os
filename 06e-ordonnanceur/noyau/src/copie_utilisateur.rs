@@ -223,6 +223,40 @@ pub fn copier_vers_utilisateur_partiel(destination: u64, source: &[u8]) -> usize
     source.len() - reste
 }
 
+/// Comme `copier_vers_utilisateur_partiel`, depuis `n` octets du noyau à
+/// `source`, désignés par un pointeur brut plutôt qu'une tranche : une page
+/// de fichier qu'une autre tâche peut écrire pendant la copie (vfs.rs).
+///
+/// # Safety
+/// [source, source + n[ est de la mémoire du noyau, lisible, qui reste
+/// allouée pendant la copie.
+pub unsafe fn copier_vers_utilisateur_brut(destination: u64, source: *const u8, n: usize) -> usize {
+    if !dans_les_bornes(destination, n as u64) {
+        return 0;
+    }
+    // SAFETY : la source, d'après l'appelant ; la destination, comme
+    // copier_vers_utilisateur.
+    let reste = unsafe { copie_brute(destination as *mut u8, source, n) };
+    n - reste
+}
+
+/// Comme `copier_depuis_utilisateur_partiel`, vers `n` octets du noyau à
+/// `destination`, désignés par un pointeur brut (vfs.rs).
+///
+/// # Safety
+/// [destination, destination + n[ est de la mémoire du noyau, inscriptible,
+/// qui reste allouée pendant la copie, et qu'aucune référence Rust ne
+/// désigne.
+pub unsafe fn copier_depuis_utilisateur_brut(destination: *mut u8, source: u64, n: usize) -> usize {
+    if !dans_les_bornes(source, n as u64) {
+        return 0;
+    }
+    // SAFETY : la destination, d'après l'appelant ; la source, comme
+    // copier_depuis_utilisateur.
+    let reste = unsafe { copie_brute(destination, source as *const u8, n) };
+    n - reste
+}
+
 /// L'adresse de reprise prévue pour une faute du noyau à l'adresse `rip`,
 /// s'il y en a une (search_exception_tables de Linux). La table est petite
 /// (une entrée par instruction qui touche la mémoire des programmes) : on

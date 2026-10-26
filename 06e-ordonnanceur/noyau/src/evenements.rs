@@ -17,12 +17,12 @@
 //! ENOSYS jusqu'en 6f, où chaque sorte de fichier apprendra à dire « prêt »
 //! et à réveiller qui l'attend.
 
-use crate::appels_fichiers::installer_fichier;
+use crate::appels_fichiers::{installer_fichier, tenir};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::descripteurs::{Donnees, FichierOuvert, Interet, Sorte, Tenu};
 use crate::attente::{self, FileAttente, Sommeil};
 use crate::tache::Reveil;
-use crate::{cpu, processus, tache, vfs};
+use crate::{cpu, tache, vfs};
 use fichiers::montages::Objet;
 
 const EBADF: i64 = 9;
@@ -253,12 +253,14 @@ pub fn epoll_ctl(epfd: u64, operation: u64, fd: u64, evenement: u64) -> i64 {
         }
         lu = (u32::from_le_bytes(o[..4].try_into().unwrap_or([0; 4])), u64::from_le_bytes(o[4..].try_into().unwrap_or([0; 8])));
     }
-    let (Some(e), Some(cible)) = processus::avec(|p| (p.descripteurs.get(epfd), p.descripteurs.get(fd))) else {
+    // Les deux fichiers, tenus jusqu'à la fin de l'appel (deux `fdget`,
+    // comme Linux).
+    let (Ok(tenu_e), Ok(tenu_cible)) = (tenir(epfd), tenir(fd)) else {
         return -EBADF;
     };
     let fd = fd as u32;
+    let (e, cible, sorte_e, sorte_cible) = (tenu_e.fichier(), tenu_cible.fichier(), tenu_e.sorte, tenu_cible.sorte);
     vfs::avec_systeme(|s, _| {
-        let (sorte_e, sorte_cible) = (s.ouverts.fichier(e.fichier).sorte, s.ouverts.fichier(cible.fichier).sorte);
         if sorte_e == Sorte::Chemin || sorte_cible == Sorte::Chemin {
             return -EBADF;
         }
@@ -266,7 +268,7 @@ pub fn epoll_ctl(epfd: u64, operation: u64, fd: u64, evenement: u64) -> i64 {
             return -EPERM;
         }
         let mut evenements = lu.0 & !EPOLLWAKEUP;
-        if e.fichier == cible.fichier || sorte_e != Sorte::Epoll {
+        if e == cible || sorte_e != Sorte::Epoll {
             return -EINVAL;
         }
         if operation != EPOLL_CTL_DEL
@@ -276,11 +278,11 @@ pub fn epoll_ctl(epfd: u64, operation: u64, fd: u64, evenement: u64) -> i64 {
             return -EINVAL;
         }
         if operation == EPOLL_CTL_ADD && sorte_cible == Sorte::Epoll {
-            if s.ouverts.surveille(cible.fichier, e.fichier) {
+            if s.ouverts.surveille(cible, e) {
                 return -ELOOP;
             }
             let (Some(dessous), Some(dessus)) =
-                (s.ouverts.etages(cible.fichier, true, EP_MAX_NESTS), s.ouverts.etages(e.fichier, false, EP_MAX_NESTS))
+                (s.ouverts.etages(cible, true, EP_MAX_NESTS), s.ouverts.etages(e, false, EP_MAX_NESTS))
             else {
                 return -ENOMEM;
             };
@@ -288,17 +290,17 @@ pub fn epoll_ctl(epfd: u64, operation: u64, fd: u64, evenement: u64) -> i64 {
                 return -ELOOP;
             }
         }
-        let Donnees::Epoll(interets) = &mut s.ouverts.fichier(e.fichier).donnees else {
+        let Donnees::Epoll(interets) = &mut s.ouverts.fichier(e).donnees else {
             unreachable!("un epoll sans liste")
         };
-        let ici = interets.iter().position(|i| i.fichier == cible.fichier && i.fd == fd);
+        let ici = interets.iter().position(|i| i.fichier == cible && i.fd == fd);
         evenements |= EPOLLERR | EPOLLHUP;
         match (operation, ici) {
             (EPOLL_CTL_ADD, None) => {
                 if interets.try_reserve(1).is_err() {
                     return -ENOMEM;
                 }
-                interets.push(Interet { fichier: cible.fichier, fd, evenements, donnees: lu.1 });
+                interets.push(Interet { fichier: cible, fd, evenements, donnees: lu.1 });
                 0
             }
             (EPOLL_CTL_ADD, Some(_)) => -EEXIST,

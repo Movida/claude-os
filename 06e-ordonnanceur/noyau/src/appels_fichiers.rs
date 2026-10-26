@@ -6,25 +6,50 @@
 //! Chaque appel suit le même chemin :
 //!   1. copier ce que donne le programme (un chemin, un tableau d'iovec)
 //!      dans un tampon du noyau, sans rien tenir ;
-//!   2. sous le verrou du processus, trouver le descripteur ; sous celui
-//!      des fichiers (vfs.rs), le fichier ouvert, l'inode, la page ;
+//!   2. sous le verrou du processus, trouver le descripteur, et TENIR son
+//!      fichier ouvert (une référence) ; sous celui des fichiers (vfs.rs),
+//!      l'inode, la page ;
 //!   3. rendre les verrous, puis seulement copier entre la page et le
 //!      programme : une copie peut faire une faute de page, qui prend le
 //!      verrou du processus, et celui des fichiers pour une page projetée
 //!      d'un fichier (memoire.rs). La page est
 //!      tenue (pages::prendre) pendant la copie : elle ne peut pas
 //!      disparaître sous elle, comme dans le `filemap_read` de Linux.
-//! Un seul fil par programme : personne ne peut fermer un descripteur
-//! pendant qu'un appel s'en sert. Avec les fils (6e), il faudra le tenir le
-//! temps de l'appel (le `fdget` de Linux).
+//!
+//! Pourquoi tenir : depuis 6e, une autre tâche peut s'exécuter entre deux
+//! sections (la préemption), et bientôt un autre fil du même programme,
+//! qui partage ses descripteurs et son dossier courant. Ce qu'un appel
+//! trouve sous un verrou et dont il se sert sous un autre doit donc être
+//! tenu entre les deux : sinon un `close`, un `chdir` ou un `rmdir` de
+//! l'autre fil le fait disparaître (le noyau s'arrête sur un fichier ouvert
+//! ou un inode qui n'existe plus), ou pire, son numéro sert à un autre (un
+//! `mmap` projetterait un fichier dont on n'a pas vérifié le droit de
+//! lecture). Comme Linux :
+//!   - le fichier d'un descripteur est tenu le temps de l'appel
+//!     (`FichierTenu`, le `fdget` et le `fdput` de Linux) ;
+//!   - un numéro de descripteur neuf est réservé dans la section qui le
+//!     choisit, puis le fichier y est installé (`NumeroReserve` : le
+//!     `get_unused_fd_flags` puis le `fd_install` de Linux) ;
+//!   - la racine et le dossier d'où part un chemin sont tenus le temps de
+//!     la résolution (`DepartTenu`, le `get_fs_pwd`), puis l'objet trouvé
+//!     le temps de s'en servir (`ObjetTenu`, le `path_get`) ;
+//!   - la position d'un fichier ne change que sous son verrou, l'écriture
+//!     d'un fichier et sa troncature que sous celui de son inode
+//!     (`verrous` : le `f_pos_lock` de `fdget_pos`, et l'`inode_lock`).
+//! Option écartée : faire tout l'appel sous le verrou du processus, celui
+//! des fichiers pris dedans (l'ordre le permet). Une copie depuis ou vers
+//! le programme ne peut pas s'y faire (elle peut fauter, et servir la
+//! faute prend le verrou du processus), et un fil qui résout un long
+//! chemin arrêterait les fautes de page de tous les autres.
 
 use alloc::vec::Vec;
 
 use crate::copie_utilisateur::{
-    ErreurChaine, chaine_depuis_utilisateur, copier_depuis_utilisateur, copier_depuis_utilisateur_partiel,
+    ErreurChaine, chaine_depuis_utilisateur, copier_depuis_utilisateur,
     copier_vers_utilisateur, copier_vers_utilisateur_partiel, dans_les_bornes,
 };
-use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Sorte, Tenu};
+use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Refus, Sorte, Tenu};
+use crate::processus::Processus;
 use crate::vfs::{self, CadresDuNoyau, Systeme};
 use crate::{aleatoire, console, evenements, pages, processus, procfs, temps};
 use fichiers::chemins::{Arbre, Depart, Fin, PATH_MAX, Suivre};
@@ -38,6 +63,7 @@ use crate::attente::{GardeMutex, Mutex};
 const EBADF: i64 = 9;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
+const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ENOTTY: i64 = 25;
@@ -99,24 +125,208 @@ fn chemin(adresse: u64) -> Result<Vec<u8>, i64> {
     })
 }
 
-/// Le descripteur `fd` du processus en cours, s'il est ouvert (EBADF).
-fn descripteur(fd: u64) -> Result<Descripteur, i64> {
-    processus::avec(|p| p.descripteurs.get(fd)).ok_or(-EBADF)
+/// Un fichier ouvert tenu le temps d'un appel système (le `struct fd` que
+/// rend le `fdget` de Linux) : une référence prise sous le verrou du
+/// processus, dans la section même qui a trouvé le descripteur, et rendue à
+/// la fin de la garde (le `fdput`). Un `close` du descripteur par un autre
+/// fil pendant l'appel ne lâche que la référence du descripteur : le
+/// fichier reste, et son numéro (`Fichier`) ne peut pas servir à un autre ;
+/// s'il était le dernier à le tenir, c'est la fin de l'appel qui le ferme,
+/// comme sous Linux. Avec ce qu'il faut savoir du fichier : ce qui ne
+/// change pas tant qu'il est ouvert (sa sorte, son objet, son mode
+/// d'ouverture), et ses drapeaux et le FD_CLOEXEC du descripteur au début
+/// de l'appel. Option écartée : l'économie de Linux, qui ne prend pas de
+/// référence quand la table des descripteurs n'est pas partagée (personne
+/// ne peut alors fermer le descripteur) ; ici, la référence ne coûte qu'un
+/// compteur, sous le verrou qu'il faut prendre de toute façon pour lire le
+/// fichier ouvert.
+pub struct FichierTenu {
+    fichier: Fichier,
+    pub sorte: Sorte,
+    pub objet: Objet,
+    pub lecture: bool,
+    pub ecriture: bool,
+    pub drapeaux: u32,
+    pub fermer_a_l_exec: bool,
 }
 
-/// D'où part la résolution d'un chemin relatif, pour un appel *at :
-/// le dossier courant (AT_FDCWD) ou celui du descripteur `dirfd` (qui doit
-/// en être un : ENOTDIR). Un chemin absolu ignore `dirfd`, même invalide,
-/// comme Linux. Avec le numéro du processus (pour /proc/self).
-fn depart(dirfd: u64, chemin: &[u8]) -> Result<(Depart<Objet>, u32), i64> {
-    let (racine, courant, qui, pid) = processus::avec(|p| (p.racine, p.dossier, p.identite, p.pid));
-    let dossier = if chemin.first() == Some(&b'/') || dirfd as i32 == AT_FDCWD {
-        courant
-    } else {
-        let d = descripteur(dirfd)?;
-        vfs::avec_systeme(|s, _| s.ouverts.fichier(d.fichier).objet())
+impl FichierTenu {
+    pub fn fichier(&self) -> Fichier {
+        self.fichier
+    }
+
+    /// L'inode du tmpfs d'un fichier dont la sorte ne vient que de lui (un
+    /// fichier ordinaire : voir `FichierOuvert::inode`).
+    fn numero(&self) -> Numero {
+        self.objet.tmpfs().expect("une sorte du tmpfs sur un objet d'un systeme monte")
+    }
+
+    /// Sa position : à lire sous son verrou (`verrous`) pour s'en servir.
+    fn position(&self) -> u64 {
+        vfs::avec_systeme(|s, _| s.ouverts.fichier(self.fichier).position)
+    }
+
+    /// Sous son verrou de position, lui aussi.
+    fn changer_position(&self, position: u64) {
+        vfs::avec_systeme(|s, _| s.ouverts.fichier(self.fichier).position = position);
+    }
+
+    /// Son objet, tenu à son tour (le fichier peut ensuite être rendu).
+    fn tenir_objet(&self) -> ObjetTenu {
+        vfs::avec_systeme(|s, _| ObjetTenu::tenir(s, self.objet))
+    }
+}
+
+impl Drop for FichierTenu {
+    /// La fin de l'appel : la référence rendue, et le fichier fermé si
+    /// c'était la dernière. Jamais sous le verrou des fichiers ni sous celui
+    /// du processus (on prend le premier).
+    fn drop(&mut self) {
+        vfs::avec_systeme(|s, cadres| s.lacher(self.fichier, cadres));
+    }
+}
+
+/// Tient le fichier du descripteur `fd` du processus en cours (EBADF s'il
+/// n'est pas ouvert).
+pub fn tenir(fd: u64) -> Result<FichierTenu, i64> {
+    processus::avec(|p| {
+        let d = p.descripteurs.get(fd)?;
+        // Le verrou des fichiers, pris sous celui du processus (l'ordre de
+        // vfs.rs) : le descripteur ne peut pas être fermé entre les deux.
+        Some(vfs::avec_systeme(|s, _| {
+            s.ouverts.prendre(d.fichier);
+            let f = s.ouverts.fichier(d.fichier);
+            FichierTenu {
+                fichier: d.fichier,
+                sorte: f.sorte,
+                objet: f.objet(),
+                lecture: f.lecture,
+                ecriture: f.ecriture,
+                drapeaux: f.drapeaux,
+                fermer_a_l_exec: d.fermer_a_l_exec,
+            }
+        }))
+    })
+    .ok_or(-EBADF)
+}
+
+/// Les verrous de position des fichiers ouverts (le `f_pos_lock` de
+/// Linux) : 64 verrous qui dorment, celui d'un fichier ouvert choisi par son
+/// numéro, comme les verrous d'écriture (`verrou_d_ecriture`). Un verrou
+/// dans chaque fichier ouvert serait celui de Linux, mais la table des
+/// fichiers ouverts est un vecteur qui se déplace quand il grandit, et un
+/// verrou qui dort ne doit pas bouger tant qu'on l'attend.
+static VERROUS_DE_POSITION: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+
+/// Les verrous d'un appel qui se sert d'un fichier ouvert, rendus à la fin
+/// de la garde (celui de l'inode d'abord).
+struct Verrous {
+    _ecriture: Option<GardeMutex<'static, ()>>,
+    _position: Option<GardeMutex<'static, ()>>,
+}
+
+/// Les verrous qu'il faut à un appel sur `f`, pris dans l'ordre de Linux,
+/// la position puis l'inode :
+///   - celui de sa position, si l'appel s'en sert (`a_la_position` : read,
+///     write, readv, writev, lseek, getdents64 ; pas pread) et que le
+///     fichier en a une (un fichier ordinaire ou un dossier : le
+///     FMODE_ATOMIC_POS de Linux). Deux fils qui lisent à la suite le même
+///     fichier ouvert lisent chacun sa part, sans octet lu deux fois ni
+///     sauté, comme le demande POSIX (Linux le garantit depuis 3.14) ;
+///   - pour un fichier du noyau (/proc, /sys), celui de sa position pour
+///     tout appel, pread compris : il garde aussi l'état de sa séquence,
+///     qui sort du fichier ouvert pendant la lecture (le `m->lock` du
+///     seq_file de Linux, procfs::lire) ;
+///   - celui de l'inode, pour écrire dans un fichier ordinaire
+///     (`verrou_d_ecriture`) : tenu sur tous les morceaux d'un writev,
+///     deux writev en O_APPEND ne s'entremêlent pas.
+fn verrous(f: &FichierTenu, a_la_position: bool, ecriture: bool) -> Verrous {
+    let position = match f.sorte {
+        Sorte::Fichier | Sorte::Dossier => a_la_position,
+        Sorte::Noyau { .. } => true,
+        _ => false,
     };
-    Ok((Depart { racine, dossier, qui, sous: false }, pid))
+    Verrous {
+        _position: position.then(|| VERROUS_DE_POSITION[f.fichier.numero() as usize % 64].verrouiller()),
+        _ecriture: (ecriture && f.sorte == Sorte::Fichier).then(|| verrou_d_ecriture(f.numero())),
+    }
+}
+
+/// Un objet de l'arborescence tenu le temps d'un appel (le `path_get` de
+/// Linux) : un inode du tmpfs, par une référence, pour qu'un `unlink` ou un
+/// `rmdir` d'une autre tâche ne le fasse pas disparaître (ni servir son
+/// numéro à un autre) pendant qu'on s'en sert. Un objet d'un système du
+/// noyau n'a rien à tenir : ses objets sont au noyau, et un processus
+/// disparu se voit à la lecture (ESRCH).
+pub struct ObjetTenu(Objet);
+
+impl ObjetTenu {
+    /// Tient `o`, sous le verrou des fichiers.
+    fn tenir(s: &mut Systeme, o: Objet) -> ObjetTenu {
+        if let Some(n) = o.tmpfs() {
+            s.fs.prendre(n);
+        }
+        ObjetTenu(o)
+    }
+
+    pub fn objet(&self) -> Objet {
+        self.0
+    }
+}
+
+impl Drop for ObjetTenu {
+    /// La référence rendue : l'inode disparaît s'il n'a plus de nom ni
+    /// d'autre référence. Jamais sous un verrou.
+    fn drop(&mut self) {
+        if let Some(n) = self.0.tmpfs() {
+            vfs::avec(|fs, cadres| fs.lacher(n, cadres));
+        }
+    }
+}
+
+/// D'où part la résolution d'un chemin, tenu jusqu'à sa fin : la racine et
+/// le dossier de départ, et qui résout (ses droits, et son numéro de
+/// processus pour /proc/self).
+struct DepartTenu {
+    racine: ObjetTenu,
+    dossier: ObjetTenu,
+    qui: Identite,
+    pid: u32,
+}
+
+impl DepartTenu {
+    fn depart(&self) -> Depart<Objet> {
+        Depart { racine: self.racine.objet(), dossier: self.dossier.objet(), qui: self.qui, sous: false }
+    }
+}
+
+/// Sous le verrou du processus `p` et celui des fichiers : le dossier
+/// courant (AT_FDCWD, ou `courant`), ou l'objet du fichier du descripteur
+/// `dirfd` (EBADF), tenu.
+fn tenir_dossier(p: &Processus, s: &mut Systeme, dirfd: u64, courant: bool) -> Result<ObjetTenu, i64> {
+    let o = if courant || dirfd as i32 == AT_FDCWD {
+        p.dossier
+    } else {
+        let d = p.descripteurs.get(dirfd).ok_or(-EBADF)?;
+        s.ouverts.fichier(d.fichier).objet()
+    };
+    Ok(ObjetTenu::tenir(s, o))
+}
+
+/// D'où part la résolution de `chemin`, pour un appel *at : le dossier
+/// courant (AT_FDCWD) ou celui du descripteur `dirfd` (qui doit en être un
+/// : ENOTDIR, à la résolution). Un chemin absolu ignore `dirfd`, même
+/// invalide, comme Linux. Tout est pris dans une seule section du
+/// processus : un `chdir` ou un `close` d'un autre fil passe avant ou
+/// après, jamais entre la lecture du dossier et sa référence.
+fn depart(dirfd: u64, chemin: &[u8]) -> Result<DepartTenu, i64> {
+    let absolu = chemin.first() == Some(&b'/');
+    processus::avec(|p| {
+        vfs::avec_systeme(|s, _| {
+            let dossier = tenir_dossier(p, s, dirfd, absolu)?;
+            Ok(DepartTenu { racine: ObjetTenu::tenir(s, p.racine), dossier, qui: p.identite, pid: p.pid })
+        })
+    })
 }
 
 /// Résout `chemin` (non vide) depuis `dirfd`, sous le verrou des fichiers,
@@ -124,7 +334,8 @@ fn depart(dirfd: u64, chemin: &[u8]) -> Result<(Depart<Objet>, u32), i64> {
 fn avec_fin<R>(dirfd: u64, chemin: &[u8], suivre: Suivre,
                f: impl FnOnce(&mut Systeme, &mut CadresDuNoyau, Fin<Objet>, Depart<Objet>, u32) -> Result<R, i64>)
     -> Result<R, i64> {
-    let (depart, pid) = depart(dirfd, chemin)?;
+    let tenu = depart(dirfd, chemin)?;
+    let (depart, pid) = (tenu.depart(), tenu.pid);
     vfs::avec_systeme(|s, cadres| {
         let fin = s.resoudre(pid, &depart, chemin, suivre).map_err(errno)?;
         f(s, cadres, fin, depart, pid)
@@ -148,21 +359,20 @@ fn canonique(s: &Systeme, pid: u32, fin: &Fin<Objet>) -> Vec<u8> {
 }
 
 /// L'objet désigné par `chemin` depuis `dirfd`, qui doit exister (stat,
-/// access...). Avec AT_EMPTY_PATH, un chemin vide désigne `dirfd`
+/// access...), tenu. Avec AT_EMPTY_PATH, un chemin vide désigne `dirfd`
 /// lui-même.
-fn objet(dirfd: u64, chemin: &[u8], suivre: bool, vide_permis: bool) -> Result<Objet, i64> {
+fn objet(dirfd: u64, chemin: &[u8], suivre: bool, vide_permis: bool) -> Result<ObjetTenu, i64> {
     if chemin.is_empty() {
         if !vide_permis {
             return Err(errno(Erreur::ENOENT));
         }
-        if dirfd as i32 == AT_FDCWD {
-            return Ok(processus::avec(|p| p.dossier));
-        }
-        let d = descripteur(dirfd)?;
-        return Ok(vfs::avec_systeme(|s, _| s.ouverts.fichier(d.fichier).objet()));
+        return processus::avec(|p| vfs::avec_systeme(|s, _| tenir_dossier(p, s, dirfd, false)));
     }
-    let (depart, pid) = depart(dirfd, chemin)?;
-    vfs::avec_systeme(|s, _| s.avec_vue(pid, |vue| fichiers::chemins::trouver(vue, &depart, chemin, suivre))).map_err(errno)
+    let tenu = depart(dirfd, chemin)?;
+    vfs::avec_systeme(|s, _| {
+        let o = s.avec_vue(tenu.pid, |vue| fichiers::chemins::trouver(vue, &tenu.depart(), chemin, suivre)).map_err(errno)?;
+        Ok(ObjetTenu::tenir(s, o))
+    })
 }
 
 /// Ce que dit `stat` de l'objet `o`, dans la vue (le processus en cours,
@@ -321,8 +531,8 @@ pub fn trouver_pour(qui: fichiers::Identite, chemin: &[u8]) -> Result<(Numero, V
 ///     sans nom) : pas pris en charge, EOPNOTSUPP avec un message ;
 ///   - le chemin, copié (EFAULT, ENAMETOOLONG ; vide : ENOENT, comme
 ///     `getname`) ;
-///   - le numéro de descripteur : plus de numéro libre, EMFILE, avant de
-///     résoudre le chemin (open("absent/x") rend EMFILE, mesuré) ;
+///   - le numéro de descripteur, réservé : plus de numéro libre, EMFILE,
+///     avant de résoudre le chemin (open("absent/x") rend EMFILE, mesuré) ;
 ///   - le chemin résolu (le dernier composant suivi, sauf O_NOFOLLOW ou
 ///     O_EXCL, et pas devant une barre finale avec O_CREAT), puis ouvert
 ///     par le tmpfs, qui fait les vérifications de `do_open` (voir
@@ -354,7 +564,7 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
     if chemin.is_empty() {
         return Err(errno(Erreur::ENOENT));
     }
-    let fd = processus::avec(|p| p.descripteurs.libre(0)).ok_or(-EMFILE)?;
+    let fd = reserver()?;
     let acces = drapeaux & O_ACCMODE;
     let umask = processus::avec(|p| p.umask);
     let o = Ouverture {
@@ -422,12 +632,7 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
     {
         tronquer(ouvert.numero, 0);
     }
-    let d = Descripteur { fichier, fermer_a_l_exec: drapeaux & O_CLOEXEC != 0 };
-    if processus::avec(|p| p.descripteurs.installer(fd, d)).is_err() {
-        vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
-        return Err(-ENOMEM);
-    }
-    Ok(fd)
+    Ok(fd.installer(fichier, drapeaux & O_CLOEXEC != 0))
 }
 
 /// open(chemin, drapeaux, droits) : openat depuis le dossier courant. Bun
@@ -450,21 +655,58 @@ fn fermer_descripteur(fd: u64) -> Result<(), i64> {
     Ok(())
 }
 
+/// Un numéro de descripteur réservé pour un fichier qu'on ouvre (le
+/// `get_unused_fd_flags` de Linux, voir descripteurs::Descripteurs) : rendu
+/// à la fin de la garde si l'ouverture échoue (le `put_unused_fd`), sauf
+/// une fois le fichier installé (`installer`, le `fd_install`). Une garde,
+/// comme les plus récentes de Linux (`CLASS(get_unused_fd, ...)`,
+/// include/linux/file.h) : aucun chemin d'erreur ne peut l'oublier.
+struct NumeroReserve(u64);
+
+impl NumeroReserve {
+    /// Installe `fichier` (tenu une fois, pour le descripteur) au numéro
+    /// réservé, et rend ce numéro.
+    fn installer(self, fichier: Fichier, fermer_a_l_exec: bool) -> u64 {
+        let fd = self.0;
+        core::mem::forget(self);
+        processus::avec(|p| p.descripteurs.installer(fd, Descripteur { fichier, fermer_a_l_exec }));
+        fd
+    }
+}
+
+impl Drop for NumeroReserve {
+    fn drop(&mut self) {
+        processus::avec(|p| p.descripteurs.liberer(self.0));
+    }
+}
+
+/// Réserve le plus petit numéro libre du processus en cours (EMFILE,
+/// ENOMEM).
+fn reserver() -> Result<NumeroReserve, i64> {
+    processus::avec(|p| p.descripteurs.reserver(0)).map(NumeroReserve).map_err(errno_table)
+}
+
+/// Le numéro d'erreur d'un refus de la table des descripteurs.
+fn errno_table(r: Refus) -> i64 {
+    match r {
+        Refus::PlusDeNumero => -EMFILE,
+        Refus::PlusDeMemoire => -ENOMEM,
+        Refus::Reserve => -EBUSY,
+    }
+}
+
 /// Range un fichier ouvert neuf (eventfd, epoll : sans chemin) au plus petit
 /// numéro libre, avec FD_CLOEXEC si demandé : rend le numéro, EMFILE s'il
 /// n'y en a plus, ENOMEM si une table ne peut pas grandir (rien ne reste).
 pub fn installer_fichier(f: FichierOuvert, fermer_a_l_exec: bool) -> i64 {
-    let Some(fd) = processus::avec(|p| p.descripteurs.libre(0)) else { return -EMFILE };
-    let fichier = match vfs::avec_systeme(|s, _| s.ouverts.ajouter(f)) {
-        Ok(fichier) => fichier,
-        Err(_) => return -ENOMEM,
+    let fd = match reserver() {
+        Ok(fd) => fd,
+        Err(e) => return e,
     };
-    let d = Descripteur { fichier, fermer_a_l_exec };
-    if processus::avec(|p| p.descripteurs.installer(fd, d)).is_err() {
-        vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
-        return -ENOMEM;
+    match vfs::avec_systeme(|s, _| s.ouverts.ajouter(f)) {
+        Ok(fichier) => fd.installer(fichier, fermer_a_l_exec) as i64,
+        Err(_) => -ENOMEM,
     }
-    fd as i64
 }
 
 /// close(fd).
@@ -506,46 +748,6 @@ pub fn close_range(premier: u64, dernier: u64, drapeaux: u64) -> i64 {
     0
 }
 
-/// Ce qu'un appel de lecture ou d'écriture doit savoir du fichier ouvert.
-#[derive(Clone, Copy)]
-struct Ouvert {
-    fichier: Fichier,
-    sorte: Sorte,
-    objet: Objet,
-    lecture: bool,
-    ecriture: bool,
-    drapeaux: u32,
-    position: u64,
-}
-
-impl Ouvert {
-    /// L'inode du tmpfs d'un fichier dont la sorte ne vient que de lui (un
-    /// fichier ordinaire : voir `FichierOuvert::inode`).
-    fn numero(&self) -> Numero {
-        self.objet.tmpfs().expect("une sorte du tmpfs sur un objet d'un systeme monte")
-    }
-}
-
-fn ouvert(fd: u64) -> Result<Ouvert, i64> {
-    let d = descripteur(fd)?;
-    Ok(vfs::avec_systeme(|s, _| {
-        let f = s.ouverts.fichier(d.fichier);
-        Ouvert {
-            fichier: d.fichier,
-            sorte: f.sorte,
-            objet: f.objet(),
-            lecture: f.lecture,
-            ecriture: f.ecriture,
-            drapeaux: f.drapeaux,
-            position: f.position,
-        }
-    }))
-}
-
-fn changer_position(f: Fichier, position: u64) {
-    vfs::avec_systeme(|s, _| s.ouverts.fichier(f).position = position);
-}
-
 /// Lit le fichier `n` du tmpfs, à partir de `position`, vers l'adresse
 /// `tampon` du programme : au plus `longueur` octets, jusqu'à la fin du
 /// fichier. Page par page : sous le verrou des fichiers, la page est
@@ -573,11 +775,10 @@ fn lire_pages(n: Numero, position: u64, tampon: u64, longueur: u64) -> Result<u6
             }
             break;
         }
-        let source = match page {
-            Some(p) => &vfs::octets(p)[decalage..decalage + morceau],
-            None => &ZEROS[..morceau],
+        let copies = match page {
+            Some(p) => vfs::copier_vers_programme(p, decalage, morceau, tampon + lus),
+            None => copier_vers_utilisateur_partiel(tampon + lus, &ZEROS[..morceau]),
         };
-        let copies = copier_vers_utilisateur_partiel(tampon + lus, source);
         if let Some(p) = page {
             pages::lacher(p);
         }
@@ -619,7 +820,7 @@ fn ecrire_pages(n: Numero, position: u64, tampon: u64, longueur: u64) -> Result<
         };
         let decalage = (ici % PAGE) as usize;
         let morceau = (longueur - ecrits).min(PAGE - decalage as u64) as usize;
-        let copies = copier_depuis_utilisateur_partiel(&mut vfs::octets_mut(page)[decalage..decalage + morceau], tampon + ecrits);
+        let copies = vfs::copier_depuis_programme(page, decalage, morceau, tampon + ecrits);
         pages::lacher(page);
         ecrits += copies as u64;
         if copies > 0 {
@@ -677,8 +878,9 @@ fn verifier_transfert(tampon: u64, longueur: u64, position: u64) -> Result<u64, 
 }
 
 /// Lire, selon la sorte du fichier, `longueur` octets à `position` (ou à
-/// la position du fichier, `None`).
-fn lire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
+/// la position du fichier, `None`, qui avance d'autant : l'appelant tient
+/// son verrou, voir `verrous`).
+fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
     // Un eventfd ou un epoll n'a pas de position : pread rend ESPIPE avant
     // tout (FMODE_PREAD n'est pas mis) ; un epoll ne se lit pas (pas
     // d'opération read : EINVAL, avant de regarder le tampon).
@@ -690,12 +892,13 @@ fn lire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) ->
     if !o.lecture {
         return Err(-EBADF);
     }
-    let longueur = verifier_transfert(tampon, longueur, position.unwrap_or(o.position))?;
+    let ici = position.unwrap_or_else(|| o.position());
+    let longueur = verifier_transfert(tampon, longueur, ici)?;
     match o.sorte {
         Sorte::Fichier => {
-            let lus = lire_pages(o.numero(), position.unwrap_or(o.position), tampon, longueur)?;
+            let lus = lire_pages(o.numero(), ici, tampon, longueur)?;
             if position.is_none() {
-                changer_position(o.fichier, o.position + lus);
+                o.changer_position(ici + lus);
             }
             Ok(lus)
         }
@@ -706,17 +909,16 @@ fn lire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) ->
         Sorte::Zero | Sorte::Plein => produire(tampon, longueur, |m| m.fill(0)),
         Sorte::Aleatoire { .. } => produire(tampon, longueur, aleatoire::remplir),
         Sorte::Chemin => Err(-EBADF),
-        Sorte::EventFd => evenements::lire(o.fichier, o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::EventFd => evenements::lire(o.fichier(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Epoll => Err(-EINVAL),
         Sorte::Noyau { .. } => {
-            let ici = position.unwrap_or(o.position);
-            let contenu = procfs::lire(o.fichier, ici, longueur)?;
+            let contenu = procfs::lire(o.fichier(), ici, longueur)?;
             let copies = copier_vers_utilisateur_partiel(tampon, &contenu) as u64;
             if copies == 0 && !contenu.is_empty() {
                 return Err(-EFAULT);
             }
             if position.is_none() {
-                changer_position(o.fichier, ici + copies);
+                o.changer_position(ici + copies);
             }
             Ok(copies)
         }
@@ -736,8 +938,12 @@ pub fn verrou_d_ecriture(n: Numero) -> GardeMutex<'static, ()> {
     VERROUS_D_ECRITURE[n.0 as usize % 64].verrouiller()
 }
 
-/// Écrire, selon la sorte du fichier.
-fn ecrire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
+/// Écrire, selon la sorte du fichier, comme `lire_ouvert`. L'appelant tient
+/// le verrou d'écriture de l'inode d'un fichier ordinaire (`verrous`), de
+/// la lecture de la fin jusqu'à la nouvelle position : deux programmes qui
+/// ajoutent au même fichier ne s'écrasent pas (l'`inode_lock` de Linux,
+/// pendant tout `generic_file_write_iter`).
+fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
     // Comme pour lire : ESPIPE, puis EINVAL pour un epoll.
     match o.sorte {
         Sorte::EventFd | Sorte::Epoll if position.is_some() => return Err(-ESPIPE),
@@ -747,21 +953,17 @@ fn ecrire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) 
     if !o.ecriture {
         return Err(-EBADF);
     }
-    let longueur = verifier_transfert(tampon, longueur, position.unwrap_or(o.position))?;
+    let ici = position.unwrap_or_else(|| o.position());
+    let longueur = verifier_transfert(tampon, longueur, ici)?;
     match o.sorte {
         Sorte::Fichier => {
-            // Le verrou d'écriture de l'inode, tenu de la lecture de la fin
-            // jusqu'à la nouvelle position : deux programmes qui ajoutent au
-            // même fichier ne s'écrasent pas (l'`inode_lock` de Linux,
-            // pendant tout `generic_file_write_iter`).
-            let _ecriture = verrou_d_ecriture(o.numero());
             // O_APPEND : toujours à la fin, même pour pwrite (une
             // bizarrerie de Linux, que décrit sa page de manuel).
             let fin = vfs::avec(|fs, _| fs.attributs(o.numero()).taille);
-            let ici = if o.drapeaux as u64 & O_APPEND != 0 { fin } else { position.unwrap_or(o.position) };
+            let ici = if o.drapeaux as u64 & O_APPEND != 0 { fin } else { ici };
             let ecrits = ecrire_pages(o.numero(), ici, tampon, longueur)?;
             if position.is_none() {
-                changer_position(o.fichier, ici + ecrits);
+                o.changer_position(ici + ecrits);
             }
             Ok(ecrits)
         }
@@ -787,7 +989,7 @@ fn ecrire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) 
         Sorte::Null | Sorte::Zero | Sorte::Aleatoire { .. } => Ok(longueur),
         Sorte::Plein => Err(-ENOSPC),
         Sorte::Dossier | Sorte::Chemin => Err(-EBADF),
-        Sorte::EventFd => evenements::ecrire(o.fichier, o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::EventFd => evenements::ecrire(o.fichier(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Epoll => Err(-EINVAL),
         // Jamais ouvert pour écrire (ouvrir_monte).
         Sorte::Noyau { .. } => Err(-EBADF),
@@ -803,12 +1005,18 @@ fn resultat(r: Result<u64, i64>) -> i64 {
 
 /// read(fd, tampon, longueur).
 pub fn read(fd: u64, tampon: u64, longueur: u64) -> i64 {
-    resultat(ouvert(fd).and_then(|o| lire_ouvert(&o, None, tampon, longueur)))
+    resultat(tenir(fd).and_then(|o| {
+        let _verrous = verrous(&o, true, false);
+        lire_ouvert(&o, None, tampon, longueur)
+    }))
 }
 
 /// write(fd, tampon, longueur).
 pub fn write(fd: u64, tampon: u64, longueur: u64) -> i64 {
-    resultat(ouvert(fd).and_then(|o| ecrire_ouvert(&o, None, tampon, longueur)))
+    resultat(tenir(fd).and_then(|o| {
+        let _verrous = verrous(&o, true, true);
+        ecrire_ouvert(&o, None, tampon, longueur)
+    }))
 }
 
 /// pread64(fd, tampon, longueur, position) : sans bouger la position.
@@ -818,7 +1026,10 @@ pub fn pread64(fd: u64, tampon: u64, longueur: u64, position: u64) -> i64 {
     if (position as i64) < 0 {
         return -EINVAL;
     }
-    resultat(ouvert(fd).and_then(|o| lire_ouvert(&o, Some(position), tampon, longueur)))
+    resultat(tenir(fd).and_then(|o| {
+        let _verrous = verrous(&o, false, false);
+        lire_ouvert(&o, Some(position), tampon, longueur)
+    }))
 }
 
 /// pwrite64(fd, tampon, longueur, position).
@@ -826,7 +1037,10 @@ pub fn pwrite64(fd: u64, tampon: u64, longueur: u64, position: u64) -> i64 {
     if (position as i64) < 0 {
         return -EINVAL;
     }
-    resultat(ouvert(fd).and_then(|o| ecrire_ouvert(&o, Some(position), tampon, longueur)))
+    resultat(tenir(fd).and_then(|o| {
+        let _verrous = verrous(&o, false, true);
+        ecrire_ouvert(&o, Some(position), tampon, longueur)
+    }))
 }
 
 /// Les morceaux d'un readv ou d'un writev : le tableau de `struct iovec`
@@ -872,7 +1086,7 @@ fn morceaux(adresse: u64, nombre: u64) -> Result<Vec<(u64, u64)>, i64> {
 /// fait en entier (une fin de fichier, une faute) ; le total transféré,
 /// ou l'erreur du premier morceau si rien ne l'a été.
 fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
-    let o = match ouvert(fd) {
+    let o = match tenir(fd) {
         Ok(o) => o,
         Err(e) => return e,
     };
@@ -885,21 +1099,19 @@ fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
     };
     // Un eventfd se lit d'un coup, sur tous les morceaux (evenements.rs).
     if !ecrire && o.sorte == Sorte::EventFd {
-        return match evenements::lire_morceaux(o.fichier, o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux) {
+        return match evenements::lire_morceaux(o.fichier(), o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux) {
             Ok(n) => n as i64,
             Err(e) => e,
         };
     }
+    // Les verrous tenus sur tous les morceaux : chacun part de la position
+    // où s'est arrêté le précédent, sans qu'un autre fil s'intercale.
+    let _verrous = verrous(&o, true, ecrire);
     let mut total = 0u64;
     for (base, longueur) in morceaux {
         if longueur == 0 {
             continue;
         }
-        // La position a pu bouger avec le morceau précédent.
-        let o = match ouvert(fd) {
-            Ok(o) => o,
-            Err(e) => return e,
-        };
         let r = if ecrire { ecrire_ouvert(&o, None, base, longueur) } else { lire_ouvert(&o, None, base, longueur) };
         match r {
             Ok(n) => {
@@ -939,7 +1151,7 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
     const SEEK_END: u64 = 2;
     const SEEK_DATA: u64 = 3;
     const SEEK_HOLE: u64 = 4;
-    let o = match ouvert(fd) {
+    let o = match tenir(fd) {
         Ok(o) => o,
         Err(e) => return e,
     };
@@ -948,18 +1160,20 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
         return -EINVAL;
     }
     let decalage = decalage as i64;
+    let _verrous = verrous(&o, true, false);
+    let position = o.position();
     let nouvelle = match (o.sorte, depuis) {
         (Sorte::Chemin, _) => return -EBADF,
         (Sorte::Console, _) => return -ESPIPE,
         (Sorte::Null | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. }, _) => return 0,
         // Ni position ni taille : `noop_llseek`, qui rend la position, nulle.
-        (Sorte::EventFd | Sorte::Epoll, _) => return o.position as i64,
-        (Sorte::Noyau { lecture }, _) => match procfs::deplacer(lecture, o.position, decalage, depuis) {
+        (Sorte::EventFd | Sorte::Epoll, _) => return position as i64,
+        (Sorte::Noyau { lecture }, _) => match procfs::deplacer(lecture, position, decalage, depuis) {
             p if p >= 0 => Some(p),
             e => return e,
         },
         (_, SEEK_SET) => Some(decalage),
-        (_, SEEK_CUR) => (o.position as i64).checked_add(decalage),
+        (_, SEEK_CUR) => (position as i64).checked_add(decalage),
         (Sorte::Fichier, SEEK_END) => {
             let taille = vfs::avec(|fs, _| fs.attributs(o.numero()).taille) as i64;
             taille.checked_add(decalage)
@@ -977,30 +1191,25 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
     };
     match nouvelle {
         Some(p) if p >= 0 => {
-            changer_position(o.fichier, p as u64);
+            o.changer_position(p as u64);
             p
         }
         _ => -EINVAL,
     }
 }
 
-/// Ce que mmap doit savoir du fichier du descripteur `fd` : le fichier
-/// ouvert, sa sorte, et s'il a été ouvert en lecture et en écriture. Un
+/// Le fichier du descripteur `fd` qu'un mmap projette, tenu jusqu'à ce que
+/// la zone tienne le sien : sinon un `close` et un `open` d'un autre fil
+/// entre les deux donneraient son numéro à un autre fichier, que la zone
+/// projetterait sans qu'on ait vérifié son droit de lecture. Un
 /// descripteur invalide ou O_PATH : EBADF (le `fget` de Linux ne rend pas
 /// les fichiers O_PATH).
-pub struct PourProjeter {
-    pub fichier: Fichier,
-    pub sorte: Sorte,
-    pub lecture: bool,
-    pub ecriture: bool,
-}
-
-pub fn pour_projeter(fd: u64) -> Result<PourProjeter, i64> {
-    let o = ouvert(fd)?;
+pub fn pour_projeter(fd: u64) -> Result<FichierTenu, i64> {
+    let o = tenir(fd)?;
     if o.sorte == Sorte::Chemin {
         return Err(-EBADF);
     }
-    Ok(PourProjeter { fichier: o.fichier, sorte: o.sorte, lecture: o.lecture, ecriture: o.ecriture })
+    Ok(o)
 }
 
 /// Le périphérique de l'objet (`st_dev`) et sa taille de bloc
@@ -1062,8 +1271,8 @@ fn ecrire_stat(o: Objet, adresse: u64) -> i64 {
 
 /// fstat(fd, stat). Un descripteur O_PATH convient.
 pub fn fstat(fd: u64, adresse: u64) -> i64 {
-    match descripteur(fd) {
-        Ok(d) => ecrire_stat(vfs::avec_systeme(|s, _| s.ouverts.fichier(d.fichier).objet()), adresse),
+    match tenir(fd) {
+        Ok(o) => ecrire_stat(o.objet, adresse),
         Err(e) => e,
     }
 }
@@ -1087,7 +1296,7 @@ pub fn newfstatat(dirfd: u64, adresse: u64, stat: u64, drapeaux: u64) -> i64 {
         Err(e) => return e,
     };
     match objet(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
-        Ok(o) => ecrire_stat(o, stat),
+        Ok(o) => ecrire_stat(o.objet(), stat),
         Err(e) => e,
     }
 }
@@ -1119,8 +1328,8 @@ pub fn statx(dirfd: u64, adresse: u64, drapeaux: u64, masque: u64, statx: u64) -
         Ok(o) => o,
         Err(e) => return e,
     };
-    let a = attributs(o);
-    let (dev, taille_de_bloc) = systeme_de(o);
+    let a = attributs(o.objet());
+    let (dev, taille_de_bloc) = systeme_de(o.objet());
     let mut s = [0u8; 256];
     let mut mettre = |position: usize, valeur: u64, taille: usize| {
         s[position..position + taille].copy_from_slice(&valeur.to_le_bytes()[..taille]);
@@ -1167,7 +1376,7 @@ pub fn faccessat2(dirfd: u64, adresse: u64, droits: u64, drapeaux: u64) -> i64 {
         Err(e) => return e,
     };
     let qui = processus::avec(|p| p.identite);
-    let a = attributs(o);
+    let a = attributs(o.objet());
     if permis(a.mode, a.uid, a.gid, qui, droits as u32) { 0 } else { errno(Erreur::EACCES) }
 }
 
@@ -1176,37 +1385,60 @@ pub fn access(adresse: u64, droits: u64) -> i64 {
     faccessat2(AT_FDCWD as u64, adresse, droits, 0)
 }
 
-/// Installe un second descripteur pour le fichier de `d`, au numéro `fd`
-/// : le fichier est tenu une fois de plus. Si `fd` était ouvert, il est
-/// remplacé d'un coup, puis son fichier lâché (le `do_dup2` de Linux) : pas
-/// d'instant où le numéro est libre, et si la table ne peut pas grandir
-/// (ENOMEM), l'ancien reste ouvert.
-fn installer_copie(d: Descripteur, fd: u64, fermer_a_l_exec: bool) -> i64 {
-    vfs::avec_systeme(|s, _| s.ouverts.prendre(d.fichier));
-    let copie = Descripteur { fichier: d.fichier, fermer_a_l_exec };
-    match processus::avec(|p| p.descripteurs.remplacer(fd, copie)) {
-        Ok(ancien) => {
-            if let Some(ancien) = ancien {
+/// Un second descripteur pour le fichier tenu `f`, au plus petit numéro
+/// libre à partir de `minimum` (dup, F_DUPFD) : réservé, le fichier tenu
+/// une fois de plus et installé, dans une seule section du processus,
+/// comme le `f_dupfd` de Linux sous le verrou de sa table. EMFILE, ENOMEM.
+fn dupliquer(f: &FichierTenu, minimum: u64, fermer_a_l_exec: bool) -> i64 {
+    let r = processus::avec(|p| {
+        let fd = p.descripteurs.reserver(minimum)?;
+        vfs::avec_systeme(|s, _| s.ouverts.prendre(f.fichier));
+        p.descripteurs.installer(fd, Descripteur { fichier: f.fichier, fermer_a_l_exec });
+        Ok(fd)
+    });
+    match r {
+        Ok(fd) => fd as i64,
+        Err(refus) => errno_table(refus),
+    }
+}
+
+/// Installe un second descripteur pour le fichier du descripteur `ancien`,
+/// au numéro `nouveau` : le fichier est tenu une fois de plus. Si `nouveau`
+/// était ouvert, il est remplacé d'un coup, puis son fichier lâché (le
+/// `do_dup2` de Linux) : pas d'instant où le numéro est libre, et si la
+/// table ne peut pas grandir (ENOMEM), l'ancien reste ouvert. Tout est
+/// fait sous le verrou du processus, avec les numéros comme Linux (pas un
+/// fichier tenu) : dans l'ordre de `ksys_dup3`, un `nouveau` au-delà de la
+/// limite, EBADF ; un `ancien` fermé, EBADF ; la table qui ne grandit pas,
+/// ENOMEM ; un `nouveau` réservé par un appel en cours d'un autre fil,
+/// EBUSY. Le fichier remplacé est lâché hors du verrou du processus (le
+/// fermer peut rendre des pages).
+fn installer_copie(ancien: u64, nouveau: u64, fermer_a_l_exec: bool) -> i64 {
+    let r = processus::avec(|p| {
+        if nouveau >= p.descripteurs.limite.0 {
+            return Err(-EBADF);
+        }
+        let d = p.descripteurs.get(ancien).ok_or(-EBADF)?;
+        let remplace = p.descripteurs.remplacer(nouveau, Descripteur { fichier: d.fichier, fermer_a_l_exec }).map_err(errno_table)?;
+        vfs::avec_systeme(|s, _| s.ouverts.prendre(d.fichier));
+        Ok(remplace)
+    });
+    match r {
+        Ok(remplace) => {
+            if let Some(ancien) = remplace {
                 vfs::avec_systeme(|s, cadres| s.lacher(ancien.fichier, cadres));
             }
-            fd as i64
+            nouveau as i64
         }
-        Err(()) => {
-            vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
-            -ENOMEM
-        }
+        Err(e) => e,
     }
 }
 
 /// dup(fd) : le plus petit numéro libre.
 pub fn dup(fd: u64) -> i64 {
-    let d = match descripteur(fd) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
-    match processus::avec(|p| p.descripteurs.libre(0)) {
-        Some(nouveau) => installer_copie(d, nouveau, false),
-        None => -EMFILE,
+    match tenir(fd) {
+        Ok(f) => dupliquer(&f, 0, false),
+        Err(e) => e,
     }
 }
 
@@ -1222,22 +1454,15 @@ pub fn dup3(ancien: u64, nouveau: u64, drapeaux: u64) -> i64 {
     if ancien == nouveau {
         return -EINVAL;
     }
-    let d = match descripteur(ancien) {
-        Ok(d) => d,
-        Err(e) => return e,
-    };
-    if nouveau >= processus::avec(|p| p.descripteurs.limite.0) {
-        return -EBADF;
-    }
-    installer_copie(d, nouveau, drapeaux & O_CLOEXEC != 0)
+    installer_copie(ancien, nouveau, drapeaux & O_CLOEXEC != 0)
 }
 
 /// dup2(ancien, nouveau).
 pub fn dup2(ancien: u64, nouveau: u64) -> i64 {
     if ancien as u32 == nouveau as u32 {
-        return match descripteur(ancien) {
-            Ok(_) => nouveau as u32 as i64,
-            Err(e) => e,
+        return match processus::avec(|p| p.descripteurs.get(ancien)) {
+            Some(_) => nouveau as u32 as i64,
+            None => -EBADF,
         };
     }
     dup3(ancien, nouveau, 0)
@@ -1252,9 +1477,9 @@ pub fn dup2(ancien: u64, nouveau: u64) -> i64 {
 ///     seuls O_APPEND et O_NONBLOCK (et O_ASYNC, O_DIRECT, O_NOATIME, sans
 ///     effet ici) changent, le reste est ignoré, comme Linux ;
 ///   - F_GETLK, F_SETLK, F_SETLKW et leurs versions « OFD » : les verrous
-///     de fichiers (`verrou_posix`). Avec un seul processus, personne ne
-///     peut gêner : poser réussit toujours, et F_GETLK répond « rien ne
-///     bloque » (l_type = F_UNLCK), une fois la demande vérifiée ;
+///     de fichiers (`verrou_posix`). Ils ne sont pas encore tenus : poser
+///     réussit toujours, et F_GETLK répond « rien ne bloque » (l_type =
+///     F_UNLCK), une fois la demande vérifiée ;
 ///   - le reste : EINVAL.
 /// Sur un descripteur O_PATH, seules F_DUPFD*, F_GETFD, F_SETFD et F_GETFL
 /// sont permises (EBADF sinon).
@@ -1273,12 +1498,11 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
     const F_DUPFD_CLOEXEC: u64 = 1030;
     const FD_CLOEXEC: u64 = 1;
     const CHANGEABLES: u64 = O_APPEND | O_NONBLOCK | 0o20000 | 0o40000 | 0o1000000;
-    let d = match descripteur(fd) {
+    let d = match tenir(fd) {
         Ok(d) => d,
         Err(e) => return e,
     };
-    let chemin_seul = vfs::avec_systeme(|s, _| s.ouverts.fichier(d.fichier).sorte == Sorte::Chemin);
-    if chemin_seul && !matches!(commande, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL) {
+    if d.sorte == Sorte::Chemin && !matches!(commande, F_DUPFD | F_DUPFD_CLOEXEC | F_GETFD | F_SETFD | F_GETFL) {
         return -EBADF;
     }
     match commande {
@@ -1287,17 +1511,14 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
             if minimum >= limite {
                 return -EINVAL;
             }
-            match processus::avec(|p| p.descripteurs.libre(minimum)) {
-                Some(nouveau) => installer_copie(d, nouveau, commande == F_DUPFD_CLOEXEC),
-                None => -EMFILE,
-            }
+            dupliquer(&d, minimum, commande == F_DUPFD_CLOEXEC)
         }
         F_GETFD => d.fermer_a_l_exec as i64,
         F_SETFD => {
             processus::avec(|p| p.descripteurs.get_mut(fd).map(|d| d.fermer_a_l_exec = argument & FD_CLOEXEC != 0));
             0
         }
-        F_GETFL => vfs::avec_systeme(|s, _| s.ouverts.fichier(d.fichier).drapeaux) as i64,
+        F_GETFL => d.drapeaux as i64,
         F_SETFL => {
             vfs::avec_systeme(|s, _| {
                 let f = s.ouverts.fichier(d.fichier);
@@ -1326,14 +1547,17 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
 ///   - poser un verrou de lecture sur un descripteur qui ne lit pas, ou
 ///     d'écriture sur un qui n'écrit pas : EBADF ;
 ///   - pour la version OFD, l_pid doit valoir 0 (EINVAL).
-/// Puis, sans autre processus pour gêner : poser réussit, F_GETLK répond
-/// F_UNLCK (le reste de la structure inchangé, comme Linux).
+/// Puis : poser réussit, F_GETLK répond F_UNLCK (le reste de la structure
+/// inchangé, comme Linux). Un écart, depuis que deux programmes peuvent
+/// tourner en même temps (`&`, 6e) : deux verrous d'écriture sur le même
+/// fichier ne s'excluent pas ; les vrais verrous viendront avec le premier
+/// programme qui en aura besoin (noté dans « Reste à faire »).
 fn verrou_posix(fd: u64, adresse: u64, demander: bool, ofd: bool) -> i64 {
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
     const EOVERFLOW: i64 = 75;
-    let o = match ouvert(fd) {
+    let o = match tenir(fd) {
         Ok(o) => o,
         Err(e) => return e,
     };
@@ -1351,7 +1575,7 @@ fn verrou_posix(fd: u64, adresse: u64, demander: bool, ofd: bool) -> i64 {
     }
     let base = match depuis {
         0 => 0,
-        1 => o.position as i64,
+        1 => o.position() as i64,
         2 if o.sorte == Sorte::Fichier => vfs::avec(|fs, _| fs.attributs(o.numero()).taille) as i64,
         2 => 0,
         _ => return -EINVAL,
@@ -1380,15 +1604,15 @@ fn verrou_posix(fd: u64, adresse: u64, demander: bool, ofd: bool) -> i64 {
     0
 }
 
-/// flock(fd, opération) : un verrou sur tout le fichier. Avec un seul
-/// processus, il est toujours accordé. Une opération inconnue : EINVAL ; un
-/// descripteur O_PATH : EBADF.
+/// flock(fd, opération) : un verrou sur tout le fichier. Toujours accordé,
+/// comme ceux de fcntl (voir `verrou_posix`, le même écart). Une opération
+/// inconnue : EINVAL ; un descripteur O_PATH : EBADF.
 pub fn flock(fd: u64, operation: u64) -> i64 {
     const LOCK_SH: u64 = 1;
     const LOCK_EX: u64 = 2;
     const LOCK_NB: u64 = 4;
     const LOCK_UN: u64 = 8;
-    let o = match ouvert(fd) {
+    let o = match tenir(fd) {
         Ok(o) => o,
         Err(e) => return e,
     };
@@ -1424,7 +1648,7 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
     const FIOCLEX: u64 = 0x5451;
     const FIONBIO: u64 = 0x5421;
     const FIONREAD: u64 = 0x541b;
-    let o = match ouvert(fd) {
+    let o = match tenir(fd) {
         Ok(o) => o,
         Err(e) => return e,
     };
@@ -1453,7 +1677,7 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
         }
         FIONREAD if attributs(o.objet).mode & S_IFMT == S_IFREG => {
             let taille = attributs(o.objet).taille;
-            let reste = (taille as i64).wrapping_sub(o.position as i64) as i32;
+            let reste = (taille as i64).wrapping_sub(o.position() as i64) as i32;
             match copier_vers_utilisateur(argument, &reste.to_le_bytes()) {
                 Ok(()) => 0,
                 Err(_) => -EFAULT,
@@ -1562,7 +1786,7 @@ pub fn ouvrir_console(descripteurs: &mut crate::descripteurs::Descripteurs) -> R
         if fd > 0 {
             vfs::avec_systeme(|s, _| s.ouverts.prendre(console));
         }
-        if descripteurs.installer(fd, Descripteur { fichier: console, fermer_a_l_exec: false }).is_err() {
+        if descripteurs.remplacer(fd, Descripteur { fichier: console, fermer_a_l_exec: false }).is_err() {
             vfs::avec_systeme(|s, cadres| {
                 s.lacher(console, cadres);
                 for installe in 0..fd {
@@ -1589,7 +1813,7 @@ pub fn entree_sur_null(descripteurs: &mut crate::descripteurs::Descripteurs) -> 
             }
             Ok(())
         }
-        Err(()) => {
+        Err(_) => {
             vfs::avec_systeme(|s, cadres| s.lacher(null, cadres));
             Err(Erreur::ENOMEM)
         }
@@ -1665,10 +1889,11 @@ pub fn readlinkat(dirfd: u64, adresse: u64, tampon: u64, taille: u64) -> i64 {
         Ok(c) => c,
         Err(e) => return e,
     };
-    let o = match objet(dirfd, &chemin, false, true) {
+    let tenu = match objet(dirfd, &chemin, false, true) {
         Ok(o) => o,
         Err(e) => return e,
     };
+    let o = tenu.objet();
     let vide = chemin.is_empty();
     let pid = processus::avec(|p| p.pid);
     let contenu = vfs::avec_systeme(|s, _| -> Result<Vec<u8>, i64> {
@@ -1727,6 +1952,7 @@ pub fn linkat(ancien_dossier: u64, ancien: u64, nouveau_dossier: u64, nouveau: u
         Err(e) => return e,
     };
     let r = avec_fin(nouveau_dossier, &nouveau, Suivre::Jamais, |s, _, fin, depart, pid| {
+        let source = source.objet();
         match (source.tmpfs(), dans_le_tmpfs(&fin)) {
             (Some(source), true) => match en_tmpfs(fin) {
                 Ok(fin) => s.fs.lier(depart.qui, source, &fin, temps::maintenant()).map_err(errno),
@@ -1760,10 +1986,11 @@ pub fn renameat2(ancien_dossier: u64, ancien: u64, nouveau_dossier: u64, nouveau
         (Ok(a), Ok(n)) => (a, n),
         (Err(e), _) | (_, Err(e)) => return e,
     };
-    let ((depart_ancien, pid), (depart_nouveau, _)) = match (depart(ancien_dossier, &ancien), depart(nouveau_dossier, &nouveau)) {
+    let (tenu_ancien, tenu_nouveau) = match (depart(ancien_dossier, &ancien), depart(nouveau_dossier, &nouveau)) {
         (Ok(a), Ok(n)) => (a, n),
         (Err(e), _) | (_, Err(e)) => return e,
     };
+    let (depart_ancien, depart_nouveau, pid) = (tenu_ancien.depart(), tenu_nouveau.depart(), tenu_ancien.pid);
     let r = vfs::avec_systeme(|s, cadres| {
         let fa = s.resoudre(pid, &depart_ancien, &ancien, Suivre::Jamais).map_err(errno)?;
         let fn_ = s.resoudre(pid, &depart_nouveau, &nouveau, Suivre::Jamais).map_err(errno)?;
@@ -1792,7 +2019,7 @@ pub fn rename(ancien: u64, nouveau: u64) -> i64 {
 /// tampon trop petit pour la première entrée : EINVAL. Les entrées sont
 /// préparées dans un bloc du tas (64 Kio au plus par appel), puis copiées.
 pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
-    let o = match ouvert(fd) {
+    let o = match tenir(fd) {
         Ok(o) => o,
         Err(e) => return e,
     };
@@ -1807,9 +2034,11 @@ pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
     if entrees.try_reserve_exact(taille).is_err() {
         return -ENOMEM;
     }
-    let mut position = o.position;
+    let _verrous = verrous(&o, true, false);
+    let debut = o.position();
+    let mut position = debut;
     let lu = vfs::avec_systeme(|s, _| {
-        let r = s.avec_vue(0, |vue| vue.lire_dossier(o.objet, o.position, |nom, n, genre, suivante| {
+        let r = s.avec_vue(0, |vue| vue.lire_dossier(o.objet, debut, |nom, n, genre, suivante| {
             let longueur = (8 + 8 + 2 + 1 + nom.len() + 1).next_multiple_of(8);
             if entrees.len() + longueur > taille {
                 return false;
@@ -1836,7 +2065,7 @@ pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
         // distingue en regardant s'il restait une entrée à lire.
         let reste = vfs::avec_systeme(|s, _| {
             let mut une = false;
-            let _ = s.avec_vue(0, |vue| vue.lire_dossier(o.objet, o.position, |_, _, _, _| {
+            let _ = s.avec_vue(0, |vue| vue.lire_dossier(o.objet, debut, |_, _, _, _| {
                 une = true;
                 false
             }));
@@ -1847,7 +2076,7 @@ pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
     if copier_vers_utilisateur(tampon, &entrees).is_err() {
         return -EFAULT;
     }
-    changer_position(o.fichier, position);
+    o.changer_position(position);
     entrees.len() as i64
 }
 
@@ -1855,8 +2084,11 @@ pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
 /// final ; rend sa longueur, zéro compris. Trop petit : ERANGE ; un dossier
 /// courant effacé : ENOENT.
 pub fn getcwd(tampon: u64, taille: u64) -> i64 {
-    let dossier = processus::avec(|p| p.dossier);
-    let mut chemin = match vfs::avec_systeme(|s, _| s.avec_vue(0, |vue| vue.chemin(dossier))) {
+    // Tenu le temps de calculer son chemin : un `chdir` d'un autre fil, puis
+    // un `rmdir`, ne le font pas disparaître sous nous (le `get_fs_pwd` de
+    // Linux).
+    let dossier = processus::avec(|p| vfs::avec_systeme(|s, _| ObjetTenu::tenir(s, p.dossier)));
+    let mut chemin = match vfs::avec_systeme(|s, _| s.avec_vue(0, |vue| vue.chemin(dossier.objet()))) {
         Ok(c) => c,
         Err(e) => return errno(e),
     };
@@ -1873,10 +2105,11 @@ pub fn getcwd(tampon: u64, taille: u64) -> i64 {
     }
 }
 
-/// Le dossier `o` devient le dossier courant : un dossier (ENOTDIR) qu'on
-/// a le droit de traverser (EACCES), comme `set_fs_pwd` après la
-/// vérification de chdir. Il peut être dans un système monté (« cd
-/// /proc ») ; un inode du tmpfs est tenu.
+/// Le dossier `o` (que l'appelant tient) devient le dossier courant : un
+/// dossier (ENOTDIR) qu'on a le droit de traverser (EACCES), comme
+/// `set_fs_pwd` après la vérification de chdir. Il peut être dans un
+/// système monté (« cd /proc ») ; un inode du tmpfs est tenu une fois de
+/// plus, pour le processus.
 fn changer_de_dossier(o: Objet) -> i64 {
     let qui = processus::avec(|p| p.identite);
     let a = attributs(o);
@@ -1903,32 +2136,42 @@ pub fn chdir(adresse: u64) -> i64 {
         Err(e) => return e,
     };
     match objet(AT_FDCWD as u64, &chemin, true, false) {
-        Ok(n) => changer_de_dossier(n),
+        Ok(o) => changer_de_dossier(o.objet()),
         Err(e) => e,
     }
 }
 
 /// fchdir(fd).
 pub fn fchdir(fd: u64) -> i64 {
-    match ouvert(fd) {
+    match tenir(fd) {
         Ok(o) => changer_de_dossier(o.objet),
         Err(e) => e,
     }
 }
 
-/// Ramène le fichier `n` à `taille` octets.
+/// Ramène le fichier `n` (tenu par l'appelant) à `taille` octets, sous le
+/// verrou d'écriture de son inode (l'`inode_lock` du `do_truncate` de
+/// Linux) : une écriture en cours ne rallonge pas le fichier derrière nous.
 ///
-/// Les pages qui disparaissent sont d'abord retirées des projections du
-/// processus, copies privées comprises (mesuré sous Linux : une page
-/// copiée puis le fichier raccourci et rallongé se relit à zéro), comme
+/// Les pages qui disparaissent sont retirées des projections du processus,
+/// copies privées comprises (mesuré sous Linux : une page copiée puis le
+/// fichier raccourci et rallongé se relit à zéro), comme
 /// `truncate_pagecache` : un accès au-delà de la nouvelle fin fera SIGBUS.
-/// Le tmpfs ne lâche ses pages qu'ensuite. Il faudrait le faire dans
-/// chaque processus qui projette le fichier (la carte inverse `i_mmap` de
-/// Linux) : avec un seul processus à la fois, c'est le processus en cours
-/// (à généraliser avec l'ordonnanceur, 6e).
+/// Deux fois, comme Linux : avant que le tmpfs lâche ses pages, et après,
+/// car un autre fil qui fait une faute entre les deux trouve encore
+/// l'ancienne taille, et projette la page (la seconde fois, la nouvelle
+/// taille est en place : une faute suivante rend SIGBUS). Il faudrait le
+/// faire dans chaque processus qui projette le fichier (la carte inverse
+/// `i_mmap` de Linux) ; seul le processus en cours l'est. Un autre programme qui
+/// projette le même fichier (`&`, 6e) garde ses pages (elles sont tenues :
+/// la mémoire reste sûre) et y lit l'ancien contenu au lieu d'un SIGBUS :
+/// un écart, noté dans « Reste à faire ».
 fn tronquer(n: Numero, taille: u64) -> i64 {
+    let _ecriture = verrou_d_ecriture(n);
     retirer_projections(n, taille.div_ceil(PAGE));
-    match vfs::avec(|fs, cadres| fs.tronquer(n, taille, temps::maintenant(), cadres)) {
+    let r = vfs::avec(|fs, cadres| fs.tronquer(n, taille, temps::maintenant(), cadres));
+    retirer_projections(n, taille.div_ceil(PAGE));
+    match r {
         Ok(()) => 0,
         Err(e) => errno(e),
     }
@@ -1966,10 +2209,13 @@ pub fn truncate(adresse: u64, taille: u64) -> i64 {
         Err(e) => return e,
     };
     let (qui, pid) = processus::avec(|p| (p.identite, p.pid));
-    let n = match objet(AT_FDCWD as u64, &chemin, true, false) {
-        Ok(Objet::Tmpfs(n)) => n,
-        Ok(o) => return vfs::avec_systeme(|s, _| refus(s, pid, qui, Modification::Tronquer(o))),
+    let tenu = match objet(AT_FDCWD as u64, &chemin, true, false) {
+        Ok(o) => o,
         Err(e) => return e,
+    };
+    let n = match tenu.objet() {
+        Objet::Tmpfs(n) => n,
+        o => return vfs::avec_systeme(|s, _| refus(s, pid, qui, Modification::Tronquer(o))),
     };
     if let Err(e) = vfs::avec(|fs, _| fs.verifier_tronquer(qui, n)) {
         return errno(e);
@@ -1985,7 +2231,7 @@ pub fn ftruncate(fd: u64, taille: u64) -> i64 {
     if (taille as i64) < 0 {
         return -EINVAL;
     }
-    let o = match ouvert(fd) {
+    let o = match tenir(fd) {
         Ok(o) => o,
         Err(e) => return e,
     };
@@ -2007,7 +2253,7 @@ pub fn ftruncate(fd: u64, taille: u64) -> i64 {
 /// un eventfd ou un epoll, ni les fichiers et dossiers de /proc, ni les
 /// dossiers de /sys.
 pub fn fsync(fd: u64) -> i64 {
-    match ouvert(fd) {
+    match tenir(fd) {
         Ok(o) => match o.sorte {
             Sorte::Chemin => -EBADF,
             Sorte::Fichier | Sorte::Noyau { lecture: Lecture::Attribut } => 0,
@@ -2022,7 +2268,7 @@ pub fn fsync(fd: u64) -> i64 {
 /// Aucun n'en a (6l) : 0, pour tout descripteur qui n'est pas O_PATH
 /// (EBADF), quelle que soit la sorte du fichier (mesuré).
 pub fn syncfs(fd: u64) -> i64 {
-    match ouvert(fd) {
+    match tenir(fd) {
         Ok(o) if o.sorte != Sorte::Chemin => 0,
         Ok(_) => -EBADF,
         Err(e) => e,
@@ -2064,10 +2310,10 @@ pub fn fchmodat2(dirfd: u64, adresse: u64, mode: u64, drapeaux: u64) -> i64 {
         Ok(o) => o,
         Err(e) => return e,
     };
-    if attributs(o).mode & S_IFMT == S_IFLNK {
+    if attributs(o.objet()).mode & S_IFMT == S_IFLNK {
         return -EOPNOTSUPP;
     }
-    changer_mode(o, mode)
+    changer_mode(o.objet(), mode)
 }
 
 /// chmod(chemin, droits).
@@ -2077,7 +2323,7 @@ pub fn chmod(adresse: u64, mode: u64) -> i64 {
 
 /// fchmod(fd, droits).
 pub fn fchmod(fd: u64, mode: u64) -> i64 {
-    match ouvert(fd) {
+    match tenir(fd) {
         Ok(o) if o.sorte != Sorte::Chemin => changer_mode(o.objet, mode),
         Ok(_) => -EBADF,
         Err(e) => e,
@@ -2113,14 +2359,14 @@ pub fn fchownat(dirfd: u64, adresse: u64, uid: u64, gid: u64, drapeaux: u64) -> 
         Err(e) => return e,
     };
     match objet(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
-        Ok(o) => changer_proprietaire(o, uid, gid),
+        Ok(o) => changer_proprietaire(o.objet(), uid, gid),
         Err(e) => e,
     }
 }
 
 /// fchown(fd, uid, gid).
 pub fn fchown(fd: u64, uid: u64, gid: u64) -> i64 {
-    match ouvert(fd) {
+    match tenir(fd) {
         Ok(o) if o.sorte != Sorte::Chemin => changer_proprietaire(o.objet, uid, gid),
         Ok(_) => -EBADF,
         Err(e) => e,
@@ -2158,12 +2404,12 @@ pub fn utimensat(dirfd: u64, adresse: u64, dates: u64, drapeaux: u64) -> i64 {
             return 0;
         }
     }
-    let o = if adresse == 0 && dirfd as i32 != AT_FDCWD {
+    let tenu = if adresse == 0 && dirfd as i32 != AT_FDCWD {
         if drapeaux != 0 {
             return -EINVAL;
         }
-        match ouvert(dirfd) {
-            Ok(o) if o.sorte != Sorte::Chemin => o.objet,
+        match tenir(dirfd) {
+            Ok(o) if o.sorte != Sorte::Chemin => o.tenir_objet(),
             Ok(_) => return -EBADF,
             Err(e) => return e,
         }
@@ -2180,6 +2426,7 @@ pub fn utimensat(dirfd: u64, adresse: u64, dates: u64, drapeaux: u64) -> i64 {
             Err(e) => return e,
         }
     };
+    let o = tenu.objet();
     let horodatage = |(secondes, nano): (i64, i64)| match nano {
         UTIME_NOW => Some(Horodatage::Maintenant),
         UTIME_OMIT => Some(Horodatage::Garder),
