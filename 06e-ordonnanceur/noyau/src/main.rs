@@ -59,6 +59,7 @@ mod sysfs;
 mod sse;
 mod tache;
 mod tas;
+mod tsc;
 mod temps;
 mod verrou;
 mod vfs;
@@ -260,7 +261,11 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // IRQ, et seulement alors sti. Dans l'autre ordre, une IRQ pourrait
     // arriver sur un vecteur d'exception.
     let bilan = irq::initialiser();
-    horloge::initialiser();
+    // Le TSC, étalonné contre le PIT avant que le PIT ne serve (ou ne soit
+    // arrêté) ; puis le tic : le timer de l'APIC si l'APIC et le TSC le
+    // permettent, le PIT sinon.
+    let tsc = tsc::etalonner();
+    let source = horloge::initialiser(irq::apic());
     cpu::activer_interruptions();
     match bilan {
         irq::Bilan::Apic { apic, ioapic } => {
@@ -269,14 +274,24 @@ extern "C" fn noyau_main(infos: u64) -> ! {
                 afficher!(", IO-APIC {} a {:#x} (GSI {}-{})", n, adresse, gsi, gsi + entrees - 1);
             }
             afficherln!(" ; 8259 masque.");
-            afficherln!("[noyau] Horloge (PIT) : IRQ {} sur le GSI {}, vecteur {:#x}, a {} Hz ; clavier : IRQ {}, GSI {}, vecteur {:#x}.",
-                        horloge::IRQ, ioapic::gsi(horloge::IRQ).unwrap_or(0), irq::vecteur(horloge::IRQ), horloge::HZ,
+            afficherln!("[noyau] Clavier : IRQ {} sur le GSI {}, vecteur {:#x}.",
                         clavier::IRQ, ioapic::gsi(clavier::IRQ).unwrap_or(0), irq::vecteur(clavier::IRQ));
         }
-        irq::Bilan::Pic(raison) => afficherln!("[noyau] PIC 8259 ({}) remappe sur les vecteurs {}-{}, horloge a {} Hz.",
-                                               raison, pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1, horloge::HZ),
-        irq::Bilan::PicSansApic(e) => afficherln!("[noyau] PIC 8259 ({}) remappe sur les vecteurs {}-{}, horloge a {} Hz.",
-                                                  e, pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1, horloge::HZ),
+        irq::Bilan::Pic(raison) => afficherln!("[noyau] PIC 8259 ({}) remappe sur les vecteurs {}-{}.",
+                                               raison, pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1),
+        irq::Bilan::PicSansApic(e) => afficherln!("[noyau] PIC 8259 ({}) remappe sur les vecteurs {}-{}.",
+                                                  e, pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1),
+    }
+    match tsc {
+        tsc::Bilan::Fiable { khz, essais } => afficherln!("[noyau] TSC : {}.{:03} MHz, constant ({} essais sur 5 retenus) : l'heure a la nanoseconde.",
+                                                         khz / 1000, khz % 1000, essais),
+        tsc::Bilan::NonConstant => afficherln!("[noyau] TSC non fiable (le processeur ne le dit pas constant) : l'heure au tic."),
+        tsc::Bilan::Mesure => afficherln!("[noyau] TSC non fiable (mesures rejetees ou en desaccord) : l'heure au tic."),
+    }
+    match source {
+        horloge::Source::Apic(hz) => afficherln!("[noyau] Horloge : timer de l'APIC ({}.{:03} MHz apres le diviseur), {} Hz, vecteur {:#x} ; PIT arrete.",
+                                                 hz / 1_000_000, hz / 1000 % 1000, horloge::HZ, apic::VECTEUR_TIMER),
+        horloge::Source::Pit => afficherln!("[noyau] Horloge : PIT, {} Hz, vecteur {:#x}.", horloge::HZ, irq::vecteur(horloge::IRQ)),
     }
     // Le compte affiché est celui depuis le démarrage de l'horloge : 100,
     // plus les tics passés à écrire les messages qui précèdent (sous QEMU,

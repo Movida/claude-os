@@ -39,8 +39,8 @@
 //! même par défaut) ; le fuseau horaire est l'affaire des programmes
 //! (/etc/localtime).
 //!
-//! Les horloges des programmes, comptées en tics d'horloge depuis le
-//! démarrage, à la milliseconde :
+//! Les horloges des programmes, comptées depuis le démarrage, à la
+//! nanoseconde (le TSC) ou au tic (voir plus bas) :
 //!   - CLOCK_REALTIME : la date, celle de l'horloge CMOS plus le temps
 //!     écoulé depuis ;
 //!   - CLOCK_MONOTONIC et CLOCK_BOOTTIME : le temps depuis le démarrage (pas
@@ -48,17 +48,20 @@
 //!   - CLOCK_TAI : le temps atomique, égal à REALTIME tant que personne ne
 //!     règle l'écart (comme Linux, où il vaut 0 au démarrage) ;
 //!   - leurs versions _COARSE, « grossières » mais plus rapides sous Linux :
-//!     ici les mêmes, tout est déjà à la milliseconde ;
+//!     l'heure du dernier tic (ici, la fine arrondie au tic : jamais en
+//!     avance sur elle), de la finesse d'un tic ;
 //!   - CLOCK_PROCESS_CPUTIME_ID et CLOCK_THREAD_CPUTIME_ID : le temps de
 //!     calcul du programme, compté tic par tic quand il s'exécute (en
 //!     anneau 3 ou dans le noyau pour lui : utime + stime, comme Linux),
 //!     celui de sa limite RLIMIT_CPU (tache.rs). Avec un seul fil, les deux
 //!     sont égaux.
-//! Un tic ne dure pas exactement une milliseconde : le PIT divise
-//! 1 193 182 Hz par 1193, soit 999 847,6 ns par tic. Le temps est compté
-//! avec cette durée exacte (le `tick_nsec` de Linux), sinon il dériverait
-//! de 13 secondes par jour. Le TSC du processeur, étalonné, donnera la
-//! nanoseconde en 6e.
+//! Le temps vient du TSC, étalonné (tsc.rs), à la nanoseconde, quand il
+//! est fiable : clock_getres rend alors 1 ns pour les horloges fines,
+//! comme Linux. Sinon, il est compté en tics, avec la durée exacte d'un
+//! tic (horloge.rs, le `tick_nsec` de Linux) : un tic du PIT ne dure pas
+//! exactement une milliseconde (1 193 182 Hz divisés par 1193, soit
+//! 999 847,6 ns), et le compter pour une milliseconde ferait dériver
+//! l'heure de 13 secondes par jour.
 
 use crate::verrou::Verrou;
 use crate::{horloge, port, tache};
@@ -87,20 +90,34 @@ const H24: u8 = 0x02;
 /// Le couple index et donnée ne se coupe pas.
 static CMOS: Verrou<()> = Verrou::new(());
 
-/// La date au démarrage (secondes depuis 1970, UTC), et le tic où on l'a
-/// lue.
+/// La date au démarrage (secondes depuis 1970, UTC), et l'instant où on
+/// l'a lue (en nanosecondes du temps monotone).
 static DATE_LUE: AtomicI64 = AtomicI64::new(0);
-static TIC_DE_LECTURE: AtomicU64 = AtomicU64::new(0);
+static INSTANT_DE_LECTURE: AtomicU64 = AtomicU64::new(0);
 
-/// La durée de `tics` tics, en nanosecondes, en fraction exacte : DIVISEUR
-/// / la fréquence du quartz, en secondes, par tic.
+/// La durée de `tics` tics, en nanosecondes (horloge.rs).
 pub fn nanosecondes(tics: u64) -> u64 {
-    (tics as u128 * horloge::DIVISEUR as u128 * 1_000_000_000 / horloge::FREQUENCE_PIT as u128) as u64
+    horloge::nanosecondes(tics)
 }
 
-/// La durée d'un tic, arrondie à la nanoseconde (clock_getres).
-pub fn resolution() -> Temps {
-    Temps { secondes: 0, nanosecondes: nanosecondes(1_000_000).div_ceil(1_000_000) as u32 }
+/// Le temps depuis le démarrage, en nanosecondes : le TSC s'il est fiable,
+/// les tics sinon.
+fn ns_monotone() -> u64 {
+    crate::tsc::nanosecondes().unwrap_or_else(|| horloge::nanosecondes(horloge::tics()))
+}
+
+/// La durée d'un tic, arrondie à la nanoseconde au-dessus.
+fn duree_tic() -> u64 {
+    horloge::nanosecondes(1_000_000).div_ceil(1_000_000)
+}
+
+/// La finesse de l'horloge `horloge` (clock_getres) : 1 ns pour les
+/// horloges fines quand le TSC sert, la durée d'un tic sinon, et pour les
+/// _COARSE et le temps de calcul (compté en tics jusqu'à l'ordonnanceur).
+pub fn resolution(h: u64) -> Temps {
+    let fine = matches!(h, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME | CLOCK_TAI);
+    let ns = if fine && crate::tsc::khz().is_some() { 1 } else { duree_tic() };
+    Temps { secondes: 0, nanosecondes: ns as u32 }
 }
 
 fn lire_registre(r: u8) -> u8 {
@@ -161,7 +178,7 @@ pub fn initialiser() -> Option<(i64, i64, i64, i64, i64, i64)> {
     // Un registre du siècle au-delà des 128 de l'horloge CMOS : une table
     // fausse, on s'en passe (le bit 7 de l'index coupe les NMI).
     let lue = lire_date(crate::acpi::registre_du_siecle().filter(|&r| r < 0x80));
-    TIC_DE_LECTURE.store(horloge::tics(), Ordering::Relaxed);
+    INSTANT_DE_LECTURE.store(ns_monotone(), Ordering::Relaxed);
     let (brut, b, siecle) = lue?;
     let valeur = |v: u8| if b & BINAIRE != 0 { v as i64 } else { (v >> 4) as i64 * 10 + (v & 0x0f) as i64 };
     let [s, mi, h, j, mo, a] = brut;
@@ -194,13 +211,23 @@ fn depuis_nanosecondes(ns: u64) -> Temps {
 
 /// Le temps depuis le démarrage (CLOCK_MONOTONIC).
 pub fn monotone() -> Temps {
-    depuis_nanosecondes(nanosecondes(horloge::tics()))
+    depuis_nanosecondes(ns_monotone())
 }
 
 /// La date et l'heure (CLOCK_REALTIME), en temps UTC.
 pub fn maintenant() -> Temps {
-    let ecoule = depuis_nanosecondes(nanosecondes(horloge::tics() - TIC_DE_LECTURE.load(Ordering::Relaxed)));
+    date(ns_monotone())
+}
+
+/// La date à l'instant `ns` du temps monotone.
+fn date(ns: u64) -> Temps {
+    let ecoule = depuis_nanosecondes(ns.saturating_sub(INSTANT_DE_LECTURE.load(Ordering::Relaxed)));
     Temps { secondes: DATE_LUE.load(Ordering::Relaxed) + ecoule.secondes, ..ecoule }
+}
+
+/// L'instant `ns`, arrondi au tic en dessous (les horloges _COARSE).
+fn grossier(ns: u64) -> u64 {
+    ns - ns % duree_tic()
 }
 
 /// Le temps de calcul du programme en cours.
@@ -224,8 +251,10 @@ pub const CLOCK_TAI: u64 = 11;
 /// autre processus (les numéros négatifs de clock_getcpuclockid) : non.
 pub fn horloge(horloge: u64) -> Option<Temps> {
     match horloge {
-        CLOCK_REALTIME | CLOCK_REALTIME_COARSE | CLOCK_TAI => Some(maintenant()),
-        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_MONOTONIC_COARSE | CLOCK_BOOTTIME => Some(monotone()),
+        CLOCK_REALTIME | CLOCK_TAI => Some(maintenant()),
+        CLOCK_REALTIME_COARSE => Some(date(grossier(ns_monotone()))),
+        CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => Some(monotone()),
+        CLOCK_MONOTONIC_COARSE => Some(depuis_nanosecondes(grossier(ns_monotone()))),
         CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => Some(temps_du_programme()),
         _ => None,
     }

@@ -38,7 +38,7 @@ use crate::interruptions::Cadre;
 use crate::memoire::{self, Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Projection, Zone};
 use crate::appels_fichiers as f;
-use crate::{aleatoire, cpu, evenements, futex, horloge, pages, processus, signaux, tache, temps};
+use crate::{aleatoire, cpu, evenements, futex, pages, processus, signaux, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
@@ -1066,7 +1066,7 @@ fn sysinfo(info: u64) -> i64 {
     let mut mettre = |position: usize, valeur: u64, taille: usize| {
         s[position..position + taille].copy_from_slice(&valeur.to_le_bytes()[..taille]);
     };
-    mettre(0, horloge::tics() / horloge::HZ as u64, 8); // uptime, en secondes
+    mettre(0, temps::monotone().secondes as u64, 8); // uptime, en secondes
     mettre(32, pages::total() as u64 * PAGE, 8); // totalram
     mettre(40, pages::libres() as u64 * PAGE, 8); // freeram
     mettre(80, 1, 2); // procs : un seul processus
@@ -1098,10 +1098,10 @@ fn clock_gettime(horloge: u64, adresse: u64) -> i64 {
     }
 }
 
-/// clock_getres(horloge, resolution) : la finesse de l'horloge, la durée
-/// d'un tic d'horloge pour toutes (Linux rend une nanoseconde pour ses
-/// horloges fines, la durée d'un tic pour les _COARSE). Le résultat peut
-/// ne pas être demandé (adresse nulle).
+/// clock_getres(horloge, resolution) : la finesse de l'horloge (Linux rend
+/// une nanoseconde pour ses horloges fines, la durée d'un tic pour les
+/// _COARSE ; voir temps::resolution). Le résultat peut ne pas être
+/// demandé (adresse nulle).
 fn clock_getres(horloge: u64, adresse: u64) -> i64 {
     if temps::horloge(horloge).is_none() {
         return -EINVAL;
@@ -1109,7 +1109,7 @@ fn clock_getres(horloge: u64, adresse: u64) -> i64 {
     if adresse == 0 {
         return 0;
     }
-    match ecrire_timespec(adresse, temps::resolution()) {
+    match ecrire_timespec(adresse, temps::resolution(horloge)) {
         Ok(()) => 0,
         Err(()) => -EFAULT,
     }

@@ -3,8 +3,8 @@
  * gettimeofday, time. Il tourne dans notre noyau et sur l'hôte (make
  * tests-hote), et n'affiche que des faits vrais des deux côtés : jamais
  * l'heure elle-même, qui change, ni la résolution exacte (une
- * nanoseconde sous Linux, une milliseconde chez nous : on vérifie
- * seulement qu'elle ne dépasse pas une milliseconde).
+ * nanoseconde sous Linux, et chez nous quand le TSC est fiable ; sinon un
+ * tic : on vérifie seulement qu'elle ne dépasse pas une milliseconde).
  */
 #include <errno.h>
 #include <stdio.h>
@@ -58,6 +58,23 @@ int main(void)
 
     verifier(clock_getres(CLOCK_MONOTONIC, &res) == 0 && res.tv_sec == 0 && res.tv_nsec > 0 && res.tv_nsec <= 1000000,
              "resolution de CLOCK_MONOTONIC d'une milliseconde au plus");
+    /* Une horloge qui se dit fine (une nanoseconde, sous Linux comme chez
+     * nous avec le TSC) doit l'être : sur 1000 paires de lectures de
+     * suite, au moins un écart non nul et de moins de 100 µs. Une
+     * horloge au tic n'en a que de nuls ou d'un tic. */
+    if (res.tv_nsec == 1) {
+        int fin = 0;
+        for (int i = 0; i < 1000 && !fin; i++) {
+            struct timespec a, b;
+            clock_gettime(CLOCK_MONOTONIC, &a);
+            clock_gettime(CLOCK_MONOTONIC, &b);
+            long long d = ns(b) - ns(a);
+            fin = d > 0 && d < 100000;
+        }
+        verifier(fin, "CLOCK_MONOTONIC a la nanoseconde (resolution 1 ns)");
+    } else {
+        printf("[linux] temps : CLOCK_MONOTONIC au tic (resolution %ld ns)\n", res.tv_nsec);
+    }
     verifier(clock_getres(CLOCK_REALTIME, NULL) == 0, "clock_getres sans resultat");
 
     /* gettimeofday et time disent la même date que CLOCK_REALTIME, à une

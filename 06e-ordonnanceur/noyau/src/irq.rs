@@ -62,6 +62,11 @@ pub fn initialiser() -> Bilan {
     r
 }
 
+/// L'APIC est-il en service (sinon, le 8259) ?
+pub fn apic() -> bool {
+    APIC.load(Ordering::Relaxed)
+}
+
 /// Le vecteur de l'IRQ ISA `irq`.
 pub fn vecteur(irq: u8) -> u8 {
     if APIC.load(Ordering::Relaxed) { ioapic::VECTEUR_ISA + irq } else { pic::VECTEUR_BASE + irq }
@@ -76,11 +81,20 @@ pub fn demasquer(irq: u8) {
     }
 }
 
+/// D'où vient une interruption matérielle.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Source {
+    /// Une IRQ du bus ISA (par le 8259 ou l'IO-APIC).
+    Isa(u8),
+    /// Le timer de l'APIC local.
+    TimerApic,
+}
+
 /// Une interruption matérielle, de vecteur `vecteur` (32 à 255), arrivée.
-/// `traiter(irq)` fait le travail du pilote de l'IRQ ISA ; puis la fin
+/// `traiter(source)` fait le travail de son pilote ; puis la fin
 /// d'interruption, en dernier (avant, le contrôleur pourrait renvoyer la
 /// même IRQ pendant qu'on la traite encore).
-pub fn gerer(vecteur: u8, traiter: impl FnOnce(u8)) {
+pub fn gerer(vecteur: u8, traiter: impl FnOnce(Source)) {
     let base_pic = pic::VECTEUR_BASE;
     match vecteur {
         v if (base_pic..base_pic + pic::NB_IRQ).contains(&v) => {
@@ -91,12 +105,16 @@ pub fn gerer(vecteur: u8, traiter: impl FnOnce(u8)) {
                 return;
             }
             if !APIC.load(Ordering::Relaxed) {
-                traiter(irq);
+                traiter(Source::Isa(irq));
             }
             pic::fin_interruption(irq);
         }
         v if APIC.load(Ordering::Relaxed) && (ioapic::VECTEUR_ISA..ioapic::VECTEUR_ISA + ioapic::NB_ISA).contains(&v) => {
-            traiter(v - ioapic::VECTEUR_ISA);
+            traiter(Source::Isa(v - ioapic::VECTEUR_ISA));
+            apic::fin_interruption();
+        }
+        apic::VECTEUR_TIMER if APIC.load(Ordering::Relaxed) => {
+            traiter(Source::TimerApic);
             apic::fin_interruption();
         }
         // Un fantôme de l'APIC : il n'est pas « en service », pas d'EOI

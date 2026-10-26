@@ -1,4 +1,6 @@
 [noyau] APIC local 0 a 0xfee00000 (xAPIC, version 0x14), IO-APIC 0 a 0xfec00000 (GSI 0-23) ; 8259 masque.
+[noyau] TSC non fiable (le processeur ne le dit pas constant) : l'heure au tic.
+[noyau] Horloge : PIT, 1000 Hz, vecteur 0x30.
 [linux] mmx-ecrit : mm0, mm7 et xmm0 remplis, arrondi x87 change.
 [linux] mmx-lit : registres x87, MMX et SSE a l'etat initial : ok.
 [noyau] mmx-lit : termine, code de sortie 0 ; memoire rendue : ok.

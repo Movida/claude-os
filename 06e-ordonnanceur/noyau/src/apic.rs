@@ -43,6 +43,8 @@ use crate::vmalloc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 /// Les vecteurs de l'APIC, ceux de Linux (arch/x86/include/asm/irq_vectors.h).
+/// Le timer (LOCAL_TIMER_VECTOR), les erreurs, les fantômes.
+pub const VECTEUR_TIMER: u8 = 0xEC;
 pub const VECTEUR_ERREUR: u8 = 0xFE;
 pub const VECTEUR_FANTOME: u8 = 0xFF;
 
@@ -59,6 +61,9 @@ const LVT_PERFORMANCE: usize = 0x340;
 const LVT_LINT0: usize = 0x350;
 const LVT_LINT1: usize = 0x360;
 const LVT_ERREUR: usize = 0x370;
+const TIMER_INITIAL: usize = 0x380;
+const TIMER_COURANT: usize = 0x390;
+const TIMER_DIVISEUR: usize = 0x3E0;
 
 /// Dans une entrée LVT : masquée.
 pub const MASQUEE: u32 = 1 << 16;
@@ -222,4 +227,33 @@ pub fn erreur() {
     let esr = lire(ESR);
     afficherln!("[noyau] erreur de l'APIC local (ESR {:#x})", esr);
     fin_interruption();
+}
+
+/// Le diviseur du timer : 16 (0b0011 dans le registre), celui de Linux
+/// (APIC_DIVISOR) : un décompte de 32 bits dure ainsi des secondes même
+/// sur un bus rapide, et une milliseconde en compte encore des dizaines
+/// de milliers.
+const DIVISEUR_16: u32 = 0b0011;
+/// Dans l'entrée LVT du timer : périodique (bit 17), sinon en un coup.
+const PERIODIQUE: u32 = 1 << 17;
+
+/// Fait décompter le timer depuis 2^32 - 1, masqué : le début d'un
+/// étalonnage (horloge.rs).
+pub fn armer_etalonnage() {
+    ecrire(TIMER_DIVISEUR, DIVISEUR_16);
+    ecrire(LVT_TIMER, MASQUEE | VECTEUR_TIMER as u32);
+    ecrire(TIMER_INITIAL, u32::MAX);
+}
+
+/// Le nombre de décomptes depuis `armer_etalonnage`.
+pub fn decomptes_etalonnage() -> u64 {
+    (u32::MAX - lire(TIMER_COURANT)) as u64
+}
+
+/// Démarre le timer en mode périodique : une interruption (vecteur 0xEC)
+/// tous les `decompte` décomptes.
+pub fn demarrer_timer(decompte: u32) {
+    ecrire(TIMER_DIVISEUR, DIVISEUR_16);
+    ecrire(LVT_TIMER, PERIODIQUE | VECTEUR_TIMER as u32);
+    ecrire(TIMER_INITIAL, decompte);
 }

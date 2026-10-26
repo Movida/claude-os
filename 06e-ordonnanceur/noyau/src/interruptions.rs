@@ -283,13 +283,13 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     let vecteur = cadre.vecteur as usize;
     let depuis_programme = cadre.cs & 3 == 3;
     if vecteur >= 32 {
-        irq::gerer(vecteur as u8, |irq| match irq {
-            horloge::IRQ => {
+        irq::gerer(vecteur as u8, |source| match source {
+            irq::Source::TimerApic | irq::Source::Isa(horloge::IRQ) => {
                 horloge::tic();
                 tache::tic();
             }
-            clavier::IRQ => clavier::interruption(),
-            _ => {}
+            irq::Source::Isa(clavier::IRQ) => clavier::interruption(),
+            irq::Source::Isa(_) => {}
         });
         // Le programme interrompu a-t-il atteint sa limite de temps de
         // calcul ? Seulement s'il était en anneau 3 : interrompu au milieu
