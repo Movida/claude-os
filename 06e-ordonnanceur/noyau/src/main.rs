@@ -22,6 +22,7 @@ extern crate alloc;
 mod console;
 mod acpi;
 mod aleatoire;
+mod apic;
 mod appel_systeme;
 mod appels_fichiers;
 mod cadres;
@@ -40,6 +41,8 @@ mod futex;
 mod gdt;
 mod horloge;
 mod interruptions;
+mod ioapic;
+mod irq;
 mod linux;
 mod memoire;
 mod pagination;
@@ -252,16 +255,33 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         deborder(0);
     }
 
-    // Les interruptions matérielles : d'abord le PIC (tout masqué), puis
-    // l'horloge qui démasque son IRQ, et seulement alors sti. Dans l'autre
-    // ordre, une IRQ pourrait arriver sur un vecteur d'exception.
-    pic::initialiser();
+    // Les interruptions matérielles : d'abord le contrôleur (l'APIC et
+    // l'IO-APIC, ou le 8259 ; tout masqué), puis l'horloge qui démasque son
+    // IRQ, et seulement alors sti. Dans l'autre ordre, une IRQ pourrait
+    // arriver sur un vecteur d'exception.
+    let bilan = irq::initialiser();
     horloge::initialiser();
     cpu::activer_interruptions();
-    afficherln!("[noyau] PIC remappe sur les vecteurs {}-{}, horloge a {} Hz.",
-                pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1, horloge::HZ);
-    // Le compte affiché vaut 100, parfois 101 : un tic peut tomber entre
-    // le réveil et la lecture du compteur.
+    match bilan {
+        irq::Bilan::Apic { apic, ioapic } => {
+            afficher!("[noyau] APIC local {} a {:#x} (xAPIC, version {:#x})", apic.id, apic.adresse, apic.version);
+            for (n, adresse, gsi, entrees) in ioapic.ioapics {
+                afficher!(", IO-APIC {} a {:#x} (GSI {}-{})", n, adresse, gsi, gsi + entrees - 1);
+            }
+            afficherln!(" ; 8259 masque.");
+            afficherln!("[noyau] Horloge (PIT) : IRQ {} sur le GSI {}, vecteur {:#x}, a {} Hz ; clavier : IRQ {}, GSI {}, vecteur {:#x}.",
+                        horloge::IRQ, ioapic::gsi(horloge::IRQ).unwrap_or(0), irq::vecteur(horloge::IRQ), horloge::HZ,
+                        clavier::IRQ, ioapic::gsi(clavier::IRQ).unwrap_or(0), irq::vecteur(clavier::IRQ));
+        }
+        irq::Bilan::Pic(raison) => afficherln!("[noyau] PIC 8259 ({}) remappe sur les vecteurs {}-{}, horloge a {} Hz.",
+                                               raison, pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1, horloge::HZ),
+        irq::Bilan::PicSansApic(e) => afficherln!("[noyau] PIC 8259 ({}) remappe sur les vecteurs {}-{}, horloge a {} Hz.",
+                                                  e, pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1, horloge::HZ),
+    }
+    // Le compte affiché est celui depuis le démarrage de l'horloge : 100,
+    // plus les tics passés à écrire les messages qui précèdent (sous QEMU,
+    // un ou deux par ligne, le port série étant un fichier), plus parfois
+    // un tic tombé entre le réveil et la lecture du compteur.
     horloge::attendre_ms(100);
     afficherln!("[noyau] 100 ms plus tard : {} tics comptes.", horloge::tics());
     match temps::initialiser() {

@@ -23,7 +23,7 @@
 //! dans la version expérimentale (nightly) du compilateur, et elle cache ce
 //! qui se passe.
 
-use crate::{clavier, faute_de_page, gdt, horloge, linux, pic, processus, tache};
+use crate::{clavier, faute_de_page, gdt, horloge, irq, linux, processus, tache};
 use crate::verrou::Verrou;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
@@ -74,11 +74,14 @@ impl Entree {
 
 static IDT: Verrou<[Entree; 256]> = Verrou::new([Entree::ABSENTE; 256]);
 
-/// Nombre de vecteurs pour lesquels on a écrit un talon : les 32
-/// exceptions, puis les 16 IRQ du PIC (vecteurs 32 à 47, voir pic.rs).
-/// Les autres entrées restent absentes : les déclencher provoquerait une
-/// protection générale, qu'on afficherait.
-const NB_TALONS: usize = 48;
+/// Nombre de vecteurs pour lesquels on a écrit un talon : tous, comme
+/// Linux (`irq_entries_start`). Les 32 exceptions, puis les interruptions
+/// des périphériques et de l'APIC (irq.rs) : le 8259 sur 0x20 à 0x2F, les
+/// IRQ ISA de l'IO-APIC sur 0x30 à 0x3F, les vecteurs propres à l'APIC tout
+/// en haut ; un vecteur que personne n'a demandé est dit, et acquitté.
+/// Leur niveau de privilège est 0 : un `int n` d'un programme (int 0x80
+/// compris) fait une faute de protection générale.
+const NB_TALONS: usize = 256;
 
 // Les talons, générés par une macro de l'assembleur pour chaque vecteur.
 // Les exceptions 8, 10-14, 17, 21, 29 et 30 empilent déjà un code
@@ -118,7 +121,7 @@ talon_\num:
     .section .text
     .altmacro
     .set i, 0
-    .rept 48
+    .rept 256
         TALON %i
         .set i, i + 1
     .endr
@@ -174,7 +177,7 @@ retour_interruption:
     .global adresses_talons
 adresses_talons:
     .set i, 0
-    .rept 48
+    .rept 256
         ADRESSE %i
         .set i, i + 1
     .endr
@@ -279,8 +282,15 @@ pub fn initialiser() {
 extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     let vecteur = cadre.vecteur as usize;
     let depuis_programme = cadre.cs & 3 == 3;
-    if vecteur >= pic::VECTEUR_BASE as usize {
-        gerer_irq((vecteur - pic::VECTEUR_BASE as usize) as u8);
+    if vecteur >= 32 {
+        irq::gerer(vecteur as u8, |irq| match irq {
+            horloge::IRQ => {
+                horloge::tic();
+                tache::tic();
+            }
+            clavier::IRQ => clavier::interruption(),
+            _ => {}
+        });
         // Le programme interrompu a-t-il atteint sa limite de temps de
         // calcul ? Seulement s'il était en anneau 3 : interrompu au milieu
         // d'un appel système, il sera arrêté à la fin de l'appel
@@ -343,28 +353,4 @@ pub fn exception_fatale(cadre: &Cadre) -> ! {
         }
     }
     panic!("exception {} non geree", vecteur);
-}
-
-/// Une interruption matérielle, venue du PIC. Les interruptions sont
-/// coupées pendant tout le traitement (porte d'interruption) : il doit être
-/// court. Linux découpe le travail en deux, une « moitié haute » minimale
-/// ici, et le reste plus tard, interruptions actives (softirq, workqueue) ;
-/// pour nous, tout tient dans la moitié haute.
-fn gerer_irq(irq: u8) {
-    if pic::est_fantome(irq) {
-        return;
-    }
-    match irq {
-        horloge::IRQ => {
-            horloge::tic();
-            tache::tic();
-        }
-        clavier::IRQ => clavier::interruption(),
-        _ => {}
-    }
-    // L'EOI en dernier : avant, le PIC pourrait nous renvoyer la même IRQ
-    // pendant qu'on la traite encore. (Les interruptions étant coupées, elle
-    // attendrait l'iretq ; mais l'habitude est la bonne pour le jour où on
-    // les réactivera pendant un traitement.)
-    pic::fin_interruption(irq);
 }

@@ -725,14 +725,20 @@ $(WAST2JSON):
 #     pour passer aussi par les chemins « si le processeur l'a » ; avec, en
 #     plus, les lignes propres à chacun (tests-attendu-qemu64.txt,
 #     tests-attendu-max.txt).
-#   test-garde et test-gros ne s'éteignent pas : QEMU est arrêté dès que
-#   la ligne cherchée est venue (`attendre`), au lieu d'attendre DUREE.
+#   - sans tables ACPI (-machine pc,acpi=off), le noyau ordinaire sur
+#     l'archive vide (vide.bin) : il doit revenir au 8259 et au PIT, le
+#     dire, et le clavier doit être prêt (depuis 6e) ;
+#   test-garde, test-gros et le démarrage sans ACPI ne s'éteignent pas :
+#   QEMU est arrêté dès que la ligne cherchée est venue (`attendre`), au
+#   lieu d'attendre DUREE.
 QEMU_TEST = qemu-system-x86_64 -display none -no-reboot
 QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
-tests-qemu: test-garde.bin test-gros.bin test-programmes.bin
+tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin
 	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile du noyau",:)
+	$(call attendre,$(QEMU_TEST) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"Clavier PS/2 pret",:)
+	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
 	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-gros.bin -serial file:test-gros.log,test-gros.log,"chaque secteur a sa place : ok",:)
 	for cpu in qemu64 max; do \
 	  $(QEMU_PROGRAMMES) -cpu $$cpu -serial file:test-programmes-$$cpu.log; code=$$?; \
@@ -778,6 +784,12 @@ test-programmes.bin: tests.cpio FORCE
 	cd noyau && cargo build --release --features test-programmes --target-dir target/test-programmes 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	$(call image,noyau/target/test-programmes/x86_64-unknown-none/release/noyau,tests.cpio,test-programmes)
 
+# Le noyau ordinaire sur l'archive vide : pour les scénarios qui ne
+# regardent que le démarrage (sans tables ACPI : le repli sur le 8259).
+vide.bin: vide.cpio FORCE
+	cd noyau && cargo build --release
+	$(call image,$(NOYAU_ELF),vide.cpio,vide)
+
 # Les noyaux de test-garde et test-gros n'ont besoin d'aucun programme :
 # une archive vide, un /etc/demarrage sans commande (celle de démarrage
 # porte claude, 307 Mo, que ces scénarios liraient sur IDE avec 128 Mio ;
@@ -790,7 +802,7 @@ test-%.bin: vide.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin test-*.bin programmes.cpio tests.cpio vide.cpio tests-demarrage.txt serial.log trace.log capture.log qemu.log ecran.png test-*.log
+	rm -f boot*.bin vide*.bin test-*.bin programmes.cpio tests.cpio vide.cpio tests-demarrage.txt serial.log trace.log capture.log qemu.log ecran.png test-*.log
 	rm -rf $(LINUX)
 	rm -rf $(GLIBC)
 	rm -rf $(SUITE)

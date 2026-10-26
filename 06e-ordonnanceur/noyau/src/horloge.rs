@@ -27,7 +27,6 @@
 //!     une optimisation d'énergie, à envisager bien plus tard.
 
 use crate::cpu;
-use crate::pic;
 use crate::port;
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -65,7 +64,7 @@ pub fn initialiser() {
         port::ecrire(PIT_CANAL0, DIVISEUR as u8);
         port::ecrire(PIT_CANAL0, (DIVISEUR >> 8) as u8);
     }
-    pic::demasquer(IRQ);
+    crate::irq::demasquer(IRQ);
 }
 
 /// Appelée à chaque IRQ 0, interruptions coupées.

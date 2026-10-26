@@ -27,7 +27,6 @@
 //! démarrage BIOS. Un vrai pilote USB (contrôleur xHCI) viendra bien plus
 //! tard.
 
-use crate::pic;
 use crate::port;
 use crate::verrou::Verrou;
 
@@ -120,7 +119,7 @@ pub fn initialiser() -> Result<(), ()> {
     ecrire_donnee(ccb)?;
     commande(0xAE)?; // Le clavier peut reparler.
 
-    pic::demasquer(IRQ);
+    crate::irq::demasquer(IRQ);
     Ok(())
 }
 

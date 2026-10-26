@@ -17,12 +17,10 @@
 //! sur les vecteurs 32 à 47, juste après les 32 réservés au processeur
 //! (le même choix que Linux, qui commence ses IRQ à 0x20).
 //!
-//! Option écartée pour l'instant : l'APIC (local APIC + I/O APIC), qui
-//! remplace le 8259 sur tous les PC depuis les années 2000 et qu'utilise
-//! Linux. Il faut le trouver dans les tables ACPI (MADT), et il ne sert
-//! vraiment qu'avec plusieurs processeurs. Le 8259 existe toujours, émulé
-//! par le chipset et par QEMU : c'est le bon premier pas, et Linux lui-même
-//! le programme puis le masque entièrement quand il passe à l'APIC.
+//! Depuis 6e, l'APIC local et l'IO-APIC (apic.rs, ioapic.rs) le remplacent
+//! quand les tables ACPI les décrivent, comme sous Linux, qui programme
+//! lui aussi le 8259 puis le masque entièrement. Il reste le contrôleur
+//! des machines sans ACPI (irq.rs).
 
 use crate::port;
 
@@ -99,6 +97,16 @@ pub fn initialiser() {
 /// sa ligne sur ce contrôleur.
 fn controleur(irq: u8) -> (u16, u8) {
     if irq < 8 { (MAITRE_DONNEES, irq) } else { (ESCLAVE_DONNEES, irq - 8) }
+}
+
+/// Masque toutes les IRQ, la cascade comprise : le 8259 ne livre plus
+/// rien (quand l'IO-APIC le remplace, irq.rs).
+pub fn masquer_tout() {
+    // SAFETY : les registres de masque des deux contrôleurs.
+    unsafe {
+        port::ecrire(MAITRE_DONNEES, 0xFF);
+        port::ecrire(ESCLAVE_DONNEES, 0xFF);
+    }
 }
 
 /// Laisse passer une IRQ.

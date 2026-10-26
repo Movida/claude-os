@@ -5,7 +5,8 @@
 [noyau] GDT, TSS et IDT du noyau en place ; syscall pret.
 [noyau] Exception 3 (point d'arret (int3)) a RIP=
 [noyau] Retour apres int3 : les exceptions sont gerees.
-[noyau] PIC remappe sur les vecteurs 32-47, horloge a 1000 Hz.
+[noyau] APIC local 0 a 0xfee00000 (xAPIC, version 0x14), IO-APIC 0 a 0xfec00000 (GSI 0-23) ; 8259 masque.
+[noyau] Horloge (PIT) : IRQ 0 sur le GSI 2, vecteur 0x30, a 1000 Hz ; clavier : IRQ 1, GSI 1, vecteur 0x31.
 [noyau] 100 ms plus tard : 
 [noyau] Heure (UTC) : 20
 [noyau] Clavier PS/2 pret : tapez du texte.
