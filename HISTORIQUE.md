@@ -238,7 +238,32 @@ Dossier `06c-dynamique/`, en cinq commits, d'après le plan écrit au début de 
 - la promesse « sous-ensemble strict de sh », fausse pour un mot réservé en tête (`if /bin/x`) : le chemin absolu exigé par la bibliothèque ;
 - des écarts avec Linux écrits en commentaire, des commentaires faux, `DUREE` portée à 12 s (14,6 s mesurées sur une machine saturée par les trois relectures, dont les délais fixes faisaient échouer `verifier-historique.sh` à tort).
 
-## 17. Reste à faire
+## 17. Sous-étape 6d réalisée : `claude --version`
+
+Dossier `06d-claude-version/`, en onze commits (et un d'outillage), d'après le plan écrit au début de son fil et relu par un relecteur indépendant (`plan-6d.md` et `relecture-6d.md` dans les fichiers du projet ; 16 constats intégrés avant de coder). **Décision de David :** son accord écrit pour télécharger et exécuter le vrai `claude` 2.1.310, ici et dans la CI. **Le jalon :** notre OS affiche « 2.1.310 (Claude Code) » sur le port série, `claude` sort avec 0 et rend toute sa mémoire ; du premier coup, sans un seul appel système inconnu.
+
+1. **RLIMIT_CPU remplace le budget de temps** : le temps de calcul compté tic par tic, comme Linux, infini par défaut ; la limite dure (SIGKILL), puis la courante (SIGXCPU, relevée d'une seconde), vérifiées après chaque tic compté.
+2. **Les signaux enregistrés** : `rt_sigaction`, `rt_sigprocmask`, `rt_sigpending`, `sigaltstack`, `kill`, `tkill`, `tgkill`, rendus comme Linux ; SIG_IGN, l'action par défaut et l'attente appliquées au retour vers l'anneau 3, ceux du fil avant ceux du processus. Un gestionnaire n'est pas encore appelé (6f). Un numéro par programme, à partir de 2.
+3. **futex, uname, sched_getaffinity, prctl**, exacts pour un seul fil.
+4. **Les points de montage** (choix de conception) : /proc et /sys sont de vrais systèmes de fichiers, montés sur des dossiers du tmpfs, comme le `vfsmount` de Linux ; un objet est un couple (système, inode), la résolution parcourt une vue de tous les systèmes (chemins.rs n'a pas changé d'une ligne).
+5. **eventfd et epoll** : la boucle d'événements de Bun, créée mais pas encore attendue (`epoll_wait` en 6f) ; l'inode anonyme.
+6. **Le chemin canonique des fichiers ouverts**, celui que montre maps.
+7. **/proc** : `fichiers::noyaufs`, un système de fichiers dont le noyau décrit l'arborescence et fabrique le contenu à la lecture (`seq_file`) ; `/proc/self`, `/proc/<pid>/maps`, `statm`, `exe`, `/proc/sys/vm`.
+8. **/sys** : le nombre de processeurs et le réglage des grandes pages, en attributs de kernfs.
+9. **La machine de l'étape** : un disque virtio (le BIOS de QEMU lit les 307 Mo de l'archive en 3,8 s, contre 74 s en IDE, avec le même chargeur), un processeur Nehalem, 2 Gio, que `verifier.sh` demande à l'étape ; les images ne recopient plus leur archive ; `make tests-qemu` arrête QEMU dès la ligne cherchée (30 s au lieu de 88).
+10. **Le binaire de claude, téléchargé et vérifié** (choix de conception) : le paquet npm officiel de la plateforme, à une version figée, l'empreinte SHA-256 du binaire vérifiée, gardé dans `~/.cache/claude-os`, jamais commité ni publié.
+11. **`claude --version`**, en dernier dans `/etc/demarrage` ; `make trace` montre ses appels dans notre noyau, et leurs seuls noms sous Linux (sans environnement ni HOME : jamais une trace qui pourrait contenir un jeton).
+
+**Relecture de fond :** trois relecteurs indépendants (le noyau, les bibliothèques, la construction et l'historique), chaque constat mesuré par une sonde C sur l'hôte (Linux 6.18) et dans notre noyau ; leurs notes, perdues avec la reconstruction du conteneur, ont été retrouvées dans les journaux de la session. Aucun défaut grave : ni réentrance de verrou, ni verrou tenu pendant un arrêt, ni fuite de mémoire. 41 constats, repliés dans leurs commits, chacun avec un test qui échouait avant :
+- **un défaut latent pour 6k** : un fichier de /proc gardé ouvert après la fin de son processus aurait fait paniquer le noyau, ou désigné en silence le fichier d'un autre processus (les numéros d'inode étaient repris) ; ils ne le sont plus, et un objet disparu répond ENOENT ;
+- **deux tests qui ne prouvaient rien** : rien ne vérifiait QUAND RLIMIT_CPU tombe (une limite comptée deux fois trop tard passait), et une ligne de `signaux.c` disait « ok » quoi qu'il arrive ; et un test de `statm` qui aurait échoué sur le noyau 6.8 de la CI (ses compteurs approchés) ;
+- une trentaine d'écarts avec Linux, mesurés : `O_NOFOLLOW`, `O_TRUNC`, `O_CREAT` dans /proc, la barre finale et les drapeaux de `renameat2` dans un système monté, `fsync` (EINVAL pour ce qui n'en a pas), `readv` d'un eventfd, la profondeur d'epoll, FUTEX_WAKE_OP, l'ordre des signaux, `sigaltstack`, `lseek` des décalages négatifs, FIONREAD, les attributs de l'inode anonyme (EOPNOTSUPP) et du dossier d'un processus (immuable), la taille des liens et les liens des dossiers de /proc/sys, et les lectures de /proc, désormais par pages de lignes entières comme le `seq_file` de Linux ;
+- la construction : le binaire du cache revérifié à chaque archive, un téléchargement qui ne laisse rien derrière lui, `make capture` qui photographiait le chargeur, `make trace` muet quand strace manque ;
+- un défaut hérité de l'étape 3, apparu quand le noyau a grandi : l'allocateur de cadres ne reprenait un cadre rendu qu'après un tour de la mémoire (il le reprend d'abord, encore chaud dans le cache).
+
+Et le dernier commit de l'étape, trop gros, coupé en trois : la machine, le binaire, le jalon.
+
+## 18. Reste à faire
 
 **Dans le noyau**
 
@@ -250,7 +275,7 @@ Dossier `06c-dynamique/`, en cinq commits, d'après le plan écrit au début de 
 - **Pages globales** (CR4.PGE) pour le noyau, maintenant qu'il y a un espace d'adressage par programme ; KPTI et PCID : en 6m.
 - **Copie de la moitié haute des espaces d'adressage** : elle suppose que la PML4 du noyau ne change plus. Avec `vmalloc`, créer d'avance toutes les tables de second niveau de la moitié haute (`preallocate_vmalloc_pages` de Linux).
 - **`iretq` qui fauterait** (un RIP non canonique écrit par le noyau, pour exec ou les signaux) : une entrée de la table d'exceptions qui transforme la faute en signal pour le programme (`bad_iret` de Linux). Inatteignable aujourd'hui : le RIP d'un cadre vient toujours du programme.
-- **Budget de temps au compteur de cycles** : compté en tics d'horloge, il se laisse un peu tromper sous QEMU sans accélération (tics perdus dans de courtes sections critiques). Avec une horloge fine (TSC, HPET), mesurer le temps réel.
+- **Temps de calcul au compteur de cycles** : compté en tics d'horloge (RLIMIT_CPU, CLOCK_PROCESS_CPUTIME_ID), il se laisse un peu tromper sous QEMU sans accélération (tics perdus dans de courtes sections critiques). Avec une horloge fine (TSC, HPET), mesurer le temps réel.
 - **La carte des zones et la réserve** : la carte d'un programme vient du tas du noyau, qui peut puiser dans la réserve (3 Mio au plus, 5 le temps de l'agrandir) ; Linux prend ses `vm_area_struct` au-dessus du seuil. Avec les allocations faillibles.
 - **Le verrou du processus coupe les interruptions** : un munmap ou la fin d'un programme qui a touché des centaines de Mio rend ses cadres d'un trait, et des tics d'horloge se perdent. Avec l'ordonnanceur, un verrou qui dort (le `mmap_lock` de Linux).
 - **MAP_SHARED d'un fichier** reste refusé : il faudra écrire les pages dans le fichier, et les retrouver dans chaque processus qui le projette (la carte inverse `i_mmap`, avec l'ordonnanceur, 6e). Pour la même raison, raccourcir un fichier ne retire ses pages que des projections du processus en cours.
@@ -263,19 +288,22 @@ Dossier `06c-dynamique/`, en cinq commits, d'après le plan écrit au début de 
 - **Écarts voulus avec Linux**, écrits en commentaire : un interpréteur passe par toutes les vérifications du programme (Linux ne vérifie son genre et ses segments qu'après le point de non-retour, et tue le processus), et un interpréteur qui chevauche le programme est refusé (Linux le pose par-dessus) ; un ET_DYN dont un `p_vaddr` relatif dépasse TASK_SIZE est accepté si l'image posée est permise ; mprotect sur une plage avec un trou ne change rien (Linux change ce qui précède le trou) ; MAP_FIXED est refusé à une zone du maximum même quand les fusions l'auraient fait tenir ; une zone rendue inscriptible deux fois est recomptée (pas de VM_ACCOUNT).
 - **Archive cpio** : archives concaténées et compressées.
 - **La console écrit au plus 1024 octets par appel**, et ld-linux ne reprend pas une écriture courte (`ld.so --help` est coupé ; stdio et Bun reprennent). Linux n'écrit jamais court sur un terminal, mais il peut attendre et être interrompu ; notre port série fait attendre activement : le terminal à interruptions et sa file (6j).
-- **Le lanceur `/etc/demarrage`** cède la place à un vrai `/init` et à un shell avec `fork` et `execve` (6k) ; son dossier courant est `/`, que l'utilisateur 1000 ne peut pas écrire (à revoir pour `claude`, 6i). Un budget de temps par ligne (RLIMIT_CPU) viendra avec 6d.
+- **Le lanceur `/etc/demarrage`** cède la place à un vrai `/init` et à un shell avec `fork` et `execve` (6k) ; son dossier courant est `/`, que l'utilisateur 1000 ne peut pas écrire (à revoir pour `claude`, 6i). Une limite de temps : le programme la pose (setrlimit), et le shell aura `ulimit -t` (6k).
 - **Le vecteur auxiliaire** n'a pas AT_SYSINFO_EHDR (le vDSO, 6m), AT_MINSIGSTKSZ (6f), AT_RSEQ_* ; `rseq` rend ENOSYS : la glibc a un repli pour chacun.
 - **Tas :** des listes par processeur pour le multiprocesseur.
+- **Les signaux** (6d) sont enregistrés, pas encore livrés à un gestionnaire (le cadre de signal, `rt_sigreturn`, SA_RESTART : 6f) ; les signaux temps réel n'ont pas encore de file ; le pid 1 n'a pas le statut à part de Linux. Une attente que rien ne finira (un futex sans délai, un eventfd vide lu en bloquant) arrête le programme ; `epoll_wait` rend ENOSYS (6e, 6f).
+- **/proc et /sys** (6d) : un fichier d'un processus terminé se lit vide (Linux rend ESRCH) ; root ne peut pas changer les droits de la racine de /proc ni d'un nœud de sysfs (Linux le permet) ; un numéro d'inode de /proc n'est jamais repris, ENOSPC après quatre milliards d'entrées.
+- **`mknodat`** (259) est encore un appel inconnu (avec le shell, 6k) ; FIONREAD sur /dev/urandom rend ENOTTY (Linux : EINVAL).
 
 **Pour le vrai matériel**
 
 - **NMI pendant le passage éclair en mode protégé du chargeur** : non masqué (Linux le masque par le port 0x70 pour son passage définitif). Risque infime, à revoir si un essai sur vrai matériel le montre.
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 18. Questions ouvertes
+## 19. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 19. Prochaine étape
+## 20. Prochaine étape
 
-Sous-étape 6d : `claude --version`. Le binaire (jamais dans le dépôt, « All rights reserved ») dans l'archive, 291 Mo lus par le chargeur, `-cpu Nehalem`, `-m 2G` ; `/proc/self/maps`, `statm`, `cgroup`, `/sys/devices/system/cpu/online` ; `rt_sigaction`, `epoll`, `eventfd`, `uname`... ; RLIMIT_CPU infini par défaut, et le budget de temps par ligne de `/etc/demarrage`. **Il faudra l'accord écrit de David** pour qu'une session télécharge et exécute `claude`. Son plan sera écrit et relu au début de son fil, avec ce que 6c a appris.
+Sous-étape 6e : l'ordonnanceur, l'APIC et l'IO-APIC, les fils (`clone3`, `futex` qui attend vraiment). Son plan sera écrit et relu au début de son fil, avec ce que 6d a appris (`etape-06/plan.md` dans les fichiers du projet pour le découpage).
