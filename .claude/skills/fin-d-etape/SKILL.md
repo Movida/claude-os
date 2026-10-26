@@ -307,3 +307,39 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   sauvegarde), et finir à la main les morceaux refusés. Construire et
   tester chaque état résolu ; l'arbre final doit être celui de la
   sauvegarde (`git diff sauvegarde HEAD` vide).
+
+## Pièges rencontrés en 6d (26 octobre 2026)
+
+- **Les notes de relecture ont disparu avec la reconstruction du
+  devcontainer** : `~/.cache` et `/tmp` sont effacés, `~/.claude/projects/`
+  survit. Y garder les notes de travail
+  (`~/.claude/projects/-workspaces-claude-os/relecture-NN/`). Si elles sont
+  perdues, les rapports des relecteurs sont dans les journaux de la
+  session : `~/.claude/projects/-workspaces-claude-os/<session>/subagents/*.jsonl`
+  (l'outil `SubagentHandback` porte le rapport final, les `Write` et les
+  `cat >>` les notes au fil de l'eau).
+- **Un test du démarrage qui dépend de la disposition de la mémoire** :
+  « rendu puis redonne : ECHEC » est apparu sans toucher à l'allocateur,
+  parce que le noyau avait grandi et que trois cadres tombaient à cheval
+  sur deux mots de la carte de bits. Chercher la cause avant d'accuser la
+  dernière modification.
+- **Une correction pour du code introduit avant d'être observable** (Vue::refus
+  en 8952269, quand rien n'était encore monté) doit être écrite pour l'API
+  de ce commit-là (refus rendait `Erreur`, pas `Result`). Avec beaucoup de
+  fichiers communs, un rebase en `edit` sur chaque commit est plus sûr que
+  des fixups : pour un fichier qu'aucun commit suivant ne touche, prendre
+  sa version finale (`git checkout corrections -- fichier`) ; sinon,
+  appliquer à la main la part de la correction, construire et tester
+  avant de continuer. Garder l'état final sur une branche, et comparer
+  l'arbre à la fin.
+- **errno se lit tout de suite** : `int r = erreur(syscall(...))` ; plusieurs
+  appels puis `erreur(r1) && erreur(r2)` lisent tous le dernier errno.
+- **Le conteneur fausse certaines mesures** : `/proc/sys` y est un montage à
+  part (un rename dedans rend EXDEV) et `/sys` est en lecture seule ; ne pas
+  en faire des lignes de test qui tournent aussi sur l'hôte.
+- **Une borne de temps mesurée des deux côtés** : sous Linux, RLIMIT_CPU
+  tombe à 0,96 s de CLOCK_PROCESS_CPUTIME_ID, pas après 1 s ; une borne
+  écrite d'après la théorie (1,0 à 1,1 s) échouait sur l'hôte.
+- **Attendre une ligne plutôt qu'un délai fixe** pour un QEMU qui ne
+  s'éteint pas (`attendre` dans le Makefile de 6d) : plus rapide sur une
+  machine tranquille, et plus sûr sur une machine chargée.
