@@ -226,8 +226,11 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         EPOLL_WAIT | EPOLL_PWAIT | EPOLL_PWAIT2 => evenements::epoll_wait(),
         UNAME => uname(a[0]),
         SCHED_GETAFFINITY => sched_getaffinity(a[0], a[1], a[2]),
-        // Céder le processeur : il n'y a personne d'autre à qui le donner.
-        SCHED_YIELD => 0,
+        // Céder le processeur (ordonnanceur.rs).
+        SCHED_YIELD => {
+            crate::ordonnanceur::ceder();
+            0
+        }
         PRCTL => prctl(a[0], a[1]),
         RT_SIGACTION => signaux::rt_sigaction(a[0], a[1], a[2], a[3]),
         RT_SIGPROCMASK => signaux::rt_sigprocmask(a[0], a[1], a[2], a[3]),

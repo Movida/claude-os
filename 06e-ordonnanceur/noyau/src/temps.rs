@@ -95,14 +95,9 @@ static CMOS: Verrou<()> = Verrou::new(());
 static DATE_LUE: AtomicI64 = AtomicI64::new(0);
 static INSTANT_DE_LECTURE: AtomicU64 = AtomicU64::new(0);
 
-/// La durée de `tics` tics, en nanosecondes (horloge.rs).
-pub fn nanosecondes(tics: u64) -> u64 {
-    horloge::nanosecondes(tics)
-}
-
 /// Le temps depuis le démarrage, en nanosecondes : le TSC s'il est fiable,
 /// les tics sinon.
-fn ns_monotone() -> u64 {
+pub fn ns_monotone() -> u64 {
     crate::tsc::nanosecondes().unwrap_or_else(|| horloge::nanosecondes(horloge::tics()))
 }
 
@@ -112,10 +107,10 @@ fn duree_tic() -> u64 {
 }
 
 /// La finesse de l'horloge `horloge` (clock_getres) : 1 ns pour les
-/// horloges fines quand le TSC sert, la durée d'un tic sinon, et pour les
-/// _COARSE et le temps de calcul (compté en tics jusqu'à l'ordonnanceur).
+/// horloges fines et le temps de calcul (compté au TSC, ordonnanceur.rs)
+/// quand le TSC sert, la durée d'un tic sinon, et pour les _COARSE.
 pub fn resolution(h: u64) -> Temps {
-    let fine = matches!(h, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME | CLOCK_TAI);
+    let fine = !matches!(h, CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE);
     let ns = if fine && crate::tsc::khz().is_some() { 1 } else { duree_tic() };
     Temps { secondes: 0, nanosecondes: ns as u32 }
 }
@@ -230,9 +225,9 @@ fn grossier(ns: u64) -> u64 {
     ns - ns % duree_tic()
 }
 
-/// Le temps de calcul du programme en cours.
+/// Le temps de calcul de la tâche en cours.
 pub fn temps_du_programme() -> Temps {
-    depuis_nanosecondes(nanosecondes(tache::tics_du_programme()))
+    depuis_nanosecondes(tache::temps_de_calcul())
 }
 
 // Les horloges de Linux (include/uapi/linux/time.h).

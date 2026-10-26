@@ -44,9 +44,9 @@
 //! à son point d'entrée, tous registres à zéro, sur sa pile. Pour une
 //! tâche du noyau, `depart_noyau` appelle sa fonction, rangée dans r12.
 //!
-//! En attendant l'ordonnanceur (commit suivant), init passe la main à
-//! chaque programme et la reprend quand il se termine : un programme à la
-//! fois, comme avant, mais chacun dans sa tâche.
+//! Les tâches prêtes se partagent le processeur (ordonnanceur.rs) ; une
+//! tâche qui en a créé d'autres (init, qui lance les programmes) dort
+//! jusqu'à ce que l'une d'elles finisse (`attendre`).
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -54,14 +54,14 @@ use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64, Ordering};
 
 use crate::interruptions::Cadre;
 use crate::linux::{self, Signal};
 use crate::programmes::NomCourt;
 use crate::verrou::Verrou;
 use crate::vmalloc::Pile;
-use crate::{cpu, gdt, pagination, processus, signaux, temps};
+use crate::{cpu, gdt, ordonnanceur, pagination, processus, signaux};
 
 global_asm!(
     r#"
@@ -169,13 +169,20 @@ pub struct Tache {
     morte: AtomicBool,
     /// Son code de sortie, posé par `terminer`.
     code_sortie: AtomicI32,
-    /// Ses tics de calcul : un de plus à chaque tic d'horloge qui la trouve
-    /// en train de s'exécuter, en anneau 3 ou dans le noyau pour elle
-    /// (`tic`). C'est le `account_process_tick` de Linux. Atomique : le
-    /// gestionnaire d'horloge le compte sans prendre de verrou.
+    /// Son temps de calcul, en nanosecondes : compté par l'ordonnanceur à
+    /// chaque tic et à chaque bascule, d'après le temps monotone (le TSC
+    /// quand il est fiable : le `sum_exec_runtime` de Linux), en anneau 3
+    /// ou dans le noyau pour elle. Atomique : le gestionnaire d'horloge le
+    /// compte sans prendre de verrou.
     calcul: AtomicU64,
-    /// Elle dort, dans un appel système (un futex qui attend son délai) :
-    /// ce temps-là n'est pas du calcul.
+    /// Son retard (positif) ou son avance (négative) sur la moyenne des
+    /// temps virtuels quand elle a quitté la file des prêtes (ordonnanceur.rs),
+    /// retrouvé à son réveil.
+    lag: AtomicI64,
+    /// La tâche qui attend sa fin (`attendre`), réveillée par `terminer`.
+    attendant: Verrou<Option<Arc<Tache>>>,
+    /// Elle attend dans `dormir_jusqu_a`, processeur arrêté (hlt) : ce
+    /// temps-là n'est pas du calcul.
     dort: AtomicBool,
     /// Un tic a été compté depuis la dernière vérification de RLIMIT_CPU.
     temps_a_verifier: AtomicBool,
@@ -225,6 +232,8 @@ impl Tache {
             morte: AtomicBool::new(false),
             code_sortie: AtomicI32::new(0),
             calcul: AtomicU64::new(0),
+            lag: AtomicI64::new(0),
+            attendant: Verrou::new(None),
             dort: AtomicBool::new(false),
             temps_a_verifier: AtomicBool::new(false),
             a_tuer: AtomicBool::new(false),
@@ -259,6 +268,28 @@ impl Tache {
     pub fn nom(&self) -> NomCourt {
         *self.nom.verrouiller()
     }
+
+    /// Ajoute `ns` nanosecondes à son temps de calcul (ordonnanceur.rs) ; un
+    /// programme verra sa limite de temps de calcul vérifiée à son retour
+    /// vers l'anneau 3.
+    pub fn compter_calcul(&self, ns: u64) {
+        if ns == 0 || self.dort.load(Ordering::Relaxed) {
+            return;
+        }
+        self.calcul.fetch_add(ns, Ordering::Relaxed);
+        if self.programme.is_some() {
+            self.temps_a_verifier.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Son retard en quittant la file des prêtes (ordonnanceur.rs).
+    pub fn lag(&self) -> i64 {
+        self.lag.load(Ordering::Relaxed)
+    }
+
+    pub fn garder_lag(&self, lag: i64) {
+        self.lag.store(lag, Ordering::Relaxed);
+    }
 }
 
 /// La tâche courante, et celle qui l'a précédée (pour la fin de bascule).
@@ -280,6 +311,8 @@ pub fn initialiser() {
         morte: AtomicBool::new(false),
         code_sortie: AtomicI32::new(0),
         calcul: AtomicU64::new(0),
+        lag: AtomicI64::new(0),
+        attendant: Verrou::new(None),
         dort: AtomicBool::new(false),
         temps_a_verifier: AtomicBool::new(false),
         a_tuer: AtomicBool::new(false),
@@ -299,10 +332,28 @@ pub fn courante() -> &'static Tache {
     unsafe { &*COURANTE.load(Ordering::Relaxed) }
 }
 
-/// Passe le processeur de la tâche courante à `nouvelle` (voir l'en-tête).
-/// Revient quand une autre tâche rend la main à la courante. Interruptions
-/// coupées pendant la bascule ; leur état est rétabli au retour.
-fn basculer_vers(nouvelle: &Tache) {
+/// Un Arc de la tâche courante (pour la mettre dans une file).
+pub fn courante_arc() -> Arc<Tache> {
+    let p = COURANTE.load(Ordering::Relaxed);
+    // SAFETY : toute tâche vient d'un Arc (Arc::new, ou Arc::into_raw pour
+    // l'inactive), toujours tenu tant qu'elle s'exécute (voir `courante`) :
+    // en prendre un de plus est permis.
+    unsafe {
+        Arc::increment_strong_count(p);
+        Arc::from_raw(p)
+    }
+}
+
+/// La tâche inactive.
+pub fn inactive() -> *const Tache {
+    INACTIVE.load(Ordering::Relaxed)
+}
+
+/// Passe le processeur de la tâche courante à `nouvelle` (voir l'en-tête),
+/// pour l'ordonnanceur. Revient quand une autre tâche rend la main à la
+/// courante. Interruptions coupées pendant la bascule ; leur état est
+/// rétabli au retour.
+pub fn basculer_vers(nouvelle: &Tache) {
     let interruptions = cpu::couper_interruptions();
     let ancienne = courante();
     // SAFETY : interruptions coupées, sur notre seul processeur : personne
@@ -360,16 +411,26 @@ extern "C" fn fin_de_bascule() {
     }
 }
 
-/// La tâche qui a lancé la tâche courante, et à qui elle rend la main en
-/// se terminant (en attendant l'ordonnanceur).
-static LANCEUSE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
+/// Rend `t` prête, et attend sa fin : son code de sortie.
+fn faire_tourner(t: Arc<Tache>) -> i32 {
+    ordonnanceur::rendre_prete(t.clone(), true);
+    attendre(&t)
+}
 
-/// Fait tourner `t` jusqu'à sa fin, puis revient (en attendant
-/// l'ordonnanceur, une tâche à la fois après celle qui la lance).
-fn faire_tourner(t: &Arc<Tache>) -> i32 {
-    let lanceuse = LANCEUSE.swap(courante() as *const Tache as *mut Tache, Ordering::Relaxed);
-    basculer_vers(t);
-    LANCEUSE.store(lanceuse, Ordering::Relaxed);
+/// Attend la fin de la tâche `t` : la tâche courante dort jusqu'à ce que
+/// `terminer` la réveille. Sans réveil perdu : la fin est vérifiée, et
+/// l'attente inscrite, interruptions coupées, comme la fin elle-même ; sur
+/// un seul processeur, rien ne peut se glisser entre les deux.
+pub fn attendre(t: &Tache) -> i32 {
+    let interruptions = cpu::couper_interruptions();
+    while !t.morte.load(Ordering::Relaxed) {
+        *t.attendant.verrouiller() = Some(courante_arc());
+        ordonnanceur::retirer_courante();
+        ordonnanceur::ordonnancer();
+    }
+    if interruptions {
+        cpu::activer_interruptions();
+    }
     t.code_sortie.load(Ordering::Relaxed)
 }
 
@@ -393,21 +454,33 @@ pub fn executer(nom: NomCourt, pml4: u64, entree: u64, pile: u64) -> Option<i32>
         rsp: pile,
         ss: gdt::DONNEES_UTILISATEUR as u64,
     }));
-    Some(faire_tourner(&t))
+    Some(faire_tourner(t))
 }
 
 /// La fonction d'une tâche du noyau.
 type FonctionNoyau = Box<dyn FnOnce() + Send>;
 
-/// Exécute `f` dans une tâche du noyau nommée `nom`, et revient quand elle
-/// a fini ; false : pas de pile pour la tâche.
-pub fn executer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> bool {
-    let Some(t) = Tache::creer(nom, pagination::pml4_noyau(), false) else { return false };
+/// Lance `f` dans une tâche du noyau nommée `nom`, prête aussitôt ; None :
+/// pas de pile pour la tâche.
+pub fn lancer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> Option<Arc<Tache>> {
+    let t = Tache::creer(nom, pagination::pml4_noyau(), false)?;
     // Un pointeur simple vers la fermeture, pour r12 : une boîte de boîte.
     let f: Box<FonctionNoyau> = Box::new(Box::new(f));
     t.preparer(depart_noyau, Box::into_raw(f) as u64, None);
-    faire_tourner(&t);
-    true
+    ordonnanceur::rendre_prete(t.clone(), true);
+    Some(t)
+}
+
+/// Exécute `f` dans une tâche du noyau nommée `nom`, et revient quand elle
+/// a fini ; false : pas de pile pour la tâche.
+pub fn executer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> bool {
+    match lancer_noyau(nom, f) {
+        Some(t) => {
+            attendre(&t);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Le corps d'une tâche du noyau (depart_noyau) : sa fonction, puis sa fin.
@@ -420,8 +493,9 @@ extern "C" fn tache_noyau(f: *mut FonctionNoyau) -> ! {
     terminer(0)
 }
 
-/// Termine la tâche courante : elle est morte, et rend la main à celle qui
-/// l'a lancée, qui rendra sa pile (fin de bascule). Appelée en haut de sa
+/// Termine la tâche courante : elle est morte, réveille qui attend sa fin,
+/// quitte la file des prêtes et cède le processeur pour toujours ; la
+/// tâche suivante rendra sa pile (fin de bascule). Appelée en haut de sa
 /// pile (retour vers l'anneau 3, ou fin de sa fonction) : rien de ce que
 /// tiennent les cadres en dessous n'est perdu.
 pub fn terminer(code: i32) -> ! {
@@ -429,10 +503,11 @@ pub fn terminer(code: i32) -> ! {
     t.code_sortie.store(code, Ordering::Relaxed);
     cpu::couper_interruptions();
     t.morte.store(true, Ordering::Relaxed);
-    // SAFETY : LANCEUSE est la tâche qui attend dans `faire_tourner`, en
-    // vie (elle tient l'Arc de celle-ci).
-    let lanceuse = unsafe { &*LANCEUSE.load(Ordering::Relaxed) };
-    basculer_vers(lanceuse);
+    if let Some(attendant) = t.attendant.verrouiller().take() {
+        ordonnanceur::rendre_prete(attendant, false);
+    }
+    ordonnanceur::retirer_courante();
+    ordonnanceur::ordonnancer();
     unreachable!("une tache morte a repris la main");
 }
 
@@ -540,25 +615,19 @@ pub fn renommer(nom: NomCourt) {
     *courante().nom.verrouiller() = nom;
 }
 
-/// Appelée à chaque tic d'horloge, interruptions coupées : la tâche
-/// courante, si c'est un programme qui ne dort pas, a calculé un tic de
-/// plus, et sa limite de temps de calcul sera vérifiée à son retour vers
-/// l'anneau 3.
+/// Appelée à chaque tic d'horloge, interruptions coupées : l'ordonnanceur
+/// compte le temps de calcul de la tâche courante, et lui fait céder le
+/// processeur si elle a fini sa tranche.
 pub fn tic() {
-    let t = courante();
-    if t.programme.is_some() && !t.dort.load(Ordering::Relaxed) {
-        t.calcul.fetch_add(1, Ordering::Relaxed);
-        t.temps_a_verifier.store(true, Ordering::Relaxed);
-    }
+    ordonnanceur::tic();
 }
 
-/// La tâche courante dort, dans un appel système, jusqu'à ce que `fini` le
-/// dise (vérifié à chaque interruption) : `sti ; hlt` entre deux, et ce
-/// temps ne compte pas dans son temps de calcul. Sans ordonnanceur (le
-/// commit suivant), le processeur n'a rien d'autre à faire : il attend.
+/// La tâche courante attend, dans un appel système, jusqu'à ce que `fini`
+/// le dise (vérifié à chaque interruption, et à chaque fois qu'elle
+/// retrouve le processeur). En attendant les files d'attente et les
+/// minuteries (commit suivant) : si une autre tâche est prête, elle lui
+/// cède le processeur ; sinon `sti ; hlt`.
 pub fn dormir_jusqu_a(fini: impl Fn() -> bool) {
-    let t = courante();
-    t.dort.store(true, Ordering::Relaxed);
     loop {
         // Vérifier interruptions coupées, puis dormir : voir pourquoi dans
         // cpu::attendre_interruption.
@@ -566,16 +635,26 @@ pub fn dormir_jusqu_a(fini: impl Fn() -> bool) {
         if fini() {
             break;
         }
-        cpu::attendre_interruption();
+        if ordonnanceur::autres_pretes() {
+            cpu::activer_interruptions();
+            ordonnanceur::ceder();
+        } else {
+            let t = courante();
+            t.dort.store(true, Ordering::Relaxed);
+            cpu::attendre_interruption();
+            cpu::couper_interruptions();
+            // Le temps arrêté n'est pas compté : l'ordonnanceur repart d'ici.
+            ordonnanceur::oublier_temps();
+            t.dort.store(false, Ordering::Relaxed);
+        }
     }
-    t.dort.store(false, Ordering::Relaxed);
     // Un appel système s'exécute interruptions actives.
     cpu::activer_interruptions();
 }
 
-/// Le temps de calcul de la tâche courante, en tics
+/// Le temps de calcul de la tâche courante, en nanosecondes
 /// (CLOCK_PROCESS_CPUTIME_ID, temps.rs).
-pub fn tics_du_programme() -> u64 {
+pub fn temps_de_calcul() -> u64 {
     courante().calcul.load(Ordering::Relaxed)
 }
 
@@ -595,6 +674,7 @@ pub fn tuer_au_retour() {
 /// se termine normalement : rien de ce qu'il tenait n'est abandonné.
 ///
 /// Dans l'ordre :
+///   0. céder le processeur, si la tâche a fini sa tranche ;
 ///   1. une fin prévue : exit (son code), ou un signal forcé (son message) ;
 ///   2. tué faute de mémoire pendant une copie du noyau ;
 ///   3. RLIMIT_CPU, dans l'ordre de Linux (voir plus bas) ;
@@ -605,9 +685,9 @@ pub fn tuer_au_retour() {
 /// arriver entre la dernière vérification et le retour (sysretq ou iretq
 /// rétablissent les interruptions du programme) ; un signal envoyé par une
 /// interruption tombée avant est vu, un autre après attend l'entrée
-/// suivante. Linux boucle ainsi jusqu'à ce qu'il n'y ait plus rien à faire ;
-/// toutes nos décisions arrêtent le programme, la boucle n'a encore qu'un
-/// tour (6e ajoutera « céder le processeur », 6f les gestionnaires).
+/// suivante. Linux boucle ainsi jusqu'à ce qu'il n'y ait plus rien à faire :
+/// céder le processeur si l'ordonnanceur le demande, puis tout revérifier
+/// (6f y ajoutera les gestionnaires de signaux).
 ///
 /// La limite de temps de calcul est RLIMIT_CPU, en secondes, celle de
 /// Linux. Comme lui, elle n'est vérifiée qu'après un tic compté (Linux le
@@ -635,8 +715,19 @@ pub fn tuer_au_retour() {
 ///     fait pas à l'exec ; un programme qui veut une limite la pose
 ///     (setrlimit), et le shell de 6k aura `ulimit -t`.
 pub fn verifier_au_retour() {
-    cpu::couper_interruptions();
-    let Some(arret) = decider() else { return };
+    let arret = loop {
+        cpu::couper_interruptions();
+        // Céder le processeur d'abord, s'il le faut : on revient ici quand
+        // la tâche le retrouve, et tout est revérifié.
+        if ordonnanceur::besoin_de_ceder() {
+            ordonnanceur::ordonnancer();
+            continue;
+        }
+        match decider() {
+            Some(arret) => break arret,
+            None => return,
+        }
+    };
     // Le verrou du processus est rendu, les interruptions reviennent :
     // mourir prend du temps (rendre la mémoire).
     cpu::activer_interruptions();
@@ -671,7 +762,7 @@ fn decider() -> Option<Arret> {
     if t.a_tuer.load(Ordering::Relaxed) {
         return Some(Arret::PlusDeMemoire);
     }
-    let calcul = temps::nanosecondes(t.calcul.load(Ordering::Relaxed));
+    let calcul = t.calcul.load(Ordering::Relaxed);
     let verifier_temps = t.temps_a_verifier.swap(false, Ordering::Relaxed);
     processus::essayer_avec(|p| {
         let (courante, dure) = p.limite(processus::RLIMIT_CPU);

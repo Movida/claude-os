@@ -23,7 +23,7 @@
 //! dans la version expérimentale (nightly) du compilateur, et elle cache ce
 //! qui se passe.
 
-use crate::{clavier, faute_de_page, gdt, horloge, irq, linux, processus, tache};
+use crate::{clavier, faute_de_page, gdt, horloge, irq, linux, ordonnanceur, processus, tache};
 use crate::verrou::Verrou;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
@@ -338,9 +338,15 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     // Interrompu au milieu d'un appel système (dans le noyau), le programme
     // verra sa fin, ses signaux, sa limite de temps de calcul à la fin de
     // l'appel (appel_systeme.rs), quand le noyau aura fini ce qu'il faisait
-    // pour lui.
+    // pour lui. Mais le noyau, lui, peut céder le processeur ici, si
+    // l'interruption l'a trouvé interruptions actives, donc sans verrou
+    // (ordonnanceur.rs) : après l'EOI, déjà envoyé par irq::gerer. Jamais
+    // après une exception à pile IST : les interruptions des périphériques
+    // n'en ont pas.
     if depuis_programme {
         tache::verifier_au_retour();
+    } else if vecteur >= 32 && cadre.rflags & 1 << 9 != 0 {
+        ordonnanceur::preempter();
     }
 }
 

@@ -47,6 +47,7 @@ mod linux;
 mod memoire;
 mod pagination;
 mod pile;
+mod ordonnanceur;
 mod pages;
 mod pic;
 mod port;
@@ -241,8 +242,10 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     afficherln!("[noyau] Adresses du noyau a la demande (vmalloc) : {} piles de {} Kio sous leur page de garde, tables faites d'avance ({} Kio).",
                 bilan.piles, vmalloc::TAILLE_PILE >> 10, bilan.tables >> 10);
     tester_vmalloc();
-    // Le code en cours devient la tâche inactive (tache.rs).
+    // Le code en cours devient la tâche inactive (tache.rs) ; la file des
+    // tâches prêtes, réservée pour autant de tâches que de piles.
     tache::initialiser();
+    ordonnanceur::initialiser(vmalloc::max_threads());
     tester_espace_utilisateur();
     match acpi::initialiser() {
         Ok(()) => acpi::afficher(),
@@ -317,8 +320,15 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
     }
 
-    // init : le lanceur de /etc/demarrage, dans sa tâche.
-    if !tache::executer_noyau(programmes::NomCourt::de(b"init"), programmes::demarrer) {
+    afficherln!("[noyau] Ordonnanceur EEVDF : tranche de {}.{:02} ms, preemption du noyau.",
+                ordonnanceur::TRANCHE / 1_000_000, ordonnanceur::TRANCHE / 10_000 % 100);
+    // init : vérifie l'ordonnanceur, puis lance /etc/demarrage, dans sa
+    // tâche.
+    let init = || {
+        tester_ordonnanceur();
+        programmes::demarrer();
+    };
+    if !tache::executer_noyau(programmes::NomCourt::de(b"init"), init) {
         afficherln!("[noyau] Pas de pile pour la tache init : rien a lancer.");
     }
 
@@ -350,6 +360,38 @@ extern "C" fn noyau_main(infos: u64) -> ! {
             afficher!("{}", c);
         }
     }
+}
+
+/// Vérifie l'ordonnanceur et la préemption du noyau : deux tâches du noyau
+/// qui calculent chacune 20 ms, sans jamais céder d'elles-mêmes, doivent se
+/// partager le processeur : chacune voit le compteur de l'autre avancer
+/// pendant son propre calcul, ce qui n'arrive que si le tic l'a préemptée.
+fn tester_ordonnanceur() {
+    use core::sync::atomic::AtomicU64;
+    static COMPTEURS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static VU: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    let calculer = |moi: usize| {
+        move || {
+            let autre_au_debut = COMPTEURS[1 - moi].load(Ordering::Relaxed);
+            let debut = tache::temps_de_calcul();
+            while tache::temps_de_calcul() - debut < 20_000_000 {
+                COMPTEURS[moi].fetch_add(1, Ordering::Relaxed);
+                if COMPTEURS[1 - moi].load(Ordering::Relaxed) != autre_au_debut {
+                    VU[moi].store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    };
+    let bascules = ordonnanceur::bascules();
+    let a = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-a"), calculer(0));
+    let b = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-b"), calculer(1));
+    if let (Some(a), Some(b)) = (&a, &b) {
+        tache::attendre(a);
+        tache::attendre(b);
+    }
+    let ok = a.is_some() && b.is_some() && VU.iter().all(|v| v.load(Ordering::Relaxed));
+    afficherln!("[noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : {} ({} bascules).",
+                if ok { "ok" } else { "ECHEC" }, ordonnanceur::bascules() - bascules);
 }
 
 /// Vérifie l'allocateur de pages : des blocs alignés sur leur taille, qu'on

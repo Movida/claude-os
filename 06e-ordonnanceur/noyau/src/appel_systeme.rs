@@ -79,7 +79,7 @@ const MASQUE_RFLAGS: u64 = 1 << 0 | 1 << 2 | 1 << 4 | 1 << 6 | 1 << 7 // CF PF A
 
 // L'entrée et la sortie, en assembleur : le même cadre que les
 // interruptions (interruptions.rs), comme le pt_regs de Linux, pour que
-// la sortie, l'arrêt d'un programme fautif ou un futur ordonnanceur
+// la sortie, l'arrêt d'un programme fautif ou l'ordonnanceur
 // traitent tous les cas de la même façon.
 global_asm!(
     r#"

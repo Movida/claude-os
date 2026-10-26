@@ -31,7 +31,19 @@
 use crate::cpu;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+
+/// Le nombre de verrous tenus sur le processeur (le `preempt_count` de
+/// Linux, pour la part des verrous) : l'ordonnanceur refuse de céder le
+/// processeur s'il n'est pas nul (ordonnanceur.rs). Un compteur pour le
+/// processeur, pas pour la tâche : un verrou coupe les interruptions, la
+/// tâche qui le tient ne peut pas être remplacée avant de l'avoir rendu.
+static TENUS: AtomicU32 = AtomicU32::new(0);
+
+/// Le nombre de verrous tenus en ce moment.
+pub fn tenus() -> u32 {
+    TENUS.load(Ordering::Relaxed)
+}
 
 pub struct Verrou<T> {
     pris: AtomicBool,
@@ -65,6 +77,7 @@ impl<T> Verrou<T> {
         if self.pris.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
             panic!("verrou deja pris : interblocage");
         }
+        TENUS.fetch_add(1, Ordering::Relaxed);
         Garde { verrou: self, interruptions_actives }
     }
 
@@ -102,6 +115,7 @@ impl<T> DerefMut for Garde<'_, T> {
 
 impl<T> Drop for Garde<'_, T> {
     fn drop(&mut self) {
+        TENUS.fetch_sub(1, Ordering::Relaxed);
         self.verrou.pris.store(false, Ordering::Release);
         // Dans cet ordre : rendre le verrou, puis seulement laisser revenir
         // les interruptions, sinon une interruption pourrait encore le
