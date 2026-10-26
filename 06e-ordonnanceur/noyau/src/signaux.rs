@@ -489,41 +489,70 @@ pub fn sigaltstack(nouvelle: u64, ancienne: u64) -> i64 {
     0
 }
 
-/// Le signal `sig` envoyé à soi-même (au fil ou au processus), après les
-/// vérifications de Linux (`check_kill_permission`) : un signal valide (0 à
-/// 64, EINVAL), 0 n'envoyant rien (il demande seulement « ce processus
-/// existe-t-il ? »). Un seul utilisateur : la permission est toujours
-/// accordée.
-fn envoyer_a_soi(sig: u64, a: Destinataire) -> i64 {
+/// Le signal `sig` envoyé au processus `pid` (ou à son fil, `a`), après
+/// les vérifications de Linux (`check_kill_permission`) : un processus qui
+/// existe (vivant ou zombie : ESRCH sinon, et avant le reste), un signal
+/// valide (0 à 64, EINVAL), 0 n'envoyant rien (il demande seulement « ce
+/// processus existe-t-il ? »). Un seul utilisateur : la permission est
+/// toujours accordée. Un zombie ne reçoit plus rien (0, comme Linux).
+/// Un signal que le processus ne bloque pas réveille sa tâche si elle dort
+/// interruptible (le `signal_wake_up` de Linux) : son appel rend EINTR, et
+/// le signal est livré à son retour vers l'anneau 3.
+fn envoyer_a(pid: u32, sig: u64, a: Destinataire) -> i64 {
+    if !processus::existe(pid) {
+        return -ESRCH;
+    }
     if sig > NSIG {
         return -EINVAL;
     }
-    if sig != 0 {
-        processus::avec(|p| envoyer(p, sig, a));
+    if sig == 0 {
+        return 0;
+    }
+    let reveiller = processus::avec_pid(pid, |p| {
+        envoyer(p, sig, a);
+        en_attente_non_bloque(p)
+    });
+    if reveiller == Some(true) {
+        crate::tache::reveiller_par_signal(pid);
     }
     0
 }
 
 /// kill(pid, signal), comme `kill_something_info` : pid > 0, un processus
-/// (le nôtre, sinon ESRCH) ; 0, notre groupe de processus ; -1, tous les
-/// processus sauf l'init et soi-même (il n'y en a aucun : ESRCH) ; < -1, le
-/// groupe -pid. Chaque programme mène son propre groupe (son numéro est
-/// celui du processus), comme une commande lancée par un shell. ESRCH
-/// passe avant EINVAL, comme chez Linux (on cherche d'abord à qui
-/// envoyer).
+/// (ESRCH s'il n'existe pas) ; 0, notre groupe de processus ; -1, tous les
+/// processus sauf l'init et soi-même (0 si au moins un l'a reçu, ESRCH
+/// s'il n'y en a aucun) ; < -1, le groupe -pid. Chaque programme mène son
+/// propre groupe (son numéro est celui du processus), comme une commande
+/// lancée par un shell. ESRCH passe avant EINVAL, comme chez Linux (on
+/// cherche d'abord à qui envoyer).
 pub fn kill(pid: u64, sig: u64) -> i64 {
     let pid = pid as u32 as i32;
-    let soi = processus::avec(|p| p.pid) as i32;
+    let soi = processus::avec(|p| p.pid);
     let sig = sig as u32 as u64;
     match pid {
-        0 => envoyer_a_soi(sig, Destinataire::Processus),
-        -1 | i32::MIN => -ESRCH,
-        p if p == soi || p == -soi => envoyer_a_soi(sig, Destinataire::Processus),
-        _ => -ESRCH,
+        0 => envoyer_a(soi, sig, Destinataire::Processus),
+        -1 => {
+            let mut autres = alloc::vec::Vec::new();
+            processus::pour_chaque_pid(|p| {
+                if p != soi && autres.try_reserve(1).is_ok() {
+                    autres.push(p);
+                }
+            });
+            let mut r = -ESRCH;
+            for p in autres {
+                let e = envoyer_a(p, sig, Destinataire::Processus);
+                if e == 0 || r == -ESRCH {
+                    r = e;
+                }
+            }
+            r
+        }
+        i32::MIN => -ESRCH,
+        p => envoyer_a(p.unsigned_abs(), sig, Destinataire::Processus),
     }
 }
 
-/// tkill(fil, signal) : un fil précis (le nôtre : un seul fil, dont le
+/// tkill(fil, signal) : un fil précis (un seul fil par processus, dont le
 /// numéro est celui du processus). Un numéro nul ou négatif : EINVAL.
 pub fn tkill(tid: u64, sig: u64) -> i64 {
     let tid = tid as u32 as i32;
@@ -547,11 +576,10 @@ pub fn tgkill(tgid: u64, tid: u64, sig: u64) -> i64 {
 /// Le `do_send_specific` de Linux : le fil `tid`, s'il existe et qu'il est
 /// bien du processus `tgid` (quand il est donné), sinon ESRCH.
 fn au_fil(tgid: Option<i32>, tid: i32, sig: u64) -> i64 {
-    let soi = processus::avec(|p| p.pid) as i32;
-    if tid != soi || tgid.is_some_and(|t| t != soi) {
+    if tgid.is_some_and(|t| t != tid) {
         return -ESRCH;
     }
-    envoyer_a_soi(sig as u32 as u64, Destinataire::Fil)
+    envoyer_a(tid as u32, sig as u32 as u64, Destinataire::Fil)
 }
 
 /// Le signal `sig` (1 à 64), avec son nom pour les messages. Les signaux

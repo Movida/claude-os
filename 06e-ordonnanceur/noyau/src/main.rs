@@ -248,6 +248,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     tache::initialiser();
     ordonnanceur::initialiser(vmalloc::max_threads());
     attente::initialiser(vmalloc::max_threads());
+    processus::initialiser(vmalloc::max_threads());
     tester_espace_utilisateur();
     match acpi::initialiser() {
         Ok(()) => acpi::afficher(),

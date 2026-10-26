@@ -38,6 +38,15 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/evenements
 # /proc et /sys (6d) : ce qu'y lit Bun, maps, statm, exe, /proc/sys/vm, cpu/online.
 /bin/proc
+# Deux programmes à la fois (6e) : lancés par `&`, ils se partagent le
+# processeur ; deux autres ajoutent au même fichier, sans rien perdre.
+/bin/partage a b &
+/bin/partage b a
+wait
+/bin/ajout ecrire a 300 &
+/bin/ajout ecrire b 300 &
+/bin/ajout verifier 300
+wait
 # Et le jalon de 6d : le vrai Claude Code, en dernier (ce qui précède a déjà
 # dit si le noyau va bien).
 /usr/local/bin/claude --version

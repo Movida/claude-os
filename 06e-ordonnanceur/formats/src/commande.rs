@@ -44,7 +44,13 @@
 //!     argv[0]), et ses arguments. Un mot qui commence par `/` n'est ni un
 //!     mot réservé de sh (`if`, `while`...), ni une commande interne
 //!     (`exec`, `.`, `:`), ni un alias : c'est ce qui rend la promesse vraie
-//!     pour toute la ligne. Et le noyau n'a pas de `PATH` à chercher.
+//!     pour toute la ligne. Et le noyau n'a pas de `PATH` à chercher ;
+//!   - depuis 6e, `&` à la fin de la ligne (collé ou non au dernier mot,
+//!     avant un commentaire éventuel) : la commande est lancée « en
+//!     arrière-plan », sans l'attendre, comme le fait `sh` ; rien d'autre
+//!     ne peut suivre (`a & b`, deux commandes, et `&&` sont refusés) ;
+//!   - et la commande interne `wait`, seule sur sa ligne, sans guillemets
+//!     ni arguments : elle attend toutes les commandes lancées par `&`.
 //! Pas de `\` en fin de ligne, pas de variables, pas d'échappements : ce
 //! n'est pas un shell, seulement de quoi écrire une commande.
 //!
@@ -70,6 +76,10 @@ pub enum Erreur {
     CheminRelatif,
     /// Le tampon de l'appelant est trop petit (voir `taille_tampon`).
     TamponTropPetit,
+    /// Quelque chose suit `&`.
+    ApresEsperluette,
+    /// `wait` avec des arguments, des affectations ou `&`.
+    Attendre,
 }
 
 // Affichés par le noyau : sans accents.
@@ -83,6 +93,8 @@ impl fmt::Display for Erreur {
             Erreur::SansProgramme => f.write_str("pas de programme a lancer"),
             Erreur::CheminRelatif => f.write_str("le programme doit etre donne par son chemin absolu"),
             Erreur::TamponTropPetit => f.write_str("ligne trop longue"),
+            Erreur::ApresEsperluette => f.write_str("rien ne peut suivre &"),
+            Erreur::Attendre => f.write_str("wait s'emploie seul"),
         }
     }
 }
@@ -114,11 +126,21 @@ pub enum Genre {
     Argument,
 }
 
+/// Ce que dit une ligne qui n'est pas vide.
+#[derive(Debug, Clone, Copy)]
+pub enum Ligne<'t> {
+    /// Une commande à lancer.
+    Commande(Commande<'t>),
+    /// `wait` : attendre les commandes lancées par `&`.
+    Attendre,
+}
+
 /// Une ligne découpée : ses mots, guillemets retirés, dans le tampon de
-/// l'appelant.
+/// l'appelant, et si elle se lance en arrière-plan (`&`).
 #[derive(Debug, Clone, Copy)]
 pub struct Commande<'t> {
     tampon: &'t [u8],
+    arriere_plan: bool,
 }
 
 impl<'t> Commande<'t> {
@@ -160,6 +182,11 @@ impl<'t> Commande<'t> {
     pub fn programme(&self) -> &'t [u8] {
         self.arguments().next().unwrap_or(&[])
     }
+
+    /// La ligne finit-elle par `&` (lancer sans attendre) ?
+    pub fn arriere_plan(&self) -> bool {
+        self.arriere_plan
+    }
 }
 
 /// Un caractère que `sh` laisse tel quel hors des guillemets. (Les octets
@@ -181,9 +208,19 @@ fn est_affectation(brut: &[u8]) -> bool {
 /// Découpe `ligne` en mots, dans `tampon` (au moins `taille_tampon(ligne)`
 /// octets). Rend `None` pour une ligne sans commande (vide, ou seulement
 /// un commentaire).
-pub fn decouper<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<Option<Commande<'t>>, Erreur> {
+pub fn decouper<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<Option<Ligne<'t>>, Erreur> {
     if tampon.len() < taille_tampon(ligne) {
         return Err(Erreur::TamponTropPetit);
+    }
+    // `wait`, seul (des blancs et un commentaire autour) : la commande
+    // interne de sh. Sans guillemets : on ne reconnaît que ce mot-là.
+    let mots: &[u8] = match ligne.iter().position(|&o| o == b'#') {
+        Some(p) if p == 0 || ligne[p - 1] == b' ' || ligne[p - 1] == b'\t' => &ligne[..p],
+        _ => ligne,
+    };
+    let mut seuls = mots.split(|&o| o == b' ' || o == b'\t').filter(|m| !m.is_empty());
+    if seuls.next() == Some(b"wait") {
+        return if seuls.next().is_none() { Ok(Some(Ligne::Attendre)) } else { Err(Erreur::Attendre) };
     }
     let mut ecrit = 0; // Ce qui est écrit dans le tampon.
     let mut i = 0;
@@ -191,6 +228,7 @@ pub fn decouper<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<Option<Command
     // peut encore en être une.
     let mut en_tete = true;
     let mut programme = false;
+    let mut arriere_plan = false;
     loop {
         // Les blancs entre deux mots.
         while i < ligne.len() && (ligne[i] == b' ' || ligne[i] == b'\t') {
@@ -199,11 +237,22 @@ pub fn decouper<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<Option<Command
         if i == ligne.len() || ligne[i] == b'#' {
             break;
         }
-        // Un mot brut : jusqu'au prochain blanc hors des guillemets.
+        if arriere_plan {
+            // Après `&` : un second `&` (`&&`), ou une autre commande.
+            return Err(if ligne[i] == b'&' { Erreur::Caractere(b'&') } else { Erreur::ApresEsperluette });
+        }
+        if ligne[i] == b'&' {
+            // `&` après un blanc : la fin de la commande.
+            arriere_plan = true;
+            i += 1;
+            continue;
+        }
+        // Un mot brut : jusqu'au prochain blanc hors des guillemets, ou un
+        // `&` (un opérateur pour sh, même collé au mot).
         let debut = i;
         let place = ecrit;
         ecrit += 1; // Le genre, écrit à la fin.
-        while i < ligne.len() && ligne[i] != b' ' && ligne[i] != b'\t' {
+        while i < ligne.len() && ligne[i] != b' ' && ligne[i] != b'\t' && ligne[i] != b'&' {
             match ligne[i] {
                 b'\'' => {
                     let fin = ligne[i + 1..].iter().position(|&o| o == b'\'').ok_or(Erreur::GuillemetNonFerme)?;
@@ -262,9 +311,9 @@ pub fn decouper<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<Option<Command
         ecrit += 1;
     }
     match (ecrit, programme) {
-        (0, _) => Ok(None),
+        (0, _) if !arriere_plan => Ok(None),
         (_, false) => Err(Erreur::SansProgramme),
-        _ => Ok(Some(Commande { tampon: &tampon[..ecrit] })),
+        _ => Ok(Some(Ligne::Commande(Commande { tampon: &tampon[..ecrit], arriere_plan }))),
     }
 }
 
@@ -277,9 +326,44 @@ mod tests {
     fn decoupe(ligne: &str) -> Result<Option<(Vec<std::string::String>, Vec<std::string::String>, Vec<std::string::String>)>, Erreur> {
         let mut tampon = std::vec![0u8; taille_tampon(ligne.as_bytes())];
         let texte = |m: &[u8]| std::string::String::from_utf8(m.to_vec()).unwrap();
-        Ok(decouper(ligne.as_bytes(), &mut tampon)?.map(|c| {
-            (c.affectations().map(texte).collect(), c.dossiers().map(texte).collect(), c.arguments().map(texte).collect())
+        Ok(decouper(ligne.as_bytes(), &mut tampon)?.map(|l| match l {
+            Ligne::Commande(c) => {
+                (c.affectations().map(texte).collect(), c.dossiers().map(texte).collect(), c.arguments().map(texte).collect())
+            }
+            Ligne::Attendre => (Vec::new(), Vec::new(), std::vec!["wait".into()]),
         }))
+    }
+
+    /// La ligne se lance-t-elle en arrière-plan ?
+    fn fond(ligne: &str) -> bool {
+        let mut tampon = std::vec![0u8; taille_tampon(ligne.as_bytes())];
+        matches!(decouper(ligne.as_bytes(), &mut tampon), Ok(Some(Ligne::Commande(c))) if c.arriere_plan())
+    }
+
+    fn attendre(ligne: &str) -> bool {
+        let mut tampon = std::vec![0u8; taille_tampon(ligne.as_bytes())];
+        matches!(decouper(ligne.as_bytes(), &mut tampon), Ok(Some(Ligne::Attendre)))
+    }
+
+    #[test]
+    fn arriere_plan_et_wait() {
+        assert!(fond("/bin/x &") && fond("/bin/x a&") && fond("/bin/x 'a'& # rien") && fond("A=1 /bin/x b &   "));
+        assert!(!fond("/bin/x") && !fond("/bin/x '&'") && !fond("/bin/x \"a&b\""));
+        assert_eq!(mots("/bin/x a&"), ["/bin/x", "a"]);
+        assert_eq!(decoupe("/bin/x & /bin/y"), Err(Erreur::ApresEsperluette));
+        assert_eq!(decoupe("/bin/x &&"), Err(Erreur::Caractere(b'&')));
+        assert_eq!(decoupe("/bin/x && /bin/y"), Err(Erreur::Caractere(b'&')));
+        assert_eq!(decoupe("&"), Err(Erreur::SansProgramme));
+        assert_eq!(decoupe("A=1 &"), Err(Erreur::SansProgramme));
+        assert!(attendre("wait") && attendre("  wait\t") && attendre("wait # tout le monde"));
+        for refus in ["wait 12", "wait &", "A=1 wait", "wait;"] {
+            assert!(decoupe(refus).is_err(), "{refus}");
+        }
+        assert_eq!(decoupe("wait %1"), Err(Erreur::Attendre));
+        // Pas la commande interne : un chemin, ou entre guillemets.
+        assert_eq!(decoupe("'wait'"), Err(Erreur::CheminRelatif));
+        assert_eq!(mots("/bin/wait"), ["/bin/wait"]);
+        assert_eq!(decoupe("wait#x"), Err(Erreur::CheminRelatif));
     }
 
     fn mots(ligne: &str) -> Vec<std::string::String> {
@@ -311,7 +395,7 @@ mod tests {
 
     #[test]
     fn caracteres_speciaux_refuses() {
-        for c in ["$", "*", "?", ";", "&", "|", "<", ">", "(", ")", "`", "\\", "~", "[", "]", "{", "}", "!", "^"] {
+        for c in ["$", "*", "?", ";", "|", "<", ">", "(", ")", "`", "\\", "~", "[", "]", "{", "}", "!", "^"] {
             assert_eq!(decoupe(&std::format!("/bin/x a{c}b")), Err(Erreur::Caractere(c.as_bytes()[0])), "{c}");
         }
         // Un octet de contrôle, même entre guillemets.
@@ -396,7 +480,8 @@ mod tests {
     #[test]
     fn messages_sans_accents() {
         for e in [Erreur::GuillemetNonFerme, Erreur::Caractere(b'$'), Erreur::Caractere(1), Erreur::DossierVide,
-                  Erreur::SansProgramme, Erreur::CheminRelatif, Erreur::TamponTropPetit] {
+                  Erreur::SansProgramme, Erreur::CheminRelatif, Erreur::TamponTropPetit, Erreur::ApresEsperluette,
+                  Erreur::Attendre] {
             assert!(std::format!("{e}").is_ascii());
         }
     }
@@ -420,8 +505,17 @@ mod tests {
             "/bin/x if then fi exec . :",
             "/bin/claude -p \"bonjour\"",
             "DISABLE_AUTOUPDATER=1 /bin/claude -p \"bonjour, ca va ?\"",
+            "/bin/x a b &",
+            "A=1 /bin/x 'c d'& # en arriere-plan",
+            "wait",
         ];
         for ligne in lignes {
+            // sh accepte la ligne telle quelle (-n : lue, pas exécutée) ;
+            // pour comparer les mots, sans son `&` (sh lancerait la
+            // commande en arrière-plan avant d'afficher quoi que ce soit).
+            let sortie = std::process::Command::new("sh").arg("-n").arg("-c").arg(ligne).output().unwrap();
+            assert!(sortie.status.success(), "{ligne} : refusee par sh");
+            let ligne = &*ligne.replace("&", "");
             let (affectations, dossiers, arguments) = decoupe(ligne).unwrap().unwrap();
             assert!(dossiers.is_empty());
             // Les arguments : `set --` les reçoit tels que sh les découpe

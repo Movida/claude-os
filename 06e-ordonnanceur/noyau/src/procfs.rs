@@ -53,12 +53,14 @@ const PERIPHERIQUE: (u32, u32) = (0, 21);
 const LECTURE_MAX: u64 = 64 << 10;
 
 /// Le procfs neuf : /proc/self et /proc/sys/vm. Assez de place d'avance
-/// pour le dossier d'un processus : sinon la table des entrées grandirait
-/// pendant le premier programme, et « memoire rendue » le compterait.
+/// pour les dossiers de seize processus à la fois (quatre entrées chacun) :
+/// sinon la table des entrées grandirait pendant les premiers programmes,
+/// et « memoire rendue » le compterait. (Linux, lui, fabrique /proc/<pid>
+/// à la demande, d'après la table des processus, sans rien garder.)
 pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     let mut p = NoyauFs::new(Genre::Proc, PERIPHERIQUE, 0o555, maintenant)?;
     let racine = p.racine();
-    p.reserver(16)?;
+    p.reserver(64)?;
     p.ajouter(racine, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), false, maintenant)?;
     let sys = p.ajouter(racine, b"sys", 0o555, (0, 0), Contenu::Dossier, false, maintenant)?;
     let vm = p.ajouter(sys, b"vm", 0o555, (0, 0), Contenu::Dossier, false, maintenant)?;
@@ -223,15 +225,11 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
         v.extend_from_slice(valeur);
         return Ok(Some((v, 1)));
     }
-    // Le dossier d'un processus terminé a été retiré avec ses fichiers ;
-    // avec un seul processus à la fois, celui qu'on lit est le processus en
-    // cours.
-    if processus::essayer_avec(|p| p.pid) != Some(argument) {
-        return Ok(None);
-    }
+    // Le processus `argument`, s'il vit encore (un fichier gardé ouvert
+    // après sa fin se lit vide).
     match source {
-        MAPS => ligne_maps(curseur),
-        STATM if curseur == 0 => statm().map(|t| Some((t, u64::MAX))),
+        MAPS => ligne_maps(argument, curseur),
+        STATM if curseur == 0 => statm(argument).map(|t| t.map(|t| (t, u64::MAX))),
         _ => Ok(None),
     }
 }
@@ -244,8 +242,8 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
 /// privées inscriptibles, hors pile, plus la pile : `data_vm + stack_vm`) ;
 /// 0. Les compteurs du résident sont ceux que tient déjà l'espace
 /// d'adressage (les `rss_stat` de Linux) ; le reste, sommé sur les zones.
-fn statm() -> Result<Vec<u8>, Erreur> {
-    let (taille, resident, partage, code, donnees) = processus::avec(|p| {
+fn statm(pid: u32) -> Result<Option<Vec<u8>>, Erreur> {
+    let Some((taille, resident, partage, code, donnees)) = processus::avec_pid(pid, |p| {
         let m = &p.memoire;
         let (debut, fin) = m.code;
         let code = if fin > debut { (fin.next_multiple_of(4096) - (debut & !4095)) / 4096 } else { 0 };
@@ -255,13 +253,15 @@ fn statm() -> Result<Vec<u8>, Erreur> {
             .sum();
         let (pages, fichier) = (m.espace.pages() as u64, m.espace.pages_fichier() as u64);
         (m.taille_virtuelle() / 4096, pages + fichier, fichier, code, donnees)
-    });
+    }) else {
+        return Ok(None);
+    };
     let mut t = Texte(Vec::new());
     writeln!(t, "{} {} {} {} 0 {} 0", taille, resident, partage, code, donnees).map_err(|_| Erreur::ENOMEM)?;
-    Ok(t.0)
+    Ok(Some(t.0))
 }
 
-/// La ligne de /proc/<pid>/maps de la première zone qui finit après
+/// La ligne de /proc/<pid>/maps du processus `pid` de la première zone qui finit après
 /// `curseur`, et le curseur suivant (sa fin). Le format de Linux
 /// (`show_map_vma`, mesuré) :
 ///   début-fin, en hexadécimal sur 8 chiffres au moins ; les droits (r, w,
@@ -272,8 +272,8 @@ fn statm() -> Result<Vec<u8>, Erreur> {
 ///   du fichier (suivi de « (deleted) » s'il n'a plus de nom), [heap] pour
 ///   le tas, [stack] pour la pile. Une zone anonyme sans nom garde
 ///   l'espace qui suit l'inode, 0.
-fn ligne_maps(curseur: u64) -> Result<Enregistrement, Erreur> {
-    let Some(z) = processus::avec(|p| p.memoire.zones.zones().iter().find(|z| z.fin > curseur).copied()) else {
+fn ligne_maps(pid: u32, curseur: u64) -> Result<Enregistrement, Erreur> {
+    let Some(z) = processus::avec_pid(pid, |p| p.memoire.zones.zones().iter().find(|z| z.fin > curseur).copied()).flatten() else {
         return Ok(None);
     };
     // Le fichier projeté : son chemin (copié : le verrou des fichiers ne

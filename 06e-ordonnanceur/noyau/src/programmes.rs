@@ -23,6 +23,7 @@
 use crate::descripteurs::Descripteurs;
 use crate::memoire::Acces;
 use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, processus, procfs, tache, vfs, wasi};
+use alloc::sync::Arc;
 use fichiers::Identite;
 use alloc::vec::Vec;
 use core::fmt;
@@ -163,16 +164,145 @@ pub fn demarrer() {
         .filter(|(_, l)| tampon_pour(l).is_none_or(|mut t| !matches!(formats::commande::decouper(l, &mut t), Ok(None))))
         .count();
     afficherln!("[noyau] Lancement : {}, {} commandes.", Nom(DEMARRAGE), commandes);
+    let mut l = Lanceur::new(commandes);
     for (numero, ligne) in formats::commande::lignes(&texte) {
-        let Some(mut tampon) = tampon_pour(ligne) else {
-            afficherln!("[noyau] {}, ligne {} : plus de memoire pour la lire", Nom(DEMARRAGE), numero);
-            continue;
-        };
-        match formats::commande::decouper(ligne, &mut tampon) {
-            Ok(None) => {}
-            Ok(Some(commande)) => lancer(numero, &commande),
-            Err(e) => afficherln!("[noyau] {}, ligne {} : refusee : {}", Nom(DEMARRAGE), numero, e),
+        // La mémoire libre quand aucun programme ne tourne, avant tout ce
+        // que la ligne fait prendre (voir `Lanceur`).
+        if l.en_cours == 0 {
+            l.libres = pages::libres();
+            l.paralleles = false;
         }
+        // Le tampon de la ligne et ce que `lancer` prend pour elle sont
+        // rendus à la fin de ce bloc, avant de recueillir un programme.
+        let action = {
+            let Some(mut tampon) = tampon_pour(ligne) else {
+                afficherln!("[noyau] {}, ligne {} : plus de memoire pour la lire", Nom(DEMARRAGE), numero);
+                continue;
+            };
+            match formats::commande::decouper(ligne, &mut tampon) {
+                Ok(None) => None,
+                Ok(Some(formats::commande::Ligne::Attendre)) => Some(Action::Attendre),
+                Ok(Some(formats::commande::Ligne::Commande(commande))) => {
+                    let fond = commande.arriere_plan();
+                    lancer(&mut l, numero, &commande).map(|t| if fond { Action::Fond(t) } else { Action::Premier(t) })
+                }
+                Err(e) => {
+                    afficherln!("[noyau] {}, ligne {} : refusee : {}", Nom(DEMARRAGE), numero, e);
+                    None
+                }
+            }
+        };
+        match action {
+            None => {}
+            Some(Action::Premier(t)) => l.recueillir(t),
+            // La place est réservée pour chaque commande du fichier.
+            Some(Action::Fond(t)) => l.fond.push(t),
+            Some(Action::Attendre) => l.attendre_tous(),
+        }
+    }
+    // Comme init, qui recueille ses enfants : le noyau attend ceux qui
+    // tournent encore.
+    l.attendre_tous();
+}
+
+/// Ce que fait une ligne.
+enum Action {
+    /// Un programme lancé, à attendre tout de suite.
+    Premier(Tache),
+    /// Un programme lancé par `&`, à attendre au prochain `wait`.
+    Fond(Tache),
+    /// `wait`.
+    Attendre,
+}
+
+/// Un programme lancé, que le lanceur recueillera.
+enum Tache {
+    /// Un programme Linux : sa tâche, son processus, son nom, son fichier
+    /// (tenu, et protégé contre l'écriture tant qu'il s'exécute).
+    Linux { tache: Arc<tache::Tache>, pid: u32, nom: NomCourt, fichier: Numero },
+    /// Un programme WebAssembly : sa tâche du noyau (elle dit elle-même
+    /// comment il s'est terminé).
+    Wasm(Arc<tache::Tache>),
+}
+
+/// Le lanceur (le rôle d'init) : les programmes lancés par `&` et pas
+/// encore recueillis, combien de programmes tournent, et la mémoire libre
+/// quand le premier d'entre eux a été lancé. « Memoire rendue » compare la
+/// mémoire libre quand aucun programme ne tourne : avant le premier, et
+/// une fois le dernier recueilli. Un programme qui a tourné seul le dit
+/// pour lui ; ceux qui ont tourné ensemble, ensemble, au `wait` qui les
+/// recueille (avec deux programmes à la fois, la mémoire libre ne dit plus
+/// rien d'un seul).
+struct Lanceur {
+    fond: Vec<Tache>,
+    en_cours: usize,
+    libres: usize,
+    /// Un programme a été lancé pendant qu'un autre tournait.
+    paralleles: bool,
+}
+
+impl Lanceur {
+    /// La liste des programmes en arrière-plan a la place d'une entrée par
+    /// commande du fichier (`commandes`) : elle ne grandit pas pendant
+    /// qu'ils tournent.
+    fn new(commandes: usize) -> Lanceur {
+        let mut fond = Vec::new();
+        let _ = fond.try_reserve_exact(commandes);
+        Lanceur { fond, en_cours: 0, libres: 0, paralleles: false }
+    }
+
+    /// Un programme va être lancé.
+    fn commencer(&mut self) {
+        if self.en_cours > 0 {
+            self.paralleles = true;
+        }
+        self.en_cours += 1;
+    }
+
+    /// Attend la fin du programme `t`, le recueille, et le dit.
+    fn recueillir(&mut self, t: Tache) {
+        let fin = match t {
+            Tache::Linux { tache, pid, nom, fichier } => {
+                tache::attendre(&tache);
+                drop(tache);
+                let code = processus::recueillir(pid).unwrap_or(-1);
+                procfs::retirer_processus(pid);
+                vfs::avec(|fs, cadres| {
+                    fs.permettre_ecriture(fichier);
+                    fs.lacher(fichier, cadres);
+                });
+                Some((nom, code))
+            }
+            Tache::Wasm(tache) => {
+                tache::attendre(&tache);
+                None
+            }
+        };
+        self.en_cours -= 1;
+        let rendue = || if pages::libres() == self.libres { "ok" } else { "ECHEC" };
+        match fin {
+            Some((nom, code)) if self.en_cours == 0 && !self.paralleles => {
+                afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.", nom, code, rendue())
+            }
+            Some((nom, code)) => afficherln!("[noyau] {} : termine, code de sortie {}.", nom, code),
+            None => {}
+        }
+        if self.en_cours == 0 && self.paralleles {
+            afficherln!("[noyau] Programmes en parallele : memoire rendue : {}.", rendue());
+        }
+    }
+
+    /// `wait` : recueille tous les programmes lancés par `&`, dans l'ordre
+    /// où ils l'ont été.
+    fn attendre_tous(&mut self) {
+        let fond = core::mem::take(&mut self.fond);
+        let place = fond.capacity();
+        for t in fond {
+            self.recueillir(t);
+        }
+        // La liste retrouve sa place (rendue avec l'ancienne) ; elle a été
+        // réservée avant le premier programme.
+        let _ = self.fond.try_reserve_exact(place);
     }
 }
 
@@ -216,9 +346,12 @@ fn lire_demarrage() -> Result<Vec<u8>, fichiers::Erreur> {
 /// noyau, remplacé ou complété par ses affectations), son programme
 /// (résolu comme `execve`, sans `PATH`, avec les droits de l'utilisateur
 /// 1000), ses arguments.
-fn lancer(numero: usize, commande: &formats::commande::Commande) {
+fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande) -> Option<Tache> {
     let programme = commande.programme();
-    let refus = |raison: &dyn fmt::Display| afficherln!("[noyau] {}, ligne {} : refusee : {}", Nom(DEMARRAGE), numero, raison);
+    let refus = |raison: &dyn fmt::Display| {
+        afficherln!("[noyau] {}, ligne {} : refusee : {}", Nom(DEMARRAGE), numero, raison);
+        None
+    };
     let (mut environnement, mut arguments, mut dossiers) = (Vec::new(), Vec::new(), Vec::new());
     let place = ENVIRONNEMENT.len() + commande.affectations().count();
     if environnement.try_reserve_exact(place).is_err()
@@ -242,9 +375,21 @@ fn lancer(numero: usize, commande: &formats::commande::Commande) {
         Ok(n) => n,
         Err(e) => return refus(&format_args!("{} : introuvable (errno {})", Nom(programme), e.errno())),
     };
-    let lancement = Lancement { chemin: programme, complet: &complet, arguments: &arguments, environnement: &environnement, dossiers: &dossiers };
-    executer(numero, n, &lancement);
-    vfs::avec(|fs, cadres| fs.lacher(n, cadres));
+    let lancement = Lancement {
+        chemin: programme,
+        complet: &complet,
+        arguments: &arguments,
+        environnement: &environnement,
+        dossiers: &dossiers,
+        fond: commande.arriere_plan(),
+    };
+    let t = executer(l, numero, n, &lancement);
+    // Un programme Linux lancé garde son fichier jusqu'à ce qu'on le
+    // recueille ; sinon, on le lâche ici.
+    if !matches!(t, Some(Tache::Linux { .. })) {
+        vfs::avec(|fs, cadres| fs.lacher(n, cadres));
+    }
+    t
 }
 
 /// Une copie de `octets` dans un bloc du tas, vide s'il n'y a pas la place
@@ -271,10 +416,12 @@ struct Lancement<'a> {
     environnement: &'a [&'a [u8]],
     /// Les dossiers pré-ouverts d'un programme WebAssembly.
     dossiers: &'a [&'a [u8]],
+    /// Lancé par `&` : son entrée standard est /dev/null, comme sous `sh`.
+    fond: bool,
 }
 
 /// Exécute le programme du fichier `n`, d'après sa signature.
-fn executer(numero: usize, n: Numero, lancement: &Lancement) {
+fn executer(l: &mut Lanceur, numero: usize, n: Numero, lancement: &Lancement) -> Option<Tache> {
     let chemin = lancement.chemin;
     let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').next().unwrap_or(chemin));
     // Le droit de l'exécuter d'abord, quel que soit son format : un fichier
@@ -282,26 +429,38 @@ fn executer(numero: usize, n: Numero, lancement: &Lancement) {
     // un dossier ou un périphérique aussi, comme do_open_execat). Avant de
     // rien lire : vfs::lire ne sait lire qu'un fichier ordinaire.
     if let Err(e) = vfs::avec(|fs, _| fs.peut_executer(IDENTITE, n)) {
-        return afficherln!("[noyau] {} : pas le droit de l'executer (errno {})", nom, e.errno());
+        afficherln!("[noyau] {} : pas le droit de l'executer (errno {})", nom, e.errno());
+        return None;
     }
     let mut signature = [0u8; 4];
     let lus = vfs::lire(n, 0, &mut signature);
     match &signature[..lus] {
-        [0, b'a', b's', b'm'] => executer_wasm(nom, n, lancement),
+        [0, b'a', b's', b'm'] => executer_wasm(l, nom, n, lancement),
         // Les dossiers pré-ouverts sont une affaire de WebAssembly : un
         // programme Linux voit tout l'arbre, avec ses droits.
         [0x7f, b'E', b'L', b'F'] if !lancement.dossiers.is_empty() => {
-            afficherln!("[noyau] {}, ligne {} : refusee : --dir= pour un programme Linux", Nom(DEMARRAGE), numero)
+            afficherln!("[noyau] {}, ligne {} : refusee : --dir= pour un programme Linux", Nom(DEMARRAGE), numero);
+            None
         }
-        [0x7f, b'E', b'L', b'F'] => executer_elf(nom, n, lancement),
-        _ => afficherln!("[noyau] {} : format inconnu, ignore.", nom),
+        [0x7f, b'E', b'L', b'F'] => executer_elf(l, nom, n, lancement),
+        _ => {
+            afficherln!("[noyau] {} : format inconnu, ignore.", nom);
+            None
+        }
     }
 }
 
 /// Un programme Linux : on vérifie le fichier, on le charge dans un espace
 /// d'adressage neuf, puis on l'exécute, dans l'anneau 3, jusqu'à ce qu'il se
 /// termine. Son espace est alors détruit, et doit rendre toute sa mémoire.
-fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
+fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement) -> Option<Tache> {
+    // Un refus : le dire, et rien n'est lancé.
+    macro_rules! refus {
+        ($($t:tt)*) => {{
+            afficherln!($($t)*);
+            return None;
+        }};
+    }
     let chemin = lancement.chemin;
     // Le fichier, lu par morceaux : la bibliothèque des formats ne voit que
     // des copies (chargeur_elf::verifier).
@@ -309,11 +468,11 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     let taille = vfs::avec(|fs, _| fs.attributs(n).taille);
     let (entete, table) = match chargeur_elf::verifier(taille, lire) {
         Ok(v) => v,
-        Err(e) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
+        Err(e) => refus!("[noyau] {} : programme Linux refuse : {}", nom, e),
     };
     let executable = match formats::elf::lire_entetes(&entete, &table, taille) {
         Ok(x) => x,
-        Err(e) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
+        Err(e) => refus!("[noyau] {} : programme Linux refuse : {}", nom, e),
     };
     // Un programme dynamique : le chemin de son interpréteur, lu dans le
     // fichier (hors de la table des en-têtes), dans un bloc du tas (4 Kio
@@ -321,22 +480,21 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     let mut chemin_interpreteur = Vec::new();
     if let Some((position, longueur)) = executable.interpreteur() {
         if chemin_interpreteur.try_reserve_exact(longueur).is_err() {
-            return afficherln!("[noyau] {} : plus de memoire pour le chemin de l'interpreteur", nom);
+            refus!("[noyau] {} : plus de memoire pour le chemin de l'interpreteur", nom);
         }
         chemin_interpreteur.resize(longueur, 0);
         if !lire(position, &mut chemin_interpreteur) {
-            return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, formats::elf::Erreur::InterpreteurHorsDuFichier);
+            refus!("[noyau] {} : programme Linux refuse : {}", nom, formats::elf::Erreur::InterpreteurHorsDuFichier);
         }
         match formats::elf::chemin_interpreteur(&chemin_interpreteur) {
             Ok(c) => {
                 let longueur = c.len();
                 chemin_interpreteur.truncate(longueur);
             }
-            Err(e) => return afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
+            Err(e) => refus!("[noyau] {} : programme Linux refuse : {}", nom, e),
         }
     }
     let identite = IDENTITE;
-    let libres = pages::libres();
     // L'interpréteur : trouvé, vérifié, son fichier ouvert (voir
     // `ouvrir_interpreteur`). Il reste protégé contre l'écriture jusqu'à
     // la fin du chargement, comme chez Linux.
@@ -345,7 +503,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
         Some(_) => match ouvrir_interpreteur(&chemin_interpreteur) {
             Ok(i) => Some(i),
             Err(e) => {
-                return afficherln!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno());
+                refus!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno());
             }
         },
     };
@@ -356,7 +514,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
             Err(e) => {
                 let e = EchecInterpreteur::Format(chargeur_elf::Refus::Format(e));
                 fermer_interpreteur(interpreteur.as_ref());
-                return afficherln!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno());
+                refus!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno());
             }
         },
     };
@@ -366,7 +524,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
         Ok(f) => f,
         Err(e) => {
             fermer_interpreteur(interpreteur.as_ref());
-            return afficherln!("[noyau] {} : ouverture impossible (errno {})", nom, e.errno());
+            refus!("[noyau] {} : ouverture impossible (errno {})", nom, e.errno());
         }
     };
     let charge = chargeur_elf::charger(&executable, nom, fichier, executable_interpreteur.as_ref().map(|(x, f)| (x, *f)));
@@ -375,13 +533,13 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
         Ok(p) => p,
         Err(e) => {
             fermer_interpreteur(interpreteur.as_ref());
-            return match e {
-                chargeur_elf::Refus::Format(e) => afficherln!("[noyau] {} : programme Linux refuse : {}", nom, e),
+            match e {
+                chargeur_elf::Refus::Format(e) => refus!("[noyau] {} : programme Linux refuse : {}", nom, e),
                 chargeur_elf::Refus::Chevauchement => {
-                    afficherln!("[noyau] {} : interpreteur {} : refuse : {}", nom, Nom(&chemin_interpreteur), e)
+                    refus!("[noyau] {} : interpreteur {} : refuse : {}", nom, Nom(&chemin_interpreteur), e)
                 }
-                e => afficherln!("[noyau] {} : chargement impossible : {}", nom, e),
-            };
+                e => refus!("[noyau] {} : chargement impossible : {}", nom, e),
+            }
         }
     };
     let image = images.programme;
@@ -466,8 +624,8 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
             && code[..longueur] == attendu[..longueur];
     }
     fermer_interpreteur(interpreteur.as_ref());
-    // La copie de sa table des en-têtes, prise après `libres`, est rendue
-    // tout de suite : sinon « memoire rendue » la compterait.
+    // La copie de sa table des en-têtes est rendue tout de suite : elle ne
+    // sert plus.
     drop(interpreteur);
     afficherln!("        en-tetes de programme a {:#x} ({} de {} octets), tas a partir de {:#x}, code en place : {}.",
                 programme.adresse_entetes.unwrap_or(0), programme.nombre_entetes, programme.taille_entete,
@@ -476,14 +634,24 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     // son chemin pour AT_EXECFN (comme Linux, le chemin donné à execve).
     let rsp = match pile::construire(&mut programme, lancement.arguments, lancement.environnement, chemin) {
         Ok(rsp) => rsp,
-        Err(e) => return afficherln!("[noyau] {} : pile initiale impossible : {}", nom, e),
+        Err(e) => refus!("[noyau] {} : pile initiale impossible : {}", nom, e),
     };
-    // Le programme devient le processus en cours : avec la console en 0,
-    // 1 et 2, la racine pour dossier courant, l'umask de Linux, et
-    // l'identité de l'utilisateur 1000.
+    // Son processus : avec la console en 0, 1 et 2 (/dev/null en 0 s'il
+    // est lancé par `&`, comme sous sh), la racine pour dossier courant,
+    // l'umask de Linux, et l'identité de l'utilisateur 1000.
     let mut descripteurs = Descripteurs::new();
     if let Err(e) = appels_fichiers::ouvrir_console(&mut descripteurs) {
-        return afficherln!("[noyau] {} : pas de console (errno {})", nom, e.errno());
+        refus!("[noyau] {} : pas de console (errno {})", nom, e.errno());
+    }
+    if lancement.fond {
+        if let Err(e) = appels_fichiers::entree_sur_null(&mut descripteurs) {
+            refus!("[noyau] {} : pas de /dev/null pour son entree (errno {})", nom, e.errno());
+        }
+    }
+    // Plus personne ne peut écrire le fichier tant qu'il s'exécute
+    // (ETXTBSY) : ses pages seront bientôt celles du programme.
+    if vfs::avec(|fs, _| fs.refuser_ecriture(n)).is_err() {
+        refus!("[noyau] {} : ouvert en ecriture, ne peut pas etre execute (ETXTBSY)", nom);
     }
     let racine = vfs::avec(|fs, _| {
         let r = fs.racine();
@@ -496,7 +664,7 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     // Son dossier de /proc, à lui, avec le lien vers son exécutable.
     let pid = processus::numero_neuf();
     procfs::ajouter_processus(pid, (identite.uid, identite.gid), lancement.complet);
-    processus::installer(processus::Processus {
+    let entree = processus::ajouter(processus::Processus {
         pid,
         memoire: programme.memoire,
         descripteurs,
@@ -507,26 +675,21 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
         limites: processus::LIMITES_PAR_DEFAUT,
         signaux: crate::signaux::Signaux::new(),
     });
-    // Plus personne ne peut écrire le fichier tant qu'il s'exécute
-    // (ETXTBSY) : ses pages seront bientôt celles du programme.
-    let code = match vfs::avec(|fs, _| fs.refuser_ecriture(n)) {
-        Ok(()) => {
-            let code = tache::executer(nom, pml4, depart, rsp).unwrap_or_else(|| {
-                afficherln!("[noyau] {} : pas de pile noyau pour sa tache", nom);
-                -1
-            });
+    let tache = entree.and_then(|e| tache::lancer_programme(nom, e, pml4, depart, rsp));
+    match tache {
+        Some(tache) => {
+            l.commencer();
+            vfs::avec(|fs, _| fs.prendre(n));
+            Some(Tache::Linux { tache, pid, nom, fichier: n })
+        }
+        None => {
+            afficherln!("[noyau] {} : plus de place pour sa tache ou son processus", nom);
+            processus::recueillir(pid);
+            procfs::retirer_processus(pid);
             vfs::avec(|fs, _| fs.permettre_ecriture(n));
-            code
+            None
         }
-        Err(_) => {
-            afficherln!("[noyau] {} : ouvert en ecriture, ne peut pas etre execute (ETXTBSY)", nom);
-            -1
-        }
-    };
-    drop(processus::retirer());
-    procfs::retirer_processus(pid);
-    afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.",
-                nom, code, if pages::libres() == libres { "ok" } else { "ECHEC" });
+    }
 }
 
 /// Un interpréteur trouvé et vérifié (en-tête et table), en attendant
@@ -640,7 +803,14 @@ fn fermer_interpreteur(interpreteur: Option<&Interpreteur>) {
 /// qu'elle utilise (ses arguments, son environnement, ses dossiers) : elle
 /// ne dépend plus de la ligne de /etc/demarrage, et pourra tourner pendant
 /// que le lanceur passe à la suivante.
-fn executer_wasm(nom: NomCourt, n: Numero, lancement: &Lancement) {
+fn executer_wasm(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement) -> Option<Tache> {
+    // Un refus : le dire, et rien n'est lancé.
+    macro_rules! refus {
+        ($($t:tt)*) => {{
+            afficherln!($($t)*);
+            return None;
+        }};
+    }
     // L'interpréteur veut le module d'un seul tenant : il est lu dans un
     // bloc du tas, qui fait au plus 4 Mio (tas.rs) ; un module plus gros est
     // refusé, jusqu'à ce que le noyau sache projeter des pages éparses d'un
@@ -648,22 +818,26 @@ fn executer_wasm(nom: NomCourt, n: Numero, lancement: &Lancement) {
     let taille = vfs::avec(|fs, _| fs.attributs(n).taille) as usize;
     let mut octets = Vec::new();
     if octets.try_reserve_exact(taille).is_err() {
-        return afficherln!("[noyau] {} : module WebAssembly de {} octets, trop gros pour le tas", nom, taille);
+        refus!("[noyau] {} : module WebAssembly de {} octets, trop gros pour le tas", nom, taille);
     }
     octets.resize(taille, 0);
     if vfs::lire(n, 0, &mut octets) != taille {
-        return afficherln!("[noyau] {} : module WebAssembly illisible", nom);
+        refus!("[noyau] {} : module WebAssembly illisible", nom);
     }
     let (Some(arguments), Some(environnement), Some(dossiers)) =
         (copies(lancement.arguments), copies(lancement.environnement), copies(lancement.dossiers))
     else {
-        return afficherln!("[noyau] {} : plus de memoire pour ses arguments", nom);
+        refus!("[noyau] {} : plus de memoire pour ses arguments", nom);
     };
-    let lance = tache::executer_noyau(nom, move || {
+    let lancee = tache::lancer_noyau(nom, move || {
         executer_module(nom, &octets, &tranches(&arguments), &tranches(&environnement), &tranches(&dossiers))
     });
-    if !lance {
-        afficherln!("[noyau] {} : pas de pile noyau pour sa tache", nom);
+    match lancee {
+        Some(t) => {
+            l.commencer();
+            Some(Tache::Wasm(t))
+        }
+        None => refus!("[noyau] {} : pas de pile noyau pour sa tache", nom),
     }
 }
 

@@ -522,6 +522,9 @@ impl Wasi {
             return EFAULT;
         }
         const O_APPEND: u32 = 0o2000;
+        // Le verrou d'écriture de l'inode, comme pour un programme Linux
+        // (appels_fichiers.rs) : la fin lue et l'écriture ne se séparent pas.
+        let _ecriture = (ecriture && sorte == Sorte::Fichier).then(|| crate::appels_fichiers::verrou_d_ecriture(n()));
         let maintenant = temps::maintenant();
         let mut ici = if ecriture && drapeaux & O_APPEND != 0 && sorte == Sorte::Fichier {
             vfs::avec(|fs, _| fs.attributs(n()).taille)

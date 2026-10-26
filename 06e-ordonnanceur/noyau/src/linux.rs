@@ -987,8 +987,10 @@ fn sched_getaffinity(pid: u64, longueur: u64, masque: u64) -> i64 {
     if longueur < MASQUE_PROCESSEURS || longueur % 8 != 0 {
         return -EINVAL;
     }
+    // Tout processus qui existe : un seul processeur, le même masque pour
+    // tous.
     let pid = pid as u32 as i32;
-    if pid != 0 && pid as i64 != self::pid() {
+    if pid != 0 && (pid < 0 || !processus::existe(pid as u32)) {
         return -ESRCH;
     }
     match copier_vers_utilisateur(masque, &1u64.to_le_bytes()) {

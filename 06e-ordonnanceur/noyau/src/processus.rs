@@ -1,17 +1,25 @@
-//! Le processus en cours : ce que les appels système d'un programme Linux
-//! doivent pouvoir modifier (sa mémoire : zones, tables de pages, tas ; ses
+//! Les processus : ce que les appels système d'un programme Linux doivent
+//! pouvoir modifier (sa mémoire : zones, tables de pages, tas ; ses
 //! descripteurs de fichiers ; son dossier courant). C'est une toute petite
 //! partie de la task_struct de Linux.
 //!
-//! Le noyau le range ici le temps de l'exécution (tache::executer), et le
-//! reprend ensuite pour le détruire. Un seul processus à la fois : un
-//! Verrou<Option<...>> ; l'ordonnanceur de l'étape 6 en fera une liste.
+//! Chaque processus est une `Entree` de la TABLE DES PROCESSUS, tenue par
+//! sa tâche (tache.rs) : `avec` donne celui de la tâche courante,
+//! `avec_pid` celui d'un numéro (kill, /proc, sched_getaffinity). Quand sa
+//! tâche meurt, elle rend elle-même la mémoire et les descripteurs du
+//! processus (le `exit_mm` et le `exit_files` de Linux) ; il reste un
+//! ZOMBIE : son numéro et son code de sortie, jusqu'à ce qu'init le
+//! recueille (programmes.rs) et le retire de la table. La table est
+//! réservée au démarrage pour autant de processus que de tâches : elle ne
+//! grandit jamais pendant un programme.
 //!
-//! Règle : jamais de copie depuis ou vers la mémoire du programme sous ce
-//! verrou (une copie peut fauter, et plus tard attendre le disque). On y
-//! lit ou change l'état, on rend le verrou, puis on copie.
+//! Règle : jamais de copie depuis ou vers la mémoire du programme sous le
+//! verrou d'un processus (une copie peut fauter, et plus tard attendre le
+//! disque). On y lit ou change l'état, on rend le verrou, puis on copie.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 
 use crate::descripteurs::{Descripteurs, LIMITE_DESCRIPTEURS};
 use crate::memoire::Memoire;
@@ -61,8 +69,8 @@ static PROCHAIN: AtomicU32 = AtomicU32::new(2);
 /// programmes le traitent autrement (Node et Bun, dans un conteneur). Le
 /// processus mène aussi son propre groupe et sa session, comme une
 /// commande lancée par un shell. Pas de recyclage des numéros avant
-/// pid_max (4 194 304 sous Linux) : avec un programme à la fois, il ne
-/// sera jamais atteint.
+/// pid_max (4 194 304 sous Linux) : des milliers de programmes par
+/// démarrage au plus, il ne sera jamais atteint.
 pub fn numero_neuf() -> u32 {
     PROCHAIN.fetch_add(1, Ordering::Relaxed)
 }
@@ -135,28 +143,95 @@ impl Drop for Processus {
     }
 }
 
-static COURANT: Verrou<Option<Processus>> = Verrou::new(None);
-
-/// Le processus devient le processus en cours.
-pub fn installer(processus: Processus) {
-    *COURANT.verrouiller() = Some(processus);
+/// Un processus de la table : son numéro, ce qu'il a tant qu'il vit
+/// (None une fois sa tâche morte : un zombie), et son code de sortie.
+pub struct Entree {
+    pid: u32,
+    processus: Verrou<Option<Processus>>,
+    code: AtomicI32,
 }
 
-/// Reprend le processus en cours (pour le détruire).
-pub fn retirer() -> Option<Processus> {
-    COURANT.verrouiller().take()
+impl Entree {
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// La fin de sa tâche : son code, puis sa mémoire et ses descripteurs
+    /// rendus (dans la tâche qui meurt, interruptions actives : rendre des
+    /// centaines de Mio prend du temps). Il reste le zombie.
+    pub fn terminer(&self, code: i32) {
+        self.code.store(code, Ordering::Relaxed);
+        let fini = self.processus.verrouiller().take();
+        drop(fini);
+    }
+
+    pub fn code(&self) -> i32 {
+        self.code.load(Ordering::Relaxed)
+    }
 }
 
-/// Exécute `f` sur le processus en cours (il y en a toujours un pendant un
-/// appel système), verrou tenu : `f` doit être court, et ne pas toucher à
-/// la mémoire du programme par ses adresses.
+static TABLE: Verrou<Vec<Arc<Entree>>> = Verrou::new(Vec::new());
+
+/// Réserve la table pour `max` processus. Au démarrage.
+pub fn initialiser(max: usize) {
+    TABLE.verrouiller().try_reserve_exact(max).expect("plus de memoire pour la table des processus");
+}
+
+/// Range un processus neuf dans la table ; None si elle est pleine (pas
+/// plus de processus que de tâches).
+pub fn ajouter(processus: Processus) -> Option<Arc<Entree>> {
+    let mut table = TABLE.verrouiller();
+    if table.len() == table.capacity() {
+        return None;
+    }
+    let e = Arc::new(Entree { pid: processus.pid, processus: Verrou::new(Some(processus)), code: AtomicI32::new(0) });
+    table.push(e.clone());
+    Some(e)
+}
+
+/// Retire de la table le zombie `pid`, recueilli (programmes.rs) : son
+/// code de sortie.
+pub fn recueillir(pid: u32) -> Option<i32> {
+    let mut table = TABLE.verrouiller();
+    let i = table.iter().position(|e| e.pid == pid)?;
+    Some(table.swap_remove(i).code())
+}
+
+/// Exécute `f` sur le processus de la tâche courante (il y en a toujours
+/// un pendant un appel système), verrou tenu : `f` doit être court, et ne
+/// pas toucher à la mémoire du programme par ses adresses.
 pub fn avec<R>(f: impl FnOnce(&mut Processus) -> R) -> R {
-    let mut courant = COURANT.verrouiller();
-    f(courant.as_mut().expect("appel systeme sans processus en cours"))
+    essayer_avec(f).expect("appel systeme sans processus en cours")
 }
 
-/// Comme `avec`, s'il y a un processus en cours : une faute de page du
-/// noyau peut arriver sans lui (le test du démarrage, dans main.rs).
+/// Comme `avec`, si la tâche courante a un processus vivant : une faute de
+/// page du noyau peut arriver sans lui (le test du démarrage, dans
+/// main.rs, une tâche du noyau).
 pub fn essayer_avec<R>(f: impl FnOnce(&mut Processus) -> R) -> Option<R> {
-    COURANT.verrouiller().as_mut().map(f)
+    if !crate::tache::en_service() {
+        return None;
+    }
+    let e = crate::tache::courante().processus()?;
+    let mut p = e.processus.verrouiller();
+    p.as_mut().map(f)
+}
+
+/// Exécute `f` sur le processus `pid`, s'il est dans la table et vivant
+/// (pas un zombie). None sinon.
+pub fn avec_pid<R>(pid: u32, f: impl FnOnce(&mut Processus) -> R) -> Option<R> {
+    let e = TABLE.verrouiller().iter().find(|e| e.pid == pid)?.clone();
+    let mut p = e.processus.verrouiller();
+    p.as_mut().map(f)
+}
+
+/// Appelle `f` sur le numéro de chaque processus de la table.
+pub fn pour_chaque_pid(mut f: impl FnMut(u32)) {
+    for e in TABLE.verrouiller().iter() {
+        f(e.pid);
+    }
+}
+
+/// Le processus `pid` est-il dans la table (vivant ou zombie) ?
+pub fn existe(pid: u32) -> bool {
+    TABLE.verrouiller().iter().any(|e| e.pid == pid)
 }

@@ -32,6 +32,7 @@ use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_t
 use fichiers::noyaufs::NoyauFs;
 use fichiers::tmpfs::{Attributs, Numero, Ouverture, limite_ecriture, suivre_pour};
 use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, permis};
+use crate::attente::{GardeMutex, Mutex};
 
 // Les numéros d'erreur de Linux qui ne viennent pas du tmpfs.
 const EBADF: i64 = 9;
@@ -722,6 +723,19 @@ fn lire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) ->
     }
 }
 
+/// Les verrous d'écriture des fichiers : un verrou qui dort (attente.rs)
+/// par inode, comme l'`inode_lock` de Linux. Plutôt qu'un verrou dans
+/// chaque inode (la bibliothèque des fichiers n'a pas de verrou qui dort),
+/// 64 verrous, celui d'un inode choisi par son numéro : deux écritures du
+/// même fichier se suivent toujours, deux de fichiers différents ne
+/// s'attendent que s'ils tombent sur le même (comme les seaux des futex).
+static VERROUS_D_ECRITURE: [Mutex<()>; 64] = [const { Mutex::new(()) }; 64];
+
+/// Le verrou d'écriture de l'inode `n`, tenu jusqu'à la fin de la garde.
+pub fn verrou_d_ecriture(n: Numero) -> GardeMutex<'static, ()> {
+    VERROUS_D_ECRITURE[n.0 as usize % 64].verrouiller()
+}
+
 /// Écrire, selon la sorte du fichier.
 fn ecrire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
     // Comme pour lire : ESPIPE, puis EINVAL pour un epoll.
@@ -736,6 +750,11 @@ fn ecrire_ouvert(o: &Ouvert, position: Option<u64>, tampon: u64, longueur: u64) 
     let longueur = verifier_transfert(tampon, longueur, position.unwrap_or(o.position))?;
     match o.sorte {
         Sorte::Fichier => {
+            // Le verrou d'écriture de l'inode, tenu de la lecture de la fin
+            // jusqu'à la nouvelle position : deux programmes qui ajoutent au
+            // même fichier ne s'écrasent pas (l'`inode_lock` de Linux,
+            // pendant tout `generic_file_write_iter`).
+            let _ecriture = verrou_d_ecriture(o.numero());
             // O_APPEND : toujours à la fin, même pour pwrite (une
             // bizarrerie de Linux, que décrit sa page de manuel).
             let fin = vfs::avec(|fs, _| fs.attributs(o.numero()).taille);
@@ -1556,6 +1575,25 @@ pub fn ouvrir_console(descripteurs: &mut crate::descripteurs::Descripteurs) -> R
         }
     }
     Ok(())
+}
+
+/// L'entrée standard d'un programme lancé par `&` : /dev/null, ouvert en
+/// lecture au numéro 0, à la place de la console (POSIX, pour un `sh` sans
+/// contrôle des tâches : « asynchronous lists »).
+pub fn entree_sur_null(descripteurs: &mut crate::descripteurs::Descripteurs) -> Result<(), Erreur> {
+    let null = ouvrir_pour_le_noyau(b"/dev/null", true, false)?;
+    match descripteurs.remplacer(0, Descripteur { fichier: null, fermer_a_l_exec: false }) {
+        Ok(ancien) => {
+            if let Some(d) = ancien {
+                vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
+            }
+            Ok(())
+        }
+        Err(()) => {
+            vfs::avec_systeme(|s, cadres| s.lacher(null, cadres));
+            Err(Erreur::ENOMEM)
+        }
+    }
 }
 
 // ----- L'arborescence -----

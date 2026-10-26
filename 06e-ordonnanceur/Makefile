@@ -239,6 +239,15 @@ $(LINUX)/proc: linux/proc.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
+# Deux programmes à la fois (6e) : lancés par `&` dans /etc/demarrage.
+$(LINUX)/partage: linux/partage.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/ajout: linux/ajout.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
 $(LINUX)/bonjour-c-deux-segments: linux/bonjour.c
 	mkdir -p $(LINUX)
 	gcc -static -Wl,-z,noseparate-code $(CFLAGS_LINUX) $< -o $@
@@ -302,6 +311,12 @@ $(LINUX)/dynamique: linux/dynamique.c
 # (il doit le dire) ; ses lignes refusées, chacune avec son numéro, sont
 # en tête du fichier (voir tests-demarrage.txt). Enfin bonjour-asm, pour
 # montrer que le noyau exécute encore des programmes après tout cela.
+# Des programmes de test lancés ensemble par `&` (6e), avec leurs
+# arguments, après les autres : deux qui écrivent 200 lignes longues sur la
+# console (lignes : make tests-qemu compte les lignes entières de chacun),
+# une cible qui dort 10 s et un programme qui lui envoie SIGTERM
+# (signaler), qui doit la réveiller.
+TESTS_PARALLELES = lignes cible signaler
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle calcul-long limite-egale \
               sig-term sig-abort sig-gestion sig-faute xcpu-ignore futex-sans-fin nom-faute eventfd-bloque \
@@ -475,11 +490,11 @@ $(GLIBC)/.copiee: $(LINUX)/libessai.so FORCE
 # ligne par programme (voir archive.sh), avec son /etc/demarrage
 # (tests-demarrage.txt), qui les lance l'un après l'autre.
 LECTEUR = lecteur/target/wasm32-unknown-unknown/release/lecteur.wasm
-tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_LINUX) $(TESTS_INTERP)) $(INTERPRETEURS) \
+tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_LINUX) $(TESTS_INTERP) $(TESTS_PARALLELES)) $(INTERPRETEURS) \
             $(LINUX)/bonjour-asm $(GLIBC)/.copiee FORCE
 	cd lecteur && cargo build --release
 	{ echo "dir /bin 755 0 0"; \
-	  for p in $(TESTS_LINUX) $(TESTS_INTERP); do echo "file /bin/$$p $(LINUX)/tests/$$p 755 0 0"; done; \
+	  for p in $(TESTS_LINUX) $(TESTS_INTERP) $(TESTS_PARALLELES); do echo "file /bin/$$p $(LINUX)/tests/$$p 755 0 0"; done; \
 	  echo "file /bin/lecteur.wasm $(LECTEUR) 755 0 0"; \
 	  echo "file /bin/bonjour-asm $(LINUX)/bonjour-asm 755 0 0"; \
 	  echo "dir /etc 755 0 0"; \
@@ -515,6 +530,12 @@ tests-demarrage.txt: Makefile
 	  echo "/bin/bonjour-asm/"; \
 	  echo "/etc/demarrage"; \
 	  for p in $(TESTS_LINUX) $(TESTS_INTERP); do echo "/bin/$$p"; done; \
+	  echo "/bin/lignes a 200 &"; \
+	  echo "/bin/lignes b 200 &"; \
+	  echo "wait"; \
+	  echo "/bin/cible &"; \
+	  echo "/bin/signaler"; \
+	  echo "wait"; \
 	  echo "/bin/lecteur.wasm"; \
 	  echo "/bin/bonjour-asm"; } > $@
 
@@ -557,7 +578,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc FORCE
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
@@ -667,7 +688,7 @@ SHELL = /bin/bash
 .DELETE_ON_ERROR:
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
-            $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc
+            $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -687,6 +708,9 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/systeme | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/evenements | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/proc | tee /dev/stderr | (! grep -q ECHEC)
+	rm -rf /tmp/ajout; \
+	  ./$(LINUX)/ajout ecrire a 500 & a=$$!; ./$(LINUX)/ajout ecrire b 500 & b=$$!; \
+	  ./$(LINUX)/ajout verifier 500 | tee /dev/stderr | (! grep -q ECHEC); r=$$?; wait $$a $$b; exit $$r
 
 suite: $(SUITE)/.convertie
 
@@ -726,7 +750,10 @@ $(WAST2JSON):
 #     les fonctions que QEMU sait imiter (-cpu max : SMEP, SMAP, UMIP...),
 #     pour passer aussi par les chemins « si le processeur l'a » ; avec, en
 #     plus, les lignes propres à chacun (tests-attendu-qemu64.txt,
-#     tests-attendu-max.txt).
+#     tests-attendu-max.txt). Et aucun ECHEC dans le journal (depuis 6e :
+#     « memoire rendue » de plusieurs groupes de programmes en parallèle
+#     s'écrit pareil, un ECHEC serait caché par un ok ; cible dit ECHEC
+#     si le signal ne l'a pas réveillée).
 #   - sans tables ACPI (-machine pc,acpi=off), le noyau ordinaire sur
 #     l'archive vide (vide.bin) : il doit revenir au 8259 et au PIT, le
 #     dire, et le clavier doit être prêt (depuis 6e) ;
@@ -755,12 +782,17 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin
 	  $(QEMU_PROGRAMMES) -cpu $$cpu -serial file:$$journal -monitor unix:$(MON_TESTS),server,nowait; code=$$?; \
 	  [ $$code -eq 1 ] || { echo "-cpu $$cpu : QEMU n'a pas ete eteint par le noyau (code $$code)"; exit 1; }; \
 	  sed -n '/Test : dort/,/dort : reveille/p' $$journal | grep -q k || { echo "-cpu $$cpu : la touche n'a pas ete affichee pendant que dort dormait"; exit 1; }; \
+	  for nom in a b; do \
+	    n=$$(grep -cE "^\[linux\] lignes $$nom [0-9]{4} $$nom{160}$$" $$journal); \
+	    [ $$n -eq 200 ] || { echo "-cpu $$cpu : $$n lignes entieres de lignes $$nom sur 200"; exit 1; }; \
+	  done; \
 	  while IFS= read -r ligne; do \
 	    grep -qF -- "$$ligne" test-programmes-$$cpu.log || { echo "-cpu $$cpu : manque « $$ligne »"; exit 1; }; \
 	  done < tests-attendu.txt; \
 	  while IFS= read -r ligne; do \
 	    grep -qF -- "$$ligne" test-programmes-$$cpu.log || { echo "-cpu $$cpu : manque « $$ligne »"; exit 1; }; \
 	  done < tests-attendu-$$cpu.txt; \
+	  ! grep -n ECHEC $$journal || { echo "-cpu $$cpu : un ECHEC dans le journal"; exit 1; }; \
 	done
 
 # La trace des appels système : le noyau construit avec la fonctionnalité

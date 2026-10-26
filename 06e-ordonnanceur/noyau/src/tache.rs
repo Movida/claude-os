@@ -162,8 +162,12 @@ pub struct Tache {
     pile: Verrou<Option<Pile>>,
     /// Le sommet de sa pile (pour TSS.rsp0).
     haut: u64,
-    /// L'espace d'adressage où elle s'exécute (la PML4, pour CR3).
-    espace: u64,
+    /// L'espace d'adressage où elle s'exécute (la PML4, pour CR3) : celui
+    /// du noyau pour une tâche du noyau, et pour un programme qui meurt
+    /// (avant de rendre le sien, `terminer`).
+    espace: AtomicU64,
+    /// Son processus, pour un programme Linux (processus.rs).
+    processus: Option<Arc<crate::processus::Entree>>,
     /// Pour un programme : son état x87/SSE, ses sélecteurs (DS, ES, FS,
     /// GS) et sa base de FS, quand il ne s'exécute pas.
     programme: Option<UnsafeCell<EtatProgramme>>,
@@ -227,7 +231,7 @@ unsafe impl Send for Tache {}
 impl Tache {
     /// Une tâche, sans encore de premier départ. None : plus de mémoire,
     /// ou plus de place pour une pile (le maximum de fils).
-    fn creer(nom: NomCourt, espace: u64, programme: bool) -> Option<Arc<Tache>> {
+    fn creer(nom: NomCourt, espace: u64, programme: bool, processus: Option<Arc<crate::processus::Entree>>) -> Option<Arc<Tache>> {
         let pile = Pile::allouer()?;
         let haut = pile.haut();
         let programme = if programme {
@@ -242,7 +246,8 @@ impl Tache {
             contexte: UnsafeCell::new(0),
             pile: Verrou::new(Some(pile)),
             haut,
-            espace,
+            espace: AtomicU64::new(espace),
+            processus,
             programme,
             morte: AtomicBool::new(false),
             code_sortie: AtomicI32::new(0),
@@ -312,6 +317,11 @@ impl Tache {
     /// Le lien de file d'attente (attente.rs).
     pub fn lien_attente(&self) -> &Cell<*const Tache> {
         &self.lien_attente
+    }
+
+    /// Son processus, pour un programme Linux.
+    pub fn processus(&self) -> Option<&Arc<crate::processus::Entree>> {
+        self.processus.as_ref()
     }
 
     /// Est-ce un programme (et pas une tâche du noyau) ?
@@ -401,7 +411,8 @@ pub fn initialiser() {
         contexte: UnsafeCell::new(0),
         pile: Verrou::new(None),
         haut: 0,
-        espace: pagination::pml4_noyau(),
+        espace: AtomicU64::new(pagination::pml4_noyau()),
+        processus: None,
         programme: None,
         morte: AtomicBool::new(false),
         code_sortie: AtomicI32::new(0),
@@ -476,6 +487,21 @@ pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) {
     }
 }
 
+/// Un signal vient d'être mis en attente pour le processus `pid` : sa
+/// tâche, si elle dort interruptible, est réveillée (le `signal_wake_up`
+/// de Linux).
+pub fn reveiller_par_signal(pid: u32) {
+    let mut cible = None;
+    pour_chaque(|t| {
+        if t.processus.as_ref().is_some_and(|p| p.pid() == pid) && t.interruptible.load(Ordering::Relaxed) {
+            cible = Some(t.clone());
+        }
+    });
+    if let Some(t) = cible {
+        reveiller(t, Reveil::Signal);
+    }
+}
+
 /// Un signal attend la tâche courante, qui doit finir son attente
 /// interruptible : sa fin prévue (SIGKILL forcé, exit_group d'un autre
 /// fil), le tueur OOM, ou un signal en attente qu'elle ne bloque pas.
@@ -534,8 +560,9 @@ pub fn basculer_vers(nouvelle: &Tache) {
                  options(nostack, preserves_flags));
             cpu::ecrire_base_fs(p.base_fs);
         }
-        if pagination::courante() != nouvelle.espace {
-            pagination::activer(nouvelle.espace);
+        let espace = nouvelle.espace.load(Ordering::Relaxed);
+        if pagination::courante() != espace {
+            pagination::activer(espace);
         }
         if nouvelle.haut != 0 {
             gdt::definir_pile_noyau(nouvelle.haut);
@@ -565,12 +592,6 @@ extern "C" fn fin_de_bascule() {
     }
 }
 
-/// Rend `t` prête, et attend sa fin : son code de sortie.
-fn faire_tourner(t: Arc<Tache>) -> i32 {
-    ordonnanceur::rendre_prete(t.clone(), true);
-    attendre(&t)
-}
-
 /// Attend la fin de la tâche `t` : la tâche courante dort jusqu'à ce que
 /// `terminer` la réveille. Sans réveil perdu : la fin est vérifiée, et
 /// l'attente inscrite, interruptions coupées, comme la fin elle-même ; sur
@@ -593,11 +614,12 @@ pub fn attendre(t: &Tache) -> i32 {
 /// le bit 1, toujours à 1. IOPL = 0 : pas de `in`, `out`, `cli`, `sti`.
 const RFLAGS_INITIAL: u64 = 1 << 9 | 1 << 1;
 
-/// Exécute un programme : `pml4` son espace d'adressage, `entree` son point
-/// d'entrée, `pile` le sommet de sa pile. Revient quand il se termine, avec
-/// son code de sortie ; None : pas de pile noyau pour sa tâche.
-pub fn executer(nom: NomCourt, pml4: u64, entree: u64, pile: u64) -> Option<i32> {
-    let t = Tache::creer(nom, pml4, true)?;
+/// Lance un programme, prêt aussitôt : `processus` son processus, `pml4`
+/// son espace d'adressage, `entree` son point d'entrée, `pile` le sommet
+/// de sa pile. None : pas de pile noyau pour sa tâche.
+pub fn lancer_programme(nom: NomCourt, processus: Arc<crate::processus::Entree>, pml4: u64, entree: u64, pile: u64)
+    -> Option<Arc<Tache>> {
+    let t = Tache::creer(nom, pml4, true, Some(processus))?;
     t.preparer(premier_depart, 0, Some(Cadre {
         r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
         rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
@@ -609,7 +631,8 @@ pub fn executer(nom: NomCourt, pml4: u64, entree: u64, pile: u64) -> Option<i32>
         rsp: pile,
         ss: gdt::DONNEES_UTILISATEUR as u64,
     }));
-    Some(faire_tourner(t))
+    ordonnanceur::rendre_prete(t.clone(), true);
+    Some(t)
 }
 
 /// La fonction d'une tâche du noyau.
@@ -618,24 +641,12 @@ type FonctionNoyau = Box<dyn FnOnce() + Send>;
 /// Lance `f` dans une tâche du noyau nommée `nom`, prête aussitôt ; None :
 /// pas de pile pour la tâche.
 pub fn lancer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> Option<Arc<Tache>> {
-    let t = Tache::creer(nom, pagination::pml4_noyau(), false)?;
+    let t = Tache::creer(nom, pagination::pml4_noyau(), false, None)?;
     // Un pointeur simple vers la fermeture, pour r12 : une boîte de boîte.
     let f: Box<FonctionNoyau> = Box::new(Box::new(f));
     t.preparer(depart_noyau, Box::into_raw(f) as u64, None);
     ordonnanceur::rendre_prete(t.clone(), true);
     Some(t)
-}
-
-/// Exécute `f` dans une tâche du noyau nommée `nom`, et revient quand elle
-/// a fini ; false : pas de pile pour la tâche.
-pub fn executer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> bool {
-    match lancer_noyau(nom, f) {
-        Some(t) => {
-            attendre(&t);
-            true
-        }
-        None => false,
-    }
 }
 
 /// Le corps d'une tâche du noyau (depart_noyau) : sa fonction, puis sa fin.
@@ -656,6 +667,20 @@ extern "C" fn tache_noyau(f: *mut FonctionNoyau) -> ! {
 pub fn terminer(code: i32) -> ! {
     let t = courante();
     t.code_sortie.store(code, Ordering::Relaxed);
+    if let Some(p) = &t.processus {
+        // La tâche passe d'abord sur l'espace du noyau, interruptions
+        // coupées : si elle est préemptée pendant qu'elle rend celui du
+        // programme (long, et préemptible), la bascule qui la reprendra
+        // chargera la PML4 du noyau, jamais des tables qu'on détruit.
+        let interruptions = cpu::couper_interruptions();
+        t.espace.store(pagination::pml4_noyau(), Ordering::Relaxed);
+        // SAFETY : la PML4 du noyau est complète.
+        unsafe { pagination::activer(pagination::pml4_noyau()) };
+        if interruptions {
+            cpu::activer_interruptions();
+        }
+        p.terminer(code);
+    }
     cpu::couper_interruptions();
     t.morte.store(true, Ordering::Relaxed);
     // Une référence à elle-même, pour la fin de bascule qui rendra sa pile.

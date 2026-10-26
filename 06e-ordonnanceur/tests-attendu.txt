@@ -147,3 +147,7 @@
 [linux] Test : dort 1,5 s.
 [linux] dort : reveille (0).
 [noyau] dort : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] signaler : sched_getaffinity de cible, et SIGTERM envoye : ok
+[noyau] cible : arrete par un signal (SIGTERM)
+[noyau] cible : termine, code de sortie 143.
+[noyau] Programmes en parallele : memoire rendue : ok.
