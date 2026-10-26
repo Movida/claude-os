@@ -49,6 +49,8 @@ const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
+const EINTR: i64 = 4;
+const EOPNOTSUPP: i64 = 95;
 const ENODEV: i64 = 19;
 const EOVERFLOW: i64 = 75;
 
@@ -124,6 +126,8 @@ const TIME: u64 = 201;
 const SET_TID_ADDRESS: u64 = 218;
 const CLOCK_GETTIME: u64 = 228;
 const CLOCK_GETRES: u64 = 229;
+const NANOSLEEP: u64 = 35;
+const CLOCK_NANOSLEEP: u64 = 230;
 const EXIT_GROUP: u64 = 231;
 const OPENAT: u64 = 257;
 const NEWFSTATAT: u64 = 262;
@@ -282,6 +286,8 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         GETGID | GETEGID => processus::avec(|p| p.identite.gid) as i64,
         CLOCK_GETTIME => clock_gettime(a[0], a[1]),
         CLOCK_GETRES => clock_getres(a[0], a[1]),
+        NANOSLEEP => clock_nanosleep(temps::CLOCK_MONOTONIC, 0, a[0], a[1]),
+        CLOCK_NANOSLEEP => clock_nanosleep(a[0], a[1], a[2], a[3]),
         GETTIMEOFDAY => gettimeofday(a[0], a[1]),
         TIME => time(a[0]),
         // Le code de sortie tient sur 8 bits : Linux ne garde que l'octet
@@ -411,6 +417,8 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         GETEGID => ("getegid", 0),
         CLOCK_GETTIME => ("clock_gettime", 2),
         CLOCK_GETRES => ("clock_getres", 2),
+        NANOSLEEP => ("nanosleep", 2),
+        CLOCK_NANOSLEEP => ("clock_nanosleep", 4),
         GETTIMEOFDAY => ("gettimeofday", 2),
         TIME => ("time", 1),
         EXIT => ("exit", 1),
@@ -1080,6 +1088,101 @@ fn sysinfo(info: u64) -> i64 {
         Ok(()) => 0,
         Err(_) => -EFAULT,
     }
+}
+
+/// clock_nanosleep(horloge, drapeaux, durée, reste) et nanosleep(durée,
+/// reste) (sur CLOCK_MONOTONIC, comme Linux) : dormir une durée, ou
+/// jusqu'à une échéance absolue (TIMER_ABSTIME), dans l'ordre de Linux
+/// (kernel/time/posix-timers.c), mesuré sur 6.18 :
+///   1. l'horloge : REALTIME, MONOTONIC, BOOTTIME, TAI et
+///      PROCESS_CPUTIME_ID dorment ; THREAD_CPUTIME_ID, MONOTONIC_RAW et
+///      les _COARSE n'ont pas d'attente (EOPNOTSUPP) ; une inconnue, EINVAL
+///      (les numéros négatifs, horloges de calcul d'un autre processus ou
+///      d'un fil, que Linux accepte : EINVAL chez nous, un écart) ;
+///   2. la durée lue (EFAULT), puis vérifiée (EINVAL : secondes négatives,
+///      nanosecondes hors de [0, 10^9[) ;
+///   3. les horloges des alarmes (REALTIME_ALARM, BOOTTIME_ALARM) : un
+///      drapeau inconnu, EINVAL ; sinon il faudrait pouvoir réveiller la
+///      machine (CAP_WAKE_ALARM) : EPERM. Pour les autres, les drapeaux
+///      autres que TIMER_ABSTIME sont ignorés ;
+///   4. une échéance déjà passée : 0 aussitôt ; sinon dormir,
+///      interruptible : un signal rend EINTR, et le temps qui restait est
+///      écrit à `reste` pour une durée relative (s'il est demandé ; pour
+///      une échéance absolue, il ne sert à rien : jamais écrit).
+/// L'attente se fait au tic qui suit l'échéance, jamais avant (attente.rs).
+/// Sur CLOCK_PROCESS_CPUTIME_ID, on attend que le temps de calcul du
+/// processus atteigne l'échéance : un programme d'un seul fil qui dort ne
+/// calcule plus, il attend pour toujours (mesuré sous Linux).
+fn clock_nanosleep(horloge: u64, drapeaux: u64, duree: u64, reste: u64) -> i64 {
+    const TIMER_ABSTIME: u64 = 1;
+    const CLOCK_REALTIME_ALARM: u64 = 8;
+    const CLOCK_BOOTTIME_ALARM: u64 = 9;
+    use temps::{CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
+                CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID};
+    let alarme = matches!(horloge, CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM);
+    match horloge {
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI | CLOCK_PROCESS_CPUTIME_ID => {}
+        _ if alarme => {}
+        CLOCK_THREAD_CPUTIME_ID | CLOCK_MONOTONIC_RAW | CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => return -EOPNOTSUPP,
+        _ => return -EINVAL,
+    }
+    let mut o = [0u8; 16];
+    if copier_depuis_utilisateur(&mut o, duree).is_err() {
+        return -EFAULT;
+    }
+    let secondes = i64::from_le_bytes(o[..8].try_into().unwrap_or([0; 8]));
+    let nanosecondes = i64::from_le_bytes(o[8..].try_into().unwrap_or([0; 8]));
+    if secondes < 0 || !(0..1_000_000_000).contains(&nanosecondes) {
+        return -EINVAL;
+    }
+    if alarme {
+        return if drapeaux & !TIMER_ABSTIME != 0 { -EINVAL } else { -EPERM };
+    }
+    let demande = (secondes as u128 * 1_000_000_000 + nanosecondes as u128).min(u64::MAX as u128) as u64;
+    let absolue = drapeaux & TIMER_ABSTIME != 0;
+    let interruptions = cpu::couper_interruptions();
+    let (reveil, fin_restante) = if horloge == CLOCK_PROCESS_CPUTIME_ID {
+        let maintenant = tache::temps_de_calcul();
+        let cible = if absolue { demande } else { maintenant.saturating_add(demande) };
+        let r = crate::attente::dormir_calcul(tache::courante_arc(), cible);
+        (r, cible.saturating_sub(tache::temps_de_calcul()))
+    } else {
+        // L'échéance en temps monotone : les horloges de dates (REALTIME,
+        // TAI) ne diffèrent du temps monotone que d'un écart fixe (la date
+        // ne se règle pas encore).
+        let mono = temps::ns_monotone();
+        let echeance = if !absolue {
+            mono.saturating_add(demande)
+        } else if matches!(horloge, CLOCK_REALTIME | CLOCK_TAI) {
+            let reel = temps::maintenant();
+            let reel = reel.secondes as i128 * 1_000_000_000 + reel.nanosecondes as i128;
+            (demande as i128 - reel + mono as i128).clamp(0, u64::MAX as i128) as u64
+        } else {
+            demande
+        };
+        let r = loop {
+            // Rien d'autre que l'échéance ou un signal ne la réveille : un
+            // réveil sans raison se rendort.
+            match crate::attente::dormir(Some(echeance), crate::attente::Sommeil::Interruptible) {
+                tache::Reveil::Reveillee => continue,
+                r => break r,
+            }
+        };
+        (r, echeance.saturating_sub(temps::ns_monotone()))
+    };
+    if interruptions {
+        cpu::activer_interruptions();
+    }
+    if reveil != tache::Reveil::Signal {
+        return 0;
+    }
+    if !absolue && reste != 0 {
+        let t = fichiers::Temps { secondes: (fin_restante / 1_000_000_000) as i64, nanosecondes: (fin_restante % 1_000_000_000) as u32 };
+        if ecrire_timespec(reste, t).is_err() {
+            return -EFAULT;
+        }
+    }
+    -EINTR
 }
 
 /// Écrit un `struct timespec` (secondes, nanosecondes : deux entiers de 64

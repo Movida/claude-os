@@ -284,7 +284,9 @@ $(LINUX)/dynamique: linux/dynamique.c
 # rien ne peut réveiller (futex-sans-fin : arrêté, le message le dit), de
 # même un eventfd vide lu en bloquant (eventfd-bloque), un
 # programme qui change de nom (PR_SET_NAME) puis fait une faute
-# (nom-faute : le message porte le nouveau nom) ; puis des
+# (nom-faute : le message porte le nouveau nom), un programme qui dort
+# (dort : une touche tapée pendant son sommeil est affichée avant son
+# réveil, voir tests-qemu) ; puis des
 # exécutables que le noyau doit refuser :
 #   - wx : un segment W+X (ld -N) ;
 #   - derniere-page : des segments dans les dernières pages de la moitié
@@ -303,7 +305,7 @@ $(LINUX)/dynamique: linux/dynamique.c
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle calcul-long limite-egale \
               sig-term sig-abort sig-gestion sig-faute xcpu-ignore futex-sans-fin nom-faute eventfd-bloque \
-              wx derniere-page et-dyn tronque bus-fichier faute-libc
+              wx derniere-page et-dyn tronque bus-fichier faute-libc dort
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
 	mkdir -p $(LINUX)/tests
@@ -732,6 +734,11 @@ $(WAST2JSON):
 #   QEMU est arrêté dès que la ligne cherchée est venue (`attendre`), au
 #   lieu d'attendre DUREE.
 QEMU_TEST = qemu-system-x86_64 -display none -no-reboot
+# Le moniteur de QEMU pendant les programmes de test (une touche envoyée
+# pendant que `dort` dort) : une socket dans le dossier de l'étape, pour
+# que deux vérifications en même temps (le dossier de travail et un
+# worktree de verifier-historique) ne se gênent pas.
+MON_TESTS = mon-tests.sock
 QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
@@ -740,9 +747,14 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin
 	$(call attendre,$(QEMU_TEST) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"Clavier PS/2 pret",:)
 	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
 	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-gros.bin -serial file:test-gros.log,test-gros.log,"chaque secteur a sa place : ok",:)
+	command -v nc >/dev/null || { echo "nc manque (paquet netcat-openbsd) : la touche de dort ne pourrait pas etre envoyee"; exit 1; }
 	for cpu in qemu64 max; do \
-	  $(QEMU_PROGRAMMES) -cpu $$cpu -serial file:test-programmes-$$cpu.log; code=$$?; \
+	  journal=test-programmes-$$cpu.log; rm -f $$journal $(MON_TESTS); \
+	  ( for i in $$(seq 300); do grep -qF "[linux] Test : dort" $$journal 2>/dev/null && break; sleep 0.1; done; \
+	    echo "sendkey k" | nc -U -q1 $(MON_TESTS) >/dev/null 2>&1 ) & \
+	  $(QEMU_PROGRAMMES) -cpu $$cpu -serial file:$$journal -monitor unix:$(MON_TESTS),server,nowait; code=$$?; \
 	  [ $$code -eq 1 ] || { echo "-cpu $$cpu : QEMU n'a pas ete eteint par le noyau (code $$code)"; exit 1; }; \
+	  sed -n '/Test : dort/,/dort : reveille/p' $$journal | grep -q k || { echo "-cpu $$cpu : la touche n'a pas ete affichee pendant que dort dormait"; exit 1; }; \
 	  while IFS= read -r ligne; do \
 	    grep -qF -- "$$ligne" test-programmes-$$cpu.log || { echo "-cpu $$cpu : manque « $$ligne »"; exit 1; }; \
 	  done < tests-attendu.txt; \
@@ -802,7 +814,7 @@ test-%.bin: vide.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin vide*.bin test-*.bin programmes.cpio tests.cpio vide.cpio tests-demarrage.txt serial.log trace.log capture.log qemu.log ecran.png test-*.log
+	rm -f boot*.bin vide*.bin test-*.bin programmes.cpio tests.cpio vide.cpio tests-demarrage.txt serial.log trace.log capture.log qemu.log ecran.png test-*.log $(MON_TESTS)
 	rm -rf $(LINUX)
 	rm -rf $(GLIBC)
 	rm -rf $(SUITE)

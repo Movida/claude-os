@@ -27,6 +27,8 @@
 //! démarrage BIOS. Un vrai pilote USB (contrôleur xHCI) viendra bien plus
 //! tard.
 
+use crate::attente::{self, FileAttente, Sommeil};
+use crate::cpu;
 use crate::port;
 use crate::verrou::Verrou;
 
@@ -141,6 +143,8 @@ struct File {
     octets: [u8; 64],
     debut: usize,
     nombre: usize,
+    /// Les tâches qui attendent un code (la tâche du clavier).
+    attente: FileAttente,
 }
 
 impl File {
@@ -163,7 +167,7 @@ impl File {
     }
 }
 
-static FILE: Verrou<File> = Verrou::new(File { octets: [0; 64], debut: 0, nombre: 0 });
+static FILE: Verrou<File> = Verrou::new(File { octets: [0; 64], debut: 0, nombre: 0, attente: FileAttente::new() });
 
 /// Le gestionnaire de l'IRQ 1 : lire l'octet, le ranger, c'est tout.
 /// Il FAUT le lire : tant que le port 0x60 est plein, le 8042 n'envoie
@@ -171,7 +175,11 @@ static FILE: Verrou<File> = Verrou::new(File { octets: [0; 64], debut: 0, nombre
 pub fn interruption() {
     // SAFETY : l'IRQ 1 signifie qu'un octet attend sur le port 0x60.
     let code = unsafe { port::lire(DONNEES) };
-    FILE.verrouiller().ajouter(code);
+    let mut f = FILE.verrouiller();
+    f.ajouter(code);
+    // Qui attendait un caractère peut le lire : il est réveillé, et le
+    // traitera hors de l'interruption (la « moitié basse » de Linux).
+    f.attente.reveiller_toutes();
 }
 
 // ---------------------------------------------------------------------------
@@ -357,7 +365,24 @@ pub fn lire_caractere() -> Option<char> {
     }
 }
 
-/// Y a-t-il des codes en attente ? Pour décider de dormir ou non.
-pub fn en_attente() -> bool {
-    FILE.verrouiller().nombre > 0
+/// La tâche du clavier : elle dort tant qu'aucune touche n'est tapée, puis
+/// affiche ce qui l'a été (l'écho du terminal, que fera la discipline de
+/// ligne en 6j). Ne revient pas.
+pub fn tache() {
+    loop {
+        cpu::couper_interruptions();
+        {
+            let mut f = FILE.verrouiller();
+            if f.nombre == 0 {
+                f.attente.inscrire();
+                drop(f);
+                attente::dormir(None, Sommeil::Ininterruptible);
+                FILE.verrouiller().attente.retirer(crate::tache::courante());
+            }
+        }
+        cpu::activer_interruptions();
+        while let Some(c) = lire_caractere() {
+            afficher!("{}", c);
+        }
+    }
 }

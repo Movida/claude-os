@@ -270,6 +270,13 @@ pub fn envoyer(p: &mut Processus, sig: u64, a: Destinataire) {
     }
 }
 
+/// Un signal attend-il, que le programme ne bloque pas ? (Une attente
+/// interruptible finit alors : attente.rs.) Un signal ignoré n'est jamais
+/// en attente : il est jeté à l'envoi (`envoyer`), ou en devenant ignoré.
+pub fn en_attente_non_bloque(p: &mut Processus) -> bool {
+    p.signaux.en_attente() & !p.signaux.bloques != 0
+}
+
 /// Le prochain signal à livrer, s'il y en a un qui arrête le programme :
 /// appelée au retour vers l'anneau 3, comme le `get_signal` de Linux. Les
 /// signaux en attente et non bloqués sont pris un par un, comme le fait

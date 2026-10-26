@@ -235,12 +235,6 @@ pub fn tic() {
     }
 }
 
-/// Le temps passé depuis le dernier compte n'est pas du calcul (la tâche
-/// courante a attendu, processeur arrêté) : le compte repart d'ici.
-pub fn oublier_temps() {
-    FILE.verrouiller().depuis = crate::temps::ns_monotone();
-}
-
 /// Une autre tâche que la courante est-elle prête ?
 pub fn autres_pretes() -> bool {
     let f = FILE.verrouiller();

@@ -10,6 +10,7 @@ capture.log
 qemu.log
 ecran.png
 ecran.ppm
+mon-tests.sock
 
 # Compilation du noyau Rust
 target/

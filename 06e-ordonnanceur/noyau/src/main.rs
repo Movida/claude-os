@@ -23,6 +23,7 @@ mod console;
 mod acpi;
 mod aleatoire;
 mod apic;
+mod attente;
 mod appel_systeme;
 mod appels_fichiers;
 mod cadres;
@@ -246,6 +247,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // tâches prêtes, réservée pour autant de tâches que de piles.
     tache::initialiser();
     ordonnanceur::initialiser(vmalloc::max_threads());
+    attente::initialiser(vmalloc::max_threads());
     tester_espace_utilisateur();
     match acpi::initialiser() {
         Ok(()) => acpi::afficher(),
@@ -304,19 +306,24 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     }
 
     // Le scénario de panne de `make tests-qemu` : déborder exprès de la
-    // pile, que la page de garde doit arrêter net.
-    // Dans une tâche du noyau, sur sa pile de vmalloc : c'est la page de
-    // garde de chaque tâche qui est vérifiée.
+    // pile, que la page de garde doit arrêter net. Dans une tâche du noyau,
+    // sur sa pile de vmalloc : c'est la page de garde de chaque tâche qui
+    // est vérifiée.
     #[cfg(feature = "test-garde")]
     {
         afficherln!("[noyau] Test : debordement volontaire de la pile d'une tache.");
-        tache::executer_noyau(programmes::NomCourt::de(b"test-garde"), || {
+        tache::lancer_noyau(programmes::NomCourt::de(b"test-garde"), || {
             deborder(0);
         });
     }
 
+    // Le clavier, et sa tâche : elle dort jusqu'à ce qu'une touche soit
+    // tapée, puis l'affiche.
     match clavier::initialiser() {
-        Ok(()) => afficherln!("[noyau] Clavier PS/2 pret : tapez du texte."),
+        Ok(()) => {
+            tache::lancer_noyau(programmes::NomCourt::de(b"clavier"), clavier::tache);
+            afficherln!("[noyau] Clavier PS/2 pret : tapez du texte.")
+        }
         Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
     }
 
@@ -327,37 +334,36 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     let init = || {
         tester_ordonnanceur();
         programmes::demarrer();
+        // Le scénario des programmes de test de `make tests-qemu` : une
+        // fois l'archive exécutée, éteindre QEMU par son périphérique
+        // isa-debug-exit (présent seulement si on le demande à QEMU, à ce
+        // port-là). Jamais dans le noyau ordinaire : sur une vraie
+        // machine, ce port peut être n'importe quoi.
+        #[cfg(feature = "test-programmes")]
+        {
+            afficherln!("[noyau] Fin des tests : extinction de QEMU.");
+            // SAFETY : le port 0xf4 est celui d'isa-debug-exit dans
+            // `make tests-qemu` ; QEMU s'arrête aussitôt.
+            unsafe { port::ecrire(0xf4, 0) };
+        }
     };
-    if !tache::executer_noyau(programmes::NomCourt::de(b"init"), init) {
+    if tache::lancer_noyau(programmes::NomCourt::de(b"init"), init).is_none() {
         afficherln!("[noyau] Pas de pile pour la tache init : rien a lancer.");
     }
 
-    // Le scénario des programmes de test de `make tests-qemu` : une fois
-    // l'archive exécutée, éteindre QEMU par son périphérique isa-debug-exit
-    // (présent seulement si on le demande à QEMU, à ce port-là). Jamais
-    // dans le noyau ordinaire : sur une vraie machine, ce port peut être
-    // n'importe quoi.
-    #[cfg(feature = "test-programmes")]
-    {
-        afficherln!("[noyau] Fin des tests : extinction de QEMU.");
-        // SAFETY : le port 0xf4 est celui d'isa-debug-exit dans
-        // `make tests-qemu` ; QEMU s'arrête aussitôt.
-        unsafe { port::ecrire(0xf4, 0) };
-    }
-
-    // La boucle principale : afficher ce qui est tapé, et dormir quand il
-    // n'y a rien. On vérifie la file interruptions coupées, puis on dort
-    // avec sti;hlt (voir cpu::attendre_interruption) : une touche tapée
-    // entre les deux ne peut pas passer inaperçue.
+    // Le code du démarrage est maintenant la tâche inactive : elle prend le
+    // processeur quand aucune autre n'est prête, et l'arrête (sti ; hlt)
+    // jusqu'à la prochaine interruption. Une interruption qui rend une
+    // tâche prête la préempte aussitôt (ordonnanceur.rs) ; on vérifie
+    // quand même la file interruptions coupées avant de dormir (voir
+    // cpu::attendre_interruption).
     loop {
         cpu::couper_interruptions();
-        if !clavier::en_attente() {
+        if ordonnanceur::autres_pretes() {
+            cpu::activer_interruptions();
+            ordonnanceur::ordonnancer();
+        } else {
             cpu::attendre_interruption();
-            continue;
-        }
-        cpu::activer_interruptions();
-        while let Some(c) = clavier::lire_caractere() {
-            afficher!("{}", c);
         }
     }
 }

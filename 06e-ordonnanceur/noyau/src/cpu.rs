@@ -25,6 +25,14 @@ pub fn couper_interruptions() -> bool {
     rflags & (1 << 9) != 0
 }
 
+/// Les interruptions sont-elles actives (IF) ?
+pub fn interruptions_actives() -> bool {
+    let rflags: u64;
+    // SAFETY : pushfq/pop ne font que lire RFLAGS.
+    unsafe { asm!("pushfq", "pop {}", out(reg) rflags) };
+    rflags & (1 << 9) != 0
+}
+
 pub fn activer_interruptions() {
     // SAFETY : l'IDT est en place (interruptions::initialiser) avant tout
     // appel ; une interruption trouvera son gestionnaire.

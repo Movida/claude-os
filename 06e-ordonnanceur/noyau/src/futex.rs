@@ -28,7 +28,9 @@
 
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::espace_utilisateur::ADRESSE_MAX;
-use crate::{linux, tache, temps};
+use crate::attente::{self, Sommeil};
+use crate::tache::Reveil;
+use crate::{cpu, linux, tache, temps};
 
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
@@ -121,14 +123,18 @@ enum Echeance {
 }
 
 impl Echeance {
-    fn passee(self) -> bool {
-        match self {
-            Echeance::Monotone(n) => monotone() >= n,
+    /// L'échéance, en temps monotone (ns). Une échéance sur CLOCK_REALTIME
+    /// est traduite d'après l'écart entre les deux horloges, qui ne change
+    /// pas : la date ne se règle pas encore (pas de clock_settime).
+    fn en_monotone(self) -> u64 {
+        let n = match self {
+            Echeance::Monotone(n) => n,
             Echeance::Reelle(n) => {
                 let t = temps::maintenant();
-                t.secondes as i128 * 1_000_000_000 + t.nanosecondes as i128 >= n
+                n - (t.secondes as i128 * 1_000_000_000 + t.nanosecondes as i128) + monotone()
             }
-        }
+        };
+        n.clamp(0, u64::MAX as i128) as u64
     }
 }
 
@@ -182,9 +188,18 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
         return -EINTR;
     };
     // Dormir jusqu'à l'échéance : au premier tic qui la dépasse, jamais
-    // avant (les tics d'une milliseconde arrondissent au-dessus).
-    tache::dormir_jusqu_a(|| echeance.passee());
-    -ETIMEDOUT
+    // avant (attente.rs). Personne d'autre ne peut réveiller un futex dans
+    // un processus d'un seul fil : seuls l'échéance ou un signal finissent
+    // l'attente.
+    let interruptions = cpu::couper_interruptions();
+    let reveil = attente::dormir(Some(echeance.en_monotone()), Sommeil::Interruptible);
+    if interruptions {
+        cpu::activer_interruptions();
+    }
+    match reveil {
+        Reveil::Signal => -EINTR,
+        _ => -ETIMEDOUT,
+    }
 }
 
 /// FUTEX_WAKE et FUTEX_WAKE_BITSET (`futex_wake`) : personne à réveiller.

@@ -144,3 +144,6 @@
 [noyau] faute-libc : termine, code de sortie 139 ; memoire rendue : ok.
 [linux] interp-gros : un interpreteur de 48 en-tetes de programme a tourne.
 [noyau] interp-gros : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Test : dort 1,5 s.
+[linux] dort : reveille (0).
+[noyau] dort : termine, code de sortie 0 ; memoire rendue : ok.

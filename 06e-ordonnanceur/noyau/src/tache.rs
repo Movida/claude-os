@@ -29,7 +29,8 @@
 //!      l'ancienne, prendre celui de la nouvelle, dépiler ses registres,
 //!      et `ret` : on revient là où la nouvelle avait elle-même basculé ;
 //!   5. la FIN DE BASCULE, dans la nouvelle tâche : si l'ancienne est
-//!      morte, rendre sa pile (une tâche ne peut pas rendre la pile sur
+//!      morte, rendre sa pile, et la référence qu'elle gardait sur
+//!      elle-même pour cela (une tâche ne peut pas rendre la pile sur
 //!      laquelle elle s'exécute : c'est la suivante qui le fait, le
 //!      `finish_task_switch` de Linux).
 //! Tout l'état d'une tâche suspendue tient donc dans sa pile, et son
@@ -51,10 +52,10 @@
 use alloc::boxed::Box;
 use alloc::sync::Arc;
 use core::arch::{asm, global_asm};
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
 use core::fmt;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 
 use crate::interruptions::Cadre;
 use crate::linux::{self, Signal};
@@ -181,9 +182,14 @@ pub struct Tache {
     lag: AtomicI64,
     /// La tâche qui attend sa fin (`attendre`), réveillée par `terminer`.
     attendant: Verrou<Option<Arc<Tache>>>,
-    /// Elle attend dans `dormir_jusqu_a`, processeur arrêté (hlt) : ce
-    /// temps-là n'est pas du calcul.
-    dort: AtomicBool,
+    /// Le lien vers la tâche suivante de la file d'attente où elle attend
+    /// (attente.rs), sous le verrou de cette file.
+    lien_attente: Cell<*const Tache>,
+    /// Pourquoi elle a été réveillée (`Reveil`, en u8) : le premier qui la
+    /// réveille l'écrit ; 0 tant que personne ne l'a fait.
+    reveil: AtomicU8,
+    /// Elle dort, et un signal peut la réveiller (TASK_INTERRUPTIBLE).
+    interruptible: AtomicBool,
     /// Un tic a été compté depuis la dernière vérification de RLIMIT_CPU.
     temps_a_verifier: AtomicBool,
     /// À tuer, faute de mémoire, dès son retour vers l'anneau 3 : une page
@@ -205,7 +211,8 @@ struct EtatProgramme {
 
 // SAFETY : les champs dans des UnsafeCell (`contexte`, `programme`) ne sont
 // lus et écrits que par `basculer_vers`, interruptions coupées, sur notre
-// seul processeur ; le reste est atomique ou sous Verrou.
+// seul processeur ; `lien_attente`, que sous le verrou de la file d'attente
+// où elle est ; le reste est atomique ou sous Verrou.
 unsafe impl Sync for Tache {}
 unsafe impl Send for Tache {}
 
@@ -234,7 +241,9 @@ impl Tache {
             calcul: AtomicU64::new(0),
             lag: AtomicI64::new(0),
             attendant: Verrou::new(None),
-            dort: AtomicBool::new(false),
+            lien_attente: Cell::new(core::ptr::null()),
+            reveil: AtomicU8::new(0),
+            interruptible: AtomicBool::new(false),
             temps_a_verifier: AtomicBool::new(false),
             a_tuer: AtomicBool::new(false),
             fin: Verrou::new(None),
@@ -273,12 +282,42 @@ impl Tache {
     /// programme verra sa limite de temps de calcul vérifiée à son retour
     /// vers l'anneau 3.
     pub fn compter_calcul(&self, ns: u64) {
-        if ns == 0 || self.dort.load(Ordering::Relaxed) {
+        if ns == 0 {
             return;
         }
         self.calcul.fetch_add(ns, Ordering::Relaxed);
         if self.programme.is_some() {
             self.temps_a_verifier.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Son temps de calcul, en nanosecondes.
+    pub fn temps_de_calcul(&self) -> u64 {
+        self.calcul.load(Ordering::Relaxed)
+    }
+
+    /// Le lien de file d'attente (attente.rs).
+    pub fn lien_attente(&self) -> &Cell<*const Tache> {
+        &self.lien_attente
+    }
+
+    /// Avant de s'endormir : personne ne l'a encore réveillée.
+    pub fn preparer_sommeil(&self) {
+        self.reveil.store(0, Ordering::Relaxed);
+    }
+
+    /// Elle dort, et un signal peut la réveiller (ou plus).
+    pub fn dort_interruptible(&self, oui: bool) {
+        self.interruptible.store(oui, Ordering::Relaxed);
+    }
+
+    /// Pourquoi elle a été réveillée (par une file, si personne ne l'a dit :
+    /// un réveil sans raison se revérifie de toute façon).
+    pub fn raison_du_reveil(&self) -> Reveil {
+        match self.reveil.load(Ordering::Relaxed) {
+            2 => Reveil::Echeance,
+            3 => Reveil::Signal,
+            _ => Reveil::Reveillee,
         }
     }
 
@@ -292,9 +331,14 @@ impl Tache {
     }
 }
 
-/// La tâche courante, et celle qui l'a précédée (pour la fin de bascule).
+/// La tâche courante.
 static COURANTE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
-static PRECEDENTE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
+/// La tâche qui vient de mourir, et qu'il faut rendre à la fin de la
+/// bascule qui suit (sa pile, puis la référence qu'elle avait laissée
+/// pour elle-même) : un Arc mis de côté par `terminer`. Sans lui, la file
+/// des prêtes, qui la lâche quand elle meurt, pouvait tenir la dernière
+/// référence : la tâche aurait rendu sa pile en s'exécutant dessus.
+static A_RENDRE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
 /// La tâche inactive, gardée pour toujours (elle ne meurt pas).
 static INACTIVE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
 
@@ -313,7 +357,9 @@ pub fn initialiser() {
         calcul: AtomicU64::new(0),
         lag: AtomicI64::new(0),
         attendant: Verrou::new(None),
-        dort: AtomicBool::new(false),
+        lien_attente: Cell::new(core::ptr::null()),
+        reveil: AtomicU8::new(0),
+        interruptible: AtomicBool::new(false),
         temps_a_verifier: AtomicBool::new(false),
         a_tuer: AtomicBool::new(false),
         fin: Verrou::new(None),
@@ -323,6 +369,11 @@ pub fn initialiser() {
     COURANTE.store(t, Ordering::Relaxed);
 }
 
+/// Les tâches existent-elles (après `initialiser`) ?
+pub fn en_service() -> bool {
+    !COURANTE.load(Ordering::Relaxed).is_null()
+}
+
 /// La tâche courante.
 pub fn courante() -> &'static Tache {
     // SAFETY : COURANTE désigne toujours une tâche vivante : la tâche
@@ -330,6 +381,37 @@ pub fn courante() -> &'static Tache {
     // structure vit tant qu'un Arc la tient : celui de qui l'a créée, et
     // la tâche inactive pour toujours).
     unsafe { &*COURANTE.load(Ordering::Relaxed) }
+}
+
+/// Pourquoi une tâche qui dormait a été réveillée (attente.rs).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reveil {
+    /// Par la file où elle attendait : ce qu'elle attendait est peut-être
+    /// là (elle revérifie).
+    Reveillee = 1,
+    /// Son échéance est passée.
+    Echeance = 2,
+    /// Un signal (elle dormait interruptible) : l'appel rendra EINTR.
+    Signal = 3,
+}
+
+/// Réveille `t`, qui dort, pour la raison `pourquoi` : elle redevient
+/// prête. Si quelqu'un l'a déjà réveillée, la première raison reste (et
+/// elle n'est mise qu'une fois dans la file des prêtes).
+pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) {
+    if t.reveil.compare_exchange(0, pourquoi as u8, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+        ordonnanceur::rendre_prete(t, false);
+    }
+}
+
+/// Un signal attend la tâche courante, qui doit finir son attente
+/// interruptible : sa fin prévue (SIGKILL forcé, exit_group d'un autre
+/// fil), le tueur OOM, ou un signal en attente qu'elle ne bloque pas.
+pub fn signal_en_attente() -> bool {
+    let t = courante();
+    t.fin.verrouiller().is_some()
+        || t.a_tuer.load(Ordering::Relaxed)
+        || (t.programme.is_some() && processus::essayer_avec(|p| signaux::en_attente_non_bloque(p)) == Some(true))
 }
 
 /// Un Arc de la tâche courante (pour la mettre dans une file).
@@ -386,7 +468,6 @@ pub fn basculer_vers(nouvelle: &Tache) {
         if nouvelle.haut != 0 {
             gdt::definir_pile_noyau(nouvelle.haut);
         }
-        PRECEDENTE.store(ancienne as *const Tache as *mut Tache, Ordering::Relaxed);
         COURANTE.store(nouvelle as *const Tache as *mut Tache, Ordering::Relaxed);
         basculer(ancienne.contexte.get(), nouvelle.contexte.get());
     }
@@ -398,16 +479,17 @@ pub fn basculer_vers(nouvelle: &Tache) {
 
 /// La fin d'une bascule, dans la tâche qui reprend (ou démarre) : si la
 /// précédente est morte, sa pile est rendue ici, puisqu'on n'est plus
-/// dessus. Interruptions coupées.
+/// dessus, puis la référence qu'elle avait gardée pour elle-même (le
+/// `put_task_stack` et le `put_task_struct` de `finish_task_switch`).
+/// Interruptions coupées.
 #[unsafe(no_mangle)]
 extern "C" fn fin_de_bascule() {
-    let precedente = PRECEDENTE.swap(core::ptr::null_mut(), Ordering::Relaxed);
-    // SAFETY : la précédente vit encore : qui l'a créée tient son Arc, et
-    // ne le lâche qu'après l'avoir vue morte, en reprenant la main ici.
-    if let Some(t) = unsafe { precedente.as_ref() } {
-        if t.morte.load(Ordering::Relaxed) {
-            drop(t.pile.verrouiller().take());
-        }
+    let morte = A_RENDRE.swap(core::ptr::null_mut(), Ordering::Relaxed);
+    if !morte.is_null() {
+        // SAFETY : `morte` vient d'Arc::into_raw dans `terminer`, rendu une
+        // seule fois, ici ; elle ne s'exécute plus.
+        let t = unsafe { Arc::from_raw(morte) };
+        drop(t.pile.verrouiller().take());
     }
 }
 
@@ -425,6 +507,7 @@ pub fn attendre(t: &Tache) -> i32 {
     let interruptions = cpu::couper_interruptions();
     while !t.morte.load(Ordering::Relaxed) {
         *t.attendant.verrouiller() = Some(courante_arc());
+        courante().preparer_sommeil();
         ordonnanceur::retirer_courante();
         ordonnanceur::ordonnancer();
     }
@@ -503,8 +586,10 @@ pub fn terminer(code: i32) -> ! {
     t.code_sortie.store(code, Ordering::Relaxed);
     cpu::couper_interruptions();
     t.morte.store(true, Ordering::Relaxed);
+    // Une référence à elle-même, pour la fin de bascule qui rendra sa pile.
+    A_RENDRE.store(Arc::into_raw(courante_arc()) as *mut Tache, Ordering::Relaxed);
     if let Some(attendant) = t.attendant.verrouiller().take() {
-        ordonnanceur::rendre_prete(attendant, false);
+        reveiller(attendant, Reveil::Reveillee);
     }
     ordonnanceur::retirer_courante();
     ordonnanceur::ordonnancer();
@@ -617,39 +702,11 @@ pub fn renommer(nom: NomCourt) {
 
 /// Appelée à chaque tic d'horloge, interruptions coupées : l'ordonnanceur
 /// compte le temps de calcul de la tâche courante, et lui fait céder le
-/// processeur si elle a fini sa tranche.
+/// processeur si elle a fini sa tranche ; les échéances passées réveillent
+/// leurs tâches.
 pub fn tic() {
     ordonnanceur::tic();
-}
-
-/// La tâche courante attend, dans un appel système, jusqu'à ce que `fini`
-/// le dise (vérifié à chaque interruption, et à chaque fois qu'elle
-/// retrouve le processeur). En attendant les files d'attente et les
-/// minuteries (commit suivant) : si une autre tâche est prête, elle lui
-/// cède le processeur ; sinon `sti ; hlt`.
-pub fn dormir_jusqu_a(fini: impl Fn() -> bool) {
-    loop {
-        // Vérifier interruptions coupées, puis dormir : voir pourquoi dans
-        // cpu::attendre_interruption.
-        cpu::couper_interruptions();
-        if fini() {
-            break;
-        }
-        if ordonnanceur::autres_pretes() {
-            cpu::activer_interruptions();
-            ordonnanceur::ceder();
-        } else {
-            let t = courante();
-            t.dort.store(true, Ordering::Relaxed);
-            cpu::attendre_interruption();
-            cpu::couper_interruptions();
-            // Le temps arrêté n'est pas compté : l'ordonnanceur repart d'ici.
-            ordonnanceur::oublier_temps();
-            t.dort.store(false, Ordering::Relaxed);
-        }
-    }
-    // Un appel système s'exécute interruptions actives.
-    cpu::activer_interruptions();
+    crate::attente::tic();
 }
 
 /// Le temps de calcul de la tâche courante, en nanosecondes

@@ -1,6 +1,7 @@
 //! La console du noyau : tout ce qu'on affiche va à la fois à l'écran et
 //! sur le port série, comme dans le chargeur.
 
+use crate::attente::{GardeMutex, Mutex};
 use crate::serie::Serie;
 use crate::verrou::Verrou;
 use crate::vga::Ecran;
@@ -30,8 +31,28 @@ pub fn preparer_panique() {
     unsafe { ECRAN.forcer_liberation() };
 }
 
+/// Le verrou des écritures, tenu pendant tout un `write` d'un programme et
+/// tout un message du noyau : deux programmes qui écrivent en même temps
+/// ne mêlent pas leurs lignes (le `atomic_write_lock` des terminaux de
+/// Linux, tenu pendant tout `tty_write`). Un verrou qui dort (attente.rs) :
+/// l'écriture d'une ligne sur un vrai port série dure des millisecondes.
+/// Le verrou de l'écran, lui, n'est pris que par paquets de 8 octets pour
+/// la sortie d'un programme (`ecrire_octets`), pour que l'horloge ne perde
+/// pas ses tics ; un message du noyau, court, est écrit d'un coup.
+static ECRITURES: Mutex<()> = Mutex::new(());
+
+/// Le verrou des écritures, quand on a le droit de dormir pour l'attendre :
+/// les tâches existent, et les interruptions sont actives (donc aucun
+/// Verrou n'est tenu, et on n'est pas dans un gestionnaire d'interruption).
+/// Sinon (le démarrage, un gestionnaire, une panique), on écrit sans lui :
+/// un message du noyau ne doit jamais attendre (comme printk).
+fn verrou_des_ecritures() -> Option<GardeMutex<'static, ()>> {
+    (crate::tache::en_service() && crate::cpu::interruptions_actives()).then(|| ECRITURES.verrouiller())
+}
+
 /// Appelée par les macros afficher! et afficherln!.
 pub fn _afficher(args: fmt::Arguments) {
+    let _ecritures = verrou_des_ecritures();
     let mut ecran = ECRAN.verrouiller();
     // Le port série n'a pas d'état à protéger, mais on l'écrit sous le même
     // verrou pour que les deux sorties gardent le même ordre.
@@ -45,6 +66,7 @@ pub fn _afficher(args: fmt::Arguments) {
 /// entre deux : sur un vrai port série, chaque octet fait attendre 87 µs,
 /// et l'horloge ne doit pas manquer ses tics (un par milliseconde).
 pub fn ecrire_octets(octets: &[u8]) {
+    let _ecritures = verrou_des_ecritures();
     for paquet in octets.chunks(8) {
         let mut ecran = ECRAN.verrouiller();
         for &octet in paquet {
