@@ -28,6 +28,7 @@
 #include <sys/sysinfo.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#include <linux/random.h>
 
 static int echecs;
 
@@ -367,6 +368,16 @@ static void peripheriques(void)
     for (unsigned i = 0; i < sizeof tampon; i++)
         non_nul |= tampon[i];
     verifier(non_nul != 0, "/dev/urandom : pas tous nuls");
+    /* Ses ioctl sont ceux du pilote (random_ioctl), après les requêtes
+       communes à tous les fichiers : FIONREAD et TCGETS n'en sont pas
+       (EINVAL, pas ENOTTY) ; le compte d'entropie se lit (0 à 256),
+       le changer demande d'être root (EPERM). */
+    int compte = -1, reste = 0;
+    verifier(alea >= 0 && ERREUR(ioctl(alea, FIONREAD, &reste), EINVAL) && ERREUR(ioctl(alea, TCGETS, &reste), EINVAL),
+             "/dev/urandom : FIONREAD et TCGETS : EINVAL");
+    verifier(ioctl(alea, RNDGETENTCNT, &compte) == 0 && compte >= 0 && compte <= 256
+             && ERREUR(ioctl(alea, RNDGETENTCNT, (void *)8), EFAULT) && ERREUR(ioctl(alea, RNDZAPENTCNT, 0), EPERM),
+             "/dev/urandom : RNDGETENTCNT lu, RNDZAPENTCNT : EPERM");
     close(alea);
 }
 

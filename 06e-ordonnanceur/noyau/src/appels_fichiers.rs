@@ -1391,10 +1391,11 @@ pub fn flock(fd: u64, operation: u64) -> i64 {
 ///     Linux ne borne pas). Les fichiers de /proc et de /sys en sont : ce
 ///     qu'en dit stat, 0 ou une page, moins la position (mesuré : -3 après
 ///     avoir lu 3 octets de maps). Pour le reste, c'est au pilote d'y
-///     répondre, et aucun des nôtres ne le fait : ENOTTY (un terminal le
-///     fera, 6j) ;
+///     répondre : ENOTTY pour les nôtres (un terminal le fera, 6j), sauf
+///     ceux qui ont leurs propres requêtes ;
 ///   - un epoll répond lui-même à toute autre requête : EINVAL
-///     (`ep_eventpoll_ioctl`, mesuré) ;
+///     (`ep_eventpoll_ioctl`, mesuré), et /dev/random et /dev/urandom
+///     aussi, après les leurs (`ioctl_aleatoire`) ;
 ///   - les requêtes des terminaux (TCGETS, la question d'isatty, et les
 ///     autres) : ENOTTY, la console n'en est pas encore un (6j). La glibc
 ///     met alors la sortie standard dans un tampon complet, vidé à la
@@ -1440,7 +1441,40 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
             }
         }
         _ if o.sorte == Sorte::Epoll => -EINVAL,
+        _ if matches!(o.sorte, Sorte::Aleatoire { .. }) => ioctl_aleatoire(requete as u32 as u64, argument),
         _ => -ENOTTY,
+    }
+}
+
+/// Les requêtes du pilote de /dev/random et /dev/urandom (`random_ioctl`,
+/// drivers/char/random.c), une fois passées celles de tous les fichiers :
+///   - RNDGETENTCNT : le compte d'entropie du générateur, en bits (Linux :
+///     256 une fois le générateur initialisé, mesuré). Le nôtre dit ce que
+///     vaut sa source : 256 avec RDRAND, 0 avec le compteur de cycles
+///     brassé, qui n'est pas cryptographique (aleatoire.rs), jusqu'au
+///     vrai générateur (ChaCha20, 6h) ;
+///   - les requêtes qui changent le générateur (ajouter de l'entropie, la
+///     remettre à zéro, le réensemencer) : réservées à root (EPERM, avant
+///     de rien lire), ce que nos programmes ne sont pas ;
+///   - toute autre, FIONREAD et les requêtes des terminaux comprises :
+///     EINVAL (mesuré ; pas ENOTTY comme les autres périphériques).
+fn ioctl_aleatoire(requete: u64, argument: u64) -> i64 {
+    const RNDGETENTCNT: u64 = 0x8004_5200;
+    const RNDADDTOENTCNT: u64 = 0x4004_5201;
+    const RNDADDENTROPY: u64 = 0x4008_5203;
+    const RNDZAPENTCNT: u64 = 0x5204;
+    const RNDCLEARPOOL: u64 = 0x5206;
+    const RNDRESEEDCRNG: u64 = 0x5207;
+    match requete {
+        RNDGETENTCNT => {
+            let compte: i32 = if crate::aleatoire::cryptographique() { 256 } else { 0 };
+            match copier_vers_utilisateur(argument, &compte.to_le_bytes()) {
+                Ok(()) => 0,
+                Err(_) => -EFAULT,
+            }
+        }
+        RNDADDTOENTCNT | RNDADDENTROPY | RNDZAPENTCNT | RNDCLEARPOOL | RNDRESEEDCRNG => errno(Erreur::EPERM),
+        _ => -EINVAL,
     }
 }
 

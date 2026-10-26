@@ -64,5 +64,10 @@ pub fn remplir(octets: &mut [u8]) {
 
 /// La source qu'utilise `remplir`, pour l'affichage.
 pub fn source() -> &'static str {
-    if a_rdrand() { "RDRAND" } else { "TSC (non cryptographique)" }
+    if cryptographique() { "RDRAND" } else { "TSC (non cryptographique)" }
+}
+
+/// La source est-elle cryptographique (RDRAND) ?
+pub fn cryptographique() -> bool {
+    a_rdrand()
 }
