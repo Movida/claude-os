@@ -25,18 +25,20 @@
 //!     0) : la glibc choisit alors d'elle-même ses versions SSE2. On ne
 //!     promet que ce qu'on sait faire. (Le processeur qemu64 n'a d'ailleurs
 //!     pas XSAVE.)
-//!   - La sauvegarde à chaque bascule : un seul programme à la fois, et le
-//!     noyau, compilé pour la cible x86_64-unknown-none, n'utilise jamais
-//!     SSE (le compilateur n'en émet pas) : les registres XMM du programme
-//!     ne sont touchés par personne pendant un appel système ou une
-//!     interruption. À l'étape 6, avec l'ordonnanceur : XSAVE à chaque
-//!     bascule, sans « sauvegarde paresseuse » (attendre la première
-//!     instruction SSE du programme suivant, CR0.TS, pour sauvegarder :
-//!     c'est la faille LazyFP, CVE-2018-3665, et Linux l'a abandonnée),
-//!     et XCR0 sans AMX (8 Kio d'état de plus par tâche).
 //!
-//! Chaque programme part d'un état propre (tache.rs, premier_depart) : un
-//! seul `fxrstor` depuis une image de l'état initial, comme
+//! La sauvegarde : à chaque bascule (tache.rs), FXSAVE de l'état de la
+//! tâche qu'on quitte si c'est un programme, FXRSTOR de celui de la tâche
+//! qui reprend. Le noyau, compilé pour la cible x86_64-unknown-none,
+//! n'utilise jamais SSE (le compilateur n'en émet pas) : les registres du
+//! programme ne sont touchés par personne pendant un appel système ou une
+//! interruption, ni par une tâche du noyau. Sans « sauvegarde paresseuse »
+//! (attendre la première instruction SSE du programme suivant, CR0.TS,
+//! pour sauvegarder : c'est la faille LazyFP, CVE-2018-3665, et Linux l'a
+//! abandonnée). XSAVE viendra plus loin en 6e, sans AMX (8 Kio d'état de
+//! plus par tâche).
+//!
+//! Chaque programme part d'un état propre (tache.rs) : sa tâche reçoit une
+//! copie de l'image de l'état initial, rétablie par la bascule, comme
 //! restore_fpregs_from_init_fpstate dans Linux. Mot de contrôle x87 0x037F,
 //! MXCSR = 0x1F80 (toutes les exceptions SSE masquées, arrondi au plus
 //! près : la valeur de l'ABI), et TOUS les registres de données à zéro :

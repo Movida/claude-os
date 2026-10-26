@@ -97,16 +97,8 @@ SECTIONS
         . += 4K;
         . += 8K;
         __pile_mc_haut = .;
-        /* La pile noyau du programme : celle que prend le processeur quand
-           le programme (anneau 3) entre dans le noyau, par un appel système
-           ou une interruption (TSS.RSP0). 16 Kio, le THREAD_SIZE de Linux
-           sur x86_64. Une seule : un seul programme à la fois, jusqu'à
-           l'ordonnanceur de l'étape 6, où chaque tâche aura la sienne. */
-        __garde_programme = .;
-        . += 4K;
-        __pile_programme_bas = .;
-        . += 16K;
-        __pile_programme_haut = .;
+        /* Les piles des tâches (6e) sont dans la région vmalloc, chacune
+           sous sa page de garde (src/vmalloc.rs). */
         __bss_fin = .;
     }
 

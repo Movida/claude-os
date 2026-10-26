@@ -10,8 +10,8 @@
 //!         code (.text)            lecture, exécution
 //!         constantes (.rodata)    lecture seule
 //!         données, pile (.data, .bss)  lecture, écriture
-//!     sauf les pages de garde, sous la pile du noyau, sous ses piles de
-//!     secours (l'IST, gdt.rs) et sous la pile noyau du programme,
+//!     sauf les pages de garde, sous la pile du noyau (celle du démarrage,
+//!     de la tâche inactive) et sous ses piles de secours (l'IST, gdt.rs),
 //!     laissées sans projection : un débordement de la pile y fait faute
 //!     de page. (Leurs cadres physiques, 4 Kio chacun, sont perdus ; les
 //!     piles des tâches, elles, sont dans la région vmalloc, où les gardes
@@ -107,20 +107,18 @@ unsafe extern "C" {
     static __garde_nmi: u8;
     static __garde_debogage: u8;
     static __garde_mc: u8;
-    static __garde_programme: u8;
     static __bss_fin: u8;
 }
 
 /// Les pages de garde, et le nom de la pile que chacune protège (pour le
 /// message d'un débordement).
-fn gardes() -> [(u64, &'static str); 6] {
+fn gardes() -> [(u64, &'static str); 5] {
     [
         (&raw const __garde as u64, "la pile du noyau"),
         (&raw const __garde_secours as u64, "la pile de la double faute"),
         (&raw const __garde_nmi as u64, "la pile du NMI"),
         (&raw const __garde_debogage as u64, "la pile du debogage"),
         (&raw const __garde_mc as u64, "la pile de la verification machine"),
-        (&raw const __garde_programme as u64, "la pile noyau du programme"),
     ]
 }
 

@@ -1,48 +1,66 @@
-//! Les tâches : le noyau, et le programme qu'il exécute.
+//! Les tâches : le noyau, et les programmes qu'il exécute.
 //!
 //! Un programme ne s'exécute pas « dans » une fonction du noyau qui
 //! l'appellerait : c'est une TÂCHE à part, avec sa propre pile noyau (celle
 //! que prend le processeur quand le programme entre dans le noyau, par un
-//! appel système ou une interruption) et son propre état des registres. Le
-//! noyau lui passe le processeur en BASCULANT de sa tâche à celle du
-//! programme ; le programme le rend en basculant dans l'autre sens, quand
-//! il se termine. C'est la primitive de l'ordonnanceur de l'étape 6, qui
-//! basculera de programme en programme à chaque tic d'horloge.
-//!
-//! Basculer (`basculer`, le __switch_to_asm de Linux) :
-//!   1. empiler les registres que l'ABI dit « préservés par l'appelé »
-//!      (rbx, rbp, r12 à r15 : les autres, l'appelant de `basculer` les a
-//!      déjà sauvés s'il en avait besoin) ;
-//!   2. ranger RSP dans le contexte de l'ancienne tâche ;
-//!   3. prendre le RSP du contexte de la nouvelle ;
-//!   4. dépiler ses registres, et `ret` : on revient là où la nouvelle tâche
-//!      avait elle-même appelé `basculer`.
+//! appel système ou une interruption) et son propre état des registres.
+//! Le noyau a aussi les siennes : la tâche inactive (le `noyau_main` du
+//! démarrage, sur la pile du démarrage), init (le lanceur de
+//! /etc/demarrage, programmes.rs), une par programme WebAssembly
+//! (l'interpréteur tourne dans sa tâche). Chaque tâche, sauf l'inactive, a
+//! sa pile de 16 Kio dans la région vmalloc, sous une page de garde
+//! (vmalloc.rs). On passe le processeur d'une tâche à l'autre en BASCULANT
+//! (`basculer_vers`, le `__switch_to` de Linux), interruptions coupées :
+//!   1. ce que les registres généraux ne disent pas, mais que le programme
+//!      a pu changer : l'état x87 et SSE (FXSAVE), les sélecteurs de
+//!      segments et la base de FS (arch_prctl), sauvés pour l'ancienne
+//!      tâche si c'est un programme, et rétablis pour la nouvelle ; le
+//!      noyau, lui, ne s'en sert jamais (il est compilé sans SSE) ;
+//!   2. l'espace d'adressage (CR3), s'il change : toute tâche du noyau
+//!      tourne sur la PML4 du noyau, sans garder celle du programme
+//!      précédent (pas de « lazy TLB », qui demanderait de compter qui se
+//!      sert encore d'un espace) ;
+//!   3. la pile que prendra le processeur à la prochaine entrée depuis
+//!      l'anneau 3 (TSS.rsp0) : le sommet de celle de la nouvelle tâche ;
+//!   4. l'échange des piles (`basculer`, le __switch_to_asm de Linux) :
+//!      empiler les registres que l'ABI dit « préservés par l'appelé »
+//!      (rbx, rbp, r12 à r15 : l'appelant de `basculer` a déjà sauvé les
+//!      autres s'il en avait besoin), ranger RSP dans le contexte de
+//!      l'ancienne, prendre celui de la nouvelle, dépiler ses registres,
+//!      et `ret` : on revient là où la nouvelle avait elle-même basculé ;
+//!   5. la FIN DE BASCULE, dans la nouvelle tâche : si l'ancienne est
+//!      morte, rendre sa pile (une tâche ne peut pas rendre la pile sur
+//!      laquelle elle s'exécute : c'est la suivante qui le fait, le
+//!      `finish_task_switch` de Linux).
 //! Tout l'état d'une tâche suspendue tient donc dans sa pile, et son
 //! contexte n'est que l'adresse de son sommet.
 //!
-//! Une tâche neuve n'a jamais appelé `basculer` : on lui prépare une pile
-//! qui y ressemble (six registres à zéro, puis l'adresse de
-//! `premier_depart`), et, au-dessus, le cadre complet d'un retour vers
-//! l'anneau 3 (le pt_regs du programme, comme pour fork dans Linux).
-//! `premier_depart` remet à zéro les segments et leurs bases, puis passe par
-//! le retour ordinaire des interruptions (iretq) : le programme démarre à
-//! son point d'entrée, tous registres à zéro, sur sa pile.
+//! Une tâche neuve n'a jamais basculé : on lui prépare une pile qui y
+//! ressemble (six registres, puis l'adresse de son premier départ), qui
+//! commence par la fin de bascule, comme le `schedule_tail` de Linux. Pour
+//! un programme, au-dessus, le cadre complet d'un retour vers l'anneau 3
+//! (le pt_regs, comme pour fork dans Linux) : `premier_depart` passe par
+//! le retour ordinaire des interruptions (iretq), et le programme démarre
+//! à son point d'entrée, tous registres à zéro, sur sa pile. Pour une
+//! tâche du noyau, `depart_noyau` appelle sa fonction, rangée dans r12.
 //!
-//! Ce qui reste à faire avec l'ordonnanceur (étape 6) : une pile noyau par
-//! tâche (aujourd'hui une seule, dans linker.ld : un programme à la fois),
-//! et la sauvegarde, à chaque bascule, de ce que les registres ne disent
-//! pas : base de FS (arch_prctl), état SSE (XSAVE).
+//! En attendant l'ordonnanceur (commit suivant), init passe la main à
+//! chaque programme et la reprend quand il se termine : un programme à la
+//! fois, comme avant, mais chacun dans sa tâche.
 
-use core::arch::global_asm;
+use alloc::boxed::Box;
+use alloc::sync::Arc;
+use core::arch::{asm, global_asm};
 use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU64, Ordering};
 
 use crate::interruptions::Cadre;
 use crate::linux::{self, Signal};
 use crate::programmes::NomCourt;
 use crate::verrou::Verrou;
+use crate::vmalloc::Pile;
 use crate::{cpu, gdt, pagination, processus, signaux, temps};
 
 global_asm!(
@@ -67,38 +85,47 @@ basculer:
     pop rbp
     ret
 
-    /* Le premier départ d'un programme. Les sélecteurs de données à 0 (en
-       64 bits, un programme n'en a pas besoin) ; les bases de FS et de GS
-       à 0 (MSR FS_BASE, GS_BASE et KERNEL_GS_BASE), pour qu'un programme
-       ne trouve rien d'un précédent : il fixera sa base de FS lui-même
-       (arch_prctl). Le x87 et SSE à leur état initial, tous registres de
-       données à zéro (voir sse.rs). Puis le retour d'interruption : iretq vers le cadre préparé
-       par executer(). */
+    /* Le premier départ d'un programme : la fin de bascule, puis les bases
+       de GS à 0 (MSR GS_BASE et KERNEL_GS_BASE), pour qu'un programme ne
+       trouve rien d'un précédent (les sélecteurs, la base de FS et l'état
+       x87/SSE, eux, sont ceux de sa tâche, rétablis par basculer_vers).
+       Puis le retour d'interruption : iretq vers le cadre préparé par
+       executer(). */
     .global premier_depart
 premier_depart:
+    call fin_de_bascule
     xor eax, eax
-    mov ds, ax
-    mov es, ax
-    mov fs, ax
-    mov gs, ax
     xor edx, edx
-    mov ecx, 0xC0000100
-    wrmsr
     mov ecx, 0xC0000101
     wrmsr
     mov ecx, 0xC0000102
     wrmsr
-    fxrstor [rip + etat_fpu_initial]
     jmp retour_interruption
+
+    /* Le premier départ d'une tâche du noyau : la fin de bascule, puis sa
+       fonction, dont l'adresse est dans r12 (rétabli par basculer). Elle
+       ne revient pas. Interruptions actives : une tâche du noyau s'exécute
+       comme un appel système (et comme sous Linux, après schedule_tail).
+       Donc jamais avant que les interruptions soient prêtes (main.rs) :
+       le 8259 du BIOS enverrait l'horloge sur le vecteur de la double
+       faute. */
+    .global depart_noyau
+depart_noyau:
+    call fin_de_bascule
+    sti
+    mov rdi, r12
+    call tache_noyau
+    ud2
 
     /* L'état x87 et SSE d'un programme qui démarre, au format de fxsave
        (512 octets, alignés sur 16) : mot de contrôle x87 0x037F (toutes
        les exceptions masquées, double précision étendue, arrondi au plus
        près : l'état de `fninit`), MXCSR 0x1F80 (la valeur de l'ABI), et
        tout le reste à zéro : registres ST0-ST7 (alias MM0-MM7), XMM0-XMM15,
-       mot d'état, étiquettes. */
+       mot d'état, étiquettes (voir sse.rs). */
     .section .rodata
     .balign 16
+    .global etat_fpu_initial
 etat_fpu_initial:
     .word 0x037F
     .skip 22
@@ -110,46 +137,241 @@ etat_fpu_initial:
 unsafe extern "C" {
     fn basculer(ancien: *mut u64, nouveau: *const u64);
     fn premier_depart();
-    // La pile noyau du programme (linker.ld).
-    static __pile_programme_haut: u8;
+    fn depart_noyau();
+    static etat_fpu_initial: EtatFpu;
 }
 
-/// Les contextes des deux tâches : le RSP de chacune, quand elle ne
-/// s'exécute pas.
-struct Contextes {
-    noyau: u64,
-    programme: u64,
+/// L'état x87 et SSE d'un programme, au format de FXSAVE.
+#[repr(C, align(16))]
+#[derive(Clone)]
+pub struct EtatFpu([u8; 512]);
+
+/// Ce que le noyau sait d'une tâche.
+pub struct Tache {
+    /// Son nom, pour les messages : celui du programme (le `comm` de
+    /// Linux), ou celui de la tâche du noyau.
+    nom: Verrou<NomCourt>,
+    /// Le RSP rangé par `basculer` quand elle ne s'exécute pas. Lu et écrit
+    /// seulement par `basculer_vers`, interruptions coupées, sur un seul
+    /// processeur.
+    contexte: UnsafeCell<u64>,
+    /// Sa pile noyau, rendue par la fin de bascule qui suit sa mort (la
+    /// tâche inactive n'en a pas : elle garde la pile du démarrage).
+    pile: Verrou<Option<Pile>>,
+    /// Le sommet de sa pile (pour TSS.rsp0).
+    haut: u64,
+    /// L'espace d'adressage où elle s'exécute (la PML4, pour CR3).
+    espace: u64,
+    /// Pour un programme : son état x87/SSE, ses sélecteurs (DS, ES, FS,
+    /// GS) et sa base de FS, quand il ne s'exécute pas.
+    programme: Option<UnsafeCell<EtatProgramme>>,
+    /// Elle s'est terminée : sa pile est à rendre.
+    morte: AtomicBool,
+    /// Son code de sortie, posé par `terminer`.
+    code_sortie: AtomicI32,
+    /// Ses tics de calcul : un de plus à chaque tic d'horloge qui la trouve
+    /// en train de s'exécuter, en anneau 3 ou dans le noyau pour elle
+    /// (`tic`). C'est le `account_process_tick` de Linux. Atomique : le
+    /// gestionnaire d'horloge le compte sans prendre de verrou.
+    calcul: AtomicU64,
+    /// Elle dort, dans un appel système (un futex qui attend son délai) :
+    /// ce temps-là n'est pas du calcul.
+    dort: AtomicBool,
+    /// Un tic a été compté depuis la dernière vérification de RLIMIT_CPU.
+    temps_a_verifier: AtomicBool,
+    /// À tuer, faute de mémoire, dès son retour vers l'anneau 3 : une page
+    /// lui a manqué pendant une copie du noyau (un appel système qui écrit
+    /// dans sa mémoire). L'appel ne peut pas s'arrêter au milieu de ce
+    /// qu'il fait : il rend EFAULT, et le programme est tué au retour
+    /// (Linux lui envoie de même un SIGKILL, délivré au retour).
+    a_tuer: AtomicBool,
+    /// Sa fin prévue (voir `Fin`).
+    fin: Verrou<Option<Fin>>,
 }
 
-/// Lus et écrits par `basculer`, interruptions coupées, sur un seul
-/// processeur : pas de Verrou (on ne peut pas tenir un verrou à travers
-/// une bascule, le code qui le rendrait ne s'exécuterait pas avant le
-/// retour).
-struct ContextesPartages(UnsafeCell<Contextes>);
-// SAFETY : voir plus haut.
-unsafe impl Sync for ContextesPartages {}
-static CONTEXTES: ContextesPartages = ContextesPartages(UnsafeCell::new(Contextes { noyau: 0, programme: 0 }));
+/// Ce qu'un programme a de plus qu'une tâche du noyau.
+struct EtatProgramme {
+    fpu: EtatFpu,
+    selecteurs: [u16; 4],
+    base_fs: u64,
+}
 
-/// Le code de sortie du dernier programme, posé par `terminer`.
-static CODE_SORTIE: AtomicI32 = AtomicI32::new(0);
+// SAFETY : les champs dans des UnsafeCell (`contexte`, `programme`) ne sont
+// lus et écrits que par `basculer_vers`, interruptions coupées, sur notre
+// seul processeur ; le reste est atomique ou sous Verrou.
+unsafe impl Sync for Tache {}
+unsafe impl Send for Tache {}
 
-/// Un programme s'exécute-t-il ? (Sa tâche existe : en anneau 3, ou dans le
-/// noyau pour lui.)
-static EN_COURS: AtomicBool = AtomicBool::new(false);
-/// Son nom, pour les messages.
-static NOM: Verrou<NomCourt> = Verrou::new(NomCourt::VIDE);
-/// Ses tics de calcul : un de plus à chaque tic d'horloge qui le trouve en
-/// train de s'exécuter, en anneau 3 ou dans le noyau pour lui (`tic`). C'est
-/// le `account_process_tick` de Linux, qui compte lui aussi le temps tic par
-/// tic. Atomique plutôt que dans le processus : le gestionnaire d'horloge
-/// le compte, interruptions coupées, sans prendre de verrou.
-static CALCUL: AtomicU64 = AtomicU64::new(0);
-/// Le programme est à tuer, faute de mémoire, dès qu'il retourne vers
-/// l'anneau 3 : une page lui a manqué pendant une copie du noyau (un appel
-/// système qui écrit dans sa mémoire). L'appel ne peut pas s'arrêter au
-/// milieu de ce qu'il fait : il rend EFAULT, et le programme est tué au
-/// retour (Linux lui envoie de même un SIGKILL, délivré au retour).
-static A_TUER: AtomicBool = AtomicBool::new(false);
+impl Tache {
+    /// Une tâche, sans encore de premier départ. None : plus de mémoire,
+    /// ou plus de place pour une pile (le maximum de fils).
+    fn creer(nom: NomCourt, espace: u64, programme: bool) -> Option<Arc<Tache>> {
+        let pile = Pile::allouer()?;
+        let haut = pile.haut();
+        let programme = if programme {
+            // SAFETY : l'image de l'état initial, une constante.
+            let fpu = unsafe { etat_fpu_initial.clone() };
+            Some(UnsafeCell::new(EtatProgramme { fpu, selecteurs: [0; 4], base_fs: 0 }))
+        } else {
+            None
+        };
+        Some(Arc::new(Tache {
+            nom: Verrou::new(nom),
+            contexte: UnsafeCell::new(0),
+            pile: Verrou::new(Some(pile)),
+            haut,
+            espace,
+            programme,
+            morte: AtomicBool::new(false),
+            code_sortie: AtomicI32::new(0),
+            calcul: AtomicU64::new(0),
+            dort: AtomicBool::new(false),
+            temps_a_verifier: AtomicBool::new(false),
+            a_tuer: AtomicBool::new(false),
+            fin: Verrou::new(None),
+        }))
+    }
+
+    /// Prépare la pile pour un premier départ : six registres pour
+    /// `basculer` (r12 : `r12`), l'adresse de `depart`, et, pour un
+    /// programme, le cadre de son retour vers l'anneau 3 au-dessus.
+    fn preparer(&self, depart: unsafe extern "C" fn(), r12: u64, cadre: Option<Cadre>) {
+        let mut sommet = self.haut;
+        // SAFETY : la pile vient d'être allouée pour cette tâche, qui n'a
+        // jamais tourné : personne d'autre ne s'en sert. On y écrit, de haut
+        // en bas, le cadre éventuel, l'adresse du départ, et les registres
+        // que dépilera `basculer` (r15, r14, r13, r12, rbx, rbp, dans
+        // l'ordre de la pile).
+        unsafe {
+            if let Some(c) = cadre {
+                sommet -= size_of::<Cadre>() as u64;
+                (sommet as *mut Cadre).write(c);
+            }
+            sommet -= 8;
+            (sommet as *mut u64).write(depart as *const () as u64);
+            sommet -= 6 * 8;
+            core::ptr::write_bytes(sommet as *mut u64, 0, 6);
+            ((sommet + 3 * 8) as *mut u64).write(r12);
+            *self.contexte.get() = sommet;
+        }
+    }
+
+    pub fn nom(&self) -> NomCourt {
+        *self.nom.verrouiller()
+    }
+}
+
+/// La tâche courante, et celle qui l'a précédée (pour la fin de bascule).
+static COURANTE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
+static PRECEDENTE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
+/// La tâche inactive, gardée pour toujours (elle ne meurt pas).
+static INACTIVE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Fait du code en cours (noyau_main, sur la pile du démarrage) la tâche
+/// inactive. Avant toute autre tâche.
+pub fn initialiser() {
+    let pile_demarrage = Tache {
+        nom: Verrou::new(NomCourt::de(b"inactive")),
+        contexte: UnsafeCell::new(0),
+        pile: Verrou::new(None),
+        haut: 0,
+        espace: pagination::pml4_noyau(),
+        programme: None,
+        morte: AtomicBool::new(false),
+        code_sortie: AtomicI32::new(0),
+        calcul: AtomicU64::new(0),
+        dort: AtomicBool::new(false),
+        temps_a_verifier: AtomicBool::new(false),
+        a_tuer: AtomicBool::new(false),
+        fin: Verrou::new(None),
+    };
+    let t = Arc::into_raw(Arc::new(pile_demarrage)) as *mut Tache;
+    INACTIVE.store(t, Ordering::Relaxed);
+    COURANTE.store(t, Ordering::Relaxed);
+}
+
+/// La tâche courante.
+pub fn courante() -> &'static Tache {
+    // SAFETY : COURANTE désigne toujours une tâche vivante : la tâche
+    // courante ne peut pas être rendue pendant qu'elle s'exécute (sa
+    // structure vit tant qu'un Arc la tient : celui de qui l'a créée, et
+    // la tâche inactive pour toujours).
+    unsafe { &*COURANTE.load(Ordering::Relaxed) }
+}
+
+/// Passe le processeur de la tâche courante à `nouvelle` (voir l'en-tête).
+/// Revient quand une autre tâche rend la main à la courante. Interruptions
+/// coupées pendant la bascule ; leur état est rétabli au retour.
+fn basculer_vers(nouvelle: &Tache) {
+    let interruptions = cpu::couper_interruptions();
+    let ancienne = courante();
+    // SAFETY : interruptions coupées, sur notre seul processeur : personne
+    // d'autre ne touche à l'état des deux tâches. Les registres et MSR
+    // écrits sont ceux du programme de la nouvelle tâche (le noyau n'en
+    // dépend pas) ; son espace a la moitié haute du noyau, on continue de
+    // s'exécuter après avoir changé CR3 ; sa pile noyau est la sienne.
+    unsafe {
+        if let Some(p) = &ancienne.programme {
+            let p = &mut *p.get();
+            asm!("fxsave64 [{}]", in(reg) &mut p.fpu, options(nostack));
+            asm!("mov {0:x}, ds", "mov {1:x}, es", "mov {2:x}, fs", "mov {3:x}, gs",
+                 out(reg) p.selecteurs[0], out(reg) p.selecteurs[1], out(reg) p.selecteurs[2], out(reg) p.selecteurs[3],
+                 options(nomem, nostack, preserves_flags));
+            p.base_fs = cpu::lire_base_fs();
+        }
+        if let Some(p) = &nouvelle.programme {
+            let p = &*p.get();
+            asm!("fxrstor64 [{}]", in(reg) &p.fpu, options(nostack));
+            // Le sélecteur avant la base : charger FS remet sa base à celle
+            // du descripteur (comme Linux, `load_seg_legacy`).
+            asm!("mov ds, {0:x}", "mov es, {1:x}", "mov fs, {2:x}", "mov gs, {3:x}",
+                 in(reg) p.selecteurs[0], in(reg) p.selecteurs[1], in(reg) p.selecteurs[2], in(reg) p.selecteurs[3],
+                 options(nostack, preserves_flags));
+            cpu::ecrire_base_fs(p.base_fs);
+        }
+        if pagination::courante() != nouvelle.espace {
+            pagination::activer(nouvelle.espace);
+        }
+        if nouvelle.haut != 0 {
+            gdt::definir_pile_noyau(nouvelle.haut);
+        }
+        PRECEDENTE.store(ancienne as *const Tache as *mut Tache, Ordering::Relaxed);
+        COURANTE.store(nouvelle as *const Tache as *mut Tache, Ordering::Relaxed);
+        basculer(ancienne.contexte.get(), nouvelle.contexte.get());
+    }
+    fin_de_bascule();
+    if interruptions {
+        cpu::activer_interruptions();
+    }
+}
+
+/// La fin d'une bascule, dans la tâche qui reprend (ou démarre) : si la
+/// précédente est morte, sa pile est rendue ici, puisqu'on n'est plus
+/// dessus. Interruptions coupées.
+#[unsafe(no_mangle)]
+extern "C" fn fin_de_bascule() {
+    let precedente = PRECEDENTE.swap(core::ptr::null_mut(), Ordering::Relaxed);
+    // SAFETY : la précédente vit encore : qui l'a créée tient son Arc, et
+    // ne le lâche qu'après l'avoir vue morte, en reprenant la main ici.
+    if let Some(t) = unsafe { precedente.as_ref() } {
+        if t.morte.load(Ordering::Relaxed) {
+            drop(t.pile.verrouiller().take());
+        }
+    }
+}
+
+/// La tâche qui a lancé la tâche courante, et à qui elle rend la main en
+/// se terminant (en attendant l'ordonnanceur).
+static LANCEUSE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Fait tourner `t` jusqu'à sa fin, puis revient (en attendant
+/// l'ordonnanceur, une tâche à la fois après celle qui la lance).
+fn faire_tourner(t: &Arc<Tache>) -> i32 {
+    let lanceuse = LANCEUSE.swap(courante() as *const Tache as *mut Tache, Ordering::Relaxed);
+    basculer_vers(t);
+    LANCEUSE.store(lanceuse, Ordering::Relaxed);
+    t.code_sortie.load(Ordering::Relaxed)
+}
 
 /// Le RFLAGS d'un programme qui démarre : IF (interruptions acceptées) et
 /// le bit 1, toujours à 1. IOPL = 0 : pas de `in`, `out`, `cli`, `sti`.
@@ -157,71 +379,61 @@ const RFLAGS_INITIAL: u64 = 1 << 9 | 1 << 1;
 
 /// Exécute un programme : `pml4` son espace d'adressage, `entree` son point
 /// d'entrée, `pile` le sommet de sa pile. Revient quand il se termine, avec
-/// son code de sortie.
-pub fn executer(nom: NomCourt, pml4: u64, entree: u64, pile: u64) -> i32 {
-    *NOM.verrouiller() = nom;
-    let haut = &raw const __pile_programme_haut as u64;
-    let cadre = (haut - size_of::<Cadre>() as u64) as *mut Cadre;
-    let retour = cadre as u64 - 8;
-    let depart = retour - 6 * 8;
-    // SAFETY : la pile noyau du programme est à nous (linker.ld), et
-    // aucun programme ne s'exécute : personne ne s'en sert. On y écrit, de
-    // haut en bas, le cadre du retour vers l'anneau 3, l'adresse de
-    // premier_depart, et six registres à zéro pour `basculer`.
-    unsafe {
-        cadre.write(Cadre {
-            r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
-            rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
-            vecteur: 0,
-            code_erreur: 0,
-            rip: entree,
-            cs: gdt::CODE_UTILISATEUR as u64,
-            rflags: RFLAGS_INITIAL,
-            rsp: pile,
-            ss: gdt::DONNEES_UTILISATEUR as u64,
-        });
-        (retour as *mut u64).write(premier_depart as *const () as u64);
-        core::ptr::write_bytes(depart as *mut u64, 0, 6);
-        (*CONTEXTES.0.get()).programme = depart;
-    }
-    let interruptions = cpu::couper_interruptions();
-    CALCUL.store(0, Ordering::Relaxed);
-    A_TUER.store(false, Ordering::Relaxed);
-    *FIN.verrouiller() = None;
-    EN_COURS.store(true, Ordering::Relaxed);
-    // SAFETY : interruptions coupées ; la pile noyau du programme sera
-    // prise à sa prochaine entrée dans le noyau ; son espace a la moitié
-    // haute du noyau (on continue de s'exécuter après avoir changé CR3).
-    // `basculer` revient quand le programme se termine (`terminer`).
-    unsafe {
-        gdt::definir_pile_noyau(haut);
-        pagination::activer(pml4);
-        let contextes = CONTEXTES.0.get();
-        basculer(&raw mut (*contextes).noyau, &raw const (*contextes).programme);
-        // De retour : on quitte l'espace du programme, qui va être détruit.
-        pagination::activer(pagination::pml4_noyau());
-    }
-    EN_COURS.store(false, Ordering::Relaxed);
-    if interruptions {
-        cpu::activer_interruptions();
-    }
-    CODE_SORTIE.load(Ordering::Relaxed)
+/// son code de sortie ; None : pas de pile noyau pour sa tâche.
+pub fn executer(nom: NomCourt, pml4: u64, entree: u64, pile: u64) -> Option<i32> {
+    let t = Tache::creer(nom, pml4, true)?;
+    t.preparer(premier_depart, 0, Some(Cadre {
+        r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
+        rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
+        vecteur: 0,
+        code_erreur: 0,
+        rip: entree,
+        cs: gdt::CODE_UTILISATEUR as u64,
+        rflags: RFLAGS_INITIAL,
+        rsp: pile,
+        ss: gdt::DONNEES_UTILISATEUR as u64,
+    }));
+    Some(faire_tourner(&t))
 }
 
-/// Termine le programme en cours (exit) : rend le processeur à la tâche du
-/// noyau, qui reprend dans `executer`. Appelée depuis un appel système, sur
-/// la pile noyau du programme, qui est abandonnée telle quelle.
+/// La fonction d'une tâche du noyau.
+type FonctionNoyau = Box<dyn FnOnce() + Send>;
+
+/// Exécute `f` dans une tâche du noyau nommée `nom`, et revient quand elle
+/// a fini ; false : pas de pile pour la tâche.
+pub fn executer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> bool {
+    let Some(t) = Tache::creer(nom, pagination::pml4_noyau(), false) else { return false };
+    // Un pointeur simple vers la fermeture, pour r12 : une boîte de boîte.
+    let f: Box<FonctionNoyau> = Box::new(Box::new(f));
+    t.preparer(depart_noyau, Box::into_raw(f) as u64, None);
+    faire_tourner(&t);
+    true
+}
+
+/// Le corps d'une tâche du noyau (depart_noyau) : sa fonction, puis sa fin.
+#[unsafe(no_mangle)]
+extern "C" fn tache_noyau(f: *mut FonctionNoyau) -> ! {
+    // SAFETY : `f` vient de Box::into_raw dans `executer_noyau`, rendu une
+    // seule fois, ici.
+    let f = unsafe { Box::from_raw(f) };
+    f();
+    terminer(0)
+}
+
+/// Termine la tâche courante : elle est morte, et rend la main à celle qui
+/// l'a lancée, qui rendra sa pile (fin de bascule). Appelée en haut de sa
+/// pile (retour vers l'anneau 3, ou fin de sa fonction) : rien de ce que
+/// tiennent les cadres en dessous n'est perdu.
 pub fn terminer(code: i32) -> ! {
-    CODE_SORTIE.store(code, Ordering::Relaxed);
+    let t = courante();
+    t.code_sortie.store(code, Ordering::Relaxed);
     cpu::couper_interruptions();
-    // SAFETY : interruptions coupées ; le contexte du noyau a été rangé par
-    // `executer`, qui attend dans `basculer`. Le contexte du programme est
-    // écrit, mais ne servira plus.
-    unsafe {
-        let contextes = CONTEXTES.0.get();
-        basculer(&raw mut (*contextes).programme, &raw const (*contextes).noyau);
-    }
-    unreachable!("un programme termine a repris la main");
+    t.morte.store(true, Ordering::Relaxed);
+    // SAFETY : LANCEUSE est la tâche qui attend dans `faire_tourner`, en
+    // vie (elle tient l'Arc de celle-ci).
+    let lanceuse = unsafe { &*LANCEUSE.load(Ordering::Relaxed) };
+    basculer_vers(lanceuse);
+    unreachable!("une tache morte a repris la main");
 }
 
 /// Arrête le programme en cours par le signal `signal` (une exception, sa
@@ -229,8 +441,7 @@ pub fn terminer(code: i32) -> ! {
 /// pourquoi : le message de Linux dans son journal, puis le code de sortie
 /// 128 + signal. Seulement au retour vers l'anneau 3 (`verifier_au_retour`).
 fn mourir(signal: Signal, raison: impl fmt::Display) -> ! {
-    let nom = *NOM.verrouiller();
-    afficherln!("[noyau] {} : {} ({})", nom, raison, signal.nom);
+    afficherln!("[noyau] {} : {} ({})", courante().nom(), raison, signal.nom);
     terminer(128 + signal.numero as i32)
 }
 
@@ -277,14 +488,11 @@ enum Fin {
     Signal(Signal, Message),
 }
 
-/// La fin prévue du programme en cours, s'il y en a une.
-static FIN: Verrou<Option<Fin>> = Verrou::new(None);
-
 /// exit et exit_group : le programme finira au retour vers l'anneau 3,
 /// avec ce code. Elle l'emporte sur tout ce qui pouvait l'attendre (sous
 /// Linux, `do_exit` part aussitôt, sans regarder les signaux).
 pub fn prevoir_sortie(code: i32) {
-    *FIN.verrouiller() = Some(Fin::Sortie(code));
+    *courante().fin.verrouiller() = Some(Fin::Sortie(code));
 }
 
 /// Le programme sera arrêté par `signal` au retour vers l'anneau 3 (une
@@ -292,7 +500,7 @@ pub fn prevoir_sortie(code: i32) {
 /// première raison l'emporte, sauf SIGKILL, qui remplace tout signal
 /// prévu avant lui (pas une sortie) : c'est lui qui tuera.
 pub fn forcer(signal: Signal, raison: impl fmt::Display) {
-    let mut fin = FIN.verrouiller();
+    let mut fin = courante().fin.verrouiller();
     let remplacer = match &*fin {
         None => true,
         Some(Fin::Signal(s, _)) => signal.numero == linux::SIGKILL.numero && s.numero != linux::SIGKILL.numero,
@@ -321,40 +529,36 @@ fn arreter_plus_de_memoire() -> ! {
     )
 }
 
-/// Le nom du programme en cours (PR_GET_NAME).
+/// Le nom de la tâche courante (PR_GET_NAME).
 pub fn nom() -> NomCourt {
-    *NOM.verrouiller()
+    courante().nom()
 }
 
-/// Change le nom du programme en cours (PR_SET_NAME) : celui des messages
+/// Change le nom de la tâche courante (PR_SET_NAME) : celui des messages
 /// du noyau, comme le `comm` de Linux, que montre aussi son tueur OOM.
 pub fn renommer(nom: NomCourt) {
-    *NOM.verrouiller() = nom;
+    *courante().nom.verrouiller() = nom;
 }
 
-/// Le programme en cours dort-il (un futex qui attend son délai) ? Ce
-/// temps-là n'est pas du calcul.
-static DORT: AtomicBool = AtomicBool::new(false);
-
-/// Un tic a été compté depuis la dernière vérification de RLIMIT_CPU.
-static TEMPS_A_VERIFIER: AtomicBool = AtomicBool::new(false);
-
-/// Appelée à chaque tic d'horloge, interruptions coupées : le programme en
-/// cours, s'il y en a un et qu'il ne dort pas, a calculé un tic de plus, et
-/// sa limite de temps de calcul sera vérifiée à son retour vers l'anneau 3.
+/// Appelée à chaque tic d'horloge, interruptions coupées : la tâche
+/// courante, si c'est un programme qui ne dort pas, a calculé un tic de
+/// plus, et sa limite de temps de calcul sera vérifiée à son retour vers
+/// l'anneau 3.
 pub fn tic() {
-    if EN_COURS.load(Ordering::Relaxed) && !DORT.load(Ordering::Relaxed) {
-        CALCUL.fetch_add(1, Ordering::Relaxed);
-        TEMPS_A_VERIFIER.store(true, Ordering::Relaxed);
+    let t = courante();
+    if t.programme.is_some() && !t.dort.load(Ordering::Relaxed) {
+        t.calcul.fetch_add(1, Ordering::Relaxed);
+        t.temps_a_verifier.store(true, Ordering::Relaxed);
     }
 }
 
-/// Le programme en cours dort, dans un appel système, jusqu'à ce que
-/// `fini` le dise (vérifié à chaque interruption) : `sti ; hlt` entre deux,
-/// et ce temps ne compte pas dans son temps de calcul. Sans ordonnanceur
-/// (6e), le processeur n'a rien d'autre à faire : il attend.
+/// La tâche courante dort, dans un appel système, jusqu'à ce que `fini` le
+/// dise (vérifié à chaque interruption) : `sti ; hlt` entre deux, et ce
+/// temps ne compte pas dans son temps de calcul. Sans ordonnanceur (le
+/// commit suivant), le processeur n'a rien d'autre à faire : il attend.
 pub fn dormir_jusqu_a(fini: impl Fn() -> bool) {
-    DORT.store(true, Ordering::Relaxed);
+    let t = courante();
+    t.dort.store(true, Ordering::Relaxed);
     loop {
         // Vérifier interruptions coupées, puis dormir : voir pourquoi dans
         // cpu::attendre_interruption.
@@ -364,24 +568,21 @@ pub fn dormir_jusqu_a(fini: impl Fn() -> bool) {
         }
         cpu::attendre_interruption();
     }
-    DORT.store(false, Ordering::Relaxed);
+    t.dort.store(false, Ordering::Relaxed);
     // Un appel système s'exécute interruptions actives.
     cpu::activer_interruptions();
 }
 
-/// Le temps de calcul du programme en cours, en tics
-/// (CLOCK_PROCESS_CPUTIME_ID, temps.rs). 0 sans programme.
+/// Le temps de calcul de la tâche courante, en tics
+/// (CLOCK_PROCESS_CPUTIME_ID, temps.rs).
 pub fn tics_du_programme() -> u64 {
-    if !EN_COURS.load(Ordering::Relaxed) {
-        return 0;
-    }
-    CALCUL.load(Ordering::Relaxed)
+    courante().calcul.load(Ordering::Relaxed)
 }
 
-/// Le programme en cours sera tué faute de mémoire à son retour vers
-/// l'anneau 3 (voir A_TUER).
+/// La tâche courante sera tuée faute de mémoire à son retour vers
+/// l'anneau 3 (voir `a_tuer`).
 pub fn tuer_au_retour() {
-    A_TUER.store(true, Ordering::Relaxed);
+    courante().a_tuer.store(true, Ordering::Relaxed);
 }
 
 /// La sortie vers l'anneau 3 : à la fin d'un appel système, et d'une
@@ -434,9 +635,6 @@ pub fn tuer_au_retour() {
 ///     fait pas à l'exec ; un programme qui veut une limite la pose
 ///     (setrlimit), et le shell de 6k aura `ulimit -t`.
 pub fn verifier_au_retour() {
-    if !EN_COURS.load(Ordering::Relaxed) {
-        return;
-    }
     cpu::couper_interruptions();
     let Some(arret) = decider() else { return };
     // Le verrou du processus est rendu, les interruptions reviennent :
@@ -464,16 +662,17 @@ pub fn verifier_au_retour() {
 /// Ce que la sortie vers l'anneau 3 doit faire (voir `verifier_au_retour`),
 /// décidé interruptions coupées.
 fn decider() -> Option<Arret> {
-    match FIN.verrouiller().take() {
+    let t = courante();
+    match t.fin.verrouiller().take() {
         Some(Fin::Sortie(code)) => return Some(Arret::Sortie(code)),
         Some(Fin::Signal(signal, message)) => return Some(Arret::Force(signal, message)),
         None => {}
     }
-    if A_TUER.load(Ordering::Relaxed) {
+    if t.a_tuer.load(Ordering::Relaxed) {
         return Some(Arret::PlusDeMemoire);
     }
-    let calcul = temps::nanosecondes(CALCUL.load(Ordering::Relaxed));
-    let verifier_temps = TEMPS_A_VERIFIER.swap(false, Ordering::Relaxed);
+    let calcul = temps::nanosecondes(t.calcul.load(Ordering::Relaxed));
+    let verifier_temps = t.temps_a_verifier.swap(false, Ordering::Relaxed);
     processus::essayer_avec(|p| {
         let (courante, dure) = p.limite(processus::RLIMIT_CPU);
         let atteinte = |secondes: u64| calcul as u128 >= secondes as u128 * 1_000_000_000;

@@ -711,8 +711,8 @@ $(WAST2JSON):
 # fonctionnalité test-NOM (dans son propre dossier de compilation, pour ne
 # pas défaire celle du noyau normal), qui provoque exprès une situation à
 # vérifier, et dont on cherche la conclusion dans ce qu'il affiche :
-#   - test-garde : déborder de la pile, que la page de garde doit arrêter
-#     net, et le dire ;
+#   - test-garde : déborder de la pile d'une tâche du noyau, que sa page
+#     de garde (vmalloc) doit arrêter net, et le dire ;
 #   - test-gros : un noyau de plus de 1 Mio, que le chargeur doit lire en
 #     entier, chaque secteur à sa place ;
 #   - test-programmes : l'archive des programmes de test (tests.cpio),
@@ -736,7 +736,7 @@ QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
 tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin
-	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile du noyau",:)
+	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
 	$(call attendre,$(QEMU_TEST) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"Clavier PS/2 pret",:)
 	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
 	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-gros.bin -serial file:test-gros.log,test-gros.log,"chaque secteur a sa place : ok",:)

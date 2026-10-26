@@ -107,8 +107,8 @@ struct Tss {
 /// rsp[0] à l'octet 4, rsp[2] à l'octet 20). D'où un nom fixe
 /// (no_mangle), et pas de Verrou autour : le processeur et l'entrée de
 /// `syscall` y accèdent sans passer par lui. Le noyau ne l'écrit que
-/// toujours interruptions coupées, sur son seul processeur : rsp[0] en
-/// démarrant un programme, rsp[2] à chaque entrée de `syscall` (FMASK a
+/// toujours interruptions coupées, sur son seul processeur : rsp[0] à
+/// chaque bascule (tache.rs), rsp[2] à chaque entrée de `syscall` (FMASK a
 /// coupé les interruptions). Avec plusieurs processeurs, il y en aura une
 /// par processeur, comme cpu_tss_rw dans Linux.
 #[repr(transparent)]

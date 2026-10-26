@@ -511,7 +511,10 @@ fn executer_elf(nom: NomCourt, n: Numero, lancement: &Lancement) {
     // (ETXTBSY) : ses pages seront bientôt celles du programme.
     let code = match vfs::avec(|fs, _| fs.refuser_ecriture(n)) {
         Ok(()) => {
-            let code = tache::executer(nom, pml4, depart, rsp);
+            let code = tache::executer(nom, pml4, depart, rsp).unwrap_or_else(|| {
+                afficherln!("[noyau] {} : pas de pile noyau pour sa tache", nom);
+                -1
+            });
             vfs::avec(|fs, _| fs.permettre_ecriture(n));
             code
         }
@@ -628,18 +631,16 @@ fn fermer_interpreteur(interpreteur: Option<&Interpreteur>) {
     }
 }
 
-/// Un programme WebAssembly : on le décode, le valide, l'instancie avec
-/// WASI, puis on appelle son point d'entrée _start par tranches de
-/// carburant : entre deux tranches, le noyau pourrait faire autre chose
-/// (exécuter un autre programme). Les interruptions de l'horloge et du
-/// clavier, elles, continuent d'arriver pendant tout ce temps, même pendant
-/// une écriture du programme (la console écrit par petits paquets).
+/// Un programme WebAssembly : on lit son module, puis, dans une tâche du
+/// noyau à lui (tache.rs), on le décode, le valide, l'instancie avec WASI,
+/// et on appelle son point d'entrée _start par tranches de carburant.
+/// Les interruptions de l'horloge et du clavier, elles, continuent
+/// d'arriver pendant tout ce temps, même pendant une écriture du programme
+/// (la console écrit par petits paquets). La tâche reçoit des copies de ce
+/// qu'elle utilise (ses arguments, son environnement, ses dossiers) : elle
+/// ne dépend plus de la ligne de /etc/demarrage, et pourra tourner pendant
+/// que le lanceur passe à la suivante.
 fn executer_wasm(nom: NomCourt, n: Numero, lancement: &Lancement) {
-    use alloc::sync::Arc;
-    use wasm::{Etat, Externe, Magasin, Piege};
-
-    const TRANCHE: u64 = 1000;
-
     // L'interpréteur veut le module d'un seul tenant : il est lu dans un
     // bloc du tas, qui fait au plus 4 Mio (tas.rs) ; un module plus gros est
     // refusé, jusqu'à ce que le noyau sache projeter des pages éparses d'un
@@ -653,8 +654,48 @@ fn executer_wasm(nom: NomCourt, n: Numero, lancement: &Lancement) {
     if vfs::lire(n, 0, &mut octets) != taille {
         return afficherln!("[noyau] {} : module WebAssembly illisible", nom);
     }
+    let (Some(arguments), Some(environnement), Some(dossiers)) =
+        (copies(lancement.arguments), copies(lancement.environnement), copies(lancement.dossiers))
+    else {
+        return afficherln!("[noyau] {} : plus de memoire pour ses arguments", nom);
+    };
+    let lance = tache::executer_noyau(nom, move || {
+        executer_module(nom, &octets, &tranches(&arguments), &tranches(&environnement), &tranches(&dossiers))
+    });
+    if !lance {
+        afficherln!("[noyau] {} : pas de pile noyau pour sa tache", nom);
+    }
+}
 
-    let module = match wasm::decoder(&octets).and_then(wasm::valider) {
+/// Des copies des chaînes de `chaines`, dans le tas ; None s'il n'y a pas
+/// la place.
+fn copies(chaines: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
+    let mut v = Vec::new();
+    v.try_reserve_exact(chaines.len()).ok()?;
+    for c in chaines {
+        let mut copie = Vec::new();
+        copie.try_reserve_exact(c.len()).ok()?;
+        copie.extend_from_slice(c);
+        v.push(copie);
+    }
+    Some(v)
+}
+
+/// Les tranches des chaînes de `v` (de petits tableaux de pointeurs, que le
+/// tas a toujours : quelques dizaines d'octets).
+fn tranches(v: &[Vec<u8>]) -> Vec<&[u8]> {
+    v.iter().map(Vec::as_slice).collect()
+}
+
+/// Le corps d'un programme WebAssembly, dans sa tâche (voir
+/// `executer_wasm`).
+fn executer_module(nom: NomCourt, octets: &[u8], arguments: &[&[u8]], environnement: &[&[u8]], dossiers: &[&[u8]]) {
+    use alloc::sync::Arc;
+    use wasm::{Etat, Externe, Magasin, Piege};
+
+    const TRANCHE: u64 = 1000;
+
+    let module = match wasm::decoder(octets).and_then(wasm::valider) {
         Ok(m) => Arc::new(m),
         Err(e) => return afficherln!("[noyau] {} : programme WebAssembly refuse : {}", nom, e),
     };
@@ -664,7 +705,7 @@ fn executer_wasm(nom: NomCourt, n: Numero, lancement: &Lancement) {
     let mut magasin = Magasin::avec_budget(16 << 20);
     // Ses descripteurs : la console, et les dossiers pré-ouverts de sa
     // ligne ; ses arguments et son environnement.
-    let mut hote = match wasi::Wasi::new(IDENTITE, lancement.dossiers, lancement.arguments, lancement.environnement) {
+    let mut hote = match wasi::Wasi::new(IDENTITE, dossiers, arguments, environnement) {
         Ok(h) => h,
         Err((e, Some(dossier))) => {
             return afficherln!("[noyau] {} : --dir={} impossible (errno {})", nom, Nom(dossier), e.errno());

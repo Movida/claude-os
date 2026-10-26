@@ -1,10 +1,10 @@
 //! Un verrou à attente active (« spinlock »), écrit à la main.
 //!
-//! Pourquoi un verrou dans un noyau qui n'a qu'un seul fil d'exécution ?
-//! Parce que Rust refuse, à juste titre, une variable globale modifiable
-//! sans protection : dès qu'il y a des interruptions matérielles
-//! (horloge, clavier) ou plusieurs processeurs, deux morceaux de code
-//! peuvent y écrire en même temps. Le verrou garantit qu'un seul à la fois y accède.
+//! Pourquoi un verrou sur un seul processeur ? Parce que Rust refuse, à
+//! juste titre, une variable globale modifiable sans protection : dès
+//! qu'il y a des interruptions matérielles (horloge, clavier), des tâches
+//! qui se passent le processeur (6e), ou plusieurs processeurs, deux
+//! morceaux de code peuvent y écrire en même temps. Le verrou garantit qu'un seul à la fois y accède.
 //!
 //! Principe : un booléen atomique. `verrouiller` le fait passer de false à
 //! true en une seule instruction indivisible (compare_exchange, `lock

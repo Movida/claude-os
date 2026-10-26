@@ -241,19 +241,13 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     afficherln!("[noyau] Adresses du noyau a la demande (vmalloc) : {} piles de {} Kio sous leur page de garde, tables faites d'avance ({} Kio).",
                 bilan.piles, vmalloc::TAILLE_PILE >> 10, bilan.tables >> 10);
     tester_vmalloc();
+    // Le code en cours devient la tâche inactive (tache.rs).
+    tache::initialiser();
     tester_espace_utilisateur();
     match acpi::initialiser() {
         Ok(()) => acpi::afficher(),
         Err(acpi::Absence::SansRsdp) => afficherln!("[noyau] Pas de tables ACPI (pas de RSDP dans la memoire du BIOS)."),
         Err(acpi::Absence::Racine(a, e)) => afficherln!("[noyau] Tables ACPI illisibles : la table racine a {:#x} : {}.", a, e),
-    }
-
-    // Le scénario de panne de `make tests-qemu` : déborder exprès de la
-    // pile, que la page de garde doit arrêter net.
-    #[cfg(feature = "test-garde")]
-    {
-        afficherln!("[noyau] Test : debordement volontaire de la pile.");
-        deborder(0);
     }
 
     // Les interruptions matérielles : d'abord le contrôleur (l'APIC et
@@ -306,12 +300,27 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         None => afficherln!("[noyau] Pas d'horloge CMOS lisible : la date part du 1er janvier 1970."),
     }
 
+    // Le scénario de panne de `make tests-qemu` : déborder exprès de la
+    // pile, que la page de garde doit arrêter net.
+    // Dans une tâche du noyau, sur sa pile de vmalloc : c'est la page de
+    // garde de chaque tâche qui est vérifiée.
+    #[cfg(feature = "test-garde")]
+    {
+        afficherln!("[noyau] Test : debordement volontaire de la pile d'une tache.");
+        tache::executer_noyau(programmes::NomCourt::de(b"test-garde"), || {
+            deborder(0);
+        });
+    }
+
     match clavier::initialiser() {
         Ok(()) => afficherln!("[noyau] Clavier PS/2 pret : tapez du texte."),
         Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
     }
 
-    programmes::demarrer();
+    // init : le lanceur de /etc/demarrage, dans sa tâche.
+    if !tache::executer_noyau(programmes::NomCourt::de(b"init"), programmes::demarrer) {
+        afficherln!("[noyau] Pas de pile pour la tache init : rien a lancer.");
+    }
 
     // Le scénario des programmes de test de `make tests-qemu` : une fois
     // l'archive exécutée, éteindre QEMU par son périphérique isa-debug-exit
