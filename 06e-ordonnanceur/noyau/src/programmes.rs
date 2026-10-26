@@ -194,7 +194,7 @@ pub fn demarrer() {
         };
         match action {
             None => {}
-            Some(Action::Premier(t)) => l.recueillir(t),
+            Some(Action::Premier(t)) => l.attendre(t),
             // La place est réservée pour chaque commande du fichier.
             Some(Action::Fond(t)) => l.fond.push(t),
             Some(Action::Attendre) => l.attendre_tous(),
@@ -259,7 +259,30 @@ impl Lanceur {
         self.en_cours += 1;
     }
 
-    /// Attend la fin du programme `t`, le recueille, et le dit.
+    /// Attend la fin du programme `t`, au premier plan. En attendant, comme
+    /// un init, recueille aussitôt chaque programme lancé par `&` qui se
+    /// termine : un zombie ne reste pas en attendant le prochain `wait`.
+    fn attendre(&mut self, t: Tache) {
+        loop {
+            self.recueillir_les_morts();
+            if t.tache().est_morte() {
+                return self.recueillir(t);
+            }
+            let fond = &self.fond;
+            tache::dormir_tant_que(|| !t.tache().est_morte() && !fond.iter().any(|f| f.tache().est_morte()));
+        }
+    }
+
+    /// Recueille les programmes lancés par `&` qui se sont terminés.
+    fn recueillir_les_morts(&mut self) {
+        while let Some(i) = self.fond.iter().position(|f| f.tache().est_morte()) {
+            let t = self.fond.remove(i);
+            self.recueillir(t);
+        }
+    }
+
+    /// Recueille le programme `t`, qui se termine (ou s'est terminé), et le
+    /// dit.
     fn recueillir(&mut self, t: Tache) {
         let fin = match t {
             Tache::Linux { tache, pid, nom, fichier } => {
@@ -292,17 +315,22 @@ impl Lanceur {
         }
     }
 
-    /// `wait` : recueille tous les programmes lancés par `&`, dans l'ordre
-    /// où ils l'ont été.
+    /// `wait` : recueille tous les programmes lancés par `&`, à mesure
+    /// qu'ils se terminent.
     fn attendre_tous(&mut self) {
-        let fond = core::mem::take(&mut self.fond);
-        let place = fond.capacity();
-        for t in fond {
-            self.recueillir(t);
+        while !self.fond.is_empty() {
+            self.recueillir_les_morts();
+            let fond = &self.fond;
+            tache::dormir_tant_que(|| !fond.is_empty() && !fond.iter().any(|f| f.tache().est_morte()));
         }
-        // La liste retrouve sa place (rendue avec l'ancienne) ; elle a été
-        // réservée avant le premier programme.
-        let _ = self.fond.try_reserve_exact(place);
+    }
+}
+
+impl Tache {
+    fn tache(&self) -> &Arc<tache::Tache> {
+        match self {
+            Tache::Linux { tache, .. } | Tache::Wasm(tache) => tache,
+        }
     }
 }
 

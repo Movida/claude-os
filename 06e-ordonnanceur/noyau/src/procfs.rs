@@ -38,6 +38,8 @@ use fichiers::noyaufs::{Cible, Contenu, Enregistrement, Genre, NoyauFs};
 use fichiers::{Erreur, Temps};
 use zones::Nature;
 
+const ESRCH: i64 = 3;
+
 /// Les sources des fichiers de /proc.
 const MAPS: u32 = 1;
 const STATM: u32 = 2;
@@ -138,6 +140,17 @@ pub fn lire(f: Fichier, position: u64, longueur: u64) -> Result<Vec<u8>, i64> {
         Donnees::Noyau { source, argument, sequence } => (*source, *argument, core::mem::take(sequence)),
         _ => unreachable!("un fichier du noyau sans source"),
     });
+    // Le fichier d'un processus recueilli (sa tâche est morte, et init l'a
+    // retiré de la table) : ESRCH, comme Linux (mesuré). Celui d'un zombie
+    // se lit encore (voir `produire`).
+    if matches!(source, MAPS | STATM) && !processus::existe(argument) {
+        vfs::avec_systeme(|s, _| {
+            if let Donnees::Noyau { sequence: place, .. } = &mut s.ouverts.fichier(f).donnees {
+                *place = sequence;
+            }
+        });
+        return Err(-ESRCH);
+    }
     let lu = match lecture(source) {
         Lecture::Valeur if position > 0 => Ok(Vec::new()),
         Lecture::Valeur => valeur(source).map(|mut v| {
@@ -225,11 +238,12 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
         v.extend_from_slice(valeur);
         return Ok(Some((v, 1)));
     }
-    // Le processus `argument`, s'il vit encore (un fichier gardé ouvert
-    // après sa fin se lit vide).
+    // Le processus `argument`. Un zombie (sa tâche est morte, il attend
+    // d'être recueilli) n'a plus de mémoire : maps vide, statm à zéro,
+    // comme Linux (mesuré).
     match source {
         MAPS => ligne_maps(argument, curseur),
-        STATM if curseur == 0 => statm(argument).map(|t| t.map(|t| (t, u64::MAX))),
+        STATM if curseur == 0 => statm(argument).map(|t| Some((t, u64::MAX))),
         _ => Ok(None),
     }
 }
@@ -242,8 +256,8 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
 /// privées inscriptibles, hors pile, plus la pile : `data_vm + stack_vm`) ;
 /// 0. Les compteurs du résident sont ceux que tient déjà l'espace
 /// d'adressage (les `rss_stat` de Linux) ; le reste, sommé sur les zones.
-fn statm(pid: u32) -> Result<Option<Vec<u8>>, Erreur> {
-    let Some((taille, resident, partage, code, donnees)) = processus::avec_pid(pid, |p| {
+fn statm(pid: u32) -> Result<Vec<u8>, Erreur> {
+    let (taille, resident, partage, code, donnees) = processus::avec_pid(pid, |p| {
         let m = &p.memoire;
         let (debut, fin) = m.code;
         let code = if fin > debut { (fin.next_multiple_of(4096) - (debut & !4095)) / 4096 } else { 0 };
@@ -253,12 +267,10 @@ fn statm(pid: u32) -> Result<Option<Vec<u8>>, Erreur> {
             .sum();
         let (pages, fichier) = (m.espace.pages() as u64, m.espace.pages_fichier() as u64);
         (m.taille_virtuelle() / 4096, pages + fichier, fichier, code, donnees)
-    }) else {
-        return Ok(None);
-    };
+    }).unwrap_or((0, 0, 0, 0, 0));
     let mut t = Texte(Vec::new());
     writeln!(t, "{} {} {} {} 0 {} 0", taille, resident, partage, code, donnees).map_err(|_| Erreur::ENOMEM)?;
-    Ok(Some(t.0))
+    Ok(t.0)
 }
 
 /// La ligne de /proc/<pid>/maps du processus `pid` de la première zone qui finit après

@@ -24,6 +24,8 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sched.h>
+#include <signal.h>
+#include <time.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <sys/sysmacros.h>
@@ -486,8 +488,56 @@ static void sys(void)
                  && erreur(mkdir("/sys/x", 0755)) == EACCES, "chez nous : pas de NUMA, rien a ecrire (EACCES)");
 }
 
-int main(void)
+/* « proc cible » : écrit son numéro dans /tmp/proc-cible.pid, attend
+ * 200 ms et se termine. « proc autre », lancé ensuite : ouvre maps et statm
+ * de la cible tant qu'elle vit, les lit, puis attend qu'elle ait été
+ * recueillie (kill(pid, 0) : ESRCH) ; ses fichiers, gardés ouverts, se
+ * lisent alors ESRCH, comme sous Linux (mesuré). Dans notre noyau, lancés
+ * ensemble par /etc/demarrage, init recueillant la cible dès sa fin. */
+static int autre(void)
 {
+    struct timespec ms = { 0, 1000000 };
+    int fd = -1;
+    for (int i = 0; i < 10000 && (fd = open("/tmp/proc-cible.pid", O_RDONLY)) < 0; i++)
+        nanosleep(&ms, NULL);
+    char t[16] = { 0 }, chemin[64], tampon[256];
+    if (read(fd, t, sizeof t - 1) <= 0)
+        return 1;
+    close(fd);
+    unlink("/tmp/proc-cible.pid");
+    int cible = atoi(t);
+    snprintf(chemin, sizeof chemin, "/proc/%d/maps", cible);
+    int maps = open(chemin, O_RDONLY);
+    snprintf(chemin, sizeof chemin, "/proc/%d/statm", cible);
+    int statm = open(chemin, O_RDONLY);
+    verifier(maps >= 0 && statm >= 0 && read(maps, tampon, sizeof tampon) > 0 && read(statm, tampon, sizeof tampon) > 0,
+             "maps et statm d'un autre processus, vivant : lus");
+    for (int i = 0; i < 10000 && kill(cible, 0) == 0; i++)
+        nanosleep(&ms, NULL);
+    lseek(maps, 0, SEEK_SET);
+    lseek(statm, 0, SEEK_SET);
+    verifier(kill(cible, 0) == -1 && erreur(read(maps, tampon, sizeof tampon)) == ESRCH && erreur(read(statm, tampon, sizeof tampon)) == ESRCH,
+             "ses fichiers gardes ouverts, une fois recueilli : ESRCH");
+    printf("[linux] proc autre : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
+    return echecs != 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc == 2 && strcmp(argv[1], "cible") == 0) {
+        char t[16];
+        int k = snprintf(t, sizeof t, "%d", getpid());
+        int fd = open("/tmp/proc-cible.tmp", O_CREAT | O_WRONLY | O_TRUNC, 0644);
+        if (write(fd, t, k) != k)
+            return 1;
+        close(fd);
+        rename("/tmp/proc-cible.tmp", "/tmp/proc-cible.pid");
+        struct timespec deux_cents = { 0, 200000000 };
+        nanosleep(&deux_cents, NULL);
+        return 0;
+    }
+    if (argc == 2 && strcmp(argv[1], "autre") == 0)
+        return autre();
     chez_nous = access("/etc/bonjour.txt", F_OK) == 0;
     printf("[linux] proc : debut\n"); /* le tampon de stdout, alloue avant de lire les cartes */
     carte();

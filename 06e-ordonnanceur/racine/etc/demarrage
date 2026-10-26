@@ -38,6 +38,9 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/evenements
 # /proc et /sys (6d) : ce qu'y lit Bun, maps, statm, exe, /proc/sys/vm, cpu/online.
 /bin/proc
+# Le fichier de /proc d'un processus recueilli, gardé ouvert : ESRCH (6e).
+/bin/proc cible &
+/bin/proc autre
 # Deux programmes à la fois (6e) : lancés par `&`, ils se partagent le
 # processeur ; deux autres ajoutent au même fichier, sans rien perdre.
 /bin/partage a b &

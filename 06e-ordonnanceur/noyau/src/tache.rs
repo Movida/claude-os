@@ -47,7 +47,7 @@
 //!
 //! Les tâches prêtes se partagent le processeur (ordonnanceur.rs) ; une
 //! tâche qui en a créé d'autres (init, qui lance les programmes) dort
-//! jusqu'à ce que l'une d'elles finisse (`attendre`).
+//! jusqu'à ce que l'une d'elles finisse (`attendre`, `dormir_tant_que`).
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -185,7 +185,9 @@ pub struct Tache {
     /// temps virtuels quand elle a quitté la file des prêtes (ordonnanceur.rs),
     /// retrouvé à son réveil.
     lag: AtomicI64,
-    /// La tâche qui attend sa fin (`attendre`), réveillée par `terminer`.
+    /// La tâche qui l'a créée, réveillée par `terminer` (elle attend sa fin,
+    /// ou celle de l'une de ses tâches : `attendre`, `dormir_tant_que`) ;
+    /// None pour l'inactive.
     attendant: Verrou<Option<Arc<Tache>>>,
     /// Le lien vers la tâche suivante de la file d'attente où elle attend
     /// (attente.rs), sous le verrou de cette file.
@@ -253,7 +255,9 @@ impl Tache {
             code_sortie: AtomicI32::new(0),
             calcul: AtomicU64::new(0),
             lag: AtomicI64::new(0),
-            attendant: Verrou::new(None),
+            // (La tâche inactive n'attend personne : elle ne doit jamais
+            // quitter son rôle pour entrer dans la file des prêtes.)
+            attendant: Verrou::new((en_service() && !core::ptr::eq(courante(), inactive())).then(courante_arc)),
             lien_attente: Cell::new(core::ptr::null()),
             reveil: AtomicU8::new(0),
             interruptible: AtomicBool::new(false),
@@ -317,6 +321,11 @@ impl Tache {
     /// Le lien de file d'attente (attente.rs).
     pub fn lien_attente(&self) -> &Cell<*const Tache> {
         &self.lien_attente
+    }
+
+    /// Est-elle morte ?
+    pub fn est_morte(&self) -> bool {
+        self.morte.load(Ordering::Relaxed)
     }
 
     /// Son processus, pour un programme Linux.
@@ -597,9 +606,17 @@ extern "C" fn fin_de_bascule() {
 /// l'attente inscrite, interruptions coupées, comme la fin elle-même ; sur
 /// un seul processeur, rien ne peut se glisser entre les deux.
 pub fn attendre(t: &Tache) -> i32 {
+    dormir_tant_que(|| !t.est_morte());
+    t.code_sortie.load(Ordering::Relaxed)
+}
+
+/// La tâche courante dort tant que `encore` le dit, réveillée par la fin
+/// de l'une des tâches qu'elle a créées (le `wait` d'un parent : init qui
+/// recueille ses enfants, programmes.rs). Sans réveil perdu : `encore` est
+/// vérifié interruptions coupées, comme la fin elle-même.
+pub fn dormir_tant_que(encore: impl Fn() -> bool) {
     let interruptions = cpu::couper_interruptions();
-    while !t.morte.load(Ordering::Relaxed) {
-        *t.attendant.verrouiller() = Some(courante_arc());
+    while encore() {
         courante().preparer_sommeil();
         ordonnanceur::retirer_courante();
         ordonnanceur::ordonnancer();
@@ -607,7 +624,6 @@ pub fn attendre(t: &Tache) -> i32 {
     if interruptions {
         cpu::activer_interruptions();
     }
-    t.code_sortie.load(Ordering::Relaxed)
 }
 
 /// Le RFLAGS d'un programme qui démarre : IF (interruptions acceptées) et
@@ -691,6 +707,8 @@ pub fn terminer(code: i32) -> ! {
             toutes.swap_remove(i);
         }
     }
+    // Sa créatrice, qui attend peut-être sa fin, ou celle de l'une de ses
+    // tâches.
     if let Some(attendant) = t.attendant.verrouiller().take() {
         reveiller(attendant, Reveil::Reveillee);
     }
