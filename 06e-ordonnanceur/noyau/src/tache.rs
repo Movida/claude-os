@@ -48,7 +48,14 @@
 //!
 //! Les tâches prêtes se partagent le processeur (ordonnanceur.rs) ; une
 //! tâche qui en a créé d'autres (init, qui lance les programmes) dort
-//! jusqu'à ce que l'une d'elles finisse (`attendre`, `dormir_tant_que`).
+//! jusqu'à ce que l'une d'elles finisse (`attendre`, `dormir_tant_que`),
+//! ou, pour un programme Linux, jusqu'à ce que son processus en ait fini
+//! avec son dernier fil (processus::Entree::est_zombie).
+//!
+//! Une tâche de programme Linux est un FIL de son processus : ce qui est à
+//! chacun (son numéro, son nom, ses registres, son temps de calcul, sa fin
+//! prévue) est ici ; ce que partagent les fils, dans le processus
+//! (processus.rs) ; leurs signaux, dans le `Fil` de chacun (fil.rs).
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
@@ -150,6 +157,10 @@ pub struct EtatFpu([u8; 512]);
 
 /// Ce que le noyau sait d'une tâche.
 pub struct Tache {
+    /// Son numéro de fil (le tid), pour un programme Linux : celui de son
+    /// processus pour le fil principal. 0 pour une tâche du noyau (les
+    /// programmes ne la voient pas).
+    tid: u32,
     /// Son nom, pour les messages : celui du programme (le `comm` de
     /// Linux), ou celui de la tâche du noyau.
     nom: Verrou<NomCourt>,
@@ -166,7 +177,8 @@ pub struct Tache {
     /// du noyau pour une tâche du noyau, et pour un programme qui meurt
     /// (avant de rendre le sien, `terminer`).
     espace: AtomicU64,
-    /// Son processus, pour un programme Linux (processus.rs).
+    /// Son processus, pour un programme Linux (processus.rs), qu'elle tient :
+    /// il vit tant qu'il a un fil, puis en zombie.
     processus: Option<Arc<crate::processus::Entree>>,
     /// Pour un programme : son état x87/SSE, ses sélecteurs (DS, ES, FS,
     /// GS) et sa base de FS, quand il ne s'exécute pas.
@@ -185,9 +197,11 @@ pub struct Tache {
     /// temps virtuels quand elle a quitté la file des prêtes (ordonnanceur.rs),
     /// retrouvé à son réveil.
     lag: AtomicI64,
-    /// La tâche qui l'a créée, réveillée par `terminer` (elle attend sa fin,
-    /// ou celle de l'une de ses tâches : `attendre`, `dormir_tant_que`) ;
-    /// None pour l'inactive.
+    /// Pour une tâche du noyau, celle qui l'a créée, réveillée par
+    /// `terminer` (elle attend sa fin, ou celle de l'une de ses tâches :
+    /// `attendre`, `dormir_tant_que`) ; None pour l'inactive. Un fil de
+    /// programme n'en a pas : c'est la fin de son processus qui réveille son
+    /// parent (processus::Entree::fil_disparu).
     attendant: Verrou<Option<Arc<Tache>>>,
     /// Le lien vers la tâche suivante de la file d'attente où elle attend
     /// (attente.rs), sous le verrou de cette file.
@@ -231,9 +245,13 @@ unsafe impl Sync for Tache {}
 unsafe impl Send for Tache {}
 
 impl Tache {
-    /// Une tâche, sans encore de premier départ. None : plus de mémoire,
-    /// ou plus de place pour une pile (le maximum de fils).
-    fn creer(nom: NomCourt, espace: u64, programme: bool, processus: Option<Arc<crate::processus::Entree>>) -> Option<Arc<Tache>> {
+    /// Une tâche, sans encore de premier départ, ni de place dans la table
+    /// des tâches (`demarrer`) : jetée avant, elle rend sa pile. None : plus
+    /// de mémoire, ou plus de place pour une pile (le maximum de fils). Une
+    /// tâche du noyau attend sa créatrice (`attendant`), un fil de programme
+    /// a le numéro `tid`.
+    fn creer(nom: NomCourt, espace: u64, programme: bool, processus: Option<Arc<crate::processus::Entree>>, tid: u32)
+        -> Option<Arc<Tache>> {
         let pile = Pile::allouer()?;
         let haut = pile.haut();
         let programme = if programme {
@@ -243,7 +261,9 @@ impl Tache {
         } else {
             None
         };
+        let noyau = processus.is_none();
         let t = Arc::new(Tache {
+            tid,
             nom: Verrou::new(nom),
             contexte: UnsafeCell::new(0),
             pile: Verrou::new(Some(pile)),
@@ -257,7 +277,7 @@ impl Tache {
             lag: AtomicI64::new(0),
             // (La tâche inactive n'attend personne : elle ne doit jamais
             // quitter son rôle pour entrer dans la file des prêtes.)
-            attendant: Verrou::new((en_service() && !core::ptr::eq(courante(), inactive())).then(courante_arc)),
+            attendant: Verrou::new((noyau && en_service() && !core::ptr::eq(courante(), inactive())).then(courante_arc)),
             lien_attente: Cell::new(core::ptr::null()),
             reveil: AtomicU8::new(0),
             interruptible: AtomicBool::new(false),
@@ -267,9 +287,12 @@ impl Tache {
             a_tuer: AtomicBool::new(false),
             fin: Verrou::new(None),
         });
-        // La place est réservée : il n'y a jamais plus de tâches que de piles.
-        TOUTES.verrouiller().push(t.clone());
         Some(t)
+    }
+
+    /// Son numéro de fil (0 : une tâche du noyau).
+    pub fn tid(&self) -> u32 {
+        self.tid
     }
 
     /// Prépare la pile pour un premier départ : six registres pour
@@ -300,22 +323,20 @@ impl Tache {
         *self.nom.verrouiller()
     }
 
-    /// Ajoute `ns` nanosecondes à son temps de calcul (ordonnanceur.rs) ; un
-    /// programme verra sa limite de temps de calcul vérifiée à son retour
-    /// vers l'anneau 3.
+    /// Ajoute `ns` nanosecondes à son temps de calcul (ordonnanceur.rs), et
+    /// à celui de son processus ; un programme verra sa limite de temps de
+    /// calcul vérifiée à son retour vers l'anneau 3.
     pub fn compter_calcul(&self, ns: u64) {
         if ns == 0 {
             return;
         }
         self.calcul.fetch_add(ns, Ordering::Relaxed);
+        if let Some(p) = &self.processus {
+            p.compter_calcul(ns);
+        }
         if self.programme.is_some() {
             self.temps_a_verifier.store(true, Ordering::Relaxed);
         }
-    }
-
-    /// Son temps de calcul, en nanosecondes.
-    pub fn temps_de_calcul(&self) -> u64 {
-        self.calcul.load(Ordering::Relaxed)
     }
 
     /// Le lien de file d'attente (attente.rs).
@@ -416,6 +437,7 @@ static INACTIVE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
 /// inactive. Avant toute autre tâche.
 pub fn initialiser() {
     let pile_demarrage = Tache {
+        tid: 0,
         nom: Verrou::new(NomCourt::de(b"inactive")),
         contexte: UnsafeCell::new(0),
         pile: Verrou::new(None),
@@ -496,17 +518,11 @@ pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) {
     }
 }
 
-/// Un signal vient d'être mis en attente pour le processus `pid` : sa
-/// tâche, si elle dort interruptible, est réveillée (le `signal_wake_up`
-/// de Linux).
-pub fn reveiller_par_signal(pid: u32) {
-    let mut cible = None;
-    pour_chaque(|t| {
-        if t.processus.as_ref().is_some_and(|p| p.pid() == pid) && t.interruptible.load(Ordering::Relaxed) {
-            cible = Some(t.clone());
-        }
-    });
-    if let Some(t) = cible {
+/// Un signal vient d'être mis en attente pour le fil `t`, qui ne le bloque
+/// pas : s'il dort interruptible, il est réveillé (le `signal_wake_up` de
+/// Linux).
+pub fn reveiller_par_signal(t: Arc<Tache>) {
+    if t.interruptible.load(Ordering::Relaxed) {
         reveiller(t, Reveil::Signal);
     }
 }
@@ -518,7 +534,18 @@ pub fn signal_en_attente() -> bool {
     let t = courante();
     t.fin.verrouiller().is_some()
         || t.a_tuer.load(Ordering::Relaxed)
-        || (t.programme.is_some() && processus::essayer_avec(|p| signaux::en_attente_non_bloque(p)) == Some(true))
+        || (t.programme.is_some() && processus::essayer_avec(|p| signaux::en_attente_non_bloque(p, t.tid)) == Some(true))
+}
+
+/// Le numéro du processus du fil `tid`, s'il vit encore.
+pub fn processus_du_fil(tid: u32) -> Option<u32> {
+    let mut pid = None;
+    pour_chaque(|t| {
+        if t.tid == tid {
+            pid = t.processus.as_ref().map(|p| p.pid());
+        }
+    });
+    pid
 }
 
 /// Un Arc de la tâche courante (pour la mettre dans une file).
@@ -598,6 +625,13 @@ extern "C" fn fin_de_bascule() {
         // seule fois, ici ; elle ne s'exécute plus.
         let t = unsafe { Arc::from_raw(morte) };
         drop(t.pile.verrouiller().take());
+        // Un fil de programme : sa tâche rendue (si rien d'autre ne la
+        // tient), son processus est peut-être fini.
+        let processus = t.processus.clone();
+        drop(t);
+        if let Some(p) = processus {
+            p.fil_disparu();
+        }
     }
 }
 
@@ -630,12 +664,22 @@ pub fn dormir_tant_que(encore: impl Fn() -> bool) {
 /// le bit 1, toujours à 1. IOPL = 0 : pas de `in`, `out`, `cli`, `sti`.
 const RFLAGS_INITIAL: u64 = 1 << 9 | 1 << 1;
 
-/// Lance un programme, prêt aussitôt : `processus` son processus, `pml4`
-/// son espace d'adressage, `entree` son point d'entrée, `pile` le sommet
-/// de sa pile. None : pas de pile noyau pour sa tâche.
+/// Range la tâche `t` dans la table des tâches, et la rend prête.
+fn demarrer(t: &Arc<Tache>) {
+    // La place est réservée : il n'y a jamais plus de tâches que de piles.
+    TOUTES.verrouiller().push(t.clone());
+    ordonnanceur::rendre_prete(t.clone(), true);
+}
+
+/// Lance le fil principal d'un programme, prêt aussitôt : `processus` son
+/// processus (dont il porte le numéro), `pml4` son espace d'adressage,
+/// `entree` son point d'entrée, `pile` le sommet de sa pile. None : pas de
+/// pile noyau pour sa tâche, ou plus de mémoire pour la liste des fils.
 pub fn lancer_programme(nom: NomCourt, processus: Arc<crate::processus::Entree>, pml4: u64, entree: u64, pile: u64)
     -> Option<Arc<Tache>> {
-    let t = Tache::creer(nom, pml4, true, Some(processus))?;
+    let tid = processus.pid();
+    let t = Tache::creer(nom, pml4, true, Some(processus.clone()), tid)?;
+    processus.attacher(&t).ok()?;
     t.preparer(premier_depart, 0, Some(Cadre {
         r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
         rbp: 0, rdi: 0, rsi: 0, rdx: 0, rcx: 0, rbx: 0, rax: 0,
@@ -647,7 +691,7 @@ pub fn lancer_programme(nom: NomCourt, processus: Arc<crate::processus::Entree>,
         rsp: pile,
         ss: gdt::DONNEES_UTILISATEUR as u64,
     }));
-    ordonnanceur::rendre_prete(t.clone(), true);
+    demarrer(&t);
     Some(t)
 }
 
@@ -657,11 +701,11 @@ type FonctionNoyau = Box<dyn FnOnce() + Send>;
 /// Lance `f` dans une tâche du noyau nommée `nom`, prête aussitôt ; None :
 /// pas de pile pour la tâche.
 pub fn lancer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> Option<Arc<Tache>> {
-    let t = Tache::creer(nom, pagination::pml4_noyau(), false, None)?;
+    let t = Tache::creer(nom, pagination::pml4_noyau(), false, None, 0)?;
     // Un pointeur simple vers la fermeture, pour r12 : une boîte de boîte.
     let f: Box<FonctionNoyau> = Box::new(Box::new(f));
     t.preparer(depart_noyau, Box::into_raw(f) as u64, None);
-    ordonnanceur::rendre_prete(t.clone(), true);
+    demarrer(&t);
     Some(t)
 }
 
@@ -679,7 +723,9 @@ extern "C" fn tache_noyau(f: *mut FonctionNoyau) -> ! {
 /// quitte la file des prêtes et cède le processeur pour toujours ; la
 /// tâche suivante rendra sa pile (fin de bascule). Appelée en haut de sa
 /// pile (retour vers l'anneau 3, ou fin de sa fonction) : rien de ce que
-/// tiennent les cadres en dessous n'est perdu.
+/// tiennent les cadres en dessous n'est perdu. Un fil de programme quitte
+/// son processus ; le processus devient un zombie quand la pile de son
+/// dernier fil est rendue (fin_de_bascule), ce qui réveille son parent.
 pub fn terminer(code: i32) -> ! {
     let t = courante();
     t.code_sortie.store(code, Ordering::Relaxed);
@@ -695,7 +741,7 @@ pub fn terminer(code: i32) -> ! {
         if interruptions {
             cpu::activer_interruptions();
         }
-        p.terminer(code);
+        p.fil_termine(t.tid, code);
     }
     cpu::couper_interruptions();
     t.morte.store(true, Ordering::Relaxed);
@@ -720,10 +766,14 @@ pub fn terminer(code: i32) -> ! {
 /// Arrête le programme en cours par le signal `signal` (une exception, sa
 /// limite de temps de calcul, un signal qu'il s'est envoyé), en disant
 /// pourquoi : le message de Linux dans son journal, puis le code de sortie
-/// 128 + signal. Seulement au retour vers l'anneau 3 (`verifier_au_retour`).
+/// 128 + signal, pour tout le groupe (un signal mortel arrête le processus,
+/// le `do_group_exit` de `get_signal`). Seulement au retour vers l'anneau 3
+/// (`verifier_au_retour`).
 fn mourir(signal: Signal, raison: impl fmt::Display) -> ! {
     afficherln!("[noyau] {} : {} ({})", courante().nom(), raison, signal.nom);
-    terminer(128 + signal.numero as i32)
+    let code = 128 + signal.numero as i32;
+    processus::essayer_avec(|p| p.finir_le_groupe(code));
+    terminer(code)
 }
 
 /// Un message du noyau gardé pour plus tard : celui d'une faute, dit quand
@@ -769,11 +819,20 @@ enum Fin {
     Signal(Signal, Message),
 }
 
-/// exit et exit_group : le programme finira au retour vers l'anneau 3,
-/// avec ce code. Elle l'emporte sur tout ce qui pouvait l'attendre (sous
-/// Linux, `do_exit` part aussitôt, sans regarder les signaux).
+/// exit : le fil finira au retour vers l'anneau 3, avec ce code. Elle
+/// l'emporte sur tout ce qui pouvait l'attendre (sous Linux, `do_exit` part
+/// aussitôt, sans regarder les signaux). Le processus finit avec son
+/// dernier fil.
 pub fn prevoir_sortie(code: i32) {
     *courante().fin.verrouiller() = Some(Fin::Sortie(code));
+}
+
+/// exit_group : la fin de tout le groupe, avec ce code (sauf si elle avait
+/// déjà commencé : son code l'emporte, comme le `do_group_exit` de Linux),
+/// puis celle du fil, au retour vers l'anneau 3.
+pub fn prevoir_sortie_du_groupe(code: i32) {
+    let code = processus::avec(|p| *p.fin_de_groupe.get_or_insert(code));
+    prevoir_sortie(code);
 }
 
 /// Le programme sera arrêté par `signal` au retour vers l'anneau 3 (une
@@ -823,9 +882,16 @@ pub fn tic() {
 }
 
 /// Le temps de calcul de la tâche courante, en nanosecondes
-/// (CLOCK_PROCESS_CPUTIME_ID, temps.rs).
+/// (CLOCK_THREAD_CPUTIME_ID, temps.rs).
 pub fn temps_de_calcul() -> u64 {
     courante().calcul.load(Ordering::Relaxed)
+}
+
+/// Celui de son processus, tous ses fils (CLOCK_PROCESS_CPUTIME_ID) ; pour
+/// une tâche du noyau (un programme WebAssembly), le sien.
+pub fn temps_du_processus() -> u64 {
+    let t = courante();
+    t.processus.as_ref().map_or_else(|| t.calcul.load(Ordering::Relaxed), |p| p.temps_de_calcul())
 }
 
 /// La tâche courante sera tuée faute de mémoire à son retour vers
@@ -932,9 +998,11 @@ fn decider() -> Option<Arret> {
     if t.a_tuer.load(Ordering::Relaxed) {
         return Some(Arret::PlusDeMemoire);
     }
-    let calcul = t.calcul.load(Ordering::Relaxed);
+    // Le temps de calcul du processus : RLIMIT_CPU compte tous ses fils.
+    let calcul = t.processus.as_ref().map_or(0, |p| p.temps_de_calcul());
     let verifier_temps = t.temps_a_verifier.swap(false, Ordering::Relaxed);
-    processus::essayer_avec(|p| {
+    let mut a_reveiller = None;
+    let arret = processus::essayer_avec(|p| {
         let (courante, dure) = p.limite(processus::RLIMIT_CPU);
         let atteinte = |secondes: u64| calcul as u128 >= secondes as u128 * 1_000_000_000;
         let mut xcpu = None;
@@ -946,17 +1014,23 @@ fn decider() -> Option<Arret> {
                 // Ici courante < dure (égales, la dure l'aurait emporté) :
                 // relevée, elle ne la dépasse pas.
                 p.changer_limite(processus::RLIMIT_CPU, (courante + 1, dure));
-                // Au processus, comme Linux (`check_process_timers`).
-                signaux::envoyer(p, linux::SIGXCPU.numero as u64, signaux::Destinataire::Processus);
+                // Au processus, comme Linux (`check_process_timers`) : un
+                // autre fil le prendra peut-être, s'il ne le bloque pas et
+                // que celui-ci le bloque.
+                a_reveiller = signaux::envoyer(p, linux::SIGXCPU.numero as u64, signaux::Destinataire::Processus);
                 xcpu = Some(courante);
             }
         }
-        signaux::a_livrer(p).map(|(sig, comment)| match (comment, xcpu) {
+        signaux::a_livrer(p, t.tid).map(|(sig, comment)| match (comment, xcpu) {
             (signaux::Fin::ParDefaut, Some(secondes)) if sig == linux::SIGXCPU.numero as u64 => Arret::Limite(secondes),
             _ => Arret::Signal(sig, comment),
         })
     })
-    .flatten()
+    .flatten();
+    if a_reveiller.as_ref().is_some_and(|a| !core::ptr::eq(Arc::as_ptr(a), t)) {
+        signaux::reveiller(a_reveiller);
+    }
+    arret
 }
 
 /// Pourquoi `verifier_au_retour` arrête le programme.
@@ -985,7 +1059,8 @@ const GESTIONNAIRE_EN_6F: &str = "gestionnaire enregistre, pas encore appele (li
 /// Sinon, comme Linux, une faute tue le programme même s'il ignore ou
 /// bloque son signal (`force_sig_info_to_task`).
 pub fn forcer_par_faute(signal: Signal, raison: impl fmt::Display) {
-    let gestionnaire = processus::essayer_avec(|p| p.signaux.gestionnaire_pour_faute(signal.numero as u64)) == Some(true);
+    let tid = courante().tid;
+    let gestionnaire = processus::essayer_avec(|p| signaux::gestionnaire_pour_faute(p, tid, signal.numero as u64)) == Some(true);
     if gestionnaire {
         forcer(signal, format_args!("{} ; {}", raison, GESTIONNAIRE_EN_6F))
     } else {

@@ -1,17 +1,20 @@
-//! Les processus : ce que les appels système d'un programme Linux doivent
-//! pouvoir modifier (sa mémoire : zones, tables de pages, tas ; ses
-//! descripteurs de fichiers ; son dossier courant). C'est une toute petite
-//! partie de la task_struct de Linux.
+//! Les processus : ce que partagent les fils d'un programme Linux, et que
+//! leurs appels système doivent pouvoir modifier (sa mémoire : zones,
+//! tables de pages, tas ; ses descripteurs de fichiers ; son dossier
+//! courant ; l'action de ses signaux). Le `signal_struct`, le `mm_struct`,
+//! le `files_struct` et le `fs_struct` de Linux, en une structure ; ce qui
+//! est à chaque fil est dans sa tâche (tache.rs) et dans son `Fil` (fil.rs).
 //!
 //! Chaque processus est une `Entree` de la TABLE DES PROCESSUS, tenue par
-//! sa tâche (tache.rs) : `avec` donne celui de la tâche courante,
-//! `avec_pid` celui d'un numéro (kill, /proc, sched_getaffinity). Quand sa
-//! tâche meurt, elle rend elle-même la mémoire et les descripteurs du
-//! processus (le `exit_mm` et le `exit_files` de Linux) ; il reste un
-//! ZOMBIE : son numéro et son code de sortie, jusqu'à ce qu'init le
-//! recueille (programmes.rs) et le retire de la table. La table est
-//! réservée au démarrage pour autant de processus que de tâches : elle ne
-//! grandit jamais pendant un programme.
+//! chacun de ses fils (leurs tâches) et par la table : `avec` donne celui
+//! de la tâche courante, `avec_pid` celui d'un numéro (kill, /proc,
+//! sched_getaffinity). Quand son dernier fil meurt, il rend lui-même la
+//! mémoire et les descripteurs du processus (le `exit_mm` et le
+//! `exit_files` de Linux, au dernier qui les tient) ; il reste un ZOMBIE :
+//! son numéro et son code de sortie, jusqu'à ce qu'init le recueille
+//! (programmes.rs) et le retire de la table. La table est réservée au
+//! démarrage pour autant de processus que de tâches : elle ne grandit
+//! jamais pendant un programme.
 //!
 //! Règle : jamais de copie depuis ou vers la mémoire du programme sous le
 //! verrou d'un processus (une copie peut fauter, et plus tard attendre le
@@ -19,9 +22,11 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::descripteurs::{Descripteurs, LIMITE_DESCRIPTEURS};
+use crate::fil::Fil;
+use crate::tache::Tache;
 use crate::memoire::Memoire;
 use crate::signaux::Signaux;
 use crate::verrou::Verrou;
@@ -30,7 +35,7 @@ use fichiers::Identite;
 use fichiers::montages::Objet;
 
 pub struct Processus {
-    /// Son numéro (pid), qui est aussi celui de son seul fil et de son
+    /// Son numéro (pid), qui est aussi celui de son fil principal et de son
     /// groupe de processus (voir `numero_neuf`).
     pub pid: u32,
     /// Sa mémoire (la mm_struct de Linux, voir memoire.rs).
@@ -51,15 +56,21 @@ pub struct Processus {
     /// Ses limites de ressources (getrlimit, prlimit64), sauf celle des
     /// descripteurs, que garde leur table (`Descripteurs::limite`).
     pub limites: [(u64, u64); LIMITES],
-    /// Ses signaux : actions, masque, signaux en attente, pile de secours
-    /// (signaux.rs).
+    /// Ses signaux : les actions, et ceux envoyés au processus (signaux.rs).
     pub signaux: Signaux,
+    /// Ses fils vivants, le principal d'abord (fil.rs).
+    pub fils: Vec<Fil>,
+    /// La fin du groupe, si elle a commencé (exit_group, un signal mortel) :
+    /// son code, que prendra le processus (le SIGNAL_GROUP_EXIT et le
+    /// `group_exit_code` de Linux). La première l'emporte.
+    pub fin_de_groupe: Option<i32>,
 }
 
 /// Le numéro du prochain programme lancé.
 static PROCHAIN: AtomicU32 = AtomicU32::new(2);
 
-/// Un numéro de processus neuf : 2, puis 3, 4... Le 1 est celui de l'init,
+/// Un numéro neuf, de processus ou de fil (le même compteur, comme les pid
+/// et les tid de Linux) : 2, puis 3, 4... Le 1 est celui de l'init,
 /// dont le noyau tient le rôle tant qu'il n'y a pas de `/init` (6k) : il
 /// lance chaque ligne de /etc/demarrage, comme un init lance ses
 /// services, et `getppid` rend 1. Option écartée : donner le 1 à chaque
@@ -109,6 +120,17 @@ pub const LIMITES_PAR_DEFAUT: [(u64, u64); LIMITES] = {
 };
 
 impl Processus {
+    /// Le fil `tid` du processus, s'il y est encore.
+    pub fn fil(&mut self, tid: u32) -> Option<&mut Fil> {
+        self.fils.iter_mut().find(|f| f.tid == tid)
+    }
+
+    /// La fin du groupe commence (exit_group, un signal mortel), avec ce
+    /// code, si elle n'a pas déjà commencé.
+    pub fn finir_le_groupe(&mut self, code: i32) {
+        self.fin_de_groupe.get_or_insert(code);
+    }
+
     /// La limite `ressource` (sous LIMITES).
     pub fn limite(&self, ressource: usize) -> (u64, u64) {
         if ressource == RLIMIT_NOFILE { self.descripteurs.limite } else { self.limites[ressource] }
@@ -144,11 +166,37 @@ impl Drop for Processus {
 }
 
 /// Un processus de la table : son numéro, ce qu'il a tant qu'il vit
-/// (None une fois sa tâche morte : un zombie), et son code de sortie.
+/// (None une fois son dernier fil mort), son code de sortie, et ce qui doit
+/// se lire sans son verrou.
 pub struct Entree {
     pid: u32,
     processus: Verrou<Option<Processus>>,
     code: AtomicI32,
+    /// Son temps de calcul, en nanosecondes : celui de tous ses fils,
+    /// vivants et morts, compté avec celui de chaque fil (tache.rs), sans
+    /// verrou (le gestionnaire d'horloge le compte). Pour
+    /// CLOCK_PROCESS_CPUTIME_ID et RLIMIT_CPU. Le `thread_group_cputimer`
+    /// de Linux ; option écartée, sa façon ordinaire : additionner les fils
+    /// vivants à chaque lecture, plus le temps des morts (le
+    /// `sum_sched_runtime`), un parcours de plus à chaque tic qui vérifie une
+    /// attente de temps de calcul.
+    calcul: AtomicU64,
+    /// Ses fils pas encore tout à fait finis : ceux de la liste, et ceux
+    /// qui l'ont quittée mais dont la pile n'est pas encore rendue (la fin
+    /// de bascule qui suit leur mort, tache.rs). Le processus n'est un
+    /// zombie qu'à zéro : un fil préempté entre sa sortie de la liste et sa
+    /// dernière bascule (pendant que le dernier fil, lui, rend tout) garde
+    /// sinon sa pile et sa tâche quand init le recueille, et « memoire
+    /// rendue » compte trop tôt (vu : -6 pages, rendues au programme
+    /// suivant).
+    vivants: AtomicU32,
+    /// Plus aucun fil, et tout est rendu : un zombie. Posé à la fin de
+    /// bascule qui rend la pile du dernier fil : celui qui le recueille voit
+    /// toute la mémoire rendue.
+    zombie: AtomicBool,
+    /// Qui attend sa fin (init, le lanceur : programmes.rs), réveillé quand
+    /// il devient un zombie (le `do_notify_parent` de Linux).
+    parent: Verrou<Option<Arc<Tache>>>,
 }
 
 impl Entree {
@@ -156,17 +204,69 @@ impl Entree {
         self.pid
     }
 
-    /// La fin de sa tâche : son code, puis sa mémoire et ses descripteurs
-    /// rendus (dans la tâche qui meurt, interruptions actives : rendre des
-    /// centaines de Mio prend du temps). Il reste le zombie.
-    pub fn terminer(&self, code: i32) {
-        self.code.store(code, Ordering::Relaxed);
-        let fini = self.processus.verrouiller().take();
+    /// La fin du fil `tid` (sa tâche meurt, en lui laissant `code`) : il
+    /// quitte le processus. Le dernier fil emporte le processus : son code de
+    /// sortie (celui de la fin du groupe s'il y en a une, sinon le sien,
+    /// mesuré sous Linux), puis sa mémoire et ses descripteurs rendus (dans
+    /// la tâche qui meurt, interruptions actives : rendre des centaines de
+    /// Mio prend du temps). Le processus devient un zombie plus tard, quand
+    /// la pile de son dernier fil est rendue (`fil_disparu`).
+    pub fn fil_termine(&self, tid: u32, code: i32) {
+        let fini = {
+            let mut garde = self.processus.verrouiller();
+            let Some(p) = garde.as_mut() else { return };
+            p.fils.retain(|f| f.tid != tid);
+            if !p.fils.is_empty() {
+                return;
+            }
+            self.code.store(p.fin_de_groupe.unwrap_or(code), Ordering::Relaxed);
+            garde.take()
+        };
         drop(fini);
+    }
+
+    /// Un fil du processus a tout à fait fini : sa pile vient d'être rendue
+    /// (la fin de bascule qui suit sa mort, interruptions coupées). Au
+    /// dernier, le processus est un zombie, et son parent, qui attend
+    /// peut-être, est réveillé.
+    pub fn fil_disparu(&self) {
+        if self.vivants.fetch_sub(1, Ordering::Relaxed) == 1 {
+            self.zombie.store(true, Ordering::Relaxed);
+            if let Some(parent) = self.parent.verrouiller().take() {
+                crate::tache::reveiller(parent, crate::tache::Reveil::Reveillee);
+            }
+        }
+    }
+
+    /// Est-il un zombie (tous ses fils morts, tout rendu) ?
+    pub fn est_zombie(&self) -> bool {
+        self.zombie.load(Ordering::Relaxed)
     }
 
     pub fn code(&self) -> i32 {
         self.code.load(Ordering::Relaxed)
+    }
+
+    /// Le fil de la tâche `t` rejoint le processus (son fil principal, ou
+    /// un fil créé par clone) : ENOMEM si la liste ne peut pas grandir, ou
+    /// si le processus n'est plus (EINTR pour clone, viendra avec lui).
+    pub fn attacher(&self, t: &Arc<Tache>) -> Result<(), ()> {
+        let mut garde = self.processus.verrouiller();
+        let p = garde.as_mut().ok_or(())?;
+        p.fils.try_reserve(1).map_err(|_| ())?;
+        p.fils.push(Fil::de(t));
+        self.vivants.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Ajoute `ns` nanosecondes au temps de calcul du processus.
+    pub fn compter_calcul(&self, ns: u64) {
+        self.calcul.fetch_add(ns, Ordering::Relaxed);
+    }
+
+    /// Son temps de calcul, en nanosecondes (tous ses fils).
+    pub fn temps_de_calcul(&self) -> u64 {
+        self.calcul.load(Ordering::Relaxed)
     }
 }
 
@@ -177,14 +277,24 @@ pub fn initialiser(max: usize) {
     TABLE.verrouiller().try_reserve_exact(max).expect("plus de memoire pour la table des processus");
 }
 
-/// Range un processus neuf dans la table ; None si elle est pleine (pas
-/// plus de processus que de tâches).
+/// Range un processus neuf dans la table, sans fil encore (son fil
+/// principal le rejoint à sa création, tache::lancer_programme), avec la
+/// tâche courante pour parent ; None si elle est pleine (pas plus de
+/// processus que de tâches).
 pub fn ajouter(processus: Processus) -> Option<Arc<Entree>> {
     let mut table = TABLE.verrouiller();
     if table.len() == table.capacity() {
         return None;
     }
-    let e = Arc::new(Entree { pid: processus.pid, processus: Verrou::new(Some(processus)), code: AtomicI32::new(0) });
+    let e = Arc::new(Entree {
+        pid: processus.pid,
+        processus: Verrou::new(Some(processus)),
+        code: AtomicI32::new(0),
+        calcul: AtomicU64::new(0),
+        vivants: AtomicU32::new(0),
+        zombie: AtomicBool::new(false),
+        parent: Verrou::new(Some(crate::tache::courante_arc())),
+    });
     table.push(e.clone());
     Some(e)
 }

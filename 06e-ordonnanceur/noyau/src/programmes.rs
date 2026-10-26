@@ -217,9 +217,10 @@ enum Action {
 
 /// Un programme lancé, que le lanceur recueillera.
 enum Tache {
-    /// Un programme Linux : sa tâche, son processus, son nom, son fichier
-    /// (tenu, et protégé contre l'écriture tant qu'il s'exécute).
-    Linux { tache: Arc<tache::Tache>, pid: u32, nom: NomCourt, fichier: Numero },
+    /// Un programme Linux : son processus (fini quand son dernier fil l'est,
+    /// pas forcément le principal), son nom, son fichier (tenu, et protégé
+    /// contre l'écriture tant qu'il s'exécute).
+    Linux { processus: Arc<processus::Entree>, nom: NomCourt, fichier: Numero },
     /// Un programme WebAssembly : sa tâche du noyau (elle dit elle-même
     /// comment il s'est terminé).
     Wasm(Arc<tache::Tache>),
@@ -265,17 +266,17 @@ impl Lanceur {
     fn attendre(&mut self, t: Tache) {
         loop {
             self.recueillir_les_morts();
-            if t.tache().est_morte() {
+            if t.fini() {
                 return self.recueillir(t);
             }
             let fond = &self.fond;
-            tache::dormir_tant_que(|| !t.tache().est_morte() && !fond.iter().any(|f| f.tache().est_morte()));
+            tache::dormir_tant_que(|| !t.fini() && !fond.iter().any(Tache::fini));
         }
     }
 
     /// Recueille les programmes lancés par `&` qui se sont terminés.
     fn recueillir_les_morts(&mut self) {
-        while let Some(i) = self.fond.iter().position(|f| f.tache().est_morte()) {
+        while let Some(i) = self.fond.iter().position(Tache::fini) {
             let t = self.fond.remove(i);
             self.recueillir(t);
         }
@@ -285,9 +286,10 @@ impl Lanceur {
     /// dit.
     fn recueillir(&mut self, t: Tache) {
         let fin = match t {
-            Tache::Linux { tache, pid, nom, fichier } => {
-                tache::attendre(&tache);
-                drop(tache);
+            Tache::Linux { processus: p, nom, fichier } => {
+                tache::dormir_tant_que(|| !p.est_zombie());
+                let pid = p.pid();
+                drop(p);
                 let code = processus::recueillir(pid).unwrap_or(-1);
                 procfs::retirer_processus(pid);
                 vfs::avec(|fs, cadres| {
@@ -321,15 +323,18 @@ impl Lanceur {
         while !self.fond.is_empty() {
             self.recueillir_les_morts();
             let fond = &self.fond;
-            tache::dormir_tant_que(|| !fond.is_empty() && !fond.iter().any(|f| f.tache().est_morte()));
+            tache::dormir_tant_que(|| !fond.is_empty() && !fond.iter().any(Tache::fini));
         }
     }
 }
 
 impl Tache {
-    fn tache(&self) -> &Arc<tache::Tache> {
+    /// Le programme est-il fini (le processus, zombie ; la tâche du
+    /// programme WebAssembly, morte) ?
+    fn fini(&self) -> bool {
         match self {
-            Tache::Linux { tache, .. } | Tache::Wasm(tache) => tache,
+            Tache::Linux { processus, .. } => processus.est_zombie(),
+            Tache::Wasm(t) => t.est_morte(),
         }
     }
 }
@@ -702,13 +707,15 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         identite,
         limites: processus::LIMITES_PAR_DEFAUT,
         signaux: crate::signaux::Signaux::new(),
+        fils: Vec::new(),
+        fin_de_groupe: None,
     });
-    let tache = entree.and_then(|e| tache::lancer_programme(nom, e, pml4, depart, rsp));
-    match tache {
-        Some(tache) => {
+    let lance = entree.and_then(|e| tache::lancer_programme(nom, e.clone(), pml4, depart, rsp).map(|_| e));
+    match lance {
+        Some(processus) => {
             l.commencer();
             vfs::avec(|fs, _| fs.prendre(n));
-            Some(Tache::Linux { tache, pid, nom, fichier: n })
+            Some(Tache::Linux { processus, nom, fichier: n })
         }
         None => {
             afficherln!("[noyau] {} : plus de place pour sa tache ou son processus", nom);

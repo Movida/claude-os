@@ -166,10 +166,14 @@ const RSEQ: u64 = 334;
 const PAGE: u64 = 4096;
 
 
-/// Le numéro du processus en cours, qui est aussi celui de son seul fil
-/// (processus::numero_neuf).
+/// Le numéro du processus en cours (processus::numero_neuf).
 fn pid() -> i64 {
     processus::avec(|p| p.pid) as i64
+}
+
+/// Le numéro du fil en cours : celui du processus pour son fil principal.
+fn tid() -> i64 {
+    tache::courante().tid() as i64
 }
 
 /// Exécute l'appel système `numero` : un résultat, ou -errno.
@@ -212,7 +216,7 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         ARCH_PRCTL => arch_prctl(a[0], a[1]),
         // L'adresse où effacer le numéro du fil quand il se termine (pour
         // pthread_join) : sans fils, rien à faire ; on rend le numéro du fil.
-        SET_TID_ADDRESS => pid(),
+        SET_TID_ADDRESS => tid(),
         // La liste des verrous « robustes » du fil (relâchés s'il meurt en
         // les tenant) : sans fils, rien à faire. La taille de la tête de
         // liste est fixée par l'ABI (24 octets) ; Linux refuse les autres.
@@ -277,10 +281,11 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         UTIMENSAT => f::utimensat(a[0], a[1], a[2], a[3]),
         GETRANDOM => getrandom(a[0], a[1], a[2]),
         SYSINFO => sysinfo(a[0]),
-        // Qui est le programme : son numéro, celui de son seul fil ; son
-        // parent, le noyau qui tient le rôle d'init (1) ; l'utilisateur et
-        // le groupe 1000.
-        GETPID | GETTID => pid(),
+        // Qui est le programme : son numéro, et celui du fil ; son parent, le
+        // noyau qui tient le rôle d'init (1) ; l'utilisateur et le groupe
+        // 1000.
+        GETPID => pid(),
+        GETTID => tid(),
         GETPPID => 1,
         GETUID | GETEUID => processus::avec(|p| p.identite.uid) as i64,
         GETGID | GETEGID => processus::avec(|p| p.identite.gid) as i64,
@@ -293,10 +298,17 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         // Le code de sortie tient sur 8 bits : Linux ne garde que l'octet
         // bas (exit(256) rend 0, exit(-1) rend 255), ce que verra le futur
         // wait ; les codes 128 + N restent ceux des signaux.
-        // La fin elle-même vient au retour vers l'anneau 3 (tache.rs).
-        EXIT | EXIT_GROUP => {
+        // La fin elle-même vient au retour vers l'anneau 3 (tache.rs) : celle
+        // du fil (exit), ou de tout le groupe (exit_group, ce qu'appelle
+        // l'exit de la glibc).
+        EXIT => {
             tracer(numero, a, None);
             tache::prevoir_sortie((a[0] & 0xff) as i32);
+            return 0;
+        }
+        EXIT_GROUP => {
+            tracer(numero, a, None);
+            tache::prevoir_sortie_du_groupe((a[0] & 0xff) as i32);
             return 0;
         }
         _ => {
@@ -1145,10 +1157,11 @@ fn clock_nanosleep(horloge: u64, drapeaux: u64, duree: u64, reste: u64) -> i64 {
     let absolue = drapeaux & TIMER_ABSTIME != 0;
     let interruptions = cpu::couper_interruptions();
     let (reveil, fin_restante) = if horloge == CLOCK_PROCESS_CPUTIME_ID {
-        let maintenant = tache::temps_de_calcul();
+        let maintenant = tache::temps_du_processus();
         let cible = if absolue { demande } else { maintenant.saturating_add(demande) };
-        let r = crate::attente::dormir_calcul(tache::courante_arc(), cible);
-        (r, cible.saturating_sub(tache::temps_de_calcul()))
+        let compte = tache::courante().processus().cloned().expect("appel systeme sans processus");
+        let r = crate::attente::dormir_calcul(compte, cible);
+        (r, cible.saturating_sub(tache::temps_du_processus()))
     } else {
         // L'échéance en temps monotone : les horloges de dates (REALTIME,
         // TAI) ne diffèrent du temps monotone que d'un écart fixe (la date

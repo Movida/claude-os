@@ -38,6 +38,7 @@
 
 use crate::cpu;
 use crate::ordonnanceur;
+use crate::processus::Entree;
 use crate::tache::{self, Reveil, Tache};
 use crate::verrou::Verrou;
 use alloc::sync::Arc;
@@ -253,9 +254,9 @@ pub fn dormir(echeance: Option<u64>, sommeil: Sommeil) -> Reveil {
 /// Les échéances des tâches qui dorment, triées.
 static MINUTERIES: Verrou<Vec<(u64, Arc<Tache>)>> = Verrou::new(Vec::new());
 /// Les attentes du temps de calcul (clock_nanosleep sur
-/// CLOCK_PROCESS_CPUTIME_ID) : le temps de calcul à atteindre, la tâche
-/// dont le temps compte, celle qui dort.
-static ATTENTES_CALCUL: Verrou<Vec<(u64, Arc<Tache>, Arc<Tache>)>> = Verrou::new(Vec::new());
+/// CLOCK_PROCESS_CPUTIME_ID) : le temps de calcul à atteindre, le processus
+/// dont le temps compte (tous ses fils), la tâche qui dort.
+static ATTENTES_CALCUL: Verrou<Vec<(u64, Arc<Entree>, Arc<Tache>)>> = Verrou::new(Vec::new());
 
 /// Réserve les minuteries pour `max` tâches : elles ne grandissent jamais
 /// pendant un programme. Au démarrage.
@@ -280,9 +281,10 @@ fn annuler(t: &Tache) {
     }
 }
 
-/// La tâche courante dort jusqu'à ce que le temps de calcul de `compte`
-/// atteigne `cible`, ou un signal. Interruptions coupées.
-pub fn dormir_calcul(compte: Arc<Tache>, cible: u64) -> Reveil {
+/// La tâche courante dort jusqu'à ce que le temps de calcul du processus
+/// `compte` atteigne `cible` (le calcul de ses autres fils), ou un signal.
+/// Interruptions coupées.
+pub fn dormir_calcul(compte: Arc<Entree>, cible: u64) -> Reveil {
     let t = tache::courante();
     t.preparer_sommeil();
     if tache::signal_en_attente() {

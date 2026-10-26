@@ -51,10 +51,10 @@
 //!     l'heure du dernier tic (ici, la fine arrondie au tic : jamais en
 //!     avance sur elle), de la finesse d'un tic ;
 //!   - CLOCK_PROCESS_CPUTIME_ID et CLOCK_THREAD_CPUTIME_ID : le temps de
-//!     calcul du programme, compté tic par tic quand il s'exécute (en
-//!     anneau 3 ou dans le noyau pour lui : utime + stime, comme Linux),
-//!     celui de sa limite RLIMIT_CPU (tache.rs). Avec un seul fil, les deux
-//!     sont égaux.
+//!     calcul du processus (tous ses fils : celui de sa limite RLIMIT_CPU,
+//!     tache.rs) et celui du fil, comptés quand il s'exécute (en anneau 3
+//!     ou dans le noyau pour lui : utime + stime, comme Linux). Pour un
+//!     programme d'un seul fil, les deux sont égaux.
 //! Le temps vient du TSC, étalonné (tsc.rs), à la nanoseconde, quand il
 //! est fiable : clock_getres rend alors 1 ns pour les horloges fines,
 //! comme Linux. Sinon, il est compté en tics, avec la durée exacte d'un
@@ -225,8 +225,14 @@ fn grossier(ns: u64) -> u64 {
     ns - ns % duree_tic()
 }
 
-/// Le temps de calcul de la tâche en cours.
+/// Le temps de calcul du processus en cours, tous ses fils (pour un
+/// programme WebAssembly, celui de sa tâche).
 pub fn temps_du_programme() -> Temps {
+    depuis_nanosecondes(tache::temps_du_processus())
+}
+
+/// Celui du fil en cours.
+pub fn temps_du_fil() -> Temps {
     depuis_nanosecondes(tache::temps_de_calcul())
 }
 
@@ -250,7 +256,8 @@ pub fn horloge(horloge: u64) -> Option<Temps> {
         CLOCK_REALTIME_COARSE => Some(date(grossier(ns_monotone()))),
         CLOCK_MONOTONIC | CLOCK_MONOTONIC_RAW | CLOCK_BOOTTIME => Some(monotone()),
         CLOCK_MONOTONIC_COARSE => Some(depuis_nanosecondes(grossier(ns_monotone()))),
-        CLOCK_PROCESS_CPUTIME_ID | CLOCK_THREAD_CPUTIME_ID => Some(temps_du_programme()),
+        CLOCK_PROCESS_CPUTIME_ID => Some(temps_du_programme()),
+        CLOCK_THREAD_CPUTIME_ID => Some(temps_du_fil()),
         _ => None,
     }
 }
