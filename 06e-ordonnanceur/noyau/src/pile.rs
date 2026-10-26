@@ -1,0 +1,249 @@
+//! La pile initiale d'un programme Linux : ce qu'il trouve au sommet de sa
+//! pile en démarrant (create_elf_tables, dans fs/binfmt_elf.c de Linux).
+//!
+//! Un programme ne reçoit aucun paramètre dans ses registres (ils sont
+//! tous à zéro, voir tache.rs) : tout est sur la pile, selon l'ABI System V
+//! pour x86_64 (§3.4.1). De RSP vers le haut :
+//!
+//!     RSP ->  argc                       le nombre d'arguments
+//!             argv[0] ... argv[argc-1]   des pointeurs vers les chaînes
+//!             0
+//!             envp[0] ... envp[n-1]      l'environnement (« NOM=valeur »)
+//!             0
+//!             auxv : paires (type, valeur), terminées par (AT_NULL, 0)
+//!             (remplissage)
+//!             16 octets aléatoires       (AT_RANDOM)
+//!             "x86_64"                   (AT_PLATFORM)
+//!             les chaînes d'argv, puis celles d'envp
+//!             le nom du programme        (AT_EXECFN)
+//!             8 octets nuls
+//!     sommet de la pile
+//!
+//! RSP est aligné sur 16 octets : l'ABI le garantit au point d'entrée, et
+//! le code compilé s'en sert (les instructions SSE `movaps` sur la pile).
+//!
+//! Le VECTEUR AUXILIAIRE (auxv) est ce que le noyau dit au programme sur
+//! lui-même et sur la machine, sans appel système : où sont ses en-têtes
+//! de programme (la glibc statique y trouve son PT_TLS), la taille des
+//! pages, son point d'entrée, ses identités, les fonctions du processeur...
+//! La glibc le lit avant même main (_dl_aux_init), et getauxval() le rend.
+
+use alloc::vec::Vec;
+
+use crate::chargeur_elf::{self, Programme};
+use crate::{aleatoire, espace_utilisateur, memoire};
+
+const PAGE: u64 = 4096;
+
+// Les types de l'auxv (include/uapi/linux/auxvec.h).
+const AT_NULL: u64 = 0;
+const AT_PHDR: u64 = 3;
+const AT_PHENT: u64 = 4;
+const AT_PHNUM: u64 = 5;
+const AT_PAGESZ: u64 = 6;
+const AT_BASE: u64 = 7;
+const AT_FLAGS: u64 = 8;
+const AT_ENTRY: u64 = 9;
+const AT_UID: u64 = 11;
+const AT_EUID: u64 = 12;
+const AT_GID: u64 = 13;
+const AT_EGID: u64 = 14;
+const AT_PLATFORM: u64 = 15;
+const AT_HWCAP: u64 = 16;
+const AT_CLKTCK: u64 = 17;
+const AT_SECURE: u64 = 23;
+const AT_RANDOM: u64 = 25;
+const AT_HWCAP2: u64 = 26;
+const AT_EXECFN: u64 = 31;
+
+/// L'identité du programme : l'utilisateur 1000, le premier utilisateur
+/// ordinaire des distributions Linux, plutôt que root (0). Il n'y a qu'un
+/// utilisateur sur cette machine, mais un programme n'a aucune raison de
+/// se croire tout-puissant ; et certains refusent de tourner en root, ou
+/// changent de comportement (Claude Code refuse
+/// --dangerously-skip-permissions en root).
+pub const UTILISATEUR: u64 = 1000;
+pub const GROUPE: u64 = 1000;
+
+/// La fréquence des « tics » que voient les programmes (times(), le
+/// USER_HZ de Linux) : 100, quelle que soit la fréquence de l'horloge du
+/// noyau, pour que l'ABI ne change pas.
+pub const USER_HZ: u64 = 100;
+
+/// Au plus un quart de la pile pour les chaînes et les tables, comme
+/// Linux (un quart de RLIMIT_STACK) : le programme doit garder de la
+/// place pour lui. Les tables de pointeurs comptent aussi (Linux les
+/// compte d'avance, dans bprm_stack_limits ; ici, elles sont écrites dans
+/// la même place, et la même vérification les couvre).
+const PLACE_MAX: u64 = chargeur_elf::PLACE_ARGUMENTS;
+
+/// La longueur maximale d'une chaîne d'argv ou d'envp, zéro final compris :
+/// 32 pages, le MAX_ARG_STRLEN de Linux (E2BIG au-delà). Il n'y a pas de
+/// limite sur leur NOMBRE : seulement la place qu'elles prennent.
+const CHAINE_MAX: usize = 32 * PAGE as usize;
+
+/// Pourquoi la pile n'a pas pu être construite.
+#[derive(Debug)]
+pub enum Erreur {
+    /// Arguments et environnement trop longs (E2BIG).
+    TropLong,
+    /// Plus de mémoire pour les tables du noyau.
+    PlusDeMemoire,
+    Espace(espace_utilisateur::Erreur),
+}
+
+impl core::fmt::Display for Erreur {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        match self {
+            Erreur::TropLong => f.write_str("arguments et environnement trop longs (E2BIG)"),
+            Erreur::PlusDeMemoire => f.write_str("plus de memoire pour la pile initiale"),
+            Erreur::Espace(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl From<espace_utilisateur::Erreur> for Erreur {
+    fn from(e: espace_utilisateur::Erreur) -> Self {
+        Erreur::Espace(e)
+    }
+}
+
+/// Une écriture de haut en bas dans la pile du programme.
+struct Curseur<'a> {
+    programme: &'a mut Programme,
+    sp: u64,
+}
+
+impl Curseur<'_> {
+    /// Range `octets` juste sous le curseur, et rend leur adresse.
+    fn empiler(&mut self, octets: &[u8]) -> Result<u64, Erreur> {
+        let n = octets.len() as u64;
+        if self.programme.sommet_pile - self.sp + n > PLACE_MAX {
+            return Err(Erreur::TropLong);
+        }
+        self.sp -= n;
+        self.programme.memoire.ecrire(self.sp, octets)?;
+        Ok(self.sp)
+    }
+
+    /// Une chaîne et son zéro final.
+    fn chaine(&mut self, texte: &[u8]) -> Result<u64, Erreur> {
+        if texte.len() >= CHAINE_MAX {
+            return Err(Erreur::TropLong);
+        }
+        self.empiler(&[0])?;
+        self.empiler(texte)
+    }
+}
+
+/// Construit la pile initiale du programme `programme` : `argv` (argv[0]
+/// est d'habitude son nom), `envp` (des chaînes « NOM=valeur »), `nom` (le
+/// chemin du fichier exécuté, pour AT_EXECFN). Aucune chaîne ne doit
+/// contenir d'octet nul. Rend la valeur de RSP au départ.
+///
+/// Le noyau écrit par la projection directe des cadres (Memoire::ecrire),
+/// en faisant venir chaque page qu'il touche : l'espace du programme n'a
+/// pas besoin d'être actif. Puis la zone de pile est ramenée à ce qui est
+/// occupé, plus PILE_INITIALE (le setup_arg_pages de Linux) ; elle
+/// grandira à la faute.
+pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom: &[u8]) -> Result<u64, Erreur> {
+    let sommet = programme.sommet_pile;
+    let mut c = Curseur { programme, sp: sommet };
+
+    // Du haut vers le bas : le marqueur de fin, les chaînes, l'aléa.
+    c.empiler(&[0; 8])?;
+    let execfn = c.chaine(nom)?;
+    // Les adresses des chaînes, puis les tables : dans des blocs du tas,
+    // pas sur la pile du noyau (16 Kio), et sans limite sur le nombre
+    // d'arguments autre que la place (comme Linux). Un nombre absurde est
+    // refusé avant d'allouer quoi que ce soit : chaque chaîne prend au
+    // moins un octet, et la place est bornée.
+    if (argv.len() + envp.len()) as u64 > PLACE_MAX {
+        return Err(Erreur::TropLong);
+    }
+    let mut adresses_envp = Vec::new();
+    let mut adresses_argv = Vec::new();
+    adresses_envp.try_reserve_exact(envp.len()).map_err(|_| Erreur::PlusDeMemoire)?;
+    adresses_argv.try_reserve_exact(argv.len()).map_err(|_| Erreur::PlusDeMemoire)?;
+    adresses_envp.resize(envp.len(), 0);
+    adresses_argv.resize(argv.len(), 0);
+    for (i, e) in envp.iter().enumerate().rev() {
+        adresses_envp[i] = c.chaine(e)?;
+    }
+    for (i, a) in argv.iter().enumerate().rev() {
+        adresses_argv[i] = c.chaine(a)?;
+    }
+    let plateforme = c.chaine(b"x86_64")?;
+    c.sp &= !15;
+    let mut alea = [0u8; 16];
+    aleatoire::remplir(&mut alea);
+    let random = c.empiler(&alea)?;
+
+    // Les tables : argc, argv, envp, auxv, toutes en mots de 8 octets,
+    // préparées dans un tableau du noyau puis écrites d'un bloc.
+    let p = &*c.programme;
+    let auxv: [(u64, u64); 19] = [
+        (AT_PHDR, p.adresse_entetes.unwrap_or(0)),
+        (AT_PHENT, p.taille_entete as u64),
+        (AT_PHNUM, p.nombre_entetes as u64),
+        (AT_PAGESZ, 4096),
+        // Où est l'interpréteur (ld-linux), 0 sans lui.
+        (AT_BASE, p.base_interpreteur),
+        (AT_FLAGS, 0),
+        // Le point d'entrée du programme, même quand il commence par son
+        // interpréteur.
+        (AT_ENTRY, p.entree),
+        (AT_UID, UTILISATEUR),
+        (AT_EUID, UTILISATEUR),
+        (AT_GID, GROUPE),
+        (AT_EGID, GROUPE),
+        // Pas un programme « setuid » : la glibc peut écouter
+        // l'environnement (LD_..., MALLOC_...).
+        (AT_SECURE, 0),
+        (AT_RANDOM, random),
+        // Les fonctions du processeur, comme Linux : EDX de CPUID feuille
+        // 1 (FPU, TSC, SSE, SSE2...). AT_HWCAP2 : rien (ring3mwait, fsgsbase).
+        (AT_HWCAP, core::arch::x86_64::__cpuid(1).edx as u64),
+        (AT_HWCAP2, 0),
+        (AT_CLKTCK, USER_HZ),
+        (AT_PLATFORM, plateforme),
+        (AT_EXECFN, execfn),
+        // Linux 6.18 donne en plus AT_SYSINFO_EHDR (l'adresse du vDSO, 6m),
+        // AT_MINSIGSTKSZ (la taille minimale d'une pile de signal, 6f) et
+        // AT_RSEQ_FEATURE_SIZE, AT_RSEQ_ALIGN (rseq, que nous n'avons pas) :
+        // la glibc a un repli pour chacune (vrais appels de clock_gettime,
+        // une taille par défaut, rseq désactivé).
+        (AT_NULL, 0),
+    ];
+    // Ses octets, dans l'ordre du processeur (petit-boutiste).
+    let mots = 1 + argv.len() + 1 + envp.len() + 1 + 2 * auxv.len();
+    let mut octets = Vec::new();
+    octets.try_reserve_exact(8 * mots).map_err(|_| Erreur::PlusDeMemoire)?;
+    let mut mettre = |valeur: u64| octets.extend_from_slice(&valeur.to_le_bytes());
+    mettre(argv.len() as u64);
+    adresses_argv.iter().for_each(|&a| mettre(a));
+    mettre(0);
+    adresses_envp.iter().for_each(|&a| mettre(a));
+    mettre(0);
+    for (genre, valeur) in auxv {
+        mettre(genre);
+        mettre(valeur);
+    }
+    let octets = &octets[..];
+    // RSP aligné sur 16 : on place la table pour que son début (argc) le
+    // soit.
+    let rsp = (c.sp - octets.len() as u64) & !15;
+    c.empiler(&[0; 16][..(c.sp - octets.len() as u64 - rsp) as usize])?;
+    let debut = c.empiler(octets)?;
+    debug_assert_eq!(debut, rsp);
+    // La zone de pile ne garde que ce qui est occupé, plus PILE_INITIALE.
+    // Ce qu'on retire est sous tout ce qui a été écrit : aucune page à
+    // rendre, et la zone n'est pas coupée en deux (le retrait ne peut pas
+    // échouer). Des arguments qui occupent presque toute leur place (plus
+    // de 1,875 Mio) : la zone garde ses 2 Mio, et grandira à la faute.
+    let bas = (rsp & !(PAGE - 1)) - memoire::PILE_INITIALE;
+    if bas > sommet - PLACE_MAX {
+        c.programme.memoire.retirer(sommet - PLACE_MAX, bas)?;
+    }
+    Ok(rsp)
+}

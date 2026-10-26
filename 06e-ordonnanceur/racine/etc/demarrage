@@ -1,0 +1,43 @@
+# Ce que le noyau lance au démarrage, une commande par ligne, dans l'ordre
+# (voir formats/src/commande.rs : un sous-ensemble strict de la syntaxe de
+# sh, plus --dir= pour les dossiers pré-ouverts d'un programme
+# WebAssembly). Chaque programme par son chemin absolu.
+
+# Le format natif de l'OS : deux programmes WebAssembly, avec la racine
+# pour dossier pré-ouvert (le second lit et écrit des fichiers, et affiche
+# ses arguments).
+--dir=/ /bin/bonjour.wasm
+--dir=/ /bin/lecteur.wasm un-argument
+
+# Les programmes Linux. pile affiche ses arguments et son environnement :
+# HOME remplacé, LANG ajouté, et un argument entre guillemets.
+/bin/bonjour-asm
+LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
+/bin/sse
+/bin/bonjour-c
+# Le même, en ET_DYN : gcc -static-pie, qui se reloge lui-même.
+/bin/bonjour-c-pie
+# Et en programme dynamique (gcc sans option) : le noyau charge aussi
+# ld-linux, son interpréteur, qui projette la glibc partagée. Puis ld-linux
+# lancé à la main, qui charge lui-même le programme.
+/bin/bonjour-c-dynamique
+/lib64/ld-linux-x86-64.so.2 /bin/bonjour-c-dynamique
+# Les cinq bibliothèques de claude, et dlopen d'une bibliothèque à nous.
+/bin/dynamique
+/bin/memoire
+/bin/claude-version
+/bin/temps
+/bin/fichiers
+/bin/arbre
+/bin/segments
+# Les signaux (6d) : enregistrés et rendus comme Linux, pas encore livrés.
+/bin/signaux
+# Les petits appels de claude (6d) : uname, sched_getaffinity, futex, prctl.
+/bin/systeme
+# eventfd et epoll (6d) : la boucle d'événements de Bun, créée mais pas encore attendue.
+/bin/evenements
+# /proc et /sys (6d) : ce qu'y lit Bun, maps, statm, exe, /proc/sys/vm, cpu/online.
+/bin/proc
+# Et le jalon de 6d : le vrai Claude Code, en dernier (ce qui précède a déjà
+# dit si le noyau va bien).
+/usr/local/bin/claude --version

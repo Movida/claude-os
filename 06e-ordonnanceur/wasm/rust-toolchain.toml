@@ -1,0 +1,8 @@
+# Même version de Rust que le noyau (03-noyau-rust/noyau) : la bibliothèque
+# sera compilée dans le noyau à la fin de l'étape. On la teste sur la
+# machine hôte (x86_64-unknown-linux-gnu) et on vérifie qu'elle se compile
+# aussi pour la cible du noyau.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+targets = ["x86_64-unknown-none"]

@@ -1,0 +1,6 @@
+# La même version de Rust que le noyau, avec la cible WebAssembly : rustup
+# l'installe à la première commande cargo lancée dans ce dossier.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+targets = ["wasm32-unknown-unknown"]

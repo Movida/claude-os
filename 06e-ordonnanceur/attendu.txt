@@ -1,0 +1,113 @@
+[16 bits] Noyau lu sur le disque, recopie a 1 Mio en mode irreel.
+[64 bits] Mode long actif !
+[noyau] Bonjour depuis le noyau Rust !
+[noyau] Mode long 64 bits, noyau a 0xffffffff80100000 (charge a 0x100000).
+[noyau] GDT, TSS et IDT du noyau en place ; syscall pret.
+[noyau] Exception 3 (point d'arret (int3)) a RIP=
+[noyau] Retour apres int3 : les exceptions sont gerees.
+[noyau] PIC remappe sur les vecteurs 32-47, horloge a 1000 Hz.
+[noyau] 100 ms plus tard : 
+[noyau] Heure (UTC) : 20
+[noyau] Clavier PS/2 pret : tapez du texte.
+[noyau] Carte de la memoire (E820)
+[noyau] Memoire libre : 
+[noyau] Pagination W^X en place
+[noyau] Protections contre les programmes : 
+rendu puis redonne : ok.
+[noyau] Allocateur buddy :
+[noyau] Memoire des programmes : surengagement (OVERCOMMIT_GUESS), reserve du noyau de 
+rendues et recollees : ok.
+[noyau] Adresses du noyau a la demande (vmalloc) : 
+[noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : ok ; garde sans projection : ok ; rendue : ok ; memoire video projetee sans cache : ok ; BIOS projete en lecture seule : ok, memoire vive refusee : ok.
+[noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
+memoire rendue : ok.
+[16 bits] Archive de programmes lue, placee apres le noyau.
+[noyau] Archive de programmes : 
+[noyau] procfs monte sur /proc.
+[noyau] sysfs monte sur /sys.
+[noyau] Archive deballee : dossiers 12, fichiers 32, liens symboliques 5, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 21 commandes.
+[noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
+[wasm] Bonjour depuis WebAssembly !
+[wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
+[noyau] bonjour.wasm : termine, code de sortie 0
+[wasm] lecteur : argc = 2, argv = /bin/lecteur.wasm un-argument
+[wasm] lecteur : dossier pre-ouvert 3 : ok
+[wasm] lecteur : /etc/bonjour.txt : Bonjour depuis un fichier de /etc !
+[wasm] lecteur : /etc/lien-bonjour : Bonjour depuis un fichier de /etc !
+[wasm] lecteur : /etc contient : . .. lien-absolu lien-bonjour salut.txt bonjour.txt
+[wasm] lecteur : ecrire puis relire /tmp/lecteur.txt : ok
+[wasm] lecteur : ../../etc/bonjour.txt refuse (EPERM) : ok
+[wasm] lecteur : etc/lien-absolu refuse (EPERM) : ok
+[wasm] lecteur : le 3 ferme puis repris n'est plus pre-ouvert : ok
+[noyau] lecteur.wasm : termine, code de sortie 0
+[noyau] bonjour-asm : programme Linux (ELF ET_EXEC), 
+        0x00401000-0x00401024 r-x (36 octets du fichier)
+        en-tetes de programme a 0x400040 (3 de 56 octets), tas a partir de 0x403000, code en place : ok.
+[linux] Bonjour depuis l'anneau 3
+[noyau] bonjour-asm : termine, code de sortie 42 ; memoire rendue : ok.
+[linux] argc = 3, argv[0] = /bin/pile
+[linux] argv[1] = un
+[linux] argv[2] = deux mots
+[linux] envp[0] = HOME=/tmp
+[linux] envp[1] = TERM=linux
+[linux] envp[2] = LANG=C.UTF-8
+[linux] Environnement : 3 variables.
+[linux] Pile alignee sur 16, AT_PAGESZ = 4096, AT_ENTRY = _start : ok.
+[noyau] pile : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] SSE pour les programmes : FXSR, sans XSAVE (pas d'AVX).
+[linux] SSE2 : racine de 2 x 1000000 = 1414213, (1,2,3,4) + (10,20,30,40) = (11,22,33,44) : ok.
+[noyau] sse : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c
+[linux] Somme des 10000 premiers carres (malloc) : 333283335000
+[linux] Taille de page (AT_PAGESZ) : 4096
+[linux] /bin/bonjour-c : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
+[noyau] bonjour-c : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] bonjour-c-pie : programme Linux (ELF ET_DYN), 
+tout en haut sous la base des projections : ok.
+tas a partir de 0x555555555000, code en place : ok.
+[linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c-pie
+[linux] /bin/bonjour-c-pie : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
+[noyau] bonjour-c-pie : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] bonjour-c-dynam : programme Linux (ELF ET_DYN), 
+        image a 0x555555554000-
+, tout en haut sous la base des projections : ok, point d'entree 0x
+[linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c-dynamique
+[linux] /bin/bonjour-c-dynamique : AT_BASE non nul (interpreteur charge par le noyau), AT_ENTRY = _start : ok.
+[noyau] bonjour-c-dynam : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] ld-linux-x86-64 : programme Linux (ELF ET_DYN), 
+[linux] /bin/bonjour-c-dynamique : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
+[noyau] ld-linux-x86-64 : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] dynamique : les cinq bibliotheques de claude chargees par ld-linux : ok
+[linux] dynamique : toutes les verifications : ok
+[noyau] dynamique : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] memoire : 8 Gio reserves (MAP_NORESERVE), trois pages ecrites loin l'une de l'autre, rendus : ok
+[linux] memoire : 64 Gio reserves puis rendus d'un seul munmap : ok
+[linux] memoire : toutes les verifications : ok
+[noyau] memoire : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Memoire de claude --version rejouee : ok.
+[noyau] claude-version : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] temps : toutes les verifications : ok
+[noyau] temps : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] fichiers : toutes les verifications : ok
+[noyau] fichiers : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] arbre : - 0644    0    0       36 /etc/bonjour.txt (2 liens)
+[linux] arbre : l 0777    0    0       11 /etc/lien-bonjour -> bonjour.txt
+[linux] arbre : - 0644    0    0       36 /etc/salut.txt (2 liens)
+[linux] arbre : d 0755 1000 1000       40 /home/utilisateur
+[linux] arbre : c 0620 1000 1000   5,   1 /dev/console
+[linux] arbre : c 0666    0    0   1,   3 /dev/null
+[noyau] arbre : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] segments : toutes les verifications : ok
+[noyau] segments : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] signaux : toutes les verifications : ok
+[noyau] signaux : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] systeme : toutes les verifications : ok
+[noyau] systeme : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] evenements : toutes les verifications : ok
+[noyau] evenements : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] proc : toutes les verifications : ok
+[noyau] proc : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] claude : programme Linux (ELF ET_EXEC), 291638640 octets, point d'entree 0x1be7900, segments :
+2.1.310 (Claude Code)
+[noyau] claude : termine, code de sortie 0 ; memoire rendue : ok.
