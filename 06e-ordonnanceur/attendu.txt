@@ -19,6 +19,9 @@ rendu puis redonne : ok.
 rendues et recollees : ok.
 [noyau] Adresses du noyau a la demande (vmalloc) : 
 [noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : ok ; garde sans projection : ok ; rendue : ok ; memoire video projetee sans cache : ok ; BIOS projete en lecture seule : ok, memoire vive refusee : ok.
+[noyau] ACPI : RSDP v0 (BOCHS), RSDT : FACP APIC HPET WAET.
+[noyau] ACPI : 1 processeur, APIC local a 0xfee00000, IO-APIC 0 a 0xfec00000 (GSI a partir de 0), 8259 present.
+[noyau] ACPI : IRQ ISA remplacees : 0 -> GSI 2 ; 5 -> GSI 5 en niveau ; 9 -> GSI 9 en niveau ; 10 -> GSI 10 en niveau ; 11 -> GSI 11 en niveau ; NMI sur LINT1.
 [noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.

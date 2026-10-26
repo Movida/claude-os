@@ -24,8 +24,13 @@
 //!     binaire, et l'heure sur 12 heures (bit 7 : l'après-midi) ou 24,
 //!     selon le registre B ;
 //!   - l'année n'a que deux chiffres. Le siècle est dans un registre que
-//!     désigne la table ACPI FADT (on la lira en 6e) ; sans lui, Linux
-//!     décide qu'une année avant 70 est dans les années 2000 ;
+//!     désigne la table ACPI FADT (acpi.rs), quand elle est de révision 3
+//!     au moins : on le lit avec le reste, et l'année est celle de Linux
+//!     (`mc146818_get_time`) : les deux chiffres, plus (siècle - 19) × 100
+//!     si le siècle dépasse 19, puis, si l'on n'arrive qu'à 69 ou moins
+//!     après 1900, cent ans de plus (une année avant 70 est dans les
+//!     années 2000). La machine `pc` de QEMU n'a qu'une FADT de révision
+//!     1 : la règle seule ;
 //!   - le bit 7 du port 0x70 coupe les interruptions non masquables (NMI)
 //!     : on le laisse à 0 ;
 //!   - le choix d'un registre puis sa lecture forment une paire qu'il ne
@@ -118,16 +123,17 @@ fn lire_registre(r: u8) -> u8 {
 /// 10 ms : pas d'horloge, ou une horloge en panne. (Appelée interruptions
 /// actives, une fois l'horloge du noyau en marche ; un plafond d'essais
 /// arrête aussi la boucle si elle ne comptait pas.)
-fn lire_date() -> Option<([u8; 6], u8)> {
+fn lire_date(siecle: Option<u8>) -> Option<([u8; 6], u8, Option<u8>)> {
     let limite = horloge::tics() + 10 * horloge::HZ as u64 / 1000;
     for _ in 0..1_000_000 {
         {
             let _cmos = CMOS.verrouiller();
             if lire_registre(ETAT_A) & UIP == 0 {
                 let date = [SECONDES, MINUTES, HEURES, JOUR, MOIS, ANNEE].map(lire_registre);
+                let s = siecle.map(lire_registre);
                 let b = lire_registre(ETAT_B);
                 if lire_registre(ETAT_A) & UIP == 0 {
-                    return Some((date, b));
+                    return Some((date, b, s));
                 }
             }
         }
@@ -152,9 +158,11 @@ fn jours_depuis_1970(annee: i64, mois: i64, jour: i64) -> i64 {
 /// heure, minute, seconde) pour l'afficher ; rien si elle ne répond pas,
 /// ou donne une date impossible : la date part alors de 1970 (0).
 pub fn initialiser() -> Option<(i64, i64, i64, i64, i64, i64)> {
-    let lue = lire_date();
+    // Un registre du siècle au-delà des 128 de l'horloge CMOS : une table
+    // fausse, on s'en passe (le bit 7 de l'index coupe les NMI).
+    let lue = lire_date(crate::acpi::registre_du_siecle().filter(|&r| r < 0x80));
     TIC_DE_LECTURE.store(horloge::tics(), Ordering::Relaxed);
-    let (brut, b) = lue?;
+    let (brut, b, siecle) = lue?;
     let valeur = |v: u8| if b & BINAIRE != 0 { v as i64 } else { (v >> 4) as i64 * 10 + (v & 0x0f) as i64 };
     let [s, mi, h, j, mo, a] = brut;
     let heure = if b & H24 != 0 {
@@ -163,7 +171,14 @@ pub fn initialiser() -> Option<(i64, i64, i64, i64, i64, i64)> {
         // Sur 12 heures : 12 h est minuit (AM) ou midi (PM).
         valeur(h & 0x7f) % 12 + if h & 0x80 != 0 { 12 } else { 0 }
     };
-    let annee = valeur(a) + if valeur(a) < 70 { 2000 } else { 1900 };
+    let mut depuis_1900 = valeur(a);
+    if let Some(s) = siecle.map(valeur).filter(|&s| s > 19) {
+        depuis_1900 += (s - 19) * 100;
+    }
+    if depuis_1900 <= 69 {
+        depuis_1900 += 100;
+    }
+    let annee = 1900 + depuis_1900;
     let (mois, jour, minute, seconde) = (valeur(mo), valeur(j), valeur(mi), valeur(s));
     if !(1..=12).contains(&mois) || !(1..=31).contains(&jour) || heure >= 24 || minute >= 60 || seconde >= 60 {
         return None;

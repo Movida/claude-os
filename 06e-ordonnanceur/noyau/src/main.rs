@@ -20,6 +20,7 @@ extern crate alloc;
 
 #[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
 mod console;
+mod acpi;
 mod aleatoire;
 mod appel_systeme;
 mod appels_fichiers;
@@ -237,6 +238,11 @@ extern "C" fn noyau_main(infos: u64) -> ! {
                 bilan.piles, vmalloc::TAILLE_PILE >> 10, bilan.tables >> 10);
     tester_vmalloc();
     tester_espace_utilisateur();
+    match acpi::initialiser() {
+        Ok(()) => acpi::afficher(),
+        Err(acpi::Absence::SansRsdp) => afficherln!("[noyau] Pas de tables ACPI (pas de RSDP dans la memoire du BIOS)."),
+        Err(acpi::Absence::Racine(a, e)) => afficherln!("[noyau] Tables ACPI illisibles : la table racine a {:#x} : {}.", a, e),
+    }
 
     // Le scénario de panne de `make tests-qemu` : déborder exprès de la
     // pile, que la page de garde doit arrêter net.

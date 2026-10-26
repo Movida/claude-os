@@ -1,4 +1,5 @@
-//! Les formats de fichiers que lit le noyau.
+//! Les formats de fichiers que lit le noyau, et les tables que lui laisse
+//! le micrologiciel (ACPI).
 //!
 //! Ces octets viennent de l'extérieur (le disque, un programme) : rien ne
 //! garantit qu'ils sont bien formés. Un fichier tronqué ou piégé ne doit
@@ -20,6 +21,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod acpi;
 pub mod commande;
 pub mod cpio;
 pub mod elf;
