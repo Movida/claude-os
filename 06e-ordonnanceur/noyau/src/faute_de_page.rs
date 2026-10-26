@@ -63,21 +63,20 @@ pub fn gerer(cadre: &mut Cadre) {
     }
 }
 
-/// Une faute du programme : servie, ou le programme est arrêté. Le
-/// résultat est calculé verrou du processus tenu, puis le verrou est rendu
-/// AVANT d'arrêter le programme : `tache::arreter` ne revient pas, et un
-/// verrou emporté dans une tâche abandonnée ne serait jamais rendu.
+/// Une faute du programme : servie, ou le programme sera arrêté au retour
+/// vers l'anneau 3 (tache.rs), qui suit aussitôt : il ne reprend pas
+/// l'instruction fautive.
 fn faute_du_programme(cadre: &Cadre, cr2: u64, acces: Acces) {
     // Une adresse de la moitié haute (le noyau), ou la dernière page de la
     // moitié basse : jamais une zone.
     let resultat = if cr2 < ADRESSE_MAX { processus::avec(|p| p.memoire.servir(cr2, acces)) } else { Err(Echec::SansZone) };
     match resultat {
         Ok(()) => {}
-        Err(Echec::PlusDeMemoire) => tache::arreter_plus_de_memoire(),
+        Err(Echec::PlusDeMemoire) => tache::tuer_au_retour(),
         Err(cause) => {
             let zone = processus::avec(|p| p.memoire.zone_du_code(cadre.rip));
             let (signal, raison) = linux::signal_de_l_exception(14, cadre, cr2, Some(cause), zone);
-            tache::arreter_par_faute(signal, raison)
+            tache::forcer_par_faute(signal, raison)
         }
     }
 }

@@ -187,6 +187,7 @@ pub fn executer(nom: NomCourt, pml4: u64, entree: u64, pile: u64) -> i32 {
     let interruptions = cpu::couper_interruptions();
     CALCUL.store(0, Ordering::Relaxed);
     A_TUER.store(false, Ordering::Relaxed);
+    *FIN.verrouiller() = None;
     EN_COURS.store(true, Ordering::Relaxed);
     // SAFETY : interruptions coupées ; la pile noyau du programme sera
     // prise à sa prochaine entrée dans le noyau ; son espace a la moitié
@@ -226,25 +227,94 @@ pub fn terminer(code: i32) -> ! {
 /// Arrête le programme en cours par le signal `signal` (une exception, sa
 /// limite de temps de calcul, un signal qu'il s'est envoyé), en disant
 /// pourquoi : le message de Linux dans son journal, puis le code de sortie
-/// 128 + signal.
-pub fn arreter(signal: Signal, raison: impl fmt::Display) -> ! {
+/// 128 + signal. Seulement au retour vers l'anneau 3 (`verifier_au_retour`).
+fn mourir(signal: Signal, raison: impl fmt::Display) -> ! {
     let nom = *NOM.verrouiller();
     afficherln!("[noyau] {} : {} ({})", nom, raison, signal.nom);
     terminer(128 + signal.numero as i32)
+}
+
+/// Un message du noyau gardé pour plus tard : celui d'une faute, dit quand
+/// le programme meurt, au retour vers l'anneau 3. 256 octets au plus (un
+/// message plus long est coupé), dans la structure même : le garder ne
+/// demande aucune allocation, qui pourrait manquer au moment d'une faute.
+pub struct Message {
+    octets: [u8; 256],
+    longueur: usize,
+}
+
+impl Message {
+    fn de(raison: impl fmt::Display) -> Message {
+        let mut m = Message { octets: [0; 256], longueur: 0 };
+        let _ = fmt::write(&mut m, format_args!("{}", raison));
+        m
+    }
+}
+
+impl fmt::Write for Message {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let n = s.len().min(self.octets.len() - self.longueur);
+        self.octets[self.longueur..self.longueur + n].copy_from_slice(&s.as_bytes()[..n]);
+        self.longueur += n;
+        Ok(())
+    }
+}
+
+impl fmt::Display for Message {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // Les messages du noyau sont en ASCII : coupés n'importe où, ils
+        // restent du texte.
+        f.write_str(core::str::from_utf8(&self.octets[..self.longueur]).unwrap_or("?"))
+    }
+}
+
+/// Comment le programme doit finir, à son retour vers l'anneau 3.
+enum Fin {
+    /// exit ou exit_group, avec son code.
+    Sortie(i32),
+    /// Un signal qu'il ne peut ni bloquer ni ignorer (une faute, SIGKILL),
+    /// et ce qu'il faudra dire.
+    Signal(Signal, Message),
+}
+
+/// La fin prévue du programme en cours, s'il y en a une.
+static FIN: Verrou<Option<Fin>> = Verrou::new(None);
+
+/// exit et exit_group : le programme finira au retour vers l'anneau 3,
+/// avec ce code. Elle l'emporte sur tout ce qui pouvait l'attendre (sous
+/// Linux, `do_exit` part aussitôt, sans regarder les signaux).
+pub fn prevoir_sortie(code: i32) {
+    *FIN.verrouiller() = Some(Fin::Sortie(code));
+}
+
+/// Le programme sera arrêté par `signal` au retour vers l'anneau 3 (une
+/// faute, plus rien ne peut le réveiller...), avec ce message. La
+/// première raison l'emporte, sauf SIGKILL, qui remplace tout signal
+/// prévu avant lui (pas une sortie) : c'est lui qui tuera.
+pub fn forcer(signal: Signal, raison: impl fmt::Display) {
+    let mut fin = FIN.verrouiller();
+    let remplacer = match &*fin {
+        None => true,
+        Some(Fin::Signal(s, _)) => signal.numero == linux::SIGKILL.numero && s.numero != linux::SIGKILL.numero,
+        Some(Fin::Sortie(_)) => false,
+    };
+    if remplacer {
+        *fin = Some(Fin::Signal(signal, Message::de(raison)));
+    }
 }
 
 /// Arrête le programme en cours faute de mémoire (SIGKILL, le tueur OOM de
 /// Linux), en disant ce qu'il occupait. Le verrou du processus est rendu
 /// avant d'arrêter : `terminer` ne revient pas, et un verrou emporté dans
 /// une tâche abandonnée ne serait jamais rendu.
-pub fn arreter_plus_de_memoire() -> ! {
+fn arreter_plus_de_memoire() -> ! {
     let (virtuelle, en_place, fichiers, tables) = processus::avec(|p| {
         let e = &p.memoire.espace;
         (p.memoire.taille_virtuelle(), e.pages() as u64 * 4096, e.pages_fichier() as u64 * 4096, e.tables() as u64 * 4096)
     });
     // Le message de Linux : « Out of memory: Killed process 1234 (a.out)
     // total-vm:...kB, anon-rss:...kB, file-rss:...kB, ... pgtables:...kB ».
-    arreter(
+    mourir(
         linux::SIGKILL,
         format_args!("plus de memoire : tue, memoire virtuelle {} Kio, en place {} Kio, fichiers {} Kio, tables {} Kio",
                      virtuelle >> 10, en_place >> 10, fichiers >> 10, tables >> 10),
@@ -314,17 +384,36 @@ pub fn tuer_au_retour() {
     A_TUER.store(true, Ordering::Relaxed);
 }
 
-/// Arrête le programme en cours s'il doit être tué faute de mémoire, ou
-/// s'il a atteint sa limite de temps de calcul. Appelée au retour vers
-/// l'anneau 3 (après une interruption, à la fin d'un appel système) : le
-/// noyau n'a alors plus rien en cours pour lui, et ne tient aucun verrou.
+/// La sortie vers l'anneau 3 : à la fin d'un appel système, et d'une
+/// interruption ou d'une exception venue du programme. C'est là, et
+/// seulement là, que le programme meurt, comme sous Linux
+/// (`exit_to_user_mode_loop`) : le noyau n'a alors plus rien en cours pour
+/// lui, en haut de sa pile noyau, et ne tient aucun verrou. Une faute, un
+/// exit, le tueur OOM ne font que PRÉVOIR la fin (`forcer`,
+/// `prevoir_sortie`, `tuer_au_retour`), puis l'appel ou le gestionnaire
+/// se termine normalement : rien de ce qu'il tenait n'est abandonné.
 ///
-/// La limite est RLIMIT_CPU, en secondes, celle de Linux. Comme lui, elle
-/// n'est vérifiée qu'après un tic compté (Linux le fait dans le tic, nous
-/// au retour qui suit, où le signal serait livré de toute façon) : un
-/// programme qui pose une limite de 0 s ne reçoit SIGXCPU qu'au tic
-/// suivant, et un getrlimit fait juste après relit 0 (mesuré), pas la
-/// limite déjà relevée. Dans l'ordre de `check_process_timers`
+/// Dans l'ordre :
+///   1. une fin prévue : exit (son code), ou un signal forcé (son message) ;
+///   2. tué faute de mémoire pendant une copie du noyau ;
+///   3. RLIMIT_CPU, dans l'ordre de Linux (voir plus bas) ;
+///   4. les signaux en attente et non bloqués (le `get_signal` de Linux) :
+///      ceux que le programme s'est envoyés, et SIGXCPU.
+/// La décision est prise interruptions coupées, et la fonction revient
+/// interruptions coupées quand il n'y a rien à faire : rien ne peut plus
+/// arriver entre la dernière vérification et le retour (sysretq ou iretq
+/// rétablissent les interruptions du programme) ; un signal envoyé par une
+/// interruption tombée avant est vu, un autre après attend l'entrée
+/// suivante. Linux boucle ainsi jusqu'à ce qu'il n'y ait plus rien à faire ;
+/// toutes nos décisions arrêtent le programme, la boucle n'a encore qu'un
+/// tour (6e ajoutera « céder le processeur », 6f les gestionnaires).
+///
+/// La limite de temps de calcul est RLIMIT_CPU, en secondes, celle de
+/// Linux. Comme lui, elle n'est vérifiée qu'après un tic compté (Linux le
+/// fait dans le tic, nous au retour qui suit, où le signal serait livré de
+/// toute façon) : un programme qui pose une limite de 0 s ne reçoit SIGXCPU
+/// qu'au tic suivant, et un getrlimit fait juste après relit 0 (mesuré),
+/// pas la limite déjà relevée. Dans l'ordre de `check_process_timers`
 /// (kernel/time/posix-cpu-timers.c) :
 ///   - rien à vérifier si la limite courante est infinie (le défaut) ;
 ///   - la limite dure d'abord : atteinte, SIGKILL ;
@@ -337,10 +426,6 @@ pub fn tuer_au_retour() {
 /// bloqué, il attend ; laissé à son action par défaut, il arrête le
 /// programme. SIGKILL, lui, ne se bloque ni ne s'ignore.
 ///
-/// Puis les signaux en attente et non bloqués sont livrés (le `get_signal`
-/// de Linux, au même endroit : le retour vers l'anneau 3) : ceux que le
-/// programme s'est envoyés, et SIGXCPU.
-///
 /// Options écartées :
 ///   - le budget fixe d'une seconde des étapes 5 à 6c : il n'existe pas
 ///     sous Linux, et il arrêterait claude ;
@@ -352,12 +437,44 @@ pub fn verifier_au_retour() {
     if !EN_COURS.load(Ordering::Relaxed) {
         return;
     }
+    cpu::couper_interruptions();
+    let Some(arret) = decider() else { return };
+    // Le verrou du processus est rendu, les interruptions reviennent :
+    // mourir prend du temps (rendre la mémoire).
+    cpu::activer_interruptions();
+    match arret {
+        Arret::Sortie(code) => terminer(code),
+        Arret::Force(signal, message) => mourir(signal, message),
+        Arret::PlusDeMemoire => arreter_plus_de_memoire(),
+        Arret::LimiteDure(secondes) => {
+            mourir(linux::SIGKILL, format_args!("limite dure de temps de calcul atteinte (RLIMIT_CPU {} s)", secondes))
+        }
+        Arret::Limite(secondes) => {
+            mourir(linux::SIGXCPU, format_args!("limite de temps de calcul atteinte (RLIMIT_CPU {} s)", secondes))
+        }
+        Arret::Signal(sig, signaux::Fin::ParDefaut) => mourir(signaux::signal(sig), "arrete par un signal"),
+        Arret::Signal(sig, signaux::Fin::Suspendu) => mourir(
+            signaux::signal(sig),
+            "suspendu par un signal ; sans controle des taches (6k), personne ne pourrait le relancer : termine",
+        ),
+        Arret::Signal(sig, signaux::Fin::Gestionnaire) => mourir(signaux::signal(sig), GESTIONNAIRE_EN_6F),
+    }
+}
+
+/// Ce que la sortie vers l'anneau 3 doit faire (voir `verifier_au_retour`),
+/// décidé interruptions coupées.
+fn decider() -> Option<Arret> {
+    match FIN.verrouiller().take() {
+        Some(Fin::Sortie(code)) => return Some(Arret::Sortie(code)),
+        Some(Fin::Signal(signal, message)) => return Some(Arret::Force(signal, message)),
+        None => {}
+    }
     if A_TUER.load(Ordering::Relaxed) {
-        arreter_plus_de_memoire();
+        return Some(Arret::PlusDeMemoire);
     }
     let calcul = temps::nanosecondes(CALCUL.load(Ordering::Relaxed));
     let verifier_temps = TEMPS_A_VERIFIER.swap(false, Ordering::Relaxed);
-    let fin = processus::essayer_avec(|p| {
+    processus::essayer_avec(|p| {
         let (courante, dure) = p.limite(processus::RLIMIT_CPU);
         let atteinte = |secondes: u64| calcul as u128 >= secondes as u128 * 1_000_000_000;
         let mut xcpu = None;
@@ -378,27 +495,18 @@ pub fn verifier_au_retour() {
             (signaux::Fin::ParDefaut, Some(secondes)) if sig == linux::SIGXCPU.numero as u64 => Arret::Limite(secondes),
             _ => Arret::Signal(sig, comment),
         })
-    }).flatten();
-    // Le verrou du processus est rendu : `arreter` ne revient pas.
-    match fin {
-        None => {}
-        Some(Arret::LimiteDure(secondes)) => {
-            arreter(linux::SIGKILL, format_args!("limite dure de temps de calcul atteinte (RLIMIT_CPU {} s)", secondes))
-        }
-        Some(Arret::Limite(secondes)) => {
-            arreter(linux::SIGXCPU, format_args!("limite de temps de calcul atteinte (RLIMIT_CPU {} s)", secondes))
-        }
-        Some(Arret::Signal(sig, signaux::Fin::ParDefaut)) => arreter(signaux::signal(sig), "arrete par un signal"),
-        Some(Arret::Signal(sig, signaux::Fin::Suspendu)) => arreter(
-            signaux::signal(sig),
-            "suspendu par un signal ; sans controle des taches (6k), personne ne pourrait le relancer : termine",
-        ),
-        Some(Arret::Signal(sig, signaux::Fin::Gestionnaire)) => arreter(signaux::signal(sig), GESTIONNAIRE_EN_6F),
-    }
+    })
+    .flatten()
 }
 
 /// Pourquoi `verifier_au_retour` arrête le programme.
 enum Arret {
+    /// exit, exit_group.
+    Sortie(i32),
+    /// Un signal forcé, et son message.
+    Force(Signal, Message),
+    /// Le tueur OOM.
+    PlusDeMemoire,
     /// RLIMIT_CPU : la limite dure (SIGKILL), ou la courante (SIGXCPU,
     /// laissé à son action par défaut), en secondes.
     LimiteDure(u64),
@@ -410,17 +518,17 @@ enum Arret {
 /// Le message d'un signal qui devrait appeler un gestionnaire.
 const GESTIONNAIRE_EN_6F: &str = "gestionnaire enregistre, pas encore appele (livraison des signaux en 6f)";
 
-/// Arrête le programme en cours pour une exception (une faute de page, une
+/// Une exception du programme en cours (une faute de page, une
 /// instruction invalide...) : `signal` et le message de Linux, `raison`.
-/// S'il a un gestionnaire pour ce signal, et ne le bloque pas, Linux
-/// l'appellerait : le message le dit. Sinon, comme Linux, une faute tue
-/// le programme même s'il ignore ou bloque son signal
-/// (`force_sig_info_to_task`).
-pub fn arreter_par_faute(signal: Signal, raison: impl fmt::Display) -> ! {
+/// Il sera arrêté au retour vers l'anneau 3. S'il a un gestionnaire pour
+/// ce signal, et ne le bloque pas, Linux l'appellerait : le message le dit.
+/// Sinon, comme Linux, une faute tue le programme même s'il ignore ou
+/// bloque son signal (`force_sig_info_to_task`).
+pub fn forcer_par_faute(signal: Signal, raison: impl fmt::Display) {
     let gestionnaire = processus::essayer_avec(|p| p.signaux.gestionnaire_pour_faute(signal.numero as u64)) == Some(true);
     if gestionnaire {
-        arreter(signal, format_args!("{} ; {}", raison, GESTIONNAIRE_EN_6F))
+        forcer(signal, format_args!("{} ; {}", raison, GESTIONNAIRE_EN_6F))
     } else {
-        arreter(signal, raison)
+        forcer(signal, raison)
     }
 }

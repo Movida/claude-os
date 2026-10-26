@@ -35,6 +35,7 @@ const EINVAL: i64 = 22;
 const EAGAIN: i64 = 11;
 const ENOSYS: i64 = 38;
 const ETIMEDOUT: i64 = 110;
+const EINTR: i64 = 4;
 
 const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
@@ -176,7 +177,9 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
     let Some(echeance) = echeance else {
         // Le verrou ne peut pas être rendu : le programme le tenait-il
         // lui-même, ou en attendait-il un qu'aucun autre fil ne rendra ?
-        tache::arreter(linux::SIGKILL, "attente sans fin d'un futex : un seul fil, rien ne peut la terminer");
+        // Il sera arrêté au retour : ce résultat, il ne le verra pas.
+        tache::forcer(linux::SIGKILL, "attente sans fin d'un futex : un seul fil, rien ne peut la terminer");
+        return -EINTR;
     };
     // Dormir jusqu'à l'échéance : au premier tic qui la dépasse, jamais
     // avant (les tics d'une milliseconde arrondissent au-dessus).

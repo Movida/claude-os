@@ -284,9 +284,11 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         // Le code de sortie tient sur 8 bits : Linux ne garde que l'octet
         // bas (exit(256) rend 0, exit(-1) rend 255), ce que verra le futur
         // wait ; les codes 128 + N restent ceux des signaux.
+        // La fin elle-même vient au retour vers l'anneau 3 (tache.rs).
         EXIT | EXIT_GROUP => {
             tracer(numero, a, None);
-            tache::terminer((a[0] & 0xff) as i32)
+            tache::prevoir_sortie((a[0] & 0xff) as i32);
+            return 0;
         }
         _ => {
             afficherln!("[noyau] appel systeme inconnu : {}", numero);

@@ -142,11 +142,32 @@ interruption_commune:
     push r13
     push r14
     push r15
+    cld
+    /* Un #DB venu d'un programme arrive sur sa pile de l'IST (gdt.rs), qui
+       ne doit servir que le temps de l'entrée : le programme va mourir de
+       ce SIGTRAP au retour, et la prochaine exception du même vecteur,
+       dans une autre tâche, réécrirait cette pile. Comme Linux
+       (`sync_regs`, entry_64.S), on recopie tout le cadre (22 valeurs) en
+       haut de la pile noyau de la tâche, libre puisque la tâche était dans
+       l'anneau 3, et on continue de là. Le NMI, la double faute et #MC
+       arrêtent le noyau : ils restent sur leur pile. */
+    cmp qword ptr [rsp + {vecteur}], 1
+    jne 2f
+    test byte ptr [rsp + {cs}], 3
+    jz 2f
+    mov rsi, rsp
+    mov rdi, [rip + TSS_PROCESSEUR + 4]
+    sub rdi, 22 * 8
+    mov rdx, rdi
+    mov ecx, 22
+    rep movsq
+    mov rsp, rdx
+2:
     /* Le CPU a aligné la pile sur 16 octets avant d'empiler son cadre ;
        5 + 2 + 15 = 22 valeurs de 8 octets : elle l'est toujours, comme
-       l'exige l'ABI avant un call. */
+       l'exige l'ABI avant un call (et le sommet de la pile de la tâche est
+       aligné aussi). */
     mov rdi, rsp
-    cld
     call gerer_interruption
     /* Le retour par iretq, partagé : la sortie d'un appel système qui ne
        peut pas prendre sysretq, et le premier départ d'un programme
@@ -182,7 +203,9 @@ adresses_talons:
         .set i, i + 1
     .endr
     .noaltmacro
-    "#
+    "#,
+    vecteur = const core::mem::offset_of!(Cadre, vecteur),
+    cs = const core::mem::offset_of!(Cadre, cs),
 );
 
 /// Ce que le code commun a empilé, dans l'ordre inverse des push.
@@ -267,8 +290,8 @@ pub fn initialiser() {
 ///
 /// Pour TOUS les vecteurs, ce qui compte d'abord est le privilège du code
 /// interrompu (les deux bits bas de CS dans le cadre) :
-///   - venue d'un programme (anneau 3), une exception est SA faute : il est
-///     arrêté, avec le signal que lui enverrait Linux, et le noyau
+///   - venue d'un programme (anneau 3), une exception est SA faute : il
+///     sera arrêté, avec le signal que lui enverrait Linux, et le noyau
 ///     continue. Même pour une exception qui n'est jamais une erreur dans
 ///     le noyau (int3) : un `int3`, un `icebp` ou un `int 0x80` d'un
 ///     programme ne doivent pas arrêter le noyau ;
@@ -278,41 +301,32 @@ pub fn initialiser() {
 ///     de personne en particulier (une panne matérielle, ou le noyau dans
 ///     un état incohérent) : on s'arrête, d'où qu'ils viennent.
 /// Linux fait ce même tri (user_mode(regs) dans arch/x86/kernel/traps.c).
+///
+/// Le programme ne meurt pas ici, mais à la sortie vers l'anneau 3, à la
+/// fin de cette fonction (tache::verifier_au_retour) : le gestionnaire
+/// prévoit sa fin, et se termine normalement.
 #[unsafe(no_mangle)]
 extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     let vecteur = cadre.vecteur as usize;
     let depuis_programme = cadre.cs & 3 == 3;
-    if vecteur >= 32 {
-        irq::gerer(vecteur as u8, |source| match source {
+    match vecteur {
+        32.. => irq::gerer(vecteur as u8, |source| match source {
             irq::Source::TimerApic | irq::Source::Isa(horloge::IRQ) => {
                 horloge::tic();
                 tache::tic();
             }
             irq::Source::Isa(clavier::IRQ) => clavier::interruption(),
             irq::Source::Isa(_) => {}
-        });
-        // Le programme interrompu a-t-il atteint sa limite de temps de
-        // calcul ? Seulement s'il était en anneau 3 : interrompu au milieu
-        // d'un appel système, il sera arrêté à la fin de l'appel
-        // (appel_systeme.rs), quand le noyau aura fini ce qu'il faisait
-        // pour lui.
-        if depuis_programme {
-            tache::verifier_au_retour();
-        }
-        return;
-    }
-    match vecteur {
+        }),
         2 | 8 | 18 => exception_fatale(cadre),
         // La faute de page, d'où qu'elle vienne : le plus souvent servie
-        // (la pagination à la demande), sinon le programme est arrêté, ou
+        // (la pagination à la demande), sinon le programme sera arrêté, ou
         // la copie du noyau rend EFAULT (faute_de_page.rs).
         14 => faute_de_page::gerer(cadre),
         _ if depuis_programme => {
-            // Le verrou du processus est rendu avant d'arrêter le
-            // programme (tache::arreter ne revient pas).
             let zone = processus::essayer_avec(|p| p.memoire.zone_du_code(cadre.rip)).flatten();
             let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, 0, None, zone);
-            tache::arreter_par_faute(signal, raison);
+            tache::forcer_par_faute(signal, raison);
         }
         // int3 n'est pas une erreur : un débogueur s'en sert pour poser des
         // points d'arrêt. RIP désigne déjà l'instruction suivante : on
@@ -320,6 +334,13 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
         3 => afficherln!("[noyau] Exception 3 ({}) a RIP={:#x}, on continue.",
                          NOMS[3], cadre.rip),
         _ => exception_fatale(cadre),
+    }
+    // Interrompu au milieu d'un appel système (dans le noyau), le programme
+    // verra sa fin, ses signaux, sa limite de temps de calcul à la fin de
+    // l'appel (appel_systeme.rs), quand le noyau aura fini ce qu'il faisait
+    // pour lui.
+    if depuis_programme {
+        tache::verifier_au_retour();
     }
 }
 

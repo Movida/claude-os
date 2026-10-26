@@ -34,6 +34,7 @@ const EPERM: i64 = 1;
 const ENOSYS: i64 = 38;
 const ELOOP: i64 = 40;
 const ENOMEM: i64 = 12;
+const EINTR: i64 = 4;
 
 const O_RDWR: u32 = 2;
 const O_NONBLOCK: u64 = 0o4000;
@@ -80,9 +81,11 @@ fn compteur(f: &mut FichierOuvert) -> (&mut u64, bool) {
 }
 
 /// Une lecture ou une écriture bloquante que rien ne finira : le programme
-/// est arrêté (voir l'en-tête).
-fn attente_sans_fin() -> ! {
-    tache::arreter(linux::SIGKILL, "attente sans fin d'un eventfd : un seul fil, rien ne peut la terminer")
+/// sera arrêté au retour vers l'anneau 3 (voir l'en-tête) ; il ne verra
+/// pas le résultat rendu.
+fn attente_sans_fin() -> i64 {
+    tache::forcer(linux::SIGKILL, "attente sans fin d'un eventfd : un seul fil, rien ne peut la terminer");
+    -EINTR
 }
 
 /// read d'un eventfd (`eventfd_read`) : au moins 8 octets (EINVAL) ; un
@@ -117,7 +120,7 @@ pub fn lire_morceaux(f: crate::descripteurs::Fichier, non_bloquant: bool, morcea
         if non_bloquant {
             return Err(-EAGAIN);
         }
-        attente_sans_fin();
+        return Err(attente_sans_fin());
     };
     let octets = pris.to_le_bytes();
     let mut faits = 0;
@@ -158,7 +161,7 @@ pub fn ecrire(f: crate::descripteurs::Fichier, non_bloquant: bool, tampon: u64, 
         if non_bloquant {
             return Err(-EAGAIN);
         }
-        attente_sans_fin();
+        return Err(attente_sans_fin());
     }
     Ok(8)
 }
