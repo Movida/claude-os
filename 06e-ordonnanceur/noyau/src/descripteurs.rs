@@ -103,9 +103,9 @@ impl Sorte {
 /// Les données propres à certaines sortes de fichiers ouverts.
 pub enum Donnees {
     Aucune,
-    /// Le compteur d'un eventfd, et EFD_SEMAPHORE (une lecture n'en prend
-    /// qu'un).
-    EventFd { compteur: u64, semaphore: bool },
+    /// Le compteur d'un eventfd, EFD_SEMAPHORE (une lecture n'en prend
+    /// qu'un), et les tâches qui attendent qu'il change (evenements.rs).
+    EventFd { compteur: u64, semaphore: bool, attente: crate::attente::FileAttente },
     /// Ce que surveille un epoll.
     Epoll(Vec<Interet>),
     /// D'où vient le contenu d'un fichier d'un système du noyau (une source

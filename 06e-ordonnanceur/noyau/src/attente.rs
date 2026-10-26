@@ -79,6 +79,73 @@ impl FileAttente {
         self.queue = t;
     }
 
+    /// Inscrit la tâche `t` (une autre que la courante : un futex déplacé
+    /// d'une file à l'autre par FUTEX_REQUEUE) à la fin de la file ; la
+    /// file prend l'Arc.
+    pub fn inscrire_tache(&mut self, t: Arc<Tache>) {
+        let t = Arc::into_raw(t);
+        // SAFETY : comme `inscrire`.
+        unsafe {
+            (*t).lien_attente().set(core::ptr::null());
+            if let Some(q) = self.queue.as_ref() {
+                q.lien_attente().set(t);
+            } else {
+                self.tete = t;
+            }
+        }
+        self.queue = t;
+    }
+
+    /// `t` est-elle dans la file ?
+    pub fn contient(&self, t: &Tache) -> bool {
+        let mut p = self.tete;
+        while !p.is_null() {
+            if core::ptr::eq(p, t) {
+                return true;
+            }
+            // SAFETY : les tâches de la file sont tenues par elle.
+            p = unsafe { (*p).lien_attente().get() };
+        }
+        false
+    }
+
+    /// Le nombre de tâches de la file pour qui `choisir` est vrai.
+    pub fn compter(&self, mut choisir: impl FnMut(&Tache) -> bool) -> usize {
+        let mut n = 0;
+        let mut p = self.tete;
+        while !p.is_null() {
+            // SAFETY : les tâches de la file sont tenues par elle.
+            let t = unsafe { &*p };
+            n += choisir(t) as usize;
+            p = t.lien_attente().get();
+        }
+        n
+    }
+
+    /// Retire de la file la première tâche pour qui `choisir` est vrai, et
+    /// la rend (avec l'Arc que tenait la file).
+    pub fn retirer_si(&mut self, mut choisir: impl FnMut(&Tache) -> bool) -> Option<Arc<Tache>> {
+        let mut p = self.tete;
+        while !p.is_null() {
+            // SAFETY : les tâches de la file sont tenues par elle.
+            let t = unsafe { &*p };
+            let suivante = t.lien_attente().get();
+            if choisir(t) {
+                // L'Arc de la file passe à l'appelant : on en prend un de
+                // plus avant que `retirer` ne lâche le sien.
+                // SAFETY : `p` est tenu par la file jusque-là.
+                let a = unsafe {
+                    Arc::increment_strong_count(p);
+                    Arc::from_raw(p)
+                };
+                self.retirer(t);
+                return Some(a);
+            }
+            p = suivante;
+        }
+        None
+    }
+
     /// Retire `t` de la file, si elle y est (réveillée par autre chose
     /// qu'un réveil de la file : une échéance, un signal).
     pub fn retirer(&mut self, t: &Tache) {
@@ -258,6 +325,35 @@ pub fn tic() {
             i += 1;
         }
     }
+}
+
+/// Le détecteur d'interblocage, appelé par la tâche inactive quand aucune
+/// tâche n'est prête, interruptions coupées. Si aucune minuterie n'est
+/// armée, plus rien ne peut réveiller les programmes qui dorment : ni une
+/// échéance, ni une autre tâche (aucune ne s'exécute), ni un périphérique
+/// (le clavier ne réveille que sa tâche du noyau, jusqu'au terminal de
+/// 6j). Linux les laisserait endormis pour toujours ; sans terminal,
+/// personne ne pourrait les interrompre (pas de ^C) : chacun est arrêté
+/// par SIGKILL, en le disant. Un écart voulu, qui généralise celui de 6d
+/// (une attente de futex sans délai dans un programme d'un seul fil). Les
+/// tâches du noyau (init qui attend un programme, le clavier) ne sont pas
+/// concernées. Rend vrai s'il a arrêté quelqu'un.
+pub fn detecter_interblocage() -> bool {
+    if !MINUTERIES.verrouiller().is_empty() || !ATTENTES_CALCUL.verrouiller().is_empty() {
+        return false;
+    }
+    let mut bloquees: Vec<Arc<Tache>> = Vec::new();
+    tache::pour_chaque(|t| {
+        if t.est_programme() && t.dort_interruptible_maintenant() && bloquees.try_reserve(1).is_ok() {
+            bloquees.push(t.clone());
+        }
+    });
+    let trouve = !bloquees.is_empty();
+    for t in bloquees {
+        t.forcer(crate::linux::SIGKILL, "plus rien ne peut le reveiller (interblocage)");
+        tache::reveiller(t, Reveil::Signal);
+    }
+    trouve
 }
 
 /// Un verrou qui DORT (le `mutex` de Linux) : une tâche qui le trouve pris

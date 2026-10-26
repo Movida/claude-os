@@ -10,18 +10,19 @@
 //! Aucun des deux n'a de nom : ils tiennent l'inode anonyme
 //! (fichiers::montages::Objet::Anonyme), comme sous Linux.
 //!
-//! En 6d, tout est fait et vérifié comme Linux (mesuré sur Linux 6.18),
-//! sauf attendre : sans ordonnanceur, rien d'autre ne s'exécute pendant
-//! qu'un programme attend, et rien ne peut lui arriver. Une lecture
-//! bloquante d'un eventfd vide (ou une écriture qui le ferait déborder)
-//! arrête donc le programme, comme une attente de futex sans délai (la
-//! même règle, futex.rs) ; `epoll_wait` rend ENOSYS jusqu'en 6f, où chaque
-//! sorte de fichier apprendra à dire « prêt » et à réveiller qui l'attend.
+//! Tout est fait et vérifié comme Linux (mesuré sur Linux 6.18). Depuis
+//! 6e, une lecture bloquante d'un eventfd vide (ou une écriture qui le
+//! ferait déborder) attend vraiment, dans la file d'attente du fichier,
+//! qu'une écriture (ou une lecture) change le compteur ; `epoll_wait` rend
+//! ENOSYS jusqu'en 6f, où chaque sorte de fichier apprendra à dire « prêt »
+//! et à réveiller qui l'attend.
 
 use crate::appels_fichiers::installer_fichier;
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::descripteurs::{Donnees, FichierOuvert, Interet, Sorte, Tenu};
-use crate::{linux, processus, tache, vfs};
+use crate::attente::{self, FileAttente, Sommeil};
+use crate::tache::Reveil;
+use crate::{cpu, processus, tache, vfs};
 use fichiers::montages::Objet;
 
 const EBADF: i64 = 9;
@@ -53,7 +54,7 @@ pub fn eventfd2(initiale: u64, drapeaux: u64) -> i64 {
     let mut f = FichierOuvert::new(Sorte::EventFd, Tenu::Noyau(Objet::Anonyme), true, true,
                                    O_RDWR | (drapeaux & O_NONBLOCK) as u32, b"anon_inode:[eventfd]");
     f.chemin = nom_anonyme(b"anon_inode:[eventfd]");
-    f.donnees = Donnees::EventFd { compteur: initiale as u32 as u64, semaphore: drapeaux & EFD_SEMAPHORE != 0 };
+    f.donnees = Donnees::EventFd { compteur: initiale as u32 as u64, semaphore: drapeaux & EFD_SEMAPHORE != 0, attente: FileAttente::new() };
     installer_fichier(f, drapeaux & O_CLOEXEC != 0)
 }
 
@@ -72,20 +73,51 @@ pub fn eventfd(initiale: u64) -> i64 {
     eventfd2(initiale, 0)
 }
 
-/// Le compteur d'un eventfd, sous le verrou des fichiers.
-fn compteur(f: &mut FichierOuvert) -> (&mut u64, bool) {
+/// Le compteur d'un eventfd et sa file d'attente, sous le verrou des
+/// fichiers.
+fn compteur(f: &mut FichierOuvert) -> (&mut u64, bool, &mut FileAttente) {
     match &mut f.donnees {
-        Donnees::EventFd { compteur, semaphore } => (compteur, *semaphore),
+        Donnees::EventFd { compteur, semaphore, attente } => (compteur, *semaphore, attente),
         _ => unreachable!("un eventfd sans compteur"),
     }
 }
 
-/// Une lecture ou une écriture bloquante que rien ne finira : le programme
-/// sera arrêté au retour vers l'anneau 3 (voir l'en-tête) ; il ne verra
-/// pas le résultat rendu.
-fn attente_sans_fin() -> i64 {
-    tache::forcer(linux::SIGKILL, "attente sans fin d'un eventfd : un seul fil, rien ne peut la terminer");
-    -EINTR
+/// Attend, si besoin, que `essayer` réussisse sur le compteur de l'eventfd
+/// `f` (sous le verrou des fichiers) : il rend Some quand l'opération est
+/// faite, None quand elle doit attendre. Une opération faite réveille qui
+/// attendait dans l'autre sens (un lecteur qui vide le compteur, les
+/// écrivains ; un écrivain, les lecteurs : une seule file, comme le `wqh`
+/// de Linux). Non bloquant : EAGAIN ; un signal pendant l'attente : EINTR.
+/// Sans réveil perdu (attente.rs).
+fn attendre_compteur<R>(f: crate::descripteurs::Fichier, non_bloquant: bool, mut essayer: impl FnMut(&mut u64, bool) -> Option<R>) -> Result<R, i64> {
+    let interruptions = cpu::couper_interruptions();
+    let r = loop {
+        let fait = vfs::avec_systeme(|s, _| {
+            let (c, semaphore, attente) = compteur(s.ouverts.fichier(f));
+            let r = essayer(c, semaphore);
+            if r.is_some() {
+                attente.reveiller_toutes();
+            } else if !non_bloquant {
+                attente.inscrire();
+            }
+            r
+        });
+        if let Some(r) = fait {
+            break Ok(r);
+        }
+        if non_bloquant {
+            break Err(-EAGAIN);
+        }
+        let reveil = attente::dormir(None, Sommeil::Interruptible);
+        vfs::avec_systeme(|s, _| compteur(s.ouverts.fichier(f)).2.retirer(tache::courante()));
+        if reveil == Reveil::Signal {
+            break Err(-EINTR);
+        }
+    };
+    if interruptions {
+        cpu::activer_interruptions();
+    }
+    r
 }
 
 /// read d'un eventfd (`eventfd_read`) : au moins 8 octets (EINVAL) ; un
@@ -107,21 +139,14 @@ pub fn lire_morceaux(f: crate::descripteurs::Fichier, non_bloquant: bool, morcea
     if morceaux.iter().fold(0u64, |t, &(_, l)| t.saturating_add(l)) < 8 {
         return Err(-EINVAL);
     }
-    let pris = vfs::avec_systeme(|s, _| {
-        let (c, semaphore) = compteur(s.ouverts.fichier(f));
+    let pris = attendre_compteur(f, non_bloquant, |c, semaphore| {
         if *c == 0 {
             return None;
         }
         let pris = if semaphore { 1 } else { *c };
         *c -= pris;
         Some(pris)
-    });
-    let Some(pris) = pris else {
-        if non_bloquant {
-            return Err(-EAGAIN);
-        }
-        return Err(attente_sans_fin());
-    };
+    })?;
     let octets = pris.to_le_bytes();
     let mut faits = 0;
     for &(base, longueur) in morceaux {
@@ -149,20 +174,13 @@ pub fn ecrire(f: crate::descripteurs::Fichier, non_bloquant: bool, tampon: u64, 
     if ajout == u64::MAX {
         return Err(-EINVAL);
     }
-    let fait = vfs::avec_systeme(|s, _| {
-        let (c, _) = compteur(s.ouverts.fichier(f));
+    attendre_compteur(f, non_bloquant, |c, _| {
         if u64::MAX - *c <= ajout {
-            return false;
+            return None;
         }
         *c += ajout;
-        true
-    });
-    if !fait {
-        if non_bloquant {
-            return Err(-EAGAIN);
-        }
-        return Err(attente_sans_fin());
-    }
+        Some(())
+    })?;
     Ok(8)
 }
 

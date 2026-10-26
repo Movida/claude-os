@@ -28,7 +28,8 @@
 //!      (faute_de_page.rs) : la copie s'arrête là, et l'appel rend EFAULT.
 //!      C'est le mécanisme de Linux (arch/x86/mm/extable.c).
 //!
-//! Une seule routine, `rep movsb`, pour les deux sens : elle copie RCX
+//! Une seule routine de copie, `rep movsb`, pour les deux sens (et, à
+//! côté, `lock cmpxchg` pour les futex : `cmpxchg_u32`) : elle copie RCX
 //! octets de [RSI] vers [RDI] ; interrompue par une faute, elle laisse
 //! dans RCX le nombre d'octets NON copiés. Sur les processeurs récents
 //! (FSRM, depuis 2019), c'est aussi la copie la plus rapide ; Linux la
@@ -49,7 +50,10 @@
 //!
 //! Jamais sous un verrou : une copie peut fauter, et servir la faute prend
 //! le verrou du processus (et, plus tard, attendra le disque). On copie
-//! dans un tampon du noyau, puis on s'en sert.
+//! dans un tampon du noyau, puis on s'en sert. Une exception : la lecture
+//! d'un futex sous le verrou de son seau (futex.rs), faite sans servir de
+//! faute (`tache::sans_faute_servie`) ; une page absente la fait échouer,
+//! et elle recommence après l'avoir fait venir, verrou rendu.
 
 use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -92,6 +96,30 @@ copie_brute:
     .quad 2b, 3b
     .popsection
 
+    /* cmpxchg_brut(adresse (rdi), attendu (esi), nouveau (edx)) : un
+       `lock cmpxchg` de 32 bits sur la mémoire du programme. Rend dans
+       rax la valeur trouvée (le cmpxchg a réussi si c'est `attendu`), ou
+       2^32 si l'accès a fait faute (l'entrée de la table d'exceptions :
+       11 reprend à 13). */
+    .global cmpxchg_brut
+cmpxchg_brut:
+    mov eax, esi
+    cmp byte ptr [rip + SMAP_ACTIF], 0
+    je 10f
+    stac
+10:
+11: lock cmpxchg dword ptr [rdi], edx
+12: cmp byte ptr [rip + SMAP_ACTIF], 0
+    je 14f
+    clac
+14: ret
+13: mov rax, 1 << 32
+    jmp 12b
+    .pushsection __ex_table, "a"
+    .balign 8
+    .quad 11b, 13b
+    .popsection
+
     /* lire_octet_direct(adresse (rdi)) : lit un octet SANS ouvrir SMAP ;
        rend l'octet, ou -1 si la lecture a fait faute. Ne sert qu'à
        vérifier, au démarrage, que SMAP protège vraiment. */
@@ -112,9 +140,26 @@ lire_octet_direct:
 unsafe extern "C" {
     fn copie_brute(destination: *mut u8, source: *const u8, n: usize) -> usize;
     fn lire_octet_direct(adresse: u64) -> i64;
+    fn cmpxchg_brut(adresse: u64, attendu: u32, nouveau: u32) -> u64;
     // Les bornes de la table d'exceptions (linker.ld).
     static __debut_ex_table: [u64; 0];
     static __fin_ex_table: [u64; 0];
+}
+
+/// Compare l'entier de 32 bits à `adresse` du programme à `attendu`, et
+/// le remplace par `nouveau` s'il lui est égal, en une instruction
+/// indivisible (`lock cmpxchg`, le `futex_atomic_cmpxchg_inatomic` de
+/// Linux) : rend la valeur trouvée. Une adresse hors du programme, non
+/// alignée sur 4, ou une page absente qu'on ne sert pas : Faute.
+pub fn cmpxchg_u32(adresse: u64, attendu: u32, nouveau: u32) -> Result<u32, Faute> {
+    if adresse % 4 != 0 || !dans_les_bornes(adresse, 4) {
+        return Err(Faute);
+    }
+    // SAFETY : l'adresse est dans la moitié basse, alignée ; une faute est
+    // reprise par la table d'exceptions (la page est servie, ou la copie
+    // échoue, comme pour copie_brute).
+    let r = unsafe { cmpxchg_brut(adresse, attendu, nouveau) };
+    if r >> 32 != 0 { Err(Faute) } else { Ok(r as u32) }
 }
 
 /// La plage [adresse, adresse + n[ est-elle dans les adresses des

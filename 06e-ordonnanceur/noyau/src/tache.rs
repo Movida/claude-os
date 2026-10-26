@@ -51,6 +51,7 @@
 
 use alloc::boxed::Box;
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::cell::{Cell, UnsafeCell};
 use core::fmt;
@@ -190,6 +191,13 @@ pub struct Tache {
     reveil: AtomicU8,
     /// Elle dort, et un signal peut la réveiller (TASK_INTERRUPTIBLE).
     interruptible: AtomicBool,
+    /// Le futex qu'elle attend (futex.rs), sous le verrou de son seau.
+    futex: Cell<Option<crate::futex::Attente>>,
+    /// Une faute de page du noyau, dans une copie depuis ou vers son
+    /// programme, ne doit pas être servie : la copie échoue (la lecture
+    /// d'un futex sous le verrou de son seau, futex.rs ; le
+    /// `pagefault_disable` de Linux).
+    sans_faute: AtomicBool,
     /// Un tic a été compté depuis la dernière vérification de RLIMIT_CPU.
     temps_a_verifier: AtomicBool,
     /// À tuer, faute de mémoire, dès son retour vers l'anneau 3 : une page
@@ -229,7 +237,7 @@ impl Tache {
         } else {
             None
         };
-        Some(Arc::new(Tache {
+        let t = Arc::new(Tache {
             nom: Verrou::new(nom),
             contexte: UnsafeCell::new(0),
             pile: Verrou::new(Some(pile)),
@@ -244,10 +252,15 @@ impl Tache {
             lien_attente: Cell::new(core::ptr::null()),
             reveil: AtomicU8::new(0),
             interruptible: AtomicBool::new(false),
+            futex: Cell::new(None),
+            sans_faute: AtomicBool::new(false),
             temps_a_verifier: AtomicBool::new(false),
             a_tuer: AtomicBool::new(false),
             fin: Verrou::new(None),
-        }))
+        });
+        // La place est réservée : il n'y a jamais plus de tâches que de piles.
+        TOUTES.verrouiller().push(t.clone());
+        Some(t)
     }
 
     /// Prépare la pile pour un premier départ : six registres pour
@@ -301,6 +314,39 @@ impl Tache {
         &self.lien_attente
     }
 
+    /// Est-ce un programme (et pas une tâche du noyau) ?
+    pub fn est_programme(&self) -> bool {
+        self.programme.is_some()
+    }
+
+    /// Dort-elle, interruptible ?
+    pub fn dort_interruptible_maintenant(&self) -> bool {
+        self.interruptible.load(Ordering::Relaxed)
+    }
+
+    /// Prévoit sa fin par `signal`, avec ce message (voir `forcer`).
+    pub fn forcer(&self, signal: Signal, raison: impl fmt::Display) {
+        let mut fin = self.fin.verrouiller();
+        let remplacer = match &*fin {
+            None => true,
+            Some(Fin::Signal(s, _)) => signal.numero == linux::SIGKILL.numero && s.numero != linux::SIGKILL.numero,
+            Some(Fin::Sortie(_)) => false,
+        };
+        if remplacer {
+            *fin = Some(Fin::Signal(signal, Message::de(raison)));
+        }
+    }
+
+    /// Le futex qu'elle attend (futex.rs).
+    pub fn futex(&self) -> &Cell<Option<crate::futex::Attente>> {
+        &self.futex
+    }
+
+    /// Faut-il servir une faute de page du noyau dans une copie pour elle ?
+    pub fn faute_servie(&self) -> bool {
+        !self.sans_faute.load(Ordering::Relaxed)
+    }
+
     /// Avant de s'endormir : personne ne l'a encore réveillée.
     pub fn preparer_sommeil(&self) {
         self.reveil.store(0, Ordering::Relaxed);
@@ -333,6 +379,11 @@ impl Tache {
 
 /// La tâche courante.
 static COURANTE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
+/// Toutes les tâches vivantes, sauf l'inactive (pour le détecteur
+/// d'interblocage, attente.rs ; bientôt /proc et les signaux). Réservée au
+/// démarrage pour autant de tâches que de piles : elle ne grandit jamais
+/// pendant un programme.
+static TOUTES: Verrou<Vec<Arc<Tache>>> = Verrou::new(Vec::new());
 /// La tâche qui vient de mourir, et qu'il faut rendre à la fin de la
 /// bascule qui suit (sa pile, puis la référence qu'elle avait laissée
 /// pour elle-même) : un Arc mis de côté par `terminer`. Sans lui, la file
@@ -360,6 +411,8 @@ pub fn initialiser() {
         lien_attente: Cell::new(core::ptr::null()),
         reveil: AtomicU8::new(0),
         interruptible: AtomicBool::new(false),
+        futex: Cell::new(None),
+        sans_faute: AtomicBool::new(false),
         temps_a_verifier: AtomicBool::new(false),
         a_tuer: AtomicBool::new(false),
         fin: Verrou::new(None),
@@ -367,6 +420,25 @@ pub fn initialiser() {
     let t = Arc::into_raw(Arc::new(pile_demarrage)) as *mut Tache;
     INACTIVE.store(t, Ordering::Relaxed);
     COURANTE.store(t, Ordering::Relaxed);
+    TOUTES.verrouiller().try_reserve_exact(crate::vmalloc::max_threads()).expect("plus de memoire pour la table des taches");
+}
+
+/// Appelle `f` sur chaque tâche vivante (sauf l'inactive), table tenue :
+/// `f` doit être court.
+pub fn pour_chaque(mut f: impl FnMut(&Arc<Tache>)) {
+    for t in TOUTES.verrouiller().iter() {
+        f(t);
+    }
+}
+
+/// Exécute `f` sans qu'une faute de page dans une copie de la tâche
+/// courante soit servie (voir `sans_faute`).
+pub fn sans_faute_servie<R>(f: impl FnOnce() -> R) -> R {
+    let t = courante();
+    t.sans_faute.store(true, Ordering::Relaxed);
+    let r = f();
+    t.sans_faute.store(false, Ordering::Relaxed);
+    r
 }
 
 /// Les tâches existent-elles (après `initialiser`) ?
@@ -588,6 +660,12 @@ pub fn terminer(code: i32) -> ! {
     t.morte.store(true, Ordering::Relaxed);
     // Une référence à elle-même, pour la fin de bascule qui rendra sa pile.
     A_RENDRE.store(Arc::into_raw(courante_arc()) as *mut Tache, Ordering::Relaxed);
+    {
+        let mut toutes = TOUTES.verrouiller();
+        if let Some(i) = toutes.iter().position(|x| core::ptr::eq(Arc::as_ptr(x), t)) {
+            toutes.swap_remove(i);
+        }
+    }
     if let Some(attendant) = t.attendant.verrouiller().take() {
         reveiller(attendant, Reveil::Reveillee);
     }
@@ -660,15 +738,7 @@ pub fn prevoir_sortie(code: i32) {
 /// première raison l'emporte, sauf SIGKILL, qui remplace tout signal
 /// prévu avant lui (pas une sortie) : c'est lui qui tuera.
 pub fn forcer(signal: Signal, raison: impl fmt::Display) {
-    let mut fin = courante().fin.verrouiller();
-    let remplacer = match &*fin {
-        None => true,
-        Some(Fin::Signal(s, _)) => signal.numero == linux::SIGKILL.numero && s.numero != linux::SIGKILL.numero,
-        Some(Fin::Sortie(_)) => false,
-    };
-    if remplacer {
-        *fin = Some(Fin::Signal(signal, Message::de(raison)));
-    }
+    courante().forcer(signal, raison);
 }
 
 /// Arrête le programme en cours faute de mémoire (SIGKILL, le tueur OOM de

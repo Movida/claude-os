@@ -352,14 +352,16 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     }
 
     // Le code du démarrage est maintenant la tâche inactive : elle prend le
-    // processeur quand aucune autre n'est prête, et l'arrête (sti ; hlt)
-    // jusqu'à la prochaine interruption. Une interruption qui rend une
+    // processeur quand aucune autre n'est prête, regarde si des programmes
+    // ne sont pas bloqués pour toujours (attente::detecter_interblocage),
+    // et arrête le processeur (sti ; hlt) jusqu'à la prochaine
+    // interruption. Une interruption qui rend une
     // tâche prête la préempte aussitôt (ordonnanceur.rs) ; on vérifie
     // quand même la file interruptions coupées avant de dormir (voir
     // cpu::attendre_interruption).
     loop {
         cpu::couper_interruptions();
-        if ordonnanceur::autres_pretes() {
+        if ordonnanceur::autres_pretes() || attente::detecter_interblocage() {
             cpu::activer_interruptions();
             ordonnanceur::ordonnancer();
         } else {

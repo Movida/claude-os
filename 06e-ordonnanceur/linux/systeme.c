@@ -118,7 +118,20 @@ static void futexes(void)
              "WAIT_BITSET, echeance absolue passee (REALTIME) : ETIMEDOUT");
     uint32_t *lecture = mmap(NULL, 4096, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     verifier(futex(lecture, FUTEX_WAIT_PRIVATE, 0, &zero, NULL, 0) == ETIMEDOUT, "WAIT sur une page en lecture seule : permis");
+    /* Un futex partagé, lui, veut sa page pour l'écrire (get_futex_key :
+     * FOLL_WRITE) : EFAULT sur une page en lecture seule, même après
+     * mprotect ; la page de zéros d'une zone inscriptible, elle, se
+     * copie (mesuré). */
+    verifier(futex(lecture, FUTEX_WAKE, 1, NULL, NULL, 0) == EFAULT && futex(lecture, FUTEX_WAIT, 0, &zero, NULL, 0) == EFAULT,
+             "WAKE et WAIT partages sur une page en lecture seule : EFAULT");
     munmap(lecture, 4096);
+    uint32_t *ecriture = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    long zeros = futex(ecriture, FUTEX_WAIT, 0, &zero, NULL, 0);
+    ecriture[0] = 0;
+    mprotect(ecriture, 4096, PROT_READ);
+    verifier(zeros == ETIMEDOUT && futex(ecriture, FUTEX_WAKE, 1, NULL, NULL, 0) == EFAULT,
+             "WAIT partage sur la page de zeros : permis ; apres mprotect en lecture seule : EFAULT");
+    munmap(ecriture, 4096);
     verifier(syscall(SYS_futex, &x, FUTEX_REQUEUE_PRIVATE, 1, 1, &y, 0) == 0, "REQUEUE : 0");
     verifier(futex(&x, FUTEX_CMP_REQUEUE_PRIVATE, 1, NULL, &y, 4) == EAGAIN, "CMP_REQUEUE sur une autre valeur : EAGAIN");
     verifier(syscall(SYS_futex, &x, FUTEX_CMP_REQUEUE_PRIVATE, 1, 1, &y, 5) == 0, "CMP_REQUEUE : 0");

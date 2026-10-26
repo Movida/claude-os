@@ -5,32 +5,45 @@
 //! réveille les attentes par `futex(FUTEX_WAKE)`. Le noyau ne connaît que
 //! l'adresse de l'entier, et la file de ceux qui y attendent.
 //!
-//! En 6d, un seul fil : personne ne peut attendre pendant qu'un autre
-//! s'exécute. Tout se réduit donc exactement (le tableau mesuré sur Linux
-//! 6.18 est dans le plan de 6d) :
-//!   - WAKE, WAKE_BITSET, REQUEUE, CMP_REQUEUE, WAKE_OP : il n'y a personne
-//!     à réveiller ni à déplacer, 0 ; avec les vérifications de Linux
-//!     (alignement, adresse, valeur comparée de CMP_REQUEUE), et WAKE_OP
-//!     fait bien son opération sur la seconde adresse ;
-//!   - WAIT, WAIT_BITSET : si l'entier ne vaut pas `val`, EAGAIN (le verrou
-//!     a changé entre le moment où le programme l'a lu et l'appel) ; sinon,
-//!     avec un délai, le noyau dort jusqu'à lui, puis ETIMEDOUT ; sans
-//!     délai, rien ne pourrait jamais réveiller le programme (aucun autre
-//!     fil, aucun signal livré avant 6f) : Linux le laisserait bloqué pour
-//!     toujours, nous l'arrêtons et le disons (un écart voulu) ;
-//!   - les futex à héritage de priorité (LOCK_PI...) : ENOSYS jusqu'en 6e.
-//! `claude --version` ne fait que des FUTEX_WAKE_PRIVATE (37 dans la
-//! trace). Le vrai futex, avec ses files d'attente par adresse, vient avec
-//! les fils, en 6e.
+//! Comme Linux (kernel/futex/) : 256 SEAUX (les `futex_hash_bucket`),
+//! chacun une file d'attente sous son verrou ; une attente est rangée dans
+//! le seau de sa CLÉ, hachée. La clé : le processus (son espace
+//! d'adressage), l'adresse, et si le futex est partagé. Linux, pour un
+//! futex partagé d'une page de fichier projetée en commun (MAP_SHARED),
+//! prend l'inode et la position dans le fichier, pour que deux processus
+//! se rencontrent ; sans MAP_SHARED ni fork (6k), un futex partagé ne peut
+//! être vu que par son processus, et la clé de Linux pour une page anonyme
+//! est la nôtre (`get_futex_key`). Une attente privée et une partagée à la
+//! même adresse ne se rencontrent jamais (mesuré : la clé dit « partagé »).
+//!
+//! WAIT sans réveil perdu : l'entier est relu SOUS le verrou du seau, puis
+//! l'attente inscrite, puis la tâche dort ; un WAKE prend le même verrou
+//! pour retirer l'attente de la file et réveiller la tâche. Qu'une attente
+//! ait été réveillée par un WAKE se décide par là : retirée de la file par
+//! le réveilleur, elle rend 0, même si son échéance ou un signal sont
+//! arrivés aussi ; encore dans la file, elle s'en retire elle-même et rend
+//! ETIMEDOUT ou EINTR (`futex_unqueue`). Sinon, un WAKE compté (et rendu à
+//! qui réveille) serait perdu : une condition de la glibc ne se réveillerait
+//! plus. Relire l'entier sous un verrou demande une lecture qui ne SERT
+//! PAS une faute de page (servir prend le verrou du processus, et attendra
+//! le disque en 6l) : en cas de faute, on rend le verrou, on fait venir la
+//! page par une lecture ordinaire, et on recommence (`futex_wait_setup`).
+//!
+//! Les futex à héritage de priorité (LOCK_PI...) : ENOSYS, avec un
+//! message. Ni `claude` (mesuré sur `--help`) ni la glibc par défaut ne
+//! s'en servent, et l'héritage de priorité n'a de sens qu'avec des
+//! priorités temps réel, que nous n'avons pas.
 //!
 //! Le délai attendu ne compte pas dans le temps de calcul (RLIMIT_CPU) :
 //! le programme dort, comme sous Linux.
 
-use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
+use crate::attente::{self, FileAttente, Sommeil};
+use crate::copie_utilisateur::{self, copier_depuis_utilisateur};
 use crate::espace_utilisateur::ADRESSE_MAX;
-use crate::attente::{self, Sommeil};
+use crate::memoire::Acces;
 use crate::tache::Reveil;
-use crate::{cpu, linux, tache, temps};
+use crate::verrou::Verrou;
+use crate::{cpu, processus, tache, temps};
 
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
@@ -100,13 +113,13 @@ pub fn futex(adresse: u64, operation: u64, val: u64, delai: u64, adresse2: u64, 
     match commande {
         FUTEX_WAIT => attendre(adresse, partage, val, echeance, BITSET_TOUS),
         FUTEX_WAIT_BITSET => attendre(adresse, partage, val, echeance, val3),
-        FUTEX_WAKE => reveiller(adresse, partage, BITSET_TOUS),
-        FUTEX_WAKE_BITSET => reveiller(adresse, partage, val3),
+        FUTEX_WAKE => reveiller(adresse, partage, val, BITSET_TOUS),
+        FUTEX_WAKE_BITSET => reveiller(adresse, partage, val, val3),
         FUTEX_REQUEUE => deplacer(adresse, partage, val, delai, adresse2, None),
         FUTEX_CMP_REQUEUE => deplacer(adresse, partage, val, delai, adresse2, Some(val3)),
-        FUTEX_WAKE_OP => operer(adresse, partage, adresse2, val3),
+        FUTEX_WAKE_OP => operer(adresse, partage, val, delai, adresse2, val3),
         FUTEX_LOCK_PI | FUTEX_UNLOCK_PI | FUTEX_TRYLOCK_PI | FUTEX_WAIT_REQUEUE_PI | FUTEX_CMP_REQUEUE_PI | FUTEX_LOCK_PI2 => {
-            afficherln!("[noyau] futex : operation {} (heritage de priorite) pas encore prise en charge (6e)", commande);
+            afficherln!("[noyau] futex : operation {} (heritage de priorite) non prise en charge", commande);
             -ENOSYS
         }
         _ => -ENOSYS,
@@ -143,22 +156,55 @@ fn monotone() -> i128 {
     t.secondes as i128 * 1_000_000_000 + t.nanosecondes as i128
 }
 
-/// La « clé » du futex, comme `get_futex_key` : l'adresse alignée sur 4
-/// (EINVAL), dans la moitié basse (EFAULT, `access_ok`) ; pour un futex
-/// partagé, Linux cherche aussi la page qu'elle désigne (EFAULT si rien
-/// n'y est projeté) : on la lit. Un futex privé n'est jamais lu ici
+/// La clé d'un futex (voir l'en-tête).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Cle {
+    pid: u32,
+    adresse: u64,
+    partage: bool,
+}
+
+/// Ce que la tâche qui attend un futex en dit (dans sa tâche, sous le
+/// verrou du seau où elle attend) : sa clé, et son masque de bits.
+#[derive(Clone, Copy)]
+pub struct Attente {
+    cle: Cle,
+    bitset: u32,
+}
+
+/// Un seau : la file des tâches qui attendent un futex dont la clé y mène.
+struct Seau {
+    file: FileAttente,
+}
+
+const SEAUX: usize = 256;
+static TABLE: [Verrou<Seau>; SEAUX] = [const { Verrou::new(Seau { file: FileAttente::new() }) }; SEAUX];
+
+/// Le seau de la clé : un mélange de ses champs (le multiplicateur de
+/// Fibonacci, comme le `hash_long` de Linux), ses 8 bits hauts.
+fn seau(c: &Cle) -> usize {
+    let x = (c.adresse >> 2) ^ (c.pid as u64) << 40 ^ c.partage as u64;
+    (x.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as usize
+}
+
+/// La clé du futex à `adresse`, comme `get_futex_key` : l'adresse alignée
+/// sur 4 (EINVAL), dans la moitié basse (EFAULT, `access_ok`). Pour un
+/// futex partagé, Linux cherche aussi la page, POUR L'ÉCRIRE (EFAULT si
+/// elle ne peut pas l'être : mesuré, une page anonyme en lecture seule,
+/// même après mprotect ; la page de zéros, elle, se copie) : on la sert
+/// comme une faute en écriture. Un futex privé n'est jamais touché ici
 /// (mesuré : un WAKE privé à l'adresse 0 rend 0).
-fn cle(adresse: u64, partage: bool) -> Result<(), i64> {
+fn cle(adresse: u64, partage: bool) -> Result<Cle, i64> {
     if adresse % 4 != 0 {
         return Err(-EINVAL);
     }
     if adresse.checked_add(4).is_none_or(|fin| fin > ADRESSE_MAX) {
         return Err(-EFAULT);
     }
-    if partage {
-        lire(adresse)?;
+    if partage && processus::avec(|p| p.memoire.servir(adresse, Acces::Ecriture)).is_err() {
+        return Err(-EFAULT);
     }
-    Ok(())
+    Ok(Cle { pid: processus::avec(|p| p.pid), adresse, partage })
 }
 
 fn lire(adresse: u64) -> Result<u32, i64> {
@@ -167,78 +213,190 @@ fn lire(adresse: u64) -> Result<u32, i64> {
     Ok(u32::from_le_bytes(o))
 }
 
+/// Lit l'entier sans servir de faute de page (sous le verrou d'un seau) :
+/// None si la page n'est pas là.
+fn lire_sans_faute(adresse: u64) -> Option<u32> {
+    let mut o = [0u8; 4];
+    tache::sans_faute_servie(|| copier_depuis_utilisateur(&mut o, adresse)).ok()?;
+    Some(u32::from_le_bytes(o))
+}
+
 /// FUTEX_WAIT et FUTEX_WAIT_BITSET (`futex_wait`).
 fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, bitset: u32) -> i64 {
     if bitset == 0 {
         return -EINVAL;
     }
-    if let Err(e) = cle(adresse, partage) {
-        return e;
-    }
-    match lire(adresse) {
+    let c = match cle(adresse, partage) {
+        Ok(c) => c,
         Err(e) => return e,
-        Ok(v) if v != val => return -EAGAIN,
-        Ok(_) => {}
-    }
-    let Some(echeance) = echeance else {
-        // Le verrou ne peut pas être rendu : le programme le tenait-il
-        // lui-même, ou en attendait-il un qu'aucun autre fil ne rendra ?
-        // Il sera arrêté au retour : ce résultat, il ne le verra pas.
-        tache::forcer(linux::SIGKILL, "attente sans fin d'un futex : un seul fil, rien ne peut la terminer");
-        return -EINTR;
     };
-    // Dormir jusqu'à l'échéance : au premier tic qui la dépasse, jamais
-    // avant (attente.rs). Personne d'autre ne peut réveiller un futex dans
-    // un processus d'un seul fil : seuls l'échéance ou un signal finissent
-    // l'attente.
+    let echeance = echeance.map(Echeance::en_monotone);
     let interruptions = cpu::couper_interruptions();
-    let reveil = attente::dormir(Some(echeance.en_monotone()), Sommeil::Interruptible);
+    let r = loop {
+        let mut s = TABLE[seau(&c)].verrouiller();
+        match lire_sans_faute(adresse) {
+            None => {
+                // La page n'est pas là : la faire venir, verrou rendu, et
+                // recommencer.
+                drop(s);
+                cpu::activer_interruptions();
+                let lue = lire(adresse);
+                cpu::couper_interruptions();
+                if let Err(e) = lire_ok(lue) {
+                    break e;
+                }
+                continue;
+            }
+            Some(v) if v != val => break -EAGAIN,
+            Some(_) => {}
+        }
+        tache::courante().futex().set(Some(Attente { cle: c, bitset }));
+        s.file.inscrire();
+        drop(s);
+        let reveil = attente::dormir(echeance, Sommeil::Interruptible);
+        // Réveillée : par un WAKE (elle n'est plus dans la file), ou par son
+        // échéance ou un signal (elle y est encore). Un REQUEUE a pu la
+        // déplacer dans le seau d'une autre clé : sa clé le dit.
+        let t = tache::courante();
+        let ou = t.futex().get().map_or(c, |a| a.cle);
+        let mut s = TABLE[seau(&ou)].verrouiller();
+        let encore = s.file.contient(t);
+        s.file.retirer(t);
+        drop(s);
+        t.futex().set(None);
+        if !encore {
+            break 0;
+        }
+        match reveil {
+            Reveil::Echeance => break -ETIMEDOUT,
+            Reveil::Signal => break -EINTR,
+            // Réveillée sans être retirée (personne ne le fait) : se rendort.
+            Reveil::Reveillee => continue,
+        }
+    };
     if interruptions {
         cpu::activer_interruptions();
     }
-    match reveil {
-        Reveil::Signal => -EINTR,
-        _ => -ETIMEDOUT,
-    }
+    r
 }
 
-/// FUTEX_WAKE et FUTEX_WAKE_BITSET (`futex_wake`) : personne à réveiller.
-fn reveiller(adresse: u64, partage: bool, bitset: u32) -> i64 {
+fn lire_ok(r: Result<u32, i64>) -> Result<(), i64> {
+    r.map(|_| ())
+}
+
+/// Réveille au plus `n` attentes de la clé `c` dont le masque croise
+/// `bitset`, dans le seau `s` (verrou tenu) ; rend leur nombre.
+fn reveiller_dans(s: &mut Seau, c: &Cle, bitset: u32, n: u32) -> u32 {
+    let mut faits = 0;
+    while faits < n {
+        let Some(t) = s.file.retirer_si(|t| t.futex().get().is_some_and(|a| a.cle == *c && a.bitset & bitset != 0)) else { break };
+        tache::reveiller(t, Reveil::Reveillee);
+        faits += 1;
+    }
+    faits
+}
+
+/// FUTEX_WAKE et FUTEX_WAKE_BITSET (`futex_wake`) : réveille jusqu'à `val`
+/// attentes (au moins une : 0 et les nombres négatifs en réveillent une,
+/// mesuré), rend leur nombre.
+fn reveiller(adresse: u64, partage: bool, val: u32, bitset: u32) -> i64 {
     if bitset == 0 {
         return -EINVAL;
     }
-    match cle(adresse, partage) {
-        Ok(()) => 0,
-        Err(e) => e,
+    let c = match cle(adresse, partage) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let n = if (val as i32) <= 0 { 1 } else { val };
+    reveiller_dans(&mut TABLE[seau(&c)].verrouiller(), &c, bitset, n) as i64
+}
+
+/// Réveille au plus `n` attentes du futex PARTAGÉ à `adresse` du processus
+/// en cours (la fin d'un fil : CLONE_CHILD_CLEARTID et la liste robuste,
+/// fils.rs), sans les vérifications d'un appel.
+#[allow(dead_code)]
+pub fn reveiller_partage(adresse: u64, n: u32) {
+    let c = Cle { pid: processus::avec(|p| p.pid), adresse, partage: true };
+    reveiller_dans(&mut TABLE[seau(&c)].verrouiller(), &c, BITSET_TOUS, n);
+}
+
+/// Les verrous des seaux `a` et `b`, dans l'ordre des numéros (un seul si
+/// c'est le même) : deux appels qui prendraient les mêmes seaux dans
+/// l'ordre inverse se bloqueraient l'un l'autre avec plusieurs
+/// processeurs.
+fn deux_seaux(a: usize, b: usize, f: impl FnOnce(&mut Seau, Option<&mut Seau>) -> i64) -> i64 {
+    if a == b {
+        return f(&mut TABLE[a].verrouiller(), None);
     }
+    let (premier, second) = (a.min(b), a.max(b));
+    let mut p = TABLE[premier].verrouiller();
+    let mut s = TABLE[second].verrouiller();
+    if a < b { f(&mut p, Some(&mut s)) } else { f(&mut s, Some(&mut p)) }
 }
 
 /// FUTEX_REQUEUE et FUTEX_CMP_REQUEUE (`futex_requeue`) : réveiller `val`
-/// attentes de la première adresse, et déplacer les suivantes, jusqu'à
-/// `val2` (passé à la place du délai), vers la seconde. Personne
-/// n'attend : 0, une fois les deux clés vérifiées, et pour CMP_REQUEUE la
-/// valeur de la première comparée à `val3` (EAGAIN).
+/// attentes de la première clé, et déplacer les suivantes, jusqu'à `val2`
+/// (passé à la place du délai), vers la seconde. Pour CMP_REQUEUE, la
+/// valeur de la première est d'abord comparée à `attendue` (EAGAIN), sous
+/// les verrous. Rend le nombre d'attentes réveillées plus déplacées.
 fn deplacer(adresse: u64, partage: bool, val: u32, val2: u64, adresse2: u64, attendue: Option<u32>) -> i64 {
     if (val as i32) < 0 || (val2 as u32 as i32) < 0 {
         return -EINVAL;
     }
-    if let Err(e) = cle(adresse, partage).and_then(|_| cle(adresse2, partage)) {
-        return e;
-    }
-    if let Some(attendue) = attendue {
-        match lire(adresse) {
-            Err(e) => return e,
-            Ok(v) if v != attendue => return -EAGAIN,
-            Ok(_) => {}
+    let (c1, c2) = match cle(adresse, partage).and_then(|a| cle(adresse2, partage).map(|b| (a, b))) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    loop {
+        let mut faute = false;
+        let r = deux_seaux(seau(&c1), seau(&c2), |s1, mut s2| {
+            if let Some(attendue) = attendue {
+                match lire_sans_faute(adresse) {
+                    None => {
+                        faute = true;
+                        return 0;
+                    }
+                    Some(v) if v != attendue => return -EAGAIN,
+                    Some(_) => {}
+                }
+            }
+            let reveillees = reveiller_dans(s1, &c1, BITSET_TOUS, val);
+            // Vers la même clé : rien ne bouge, mais Linux compte celles
+            // qu'il aurait déplacées (un seul parcours de la file). Les
+            // retirer et les remettre à la fin, comme pour une autre clé,
+            // les ferait retrouver sans fin : `val2` tours, interruptions
+            // coupées (2^31 : des minutes de machine figée).
+            if c1 == c2 {
+                let restantes = s1.file.compter(|t| t.futex().get().is_some_and(|a| a.cle == c1));
+                return (reveillees as u64 + (restantes as u64).min(val2)) as i64;
+            }
+            let mut deplacees = 0;
+            while deplacees < val2 as u32 {
+                let Some(t) = s1.file.retirer_si(|t| t.futex().get().is_some_and(|a| a.cle == c1)) else { break };
+                let bitset = t.futex().get().map_or(BITSET_TOUS, |a| a.bitset);
+                t.futex().set(Some(Attente { cle: c2, bitset }));
+                // Dans la file du seau de la seconde clé (le même, ou l'autre).
+                match s2.as_deref_mut() {
+                    Some(s2) => s2.file.inscrire_tache(t),
+                    None => s1.file.inscrire_tache(t),
+                }
+                deplacees += 1;
+            }
+            (reveillees + deplacees) as i64
+        });
+        if !faute {
+            return r;
+        }
+        if let Err(e) = lire(adresse) {
+            return e;
         }
     }
-    0
 }
 
 /// FUTEX_WAKE_OP (`futex_wake_op`) : changer l'entier de la seconde adresse
 /// par une opération, et réveiller sur l'une, puis sur l'autre selon
-/// l'ancienne valeur. Personne à réveiller : reste l'opération, codée dans
-/// `codee` (`futex_atomic_op_inuser`) :
+/// l'ancienne valeur. L'opération, codée dans `codee`
+/// (`futex_atomic_op_inuser`) :
 ///   bits 28-31 : l'opération (SET, ADD, OR, ANDN, XOR ; plus 8 : son
 ///                argument est un décalage, 1 << arg) ;
 ///   bits 24-27 : la comparaison (EQ, NE, LT, LE, GT, GE) ;
@@ -247,15 +405,20 @@ fn deplacer(adresse: u64, partage: bool, val: u32, val2: u64, adresse2: u64, att
 /// Une opération inconnue : ENOSYS, sans rien écrire. Une comparaison
 /// inconnue : ENOSYS aussi, mais APRÈS l'opération, comme Linux, qui ne la
 /// regarde qu'une fois l'entier changé (mesuré : 7 + 3 donne 10, et -38).
-/// Un seul fil : lire puis écrire suffit à rendre l'opération indivisible.
-fn operer(adresse: u64, partage: bool, adresse2: u64, codee: u32) -> i64 {
-    if let Err(e) = cle(adresse, partage).and_then(|_| cle(adresse2, partage)) {
-        return e;
-    }
+/// L'opération est indivisible (`lock cmpxchg`, recommencé si l'entier a
+/// changé entre la lecture et l'écriture), sous les verrous des deux
+/// seaux ; une faute rend les verrous, fait venir la page, et recommence.
+/// Rend le nombre d'attentes réveillées sur les deux clés.
+fn operer(adresse: u64, partage: bool, val: u32, val2: u64, adresse2: u64, codee: u32) -> i64 {
+    let (c1, c2) = match cle(adresse, partage).and_then(|a| cle(adresse2, partage).map(|b| (a, b))) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
     let mut op = codee >> 28;
     let cmp = (codee >> 24) & 0xf;
     let signe12 = |x: u32| ((x << 20) as i32) >> 20;
     let mut argument = signe12((codee >> 12) & 0xfff);
+    let comparee = signe12(codee & 0xfff);
     if op & 8 != 0 {
         op &= 7;
         // Linux garde les 5 bits bas d'un décalage hors de [0, 31].
@@ -264,23 +427,64 @@ fn operer(adresse: u64, partage: bool, adresse2: u64, codee: u32) -> i64 {
     if op > 4 {
         return -ENOSYS;
     }
-    let ancienne = match lire(adresse2) {
-        Ok(v) => v,
-        Err(e) => return e,
-    };
     let a = argument as u32;
-    let nouvelle = match op {
-        0 => a,
-        1 => ancienne.wrapping_add(a),
-        2 => ancienne | a,
-        3 => ancienne & !a,
-        _ => ancienne ^ a,
-    };
-    if copier_vers_utilisateur(adresse2, &nouvelle.to_le_bytes()).is_err() {
-        return -EFAULT;
+    loop {
+        let mut faute = false;
+        let r = deux_seaux(seau(&c1), seau(&c2), |s1, s2| {
+            let ancienne = loop {
+                let Some(ancienne) = lire_sans_faute(adresse2) else {
+                    faute = true;
+                    return 0;
+                };
+                let nouvelle = match op {
+                    0 => a,
+                    1 => ancienne.wrapping_add(a),
+                    2 => ancienne | a,
+                    3 => ancienne & !a,
+                    _ => ancienne ^ a,
+                };
+                match tache::sans_faute_servie(|| copie_utilisateur::cmpxchg_u32(adresse2, ancienne, nouvelle)) {
+                    Err(_) => {
+                        faute = true;
+                        return 0;
+                    }
+                    Ok(trouvee) if trouvee == ancienne => break ancienne as i32,
+                    // Changé entre-temps (un autre processeur, un jour) :
+                    // recommencer.
+                    Ok(_) => continue,
+                }
+            };
+            if cmp > 5 {
+                return -ENOSYS;
+            }
+            // Au moins une attente de chaque côté, comme FUTEX_WAKE (la
+            // boucle de `futex_wake_op` compte comme celle de `futex_wake`).
+            let au_moins_une = |n: u32| if (n as i32) <= 0 { 1 } else { n };
+            let mut n = reveiller_dans(s1, &c1, BITSET_TOUS, au_moins_une(val));
+            let vrai = match cmp {
+                0 => ancienne == comparee,
+                1 => ancienne != comparee,
+                2 => ancienne < comparee,
+                3 => ancienne <= comparee,
+                4 => ancienne > comparee,
+                _ => ancienne >= comparee,
+            };
+            if vrai {
+                let s2 = match s2 {
+                    Some(s2) => s2,
+                    None => s1,
+                };
+                n += reveiller_dans(s2, &c2, BITSET_TOUS, au_moins_une(val2 as u32));
+            }
+            n as i64
+        });
+        if !faute {
+            return r;
+        }
+        // La page à écrire : la faire venir en écriture (un futex partagé
+        // l'a déjà fait), verrous rendus.
+        if processus::avec(|p| p.memoire.servir(adresse2, Acces::Ecriture)).is_err() {
+            return -EFAULT;
+        }
     }
-    if cmp > 5 {
-        return -ENOSYS;
-    }
-    0
 }

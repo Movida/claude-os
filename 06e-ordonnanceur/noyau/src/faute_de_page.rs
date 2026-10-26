@@ -88,7 +88,7 @@ fn faute_du_programme(cadre: &Cadre, cr2: u64, acces: Acces) {
 /// où il en est. Toute autre faute du noyau est une erreur du noyau : on
 /// s'arrête.
 ///
-/// Même dans la table, trois cas ne sont jamais servis ; la copie s'arrête
+/// Même dans la table, quatre cas ne sont jamais servis ; la copie s'arrête
 /// alors à son adresse de reprise, et l'appel système rend EFAULT :
 ///   - une violation de SMAP : SMAP actif, et le drapeau AC à 0 au moment
 ///     de la faute (hors de `stac` ... `clac`). La page est présente et
@@ -97,7 +97,10 @@ fn faute_du_programme(cadre: &Cadre, cr2: u64, acces: Acces) {
 ///     Linux. Cette règle passe avant toute recherche ;
 ///   - pas de processus en cours : le test du démarrage copie vers un
 ///     espace créé à la main (main.rs) ;
-///   - une adresse qu'aucune zone ne permet.
+///   - une adresse qu'aucune zone ne permet ;
+///   - une copie faite sans servir de faute (`tache::sans_faute_servie` :
+///     la lecture d'un futex sous le verrou de son seau, qui recommence
+///     après avoir fait venir la page autrement).
 /// Une page qui manque, faute de mémoire, rend aussi EFAULT, et le
 /// programme sera tué à son retour (tache::tuer_au_retour).
 fn faute_du_noyau(cadre: &mut Cadre, cr2: u64, acces: Acces) {
@@ -105,7 +108,9 @@ fn faute_du_noyau(cadre: &mut Cadre, cr2: u64, acces: Acces) {
         exception_fatale(cadre);
     };
     let smap_viole = SMAP_ACTIF.load(Ordering::Relaxed) && cadre.rflags & AC == 0;
+    let permise = !crate::tache::en_service() || crate::tache::courante().faute_servie();
     let servie = !smap_viole
+        && permise
         && cr2 < ADRESSE_MAX
         && acces != Acces::Execution
         && match processus::essayer_avec(|p| p.memoire.servir(cr2, acces)) {
