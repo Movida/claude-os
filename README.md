@@ -62,4 +62,4 @@ C'est un projet d'apprentissage mené avec Claude Code : Claude écrit le code, 
 
 ## Licence
 
-[MIT](LICENSE).
+[Apache 2.0](LICENSE).
