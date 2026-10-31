@@ -313,8 +313,7 @@ fn reveiller(adresse: u64, partage: bool, val: u32, bitset: u32) -> i64 {
 
 /// Réveille au plus `n` attentes du futex PARTAGÉ à `adresse` du processus
 /// en cours (la fin d'un fil : CLONE_CHILD_CLEARTID et la liste robuste,
-/// fils.rs), sans les vérifications d'un appel.
-#[allow(dead_code)]
+/// tache.rs), sans les vérifications d'un appel.
 pub fn reveiller_partage(adresse: u64, n: u32) {
     let c = Cle { pid: processus::avec(|p| p.pid), adresse, partage: true };
     reveiller_dans(&mut TABLE[seau(&c)].verrouiller(), &c, BITSET_TOUS, n);
@@ -486,5 +485,95 @@ fn operer(adresse: u64, partage: bool, val: u32, val2: u64, adresse2: u64, codee
         if processus::avec(|p| p.memoire.servir(adresse2, Acces::Ecriture)).is_err() {
             return -EFAULT;
         }
+    }
+}
+
+/// Le plus d'entrées parcourues dans une liste robuste (ROBUST_LIST_LIMIT) :
+/// une liste en boucle, ou trop longue, ne retient pas la fin d'un fil.
+const LISTE_ROBUSTE_MAX: u32 = 2048;
+/// Les bits du mot d'un futex robuste : quelqu'un attend, son détenteur est
+/// mort, et le numéro du fil détenteur (FUTEX_WAITERS, FUTEX_OWNER_DIED,
+/// FUTEX_TID_MASK).
+const FUTEX_WAITERS: u32 = 0x8000_0000;
+const FUTEX_OWNER_DIED: u32 = 0x4000_0000;
+const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
+
+/// La fin du fil `tid`, dont la liste de verrous robustes commence à `tete`
+/// (le `exit_robust_list` de Linux). Un verrou ROBUSTE (un mutex
+/// `PTHREAD_MUTEX_ROBUST`) ne reste pas pris pour toujours quand son
+/// détenteur meurt : chaque fil tient dans sa mémoire la liste de ceux qu'il
+/// détient, et le noyau, à sa fin, marque chacun « détenteur mort »
+/// (FUTEX_OWNER_DIED), puis réveille un fil qui l'attend ; le suivant à le
+/// prendre reçoit EOWNERDEAD de la glibc. La tête (24 octets) : le premier
+/// élément, le décalage du mot du futex dans chaque élément, et l'élément
+/// en cours de prise ou de rendu (`list_op_pending`), traité en dernier,
+/// une seule fois. Un pointeur a dans son bit 0 la marque d'un futex à
+/// héritage de priorité (PI), que nous n'avons pas : ceux-là ne sont pas
+/// réveillés ici. Une lecture qui fait faute arrête le parcours, sans rien
+/// dire, comme Linux.
+pub fn rendre_liste_robuste(tete: u64, tid: u32) {
+    let lire = |adresse: u64| -> Option<u64> {
+        let mut o = [0u8; 8];
+        copier_depuis_utilisateur(&mut o, adresse).ok()?;
+        Some(u64::from_le_bytes(o))
+    };
+    let (Some(premier), Some(decalage), Some(en_cours)) = (lire(tete), lire(tete + 8), lire(tete + 16)) else { return };
+    let decalage = decalage as i64;
+    let en_cours_pi = en_cours & 1 != 0;
+    let en_cours = en_cours & !1;
+    let (mut element, mut pi) = (premier & !1, premier & 1 != 0);
+    let mut reste = LISTE_ROBUSTE_MAX;
+    while element != tete {
+        let suivant = lire(element);
+        if element != en_cours && !mort_du_detenteur(element.wrapping_add_signed(decalage), tid, pi, false) {
+            return;
+        }
+        let Some(suivant) = suivant else { return };
+        (element, pi) = (suivant & !1, suivant & 1 != 0);
+        reste -= 1;
+        if reste == 0 {
+            break;
+        }
+    }
+    if en_cours != 0 {
+        mort_du_detenteur(en_cours.wrapping_add_signed(decalage), tid, en_cours_pi, true);
+    }
+}
+
+/// Le futex robuste à `adresse` : si le fil `tid` qui meurt le détient, il
+/// est marqué FUTEX_OWNER_DIED (en gardant FUTEX_WAITERS), par `lock
+/// cmpxchg`, et un fil qui l'attend est réveillé, par un réveil partagé
+/// (la glibc attend les mutex robustes en partagé). `en_cours` : l'élément
+/// que le fil prenait ou rendait ; s'il vaut 0, il l'avait rendu sans avoir
+/// encore réveillé personne : on le fait pour lui. Le `handle_futex_death`
+/// de Linux. Rend faux si le mot ne se lit pas (le parcours s'arrête).
+fn mort_du_detenteur(adresse: u64, tid: u32, pi: bool, en_cours: bool) -> bool {
+    if adresse % 4 != 0 {
+        return false;
+    }
+    loop {
+        let mut o = [0u8; 4];
+        if copier_depuis_utilisateur(&mut o, adresse).is_err() {
+            return false;
+        }
+        let mot = u32::from_le_bytes(o);
+        if en_cours && !pi && mot == 0 {
+            reveiller_partage(adresse, 1);
+            return true;
+        }
+        if mot & FUTEX_TID_MASK != tid {
+            return true;
+        }
+        let nouveau = (mot & FUTEX_WAITERS) | FUTEX_OWNER_DIED;
+        match copie_utilisateur::cmpxchg_u32(adresse, mot, nouveau) {
+            Err(_) => return false,
+            // Changé entre la lecture et l'échange : on recommence.
+            Ok(trouve) if trouve != mot => continue,
+            Ok(_) => {}
+        }
+        if !pi && mot & FUTEX_WAITERS != 0 {
+            reveiller_partage(adresse, 1);
+        }
+        return true;
     }
 }

@@ -210,7 +210,7 @@ adresses_talons:
 
 /// Ce que le code commun a empilé, dans l'ordre inverse des push.
 #[repr(C)]
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct Cadre {
     pub r15: u64, pub r14: u64, pub r13: u64, pub r12: u64,
     pub r11: u64, pub r10: u64, pub r9: u64, pub r8: u64,

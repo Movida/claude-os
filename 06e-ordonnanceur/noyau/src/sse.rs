@@ -154,6 +154,24 @@ impl ZoneFpu {
         Some(ZoneFpu { octets: p })
     }
 
+    /// Une zone qui reçoit l'état x87/SSE/AVX du processeur, celui de la
+    /// tâche courante : l'état d'un fil neuf, copié de son créateur (le
+    /// `fpu_clone` de Linux : un fil hérite de son mode d'arrondi, mesuré).
+    /// None : plus de mémoire.
+    pub fn du_processeur() -> Option<ZoneFpu> {
+        // SAFETY : comme `neuve`.
+        let p = NonNull::new(unsafe { alloc_zeroed(disposition()) })?;
+        let mut zone = ZoneFpu { octets: p };
+        let interruptions = crate::cpu::couper_interruptions();
+        // SAFETY : interruptions coupées, l'état du processeur est celui de
+        // la tâche courante ; la copie va dans une zone à nous.
+        unsafe { zone.sauver() };
+        if interruptions {
+            crate::cpu::activer_interruptions();
+        }
+        Some(zone)
+    }
+
     /// Sauve l'état x87/SSE/AVX du processeur dans la zone.
     ///
     /// # Safety

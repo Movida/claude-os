@@ -17,8 +17,8 @@
 //!      disparaître sous elle, comme dans le `filemap_read` de Linux.
 //!
 //! Pourquoi tenir : depuis 6e, une autre tâche peut s'exécuter entre deux
-//! sections (la préemption), et bientôt un autre fil du même programme,
-//! qui partage ses descripteurs et son dossier courant. Ce qu'un appel
+//! sections (la préemption), et un autre fil du même programme (clone,
+//! fil.rs), qui partage ses descripteurs et son dossier courant. Ce qu'un appel
 //! trouve sous un verrou et dont il se sert sous un autre doit donc être
 //! tenu entre les deux : sinon un `close`, un `chdir` ou un `rmdir` de
 //! l'autre fil le fait disparaître (le noyau s'arrête sur un fichier ouvert
@@ -720,13 +720,20 @@ pub fn close(fd: u64) -> i64 {
 /// close_range(premier, dernier, drapeaux) : ferme (ou marque « fermer à
 /// l'exec », CLOSE_RANGE_CLOEXEC) les descripteurs de [premier, dernier].
 /// Premier après dernier, ou un drapeau inconnu : EINVAL.
-/// CLOSE_RANGE_UNSHARE (ne plus partager la table, après un clone) : sans
-/// objet avec un seul fil.
+/// CLOSE_RANGE_UNSHARE (ne plus partager la table avec les autres fils,
+/// puis fermer dans sa copie : ce que fait un programme avant execve) : sans
+/// objet pour un processus d'un seul fil ; avec plusieurs, la table est au
+/// processus (processus.rs), un fil ne peut pas en avoir une à lui : EINVAL,
+/// avec un message (un écart, jusqu'à execve, 6k).
 pub fn close_range(premier: u64, dernier: u64, drapeaux: u64) -> i64 {
     const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
     const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
     let (premier, dernier) = (premier as u32 as u64, dernier as u32 as u64);
     if drapeaux & !(CLOSE_RANGE_UNSHARE | CLOSE_RANGE_CLOEXEC) != 0 || premier > dernier {
+        return -EINVAL;
+    }
+    if drapeaux & CLOSE_RANGE_UNSHARE != 0 && processus::avec(|p| p.fils.len() > 1) {
+        afficherln!("[noyau] close_range : CLOSE_RANGE_UNSHARE avec plusieurs fils pas pris en charge");
         return -EINVAL;
     }
     let ouverts: Vec<u64> = match processus::avec(|p| {

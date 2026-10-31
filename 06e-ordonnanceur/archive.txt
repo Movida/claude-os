@@ -26,6 +26,7 @@ file  /bin/arbre           linux/construits/arbre 755 0 0
 file  /bin/segments        linux/construits/segments 755 0 0
 file  /bin/signaux         linux/construits/signaux 755 0 0
 file  /bin/systeme         linux/construits/systeme 755 0 0
+file  /bin/clone           linux/construits/clone 755 0 0
 file  /bin/evenements      linux/construits/evenements 755 0 0
 file  /bin/proc            linux/construits/proc 755 0 0
 file  /bin/partage         linux/construits/partage 755 0 0

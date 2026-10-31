@@ -14,8 +14,9 @@
 //! (mesuré sur Linux 6.18) : Bun en règle quatorze dès son démarrage,
 //! avec une pile de secours. Et ce qui ne demande pas d'appeler un
 //! gestionnaire est appliqué : SIG_IGN, l'action par défaut (terminer,
-//! ignorer, arrêter), l'attente d'un signal bloqué, pour les signaux qu'un
-//! programme s'envoie (`kill`, `tkill`, `tgkill`) et pour SIGXCPU. Appeler
+//! ignorer, arrêter), l'attente d'un signal bloqué, pour les signaux
+//! qu'envoient les programmes (`kill`, `tkill`, `tgkill` : à eux-mêmes, et
+//! depuis 6e à un autre processus ou à un autre fil) et pour SIGXCPU. Appeler
 //! un gestionnaire (le cadre de signal, `rt_sigreturn`, SA_RESTART) vient
 //! en 6f : d'ici là, un signal qui devrait l'appeler arrête le programme,
 //! et le message le dit. Une faute d'un programme qui a un gestionnaire
@@ -169,6 +170,15 @@ pub struct SignauxDuFil {
     pile: PileDeSecours,
 }
 
+impl SignauxDuFil {
+    /// Ceux d'un fil neuf créé par ce fil (clone) : son masque, rien en
+    /// attente, pas de pile de secours (`copy_process` l'efface pour un fil
+    /// qui partage la mémoire sans vfork).
+    pub fn herite(&self) -> SignauxDuFil {
+        SignauxDuFil { bloques: self.bloques, ..SignauxDuFil::default() }
+    }
+}
+
 /// À qui un signal est envoyé : à un fil, ou au processus (le `PIDTYPE_PID`
 /// et le `PIDTYPE_TGID` de `send_signal_locked`).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -305,18 +315,34 @@ pub fn envoyer(p: &mut Processus, sig: u64, a: Destinataire) -> Option<Arc<Tache
 }
 
 /// Le fil qui prendra un signal envoyé au processus (le `complete_signal` de
-/// Linux) : le principal s'il ne le bloque pas, sinon le premier qui ne le
-/// bloque pas ; aucun s'ils le bloquent tous (il attendra qu'un fil le
-/// débloque, et le verra en revenant de rt_sigprocmask).
+/// Linux) : le principal s'il le veut, sinon le premier qui le veut ; le
+/// veut un fil qui ne le bloque pas et dont la fin n'est pas prévue (le
+/// `wants_signal` de Linux, qui écarte les fils PF_EXITING) ; aucun s'ils
+/// le bloquent tous (il attendra qu'un fil le débloque, et le verra en
+/// revenant de rt_sigprocmask).
 fn choisir_fil(p: &Processus, sig: u64) -> Option<Arc<Tache>> {
-    let libre = |f: &&fil::Fil| f.signaux.bloques & bit(sig) == 0;
-    let principal = p.fils.iter().find(|f| f.tid == p.pid).filter(libre);
-    principal.or_else(|| p.fils.iter().find(libre)).and_then(|f| f.tache.upgrade())
+    let veut = |f: &fil::Fil| {
+        (f.signaux.bloques & bit(sig) == 0).then(|| f.tache.upgrade()).flatten().filter(|t| !t.fin_prevue())
+    };
+    p.fils.iter().find(|f| f.tid == p.pid).and_then(veut).or_else(|| p.fils.iter().find_map(veut))
+}
+
+/// Les signaux de `ensemble`, envoyés au processus et en attente, que le
+/// fil qui devait les prendre ne prendra pas (il vient de les bloquer, ou
+/// il finit) : chacun est confié à un autre fil qui le veut, réveillé (le
+/// `retarget_shared_pending` de Linux). Sous le verrou du processus, comme
+/// chez Linux sous le `siglock`.
+pub fn reconfier(p: &Processus, ensemble: u64) {
+    let mut reste = ensemble & p.signaux.attente;
+    while reste != 0 {
+        let sig = reste.trailing_zeros() as u64 + 1;
+        reste &= !bit(sig);
+        reveiller(choisir_fil(p, sig));
+    }
 }
 
 /// Réveille le fil `t`, à qui un signal vient d'être envoyé, s'il dort
-/// interruptible (le `signal_wake_up` de Linux). Hors du verrou du
-/// processus.
+/// interruptible (le `signal_wake_up` de Linux).
 pub fn reveiller(t: Option<Arc<Tache>>) {
     if let Some(t) = t {
         tache::reveiller_par_signal(t);
@@ -425,7 +451,10 @@ const SIG_SETMASK: u64 = 2;
 /// nouvel ensemble, il est lu (EFAULT), sans SIGKILL ni SIGSTOP, puis
 /// `comment` est vérifié (EINVAL : seulement quand il y a un ensemble,
 /// mesuré) ; l'ancien écrit. Un signal en attente débloqué sera livré au
-/// retour vers l'anneau 3.
+/// retour vers l'anneau 3. Un signal du processus en attente que ce fil
+/// vient de bloquer est confié à un autre fil qui ne le bloque pas, réveillé
+/// (le `retarget_shared_pending` de Linux) : sinon il attendrait que ce fil
+/// le débloque, pendant qu'un autre aurait pu le prendre.
 pub fn rt_sigprocmask(comment: u64, ensemble: u64, ancien: u64, taille: u64) -> i64 {
     if taille != 8 {
         return -EINVAL;
@@ -438,21 +467,24 @@ pub fn rt_sigprocmask(comment: u64, ensemble: u64, ancien: u64, taille: u64) -> 
         }
         lu = Some(u64::from_le_bytes(octets) & !IMBLOQUABLES);
     }
-    let avant = fil::avec(|f| {
-        let s = &mut f.signaux;
-        let avant = s.bloques;
+    let tid = tache::courante().tid();
+    let r = processus::avec(|p| {
+        let f = &mut p.fil(tid).expect("appel systeme d'un fil qui a quitte son processus").signaux;
+        let avant = f.bloques;
         if let Some(e) = lu {
-            s.bloques = match comment as u32 as u64 {
+            f.bloques = match comment as u32 as u64 {
                 SIG_BLOCK => avant | e,
                 SIG_UNBLOCK => avant & !e,
                 SIG_SETMASK => e,
                 _ => return Err(-EINVAL),
             };
         }
+        let bloques = f.bloques & !avant;
+        reconfier(p, bloques);
         Ok(avant)
     });
-    let avant = match avant {
-        Ok(a) => a,
+    let avant = match r {
+        Ok(avant) => avant,
         Err(e) => return e,
     };
     if ancien != 0 && copier_vers_utilisateur(ancien, &avant.to_le_bytes()).is_err() {
@@ -570,8 +602,8 @@ fn envoyer_a(pid: u32, sig: u64, a: Destinataire) -> i64 {
     0
 }
 
-/// kill(pid, signal), comme `kill_something_info` : pid > 0, un processus
-/// (ESRCH s'il n'existe pas) ; 0, notre groupe de processus ; -1, tous les
+/// kill(pid, signal), comme `kill_something_info` : pid > 0, un processus,
+/// ou le processus du fil de ce numéro (ESRCH si aucun n'existe) ; 0, notre groupe de processus ; -1, tous les
 /// processus sauf l'init et soi-même (0 si au moins un l'a reçu, ESRCH
 /// s'il n'y en a aucun) ; < -1, le groupe -pid. Chaque programme mène son
 /// propre groupe (son numéro est celui du processus), comme une commande
@@ -600,6 +632,13 @@ pub fn kill(pid: u64, sig: u64) -> i64 {
             r
         }
         i32::MIN => -ESRCH,
+        // Un numéro de fil (pas celui d'un processus) : son processus, comme
+        // Linux (`kill_proc_info` trouve la tâche du fil, puis envoie à son
+        // groupe).
+        p if p > 0 && !processus::existe(p as u32) => match tache::processus_du_fil(p as u32) {
+            Some(pid) => envoyer_a(pid, sig, Destinataire::Processus),
+            None => -ESRCH,
+        },
         p => envoyer_a(p.unsigned_abs(), sig, Destinataire::Processus),
     }
 }

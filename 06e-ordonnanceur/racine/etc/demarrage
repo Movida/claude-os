@@ -50,6 +50,8 @@ wait
 /bin/ajout ecrire b 300 &
 /bin/ajout verifier 300
 wait
+# clone et clone3 (6e) : les refus de Linux, puis un fil par l'appel brut.
+/bin/clone
 # Et le jalon de 6d : le vrai Claude Code, en dernier (ce qui précède a déjà
 # dit si le noyau va bien).
 /usr/local/bin/claude --version

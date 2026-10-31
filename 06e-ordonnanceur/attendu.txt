@@ -36,8 +36,8 @@ memoire rendue : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 34, liens symboliques 5, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 30 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 35, liens symboliques 5, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 31 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -128,6 +128,8 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] ajout b : 300 lignes ecrites : ok
 [linux] ajout : 300 lignes de chacun, entieres et dans l'ordre : ok
 [noyau] Programmes en parallele : memoire rendue : ok.
+[linux] clone : toutes les verifications : ok
+[noyau] clone : termine, code de sortie 0 ; memoire rendue : ok.
 [noyau] claude : programme Linux (ELF ET_EXEC), 291638640 octets, point d'entree 0x1be7900, segments :
 2.1.310 (Claude Code)
 [noyau] claude : termine, code de sortie 0 ; memoire rendue : ok.

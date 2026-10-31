@@ -90,6 +90,7 @@ pub fn numero_neuf() -> u32 {
 pub const LIMITES: usize = 16;
 pub const RLIMIT_CPU: usize = 0;
 pub const RLIMIT_STACK: usize = 3;
+pub const RLIMIT_NPROC: usize = 6;
 pub const RLIMIT_NOFILE: usize = 7;
 /// RLIM_INFINITY.
 pub const INFINI: u64 = u64::MAX;
@@ -100,13 +101,15 @@ pub const INFINI: u64 = u64::MAX;
 /// PILE_MAX), pas de fichier « core », 8 Mio de mémoire verrouillable, 800
 /// Kio de files de messages, 1024 descripteurs (4096 au plus), infini pour
 /// le reste. NPROC et SIGPENDING : Linux les tire de la mémoire (la moitié
-/// de max_threads) ; sans fils ni signaux (6e, 6f), infini.
+/// de max_threads) ; infini ici, max_threads borne déjà les fils (6e), et
+/// les signaux n'ont pas encore de file (6f).
 ///
-/// Seules celles des descripteurs et du temps de calcul (RLIMIT_CPU, infini
-/// par défaut comme chez Linux : voir tache::verifier_au_retour) sont
-/// appliquées ; les autres sont rendues telles qu'on les a posées, comme le
-/// demandent les programmes qui les baissent par prudence (pas de « core »,
-/// une pile plus petite). Les appliquer viendra avec ce qu'elles limitent.
+/// Seules celles des descripteurs, du temps de calcul (RLIMIT_CPU, infini
+/// par défaut comme chez Linux : voir tache::verifier_au_retour) et du
+/// nombre de tâches (RLIMIT_NPROC, tache::lancer_fil) sont appliquées ;
+/// les autres sont rendues telles qu'on les a posées, comme le demandent
+/// les programmes qui les baissent par prudence (pas de « core », une pile
+/// plus petite). Les appliquer viendra avec ce qu'elles limitent.
 pub const LIMITES_PAR_DEFAUT: [(u64, u64); LIMITES] = {
     let mut l = [(INFINI, INFINI); LIMITES];
     l[RLIMIT_STACK] = (8 << 20, INFINI);
@@ -125,10 +128,24 @@ impl Processus {
         self.fils.iter_mut().find(|f| f.tid == tid)
     }
 
-    /// La fin du groupe commence (exit_group, un signal mortel), avec ce
-    /// code, si elle n'a pas déjà commencé.
-    pub fn finir_le_groupe(&mut self, code: i32) {
-        self.fin_de_groupe.get_or_insert(code);
+    /// La fin du groupe commence (exit_group, une faute, un signal mortel),
+    /// demandée par le fil `appelant`, avec ce code, si elle n'a pas déjà
+    /// commencé (le `do_group_exit` de Linux) : les autres fils sont
+    /// arrêtés (le `zap_other_threads`). Rend le code du groupe : le premier
+    /// l'emporte.
+    pub fn finir_le_groupe(&mut self, code: i32, appelant: u32) -> i32 {
+        if let Some(c) = self.fin_de_groupe {
+            return c;
+        }
+        self.fin_de_groupe = Some(code);
+        for f in &self.fils {
+            if f.tid != appelant
+                && let Some(t) = f.tache.upgrade()
+            {
+                crate::tache::arreter_avec_le_groupe(t, code);
+            }
+        }
+        code
     }
 
     /// La limite `ressource` (sous LIMITES).
@@ -217,6 +234,9 @@ impl Entree {
             let Some(p) = garde.as_mut() else { return };
             p.fils.retain(|f| f.tid != tid);
             if !p.fils.is_empty() {
+                // Les signaux du processus qui l'attendaient vont à un
+                // autre fil (`exit_signals` de Linux).
+                crate::signaux::reconfier(p, u64::MAX);
                 return;
             }
             self.code.store(p.fin_de_groupe.unwrap_or(code), Ordering::Relaxed);
@@ -247,9 +267,8 @@ impl Entree {
         self.code.load(Ordering::Relaxed)
     }
 
-    /// Le fil de la tâche `t` rejoint le processus (son fil principal, ou
-    /// un fil créé par clone) : ENOMEM si la liste ne peut pas grandir, ou
-    /// si le processus n'est plus (EINTR pour clone, viendra avec lui).
+    /// Le fil principal, de la tâche `t`, rejoint son processus neuf : Err
+    /// si la liste ne peut pas grandir.
     pub fn attacher(&self, t: &Arc<Tache>) -> Result<(), ()> {
         let mut garde = self.processus.verrouiller();
         let p = garde.as_mut().ok_or(())?;
@@ -257,6 +276,31 @@ impl Entree {
         p.fils.push(Fil::de(t));
         self.vivants.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Le fil neuf de la tâche `t`, créé par le fil `createur` (clone),
+    /// rejoint le processus, avec le masque de signaux de son créateur ;
+    /// sous le verrou du processus, sauf si la fin du groupe a commencé ou
+    /// celle du créateur est prévue (un SIGKILL en attente : le
+    /// `fatal_signal_pending` de `copy_process`) : Interrompu.
+    pub fn attacher_fil(&self, t: &Arc<Tache>, createur: &Tache) -> Result<(), RefusFil> {
+        let mut garde = self.processus.verrouiller();
+        let p = garde.as_mut().ok_or(RefusFil::Interrompu)?;
+        if p.fin_de_groupe.is_some() || createur.fin_prevue() {
+            return Err(RefusFil::Interrompu);
+        }
+        let masque = p.fil(createur.tid()).map(|f| f.signaux.herite()).unwrap_or_default();
+        p.fils.try_reserve(1).map_err(|_| RefusFil::PlusDeMemoire)?;
+        let mut fil = Fil::de(t);
+        fil.signaux = masque;
+        p.fils.push(fil);
+        self.vivants.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Le processus a-t-il d'autres fils vivants que `tid` ?
+    pub fn a_d_autres_fils(&self, tid: u32) -> bool {
+        self.processus.verrouiller().as_ref().is_some_and(|p| p.fils.iter().any(|f| f.tid != tid))
     }
 
     /// Ajoute `ns` nanosecondes au temps de calcul du processus.
@@ -268,6 +312,14 @@ impl Entree {
     pub fn temps_de_calcul(&self) -> u64 {
         self.calcul.load(Ordering::Relaxed)
     }
+}
+
+/// Pourquoi un fil ne peut pas rejoindre son processus (clone).
+pub enum RefusFil {
+    /// La fin du groupe, ou celle du créateur, a commencé (EINTR).
+    Interrompu,
+    /// Plus de mémoire pour la liste des fils (ENOMEM).
+    PlusDeMemoire,
 }
 
 static TABLE: Verrou<Vec<Arc<Entree>>> = Verrou::new(Vec::new());

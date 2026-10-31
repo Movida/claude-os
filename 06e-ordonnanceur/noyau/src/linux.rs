@@ -20,7 +20,8 @@
 //! signaux.rs : rt_sigaction, rt_sigprocmask, rt_sigpending, sigaltstack,
 //! kill, tkill, tgkill ; et ce que `claude --version` demande encore (6d) :
 //! futex (futex.rs), uname, sched_getaffinity, sched_yield, prctl ;
-//! eventfd et epoll (evenements.rs).
+//! eventfd et epoll (evenements.rs) ; et les fils (6e) : clone et clone3
+//! (fil.rs), gettid, exit (un fil) et exit_group (le groupe).
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -162,6 +163,8 @@ const TKILL: u64 = 200;
 const TGKILL: u64 = 234;
 const GETRANDOM: u64 = 318;
 const RSEQ: u64 = 334;
+const CLONE: u64 = 56;
+const CLONE3: u64 = 435;
 
 const PAGE: u64 = 4096;
 
@@ -176,9 +179,12 @@ fn tid() -> i64 {
     tache::courante().tid() as i64
 }
 
-/// Exécute l'appel système `numero` : un résultat, ou -errno.
-pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
+/// Exécute l'appel système `numero` : un résultat, ou -errno. `cadre` :
+/// les registres du programme à l'appel (clone les copie pour le fil neuf).
+pub fn appel(numero: u64, a: [u64; 6], cadre: &Cadre) -> i64 {
     let resultat = match numero {
+        CLONE => crate::fil::clone(a[0], a[1], a[2], a[3], a[4], cadre),
+        CLONE3 => crate::fil::clone3(a[0], a[1], cadre),
         READ => f::read(a[0], a[1], a[2]),
         WRITE => f::write(a[0], a[1], a[2]),
         OPEN => f::open(a[0], a[1], a[2]),
@@ -215,12 +221,19 @@ pub fn appel(numero: u64, a: [u64; 6]) -> i64 {
         MADVISE => madvise(a[0], a[1], a[2]),
         ARCH_PRCTL => arch_prctl(a[0], a[1]),
         // L'adresse où effacer le numéro du fil quand il se termine (pour
-        // pthread_join) : sans fils, rien à faire ; on rend le numéro du fil.
-        SET_TID_ADDRESS => tid(),
-        // La liste des verrous « robustes » du fil (relâchés s'il meurt en
-        // les tenant) : sans fils, rien à faire. La taille de la tête de
-        // liste est fixée par l'ABI (24 octets) ; Linux refuse les autres.
-        SET_ROBUST_LIST => if a[1] == 24 { 0 } else { -EINVAL },
+        // pthread_join, tache.rs) ; rend le numéro du fil.
+        SET_TID_ADDRESS => tache::effacer_tid_a(a[0]) as i64,
+        // La liste des verrous « robustes » du fil (rendus s'il meurt en
+        // les tenant, futex.rs). La taille de la tête de liste est fixée
+        // par l'ABI (24 octets) ; Linux refuse les autres.
+        SET_ROBUST_LIST => {
+            if a[1] != 24 {
+                -EINVAL
+            } else {
+                tache::liste_robuste(a[0]);
+                0
+            }
+        }
         // Les « séquences redémarrables » : une optimisation des compteurs
         // par processeur. La glibc s'en passe si le noyau ne l'a pas.
         RSEQ => -ENOSYS,
@@ -363,6 +376,8 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         MPROTECT => ("mprotect", 3),
         MADVISE => ("madvise", 3),
         ARCH_PRCTL => ("arch_prctl", 2),
+        CLONE => ("clone", 5),
+        CLONE3 => ("clone3", 2),
         SET_TID_ADDRESS => ("set_tid_address", 1),
         SET_ROBUST_LIST => ("set_robust_list", 2),
         RSEQ => ("rseq", 4),
@@ -992,7 +1007,8 @@ const MASQUE_PROCESSEURS: u64 = 8;
 /// programme peut tourner. Un seul processeur, le 0 (pas de multiprocesseur
 /// dans l'étape 6). Dans l'ordre de Linux : la longueur d'abord (au moins
 /// le masque du noyau, et un multiple de 8 : EINVAL, avant même de chercher
-/// le processus), puis le processus (0 ou le nôtre, sinon ESRCH) ; on écrit
+/// le processus), puis le fil (0 : le courant ; tout processus qui existe,
+/// zombie compris, ou tout fil vivant ; sinon ESRCH) ; on écrit
 /// au plus le masque du noyau, et on rend sa taille (mesuré : 8 sur une
 /// machine de 12 processeurs, autant que pour un).
 fn sched_getaffinity(pid: u64, longueur: u64, masque: u64) -> i64 {
@@ -1000,10 +1016,11 @@ fn sched_getaffinity(pid: u64, longueur: u64, masque: u64) -> i64 {
     if longueur < MASQUE_PROCESSEURS || longueur % 8 != 0 {
         return -EINVAL;
     }
-    // Tout processus qui existe : un seul processeur, le même masque pour
-    // tous.
+    // Tout processus qui existe, ou tout fil vivant (le numéro est celui
+    // d'une tâche : sched_getaffinity vise un fil) : un seul processeur, le
+    // même masque pour tous.
     let pid = pid as u32 as i32;
-    if pid != 0 && (pid < 0 || !processus::existe(pid as u32)) {
+    if pid != 0 && (pid < 0 || (!processus::existe(pid as u32) && tache::processus_du_fil(pid as u32).is_none())) {
         return -ESRCH;
     }
     match copier_vers_utilisateur(masque, &1u64.to_le_bytes()) {
@@ -1097,7 +1114,7 @@ fn sysinfo(info: u64) -> i64 {
     mettre(0, temps::monotone().secondes as u64, 8); // uptime, en secondes
     mettre(32, pages::total() as u64 * PAGE, 8); // totalram
     mettre(40, pages::libres() as u64 * PAGE, 8); // freeram
-    mettre(80, 1, 2); // procs : un seul processus
+    mettre(80, tache::nombre().min(u16::MAX as usize) as u64, 2); // procs : les tâches (nr_threads)
     mettre(104, 1, 4); // mem_unit
     match copier_vers_utilisateur(info, &s) {
         Ok(()) => 0,

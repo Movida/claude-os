@@ -95,12 +95,14 @@ basculer:
     pop rbp
     ret
 
-    /* Le premier départ d'un programme : la fin de bascule, puis les bases
-       de GS à 0 (MSR GS_BASE et KERNEL_GS_BASE), pour qu'un programme ne
-       trouve rien d'un précédent (les sélecteurs, la base de FS et l'état
-       x87/SSE, eux, sont ceux de sa tâche, rétablis par basculer_vers).
-       Puis le retour d'interruption : iretq vers le cadre préparé par
-       executer(). */
+    /* Le premier départ d'un fil de programme : la fin de bascule, puis les
+       bases de GS à 0 (MSR GS_BASE et KERNEL_GS_BASE), pour qu'un programme
+       ne trouve rien d'un précédent (les sélecteurs, la base de FS et l'état
+       x87/SSE, eux, sont ceux de sa tâche, rétablis par basculer_vers ; un
+       programme ne peut pas changer la base de GS, arch_prctl la refuse).
+       Puis `debut_de_fil`, la sortie ordinaire vers l'anneau 3 (le
+       `ret_from_fork` de Linux), et le retour d'interruption : iretq vers
+       le cadre préparé par executer() ou par clone. */
     .global premier_depart
 premier_depart:
     call fin_de_bascule
@@ -110,6 +112,7 @@ premier_depart:
     wrmsr
     mov ecx, 0xC0000102
     wrmsr
+    call debut_de_fil
     jmp retour_interruption
 
     /* Le premier départ d'une tâche du noyau : la fin de bascule, puis sa
@@ -185,6 +188,16 @@ pub struct Tache {
     programme: Option<UnsafeCell<EtatProgramme>>,
     /// Elle s'est terminée : sa pile est à rendre.
     morte: AtomicBool,
+    /// Pour un fil créé avec CLONE_CHILD_SETTID : l'adresse où il écrit son
+    /// numéro à son premier départ (le `set_child_tid` de Linux), 0 sinon.
+    ecrire_tid: AtomicU64,
+    /// L'adresse où effacer son numéro à sa fin, puis réveiller qui y attend
+    /// (CLONE_CHILD_CLEARTID, set_tid_address : le `clear_child_tid` de
+    /// Linux, ce qu'attend `pthread_join`), 0 sinon.
+    effacer_tid: AtomicU64,
+    /// La tête de sa liste de verrous robustes (set_robust_list), 0 sinon
+    /// (futex.rs).
+    liste_robuste: AtomicU64,
     /// Son code de sortie, posé par `terminer`.
     code_sortie: AtomicI32,
     /// Son temps de calcul, en nanosecondes : compté par l'ordonnanceur à
@@ -237,6 +250,32 @@ struct EtatProgramme {
     base_fs: u64,
 }
 
+impl EtatProgramme {
+    /// Celui d'un programme qui commence : l'état x87/SSE initial, des
+    /// sélecteurs et une base de FS nuls. None : plus de mémoire.
+    fn initial() -> Option<EtatProgramme> {
+        // SAFETY : l'image de l'état initial, une constante.
+        let fpu = crate::sse::ZoneFpu::neuve(unsafe { &etat_fpu_initial.0 })?;
+        Some(EtatProgramme { fpu, selecteurs: [0; 4], base_fs: 0 })
+    }
+
+    /// Celui d'un fil neuf : une copie de celui de la tâche courante, son
+    /// créateur (son état x87/SSE, ses sélecteurs), avec la base de FS
+    /// `base_fs` (CLONE_SETTLS), ou la sienne (le `copy_thread` de Linux).
+    fn herite(base_fs: Option<u64>) -> Option<EtatProgramme> {
+        let fpu = crate::sse::ZoneFpu::du_processeur()?;
+        let mut selecteurs = [0u16; 4];
+        // SAFETY : lire les sélecteurs de segments ne change rien ; ceux
+        // de l'anneau 3, que le noyau ne touche pas.
+        unsafe {
+            asm!("mov {0:x}, ds", "mov {1:x}, es", "mov {2:x}, fs", "mov {3:x}, gs",
+                 out(reg) selecteurs[0], out(reg) selecteurs[1], out(reg) selecteurs[2], out(reg) selecteurs[3],
+                 options(nomem, nostack, preserves_flags));
+        }
+        Some(EtatProgramme { fpu, selecteurs, base_fs: base_fs.unwrap_or_else(cpu::lire_base_fs) })
+    }
+}
+
 // SAFETY : les champs dans des UnsafeCell (`contexte`, `programme`) ne sont
 // lus et écrits que par `basculer_vers`, interruptions coupées, sur notre
 // seul processeur ; `lien_attente`, que sous le verrou de la file d'attente
@@ -249,18 +288,12 @@ impl Tache {
     /// des tâches (`demarrer`) : jetée avant, elle rend sa pile. None : plus
     /// de mémoire, ou plus de place pour une pile (le maximum de fils). Une
     /// tâche du noyau attend sa créatrice (`attendant`), un fil de programme
-    /// a le numéro `tid`.
-    fn creer(nom: NomCourt, espace: u64, programme: bool, processus: Option<Arc<crate::processus::Entree>>, tid: u32)
-        -> Option<Arc<Tache>> {
+    /// a le numéro `tid` et l'état `programme`.
+    fn creer(nom: NomCourt, espace: u64, programme: Option<EtatProgramme>, processus: Option<Arc<crate::processus::Entree>>,
+             tid: u32) -> Option<Arc<Tache>> {
         let pile = Pile::allouer()?;
         let haut = pile.haut();
-        let programme = if programme {
-            // SAFETY : l'image de l'état initial, une constante.
-            let fpu = crate::sse::ZoneFpu::neuve(unsafe { &etat_fpu_initial.0 })?;
-            Some(UnsafeCell::new(EtatProgramme { fpu, selecteurs: [0; 4], base_fs: 0 }))
-        } else {
-            None
-        };
+        let programme = programme.map(UnsafeCell::new);
         let noyau = processus.is_none();
         let t = Arc::new(Tache {
             tid,
@@ -272,6 +305,9 @@ impl Tache {
             processus,
             programme,
             morte: AtomicBool::new(false),
+            ecrire_tid: AtomicU64::new(0),
+            effacer_tid: AtomicU64::new(0),
+            liste_robuste: AtomicU64::new(0),
             code_sortie: AtomicI32::new(0),
             calcul: AtomicU64::new(0),
             lag: AtomicI64::new(0),
@@ -293,6 +329,12 @@ impl Tache {
     /// Son numéro de fil (0 : une tâche du noyau).
     pub fn tid(&self) -> u32 {
         self.tid
+    }
+
+    /// Sa fin est-elle prévue (exit, une faute, SIGKILL, la fin de son
+    /// groupe) ? Un clone en cours rend alors EINTR (fil.rs).
+    pub fn fin_prevue(&self) -> bool {
+        self.fin.verrouiller().is_some()
     }
 
     /// Prépare la pile pour un premier départ : six registres pour
@@ -420,7 +462,8 @@ impl Tache {
 /// La tâche courante.
 static COURANTE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
 /// Toutes les tâches vivantes, sauf l'inactive (pour le détecteur
-/// d'interblocage, attente.rs ; bientôt /proc et les signaux). Réservée au
+/// d'interblocage, attente.rs ; pour trouver un fil par son numéro :
+/// tkill, /proc, sched_getaffinity ; RLIMIT_NPROC, sysinfo). Réservée au
 /// démarrage pour autant de tâches que de piles : elle ne grandit jamais
 /// pendant un programme.
 static TOUTES: Verrou<Vec<Arc<Tache>>> = Verrou::new(Vec::new());
@@ -446,6 +489,9 @@ pub fn initialiser() {
         processus: None,
         programme: None,
         morte: AtomicBool::new(false),
+        ecrire_tid: AtomicU64::new(0),
+        effacer_tid: AtomicU64::new(0),
+        liste_robuste: AtomicU64::new(0),
         code_sortie: AtomicI32::new(0),
         calcul: AtomicU64::new(0),
         lag: AtomicI64::new(0),
@@ -678,7 +724,7 @@ fn demarrer(t: &Arc<Tache>) {
 pub fn lancer_programme(nom: NomCourt, processus: Arc<crate::processus::Entree>, pml4: u64, entree: u64, pile: u64)
     -> Option<Arc<Tache>> {
     let tid = processus.pid();
-    let t = Tache::creer(nom, pml4, true, Some(processus.clone()), tid)?;
+    let t = Tache::creer(nom, pml4, Some(EtatProgramme::initial()?), Some(processus.clone()), tid)?;
     processus.attacher(&t).ok()?;
     t.preparer(premier_depart, 0, Some(Cadre {
         r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
@@ -695,13 +741,135 @@ pub fn lancer_programme(nom: NomCourt, processus: Arc<crate::processus::Entree>,
     Some(t)
 }
 
+/// Ce qu'il faut pour lancer un fil neuf du processus courant (clone,
+/// fil.rs) : son cadre de départ (une copie de celui de l'appel de son
+/// créateur, déjà ajustée), sa base de FS (CLONE_SETTLS, sinon celle du
+/// créateur), et les adresses de CLONE_CHILD_SETTID, CLONE_CHILD_CLEARTID et
+/// CLONE_PARENT_SETTID (0 : sans).
+pub struct NouveauFil {
+    pub cadre: Cadre,
+    pub tls: Option<u64>,
+    pub ecrire_tid: u64,
+    pub effacer_tid: u64,
+    pub parent_tid: u64,
+}
+
+/// Lance un fil neuf du processus de la tâche courante, dans l'ordre du
+/// `copy_process` puis du `kernel_clone` de Linux : la copie de l'état du
+/// créateur (ENOMEM), une pile noyau (EAGAIN : le maximum de fils,
+/// max_threads), sa place dans le processus, sous son verrou, à condition
+/// que le créateur ne soit pas en train de finir (EINTR, tout est défait :
+/// « Let kill terminate clone/fork in the middle ») ; puis son numéro écrit
+/// à CLONE_PARENT_SETTID AVANT qu'il soit prêt (un fil qui finirait aussitôt
+/// effacerait sinon son numéro avant que son créateur ne l'écrive, et
+/// `pthread_join` attendrait pour toujours ; une faute est ignorée, comme
+/// chez Linux) ; enfin il est prêt. Rend son numéro.
+pub fn lancer_fil(n: NouveauFil) -> Result<u32, i64> {
+    const ENOMEM: i64 = 12;
+    const EAGAIN: i64 = 11;
+    const EINTR: i64 = 4;
+    let createur = courante();
+    let processus = createur.processus.clone().expect("clone sans processus");
+    let etat = EtatProgramme::herite(n.tls).ok_or(-ENOMEM)?;
+    // RLIMIT_NPROC : les tâches de l'utilisateur, fils compris (tous nos
+    // programmes sont au même) ; infinie par défaut.
+    let (limite, _) = processus::avec(|p| p.limite(processus::RLIMIT_NPROC));
+    if limite != processus::INFINI {
+        let mut n = 0u64;
+        pour_chaque(|t| n += t.processus.is_some() as u64);
+        if n >= limite {
+            return Err(-EAGAIN);
+        }
+    }
+    let tid = processus::numero_neuf();
+    let espace = createur.espace.load(Ordering::Relaxed);
+    let t = Tache::creer(createur.nom(), espace, Some(etat), Some(processus.clone()), tid).ok_or(-EAGAIN)?;
+    t.ecrire_tid.store(n.ecrire_tid, Ordering::Relaxed);
+    t.effacer_tid.store(n.effacer_tid, Ordering::Relaxed);
+    t.preparer(premier_depart, 0, Some(n.cadre));
+    processus.attacher_fil(&t, createur).map_err(|r| match r {
+        processus::RefusFil::Interrompu => -EINTR,
+        processus::RefusFil::PlusDeMemoire => -ENOMEM,
+    })?;
+    if n.parent_tid != 0 {
+        let _ = crate::copie_utilisateur::copier_vers_utilisateur(n.parent_tid, &tid.to_le_bytes());
+    }
+    demarrer(&t);
+    Ok(tid)
+}
+
+/// Le premier départ d'un fil de programme, avant l'anneau 3 (le
+/// `schedule_tail` et le `ret_from_fork` de Linux), interruptions coupées :
+/// son numéro écrit à CLONE_CHILD_SETTID, par lui-même (une faute est
+/// ignorée), puis la sortie ordinaire vers l'anneau 3 : un fil créé pendant
+/// que son groupe commençait à finir s'arrête là, sans exécuter une
+/// instruction du programme. Revient interruptions coupées.
+#[unsafe(no_mangle)]
+extern "C" fn debut_de_fil() {
+    let t = courante();
+    let adresse = t.ecrire_tid.swap(0, Ordering::Relaxed);
+    if adresse != 0 {
+        cpu::activer_interruptions();
+        let _ = crate::copie_utilisateur::copier_vers_utilisateur(adresse, &t.tid.to_le_bytes());
+    }
+    verifier_au_retour();
+}
+
+/// set_tid_address(adresse) : l'adresse où effacer le numéro du fil courant
+/// à sa fin (le `clear_child_tid` de Linux). Rend son numéro.
+pub fn effacer_tid_a(adresse: u64) -> u32 {
+    let t = courante();
+    t.effacer_tid.store(adresse, Ordering::Relaxed);
+    t.tid
+}
+
+/// set_robust_list(tête) : la liste des verrous robustes du fil courant.
+pub fn liste_robuste(tete: u64) {
+    courante().liste_robuste.store(tete, Ordering::Relaxed);
+}
+
+/// La fin d'un fil, côté programme, avant qu'il ne quitte son processus
+/// (le `mm_release` de Linux) : ses verrous robustes rendus (futex.rs), puis
+/// son numéro effacé à CLONE_CHILD_CLEARTID et un réveil partagé à cette
+/// adresse, ce qu'attend `pthread_join` ; seulement s'il reste d'autres fils
+/// pour le voir (Linux regarde `mm_users`). Plus aucun accès à la mémoire du
+/// programme ensuite : `pthread_join` peut déjà avoir rendu la pile du fil.
+fn liberer_le_fil(t: &Tache, p: &crate::processus::Entree) {
+    let tete = t.liste_robuste.swap(0, Ordering::Relaxed);
+    if tete != 0 {
+        crate::futex::rendre_liste_robuste(tete, t.tid);
+    }
+    let adresse = t.effacer_tid.swap(0, Ordering::Relaxed);
+    if adresse != 0 && p.a_d_autres_fils(t.tid) {
+        let _ = crate::copie_utilisateur::copier_vers_utilisateur(adresse, &0u32.to_le_bytes());
+        crate::futex::reveiller_partage(adresse, 1);
+    }
+}
+
+/// Arrête le fil `t` avec son groupe (exit_group, une faute, un signal
+/// mortel d'un autre fil : le `zap_other_threads` de Linux, qui lui envoie
+/// SIGKILL) : il finira sans un mot, avec le code du groupe, à son retour
+/// vers l'anneau 3, réveillé s'il dort interruptible (son appel rend
+/// EINTR). Sous le verrou de son processus.
+pub fn arreter_avec_le_groupe(t: Arc<Tache>, code: i32) {
+    *t.fin.verrouiller() = Some(Fin::Sortie(code));
+    if t.interruptible.load(Ordering::Relaxed) {
+        reveiller(t, Reveil::Signal);
+    }
+}
+
+/// Le nombre de tâches (sysinfo : `procs`, le `nr_threads` de Linux).
+pub fn nombre() -> usize {
+    TOUTES.verrouiller().len() + 1
+}
+
 /// La fonction d'une tâche du noyau.
 type FonctionNoyau = Box<dyn FnOnce() + Send>;
 
 /// Lance `f` dans une tâche du noyau nommée `nom`, prête aussitôt ; None :
 /// pas de pile pour la tâche.
 pub fn lancer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> Option<Arc<Tache>> {
-    let t = Tache::creer(nom, pagination::pml4_noyau(), false, None, 0)?;
+    let t = Tache::creer(nom, pagination::pml4_noyau(), None, None, 0)?;
     // Un pointeur simple vers la fermeture, pour r12 : une boîte de boîte.
     let f: Box<FonctionNoyau> = Box::new(Box::new(f));
     t.preparer(depart_noyau, Box::into_raw(f) as u64, None);
@@ -730,7 +898,8 @@ pub fn terminer(code: i32) -> ! {
     let t = courante();
     t.code_sortie.store(code, Ordering::Relaxed);
     if let Some(p) = &t.processus {
-        // La tâche passe d'abord sur l'espace du noyau, interruptions
+        liberer_le_fil(t, p);
+        // La tâche passe ensuite sur l'espace du noyau, interruptions
         // coupées : si elle est préemptée pendant qu'elle rend celui du
         // programme (long, et préemptible), la bascule qui la reprendra
         // chargera la PML4 du noyau, jamais des tables qu'on détruit.
@@ -764,15 +933,16 @@ pub fn terminer(code: i32) -> ! {
 }
 
 /// Arrête le programme en cours par le signal `signal` (une exception, sa
-/// limite de temps de calcul, un signal qu'il s'est envoyé), en disant
-/// pourquoi : le message de Linux dans son journal, puis le code de sortie
+/// limite de temps de calcul, un signal envoyé par lui ou par un autre),
+/// en disant pourquoi : le message de Linux dans son journal, puis le code de sortie
 /// 128 + signal, pour tout le groupe (un signal mortel arrête le processus,
 /// le `do_group_exit` de `get_signal`). Seulement au retour vers l'anneau 3
 /// (`verifier_au_retour`).
 fn mourir(signal: Signal, raison: impl fmt::Display) -> ! {
     afficherln!("[noyau] {} : {} ({})", courante().nom(), raison, signal.nom);
     let code = 128 + signal.numero as i32;
-    processus::essayer_avec(|p| p.finir_le_groupe(code));
+    let tid = courante().tid;
+    let code = processus::essayer_avec(|p| p.finir_le_groupe(code, tid)).unwrap_or(code);
     terminer(code)
 }
 
@@ -831,7 +1001,8 @@ pub fn prevoir_sortie(code: i32) {
 /// déjà commencé : son code l'emporte, comme le `do_group_exit` de Linux),
 /// puis celle du fil, au retour vers l'anneau 3.
 pub fn prevoir_sortie_du_groupe(code: i32) {
-    let code = processus::avec(|p| *p.fin_de_groupe.get_or_insert(code));
+    let tid = courante().tid;
+    let code = processus::avec(|p| p.finir_le_groupe(code, tid));
     prevoir_sortie(code);
 }
 
@@ -915,7 +1086,7 @@ pub fn tuer_au_retour() {
 ///   2. tué faute de mémoire pendant une copie du noyau ;
 ///   3. RLIMIT_CPU, dans l'ordre de Linux (voir plus bas) ;
 ///   4. les signaux en attente et non bloqués (le `get_signal` de Linux) :
-///      ceux que le programme s'est envoyés, et SIGXCPU.
+///      ceux qu'envoient les programmes (kill, tkill, tgkill), et SIGXCPU.
 /// La décision est prise interruptions coupées, et la fonction revient
 /// interruptions coupées quand il n'y a rien à faire : rien ne peut plus
 /// arriver entre la dernière vérification et le retour (sysretq ou iretq
