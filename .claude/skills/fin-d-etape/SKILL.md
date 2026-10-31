@@ -343,3 +343,29 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
 - **Attendre une ligne plutôt qu'un délai fixe** pour un QEMU qui ne
   s'éteint pas (`attendre` dans le Makefile de 6d) : plus rapide sur une
   machine tranquille, et plus sûr sur une machine chargée.
+
+## Pièges rencontrés en 6e (31 octobre 2026)
+
+- **La signature peut tomber en panne pour des jours** : quand l'agent de
+  1Password ne signe plus dans le conteneur, garder chaque commit en patch
+  (`git diff` contre un index temporaire, `GIT_INDEX_FILE`, plus le message)
+  dans `.git/attente-signature/` ; David les crée depuis WSL, dans l'ordre
+  (`git apply --cached cNN.patch && git commit -F cNN.txt`). Ne jamais
+  commiter sans signature.
+- **Le `.git` est partagé avec WSL** : un `git pull --rebase` de David
+  pendant le travail réécrit la branche sous nos pieds (vu : origin/main
+  avait reçu une PR). Avant un repli, lui demander de ne plus toucher à la
+  branche, et repartir de `origin/main` tel qu'il est alors.
+- **Un test de concurrence doit mordre** : le vérifier par une mutation
+  (retirer ce qu'il protège). Sous QEMU sans accélération, une fenêtre
+  d'interruptions de quelques instructions ne laisse presque jamais passer
+  la préemption : un test qui compte sur elle ne prouve rien (« lignes ») ;
+  un test qui garde ouvertes les poignées en jeu, et les change d'un coup
+  (dup2), mord (« courses »).
+- **« memoire rendue » faux par moments** : chercher ce qui est rendu en
+  retard (l'écart s'affiche, en pages : -N puis +N au programme suivant),
+  pas une fuite. En 6e : un processus devenu zombie avant que la pile d'un
+  de ses fils ne soit rendue.
+- **Un échec isolé de `verifier-historique.sh`** (un commit, puis OK quand
+  on le relance seul) : la machine chargée ; le journal de l'échec est
+  désormais gardé, le lire avant de conclure.

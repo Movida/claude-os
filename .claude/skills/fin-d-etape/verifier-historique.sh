@@ -74,10 +74,15 @@ for commit in $COMMITS; do
         printf '%s  -               %s (pas de verifier.sh)\n' "$(git rev-parse --short "$commit")" "$sujet" >>"$RAPPORT"
         continue
     fi
-    if ! (cd "$ARBRE/copie" && sh verifier.sh) >"$ARBRE/verif.log" 2>&1; then
-        raison="$raison verifier.sh :$(grep '^ECHEC' "$ARBRE/verif.log" | head -n3 | sed 's/^ECHEC */ /' | tr '\n' ';')"
-    fi
     court=$(git rev-parse --short "$commit")
+    if ! (cd "$ARBRE/copie" && sh verifier.sh) >"$ARBRE/verif.log" 2>&1; then
+        # Le journal est gardé (hors du dossier temporaire, effacé à la
+        # fin) : un échec rare, qui ne revient pas quand on relance le
+        # commit seul, ne se comprend qu'avec lui.
+        garde=$(mktemp "${TMPDIR:-/tmp}/verifier-$court-XXXXXX.log")
+        cp "$ARBRE/verif.log" "$garde"
+        raison="$raison verifier.sh :$(grep '^ECHEC' "$ARBRE/verif.log" | head -n3 | sed 's/^ECHEC */ /' | tr '\n' ';') journal : $garde"
+    fi
     if [ -z "$raison" ]; then
         printf '%s  OK              %s\n' "$court" "$sujet" >>"$RAPPORT"
     elif [ "$sujet" = "$ECHECS_CONNUS" ]; then
