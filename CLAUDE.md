@@ -38,6 +38,7 @@ Le dépôt (github.com/Movida/claude-os) doit se lire étape par étape.
 - Depuis 6a : `make tests-hote` lance aussi `linux/memoire` et `linux/claude-version` sur l'hôte : nos appels de la mémoire (mmap, munmap, mprotect, madvise) doivent s'y comporter comme sous le vrai Linux. Depuis 6b, de même `linux/temps`, `linux/fichiers` et `linux/segments` ; depuis 6c, `linux/dynamique` (avec `LD_LIBRARY_PATH` pour sa bibliothèque de test).
 - Depuis 6c : `make` copie dans `glibc/` la glibc partagée de la machine (ld-linux, `libc.so.6` et les quatre autres bibliothèques de `claude`), jamais commitée, et fabrique son `/etc/ld.so.cache` par `/sbin/ldconfig -r` (paquet `libc-bin`, sans root) ; la copie est refaite quand le contenu des fichiers change (une empreinte), pas leur date. Ce que lance le noyau au démarrage, dans l'ordre, avec ses arguments : `racine/etc/demarrage` de l'étape (un sous-ensemble strict de la syntaxe de `sh`, voir `formats/src/commande.rs`).
 - Depuis 6d : `make` télécharge le vrai `claude` (2.1.310, paquet npm officiel, empreinte SHA-256 vérifiée) dans `~/.cache/claude-os`, jamais commité ni publié (accord écrit de David pour le télécharger et l'exécuter, ici et dans la CI). La machine de l'étape (disque virtio, `-cpu Nehalem`, `-m 2G`) : `verifier.sh` la demande par `make qemu-disque` et `make qemu-options`. `make tests-hote` lance aussi `linux/signaux`, `systeme`, `evenements` et `proc`. Jamais de trace `strace` de `claude` gardée ou montrée (elle pourrait contenir un jeton) : `make trace` n'en garde que les noms des appels.
+- Depuis 6e : `make tests-hote` lance aussi `linux/clone`, `fils` (dont `fils groupe`, qui doit sortir avec 7) et `courses` ; `make tests-qemu` demande `nc` (paquet `netcat-openbsd`, dans le Dockerfile et la CI), pour envoyer une touche au moniteur de QEMU, et échoue sur tout « ECHEC » de son journal.
 - Un test qui peut s'emballer se lance avec `ulimit -v` et `timeout` : en 6b, une boucle infinie a rempli toute la mémoire de WSL (le conteneur est depuis plafonné à 8 Go).
 - Rust, via `rustup` (installé par le devcontainer). La version exacte est figée dans `03-noyau-rust/noyau/rust-toolchain.toml` ; `rustup` l'installe à la première commande `cargo`.
 - Dans chaque étape : `make` pour construire, `make run` pour démarrer dans QEMU, `make dump` pour inspecter l'image ; `make tests-hote` pour les tests qui tournent sur la machine hôte, et `make tests-qemu` pour les scénarios dans QEMU (pannes provoquées, programmes fautifs), quand l'étape en a.
@@ -65,7 +66,7 @@ Puis lire `serial.log`. Pour une capture de l'écran, envoyer `screendump ecran.
    - 6b. Système de fichiers en mémoire, descripteurs, cache des pages, mmap de fichiers (fait)
    - 6c. Programmes dynamiques : ET_DYN, PT_INTERP, ld-linux et la glibc partagée, un lanceur (`/etc/demarrage`) (fait)
    - 6d. `claude --version` (fait)
-   - 6e. Ordonnanceur, APIC et IO-APIC, fils (`clone3`, `futex`)
+   - 6e. Ordonnanceur, APIC et IO-APIC, fils (`clone3`, `futex`) (fait)
    - 6f. Signaux, `epoll`, `eventfd`, tubes
    - 6g. PCI, virtio-net, Ethernet, IPv4, UDP, DNS
    - 6h. TCP, sockets, générateur aléatoire (ChaCha20)

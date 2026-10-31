@@ -263,26 +263,61 @@ Dossier `06d-claude-version/`, en onze commits (et un d'outillage), d'après le 
 
 Et le dernier commit de l'étape, trop gros, coupé en trois : la machine, le binaire, le jalon.
 
-## 18. Reste à faire
+## 18. Sous-étape 6e réalisée : l'ordonnanceur, l'APIC et les fils
+
+Dossier `06e-ordonnanceur/`, en dix-huit commits, d'après le plan écrit au début de son fil et relu par un relecteur indépendant (`plan-6e.md` et `relecture-plan.md` dans les fichiers du projet ; 26 constats intégrés avant de coder, dont 3 graves). **Le jalon :** des programmes à plusieurs fils, écrits avec la glibc (pthread), tournent dans notre noyau comme sous Linux, et `claude --version` passe toujours, en dernier.
+
+1. **vmalloc et ioremap** : des adresses du noyau à la demande, les piles des tâches sous une page de garde, les registres des périphériques projetés sans cache.
+2. **Reste de 6d** : les ioctl de /dev/urandom sont ceux de son pilote.
+3. **Les tables ACPI** (RSDP, RSDT ou XSDT, MADT, FADT), lues par `formats/` et testées sur l'hôte avec les tables capturées de QEMU ; le siècle de l'horloge CMOS.
+4. **L'APIC local et l'IO-APIC** remplacent le 8259 (gardé en repli, sans ACPI ou sans IO-APIC).
+5. **Le TSC étalonné** contre le PIT, et le timer de l'APIC à 1000 Hz ; le temps à la nanoseconde.
+6. **On ne meurt qu'au retour vers l'anneau 3** (choix de conception) : une faute, exit, le tueur OOM ne font que prévoir la fin.
+7. **Une pile noyau par tâche**, et la bascule (`__switch_to`), interruptions coupées ; la pile d'une morte rendue par la suivante.
+8. **L'ordonnanceur EEVDF** de Linux 6.6 (choix de conception), et la préemption du noyau ; un compteur de verrous fait paniquer qui céderait le processeur verrou tenu.
+9. **Dormir et se réveiller** : files d'attente chaînées par les tâches, minuteries, nanosleep et clock_nanosleep, un verrou qui dort.
+10. **futex et eventfd attendent vraiment** ; un détecteur d'interblocage.
+11. **Deux programmes à la fois** : `&` et `wait` dans `/etc/demarrage`, kill et tgkill entre processus.
+12. **Reste de 6d** : un fichier de /proc d'un processus recueilli rend ESRCH.
+13. **XSAVE** : l'état AVX de chaque tâche.
+14. **Des descripteurs tenus le temps d'un appel** (choix de conception) : le `fdget` de Linux, les numéros réservés, les dossiers et les objets tenus pendant une résolution, la position d'un fichier sous son verrou ; sans cela, un `close` d'un autre fil arrête le noyau.
+15. **Le processus et ses fils** (choix de conception) : ce qui est au processus (la mémoire, les descripteurs, l'action des signaux, la fin du groupe) et ce qui est à chaque fil (son numéro, son masque, ses signaux, sa pile de secours) ; le processus devient zombie avec son dernier fil.
+16. **clone et clone3**, dans l'ordre de `kernel/fork.c` ; la fin d'un fil (liste robuste, CLONE_CHILD_CLEARTID), la fin du groupe.
+17. **/proc et les fils** : `comm`, `task/<tid>/comm`, `/proc/thread-self`.
+18. **Des programmes à plusieurs fils** : `fils.c` (verrous, conditions, __thread, un verrou robuste, deux cents fils) et `courses.c` (quatre fils qui ferment, changent de dossier et se servent en même temps des mêmes descripteurs ; il fait paniquer un noyau sans le commit 14).
+
+**Pendant l'étape :** la signature des commits par 1Password a cessé de marcher dans le conteneur un soir ; les commits 9 à 15 ont attendu en patchs, que David a créés et signés depuis WSL, et la signature est revenue d'elle-même.
+
+**Relecture de fond :** trois relecteurs indépendants (le cœur du noyau ; les fichiers, les processus et les fils ; la construction, les tests et l'historique), chaque constat vérifié par une sonde ou une mutation. Aucune faille ni corruption de la mémoire. Repliés dans leurs commits :
+- **un programme pouvait geler la machine** : FUTEX_REQUEUE d'une adresse vers elle-même tournait `val2` fois interruptions coupées (des minutes pour 2^31) ;
+- **la cause d'un « memoire rendue : ECHEC » rare** : le processus devenait zombie pendant qu'un de ses fils, préempté, n'avait pas fini de mourir ; il ne l'est plus qu'à la fin de bascule qui rend la pile du dernier ;
+- **le repli sur le 8259 figeait le démarrage** sans IO-APIC (LINT0 masquée) : le « fil virtuel » de Linux ;
+- la troncature (une page projetée par un autre fil entre deux temps), `kill` vers un numéro de fil, la place de /proc pour tous les fils ;
+- des écarts à Linux : RUN_TO_PARITY et le temps virtuel d'une file vide dans l'EEVDF, l'ordre des erreurs de clone3, le nom d'un fil coupé au premier octet nul, les signaux du processus reconfiés quand un fil les bloque ou finit ;
+- deux tests qui ne mordaient pas : « cible » (son ECHEC, maintenant cherché dans tout le journal de `make tests-qemu`) et « lignes » (qui ne peut pas prouver le verrou de la console sous QEMU sans accélération : écrit) ;
+- `nc` pour `make tests-qemu` dans la CI, un journal de débogage committé par erreur, une vingtaine de commentaires devenus faux.
+
+## 19. Reste à faire
 
 **Dans le noyau**
 
 - **Allocations faillibles.** Une allocation impossible, hors de `try_reserve`, fait paniquer le noyau. Rust pour Linux n'utilise que des allocations qui rendent une erreur : à généraliser avant que des programmes puissent en abuser.
 - **Grandes allocations.** Un bloc du tas ne dépasse pas 4 Mio (l'ordre maximal du buddy) : il faudra projeter des pages éparses d'un seul tenant (`vmalloc`). Pour les mémoires WebAssembly, réserver 4 Gio d'adresses suivies de pages de garde (comme wasmtime), ce qui supprimera aussi le contrôle des bornes une fois le code compilé.
-- **Validation sous carburant.** Valider un module piégé coûte jusqu'à environ 1 s par Mio (le facteur 1000 de l'algorithme de la spécification) ; l'instanciation copie les segments actifs sans carburant (linéaire en la taille du module). À rendre interruptible avec l'ordonnanceur.
 - **Console non bloquante.** Le port série fait attendre activement (87 µs par octet sur du vrai matériel) : un pilote à interruptions et une file d'attente, comme le tty de Linux.
-- **Registres des périphériques** (ACPI, APIC…) : les projeter à la demande, sans cache (`ioremap`) ; la projection directe ne couvre que la mémoire vive.
 - **Pages globales** (CR4.PGE) pour le noyau, maintenant qu'il y a un espace d'adressage par programme ; KPTI et PCID : en 6m.
-- **Copie de la moitié haute des espaces d'adressage** : elle suppose que la PML4 du noyau ne change plus. Avec `vmalloc`, créer d'avance toutes les tables de second niveau de la moitié haute (`preallocate_vmalloc_pages` de Linux).
 - **`iretq` qui fauterait** (un RIP non canonique écrit par le noyau, pour exec ou les signaux) : une entrée de la table d'exceptions qui transforme la faute en signal pour le programme (`bad_iret` de Linux). Inatteignable aujourd'hui : le RIP d'un cadre vient toujours du programme.
-- **Temps de calcul au compteur de cycles** : compté en tics d'horloge (RLIMIT_CPU, CLOCK_PROCESS_CPUTIME_ID), il se laisse un peu tromper sous QEMU sans accélération (tics perdus dans de courtes sections critiques). Avec une horloge fine (TSC, HPET), mesurer le temps réel.
 - **La carte des zones et la réserve** : la carte d'un programme vient du tas du noyau, qui peut puiser dans la réserve (3 Mio au plus, 5 le temps de l'agrandir) ; Linux prend ses `vm_area_struct` au-dessus du seuil. Avec les allocations faillibles.
-- **Le verrou du processus coupe les interruptions** : un munmap ou la fin d'un programme qui a touché des centaines de Mio rend ses cadres d'un trait, et des tics d'horloge se perdent. Avec l'ordonnanceur, un verrou qui dort (le `mmap_lock` de Linux).
-- **MAP_SHARED d'un fichier** reste refusé : il faudra écrire les pages dans le fichier, et les retrouver dans chaque processus qui le projette (la carte inverse `i_mmap`, avec l'ordonnanceur, 6e). Pour la même raison, raccourcir un fichier ne retire ses pages que des projections du processus en cours.
-- **Les verrous de fichiers** (fcntl, flock) sont vérifiés mais toujours accordés : avec un seul processus, personne ne peut gêner. Une vraie table des verrous avec plusieurs processus (6k).
+- **Le verrou du processus coupe les interruptions** : un munmap ou la fin d'un programme qui a touché des centaines de Mio rend ses cadres d'un trait, et des tics d'horloge se perdent ; il sérialise aussi les fautes de page de tous les fils. Un verrou qui dort, en lecture et écriture (le `mmap_lock` de Linux).
+- **MAP_SHARED d'un fichier** reste refusé : il faudra écrire les pages dans le fichier, et les retrouver dans chaque processus qui le projette (la carte inverse `i_mmap`, 6k). Pour la même raison, raccourcir un fichier ne retire ses pages que des projections du processus en cours : un autre programme qui le projette (`&`) y lit l'ancien contenu au lieu d'un SIGBUS.
+- **Les verrous de fichiers** (fcntl, flock) sont vérifiés mais toujours accordés : deux programmes lancés par `&` ne s'excluent pas. Une vraie table des verrous.
+- **Le tueur OOM** tue le programme qui faute, pas le plus gros : avec plusieurs programmes à la fois, un petit peut payer pour un gros.
+- **/proc fabriqué à la demande** : les dossiers des processus et des fils sont des entrées gardées (la place réservée pour tous les fils possibles) ; Linux les fabrique d'après la table des tâches. Avec /proc/<pid>/fd (6f), qui le demandera vraiment : des numéros d'inode qui disent le processus, le fil et l'entrée. Écarts voulus d'ici là : /proc/<tid> d'un fil non principal (ENOENT), maps et statm quand le fil principal a fini.
+- **Les fils** : CLOSE_RANGE_UNSHARE refusé avec plusieurs fils (la table est au processus) ; CLONE_PIDFD, set_tid, CLONE_INTO_CGROUP, CLONE_CLEAR_SIGHAND, un processus neuf (fork, vfork : 6k) rendent ENOSYS, un espace de noms EPERM (CLONE_NEWUSER compris, que Linux permet) ; la base de GS n'est pas sauvée par tâche (arch_prctl refuse ARCH_SET_GS) ; RLIMIT_SIGPENDING n'est pas appliquée.
+- **Préempter en rendant un verrou** (Linux le fait) : chez nous, un réveil fait dans le noyau ne prend effet qu'au retour vers l'anneau 3 ou au tic suivant.
+- **Le test « lignes »** ne peut pas prouver le verrou des écritures de la console sous QEMU sans accélération (TCG ne livre l'horloge qu'entre deux blocs traduits) ; à revoir sur un vrai processeur ou avec le multiprocesseur.
+- **WebAssembly** : l'O_TRUNC de path_open se fait sans le verrou d'écriture de l'inode.
 - **Les limites de ressources** autres que celle des descripteurs sont gardées et rendues, pas appliquées (la pile reste à 8 Mio quoi qu'on demande).
 - **Un seul utilisateur** (1000, root pour le noyau), sans groupes supplémentaires ni setuid : `protected_symlinks` et `protected_regular` ne sont pas suivis, ils ne protégeraient de rien.
-- **Le siècle de l'horloge CMOS** est dans un registre que désigne la table ACPI FADT (6e) ; d'ici là, une année avant 70 est dans les années 2000, comme Linux.
 - **O_TMPFILE et RENAME_WHITEOUT** : refusés (EOPNOTSUPP, EINVAL) ; le premier pour des fichiers sans nom, le second pour overlayfs.
 - **La recherche d'un nom dans un dossier** parcourt ses entrées ; une table de hachage (le dcache de Linux) si une mesure le demande.
 - **Écarts voulus avec Linux**, écrits en commentaire : un interpréteur passe par toutes les vérifications du programme (Linux ne vérifie son genre et ses segments qu'après le point de non-retour, et tue le processus), et un interpréteur qui chevauche le programme est refusé (Linux le pose par-dessus) ; un ET_DYN dont un `p_vaddr` relatif dépasse TASK_SIZE est accepté si l'image posée est permise ; mprotect sur une plage avec un trou ne change rien (Linux change ce qui précède le trou) ; MAP_FIXED est refusé à une zone du maximum même quand les fusions l'auraient fait tenir ; une zone rendue inscriptible deux fois est recomptée (pas de VM_ACCOUNT).
@@ -291,19 +326,21 @@ Et le dernier commit de l'étape, trop gros, coupé en trois : la machine, le bi
 - **Le lanceur `/etc/demarrage`** cède la place à un vrai `/init` et à un shell avec `fork` et `execve` (6k) ; son dossier courant est `/`, que l'utilisateur 1000 ne peut pas écrire (à revoir pour `claude`, 6i). Une limite de temps : le programme la pose (setrlimit), et le shell aura `ulimit -t` (6k).
 - **Le vecteur auxiliaire** n'a pas AT_SYSINFO_EHDR (le vDSO, 6m), AT_MINSIGSTKSZ (6f), AT_RSEQ_* ; `rseq` rend ENOSYS : la glibc a un repli pour chacun.
 - **Tas :** des listes par processeur pour le multiprocesseur.
-- **Les signaux** (6d) sont enregistrés, pas encore livrés à un gestionnaire (le cadre de signal, `rt_sigreturn`, SA_RESTART : 6f) ; les signaux temps réel n'ont pas encore de file ; le pid 1 n'a pas le statut à part de Linux. Une attente que rien ne finira (un futex sans délai, un eventfd vide lu en bloquant) arrête le programme ; `epoll_wait` rend ENOSYS (6e, 6f).
-- **/proc et /sys** (6d) : un fichier d'un processus terminé se lit vide (Linux rend ESRCH) ; root ne peut pas changer les droits de la racine de /proc ni d'un nœud de sysfs (Linux le permet) ; un numéro d'inode de /proc n'est jamais repris, ENOSPC après quatre milliards d'entrées.
-- **`mknodat`** (259) est encore un appel inconnu (avec le shell, 6k) ; FIONREAD sur /dev/urandom rend ENOTTY (Linux : EINVAL).
+- **Les signaux** (6d) sont enregistrés, pas encore livrés à un gestionnaire (le cadre de signal, `rt_sigreturn`, SA_RESTART : 6f) ; les signaux temps réel n'ont pas encore de file ; le pid 1 n'a pas le statut à part de Linux. Une attente que rien ne finira (plus aucune tâche prête ni minuterie) arrête les programmes qui dorment, par SIGKILL et en le disant, faute de terminal pour les interrompre ; `epoll_wait` rend ENOSYS (6f).
+- **/proc et /sys** (6d) : root ne peut pas changer les droits de la racine de /proc ni d'un nœud de sysfs (Linux le permet) ; un numéro d'inode de /proc n'est jamais repris, ENOSPC après quatre milliards d'entrées.
+- **`mknodat`** (259) est encore un appel inconnu (avec le shell, 6k).
 
 **Pour le vrai matériel**
+
+- **L'APIC n'est vérifié que sous QEMU**, en xAPIC ; x2APIC (que TCG n'imite pas) fait revenir au 8259. Non vérifiés faute de pouvoir les imiter : `sysretq` avec un SS nul après une bascule sur AMD (le `X86_BUG_SYSRET_SS_ATTRS` de Linux), une adresse ACPI au-delà de MAXPHYADDR (Linux la refuse).
 
 - **NMI pendant le passage éclair en mode protégé du chargeur** : non masqué (Linux le masque par le port 0x70 pour son passage définitif). Risque infime, à revoir si un essai sur vrai matériel le montre.
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 19. Questions ouvertes
+## 20. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 20. Prochaine étape
+## 21. Prochaine étape
 
-Sous-étape 6e : l'ordonnanceur, l'APIC et l'IO-APIC, les fils (`clone3`, `futex` qui attend vraiment). Son plan sera écrit et relu au début de son fil, avec ce que 6d a appris (`etape-06/plan.md` dans les fichiers du projet pour le découpage).
+Sous-étape 6f : les signaux livrés à leurs gestionnaires (le cadre de signal, `rt_sigreturn`, SA_RESTART), `epoll_wait` qui attend vraiment, `eventfd`, les tubes. Son plan sera écrit et relu au début de son fil, avec ce que 6e a appris (`etape-06/plan.md` dans les fichiers du projet pour le découpage).
