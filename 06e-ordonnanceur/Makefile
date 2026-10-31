@@ -54,8 +54,9 @@
 #                  linux/dynamique (ld-linux, la glibc partagée, dlopen),
 #                  linux/signaux (nos codes d'erreur des signaux),
 #                  linux/systeme (uname, futex, prctl...),
-#                  linux/evenements (eventfd, epoll), linux/proc et
-#                  linux/clone (clone, clone3)
+#                  linux/evenements (eventfd, epoll), linux/proc,
+#                  linux/clone (clone, clone3), linux/fils et
+#                  linux/courses (des programmes à plusieurs fils)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -150,8 +151,16 @@ boot.bin: programmes.cpio FORCE
 #   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi ;
 #   - proc : gcc -static, /proc (maps, statm, exe, /proc/sys) et /sys
 #     (cpu/online, transparent_hugepage) ; sur l'hôte aussi ;
+#   - ajout : gcc -static, deux programmes qui ajoutent au même fichier
+#     (O_APPEND), un troisième qui vérifie ; sur l'hôte aussi ;
 #   - clone : gcc -static, les refus de clone et clone3, et un fil créé par
-#     l'appel brut ; sur l'hôte aussi.
+#     l'appel brut ; sur l'hôte aussi ;
+#   - fils : gcc -static, des fils par la glibc (verrous, conditions,
+#     __thread, un verrou robuste, l'arrondi et les masques hérités ; le
+#     processus finit avec son dernier fil, ou avec le groupe) ; sur l'hôte
+#     aussi ;
+#   - courses : gcc -static, quatre fils qui ferment, changent de dossier et
+#     se servent en même temps des mêmes descripteurs ; sur l'hôte aussi.
 # Pour les tests du lecteur ELF sur l'hôte, des variantes qu'il doit
 # accepter : bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -235,6 +244,14 @@ $(LINUX)/systeme: linux/systeme.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/clone: linux/clone.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/fils: linux/fils.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@ -lm
+
+$(LINUX)/courses: linux/courses.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -500,12 +517,14 @@ $(GLIBC)/.copiee: $(LINUX)/libessai.so FORCE
 # (tests-demarrage.txt), qui les lance l'un après l'autre.
 LECTEUR = lecteur/target/wasm32-unknown-unknown/release/lecteur.wasm
 tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_LINUX) $(TESTS_INTERP) $(TESTS_PARALLELES)) $(INTERPRETEURS) \
-            $(LINUX)/bonjour-asm $(GLIBC)/.copiee FORCE
+            $(LINUX)/bonjour-asm $(LINUX)/fils $(LINUX)/courses $(GLIBC)/.copiee FORCE
 	cd lecteur && cargo build --release
 	{ echo "dir /bin 755 0 0"; \
 	  for p in $(TESTS_LINUX) $(TESTS_INTERP) $(TESTS_PARALLELES); do echo "file /bin/$$p $(LINUX)/tests/$$p 755 0 0"; done; \
 	  echo "file /bin/lecteur.wasm $(LECTEUR) 755 0 0"; \
 	  echo "file /bin/bonjour-asm $(LINUX)/bonjour-asm 755 0 0"; \
+	  echo "file /bin/fils $(LINUX)/fils 755 0 0"; \
+	  echo "file /bin/courses $(LINUX)/courses 755 0 0"; \
 	  echo "dir /etc 755 0 0"; \
 	  echo "file /etc/demarrage tests-demarrage.txt 644 0 0"; \
 	  echo "file /etc/ld.so.conf racine/etc/ld.so.conf 644 0 0"; \
@@ -528,7 +547,10 @@ tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_L
 # programme Linux ; 4 : un chemin relatif ; 5 : un programme absent ; 6 :
 # un dossier ; 7 : une barre finale après un fichier ; 8 : un fichier sans
 # le droit d'exécution) ; puis chaque programme de TESTS_LINUX et de
-# TESTS_INTERP, lecteur.wasm sans dossier pré-ouvert, et bonjour-asm.
+# TESTS_INTERP, ceux de TESTS_PARALLELES par deux, un fil qui fait une
+# faute (fils faute : tout le groupe meurt) et les courses entre fils (sous
+# qemu64 et max, en plus de Nehalem au démarrage), lecteur.wasm sans
+# dossier pré-ouvert, et bonjour-asm.
 tests-demarrage.txt: Makefile
 	{ echo "# Fabrique par le Makefile (tests.cpio)."; \
 	  echo "/bin/bonjour-asm \"pas ferme"; \
@@ -548,6 +570,8 @@ tests-demarrage.txt: Makefile
 	  echo "/bin/avx a b &"; \
 	  echo "/bin/avx b a &"; \
 	  echo "wait"; \
+	  echo "/bin/fils faute"; \
+	  echo "/bin/courses"; \
 	  echo "/bin/lecteur.wasm"; \
 	  echo "/bin/bonjour-asm"; } > $@
 
@@ -590,7 +614,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone FORCE
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
@@ -607,8 +631,9 @@ texte: boot.bin
 # Le temps que met l'étape à démarrer et à exécuter toute son archive,
 # sous QEMU sans accélération, avec de la marge. Depuis 6d, l'archive porte
 # claude (307 Mo) : lue en 3,8 s (sur un disque virtio), déballée en 1 s,
-# puis tous les programmes, claude --version compris (0,45 s), 7,9 s en
-# tout, mesurées sur une machine tranquille. En 6c, 3,8 s devenaient
+# puis tous les programmes, claude --version compris (0,45 s) ; en 6e,
+# avec les programmes à plusieurs fils et leurs temps d'attente (partage,
+# dort, courses), 8,8 s en tout, mesurées sur une machine tranquille. En 6c, 3,8 s devenaient
 # 14,6 s quand trois relectures se partageaient les 12 cœurs de la
 # machine : d'où la marge. verifier.sh le demande par `make duree` ; ne
 # pas le lancer sur une machine saturée.
@@ -700,7 +725,7 @@ SHELL = /bin/bash
 .DELETE_ON_ERROR:
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
-            $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone
+            $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -721,6 +746,9 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/evenements | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/proc | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/clone | tee /dev/stderr | (! grep -q ECHEC)
+	./$(LINUX)/fils | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	./$(LINUX)/fils groupe; test $$? = 7
+	./$(LINUX)/courses | tee /dev/stderr | (! grep -q ECHEC)
 	rm -rf /tmp/ajout; \
 	  ./$(LINUX)/ajout ecrire a 500 & a=$$!; ./$(LINUX)/ajout ecrire b 500 & b=$$!; \
 	  ./$(LINUX)/ajout verifier 500 | tee /dev/stderr | (! grep -q ECHEC); r=$$?; wait $$a $$b; exit $$r

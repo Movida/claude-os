@@ -151,3 +151,8 @@
 [noyau] cible : arrete par un signal (SIGTERM)
 [noyau] cible : termine, code de sortie 143.
 [noyau] Programmes en parallele : memoire rendue : ok.
+[linux] fils : un fil ecrit a l'adresse 0
+[noyau] fautif : segfault at 0x0 ip 
+[noyau] fils : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] courses : ok
+[noyau] courses : termine, code de sortie 0 ; memoire rendue : ok.

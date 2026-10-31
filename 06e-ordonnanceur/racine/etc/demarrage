@@ -52,6 +52,12 @@ wait
 wait
 # clone et clone3 (6e) : les refus de Linux, puis un fil par l'appel brut.
 /bin/clone
-# Et le jalon de 6d : le vrai Claude Code, en dernier (ce qui précède a déjà
-# dit si le noyau va bien).
+# Des programmes à plusieurs fils (6e) : par la glibc, le processus qui
+# finit avec son dernier fil (0), puis avec son groupe (exit dans un fil :
+# 7) ; et des courses entre quatre fils sur les mêmes descripteurs.
+/bin/fils
+/bin/fils groupe
+/bin/courses
+# Et le jalon de 6d, et de 6e : le vrai Claude Code, en dernier (ce qui
+# précède a déjà dit si le noyau va bien).
 /usr/local/bin/claude --version

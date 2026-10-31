@@ -304,7 +304,7 @@ impl Lanceur {
             }
         };
         self.en_cours -= 1;
-        let rendue = || if pages::libres() == self.libres { "ok" } else { "ECHEC" };
+        let rendue = || Rendue(self.libres, pages::libres());
         match fin {
             Some((nom, code)) if self.en_cours == 0 && !self.paralleles => {
                 afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.", nom, code, rendue())
@@ -324,6 +324,20 @@ impl Lanceur {
             self.recueillir_les_morts();
             let fond = &self.fond;
             tache::dormir_tant_que(|| !fond.is_empty() && !fond.iter().any(Tache::fini));
+        }
+    }
+}
+
+/// Ce que dit « memoire rendue » : ok, ou ECHEC avec l'écart, en pages
+/// (libres avant le premier programme, puis maintenant), pour chercher ce
+/// qui manque (ou ce qui a été rendu en retard, d'un programme d'avant).
+struct Rendue(usize, usize);
+
+impl fmt::Display for Rendue {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self.1 as i64 - self.0 as i64 {
+            0 => write!(f, "ok"),
+            d => write!(f, "ECHEC ({:+} pages libres)", d),
         }
     }
 }
