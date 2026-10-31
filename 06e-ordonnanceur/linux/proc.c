@@ -21,6 +21,7 @@
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sched.h>
@@ -325,10 +326,12 @@ static void arborescence(void)
     struct dirent *e;
     char moi[32];
     snprintf(moi, sizeof moi, "%d", getpid());
-    int vu_self = 0, vu_moi = 0, vu_sys = 0, autres = 0;
+    int vu_self = 0, vu_fil = 0, vu_moi = 0, vu_sys = 0, autres = 0;
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, "self"))
             vu_self = e->d_type == DT_LNK;
+        else if (!strcmp(e->d_name, "thread-self"))
+            vu_fil = e->d_type == DT_LNK;
         else if (!strcmp(e->d_name, moi))
             vu_moi = e->d_type == DT_DIR;
         else if (!strcmp(e->d_name, "sys"))
@@ -337,7 +340,7 @@ static void arborescence(void)
             autres++;
     }
     closedir(d);
-    verifier(vu_self && vu_moi && vu_sys, "/proc contient self, sys et le dossier du processus");
+    verifier(vu_self && vu_fil && vu_moi && vu_sys, "/proc contient self, thread-self, sys et le dossier du processus");
     if (chez_nous)
         verifier(autres == 0, "chez nous, rien d'autre");
     char cwd[256];
@@ -488,6 +491,93 @@ static void sys(void)
                  && erreur(mkdir("/sys/x", 0755)) == EACCES, "chez nous : pas de NUMA, rien a ecrire (EACCES)");
 }
 
+/* Les fils dans /proc (6e), mesurés sous Linux 6.18 : comm (le nom, un
+ * saut de ligne), task/<tid>/comm pour chaque fil, /proc/thread-self ;
+ * écrire comm renomme le fil (15 octets au plus, tout compte comme écrit) ;
+ * pthread_setname_np et pthread_getname_np pour un autre fil passent par
+ * task/<tid>/comm. */
+static pthread_mutex_t verrou = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t condition = PTHREAD_COND_INITIALIZER;
+static int fini;
+static volatile pid_t tid_autre;
+
+static void *fil_qui_attend(void *a)
+{
+    tid_autre = syscall(SYS_gettid);
+    pthread_mutex_lock(&verrou);
+    while (!fini)
+        pthread_cond_wait(&condition, &verrou);
+    pthread_mutex_unlock(&verrou);
+    return a;
+}
+
+/* Le nombre d'entrées d'un dossier, sans « . » ni « .. ». */
+static int entrees(const char *chemin)
+{
+    DIR *d = opendir(chemin);
+    struct dirent *e;
+    int n = 0;
+    if (d == NULL)
+        return -1;
+    while ((e = readdir(d)) != NULL)
+        n += strcmp(e->d_name, ".") != 0 && strcmp(e->d_name, "..") != 0;
+    closedir(d);
+    return n;
+}
+
+static int dans_task(pid_t tid)
+{
+    char chemin[64];
+    snprintf(chemin, sizeof chemin, "/proc/self/task/%d", tid);
+    return access(chemin, F_OK) == 0;
+}
+
+static void fils(void)
+{
+    char t[256], chemin[64], attendu[64], nom[16];
+    pid_t pid = getpid(), tid = syscall(SYS_gettid);
+    lire_tout("/proc/self/comm", t, sizeof t, 1024);
+    verifier(strcmp(t, "proc\n") == 0, "comm : le nom du programme, et un saut de ligne");
+    snprintf(chemin, sizeof chemin, "/proc/self/task/%d/comm", tid);
+    lire_tout(chemin, t, sizeof t, 1024);
+    verifier(strcmp(t, "proc\n") == 0, "task/<tid>/comm du fil principal");
+    ssize_t n = readlink("/proc/thread-self", t, sizeof t - 1);
+    t[n < 0 ? 0 : n] = 0;
+    snprintf(attendu, sizeof attendu, "%d/task/%d", pid, tid);
+    verifier(strcmp(t, attendu) == 0, "/proc/thread-self : <pid>/task/<tid>");
+    int fd = open("/proc/self/comm", O_WRONLY);
+    verifier(fd >= 0 && write(fd, "nouveau", 7) == 7, "ecrire comm");
+    verifier(prctl(PR_GET_NAME, nom) == 0 && strcmp(nom, "nouveau") == 0, "comm ecrit : le nom du fil (PR_GET_NAME)");
+    verifier(write(fd, "0123456789abcdefghij", 20) == 20, "ecrire 20 octets dans comm : 20");
+    lire_tout("/proc/self/comm", t, sizeof t, 1024);
+    verifier(strcmp(t, "0123456789abcde\n") == 0, "comm : les 15 premiers seulement");
+    verifier(write(fd, "proc", 4) == 4, "comm remis");
+    close(fd);
+    pthread_t f;
+    verifier(pthread_create(&f, NULL, fil_qui_attend, NULL) == 0, "un fil (pthread_create)");
+    while (tid_autre == 0)
+        sched_yield();
+    verifier(dans_task(tid_autre), "task/<tid> du nouveau fil");
+    verifier(entrees("/proc/self/task") == 2, "task : deux fils");
+    verifier(pthread_setname_np(f, "autre") == 0 && pthread_getname_np(f, nom, sizeof nom) == 0 && strcmp(nom, "autre") == 0,
+             "nommer un autre fil (task/<tid>/comm)");
+    verifier(prctl(PR_GET_NAME, nom) == 0 && strcmp(nom, "proc") == 0, "le nom du fil principal n'a pas change");
+    pthread_mutex_lock(&verrou);
+    fini = 1;
+    pthread_cond_signal(&condition);
+    pthread_mutex_unlock(&verrou);
+    verifier(pthread_join(f, NULL) == 0, "pthread_join");
+    /* Le fil efface son numéro (ce qu'attend pthread_join) un peu avant de
+     * disparaître tout à fait. */
+    int parti = 0;
+    for (int i = 0; i < 1000 && !parti; i++) {
+        parti = !dans_task(tid_autre);
+        if (!parti)
+            sched_yield();
+    }
+    verifier(parti && entrees("/proc/self/task") == 1, "task/<tid> retire a la fin du fil");
+}
+
 /* « proc cible » : écrit son numéro dans /tmp/proc-cible.pid, attend
  * 200 ms et se termine. « proc autre », lancé ensuite : ouvre maps et statm
  * de la cible tant qu'elle vit, les lit, puis attend qu'elle ait été
@@ -546,6 +636,7 @@ int main(int argc, char **argv)
     arborescence();
     modifications();
     sys();
+    fils();
     printf("[linux] proc : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

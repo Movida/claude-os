@@ -794,6 +794,8 @@ pub fn lancer_fil(n: NouveauFil) -> Result<u32, i64> {
     if n.parent_tid != 0 {
         let _ = crate::copie_utilisateur::copier_vers_utilisateur(n.parent_tid, &tid.to_le_bytes());
     }
+    let proprietaire = processus::avec(|p| (p.identite.uid, p.identite.gid));
+    crate::procfs::ajouter_fil(processus.pid(), tid, proprietaire);
     demarrer(&t);
     Ok(tid)
 }
@@ -911,6 +913,11 @@ pub fn terminer(code: i32) -> ! {
             cpu::activer_interruptions();
         }
         p.fil_termine(t.tid, code);
+        // Son dossier de /proc/<pid>/task ; celui du fil principal reste
+        // jusqu'à ce que le processus soit recueilli (procfs.rs).
+        if t.tid != p.pid() {
+            crate::procfs::retirer_fil(p.pid(), t.tid);
+        }
     }
     cpu::couper_interruptions();
     t.morte.store(true, Ordering::Relaxed);
@@ -1040,7 +1047,58 @@ pub fn nom() -> NomCourt {
 /// Change le nom de la tâche courante (PR_SET_NAME) : celui des messages
 /// du noyau, comme le `comm` de Linux, que montre aussi son tueur OOM.
 pub fn renommer(nom: NomCourt) {
-    *courante().nom.verrouiller() = nom;
+    renommer_tache(courante(), nom);
+}
+
+/// Change le nom de `t` ; celui d'un fil principal est aussi gardé par son
+/// processus (/proc/<pid>/comm, après la fin de ce fil).
+fn renommer_tache(t: &Tache, nom: NomCourt) {
+    *t.nom.verrouiller() = nom;
+    if let Some(p) = &t.processus
+        && p.pid() == t.tid
+    {
+        p.renommer(nom);
+    }
+}
+
+/// Le nom du fil `tid`, s'il vit.
+pub fn nom_du_fil(tid: u32) -> Option<NomCourt> {
+    let mut nom = None;
+    pour_chaque(|t| {
+        if t.tid == tid && tid != 0 {
+            nom = Some(t.nom());
+        }
+    });
+    nom
+}
+
+/// Pourquoi un fil ne peut pas être renommé par /proc/<pid>/task/<tid>/comm.
+pub enum RefusNom {
+    /// Il n'existe plus (ESRCH).
+    Absent,
+    /// Il est d'un autre processus que celui qui écrit (EINVAL).
+    AutreProcessus,
+}
+
+/// Renomme le fil `tid`, du processus de la tâche courante (l'écriture de
+/// /proc/.../comm : `pthread_setname_np` pour un autre fil que soi).
+pub fn renommer_fil(tid: u32, nom: NomCourt) -> Result<(), RefusNom> {
+    let mut cible = None;
+    pour_chaque(|t| {
+        if t.tid == tid && tid != 0 {
+            cible = Some(t.clone());
+        }
+    });
+    let t = cible.ok_or(RefusNom::Absent)?;
+    let meme = match (&t.processus, &courante().processus) {
+        (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+        _ => false,
+    };
+    if !meme {
+        return Err(RefusNom::AutreProcessus);
+    }
+    renommer_tache(&t, nom);
+    Ok(())
 }
 
 /// Appelée à chaque tic d'horloge, interruptions coupées : l'ordonnanceur

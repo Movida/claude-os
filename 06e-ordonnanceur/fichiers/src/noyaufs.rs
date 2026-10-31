@@ -42,6 +42,8 @@ pub enum Cible {
     Fixe(Vec<u8>),
     /// Le numéro du processus qui lit (/proc/self).
     Lecteur,
+    /// Le fil qui lit, « <pid>/task/<tid> » (/proc/thread-self).
+    LecteurFil,
 }
 
 /// Ce qu'est une entrée.
@@ -320,10 +322,11 @@ impl Monte for NoyauFs {
         &self.entree(n).nom
     }
 
-    fn cible<'a>(&'a self, lien: u32, lecteur: &'a [u8]) -> &'a [u8] {
+    fn cible<'a>(&'a self, lien: u32, lecteur: &'a [u8], fil: &'a [u8]) -> &'a [u8] {
         match &self.entree(lien).contenu {
             Contenu::Lien(Cible::Fixe(c)) => c,
             Contenu::Lien(Cible::Lecteur) => lecteur,
+            Contenu::Lien(Cible::LecteurFil) => fil,
             _ => &[],
         }
     }
@@ -661,9 +664,12 @@ mod tests {
         assert_eq!(p.parent(maps), deux);
         assert_eq!(p.nom(maps), b"maps");
         let soi = p.chercher(RACINE, b"self").unwrap();
-        assert_eq!(p.cible(soi, b"42"), b"42");
+        assert_eq!(p.cible(soi, b"42", b"42/task/7"), b"42");
         let exe = p.chercher(deux, b"exe").unwrap();
-        assert_eq!(p.cible(exe, b"42"), b"/bin/x");
+        assert_eq!(p.cible(exe, b"42", b"42/task/7"), b"/bin/x");
+        let fil = p.ajouter(RACINE, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), false, Temps::default()).unwrap();
+        assert_eq!(p.cible(fil, b"42", b"42/task/7"), b"42/task/7");
+        p.retirer(fil);
         assert_eq!(p.ajouter(deux, b"maps", 0o444, (0, 0), Contenu::Dossier, true, Temps::default()), Err(Erreur::EEXIST));
         // Les entrées, dans l'ordre, avec des positions qui restent justes
         // quand une entrée disparaît.

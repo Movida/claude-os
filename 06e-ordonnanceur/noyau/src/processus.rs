@@ -26,6 +26,7 @@ use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::descripteurs::{Descripteurs, LIMITE_DESCRIPTEURS};
 use crate::fil::Fil;
+use crate::programmes::NomCourt;
 use crate::tache::Tache;
 use crate::memoire::Memoire;
 use crate::signaux::Signaux;
@@ -214,6 +215,9 @@ pub struct Entree {
     /// Qui attend sa fin (init, le lanceur : programmes.rs), réveillé quand
     /// il devient un zombie (le `do_notify_parent` de Linux).
     parent: Verrou<Option<Arc<Tache>>>,
+    /// Le nom de son fil principal, qui se lit encore après la fin de ce fil
+    /// (/proc/<pid>/comm ; Linux garde la tâche du fil principal).
+    nom: Verrou<NomCourt>,
 }
 
 impl Entree {
@@ -256,6 +260,11 @@ impl Entree {
                 crate::tache::reveiller(parent, crate::tache::Reveil::Reveillee);
             }
         }
+    }
+
+    /// Le nom de son fil principal a changé.
+    pub fn renommer(&self, nom: NomCourt) {
+        *self.nom.verrouiller() = nom;
     }
 
     /// Est-il un zombie (tous ses fils morts, tout rendu) ?
@@ -333,7 +342,7 @@ pub fn initialiser(max: usize) {
 /// principal le rejoint à sa création, tache::lancer_programme), avec la
 /// tâche courante pour parent ; None si elle est pleine (pas plus de
 /// processus que de tâches).
-pub fn ajouter(processus: Processus) -> Option<Arc<Entree>> {
+pub fn ajouter(processus: Processus, nom: NomCourt) -> Option<Arc<Entree>> {
     let mut table = TABLE.verrouiller();
     if table.len() == table.capacity() {
         return None;
@@ -346,6 +355,7 @@ pub fn ajouter(processus: Processus) -> Option<Arc<Entree>> {
         vivants: AtomicU32::new(0),
         zombie: AtomicBool::new(false),
         parent: Verrou::new(Some(crate::tache::courante_arc())),
+        nom: Verrou::new(nom),
     });
     table.push(e.clone());
     Some(e)
@@ -391,6 +401,12 @@ pub fn pour_chaque_pid(mut f: impl FnMut(u32)) {
     for e in TABLE.verrouiller().iter() {
         f(e.pid);
     }
+}
+
+/// Le nom du fil principal du processus `pid`, s'il est dans la table
+/// (vivant ou zombie).
+pub fn nom_du_principal(pid: u32) -> Option<NomCourt> {
+    TABLE.verrouiller().iter().find(|e| e.pid == pid).map(|e| *e.nom.verrouiller())
 }
 
 /// Le processus `pid` est-il dans la table (vivant ou zombie) ?

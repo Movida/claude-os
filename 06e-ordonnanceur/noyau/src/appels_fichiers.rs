@@ -456,8 +456,8 @@ pub fn ouvrir_pour(qui: fichiers::Identite, chemin: &[u8], lecture: bool, ecritu
 /// bout du chemin), ELOOP ; un dossier ouvert pour écrire, ou avec
 /// O_TRUNC, EISDIR ; puis les droits demandés, EACCES, O_TRUNC demandant
 /// celui d'écrire (`build_open_flags`). Un fichier d'un système du noyau a une source (son
-/// contenu est fabriqué à la lecture, procfs.rs) ; aucun ne s'écrit encore
-/// (un réglage de /proc/sys, en 0644 à root : EACCES pour root aussi, nos
+/// contenu est fabriqué à la lecture, procfs.rs) ; seul `comm` s'écrit (un
+/// réglage de /proc/sys, en 0644 à root : EACCES pour root aussi, nos
 /// programmes ne le sont jamais).
 pub fn ouvrir_monte(vue: &Vue<NoyauFs>, qui: Identite, objet: Objet, o: &Ouverture, drapeaux: u32, chemin: &[u8])
     -> Result<FichierOuvert, Erreur> {
@@ -491,7 +491,7 @@ pub fn ouvrir_monte(vue: &Vue<NoyauFs>, qui: Identite, objet: Objet, o: &Ouvertu
         return Ok(ouvrir(Sorte::Dossier));
     }
     let Some((source, argument)) = vue.contenu(objet) else { return Err(Erreur::ENXIO) };
-    if o.ecriture {
+    if o.ecriture && !procfs::ecrivable(source) {
         return Err(Erreur::EACCES);
     }
     let mut f = ouvrir(Sorte::Noyau { lecture: procfs::lecture(source) });
@@ -998,8 +998,18 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
         Sorte::Dossier | Sorte::Chemin => Err(-EBADF),
         Sorte::EventFd => evenements::ecrire(o.fichier(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Epoll => Err(-EINVAL),
-        // Jamais ouvert pour écrire (ouvrir_monte).
-        Sorte::Noyau { .. } => Err(-EBADF),
+        // Un fichier du noyau qui s'écrit (procfs::ecrivable : comm) :
+        // seuls ses 15 premiers octets comptent, copiés d'abord, sans rien
+        // tenir ; la position ne sert pas (`comm_write`).
+        Sorte::Noyau { .. } => {
+            let (source, argument) = procfs::source(o.fichier());
+            let mut copie = [0u8; 15];
+            let n = (longueur as usize).min(copie.len());
+            if copier_depuis_utilisateur(&mut copie[..n], tampon).is_err() {
+                return Err(-EFAULT);
+            }
+            procfs::ecrire(source, argument, &copie[..n], longueur)
+        }
     }
 }
 

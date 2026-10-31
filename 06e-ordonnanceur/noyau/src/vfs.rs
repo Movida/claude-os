@@ -115,12 +115,23 @@ impl Systeme {
     }
 
     /// Appelle `f` avec la vue de tous les systèmes de fichiers, telle que
-    /// la voit le processus `pid` (pour /proc/self ; 0 : le noyau, ou un
-    /// programme WebAssembly, qui n'est pas un processus Linux).
+    /// la voit le processus `pid`, par la tâche courante (pour /proc/self et
+    /// /proc/thread-self ; 0 : le noyau, ou un programme WebAssembly, qui
+    /// n'est pas un processus Linux).
     pub fn avec_vue<R>(&self, pid: u32, f: impl FnOnce(&Vue<NoyauFs>) -> R) -> R {
         let mut texte = [0u8; 10];
         let lecteur = decimal(pid, &mut texte);
-        f(&Vue { fs: &self.fs, montes: &self.montes, lecteur })
+        // « <pid>/task/<tid> » : 10 + 6 + 10 octets au plus.
+        let mut chemin_du_fil = [0u8; 26];
+        let mut longueur = 0;
+        if pid != 0 {
+            let mut tid = [0u8; 10];
+            for morceau in [lecteur, b"/task/", decimal(crate::tache::courante().tid(), &mut tid)] {
+                chemin_du_fil[longueur..longueur + morceau.len()].copy_from_slice(morceau);
+                longueur += morceau.len();
+            }
+        }
+        f(&Vue { fs: &self.fs, montes: &self.montes, lecteur, fil: &chemin_du_fil[..longueur] })
     }
 
     /// Résout `chemin` depuis `depart`, pour le processus `pid`, à travers

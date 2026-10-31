@@ -709,7 +709,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         signaux: crate::signaux::Signaux::new(),
         fils: Vec::new(),
         fin_de_groupe: None,
-    });
+    }, nom);
     let lance = entree.and_then(|e| tache::lancer_programme(nom, e.clone(), pml4, depart, rsp).map(|_| e));
     match lance {
         Some(processus) => {

@@ -36,7 +36,7 @@ fn essai(l_point: usize, l_total: usize) -> (Result<usize, Erreur>, Result<usize
         dernier_nom = k;
     }
     let montes = [(d, m)];
-    let vue = Vue { fs: &fs, montes: &montes, lecteur: b"" };
+    let vue = Vue { fs: &fs, montes: &montes, lecteur: b"", fil: b"" };
     let o = Objet::Monte(Systeme(0), n);
     let chemin = vue.chemin(o).map(|c| c.len());
     // Le même chemin, comme nom à créer dans le parent.

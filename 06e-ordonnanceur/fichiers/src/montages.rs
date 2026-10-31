@@ -114,8 +114,9 @@ pub trait Monte {
     /// Le nom de `n` dans son parent (vide pour la racine).
     fn nom(&self, n: u32) -> &[u8];
     /// Le contenu du lien `lien`, pour le lecteur dont le numéro de
-    /// processus s'écrit `lecteur` (/proc/self dépend de qui le lit).
-    fn cible<'a>(&'a self, lien: u32, lecteur: &'a [u8]) -> &'a [u8];
+    /// processus s'écrit `lecteur`, et le chemin de son fil (dans /proc)
+    /// `fil` : /proc/self et /proc/thread-self dépendent de qui les lit.
+    fn cible<'a>(&'a self, lien: u32, lecteur: &'a [u8], fil: &'a [u8]) -> &'a [u8];
     /// Les entrées du dossier à partir de `position`, comme
     /// `Tmpfs::lire_dossier` : `entree(nom, inode, type, position suivante)`
     /// tant qu'elle rend vrai.
@@ -195,6 +196,9 @@ pub struct Vue<'a, M: Monte> {
     pub fs: &'a Tmpfs,
     pub montes: &'a [(Numero, M)],
     pub lecteur: &'a [u8],
+    /// Le fil qui lit, vu de /proc : « <pid>/task/<tid> » (la cible de
+    /// /proc/thread-self).
+    pub fil: &'a [u8],
 }
 
 impl<'a, M: Monte> Vue<'a, M> {
@@ -632,7 +636,7 @@ impl<M: Monte> Arbre for Vue<'_, M> {
     fn cible(&self, lien: Objet) -> &[u8] {
         match lien {
             Objet::Tmpfs(n) => <Tmpfs as Arbre>::cible(self.fs, n),
-            Objet::Monte(s, n) => self.monte(s).cible(n, self.lecteur),
+            Objet::Monte(s, n) => self.monte(s).cible(n, self.lecteur, self.fil),
             Objet::Anonyme => &[],
         }
     }
@@ -695,7 +699,7 @@ mod tests {
         fn nom(&self, n: u32) -> &[u8] {
             NOMS[n as usize]
         }
-        fn cible<'a>(&'a self, _: u32, lecteur: &'a [u8]) -> &'a [u8] {
+        fn cible<'a>(&'a self, _: u32, lecteur: &'a [u8], _: &'a [u8]) -> &'a [u8] {
             lecteur
         }
         fn lire_dossier(&self, dossier: u32, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
@@ -740,7 +744,7 @@ mod tests {
     fn traverser_le_montage() {
         let (fs, point) = arbre();
         let montes = [(point, Petit)];
-        let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42" };
+        let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42", fil: b"42/task/42" };
         let racine = Objet::Tmpfs(fs.racine());
         let depart = Depart { racine, dossier: racine, qui: DAVID, sous: false };
         let p = Systeme(0);
@@ -777,7 +781,7 @@ mod tests {
     fn chemins_et_attributs() {
         let (fs, point) = arbre();
         let montes = [(point, Petit)];
-        let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42" };
+        let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42", fil: b"42/task/42" };
         let p = Systeme(0);
         assert_eq!(vue.chemin(Objet::Monte(p, 0)).unwrap(), b"/proc");
         assert_eq!(vue.chemin(Objet::Monte(p, 1)).unwrap(), b"/proc/d");
@@ -825,13 +829,13 @@ mod tests {
         let racine = Objet::Tmpfs(fs.racine());
         let fin = |fs: &Tmpfs, qui: Identite, chemin: &[u8]| {
             let montes = [(point, Petit)];
-            let vue = Vue { fs, montes: &montes, lecteur: b"42" };
+            let vue = Vue { fs, montes: &montes, lecteur: b"42", fil: b"42/task/42" };
             let depart = Depart { racine, dossier: racine, qui, sous: false };
             resoudre(&vue, &depart, chemin, Suivre::Jamais).unwrap()
         };
         let refus = |fs: &Tmpfs, qui: Identite, m: Modification| {
             let montes = [(point, Petit)];
-            Vue { fs, montes: &montes, lecteur: b"42" }.refus(qui, m).unwrap_err()
+            Vue { fs, montes: &montes, lecteur: b"42", fil: b"42/task/42" }.refus(qui, m).unwrap_err()
         };
         let dans = fin(&fs, DAVID, b"/proc/d/neuf");
         let existe = fin(&fs, DAVID, b"/proc/d/f");
@@ -916,7 +920,7 @@ mod tests {
         assert_eq!(refus(&fs, DAVID, Modification::Renommer(&d, &existe, 0)), Erreur::EINVAL);
         {
             let montes = [(point, Petit)];
-            let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42" };
+            let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42", fil: b"42/task/42" };
             assert_eq!(vue.refus(DAVID, Modification::Renommer(&existe, &existe, 0)), Ok(()));
         }
         // Renommer un fichier du tmpfs sur le point de montage : `may_delete`
@@ -928,7 +932,7 @@ mod tests {
         // L'inode anonyme n'est pas un dossier ; son périphérique.
         {
             let montes = [(point, Petit)];
-            let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42" };
+            let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42", fil: b"42/task/42" };
             assert_eq!(vue.lire_dossier(Objet::Anonyme, 0, |_, _, _, _| true), Err(Erreur::ENOTDIR));
             assert_eq!(vue.peripherique(Objet::Anonyme), Some(ANONYME_PERIPHERIQUE));
         }

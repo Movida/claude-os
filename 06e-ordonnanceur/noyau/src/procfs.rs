@@ -7,13 +7,28 @@
 //! L'arborescence est un système de fichiers du noyau (fichiers::noyaufs),
 //! monté sur /proc au démarrage (vfs.rs) :
 //!   - /proc/self : un lien vers le numéro du processus qui le lit ;
+//!     /proc/thread-self, vers « <pid>/task/<tid> », le dossier du fil qui
+//!     le lit ;
 //!   - /proc/<pid>/ pour chaque processus, ajouté à son lancement et retiré
-//!     à sa fin (programmes.rs) : `maps`, `statm`, et le lien `exe` vers le
-//!     chemin canonique de son exécutable ; à lui (son utilisateur), comme
-//!     sous Linux ;
+//!     quand il est recueilli (programmes.rs) : `maps`, `statm`, `comm` (le
+//!     nom de son fil principal), le lien `exe` vers le chemin canonique de
+//!     son exécutable, et `task/<tid>/comm` pour chacun de ses fils (ajouté
+//!     à la création du fil, retiré à sa fin ; celui du fil principal reste
+//!     jusqu'au processus, comme Linux garde sa tâche) ; à lui (son
+//!     utilisateur), comme sous Linux ;
 //!   - /proc/sys/vm/overcommit_memory et mmap_min_addr, à root.
-//! Le reste viendra avec son besoin : /proc/<pid>/fd (6f), task (6e),
-//! /proc/meminfo si une mesure le demande. /proc/self/cgroup est absent,
+//! Le reste viendra avec son besoin : /proc/<pid>/fd (6f), /proc/meminfo si
+//! une mesure le demande. Les dossiers des processus et des fils sont des
+//! entrées gardées, ajoutées et retirées ; Linux les fabrique à la demande,
+//! d'après la table des tâches. Un écart voulu jusqu'à /proc/<pid>/fd (6f),
+//! qui le demandera vraiment (un dossier qui change à chaque open) : il
+//! faudra alors des numéros d'inode qui disent le processus, le fil et
+//! l'entrée, plus que n'en tiennent les 32 bits d'un `Objet`. Deux autres
+//! écarts voulus, mesurés sous Linux 6.18 : /proc/<tid> d'un fil qui n'est
+//! pas le principal, que Linux résout (sans le lister), est absent chez
+//! nous (ENOENT) ; et quand le fil principal a fini mais que d'autres
+//! vivent, Linux montre maps vide et statm à zéro (il rattache la mémoire
+//! à la tâche du fil principal), nous les vraies valeurs du processus. /proc/self/cgroup est absent,
 //! comme sur un Linux construit sans les cgroups (nous n'en avons pas) :
 //! libuv le prévoit (« aucune limite »).
 //!
@@ -45,6 +60,9 @@ const MAPS: u32 = 1;
 const STATM: u32 = 2;
 const OVERCOMMIT_MEMORY: u32 = 3;
 const MMAP_MIN_ADDR: u32 = 4;
+/// Le nom d'un fil (/proc/<pid>/comm, task/<tid>/comm : l'argument est le
+/// numéro du fil, celui du processus pour son fil principal).
+const COMM: u32 = 5;
 
 /// Le périphérique de procfs (un numéro anonyme, après celui du tmpfs de la
 /// racine, 0:20).
@@ -54,16 +72,20 @@ const PERIPHERIQUE: (u32, u32) = (0, 21);
 /// relit pour la suite, comme pour tout fichier).
 const LECTURE_MAX: u64 = 64 << 10;
 
-/// Le procfs neuf : /proc/self et /proc/sys/vm. Assez de place d'avance
-/// pour les dossiers de seize processus à la fois (quatre entrées chacun) :
-/// sinon la table des entrées grandirait pendant les premiers programmes,
-/// et « memoire rendue » le compterait. (Linux, lui, fabrique /proc/<pid>
-/// à la demande, d'après la table des processus, sans rien garder.)
+/// Le procfs neuf : /proc/self, /proc/thread-self et /proc/sys/vm. Assez de
+/// place d'avance pour les dossiers de seize processus à la fois (huit
+/// entrées chacun), et pour tous les fils qui peuvent exister (deux entrées
+/// chacun : max_threads, vmalloc.rs ; une centaine d'octets par entrée, 3
+/// Mio pour 2 Gio de mémoire) : sinon la table des entrées grandirait
+/// pendant un programme, et « memoire rendue » le compterait (vu avec 122
+/// fils et 256 entrées). Linux, lui, fabrique /proc/<pid> à la demande,
+/// d'après la table des processus, sans rien garder : voir l'en-tête.
 pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     let mut p = NoyauFs::new(Genre::Proc, PERIPHERIQUE, 0o555, maintenant)?;
     let racine = p.racine();
-    p.reserver(64)?;
+    p.reserver(16 * 8 + 2 * crate::vmalloc::max_threads())?;
     p.ajouter(racine, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), false, maintenant)?;
+    p.ajouter(racine, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), false, maintenant)?;
     let sys = p.ajouter(racine, b"sys", 0o555, (0, 0), Contenu::Dossier, false, maintenant)?;
     let vm = p.ajouter(sys, b"vm", 0o555, (0, 0), Contenu::Dossier, false, maintenant)?;
     let reglage = |source| Contenu::Fichier { source, argument: 0 };
@@ -89,7 +111,10 @@ pub fn ajouter_processus(pid: u32, proprietaire: (u32, u32), exe: &[u8]) {
         let fichier = |source| Contenu::Fichier { source, argument: pid };
         let r = p.ajouter(d, b"maps", 0o444, proprietaire, fichier(MAPS), true, maintenant)
             .and_then(|_| p.ajouter(d, b"statm", 0o444, proprietaire, fichier(STATM), true, maintenant))
-            .and_then(|_| p.ajouter(d, b"exe", 0o777, proprietaire, Contenu::Lien(Cible::Fixe(cible)), true, maintenant));
+            .and_then(|_| p.ajouter(d, b"comm", 0o644, proprietaire, fichier(COMM), true, maintenant))
+            .and_then(|_| p.ajouter(d, b"exe", 0o777, proprietaire, Contenu::Lien(Cible::Fixe(cible)), true, maintenant))
+            .and_then(|_| p.ajouter(d, b"task", 0o555, proprietaire, Contenu::Dossier, true, maintenant))
+            .and_then(|task| ajouter_tache(p, task, pid, proprietaire, maintenant));
         if r.is_err() {
             p.retirer(d);
         }
@@ -98,6 +123,51 @@ pub fn ajouter_processus(pid: u32, proprietaire: (u32, u32), exe: &[u8]) {
     if let Err(e) = fait {
         afficherln!("[noyau] /proc/{} : impossible a creer (errno {})", pid, e.errno());
     }
+}
+
+/// Ajoute task/<tid>/comm dans le dossier `task` (sous le verrou des
+/// fichiers).
+fn ajouter_tache(p: &mut NoyauFs, task: u32, tid: u32, proprietaire: (u32, u32), maintenant: Temps) -> Result<(), Erreur> {
+    let mut nom = [0u8; 10];
+    let nom = vfs::decimal(tid, &mut nom);
+    let d = p.ajouter(task, nom, 0o555, proprietaire, Contenu::Dossier, true, maintenant)?;
+    let r = p.ajouter(d, b"comm", 0o644, proprietaire, Contenu::Fichier { source: COMM, argument: tid }, true, maintenant);
+    if r.is_err() {
+        p.retirer(d);
+    }
+    r.map(|_| ())
+}
+
+/// Le dossier task/ de /proc/<pid>, s'il existe.
+fn dossier_task(p: &NoyauFs, pid: u32) -> Option<u32> {
+    let mut nom = [0u8; 10];
+    let d = p.chercher(p.racine(), vfs::decimal(pid, &mut nom))?;
+    p.chercher(d, b"task")
+}
+
+/// Ajoute /proc/<pid>/task/<tid> pour un fil neuf (clone). Un échec (plus
+/// de mémoire) est dit, et le fil tourne sans.
+pub fn ajouter_fil(pid: u32, tid: u32, proprietaire: (u32, u32)) {
+    let maintenant = crate::temps::maintenant();
+    let fait = vfs::avec_systeme(|s, _| {
+        let p = &mut s.montes[vfs::PROC].1;
+        let task = dossier_task(p, pid).ok_or(Erreur::ENOENT)?;
+        ajouter_tache(p, task, tid, proprietaire, maintenant)
+    });
+    if let Err(e) = fait {
+        afficherln!("[noyau] /proc/{}/task/{} : impossible a creer (errno {})", pid, tid, e.errno());
+    }
+}
+
+/// Retire /proc/<pid>/task/<tid> (le fil est terminé).
+pub fn retirer_fil(pid: u32, tid: u32) {
+    vfs::avec_systeme(|s, _| {
+        let p = &mut s.montes[vfs::PROC].1;
+        let mut nom = [0u8; 10];
+        if let Some(d) = dossier_task(p, pid).and_then(|task| p.chercher(task, vfs::decimal(tid, &mut nom))) {
+            p.retirer(d);
+        }
+    })
 }
 
 /// Retire /proc/<pid> (le processus est terminé).
@@ -117,7 +187,7 @@ pub fn retirer_processus(pid: u32) {
 pub fn lecture(source: u32) -> Lecture {
     match source {
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR => Lecture::Valeur,
-        MAPS | STATM => Lecture::Sequence,
+        MAPS | STATM | COMM => Lecture::Sequence,
         _ => Lecture::Attribut,
     }
 }
@@ -125,6 +195,14 @@ pub fn lecture(source: u32) -> Lecture {
 /// Les données du fichier ouvert d'une source.
 pub fn donnees(source: u32, argument: u32) -> Donnees {
     Donnees::Noyau { source, argument, sequence: Default::default() }
+}
+
+/// La source du fichier ouvert `f` (d'un système du noyau), et son argument.
+pub fn source(f: Fichier) -> (u32, u32) {
+    vfs::avec_systeme(|s, _| match &s.ouverts.fichier(f).donnees {
+        Donnees::Noyau { source, argument, .. } => (*source, *argument),
+        _ => unreachable!("un fichier du noyau sans source"),
+    })
 }
 
 /// Lit le fichier ouvert `f` (une source du noyau) à `position` : au plus
@@ -141,9 +219,14 @@ pub fn lire(f: Fichier, position: u64, longueur: u64) -> Result<Vec<u8>, i64> {
         _ => unreachable!("un fichier du noyau sans source"),
     });
     // Le fichier d'un processus recueilli (sa tâche est morte, et init l'a
-    // retiré de la table) : ESRCH, comme Linux (mesuré). Celui d'un zombie
-    // se lit encore (voir `produire`).
-    if matches!(source, MAPS | STATM) && !processus::existe(argument) {
+    // retiré de la table), ou d'un fil fini : ESRCH, comme Linux (mesuré).
+    // Celui d'un zombie se lit encore (voir `produire`).
+    let disparu = match source {
+        MAPS | STATM => !processus::existe(argument),
+        COMM => nom(argument).is_none(),
+        _ => false,
+    };
+    if disparu {
         vfs::avec_systeme(|s, _| {
             if let Donnees::Noyau { sequence: place, .. } = &mut s.ouverts.fichier(f).donnees {
                 *place = sequence;
@@ -244,7 +327,53 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
     match source {
         MAPS => ligne_maps(argument, curseur),
         STATM if curseur == 0 => statm(argument).map(|t| Some((t, u64::MAX))),
+        COMM if curseur == 0 => comm(argument).map(|t| Some((t, u64::MAX))),
         _ => Ok(None),
+    }
+}
+
+/// Le nom du fil `tid` : celui de sa tâche si elle vit ; sinon, pour un fil
+/// principal, celui que garde son processus (un zombie, ou dont seul le fil
+/// principal a fini : Linux garde sa tâche jusqu'au bout). None pour un fil
+/// fini (ESRCH, `lire`).
+fn nom(tid: u32) -> Option<crate::programmes::NomCourt> {
+    crate::tache::nom_du_fil(tid).or_else(|| processus::nom_du_principal(tid))
+}
+
+/// /proc/.../comm : le nom du fil, avec un saut de ligne (`comm_show`) ;
+/// vide si le fil vient de finir.
+fn comm(tid: u32) -> Result<Vec<u8>, Erreur> {
+    let nom = nom(tid).unwrap_or(crate::programmes::NomCourt::VIDE);
+    let mut t = Vec::new();
+    t.try_reserve_exact(nom.octets().len() + 1).map_err(|_| Erreur::ENOMEM)?;
+    t.extend_from_slice(nom.octets());
+    t.push(b'\n');
+    Ok(t)
+}
+
+/// La source `source` s'écrit-elle (le fichier s'ouvre-t-il en écriture,
+/// si ses droits le permettent) ? Seul `comm`, parmi les nôtres.
+pub fn ecrivable(source: u32) -> bool {
+    source == COMM
+}
+
+/// Écrit `octets` dans le fichier de la source `source` (pour `argument`),
+/// à n'importe quelle position : rend le nombre d'octets pris, ou -errno.
+/// Pour `comm`, comme `comm_write` (mesuré sous Linux 6.18) : les 15
+/// premiers octets deviennent le nom du fil, tels quels jusqu'au premier
+/// octet nul (un saut de ligne écrit en fait partie ; rien écrit : un nom
+/// vide), et tout compte comme écrit ; seul un fil du même processus peut être renommé (EINVAL sinon),
+/// un fil fini : ESRCH.
+pub fn ecrire(source: u32, argument: u32, octets: &[u8], longueur: u64) -> Result<u64, i64> {
+    const EINVAL: i64 = 22;
+    if source != COMM {
+        return Err(-EINVAL);
+    }
+    let nom = octets.split(|&o| o == 0).next().unwrap_or(&[]);
+    match crate::tache::renommer_fil(argument, crate::programmes::NomCourt::de(nom)) {
+        Ok(()) => Ok(longueur),
+        Err(crate::tache::RefusNom::Absent) => Err(-ESRCH),
+        Err(crate::tache::RefusNom::AutreProcessus) => Err(-EINVAL),
     }
 }
 
