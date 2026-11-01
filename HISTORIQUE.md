@@ -328,7 +328,31 @@ Dossier `06f-signaux/`, en quinze commits, d'après le plan écrit au début de 
 - une écriture dans un tube qui voyait partir le dernier lecteur entre deux pages, le `Drop` d'un tube qui prenait un Mutex sous un Verrou, un tube rouvert par son inode après qu'il a été redonné, `tubes sigpipe` qui dépendait de l'action héritée de SIGPIPE ;
 - le code resté des entrées gardées de /proc (6b à 6e) retiré de `noyaufs`, l'ordre des verrous des fichiers et des processus écrit tel qu'il est, une quinzaine de commentaires devenus faux.
 
-## 20. Reste à faire
+## 20. Sous-étape 6g réalisée : PCI, virtio-net, IPv4, UDP, ICMP et le DNS
+
+Dossier `06g-reseau/`, en neuf commits, d'après le plan écrit au début de son fil, mesuré sur Linux 6.18, QEMU 8.2 et libslirp 4.7 par des sondes C et un noyau d'essai au brouillon, et relu par un relecteur indépendant (`plan-6g.md` dans les fichiers du projet ; 34 constats intégrés avant de coder, dont 2 graves). **Le jalon :** `claude -p bonjour` (avec une fausse clé) trouve maintenant l'adresse de l'API par le DNS (celui de slirp, qui relaie celui de l'hôte), puis s'arrête là où il le doit : « API Error: Connection refused … (ECONNREFUSED) », faute de TCP (6h). En 6f, il ne trouvait même pas l'adresse (EAI_AGAIN).
+
+1. **Le bus PCI** : l'espace de configuration par les ports 0xCF8 et 0xCFC (le mécanisme n° 1, celui de l'i440FX ; ECAM viendra avec le vrai matériel), le parcours de `pci_scan_child_bus` en gardant ce qu'a attribué le BIOS, la mesure des BAR (décodage coupé, sauf celui du pont hôte : le `mmio_always_on` de Linux) ; le décodage dans `formats::pci`, testé sur l'hôte avec les espaces capturés de neuf fonctions de QEMU.
+2. **Les vecteurs d'interruption à la demande, et MSI-X** (choix de conception) : de 0x40 à 0xEB, le premier libre (l'`irq_matrix` de Linux pour un processeur), un gestionnaire et son argument par vecteur, lus sans verrou ; MSI-X dans l'ordre de `msix_capability_init`. Pourquoi pas le fil INTx : sa ligne se lit dans la table `_PRT` de l'ACPI, en AML, un interpréteur entier.
+3. **virtio, le transport PCI moderne** (virtio 1.x) : ses quatre structures, la poignée de main de la spécification, la maîtrise du bus que SeaBIOS laisse éteinte ; la carte virtio-net devient eth0, son lien suivi par l'interruption de configuration (le `linkwatch` de Linux).
+4. **Les files de virtio** (choix de conception) : le format « split » avec EVENT_IDX, et ses barrières (un vrai `fence` entre l'écriture d'un index et la lecture de l'index d'événement de l'autre) ; les paquets (le `sk_buff`), les interfaces (la `net_device`) ; la tâche du réseau fait aussi le travail de NAPI (le NAPI « threaded » de Linux), 64 trames par passage.
+5. **Ethernet, IPv4, et la configuration par DHCP** (choix de conception, deux fois) : la configuration faite par le noyau au démarrage (le `ip=dhcp` de Linux, `ipconfig.c` : ses messages, ses délais, la MTU posée, les DNS dans `/proc/net/pnp`, dont `/etc/resolv.conf` est un lien) ; les règles de la pile dans une bibliothèque `inet/`, sans `unsafe`, testée sur l'hôte à l'horloge simulée ; l'entrée d'IPv4 et ses martiens ; /proc/net (pnp, route, dev).
+6. **ARP, les voisins** : la machine à états de Linux (`neighbour`, ses délais, sa file), les règles d'`arp_process` et de `__neigh_update` (le locktime, l'ARP gratuit), /proc/net/arp.
+7. **Les sockets, et UDP** (choix de conception) : la socket à deux étages de Linux, deux verrous (un `Verrou` pour ce que touche la tâche du réseau, un `Mutex` pour les appels) ; bind, connect, le port éphémère, sendto/recvfrom, sendmsg/recvmsg avec IP_PKTINFO, sendmmsg/recvmmsg, les options, poll et epoll ; l'interface de boucle `lo`, dont la file est vidée dans le contexte de qui envoie (le softirq de Linux) : un datagramme envoyé à soi-même est là quand `sendto` revient ; les routes de `ip_route_output` (0.0.0.0, une source de la boucle qui ne sort pas, SO_DONTROUTE).
+8. **ICMP, ses erreurs, et les sockets de ping** : l'écho, les erreurs envoyées comme `__icmp_send` (et sa limite globale), les erreurs rendues aux sockets (ECONNREFUSED, IP_RECVERR et la file d'erreurs) ; les sockets de ping (SOCK_DGRAM, IPPROTO_ICMP) sans être root.
+9. **Le DNS, par la glibc** : rien de neuf dans le noyau ; un serveur DNS dans le programme de test (`linux/dns.c`) qui répond de travers, `api.anthropic.com` trouvé par le DNS de slirp, et sans serveur, EAI_AGAIN tout de suite (l'ICMP « port injoignable » revient par `lo`).
+
+**Pendant l'étape :** la signature des commits n'a pas marché de toute l'étape dans le conteneur, même après le déverrouillage de 1Password : les commits ont attendu en patchs, à créer et signer depuis WSL.
+
+**Relecture de fond :** trois relecteurs indépendants (le matériel ; la pile sous les sockets ; les sockets), chacun avec les sources de Linux 6.18 et sans mes conclusions, 50 constats (aucun grave, 7 moyens), chacun vérifié par une sonde sur l'hôte et dans QEMU, une capture de trames, les sources ou une mutation. Repliés dans leurs commits :
+- **une adresse de `lo` sortait par eth0** : une socket liée à 127.0.0.1 (ou un IP_PKTINFO de source 127.0.0.1) envoyait vers le dehors un paquet de source 127.0.0.1 ; Linux rend EINVAL (`__mkroute_output`) ;
+- **`msg_controllen` n'était pas borné** : jusqu'à 2 Gio alloués dans le tas du noyau à chaque sendmsg ; Linux refuse au-delà d'`optmem_max` (ENOBUFS) ;
+- **ce qui part par `lo` arrivait trop tard** (au passage suivant de la tâche du réseau) ; maintenant livré avant le retour de l'appel, comme Linux ;
+- une fausse alerte « memoire rendue » (un paquet encore dans la file d'un voisin muet, que le repos du réseau ne regardait pas) ;
+- le décodage du pont hôte coupé pendant la mesure des BAR (risqué sur un vrai PC) ; une requête ARP qui ne nous vise pas ignorée (une passerelle qui change d'adresse matérielle coupait le trafic jusqu'à 53 s) ; la MTU donnée par le DHCP lue, jamais posée ;
+- 43 constats mineurs : des écarts à Linux mesurés (les genres ICMP qui sont des erreurs, IP_PMTUDISC_DONT, la destination 0.0.0.0, la diffusion de `lo`, l'ordre des erreurs d'accept4 et de connect, IP_PKTINFO, SO_DONTROUTE, l'identifiant IP, une socket de ping liée à une diffusion…), une BAR « tous les bits à 1 », une mise en service ratée qui perdait 256 pages, deux tests qui ne mordaient pas (révélés par neuf mutations), une vingtaine de commentaires faux.
+
+## 21. Reste à faire
 
 **Dans le noyau**
 
@@ -359,20 +383,32 @@ Dossier `06f-signaux/`, en quinze commits, d'après le plan écrit au début de 
 - **Les signaux** (6f) : livrés à leurs gestionnaires, mais un programme qui devrait s'arrêter (SIGSTOP, SIGTSTP) est terminé, faute de contrôle des tâches pour lui envoyer SIGCONT (6j, 6k) ; ni `signalfd`, ni `timerfd`, ni minuteries de processus (`setitimer`, `alarm`, `timer_create`) ; pas de fichier core ; le pid 1 n'a pas le statut à part de Linux ; un signal envoyé au processus est pris par le premier de ses fils qui retourne vers l'anneau 3 sans le bloquer (Linux le laisse au fil qu'il a choisi et prévenu, `complete_signal`). Une attente que rien ne finira (plus aucune tâche prête ni minuterie) arrête les programmes qui dorment, par SIGKILL et en le disant, faute de terminal pour les interrompre.
 - **/proc et /sys** (6d) : root ne peut pas changer les droits de la racine de /proc ni d'un nœud de sysfs (Linux le permet).
 - **epoll** (6f) : Linux refuse un ajout qui ferait plus de 1000 chemins de réveil vers un même fichier (`reverse_path_check`), pas nous.
-- **Ce que `claude -p` demande encore** : `socket` (le réseau, 6g et 6h), et `socketpair`, `copy_file_range`, `sendfile`, `fadvise64`, `inotify_init1`, qui rendent ENOSYS et dont il se passe (copies par read et write, pas de surveillance des fichiers). Sa vérification « memoire rendue » (`make claude-p`) échoue, à raison : les fichiers qu'il laisse dans HOME restent dans le tmpfs.
+- **Ce que `claude -p` demande encore** : TCP (`socket(AF_INET, SOCK_STREAM)` rend ESOCKTNOSUPPORT jusqu'à 6h), et `socketpair`, `copy_file_range`, `sendfile`, `fadvise64`, `inotify_init1`, qui rendent ENOSYS et dont il se passe (copies par read et write, pas de surveillance des fichiers). Sa vérification « memoire rendue » (`make claude-p`) échoue, à raison : les fichiers qu'il laisse dans HOME restent dans le tmpfs.
 - **`mknodat`** (259) est encore un appel inconnu (avec le shell, 6k).
+
+**Le réseau** (6g)
+
+- **L'identifiant IP** d'un paquet d'une socket non connectée (sauf IP_PMTUDISC_DO et PROBE) et de chaque réponse ou erreur ICMP vient d'un compteur global : un tiers peut y compter, par deux pings, les ICMP que la machine envoie aux autres. Linux hache la destination avec une clé secrète (`__ip_select_ident`) : avec le générateur ChaCha20 de 6h, qui servira aussi aux numéros de séquence de TCP.
+- **Ni fragmentation ni réassemblage** : un datagramme plus grand que la MTU du chemin rend EMSGSIZE (Linux le fragmente avec IP_PMTUDISC_WANT, le réglage par défaut), un fragment reçu est jeté. Une « fragmentation nécessaire » reçue n'est pas retenue pour la route (la MTU du chemin).
+- **ICMP** : la limite des erreurs par destination (`inet_peer`) manque, seule la limite globale est faite. Les options IP ne sont pas validées une à une (`ip_options_compile`) : seules les routes sources sont jetées, sans « problème de paramètre » pour une option fausse.
+- **Une diffusion envoyée** n'est pas rendue aussi aux sockets de la machine (Linux en fait une copie par la boucle) ; ni multidiffusion, ni MSG_MORE et UDP_CORK, ni IP_OPTIONS et IP_RECVTTL (ENOPROTOOPT) ; SO_SNDBUF ne fait jamais attendre. L'interface d'IP_PKTINFO à l'envoi n'est que vérifiée (ENODEV), pas prise pour sortie.
+- **Le DHCP** : les valeurs de l'ACK plutôt que de l'offre (ce que demande la RFC 2131 ; Linux garde l'offre), la porteuse pas attendue (Linux l'attend jusqu'à 120 s), pas de renouvellement du bail (celui de slirp dure un jour).
+- **Le détecteur d'interblocage** épargne un programme bloqué pour toujours dès qu'une de ses sockets est dans un epoll, même que personne n'attend (épargner trop rejoint Linux, qui ne tue jamais personne) : à revoir en 6h si la boucle de Bun le montre.
+- **Pas d'espaces de noms réseau** : /proc/net est un dossier fixe (Linux : un lien vers self/net). Pas d'IPv6, pas d'AF_UNIX (6h) ni d'AF_NETLINK : la glibc s'en passe.
 
 **Pour le vrai matériel**
 
+- **PCI** : seul le premier pont hôte est parcouru ; les bus d'un autre (un serveur à plusieurs complexes racines, l'expandeur `pxb` de QEMU) se trouvent par l'ACPI (l'AML de chaque pont hôte), et l'espace de configuration de PCI Express par ECAM (la table MCFG) : avec le vrai matériel.
+- **virtio-net** veut trois entrées MSI-X (la configuration, une par file) ; une carte qui en a moins reste éteinte, là où Linux se replie sur un vecteur partagé puis sur INTx (dont la ligne se lit dans la table `_PRT` de l'ACPI). Aucune carte de QEMU n'en a moins, sauf demandé.
 - **L'APIC n'est vérifié que sous QEMU**, en xAPIC ; x2APIC (que TCG n'imite pas) fait revenir au 8259. Non vérifiés faute de pouvoir les imiter : `sysretq` avec un SS nul après une bascule sur AMD (le `X86_BUG_SYSRET_SS_ATTRS` de Linux), une adresse ACPI au-delà de MAXPHYADDR (Linux la refuse).
 
 - **NMI pendant le passage éclair en mode protégé du chargeur** : non masqué (Linux le masque par le port 0x70 pour son passage définitif). Risque infime, à revoir si un essai sur vrai matériel le montre.
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 21. Questions ouvertes
+## 22. Questions ouvertes
 
 - Aucune pour l'instant.
 
-## 22. Prochaine étape
+## 23. Prochaine étape
 
-Sous-étape 6g : le bus PCI, la carte réseau virtio-net, Ethernet, IPv4, UDP et le DNS : `claude -p` trouvera l'adresse de l'API, puis bloquera sur TCP (6h). Son plan sera écrit et relu au début de son fil, avec ce que 6f a appris (`etape-06/plan.md` dans les fichiers du projet pour le découpage).
+Sous-étape 6h : TCP, les sockets de flux, AF_UNIX et le générateur aléatoire ChaCha20 (qui servira aussi aux identifiants IP et aux numéros de séquence) : `claude -p` ouvrira sa connexion à l'API (le TLS est l'affaire de Bun, dans le programme). Son plan sera écrit et relu au début de son fil, avec ce que 6g a appris (`etape-06/plan.md` dans les fichiers du projet pour le découpage).

@@ -40,6 +40,7 @@ Le dépôt (github.com/Movida/claude-os) doit se lire étape par étape.
 - Depuis 6d : `make` télécharge le vrai `claude` (2.1.310, paquet npm officiel, empreinte SHA-256 vérifiée) dans `~/.cache/claude-os`, jamais commité ni publié (accord écrit de David pour le télécharger et l'exécuter, ici et dans la CI). La machine de l'étape (disque virtio, `-cpu Nehalem`, `-m 2G`) : `verifier.sh` la demande par `make qemu-disque` et `make qemu-options`. `make tests-hote` lance aussi `linux/signaux`, `systeme`, `evenements` et `proc`. Jamais de trace `strace` de `claude` gardée ou montrée (elle pourrait contenir un jeton) : `make trace` n'en garde que les noms des appels.
 - Depuis 6e : `make tests-hote` lance aussi `linux/clone`, `fils` (dont `fils groupe`, qui doit sortir avec 7) et `courses` ; `make tests-qemu` demande `nc` (paquet `netcat-openbsd`, dans le Dockerfile et la CI), pour envoyer une touche au moniteur de QEMU, et échoue sur tout « ECHEC » de son journal.
 - Depuis 6f : `make tests-hote` lance aussi `linux/gestionnaires`, `reprise`, `suspendre`, `attente` et `tubes` (dont `tubes sigpipe`, qui doit mourir de SIGPIPE : code 141). `make claude-p` lance `claude -p bonjour` (fausse clé, sans réseau) dans une image à part, jusqu'à 240 s sous QEMU, qui doit aller jusqu'à l'appel de l'API (`claude-p-attendu.txt`) ; `make tests-qemu` le lance aussi.
+- Depuis 6g : chaque machine de l'étape a sa carte, virtio-net sur le réseau « utilisateur » de QEMU (slirp), par `-netdev user` et `-device virtio-net-pci` (la forme courte `-nic` donne une carte sans MSI-X ; sans option de réseau, QEMU ajoute une e1000) : `make qemu-options` la donne à `verifier.sh`. `make tests-hote` lance aussi `linux/reseau` (les sockets UDP et ICMP, sur lo) et `linux/dns` (un serveur DNS dans le programme). Dans notre noyau, `passerelle` et `make claude-p` demandent `api.anthropic.com` au DNS de slirp, qui relaie celui de l'hôte : il y faut Internet ; `claude -p` va jusqu'à la connexion refusée (pas de TCP avant 6h).
 - Un test qui peut s'emballer se lance avec `ulimit -v` et `timeout` : en 6b, une boucle infinie a rempli toute la mémoire de WSL (le conteneur est depuis plafonné à 8 Go).
 - Rust, via `rustup` (installé par le devcontainer). La version exacte est figée dans `03-noyau-rust/noyau/rust-toolchain.toml` ; `rustup` l'installe à la première commande `cargo`.
 - Dans chaque étape : `make` pour construire, `make run` pour démarrer dans QEMU, `make dump` pour inspecter l'image ; `make tests-hote` pour les tests qui tournent sur la machine hôte, et `make tests-qemu` pour les scénarios dans QEMU (pannes provoquées, programmes fautifs), quand l'étape en a.
@@ -69,7 +70,7 @@ Puis lire `serial.log`. Pour une capture de l'écran, envoyer `screendump ecran.
    - 6d. `claude --version` (fait)
    - 6e. Ordonnanceur, APIC et IO-APIC, fils (`clone3`, `futex`) (fait)
    - 6f. Signaux, `epoll`, `eventfd`, tubes (fait)
-   - 6g. PCI, virtio-net, Ethernet, IPv4, UDP, DNS
+   - 6g. PCI, virtio-net, Ethernet, IPv4, UDP, DNS (fait)
    - 6h. TCP, sockets, générateur aléatoire (ChaCha20)
    - 6i. `claude -p "bonjour"` : la première réponse de Claude
    - 6j. Le port série devient un vrai terminal (termios, `/dev/tty`)
