@@ -1272,6 +1272,17 @@ pub fn verifier_au_retour(cadre: &mut Cadre) {
                 crate::reprise::avant_gestionnaire(cadre, action.drapeaux & signaux::SA_RESTART != 0);
                 livrer(cadre, sig, &info, &action, masque, pile);
             }
+            // Rien à livrer sous le masque d'attente : comme Linux
+            // (`arch_do_signal_or_restart`), l'appel interrompu est d'abord
+            // repris, puis le masque d'avant rendu, et l'on regarde
+            // encore. Un signal qu'il bloquait de moins est alors livré
+            // par-dessus l'appel refait (rax est redevenu son numéro, rien
+            // à convertir) : sigsuspend attend de nouveau après le
+            // gestionnaire au lieu de rendre EINTR.
+            Some(Arret::RendreMasque) => {
+                crate::reprise::sans_gestionnaire(cadre);
+                processus::avec(|p| signaux::rendre_masque_sauve(p, courante().tid));
+            }
             Some(arret) => break arret,
             None => {
                 // Plus rien à livrer : un appel interrompu sans qu'un
@@ -1299,7 +1310,7 @@ pub fn verifier_au_retour(cadre: &mut Cadre) {
             signaux::signal(sig),
             "suspendu par un signal ; sans controle des taches (6k), personne ne pourrait le relancer : termine",
         ),
-        Arret::Gestionnaire { .. } => unreachable!("un gestionnaire est appele dans la boucle"),
+        Arret::Gestionnaire { .. } | Arret::RendreMasque => unreachable!("un gestionnaire, un masque : dans la boucle"),
     }
 }
 
@@ -1362,7 +1373,12 @@ fn decider() -> Option<Arret> {
                 xcpu = Some(courante);
             }
         }
-        signaux::a_livrer(p, t.tid).map(|l| match l {
+        // Plus rien à livrer, mais un masque sauvé (rt_sigsuspend) : la
+        // boucle reprend l'appel, puis le rend.
+        let Some(livraison) = signaux::a_livrer(p, t.tid) else {
+            return signaux::a_un_masque_sauve(p, t.tid).then_some(Arret::RendreMasque);
+        };
+        Some(match livraison {
             signaux::Livraison::Gestionnaire { sig, info, action } => {
                 let (masque, pile) = signaux::masque_et_pile(p, t.tid);
                 Arret::Gestionnaire { sig, info, action, masque, pile }
@@ -1397,6 +1413,10 @@ enum Arret {
     /// pose son cadre et recommence), avec le masque et la pile de secours
     /// du fil à ce moment.
     Gestionnaire { sig: u64, info: signaux::Info, action: signaux::Action, masque: u64, pile: signaux::PileDeSecours },
+    /// Rien à livrer, mais un masque sauvé à rendre (cela n'arrête rien non
+    /// plus : la boucle reprend l'appel interrompu, rend le masque, et
+    /// recommence).
+    RendreMasque,
 }
 
 /// Une exception du programme en cours (une faute de page, une

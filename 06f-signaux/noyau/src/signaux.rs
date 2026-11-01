@@ -374,6 +374,14 @@ pub struct SignauxDuFil {
     bloques_reels: u64,
     attente: EnAttente,
     pile: PileDeSecours,
+    /// Le masque à rendre au retour vers l'anneau 3 (le `saved_sigmask` et le
+    /// TIF_RESTORE_SIGMASK de Linux) : rt_sigsuspend (et bientôt ppoll,
+    /// pselect6, epoll_pwait) pose un masque le temps de l'attente ; si un
+    /// gestionnaire est appelé, c'est ce masque-ci qui va dans son cadre (le
+    /// premier seulement : les suivants prennent le masque courant), et
+    /// rt_sigreturn le rétablira ; sinon il est remis au retour, une fois
+    /// l'appel interrompu repris (tache.rs).
+    masque_sauve: Option<u64>,
 }
 
 impl SignauxDuFil {
@@ -381,7 +389,13 @@ impl SignauxDuFil {
     /// attente, pas de pile de secours (`copy_process` l'efface pour un fil
     /// qui partage la mémoire sans vfork).
     pub fn herite(&self) -> SignauxDuFil {
-        SignauxDuFil { bloques: self.bloques, bloques_reels: 0, attente: EnAttente::default(), pile: PileDeSecours::default() }
+        SignauxDuFil {
+            bloques: self.bloques,
+            bloques_reels: 0,
+            attente: EnAttente::default(),
+            pile: PileDeSecours::default(),
+            masque_sauve: None,
+        }
     }
 }
 
@@ -655,7 +669,33 @@ pub const SA_RESETHAND: u64 = 0x8000_0000;
 /// Le masque du fil `tid`, et sa pile de secours (pour poser un cadre de
 /// signal).
 pub fn masque_et_pile(p: &mut Processus, tid: u32) -> (u64, PileDeSecours) {
-    p.fil(tid).map_or((0, PileDeSecours::default()), |f| (f.signaux.bloques, f.signaux.pile))
+    p.fil(tid).map_or((0, PileDeSecours::default()), |f| (f.signaux.masque_sauve.unwrap_or(f.signaux.bloques), f.signaux.pile))
+}
+
+/// Le fil `tid` a-t-il un masque sauvé (rt_sigsuspend...), à rendre au
+/// retour vers l'anneau 3 ?
+pub fn a_un_masque_sauve(p: &mut Processus, tid: u32) -> bool {
+    p.fil(tid).is_some_and(|f| f.signaux.masque_sauve.is_some())
+}
+
+/// Plus rien à livrer au fil `tid`, et l'appel interrompu repris : son
+/// masque sauvé est remis (`restore_saved_sigmask`). Des signaux qu'il
+/// bloquait de moins peuvent maintenant être livrés : la sortie vers
+/// l'anneau 3 regarde encore.
+pub fn rendre_masque_sauve(p: &mut Processus, tid: u32) {
+    if let Some(m) = p.fil(tid).and_then(|f| f.signaux.masque_sauve.take()) {
+        poser_masque(p, tid, m);
+    }
+}
+
+/// Pose le masque `masque` le temps d'une attente, l'actuel étant sauvé
+/// pour être rendu au retour (rt_sigsuspend). Rend le masque d'avant.
+fn masque_d_attente(p: &mut Processus, tid: u32, masque: u64) -> u64 {
+    let Some(f) = p.fil(tid) else { return 0 };
+    let avant = f.signaux.bloques;
+    f.signaux.masque_sauve = Some(avant);
+    poser_masque(p, tid, masque);
+    avant
 }
 
 /// Un gestionnaire de `sig` vient d'être posé pour le fil `tid` (le
@@ -670,6 +710,9 @@ pub fn apres_livraison(p: &mut Processus, tid: u32, sig: u64, action: &Action) {
     }
     if let Some(f) = p.fil(tid) {
         f.signaux.bloques |= bloques & !IMBLOQUABLES;
+        // Le masque sauvé est dans le cadre : rt_sigreturn le rendra
+        // (`clear_restore_sigmask`).
+        f.signaux.masque_sauve = None;
         if f.signaux.pile.drapeaux & SS_AUTODISARM != 0 {
             f.signaux.pile = PileDeSecours { adresse: 0, taille: 0, drapeaux: SS_DISABLE };
         }
@@ -1125,6 +1168,49 @@ pub fn rt_tgsigqueueinfo(tgid: u64, tid: u64, sig: u64, uinfo: u64) -> i64 {
         return -EPERM;
     }
     au_fil(Some(tgid), tid, sig, info)
+}
+
+/// rt_sigsuspend(masque, taille du masque) : attend un signal avec ce masque
+/// (sans SIGKILL ni SIGSTOP), puis rend le sien (`sigsuspend`). La taille :
+/// 8, sinon EINVAL ; le masque lu (EFAULT). Le fil dort jusqu'à ce qu'un
+/// signal qu'il ne bloque pas arrive, puis rend ERESTARTNOHAND : un
+/// gestionnaire est appelé, sigsuspend rend EINTR après lui, et son masque
+/// d'avant revient avec rt_sigreturn ; sans gestionnaire (un signal pris par
+/// un autre fil), il attend de nouveau. C'est ce que fait JavaScriptCore pour
+/// suspendre un fil (son gestionnaire de SIGPWR attend là qu'on le relance).
+pub fn rt_sigsuspend(masque: u64, taille: u64) -> i64 {
+    if taille != 8 {
+        return -EINVAL;
+    }
+    let mut o = [0u8; 8];
+    if copier_depuis_utilisateur(&mut o, masque).is_err() {
+        return -EFAULT;
+    }
+    let tid = tache::courante().tid();
+    let interruptions = crate::cpu::couper_interruptions();
+    processus::avec(|p| masque_d_attente(p, tid, u64::from_le_bytes(o)));
+    attendre_un_signal();
+    if interruptions {
+        crate::cpu::activer_interruptions();
+    }
+    -crate::reprise::ERESTARTNOHAND
+}
+
+/// pause() : attend un signal, sans changer de masque ; ERESTARTNOHAND,
+/// comme sigsuspend.
+pub fn pause() -> i64 {
+    let interruptions = crate::cpu::couper_interruptions();
+    attendre_un_signal();
+    if interruptions {
+        crate::cpu::activer_interruptions();
+    }
+    -crate::reprise::ERESTARTNOHAND
+}
+
+/// Dort jusqu'à ce qu'un signal non bloqué attende le fil courant (une
+/// attente sans file : seul un signal la réveille). Interruptions coupées.
+fn attendre_un_signal() {
+    while crate::attente::dormir(None, crate::attente::Sommeil::Interruptible) != tache::Reveil::Signal {}
 }
 
 /// rt_sigtimedwait(ensemble, siginfo, délai, taille du masque) : attend un

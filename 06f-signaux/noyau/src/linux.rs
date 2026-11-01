@@ -161,6 +161,8 @@ const KILL: u64 = 62;
 const RT_SIGPENDING: u64 = 127;
 const SIGALTSTACK: u64 = 131;
 const RT_SIGRETURN: u64 = 15;
+const RT_SIGSUSPEND: u64 = 130;
+const PAUSE: u64 = 34;
 const RESTART_SYSCALL: u64 = 219;
 const TKILL: u64 = 200;
 const TGKILL: u64 = 234;
@@ -264,6 +266,8 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         RT_SIGPENDING => signaux::rt_sigpending(a[0], a[1]),
         SIGALTSTACK => signaux::sigaltstack(a[0], a[1], cadre.rsp),
         RT_SIGRETURN => crate::cadre_signal::rt_sigreturn(cadre),
+        RT_SIGSUSPEND => signaux::rt_sigsuspend(a[0], a[1]),
+        PAUSE => signaux::pause(),
         RESTART_SYSCALL => crate::reprise::restart_syscall(),
         KILL => signaux::kill(a[0], a[1]),
         TKILL => signaux::tkill(a[0], a[1]),
@@ -412,6 +416,8 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         RT_SIGPENDING => ("rt_sigpending", 2),
         SIGALTSTACK => ("sigaltstack", 2),
         RT_SIGRETURN => ("rt_sigreturn", 0),
+        RT_SIGSUSPEND => ("rt_sigsuspend", 2),
+        PAUSE => ("pause", 0),
         RESTART_SYSCALL => ("restart_syscall", 0),
         KILL => ("kill", 2),
         TKILL => ("tkill", 2),
