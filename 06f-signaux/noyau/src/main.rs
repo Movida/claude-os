@@ -61,6 +61,7 @@ mod reprise;
 mod rusage;
 mod serie;
 mod signaux;
+mod sondage;
 mod sysfs;
 mod sse;
 mod tache;

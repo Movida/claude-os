@@ -151,6 +151,10 @@ const EVENTFD: u64 = 284;
 const EVENTFD2: u64 = 290;
 const EPOLL_CREATE1: u64 = 291;
 const EPOLL_PWAIT2: u64 = 441;
+const POLL: u64 = 7;
+const PPOLL: u64 = 271;
+const SELECT: u64 = 23;
+const PSELECT6: u64 = 270;
 const UNAME: u64 = 63;
 const PRCTL: u64 = 157;
 const FUTEX: u64 = 202;
@@ -253,6 +257,10 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         EPOLL_CREATE1 => evenements::epoll_create1(a[0]),
         EPOLL_CTL => evenements::epoll_ctl(a[0], a[1], a[2], a[3]),
         EPOLL_WAIT | EPOLL_PWAIT | EPOLL_PWAIT2 => evenements::epoll_wait(),
+        POLL => crate::sondage::poll(a[0], a[1], a[2]),
+        PPOLL => crate::sondage::ppoll(a[0], a[1], a[2], a[3], a[4]),
+        SELECT => crate::sondage::select(a[0], a[1], a[2], a[3], a[4]),
+        PSELECT6 => crate::sondage::pselect6(a[0], a[1], a[2], a[3], a[4], a[5]),
         UNAME => uname(a[0]),
         SCHED_GETAFFINITY => sched_getaffinity(a[0], a[1], a[2]),
         // Céder le processeur (ordonnanceur.rs).
@@ -407,6 +415,10 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         EPOLL_WAIT => ("epoll_wait", 4),
         EPOLL_PWAIT => ("epoll_pwait", 6),
         EPOLL_PWAIT2 => ("epoll_pwait2", 6),
+        POLL => ("poll", 3),
+        PPOLL => ("ppoll", 5),
+        SELECT => ("select", 5),
+        PSELECT6 => ("pselect6", 6),
         UNAME => ("uname", 1),
         SCHED_GETAFFINITY => ("sched_getaffinity", 3),
         SCHED_YIELD => ("sched_yield", 0),

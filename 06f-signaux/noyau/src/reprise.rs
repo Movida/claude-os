@@ -21,7 +21,7 @@
 //!     noyau a gardé pour lui dans le fil (le `restart_block` : un sommeil
 //!     relatif devenu échéance absolue, pour ne pas recommencer le délai) ;
 //!     EINTR avec un gestionnaire. nanosleep, clock_nanosleep relatif, un
-//!     futex à délai.
+//!     futex à délai, poll (avec ou sans délai : sondage.rs).
 //! « Refaire » : remettre dans rax le numéro de l'appel (gardé dans le
 //! cadre : `code_erreur`, l'orig_ax de Linux), et reculer RIP de 2 octets,
 //! la taille de l'instruction `syscall` : le programme la refait en
@@ -59,6 +59,8 @@ pub enum Reprise {
     /// Un futex attendu avec un délai, jusqu'à son échéance absolue (sur
     /// CLOCK_REALTIME si `reelle`).
     Futex { adresse: u64, partage: bool, val: u32, reelle: bool, echeance: i128, bitset: u32 },
+    /// Un poll, avec son tableau, jusqu'à la même échéance.
+    Poll { tableau: u64, nombre: u32, delai: crate::sondage::Delai },
 }
 
 /// Garde dans le fil courant ce que reprendra `restart_syscall`.
@@ -75,6 +77,7 @@ pub fn restart_syscall() -> i64 {
         Some(Reprise::Futex { adresse, partage, val, reelle, echeance, bitset }) => {
             crate::futex::reprendre_attente(adresse, partage, val, reelle, echeance, bitset)
         }
+        Some(Reprise::Poll { tableau, nombre, delai }) => crate::sondage::reprendre_poll(tableau, nombre, delai),
         None => -EINTR,
     }
 }

@@ -173,6 +173,23 @@ impl FichierTenu {
         vfs::avec_systeme(|s, _| s.ouverts.fichier(self.fichier).position = position);
     }
 
+    /// Le même fichier, tenu une fois de plus (le `get_file` de Linux) : une
+    /// entrée de `poll` le garde ainsi tant qu'elle est inscrite dans sa file
+    /// (sondage.rs), même s'il est fermé entre-temps.
+    pub fn dupliquer(&self) -> FichierTenu {
+        vfs::avec_systeme(|s, _| s.ouverts.prendre(self.fichier));
+        FichierTenu {
+            fichier: self.fichier,
+            sorte: self.sorte,
+            prive: self.prive.clone(),
+            objet: self.objet,
+            lecture: self.lecture,
+            ecriture: self.ecriture,
+            drapeaux: self.drapeaux,
+            fermer_a_l_exec: self.fermer_a_l_exec,
+        }
+    }
+
     /// L'eventfd d'un fichier de sorte EventFd.
     pub fn eventfd(&self) -> &evenements::EventFd {
         match &self.prive {

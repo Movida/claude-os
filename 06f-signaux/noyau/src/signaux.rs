@@ -375,8 +375,8 @@ pub struct SignauxDuFil {
     attente: EnAttente,
     pile: PileDeSecours,
     /// Le masque à rendre au retour vers l'anneau 3 (le `saved_sigmask` et le
-    /// TIF_RESTORE_SIGMASK de Linux) : rt_sigsuspend (et bientôt ppoll,
-    /// pselect6, epoll_pwait) pose un masque le temps de l'attente ; si un
+    /// TIF_RESTORE_SIGMASK de Linux) : rt_sigsuspend, ppoll et pselect6 (et
+    /// bientôt epoll_pwait) posent un masque le temps de l'attente ; si un
     /// gestionnaire est appelé, c'est ce masque-ci qui va dans son cadre (le
     /// premier seulement : les suivants prennent le masque courant), et
     /// rt_sigreturn le rétablira ; sinon il est remis au retour, une fois
@@ -685,6 +685,36 @@ pub fn a_un_masque_sauve(p: &mut Processus, tid: u32) -> bool {
 pub fn rendre_masque_sauve(p: &mut Processus, tid: u32) {
     if let Some(m) = p.fil(tid).and_then(|f| f.signaux.masque_sauve.take()) {
         poser_masque(p, tid, m);
+    }
+}
+
+/// Le masque du programme à l'adresse `adresse` (`taille` : 8, sinon
+/// EINVAL ; EFAULT), posé le temps d'une attente, celui d'avant sauvé pour
+/// être rendu au retour : ppoll, pselect6, epoll_pwait (`set_user_sigmask`).
+/// Une adresse nulle : rien ne change.
+pub fn masque_temporaire(adresse: u64, taille: u64) -> Result<(), i64> {
+    if adresse == 0 {
+        return Ok(());
+    }
+    if taille != 8 {
+        return Err(-EINVAL);
+    }
+    let mut o = [0u8; 8];
+    copier_depuis_utilisateur(&mut o, adresse).map_err(|_| -EFAULT)?;
+    let tid = tache::courante().tid();
+    processus::avec(|p| masque_d_attente(p, tid, u64::from_le_bytes(o)));
+    Ok(())
+}
+
+/// La fin d'une attente sous un masque temporaire
+/// (`restore_saved_sigmask_unless`) : interrompue (ERESTARTNOHAND), le
+/// masque sauvé reste, pour aller dans le cadre du gestionnaire ; sinon il
+/// est rendu tout de suite, et un signal que seul le masque temporaire
+/// laissait passer ne sera pas livré.
+pub fn fin_du_masque_temporaire(interrompue: bool) {
+    if !interrompue {
+        let tid = tache::courante().tid();
+        processus::avec(|p| rendre_masque_sauve(p, tid));
     }
 }
 

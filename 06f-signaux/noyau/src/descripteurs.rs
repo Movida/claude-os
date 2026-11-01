@@ -431,11 +431,14 @@ pub struct Descripteurs {
     /// RLIMIT_NOFILE : (courante, dure). Aucun descripteur à cette valeur
     /// ou au-delà.
     pub limite: (u64, u64),
+    /// Le plus grand numéro jamais pris : de lui vient la taille qu'aurait
+    /// la table de Linux (`taille_linux`).
+    plus_haut: u64,
 }
 
 impl Descripteurs {
     pub fn new() -> Descripteurs {
-        Descripteurs { cases: Vec::new(), limite: LIMITE_DESCRIPTEURS }
+        Descripteurs { cases: Vec::new(), limite: LIMITE_DESCRIPTEURS, plus_haut: 0 }
     }
 
     /// La case `fd` (libre au-delà de la fin de la table). Linux ne regarde
@@ -467,7 +470,24 @@ impl Descripteurs {
             self.cases.try_reserve(i + 1 - self.cases.len()).map_err(|_| Refus::PlusDeMemoire)?;
             self.cases.resize(i + 1, Case::Libre);
         }
+        self.plus_haut = self.plus_haut.max(fd);
         Ok(())
+    }
+
+    /// La taille qu'aurait la table de Linux (le `max_fds` de sa `fdtable`) :
+    /// 64 cases d'abord, puis la puissance de deux qui contient le plus
+    /// grand numéro jamais pris (`alloc_fdtable`), jamais moins. `select`
+    /// ne regarde pas au-delà (ni ne lit, ni n'écrit les bits suivants des
+    /// ensembles du programme). La nôtre rétrécit quand on ferme ; il faut
+    /// donc s'en souvenir.
+    pub fn taille_linux(&self) -> u64 {
+        (self.plus_haut + 1).next_power_of_two().max(64)
+    }
+
+    /// Le numéro `fd` est-il pris, ouvert ou seulement réservé (son bit
+    /// dans l'`open_fds` de Linux, posé dès `alloc_fd`) ?
+    pub fn pris(&self, fd: u64) -> bool {
+        !matches!(self.case(fd), Case::Libre)
     }
 
     /// Réserve le plus petit numéro libre, `minimum` ou au-delà, sous la

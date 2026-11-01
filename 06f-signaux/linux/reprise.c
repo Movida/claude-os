@@ -1,7 +1,8 @@
 /*
  * Les appels interrompus par un gestionnaire de signal (6f) : rendent-ils
- * EINTR, ou reprennent-ils (SA_RESTART, restart_syscall) ? Avec
- * rt_sigsuspend et pause, et le masque qu'ils rendent au retour. Pour chaque appel
+ * EINTR, ou reprennent-ils (SA_RESTART, restart_syscall) ? Avec poll,
+ * ppoll, select, pselect6, rt_sigsuspend et pause, et le masque qu'ils
+ * rendent au retour. Pour chaque appel
  * qui attend, un autre fil envoie SIGUSR1 au fil qui attend jusqu'à ce que
  * son gestionnaire ait tourné, puis fait ce qui finit l'attente (écrire
  * l'eventfd, réveiller le futex) : un appel repris rend alors son résultat,
@@ -16,6 +17,7 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <linux/futex.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -23,6 +25,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include <sys/select.h>
 #include <sys/syscall.h>
 #include <time.h>
 #include <ucontext.h>
@@ -161,6 +164,61 @@ static long dormir_clock_absolu(void)
     t.tv_sec += 5;
     reste = (struct timespec){ 99, 0 };
     return syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, TIMER_ABSTIME, &t, &reste);
+}
+
+/* poll, ppoll, select et pselect6 sur l'eventfd, que l'aide écrit après
+ * le signal : repris, ils rendraient 1. Le temps restant de ppoll, select
+ * et pselect6 (un délai de 1 s, interrompu au début) est écrit. */
+static struct pollfd pfd;
+static struct timespec delai_ts;
+static struct timeval delai_tv;
+static fd_set ensemble;
+
+static long poll_infini(void)
+{
+    pfd = (struct pollfd){ efd, POLLIN, 0 };
+    return syscall(SYS_poll, &pfd, 1, -1);
+}
+
+static long poll_1000(void)
+{
+    pfd = (struct pollfd){ efd, POLLIN, 0 };
+    return syscall(SYS_poll, &pfd, 1, 1000);
+}
+
+static long ppoll_1s(void)
+{
+    pfd = (struct pollfd){ efd, POLLIN, 0 };
+    delai_ts = (struct timespec){ 1, 0 };
+    return syscall(SYS_ppoll, &pfd, 1, &delai_ts, NULL, 8);
+}
+
+static long ppoll_infini(void)
+{
+    pfd = (struct pollfd){ efd, POLLIN, 0 };
+    return syscall(SYS_ppoll, &pfd, 1, NULL, NULL, 8);
+}
+
+static long select_1s(void)
+{
+    FD_ZERO(&ensemble);
+    FD_SET(efd, &ensemble);
+    delai_tv = (struct timeval){ 1, 0 };
+    return syscall(SYS_select, efd + 1, &ensemble, NULL, NULL, &delai_tv);
+}
+
+static long pselect6_1s(void)
+{
+    FD_ZERO(&ensemble);
+    FD_SET(efd, &ensemble);
+    delai_ts = (struct timespec){ 1, 0 };
+    return syscall(SYS_pselect6, efd + 1, &ensemble, NULL, NULL, &delai_ts, NULL);
+}
+
+/* Le reste d'un délai de 1 s, interrompu après quelques millisecondes. */
+static int reste_d_une_seconde(long long us)
+{
+    return us > 500000 && us < 1000000;
 }
 
 static long suspendre_vide(void)
@@ -409,6 +467,15 @@ int main(void)
     sigprocmask(SIG_BLOCK, &u2, NULL);
     deux("rt_sigtimedwait", 0, attendre_usr2, -EINTR, -EINTR);
     sigprocmask(SIG_UNBLOCK, &u2, NULL);
+    deux("poll sans delai", 1, poll_infini, -EINTR, -EINTR);
+    deux("poll de 1000 ms", 1, poll_1000, -EINTR, -EINTR);
+    deux("ppoll de 1 s", 1, ppoll_1s, -EINTR, -EINTR);
+    verifier(reste_d_une_seconde(delai_ts.tv_sec * 1000000LL + delai_ts.tv_nsec / 1000), "ppoll interrompu : le temps restant ecrit");
+    deux("ppoll sans delai", 1, ppoll_infini, -EINTR, -EINTR);
+    deux("select de 1 s", 1, select_1s, -EINTR, -EINTR);
+    verifier(reste_d_une_seconde(delai_tv.tv_sec * 1000000LL + delai_tv.tv_usec), "select interrompu : le temps restant ecrit");
+    deux("pselect6 de 1 s", 1, pselect6_1s, -EINTR, -EINTR);
+    verifier(reste_d_une_seconde(delai_ts.tv_sec * 1000000LL + delai_ts.tv_nsec / 1000), "pselect6 interrompu : le temps restant ecrit");
     deux("rt_sigsuspend", 0, suspendre_vide, -EINTR, -EINTR);
     deux("pause", 0, en_pause, -EINTR, -EINTR);
     deux_signaux_pendant_sigsuspend();

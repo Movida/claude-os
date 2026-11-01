@@ -36,8 +36,8 @@ memoire rendue : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 40, liens symboliques 5, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 37 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 41, liens symboliques 5, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 38 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -120,6 +120,8 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] reprise : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] suspendre : toutes les verifications : ok
 [noyau] suspendre : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] attente : toutes les verifications : ok
+[noyau] attente : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] systeme : toutes les verifications : ok
 [noyau] systeme : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] evenements : toutes les verifications : ok

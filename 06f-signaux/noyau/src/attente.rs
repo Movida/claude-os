@@ -27,9 +27,17 @@
 //! qu'une chose à la fois) : s'inscrire ne peut donc pas échouer, et une
 //! file d'un objet qui dure (le clavier, la console) ne garde aucune mémoire
 //! après son dernier attendant (le contrôle « memoire rendue » des
-//! programmes le verrait).
+//! programmes le verrait). Une entrée peut aussi être un RAPPEL : une
+//! fonction que le réveil appelle au lieu de réveiller une tâche, et qui
+//! laisse l'entrée inscrite. C'est ainsi que `poll` attend plusieurs
+//! fichiers à la fois (une entrée dans la file de chacun, qui réveille la
+//! même tâche), et qu'un epoll apprendra qu'un de ses fichiers est prêt.
 //!
-//! Une entrée peut être EXCLUSIVE (WQ_FLAG_EXCLUSIVE) : `reveiller(n)`
+//! Un réveil porte une CLÉ, les événements qui viennent d'arriver (POLLIN
+//! quand un eventfd reçoit une écriture, POLLOUT quand il est lu ; 0 :
+//! « n'importe quoi ») : un rappel l'ignore s'il attend autre chose (une
+//! tâche, elle, est toujours réveillée). Une entrée peut être EXCLUSIVE
+//! (WQ_FLAG_EXCLUSIVE) : `reveiller(cle, n)`
 //! réveille toutes les entrées ordinaires, mais s'arrête dès que `n`
 //! exclusives ont réveillé quelqu'un (le `__wake_up_common` de Linux). Pour
 //! un verrou qui dort, ou bientôt les lecteurs d'un tube, réveiller tous
@@ -44,9 +52,12 @@
 //! La file a son propre verrou (le spinlock du `wait_queue_head` de
 //! Linux), pris APRÈS celui de l'objet attendu s'il est tenu. Option
 //! écartée, celle de 6e : la file sous le verrou de son objet. Mais `poll`
-//! et epoll (6f) laisseront des entrées dans la file d'un fichier pendant
-//! qu'ils attendent, et devront les retirer sans rien savoir de lui (un
-//! eventfd, un tube, le clavier...), ni de son verrou.
+//! et epoll laissent des entrées dans la file d'un fichier pendant qu'ils
+//! attendent, et doivent les retirer sans rien savoir de lui (un eventfd,
+//! un tube, le clavier...), ni de son verrou. Un rappel est appelé sous le
+//! verrou de la file : il ne doit pas y toucher (le verrou est pris :
+//! panique), mais peut prendre d'autres verrous (celui de son epoll, la
+//! file des prêtes).
 //!
 //! Les minuteries (les échéances des attentes) : une liste triée par
 //! échéance, réservée au démarrage pour autant de tâches qu'il peut y en
@@ -63,17 +74,31 @@ use crate::verrou::Verrou;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, UnsafeCell};
+use core::marker::PhantomPinned;
 use core::ops::{Deref, DerefMut};
+use core::pin::Pin;
 
-/// Une entrée d'une file d'attente (la `wait_queue_entry` de Linux) : celle
-/// d'une tâche qui dort. Une entrée inscrite ne doit ni bouger ni
-/// disparaître : la file la désigne par son adresse. Celle d'une tâche est
-/// dans sa `Tache`, qui ne quitte jamais son Arc, et la file tient cet Arc
-/// tant qu'elle y est ; la détruire encore inscrite arrête le noyau (`Drop`),
-/// avant que la file ne désigne une mémoire rendue. Option écartée : des
-/// entrées dans un `Vec` de la file (pas de pointeurs) ; mais inscrire
-/// allouerait (et pourrait échouer), et une tâche ne pourrait pas attendre
-/// sans mémoire.
+/// Ce que fait le réveil d'une entrée qui n'est pas une tâche : l'entrée
+/// d'un `poll` (sondage.rs), et bientôt l'élément d'un epoll.
+pub trait Rappel {
+    /// La file de l'entrée est réveillée, avec la clé `cle` (les événements
+    /// arrivés, 0 : n'importe lesquels). Rend vrai si une tâche a été
+    /// réveillée par lui : pour une entrée exclusive, le réveil compte.
+    /// Appelé sous le verrou de la file, interruptions coupées.
+    fn rappel(&self, cle: u32) -> bool;
+}
+
+/// Une entrée d'une file d'attente (la `wait_queue_entry` de Linux).
+///
+/// Une entrée inscrite ne doit ni bouger ni disparaître : la file la
+/// désigne par son adresse. Celle d'une tâche est dans sa `Tache`, qui ne
+/// quitte jamais son Arc, et la file tient cet Arc tant qu'elle y est ;
+/// celle d'un rappel est épinglée (`Pin`, et `PhantomPinned` pour que Rust
+/// refuse de la déplacer une fois épinglée). Et la détruire encore inscrite
+/// arrête le noyau (`Drop`), avant que la file ne désigne une mémoire
+/// rendue. Option écartée : des entrées dans un `Vec` de la file (pas de
+/// pointeurs) ; mais inscrire allouerait (et pourrait échouer), et une
+/// tâche ne pourrait pas attendre sans mémoire.
 pub struct EntreeAttente {
     /// La suivante dans la file (sous le verrou de la file).
     suivante: Cell<*const EntreeAttente>,
@@ -81,10 +106,19 @@ pub struct EntreeAttente {
     exclusive: Cell<bool>,
     /// Dans une file en ce moment : une entrée n'est que dans une à la fois.
     inscrite: Cell<bool>,
-    /// La tâche : le pointeur de l'Arc que tient la file tant qu'elle y est.
-    /// Son réveil la retire de la file (le `autoremove_wake_function` de
-    /// Linux).
-    tache: Cell<*const Tache>,
+    genre: Cell<Genre>,
+    _epinglee: PhantomPinned,
+}
+
+/// Ce que désigne une entrée.
+#[derive(Clone, Copy)]
+enum Genre {
+    /// Une tâche qui dort : le pointeur d'un Arc que tient la file tant
+    /// qu'elle y est. Son réveil la retire de la file (le
+    /// `autoremove_wake_function` de Linux).
+    Tache(*const Tache),
+    /// Un rappel, qui laisse l'entrée inscrite.
+    Rappel(*const dyn Rappel),
 }
 
 // SAFETY : une entrée n'est lue et écrite que par qui l'inscrit, avant de
@@ -100,8 +134,23 @@ impl EntreeAttente {
             suivante: Cell::new(core::ptr::null()),
             exclusive: Cell::new(false),
             inscrite: Cell::new(false),
-            tache: Cell::new(core::ptr::null()),
+            genre: Cell::new(Genre::Tache(core::ptr::null())),
+            _epinglee: PhantomPinned,
         }
+    }
+
+    /// Fait de l'entrée celle d'un rappel : `qui` sera appelé à chaque
+    /// réveil de la file où elle sera inscrite ; exclusive ou non, comme
+    /// `inscrire_exclusive` et `inscrire`.
+    ///
+    /// # Safety
+    /// `qui` doit rester valable tant que l'entrée est inscrite (en
+    /// pratique : `qui` contient l'entrée, et n'est rendu qu'après l'avoir
+    /// retirée).
+    pub unsafe fn preparer_rappel(&self, qui: *const dyn Rappel, exclusive: bool) {
+        assert!(!self.inscrite.get(), "entree d'attente preparee pendant qu'elle est inscrite");
+        self.genre.set(Genre::Rappel(qui));
+        self.exclusive.set(exclusive);
     }
 }
 
@@ -123,7 +172,7 @@ struct Liste {
 }
 
 // SAFETY : la liste n'est touchée que sous son verrou, et ses entrées
-// restent à leur place tant qu'elles y sont (dans leur tâche).
+// restent à leur place tant qu'elles y sont (dans leur tâche, ou épinglées).
 unsafe impl Send for Liste {}
 
 impl Liste {
@@ -135,7 +184,7 @@ impl Liste {
         let p: *const EntreeAttente = e;
         if e.exclusive.get() {
             e.suivante.set(core::ptr::null());
-            // SAFETY : les entrées de la liste sont valables (dans leur tâche, tenue).
+            // SAFETY : les entrées de la liste sont valables (dans leur tâche tenue, ou épinglées).
             match unsafe { self.queue.as_ref() } {
                 Some(q) => q.suivante.set(p),
                 None => self.tete = p,
@@ -183,6 +232,14 @@ impl Liste {
     }
 }
 
+/// La tâche d'une entrée, si c'en est une.
+fn tache_de(e: &EntreeAttente) -> Option<*const Tache> {
+    match e.genre.get() {
+        Genre::Tache(t) => Some(t),
+        Genre::Rappel(_) => None,
+    }
+}
+
 impl FileAttente {
     pub const fn new() -> FileAttente {
         FileAttente { liste: Verrou::new(Liste { tete: core::ptr::null(), queue: core::ptr::null() }) }
@@ -215,14 +272,30 @@ impl FileAttente {
         // la fois, son entrée est donc libre (`placer` le vérifie).
         let e = unsafe { (*p).entree_attente() };
         let mut l = self.liste.verrouiller();
-        e.tache.set(p);
+        e.genre.set(Genre::Tache(p));
         e.exclusive.set(exclusive);
         l.placer(e);
     }
 
+    /// Inscrit l'entrée d'un rappel (`EntreeAttente::preparer_rappel`) : en
+    /// tête, ou en queue si elle est exclusive. Épinglée : elle ne bougera
+    /// pas avant d'en être retirée (`enlever`).
+    pub fn ajouter(&self, e: Pin<&EntreeAttente>) {
+        assert!(tache_de(&e).is_none(), "une entree de tache ajoutee comme un rappel");
+        self.liste.verrouiller().placer(&e);
+    }
+
+    /// Retire l'entrée d'un rappel, si elle est dans la file.
+    pub fn enlever(&self, e: &EntreeAttente) {
+        let mut l = self.liste.verrouiller();
+        if let Some((precedente, _)) = l.chercher(|x| core::ptr::eq(x, e)) {
+            l.delier(precedente, e);
+        }
+    }
+
     /// Délie l'entrée de tâche `e` et rend l'Arc que tenait la file.
     fn sortir_tache(l: &mut Liste, precedente: *const EntreeAttente, e: &EntreeAttente) -> Arc<Tache> {
-        let t = e.tache.get();
+        let t = tache_de(e).expect("une entree de rappel sortie comme une tache");
         l.delier(precedente, e);
         // SAFETY : l'Arc pris par `inscrire_tache_en`, tenu par la file
         // jusqu'ici, passe à l'appelant.
@@ -240,7 +313,7 @@ impl FileAttente {
         let mut n = 0;
         l.chercher(|e| {
             // SAFETY : la tâche d'une entrée inscrite est tenue par la file.
-            n += choisir(unsafe { &*e.tache.get() }) as usize;
+            n += tache_de(e).is_some_and(|t| choisir(unsafe { &*t })) as usize;
             false
         });
         n
@@ -251,7 +324,7 @@ impl FileAttente {
     pub fn retirer_si(&self, mut choisir: impl FnMut(&Tache) -> bool) -> Option<Arc<Tache>> {
         let mut l = self.liste.verrouiller();
         // SAFETY : comme `compter` ; l'entrée trouvée est inscrite.
-        let (precedente, e) = l.chercher(|e| choisir(unsafe { &*e.tache.get() }))?;
+        let (precedente, e) = l.chercher(|e| tache_de(e).is_some_and(|t| choisir(unsafe { &*t })))?;
         Some(Self::sortir_tache(&mut l, precedente, unsafe { &*e }))
     }
 
@@ -267,11 +340,12 @@ impl FileAttente {
         }
     }
 
-    /// Réveille la file : toutes les entrées ordinaires, et des exclusives
-    /// jusqu'à ce que `exclusives` d'entre elles aient réveillé quelqu'un
-    /// (0 : toutes). Une tâche réveillée quitte la file ; une tâche déjà
-    /// réveillée y reste, et ne compte pas.
-    pub fn reveiller(&self, exclusives: usize) {
+    /// Réveille la file avec la clé `cle` : toutes les entrées ordinaires,
+    /// et des exclusives jusqu'à ce que `exclusives` d'entre elles aient
+    /// réveillé quelqu'un (0 : toutes). Une tâche réveillée quitte la file ;
+    /// une tâche déjà réveillée y reste, et ne compte pas. Un rappel reste,
+    /// et dit s'il a réveillé quelqu'un.
+    pub fn reveiller(&self, cle: u32, exclusives: usize) {
         let mut l = self.liste.verrouiller();
         let mut reste = exclusives;
         let mut precedente: *const EntreeAttente = core::ptr::null();
@@ -279,20 +353,28 @@ impl FileAttente {
         // SAFETY : comme `Liste::placer`.
         while let Some(e) = unsafe { p.as_ref() } {
             let suivante = e.suivante.get();
-            let t = e.tache.get();
-            // SAFETY : l'Arc de la file tient la tâche ; on en prend un pour
-            // le réveil.
-            let a = unsafe {
-                Arc::increment_strong_count(t);
-                Arc::from_raw(t)
+            let reveille = match e.genre.get() {
+                Genre::Tache(t) => {
+                    // SAFETY : l'Arc de la file tient la tâche ; on en
+                    // prend un pour le réveil.
+                    let a = unsafe {
+                        Arc::increment_strong_count(t);
+                        Arc::from_raw(t)
+                    };
+                    let reveillee = tache::reveiller(a, Reveil::Reveillee);
+                    if reveillee {
+                        drop(Self::sortir_tache(&mut l, precedente, e));
+                    }
+                    reveillee
+                }
+                // SAFETY : `qui` reste valable tant que l'entrée est
+                // inscrite (`preparer_rappel`).
+                Genre::Rappel(qui) => unsafe { (*qui).rappel(cle) },
             };
-            let reveillee = tache::reveiller(a, Reveil::Reveillee);
-            if reveillee {
-                drop(Self::sortir_tache(&mut l, precedente, e));
-            } else {
+            if e.inscrite.get() {
                 precedente = p;
             }
-            if reveillee && e.exclusive.get() && exclusives != 0 {
+            if reveille && e.exclusive.get() && exclusives != 0 {
                 reste -= 1;
                 if reste == 0 {
                     break;
@@ -305,12 +387,12 @@ impl FileAttente {
     /// Réveille toutes les entrées ordinaires et la première exclusive
     /// (le `wake_up` de Linux).
     pub fn reveiller_une(&self) {
-        self.reveiller(1);
+        self.reveiller(0, 1);
     }
 
     /// Réveille toutes les entrées (le `wake_up_all` de Linux).
     pub fn reveiller_toutes(&self) {
-        self.reveiller(0);
+        self.reveiller(0, 0);
     }
 }
 

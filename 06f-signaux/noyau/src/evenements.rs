@@ -22,6 +22,7 @@ use crate::appels_fichiers::{installer_fichier, tenir};
 use crate::attente::{self, FileAttente, Sommeil};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::descripteurs::{Donnees, FichierOuvert, Interet, Prive, Sorte, Tenu};
+use crate::sondage::{POLLERR, POLLIN, POLLOUT, Table};
 use crate::tache::Reveil;
 use crate::verrou::Verrou;
 use crate::{cpu, tache, vfs};
@@ -46,7 +47,8 @@ const EFD_SEMAPHORE: u64 = 1;
 
 /// Un eventfd (l'`eventfd_ctx` de Linux) : son compteur, sous son propre
 /// verrou, et la file de ceux qui attendent qu'il change, lecteurs et
-/// écrivains ensemble (le `wqh` de Linux).
+/// écrivains ensemble (le `wqh` de Linux) : un lecteur vide le compteur et
+/// réveille avec POLLOUT, un écrivain le remplit et réveille avec POLLIN.
 pub struct EventFd {
     compteur: Verrou<u64>,
     /// EFD_SEMAPHORE : une lecture n'en prend qu'un.
@@ -92,22 +94,22 @@ pub fn eventfd(initiale: u64) -> i64 {
 impl EventFd {
     /// Attend, si besoin, que `essayer` réussisse sur le compteur (sous son
     /// verrou) : il rend Some quand l'opération est faite, None quand elle
-    /// doit attendre. Une opération faite réveille qui attendait dans
-    /// l'autre sens (un lecteur qui vide le compteur, les écrivains ; un
-    /// écrivain, les lecteurs : une seule file, d'entrées ordinaires, toutes
-    /// réveillées par le `wake_up` de Linux). Non bloquant : EAGAIN. Dans
+    /// doit attendre. Une opération faite réveille la file avec `cle` (qui
+    /// attendait dans l'autre sens, et qui le sonde : une seule file,
+    /// d'entrées ordinaires, toutes réveillées par le `wake_up_poll` de
+    /// Linux). Non bloquant : EAGAIN. Dans
     /// l'ordre du `wait_event_interruptible` de Linux : la condition
     /// d'abord, à chaque tour, même réveillé par un signal (une écriture
     /// arrivée en même temps se lit) ; puis seulement le signal :
     /// ERESTARTSYS (EINTR, ou refaite : reprise.rs). Sans réveil perdu
     /// (attente.rs).
-    fn attendre<R>(&self, non_bloquant: bool, mut essayer: impl FnMut(&mut u64, bool) -> Option<R>) -> Result<R, i64> {
+    fn attendre<R>(&self, non_bloquant: bool, cle: u32, mut essayer: impl FnMut(&mut u64, bool) -> Option<R>) -> Result<R, i64> {
         let interruptions = cpu::couper_interruptions();
         let mut signal = false;
         let r = loop {
             let fait = essayer(&mut self.compteur.verrouiller(), self.semaphore);
             if let Some(r) = fait {
-                self.attente.reveiller_une();
+                self.attente.reveiller(cle, 1);
                 break Ok(r);
             }
             if non_bloquant {
@@ -126,6 +128,27 @@ impl EventFd {
             cpu::activer_interruptions();
         }
         r
+    }
+
+    /// Le sondage (`eventfd_poll`) : s'inscrit d'abord dans la file (une
+    /// écriture qui suit le verra), puis lit le compteur : POLLIN s'il
+    /// n'est pas nul, POLLOUT si une écriture de 1 passerait, POLLERR s'il
+    /// est au maximum (impossible par write ; Linux le garde pour
+    /// `eventfd_signal`). Sans POLLRDNORM ni POLLWRNORM (mesuré : 0x5).
+    pub fn sonder(&self, table: &mut Table, tenu: &crate::appels_fichiers::FichierTenu) -> u32 {
+        table.attendre(&self.attente, tenu);
+        let c = *self.compteur.verrouiller();
+        let mut m = 0;
+        if c > 0 {
+            m |= POLLIN;
+        }
+        if c == u64::MAX {
+            m |= POLLERR;
+        }
+        if u64::MAX - 1 > c {
+            m |= POLLOUT;
+        }
+        m
     }
 }
 
@@ -148,7 +171,7 @@ pub fn lire_morceaux(e: &EventFd, non_bloquant: bool, morceaux: &[(u64, u64)]) -
     if morceaux.iter().fold(0u64, |t, &(_, l)| t.saturating_add(l)) < 8 {
         return Err(-EINVAL);
     }
-    let pris = e.attendre(non_bloquant, |c, semaphore| {
+    let pris = e.attendre(non_bloquant, POLLOUT, |c, semaphore| {
         if *c == 0 {
             return None;
         }
@@ -184,7 +207,7 @@ pub fn ecrire(e: &EventFd, non_bloquant: bool, tampon: u64, longueur: u64) -> Re
     if ajout == u64::MAX {
         return Err(-EINVAL);
     }
-    e.attendre(non_bloquant, |c, _| {
+    e.attendre(non_bloquant, POLLIN, |c, _| {
         if u64::MAX - *c <= ajout {
             return None;
         }
