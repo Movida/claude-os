@@ -35,6 +35,7 @@ mod clavier;
 mod cpu;
 mod demarrage;
 mod descripteurs;
+mod epoll;
 mod espace;
 mod espace_utilisateur;
 mod evenements;

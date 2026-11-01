@@ -194,7 +194,15 @@ impl FichierTenu {
     pub fn eventfd(&self) -> &evenements::EventFd {
         match &self.prive {
             Prive::EventFd(e) => e,
-            Prive::Aucun => unreachable!("un eventfd sans compteur"),
+            _ => unreachable!("un eventfd sans compteur"),
+        }
+    }
+
+    /// L'epoll d'un fichier de sorte Epoll.
+    pub fn epoll(&self) -> &crate::epoll::Epoll {
+        match &self.prive {
+            Prive::Epoll(e) => e,
+            _ => unreachable!("un epoll sans objet"),
         }
     }
 
@@ -221,21 +229,29 @@ pub fn tenir(fd: u64) -> Result<FichierTenu, i64> {
         // Le verrou des fichiers, pris sous celui du processus (l'ordre de
         // vfs.rs) : le descripteur ne peut pas être fermé entre les deux.
         Some(vfs::avec_systeme(|s, _| {
-            s.ouverts.prendre(d.fichier);
-            let f = s.ouverts.fichier(d.fichier);
-            FichierTenu {
-                fichier: d.fichier,
-                sorte: f.sorte,
-                prive: f.prive.clone(),
-                objet: f.objet(),
-                lecture: f.lecture,
-                ecriture: f.ecriture,
-                drapeaux: f.drapeaux,
-                fermer_a_l_exec: d.fermer_a_l_exec,
-            }
+            let mut o = tenir_ouvert(s, d.fichier);
+            o.fermer_a_l_exec = d.fermer_a_l_exec;
+            o
         }))
     })
     .ok_or(-EBADF)
+}
+
+/// Tient le fichier ouvert `f`, sous le verrou des fichiers : un élément
+/// d'epoll le désigne ainsi, sans descripteur (epoll.rs).
+pub fn tenir_ouvert(s: &mut Systeme, f: Fichier) -> FichierTenu {
+    s.ouverts.prendre(f);
+    let o = s.ouverts.fichier(f);
+    FichierTenu {
+        fichier: f,
+        sorte: o.sorte,
+        prive: o.prive.clone(),
+        objet: o.objet(),
+        lecture: o.lecture,
+        ecriture: o.ecriture,
+        drapeaux: o.drapeaux,
+        fermer_a_l_exec: false,
+    }
 }
 
 /// Les verrous de position des fichiers ouverts (le `f_pos_lock` de
@@ -727,12 +743,22 @@ fn errno_table(r: Refus) -> i64 {
 /// numéro libre, avec FD_CLOEXEC si demandé : rend le numéro, EMFILE s'il
 /// n'y en a plus, ENOMEM si une table ne peut pas grandir (rien ne reste).
 pub fn installer_fichier(f: FichierOuvert, fermer_a_l_exec: bool) -> i64 {
+    installer_fichier_puis(f, fermer_a_l_exec, |_| {})
+}
+
+/// installer_fichier, en appelant `range` avec le fichier ouvert dès qu'il
+/// est dans la table, avant que son descripteur n'existe (personne ne peut
+/// encore s'en servir) : un epoll y apprend sa case.
+pub fn installer_fichier_puis(f: FichierOuvert, fermer_a_l_exec: bool, range: impl FnOnce(Fichier)) -> i64 {
     let fd = match reserver() {
         Ok(fd) => fd,
         Err(e) => return e,
     };
     match vfs::avec_systeme(|s, _| s.ouverts.ajouter(f)) {
-        Ok(fichier) => fd.installer(fichier, fermer_a_l_exec) as i64,
+        Ok(fichier) => {
+            range(fichier);
+            fd.installer(fichier, fermer_a_l_exec) as i64
+        }
         Err(_) => -ENOMEM,
     }
 }

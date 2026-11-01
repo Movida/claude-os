@@ -29,10 +29,12 @@
 //! Les sortes à venir : les tubes (6f), les sockets (6h). Une sorte de
 //! plus, ce sera une ligne de plus dans chaque `match` des appels
 //! (appels_fichiers.rs). Certaines ont des données à elles, de deux
-//! façons : sous le verrou des fichiers (la liste d'un epoll, la source d'un
-//! fichier de /proc : `Donnees`), ou dans un objet du noyau qui a son propre
-//! verrou, et dont se servent sans celui des fichiers les appels qui tiennent
-//! le fichier (un eventfd, depuis 6f : `Prive`).
+//! façons : sous le verrou des fichiers (la source d'un fichier de /proc :
+//! `Donnees`), ou dans un objet du noyau qui a son propre verrou, et dont se
+//! servent sans celui des fichiers les appels qui tiennent le fichier (un
+//! eventfd, un epoll, depuis 6f : `Prive`). Un fichier ouvert connaît aussi
+//! les éléments d'epoll qui le surveillent (`surveillants`) : à son dernier
+//! `close`, ils meurent avant que sa case ne puisse resservir.
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -68,7 +70,8 @@ pub enum Sorte {
     /// Un compteur que se partagent ceux qui s'attendent (eventfd, 6d) :
     /// son objet dans `Prive::EventFd`.
     EventFd,
-    /// Une liste de fichiers à surveiller (epoll, 6d) : `Donnees::Epoll`.
+    /// Une liste de fichiers à surveiller (epoll, 6d) : son objet dans
+    /// `Prive::Epoll`.
     Epoll,
     /// Un fichier d'un système du noyau (/proc, /sys, 6d), dont le contenu
     /// est fabriqué à la lecture (`Donnees::Noyau`), d'une des trois façons
@@ -111,24 +114,9 @@ impl Sorte {
 /// verrou des fichiers.
 pub enum Donnees {
     Aucune,
-    /// Ce que surveille un epoll.
-    Epoll(Vec<Interet>),
     /// D'où vient le contenu d'un fichier d'un système du noyau (une source
     /// du noyau et son argument : procfs.rs), et où en est sa lecture.
     Noyau { source: u32, argument: u32, sequence: Sequence },
-}
-
-/// Une inscription dans un epoll (l'`epitem` de Linux) : le couple (fichier
-/// ouvert, numéro de descripteur) qui l'identifie, comme Linux (mesuré :
-/// après un dup puis la fermeture du premier numéro, l'inscription reste,
-/// au nom du premier), les événements demandés et la donnée que le
-/// programme veut voir revenir.
-#[derive(Clone, Copy, Debug)]
-pub struct Interet {
-    pub fichier: Fichier,
-    pub fd: u32,
-    pub evenements: u32,
-    pub donnees: u64,
 }
 
 /// L'objet du noyau derrière un fichier ouvert qui en a un (le
@@ -143,6 +131,7 @@ pub struct Interet {
 pub enum Prive {
     Aucun,
     EventFd(Arc<crate::evenements::EventFd>),
+    Epoll(Arc<crate::epoll::Epoll>),
 }
 
 /// Ce que tient un fichier ouvert : un inode du tmpfs, avec ce qu'a rendu
@@ -166,11 +155,12 @@ pub struct FichierOuvert {
     pub drapeaux: u32,
     /// La position (pour un dossier : celle de `lire_dossier`).
     pub position: u64,
-    /// Ce qui est propre à sa sorte, sous le verrou des fichiers (epoll,
-    /// /proc)...
+    /// Ce qui est propre à sa sorte, sous le verrou des fichiers (/proc)...
     pub donnees: Donnees,
-    /// ... ou dans un objet à lui (eventfd).
+    /// ... ou dans un objet à lui (eventfd, epoll).
     pub prive: Prive,
+    /// Les éléments d'epoll qui le surveillent (le `f_ep` de Linux).
+    pub surveillants: Vec<Arc<crate::epoll::Element>>,
     /// Le nom de base du chemin par lequel il a été ouvert, pour les
     /// messages (« dans libc.so.6[...] »).
     pub nom: NomCourt,
@@ -190,8 +180,8 @@ pub struct FichierOuvert {
 impl FichierOuvert {
     pub fn new(sorte: Sorte, tenu: Tenu, lecture: bool, ecriture: bool, drapeaux: u32, chemin: &[u8]) -> FichierOuvert {
         let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').find(|n| !n.is_empty()).unwrap_or(chemin));
-        FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, donnees: Donnees::Aucune, prive: Prive::Aucun, nom,
-                       chemin: Vec::new(), references: 1 }
+        FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, donnees: Donnees::Aucune, prive: Prive::Aucun,
+                       surveillants: Vec::new(), nom, chemin: Vec::new(), references: 1 }
     }
 
     /// Le même, avec son chemin canonique.
@@ -265,85 +255,9 @@ impl Ouverts {
         self.cases[f.0 as usize].as_mut().expect("fichier ouvert disparu")
     }
 
-    /// L'epoll `depuis` surveille-t-il `cherche`, directement ou par un
-    /// epoll qu'il surveille ? (Pour refuser une boucle : ELOOP.)
-    pub fn surveille(&self, depuis: Fichier, cherche: Fichier) -> bool {
-        // Un parcours en profondeur, sans récursion (la pile du noyau est
-        // petite), borné par le nombre de fichiers ouverts : chacun n'est
-        // vu qu'une fois.
-        let mut vus = Vec::new();
-        let mut a_voir = Vec::new();
-        if a_voir.try_reserve(1).is_err() {
-            return true;
-        }
-        a_voir.push(depuis);
-        while let Some(f) = a_voir.pop() {
-            if f == cherche {
-                return true;
-            }
-            if vus.contains(&f) || vus.try_reserve(1).is_err() {
-                continue;
-            }
-            vus.push(f);
-            if let Some(Some(FichierOuvert { donnees: Donnees::Epoll(interets), .. })) = self.cases.get(f.0 as usize) {
-                for i in interets {
-                    if a_voir.try_reserve(1).is_err() {
-                        return true;
-                    }
-                    a_voir.push(i.fichier);
-                }
-            }
-        }
-        false
-    }
-
-    /// La plus longue chaîne d'epoll sous l'epoll `f` (ceux qu'il
-    /// surveille, puis ceux qu'ils surveillent...), ou au-dessus de lui
-    /// (ceux qui le surveillent...), en nombre d'étages, sans compter `f` :
-    /// le `ep_loop_check_proc` et le `ep_get_upwards_depth_proc` de Linux.
-    /// Étage par étage, sans récursion ; au-delà de `limite` étages, on
-    /// s'arrête (la réponse est déjà « trop »). None : plus de mémoire.
-    /// Il n'y a pas de boucle (`surveille` les refuse) : le parcours finit.
-    pub fn etages(&self, f: Fichier, vers_le_bas: bool, limite: u32) -> Option<u32> {
-        let epoll = |g: Fichier| match self.cases.get(g.0 as usize) {
-            Some(Some(FichierOuvert { donnees: Donnees::Epoll(interets), .. })) => Some(interets),
-            _ => None,
-        };
-        let mut etage = Vec::new();
-        etage.try_reserve(1).ok()?;
-        etage.push(f);
-        let mut n = 0;
-        while n <= limite {
-            let mut suivant: Vec<Fichier> = Vec::new();
-            let mut ajouter = |g: Fichier| -> Option<()> {
-                if epoll(g).is_some() && !suivant.contains(&g) {
-                    suivant.try_reserve(1).ok()?;
-                    suivant.push(g);
-                }
-                Some(())
-            };
-            for &g in &etage {
-                if vers_le_bas {
-                    for i in epoll(g).into_iter().flatten() {
-                        ajouter(i.fichier)?;
-                    }
-                } else {
-                    for (h, case) in self.cases.iter().enumerate() {
-                        if let Some(FichierOuvert { donnees: Donnees::Epoll(interets), .. }) = case
-                            && interets.iter().any(|i| i.fichier == g)
-                        {
-                            ajouter(Fichier(h as u32))?;
-                        }
-                    }
-                }
-            }
-            if suivant.is_empty() {
-                break;
-            }
-            n += 1;
-            etage = suivant;
-        }
-        Some(n)
+    /// Le fichier ouvert `f`, s'il l'est encore.
+    pub fn peut_etre(&mut self, f: Fichier) -> Option<&mut FichierOuvert> {
+        self.cases.get_mut(f.0 as usize).and_then(Option::as_mut)
     }
 
     /// Le fichier est tenu une fois de plus (dup).
@@ -353,21 +267,20 @@ impl Ouverts {
 
     /// Le fichier est tenu une fois de moins : au dernier, il est retiré
     /// de la table, et rendu à l'appelant pour qu'il le ferme (qu'il rende
-    /// l'inode au tmpfs). Une table vide rend sa mémoire. Un fichier fermé
-    /// quitte aussi les epoll qui le surveillaient (le `eventpoll_release`
-    /// de Linux) : une inscription ne tient pas le fichier, et son numéro
-    /// servira à un autre.
+    /// l'inode au tmpfs). Une table vide rend sa mémoire. Avant que sa case
+    /// ne puisse resservir, les éléments d'epoll qui le surveillaient
+    /// meurent, et, si c'est un epoll, les siens quittent leurs fichiers
+    /// (epoll::fichier_ferme, le `eventpoll_release` de Linux) : un élément
+    /// ne tient pas son fichier, il le désigne par sa case.
     pub fn lacher(&mut self, f: Fichier) -> Option<FichierOuvert> {
         let fichier = self.fichier(f);
         fichier.references -= 1;
         if fichier.references > 0 {
             return None;
         }
-        let ferme = self.cases[f.0 as usize].take();
-        for case in self.cases.iter_mut().flatten() {
-            if let Donnees::Epoll(interets) = &mut case.donnees {
-                interets.retain(|i| i.fichier != f);
-            }
+        let mut ferme = self.cases[f.0 as usize].take();
+        if let Some(o) = ferme.as_mut() {
+            crate::epoll::fichier_ferme(self, o);
         }
         while self.cases.last().is_some_and(Option::is_none) {
             self.cases.pop();

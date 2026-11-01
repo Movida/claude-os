@@ -375,8 +375,8 @@ pub struct SignauxDuFil {
     attente: EnAttente,
     pile: PileDeSecours,
     /// Le masque à rendre au retour vers l'anneau 3 (le `saved_sigmask` et le
-    /// TIF_RESTORE_SIGMASK de Linux) : rt_sigsuspend, ppoll et pselect6 (et
-    /// bientôt epoll_pwait) posent un masque le temps de l'attente ; si un
+    /// TIF_RESTORE_SIGMASK de Linux) : rt_sigsuspend, ppoll, pselect6 et
+    /// epoll_pwait posent un masque le temps de l'attente ; si un
     /// gestionnaire est appelé, c'est ce masque-ci qui va dans son cadre (le
     /// premier seulement : les suivants prennent le masque courant), et
     /// rt_sigreturn le rétablira ; sinon il est remis au retour, une fois

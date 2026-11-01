@@ -1,12 +1,17 @@
 /*
- * Attendre plusieurs fichiers à la fois (6f) : poll, ppoll, select et
- * pselect6, contre ce qu'en fait Linux 6.18 (mesuré). Ce que rend le
+ * Attendre plusieurs fichiers à la fois (6f) : poll, ppoll, select,
+ * pselect6 et epoll, contre ce qu'en fait Linux 6.18 (mesuré). Ce que rend le
  * sondage de chaque sorte de fichier, les erreurs dans leur ordre, les
  * délais et le temps restant écrit, le masque de ppoll et pselect6, et
  * l'attente elle-même : un autre fil qui écrit un eventfd réveille le fil
  * qui attend, deux fils qui attendent le même sont réveillés tous les deux,
  * et un numéro fermé pendant l'attente par un autre fil ne fait pas
- * disparaître le fichier sous elle. Sur l'hôte comme chez nous.
+ * disparaître le fichier sous elle. Pour epoll : par front (EPOLLET), par
+ * niveau, EPOLLONESHOT, les epolls emboîtés, l'inscription qui survit à un
+ * dup puis disparaît au dernier close, les erreurs d'epoll_wait ; dix mille
+ * écritures d'un autre fil en EPOLLET sans en perdre une, et un fil qui
+ * ferme et rouvre des eventfd surveillés pendant l'attente. Sur l'hôte comme
+ * chez nous.
  *
  * Par les appels bruts (syscall) là où la glibc cache ce que fait le noyau :
  * son ppoll et son pselect travaillent sur une copie du délai (le temps
@@ -21,6 +26,8 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <limits.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/resource.h>
 #include <sys/select.h>
@@ -365,6 +372,264 @@ static void selects(void)
     close(chemin);
 }
 
+/* L'événement que rend un epoll_wait sans attente (0 : aucun). */
+static unsigned evs(int ep)
+{
+    struct epoll_event e[1];
+    int n = epoll_wait(ep, e, 1, 0);
+    return n == 1 ? e[0].events : n == 0 ? 0 : 0xdead;
+}
+
+static void ecrire(int fd, uint64_t v)
+{
+    if (write(fd, &v, 8) != 8)
+        printf("[linux] attente : ecriture d'un eventfd : ECHEC\n");
+}
+
+static uint64_t lire(int fd)
+{
+    uint64_t v = 0;
+    if (read(fd, &v, 8) != 8)
+        return 0;
+    return v;
+}
+
+static long erreur(long r)
+{
+    return r < 0 ? errno : 0;
+}
+
+static void epolls(void)
+{
+    int ef = eventfd(0, EFD_NONBLOCK), ep = epoll_create1(0);
+    struct epoll_event e = { .events = EPOLLIN | EPOLLET, .data.u32 = 1 };
+    epoll_ctl(ep, EPOLL_CTL_ADD, ef, &e);
+    ecrire(ef, 1);
+    unsigned a = evs(ep), b = evs(ep);
+    ecrire(ef, 1);
+    unsigned c = evs(ep);
+    verifier(a == EPOLLIN && b == 0 && c == EPOLLIN, "EPOLLET sur un eventfd : chaque ecriture redonne EPOLLIN, meme sans lecture entre deux");
+    lire(ef);
+    e.events = EPOLLIN;
+    epoll_ctl(ep, EPOLL_CTL_MOD, ef, &e);
+    ecrire(ef, 1);
+    a = evs(ep);
+    b = evs(ep);
+    lire(ef);
+    c = evs(ep);
+    verifier(a == EPOLLIN && b == EPOLLIN && c == 0, "par niveau : EPOLLIN tant que le compteur n'est pas nul");
+    e.events = EPOLLIN | EPOLLONESHOT;
+    epoll_ctl(ep, EPOLL_CTL_MOD, ef, &e);
+    ecrire(ef, 1);
+    a = evs(ep);
+    b = evs(ep);
+    epoll_ctl(ep, EPOLL_CTL_MOD, ef, &e);
+    c = evs(ep);
+    verifier(a == EPOLLIN && b == 0 && c == EPOLLIN, "EPOLLONESHOT : une fois, puis rien jusqu'a un MOD");
+    e.events = EPOLLOUT;
+    epoll_ctl(ep, EPOLL_CTL_MOD, ef, &e);
+    lire(ef);
+    a = evs(ep);
+    ecrire(ef, 0xfffffffffffffffeull);
+    b = evs(ep);
+    lire(ef);
+    verifier(a == EPOLLOUT && b == 0, "EPOLLOUT d'un eventfd vide : pret ; plein : rien");
+
+    /* Emboîtés : l'intérieur prêt rend l'extérieur prêt ; un prêt qui ne
+     * l'est plus (le compteur lu) ne compte plus. */
+    int ep2 = epoll_create1(0);
+    struct epoll_event e2 = { .events = EPOLLIN, .data.u32 = 2 };
+    epoll_ctl(ep2, EPOLL_CTL_ADD, ep, &e2);
+    e.events = EPOLLIN;
+    epoll_ctl(ep, EPOLL_CTL_MOD, ef, &e);
+    a = evs(ep2);
+    ecrire(ef, 1);
+    b = evs(ep2);
+    struct pollfd pf = { ep, -1, 0 };
+    poll(&pf, 1, 0);
+    short pret = pf.revents;
+    lire(ef);
+    pf.revents = 0;
+    int n = poll(&pf, 1, 0);
+    verifier(a == 0 && b == EPOLLIN && pret == (POLLIN | POLLRDNORM) && n == 0 && evs(ep2) == 0,
+             "un epoll dans un epoll : l'interieur pret rend l'exterieur pret ; poll d'un epoll pret 0x41, vide de nouveau 0");
+
+    /* close d'un numéro qu'un dup double : l'inscription reste ; au dernier
+     * close, elle disparaît. */
+    int d = dup(ef);
+    close(ef);
+    ecrire(d, 1);
+    a = evs(ep);
+    long r1 = erreur(epoll_ctl(ep, EPOLL_CTL_DEL, ef, &e));
+    close(d);
+    int ef2 = eventfd(1, 0);
+    b = evs(ep);
+    verifier(a == EPOLLIN && r1 == EBADF && b == 0,
+             "close d'un numero qu'un dup double : l'inscription reste, DEL par l'ancien numero EBADF ; au dernier close, elle disparait");
+
+    struct epoll_event t[2];
+    long m0 = erreur(epoll_wait(ep, t, 0, 0)), mg = erreur(syscall(SYS_epoll_wait, ep, t, INT_MAX / 12 + 1, 0));
+    long mf = erreur(syscall(SYS_epoll_wait, ep, (void *)8, 1, 0));
+    epoll_ctl(ep, EPOLL_CTL_ADD, ef2, &e);
+    long mf2 = erreur(syscall(SYS_epoll_wait, ep, (void *)8, 1, 0));
+    long mk = erreur(syscall(SYS_epoll_wait, ep, (void *)0xffff800000000000ull, 1, 0));
+    long mbad = erreur(epoll_wait(ef2, t, 1, 0));
+    struct timespec ts = { 0, 1000000000 };
+    long pw = erreur(syscall(SYS_epoll_pwait2, ep, t, 1, &ts, NULL, 8));
+    sigset_t vide;
+    sigemptyset(&vide);
+    long pw2 = erreur(syscall(SYS_epoll_pwait, ep, t, 1, 0, &vide, 7));
+    verifier(m0 == EINVAL && mg == EINVAL && mf == 0 && mf2 == EFAULT && mk == EFAULT && mbad == EINVAL && pw == EINVAL && pw2 == EINVAL,
+             "epoll_wait : maxevents 0 ou trop grand EINVAL ; tampon a 8 : 0 sans evenement, EFAULT avec ; hors des programmes EFAULT ; pas un epoll EINVAL ; pwait2 1e9 ns, pwait masque de 7 : EINVAL");
+    int ef3 = eventfd(0, 0);
+    struct epoll_event ex = { .events = EPOLLIN | EPOLLRDNORM | EPOLLEXCLUSIVE };
+    verifier(erreur(epoll_ctl(ep, EPOLL_CTL_ADD, ef3, &ex)) == EINVAL, "EPOLLEXCLUSIVE avec EPOLLRDNORM : EINVAL");
+    close(ef3);
+    close(ef2);
+    close(ep);
+    close(ep2);
+}
+
+/* epoll_wait sans délai, réveillé par un autre fil ; et un poll du même
+ * eventfd, surveillé par un epoll en EPOLLEXCLUSIVE : une écriture réveille
+ * les deux (l'entrée exclusive n'éteint pas l'ordinaire). */
+static int ep_commun, ef_commun;
+static volatile int reveils_ep, reveils_poll;
+
+static void *attendre_epoll(void *rien)
+{
+    (void)rien;
+    struct epoll_event e;
+    if (epoll_wait(ep_commun, &e, 1, 3000) == 1)
+        reveils_ep++;
+    return NULL;
+}
+
+static void *attendre_poll(void *rien)
+{
+    (void)rien;
+    struct pollfd q = { ef_commun, POLLIN, 0 };
+    if (poll(&q, 1, 3000) == 1)
+        reveils_poll++;
+    return NULL;
+}
+
+/* Dix mille écritures en EPOLLET par un autre fil : chacune réveille
+ * epoll_wait, aucune n'est perdue (un réveil perdu ferait attendre le
+ * lecteur jusqu'à son délai de garde, 2 s, sans plus rien à venir). */
+#define ECRITURES 10000
+static volatile int ecrit;
+
+static void *ecrire_dix_mille(void *rien)
+{
+    (void)rien;
+    for (int i = 0; i < ECRITURES; i++) {
+        ecrire(ef_commun, 1);
+        ecrit = i + 1;
+        if (i % 7 == 0)
+            sched_yield();
+    }
+    return NULL;
+}
+
+/* Un fil ouvre, inscrit et ferme des eventfd prêts pendant que l'autre
+ * attend : un événement rendu porte la donnée d'un eventfd encore ouvert au
+ * début de l'attente (jamais celle d'un fermé avant : son élément a disparu
+ * avec lui), et l'inscription d'un nouveau, sous un numéro et peut-être une
+ * case qui servaient, réussit toujours. */
+#define TOURS 300
+static volatile int ferme_jusqu_a, fini_de_tourner, inscriptions_ratees;
+
+static void *tourner(void *rien)
+{
+    (void)rien;
+    for (int i = 1; i <= TOURS; i++) {
+        int f = eventfd(1, 0);
+        struct epoll_event e = { .events = EPOLLIN | EPOLLET, .data.u64 = (uint64_t)i };
+        if (epoll_ctl(ep_commun, EPOLL_CTL_ADD, f, &e) != 0)
+            inscriptions_ratees++;
+        if (i % 3 == 0)
+            sched_yield();
+        close(f);
+        __atomic_store_n(&ferme_jusqu_a, i, __ATOMIC_SEQ_CST);
+    }
+    fini_de_tourner = 1;
+    return NULL;
+}
+
+static void attentes_epoll(void)
+{
+    pthread_t a, b;
+    ep_commun = epoll_create1(0);
+    ef_commun = eventfd(0, EFD_NONBLOCK);
+    struct epoll_event e = { .events = EPOLLIN, .data.u32 = 7 };
+    epoll_ctl(ep_commun, EPOLL_CTL_ADD, ef_commun, &e);
+    cible_efd = ef_commun;
+    lire_au_lieu_d_ecrire = 0;
+    pthread_create(&a, NULL, ecrire_plus_tard, NULL);
+    struct epoll_event r;
+    long long t0 = maintenant_ms();
+    int n = epoll_wait(ep_commun, &r, 1, -1);
+    pthread_join(a, NULL);
+    verifier(n == 1 && r.events == EPOLLIN && r.data.u32 == 7 && maintenant_ms() - t0 >= 50,
+             "epoll_wait sans delai, un autre fil ecrit l'eventfd : reveille, la donnee rendue");
+    lire(ef_commun);
+    close(ep_commun);
+
+    ep_commun = epoll_create1(0);
+    e = (struct epoll_event){ .events = EPOLLIN | EPOLLEXCLUSIVE };
+    epoll_ctl(ep_commun, EPOLL_CTL_ADD, ef_commun, &e);
+    reveils_ep = reveils_poll = 0;
+    pthread_create(&a, NULL, attendre_epoll, NULL);
+    pthread_create(&b, NULL, attendre_poll, NULL);
+    dormir_ms(50);
+    ecrire(ef_commun, 1);
+    pthread_join(a, NULL);
+    pthread_join(b, NULL);
+    verifier(reveils_ep == 1 && reveils_poll == 1, "un eventfd surveille en EPOLLEXCLUSIVE et par poll : une ecriture reveille les deux");
+    lire(ef_commun);
+    close(ep_commun);
+
+    ep_commun = epoll_create1(0);
+    e = (struct epoll_event){ .events = EPOLLIN | EPOLLET };
+    epoll_ctl(ep_commun, EPOLL_CTL_ADD, ef_commun, &e);
+    ecrit = 0;
+    pthread_create(&a, NULL, ecrire_dix_mille, NULL);
+    uint64_t total = 0;
+    int perdu = 0;
+    while (total < ECRITURES) {
+        n = epoll_wait(ep_commun, &r, 1, 2000);
+        if (n != 1) {
+            perdu = 1;
+            break;
+        }
+        total += lire(ef_commun);
+    }
+    pthread_join(a, NULL);
+    verifier(!perdu && total == ECRITURES, "dix mille ecritures en EPOLLET d'un autre fil : aucun reveil perdu");
+    close(ep_commun);
+
+    ep_commun = epoll_create1(0);
+    ferme_jusqu_a = fini_de_tourner = inscriptions_ratees = 0;
+    pthread_create(&a, NULL, tourner, NULL);
+    int perime = 0, recus = 0;
+    while (!fini_de_tourner) {
+        int avant = __atomic_load_n(&ferme_jusqu_a, __ATOMIC_SEQ_CST);
+        struct epoll_event rs[8];
+        n = epoll_wait(ep_commun, rs, 8, 20);
+        for (int i = 0; i < n; i++) {
+            recus++;
+            if (rs[i].data.u64 <= (uint64_t)avant || rs[i].data.u64 > TOURS)
+                perime = 1;
+        }
+    }
+    pthread_join(a, NULL);
+    verifier(!perime && inscriptions_ratees == 0 && evs(ep_commun) == 0,
+             "un fil ouvre, inscrit et ferme des eventfd pendant l'attente : jamais l'evenement d'un ferme, aucune inscription refusee");
+    close(ep_commun);
+    close(ef_commun);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -372,6 +637,8 @@ int main(void)
     reveils();
     masques();
     selects();
+    epolls();
+    attentes_epoll();
     printf("[linux] attente : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

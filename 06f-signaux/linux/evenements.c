@@ -1,6 +1,6 @@
 /*
- * eventfd et epoll (6d) : la boucle d'événements de Bun, créée mais pas
- * encore attendue (epoll_wait vient en 6f). Il tourne dans notre noyau et
+ * eventfd et epoll (6d) : la boucle d'événements de Bun, sa création et
+ * ses inscriptions (son attente, depuis 6f : attente.c). Il tourne dans notre noyau et
  * sur l'hôte (make tests-hote) : chaque ligne doit dire « ok » des deux
  * côtés, d'après ce qu'a mesuré la sonde sur Linux 6.18. Rien n'y attend :
  * les eventfd lus vides sont non bloquants.

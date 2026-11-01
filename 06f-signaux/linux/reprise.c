@@ -1,7 +1,7 @@
 /*
  * Les appels interrompus par un gestionnaire de signal (6f) : rendent-ils
  * EINTR, ou reprennent-ils (SA_RESTART, restart_syscall) ? Avec poll,
- * ppoll, select, pselect6, rt_sigsuspend et pause, et le masque qu'ils
+ * ppoll, select, pselect6, epoll, rt_sigsuspend et pause, et le masque qu'ils
  * rendent au retour. Pour chaque appel
  * qui attend, un autre fil envoie SIGUSR1 au fil qui attend jusqu'à ce que
  * son gestionnaire ait tourné, puis fait ce qui finit l'attente (écrire
@@ -24,6 +24,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/eventfd.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
@@ -213,6 +214,37 @@ static long pselect6_1s(void)
     FD_SET(efd, &ensemble);
     delai_ts = (struct timespec){ 1, 0 };
     return syscall(SYS_pselect6, efd + 1, &ensemble, NULL, NULL, &delai_ts, NULL);
+}
+
+/* epoll_wait, epoll_pwait2 sur un epoll qui surveille l'eventfd. */
+static long epoll_sur_efd(int quoi)
+{
+    int ep = epoll_create1(0);
+    struct epoll_event e = { .events = EPOLLIN }, evs[4];
+    epoll_ctl(ep, EPOLL_CTL_ADD, efd, &e);
+    struct timespec une = { 1, 0 };
+    long r = quoi == 0 ? syscall(SYS_epoll_wait, ep, evs, 4, -1)
+           : quoi == 1 ? syscall(SYS_epoll_wait, ep, evs, 4, 1000)
+                       : syscall(SYS_epoll_pwait2, ep, evs, 4, &une, NULL, 8);
+    int erreur = errno;
+    close(ep);
+    errno = erreur;
+    return r;
+}
+
+static long epoll_infini(void)
+{
+    return epoll_sur_efd(0);
+}
+
+static long epoll_1000(void)
+{
+    return epoll_sur_efd(1);
+}
+
+static long epoll_pwait2_1s(void)
+{
+    return epoll_sur_efd(2);
 }
 
 /* Le reste d'un délai de 1 s, interrompu après quelques millisecondes. */
@@ -476,6 +508,9 @@ int main(void)
     verifier(reste_d_une_seconde(delai_tv.tv_sec * 1000000LL + delai_tv.tv_usec), "select interrompu : le temps restant ecrit");
     deux("pselect6 de 1 s", 1, pselect6_1s, -EINTR, -EINTR);
     verifier(reste_d_une_seconde(delai_ts.tv_sec * 1000000LL + delai_ts.tv_nsec / 1000), "pselect6 interrompu : le temps restant ecrit");
+    deux("epoll_wait sans delai", 1, epoll_infini, -EINTR, -EINTR);
+    deux("epoll_wait de 1000 ms", 1, epoll_1000, -EINTR, -EINTR);
+    deux("epoll_pwait2 de 1 s", 1, epoll_pwait2_1s, -EINTR, -EINTR);
     deux("rt_sigsuspend", 0, suspendre_vide, -EINTR, -EINTR);
     deux("pause", 0, en_pause, -EINTR, -EINTR);
     deux_signaux_pendant_sigsuspend();

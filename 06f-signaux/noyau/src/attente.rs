@@ -79,7 +79,7 @@ use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
 
 /// Ce que fait le réveil d'une entrée qui n'est pas une tâche : l'entrée
-/// d'un `poll` (sondage.rs), et bientôt l'élément d'un epoll.
+/// d'un `poll` (sondage.rs), l'élément d'un epoll (epoll.rs).
 pub trait Rappel {
     /// La file de l'entrée est réveillée, avec la clé `cle` (les événements
     /// arrivés, 0 : n'importe lesquels). Rend vrai si une tâche a été
@@ -179,24 +179,31 @@ impl Liste {
     /// Inscrit `e` : en tête si elle est ordinaire, en queue si elle est
     /// exclusive.
     fn placer(&mut self, e: &EntreeAttente) {
+        if !e.exclusive.get() {
+            return self.placer_en_tete(e);
+        }
         assert!(!e.inscrite.get(), "entree d'attente inscrite deux fois");
         e.inscrite.set(true);
         let p: *const EntreeAttente = e;
-        if e.exclusive.get() {
-            e.suivante.set(core::ptr::null());
-            // SAFETY : les entrées de la liste sont valables (dans leur tâche tenue, ou épinglées).
-            match unsafe { self.queue.as_ref() } {
-                Some(q) => q.suivante.set(p),
-                None => self.tete = p,
-            }
-            self.queue = p;
-        } else {
-            e.suivante.set(self.tete);
-            if self.tete.is_null() {
-                self.queue = p;
-            }
-            self.tete = p;
+        e.suivante.set(core::ptr::null());
+        // SAFETY : les entrées de la liste sont valables (dans leur tâche tenue, ou épinglées).
+        match unsafe { self.queue.as_ref() } {
+            Some(q) => q.suivante.set(p),
+            None => self.tete = p,
         }
+        self.queue = p;
+    }
+
+    /// Inscrit `e` en tête, même exclusive.
+    fn placer_en_tete(&mut self, e: &EntreeAttente) {
+        assert!(!e.inscrite.get(), "entree d'attente inscrite deux fois");
+        e.inscrite.set(true);
+        let p: *const EntreeAttente = e;
+        e.suivante.set(self.tete);
+        if self.tete.is_null() {
+            self.queue = p;
+        }
+        self.tete = p;
     }
 
     /// Délie `e`, qui suit `precedente` (nulle : `e` est en tête).
@@ -256,6 +263,25 @@ impl FileAttente {
     /// d'arrivée.
     pub fn inscrire_exclusive(&self) {
         self.inscrire_tache_en(tache::courante_arc(), true);
+    }
+
+    /// Inscrit la tâche courante, exclusive, en TÊTE (le
+    /// `__add_wait_queue_exclusive` de Linux, pour `epoll_wait`) : de
+    /// plusieurs fils qui attendent le même epoll, le dernier arrivé est
+    /// réveillé le premier (le plus chaud dans les caches).
+    pub fn inscrire_exclusive_en_tete(&self) {
+        let p = Arc::into_raw(tache::courante_arc());
+        // SAFETY : comme `inscrire_tache_en`.
+        let e = unsafe { (*p).entree_attente() };
+        let mut l = self.liste.verrouiller();
+        e.genre.set(Genre::Tache(p));
+        e.exclusive.set(true);
+        l.placer_en_tete(e);
+    }
+
+    /// Quelqu'un attend-il (le `waitqueue_active` de Linux) ?
+    pub fn active(&self) -> bool {
+        !self.liste.verrouiller().tete.is_null()
     }
 
     /// Inscrit la tâche `t` (une autre que la courante : un futex déplacé
@@ -590,6 +616,19 @@ impl<T> Mutex<T> {
                 cpu::activer_interruptions();
             }
         }
+    }
+}
+
+impl<T> Mutex<T> {
+    /// Prend le verrou s'il est libre, sans dormir (le `mutex_trylock` de
+    /// Linux) : possible sous un Verrou.
+    pub fn essayer(&self) -> Option<GardeMutex<'_, T>> {
+        let mut e = self.etat.verrouiller();
+        if e.pris {
+            return None;
+        }
+        e.pris = true;
+        Some(GardeMutex { mutex: self })
     }
 }
 

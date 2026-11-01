@@ -67,8 +67,8 @@ pub const POLLWRBAND: u32 = 0x200;
 pub const PAR_DEFAUT: u32 = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
 
 /// Qui inscrit une entrée dans chaque file que rencontre un sondage (le
-/// `_qproc` du `poll_table` de Linux) : `poll` et `select` (`Entrees`),
-/// bientôt epoll.
+/// `_qproc` du `poll_table` de Linux) : `poll` et `select` (`Entrees`), et
+/// l'ajout d'un élément d'epoll (epoll.rs).
 pub trait Inscrire {
     /// `tenu` peut changer quand `file` est réveillée ; `cle` : ce qui
     /// intéresse.
@@ -100,6 +100,12 @@ impl<'a> Table<'a> {
         }
     }
 
+    /// Ce qui intéresse désormais (le `_key`) : ce que demande un élément
+    /// d'epoll.
+    pub fn changer_cle(&mut self, cle: u32) {
+        self.cle = cle;
+    }
+
     /// Plus d'inscription : quelque chose est prêt, l'appel ne dormira pas
     /// (Linux annule alors `_qproc`).
     fn arreter(&mut self) {
@@ -117,10 +123,8 @@ pub fn sonder(o: &FichierTenu, table: &mut Table) -> u32 {
         // nôtre l'est dès le démarrage (`random_poll` : POLLIN | POLLRDNORM,
         // 0x41 mesuré). /dev/urandom n'a pas d'opération de sondage.
         Sorte::Aleatoire { random: true } => POLLIN | POLLRDNORM,
-        // Un epoll ne sait pas encore dire s'il est prêt : il le saura quand
-        // ses éléments seront inscrits dans les files de ses fichiers. D'ici
-        // là, jamais prêt.
-        Sorte::Epoll => 0,
+        // Un epoll : prêt si l'un de ses prêts l'est vraiment (epoll.rs).
+        Sorte::Epoll => o.epoll().sonder(table, o),
         // Les autres n'ont pas d'opération de sondage chez nous : toujours
         // prêts. La console n'est pas encore un terminal (6j) : sa lecture
         // rend « fin de fichier » sans attendre. Une valeur de /proc/sys ou
@@ -260,7 +264,7 @@ fn lire_paire(adresse: u64) -> Result<(i64, i64), i64> {
 
 /// Un délai donné en timespec par le programme (EFAULT, EINVAL) ; une
 /// adresse nulle : attendre toujours.
-fn delai_timespec(adresse: u64) -> Result<Delai, i64> {
+pub fn delai_timespec(adresse: u64) -> Result<Delai, i64> {
     if adresse == 0 {
         return Ok(Delai::Infini);
     }
