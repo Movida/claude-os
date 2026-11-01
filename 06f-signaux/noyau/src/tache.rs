@@ -66,6 +66,7 @@ use core::fmt;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 
+use crate::attente::EntreeAttente;
 use crate::interruptions::Cadre;
 use crate::linux::{self, Signal};
 use crate::programmes::NomCourt;
@@ -216,9 +217,11 @@ pub struct Tache {
     /// programme n'en a pas : c'est la fin de son processus qui réveille son
     /// parent (processus::Entree::fil_disparu).
     attendant: Verrou<Option<Arc<Tache>>>,
-    /// Le lien vers la tâche suivante de la file d'attente où elle attend
-    /// (attente.rs), sous le verrou de cette file.
-    lien_attente: Cell<*const Tache>,
+    /// Son entrée de file d'attente, celle qu'elle inscrit dans la file de ce
+    /// qu'elle attend (attente.rs) : une tâche n'attend qu'une chose à la
+    /// fois. Dans la tâche, elle ne bouge jamais (une tâche ne quitte pas son
+    /// Arc).
+    entree_attente: EntreeAttente,
     /// Pourquoi elle a été réveillée (`Reveil`, en u8) : le premier qui la
     /// réveille l'écrit ; 0 tant que personne ne l'a fait.
     reveil: AtomicU8,
@@ -294,8 +297,8 @@ impl EtatProgramme {
 
 // SAFETY : les champs dans des UnsafeCell (`contexte`, `programme`) ne sont
 // lus et écrits que par `basculer_vers`, interruptions coupées, sur notre
-// seul processeur ; `lien_attente`, que sous le verrou de la file d'attente
-// où elle est ; le reste est atomique ou sous Verrou.
+// seul processeur ; `entree_attente`, que sous le verrou de la file d'attente
+// où elle est inscrite ; le reste est atomique ou sous Verrou.
 unsafe impl Sync for Tache {}
 unsafe impl Send for Tache {}
 
@@ -330,7 +333,7 @@ impl Tache {
             // (La tâche inactive n'attend personne : elle ne doit jamais
             // quitter son rôle pour entrer dans la file des prêtes.)
             attendant: Verrou::new((noyau && en_service() && !core::ptr::eq(courante(), inactive())).then(courante_arc)),
-            lien_attente: Cell::new(core::ptr::null()),
+            entree_attente: EntreeAttente::new(),
             reveil: AtomicU8::new(0),
             interruptible: AtomicBool::new(false),
             futex: Cell::new(None),
@@ -401,9 +404,9 @@ impl Tache {
         }
     }
 
-    /// Le lien de file d'attente (attente.rs).
-    pub fn lien_attente(&self) -> &Cell<*const Tache> {
-        &self.lien_attente
+    /// Son entrée de file d'attente (attente.rs).
+    pub fn entree_attente(&self) -> &EntreeAttente {
+        &self.entree_attente
     }
 
     /// Est-elle morte ?
@@ -551,7 +554,7 @@ pub fn initialiser() {
         calcul: AtomicU64::new(0),
         lag: AtomicI64::new(0),
         attendant: Verrou::new(None),
-        lien_attente: Cell::new(core::ptr::null()),
+        entree_attente: EntreeAttente::new(),
         reveil: AtomicU8::new(0),
         interruptible: AtomicBool::new(false),
         futex: Cell::new(None),
@@ -617,11 +620,16 @@ pub enum Reveil {
 
 /// Réveille `t`, qui dort, pour la raison `pourquoi` : elle redevient
 /// prête. Si quelqu'un l'a déjà réveillée, la première raison reste (et
-/// elle n'est mise qu'une fois dans la file des prêtes).
-pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) {
+/// elle n'est mise qu'une fois dans la file des prêtes). Rend vrai si c'est
+/// ce réveil-ci qui compte (le `try_to_wake_up` de Linux, qui rend faux pour
+/// une tâche déjà réveillée) : un réveil exclusif qui n'a réveillé personne
+/// passe à la suivante (attente.rs).
+pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) -> bool {
     if t.reveil.compare_exchange(0, pourquoi as u8, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
         ordonnanceur::rendre_prete(t, false);
+        return true;
     }
+    false
 }
 
 /// Un signal vient d'être mis en attente pour le fil `t`, qui ne le bloque

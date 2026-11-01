@@ -48,7 +48,7 @@ use crate::copie_utilisateur::{
     ErreurChaine, chaine_depuis_utilisateur, copier_depuis_utilisateur,
     copier_vers_utilisateur, copier_vers_utilisateur_partiel, dans_les_bornes,
 };
-use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Refus, Sorte, Tenu};
+use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Prive, Refus, Sorte, Tenu};
 use crate::processus::Processus;
 use crate::vfs::{self, CadresDuNoyau, Systeme};
 use crate::{aleatoire, console, evenements, pages, processus, procfs, temps};
@@ -143,6 +143,8 @@ fn chemin(adresse: u64) -> Result<Vec<u8>, i64> {
 pub struct FichierTenu {
     fichier: Fichier,
     pub sorte: Sorte,
+    /// Son objet du noyau, s'il en a un (un eventfd).
+    pub prive: Prive,
     pub objet: Objet,
     pub lecture: bool,
     pub ecriture: bool,
@@ -169,6 +171,14 @@ impl FichierTenu {
     /// Sous son verrou de position, lui aussi.
     fn changer_position(&self, position: u64) {
         vfs::avec_systeme(|s, _| s.ouverts.fichier(self.fichier).position = position);
+    }
+
+    /// L'eventfd d'un fichier de sorte EventFd.
+    pub fn eventfd(&self) -> &evenements::EventFd {
+        match &self.prive {
+            Prive::EventFd(e) => e,
+            Prive::Aucun => unreachable!("un eventfd sans compteur"),
+        }
     }
 
     /// Son objet, tenu à son tour (le fichier peut ensuite être rendu).
@@ -199,6 +209,7 @@ pub fn tenir(fd: u64) -> Result<FichierTenu, i64> {
             FichierTenu {
                 fichier: d.fichier,
                 sorte: f.sorte,
+                prive: f.prive.clone(),
                 objet: f.objet(),
                 lecture: f.lecture,
                 ecriture: f.ecriture,
@@ -916,7 +927,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         Sorte::Zero | Sorte::Plein => produire(tampon, longueur, |m| m.fill(0)),
         Sorte::Aleatoire { .. } => produire(tampon, longueur, aleatoire::remplir),
         Sorte::Chemin => Err(-EBADF),
-        Sorte::EventFd => evenements::lire(o.fichier(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::EventFd => evenements::lire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Epoll => Err(-EINVAL),
         Sorte::Noyau { .. } => {
             let contenu = procfs::lire(o.fichier(), ici, longueur)?;
@@ -996,7 +1007,7 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
         Sorte::Null | Sorte::Zero | Sorte::Aleatoire { .. } => Ok(longueur),
         Sorte::Plein => Err(-ENOSPC),
         Sorte::Dossier | Sorte::Chemin => Err(-EBADF),
-        Sorte::EventFd => evenements::ecrire(o.fichier(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::EventFd => evenements::ecrire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Epoll => Err(-EINVAL),
         // Un fichier du noyau qui s'écrit (procfs::ecrivable : comm) :
         // seuls ses 15 premiers octets comptent, copiés d'abord, sans rien
@@ -1116,7 +1127,7 @@ fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
     };
     // Un eventfd se lit d'un coup, sur tous les morceaux (evenements.rs).
     if !ecrire && o.sorte == Sorte::EventFd {
-        return match evenements::lire_morceaux(o.fichier(), o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux) {
+        return match evenements::lire_morceaux(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux) {
             Ok(n) => n as i64,
             Err(e) => e,
         };

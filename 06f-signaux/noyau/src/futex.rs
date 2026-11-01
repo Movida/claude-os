@@ -234,7 +234,7 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
     let echeance = echeance.map(Echeance::en_monotone);
     let interruptions = cpu::couper_interruptions();
     let r = loop {
-        let mut s = TABLE[seau(&c)].verrouiller();
+        let s = TABLE[seau(&c)].verrouiller();
         match lire_sans_faute(adresse) {
             None => {
                 // La page n'est pas là : la faire venir, verrou rendu, et
@@ -252,7 +252,9 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
             Some(_) => {}
         }
         tache::courante().futex().set(Some(Attente { cle: c, bitset }));
-        s.file.inscrire();
+        // En queue : un FUTEX_WAKE réveille les plus anciennes d'abord (la
+        // plist de Linux, à priorité égale).
+        s.file.inscrire_exclusive();
         drop(s);
         let reveil = attente::dormir(echeance, Sommeil::Interruptible);
         // Réveillée : par un WAKE (elle n'est plus dans la file), ou par son
@@ -260,7 +262,7 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
         // déplacer dans le seau d'une autre clé : sa clé le dit.
         let t = tache::courante();
         let ou = t.futex().get().map_or(c, |a| a.cle);
-        let mut s = TABLE[seau(&ou)].verrouiller();
+        let s = TABLE[seau(&ou)].verrouiller();
         let encore = s.file.contient(t);
         s.file.retirer(t);
         drop(s);

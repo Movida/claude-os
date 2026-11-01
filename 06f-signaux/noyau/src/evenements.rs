@@ -12,17 +12,20 @@
 //!
 //! Tout est fait et vérifié comme Linux (mesuré sur Linux 6.18). Depuis
 //! 6e, une lecture bloquante d'un eventfd vide (ou une écriture qui le
-//! ferait déborder) attend vraiment, dans la file d'attente du fichier,
-//! qu'une écriture (ou une lecture) change le compteur ; `epoll_wait` rend
-//! ENOSYS jusqu'en 6f, où chaque sorte de fichier apprendra à dire « prêt »
-//! et à réveiller qui l'attend.
+//! ferait déborder) attend vraiment, dans la file d'attente de l'eventfd,
+//! qu'une écriture (ou une lecture) change le compteur. Depuis 6f, l'eventfd
+//! est un objet à lui (`EventFd`), avec son verrou, hors de celui des
+//! fichiers ; `epoll_wait` rend ENOSYS jusqu'à ce que chaque sorte de
+//! fichier sache dire « prêt » et réveiller qui l'attend.
 
 use crate::appels_fichiers::{installer_fichier, tenir};
-use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
-use crate::descripteurs::{Donnees, FichierOuvert, Interet, Sorte, Tenu};
 use crate::attente::{self, FileAttente, Sommeil};
+use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
+use crate::descripteurs::{Donnees, FichierOuvert, Interet, Prive, Sorte, Tenu};
 use crate::tache::Reveil;
+use crate::verrou::Verrou;
 use crate::{cpu, tache, vfs};
+use alloc::sync::Arc;
 use fichiers::montages::Objet;
 
 const EBADF: i64 = 9;
@@ -41,6 +44,16 @@ const O_NONBLOCK: u64 = 0o4000;
 const O_CLOEXEC: u64 = 0o2000000;
 const EFD_SEMAPHORE: u64 = 1;
 
+/// Un eventfd (l'`eventfd_ctx` de Linux) : son compteur, sous son propre
+/// verrou, et la file de ceux qui attendent qu'il change, lecteurs et
+/// écrivains ensemble (le `wqh` de Linux).
+pub struct EventFd {
+    compteur: Verrou<u64>,
+    /// EFD_SEMAPHORE : une lecture n'en prend qu'un.
+    semaphore: bool,
+    attente: FileAttente,
+}
+
 /// eventfd2(valeur initiale, drapeaux) : EFD_SEMAPHORE, EFD_NONBLOCK et
 /// EFD_CLOEXEC (les valeurs d'O_NONBLOCK et d'O_CLOEXEC) ; un autre :
 /// EINVAL. F_GETFL rendra O_RDWR, plus O_NONBLOCK s'il est demandé
@@ -53,7 +66,11 @@ pub fn eventfd2(initiale: u64, drapeaux: u64) -> i64 {
     let mut f = FichierOuvert::new(Sorte::EventFd, Tenu::Noyau(Objet::Anonyme), true, true,
                                    O_RDWR | (drapeaux & O_NONBLOCK) as u32, b"anon_inode:[eventfd]");
     f.chemin = nom_anonyme(b"anon_inode:[eventfd]");
-    f.donnees = Donnees::EventFd { compteur: initiale as u32 as u64, semaphore: drapeaux & EFD_SEMAPHORE != 0, attente: FileAttente::new() };
+    f.prive = Prive::EventFd(Arc::new(EventFd {
+        compteur: Verrou::new(initiale as u32 as u64),
+        semaphore: drapeaux & EFD_SEMAPHORE != 0,
+        attente: FileAttente::new(),
+    }));
     installer_fichier(f, drapeaux & O_CLOEXEC != 0)
 }
 
@@ -72,54 +89,44 @@ pub fn eventfd(initiale: u64) -> i64 {
     eventfd2(initiale, 0)
 }
 
-/// Le compteur d'un eventfd et sa file d'attente, sous le verrou des
-/// fichiers.
-fn compteur(f: &mut FichierOuvert) -> (&mut u64, bool, &mut FileAttente) {
-    match &mut f.donnees {
-        Donnees::EventFd { compteur, semaphore, attente } => (compteur, *semaphore, attente),
-        _ => unreachable!("un eventfd sans compteur"),
-    }
-}
-
-/// Attend, si besoin, que `essayer` réussisse sur le compteur de l'eventfd
-/// `f` (sous le verrou des fichiers) : il rend Some quand l'opération est
-/// faite, None quand elle doit attendre. Une opération faite réveille qui
-/// attendait dans l'autre sens (un lecteur qui vide le compteur, les
-/// écrivains ; un écrivain, les lecteurs : une seule file, comme le `wqh`
-/// de Linux). Non bloquant : EAGAIN ; un signal pendant l'attente :
-/// ERESTARTSYS (EINTR, ou refaite : reprise.rs).
-/// Sans réveil perdu (attente.rs).
-fn attendre_compteur<R>(f: crate::descripteurs::Fichier, non_bloquant: bool, mut essayer: impl FnMut(&mut u64, bool) -> Option<R>) -> Result<R, i64> {
-    let interruptions = cpu::couper_interruptions();
-    let r = loop {
-        let fait = vfs::avec_systeme(|s, _| {
-            let (c, semaphore, attente) = compteur(s.ouverts.fichier(f));
-            let r = essayer(c, semaphore);
-            if r.is_some() {
-                attente.reveiller_toutes();
-            } else if !non_bloquant {
-                attente.inscrire();
+impl EventFd {
+    /// Attend, si besoin, que `essayer` réussisse sur le compteur (sous son
+    /// verrou) : il rend Some quand l'opération est faite, None quand elle
+    /// doit attendre. Une opération faite réveille qui attendait dans
+    /// l'autre sens (un lecteur qui vide le compteur, les écrivains ; un
+    /// écrivain, les lecteurs : une seule file, d'entrées ordinaires, toutes
+    /// réveillées par le `wake_up` de Linux). Non bloquant : EAGAIN. Dans
+    /// l'ordre du `wait_event_interruptible` de Linux : la condition
+    /// d'abord, à chaque tour, même réveillé par un signal (une écriture
+    /// arrivée en même temps se lit) ; puis seulement le signal :
+    /// ERESTARTSYS (EINTR, ou refaite : reprise.rs). Sans réveil perdu
+    /// (attente.rs).
+    fn attendre<R>(&self, non_bloquant: bool, mut essayer: impl FnMut(&mut u64, bool) -> Option<R>) -> Result<R, i64> {
+        let interruptions = cpu::couper_interruptions();
+        let mut signal = false;
+        let r = loop {
+            let fait = essayer(&mut self.compteur.verrouiller(), self.semaphore);
+            if let Some(r) = fait {
+                self.attente.reveiller_une();
+                break Ok(r);
             }
-            r
-        });
-        if let Some(r) = fait {
-            break Ok(r);
+            if non_bloquant {
+                break Err(-EAGAIN);
+            }
+            if signal {
+                // Refaite d'elle-même après le signal, sauf gestionnaire sans
+                // SA_RESTART (reprise.rs).
+                break Err(-crate::reprise::ERESTARTSYS);
+            }
+            self.attente.inscrire();
+            signal = attente::dormir(None, Sommeil::Interruptible) == Reveil::Signal;
+            self.attente.retirer(tache::courante());
+        };
+        if interruptions {
+            cpu::activer_interruptions();
         }
-        if non_bloquant {
-            break Err(-EAGAIN);
-        }
-        let reveil = attente::dormir(None, Sommeil::Interruptible);
-        vfs::avec_systeme(|s, _| compteur(s.ouverts.fichier(f)).2.retirer(tache::courante()));
-        if reveil == Reveil::Signal {
-            // Refaite d'elle-même après le signal, sauf gestionnaire sans
-            // SA_RESTART (reprise.rs).
-            break Err(-crate::reprise::ERESTARTSYS);
-        }
-    };
-    if interruptions {
-        cpu::activer_interruptions();
+        r
     }
-    r
 }
 
 /// read d'un eventfd (`eventfd_read`) : au moins 8 octets (EINVAL) ; un
@@ -127,8 +134,8 @@ fn attendre_compteur<R>(f: crate::descripteurs::Fichier, non_bloquant: bool, mut
 /// compteur (ou 1 avec EFD_SEMAPHORE), puis on l'écrit en 8 octets. Comme
 /// Linux, le compteur est pris avant la copie : une copie qui échoue
 /// (EFAULT) l'a perdu.
-pub fn lire(f: crate::descripteurs::Fichier, non_bloquant: bool, tampon: u64, longueur: u64) -> Result<u64, i64> {
-    lire_morceaux(f, non_bloquant, &[(tampon, longueur)])
+pub fn lire(e: &EventFd, non_bloquant: bool, tampon: u64, longueur: u64) -> Result<u64, i64> {
+    lire_morceaux(e, non_bloquant, &[(tampon, longueur)])
 }
 
 /// readv d'un eventfd : Linux lit un eventfd par `read_iter`, qui voit
@@ -137,11 +144,11 @@ pub fn lire(f: crate::descripteurs::Fichier, non_bloquant: bool, tampon: u64, lo
 /// compteur sont écrits à la suite, d'un morceau à l'autre ; une faute
 /// avant le huitième : EFAULT. (writev, lui, passe morceau par morceau :
 /// `eventfd_write` n'est pas un `write_iter`, et 4 + 4 rend EINVAL.)
-pub fn lire_morceaux(f: crate::descripteurs::Fichier, non_bloquant: bool, morceaux: &[(u64, u64)]) -> Result<u64, i64> {
+pub fn lire_morceaux(e: &EventFd, non_bloquant: bool, morceaux: &[(u64, u64)]) -> Result<u64, i64> {
     if morceaux.iter().fold(0u64, |t, &(_, l)| t.saturating_add(l)) < 8 {
         return Err(-EINVAL);
     }
-    let pris = attendre_compteur(f, non_bloquant, |c, semaphore| {
+    let pris = e.attendre(non_bloquant, |c, semaphore| {
         if *c == 0 {
             return None;
         }
@@ -162,12 +169,13 @@ pub fn lire_morceaux(f: crate::descripteurs::Fichier, non_bloquant: bool, morcea
     Ok(8)
 }
 
-/// write d'un eventfd (`eventfd_write`) : au moins 8 octets (EINVAL), lus
-/// (EFAULT) ; 0xffffffffffffffff est refusé (EINVAL : le compteur ne peut
-/// jamais l'atteindre) ; un ajout qui l'atteindrait fait attendre qu'un
-/// lecteur le vide (EAGAIN en non bloquant).
-pub fn ecrire(f: crate::descripteurs::Fichier, non_bloquant: bool, tampon: u64, longueur: u64) -> Result<u64, i64> {
-    if longueur < 8 {
+/// write d'un eventfd (`eventfd_write`) : exactement 8 octets (EINVAL ;
+/// depuis Linux 6.6, mesuré : 16 aussi, alors qu'une lecture en prend au
+/// moins 8), lus (EFAULT) ; 0xffffffffffffffff est refusé (EINVAL : le
+/// compteur ne peut jamais l'atteindre) ; un ajout qui l'atteindrait fait
+/// attendre qu'un lecteur le vide (EAGAIN en non bloquant).
+pub fn ecrire(e: &EventFd, non_bloquant: bool, tampon: u64, longueur: u64) -> Result<u64, i64> {
+    if longueur != 8 {
         return Err(-EINVAL);
     }
     let mut o = [0u8; 8];
@@ -176,7 +184,7 @@ pub fn ecrire(f: crate::descripteurs::Fichier, non_bloquant: bool, tampon: u64, 
     if ajout == u64::MAX {
         return Err(-EINVAL);
     }
-    attendre_compteur(f, non_bloquant, |c, _| {
+    e.attendre(non_bloquant, |c, _| {
         if u64::MAX - *c <= ajout {
             return None;
         }

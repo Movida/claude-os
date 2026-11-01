@@ -28,10 +28,13 @@
 //!     rendre ENOMEM. Une table à index, avec un compteur explicite.
 //! Les sortes à venir : les tubes (6f), les sockets (6h). Une sorte de
 //! plus, ce sera une ligne de plus dans chaque `match` des appels
-//! (appels_fichiers.rs). Certaines ont des données à elles (le compteur
-//! d'un eventfd, la liste d'un epoll, la source d'un fichier de /proc :
-//! `Donnees`).
+//! (appels_fichiers.rs). Certaines ont des données à elles, de deux
+//! façons : sous le verrou des fichiers (la liste d'un epoll, la source d'un
+//! fichier de /proc : `Donnees`), ou dans un objet du noyau qui a son propre
+//! verrou, et dont se servent sans celui des fichiers les appels qui tiennent
+//! le fichier (un eventfd, depuis 6f : `Prive`).
 
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::programmes::NomCourt;
@@ -63,7 +66,7 @@ pub enum Sorte {
     /// (6j) : la lecture rend « fin de fichier ».
     Console,
     /// Un compteur que se partagent ceux qui s'attendent (eventfd, 6d) :
-    /// ses données dans `Donnees::EventFd`.
+    /// son objet dans `Prive::EventFd`.
     EventFd,
     /// Une liste de fichiers à surveiller (epoll, 6d) : `Donnees::Epoll`.
     Epoll,
@@ -104,12 +107,10 @@ impl Sorte {
     }
 }
 
-/// Les données propres à certaines sortes de fichiers ouverts.
+/// Les données propres à certaines sortes de fichiers ouverts, sous le
+/// verrou des fichiers.
 pub enum Donnees {
     Aucune,
-    /// Le compteur d'un eventfd, EFD_SEMAPHORE (une lecture n'en prend
-    /// qu'un), et les tâches qui attendent qu'il change (evenements.rs).
-    EventFd { compteur: u64, semaphore: bool, attente: crate::attente::FileAttente },
     /// Ce que surveille un epoll.
     Epoll(Vec<Interet>),
     /// D'où vient le contenu d'un fichier d'un système du noyau (une source
@@ -128,6 +129,20 @@ pub struct Interet {
     pub fd: u32,
     pub evenements: u32,
     pub donnees: u64,
+}
+
+/// L'objet du noyau derrière un fichier ouvert qui en a un (le
+/// `private_data` de Linux). Il a son propre verrou : un appel qui tient le
+/// fichier en garde un Arc (appels_fichiers::FichierTenu), et s'en sert
+/// sans le verrou des fichiers, même pour attendre. Option écartée, celle de
+/// 6e : le compteur d'un eventfd sous le verrou des fichiers, repris à
+/// chaque essai ; mais un `poll` ou un epoll qui attend un eventfd doit
+/// s'inscrire dans sa file et l'y laisser, hors de tout appel sur lui, et
+/// un réveil ne doit pas avoir à prendre le verrou de tous les fichiers.
+#[derive(Clone)]
+pub enum Prive {
+    Aucun,
+    EventFd(Arc<crate::evenements::EventFd>),
 }
 
 /// Ce que tient un fichier ouvert : un inode du tmpfs, avec ce qu'a rendu
@@ -151,8 +166,11 @@ pub struct FichierOuvert {
     pub drapeaux: u32,
     /// La position (pour un dossier : celle de `lire_dossier`).
     pub position: u64,
-    /// Ce qui est propre à sa sorte (eventfd, epoll).
+    /// Ce qui est propre à sa sorte, sous le verrou des fichiers (epoll,
+    /// /proc)...
     pub donnees: Donnees,
+    /// ... ou dans un objet à lui (eventfd).
+    pub prive: Prive,
     /// Le nom de base du chemin par lequel il a été ouvert, pour les
     /// messages (« dans libc.so.6[...] »).
     pub nom: NomCourt,
@@ -172,7 +190,8 @@ pub struct FichierOuvert {
 impl FichierOuvert {
     pub fn new(sorte: Sorte, tenu: Tenu, lecture: bool, ecriture: bool, drapeaux: u32, chemin: &[u8]) -> FichierOuvert {
         let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').find(|n| !n.is_empty()).unwrap_or(chemin));
-        FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, donnees: Donnees::Aucune, nom, chemin: Vec::new(), references: 1 }
+        FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, donnees: Donnees::Aucune, prive: Prive::Aucun, nom,
+                       chemin: Vec::new(), references: 1 }
     }
 
     /// Le même, avec son chemin canonique.

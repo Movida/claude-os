@@ -372,7 +372,7 @@ pub fn tache() {
     loop {
         cpu::couper_interruptions();
         {
-            let mut f = FILE.verrouiller();
+            let f = FILE.verrouiller();
             if f.nombre == 0 {
                 f.attente.inscrire();
                 drop(f);

@@ -22,12 +22,31 @@
 //! sommeil, ni le gestionnaire qui réveillerait, ni une autre tâche.
 //!
 //! Une file d'attente ne demande aucune allocation : c'est une liste
-//! chaînée PAR les tâches elles-mêmes (chaque tâche a un champ « suivante
-//! dans la file où j'attends » : une tâche n'attend qu'une chose à la
-//! fois), comme les `wait_queue_entry` de Linux, posées sur la pile de qui
-//! attend. S'inscrire ne peut donc pas échouer, et une file d'un objet qui
-//! dure (le clavier, la console) ne garde aucune mémoire après son dernier
-//! attendant (le contrôle « memoire rendue » des programmes le verrait).
+//! chaînée d'ENTRÉES posées par ceux qui attendent (les `wait_queue_entry`
+//! de Linux). Chaque tâche a la sienne, dans sa `Tache` (elle n'attend
+//! qu'une chose à la fois) : s'inscrire ne peut donc pas échouer, et une
+//! file d'un objet qui dure (le clavier, la console) ne garde aucune mémoire
+//! après son dernier attendant (le contrôle « memoire rendue » des
+//! programmes le verrait).
+//!
+//! Une entrée peut être EXCLUSIVE (WQ_FLAG_EXCLUSIVE) : `reveiller(n)`
+//! réveille toutes les entrées ordinaires, mais s'arrête dès que `n`
+//! exclusives ont réveillé quelqu'un (le `__wake_up_common` de Linux). Pour
+//! un verrou qui dort, ou bientôt les lecteurs d'un tube, réveiller tous
+//! ceux qui attendent quand un seul pourra passer serait les faire courir
+//! pour rien (le « troupeau tonitruant »). Les ordinaires sont rangées en
+//! tête, les exclusives en queue (dans l'ordre d'arrivée), comme chez
+//! Linux : toutes les ordinaires sont réveillées avant la première
+//! exclusive. Une tâche déjà réveillée (par son échéance, un signal) ne
+//! compte pas : le réveil passe à l'exclusive suivante, au lieu d'être
+//! perdu.
+//!
+//! La file a son propre verrou (le spinlock du `wait_queue_head` de
+//! Linux), pris APRÈS celui de l'objet attendu s'il est tenu. Option
+//! écartée, celle de 6e : la file sous le verrou de son objet. Mais `poll`
+//! et epoll (6f) laisseront des entrées dans la file d'un fichier pendant
+//! qu'ils attendent, et devront les retirer sans rien savoir de lui (un
+//! eventfd, un tube, le clavier...), ni de son verrou.
 //!
 //! Les minuteries (les échéances des attentes) : une liste triée par
 //! échéance, réservée au démarrage pour autant de tâches qu'il peut y en
@@ -43,173 +62,255 @@ use crate::tache::{self, Reveil, Tache};
 use crate::verrou::Verrou;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
 use core::ops::{Deref, DerefMut};
 
-/// Une file d'attente : les tâches qui attendent un même objet, dans
-/// l'ordre où elles se sont inscrites. Toujours sous le verrou de l'objet.
-pub struct FileAttente {
-    tete: *const Tache,
-    queue: *const Tache,
+/// Une entrée d'une file d'attente (la `wait_queue_entry` de Linux) : celle
+/// d'une tâche qui dort. Une entrée inscrite ne doit ni bouger ni
+/// disparaître : la file la désigne par son adresse. Celle d'une tâche est
+/// dans sa `Tache`, qui ne quitte jamais son Arc, et la file tient cet Arc
+/// tant qu'elle y est ; la détruire encore inscrite arrête le noyau (`Drop`),
+/// avant que la file ne désigne une mémoire rendue. Option écartée : des
+/// entrées dans un `Vec` de la file (pas de pointeurs) ; mais inscrire
+/// allouerait (et pourrait échouer), et une tâche ne pourrait pas attendre
+/// sans mémoire.
+pub struct EntreeAttente {
+    /// La suivante dans la file (sous le verrou de la file).
+    suivante: Cell<*const EntreeAttente>,
+    /// Réveillée parmi les exclusives (voir l'en-tête).
+    exclusive: Cell<bool>,
+    /// Dans une file en ce moment : une entrée n'est que dans une à la fois.
+    inscrite: Cell<bool>,
+    /// La tâche : le pointeur de l'Arc que tient la file tant qu'elle y est.
+    /// Son réveil la retire de la file (le `autoremove_wake_function` de
+    /// Linux).
+    tache: Cell<*const Tache>,
 }
 
-// SAFETY : une file n'est lue et écrite que sous le verrou de son objet
-// (elle n'est jamais ailleurs que dans un Verrou).
-unsafe impl Send for FileAttente {}
+// SAFETY : une entrée n'est lue et écrite que par qui l'inscrit, avant de
+// l'inscrire et après l'avoir retirée, et sous le verrou de sa file entre
+// les deux.
+unsafe impl Sync for EntreeAttente {}
+unsafe impl Send for EntreeAttente {}
+
+impl EntreeAttente {
+    /// Une entrée de tâche (celle de chaque `Tache`), pas encore inscrite.
+    pub const fn new() -> EntreeAttente {
+        EntreeAttente {
+            suivante: Cell::new(core::ptr::null()),
+            exclusive: Cell::new(false),
+            inscrite: Cell::new(false),
+            tache: Cell::new(core::ptr::null()),
+        }
+    }
+}
+
+impl Drop for EntreeAttente {
+    fn drop(&mut self) {
+        assert!(!self.inscrite.get(), "entree d'attente detruite encore inscrite");
+    }
+}
+
+/// Une file d'attente : les entrées de ceux qui attendent un même objet (le
+/// `wait_queue_head` de Linux), avec son verrou.
+pub struct FileAttente {
+    liste: Verrou<Liste>,
+}
+
+struct Liste {
+    tete: *const EntreeAttente,
+    queue: *const EntreeAttente,
+}
+
+// SAFETY : la liste n'est touchée que sous son verrou, et ses entrées
+// restent à leur place tant qu'elles y sont (dans leur tâche).
+unsafe impl Send for Liste {}
+
+impl Liste {
+    /// Inscrit `e` : en tête si elle est ordinaire, en queue si elle est
+    /// exclusive.
+    fn placer(&mut self, e: &EntreeAttente) {
+        assert!(!e.inscrite.get(), "entree d'attente inscrite deux fois");
+        e.inscrite.set(true);
+        let p: *const EntreeAttente = e;
+        if e.exclusive.get() {
+            e.suivante.set(core::ptr::null());
+            // SAFETY : les entrées de la liste sont valables (dans leur tâche, tenue).
+            match unsafe { self.queue.as_ref() } {
+                Some(q) => q.suivante.set(p),
+                None => self.tete = p,
+            }
+            self.queue = p;
+        } else {
+            e.suivante.set(self.tete);
+            if self.tete.is_null() {
+                self.queue = p;
+            }
+            self.tete = p;
+        }
+    }
+
+    /// Délie `e`, qui suit `precedente` (nulle : `e` est en tête).
+    fn delier(&mut self, precedente: *const EntreeAttente, e: &EntreeAttente) {
+        let suivante = e.suivante.get();
+        // SAFETY : comme `placer`.
+        match unsafe { precedente.as_ref() } {
+            Some(pr) => pr.suivante.set(suivante),
+            None => self.tete = suivante,
+        }
+        if core::ptr::eq(self.queue, e) {
+            self.queue = precedente;
+        }
+        e.suivante.set(core::ptr::null());
+        e.inscrite.set(false);
+    }
+
+    /// Cherche la première entrée pour qui `choisir` est vrai : (sa
+    /// précédente, elle), en pointeurs (une entrée inscrite ne bouge pas :
+    /// on la désigne sans retenir la liste empruntée).
+    fn chercher(&self, mut choisir: impl FnMut(&EntreeAttente) -> bool) -> Option<(*const EntreeAttente, *const EntreeAttente)> {
+        let mut precedente: *const EntreeAttente = core::ptr::null();
+        let mut p = self.tete;
+        // SAFETY : comme `placer`.
+        while let Some(e) = unsafe { p.as_ref() } {
+            if choisir(e) {
+                return Some((precedente, p));
+            }
+            precedente = p;
+            p = e.suivante.get();
+        }
+        None
+    }
+}
 
 impl FileAttente {
     pub const fn new() -> FileAttente {
-        FileAttente { tete: core::ptr::null(), queue: core::ptr::null() }
+        FileAttente { liste: Verrou::new(Liste { tete: core::ptr::null(), queue: core::ptr::null() }) }
     }
 
-    /// Inscrit la tâche courante à la fin de la file. Elle doit ensuite
-    /// dormir (`dormir`), puis s'en retirer (`retirer`).
-    pub fn inscrire(&mut self) {
-        // Un Arc de plus, tenu par la file : la tâche vit tant qu'elle y est.
-        let t = Arc::into_raw(tache::courante_arc());
-        // SAFETY : `t` vient d'être tenu ; une tâche n'est que dans une file
-        // à la fois (elle n'attend qu'une chose), son lien est donc libre.
-        unsafe {
-            (*t).lien_attente().set(core::ptr::null());
-            if let Some(q) = self.queue.as_ref() {
-                q.lien_attente().set(t);
-            } else {
-                self.tete = t;
-            }
-        }
-        self.queue = t;
+    /// Inscrit la tâche courante, en tête (le `add_wait_queue` de Linux).
+    /// Elle doit ensuite dormir (`dormir`), puis s'en retirer (`retirer`).
+    pub fn inscrire(&self) {
+        self.inscrire_tache_en(tache::courante_arc(), false);
+    }
+
+    /// Inscrit la tâche courante, exclusive, en queue (le
+    /// `add_wait_queue_exclusive` de Linux) : réveillée seule, dans l'ordre
+    /// d'arrivée.
+    pub fn inscrire_exclusive(&self) {
+        self.inscrire_tache_en(tache::courante_arc(), true);
     }
 
     /// Inscrit la tâche `t` (une autre que la courante : un futex déplacé
-    /// d'une file à l'autre par FUTEX_REQUEUE) à la fin de la file ; la
+    /// d'une file à l'autre par FUTEX_REQUEUE), exclusive, en queue ; la
     /// file prend l'Arc.
-    pub fn inscrire_tache(&mut self, t: Arc<Tache>) {
-        let t = Arc::into_raw(t);
-        // SAFETY : comme `inscrire`.
-        unsafe {
-            (*t).lien_attente().set(core::ptr::null());
-            if let Some(q) = self.queue.as_ref() {
-                q.lien_attente().set(t);
-            } else {
-                self.tete = t;
-            }
-        }
-        self.queue = t;
+    pub fn inscrire_tache(&self, t: Arc<Tache>) {
+        self.inscrire_tache_en(t, true);
+    }
+
+    fn inscrire_tache_en(&self, t: Arc<Tache>, exclusive: bool) {
+        // Un Arc de plus, tenu par la file : la tâche vit tant qu'elle y est.
+        let p = Arc::into_raw(t);
+        // SAFETY : `p` vient d'être tenu ; une tâche n'attend qu'une chose à
+        // la fois, son entrée est donc libre (`placer` le vérifie).
+        let e = unsafe { (*p).entree_attente() };
+        let mut l = self.liste.verrouiller();
+        e.tache.set(p);
+        e.exclusive.set(exclusive);
+        l.placer(e);
+    }
+
+    /// Délie l'entrée de tâche `e` et rend l'Arc que tenait la file.
+    fn sortir_tache(l: &mut Liste, precedente: *const EntreeAttente, e: &EntreeAttente) -> Arc<Tache> {
+        let t = e.tache.get();
+        l.delier(precedente, e);
+        // SAFETY : l'Arc pris par `inscrire_tache_en`, tenu par la file
+        // jusqu'ici, passe à l'appelant.
+        unsafe { Arc::from_raw(t) }
     }
 
     /// `t` est-elle dans la file ?
     pub fn contient(&self, t: &Tache) -> bool {
-        let mut p = self.tete;
-        while !p.is_null() {
-            if core::ptr::eq(p, t) {
-                return true;
-            }
-            // SAFETY : les tâches de la file sont tenues par elle.
-            p = unsafe { (*p).lien_attente().get() };
-        }
-        false
+        self.liste.verrouiller().chercher(|e| core::ptr::eq(e, t.entree_attente())).is_some()
     }
 
     /// Le nombre de tâches de la file pour qui `choisir` est vrai.
     pub fn compter(&self, mut choisir: impl FnMut(&Tache) -> bool) -> usize {
+        let l = self.liste.verrouiller();
         let mut n = 0;
-        let mut p = self.tete;
-        while !p.is_null() {
-            // SAFETY : les tâches de la file sont tenues par elle.
-            let t = unsafe { &*p };
-            n += choisir(t) as usize;
-            p = t.lien_attente().get();
-        }
+        l.chercher(|e| {
+            // SAFETY : la tâche d'une entrée inscrite est tenue par la file.
+            n += choisir(unsafe { &*e.tache.get() }) as usize;
+            false
+        });
         n
     }
 
     /// Retire de la file la première tâche pour qui `choisir` est vrai, et
     /// la rend (avec l'Arc que tenait la file).
-    pub fn retirer_si(&mut self, mut choisir: impl FnMut(&Tache) -> bool) -> Option<Arc<Tache>> {
-        let mut p = self.tete;
-        while !p.is_null() {
-            // SAFETY : les tâches de la file sont tenues par elle.
-            let t = unsafe { &*p };
-            let suivante = t.lien_attente().get();
-            if choisir(t) {
-                // L'Arc de la file passe à l'appelant : on en prend un de
-                // plus avant que `retirer` ne lâche le sien.
-                // SAFETY : `p` est tenu par la file jusque-là.
-                let a = unsafe {
-                    Arc::increment_strong_count(p);
-                    Arc::from_raw(p)
-                };
-                self.retirer(t);
-                return Some(a);
-            }
-            p = suivante;
-        }
-        None
+    pub fn retirer_si(&self, mut choisir: impl FnMut(&Tache) -> bool) -> Option<Arc<Tache>> {
+        let mut l = self.liste.verrouiller();
+        // SAFETY : comme `compter` ; l'entrée trouvée est inscrite.
+        let (precedente, e) = l.chercher(|e| choisir(unsafe { &*e.tache.get() }))?;
+        Some(Self::sortir_tache(&mut l, precedente, unsafe { &*e }))
     }
 
     /// Retire `t` de la file, si elle y est (réveillée par autre chose
     /// qu'un réveil de la file : une échéance, un signal).
-    pub fn retirer(&mut self, t: &Tache) {
-        let mut precedente: *const Tache = core::ptr::null();
-        let mut p = self.tete;
-        while !p.is_null() {
-            // SAFETY : les tâches de la file sont tenues par elle (inscrire).
-            let suivante = unsafe { (*p).lien_attente().get() };
-            if core::ptr::eq(p, t) {
-                // SAFETY : comme ci-dessus.
-                unsafe {
-                    match precedente.as_ref() {
-                        Some(pr) => pr.lien_attente().set(suivante),
-                        None => self.tete = suivante,
-                    }
-                    if core::ptr::eq(self.queue, p) {
-                        self.queue = precedente;
-                    }
-                    // L'Arc que tenait la file.
-                    drop(Arc::from_raw(p));
-                }
-                return;
+    pub fn retirer(&self, t: &Tache) {
+        let mut l = self.liste.verrouiller();
+        if !t.entree_attente().inscrite.get() {
+            return;
+        }
+        if let Some((precedente, _)) = l.chercher(|e| core::ptr::eq(e, t.entree_attente())) {
+            drop(Self::sortir_tache(&mut l, precedente, t.entree_attente()));
+        }
+    }
+
+    /// Réveille la file : toutes les entrées ordinaires, et des exclusives
+    /// jusqu'à ce que `exclusives` d'entre elles aient réveillé quelqu'un
+    /// (0 : toutes). Une tâche réveillée quitte la file ; une tâche déjà
+    /// réveillée y reste, et ne compte pas.
+    pub fn reveiller(&self, exclusives: usize) {
+        let mut l = self.liste.verrouiller();
+        let mut reste = exclusives;
+        let mut precedente: *const EntreeAttente = core::ptr::null();
+        let mut p = l.tete;
+        // SAFETY : comme `Liste::placer`.
+        while let Some(e) = unsafe { p.as_ref() } {
+            let suivante = e.suivante.get();
+            let t = e.tache.get();
+            // SAFETY : l'Arc de la file tient la tâche ; on en prend un pour
+            // le réveil.
+            let a = unsafe {
+                Arc::increment_strong_count(t);
+                Arc::from_raw(t)
+            };
+            let reveillee = tache::reveiller(a, Reveil::Reveillee);
+            if reveillee {
+                drop(Self::sortir_tache(&mut l, precedente, e));
+            } else {
+                precedente = p;
             }
-            precedente = p;
+            if reveillee && e.exclusive.get() && exclusives != 0 {
+                reste -= 1;
+                if reste == 0 {
+                    break;
+                }
+            }
             p = suivante;
         }
     }
 
-    /// Retire la première tâche de la file : None si elle est vide.
-    fn sortir(&mut self) -> Option<Arc<Tache>> {
-        if self.tete.is_null() {
-            return None;
-        }
-        let p = self.tete;
-        // SAFETY : la tête est tenue par la file ; son Arc passe à
-        // l'appelant.
-        unsafe {
-            self.tete = (*p).lien_attente().get();
-            if self.tete.is_null() {
-                self.queue = core::ptr::null();
-            }
-            Some(Arc::from_raw(p))
-        }
+    /// Réveille toutes les entrées ordinaires et la première exclusive
+    /// (le `wake_up` de Linux).
+    pub fn reveiller_une(&self) {
+        self.reveiller(1);
     }
 
-    /// Réveille la première tâche de la file ; false : elle était vide.
-    pub fn reveiller_une(&mut self) -> bool {
-        match self.sortir() {
-            Some(t) => {
-                tache::reveiller(t, Reveil::Reveillee);
-                true
-            }
-            None => false,
-        }
-    }
-
-    /// Réveille toutes les tâches de la file ; rend leur nombre.
-    pub fn reveiller_toutes(&mut self) -> usize {
-        let mut n = 0;
-        while self.reveiller_une() {
-            n += 1;
-        }
-        n
+    /// Réveille toutes les entrées (le `wake_up_all` de Linux).
+    pub fn reveiller_toutes(&self) {
+        self.reveiller(0);
     }
 }
 
@@ -397,7 +498,9 @@ impl<T> Mutex<T> {
                     }
                     return GardeMutex { mutex: self };
                 }
-                e.file.inscrire();
+                // Exclusive : celui qui le rend n'en réveille qu'une, la
+                // première arrivée.
+                e.file.inscrire_exclusive();
             }
             dormir(None, Sommeil::Ininterruptible);
             self.etat.verrouiller().file.retirer(tache::courante());

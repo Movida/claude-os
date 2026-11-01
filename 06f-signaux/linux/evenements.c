@@ -104,6 +104,12 @@ static void fichier_anonyme(void)
     struct iovec deux_w[2] = { { &un, 4 }, { (char *)&un + 4, 4 } };
     verifier(write(e, &un, 8) == 8 && readv(e, deux, 2) == 8 && lu == 5, "readv de 4 + 4 octets : 8, le compteur");
     verifier(erreur(writev(e, deux_w, 2)) == EINVAL, "writev de 4 + 4 octets : EINVAL");
+    /* Un write prend exactement 8 octets (Linux 6.6) ; un writev de 8 + 8,
+     * deux fois 8. */
+    uint64_t seize[2] = { 1, 1 };
+    struct iovec huit_huit[2] = { { &seize[0], 8 }, { &seize[1], 8 } };
+    verifier(erreur(write(e, seize, 16)) == EINVAL && writev(e, huit_huit, 2) == 16 && read(e, &lu, 8) == 8 && lu == 2,
+             "write de 16 octets : EINVAL ; writev de 8 + 8 : 16, deux ajouts");
     close(e);
     close(p);
 }
