@@ -8,7 +8,8 @@
 //! est gardé pour un processus. Sa partie fixe est un système de fichiers
 //! du noyau tout fait (fichiers::noyaufs, monté sur /proc au démarrage,
 //! vfs.rs) : /proc/sys/vm/overcommit_memory et mmap_min_addr,
-//! /proc/sys/fs/pipe-max-size et pipe-user-pages-*, à root ; /proc/self,
+//! /proc/sys/fs/pipe-max-size et pipe-user-pages-*, à root ; /proc/net
+//! (dev, pnp, route : le réseau, 6g, reseau/proc.rs) ; /proc/self,
 //! un lien vers le numéro du processus qui le lit, et /proc/thread-self,
 //! vers « <pid>/task/<tid> », le dossier du fil qui le lit. Le reste, la
 //! vue de /proc le fabrique le temps d'un appel (`ProcVue`), d'après la
@@ -99,6 +100,10 @@ const COMM: u32 = 5;
 const PIPE_MAX_SIZE: u32 = 6;
 const PIPE_USER_PAGES_SOFT: u32 = 7;
 const PIPE_USER_PAGES_HARD: u32 = 8;
+/// /proc/net/pnp, route et dev (6g, reseau/proc.rs).
+const NET_PNP: u32 = 20;
+const NET_ROUTE: u32 = 21;
+const NET_DEV: u32 = 22;
 
 /// Le périphérique de procfs (un numéro anonyme, après celui du tmpfs de la
 /// racine, 0:20).
@@ -123,6 +128,15 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     p.ajouter(fs, b"pipe-max-size", 0o644, (0, 0), reglage(PIPE_MAX_SIZE), maintenant)?;
     p.ajouter(fs, b"pipe-user-pages-hard", 0o644, (0, 0), reglage(PIPE_USER_PAGES_HARD), maintenant)?;
     p.ajouter(fs, b"pipe-user-pages-soft", 0o644, (0, 0), reglage(PIPE_USER_PAGES_SOFT), maintenant)?;
+    // /proc/net : chez Linux, un lien vers self/net, le réseau de l'espace
+    // de noms du processus qui lit ; sans espaces de noms (un seul réseau),
+    // un dossier de la partie fixe : un écart, qu'aucun programme ne voit
+    // en lisant /proc/net/route ou pnp.
+    let net = p.ajouter(racine, b"net", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    let net_fichier = |source| Contenu::Fichier { source, argument: 0 };
+    p.ajouter(net, b"dev", 0o444, (0, 0), net_fichier(NET_DEV), maintenant)?;
+    p.ajouter(net, b"pnp", 0o444, (0, 0), net_fichier(NET_PNP), maintenant)?;
+    p.ajouter(net, b"route", 0o444, (0, 0), net_fichier(NET_ROUTE), maintenant)?;
     p.ajouter(racine, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), maintenant)?;
     p.ajouter(racine, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), maintenant)?;
     Ok(p)
@@ -570,7 +584,7 @@ impl Monte for ProcVue<'_> {
 pub fn lecture(source: u32) -> Lecture {
     match source {
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD => Lecture::Valeur,
-        MAPS | STATM | COMM => Lecture::Sequence,
+        MAPS | STATM | COMM | NET_PNP | NET_ROUTE | NET_DEV => Lecture::Sequence,
         _ => Lecture::Attribut,
     }
 }
@@ -714,6 +728,17 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
         MAPS => ligne_maps(argument, curseur),
         STATM if curseur == 0 => statm(argument).map(|t| Some((t, u64::MAX))),
         COMM if curseur == 0 => comm(argument).map(|t| Some((t, u64::MAX))),
+        NET_PNP | NET_ROUTE | NET_DEV => {
+            let f = match source {
+                NET_PNP => crate::reseau::proc::Fichier::Pnp,
+                NET_ROUTE => crate::reseau::proc::Fichier::Route,
+                _ => crate::reseau::proc::Fichier::Dev,
+            };
+            match crate::reseau::proc::ligne(f, curseur) {
+                Ok(l) => Ok(l.map(|l| (l, curseur + 1))),
+                Err(()) => Err(Erreur::ENOMEM),
+            }
+        }
         _ => Ok(None),
     }
 }

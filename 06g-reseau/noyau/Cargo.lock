@@ -11,11 +11,19 @@ name = "formats"
 version = "0.1.0"
 
 [[package]]
+name = "inet"
+version = "0.1.0"
+dependencies = [
+ "formats",
+]
+
+[[package]]
 name = "noyau"
 version = "0.1.0"
 dependencies = [
  "fichiers",
  "formats",
+ "inet",
  "wasm",
  "zones",
 ]

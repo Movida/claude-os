@@ -1,9 +1,9 @@
 //! Les formats de fichiers que lit le noyau, les tables que lui laisse
-//! le micrologiciel (ACPI), et ce que disent les périphériques d'eux-mêmes
-//! (l'espace de configuration PCI, 6g).
+//! le micrologiciel (ACPI), ce que disent les périphériques d'eux-mêmes
+//! (l'espace de configuration PCI, 6g), et les trames du réseau (6g).
 //!
 //! Ces octets viennent de l'extérieur (le disque, un programme, un
-//! périphérique) : rien ne garantit qu'ils sont bien formés. Un fichier
+//! périphérique, le réseau) : rien ne garantit qu'ils sont bien formés. Un fichier
 //! tronqué ou piégé ne doit jamais faire lire le noyau hors du fichier, ni
 //! le faire paniquer : chaque champ est vérifié, chaque addition aussi,
 //! avant de s'en servir. Le code de lecture est donc à part, dans cette
@@ -28,3 +28,4 @@ pub mod commande;
 pub mod cpio;
 pub mod elf;
 pub mod pci;
+pub mod reseau;

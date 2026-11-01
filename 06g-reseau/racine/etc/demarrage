@@ -71,6 +71,9 @@ wait
 /bin/fils
 /bin/fils groupe
 /bin/courses
+# Le réseau (6g), tel que l'a configuré le DHCP du démarrage : /proc/net,
+# /etc/resolv.conf.
+/bin/passerelle
 # Et le jalon de 6d, et de 6e : le vrai Claude Code, en dernier (ce qui
 # précède a déjà dit si le noyau va bien).
 /usr/local/bin/claude --version

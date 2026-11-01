@@ -16,7 +16,7 @@
 use super::paquet::Paquet;
 use super::virtio_net::{self, Carte};
 use crate::verrou::Verrou;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Le matériel derrière une interface.
 pub enum Materiel {
@@ -45,7 +45,10 @@ pub struct Interface {
     pub nom: &'static str,
     pub index: u32,
     pub mac: [u8; 6],
-    pub mtu: u32,
+    /// La MTU, que le DHCP peut baisser (`changer_mtu`), et la plus grande
+    /// que la carte accepte (celle de sa création).
+    mtu: AtomicU32,
+    mtu_max: u32,
     /// Le lien (le « carrier » de Linux) : le câble est-il branché ?
     pub lien: AtomicBool,
     pub compteurs: Compteurs,
@@ -65,7 +68,8 @@ pub fn ajouter(nom: &'static str, mac: [u8; 6], mtu: u32, lien: bool, materiel: 
     let place = t.iter().position(Option::is_none)?;
     // Au démarrage seulement : une allocation qui ne peut pas échouer.
     let i = alloc::boxed::Box::new(Interface {
-        nom, index: place as u32 + 1, mac, mtu, lien: AtomicBool::new(lien), compteurs: Compteurs::default(), materiel,
+        nom, index: place as u32 + 1, mac, mtu: AtomicU32::new(mtu), mtu_max: mtu, lien: AtomicBool::new(lien),
+        compteurs: Compteurs::default(), materiel,
     });
     let i: &'static Interface = alloc::boxed::Box::leak(i);
     t[place] = Some(i);
@@ -79,6 +83,28 @@ pub fn par_index(index: u32) -> Option<&'static Interface> {
 }
 
 impl Interface {
+    pub fn mtu(&self) -> u32 {
+        self.mtu.load(Ordering::Relaxed)
+    }
+
+    /// Change la MTU (le `dev_set_mtu` de Linux) : de 68 (le plus petit
+    /// paquet qu'IPv4 doit faire passer, ETH_MIN_MTU) à celle de la carte.
+    /// false : hors de ces bornes, rien ne change.
+    pub fn changer_mtu(&self, mtu: u32) -> bool {
+        if !(68..=self.mtu_max).contains(&mtu) {
+            return false;
+        }
+        self.mtu.store(mtu, Ordering::Relaxed);
+        true
+    }
+
+    /// Est-ce une interface de boucle (lo), plutôt qu'une carte ?
+    pub fn boucle(&self) -> bool {
+        match self.materiel {
+            Materiel::VirtioNet(_) => false,
+        }
+    }
+
     /// Émet la trame `p` (le `dev_queue_xmit` de Linux), dans le contexte
     /// de qui l'envoie. Lien coupé, ou file d'émission pleine : jetée, et
     /// comptée.

@@ -200,7 +200,7 @@ pub fn sonder() {
     };
     c.interface.store(i.index, Ordering::Relaxed);
     *CARTE.verrouiller() = Some(c);
-    afficherln!("[reseau] {} : {}, mtu {}, lien {}.", i.nom, interface::decrire(i), i.mtu, if lien { "actif" } else { "coupe" });
+    afficherln!("[reseau] {} : {}, mtu {}, lien {}.", i.nom, interface::decrire(i), i.mtu(), if lien { "actif" } else { "coupe" });
     // Des trames ont pu arriver avant que l'interface n'existe (la file
     // de réception était déjà ouverte) : la tâche les prendra.
     super::tache::signaler_interface(i.index);

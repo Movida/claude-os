@@ -38,6 +38,7 @@ file  /bin/evenements      linux/construits/evenements 755 0 0
 file  /bin/proc            linux/construits/proc 755 0 0
 file  /bin/partage         linux/construits/partage 755 0 0
 file  /bin/ajout           linux/construits/ajout 755 0 0
+file  /bin/passerelle      linux/construits/passerelle 755 0 0
 
 # Les commandes que lance le noyau (formats/src/commande.rs). Écrit avant
 # les autres fichiers de /etc : un dossier se lit du plus récent au plus
@@ -49,6 +50,14 @@ file  /etc/demarrage       racine/etc/demarrage 644 0 0
 # trouvé, fabriqué par ldconfig (le cache : voir le Makefile).
 file  /etc/ld.so.conf      racine/etc/ld.so.conf 644 0 0
 file  /etc/ld.so.cache     glibc/racine/etc/ld.so.cache 644 0 0
+# Le réseau (6g) : où chercher les noms de machines (d'abord /etc/hosts,
+# puis le DNS), les noms de la machine elle-même, et les serveurs DNS :
+# /etc/resolv.conf est un lien vers /proc/net/pnp, que remplit le DHCP du
+# démarrage, comme le propose la documentation de Linux pour les machines
+# qui démarrent par le réseau (Documentation/admin-guide/nfs/nfsroot.rst).
+file  /etc/nsswitch.conf   racine/etc/nsswitch.conf 644 0 0
+file  /etc/hosts           racine/etc/hosts 644 0 0
+slink /etc/resolv.conf     /proc/net/pnp 777 0 0
 
 # Quelques fichiers à lire : un texte, un second nom (un lien physique),
 # et des liens symboliques.

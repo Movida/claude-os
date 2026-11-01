@@ -17,6 +17,9 @@ zones = { path = "../zones" }
 # Le système de fichiers en mémoire (le tmpfs) et la résolution des
 # chemins, notre propre bibliothèque, sans unsafe, testée sur l'hôte.
 fichiers = { path = "../fichiers" }
+# La pile d'IPv4 sans le matériel (les routes, le client DHCP), notre
+# propre bibliothèque, sans unsafe, testée sur l'hôte.
+inet = { path = "../inet" }
 
 # Les scénarios de `make tests-qemu` : des versions du noyau qui
 # provoquent exprès une situation à tester (voir src/main.rs).

@@ -327,7 +327,7 @@ static void arborescence(void)
     struct dirent *e;
     char moi[32];
     snprintf(moi, sizeof moi, "%d", getpid());
-    int vu_self = 0, vu_fil = 0, vu_moi = 0, vu_sys = 0, autres = 0, numeros = 0;
+    int vu_self = 0, vu_fil = 0, vu_moi = 0, vu_sys = 0, vu_net = 0, autres = 0, numeros = 0;
     while ((e = readdir(d))) {
         numeros += e->d_name[0] >= '1' && e->d_name[0] <= '9';
         if (!strcmp(e->d_name, "self"))
@@ -338,11 +338,14 @@ static void arborescence(void)
             vu_moi = e->d_type == DT_DIR;
         else if (!strcmp(e->d_name, "sys"))
             vu_sys = e->d_type == DT_DIR;
+        else if (!strcmp(e->d_name, "net"))
+            /* Un lien vers self/net chez Linux, un dossier chez nous (6g). */
+            vu_net = e->d_type == DT_DIR || e->d_type == DT_LNK;
         else if (strcmp(e->d_name, ".") && strcmp(e->d_name, ".."))
             autres++;
     }
     closedir(d);
-    verifier(vu_self && vu_fil && vu_moi && vu_sys, "/proc contient self, thread-self, sys et le dossier du processus");
+    verifier(vu_self && vu_fil && vu_moi && vu_sys && vu_net, "/proc contient self, thread-self, sys, net et le dossier du processus");
     /* Les liens de /proc : deux, un par sous-dossier fixe, et un par
      * processus (`proc_root_getattr`) ; sur l'hôte, bien plus de dossiers
      * fixes, et tous les processus de la machine. */

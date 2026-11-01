@@ -38,14 +38,15 @@ rendues et recollees : ok.
 [virtio] 00:03.0 : reseau, fonctionnalites VERSION_1 MAC STATUS EVENT_IDX, 3 files.
 [reseau] eth0 : virtio-net 52:54:00:12:34:56, mtu 1500, lien actif.
 [reseau] eth0 : deux sondes ARP (qui a 10.0.2.2 ?) emises, reponses de la passerelle de QEMU recues : ok.
+[reseau] eth0 : 10.0.2.15/24, passerelle 10.0.2.2, DNS 10.0.2.3 (DHCP de 10.0.2.2, 
 [noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 42, liens symboliques 5, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 40 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 45, liens symboliques 6, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 41 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -162,6 +163,13 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] fils : termine, code de sortie 7 ; memoire rendue : ok.
 [linux] courses : ok
 [noyau] courses : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] passerelle : /proc/net/route comme Linux : ok
+[linux] passerelle : /proc/net/route lu par morceaux : ok
+[linux] passerelle : /etc/resolv.conf -> /proc/net/pnp : ok
+[linux] passerelle : /etc/resolv.conf : le DNS de slirp : ok
+[linux] passerelle : /proc/net/dev : en-tete et eth0 : ok
+[linux] passerelle : toutes les verifications : ok
+[noyau] passerelle : termine, code de sortie 0 ; memoire rendue : ok.
 [noyau] claude : programme Linux (ELF ET_EXEC), 291638640 octets, point d'entree 0x1be7900, segments :
 2.1.310 (Claude Code)
 [noyau] claude : termine, code de sortie 0 ; memoire rendue : ok.

@@ -1,7 +1,9 @@
 # Sous-étape 6g : le réseau. Le bus PCI (formats/src/pci.rs et
 # noyau/src/pci.rs), les vecteurs d'interruption à la demande et MSI-X,
 # virtio (noyau/src/virtio.rs, virtqueue.rs) et la carte virtio-net, ses
-# files et la tâche du réseau (noyau/src/reseau/).
+# files et la tâche du réseau (noyau/src/reseau/) ; Ethernet, IPv4 et la
+# configuration par DHCP (formats/src/reseau/, et la bibliothèque inet/ :
+# les routes, le client DHCP).
 # De 6f : les signaux livrés à leurs gestionnaires (le
 # cadre de signal, rt_sigreturn, la reprise des appels interrompus),
 # l'attente d'événements (poll, select, epoll), les tubes, /proc fabriqué
@@ -40,7 +42,7 @@
 #                  un noyau gonflé au-delà de 1 Mio doit être lu en entier ;
 #                  une carte derrière un pont PCI doit être trouvée ;
 #                  une carte sans MSI-X laissée éteinte ; le câble
-#                  débranché puis rebranché, vu ;
+#                  débranché puis rebranché, vu ; un réseau sans DHCP ;
 #                  et make claude-p
 #   make claude-p -> le jalon de 6f, dans une image à part : claude -p
 #                  bonjour jusqu'à l'appel de l'API (claude-p-attendu.txt)
@@ -52,11 +54,12 @@
 #                  d'opérations au hasard comparées à un modèle) ; ceux du
 #                  système de fichiers (fichiers/ : une règle de Linux par
 #                  cas, puis des milliers d'opérations au hasard comparées
-#                  à un modèle naïf) ; puis
+#                  à un modèle naïf) ; ceux de la pile d'IPv4 (inet/ :
+#                  les routes, le client DHCP, à l'horloge simulée) ; puis
 #                  pour l'interpréteur WebAssembly, télécharge et
 #                  convertit la suite de tests officielle si besoin, puis la
 #                  rejoue contre la bibliothèque (tableau par fichier) ;
-#                  vérifie aussi que les quatre bibliothèques se compilent
+#                  vérifie aussi que les cinq bibliothèques se compilent
 #                  pour le noyau (no_std), sans avertissement ; enfin
 #                  lance linux/memoire sur l'hôte : nos codes d'erreur de
 #                  mmap & co. doivent être ceux du vrai Linux ; et
@@ -197,7 +200,11 @@ boot.bin: programmes.cpio FORCE
 #     processus finit avec son dernier fil, ou avec le groupe) ; sur l'hôte
 #     aussi ;
 #   - courses : gcc -static, quatre fils qui ferment, changent de dossier et
-#     se servent en même temps des mêmes descripteurs ; sur l'hôte aussi.
+#     se servent en même temps des mêmes descripteurs ; sur l'hôte aussi ;
+#   - passerelle : gcc sans option (la glibc partagée, comme claude), le
+#     réseau que le DHCP du démarrage a configuré (/proc/net, le DNS de
+#     /etc/resolv.conf) ; dans notre noyau seulement (il connaît les
+#     adresses du réseau de QEMU).
 # Pour les tests du lecteur ELF sur l'hôte, des variantes qu'il doit
 # accepter : bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -311,6 +318,10 @@ $(LINUX)/fils: linux/fils.c
 $(LINUX)/courses: linux/courses.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/passerelle: linux/passerelle.c
+	mkdir -p $(LINUX)
+	gcc $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/evenements: linux/evenements.c
 	mkdir -p $(LINUX)
@@ -684,7 +695,8 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses FORCE
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/passerelle \
+              racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
@@ -837,6 +849,8 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	cd zones && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd fichiers && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd fichiers && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	cd inet && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	cd inet && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo test --release -q -- --nocapture suite_officielle 2>/dev/null | grep -v '^running\|^test \|^$$'
@@ -916,6 +930,9 @@ $(WAST2JSON):
 #     BIOS lui a donné (depuis 6g) ;
 #   - une carte virtio-net sans MSI-X (vectors=0) : le pilote la laisse
 #     éteinte, et le dit (6g) ;
+#   - une carte sur un réseau sans serveur DHCP (-netdev hubport, un
+#     concentrateur relié à rien) : le DHCP abandonne au bout de 12 à 17 s,
+#     et le démarrage continue (6g) ;
 #   - le câble débranché puis rebranché au moniteur (set_link) : chaque
 #     fois, l'interruption de configuration de la carte, par MSI-X, et le
 #     noyau le dit (6g) ;
@@ -940,6 +957,8 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin claude-p
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -device pci-bridge$(,)id=pont$(,)chassis_nr=1 -netdev user$(,)id=n1 \
 	  -device virtio-net-pci$(,)netdev=n1$(,)bus=pont$(,)addr=1 -drive format=raw$(,)file=vide.bin -serial file:test-pont.log,test-pont.log,"[pci] 01:01.0 1af4:1000 Ethernet",:)
 	grep -F "[pci] 00:04.0 1b36:0001 pont PCI, bus 1-1" test-pont.log
+	$(call attendre,$(QEMU_TEST) -netdev hubport$(,)id=n0$(,)hubid=1 -device virtio-net-pci$(,)netdev=n0 -drive format=raw$(,)file=vide.bin \
+	  -serial file:test-sans-dhcp.log,test-sans-dhcp.log,"[reseau] eth0 : pas de reponse DHCP (3 essais) : pas d'adresse.",:)
 	$(call attendre,$(QEMU_TEST) -netdev user$(,)id=n0 -device virtio-net-pci$(,)netdev=n0$(,)vectors=0 -drive format=raw$(,)file=vide.bin \
 	  -serial file:test-sans-msix.log,test-sans-msix.log,"[virtio] 00:03.0 : pas de MSI-X : carte laissee eteinte.",:)
 	rm -f test-lien.log $(MON_TESTS); \

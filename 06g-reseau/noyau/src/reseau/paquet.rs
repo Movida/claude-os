@@ -50,6 +50,10 @@ impl Paquet {
         &self.tampon[self.debut..self.fin]
     }
 
+    pub fn donnees_mut(&mut self) -> &mut [u8] {
+        &mut self.tampon[self.debut..self.fin]
+    }
+
     pub fn longueur(&self) -> usize {
         self.fin - self.debut
     }
@@ -60,5 +64,23 @@ impl Paquet {
         let fin = self.fin.checked_add(n).filter(|&f| f <= self.tampon.len())?;
         let debut = core::mem::replace(&mut self.fin, fin);
         Some(&mut self.tampon[debut..fin])
+    }
+
+    /// Ajoute un en-tête de `n` octets devant les données (le `skb_push`),
+    /// dans la marge. None : la marge est épuisée.
+    pub fn ajouter_entete(&mut self, n: usize) -> Option<&mut [u8]> {
+        self.debut = self.debut.checked_sub(n)?;
+        Some(&mut self.tampon[self.debut..self.debut + n])
+    }
+
+    /// Retire les `n` premiers octets des données (le `skb_pull`), et les
+    /// rend. None : il y en a moins.
+    pub fn retirer_entete(&mut self, n: usize) -> Option<&[u8]> {
+        if n > self.longueur() {
+            return None;
+        }
+        let debut = self.debut;
+        self.debut += n;
+        Some(&self.tampon[debut..debut + n])
     }
 }
