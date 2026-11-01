@@ -48,8 +48,8 @@ memoire rendue : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 46, liens symboliques 6, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 42 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 47, liens symboliques 6, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 43 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -168,6 +168,8 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] courses : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] reseau : toutes les verifications : ok
 [noyau] reseau : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] dns : toutes les verifications : ok
+[noyau] dns : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] passerelle : /proc/net/route comme Linux : ok
 [linux] passerelle : /proc/net/route lu par morceaux : ok
 [linux] passerelle : /etc/resolv.conf -> /proc/net/pnp : ok
@@ -178,6 +180,9 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] passerelle : /proc/net/arp : la passerelle et le DNS, comme Linux : ok
 [linux] passerelle : ping de 10.0.2.2 : la reponse, attendue sans delai : ok
 [linux] passerelle : 10.0.2.2:9 connectee : l'ICMP de 127.0.0.1 est un martien, aucune erreur : ok
+[linux] passerelle : api.anthropic.com : adresse trouvee : ok
+[linux] passerelle : localhost : 127.0.0.1, par /etc/hosts : ok
+[linux] passerelle : nexistepas-claude-os.anthropic.com : EAI_NONAME : ok
 [linux] passerelle : toutes les verifications : ok
 [noyau] passerelle : termine, code de sortie 0 ; memoire rendue : ok.
 [noyau] claude : programme Linux (ELF ET_EXEC), 291638640 octets, point d'entree 0x1be7900, segments :

@@ -4,7 +4,8 @@
 # files et la tâche du réseau (noyau/src/reseau/) ; Ethernet, IPv4 et la
 # configuration par DHCP (formats/src/reseau/, et la bibliothèque inet/ :
 # les routes, le client DHCP), ARP et la table des voisins ; les sockets
-# et UDP, avec l'interface de boucle lo ; ICMP et les sockets de ping.
+# et UDP, avec l'interface de boucle lo ; ICMP et les sockets de ping ; le
+# DNS, par la glibc (linux/dns.c).
 # De 6f : les signaux livrés à leurs gestionnaires (le
 # cadre de signal, rt_sigreturn, la reprise des appels interrompus),
 # l'attente d'événements (poll, select, epoll), les tubes, /proc fabriqué
@@ -73,8 +74,9 @@
 #                  linux/systeme (uname, futex, prctl...),
 #                  linux/evenements (eventfd, epoll), linux/proc,
 #                  linux/clone (clone, clone3), linux/fils et
-#                  linux/courses (des programmes à plusieurs fils), et
-#                  linux/reseau (les sockets UDP et ICMP, sur lo)
+#                  linux/courses (des programmes à plusieurs fils),
+#                  linux/reseau (les sockets UDP et ICMP, sur lo) et
+#                  linux/dns (getaddrinfo, par un DNS du programme)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -208,10 +210,15 @@ boot.bin: programmes.cpio FORCE
 #     leurs refus, les options, la socket vue comme fichier, les attentes
 #     d'un fil à l'autre, 10 000 allers-retours, les erreurs ICMP, le ping) ;
 #     sur l'hôte aussi ;
-#   - passerelle : gcc sans option (la glibc partagée, comme claude), le
-#     réseau que le DHCP du démarrage a configuré (/proc/net, le DNS de
-#     /etc/resolv.conf, un datagramme qui part par eth0) ; dans notre noyau
-#     seulement (il connaît les adresses du réseau de QEMU).
+#   - dns : gcc sans option (la glibc partagée, comme claude), getaddrinfo
+#     par un serveur DNS du programme (des réponses de travers, NXDOMAIN,
+#     /etc/hosts) ; sur l'hôte aussi ;
+#   - passerelle : gcc sans option, le réseau que le DHCP du démarrage a
+#     configuré (/proc/net, le DNS de /etc/resolv.conf, un datagramme qui
+#     part par eth0, le ping de la passerelle, api.anthropic.com) ; dans
+#     notre noyau seulement (il connaît les adresses du réseau de QEMU) ;
+#     `passerelle muet` dans le noyau des tests, `passerelle sans-reseau`
+#     sur une machine sans carte (make tests-qemu).
 # Pour les tests du lecteur ELF sur l'hôte, des variantes qu'il doit
 # accepter : bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -329,6 +336,10 @@ $(LINUX)/courses: linux/courses.c
 $(LINUX)/reseau: linux/reseau.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/dns: linux/dns.c
+	mkdir -p $(LINUX)
+	gcc $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/passerelle: linux/passerelle.c
 	mkdir -p $(LINUX)
@@ -710,7 +721,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -723,6 +734,15 @@ programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/
 claude-p.cpio: programmes.cpio racine/etc/demarrage-claude-p
 	{ sed 's|racine/etc/demarrage |racine/etc/demarrage-claude-p |' archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } \
 	  | sh archive.sh $@ -
+
+# L'archive de la machine sans carte (6g) : celle de l'étape sans claude,
+# dont /etc/demarrage ne lance que `passerelle sans-reseau`.
+sans-reseau.cpio: programmes.cpio racine/etc/demarrage-sans-reseau
+	sed 's|racine/etc/demarrage |racine/etc/demarrage-sans-reseau |' archive.txt | sh archive.sh $@ -
+
+sans-reseau.bin: sans-reseau.cpio FORCE
+	cd noyau && cargo build --release
+	$(call image,$(NOYAU_ELF),sans-reseau.cpio,sans-reseau)
 
 claude-p.bin: claude-p.cpio FORCE
 	cd noyau && cargo build --release
@@ -859,7 +879,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -892,6 +912,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/fils groupe; test $$? = 7
 	./$(LINUX)/courses | tee /dev/stderr | (! grep -q ECHEC)
 	timeout 60 ./$(LINUX)/reseau | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	timeout 60 ./$(LINUX)/dns | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	rm -rf /tmp/ajout; \
 	  ./$(LINUX)/ajout ecrire a 500 & a=$$!; ./$(LINUX)/ajout ecrire b 500 & b=$$!; \
 	  ./$(LINUX)/ajout verifier 500 | tee /dev/stderr | (! grep -q ECHEC); r=$$?; wait $$a $$b; exit $$r
@@ -954,6 +975,9 @@ $(WAST2JSON):
 #   - le câble débranché puis rebranché au moniteur (set_link) : chaque
 #     fois, l'interruption de configuration de la carte, par MSI-X, et le
 #     noyau le dit (6g) ;
+#   - une machine sans carte (-nic none : sans cette option, QEMU ajoute
+#     une e1000), et `passerelle sans-reseau` : le DNS de la glibc échoue
+#     vite, EAI_AGAIN (6g) ;
 #   test-garde, test-gros, le démarrage sans ACPI et celui du pont ne
 #   s'éteignent pas : QEMU est arrêté dès que la ligne cherchée est venue
 #   (`attendre`), au lieu d'attendre DUREE.
@@ -966,7 +990,7 @@ MON_TESTS = mon-tests.sock
 QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot $(QEMU_RESEAU) \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
-tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin claude-p
+tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin sans-reseau.bin claude-p
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"Clavier PS/2 pret",:)
 	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
@@ -979,6 +1003,8 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin claude-p
 	  -serial file:test-sans-dhcp.log,test-sans-dhcp.log,"[reseau] eth0 : pas de reponse DHCP (3 essais) : pas d'adresse.",:)
 	$(call attendre,$(QEMU_TEST) -netdev user$(,)id=n0 -device virtio-net-pci$(,)netdev=n0$(,)vectors=0 -drive format=raw$(,)file=vide.bin \
 	  -serial file:test-sans-msix.log,test-sans-msix.log,"[virtio] 00:03.0 : pas de MSI-X : carte laissee eteinte.",:)
+	$(call attendre,$(QEMU_TEST) -nic none -drive format=raw$(,)file=sans-reseau.bin -serial file:test-sans-reseau.log,test-sans-reseau.log,"[noyau] passerelle : termine",:)
+	grep -F "[linux] passerelle : toutes les verifications (sans reseau) : ok" test-sans-reseau.log
 	rm -f test-lien.log $(MON_TESTS); \
 	$(QEMU_TEST) $(QEMU_RESEAU) -drive format=raw,file=vide.bin -serial file:test-lien.log -monitor unix:$(MON_TESTS),server,nowait & q=$$!; \
 	ligne() { for i in $$(seq $$(( $(DUREE) * 10 ))); do grep -qF -- "$$1" test-lien.log 2>/dev/null && return 0; \
@@ -1059,7 +1085,8 @@ test-%.bin: vide.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio tests-demarrage.txt serial.log trace.log \
+	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio \
+	  tests-demarrage.txt serial.log trace.log \
 	  capture.log qemu.log ecran.png test-*.log claude-p.log $(MON_TESTS)
 	rm -rf $(LINUX)
 	rm -rf $(GLIBC)

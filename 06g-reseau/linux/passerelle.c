@@ -17,7 +17,17 @@
  *     attendre (une réponse peut venir du réseau) ;
  *   - une socket connectée à 10.0.2.2:9 : slirp répond par un ICMP « port
  *     injoignable » venu de 127.0.0.1 (ce que lui dit l'hôte), un martien
- *     que Linux jette : aucune erreur.
+ *     que Linux jette : aucune erreur ;
+ *   - le DNS, par getaddrinfo comme claude : api.anthropic.com trouvé (par
+ *     le DNS de slirp, qui relaie celui de l'hôte : il y faut Internet ;
+ *     l'adresse n'est pas affichée, elle change), localhost par /etc/hosts,
+ *     nexistepas-claude-os.anthropic.com inconnu (EAI_NONAME ; pas un nom
+ *     réservé de la RFC 6761, qu'un résolveur peut traiter à part).
+ * `passerelle sans-reseau`, sur une machine sans carte : la glibc, sans
+ * serveur DNS dans /etc/resolv.conf (/proc/net/pnp dit « #MANUAL »),
+ * demande à 127.0.0.1, dont le port 53 est fermé : l'ICMP « port
+ * injoignable » revient par lo, et getaddrinfo rend EAI_AGAIN tout de suite,
+ * sans attendre ses 5 s de délai.
  * `passerelle muet`, dans le noyau des tests : 10.0.2.99, une adresse du
  * réseau où personne ne répond. Le voisin échoue (3 s), et chaque paquet
  * qui l'attendait revient en ICMP « hôte injoignable », de nous à nous :
@@ -30,12 +40,14 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/errqueue.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <time.h>
 #include <unistd.h>
 
 static int echecs;
@@ -133,10 +145,41 @@ static int muet(void)
     return echecs != 0;
 }
 
+/* getaddrinfo(nom), comme le fait claude (AF_UNSPEC, le port 443) ; rend
+ * son code, et la première adresse IPv4 dans `a`. */
+static int chercher(const char *nom, struct sockaddr_in *a)
+{
+    struct addrinfo h = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_STREAM }, *r;
+    int e = getaddrinfo(nom, "443", &h, &r);
+    if (e != 0)
+        return e;
+    memset(a, 0, sizeof *a);
+    for (struct addrinfo *p = r; p; p = p->ai_next)
+        if (p->ai_family == AF_INET && a->sin_family == 0)
+            memcpy(a, p->ai_addr, sizeof *a);
+    freeaddrinfo(r);
+    return 0;
+}
+
+static int sans_reseau(void)
+{
+    struct sockaddr_in a;
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int e = chercher("api.anthropic.com", &a);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double duree = (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+    verifier(e == EAI_AGAIN && duree < 2, "sans carte : EAI_AGAIN, en moins de 2 s (le 127.0.0.1 de la glibc, l'ICMP de lo)");
+    printf("[linux] passerelle : %s\n", echecs ? "ECHEC" : "toutes les verifications (sans reseau) : ok");
+    return echecs != 0;
+}
+
 int main(int argc, char **argv)
 {
     if (argc > 1 && strcmp(argv[1], "muet") == 0)
         return muet();
+    if (argc > 1 && strcmp(argv[1], "sans-reseau") == 0)
+        return sans_reseau();
     char t[8192], attendu[3 * 128 + 1];
     /* La table de routage : la route par défaut (RTF_UP | RTF_GATEWAY, par
      * 10.0.2.2), puis celle du réseau (RTF_UP) ; les adresses comme Linux
@@ -233,6 +276,12 @@ int main(int argc, char **argv)
     verifier(poll(&p, 1, 500) == 0 && recv(s, rep, sizeof rep, MSG_DONTWAIT) == -1 && errno == EAGAIN,
              "10.0.2.2:9 connectee : l'ICMP de 127.0.0.1 est un martien, aucune erreur");
     close(s);
+
+    /* Le DNS, par la glibc. */
+    verifier(chercher("api.anthropic.com", &a) == 0 && a.sin_family == AF_INET && ntohs(a.sin_port) == 443,
+             "api.anthropic.com : adresse trouvee");
+    verifier(chercher("localhost", &a) == 0 && a.sin_addr.s_addr == htonl(INADDR_LOOPBACK), "localhost : 127.0.0.1, par /etc/hosts");
+    verifier(chercher("nexistepas-claude-os.anthropic.com", &a) == EAI_NONAME, "nexistepas-claude-os.anthropic.com : EAI_NONAME");
 
     printf("[linux] passerelle : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
