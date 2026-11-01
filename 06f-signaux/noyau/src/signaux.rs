@@ -135,6 +135,14 @@ impl Info {
         Info::nouveau(sig, SI_KERNEL)
     }
 
+    /// Celui d'une faute du programme : sa raison (SEGV_MAPERR...) et
+    /// l'adresse en cause (les champs `_sigfault` : si_addr).
+    pub fn faute(sig: u64, code: i32, adresse: u64) -> Info {
+        let mut i = Info::nouveau(sig, code);
+        i.0[16..24].copy_from_slice(&adresse.to_le_bytes());
+        i
+    }
+
     /// Celui d'un signal en attente dont le siginfo n'a pas pu être gardé
     /// (la limite, ou plus de mémoire) : SI_USER, sans qui ni pourquoi
     /// (`collect_signal`).

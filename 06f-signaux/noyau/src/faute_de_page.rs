@@ -75,7 +75,7 @@ fn faute_du_programme(cadre: &Cadre, cr2: u64, acces: Acces) {
         Err(Echec::PlusDeMemoire) => tache::tuer_au_retour(),
         Err(cause) => {
             let zone = processus::avec(|p| p.memoire.zone_du_code(cadre.rip));
-            let (signal, raison) = linux::signal_de_l_exception(14, cadre, cr2, Some(cause), zone);
+            let (signal, raison) = linux::signal_de_l_exception(14, cadre, cr2, Some(cause), zone, 0);
             tache::forcer_par_faute(signal, raison)
         }
     }

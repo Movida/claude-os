@@ -322,8 +322,9 @@ $(LINUX)/dynamique: linux/dynamique.c
 # défaut, le temps de calcul est infini, comme sous Linux ; des signaux
 # qu'un programme s'envoie (sig-term, sig-abort : terminés par leur
 # action par défaut), un gestionnaire appelé (sig-gestion : le programme
-# continue), un gestionnaire de faute que le noyau n'appelle pas encore
-# (sig-faute : arrêté, le message le dit, alors que Linux l'appelle), des
+# continue), un gestionnaire de faute (sig-faute : il est appelé, et sort
+# avec 0), une faute dans le gestionnaire de la même faute (sig-refaute :
+# tué), des
 # cadres de signal impossibles (sig-restorer : sans adresse de
 # retour ; sig-pile-perdue : un RSP où rien n'est projeté ;
 # sig-secours : une pile de secours trop petite pour deux cadres) et
@@ -363,7 +364,7 @@ $(LINUX)/dynamique: linux/dynamique.c
 TESTS_PARALLELES = lignes cible signaler avx
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle calcul-long limite-egale \
-              sig-term sig-abort sig-gestion sig-faute sig-restorer sig-pile-perdue sig-mxcsr sig-secours \
+              sig-term sig-abort sig-gestion sig-faute sig-refaute sig-restorer sig-pile-perdue sig-mxcsr sig-secours \
               sig-retour-cs sig-retour-ss sig-retour-rip \
               xcpu-ignore futex-sans-fin nom-faute eventfd-bloque \
               wx derniere-page et-dyn tronque bus-fichier faute-libc dort

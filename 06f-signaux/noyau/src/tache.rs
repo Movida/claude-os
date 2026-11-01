@@ -1376,18 +1376,39 @@ enum Arret {
 }
 
 /// Une exception du programme en cours (une faute de page, une
-/// instruction invalide...) : `signal` et le message de Linux, `raison`.
-/// Il sera arrêté au retour vers l'anneau 3. S'il a un gestionnaire pour
-/// ce signal, et ne le bloque pas, Linux l'appellerait ; les gestionnaires
-/// ne sont pas encore appelés pour une faute : le message le dit. Sinon,
-/// comme Linux, une faute tue le programme même s'il ignore ou bloque son
-/// signal (`force_sig_info_to_task`).
-pub fn forcer_par_faute(signal: Signal, raison: impl fmt::Display) {
-    let tid = courante().tid;
-    let gestionnaire = processus::essayer_avec(|p| signaux::gestionnaire_pour_faute(p, tid, signal.numero as u64)) == Some(true);
-    if gestionnaire {
-        forcer(signal, format_args!("{} ; gestionnaire enregistre, pas encore appele pour une faute", raison))
+/// instruction invalide...) : `signal`, et `raison`, le message de Linux et
+/// le siginfo. Le fil garde la trace de l'exception (son vecteur, son code
+/// d'erreur, l'adresse d'une faute de page : le sigcontext les montrera).
+/// S'il a un gestionnaire pour ce signal, et ne le bloque pas, le signal lui
+/// est envoyé, forcé, avec son siginfo : le gestionnaire sera appelé au
+/// retour vers l'anneau 3 (`force_sig_fault`), sans message, comme sous
+/// Linux. Sinon le programme sera arrêté au retour, même s'il ignore ou
+/// bloque son signal (`force_sig_info_to_task`), et le message le dit.
+pub fn forcer_par_faute(signal: Signal, raison: linux::Raison) {
+    let t = courante();
+    // Le code d'erreur d'une faute de page : avec « venue de l'anneau 3 »,
+    // et « protection » pour une adresse du noyau (Linux ne dit pas au
+    // programme si la page du noyau existe : `set_signal_archinfo`).
+    let (code, cr2) = if raison.vecteur == 14 {
+        let protection = if raison.cr2 >= crate::espace_utilisateur::ADRESSE_MAX { 1 } else { 0 };
+        (raison.code | 4 | protection, raison.cr2)
     } else {
+        (raison.code, t.exception[2].load(Ordering::Relaxed))
+    };
+    t.exception[0].store(raison.vecteur as u64, Ordering::Relaxed);
+    t.exception[1].store(code, Ordering::Relaxed);
+    t.exception[2].store(cr2, Ordering::Relaxed);
+    let tid = t.tid;
+    let sig = signal.numero as u64;
+    let livree = processus::essayer_avec(|p| {
+        let gestionnaire = signaux::gestionnaire_pour_faute(p, tid, sig);
+        if gestionnaire {
+            // C'est la tâche courante : rien à réveiller.
+            let _ = signaux::forcer_au_fil(p, tid, sig, raison.info(signal), false);
+        }
+        gestionnaire
+    }) == Some(true);
+    if !livree {
         forcer(signal, raison)
     }
 }

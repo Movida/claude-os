@@ -88,9 +88,12 @@
 [linux] sig-gestion : apres le gestionnaire
 [noyau] sig-gestion : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] Test : un gestionnaire de SIGSEGV, puis une faute.
-[noyau] sig-faute : segfault at 0x0 ip 
- ; gestionnaire enregistre, pas encore appele pour une faute (SIGSEGV)
-[noyau] sig-faute : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] sig-faute : gestionnaire appele
+[noyau] sig-faute : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Test : une faute dans le gestionnaire de la meme faute.
+[linux] sig-refaute : dans le gestionnaire, une seconde faute
+[noyau] sig-refaute : segfault at 0x0 ip 
+[noyau] sig-refaute : termine, code de sortie 139 ; memoire rendue : ok.
 [linux] Test : un gestionnaire sans SA_RESTORER, puis raise(SIGUSR1).
 [noyau] sig-restorer : gestionnaire de SIGUSR1 sans SA_RESTORER (pas d'adresse de retour)
 [noyau] sig-restorer : arrete par un signal (SIGSEGV)

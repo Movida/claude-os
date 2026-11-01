@@ -2,7 +2,8 @@
  * Les gestionnaires de signaux (6f) : le cadre de signal posé par le
  * noyau, ce que voit le gestionnaire en entrant, ce qui revient après
  * rt_sigreturn, la pile de secours, les drapeaux d'une action, l'ordre de
- * plusieurs signaux. Il tourne dans notre noyau (au démarrage avec
+ * plusieurs signaux ; puis les fautes livrées à leur gestionnaire (le
+ * siginfo et le contexte de chaque exception). Il tourne dans notre noyau (au démarrage avec
  * Nehalem, sans XSAVE ; dans make tests-qemu avec qemu64 et -cpu max, avec
  * XSAVE et AVX) et sur l'hôte (make tests-hote) : chaque ligne doit dire
  * « ok » partout. Ce qui dépend du processeur (XSAVE, AVX) est demandé à
@@ -16,6 +17,7 @@
 #define _GNU_SOURCE
 #include <cpuid.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -606,6 +608,248 @@ static void fil_neuf(void)
     signal(SIGUSR2, SIG_DFL);
 }
 
+/* ---- Les fautes livrées à leur gestionnaire ---- */
+
+static sigjmp_buf apres_faute;
+static volatile int f_sig, f_code;
+static volatile uint64_t f_addr, f_err, f_trapno, f_cr2, f_rip;
+
+static void sur_faute(int sig, siginfo_t *si, void *c)
+{
+    /* AC d'abord : le gestionnaire hérite des drapeaux du programme (Linux
+     * garde AC), et une faute d'alignement l'a peut-être mis ; sans cela,
+     * ce gestionnaire referait la même faute. */
+    __asm__ volatile("pushfq\n\tandq $~0x40000, (%%rsp)\n\tpopfq" ::: "cc", "memory");
+    ucontext_t *uc = c;
+    f_sig = sig;
+    f_code = si->si_code;
+    f_addr = (uint64_t)si->si_addr;
+    f_err = uc->uc_mcontext.gregs[REG_ERR];
+    f_trapno = uc->uc_mcontext.gregs[REG_TRAPNO];
+    f_cr2 = uc->uc_mcontext.gregs[REG_CR2];
+    f_rip = uc->uc_mcontext.gregs[REG_RIP];
+    siglongjmp(apres_faute, 1);
+}
+
+static void faire(void (*f)(void))
+{
+    f_sig = 0;
+    if (!sigsetjmp(apres_faute, 1))
+        f();
+}
+
+static const int lecture_seule = 1;
+static char *page_interdite, *fichier_projete;
+/* L'adresse attendue de RIP, rangée par l'assembleur AVANT la faute (le
+ * gestionnaire part par siglongjmp : une sortie de l'asm ne serait jamais
+ * écrite). */
+uint64_t etiquette;
+
+static volatile uintptr_t adresse_basse = 0x10;
+static void lire_0x10(void) { (void)*(volatile int *)adresse_basse; }
+static void ecrire_rodata(void) { *(volatile int *)&lecture_seule = 2; }
+static void lire_interdite(void) { (void)*(volatile char *)page_interdite; }
+static void au_dela(void) { (void)*(volatile char *)(fichier_projete + 8192); }
+static void executer_pile(void) { volatile unsigned char code[16] = { 0xc3 }; ((void (*)(void))code)(); }
+static void instruction_ud2(void) { __asm__ volatile("lea 1f(%%rip), %%rax\n\tmov %%rax, etiquette(%%rip)\n1:\tud2" ::: "rax", "memory"); }
+static void division(void) { volatile int a = 1, b = 0; a = a / b; }
+static void point_d_arret(void) { __asm__ volatile("lea 1f(%%rip), %%rax\n\tmov %%rax, etiquette(%%rip)\n\tint3\n1:" ::: "rax", "memory"); }
+static void instruction_hlt(void) { __asm__ volatile("hlt"); }
+static void int_0x81(void) { __asm__ volatile("int $0x81"); }
+static void pas_a_pas(void)
+{
+    /* Le pas-à-pas s'arrête APRÈS l'instruction qui suit popfq (le nop). */
+    __asm__ volatile("lea 1f(%%rip), %%rax\n\tmov %%rax, etiquette(%%rip)\n\t"
+                     "pushfq\n\torq $0x100, (%%rsp)\n\tpopfq\n\tnop\n1:\tnop" ::: "rax", "cc", "memory");
+}
+static void instruction_icebp(void) { __asm__ volatile(".byte 0xf1"); }
+static void alignement(void)
+{
+    static char t[16] __attribute__((aligned(16)));
+    __asm__ volatile("pushfq\n\torq $0x40000, (%%rsp)\n\tpopfq\n\tmovl $1, 1(%0)\n\t"
+                     "pushfq\n\tandq $~0x40000, (%%rsp)\n\tpopfq" :: "r"(t) : "cc", "memory");
+}
+static void division_sse(void)
+{
+    uint32_t m = 0x1f80 & ~0x200u;
+    float un = 1.0f, zero = 0.0f;
+    __asm__ volatile("ldmxcsr %0\n\tmovss %1, %%xmm0\n\tlea 1f(%%rip), %%rax\n\tmov %%rax, etiquette(%%rip)\n1:\tdivss %2, %%xmm0"
+                     :: "m"(m), "m"(un), "m"(zero) : "rax", "xmm0", "memory");
+}
+static void division_x87(void)
+{
+    uint16_t cw = 0x037b;
+    double un = 1.0, zero = 0.0;
+    __asm__ volatile("fldcw %0\n\tfldl %1\n\tfdivl %2\n\tfwait\n\tfstp %%st(0)" :: "m"(cw), "m"(un), "m"(zero));
+}
+static void saut_non_canonique(void) { ((void (*)(void))0x8000000000000000ull)(); }
+
+/* Une faute, et ce qu'en dit le gestionnaire : le signal, si_code, si_addr,
+ * trapno et err du contexte. */
+static int vu(int sig, int code, uint64_t addr, uint64_t trapno, uint64_t err)
+{
+    int ok = f_sig == sig && f_code == code && f_addr == addr && f_trapno == trapno && f_err == err;
+    if (!ok)
+        printf("[linux] gestionnaires : (vu : signal %d, si_code %d, si_addr %#lx, trapno %lu, err %#lx)\n", f_sig, f_code,
+               (unsigned long)f_addr, (unsigned long)f_trapno, (unsigned long)f_err);
+    return ok;
+}
+
+/* Le gestionnaire répare : il saute l'ud2 (2 octets) en changeant RIP dans
+ * son contexte, comme un JIT qui intercepte ses propres fautes. */
+static void sauter_ud2(int sig, siginfo_t *si, void *c)
+{
+    (void)sig;
+    (void)si;
+    ucontext_t *uc = c;
+    uc->uc_mcontext.gregs[REG_RIP] += 2;
+}
+
+/* Un SS invalide rendu par un gestionnaire : l'iretq qui retourne au
+ * programme fait une faute, le noyau en fait un SIGSEGV du programme (le
+ * « bad iret »), dont le gestionnaire voit le SS fautif dans son contexte,
+ * le répare, et le programme continue (Linux le permet : SS est remis
+ * valide pour entrer dans ce gestionnaire). */
+static volatile uint16_t ss_vu_par_segv;
+static volatile int code_segv;
+
+static void abimer_ss(int sig, siginfo_t *si, void *c)
+{
+    (void)sig;
+    (void)si;
+    ucontext_t *uc = c;
+    ((uint16_t *)&uc->uc_mcontext.gregs[REG_CSGSFS])[3] = 0x33;
+}
+
+static void reparer_ss(int sig, siginfo_t *si, void *c)
+{
+    (void)sig;
+    ucontext_t *uc = c;
+    uint16_t *segments = (uint16_t *)&uc->uc_mcontext.gregs[REG_CSGSFS];
+    ss_vu_par_segv = segments[3];
+    code_segv = si->si_code;
+    segments[3] = 0x2b;
+}
+
+/* CS et SS faux rendus ensemble (0x2b, 0x33) : iretq refuse, et le cadre
+ * de SIGSEGV n'a pas UC_STRICT_RESTORE_SS (le CS interrompu n'est pas celui
+ * du mode 64 bits, `frame_uc_flags`) ; son gestionnaire ne répare que CS,
+ * et rt_sigreturn remet SS valide (`force_valid_ss`) : le programme
+ * continue (mesuré). */
+static volatile uint64_t drapeaux_de_segv;
+
+static void abimer_cs_ss(int sig, siginfo_t *si, void *c)
+{
+    (void)sig;
+    (void)si;
+    uint16_t *segments = (uint16_t *)&((ucontext_t *)c)->uc_mcontext.gregs[REG_CSGSFS];
+    segments[0] = 0x2b;
+    segments[3] = 0x33;
+}
+
+static void reparer_cs(int sig, siginfo_t *si, void *c)
+{
+    (void)sig;
+    (void)si;
+    ucontext_t *uc = c;
+    drapeaux_de_segv = uc->uc_flags;
+    uint16_t *segments = (uint16_t *)&uc->uc_mcontext.gregs[REG_CSGSFS];
+    segments[0] = 0x33;
+}
+
+static void fautes(void)
+{
+    struct sigaction sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sa_sigaction = sur_faute;
+    sa.sa_flags = SA_SIGINFO;
+    int sigs[] = { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP };
+    for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++)
+        sigaction(sigs[i], &sa, NULL);
+    page_interdite = mmap(NULL, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    char chemin[64];
+    snprintf(chemin, sizeof chemin, "/tmp/gestionnaires-%d", (int)getpid());
+    int fd = open(chemin, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    if (write(fd, "x", 1) != 1)
+        verifier(0, "fichier de test");
+    fichier_projete = mmap(NULL, 16384, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    unlink(chemin);
+
+    faire(lire_0x10);
+    verifier(vu(SIGSEGV, SEGV_MAPERR, 0x10, 14, 4) && f_cr2 == 0x10, "lecture de 0x10 : SIGSEGV SEGV_MAPERR, si_addr et cr2 0x10, trapno 14, err 4");
+    faire(ecrire_rodata);
+    uint64_t a = (uint64_t)&lecture_seule;
+    verifier(vu(SIGSEGV, SEGV_ACCERR, a, 14, 7) && f_cr2 == a, "ecriture dans .rodata : SIGSEGV SEGV_ACCERR, err 7");
+    faire(lire_interdite);
+    verifier(vu(SIGSEGV, SEGV_ACCERR, (uint64_t)page_interdite, 14, 4), "lecture d'une page PROT_NONE : SEGV_ACCERR, err 4");
+    faire(executer_pile);
+    verifier(f_sig == SIGSEGV && f_code == SEGV_ACCERR && f_trapno == 14 && f_err == 0x15 && f_addr == f_rip,
+             "executer la pile : SEGV_ACCERR, err 0x15, si_addr = RIP");
+    faire(au_dela);
+    uint64_t b = (uint64_t)fichier_projete + 8192;
+    verifier(vu(SIGBUS, BUS_ADRERR, b, 14, 4), "au-dela de la fin d'un fichier projete : SIGBUS BUS_ADRERR");
+    faire(instruction_ud2);
+    verifier(vu(SIGILL, ILL_ILLOPN, etiquette, 6, 0) && f_rip == etiquette && f_cr2 == b,
+             "ud2 : SIGILL ILL_ILLOPN, si_addr = RIP, trapno 6 ; cr2 garde la derniere faute de page");
+    faire(division);
+    verifier(f_sig == SIGFPE && f_code == FPE_INTDIV && f_addr == f_rip && f_trapno == 0, "division par zero : SIGFPE FPE_INTDIV, si_addr = RIP");
+    faire(point_d_arret);
+    verifier(vu(SIGTRAP, SI_KERNEL, 0, 3, 0) && f_rip == etiquette, "int3 : SIGTRAP SI_KERNEL, trapno 3, RIP apres l'instruction");
+    faire(instruction_hlt);
+    verifier(vu(SIGSEGV, SI_KERNEL, 0, 13, 0), "hlt : SIGSEGV SI_KERNEL, trapno 13, err 0");
+    faire(int_0x81);
+    verifier(vu(SIGSEGV, SI_KERNEL, 0, 13, 0x40a), "int 0x81 : SIGSEGV, err 0x40a (le vecteur x 8 + 2)");
+    faire(pas_a_pas);
+    verifier(vu(SIGTRAP, TRAP_TRACE, etiquette, 1, 0) && f_rip == etiquette, "pas-a-pas (TF) : SIGTRAP TRAP_TRACE, si_addr = RIP, trapno 1");
+    faire(instruction_icebp);
+    /* Sous QEMU sans accélération, icebp est une instruction invalide. */
+    verifier((f_sig == SIGTRAP && f_code == TRAP_BRKPT && f_trapno == 1) || (f_sig == SIGILL && f_code == ILL_ILLOPN && f_trapno == 6),
+             "icebp : SIGTRAP TRAP_BRKPT (ou SIGILL sous QEMU sans acceleration)");
+    /* QEMU sans accélération n'imite ni le contrôle de l'alignement (#AC)
+     * ni les exceptions SIMD (#XM, lu dans target/i386/tcg/fpu_helper.c de
+     * QEMU 8.2.2 : il ne lève que #MF) : là, aucune faute. Sur un vrai
+     * processeur, et sur l'hôte, la faute et son siginfo. */
+    faire(alignement);
+    verifier(f_sig == 0 || vu(SIGBUS, BUS_ADRALN, 0, 17, 0),
+             "acces non aligne sous AC : SIGBUS BUS_ADRALN, sans adresse, trapno 17 (rien sous QEMU sans acceleration)");
+    faire(division_sse);
+    verifier(f_sig == 0 || vu(SIGFPE, FPE_FLTDIV, etiquette, 19, 0),
+             "division SSE par zero demasquee : SIGFPE FPE_FLTDIV, trapno 19 (rien sous QEMU sans acceleration)");
+    faire(division_x87);
+    verifier(f_sig == SIGFPE && f_code == FPE_FLTDIV && f_trapno == 16, "division x87 par zero demasquee : SIGFPE FPE_FLTDIV, trapno 16");
+    faire(saut_non_canonique);
+    /* Le matériel refuse le saut (#GP : SI_KERNEL) ; QEMU sans
+     * accélération fait une faute de page en chargeant l'instruction. */
+    verifier(f_sig == SIGSEGV, "un saut a une adresse non canonique : SIGSEGV");
+
+    sa.sa_sigaction = sauter_ud2;
+    sigaction(SIGILL, &sa, NULL);
+    __asm__ volatile("ud2");
+    verifier(1, "un gestionnaire saute l'ud2 en changeant RIP : le programme continue");
+
+    sa.sa_sigaction = abimer_ss;
+    sigaction(SIGUSR1, &sa, NULL);
+    sa.sa_sigaction = reparer_ss;
+    sigaction(SIGSEGV, &sa, NULL);
+    raise(SIGUSR1);
+    uint16_t ss;
+    __asm__ volatile("mov %%ss, %0" : "=r"(ss));
+    verifier(ss_vu_par_segv == 0x33 && code_segv == SI_KERNEL && ss == 0x2b,
+             "SS 0x33 rendu : iretq refuse, SIGSEGV livre, son gestionnaire voit 0x33, le repare, on continue");
+    sa.sa_sigaction = abimer_cs_ss;
+    sigaction(SIGUSR1, &sa, NULL);
+    sa.sa_sigaction = reparer_cs;
+    sigaction(SIGSEGV, &sa, NULL);
+    raise(SIGUSR1);
+    __asm__ volatile("mov %%ss, %0" : "=r"(ss));
+    verifier((drapeaux_de_segv & 6) == 2 && ss == 0x2b,
+             "CS et SS faux rendus : le cadre de SIGSEGV sans UC_STRICT_RESTORE_SS ; CS seul repare, SS remis valide, on continue");
+    for (unsigned i = 0; i < sizeof sigs / sizeof *sigs; i++)
+        signal(sigs[i], SIG_DFL);
+    signal(SIGUSR1, SIG_DFL);
+}
+
 int main(void)
 {
     chez_nous = access("/etc/bonjour.txt", F_OK) == 0;
@@ -620,6 +864,7 @@ int main(void)
     plusieurs();
     abandonner();
     fil_neuf();
+    fautes();
     printf("[linux] gestionnaires : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

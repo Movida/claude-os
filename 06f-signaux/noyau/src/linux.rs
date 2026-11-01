@@ -31,6 +31,7 @@
 //! Les numéros de fichier sont des `unsigned int` pour Linux : on n'en
 //! regarde que les 32 bits bas, comme lui.
 
+use core::arch::asm;
 use core::fmt;
 
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
@@ -1322,20 +1323,30 @@ pub const SIGXCPU: Signal = Signal { numero: 24, nom: "SIGXCPU" };
 /// journal pour un programme tué par une exception
 /// (show_signal_msg, do_trap), en ajoutant le vecteur.
 pub struct Raison {
-    vecteur: usize,
+    pub vecteur: usize,
     rip: u64,
     rsp: u64,
-    code: u64,
-    cr2: u64,
+    pub code: u64,
+    pub cr2: u64,
     /// Pour une faute de page : pourquoi elle n'a pas été servie.
     cause: Option<Echec>,
     /// La zone où était RIP, s'il y en a une.
     zone: Option<ZoneDuCode>,
+    /// Le si_code et le si_addr du siginfo (le `force_sig_fault` de Linux).
+    pub si_code: i32,
+    pub si_addr: u64,
+}
+
+impl Raison {
+    /// Le siginfo de cette exception, pour le signal `signal`.
+    pub fn info(&self, signal: Signal) -> crate::signaux::Info {
+        crate::signaux::Info::faute(signal.numero as u64, self.si_code, self.si_addr)
+    }
 }
 
 impl fmt::Display for Raison {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let Raison { vecteur, rip, rsp, code, cr2, cause, zone } = *self;
+        let Raison { vecteur, rip, rsp, code, cr2, cause, zone, .. } = *self;
         match vecteur {
             // Le code d'erreur d'une faute de page : bit 0 page présente
             // (sinon absente), bit 1 écriture, bit 2 venue de l'anneau 3,
@@ -1366,23 +1377,86 @@ impl fmt::Display for Raison {
     }
 }
 
+/// Les si_code des fautes (include/uapi/asm-generic/siginfo.h).
+const SEGV_MAPERR: i32 = 1;
+const SEGV_ACCERR: i32 = 2;
+const BUS_ADRALN: i32 = 1;
+const BUS_ADRERR: i32 = 2;
+const ILL_ILLOPN: i32 = 2;
+const FPE_INTDIV: i32 = 1;
+const TRAP_BRKPT: i32 = 1;
+const TRAP_TRACE: i32 = 2;
+const SI_KERNEL: i32 = 0x80;
+
 /// Le signal qu'envoie Linux pour l'exception `vecteur` venue d'un
-/// programme (arch/x86/kernel/traps.c), et de quoi l'expliquer. `cr2` :
+/// programme (arch/x86/kernel/traps.c, et arch/x86/mm/fault.c pour la faute
+/// de page), et de quoi l'expliquer : le message, et le siginfo que reçoit
+/// un gestionnaire (si_code, si_addr ; mesurés sous Linux 6.18). `cr2` :
 /// l'adresse fautive d'une faute de page, et `cause` pourquoi elle n'a
-/// pas été servie ; `zone` : celle où était RIP.
-pub fn signal_de_l_exception(vecteur: usize, cadre: &Cadre, cr2: u64, cause: Option<Echec>, zone: Option<ZoneDuCode>)
-    -> (Signal, Raison) {
-    let signal = match vecteur {
+/// pas été servie ; `zone` : celle où était RIP ; `dr6` : pour #DB, le
+/// registre de débogage qui dit pourquoi (0 sinon).
+pub fn signal_de_l_exception(vecteur: usize, cadre: &Cadre, cr2: u64, cause: Option<Echec>, zone: Option<ZoneDuCode>,
+                             dr6: u64) -> (Signal, Raison) {
+    let rip = cadre.rip;
+    let (signal, si_code, si_addr) = match vecteur {
         // Une projection de fichier au-delà de sa fin, ou un trou qu'un
-        // système de fichiers plein ne peut pas remplir : SIGBUS (BUS_ADRERR),
-        // comme Linux.
-        14 if matches!(cause, Some(Echec::HorsDuFichier | Echec::PlusDePlace)) => SIGBUS,
-        0 | 16 | 19 => SIGFPE, // division, x87, SIMD
-        1 | 3 => SIGTRAP,      // débogage, int3
-        6 => SIGILL,           // instruction invalide
-        7 => SIGILL,           // SSE sans le contexte prêt (sous-étape 9)
-        17 => SIGBUS,          // alignement
-        _ => SIGSEGV,          // pages, protection générale, segments
+        // système de fichiers plein ne peut pas remplir : SIGBUS, comme Linux.
+        14 if matches!(cause, Some(Echec::HorsDuFichier | Echec::PlusDePlace)) => (SIGBUS, BUS_ADRERR, cr2),
+        // Pas de zone (ou une adresse du noyau) : SEGV_MAPERR ; une zone qui
+        // ne permet pas l'accès : SEGV_ACCERR.
+        14 if cause == Some(Echec::AccesInterdit) => (SIGSEGV, SEGV_ACCERR, cr2),
+        14 => (SIGSEGV, SEGV_MAPERR, cr2),
+        0 => (SIGFPE, FPE_INTDIV, rip),
+        // x87 et SIMD : la raison, d'après l'état du processeur (le
+        // `math_error` de Linux).
+        16 | 19 => (SIGFPE, code_fpu(vecteur), rip),
+        // #DB : le pas-à-pas (DR6.BS) ou `icebp` ; si_addr, l'instruction
+        // suivante (`exc_debug_user`, `get_si_code`).
+        1 => (SIGTRAP, if dr6 & 1 << 14 != 0 { TRAP_TRACE } else { TRAP_BRKPT }, rip),
+        3 => (SIGTRAP, SI_KERNEL, 0),
+        6 => (SIGILL, ILL_ILLOPN, rip),
+        // SSE sans le contexte prêt (étape 5, sous-étape 9) : ne doit pas
+        // arriver.
+        7 => (SIGILL, SI_KERNEL, 0),
+        // Segment absent, faute de pile : SIGBUS (`exc_segment_not_present`,
+        // `exc_stack_segment`) ; l'alignement : SIGBUS BUS_ADRALN, sans
+        // adresse.
+        11 | 12 => (SIGBUS, SI_KERNEL, 0),
+        17 => (SIGBUS, BUS_ADRALN, 0),
+        // Protection générale, et le reste : SIGSEGV, du noyau, sans adresse.
+        _ => (SIGSEGV, SI_KERNEL, 0),
     };
-    (signal, Raison { vecteur, rip: cadre.rip, rsp: cadre.rsp, code: cadre.code_erreur, cr2, cause, zone })
+    (signal, Raison { vecteur, rip, rsp: cadre.rsp, code: cadre.code_erreur, cr2, cause, zone, si_code, si_addr })
+}
+
+/// Le si_code d'une exception x87 (#MF, 16) ou SIMD (#XM, 19), d'après
+/// l'état du programme, encore dans les registres (le `fpu__exception_code`
+/// de Linux) : les exceptions signalées et non masquées (x87 : le mot
+/// d'état et le mot de contrôle ; SIMD : MXCSR), dans l'ordre de Linux.
+fn code_fpu(vecteur: usize) -> i32 {
+    let erreur: u32 = if vecteur == 16 {
+        let (mut controle, mut etat) = (0u16, 0u16);
+        // SAFETY : lire le mot de contrôle et le mot d'état x87 ne change
+        // rien ; ce sont ceux du programme (le noyau ne s'en sert pas).
+        unsafe {
+            asm!("fnstcw [{}]", in(reg) &mut controle, options(nostack));
+            asm!("fnstsw [{}]", in(reg) &mut etat, options(nostack));
+        }
+        (etat & !controle) as u32
+    } else {
+        let mut mxcsr = 0u32;
+        // SAFETY : lire MXCSR ne change rien ; c'est celui du programme.
+        unsafe { asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack)) };
+        !(mxcsr >> 7) & mxcsr
+    };
+    match erreur {
+        e if e & 0x001 != 0 => 7, // FPE_FLTINV
+        e if e & 0x004 != 0 => 3, // FPE_FLTDIV
+        e if e & 0x008 != 0 => 4, // FPE_FLTOVF
+        e if e & 0x012 != 0 => 5, // FPE_FLTUND
+        e if e & 0x020 != 0 => 6, // FPE_FLTRES
+        // Linux n'envoie alors rien (une exception fantôme) ; nous envoyons
+        // SIGFPE sans raison : l'instruction referait la même faute.
+        _ => 0,
+    }
 }

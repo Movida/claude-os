@@ -446,6 +446,11 @@ pub fn initialiser() -> Bilan {
     //   - CR0.WP (bit 16) : sans lui, le noyau (anneau 0) pourrait écrire
     //     même dans une page en lecture seule ; la protection ne vaudrait
     //     que pour les programmes.
+    //   - CR0.AM (bit 18), comme Linux (CR0_STATE) : un programme qui met AC
+    //     dans RFLAGS demande le contrôle de l'alignement (une faute #AC,
+    //     SIGBUS BUS_ADRALN) ; sans AM, AC ne ferait rien. Il ne joue qu'en
+    //     anneau 3 : dans le noyau, AC est la porte de SMAP
+    //     (copie_utilisateur.rs).
     //   - CR3 : l'adresse physique de la nouvelle PML4. L'écrire vide aussi
     //     le cache des traductions (TLB) : plus rien de l'ancien arbre ne
     //     sert.
@@ -465,7 +470,7 @@ pub fn initialiser() -> Bilan {
         }
         asm!(
             "mov rax, cr0",
-            "or rax, 1 << 16",
+            "or rax, (1 << 16) | (1 << 18)",
             "mov cr0, rax",
             "mov cr3, {pml4}",
             pml4 = in(reg) pml4,

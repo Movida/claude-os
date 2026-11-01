@@ -388,7 +388,11 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
         14 => faute_de_page::gerer(cadre),
         _ if depuis_programme => {
             let zone = processus::essayer_avec(|p| p.memoire.zone_du_code(cadre.rip)).flatten();
-            let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, 0, None, zone);
+            // Pour #DB, DR6 dit pourquoi ; il est remis à son état de repos
+            // (Linux le lit en entrant, puis l'efface : sinon ses bits
+            // resteraient pour le #DB suivant).
+            let dr6 = if vecteur == 1 { lire_et_effacer_dr6() } else { 0 };
+            let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, 0, None, zone, dr6);
             tache::forcer_par_faute(signal, raison);
         }
         // Une faute de protection générale du noyau sur une instruction de
@@ -419,6 +423,18 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     } else if vecteur >= 32 && cadre.rflags & 1 << 9 != 0 {
         ordonnanceur::preempter();
     }
+}
+
+/// DR6, le registre qui dit d'où vient un #DB, puis remis à sa valeur de
+/// repos (DR6_RESERVED : les bits réservés à 1, les autres à 0).
+fn lire_et_effacer_dr6() -> u64 {
+    let dr6: u64;
+    // SAFETY : lire et écrire DR6 en anneau 0 ne touche que ce registre.
+    unsafe {
+        asm!("mov {}, dr6", out(reg) dr6, options(nomem, nostack));
+        asm!("mov dr6, {}", in(reg) 0xFFFF_0FF0u64, options(nomem, nostack));
+    }
+    dr6
 }
 
 /// L'adresse de la dernière faute de page (CR2).
