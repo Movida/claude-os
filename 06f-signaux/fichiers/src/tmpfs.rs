@@ -102,7 +102,9 @@ pub const TAILLE_MAX: u64 = i64::MAX as u64;
 /// Ce que dit `stat` d'un inode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Attributs {
-    pub numero: Numero,
+    /// Le numéro d'inode (st_ino) : celui du tmpfs (`Numero`), ou d'un
+    /// système monté, sur 64 bits.
+    pub numero: u64,
     pub mode: u32,
     pub nlink: u32,
     pub uid: u32,
@@ -456,7 +458,7 @@ impl Tmpfs {
             _ => 0,
         };
         Attributs {
-            numero: n,
+            numero: n.0 as u64,
             mode: i.mode,
             // Un inode de pipefs a un lien, comme tout inode d'un système
             // sans dossiers (`new_inode_pseudo` ; mesuré : 1). Il n'a pas de
@@ -1532,11 +1534,11 @@ impl Arbre for Tmpfs {
         self.inode(dossier).dossier().parent
     }
 
-    fn cible(&self, lien: Numero) -> &[u8] {
-        match &self.inode(lien).contenu {
+    fn cible(&self, lien: Numero) -> crate::chemins::Texte<'_> {
+        crate::chemins::Texte::Emprunte(match &self.inode(lien).contenu {
             Contenu::Lien(c) => c,
             _ => &[],
-        }
+        })
     }
 }
 

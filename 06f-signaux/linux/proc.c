@@ -326,8 +326,9 @@ static void arborescence(void)
     struct dirent *e;
     char moi[32];
     snprintf(moi, sizeof moi, "%d", getpid());
-    int vu_self = 0, vu_fil = 0, vu_moi = 0, vu_sys = 0, autres = 0;
+    int vu_self = 0, vu_fil = 0, vu_moi = 0, vu_sys = 0, autres = 0, numeros = 0;
     while ((e = readdir(d))) {
+        numeros += e->d_name[0] >= '1' && e->d_name[0] <= '9';
         if (!strcmp(e->d_name, "self"))
             vu_self = e->d_type == DT_LNK;
         else if (!strcmp(e->d_name, "thread-self"))
@@ -341,6 +342,11 @@ static void arborescence(void)
     }
     closedir(d);
     verifier(vu_self && vu_fil && vu_moi && vu_sys, "/proc contient self, thread-self, sys et le dossier du processus");
+    /* Les liens de /proc : deux, un par sous-dossier fixe, et un par
+     * processus (`proc_root_getattr`) ; sur l'hôte, bien plus de dossiers
+     * fixes, et tous les processus de la machine. */
+    stat("/proc", &p);
+    verifier(p.st_nlink >= 3 + (nlink_t)numeros, "/proc : un lien de plus par processus");
     if (chez_nous)
         verifier(autres == 0, "chez nous, rien d'autre");
     char cwd[256];
@@ -562,6 +568,27 @@ static void fils(void)
     verifier(pthread_setname_np(f, "autre") == 0 && pthread_getname_np(f, nom, sizeof nom) == 0 && strcmp(nom, "autre") == 0,
              "nommer un autre fil (task/<tid>/comm)");
     verifier(prctl(PR_GET_NAME, nom) == 0 && strcmp(nom, "proc") == 0, "le nom du fil principal n'a pas change");
+    /* /proc/<tid> d'un fil qui n'est pas le principal (6f) : résolu, sans
+     * être listé dans /proc ; son comm est celui du fil. */
+    struct stat st;
+    snprintf(chemin, sizeof chemin, "/proc/%d", tid_autre);
+    int resolu = stat(chemin, &st) == 0 && S_ISDIR(st.st_mode) && st.st_uid == getuid();
+    snprintf(chemin, sizeof chemin, "/proc/%d/comm", tid_autre);
+    lire_tout(chemin, t, sizeof t, 1024);
+    DIR *racine = opendir("/proc");
+    struct dirent *e;
+    int liste = 0;
+    while (racine && (e = readdir(racine)) != NULL)
+        liste |= atoi(e->d_name) == tid_autre;
+    if (racine)
+        closedir(racine);
+    verifier(resolu && strcmp(t, "autre\n") == 0 && !liste, "/proc/<tid> d'un autre fil : resolu (son comm), sans etre liste");
+    /* Le dossier d'un fil est immuable comme celui du processus
+     * (`proc_task_instantiate`) ; task/ suit ses droits (0555). */
+    snprintf(chemin, sizeof chemin, "/proc/self/task/%d", tid_autre);
+    verifier(erreur(utimensat(AT_FDCWD, chemin, NULL, 0)) == EPERM && erreur(chown(chemin, getuid(), getgid())) == EPERM
+                 && erreur(rmdir(chemin)) == EACCES,
+             "task/<tid> : immuable (utimensat, chown : EPERM) ; rmdir : EACCES");
     pthread_mutex_lock(&verrou);
     fini = 1;
     pthread_cond_signal(&condition);
@@ -600,6 +627,8 @@ static int autre(void)
     int maps = open(chemin, O_RDONLY);
     snprintf(chemin, sizeof chemin, "/proc/%d/statm", cible);
     int statm = open(chemin, O_RDONLY);
+    snprintf(chemin, sizeof chemin, "/proc/%d", cible);
+    int dossier = open(chemin, O_RDONLY | O_DIRECTORY);
     verifier(maps >= 0 && statm >= 0 && read(maps, tampon, sizeof tampon) > 0 && read(statm, tampon, sizeof tampon) > 0,
              "maps et statm d'un autre processus, vivant : lus");
     for (int i = 0; i < 10000 && kill(cible, 0) == 0; i++)
@@ -608,6 +637,10 @@ static int autre(void)
     lseek(statm, 0, SEEK_SET);
     verifier(kill(cible, 0) == -1 && erreur(read(maps, tampon, sizeof tampon)) == ESRCH && erreur(read(statm, tampon, sizeof tampon)) == ESRCH,
              "ses fichiers gardes ouverts, une fois recueilli : ESRCH");
+    /* Son dossier, gardé ouvert : le même mode, à root (`pid_getattr`). */
+    struct stat d;
+    verifier(dossier >= 0 && fstat(dossier, &d) == 0 && d.st_mode == (S_IFDIR | 0555) && d.st_uid == 0,
+             "son dossier garde ouvert, une fois recueilli : le meme mode, a root");
     printf("[linux] proc autre : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

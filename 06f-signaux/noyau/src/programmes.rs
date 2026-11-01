@@ -22,7 +22,7 @@
 
 use crate::descripteurs::Descripteurs;
 use crate::memoire::Acces;
-use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, processus, procfs, tache, vfs, wasi};
+use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, processus, tache, vfs, wasi};
 use alloc::sync::Arc;
 use fichiers::Identite;
 use alloc::vec::Vec;
@@ -291,7 +291,6 @@ impl Lanceur {
                 let pid = p.pid();
                 drop(p);
                 let code = processus::recueillir(pid).unwrap_or(-1);
-                procfs::retirer_processus(pid);
                 vfs::avec(|fs, cadres| {
                     fs.permettre_ecriture(fichier);
                     fs.lacher(fichier, cadres);
@@ -712,9 +711,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         r
     });
     let (pml4, depart) = (programme.memoire.espace.pml4(), programme.depart);
-    // Son dossier de /proc, à lui, avec le lien vers son exécutable.
     let pid = processus::numero_neuf();
-    procfs::ajouter_processus(pid, (identite.uid, identite.gid), lancement.complet);
     let entree = processus::ajouter(processus::Processus {
         pid,
         memoire: programme.memoire,
@@ -728,6 +725,13 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         fils: Vec::new(),
         fin_de_groupe: None,
     }, nom);
+    // Le chemin de son exécutable, pour /proc/<pid>/exe (procfs.rs fabrique
+    // son dossier d'après la table des processus).
+    let mut exe = Vec::new();
+    if exe.try_reserve_exact(lancement.complet.len()).is_ok() {
+        exe.extend_from_slice(lancement.complet);
+    }
+    processus::poser_exe(pid, exe);
     let lance = entree.and_then(|e| tache::lancer_programme(nom, e.clone(), pml4, depart, rsp).map(|_| e));
     match lance {
         Some(processus) => {
@@ -738,7 +742,6 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         None => {
             afficherln!("[noyau] {} : plus de place pour sa tache ou son processus", nom);
             processus::recueillir(pid);
-            procfs::retirer_processus(pid);
             vfs::avec(|fs, _| fs.permettre_ecriture(n));
             None
         }

@@ -225,6 +225,13 @@ pub struct Entree {
     nom: Verrou<NomCourt>,
     /// Ce que ses fils morts ont consommé, pour getrusage (rusage.rs).
     usage: crate::rusage::DuProcessus,
+    /// Ce qu'en montre /proc sans le verrou du processus (procfs.rs) : à
+    /// qui il est (le propriétaire de /proc/<pid>, même zombie), quand il a
+    /// été lancé (les dates de ses entrées), le chemin canonique de son
+    /// exécutable (/proc/<pid>/exe).
+    identite: Identite,
+    lance: fichiers::Temps,
+    exe: Verrou<Vec<u8>>,
 }
 
 impl Entree {
@@ -359,6 +366,7 @@ pub fn ajouter(processus: Processus, nom: NomCourt) -> Option<Arc<Entree>> {
     if table.len() == table.capacity() {
         return None;
     }
+    let identite = processus.identite;
     let e = Arc::new(Entree {
         pid: processus.pid,
         processus: Verrou::new(Some(processus)),
@@ -369,9 +377,65 @@ pub fn ajouter(processus: Processus, nom: NomCourt) -> Option<Arc<Entree>> {
         parent: Verrou::new(Some(crate::tache::courante_arc())),
         nom: Verrou::new(nom),
         usage: crate::rusage::DuProcessus::new(),
+        identite,
+        lance: crate::temps::maintenant(),
+        exe: Verrou::new(Vec::new()),
     });
     table.push(e.clone());
     Some(e)
+}
+
+/// Le chemin canonique de l'exécutable du processus `pid` (/proc/<pid>/exe).
+pub fn poser_exe(pid: u32, exe: Vec<u8>) {
+    if let Some(e) = entree(pid) {
+        *e.exe.verrouiller() = exe;
+    }
+}
+
+/// L'entrée du processus `pid` (vivant ou zombie).
+fn entree(pid: u32) -> Option<Arc<Entree>> {
+    TABLE.verrouiller().iter().find(|e| e.pid == pid).cloned()
+}
+
+/// Ce que /proc montre d'un processus : son identité, quand il a été lancé,
+/// s'il est un zombie.
+pub fn vu_de_proc(pid: u32) -> Option<(Identite, fichiers::Temps, bool)> {
+    TABLE.verrouiller().iter().find(|e| e.pid == pid).map(|e| (e.identite, e.lance, e.est_zombie()))
+}
+
+/// Le nombre de processus de la table, vivants et zombies (ceux que liste
+/// /proc).
+pub fn nombre() -> u32 {
+    TABLE.verrouiller().len() as u32
+}
+
+/// Une copie de son exécutable (vide sans mémoire).
+pub fn exe(pid: u32) -> Option<Vec<u8>> {
+    let e = entree(pid)?;
+    let exe = e.exe.verrouiller();
+    let mut v = Vec::new();
+    if v.try_reserve_exact(exe.len()).is_ok() {
+        v.extend_from_slice(&exe);
+    }
+    Some(v)
+}
+
+/// Le plus petit numéro de processus de la table (vivant ou zombie) à partir
+/// de `depuis` : pour lister /proc dans l'ordre (la table ne l'est pas).
+pub fn pid_suivant(depuis: u32) -> Option<u32> {
+    TABLE.verrouiller().iter().map(|e| e.pid).filter(|&p| p >= depuis).min()
+}
+
+/// Les fils vivants du processus `pid`, dans l'ordre de leur création (le
+/// principal d'abord, s'il vit), pour /proc/<pid>/task.
+pub fn pour_chaque_fil(pid: u32, mut f: impl FnMut(u32)) {
+    if let Some(e) = entree(pid)
+        && let Some(p) = e.processus.verrouiller().as_ref()
+    {
+        for fil in &p.fils {
+            f(fil.tid);
+        }
+    }
 }
 
 /// Retire de la table le zombie `pid`, recueilli (programmes.rs) : son

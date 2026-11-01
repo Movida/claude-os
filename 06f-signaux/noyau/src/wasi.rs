@@ -463,7 +463,7 @@ fn filestat(o: Objet) -> [u8; 64] {
     let mut s = [0u8; 64];
     // dev : celui de son système de fichiers, codé comme st_dev.
     s[0..8].copy_from_slice(&appels_fichiers::encoder_peripherique(dev).to_le_bytes());
-    s[8..16].copy_from_slice(&(a.numero.0 as u64).to_le_bytes());
+    s[8..16].copy_from_slice(&a.numero.to_le_bytes());
     s[16] = type_wasi(a.mode);
     s[24..32].copy_from_slice(&(a.nlink as u64).to_le_bytes());
     s[32..40].copy_from_slice(&a.taille.to_le_bytes());

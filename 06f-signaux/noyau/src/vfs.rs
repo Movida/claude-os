@@ -26,9 +26,15 @@
 //! pages (ENOSPC au-delà).
 //!
 //! Le système de fichiers est sous un verrou. Règles :
-//!   - l'ordre : le verrou du processus, puis celui des fichiers, jamais
-//!     l'inverse (une faute de page dans une projection de fichier tiendra
-//!     le premier et prendra le second) ;
+//!   - l'ordre : le verrou d'un processus, puis celui des fichiers (une
+//!     faute de page dans une projection de fichier tient le premier et
+//!     prend le second) ; mais une vue de /proc, sous celui des fichiers,
+//!     prend la table des processus puis un processus (procfs.rs). Ce qui
+//!     se fait sous le verrou d'un processus ne résout donc jamais de
+//!     chemin. Sur un seul processeur (un `Verrou` coupe les
+//!     interruptions), ces deux ordres ne s'interbloquent pas ; avec
+//!     plusieurs, il faudra un ordre total : lire les descripteurs d'un
+//!     processus sans son verrou (le RCU de `fget_task` chez Linux) ;
 //!   - jamais de copie depuis ou vers un programme sous ce verrou : une
 //!     copie peut faire une faute de page.
 //! D'autres systèmes de fichiers se montent sur des dossiers du tmpfs
@@ -43,9 +49,10 @@ use crate::descripteurs::{Fichier, Ouverts, Tenu};
 use crate::memoire::Echec;
 use crate::verrou::Verrou;
 use crate::{copie_utilisateur, espace, pages, pile, temps};
-use fichiers::chemins::{Depart, Fin, Suivre, resoudre};
-use fichiers::montages::{Objet, Vue};
+use fichiers::chemins::{Depart, Fin, Suivre, Texte, resoudre};
+use fichiers::montages::{Interne, Monte, Objet, Vue};
 use fichiers::noyaufs::NoyauFs;
+use fichiers::tmpfs::Attributs;
 use fichiers::tmpfs::{Cadres, Horodatage, Limites, Numero, Tmpfs};
 use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Temps};
 
@@ -102,6 +109,97 @@ pub struct Systeme {
 /// La place de procfs dans la table des montages (sysfs est la suivante).
 pub const PROC: usize = 0;
 
+/// Un système monté, vu le temps d'un appel (le `Monte` de la `Vue`) : /proc,
+/// dont une partie est fabriquée d'après les processus (procfs.rs), ou un
+/// système du noyau tout fait (/sys). Option écartée : un `dyn Monte` dans
+/// la table des montages ; mais /proc a besoin, pour ce qu'il fabrique,
+/// d'autres morceaux du système (bientôt la table des fichiers ouverts),
+/// qu'il emprunte le temps de l'appel.
+pub enum Montage<'a> {
+    Proc(crate::procfs::ProcVue<'a>),
+    Fixe(&'a NoyauFs),
+}
+
+impl Monte for Montage<'_> {
+    fn racine(&self) -> u64 {
+        match self {
+            Montage::Proc(p) => p.racine(),
+            Montage::Fixe(f) => Monte::racine(*f),
+        }
+    }
+
+    fn peripherique(&self) -> (u32, u32) {
+        match self {
+            Montage::Proc(p) => p.peripherique(),
+            Montage::Fixe(f) => f.peripherique(),
+        }
+    }
+
+    fn taille_de_bloc(&self) -> u64 {
+        match self {
+            Montage::Proc(p) => p.taille_de_bloc(),
+            Montage::Fixe(f) => f.taille_de_bloc(),
+        }
+    }
+
+    fn attributs(&self, n: u64) -> Attributs {
+        match self {
+            Montage::Proc(p) => p.attributs(n),
+            Montage::Fixe(f) => f.attributs(n),
+        }
+    }
+
+    fn chercher(&self, dossier: u64, nom: &[u8]) -> Option<u64> {
+        match self {
+            Montage::Proc(p) => p.chercher(dossier, nom),
+            Montage::Fixe(f) => f.chercher(dossier, nom),
+        }
+    }
+
+    fn parent(&self, n: u64) -> u64 {
+        match self {
+            Montage::Proc(p) => p.parent(n),
+            Montage::Fixe(f) => f.parent(n),
+        }
+    }
+
+    fn nom(&self, n: u64) -> Texte<'_> {
+        match self {
+            Montage::Proc(p) => p.nom(n),
+            Montage::Fixe(f) => f.nom(n),
+        }
+    }
+
+    fn cible<'b>(&'b self, lien: u64, lecteur: &'b [u8], fil: &'b [u8]) -> Texte<'b> {
+        match self {
+            Montage::Proc(p) => p.cible(lien, lecteur, fil),
+            Montage::Fixe(f) => f.cible(lien, lecteur, fil),
+        }
+    }
+
+    fn lire_dossier(&self, dossier: u64, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
+        -> Result<(), Erreur> {
+        match self {
+            Montage::Proc(p) => p.lire_dossier(dossier, position, entree),
+            Montage::Fixe(f) => f.lire_dossier(dossier, position, entree),
+        }
+    }
+
+    fn contenu(&self, n: u64) -> Option<(u32, u32)> {
+        match self {
+            Montage::Proc(p) => p.contenu(n),
+            Montage::Fixe(f) => f.contenu(n),
+        }
+    }
+
+    fn refuser(&self, qui: Identite, m: Interne) -> Result<(), Erreur> {
+        match self {
+            Montage::Proc(p) => p.refuser(qui, m),
+            Montage::Fixe(f) => f.refuser(qui, m),
+        }
+    }
+}
+
 impl Systeme {
     /// Le fichier ouvert `f` est tenu une fois de moins ; au dernier, il est
     /// fermé : le tmpfs rend son inode (et ses pages, si plus rien ne le
@@ -118,7 +216,7 @@ impl Systeme {
     /// la voit le processus `pid`, par la tâche courante (pour /proc/self et
     /// /proc/thread-self ; 0 : le noyau, ou un programme WebAssembly, qui
     /// n'est pas un processus Linux).
-    pub fn avec_vue<R>(&self, pid: u32, f: impl FnOnce(&Vue<NoyauFs>) -> R) -> R {
+    pub fn avec_vue<R>(&self, pid: u32, f: impl FnOnce(&Vue<Montage>) -> R) -> R {
         let mut texte = [0u8; 10];
         let lecteur = decimal(pid, &mut texte);
         // « <pid>/task/<tid> » : 10 + 6 + 10 octets au plus.
@@ -131,7 +229,15 @@ impl Systeme {
                 longueur += morceau.len();
             }
         }
-        f(&Vue { fs: &self.fs, montes: &self.montes, lecteur, fil: &chemin_du_fil[..longueur] })
+        // Les systèmes montés, vus le temps de l'appel : /proc avec ce qu'il
+        // fabrique des processus (procfs.rs), /sys tel qu'il est ; eux deux
+        // seuls, montés au démarrage (un système de plus, le disque de 6l,
+        // devra prendre place ici).
+        let montes: [(Numero, Montage); 2] = core::array::from_fn(|i| {
+            let (point, fs) = &self.montes[i];
+            (*point, if i == PROC { Montage::Proc(crate::procfs::ProcVue::new(fs)) } else { Montage::Fixe(fs) })
+        });
+        f(&Vue { fs: &self.fs, montes: &montes, lecteur, fil: &chemin_du_fil[..longueur] })
     }
 
     /// Résout `chemin` depuis `depart`, pour le processus `pid`, à travers

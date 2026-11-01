@@ -4,45 +4,67 @@
 //! sa pile), sa mémoire résidente (`statm`), deux réglages de la mémoire
 //! (`/proc/sys/vm/...`).
 //!
-//! L'arborescence est un système de fichiers du noyau (fichiers::noyaufs),
-//! monté sur /proc au démarrage (vfs.rs) :
-//!   - /proc/self : un lien vers le numéro du processus qui le lit ;
-//!     /proc/thread-self, vers « <pid>/task/<tid> », le dossier du fil qui
-//!     le lit ;
-//!   - /proc/<pid>/ pour chaque processus, ajouté à son lancement et retiré
-//!     quand il est recueilli (programmes.rs) : `maps`, `statm`, `comm` (le
-//!     nom de son fil principal), le lien `exe` vers le chemin canonique de
-//!     son exécutable, et `task/<tid>/comm` pour chacun de ses fils (ajouté
-//!     à la création du fil, retiré à sa fin ; celui du fil principal reste
-//!     jusqu'au processus, comme Linux garde sa tâche) ; à lui (son
-//!     utilisateur), comme sous Linux ;
-//!   - /proc/sys/vm/overcommit_memory et mmap_min_addr, à root ;
-//!   - /proc/sys/fs/pipe-max-size, pipe-user-pages-soft et -hard (6f), à
-//!     root.
-//! Le reste viendra avec son besoin : /proc/<pid>/fd (6f), /proc/meminfo si
-//! une mesure le demande. Les dossiers des processus et des fils sont des
-//! entrées gardées, ajoutées et retirées ; Linux les fabrique à la demande,
-//! d'après la table des tâches. Un écart voulu jusqu'à /proc/<pid>/fd (6f),
-//! qui le demandera vraiment (un dossier qui change à chaque open) : il
-//! faudra alors des numéros d'inode qui disent le processus, le fil et
-//! l'entrée, plus que n'en tiennent les 32 bits d'un `Objet`. Deux autres
-//! écarts voulus, mesurés sous Linux 6.18 : /proc/<tid> d'un fil qui n'est
-//! pas le principal, que Linux résout (sans le lister), est absent chez
-//! nous (ENOENT) ; et quand le fil principal a fini mais que d'autres
-//! vivent, Linux montre maps vide et statm à zéro (il rattache la mémoire
-//! à la tâche du fil principal), nous les vraies valeurs du processus. /proc/self/cgroup est absent,
-//! comme sur un Linux construit sans les cgroups (nous n'en avons pas) :
-//! libuv le prévoit (« aucune limite »).
+//! Comme chez Linux, /proc est FABRIQUÉ À LA DEMANDE (depuis 6f) : rien n'y
+//! est gardé pour un processus. Sa partie fixe est un système de fichiers
+//! du noyau tout fait (fichiers::noyaufs, monté sur /proc au démarrage,
+//! vfs.rs) : /proc/sys/vm/overcommit_memory et mmap_min_addr,
+//! /proc/sys/fs/pipe-max-size et pipe-user-pages-*, à root ; /proc/self,
+//! un lien vers le numéro du processus qui le lit, et /proc/thread-self,
+//! vers « <pid>/task/<tid> », le dossier du fil qui le lit. Le reste, la
+//! vue de /proc le fabrique le temps d'un appel (`ProcVue`), d'après la
+//! table des processus et de leurs fils :
+//!   - /proc/<pid>/ pour chaque processus vivant ou zombie (jusqu'à ce
+//!     qu'il soit recueilli), à lui (son utilisateur), immuable : `maps`,
+//!     `statm`, `comm` (le nom de son fil principal), le lien `exe` vers le
+//!     chemin canonique de son exécutable, et `task/<tid>/comm` pour chacun
+//!     de ses fils (celui du fil principal reste jusqu'au processus, comme
+//!     Linux garde sa tâche) ;
+//!   - /proc/<tid> d'un fil qui n'est pas le principal : résolu, sans être
+//!     listé, comme Linux (mesuré) ; son `comm` est celui du fil, sa mémoire
+//!     celle de son processus.
+//! Le numéro d'inode d'une entrée fabriquée dit ce qu'elle est : son genre
+//! (8 bits), le numéro du processus ou du fil (32), et un fil (24 : un
+//! numéro de Linux tient en 22, pid_max ; les nôtres ne sont jamais
+//! repris, et un fil créé après 2^24 tâches ne se verrait pas dans task/,
+//! une borne à nous, hors d'atteinte aujourd'hui) ; celles
+//! de la partie fixe ont un numéro de moins de 32 bits. Un numéro gardé (un
+//! dossier courant, un descripteur ouvert) dont le processus est parti :
+//! l'entrée garde son mode et ses liens, et passe à root (`pid_getattr`) ;
+//! ENOENT pour y chercher ou la lister, ESRCH pour lire un fichier ouvert
+//! (Linux rend ESRCH pour y chercher aussi, par la permission de
+//! traverser, `proc_pid_permission` : un écart, que nos systèmes montés ne
+//! savent pas dire). Un zombie (Linux : sans mémoire) : ce qui n'est pas
+//! un dossier 0555 de son /proc passe à root (`task_dump_owner`). Option
+//! écartée, celle de 6b à 6e :
+//! des entrées gardées, ajoutées au lancement et à chaque fil, retirées à
+//! la fin ; la table grandissait avec les fils (une réserve de 3 Mio pour
+//! qu'elle ne grandisse pas pendant un programme), et /proc/<pid>/fd
+//! changerait à chaque `open`.
+//! Un écart voulu, mesuré sous Linux 6.18 : quand le fil principal a fini
+//! mais que d'autres vivent, Linux montre maps vide et statm à zéro (il
+//! rattache la mémoire à la tâche du fil principal), nous les vraies
+//! valeurs du processus. /proc/self/cgroup est absent, comme sur un Linux
+//! construit sans les cgroups (nous n'en avons pas) : libuv le prévoit
+//! (« aucune limite »).
+//!
+//! Les verrous : une vue de /proc travaille sous le verrou des fichiers
+//! (celui de la résolution des chemins), et y prend celui de la table des
+//! processus, puis d'un processus. L'inverse se fait aussi : le verrou des
+//! fichiers pris sous celui d'un processus, pour le dossier de départ d'une
+//! résolution (appels_fichiers.rs, rendu avant de résoudre), getcwd, la
+//! faute de page d'une projection, et ici `ligne_maps` (le chemin du
+//! fichier d'une zone). Aucun de ces endroits ne résout de chemin ni
+//! n'entre dans une vue de /proc : le verrou d'un processus n'est jamais
+//! pris deux fois, et sur un seul processeur (un `Verrou` coupe les
+//! interruptions) ces deux ordres ne peuvent pas s'interbloquer. Avec
+//! plusieurs processeurs, il faudra un ordre total (vfs.rs).
 //!
 //! Le contenu d'un fichier est fabriqué à la lecture, par une « source » :
 //! `maps` ligne par ligne (le parcours reprend à l'adresse de fin de la
 //! dernière zone écrite, comme `m_start` de Linux : une carte qui change
 //! entre deux lectures ne fait ni sauter ni répéter de zone), `statm` d'un
-//! seul enregistrement, les réglages en une valeur.
-//!
-//! Les verrous, dans l'ordre de toujours : celui du processus (la carte des
-//! zones), rendu, puis celui des fichiers (le chemin du fichier d'une
-//! zone) ; la copie vers le programme, hors des deux (appels_fichiers.rs).
+//! seul enregistrement, les réglages en une valeur ; la copie vers le
+//! programme, hors de tout verrou (appels_fichiers.rs).
 
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
@@ -50,9 +72,11 @@ use core::fmt::{self, Write};
 use crate::descripteurs::{Donnees, Fichier, Lecture};
 use crate::espace_utilisateur::ADRESSE_MIN;
 use crate::{appels_fichiers, processus, sysfs, vfs};
-use fichiers::montages::Monte;
-use fichiers::noyaufs::{Cible, Contenu, Enregistrement, Genre, NoyauFs};
-use fichiers::{Erreur, Temps};
+use fichiers::chemins::Texte;
+use fichiers::montages::{Interne, Monte};
+use fichiers::noyaufs::{Cible, Contenu, Enregistrement, Genre, NoyauFs, Proprietes, refus};
+use fichiers::tmpfs::{Attributs, DT_DIR, DT_LNK, DT_REG};
+use fichiers::{Erreur, Identite, S_IFDIR, S_IFLNK, S_IFREG, Temps};
 use zones::{Nature, Zone};
 
 const ESRCH: i64 = 3;
@@ -79,118 +103,350 @@ const PERIPHERIQUE: (u32, u32) = (0, 21);
 /// relit pour la suite, comme pour tout fichier).
 const LECTURE_MAX: u64 = 64 << 10;
 
-/// Le procfs neuf : /proc/self, /proc/thread-self et /proc/sys/vm. Assez de
-/// place d'avance pour les dossiers de seize processus à la fois (huit
-/// entrées chacun), et pour tous les fils qui peuvent exister (deux entrées
-/// chacun : max_threads, vmalloc.rs ; une centaine d'octets par entrée, 3
-/// Mio pour 2 Gio de mémoire) : sinon la table des entrées grandirait
-/// pendant un programme, et « memoire rendue » le compterait (vu avec 122
-/// fils et 256 entrées). Linux, lui, fabrique /proc/<pid> à la demande,
-/// d'après la table des processus, sans rien garder : voir l'en-tête.
+/// La partie fixe de /proc : /proc/sys, puis /proc/self et
+/// /proc/thread-self (dans l'ordre où Linux les liste : ses entrées
+/// fixes, puis ces deux liens, puis les processus).
 pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     let mut p = NoyauFs::new(Genre::Proc, PERIPHERIQUE, 0o555, maintenant)?;
     let racine = p.racine();
-    p.reserver(16 * 8 + 2 * crate::vmalloc::max_threads())?;
-    p.ajouter(racine, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), false, maintenant)?;
-    p.ajouter(racine, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), false, maintenant)?;
-    let sys = p.ajouter(racine, b"sys", 0o555, (0, 0), Contenu::Dossier, false, maintenant)?;
-    let vm = p.ajouter(sys, b"vm", 0o555, (0, 0), Contenu::Dossier, false, maintenant)?;
+    let sys = p.ajouter(racine, b"sys", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    let vm = p.ajouter(sys, b"vm", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
     let reglage = |source| Contenu::Fichier { source, argument: 0 };
-    p.ajouter(vm, b"overcommit_memory", 0o644, (0, 0), reglage(OVERCOMMIT_MEMORY), false, maintenant)?;
-    p.ajouter(vm, b"mmap_min_addr", 0o644, (0, 0), reglage(MMAP_MIN_ADDR), false, maintenant)?;
-    let fs = p.ajouter(sys, b"fs", 0o555, (0, 0), Contenu::Dossier, false, maintenant)?;
-    p.ajouter(fs, b"pipe-max-size", 0o644, (0, 0), reglage(PIPE_MAX_SIZE), false, maintenant)?;
-    p.ajouter(fs, b"pipe-user-pages-hard", 0o644, (0, 0), reglage(PIPE_USER_PAGES_HARD), false, maintenant)?;
-    p.ajouter(fs, b"pipe-user-pages-soft", 0o644, (0, 0), reglage(PIPE_USER_PAGES_SOFT), false, maintenant)?;
+    p.ajouter(vm, b"overcommit_memory", 0o644, (0, 0), reglage(OVERCOMMIT_MEMORY), maintenant)?;
+    p.ajouter(vm, b"mmap_min_addr", 0o644, (0, 0), reglage(MMAP_MIN_ADDR), maintenant)?;
+    let fs = p.ajouter(sys, b"fs", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    p.ajouter(fs, b"pipe-max-size", 0o644, (0, 0), reglage(PIPE_MAX_SIZE), maintenant)?;
+    p.ajouter(fs, b"pipe-user-pages-hard", 0o644, (0, 0), reglage(PIPE_USER_PAGES_HARD), maintenant)?;
+    p.ajouter(fs, b"pipe-user-pages-soft", 0o644, (0, 0), reglage(PIPE_USER_PAGES_SOFT), maintenant)?;
+    p.ajouter(racine, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), maintenant)?;
+    p.ajouter(racine, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), maintenant)?;
     Ok(p)
 }
 
-/// Ajoute /proc/<pid> pour le processus `pid`, d'identité (`uid`, `gid`),
-/// d'exécutable `exe` (son chemin canonique). Un échec (plus de mémoire)
-/// est dit, et le programme tourne sans.
-pub fn ajouter_processus(pid: u32, proprietaire: (u32, u32), exe: &[u8]) {
-    let maintenant = crate::temps::maintenant();
-    let mut cible = Vec::new();
-    if cible.try_reserve_exact(exe.len()).is_ok() {
-        cible.extend_from_slice(exe);
+// Les genres des entrées fabriquées (les 8 bits hauts de leur numéro).
+/// /proc/<n> : le dossier d'un processus, ou d'un fil (n).
+const PROCESSUS: u64 = 1;
+const FICHIER_MAPS: u64 = 2;
+const FICHIER_STATM: u64 = 3;
+const FICHIER_COMM: u64 = 4;
+const LIEN_EXE: u64 = 5;
+const DOSSIER_TASK: u64 = 6;
+/// task/<tid> (le fil dans les 24 bits bas).
+const FIL: u64 = 7;
+const FIL_COMM: u64 = 8;
+
+/// Les entrées d'un dossier de processus, dans l'ordre où elles se
+/// listent.
+const ENTREES_DU_PROCESSUS: [(&[u8], u64); 5] =
+    [(b"maps", FICHIER_MAPS), (b"statm", FICHIER_STATM), (b"comm", FICHIER_COMM), (b"exe", LIEN_EXE), (b"task", DOSSIER_TASK)];
+
+/// Le numéro de l'entrée de genre `genre` pour le processus (ou fil) `n`,
+/// et le fil `fil`.
+fn numero(genre: u64, n: u32, fil: u32) -> u64 {
+    genre << 56 | (n as u64) << 24 | fil as u64
+}
+
+/// Ce que dit un numéro : son genre (0 : la partie fixe), le processus ou
+/// fil, le fil.
+fn decoder(i: u64) -> (u64, u32, u32) {
+    (i >> 56, (i >> 24) as u32, (i & 0xff_ffff) as u32)
+}
+
+/// La position dans /proc du premier processus listé (après les entrées
+/// fixes) : `PREMIER_PROCESSUS + pid`, comme le FIRST_PROCESS_ENTRY de Linux.
+const PREMIER_PROCESSUS: u64 = 1 << 32;
+
+/// Un nom de /proc qui est un numéro (`name_to_int` : des chiffres, sans
+/// zéro devant ; au plus 32 bits).
+fn nombre(nom: &[u8]) -> Option<u32> {
+    if nom.is_empty() || (nom.len() > 1 && nom[0] == b'0') || !nom.iter().all(u8::is_ascii_digit) {
+        return None;
     }
-    let fait = vfs::avec_systeme(|s, _| -> Result<(), Erreur> {
-        let p = &mut s.montes[vfs::PROC].1;
-        let mut nom = [0u8; 10];
-        let nom = vfs::decimal(pid, &mut nom);
-        let d = p.ajouter(p.racine(), nom, 0o555, proprietaire, Contenu::Dossier, true, maintenant)?;
-        let fichier = |source| Contenu::Fichier { source, argument: pid };
-        let r = p.ajouter(d, b"maps", 0o444, proprietaire, fichier(MAPS), true, maintenant)
-            .and_then(|_| p.ajouter(d, b"statm", 0o444, proprietaire, fichier(STATM), true, maintenant))
-            .and_then(|_| p.ajouter(d, b"comm", 0o644, proprietaire, fichier(COMM), true, maintenant))
-            .and_then(|_| p.ajouter(d, b"exe", 0o777, proprietaire, Contenu::Lien(Cible::Fixe(cible)), true, maintenant))
-            .and_then(|_| p.ajouter(d, b"task", 0o555, proprietaire, Contenu::Dossier, true, maintenant))
-            .and_then(|task| ajouter_tache(p, task, pid, proprietaire, maintenant));
-        if r.is_err() {
-            p.retirer(d);
+    core::str::from_utf8(nom).ok()?.parse().ok()
+}
+
+/// Le processus que montre /proc/<n> : n lui-même, ou le processus du fil n.
+fn processus_de(n: u32) -> Option<u32> {
+    if processus::existe(n) { Some(n) } else { crate::tache::processus_du_fil(n) }
+}
+
+/// Le fil `tid` est-il de ceux de task/ du processus `pid` : le principal
+/// (tant que le processus existe), ou un fil vivant.
+fn fil_de(pid: u32, tid: u32) -> bool {
+    if tid == pid {
+        return processus::existe(pid);
+    }
+    let mut trouve = false;
+    processus::pour_chaque_fil(pid, |t| trouve |= t == tid);
+    trouve
+}
+
+/// La vue de /proc le temps d'un appel, sous le verrou des fichiers : sa
+/// partie fixe, et ce qu'elle fabrique des processus.
+pub struct ProcVue<'a> {
+    fixe: &'a NoyauFs,
+}
+
+impl<'a> ProcVue<'a> {
+    pub fn new(fixe: &'a NoyauFs) -> ProcVue<'a> {
+        ProcVue { fixe }
+    }
+
+    /// L'entrée fabriquée `i` existe-t-elle encore (son processus, son fil) ?
+    fn existe(&self, i: u64) -> bool {
+        let (genre, n, fil) = decoder(i);
+        match genre {
+            0 => true,
+            FIL | FIL_COMM => processus_de(n).is_some_and(|p| fil_de(p, fil)),
+            _ => processus_de(n).is_some(),
         }
-        r.map(|_| ())
-    });
-    if let Err(e) = fait {
-        afficherln!("[noyau] /proc/{} : impossible a creer (errno {})", pid, e.errno());
     }
-}
 
-/// Ajoute task/<tid>/comm dans le dossier `task` (sous le verrou des
-/// fichiers).
-fn ajouter_tache(p: &mut NoyauFs, task: u32, tid: u32, proprietaire: (u32, u32), maintenant: Temps) -> Result<(), Erreur> {
-    let mut nom = [0u8; 10];
-    let nom = vfs::decimal(tid, &mut nom);
-    let d = p.ajouter(task, nom, 0o555, proprietaire, Contenu::Dossier, true, maintenant)?;
-    let r = p.ajouter(d, b"comm", 0o644, proprietaire, Contenu::Fichier { source: COMM, argument: tid }, true, maintenant);
-    if r.is_err() {
-        p.retirer(d);
-    }
-    r.map(|_| ())
-}
-
-/// Le dossier task/ de /proc/<pid>, s'il existe.
-fn dossier_task(p: &NoyauFs, pid: u32) -> Option<u32> {
-    let mut nom = [0u8; 10];
-    let d = p.chercher(p.racine(), vfs::decimal(pid, &mut nom))?;
-    p.chercher(d, b"task")
-}
-
-/// Ajoute /proc/<pid>/task/<tid> pour un fil neuf (clone). Un échec (plus
-/// de mémoire) est dit, et le fil tourne sans.
-pub fn ajouter_fil(pid: u32, tid: u32, proprietaire: (u32, u32)) {
-    let maintenant = crate::temps::maintenant();
-    let fait = vfs::avec_systeme(|s, _| {
-        let p = &mut s.montes[vfs::PROC].1;
-        let task = dossier_task(p, pid).ok_or(Erreur::ENOENT)?;
-        ajouter_tache(p, task, tid, proprietaire, maintenant)
-    });
-    if let Err(e) = fait {
-        afficherln!("[noyau] /proc/{}/task/{} : impossible a creer (errno {})", pid, tid, e.errno());
-    }
-}
-
-/// Retire /proc/<pid>/task/<tid> (le fil est terminé).
-pub fn retirer_fil(pid: u32, tid: u32) {
-    vfs::avec_systeme(|s, _| {
-        let p = &mut s.montes[vfs::PROC].1;
-        let mut nom = [0u8; 10];
-        if let Some(d) = dossier_task(p, pid).and_then(|task| p.chercher(task, vfs::decimal(tid, &mut nom))) {
-            p.retirer(d);
+    /// Ce qu'il faut savoir d'une entrée pour la modifier
+    /// (noyaufs::refus) ; pour une entrée fabriquée : son mode, son
+    /// propriétaire (le processus), son parent. Le dossier d'un processus
+    /// et celui d'un fil sont immuables (`proc_pid_instantiate`,
+    /// `proc_task_instantiate`), et une écriture y est refusée avant les
+    /// droits, comme dans fd/ (sa propre permission) ; pas dans task/, qui
+    /// suit ses droits (mesuré : rmdir d'un task/<tid>, EACCES).
+    fn proprietes(&self, i: u64) -> Proprietes {
+        let (genre, _, _) = decoder(i);
+        if genre == 0 {
+            return self.fixe.proprietes(i);
         }
-    })
+        let a = self.attributs(i);
+        Proprietes {
+            mode: a.mode,
+            uid: a.uid,
+            gid: a.gid,
+            parent: self.parent(i),
+            processus: genre != DOSSIER_TASK,
+            immuable: matches!(genre, PROCESSUS | FIL) && self.existe(i),
+            dans_proc_sys: false,
+        }
+    }
 }
 
-/// Retire /proc/<pid> (le processus est terminé).
-pub fn retirer_processus(pid: u32) {
-    vfs::avec_systeme(|s, _| {
-        let p = &mut s.montes[vfs::PROC].1;
-        let mut nom = [0u8; 10];
-        let nom = vfs::decimal(pid, &mut nom);
-        if let Some(d) = p.chercher(p.racine(), nom) {
-            p.retirer(d);
+impl Monte for ProcVue<'_> {
+    fn racine(&self) -> u64 {
+        self.fixe.racine()
+    }
+
+    fn peripherique(&self) -> (u32, u32) {
+        self.fixe.peripherique()
+    }
+
+    fn taille_de_bloc(&self) -> u64 {
+        self.fixe.taille_de_bloc()
+    }
+
+    /// Celles d'une entrée fabriquée : à l'utilisateur du processus, datées
+    /// de son lancement, une taille nulle ; un dossier a deux liens et un
+    /// par sous-dossier (le dossier d'un processus : task ; task : un par
+    /// fil). Le processus parti : le même mode et les mêmes liens, à
+    /// root, sans date ni taille (`pid_getattr`) ; un zombie : ce qui n'est
+    /// pas un dossier 0555 à root (`task_dump_owner`). La racine de /proc
+    /// compte aussi un lien par processus (`proc_root_getattr`).
+    fn attributs(&self, i: u64) -> Attributs {
+        let (genre, n, _) = decoder(i);
+        if genre == 0 {
+            let mut a = self.fixe.attributs(i);
+            if i == self.fixe.racine() {
+                a.nlink += processus::nombre();
+            }
+            return a;
         }
-    })
+        let vu = processus_de(n).and_then(processus::vu_de_proc).filter(|_| self.existe(i));
+        let (mode, nlink) = match genre {
+            PROCESSUS => (S_IFDIR | 0o555, 3),
+            FICHIER_MAPS | FICHIER_STATM => (S_IFREG | 0o444, 1),
+            FICHIER_COMM | FIL_COMM => (S_IFREG | 0o644, 1),
+            LIEN_EXE => (S_IFLNK | 0o777, 1),
+            DOSSIER_TASK => {
+                let mut fils = 0;
+                if let Some(p) = processus_de(n) {
+                    fils = 1;
+                    processus::pour_chaque_fil(p, |t| fils += (t != p) as u32);
+                }
+                (S_IFDIR | 0o555, 2 + fils)
+            }
+            _ => (S_IFDIR | 0o555, 2),
+        };
+        let (uid, gid, date) = match vu {
+            Some((_, lance, true)) if mode != S_IFDIR | 0o555 => (0, 0, lance),
+            Some((identite, lance, _)) => (identite.uid, identite.gid, lance),
+            None => (0, 0, Temps::default()),
+        };
+        Attributs { numero: i, mode, nlink, uid, gid, rdev: (0, 0), taille: 0, blocs: 0, atime: date, mtime: date, ctime: date }
+    }
+
+    fn chercher(&self, dossier: u64, nom: &[u8]) -> Option<u64> {
+        let (genre, n, fil) = decoder(dossier);
+        if genre == 0 {
+            if let Some(i) = self.fixe.chercher(dossier, nom) {
+                return Some(i);
+            }
+            if dossier != self.fixe.racine() {
+                return None;
+            }
+            let n = nombre(nom)?;
+            return processus_de(n).map(|_| numero(PROCESSUS, n, 0));
+        }
+        if !self.existe(dossier) {
+            return None;
+        }
+        match genre {
+            PROCESSUS => ENTREES_DU_PROCESSUS.iter().find(|(e, _)| *e == nom).map(|&(_, g)| numero(g, n, 0)),
+            DOSSIER_TASK => {
+                let tid = nombre(nom)?;
+                let p = processus_de(n)?;
+                (tid < 1 << 24 && fil_de(p, tid)).then(|| numero(FIL, n, tid))
+            }
+            FIL if nom == b"comm" => Some(numero(FIL_COMM, n, fil)),
+            _ => None,
+        }
+    }
+
+    fn parent(&self, i: u64) -> u64 {
+        let (genre, n, fil) = decoder(i);
+        match genre {
+            0 => self.fixe.parent(i),
+            PROCESSUS => self.fixe.racine(),
+            FIL => numero(DOSSIER_TASK, n, 0),
+            FIL_COMM => numero(FIL, n, fil),
+            _ => numero(PROCESSUS, n, 0),
+        }
+    }
+
+    fn nom(&self, i: u64) -> Texte<'_> {
+        let (genre, n, fil) = decoder(i);
+        match genre {
+            0 => self.fixe.nom(i),
+            PROCESSUS => Texte::nombre(n as u64),
+            FIL => Texte::nombre(fil as u64),
+            FIL_COMM => Texte::Emprunte(b"comm"),
+            g => Texte::Emprunte(ENTREES_DU_PROCESSUS.iter().find(|&&(_, x)| x == g).map_or(&b""[..], |&(e, _)| e)),
+        }
+    }
+
+    fn cible<'b>(&'b self, lien: u64, lecteur: &'b [u8], fil: &'b [u8]) -> Texte<'b> {
+        match decoder(lien) {
+            (0, _, _) => self.fixe.cible(lien, lecteur, fil),
+            (LIEN_EXE, n, _) => match processus_de(n).and_then(processus::exe) {
+                Some(exe) => Texte::Long(exe),
+                None => Texte::Emprunte(&[]),
+            },
+            _ => Texte::Emprunte(&[]),
+        }
+    }
+
+    /// La racine : « . », « .. », les entrées fixes, puis les processus (à
+    /// la position PREMIER_PROCESSUS + pid) ; le dossier d'un processus, ses
+    /// cinq entrées ; task/, ses fils (à la position 3 + tid) ; un fil, son
+    /// comm. Un dossier dont le processus est parti : ENOENT.
+    fn lire_dossier(&self, dossier: u64, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
+        -> Result<(), Erreur> {
+        let (genre, n, fil) = decoder(dossier);
+        if genre == 0 {
+            let mut encore = true;
+            if position < PREMIER_PROCESSUS {
+                self.fixe.lire_dossier(dossier, position, &mut |nom, i, t, suivante| {
+                    encore = entree(nom, i, t, suivante);
+                    encore
+                })?;
+            }
+            if !encore || dossier != self.fixe.racine() {
+                return Ok(());
+            }
+            let mut depuis = position.max(PREMIER_PROCESSUS) - PREMIER_PROCESSUS;
+            while let Some(pid) = processus::pid_suivant(depuis.min(u32::MAX as u64) as u32) {
+                let nom = Texte::nombre(pid as u64);
+                if !entree(&nom, numero(PROCESSUS, pid, 0), DT_DIR, PREMIER_PROCESSUS + pid as u64 + 1) {
+                    break;
+                }
+                depuis = pid as u64 + 1;
+            }
+            return Ok(());
+        }
+        if !self.existe(dossier) {
+            return Err(Erreur::ENOENT);
+        }
+        if !matches!(genre, PROCESSUS | DOSSIER_TASK | FIL) {
+            return Err(Erreur::ENOTDIR);
+        }
+        if position == 0 && !entree(b".", dossier, DT_DIR, 1) {
+            return Ok(());
+        }
+        if position <= 1 && !entree(b"..", self.parent(dossier), DT_DIR, 2) {
+            return Ok(());
+        }
+        match genre {
+            PROCESSUS => {
+                for (k, &(nom, g)) in ENTREES_DU_PROCESSUS.iter().enumerate().skip((position.max(2) - 2) as usize) {
+                    let t = match g {
+                        LIEN_EXE => DT_LNK,
+                        DOSSIER_TASK => DT_DIR,
+                        _ => DT_REG,
+                    };
+                    if !entree(nom, numero(g, n, 0), t, k as u64 + 3) {
+                        break;
+                    }
+                }
+            }
+            DOSSIER_TASK => {
+                let Some(p) = processus_de(n) else { return Ok(()) };
+                // Le fil principal d'abord, puis les autres, dans l'ordre de
+                // leurs numéros (ils ne font que croître).
+                let suivant = |depuis: u64| -> Option<u32> {
+                    let mut meilleur: Option<u32> = None;
+                    if p as u64 + 3 > depuis {
+                        meilleur = Some(p);
+                    }
+                    processus::pour_chaque_fil(p, |t| {
+                        if t != p && t as u64 + 3 > depuis && meilleur.is_none_or(|m| t < m) {
+                            meilleur = Some(t);
+                        }
+                    });
+                    meilleur
+                };
+                let mut depuis = position;
+                while let Some(t) = suivant(depuis) {
+                    if t >= 1 << 24 {
+                        break;
+                    }
+                    let nom = Texte::nombre(t as u64);
+                    if !entree(&nom, numero(FIL, n, t), DT_DIR, t as u64 + 3) {
+                        break;
+                    }
+                    depuis = t as u64 + 3;
+                }
+            }
+            _ => {
+                if position <= 2 {
+                    let _ = entree(b"comm", numero(FIL_COMM, n, fil), DT_REG, 3);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// La source d'un fichier : maps et statm du processus du numéro (celui
+    /// d'un fil aussi), comm du fil (le processus : son fil principal).
+    fn contenu(&self, i: u64) -> Option<(u32, u32)> {
+        let (genre, n, fil) = decoder(i);
+        match genre {
+            0 => self.fixe.contenu(i),
+            FICHIER_MAPS => Some((MAPS, processus_de(n).unwrap_or(n))),
+            FICHIER_STATM => Some((STATM, processus_de(n).unwrap_or(n))),
+            FICHIER_COMM => Some((COMM, n)),
+            FIL_COMM => Some((COMM, fil)),
+            _ => None,
+        }
+    }
+
+    fn refuser(&self, qui: Identite, m: Interne) -> Result<(), Erreur> {
+        refus(Genre::Proc, qui, m, |i| self.proprietes(i))
+    }
 }
 
 /// Comment se lit la source `source` d'un système du noyau : les
@@ -296,9 +552,9 @@ pub fn deplacer(l: Lecture, position: u64, decalage: i64, depuis: u64) -> i64 {
 
 /// Un bloc du tas où écrire un enregistrement avec `write!`, qui échoue
 /// (sans paniquer) quand la mémoire manque.
-struct Texte(Vec<u8>);
+struct Ecrit(Vec<u8>);
 
-impl Write for Texte {
+impl Write for Ecrit {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.0.try_reserve(s.len()).map_err(|_| fmt::Error)?;
         self.0.extend_from_slice(s.as_bytes());
@@ -308,7 +564,7 @@ impl Write for Texte {
 
 /// La valeur d'un réglage de /proc/sys, avec son saut de ligne.
 fn valeur(source: u32) -> Result<Vec<u8>, Erreur> {
-    let mut t = Texte(Vec::new());
+    let mut t = Ecrit(Vec::new());
     let r = match source {
         // OVERCOMMIT_GUESS : la politique de 6a (memoire.rs).
         OVERCOMMIT_MEMORY => writeln!(t, "0"),
@@ -411,7 +667,7 @@ fn statm(pid: u32) -> Result<Vec<u8>, Erreur> {
         let (pages, fichier) = (m.espace.pages() as u64, m.espace.pages_fichier() as u64);
         (m.taille_virtuelle() / 4096, pages + fichier, fichier, code, donnees)
     }).unwrap_or((0, 0, 0, 0, 0));
-    let mut t = Texte(Vec::new());
+    let mut t = Ecrit(Vec::new());
     writeln!(t, "{} {} {} {} 0 {} 0", taille, resident, partage, code, donnees).map_err(|_| Erreur::ENOMEM)?;
     Ok(t.0)
 }
@@ -465,7 +721,7 @@ fn ligne_maps(pid: u32, curseur: u64) -> Result<Enregistrement, Erreur> {
         Some((_, inode, _, decalage)) => (appels_fichiers::DEV_RACINE, *inode, *decalage),
         None => ((0, 0), 0, 0),
     };
-    let mut t = Texte(Vec::new());
+    let mut t = Ecrit(Vec::new());
     write!(t, "{:08x}-{:08x} {}{}{}p {:08x} {:02x}:{:02x} {} ", z.debut, z.fin, lettre(z.droits.lecture, 'r'),
            lettre(z.droits.ecriture, 'w'), lettre(z.droits.execution, 'x'), decalage, dev.0, dev.1, inode)
         .map_err(|_| Erreur::ENOMEM)?;

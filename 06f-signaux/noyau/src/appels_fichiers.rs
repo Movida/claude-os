@@ -54,7 +54,7 @@ use crate::vfs::{self, CadresDuNoyau, Systeme};
 use crate::{aleatoire, console, evenements, pages, processus, procfs, temps};
 use fichiers::chemins::{Arbre, Depart, Fin, PATH_MAX, Suivre};
 use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_tmpfs};
-use fichiers::noyaufs::NoyauFs;
+use crate::vfs::Montage;
 use fichiers::tmpfs::{Attributs, Numero, Ouverture, limite_ecriture, suivre_pour};
 use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, permis};
 use crate::attente::{GardeMutex, Mutex};
@@ -512,7 +512,7 @@ pub fn ouvrir_pour(qui: fichiers::Identite, chemin: &[u8], lecture: bool, ecritu
 /// contenu est fabriqué à la lecture, procfs.rs) ; seul `comm` s'écrit (un
 /// réglage de /proc/sys, en 0644 à root : EACCES pour root aussi, nos
 /// programmes ne le sont jamais).
-pub fn ouvrir_monte(vue: &Vue<NoyauFs>, qui: Identite, objet: Objet, o: &Ouverture, drapeaux: u32, chemin: &[u8])
+pub fn ouvrir_monte(vue: &Vue<Montage>, qui: Identite, objet: Objet, o: &Ouverture, drapeaux: u32, chemin: &[u8])
     -> Result<FichierOuvert, Erreur> {
     let ouvrir = |sorte| FichierOuvert::new(sorte, Tenu::Noyau(objet), o.lecture, o.ecriture, drapeaux, chemin);
     if o.chemin_seul {
@@ -1375,7 +1375,7 @@ fn stat_linux(a: &Attributs, (dev, taille_de_bloc): ((u32, u32), u64)) -> [u8; 1
         s[position..position + taille].copy_from_slice(&valeur.to_le_bytes()[..taille]);
     };
     mettre(0, encoder_peripherique(dev), 8); // st_dev
-    mettre(8, a.numero.0 as u64, 8); // st_ino
+    mettre(8, a.numero, 8); // st_ino
     mettre(16, a.nlink as u64, 8); // st_nlink
     mettre(24, a.mode as u64, 4); // st_mode
     mettre(28, a.uid as u64, 4); // st_uid
@@ -1487,7 +1487,7 @@ pub fn statx(dirfd: u64, adresse: u64, drapeaux: u64, masque: u64, statx: u64) -
     mettre(20, a.uid as u64, 4);
     mettre(24, a.gid as u64, 4);
     mettre(28, a.mode as u64, 2);
-    mettre(32, a.numero.0 as u64, 8);
+    mettre(32, a.numero, 8);
     mettre(40, a.taille, 8);
     mettre(48, a.blocs, 8);
     // atime, btime (absente), ctime, mtime : secondes sur 64 bits,
@@ -2063,9 +2063,16 @@ pub fn readlinkat(dirfd: u64, adresse: u64, tampon: u64, taille: u64) -> i64 {
             if vue.mode(o) & S_IFMT != S_IFLNK {
                 return Err(pas_un_lien());
             }
+            // Un lien sans texte n'est qu'un lien de /proc dont l'objet est
+            // parti (le processus) ou faute de mémoire : ENOENT, l'erreur
+            // de `proc_pid_readlink`, jamais 0 (un lien du tmpfs n'est
+            // jamais vide : symlink de "" rend ENOENT).
             let cible = vue.cible(o);
+            if cible.is_empty() {
+                return Err(errno(Erreur::ENOENT));
+            }
             copie.try_reserve_exact(cible.len()).map_err(|_| -ENOMEM)?;
-            copie.extend_from_slice(cible);
+            copie.extend_from_slice(&cible);
             Ok(())
         })?;
         if let Some(n) = o.tmpfs() {

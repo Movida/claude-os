@@ -134,6 +134,7 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] proc : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] proc : maps et statm d'un autre processus, vivant : lus : ok
 [linux] proc : ses fichiers gardes ouverts, une fois recueilli : ESRCH : ok
+[linux] proc : son dossier garde ouvert, une fois recueilli : le meme mode, a root : ok
 [linux] proc autre : toutes les verifications : ok
 [linux] partage a : temps reel / temps de calcul entre 1,6 et 2,6 : ok
 [linux] partage b : temps reel / temps de calcul entre 1,6 et 2,6 : ok

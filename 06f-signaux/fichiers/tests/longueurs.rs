@@ -31,7 +31,7 @@ fn essai(l_point: usize, l_total: usize) -> (Result<usize, Erreur>, Result<usize
     let mut dernier_nom = 0;
     while total < l_total {
         let k = (l_total - total - 1).min(255).max(1);
-        n = m.ajouter(n, &vec![b'q'; k], 0o555, (0, 0), Contenu::Dossier, false, Temps::default()).unwrap();
+        n = m.ajouter(n, &vec![b'q'; k], 0o555, (0, 0), Contenu::Dossier, Temps::default()).unwrap();
         total += 1 + k;
         dernier_nom = k;
     }

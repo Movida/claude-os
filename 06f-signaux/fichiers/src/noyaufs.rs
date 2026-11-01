@@ -8,9 +8,11 @@
 //!
 //! La bibliothèque tient l'arborescence et répond à la résolution des
 //! chemins (le trait `Monte` de montages.rs) ; elle découpe aussi le
-//! contenu en lectures (`Sequence`, le `seq_file` de Linux). Le noyau,
-//! lui, ajoute et retire les entrées (une entrée par processus dans
-//! /proc), et fabrique les contenus.
+//! contenu en lectures (`Sequence`, le `seq_file` de Linux), et dit ce que
+//! ces systèmes répondent à une modification (`refus`). Le noyau, lui,
+//! fabrique les contenus ; pour /proc, il fabrique aussi à la demande les
+//! dossiers des processus, d'après leur table (procfs.rs), et ne met ici
+//! que la partie fixe.
 //!
 //! Les deux genres, mesurés sous Linux 6.18, ne diffèrent que par ce
 //! qu'ils répondent :
@@ -22,8 +24,9 @@
 //!     bloc aussi ; un nom absent n'y est qu'absent (créer est refusé par
 //!     les droits, EACCES, ou par EPERM pour root : rien ne sait y créer).
 
+use crate::chemins::Texte;
 use crate::montages::{Interne, Monte};
-use crate::tmpfs::{Attributs, DT_DIR, DT_LNK, DT_REG, Numero};
+use crate::tmpfs::{Attributs, DT_DIR, DT_LNK, DT_REG};
 use crate::{ECRIRE, EXECUTER, Erreur, Identite, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Temps, permis};
 use alloc::vec::Vec;
 
@@ -34,12 +37,11 @@ pub enum Genre {
     Sys,
 }
 
-/// La cible d'un lien.
+/// La cible d'un lien : elle dépend de qui le lit (les liens d'un
+/// processus, /proc/<pid>/exe et fd/, sont fabriqués par le noyau,
+/// procfs.rs).
 #[derive(Clone, Debug)]
 pub enum Cible {
-    /// Un texte fixé à la création (/proc/<pid>/exe : le chemin de
-    /// l'exécutable).
-    Fixe(Vec<u8>),
     /// Le numéro du processus qui lit (/proc/self).
     Lecteur,
     /// Le fil qui lit, « <pid>/task/<tid> » (/proc/thread-self).
@@ -51,8 +53,7 @@ pub enum Cible {
 pub enum Contenu {
     Dossier,
     /// Un fichier, dont le contenu vient de la source `source` du noyau,
-    /// avec `argument` (le numéro du processus d'un fichier de
-    /// /proc/<pid>).
+    /// avec `argument`.
     Fichier { source: u32, argument: u32 },
     Lien(Cible),
 }
@@ -67,30 +68,15 @@ struct Entree {
     uid: u32,
     gid: u32,
     contenu: Contenu,
-    /// Dans le dossier d'un processus (/proc/<pid>, et lui-même) : une
-    /// écriture dans un tel dossier est refusée par EPERM (mesuré), avant
-    /// même les droits.
-    processus: bool,
-    /// Immuable (le S_IMMUTABLE de Linux, que procfs pose sur /proc/<pid>
-    /// lui-même, `proc_pid_instantiate`) : ni son propriétaire, ni ses
-    /// droits, ni ses dates ne changent, pour personne (EPERM, avant toute
-    /// autre vérification, `notify_change` ; mesuré : chown vers son propre
-    /// propriétaire rend EPERM pour le dossier, 0 pour maps).
-    immuable: bool,
     /// Sa date de création (celle de ses trois dates).
     date: Temps,
-    /// Marquée pour `retirer`, le temps d'un balayage.
-    retiree: bool,
 }
 
-/// Ce que désigne un numéro qui n'est plus dans la table : l'entrée d'un
-/// processus terminé, qu'un descripteur ouvert ou un dossier courant
-/// désigne encore. Linux garde l'inode (compté) et ses attributs, et les
-/// opérations sur le processus disparu échouent (ESRCH, ENOENT) ; nous
-/// rendons une entrée vide, à root, sans nom ni contenu : stat répond,
-/// readdir rend ENOENT (`lire_dossier`), et un numéro n'est jamais repris
-/// (`NoyauFs::prochain`) : il ne peut pas désigner l'entrée d'un autre.
-static DISPARUE: Entree = Entree {
+/// Ce que désigne un numéro qui n'est pas dans la table (rien ne s'en
+/// retire : seul un numéro faux le peut) : une entrée vide, à root, sans
+/// nom ni contenu, plutôt qu'une panique ; readdir y rend ENOENT
+/// (`lire_dossier`).
+static ABSENTE: Entree = Entree {
     numero: 0,
     nom: Vec::new(),
     parent: RACINE,
@@ -98,10 +84,7 @@ static DISPARUE: Entree = Entree {
     uid: 0,
     gid: 0,
     contenu: Contenu::Dossier,
-    processus: false,
-    immuable: false,
     date: Temps { secondes: 0, nanosecondes: 0 },
-    retiree: false,
 };
 
 /// Un système de fichiers du noyau.
@@ -113,14 +96,7 @@ pub struct NoyauFs {
     /// enfants : il existait quand on les a ajoutés, et les numéros
     /// croissent.
     entrees: Vec<Entree>,
-    /// Le numéro de la prochaine entrée. Il ne fait que croître : un numéro
-    /// gardé par un fichier ouvert (un `Objet::Monte`) ne désigne jamais
-    /// l'entrée d'un autre. Options écartées : reprendre la première place
-    /// libre (le numéro de /proc/2/maps désignerait, après la fin de 2, le
-    /// statm de /proc/3) ; une génération à côté de chaque numéro (il
-    /// faudrait l'ajouter à `Objet`, que partagent tous les systèmes). À
-    /// quatre milliards d'entrées, `ajouter` rend ENOSPC (Linux, lui,
-    /// recycle ses numéros d'inode de procfs, mais il tient l'inode).
+    /// Le numéro de la prochaine entrée (ENOSPC au-delà de 32 bits).
     prochain: u32,
 }
 
@@ -141,16 +117,13 @@ impl NoyauFs {
             uid: 0,
             gid: 0,
             contenu: Contenu::Dossier,
-            processus: false,
-            immuable: false,
             date: maintenant,
-            retiree: false,
         });
         Ok(NoyauFs { genre, peripherique, entrees, prochain: RACINE + 1 })
     }
 
-    pub fn racine(&self) -> u32 {
-        RACINE
+    pub fn racine(&self) -> u64 {
+        RACINE as u64
     }
 
     /// L'entrée de numéro `n`, si elle existe encore.
@@ -158,31 +131,24 @@ impl NoyauFs {
         self.entrees.binary_search_by_key(&n, |e| e.numero).ok().map(|i| &self.entrees[i])
     }
 
-    /// L'entrée de numéro `n`, ou `DISPARUE`.
+    /// L'entrée de numéro `n`, ou `ABSENTE`.
     fn entree(&self, n: u32) -> &Entree {
-        self.trouver(n).unwrap_or(&DISPARUE)
-    }
-
-    /// De la place d'avance pour `n` entrées de plus (ENOMEM) : une table qui
-    /// ne grandit pas plus tard.
-    pub fn reserver(&mut self, n: usize) -> Result<(), Erreur> {
-        self.entrees.try_reserve(n).map_err(|_| Erreur::ENOMEM)
+        self.trouver(n).unwrap_or(&ABSENTE)
     }
 
     /// Ajoute `nom` dans le dossier `parent` : un dossier, un fichier ou un
     /// lien (`contenu`), de droits `droits`, à (`uid`, `gid`), daté de
-    /// `maintenant`. `processus` : l'entrée appartient au dossier d'un
-    /// processus (voir `Entree::processus`) ; un dossier de processus mis
-    /// à la racine est le dossier du processus lui-même, immuable. Rend son
-    /// numéro ; ENOENT si le parent n'existe pas, ENOTDIR s'il n'est pas un
-    /// dossier, EEXIST si le nom est déjà pris, ENOMEM, ENOSPC.
-    pub fn ajouter(&mut self, parent: u32, nom: &[u8], droits: u32, (uid, gid): (u32, u32), contenu: Contenu,
-                   processus: bool, maintenant: Temps) -> Result<u32, Erreur> {
+    /// `maintenant`. Rend son numéro ; ENOENT si le parent n'existe pas,
+    /// ENOTDIR s'il n'est pas un dossier, EEXIST si le nom est déjà pris,
+    /// ENOMEM, ENOSPC.
+    pub fn ajouter(&mut self, parent: u64, nom: &[u8], droits: u32, (uid, gid): (u32, u32), contenu: Contenu,
+                   maintenant: Temps) -> Result<u64, Erreur> {
+        let parent = entree32(parent);
         let p = self.trouver(parent).ok_or(Erreur::ENOENT)?;
         if p.mode & S_IFMT != S_IFDIR {
             return Err(Erreur::ENOTDIR);
         }
-        if self.chercher(parent, nom).is_some() {
+        if self.chercher_ici(parent, nom).is_some() {
             return Err(Erreur::EEXIST);
         }
         let genre = match contenu {
@@ -196,7 +162,6 @@ impl NoyauFs {
         copie.try_reserve_exact(nom.len()).map_err(|_| Erreur::ENOMEM)?;
         copie.extend_from_slice(nom);
         self.entrees.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
-        let immuable = processus && parent == RACINE && genre == S_IFDIR;
         self.entrees.push(Entree {
             numero,
             nom: copie,
@@ -205,32 +170,32 @@ impl NoyauFs {
             uid,
             gid,
             contenu,
-            processus,
-            immuable,
             date: maintenant,
-            retiree: false,
         });
         self.prochain = prochain;
-        Ok(numero)
+        Ok(numero as u64)
     }
 
-    /// Retire l'entrée `n` et tout ce qu'elle contient (le dossier d'un
-    /// processus qui se termine), sans allouer : retirer ne doit pas
-    /// pouvoir échouer. Un parent étant toujours avant ses enfants, un seul
-    /// passage dans l'ordre marque tout le sous-arbre (le parent d'une
-    /// entrée a déjà été vu), puis `retain` balaie. La racine ne se retire
-    /// pas.
-    pub fn retirer(&mut self, n: u32) {
-        if n == RACINE {
-            return;
+    /// Ce que désigne `nom` dans `dossier`.
+    fn chercher_ici(&self, dossier: u32, nom: &[u8]) -> Option<u32> {
+        self.entrees.iter().find(|e| e.parent == dossier && e.numero != dossier && e.nom == nom).map(|e| e.numero)
+    }
+
+    /// Ce qu'il faut savoir de l'entrée `n` pour la modifier (`refus`) :
+    /// pour /proc, dont le noyau fabrique le reste (procfs.rs). Rien d'ici
+    /// n'est dans le dossier d'un processus, ni immuable.
+    pub fn proprietes(&self, n: u64) -> Proprietes {
+        let n = entree32(n);
+        let e = self.entree(n);
+        Proprietes {
+            mode: e.mode,
+            uid: e.uid,
+            gid: e.gid,
+            parent: e.parent as u64,
+            processus: false,
+            immuable: false,
+            dans_proc_sys: self.dans_proc_sys(n),
         }
-        for i in 0..self.entrees.len() {
-            let parent = self.entrees[i].parent;
-            let retiree = self.entrees[i].numero == n
-                || self.entrees[..i].binary_search_by_key(&parent, |e| e.numero).is_ok_and(|j| self.entrees[j].retiree);
-            self.entrees[i].retiree = retiree;
-        }
-        self.entrees.retain(|e| !e.retiree);
     }
 
     /// Les sous-dossiers d'un dossier (pour son nombre de liens).
@@ -259,9 +224,15 @@ impl NoyauFs {
     }
 }
 
+/// Un numéro d'inode de la `Vue` (64 bits), en numéro d'entrée : au-delà
+/// de 32 bits, aucune entrée (0 n'en est jamais une).
+fn entree32(n: u64) -> u32 {
+    u32::try_from(n).unwrap_or(0)
+}
+
 impl Monte for NoyauFs {
-    fn racine(&self) -> u32 {
-        RACINE
+    fn racine(&self) -> u64 {
+        RACINE as u64
     }
 
     fn peripherique(&self) -> (u32, u32) {
@@ -280,9 +251,10 @@ impl Monte for NoyauFs {
     /// un seul (mesuré, comme ceux de btrfs : « nombre inconnu ») ; le
     /// reste, un. Les fichiers et les liens de procfs annoncent une taille
     /// nulle (leur contenu n'existe qu'à la lecture), comme les liens de
-    /// sysfs ; ses fichiers, une page (mesuré). Une entrée disparue : mode
-    /// et liens nuls.
-    fn attributs(&self, n: u32) -> Attributs {
+    /// sysfs ; ses fichiers, une page (mesuré). Un numéro absent : mode et
+    /// liens nuls.
+    fn attributs(&self, n: u64) -> Attributs {
+        let n = entree32(n);
         let e = self.entree(n);
         let dossier = e.mode & S_IFMT == S_IFDIR;
         let taille = match (&e.contenu, self.genre) {
@@ -296,7 +268,7 @@ impl Monte for NoyauFs {
             _ => 1,
         };
         Attributs {
-            numero: Numero(n),
+            numero: n as u64,
             mode: e.mode,
             nlink,
             uid: e.uid,
@@ -310,34 +282,32 @@ impl Monte for NoyauFs {
         }
     }
 
-    fn chercher(&self, dossier: u32, nom: &[u8]) -> Option<u32> {
-        self.entrees.iter().find(|e| e.parent == dossier && e.numero != dossier && e.nom == nom).map(|e| e.numero)
+    fn chercher(&self, dossier: u64, nom: &[u8]) -> Option<u64> {
+        self.chercher_ici(entree32(dossier), nom).map(u64::from)
     }
 
-    fn parent(&self, n: u32) -> u32 {
-        self.entree(n).parent
+    fn parent(&self, n: u64) -> u64 {
+        self.entree(entree32(n)).parent as u64
     }
 
-    fn nom(&self, n: u32) -> &[u8] {
-        &self.entree(n).nom
+    fn nom(&self, n: u64) -> Texte<'_> {
+        Texte::Emprunte(&self.entree(entree32(n)).nom)
     }
 
-    fn cible<'a>(&'a self, lien: u32, lecteur: &'a [u8], fil: &'a [u8]) -> &'a [u8] {
-        match &self.entree(lien).contenu {
-            Contenu::Lien(Cible::Fixe(c)) => c,
+    fn cible<'a>(&'a self, lien: u64, lecteur: &'a [u8], fil: &'a [u8]) -> Texte<'a> {
+        Texte::Emprunte(match &self.entree(entree32(lien)).contenu {
             Contenu::Lien(Cible::Lecteur) => lecteur,
             Contenu::Lien(Cible::LecteurFil) => fil,
             _ => &[],
-        }
+        })
     }
 
     /// « . » (position 0), « .. » (1), puis les entrées dans l'ordre de leur
     /// numéro : l'entrée `i` est à la position i + 2, et sa suivante à
-    /// i + 3. Une position reste juste quand une entrée disparaît. Un
-    /// dossier disparu : ENOENT, comme Linux pour le dossier d'un processus
-    /// terminé.
-    fn lire_dossier(&self, dossier: u32, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
+    /// i + 3. Un numéro absent : ENOENT.
+    fn lire_dossier(&self, dossier: u64, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
         -> Result<(), Erreur> {
+        let dossier = entree32(dossier);
         let d = self.trouver(dossier).ok_or(Erreur::ENOENT)?;
         if d.mode & S_IFMT != S_IFDIR {
             return Err(Erreur::ENOTDIR);
@@ -365,92 +335,122 @@ impl Monte for NoyauFs {
         Ok(())
     }
 
-    fn contenu(&self, n: u32) -> Option<(u32, u32)> {
-        match self.trouver(n)?.contenu {
+    fn contenu(&self, n: u64) -> Option<(u32, u32)> {
+        match self.trouver(entree32(n))?.contenu {
             Contenu::Fichier { source, argument } => Some((source, argument)),
             _ => None,
         }
     }
 
-    /// Ce que répond le système (mesuré sous Linux 6.18, pour un
-    /// utilisateur ordinaire ; root passe les droits, puis rien ne sait le
-    /// faire : EPERM, l'erreur d'une opération absente) :
-    ///   - créer : procfs, ENOENT (sa recherche d'un nom absent échoue) ;
-    ///     sysfs, le droit d'écrire dans le dossier (EACCES), puis EPERM, ou
-    ///     EACCES pour open (`lookup_open`, lu dans les sources : un dossier
-    ///     sans opération `create`) ;
-    ///   - effacer, renommer, lier dans le système : dans le dossier d'un
-    ///     processus, EPERM ; ailleurs, le droit d'écrire (EACCES), puis
-    ///     EPERM ; renommer vers un nom absent de procfs : ENOENT ;
-    ///   - changer les droits : EPERM ;
-    ///   - changer le propriétaire : du dossier d'un processus (immuable),
-    ///     ou dans /proc/sys (`proc_sys_setattr`), EPERM dès qu'un
-    ///     identifiant est donné ; ailleurs, sans rien changer (le même
-    ///     utilisateur, son propre groupe, ou -1), le propriétaire le peut
-    ///     (0), sinon EPERM ; root : 0. Sans effet ici (Linux garde le
-    ///     changement en mémoire tant que l'inode y reste) ;
-    ///   - les dates : du dossier d'un processus, EPERM ; à maintenant, il
-    ///     faut pouvoir écrire, ou être le propriétaire (EACCES) ; d'autres
-    ///     dates, être le propriétaire (EPERM) ; sans effet ici ;
-    ///   - truncate (d'un fichier ordinaire : `Vue::refus` a vu le reste) :
-    ///     le droit d'écrire (EACCES), puis 0 (procfs ignore la taille,
-    ///     `proc_setattr`).
-    /// Écarts pour root, écrits ici faute de pouvoir les mesurer sans
-    /// écrire dans /proc (nos programmes ne sont jamais root) : Linux le
-    /// laisse changer les droits de la racine de /proc (`simple_setattr`)
-    /// et d'un nœud de sysfs (`kernfs_iop_setattr`) ; nous rendons EPERM.
+    /// Les règles communes des systèmes du noyau (`refus`).
     fn refuser(&self, qui: Identite, m: Interne) -> Result<(), Erreur> {
-        let droits = |n: u32, masque: u32| {
-            let e = self.entree(n);
-            permis(e.mode, e.uid, e.gid, qui, masque)
-        };
-        let proprietaire = |n: u32| qui.root() || qui.uid == self.entree(n).uid;
-        // Écrire dans le dossier `d` : refusé dans un dossier de processus
-        // (EPERM), sinon par les droits.
-        let ecrire_dans = |d: u32| -> Erreur {
-            if self.entree(d).processus {
-                Erreur::EPERM
-            } else if !droits(d, ECRIRE | EXECUTER) {
-                Erreur::EACCES
-            } else {
-                Erreur::EPERM
-            }
-        };
-        match m {
-            Interne::Creer { dossier, ouvrir } => Err(match self.genre {
-                Genre::Proc => Erreur::ENOENT,
-                Genre::Sys if !droits(dossier, ECRIRE | EXECUTER) || ouvrir => Erreur::EACCES,
-                Genre::Sys => Erreur::EPERM,
-            }),
-            Interne::Effacer { dossier, .. } => Err(ecrire_dans(dossier)),
-            Interne::Renommer { ancien, nouveau } => Err(match (self.genre, nouveau) {
-                (Genre::Proc, None) => Erreur::ENOENT,
-                _ => ecrire_dans(self.entree(ancien).parent),
-            }),
-            Interne::Lier { .. } | Interne::ChangerMode { .. } => Err(Erreur::EPERM),
-            Interne::ChangerProprietaire { objet, uid, gid } => {
-                let e = self.entree(objet);
-                let change = uid.is_some() || gid.is_some();
-                if change && (e.immuable || self.dans_proc_sys(objet)) {
-                    return Err(Erreur::EPERM);
-                }
-                let uid_permis = uid.is_none_or(|u| proprietaire(objet) && u == e.uid);
-                let gid_permis = gid.is_none_or(|g| proprietaire(objet) && (g == e.gid || g == qui.gid));
-                if qui.root() || (uid_permis && gid_permis) { Ok(()) } else { Err(Erreur::EPERM) }
-            }
-            Interne::ChangerTemps { objet, maintenant } => {
-                if self.entree(objet).immuable {
-                    Err(Erreur::EPERM)
-                } else if proprietaire(objet) || (maintenant && droits(objet, ECRIRE)) {
-                    Ok(())
-                } else if maintenant {
-                    Err(Erreur::EACCES)
-                } else {
-                    Err(Erreur::EPERM)
-                }
-            }
-            Interne::Tronquer { objet } => if droits(objet, ECRIRE) { Ok(()) } else { Err(Erreur::EACCES) },
+        refus(self.genre, qui, m, |n| self.proprietes(n))
+    }
+}
+
+/// Ce qu'il faut savoir d'une entrée d'un système du noyau pour répondre à
+/// une modification (`refus`) : celle d'un `NoyauFs`, ou une entrée de
+/// /proc fabriquée à la demande (le noyau, procfs.rs).
+#[derive(Clone, Copy, Debug)]
+pub struct Proprietes {
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    pub parent: u64,
+    /// Un dossier où une écriture est refusée par EPERM avant même les
+    /// droits (mesuré) : celui d'un processus, d'un fil, et fd/ (procfs.rs).
+    pub processus: bool,
+    /// Immuable (le S_IMMUTABLE de Linux, que procfs pose sur /proc/<pid>
+    /// et task/<tid>, `proc_pid_instantiate`, `proc_task_instantiate`) :
+    /// ni son propriétaire, ni ses droits, ni ses dates ne changent, pour
+    /// personne (EPERM, avant toute autre vérification, `notify_change` ;
+    /// mesuré : chown vers son propre propriétaire rend EPERM pour le
+    /// dossier, 0 pour maps).
+    pub immuable: bool,
+    /// /proc/sys ou dedans.
+    pub dans_proc_sys: bool,
+}
+
+/// Ce que répond un système du noyau de genre `genre` à la modification `m`
+/// (mesuré sous Linux 6.18, pour un utilisateur ordinaire ; root passe les
+/// droits, puis rien ne sait le faire : EPERM, l'erreur d'une opération
+/// absente), d'après les propriétés de ses entrées :
+///   - créer : procfs, ENOENT (sa recherche d'un nom absent échoue) ;
+///     sysfs, le droit d'écrire dans le dossier (EACCES), puis EPERM, ou
+///     EACCES pour open (`lookup_open`, lu dans les sources : un dossier
+///     sans opération `create`) ;
+///   - effacer, renommer, lier dans le système : dans le dossier d'un
+///     processus, d'un fil ou fd/, EPERM ; ailleurs, le droit d'écrire
+///     (EACCES), puis EPERM ; renommer vers un nom absent de procfs :
+///     ENOENT ;
+///   - changer les droits : EPERM ;
+///   - changer le propriétaire : d'une entrée immuable (le dossier d'un
+///     processus, d'un fil), ou dans /proc/sys (`proc_sys_setattr`),
+///     EPERM dès qu'un identifiant est donné ; ailleurs, sans rien changer
+///     (le même utilisateur, son propre groupe, ou -1), le propriétaire le
+///     peut (0), sinon EPERM ; root : 0. Sans effet ici (Linux garde le
+///     changement en mémoire tant que l'inode y reste) ;
+///   - les dates : d'une entrée immuable, EPERM ; à maintenant, il
+///     faut pouvoir écrire, ou être le propriétaire (EACCES) ; d'autres
+///     dates, être le propriétaire (EPERM) ; sans effet ici ;
+///   - truncate (d'un fichier ordinaire : `Vue::refus` a vu le reste) :
+///     le droit d'écrire (EACCES), puis 0 (procfs ignore la taille,
+///     `proc_setattr`).
+/// Écarts pour root, écrits ici faute de pouvoir les mesurer sans
+/// écrire dans /proc (nos programmes ne sont jamais root) : Linux le
+/// laisse changer les droits de la racine de /proc (`simple_setattr`)
+/// et d'un nœud de sysfs (`kernfs_iop_setattr`) ; nous rendons EPERM.
+pub fn refus(genre: Genre, qui: Identite, m: Interne, proprietes: impl Fn(u64) -> Proprietes) -> Result<(), Erreur> {
+    let droits = |n: u64, masque: u32| {
+        let e = proprietes(n);
+        permis(e.mode, e.uid, e.gid, qui, masque)
+    };
+    let proprietaire = |n: u64| qui.root() || qui.uid == proprietes(n).uid;
+    // Écrire dans le dossier `d` : refusé dans un dossier de processus
+    // (EPERM), sinon par les droits.
+    let ecrire_dans = |d: u64| -> Erreur {
+        if proprietes(d).processus {
+            Erreur::EPERM
+        } else if !droits(d, ECRIRE | EXECUTER) {
+            Erreur::EACCES
+        } else {
+            Erreur::EPERM
         }
+    };
+    match m {
+        Interne::Creer { dossier, ouvrir } => Err(match genre {
+            Genre::Proc => Erreur::ENOENT,
+            Genre::Sys if !droits(dossier, ECRIRE | EXECUTER) || ouvrir => Erreur::EACCES,
+            Genre::Sys => Erreur::EPERM,
+        }),
+        Interne::Effacer { dossier, .. } => Err(ecrire_dans(dossier)),
+        Interne::Renommer { ancien, nouveau } => Err(match (genre, nouveau) {
+            (Genre::Proc, None) => Erreur::ENOENT,
+            _ => ecrire_dans(proprietes(ancien).parent),
+        }),
+        Interne::Lier { .. } | Interne::ChangerMode { .. } => Err(Erreur::EPERM),
+        Interne::ChangerProprietaire { objet, uid, gid } => {
+            let e = proprietes(objet);
+            let change = uid.is_some() || gid.is_some();
+            if change && (e.immuable || e.dans_proc_sys) {
+                return Err(Erreur::EPERM);
+            }
+            let uid_permis = uid.is_none_or(|u| proprietaire(objet) && u == e.uid);
+            let gid_permis = gid.is_none_or(|g| proprietaire(objet) && (g == e.gid || g == qui.gid));
+            if qui.root() || (uid_permis && gid_permis) { Ok(()) } else { Err(Erreur::EPERM) }
+        }
+        Interne::ChangerTemps { objet, maintenant } => {
+            if proprietes(objet).immuable {
+                Err(Erreur::EPERM)
+            } else if proprietaire(objet) || (maintenant && droits(objet, ECRIRE)) {
+                Ok(())
+            } else if maintenant {
+                Err(Erreur::EACCES)
+            } else {
+                Err(Erreur::EPERM)
+            }
+        }
+        Interne::Tronquer { objet } => if droits(objet, ECRIRE) { Ok(()) } else { Err(Erreur::EACCES) },
     }
 }
 
@@ -635,68 +635,59 @@ mod tests {
     const DAVID: Identite = Identite { uid: 1000, gid: 1000 };
 
     /// Un /proc en miniature : self (lien vers le lecteur), sys/vm/valeur,
-    /// et le dossier du processus 2, à David, avec maps et exe.
+    /// et un dossier à David, avec un fichier.
     fn proc_() -> NoyauFs {
         let t = Temps::default();
         let mut p = NoyauFs::new(Genre::Proc, (0, 21), 0o555, t).unwrap();
-        p.ajouter(RACINE, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), false, t).unwrap();
-        let sys = p.ajouter(RACINE, b"sys", 0o555, (0, 0), Contenu::Dossier, false, t).unwrap();
-        let vm = p.ajouter(sys, b"vm", 0o555, (0, 0), Contenu::Dossier, false, t).unwrap();
-        p.ajouter(vm, b"valeur", 0o644, (0, 0), Contenu::Fichier { source: 3, argument: 0 }, false, t).unwrap();
-        let pid = p.ajouter(RACINE, b"2", 0o555, (1000, 1000), Contenu::Dossier, true, t).unwrap();
-        p.ajouter(pid, b"maps", 0o444, (1000, 1000), Contenu::Fichier { source: 1, argument: 2 }, true, t).unwrap();
-        p.ajouter(pid, b"exe", 0o777, (1000, 1000), Contenu::Lien(Cible::Fixe(b"/bin/x".to_vec())), true, t).unwrap();
+        p.ajouter(RACINE as u64, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), t).unwrap();
+        let sys = p.ajouter(RACINE as u64, b"sys", 0o555, (0, 0), Contenu::Dossier, t).unwrap();
+        let vm = p.ajouter(sys, b"vm", 0o555, (0, 0), Contenu::Dossier, t).unwrap();
+        p.ajouter(vm, b"valeur", 0o644, (0, 0), Contenu::Fichier { source: 3, argument: 0 }, t).unwrap();
+        let d = p.ajouter(RACINE as u64, b"d", 0o555, (1000, 1000), Contenu::Dossier, t).unwrap();
+        p.ajouter(d, b"f", 0o444, (1000, 1000), Contenu::Fichier { source: 1, argument: 2 }, t).unwrap();
         p
     }
 
     #[test]
     fn arborescence() {
         let mut p = proc_();
-        assert_eq!(p.attributs(RACINE).numero, Numero(1));
-        let deux = p.chercher(RACINE, b"2").unwrap();
-        let maps = p.chercher(deux, b"maps").unwrap();
-        assert_eq!(p.contenu(maps), Some((1, 2)));
-        assert_eq!(p.attributs(maps).taille, 0);
-        assert_eq!(p.attributs(maps).mode, S_IFREG | 0o444);
-        assert_eq!(p.attributs(maps).uid, 1000);
-        // La racine : deux liens, plus un par sous-dossier (sys, 2).
-        assert_eq!(p.attributs(RACINE).nlink, 4);
-        assert_eq!(p.parent(maps), deux);
-        assert_eq!(p.nom(maps), b"maps");
-        let soi = p.chercher(RACINE, b"self").unwrap();
-        assert_eq!(p.cible(soi, b"42", b"42/task/7"), b"42");
-        let exe = p.chercher(deux, b"exe").unwrap();
-        assert_eq!(p.cible(exe, b"42", b"42/task/7"), b"/bin/x");
-        let fil = p.ajouter(RACINE, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), false, Temps::default()).unwrap();
-        assert_eq!(p.cible(fil, b"42", b"42/task/7"), b"42/task/7");
-        p.retirer(fil);
-        assert_eq!(p.ajouter(deux, b"maps", 0o444, (0, 0), Contenu::Dossier, true, Temps::default()), Err(Erreur::EEXIST));
-        // Les entrées, dans l'ordre, avec des positions qui restent justes
-        // quand une entrée disparaît.
+        assert_eq!(p.attributs(u64::from(RACINE as u64)).numero, 1);
+        let d = p.chercher(RACINE as u64, b"d").unwrap();
+        let f = p.chercher(u64::from(d), b"f").unwrap();
+        assert_eq!(p.contenu(u64::from(f)), Some((1, 2)));
+        assert_eq!(p.attributs(u64::from(f)).taille, 0);
+        assert_eq!(p.attributs(u64::from(f)).mode, S_IFREG | 0o444);
+        assert_eq!(p.attributs(u64::from(f)).uid, 1000);
+        // La racine : deux liens, plus un par sous-dossier (sys, d).
+        assert_eq!(p.attributs(RACINE as u64).nlink, 4);
+        assert_eq!(p.parent(u64::from(f)), d);
+        assert_eq!(p.nom(u64::from(f)), b"f");
+        let soi = p.chercher(RACINE as u64, b"self").unwrap();
+        assert_eq!(p.cible(u64::from(soi), b"42", b"42/task/7"), b"42");
+        let fil = p.ajouter(RACINE as u64, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), Temps::default()).unwrap();
+        assert_eq!(p.cible(u64::from(fil), b"42", b"42/task/7"), b"42/task/7");
+        assert_eq!(p.ajouter(d, b"f", 0o444, (0, 0), Contenu::Dossier, Temps::default()), Err(Erreur::EEXIST));
+        // Les entrées, dans l'ordre de leurs numéros, et la position qui
+        // suit chacune.
         let mut vus = vec![];
-        p.lire_dossier(RACINE, 0, &mut |nom, _, _, suivante| {
+        p.lire_dossier(RACINE as u64, 0, &mut |nom, _, _, suivante| {
             vus.push((nom.to_vec(), suivante));
             true
         })
         .unwrap();
-        assert_eq!(vus.iter().map(|(n, _)| n.as_slice()).collect::<Vec<_>>(), [&b"."[..], b"..", b"self", b"sys", b"2"]);
-        let apres_sys = vus[3].1;
+        assert_eq!(vus.iter().map(|(n, _)| n.as_slice()).collect::<Vec<_>>(), [&b"."[..], b"..", b"self", b"sys", b"d", b"thread-self"]);
+        let apres_d = vus[4].1;
         let mut suite = vec![];
-        p.lire_dossier(RACINE, apres_sys, &mut |nom, _, _, _| {
+        p.lire_dossier(RACINE as u64, apres_d, &mut |nom, _, _, _| {
             suite.push(nom.to_vec());
             true
         })
         .unwrap();
-        assert_eq!(suite, [b"2".to_vec()]);
-        // Le processus se termine : son dossier et ce qu'il contient s'en
-        // vont.
-        p.retirer(deux);
-        assert_eq!(p.chercher(RACINE, b"2"), None);
-        assert_eq!(p.attributs(RACINE).nlink, 3);
+        assert_eq!(suite, [b"thread-self".to_vec()]);
         // Un système de sysfs : des fichiers d'une page.
         let mut s = NoyauFs::new(Genre::Sys, (0, 22), 0o555, Temps::default()).unwrap();
-        let f = s.ajouter(RACINE, b"online", 0o444, (0, 0), Contenu::Fichier { source: 9, argument: 0 }, false, Temps::default()).unwrap();
-        assert_eq!(s.attributs(f).taille, 4096);
+        let f = s.ajouter(RACINE as u64, b"online", 0o444, (0, 0), Contenu::Fichier { source: 9, argument: 0 }, Temps::default()).unwrap();
+        assert_eq!(s.attributs(u64::from(f)).taille, 4096);
         assert_eq!(s.taille_de_bloc(), 4096);
         assert_eq!(p.taille_de_bloc(), 1024);
     }
@@ -704,112 +695,114 @@ mod tests {
     #[test]
     fn refus() {
         let p = proc_();
-        let deux = p.chercher(RACINE, b"2").unwrap();
-        let maps = p.chercher(deux, b"maps").unwrap();
-        let sys = p.chercher(RACINE, b"sys").unwrap();
-        let vm = p.chercher(sys, b"vm").unwrap();
-        let valeur = p.chercher(vm, b"valeur").unwrap();
-        // Le tableau mesuré sous Linux 6.18, pour /proc/self/maps.
-        assert_eq!(p.refuser(DAVID, Interne::Creer { dossier: deux, ouvrir: false }), Err(Erreur::ENOENT));
-        assert_eq!(p.refuser(DAVID, Interne::Effacer { dossier: deux, objet: maps, rmdir: false }), Err(Erreur::EPERM));
-        assert_eq!(p.refuser(DAVID, Interne::Effacer { dossier: RACINE, objet: sys, rmdir: true }), Err(Erreur::EACCES));
-        assert_eq!(p.refuser(DAVID, Interne::Renommer { ancien: maps, nouveau: None }), Err(Erreur::ENOENT));
-        assert_eq!(p.refuser(DAVID, Interne::ChangerMode { objet: maps }), Err(Erreur::EPERM));
-        assert_eq!(p.refuser(DAVID, Interne::ChangerProprietaire { objet: maps, uid: Some(1000), gid: Some(1000) }), Ok(()));
-        assert_eq!(p.refuser(DAVID, Interne::ChangerProprietaire { objet: maps, uid: None, gid: None }), Ok(()));
-        assert_eq!(p.refuser(DAVID, Interne::ChangerProprietaire { objet: maps, uid: Some(0), gid: Some(0) }), Err(Erreur::EPERM));
-        assert_eq!(p.refuser(DAVID, Interne::ChangerTemps { objet: maps, maintenant: true }), Ok(()));
-        assert_eq!(p.refuser(DAVID, Interne::ChangerTemps { objet: maps, maintenant: false }), Ok(()));
+        let d = p.chercher(RACINE as u64, b"d").unwrap();
+        let f = p.chercher(u64::from(d), b"f").unwrap();
+        let sys = p.chercher(RACINE as u64, b"sys").unwrap();
+        let vm = p.chercher(u64::from(sys), b"vm").unwrap();
+        let valeur = p.chercher(u64::from(vm), b"valeur").unwrap();
+        // Le tableau mesuré sous Linux 6.18, pour /proc/self/maps, que
+        // fabrique le noyau (procfs.rs) : ses propriétés, et celles de son
+        // dossier, celui d'un processus (immuable, une écriture y est
+        // refusée avant les droits).
+        const PID: u64 = 100;
+        const MAPS: u64 = 101;
+        let fabriquees = |n: u64| match n {
+            PID => Proprietes { mode: S_IFDIR | 0o555, uid: 1000, gid: 1000, parent: RACINE as u64, processus: true, immuable: true, dans_proc_sys: false },
+            MAPS => Proprietes { mode: S_IFREG | 0o444, uid: 1000, gid: 1000, parent: PID, processus: true, immuable: false, dans_proc_sys: false },
+            n => p.proprietes(n),
+        };
+        let r = |qui, m| super::refus(Genre::Proc, qui, m, &fabriquees);
+        assert_eq!(r(DAVID, Interne::Creer { dossier: PID, ouvrir: false }), Err(Erreur::ENOENT));
+        assert_eq!(r(DAVID, Interne::Effacer { dossier: PID, objet: MAPS, rmdir: false }), Err(Erreur::EPERM));
+        assert_eq!(r(DAVID, Interne::Effacer { dossier: RACINE as u64, objet: sys, rmdir: true }), Err(Erreur::EACCES));
+        assert_eq!(r(DAVID, Interne::Renommer { ancien: MAPS, nouveau: None }), Err(Erreur::ENOENT));
+        assert_eq!(r(DAVID, Interne::ChangerMode { objet: MAPS }), Err(Erreur::EPERM));
+        assert_eq!(r(DAVID, Interne::ChangerProprietaire { objet: MAPS, uid: Some(1000), gid: Some(1000) }), Ok(()));
+        assert_eq!(r(DAVID, Interne::ChangerProprietaire { objet: MAPS, uid: None, gid: None }), Ok(()));
+        assert_eq!(r(DAVID, Interne::ChangerProprietaire { objet: MAPS, uid: Some(0), gid: Some(0) }), Err(Erreur::EPERM));
+        assert_eq!(r(DAVID, Interne::ChangerTemps { objet: MAPS, maintenant: true }), Ok(()));
+        assert_eq!(r(DAVID, Interne::ChangerTemps { objet: MAPS, maintenant: false }), Ok(()));
+        assert_eq!(r(DAVID, Interne::Tronquer { objet: MAPS }), Err(Erreur::EACCES));
+        assert_eq!(r(Identite::ROOT, Interne::ChangerProprietaire { objet: MAPS, uid: Some(0), gid: Some(0) }), Ok(()));
+        // Une entrée immuable : EPERM dès qu'un identifiant est donné, même
+        // le sien, et pour ses dates ; pour root aussi. Rien à changer
+        // (-1, -1) : 0.
+        for qui in [DAVID, Identite::ROOT] {
+            assert_eq!(r(qui, Interne::ChangerProprietaire { objet: PID, uid: Some(1000), gid: None }), Err(Erreur::EPERM));
+            assert_eq!(r(qui, Interne::ChangerProprietaire { objet: PID, uid: None, gid: Some(1000) }), Err(Erreur::EPERM));
+            assert_eq!(r(qui, Interne::ChangerTemps { objet: PID, maintenant: true }), Err(Erreur::EPERM));
+            assert_eq!(r(qui, Interne::ChangerTemps { objet: PID, maintenant: false }), Err(Erreur::EPERM));
+        }
+        assert_eq!(r(DAVID, Interne::ChangerProprietaire { objet: PID, uid: None, gid: None }), Ok(()));
+        // La partie fixe : ni dossier de processus ni immuable ; un dossier
+        // à David mais 0555 refuse d'effacer par les droits.
+        assert_eq!(p.refuser(DAVID, Interne::Effacer { dossier: d, objet: f, rmdir: false }), Err(Erreur::EACCES));
         assert_eq!(p.refuser(DAVID, Interne::ChangerTemps { objet: valeur, maintenant: true }), Err(Erreur::EACCES));
         assert_eq!(p.refuser(DAVID, Interne::ChangerTemps { objet: valeur, maintenant: false }), Err(Erreur::EPERM));
-        assert_eq!(p.refuser(DAVID, Interne::Tronquer { objet: maps }), Err(Erreur::EACCES));
         // sysfs : créer est refusé par les droits, puis par EPERM.
         let s = NoyauFs::new(Genre::Sys, (0, 22), 0o755, Temps::default()).unwrap();
-        assert_eq!(s.refuser(DAVID, Interne::Creer { dossier: RACINE, ouvrir: false }), Err(Erreur::EACCES));
-        assert_eq!(s.refuser(Identite::ROOT, Interne::Creer { dossier: RACINE, ouvrir: false }), Err(Erreur::EPERM));
+        assert_eq!(s.refuser(DAVID, Interne::Creer { dossier: RACINE as u64, ouvrir: false }), Err(Erreur::EACCES));
+        assert_eq!(s.refuser(Identite::ROOT, Interne::Creer { dossier: RACINE as u64, ouvrir: false }), Err(Erreur::EPERM));
         // open(O_CREAT), pour root : EACCES (`lookup_open`).
-        assert_eq!(s.refuser(Identite::ROOT, Interne::Creer { dossier: RACINE, ouvrir: true }), Err(Erreur::EACCES));
-        // Changer le propriétaire : root le peut ; le propriétaire peut
-        // donner le fichier à son propre groupe, pas à un autre.
-        assert_eq!(p.refuser(Identite::ROOT, Interne::ChangerProprietaire { objet: maps, uid: Some(0), gid: Some(0) }), Ok(()));
+        assert_eq!(s.refuser(Identite::ROOT, Interne::Creer { dossier: RACINE as u64, ouvrir: true }), Err(Erreur::EACCES));
+        // Changer le propriétaire : le propriétaire peut donner le fichier
+        // à son propre groupe, pas à un autre.
         let mut q = proc_();
         let t = Temps::default();
-        let a_lui = q.ajouter(RACINE, b"a-lui", 0o666, (1000, 0), Contenu::Fichier { source: 5, argument: 0 }, false, t).unwrap();
-        let a_root = q.ajouter(RACINE, b"a-root", 0o666, (0, 0), Contenu::Fichier { source: 5, argument: 0 }, false, t).unwrap();
+        let a_lui = q.ajouter(RACINE as u64, b"a-lui", 0o666, (1000, 0), Contenu::Fichier { source: 5, argument: 0 }, t).unwrap();
+        let a_root = q.ajouter(RACINE as u64, b"a-root", 0o666, (0, 0), Contenu::Fichier { source: 5, argument: 0 }, t).unwrap();
         assert_eq!(q.refuser(DAVID, Interne::ChangerProprietaire { objet: a_lui, uid: None, gid: Some(1000) }), Ok(()));
         assert_eq!(q.refuser(DAVID, Interne::ChangerProprietaire { objet: a_lui, uid: None, gid: Some(5) }), Err(Erreur::EPERM));
         // Qui peut écrire sans être le propriétaire : les dates à
         // maintenant, pas d'autres.
         assert_eq!(q.refuser(DAVID, Interne::ChangerTemps { objet: a_root, maintenant: true }), Ok(()));
         assert_eq!(q.refuser(DAVID, Interne::ChangerTemps { objet: a_root, maintenant: false }), Err(Erreur::EPERM));
-        // Le dossier d'un processus est immuable : EPERM dès qu'un
-        // identifiant est donné, même le sien, et pour ses dates ; pour
-        // root aussi. Rien à changer (-1, -1) : 0.
-        for qui in [DAVID, Identite::ROOT] {
-            assert_eq!(p.refuser(qui, Interne::ChangerProprietaire { objet: deux, uid: Some(1000), gid: None }), Err(Erreur::EPERM));
-            assert_eq!(p.refuser(qui, Interne::ChangerProprietaire { objet: deux, uid: None, gid: Some(1000) }), Err(Erreur::EPERM));
-            assert_eq!(p.refuser(qui, Interne::ChangerTemps { objet: deux, maintenant: true }), Err(Erreur::EPERM));
-            assert_eq!(p.refuser(qui, Interne::ChangerTemps { objet: deux, maintenant: false }), Err(Erreur::EPERM));
-        }
-        assert_eq!(p.refuser(DAVID, Interne::ChangerProprietaire { objet: deux, uid: None, gid: None }), Ok(()));
         // /proc/sys : pas de changement de propriétaire, pour root non plus.
         assert_eq!(p.refuser(Identite::ROOT, Interne::ChangerProprietaire { objet: valeur, uid: Some(0), gid: None }), Err(Erreur::EPERM));
         assert_eq!(p.refuser(Identite::ROOT, Interne::ChangerProprietaire { objet: valeur, uid: None, gid: None }), Ok(()));
     }
 
     #[test]
-    fn numeros_et_disparitions() {
-        let mut p = proc_();
+    fn numeros() {
+        let p = proc_();
         let t = Temps::default();
-        let deux = p.chercher(RACINE, b"2").unwrap();
-        let maps = p.chercher(deux, b"maps").unwrap();
-        let exe = p.chercher(deux, b"exe").unwrap();
-        let sys = p.chercher(RACINE, b"sys").unwrap();
-        let vm = p.chercher(sys, b"vm").unwrap();
-        let avant = p.entrees.len();
+        let d = p.chercher(RACINE as u64, b"d").unwrap();
+        let f = p.chercher(u64::from(d), b"f").unwrap();
+        let soi = p.chercher(RACINE as u64, b"self").unwrap();
+        let sys = p.chercher(RACINE as u64, b"sys").unwrap();
+        let vm = p.chercher(u64::from(sys), b"vm").unwrap();
         // « . » et « .. » : leurs inodes, et la position suivante ; une
         // lecture reprise à la position 1 commence par « .. ».
         let mut vus = vec![];
-        p.lire_dossier(deux, 0, &mut |nom, n, _, suivante| {
+        p.lire_dossier(u64::from(d), 0, &mut |nom, n, _, suivante| {
             vus.push((nom.to_vec(), n, suivante));
             vus.len() < 2
         })
         .unwrap();
-        assert_eq!(vus, [(b".".to_vec(), deux as u64, 1), (b"..".to_vec(), RACINE as u64, 2)]);
+        assert_eq!(vus, [(b".".to_vec(), d as u64, 1), (b"..".to_vec(), RACINE as u64, 2)]);
         let mut premier = None;
-        p.lire_dossier(deux, 1, &mut |nom, _, _, _| {
+        p.lire_dossier(u64::from(d), 1, &mut |nom, _, _, _| {
             premier = Some(nom.to_vec());
             false
         })
         .unwrap();
         assert_eq!(premier, Some(b"..".to_vec()));
-        assert_eq!(p.lire_dossier(maps, 0, &mut |_, _, _, _| true), Err(Erreur::ENOTDIR));
+        assert_eq!(p.lire_dossier(u64::from(f), 0, &mut |_, _, _, _| true), Err(Erreur::ENOTDIR));
         // Un lien annonce une taille nulle ; les dossiers de /proc/sys, un
         // seul lien.
-        assert_eq!(p.attributs(exe).taille, 0);
-        assert_eq!((p.attributs(sys).nlink, p.attributs(vm).nlink), (1, 1));
+        assert_eq!(p.attributs(u64::from(soi)).taille, 0);
+        assert_eq!((p.attributs(u64::from(sys)).nlink, p.attributs(u64::from(vm)).nlink), (1, 1));
         // Un parent qui n'existe pas, ou qui n'est pas un dossier.
-        assert_eq!(p.ajouter(77, b"x", 0o444, (0, 0), Contenu::Dossier, false, t), Err(Erreur::ENOENT));
-        assert_eq!(p.ajouter(maps, b"x", 0o444, (0, 0), Contenu::Dossier, false, t), Err(Erreur::ENOTDIR));
-        // Retirer le dossier d'un processus emporte tout ce qu'il contient,
-        // et la table revient à sa taille.
-        p.retirer(deux);
-        assert_eq!(p.entrees.len(), avant - 3);
-        for n in [deux, maps, exe] {
+        let mut q = proc_();
+        assert_eq!(q.ajouter(77, b"x", 0o444, (0, 0), Contenu::Dossier, t), Err(Erreur::ENOENT));
+        assert_eq!(q.ajouter(f, b"x", 0o444, (0, 0), Contenu::Dossier, t), Err(Erreur::ENOTDIR));
+        // Un numéro absent (au-delà de 32 bits, ou jamais donné) : une
+        // entrée vide, rien à lister.
+        for n in [77, 1 << 40] {
             assert_eq!(p.attributs(n).nlink, 0);
             assert_eq!(p.contenu(n), None);
+            assert_eq!(p.lire_dossier(n, 0, &mut |_, _, _, _| true), Err(Erreur::ENOENT));
         }
-        assert_eq!(p.lire_dossier(deux, 0, &mut |_, _, _, _| true), Err(Erreur::ENOENT));
-        // Un numéro n'est jamais repris : celui de l'ancien maps ne désigne
-        // pas le statm du processus suivant.
-        let trois = p.ajouter(RACINE, b"3", 0o555, (1000, 1000), Contenu::Dossier, true, t).unwrap();
-        let statm = p.ajouter(trois, b"statm", 0o444, (1000, 1000), Contenu::Fichier { source: 2, argument: 3 }, true, t).unwrap();
-        assert!(trois > exe && statm > trois);
-        assert_eq!(p.contenu(maps), None);
-        assert_eq!(p.contenu(statm), Some((2, 3)));
-        // La racine ne se retire pas.
-        p.retirer(RACINE);
-        assert_eq!(p.attributs(RACINE).nlink, 4);
     }
 
     /// Un producteur de trois enregistrements, « a\n », « bbb\n », « cc\n »,

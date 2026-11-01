@@ -34,7 +34,8 @@
 //! au tas, faillible), comme le `nd->stack` de Linux. La pile du noyau ne
 //! fait que 16 Kio, et 40 liens imbriqués y tiendraient mal. Les contenus
 //! des liens ne sont pas copiés : la résolution les lit en place, dans
-//! l'arbre, qu'elle ne modifie pas.
+//! l'arbre, qu'elle ne modifie pas, ou garde le texte que le système
+//! fabrique pour l'occasion (`Texte`, le temps du lien).
 //!
 //! Une option pour WASI : la résolution « sous » le dossier de départ (le
 //! RESOLVE_BENEATH d'`openat2`) refuse tout ce qui en sortirait, un « .. »
@@ -52,6 +53,60 @@ pub const NAME_MAX: usize = 255;
 /// Le plus de liens symboliques suivis pour un chemin (MAXSYMLINKS).
 pub const LIENS_MAX: u32 = 40;
 
+/// Un texte que rend un système de fichiers (un nom, la cible d'un lien) :
+/// le sien, emprunté ; ou fabriqué pour l'occasion, comme /proc fabrique le
+/// numéro d'un processus, ou la cible d'un lien vers un fichier ouvert.
+/// Option écartée : un `&[u8]` toujours emprunté, ce qu'il était jusqu'en 6f
+/// ; mais /proc n'a plus d'entrées gardées où les emprunter.
+pub enum Texte<'a> {
+    Emprunte(&'a [u8]),
+    /// Un nombre en décimal, sans allocation.
+    Court([u8; 20], u8),
+    Long(Vec<u8>),
+}
+
+impl Texte<'_> {
+    /// `n` en décimal.
+    pub fn nombre(mut n: u64) -> Texte<'static> {
+        let mut t = [0u8; 20];
+        let mut i = t.len();
+        loop {
+            i -= 1;
+            t[i] = b'0' + (n % 10) as u8;
+            n /= 10;
+            if n == 0 {
+                break;
+            }
+        }
+        let l = t.len() - i;
+        t.copy_within(i.., 0);
+        Texte::Court(t, l as u8)
+    }
+}
+
+impl core::fmt::Debug for Texte<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self, f)
+    }
+}
+
+impl<const N: usize> PartialEq<&[u8; N]> for Texte<'_> {
+    fn eq(&self, autre: &&[u8; N]) -> bool {
+        **self == autre[..]
+    }
+}
+
+impl core::ops::Deref for Texte<'_> {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Texte::Emprunte(t) => t,
+            Texte::Court(t, l) => &t[..*l as usize],
+            Texte::Long(v) => v,
+        }
+    }
+}
+
 /// Ce que la résolution doit savoir d'un système de fichiers (le
 /// `inode_operations->lookup` de Linux, et un peu plus).
 pub trait Arbre {
@@ -67,7 +122,7 @@ pub trait Arbre {
     /// Le parent du dossier (la racine est son propre parent).
     fn parent(&self, dossier: Self::Objet) -> Self::Objet;
     /// Le contenu du lien symbolique `lien`.
-    fn cible(&self, lien: Self::Objet) -> &[u8];
+    fn cible(&self, lien: Self::Objet) -> Texte<'_>;
 }
 
 /// D'où part la résolution, et pour qui.
@@ -132,7 +187,7 @@ pub struct Fin<O> {
 /// Un morceau de chemin en cours de lecture : le chemin donné, ou le
 /// contenu d'un lien qu'on suit.
 struct Morceau<'a> {
-    texte: &'a [u8],
+    texte: Texte<'a>,
     position: usize,
     /// Le lien dont c'est le contenu était le dernier composant, suivi d'une
     /// barre : le dernier composant de ce contenu en hérite.
@@ -184,7 +239,7 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
     };
     let mut pile: Vec<Morceau<'a>> = Vec::new();
     pile.try_reserve(4).map_err(|_| Erreur::ENOMEM)?;
-    pile.push(Morceau { texte: chemin, position: 0, barre: false });
+    pile.push(Morceau { texte: Texte::Emprunte(chemin), position: 0, barre: false });
     let mut liens = 0u32;
     loop {
         // Les morceaux finis (des barres, puis rien) cèdent la place à
@@ -205,9 +260,13 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
         let m = &mut pile[haut];
         let debut = m.position;
         let fin = m.texte[debut..].iter().position(|&o| o == b'/').map_or(m.texte.len(), |p| debut + p);
-        let texte = m.texte;
-        let nom = &texte[debut..fin];
-        let barre_ici = fin < texte.len();
+        // Le nom, copié : le morceau peut être un texte fabriqué, que la
+        // pile rendra si un lien la fait grandir.
+        let longueur = fin - debut;
+        let mut tampon = [0u8; NAME_MAX];
+        tampon[..longueur.min(NAME_MAX)].copy_from_slice(&m.texte[debut..debut + longueur.min(NAME_MAX)]);
+        let nom = &tampon[..longueur.min(NAME_MAX)];
+        let barre_ici = fin < m.texte.len();
         m.position = fin;
         m.sauter_barres();
         let barre_heritee = m.barre;
@@ -220,7 +279,7 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
         if !permis(arbre.mode(courant), uid, gid, depart.qui, EXECUTER) {
             return Err(Erreur::EACCES);
         }
-        if nom.len() > NAME_MAX {
+        if longueur > NAME_MAX {
             return Err(Erreur::ENAMETOOLONG);
         }
         if nom == b"." {
@@ -332,8 +391,8 @@ mod tests {
         fn parent(&self, dossier: usize) -> usize {
             self.0[dossier].1
         }
-        fn cible(&self, lien: usize) -> &[u8] {
-            self.0[lien].3
+        fn cible(&self, lien: usize) -> Texte<'_> {
+            Texte::Emprunte(self.0[lien].3)
         }
     }
 

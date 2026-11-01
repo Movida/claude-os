@@ -29,7 +29,7 @@
 //! courant dans /proc le contourneraient). Et le disque de 6l se montera de
 //! la même façon.
 
-use crate::chemins::{Arbre, Dernier, Fin, PATH_MAX};
+use crate::chemins::{Arbre, Dernier, Fin, PATH_MAX, Texte};
 use crate::tmpfs::{Attributs, Numero, RENAME_EXCHANGE, RENAME_NOREPLACE, Tmpfs};
 use crate::{Erreur, Identite, S_IFDIR, S_IFMT, S_IFREG};
 use alloc::vec::Vec;
@@ -47,7 +47,7 @@ pub struct Systeme(pub u8);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Objet {
     Tmpfs(Numero),
-    Monte(Systeme, u32),
+    Monte(Systeme, u64),
     Anonyme,
 }
 
@@ -56,7 +56,7 @@ pub enum Objet {
 /// lien, une taille nulle. Le même pour tous les fichiers qui le
 /// tiennent : un eventfd et un epoll ont le même numéro d'inode.
 pub const ANONYME: Attributs = Attributs {
-    numero: Numero(1),
+    numero: 1,
     mode: 0o600,
     nlink: 1,
     uid: 0,
@@ -99,9 +99,10 @@ impl Objet {
 
 /// Ce qu'on demande à un système monté (un peu des `inode_operations` et
 /// des `file_operations` de Linux) : ses inodes sont numérotés par des
-/// `u32`, sa racine est l'un d'eux.
+/// `u64` (depuis 6f : /proc fabrique ses numéros à la demande, et y met le
+/// processus, le fil et l'entrée), sa racine est l'un d'eux.
 pub trait Monte {
-    fn racine(&self) -> u32;
+    fn racine(&self) -> u64;
     /// Son périphérique (majeur, mineur), le `st_dev` de ses inodes : un
     /// numéro anonyme, comme Linux en donne à procfs et sysfs.
     fn peripherique(&self) -> (u32, u32);
@@ -110,26 +111,26 @@ pub trait Monte {
     /// pourquoi la glibc lit /proc/self/maps par tranches de 1024 octets.
     fn taille_de_bloc(&self) -> u64;
     /// Ce que dit `stat` de l'inode `n` (son champ `numero` est `n`).
-    fn attributs(&self, n: u32) -> Attributs;
+    fn attributs(&self, n: u64) -> Attributs;
     /// Ce que désigne `nom` dans le dossier `dossier`.
-    fn chercher(&self, dossier: u32, nom: &[u8]) -> Option<u32>;
+    fn chercher(&self, dossier: u64, nom: &[u8]) -> Option<u64>;
     /// Le parent du dossier (la racine est son propre parent).
-    fn parent(&self, n: u32) -> u32;
+    fn parent(&self, n: u64) -> u64;
     /// Le nom de `n` dans son parent (vide pour la racine).
-    fn nom(&self, n: u32) -> &[u8];
+    fn nom(&self, n: u64) -> Texte<'_>;
     /// Le contenu du lien `lien`, pour le lecteur dont le numéro de
     /// processus s'écrit `lecteur`, et le chemin de son fil (dans /proc)
     /// `fil` : /proc/self et /proc/thread-self dépendent de qui les lit.
-    fn cible<'a>(&'a self, lien: u32, lecteur: &'a [u8], fil: &'a [u8]) -> &'a [u8];
+    fn cible<'a>(&'a self, lien: u64, lecteur: &'a [u8], fil: &'a [u8]) -> Texte<'a>;
     /// Les entrées du dossier à partir de `position`, comme
     /// `Tmpfs::lire_dossier` : `entree(nom, inode, type, position suivante)`
     /// tant qu'elle rend vrai.
-    fn lire_dossier(&self, dossier: u32, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
+    fn lire_dossier(&self, dossier: u64, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
         -> Result<(), Erreur>;
     /// D'où vient le contenu du fichier `n` (une source et son argument,
     /// que le noyau sait fabriquer : noyaufs.rs), None pour ce qui n'est pas
     /// un fichier.
-    fn contenu(&self, n: u32) -> Option<(u32, u32)>;
+    fn contenu(&self, n: u64) -> Option<(u32, u32)>;
     /// Ce que ce système répond à une modification de son arborescence ou
     /// de ses inodes, qui y reste entièrement (ce qui en sort a déjà été
     /// refusé par la `Vue`). Rien ne s'y modifie : c'est une erreur, qui
@@ -146,22 +147,22 @@ pub enum Interne {
     /// sinon mkdir, symlink, mknod, le nouveau nom de link ou de rename :
     /// Linux ne répond pas la même chose, `lookup_open` rendant EACCES là
     /// où `vfs_mkdir` et les autres rendent EPERM).
-    Creer { dossier: u32, ouvrir: bool },
+    Creer { dossier: u64, ouvrir: bool },
     /// Effacer `objet` de `dossier` (unlink, ou rmdir si `rmdir`).
-    Effacer { dossier: u32, objet: u32, rmdir: bool },
+    Effacer { dossier: u64, objet: u64, rmdir: bool },
     /// Renommer, dans le même système ; `nouveau` existe peut-être.
-    Renommer { ancien: u32, nouveau: Option<u32> },
+    Renommer { ancien: u64, nouveau: Option<u64> },
     /// Un lien physique vers `source`, dans le même système.
-    Lier { source: u32 },
-    ChangerMode { objet: u32 },
+    Lier { source: u64 },
+    ChangerMode { objet: u64 },
     /// `uid` et `gid` : None pour « sans changement ».
-    ChangerProprietaire { objet: u32, uid: Option<u32>, gid: Option<u32> },
+    ChangerProprietaire { objet: u64, uid: Option<u32>, gid: Option<u32> },
     /// `maintenant` : les deux dates à maintenant (un pointeur nul, ou
     /// UTIME_NOW), qui demande seulement le droit d'écrire ; sinon des
     /// dates données, qui demandent d'être le propriétaire.
-    ChangerTemps { objet: u32, maintenant: bool },
+    ChangerTemps { objet: u64, maintenant: bool },
     /// truncate.
-    Tronquer { objet: u32 },
+    Tronquer { objet: u64 },
 }
 
 /// Ce qu'on crée : la couche commune ne répond pas de même à une barre
@@ -279,7 +280,7 @@ impl<'a, M: Monte> Vue<'a, M> {
         let m = self.monte(s);
         let mut chemin = self.fs.chemin(self.point(s))?;
         // Les noms, du bas vers le haut, puis retournés.
-        let mut noms: Vec<&[u8]> = Vec::new();
+        let mut noms: Vec<Texte> = Vec::new();
         let mut longueur = chemin.len();
         while n != m.racine() {
             longueur += m.nom(n).len() + 1;
@@ -557,7 +558,7 @@ impl<'a, M: Monte> Vue<'a, M> {
         Err(Erreur::EBUSY)
     }
 
-    fn interne(&self, qui: Identite, o: Objet, m: impl FnOnce(u32) -> Interne) -> Result<(), Erreur> {
+    fn interne(&self, qui: Identite, o: Objet, m: impl FnOnce(u64) -> Interne) -> Result<(), Erreur> {
         match o {
             Objet::Monte(s, n) => self.monte(s).refuser(qui, m(n)),
             // L'inode anonyme : Linux 6.18 refuse d'en changer les
@@ -638,11 +639,11 @@ impl<M: Monte> Arbre for Vue<'_, M> {
         }
     }
 
-    fn cible(&self, lien: Objet) -> &[u8] {
+    fn cible(&self, lien: Objet) -> Texte<'_> {
         match lien {
             Objet::Tmpfs(n) => <Tmpfs as Arbre>::cible(self.fs, n),
             Objet::Monte(s, n) => self.monte(s).cible(n, self.lecteur, self.fil),
-            Objet::Anonyme => &[],
+            Objet::Anonyme => Texte::Emprunte(&[]),
         }
     }
 }
@@ -664,9 +665,9 @@ mod tests {
     /// contient un fichier « f » (2), et un lien « soi » (3) vers le lecteur.
     struct Petit;
     const NOMS: [&[u8]; 4] = [b"", b"d", b"f", b"soi"];
-    const PARENTS: [u32; 4] = [0, 0, 1, 0];
+    const PARENTS: [u64; 4] = [0, 0, 1, 0];
     impl Monte for Petit {
-        fn racine(&self) -> u32 {
+        fn racine(&self) -> u64 {
             0
         }
         fn peripherique(&self) -> (u32, u32) {
@@ -675,14 +676,14 @@ mod tests {
         fn taille_de_bloc(&self) -> u64 {
             1024
         }
-        fn attributs(&self, n: u32) -> Attributs {
+        fn attributs(&self, n: u64) -> Attributs {
             let mode = match n {
                 0 | 1 => S_IFDIR | 0o555,
                 2 => S_IFREG | 0o444,
                 _ => S_IFLNK | 0o777,
             };
             Attributs {
-                numero: Numero(n),
+                numero: n,
                 mode,
                 nlink: 1,
                 uid: 0,
@@ -695,28 +696,28 @@ mod tests {
                 ctime: Temps::default(),
             }
         }
-        fn chercher(&self, dossier: u32, nom: &[u8]) -> Option<u32> {
+        fn chercher(&self, dossier: u64, nom: &[u8]) -> Option<u64> {
             (0..4).find(|&n| n != 0 && PARENTS[n as usize] == dossier && NOMS[n as usize] == nom)
         }
-        fn parent(&self, n: u32) -> u32 {
+        fn parent(&self, n: u64) -> u64 {
             PARENTS[n as usize]
         }
-        fn nom(&self, n: u32) -> &[u8] {
-            NOMS[n as usize]
+        fn nom(&self, n: u64) -> Texte<'_> {
+            Texte::Emprunte(NOMS[n as usize])
         }
-        fn cible<'a>(&'a self, _: u32, lecteur: &'a [u8], _: &'a [u8]) -> &'a [u8] {
-            lecteur
+        fn cible<'a>(&'a self, _: u64, lecteur: &'a [u8], _: &'a [u8]) -> Texte<'a> {
+            Texte::Emprunte(lecteur)
         }
-        fn lire_dossier(&self, dossier: u32, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
+        fn lire_dossier(&self, dossier: u64, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
             -> Result<(), Erreur> {
-            for n in 1..4u32 {
-                if PARENTS[n as usize] == dossier && n as u64 > position && !entree(NOMS[n as usize], n as u64, 0, n as u64) {
+            for n in 1..4u64 {
+                if PARENTS[n as usize] == dossier && n > position && !entree(NOMS[n as usize], n, 0, n) {
                     break;
                 }
             }
             Ok(())
         }
-        fn contenu(&self, n: u32) -> Option<(u32, u32)> {
+        fn contenu(&self, n: u64) -> Option<(u32, u32)> {
             (n == 2).then_some((7, 0))
         }
         fn refuser(&self, _: Identite, m: Interne) -> Result<(), Erreur> {

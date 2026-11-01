@@ -38,18 +38,18 @@ const PERIPHERIQUE: (u32, u32) = (0, 22);
 pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     let mut s = NoyauFs::new(Genre::Sys, PERIPHERIQUE, 0o555, maintenant)?;
     let racine = s.racine();
-    let dossier = |s: &mut NoyauFs, parent, nom: &[u8]| s.ajouter(parent, nom, 0o755, (0, 0), Contenu::Dossier, false, maintenant);
+    let dossier = |s: &mut NoyauFs, parent, nom: &[u8]| s.ajouter(parent, nom, 0o755, (0, 0), Contenu::Dossier, maintenant);
     let attribut = |source| Contenu::Fichier { source, argument: 0 };
     let devices = dossier(&mut s, racine, b"devices")?;
     let system = dossier(&mut s, devices, b"system")?;
     let cpu = dossier(&mut s, system, b"cpu")?;
-    s.ajouter(cpu, b"online", 0o444, (0, 0), attribut(CPU_ONLINE), false, maintenant)?;
-    s.ajouter(cpu, b"possible", 0o444, (0, 0), attribut(CPU_POSSIBLE), false, maintenant)?;
-    s.ajouter(cpu, b"present", 0o444, (0, 0), attribut(CPU_PRESENT), false, maintenant)?;
+    s.ajouter(cpu, b"online", 0o444, (0, 0), attribut(CPU_ONLINE), maintenant)?;
+    s.ajouter(cpu, b"possible", 0o444, (0, 0), attribut(CPU_POSSIBLE), maintenant)?;
+    s.ajouter(cpu, b"present", 0o444, (0, 0), attribut(CPU_PRESENT), maintenant)?;
     let kernel = dossier(&mut s, racine, b"kernel")?;
     let mm = dossier(&mut s, kernel, b"mm")?;
     let thp = dossier(&mut s, mm, b"transparent_hugepage")?;
-    s.ajouter(thp, b"enabled", 0o644, (0, 0), attribut(THP_ENABLED), false, maintenant)?;
+    s.ajouter(thp, b"enabled", 0o644, (0, 0), attribut(THP_ENABLED), maintenant)?;
     Ok(s)
 }
 

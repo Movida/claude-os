@@ -862,8 +862,6 @@ pub fn lancer_fil(n: NouveauFil) -> Result<u32, i64> {
     if n.parent_tid != 0 {
         let _ = crate::copie_utilisateur::copier_vers_utilisateur(n.parent_tid, &tid.to_le_bytes());
     }
-    let proprietaire = processus::avec(|p| (p.identite.uid, p.identite.gid));
-    crate::procfs::ajouter_fil(processus.pid(), tid, proprietaire);
     demarrer(&t);
     Ok(tid)
 }
@@ -984,11 +982,6 @@ pub fn terminer(code: i32) -> ! {
         }
         p.usage().garder(&t.usage);
         p.fil_termine(t.tid, code);
-        // Son dossier de /proc/<pid>/task ; celui du fil principal reste
-        // jusqu'à ce que le processus soit recueilli (procfs.rs).
-        if t.tid != p.pid() {
-            crate::procfs::retirer_fil(p.pid(), t.tid);
-        }
     }
     cpu::couper_interruptions();
     t.morte.store(true, Ordering::Relaxed);
