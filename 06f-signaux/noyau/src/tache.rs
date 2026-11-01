@@ -254,6 +254,9 @@ pub struct Tache {
     /// par kill : ce sont ceux de la dernière exception, pas du signal
     /// (mesuré).
     exception: [AtomicU64; 3],
+    /// Ce que reprendra `restart_syscall` (le `restart_block` de Linux,
+    /// reprise.rs).
+    reprise: Verrou<Option<crate::reprise::Reprise>>,
 }
 
 /// Ce qu'un programme a de plus qu'une tâche du noyau.
@@ -338,6 +341,7 @@ impl Tache {
             usage: crate::rusage::Compteurs::default(),
             precedent: crate::rusage::Precedent::new(),
             exception: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            reprise: Verrou::new(None),
         });
         Some(t)
     }
@@ -484,6 +488,16 @@ impl Tache {
         &self.precedent
     }
 
+    /// Garde ce que reprendra `restart_syscall` (None : rien, rt_sigreturn).
+    pub fn garder_reprise(&self, r: Option<crate::reprise::Reprise>) {
+        *self.reprise.verrouiller() = r;
+    }
+
+    /// Prend ce que reprendra `restart_syscall`.
+    pub fn prendre_reprise(&self) -> Option<crate::reprise::Reprise> {
+        self.reprise.verrouiller().take()
+    }
+
     /// Sa dernière exception : (vecteur, code d'erreur, adresse fautive).
     pub fn derniere_exception(&self) -> (u64, u64, u64) {
         (self.exception[0].load(Ordering::Relaxed), self.exception[1].load(Ordering::Relaxed),
@@ -548,6 +562,7 @@ pub fn initialiser() {
         usage: crate::rusage::Compteurs::default(),
         precedent: crate::rusage::Precedent::new(),
         exception: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+        reprise: Verrou::new(None),
     };
     let t = Arc::into_raw(Arc::new(pile_demarrage)) as *mut Tache;
     INACTIVE.store(t, Ordering::Relaxed);
@@ -595,7 +610,8 @@ pub enum Reveil {
     Reveillee = 1,
     /// Son échéance est passée.
     Echeance = 2,
-    /// Un signal (elle dormait interruptible) : l'appel rendra EINTR.
+    /// Un signal (elle dormait interruptible) : l'appel rendra EINTR, ou
+    /// sera refait (reprise.rs).
     Signal = 3,
 }
 
@@ -1249,12 +1265,20 @@ pub fn verifier_au_retour(cadre: &mut Cadre) {
         match decider() {
             Some(Arret::Gestionnaire { sig, info, action, masque, pile }) => {
                 // Le cadre s'écrit dans la mémoire du programme :
-                // interruptions actives, aucun verrou tenu.
+                // interruptions actives, aucun verrou tenu. D'abord, l'appel
+                // interrompu rendra EINTR, ou sera refait après le
+                // gestionnaire (reprise.rs).
                 cpu::activer_interruptions();
+                crate::reprise::avant_gestionnaire(cadre, action.drapeaux & signaux::SA_RESTART != 0);
                 livrer(cadre, sig, &info, &action, masque, pile);
             }
             Some(arret) => break arret,
-            None => return,
+            None => {
+                // Plus rien à livrer : un appel interrompu sans qu'un
+                // gestionnaire soit appelé est refait.
+                crate::reprise::sans_gestionnaire(cadre);
+                return;
+            }
         }
     };
     // Le verrou du processus est rendu, les interruptions reviennent :

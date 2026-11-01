@@ -57,6 +57,7 @@ mod port;
 mod procfs;
 mod processus;
 mod programmes;
+mod reprise;
 mod rusage;
 mod serie;
 mod signaux;

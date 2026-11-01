@@ -518,7 +518,8 @@ pub enum Livraison {
 ///      information »). SIGKILL n'en garde pas (il tue, sans gestionnaire) ;
 ///   4. le signal en attente, et le fil qui le prendra (`complete_signal`).
 /// Rend le fil à réveiller, s'il y en a un (son appel en cours, s'il dort
-/// interruptible, rendra EINTR) : à faire hors du verrou du processus
+/// interruptible, rendra EINTR ou sera refait) : à faire hors du verrou du
+/// processus
 /// (`reveiller`).
 pub fn envoyer(p: &mut Processus, sig: u64, a: Destinataire, info: Info, speciale: bool)
     -> Result<Option<Arc<Tache>>, i64> {
@@ -647,6 +648,7 @@ pub fn a_livrer(p: &mut Processus, tid: u32) -> Option<Livraison> {
 pub const SA_SIGINFO: u64 = 0x4;
 pub const SA_RESTORER: u64 = 0x0400_0000;
 pub const SA_ONSTACK: u64 = 0x0800_0000;
+pub const SA_RESTART: u64 = 0x1000_0000;
 pub const SA_NODEFER: u64 = 0x4000_0000;
 pub const SA_RESETHAND: u64 = 0x8000_0000;
 
@@ -931,7 +933,8 @@ pub fn sigaltstack(nouvelle: u64, ancienne: u64, sp: u64) -> i64 {
 /// permission est toujours accordée. Un zombie ne reçoit plus rien (0, comme
 /// Linux). Le fil qui le prendra, s'il ne le bloque pas, est réveillé s'il
 /// dort interruptible (le `signal_wake_up` de Linux) : son appel rend
-/// EINTR, et le signal est livré à son retour vers l'anneau 3.
+/// EINTR ou sera refait (reprise.rs), et le signal est livré à son retour
+/// vers l'anneau 3.
 fn envoyer_a(pid: u32, sig: u64, a: Destinataire, info: Info) -> i64 {
     if !processus::existe(pid) {
         return -ESRCH;

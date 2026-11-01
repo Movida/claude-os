@@ -22,7 +22,8 @@
 //! ait été réveillée par un WAKE se décide par là : retirée de la file par
 //! le réveilleur, elle rend 0, même si son échéance ou un signal sont
 //! arrivés aussi ; encore dans la file, elle s'en retire elle-même et rend
-//! ETIMEDOUT ou EINTR (`futex_unqueue`). Sinon, un WAKE compté (et rendu à
+//! ETIMEDOUT, ou un code de reprise pour un signal (EINTR, ou refaite :
+//! reprise.rs ; `futex_unqueue`). Sinon, un WAKE compté (et rendu à
 //! qui réveille) serait perdu : une condition de la glibc ne se réveillerait
 //! plus. Relire l'entier sous un verrou demande une lecture qui ne SERT
 //! PAS une faute de page (servir prend le verrou du processus, et attendra
@@ -50,7 +51,6 @@ const EINVAL: i64 = 22;
 const EAGAIN: i64 = 11;
 const ENOSYS: i64 = 38;
 const ETIMEDOUT: i64 = 110;
-const EINTR: i64 = 4;
 
 const FUTEX_WAIT: u32 = 0;
 const FUTEX_WAKE: u32 = 1;
@@ -230,6 +230,7 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
         Ok(c) => c,
         Err(e) => return e,
     };
+    let echeance_gardee = echeance;
     let echeance = echeance.map(Echeance::en_monotone);
     let interruptions = cpu::couper_interruptions();
     let r = loop {
@@ -269,7 +270,22 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
         }
         match reveil {
             Reveil::Echeance => break -ETIMEDOUT,
-            Reveil::Signal => break -EINTR,
+            // Un signal : sans délai, l'attente se refait d'elle-même
+            // (ERESTARTSYS) ; avec, elle est gardée pour restart_syscall,
+            // jusqu'à la même échéance (ERESTART_RESTARTBLOCK,
+            // `futex_wait_restart` ; EINTR si un gestionnaire est appelé,
+            // même avec SA_RESTART, mesuré).
+            Reveil::Signal => match echeance_gardee {
+                None => break -crate::reprise::ERESTARTSYS,
+                Some(e) => {
+                    let (reelle, echeance) = match e {
+                        Echeance::Monotone(n) => (false, n),
+                        Echeance::Reelle(n) => (true, n),
+                    };
+                    crate::reprise::garder(crate::reprise::Reprise::Futex { adresse, partage, val, reelle, echeance, bitset });
+                    break -crate::reprise::ERESTART_RESTARTBLOCK;
+                }
+            },
             // Réveillée sans être retirée (personne ne le fait) : se rendort.
             Reveil::Reveillee => continue,
         }
@@ -278,6 +294,13 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
         cpu::activer_interruptions();
     }
     r
+}
+
+/// La reprise d'une attente à délai par restart_syscall (reprise.rs),
+/// jusqu'à la même échéance (`futex_wait_restart`).
+pub fn reprendre_attente(adresse: u64, partage: bool, val: u32, reelle: bool, echeance: i128, bitset: u32) -> i64 {
+    let e = if reelle { Echeance::Reelle(echeance) } else { Echeance::Monotone(echeance) };
+    attendre(adresse, partage, val, Some(e), bitset)
 }
 
 fn lire_ok(r: Result<u32, i64>) -> Result<(), i64> {

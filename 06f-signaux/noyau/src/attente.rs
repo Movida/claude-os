@@ -219,7 +219,7 @@ pub enum Sommeil {
     /// Seul un réveil de la file finit l'attente (un verrou qui dort).
     Ininterruptible,
     /// Un signal la finit aussi (TASK_INTERRUPTIBLE) : l'appel système
-    /// rendra EINTR.
+    /// rendra EINTR, ou sera refait (reprise.rs).
     Interruptible,
 }
 

@@ -35,7 +35,6 @@ const EPERM: i64 = 1;
 const ENOSYS: i64 = 38;
 const ELOOP: i64 = 40;
 const ENOMEM: i64 = 12;
-const EINTR: i64 = 4;
 
 const O_RDWR: u32 = 2;
 const O_NONBLOCK: u64 = 0o4000;
@@ -87,7 +86,8 @@ fn compteur(f: &mut FichierOuvert) -> (&mut u64, bool, &mut FileAttente) {
 /// faite, None quand elle doit attendre. Une opération faite réveille qui
 /// attendait dans l'autre sens (un lecteur qui vide le compteur, les
 /// écrivains ; un écrivain, les lecteurs : une seule file, comme le `wqh`
-/// de Linux). Non bloquant : EAGAIN ; un signal pendant l'attente : EINTR.
+/// de Linux). Non bloquant : EAGAIN ; un signal pendant l'attente :
+/// ERESTARTSYS (EINTR, ou refaite : reprise.rs).
 /// Sans réveil perdu (attente.rs).
 fn attendre_compteur<R>(f: crate::descripteurs::Fichier, non_bloquant: bool, mut essayer: impl FnMut(&mut u64, bool) -> Option<R>) -> Result<R, i64> {
     let interruptions = cpu::couper_interruptions();
@@ -111,7 +111,9 @@ fn attendre_compteur<R>(f: crate::descripteurs::Fichier, non_bloquant: bool, mut
         let reveil = attente::dormir(None, Sommeil::Interruptible);
         vfs::avec_systeme(|s, _| compteur(s.ouverts.fichier(f)).2.retirer(tache::courante()));
         if reveil == Reveil::Signal {
-            break Err(-EINTR);
+            // Refaite d'elle-même après le signal, sauf gestionnaire sans
+            // SA_RESTART (reprise.rs).
+            break Err(-crate::reprise::ERESTARTSYS);
         }
     };
     if interruptions {

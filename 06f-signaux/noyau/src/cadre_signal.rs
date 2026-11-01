@@ -308,6 +308,9 @@ pub fn rt_sigreturn(cadre: &mut Cadre) -> i64 {
         signaux::poser_masque(p, tid, masque);
         signaux::retablir_pile(p, tid, pile, sp);
     });
+    // Ce que gardait restart_syscall est oublié : un `restart_syscall` du
+    // programme rendrait EINTR (`do_no_restart_syscall`).
+    tache::courante().garder_reprise(None);
     // Le contexte (`restore_sigcontext`) : les registres, puis l'état
     // x87/SSE.
     let mc = UC_MCONTEXT;

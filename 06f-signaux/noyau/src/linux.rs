@@ -51,7 +51,6 @@ const EFAULT: i64 = 14;
 const EEXIST: i64 = 17;
 const EINVAL: i64 = 22;
 const ENOSYS: i64 = 38;
-const EINTR: i64 = 4;
 const EOPNOTSUPP: i64 = 95;
 const ENODEV: i64 = 19;
 const EOVERFLOW: i64 = 75;
@@ -162,6 +161,7 @@ const KILL: u64 = 62;
 const RT_SIGPENDING: u64 = 127;
 const SIGALTSTACK: u64 = 131;
 const RT_SIGRETURN: u64 = 15;
+const RESTART_SYSCALL: u64 = 219;
 const TKILL: u64 = 200;
 const TGKILL: u64 = 234;
 const RT_SIGTIMEDWAIT: u64 = 128;
@@ -264,6 +264,7 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         RT_SIGPENDING => signaux::rt_sigpending(a[0], a[1]),
         SIGALTSTACK => signaux::sigaltstack(a[0], a[1], cadre.rsp),
         RT_SIGRETURN => crate::cadre_signal::rt_sigreturn(cadre),
+        RESTART_SYSCALL => crate::reprise::restart_syscall(),
         KILL => signaux::kill(a[0], a[1]),
         TKILL => signaux::tkill(a[0], a[1]),
         TGKILL => signaux::tgkill(a[0], a[1], a[2]),
@@ -411,6 +412,7 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         RT_SIGPENDING => ("rt_sigpending", 2),
         SIGALTSTACK => ("sigaltstack", 2),
         RT_SIGRETURN => ("rt_sigreturn", 0),
+        RESTART_SYSCALL => ("restart_syscall", 0),
         KILL => ("kill", 2),
         TKILL => ("tkill", 2),
         TGKILL => ("tgkill", 3),
@@ -1153,10 +1155,16 @@ fn sysinfo(info: u64) -> i64 {
 ///      drapeau inconnu, EINVAL ; sinon il faudrait pouvoir réveiller la
 ///      machine (CAP_WAKE_ALARM) : EPERM. Pour les autres, les drapeaux
 ///      autres que TIMER_ABSTIME sont ignorés ;
-///   4. une échéance déjà passée : 0 aussitôt ; sinon dormir,
-///      interruptible : un signal rend EINTR, et le temps qui restait est
-///      écrit à `reste` pour une durée relative (s'il est demandé ; pour
-///      une échéance absolue, il ne sert à rien : jamais écrit).
+///   4. dormir, interruptible (`sommeil`) ; une échéance atteinte, même
+///      avec un signal en attente : 0 (le sommeil a réussi, le signal sera
+///      livré au retour : `do_nanosleep`, `do_cpu_nanosleep`). Un signal
+///      avant l'échéance : pour une durée relative, le
+///      temps qui restait est écrit à `reste` (s'il est demandé), et
+///      l'appel rend ERESTART_RESTARTBLOCK (EINTR si un gestionnaire est
+///      appelé ; sans, il est repris par restart_syscall, jusqu'à la même
+///      échéance : le délai ne recommence pas) ; pour une échéance absolue,
+///      rien n'est écrit, et ERESTARTNOHAND (refait tel quel sans
+///      gestionnaire : `hrtimer_nanosleep`, reprise.rs).
 /// L'attente se fait au tic qui suit l'échéance, jamais avant (attente.rs).
 /// Sur CLOCK_PROCESS_CPUTIME_ID, on attend que le temps de calcul du
 /// processus atteigne l'échéance : un programme d'un seul fil qui dort ne
@@ -1188,19 +1196,15 @@ fn clock_nanosleep(horloge: u64, drapeaux: u64, duree: u64, reste: u64) -> i64 {
     }
     let demande = (secondes as u128 * 1_000_000_000 + nanosecondes as u128).min(u64::MAX as u128) as u64;
     let absolue = drapeaux & TIMER_ABSTIME != 0;
-    let interruptions = cpu::couper_interruptions();
-    let (reveil, fin_restante) = if horloge == CLOCK_PROCESS_CPUTIME_ID {
-        let maintenant = tache::temps_du_processus();
-        let cible = if absolue { demande } else { maintenant.saturating_add(demande) };
-        let compte = tache::courante().processus().cloned().expect("appel systeme sans processus");
-        let r = crate::attente::dormir_calcul(compte, cible);
-        (r, cible.saturating_sub(tache::temps_du_processus()))
+    let calcul = horloge == CLOCK_PROCESS_CPUTIME_ID;
+    let cible = if calcul {
+        if absolue { demande } else { tache::temps_du_processus().saturating_add(demande) }
     } else {
         // L'échéance en temps monotone : les horloges de dates (REALTIME,
         // TAI) ne diffèrent du temps monotone que d'un écart fixe (la date
         // ne se règle pas encore).
         let mono = temps::ns_monotone();
-        let echeance = if !absolue {
+        if !absolue {
             mono.saturating_add(demande)
         } else if matches!(horloge, CLOCK_REALTIME | CLOCK_TAI) {
             let reel = temps::maintenant();
@@ -1208,30 +1212,58 @@ fn clock_nanosleep(horloge: u64, drapeaux: u64, duree: u64, reste: u64) -> i64 {
             (demande as i128 - reel + mono as i128).clamp(0, u64::MAX as i128) as u64
         } else {
             demande
-        };
+        }
+    };
+    sommeil(calcul, cible, if absolue { None } else { Some(reste) })
+}
+
+/// Dort jusqu'à `cible` (temps monotone, ou temps de calcul du processus si
+/// `calcul`), interruptible. Un signal : pour un sommeil relatif (`reste`
+/// donné), le temps qui restait écrit (si l'adresse n'est pas nulle), et la
+/// reprise gardée pour restart_syscall : ERESTART_RESTARTBLOCK ; pour une
+/// échéance absolue, ERESTARTNOHAND.
+fn sommeil(calcul: bool, cible: u64, reste: Option<u64>) -> i64 {
+    let interruptions = cpu::couper_interruptions();
+    let (reveil, restant) = if calcul {
+        let compte = tache::courante().processus().cloned().expect("appel systeme sans processus");
+        let r = crate::attente::dormir_calcul(compte, cible);
+        (r, cible.saturating_sub(tache::temps_du_processus()))
+    } else {
         let r = loop {
             // Rien d'autre que l'échéance ou un signal ne la réveille : un
             // réveil sans raison se rendort.
-            match crate::attente::dormir(Some(echeance), crate::attente::Sommeil::Interruptible) {
+            match crate::attente::dormir(Some(cible), crate::attente::Sommeil::Interruptible) {
                 tache::Reveil::Reveillee => continue,
                 r => break r,
             }
         };
-        (r, echeance.saturating_sub(temps::ns_monotone()))
+        (r, cible.saturating_sub(temps::ns_monotone()))
     };
     if interruptions {
         cpu::activer_interruptions();
     }
-    if reveil != tache::Reveil::Signal {
+    // L'échéance atteinte : le sommeil a réussi, même réveillé par un signal
+    // (`dormir` regarde les signaux avant l'échéance, servie au tic qui la
+    // suit : un signal peut tomber entre les deux, ou attendre déjà à
+    // l'entrée d'un sommeil nul).
+    if reveil != tache::Reveil::Signal || restant == 0 {
         return 0;
     }
-    if !absolue && reste != 0 {
-        let t = fichiers::Temps { secondes: (fin_restante / 1_000_000_000) as i64, nanosecondes: (fin_restante % 1_000_000_000) as u32 };
+    let Some(reste) = reste else { return -crate::reprise::ERESTARTNOHAND };
+    if reste != 0 {
+        let t = fichiers::Temps { secondes: (restant / 1_000_000_000) as i64, nanosecondes: (restant % 1_000_000_000) as u32 };
         if ecrire_timespec(reste, t).is_err() {
             return -EFAULT;
         }
     }
-    -EINTR
+    crate::reprise::garder(crate::reprise::Reprise::Sommeil { calcul, cible, reste });
+    -crate::reprise::ERESTART_RESTARTBLOCK
+}
+
+/// La reprise d'un sommeil relatif par restart_syscall (reprise.rs) :
+/// jusqu'à la même échéance (le `hrtimer_nanosleep_restart` de Linux).
+pub fn reprendre_sommeil(calcul: bool, cible: u64, reste: u64) -> i64 {
+    sommeil(calcul, cible, Some(reste))
 }
 
 /// Écrit un `struct timespec` (secondes, nanosecondes : deux entiers de 64

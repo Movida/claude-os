@@ -250,8 +250,12 @@ pub fn clone3(adresse: u64, taille: u64, cadre: &Cadre) -> i64 {
 /// processus. Puis ce que nous savons faire : un FIL du processus, ce que
 /// fait `pthread_create`. Un nouvel espace de noms : EPERM, ce que reçoit
 /// tout programme qui n'est pas root (sauf pour CLONE_NEWUSER, que Linux
-/// lui permet : un écart). Un nouveau processus (fork, vfork, posix_spawn)
-/// viendra en 6k : ENOSYS, avec un message. Puis la base de FS de
+/// lui permet : un écart). Un signal en attente que le fil ne bloque pas :
+/// ERESTARTNOINTR, pour qu'il soit livré avant la création, puis l'appel
+/// refait, même sans SA_RESTART (« Force any signals received before this
+/// point to be delivered before the fork happens », `copy_process`). Un
+/// nouveau processus (fork, vfork, posix_spawn) viendra en 6k : ENOSYS, avec
+/// un message. Puis la base de FS de
 /// CLONE_SETTLS, vérifiée tard comme le `set_new_tls` de Linux (EPERM hors
 /// des adresses des programmes), et le fil (tache::lancer_fil).
 fn cloner(d: Demande, cadre: &Cadre) -> i64 {
@@ -275,6 +279,9 @@ fn cloner(d: Demande, cadre: &Cadre) -> i64 {
     }
     if f & CLONE_NEW != 0 {
         return -EPERM;
+    }
+    if tache::signal_en_attente() {
+        return -crate::reprise::ERESTARTNOINTR;
     }
     let geres = UN_FIL | SANS_EFFET | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
     if f & UN_FIL != UN_FIL || f & !geres != 0 {
