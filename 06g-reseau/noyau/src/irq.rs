@@ -15,11 +15,92 @@
 //! (`demasquer`) ; `gerer` les retrouve d'après le vecteur, et fait ce que
 //! demande chaque contrôleur (les fantômes du 8259, l'EOI de l'APIC).
 
+use crate::verrou::Verrou;
 use crate::{apic, ioapic, pic};
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 /// L'APIC est-il en service ?
 static APIC: AtomicBool = AtomicBool::new(false);
+
+// ---------------------------------------------------------------------------
+// Les vecteurs donnés à la demande (6g)
+// ---------------------------------------------------------------------------
+//
+// Une interruption MSI ou MSI-X n'arrive sur aucune ligne : le périphérique
+// écrit un message à l'APIC local, qui porte directement le VECTEUR (6g,
+// msix.rs). Chaque file d'une carte réseau en veut un. Les vecteurs fixes
+// (0x30 + n pour l'ISA, 0xEC pour le timer, 0xFE et 0xFF) ne suffisent
+// plus : ceux qui restent se donnent à la demande, et chaque vecteur donné
+// a son gestionnaire. C'est la `irq_matrix` de Linux (kernel/irq/matrix.c),
+// pour un seul processeur : une carte des vecteurs libres, le premier libre
+// donné (comme `irq_matrix_alloc`) ; et la table `vector_irq` qui dit, pour
+// chaque vecteur, à qui il est.
+//
+// Le gestionnaire d'un vecteur est une fonction et son argument (l'adresse
+// de l'objet du pilote), lus sans verrou dans l'interruption : deux
+// atomiques, la fonction écrite en dernier (et effacée en premier) ; le
+// pilote ne démasque son interruption qu'une fois `allouer` revenu, et
+// `liberer` ne se fait qu'interruption masquée. Option écartée : une
+// fermeture Rust (`Box<dyn Fn>`), qu'il faudrait allouer, et lire sous un
+// verrou dans l'interruption.
+
+/// Les vecteurs donnés à la demande : de 0x40 (après ceux de l'ISA) à 0xEB
+/// (avant le timer). Linux commence à 0x20 (FIRST_EXTERNAL_VECTOR), mais ses
+/// IRQ ISA y sont elles aussi données à la demande.
+pub const PREMIER_DYNAMIQUE: u8 = 0x40;
+pub const DERNIER_DYNAMIQUE: u8 = 0xEB;
+
+/// La carte des vecteurs pris (un bit par vecteur).
+static PRIS: Verrou<[u64; 4]> = Verrou::new([0; 4]);
+
+/// Le gestionnaire de chaque vecteur : la fonction (0 : aucune), et son
+/// argument.
+struct Gestionnaire {
+    fonction: AtomicUsize,
+    argument: AtomicUsize,
+}
+
+static GESTIONNAIRES: [Gestionnaire; 256] =
+    [const { Gestionnaire { fonction: AtomicUsize::new(0), argument: AtomicUsize::new(0) } }; 256];
+
+/// Donne un vecteur libre, dont l'interruption appellera `fonction(argument)`
+/// (interruptions coupées, avant l'EOI). None : plus aucun libre, ou pas
+/// d'APIC (sans lui, les messages MSI n'arrivent nulle part).
+pub fn allouer(fonction: fn(usize), argument: usize) -> Option<u8> {
+    if !APIC.load(Ordering::Relaxed) {
+        return None;
+    }
+    let mut pris = PRIS.verrouiller();
+    let v = (PREMIER_DYNAMIQUE..=DERNIER_DYNAMIQUE).find(|&v| pris[v as usize / 64] & 1 << (v % 64) == 0)?;
+    pris[v as usize / 64] |= 1 << (v % 64);
+    let g = &GESTIONNAIRES[v as usize];
+    g.argument.store(argument, Ordering::Relaxed);
+    g.fonction.store(fonction as usize, Ordering::Release);
+    Some(v)
+}
+
+/// Rend le vecteur `v` : son interruption doit déjà être masquée à la
+/// source.
+pub fn liberer(v: u8) {
+    let mut pris = PRIS.verrouiller();
+    GESTIONNAIRES[v as usize].fonction.store(0, Ordering::Release);
+    pris[v as usize / 64] &= !(1 << (v % 64));
+}
+
+/// Le nombre de vecteurs encore libres.
+pub fn libres() -> usize {
+    let pris = PRIS.verrouiller();
+    (PREMIER_DYNAMIQUE..=DERNIER_DYNAMIQUE).filter(|&v| pris[v as usize / 64] & 1 << (v % 64) == 0).count()
+}
+
+/// Le gestionnaire du vecteur `v`, s'il en a un.
+fn gestionnaire(v: u8) -> Option<(fn(usize), usize)> {
+    let g = &GESTIONNAIRES[v as usize];
+    let f = g.fonction.load(Ordering::Acquire);
+    // SAFETY : une valeur non nulle n'a été écrite que par `allouer`, à
+    // partir d'un `fn(usize)`.
+    (f != 0).then(|| (unsafe { core::mem::transmute::<usize, fn(usize)>(f) }, g.argument.load(Ordering::Relaxed)))
+}
 
 /// Ce que l'initialisation a choisi, pour l'afficher.
 pub enum Bilan {
@@ -121,6 +202,14 @@ pub fn gerer(vecteur: u8, traiter: impl FnOnce(Source)) {
         // (manuel d'Intel, vol. 3A, 11.9).
         apic::VECTEUR_FANTOME if APIC.load(Ordering::Relaxed) => {}
         apic::VECTEUR_ERREUR if APIC.load(Ordering::Relaxed) => apic::erreur(),
+        // Un vecteur donné à la demande (une MSI-X) : son gestionnaire,
+        // puis l'EOI.
+        v if APIC.load(Ordering::Relaxed) && gestionnaire(v).is_some() => {
+            if let Some((f, argument)) = gestionnaire(v) {
+                f(argument);
+            }
+            apic::fin_interruption();
+        }
         v => {
             // Un vecteur que personne n'a demandé : on le dit, et on
             // l'acquitte s'il vient de l'APIC (Linux : « spurious or

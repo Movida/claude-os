@@ -33,6 +33,8 @@ rendues et recollees : ok.
 [pci] 7 fonctions sur le bus (ports 0xCF8 et 0xCFC).
 [pci] 00:00.0 8086:1237 pont hote.
 [pci] 00:03.0 1af4:1000 Ethernet, BAR0 ports 0xc080 (32), BAR1 0xfeb91000 (4 Kio), BAR4 0xfe000000 (16 Kio, 64 bits, prefetchable), MSI-X (4 entrees).
+[noyau] Vecteurs a la demande : 0x40 donne, IPI a soi-meme recue par son gestionnaire : ok ; rendu : ok.
+[noyau] MSI-X de 00:03.0 : 4 entrees, entree 1 programmee et relue : ok.
 [noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.

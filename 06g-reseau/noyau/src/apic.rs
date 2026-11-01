@@ -40,7 +40,7 @@
 
 use crate::acpi;
 use crate::vmalloc;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Les vecteurs de l'APIC, ceux de Linux (arch/x86/include/asm/irq_vectors.h).
 /// Le timer (LOCAL_TIMER_VECTOR), les erreurs, les fantômes.
@@ -55,6 +55,8 @@ const TPR: usize = 0x80;
 const EOI: usize = 0xB0;
 const SVR: usize = 0xF0;
 const ESR: usize = 0x280;
+const ICR_BAS: usize = 0x300;
+const ICR_HAUT: usize = 0x310;
 const LVT_TIMER: usize = 0x320;
 const LVT_THERMIQUE: usize = 0x330;
 const LVT_PERFORMANCE: usize = 0x340;
@@ -81,6 +83,10 @@ const ALLUME: u32 = 1 << 8;
 const IA32_APIC_BASE: u32 = 0x1B;
 const APIC_EN: u64 = 1 << 11;
 const APIC_EXTD: u64 = 1 << 10;
+
+/// Le numéro de l'APIC de ce processeur (celui que visent les messages
+/// MSI).
+static ID_APIC: AtomicU8 = AtomicU8::new(0);
 
 /// L'adresse virtuelle des registres (la projection, gardée pour
 /// toujours : l'APIC sert jusqu'à l'arrêt de la machine). 0 : pas d'APIC
@@ -162,6 +168,7 @@ pub fn initialiser(madt: &acpi::ConfigurationMadt) -> Result<Bilan, Refus> {
     core::mem::forget(projection);
 
     let id = (lire(ID) >> 24) as u8;
+    ID_APIC.store(id, Ordering::Relaxed);
     let version = lire(VERSION) as u8;
     // Le nombre d'entrées LVT moins un, bits 16 à 23 : le capteur thermique
     // et le compteur de performance n'existent que si l'APIC les a (5 et 4
@@ -256,4 +263,18 @@ pub fn demarrer_timer(decompte: u32) {
     ecrire(TIMER_DIVISEUR, DIVISEUR_16);
     ecrire(LVT_TIMER, PERIODIQUE | VECTEUR_TIMER as u32);
     ecrire(TIMER_INITIAL, decompte);
+}
+
+/// Le numéro de l'APIC local de ce processeur.
+pub fn id() -> u8 {
+    ID_APIC.load(Ordering::Relaxed)
+}
+
+/// Envoie l'interruption `vecteur` à ce processeur lui-même (une IPI
+/// « à soi », le raccourci 01 de l'ICR, en livraison fixe) : elle arrive
+/// comme celle d'un périphérique, dès que les interruptions sont permises.
+pub fn ipi_a_soi(vecteur: u8) {
+    const A_SOI: u32 = 0b01 << 18;
+    ecrire(ICR_HAUT, 0);
+    ecrire(ICR_BAS, A_SOI | vecteur as u32);
 }

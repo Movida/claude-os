@@ -44,6 +44,7 @@ mod futex;
 mod gdt;
 mod horloge;
 mod interruptions;
+mod msix;
 mod fil;
 mod ioapic;
 mod irq;
@@ -319,6 +320,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // un tic tombé entre le réveil et la lecture du compteur.
     horloge::attendre_ms(100);
     afficherln!("[noyau] 100 ms plus tard : {} tics comptes.", horloge::tics());
+    tester_vecteurs();
     match temps::initialiser() {
         Some((annee, mois, jour, heure, minute, seconde)) => afficherln!(
             "[noyau] Heure (UTC) : {annee:04}-{mois:02}-{jour:02} {heure:02}:{minute:02}:{seconde:02}, de l'horloge CMOS."
@@ -549,6 +551,52 @@ fn tester_vmalloc() {
     let ok = |b: bool| if b { "ok" } else { "ECHEC" };
     afficherln!("[noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : {} ; garde sans projection : {} ; rendue : {} ; memoire video projetee sans cache : {} ; BIOS projete en lecture seule : {}, memoire vive refusee : {}.",
                 ok(ecrite), ok(garde), ok(rendue), ok(video), ok(bios), ok(vive));
+}
+
+/// Vérifie les vecteurs donnés à la demande : un vecteur donné, une IPI à
+/// soi-même sur lui arrive à son gestionnaire (avec son argument), puis il
+/// est rendu ; puis MSI-X : la table de la première carte virtio qui en a
+/// une, mise en service, une entrée programmée puis relue, et rendue (la
+/// table masquée, MSI-X coupé, la projection rendue). Sans APIC (le 8259
+/// de repli), ni l'un ni l'autre : on le dit.
+fn tester_vecteurs() {
+    use core::sync::atomic::AtomicUsize;
+    static RECU: AtomicUsize = AtomicUsize::new(0);
+    fn gestionnaire(argument: usize) {
+        RECU.store(argument, Ordering::Relaxed);
+    }
+    let ok = |b: bool| if b { "ok" } else { "ECHEC" };
+    let libres = irq::libres();
+    match irq::allouer(gestionnaire, 0x6789) {
+        Some(v) => {
+            apic::ipi_a_soi(v);
+            // Elle arrive dès que le processeur l'accepte (les
+            // interruptions sont permises) : sous QEMU sans accélération,
+            // entre deux blocs traduits ; dix tics au plus.
+            let debut = horloge::tics();
+            while RECU.load(Ordering::Relaxed) == 0 && horloge::tics() - debut < 10 {
+                core::hint::spin_loop();
+            }
+            let recu = RECU.load(Ordering::Relaxed) == 0x6789;
+            irq::liberer(v);
+            afficherln!("[noyau] Vecteurs a la demande : {:#x} donne, IPI a soi-meme recue par son gestionnaire : {} ; rendu : {}.",
+                        v, ok(recu), ok(irq::libres() == libres));
+        }
+        None => afficherln!("[noyau] Vecteurs a la demande : pas d'APIC local, pas de vecteur."),
+    }
+    let carte = pci::fonctions().iter()
+        .find(|f| f.entete.vendeur == 0x1af4 && f.capacites().any(|(_, n)| n == formats::pci::CAPACITE_MSIX));
+    if let Some(f) = carte {
+        match msix::MsiX::activer(f) {
+            Ok(m) => {
+                let programme = m.programmer(1, 0x45);
+                let attendu = (0xfee0_0000 | (apic::id() as u64) << 12, 0x45, false);
+                afficherln!("[noyau] MSI-X de {} : {} entrees, entree 1 programmee et relue : {}.",
+                            f.adresse, m.entrees(), ok(programme && m.message(1) == Some(attendu)));
+            }
+            Err(e) => afficherln!("[noyau] MSI-X de {} : {}.", f.adresse, e),
+        }
+    }
 }
 
 /// Vérifie le tas : des collections de Rust de toutes tailles, et un objet

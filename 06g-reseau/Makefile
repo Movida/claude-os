@@ -1,5 +1,5 @@
 # Sous-étape 6g : le réseau. Le bus PCI (formats/src/pci.rs et
-# noyau/src/pci.rs).
+# noyau/src/pci.rs), les vecteurs d'interruption à la demande et MSI-X.
 # De 6f : les signaux livrés à leurs gestionnaires (le
 # cadre de signal, rt_sigreturn, la reprise des appels interrompus),
 # l'attente d'événements (poll, select, epoll), les tubes, /proc fabriqué
@@ -904,7 +904,8 @@ $(WAST2JSON):
 #     si le signal ne l'a pas réveillée).
 #   - sans tables ACPI (-machine pc,acpi=off), le noyau ordinaire sur
 #     l'archive vide (vide.bin) : il doit revenir au 8259 et au PIT, le
-#     dire, et le clavier doit être prêt (depuis 6e) ;
+#     dire, et le clavier doit être prêt (depuis 6e) ; sans APIC local,
+#     pas de MSI-X pour la carte réseau, et il le dit (depuis 6g) ;
 #   - un pont PCI (pci-bridge) et une seconde carte virtio-net derrière
 #     lui, avec le noyau ordinaire sur l'archive vide : le parcours du bus
 #     doit descendre par le pont, et trouver la carte sur le bus 1 que le
@@ -925,6 +926,7 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin claude-p
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"Clavier PS/2 pret",:)
 	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
+	grep -F "MSI-X de 00:03.0 : pas d'APIC local : pas de MSI-X." test-sans-acpi.log
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -drive format=raw$(,)file=test-gros.bin -serial file:test-gros.log,test-gros.log,"chaque secteur a sa place : ok",:)
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -device pci-bridge$(,)id=pont$(,)chassis_nr=1 -netdev user$(,)id=n1 \
 	  -device virtio-net-pci$(,)netdev=n1$(,)bus=pont$(,)addr=1 -drive format=raw$(,)file=vide.bin -serial file:test-pont.log,test-pont.log,"[pci] 01:01.0 1af4:1000 Ethernet",:)

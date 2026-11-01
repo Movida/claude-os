@@ -86,6 +86,26 @@ impl Adresse {
         1 << 31 | (self.bus as u32) << 16 | (self.periph as u32) << 11 | (self.fonction as u32) << 8
             | (position as u32 & 0xFC)
     }
+
+    /// Lit le mot de 16 bits à `position` de l'espace (un accès, sous le
+    /// verrou).
+    pub fn lire16(self, position: usize) -> u16 {
+        configuration().lire16(self, position)
+    }
+
+    /// Écrit le mot de 16 bits à `position` de l'espace.
+    pub fn ecrire16(self, position: usize, valeur: u16) {
+        configuration().ecrire16(self, position, valeur)
+    }
+
+    /// Change le registre de commande : les bits `poser` mis, puis les bits
+    /// `effacer` ôtés, d'un seul tenant sous le verrou (en 16 bits : l'état,
+    /// à côté, n'est pas touché).
+    pub fn changer_commande(self, poser: u16, effacer: u16) {
+        let c = configuration();
+        let commande = c.lire16(self, pci::COMMANDE);
+        c.ecrire16(self, pci::COMMANDE, (commande | poser) & !effacer);
+    }
 }
 
 /// L'espace de configuration, son verrou tenu : une suite d'accès qu'aucun
