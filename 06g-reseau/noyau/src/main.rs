@@ -1,0 +1,675 @@
+//! Le noyau, en Rust.
+//!
+//! Il est lancé par notre chargeur (../boot.asm) : processeur en mode long
+//! 64 bits, pagination active (1er Gio projeté à l'identique), interruptions
+//! coupées, noyau chargé à 1 Mio. C'est tout ce qu'il attend de lui : un
+//! futur chargeur UEFI, qui laisse le processeur dans ce même état, n'aura
+//! rien de plus à faire. Le noyau construit lui-même ses tables de pages et
+//! s'installe dans la moitié haute de l'espace d'adressage (voir espace.rs).
+
+// Pas de bibliothèque standard : elle suppose un système d'exploitation
+// (fichiers, fils d'exécution, allocation...). Il ne reste que `core` : les
+// types, le formatage, les opérations atomiques.
+#![no_std]
+// Pas de `main` classique : personne ne prépare d'arguments ni d'environnement.
+// Le point d'entrée est _start, ci-dessous.
+#![no_main]
+
+// Les collections de Rust (Box, Vec, String), servies par notre tas (tas.rs).
+extern crate alloc;
+
+#[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
+mod console;
+mod acpi;
+mod aleatoire;
+mod apic;
+mod attente;
+mod appel_systeme;
+mod appels_fichiers;
+mod cadre_signal;
+mod cadres;
+mod carte_memoire;
+mod chargeur_elf;
+mod copie_utilisateur;
+mod clavier;
+mod cpu;
+mod demarrage;
+mod descripteurs;
+mod epoll;
+mod espace;
+mod espace_utilisateur;
+mod evenements;
+mod faute_de_page;
+mod futex;
+mod gdt;
+mod horloge;
+mod interruptions;
+mod fil;
+mod ioapic;
+mod irq;
+mod linux;
+mod memoire;
+mod pagination;
+mod pci;
+mod pile;
+mod ordonnanceur;
+mod pages;
+mod pic;
+mod port;
+mod procfs;
+mod processus;
+mod programmes;
+mod reprise;
+mod rusage;
+mod serie;
+mod signaux;
+mod sondage;
+mod sysfs;
+mod sse;
+mod tache;
+mod tas;
+mod tsc;
+mod tube;
+mod temps;
+mod verrou;
+mod vfs;
+mod vmalloc;
+mod vga;
+mod wasi;
+
+use core::arch::{asm, global_asm};
+use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+// Le point d'entrée, en assembleur : avant de pouvoir exécuter du Rust, il
+// faut une pile (le code compilé y range variables et adresses de retour),
+// une .bss à zéro (le compilateur suppose que les variables statiques
+// initialisées à zéro le sont vraiment), et ici des tables de pages qui
+// projettent le noyau là où il a été lié. Placé dans .text.debut, que le
+// script d'édition de liens met en tête de l'image : c'est là que le
+// chargeur saute.
+//
+// Le chargeur saute à l'adresse PHYSIQUE 0x100000, le premier Gio étant
+// projeté à l'identique. Le noyau, lui, est lié pour s'exécuter en haut, à
+// BASE_NOYAU + 0x100000 : jusqu'au saut, seules les adresses relatives à
+// RIP (lea [rip + ...]) sont justes, et elles donnent des adresses
+// physiques. C'est ce que fait startup_64, dans head_64.S de Linux.
+//
+// Les tables de démarrage, dans la .bss : une PD de 512 pages de 2 Mio
+// couvre le premier Gio de mémoire physique, et trois PDPT la font voir à
+// trois endroits (les index viennent des bits de l'adresse, voir
+// ../02-mode-long/boot.asm) :
+//   - à l'identique (PML4[0]), le temps de sauter en haut, puisque le code
+//     s'exécute encore à son adresse physique ;
+//   - dans la projection directe (PML4[273], 0xffff_8880_0000_0000) ;
+//   - à la place du noyau (PML4[511] puis PDPT[510], 0xffff_ffff_8000_0000).
+// Bits des entrées : 0x003 = présente, inscriptible ; 0x080 = page de 2 Mio.
+// Ce sont des tables provisoires, à grosses pages, sans protection : le
+// noyau les remplacera par les siennes, page par page.
+//
+// Le chargeur passe l'adresse des informations de démarrage dans rdi ; or
+// rep stosb se sert de rdi : on la met de côté dans r15, puis on la rend à
+// rdi, 1er argument de noyau_main.
+global_asm!(
+    r#"
+    .section .text.debut, "ax"
+    .global _start
+_start:
+    mov r15, rdi
+
+    lea rdi, [rip + __bss_debut]
+    lea rcx, [rip + __bss_fin]
+    sub rcx, rdi
+    xor eax, eax
+    cld
+    rep stosb
+
+    lea rdi, [rip + demarrage_pd]
+    mov eax, 0x83
+    mov ecx, 512
+1:  mov [rdi], rax
+    add rax, 0x200000
+    add rdi, 8
+    dec ecx
+    jnz 1b
+
+    lea rax, [rip + demarrage_pd]
+    or rax, 3
+    mov [rip + demarrage_pdpt_identite], rax
+    mov [rip + demarrage_pdpt_directe], rax
+    mov [rip + demarrage_pdpt_noyau + 510 * 8], rax
+    lea rax, [rip + demarrage_pdpt_identite]
+    or rax, 3
+    mov [rip + demarrage_pml4], rax
+    lea rax, [rip + demarrage_pdpt_directe]
+    or rax, 3
+    mov [rip + demarrage_pml4 + 273 * 8], rax
+    lea rax, [rip + demarrage_pdpt_noyau]
+    or rax, 3
+    mov [rip + demarrage_pml4 + 511 * 8], rax
+    lea rax, [rip + demarrage_pml4]
+    mov cr3, rax
+
+    /* Le saut en haut : par l'adresse ABSOLUE de la suite, que l'éditeur
+       de liens a fixée en haut (un saut relatif resterait en bas). */
+    movabs rax, offset haut
+    jmp rax
+haut:
+    lea rsp, [rip + __pile_haut]
+    mov rdi, r15
+    call noyau_main
+2:  cli
+    hlt
+    jmp 2b
+
+    .section .bss.demarrage, "aw", @nobits
+    .p2align 12
+demarrage_pml4: .skip 4096
+demarrage_pdpt_identite: .skip 4096
+demarrage_pdpt_directe: .skip 4096
+demarrage_pdpt_noyau: .skip 4096
+demarrage_pd: .skip 4096
+    "#
+);
+
+unsafe extern "C" {
+    // Défini dans le global_asm! ci-dessus : seule son adresse nous intéresse.
+    static _start: u8;
+    // Défini par le script d'édition de liens : la fin du noyau en mémoire
+    // (après la .bss et la pile).
+    static __bss_fin: u8;
+}
+
+#[unsafe(no_mangle)]
+extern "C" fn noyau_main(infos: u64) -> ! {
+    console::initialiser();
+    afficherln!("[noyau] Bonjour depuis le noyau Rust !");
+    let debut = &raw const _start as u64;
+    afficherln!("[noyau] Mode long 64 bits, noyau a {:#x} (charge a {:#x}).", debut, espace::physique_du_noyau(debut));
+    #[cfg(feature = "test-gros")]
+    verifier_gros();
+
+    gdt::initialiser();
+    interruptions::initialiser();
+    appel_systeme::initialiser();
+    afficherln!("[noyau] GDT, TSS et IDT du noyau en place ; syscall pret.");
+
+    // Test volontaire : int3 déclenche l'exception 3. Si l'IDT est fausse,
+    // c'est une triple faute et QEMU redémarre ; sinon, on revient ici.
+    // SAFETY : int3 ne fait qu'appeler notre gestionnaire, qui revient.
+    unsafe { asm!("int3") };
+    afficherln!("[noyau] Retour apres int3 : les exceptions sont gerees.");
+
+    // La mémoire physique : les informations du chargeur (dont la carte du
+    // BIOS), puis l'allocateur de cadres.
+    // SAFETY : `infos` est l'adresse passée par notre chargeur, et rien n'a
+    // encore réutilisé la mémoire basse.
+    if let Err(e) = unsafe { demarrage::recopier(infos) } {
+        panic!("informations de demarrage illisibles ({})", e);
+    }
+    carte_memoire::afficher();
+    let fin_noyau = espace::physique_du_noyau(&raw const __bss_fin as u64);
+    match cadres::initialiser(fin_noyau, demarrage::archive()) {
+        Ok(bilan) => {
+            afficherln!("[noyau] Memoire libre : {} cadres de 4 Kio ({} Mio).",
+                        bilan.libres, bilan.libres as u64 * cadres::TAILLE_CADRE >> 20);
+            afficherln!("        Carte de bits : {} Kio a {:#x}, apres le noyau (fin a {:#x}).",
+                        bilan.taille_bits >> 10, bilan.adresse_bits, fin_noyau);
+        }
+        Err(e) => panic!("allocateur de cadres : {}", e),
+    }
+
+    // Les tables de pages définitives : jusqu'ici, seul le premier Gio est
+    // projeté, sans protection.
+    let bilan = pagination::initialiser();
+    if bilan.nx {
+        afficherln!("[noyau] Pagination W^X en place : noyau en {} pages de 4 Kio, {} Mio en projection directe.",
+                    bilan.pages_noyau, bilan.projection_directe >> 20);
+    } else {
+        afficherln!("[noyau] Pagination en place, SANS le bit NX (absent du processeur) : les donnees restent executables.");
+    }
+    tester_cadres();
+    let p = copie_utilisateur::activer_protections();
+    let oui_non = |b: bool| if b { "oui" } else { "non (absent du processeur)" };
+    afficherln!("[noyau] Protections contre les programmes : SMEP {}, SMAP {}, UMIP {}.",
+                oui_non(p.smep), oui_non(p.smap), oui_non(p.umip));
+    afficherln!("[noyau] Alea des programmes (AT_RANDOM) : {}.", aleatoire::source());
+    let fpu = sse::initialiser();
+    if fpu.xsave {
+        afficherln!("[noyau] SSE pour les programmes : XSAVE (x87, SSE{}), {} octets par tache.",
+                    if fpu.avx { ", AVX" } else { "" }, fpu.taille);
+    } else {
+        afficherln!("[noyau] SSE pour les programmes : FXSAVE (x87, SSE, pas d'AVX), {} octets par tache.", fpu.taille);
+    }
+
+    // L'allocateur de démarrage cède la mémoire à l'allocateur de pages.
+    let bilan = pages::initialiser();
+    afficherln!("[noyau] Allocateur buddy : {} pages libres ({} Mio), blocs de 4 Kio a {} Mio ; descripteurs des cadres : {} Kio.",
+                bilan.libres, bilan.libres >> 8, (4096 << pages::ORDRE_MAX) >> 20, bilan.taille_descripteurs >> 10);
+    afficherln!("[noyau] Memoire des programmes : surengagement (OVERCOMMIT_GUESS), reserve du noyau de {} Kio.",
+                bilan.reserve * 4);
+    tester_pages();
+    tester_tas();
+    // La région des adresses à la demande : avant le premier espace
+    // d'adressage, qui recopie la moitié haute de la PML4 du noyau.
+    let bilan = vmalloc::initialiser();
+    afficherln!("[noyau] Adresses du noyau a la demande (vmalloc) : {} piles de {} Kio sous leur page de garde, tables faites d'avance ({} Kio).",
+                bilan.piles, vmalloc::TAILLE_PILE >> 10, bilan.tables >> 10);
+    tester_vmalloc();
+    // Le code en cours devient la tâche inactive (tache.rs) ; la file des
+    // tâches prêtes, réservée pour autant de tâches que de piles.
+    tache::initialiser();
+    ordonnanceur::initialiser(vmalloc::max_threads());
+    attente::initialiser(vmalloc::max_threads());
+    processus::initialiser(vmalloc::max_threads());
+    tester_espace_utilisateur();
+    match acpi::initialiser() {
+        Ok(()) => acpi::afficher(),
+        Err(acpi::Absence::SansRsdp) => afficherln!("[noyau] Pas de tables ACPI (pas de RSDP dans la memoire du BIOS)."),
+        Err(acpi::Absence::Racine(a, e)) => afficherln!("[noyau] Tables ACPI illisibles : la table racine a {:#x} : {}.", a, e),
+    }
+
+    // Le bus PCI : ce qui y est branché, et où sont ses registres. Avant
+    // les interruptions : rien ne s'affiche pendant la mesure des BAR (la
+    // carte VGA coupée), et aucun pilote ne s'en sert encore.
+    let n = pci::initialiser();
+    afficherln!("[pci] {} fonctions sur le bus (ports 0xCF8 et 0xCFC).", n);
+    pci::afficher();
+
+    // Les interruptions matérielles : d'abord le contrôleur (l'APIC et
+    // l'IO-APIC, ou le 8259 ; tout masqué), puis l'horloge qui démasque son
+    // IRQ, et seulement alors sti. Dans l'autre ordre, une IRQ pourrait
+    // arriver sur un vecteur d'exception.
+    let bilan = irq::initialiser();
+    // Le TSC, étalonné contre le PIT avant que le PIT ne serve (ou ne soit
+    // arrêté) ; puis le tic : le timer de l'APIC si l'APIC et le TSC le
+    // permettent, le PIT sinon.
+    let tsc = tsc::etalonner();
+    let source = horloge::initialiser(irq::apic());
+    cpu::activer_interruptions();
+    match bilan {
+        irq::Bilan::Apic { apic, ioapic } => {
+            afficher!("[noyau] APIC local {} a {:#x} (xAPIC, version {:#x})", apic.id, apic.adresse, apic.version);
+            for (n, adresse, gsi, entrees) in ioapic.ioapics {
+                afficher!(", IO-APIC {} a {:#x} (GSI {}-{})", n, adresse, gsi, gsi + entrees - 1);
+            }
+            afficherln!(" ; 8259 masque.");
+            afficherln!("[noyau] Clavier : IRQ {} sur le GSI {}, vecteur {:#x}.",
+                        clavier::IRQ, ioapic::gsi(clavier::IRQ).unwrap_or(0), irq::vecteur(clavier::IRQ));
+        }
+        irq::Bilan::Pic(raison) => afficherln!("[noyau] PIC 8259 ({}) remappe sur les vecteurs {}-{}.",
+                                               raison, pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1),
+        irq::Bilan::PicSansApic(e) => afficherln!("[noyau] PIC 8259 ({}) remappe sur les vecteurs {}-{}.",
+                                                  e, pic::VECTEUR_BASE, pic::VECTEUR_BASE + pic::NB_IRQ - 1),
+    }
+    match tsc {
+        tsc::Bilan::Fiable { khz, essais } => afficherln!("[noyau] TSC : {}.{:03} MHz, constant ({} essais sur 5 retenus) : l'heure a la nanoseconde.",
+                                                         khz / 1000, khz % 1000, essais),
+        tsc::Bilan::NonConstant => afficherln!("[noyau] TSC non fiable (le processeur ne le dit pas constant) : l'heure au tic."),
+        tsc::Bilan::Mesure => afficherln!("[noyau] TSC non fiable (mesures rejetees ou en desaccord) : l'heure au tic."),
+    }
+    match source {
+        horloge::Source::Apic(hz) => afficherln!("[noyau] Horloge : timer de l'APIC ({}.{:03} MHz apres le diviseur), {} Hz, vecteur {:#x} ; PIT arrete.",
+                                                 hz / 1_000_000, hz / 1000 % 1000, horloge::HZ, apic::VECTEUR_TIMER),
+        horloge::Source::Pit => afficherln!("[noyau] Horloge : PIT, {} Hz, vecteur {:#x}.", horloge::HZ, irq::vecteur(horloge::IRQ)),
+    }
+    // Le compte affiché est celui depuis le démarrage de l'horloge : 100,
+    // plus les tics passés à écrire les messages qui précèdent (sous QEMU,
+    // un ou deux par ligne, le port série étant un fichier), plus parfois
+    // un tic tombé entre le réveil et la lecture du compteur.
+    horloge::attendre_ms(100);
+    afficherln!("[noyau] 100 ms plus tard : {} tics comptes.", horloge::tics());
+    match temps::initialiser() {
+        Some((annee, mois, jour, heure, minute, seconde)) => afficherln!(
+            "[noyau] Heure (UTC) : {annee:04}-{mois:02}-{jour:02} {heure:02}:{minute:02}:{seconde:02}, de l'horloge CMOS."
+        ),
+        None => afficherln!("[noyau] Pas d'horloge CMOS lisible : la date part du 1er janvier 1970."),
+    }
+
+    // Le scénario de panne de `make tests-qemu` : déborder exprès de la
+    // pile, que la page de garde doit arrêter net. Dans une tâche du noyau,
+    // sur sa pile de vmalloc : c'est la page de garde de chaque tâche qui
+    // est vérifiée.
+    #[cfg(feature = "test-garde")]
+    {
+        afficherln!("[noyau] Test : debordement volontaire de la pile d'une tache.");
+        tache::lancer_noyau(programmes::NomCourt::de(b"test-garde"), || {
+            deborder(0);
+        });
+    }
+
+    // Le clavier, et sa tâche : elle dort jusqu'à ce qu'une touche soit
+    // tapée, puis l'affiche.
+    match clavier::initialiser() {
+        Ok(()) => {
+            tache::lancer_noyau(programmes::NomCourt::de(b"clavier"), clavier::tache);
+            afficherln!("[noyau] Clavier PS/2 pret : tapez du texte.")
+        }
+        Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
+    }
+
+    afficherln!("[noyau] Ordonnanceur EEVDF : tranche de {}.{:02} ms, preemption du noyau.",
+                ordonnanceur::TRANCHE / 1_000_000, ordonnanceur::TRANCHE / 10_000 % 100);
+    // init : vérifie l'ordonnanceur, puis lance /etc/demarrage, dans sa
+    // tâche.
+    let init = || {
+        tester_ordonnanceur();
+        programmes::demarrer();
+        // Le scénario des programmes de test de `make tests-qemu` : une
+        // fois l'archive exécutée, éteindre QEMU par son périphérique
+        // isa-debug-exit (présent seulement si on le demande à QEMU, à ce
+        // port-là). Jamais dans le noyau ordinaire : sur une vraie
+        // machine, ce port peut être n'importe quoi.
+        #[cfg(feature = "test-programmes")]
+        {
+            afficherln!("[noyau] Fin des tests : extinction de QEMU.");
+            // SAFETY : le port 0xf4 est celui d'isa-debug-exit dans
+            // `make tests-qemu` ; QEMU s'arrête aussitôt.
+            unsafe { port::ecrire(0xf4, 0) };
+        }
+    };
+    if tache::lancer_noyau(programmes::NomCourt::de(b"init"), init).is_none() {
+        afficherln!("[noyau] Pas de pile pour la tache init : rien a lancer.");
+    }
+
+    // Le code du démarrage est maintenant la tâche inactive : elle prend le
+    // processeur quand aucune autre n'est prête, regarde si des programmes
+    // ne sont pas bloqués pour toujours (attente::detecter_interblocage),
+    // et arrête le processeur (sti ; hlt) jusqu'à la prochaine
+    // interruption. Une interruption qui rend une
+    // tâche prête la préempte aussitôt (ordonnanceur.rs) ; on vérifie
+    // quand même la file interruptions coupées avant de dormir (voir
+    // cpu::attendre_interruption).
+    loop {
+        cpu::couper_interruptions();
+        if ordonnanceur::autres_pretes() || attente::detecter_interblocage() {
+            cpu::activer_interruptions();
+            ordonnanceur::ordonnancer();
+        } else {
+            cpu::attendre_interruption();
+        }
+    }
+}
+
+/// Vérifie l'ordonnanceur et la préemption du noyau : deux tâches du noyau
+/// qui calculent chacune 20 ms, sans jamais céder d'elles-mêmes, doivent se
+/// partager le processeur : chacune voit le compteur de l'autre avancer
+/// pendant son propre calcul, ce qui n'arrive que si le tic l'a préemptée.
+fn tester_ordonnanceur() {
+    use core::sync::atomic::AtomicU64;
+    static COMPTEURS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+    static VU: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    let calculer = |moi: usize| {
+        move || {
+            let autre_au_debut = COMPTEURS[1 - moi].load(Ordering::Relaxed);
+            let debut = tache::temps_de_calcul();
+            while tache::temps_de_calcul() - debut < 20_000_000 {
+                COMPTEURS[moi].fetch_add(1, Ordering::Relaxed);
+                if COMPTEURS[1 - moi].load(Ordering::Relaxed) != autre_au_debut {
+                    VU[moi].store(true, Ordering::Relaxed);
+                }
+            }
+        }
+    };
+    let bascules = ordonnanceur::bascules();
+    let a = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-a"), calculer(0));
+    let b = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-b"), calculer(1));
+    if let (Some(a), Some(b)) = (&a, &b) {
+        tache::attendre(a);
+        tache::attendre(b);
+    }
+    let ok = a.is_some() && b.is_some() && VU.iter().all(|v| v.load(Ordering::Relaxed));
+    afficherln!("[noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : {} ({} bascules).",
+                if ok { "ok" } else { "ECHEC" }, ordonnanceur::bascules() - bascules);
+}
+
+/// Vérifie l'allocateur de pages : des blocs alignés sur leur taille, qu'on
+/// peut écrire de bout en bout, et qui se recollent en les rendant (le
+/// nombre de pages libres revient à ce qu'il était). Le plus grand bloc
+/// possible : sur une très petite machine, il n'y a pas forcément de bloc
+/// de 4 Mio. Une page prise deux fois n'est rendue qu'au second `lacher`.
+fn tester_pages() {
+    let libres_avant = pages::libres();
+    let a = pages::allouer(0).expect("plus de memoire");
+    let b = pages::allouer(3).expect("plus de memoire");
+    let (c, ordre_c) = (0..=pages::ORDRE_MAX).rev().find_map(|o| pages::allouer(o).map(|c| (c, o))).expect("plus de memoire");
+    let taille_c = 4096 << ordre_c;
+    assert!(a % 4096 == 0 && b % (4096 << 3) == 0 && c % taille_c == 0);
+    // SAFETY : `c` vient d'être alloué, il est à nous, de bout en bout.
+    unsafe {
+        let debut = espace::virtuelle(c) as *mut u8;
+        debut.write_volatile(1);
+        debut.add(taille_c as usize - 1).write_volatile(2);
+    }
+    pages::prendre(a);
+    let compteur = pages::references(a) == 2 && !pages::lacher(a) && pages::lacher(a);
+    pages::liberer(b, 3);
+    pages::liberer(c, ordre_c);
+    afficherln!("[noyau] Pages allouees : {:#x} (4 Kio), {:#x} (32 Kio), {:#x} ({} Kio) ; prise deux fois, rendue au second lacher : {} ; rendues et recollees : {}.",
+                a, b, c, taille_c >> 10, if compteur { "ok" } else { "ECHEC" },
+                if pages::libres() == libres_avant { "ok" } else { "ECHEC" });
+}
+
+/// Vérifie l'espace d'adressage d'un programme : le créer, y projeter une
+/// page, l'écrire par son adresse de programme, la relire par la projection
+/// directe, puis tout détruire. Toutes les pages (la page, les quatre
+/// tables) doivent revenir à l'allocateur, et les adresses interdites être
+/// refusées.
+fn tester_espace_utilisateur() {
+    use espace_utilisateur::{EspaceUtilisateur, Erreur, ADRESSE_MAX, ADRESSE_MIN};
+    const ADRESSE: u64 = 0x40_0000;
+    let libres_avant = pages::libres();
+    let mut e = EspaceUtilisateur::creer().expect("plus de memoire");
+    let rw = zones::Droits { lecture: true, ecriture: true, execution: false };
+    let r = zones::Droits { lecture: true, ..zones::Droits::AUCUN };
+    let cadre = e.projeter_neuve(ADRESSE, rw).expect("plus de memoire");
+    let refus = [
+        e.projeter_neuve(ADRESSE, r) == Err(Erreur::DejaProjetee),
+        e.projeter_neuve(0, r) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE_MIN - 4096, r) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE_MAX, r) == Err(Erreur::AdresseInterdite),
+        e.projeter_neuve(ADRESSE + 1, r) == Err(Erreur::AdresseInterdite),
+        e.traduire(ADRESSE).map(|(c, _)| c) == Some(cadre),
+    ];
+    // On écrit par l'adresse du programme, comme un appel système : par la
+    // copie protégée (et SMAP doit refuser une lecture directe), puis on
+    // relit par la projection directe du cadre.
+    // SAFETY : l'espace a la moitié haute du noyau (pile, code) : on
+    // continue de s'exécuter après avoir changé CR3 ; on revient sur la
+    // PML4 du noyau avant de le détruire.
+    unsafe { pagination::activer(e.pml4()) };
+    let copie = copie_utilisateur::copier_vers_utilisateur(ADRESSE, &0x1234_5678u64.to_le_bytes());
+    let hors_bornes = copie_utilisateur::copier_vers_utilisateur(ADRESSE_MAX - 4, &[0; 8]);
+    let absente = copie_utilisateur::copier_vers_utilisateur(ADRESSE + 4096 - 4, &[0; 8]);
+    let smap_ok = !copie_utilisateur::SMAP_ACTIF.load(core::sync::atomic::Ordering::Relaxed)
+        || copie_utilisateur::smap_verifie(ADRESSE);
+    // SAFETY : la PML4 du noyau est complète.
+    unsafe { pagination::activer(pagination::pml4_noyau()) };
+    // SAFETY : `cadre` est la page projetée, à nous jusqu'à la destruction
+    // de l'espace.
+    let relu = unsafe { (espace::virtuelle(cadre) as *const u64).read_volatile() };
+    let refus = [refus.iter().all(|&r| r), copie.is_ok(), hors_bornes.is_err(), absente.is_err(), smap_ok];
+    drop(e);
+    let ok = relu == 0x1234_5678 && refus.iter().all(|&r| r) && pages::libres() == libres_avant;
+    afficherln!("[noyau] Espace d'un programme : page {:#x} ecrite par son adresse (copie protegee), relue par le cadre {:#x} ; memoire rendue : {}.",
+                ADRESSE, cadre, if ok { "ok" } else { "ECHEC" });
+    if copie_utilisateur::SMAP_ACTIF.load(core::sync::atomic::Ordering::Relaxed) && smap_ok {
+        afficherln!("[noyau] SMAP verifie : une lecture directe de la memoire d'un programme fait faute.");
+    }
+}
+
+/// Vérifie la région des adresses à la demande : une pile, écrite par son
+/// adresse et relue par la projection directe de ses cadres, sa garde sans
+/// projection, puis rendue (toute la mémoire revient) ; et la mémoire
+/// vidéo (dans le premier Mio, déjà vue par la projection directe)
+/// projetée une seconde fois sans cache, comme des registres : les deux
+/// vues lisent le même caractère.
+fn tester_vmalloc() {
+    let libres_avant = pages::libres();
+    let pml4 = pagination::pml4_noyau();
+    let Some(pile) = vmalloc::Pile::allouer() else {
+        return afficherln!("[noyau] vmalloc : pas de pile : ECHEC.");
+    };
+    let (bas, haut) = (pile.bas(), pile.haut());
+    // SAFETY : la pile vient d'être projetée, elle est à nous ; ses deux
+    // bouts sont dans ses pages.
+    unsafe {
+        (bas as *mut u64).write_volatile(0x1234);
+        ((haut - 8) as *mut u64).write_volatile(0x5678);
+    }
+    let relu = |v: u64| {
+        pagination::traduire(pml4, v / 4096 * 4096)
+            // SAFETY : un cadre de la pile, vu par la projection directe.
+            .map(|c| unsafe { (espace::virtuelle(c + v % 4096) as *const u64).read_volatile() })
+    };
+    let ecrite = relu(bas) == Some(0x1234) && relu(haut - 8) == Some(0x5678);
+    let garde = pagination::traduire(pml4, bas - 4096).is_none() && pagination::garde_touchee(bas - 1).is_some()
+        && pagination::garde_touchee(bas).is_none();
+    drop(pile);
+    let rendue = pages::libres() == libres_avant && pagination::traduire(pml4, bas).is_none();
+    // La mémoire vidéo en mode texte : 0xB8000, un caractère et sa
+    // couleur par mot.
+    let video = vmalloc::ioremap(0xB8000, 4096).map(|p| {
+        // SAFETY : la page projetée est la mémoire vidéo, comme sa vue par
+        // la projection directe ; lire un mot ne change rien.
+        unsafe { (p.adresse() as *const u16).read_volatile() == (espace::virtuelle(0xB8000) as *const u16).read_volatile() }
+    }) == Some(true);
+    // Le BIOS (0xF0000, dans le premier Mio), projeté comme une table du
+    // micrologiciel ; une page de la mémoire vive donnée à l'allocateur,
+    // refusée.
+    let bios = vmalloc::memremap(0xF0000 + 0x10, 8).map(|p| {
+        // SAFETY : une page du BIOS, vue aussi par la projection directe.
+        unsafe { (p.adresse() as *const u64).read_volatile() == (espace::virtuelle(0xF0010) as *const u64).read_volatile() }
+    }) == Some(true);
+    let vive = pages::allouer(0).map(|c| {
+        let refusee = vmalloc::memremap(c, 8).is_none();
+        pages::liberer(c, 0);
+        refusee
+    }) == Some(true);
+    let ok = |b: bool| if b { "ok" } else { "ECHEC" };
+    afficherln!("[noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : {} ; garde sans projection : {} ; rendue : {} ; memoire video projetee sans cache : {} ; BIOS projete en lecture seule : {}, memoire vive refusee : {}.",
+                ok(ecrite), ok(garde), ok(rendue), ok(video), ok(bios), ok(vive));
+}
+
+/// Vérifie le tas : des collections de Rust de toutes tailles, et un objet
+/// rendu qui sert à nouveau.
+fn tester_tas() {
+    use alloc::{boxed::Box, format, vec, vec::Vec};
+    // Un Vec qui grandit : il passe par plusieurs classes, puis par des
+    // pages (8000 octets à la fin).
+    let carres: Vec<u64> = (0..1000).map(|i| i * i).collect();
+    let somme: u64 = carres.iter().sum();
+    let texte = format!("Vec de {} carres (somme {})", carres.len(), somme);
+    let grand = vec![1u8; 1 << 20];
+    // L'objet rendu doit être le prochain donné. black_box cache les
+    // adresses à l'optimiseur : sans lui, le compilateur, qui sait que deux
+    // allocations distinctes n'ont jamais la même adresse, remplace la
+    // comparaison par « faux » sans l'exécuter.
+    let a = Box::into_raw(Box::new(1u32));
+    let adresse_a = core::hint::black_box(a as usize);
+    // SAFETY : `a` vient de Box::into_raw, rendu une seule fois.
+    drop(unsafe { Box::from_raw(a) });
+    let b = Box::new(2u32);
+    let reutilise = core::hint::black_box(&*b as *const u32 as usize) == adresse_a;
+    // Mille objets de 100 octets (la classe de 128 : 32 par page), rendus :
+    // les pages découpées pour eux reviennent à l'allocateur de pages. Le
+    // tableau des boîtes (8000 octets) prend, lui, un bloc de pages, rendu
+    // aussi.
+    let libres = pages::libres();
+    let boites: Vec<Box<[u8; 100]>> = (0..1000).map(|_| Box::new([7; 100])).collect();
+    let prises = libres - pages::libres();
+    drop(boites);
+    let rendues = prises >= 1000 / 32 && pages::libres() == libres;
+    afficherln!("[noyau] Tas : {}, Box, String, 1 Mio d'un bloc ({} octets a 1) : {} ; pages vides rendues : {}.",
+                texte, grand.iter().filter(|&&o| o == 1).count(), if reutilise { "ok" } else { "ECHEC" },
+                if rendues { "ok" } else { "ECHEC" });
+}
+
+/// Une récursion sans fin (ou presque : la condition, jamais vraie, évite
+/// l'avertissement du compilateur). Chaque appel garde 512 octets sur la
+/// pile ; black_box empêche le compilateur de les supprimer, ou de changer
+/// la récursion en boucle.
+#[cfg(feature = "test-garde")]
+fn deborder(n: u64) -> u64 {
+    if n == u64::MAX {
+        return 0;
+    }
+    let tableau = core::hint::black_box([n; 64]);
+    deborder(n + 1) + tableau[63]
+}
+
+/// Le scénario « noyau gonflé » de `make tests-qemu` : 1,5 Mio de
+/// constantes, assez pour que l'image dépasse 1 Mio (l'ancienne limite du
+/// tampon en mémoire basse était de 576 Kio). Le début de chaque secteur de
+/// 512 octets porte son propre numéro : un morceau lu au mauvais endroit,
+/// ou pas lu du tout (des zéros), se voit au premier secteur faux. Le
+/// dernier octet du tableau, le dernier du fichier qui compte, vaut 0x5A.
+#[cfg(feature = "test-gros")]
+fn verifier_gros() {
+    const TAILLE: usize = 3 << 19;
+    const fn gros() -> [u8; TAILLE] {
+        let mut t = [0u8; TAILLE];
+        let mut secteur = 0;
+        while secteur < TAILLE / 512 {
+            let numero = (secteur as u64).to_le_bytes();
+            let mut i = 0;
+            while i < 8 {
+                t[secteur * 512 + i] = numero[i];
+                i += 1;
+            }
+            secteur += 1;
+        }
+        t[TAILLE - 1] = 0x5A;
+        t
+    }
+    static GROS: [u8; TAILLE] = gros();
+    // black_box : sans lui, le compilateur, qui connaît le contenu du
+    // tableau, ferait la vérification lui-même et n'en garderait rien.
+    let gros = core::hint::black_box(&GROS);
+    let faux = (0..TAILLE / 512).find(|&s| gros[s * 512..s * 512 + 8] != (s as u64).to_le_bytes());
+    match faux {
+        None if gros[TAILLE - 1] == 0x5A => afficherln!(
+            "[noyau] Test : noyau gonfle de {} Kio, chaque secteur a sa place : ok.", TAILLE >> 10),
+        None => afficherln!("[noyau] Test : noyau gonfle, dernier octet faux : ECHEC."),
+        Some(s) => afficherln!("[noyau] Test : noyau gonfle, secteur {} faux : ECHEC.", s),
+    }
+}
+
+/// Vérifie l'allocateur : trois cadres distincts et alignés, et un cadre
+/// rendu est bien redonné ensuite.
+fn tester_cadres() {
+    let libres_avant = cadres::libres();
+    let a = cadres::allouer().expect("plus de memoire");
+    let b = cadres::allouer().expect("plus de memoire");
+    let c = cadres::allouer().expect("plus de memoire");
+    assert!(a != b && b != c && a != c && (a | b | c) % cadres::TAILLE_CADRE == 0);
+    // On écrit dans un cadre, par la projection directe : il est bien
+    // projeté et à nous.
+    // SAFETY : `b` vient d'être alloué, personne d'autre ne s'en sert.
+    unsafe { core::ptr::write_bytes(espace::virtuelle(b) as *mut u8, 0, cadres::TAILLE_CADRE as usize) };
+    cadres::liberer(b);
+    let d = cadres::allouer().expect("plus de memoire");
+    cadres::liberer(a);
+    cadres::liberer(c);
+    cadres::liberer(d);
+    assert!(cadres::libres() == libres_avant);
+    afficherln!("[noyau] Cadres alloues : {:#x} {:#x} {:#x} ; {:#x} rendu puis redonne : {}.",
+                a, b, c, b, if d == b { "ok" } else { "ECHEC" });
+}
+
+/// Appelé par Rust en cas d'erreur fatale (indice hors d'un tableau,
+/// unwrap() sur une erreur, panic! explicite...). Sans système en dessous,
+/// on affiche ce qu'on sait et on arrête tout.
+#[panic_handler]
+fn panique(info: &PanicInfo) -> ! {
+    // Une panique pendant l'affichage de la panique (un bogue dans la
+    // console elle-même) recommencerait sans fin : la deuxième fois, on
+    // s'arrête sans rien dire.
+    static EN_PANIQUE: AtomicBool = AtomicBool::new(false);
+    if EN_PANIQUE.swap(true, Ordering::Relaxed) {
+        cpu::arreter();
+    }
+    console::preparer_panique();
+    afficherln!("[noyau] PANIQUE : {}", info);
+    cpu::arreter()
+}
