@@ -1,0 +1,11 @@
+[build]
+# Toujours compiler pour la machine nue, jamais pour Linux.
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+# relocation-model=static : le noyau est lié pour une adresse fixe (1 Mio).
+# Par défaut, cette cible produit un exécutable relogeable (PIE), qui
+# suppose qu'un chargeur corrige les adresses au chargement ; notre
+# chargeur se contente de recopier l'image, donc les adresses doivent être
+# justes d'avance.
+rustflags = ["-C", "relocation-model=static"]

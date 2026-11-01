@@ -1,0 +1,12 @@
+# Les formats de fichiers que lit le noyau : l'archive de programmes (cpio
+# « newc », celui de l'initramfs de Linux) et, à partir de la sous-étape
+# 4, les exécutables ELF. Comme l'interpréteur WebAssembly (../wasm), une
+# bibliothèque sans bibliothèque standard (no_std) et sans dépendance,
+# testée sur la machine hôte (`make tests-hote`), puis compilée dans le
+# noyau. Elle n'a pas besoin d'`alloc` : elle ne fait que lire des octets.
+[package]
+name = "formats"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
