@@ -33,7 +33,10 @@
 #                  avec strace, pour comparer
 #   make tests-qemu -> les scénarios dans QEMU : un noyau qui déborde exprès
 #                  de sa pile doit le dire (page de garde, double faute) ;
-#                  un noyau gonflé au-delà de 1 Mio doit être lu en entier
+#                  un noyau gonflé au-delà de 1 Mio doit être lu en entier ;
+#                  et make claude-p
+#   make claude-p -> le jalon de 6f, dans une image à part : claude -p
+#                  bonjour jusqu'à l'appel de l'API (claude-p-attendu.txt)
 #   make tests-hote -> les tests sur la machine hôte : ceux de la
 #                  bibliothèque des formats (formats/ : archive cpio,
 #                  exécutables ELF, essayés aussi sur de vrais programmes
@@ -672,6 +675,40 @@ programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/
 	cd lecteur && cargo build --release
 	{ cat archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } | sh archive.sh $@ -
 
+# L'archive du jalon de 6f : celle de l'étape, dont /etc/demarrage ne lance
+# que claude -p (racine/etc/demarrage-claude-p), puis la liste de HOME.
+claude-p.cpio: programmes.cpio racine/etc/demarrage-claude-p
+	{ sed 's|racine/etc/demarrage |racine/etc/demarrage-claude-p |' archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } \
+	  | sh archive.sh $@ -
+
+claude-p.bin: claude-p.cpio FORCE
+	cd noyau && cargo build --release
+	$(call image,$(NOYAU_ELF),claude-p.cpio,claude-p)
+
+# Le temps que met claude -p dans QEMU sans accélération (28 s mesurées ici,
+# le double ou plus sur une machine de la CI).
+DUREE_CLAUDE_P = 240
+
+# claude -p bonjour, dans notre noyau : il doit aller jusqu'à l'appel de
+# l'API, et dire qu'il ne la trouve pas (pas de réseau avant 6g). Sa ligne
+# de fin ne dit pas « memoire rendue : ok » : Claude laisse dans HOME sa
+# configuration (.claude.json et ses copies) et la télémétrie qu'il n'a pas
+# pu envoyer (environ 300 Kio), que le tmpfs garde, à raison. Le contrôle
+# ne sait pas les distinguer d'une fuite ; `arbre` les montre, et sa propre
+# mémoire, elle, est rendue.
+claude-p: claude-p.bin
+	rm -f claude-p.log; \
+	timeout $(DUREE_CLAUDE_P) $(QEMU_TEST) -drive format=raw,file=claude-p.bin,if=$(QEMU_DISQUE) $(QEMU_OPTIONS) \
+	  -serial file:claude-p.log & q=$$!; \
+	for i in $$(seq $$(( $(DUREE_CLAUDE_P) * 10 ))); do \
+	  grep -qF -- "arbre : termine" claude-p.log 2>/dev/null && break; kill -0 $$q 2>/dev/null || break; sleep 0.1; \
+	done; \
+	kill $$q 2>/dev/null; wait $$q 2>/dev/null; \
+	grep -E "API Error|claude : termine" claude-p.log; \
+	while IFS= read -r ligne; do \
+	  grep -qF -- "$$ligne" claude-p.log || { echo "claude -p : manque « $$ligne »"; exit 1; }; \
+	done < claude-p-attendu.txt
+
 FORCE:
 
 run: boot.bin
@@ -869,7 +906,7 @@ MON_TESTS = mon-tests.sock
 QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
-tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin
+tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin claude-p
 	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
 	$(call attendre,$(QEMU_TEST) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"Clavier PS/2 pret",:)
 	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
@@ -946,7 +983,8 @@ test-%.bin: vide.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin vide*.bin test-*.bin programmes.cpio tests.cpio vide.cpio tests-demarrage.txt serial.log trace.log capture.log qemu.log ecran.png test-*.log $(MON_TESTS)
+	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio tests-demarrage.txt serial.log trace.log \
+	  capture.log qemu.log ecran.png test-*.log claude-p.log $(MON_TESTS)
 	rm -rf $(LINUX)
 	rm -rf $(GLIBC)
 	rm -rf $(SUITE)
@@ -958,4 +996,4 @@ clean:
 	cd zones && cargo clean
 	cd fichiers && cargo clean
 
-.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace tests-hote tests-qemu suite clean FORCE
+.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace tests-hote tests-qemu claude-p suite clean FORCE

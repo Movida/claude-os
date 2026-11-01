@@ -5,6 +5,7 @@ tests-demarrage.txt
 serial.log
 garde.log
 test-*.log
+claude-p.log
 trace.log
 capture.log
 qemu.log

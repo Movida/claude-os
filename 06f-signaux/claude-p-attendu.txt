@@ -1,0 +1,5 @@
+[noyau] Lancement : /etc/demarrage, 2 commandes.
+API Error: Can't reach the API server
+[noyau] claude : termine, code de sortie 1
+[linux] arbre : - 0600 1000 1000
+[noyau] arbre : termine, code de sortie 0 ; memoire rendue : ok.
