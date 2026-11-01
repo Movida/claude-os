@@ -22,19 +22,29 @@
 //!     le niveau 3) : il faut, à partir d'une base, un emplacement (le code
 //!     32 bits utilisateur, pour `sysretl`), les données utilisateur, puis
 //!     le code 64 bits utilisateur.
-//! D'où :
+//! D'où la disposition de Linux (arch/x86/include/asm/segment.h), entrée
+//! pour entrée :
 //!     0x00  nul
-//!     0x08  code noyau 64 bits          (STAR[47:32])
-//!     0x10  données noyau
-//!     0x18  code utilisateur 32 bits    (STAR[63:48]) : laissé NUL
-//!     0x20  données utilisateur         -> sélecteur 0x23 (niveau 3)
-//!     0x28  code utilisateur 64 bits    -> sélecteur 0x2B
-//!     0x30  TSS (deux entrées)
-//! Linux a la même disposition, décalée d'une entrée (il garde un code
-//! noyau 32 bits en 0x08). Le code utilisateur 32 bits reste nul : pas de
-//! « mode compatibilité » pour exécuter des programmes 32 bits. Un
-//! programme qui y sauterait (`ljmp` vers 0x1B) ferait une faute de
-//! protection générale, et `sysretl` n'est jamais employé.
+//!     0x08  code noyau 32 bits          : laissé NUL
+//!     0x10  code noyau 64 bits          (STAR[47:32])
+//!     0x18  données noyau
+//!     0x20  code utilisateur 32 bits    (STAR[63:48]) : laissé NUL
+//!     0x28  données utilisateur         -> sélecteur 0x2B (niveau 3)
+//!     0x30  code utilisateur 64 bits    -> sélecteur 0x33
+//!     0x38  libre
+//!     0x40  TSS (deux entrées)
+//! Choix de conception : les MÊMES sélecteurs que Linux, et pas seulement
+//! le même ordre. Les programmes les voient : dans CS et SS bien sûr, et
+//! dans le contexte que reçoit un gestionnaire de signal (le sigcontext,
+//! cadre_signal.rs), que lisent des programmes faits pour Linux (un JIT
+//! qui regarde CS pour savoir s'il interrompt du code 64 bits, un
+//! débogueur). Option écartée : la disposition serrée des étapes 5 à 6e
+//! (code noyau en 0x08, programmes en 0x23 et 0x2B), qui économisait une
+//! entrée mais donnait aux programmes d'autres sélecteurs que Linux. Les
+//! deux codes 32 bits restent nuls : pas de « mode compatibilité » pour
+//! exécuter des programmes 32 bits ; un programme qui y sauterait (`ljmp`
+//! vers 0x23) ferait une faute de protection générale, et `sysretl` n'est
+//! jamais employé.
 
 use core::arch::asm;
 use core::cell::UnsafeCell;
@@ -42,15 +52,15 @@ use core::mem::size_of;
 
 use crate::verrou::Verrou;
 
-pub const CODE_NOYAU: u16 = 0x08;
-pub const DONNEES_NOYAU: u16 = 0x10;
+pub const CODE_NOYAU: u16 = 0x10;
+pub const DONNEES_NOYAU: u16 = 0x18;
 /// La base des sélecteurs de `sysretq` (STAR[63:48]).
-pub const BASE_UTILISATEUR: u16 = 0x18;
+pub const BASE_UTILISATEUR: u16 = 0x20;
 /// Les sélecteurs des programmes : index dans la GDT, plus le niveau de
 /// privilège demandé (RPL) 3, dans les deux bits bas.
-pub const DONNEES_UTILISATEUR: u16 = 0x20 | 3;
-pub const CODE_UTILISATEUR: u16 = 0x28 | 3;
-const SELECTEUR_TSS: u16 = 0x30;
+pub const DONNEES_UTILISATEUR: u16 = 0x28 | 3;
+pub const CODE_UTILISATEUR: u16 = 0x30 | 3;
+const SELECTEUR_TSS: u16 = 0x40;
 
 /// Les piles de l'IST (Interrupt Stack Table), de 1 à 7 ; 0 = « pas
 /// d'IST ». Pour certaines exceptions, le processeur change TOUJOURS de
@@ -138,10 +148,10 @@ unsafe extern "C" {
     static __pile_mc_haut: u8;
 }
 
-/// 8 entrées de 8 octets : les 6 descripteurs de segment (dont le code
-/// 32 bits nul), puis la TSS qui en occupe deux (son adresse est sur
-/// 64 bits).
-static GDT: Verrou<[u64; 8]> = Verrou::new([0; 8]);
+/// 10 entrées de 8 octets : les 8 descripteurs de segment (dont les deux
+/// codes 32 bits nuls et l'entrée libre), puis la TSS qui en occupe deux
+/// (son adresse est sur 64 bits).
+static GDT: Verrou<[u64; 10]> = Verrou::new([0; 10]);
 
 /// Même format que les descripteurs écrits à la main à l'étape 2a (voir
 /// 02-mode-protege/boot.asm), en une seule valeur de 64 bits :
@@ -180,7 +190,7 @@ pub fn initialiser() {
     let tss_haut = base_tss >> 32;
 
     let mut gdt = GDT.verrouiller();
-    *gdt = [NULLE, CODE_64, DONNEES, NULLE, DONNEES_UTILISATEUR_DESC, CODE_64_UTILISATEUR, tss_bas, tss_haut];
+    *gdt = [NULLE, NULLE, CODE_64, DONNEES, NULLE, DONNEES_UTILISATEUR_DESC, CODE_64_UTILISATEUR, NULLE, tss_bas, tss_haut];
 
     // Ce que lit lgdt : taille - 1, puis adresse.
     #[repr(C, packed)]
@@ -189,7 +199,7 @@ pub fn initialiser() {
         base: u64,
     }
     let descripteur = Descripteur {
-        limite: (size_of::<[u64; 8]>() - 1) as u16,
+        limite: (size_of::<[u64; 10]>() - 1) as u16,
         base: gdt.as_ptr() as u64,
     };
 
