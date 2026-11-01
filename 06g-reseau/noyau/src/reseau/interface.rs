@@ -20,6 +20,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 /// Le matériel derrière une interface.
 pub enum Materiel {
+    /// L'interface de boucle (boucle.rs) : pas de matériel, une file.
+    Boucle,
     VirtioNet(&'static Carte),
 }
 
@@ -58,7 +60,8 @@ pub struct Interface {
 /// Le nombre maximal d'interfaces.
 const MAX: usize = 4;
 
-/// Les interfaces, dans l'ordre de leur numéro.
+/// Les interfaces, dans l'ordre de leur numéro : `lo` d'abord (1), puis
+/// les cartes (`eth0` : 2), comme chez Linux.
 static INTERFACES: Verrou<[Option<&'static Interface>; MAX]> = Verrou::new([None; MAX]);
 
 /// Ajoute une interface ; son numéro est le suivant. None : la table est
@@ -82,6 +85,18 @@ pub fn par_index(index: u32) -> Option<&'static Interface> {
     t.get((index as usize).checked_sub(1)?).copied().flatten()
 }
 
+/// La première carte (la première interface qui n'est pas `lo`) : `eth0`,
+/// que configure le DHCP.
+pub fn premiere_carte() -> Option<&'static Interface> {
+    INTERFACES.verrouiller().iter().flatten().find(|i| !i.boucle()).copied()
+}
+
+/// Une interface autre que `lo` a-t-elle son lien (le détecteur
+/// d'interblocage : une réponse peut encore venir du dehors) ?
+pub fn une_carte_a_son_lien() -> bool {
+    INTERFACES.verrouiller().iter().flatten().any(|i| !i.boucle() && i.lien.load(Ordering::Relaxed))
+}
+
 impl Interface {
     pub fn mtu(&self) -> u32 {
         self.mtu.load(Ordering::Relaxed)
@@ -100,9 +115,7 @@ impl Interface {
 
     /// Est-ce une interface de boucle (lo), plutôt qu'une carte ?
     pub fn boucle(&self) -> bool {
-        match self.materiel {
-            Materiel::VirtioNet(_) => false,
-        }
+        matches!(self.materiel, Materiel::Boucle)
     }
 
     /// Émet la trame `p` (le `dev_queue_xmit` de Linux), dans le contexte
@@ -115,6 +128,8 @@ impl Interface {
         }
         let longueur = p.longueur() as u64;
         let parti = match self.materiel {
+            // lo compte elle-même (boucle.rs : ses deux sens à la fois).
+            Materiel::Boucle => return super::boucle::emettre(self, p),
             Materiel::VirtioNet(c) => c.emettre(p),
         };
         if parti {
@@ -130,17 +145,19 @@ impl Interface {
     /// livrées à `super::recevoir`. Rend vrai s'il en reste.
     pub fn travailler(&'static self, budget: usize) -> bool {
         match self.materiel {
+            Materiel::Boucle => super::boucle::travailler(self, budget),
             Materiel::VirtioNet(c) => c.travailler(self, budget),
         }
     }
 }
 
-/// Le matériel de virtio-net, pour un message.
+/// Le matériel d'une interface, pour un message.
 pub fn decrire(i: &Interface) -> impl core::fmt::Display + '_ {
     struct D<'a>(&'a Interface);
     impl core::fmt::Display for D<'_> {
         fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
             match self.0.materiel {
+                Materiel::Boucle => write!(f, "boucle locale"),
                 Materiel::VirtioNet(_) => write!(f, "virtio-net {}", virtio_net::Mac(self.0.mac)),
             }
         }

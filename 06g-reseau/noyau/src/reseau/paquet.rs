@@ -13,8 +13,21 @@
 //! noyau (`try_reserve`). Les bornes sont vérifiées à chaque ajout et à
 //! chaque retrait : un en-tête plus long que ce qui reste est une erreur,
 //! jamais une lecture hors du tampon.
+//!
+//! Les octets de tous les paquets vivants sont comptés (`vivants`) : le
+//! lanceur les montre quand « memoire rendue » échoue, pour qu'un écart
+//! dise tout de suite s'il vient d'une file du réseau.
 
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicUsize, Ordering};
+
+/// Les octets des tampons de tous les paquets vivants.
+static VIVANTS: AtomicUsize = AtomicUsize::new(0);
+
+/// Les octets des tampons de tous les paquets vivants.
+pub fn vivants() -> usize {
+    VIVANTS.load(Ordering::Relaxed)
+}
 
 /// La marge laissée devant les données d'un paquet à émettre : de quoi
 /// ajouter les en-têtes d'UDP (8 octets), d'IPv4 (20 à 60) et d'Ethernet
@@ -39,6 +52,7 @@ impl Paquet {
         let mut tampon = Vec::new();
         tampon.try_reserve_exact(MARGE + longueur).ok()?;
         tampon.resize(MARGE + longueur, 0);
+        VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
         Some(Paquet { tampon, debut: MARGE, fin: MARGE })
     }
 
@@ -47,6 +61,7 @@ impl Paquet {
         let mut tampon = Vec::new();
         tampon.try_reserve_exact(octets.len()).ok()?;
         tampon.extend_from_slice(octets);
+        VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
         Some(Paquet { tampon, debut: 0, fin: octets.len() })
     }
 
@@ -94,5 +109,19 @@ impl Paquet {
         let debut = self.debut;
         self.debut += n;
         Some(&self.tampon[debut..debut + n])
+    }
+
+    /// Garde les `n` premiers octets des données (le `skb_trim`) : la
+    /// longueur que dit un en-tête, quand la trame en portait plus
+    /// (le bourrage d'une trame Ethernet trop courte). Plus que la
+    /// longueur : rien ne change.
+    pub fn couper(&mut self, n: usize) {
+        self.fin = self.fin.min(self.debut + n);
+    }
+}
+
+impl Drop for Paquet {
+    fn drop(&mut self) {
+        VIVANTS.fetch_sub(self.tampon.capacity(), Ordering::Relaxed);
     }
 }

@@ -149,6 +149,11 @@ pub fn recevoir(i: &'static Interface, a: &[u8], trame_diffusee: bool) {
     super::tache::signaler(super::tache::VOISINS);
 }
 
+/// Un paquet attend-il un voisin qui se cherche ?
+pub fn en_attente() -> bool {
+    VOISINS.verrouiller().as_ref().is_some_and(|t| t.en_attente())
+}
+
 /// L'état du voisin `adresse` de `i`, et son adresse matérielle.
 pub fn voisin(i: &Interface, adresse: [u8; 4]) -> Option<(Etat, [u8; 6])> {
     VOISINS.verrouiller().as_ref()?.voisin(i.index, adresse).map(|v| (v.etat, v.mac))

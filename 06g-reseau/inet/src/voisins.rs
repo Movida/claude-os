@@ -173,6 +173,11 @@ impl<T> Table<T> {
         Some(i)
     }
 
+    /// Un paquet attend-il dans la file d'une entrée ?
+    pub fn en_attente(&self) -> bool {
+        self.voisins.iter().any(|v| !v.attente.is_empty())
+    }
+
     /// Les entrées, pour /proc/net/arp.
     pub fn voisins(&self) -> impl Iterator<Item = &Voisin<T>> {
         self.voisins.iter()

@@ -418,7 +418,7 @@ impl Monte for ProcVue<'_> {
             (LIEN_FD, n, fd) => {
                 let Some(f) = self.ouvert(n, fd) else { return Texte::Emprunte(&[]) };
                 let chemin = if f.chemin.is_empty() { f.nom.octets() } else { &f.chemin[..] };
-                (Texte::Emprunte(chemin), f.numero().filter(|_| f.sorte != Sorte::Tube))
+                (Texte::Emprunte(chemin), f.numero().filter(|_| !matches!(f.sorte, Sorte::Tube | Sorte::Socket)))
             }
             _ => return Texte::Emprunte(&[]),
         };

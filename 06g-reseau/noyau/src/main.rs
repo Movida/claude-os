@@ -26,6 +26,7 @@ mod apic;
 mod attente;
 mod appel_systeme;
 mod appels_fichiers;
+mod appels_reseau;
 mod cadre_signal;
 mod cadres;
 mod carte_memoire;
@@ -444,7 +445,7 @@ fn tester_ordonnanceur() {
 fn tester_voisins() {
     use reseau::arp;
     use inet::voisins::Etat;
-    let (Some(i), Some(b)) = (reseau::interface::par_index(1), reseau::dhcp::bail()) else { return };
+    let (Some(i), Some(b)) = (reseau::interface::premiere_carte(), reseau::dhcp::bail()) else { return };
     let paquet = |destination: [u8; 4]| {
         let mut p = reseau::paquet::Paquet::vide(formats::reseau::ipv4::ENTETE)?;
         let e: &mut [u8; formats::reseau::ipv4::ENTETE] = p.ajouter_fin(formats::reseau::ipv4::ENTETE)?.try_into().ok()?;

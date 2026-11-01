@@ -342,6 +342,12 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
     Ok((carte, mac, lien))
 }
 
+/// La petite file d'émission de la carte est-elle vide (vrai sans carte) ?
+pub fn au_repos() -> bool {
+    let carte = *CARTE.verrouiller();
+    carte.is_none_or(|c| c.emission.verrouiller().attente.is_empty())
+}
+
 impl Carte {
     /// Émet la trame `p` : dans une case de l'anneau si possible, sinon dans
     /// la petite file. false : jetée (plus grande qu'une case : elle ne

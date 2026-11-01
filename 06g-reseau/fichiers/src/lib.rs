@@ -55,6 +55,7 @@ pub const S_IFDIR: u32 = 0o040_000;
 pub const S_IFLNK: u32 = 0o120_000;
 pub const S_IFCHR: u32 = 0o020_000;
 pub const S_IFIFO: u32 = 0o010_000;
+pub const S_IFSOCK: u32 = 0o140_000;
 // Les bits spéciaux des droits.
 pub const S_ISUID: u32 = 0o4000;
 pub const S_ISGID: u32 = 0o2000;

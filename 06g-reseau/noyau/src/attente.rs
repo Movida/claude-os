@@ -553,10 +553,24 @@ pub fn tic() {
 /// tâches du noyau (6g : les voisins du réseau, que la tâche du réseau fait
 /// vieillir pendant des dizaines de secondes) ne réveillent pas un programme
 /// ; sans cela, un programme bloqué pour toujours attendrait la prochaine
-/// échéance de la tâche du réseau pour être arrêté. Rend vrai s'il a arrêté
-/// quelqu'un.
+/// échéance de la tâche du réseau pour être arrêté. Une réponse du réseau
+/// le peut aussi : tant qu'une socket liée a quelqu'un dans sa file
+/// d'attente (un `recv`, un `poll`, un epoll qui la surveille) et qu'une
+/// carte a son lien, un datagramme peut encore venir du dehors, et le
+/// détecteur ne tue personne (6g : un ping attendu sans délai). Par `lo`,
+/// non : seul un programme qui s'exécute peut s'y envoyer quelque chose.
+/// Il épargne ainsi plus qu'il ne faudrait : un élément d'epoll reste
+/// inscrit dans la file de sa socket même quand personne n'attend l'epoll,
+/// et un programme bloqué pour toujours ailleurs (un futex, `pause`) n'est
+/// alors pas arrêté. C'est ce que fait Linux, qui n'arrête jamais
+/// personne ; ne compter que les éléments dont l'epoll a quelqu'un dans sa
+/// file serait plus juste, à voir quand la boucle de Bun aura des sockets
+/// (6h). Rend vrai s'il a arrêté quelqu'un.
 pub fn detecter_interblocage() -> bool {
     if MINUTERIES.verrouiller().iter().any(|(_, t)| t.est_programme()) || !ATTENTES_CALCUL.verrouiller().is_empty() {
+        return false;
+    }
+    if crate::reseau::udp::attentes() > 0 && crate::reseau::interface::une_carte_a_son_lien() {
         return false;
     }
     let mut bloquees: Vec<Arc<Tache>> = Vec::new();

@@ -126,6 +126,7 @@ pub fn sonder(o: &FichierTenu, table: &mut Table) -> u32 {
         // Un epoll : prêt si l'un de ses prêts l'est vraiment (epoll.rs).
         Sorte::Epoll => o.epoll().sonder(table, o),
         Sorte::Tube => o.tube().sonder(table, o),
+        Sorte::Socket => o.socket().sonder(table, o),
         // Les autres n'ont pas d'opération de sondage chez nous : toujours
         // prêts. La console n'est pas encore un terminal (6j) : sa lecture
         // rend « fin de fichier » sans attendre. Une valeur de /proc/sys ou

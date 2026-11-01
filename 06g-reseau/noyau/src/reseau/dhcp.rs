@@ -131,7 +131,7 @@ fn appliquer(i: &Interface, b: &Bail) {
         i.changer_mtu(m as u32);
     }
     super::ipv4::avec_table(|t| {
-        let _ = t.ajouter_adresse(Adresse { interface: i.index, adresse: b.adresse, prefixe: b.prefixe });
+        let _ = t.ajouter_adresse(Adresse { interface: i.index, adresse: b.adresse, prefixe: b.prefixe, boucle: false });
         if let Some(passerelle) = b.passerelle {
             let _ = t.ajouter_route(Route { reseau: ipv4::AUCUNE, prefixe: 0, passerelle: Some(passerelle), interface: i.index, source: b.adresse });
         }
@@ -156,7 +156,7 @@ pub fn recu(i: &'static Interface, message: &[u8]) {
 /// l'adresse obtenue, ou l'abandon. Dans la tâche du lanceur, avant
 /// /etc/demarrage. Sans interface, ou son câble débranché : rien.
 pub fn configurer() {
-    let Some(i) = interface::par_index(1) else { return };
+    let Some(i) = interface::premiere_carte() else { return };
     if !i.lien.load(core::sync::atomic::Ordering::Relaxed) {
         return afficherln!("[reseau] {} : lien coupe, pas de DHCP.", i.nom);
     }

@@ -71,8 +71,10 @@ wait
 /bin/fils
 /bin/fils groupe
 /bin/courses
+# Les sockets UDP (6g), sur lo.
+/bin/reseau
 # Le réseau (6g), tel que l'a configuré le DHCP du démarrage : /proc/net,
-# /etc/resolv.conf.
+# /etc/resolv.conf, un datagramme vers la passerelle.
 /bin/passerelle
 # Et le jalon de 6d, et de 6e : le vrai Claude Code, en dernier (ce qui
 # précède a déjà dit si le noyau va bien).

@@ -303,7 +303,10 @@ impl Lanceur {
             }
         };
         self.en_cours -= 1;
-        let rendue = || Rendue(self.libres, pages::libres(), crate::signaux::en_file());
+        if self.en_cours == 0 {
+            attendre_le_reseau();
+        }
+        let rendue = || Rendue(self.libres, pages::libres(), crate::signaux::en_file(), crate::reseau::paquet::vivants());
         match fin {
             Some((nom, code)) if self.en_cours == 0 && !self.paralleles => {
                 afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.", nom, code, rendue())
@@ -332,15 +335,34 @@ impl Lanceur {
 /// qui manque (ou ce qui a été rendu en retard, d'un programme d'avant).
 /// Depuis 6f, aussi le compte des siginfo en file de l'utilisateur
 /// (signaux.rs) : sans programme, il doit être revenu à 0, sinon un compte
-/// perdu finirait par refuser des signaux (RLIMIT_SIGPENDING).
-struct Rendue(usize, usize, u64);
+/// perdu finirait par refuser des signaux (RLIMIT_SIGPENDING). Depuis 6g,
+/// un ECHEC dit aussi les octets des paquets du réseau encore vivants
+/// (reseau::paquet) : un écart qui vient d'une file du réseau se voit tout
+/// de suite.
+struct Rendue(usize, usize, u64, usize);
 
 impl fmt::Display for Rendue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match (self.1 as i64 - self.0 as i64, self.2) {
             (0, 0) => write!(f, "ok"),
             (0, n) => write!(f, "ECHEC ({} siginfo encore comptes en file)", n),
-            (d, _) => write!(f, "ECHEC ({:+} pages libres)", d),
+            (d, _) => write!(f, "ECHEC ({:+} pages libres, {} octets de paquets vivants)", d, self.3),
+        }
+    }
+}
+
+/// Attend que le réseau soit au repos (reseau::au_repos), 4 s au plus,
+/// avant de mesurer la mémoire rendue : un programme qui a écrit à une
+/// machine muette juste avant de finir a laissé son paquet dans la file du
+/// voisin, jusqu'à l'échec de celui-ci (3 s, inet::voisins). Par tranches
+/// d'une milliseconde (le tic).
+fn attendre_le_reseau() {
+    let fin = crate::temps::ns_monotone() + 4_000_000_000;
+    while !crate::reseau::au_repos() && crate::temps::ns_monotone() < fin {
+        let interruptions = crate::cpu::couper_interruptions();
+        crate::attente::dormir(Some(crate::temps::ns_monotone() + 1_000_000), crate::attente::Sommeil::Ininterruptible);
+        if interruptions {
+            crate::cpu::activer_interruptions();
         }
     }
 }

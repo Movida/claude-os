@@ -50,10 +50,13 @@ const BUDGET: usize = 64;
 
 struct Travail {
     a_faire: u32,
+    /// La tâche fait le travail qu'elle a pris (de la prise jusqu'à son
+    /// retour dans `attendre`, qui le revoit vide avant de dormir).
+    en_travail: bool,
     attente: FileAttente,
 }
 
-static TRAVAIL: Verrou<Travail> = Verrou::new(Travail { a_faire: 0, attente: FileAttente::new() });
+static TRAVAIL: Verrou<Travail> = Verrou::new(Travail { a_faire: 0, en_travail: false, attente: FileAttente::new() });
 
 /// Signale du travail à la tâche du réseau (depuis une interruption, ou
 /// d'ailleurs), et la réveille.
@@ -71,6 +74,12 @@ pub fn signaler_interface(index: u32) {
     }
 }
 
+/// La tâche n'a-t-elle aucun travail, ni en attente, ni en cours ?
+pub fn au_repos() -> bool {
+    let t = TRAVAIL.verrouiller();
+    t.a_faire == 0 && !t.en_travail
+}
+
 /// Prend le travail en attente, en dormant tant qu'il n'y en a pas, et au
 /// plus jusqu'à `echeance` (alors rien : c'est l'heure des minuteurs).
 fn attendre(echeance: Option<u64>) -> u32 {
@@ -78,8 +87,10 @@ fn attendre(echeance: Option<u64>) -> u32 {
     let travail = loop {
         let mut t = TRAVAIL.verrouiller();
         if t.a_faire != 0 || echeance.is_some_and(|e| e <= temps::ns_monotone()) {
+            t.en_travail = true;
             break core::mem::take(&mut t.a_faire);
         }
+        t.en_travail = false;
         t.attente.inscrire();
         drop(t);
         attente::dormir(echeance, Sommeil::Ininterruptible);

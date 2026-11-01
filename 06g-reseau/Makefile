@@ -3,7 +3,8 @@
 # virtio (noyau/src/virtio.rs, virtqueue.rs) et la carte virtio-net, ses
 # files et la tâche du réseau (noyau/src/reseau/) ; Ethernet, IPv4 et la
 # configuration par DHCP (formats/src/reseau/, et la bibliothèque inet/ :
-# les routes, le client DHCP), ARP et la table des voisins.
+# les routes, le client DHCP), ARP et la table des voisins ; les sockets
+# et UDP, avec l'interface de boucle lo.
 # De 6f : les signaux livrés à leurs gestionnaires (le
 # cadre de signal, rt_sigreturn, la reprise des appels interrompus),
 # l'attente d'événements (poll, select, epoll), les tubes, /proc fabriqué
@@ -44,8 +45,9 @@
 #                  une carte sans MSI-X laissée éteinte ; le câble
 #                  débranché puis rebranché, vu ; un réseau sans DHCP ;
 #                  et make claude-p
-#   make claude-p -> le jalon de 6f, dans une image à part : claude -p
-#                  bonjour jusqu'à l'appel de l'API (claude-p-attendu.txt)
+#   make claude-p -> le jalon de 6f et de 6g, dans une image à part :
+#                  claude -p bonjour jusqu'à la connexion à l'API
+#                  (claude-p-attendu.txt)
 #   make tests-hote -> les tests sur la machine hôte : ceux de la
 #                  bibliothèque des formats (formats/ : archive cpio,
 #                  exécutables ELF, essayés aussi sur de vrais programmes
@@ -71,7 +73,8 @@
 #                  linux/systeme (uname, futex, prctl...),
 #                  linux/evenements (eventfd, epoll), linux/proc,
 #                  linux/clone (clone, clone3), linux/fils et
-#                  linux/courses (des programmes à plusieurs fils)
+#                  linux/courses (des programmes à plusieurs fils), et
+#                  linux/reseau (les sockets UDP, sur lo)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -201,10 +204,13 @@ boot.bin: programmes.cpio FORCE
 #     aussi ;
 #   - courses : gcc -static, quatre fils qui ferment, changent de dossier et
 #     se servent en même temps des mêmes descripteurs ; sur l'hôte aussi ;
+#   - reseau : gcc -static, les sockets UDP sur lo (les appels et leurs
+#     refus, les options, la socket vue comme fichier, les attentes d'un fil
+#     à l'autre, 10 000 allers-retours) ; sur l'hôte aussi ;
 #   - passerelle : gcc sans option (la glibc partagée, comme claude), le
 #     réseau que le DHCP du démarrage a configuré (/proc/net, le DNS de
-#     /etc/resolv.conf) ; dans notre noyau seulement (il connaît les
-#     adresses du réseau de QEMU).
+#     /etc/resolv.conf, un datagramme qui part par eth0) ; dans notre noyau
+#     seulement (il connaît les adresses du réseau de QEMU).
 # Pour les tests du lecteur ELF sur l'hôte, des variantes qu'il doit
 # accepter : bonjour-c-deux-segments (gcc -static -z noseparate-code : code
 # et données dans deux segments seulement, la disposition d'avant binutils
@@ -316,6 +322,10 @@ $(LINUX)/fils: linux/fils.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@ -lm
 
 $(LINUX)/courses: linux/courses.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/reseau: linux/reseau.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -695,15 +705,16 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
 	{ cat archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } | sh archive.sh $@ -
 
-# L'archive du jalon de 6f : celle de l'étape, dont /etc/demarrage ne lance
-# que claude -p (racine/etc/demarrage-claude-p), puis la liste de HOME.
+# L'archive du jalon de 6f et de 6g : celle de l'étape, dont /etc/demarrage
+# ne lance que claude -p (racine/etc/demarrage-claude-p), puis la liste de
+# HOME.
 claude-p.cpio: programmes.cpio racine/etc/demarrage-claude-p
 	{ sed 's|racine/etc/demarrage |racine/etc/demarrage-claude-p |' archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } \
 	  | sh archive.sh $@ -
@@ -712,17 +723,18 @@ claude-p.bin: claude-p.cpio FORCE
 	cd noyau && cargo build --release
 	$(call image,$(NOYAU_ELF),claude-p.cpio,claude-p)
 
-# Le temps que met claude -p dans QEMU sans accélération (28 s mesurées ici,
-# le double ou plus sur une machine de la CI).
+# Le temps que met claude -p dans QEMU sans accélération (28 s mesurées ici
+# en 6f ; 33 s en 6g, l'image construite comprise, avec le DNS et la
+# connexion refusée ; le double ou plus sur une machine de la CI).
 DUREE_CLAUDE_P = 240
 
 # claude -p bonjour, dans notre noyau : il doit aller jusqu'à l'appel de
-# l'API, et dire qu'il ne la trouve pas (pas de réseau avant 6g). Sa ligne
-# de fin ne dit pas « memoire rendue : ok » : Claude laisse dans HOME sa
-# configuration (.claude.json et ses copies) et la télémétrie qu'il n'a pas
-# pu envoyer (environ 300 Kio), que le tmpfs garde, à raison. Le contrôle
-# ne sait pas les distinguer d'une fuite ; `arbre` les montre, et sa propre
-# mémoire, elle, est rendue.
+# l'API, trouver son adresse par le DNS, et dire que la connexion est
+# refusée (pas de TCP avant 6h). Sa ligne de fin ne dit pas « memoire
+# rendue : ok » : Claude laisse dans HOME sa configuration (.claude.json et
+# ses copies) et la télémétrie qu'il n'a pas pu envoyer (environ 300 Kio),
+# que le tmpfs garde, à raison. Le contrôle ne sait pas les distinguer
+# d'une fuite ; `arbre` les montre, et sa propre mémoire, elle, est rendue.
 claude-p: claude-p.bin
 	rm -f claude-p.log; \
 	timeout $(DUREE_CLAUDE_P) $(QEMU_TEST) -drive format=raw,file=claude-p.bin,if=$(QEMU_DISQUE) $(QEMU_OPTIONS) \
@@ -842,7 +854,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -874,6 +886,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/fils | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	./$(LINUX)/fils groupe; test $$? = 7
 	./$(LINUX)/courses | tee /dev/stderr | (! grep -q ECHEC)
+	timeout 60 ./$(LINUX)/reseau | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	rm -rf /tmp/ajout; \
 	  ./$(LINUX)/ajout ecrire a 500 & a=$$!; ./$(LINUX)/ajout ecrire b 500 & b=$$!; \
 	  ./$(LINUX)/ajout verifier 500 | tee /dev/stderr | (! grep -q ECHEC); r=$$?; wait $$a $$b; exit $$r

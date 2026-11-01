@@ -56,7 +56,7 @@ use fichiers::chemins::{Arbre, Depart, Dernier, Fin, PATH_MAX, Suivre};
 use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_tmpfs};
 use crate::vfs::Montage;
 use fichiers::tmpfs::{Attributs, Numero, Ouverture, limite_ecriture, suivre_pour};
-use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, permis};
+use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, permis};
 use crate::attente::{GardeMutex, Mutex};
 
 // Les numéros d'erreur de Linux qui ne viennent pas du tmpfs.
@@ -204,6 +204,14 @@ impl FichierTenu {
         match &self.prive {
             Prive::Tube(t) => t,
             _ => unreachable!("un tube sans objet"),
+        }
+    }
+
+    /// La socket d'un fichier de sorte Socket.
+    pub fn socket(&self) -> &alloc::sync::Arc<crate::reseau::socket::Socket> {
+        match &self.prive {
+            Prive::Socket(s) => s,
+            _ => unreachable!("une socket sans objet"),
         }
     }
 
@@ -461,6 +469,9 @@ fn sorte(mode: u32, rdev: (u32, u32)) -> Result<Sorte, i64> {
         // L'inode d'un tube, rouvert par /proc/<pid>/fd (le `fifo_open` de
         // Linux) : son tube (tube::rouvrir).
         S_IFIFO => Sorte::Tube,
+        // Une socket ne se rouvre pas par son inode (`sock_no_open` : ENXIO,
+        // mesuré) ; O_PATH, oui (il ne passe pas par ici).
+        S_IFSOCK => return Err(errno(Erreur::ENXIO)),
         S_IFCHR => match rdev {
             vfs::NULL => Sorte::Null,
             vfs::ZERO => Sorte::Zero,
@@ -842,16 +853,29 @@ pub fn installer_paire(a: FichierOuvert, b: FichierOuvert, fermer_a_l_exec: bool
 /// est dans la table, avant que son descripteur n'existe (personne ne peut
 /// encore s'en servir) : un epoll y apprend sa case.
 pub fn installer_fichier_puis(f: FichierOuvert, fermer_a_l_exec: bool, range: impl FnOnce(Fichier)) -> i64 {
+    // Refusé, le fichier rend son inode s'il en tient un du tmpfs (celui
+    // d'une socket : 6g).
+    let rendre = |f: FichierOuvert| {
+        if let Tenu::Tmpfs(o) = f.tenu {
+            vfs::avec(|fs, cadres| fs.fermer(&o, cadres));
+        }
+    };
     let fd = match reserver() {
         Ok(fd) => fd,
-        Err(e) => return e,
+        Err(e) => {
+            rendre(f);
+            return e;
+        }
     };
     match vfs::avec_systeme(|s, _| s.ouverts.ajouter(f)) {
         Ok(fichier) => {
             range(fichier);
             fd.installer(fichier, fermer_a_l_exec) as i64
         }
-        Err(_) => -ENOMEM,
+        Err(f) => {
+            rendre(f);
+            -ENOMEM
+        }
     }
 }
 
@@ -1034,11 +1058,12 @@ fn verifier_transfert(tampon: u64, longueur: u64, position: u64) -> Result<u64, 
 /// la position du fichier, `None`, qui avance d'autant : l'appelant tient
 /// son verrou, voir `verrous`).
 fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
-    // Un eventfd, un epoll ou un tube n'a pas de position : pread rend
-    // ESPIPE avant tout (FMODE_PREAD n'est pas mis) ; un epoll ne se lit
-    // pas (pas d'opération read : EINVAL, avant de regarder le tampon).
+    // Un eventfd, un epoll, un tube ou une socket n'a pas de position :
+    // pread rend ESPIPE avant tout (FMODE_PREAD n'est pas mis) ; un epoll ne
+    // se lit pas (pas d'opération read : EINVAL, avant de regarder le
+    // tampon).
     match o.sorte {
-        Sorte::EventFd | Sorte::Epoll | Sorte::Tube if position.is_some() => return Err(-ESPIPE),
+        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket if position.is_some() => return Err(-ESPIPE),
         Sorte::Epoll => return Err(-EINVAL),
         _ => {}
     }
@@ -1064,6 +1089,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         Sorte::Chemin => Err(-EBADF),
         Sorte::EventFd => evenements::lire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Tube => en_resultat(o.tube().lire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0)),
+        Sorte::Socket => en_resultat(crate::appels_reseau::lire(o, &[(tampon, longueur)])),
         Sorte::Epoll => Err(-EINVAL),
         Sorte::Noyau { .. } => {
             let contenu = procfs::lire(o.fichier(), ici, longueur)?;
@@ -1100,7 +1126,7 @@ pub fn verrou_d_ecriture(n: Numero) -> GardeMutex<'static, ()> {
 fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
     // Comme pour lire : ESPIPE, puis EINVAL pour un epoll.
     match o.sorte {
-        Sorte::EventFd | Sorte::Epoll | Sorte::Tube if position.is_some() => return Err(-ESPIPE),
+        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket if position.is_some() => return Err(-ESPIPE),
         Sorte::Epoll => return Err(-EINVAL),
         _ => {}
     }
@@ -1146,6 +1172,7 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
         Sorte::EventFd => evenements::ecrire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Tube => en_resultat(o.tube().ecrire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0,
                                                o.drapeaux as u64 & O_DIRECT != 0)),
+        Sorte::Socket => en_resultat(crate::appels_reseau::ecrire(o, &[(tampon, longueur)])),
         Sorte::Epoll => Err(-EINVAL),
         // Un fichier du noyau qui s'écrit (procfs::ecrivable : comm) :
         // seuls ses 15 premiers octets comptent, copiés d'abord, sans rien
@@ -1224,7 +1251,7 @@ pub fn pwrite64(fd: u64, tampon: u64, longueur: u64, position: u64) -> i64 {
 /// dépasse pas RW_MAX : au-delà, le transfert est partiel, comme pour un
 /// read. (Un point de « Reste à faire » de l'étape 5 : writev écrivait les
 /// premiers morceaux avant de découvrir une erreur dans un suivant.)
-fn morceaux(adresse: u64, nombre: u64) -> Result<Vec<(u64, u64)>, i64> {
+pub fn morceaux(adresse: u64, nombre: u64) -> Result<Vec<(u64, u64)>, i64> {
     if nombre > 1024 {
         return Err(-EINVAL);
     }
@@ -1278,6 +1305,11 @@ fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
         } else {
             o.tube().lire(&morceaux, non_bloquant)
         };
+    }
+    // Une socket aussi : un seul datagramme, de tous les morceaux, ou dans
+    // tous les morceaux (le `sock_read_iter` et le `sock_write_iter`).
+    if o.sorte == Sorte::Socket {
+        return if ecrire { crate::appels_reseau::ecrire(&o, &morceaux) } else { crate::appels_reseau::lire(&o, &morceaux) };
     }
     // Un eventfd se lit d'un coup, sur tous les morceaux (evenements.rs).
     if !ecrire && o.sorte == Sorte::EventFd {
@@ -1346,7 +1378,7 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
     let position = o.position();
     let nouvelle = match (o.sorte, depuis) {
         (Sorte::Chemin, _) => return -EBADF,
-        (Sorte::Console | Sorte::Tube, _) => return -ESPIPE,
+        (Sorte::Console | Sorte::Tube | Sorte::Socket, _) => return -ESPIPE,
         (Sorte::Null | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. }, _) => return 0,
         // Ni position ni taille : `noop_llseek`, qui rend la position, nulle.
         (Sorte::EventFd | Sorte::Epoll, _) => return position as i64,
@@ -1879,6 +1911,7 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
             Err(_) => -EFAULT,
         },
         _ if o.sorte == Sorte::Epoll => -EINVAL,
+        _ if o.sorte == Sorte::Socket => crate::appels_reseau::ioctl(&o, requete as u32 as u64, argument),
         _ if matches!(o.sorte, Sorte::Aleatoire { .. }) => ioctl_aleatoire(requete as u32 as u64, argument),
         _ => -ENOTTY,
     }

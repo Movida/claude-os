@@ -26,9 +26,8 @@
 //!   - des `Rc` pour les fichiers ouverts : leur allocation ne sait pas
 //!     échouer, et une allocation demandée par un programme doit pouvoir
 //!     rendre ENOMEM. Une table à index, avec un compteur explicite.
-//! Les sortes à venir : les sockets (6h). Une sorte de
-//! plus, ce sera une ligne de plus dans chaque `match` des appels
-//! (appels_fichiers.rs). Certaines ont des données à elles, de deux
+//! Une sorte de plus (les sockets, 6g), c'est une ligne de plus dans chaque
+//! `match` des appels (appels_fichiers.rs). Certaines ont des données à elles, de deux
 //! façons : sous le verrou des fichiers (la source d'un fichier de /proc :
 //! `Donnees`), ou dans un objet du noyau qui a son propre verrou, et dont se
 //! servent sans celui des fichiers les appels qui tiennent le fichier (un
@@ -76,6 +75,9 @@ pub enum Sorte {
     /// Un bout de tube (6f) : son objet dans `Prive::Tube`, son inode dans
     /// le tmpfs (sans nom).
     Tube,
+    /// Une socket (6g) : son objet dans `Prive::Socket`, son inode dans le
+    /// tmpfs (sans nom, celui de sockfs chez Linux).
+    Socket,
     /// Un fichier d'un système du noyau (/proc, /sys, 6d), dont le contenu
     /// est fabriqué à la lecture (`Donnees::Noyau`), d'une des trois façons
     /// de Linux.
@@ -109,7 +111,7 @@ impl Sorte {
     /// /dev/random et les terminaux acceptés.
     pub fn sait_attendre(self) -> bool {
         matches!(self, Sorte::Aleatoire { random: true } | Sorte::Console | Sorte::EventFd | Sorte::Epoll | Sorte::Tube
-                       | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
+                       | Sorte::Socket | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
     }
 }
 
@@ -136,6 +138,7 @@ pub enum Prive {
     EventFd(Arc<crate::evenements::EventFd>),
     Epoll(Arc<crate::epoll::Epoll>),
     Tube(Arc<crate::tube::Tube>),
+    Socket(Arc<crate::reseau::socket::Socket>),
 }
 
 /// Ce que tient un fichier ouvert : un inode du tmpfs, avec ce qu'a rendu
@@ -291,6 +294,7 @@ impl Ouverts {
         if let Some(o) = ferme.as_mut() {
             crate::epoll::fichier_ferme(self, o);
             crate::tube::fichier_ferme(o);
+            crate::reseau::socket::fichier_ferme(o);
         }
         while self.cases.last().is_some_and(Option::is_none) {
             self.cases.pop();

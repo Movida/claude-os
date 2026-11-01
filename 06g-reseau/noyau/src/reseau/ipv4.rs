@@ -22,17 +22,31 @@
 //! est jeté, comme Linux par défaut (`accept_source_route` à 0), et un
 //! en-tête dont les options ne se lisent pas aussi ; les autres sont
 //! sautées (Linux les vérifie une à une, `ip_options_compile`, et répond à
-//! une option fausse par un « problème de paramètre » : un écart). Avant la
-//! configuration,
-//! les réponses au client DHCP (port 68) lui sont passées quelle que soit
-//! leur destination (le `ic_bootp_recv` de Linux, branché avant ce tri).
+//! une option fausse par un « problème de paramètre » : un écart). Avant
+//! la configuration, les réponses au client DHCP (port 68) lui sont
+//! passées quelle que soit leur destination (le `ic_bootp_recv` de Linux,
+//! branché avant ce tri).
+//! Puis le protocole : UDP (udp.rs) ; les autres sont jetés (ICMP : le
+//! commit suivant).
+//!
+//! LA SORTIE (`ip_queue_xmit`, `ip_make_skb`) : la route (`router`), puis
+//! l'en-tête, puis l'interface : `lo` pour une de nos adresses (Linux
+//! aussi : la route locale passe par `lo`), la diffusion d'Ethernet pour
+//! une diffusion, le voisin (ARP) pour le reste. Pas de fragmentation : un
+//! paquet plus grand que la MTU est refusé avant (EMSGSIZE, udp.rs ; un
+//! écart, Linux le fragmente avec IP_PMTUDISC_WANT, le réglage par
+//! défaut). Une diffusion envoyée n'est pas rendue aussi aux sockets de la
+//! machine (Linux en fait toujours une copie par la boucle, `ip_mc_output` ;
+//! IP_MULTICAST_LOOP ne règle que la multidiffusion) : un écart écrit.
 
-use super::interface::Interface;
+use super::interface::{self, Interface};
 use super::paquet::Paquet;
 use crate::verrou::Verrou;
-use core::sync::atomic::{AtomicU64, Ordering};
-use formats::reseau::{dhcp as format_dhcp, ipv4, udp};
-use inet::routes::Table;
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use formats::reseau::{dhcp as format_dhcp, ethernet, ipv4, udp};
+use inet::routes::{Chemin, Table};
+
+const ENETUNREACH: i64 = 101;
 
 /// Les adresses et les routes ; faites au démarrage.
 static TABLE: Verrou<Option<Table>> = Verrou::new(None);
@@ -45,9 +59,16 @@ static PAS_POUR_NOUS: AtomicU64 = AtomicU64::new(0);
 static FRAGMENTS: AtomicU64 = AtomicU64::new(0);
 static OPTIONS: AtomicU64 = AtomicU64::new(0);
 
-/// Fait la table (vide). Au démarrage.
+/// L'identifiant des paquets qui en demandent un sans être d'une socket
+/// connectée (voir `identifiant`).
+static IDENTIFIANT: AtomicU16 = AtomicU16::new(0);
+
+/// Fait la table (vide), et tire le premier identifiant. Au démarrage.
 pub fn initialiser() {
     *TABLE.verrouiller() = Table::new(inet::routes::MAX);
+    let mut h = [0u8; 2];
+    crate::aleatoire::remplir(&mut h);
+    IDENTIFIANT.store(u16::from_le_bytes(h), Ordering::Relaxed);
 }
 
 /// Fait `f` sur la table (sous son verrou : `f` ne dort pas). None : pas de
@@ -140,8 +161,128 @@ pub fn recevoir(i: &'static Interface, p: Paquet) {
     if !options_acceptees(&p.donnees()[..h.longueur_entete]) {
         return compter(&OPTIONS);
     }
-    // Aucun protocole au-dessus d'IPv4 pour l'instant : le paquet s'arrête
-    // ici.
+    // Une diffusion (la limitée, ou celle d'un réseau de l'interface) va à
+    // chaque socket qui l'accepte.
+    let diffusion = TABLE.verrouiller().as_ref().is_some_and(|t| t.est_diffusion(i.index, h.destination)) || de_rien_a_rien(&h);
+    let mut p = p;
+    let longueur = h.longueur as usize - h.longueur_entete;
+    let _ = p.retirer_entete(h.longueur_entete);
+    p.couper(longueur);
+    match h.protocole {
+        ipv4::UDP => {
+            super::udp::recevoir(i.index, h.source, h.destination, diffusion, p);
+        }
+        // ICMP, et « protocole injoignable » pour les autres : le commit
+        // suivant.
+        _ => {}
+    }
+}
+
+/// Ce que précise l'envoi d'un paquet (le `flowi4` et l'`ipcm_cookie` de
+/// Linux) : les adresses, le protocole, et les champs de l'en-tête.
+pub struct Envoi {
+    pub source: [u8; 4],
+    pub destination: [u8; 4],
+    pub protocole: u8,
+    pub ttl: u8,
+    pub tos: u8,
+    pub identifiant: u16,
+    pub ne_pas_fragmenter: bool,
+    /// MSG_CONFIRM : la machine voisine est là (arp.rs).
+    pub confirmer: bool,
+}
+
+/// Le chemin vers `destination` (l'`ip_route_output_key` de Linux), et la
+/// destination à mettre dans l'en-tête : 0.0.0.0 veut dire « cette
+/// machine », et devient la source demandée (`source` : celle de `bind`
+/// ou d'IP_PKTINFO), ou sans elle 127.0.0.1, comme
+/// `ip_route_output_key_hash_rcu`. Pas de route : ENETUNREACH.
+pub fn router(destination: [u8; 4], source: Option<[u8; 4]>) -> Result<(Chemin, [u8; 4]), i64> {
+    let destination = if destination == ipv4::AUCUNE {
+        source.filter(|&s| s != ipv4::AUCUNE).unwrap_or(super::boucle::ADRESSE)
+    } else {
+        destination
+    };
+    match TABLE.verrouiller().as_ref().and_then(|t| t.chercher(destination)) {
+        Some(c) => Ok((c, destination)),
+        None => Err(-ENETUNREACH),
+    }
+}
+
+/// L'adresse source que propose le chemin `c`.
+pub fn source(c: &Chemin) -> [u8; 4] {
+    match *c {
+        Chemin::Locale { source } | Chemin::Diffusion { source, .. } | Chemin::Unicast { source, .. } => source,
+    }
+}
+
+/// Le chemin `c` passe-t-il par `lo` ?
+pub fn par_lo(c: &Chemin) -> bool {
+    interface_de(c).is_some_and(|i| i.boucle())
+}
+
+/// L'interface qui porte notre adresse `a`, s'il y en a une.
+pub fn interface_de_l_adresse(a: [u8; 4]) -> Option<u32> {
+    avec_table(|t| t.interface_de(a)).flatten()
+}
+
+/// L'interface par où part ce qui suit le chemin `c`.
+fn interface_de(c: &Chemin) -> Option<&'static Interface> {
+    match *c {
+        Chemin::Locale { .. } => super::boucle::interface(),
+        Chemin::Diffusion { interface, .. } | Chemin::Unicast { interface, .. } => interface::par_index(interface),
+    }
+}
+
+/// La MTU du chemin `c` : celle de son interface, au plus 65 535 (la plus
+/// grande longueur que dit un en-tête IPv4 : `ipv4_mtu` borne aussi celle
+/// de lo, 65 536, à IP_MAX_MTU). Linux mémorise aussi celle qu'apprend un
+/// ICMP « fragmentation nécessaire » : pas encore.
+pub fn mtu(c: &Chemin) -> u32 {
+    interface_de(c).map_or(super::boucle::MTU, |i| i.mtu()).min(0xFFFF)
+}
+
+/// Un identifiant pour un paquet qui n'est pas d'une socket connectée
+/// (sauf IP_PMTUDISC_DO et PROBE, qui ont 0 : voir udp.rs). Linux le tire
+/// de compteurs choisis par un hachage à clé secrète de la destination
+/// (`__ip_select_ident`), pour qu'un tiers ne puisse pas compter, par la
+/// différence de deux identifiants qu'il reçoit, ce que la machine envoie
+/// aux autres ; chez nous, un compteur parti du hasard, que ce tiers peut
+/// lire : un écart écrit, jusqu'au générateur ChaCha20 de 6h (qui
+/// servira aussi aux numéros de séquence de TCP).
+pub fn identifiant() -> u16 {
+    IDENTIFIANT.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Émet le paquet `p` (sa charge en place, l'en-tête du protocole
+/// compris) selon `e`, par le chemin `c` : l'en-tête IPv4 devant, puis
+/// l'interface du chemin, dans le contexte de qui envoie (le
+/// `dev_queue_xmit` de Linux). Rien ne revient : un paquet perdu en route
+/// (file pleine, voisin muet) l'est sans le dire, comme sur un câble.
+pub fn emettre(c: Chemin, e: &Envoi, mut p: Paquet) {
+    let longueur = (p.longueur() + ipv4::ENTETE) as u16;
+    let Some(entete) = p.ajouter_entete(ipv4::ENTETE) else { return };
+    let entete: &mut [u8; ipv4::ENTETE] = entete.try_into().expect("20 octets");
+    ipv4::ecrire(entete, &ipv4::Ipv4 {
+        tos: e.tos,
+        longueur,
+        identifiant: e.identifiant,
+        ne_pas_fragmenter: e.ne_pas_fragmenter,
+        fragments_suivants: false,
+        decalage: 0,
+        ttl: e.ttl,
+        protocole: e.protocole,
+        source: e.source,
+        destination: e.destination,
+        longueur_entete: ipv4::ENTETE,
+    });
+    let Some(i) = interface_de(&c) else { return };
+    match c {
+        // lo : pas de voisin (IFF_NOARP), une adresse matérielle nulle.
+        Chemin::Locale { .. } => super::ethernet::emettre(i, [0; 6], ethernet::IPV4, p),
+        Chemin::Diffusion { .. } => super::ethernet::emettre(i, ethernet::DIFFUSION, ethernet::IPV4, p),
+        Chemin::Unicast { prochain, .. } => super::arp::envoyer(i, prochain, p, e.confirmer),
+    }
 }
 
 /// Émet par `i` le paquet `p` (sa charge en place) en diffusion limitée
@@ -166,5 +307,5 @@ pub fn emettre_en_diffusion(i: &'static Interface, source: [u8; 4], protocole: u
         destination: ipv4::DIFFUSION,
         longueur_entete: ipv4::ENTETE,
     });
-    super::ethernet::emettre(i, formats::reseau::ethernet::DIFFUSION, formats::reseau::ethernet::IPV4, p);
+    super::ethernet::emettre(i, ethernet::DIFFUSION, ethernet::IPV4, p);
 }

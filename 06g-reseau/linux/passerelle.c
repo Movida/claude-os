@@ -6,16 +6,21 @@
  * ipconfig (ip=dhcp) sur la même machine, octet pour octet :
  *   - /proc/net/route : la table principale, lignes de 127 colonnes ;
  *   - /etc/resolv.conf, un lien vers /proc/net/pnp : le résultat du DHCP ;
- *   - /proc/net/dev : son en-tête, et la ligne d'eth0 ;
+ *   - /proc/net/dev : son en-tête, et les lignes de lo et d'eth0 ; un
+ *     datagramme UDP envoyé à 10.0.2.2:9 (le port « discard ») part par
+ *     eth0, et ses compteurs le comptent ;
  *   - /proc/net/arp : son en-tête, et les voisins résolus au démarrage (la
  *     passerelle et le DNS de slirp, dont l'adresse matérielle est 52:55
  *     suivi de leur adresse IPv4).
  */
 #define _GNU_SOURCE
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 static int echecs;
@@ -75,13 +80,50 @@ int main(void)
     lire_tout("/etc/resolv.conf", t, sizeof t, sizeof t);
     verifier(strcmp(t, "#PROTO: DHCP\nnameserver 10.0.2.3\nbootserver 10.0.2.2\n") == 0, "/etc/resolv.conf : le DNS de slirp");
 
-    /* /proc/net/dev : l'en-tête de Linux, puis eth0 (le nom aligné à droite
-     * sur 6 colonnes). Les compteurs ne sont pas comparés : ils dépendent de
-     * ce qui est passé. */
+    /* /proc/net/dev : l'en-tête de Linux, puis lo et eth0, dans l'ordre de
+     * leur numéro (le nom aligné à droite sur 6 colonnes). Les compteurs ne
+     * sont pas comparés : ils dépendent de ce qui est passé. */
     lire_tout("/proc/net/dev", t, sizeof t, sizeof t);
     const char *entete = "Inter-|   Receive                                                |  Transmit\n"
         " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n";
-    verifier(strncmp(t, entete, strlen(entete)) == 0 && strncmp(t + strlen(entete), "  eth0: ", 8) == 0, "/proc/net/dev : en-tete et eth0");
+    char *eth0 = strstr(t, "\n  eth0: ");
+    verifier(strncmp(t, entete, strlen(entete)) == 0 && strncmp(t + strlen(entete), "    lo: ", 8) == 0 && eth0,
+             "/proc/net/dev : en-tete, lo puis eth0");
+
+    /* Un datagramme vers le port « discard » de la passerelle : il part par
+     * eth0 (slirp le fait suivre à l'hôte, qui n'écoute pas : son ICMP
+     * revient de 127.0.0.1, un martien, jeté). */
+    unsigned long avant = 0, apres = 0, octets;
+    if (eth0)
+        sscanf(eth0 + 9, "%lu %*u %*u %*u %*u %*u %*u %*u %lu %lu", &octets, &octets, &avant);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(0x0a000202) };
+    int parti = sendto(s, "bonjour", 7, 0, (struct sockaddr *)&a, sizeof a) == 7;
+    close(s);
+    lire_tout("/proc/net/dev", t, sizeof t, sizeof t);
+    eth0 = strstr(t, "\n  eth0: ");
+    if (eth0)
+        sscanf(eth0 + 9, "%lu %*u %*u %*u %*u %*u %*u %*u %lu %lu", &octets, &octets, &apres);
+    verifier(parti && apres > avant, "un datagramme vers 10.0.2.2:9 part par eth0");
+
+    /* À notre adresse d'eth0, un datagramme passe par lo ; IP_PKTINFO dit
+     * pourtant eth0 (2), l'interface qui porte l'adresse, comme Linux. */
+    int r = socket(AF_INET, SOCK_DGRAM, 0), un = 1;
+    struct sockaddr_in ici = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(0x0a00020f) };
+    socklen_t l = sizeof ici;
+    bind(r, (struct sockaddr *)&ici, sizeof ici);
+    getsockname(r, (struct sockaddr *)&ici, &l);
+    setsockopt(r, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    sendto(s, "i", 1, 0, (struct sockaddr *)&ici, sizeof ici);
+    char o[8], c[64];
+    struct iovec v = { o, sizeof o };
+    struct msghdr m = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = c, .msg_controllen = sizeof c };
+    struct cmsghdr *h = recvmsg(r, &m, MSG_DONTWAIT) == 1 ? CMSG_FIRSTHDR(&m) : NULL;
+    verifier(h && h->cmsg_type == IP_PKTINFO && ((struct in_pktinfo *)CMSG_DATA(h))->ipi_ifindex == 2,
+             "a 10.0.2.15 par lo : IP_PKTINFO dit eth0 (2)");
+    close(s);
+    close(r);
 
     /* /proc/net/arp : l'en-tête d'arp_seq_show, puis une ligne par voisin
      * (dans l'ordre de la table : Linux suit celui de ses seaux, on ne

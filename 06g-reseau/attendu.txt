@@ -36,6 +36,7 @@ rendues et recollees : ok.
 [noyau] Vecteurs a la demande : 0x40 donne, IPI a soi-meme recue par son gestionnaire : ok ; rendu : ok.
 [noyau] MSI-X de 00:03.0 : 4 entrees, entree 1 programmee et relue : ok.
 [virtio] 00:03.0 : reseau, fonctionnalites VERSION_1 MAC STATUS EVENT_IDX, 3 files.
+[reseau] lo : boucle locale, 127.0.0.1/8, mtu 65536.
 [reseau] eth0 : virtio-net 52:54:00:12:34:56, mtu 1500, lien actif.
 [reseau] eth0 : 10.0.2.15/24, passerelle 10.0.2.2, DNS 10.0.2.3 (DHCP de 10.0.2.2, 
 [reseau] eth0 : voisin 10.0.2.2 : 52:55:0a:00:02:02, joignable (ARP).
@@ -47,8 +48,8 @@ memoire rendue : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 45, liens symboliques 6, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 41 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 46, liens symboliques 6, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 42 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -165,11 +166,15 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] fils : termine, code de sortie 7 ; memoire rendue : ok.
 [linux] courses : ok
 [noyau] courses : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] reseau : toutes les verifications : ok
+[noyau] reseau : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] passerelle : /proc/net/route comme Linux : ok
 [linux] passerelle : /proc/net/route lu par morceaux : ok
 [linux] passerelle : /etc/resolv.conf -> /proc/net/pnp : ok
 [linux] passerelle : /etc/resolv.conf : le DNS de slirp : ok
-[linux] passerelle : /proc/net/dev : en-tete et eth0 : ok
+[linux] passerelle : /proc/net/dev : en-tete, lo puis eth0 : ok
+[linux] passerelle : un datagramme vers 10.0.2.2:9 part par eth0 : ok
+[linux] passerelle : a 10.0.2.15 par lo : IP_PKTINFO dit eth0 (2) : ok
 [linux] passerelle : /proc/net/arp : la passerelle et le DNS, comme Linux : ok
 [linux] passerelle : toutes les verifications : ok
 [noyau] passerelle : termine, code de sortie 0 ; memoire rendue : ok.

@@ -21,7 +21,8 @@
 //! kill, tkill, tgkill ; et ce que `claude --version` demande encore (6d) :
 //! futex (futex.rs), uname, sched_getaffinity, sched_yield, prctl ;
 //! eventfd et epoll (evenements.rs) ; et les fils (6e) : clone et clone3
-//! (fil.rs), gettid, exit (un fil) et exit_group (le groupe).
+//! (fil.rs), gettid, exit (un fil) et exit_group (le groupe) ; et les
+//! sockets (6g), dans appels_reseau.rs.
 //!
 //! Le reste rend -ENOSYS (« appel non implémenté »), comme Linux pour un
 //! numéro qu'il ne connaît pas, et le noyau le signale. `make trace`
@@ -40,7 +41,7 @@ use crate::interruptions::Cadre;
 use crate::memoire::{self, Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Projection, Zone};
 use crate::appels_fichiers as f;
-use crate::{aleatoire, cpu, evenements, futex, pages, processus, signaux, tache, temps};
+use crate::{aleatoire, appels_reseau, cpu, evenements, futex, pages, processus, signaux, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
@@ -146,6 +147,25 @@ const SCHED_YIELD: u64 = 24;
 const EPOLL_CREATE: u64 = 213;
 const EPOLL_WAIT: u64 = 232;
 const EPOLL_CTL: u64 = 233;
+// Les sockets (6g : appels_reseau.rs).
+const SOCKET: u64 = 41;
+const CONNECT: u64 = 42;
+const ACCEPT: u64 = 43;
+const SENDTO: u64 = 44;
+const RECVFROM: u64 = 45;
+const SENDMSG: u64 = 46;
+const RECVMSG: u64 = 47;
+const SHUTDOWN: u64 = 48;
+const BIND: u64 = 49;
+const LISTEN: u64 = 50;
+const GETSOCKNAME: u64 = 51;
+const GETPEERNAME: u64 = 52;
+const SOCKETPAIR: u64 = 53;
+const SETSOCKOPT: u64 = 54;
+const GETSOCKOPT: u64 = 55;
+const ACCEPT4: u64 = 288;
+const RECVMMSG: u64 = 299;
+const SENDMMSG: u64 = 307;
 const EPOLL_PWAIT: u64 = 281;
 const EVENTFD: u64 = 284;
 const PIPE: u64 = 22;
@@ -260,6 +280,24 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         EPOLL_CREATE => crate::epoll::epoll_create(a[0]),
         EPOLL_CREATE1 => crate::epoll::epoll_create1(a[0]),
         EPOLL_CTL => crate::epoll::epoll_ctl(a[0], a[1], a[2], a[3]),
+        SOCKET => appels_reseau::socket(a[0], a[1], a[2]),
+        SOCKETPAIR => appels_reseau::socketpair(a[0], a[1], a[2], a[3]),
+        BIND => appels_reseau::bind(a[0], a[1], a[2]),
+        CONNECT => appels_reseau::connect(a[0], a[1], a[2]),
+        LISTEN => appels_reseau::listen(a[0], a[1]),
+        ACCEPT => appels_reseau::accept4(a[0], a[1], a[2], 0),
+        ACCEPT4 => appels_reseau::accept4(a[0], a[1], a[2], a[3]),
+        GETSOCKNAME => appels_reseau::getsockname(a[0], a[1], a[2]),
+        GETPEERNAME => appels_reseau::getpeername(a[0], a[1], a[2]),
+        SENDTO => appels_reseau::sendto(a[0], a[1], a[2], a[3], a[4], a[5]),
+        RECVFROM => appels_reseau::recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]),
+        SENDMSG => appels_reseau::sendmsg(a[0], a[1], a[2]),
+        RECVMSG => appels_reseau::recvmsg(a[0], a[1], a[2]),
+        SENDMMSG => appels_reseau::sendmmsg(a[0], a[1], a[2], a[3]),
+        RECVMMSG => appels_reseau::recvmmsg(a[0], a[1], a[2], a[3], a[4]),
+        SHUTDOWN => appels_reseau::shutdown(a[0], a[1]),
+        SETSOCKOPT => appels_reseau::setsockopt(a[0], a[1], a[2], a[3], a[4]),
+        GETSOCKOPT => appels_reseau::getsockopt(a[0], a[1], a[2], a[3], a[4]),
         EPOLL_WAIT => crate::epoll::epoll_wait(a[0], a[1], a[2], a[3]),
         EPOLL_PWAIT => crate::epoll::epoll_pwait(a[0], a[1], a[2], a[3], a[4], a[5]),
         EPOLL_PWAIT2 => crate::epoll::epoll_pwait2(a[0], a[1], a[2], a[3], a[4], a[5]),
@@ -420,6 +458,24 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         EPOLL_CREATE => ("epoll_create", 1),
         EPOLL_CREATE1 => ("epoll_create1", 1),
         EPOLL_CTL => ("epoll_ctl", 4),
+        SOCKET => ("socket", 3),
+        SOCKETPAIR => ("socketpair", 4),
+        BIND => ("bind", 3),
+        CONNECT => ("connect", 3),
+        LISTEN => ("listen", 2),
+        ACCEPT => ("accept", 3),
+        ACCEPT4 => ("accept4", 4),
+        GETSOCKNAME => ("getsockname", 3),
+        GETPEERNAME => ("getpeername", 3),
+        SENDTO => ("sendto", 6),
+        RECVFROM => ("recvfrom", 6),
+        SENDMSG => ("sendmsg", 3),
+        RECVMSG => ("recvmsg", 3),
+        SENDMMSG => ("sendmmsg", 4),
+        RECVMMSG => ("recvmmsg", 5),
+        SHUTDOWN => ("shutdown", 2),
+        SETSOCKOPT => ("setsockopt", 5),
+        GETSOCKOPT => ("getsockopt", 5),
         EPOLL_WAIT => ("epoll_wait", 4),
         EPOLL_PWAIT => ("epoll_pwait", 6),
         EPOLL_PWAIT2 => ("epoll_pwait2", 6),

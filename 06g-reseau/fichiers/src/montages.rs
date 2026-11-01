@@ -75,6 +75,10 @@ pub const ANONYME_PERIPHERIQUE: ((u32, u32), u64) = ((0, 16), 4096);
 /// tubes chez Linux (mesuré : 0:15, 4096), et chez nous dans le tmpfs
 /// (`Tmpfs::creer_tube`).
 pub const TUBES_PERIPHERIQUE: ((u32, u32), u64) = ((0, 15), 4096);
+/// Le périphérique et la taille de bloc de sockfs, où vivent les inodes des
+/// sockets chez Linux (mesuré sous WSL : 0:9, 4096), et chez nous dans le
+/// tmpfs (`Tmpfs::creer_socket`).
+pub const SOCKETS_PERIPHERIQUE: ((u32, u32), u64) = ((0, 9), 4096);
 
 impl Objet {
     /// L'inode du tmpfs, si c'en est un.
@@ -242,6 +246,7 @@ impl<'a, M: Monte> Vue<'a, M> {
     pub fn peripherique(&self, o: Objet) -> Option<((u32, u32), u64)> {
         match o {
             Objet::Tmpfs(n) if self.fs.est_tube(n) => Some(TUBES_PERIPHERIQUE),
+            Objet::Tmpfs(n) if self.fs.est_socket(n) => Some(SOCKETS_PERIPHERIQUE),
             Objet::Tmpfs(_) => None,
             Objet::Monte(s, _) => Some((self.monte(s).peripherique(), self.monte(s).taille_de_bloc())),
             Objet::Anonyme => Some(ANONYME_PERIPHERIQUE),
