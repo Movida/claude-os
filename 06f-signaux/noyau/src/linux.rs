@@ -162,6 +162,9 @@ const RT_SIGPENDING: u64 = 127;
 const SIGALTSTACK: u64 = 131;
 const TKILL: u64 = 200;
 const TGKILL: u64 = 234;
+const RT_SIGTIMEDWAIT: u64 = 128;
+const RT_SIGQUEUEINFO: u64 = 129;
+const RT_TGSIGQUEUEINFO: u64 = 297;
 const GETRANDOM: u64 = 318;
 const RSEQ: u64 = 334;
 const CLONE: u64 = 56;
@@ -261,6 +264,9 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &Cadre) -> i64 {
         KILL => signaux::kill(a[0], a[1]),
         TKILL => signaux::tkill(a[0], a[1]),
         TGKILL => signaux::tgkill(a[0], a[1], a[2]),
+        RT_SIGTIMEDWAIT => signaux::rt_sigtimedwait(a[0], a[1], a[2], a[3]),
+        RT_SIGQUEUEINFO => signaux::rt_sigqueueinfo(a[0], a[1], a[2]),
+        RT_TGSIGQUEUEINFO => signaux::rt_tgsigqueueinfo(a[0], a[1], a[2], a[3]),
         // La glibc lit le lien /proc/self/exe pour connaître son propre
         // chemin (dl_get_origin) : /proc y répond (procfs.rs).
         READLINKAT => f::readlinkat(a[0], a[1], a[2], a[3]),
@@ -404,6 +410,9 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         KILL => ("kill", 2),
         TKILL => ("tkill", 2),
         TGKILL => ("tgkill", 3),
+        RT_SIGTIMEDWAIT => ("rt_sigtimedwait", 4),
+        RT_SIGQUEUEINFO => ("rt_sigqueueinfo", 3),
+        RT_TGSIGQUEUEINFO => ("rt_tgsigqueueinfo", 4),
         READLINKAT => ("readlinkat", 4),
         READLINK => ("readlink", 3),
         MKDIR => ("mkdir", 2),
@@ -925,7 +934,7 @@ fn arch_prctl(code: u64, adresse: u64) -> i64 {
 }
 
 /// prlimit64(processus, ressource, nouvelle, ancienne) : les limites du
-/// processus (processus::LIMITES_PAR_DEFAUT). Dans l'ordre de `do_prlimit`
+/// processus (processus::limites_par_defaut). Dans l'ordre de `do_prlimit`
 /// : la nouvelle lue ; courante au-delà de la dure : EINVAL ; plus de
 /// descripteurs que Linux n'en permet (nr_open, 2^20) : EPERM ; la dure
 /// relevée sans être root (CAP_SYS_RESOURCE) : EPERM. Baisser, ou relever

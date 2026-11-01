@@ -304,7 +304,7 @@ impl Lanceur {
             }
         };
         self.en_cours -= 1;
-        let rendue = || Rendue(self.libres, pages::libres());
+        let rendue = || Rendue(self.libres, pages::libres(), crate::signaux::en_file());
         match fin {
             Some((nom, code)) if self.en_cours == 0 && !self.paralleles => {
                 afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.", nom, code, rendue())
@@ -331,13 +331,17 @@ impl Lanceur {
 /// Ce que dit « memoire rendue » : ok, ou ECHEC avec l'écart, en pages
 /// (libres avant le premier programme, puis maintenant), pour chercher ce
 /// qui manque (ou ce qui a été rendu en retard, d'un programme d'avant).
-struct Rendue(usize, usize);
+/// Depuis 6f, aussi le compte des siginfo en file de l'utilisateur
+/// (signaux.rs) : sans programme, il doit être revenu à 0, sinon un compte
+/// perdu finirait par refuser des signaux (RLIMIT_SIGPENDING).
+struct Rendue(usize, usize, u64);
 
 impl fmt::Display for Rendue {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        match self.1 as i64 - self.0 as i64 {
-            0 => write!(f, "ok"),
-            d => write!(f, "ECHEC ({:+} pages libres)", d),
+        match (self.1 as i64 - self.0 as i64, self.2) {
+            (0, 0) => write!(f, "ok"),
+            (0, n) => write!(f, "ECHEC ({} siginfo encore comptes en file)", n),
+            (d, _) => write!(f, "ECHEC ({:+} pages libres)", d),
         }
     }
 }
@@ -719,7 +723,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         racine: Objet::Tmpfs(racine),
         umask: 0o022,
         identite,
-        limites: processus::LIMITES_PAR_DEFAUT,
+        limites: processus::limites_par_defaut(),
         signaux: crate::signaux::Signaux::new(),
         fils: Vec::new(),
         fin_de_groupe: None,

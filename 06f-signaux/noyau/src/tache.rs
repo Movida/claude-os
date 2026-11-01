@@ -1272,11 +1272,16 @@ fn decider() -> Option<Arret> {
                 // Au processus, comme Linux (`check_process_timers`) : un
                 // autre fil le prendra peut-être, s'il ne le bloque pas et
                 // que celui-ci le bloque.
-                a_reveiller = signaux::envoyer(p, linux::SIGXCPU.numero as u64, signaux::Destinataire::Processus);
+                let sig = linux::SIGXCPU.numero as u64;
+                // Du noyau (SI_KERNEL) : il passe toujours, même au-delà de
+                // RLIMIT_SIGPENDING.
+                a_reveiller = signaux::envoyer(p, sig, signaux::Destinataire::Processus, signaux::Info::du_noyau(sig), true)
+                    .ok()
+                    .flatten();
                 xcpu = Some(courante);
             }
         }
-        signaux::a_livrer(p, t.tid).map(|(sig, comment)| match (comment, xcpu) {
+        signaux::a_livrer(p, t.tid).map(|(sig, _info, comment)| match (comment, xcpu) {
             (signaux::Fin::ParDefaut, Some(secondes)) if sig == linux::SIGXCPU.numero as u64 => Arret::Limite(secondes),
             _ => Arret::Signal(sig, comment),
         })

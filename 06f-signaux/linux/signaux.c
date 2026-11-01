@@ -1,10 +1,11 @@
 /*
  * Les signaux enregistrés (6d) : rt_sigaction, rt_sigprocmask,
- * rt_sigpending, sigaltstack, kill, tkill, tgkill. Il tourne dans notre
- * noyau et sur l'hôte (make tests-hote) : chaque ligne doit dire « ok »
- * des deux côtés. Rien ici n'appelle de gestionnaire (notre noyau ne les
- * appelle qu'en 6f) : les signaux envoyés sont ignorés, ou bloqués puis
- * effacés.
+ * rt_sigpending, sigaltstack, kill, tkill, tgkill ; puis leur file et leur
+ * siginfo (6f) : rt_sigqueueinfo, rt_tgsigqueueinfo, rt_sigtimedwait, et
+ * RLIMIT_SIGPENDING. Il tourne dans notre noyau et sur l'hôte (make
+ * tests-hote) : chaque ligne doit dire « ok » des deux côtés. Rien ici
+ * n'appelle de gestionnaire (gestionnaires.c le fait) : les signaux envoyés
+ * sont ignorés, ou bloqués puis effacés, ou pris par rt_sigtimedwait.
  *
  * Les appels passent par syscall() quand la glibc changerait ce qu'on
  * veut voir : son sigaction() traduit sa propre structure et ajoute
@@ -12,11 +13,14 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
+#include <time.h>
 #include <unistd.h>
 
 static int echecs;
@@ -188,6 +192,195 @@ static void pile_de_secours(void)
              && lue.ss_flags == SS_DISABLE, "SS_DISABLE remet l'adresse et la taille a 0");
 }
 
+/* rt_sigtimedwait brut : `ensemble` attendu, `info` rempli, `delai` (NULL :
+ * sans fin). Rend le signal pris, ou -errno. */
+static long attendre(uint64_t ensemble, siginfo_t *info, const struct timespec *delai)
+{
+    long r = syscall(SYS_rt_sigtimedwait, &ensemble, info, delai, 8);
+    return r < 0 ? -errno : r;
+}
+
+static long long maintenant_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+/* rt_sigqueueinfo brut, avec un siginfo écrit à la main. */
+static long mettre_en_file(pid_t pid, int sig, int code, int valeur, int octet_100)
+{
+    union {
+        siginfo_t si;
+        unsigned char o[128];
+    } u;
+    memset(&u, 0, sizeof u);
+    u.si.si_signo = 99;
+    u.si.si_code = code;
+    u.si.si_pid = 4242;
+    u.si.si_uid = 77;
+    u.si.si_value.sival_int = valeur;
+    u.o[100] = (unsigned char)octet_100;
+    return erreur(syscall(SYS_rt_sigqueueinfo, pid, sig, &u.si));
+}
+
+/* Un fil secondaire : rt_sigqueueinfo en SI_USER vers son propre processus
+ * est refusé (Linux compare au numéro du fil appelant), en SI_QUEUE non. */
+static long refus_du_fil, accepte_du_fil;
+
+static void *fil_secondaire(void *rien)
+{
+    (void)rien;
+    refus_du_fil = mettre_en_file(getpid(), SIGUSR1, SI_USER, 0, 0);
+    accepte_du_fil = mettre_en_file(getpid(), SIGUSR1, SI_QUEUE, 0, 0);
+    return NULL;
+}
+
+/* Un autre fil envoie `sig` au fil principal, 50 ms plus tard. */
+static pid_t fil_principal;
+
+static void *envoyer_plus_tard(void *sig)
+{
+    struct timespec cinquante = { 0, 50000000 };
+    nanosleep(&cinquante, NULL);
+    syscall(SYS_tgkill, getpid(), fil_principal, (int)(long)sig);
+    return NULL;
+}
+
+/* La file des signaux et leur siginfo (6f), lus par rt_sigtimedwait : qui
+ * envoie quoi, combien d'exemplaires restent, ce que fait la limite. Tout
+ * est bloqué avant d'être envoyé : sans gestionnaire, un signal non
+ * bloqué tuerait le programme. */
+static void files(void)
+{
+    pid_t moi = getpid(), fil = (pid_t)syscall(SYS_gettid);
+    uid_t uid = getuid();
+    int rt = SIGRTMIN + 3;
+    uint64_t usr1 = BIT(SIGUSR1), tous = BIT(SIGUSR1) | BIT(SIGWINCH) | BIT(rt) | BIT(SIGRTMIN + 4), rien = 0;
+    masque(SIG_BLOCK, &tous, NULL, 8);
+    siginfo_t si;
+    struct timespec zero = { 0, 0 };
+
+    kill(moi, SIGUSR1);
+    memset(&si, 0xff, sizeof si);
+    verifier(attendre(usr1, &si, &zero) == SIGUSR1 && si.si_signo == SIGUSR1 && si.si_code == SI_USER && si.si_errno == 0
+             && si.si_pid == moi && si.si_uid == uid, "kill : SI_USER, le pid et l'uid de qui envoie");
+    syscall(SYS_tgkill, moi, fil, SIGUSR1);
+    verifier(attendre(usr1, &si, &zero) == SIGUSR1 && si.si_code == SI_TKILL && si.si_pid == moi && si.si_uid == uid,
+             "tgkill : SI_TKILL");
+    union sigval v = { .sival_int = 42 };
+    sigqueue(moi, rt, v);
+    verifier(attendre(BIT(rt), &si, &zero) == rt && si.si_code == SI_QUEUE && si.si_value.sival_int == 42 && si.si_pid == moi,
+             "sigqueue : SI_QUEUE et sa valeur");
+    unsigned char *o = (unsigned char *)&si;
+    int reste_nul = 1;
+    for (int i = 48; i < 128; i++)
+        reste_nul &= o[i] == 0;
+    verifier(reste_nul, "le siginfo rendu : 128 octets, nuls apres les 48 que garde le noyau");
+
+    /* rt_sigqueueinfo : un siginfo à soi, tel quel (sauf si_signo) ; se
+     * faire passer pour kill ou tkill vers un autre : EPERM, avant même de
+     * chercher le processus ; une disposition inconnue (si_code -100) ne
+     * passe que si le reste du siginfo est nul (E2BIG). */
+    verifier(mettre_en_file(moi, SIGUSR1, SI_USER, 0, 0) == 0 && attendre(usr1, &si, &zero) == SIGUSR1
+             && si.si_signo == SIGUSR1 && si.si_code == SI_USER && si.si_pid == 4242 && si.si_uid == 77,
+             "rt_sigqueueinfo vers soi : le siginfo donne, si_signo corrige");
+    verifier(mettre_en_file(1, SIGUSR1, SI_USER, 0, 0) == EPERM && mettre_en_file(1, SIGUSR1, SI_TKILL, 0, 0) == EPERM,
+             "rt_sigqueueinfo vers un autre, en SI_USER ou SI_TKILL : EPERM");
+    verifier(mettre_en_file(2147483000, SIGUSR1, SI_QUEUE, 0, 0) == ESRCH, "en SI_QUEUE vers un processus absent : ESRCH");
+    pthread_t f;
+    pthread_create(&f, NULL, fil_secondaire, NULL);
+    pthread_join(f, NULL);
+    verifier(refus_du_fil == EPERM && accepte_du_fil == 0 && attendre(usr1, &si, &zero) == SIGUSR1 && si.si_code == SI_QUEUE,
+             "d'un fil secondaire vers son processus : SI_USER refuse (EPERM, compare au fil), SI_QUEUE accepte");
+    verifier(mettre_en_file(moi, SIGUSR1, -100, 0, 1) == E2BIG && mettre_en_file(moi, SIGUSR1, SI_QUEUE, 0, 1) == 0
+             && attendre(usr1, &si, &zero) == SIGUSR1, "si_code inconnu (-100) et un octet au-dela des 48 : E2BIG ; connu : accepte");
+    verifier(mettre_en_file(moi, 65, SI_QUEUE, 0, 0) == EINVAL, "rt_sigqueueinfo du signal 65 : EINVAL");
+    uint64_t sys = BIT(SIGSYS);
+    masque(SIG_BLOCK, &sys, NULL, 8);
+    verifier(mettre_en_file(moi, SIGSYS, 2, 0, 1) == 0 && attendre(sys, &si, &zero) == SIGSYS && si.si_code == 2
+                 && mettre_en_file(moi, SIGSYS, 3, 0, 1) == E2BIG,
+             "SIGSYS : si_code 2 (SYS_USER_DISPATCH) connu, 3 non (E2BIG)");
+    masque(SIG_UNBLOCK, &sys, NULL, 8);
+    union {
+        siginfo_t si;
+        unsigned char o[128];
+    } u;
+    memset(&u, 0, sizeof u);
+    u.si.si_code = SI_QUEUE;
+    verifier(erreur(syscall(SYS_rt_tgsigqueueinfo, moi, fil, SIGUSR1, &u.si)) == 0 && attendre(usr1, &si, &zero) == SIGUSR1
+             && si.si_code == SI_QUEUE, "rt_tgsigqueueinfo vers soi : accepte");
+    verifier(erreur(syscall(SYS_rt_tgsigqueueinfo, 0, fil, SIGUSR1, &u.si)) == EINVAL
+             && erreur(syscall(SYS_rt_tgsigqueueinfo, moi, 2147483000, SIGUSR1, &u.si)) == ESRCH,
+             "rt_tgsigqueueinfo : tgid nul EINVAL, fil absent ESRCH");
+    verifier(erreur(syscall(SYS_rt_sigqueueinfo, moi, SIGUSR1, (void *)8)) == EFAULT, "rt_sigqueueinfo, siginfo invalide : EFAULT");
+
+    /* La file : trois temps réel et trois SIGWINCH bloqués, puis pris un
+     * par un : les trois temps réel (dans l'ordre d'envoi), un seul SIGWINCH
+     * (un signal ordinaire n'est en file qu'une fois), et lui d'abord (le
+     * plus petit numéro passe le premier). */
+    for (int i = 0; i < 3; i++) {
+        v.sival_int = i;
+        sigqueue(moi, rt, v);
+        kill(moi, SIGWINCH);
+    }
+    long a = attendre(tous, &si, &zero);
+    int ordre = a == SIGWINCH;
+    for (int i = 0; i < 3; i++)
+        ordre &= attendre(tous, &si, &zero) == rt && si.si_value.sival_int == i;
+    verifier(ordre && attendre(tous, &si, &zero) == -EAGAIN,
+             "3 temps reel et 3 SIGWINCH : SIGWINCH une fois, d'abord, puis les 3 temps reel dans l'ordre");
+
+    /* La limite : à 0, plus aucun temps réel ne se met en file. sigqueue rend
+     * EAGAIN ; kill réussit, mais le signal arrive sans son siginfo (SI_USER,
+     * pid 0) ; un ordinaire passe toujours, avec le sien. */
+    struct rlimit lim, zero_lim;
+    getrlimit(RLIMIT_SIGPENDING, &lim);
+    verifier(lim.rlim_cur == lim.rlim_max && lim.rlim_cur > 0 && lim.rlim_cur != RLIM_INFINITY,
+             "RLIMIT_SIGPENDING : une limite finie, la meme pour les deux");
+    zero_lim = (struct rlimit){ 0, lim.rlim_max };
+    setrlimit(RLIMIT_SIGPENDING, &zero_lim);
+    v.sival_int = 7;
+    int refuse = sigqueue(moi, rt, v) == -1 && errno == EAGAIN;
+    int tue = kill(moi, SIGRTMIN + 4) == 0 && attendre(BIT(SIGRTMIN + 4), &si, &zero) == SIGRTMIN + 4 && si.si_code == SI_USER
+              && si.si_pid == 0;
+    int ordinaire = kill(moi, SIGUSR1) == 0 && attendre(usr1, &si, &zero) == SIGUSR1 && si.si_pid == moi;
+    setrlimit(RLIMIT_SIGPENDING, &lim);
+    verifier(refuse && tue && ordinaire,
+             "RLIMIT_SIGPENDING a 0 : sigqueue EAGAIN, kill d'un temps reel sans siginfo, un ordinaire avec le sien");
+
+    /* rt_sigtimedwait : un délai nul rend EAGAIN tout de suite, 50 ms au
+     * moins 50 ms plus tard ; les erreurs. */
+    struct timespec cinquante = { 0, 50000000 }, faux = { 0, 1000000000 };
+    long long t = maintenant_ns();
+    verifier(attendre(usr1, &si, &cinquante) == -EAGAIN && maintenant_ns() - t >= 50000000, "rt_sigtimedwait 50 ms : EAGAIN, pas avant");
+    verifier(attendre(usr1, &si, &faux) == -EINVAL, "un delai de 1e9 ns : EINVAL");
+    verifier(erreur(syscall(SYS_rt_sigtimedwait, &usr1, &si, &zero, 4)) == EINVAL, "une taille de masque de 4 : EINVAL");
+    verifier(erreur(syscall(SYS_rt_sigtimedwait, (void *)8, &si, &zero, 8)) == EFAULT, "un masque invalide : EFAULT");
+    kill(moi, SIGUSR1);
+    verifier(attendre(usr1, (void *)8, &zero) == -EFAULT && en_attente() == 0, "un siginfo invalide : EFAULT, le signal pris quand meme");
+    kill(moi, SIGUSR1);
+    verifier(attendre(usr1, NULL, &zero) == SIGUSR1, "sans siginfo (NULL) : le signal");
+    /* Un signal ignoré (SIGWINCH par défaut, SIGUSR2 à SIG_IGN), bloqué et
+     * attendu, envoyé par un autre fil pendant l'attente : pris. Linux garde
+     * le vrai masque le temps de l'attente (`real_blocked`), et un signal
+     * bloqué n'est jamais jeté à l'envoi. */
+    struct timespec une = { 1, 0 };
+    uint64_t usr2 = BIT(SIGUSR2);
+    fil_principal = fil;
+    pthread_create(&f, NULL, envoyer_plus_tard, (void *)(long)SIGWINCH);
+    long winch = attendre(BIT(SIGWINCH), &si, &une);
+    pthread_join(f, NULL);
+    masque(SIG_BLOCK, &usr2, NULL, 8);
+    signal(SIGUSR2, SIG_IGN);
+    pthread_create(&f, NULL, envoyer_plus_tard, (void *)(long)SIGUSR2);
+    long ignore = attendre(usr2, &si, &une);
+    pthread_join(f, NULL);
+    signal(SIGUSR2, SIG_DFL);
+    verifier(winch == SIGWINCH && ignore == SIGUSR2, "un signal ignore, attendu par rt_sigtimedwait, envoye pendant l'attente : pris");
+    masque(SIG_SETMASK, &rien, NULL, 8);
+}
+
 int main(void)
 {
     actions();
@@ -195,6 +388,7 @@ int main(void)
     attente();
     envois();
     pile_de_secours();
+    files();
     printf("[linux] signaux : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

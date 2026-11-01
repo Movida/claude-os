@@ -93,6 +93,7 @@ pub const RLIMIT_CPU: usize = 0;
 pub const RLIMIT_STACK: usize = 3;
 pub const RLIMIT_NPROC: usize = 6;
 pub const RLIMIT_NOFILE: usize = 7;
+pub const RLIMIT_SIGPENDING: usize = 11;
 /// RLIM_INFINITY.
 pub const INFINI: u64 = u64::MAX;
 
@@ -101,27 +102,31 @@ pub const INFINI: u64 = u64::MAX;
 /// la pile de ses fils ; elle grandit bien jusque-là, memoire.rs,
 /// PILE_MAX), pas de fichier « core », 8 Mio de mémoire verrouillable, 800
 /// Kio de files de messages, 1024 descripteurs (4096 au plus), infini pour
-/// le reste. NPROC et SIGPENDING : Linux les tire de la mémoire (la moitié
-/// de max_threads) ; infini ici, max_threads borne déjà les fils (6e), et
-/// les signaux n'ont pas encore de file (6f).
+/// le reste. SIGPENDING : comme Linux, la moitié de max_threads, pour la
+/// courante et la dure (`fork_init`), depuis que les signaux ont une file
+/// (6f) ; NPROC aussi chez Linux, infini ici : max_threads borne déjà les
+/// fils (6e).
 ///
 /// Seules celles des descripteurs, du temps de calcul (RLIMIT_CPU, infini
-/// par défaut comme chez Linux : voir tache::verifier_au_retour) et du
-/// nombre de tâches (RLIMIT_NPROC, tache::lancer_fil) sont appliquées ;
-/// les autres sont rendues telles qu'on les a posées, comme le demandent
-/// les programmes qui les baissent par prudence (pas de « core », une pile
-/// plus petite). Les appliquer viendra avec ce qu'elles limitent.
-pub const LIMITES_PAR_DEFAUT: [(u64, u64); LIMITES] = {
+/// par défaut comme chez Linux : voir tache::verifier_au_retour), du
+/// nombre de tâches (RLIMIT_NPROC, tache::lancer_fil) et des signaux en
+/// file (RLIMIT_SIGPENDING, signaux.rs) sont appliquées ; les autres sont
+/// rendues telles qu'on les a posées, comme le demandent les programmes qui
+/// les baissent par prudence (pas de « core », une pile plus petite). Les
+/// appliquer viendra avec ce qu'elles limitent.
+pub fn limites_par_defaut() -> [(u64, u64); LIMITES] {
     let mut l = [(INFINI, INFINI); LIMITES];
     l[RLIMIT_STACK] = (8 << 20, INFINI);
     l[4] = (0, INFINI); // RLIMIT_CORE
     l[RLIMIT_NOFILE] = LIMITE_DESCRIPTEURS;
     l[8] = (8 << 20, 8 << 20); // RLIMIT_MEMLOCK
+    let signaux = (crate::vmalloc::max_threads() / 2) as u64;
+    l[RLIMIT_SIGPENDING] = (signaux, signaux);
     l[12] = (819_200, 819_200); // RLIMIT_MSGQUEUE
     l[13] = (0, 0); // RLIMIT_NICE
     l[14] = (0, 0); // RLIMIT_RTPRIO
     l
-};
+}
 
 impl Processus {
     /// Le fil `tid` du processus, s'il y est encore.
