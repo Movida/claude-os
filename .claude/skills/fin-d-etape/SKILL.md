@@ -369,3 +369,35 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
 - **Un échec isolé de `verifier-historique.sh`** (un commit, puis OK quand
   on le relance seul) : la machine chargée ; le journal de l'échec est
   désormais gardé, le lire avant de conclure.
+
+## Pièges rencontrés en 6f (31 octobre 2026)
+
+- **Replier dans des commits en attente de signature** (des patchs, pas
+  de commits) : un petit dépôt git à part, dans le brouillon, dont le
+  premier commit est l'état final de l'étape ; une correction par commit,
+  son sujet commençant par le commit visé (« c13 : ... »), remis dans
+  l'ordre des commits visés (`git cherry-pick`). Puis chaque instantané
+  refait, fichier par fichier, par `git merge-file` (le nôtre : l'ancien
+  instantané ; la base et le leur : avant et après la correction), les
+  conflits écrits à la main une fois pour chaque instantané qui les a.
+  Le dernier instantané doit être l'état final ; `git range-diff` des
+  deux chaînes (des commits faits par `git commit-tree`, dans ce dépôt à
+  part) montre ce que chaque repli a changé.
+- **Une correction ne se replie que vraie au commit visé** : un
+  commentaire qui ne devient vrai qu'avec un commit suivant (« task et
+  fd ») se coupe en deux corrections, une par commit.
+- **Un test qui ne couvre que le cas difficile laisse passer le cas
+  simple** : `/proc/self/fd/N` n'était ouvert qu'après l'effacement du
+  fichier, et ouvrir celui d'un fichier qui a son nom (ou `/dev/stdout`)
+  arrêtait le noyau. Pour chaque chemin nouveau, essayer aussi l'usage le
+  plus banal.
+- **Un relecteur se trompe parfois sur le remède** : « (deleted) d'après
+  le nom ouvert » aurait fait dire « (deleted) » d'un fichier simplement
+  renommé, faute de dentry. Vérifier ce que la correction proposée casse
+  avant de l'appliquer, et écrire l'écart quand le bon remède dépasse
+  l'étape.
+- **Un test d'ordonnancement peut ne mordre que chez nous** : le signal
+  qui réveille sigsuspend pris par un autre fil arrive vingt fois sur
+  vingt dans notre noyau, jamais sur l'hôte (Linux ne prévient que le fil
+  choisi). Le test l'affiche, ne l'exige pas sur l'hôte, et une mutation
+  prouve qu'il mord dans QEMU.
