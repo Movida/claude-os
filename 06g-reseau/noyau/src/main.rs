@@ -60,6 +60,7 @@ mod port;
 mod procfs;
 mod processus;
 mod programmes;
+mod reseau;
 mod reprise;
 mod rusage;
 mod serie;
@@ -76,6 +77,7 @@ mod verrou;
 mod vfs;
 mod vmalloc;
 mod vga;
+mod virtio;
 mod wasi;
 
 use core::arch::{asm, global_asm};
@@ -349,6 +351,10 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         }
         Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
     }
+
+    // Le réseau : les cartes qu'on sait piloter, et la tâche qui fait leur
+    // travail.
+    reseau::demarrer();
 
     afficherln!("[noyau] Ordonnanceur EEVDF : tranche de {}.{:02} ms, preemption du noyau.",
                 ordonnanceur::TRANCHE / 1_000_000, ordonnanceur::TRANCHE / 10_000 % 100);

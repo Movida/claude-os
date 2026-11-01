@@ -98,6 +98,14 @@ impl Adresse {
         configuration().ecrire16(self, position, valeur)
     }
 
+    /// La fonction devient « maître du bus » : elle peut lire et écrire la
+    /// mémoire elle-même (DMA), et envoyer ses MSI, qui sont des écritures
+    /// (le `pci_set_master` de Linux). Le décodage de sa mémoire aussi, au
+    /// cas où le micrologiciel l'aurait laissé coupé (`pci_enable_device`).
+    pub fn activer_maitrise(self) {
+        self.changer_commande(pci::COMMANDE_MAITRE | pci::COMMANDE_MEMOIRE, 0);
+    }
+
     /// Change le registre de commande : les bits `poser` mis, puis les bits
     /// `effacer` ôtés, d'un seul tenant sous le verrou (en 16 bits : l'état,
     /// à côté, n'est pas touché).

@@ -1,5 +1,6 @@
 # Sous-étape 6g : le réseau. Le bus PCI (formats/src/pci.rs et
-# noyau/src/pci.rs), les vecteurs d'interruption à la demande et MSI-X.
+# noyau/src/pci.rs), les vecteurs d'interruption à la demande et MSI-X,
+# virtio (noyau/src/virtio.rs) et la carte virtio-net (noyau/src/reseau/).
 # De 6f : les signaux livrés à leurs gestionnaires (le
 # cadre de signal, rt_sigreturn, la reprise des appels interrompus),
 # l'attente d'événements (poll, select, epoll), les tubes, /proc fabriqué
@@ -37,6 +38,8 @@
 #                  de sa pile doit le dire (page de garde, double faute) ;
 #                  un noyau gonflé au-delà de 1 Mio doit être lu en entier ;
 #                  une carte derrière un pont PCI doit être trouvée ;
+#                  une carte sans MSI-X laissée éteinte ; le câble
+#                  débranché puis rebranché, vu ;
 #                  et make claude-p
 #   make claude-p -> le jalon de 6f, dans une image à part : claude -p
 #                  bonjour jusqu'à l'appel de l'API (claude-p-attendu.txt)
@@ -910,6 +913,11 @@ $(WAST2JSON):
 #     lui, avec le noyau ordinaire sur l'archive vide : le parcours du bus
 #     doit descendre par le pont, et trouver la carte sur le bus 1 que le
 #     BIOS lui a donné (depuis 6g) ;
+#   - une carte virtio-net sans MSI-X (vectors=0) : le pilote la laisse
+#     éteinte, et le dit (6g) ;
+#   - le câble débranché puis rebranché au moniteur (set_link) : chaque
+#     fois, l'interruption de configuration de la carte, par MSI-X, et le
+#     noyau le dit (6g) ;
 #   test-garde, test-gros, le démarrage sans ACPI et celui du pont ne
 #   s'éteignent pas : QEMU est arrêté dès que la ligne cherchée est venue
 #   (`attendre`), au lieu d'attendre DUREE.
@@ -931,6 +939,16 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin claude-p
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -device pci-bridge$(,)id=pont$(,)chassis_nr=1 -netdev user$(,)id=n1 \
 	  -device virtio-net-pci$(,)netdev=n1$(,)bus=pont$(,)addr=1 -drive format=raw$(,)file=vide.bin -serial file:test-pont.log,test-pont.log,"[pci] 01:01.0 1af4:1000 Ethernet",:)
 	grep -F "[pci] 00:04.0 1b36:0001 pont PCI, bus 1-1" test-pont.log
+	$(call attendre,$(QEMU_TEST) -netdev user$(,)id=n0 -device virtio-net-pci$(,)netdev=n0$(,)vectors=0 -drive format=raw$(,)file=vide.bin \
+	  -serial file:test-sans-msix.log,test-sans-msix.log,"[virtio] 00:03.0 : pas de MSI-X : carte laissee eteinte.",:)
+	rm -f test-lien.log $(MON_TESTS); \
+	$(QEMU_TEST) $(QEMU_RESEAU) -drive format=raw,file=vide.bin -serial file:test-lien.log -monitor unix:$(MON_TESTS),server,nowait & q=$$!; \
+	ligne() { for i in $$(seq $$(( $(DUREE) * 10 ))); do grep -qF -- "$$1" test-lien.log 2>/dev/null && return 0; \
+	  kill -0 $$q 2>/dev/null || return 1; sleep 0.1; done; return 1; }; \
+	ligne "eth0 : virtio-net" && echo "set_link n0 off" | nc -U -q1 $(MON_TESTS) >/dev/null && \
+	ligne "eth0 : lien coupe" && echo "set_link n0 on" | nc -U -q1 $(MON_TESTS) >/dev/null && \
+	ligne "eth0 : lien retabli"; r=$$?; kill $$q 2>/dev/null; wait $$q 2>/dev/null; \
+	grep -F "eth0 : " test-lien.log; exit $$r
 	command -v nc >/dev/null || { echo "nc manque (paquet netcat-openbsd) : la touche de dort ne pourrait pas etre envoyee"; exit 1; }
 	for cpu in qemu64 max; do \
 	  journal=test-programmes-$$cpu.log; rm -f $$journal $(MON_TESTS); \
