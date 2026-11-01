@@ -51,6 +51,10 @@ memoire rendue : ok.
 [wasm] lecteur : ../../etc/bonjour.txt refuse (EPERM) : ok
 [wasm] lecteur : etc/lien-absolu refuse (EPERM) : ok
 [wasm] lecteur : le 3 ferme puis repris n'est plus pre-ouvert : ok
+[wasm] lecteur : poll_oneoff d'une horloge de 20 ms : attendu, un evenement : ok
+[wasm] lecteur : poll_oneoff, une heure et la sortie a ecrire : la sortie, sans attendre : ok
+[wasm] lecteur : poll_oneoff, une horloge echue et la sortie a ecrire : les deux : ok
+[wasm] lecteur : poll_oneoff sans abonnement : EINVAL ; sched_yield : 0 : ok
 [noyau] lecteur.wasm : termine, code de sortie 0
 [noyau] bonjour-asm : programme Linux (ELF ET_EXEC), 
         0x00401000-0x00401024 r-x (36 octets du fichier)

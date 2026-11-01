@@ -46,7 +46,94 @@ unsafe extern "C" {
     fn fd_readdir(dossier: u32, tampon: *mut u8, longueur: usize, cookie: u64, utilises: *mut usize) -> u16;
     fn args_sizes_get(nombre: *mut usize, taille: *mut usize) -> u16;
     fn args_get(pointeurs: *mut *const u8, chaines: *mut u8) -> u16;
+    fn clock_time_get(horloge: u32, precision: u64, temps: *mut u64) -> u16;
+    fn poll_oneoff(abonnements: *const Abonnement, evenements: *mut Evenement, nombre: usize, publies: *mut usize) -> u16;
+    fn sched_yield() -> u16;
     fn proc_exit(code: u32) -> !;
+}
+
+/// Un abonnement de poll_oneoff (la `subscription` de WASI, 48 octets) : sa
+/// donnée, son genre (0 une horloge, 1 lire, 2 écrire), puis l'horloge et
+/// son délai, ou le descripteur.
+#[repr(C)]
+struct Abonnement {
+    donnee: u64,
+    genre: u8,
+    _vide: [u8; 7],
+    horloge_ou_fd: u32,
+    _vide2: u32,
+    delai: u64,
+    precision: u64,
+    drapeaux: u16,
+    _vide3: [u8; 6],
+}
+
+/// Un événement (l'`event` de WASI, 32 octets).
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct Evenement {
+    donnee: u64,
+    erreur: u16,
+    genre: u8,
+    _vide: [u8; 5],
+    octets: u64,
+    drapeaux: u16,
+    _vide2: [u8; 6],
+}
+
+const EINVAL: u16 = 28;
+
+/// Le temps monotone, en ns.
+fn monotone() -> u64 {
+    let mut t = 0;
+    // SAFETY : `t` est dans notre mémoire.
+    unsafe { clock_time_get(1, 1, &mut t) };
+    t
+}
+
+/// poll_oneoff : une horloge de 20 ms seule fait attendre 20 ms au moins,
+/// et rend un événement d'horloge avec sa donnée ; une horloge lointaine
+/// avec un descripteur à écrire (la sortie) n'attend pas : seul le
+/// descripteur est publié ; une horloge échue (un délai nul) avec lui :
+/// les deux ; aucun abonnement : EINVAL. Et sched_yield.
+fn attendre(s: &mut Sortie) -> bool {
+    let horloge = |delai: u64, donnee: u64| Abonnement {
+        donnee, genre: 0, _vide: [0; 7], horloge_ou_fd: 1, _vide2: 0, delai, precision: 0, drapeaux: 0, _vide3: [0; 6],
+    };
+    let vide = Evenement { donnee: 0, erreur: 0, genre: 9, _vide: [0; 5], octets: 0, drapeaux: 0, _vide2: [0; 6] };
+    let mut evenements = [vide; 2];
+    let mut publies = 0;
+    let avant = monotone();
+    // SAFETY : les tableaux et `publies` sont dans notre mémoire.
+    let r = unsafe { poll_oneoff(&horloge(20_000_000, 7), evenements.as_mut_ptr(), 1, &mut publies) };
+    let duree = monotone() - avant;
+    let dort = r == 0 && publies == 1 && evenements[0].donnee == 7 && evenements[0].genre == 0 && duree >= 20_000_000;
+    let _ = writeln!(s, "[wasm] lecteur : poll_oneoff d'une horloge de 20 ms : attendu, un evenement : {}", if dort { "ok" } else { "ECHEC" });
+    let abonnements = [horloge(3_600_000_000_000, 1),
+                       Abonnement { donnee: 2, genre: 2, _vide: [0; 7], horloge_ou_fd: 1, _vide2: 0, delai: 0, precision: 0, drapeaux: 0,
+                                    _vide3: [0; 6] }];
+    let avant = monotone();
+    // SAFETY : comme ci-dessus.
+    let r = unsafe { poll_oneoff(abonnements.as_ptr(), evenements.as_mut_ptr(), 2, &mut publies) };
+    let pret = r == 0 && publies == 1 && evenements[0].donnee == 2 && evenements[0].genre == 2 && evenements[0].erreur == 0
+               && monotone() - avant < 1_000_000_000;
+    let _ = writeln!(s, "[wasm] lecteur : poll_oneoff, une heure et la sortie a ecrire : la sortie, sans attendre : {}",
+                     if pret { "ok" } else { "ECHEC" });
+    let abonnements = [horloge(0, 3),
+                       Abonnement { donnee: 4, genre: 2, _vide: [0; 7], horloge_ou_fd: 1, _vide2: 0, delai: 0, precision: 0, drapeaux: 0,
+                                    _vide3: [0; 6] }];
+    // SAFETY : comme ci-dessus.
+    let r = unsafe { poll_oneoff(abonnements.as_ptr(), evenements.as_mut_ptr(), 2, &mut publies) };
+    let deux = r == 0 && publies == 2 && evenements[0].donnee == 3 && evenements[0].genre == 0 && evenements[1].donnee == 4
+               && evenements[1].genre == 2;
+    let _ = writeln!(s, "[wasm] lecteur : poll_oneoff, une horloge echue et la sortie a ecrire : les deux : {}",
+                     if deux { "ok" } else { "ECHEC" });
+    // SAFETY : comme ci-dessus.
+    let refus = unsafe { poll_oneoff(abonnements.as_ptr(), evenements.as_mut_ptr(), 0, &mut publies) } == EINVAL;
+    // SAFETY : sans argument.
+    let cede = unsafe { sched_yield() } == 0;
+    let _ = writeln!(s, "[wasm] lecteur : poll_oneoff sans abonnement : EINVAL ; sched_yield : 0 : {}", if refus && cede { "ok" } else { "ECHEC" });
+    dort && pret && deux && refus && cede
 }
 
 /// La sortie standard, pour formater du texte avec write! (core::fmt).
@@ -231,6 +318,7 @@ pub extern "C" fn _start() {
     });
     let _ = writeln!(s, "[wasm] lecteur : le 3 ferme puis repris n'est plus pre-ouvert : {}", if ferme { "ok" } else { "ECHEC" });
     ok &= ferme;
+    ok &= attendre(&mut s);
     // SAFETY : proc_exit ne revient pas.
     unsafe { proc_exit(if ok { 0 } else { 1 }) }
 }

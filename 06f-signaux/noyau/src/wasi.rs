@@ -15,6 +15,8 @@
 //!     fd_readdir : les fichiers et les dossiers, sur le même système de
 //!     fichiers que les programmes Linux (vfs.rs) ;
 //!   - clock_time_get : l'heure (temps.rs) ;
+//!   - poll_oneoff : attendre une échéance, ou qu'un descripteur soit prêt
+//!     (6f) ; sched_yield : céder le processeur (6f) ;
 //!   - proc_exit : terminer le programme.
 //!
 //! Tout passe par la mémoire du programme : il donne des adresses dans SA
@@ -41,7 +43,10 @@
 //! Un appel système ne doit pas non plus prendre la machine en otage : il
 //! n'est pas interrompu par le carburant (voir wasm::Hote). Chaque appel
 //! fait donc un travail borné (au plus 1024 octets lus ou écrits), et
-//! compte ce travail en carburant.
+//! compte ce travail en carburant. Seul `poll_oneoff` peut durer : il dort
+//! jusqu'à l'échéance qu'on lui donne, comme nanosleep pour un programme
+//! Linux (le processeur passe aux autres) ; un programme WebAssembly n'a pas
+//! de signal pour l'interrompre (ni de ^C avant le terminal, 6j).
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -56,7 +61,7 @@ use crate::{appels_fichiers, console, temps, vfs};
 use crate::descripteurs::Tenu;
 use fichiers::chemins::Depart;
 use fichiers::montages::{Creation, Modification, Objet, en_tmpfs};
-use fichiers::tmpfs::{Numero, Ouverture, suivre_pour};
+use fichiers::tmpfs::{Attributs, Numero, Ouverture, suivre_pour};
 use fichiers::{Erreur, Identite, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, Temps};
 
 /// Le module d'où un programme WASI importe ses appels système.
@@ -133,6 +138,8 @@ const ARGS_SIZES_GET: u32 = 14;
 const ARGS_GET: u32 = 15;
 const ENVIRON_SIZES_GET: u32 = 16;
 const ENVIRON_GET: u32 = 17;
+const POLL_ONEOFF: u32 = 18;
+const SCHED_YIELD: u32 = 19;
 
 /// Le plus de morceaux qu'un fd_write ou un fd_read peut décrire : l'IOV_MAX
 /// de POSIX, que Linux impose aussi (UIO_MAXIOV). Au-delà : EINVAL.
@@ -288,6 +295,10 @@ pub fn imports(magasin: &mut Magasin, module: &ModuleValide) -> Result<Vec<Exter
             "environ_sizes_get" => (ENVIRON_SIZES_GET, &[I32, I32], &[I32]),
             // environ_get(pointeurs, chaines) -> errno
             "environ_get" => (ENVIRON_GET, &[I32, I32], &[I32]),
+            // poll_oneoff(abonnements, evenements, nombre, publies) -> errno
+            "poll_oneoff" => (POLL_ONEOFF, &[I32, I32, I32, I32], &[I32]),
+            // sched_yield() -> errno
+            "sched_yield" => (SCHED_YIELD, &[], &[I32]),
             // proc_exit(code)
             "proc_exit" => (PROC_EXIT, &[I32], &[]),
             _ => return Err(format!("import inconnu : {} {}", import.module, import.nom)),
@@ -319,6 +330,11 @@ impl Hote for Wasi {
             Valeur::I64(x) => x,
             _ => unreachable!("argument i64"),
         };
+        if numero == SCHED_YIELD {
+            crate::ordonnanceur::ceder();
+            resultats[0] = Valeur::I32(SUCCES);
+            return Ok(());
+        }
         if numero == PROC_EXIT {
             // Terminer : un « piège » de l'hôte, qui arrête l'exécution avec
             // le code de sortie ; le noyau le reconnaît (programmes.rs).
@@ -342,6 +358,7 @@ impl Hote for Wasi {
             PATH_FILESTAT_GET => self.path_filestat_get(a(0), a(1), a(2), a(3), a(4), m),
             FD_READDIR => self.fd_readdir(a(0), a(1), a(2), a64(3), a(4), m, cout),
             CLOCK_TIME_GET => clock_time_get(a(0), a(2), m),
+            POLL_ONEOFF => self.poll_oneoff(a(0), a(1), a(2), a(3), m, cout),
             ARGS_SIZES_GET => tailles(&self.arguments, a(0), a(1), m),
             ARGS_GET => chaines(&self.arguments, a(0), a(1), m, cout),
             ENVIRON_SIZES_GET => tailles(&self.environnement, a(0), a(1), m),
@@ -456,10 +473,9 @@ fn inode(o: Objet) -> Numero {
     o.tmpfs().expect("un fichier ordinaire hors du tmpfs")
 }
 
-/// Le « filestat » de WASI (64 octets) de l'objet `o`.
-fn filestat(o: Objet) -> [u8; 64] {
-    let a = appels_fichiers::attributs(o);
-    let (dev, _) = appels_fichiers::systeme_de(o);
+/// Le « filestat » de WASI (64 octets), d'après les attributs d'un objet
+/// et le périphérique de son système de fichiers.
+fn filestat(a: &Attributs, dev: (u32, u32)) -> [u8; 64] {
     let mut s = [0u8; 64];
     // dev : celui de son système de fichiers, codé comme st_dev.
     s[0..8].copy_from_slice(&appels_fichiers::encoder_peripherique(dev).to_le_bytes());
@@ -489,7 +505,134 @@ fn clock_time_get(horloge: u32, adresse: u32, m: &mut [u8]) -> u32 {
     }
 }
 
+/// La taille d'un abonnement de poll_oneoff (`subscription`), et d'un
+/// événement (`event`), dans la mémoire du programme.
+const ABONNEMENT: u32 = 48;
+const EVENEMENT: u32 = 32;
+/// Les genres d'abonnements (`eventtype`).
+const HORLOGE: u8 = 0;
+const LECTURE: u8 = 1;
+const ECRITURE: u8 = 2;
+/// `subclockflags` : l'échéance est absolue.
+const ABSOLUE: u16 = 1;
+
+/// L'abonnement `i` (48 octets), copié de la mémoire (déjà vérifiée).
+fn abonnement(m: &[u8], entree: u32, i: u32) -> [u8; 48] {
+    let mut a = [0u8; 48];
+    if let Some(o) = plage(m, entree + i * ABONNEMENT, ABONNEMENT) {
+        a.copy_from_slice(o);
+    }
+    a
+}
+
+/// L'échéance d'un abonnement d'horloge, en temps monotone : `maintenant`
+/// (monotone) et `reel` (la date) pris au début de l'appel. Une échéance
+/// absolue de la date devient monotone par leur écart (la date ne se règle
+/// pas encore). None : une horloge sans échéance chez nous (les temps de
+/// calcul).
+fn echeance(a: &[u8; 48], maintenant: u64, reel: u64) -> Option<u64> {
+    let horloge = u32::from_le_bytes([a[16], a[17], a[18], a[19]]);
+    let delai = u64::from_le_bytes([a[24], a[25], a[26], a[27], a[28], a[29], a[30], a[31]]);
+    let absolue = u16::from_le_bytes([a[40], a[41]]) & ABSOLUE != 0;
+    match (horloge, absolue) {
+        (0, true) => Some(maintenant.saturating_add(delai.saturating_sub(reel))),
+        (1, true) => Some(delai),
+        (0 | 1, false) => Some(maintenant.saturating_add(delai)),
+        _ => None,
+    }
+}
+
 impl Wasi {
+    /// poll_oneoff(abonnements, événements, nombre, publiés) : `nombre`
+    /// abonnements (48 octets chacun) ; les événements arrivés sont écrits à
+    /// `evenements` (32 octets chacun), leur nombre à `publies`. Comme
+    /// wasmtime : aucun abonnement, EINVAL ; une horloge inconnue (seules
+    /// celles de la date et du temps monotone ont une échéance), EINVAL.
+    /// Un abonnement à un descripteur (lire, écrire) est prêt tout de suite :
+    /// nos programmes WebAssembly n'ont que des fichiers, des dossiers et la
+    /// console, qui n'attendent jamais. S'il y en a un, rien n'attend ;
+    /// sinon le programme dort jusqu'à la première échéance. Puis tout ce
+    /// qui est prêt est publié : les descripteurs, et les horloges échues
+    /// (une échéance nulle ou passée l'est même à côté d'un descripteur).
+    /// Tout est vérifié avant d'attendre. Deux écarts voulus avec le
+    /// wasmtime d'aujourd'hui (p1.rs), qui fait échouer tout l'appel pour un
+    /// mauvais descripteur (EBADF) et annonce 1 octet à lire : ce que dit la
+    /// spécification (l'`error` d'un événement), et ce que faisait l'ancien
+    /// wasi-common de wasmtime ; un descripteur qui n'est pas à lui, ou un
+    /// dossier : l'événement porte EBADF ; lire un fichier : combien
+    /// d'octets restent (`nbytes`).
+    fn poll_oneoff(&self, entree: u32, sortie: u32, nombre: u32, publies: u32, m: &mut [u8], cout: &mut u64) -> u32 {
+        if nombre == 0 {
+            return EINVAL;
+        }
+        if nombre > MORCEAUX_MAX {
+            return EINVAL;
+        }
+        let (Some(_), Some(_), Some(_)) = (plage(m, entree, nombre * ABONNEMENT), plage(m, sortie, nombre * EVENEMENT), plage(m, publies, 4))
+        else {
+            return EFAULT;
+        };
+        *cout += nombre as u64;
+        // La première échéance, et s'il y a un descripteur (prêt tout de
+        // suite).
+        let (maintenant, reel) = (temps::ns_monotone(), nanosecondes(temps::maintenant()));
+        let mut prets = false;
+        let mut premiere: Option<u64> = None;
+        for i in 0..nombre {
+            let a = abonnement(m, entree, i);
+            match a[8] {
+                HORLOGE => {
+                    let Some(e) = echeance(&a, maintenant, reel) else { return EINVAL };
+                    premiere = Some(premiere.map_or(e, |p| p.min(e)));
+                }
+                LECTURE | ECRITURE => prets = true,
+                _ => return EINVAL,
+            }
+        }
+        if !prets && let Some(e) = premiere {
+            let interruptions = crate::cpu::couper_interruptions();
+            while temps::ns_monotone() < e {
+                crate::attente::dormir(Some(e), crate::attente::Sommeil::Ininterruptible);
+            }
+            if interruptions {
+                crate::cpu::activer_interruptions();
+            }
+        }
+        // Les événements : les descripteurs, ou les horloges échues.
+        let apres = temps::ns_monotone();
+        let mut n = 0u32;
+        for i in 0..nombre {
+            let a = abonnement(m, entree, i);
+            let mut e = [0u8; 32];
+            e[..8].copy_from_slice(&a[..8]);
+            e[10] = a[8];
+            let publier = if a[8] == HORLOGE {
+                echeance(&a, maintenant, reel).is_some_and(|x| x <= apres)
+            } else {
+                let fd = u32::from_le_bytes([a[16], a[17], a[18], a[19]]);
+                let (erreur, restant) = match self.ouvert(fd) {
+                    Ok((_, Sorte::Fichier, objet, _, _, _, position)) if a[8] == LECTURE => {
+                        let taille = objet.tmpfs().map_or(0, |n| vfs::avec(|fs, _| fs.attributs(n).taille));
+                        (0u16, taille.saturating_sub(position))
+                    }
+                    Ok((_, Sorte::Dossier | Sorte::Chemin, ..)) | Err(_) => (EBADF as u16, 0),
+                    Ok(_) => (0, 0),
+                };
+                e[8..10].copy_from_slice(&erreur.to_le_bytes());
+                e[16..24].copy_from_slice(&restant.to_le_bytes());
+                true
+            };
+            if publier {
+                let _ = ecrire(m, sortie + n * EVENEMENT, &e);
+                n += 1;
+            }
+        }
+        match ecrire(m, publies, &n.to_le_bytes()) {
+            Ok(()) => SUCCES,
+            Err(e) => e,
+        }
+    }
+
     /// Le fichier ouvert du descripteur `fd`, et ce qu'il faut en savoir. Sans
     /// le tenir (`appels_fichiers::FichierTenu`) : les descripteurs d'un
     /// programme WebAssembly ne sont qu'à lui, une seule tâche (WASI preview
@@ -794,13 +937,15 @@ impl Wasi {
         }
     }
 
-    /// fd_filestat_get.
+    /// fd_filestat_get : l'objet est tenu par son descripteur.
     fn fd_filestat_get(&self, fd: u32, adresse: u32, m: &mut [u8]) -> u32 {
-        match self.ouvert(fd) {
-            Ok((_, _, objet, ..)) => match ecrire(m, adresse, &filestat(objet)) {
-                Ok(()) => SUCCES,
-                Err(e) => e,
-            },
+        let objet = match self.ouvert(fd) {
+            Ok((_, _, objet, ..)) => objet,
+            Err(e) => return e,
+        };
+        let stat = filestat(&appels_fichiers::attributs(objet), appels_fichiers::systeme_de(objet).0);
+        match ecrire(m, adresse, &stat) {
+            Ok(()) => SUCCES,
             Err(e) => e,
         }
     }
@@ -820,12 +965,19 @@ impl Wasi {
             Err(e) => return e,
         };
         let qui = self.identite;
-        let o = vfs::avec_systeme(|s, _| {
+        // Les attributs, lus dans la même section du verrou des fichiers que
+        // la résolution : l'objet trouvé n'est pas tenu, et un autre
+        // programme pourrait l'effacer juste après (son inode n'existerait
+        // plus).
+        let stat = vfs::avec_systeme(|s, _| {
             let depart = Depart { racine: s.racine(), dossier: base, qui, sous: true };
-            s.avec_vue(0, |vue| fichiers::chemins::trouver(vue, &depart, &chemin, suivre & 1 != 0))
+            s.avec_vue(0, |vue| {
+                let o = fichiers::chemins::trouver(vue, &depart, &chemin, suivre & 1 != 0)?;
+                Ok(filestat(&vue.attributs(o), vue.peripherique(o).map_or(appels_fichiers::DEV_RACINE, |(dev, _)| dev)))
+            })
         });
-        match o {
-            Ok(o) => match ecrire(m, sortie, &filestat(o)) {
+        match stat {
+            Ok(stat) => match ecrire(m, sortie, &stat) {
                 Ok(()) => SUCCES,
                 Err(e) => e,
             },
