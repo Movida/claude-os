@@ -401,3 +401,48 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   vingt dans notre noyau, jamais sur l'hôte (Linux ne prévient que le fil
   choisi). Le test l'affiche, ne l'exige pas sur l'hôte, et une mutation
   prouve qu'il mord dans QEMU.
+
+## Pièges rencontrés en 6g (1er novembre 2026)
+
+- **Un `edit` qui conflicte ne s'arrête qu'une fois** : dans
+  `rebase -i`, un commit marqué `edit` dont l'application conflicte
+  s'arrête sur le conflit ; après `git add` et `rebase --continue`, git
+  le commite avec son ancien message et passe au suivant, sans l'arrêt
+  promis. Donner le nouveau message à l'arrêt du conflit (`git commit
+  -F`, puis `rebase --continue` ; la date d'auteur devient alors celle du
+  jour), ou après coup par la plomberie.
+- **Une phrase que chaque commit allonge** (l'en-tête du Makefile,
+  « Sous-étape 6g : ... ») : complétée au bout de sa ligne sans la
+  refaire, elle a fini à 114 colonnes en six commits. Reprise par la
+  plomberie de la section B, sans rebase : pour chaque commit, le fichier
+  du commit d'origine passé dans une fonction pure (un script Python du
+  brouillon : la phrase de l'étape remise en forme par `textwrap`, avec
+  des espaces insécables le temps de couper, pour qu'aucune ligne ne
+  commence par « : » ou « ; »), l'arbre gardé pour le reste : aucun
+  conflit, quel que soit le nombre de commits.
+- **Linux livre ce qui part par `lo` dans l'appel qui envoie** (le
+  softirq exécuté à la sortie de `__dev_queue_xmit`) : un test qui
+  attendait « que lo ait tout livré » (par un datagramme témoin) cachait
+  que, chez nous, le datagramme n'était pas encore là au retour de
+  `sendto`. Essayer d'abord sur l'hôte le cas sans attente
+  (`recv(MSG_DONTWAIT)` juste après `sendto`).
+- **Le devcontainer filtre des appels du réseau que la CI laisse
+  passer** : le seccomp de Docker (`socket(46, ...)` : EPERM),
+  `ping_group_range` et `ip_unprivileged_port_start` réglés par Docker,
+  SELinux compilé dans le noyau de WSL. Aucun test sur l'hôte ne doit en
+  dépendre (les sockets de ping : seulement si l'hôte les permet).
+- **La glibc abandonne un essai DNS** sur une réponse plus courte qu'un
+  en-tête, et recommence avec une autre socket : un test qui ment au
+  résolveur ne le fait qu'au premier essai, et compte les questions
+  (mesuré sur l'hôte).
+- **Le classifieur du mode automatique refuse** de tuer un QEMU par
+  motif, et de créer un document dans une application connectée sans
+  qu'on l'ait demandé : lancer chaque QEMU sous `timeout` et l'attendre ;
+  écrire les rapports en `.md`, envoyés comme fichiers.
+- **Une boucle `while read ... < liste` qui signe peut s'arrêter sans
+  rien dire** : le programme de signature de WSL (celui de 1Password) a
+  lu l'entrée standard de la boucle, et donc les lignes qui restaient.
+  Seul c00 a été créé, puis poussé et tagué, sans aucun message
+  d'arrêt. Reproduit avec un signataire qui lit son entrée. Lire la
+  liste par un autre descripteur (`while read -r k <&3; do ... done 3<
+  liste`), et donner `</dev/null` aux commandes de la boucle.
