@@ -50,6 +50,7 @@
 
 use crate::msix::{self, MsiX};
 use crate::pci::Fonction;
+use crate::virtqueue::Virtqueue;
 use crate::vmalloc::{self, Projection};
 use formats::pci::{self, Bar, StructureVirtio};
 
@@ -71,6 +72,14 @@ const VECTEUR_CONFIGURATION: u64 = 0x10;
 const NB_FILES: u64 = 0x12;
 const ETAT: u64 = 0x14;
 const GENERATION: u64 = 0x15;
+const FILE_CHOIX: u64 = 0x16;
+const FILE_TAILLE: u64 = 0x18;
+const FILE_VECTEUR: u64 = 0x1A;
+const FILE_ACTIVE: u64 = 0x1C;
+const FILE_NOTIFICATION: u64 = 0x1E;
+const FILE_DESCRIPTEURS: u64 = 0x20;
+const FILE_PILOTE: u64 = 0x28;
+const FILE_PERIPHERIQUE: u64 = 0x30;
 /// La taille minimale de la configuration commune (jusqu'à
 /// `queue_device` compris).
 const TAILLE_COMMUNE: u32 = 0x38;
@@ -105,6 +114,8 @@ pub enum Refus {
     Fonctionnalites,
     /// La carte ne revient pas à zéro.
     RemiseAZero,
+    /// Plus de mémoire pour les files ou leurs tampons.
+    Memoire,
     /// MSI-X absent ou inutilisable.
     MsiX(msix::Refus),
     /// La carte refuse un vecteur MSI-X.
@@ -119,6 +130,7 @@ impl core::fmt::Display for Refus {
             Refus::Projection => f.write_str("registres impossibles a projeter"),
             Refus::Fonctionnalites => f.write_str("fonctionnalites refusees"),
             Refus::RemiseAZero => f.write_str("la carte ne revient pas a zero"),
+            Refus::Memoire => f.write_str("plus de memoire"),
             Refus::MsiX(r) => write!(f, "{r}"),
             Refus::Vecteur => f.write_str("vecteur MSI-X refuse par la carte"),
         }
@@ -149,6 +161,9 @@ fn projeter(f: &Fonction, c: &pci::CapaciteVirtio, minimum: u32) -> Result<Fenet
 /// Une carte virtio en cours de mise en service, puis en service.
 pub struct Virtio {
     commune: Fenetre,
+    notification: Fenetre,
+    /// L'écart entre les adresses de notification de deux files.
+    multiplicateur: u32,
     peripherique: Fenetre,
     pub msix: MsiX,
     /// Les fonctionnalités négociées.
@@ -202,11 +217,10 @@ impl Virtio {
                 _ => {}
             }
         }
-        // La zone de notification ne sert qu'aux files ; mais une carte
-        // sans elle n'est pas une carte virtio 1.x.
-        let (Some(c), Some(_), Some(d)) = (commune, notification, peripherique) else {
+        let (Some(c), Some(n), Some(d)) = (commune, notification, peripherique) else {
             return Err(Refus::Structure);
         };
+        let StructureVirtio::Notification { multiplicateur } = n.structure else { return Err(Refus::Structure) };
         // La carte lit et écrit la mémoire elle-même (ses files), et ses
         // MSI-X sont des écritures en mémoire : la maîtrise du bus d'abord,
         // comme le `pci_set_master` de `virtio_pci_probe`. SeaBIOS la laisse
@@ -215,9 +229,10 @@ impl Virtio {
         // l'a pas retire DRIVER_OK à la carte.
         f.adresse.activer_maitrise();
         let commune = projeter(f, &c, TAILLE_COMMUNE)?;
+        let notification = projeter(f, &n, 2)?;
         let peripherique = projeter(f, &d, 0)?;
         let msix = MsiX::activer(f).map_err(Refus::MsiX)?;
-        let v = Virtio { commune, peripherique, msix, fonctionnalites: 0 };
+        let v = Virtio { commune, notification, multiplicateur, peripherique, msix, fonctionnalites: 0 };
         v.remettre_a_zero()?;
         v.poser_etat(ETAT_ACKNOWLEDGE);
         v.poser_etat(ETAT_DRIVER);
@@ -326,6 +341,56 @@ impl Virtio {
                 return r;
             }
         }
+    }
+}
+
+impl Virtio {
+    /// La taille maximale de la file `i` (0 : elle n'existe pas).
+    pub fn taille_max(&self, i: u16) -> u16 {
+        ecrire16(&self.commune, FILE_CHOIX, i);
+        lire16(&self.commune, FILE_TAILLE)
+    }
+
+    /// Donne la file `q` comme file `i` du périphérique, ses interruptions
+    /// par l'entrée MSI-X `entree` (déjà programmée), et l'active (la
+    /// spécification, 4.1.5.1.3). Rend de quoi la notifier.
+    pub fn installer_file(&self, i: u16, q: &Virtqueue, entree: u16) -> Result<Notifieur, Refus> {
+        ecrire16(&self.commune, FILE_CHOIX, i);
+        ecrire16(&self.commune, FILE_TAILLE, q.taille());
+        let (d, a, u) = q.adresses();
+        for (champ, adresse) in [(FILE_DESCRIPTEURS, d), (FILE_PILOTE, a), (FILE_PERIPHERIQUE, u)] {
+            ecrire32(&self.commune, champ, adresse as u32);
+            ecrire32(&self.commune, champ + 4, (adresse >> 32) as u32);
+        }
+        ecrire16(&self.commune, FILE_VECTEUR, entree);
+        if lire16(&self.commune, FILE_VECTEUR) == SANS_VECTEUR {
+            return Err(Refus::Vecteur);
+        }
+        // L'adresse de notification de la file : son décalage, en unités du
+        // multiplicateur (4.1.4.4).
+        let decalage = lire16(&self.commune, FILE_NOTIFICATION) as u64 * self.multiplicateur as u64;
+        if decalage + 2 > self.notification.longueur as u64 {
+            return Err(Refus::Structure);
+        }
+        ecrire16(&self.commune, FILE_ACTIVE, 1);
+        Ok(Notifieur { adresse: self.notification.adresse + decalage, file: i })
+    }
+}
+
+/// De quoi prévenir le périphérique qu'une file a du nouveau : écrire le
+/// numéro de la file à son adresse de notification. Il vit autant que la
+/// carte (une carte n'est jamais retirée).
+pub struct Notifieur {
+    adresse: u64,
+    file: u16,
+}
+
+impl Notifieur {
+    pub fn notifier(&self) {
+        // SAFETY : une adresse de la zone de notification projetée, que
+        // `installer_file` a vérifiée ; la projection vit autant que la
+        // carte, et la carte toujours.
+        unsafe { (self.adresse as *mut u16).write_volatile(self.file) }
     }
 }
 

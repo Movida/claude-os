@@ -36,7 +36,8 @@ rendues et recollees : ok.
 [noyau] Vecteurs a la demande : 0x40 donne, IPI a soi-meme recue par son gestionnaire : ok ; rendu : ok.
 [noyau] MSI-X de 00:03.0 : 4 entrees, entree 1 programmee et relue : ok.
 [virtio] 00:03.0 : reseau, fonctionnalites VERSION_1 MAC STATUS EVENT_IDX, 3 files.
-[reseau] eth0 : virtio-net 52:54:00:12:34:56, lien actif.
+[reseau] eth0 : virtio-net 52:54:00:12:34:56, mtu 1500, lien actif.
+[reseau] eth0 : deux sondes ARP (qui a 10.0.2.2 ?) emises, reponses de la passerelle de QEMU recues : ok.
 [noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.

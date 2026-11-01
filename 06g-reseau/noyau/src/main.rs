@@ -78,6 +78,7 @@ mod vfs;
 mod vmalloc;
 mod vga;
 mod virtio;
+mod virtqueue;
 mod wasi;
 
 use core::arch::{asm, global_asm};
@@ -362,6 +363,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // tâche.
     let init = || {
         tester_ordonnanceur();
+        tester_reseau();
         programmes::demarrer();
         // Le scénario des programmes de test de `make tests-qemu` : une
         // fois l'archive exécutée, éteindre QEMU par son périphérique
@@ -429,6 +431,41 @@ fn tester_ordonnanceur() {
     let ok = a.is_some() && b.is_some() && VU.iter().all(|v| v.load(Ordering::Relaxed));
     afficherln!("[noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : {} ({} bascules).",
                 if ok { "ok" } else { "ECHEC" }, ordonnanceur::bascules() - bascules);
+}
+
+/// Vérifie la carte réseau, ses deux files et la tâche du réseau : une
+/// sonde ARP faite à la main (« qui a 10.0.2.2 ? », de 0.0.0.0 : la sonde
+/// de la RFC 5227, qui n'a pas besoin d'adresse) part par eth0, et la
+/// réponse de la passerelle du réseau de QEMU doit revenir (l'interruption
+/// de réception, la tâche du réseau réveillée, la trame livrée). Deux fois :
+/// QEMU interrompt toujours pour la première émission finie d'une file (son
+/// `virtio_should_notify` : « signalled_used_valid »), ce qui réveille aussi
+/// la tâche ; la seconde réponse ne peut arriver que par l'interruption de
+/// réception. Sans eth0, rien.
+fn tester_reseau() {
+    let Some(i) = reseau::interface::par_index(1) else { return };
+    let mut recues = 0;
+    for _ in 0..2 {
+        let avant = reseau::arp_recues();
+        let Some(mut p) = reseau::paquet::Paquet::vide(60) else { return };
+        if let Some(t) = p.ajouter_fin(60) {
+            t[..6].fill(0xff);
+            t[6..12].copy_from_slice(&i.mac);
+            t[12..14].copy_from_slice(&[0x08, 0x06]);
+            // Ethernet, IPv4, 6 et 4 octets d'adresse, requête.
+            t[14..22].copy_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 1]);
+            t[22..28].copy_from_slice(&i.mac);
+            t[38..42].copy_from_slice(&[10, 0, 2, 2]);
+        }
+        i.emettre(p);
+        let fin = temps::ns_monotone() + 1_000_000_000;
+        while reseau::arp_recues() == avant && temps::ns_monotone() < fin {
+            attente::dormir(Some(temps::ns_monotone() + 10_000_000), attente::Sommeil::Ininterruptible);
+        }
+        recues += (reseau::arp_recues() > avant) as u32;
+    }
+    afficherln!("[reseau] {} : deux sondes ARP (qui a 10.0.2.2 ?) emises, reponses de la passerelle de QEMU recues : {}.",
+                i.nom, if recues == 2 { "ok" } else { "ECHEC" });
 }
 
 /// Vérifie l'allocateur de pages : des blocs alignés sur leur taille, qu'on

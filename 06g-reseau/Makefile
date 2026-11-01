@@ -1,6 +1,7 @@
 # Sous-étape 6g : le réseau. Le bus PCI (formats/src/pci.rs et
 # noyau/src/pci.rs), les vecteurs d'interruption à la demande et MSI-X,
-# virtio (noyau/src/virtio.rs) et la carte virtio-net (noyau/src/reseau/).
+# virtio (noyau/src/virtio.rs, virtqueue.rs) et la carte virtio-net, ses
+# files et la tâche du réseau (noyau/src/reseau/).
 # De 6f : les signaux livrés à leurs gestionnaires (le
 # cadre de signal, rt_sigreturn, la reprise des appels interrompus),
 # l'attente d'événements (poll, select, epoll), les tubes, /proc fabriqué
