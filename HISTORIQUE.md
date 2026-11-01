@@ -297,7 +297,38 @@ Dossier `06e-ordonnanceur/`, en dix-huit commits, d'après le plan écrit au dé
 - deux tests qui ne mordaient pas : « cible » (son ECHEC, maintenant cherché dans tout le journal de `make tests-qemu`) et « lignes » (qui ne peut pas prouver le verrou de la console sous QEMU sans accélération : écrit) ;
 - `nc` pour `make tests-qemu` dans la CI, un journal de débogage committé par erreur, une vingtaine de commentaires devenus faux.
 
-## 19. Reste à faire
+## 19. Sous-étape 6f réalisée : les signaux livrés, l'attente, les tubes, /proc à la demande
+
+Dossier `06f-signaux/`, en quinze commits, d'après le plan écrit au début de son fil, mesuré sur Linux 6.18 par des sondes C et relu par un relecteur indépendant (`plan-6f.md` dans les fichiers du projet ; 26 constats intégrés avant de coder, dont 3 graves). **Le jalon :** le vrai Claude Code, `claude -p bonjour` (avec une fausse clé), va dans notre noyau jusqu'à l'appel de l'API et dit qu'il ne la trouve pas : « API Error: Can't reach the API server … (EAI_AGAIN) », faute de réseau avant 6g. Il passe dans une image à part (`make claude-p`, 28 s sous QEMU sans accélération).
+
+1. **getrusage**, que `claude -p` demande dès son démarrage : le temps compté par tic comme le Linux d'une distribution, puis ajusté au temps exact de l'ordonnanceur (`cputime_adjust`) ; ru_maxrss, les fautes, les bascules.
+2. **Les signaux en file, et leur siginfo** (le `sigpending` de Linux) : un temps réel en file autant de fois qu'envoyé, RLIMIT_SIGPENDING appliquée ; rt_sigqueueinfo, rt_tgsigqueueinfo, rt_sigtimedwait.
+3. **La GDT de Linux** (choix de conception) : les mêmes sélecteurs (0x33 et 0x2B pour les programmes), que montre le contexte d'un gestionnaire.
+4. **Le cadre de signal de Linux, octet pour octet** (choix de conception) : l'état x87/SSE/AVX en XSAVE ou FXSAVE avec ses mots magiques, l'ucontext, le siginfo ; SA_ONSTACK, SA_NODEFER, SA_RESETHAND ; `rt_sigreturn` qui vérifie tout ce qu'il recharge ; `sysretq` seulement quand RCX et R11 le permettent ; le `bad_iret` de Linux (un `iretq` qui faute est une faute du programme, jamais un arrêt du noyau) ; AT_MINSIGSTKSZ.
+5. **Les fautes livrées à leurs gestionnaires**, avec le siginfo et le sigcontext que donne Linux (si_code, si_addr, trapno, err, cr2), mesurés faute par faute.
+6. **Les appels interrompus reprennent** : les quatre codes internes de Linux (ERESTARTSYS, ERESTARTNOINTR, ERESTARTNOHAND, ERESTART_RESTARTBLOCK), SA_RESTART et `restart_syscall`, seulement pour le cadre d'un appel système.
+7. **rt_sigsuspend et pause**, et le masque rendu au retour (`saved_sigmask`) ; `suspendre.c` imite la suspension des fils de JavaScriptCore (le moteur de Bun) par SIGPWR.
+8. **Des files d'attente à entrées** (choix de conception) : les `wait_queue_entry` de Linux, exclusives ou non, la file sous son propre verrou ; l'eventfd devient un objet à lui, hors du verrou des fichiers.
+9. **Le sondage des fichiers** (l'opération `poll` de Linux, la table de sondage, les entrées à rappel), et poll, ppoll, select, pselect6 dans l'ordre de `fs/select.c`.
+10. **epoll attend vraiment** (choix de conception) : `fs/eventpoll.c` pas à pas, les éléments inscrits dans les files de leurs fichiers, la liste des prêts et sa liste de débordement, les epolls emboîtés, la recherche de boucles ; le fichier ouvert tient la liste de ses surveillants (le `f_ep`), qui meurent à son dernier close. Reste de 6d corrigé : les bits qu'accepte EPOLLEXCLUSIVE.
+11. **Les tubes** : un anneau de pages avec la règle de fusion de Linux (`write(5000)` sur un tube presque plein rend 904), les attentes exclusives, SIGPIPE, O_DIRECT, F_SETPIPE_SZ, le compte des pages de l'utilisateur ; l'inode d'un tube dans le tmpfs.
+12. **/proc fabriqué à la demande** (choix de conception) : plus aucune entrée gardée par processus ni par fil ; un numéro d'inode qui dit le genre, le processus et le fil. Écart de 6e corrigé : /proc/<tid> d'un fil secondaire se résout.
+13. **/proc/<pid>/fd et les liens magiques** (`nd_jump_link`) : ce que lit Bun pour connaître son dossier courant ; un fichier effacé se rouvre, un tube se rouvre du côté demandé ; `exe` est lui aussi un lien magique, vers l'inode de l'exécutable.
+14. **WASI poll_oneoff et sched_yield**.
+15. **claude -p, le jalon**, dans son image à part ; il lui manque encore socket, copy_file_range, sendfile, fadvise64, socketpair et inotify_init1 (ENOSYS : il s'en passe, sauf du premier).
+
+**Pendant l'étape :** la signature des commits a de nouveau cessé de marcher dans le conteneur ; les quinze commits ont attendu en patchs (un index git par commit, construit et vérifié à part), que David a créés et signés depuis WSL.
+
+**Relecture de fond :** trois relecteurs indépendants (la livraison des signaux et la reprise des appels ; l'attente, poll, epoll, eventfd et les tubes ; /proc et la bibliothèque `fichiers`), 28 constats, chacun vérifié par une sonde sur l'hôte, les sources de Linux 6.18 ou une mutation. Repliés dans leurs commits :
+- **un programme pouvait arrêter le noyau** : ouvrir `/proc/self/fd/N` d'un fichier qui a encore son nom (ou `/dev/stdout`, un dossier tenu en O_PATH) calculait son chemin en remontant des parents qu'un fichier n'a pas, et paniquait ; ce qu'on ouvre par un lien magique garde maintenant le chemin du fichier ouvert, comme Linux, et `/proc/<pid>/exe` devient lui aussi un lien magique ;
+- **Reste de 6e** : `path_filestat_get` (WASI) lisait les attributs d'un objet qu'il ne tenait plus, qu'un autre programme pouvait effacer entre-temps (le noyau s'arrêtait) ;
+- un lien magique sortait d'une résolution « sous » le dossier de départ (le confinement des programmes WebAssembly), et le rappel d'un epoll pouvait allouer, interruptions coupées, quand un fichier surveillé avait été fermé ;
+- des écarts à Linux, mesurés : un signal ignoré qu'attend `rt_sigtimedwait` jeté à l'envoi ; le MXCSR rendu par un gestionnaire perdu quand le cadre ne demandait pas AVX ; `sigsuspend` qui rendait EINTR au lieu d'être refait quand un autre fil prenait le signal qui l'avait réveillé (l'ordre de `arch_do_signal_or_restart`, et une mutation le prouve) ; UC_STRICT_RESTORE_SS posé après un `iretq` refusé ; un sommeil échu rendu EINTR ; `rt_sigreturn` qui lisait le siginfo ; SIGSYS et SYS_USER_DISPATCH ; une poll_oneoff qui oubliait une horloge échue à côté d'un descripteur ; les attributs d'un dossier de /proc d'un processus parti ou zombie, task/<tid> immuable, le nombre de liens de /proc, `readlink` qui rendait 0 ;
+- **Reste de 6d** : un `write` d'eventfd prend exactement 8 octets (Linux 6.6) ;
+- une écriture dans un tube qui voyait partir le dernier lecteur entre deux pages, le `Drop` d'un tube qui prenait un Mutex sous un Verrou, un tube rouvert par son inode après qu'il a été redonné, `tubes sigpipe` qui dépendait de l'action héritée de SIGPIPE ;
+- le code resté des entrées gardées de /proc (6b à 6e) retiré de `noyaufs`, l'ordre des verrous des fichiers et des processus écrit tel qu'il est, une quinzaine de commentaires devenus faux.
+
+## 20. Reste à faire
 
 **Dans le noyau**
 
@@ -305,14 +336,13 @@ Dossier `06e-ordonnanceur/`, en dix-huit commits, d'après le plan écrit au dé
 - **Grandes allocations.** Un bloc du tas ne dépasse pas 4 Mio (l'ordre maximal du buddy) : il faudra projeter des pages éparses d'un seul tenant (`vmalloc`). Pour les mémoires WebAssembly, réserver 4 Gio d'adresses suivies de pages de garde (comme wasmtime), ce qui supprimera aussi le contrôle des bornes une fois le code compilé.
 - **Console non bloquante.** Le port série fait attendre activement (87 µs par octet sur du vrai matériel) : un pilote à interruptions et une file d'attente, comme le tty de Linux.
 - **Pages globales** (CR4.PGE) pour le noyau, maintenant qu'il y a un espace d'adressage par programme ; KPTI et PCID : en 6m.
-- **`iretq` qui fauterait** (un RIP non canonique écrit par le noyau, pour exec ou les signaux) : une entrée de la table d'exceptions qui transforme la faute en signal pour le programme (`bad_iret` de Linux). Inatteignable aujourd'hui : le RIP d'un cadre vient toujours du programme.
 - **La carte des zones et la réserve** : la carte d'un programme vient du tas du noyau, qui peut puiser dans la réserve (3 Mio au plus, 5 le temps de l'agrandir) ; Linux prend ses `vm_area_struct` au-dessus du seuil. Avec les allocations faillibles.
 - **Le verrou du processus coupe les interruptions** : un munmap ou la fin d'un programme qui a touché des centaines de Mio rend ses cadres d'un trait, et des tics d'horloge se perdent ; il sérialise aussi les fautes de page de tous les fils. Un verrou qui dort, en lecture et écriture (le `mmap_lock` de Linux).
 - **MAP_SHARED d'un fichier** reste refusé : il faudra écrire les pages dans le fichier, et les retrouver dans chaque processus qui le projette (la carte inverse `i_mmap`, 6k). Pour la même raison, raccourcir un fichier ne retire ses pages que des projections du processus en cours : un autre programme qui le projette (`&`) y lit l'ancien contenu au lieu d'un SIGBUS.
 - **Les verrous de fichiers** (fcntl, flock) sont vérifiés mais toujours accordés : deux programmes lancés par `&` ne s'excluent pas. Une vraie table des verrous.
 - **Le tueur OOM** tue le programme qui faute, pas le plus gros : avec plusieurs programmes à la fois, un petit peut payer pour un gros.
-- **/proc fabriqué à la demande** : les dossiers des processus et des fils sont des entrées gardées (la place réservée pour tous les fils possibles) ; Linux les fabrique d'après la table des tâches. Avec /proc/<pid>/fd (6f), qui le demandera vraiment : des numéros d'inode qui disent le processus, le fil et l'entrée. Écarts voulus d'ici là : /proc/<tid> d'un fil non principal (ENOENT), maps et statm quand le fil principal a fini.
-- **Les fils** : CLOSE_RANGE_UNSHARE refusé avec plusieurs fils (la table est au processus) ; CLONE_PIDFD, set_tid, CLONE_INTO_CGROUP, CLONE_CLEAR_SIGHAND, un processus neuf (fork, vfork : 6k) rendent ENOSYS, un espace de noms EPERM (CLONE_NEWUSER compris, que Linux permet) ; la base de GS n'est pas sauvée par tâche (arch_prctl refuse ARCH_SET_GS) ; RLIMIT_SIGPENDING n'est pas appliquée.
+- **/proc** (6f) : fabriqué à la demande, mais avec seulement ce que demandent nos programmes et `claude` (maps, statm, comm, exe, task, fd) ; ni `stat`, ni `status`, ni `/proc/version`, ni `ns/`, que `claude -p` cherche et dont il se passe. Écart voulu : /proc/<pid>/maps et statm montrent la mémoire du processus tant qu'il vit, même quand son fil principal a fini (Linux, qui la range dans la tâche du fil principal, les montre alors vides). Le texte d'un lien de fd/ et de maps garde le chemin de l'ouverture, et « (deleted) » se décide par le nombre de liens de l'inode : Linux suit le nom ouvert (son dentry), qui montre un renommage, et « (deleted) » pour un nom effacé dont un autre lien physique garde l'inode ; il faudrait au tmpfs ce dentry. Chercher dans le dossier d'un processus parti rend ENOENT (Linux : ESRCH, par la permission de traverser).
+- **Les fils** : CLOSE_RANGE_UNSHARE refusé avec plusieurs fils (la table est au processus) ; CLONE_PIDFD, set_tid, CLONE_INTO_CGROUP, CLONE_CLEAR_SIGHAND, un processus neuf (fork, vfork : 6k) rendent ENOSYS, un espace de noms EPERM (CLONE_NEWUSER compris, que Linux permet) ; la base de GS n'est pas sauvée par tâche (arch_prctl refuse ARCH_SET_GS).
 - **Préempter en rendant un verrou** (Linux le fait) : chez nous, un réveil fait dans le noyau ne prend effet qu'au retour vers l'anneau 3 ou au tic suivant.
 - **Le test « lignes »** ne peut pas prouver le verrou des écritures de la console sous QEMU sans accélération (TCG ne livre l'horloge qu'entre deux blocs traduits) ; à revoir sur un vrai processeur ou avec le multiprocesseur.
 - **WebAssembly** : l'O_TRUNC de path_open se fait sans le verrou d'écriture de l'inode.
@@ -324,10 +354,12 @@ Dossier `06e-ordonnanceur/`, en dix-huit commits, d'après le plan écrit au dé
 - **Archive cpio** : archives concaténées et compressées.
 - **La console écrit au plus 1024 octets par appel**, et ld-linux ne reprend pas une écriture courte (`ld.so --help` est coupé ; stdio et Bun reprennent). Linux n'écrit jamais court sur un terminal, mais il peut attendre et être interrompu ; notre port série fait attendre activement : le terminal à interruptions et sa file (6j).
 - **Le lanceur `/etc/demarrage`** cède la place à un vrai `/init` et à un shell avec `fork` et `execve` (6k) ; son dossier courant est `/`, que l'utilisateur 1000 ne peut pas écrire (à revoir pour `claude`, 6i). Une limite de temps : le programme la pose (setrlimit), et le shell aura `ulimit -t` (6k).
-- **Le vecteur auxiliaire** n'a pas AT_SYSINFO_EHDR (le vDSO, 6m), AT_MINSIGSTKSZ (6f), AT_RSEQ_* ; `rseq` rend ENOSYS : la glibc a un repli pour chacun.
-- **Tas :** des listes par processeur pour le multiprocesseur.
-- **Les signaux** (6d) sont enregistrés, pas encore livrés à un gestionnaire (le cadre de signal, `rt_sigreturn`, SA_RESTART : 6f) ; les signaux temps réel n'ont pas encore de file ; le pid 1 n'a pas le statut à part de Linux. Une attente que rien ne finira (plus aucune tâche prête ni minuterie) arrête les programmes qui dorment, par SIGKILL et en le disant, faute de terminal pour les interrompre ; `epoll_wait` rend ENOSYS (6f).
-- **/proc et /sys** (6d) : root ne peut pas changer les droits de la racine de /proc ni d'un nœud de sysfs (Linux le permet) ; un numéro d'inode de /proc n'est jamais repris, ENOSPC après quatre milliards d'entrées.
+- **Le vecteur auxiliaire** n'a pas AT_SYSINFO_EHDR (le vDSO, 6m), AT_RSEQ_* ; `rseq` rend ENOSYS : la glibc a un repli pour chacun.
+- **Tas :** des listes par processeur pour le multiprocesseur. Avec lui aussi, un ordre total des verrous des fichiers et des processus : deux ordres coexistent depuis /proc à la demande (6f), sans danger sur un seul processeur (vfs.rs).
+- **Les signaux** (6f) : livrés à leurs gestionnaires, mais un programme qui devrait s'arrêter (SIGSTOP, SIGTSTP) est terminé, faute de contrôle des tâches pour lui envoyer SIGCONT (6j, 6k) ; ni `signalfd`, ni `timerfd`, ni minuteries de processus (`setitimer`, `alarm`, `timer_create`) ; pas de fichier core ; le pid 1 n'a pas le statut à part de Linux ; un signal envoyé au processus est pris par le premier de ses fils qui retourne vers l'anneau 3 sans le bloquer (Linux le laisse au fil qu'il a choisi et prévenu, `complete_signal`). Une attente que rien ne finira (plus aucune tâche prête ni minuterie) arrête les programmes qui dorment, par SIGKILL et en le disant, faute de terminal pour les interrompre.
+- **/proc et /sys** (6d) : root ne peut pas changer les droits de la racine de /proc ni d'un nœud de sysfs (Linux le permet).
+- **epoll** (6f) : Linux refuse un ajout qui ferait plus de 1000 chemins de réveil vers un même fichier (`reverse_path_check`), pas nous.
+- **Ce que `claude -p` demande encore** : `socket` (le réseau, 6g et 6h), et `socketpair`, `copy_file_range`, `sendfile`, `fadvise64`, `inotify_init1`, qui rendent ENOSYS et dont il se passe (copies par read et write, pas de surveillance des fichiers). Sa vérification « memoire rendue » (`make claude-p`) échoue, à raison : les fichiers qu'il laisse dans HOME restent dans le tmpfs.
 - **`mknodat`** (259) est encore un appel inconnu (avec le shell, 6k).
 
 **Pour le vrai matériel**
@@ -337,10 +369,10 @@ Dossier `06e-ordonnanceur/`, en dix-huit commits, d'après le plan écrit au dé
 - **NMI pendant le passage éclair en mode protégé du chargeur** : non masqué (Linux le masque par le port 0x70 pour son passage définitif). Risque infime, à revoir si un essai sur vrai matériel le montre.
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
 
-## 20. Questions ouvertes
+## 21. Questions ouvertes
 
-- Aucune pour l'instant.
+- **/proc/<pid>/maps quand le fil principal a fini** (et que d'autres vivent) : Linux le montre vide, nous la vraie mémoire du processus ; l'écart est proposé (le comportement de Linux vient de son organisation, aucun programme ne l'attend), en attente de l'avis de David. L'imiter serait une ligne de `ProcVue`.
 
-## 21. Prochaine étape
+## 22. Prochaine étape
 
-Sous-étape 6f : les signaux livrés à leurs gestionnaires (le cadre de signal, `rt_sigreturn`, SA_RESTART), `epoll_wait` qui attend vraiment, `eventfd`, les tubes. Son plan sera écrit et relu au début de son fil, avec ce que 6e a appris (`etape-06/plan.md` dans les fichiers du projet pour le découpage).
+Sous-étape 6g : le bus PCI, la carte réseau virtio-net, Ethernet, IPv4, UDP et le DNS : `claude -p` trouvera l'adresse de l'API, puis bloquera sur TCP (6h). Son plan sera écrit et relu au début de son fil, avec ce que 6f a appris (`etape-06/plan.md` dans les fichiers du projet pour le découpage).
