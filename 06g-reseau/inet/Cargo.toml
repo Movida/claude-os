@@ -1,7 +1,8 @@
 # La pile d'IPv4 sans le matériel (« inet », le nom de la famille d'IPv4
-# dans Linux, net/ipv4) : les tables et les machines à états
-# (la table de routage, le client DHCP, puis les voisins et les ports), qui
-# reçoivent l'heure et le hasard en arguments. Comme la carte des zones
+# dans Linux, net/ipv4) : les tables et les machines à états (la table de
+# routage, le client DHCP, puis les voisins, les ports d'UDP et les
+# identifiants des sockets de ping), qui reçoivent l'heure et le hasard en
+# arguments. Comme la carte des zones
 # (../zones) et le système de fichiers (../fichiers), une bibliothèque sans
 # bibliothèque standard (no_std) et sans `unsafe`, testée sur la machine
 # hôte (`make tests-hote`), où une horloge simulée rejoue en une

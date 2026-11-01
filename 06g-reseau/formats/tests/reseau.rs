@@ -5,7 +5,7 @@
 //! bonne raison ; puis des mutations au hasard, à graine fixe : aucune
 //! panique, et ce qui est accepté reste dans les octets reçus.
 
-use formats::reseau::{self, Erreur, arp, dhcp, ethernet, ipv4, udp};
+use formats::reseau::{self, Erreur, arp, dhcp, ethernet, icmp, ipv4, udp};
 use std::path::PathBuf;
 
 fn trame(nom: &str) -> Vec<u8> {
@@ -151,6 +151,10 @@ fn ipv4_abime() {
         let s = reseau::plier(reseau::somme(&o[..20], 0));
         o[10..12].copy_from_slice(&s.to_be_bytes());
         assert_eq!(ipv4::lire(&o), Err(attendu));
+        // L'en-tête seul (d'un paquet dont on n'a que le début) : une
+        // longueur au-delà de ce qu'on a passe, pas une trop courte.
+        let seul = if attendu == Erreur::Tronque { Ok(longueur) } else { Err(attendu) };
+        assert_eq!(ipv4::lire_entete(&o).map(|h| h.longueur), seul);
     }
     // Du bourrage après la longueur totale : ôté de la charge.
     let mut o = ip.to_vec();
@@ -234,6 +238,45 @@ impl Hasard {
 }
 
 #[test]
+fn icmp_echo_et_erreur() {
+    // Un écho de 4 octets : écrit, relu, sa somme couvre aussi les données.
+    let mut o = vec![0u8; 12];
+    o[8..].copy_from_slice(b"ping");
+    let e = icmp::Icmp { genre: icmp::ECHO, code: 0, reste: icmp::reste_echo(0x1234, 7) };
+    icmp::ecrire(&mut o, &e);
+    let (lu, donnees) = icmp::lire(&o).unwrap();
+    assert_eq!((lu, lu.echo(), donnees), (e, (0x1234, 7), &b"ping"[..]));
+    o[10] ^= 1;
+    assert_eq!(icmp::lire(&o), Err(Erreur::Somme));
+    // Moins de 8 octets, la somme juste (0xFFFF, puis un mot nul : le
+    // complément de leur somme est 0) : tronqué.
+    assert_eq!(icmp::lire(&[0xFF, 0xFF, 0, 0]), Err(Erreur::Tronque));
+    // Une erreur : le début du paquet d'origine, un datagramme UDP de
+    // 10.0.2.15:40000 vers 10.0.2.2:9 ; il faut l'en-tête entier et 8
+    // octets derrière.
+    let mut p = vec![0u8; 28];
+    p[0] = 0x45;
+    p[9] = ipv4::UDP;
+    p[12..16].copy_from_slice(&[10, 0, 2, 15]);
+    p[16..20].copy_from_slice(&[10, 0, 2, 2]);
+    p[20..22].copy_from_slice(&40000u16.to_be_bytes());
+    p[22..24].copy_from_slice(&9u16.to_be_bytes());
+    let i = icmp::interne(&p).unwrap();
+    assert_eq!((i.protocole, i.source, i.destination, i.longueur_entete), (ipv4::UDP, [10, 0, 2, 15], [10, 0, 2, 2], 20));
+    assert_eq!(icmp::ports(&p, &i), Some((40000, 9)));
+    assert_eq!(icmp::interne(&p[..27]), None, "7 octets derrière l'en-tête");
+    p[0] = 0x44;
+    assert_eq!(icmp::interne(&p), None, "un en-tête de 4 mots");
+    p[0] = 0x46;
+    assert_eq!(icmp::interne(&p), None, "des options : l'en-tête et 8 octets ne tiennent plus");
+    // Les genres qui sont des erreurs : ceux d'icmp_pointers (1, 2, 6, 7,
+    // 9 et 10 compris), et les inconnus.
+    let erreurs: Vec<u8> = (0..=255).filter(|&g| icmp::est_erreur(g)).collect();
+    let attendues: Vec<u8> = [1, 2, 3, 4, 5, 6, 7, 9, 10, 11, 12].into_iter().chain(19..=255).collect();
+    assert_eq!(erreurs, attendues);
+}
+
+#[test]
 fn mutations() {
     let mut h = Hasard(0x7e5e_a0de);
     let originaux: Vec<Vec<u8>> = ["arp-reponse", "dhcp-discover", "dhcp-offer", "dhcp-request", "dhcp-ack"].iter().map(|n| trame(n)).collect();
@@ -265,10 +308,24 @@ fn mutations() {
             let s = reseau::plier(reseau::somme(&ip[..ihl], 0));
             ip[10..12].copy_from_slice(&s.to_be_bytes());
         }
+        // L'en-tête seul : tout entier présent ; le même que celui de `lire`
+        // quand `lire` l'accepte.
+        let seul = ipv4::lire_entete(&ip);
+        if let Ok(e) = seul {
+            assert!(e.longueur_entete >= 20 && e.longueur_entete <= ip.len());
+        }
         let Ok((entete, charge)) = ipv4::lire(&ip) else { continue };
+        assert_eq!(seul, Ok(entete));
         assert!(entete.longueur_entete >= 20 && entete.longueur as usize <= ip.len() && charge.len() == entete.longueur as usize - entete.longueur_entete);
         if let Ok((_, message)) = udp::lire(charge, entete.source, entete.destination) {
             assert!(message.len() + udp::ENTETE <= charge.len());
+        }
+        // Lu comme un message ICMP, et comme le paquet qu'une erreur porte.
+        if let Ok((_, donnees)) = icmp::lire(charge) {
+            assert_eq!(donnees.len() + icmp::ENTETE, charge.len());
+        }
+        if let Some(i) = icmp::interne(charge) {
+            assert!(i.longueur_entete + 8 <= charge.len() && icmp::ports(charge, &i).is_some());
         }
     }
     assert!(acceptes > 10_000, "trop peu de messages acceptés ({acceptes}) : le test ne mord plus");

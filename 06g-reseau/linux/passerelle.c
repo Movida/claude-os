@@ -11,13 +11,28 @@
  *     eth0, et ses compteurs le comptent ;
  *   - /proc/net/arp : son en-tête, et les voisins résolus au démarrage (la
  *     passerelle et le DNS de slirp, dont l'adresse matérielle est 52:55
- *     suivi de leur adresse IPv4).
+ *     suivi de leur adresse IPv4) ;
+ *   - un ping de la passerelle, attendu par un recv sans délai : aucune
+ *     minuterie armée, le détecteur d'interblocage doit le laisser
+ *     attendre (une réponse peut venir du réseau) ;
+ *   - une socket connectée à 10.0.2.2:9 : slirp répond par un ICMP « port
+ *     injoignable » venu de 127.0.0.1 (ce que lui dit l'hôte), un martien
+ *     que Linux jette : aucune erreur.
+ * `passerelle muet`, dans le noyau des tests : 10.0.2.99, une adresse du
+ * réseau où personne ne répond. Le voisin échoue (3 s), et chaque paquet
+ * qui l'attendait revient en ICMP « hôte injoignable », de nous à nous :
+ * une socket connectée sans IP_RECVERR n'en voit rien (l'erreur n'est pas
+ * fatale), une socket UDP et une socket de ping avec IP_RECVERR l'ont
+ * dans leur file d'erreurs (EHOSTUNREACH, ICMP 3/1, dite par 10.0.2.15).
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/errqueue.h>
 #include <netinet/in.h>
+#include <netinet/ip_icmp.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -57,8 +72,71 @@ static void ligne_de_route(char *o, const char *texte)
     o[128] = 0;
 }
 
-int main(void)
+static struct sockaddr_in adresse(uint32_t ip, uint16_t port)
 {
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(ip) };
+    return a;
+}
+
+/* Un écho de 12 octets : l'en-tête ICMP, puis « ping ». */
+static void echo(char m[12])
+{
+    struct icmphdr e = { .type = ICMP_ECHO, .un.echo = { .id = htons(1), .sequence = htons(1) } };
+    memcpy(m, &e, sizeof e);
+    memcpy(m + 8, "ping", 4);
+}
+
+/* La première erreur de la file de s, avec son errno, son genre, son code
+ * et qui l'a dite ; 0 si elle est ICMP 3/1 de 10.0.2.15, EHOSTUNREACH. */
+static int hote_injoignable(int s)
+{
+    char o[64], c[256];
+    struct iovec v = { o, sizeof o };
+    struct msghdr m = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = c, .msg_controllen = sizeof c };
+    if (recvmsg(s, &m, MSG_ERRQUEUE) < 0)
+        return -1;
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+        struct sock_extended_err *ee = (struct sock_extended_err *)CMSG_DATA(h);
+        struct sockaddr_in *de = (struct sockaddr_in *)SO_EE_OFFENDER(ee);
+        if (h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_RECVERR)
+            return !(ee->ee_errno == EHOSTUNREACH && ee->ee_origin == SO_EE_ORIGIN_ICMP && ee->ee_type == ICMP_DEST_UNREACH
+                     && ee->ee_code == ICMP_HOST_UNREACH && de->sin_addr.s_addr == htonl(0x0a00020f));
+    }
+    return -1;
+}
+
+static int muet(void)
+{
+    struct sockaddr_in a = adresse(0x0a000263, 9);
+    int un = 1;
+    int connectee = socket(AF_INET, SOCK_DGRAM, 0), libre = socket(AF_INET, SOCK_DGRAM, 0);
+    int ping = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    setsockopt(libre, IPPROTO_IP, IP_RECVERR, &un, sizeof un);
+    setsockopt(ping, IPPROTO_IP, IP_RECVERR, &un, sizeof un);
+    connect(connectee, (struct sockaddr *)&a, sizeof a);
+    char m[12];
+    echo(m);
+    int partis = send(connectee, "muet", 4, 0) == 4 && sendto(libre, "muet", 4, 0, (struct sockaddr *)&a, sizeof a) == 4
+                 && sendto(ping, m, sizeof m, 0, (struct sockaddr *)&a, sizeof a) == sizeof m;
+    verifier(partis, "10.0.2.99 : trois paquets partent (le voisin se cherche)");
+    /* Les deux erreurs, 10 s au plus chacune (le voisin échoue en 3 s). */
+    struct pollfd p = { libre, 0, 0 }, q = { ping, 0, 0 };
+    poll(&p, 1, 10000);
+    poll(&q, 1, 10000);
+    verifier(hote_injoignable(libre) == 0, "UDP avec IP_RECVERR : EHOSTUNREACH, ICMP 3/1 de 10.0.2.15");
+    verifier(hote_injoignable(ping) == 0, "ping avec IP_RECVERR : EHOSTUNREACH, ICMP 3/1 de 10.0.2.15");
+    struct pollfd c = { connectee, POLLIN, 0 };
+    char o[8];
+    verifier(poll(&c, 1, 0) == 0 && recv(connectee, o, sizeof o, MSG_DONTWAIT) == -1 && errno == EAGAIN,
+             "connectee sans IP_RECVERR : rien (l'hote injoignable n'est pas fatal)");
+    printf("[linux] passerelle : %s\n", echecs ? "ECHEC" : "toutes les verifications (muet) : ok");
+    return echecs != 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "muet") == 0)
+        return muet();
     char t[8192], attendu[3 * 128 + 1];
     /* La table de routage : la route par défaut (RTF_UP | RTF_GATEWAY, par
      * 10.0.2.2), puis celle du réseau (RTF_UP) ; les adresses comme Linux
@@ -133,6 +211,28 @@ int main(void)
              && strstr(t, "\n10.0.2.2         0x1         0x2         52:55:0a:00:02:02     *        eth0\n")
              && strstr(t, "\n10.0.2.3         0x1         0x2         52:55:0a:00:02:03     *        eth0\n"),
              "/proc/net/arp : la passerelle et le DNS, comme Linux");
+
+    /* Le ping de la passerelle, attendu sans délai. */
+    int q = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    a = adresse(0x0a000202, 0);
+    char e[12], rep[64];
+    echo(e);
+    parti = sendto(q, e, sizeof e, 0, (struct sockaddr *)&a, sizeof a) == sizeof e;
+    l = sizeof a;
+    n = recvfrom(q, rep, sizeof rep, 0, (struct sockaddr *)&a, &l);
+    verifier(parti && n == sizeof e && rep[0] == ICMP_ECHOREPLY && memcmp(rep + 8, "ping", 4) == 0 && a.sin_addr.s_addr == htonl(0x0a000202),
+             "ping de 10.0.2.2 : la reponse, attendue sans delai");
+    close(q);
+
+    /* 10.0.2.2:9, connectée : l'ICMP de slirp, de 127.0.0.1, est jeté. */
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    a = adresse(0x0a000202, 9);
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    send(s, "x", 1, 0);
+    struct pollfd p = { s, POLLIN, 0 };
+    verifier(poll(&p, 1, 500) == 0 && recv(s, rep, sizeof rep, MSG_DONTWAIT) == -1 && errno == EAGAIN,
+             "10.0.2.2:9 connectee : l'ICMP de 127.0.0.1 est un martien, aucune erreur");
+    close(s);
 
     printf("[linux] passerelle : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;

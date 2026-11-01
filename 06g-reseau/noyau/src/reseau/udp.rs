@@ -16,9 +16,10 @@
 //! la carte, ou sa petite file) ; MSG_MORE et UDP_CORK ; la multidiffusion.
 
 use super::datagramme::{self, Controle};
-use super::ipv4::{self, Envoi};
+use super::ipv4;
 use super::paquet::Paquet;
-use super::socket::{self, AF_INET, AF_UNSPEC, ARRET_ECRITURE, Datagramme, Inet, Socket};
+use super::icmp::ErreurRecue;
+use super::socket::{self, Admission, AF_INET, AF_UNSPEC, Datagramme, ErreurEnFile, Inet, Socket};
 use crate::aleatoire;
 use crate::verrou::Verrou;
 use alloc::sync::Arc;
@@ -27,7 +28,6 @@ use formats::reseau::{ipv4 as format_ipv4, udp};
 use inet::ports::{Lien, Refus, Table};
 
 const EINVAL: i64 = 22;
-const EPIPE: i64 = 32;
 const EDESTADDRREQ: i64 = 89;
 const EMSGSIZE: i64 = 90;
 const EOPNOTSUPP: i64 = 95;
@@ -114,20 +114,14 @@ pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
 ///     pas connectée : EDESTADDRREQ ;
 ///   - les messages de contrôle (`controle`, lus par l'appel : leur erreur
 ///     sort ici, EINVAL) ;
-///   - la route (ENETUNREACH) ; une diffusion sans SO_BROADCAST : EACCES ;
-///     l'adresse source (IP_PKTINFO, celle de `bind`, celle de la route ;
-///     une qui n'est pas à nous : EINVAL) ;
-///   - plus grand que la MTU du chemin : EMSGSIZE (l'en-tête du module) ;
-///   - l'écriture arrêtée (`shutdown`) : EPIPE, sans SIGPIPE (le
-///     `sock_alloc_send_pskb` de Linux, pour qui le signal est l'affaire de
-///     TCP) ;
+///   - ce que fait toute socket de datagrammes (`datagramme::preparer`) :
+///     la route, l'adresse source, la MTU, l'erreur en attente, l'arrêt ;
 ///   - le paquet (ENOBUFS), la copie (EFAULT), et il part.
 ///
 /// Rend la longueur envoyée.
 pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u64, controle: Result<Controle, i64>,
-               remplir: impl FnOnce(&mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
+               mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_OOB: u64 = 1;
-    const MSG_CONFIRM: u64 = 0x800;
     const MSG_MORE: u64 = 0x8000;
     let mut inet = s.appels.verrouiller();
     datagramme::lier_au_besoin(s, &mut inet)?;
@@ -152,38 +146,14 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
         None => return Err(-EDESTADDRREQ),
     };
     let c = controle?;
-    let datagramme::Trajet { chemin, destination: adresse, source } = datagramme::router(&inet, adresse, &c, drapeaux)?;
-    if longueur + udp::ENTETE + format_ipv4::ENTETE > ipv4::mtu(&chemin) as usize {
-        return Err(-EMSGSIZE);
-    }
-    if s.reception.verrouiller().arret & ARRET_ECRITURE != 0 {
-        return Err(-EPIPE);
-    }
-    // DF avec IP_PMTUDISC_WANT, DO et PROBE (`__ip_make_skb`) ;
-    // l'identifiant comme `ip_select_ident_segs` : celui de la socket si
-    // elle est connectée (même pour un autre destinataire) ; 0 avec DO et
-    // PROBE (un paquet que rien ne fragmentera, pas même nous :
-    // `ignore_df` faux) ; sinon `ipv4::identifiant`.
-    let ne_pas_fragmenter = matches!(inet.options.pmtudisc, 1..=3);
-    let identifiant = if inet.connecte {
-        inet.identifiant = inet.identifiant.wrapping_add(1);
-        inet.identifiant
-    } else if matches!(inet.options.pmtudisc, 2 | 3) {
-        0
-    } else {
-        ipv4::identifiant()
-    };
-    let envoi = Envoi {
-        source, destination: adresse, protocole: format_ipv4::UDP, ttl: c.ttl.or(inet.options.ttl).unwrap_or(64),
-        tos: c.tos.unwrap_or(inet.options.tos), identifiant, ne_pas_fragmenter,
-        confirmer: drapeaux & MSG_CONFIRM != 0,
-    };
+    let (chemin, envoi) = datagramme::preparer(s, &mut inet, adresse, udp::ENTETE + longueur, format_ipv4::UDP, drapeaux, &c)?;
+    let adresse = envoi.destination;
     let u = udp::Udp { source: inet.port, destination: port };
     drop(inet);
     let Some(mut p) = Paquet::vide(udp::ENTETE + longueur) else { return Err(-ENOBUFS) };
     let Some(segment) = p.ajouter_fin(udp::ENTETE + longueur) else { return Err(-ENOBUFS) };
-    remplir(&mut segment[udp::ENTETE..])?;
-    udp::ecrire(segment, &u, source, adresse);
+    remplir(0, &mut segment[udp::ENTETE..])?;
+    udp::ecrire(segment, &u, envoi.source, adresse);
     ipv4::emettre(chemin, &envoi, p);
     Ok(longueur)
 }
@@ -191,13 +161,14 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
 /// Un datagramme UDP (`p` : le segment, en-tête compris, sans l'en-tête
 /// d'IPv4) reçu par l'interface `interface`, pour `destination`, de
 /// `source`, dans la tâche du réseau : `__udp4_lib_rcv`, la somme
-/// vérifiée, puis la socket qui le reçoit ; une diffusion à chacune de
-/// celles du port. Rend vrai si une socket l'a pris (sinon, ICMP « port
-/// injoignable » : le commit suivant).
-pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion: bool, mut p: Paquet) -> bool {
+/// vérifiée (fausse : jeté, sans rien dire), puis la socket qui le reçoit ;
+/// une diffusion à chacune de celles du port. Sans socket, le segment est
+/// rendu, son en-tête remis, pour l'erreur ICMP « port injoignable » (que
+/// l'appelant envoie : il a l'en-tête d'IPv4).
+pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion: bool, mut p: Paquet) -> Result<(), Paquet> {
     let Ok((u, charge)) = udp::lire(p.donnees(), source, destination) else {
         FAUX.fetch_add(1, Ordering::Relaxed);
-        return true;
+        return Ok(());
     };
     let longueur = charge.len();
     let _ = p.retirer_entete(udp::ENTETE);
@@ -212,17 +183,18 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion
                 }
             });
         }
-        return true;
+        return Ok(());
     }
     let s = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(source, u.source, destination, u.destination));
     match s {
         Some(s) => {
             deposer(&s, p, source, u.source, destination, interface);
-            true
+            Ok(())
         }
         None => {
             SANS_SOCKET.fetch_add(1, Ordering::Relaxed);
-            false
+            let _ = p.ajouter_entete(udp::ENTETE);
+            Err(p)
         }
     }
 }
@@ -230,9 +202,91 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion
 fn deposer(s: &Socket, p: Paquet, source: [u8; 4], port: u16, destination: [u8; 4], interface: u32) {
     let taille = p.taille_vraie();
     let d = Datagramme { paquet: p, source, port, destination, interface, taille };
-    if !s.deposer(d) {
+    if !s.deposer(d, Admission::Udp) {
         FILE_PLEINE.fetch_add(1, Ordering::Relaxed);
     }
+}
+
+/// Ce que veut dire une erreur ICMP pour une socket (l'`icmp_err_convert`
+/// de Linux, pour ICMP_DEST_UNREACH) : son errno, et si elle est « fatale »
+/// (une socket connectée sans IP_RECVERR ne voit que celles-là : l'hôte
+/// injoignable, qui peut n'être que passager, ne lui est pas dit).
+pub fn convertir(genre: u8, code: u8, pmtudisc: bool) -> Option<(i32, bool)> {
+    const ENOPROTOOPT: i32 = 92;
+    const ECONNREFUSED: i32 = 111;
+    const ENETUNREACH: i32 = 101;
+    const EHOSTUNREACH: i32 = 113;
+    const EMSGSIZE: i32 = 90;
+    const EOPNOTSUPP: i32 = 95;
+    const EHOSTDOWN: i32 = 112;
+    const ENONET: i32 = 64;
+    const EPROTO: i32 = 71;
+    use formats::reseau::icmp;
+    const TABLE: [(i32, bool); 16] = [
+        (ENETUNREACH, false), (EHOSTUNREACH, false), (ENOPROTOOPT, true), (ECONNREFUSED, true), (EMSGSIZE, false),
+        (EOPNOTSUPP, false), (ENETUNREACH, true), (EHOSTDOWN, true), (ENONET, true), (ENETUNREACH, true),
+        (EHOSTUNREACH, true), (ENETUNREACH, false), (EHOSTUNREACH, false), (EHOSTUNREACH, true), (EHOSTUNREACH, true),
+        (EHOSTUNREACH, true),
+    ];
+    match genre {
+        // La fragmentation nécessaire : la découverte de la MTU du chemin
+        // (Linux la retient pour la route : pas encore, un écart) ; une
+        // erreur fatale, sauf avec IP_PMTUDISC_DONT.
+        icmp::INJOIGNABLE if code == icmp::FRAGMENTATION => pmtudisc.then_some((EMSGSIZE, true)),
+        icmp::INJOIGNABLE => Some(TABLE.get(code as usize).copied().unwrap_or((EHOSTUNREACH, false))),
+        icmp::PARAMETRE => Some((EPROTO, true)),
+        // Une redirection (Linux la retient pour la route, pas nous) et
+        // l'étouffement ne sont pas des erreurs pour la socket.
+        icmp::REDIRECTION | icmp::ETOUFFEMENT => None,
+        _ => Some((EHOSTUNREACH, false)),
+    }
+}
+
+/// Une erreur ICMP pour un datagramme UDP que nous avons envoyé, dans la
+/// tâche du réseau (`__udp4_lib_err`) : la socket qui l'a envoyé, retrouvée
+/// par les adresses et les ports de sa copie (comme on trouve celle d'un
+/// datagramme reçu, les deux bouts inversés) ; sans IP_RECVERR, seule une
+/// socket connectée voit une erreur fatale (`sk_err`, le prochain appel la
+/// rend) ; avec, toute erreur va aussi dans sa file d'erreurs, avec ce que
+/// le message portait de la charge d'origine.
+pub fn erreur(e: &ErreurRecue) {
+    let Some((port_source, port_destination)) = formats::reseau::icmp::ports(e.origine, &e.interne) else { return };
+    let i = &e.interne;
+    let Some(s) = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source)) else {
+        return;
+    };
+    let Some((errno, fatale)) = convertir(e.genre, e.code, fragmentation_dite(&s)) else { return };
+    signaler(&s, e, errno, fatale, port_destination, udp::ENTETE);
+}
+
+/// Faut-il dire à la socket `s` qu'un paquet devait être fragmenté (ICMP
+/// « fragmentation nécessaire ») ? Oui, sauf avec IP_PMTUDISC_DONT (0), lu
+/// par sa copie atomique : la tâche du réseau ne prend pas le `Mutex`.
+pub fn fragmentation_dite(s: &Socket) -> bool {
+    s.pmtudisc.load(Ordering::Relaxed) != 0
+}
+
+/// Ce que fait une erreur ICMP à la socket `s` (la fin d'`__udp4_lib_err`
+/// et de `ping_err`) : voir `erreur`. `port` : celui de la destination
+/// d'origine (0 pour ping) ; `debut` : où commence, après l'en-tête IPv4
+/// de la copie, ce que lira le programme.
+pub fn signaler(s: &Socket, e: &ErreurRecue, errno: i32, fatale: bool, port: u16, debut: usize) {
+    if !s.recverr.load(Ordering::Relaxed) {
+        if !fatale || !s.connectee.load(Ordering::Relaxed) {
+            return;
+        }
+    } else {
+        let charge = e.origine.get(e.interne.longueur_entete + debut..).unwrap_or(&[]);
+        if let Some(donnees) = Paquet::copie(charge) {
+            let taille = donnees.taille_vraie();
+            s.mettre_en_file(ErreurEnFile {
+                errno, origine: socket::ORIGINE_ICMP, genre: e.genre, code: e.code, info: e.info,
+                adresse: e.interne.destination, port, emetteur: e.emetteur, interface: e.interface,
+                arrivee: e.destination, donnees, taille,
+            });
+        }
+    }
+    s.signaler_erreur(errno);
 }
 
 /// Le nombre de sockets dont quelqu'un attend une lecture (le détecteur

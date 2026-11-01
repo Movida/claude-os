@@ -19,7 +19,7 @@ pub fn recevoir(i: &'static Interface, mut p: Paquet) {
     }
     let _ = p.retirer_entete(ethernet::ENTETE);
     match e.genre {
-        ethernet::IPV4 => super::ipv4::recevoir(i, p),
+        ethernet::IPV4 => super::ipv4::recevoir(i, p, e.destination == ethernet::DIFFUSION),
         ethernet::ARP => super::arp::recevoir(i, p.donnees(), e.destination == ethernet::DIFFUSION),
         _ => {}
     }

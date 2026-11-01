@@ -570,7 +570,7 @@ pub fn detecter_interblocage() -> bool {
     if MINUTERIES.verrouiller().iter().any(|(_, t)| t.est_programme()) || !ATTENTES_CALCUL.verrouiller().is_empty() {
         return false;
     }
-    if crate::reseau::udp::attentes() > 0 && crate::reseau::interface::une_carte_a_son_lien() {
+    if crate::reseau::attentes() > 0 && crate::reseau::interface::une_carte_a_son_lien() {
         return false;
     }
     let mut bloquees: Vec<Arc<Tache>> = Vec::new();

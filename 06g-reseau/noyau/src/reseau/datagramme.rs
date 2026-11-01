@@ -3,11 +3,12 @@
 //! éphémère d'un envoi, getsockname et getpeername. Chaque appel dans
 //! l'ordre de vérification de Linux ; la table où une socket prend son
 //! port est celle de son protocole (`table`). Ce que fait chaque protocole
-//! d'un envoi et d'une arrivée est dans le sien (udp.rs).
+//! d'un envoi et d'une arrivée est dans le sien (udp.rs, ping.rs).
 
 use super::ipv4;
-use super::socket::{self, AF_INET, AF_UNSPEC, Inet, Socket};
+use super::socket::{self, AF_INET, AF_UNSPEC, Inet, Protocole, Socket};
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 use formats::reseau::ipv4 as format_ipv4;
 use inet::ports;
 use inet::routes::Chemin;
@@ -23,30 +24,34 @@ const EADDRNOTAVAIL: i64 = 99;
 /// ou SO_REUSEPORT a changé. Sous le `Mutex` de la socket.
 pub mod table {
     use super::super::socket::{Inet, Protocole, Socket};
-    use super::super::udp;
+    use super::super::{ping, udp};
     use alloc::sync::Arc;
 
     pub fn inscrire(s: &Arc<Socket>, inet: &mut Inet, port: u16) -> Result<(), i64> {
         match s.protocole {
             Protocole::Udp => udp::inscrire(s, inet, port),
+            Protocole::Ping => ping::inscrire(s, inet, port),
         }
     }
 
     pub fn changer(s: &Socket, inet: &Inet) {
         match s.protocole {
             Protocole::Udp => udp::changer(s, inet),
+            Protocole::Ping => ping::changer(s, inet),
         }
     }
 
     pub fn retirer(s: &Socket) {
         match s.protocole {
             Protocole::Udp => udp::liberer(s),
+            Protocole::Ping => ping::liberer(s),
         }
     }
 
     pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
         match s.protocole {
             Protocole::Udp => udp::reutilisation_changee(s, inet),
+            Protocole::Ping => ping::reutilisation_changee(s, inet),
         }
     }
 }
@@ -55,21 +60,27 @@ pub mod table {
 /// d'`inet_bind` et d'`__inet_bind` : moins de 16 octets : EINVAL ; une
 /// autre famille qu'AF_INET : EAFNOSUPPORT (AF_UNSPEC accepté avec
 /// 0.0.0.0, une compatibilité de Linux) ; une adresse qui n'est pas à nous
-/// (ni 0.0.0.0, ni une diffusion, ni une multidiffusion) : EADDRNOTAVAIL ;
-/// un port de moins de 1024 sans être root : EACCES ; déjà liée : EINVAL ;
-/// le port pris : EADDRINUSE.
+/// (ni 0.0.0.0, ni, pour UDP seulement, une diffusion ou une
+/// multidiffusion) : EADDRNOTAVAIL ; un port de moins de 1024 sans être
+/// root : EACCES (pour UDP) ; déjà liée : EINVAL ; le port pris :
+/// EADDRINUSE. Une socket de ping suit le même ordre
+/// (`ping_check_bind_addr`, qui refuse diffusions et multidiffusions, puis
+/// `ping_bind`), son port étant l'identifiant de ses échos.
 pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     let Some(a) = socket::lire_adresse(o) else { return Err(-EINVAL) };
     if a.famille != AF_INET && !(a.famille == AF_UNSPEC && a.adresse == format_ipv4::AUCUNE) {
         return Err(-EAFNOSUPPORT);
     }
-    let a_nous = a.adresse == format_ipv4::AUCUNE || a.adresse == format_ipv4::DIFFUSION || format_ipv4::multidiffusion(a.adresse)
-        || ipv4::avec_table(|t| t.est_a_nous(a.adresse) || matches!(t.chercher(a.adresse), Some(Chemin::Diffusion { .. })))
-            .unwrap_or(false);
-    if !a_nous {
+    let (locale, diffusion) = ipv4::avec_table(|t| {
+        (t.est_a_nous(a.adresse), matches!(t.chercher(a.adresse), Some(Chemin::Diffusion { .. })))
+    }).unwrap_or((false, false));
+    let diffusion = diffusion || a.adresse == format_ipv4::DIFFUSION || format_ipv4::multidiffusion(a.adresse);
+    if !(a.adresse == format_ipv4::AUCUNE || locale || (diffusion && s.protocole == Protocole::Udp)) {
         return Err(-EADDRNOTAVAIL);
     }
-    if a.port != 0 && a.port < ports::PRIVILEGIE && s.uid != 0 {
+    // Un port privilégié pour UDP ; une socket de ping n'a que des
+    // identifiants (`ping_bind` ne regarde pas).
+    if s.protocole == Protocole::Udp && a.port != 0 && a.port < ports::PRIVILEGIE && s.uid != 0 {
         return Err(-EACCES);
     }
     let mut inet = s.appels.verrouiller();
@@ -131,6 +142,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     inet.distante = adresse;
     inet.port_distant = a.port;
     inet.connecte = true;
+    s.connectee.store(true, Ordering::Relaxed);
     let mut h = [0u8; 2];
     crate::aleatoire::remplir(&mut h);
     inet.identifiant = u16::from_le_bytes(h);
@@ -145,6 +157,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
 pub fn deconnecter(s: &Arc<Socket>) {
     let mut inet = s.appels.verrouiller();
     inet.connecte = false;
+    s.connectee.store(false, Ordering::Relaxed);
     inet.distante = format_ipv4::AUCUNE;
     inet.port_distant = 0;
     inet.source = format_ipv4::AUCUNE;
@@ -235,4 +248,56 @@ pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64) ->
         return Err(-EACCES);
     }
     Ok(Trajet { chemin, destination, source })
+}
+
+/// La suite d'un envoi, une fois sa destination connue (`ip_make_skb`,
+/// `__ip_append_data`, `sock_alloc_send_pskb`), commune à UDP et ping, sous
+/// le `Mutex` : la route et ses refus (`router`) ; `charge` octets
+/// (l'en-tête du protocole compris) plus l'en-tête IPv4 au-delà de la MTU
+/// du chemin : EMSGSIZE, et avec IP_RECVERR une erreur « locale » en file
+/// (`ip_local_error` : la destination, le port de la connexion, la MTU) ;
+/// l'erreur en attente (lue et effacée : un ECONNREFUSED revenu après
+/// l'envoi précédent sort ici) ; l'écriture arrêtée : EPIPE, sans SIGPIPE
+/// (le signal est l'affaire de TCP). Rend le chemin et ce qu'il faut à
+/// l'en-tête IPv4.
+pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize, protocole: u8, drapeaux: u64, c: &Controle)
+                -> Result<(Chemin, ipv4::Envoi), i64> {
+    const MSG_CONFIRM: u64 = 0x800;
+    const EPIPE: i64 = 32;
+    const EMSGSIZE: i64 = 90;
+    let Trajet { chemin, destination, source } = router(inet, destination, c, drapeaux)?;
+    let mtu = ipv4::mtu(&chemin);
+    if charge + format_ipv4::ENTETE > mtu as usize {
+        if inet.options.recverr {
+            if let Some(e) = socket::ErreurEnFile::locale(EMSGSIZE as i32, mtu, destination, inet.port_distant) {
+                s.mettre_en_file(e);
+            }
+        }
+        return Err(-EMSGSIZE);
+    }
+    let erreur = s.prendre_erreur();
+    if erreur != 0 {
+        return Err(-(erreur as i64));
+    }
+    if s.reception.verrouiller().arret & socket::ARRET_ECRITURE != 0 {
+        return Err(-EPIPE);
+    }
+    // DF avec IP_PMTUDISC_WANT, DO et PROBE (`__ip_make_skb`) ;
+    // l'identifiant comme `ip_select_ident_segs` : celui de la socket si
+    // elle est connectée (même pour un autre destinataire) ; 0 avec DO et
+    // PROBE (un paquet que rien ne fragmentera, pas même nous :
+    // `ignore_df` faux) ; sinon `ipv4::identifiant`.
+    let ne_pas_fragmenter = matches!(inet.options.pmtudisc, 1..=3);
+    let identifiant = if inet.connecte {
+        inet.identifiant = inet.identifiant.wrapping_add(1);
+        inet.identifiant
+    } else if matches!(inet.options.pmtudisc, 2 | 3) {
+        0
+    } else {
+        ipv4::identifiant()
+    };
+    Ok((chemin, ipv4::Envoi {
+        source, destination, protocole, ttl: c.ttl.or(inet.options.ttl).unwrap_or(64), tos: c.tos.unwrap_or(inet.options.tos),
+        identifiant, ne_pas_fragmenter, confirmer: drapeaux & MSG_CONFIRM != 0,
+    }))
 }

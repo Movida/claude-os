@@ -6,8 +6,8 @@
 //! fait plus tard, interruptions permises (tache.rs). Les pilotes : la carte
 //! virtio-net (virtio_net.rs). Ce que voit la pile d'une carte : son
 //! interface (interface.rs) ; ce qui circule : des paquets (paquet.rs).
-//! Les étages : Ethernet (ethernet.rs), ARP (arp.rs), IPv4 (ipv4.rs), UDP
-//! (udp.rs) ; les sockets, ce qu'en voient les programmes (socket.rs, ce
+//! Les étages : Ethernet (ethernet.rs), ARP (arp.rs), IPv4 (ipv4.rs), ICMP
+//! (icmp.rs), UDP (udp.rs), les sockets de ping (ping.rs) ; les sockets, ce qu'en voient les programmes (socket.rs, ce
 //! qu'ont en commun celles de datagrammes : datagramme.rs, et leurs appels
 //! système : ../appels_reseau.rs) ; l'interface de boucle,
 //! `lo` (boucle.rs) ; la configuration au démarrage par DHCP (dhcp.rs) ;
@@ -20,9 +20,11 @@ pub mod boucle;
 pub mod datagramme;
 pub mod dhcp;
 pub mod ethernet;
+pub mod icmp;
 pub mod interface;
 pub mod ipv4;
 pub mod paquet;
+pub mod ping;
 pub mod proc;
 pub mod socket;
 pub mod tache;
@@ -44,9 +46,16 @@ pub fn demarrer() {
     ipv4::initialiser();
     arp::initialiser();
     udp::initialiser();
+    ping::initialiser();
     boucle::ajouter();
     virtio_net::sonder();
     tache::lancer();
+}
+
+/// Le nombre de sockets liées dont quelqu'un attend une lecture (le
+/// détecteur d'interblocage, attente.rs).
+pub fn attentes() -> usize {
+    udp::attentes() + ping::attentes()
 }
 
 /// Le réseau est-il au repos : plus rien dans une file du noyau (celle de

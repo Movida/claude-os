@@ -22,10 +22,10 @@ use crate::appels_fichiers::{self, FichierTenu, installer_fichier};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::descripteurs::{FichierOuvert, Prive, Sorte, Tenu};
 use crate::reseau::socket::{self, Protocole, Socket, AF_INET, ARRET_ECRITURE, ARRET_LECTURE, IPPROTO_IP, IPPROTO_MAX,
-                            IPPROTO_UDP, NPROTO, RCVBUF_MIN, SNDBUF_MIN, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_MAX, SOCK_NONBLOCK,
-                            TAMPON_MAX};
+                            IPPROTO_ICMP, IPPROTO_UDP, NPROTO, RCVBUF_MIN, SNDBUF_MIN, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_MAX,
+                            SOCK_NONBLOCK, SOCK_RAW, TAMPON_MAX};
 use crate::reseau::datagramme::{self, Controle};
-use crate::reseau::udp;
+use crate::reseau::{ping, udp};
 use crate::{processus, temps, vfs};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
@@ -63,6 +63,7 @@ const ADRESSE_MAX: usize = 128;
 const SOCK_PACKET: i32 = 10;
 
 // Les drapeaux de sendmsg et recvmsg.
+const MSG_OOB: u64 = 1;
 const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_CTRUNC: u32 = 0x08;
@@ -208,11 +209,21 @@ fn choisir(famille: i32, sorte: i32, protocole: i32) -> Result<(Protocole, u16),
     if protocole < 0 || protocole as u64 >= IPPROTO_MAX {
         return Err(-EINVAL);
     }
-    // La table `inetsw` de 6g : SOCK_DGRAM a UDP ; SOCK_STREAM (TCP) et
-    // SOCK_RAW (le commit suivant) n'ont encore rien.
+    // La table `inetsw` de 6g : SOCK_DGRAM a UDP (le protocole par défaut)
+    // et ping (IPPROTO_ICMP : `ping_group_range` les permet à tous, voir
+    // reseau/ping.rs) ; SOCK_RAW a son entrée, au protocole joker
+    // (IPPROTO_IP), qui accepte tout protocole sauf 0 lui-même (la boucle
+    // d'`inet_create` ne s'arrête sur un joker que pour un protocole
+    // demandé : sinon EPROTONOSUPPORT), et demande CAP_NET_RAW : EPERM (un
+    // écart pour root, qui l'a chez Linux : nous n'avons pas de sockets
+    // RAW, et aucun de nos programmes n'est root) ; SOCK_STREAM (TCP, 6h)
+    // n'a encore rien.
     match (sorte as u64, protocole as u64) {
         (SOCK_DGRAM, IPPROTO_IP | IPPROTO_UDP) => Ok((Protocole::Udp, IPPROTO_UDP as u16)),
+        (SOCK_DGRAM, IPPROTO_ICMP) => Ok((Protocole::Ping, IPPROTO_ICMP as u16)),
         (SOCK_DGRAM, _) => Err(-EPROTONOSUPPORT),
+        (SOCK_RAW, IPPROTO_IP) => Err(-EPROTONOSUPPORT),
+        (SOCK_RAW, _) => Err(-EPERM),
         // SOCK_STREAM compris.
         _ => Err(-ESOCKTNOSUPPORT),
     }
@@ -297,7 +308,7 @@ pub fn bind(fd: u64, adresse: u64, longueur: u64) -> i64 {
         let o = tenir(fd)?;
         let a = copier_adresse(adresse, longueur)?;
         match o.socket().protocole {
-            Protocole::Udp => datagramme::lier(o.socket(), a.octets()).map(|()| 0),
+            Protocole::Udp | Protocole::Ping => datagramme::lier(o.socket(), a.octets()).map(|()| 0),
         }
     })())
 }
@@ -311,7 +322,7 @@ pub fn connect(fd: u64, adresse: u64, longueur: u64) -> i64 {
         let a = copier_adresse(adresse, longueur)?;
         let o = socket_de(o)?;
         match o.socket().protocole {
-            Protocole::Udp => datagramme::connecter(o.socket(), a.octets()).map(|()| 0),
+            Protocole::Udp | Protocole::Ping => datagramme::connecter(o.socket(), a.octets()).map(|()| 0),
         }
     })())
 }
@@ -375,13 +386,23 @@ fn copier_vers_morceaux(morceaux: &[(u64, u64)], octets: &[u8]) -> Result<usize,
     Ok(fait)
 }
 
-/// Remplit `destination` des morceaux du programme, à la suite.
-fn copier_des_morceaux(morceaux: &[(u64, u64)], destination: &mut [u8]) -> Result<(), i64> {
-    let mut fait = 0;
+/// Remplit `destination` des morceaux du programme, à partir de l'octet
+/// `decalage` de leur suite.
+fn copier_des_morceaux(morceaux: &[(u64, u64)], decalage: usize, destination: &mut [u8]) -> Result<(), i64> {
+    let (mut saute, mut fait) = (decalage, 0);
     for &(base, longueur) in morceaux {
-        let n = (longueur as usize).min(destination.len() - fait);
-        copier_depuis_utilisateur(&mut destination[fait..fait + n], base).map_err(|_| -EFAULT)?;
+        let longueur = longueur as usize;
+        if saute >= longueur {
+            saute -= longueur;
+            continue;
+        }
+        let n = (longueur - saute).min(destination.len() - fait);
+        copier_depuis_utilisateur(&mut destination[fait..fait + n], base + saute as u64).map_err(|_| -EFAULT)?;
+        saute = 0;
         fait += n;
+        if fait == destination.len() {
+            break;
+        }
     }
     Ok(())
 }
@@ -399,30 +420,47 @@ fn envoyer(o: &FichierTenu, nom: Option<&[u8]>, morceaux: &[(u64, u64)], mut dra
         drapeaux |= MSG_DONTWAIT;
     }
     let longueur = total(morceaux);
-    match o.socket().protocole {
-        Protocole::Udp => en_i64(udp::envoyer(o.socket(), nom, longueur, drapeaux, controle,
-                                              |d| copier_des_morceaux(morceaux, d)).map(|n| n as i64)),
-    }
+    let remplir = |decalage, d: &mut [u8]| copier_des_morceaux(morceaux, decalage, d);
+    let r = match o.socket().protocole {
+        Protocole::Udp => udp::envoyer(o.socket(), nom, longueur, drapeaux, controle, remplir),
+        Protocole::Ping => ping::envoyer(o.socket(), nom, longueur, drapeaux, controle, remplir),
+    };
+    en_i64(r.map(|n| n as i64))
 }
 
 /// Ce qu'a rendu une réception, et ce qu'il faut en dire au programme.
 struct Reception {
     recu: socket::Recu,
-    /// MSG_TRUNC, MSG_CTRUNC.
+    /// MSG_TRUNC, MSG_CTRUNC, MSG_ERRQUEUE.
     drapeaux: u32,
+    /// L'erreur prise de la file d'erreurs (MSG_ERRQUEUE).
+    erreur: Option<socket::ErreurEnFile>,
 }
 
-/// Reçoit dans les morceaux `morceaux` (le `sock_recvmsg`) : MSG_ERRQUEUE
-/// rend EAGAIN (la file d'erreurs : le commit suivant, vide d'ici là).
+/// Reçoit dans les morceaux `morceaux` (le `sock_recvmsg`) : une socket de
+/// ping refuse MSG_OOB avant tout (`ping_recvmsg` : EOPNOTSUPP ; UDP
+/// l'ignore) ; MSG_ERRQUEUE : la première erreur de la file d'erreurs
+/// (`ip_recv_error` : EAGAIN s'il n'y en a pas, sans attendre ; ce qu'elle
+/// porte, coupé à la place donnée, MSG_TRUNC le dit ; l'adresse visée par
+/// le paquet d'origine).
 fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<Reception, i64> {
-    if drapeaux & MSG_ERRQUEUE != 0 {
-        return Err(-EAGAIN);
+    if drapeaux & MSG_OOB != 0 && o.socket().protocole == Protocole::Ping {
+        return Err(-EOPNOTSUPP);
     }
-    let recu = match o.socket().protocole {
-        Protocole::Udp => socket::prendre(o.socket(), drapeaux, non_bloquant(o), |octets| copier_vers_morceaux(morceaux, octets))?,
-    };
+    if drapeaux & MSG_ERRQUEUE != 0 {
+        let e = o.socket().prendre_en_file().ok_or(-EAGAIN)?;
+        let total = e.donnees.longueur();
+        let copie = copier_vers_morceaux(morceaux, e.donnees.donnees())?;
+        let recu = socket::Recu {
+            vide: false, longueur: copie, source: e.adresse, port: e.port, destination: e.arrivee, interface: e.interface,
+            coupe: copie < total,
+        };
+        let d = if recu.coupe { MSG_TRUNC } else { 0 } | MSG_ERRQUEUE as u32;
+        return Ok(Reception { recu, drapeaux: d, erreur: Some(e) });
+    }
+    let recu = socket::prendre(o.socket(), drapeaux, non_bloquant(o), |octets| copier_vers_morceaux(morceaux, octets))?;
     let drapeaux = if recu.coupe { MSG_TRUNC } else { 0 };
-    Ok(Reception { recu, drapeaux })
+    Ok(Reception { recu, drapeaux, erreur: None })
 }
 
 /// sendto(fd, tampon, longueur, drapeaux, adresse, longueur de l'adresse) :
@@ -659,7 +697,7 @@ impl ControleSortant {
             *drapeaux |= MSG_CTRUNC;
             longueur = reste;
         }
-        let mut o = [0u8; CMSG_ENTETE + 16];
+        let mut o = [0u8; CMSG_ENTETE + 32];
         o[..8].copy_from_slice(&longueur.to_le_bytes());
         o[8..12].copy_from_slice(&niveau.to_le_bytes());
         o[12..16].copy_from_slice(&sorte.to_le_bytes());
@@ -689,28 +727,55 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
     // MSG_CMSG_CLOEXEC demandé revient dans msg_flags (`____sys_recvmsg`).
     r.drapeaux |= (drapeaux & MSG_CMSG_CLOEXEC) as u32;
     let mut c = ControleSortant { adresse: m.controle, place: m.longueur_controle, utilise: 0 };
-    if o.socket().appels.verrouiller().options.pktinfo && !r.recu.vide {
+    // IP_PKTINFO : pour un datagramme ; pour une erreur, seulement si elle
+    // vient d'ICMP (`ipv4_datagram_support_cmsg`), celui de son message.
+    let icmp = r.erreur.as_ref().is_none_or(|e| e.origine == socket::ORIGINE_ICMP);
+    if o.socket().appels.verrouiller().options.pktinfo && !r.recu.vide && icmp {
         use crate::reseau::ipv4;
-        // in_pktinfo : l'interface d'arrivée (pour un paquet venu par lo à
-        // l'une de nos adresses d'une carte, celle qui porte l'adresse :
-        // `ipv4_pktinfo_prepare`), l'adresse locale à laquelle répondre (la
-        // destination, ou pour une diffusion l'adresse qu'aurait la
-        // réponse : `fib_compute_spec_dst`), la destination.
-        let lo = crate::reseau::boucle::interface().map(|i| i.index);
-        let interface = match ipv4::interface_de_l_adresse(r.recu.destination) {
-            Some(k) if Some(r.recu.interface) == lo => k,
-            _ => r.recu.interface,
-        };
-        let locale = if ipv4::avec_table(|t| t.est_a_nous(r.recu.destination)).unwrap_or(false) {
-            r.recu.destination
+        // in_pktinfo : l'interface d'arrivée, l'adresse locale à laquelle
+        // répondre, la destination. Pour un datagramme, ce que prépare
+        // `ipv4_pktinfo_prepare` : venu par lo à l'une de nos adresses d'une
+        // carte, l'interface qui porte l'adresse ; l'adresse locale, la
+        // destination, ou pour une diffusion celle qu'aurait la réponse
+        // (`fib_compute_spec_dst`). Pour une erreur, `ip_recv_error` rend le
+        // contrôle du message ICMP, que rien n'a préparé : l'interface
+        // d'arrivée telle quelle, et 0.0.0.0 (le `faddr` de ses options IP).
+        let (interface, locale) = if r.erreur.is_some() {
+            (r.recu.interface, [0; 4])
         } else {
-            ipv4::router(r.recu.source, None).map_or([0; 4], |(c, _)| ipv4::source(&c))
+            let lo = crate::reseau::boucle::interface().map(|i| i.index);
+            let interface = match ipv4::interface_de_l_adresse(r.recu.destination) {
+                Some(k) if Some(r.recu.interface) == lo => k,
+                _ => r.recu.interface,
+            };
+            let locale = if ipv4::avec_table(|t| t.est_a_nous(r.recu.destination)).unwrap_or(false) {
+                r.recu.destination
+            } else {
+                ipv4::router(r.recu.source, None).map_or([0; 4], |(c, _)| ipv4::source(&c))
+            };
+            (interface, locale)
         };
         let mut info = [0u8; 12];
         info[..4].copy_from_slice(&(interface as i32).to_le_bytes());
         info[4..8].copy_from_slice(&locale);
         info[8..12].copy_from_slice(&r.recu.destination);
         c.ecrire(SOL_IP, IP_PKTINFO, &info, &mut r.drapeaux);
+    }
+    // L'erreur elle-même (IP_RECVERR) : sa `sock_extended_err` (errno,
+    // origine, genre, code, un octet nul, info, data nul), puis
+    // SO_EE_OFFENDER, l'adresse de qui l'a dite (nulle pour une erreur
+    // locale).
+    if let Some(e) = &r.erreur {
+        let mut o = [0u8; 32];
+        o[..4].copy_from_slice(&e.errno.to_le_bytes());
+        o[4] = e.origine;
+        o[5] = e.genre;
+        o[6] = e.code;
+        o[8..12].copy_from_slice(&e.info.to_le_bytes());
+        if e.origine == socket::ORIGINE_ICMP {
+            o[16..32].copy_from_slice(&socket::sockaddr_in(e.emetteur, 0));
+        }
+        c.ecrire(SOL_IP, IP_RECVERR, &o, &mut r.drapeaux);
     }
     if copier_vers_utilisateur(adresse + 48, &r.drapeaux.to_le_bytes()).is_err()
         || copier_vers_utilisateur(adresse + 40, &c.utilise.to_le_bytes()).is_err() {
@@ -902,7 +967,9 @@ pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
         let s = o.socket();
         match niveau {
             SOL_SOCKET => options_socket(s, option, valeur, longueur),
-            SOL_UDP => {
+            // SOL_UDP n'est pas un niveau d'une socket de ping (elle va
+            // droit à IP : ENOPROTOOPT sans rien lire).
+            SOL_UDP if s.protocole == Protocole::Udp => {
                 entier(valeur, longueur)?;
                 Err(-ENOPROTOOPT)
             }
@@ -1000,7 +1067,15 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
     let op = &mut inet.options;
     match option {
         IP_PKTINFO => op.pktinfo = v != 0,
-        IP_RECVERR => op.recverr = v != 0,
+        // Retiré, il vide la file d'erreurs (`skb_errqueue_purge`). Sa copie
+        // atomique, pour la tâche du réseau.
+        IP_RECVERR => {
+            op.recverr = v != 0;
+            s.recverr.store(v != 0, Ordering::Relaxed);
+            if v == 0 {
+                s.vider_erreurs();
+            }
+        }
         // La priorité ne suit que si le TOS change (`__ip_sock_set_tos`).
         IP_TOS if op.tos != v as u8 => {
             op.tos = v as u8;
@@ -1018,6 +1093,7 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
                 return Err(-EINVAL);
             }
             op.pmtudisc = v as u8;
+            s.pmtudisc.store(v as u8, Ordering::Relaxed);
         }
         _ => return Err(-ENOPROTOOPT),
     }
@@ -1048,7 +1124,7 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
                 copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
                 Ok(0)
             }
-            SOL_UDP => {
+            SOL_UDP if s.protocole == Protocole::Udp => {
                 lire_longueur(&mut l)?;
                 Err(-ENOPROTOOPT)
             }
@@ -1165,6 +1241,10 @@ pub fn ecrire(o: &FichierTenu, morceaux: &[(u64, u64)]) -> i64 {
 pub fn ioctl(o: &FichierTenu, requete: u64, argument: u64) -> i64 {
     const SIOCINQ: u64 = 0x541b;
     const SIOCOUTQ: u64 = 0x5411;
+    // Une socket de ping n'en a aucune (`ping_prot` n'a pas d'ioctl).
+    if o.socket().protocole == Protocole::Ping {
+        return -ENOTTY;
+    }
     let v: i32 = match requete {
         SIOCINQ => o.socket().premier() as i32,
         SIOCOUTQ => 0,

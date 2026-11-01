@@ -8,7 +8,8 @@
 //! DHCP du démarrage à chaque message et à chaque échéance (dhcp.rs), ce
 //! qu'on sait de chaque voisin du réseau local et quand le redemander
 //! (voisins.rs), à quelle socket UDP va un datagramme et quels ports une
-//! socket peut prendre (ports.rs). Rien
+//! socket peut prendre (ports.rs), et de même pour les sockets de ping et
+//! leurs identifiants (idents.rs). Rien
 //! ici ne lit l'horloge ni ne tire au hasard : l'heure (en nanosecondes) et
 //! le hasard sont des arguments, si bien qu'un test peut faire passer 45
 //! secondes en une ligne, et rejouer exactement un cas.
@@ -21,6 +22,7 @@
 extern crate alloc;
 
 pub mod dhcp;
+pub mod idents;
 pub mod ports;
 pub mod routes;
 pub mod voisins;

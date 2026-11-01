@@ -26,7 +26,14 @@
  *     routes (une source de la boucle ne sort pas, 0.0.0.0, la diffusion
  *     de lo, SO_DONTROUTE, l'interface d'IP_PKTINFO), les messages de
  *     contrôle (optmem_max, une place fautive, MSG_CMSG_CLOEXEC), l'ordre
- *     des erreurs d'accept4 et de connect.
+ *     des erreurs d'accept4 et de connect ;
+ *   - ICMP : une socket connectée à un port fermé (ECONNREFUSED une fois,
+ *     au recv comme au send, et dès le send suivant : lo livre l'erreur
+ *     avant qu'il ne revienne ; SO_ERROR, recvmmsg), IP_RECVERR et la file
+ *     d'erreurs (MSG_ERRQUEUE, sock_extended_err, IP_PKTINFO d'une erreur,
+ *     l'erreur locale d'EMSGSIZE), les sockets de ping (l'écho de
+ *     127.0.0.1, l'identifiant remplacé, les refus, MSG_OOB), SOCK_RAW
+ *     (EPERM ; EPROTONOSUPPORT pour le protocole 0).
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic de l'hôte : HZ = 250).
  */
@@ -34,7 +41,9 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/errqueue.h>
 #include <netinet/in.h>
+#include <netinet/ip_icmp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -755,6 +764,170 @@ static void routes_et_messages(void)
     close(f);
 }
 
+/* Un port fermé de 127.0.0.1 : celui d'une socket qu'on vient de fermer. */
+static uint16_t port_ferme(void)
+{
+    uint16_t p;
+    close(liee(&p));
+    return p;
+}
+
+/* Attend POLLERR sur s, 5 s au plus. */
+static int attendre_erreur(int s)
+{
+    struct pollfd p = { s, 0, 0 };
+    return poll(&p, 1, 5000) == 1 && (p.revents & POLLERR);
+}
+
+/* Prend la première erreur de la file de s : ce qu'elle porte dans o (n
+ * octets au plus), qui l'a dite et son adresse, et son IP_PKTINFO (nul
+ * s'il n'y en a pas). Rend la longueur, ou -1. */
+static long erreur_en_file(int s, char *o, size_t n, struct sock_extended_err *ee, struct sockaddr_in *offender,
+                           struct sockaddr_in *nom, int *drapeaux, struct in_pktinfo *pi)
+{
+    char c[256];
+    struct iovec v = { o, n };
+    struct msghdr m = { .msg_name = nom, .msg_namelen = sizeof *nom, .msg_iov = &v, .msg_iovlen = 1,
+                        .msg_control = c, .msg_controllen = sizeof c };
+    long r = recvmsg(s, &m, MSG_ERRQUEUE);
+    if (r < 0)
+        return r;
+    *drapeaux = m.msg_flags;
+    memset(ee, 0, sizeof *ee);
+    memset(pi, 0, sizeof *pi);
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+        if (h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_RECVERR) {
+            memcpy(ee, CMSG_DATA(h), sizeof *ee);
+            memcpy(offender, SO_EE_OFFENDER((struct sock_extended_err *)CMSG_DATA(h)), sizeof *offender);
+        }
+        if (h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_PKTINFO)
+            memcpy(pi, CMSG_DATA(h), sizeof *pi);
+    }
+    return r;
+}
+
+static void icmp(void)
+{
+    /* Connectée à un port fermé : le send réussit, l'ICMP « port
+     * injoignable » revient (de lo : sans limite), POLLERR ; le recv
+     * suivant rend ECONNREFUSED une fois, puis EAGAIN. */
+    int s = udp(0);
+    struct sockaddr_in d = adresse(LO, port_ferme());
+    connect(s, (struct sockaddr *)&d, sizeof d);
+    char o[64];
+    verifier(send(s, "x", 1, 0) == 1, "connectee a un port ferme : send reussit");
+    struct pollfd p = { s, POLLIN | POLLOUT, 0 };
+    verifier(attendre_erreur(s) && poll(&p, 1, 0) == 1 && p.revents == (POLLOUT | POLLERR), "l'ICMP revient : POLLOUT | POLLERR");
+    verifier(erreur(recv(s, o, sizeof o, MSG_DONTWAIT)) == ECONNREFUSED && erreur(recv(s, o, sizeof o, MSG_DONTWAIT)) == EAGAIN,
+             "recv : ECONNREFUSED une fois, puis EAGAIN");
+    /* Au send aussi : celui qui suit l'erreur la rend. Par lo, elle est là
+     * avant que le send qui l'a provoquée ne revienne : le suivant la rend
+     * tout de suite. */
+    send(s, "x", 1, 0);
+    verifier(erreur(send(s, "x", 1, 0)) == ECONNREFUSED, "send juste apres : ECONNREFUSED (lo livre l'erreur avant le retour)");
+    send(s, "x", 1, 0);
+    attendre_erreur(s);
+    int v;
+    socklen_t l = sizeof v;
+    int ok = getsockopt(s, SOL_SOCKET, SO_ERROR, &v, &l) == 0 && v == ECONNREFUSED;
+    verifier(ok && getsockopt(s, SOL_SOCKET, SO_ERROR, &v, &l) == 0 && v == 0, "SO_ERROR : 111, puis effacee");
+    send(s, "x", 1, 0);
+    attendre_erreur(s);
+    struct iovec iv = { o, sizeof o };
+    struct mmsghdr mm = { .msg_hdr = { .msg_iov = &iv, .msg_iovlen = 1 } };
+    verifier(erreur(recvmmsg(s, &mm, 1, MSG_DONTWAIT, NULL)) == ECONNREFUSED, "recvmmsg : l'erreur en attente d'abord");
+    close(s);
+
+    /* Non connectée : rien ; avec IP_RECVERR, la file d'erreurs. */
+    s = udp(0);
+    uint16_t ferme = port_ferme();
+    envoyer(s, "rien", 4, ferme);
+    attendre_lo();
+    verifier(erreur(recv(s, o, sizeof o, MSG_DONTWAIT)) == EAGAIN, "non connectee, port ferme : aucune erreur");
+    int un = 1;
+    setsockopt(s, IPPROTO_IP, IP_RECVERR, &un, sizeof un);
+    setsockopt(s, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    envoyer(s, "origine", 7, ferme);
+    struct sock_extended_err ee;
+    struct sockaddr_in offender, nom;
+    struct in_pktinfo pi;
+    int drapeaux = 0;
+    verifier(attendre_erreur(s), "avec IP_RECVERR : POLLERR");
+    long n = erreur_en_file(s, o, sizeof o, &ee, &offender, &nom, &drapeaux, &pi);
+    verifier(n == 7 && memcmp(o, "origine", 7) == 0 && (drapeaux & MSG_ERRQUEUE), "MSG_ERRQUEUE : le datagramme d'origine, MSG_ERRQUEUE");
+    verifier(ee.ee_errno == ECONNREFUSED && ee.ee_origin == SO_EE_ORIGIN_ICMP && ee.ee_type == ICMP_DEST_UNREACH
+                 && ee.ee_code == ICMP_PORT_UNREACH && offender.sin_family == AF_INET && offender.sin_addr.s_addr == htonl(LO)
+                 && nom.sin_addr.s_addr == htonl(LO) && ntohs(nom.sin_port) == ferme,
+             "sock_extended_err : 111, ICMP 3/3, de 127.0.0.1 ; le nom : la destination");
+    /* L'IP_PKTINFO d'une erreur : celui du message ICMP, que rien n'a
+     * préparé (l'adresse locale est nulle). */
+    verifier(pi.ipi_ifindex == 1 && pi.ipi_spec_dst.s_addr == 0 && pi.ipi_addr.s_addr == htonl(LO),
+             "IP_PKTINFO de l'erreur : lo (1), 0.0.0.0, 127.0.0.1");
+    verifier(erreur(recv(s, o, sizeof o, MSG_DONTWAIT)) == EAGAIN && erreur(recvmsg(s, &(struct msghdr){ 0 }, MSG_ERRQUEUE)) == EAGAIN,
+             "puis plus rien : recv et MSG_ERRQUEUE rendent EAGAIN");
+    /* L'erreur locale d'EMSGSIZE : la destination, le port de la connexion
+     * (0 : pas connectée), la MTU de lo bornée à 65 535. */
+    static char gros[65508];
+    verifier(erreur(envoyer(s, gros, sizeof gros, ferme)) == EMSGSIZE, "65 508 octets avec IP_RECVERR : EMSGSIZE");
+    n = erreur_en_file(s, o, sizeof o, &ee, &offender, &nom, &drapeaux, &pi);
+    verifier(n == 0 && ee.ee_errno == EMSGSIZE && ee.ee_origin == SO_EE_ORIGIN_LOCAL && ee.ee_info == 65535
+                 && offender.sin_family == 0 && nom.sin_addr.s_addr == htonl(LO) && nom.sin_port == 0 && pi.ipi_ifindex == 0,
+             "et l'erreur locale en file : 90, origine 1, ee_info 65 535, sans IP_PKTINFO");
+    close(s);
+
+    /* Une socket de ping, si l'hôte la permet (ping_group_range). */
+    int q = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (q >= 0) {
+        struct icmphdr e = { .type = ICMP_ECHO, .un.echo = { .id = htons(0x1234), .sequence = htons(7) } };
+        char m[sizeof e + 4];
+        memcpy(m, &e, sizeof e);
+        memcpy(m + sizeof e, "ping", 4);
+        d = adresse(LO, 0);
+        verifier(sendto(q, m, sizeof m, 0, (struct sockaddr *)&d, sizeof d) == sizeof m, "ping de 127.0.0.1 : l'echo part");
+        struct sockaddr_in a;
+        l = sizeof a;
+        getsockname(q, (struct sockaddr *)&a, &l);
+        char r[64];
+        l = sizeof d;
+        n = recvfrom(q, r, sizeof r, 0, (struct sockaddr *)&d, &l);
+        struct icmphdr *h = (struct icmphdr *)r;
+        verifier(n == (long)sizeof m && h->type == ICMP_ECHOREPLY && h->code == 0 && h->un.echo.id == a.sin_port
+                     && ntohs(h->un.echo.sequence) == 7 && memcmp(r + sizeof e, "ping", 4) == 0
+                     && d.sin_addr.s_addr == htonl(LO) && d.sin_port == 0,
+                 "la reponse, sans en-tete IP, de 127.0.0.1:0 ; l'identifiant est le port de la socket");
+        e.type = ICMP_TIMESTAMP;
+        verifier(erreur(sendto(q, &e, sizeof e, 0, (struct sockaddr *)&d, sizeof d)) == EINVAL
+                     && erreur(sendto(q, m, 4, 0, (struct sockaddr *)&d, sizeof d)) == EINVAL,
+                 "ping : un autre genre que l'echo, ou moins de 8 octets : EINVAL");
+        int f;
+        verifier(ioctl(q, FIONREAD, &f) == -1 && errno == ENOTTY, "ping : FIONREAD : ENOTTY");
+        /* MSG_OOB : refusé avant tout par ping, ignoré par UDP. */
+        int u = udp(0);
+        verifier(erreur(recv(q, r, sizeof r, MSG_OOB | MSG_DONTWAIT)) == EOPNOTSUPP
+                     && erreur(recv(q, r, sizeof r, MSG_OOB | MSG_ERRQUEUE)) == EOPNOTSUPP
+                     && erreur(recv(u, r, sizeof r, MSG_OOB | MSG_DONTWAIT)) == EAGAIN,
+                 "ping : recv avec MSG_OOB : EOPNOTSUPP, meme avec MSG_ERRQUEUE (UDP : EAGAIN)");
+        close(u);
+        close(q);
+        /* Ni diffusion ni multidiffusion pour une socket de ping, que UDP
+         * accepte. */
+        ok = 1;
+        for (int k = 0; k < 3; k++) {
+            uint32_t ad[] = { 0xffffffff, 0x7fffffff, 0xe0000001 };
+            struct sockaddr_in b = adresse(ad[k], 0);
+            q = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+            u = udp(0);
+            ok = ok && erreur(bind(q, (struct sockaddr *)&b, sizeof b)) == EADDRNOTAVAIL
+                    && bind(u, (struct sockaddr *)&b, sizeof b) == 0;
+            close(q);
+            close(u);
+        }
+        verifier(ok, "ping : bind a 255.255.255.255, 127.255.255.255, 224.0.0.1 : EADDRNOTAVAIL (UDP : accepte)");
+    }
+    verifier(erreur(socket(AF_INET, SOCK_RAW, IPPROTO_UDP)) == EPERM && erreur(socket(AF_INET, SOCK_RAW, 0)) == EPROTONOSUPPORT,
+             "SOCK_RAW sans CAP_NET_RAW : EPERM ; de protocole 0 : EPROTONOSUPPORT");
+}
+
 int main(void)
 {
     creation();
@@ -767,6 +940,7 @@ int main(void)
     file_pleine();
     aller_retour();
     routes_et_messages();
+    icmp();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

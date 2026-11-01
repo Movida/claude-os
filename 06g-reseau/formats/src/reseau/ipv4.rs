@@ -57,6 +57,19 @@ impl Ipv4 {
 /// présent, sa somme, puis une longueur totale qui tient dans ce qui a été
 /// reçu et couvre l'en-tête.
 pub fn lire(o: &[u8]) -> Result<(Ipv4, &[u8]), Erreur> {
+    let h = lire_entete(o)?;
+    if (h.longueur as usize) > o.len() {
+        return Err(Erreur::Tronque);
+    }
+    Ok((h, &o[h.longueur_entete..h.longueur as usize]))
+}
+
+/// L'en-tête seul, sans exiger que la longueur totale tienne dans `o` :
+/// celui d'un paquet dont on n'a que le début (celui que porte une erreur
+/// ICMP qu'on va envoyer, que `__icmp_send` ne relit pas en entier). Les
+/// mêmes vérifications que `lire`, sauf celle-là (et une longueur totale
+/// plus courte que l'en-tête reste refusée).
+pub fn lire_entete(o: &[u8]) -> Result<Ipv4, Erreur> {
     let debut = o.get(..ENTETE).ok_or(Erreur::Tronque)?;
     let ihl = (debut[0] & 0x0F) as usize;
     if debut[0] >> 4 != 4 || ihl < 5 {
@@ -68,14 +81,11 @@ pub fn lire(o: &[u8]) -> Result<(Ipv4, &[u8]), Erreur> {
         return Err(Erreur::Somme);
     }
     let longueur = mot16(entete, 2).ok_or(Erreur::Tronque)?;
-    if (longueur as usize) > o.len() {
-        return Err(Erreur::Tronque);
-    }
     if (longueur as usize) < longueur_entete {
         return Err(Erreur::Invalide);
     }
     let fragment = mot16(entete, 6).ok_or(Erreur::Tronque)?;
-    let h = Ipv4 {
+    Ok(Ipv4 {
         tos: entete[1],
         longueur,
         identifiant: mot16(entete, 4).ok_or(Erreur::Tronque)?,
@@ -87,8 +97,7 @@ pub fn lire(o: &[u8]) -> Result<(Ipv4, &[u8]), Erreur> {
         source: adresse(entete, 12).ok_or(Erreur::Tronque)?,
         destination: adresse(entete, 16).ok_or(Erreur::Tronque)?,
         longueur_entete,
-    };
-    Ok((h, &o[longueur_entete..longueur as usize]))
+    })
 }
 
 /// Écrit l'en-tête `h` (sans options : `longueur_entete` est ignoré) dans

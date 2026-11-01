@@ -44,7 +44,7 @@ use crate::verrou::Verrou;
 use crate::{cpu, temps};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// POLLRDHUP : l'autre côté a fermé (ou la lecture est arrêtée).
 pub const POLLRDHUP: u32 = 0x2000;
@@ -57,12 +57,14 @@ pub const AF_INET: u16 = 2;
 pub const NPROTO: u64 = 46;
 // Les sortes.
 pub const SOCK_DGRAM: u64 = 2;
+pub const SOCK_RAW: u64 = 3;
 pub const SOCK_MAX: u64 = 11;
 /// Les drapeaux que `socket` accepte avec la sorte.
 pub const SOCK_NONBLOCK: u64 = 0o4000;
 pub const SOCK_CLOEXEC: u64 = 0o2000000;
 // Les protocoles d'IPv4.
 pub const IPPROTO_IP: u64 = 0;
+pub const IPPROTO_ICMP: u64 = 1;
 pub const IPPROTO_UDP: u64 = 17;
 pub const IPPROTO_MAX: u64 = 263;
 
@@ -126,6 +128,47 @@ static NUMEROS: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Protocole {
     Udp,
+    /// Les sockets de ping (ping.rs) : SOCK_DGRAM et IPPROTO_ICMP.
+    Ping,
+}
+
+/// La règle qui accepte un datagramme en file.
+#[derive(Clone, Copy)]
+pub enum Admission {
+    /// Celle d'UDP (`__udp_enqueue_schedule_skb`) : une file vide accepte
+    /// toujours ; sinon la taille vraie du datagramme doit tenir dans
+    /// SO_RCVBUF.
+    Udp,
+    /// Celle des autres (`__sock_queue_rcv_skb`) : accepté tant que la file
+    /// n'a pas atteint SO_RCVBUF, quelle que soit sa taille.
+    Ordinaire,
+}
+
+// D'où vient une erreur de la file d'erreurs (SO_EE_ORIGIN_*).
+pub const ORIGINE_LOCALE: u8 = 1;
+pub const ORIGINE_ICMP: u8 = 2;
+
+/// Une erreur dans la file d'erreurs (la `sk_error_queue` de Linux, avec
+/// IP_RECVERR), lue par MSG_ERRQUEUE : sa `sock_extended_err` (l'errno,
+/// l'origine, le genre et le code du message ICMP, son `info`), la
+/// destination du paquet qui l'a causée (le `msg_name` rendu), qui l'a dite
+/// (SO_EE_OFFENDER : la source du message ICMP), où ce message est arrivé
+/// (IP_PKTINFO), et ce que lira le programme : ce que le message portait de
+/// la charge d'origine (rien pour une erreur locale).
+pub struct ErreurEnFile {
+    pub errno: i32,
+    pub origine: u8,
+    pub genre: u8,
+    pub code: u8,
+    pub info: u32,
+    pub adresse: [u8; 4],
+    pub port: u16,
+    pub emetteur: [u8; 4],
+    pub interface: u32,
+    pub arrivee: [u8; 4],
+    pub donnees: Paquet,
+    /// Sa taille vraie (elle compte dans SO_RCVBUF, avec les datagrammes).
+    pub taille: usize,
 }
 
 /// Un datagramme reçu, en file : sa charge (les données du paquet), qui
@@ -140,10 +183,25 @@ pub struct Datagramme {
     pub taille: usize,
 }
 
+impl ErreurEnFile {
+    /// Une erreur « locale » (`ip_local_error`) : vue par l'envoi lui-même,
+    /// sans message ICMP ni données. None : plus de mémoire.
+    pub fn locale(errno: i32, info: u32, adresse: [u8; 4], port: u16) -> Option<ErreurEnFile> {
+        let donnees = Paquet::vide(0)?;
+        Some(ErreurEnFile {
+            errno, origine: ORIGINE_LOCALE, genre: 0, code: 0, info, adresse, port, emetteur: [0; 4], interface: 0,
+            arrivee: [0; 4], taille: donnees.taille_vraie(), donnees,
+        })
+    }
+}
+
 /// Ce que touche la tâche du réseau (sous le `Verrou`).
 pub struct Reception {
     pub file: VecDeque<Datagramme>,
-    /// La taille vraie de ce qui est en file (`sk_rmem_alloc`).
+    /// La file d'erreurs (IP_RECVERR).
+    pub erreurs: VecDeque<ErreurEnFile>,
+    /// La taille vraie de ce qui est en file, dans les deux files
+    /// (`sk_rmem_alloc`).
     pub octets: usize,
     /// L'erreur en attente (`sk_err`, un errno positif ; 0 : aucune).
     pub erreur: i32,
@@ -226,6 +284,14 @@ pub struct Socket {
     /// SO_RCVBUF et SO_SNDBUF (lus par la tâche du réseau sans le Mutex).
     pub rcvbuf: AtomicU32,
     pub sndbuf: AtomicU32,
+    /// Ce que la tâche du réseau doit savoir d'une socket quand une erreur
+    /// ICMP arrive, sans prendre le `Mutex` : est-elle connectée (le
+    /// `sk_state` de Linux) ? a-t-elle IP_RECVERR (un bit atomique de
+    /// Linux aussi) ? et IP_MTU_DISCOVER (lu par READ_ONCE chez Linux) ?
+    /// Écrits sous le `Mutex`, avec leurs copies d'`Inet`.
+    pub connectee: AtomicBool,
+    pub recverr: AtomicBool,
+    pub pmtudisc: AtomicU8,
 }
 
 impl Socket {
@@ -235,26 +301,31 @@ impl Socket {
             numero: NUMEROS.fetch_add(1, Ordering::Relaxed),
             protocole, sorte, proto, uid,
             attente: FileAttente::new(),
-            reception: Verrou::new(Reception { file: VecDeque::new(), octets: 0, erreur: 0, arret: 0 }),
+            reception: Verrou::new(Reception { file: VecDeque::new(), erreurs: VecDeque::new(), octets: 0, erreur: 0, arret: 0 }),
             appels: Mutex::new(Inet {
                 lie: false, adresse: [0; 4], port: 0, port_choisi: false, adresse_choisie: false, connecte: false,
                 distante: [0; 4], port_distant: 0, source: [0; 4], identifiant: 0, options: Options::DEFAUT,
             }),
             rcvbuf: AtomicU32::new(TAMPON_DEFAUT),
             sndbuf: AtomicU32::new(TAMPON_DEFAUT),
+            connectee: AtomicBool::new(false),
+            recverr: AtomicBool::new(false),
+            pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
         }
     }
 
-    /// Dépose un datagramme reçu (dans la tâche du réseau), si la file le
-    /// permet : la règle d'`__udp_enqueue_schedule_skb`, une file vide
-    /// accepte toujours ; sinon il faut que sa taille vraie tienne dans
-    /// SO_RCVBUF. Puis ceux qui attendent sont réveillés (le
+    /// Dépose un datagramme reçu (dans la tâche du réseau), si la règle
+    /// `admission` le permet ; puis ceux qui attendent sont réveillés (le
     /// `sock_def_readable`). false : jeté.
-    pub fn deposer(&self, d: Datagramme) -> bool {
+    pub fn deposer(&self, d: Datagramme, admission: Admission) -> bool {
         let rcvbuf = self.rcvbuf.load(Ordering::Relaxed) as usize;
         {
             let mut r = self.reception.verrouiller();
-            if r.octets > 0 && r.octets + d.taille > rcvbuf {
+            let refuse = match admission {
+                Admission::Udp => r.octets > 0 && r.octets + d.taille > rcvbuf,
+                Admission::Ordinaire => r.octets >= rcvbuf,
+            };
+            if refuse {
                 return false;
             }
             if r.file.try_reserve(1).is_err() {
@@ -267,13 +338,67 @@ impl Socket {
         true
     }
 
+    /// Pose l'erreur `errno` (`sk_err`) et réveille (le `sk_error_report`).
+    pub fn signaler_erreur(&self, errno: i32) {
+        self.reception.verrouiller().erreur = errno;
+        self.attente.reveiller(POLLERR, 1);
+    }
+
+    /// Met l'erreur `e` dans la file d'erreurs, s'il y a la place
+    /// (`sock_queue_err_skb` : elle compte avec les datagrammes, et doit
+    /// laisser de la place sous SO_RCVBUF), et réveille. false : jetée.
+    pub fn mettre_en_file(&self, e: ErreurEnFile) -> bool {
+        let rcvbuf = self.rcvbuf.load(Ordering::Relaxed) as usize;
+        {
+            let mut r = self.reception.verrouiller();
+            if r.octets + e.taille >= rcvbuf || r.erreurs.try_reserve(1).is_err() {
+                return false;
+            }
+            r.octets += e.taille;
+            r.erreurs.push_back(e);
+        }
+        self.attente.reveiller(POLLERR, 1);
+        true
+    }
+
+    /// Prend la première erreur de la file (`sock_dequeue_err_skb`) : l'erreur
+    /// en attente devient celle de la suivante si elle vient d'ICMP, ou 0 si
+    /// celle-ci en venait et qu'il n'en reste pas d'ICMP ; une erreur locale
+    /// n'y touche pas. S'il en reste, ceux qui attendent sont réveillés.
+    pub fn prendre_en_file(&self) -> Option<ErreurEnFile> {
+        let (e, reste) = {
+            let mut r = self.reception.verrouiller();
+            let e = r.erreurs.pop_front()?;
+            r.octets = r.octets.saturating_sub(e.taille);
+            let suivante_icmp = r.erreurs.front().filter(|s| s.origine == ORIGINE_ICMP).map(|s| s.errno);
+            if let Some(errno) = suivante_icmp {
+                r.erreur = errno;
+            } else if e.origine == ORIGINE_ICMP {
+                r.erreur = 0;
+            }
+            (e, !r.erreurs.is_empty())
+        };
+        if reste {
+            self.attente.reveiller(POLLERR, 1);
+        }
+        Some(e)
+    }
+
+    /// Vide la file d'erreurs (IP_RECVERR remis à 0).
+    pub fn vider_erreurs(&self) {
+        let mut r = self.reception.verrouiller();
+        let rendus: usize = r.erreurs.iter().map(|e| e.taille).sum();
+        r.octets = r.octets.saturating_sub(rendus);
+        r.erreurs.clear();
+    }
+
     /// Prend l'erreur en attente (le `sock_error` : lue et effacée).
     pub fn prendre_erreur(&self) -> i32 {
         core::mem::take(&mut self.reception.verrouiller().erreur)
     }
 
     /// Ce qu'on peut faire de la socket sans attendre (le `datagram_poll`
-    /// de Linux) : une erreur (POLLERR), l'arrêt de la lecture (POLLRDHUP,
+    /// de Linux) : une erreur en attente ou en file (POLLERR), l'arrêt de la lecture (POLLRDHUP,
     /// et POLLIN : un recv rendra 0), les deux arrêts (POLLHUP), un
     /// datagramme en file (POLLIN), et toujours l'écriture (nos envois ne
     /// comptent pas dans SO_SNDBUF : « Reste à faire »).
@@ -281,7 +406,7 @@ impl Socket {
         table.attendre(&self.attente, tenu);
         let r = self.reception.verrouiller();
         let mut m = POLLOUT | POLLWRNORM | POLLWRBAND;
-        if r.erreur != 0 {
+        if r.erreur != 0 || !r.erreurs.is_empty() {
             m |= POLLERR;
         }
         if r.arret & ARRET_LECTURE != 0 {
@@ -378,7 +503,7 @@ pub struct Recu {
 /// le `Verrou` (une copie peut fauter, et dormir pour servir une faute de
 /// page). Un datagramme plus long que ce qui est copié est coupé, et le
 /// reste perdu (MSG_TRUNC le dit dans `msg_flags`, ou fait rendre la vraie
-/// longueur).
+/// longueur, pour UDP).
 ///
 /// MSG_PEEK laisse le datagramme en file : Linux le copie depuis la file,
 /// le paquet tenu par un compteur de références (`skb_get`). Le nôtre est
@@ -387,6 +512,9 @@ pub struct Recu {
 /// pas de paquet partagé entre la file et l'appel.
 pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl FnMut(&[u8]) -> Result<usize, i64>)
                -> Result<Recu, i64> {
+    // MSG_TRUNC fait rendre la vraie longueur à UDP (`udp_recvmsg`), pas à
+    // ping (`ping_recvmsg` rend ce qu'il a copié).
+    let vraie = s.protocole == Protocole::Udp;
     const MSG_PEEK: u64 = 2;
     const MSG_TRUNC: u64 = 0x20;
     const MSG_DONTWAIT: u64 = 0x40;
@@ -419,7 +547,7 @@ pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl F
                 };
                 return Ok(Recu {
                     vide: false,
-                    longueur: if drapeaux & MSG_TRUNC != 0 { total } else { copie },
+                    longueur: if vraie && drapeaux & MSG_TRUNC != 0 { total } else { copie },
                     source, port, destination, interface, coupe: copie < total,
                 });
             }
@@ -443,8 +571,6 @@ pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl F
 /// `Verrou`).
 pub fn fichier_ferme(ferme: &FichierOuvert) {
     if let Prive::Socket(s) = &ferme.prive {
-        match s.protocole {
-            Protocole::Udp => super::udp::liberer(s),
-        }
+        super::datagramme::table::retirer(s);
     }
 }

@@ -26,9 +26,10 @@ use super::interface::Interface;
 use super::paquet::Paquet;
 use crate::verrou::Verrou;
 use crate::{aleatoire, temps};
+use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, Ordering};
 use formats::reseau::arp::{self, Arp};
-use formats::reseau::{ethernet, ipv4};
+use formats::reseau::{ethernet, icmp, ipv4};
 use inet::voisins::{Action, Appris, Etat, Table};
 
 static VOISINS: Verrou<Option<Table<Paquet>>> = Verrou::new(None);
@@ -96,12 +97,35 @@ pub fn envoyer(i: &'static Interface, prochain: [u8; 4], p: Paquet, confirmer: b
 }
 
 /// Les minuteurs des voisins (dans la tâche du réseau), et la prochaine
-/// échéance.
+/// échéance. Un voisin passé en ÉCHEC jette sa file : pour chacun de ses
+/// paquets, une erreur ICMP « hôte injoignable » de nous vers nous (le
+/// `neigh_invalidate` de Linux, puis `arp_error_report` et
+/// `ipv4_send_dest_unreach`), envoyée une fois le verrou des voisins rendu
+/// : elle passe par `lo`, puis par le chemin de toute erreur ICMP reçue,
+/// jusqu'à la socket qui avait envoyé le paquet (qui le dit selon ses
+/// règles : icmp.rs, udp.rs). Aucun verrou de socket n'est pris sous
+/// celui des voisins. Plus de mémoire pour retenir un paquet : il est jeté
+/// sans erreur.
 pub fn temps() -> Option<u64> {
-    let mut v = VOISINS.verrouiller();
-    let t = v.as_mut()?;
-    t.temps(temps::ns_monotone(), hasard(), &mut faire);
-    t.echeance()
+    let mut echecs: Vec<Paquet> = Vec::new();
+    let echeance = {
+        let mut v = VOISINS.verrouiller();
+        let t = v.as_mut()?;
+        t.temps(temps::ns_monotone(), hasard(), &mut |a| match a {
+            Action::Jeter { paquet, echec: true } => {
+                JETES.fetch_add(1, Ordering::Relaxed);
+                if echecs.try_reserve(1).is_ok() {
+                    echecs.push(paquet);
+                }
+            }
+            a => faire(a),
+        });
+        t.echeance()
+    };
+    for p in echecs {
+        super::icmp::envoyer_erreur(icmp::INJOIGNABLE, icmp::HOTE, 0, p.donnees(), false, false, false);
+    }
+    echeance
 }
 
 /// Un message ARP reçu par `i` (la charge de la trame), dans la tâche du

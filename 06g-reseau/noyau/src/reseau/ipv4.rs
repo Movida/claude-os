@@ -26,8 +26,8 @@
 //! la configuration, les réponses au client DHCP (port 68) lui sont
 //! passées quelle que soit leur destination (le `ic_bootp_recv` de Linux,
 //! branché avant ce tri).
-//! Puis le protocole : UDP (udp.rs) ; les autres sont jetés (ICMP : le
-//! commit suivant).
+//! Puis le protocole : UDP (udp.rs), ICMP (icmp.rs) ; un autre, ou un
+//! datagramme UDP sans socket, reçoit l'erreur ICMP de Linux.
 //!
 //! LA SORTIE (`ip_queue_xmit`, `ip_make_skb`) : la route (`router`), puis
 //! l'en-tête, puis l'interface : `lo` pour une de nos adresses (Linux
@@ -43,7 +43,7 @@ use super::interface::{self, Interface};
 use super::paquet::Paquet;
 use crate::verrou::Verrou;
 use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
-use formats::reseau::{dhcp as format_dhcp, ethernet, ipv4, udp};
+use formats::reseau::{dhcp as format_dhcp, ethernet, icmp, ipv4, udp};
 use inet::routes::{Chemin, Table};
 
 const ENETUNREACH: i64 = 101;
@@ -129,8 +129,9 @@ fn options_acceptees(entete: &[u8]) -> bool {
 }
 
 /// Un paquet IPv4 (sans son en-tête Ethernet) reçu par `i`, dans la tâche
-/// du réseau.
-pub fn recevoir(i: &'static Interface, p: Paquet) {
+/// du réseau ; `trame_diffusee` : sa trame allait à toutes les machines
+/// (jamais d'erreur ICMP en réponse).
+pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
     let Ok((h, charge)) = ipv4::lire(p.donnees()) else { return compter(&ENTETES_FAUX) };
     // Le client DHCP d'abord, avant le tri des destinations : l'interface
     // n'a pas encore d'adresse.
@@ -168,13 +169,24 @@ pub fn recevoir(i: &'static Interface, p: Paquet) {
     let longueur = h.longueur as usize - h.longueur_entete;
     let _ = p.retirer_entete(h.longueur_entete);
     p.couper(longueur);
+    // Un protocole sans destinataire : l'erreur ICMP de Linux (« port
+    // injoignable » d'UDP, `__udp4_lib_rcv` ; « protocole injoignable »
+    // sinon, `ip_local_deliver_finish`), avec le paquet d'origine, son
+    // en-tête remis devant ; jamais pour une diffusion.
+    let injoignable = |code: u8, mut p: Paquet| {
+        if diffusion || p.ajouter_entete(h.longueur_entete).is_none() {
+            return;
+        }
+        super::icmp::envoyer_erreur(icmp::INJOIGNABLE, code, 0, p.donnees(), i.boucle(), true, trame_diffusee);
+    };
     match h.protocole {
         ipv4::UDP => {
-            super::udp::recevoir(i.index, h.source, h.destination, diffusion, p);
+            if let Err(p) = super::udp::recevoir(i.index, h.source, h.destination, diffusion, p) {
+                injoignable(icmp::PORT, p);
+            }
         }
-        // ICMP, et « protocole injoignable » pour les autres : le commit
-        // suivant.
-        _ => {}
+        ipv4::ICMP => super::icmp::recevoir(i, &h, diffusion, p),
+        _ => injoignable(icmp::PROTOCOLE, p),
     }
 }
 
@@ -242,14 +254,16 @@ pub fn mtu(c: &Chemin) -> u32 {
     interface_de(c).map_or(super::boucle::MTU, |i| i.mtu()).min(0xFFFF)
 }
 
-/// Un identifiant pour un paquet qui n'est pas d'une socket connectée
-/// (sauf IP_PMTUDISC_DO et PROBE, qui ont 0 : voir udp.rs). Linux le tire
-/// de compteurs choisis par un hachage à clé secrète de la destination
-/// (`__ip_select_ident`), pour qu'un tiers ne puisse pas compter, par la
-/// différence de deux identifiants qu'il reçoit, ce que la machine envoie
-/// aux autres ; chez nous, un compteur parti du hasard, que ce tiers peut
-/// lire : un écart écrit, jusqu'au générateur ChaCha20 de 6h (qui
-/// servira aussi aux numéros de séquence de TCP).
+/// Un identifiant pour un paquet qui n'est pas d'une socket connectée :
+/// un envoi d'UDP ou de ping (sauf IP_PMTUDISC_DO et PROBE, qui ont 0 :
+/// voir `datagramme::preparer`), et chaque réponse et erreur d'ICMP. Linux
+/// le tire de compteurs choisis par un hachage à clé secrète de la
+/// destination (`__ip_select_ident`), pour qu'un tiers ne puisse pas
+/// compter, par la différence de deux identifiants qu'il reçoit, ce que la
+/// machine envoie aux autres ; chez nous, un compteur parti du hasard, que
+/// ce tiers peut lire (deux pings lui disent combien d'ICMP sont partis
+/// entre-temps vers d'autres) : un écart écrit, jusqu'au générateur
+/// ChaCha20 de 6h (qui servira aussi aux numéros de séquence de TCP).
 pub fn identifiant() -> u16 {
     IDENTIFIANT.fetch_add(1, Ordering::Relaxed)
 }

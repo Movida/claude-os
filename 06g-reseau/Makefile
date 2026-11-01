@@ -4,7 +4,7 @@
 # files et la tâche du réseau (noyau/src/reseau/) ; Ethernet, IPv4 et la
 # configuration par DHCP (formats/src/reseau/, et la bibliothèque inet/ :
 # les routes, le client DHCP), ARP et la table des voisins ; les sockets
-# et UDP, avec l'interface de boucle lo.
+# et UDP, avec l'interface de boucle lo ; ICMP et les sockets de ping.
 # De 6f : les signaux livrés à leurs gestionnaires (le
 # cadre de signal, rt_sigreturn, la reprise des appels interrompus),
 # l'attente d'événements (poll, select, epoll), les tubes, /proc fabriqué
@@ -74,7 +74,7 @@
 #                  linux/evenements (eventfd, epoll), linux/proc,
 #                  linux/clone (clone, clone3), linux/fils et
 #                  linux/courses (des programmes à plusieurs fils), et
-#                  linux/reseau (les sockets UDP, sur lo)
+#                  linux/reseau (les sockets UDP et ICMP, sur lo)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -204,9 +204,10 @@ boot.bin: programmes.cpio FORCE
 #     aussi ;
 #   - courses : gcc -static, quatre fils qui ferment, changent de dossier et
 #     se servent en même temps des mêmes descripteurs ; sur l'hôte aussi ;
-#   - reseau : gcc -static, les sockets UDP sur lo (les appels et leurs
-#     refus, les options, la socket vue comme fichier, les attentes d'un fil
-#     à l'autre, 10 000 allers-retours) ; sur l'hôte aussi ;
+#   - reseau : gcc -static, les sockets UDP et ICMP sur lo (les appels et
+#     leurs refus, les options, la socket vue comme fichier, les attentes
+#     d'un fil à l'autre, 10 000 allers-retours, les erreurs ICMP, le ping) ;
+#     sur l'hôte aussi ;
 #   - passerelle : gcc sans option (la glibc partagée, comme claude), le
 #     réseau que le DHCP du démarrage a configuré (/proc/net, le DNS de
 #     /etc/resolv.conf, un datagramme qui part par eth0) ; dans notre noyau
@@ -605,7 +606,7 @@ $(GLIBC)/.copiee: $(LINUX)/libessai.so FORCE
 # (tests-demarrage.txt), qui les lance l'un après l'autre.
 LECTEUR = lecteur/target/wasm32-unknown-unknown/release/lecteur.wasm
 tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_LINUX) $(TESTS_INTERP) $(TESTS_PARALLELES)) $(INTERPRETEURS) \
-            $(LINUX)/bonjour-asm $(LINUX)/fils $(LINUX)/courses $(LINUX)/gestionnaires $(GLIBC)/.copiee FORCE
+            $(LINUX)/bonjour-asm $(LINUX)/fils $(LINUX)/courses $(LINUX)/gestionnaires $(LINUX)/passerelle $(GLIBC)/.copiee FORCE
 	cd lecteur && cargo build --release
 	{ echo "dir /bin 755 0 0"; \
 	  for p in $(TESTS_LINUX) $(TESTS_INTERP) $(TESTS_PARALLELES); do echo "file /bin/$$p $(LINUX)/tests/$$p 755 0 0"; done; \
@@ -614,6 +615,7 @@ tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_L
 	  echo "file /bin/fils $(LINUX)/fils 755 0 0"; \
 	  echo "file /bin/courses $(LINUX)/courses 755 0 0"; \
 	  echo "file /bin/gestionnaires $(LINUX)/gestionnaires 755 0 0"; \
+	  echo "file /bin/passerelle $(LINUX)/passerelle 755 0 0"; \
 	  echo "dir /etc 755 0 0"; \
 	  echo "file /etc/demarrage tests-demarrage.txt 644 0 0"; \
 	  echo "file /etc/ld.so.conf racine/etc/ld.so.conf 644 0 0"; \
@@ -639,8 +641,10 @@ tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_L
 # TESTS_INTERP, ceux de TESTS_PARALLELES par deux, un fil qui fait une
 # faute (fils faute : tout le groupe meurt), les courses entre fils et les
 # gestionnaires de signaux (sous qemu64 et max, en plus de Nehalem au
-# démarrage : sans XSAVE, puis avec XSAVE et AVX), lecteur.wasm sans
-# dossier pré-ouvert, et bonjour-asm.
+# démarrage : sans XSAVE, puis avec XSAVE et AVX), les erreurs ICMP d'une
+# adresse muette (passerelle muet : 10.0.2.99, que le noyau des tests a
+# déjà vue échouer au démarrage), lecteur.wasm sans dossier pré-ouvert, et
+# bonjour-asm.
 tests-demarrage.txt: Makefile
 	{ echo "# Fabrique par le Makefile (tests.cpio)."; \
 	  echo "/bin/bonjour-asm \"pas ferme"; \
@@ -663,6 +667,7 @@ tests-demarrage.txt: Makefile
 	  echo "/bin/fils faute"; \
 	  echo "/bin/courses"; \
 	  echo "/bin/gestionnaires"; \
+	  echo "/bin/passerelle muet"; \
 	  echo "/bin/lecteur.wasm"; \
 	  echo "/bin/bonjour-asm"; } > $@
 

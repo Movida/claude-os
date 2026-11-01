@@ -189,3 +189,7 @@
 [linux] gestionnaires : toutes les verifications : ok
 [noyau] gestionnaires : termine, code de sortie 0 ; memoire rendue : ok.
 [reseau] eth0 : voisin muet 10.0.2.99 : echec apres trois requetes, en 3 s, son paquet jete : ok.
+[linux] passerelle : UDP avec IP_RECVERR : EHOSTUNREACH, ICMP 3/1 de 10.0.2.15 : ok
+[linux] passerelle : ping avec IP_RECVERR : EHOSTUNREACH, ICMP 3/1 de 10.0.2.15 : ok
+[linux] passerelle : connectee sans IP_RECVERR : rien (l'hote injoignable n'est pas fatal) : ok
+[linux] passerelle : toutes les verifications (muet) : ok
