@@ -19,6 +19,7 @@
 #include <string.h>
 #include <linux/fs.h>
 #include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -645,6 +646,160 @@ static int autre(void)
     return echecs != 0;
 }
 
+/* /proc/self/fd (6f), mesuré sous Linux 6.18 : le texte de chaque lien (le
+ * chemin, « (deleted) », anon_inode:[...], pipe:[...]), ses droits (le mode
+ * d'ouverture) et sa taille (64), le dossier (dr-x------, sa taille : le
+ * nombre de descripteurs), et le LIEN MAGIQUE : stat et open vont droit au
+ * fichier ouvert, même effacé ; un tube se rouvre du côté qu'on veut ; un
+ * epoll non (EACCES : son inode anonyme est à root, 0600). */
+static void lien_de(int fd, char *t, size_t n)
+{
+    char chemin[64];
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", fd);
+    ssize_t r = readlink(chemin, t, n - 1);
+    t[r < 0 ? 0 : r] = 0;
+}
+
+static mode_t droits_du_lien(int fd)
+{
+    char chemin[64];
+    struct stat s;
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", fd);
+    return lstat(chemin, &s) == 0 && S_ISLNK(s.st_mode) && s.st_size == 64 && s.st_uid == getuid() ? s.st_mode & 07777 : 07777;
+}
+
+static void descripteurs(void)
+{
+    char nom[64], t[256], attendu[256], chemin[64];
+    snprintf(nom, sizeof nom, "/tmp/proc-fd-%d", getpid());
+    int f = open(nom, O_RDWR | O_CREAT | O_TRUNC, 0644);
+    if (write(f, "contenu", 7) != 7)
+        verifier(0, "ecrire le fichier");
+    int lu = open(nom, O_RDONLY), ecrit = open(nom, O_WRONLY), chemin_seul = open(nom, O_PATH);
+    lien_de(f, t, sizeof t);
+    verifier(strcmp(t, nom) == 0, "readlink /proc/self/fd/N : le chemin du fichier");
+    verifier(droits_du_lien(lu) == 0500 && droits_du_lien(ecrit) == 0300 && droits_du_lien(f) == 0700 && droits_du_lien(chemin_seul) == 0,
+             "lstat d'un lien : r-x en lecture, -wx en ecriture, rwx les deux, rien pour O_PATH ; taille 64, a l'utilisateur");
+    struct stat a, b;
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", f);
+    verifier(stat(chemin, &a) == 0 && stat(nom, &b) == 0 && a.st_ino == b.st_ino && S_ISREG(a.st_mode),
+             "stat d'un lien : le fichier ouvert");
+    /* Ce qu'on ouvre par un lien garde le chemin du fichier ouvert : un
+     * fichier qui a son nom, la sortie standard (la console chez nous, un
+     * tuyau sous make sur l'hôte), un dossier, l'exécutable. */
+    int par_lien = open(chemin, O_RDONLY);
+    char c[8] = { 0 }, t2[256];
+    lien_de(par_lien, t2, sizeof t2);
+    verifier(par_lien >= 0 && read(par_lien, c, 7) == 7 && strcmp(c, "contenu") == 0 && strcmp(t2, nom) == 0,
+             "open d'un lien vers un fichier qui a son nom : ouvert, le meme chemin");
+    close(par_lien);
+    int sortie = open("/proc/self/fd/1", O_WRONLY);
+    lien_de(1, t, sizeof t);
+    lien_de(sortie, t2, sizeof t2);
+    verifier(sortie >= 0 && t[0] != 0 && strcmp(t, t2) == 0, "open de /proc/self/fd/1 (/dev/stdout) : ouvert, le meme chemin");
+    close(sortie);
+    int tmp = open("/tmp", O_RDONLY | O_DIRECTORY);
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", tmp);
+    int dossier = open(chemin, O_RDONLY | O_DIRECTORY);
+    lien_de(dossier, t2, sizeof t2);
+    verifier(dossier >= 0 && strcmp(t2, "/tmp") == 0, "open d'un lien vers un dossier : ouvert, le meme chemin");
+    close(dossier);
+    close(tmp);
+    char exe[256] = { 0 };
+    struct stat e_lien, e_ouvert;
+    int par_exe = open("/proc/self/exe", O_RDONLY);
+    if (readlink("/proc/self/exe", exe, sizeof exe - 1) <= 0)
+        exe[0] = 0;
+    lien_de(par_exe, t2, sizeof t2);
+    verifier(par_exe >= 0 && stat("/proc/self/exe", &e_lien) == 0 && fstat(par_exe, &e_ouvert) == 0 && e_lien.st_ino == e_ouvert.st_ino
+                 && exe[0] == '/' && strcmp(t2, exe) == 0,
+             "open de /proc/self/exe : l'executable, son chemin");
+    close(par_exe);
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", f);
+    unlink(nom);
+    lien_de(f, t, sizeof t);
+    snprintf(attendu, sizeof attendu, "%s (deleted)", nom);
+    verifier(strcmp(t, attendu) == 0, "le fichier efface : (deleted)");
+    /* Le LIEN MAGIQUE : son texte ne mène plus nulle part, le suivre mène
+     * encore au fichier. */
+    verifier(stat(chemin, &a) == 0 && a.st_ino == b.st_ino && a.st_nlink == 0, "stat d'un lien vers un fichier efface : le fichier (un lien magique)");
+    int rouvert = open(chemin, O_RDONLY);
+    memset(c, 0, sizeof c);
+    lien_de(rouvert, t2, sizeof t2);
+    verifier(rouvert >= 0 && read(rouvert, c, 7) == 7 && strcmp(c, "contenu") == 0 && strcmp(t2, attendu) == 0,
+             "open d'un lien vers un fichier efface : il se rouvre, avec son chemin et (deleted)");
+    close(rouvert);
+
+    int e = eventfd(0, 0), ep = epoll_create1(0), tube[2];
+    if (pipe(tube) != 0)
+        verifier(0, "pipe");
+    int m = open("/proc/self/maps", O_RDONLY);
+    char e_t[64], ep_t[64], tl[64], te[64], m_t[64];
+    lien_de(e, e_t, sizeof e_t);
+    lien_de(ep, ep_t, sizeof ep_t);
+    lien_de(tube[0], tl, sizeof tl);
+    lien_de(tube[1], te, sizeof te);
+    lien_de(m, m_t, sizeof m_t);
+    struct stat st;
+    fstat(tube[0], &st);
+    snprintf(attendu, sizeof attendu, "pipe:[%lu]", (unsigned long)st.st_ino);
+    char maps[64];
+    snprintf(maps, sizeof maps, "/proc/%d/maps", getpid());
+    verifier(strcmp(e_t, "anon_inode:[eventfd]") == 0 && strcmp(ep_t, "anon_inode:[eventpoll]") == 0 && strcmp(tl, attendu) == 0
+                 && strcmp(te, attendu) == 0 && strcmp(m_t, maps) == 0,
+             "anon_inode:[eventfd], anon_inode:[eventpoll], pipe:[inode] pour les deux bouts, /proc/<pid>/maps");
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", tube[0]);
+    int autre_bout = open(chemin, O_WRONLY);
+    char x = 0;
+    verifier(autre_bout >= 0 && write(autre_bout, "y", 1) == 1 && read(tube[0], &x, 1) == 1 && x == 'y',
+             "open O_WRONLY du lien d'un bout de lecture : un bout d'ecriture du meme tube");
+    close(autre_bout);
+    int tube_chemin = open(chemin, O_PATH);
+    lien_de(tube_chemin, t2, sizeof t2);
+    verifier(tube_chemin >= 0 && strcmp(t2, attendu) == 0, "open O_PATH du lien d'un tube : pipe:[inode]");
+    close(tube_chemin);
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", ep);
+    verifier(open(chemin, O_RDONLY) == -1 && errno == EACCES, "open du lien d'un epoll : EACCES");
+    int ferme = dup(e);
+    close(ferme);
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", ferme);
+    verifier(readlink(chemin, t, sizeof t) == -1 && errno == ENOENT && open(chemin, O_RDONLY) == -1 && errno == ENOENT,
+             "un numero ferme : ENOENT");
+
+    struct stat d;
+    DIR *dir = opendir("/proc/self/fd");
+    int n = 0, dt = 1, croissants = 1, precedent = -1, points = 0;
+    struct dirent *x_;
+    while (dir && (x_ = readdir(dir)) != NULL) {
+        if (strcmp(x_->d_name, ".") == 0 || strcmp(x_->d_name, "..") == 0) {
+            points++;
+            continue;
+        }
+        n++;
+        dt &= x_->d_type == DT_LNK;
+        croissants &= atoi(x_->d_name) > precedent;
+        precedent = atoi(x_->d_name);
+    }
+    if (dir)
+        closedir(dir);
+    stat("/proc/self/fd", &d);
+    verifier(S_ISDIR(d.st_mode) && (d.st_mode & 07777) == 0500 && d.st_nlink == 2 && d.st_uid == getuid(),
+             "/proc/self/fd : dr-x------, deux liens, a l'utilisateur");
+    /* Sa taille : le nombre de descripteurs ouverts (celui de opendir, fermé
+     * depuis, n'y est plus ; la liste l'avait). */
+    verifier((long)d.st_size == n - 1, "/proc/self/fd : sa taille est le nombre de descripteurs");
+    verifier(points == 2 && dt && croissants, "getdents de /proc/self/fd : . et .., puis les numeros, croissants, en DT_LNK");
+    close(f);
+    close(lu);
+    close(ecrit);
+    close(chemin_seul);
+    close(e);
+    close(ep);
+    close(tube[0]);
+    close(tube[1]);
+    close(m);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "cible") == 0) {
@@ -670,6 +825,7 @@ int main(int argc, char **argv)
     modifications();
     sys();
     fils();
+    descripteurs();
     printf("[linux] proc : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

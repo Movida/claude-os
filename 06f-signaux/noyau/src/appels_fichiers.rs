@@ -52,11 +52,11 @@ use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Prive, R
 use crate::processus::Processus;
 use crate::vfs::{self, CadresDuNoyau, Systeme};
 use crate::{aleatoire, console, evenements, pages, processus, procfs, temps};
-use fichiers::chemins::{Arbre, Depart, Fin, PATH_MAX, Suivre};
+use fichiers::chemins::{Arbre, Depart, Dernier, Fin, PATH_MAX, Suivre};
 use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_tmpfs};
 use crate::vfs::Montage;
 use fichiers::tmpfs::{Attributs, Numero, Ouverture, limite_ecriture, suivre_pour};
-use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, permis};
+use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, permis};
 use crate::attente::{GardeMutex, Mutex};
 
 // Les numéros d'erreur de Linux qui ne viennent pas du tmpfs.
@@ -408,7 +408,25 @@ fn refus(s: &Systeme, pid: u32, qui: Identite, m: Modification) -> i64 {
 /// Le chemin canonique de ce que désigne `fin` (pour le fichier ouvert,
 /// `FichierOuvert::chemin`), vide s'il ne peut pas être calculé.
 fn canonique(s: &Systeme, pid: u32, fin: &Fin<Objet>) -> Vec<u8> {
-    s.avec_vue(pid, |vue| vue.chemin_de(fin)).unwrap_or_default()
+    s.avec_vue(pid, |vue| {
+        // Un lien magique en dernier (/proc/<pid>/fd/N, /proc/<pid>/exe) :
+        // ce qu'il désigne garde le chemin du fichier (Linux rouvre le même
+        // `struct path`), même effacé ou sans nom ; jamais un chemin
+        // calculé d'après l'objet, qui n'existe que pour un dossier.
+        if fin.dernier == Dernier::Nom
+            && let Some(objet) = fin.objet
+            && let Some(lien) = vue.chercher(fin.dossier, &fin.nom)
+            && vue.saut(lien) == Some(objet)
+            && let Some(chemin) = vue.chemin_du_saut(lien)
+        {
+            let mut v = Vec::new();
+            v.try_reserve_exact(chemin.len()).map_err(|_| Erreur::ENOMEM)?;
+            v.extend_from_slice(&chemin);
+            return Ok(v);
+        }
+        vue.chemin_de(fin)
+    })
+    .unwrap_or_default()
 }
 
 /// L'objet désigné par `chemin` depuis `dirfd`, qui doit exister (stat,
@@ -440,6 +458,9 @@ fn sorte(mode: u32, rdev: (u32, u32)) -> Result<Sorte, i64> {
     Ok(match mode & S_IFMT {
         S_IFREG => Sorte::Fichier,
         S_IFDIR => Sorte::Dossier,
+        // L'inode d'un tube, rouvert par /proc/<pid>/fd (le `fifo_open` de
+        // Linux) : son tube (tube::rouvrir).
+        S_IFIFO => Sorte::Tube,
         S_IFCHR => match rdev {
             vfs::NULL => Sorte::Null,
             vfs::ZERO => Sorte::Zero,
@@ -666,8 +687,22 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
                 return Err(e);
             }
         };
-        let fichier = s.ouverts.ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, gardes as u32, &chemin).avec_chemin(complet))
+        let mut f = FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, gardes as u32, &chemin).avec_chemin(complet);
+        if sorte == Sorte::Tube {
+            match crate::tube::rouvrir(ouvert.numero, o.lecture, o.ecriture) {
+                Some((tube, nom)) => {
+                    f.prive = Prive::Tube(tube);
+                    f.chemin = nom;
+                }
+                None => {
+                    s.fs.fermer(&ouvert, cadres);
+                    return Err(errno(Erreur::ENXIO));
+                }
+            }
+        }
+        let fichier = s.ouverts.ajouter(f)
             .map_err(|f| {
+                crate::tube::fichier_ferme(&f);
                 if let Tenu::Tmpfs(ouvert) = f.tenu {
                     s.fs.fermer(&ouvert, cadres);
                 }

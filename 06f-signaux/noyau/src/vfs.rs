@@ -113,8 +113,8 @@ pub const PROC: usize = 0;
 /// dont une partie est fabriquée d'après les processus (procfs.rs), ou un
 /// système du noyau tout fait (/sys). Option écartée : un `dyn Monte` dans
 /// la table des montages ; mais /proc a besoin, pour ce qu'il fabrique,
-/// d'autres morceaux du système (bientôt la table des fichiers ouverts),
-/// qu'il emprunte le temps de l'appel.
+/// d'autres morceaux du système (la table des fichiers ouverts, le
+/// tmpfs, pour fd/), qu'il emprunte le temps de l'appel.
 pub enum Montage<'a> {
     Proc(crate::procfs::ProcVue<'a>),
     Fixe(&'a NoyauFs),
@@ -177,6 +177,20 @@ impl Monte for Montage<'_> {
         }
     }
 
+    fn saut(&self, lien: u64) -> Option<Objet> {
+        match self {
+            Montage::Proc(p) => p.saut(lien),
+            Montage::Fixe(f) => f.saut(lien),
+        }
+    }
+
+    fn chemin_du_saut(&self, lien: u64) -> Option<Texte<'_>> {
+        match self {
+            Montage::Proc(p) => p.chemin_du_saut(lien),
+            Montage::Fixe(f) => f.chemin_du_saut(lien),
+        }
+    }
+
     fn lire_dossier(&self, dossier: u64, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
         -> Result<(), Erreur> {
         match self {
@@ -235,7 +249,7 @@ impl Systeme {
         // devra prendre place ici).
         let montes: [(Numero, Montage); 2] = core::array::from_fn(|i| {
             let (point, fs) = &self.montes[i];
-            (*point, if i == PROC { Montage::Proc(crate::procfs::ProcVue::new(fs)) } else { Montage::Fixe(fs) })
+            (*point, if i == PROC { Montage::Proc(crate::procfs::ProcVue::new(fs, &self.ouverts, &self.fs)) } else { Montage::Fixe(fs) })
         });
         f(&Vue { fs: &self.fs, montes: &montes, lecteur, fil: &chemin_du_fil[..longueur] })
     }

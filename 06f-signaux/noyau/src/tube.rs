@@ -38,7 +38,7 @@ use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, 
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::{cpu, espace, pages, processus, signaux, temps, vfs};
-use alloc::sync::Arc;
+use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use fichiers::tmpfs::Ouvert;
@@ -77,6 +77,13 @@ pub const TAILLE_MAX: u64 = 1 << 20;
 /// (0 : sans limite dure).
 pub const PAGES_UTILISATEUR_DOUCE: u64 = 16 * 1024;
 pub const PAGES_UTILISATEUR_DURE: u64 = 0;
+
+/// Les tubes vivants, par le numéro de leur inode (pipefs) : pour en rouvrir
+/// un par /proc/<pid>/fd (Linux : `inode->i_pipe`). Un tube la quitte quand
+/// son dernier bout est fermé, avant que le tmpfs ne puisse redonner son
+/// numéro d'inode (`put_pipe_info`, qui coupe `i_pipe`) ; elle est rendue
+/// vide quand il n'y en a plus.
+static TUBES: Verrou<Vec<(u32, Weak<Tube>)>> = Verrou::new(Vec::new());
 
 /// Les pages de tubes de l'utilisateur (le `pipe_bufs` de sa `user_struct` :
 /// nos programmes n'en ont qu'un).
@@ -582,12 +589,28 @@ impl Tube {
         n as i64 * PAGE as i64
     }
 
+    /// Un bout de plus, rouvert par /proc/<pid>/fd (le `fifo_open` d'un
+    /// tube, qui n'attend jamais l'autre bout) : un lecteur ou un écrivain
+    /// de plus ; le premier d'un côté réveille qui attend de l'autre.
+    fn ouvrir_bout(&self, lecture: bool, ecriture: bool) {
+        let premier = {
+            let mut e = self.etat.verrouiller();
+            let premier = (lecture && e.lecteurs == 0) || (ecriture && e.ecrivains == 0);
+            e.lecteurs += lecture as u32;
+            e.ecrivains += ecriture as u32;
+            premier
+        };
+        if premier {
+            self.rd_wait.reveiller_toutes();
+        }
+    }
+
     /// Le dernier close d'un bout (`pipe_release`), sous le verrou des
     /// fichiers : un lecteur ou un écrivain de moins ; si c'était le dernier
     /// d'un côté seulement, tout le monde est réveillé (clé nulle : tous les
     /// événements), pour voir la fin ou l'erreur.
     pub fn fermer_bout(&self, lecture: bool, ecriture: bool) {
-        let fin = {
+        let (fin, plus_aucun) = {
             let mut e = self.etat.verrouiller();
             if lecture {
                 e.lecteurs -= 1;
@@ -595,8 +618,14 @@ impl Tube {
             if ecriture {
                 e.ecrivains -= 1;
             }
-            (e.lecteurs == 0) != (e.ecrivains == 0)
+            ((e.lecteurs == 0) != (e.ecrivains == 0), e.lecteurs == 0 && e.ecrivains == 0)
         };
+        // Plus aucun bout : l'inode n'a plus de tube. Un O_PATH qui le tient
+        // encore ne peut plus le rouvrir (ENXIO ; Linux en fabrique un neuf,
+        // `fifo_open` : un écart, pour un cas que rien ne demande).
+        if plus_aucun {
+            TUBES.verrouiller().retain(|(_, t)| !core::ptr::eq(t.as_ptr(), self));
+        }
         if fin {
             self.rd_wait.reveiller_toutes();
             self.wr_wait.reveiller_toutes();
@@ -606,8 +635,14 @@ impl Tube {
 
 impl Drop for Tube {
     /// La fin du tube (`free_pipe_info`) : ses pages rendues, et le compte
-    /// de l'utilisateur.
+    /// de l'utilisateur ; il quitte la table des tubes.
     fn drop(&mut self) {
+        let mut tubes = TUBES.verrouiller();
+        tubes.retain(|(_, t)| t.strong_count() > 0);
+        if tubes.is_empty() {
+            *tubes = Vec::new();
+        }
+        drop(tubes);
         // Le dernier Arc rendu, souvent sous le verrou des fichiers (le
         // dernier close) : l'anneau sans son Mutex, que personne ne tient.
         for t in self.anneau.seul().iter().filter(|t| t.cadre != 0) {
@@ -646,6 +681,9 @@ pub fn pipe2(tableau: u64, drapeaux: u64) -> i64 {
     }
     let Some(tube) = Tube::new() else { return -ENFILE };
     let tube = Arc::new(tube);
+    if TUBES.verrouiller().try_reserve(1).is_err() {
+        return -ENFILE;
+    }
     let identite = processus::avec(|p| p.identite);
     let maintenant = temps::maintenant();
     let Ok(numero) = vfs::avec(|fs, _| {
@@ -656,6 +694,7 @@ pub fn pipe2(tableau: u64, drapeaux: u64) -> i64 {
     }) else {
         return -ENFILE;
     };
+    TUBES.verrouiller().push((numero.0, Arc::downgrade(&tube)));
     let bout = |lecture: bool, ecriture: bool, etat: u32| {
         let ouvert = Ouvert { numero, cree: false, tronquer: false, ecrivain: false };
         let mut f = FichierOuvert::new(Sorte::Tube, Tenu::Tmpfs(ouvert), lecture, ecriture, etat, b"pipe");
@@ -676,6 +715,15 @@ pub fn pipe2(tableau: u64, drapeaux: u64) -> i64 {
 /// pipe(tableau) : pipe2 sans drapeaux.
 pub fn pipe(tableau: u64) -> i64 {
     pipe2(tableau, 0)
+}
+
+/// Rouvre le tube de l'inode `numero` (par /proc/<pid>/fd) : un bout de
+/// plus, en lecture, en écriture ou les deux ; rend son tube et le nom du
+/// bout (« pipe:[numero] »). None : plus de tube à cet inode.
+pub fn rouvrir(numero: fichiers::tmpfs::Numero, lecture: bool, ecriture: bool) -> Option<(Arc<Tube>, Vec<u8>)> {
+    let tube = TUBES.verrouiller().iter().filter(|(n, _)| *n == numero.0).find_map(|(_, t)| t.upgrade())?;
+    tube.ouvrir_bout(lecture, ecriture);
+    Some((tube, chemin(numero.0)))
 }
 
 /// Le bout `tenu` d'un tube, fermé pour la dernière fois.

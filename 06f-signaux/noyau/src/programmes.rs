@@ -725,13 +725,14 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         fils: Vec::new(),
         fin_de_groupe: None,
     }, nom);
-    // Le chemin de son exécutable, pour /proc/<pid>/exe (procfs.rs fabrique
-    // son dossier d'après la table des processus).
+    // Son exécutable, pour /proc/<pid>/exe (procfs.rs fabrique son dossier
+    // d'après la table des processus) : son chemin, et son inode, tenu par
+    // le lancement, puis par le lanceur jusqu'au recueil.
     let mut exe = Vec::new();
     if exe.try_reserve_exact(lancement.complet.len()).is_ok() {
         exe.extend_from_slice(lancement.complet);
     }
-    processus::poser_exe(pid, exe);
+    processus::poser_exe(pid, exe, n);
     let lance = entree.and_then(|e| tache::lancer_programme(nom, e.clone(), pml4, depart, rsp).map(|_| e));
     match lance {
         Some(processus) => {

@@ -122,6 +122,19 @@ pub trait Monte {
     /// processus s'écrit `lecteur`, et le chemin de son fil (dans /proc)
     /// `fil` : /proc/self et /proc/thread-self dépendent de qui les lit.
     fn cible<'a>(&'a self, lien: u64, lecteur: &'a [u8], fil: &'a [u8]) -> Texte<'a>;
+    /// Ce que désigne directement le lien magique `lien` (chemins::Arbre::saut).
+    fn saut(&self, _lien: u64) -> Option<Objet> {
+        None
+    }
+    /// Le chemin qu'aura ce qu'on ouvre par le lien magique `lien` : celui
+    /// du fichier ouvert qu'il désigne (vide s'il n'en a pas). Linux rouvre
+    /// le même `struct path` (`nd_jump_link`), dont `d_path` donne le même
+    /// texte ; un chemin calculé d'après l'objet n'existe que pour un
+    /// dossier (un fichier ne connaît pas son parent, et peut en avoir
+    /// plusieurs par ses liens physiques). None : pas un lien magique.
+    fn chemin_du_saut(&self, _lien: u64) -> Option<Texte<'_>> {
+        None
+    }
     /// Les entrées du dossier à partir de `position`, comme
     /// `Tmpfs::lire_dossier` : `entree(nom, inode, type, position suivante)`
     /// tant qu'elle rend vrai.
@@ -264,6 +277,15 @@ impl<'a, M: Monte> Vue<'a, M> {
             }),
             Objet::Monte(s, n) => self.monte(s).lire_dossier(n, position, &mut entree),
             Objet::Anonyme => Err(Erreur::ENOTDIR),
+        }
+    }
+
+    /// Le chemin de ce qu'on ouvre par le lien magique `lien`
+    /// (Monte::chemin_du_saut) ; None : pas un lien magique.
+    pub fn chemin_du_saut(&self, lien: Objet) -> Option<Texte<'_>> {
+        match lien {
+            Objet::Monte(s, n) => self.monte(s).chemin_du_saut(n),
+            Objet::Tmpfs(_) | Objet::Anonyme => None,
         }
     }
 
@@ -594,6 +616,12 @@ pub fn en_tmpfs(fin: Fin<Objet>) -> Result<Fin<Numero>, Fin<Objet>> {
         (Some(dossier), Some(objet)) => {
             Ok(Fin { dossier, nom: fin.nom, objet, dernier: fin.dernier, barre: fin.barre })
         }
+        // Un lien magique a mené d'un système monté à un inode du tmpfs qui
+        // existe (/proc/self/fd/N, chemins::Arbre::saut) : c'est lui qu'on
+        // ouvre ou modifie ; aucun nom ne sera créé, son dossier ne sert pas.
+        (None, Some(Some(n))) if fin.dernier == Dernier::Nom => {
+            Ok(Fin { dossier: n, nom: fin.nom, objet: Some(n), dernier: fin.dernier, barre: fin.barre })
+        }
         _ => Err(fin),
     }
 }
@@ -644,6 +672,13 @@ impl<M: Monte> Arbre for Vue<'_, M> {
             Objet::Tmpfs(n) => <Tmpfs as Arbre>::cible(self.fs, n),
             Objet::Monte(s, n) => self.monte(s).cible(n, self.lecteur, self.fil),
             Objet::Anonyme => Texte::Emprunte(&[]),
+        }
+    }
+
+    fn saut(&self, lien: Objet) -> Option<Objet> {
+        match lien {
+            Objet::Monte(s, n) => self.monte(s).saut(n),
+            Objet::Tmpfs(_) | Objet::Anonyme => None,
         }
     }
 }

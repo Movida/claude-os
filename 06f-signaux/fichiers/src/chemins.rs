@@ -39,7 +39,8 @@
 //!
 //! Une option pour WASI : la résolution « sous » le dossier de départ (le
 //! RESOLVE_BENEATH d'`openat2`) refuse tout ce qui en sortirait, un « .. »
-//! au-dessus de lui comme un chemin ou un lien absolus (EXDEV). C'est ce
+//! au-dessus de lui comme un chemin ou un lien absolus, ou un lien
+//! magique de /proc (EXDEV). C'est ce
 //! qui confine un programme WebAssembly à son dossier pré-ouvert.
 
 use crate::{EXECUTER, Erreur, Identite, S_IFDIR, S_IFLNK, S_IFMT, permis};
@@ -123,6 +124,13 @@ pub trait Arbre {
     fn parent(&self, dossier: Self::Objet) -> Self::Objet;
     /// Le contenu du lien symbolique `lien`.
     fn cible(&self, lien: Self::Objet) -> Texte<'_>;
+    /// Un LIEN MAGIQUE (6f) : `lien` ne se suit pas par son texte, il mène
+    /// droit à cet objet (le `nd_jump_link` de Linux, pour /proc/<pid>/fd/N :
+    /// l'objet du fichier ouvert, même sans nom, effacé, ou anonyme). None :
+    /// un lien ordinaire.
+    fn saut(&self, _lien: Self::Objet) -> Option<Self::Objet> {
+        None
+    }
 }
 
 /// D'où part la résolution, et pour qui.
@@ -309,6 +317,16 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
                 Suivre::Jamais => false,
             };
             if let Some(lien) = lien.filter(|_| suivre_ici) {
+                // Un lien magique en dernier : ce qu'il désigne est le
+                // résultat (une barre finale demande encore un dossier).
+                if let Some(cible) = arbre.saut(lien) {
+                    compter_lien(&mut liens)?;
+                    sauter_sous(depart)?;
+                    let mut copie = Vec::new();
+                    copie.try_reserve_exact(nom.len()).map_err(|_| Erreur::ENOMEM)?;
+                    copie.extend_from_slice(nom);
+                    return Ok(Fin { dossier: courant, nom: copie, objet: Some(cible), dernier: Dernier::Nom, barre });
+                }
                 courant = suivre_lien(arbre, depart, lien, &mut liens, &mut pile, barre, courant)?;
                 continue;
             }
@@ -321,6 +339,16 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
             return Err(Erreur::ENOENT);
         };
         if let Some(lien) = lien {
+            // Un lien magique au milieu : la suite part de ce qu'il désigne.
+            if let Some(cible) = arbre.saut(lien) {
+                compter_lien(&mut liens)?;
+                sauter_sous(depart)?;
+                if !est_dossier(cible) {
+                    return Err(Erreur::ENOTDIR);
+                }
+                courant = cible;
+                continue;
+            }
             courant = suivre_lien(arbre, depart, lien, &mut liens, &mut pile, false, courant)?;
             continue;
         }
@@ -331,14 +359,24 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
     }
 }
 
+/// Un lien de plus de suivi : au-delà de LIENS_MAX, ELOOP.
+fn compter_lien(liens: &mut u32) -> Result<(), Erreur> {
+    *liens += 1;
+    if *liens > LIENS_MAX { Err(Erreur::ELOOP) } else { Ok(()) }
+}
+
+/// Un lien magique mène n'importe où, hors du dossier de départ : une
+/// résolution « sous » lui le refuse (EXDEV), après avoir compté le lien
+/// (ELOOP d'abord), comme `nd_jump_link` de Linux pour RESOLVE_BENEATH.
+fn sauter_sous<O>(depart: &Depart<O>) -> Result<(), Erreur> {
+    if depart.sous { Err(Erreur::EXDEV) } else { Ok(()) }
+}
+
 /// Suit le lien `lien`, rencontré dans le dossier `courant` : son contenu
 /// devient le morceau à lire. Rend le dossier d'où il part.
 fn suivre_lien<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, lien: A::Objet, liens: &mut u32,
                              pile: &mut Vec<Morceau<'a>>, barre: bool, courant: A::Objet) -> Result<A::Objet, Erreur> {
-    *liens += 1;
-    if *liens > LIENS_MAX {
-        return Err(Erreur::ELOOP);
-    }
+    compter_lien(liens)?;
     let cible = arbre.cible(lien);
     if cible.is_empty() {
         return Err(Erreur::ENOENT);
@@ -423,6 +461,59 @@ mod tests {
 
     const ROOT: Identite = Identite::ROOT;
     const DAVID: Identite = Identite { uid: 1000, gid: 1000 };
+
+    /// Le même arbre, où /magique est un lien magique vers /etc/sous, et
+    /// /fichier-magique vers /etc/hosts (leur texte, lui, mène ailleurs).
+    struct Magique(Petit);
+
+    impl Arbre for Magique {
+        type Objet = usize;
+        fn mode(&self, o: usize) -> u32 {
+            self.0.mode(o)
+        }
+        fn proprietaire(&self, o: usize) -> (u32, u32) {
+            self.0.proprietaire(o)
+        }
+        fn chercher(&self, dossier: usize, nom: &[u8]) -> Option<usize> {
+            self.0.chercher(dossier, nom)
+        }
+        fn parent(&self, dossier: usize) -> usize {
+            self.0.parent(dossier)
+        }
+        fn cible(&self, lien: usize) -> Texte<'_> {
+            self.0.cible(lien)
+        }
+        fn saut(&self, lien: usize) -> Option<usize> {
+            match self.0.0[lien].0 {
+                b"magique" => Some(10),
+                b"fichier-magique" => Some(2),
+                _ => None,
+            }
+        }
+    }
+
+    #[test]
+    fn lien_magique() {
+        let mut a = arbre();
+        a.0.push((b"magique", 0, L, b"nulle/part"));
+        a.0.push((b"fichier-magique", 0, L, b"nulle/part"));
+        let m = Magique(a);
+        let d = depart(DAVID);
+        // En dernier : ce qu'il désigne, sans lire son texte ; au milieu :
+        // la suite part de lui ; pas suivi (lstat) : le lien lui-même ; une
+        // barre finale après un fichier : ENOTDIR (au milieu).
+        assert_eq!(trouver(&m, &d, b"/magique", true), Ok(10));
+        assert_eq!(trouver(&m, &d, b"/magique/..", true), Ok(1));
+        assert_eq!(trouver(&m, &d, b"/fichier-magique", true), Ok(2));
+        assert_eq!(trouver(&m, &d, b"/magique", false), Ok(12));
+        assert_eq!(trouver(&m, &d, b"/fichier-magique/x", true), Err(Erreur::ENOTDIR));
+        // Sous le dossier de départ (WASI) : un lien magique en sortirait,
+        // en dernier comme au milieu (EXDEV) ; pas suivi, il ne sort pas.
+        let sous = Depart { sous: true, ..d };
+        assert_eq!(trouver(&m, &sous, b"magique", true), Err(Erreur::EXDEV));
+        assert_eq!(trouver(&m, &sous, b"magique/..", true), Err(Erreur::EXDEV));
+        assert_eq!(trouver(&m, &sous, b"magique", false), Ok(12));
+    }
 
     fn depart(qui: Identite) -> Depart<usize> {
         Depart { racine: 0, dossier: 0, qui, sous: false }

@@ -34,6 +34,7 @@ use crate::verrou::Verrou;
 use crate::vfs;
 use fichiers::Identite;
 use fichiers::montages::Objet;
+use fichiers::tmpfs::Numero;
 
 pub struct Processus {
     /// Son numéro (pid), qui est aussi celui de son fil principal et de son
@@ -227,11 +228,12 @@ pub struct Entree {
     usage: crate::rusage::DuProcessus,
     /// Ce qu'en montre /proc sans le verrou du processus (procfs.rs) : à
     /// qui il est (le propriétaire de /proc/<pid>, même zombie), quand il a
-    /// été lancé (les dates de ses entrées), le chemin canonique de son
-    /// exécutable (/proc/<pid>/exe).
+    /// été lancé (les dates de ses entrées), son exécutable
+    /// (/proc/<pid>/exe) : le chemin canonique et l'inode, que le lanceur
+    /// tient jusqu'au recueil.
     identite: Identite,
     lance: fichiers::Temps,
-    exe: Verrou<Vec<u8>>,
+    exe: Verrou<(Vec<u8>, Option<Numero>)>,
 }
 
 impl Entree {
@@ -379,16 +381,17 @@ pub fn ajouter(processus: Processus, nom: NomCourt) -> Option<Arc<Entree>> {
         usage: crate::rusage::DuProcessus::new(),
         identite,
         lance: crate::temps::maintenant(),
-        exe: Verrou::new(Vec::new()),
+        exe: Verrou::new((Vec::new(), None)),
     });
     table.push(e.clone());
     Some(e)
 }
 
-/// Le chemin canonique de l'exécutable du processus `pid` (/proc/<pid>/exe).
-pub fn poser_exe(pid: u32, exe: Vec<u8>) {
+/// L'exécutable du processus `pid` (/proc/<pid>/exe) : son chemin
+/// canonique, son inode.
+pub fn poser_exe(pid: u32, chemin: Vec<u8>, inode: Numero) {
     if let Some(e) = entree(pid) {
-        *e.exe.verrouiller() = exe;
+        *e.exe.verrouiller() = (chemin, Some(inode));
     }
 }
 
@@ -409,13 +412,22 @@ pub fn nombre() -> u32 {
     TABLE.verrouiller().len() as u32
 }
 
-/// Une copie de son exécutable (vide sans mémoire).
-pub fn exe(pid: u32) -> Option<Vec<u8>> {
-    let e = entree(pid)?;
+/// L'inode de son exécutable ; None pour un zombie, qui n'a plus de
+/// mémoire (Linux le trouve par elle, `get_task_exe_file` : ENOENT).
+pub fn exe(pid: u32) -> Option<Numero> {
+    let e = entree(pid).filter(|e| !e.est_zombie())?;
+    let exe = e.exe.verrouiller();
+    exe.1
+}
+
+/// Une copie du chemin de son exécutable (vide sans mémoire) ; None pour
+/// un zombie.
+pub fn chemin_exe(pid: u32) -> Option<Vec<u8>> {
+    let e = entree(pid).filter(|e| !e.est_zombie())?;
     let exe = e.exe.verrouiller();
     let mut v = Vec::new();
-    if v.try_reserve_exact(exe.len()).is_ok() {
-        v.extend_from_slice(&exe);
+    if v.try_reserve_exact(exe.0.len()).is_ok() {
+        v.extend_from_slice(&exe.0);
     }
     Some(v)
 }
@@ -471,6 +483,21 @@ pub fn avec_pid<R>(pid: u32, f: impl FnOnce(&mut Processus) -> R) -> Option<R> {
     let e = TABLE.verrouiller().iter().find(|e| e.pid == pid)?.clone();
     let mut p = e.processus.verrouiller();
     p.as_mut().map(f)
+}
+
+/// Le fichier ouvert du descripteur `fd` du processus `pid` (/proc/<pid>/fd).
+pub fn descripteur(pid: u32, fd: u64) -> Option<crate::descripteurs::Fichier> {
+    avec_pid(pid, |p| p.descripteurs.get(fd).map(|d| d.fichier)).flatten()
+}
+
+/// Le plus petit descripteur ouvert du processus `pid` à partir de `depuis`.
+pub fn descripteur_suivant(pid: u32, depuis: u64) -> Option<u64> {
+    avec_pid(pid, |p| p.descripteurs.ouverts(depuis, u64::MAX).next()).flatten()
+}
+
+/// Le nombre de descripteurs ouverts du processus `pid`.
+pub fn nombre_de_descripteurs(pid: u32) -> u64 {
+    avec_pid(pid, |p| p.descripteurs.ouverts(0, u64::MAX).count() as u64).unwrap_or(0)
 }
 
 /// Appelle `f` sur le numéro de chaque processus de la table.

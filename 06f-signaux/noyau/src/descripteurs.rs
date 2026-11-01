@@ -259,6 +259,11 @@ impl Ouverts {
         self.cases[f.0 as usize].as_mut().expect("fichier ouvert disparu")
     }
 
+    /// Le fichier ouvert `f`, s'il l'est encore, à lire.
+    pub fn voir(&self, f: Fichier) -> Option<&FichierOuvert> {
+        self.cases.get(f.0 as usize).and_then(Option::as_ref)
+    }
+
     /// Le fichier ouvert `f`, s'il l'est encore.
     pub fn peut_etre(&mut self, f: Fichier) -> Option<&mut FichierOuvert> {
         self.cases.get_mut(f.0 as usize).and_then(Option::as_mut)

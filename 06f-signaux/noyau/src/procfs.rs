@@ -15,27 +15,32 @@
 //! table des processus et de leurs fils :
 //!   - /proc/<pid>/ pour chaque processus vivant ou zombie (jusqu'à ce
 //!     qu'il soit recueilli), à lui (son utilisateur), immuable : `maps`,
-//!     `statm`, `comm` (le nom de son fil principal), le lien `exe` vers le
-//!     chemin canonique de son exécutable, et `task/<tid>/comm` pour chacun
-//!     de ses fils (celui du fil principal reste jusqu'au processus, comme
-//!     Linux garde sa tâche) ;
+//!     `statm`, `comm` (le nom de son fil principal), le lien `exe` vers son
+//!     exécutable, `task/<tid>/comm` pour chacun de ses fils (celui du fil
+//!     principal reste jusqu'au processus, comme Linux garde sa tâche), et
+//!     `fd/<n>` pour chacun de ses descripteurs ;
 //!   - /proc/<tid> d'un fil qui n'est pas le principal : résolu, sans être
 //!     listé, comme Linux (mesuré) ; son `comm` est celui du fil, sa mémoire
 //!     celle de son processus.
+//! `exe` et les liens de fd/ sont des LIENS MAGIQUES, comme chez Linux :
+//! les suivre mène droit au fichier (l'exécutable, le fichier ouvert),
+//! même effacé ou sans nom ; leur texte n'est que son chemin, pour
+//! readlink.
 //! Le numéro d'inode d'une entrée fabriquée dit ce qu'elle est : son genre
-//! (8 bits), le numéro du processus ou du fil (32), et un fil (24 : un
-//! numéro de Linux tient en 22, pid_max ; les nôtres ne sont jamais
-//! repris, et un fil créé après 2^24 tâches ne se verrait pas dans task/,
-//! une borne à nous, hors d'atteinte aujourd'hui) ; celles
+//! (8 bits), le numéro du processus ou du fil (32), et un fil ou un
+//! descripteur (24 : un numéro de Linux tient en 22, pid_max ; les nôtres
+//! ne sont jamais repris, et un fil créé après 2^24 tâches ne se verrait
+//! pas dans task/, une borne à nous, hors d'atteinte aujourd'hui) ; celles
 //! de la partie fixe ont un numéro de moins de 32 bits. Un numéro gardé (un
 //! dossier courant, un descripteur ouvert) dont le processus est parti :
 //! l'entrée garde son mode et ses liens, et passe à root (`pid_getattr`) ;
 //! ENOENT pour y chercher ou la lister, ESRCH pour lire un fichier ouvert
 //! (Linux rend ESRCH pour y chercher aussi, par la permission de
 //! traverser, `proc_pid_permission` : un écart, que nos systèmes montés ne
-//! savent pas dire). Un zombie (Linux : sans mémoire) : ce qui n'est pas
-//! un dossier 0555 de son /proc passe à root (`task_dump_owner`). Option
-//! écartée, celle de 6b à 6e :
+//! savent pas dire). Un zombie (Linux : sans mémoire) n'a plus d'`exe`,
+//! et ce qui n'est pas un dossier 0555 de son /proc passe à root
+//! (`task_dump_owner`) : fd/ ne se lit plus. Option écartée, celle de 6b
+//! à 6e :
 //! des entrées gardées, ajoutées au lancement et à chaque fil, retirées à
 //! la fin ; la table grandissait avec les fils (une réserve de 3 Mio pour
 //! qu'elle ne grandisse pas pendant un programme), et /proc/<pid>/fd
@@ -69,13 +74,13 @@
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 
-use crate::descripteurs::{Donnees, Fichier, Lecture};
+use crate::descripteurs::{Donnees, Fichier, FichierOuvert, Lecture, Ouverts, Sorte};
 use crate::espace_utilisateur::ADRESSE_MIN;
 use crate::{appels_fichiers, processus, sysfs, vfs};
 use fichiers::chemins::Texte;
-use fichiers::montages::{Interne, Monte};
+use fichiers::montages::{Interne, Monte, Objet};
 use fichiers::noyaufs::{Cible, Contenu, Enregistrement, Genre, NoyauFs, Proprietes, refus};
-use fichiers::tmpfs::{Attributs, DT_DIR, DT_LNK, DT_REG};
+use fichiers::tmpfs::{Attributs, DT_DIR, DT_LNK, DT_REG, Tmpfs};
 use fichiers::{Erreur, Identite, S_IFDIR, S_IFLNK, S_IFREG, Temps};
 use zones::{Nature, Zone};
 
@@ -134,11 +139,28 @@ const DOSSIER_TASK: u64 = 6;
 /// task/<tid> (le fil dans les 24 bits bas).
 const FIL: u64 = 7;
 const FIL_COMM: u64 = 8;
+/// fd/, et fd/<n> (le descripteur dans les 24 bits bas : nr_open, 2^20,
+/// y tient).
+const DOSSIER_FD: u64 = 9;
+const LIEN_FD: u64 = 10;
 
 /// Les entrées d'un dossier de processus, dans l'ordre où elles se
 /// listent.
-const ENTREES_DU_PROCESSUS: [(&[u8], u64); 5] =
-    [(b"maps", FICHIER_MAPS), (b"statm", FICHIER_STATM), (b"comm", FICHIER_COMM), (b"exe", LIEN_EXE), (b"task", DOSSIER_TASK)];
+const ENTREES_DU_PROCESSUS: [(&[u8], u64); 6] = [(b"maps", FICHIER_MAPS), (b"statm", FICHIER_STATM), (b"comm", FICHIER_COMM),
+                                                 (b"exe", LIEN_EXE), (b"task", DOSSIER_TASK), (b"fd", DOSSIER_FD)];
+
+/// Les droits d'un lien de fd/ : r-x pour un fichier ouvert en lecture,
+/// -wx en écriture, les deux s'il fait les deux, rien pour un O_PATH (le
+/// `proc_fd_instantiate` de Linux, mesuré : 0500, 0300, 0700, 0). Ni l'un
+/// ni l'autre pour un O_ACCMODE de 3 (OPEN_FMODE de Linux : (3 + 1) & 3,
+/// mesuré : 0), qui nous permet pourtant de lire et d'écrire (un écart
+/// d'appels_fichiers.rs).
+fn droits_du_lien(f: &FichierOuvert) -> u32 {
+    if f.sorte == Sorte::Chemin || f.drapeaux & 3 == 3 {
+        return 0;
+    }
+    (if f.lecture { 0o500 } else { 0 }) | (if f.ecriture { 0o300 } else { 0 })
+}
 
 /// Le numéro de l'entrée de genre `genre` pour le processus (ou fil) `n`,
 /// et le fil `fil`.
@@ -182,14 +204,24 @@ fn fil_de(pid: u32, tid: u32) -> bool {
 }
 
 /// La vue de /proc le temps d'un appel, sous le verrou des fichiers : sa
-/// partie fixe, et ce qu'elle fabrique des processus.
+/// partie fixe, et ce qu'elle fabrique des processus ; la table des
+/// fichiers ouverts et le tmpfs, pour fd/ (le chemin d'un fichier ouvert,
+/// s'il est effacé).
 pub struct ProcVue<'a> {
     fixe: &'a NoyauFs,
+    ouverts: &'a Ouverts,
+    fs: &'a Tmpfs,
 }
 
 impl<'a> ProcVue<'a> {
-    pub fn new(fixe: &'a NoyauFs) -> ProcVue<'a> {
-        ProcVue { fixe }
+    pub fn new(fixe: &'a NoyauFs, ouverts: &'a Ouverts, fs: &'a Tmpfs) -> ProcVue<'a> {
+        ProcVue { fixe, ouverts, fs }
+    }
+
+    /// Le fichier ouvert du lien fd/<fd> du processus (ou fil) `n`.
+    fn ouvert(&self, n: u32, fd: u32) -> Option<&'a FichierOuvert> {
+        let pid = processus_de(n)?;
+        self.ouverts.voir(processus::descripteur(pid, fd as u64)?)
     }
 
     /// L'entrée fabriquée `i` existe-t-elle encore (son processus, son fil) ?
@@ -198,6 +230,7 @@ impl<'a> ProcVue<'a> {
         match genre {
             0 => true,
             FIL | FIL_COMM => processus_de(n).is_some_and(|p| fil_de(p, fil)),
+            LIEN_FD => self.ouvert(n, fil).is_some(),
             _ => processus_de(n).is_some(),
         }
     }
@@ -242,8 +275,8 @@ impl Monte for ProcVue<'_> {
 
     /// Celles d'une entrée fabriquée : à l'utilisateur du processus, datées
     /// de son lancement, une taille nulle ; un dossier a deux liens et un
-    /// par sous-dossier (le dossier d'un processus : task ; task : un par
-    /// fil). Le processus parti : le même mode et les mêmes liens, à
+    /// par sous-dossier (le dossier d'un processus : task et fd ; task : un
+    /// par fil). Le processus parti : le même mode et les mêmes liens, à
     /// root, sans date ni taille (`pid_getattr`) ; un zombie : ce qui n'est
     /// pas un dossier 0555 à root (`task_dump_owner`). La racine de /proc
     /// compte aussi un lien par processus (`proc_root_getattr`).
@@ -257,8 +290,21 @@ impl Monte for ProcVue<'_> {
             return a;
         }
         let vu = processus_de(n).and_then(processus::vu_de_proc).filter(|_| self.existe(i));
+        let mut taille = 0;
         let (mode, nlink) = match genre {
-            PROCESSUS => (S_IFDIR | 0o555, 3),
+            PROCESSUS => (S_IFDIR | 0o555, 4),
+            // fd/ : dr-x------, et sa taille est le nombre de descripteurs
+            // (`proc_fd_getattr`, mesuré).
+            DOSSIER_FD => {
+                taille = processus_de(n).map_or(0, processus::nombre_de_descripteurs);
+                (S_IFDIR | 0o500, 2)
+            }
+            // Un lien de fd/ : ses droits disent le mode d'ouverture, sa
+            // taille est 64 (mesuré).
+            LIEN_FD => {
+                taille = 64;
+                (S_IFLNK | self.ouvert(n, decoder(i).2).map_or(0, droits_du_lien), 1)
+            }
             FICHIER_MAPS | FICHIER_STATM => (S_IFREG | 0o444, 1),
             FICHIER_COMM | FIL_COMM => (S_IFREG | 0o644, 1),
             LIEN_EXE => (S_IFLNK | 0o777, 1),
@@ -277,7 +323,8 @@ impl Monte for ProcVue<'_> {
             Some((identite, lance, _)) => (identite.uid, identite.gid, lance),
             None => (0, 0, Temps::default()),
         };
-        Attributs { numero: i, mode, nlink, uid, gid, rdev: (0, 0), taille: 0, blocs: 0, atime: date, mtime: date, ctime: date }
+        let taille = if vu.is_some() { taille } else { 0 };
+        Attributs { numero: i, mode, nlink, uid, gid, rdev: (0, 0), taille, blocs: 0, atime: date, mtime: date, ctime: date }
     }
 
     fn chercher(&self, dossier: u64, nom: &[u8]) -> Option<u64> {
@@ -303,6 +350,10 @@ impl Monte for ProcVue<'_> {
                 (tid < 1 << 24 && fil_de(p, tid)).then(|| numero(FIL, n, tid))
             }
             FIL if nom == b"comm" => Some(numero(FIL_COMM, n, fil)),
+            DOSSIER_FD => {
+                let fd = nombre(nom)?;
+                (fd < 1 << 24 && self.ouvert(n, fd).is_some()).then(|| numero(LIEN_FD, n, fd))
+            }
             _ => None,
         }
     }
@@ -314,6 +365,7 @@ impl Monte for ProcVue<'_> {
             PROCESSUS => self.fixe.racine(),
             FIL => numero(DOSSIER_TASK, n, 0),
             FIL_COMM => numero(FIL, n, fil),
+            LIEN_FD => numero(DOSSIER_FD, n, 0),
             _ => numero(PROCESSUS, n, 0),
         }
     }
@@ -323,26 +375,75 @@ impl Monte for ProcVue<'_> {
         match genre {
             0 => self.fixe.nom(i),
             PROCESSUS => Texte::nombre(n as u64),
-            FIL => Texte::nombre(fil as u64),
+            FIL | LIEN_FD => Texte::nombre(fil as u64),
             FIL_COMM => Texte::Emprunte(b"comm"),
             g => Texte::Emprunte(ENTREES_DU_PROCESSUS.iter().find(|&&(_, x)| x == g).map_or(&b""[..], |&(e, _)| e)),
         }
     }
 
+    /// Le texte d'`exe` et d'un lien de fd/ : le chemin du fichier, suivi
+    /// de « (deleted) » s'il n'a plus de nom (le `d_path` de Linux) ; un
+    /// fichier sans nom dit ce qu'il est (anon_inode:[eventfd],
+    /// pipe:[123]). Le chemin d'un fichier ouvert est celui de son
+    /// ouverture, et « (deleted) » se décide par son nombre de liens :
+    /// Linux tient le nom qui l'a ouvert (son dentry), et montre le nouveau
+    /// nom d'un fichier renommé, et « (deleted) » pour un nom effacé dont
+    /// un autre lien physique garde l'inode ; il faudrait au tmpfs ce
+    /// dentry (voir FichierOuvert::chemin, le même écart). Un zombie n'a
+    /// plus d'`exe`, un descripteur fermé plus de lien, et sans mémoire :
+    /// vide (readlink rend ENOENT).
     fn cible<'b>(&'b self, lien: u64, lecteur: &'b [u8], fil: &'b [u8]) -> Texte<'b> {
-        match decoder(lien) {
-            (0, _, _) => self.fixe.cible(lien, lecteur, fil),
-            (LIEN_EXE, n, _) => match processus_de(n).and_then(processus::exe) {
-                Some(exe) => Texte::Long(exe),
-                None => Texte::Emprunte(&[]),
+        let (chemin, inode) = match decoder(lien) {
+            (0, _, _) => return self.fixe.cible(lien, lecteur, fil),
+            (LIEN_EXE, n, _) => match processus_de(n).and_then(|p| Some((processus::chemin_exe(p)?, processus::exe(p)?))) {
+                Some((chemin, inode)) => (Texte::Long(chemin), Some(inode)),
+                None => return Texte::Emprunte(&[]),
             },
-            _ => Texte::Emprunte(&[]),
+            (LIEN_FD, n, fd) => {
+                let Some(f) = self.ouvert(n, fd) else { return Texte::Emprunte(&[]) };
+                let chemin = if f.chemin.is_empty() { f.nom.octets() } else { &f.chemin[..] };
+                (Texte::Emprunte(chemin), f.numero().filter(|_| f.sorte != Sorte::Tube))
+            }
+            _ => return Texte::Emprunte(&[]),
+        };
+        if !inode.is_some_and(|i| self.fs.attributs(i).nlink == 0) {
+            return chemin;
+        }
+        let mut v = Vec::new();
+        if v.try_reserve_exact(chemin.len() + 10).is_err() {
+            return Texte::Emprunte(&[]);
+        }
+        v.extend_from_slice(&chemin);
+        v.extend_from_slice(b" (deleted)");
+        Texte::Long(v)
+    }
+
+    /// `exe` et les liens de fd/ sont des LIENS MAGIQUES : les suivre mène
+    /// droit à l'exécutable ou au fichier ouvert (son objet), même effacé ou
+    /// sans nom, sans lire leur texte (`proc_exe_link`, `proc_fd_link`,
+    /// puis `nd_jump_link`).
+    fn saut(&self, lien: u64) -> Option<Objet> {
+        match decoder(lien) {
+            (LIEN_EXE, n, _) => processus_de(n).and_then(processus::exe).map(Objet::Tmpfs),
+            (LIEN_FD, n, fd) => self.ouvert(n, fd).map(FichierOuvert::objet),
+            _ => None,
+        }
+    }
+
+    /// Ce qu'ouvre un lien magique garde le chemin du fichier qu'il
+    /// désigne : celui de l'exécutable, celui du fichier ouvert (pipe:[123],
+    /// anon_inode:[eventfd] pour un fichier sans nom).
+    fn chemin_du_saut(&self, lien: u64) -> Option<Texte<'_>> {
+        match decoder(lien) {
+            (LIEN_EXE, n, _) => processus_de(n).and_then(processus::chemin_exe).map(Texte::Long),
+            (LIEN_FD, n, fd) => self.ouvert(n, fd).map(|f| Texte::Emprunte(&f.chemin[..])),
+            _ => None,
         }
     }
 
     /// La racine : « . », « .. », les entrées fixes, puis les processus (à
     /// la position PREMIER_PROCESSUS + pid) ; le dossier d'un processus, ses
-    /// cinq entrées ; task/, ses fils (à la position 3 + tid) ; un fil, son
+    /// six entrées ; task/, ses fils (à la position 3 + tid) ; un fil, son
     /// comm. Un dossier dont le processus est parti : ENOENT.
     fn lire_dossier(&self, dossier: u64, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
         -> Result<(), Erreur> {
@@ -371,7 +472,7 @@ impl Monte for ProcVue<'_> {
         if !self.existe(dossier) {
             return Err(Erreur::ENOENT);
         }
-        if !matches!(genre, PROCESSUS | DOSSIER_TASK | FIL) {
+        if !matches!(genre, PROCESSUS | DOSSIER_TASK | FIL | DOSSIER_FD) {
             return Err(Erreur::ENOTDIR);
         }
         if position == 0 && !entree(b".", dossier, DT_DIR, 1) {
@@ -385,7 +486,7 @@ impl Monte for ProcVue<'_> {
                 for (k, &(nom, g)) in ENTREES_DU_PROCESSUS.iter().enumerate().skip((position.max(2) - 2) as usize) {
                     let t = match g {
                         LIEN_EXE => DT_LNK,
-                        DOSSIER_TASK => DT_DIR,
+                        DOSSIER_TASK | DOSSIER_FD => DT_DIR,
                         _ => DT_REG,
                     };
                     if !entree(nom, numero(g, n, 0), t, k as u64 + 3) {
@@ -419,6 +520,21 @@ impl Monte for ProcVue<'_> {
                         break;
                     }
                     depuis = t as u64 + 3;
+                }
+            }
+            // fd/ : ses descripteurs, dans l'ordre (à la position 3 + fd).
+            DOSSIER_FD => {
+                let Some(p) = processus_de(n) else { return Ok(()) };
+                let mut depuis = position.max(2) - 2;
+                while let Some(fd) = processus::descripteur_suivant(p, depuis) {
+                    if fd >= 1 << 24 {
+                        break;
+                    }
+                    let nom = Texte::nombre(fd);
+                    if !entree(&nom, numero(LIEN_FD, n, fd as u32), DT_LNK, fd + 3) {
+                        break;
+                    }
+                    depuis = fd + 1;
                 }
             }
             _ => {
