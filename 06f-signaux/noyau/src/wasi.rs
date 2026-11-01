@@ -558,9 +558,9 @@ impl Wasi {
                     Ok(octets.len())
                 }
                 (Sorte::Dossier, _) => Err(EISDIR),
-                // Un programme WebAssembly n'a ni eventfd ni epoll : ce
-                // descripteur ne peut pas être à lui.
-                (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll, _) => Err(EBADF),
+                // Un programme WebAssembly n'a ni eventfd, ni epoll, ni
+                // tube : ce descripteur ne peut pas être à lui.
+                (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll | Sorte::Tube, _) => Err(EBADF),
                 // Un fichier de /proc ou de /sys : son contenu fabriqué à la
                 // lecture, comme pour un programme Linux (seule une mémoire
                 // qui manque peut échouer) ; il ne s'écrit pas.

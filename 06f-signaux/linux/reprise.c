@@ -70,6 +70,7 @@ static void dormir_ms(int ms)
  * tard, ce qui finit l'attente. */
 static pid_t cible;
 static int efd;
+static int tube[2];
 static uint32_t mot;
 static int fin;
 static volatile int dans_l_appel;
@@ -92,6 +93,8 @@ static void *aide(void *rien)
         mot = 1;
         syscall(SYS_futex, &mot, FUTEX_WAKE, 1, NULL, NULL, 0);
     }
+    if (fin == 3 && write(tube[1], "x", 1) != 1)
+        printf("[linux] reprise : ecriture du tube : ECHEC\n");
     return NULL;
 }
 
@@ -103,6 +106,8 @@ static long essayer(int sa_restart, int quoi_finit, long (*appel)(void))
     fin = quoi_finit;
     mot = 0;
     efd = eventfd(0, 0);
+    if (pipe(tube) != 0)
+        printf("[linux] reprise : pipe : ECHEC\n");
     cible = (pid_t)syscall(SYS_gettid);
     dans_l_appel = 0;
     pthread_t t;
@@ -114,6 +119,8 @@ static long essayer(int sa_restart, int quoi_finit, long (*appel)(void))
         r = -errno;
     pthread_join(t, NULL);
     close(efd);
+    close(tube[0]);
+    close(tube[1]);
     return r;
 }
 
@@ -121,6 +128,12 @@ static long lire_eventfd(void)
 {
     uint64_t v;
     return read(efd, &v, 8);
+}
+
+static long lire_tube(void)
+{
+    char c;
+    return read(tube[0], &c, 1);
 }
 
 static long futex_sans_delai(void)
@@ -484,6 +497,7 @@ int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
     deux("read d'un eventfd", 1, lire_eventfd, 8, -EINTR);
+    deux("read d'un tube", 3, lire_tube, 1, -EINTR);
     deux("futex WAIT sans delai", 2, futex_sans_delai, 0, -EINTR);
     deux("futex WAIT a delai", 0, futex_delai, -EINTR, -EINTR);
     deux("futex WAIT_BITSET absolu", 0, futex_absolu, -EINTR, -EINTR);

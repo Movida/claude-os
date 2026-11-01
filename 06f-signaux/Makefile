@@ -160,8 +160,11 @@ boot.bin: programmes.cpio FORCE
 #     comme le fait JavaScriptCore (sigsuspend dans le gestionnaire) ; sur
 #     l'hôte aussi ;
 #   - attente : gcc -static, attendre plusieurs fichiers à la fois (poll,
-#     ppoll, select, pselect6 : le sondage de chaque sorte, les délais, les
-#     masques, les réveils par un autre fil) ; sur l'hôte aussi ;
+#     ppoll, select, pselect6, epoll : le sondage de chaque sorte, les
+#     délais, les masques, les réveils par un autre fil) ; sur l'hôte aussi ;
+#   - tubes : gcc -static, les tubes (pipe2, les pages et la fusion, la
+#     capacité, la fin, SIGPIPE, les paquets, 10 Mo entre deux fils) ; sur
+#     l'hôte aussi ; `tubes sigpipe` meurt de SIGPIPE (code 141) ;
 #   - systeme : gcc -static, les petits appels de claude (uname,
 #     sched_getaffinity, futex, prctl) ; sur l'hôte aussi ;
 #   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi ;
@@ -268,6 +271,10 @@ $(LINUX)/suspendre: linux/suspendre.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/attente: linux/attente.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/tubes: linux/tubes.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -659,7 +666,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses FORCE
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
@@ -770,7 +777,7 @@ SHELL = /bin/bash
 .DELETE_ON_ERROR:
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
-            $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
+            $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
             $(LINUX)/fils $(LINUX)/courses
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -792,6 +799,8 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	timeout 60 ./$(LINUX)/reprise | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/suspendre | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/attente | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	timeout 60 ./$(LINUX)/tubes | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	timeout 10 ./$(LINUX)/tubes sigpipe; test $$? = 141
 	./$(LINUX)/systeme | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/evenements | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/proc | tee /dev/stderr | (! grep -q ECHEC)

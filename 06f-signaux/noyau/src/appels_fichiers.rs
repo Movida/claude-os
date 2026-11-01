@@ -87,6 +87,7 @@ const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_NONBLOCK: u64 = 0o4000;
 const O_LARGEFILE: u64 = 0o100000;
+const O_DIRECT: u64 = 0o40000;
 const O_DIRECTORY: u64 = 0o200000;
 const O_NOFOLLOW: u64 = 0o400000;
 const O_CLOEXEC: u64 = 0o2000000;
@@ -195,6 +196,14 @@ impl FichierTenu {
         match &self.prive {
             Prive::EventFd(e) => e,
             _ => unreachable!("un eventfd sans compteur"),
+        }
+    }
+
+    /// Le tube d'un bout de tube.
+    pub fn tube(&self) -> &crate::tube::Tube {
+        match &self.prive {
+            Prive::Tube(t) => t,
+            _ => unreachable!("un tube sans objet"),
         }
     }
 
@@ -746,6 +755,54 @@ pub fn installer_fichier(f: FichierOuvert, fermer_a_l_exec: bool) -> i64 {
     installer_fichier_puis(f, fermer_a_l_exec, |_| {})
 }
 
+/// Range deux fichiers ouverts neufs (les deux bouts d'un tube) aux deux plus
+/// petits numéros libres, avec FD_CLOEXEC si demandé, comme `do_pipe2` : les
+/// deux numéros réservés (EMFILE), les fichiers rangés (ENOMEM), puis
+/// `ecrire` reçoit les numéros pour les donner au programme ; s'il échoue
+/// (EFAULT), rien ne reste. Rend 0.
+pub fn installer_paire(a: FichierOuvert, b: FichierOuvert, fermer_a_l_exec: bool, ecrire: impl FnOnce([u64; 2]) -> bool) -> i64 {
+    let fermer = |f: FichierOuvert| vfs::avec_systeme(|s, cadres| {
+        if let Tenu::Tmpfs(o) = f.tenu {
+            s.fs.fermer(&o, cadres);
+        }
+        crate::tube::fichier_ferme(&f);
+    });
+    let (fa, fb) = match (reserver(), reserver()) {
+        (Ok(x), Ok(y)) => (x, y),
+        (Err(e), _) | (_, Err(e)) => {
+            fermer(a);
+            fermer(b);
+            return e;
+        }
+    };
+    let x = match vfs::avec_systeme(|s, _| s.ouverts.ajouter(a)) {
+        Ok(x) => x,
+        Err(a) => {
+            fermer(a);
+            fermer(b);
+            return -ENOMEM;
+        }
+    };
+    let y = match vfs::avec_systeme(|s, _| s.ouverts.ajouter(b)) {
+        Ok(y) => y,
+        Err(b) => {
+            fermer(b);
+            vfs::avec_systeme(|s, cadres| s.lacher(x, cadres));
+            return -ENOMEM;
+        }
+    };
+    if !ecrire([fa.0, fb.0]) {
+        vfs::avec_systeme(|s, cadres| {
+            s.lacher(x, cadres);
+            s.lacher(y, cadres);
+        });
+        return -EFAULT;
+    }
+    fa.installer(x, fermer_a_l_exec);
+    fb.installer(y, fermer_a_l_exec);
+    0
+}
+
 /// installer_fichier, en appelant `range` avec le fichier ouvert dès qu'il
 /// est dans la table, avant que son descripteur n'existe (personne ne peut
 /// encore s'en servir) : un epoll y apprend sa case.
@@ -942,11 +999,11 @@ fn verifier_transfert(tampon: u64, longueur: u64, position: u64) -> Result<u64, 
 /// la position du fichier, `None`, qui avance d'autant : l'appelant tient
 /// son verrou, voir `verrous`).
 fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
-    // Un eventfd ou un epoll n'a pas de position : pread rend ESPIPE avant
-    // tout (FMODE_PREAD n'est pas mis) ; un epoll ne se lit pas (pas
-    // d'opération read : EINVAL, avant de regarder le tampon).
+    // Un eventfd, un epoll ou un tube n'a pas de position : pread rend
+    // ESPIPE avant tout (FMODE_PREAD n'est pas mis) ; un epoll ne se lit
+    // pas (pas d'opération read : EINVAL, avant de regarder le tampon).
     match o.sorte {
-        Sorte::EventFd | Sorte::Epoll if position.is_some() => return Err(-ESPIPE),
+        Sorte::EventFd | Sorte::Epoll | Sorte::Tube if position.is_some() => return Err(-ESPIPE),
         Sorte::Epoll => return Err(-EINVAL),
         _ => {}
     }
@@ -971,6 +1028,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         Sorte::Aleatoire { .. } => produire(tampon, longueur, aleatoire::remplir),
         Sorte::Chemin => Err(-EBADF),
         Sorte::EventFd => evenements::lire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::Tube => en_resultat(o.tube().lire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0)),
         Sorte::Epoll => Err(-EINVAL),
         Sorte::Noyau { .. } => {
             let contenu = procfs::lire(o.fichier(), ici, longueur)?;
@@ -1007,7 +1065,7 @@ pub fn verrou_d_ecriture(n: Numero) -> GardeMutex<'static, ()> {
 fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
     // Comme pour lire : ESPIPE, puis EINVAL pour un epoll.
     match o.sorte {
-        Sorte::EventFd | Sorte::Epoll if position.is_some() => return Err(-ESPIPE),
+        Sorte::EventFd | Sorte::Epoll | Sorte::Tube if position.is_some() => return Err(-ESPIPE),
         Sorte::Epoll => return Err(-EINVAL),
         _ => {}
     }
@@ -1051,6 +1109,8 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
         Sorte::Plein => Err(-ENOSPC),
         Sorte::Dossier | Sorte::Chemin => Err(-EBADF),
         Sorte::EventFd => evenements::ecrire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::Tube => en_resultat(o.tube().ecrire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0,
+                                               o.drapeaux as u64 & O_DIRECT != 0)),
         Sorte::Epoll => Err(-EINVAL),
         // Un fichier du noyau qui s'écrit (procfs::ecrivable : comm) :
         // seuls ses 15 premiers octets comptent, copiés d'abord, sans rien
@@ -1065,6 +1125,11 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
             procfs::ecrire(source, argument, &copie[..n], longueur)
         }
     }
+}
+
+/// Un résultat d'appel (négatif : une erreur) en Result.
+fn en_resultat(r: i64) -> Result<u64, i64> {
+    if r < 0 { Err(r) } else { Ok(r as u64) }
 }
 
 fn resultat(r: Result<u64, i64>) -> i64 {
@@ -1168,6 +1233,17 @@ fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
         Ok(m) => m,
         Err(e) => return e,
     };
+    // Un tube se lit et s'écrit d'un coup, sur tous les morceaux (le
+    // `read_iter` et le `write_iter` de Linux : un writev de PIPE_BUF octets
+    // en plusieurs morceaux reste atomique).
+    if o.sorte == Sorte::Tube {
+        let non_bloquant = o.drapeaux as u64 & O_NONBLOCK != 0;
+        return if ecrire {
+            o.tube().ecrire(&morceaux, non_bloquant, o.drapeaux as u64 & O_DIRECT != 0)
+        } else {
+            o.tube().lire(&morceaux, non_bloquant)
+        };
+    }
     // Un eventfd se lit d'un coup, sur tous les morceaux (evenements.rs).
     if !ecrire && o.sorte == Sorte::EventFd {
         return match evenements::lire_morceaux(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux) {
@@ -1235,7 +1311,7 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
     let position = o.position();
     let nouvelle = match (o.sorte, depuis) {
         (Sorte::Chemin, _) => return -EBADF,
-        (Sorte::Console, _) => return -ESPIPE,
+        (Sorte::Console | Sorte::Tube, _) => return -ESPIPE,
         (Sorte::Null | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. }, _) => return 0,
         // Ni position ni taille : `noop_llseek`, qui rend la position, nulle.
         (Sorte::EventFd | Sorte::Epoll, _) => return position as i64,
@@ -1551,6 +1627,8 @@ pub fn dup2(ancien: u64, nouveau: u64) -> i64 {
 ///     de fichiers (`verrou_posix`). Ils ne sont pas encore tenus : poser
 ///     réussit toujours, et F_GETLK répond « rien ne bloque » (l_type =
 ///     F_UNLCK), une fois la demande vérifiée ;
+///   - F_GETPIPE_SZ, F_SETPIPE_SZ : la capacité d'un tube (tube.rs) ; d'un
+///     autre fichier : EBADF (mesuré) ;
 ///   - le reste : EINVAL.
 /// Sur un descripteur O_PATH, seules F_DUPFD*, F_GETFD, F_SETFD et F_GETFL
 /// sont permises (EBADF sinon).
@@ -1567,6 +1645,8 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
     const F_OFD_SETLK: u64 = 37;
     const F_OFD_SETLKW: u64 = 38;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const F_SETPIPE_SZ: u64 = 1031;
+    const F_GETPIPE_SZ: u64 = 1032;
     const FD_CLOEXEC: u64 = 1;
     const CHANGEABLES: u64 = O_APPEND | O_NONBLOCK | 0o20000 | 0o40000 | 0o1000000;
     let d = match tenir(fd) {
@@ -1601,6 +1681,10 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
             verrou_posix(fd, argument, false, matches!(commande, F_OFD_SETLK | F_OFD_SETLKW))
         }
         F_GETLK | F_OFD_GETLK => verrou_posix(fd, argument, true, commande == F_OFD_GETLK),
+        // La capacité d'un tube (`pipe_fcntl`) ; un autre fichier : EBADF.
+        F_SETPIPE_SZ | F_GETPIPE_SZ if d.sorte != Sorte::Tube => -EBADF,
+        F_GETPIPE_SZ => d.tube().capacite(),
+        F_SETPIPE_SZ => d.tube().changer_capacite(argument, processus::avec(|p| p.identite.root())),
         _ => -EINVAL,
     }
 }
@@ -1754,6 +1838,11 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
                 Err(_) => -EFAULT,
             }
         }
+        // Les octets présents dans un tube (`pipe_ioctl`).
+        FIONREAD if o.sorte == Sorte::Tube => match copier_vers_utilisateur(argument, &o.tube().octets_presents().to_le_bytes()) {
+            Ok(()) => 0,
+            Err(_) => -EFAULT,
+        },
         _ if o.sorte == Sorte::Epoll => -EINVAL,
         _ if matches!(o.sorte, Sorte::Aleatoire { .. }) => ioctl_aleatoire(requete as u32 as u64, argument),
         _ => -ENOTTY,

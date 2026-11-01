@@ -148,6 +148,8 @@ const EPOLL_WAIT: u64 = 232;
 const EPOLL_CTL: u64 = 233;
 const EPOLL_PWAIT: u64 = 281;
 const EVENTFD: u64 = 284;
+const PIPE: u64 = 22;
+const PIPE2: u64 = 293;
 const EVENTFD2: u64 = 290;
 const EPOLL_CREATE1: u64 = 291;
 const EPOLL_PWAIT2: u64 = 441;
@@ -252,6 +254,8 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         PRLIMIT64 => prlimit64(a[0], a[1], a[2], a[3]),
         FUTEX => futex::futex(a[0], a[1], a[2], a[3], a[4], a[5]),
         EVENTFD => evenements::eventfd(a[0]),
+        PIPE => crate::tube::pipe(a[0]),
+        PIPE2 => crate::tube::pipe2(a[0], a[1]),
         EVENTFD2 => evenements::eventfd2(a[0], a[1]),
         EPOLL_CREATE => crate::epoll::epoll_create(a[0]),
         EPOLL_CREATE1 => crate::epoll::epoll_create1(a[0]),
@@ -410,6 +414,8 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         PRLIMIT64 => ("prlimit64", 4),
         FUTEX => ("futex", 6),
         EVENTFD => ("eventfd", 1),
+        PIPE => ("pipe", 1),
+        PIPE2 => ("pipe2", 2),
         EVENTFD2 => ("eventfd2", 2),
         EPOLL_CREATE => ("epoll_create", 1),
         EPOLL_CREATE1 => ("epoll_create1", 1),

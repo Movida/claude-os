@@ -16,7 +16,9 @@
 //!     à la création du fil, retiré à sa fin ; celui du fil principal reste
 //!     jusqu'au processus, comme Linux garde sa tâche) ; à lui (son
 //!     utilisateur), comme sous Linux ;
-//!   - /proc/sys/vm/overcommit_memory et mmap_min_addr, à root.
+//!   - /proc/sys/vm/overcommit_memory et mmap_min_addr, à root ;
+//!   - /proc/sys/fs/pipe-max-size, pipe-user-pages-soft et -hard (6f), à
+//!     root.
 //! Le reste viendra avec son besoin : /proc/<pid>/fd (6f), /proc/meminfo si
 //! une mesure le demande. Les dossiers des processus et des fils sont des
 //! entrées gardées, ajoutées et retirées ; Linux les fabrique à la demande,
@@ -63,6 +65,11 @@ const MMAP_MIN_ADDR: u32 = 4;
 /// Le nom d'un fil (/proc/<pid>/comm, task/<tid>/comm : l'argument est le
 /// numéro du fil, celui du processus pour son fil principal).
 const COMM: u32 = 5;
+/// /proc/sys/fs/pipe-max-size, pipe-user-pages-soft, pipe-user-pages-hard
+/// (tube.rs).
+const PIPE_MAX_SIZE: u32 = 6;
+const PIPE_USER_PAGES_SOFT: u32 = 7;
+const PIPE_USER_PAGES_HARD: u32 = 8;
 
 /// Le périphérique de procfs (un numéro anonyme, après celui du tmpfs de la
 /// racine, 0:20).
@@ -91,6 +98,10 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     let reglage = |source| Contenu::Fichier { source, argument: 0 };
     p.ajouter(vm, b"overcommit_memory", 0o644, (0, 0), reglage(OVERCOMMIT_MEMORY), false, maintenant)?;
     p.ajouter(vm, b"mmap_min_addr", 0o644, (0, 0), reglage(MMAP_MIN_ADDR), false, maintenant)?;
+    let fs = p.ajouter(sys, b"fs", 0o555, (0, 0), Contenu::Dossier, false, maintenant)?;
+    p.ajouter(fs, b"pipe-max-size", 0o644, (0, 0), reglage(PIPE_MAX_SIZE), false, maintenant)?;
+    p.ajouter(fs, b"pipe-user-pages-hard", 0o644, (0, 0), reglage(PIPE_USER_PAGES_HARD), false, maintenant)?;
+    p.ajouter(fs, b"pipe-user-pages-soft", 0o644, (0, 0), reglage(PIPE_USER_PAGES_SOFT), false, maintenant)?;
     Ok(p)
 }
 
@@ -186,7 +197,7 @@ pub fn retirer_processus(pid: u32) {
 /// séquences et les valeurs de /proc, les attributs de /sys.
 pub fn lecture(source: u32) -> Lecture {
     match source {
-        OVERCOMMIT_MEMORY | MMAP_MIN_ADDR => Lecture::Valeur,
+        OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD => Lecture::Valeur,
         MAPS | STATM | COMM => Lecture::Sequence,
         _ => Lecture::Attribut,
     }
@@ -301,6 +312,9 @@ fn valeur(source: u32) -> Result<Vec<u8>, Erreur> {
     let r = match source {
         // OVERCOMMIT_GUESS : la politique de 6a (memoire.rs).
         OVERCOMMIT_MEMORY => writeln!(t, "0"),
+        PIPE_MAX_SIZE => writeln!(t, "{}", crate::tube::TAILLE_MAX),
+        PIPE_USER_PAGES_SOFT => writeln!(t, "{}", crate::tube::PAGES_UTILISATEUR_DOUCE),
+        PIPE_USER_PAGES_HARD => writeln!(t, "{}", crate::tube::PAGES_UTILISATEUR_DURE),
         // La plus petite adresse qu'un programme peut projeter.
         _ => writeln!(t, "{}", ADRESSE_MIN),
     };

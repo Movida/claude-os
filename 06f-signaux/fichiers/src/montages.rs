@@ -71,6 +71,10 @@ pub const ANONYME: Attributs = Attributs {
 
 /// Le périphérique de l'anon_inodefs (mesuré : 0:16) et sa taille de bloc.
 pub const ANONYME_PERIPHERIQUE: ((u32, u32), u64) = ((0, 16), 4096);
+/// Le périphérique et la taille de bloc de pipefs, où vivent les inodes des
+/// tubes chez Linux (mesuré : 0:15, 4096), et chez nous dans le tmpfs
+/// (`Tmpfs::creer_tube`).
+pub const TUBES_PERIPHERIQUE: ((u32, u32), u64) = ((0, 15), 4096);
 
 impl Objet {
     /// L'inode du tmpfs, si c'en est un.
@@ -223,6 +227,7 @@ impl<'a, M: Monte> Vue<'a, M> {
     /// (None pour le tmpfs, que le noyau connaît).
     pub fn peripherique(&self, o: Objet) -> Option<((u32, u32), u64)> {
         match o {
+            Objet::Tmpfs(n) if self.fs.est_tube(n) => Some(TUBES_PERIPHERIQUE),
             Objet::Tmpfs(_) => None,
             Objet::Monte(s, _) => Some((self.monte(s).peripherique(), self.monte(s).taille_de_bloc())),
             Objet::Anonyme => Some(ANONYME_PERIPHERIQUE),

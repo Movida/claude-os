@@ -244,6 +244,11 @@ enum Contenu {
     Lien(Vec<u8>),
     /// Un périphérique : le noyau sait ce qu'il fait.
     Rien,
+    /// L'inode d'un tube (6f), sans nom : il est celui de pipefs chez Linux,
+    /// un système que personne ne monte. Le noyau garde ses données ; ici,
+    /// ses attributs (fchmod, fchown, futimens marchent sur un tube,
+    /// mesuré), et il vit tant que ses bouts sont ouverts.
+    Tube,
 }
 
 struct Inode {
@@ -453,7 +458,10 @@ impl Tmpfs {
         Attributs {
             numero: n,
             mode: i.mode,
-            nlink: i.nlink,
+            // Un inode de pipefs a un lien, comme tout inode d'un système
+            // sans dossiers (`new_inode_pseudo` ; mesuré : 1). Il n'a pas de
+            // nom pour autant : il disparaît avec sa dernière référence.
+            nlink: if matches!(i.contenu, Contenu::Tube) { 1 } else { i.nlink },
             uid: i.uid,
             gid: i.gid,
             rdev: i.rdev,
@@ -463,6 +471,18 @@ impl Tmpfs {
             mtime: i.mtime,
             ctime: i.ctime,
         }
+    }
+
+    /// Un inode neuf pour un tube (`get_pipe_inode`) : S_IFIFO, 0600, à
+    /// `qui`, sans nom ni référence ; l'appelant le tient aussitôt
+    /// (`prendre`, une fois par bout). ENOSPC au-delà du nombre d'inodes.
+    pub fn creer_tube(&mut self, qui: Identite, maintenant: Temps) -> Result<Numero, Erreur> {
+        self.nouvel_inode(qui, crate::S_IFIFO | 0o600, Contenu::Tube, maintenant)
+    }
+
+    /// L'inode est-il celui d'un tube ?
+    pub fn est_tube(&self, n: Numero) -> bool {
+        matches!(self.inode(n).contenu, Contenu::Tube)
     }
 
     /// Le mode de l'inode (type et droits).
@@ -1708,6 +1728,30 @@ mod tests {
         let court = t.symlink(&[b'x'; 128], b"/tmp/court").unwrap();
         let long = t.symlink(&[b'x'; 129], b"/tmp/long").unwrap();
         assert_eq!((t.fs.attributs(court).blocs, t.fs.attributs(long).blocs), (0, 8));
+        t.verifier();
+    }
+
+    #[test]
+    fn tube() {
+        // L'inode d'un tube : sans nom, S_IFIFO 0600 à son créateur, un lien
+        // vu de stat ; ses attributs changent comme ceux d'un fichier ; il
+        // disparaît avec sa dernière référence (ses deux bouts fermés).
+        let mut t = T::new();
+        let n = t.fs.creer_tube(DAVID, T0).unwrap();
+        t.fs.prendre(n);
+        t.fs.prendre(n);
+        let a = t.fs.attributs(n);
+        assert!(t.fs.est_tube(n) && !t.fs.est_tube(t.fs.racine()));
+        assert_eq!((a.mode, a.nlink, a.uid, a.gid, a.taille, a.blocs), (crate::S_IFIFO | 0o600, 1, 1000, 1000, 0, 0));
+        t.fs.changer_mode(DAVID, n, 0o644, T0).unwrap();
+        assert_eq!(t.fs.attributs(n).mode, crate::S_IFIFO | 0o644);
+        assert_eq!(t.fs.changer_mode(AUTRE, n, 0o600, T0), Err(EPERM));
+        assert_eq!(t.fs.verifier_tronquer(DAVID, n), Err(EINVAL));
+        let mut h = Hote::default();
+        t.fs.lacher(n, &mut h);
+        assert!(t.fs.existe(n));
+        t.fs.lacher(n, &mut h);
+        assert!(!t.fs.existe(n));
         t.verifier();
     }
 

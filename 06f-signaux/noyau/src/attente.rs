@@ -40,7 +40,7 @@
 //! (WQ_FLAG_EXCLUSIVE) : `reveiller(cle, n)`
 //! réveille toutes les entrées ordinaires, mais s'arrête dès que `n`
 //! exclusives ont réveillé quelqu'un (le `__wake_up_common` de Linux). Pour
-//! un verrou qui dort, ou bientôt les lecteurs d'un tube, réveiller tous
+//! un verrou qui dort, ou les lecteurs d'un tube, réveiller tous
 //! ceux qui attendent quand un seul pourra passer serait les faire courir
 //! pour rien (le « troupeau tonitruant »). Les ordinaires sont rangées en
 //! tête, les exclusives en queue (dans l'ordre d'arrivée), comme chez
@@ -629,6 +629,13 @@ impl<T> Mutex<T> {
         }
         e.pris = true;
         Some(GardeMutex { mutex: self })
+    }
+
+    /// La donnée, sans prendre le verrou, quand on la tient seul (`&mut
+    /// self` : personne d'autre ne peut la prendre ; le `get_mut` de Rust) :
+    /// dans un `Drop`, sous un Verrou.
+    pub fn seul(&mut self) -> &mut T {
+        self.donnee.get_mut()
     }
 }
 

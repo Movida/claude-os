@@ -1035,6 +1035,14 @@ fn info_de_soi(sig: u64, code: i32) -> Info {
     Info::par(sig, code, pid, uid)
 }
 
+/// `sig` au fil courant, de lui-même (le `send_sig(sig, current, 0)` de
+/// Linux : SI_USER, son pid et son uid) : SIGPIPE pour qui écrit dans un
+/// tube sans lecteur. Ignoré, il est perdu.
+pub fn au_fil_courant(sig: u64) {
+    let tid = tache::courante().tid();
+    au_fil(None, tid as i32, sig, info_de_soi(sig, SI_USER));
+}
+
 /// kill(pid, signal), comme `kill_something_info` : pid > 0, un processus,
 /// ou le processus du fil de ce numéro (ESRCH si aucun n'existe) ; 0, notre groupe de processus ; -1, tous les
 /// processus sauf l'init et soi-même (0 si au moins un l'a reçu, ESRCH

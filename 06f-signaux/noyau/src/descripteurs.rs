@@ -26,7 +26,7 @@
 //!   - des `Rc` pour les fichiers ouverts : leur allocation ne sait pas
 //!     échouer, et une allocation demandée par un programme doit pouvoir
 //!     rendre ENOMEM. Une table à index, avec un compteur explicite.
-//! Les sortes à venir : les tubes (6f), les sockets (6h). Une sorte de
+//! Les sortes à venir : les sockets (6h). Une sorte de
 //! plus, ce sera une ligne de plus dans chaque `match` des appels
 //! (appels_fichiers.rs). Certaines ont des données à elles, de deux
 //! façons : sous le verrou des fichiers (la source d'un fichier de /proc :
@@ -73,6 +73,9 @@ pub enum Sorte {
     /// Une liste de fichiers à surveiller (epoll, 6d) : son objet dans
     /// `Prive::Epoll`.
     Epoll,
+    /// Un bout de tube (6f) : son objet dans `Prive::Tube`, son inode dans
+    /// le tmpfs (sans nom).
+    Tube,
     /// Un fichier d'un système du noyau (/proc, /sys, 6d), dont le contenu
     /// est fabriqué à la lecture (`Donnees::Noyau`), d'une des trois façons
     /// de Linux.
@@ -105,7 +108,7 @@ impl Sorte {
     /// Linux 6.18 : /dev/null, /dev/zero, /dev/full et /dev/urandom refusés,
     /// /dev/random et les terminaux acceptés.
     pub fn sait_attendre(self) -> bool {
-        matches!(self, Sorte::Aleatoire { random: true } | Sorte::Console | Sorte::EventFd | Sorte::Epoll
+        matches!(self, Sorte::Aleatoire { random: true } | Sorte::Console | Sorte::EventFd | Sorte::Epoll | Sorte::Tube
                        | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
     }
 }
@@ -132,6 +135,7 @@ pub enum Prive {
     Aucun,
     EventFd(Arc<crate::evenements::EventFd>),
     Epoll(Arc<crate::epoll::Epoll>),
+    Tube(Arc<crate::tube::Tube>),
 }
 
 /// Ce que tient un fichier ouvert : un inode du tmpfs, avec ce qu'a rendu
@@ -281,6 +285,7 @@ impl Ouverts {
         let mut ferme = self.cases[f.0 as usize].take();
         if let Some(o) = ferme.as_mut() {
             crate::epoll::fichier_ferme(self, o);
+            crate::tube::fichier_ferme(o);
         }
         while self.cases.last().is_some_and(Option::is_none) {
             self.cases.pop();

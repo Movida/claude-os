@@ -68,6 +68,7 @@ mod sse;
 mod tache;
 mod tas;
 mod tsc;
+mod tube;
 mod temps;
 mod verrou;
 mod vfs;
