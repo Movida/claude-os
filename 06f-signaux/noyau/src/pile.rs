@@ -55,6 +55,7 @@ const AT_SECURE: u64 = 23;
 const AT_RANDOM: u64 = 25;
 const AT_HWCAP2: u64 = 26;
 const AT_EXECFN: u64 = 31;
+const AT_MINSIGSTKSZ: u64 = 51;
 
 /// L'identité du programme : l'utilisateur 1000, le premier utilisateur
 /// ordinaire des distributions Linux, plutôt que root (0). Il n'y a qu'un
@@ -182,7 +183,11 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
     // Les tables : argc, argv, envp, auxv, toutes en mots de 8 octets,
     // préparées dans un tableau du noyau puis écrites d'un bloc.
     let p = &*c.programme;
-    let auxv: [(u64, u64); 19] = [
+    let auxv: [(u64, u64); 20] = [
+        // La plus petite pile de secours qui tienne un cadre de signal
+        // (cadre_signal.rs) : la glibc en tire sysconf(_SC_MINSIGSTKSZ) et
+        // _SC_SIGSTKSZ. En tête, comme le ARCH_DLINFO de Linux.
+        (AT_MINSIGSTKSZ, crate::cadre_signal::taille_minimale()),
         (AT_PHDR, p.adresse_entetes.unwrap_or(0)),
         (AT_PHENT, p.taille_entete as u64),
         (AT_PHNUM, p.nombre_entetes as u64),
@@ -208,11 +213,10 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
         (AT_CLKTCK, USER_HZ),
         (AT_PLATFORM, plateforme),
         (AT_EXECFN, execfn),
-        // Linux 6.18 donne en plus AT_SYSINFO_EHDR (l'adresse du vDSO, 6m),
-        // AT_MINSIGSTKSZ (la taille minimale d'une pile de signal, 6f) et
-        // AT_RSEQ_FEATURE_SIZE, AT_RSEQ_ALIGN (rseq, que nous n'avons pas) :
-        // la glibc a un repli pour chacune (vrais appels de clock_gettime,
-        // une taille par défaut, rseq désactivé).
+        // Linux 6.18 donne en plus AT_SYSINFO_EHDR (l'adresse du vDSO, 6m)
+        // et AT_RSEQ_FEATURE_SIZE, AT_RSEQ_ALIGN (rseq, que nous n'avons
+        // pas) : la glibc a un repli pour chacune (vrais appels de
+        // clock_gettime, rseq désactivé).
         (AT_NULL, 0),
     ];
     // Ses octets, dans l'ordre du processeur (petit-boutiste).

@@ -16,12 +16,10 @@
 //! gestionnaire est appliqué : SIG_IGN, l'action par défaut (terminer,
 //! ignorer, arrêter), l'attente d'un signal bloqué, pour les signaux
 //! qu'envoient les programmes (`kill`, `tkill`, `tgkill` : à eux-mêmes, et
-//! depuis 6e à un autre processus ou à un autre fil) et pour SIGXCPU. Appeler
-//! un gestionnaire (le cadre de signal, `rt_sigreturn`, SA_RESTART) vient
-//! en 6f : d'ici là, un signal qui devrait l'appeler arrête le programme,
-//! et le message le dit. Une faute d'un programme qui a un gestionnaire
-//! l'arrête aussi (sous Linux, celui de Bun afficherait son rapport de
-//! plantage).
+//! depuis 6e à un autre processus ou à un autre fil) et pour SIGXCPU. Depuis
+//! 6f, un gestionnaire est appelé : sur un cadre de signal posé sur la pile
+//! du programme, ou sur sa pile de secours, d'où il revient par
+//! `rt_sigreturn` (cadre_signal.rs).
 //!
 //! Comme Linux, les actions sont au processus (la `sighand_struct`, que
 //! partagent ses fils : `Signaux`), le masque et la pile de secours au fil
@@ -273,7 +271,7 @@ pub struct Action {
     pub gestionnaire: u64,
     pub drapeaux: u64,
     /// Où revient un gestionnaire (le `__restore_rt` de la glibc, qui
-    /// appelle rt_sigreturn) : ne servira qu'en 6f.
+    /// appelle rt_sigreturn) : l'adresse de retour de son cadre.
     pub restaurateur: u64,
     /// Les signaux bloqués pendant le gestionnaire.
     pub masque: u64,
@@ -296,21 +294,49 @@ impl Action {
 }
 
 /// La pile de secours (`sigaltstack`) : là où un gestionnaire marqué
-/// SA_ONSTACK s'exécutera (6f), pour qu'un débordement de la pile ordinaire
+/// SA_ONSTACK s'exécute, pour qu'un débordement de la pile ordinaire
 /// puisse encore être signalé. Ses valeurs telles que le programme les a
 /// posées, comme Linux (sas_ss_sp, sas_ss_size, sas_ss_flags).
 #[derive(Clone, Copy, Default)]
-struct PileDeSecours {
-    adresse: u64,
-    taille: u64,
-    drapeaux: u32,
+pub struct PileDeSecours {
+    pub adresse: u64,
+    pub taille: u64,
+    pub drapeaux: u32,
+}
+
+impl PileDeSecours {
+    /// `sp` est-il dessus (`__on_sig_stack` : la pile descend, son sommet en
+    /// fait partie, pas son pied) ?
+    pub fn contient(&self, sp: u64) -> bool {
+        sp > self.adresse && sp - self.adresse <= self.taille
+    }
+
+    /// S'exécute-t-on dessus (`on_sig_stack`) ? Jamais avec SS_AUTODISARM :
+    /// elle est désarmée pendant le gestionnaire, un programme n'y est donc
+    /// pas, sauf à l'avoir posée en étant déjà dessus ; et un RSP abîmé tout
+    /// près de son sommet n'empêche pas de livrer le signal.
+    pub fn dessus(&self, sp: u64) -> bool {
+        self.drapeaux & SS_AUTODISARM == 0 && self.contient(sp)
+    }
+
+    /// Ce que dit `sigaltstack` (`sas_ss_flags`) : SS_DISABLE sans pile,
+    /// SS_ONSTACK dessus, 0 sinon.
+    pub fn etat(&self, sp: u64) -> u32 {
+        if self.taille == 0 {
+            SS_DISABLE
+        } else if self.dessus(sp) {
+            SS_ONSTACK
+        } else {
+            0
+        }
+    }
 }
 
 const SS_ONSTACK: u32 = 1;
 const SS_DISABLE: u32 = 2;
 /// Le seul drapeau à côté du mode : rendre la pile de secours le temps
-/// d'un gestionnaire (6f).
-const SS_AUTODISARM: u32 = 1 << 31;
+/// d'un gestionnaire.
+pub const SS_AUTODISARM: u32 = 1 << 31;
 /// La plus petite pile de secours (MINSIGSTKSZ de x86).
 const MINSIGSTKSZ: u64 = 2048;
 
@@ -454,8 +480,15 @@ pub enum Fin {
     /// Son action par défaut l'arrête (SIGSTOP) : sans contrôle des tâches
     /// (6k), personne ne pourrait lui envoyer SIGCONT. Il est terminé.
     Suspendu,
-    /// Un gestionnaire devrait être appelé : 6f.
-    Gestionnaire,
+}
+
+/// Ce que fait le prochain signal livré (`a_livrer`).
+pub enum Livraison {
+    /// Appeler son gestionnaire, avec l'action telle qu'elle était quand il a
+    /// été pris (SA_RESETHAND l'a peut-être remise à SIG_DFL depuis).
+    Gestionnaire { sig: u64, info: Info, action: Action },
+    /// L'arrêter.
+    Arret { sig: u64, fin: Fin },
 }
 
 /// Envoie `sig` (1 à 64), avec son siginfo `info`, au fil `tid` du
@@ -577,23 +610,91 @@ pub fn en_attente_non_bloque(p: &mut Processus, tid: u32) -> bool {
 /// SIGTTOU sont jetés aussi, comme Linux le fait pour un groupe de
 /// processus orphelin, ce qu'est le nôtre (son parent, le noyau qui joue
 /// le rôle d'init, n'est pas dans sa session).
-pub fn a_livrer(p: &mut Processus, tid: u32) -> Option<(u64, Info, Fin)> {
+pub fn a_livrer(p: &mut Processus, tid: u32) -> Option<Livraison> {
     loop {
         let (sig, info) = prendre_parmi(p, tid, !0)?;
-        let gestionnaire = p.signaux.action(sig).gestionnaire;
-        if gestionnaire == SIG_IGN {
+        let action = *p.signaux.action(sig);
+        if action.gestionnaire == SIG_IGN {
             continue;
         }
-        if gestionnaire != SIG_DFL {
-            return Some((sig, info, Fin::Gestionnaire));
+        if action.gestionnaire != SIG_DFL {
+            // SA_RESETHAND (SA_ONESHOT) : le gestionnaire ne sert qu'une
+            // fois ; ses drapeaux restent (mesuré).
+            if action.drapeaux & SA_RESETHAND != 0 {
+                p.signaux.actions[(sig - 1) as usize].gestionnaire = SIG_DFL;
+            }
+            return Some(Livraison::Gestionnaire { sig, info, action });
         }
-        match par_defaut(sig) {
+        let fin = match par_defaut(sig) {
             ParDefaut::Ignorer => continue,
             ParDefaut::Arreter if sig != SIGSTOP => continue,
-            ParDefaut::Arreter => return Some((sig, info, Fin::Suspendu)),
-            ParDefaut::Terminer | ParDefaut::ImageMemoire => return Some((sig, info, Fin::ParDefaut)),
+            ParDefaut::Arreter => Fin::Suspendu,
+            ParDefaut::Terminer | ParDefaut::ImageMemoire => Fin::ParDefaut,
+        };
+        return Some(Livraison::Arret { sig, fin });
+    }
+}
+
+/// Les drapeaux d'une action dont se sert la livraison (cadre_signal.rs).
+pub const SA_SIGINFO: u64 = 0x4;
+pub const SA_RESTORER: u64 = 0x0400_0000;
+pub const SA_ONSTACK: u64 = 0x0800_0000;
+pub const SA_NODEFER: u64 = 0x4000_0000;
+pub const SA_RESETHAND: u64 = 0x8000_0000;
+
+/// Le masque du fil `tid`, et sa pile de secours (pour poser un cadre de
+/// signal).
+pub fn masque_et_pile(p: &mut Processus, tid: u32) -> (u64, PileDeSecours) {
+    p.fil(tid).map_or((0, PileDeSecours::default()), |f| (f.signaux.bloques, f.signaux.pile))
+}
+
+/// Un gestionnaire de `sig` vient d'être posé pour le fil `tid` (le
+/// `signal_delivered` de Linux) : pendant qu'il s'exécute, le fil bloque en
+/// plus le masque de l'action, et `sig` lui-même sauf SA_NODEFER ; une pile
+/// de secours SS_AUTODISARM est désarmée (rt_sigreturn la rétablira, d'après
+/// le cadre).
+pub fn apres_livraison(p: &mut Processus, tid: u32, sig: u64, action: &Action) {
+    let mut bloques = action.masque;
+    if action.drapeaux & SA_NODEFER == 0 {
+        bloques |= bit(sig);
+    }
+    if let Some(f) = p.fil(tid) {
+        f.signaux.bloques |= bloques & !IMBLOQUABLES;
+        if f.signaux.pile.drapeaux & SS_AUTODISARM != 0 {
+            f.signaux.pile = PileDeSecours { adresse: 0, taille: 0, drapeaux: SS_DISABLE };
         }
     }
+    reconfier(p, bloques);
+}
+
+/// Le masque du fil `tid` devient `masque`, sans SIGKILL ni SIGSTOP (le
+/// `set_current_blocked` de Linux : rt_sigreturn) ; les signaux du processus
+/// qu'il vient de bloquer vont à un autre fil.
+pub fn poser_masque(p: &mut Processus, tid: u32, masque: u64) {
+    let masque = masque & !IMBLOQUABLES;
+    let Some(f) = p.fil(tid) else { return };
+    let nouveaux = masque & !f.signaux.bloques;
+    f.signaux.bloques = masque;
+    reconfier(p, nouveaux);
+}
+
+/// Force `sig` vers le fil `tid` (le `force_sig_info_to_task` de Linux) :
+/// bloqué ou ignoré, il est débloqué et remis à son action par défaut, pour
+/// qu'il soit livré, et tue ; `mortel` (HANDLER_SIG_DFL, celui de
+/// `force_fatal_sig` : un cadre de SIGSEGV impossible à poser) le remet à
+/// l'action par défaut même s'il avait un gestionnaire. Rend le fil à
+/// réveiller.
+pub fn forcer_au_fil(p: &mut Processus, tid: u32, sig: u64, info: Info, mortel: bool) -> Option<Arc<Tache>> {
+    let Some(f) = p.fil(tid) else { return None };
+    let bloque = f.signaux.bloques & bit(sig) != 0;
+    if bloque {
+        f.signaux.bloques &= !bit(sig);
+    }
+    let action = &mut p.signaux.actions[(sig - 1) as usize];
+    if bloque || mortel || action.gestionnaire == SIG_IGN {
+        action.gestionnaire = SIG_DFL;
+    }
+    envoyer(p, sig, Destinataire::Fil(tid), info, true).ok().flatten()
 }
 
 /// Prend, pour le fil `tid`, un signal en attente de `voulus` qu'il ne bloque
@@ -729,6 +830,39 @@ pub fn rt_sigpending(ensemble: u64, taille: u64) -> i64 {
     0
 }
 
+/// Pose la pile de secours `n` du fil (`do_sigaltstack`, voir `sigaltstack`).
+fn changer_pile(s: &mut SignauxDuFil, mut n: PileDeSecours, sp: u64) -> Result<(), i64> {
+    let avant = s.pile;
+    if avant.dessus(sp) {
+        return Err(-EPERM);
+    }
+    let mode = n.drapeaux & !SS_AUTODISARM;
+    if mode != 0 && mode != SS_ONSTACK && mode != SS_DISABLE {
+        return Err(-EINVAL);
+    }
+    if n.adresse == avant.adresse && n.taille == avant.taille && n.drapeaux == avant.drapeaux {
+        return Ok(());
+    }
+    if mode == SS_DISABLE {
+        n.adresse = 0;
+        n.taille = 0;
+    } else if n.taille < MINSIGSTKSZ {
+        return Err(-ENOMEM);
+    }
+    s.pile = n;
+    Ok(())
+}
+
+/// rt_sigreturn rétablit la pile de secours que dit le cadre
+/// (`restore_altstack`) : comme sigaltstack, avec le RSP du programme à
+/// l'appel ; ses erreurs sont ignorées (seule une faute de copie compte, et
+/// elle a déjà eu lieu en lisant le cadre).
+pub fn retablir_pile(p: &mut Processus, tid: u32, n: PileDeSecours, sp: u64) {
+    if let Some(f) = p.fil(tid) {
+        let _ = changer_pile(&mut f.signaux, n, sp);
+    }
+}
+
 /// sigaltstack(nouvelle, ancienne), dans l'ordre de `do_sigaltstack` :
 ///   - l'ancienne : adresse et taille posées, et dans les drapeaux
 ///     SS_DISABLE si la taille est nulle (la valeur initiale : {NULL,
@@ -741,11 +875,10 @@ pub fn rt_sigpending(ensemble: u64, taille: u64) -> i64 {
 ///     taille soit sous MINSIGSTKSZ (mesuré : 0) ; SS_DISABLE remet adresse
 ///     et taille à 0 ; sinon une taille d'au moins MINSIGSTKSZ (ENOMEM).
 ///     L'adresse n'a pas à être alignée (Linux l'accepte).
-/// Changer de pile de secours pendant qu'on s'exécute dessus rend EPERM
-/// chez Linux ; seul un gestionnaire s'y exécute, et aucun n'est appelé
-/// avant 6f : le programme n'y est jamais (écart écrit, il faudrait sinon
-/// comparer son RSP à la pile).
-pub fn sigaltstack(nouvelle: u64, ancienne: u64) -> i64 {
+/// Changer de pile de secours pendant qu'on s'exécute dessus (`sp`, le RSP
+/// du programme à l'appel, dans la pile, sans SS_AUTODISARM) : EPERM, avant
+/// même de regarder le mode ; l'ancienne dit alors SS_ONSTACK.
+pub fn sigaltstack(nouvelle: u64, ancienne: u64, sp: u64) -> i64 {
     // stack_t : ss_sp (8 octets), ss_flags (un int, puis 4 de bourrage),
     // ss_size (8).
     let mut lue = None;
@@ -759,23 +892,9 @@ pub fn sigaltstack(nouvelle: u64, ancienne: u64) -> i64 {
         lue = Some(PileDeSecours { adresse: mot(0), taille: mot(16), drapeaux });
     }
     let avant = fil::avec(|f| {
-        let s = &mut f.signaux;
-        let avant = s.pile;
-        if let Some(mut n) = lue {
-            let mode = n.drapeaux & !SS_AUTODISARM;
-            if mode != 0 && mode != SS_ONSTACK && mode != SS_DISABLE {
-                return Err(-EINVAL);
-            }
-            if n.adresse == avant.adresse && n.taille == avant.taille && n.drapeaux == avant.drapeaux {
-                return Ok(avant);
-            }
-            if mode == SS_DISABLE {
-                n.adresse = 0;
-                n.taille = 0;
-            } else if n.taille < MINSIGSTKSZ {
-                return Err(-ENOMEM);
-            }
-            s.pile = n;
+        let avant = f.signaux.pile;
+        if let Some(n) = lue {
+            changer_pile(&mut f.signaux, n, sp)?;
         }
         Ok(avant)
     });
@@ -784,7 +903,7 @@ pub fn sigaltstack(nouvelle: u64, ancienne: u64) -> i64 {
         Err(e) => return e,
     };
     if ancienne != 0 {
-        let drapeaux = if avant.taille == 0 { SS_DISABLE } else { 0 } | avant.drapeaux & SS_AUTODISARM;
+        let drapeaux = avant.etat(sp) | avant.drapeaux & SS_AUTODISARM;
         let mut o = [0u8; 24];
         o[0..8].copy_from_slice(&avant.adresse.to_le_bytes());
         o[8..12].copy_from_slice(&drapeaux.to_le_bytes());

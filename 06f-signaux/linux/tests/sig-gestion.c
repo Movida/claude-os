@@ -1,7 +1,7 @@
-/* Un gestionnaire de SIGUSR1, puis raise(SIGUSR1). Sous Linux, le
- * gestionnaire est appelé et le programme continue ; notre noyau
- * n'appelle les gestionnaires qu'en 6f : d'ici là, il arrête le programme
- * et le dit (code 138, 128 + 10). */
+/* Un gestionnaire de SIGUSR1, puis raise(SIGUSR1) : le gestionnaire est
+ * appelé, puis le programme continue après raise, et sort avec 0, sous
+ * Linux comme chez nous (depuis 6f ; avant, notre noyau l'arrêtait,
+ * code 138). */
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,7 +10,7 @@
 static void gestionnaire(int sig)
 {
     (void)sig;
-    static const char m[] = "[linux] sig-gestion : gestionnaire appele (Linux le fait ; notre noyau en 6f)\n";
+    static const char m[] = "[linux] sig-gestion : gestionnaire appele\n";
     if (write(1, m, sizeof m - 1) < 0)
         _exit(2);
 }

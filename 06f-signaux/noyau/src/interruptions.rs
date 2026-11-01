@@ -143,6 +143,28 @@ interruption_commune:
     push r14
     push r15
     cld
+    /* Le « bad iret » de Linux : une faute de segment absent (11), de pile
+       (12) ou de protection générale (13) sur l'`iretq` qui rendait la main à
+       un programme. Le cadre que dépilait iretq venait du programme (après
+       rt_sigreturn : un CS ou un SS invalide, un RIP non canonique) : c'est
+       sa faute à lui. On fait comme si l'exception venait de lui
+       (`reparer_iret`, qui recopie son cadre en haut de la pile de la
+       tâche), et la suite ordinaire la voit venue de l'anneau 3 : un signal,
+       jamais un arrêt du noyau. RAX est déjà rangé dans le cadre. */
+    mov rax, [rsp + {vecteur}]
+    cmp rax, 11
+    jb 3f
+    cmp rax, 13
+    ja 3f
+    test byte ptr [rsp + {cs}], 3
+    jnz 3f
+    lea rax, [rip + iret_retour]
+    cmp [rsp + {rip}], rax
+    jne 3f
+    mov rdi, rsp
+    call reparer_iret
+    mov rsp, rax
+3:
     /* Un #DB venu d'un programme arrive sur sa pile de l'IST (gdt.rs), qui
        ne doit servir que le temps de l'entrée : le programme va mourir de
        ce SIGTRAP au retour, et la prochaine exception du même vecteur,
@@ -190,6 +212,8 @@ retour_interruption:
     pop rbx
     pop rax
     add rsp, 16         /* Retire le numéro et le code d'erreur. */
+    .global iret_retour
+iret_retour:
     iretq
 
     /* La table des adresses des talons, lue par initialiser(). */
@@ -206,7 +230,46 @@ adresses_talons:
     "#,
     vecteur = const core::mem::offset_of!(Cadre, vecteur),
     cs = const core::mem::offset_of!(Cadre, cs),
+    rip = const core::mem::offset_of!(Cadre, rip),
 );
+
+/// Le cadre d'une faute de l'`iretq` de `retour_interruption` (voir plus
+/// haut), devenu celui d'une exception venue du programme, comme le
+/// `fixup_bad_iret` de Linux : les registres généraux du cadre de la faute,
+/// déjà ceux du programme (`retour_interruption` venait de les dépiler) ; son
+/// vecteur et son code d'erreur ; et RIP, CS, RFLAGS, RSP, SS, ceux que
+/// dépilait `iretq`, à l'adresse du RSP de la faute. Le tout est recopié en
+/// haut de la pile noyau de la tâche, là où est toujours le cadre d'un
+/// programme. Les trois zones se recouvrent (le cadre que dépilait iretq, en
+/// haut ; celui de la faute, juste dessous ; la destination, qui couvre les
+/// deux) : on lit tout dans une copie locale, plus bas sur la pile, avant
+/// d'écrire. Rend l'adresse du nouveau cadre ; si `iretq` ramenait au
+/// noyau (CS de niveau 0 : une erreur du noyau), le cadre de la faute tel
+/// quel, et la suite s'arrête (`exception_fatale`).
+#[unsafe(no_mangle)]
+extern "C" fn reparer_iret(faute: *mut Cadre) -> *mut Cadre {
+    // SAFETY : `faute` est le cadre que vient d'empiler interruption_commune ;
+    // son RSP désigne les cinq mots que dépilait iretq, sur la même pile.
+    let (mut nouveau, cible) = unsafe {
+        let f = *faute;
+        let iret = f.rsp as *const u64;
+        let cible = [iret.read(), iret.add(1).read(), iret.add(2).read(), iret.add(3).read(), iret.add(4).read()];
+        (f, cible)
+    };
+    if cible[1] & 3 != 3 {
+        return faute;
+    }
+    nouveau.rip = cible[0];
+    nouveau.cs = cible[1];
+    nouveau.rflags = cible[2];
+    nouveau.rsp = cible[3];
+    nouveau.ss = cible[4];
+    let destination = tache::courante().cadre_du_programme();
+    // SAFETY : le haut de la pile noyau de la tâche courante ; tout ce qu'il y
+    // avait est dans `nouveau` et `cible`, des copies.
+    unsafe { destination.write(nouveau) };
+    destination
+}
 
 /// Ce que le code commun a empilé, dans l'ordre inverse des push.
 #[repr(C)]
@@ -328,6 +391,14 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
             let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, 0, None, zone);
             tache::forcer_par_faute(signal, raison);
         }
+        // Une faute de protection générale du noyau sur une instruction de
+        // la table d'exceptions (copie_utilisateur.rs) : XRSTOR d'un état
+        // x87/SSE venu d'un programme (rt_sigreturn, sse.rs), que le
+        // processeur refuse. On reprend à son adresse de reprise, qui rend
+        // une erreur (le `fixup_exception` de `do_general_protection`).
+        13 if crate::copie_utilisateur::reprise(cadre.rip).is_some() => {
+            cadre.rip = crate::copie_utilisateur::reprise(cadre.rip).unwrap_or(cadre.rip);
+        }
         // int3 n'est pas une erreur : un débogueur s'en sert pour poser des
         // points d'arrêt. RIP désigne déjà l'instruction suivante : on
         // revient simplement.
@@ -344,7 +415,7 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     // après une exception à pile IST : les interruptions des périphériques
     // n'en ont pas.
     if depuis_programme {
-        tache::verifier_au_retour();
+        tache::verifier_au_retour(cadre);
     } else if vecteur >= 32 && cadre.rflags & 1 << 9 != 0 {
         ordonnanceur::preempter();
     }

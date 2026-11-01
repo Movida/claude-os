@@ -146,8 +146,13 @@ boot.bin: programmes.cpio FORCE
 #   - segments : gcc -static, ses propres segments projetés depuis son
 #     fichier (MADV_DONTNEED relit le fichier) ; sur l'hôte aussi ;
 #   - signaux : gcc -static, les signaux enregistrés (rt_sigaction,
-#     rt_sigprocmask, sigaltstack, kill...) contre ce qu'en fait Linux ;
-#     sur l'hôte aussi ;
+#     rt_sigprocmask, sigaltstack, kill...) et leur file (siginfo,
+#     rt_sigqueueinfo, rt_sigtimedwait) contre ce qu'en fait Linux ; sur
+#     l'hôte aussi ;
+#   - gestionnaires : gcc -static, les gestionnaires de signaux (le cadre de
+#     signal, rt_sigreturn, la pile de secours, les drapeaux, l'ordre) ; sur
+#     l'hôte aussi, et dans l'archive des tests (qemu64 et -cpu max : avec
+#     et sans XSAVE) ;
 #   - systeme : gcc -static, les petits appels de claude (uname,
 #     sched_getaffinity, futex, prctl) ; sur l'hôte aussi ;
 #   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi ;
@@ -241,6 +246,10 @@ $(LINUX)/signaux: linux/signaux.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
+$(LINUX)/gestionnaires: linux/gestionnaires.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
 $(LINUX)/systeme: linux/systeme.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
@@ -312,9 +321,16 @@ $(LINUX)/dynamique: linux/dynamique.c
 # dure), et calcul-long, qui ne pose aucune limite, doit finir : par
 # défaut, le temps de calcul est infini, comme sous Linux ; des signaux
 # qu'un programme s'envoie (sig-term, sig-abort : terminés par leur
-# action par défaut), un gestionnaire que le noyau n'appelle pas encore
-# (sig-gestion, et sig-faute pour une faute : arrêtés, le message le dit,
-# alors que Linux appelle le gestionnaire), SIGXCPU ignoré jusqu'à la
+# action par défaut), un gestionnaire appelé (sig-gestion : le programme
+# continue), un gestionnaire de faute que le noyau n'appelle pas encore
+# (sig-faute : arrêté, le message le dit, alors que Linux l'appelle), des
+# cadres de signal impossibles (sig-restorer : sans adresse de
+# retour ; sig-pile-perdue : un RSP où rien n'est projeté ;
+# sig-secours : une pile de secours trop petite pour deux cadres) et
+# un contexte refusé au retour (sig-mxcsr : un MXCSR invalide), des
+# contextes que iretq refuse (sig-retour-cs, sig-retour-ss, sig-retour-rip :
+# le « bad iret »), chacun tué par SIGSEGV comme sous Linux, le noyau
+# continuant, SIGXCPU ignoré jusqu'à la
 # limite dure (xcpu-ignore : SIGKILL) ; un futex attendu sans délai, que
 # rien ne peut réveiller (futex-sans-fin : arrêté, le message le dit), de
 # même un eventfd vide lu en bloquant (eventfd-bloque), un
@@ -347,7 +363,9 @@ $(LINUX)/dynamique: linux/dynamique.c
 TESTS_PARALLELES = lignes cible signaler avx
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle calcul-long limite-egale \
-              sig-term sig-abort sig-gestion sig-faute xcpu-ignore futex-sans-fin nom-faute eventfd-bloque \
+              sig-term sig-abort sig-gestion sig-faute sig-restorer sig-pile-perdue sig-mxcsr sig-secours \
+              sig-retour-cs sig-retour-ss sig-retour-rip \
+              xcpu-ignore futex-sans-fin nom-faute eventfd-bloque \
               wx derniere-page et-dyn tronque bus-fichier faute-libc dort
 
 $(LINUX)/tests/%.o: linux/tests/%.asm linux/tests/commun.inc
@@ -519,7 +537,7 @@ $(GLIBC)/.copiee: $(LINUX)/libessai.so FORCE
 # (tests-demarrage.txt), qui les lance l'un après l'autre.
 LECTEUR = lecteur/target/wasm32-unknown-unknown/release/lecteur.wasm
 tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_LINUX) $(TESTS_INTERP) $(TESTS_PARALLELES)) $(INTERPRETEURS) \
-            $(LINUX)/bonjour-asm $(LINUX)/fils $(LINUX)/courses $(GLIBC)/.copiee FORCE
+            $(LINUX)/bonjour-asm $(LINUX)/fils $(LINUX)/courses $(LINUX)/gestionnaires $(GLIBC)/.copiee FORCE
 	cd lecteur && cargo build --release
 	{ echo "dir /bin 755 0 0"; \
 	  for p in $(TESTS_LINUX) $(TESTS_INTERP) $(TESTS_PARALLELES); do echo "file /bin/$$p $(LINUX)/tests/$$p 755 0 0"; done; \
@@ -527,6 +545,7 @@ tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_L
 	  echo "file /bin/bonjour-asm $(LINUX)/bonjour-asm 755 0 0"; \
 	  echo "file /bin/fils $(LINUX)/fils 755 0 0"; \
 	  echo "file /bin/courses $(LINUX)/courses 755 0 0"; \
+	  echo "file /bin/gestionnaires $(LINUX)/gestionnaires 755 0 0"; \
 	  echo "dir /etc 755 0 0"; \
 	  echo "file /etc/demarrage tests-demarrage.txt 644 0 0"; \
 	  echo "file /etc/ld.so.conf racine/etc/ld.so.conf 644 0 0"; \
@@ -550,8 +569,9 @@ tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_L
 # un dossier ; 7 : une barre finale après un fichier ; 8 : un fichier sans
 # le droit d'exécution) ; puis chaque programme de TESTS_LINUX et de
 # TESTS_INTERP, ceux de TESTS_PARALLELES par deux, un fil qui fait une
-# faute (fils faute : tout le groupe meurt) et les courses entre fils (sous
-# qemu64 et max, en plus de Nehalem au démarrage), lecteur.wasm sans
+# faute (fils faute : tout le groupe meurt), les courses entre fils et les
+# gestionnaires de signaux (sous qemu64 et max, en plus de Nehalem au
+# démarrage : sans XSAVE, puis avec XSAVE et AVX), lecteur.wasm sans
 # dossier pré-ouvert, et bonjour-asm.
 tests-demarrage.txt: Makefile
 	{ echo "# Fabrique par le Makefile (tests.cpio)."; \
@@ -574,6 +594,7 @@ tests-demarrage.txt: Makefile
 	  echo "wait"; \
 	  echo "/bin/fils faute"; \
 	  echo "/bin/courses"; \
+	  echo "/bin/gestionnaires"; \
 	  echo "/bin/lecteur.wasm"; \
 	  echo "/bin/bonjour-asm"; } > $@
 
@@ -616,7 +637,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses FORCE
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
@@ -727,7 +748,8 @@ SHELL = /bin/bash
 .DELETE_ON_ERROR:
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
-            $(LINUX)/signaux $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses
+            $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
+            $(LINUX)/fils $(LINUX)/courses
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -744,6 +766,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/segments | tee /dev/stderr | (! grep -q ECHEC)
 	LD_LIBRARY_PATH=$(LINUX) ./$(LINUX)/dynamique | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/signaux | tee /dev/stderr | (! grep -q ECHEC)
+	timeout 60 ./$(LINUX)/gestionnaires | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	./$(LINUX)/systeme | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/evenements | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/proc | tee /dev/stderr | (! grep -q ECHEC)

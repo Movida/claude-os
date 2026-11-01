@@ -26,6 +26,7 @@ mod apic;
 mod attente;
 mod appel_systeme;
 mod appels_fichiers;
+mod cadre_signal;
 mod cadres;
 mod carte_memoire;
 mod chargeur_elf;

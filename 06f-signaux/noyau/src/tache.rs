@@ -247,6 +247,13 @@ pub struct Tache {
     /// Le dernier partage de son temps entre anneau 3 et noyau rendu par
     /// getrusage(RUSAGE_THREAD).
     precedent: crate::rusage::Precedent,
+    /// Sa dernière exception qui a donné un signal : le vecteur, le code
+    /// d'erreur, et l'adresse d'une faute de page (le `trap_nr`, l'`error_code`
+    /// et le `cr2` du `thread_struct` de Linux). Le cadre de signal les
+    /// montre (sigcontext : trapno, err, cr2), même pour un signal envoyé
+    /// par kill : ce sont ceux de la dernière exception, pas du signal
+    /// (mesuré).
+    exception: [AtomicU64; 3],
 }
 
 /// Ce qu'un programme a de plus qu'une tâche du noyau.
@@ -330,6 +337,7 @@ impl Tache {
             fin: Verrou::new(None),
             usage: crate::rusage::Compteurs::default(),
             precedent: crate::rusage::Precedent::new(),
+            exception: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
         });
         Some(t)
     }
@@ -475,6 +483,21 @@ impl Tache {
     pub fn precedent(&self) -> &crate::rusage::Precedent {
         &self.precedent
     }
+
+    /// Sa dernière exception : (vecteur, code d'erreur, adresse fautive).
+    pub fn derniere_exception(&self) -> (u64, u64, u64) {
+        (self.exception[0].load(Ordering::Relaxed), self.exception[1].load(Ordering::Relaxed),
+         self.exception[2].load(Ordering::Relaxed))
+    }
+
+    /// Le cadre de son retour vers l'anneau 3, en haut de sa pile noyau :
+    /// celui qu'empilent l'entrée de `syscall` et une interruption venue du
+    /// programme (22 valeurs sous le sommet ; une exception à pile IST le
+    /// recopie là, interruptions.rs), et que prépare le premier départ d'un
+    /// fil.
+    pub fn cadre_du_programme(&self) -> *mut Cadre {
+        (self.haut - size_of::<Cadre>() as u64) as *mut Cadre
+    }
 }
 
 /// La tâche courante.
@@ -524,6 +547,7 @@ pub fn initialiser() {
         fin: Verrou::new(None),
         usage: crate::rusage::Compteurs::default(),
         precedent: crate::rusage::Precedent::new(),
+        exception: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
     };
     let t = Arc::into_raw(Arc::new(pile_demarrage)) as *mut Tache;
     INACTIVE.store(t, Ordering::Relaxed);
@@ -834,7 +858,9 @@ extern "C" fn debut_de_fil() {
         cpu::activer_interruptions();
         let _ = crate::copie_utilisateur::copier_vers_utilisateur(adresse, &t.tid.to_le_bytes());
     }
-    verifier_au_retour();
+    // SAFETY : le cadre du premier départ, préparé en haut de sa pile
+    // (`preparer`) ; rien d'autre ne s'en sert.
+    verifier_au_retour(unsafe { &mut *t.cadre_du_programme() });
 }
 
 /// set_tid_address(adresse) : l'adresse où effacer le numéro du fil courant
@@ -1171,14 +1197,20 @@ pub fn tuer_au_retour() {
 ///   3. RLIMIT_CPU, dans l'ordre de Linux (voir plus bas) ;
 ///   4. les signaux en attente et non bloqués (le `get_signal` de Linux) :
 ///      ceux qu'envoient les programmes (kill, tkill, tgkill), et SIGXCPU.
+///      Un signal qui a un gestionnaire : son cadre est posé (cadre_signal.rs),
+///      `cadre` (le cadre de retour vers l'anneau 3) mène désormais au
+///      gestionnaire, et l'on recommence : un second signal non bloqué pose
+///      son cadre par-dessus, son gestionnaire passera le premier (comme
+///      Linux, mesuré : SIGUSR1, SIGUSR2 et SIGWINCH en attente, leurs
+///      gestionnaires s'exécutent dans l'ordre SIGWINCH, SIGUSR2, SIGUSR1).
+///      Un cadre impossible à poser : SIGSEGV forcé (`force_sigsegv`).
 /// La décision est prise interruptions coupées, et la fonction revient
 /// interruptions coupées quand il n'y a rien à faire : rien ne peut plus
 /// arriver entre la dernière vérification et le retour (sysretq ou iretq
 /// rétablissent les interruptions du programme) ; un signal envoyé par une
 /// interruption tombée avant est vu, un autre après attend l'entrée
 /// suivante. Linux boucle ainsi jusqu'à ce qu'il n'y ait plus rien à faire :
-/// céder le processeur si l'ordonnanceur le demande, puis tout revérifier
-/// (6f y ajoutera les gestionnaires de signaux).
+/// céder le processeur si l'ordonnanceur le demande, puis tout revérifier.
 ///
 /// La limite de temps de calcul est RLIMIT_CPU, en secondes, celle de
 /// Linux. Comme lui, elle n'est vérifiée qu'après un tic compté (Linux le
@@ -1205,7 +1237,7 @@ pub fn tuer_au_retour() {
 ///     une seconde entorse à la syntaxe de sh, pour une chose que Linux ne
 ///     fait pas à l'exec ; un programme qui veut une limite la pose
 ///     (setrlimit), et le shell de 6k aura `ulimit -t`.
-pub fn verifier_au_retour() {
+pub fn verifier_au_retour(cadre: &mut Cadre) {
     let arret = loop {
         cpu::couper_interruptions();
         // Céder le processeur d'abord, s'il le faut : on revient ici quand
@@ -1215,6 +1247,12 @@ pub fn verifier_au_retour() {
             continue;
         }
         match decider() {
+            Some(Arret::Gestionnaire { sig, info, action, masque, pile }) => {
+                // Le cadre s'écrit dans la mémoire du programme :
+                // interruptions actives, aucun verrou tenu.
+                cpu::activer_interruptions();
+                livrer(cadre, sig, &info, &action, masque, pile);
+            }
             Some(arret) => break arret,
             None => return,
         }
@@ -1237,7 +1275,26 @@ pub fn verifier_au_retour() {
             signaux::signal(sig),
             "suspendu par un signal ; sans controle des taches (6k), personne ne pourrait le relancer : termine",
         ),
-        Arret::Signal(sig, signaux::Fin::Gestionnaire) => mourir(signaux::signal(sig), GESTIONNAIRE_EN_6F),
+        Arret::Gestionnaire { .. } => unreachable!("un gestionnaire est appele dans la boucle"),
+    }
+}
+
+/// Appelle le gestionnaire de `sig` : son cadre posé, le masque et la pile
+/// de secours du fil changés (`signal_delivered`). Un cadre impossible :
+/// SIGSEGV forcé, livré au tour suivant de la boucle (`force_sigsegv` de
+/// Linux) : à son gestionnaire s'il en a un, sinon il tue ; un cadre de
+/// SIGSEGV impossible tue directement.
+fn livrer(cadre: &mut Cadre, sig: u64, info: &signaux::Info, action: &signaux::Action, masque: u64, pile: signaux::PileDeSecours) {
+    let tid = courante().tid;
+    match crate::cadre_signal::poser_cadre(cadre, sig, info, action, masque, pile) {
+        Ok(()) => processus::avec(|p| signaux::apres_livraison(p, tid, sig, action)),
+        Err(_) => {
+            let segv = linux::SIGSEGV.numero as u64;
+            let t = processus::avec(|p| signaux::forcer_au_fil(p, tid, segv, signaux::Info::du_noyau(segv), sig == segv));
+            if t.as_ref().is_some_and(|t| !core::ptr::eq(Arc::as_ptr(t), courante())) {
+                signaux::reveiller(t);
+            }
+        }
     }
 }
 
@@ -1281,9 +1338,14 @@ fn decider() -> Option<Arret> {
                 xcpu = Some(courante);
             }
         }
-        signaux::a_livrer(p, t.tid).map(|(sig, _info, comment)| match (comment, xcpu) {
-            (signaux::Fin::ParDefaut, Some(secondes)) if sig == linux::SIGXCPU.numero as u64 => Arret::Limite(secondes),
-            _ => Arret::Signal(sig, comment),
+        signaux::a_livrer(p, t.tid).map(|l| match l {
+            signaux::Livraison::Gestionnaire { sig, info, action } => {
+                let (masque, pile) = signaux::masque_et_pile(p, t.tid);
+                Arret::Gestionnaire { sig, info, action, masque, pile }
+            }
+            signaux::Livraison::Arret { sig, fin: signaux::Fin::ParDefaut }
+                if xcpu.is_some() && sig == linux::SIGXCPU.numero as u64 => Arret::Limite(xcpu.unwrap_or(0)),
+            signaux::Livraison::Arret { sig, fin } => Arret::Signal(sig, fin),
         })
     })
     .flatten();
@@ -1305,24 +1367,26 @@ enum Arret {
     /// laissé à son action par défaut), en secondes.
     LimiteDure(u64),
     Limite(u64),
-    /// Un signal livré.
+    /// Un signal livré, qui l'arrête.
     Signal(u64, signaux::Fin),
+    /// Un signal livré à son gestionnaire (cela n'arrête rien : la boucle
+    /// pose son cadre et recommence), avec le masque et la pile de secours
+    /// du fil à ce moment.
+    Gestionnaire { sig: u64, info: signaux::Info, action: signaux::Action, masque: u64, pile: signaux::PileDeSecours },
 }
-
-/// Le message d'un signal qui devrait appeler un gestionnaire.
-const GESTIONNAIRE_EN_6F: &str = "gestionnaire enregistre, pas encore appele (livraison des signaux en 6f)";
 
 /// Une exception du programme en cours (une faute de page, une
 /// instruction invalide...) : `signal` et le message de Linux, `raison`.
 /// Il sera arrêté au retour vers l'anneau 3. S'il a un gestionnaire pour
-/// ce signal, et ne le bloque pas, Linux l'appellerait : le message le dit.
-/// Sinon, comme Linux, une faute tue le programme même s'il ignore ou
-/// bloque son signal (`force_sig_info_to_task`).
+/// ce signal, et ne le bloque pas, Linux l'appellerait ; les gestionnaires
+/// ne sont pas encore appelés pour une faute : le message le dit. Sinon,
+/// comme Linux, une faute tue le programme même s'il ignore ou bloque son
+/// signal (`force_sig_info_to_task`).
 pub fn forcer_par_faute(signal: Signal, raison: impl fmt::Display) {
     let tid = courante().tid;
     let gestionnaire = processus::essayer_avec(|p| signaux::gestionnaire_pour_faute(p, tid, signal.numero as u64)) == Some(true);
     if gestionnaire {
-        forcer(signal, format_args!("{} ; {}", raison, GESTIONNAIRE_EN_6F))
+        forcer(signal, format_args!("{} ; gestionnaire enregistre, pas encore appele pour une faute", raison))
     } else {
         forcer(signal, raison)
     }

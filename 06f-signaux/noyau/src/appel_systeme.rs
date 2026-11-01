@@ -143,12 +143,23 @@ entree_syscall:
          vérification ici, au dernier moment ;
        - ni TF (pas-à-pas) ni RF dans RFLAGS : sysretq les rétablirait
          d'une façon qui diffère d'un processeur à l'autre ;
-       - CS et SS ceux d'un programme 64 bits. */
+       - CS et SS ceux d'un programme 64 bits ;
+       - RCX égal à RIP, et R11 à RFLAGS, dans le cadre : sysretq les
+         écrase. Après un appel système ordinaire, c'est le cas (syscall
+         les y a mis) ; après rt_sigreturn, ce sont ceux du programme
+         interrompu par le signal, peut-être vivants (une interruption
+         tombée au milieu d'un calcul), et après la pose d'un cadre de
+         signal, RIP est celui du gestionnaire : iretq les rend tous
+         (la même condition que Linux, `syscall_return_via_sysret`). */
     mov rcx, [rsp + {rip}]
     mov r11, rcx
     shr r11, 47
     jnz retour_interruption
+    cmp rcx, [rsp + {rcx}]
+    jne retour_interruption
     mov r11, [rsp + {rflags}]
+    cmp r11, [rsp + {r11}]
+    jne retour_interruption
     test r11, (1 << 8) | (1 << 16)
     jnz retour_interruption
     cmp qword ptr [rsp + {cs}], {code_utilisateur}
@@ -194,6 +205,8 @@ entree_syscall_compat:
     vecteur = const VECTEUR_SYSCALL,
     rip = const offset_of!(Cadre, rip),
     rflags = const offset_of!(Cadre, rflags),
+    rcx = const offset_of!(Cadre, rcx),
+    r11 = const offset_of!(Cadre, r11),
     cs = const offset_of!(Cadre, cs),
     ss = const offset_of!(Cadre, ss),
 );
@@ -252,5 +265,5 @@ extern "C" fn gerer_appel_systeme(cadre: &mut Cadre) {
     // Le programme a pu atteindre sa limite de temps de calcul pendant
     // l'appel : l'horloge ne l'arrête pas au milieu du travail du noyau,
     // mais ici, l'appel fini.
-    crate::tache::verifier_au_retour();
+    crate::tache::verifier_au_retour(cadre);
 }

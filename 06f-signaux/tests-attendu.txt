@@ -84,12 +84,39 @@
 [noyau] sig-abort : arrete par un signal (SIGABRT)
 [noyau] sig-abort : termine, code de sortie 134 ; memoire rendue : ok.
 [linux] Test : un gestionnaire de SIGUSR1, puis raise(SIGUSR1).
-[noyau] sig-gestion : gestionnaire enregistre, pas encore appele (livraison des signaux en 6f) (SIGUSR1)
-[noyau] sig-gestion : termine, code de sortie 138 ; memoire rendue : ok.
+[linux] sig-gestion : gestionnaire appele
+[linux] sig-gestion : apres le gestionnaire
+[noyau] sig-gestion : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] Test : un gestionnaire de SIGSEGV, puis une faute.
 [noyau] sig-faute : segfault at 0x0 ip 
- ; gestionnaire enregistre, pas encore appele (livraison des signaux en 6f) (SIGSEGV)
+ ; gestionnaire enregistre, pas encore appele pour une faute (SIGSEGV)
 [noyau] sig-faute : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : un gestionnaire sans SA_RESTORER, puis raise(SIGUSR1).
+[noyau] sig-restorer : gestionnaire de SIGUSR1 sans SA_RESTORER (pas d'adresse de retour)
+[noyau] sig-restorer : arrete par un signal (SIGSEGV)
+[noyau] sig-restorer : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : RSP a 0x10000 (rien n'y est projete), puis tgkill(SIGUSR1).
+[noyau] sig-pile-perdue : impossible d'ecrire le cadre du signal SIGUSR1 a 0x
+[noyau] sig-pile-perdue : impossible d'ecrire le cadre du signal SIGSEGV a 0x
+[noyau] sig-pile-perdue : arrete par un signal (SIGSEGV)
+[noyau] sig-pile-perdue : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : un gestionnaire qui rend un MXCSR refuse par le processeur.
+[noyau] sig-mxcsr : mauvais cadre de signal a 0x
+[noyau] sig-mxcsr : arrete par un signal (SIGSEGV)
+[noyau] sig-mxcsr : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : une pile de secours de 2048 octets, deux cadres l'un sur l'autre.
+[linux] sig-secours : premier gestionnaire, sur la pile de secours
+[noyau] sig-secours : debordement de la pile de secours (cadre du signal SIGUSR2)
+[noyau] sig-secours : arrete par un signal (SIGSEGV)
+[noyau] sig-secours : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : un gestionnaire qui rend CS = 0x2B (un segment de donnees).
+[noyau] sig-retour-cs : general protection fault
+[noyau] sig-retour-cs : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : un gestionnaire qui rend SS = 0x33 (un segment de code).
+[noyau] sig-retour-ss : general protection fault
+[noyau] sig-retour-ss : termine, code de sortie 139 ; memoire rendue : ok.
+[linux] Test : un gestionnaire qui rend un RIP non canonique.
+[noyau] sig-retour-rip : termine, code de sortie 139 ; memoire rendue : ok.
 [linux] Test : SIGXCPU ignore, sous RLIMIT_CPU (1 s, 2 s).
 [linux] xcpu-ignore : SIGXCPU ignore, limite courante relevee a 2 s apres 1 s de calcul : ok
 [noyau] xcpu-ignore : limite dure de temps de calcul atteinte (RLIMIT_CPU 2 s) (SIGKILL)
@@ -156,3 +183,5 @@
 [noyau] fils : termine, code de sortie 139 ; memoire rendue : ok.
 [linux] courses : ok
 [noyau] courses : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] gestionnaires : toutes les verifications : ok
+[noyau] gestionnaires : termine, code de sortie 0 ; memoire rendue : ok.

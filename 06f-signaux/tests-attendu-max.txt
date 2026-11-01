@@ -6,3 +6,4 @@
 [noyau] SSE pour les programmes : XSAVE (x87, SSE, AVX), 832 octets par tache.
 [linux] avx a : YMM0-YMM15, MXCSR et x87 intacts apres 300 sched_yield : ok
 [linux] avx b : YMM0-YMM15, MXCSR et x87 intacts apres 300 sched_yield : ok
+[linux] gestionnaires : processeur : XSAVE et AVX

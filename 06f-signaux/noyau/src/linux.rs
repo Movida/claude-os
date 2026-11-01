@@ -160,6 +160,7 @@ const RT_SIGPROCMASK: u64 = 14;
 const KILL: u64 = 62;
 const RT_SIGPENDING: u64 = 127;
 const SIGALTSTACK: u64 = 131;
+const RT_SIGRETURN: u64 = 15;
 const TKILL: u64 = 200;
 const TGKILL: u64 = 234;
 const RT_SIGTIMEDWAIT: u64 = 128;
@@ -185,7 +186,7 @@ fn tid() -> i64 {
 
 /// Exécute l'appel système `numero` : un résultat, ou -errno. `cadre` :
 /// les registres du programme à l'appel (clone les copie pour le fil neuf).
-pub fn appel(numero: u64, a: [u64; 6], cadre: &Cadre) -> i64 {
+pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
     let resultat = match numero {
         CLONE => crate::fil::clone(a[0], a[1], a[2], a[3], a[4], cadre),
         CLONE3 => crate::fil::clone3(a[0], a[1], cadre),
@@ -260,7 +261,8 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &Cadre) -> i64 {
         RT_SIGACTION => signaux::rt_sigaction(a[0], a[1], a[2], a[3]),
         RT_SIGPROCMASK => signaux::rt_sigprocmask(a[0], a[1], a[2], a[3]),
         RT_SIGPENDING => signaux::rt_sigpending(a[0], a[1]),
-        SIGALTSTACK => signaux::sigaltstack(a[0], a[1]),
+        SIGALTSTACK => signaux::sigaltstack(a[0], a[1], cadre.rsp),
+        RT_SIGRETURN => crate::cadre_signal::rt_sigreturn(cadre),
         KILL => signaux::kill(a[0], a[1]),
         TKILL => signaux::tkill(a[0], a[1]),
         TGKILL => signaux::tgkill(a[0], a[1], a[2]),
@@ -407,6 +409,7 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         RT_SIGPROCMASK => ("rt_sigprocmask", 4),
         RT_SIGPENDING => ("rt_sigpending", 2),
         SIGALTSTACK => ("sigaltstack", 2),
+        RT_SIGRETURN => ("rt_sigreturn", 0),
         KILL => ("kill", 2),
         TKILL => ("tkill", 2),
         TGKILL => ("tgkill", 3),

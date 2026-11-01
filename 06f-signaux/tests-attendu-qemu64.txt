@@ -5,3 +5,4 @@
 [noyau] SSE pour les programmes : FXSAVE (x87, SSE, pas d'AVX), 512 octets par tache.
 [linux] avx a : XMM0-XMM15, MXCSR et x87 intacts apres 300 sched_yield : ok
 [linux] avx b : XMM0-XMM15, MXCSR et x87 intacts apres 300 sched_yield : ok
+[linux] gestionnaires : processeur : FXSAVE

@@ -30,8 +30,11 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/fichiers
 /bin/arbre
 /bin/segments
-# Les signaux (6d) : enregistrés et rendus comme Linux, pas encore livrés.
+# Les signaux (6d) : enregistrés et rendus comme Linux, puis leur file et
+# leur siginfo (6f) ; et livrés à leurs gestionnaires (6f) : le cadre de
+# signal, rt_sigreturn, la pile de secours.
 /bin/signaux
+/bin/gestionnaires
 # Les petits appels de claude (6d) : uname, sched_getaffinity, futex, prctl.
 /bin/systeme
 # eventfd et epoll (6d) : la boucle d'événements de Bun, créée mais pas encore attendue.

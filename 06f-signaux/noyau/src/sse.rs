@@ -64,14 +64,86 @@
 //! d'Intel, vol. 1, 13.8) ; le reste de la zone, à zéro aussi.
 
 use alloc::alloc::{Layout, alloc_zeroed, dealloc};
-use core::arch::asm;
+use core::arch::{asm, global_asm};
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 /// Les composants que sauve XSAVE (XCR0) ; 0 : FXSAVE.
 static COMPOSANTS: AtomicU64 = AtomicU64::new(0);
 /// La taille de la zone d'une tâche.
 static TAILLE: AtomicU64 = AtomicU64::new(512);
+/// Les bits de MXCSR que le processeur accepte (MXCSR_MASK, que rend
+/// FXSAVE ; 0xFFBF s'il y laisse 0, manuel d'Intel vol. 1, 11.6.6) : un
+/// MXCSR rendu par un gestionnaire de signal avec un autre bit ferait une
+/// faute de protection générale au XRSTOR (le `mxcsr_feature_mask` de
+/// Linux).
+static MASQUE_MXCSR: AtomicU32 = AtomicU32::new(0xFFBF);
+
+/// La plus grande zone que le noyau sache mettre dans un cadre de signal
+/// (cadre_signal.rs) : celle de x87, SSE et AVX fait 832 octets ; AVX-512
+/// (2,7 Kio), que nous ne prenons pas, n'y tiendrait pas.
+pub const TAILLE_MAX: usize = 1024;
+
+/// L'état initial, pour FXRSTOR et pour XRSTOR (aligné sur 64 octets) : mot
+/// de contrôle x87 0x037F, MXCSR 0x1F80, tout le reste à zéro, en-tête de
+/// XSAVE compris (tous les composants à leur état initial ; MXCSR est lu
+/// dans la zone même alors). Ce que reçoit un gestionnaire de signal (le
+/// `init_fpstate` de Linux).
+#[repr(C, align(64))]
+struct Initial([u8; TAILLE_MAX]);
+
+static INITIAL: Initial = {
+    let mut o = [0u8; TAILLE_MAX];
+    o[0] = 0x7F;
+    o[1] = 0x03;
+    o[24] = 0x80;
+    o[25] = 0x1F;
+    Initial(o)
+};
+
+// XRSTOR et FXRSTOR depuis une zone du noyau, avec une entrée dans la table
+// d'exceptions (copie_utilisateur.rs) : une faute de protection générale
+// (un en-tête ou un MXCSR que le processeur refuse, venus d'un programme
+// par rt_sigreturn) reprend à l'étiquette 2, qui rend 1, au lieu d'arrêter
+// le noyau (le `os_xrstor_safe` de Linux). Les vérifications de
+// cadre_signal.rs refusent déjà ce qui ferait cette faute : la table est
+// la seconde ligne de défense.
+global_asm!(
+    r#"
+    .section .text
+    /* xrstor_protege(zone (rdi), composants : eax (esi) et edx (edx)) */
+    .global xrstor_protege
+xrstor_protege:
+    mov eax, esi
+1:  xrstor64 [rdi]
+    xor eax, eax
+    ret
+2:  mov eax, 1
+    ret
+    .pushsection __ex_table, "a"
+    .balign 8
+    .quad 1b, 2b
+    .popsection
+
+    /* fxrstor_protege(zone (rdi)) */
+    .global fxrstor_protege
+fxrstor_protege:
+3:  fxrstor64 [rdi]
+    xor eax, eax
+    ret
+4:  mov eax, 1
+    ret
+    .pushsection __ex_table, "a"
+    .balign 8
+    .quad 3b, 4b
+    .popsection
+    "#
+);
+
+unsafe extern "C" {
+    fn xrstor_protege(zone: *const u8, bas: u32, haut: u32) -> u32;
+    fn fxrstor_protege(zone: *const u8) -> u32;
+}
 
 const X87: u64 = 1 << 0;
 const SSE: u64 = 1 << 1;
@@ -107,6 +179,15 @@ pub fn initialiser() -> Bilan {
         );
     }
     use core::arch::x86_64::{__cpuid, __cpuid_count};
+    // MXCSR_MASK : les octets 28 à 31 d'une image FXSAVE.
+    let mut image = Initial([0; TAILLE_MAX]);
+    // SAFETY : FXSAVE écrit 512 octets dans une zone alignée à nous ; le
+    // processeur n'a encore l'état d'aucun programme.
+    unsafe { asm!("fxsave64 [{}]", in(reg) image.0.as_mut_ptr(), options(nostack)) };
+    let masque = u32::from_le_bytes([image.0[28], image.0[29], image.0[30], image.0[31]]);
+    if masque != 0 {
+        MASQUE_MXCSR.store(masque, Ordering::Relaxed);
+    }
     if __cpuid(1).ecx & 1 << 26 == 0 {
         return Bilan { xsave: false, avx: false, taille: 512 };
     }
@@ -124,10 +205,77 @@ pub fn initialiser() -> Bilan {
     // La taille de la zone pour les composants en service (EBX, une fois
     // XCR0 posé).
     let taille = __cpuid_count(0xD, 0).ebx as u64;
+    assert!(taille as usize <= TAILLE_MAX, "zone XSAVE trop grande pour un cadre de signal");
     COMPOSANTS.store(composants, Ordering::Relaxed);
     TAILLE.store(taille, Ordering::Relaxed);
     Bilan { xsave: true, avx: composants & AVX != 0, taille }
 }
+
+/// Les composants que sauve XSAVE (XCR0), 0 sans XSAVE (FXSAVE).
+pub fn composants() -> u64 {
+    COMPOSANTS.load(Ordering::Relaxed)
+}
+
+/// La taille de l'image de l'état : 512 octets avec FXSAVE, ce que dit le
+/// processeur avec XSAVE (832 pour x87, SSE et AVX).
+pub fn taille() -> usize {
+    TAILLE.load(Ordering::Relaxed) as usize
+}
+
+/// Les bits permis de MXCSR.
+pub fn masque_mxcsr() -> u32 {
+    MASQUE_MXCSR.load(Ordering::Relaxed)
+}
+
+/// Sauve l'état x87/SSE/AVX du processeur (celui de la tâche courante,
+/// un programme) dans `zone`, au format standard (cadre_signal.rs).
+pub fn sauver_dans(zone: &mut ImageFpu) {
+    let c = composants();
+    // SAFETY : la zone est alignée sur 64 et assez grande (TAILLE_MAX) ;
+    // le noyau ne se sert pas de SSE : l'état est celui du programme.
+    unsafe {
+        if c == 0 {
+            asm!("fxsave64 [{}]", in(reg) zone.0.as_mut_ptr(), options(nostack));
+        } else {
+            asm!("xsave64 [{}]", in(reg) zone.0.as_mut_ptr(), in("eax") c as u32, in("edx") (c >> 32) as u32,
+                 options(nostack));
+        }
+    }
+}
+
+/// Met l'état x87/SSE/AVX du processeur à l'état initial (pour un
+/// gestionnaire de signal : `fpu__clear_user_states`).
+pub fn charger_initial() {
+    let c = composants();
+    // SAFETY : l'image initiale est valide (en-tête nul, MXCSR permis).
+    unsafe {
+        if c == 0 {
+            fxrstor_protege(INITIAL.0.as_ptr());
+        } else {
+            xrstor_protege(INITIAL.0.as_ptr(), c as u32, (c >> 32) as u32);
+        }
+    }
+}
+
+/// Charge dans le processeur les composants `rfbm` de `zone` (XRSTOR ;
+/// FXRSTOR si `rfbm` vaut 0). Faux si le processeur l'a refusé (une faute
+/// de protection générale, reprise par la table d'exceptions).
+pub fn charger(zone: &ImageFpu, rfbm: u64) -> bool {
+    // SAFETY : la zone est alignée et assez grande ; un contenu refusé fait
+    // une faute reprise.
+    unsafe {
+        if rfbm == 0 {
+            fxrstor_protege(zone.0.as_ptr()) == 0
+        } else {
+            xrstor_protege(zone.0.as_ptr(), rfbm as u32, (rfbm >> 32) as u32) == 0
+        }
+    }
+}
+
+/// Une image de l'état x87/SSE/AVX dans le noyau (pour un cadre de signal),
+/// alignée sur 64 octets, de la plus grande taille possible.
+#[repr(C, align(64))]
+pub struct ImageFpu(pub [u8; TAILLE_MAX]);
 
 /// La zone de l'état x87, SSE (et AVX) d'une tâche de programme, au format
 /// de FXSAVE ou de XSAVE (standard), alignée sur 64 octets.

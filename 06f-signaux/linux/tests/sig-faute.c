@@ -1,7 +1,8 @@
 /* Un gestionnaire de SIGSEGV (comme celui de Bun), puis une écriture à
  * l'adresse 0. Sous Linux, le gestionnaire est appelé (il sort avec 0) ;
  * notre noyau arrête le programme comme toute faute, et son message dit
- * qu'un gestionnaire attendait (livraison en 6f) : code 139. */
+ * qu'un gestionnaire attendait (les fautes ne lui sont pas encore
+ * livrées) : code 139. */
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
