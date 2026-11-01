@@ -188,3 +188,4 @@
 [noyau] courses : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] gestionnaires : toutes les verifications : ok
 [noyau] gestionnaires : termine, code de sortie 0 ; memoire rendue : ok.
+[reseau] eth0 : voisin muet 10.0.2.99 : echec apres trois requetes, en 3 s, son paquet jete : ok.

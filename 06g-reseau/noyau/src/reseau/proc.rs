@@ -5,7 +5,8 @@
 //!   - `route` : la table de routage principale (le `fib_route_seq_show`
 //!     de fib_trie.c), chaque ligne complétée à 127 colonnes ;
 //!   - `dev` : les compteurs de chaque interface (le `dev_seq_show` de
-//!     net-procfs.c).
+//!     net-procfs.c) ;
+//!   - `arp` : la table des voisins (le `arp_seq_show` d'arp.c).
 //! Les adresses de `route` s'écrivent comme Linux les imprime : le mot de
 //! 32 bits gros-boutiste lu comme un nombre de la machine (petit-boutiste),
 //! en hexadécimal : 10.0.2.2 donne 0202000A.
@@ -22,6 +23,7 @@ pub enum Fichier {
     Pnp,
     Route,
     Dev,
+    Arp,
 }
 
 /// Un bloc du tas où écrire avec `write!`, qui échoue sans paniquer.
@@ -49,6 +51,7 @@ pub fn ligne(f: Fichier, n: u64) -> Result<Option<Vec<u8>>, ()> {
         Fichier::Pnp => pnp(&mut t, n),
         Fichier::Route => route(&mut t, n),
         Fichier::Dev => dev(&mut t, n),
+        Fichier::Arp => super::arp::ligne_proc(n, &mut t),
     };
     match ecrite {
         Ok(true) => Ok(Some(t.0)),

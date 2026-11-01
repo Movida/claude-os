@@ -21,6 +21,11 @@ use alloc::vec::Vec;
 /// (14) sans recopier.
 pub const MARGE: usize = 96;
 
+/// Ce que Linux ajoute à la taille des données pour la « taille vraie »
+/// d'un paquet, celle que comptent ses files (celle des voisins, celles des
+/// sockets) : son `sk_buff` (256 octets) et sa `skb_shared_info` (320).
+pub const SURCOUT: usize = 576;
+
 pub struct Paquet {
     tampon: Vec<u8>,
     debut: usize,
@@ -71,6 +76,13 @@ impl Paquet {
     pub fn ajouter_entete(&mut self, n: usize) -> Option<&mut [u8]> {
         self.debut = self.debut.checked_sub(n)?;
         Some(&mut self.tampon[self.debut..self.debut + n])
+    }
+
+    /// La taille vraie du paquet (le `truesize` de Linux) : son tampon, plus
+    /// ce que coûtent ses structures chez Linux, pour que les limites des
+    /// files comptent à peu près comme les siennes.
+    pub fn taille_vraie(&self) -> usize {
+        self.tampon.capacity() + SURCOUT
     }
 
     /// Retire les `n` premiers octets des données (le `skb_pull`), et les

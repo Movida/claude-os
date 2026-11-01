@@ -5,7 +5,9 @@
 //! Le noyau garde ce qui touche le matériel (les cartes, leurs files), les
 //! verrous, les attentes des programmes et les copies vers eux. Ici, les
 //! RÈGLES : quelle route prend un paquet (routes.rs), ce que fait le client
-//! DHCP du démarrage à chaque message et à chaque échéance (dhcp.rs). Rien
+//! DHCP du démarrage à chaque message et à chaque échéance (dhcp.rs), ce
+//! qu'on sait de chaque voisin du réseau local et quand le redemander
+//! (voisins.rs). Rien
 //! ici ne lit l'horloge ni ne tire au hasard : l'heure (en nanosecondes) et
 //! le hasard sont des arguments, si bien qu'un test peut faire passer 45
 //! secondes en une ligne, et rejouer exactement un cas.
@@ -19,3 +21,4 @@ extern crate alloc;
 
 pub mod dhcp;
 pub mod routes;
+pub mod voisins;

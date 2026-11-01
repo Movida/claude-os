@@ -20,6 +20,10 @@
 //! est reprise au tour suivant. Une rafale coûte une interruption, pas une
 //! par trame.
 //!
+//! Les minuteurs du réseau (ceux des voisins, arp.rs) : la tâche dort
+//! jusqu'à la prochaine échéance, ou un réveil, et les fait tourner à
+//! chaque tour.
+//!
 //! Sans réveil perdu : le travail est un mot de bits, sous un verrou ; une
 //! interruption pose son bit puis réveille ; la tâche prend le mot, et ne
 //! s'endort que s'il est vide, en s'inscrivant dans la file d'attente
@@ -29,11 +33,14 @@ use super::interface;
 use crate::attente::{self, FileAttente, Sommeil};
 use crate::programmes::NomCourt;
 use crate::verrou::Verrou;
-use crate::{cpu, tache};
+use crate::{cpu, tache, temps};
 
 /// Du travail à faire : un changement dans la configuration d'une carte
 /// (son lien).
 pub const CONFIGURATION: u32 = 1 << 0;
+/// Un minuteur de la table des voisins a pu changer (une résolution
+/// commence) : recalculer l'échéance.
+pub const VOISINS: u32 = 1 << 1;
 /// Le travail d'une interface (sa réception, ses émissions finies) : le
 /// bit `INTERFACES << index`.
 const INTERFACES: u32 = 1 << 8;
@@ -64,17 +71,18 @@ pub fn signaler_interface(index: u32) {
     }
 }
 
-/// Prend le travail en attente, en dormant tant qu'il n'y en a pas.
-fn attendre() -> u32 {
+/// Prend le travail en attente, en dormant tant qu'il n'y en a pas, et au
+/// plus jusqu'à `echeance` (alors rien : c'est l'heure des minuteurs).
+fn attendre(echeance: Option<u64>) -> u32 {
     let interruptions = cpu::couper_interruptions();
     let travail = loop {
         let mut t = TRAVAIL.verrouiller();
-        if t.a_faire != 0 {
+        if t.a_faire != 0 || echeance.is_some_and(|e| e <= temps::ns_monotone()) {
             break core::mem::take(&mut t.a_faire);
         }
         t.attente.inscrire();
         drop(t);
-        attente::dormir(None, Sommeil::Ininterruptible);
+        attente::dormir(echeance, Sommeil::Ininterruptible);
         TRAVAIL.verrouiller().attente.retirer(tache::courante());
     };
     if interruptions {
@@ -91,8 +99,9 @@ pub fn lancer() {
 }
 
 fn boucle() {
+    let mut echeance = None;
     loop {
-        let travail = attendre();
+        let travail = attendre(echeance);
         if travail & CONFIGURATION != 0 {
             super::virtio_net::configuration_changee();
         }
@@ -106,5 +115,6 @@ fn boucle() {
                 signaler_interface(index);
             }
         }
+        echeance = super::arp::temps();
     }
 }

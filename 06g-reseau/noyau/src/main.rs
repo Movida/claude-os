@@ -363,8 +363,8 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // tâche.
     let init = || {
         tester_ordonnanceur();
-        tester_reseau();
         reseau::configurer();
+        tester_voisins();
         programmes::demarrer();
         // Le scénario des programmes de test de `make tests-qemu` : une
         // fois l'archive exécutée, éteindre QEMU par son périphérique
@@ -434,39 +434,60 @@ fn tester_ordonnanceur() {
                 if ok { "ok" } else { "ECHEC" }, ordonnanceur::bascules() - bascules);
 }
 
-/// Vérifie la carte réseau, ses deux files et la tâche du réseau : une
-/// sonde ARP faite à la main (« qui a 10.0.2.2 ? », de 0.0.0.0 : la sonde
-/// de la RFC 5227, qui n'a pas besoin d'adresse) part par eth0, et la
-/// réponse de la passerelle du réseau de QEMU doit revenir (l'interruption
-/// de réception, la tâche du réseau réveillée, la trame livrée). Deux fois :
-/// QEMU interrompt toujours pour la première émission finie d'une file (son
-/// `virtio_should_notify` : « signalled_used_valid »), ce qui réveille aussi
-/// la tâche ; la seconde réponse ne peut arriver que par l'interruption de
-/// réception. Sans eth0, rien.
-fn tester_reseau() {
-    let Some(i) = reseau::interface::par_index(1) else { return };
-    let mut recues = 0;
-    for _ in 0..2 {
-        let avant = reseau::arp_recues();
-        let Some(mut p) = reseau::paquet::Paquet::vide(60) else { return };
-        if let Some(t) = p.ajouter_fin(60) {
-            t[..6].fill(0xff);
-            t[6..12].copy_from_slice(&i.mac);
-            t[12..14].copy_from_slice(&[0x08, 0x06]);
-            // Ethernet, IPv4, 6 et 4 octets d'adresse, requête.
-            t[14..22].copy_from_slice(&[0, 1, 0x08, 0x00, 6, 4, 0, 1]);
-            t[22..28].copy_from_slice(&i.mac);
-            t[38..42].copy_from_slice(&[10, 0, 2, 2]);
-        }
-        i.emettre(p);
-        let fin = temps::ns_monotone() + 1_000_000_000;
-        while reseau::arp_recues() == avant && temps::ns_monotone() < fin {
+/// Vérifie ARP et la table des voisins, une fois le réseau configuré : un
+/// paquet IPv4 (vide, du protocole 253, « pour les essais », RFC 3692) pour
+/// la passerelle et un pour le serveur DNS ; chacun attend la résolution de
+/// son voisin (une requête en diffusion, la réponse de slirp par
+/// l'interruption de réception), puis part. Dans le noyau des tests, une
+/// adresse muette du réseau (10.0.2.99) : trois requêtes, l'échec au bout
+/// de trois secondes, et son paquet jeté. Sans adresse : rien.
+fn tester_voisins() {
+    use reseau::arp;
+    use inet::voisins::Etat;
+    let (Some(i), Some(b)) = (reseau::interface::par_index(1), reseau::dhcp::bail()) else { return };
+    let paquet = |destination: [u8; 4]| {
+        let mut p = reseau::paquet::Paquet::vide(formats::reseau::ipv4::ENTETE)?;
+        let e: &mut [u8; formats::reseau::ipv4::ENTETE] = p.ajouter_fin(formats::reseau::ipv4::ENTETE)?.try_into().ok()?;
+        formats::reseau::ipv4::ecrire(e, &formats::reseau::ipv4::Ipv4 {
+            tos: 0, longueur: 20, identifiant: 0, ne_pas_fragmenter: true, fragments_suivants: false, decalage: 0,
+            ttl: 64, protocole: 253, source: b.adresse, destination, longueur_entete: 20,
+        });
+        Some(p)
+    };
+    let attendre = |adresse: [u8; 4], fini: fn(Etat) -> bool, ms: u64| {
+        let debut = temps::ns_monotone();
+        while !arp::voisin(i, adresse).is_some_and(|(e, _)| fini(e)) && temps::ns_monotone() - debut < ms * 1_000_000 {
             attente::dormir(Some(temps::ns_monotone() + 10_000_000), attente::Sommeil::Ininterruptible);
         }
-        recues += (reseau::arp_recues() > avant) as u32;
+        ((temps::ns_monotone() - debut) / 1_000_000, arp::voisin(i, adresse))
+    };
+    let mut cibles = [b.passerelle, b.dns[0]];
+    if cibles[0] == cibles[1] {
+        cibles[1] = None;
     }
-    afficherln!("[reseau] {} : deux sondes ARP (qui a 10.0.2.2 ?) emises, reponses de la passerelle de QEMU recues : {}.",
-                i.nom, if recues == 2 { "ok" } else { "ECHEC" });
+    let mut ok = true;
+    for a in cibles.into_iter().flatten() {
+        let Some(p) = paquet(a) else { return };
+        arp::envoyer(i, a, p, false);
+        let (_, v) = attendre(a, |e| e == Etat::Joignable, 1000);
+        match v {
+            Some((Etat::Joignable, mac)) => afficherln!("[reseau] {} : voisin {} : {}, joignable (ARP).", i.nom,
+                                                       formats::reseau::Ipv4Affichee(a), reseau::virtio_net::Mac(mac)),
+            _ => ok = false,
+        }
+    }
+    afficherln!("[reseau] {} : la passerelle et le DNS resolus par ARP : {}.", i.nom, if ok { "ok" } else { "ECHEC" });
+    #[cfg(feature = "test-programmes")]
+    {
+        let muet = [10, 0, 2, 99];
+        let jetes = arp::jetes();
+        let Some(p) = paquet(muet) else { return };
+        arp::envoyer(i, muet, p, false);
+        let (ms, v) = attendre(muet, |e| e == Etat::Echec, 5000);
+        let echec = v.is_some_and(|(e, _)| e == Etat::Echec) && (2900..4000).contains(&ms);
+        afficherln!("[reseau] {} : voisin muet 10.0.2.99 : echec apres trois requetes, en 3 s, son paquet jete : {}.", i.nom,
+                    if echec && arp::jetes() == jetes + 1 { "ok" } else { "ECHEC" });
+    }
 }
 
 /// Vérifie l'allocateur de pages : des blocs alignés sur leur taille, qu'on

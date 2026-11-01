@@ -1,5 +1,5 @@
-//! Les en-têtes des trames du réseau (6g) : Ethernet, IPv4, UDP, et les
-//! messages de DHCP.
+//! Les en-têtes des trames du réseau (6g) : Ethernet, ARP, IPv4, UDP, et
+//! les messages de DHCP.
 //!
 //! Une trame reçue vient du dehors : n'importe qui sur le réseau peut
 //! l'avoir fabriquée pour faire lire le noyau hors du tampon, ou le faire
@@ -12,6 +12,7 @@
 //! le premier octet est le plus fort. Une adresse IPv4 est gardée comme ses
 //! quatre octets, dans cet ordre ([10, 0, 2, 15] pour 10.0.2.15).
 
+pub mod arp;
 pub mod dhcp;
 pub mod ethernet;
 pub mod ipv4;

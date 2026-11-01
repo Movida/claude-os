@@ -6,7 +6,10 @@
  * ipconfig (ip=dhcp) sur la même machine, octet pour octet :
  *   - /proc/net/route : la table principale, lignes de 127 colonnes ;
  *   - /etc/resolv.conf, un lien vers /proc/net/pnp : le résultat du DHCP ;
- *   - /proc/net/dev : son en-tête, et la ligne d'eth0.
+ *   - /proc/net/dev : son en-tête, et la ligne d'eth0 ;
+ *   - /proc/net/arp : son en-tête, et les voisins résolus au démarrage (la
+ *     passerelle et le DNS de slirp, dont l'adresse matérielle est 52:55
+ *     suivi de leur adresse IPv4).
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -79,6 +82,15 @@ int main(void)
     const char *entete = "Inter-|   Receive                                                |  Transmit\n"
         " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n";
     verifier(strncmp(t, entete, strlen(entete)) == 0 && strncmp(t + strlen(entete), "  eth0: ", 8) == 0, "/proc/net/dev : en-tete et eth0");
+
+    /* /proc/net/arp : l'en-tête d'arp_seq_show, puis une ligne par voisin
+     * (dans l'ordre de la table : Linux suit celui de ses seaux, on ne
+     * compare que les lignes). */
+    lire_tout("/proc/net/arp", t, sizeof t, 13);
+    verifier(strncmp(t, "IP address       HW type     Flags       HW address            Mask     Device\n", 79) == 0
+             && strstr(t, "\n10.0.2.2         0x1         0x2         52:55:0a:00:02:02     *        eth0\n")
+             && strstr(t, "\n10.0.2.3         0x1         0x2         52:55:0a:00:02:03     *        eth0\n"),
+             "/proc/net/arp : la passerelle et le DNS, comme Linux");
 
     printf("[linux] passerelle : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;

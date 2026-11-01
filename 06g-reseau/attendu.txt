@@ -37,8 +37,10 @@ rendues et recollees : ok.
 [noyau] MSI-X de 00:03.0 : 4 entrees, entree 1 programmee et relue : ok.
 [virtio] 00:03.0 : reseau, fonctionnalites VERSION_1 MAC STATUS EVENT_IDX, 3 files.
 [reseau] eth0 : virtio-net 52:54:00:12:34:56, mtu 1500, lien actif.
-[reseau] eth0 : deux sondes ARP (qui a 10.0.2.2 ?) emises, reponses de la passerelle de QEMU recues : ok.
 [reseau] eth0 : 10.0.2.15/24, passerelle 10.0.2.2, DNS 10.0.2.3 (DHCP de 10.0.2.2, 
+[reseau] eth0 : voisin 10.0.2.2 : 52:55:0a:00:02:02, joignable (ARP).
+[reseau] eth0 : voisin 10.0.2.3 : 52:55:0a:00:02:03, joignable (ARP).
+[reseau] eth0 : la passerelle et le DNS resolus par ARP : ok.
 [noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
 memoire rendue : ok.
 [16 bits] Archive de programmes lue, placee apres le noyau.
@@ -168,6 +170,7 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] passerelle : /etc/resolv.conf -> /proc/net/pnp : ok
 [linux] passerelle : /etc/resolv.conf : le DNS de slirp : ok
 [linux] passerelle : /proc/net/dev : en-tete et eth0 : ok
+[linux] passerelle : /proc/net/arp : la passerelle et le DNS, comme Linux : ok
 [linux] passerelle : toutes les verifications : ok
 [noyau] passerelle : termine, code de sortie 0 ; memoire rendue : ok.
 [noyau] claude : programme Linux (ELF ET_EXEC), 291638640 octets, point d'entree 0x1be7900, segments :

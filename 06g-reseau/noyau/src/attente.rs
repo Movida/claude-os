@@ -539,8 +539,9 @@ pub fn tic() {
 }
 
 /// Le détecteur d'interblocage, appelé par la tâche inactive quand aucune
-/// tâche n'est prête, interruptions coupées. Si aucune minuterie n'est
-/// armée, plus rien ne peut réveiller les programmes qui dorment : ni une
+/// tâche n'est prête, interruptions coupées. Si aucune minuterie d'un
+/// programme n'est armée, plus rien ne peut réveiller les programmes qui
+/// dorment : ni une
 /// échéance, ni une autre tâche (aucune ne s'exécute), ni un périphérique
 /// (le clavier ne réveille que sa tâche du noyau, jusqu'au terminal de
 /// 6j). Linux les laisserait endormis pour toujours ; sans terminal,
@@ -548,9 +549,14 @@ pub fn tic() {
 /// par SIGKILL, en le disant. Un écart voulu, qui généralise celui de 6d
 /// (une attente de futex sans délai dans un programme d'un seul fil). Les
 /// tâches du noyau (init qui attend un programme, le clavier) ne sont pas
-/// concernées. Rend vrai s'il a arrêté quelqu'un.
+/// concernées. Seules comptent les minuteries des programmes : celles des
+/// tâches du noyau (6g : les voisins du réseau, que la tâche du réseau fait
+/// vieillir pendant des dizaines de secondes) ne réveillent pas un programme
+/// ; sans cela, un programme bloqué pour toujours attendrait la prochaine
+/// échéance de la tâche du réseau pour être arrêté. Rend vrai s'il a arrêté
+/// quelqu'un.
 pub fn detecter_interblocage() -> bool {
-    if !MINUTERIES.verrouiller().is_empty() || !ATTENTES_CALCUL.verrouiller().is_empty() {
+    if MINUTERIES.verrouiller().iter().any(|(_, t)| t.est_programme()) || !ATTENTES_CALCUL.verrouiller().is_empty() {
         return false;
     }
     let mut bloquees: Vec<Arc<Tache>> = Vec::new();

@@ -5,7 +5,7 @@
 //! bonne raison ; puis des mutations au hasard, à graine fixe : aucune
 //! panique, et ce qui est accepté reste dans les octets reçus.
 
-use formats::reseau::{self, Erreur, dhcp, ethernet, ipv4, udp};
+use formats::reseau::{self, Erreur, arp, dhcp, ethernet, ipv4, udp};
 use std::path::PathBuf;
 
 fn trame(nom: &str) -> Vec<u8> {
@@ -103,6 +103,25 @@ fn reponse_arp() {
     // slirp complète la trame à 64 octets (60, et 4 de plus).
     assert_eq!(reste.len(), 64 - ethernet::ENTETE);
     assert!(!e.vers_un_groupe());
+    // La réponse à notre sonde de 0.0.0.0 : « 10.0.2.2, c'est moi ».
+    let a = arp::lire(reste).unwrap();
+    assert_eq!(a, arp::Arp { operation: arp::REPONSE, mac_emetteur: SLIRP_MAC, ip_emetteur: [10, 0, 2, 2],
+                             mac_cible: NOTRE_MAC, ip_cible: [0; 4] });
+    // Réécrite : les mêmes 28 octets.
+    let mut o = [0u8; arp::TAILLE];
+    arp::ecrire(&mut o, &a);
+    assert_eq!(&o[..], &reste[..arp::TAILLE]);
+    // Le type de matériel 6 (IEEE 802) est accepté, comme par Linux.
+    let mut m = reste.to_vec();
+    m[1] = 6;
+    assert_eq!(arp::lire(&m), Ok(a));
+    // Pas Ethernet, pas IPv4, des longueurs fausses, tronquée.
+    for (i, v) in [(1, 7), (3, 0xdd), (4, 8), (5, 16)] {
+        let mut m = reste.to_vec();
+        m[i] = v;
+        assert_eq!(arp::lire(&m), Err(Erreur::Invalide), "octet {i}");
+    }
+    assert_eq!(arp::lire(&reste[..27]), Err(Erreur::Tronque));
 }
 
 #[test]

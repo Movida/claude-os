@@ -3,7 +3,7 @@
 # virtio (noyau/src/virtio.rs, virtqueue.rs) et la carte virtio-net, ses
 # files et la tâche du réseau (noyau/src/reseau/) ; Ethernet, IPv4 et la
 # configuration par DHCP (formats/src/reseau/, et la bibliothèque inet/ :
-# les routes, le client DHCP).
+# les routes, le client DHCP), ARP et la table des voisins.
 # De 6f : les signaux livrés à leurs gestionnaires (le
 # cadre de signal, rt_sigreturn, la reprise des appels interrompus),
 # l'attente d'événements (poll, select, epoll), les tubes, /proc fabriqué
