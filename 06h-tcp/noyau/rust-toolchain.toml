@@ -1,0 +1,9 @@
+# Version de Rust figée : tout le monde (la VM de David, la CI) compile le
+# noyau avec exactement le même compilateur. rustup l'installe tout seul à la
+# première commande cargo lancée dans ce dossier.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+# Cible « x86_64 sans système » : pas de bibliothèque standard, pas de
+# zone rouge, pas d'instructions SSE (voir src/main.rs).
+targets = ["x86_64-unknown-none"]
