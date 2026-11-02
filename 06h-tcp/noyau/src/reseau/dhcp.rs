@@ -10,7 +10,10 @@
 //! a, pour les machines qui démarrent par le réseau, un client DHCP dans le
 //! noyau : nous faisons de même. Le lanceur l'attend avant /etc/demarrage
 //! (Linux attend `ip_auto_config` avant de lancer /init), les programmes
-//! trouvent donc le réseau prêt.
+//! trouvent donc le réseau prêt. Chez Linux, ce client ne sert qu'à
+//! démarrer sur le réseau (un système de fichiers racine par NFS) : avec un
+//! shell (6l), et des sockets brutes, le nôtre pourra passer dans un
+//! programme, comme sur une distribution ; ou rester ici, comme `ipconfig`.
 //!
 //! Les messages partent en diffusion limitée, de 0.0.0.0:68 vers
 //! 255.255.255.255:67 ; les réponses arrivent par l'entrée d'IPv4, qui les

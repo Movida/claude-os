@@ -780,8 +780,9 @@ pm_entry:
     ;   - correspondance IDENTITÉ (adresse virtuelle = adresse physique) : le
     ;     code qui active la pagination continue de s'exécuter à la même
     ;     adresse, sans quoi l'instruction suivante serait introuvable. Le
-    ;     noyau mettra plus tard sa propre organisation (noyau dans la moitié
-    ;     haute de l'espace d'adresses, comme Linux) ;
+    ;     noyau installe ensuite sa propre organisation (lui-même dans la
+    ;     moitié haute de l'espace d'adresses, comme Linux : voir
+    ;     noyau/src/espace.rs) ;
     ;   - pages de 2 Mio : un seul niveau de moins à remplir. Des pages de
     ;     4 Kio couvriraient 1 Gio avec 512 tables de plus (2 Mio de tables) ;
     ;     des pages de 1 Gio n'existent pas sur tous les CPU (cpuid pdpe1gb),
@@ -1095,8 +1096,8 @@ gdt_code64:
     db 0x00
 
 ; Le segment de données 0x10 sert aussi en 64 bits : seul y compte le bit P.
-; Pas encore de segments utilisateur (DPL=3) ni de TSS : ils arriveront avec
-; les processus.
+; Ni segments utilisateur (DPL=3) ni TSS : la GDT du chargeur n'en aura
+; jamais ; ceux des programmes sont dans la GDT du noyau (noyau/src/gdt.rs).
 
 gdt_end:
 

@@ -8,8 +8,10 @@ edition = "2024"
 [dependencies]
 # L'interpréteur WebAssembly de l'étape 4, notre propre bibliothèque.
 wasm = { path = "../wasm" }
-# La lecture des formats de fichiers : l'archive de programmes (cpio), et
-# bientôt les exécutables ELF. Notre propre bibliothèque, sans unsafe.
+# La lecture des formats : l'archive de programmes (cpio), les exécutables
+# ELF, les tables de l'ACPI, l'espace de configuration PCI, les paquets du
+# réseau, les lignes de /etc/demarrage. Notre propre bibliothèque, sans
+# unsafe, testée sur l'hôte.
 formats = { path = "../formats" }
 # La carte des zones des programmes, notre propre bibliothèque, sans
 # unsafe, testée sur l'hôte.
