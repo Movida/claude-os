@@ -79,6 +79,7 @@ mod vfs;
 mod vmalloc;
 mod vga;
 mod virtio;
+mod virtio_rng;
 mod virtqueue;
 mod wasi;
 
@@ -365,6 +366,9 @@ extern "C" fn noyau_main(infos: u64) -> ! {
 
     // Le réseau : les cartes qu'on sait piloter, et la tâche qui fait leur
     // travail.
+    // Le générateur matériel de la machine virtuelle, s'il y en a un :
+    // avant le réseau, qui tire ses premiers nombres (le DHCP).
+    virtio_rng::sonder();
     reseau::demarrer();
 
     afficherln!("[noyau] Ordonnanceur EEVDF : tranche de {}.{:02} ms, preemption du noyau.",

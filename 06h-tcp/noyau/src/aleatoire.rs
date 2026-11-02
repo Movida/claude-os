@@ -24,12 +24,16 @@
 //!     programme attend un générateur pas encore prêt : le compteur de
 //!     cycles lu à chaque fin de sommeil d'une milliseconde, dont l'instant
 //!     exact dépend de tout ce que fait la machine ;
-//!   - virtio-rng, quand la machine en a une (sous-étape suivante).
+//!   - virtio-rng, le générateur de l'hyperviseur (virtio_rng.rs), quand
+//!     la machine en a un.
 //!
-//! Sur la machine de l'étape (`-cpu Nehalem`, de 2008), ni RDRAND ni
-//! RDSEED : le générateur n'est pas prêt au démarrage. Le noyau tire quand
-//! même (ce qu'il a, comme Linux), mais un programme qui demande de l'aléa
-//! sûr attend, ou reçoit EAGAIN s'il ne veut pas attendre.
+//! Sans RDRAND ni RDSEED (`-cpu Nehalem`, de 2008, le processeur de la
+//! machine de l'étape), le générateur n'est pas prêt au démarrage :
+//! virtio-rng le rend prêt avant le réseau sur la machine de l'étape ; sans
+//! lui (la machine des programmes de test), la gigue ou les interruptions.
+//! En attendant, le noyau tire quand même (ce qu'il a, comme Linux), mais
+//! un programme qui demande de l'aléa sûr attend, ou reçoit EAGAIN s'il ne
+//! veut pas attendre.
 //!
 //! LE VERROU : un seul, court (interruptions coupées), pour le réservoir,
 //! le générateur et le lot (Linux en a trois, plus un par processeur, pour

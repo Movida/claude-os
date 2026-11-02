@@ -7,7 +7,8 @@
 [noyau] Retour apres int3 : les exceptions sont gerees.
 [alea] pas encore pret (ni RDRAND ni RDSEED)
 [alea] ChaCha20, BLAKE2s, SipHash : vecteurs des RFC : ok.
-[alea] pret (
+[virtio] 00:04.0 : alea.
+[alea] pret (virtio-rng).
 [noyau] APIC local 0 a 0xfee00000 (xAPIC, version 0x14), IO-APIC 0 a 0xfec00000 (GSI 0-23) ; 8259 masque.
 [noyau] Clavier : IRQ 1 sur le GSI 1, vecteur 0x31.
 [noyau] TSC : 
@@ -33,9 +34,10 @@ rendues et recollees : ok.
 [noyau] ACPI : RSDP v0 (BOCHS), RSDT : FACP APIC HPET WAET.
 [noyau] ACPI : 1 processeur, APIC local a 0xfee00000, IO-APIC 0 a 0xfec00000 (GSI a partir de 0), 8259 present.
 [noyau] ACPI : IRQ ISA remplacees : 0 -> GSI 2 ; 5 -> GSI 5 en niveau ; 9 -> GSI 9 en niveau ; 10 -> GSI 10 en niveau ; 11 -> GSI 11 en niveau ; NMI sur LINT1.
-[pci] 7 fonctions sur le bus (ports 0xCF8 et 0xCFC).
+[pci] 8 fonctions sur le bus (ports 0xCF8 et 0xCFC).
 [pci] 00:00.0 8086:1237 pont hote.
 [pci] 00:03.0 1af4:1000 Ethernet, BAR0 ports 0xc080 (32), BAR1 0xfeb91000 (4 Kio), BAR4 0xfe000000 (16 Kio, 64 bits, prefetchable), MSI-X (4 entrees).
+[pci] 00:04.0 1af4:1005 autre, BAR0 ports
 [noyau] Vecteurs a la demande : 0x40 donne, IPI a soi-meme recue par son gestionnaire : ok ; rendu : ok.
 [noyau] MSI-X de 00:03.0 : 4 entrees, entree 1 programmee et relue : ok.
 [virtio] 00:03.0 : reseau, fonctionnalites VERSION_1 MAC STATUS EVENT_IDX, 3 files.

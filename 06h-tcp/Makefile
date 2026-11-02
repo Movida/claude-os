@@ -2,7 +2,8 @@
 # bibliothèque crypto/ (ChaCha20, BLAKE2s, SipHash), rejouée par le noyau
 # au démarrage ; le générateur de Linux (crypto/src/alea.rs et
 # noyau/src/aleatoire.rs : le réservoir, RDSEED et RDRAND, les
-# interruptions, la gigue ; getrandom, /dev/random, linux/aleatoire.c).
+# interruptions, la gigue ; getrandom, /dev/random, linux/aleatoire.c),
+# et virtio-rng, le générateur matériel de QEMU (noyau/src/virtio_rng.rs).
 # De 6g : le réseau. Le bus PCI (formats/src/pci.rs et
 # noyau/src/pci.rs), les vecteurs d'interruption à la demande et MSI-X,
 # virtio (noyau/src/virtio.rs, virtqueue.rs) et la carte virtio-net, ses
@@ -110,7 +111,15 @@
 # une carte sans MSI-X (vectors = 0, mesuré avec QEMU 8.2).
 QEMU_DISQUE = virtio
 QEMU_RESEAU = -netdev user,id=n0 -device virtio-net-pci,netdev=n0
-QEMU_OPTIONS = -cpu Nehalem -m 2G $(QEMU_RESEAU)
+#
+# Le générateur matériel (6h) : virtio-rng, l'aléa de l'hôte, comme Linux
+# l'emploie dans une machine virtuelle ; sans lui, et sans RDRAND (Nehalem
+# n'en a pas), le générateur du noyau attend la gigue. Chaque machine de
+# l'étape l'a, sauf celle des programmes de test (QEMU_PROGRAMMES) : avec
+# -cpu qemu64, elle passe par la gigue, le chemin de la machine sans
+# générateur.
+QEMU_ALEA = -device virtio-rng-pci
+QEMU_OPTIONS = -cpu Nehalem -m 2G $(QEMU_RESEAU) $(QEMU_ALEA)
 QEMU = qemu-system-x86_64 -drive format=raw,file=boot.bin,if=$(QEMU_DISQUE) $(QEMU_OPTIONS)
 MON  = /tmp/qemu-mon-os.sock
 NOYAU_ELF = noyau/target/x86_64-unknown-none/release/noyau
@@ -1010,11 +1019,12 @@ QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot $(QEMU_
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
 tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin sans-reseau.bin claude-p
-	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
-	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"Clavier PS/2 pret",:)
+	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
+	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"Clavier PS/2 pret",:)
 	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
 	grep -F "MSI-X de 00:03.0 : pas d'APIC local : pas de MSI-X." test-sans-acpi.log
-	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -drive format=raw$(,)file=test-gros.bin -serial file:test-gros.log,test-gros.log,"chaque secteur a sa place : ok",:)
+	grep -F "generateur laisse eteint." test-sans-acpi.log
+	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-gros.bin -serial file:test-gros.log,test-gros.log,"chaque secteur a sa place : ok",:)
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) -device pci-bridge$(,)id=pont$(,)chassis_nr=1 -netdev user$(,)id=n1 \
 	  -device virtio-net-pci$(,)netdev=n1$(,)bus=pont$(,)addr=1 -drive format=raw$(,)file=vide.bin -serial file:test-pont.log,test-pont.log,"[pci] 01:01.0 1af4:1000 Ethernet",:)
 	grep -F "[pci] 00:04.0 1b36:0001 pont PCI, bus 1-1" test-pont.log
@@ -1022,10 +1032,10 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin sans-resea
 	  -serial file:test-sans-dhcp.log,test-sans-dhcp.log,"[reseau] eth0 : pas de reponse DHCP (3 essais) : pas d'adresse.",:)
 	$(call attendre,$(QEMU_TEST) -netdev user$(,)id=n0 -device virtio-net-pci$(,)netdev=n0$(,)vectors=0 -drive format=raw$(,)file=vide.bin \
 	  -serial file:test-sans-msix.log,test-sans-msix.log,"[virtio] 00:03.0 : pas de MSI-X : carte laissee eteinte.",:)
-	$(call attendre,$(QEMU_TEST) -nic none -drive format=raw$(,)file=sans-reseau.bin -serial file:test-sans-reseau.log,test-sans-reseau.log,"[noyau] passerelle : termine",:)
+	$(call attendre,$(QEMU_TEST) -nic none $(QEMU_ALEA) -drive format=raw$(,)file=sans-reseau.bin -serial file:test-sans-reseau.log,test-sans-reseau.log,"[noyau] passerelle : termine",:)
 	grep -F "[linux] passerelle : toutes les verifications (sans reseau) : ok" test-sans-reseau.log
 	rm -f test-lien.log $(MON_TESTS); \
-	$(QEMU_TEST) $(QEMU_RESEAU) -drive format=raw,file=vide.bin -serial file:test-lien.log -monitor unix:$(MON_TESTS),server,nowait & q=$$!; \
+	$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw,file=vide.bin -serial file:test-lien.log -monitor unix:$(MON_TESTS),server,nowait & q=$$!; \
 	ligne() { for i in $$(seq $$(( $(DUREE) * 10 ))); do grep -qF -- "$$1" test-lien.log 2>/dev/null && return 0; \
 	  kill -0 $$q 2>/dev/null || return 1; sleep 0.1; done; return 1; }; \
 	ligne "eth0 : virtio-net" && echo "set_link n0 off" | nc -U -q1 $(MON_TESTS) >/dev/null && \
