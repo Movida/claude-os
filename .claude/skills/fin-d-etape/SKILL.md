@@ -61,7 +61,10 @@ avec les commandes données à la fin.
      interruptions coupées (les tics de l'horloge se perdent).
    - **Pour une bibliothèque testée sur l'hôte** (étape 4) : faire échouer
      un test exprès pour vérifier que `make tests-hote` le signale ; faire « muter »
-     le code (un décalage de un) pour vérifier qu'un contrôle le détecte ;
+     le code (un décalage de un) pour vérifier qu'un contrôle le détecte
+     (`cargo mutants`, un outil de l'hôte comme `wast2json`, le fait pour
+     toute une bibliothèque : les modules qui survivent à beaucoup de
+     mutations sont ceux que les tests vérifient mal) ;
      fuzzer décodeur et validateur avec des millions de modules corrompus,
      dans une crate temporaire du brouillon qui dépend de la bibliothèque
      par son chemin (`overflow-checks = true` dans son profil, et un
@@ -98,7 +101,10 @@ avec les commandes données à la fin.
    réécriture ne change que l'historique). `range-diff` montre, commit par
    commit, ce que chaque fixup a changé.
 6. **Documenter** : `CLAUDE.md` (feuille de route), `HISTORIQUE.md` (ce que
-   l'étape a fait, ce qui reste à faire), dans un commit
+   l'étape a fait ; « Reste à faire » : chaque dette avec l'étape qui la
+   remboursera, ou ce qui la déclenchera, et les écarts voulus avec Linux
+   à part), `README.md` (où en est le projet, le tableau des étapes : il
+   s'était arrêté à 6d sans que personne le voie), dans un commit
    « Projet : etape NN terminee ... ».
 7. **Supprimer** les branches de travail et la sauvegarde devenues inutiles.
 8. **Commandes pour David**, depuis WSL, dans le dépôt :
@@ -446,3 +452,27 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   d'arrêt. Reproduit avec un signataire qui lit son entrée. Lire la
   liste par un autre descripteur (`while read -r k <&3; do ... done 3<
   liste`), et donner `</dev/null` aux commandes de la boucle.
+
+## Pièges rencontrés pendant la relecture globale (2 novembre 2026)
+
+- **Un auto-test du démarrage qui ne peut pas échouer** : `verifier.sh`
+  cherchait chaque ligne attendue n'importe où, jamais l'absence d'un
+  « ECHEC » ; une vérification dont la ligne attendue était aussi
+  contenue dans 33 autres lignes passait toujours. Pour chaque ligne
+  attendue neuve, vérifier qu'elle ne se trouve pas déjà ailleurs dans
+  le journal (`grep -c`), et faire échouer exprès ce qu'elle vérifie.
+- **clippy ne reconnaît que « SAFETY: »** (sans l'espace du français)
+  pour `undocumented_unsafe_blocks` ; et `rustup` ajoute tout seul un
+  composant listé dans le `rust-toolchain.toml` d'une étape (clippy),
+  même si la version est déjà installée (vérifié avec rustup 1.29).
+- **Couper un travail déjà fait en plusieurs commits** : appliquer à
+  l'index des morceaux de `git diff -U0` (`git apply --cached
+  --unidiff-zero`) les a placés de travers là où deux morceaux se
+  touchaient. Reconstruire plutôt chaque fichier du commit (le texte
+  ajouté par les morceaux à garder pour plus tard, remplacé par l'ancien),
+  et comparer l'arbre obtenu à la copie qui a été vérifiée (`cmp`).
+- **Deux fils dans le même conteneur** : travailler dans un clone à part
+  (le `.git` partagé avec WSL ne doit pas changer de branche sous l'autre
+  fil), vérifier une copie de l'arbre à commiter (`git checkout-index -a
+  --prefix=...`, puis `VERIF_RACINE`) pendant qu'on avance dans le clone,
+  et ne lancer qu'un QEMU à la fois.
