@@ -42,12 +42,13 @@
 //! `ucounts` de Linux.
 
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
+use crate::faillible::{FileFaillible, VecFaillible};
 use crate::fil;
 use crate::linux::Signal;
+use crate::partage::Arc;
 use crate::processus::{self, Processus};
 use crate::tache::{self, Tache};
 
@@ -197,11 +198,10 @@ impl EnAttente {
     /// Range un siginfo (déjà compté dans EN_FILE) : faux s'il n'y a pas la
     /// place (plus de mémoire), le compte est alors rendu.
     fn garder(&mut self, info: Info) -> bool {
-        if self.file.try_reserve(1).is_err() {
+        if self.file.ajouter_derriere(info).is_err() {
             EN_FILE.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
-        self.file.push_back(info);
         true
     }
 
@@ -1060,8 +1060,8 @@ pub fn kill(pid: u64, sig: u64) -> i64 {
         -1 => {
             let mut autres = alloc::vec::Vec::new();
             processus::pour_chaque_pid(|p| {
-                if p != soi && autres.try_reserve(1).is_ok() {
-                    autres.push(p);
+                if p != soi {
+                    let _ = autres.ajouter(p);
                 }
             });
             let mut r = -ESRCH;

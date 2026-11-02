@@ -50,6 +50,7 @@ use core::fmt;
 
 use crate::descripteurs::Fichier;
 use crate::espace_utilisateur;
+use crate::faillible;
 use crate::memoire::{self, Memoire};
 use crate::programmes::NomCourt;
 use formats::elf::{Entete, Executable, Genre, Image, Plage};
@@ -140,9 +141,7 @@ pub fn verifier(taille: u64, lire: impl Fn(u64, &mut [u8]) -> bool) -> Result<(E
     }
     let entete = formats::elf::lire_entete(&premiers).map_err(Refus::Format)?;
     let (position, longueur) = entete.table();
-    let mut table = Vec::new();
-    table.try_reserve_exact(longueur).map_err(|_| Refus::PlusDeMemoire)?;
-    table.resize(longueur, 0);
+    let mut table = faillible::remplie(longueur, 0).map_err(|_| Refus::PlusDeMemoire)?;
     if position.checked_add(longueur as u64).is_none_or(|fin| fin > taille) || !lire(position, &mut table) {
         return Err(Refus::Format(formats::elf::Erreur::TableTronquee));
     }

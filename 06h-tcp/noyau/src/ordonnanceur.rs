@@ -49,9 +49,10 @@
 //! préempte aussi en rendant un verrou ; chez nous, un réveil fait dans le
 //! noyau ne prend effet qu'au retour vers l'anneau 3 ou au tic suivant.
 
+use crate::faillible::VecFaillible;
+use crate::partage::Arc;
 use crate::tache::{self, Tache};
 use crate::verrou::{self, Verrou};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -166,8 +167,9 @@ impl File {
         let vruntime = (self.moyenne() as i64).saturating_sub(lag).max(0) as u64;
         let tranche = if neuve { tranche_virtuelle(poids) / 2 } else { tranche_virtuelle(poids) };
         // La place est réservée au démarrage (`initialiser`) : la file ne
-        // grandit pas pendant un programme.
-        self.entites.push(Entite { tache: t, vruntime, echeance: vruntime + tranche, poids, protegee: false });
+        // grandit pas pendant un programme, et l'ordonnanceur n'appelle
+        // jamais le tas (il tourne aussi dans les interruptions).
+        self.entites.ajouter_dans_la_place(Entite { tache: t, vruntime, echeance: vruntime + tranche, poids, protegee: false });
     }
 
     /// Retire `t` de la file, en gardant son retard (`update_entity_lag`) :

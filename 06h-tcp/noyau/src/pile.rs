@@ -28,10 +28,9 @@
 //! pages, son point d'entrée, ses identités, les fonctions du processeur...
 //! La glibc le lit avant même main (_dl_aux_init), et getauxval() le rend.
 
-use alloc::vec::Vec;
 
 use crate::chargeur_elf::{self, Programme};
-use crate::{aleatoire, espace_utilisateur, memoire};
+use crate::{aleatoire, espace_utilisateur, faillible, memoire};
 
 const PAGE: u64 = 4096;
 
@@ -162,12 +161,8 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
     if (argv.len() + envp.len()) as u64 > PLACE_MAX {
         return Err(Erreur::TropLong);
     }
-    let mut adresses_envp = Vec::new();
-    let mut adresses_argv = Vec::new();
-    adresses_envp.try_reserve_exact(envp.len()).map_err(|_| Erreur::PlusDeMemoire)?;
-    adresses_argv.try_reserve_exact(argv.len()).map_err(|_| Erreur::PlusDeMemoire)?;
-    adresses_envp.resize(envp.len(), 0);
-    adresses_argv.resize(argv.len(), 0);
+    let mut adresses_envp = faillible::remplie(envp.len(), 0).map_err(|_| Erreur::PlusDeMemoire)?;
+    let mut adresses_argv = faillible::remplie(argv.len(), 0).map_err(|_| Erreur::PlusDeMemoire)?;
     for (i, e) in envp.iter().enumerate().rev() {
         adresses_envp[i] = c.chaine(e)?;
     }
@@ -221,9 +216,9 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
     ];
     // Ses octets, dans l'ordre du processeur (petit-boutiste).
     let mots = 1 + argv.len() + 1 + envp.len() + 1 + 2 * auxv.len();
-    let mut octets = Vec::new();
-    octets.try_reserve_exact(8 * mots).map_err(|_| Erreur::PlusDeMemoire)?;
-    let mut mettre = |valeur: u64| octets.extend_from_slice(&valeur.to_le_bytes());
+    let mut octets = faillible::remplie(8 * mots, 0).map_err(|_| Erreur::PlusDeMemoire)?;
+    let mut place = octets.chunks_exact_mut(8);
+    let mut mettre = |valeur: u64| place.next().expect("mots comptes").copy_from_slice(&valeur.to_le_bytes());
     mettre(argv.len() as u64);
     adresses_argv.iter().for_each(|&a| mettre(a));
     mettre(0);

@@ -33,6 +33,7 @@
 
 use super::interface::{self, Compteurs, Interface, Materiel};
 use super::paquet::Paquet;
+use crate::faillible::FileFaillible;
 use crate::verrou::Verrou;
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -86,7 +87,8 @@ pub fn emettre(i: &Interface, p: Paquet) {
             drop(f);
             return Compteurs::compter(&i.compteurs.jetes_reception, 1);
         }
-        f.push_back(p);
+        // La place de MAX paquets est prise au démarrage (`ajouter`).
+        f.ajouter_derriere_dans_la_place(p);
     }
     for (paquets, octets) in [(&i.compteurs.recus, &i.compteurs.octets_recus), (&i.compteurs.emis, &i.compteurs.octets_emis)] {
         Compteurs::compter(paquets, 1);

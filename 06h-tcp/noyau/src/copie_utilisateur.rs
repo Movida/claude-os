@@ -59,6 +59,7 @@ use core::arch::{asm, global_asm};
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::espace_utilisateur::ADRESSE_MAX;
+use crate::faillible::VecFaillible;
 
 /// SMAP est-il en service ? Lu par l'assembleur (un octet : AtomicBool a
 /// la taille et la représentation d'un u8), dans la copie et en tête de
@@ -341,7 +342,7 @@ pub fn chaine_depuis_utilisateur(source: u64, max: usize) -> Result<alloc::vec::
         // Jusqu'à la fin de la page, ou de la place.
         let n = ((4096 - adresse % 4096) as usize).min(max - chaine.len());
         let debut = chaine.len();
-        chaine.resize(debut + n, 0);
+        chaine.redimensionner(debut + n, 0).map_err(|_| ErreurChaine::PlusDeMemoire)?;
         copier_depuis_utilisateur(&mut chaine[debut..], adresse).map_err(|_| ErreurChaine::Faute)?;
         if let Some(zero) = chaine[debut..].iter().position(|&o| o == 0) {
             chaine.truncate(debut + zero);

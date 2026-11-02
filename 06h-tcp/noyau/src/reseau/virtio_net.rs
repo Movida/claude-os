@@ -46,6 +46,7 @@
 
 use super::interface::{self, Interface, Materiel};
 use super::paquet::Paquet;
+use crate::faillible::{self, FileFaillible, VecFaillible};
 use crate::pci::{self, Fonction};
 use crate::virtio::{self, Notifieur, Virtio};
 use crate::virtqueue::{ECRIT_PAR_PERIPHERIQUE, Tampon, Virtqueue};
@@ -213,10 +214,9 @@ struct Tampons(Vec<u64>);
 impl Tampons {
     /// Prend `n` pages. None : plus de mémoire (rien n'est gardé).
     fn new(n: usize) -> Option<Tampons> {
-        let mut t = Tampons(Vec::new());
-        t.0.try_reserve_exact(n).ok()?;
+        let mut t = Tampons(faillible::avec_capacite(n).ok()?);
         for _ in 0..n {
-            t.0.push(pages::allouer(0)?);
+            t.0.ajouter_dans_la_place(pages::allouer(0)?);
         }
         Some(t)
     }
@@ -277,10 +277,15 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
     };
     let mut libres = Vec::new();
     let mut attente = VecDeque::new();
+    // La place de toutes les cases, et de la petite file : l'émission
+    // n'alloue jamais (elle rend une case à sa place, met un paquet en
+    // attente dans la sienne).
     if libres.try_reserve_exact(TAILLE_FILE as usize).is_err() || attente.try_reserve_exact(ATTENTE_MAX).is_err() {
         return Err(renoncer(v, virtio::Refus::Memoire));
     }
-    libres.extend((0..TAILLE_FILE).rev());
+    for case in (0..TAILLE_FILE).rev() {
+        libres.ajouter_dans_la_place(case);
+    }
     // Les files d'abord, puis leurs interruptions : la carte est dans le
     // tas (son adresse, l'argument des gestionnaires, ne bouge plus), et
     // n'y est laissée pour toujours qu'une fois en service.
@@ -292,7 +297,8 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
         Ok(n) => n,
         Err(e) => return Err(renoncer(v, e)),
     };
-    let carte = alloc::boxed::Box::new(Carte {
+    let Ok(place) = faillible::boite_vide::<Carte>() else { return Err(renoncer(v, virtio::Refus::Memoire)) };
+    let carte = alloc::boxed::Box::write(place, Carte {
         adresse: f.adresse,
         virtio: v,
         interface: AtomicU32::new(0),
@@ -365,7 +371,7 @@ impl Carte {
         if e.attente.len() >= ATTENTE_MAX {
             return false;
         }
-        e.attente.push_back(p);
+        e.attente.ajouter_derriere_dans_la_place(p);
         // Être prévenu quand des cases se libèrent.
         if !e.file.rallumer() {
             super::tache::signaler_interface(self.interface.load(Ordering::Relaxed));
@@ -376,7 +382,7 @@ impl Carte {
     /// Reprend les cases que la carte a finies d'émettre.
     fn reprendre_cases(&self, e: &mut Emission) {
         while let Some((case, _)) = e.file.obtenir() {
-            e.libres.push(case as u16);
+            e.libres.ajouter_dans_la_place(case as u16);
         }
     }
 
@@ -415,7 +421,7 @@ impl Carte {
             self.reprendre_cases(&mut e);
             while let Some(p) = e.attente.pop_front() {
                 if !self.poser(&mut e, &p) {
-                    e.attente.push_front(p);
+                    e.attente.ajouter_devant_dans_la_place(p);
                     break;
                 }
             }

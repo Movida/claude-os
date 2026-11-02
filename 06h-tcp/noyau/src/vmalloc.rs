@@ -47,6 +47,7 @@
 //! disent sans calcul à quelle pile appartient une garde touchée.
 
 use crate::pagination::{self, ECRITURE, SANS_CACHE};
+use crate::faillible::VecFaillible;
 use crate::pages;
 use crate::verrou::Verrou;
 use alloc::vec::Vec;
@@ -117,11 +118,13 @@ pub fn initialiser() -> Bilan {
     }
     let tables = (avant - pages::libres()) as u64 * PAGE;
     let mut r = REGION.verrouiller();
-    // Les numéros dans l'ordre inverse : `pop` donne d'abord la case 0.
+    // Les numéros dans l'ordre inverse : `pop` donne d'abord la case 0. La
+    // liste a la place de toutes les piles : une pile rendue y retrouve
+    // toujours la sienne.
     r.piles_libres.try_reserve_exact(piles).expect("plus de memoire pour la liste des piles");
-    r.piles_libres.extend((0..piles as u32).rev());
+    r.piles_libres.ajouter_tout((0..piles as u32).rev()).expect("plus de memoire pour la liste des piles");
     r.plages.try_reserve_exact(16).expect("plus de memoire pour la liste des plages");
-    r.plages.push((debut_projections(piles), DEBUT + TAILLE));
+    r.plages.ajouter_dans_la_place((debut_projections(piles), DEBUT + TAILLE));
     PILES.store(piles, Ordering::Relaxed);
     Bilan { piles, tables }
 }
@@ -176,7 +179,7 @@ impl Drop for Pile {
                 pages::liberer(cadre, 0);
             }
         }
-        REGION.verrouiller().piles_libres.push(self.case);
+        REGION.verrouiller().piles_libres.ajouter_dans_la_place(self.case);
     }
 }
 
@@ -298,9 +301,7 @@ impl Drop for Projection {
             // plages, et le noyau en garde bien moins à la fois. Sinon, la
             // plage est perdue (des adresses seulement), pas la mémoire.
             (false, false) => {
-                if r.plages.try_reserve(1).is_ok() {
-                    r.plages.insert(i, (debut, fin));
-                }
+                let _ = r.plages.inserer(i, (debut, fin));
             }
         }
     }

@@ -49,6 +49,7 @@ use crate::copie_utilisateur::{
     copier_vers_utilisateur, copier_vers_utilisateur_partiel, dans_les_bornes,
 };
 use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Prive, Refus, Sorte, Tenu};
+use crate::faillible::{self, VecFaillible};
 use crate::processus::Processus;
 use crate::vfs::{self, CadresDuNoyau, Systeme};
 use crate::{aleatoire, console, evenements, pages, processus, procfs, tache, temps};
@@ -209,7 +210,7 @@ impl FichierTenu {
     }
 
     /// La socket d'un fichier de sorte Socket.
-    pub fn socket(&self) -> &alloc::sync::Arc<crate::reseau::socket::Socket> {
+    pub fn socket(&self) -> &crate::partage::Arc<crate::reseau::socket::Socket> {
         match &self.prive {
             Prive::Socket(s) => s,
             _ => unreachable!("une socket sans objet"),
@@ -428,10 +429,7 @@ fn canonique(s: &Systeme, pid: u32, fin: &Fin<Objet>) -> Vec<u8> {
             && vue.saut(lien) == Some(objet)
             && let Some(chemin) = vue.chemin_du_saut(lien)
         {
-            let mut v = Vec::new();
-            v.try_reserve_exact(chemin.len()).map_err(|_| Erreur::ENOMEM)?;
-            v.extend_from_slice(&chemin);
-            return Ok(v);
+            return Ok(faillible::copie(&chemin)?);
         }
         vue.chemin_de(fin)
     })
@@ -919,9 +917,8 @@ pub fn close_range(premier: u64, dernier: u64, drapeaux: u64) -> i64 {
         return -EINVAL;
     }
     let ouverts: Vec<u64> = match processus::avec(|p| {
-        let mut v = Vec::new();
-        v.try_reserve(p.descripteurs.ouverts(premier, dernier).count()).ok()?;
-        v.extend(p.descripteurs.ouverts(premier, dernier));
+        let mut v = faillible::avec_capacite(p.descripteurs.ouverts(premier, dernier).count()).ok()?;
+        v.ajouter_tout(p.descripteurs.ouverts(premier, dernier)).ok()?;
         Some(v)
     }) {
         Some(v) => v,
@@ -1345,19 +1342,16 @@ pub fn morceaux(adresse: u64, nombre: u64) -> Result<Vec<(u64, u64)>, i64> {
     if nombre > 1024 {
         return Err(-EINVAL);
     }
-    let mut octets = Vec::new();
-    octets.try_reserve_exact(nombre as usize * 16).map_err(|_| -ENOMEM)?;
-    octets.resize(nombre as usize * 16, 0);
+    let mut octets = faillible::remplie(nombre as usize * 16, 0).map_err(|_| -ENOMEM)?;
     copier_depuis_utilisateur(&mut octets, adresse).map_err(|_| -EFAULT)?;
-    let mut v = Vec::new();
-    v.try_reserve_exact(nombre as usize).map_err(|_| -ENOMEM)?;
+    let mut v = faillible::avec_capacite(nombre as usize).map_err(|_| -ENOMEM)?;
     for c in octets.chunks_exact(16) {
         let base = u64::from_le_bytes(c[..8].try_into().unwrap_or([0; 8]));
         let longueur = u64::from_le_bytes(c[8..].try_into().unwrap_or([0; 8]));
         if (longueur as i64) < 0 {
             return Err(-EINVAL);
         }
-        v.push((base, longueur));
+        v.ajouter_dans_la_place((base, longueur));
     }
     let mut total = 0;
     for (base, longueur) in v.iter_mut() {
@@ -2226,8 +2220,7 @@ pub fn readlinkat(dirfd: u64, adresse: u64, tampon: u64, taille: u64) -> i64 {
             if cible.is_empty() {
                 return Err(errno(Erreur::ENOENT));
             }
-            copie.try_reserve_exact(cible.len()).map_err(|_| -ENOMEM)?;
-            copie.extend_from_slice(&cible);
+            copie = faillible::copie(&cible).map_err(|_| -ENOMEM)?;
             Ok(())
         })?;
         if let Some(n) = o.tmpfs() {
@@ -2352,25 +2345,27 @@ pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
         return errno(Erreur::ENOTDIR);
     }
     let taille = (taille as u32 as usize).min(64 << 10);
-    let mut entrees = Vec::new();
-    if entrees.try_reserve_exact(taille).is_err() {
-        return -ENOMEM;
-    }
+    // Le bloc mis à zéro d'avance (le zéro final de chaque nom et le
+    // bourrage y sont déjà) : la lecture du dossier, sous le verrou des
+    // fichiers, n'alloue rien ; `ecrit` en compte les octets remplis.
+    let Ok(mut entrees) = faillible::remplie(taille, 0u8) else { return -ENOMEM };
+    let mut ecrit = 0;
     let _verrous = verrous(&o, true, false);
     let debut = o.position();
     let mut position = debut;
     let lu = vfs::avec_systeme(|s, _| {
         let r = s.avec_vue(0, |vue| vue.lire_dossier(o.objet, debut, |nom, n, genre, suivante| {
             let longueur = (8 + 8 + 2 + 1 + nom.len() + 1).next_multiple_of(8);
-            if entrees.len() + longueur > taille {
+            if ecrit + longueur > taille {
                 return false;
             }
-            entrees.extend_from_slice(&n.to_le_bytes());
-            entrees.extend_from_slice(&suivante.to_le_bytes());
-            entrees.extend_from_slice(&(longueur as u16).to_le_bytes());
-            entrees.push(genre);
-            entrees.extend_from_slice(nom);
-            entrees.resize(entrees.len() + longueur - (19 + nom.len()), 0);
+            let e = &mut entrees[ecrit..ecrit + longueur];
+            e[..8].copy_from_slice(&n.to_le_bytes());
+            e[8..16].copy_from_slice(&suivante.to_le_bytes());
+            e[16..18].copy_from_slice(&(longueur as u16).to_le_bytes());
+            e[18] = genre;
+            e[19..19 + nom.len()].copy_from_slice(nom);
+            ecrit += longueur;
             position = suivante;
             true
         }));
@@ -2382,7 +2377,7 @@ pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
     if let Err(e) = lu {
         return errno(e);
     }
-    if entrees.is_empty() {
+    if ecrit == 0 {
         // Fin du dossier, ou la première entrée ne tient pas : on les
         // distingue en regardant s'il restait une entrée à lire.
         let reste = vfs::avec_systeme(|s, _| {
@@ -2395,11 +2390,11 @@ pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
         });
         return if reste { -EINVAL } else { 0 };
     }
-    if copier_vers_utilisateur(tampon, &entrees).is_err() {
+    if copier_vers_utilisateur(tampon, &entrees[..ecrit]).is_err() {
         return -EFAULT;
     }
     o.changer_position(position);
-    entrees.len() as i64
+    ecrit as i64
 }
 
 /// getcwd(tampon, taille) : le chemin du dossier courant, avec son zéro
@@ -2414,10 +2409,9 @@ pub fn getcwd(tampon: u64, taille: u64) -> i64 {
         Ok(c) => c,
         Err(e) => return errno(e),
     };
-    if chemin.try_reserve_exact(1).is_err() {
+    if chemin.ajouter(0).is_err() {
         return -ENOMEM;
     }
-    chemin.push(0);
     if (taille as usize) < chemin.len() {
         return -ERANGE;
     }

@@ -16,16 +16,17 @@ use crate::appels_fichiers::installer_fichier;
 use crate::attente::{self, FileAttente, Sommeil};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::descripteurs::{FichierOuvert, Prive, Sorte, Tenu};
+use crate::partage::Arc;
 use crate::sondage::{POLLERR, POLLIN, POLLOUT, Table};
 use crate::tache::Reveil;
 use crate::verrou::Verrou;
-use crate::{cpu, tache};
-use alloc::sync::Arc;
+use crate::{cpu, faillible, tache};
 use fichiers::montages::Objet;
 
 const EAGAIN: i64 = 11;
 const EFAULT: i64 = 14;
 const EINVAL: i64 = 22;
+const ENOMEM: i64 = 12;
 
 const O_RDWR: u32 = 2;
 const O_NONBLOCK: u64 = 0o4000;
@@ -55,22 +56,21 @@ pub fn eventfd2(initiale: u64, drapeaux: u64) -> i64 {
     let mut f = FichierOuvert::new(Sorte::EventFd, Tenu::Noyau(Objet::Anonyme), true, true,
                                    O_RDWR | (drapeaux & O_NONBLOCK) as u32, b"anon_inode:[eventfd]");
     f.chemin = nom_anonyme(b"anon_inode:[eventfd]");
-    f.prive = Prive::EventFd(Arc::new(EventFd {
+    let Ok(e) = Arc::new(EventFd {
         compteur: Verrou::new(initiale as u32 as u64),
         semaphore: drapeaux & EFD_SEMAPHORE != 0,
         attente: FileAttente::new(),
-    }));
+    }) else {
+        return -ENOMEM;
+    };
+    f.prive = Prive::EventFd(e);
     installer_fichier(f, drapeaux & O_CLOEXEC != 0)
 }
 
 /// Le « chemin » d'un fichier anonyme, celui que Linux montre dans
 /// /proc/self/fd (vide s'il n'y a pas la place de le copier).
 pub fn nom_anonyme(nom: &[u8]) -> alloc::vec::Vec<u8> {
-    let mut v = alloc::vec::Vec::new();
-    if v.try_reserve_exact(nom.len()).is_ok() {
-        v.extend_from_slice(nom);
-    }
-    v
+    faillible::copie(nom).unwrap_or_default()
 }
 
 /// eventfd(valeur initiale) : eventfd2 sans drapeaux.

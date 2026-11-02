@@ -39,6 +39,19 @@ test-programmes = []
 # (make trace).
 trace = []
 
+# Les règles que `cargo clippy` vérifie (make le lance avant de compiler,
+# la CI aussi) : les nôtres, refusées comme des erreurs. Pas l'ensemble
+# par défaut de clippy (`all`), des conseils de style : sur ce noyau, 279
+# avertissements, dont 220 sur la mise en forme des listes dans les
+# commentaires de documentation, écrites pour se lire en français. Une
+# règle choisie et justifiée, plutôt que d'en suivre beaucoup sans les
+# avoir choisies.
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+# Les méthodes et macros de clippy.toml : les allocations qui paniquent.
+disallowed_methods = "deny"
+disallowed_macros = "deny"
+
 # panic = "abort" : en cas de panique, pas de « déroulement » de la pile
 # (unwinding), qui demanderait une bibliothèque d'exécution qu'on n'a pas.
 # Le noyau affiche le message et arrête le processeur.

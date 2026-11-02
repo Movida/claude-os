@@ -18,6 +18,7 @@
 //! lanceur les montre quand « memoire rendue » échoue, pour qu'un écart
 //! dise tout de suite s'il vient d'une file du réseau.
 
+use crate::faillible;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -49,18 +50,14 @@ impl Paquet {
     /// Un paquet vide, avec la marge pour ses en-têtes et la place pour
     /// `longueur` octets de données. None : plus de mémoire.
     pub fn vide(longueur: usize) -> Option<Paquet> {
-        let mut tampon = Vec::new();
-        tampon.try_reserve_exact(MARGE + longueur).ok()?;
-        tampon.resize(MARGE + longueur, 0);
+        let tampon = faillible::remplie(MARGE + longueur, 0).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
         Some(Paquet { tampon, debut: MARGE, fin: MARGE })
     }
 
     /// Une copie de la trame `octets` (reçue), sans marge.
     pub fn copie(octets: &[u8]) -> Option<Paquet> {
-        let mut tampon = Vec::new();
-        tampon.try_reserve_exact(octets.len()).ok()?;
-        tampon.extend_from_slice(octets);
+        let tampon = faillible::copie(octets).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
         Some(Paquet { tampon, debut: 0, fin: octets.len() })
     }

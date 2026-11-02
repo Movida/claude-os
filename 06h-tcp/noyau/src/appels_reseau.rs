@@ -21,13 +21,13 @@
 use crate::appels_fichiers::{self, FichierTenu, installer_fichier};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::descripteurs::{FichierOuvert, Prive, Sorte, Tenu};
+use crate::partage::{Arc, ArcVide};
 use crate::reseau::socket::{self, Protocole, Socket, AF_INET, ARRET_ECRITURE, ARRET_LECTURE, IPPROTO_IP, IPPROTO_MAX,
                             IPPROTO_ICMP, IPPROTO_UDP, NPROTO, RCVBUF_MIN, SNDBUF_MIN, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_MAX,
                             SOCK_NONBLOCK, SOCK_RAW, TAMPON_MAX};
 use crate::reseau::datagramme::{self, Controle};
 use crate::reseau::{ping, tcp, udp};
-use crate::{processus, temps, vfs};
-use alloc::sync::Arc;
+use crate::{faillible, processus, temps, vfs};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use fichiers::tmpfs::Ouvert;
@@ -263,13 +263,7 @@ fn separer(sorte: u64) -> Result<(i32, u64), i64> {
 fn nom(numero: u32) -> Vec<u8> {
     let mut t = [0u8; 10];
     let n = vfs::decimal(numero, &mut t);
-    let mut v = Vec::new();
-    if v.try_reserve_exact(9 + n.len()).is_ok() {
-        v.extend_from_slice(b"socket:[");
-        v.extend_from_slice(n);
-        v.push(b']');
-    }
-    v
+    faillible::concatenation(&[b"socket:[", n, b"]"]).unwrap_or_default()
 }
 
 /// socket(famille, sorte, protocole) : la socket (son protocole choisi),
@@ -286,9 +280,12 @@ pub fn socket(famille: u64, sorte: u64, protocole: u64) -> i64 {
         Err(e) => return e,
     };
     let identite = processus::avec(|p| p.identite);
+    // Dans l'ordre de `__sock_create` : la socket d'abord (`sock_alloc` :
+    // ENFILE), puis ce que demande son protocole (`sk_alloc` : ENOBUFS).
+    let Ok(place) = ArcVide::new() else { return -ENFILE };
     let s = Socket::new(p, sorte as u16, proto, identite.uid);
-    let s = Arc::new(if p == Protocole::Tcp { s.tcp() } else { s });
-    installer(s, drapeaux)
+    let Some(s) = (if p == Protocole::Tcp { s.tcp() } else { Some(s) }) else { return -ENOBUFS };
+    installer(place.remplir(s), drapeaux)
 }
 
 /// Le fichier ouvert d'une socket neuve (`sock_alloc_file`) : son inode
@@ -749,11 +746,7 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
         if m.longueur_controle > OPTMEM_MAX {
             return -ENOBUFS;
         }
-        let mut c = Vec::new();
-        if c.try_reserve_exact(m.longueur_controle as usize).is_err() {
-            return -ENOMEM;
-        }
-        c.resize(m.longueur_controle as usize, 0);
+        let Ok(mut c) = faillible::remplie(m.longueur_controle as usize, 0) else { return -ENOMEM };
         if copier_depuis_utilisateur(&mut c, m.controle).is_err() {
             return -EFAULT;
         }

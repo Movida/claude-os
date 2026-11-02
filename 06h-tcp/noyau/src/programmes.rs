@@ -21,9 +21,10 @@
 //! s'en charge. Le nom du fichier (son extension) ne compte pas.
 
 use crate::descripteurs::Descripteurs;
+use crate::faillible::{self, VecFaillible};
 use crate::memoire::Acces;
+use crate::partage::Arc;
 use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, processus, tache, vfs, wasi};
-use alloc::sync::Arc;
 use fichiers::Identite;
 use alloc::vec::Vec;
 use core::fmt;
@@ -195,8 +196,14 @@ pub fn demarrer() {
         match action {
             None => {}
             Some(Action::Premier(t)) => l.attendre(t),
-            // La place est réservée pour chaque commande du fichier.
-            Some(Action::Fond(t)) => l.fond.push(t),
+            // La place est réservée pour chaque commande du fichier ; si le
+            // tas n'avait pas pu la donner, le programme est attendu tout de
+            // suite, comme au premier plan.
+            Some(Action::Fond(t)) => {
+                if let Err(t) = l.fond.ajouter_ou_rendre(t) {
+                    l.attendre(t);
+                }
+            }
             Some(Action::Attendre) => l.attendre_tous(),
         }
     }
@@ -248,6 +255,8 @@ impl Lanceur {
     /// qu'ils tournent.
     fn new(commandes: usize) -> Lanceur {
         let mut fond = Vec::new();
+        // Sans cette place, chaque programme lancé en fond retentera (voir
+        // `demarrer`).
         let _ = fond.try_reserve_exact(commandes);
         Lanceur { fond, en_cours: 0, libres: 0, paralleles: false }
     }
@@ -380,10 +389,7 @@ impl Tache {
 
 /// Le tampon où découper `ligne` (formats::commande), s'il y a la place.
 fn tampon_pour(ligne: &[u8]) -> Option<Vec<u8>> {
-    let mut tampon = Vec::new();
-    tampon.try_reserve_exact(formats::commande::taille_tampon(ligne)).ok()?;
-    tampon.resize(formats::commande::taille_tampon(ligne), 0);
-    Some(tampon)
+    faillible::remplie(formats::commande::taille_tampon(ligne), 0).ok()
 }
 
 /// Le contenu de /etc/demarrage, lu en root (comme `init` lit son
@@ -394,7 +400,6 @@ fn lire_demarrage() -> Result<Vec<u8>, fichiers::Erreur> {
         let a = fs.attributs(n);
         (a.mode, a.taille)
     });
-    let mut texte = Vec::new();
     // Un fichier ordinaire seulement : vfs::lire ne sait lire que lui.
     let lu = if mode & fichiers::S_IFMT == fichiers::S_IFDIR {
         Err(fichiers::Erreur::EISDIR)
@@ -402,13 +407,12 @@ fn lire_demarrage() -> Result<Vec<u8>, fichiers::Erreur> {
         Err(fichiers::Erreur::EINVAL)
     } else if taille > DEMARRAGE_MAX {
         Err(fichiers::Erreur::EFBIG)
-    } else if texte.try_reserve_exact(taille as usize).is_err() {
-        Err(fichiers::Erreur::ENOMEM)
     } else {
-        texte.resize(taille as usize, 0);
-        let lus = vfs::lire(n, 0, &mut texte);
-        texte.truncate(lus);
-        Ok(texte)
+        faillible::remplie(taille as usize, 0).map_err(fichiers::Erreur::from).map(|mut texte| {
+            let lus = vfs::lire(n, 0, &mut texte);
+            texte.truncate(lus);
+            texte
+        })
     };
     vfs::avec(|fs, cadres| fs.lacher(n, cadres));
     lu
@@ -432,17 +436,20 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
     {
         return refus(&"plus de memoire");
     }
-    environnement.extend_from_slice(ENVIRONNEMENT);
+    // Dans la place réservée juste au-dessus : plus rien n'échoue.
+    for &v in ENVIRONNEMENT {
+        environnement.ajouter_dans_la_place(v);
+    }
     for affectation in commande.affectations() {
         // « NOM=... » remplace la variable NOM du noyau, comme le shell.
         let nom = &affectation[..=affectation.iter().position(|&o| o == b'=').unwrap_or(0)];
         match environnement.iter().position(|v| v.starts_with(nom)) {
             Some(i) => environnement[i] = affectation,
-            None => environnement.push(affectation),
+            None => environnement.ajouter_dans_la_place(affectation),
         }
     }
-    arguments.extend(commande.arguments());
-    dossiers.extend(commande.dossiers());
+    commande.arguments().for_each(|a| arguments.ajouter_dans_la_place(a));
+    commande.dossiers().for_each(|d| dossiers.ajouter_dans_la_place(d));
     let (n, complet) = match appels_fichiers::trouver_pour(IDENTITE, programme) {
         Ok(n) => n,
         Err(e) => return refus(&format_args!("{} : introuvable (errno {})", Nom(programme), e.errno())),
@@ -468,11 +475,7 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
 /// (pour un chemin canonique, qui ne doit jamais faire échouer un
 /// lancement).
 fn copie(octets: &[u8]) -> Vec<u8> {
-    let mut v = Vec::new();
-    if v.try_reserve_exact(octets.len()).is_ok() {
-        v.extend_from_slice(octets);
-    }
-    v
+    faillible::copie(octets).unwrap_or_default()
 }
 
 /// Ce qu'une ligne de /etc/demarrage donne au programme.
@@ -551,10 +554,9 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     // au plus : la pile du noyau ne fait que 16 Kio).
     let mut chemin_interpreteur = Vec::new();
     if let Some((position, longueur)) = executable.interpreteur() {
-        if chemin_interpreteur.try_reserve_exact(longueur).is_err() {
+        if chemin_interpreteur.redimensionner(longueur, 0).is_err() {
             refus!("[noyau] {} : plus de memoire pour le chemin de l'interpreteur", nom);
         }
-        chemin_interpreteur.resize(longueur, 0);
         if !lire(position, &mut chemin_interpreteur) {
             refus!("[noyau] {} : programme Linux refuse : {}", nom, formats::elf::Erreur::InterpreteurHorsDuFichier);
         }
@@ -750,11 +752,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     // Son exécutable, pour /proc/<pid>/exe (procfs.rs fabrique son dossier
     // d'après la table des processus) : son chemin, et son inode, tenu par
     // le lancement, puis par le lanceur jusqu'au recueil.
-    let mut exe = Vec::new();
-    if exe.try_reserve_exact(lancement.complet.len()).is_ok() {
-        exe.extend_from_slice(lancement.complet);
-    }
-    processus::poser_exe(pid, exe, n);
+    processus::poser_exe(pid, copie(lancement.complet), n);
     let lance = entree.and_then(|e| tache::lancer_programme(nom, e.clone(), pml4, depart, rsp).map(|_| e));
     match lance {
         Some(processus) => {
@@ -895,11 +893,9 @@ fn executer_wasm(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancemen
     // refusé, jusqu'à ce que le noyau sache projeter des pages éparses d'un
     // seul tenant (vmalloc).
     let taille = vfs::avec(|fs, _| fs.attributs(n).taille) as usize;
-    let mut octets = Vec::new();
-    if octets.try_reserve_exact(taille).is_err() {
+    let Ok(mut octets) = faillible::remplie(taille, 0) else {
         refus!("[noyau] {} : module WebAssembly de {} octets, trop gros pour le tas", nom, taille);
-    }
-    octets.resize(taille, 0);
+    };
     if vfs::lire(n, 0, &mut octets) != taille {
         refus!("[noyau] {} : module WebAssembly illisible", nom);
     }
@@ -909,7 +905,10 @@ fn executer_wasm(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancemen
         refus!("[noyau] {} : plus de memoire pour ses arguments", nom);
     };
     let lancee = tache::lancer_noyau(nom, move || {
-        executer_module(nom, &octets, &tranches(&arguments), &tranches(&environnement), &tranches(&dossiers))
+        let (Some(a), Some(e), Some(d)) = (tranches(&arguments), tranches(&environnement), tranches(&dossiers)) else {
+            return afficherln!("[noyau] {} : plus de memoire pour ses arguments", nom);
+        };
+        executer_module(nom, &octets, &a, &e, &d)
     });
     match lancee {
         Some(t) => {
@@ -923,33 +922,35 @@ fn executer_wasm(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancemen
 /// Des copies des chaînes de `chaines`, dans le tas ; None s'il n'y a pas
 /// la place.
 fn copies(chaines: &[&[u8]]) -> Option<Vec<Vec<u8>>> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(chaines.len()).ok()?;
+    let mut v = faillible::avec_capacite(chaines.len()).ok()?;
     for c in chaines {
-        let mut copie = Vec::new();
-        copie.try_reserve_exact(c.len()).ok()?;
-        copie.extend_from_slice(c);
-        v.push(copie);
+        v.ajouter_dans_la_place(faillible::copie(c).ok()?);
     }
     Some(v)
 }
 
-/// Les tranches des chaînes de `v` (de petits tableaux de pointeurs, que le
-/// tas a toujours : quelques dizaines d'octets).
-fn tranches(v: &[Vec<u8>]) -> Vec<&[u8]> {
-    v.iter().map(Vec::as_slice).collect()
+/// Les tranches des chaînes de `v` (un petit tableau de pointeurs, quelques
+/// dizaines d'octets) ; None s'il n'y a pas la place.
+fn tranches(v: &[Vec<u8>]) -> Option<Vec<&[u8]>> {
+    let mut t = faillible::avec_capacite(v.len()).ok()?;
+    v.iter().for_each(|c| t.ajouter_dans_la_place(c.as_slice()));
+    Some(t)
 }
 
 /// Le corps d'un programme WebAssembly, dans sa tâche (voir
 /// `executer_wasm`).
 fn executer_module(nom: NomCourt, octets: &[u8], arguments: &[&[u8]], environnement: &[&[u8]], dossiers: &[&[u8]]) {
-    use alloc::sync::Arc;
     use wasm::{Etat, Externe, Magasin, Piege};
 
     const TRANCHE: u64 = 1000;
 
     let module = match wasm::decoder(octets).and_then(wasm::valider) {
-        Ok(m) => Arc::new(m),
+        // La bibliothèque wasm prend son module dans l'Arc de alloc (son
+        // interface, testée aussi sur l'hôte) : une allocation qui peut
+        // encore faire paniquer le noyau, comme celles de la bibliothèque
+        // elle-même (une dette, dans « Reste à faire »).
+        #[allow(clippy::disallowed_methods)]
+        Ok(m) => alloc::sync::Arc::new(m),
         Err(e) => return afficherln!("[noyau] {} : programme WebAssembly refuse : {}", nom, e),
     };
     afficherln!("[noyau] {} : programme WebAssembly, {} octets, decode et valide.", nom, octets.len());

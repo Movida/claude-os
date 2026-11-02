@@ -67,11 +67,12 @@
 //! hrtimers ; nos attentes se comptent en dizaines, la liste suffit.
 
 use crate::cpu;
+use crate::faillible::{FileFaillible, VecFaillible};
 use crate::ordonnanceur;
+use crate::partage::Arc;
 use crate::processus::Entree;
 use crate::tache::{self, Reveil, Tache};
 use crate::verrou::Verrou;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::cell::{Cell, UnsafeCell};
 use core::marker::PhantomPinned;
@@ -478,8 +479,8 @@ pub fn initialiser(max: usize) {
 fn armer(echeance: u64) {
     let mut m = MINUTERIES.verrouiller();
     let i = m.partition_point(|&(e, _)| e <= echeance);
-    // La place est réservée pour une échéance par tâche.
-    m.insert(i, (echeance, tache::courante_arc()));
+    // La place est réservée pour une échéance par tâche (`initialiser`).
+    m.inserer(i, (echeance, tache::courante_arc())).expect("minuteries sans leur place");
 }
 
 /// Retire la minuterie de `t`, si elle y est encore.
@@ -502,7 +503,8 @@ pub fn dormir_calcul(compte: Arc<Entree>, cible: u64) -> Reveil {
     if compte.temps_de_calcul() >= cible {
         return Reveil::Echeance;
     }
-    ATTENTES_CALCUL.verrouiller().push((cible, compte, tache::courante_arc()));
+    // La place est réservée pour une attente par tâche (`initialiser`).
+    ATTENTES_CALCUL.verrouiller().ajouter_dans_la_place((cible, compte, tache::courante_arc()));
     t.dort_interruptible(true);
     ordonnanceur::retirer_courante();
     ordonnanceur::ordonnancer();
@@ -575,8 +577,8 @@ pub fn detecter_interblocage() -> bool {
     }
     let mut bloquees: Vec<Arc<Tache>> = Vec::new();
     tache::pour_chaque(|t| {
-        if t.est_programme() && t.dort_interruptible_maintenant() && bloquees.try_reserve(1).is_ok() {
-            bloquees.push(t.clone());
+        if t.est_programme() && t.dort_interruptible_maintenant() {
+            let _ = bloquees.ajouter(t.clone());
         }
     });
     let trouve = !bloquees.is_empty();
@@ -798,11 +800,10 @@ impl<T: Possede> Possession<T> {
     pub fn du_reseau(&self, e: T::Element, taille: usize, limite: usize) -> bool {
         let mut c = self.court.verrouiller();
         if c.possede {
-            if c.taille + taille > limite || c.file.try_reserve(1).is_err() {
+            if c.taille + taille > limite || c.file.ajouter_derriere(e).is_err() {
                 return false;
             }
             c.taille += taille;
-            c.file.push_back(e);
             return true;
         }
         // SAFETY : personne ne possède, et le verrou court est tenu : nul

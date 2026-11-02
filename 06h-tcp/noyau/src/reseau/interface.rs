@@ -15,6 +15,7 @@
 
 use super::paquet::Paquet;
 use super::virtio_net::{self, Carte};
+use crate::faillible;
 use crate::verrou::Verrou;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
@@ -65,15 +66,14 @@ const MAX: usize = 4;
 static INTERFACES: Verrou<[Option<&'static Interface>; MAX]> = Verrou::new([None; MAX]);
 
 /// Ajoute une interface ; son numéro est le suivant. None : la table est
-/// pleine.
+/// pleine, ou le tas.
 pub fn ajouter(nom: &'static str, mac: [u8; 6], mtu: u32, lien: bool, materiel: Materiel) -> Option<&'static Interface> {
     let mut t = INTERFACES.verrouiller();
     let place = t.iter().position(Option::is_none)?;
-    // Au démarrage seulement : une allocation qui ne peut pas échouer.
-    let i = alloc::boxed::Box::new(Interface {
+    let i = faillible::boite(Interface {
         nom, index: place as u32 + 1, mac, mtu: AtomicU32::new(mtu), mtu_max: mtu, lien: AtomicBool::new(lien),
         compteurs: Compteurs::default(), materiel,
-    });
+    }).ok()?;
     let i: &'static Interface = alloc::boxed::Box::leak(i);
     t[place] = Some(i);
     Some(i)

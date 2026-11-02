@@ -37,12 +37,13 @@
 
 use crate::appels_fichiers::{FichierTenu, tenir};
 use crate::attente::{self, EntreeAttente, FileAttente, Rappel, Sommeil};
+use crate::faillible::{self, VecFaillible};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::descripteurs::Sorte;
+use crate::partage::Arc;
 use crate::reprise::{self, ERESTART_RESTARTBLOCK, ERESTARTNOHAND, Reprise};
 use crate::tache::{self, Reveil, Tache};
 use crate::{cpu, processus, signaux, temps};
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::pin::Pin;
 
@@ -195,10 +196,8 @@ impl Entrees<'_> {
     /// Le bloc où mettre l'entrée suivante.
     fn place(&mut self) -> Option<&mut Vec<EntreeSondage>> {
         if self.blocs.last().is_none_or(|b| b.len() == b.capacity()) {
-            let mut b = Vec::new();
-            b.try_reserve_exact(PAR_BLOC).ok()?;
-            self.blocs.try_reserve(1).ok()?;
-            self.blocs.push(b);
+            let b = faillible::avec_capacite(PAR_BLOC).ok()?;
+            self.blocs.ajouter(b).ok()?;
         }
         self.blocs.last_mut()
     }
@@ -212,7 +211,9 @@ impl Inscrire for Entrees<'_> {
             self.erreur = true;
             return;
         };
-        bloc.push(EntreeSondage { entree: EntreeAttente::new(), file, cle, _tenu: tenu.dupliquer(), attente });
+        // Dans la place du bloc : il ne grandit jamais (ses entrées, liées
+        // dans les files d'attente, ne doivent pas bouger).
+        bloc.ajouter_dans_la_place(EntreeSondage { entree: EntreeAttente::new(), file, cle, _tenu: tenu.dupliquer(), attente });
         let Some(e) = bloc.last() else { return };
         let qui: *const dyn Rappel = e;
         // SAFETY : l'entrée est dans `e`, qui ne bouge plus (son bloc n'est
@@ -349,11 +350,7 @@ fn sys_poll(tableau: u64, nombre: u32, delai: Delai) -> i64 {
     if nombre as u64 > processus::avec(|p| p.descripteurs.limite.0) {
         return -EINVAL;
     }
-    let mut octets: Vec<u8> = Vec::new();
-    if octets.try_reserve_exact(nombre as usize * 8).is_err() {
-        return -ENOMEM;
-    }
-    octets.resize(nombre as usize * 8, 0);
+    let Ok(mut octets) = faillible::remplie(nombre as usize * 8, 0u8) else { return -ENOMEM };
     if copier_depuis_utilisateur(&mut octets, tableau).is_err() {
         return -EFAULT;
     }
@@ -533,20 +530,14 @@ fn sys_select(n: u64, adresses: [u64; 3], d: Delai) -> i64 {
     let mut demandes: Ensembles = [Vec::new(), Vec::new(), Vec::new()];
     let mut resultats: Ensembles = [Vec::new(), Vec::new(), Vec::new()];
     for e in demandes.iter_mut().chain(resultats.iter_mut()) {
-        if e.try_reserve_exact(mots).is_err() {
-            return -ENOMEM;
-        }
-        e.resize(mots, 0);
+        let Ok(v) = faillible::remplie(mots, 0) else { return -ENOMEM };
+        *e = v;
     }
     for (e, &adresse) in demandes.iter_mut().zip(&adresses) {
         if adresse == 0 {
             continue;
         }
-        let mut o: Vec<u8> = Vec::new();
-        if o.try_reserve_exact(mots * 8).is_err() {
-            return -ENOMEM;
-        }
-        o.resize(mots * 8, 0);
+        let Ok(mut o) = faillible::remplie(mots * 8, 0u8) else { return -ENOMEM };
         if copier_depuis_utilisateur(&mut o, adresse).is_err() {
             return -EFAULT;
         }

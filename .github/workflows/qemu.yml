@@ -20,7 +20,9 @@ jobs:
       - name: Installer nasm, QEMU et gcc
         run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86 gcc libc6-dev netcat-openbsd
       # rustup est préinstallé sur les machines de GitHub ; il installe la
-      # version de Rust figée dans rust-toolchain.toml, avec la cible du noyau.
+      # version de Rust figée dans rust-toolchain.toml, avec la cible du noyau
+      # (et clippy, depuis 6h : make le lance, rustup l'ajoute tout seul en
+      # lisant le rust-toolchain.toml de l'étape).
       - name: Installer Rust
         run: cd 03-noyau-rust/noyau && rustup toolchain install
       - name: Tester chaque etape

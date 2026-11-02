@@ -7,7 +7,7 @@
 
 use super::ipv4;
 use super::socket::{self, AF_INET, AF_UNSPEC, Inet, Protocole, Socket};
-use alloc::sync::Arc;
+use crate::partage::Arc;
 use core::sync::atomic::Ordering;
 use formats::reseau::ipv4 as format_ipv4;
 use inet::ports;
@@ -25,7 +25,7 @@ const EADDRNOTAVAIL: i64 = 99;
 pub mod table {
     use super::super::socket::{Inet, Protocole, Socket};
     use super::super::{ping, udp};
-    use alloc::sync::Arc;
+    use crate::partage::Arc;
 
     pub fn inscrire(s: &Arc<Socket>, inet: &mut Inet, port: u16) -> Result<(), i64> {
         match s.protocole {

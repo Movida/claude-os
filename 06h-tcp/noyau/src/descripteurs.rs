@@ -35,9 +35,10 @@
 //! les éléments d'epoll qui le surveillent (`surveillants`) : à son dernier
 //! `close`, ils meurent avant que sa case ne puisse resservir.
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 
+use crate::faillible::VecFaillible;
+use crate::partage::Arc;
 use crate::programmes::NomCourt;
 use fichiers::montages::Objet;
 use fichiers::noyaufs::Sequence;
@@ -251,10 +252,9 @@ impl Ouverts {
             self.cases[i] = Some(f);
             return Ok(Fichier(i as u32));
         }
-        if self.cases.try_reserve(1).is_err() {
+        if let Err(Some(f)) = self.cases.ajouter_ou_rendre(Some(f)) {
             return Err(f);
         }
-        self.cases.push(Some(f));
         Ok(Fichier(self.cases.len() as u32 - 1))
     }
 
@@ -394,8 +394,7 @@ impl Descripteurs {
     fn agrandir(&mut self, fd: u64) -> Result<(), Refus> {
         let i = fd as usize;
         if i >= self.cases.len() {
-            self.cases.try_reserve(i + 1 - self.cases.len()).map_err(|_| Refus::PlusDeMemoire)?;
-            self.cases.resize(i + 1, Case::Libre);
+            self.cases.redimensionner(i + 1, Case::Libre).map_err(|_| Refus::PlusDeMemoire)?;
         }
         self.plus_haut = self.plus_haut.max(fd);
         Ok(())

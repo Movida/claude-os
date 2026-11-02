@@ -356,7 +356,7 @@ Dossier `06g-reseau/`, en neuf commits, d'après le plan écrit au début de son
 
 **Dans le noyau**
 
-- **Allocations faillibles.** Une allocation impossible, hors de `try_reserve`, fait paniquer le noyau. Rust pour Linux n'utilise que des allocations qui rendent une erreur : à généraliser avant que des programmes puissent en abuser.
+- **Allocations faillibles, dans les bibliothèques.** Le noyau n'en a plus aucune qui panique (6h, reste de 6g : `faillible.rs`, notre `Arc`, et `cargo clippy` qui le vérifie). Les bibliothèques qu'il embarque en gardent : `wasm` (plus d'une centaine d'appels, et le module d'un programme dans l'`Arc` de `alloc`), `fichiers` (environ 70), `formats` (environ 35), `inet` et `zones` (une dizaine chacune). Le même passage, et la même règle de clippy pour chacune.
 - **Grandes allocations.** Un bloc du tas ne dépasse pas 4 Mio (l'ordre maximal du buddy) : il faudra projeter des pages éparses d'un seul tenant (`vmalloc`). Pour les mémoires WebAssembly, réserver 4 Gio d'adresses suivies de pages de garde (comme wasmtime), ce qui supprimera aussi le contrôle des bornes une fois le code compilé.
 - **Console non bloquante.** Le port série fait attendre activement (87 µs par octet sur du vrai matériel) : un pilote à interruptions et une file d'attente, comme le tty de Linux.
 - **Pages globales** (CR4.PGE) pour le noyau, maintenant qu'il y a un espace d'adressage par programme ; KPTI et PCID : en 6m.

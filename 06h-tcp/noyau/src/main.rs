@@ -40,6 +40,7 @@ mod epoll;
 mod espace;
 mod espace_utilisateur;
 mod evenements;
+mod faillible;
 mod faute_de_page;
 mod futex;
 mod gdt;
@@ -52,6 +53,7 @@ mod irq;
 mod linux;
 mod memoire;
 mod pagination;
+mod partage;
 mod pci;
 mod pile;
 mod ordonnanceur;
@@ -679,7 +681,11 @@ fn tester_vecteurs() {
 }
 
 /// Vérifie le tas : des collections de Rust de toutes tailles, et un objet
-/// rendu qui sert à nouveau.
+/// rendu qui sert à nouveau. Exprès avec les allocations ordinaires de
+/// `alloc` (Box::new, vec!, format!, collect), celles que clippy.toml
+/// refuse ailleurs : c'est elles qu'on essaie, au démarrage, où un échec
+/// est l'échec du test.
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
 fn tester_tas() {
     use alloc::{boxed::Box, format, vec, vec::Vec};
     // Un Vec qui grandit : il passe par plusieurs classes, puis par des

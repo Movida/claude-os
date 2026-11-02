@@ -34,11 +34,12 @@ use crate::appels_fichiers::{FichierTenu, installer_paire};
 use crate::attente::{self, FileAttente, Mutex, Sommeil};
 use crate::copie_utilisateur::{copier_depuis_utilisateur_partiel, copier_vers_utilisateur, copier_vers_utilisateur_partiel};
 use crate::descripteurs::{FichierOuvert, Prive, Sorte, Tenu};
+use crate::partage::{Arc, Weak};
 use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, Table};
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
+use crate::faillible::{self, VecFaillible};
 use crate::{cpu, espace, pages, processus, signaux, temps, vfs};
-use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use fichiers::tmpfs::Ouvert;
@@ -261,12 +262,13 @@ impl Tube {
             compte = compter(n as u64, PAGES_AU_MOINS as u64);
             n = PAGES_AU_MOINS;
         }
-        let mut anneau = Vec::new();
-        if trop(compte).1 || anneau.try_reserve_exact(n as usize).is_err() {
-            compter(n as u64, 0);
-            return None;
-        }
-        anneau.resize(n as usize, Tampon::default());
+        let anneau = match faillible::remplie(n as usize, Tampon::default()) {
+            Ok(a) if !trop(compte).1 => a,
+            _ => {
+                compter(n as u64, 0);
+                return None;
+            }
+        };
         Some(Tube {
             anneau: Mutex::new(anneau),
             etat: Verrou::new(Etat { tete: 0, queue: 0, max: n, taille: n, lecteurs: 1, ecrivains: 1 }),
@@ -567,14 +569,13 @@ impl Tube {
             return -EBUSY;
         }
         let mut neuf = Vec::new();
-        if neuf.try_reserve_exact(n as usize).is_err() {
+        let copie = neuf.try_reserve_exact(n as usize).is_ok()
+            && neuf.ajouter_tout((0..presentes).map(|i| anneau[(e.queue.wrapping_add(i) & (e.taille - 1)) as usize])).is_ok()
+            && neuf.redimensionner(n as usize, Tampon::default()).is_ok();
+        if !copie {
             rendre();
             return -ENOMEM;
         }
-        for i in 0..presentes {
-            neuf.push(anneau[(e.queue.wrapping_add(i) & (e.taille - 1)) as usize]);
-        }
-        neuf.resize(n as usize, Tampon::default());
         *anneau = neuf;
         {
             let mut e = self.etat.verrouiller();
@@ -656,13 +657,7 @@ impl Drop for Tube {
 fn chemin(numero: u32) -> Vec<u8> {
     let mut t = [0u8; 10];
     let n = vfs::decimal(numero, &mut t);
-    let mut v = Vec::new();
-    if v.try_reserve_exact(7 + n.len()).is_ok() {
-        v.extend_from_slice(b"pipe:[");
-        v.extend_from_slice(n);
-        v.push(b']');
-    }
-    v
+    faillible::concatenation(&[b"pipe:[", n, b"]"]).unwrap_or_default()
 }
 
 /// pipe2(tableau, drapeaux), dans l'ordre de `do_pipe2` : un drapeau autre
@@ -680,7 +675,7 @@ pub fn pipe2(tableau: u64, drapeaux: u64) -> i64 {
         return -ENOPKG;
     }
     let Some(tube) = Tube::new() else { return -ENFILE };
-    let tube = Arc::new(tube);
+    let Ok(tube) = Arc::new(tube) else { return -ENFILE };
     if TUBES.verrouiller().try_reserve(1).is_err() {
         return -ENFILE;
     }
@@ -694,7 +689,11 @@ pub fn pipe2(tableau: u64, drapeaux: u64) -> i64 {
     }) else {
         return -ENFILE;
     };
-    TUBES.verrouiller().push((numero.0, Arc::downgrade(&tube)));
+    // La place prise plus haut a pu servir entre-temps à un autre pipe2
+    // (le verrou est rendu pendant la création de l'inode) : sans place, le
+    // tube marche, mais /proc/<pid>/fd ne pourra pas le rouvrir (ENXIO), le
+    // seul usage de la table.
+    let _ = TUBES.verrouiller().ajouter((numero.0, Arc::downgrade(&tube)));
     let bout = |lecture: bool, ecriture: bool, etat: u32| {
         let ouvert = Ouvert { numero, cree: false, tronquer: false, ecrivain: false };
         let mut f = FichierOuvert::new(Sorte::Tube, Tenu::Tmpfs(ouvert), lecture, ecriture, etat, b"pipe");

@@ -28,6 +28,7 @@
 //! pilote la démasque, quand il est prêt.
 
 use crate::acpi;
+use crate::faillible::VecFaillible;
 use crate::verrou::Verrou;
 use crate::vmalloc;
 use alloc::vec::Vec;
@@ -117,9 +118,8 @@ pub fn initialiser(madt: &acpi::ConfigurationMadt, apic: u8) -> Option<Bilan> {
         for n in 0..i.entrees {
             i.ecrire_entree(n, MASQUEE);
         }
-        bilan.ioapics.push((numero, adresse, gsi_base, i.entrees));
-        etat.ioapics.try_reserve(1).ok()?;
-        etat.ioapics.push(i);
+        bilan.ioapics.ajouter((numero, adresse, gsi_base, i.entrees)).ok()?;
+        etat.ioapics.ajouter(i).ok()?;
     }
     if etat.ioapics.is_empty() {
         return None;

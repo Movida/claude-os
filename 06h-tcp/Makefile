@@ -32,8 +32,10 @@
 # exécute des binaires Linux et garde l'interpréteur WebAssembly de
 # l'étape 4 (wasm/) ; il est lancé par notre chargeur (boot.asm), qui le
 # lit par morceaux, en mode irréel.
-#   make        -> compile le noyau et les programmes, fabrique l'archive,
-#                  assemble le chargeur, colle les trois dans boot.bin
+#   make        -> vérifie les règles du noyau (cargo clippy : aucune
+#                  allocation qui panique, noyau/clippy.toml), compile le
+#                  noyau et les programmes, fabrique l'archive, assemble
+#                  le chargeur, colle les trois dans boot.bin
 #   make run    -> démarre dans QEMU avec une fenêtre (port série dans le terminal)
 #   make texte  -> même chose, mais l'écran VGA s'affiche dans le terminal
 #                  (pratique dans un conteneur sans fenêtre ; quitter : Echap puis 2, puis « quit »)
@@ -166,7 +168,11 @@ define image
 endef
 
 # cargo décide lui-même s'il faut recompiler : on l'appelle à chaque fois.
+# D'abord les règles du noyau (6h) : cargo clippy, sur toutes ses variantes
+# (les fonctionnalités des noyaux de test comprises) ; une règle enfreinte
+# est une erreur, et arrête make.
 boot.bin: programmes.cpio FORCE
+	cd noyau && cargo clippy --release --all-features
 	cd noyau && cargo build --release
 	$(call image,$(NOYAU_ELF),programmes.cpio,boot)
 

@@ -42,11 +42,11 @@
 //! Un fil naît de clone ou de clone3 (plus bas), et finit par exit, par la
 //! fin de son groupe, ou avec son processus (tache.rs).
 
-use alloc::sync::{Arc, Weak};
 
 use crate::copie_utilisateur::{copier_depuis_utilisateur, dans_les_bornes};
 use crate::espace_utilisateur::ADRESSE_MAX;
 use crate::interruptions::Cadre;
+use crate::partage::{Arc, Weak};
 use crate::processus;
 use crate::signaux::SignauxDuFil;
 use crate::tache::{self, NouveauFil, Tache};

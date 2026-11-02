@@ -4,6 +4,9 @@
 [toolchain]
 channel = "1.99.1"
 profile = "minimal"
+# clippy (6h) : les règles du noyau (Cargo.toml, [lints]), vérifiées à
+# chaque `make`.
+components = ["clippy"]
 # Cible « x86_64 sans système » : pas de bibliothèque standard, pas de
 # zone rouge, pas d'instructions SSE (voir src/main.rs).
 targets = ["x86_64-unknown-none"]

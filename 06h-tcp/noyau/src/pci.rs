@@ -51,6 +51,7 @@
 //! sert encore de ces fenêtres (sauf la mémoire vidéo, que coupe aussi le
 //! bit mémoire de la carte VGA : on n'affiche rien pendant la mesure).
 
+use crate::faillible::VecFaillible;
 use crate::port;
 use crate::verrou::{Garde, Verrou};
 use alloc::vec::Vec;
@@ -298,8 +299,8 @@ fn parcourir(bus: u8, vus: &mut [bool; 256], trouvees: &mut Vec<Fonction>) {
                 }
             }
             let multifonction = entete.multifonction;
-            if trouvees.len() < FONCTIONS_MAX && trouvees.try_reserve(1).is_ok() {
-                trouvees.push(Fonction { adresse: a, entete, bars, espace });
+            if trouvees.len() < FONCTIONS_MAX {
+                let _ = trouvees.ajouter(Fonction { adresse: a, entete, bars, espace });
             }
             if fonction == 0 && !multifonction {
                 break;

@@ -48,6 +48,7 @@ use core::fmt;
 use crate::descripteurs::{Fichier, Ouverts, Tenu};
 use crate::memoire::Echec;
 use crate::verrou::Verrou;
+use crate::faillible::{self, VecFaillible};
 use crate::{copie_utilisateur, espace, pages, pile, temps};
 use fichiers::chemins::{Depart, Fin, Suivre, Texte, resoudre};
 use fichiers::montages::{Interne, Monte, Objet, Vue};
@@ -373,11 +374,7 @@ fn date(secondes: u32) -> Horodatage {
 
 /// Le chemin absolu d'une entrée de l'archive (« bin/x » : « /bin/x »).
 fn absolu(nom: &[u8]) -> Result<Vec<u8>, Erreur> {
-    let mut chemin = Vec::new();
-    chemin.try_reserve_exact(nom.len() + 1).map_err(|_| Erreur::ENOMEM)?;
-    chemin.push(b'/');
-    chemin.extend_from_slice(nom);
-    Ok(chemin)
+    Ok(faillible::concatenation(&[b"/", nom])?)
 }
 
 /// Le nom d'une entrée, pour un message (sans accents : tel quel, l'ASCII
@@ -425,7 +422,7 @@ fn monter(nom: &str, chemin: &[u8], creer: fn(Temps) -> Result<NoyauFs, Erreur>)
             None => s.fs.creer(Identite::ROOT, &fin, S_IFDIR | 0o555, (0, 0), &[], maintenant)?,
         };
         s.fs.prendre(point);
-        s.montes.push((point, systeme));
+        s.montes.ajouter_dans_la_place((point, systeme));
         Ok(())
     })?;
     afficherln!("[noyau] {} monte sur {}.", nom, Chemin(chemin));
@@ -498,8 +495,7 @@ fn deballer_entree(entree: &formats::cpio::Entree, chemin: &[u8], vus: &mut Vec<
             _ => {}
         }
         if genre == S_IFREG && entree.liens >= 2 {
-            vus.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
-            vus.push((entree.inode, n));
+            vus.ajouter((entree.inode, n))?;
         }
         Ok(Some(n))
     })?;

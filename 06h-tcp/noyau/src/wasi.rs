@@ -48,15 +48,14 @@
 //! Linux (le processeur passe aux autres) ; un programme WebAssembly n'a pas
 //! de signal pour l'interrompre (ni de ^C avant le terminal, 6j).
 
-use alloc::boxed::Box;
-use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
+use core::fmt;
 use wasm::module::{DescriptionImport, TypeFonction, TypeValeur};
 use wasm::validateur::ModuleValide;
 use wasm::{Externe, Hote, Magasin, Piege, Valeur};
 
 use crate::descripteurs::{Descripteur, Descripteurs, FichierOuvert, Refus, Sorte};
+use crate::faillible::{self, VecFaillible};
 use crate::{appels_fichiers, console, temps, vfs};
 use crate::descripteurs::Tenu;
 use fichiers::chemins::Depart;
@@ -184,11 +183,10 @@ pub struct Wasi {
 /// nombre ; ENOMEM si la place manque. (Aucune ne contient de zéro :
 /// formats::commande les refuse.)
 fn a_la_suite(chaines: &[&[u8]]) -> Result<(Vec<u8>, u32), Erreur> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(chaines.iter().map(|c| c.len() + 1).sum()).map_err(|_| Erreur::ENOMEM)?;
+    let mut v = faillible::avec_capacite(chaines.iter().map(|c| c.len() + 1).sum())?;
     for c in chaines {
-        v.extend_from_slice(c);
-        v.push(0);
+        v.ajouter_tranche(c)?;
+        v.ajouter(0)?;
     }
     Ok((v, chaines.len() as u32))
 }
@@ -215,9 +213,7 @@ impl Wasi {
         }
         for (i, &dossier) in dossiers.iter().enumerate() {
             let fd = PREMIER_PREOUVERT + i as u64;
-            let mut nom = Vec::new();
-            nom.try_reserve_exact(dossier.len()).map_err(|_| (Erreur::ENOMEM, None))?;
-            nom.extend_from_slice(dossier);
+            let nom = faillible::copie(dossier).map_err(|_| (Erreur::ENOMEM, None))?;
             // `wasi` est rendu en cas d'erreur : son Drop ferme ce qui est
             // déjà ouvert.
             let f = appels_fichiers::ouvrir_pour(identite, dossier, true, false, true).map_err(|e| (e, Some(dossier)))?;
@@ -225,7 +221,7 @@ impl Wasi {
                 vfs::avec_systeme(|s, cadres| s.lacher(f, cadres));
                 return Err((Erreur::ENOMEM, None));
             }
-            wasi.preouverts.push(Preouvert { fd, nom });
+            wasi.preouverts.ajouter(Preouvert { fd, nom }).map_err(|_| (Erreur::ENOMEM, None))?;
         }
         Ok(wasi)
     }
@@ -249,17 +245,32 @@ impl Drop for Wasi {
     }
 }
 
+/// Pourquoi les imports d'un module ne peuvent pas être fournis.
+pub enum RefusImports<'a> {
+    /// Un import que nous n'avons pas : son module et son nom.
+    Inconnu(&'a str, &'a str),
+    PlusDeMemoire,
+}
+
+impl fmt::Display for RefusImports<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            RefusImports::Inconnu(module, nom) => write!(f, "import inconnu : {} {}", module, nom),
+            RefusImports::PlusDeMemoire => f.write_str("plus de memoire"),
+        }
+    }
+}
+
 /// Ce qu'il faut donner aux imports de `module` (dans leur ordre), après
 /// avoir ajouté nos fonctions au magasin ; ou pourquoi on ne peut pas.
-pub fn imports(magasin: &mut Magasin, module: &ModuleValide) -> Result<Vec<Externe>, String> {
+pub fn imports<'a>(magasin: &mut Magasin, module: &'a ModuleValide) -> Result<Vec<Externe>, RefusImports<'a>> {
     use TypeValeur::{I32, I64};
     let mut externes = Vec::new();
     for import in &module.module().imports {
-        let DescriptionImport::Fonction(_) = import.description else {
-            return Err(format!("import inconnu : {} {}", import.module, import.nom));
-        };
+        let inconnu = RefusImports::Inconnu(&import.module, &import.nom);
+        let DescriptionImport::Fonction(_) = import.description else { return Err(inconnu) };
         if import.module != MODULE {
-            return Err(format!("import inconnu : {} {}", import.module, import.nom));
+            return Err(inconnu);
         }
         let (numero, parametres, resultats): (u32, &[TypeValeur], &[TypeValeur]) = match import.nom.as_str() {
             // fd_write(fichier, morceaux, nombre, ecrits) -> errno
@@ -303,12 +314,13 @@ pub fn imports(magasin: &mut Magasin, module: &ModuleValide) -> Result<Vec<Exter
             "sched_yield" => (SCHED_YIELD, &[], &[I32]),
             // proc_exit(code)
             "proc_exit" => (PROC_EXIT, &[I32], &[]),
-            _ => return Err(format!("import inconnu : {} {}", import.module, import.nom)),
+            _ => return Err(inconnu),
         };
         // Le type exact : l'instanciation refusera un programme qui déclare
         // une fonction autrement.
-        let t = TypeFonction { parametres: Box::from(parametres), resultats: Box::from(resultats) };
-        externes.push(magasin.ajouter_fonction_hote(t, numero));
+        let boite = |types: &[TypeValeur]| faillible::boite_de_tranche(types).map_err(|_| RefusImports::PlusDeMemoire);
+        let t = TypeFonction { parametres: boite(parametres)?, resultats: boite(resultats)? };
+        externes.ajouter(magasin.ajouter_fonction_hote(t, numero)).map_err(|_| RefusImports::PlusDeMemoire)?;
     }
     Ok(externes)
 }
@@ -444,10 +456,7 @@ fn morceau(memoire: &[u8], morceaux: u32, i: u32) -> Option<(u32, u32)> {
 /// sa longueur, sans zéro final).
 fn chemin(memoire: &[u8], adresse: u32, longueur: u32) -> Result<Vec<u8>, u32> {
     let octets = plage(memoire, adresse, longueur).ok_or(EFAULT)?;
-    let mut copie = Vec::new();
-    copie.try_reserve_exact(octets.len()).map_err(|_| ENOMEM)?;
-    copie.extend_from_slice(octets);
-    Ok(copie)
+    faillible::copie(octets).map_err(|_| ENOMEM)
 }
 
 // Les types de fichiers de WASI (filetype).

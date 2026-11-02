@@ -40,13 +40,13 @@ use super::paquet::Paquet;
 use crate::appels_fichiers::FichierTenu;
 use crate::attente::{self, FileAttente, Mutex, Sommeil};
 use crate::descripteurs::{FichierOuvert, Prive};
+use crate::partage::Arc;
 use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM, Table};
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
+use crate::faillible::{self, FileFaillible};
 use crate::{cpu, temps};
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
-use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// POLLRDHUP : l'autre côté a fermé (ou la lecture est arrêtée).
@@ -327,12 +327,12 @@ impl Socket {
     }
 
     /// Une socket TCP : son flux, et ses tampons de départ (`tcp_rmem[1]`,
-    /// `tcp_wmem[1]`).
-    pub fn tcp(mut self) -> Socket {
-        self.flux = Some(alloc::boxed::Box::new(super::tcp::nouvelle(self.numero)));
+    /// `tcp_wmem[1]`). None : plus de mémoire pour le flux.
+    pub fn tcp(mut self) -> Option<Socket> {
+        self.flux = Some(faillible::boite(super::tcp::nouvelle(self.numero)).ok()?);
         self.rcvbuf.store(super::tcp::RCVBUF_DEFAUT, Ordering::Relaxed);
         self.sndbuf.store(super::tcp::SNDBUF_DEFAUT, Ordering::Relaxed);
-        self
+        Some(self)
     }
 
     /// La même, avec un flux déjà fait (la fille d'une écoute, à
@@ -364,11 +364,11 @@ impl Socket {
             if refuse {
                 return false;
             }
-            if r.file.try_reserve(1).is_err() {
+            let taille = d.taille;
+            if r.file.ajouter_derriere(d).is_err() {
                 return false;
             }
-            r.octets += d.taille;
-            r.file.push_back(d);
+            r.octets += taille;
         }
         self.attente.reveiller(POLLIN | POLLRDNORM, 1);
         true
@@ -387,11 +387,11 @@ impl Socket {
         let rcvbuf = self.rcvbuf.load(Ordering::Relaxed) as usize;
         {
             let mut r = self.reception.verrouiller();
-            if r.octets + e.taille >= rcvbuf || r.erreurs.try_reserve(1).is_err() {
+            let taille = e.taille;
+            if r.octets + taille >= rcvbuf || r.erreurs.ajouter_derriere(e).is_err() {
                 return false;
             }
-            r.octets += e.taille;
-            r.erreurs.push_back(e);
+            r.octets += taille;
         }
         self.attente.reveiller(POLLERR, 1);
         true
@@ -574,9 +574,7 @@ pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl F
                 let (source, port, destination, interface) = (premier.source, premier.port, premier.destination, premier.interface);
                 let total = premier.paquet.longueur();
                 let copie = if drapeaux & MSG_PEEK != 0 {
-                    let mut v = Vec::new();
-                    v.try_reserve_exact(total).map_err(|_| -ENOMEM)?;
-                    v.extend_from_slice(premier.paquet.donnees());
+                    let v = faillible::copie(premier.paquet.donnees()).map_err(|_| -ENOMEM)?;
                     drop(r);
                     copier(&v)?
                 } else {

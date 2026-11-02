@@ -24,6 +24,7 @@
 
 use super::interface::Interface;
 use super::paquet::Paquet;
+use crate::faillible::VecFaillible;
 use crate::verrou::Verrou;
 use crate::{aleatoire, temps};
 use alloc::vec::Vec;
@@ -121,9 +122,8 @@ pub fn temps() {
         t.temps(temps::ns_monotone(), hasard(), &mut |a| match a {
             Action::Jeter { paquet, echec: true } => {
                 JETES.fetch_add(1, Ordering::Relaxed);
-                if echecs.try_reserve(1).is_ok() {
-                    echecs.push(paquet);
-                }
+                // Sans place, le paquet est seulement jeté (sans ICMP).
+                let _ = echecs.ajouter(paquet);
             }
             a => faire(a),
         });

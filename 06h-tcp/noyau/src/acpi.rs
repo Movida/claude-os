@@ -20,6 +20,7 @@
 //! table MP d'Intel ; pas nous (aucune machine de QEMU n'en a besoin).
 
 use crate::espace;
+use crate::faillible::VecFaillible;
 use crate::verrou::Verrou;
 use crate::vmalloc;
 use alloc::vec::Vec;
@@ -88,12 +89,8 @@ fn chercher_rsdp() -> Option<(u64, acpi::Rsdp)> {
     // 0x400 et 0xA0000 (au-delà commence la mémoire vidéo).
     let segment = u16::from_le_bytes([memoire_basse(0x40E, 2)[0], memoire_basse(0x40E, 2)[1]]);
     let ebda = (segment as u64) << 4;
-    let mut zones = Vec::new();
-    if ebda > 0x400 && ebda + 1024 <= 0xA0000 {
-        zones.push((ebda, 1024));
-    }
-    zones.push((0xE0000, 0x20000));
-    zones.into_iter().find_map(|(debut, longueur)| {
+    let ebda = (ebda > 0x400 && ebda + 1024 <= 0xA0000).then_some((ebda, 1024));
+    [ebda, Some((0xE0000, 0x20000))].into_iter().flatten().find_map(|(debut, longueur)| {
         let zone = memoire_basse(debut, longueur);
         let i = acpi::chercher_rsdp(zone)?;
         Some((debut + i as u64, acpi::lire_rsdp(&zone[i..]).ok()?))
@@ -137,11 +134,11 @@ fn lire_madt(t: &acpi::Table) -> Option<ConfigurationMadt> {
         match e {
             // Activé, ou activable plus tard : on ne compte que les premiers
             // (un seul processeur servi de toute façon).
-            Entree::Processeur { processeur, apic, drapeaux } if drapeaux & 1 != 0 => c.processeurs.push((processeur, apic)),
-            Entree::IoApic { numero, adresse, gsi_base } => c.ioapics.push((numero, adresse as u64, gsi_base)),
+            Entree::Processeur { processeur, apic, drapeaux } if drapeaux & 1 != 0 => c.processeurs.ajouter((processeur, apic)).ok()?,
+            Entree::IoApic { numero, adresse, gsi_base } => c.ioapics.ajouter((numero, adresse as u64, gsi_base)).ok()?,
             // Seul le bus 0, ISA, existe.
-            Entree::Remplacement { bus: 0, source, gsi, drapeaux } => c.remplacements.push((source, gsi, drapeaux)),
-            Entree::NmiApic { processeur, drapeaux, lint } => c.nmi.push((processeur, drapeaux, lint)),
+            Entree::Remplacement { bus: 0, source, gsi, drapeaux } => c.remplacements.ajouter((source, gsi, drapeaux)).ok()?,
+            Entree::NmiApic { processeur, drapeaux, lint } => c.nmi.ajouter((processeur, drapeaux, lint)).ok()?,
             Entree::AdresseApic(a) => c.apic_local = a,
             _ => {}
         }
@@ -159,7 +156,11 @@ pub fn initialiser() -> Result<(), Absence> {
         None => (rsdp.rsdt as u64, false, b"RSDT"),
     };
     let adresses: Vec<u64> = avec_table(racine, |t| {
-        if &t.signature == signature { Some(acpi::adresses(t, larges).collect()) } else { None }
+        (&t.signature == signature).then(|| {
+            let mut v = Vec::new();
+            v.ajouter_tout(acpi::adresses(t, larges)).expect("plus de memoire pour les tables ACPI");
+            v
+        })
     })
     .and_then(|a| a.ok_or(acpi::Erreur::Signature))
     .map_err(|e| Absence::Racine(racine, e))?;
@@ -167,7 +168,7 @@ pub fn initialiser() -> Result<(), Absence> {
     for a in adresses {
         // Une table illisible est sautée : les autres peuvent servir.
         let _ = avec_table(a, |t| {
-            c.signatures.push(t.signature);
+            c.signatures.ajouter(t.signature).expect("plus de memoire pour les tables ACPI");
             match &t.signature {
                 // La première de chaque, comme Linux.
                 b"APIC" if c.madt.is_none() => c.madt = lire_madt(t),

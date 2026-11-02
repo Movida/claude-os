@@ -20,12 +20,13 @@
 //! verrou d'un processus (une copie peut fauter, et plus tard attendre le
 //! disque). On y lit ou change l'état, on rend le verrou, puis on copie.
 
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::descripteurs::{Descripteurs, LIMITE_DESCRIPTEURS};
+use crate::faillible::{self, VecFaillible};
 use crate::fil::Fil;
+use crate::partage::Arc;
 use crate::programmes::NomCourt;
 use crate::tache::Tache;
 use crate::memoire::Memoire;
@@ -297,8 +298,7 @@ impl Entree {
     pub fn attacher(&self, t: &Arc<Tache>) -> Result<(), ()> {
         let mut garde = self.processus.verrouiller();
         let p = garde.as_mut().ok_or(())?;
-        p.fils.try_reserve(1).map_err(|_| ())?;
-        p.fils.push(Fil::de(t));
+        p.fils.ajouter(Fil::de(t)).map_err(|_| ())?;
         self.vivants.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -315,10 +315,9 @@ impl Entree {
             return Err(RefusFil::Interrompu);
         }
         let masque = p.fil(createur.tid()).map(|f| f.signaux.herite()).unwrap_or_default();
-        p.fils.try_reserve(1).map_err(|_| RefusFil::PlusDeMemoire)?;
         let mut fil = Fil::de(t);
         fil.signaux = masque;
-        p.fils.push(fil);
+        p.fils.ajouter(fil).map_err(|_| RefusFil::PlusDeMemoire)?;
         self.vivants.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
@@ -362,7 +361,7 @@ pub fn initialiser(max: usize) {
 /// Range un processus neuf dans la table, sans fil encore (son fil
 /// principal le rejoint à sa création, tache::lancer_programme), avec la
 /// tâche courante pour parent ; None si elle est pleine (pas plus de
-/// processus que de tâches).
+/// processus que de tâches), ou le tas.
 pub fn ajouter(processus: Processus, nom: NomCourt) -> Option<Arc<Entree>> {
     let mut table = TABLE.verrouiller();
     if table.len() == table.capacity() {
@@ -382,8 +381,8 @@ pub fn ajouter(processus: Processus, nom: NomCourt) -> Option<Arc<Entree>> {
         identite,
         lance: crate::temps::maintenant(),
         exe: Verrou::new((Vec::new(), None)),
-    });
-    table.push(e.clone());
+    }).ok()?;
+    table.ajouter_dans_la_place(e.clone());
     Some(e)
 }
 
@@ -425,11 +424,7 @@ pub fn exe(pid: u32) -> Option<Numero> {
 pub fn chemin_exe(pid: u32) -> Option<Vec<u8>> {
     let e = entree(pid).filter(|e| !e.est_zombie())?;
     let exe = e.exe.verrouiller();
-    let mut v = Vec::new();
-    if v.try_reserve_exact(exe.0.len()).is_ok() {
-        v.extend_from_slice(&exe.0);
-    }
-    Some(v)
+    Some(faillible::copie(&exe.0).unwrap_or_default())
 }
 
 /// Le plus petit numéro de processus de la table (vivant ou zombie) à partir

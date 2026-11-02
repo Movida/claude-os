@@ -12,6 +12,7 @@
 //! en hexadécimal : 10.0.2.2 donne 0202000A.
 
 use super::interface;
+use crate::faillible::VecFaillible;
 use alloc::vec::Vec;
 use core::fmt::{self, Write};
 use core::sync::atomic::Ordering;
@@ -31,9 +32,7 @@ struct Texte(Vec<u8>);
 
 impl Write for Texte {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.try_reserve(s.len()).map_err(|_| fmt::Error)?;
-        self.0.extend_from_slice(s.as_bytes());
-        Ok(())
+        self.0.ajouter_tranche(s.as_bytes()).map_err(|_| fmt::Error)
     }
 }
 

@@ -77,6 +77,7 @@ use core::fmt::{self, Write};
 
 use crate::descripteurs::{Donnees, Fichier, FichierOuvert, Lecture, Ouverts, Sorte};
 use crate::espace_utilisateur::ADRESSE_MIN;
+use crate::faillible::{self, VecFaillible};
 use crate::{appels_fichiers, processus, sysfs, vfs};
 use fichiers::chemins::Texte;
 use fichiers::montages::{Interne, Monte, Objet};
@@ -448,13 +449,10 @@ impl Monte for ProcVue<'_> {
         if !inode.is_some_and(|i| self.fs.attributs(i).nlink == 0) {
             return chemin;
         }
-        let mut v = Vec::new();
-        if v.try_reserve_exact(chemin.len() + 10).is_err() {
-            return Texte::Emprunte(&[]);
+        match faillible::concatenation(&[&chemin, b" (deleted)"]) {
+            Ok(v) => Texte::Long(v),
+            Err(_) => Texte::Emprunte(&[]),
         }
-        v.extend_from_slice(&chemin);
-        v.extend_from_slice(b" (deleted)");
-        Texte::Long(v)
     }
 
     /// `exe` et les liens de fd/ sont des LIENS MAGIQUES : les suivre mène
@@ -712,9 +710,7 @@ struct Ecrit(Vec<u8>);
 
 impl Write for Ecrit {
     fn write_str(&mut self, s: &str) -> fmt::Result {
-        self.0.try_reserve(s.len()).map_err(|_| fmt::Error)?;
-        self.0.extend_from_slice(s.as_bytes());
-        Ok(())
+        self.0.ajouter_tranche(s.as_bytes()).map_err(|_| fmt::Error)
     }
 }
 
@@ -763,10 +759,7 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
         if curseur > 0 {
             return Ok(None);
         }
-        let mut v = Vec::new();
-        v.try_reserve_exact(valeur.len()).map_err(|_| Erreur::ENOMEM)?;
-        v.extend_from_slice(valeur);
-        return Ok(Some((v, 1)));
+        return Ok(Some((faillible::copie(valeur)?, 1)));
     }
     // Le processus `argument`. Un zombie (sa tâche est morte, il attend
     // d'être recueilli) n'a plus de mémoire : maps vide, statm à zéro,
@@ -803,11 +796,7 @@ fn nom(tid: u32) -> Option<crate::programmes::NomCourt> {
 /// vide si le fil vient de finir.
 fn comm(tid: u32) -> Result<Vec<u8>, Erreur> {
     let nom = nom(tid).unwrap_or(crate::programmes::NomCourt::VIDE);
-    let mut t = Vec::new();
-    t.try_reserve_exact(nom.octets().len() + 1).map_err(|_| Erreur::ENOMEM)?;
-    t.extend_from_slice(nom.octets());
-    t.push(b'\n');
-    Ok(t)
+    Ok(faillible::concatenation(&[nom.octets(), b"\n"])?)
 }
 
 /// La source `source` s'écrit-elle (le fichier s'ouvre-t-il en écriture,
@@ -868,10 +857,8 @@ fn fichier_de_zone(z: &Zone) -> Result<Option<(Vec<u8>, u32, bool, u64)>, Erreur
     let Some(projection) = z.fichier else { return Ok(None) };
     vfs::avec_systeme(|s, _| {
         let f = s.ouverts.fichier(Fichier::de(projection.fichier));
-        let mut chemin = Vec::new();
         let source = if f.chemin.is_empty() { f.nom.octets() } else { &f.chemin[..] };
-        chemin.try_reserve_exact(source.len()).map_err(|_| Erreur::ENOMEM)?;
-        chemin.extend_from_slice(source);
+        let chemin = faillible::copie(source)?;
         let numero = f.numero();
         let efface = numero.is_some_and(|n| s.fs.attributs(n).nlink == 0);
         Ok(Some((chemin, numero.map_or(0, |n| n.0), efface, projection.page * 4096)))
@@ -924,17 +911,15 @@ fn ligne_maps(pid: u32, curseur: u64) -> Result<Enregistrement, Erreur> {
     if let Some(nom) = nom {
         let efface = matches!(fichier, Some((_, _, true, _)));
         let place = 72usize.saturating_sub(ligne.len()) + 1 + nom.len() + if efface { 10 } else { 0 } + 1;
+        // Une seule allocation pour tout ce qui suit.
         ligne.try_reserve(place).map_err(|_| Erreur::ENOMEM)?;
-        while ligne.len() < 72 {
-            ligne.push(b' ');
-        }
-        ligne.push(b' ');
-        ligne.extend_from_slice(nom);
+        ligne.redimensionner(ligne.len().max(72), b' ')?;
+        ligne.ajouter(b' ')?;
+        ligne.ajouter_tranche(nom)?;
         if efface {
-            ligne.extend_from_slice(b" (deleted)");
+            ligne.ajouter_tranche(b" (deleted)")?;
         }
     }
-    ligne.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
-    ligne.push(b'\n');
+    ligne.ajouter(b'\n')?;
     Ok(Some((ligne, z.fin)))
 }

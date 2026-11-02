@@ -58,7 +58,6 @@
 //! (processus.rs) ; leurs signaux, dans le `Fil` de chacun (fil.rs).
 
 use alloc::boxed::Box;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
 use core::cell::{Cell, UnsafeCell};
@@ -67,8 +66,10 @@ use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::attente::EntreeAttente;
+use crate::faillible::{self, VecFaillible};
 use crate::interruptions::Cadre;
 use crate::linux::{self, Signal};
+use crate::partage::Arc;
 use crate::programmes::NomCourt;
 use crate::verrou::Verrou;
 use crate::vmalloc::Pile;
@@ -309,15 +310,25 @@ impl EtatProgramme {
 unsafe impl Sync for Tache {}
 unsafe impl Send for Tache {}
 
+/// Ce qui a manqué pour créer une tâche.
+pub enum Manque {
+    /// Une pile du noyau : il n'y en a qu'autant que le maximum de fils
+    /// (`max_threads`), comme le `threads-max` de Linux (EAGAIN).
+    Pile,
+    /// La mémoire de la tâche elle-même (ENOMEM, le `dup_task_struct` de
+    /// Linux).
+    Memoire,
+}
+
 impl Tache {
     /// Une tâche, sans encore de premier départ, ni de place dans la table
-    /// des tâches (`demarrer`) : jetée avant, elle rend sa pile. None : plus
-    /// de mémoire, ou plus de place pour une pile (le maximum de fils). Une
+    /// des tâches (`demarrer`) : jetée avant, elle rend sa pile. Ou ce qui
+    /// manque : une pile (le maximum de fils), ou la mémoire de la tâche. Une
     /// tâche du noyau attend sa créatrice (`attendant`), un fil de programme
     /// a le numéro `tid` et l'état `programme`.
     fn creer(nom: NomCourt, espace: u64, programme: Option<EtatProgramme>, processus: Option<Arc<crate::processus::Entree>>,
-             tid: u32) -> Option<Arc<Tache>> {
-        let pile = Pile::allouer()?;
+             tid: u32) -> Result<Arc<Tache>, Manque> {
+        let pile = Pile::allouer().ok_or(Manque::Pile)?;
         let haut = pile.haut();
         let programme = programme.map(UnsafeCell::new);
         let noyau = processus.is_none();
@@ -354,8 +365,9 @@ impl Tache {
             reprise: Verrou::new(None),
             contexte_reseau: AtomicU32::new(0),
             fermetures: Verrou::new(None),
-        });
-        Some(t)
+        })
+        .map_err(|_| Manque::Memoire)?;
+        Ok(t)
     }
 
     /// Son numéro de fil (0 : une tâche du noyau).
@@ -578,7 +590,7 @@ pub fn initialiser() {
         contexte_reseau: AtomicU32::new(0),
         fermetures: Verrou::new(None),
     };
-    let t = Arc::into_raw(Arc::new(pile_demarrage)) as *mut Tache;
+    let t = Arc::into_raw(Arc::new(pile_demarrage).expect("plus de memoire pour la tache du demarrage")) as *mut Tache;
     INACTIVE.store(t, Ordering::Relaxed);
     COURANTE.store(t, Ordering::Relaxed);
     TOUTES.verrouiller().try_reserve_exact(crate::vmalloc::max_threads()).expect("plus de memoire pour la table des taches");
@@ -792,7 +804,7 @@ const RFLAGS_INITIAL: u64 = 1 << 9 | 1 << 1;
 /// Range la tâche `t` dans la table des tâches, et la rend prête.
 fn demarrer(t: &Arc<Tache>) {
     // La place est réservée : il n'y a jamais plus de tâches que de piles.
-    TOUTES.verrouiller().push(t.clone());
+    TOUTES.verrouiller().ajouter_dans_la_place(t.clone());
     ordonnanceur::rendre_prete(t.clone(), true);
 }
 
@@ -803,7 +815,7 @@ fn demarrer(t: &Arc<Tache>) {
 pub fn lancer_programme(nom: NomCourt, processus: Arc<crate::processus::Entree>, pml4: u64, entree: u64, pile: u64)
     -> Option<Arc<Tache>> {
     let tid = processus.pid();
-    let t = Tache::creer(nom, pml4, Some(EtatProgramme::initial()?), Some(processus.clone()), tid)?;
+    let t = Tache::creer(nom, pml4, Some(EtatProgramme::initial()?), Some(processus.clone()), tid).ok()?;
     processus.attacher(&t).ok()?;
     t.preparer(premier_depart, 0, Some(Cadre {
         r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
@@ -836,7 +848,7 @@ pub struct NouveauFil {
 /// Lance un fil neuf du processus de la tâche courante, dans l'ordre du
 /// `copy_process` puis du `kernel_clone` de Linux : la copie de l'état du
 /// créateur (ENOMEM), une pile noyau (EAGAIN : le maximum de fils,
-/// max_threads), sa place dans le processus, sous son verrou, à condition
+/// max_threads) et la tâche (ENOMEM), sa place dans le processus, sous son verrou, à condition
 /// que le créateur ne soit pas en train de finir (EINTR, tout est défait :
 /// « Let kill terminate clone/fork in the middle ») ; puis son numéro écrit
 /// à CLONE_PARENT_SETTID AVANT qu'il soit prêt (un fil qui finirait aussitôt
@@ -862,7 +874,10 @@ pub fn lancer_fil(n: NouveauFil) -> Result<u32, i64> {
     }
     let tid = processus::numero_neuf();
     let espace = createur.espace.load(Ordering::Relaxed);
-    let t = Tache::creer(createur.nom(), espace, Some(etat), Some(processus.clone()), tid).ok_or(-EAGAIN)?;
+    let t = Tache::creer(createur.nom(), espace, Some(etat), Some(processus.clone()), tid).map_err(|m| match m {
+        Manque::Pile => -EAGAIN,
+        Manque::Memoire => -ENOMEM,
+    })?;
     t.ecrire_tid.store(n.ecrire_tid, Ordering::Relaxed);
     t.effacer_tid.store(n.effacer_tid, Ordering::Relaxed);
     t.preparer(premier_depart, 0, Some(n.cadre));
@@ -948,11 +963,12 @@ pub fn nombre() -> usize {
 type FonctionNoyau = Box<dyn FnOnce() + Send>;
 
 /// Lance `f` dans une tâche du noyau nommée `nom`, prête aussitôt ; None :
-/// pas de pile pour la tâche.
+/// pas de pile pour la tâche, ou plus de mémoire.
 pub fn lancer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> Option<Arc<Tache>> {
-    let t = Tache::creer(nom, pagination::pml4_noyau(), None, None, 0)?;
     // Un pointeur simple vers la fermeture, pour r12 : une boîte de boîte.
-    let f: Box<FonctionNoyau> = Box::new(Box::new(f));
+    let f: FonctionNoyau = faillible::boite(f).ok()?;
+    let f: Box<FonctionNoyau> = faillible::boite(f).ok()?;
+    let t = Tache::creer(nom, pagination::pml4_noyau(), None, None, 0).ok()?;
     t.preparer(depart_noyau, Box::into_raw(f) as u64, None);
     demarrer(&t);
     Some(t)

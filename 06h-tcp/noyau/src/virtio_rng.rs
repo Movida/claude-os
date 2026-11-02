@@ -29,7 +29,7 @@ use crate::programmes::NomCourt;
 use crate::verrou::Verrou;
 use crate::virtio::{self, Notifieur, Virtio};
 use crate::virtqueue::{ECRIT_PAR_PERIPHERIQUE, Tampon, Virtqueue};
-use crate::{cpu, espace, irq, pages, tache, temps};
+use crate::{cpu, espace, faillible, irq, pages, tache, temps};
 
 /// Les modèles : transitionnel (0x1005, sous-système 4) et moderne
 /// (0x1040 + 4).
@@ -103,7 +103,11 @@ fn ouvrir(f: &Fonction) -> Result<&'static Carte, virtio::Refus> {
             return Err(v.echouer(e));
         }
     };
-    let carte = alloc::boxed::Box::new(Carte { virtio: v, file: Verrou::new(file), notifieur, page, attente: FileAttente::new() });
+    let Ok(place) = faillible::boite_vide::<Carte>() else {
+        pages::liberer(page, 0);
+        return Err(v.echouer(virtio::Refus::Memoire));
+    };
+    let carte = alloc::boxed::Box::write(place, Carte { virtio: v, file: Verrou::new(file), notifieur, page, attente: FileAttente::new() });
     let Some(vecteur) = irq::allouer(interruption, &*carte as *const Carte as usize) else {
         pages::liberer(carte.page, 0);
         return Err(carte.virtio.echouer(virtio::Refus::Vecteur));

@@ -16,12 +16,14 @@
 //! écoute crée une fille (SYN_RECEIVED, une `Tcb` neuve), qui reste une
 //! valeur dans la file de l'écoute jusqu'à `accept`, comme la
 //! `request_sock` de Linux avant le troisième ACK (Linux, lui, en fait une
-//! socket entière dès la poignée de main finie) : rien de ce qu'un client
-//! du dehors déclenche n'alloue sans pouvoir échouer (`Arc::new` ne sait
-//! pas échouer en Rust stable). Le prix : une fille établie n'est pas une
-//! socket, et ce qui la concerne (poll de l'écoute, accept, un RST, une
-//! erreur ICMP) passe par l'écoute (`Fille::prete`, `ranger_filles`). La
-//! table des ports la désigne par
+//! socket entière dès la poignée de main finie). Choix gardé : la socket
+//! (son Arc, son inode, sa partie possédée) ne naît que dans l'appel
+//! système qui la donne au programme, où sa mémoire peut manquer sans rien
+//! perdre (la fille reste en file) ; un client du dehors ne fait allouer
+//! au noyau que la petite valeur de la fille, sous la borne de la file. Le
+//! prix : une fille établie n'est pas une socket, et ce qui la concerne
+//! (poll de l'écoute, accept, un RST, une erreur ICMP) passe par l'écoute
+//! (`Fille::prete`, `ranger_filles`). La table des ports la désigne par
 //! « l'écoute, et sa fille de tel numéro » ; `accept4`, dans l'appel
 //! système, la sort de la file et lui fait sa socket. La file : au plus
 //! `backlog + 1` filles en tout, un SYN jeté quand les filles prêtes
@@ -44,11 +46,12 @@ use super::ipv4;
 use super::paquet::Paquet;
 use super::socket::{self, Protocole, Socket};
 use crate::attente::{FileAttente, Possede, Possession, Sommeil};
+use crate::faillible::{self, FileFaillible, VecFaillible};
+use crate::partage::{Arc, ArcVide};
 use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use crate::tache::Reveil;
 use crate::verrou::Verrou;
 use alloc::collections::VecDeque;
-use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use formats::reseau::ipv4 as fipv4;
@@ -63,6 +66,7 @@ const EPIPE: i64 = 32;
 const EACCES: i64 = 13;
 const EADDRINUSE: i64 = 98;
 const EADDRNOTAVAIL: i64 = 99;
+const ENFILE: i64 = 23;
 const EAFNOSUPPORT: i64 = 97;
 const EISCONN: i64 = 106;
 const ENOTCONN: i64 = 107;
@@ -391,8 +395,10 @@ impl Partie {
             // L'entrée de TIME_WAIT prend un numéro neuf, et l'échéance
             // qui va avec ; la socket n'a plus d'entrée dans la table.
             let mut tw = TW.verrouiller();
-            if tw.len() < MAX_TW {
-                tw.push(e);
+            // La place prise au démarrage : MAX_TW entrées, ou aucune si le
+            // tas n'avait pas pu la donner (`initialiser`).
+            if tw.len() < tw.capacity() {
+                tw.ajouter_dans_la_place(e);
                 drop(tw);
                 if let Some(t) = TABLE.verrouiller().as_mut() {
                     t.temps_attente(self.numero, numero);
@@ -478,9 +484,8 @@ impl Ip {
 fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip) {
     let mut a_envoyer: Vec<itcp::Sortant> = Vec::new();
     t.emettre(|s| {
-        if a_envoyer.try_reserve(1).is_ok() {
-            a_envoyer.push(s);
-        }
+        // Sans place, le segment ne part pas : la retransmission y pourvoira.
+        let _ = a_envoyer.ajouter(s);
     });
     for s in a_envoyer {
         envoyer_segment(&s.entete, source, distante, identifiant, ip, s.longueur, |o| t.copier_envoi(s.debut, o));
@@ -656,7 +661,8 @@ impl Partie {
             numero, tcb, locale: s.destination, distante: s.source, identifiant: crate::aleatoire::u32() as u16, etablie: false,
         };
         emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip);
-        filles.push_back(f);
+        // La place est prise plus haut, avant tout changement.
+        filles.ajouter_derriere_dans_la_place(f);
     }
 }
 
@@ -1154,6 +1160,10 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
         let p = g.donnee();
         let Mode::Ecoute { filles, .. } = &mut p.mode else { return Err(-EINVAL) };
         if let Some(i) = filles.iter().position(|f| f.prete()) {
+            // La place de la socket neuve d'abord : sans mémoire, la fille
+            // reste dans la file, pour un prochain accept (ENFILE, comme le
+            // `sock_alloc` de `do_accept`).
+            let (Ok(place_flux), Ok(place_socket)) = (faillible::boite_vide(), ArcVide::new()) else { return Err(-ENFILE) };
             let f = filles.remove(i).expect("la fille");
             let (port, distante, port_distant, locale) = (f.tcb.port_local, f.distante, f.tcb.port_distant, f.locale);
             let numero = f.numero;
@@ -1169,7 +1179,8 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 connexion_en_cours: false,
             };
             let premier = partie.premier(0, SNDBUF_DEFAUT as usize);
-            let enfant = Arc::new(enfant.avec_flux(alloc::boxed::Box::new(Possession::new(partie, premier))));
+            let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
+            let enfant = place_socket.remplir(enfant.avec_flux(flux));
             enfant.rcvbuf.store(s.rcvbuf.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.sndbuf.store(s.sndbuf.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.recverr.store(options.recverr, Ordering::Relaxed);

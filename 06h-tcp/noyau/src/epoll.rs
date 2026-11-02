@@ -48,12 +48,13 @@ use crate::appels_fichiers::{FichierTenu, installer_fichier_puis, tenir, tenir_o
 use crate::attente::{self, EntreeAttente, FileAttente, Mutex, Rappel, Sommeil};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur, dans_les_bornes};
 use crate::descripteurs::{Fichier, FichierOuvert, Ouverts, Prive, Sorte, Tenu};
+use crate::partage::{Arc, Weak};
 use crate::sondage::{self, Delai, Inscrire, POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, Table};
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
+use crate::faillible::{FileFaillible, VecFaillible};
 use crate::{cpu, pages, signaux, temps, vfs};
 use alloc::collections::VecDeque;
-use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
@@ -238,7 +239,7 @@ impl Epoll {
     /// Remet `e`, encore lié, en tête du parcours (il reviendra en tête des
     /// prêts).
     fn remettre(&self, e: Arc<Element>) {
-        self.prets.verrouiller().parcourus.push_front(e);
+        self.prets.verrouiller().parcourus.ajouter_devant_dans_la_place(e);
     }
 
     /// La fin d'un parcours (`ep_done_scan`) : dans l'ordre, ce qui reste du
@@ -251,11 +252,11 @@ impl Epoll {
         for e in p.debordement.drain(..) {
             e.deborde.store(false, Relaxed);
             if !e.lie.swap(true, Relaxed) {
-                p.parcourus.push_back(e);
+                p.parcourus.ajouter_derriere_dans_la_place(e);
             }
         }
         p.en_parcours = false;
-        p.parcourus.append(&mut p.liste);
+        p.parcourus.deplacer_dans_la_place(&mut p.liste);
         core::mem::swap(&mut p.liste, &mut p.parcourus);
         if !p.liste.is_empty() && self.wq.active() {
             self.wq.reveiller(0, 1);
@@ -270,7 +271,7 @@ impl Epoll {
             if e.lie.swap(true, Relaxed) {
                 return;
             }
-            p.liste.push_back(e.clone());
+            p.liste.ajouter_derriere_dans_la_place(e.clone());
             if self.wq.active() {
                 self.wq.reveiller(0, 1);
             }
@@ -342,7 +343,7 @@ impl Epoll {
                 // d'autre ne range dans `liste` (les rappels débordent, les
                 // epoll_ctl attendent le Mutex).
                 e.lie.store(true, Relaxed);
-                self.prets.verrouiller().liste.push_back(e);
+                self.prets.verrouiller().liste.ajouter_derriere_dans_la_place(e);
             }
         }
         self.fin_du_parcours();
@@ -485,10 +486,10 @@ impl Element {
             if let Some(moi) = self.moi.upgrade() {
                 if p.en_parcours {
                     if !self.deborde.swap(true, Relaxed) {
-                        p.debordement.push(moi);
+                        p.debordement.ajouter_dans_la_place(moi);
                     }
                 } else if !self.lie.swap(true, Relaxed) {
-                    p.liste.push_back(moi);
+                    p.liste.ajouter_derriere_dans_la_place(moi);
                 }
             }
             if ep.wq.active() {
@@ -595,10 +596,8 @@ fn etages_dessus(ouverts: &mut Ouverts, ep: &Epoll, tour: u64) -> u32 {
     let mut dessus: Vec<Arc<Epoll>> = Vec::new();
     if let Some(f) = ouverts.peut_etre(Fichier::de(ep.fichier.load(Relaxed))) {
         for e in f.surveillants.iter().filter(|e| !e.mourant.load(Relaxed)) {
-            if let Some(x) = e.epoll.upgrade()
-                && dessus.try_reserve(1).is_ok()
-            {
-                dessus.push(x);
+            if let Some(x) = e.epoll.upgrade() {
+                let _ = dessus.ajouter(x);
             }
         }
     }
@@ -629,7 +628,7 @@ pub fn epoll_create1(drapeaux: u64) -> i64 {
     if drapeaux & !O_CLOEXEC != 0 {
         return -EINVAL;
     }
-    let ep = Arc::new(Epoll::new());
+    let Ok(ep) = Arc::new(Epoll::new()) else { return -ENOMEM };
     let mut f = FichierOuvert::new(Sorte::Epoll, Tenu::Noyau(Objet::Anonyme), true, true, O_RDWR, b"anon_inode:[eventpoll]");
     f.chemin = crate::evenements::nom_anonyme(b"anon_inode:[eventpoll]");
     f.prive = Prive::Epoll(ep.clone());
@@ -786,22 +785,21 @@ fn inserer(ep: &Epoll, elements: &mut Vec<Arc<Element>>, e: &FichierTenu, cible:
         entrees: [const { EntreeElement { entree: EntreeAttente::new(), file: AtomicPtr::new(core::ptr::null_mut()), element: AtomicPtr::new(core::ptr::null_mut()) } }; 2],
         inscrites: AtomicUsize::new(0),
     });
+    let Ok(x) = x else { return -ENOMEM };
     for en in &x.entrees {
         en.element.store(Arc::as_ptr(&x) as *mut Element, Relaxed);
     }
     let attache = vfs::avec_systeme(|s, _| {
         let f = s.ouverts.fichier(cible.fichier());
-        if f.surveillants.try_reserve(1).is_err() {
-            return false;
-        }
-        f.surveillants.push(x.clone());
-        true
+        f.surveillants.ajouter(x.clone()).is_ok()
     });
     if !attache {
         return -ENOMEM;
     }
     SURVEILLANCES.fetch_add(1, Relaxed);
-    elements.push(x.clone());
+    // La place est prise au début (`elements` est à nous : le Mutex de
+    // l'epoll est tenu).
+    elements.ajouter_dans_la_place(x.clone());
     let mut inscription = Inscription { element: &x, echec: false };
     let revents = x.sonder(&mut Table::new(Some(&mut inscription as &mut dyn Inscrire)));
     if inscription.echec {
