@@ -49,6 +49,14 @@ for etape in [0-9][0-9]*-*/; do
             echec=1
         fi
     done < "$etape/attendu.txt"
+    # Et aucun échec : le noyau dit « ok » ou « ECHEC » pour chacune de ses
+    # vérifications, et « PANIQUE » s'il s'arrête. Une ligne attendue
+    # trouvée n'importe où ne prouve pas qu'aucune autre n'a échoué
+    # (depuis 6h ; make tests-qemu le faisait déjà pour son journal).
+    if grep -nE 'ECHEC|PANIQUE' "$etape/serial.log"; then
+        echo "ECHEC  $etape : un ECHEC ou une PANIQUE dans le journal du demarrage"
+        echec=1
+    fi
 done
 for etape in [0-9][0-9]*-*/; do
     etape=${etape%/}
