@@ -257,7 +257,7 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
         v.configuration(|c| core::array::from_fn(|i| c.octet(i as u64).unwrap_or(0)))
     } else {
         let mut m = [0u8; 6];
-        crate::aleatoire::remplir(&mut m);
+        crate::aleatoire::obtenir(&mut m);
         // Une adresse « administrée localement » (bit 1), pas de groupe
         // (bit 0) : le `eth_random_addr` de Linux.
         m[0] = m[0] & !1 | 2;

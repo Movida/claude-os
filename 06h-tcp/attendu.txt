@@ -5,7 +5,9 @@
 [noyau] GDT, TSS et IDT du noyau en place ; syscall pret.
 [noyau] Exception 3 (point d'arret (int3)) a RIP=
 [noyau] Retour apres int3 : les exceptions sont gerees.
+[alea] pas encore pret (ni RDRAND ni RDSEED)
 [alea] ChaCha20, BLAKE2s, SipHash : vecteurs des RFC : ok.
+[alea] pret (
 [noyau] APIC local 0 a 0xfee00000 (xAPIC, version 0x14), IO-APIC 0 a 0xfec00000 (GSI 0-23) ; 8259 masque.
 [noyau] Clavier : IRQ 1 sur le GSI 1, vecteur 0x31.
 [noyau] TSC : 
@@ -49,8 +51,8 @@ memoire rendue : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 47, liens symboliques 6, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 43 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 48, liens symboliques 6, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 44 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -171,6 +173,8 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] reseau : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] dns : toutes les verifications : ok
 [noyau] dns : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] aleatoire : toutes les verifications : ok
+[noyau] aleatoire : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] passerelle : /proc/net/route comme Linux : ok
 [linux] passerelle : /proc/net/route lu par morceaux : ok
 [linux] passerelle : /etc/resolv.conf -> /proc/net/pnp : ok

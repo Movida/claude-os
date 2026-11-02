@@ -49,9 +49,7 @@ pub fn initialiser() {
 }
 
 fn hasard() -> u32 {
-    let mut h = [0u8; 4];
-    aleatoire::remplir(&mut h);
-    u32::from_le_bytes(h)
+    aleatoire::u32()
 }
 
 /// Retire la socket `s` de la table des ports (son dernier close).

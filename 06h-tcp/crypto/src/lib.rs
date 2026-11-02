@@ -34,6 +34,7 @@
 #![no_std]
 #![forbid(unsafe_code)]
 
+pub mod alea;
 pub mod blake2s;
 pub mod chacha20;
 pub mod siphash;

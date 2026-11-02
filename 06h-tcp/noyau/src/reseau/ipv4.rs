@@ -42,7 +42,7 @@
 use super::interface::{self, Interface};
 use super::paquet::Paquet;
 use crate::verrou::Verrou;
-use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use formats::reseau::{dhcp as format_dhcp, ethernet, icmp, ipv4, udp};
 use inet::routes::{Chemin, Table};
 
@@ -59,16 +59,26 @@ static PAS_POUR_NOUS: AtomicU64 = AtomicU64::new(0);
 static FRAGMENTS: AtomicU64 = AtomicU64::new(0);
 static OPTIONS: AtomicU64 = AtomicU64::new(0);
 
-/// L'identifiant des paquets qui en demandent un sans être d'une socket
-/// connectée (voir `identifiant`).
-static IDENTIFIANT: AtomicU16 = AtomicU16::new(0);
+/// Les identifiants des paquets qui en demandent un sans être d'une
+/// socket connectée (voir `identifiant`) : 2048 compteurs (`ip_idents`),
+/// partis du hasard, et le tic de leur dernier usage (`ip_tstamps`).
+const IDENTS: usize = 2048;
+static IDENTS_COMPTEURS: [AtomicU32; IDENTS] = [const { AtomicU32::new(0) }; IDENTS];
+static IDENTS_TICS: [AtomicU32; IDENTS] = [const { AtomicU32::new(0) }; IDENTS];
+/// La clé secrète qui choisit le compteur d'une destination
+/// (`net->ipv4.ip_id_key`).
+static CLE_IDENTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
-/// Fait la table (vide), et tire le premier identifiant. Au démarrage.
+/// Fait la table (vide), et tire les compteurs d'identifiants et leur clé.
+/// Au démarrage.
 pub fn initialiser() {
     *TABLE.verrouiller() = Table::new(inet::routes::MAX);
-    let mut h = [0u8; 2];
-    crate::aleatoire::remplir(&mut h);
-    IDENTIFIANT.store(u16::from_le_bytes(h), Ordering::Relaxed);
+    for c in &IDENTS_COMPTEURS {
+        c.store(crate::aleatoire::u32(), Ordering::Relaxed);
+    }
+    for k in &CLE_IDENTS {
+        k.store(crate::aleatoire::u64(), Ordering::Relaxed);
+    }
 }
 
 /// Fait `f` sur la table (sous son verrou : `f` ne dort pas). None : pas de
@@ -256,16 +266,30 @@ pub fn mtu(c: &Chemin) -> u32 {
 
 /// Un identifiant pour un paquet qui n'est pas d'une socket connectée :
 /// un envoi d'UDP ou de ping (sauf IP_PMTUDISC_DO et PROBE, qui ont 0 :
-/// voir `datagramme::preparer`), et chaque réponse et erreur d'ICMP. Linux
-/// le tire de compteurs choisis par un hachage à clé secrète de la
-/// destination (`__ip_select_ident`), pour qu'un tiers ne puisse pas
-/// compter, par la différence de deux identifiants qu'il reçoit, ce que la
-/// machine envoie aux autres ; chez nous, un compteur parti du hasard, que
-/// ce tiers peut lire (deux pings lui disent combien d'ICMP sont partis
-/// entre-temps vers d'autres) : un écart écrit, jusqu'au générateur
-/// ChaCha20 de 6h (qui servira aussi aux numéros de séquence de TCP).
-pub fn identifiant() -> u16 {
-    IDENTIFIANT.fetch_add(1, Ordering::Relaxed)
+/// voir `datagramme::preparer`), et chaque réponse et erreur d'ICMP ;
+/// celui de `__ip_select_ident` : SipHash de (destination, source,
+/// protocole), sous une clé secrète, choisit l'un des 2048 compteurs, qui
+/// avance d'un pas tiré entre 0 et le nombre de tics depuis son dernier
+/// usage (`ip_idents_reserve`). Pourquoi : avec un seul compteur pour
+/// tous, un tiers qui reçoit deux paquets de nous saurait, par la
+/// différence de leurs identifiants, combien nous en avons envoyé aux
+/// autres entre-temps (une machine « idle » sert ainsi de relais à un
+/// balayage de ports caché, l'« idle scan » de nmap) ; avec un compteur
+/// par destination qu'on ne peut pas deviner, et des pas au hasard, il
+/// n'apprend plus rien. Linux compte en jiffies ; nous, en tics (1 ms).
+pub fn identifiant(destination: [u8; 4], source: [u8; 4], protocole: u8) -> u16 {
+    let cle = [CLE_IDENTS[0].load(Ordering::Relaxed), CLE_IDENTS[1].load(Ordering::Relaxed)];
+    let hachage = crypto::siphash::siphash_3u32(u32::from_ne_bytes(destination), u32::from_ne_bytes(source), protocole as u32, &cle);
+    let case = hachage as usize & (IDENTS - 1);
+    let maintenant = crate::horloge::tics() as u32;
+    let ancien = IDENTS_TICS[case].load(Ordering::Relaxed);
+    let mut pas = 0;
+    if ancien != maintenant
+        && IDENTS_TICS[case].compare_exchange(ancien, maintenant, Ordering::Relaxed, Ordering::Relaxed).is_ok()
+    {
+        pas = crate::aleatoire::u32_sous(maintenant.wrapping_sub(ancien));
+    }
+    IDENTS_COMPTEURS[case].fetch_add(1 + pas, Ordering::Relaxed).wrapping_add(pas) as u16
 }
 
 /// Émet le paquet `p` (sa charge en place, l'en-tête du protocole

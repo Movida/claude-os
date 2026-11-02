@@ -38,9 +38,7 @@ static VOISINS: Verrou<Option<Table<Paquet>>> = Verrou::new(None);
 static JETES: AtomicU64 = AtomicU64::new(0);
 
 fn hasard() -> u64 {
-    let mut h = [0u8; 8];
-    aleatoire::remplir(&mut h);
-    u64::from_le_bytes(h)
+    aleatoire::u64()
 }
 
 /// Fait la table (vide). Au démarrage.

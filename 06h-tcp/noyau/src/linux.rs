@@ -1174,28 +1174,42 @@ fn prctl(option: u64, argument: u64) -> i64 {
     }
 }
 
-/// getrandom(tampon, nombre, options) : des octets aléatoires, de la même
-/// source qu'AT_RANDOM (aleatoire.rs). Au plus 256 octets d'une fois, la
-/// taille que Linux garantit sans interruption ; au-delà, une partie
-/// (permis : le programme redemande).
+/// getrandom(tampon, nombre, options), dans l'ordre de Linux (le
+/// `getrandom` de drivers/char/random.c) : des options inconnues, ou
+/// GRND_INSECURE (« même si le générateur n'est pas prêt ») avec
+/// GRND_RANDOM (« de la meilleure source »), qui se contredisent : EINVAL ;
+/// le générateur pas prêt (et pas GRND_INSECURE) : EAGAIN avec
+/// GRND_NONBLOCK, sinon attendre (aleatoire::attendre_pret, interruptible) ;
+/// puis les octets (`alea_vers_programme`), au plus MAX_RW_COUNT, ce
+/// qu'a copié une faute ou un signal. GRND_RANDOM ne change rien depuis
+/// Linux 5.6 (plus de réservoir « bloquant » à part).
 fn getrandom(tampon: u64, nombre: u64, options: u64) -> i64 {
     const GRND_NONBLOCK: u64 = 1;
     const GRND_RANDOM: u64 = 2;
     const GRND_INSECURE: u64 = 4;
-    // GRND_INSECURE (« même si le générateur n'est pas prêt ») et
-    // GRND_RANDOM (« de la meilleure source ») se contredisent : Linux
-    // refuse les deux ensemble.
+    const EAGAIN: i64 = 11;
+    let options = options as u32 as u64;
     if options & !(GRND_NONBLOCK | GRND_RANDOM | GRND_INSECURE) != 0
         || options & (GRND_RANDOM | GRND_INSECURE) == GRND_RANDOM | GRND_INSECURE
     {
         return -EINVAL;
     }
-    let mut octets = [0u8; 256];
-    let n = (nombre as usize).min(octets.len());
-    aleatoire::remplir(&mut octets[..n]);
-    match copier_vers_utilisateur(tampon, &octets[..n]) {
-        Ok(()) => n as i64,
-        Err(_) => -EFAULT,
+    if !aleatoire::pret() && options & GRND_INSECURE == 0 {
+        if options & GRND_NONBLOCK != 0 {
+            return -EAGAIN;
+        }
+        if let Err(e) = aleatoire::attendre_pret() {
+            return e;
+        }
+    }
+    // import_ubuf : la plage dans les adresses des programmes, plafonnée.
+    let nombre = nombre.min(crate::appels_fichiers::RW_MAX);
+    if !crate::copie_utilisateur::dans_les_bornes(tampon, nombre) {
+        return -EFAULT;
+    }
+    match crate::appels_fichiers::alea_vers_programme(tampon, nombre) {
+        Ok(n) => n as i64,
+        Err(e) => e,
     }
 }
 

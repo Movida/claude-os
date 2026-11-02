@@ -102,6 +102,21 @@ fn gestionnaire(v: u8) -> Option<(fn(usize), usize)> {
     (f != 0).then(|| (unsafe { core::mem::transmute::<usize, fn(usize)>(f) }, g.argument.load(Ordering::Relaxed)))
 }
 
+/// Le vecteur `v` est-il celui d'un périphérique (le clavier, le port
+/// série, une MSI-X), dont l'instant d'arrivée nourrit le générateur
+/// aléatoire ? Pas l'horloge (ni le timer de l'APIC, ni l'IRQ 0 du PIT) :
+/// Linux ne la compte pas, elle est périodique.
+pub fn est_un_peripherique(v: u8) -> bool {
+    let isa = |irq: u8| irq != crate::horloge::IRQ;
+    if APIC.load(Ordering::Relaxed) {
+        if (ioapic::VECTEUR_ISA..ioapic::VECTEUR_ISA + ioapic::NB_ISA).contains(&v) {
+            return isa(v - ioapic::VECTEUR_ISA);
+        }
+        return gestionnaire(v).is_some();
+    }
+    (pic::VECTEUR_BASE..pic::VECTEUR_BASE + pic::NB_IRQ).contains(&v) && isa(v - pic::VECTEUR_BASE)
+}
+
 /// Ce que l'initialisation a choisi, pour l'afficher.
 pub enum Bilan {
     Apic { apic: apic::Bilan, ioapic: ioapic::Bilan },

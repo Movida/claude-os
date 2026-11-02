@@ -1,6 +1,8 @@
 # Sous-étape 6h : le générateur aléatoire de Linux, TCP, AF_UNIX. La
 # bibliothèque crypto/ (ChaCha20, BLAKE2s, SipHash), rejouée par le noyau
-# au démarrage.
+# au démarrage ; le générateur de Linux (crypto/src/alea.rs et
+# noyau/src/aleatoire.rs : le réservoir, RDSEED et RDRAND, les
+# interruptions, la gigue ; getrandom, /dev/random, linux/aleatoire.c).
 # De 6g : le réseau. Le bus PCI (formats/src/pci.rs et
 # noyau/src/pci.rs), les vecteurs d'interruption à la demande et MSI-X,
 # virtio (noyau/src/virtio.rs, virtqueue.rs) et la carte virtio-net, ses
@@ -63,7 +65,8 @@
 #                  à un modèle naïf) ; ceux de la pile d'IPv4 (inet/ :
 #                  les routes, le client DHCP, à l'horloge simulée) ; ceux
 #                  de la bibliothèque crypto (crypto/ : ChaCha20, BLAKE2s
-#                  et SipHash, contre les vecteurs officiels) ; puis
+#                  et SipHash, contre les vecteurs officiels, et les règles
+#                  du générateur de Linux) ; puis
 #                  pour l'interpréteur WebAssembly, télécharge et
 #                  convertit la suite de tests officielle si besoin, puis la
 #                  rejoue contre la bibliothèque (tableau par fichier) ;
@@ -81,7 +84,8 @@
 #                  linux/clone (clone, clone3), linux/fils et
 #                  linux/courses (des programmes à plusieurs fils),
 #                  linux/reseau (les sockets UDP et ICMP, sur lo) et
-#                  linux/dns (getaddrinfo, par un DNS du programme)
+#                  linux/dns (getaddrinfo, par un DNS du programme),
+#                  et linux/aleatoire (getrandom, /dev/random)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -218,6 +222,9 @@ boot.bin: programmes.cpio FORCE
 #   - dns : gcc sans option (la glibc partagée, comme claude), getaddrinfo
 #     par un serveur DNS du programme (des réponses de travers, NXDOMAIN,
 #     /etc/hosts) ; sur l'hôte aussi ;
+#   - aleatoire : gcc -static, le générateur (getrandom et ses refus,
+#     /dev/random, /dev/urandom, /proc/sys/kernel/random) ; sur l'hôte
+#     aussi ;
 #   - passerelle : gcc sans option, le réseau que le DHCP du démarrage a
 #     configuré (/proc/net, le DNS de /etc/resolv.conf, un datagramme qui
 #     part par eth0, le ping de la passerelle, api.anthropic.com) ; dans
@@ -345,6 +352,10 @@ $(LINUX)/reseau: linux/reseau.c
 $(LINUX)/dns: linux/dns.c
 	mkdir -p $(LINUX)
 	gcc $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/aleatoire: linux/aleatoire.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/passerelle: linux/passerelle.c
 	mkdir -p $(LINUX)
@@ -726,7 +737,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -884,7 +895,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -920,6 +931,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/courses | tee /dev/stderr | (! grep -q ECHEC)
 	timeout 60 ./$(LINUX)/reseau | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/dns | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	timeout 60 ./$(LINUX)/aleatoire | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	rm -rf /tmp/ajout; \
 	  ./$(LINUX)/ajout ecrire a 500 & a=$$!; ./$(LINUX)/ajout ecrire b 500 & b=$$!; \
 	  ./$(LINUX)/ajout verifier 500 | tee /dev/stderr | (! grep -q ECHEC); r=$$?; wait $$a $$b; exit $$r

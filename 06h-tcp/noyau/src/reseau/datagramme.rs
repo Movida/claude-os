@@ -143,9 +143,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     inet.port_distant = a.port;
     inet.connecte = true;
     s.connectee.store(true, Ordering::Relaxed);
-    let mut h = [0u8; 2];
-    crate::aleatoire::remplir(&mut h);
-    inet.identifiant = u16::from_le_bytes(h);
+    inet.identifiant = crate::aleatoire::u32() as u16;
     table::changer(s, &inet);
     Ok(())
 }
@@ -294,7 +292,7 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
     } else if matches!(inet.options.pmtudisc, 2 | 3) {
         0
     } else {
-        ipv4::identifiant()
+        ipv4::identifiant(destination, source, protocole)
     };
     Ok((chemin, ipv4::Envoi {
         source, destination, protocole, ttl: c.ttl.or(inet.options.ttl).unwrap_or(64), tos: c.tos.unwrap_or(inet.options.tos),

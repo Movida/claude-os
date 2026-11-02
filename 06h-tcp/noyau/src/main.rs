@@ -238,7 +238,9 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     let oui_non = |b: bool| if b { "oui" } else { "non (absent du processeur)" };
     afficherln!("[noyau] Protections contre les programmes : SMEP {}, SMAP {}, UMIP {}.",
                 oui_non(p.smep), oui_non(p.smap), oui_non(p.umip));
-    afficherln!("[noyau] Alea des programmes (AT_RANDOM) : {}.", aleatoire::source());
+    // Le générateur aléatoire : ce que donnent RDSEED et RDRAND, avant
+    // les interruptions (le `random_init_early` de Linux).
+    aleatoire::initialiser();
     // Les fonctions de la bibliothèque crypto rejouent un vecteur officiel
     // chacune, compilées pour le noyau (l'hôte n'a vérifié que leur
     // version pour lui) : le `blake2s_selftest` et ses semblables de Linux.
@@ -335,6 +337,9 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         ),
         None => afficherln!("[noyau] Pas d'horloge CMOS lisible : la date part du 1er janvier 1970."),
     }
+    // L'heure aussi distingue ce démarrage d'un autre : versée au
+    // générateur, sans crédit (le `random_init` de Linux).
+    aleatoire::melanger(&temps::maintenant().secondes.to_le_bytes());
 
     // Le scénario de panne de `make tests-qemu` : déborder exprès de la
     // pile, que la page de garde doit arrêter net. Dans une tâche du noyau,

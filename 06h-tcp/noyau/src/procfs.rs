@@ -100,6 +100,16 @@ const COMM: u32 = 5;
 const PIPE_MAX_SIZE: u32 = 6;
 const PIPE_USER_PAGES_SOFT: u32 = 7;
 const PIPE_USER_PAGES_HARD: u32 = 8;
+/// /proc/sys/kernel/random/ (6h) : boot_id, uuid, entropy_avail, poolsize
+/// (après les numéros de /sys, sysfs.rs : 10 à 13).
+const RANDOM_BOOT_ID: u32 = 30;
+const RANDOM_UUID: u32 = 31;
+const RANDOM_ENTROPY_AVAIL: u32 = 32;
+const RANDOM_POOLSIZE: u32 = 33;
+/// write_wakeup_threshold et urandom_min_reseed_secs : sans effet depuis
+/// Linux 5.18, mais montrés à tous (256 et 60).
+const RANDOM_WAKEUP: u32 = 34;
+const RANDOM_RESEED: u32 = 35;
 /// /proc/net/pnp, route, dev et arp (6g, reseau/proc.rs).
 const NET_PNP: u32 = 20;
 const NET_ROUTE: u32 = 21;
@@ -129,6 +139,19 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     p.ajouter(fs, b"pipe-max-size", 0o644, (0, 0), reglage(PIPE_MAX_SIZE), maintenant)?;
     p.ajouter(fs, b"pipe-user-pages-hard", 0o644, (0, 0), reglage(PIPE_USER_PAGES_HARD), maintenant)?;
     p.ajouter(fs, b"pipe-user-pages-soft", 0o644, (0, 0), reglage(PIPE_USER_PAGES_SOFT), maintenant)?;
+    // Le générateur aléatoire (le `random_table` de drivers/char/random.c) :
+    // ses six fichiers ; les deux réglages sans effet depuis Linux 5.18,
+    // que root peut y écrire, en 0644 à root comme chez lui (nos programmes
+    // ne sont pas root : EACCES ; un écrit de root rendrait EINVAL, comme
+    // pour tout réglage de /proc/sys chez nous).
+    let kernel = p.ajouter(sys, b"kernel", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    let random = p.ajouter(kernel, b"random", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    p.ajouter(random, b"boot_id", 0o444, (0, 0), reglage(RANDOM_BOOT_ID), maintenant)?;
+    p.ajouter(random, b"entropy_avail", 0o444, (0, 0), reglage(RANDOM_ENTROPY_AVAIL), maintenant)?;
+    p.ajouter(random, b"poolsize", 0o444, (0, 0), reglage(RANDOM_POOLSIZE), maintenant)?;
+    p.ajouter(random, b"urandom_min_reseed_secs", 0o644, (0, 0), reglage(RANDOM_RESEED), maintenant)?;
+    p.ajouter(random, b"uuid", 0o444, (0, 0), reglage(RANDOM_UUID), maintenant)?;
+    p.ajouter(random, b"write_wakeup_threshold", 0o644, (0, 0), reglage(RANDOM_WAKEUP), maintenant)?;
     // /proc/net : chez Linux, un lien vers self/net, le réseau de l'espace
     // de noms du processus qui lit ; sans espaces de noms (un seul réseau),
     // un dossier de la partie fixe : un écart, qu'aucun programme ne voit
@@ -585,7 +608,8 @@ impl Monte for ProcVue<'_> {
 /// séquences et les valeurs de /proc, les attributs de /sys.
 pub fn lecture(source: u32) -> Lecture {
     match source {
-        OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD => Lecture::Valeur,
+        OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD | RANDOM_BOOT_ID
+        | RANDOM_UUID | RANDOM_ENTROPY_AVAIL | RANDOM_POOLSIZE | RANDOM_WAKEUP | RANDOM_RESEED => Lecture::Valeur,
         MAPS | STATM | COMM | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP => Lecture::Sequence,
         _ => Lecture::Attribut,
     }
@@ -694,6 +718,18 @@ impl Write for Ecrit {
     }
 }
 
+/// Un UUID au format de Linux (`%pU` : 8-4-4-4-12 chiffres hexadécimaux
+/// minuscules), avec son saut de ligne.
+fn ecrire_uuid(t: &mut Ecrit, u: [u8; 16]) -> fmt::Result {
+    for (i, o) in u.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            t.write_str("-")?;
+        }
+        write!(t, "{:02x}", o)?;
+    }
+    writeln!(t)
+}
+
 /// La valeur d'un réglage de /proc/sys, avec son saut de ligne.
 fn valeur(source: u32) -> Result<Vec<u8>, Erreur> {
     let mut t = Ecrit(Vec::new());
@@ -703,6 +739,15 @@ fn valeur(source: u32) -> Result<Vec<u8>, Erreur> {
         PIPE_MAX_SIZE => writeln!(t, "{}", crate::tube::TAILLE_MAX),
         PIPE_USER_PAGES_SOFT => writeln!(t, "{}", crate::tube::PAGES_UTILISATEUR_DOUCE),
         PIPE_USER_PAGES_HARD => writeln!(t, "{}", crate::tube::PAGES_UTILISATEUR_DURE),
+        // boot_id : tiré une fois, au premier usage ; uuid : neuf à chaque
+        // lecture (`proc_do_uuid`).
+        RANDOM_BOOT_ID => ecrire_uuid(&mut t, crate::aleatoire::identifiant_du_demarrage()),
+        RANDOM_UUID => ecrire_uuid(&mut t, crate::aleatoire::uuid()),
+        // Les bits crédités, 256 une fois prêt (POOL_BITS, comme poolsize).
+        RANDOM_ENTROPY_AVAIL => writeln!(t, "{}", crate::aleatoire::bits()),
+        RANDOM_POOLSIZE => writeln!(t, "256"),
+        RANDOM_WAKEUP => writeln!(t, "256"),
+        RANDOM_RESEED => writeln!(t, "60"),
         // La plus petite adresse qu'un programme peut projeter.
         _ => writeln!(t, "{}", ADRESSE_MIN),
     };

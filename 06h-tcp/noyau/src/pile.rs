@@ -177,7 +177,7 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
     let plateforme = c.chaine(b"x86_64")?;
     c.sp &= !15;
     let mut alea = [0u8; 16];
-    aleatoire::remplir(&mut alea);
+    aleatoire::obtenir(&mut alea);
     let random = c.empiler(&alea)?;
 
     // Les tables : argc, argv, envp, auxv, toutes en mots de 8 octets,

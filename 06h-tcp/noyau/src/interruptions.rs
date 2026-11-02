@@ -373,14 +373,22 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     let vecteur = cadre.vecteur as usize;
     let depuis_programme = cadre.cs & 3 == 3;
     match vecteur {
-        32.. => irq::gerer(vecteur as u8, |source| match source {
-            irq::Source::TimerApic | irq::Source::Isa(horloge::IRQ) => {
-                horloge::tic();
-                tache::tic(depuis_programme);
+        32.. => {
+            irq::gerer(vecteur as u8, |source| match source {
+                irq::Source::TimerApic | irq::Source::Isa(horloge::IRQ) => {
+                    horloge::tic();
+                    tache::tic(depuis_programme);
+                }
+                irq::Source::Isa(clavier::IRQ) => clavier::interruption(),
+                irq::Source::Isa(_) => {}
+            });
+            // L'instant d'une interruption de périphérique, pour le
+            // générateur aléatoire (le `add_interrupt_randomness` que
+            // Linux appelle de `handle_irq_event_percpu`).
+            if irq::est_un_peripherique(vecteur as u8) {
+                crate::aleatoire::ajouter_interruption(vecteur as u64, cadre.rip);
             }
-            irq::Source::Isa(clavier::IRQ) => clavier::interruption(),
-            irq::Source::Isa(_) => {}
-        }),
+        }
         2 | 8 | 18 => exception_fatale(cadre),
         // La faute de page, d'où qu'elle vienne : le plus souvent servie
         // (la pagination à la demande), sinon le programme sera arrêté, ou

@@ -119,10 +119,14 @@ impl<'a> Table<'a> {
 pub fn sonder(o: &FichierTenu, table: &mut Table) -> u32 {
     match o.sorte {
         Sorte::EventFd => o.eventfd().sonder(table, o),
-        // /dev/random : prêt à lire dès que son générateur l'est, et le
-        // nôtre l'est dès le démarrage (`random_poll` : POLLIN | POLLRDNORM,
-        // 0x41 mesuré). /dev/urandom n'a pas d'opération de sondage.
-        Sorte::Aleatoire { random: true } => POLLIN | POLLRDNORM,
+        // /dev/random : prêt à lire dès que son générateur l'est, sinon
+        // « on peut écrire » (lui verser de l'aléa), réveillé à « prêt »
+        // (`random_poll` : POLLIN | POLLRDNORM, 0x41 mesuré, ou POLLOUT |
+        // POLLWRNORM). /dev/urandom n'a pas d'opération de sondage.
+        Sorte::Aleatoire { random: true } => {
+            table.attendre(&crate::aleatoire::PRET, o);
+            if crate::aleatoire::pret() { POLLIN | POLLRDNORM } else { POLLOUT | POLLWRNORM }
+        }
         // Un epoll : prêt si l'un de ses prêts l'est vraiment (epoll.rs).
         Sorte::Epoll => o.epoll().sonder(table, o),
         Sorte::Tube => o.tube().sonder(table, o),

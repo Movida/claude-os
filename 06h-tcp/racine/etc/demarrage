@@ -75,6 +75,8 @@ wait
 # serveur du programme.
 /bin/reseau
 /bin/dns
+# Le générateur aléatoire (6h) : getrandom, /dev/random, /proc/sys/kernel/random.
+/bin/aleatoire
 # Le réseau (6g), tel que l'a configuré le DHCP du démarrage : /proc/net,
 # /etc/resolv.conf, un datagramme vers la passerelle.
 /bin/passerelle

@@ -161,7 +161,7 @@ pub fn configurer() {
         return afficherln!("[reseau] {} : lien coupe, pas de DHCP.", i.nom);
     }
     let mut hasard = [0u8; 12];
-    aleatoire::remplir(&mut hasard);
+    aleatoire::obtenir(&mut hasard);
     let xid = u32::from_le_bytes([hasard[0], hasard[1], hasard[2], hasard[3]]);
     let delai = u64::from_le_bytes([hasard[4], hasard[5], hasard[6], hasard[7], hasard[8], hasard[9], hasard[10], hasard[11]]);
     let maintenant = temps::ns_monotone();

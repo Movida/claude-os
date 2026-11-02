@@ -76,6 +76,7 @@ const EBUSY: u32 = 10;
 const EEXIST: u32 = 20;
 const EFAULT: u32 = 21;
 const EFBIG: u32 = 22;
+const EINTR: u32 = 27;
 const EINVAL: u32 = 28;
 const EIO: u32 = 29;
 const EISDIR: u32 = 31;
@@ -687,7 +688,14 @@ impl Wasi {
                     console::ecrire_octets(octets);
                     Ok(octets.len())
                 }
-                (Sorte::Null | Sorte::Zero | Sorte::Aleatoire { .. }, true) => Ok(octets.len()),
+                (Sorte::Null | Sorte::Zero, true) => Ok(octets.len()),
+                // Écrire dans /dev/random ou /dev/urandom : mêlé au
+                // réservoir, sans crédit (`write_pool_user`), comme pour un
+                // programme Linux.
+                (Sorte::Aleatoire { .. }, true) => {
+                    crate::aleatoire::melanger(octets);
+                    Ok(octets.len())
+                }
                 (Sorte::Plein, true) => Err(ENOSPC),
                 (Sorte::Fichier, true) => vfs::avec(|fs, cadres| fs.ecrire(n(), ici, octets, maintenant, cadres)).map_err(errno),
                 (Sorte::Fichier, false) => Ok(vfs::avec(|fs, cadres| fs.lire(n(), ici, octets, cadres))),
@@ -696,9 +704,23 @@ impl Wasi {
                     octets.fill(0);
                     Ok(octets.len())
                 }
-                (Sorte::Aleatoire { .. }, false) => {
-                    crate::aleatoire::remplir(octets);
-                    Ok(octets.len())
+                // Lire /dev/random attend que le générateur soit prêt
+                // (`random_read_iter`) : un programme WebAssembly n'a pas de
+                // signal, l'attente ne finit qu'à « prêt » (ou à l'arrêt de
+                // sa tâche : EINTR). /dev/urandom n'attend pas, mais lance
+                // la gigue (`urandom_read_iter`). Comme pour un programme
+                // Linux (appels_fichiers.rs).
+                (Sorte::Aleatoire { random }, false) => {
+                    let pret = if random {
+                        crate::aleatoire::attendre_pret().map_err(|_| EINTR)
+                    } else {
+                        crate::aleatoire::essayer_la_gigue();
+                        Ok(())
+                    };
+                    pret.map(|()| {
+                        crate::aleatoire::obtenir(octets);
+                        octets.len()
+                    })
                 }
                 (Sorte::Dossier, _) => Err(EISDIR),
                 // Un programme WebAssembly n'a ni eventfd, ni epoll, ni

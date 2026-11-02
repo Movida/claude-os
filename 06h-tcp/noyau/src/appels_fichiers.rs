@@ -45,13 +45,13 @@
 use alloc::vec::Vec;
 
 use crate::copie_utilisateur::{
-    ErreurChaine, chaine_depuis_utilisateur, copier_depuis_utilisateur,
+    ErreurChaine, chaine_depuis_utilisateur, copier_depuis_utilisateur, copier_depuis_utilisateur_partiel,
     copier_vers_utilisateur, copier_vers_utilisateur_partiel, dans_les_bornes,
 };
 use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Prive, Refus, Sorte, Tenu};
 use crate::processus::Processus;
 use crate::vfs::{self, CadresDuNoyau, Systeme};
-use crate::{aleatoire, console, evenements, pages, processus, procfs, temps};
+use crate::{aleatoire, console, evenements, pages, processus, procfs, tache, temps};
 use fichiers::chemins::{Arbre, Depart, Dernier, Fin, PATH_MAX, Suivre};
 use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_tmpfs};
 use crate::vfs::Montage;
@@ -61,6 +61,7 @@ use crate::attente::{GardeMutex, Mutex};
 
 // Les numéros d'erreur de Linux qui ne viennent pas du tmpfs.
 const EBADF: i64 = 9;
+const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
 const EBUSY: i64 = 16;
@@ -107,7 +108,7 @@ const AT_STATX_SYNC_TYPE: u64 = 0x6000;
 /// Le plus d'octets qu'un read ou un write transfère d'un coup : celui de
 /// Linux (MAX_RW_COUNT, 2 Gio moins une page) ; au-delà, une partie,
 /// comme le permet POSIX.
-const RW_MAX: u64 = 0x7fff_f000;
+pub const RW_MAX: u64 = 0x7fff_f000;
 /// Le plus d'octets écrits d'un coup sur la console : un vrai port série à
 /// 115 200 bauds en met déjà 90 ms à 1024 octets (comme fd_write de WASI).
 const CONSOLE_MAX: usize = 1024;
@@ -1017,6 +1018,49 @@ fn ecrire_pages(n: Numero, position: u64, tampon: u64, longueur: u64) -> Result<
     Ok(ecrits)
 }
 
+/// Des octets aléatoires vers le programme (`get_random_bytes_user`) :
+/// un tirage, dont la clé est remplacée par 32 octets neufs avant la
+/// première copie (une copie peut fauter et dormir : la clé d'avant
+/// l'effacement rapide ne doit pas attendre avec elle) ; ces 32 octets,
+/// pour une demande de 32 octets au plus, directement ; au-delà, des
+/// blocs de 64 octets, un signal regardé à chaque page copiée (il fait
+/// rendre ce qui l'est). Une faute : ce qui a été copié, ou EFAULT si
+/// rien.
+pub fn alea_vers_programme(tampon: u64, longueur: u64) -> Result<u64, i64> {
+    if longueur == 0 {
+        return Ok(0);
+    }
+    let mut premiers = [0u8; 32];
+    let mut tirage = aleatoire::commencer(&mut premiers);
+    // La clé de l'état, écrasée tout de suite par ces 32 octets
+    // (`get_random_bytes_user`) : la copie peut dormir, la clé d'avant
+    // l'effacement rapide ne doit pas attendre avec elle.
+    tirage.changer_de_cle(&premiers);
+    if longueur <= 32 {
+        let n = longueur as usize;
+        let copies = copier_vers_utilisateur_partiel(tampon, &premiers[..n]);
+        crypto::effacer(&mut premiers);
+        return if copies == 0 { Err(-EFAULT) } else { Ok(copies as u64) };
+    }
+    crypto::effacer(&mut premiers);
+    let mut fait = 0u64;
+    let mut bloc = [0u8; 64];
+    let r = loop {
+        tirage.suite(&mut bloc);
+        let n = (longueur - fait).min(64) as usize;
+        let copies = copier_vers_utilisateur_partiel(tampon + fait, &bloc[..n]);
+        fait += copies as u64;
+        if fait == longueur || copies < n {
+            break if fait == 0 { Err(-EFAULT) } else { Ok(fait) };
+        }
+        if fait % PAGE == 0 && tache::signal_en_attente() {
+            break Ok(fait);
+        }
+    };
+    crypto::effacer(&mut bloc);
+    r
+}
+
 /// Remplit `longueur` octets du programme à `tampon` avec `remplir`, par
 /// morceaux de 256 octets (des zéros, de l'aléa). Une faute : ce qui a été
 /// copié, ou EFAULT si rien.
@@ -1085,7 +1129,22 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         // La console n'est pas encore un terminal (6j) : rien à lire.
         Sorte::Null | Sorte::Console => Ok(0),
         Sorte::Zero | Sorte::Plein => produire(tampon, longueur, |m| m.fill(0)),
-        Sorte::Aleatoire { .. } => produire(tampon, longueur, aleatoire::remplir),
+        // /dev/random attend que le générateur soit prêt (EAGAIN en
+        // O_NONBLOCK) ; /dev/urandom n'attend pas, mais lance la gigue
+        // (`random_read_iter`, `urandom_read_iter`).
+        Sorte::Aleatoire { random: true } => {
+            if !aleatoire::pret() {
+                if o.drapeaux as u64 & O_NONBLOCK != 0 {
+                    return Err(-EAGAIN);
+                }
+                aleatoire::attendre_pret()?;
+            }
+            alea_vers_programme(tampon, longueur)
+        }
+        Sorte::Aleatoire { random: false } => {
+            aleatoire::essayer_la_gigue();
+            alea_vers_programme(tampon, longueur)
+        }
         Sorte::Chemin => Err(-EBADF),
         Sorte::EventFd => evenements::lire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Tube => en_resultat(o.tube().lire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0)),
@@ -1164,9 +1223,29 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
             Ok(n as u64)
         }
         // Dans le vide, sans même lire le tampon (comme le write_null de
-        // Linux). L'aléa écrit dans /dev/random ne nourrit rien : notre
-        // générateur n'a pas encore de réserve à brasser (6h).
-        Sorte::Null | Sorte::Zero | Sorte::Aleatoire { .. } => Ok(longueur),
+        // Linux).
+        Sorte::Null | Sorte::Zero => Ok(longueur),
+        // Mêlé au réservoir du générateur, sans crédit (`write_pool_user`) :
+        // par morceaux de 64 octets copiés d'abord ; une faute : ce qui a
+        // été versé, ou EFAULT si rien.
+        Sorte::Aleatoire { .. } => {
+            let mut fait = 0u64;
+            let mut morceau = [0u8; 64];
+            while fait < longueur {
+                let n = (longueur - fait).min(64) as usize;
+                let copies = copier_depuis_utilisateur_partiel(&mut morceau[..n], tampon + fait);
+                aleatoire::melanger(&morceau[..copies]);
+                fait += copies as u64;
+                if copies < n {
+                    break;
+                }
+                if fait % PAGE == 0 && tache::signal_en_attente() {
+                    break;
+                }
+            }
+            crypto::effacer(&mut morceau);
+            if fait == 0 && longueur > 0 { Err(-EFAULT) } else { Ok(fait) }
+        }
         Sorte::Plein => Err(-ENOSPC),
         Sorte::Dossier | Sorte::Chemin => Err(-EBADF),
         Sorte::EventFd => evenements::ecrire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
@@ -1919,11 +1998,8 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
 
 /// Les requêtes du pilote de /dev/random et /dev/urandom (`random_ioctl`,
 /// drivers/char/random.c), une fois passées celles de tous les fichiers :
-///   - RNDGETENTCNT : le compte d'entropie du générateur, en bits (Linux :
-///     256 une fois le générateur initialisé, mesuré). Le nôtre dit ce que
-///     vaut sa source : 256 avec RDRAND, 0 avec le compteur de cycles
-///     brassé, qui n'est pas cryptographique (aleatoire.rs), jusqu'au
-///     vrai générateur (ChaCha20, 6h) ;
+///   - RNDGETENTCNT : les bits crédités au réservoir (`input_pool.init_bits`),
+///     de 0 à 256 ; 256 une fois prêt (le compte ne bouge plus, mesuré) ;
 ///   - les requêtes qui changent le générateur (ajouter de l'entropie, la
 ///     remettre à zéro, le réensemencer) : réservées à root (EPERM, avant
 ///     de rien lire), ce que nos programmes ne sont pas ;
@@ -1938,7 +2014,7 @@ fn ioctl_aleatoire(requete: u64, argument: u64) -> i64 {
     const RNDRESEEDCRNG: u64 = 0x5207;
     match requete {
         RNDGETENTCNT => {
-            let compte: i32 = if crate::aleatoire::cryptographique() { 256 } else { 0 };
+            let compte = crate::aleatoire::bits() as i32;
             match copier_vers_utilisateur(argument, &compte.to_le_bytes()) {
                 Ok(()) => 0,
                 Err(_) => -EFAULT,
