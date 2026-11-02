@@ -17,6 +17,7 @@
 
 pub mod arp;
 pub mod boucle;
+pub mod contexte;
 pub mod datagramme;
 pub mod dhcp;
 pub mod ethernet;
@@ -47,6 +48,7 @@ pub fn demarrer() {
     arp::initialiser();
     udp::initialiser();
     ping::initialiser();
+    tache::initialiser();
     boucle::ajouter();
     virtio_net::sonder();
     tache::lancer();

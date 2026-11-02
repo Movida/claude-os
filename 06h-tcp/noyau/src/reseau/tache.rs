@@ -20,9 +20,10 @@
 //! est reprise au tour suivant. Une rafale coûte une interruption, pas une
 //! par trame.
 //!
-//! Les minuteurs du réseau (ceux des voisins, arp.rs) : la tâche dort
-//! jusqu'à la prochaine échéance, ou un réveil, et les fait tourner à
-//! chaque tour.
+//! Les minuteurs du réseau : une liste d'échéances, une par objet (la
+//! table des voisins, arp.rs ; puis les connexions TCP), inet::echeances.
+//! La tâche dort jusqu'à la plus proche, ou un réveil, et fait le travail
+//! des objets échus.
 //!
 //! Sans réveil perdu : le travail est un mot de bits, sous un verrou ; une
 //! interruption pose son bit puis réveille ; la tâche prend le mot, et ne
@@ -34,13 +35,13 @@ use crate::attente::{self, FileAttente, Sommeil};
 use crate::programmes::NomCourt;
 use crate::verrou::Verrou;
 use crate::{cpu, tache, temps};
+use inet::echeances::Echeances;
 
 /// Du travail à faire : un changement dans la configuration d'une carte
 /// (son lien).
 pub const CONFIGURATION: u32 = 1 << 0;
-/// Un minuteur de la table des voisins a pu changer (une résolution
-/// commence) : recalculer l'échéance.
-pub const VOISINS: u32 = 1 << 1;
+/// Une échéance a été armée : recalculer le sommeil.
+const ECHEANCE: u32 = 1 << 1;
 /// Le travail d'une interface (sa réception, ses émissions finies) : le
 /// bit `INTERFACES << index`.
 const INTERFACES: u32 = 1 << 8;
@@ -109,13 +110,66 @@ pub fn lancer() {
     }
 }
 
+/// Les échéances du réseau (inet::echeances) : quand se réveiller, et
+/// pour qui. Faites au démarrage, à leur taille définitive.
+static ECHEANCES: Verrou<Option<Echeances>> = Verrou::new(None);
+/// Le nombre d'objets qui peuvent avoir une échéance à la fois.
+const MAX_ECHEANCES: usize = 64;
+/// L'objet « table des voisins » (arp.rs) ; les connexions TCP prendront
+/// le numéro de leur socket, qui part de 1.
+pub const OBJET_VOISINS: u64 = u64::MAX;
+
+/// Fait la liste des échéances. Au démarrage, avant la tâche.
+pub fn initialiser() {
+    *ECHEANCES.verrouiller() = Echeances::new(MAX_ECHEANCES);
+    if ECHEANCES.verrouiller().is_none() {
+        afficherln!("[reseau] plus de memoire pour les echeances du reseau.");
+    }
+}
+
+/// Réveille la tâche du réseau, pour qu'elle recalcule son sommeil (après
+/// `inscrire`).
+pub fn reveiller() {
+    signaler(ECHEANCE);
+}
+
+/// Inscrit l'échéance de `objet` (None : retirée), sans réveiller la tâche
+/// du réseau (qui l'appelle elle-même ; un autre appelant la réveille,
+/// `reveiller`, une fois ses propres verrous rendus) : rend si
+/// l'inscription a pu se faire.
+pub fn inscrire(objet: u64, echeance: Option<u64>) -> bool {
+    match ECHEANCES.verrouiller().as_mut() {
+        Some(e) => match echeance {
+            Some(t) => e.armer(objet, t).is_ok(),
+            None => {
+                e.desarmer(objet);
+                true
+            }
+        },
+        None => false,
+    }
+}
+
+fn prochaine() -> Option<u64> {
+    ECHEANCES.verrouiller().as_ref().and_then(Echeances::prochaine)
+}
+
+fn prendre_echu(maintenant: u64) -> Option<u64> {
+    ECHEANCES.verrouiller().as_mut().and_then(|e| e.prendre_echu(maintenant))
+}
+
 fn boucle() {
-    let mut echeance = None;
+    // Au premier tour, la table des voisins dit son échéance.
+    let mut voisins = true;
     loop {
-        let travail = attendre(echeance);
+        let travail = attendre(prochaine());
         if travail & CONFIGURATION != 0 {
             super::virtio_net::configuration_changee();
         }
+        // La réception des cartes, dans le contexte réseau : ce qu'elle
+        // envoie par `lo` (une réponse) part à la fin du tour, en sortant
+        // du contexte (contexte.rs).
+        let contexte = super::contexte::entrer();
         for index in 1..=16u32 {
             if travail & INTERFACES << (index - 1) == 0 {
                 continue;
@@ -126,6 +180,16 @@ fn boucle() {
                 signaler_interface(index);
             }
         }
-        echeance = super::arp::temps();
+        // Les objets dont l'échéance est passée.
+        let maintenant = temps::ns_monotone();
+        while let Some(objet) = prendre_echu(maintenant) {
+            if objet == OBJET_VOISINS {
+                voisins = true;
+            }
+        }
+        if core::mem::take(&mut voisins) {
+            super::arp::temps();
+        }
+        drop(contexte);
     }
 }

@@ -86,12 +86,20 @@ fn faire(a: Action<Paquet>) {
 pub fn envoyer(i: &'static Interface, prochain: [u8; 4], p: Paquet, confirmer: bool) {
     let taille = p.taille_vraie();
     let mut v = VOISINS.verrouiller();
+    // Une résolution a pu commencer : la tâche du réseau saura quand y
+    // revenir (ses échéances, tache.rs). L'échéance de la table s'inscrit
+    // sous son verrou : calculée sous lui puis inscrite après, une plus
+    // ancienne pourrait écraser une plus neuve (une autre tâche passant
+    // entre les deux), et une résolution perdre son minuteur.
     match v.as_mut() {
-        Some(t) => t.envoyer(i.index, prochain, p, taille, confirmer, temps::ns_monotone(), &mut faire),
-        None => faire(Action::Jeter { paquet: p, echec: false }),
+        Some(t) => {
+            t.envoyer(i.index, prochain, p, taille, confirmer, temps::ns_monotone(), &mut faire);
+            super::tache::inscrire(super::tache::OBJET_VOISINS, t.echeance());
+        }
+        None => return faire(Action::Jeter { paquet: p, echec: false }),
     }
     drop(v);
-    super::tache::signaler(super::tache::VOISINS);
+    super::tache::reveiller();
 }
 
 /// Les minuteurs des voisins (dans la tâche du réseau), et la prochaine
@@ -103,12 +111,13 @@ pub fn envoyer(i: &'static Interface, prochain: [u8; 4], p: Paquet, confirmer: b
 /// jusqu'à la socket qui avait envoyé le paquet (qui le dit selon ses
 /// règles : icmp.rs, udp.rs). Aucun verrou de socket n'est pris sous
 /// celui des voisins. Plus de mémoire pour retenir un paquet : il est jeté
-/// sans erreur.
-pub fn temps() -> Option<u64> {
+/// sans erreur. La prochaine échéance s'inscrit sous le verrou des voisins
+/// (voir `envoyer`).
+pub fn temps() {
     let mut echecs: Vec<Paquet> = Vec::new();
-    let echeance = {
+    {
         let mut v = VOISINS.verrouiller();
-        let t = v.as_mut()?;
+        let Some(t) = v.as_mut() else { return };
         t.temps(temps::ns_monotone(), hasard(), &mut |a| match a {
             Action::Jeter { paquet, echec: true } => {
                 JETES.fetch_add(1, Ordering::Relaxed);
@@ -118,12 +127,11 @@ pub fn temps() -> Option<u64> {
             }
             a => faire(a),
         });
-        t.echeance()
-    };
+        super::tache::inscrire(super::tache::OBJET_VOISINS, t.echeance());
+    }
     for p in echecs {
         super::icmp::envoyer_erreur(icmp::INJOIGNABLE, icmp::HOTE, 0, p.donnees(), false, false, false);
     }
-    echeance
 }
 
 /// Un message ARP reçu par `i` (la charge de la trame), dans la tâche du
@@ -162,13 +170,15 @@ pub fn recevoir(i: &'static Interface, a: &[u8], trame_diffusee: bool) {
         let gratuit = sip == tip && (a.operation != arp::REPONSE || a.mac_cible == a.mac_emetteur) && source_unicast;
         Appris::Message { joignable: a.operation == arp::REPONSE && !trame_diffusee, gratuit }
     };
+    // (L'échéance, sous le verrou des voisins, voir `envoyer` ; dans la
+    // tâche du réseau : pas besoin de la réveiller.)
     if let Some(t) = VOISINS.verrouiller().as_mut() {
         t.apprendre(i.index, sip, a.mac_emetteur, appris, temps::ns_monotone(), &mut faire);
+        super::tache::inscrire(super::tache::OBJET_VOISINS, t.echeance());
     }
     if appris == Appris::RequetePourNous {
         repondre();
     }
-    super::tache::signaler(super::tache::VOISINS);
 }
 
 /// Un paquet attend-il un voisin qui se cherche ?

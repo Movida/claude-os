@@ -3,7 +3,9 @@
 # au démarrage ; le générateur de Linux (crypto/src/alea.rs et
 # noyau/src/aleatoire.rs : le réservoir, RDSEED et RDRAND, les
 # interruptions, la gigue ; getrandom, /dev/random, linux/aleatoire.c),
-# et virtio-rng, le générateur matériel de QEMU (noyau/src/virtio_rng.rs).
+# et virtio-rng, le générateur matériel de QEMU (noyau/src/virtio_rng.rs) ;
+# les échéances du réseau (inet/src/echeances.rs), le contexte réseau
+# (noyau/src/reseau/contexte.rs) et la fermeture différée des sockets.
 # De 6g : le réseau. Le bus PCI (formats/src/pci.rs et
 # noyau/src/pci.rs), les vecteurs d'interruption à la demande et MSI-X,
 # virtio (noyau/src/virtio.rs, virtqueue.rs) et la carte virtio-net, ses
@@ -64,7 +66,8 @@
 #                  système de fichiers (fichiers/ : une règle de Linux par
 #                  cas, puis des milliers d'opérations au hasard comparées
 #                  à un modèle naïf) ; ceux de la pile d'IPv4 (inet/ :
-#                  les routes, le client DHCP, à l'horloge simulée) ; ceux
+#                  les routes, le client DHCP, les échéances, à
+#                  l'horloge simulée) ; ceux
 #                  de la bibliothèque crypto (crypto/ : ChaCha20, BLAKE2s
 #                  et SipHash, contre les vecteurs officiels, et les règles
 #                  du générateur de Linux) ; puis

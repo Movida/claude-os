@@ -64,7 +64,7 @@ use core::arch::{asm, global_asm};
 use core::cell::{Cell, UnsafeCell};
 use core::fmt;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::attente::EntreeAttente;
 use crate::interruptions::Cadre;
@@ -260,6 +260,13 @@ pub struct Tache {
     /// Ce que reprendra `restart_syscall` (le `restart_block` de Linux,
     /// reprise.rs).
     reprise: Verrou<Option<crate::reprise::Reprise>>,
+    /// La profondeur du « contexte réseau » où elle est (reseau/contexte.rs :
+    /// le `local_bh_disable` de Linux, mais par tâche).
+    pub contexte_reseau: AtomicU32,
+    /// Les sockets dont elle a fait le dernier `close`, à fermer à la
+    /// sortie de son appel (la liste chaînée par les sockets elles-mêmes :
+    /// le `task_work` de Linux ; reseau/socket.rs).
+    pub fermetures: Verrou<Option<Arc<crate::reseau::socket::Socket>>>,
 }
 
 /// Ce qu'un programme a de plus qu'une tâche du noyau.
@@ -345,6 +352,8 @@ impl Tache {
             precedent: crate::rusage::Precedent::new(),
             exception: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
             reprise: Verrou::new(None),
+            contexte_reseau: AtomicU32::new(0),
+            fermetures: Verrou::new(None),
         });
         Some(t)
     }
@@ -566,6 +575,8 @@ pub fn initialiser() {
         precedent: crate::rusage::Precedent::new(),
         exception: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
         reprise: Verrou::new(None),
+        contexte_reseau: AtomicU32::new(0),
+        fermetures: Verrou::new(None),
     };
     let t = Arc::into_raw(Arc::new(pile_demarrage)) as *mut Tache;
     INACTIVE.store(t, Ordering::Relaxed);
@@ -982,6 +993,9 @@ pub fn terminer(code: i32) -> ! {
         }
         p.usage().garder(&t.usage);
         p.fil_termine(t.tid, code);
+        // Le dernier fil ferme les fichiers du processus (fil_termine) :
+        // leurs sockets, maintenant (la fermeture différée, socket.rs).
+        crate::reseau::socket::fermer_les_differees();
     }
     cpu::couper_interruptions();
     t.morte.store(true, Ordering::Relaxed);

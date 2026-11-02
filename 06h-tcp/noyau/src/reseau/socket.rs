@@ -29,8 +29,10 @@
 //!
 //! La socket vit tant qu'on la tient : son fichier ouvert, un appel en
 //! cours, la table des ports. Son DERNIER `close` (le fichier ouvert rendu,
-//! `fichier_ferme`) la retire de la table des ports : elle ne reçoit plus
-//! rien, et ce qui restait dans sa file est rendu avec elle. Un `recv` qui
+//! `fichier_ferme`) l'accroche à la tâche, et la sortie de l'appel la
+//! retire de la table des ports (6h : la fermeture différée de Linux,
+//! `fermer_les_differees`) : elle ne reçoit plus rien, et ce qui restait
+//! dans sa file est rendu avec elle. Un `recv` qui
 //! dort dans un autre fil n'est pas réveillé (Linux non plus, mesuré) : il
 //! tient la socket (le `fdget` de 6e) jusqu'à ce qu'un datagramme arrive.
 
@@ -43,6 +45,7 @@ use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::{cpu, temps};
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
@@ -292,6 +295,9 @@ pub struct Socket {
     pub connectee: AtomicBool,
     pub recverr: AtomicBool,
     pub pmtudisc: AtomicU8,
+    /// La suivante des sockets qu'une tâche a à fermer (sa liste
+    /// `Tache::fermetures`, voir `fichier_ferme`).
+    suivante: Verrou<Option<Arc<Socket>>>,
 }
 
 impl Socket {
@@ -311,6 +317,7 @@ impl Socket {
             connectee: AtomicBool::new(false),
             recverr: AtomicBool::new(false),
             pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
+            suivante: Verrou::new(None),
         }
     }
 
@@ -566,11 +573,38 @@ pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl F
 }
 
 /// Le dernier `close` d'un fichier ouvert : s'il tenait une socket, elle
-/// quitte la table des ports (le `sock_close`, puis `udp_lib_unhash`).
-/// Sous le verrou des fichiers : ne dort pas (la table des ports a un
-/// `Verrou`).
+/// est accrochée à la tâche courante, et sera fermée à la sortie de son
+/// appel (`fermer_les_differees`). Le `__fput` de Linux, remis par
+/// `task_work_add` au retour vers l'anneau 3 : le dernier `close` se fait
+/// sous le verrou des fichiers (vfs.rs), où l'on ne peut ni dormir ni
+/// prendre la possession d'une socket, ce que demandera la fermeture d'une
+/// socket TCP (envoyer FIN, attendre SO_LINGER) ; une socket UDP s'en
+/// passerait, mais toutes suivent le même chemin, comme chez Linux. Sans
+/// allocation : la liste est chaînée par les sockets elles-mêmes.
 pub fn fichier_ferme(ferme: &FichierOuvert) {
     if let Prive::Socket(s) = &ferme.prive {
-        super::datagramme::table::retirer(s);
+        let t = tache::courante();
+        let mut tete = t.fermetures.verrouiller();
+        *s.suivante.verrouiller() = tete.take();
+        *tete = Some(s.clone());
+    }
+}
+
+/// Ferme les sockets dont la tâche courante a fait le dernier `close` (le
+/// `task_work_run`) : à la sortie de chaque appel système et de chaque
+/// appel WASI, et à la fin de la tâche. Sans verrou tenu. Une socket
+/// quitte alors sa table des ports (le `sock_close`, puis
+/// `udp_lib_unhash`) : elle ne reçoit plus rien, et ce qui restait dans sa
+/// file est rendu avec elle.
+pub fn fermer_les_differees() {
+    let t = tache::courante();
+    loop {
+        let s = {
+            let mut tete = t.fermetures.verrouiller();
+            let Some(s) = tete.take() else { return };
+            *tete = s.suivante.verrouiller().take();
+            s
+        };
+        super::datagramme::table::retirer(&s);
     }
 }

@@ -245,6 +245,7 @@ impl Drop for Wasi {
                 vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
             }
         }
+        crate::reseau::socket::fermer_les_differees();
     }
 }
 
@@ -366,6 +367,9 @@ impl Hote for Wasi {
             ENVIRON_GET => chaines(&self.environnement, a(0), a(1), m, cout),
             _ => unreachable!("fonction hote inconnue"),
         };
+        // Les sockets dont l'appel a fait le dernier `close` (comme à la
+        // sortie d'un appel système, reseau/socket.rs).
+        crate::reseau::socket::fermer_les_differees();
         resultats[0] = Valeur::I32(errno);
         Ok(())
     }

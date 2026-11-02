@@ -11,8 +11,11 @@
 //! (`VIDAGE`) : une réception qui émet à son tour par `lo` (une réponse à
 //! l'écho, un ICMP d'erreur) ne fait que déposer, et le vidage en cours,
 //! plus haut sur la même pile, la prend au tour suivant ; pas de
-//! récursion. Options écartées : livrer la trame sans file, dans l'appel
-//! même (une réception en provoquerait une autre, sans borne, sur la pile
+//! récursion. Et dans le CONTEXTE RÉSEAU (contexte.rs, 6h : une
+//! réception, la tâche du réseau, un verrou court de TCP), l'envoi ne fait
+//! que déposer, et la file est vidée quand le contexte finit : jamais de
+//! livraison à une socket sous le verrou d'une autre, ni de la même.
+//! Options écartées : livrer la trame sans file, dans l'appel même (une réception en provoquerait une autre, sans borne, sur la pile
 //! du noyau) ; ne la faire recevoir que par la tâche du réseau (elle
 //! arriverait quand l'ordonnanceur la choisit : un `recv` sans attendre ne
 //! la trouverait pas encore, mesuré). La tâche du réseau vide aussi la
@@ -92,6 +95,19 @@ pub fn emettre(i: &Interface, p: Paquet) {
     // La tâche du réseau aussi, au cas où le vidage serait déjà pris par
     // une tâche préemptée (elle reprendra, mais plus tard).
     super::tache::signaler_interface(i.index);
+    // Dans le contexte réseau (une réception, un verrou court de TCP) :
+    // seulement déposée, livrée quand le contexte finit (contexte.rs).
+    if !super::contexte::actif() {
+        vider_en_attente();
+    }
+}
+
+/// Livre ce qui attend dans la file de `lo`, s'il y a quelque chose (à la
+/// fin du contexte réseau, ou d'un envoi hors de lui).
+pub fn vider_en_attente() {
+    if FILE.verrouiller().is_empty() {
+        return;
+    }
     if let Some(lo) = interface() {
         vider(lo, usize::MAX);
     }
@@ -107,13 +123,16 @@ fn vider(i: &'static Interface, budget: usize) -> bool {
         if VIDAGE.swap(true, Ordering::Acquire) {
             return false;
         }
-        while n < budget {
-            // Prise sous le verrou, reçue sans lui : la réception peut
-            // émettre à son tour par `lo` (une réponse).
-            let Some(p) = FILE.verrouiller().pop_front() else { break };
-            super::recevoir(i, p);
-            n += 1;
-        }
+        // Dans le contexte réseau : une réception qui émet à son tour par
+        // `lo` (une réponse) ne fait que déposer, et ce tour-ci la prend.
+        super::contexte::pendant(|| {
+            while n < budget {
+                // Prise sous le verrou, reçue sans lui.
+                let Some(p) = FILE.verrouiller().pop_front() else { break };
+                super::recevoir(i, p);
+                n += 1;
+            }
+        });
         VIDAGE.store(false, Ordering::Release);
         if FILE.verrouiller().is_empty() {
             return false;
