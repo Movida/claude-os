@@ -35,6 +35,9 @@ static APIC: AtomicBool = AtomicBool::new(false);
 // pour un seul processeur : une carte des vecteurs libres, le premier libre
 // donné (comme `irq_matrix_alloc`) ; et la table `vector_irq` qui dit, pour
 // chaque vecteur, à qui il est.
+// UNIPROCESSEUR : une carte des vecteurs pour tout le noyau ; avec
+// plusieurs processeurs, une par processeur, et chaque interruption dirigée
+// vers l'un d'eux (son affinité).
 //
 // Le gestionnaire d'un vecteur est une fonction et son argument (l'adresse
 // de l'objet du pilote), lus sans verrou dans l'interruption : deux

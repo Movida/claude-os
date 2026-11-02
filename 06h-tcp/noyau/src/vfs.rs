@@ -31,10 +31,11 @@
 //!     prend le second) ; mais une vue de /proc, sous celui des fichiers,
 //!     prend la table des processus puis un processus (procfs.rs). Ce qui
 //!     se fait sous le verrou d'un processus ne résout donc jamais de
-//!     chemin. Sur un seul processeur (un `Verrou` coupe les
-//!     interruptions), ces deux ordres ne s'interbloquent pas ; avec
-//!     plusieurs, il faudra un ordre total : lire les descripteurs d'un
-//!     processus sans son verrou (le RCU de `fget_task` chez Linux) ;
+//!     chemin.
+//!     UNIPROCESSEUR : un `Verrou` coupe les interruptions, ces deux
+//!     ordres ne s'interbloquent pas ; avec plusieurs processeurs, il
+//!     faudra un ordre total : lire les descripteurs d'un processus sans
+//!     son verrou (le RCU de `fget_task` chez Linux) ;
 //!   - jamais de copie depuis ou vers un programme sous ce verrou : une
 //!     copie peut faire une faute de page.
 //! D'autres systèmes de fichiers se montent sur des dossiers du tmpfs

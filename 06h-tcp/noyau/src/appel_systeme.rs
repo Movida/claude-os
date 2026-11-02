@@ -31,14 +31,14 @@
 //!     64 bits. SYSENTER_CS vaut 0 : un `sysenter` fait une faute de
 //!     protection générale, et le programme est arrêté.
 //!
-//! Pas de `swapgs` : Linux s'en sert pour trouver, par GS, la zone propre à
-//! chaque processeur (la pile noyau courante, entre autres). Avec un seul
-//! processeur, une seule TSS, adressée par RIP, suffit ; le noyau ne touche
-//! jamais à GS (la cible x86_64-unknown-none n'a ni variables par fil
-//! d'exécution ni protection de pile, qui s'en serviraient). `swapgs` est
-//! la source de failles la plus fournie de l'entrée de Linux
-//! (CVE-2014-9322, CVE-2019-1125) : on l'ajoutera avec le multiprocesseur,
-//! pas avant.
+//! UNIPROCESSEUR : pas de `swapgs`. Linux s'en sert pour trouver, par GS,
+//! la zone propre à chaque processeur (la pile noyau courante, entre
+//! autres). Avec un seul processeur, une seule TSS, adressée par RIP,
+//! suffit ; le noyau ne touche jamais à GS (la cible x86_64-unknown-none
+//! n'a ni variables par fil d'exécution ni protection de pile, qui s'en
+//! serviraient). `swapgs` est la source de failles la plus fournie de
+//! l'entrée de Linux (CVE-2014-9322, CVE-2019-1125) : on l'ajoutera avec
+//! le multiprocesseur, pas avant.
 
 use core::arch::{asm, global_asm};
 use core::mem::offset_of;

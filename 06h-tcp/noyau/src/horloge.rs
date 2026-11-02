@@ -4,11 +4,11 @@
 //! Deux sources, choisies au démarrage :
 //!   - le TIMER DE L'APIC local (apic.rs), quand l'APIC est en service et
 //!     que le TSC est fiable (tsc.rs) : celle de Linux. Chaque processeur a
-//!     le sien (il en faudra un par cœur avec le multiprocesseur), il ne
-//!     passe ni par l'IO-APIC ni par le bus ISA. Sa fréquence (celle du bus
-//!     de l'APIC, divisée par 16) dépend de la machine : on la MESURE
-//!     contre le TSC pendant 10 ms, puis on le règle en mode périodique pour
-//!     une interruption par milliseconde. Le PIT est alors arrêté ;
+//!     le sien, il ne passe ni par l'IO-APIC ni par le bus ISA. Sa
+//!     fréquence (celle du bus de l'APIC, divisée par 16) dépend de la
+//!     machine : on la MESURE contre le TSC pendant 10 ms, puis on le règle
+//!     en mode périodique pour une interruption par milliseconde. Le PIT
+//!     est alors arrêté ;
 //!   - sinon le PIT 8253/8254 (Programmable Interval Timer) des étapes 3 à
 //!     6d, qui reçoit un quartz à 1 193 182 Hz (un tiers de la fréquence
 //!     des télévisions NTSC : le quartz le moins cher en 1981 !). Son canal
@@ -16,6 +16,10 @@
 //!     recommence. Sans TSC fiable, la période exacte du PIT est notre
 //!     seule mesure du temps (Linux prendrait le HPET, que nous n'avons
 //!     pas) : il reste l'horloge.
+//!
+//! UNIPROCESSEUR : un seul timer réglé, celui du processeur de démarrage ;
+//! avec plusieurs, chaque processeur règle le sien (son tic fait tourner
+//! sa propre file des prêtes), et le temps reste compté une seule fois.
 //!
 //! Fréquence : 1000 Hz, un tic par milliseconde, comme le CONFIG_HZ=1000
 //! des noyaux Linux de bureau. Plus de tics = plus de réactivité (un

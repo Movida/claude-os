@@ -119,13 +119,15 @@ struct Tss {
 /// `syscall` y accèdent sans passer par lui. Le noyau ne l'écrit que
 /// toujours interruptions coupées, sur son seul processeur : rsp[0] à
 /// chaque bascule (tache.rs), rsp[2] à chaque entrée de `syscall` (FMASK a
-/// coupé les interruptions). Avec plusieurs processeurs, il y en aura une
-/// par processeur, comme cpu_tss_rw dans Linux.
+/// coupé les interruptions).
+/// UNIPROCESSEUR : une seule TSS ; une par processeur avec plusieurs,
+/// comme cpu_tss_rw dans Linux (et l'entrée de `syscall` la trouvera par
+/// GS, voir appel_systeme.rs).
 #[repr(transparent)]
 pub struct TssPartagee(UnsafeCell<Tss>);
 
 // SAFETY : voir plus haut ; un seul processeur, accès interruptions
-// coupées.
+// coupées (UNIPROCESSEUR, voir plus haut).
 unsafe impl Sync for TssPartagee {}
 
 #[unsafe(no_mangle)]

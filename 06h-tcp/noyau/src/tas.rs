@@ -38,7 +38,9 @@
 //!     une page au buddy. Rendre tout de suite coûte de redécouper une page
 //!     de temps en temps, et garde exact le compte de la mémoire ;
 //!   - un seul verrou : SLUB a des listes par processeur, pour ne pas se
-//!     disputer le verrou (on n'a qu'un processeur).
+//!     disputer le verrou.
+//!     UNIPROCESSEUR : un seul verrou pour tout le tas ; avec plusieurs
+//!     processeurs, un cache par processeur devant lui (les `cpu_slab`).
 //!
 //! Un seul bloc ne dépasse pas 4 Mio (pages::ORDRE_MAX) : au-delà, une
 //! allocation échoue. `try_reserve` le dit proprement (memory.grow d'un

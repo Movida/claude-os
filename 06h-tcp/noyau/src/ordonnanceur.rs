@@ -41,9 +41,11 @@
 //! interrompu le noyau, si les interruptions y étaient actives (le
 //! `PREEMPT` de Linux). Un programme WebAssembly s'exécute dans
 //! l'interpréteur du noyau : sans préemption du noyau, il ne céderait
-//! jamais le processeur. Sur un seul processeur, avec des verrous qui
-//! coupent tous les interruptions, « les interruptions étaient actives »
-//! garantit qu'aucun verrou n'était tenu. La règle qui reste, vérifiée :
+//! jamais le processeur.
+//! UNIPROCESSEUR : avec des verrous qui coupent tous les interruptions,
+//! « les interruptions étaient actives » garantit qu'aucun verrou n'était
+//! tenu ; avec plusieurs processeurs (et des verrous qui ne les coupent
+//! pas tous), il faudra le compte de préemption de Linux, par tâche. La règle qui reste, vérifiée :
 //! ne jamais céder le processeur verrou tenu (`ordonnancer` panique,
 //! comme le « scheduling while atomic » de Linux). Écart avec Linux : il
 //! préempte aussi en rendant un verrou ; chez nous, un réveil fait dans le
@@ -86,6 +88,8 @@ struct File {
     zero: u64,
 }
 
+// UNIPROCESSEUR : une seule file des prêtes ; une par processeur avec
+// plusieurs (la `rq` de Linux), et l'équilibrage des charges entre elles.
 static FILE: Verrou<File> = Verrou::new(File { entites: Vec::new(), depuis: 0, zero: 0 });
 /// La tâche courante a fini sa tranche, ou une tâche réveillée devrait
 /// passer avant elle (le TIF_NEED_RESCHED de Linux).

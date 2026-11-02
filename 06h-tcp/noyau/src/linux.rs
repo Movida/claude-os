@@ -1104,8 +1104,9 @@ fn uname(tampon: u64) -> i64 {
 const MASQUE_PROCESSEURS: u64 = 8;
 
 /// sched_getaffinity(pid, longueur, masque) : sur quels processeurs le
-/// programme peut tourner. Un seul processeur, le 0 (pas de multiprocesseur
-/// dans l'étape 6). Dans l'ordre de Linux : la longueur d'abord (au moins
+/// programme peut tourner.
+/// UNIPROCESSEUR : un seul processeur, le 0 ; avec plusieurs, ceux qui
+/// sont en service (et sched_setaffinity). Dans l'ordre de Linux : la longueur d'abord (au moins
 /// le masque du noyau, et un multiple de 8 : EINVAL, avant même de chercher
 /// le processus), puis le fil (0 : le courant ; tout processus qui existe,
 /// zombie compris, ou tout fil vivant ; sinon ESRCH) ; on écrit

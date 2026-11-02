@@ -12,6 +12,12 @@
 //! quelqu'un d'autre le tient ; sur un seul, ce serait attendre pour
 //! toujours (voir `verrouiller`).
 //!
+//! Le marqueur UNIPROCESSEUR : chaque endroit du noyau qui suppose un seul
+//! processeur le dit par une ligne qui commence par ce mot, avec ce qu'il
+//! faudra changer ; `grep -rn UNIPROCESSEUR` en donne la liste, pour le
+//! jour du multiprocesseur. Ici, la première : couper les interruptions
+//! suffit à exclure tout autre code.
+//!
 //! Piège des interruptions : si le noyau tient le verrou de la console et
 //! qu'une interruption d'horloge arrive, et que son gestionnaire veut
 //! afficher, il attend un verrou que personne ne rendra jamais (le code qui
@@ -38,6 +44,8 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 /// processeur s'il n'est pas nul (ordonnanceur.rs). Un compteur pour le
 /// processeur, pas pour la tâche : un verrou coupe les interruptions, la
 /// tâche qui le tient ne peut pas être remplacée avant de l'avoir rendu.
+/// UNIPROCESSEUR : un seul compteur ; un par processeur avec plusieurs
+/// (dans la zone propre à chacun, voir appel_systeme.rs).
 static TENUS: AtomicU32 = AtomicU32::new(0);
 
 /// Le nombre de verrous tenus en ce moment.
@@ -66,9 +74,11 @@ impl<T> Verrou<T> {
     /// main avant d'avoir fini. Boucler serait un interblocage silencieux :
     /// on le dit par une panique, avec l'endroit de l'appel
     /// (#[track_caller]). La panique peut toujours afficher : elle force
-    /// d'abord le verrou de la console (console::preparer_panique). Avec
-    /// plusieurs processeurs, un verrou pris par un autre cœur se libère :
-    /// il faudra de nouveau attendre (la boucle des spinlocks).
+    /// d'abord le verrou de la console (console::preparer_panique).
+    /// UNIPROCESSEUR : avec plusieurs processeurs, un verrou pris par un
+    /// autre cœur se libère : il faudra de nouveau attendre (la boucle des
+    /// spinlocks), et distinguer les sortes de verrous de Linux (spin_lock,
+    /// spin_lock_irqsave, mutex), un seul ne suffisant plus.
     #[track_caller]
     pub fn verrouiller(&self) -> Garde<'_, T> {
         let interruptions_actives = cpu::couper_interruptions();

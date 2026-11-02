@@ -281,6 +281,10 @@ pub unsafe fn table_modifiable(physique: u64) -> &'static mut Table {
 
 /// Retire du cache des traductions (TLB) celle de la page `adresse`, dans
 /// l'espace courant : après qu'on a retiré la page ou réduit ses droits.
+/// UNIPROCESSEUR : seul ce processeur a pu garder la traduction ; avec
+/// plusieurs, ceux qui exécutent le même espace (les fils d'un processus)
+/// doivent l'oublier aussi : une interruption entre processeurs (IPI), le
+/// « TLB shootdown » de Linux. De même pour `vider_tlb`.
 pub fn invalider(adresse: u64) {
     // SAFETY : invlpg ne fait qu'oublier une traduction ; le processeur la
     // relira dans les tables.

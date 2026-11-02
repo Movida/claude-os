@@ -17,9 +17,11 @@
 //!      processeur ;
 //!   5. réveillée, se retirer de la file si elle y est encore (réveillée
 //!      par une échéance ou un signal), et revérifier.
-//! Sur un seul processeur, les interruptions coupées de 1 à 4 tiennent lieu
-//! de verrou : personne ne peut s'exécuter entre la vérification et le
-//! sommeil, ni le gestionnaire qui réveillerait, ni une autre tâche.
+//! UNIPROCESSEUR : les interruptions coupées de 1 à 4 tiennent lieu de
+//! verrou : personne ne peut s'exécuter entre la vérification et le
+//! sommeil, ni le gestionnaire qui réveillerait, ni une autre tâche. Avec
+//! plusieurs processeurs, le verrou de la file (et l'état de la tâche,
+//! changé avant de vérifier, comme `set_current_state` chez Linux).
 //!
 //! Une file d'attente ne demande aucune allocation : c'est une liste
 //! chaînée d'ENTRÉES posées par ceux qui attendent (les `wait_queue_entry`

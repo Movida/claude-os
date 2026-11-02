@@ -61,9 +61,10 @@
 //! faute de page d'une projection, et ici `ligne_maps` (le chemin du
 //! fichier d'une zone). Aucun de ces endroits ne résout de chemin ni
 //! n'entre dans une vue de /proc : le verrou d'un processus n'est jamais
-//! pris deux fois, et sur un seul processeur (un `Verrou` coupe les
-//! interruptions) ces deux ordres ne peuvent pas s'interbloquer. Avec
-//! plusieurs processeurs, il faudra un ordre total (vfs.rs).
+//! pris deux fois.
+//! UNIPROCESSEUR : un `Verrou` coupe les interruptions, ces deux ordres ne
+//! peuvent donc pas s'interbloquer ; avec plusieurs processeurs, il faudra
+//! un ordre total (vfs.rs).
 //!
 //! Le contenu d'un fichier est fabriqué à la lecture, par une « source » :
 //! `maps` ligne par ligne (le parcours reprend à l'adresse de fin de la

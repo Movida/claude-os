@@ -37,12 +37,14 @@
 //!
 //! LE VERROU : un seul, court (interruptions coupées), pour le réservoir,
 //! le générateur et le lot (Linux en a trois, plus un par processeur, pour
-//! que les processeurs ne se gênent pas : avec un seul processeur, un
-//! suffit). Aucun calcul long dessous : un tirage ne prépare sous le
-//! verrou que son premier bloc (`preparer`), puis tire les suivants sans
-//! lui, d'un état de ChaCha20 qui n'appartient qu'à lui. Le petit
-//! réservoir des interruptions a son propre verrou, le seul que prennent
-//! les interruptions.
+//! que les processeurs ne se gênent pas). Aucun calcul long dessous : un
+//! tirage ne prépare sous le verrou que son premier bloc (`preparer`),
+//! puis tire les suivants sans lui, d'un état de ChaCha20 qui n'appartient
+//! qu'à lui. Le petit réservoir des interruptions a son propre verrou, le
+//! seul que prennent les interruptions.
+//!
+//! UNIPROCESSEUR : un seul verrou suffit ; avec plusieurs processeurs, un
+//! générateur et un lot par processeur, comme Linux.
 
 use crate::attente::{self, FileAttente, Sommeil};
 use crate::tache::{self, Reveil};

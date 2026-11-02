@@ -305,7 +305,9 @@ impl EtatProgramme {
 
 // SAFETY : les champs dans des UnsafeCell (`contexte`, `programme`) ne sont
 // lus et écrits que par `basculer_vers`, interruptions coupées, sur notre
-// seul processeur ; `entree_attente`, que sous le verrou de la file d'attente
+// seul processeur (UNIPROCESSEUR : avec plusieurs, une tâche ne tourne que
+// sur un à la fois, ce que la bascule devra garantir, le `on_cpu` de
+// Linux) ; `entree_attente`, que sous le verrou de la file d'attente
 // où elle est inscrite ; le reste est atomique ou sous Verrou.
 unsafe impl Sync for Tache {}
 unsafe impl Send for Tache {}
@@ -539,6 +541,9 @@ impl Tache {
 }
 
 /// La tâche courante.
+/// UNIPROCESSEUR : une seule tâche courante, comme la tâche inactive et
+/// celle à rendre ci-dessous ; avec plusieurs processeurs, une par
+/// processeur, dans sa zone propre (le `current` de Linux, lu par GS).
 static COURANTE: AtomicPtr<Tache> = AtomicPtr::new(core::ptr::null_mut());
 /// Toutes les tâches vivantes, sauf l'inactive (pour le détecteur
 /// d'interblocage, attente.rs ; pour trouver un fil par son numéro :
@@ -710,7 +715,8 @@ pub fn basculer_vers(nouvelle: &Tache) {
     let interruptions = cpu::couper_interruptions();
     let ancienne = courante();
     // SAFETY : interruptions coupées, sur notre seul processeur : personne
-    // d'autre ne touche à l'état des deux tâches. Les registres et MSR
+    // d'autre ne touche à l'état des deux tâches (UNIPROCESSEUR, voir
+    // `unsafe impl Sync for Tache`). Les registres et MSR
     // écrits sont ceux du programme de la nouvelle tâche (le noyau n'en
     // dépend pas) ; son espace a la moitié haute du noyau, on continue de
     // s'exécuter après avoir changé CR3 ; sa pile noyau est la sienne.
@@ -774,8 +780,9 @@ extern "C" fn fin_de_bascule() {
 
 /// Attend la fin de la tâche `t` : la tâche courante dort jusqu'à ce que
 /// `terminer` la réveille. Sans réveil perdu : la fin est vérifiée, et
-/// l'attente inscrite, interruptions coupées, comme la fin elle-même ; sur
-/// un seul processeur, rien ne peut se glisser entre les deux.
+/// l'attente inscrite, interruptions coupées, comme la fin elle-même.
+/// UNIPROCESSEUR : rien ne peut se glisser entre les deux ; avec plusieurs
+/// processeurs, la fin et l'inscription sous un même verrou.
 pub fn attendre(t: &Tache) -> i32 {
     dormir_tant_que(|| !t.est_morte());
     t.code_sortie.load(Ordering::Relaxed)
