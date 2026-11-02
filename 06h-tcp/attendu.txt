@@ -46,7 +46,7 @@ rendues et recollees : ok.
 [reseau] eth0 : voisin 10.0.2.3 : 52:55:0a:00:02:03, joignable (ARP).
 [reseau] eth0 : la passerelle et le DNS resolus par ARP : ok.
 [noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
-memoire rendue : ok.
+[noyau] Espace d'un programme : page 0x400000 ecrite par son adresse (copie protegee), relue par le cadre
 [16 bits] Archive de programmes lue, placee apres le noyau.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
