@@ -17,15 +17,15 @@ Le vrai Claude Code plutôt qu'un agent maison, parce que David veut utiliser so
 - Le code est commenté en français et explique le *pourquoi*, pas seulement le *quoi*.
 - Au plus bas niveau : aucune crate Rust qui fait le travail à notre place (pas de `bootloader`, `x86_64`, `pic8259`, `uart_16550`…). Le noyau n'utilise que `core` et `alloc` (les collections de Rust : `Vec`, `Box`, `String`…), avec notre propre allocateur ; tout accès au matériel passe par notre code. `unsafe` est cantonné aux modules d'abstraction de bas niveau (le matériel, la mémoire physique, les copies vers les programmes, la synchronisation, la bascule de contexte : leur liste est dans `noyau/src/main.rs`, et `#![deny(unsafe_code)]` le refuse ailleurs) ; chaque bloc dit pourquoi il est sûr (un commentaire `SAFETY:`). Les bibliothèques et la logique des appels système n'en ont pas. Aucune allocation qui panique : le noyau passe par `faillible.rs` et notre `Arc`.
 - Les messages affichés par l'OS n'ont pas d'accents : la police du BIOS utilise la page de code 437, pas l'UTF-8.
-- Une étape = un dossier numéroté (`01-boot/`, `02-…/`), chacun avec son propre Makefile. Une sous-étape porte sa lettre (`06a-memoire/`, `06b-…/`), avec son tag (`etape-06a`) et son propre fil de discussion.
+- Une étape = un dossier numéroté (`01-boot/`, `02-…/`), chacun avec son propre Makefile. Une sous-étape porte sa lettre (`06a-memoire/`, `06b-…/`), avec son tag (`etape-06a`) et son propre fil de discussion. (L'étape 2, antérieure à cette règle : `02-mode-protege/` et `02-mode-long/`, tags `etape-02a` et `etape-02b`.)
 
 ## Historique git
 
 Le dépôt (github.com/Movida/claude-os) doit se lire étape par étape.
 
 - Un commit = un changement logique. Sujet sans accents : `Etape NN : ...`, `Outillage : ...` ou `Projet : ...`.
-- Nouvelle étape : pas de commit de copie. Pour voir ce qu'une étape ajoute à la précédente, comparer les fichiers : `git diff --no-index 01-boot/boot.asm 02-mode-protege/boot.asm`.
-- Un choix de conception important fait l'objet d'un commit à part, pour qu'on le retrouve facilement dans l'historique.
+- Nouvelle étape : pas de commit de copie. Pour voir ce qu'une étape ajoute à la précédente, comparer les fichiers : `git diff --no-index 01-boot/boot.asm 02-mode-protege/boot.asm`. Une correction tardive ne touche que l'étape courante : les dossiers des étapes passées gardent ce qu'ils étaient.
+- Un choix de conception important est écrit dans le message du commit qui l'implémente (« Choix de conception »), à côté de son code : `git log --grep='hoix de conception'` les retrouve. (La règle de départ voulait un commit à part ; depuis l'étape 4, le choix vit avec son code, ce qui se relit mieux.)
 - Avant le premier push d'une étape : relecture de fond, et chaque correction repliée dans le commit qui avait introduit le défaut. La marche à suivre est dans le skill `fin-d-etape` (`.claude/skills/fin-d-etape/`).
 - Étape vérifiée dans QEMU : tag `etape-NN` (à pousser depuis la VM de David, le proxy de la session cloud refuse les tags).
 - On ne réécrit l'historique que tant que personne d'autre ne l'a récupéré ; ensuite, uniquement de nouveaux commits.

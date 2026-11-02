@@ -8,7 +8,7 @@ Un OS x86 écrit de zéro, brique par brique, pour apprendre comment tout foncti
 
 ## Où en est le projet
 
-`claude --version` tourne dans le noyau : le binaire officiel de Claude Code, un ELF x86_64 dynamique, chargé avec ld-linux et la glibc de la machine, sans aucune modification.
+`claude -p` va jusqu'à l'API d'Anthropic : le binaire officiel de Claude Code, un ELF x86_64 dynamique chargé avec ld-linux et la glibc de la machine, sans aucune modification, ouvre sa connexion par notre pile TCP/IP et y fait son TLS (avec une fausse clé, l'API répond « Invalid API key »). `claude --version` y tourne depuis 6d. La prochaine étape : la première vraie réponse de Claude (6i).
 
 ```
 [16 bits] Noyau lu sur le disque, recopie a 1 Mio en mode irreel.
@@ -20,7 +20,7 @@ Un OS x86 écrit de zéro, brique par brique, pour apprendre comment tout foncti
 ## Architecture
 
 - **Démarrage** : notre propre chargeur en assembleur (BIOS legacy), passage du mode réel 16 bits au mode protégé 32 bits puis au mode long 64 bits.
-- **Noyau Rust** `no_std` : interruptions, horloge, clavier, pagination W^X, allocateur buddy, mémoire virtuelle à la demande, système de fichiers en mémoire. Aucune crate qui fait le travail à notre place : seulement `core` et `alloc`, avec notre propre allocateur.
+- **Noyau Rust** `no_std` : interruptions, APIC, pagination W^X, allocateur buddy, mémoire virtuelle à la demande, système de fichiers en mémoire, ordonnanceur EEVDF et fils, signaux, `epoll`, tubes, pile réseau (PCI, virtio-net, IPv4, UDP, TCP, DNS), générateur aléatoire de Linux (ChaCha20). Aucune crate qui fait le travail à notre place : seulement `core` et `alloc`, avec notre propre allocateur. `unsafe` est réservé aux modules d'abstraction de bas niveau, et aucune allocation du noyau ne panique : le compilateur et `cargo clippy` le vérifient.
 - **WebAssembly est le format natif des programmes** : le noyau embarque un interpréteur Wasm, testé contre la suite officielle de WebAssembly, avec WASI comme interface système (isolation à la façon de Nebulet).
 - **Une couche de compatibilité Linux minimale**, uniquement pour exécuter `claude` tel quel : chargeur ELF, anneau 3, appels système de Linux, programmes dynamiques.
 
@@ -39,8 +39,12 @@ Chaque étape est un dossier autonome avec son propre `Makefile`, et un tag `eta
 | `06b-fichiers/` | Système de fichiers en mémoire, descripteurs, cache des pages |
 | `06c-dynamique/` | Programmes dynamiques : ld-linux et la glibc partagée |
 | `06d-claude-version/` | `claude --version` |
+| `06e-ordonnanceur/` | Ordonnanceur EEVDF, APIC et IO-APIC, fils (`clone3`, `futex`) |
+| `06f-signaux/` | Signaux, `epoll`, `eventfd`, tubes, `/proc` à la demande |
+| `06g-reseau/` | PCI, virtio-net, Ethernet, IPv4, UDP, ICMP, DNS |
+| `06h-tcp/` | Le générateur aléatoire de Linux, TCP, sockets (en cours) |
 
-La feuille de route complète (ordonnanceur, réseau, TCP, terminal, shell…) est dans [`CLAUDE.md`](CLAUDE.md), et le récit des décisions dans [`HISTORIQUE.md`](HISTORIQUE.md).
+La feuille de route complète (la première réponse de Claude, le multiprocesseur, le terminal, le shell, le disque…) est dans [`CLAUDE.md`](CLAUDE.md), et le récit des décisions dans [`HISTORIQUE.md`](HISTORIQUE.md).
 
 ## Essayer
 
