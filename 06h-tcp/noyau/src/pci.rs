@@ -136,7 +136,7 @@ pub fn configuration() -> Configuration<'static> {
 impl Configuration<'_> {
     /// Lit le mot de 32 bits à `position` (multiple de 4) de l'espace de `a`.
     pub fn lire32(&self, a: Adresse, position: usize) -> u32 {
-        // SAFETY : les deux ports du mécanisme n° 1, toujours présents sur
+        // SAFETY: les deux ports du mécanisme n° 1, toujours présents sur
         // un PC ; lire l'espace de configuration n'a pas d'effet de bord.
         unsafe {
             port::ecrire32(ADRESSE, a.mot(position));
@@ -147,7 +147,7 @@ impl Configuration<'_> {
     /// Lit le mot de 16 bits à `position` (paire) : sur le port de donnée
     /// plus la position dans le mot.
     pub fn lire16(&self, a: Adresse, position: usize) -> u16 {
-        // SAFETY : comme lire32.
+        // SAFETY: comme lire32.
         unsafe {
             port::ecrire32(ADRESSE, a.mot(position));
             port::lire16(DONNEE + (position as u16 & 2))
@@ -156,7 +156,7 @@ impl Configuration<'_> {
 
     /// Écrit le mot de 32 bits à `position` (multiple de 4).
     pub fn ecrire32(&self, a: Adresse, position: usize, valeur: u32) {
-        // SAFETY : l'appelant écrit un registre dont il connaît l'effet
+        // SAFETY: l'appelant écrit un registre dont il connaît l'effet
         // (une BAR à mesurer, puis remise).
         unsafe {
             port::ecrire32(ADRESSE, a.mot(position));
@@ -167,7 +167,7 @@ impl Configuration<'_> {
     /// Écrit le mot de 16 bits à `position` (paire), sans toucher aux deux
     /// autres octets du mot de 32 bits.
     pub fn ecrire16(&self, a: Adresse, position: usize, valeur: u16) {
-        // SAFETY : comme ecrire32.
+        // SAFETY: comme ecrire32.
         unsafe {
             port::ecrire32(ADRESSE, a.mot(position));
             port::ecrire16(DONNEE + (position as u16 & 2), valeur);

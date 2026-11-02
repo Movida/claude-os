@@ -58,7 +58,7 @@ pub struct Verrou<T> {
     donnee: UnsafeCell<T>,
 }
 
-// SAFETY : l'accès à `donnee` ne se fait qu'à travers une Garde, et le
+// SAFETY: l'accès à `donnee` ne se fait qu'à travers une Garde, et le
 // booléen atomique garantit qu'il n'existe qu'une Garde à la fois.
 unsafe impl<T: Send> Sync for Verrou<T> {}
 
@@ -111,14 +111,14 @@ pub struct Garde<'a, T> {
 impl<T> Deref for Garde<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY : la Garde prouve qu'on tient le verrou.
+        // SAFETY: la Garde prouve qu'on tient le verrou.
         unsafe { &*self.verrou.donnee.get() }
     }
 }
 
 impl<T> DerefMut for Garde<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY : idem, et &mut self garantit l'exclusivité locale.
+        // SAFETY: idem, et &mut self garantit l'exclusivité locale.
         unsafe { &mut *self.verrou.donnee.get() }
     }
 }

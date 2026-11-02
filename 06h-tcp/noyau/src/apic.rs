@@ -96,7 +96,7 @@ static REGISTRES: AtomicU64 = AtomicU64::new(0);
 fn lire(registre: usize) -> u32 {
     let base = REGISTRES.load(Ordering::Relaxed);
     debug_assert!(base != 0);
-    // SAFETY : la page des registres est projetée sans cache
+    // SAFETY: la page des registres est projetée sans cache
     // (initialiser) ; un accès de 32 bits aligné, ce qu'exige l'APIC.
     unsafe { ((base + registre as u64) as *const u32).read_volatile() }
 }
@@ -104,7 +104,7 @@ fn lire(registre: usize) -> u32 {
 fn ecrire(registre: usize, valeur: u32) {
     let base = REGISTRES.load(Ordering::Relaxed);
     debug_assert!(base != 0);
-    // SAFETY : comme `lire`.
+    // SAFETY: comme `lire`.
     unsafe { ((base + registre as u64) as *mut u32).write_volatile(valeur) }
 }
 
@@ -141,7 +141,7 @@ pub struct Bilan {
 
 fn lire_msr(msr: u32) -> u64 {
     let (bas, haut): (u32, u32);
-    // SAFETY : IA32_APIC_BASE existe dès que CPUID dit qu'il y a un APIC.
+    // SAFETY: IA32_APIC_BASE existe dès que CPUID dit qu'il y a un APIC.
     unsafe { core::arch::asm!("rdmsr", in("ecx") msr, out("eax") bas, out("edx") haut, options(nomem, nostack, preserves_flags)) };
     (haut as u64) << 32 | bas as u64
 }

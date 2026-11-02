@@ -17,9 +17,11 @@
 //!
 //! La bibliothèque n'utilise que `core` et `alloc` : elle se compile pour
 //! la machine hôte, où on la teste avec la suite de tests officielle
-//! (tests/suite.rs), et pour notre noyau.
+//! (tests/suite.rs), et pour notre noyau. Sans `unsafe`, comme les autres
+//! bibliothèques du noyau : le compilateur le refuse (forbid).
 
 #![no_std]
+#![forbid(unsafe_code)]
 
 extern crate alloc;
 

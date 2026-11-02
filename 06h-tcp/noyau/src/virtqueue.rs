@@ -119,7 +119,7 @@ impl Virtqueue {
         let avail = espace::virtuelle(page_anneaux);
         // used aligné sur 4 (spécification 2.7 : 4 pour l'anneau used).
         let used = avail + taille_avail(taille).next_multiple_of(4);
-        // SAFETY : deux pages qui viennent d'être données, à nous, vues par
+        // SAFETY: deux pages qui viennent d'être données, à nous, vues par
         // la projection directe.
         unsafe {
             core::ptr::write_bytes(descripteurs as *mut u8, 0, 4096);
@@ -153,7 +153,7 @@ impl Virtqueue {
 
     fn ecrire_descripteur(&mut self, i: u16, physique: u64, longueur: u32, drapeaux: u16, suivant: u16) {
         let d = self.descripteurs + i as u64 * TAILLE_DESCRIPTEUR;
-        // SAFETY : `i` < taille : un descripteur de notre page.
+        // SAFETY: `i` < taille : un descripteur de notre page.
         unsafe {
             (d as *mut u64).write_volatile(physique);
             ((d + 8) as *mut u32).write_volatile(longueur);
@@ -164,18 +164,18 @@ impl Virtqueue {
 
     fn suivant_du_descripteur(&self, i: u16) -> (u16, u16) {
         let d = self.descripteurs + i as u64 * TAILLE_DESCRIPTEUR;
-        // SAFETY : comme ecrire_descripteur.
+        // SAFETY: comme ecrire_descripteur.
         unsafe { (((d + 12) as *const u16).read_volatile(), ((d + 14) as *const u16).read_volatile()) }
     }
 
     fn mot16(adresse: u64) -> u16 {
-        // SAFETY : une adresse de nos anneaux (les appelants la calculent
+        // SAFETY: une adresse de nos anneaux (les appelants la calculent
         // dans leurs bornes).
         unsafe { (adresse as *const u16).read_volatile() }
     }
 
     fn ecrire16(adresse: u64, valeur: u16) {
-        // SAFETY : comme mot16.
+        // SAFETY: comme mot16.
         unsafe { (adresse as *mut u16).write_volatile(valeur) }
     }
 
@@ -247,7 +247,7 @@ impl Virtqueue {
             compiler_fence(Ordering::Acquire);
             let place = self.used_lu % self.taille;
             let entree = self.used + 4 + 8 * place as u64;
-            // SAFETY : une entrée de notre anneau used.
+            // SAFETY: une entrée de notre anneau used.
             let (id, longueur) = unsafe { ((entree as *const u32).read_volatile(), ((entree + 4) as *const u32).read_volatile()) };
             self.used_lu = self.used_lu.wrapping_add(1);
             if !self.coupees && self.evenements {

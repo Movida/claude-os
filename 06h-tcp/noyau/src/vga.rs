@@ -30,7 +30,7 @@ impl Ecran {
     /// l'écriture. « Volatile » lui dit que la mémoire a un effet ailleurs
     /// (ici, la carte vidéo).
     fn case(&mut self, ligne: usize, colonne: usize, valeur: u16) {
-        // SAFETY : ligne < HAUTEUR et colonne < LARGEUR, donc on reste dans
+        // SAFETY: ligne < HAUTEUR et colonne < LARGEUR, donc on reste dans
         // les 4000 octets de la mémoire vidéo, vus par la projection directe.
         unsafe {
             ptr::write_volatile(MEMOIRE_VIDEO.add(ligne * LARGEUR + colonne), valeur);
@@ -38,7 +38,7 @@ impl Ecran {
     }
 
     fn lire_case(&self, ligne: usize, colonne: usize) -> u16 {
-        // SAFETY : mêmes bornes que case().
+        // SAFETY: mêmes bornes que case().
         unsafe { ptr::read_volatile(MEMOIRE_VIDEO.add(ligne * LARGEUR + colonne)) }
     }
 
@@ -107,7 +107,7 @@ impl Ecran {
     /// la position, comptée en cases depuis le coin haut gauche.
     fn placer_curseur(&self) {
         let position = (self.ligne * LARGEUR + self.colonne.min(LARGEUR - 1)) as u16;
-        // SAFETY : registres documentés du contrôleur CRT ; ils ne règlent
+        // SAFETY: registres documentés du contrôleur CRT ; ils ne règlent
         // que la position du curseur.
         unsafe {
             port::ecrire(0x3D4, 0x0F);

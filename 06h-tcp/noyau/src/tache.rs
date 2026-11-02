@@ -281,7 +281,7 @@ impl EtatProgramme {
     /// Celui d'un programme qui commence : l'état x87/SSE initial, des
     /// sélecteurs et une base de FS nuls. None : plus de mémoire.
     fn initial() -> Option<EtatProgramme> {
-        // SAFETY : l'image de l'état initial, une constante.
+        // SAFETY: l'image de l'état initial, une constante.
         let fpu = crate::sse::ZoneFpu::neuve(unsafe { &etat_fpu_initial.0 })?;
         Some(EtatProgramme { fpu, selecteurs: [0; 4], base_fs: 0 })
     }
@@ -292,7 +292,7 @@ impl EtatProgramme {
     fn herite(base_fs: Option<u64>) -> Option<EtatProgramme> {
         let fpu = crate::sse::ZoneFpu::du_processeur()?;
         let mut selecteurs = [0u16; 4];
-        // SAFETY : lire les sélecteurs de segments ne change rien ; ceux
+        // SAFETY: lire les sélecteurs de segments ne change rien ; ceux
         // de l'anneau 3, que le noyau ne touche pas.
         unsafe {
             asm!("mov {0:x}, ds", "mov {1:x}, es", "mov {2:x}, fs", "mov {3:x}, gs",
@@ -303,13 +303,14 @@ impl EtatProgramme {
     }
 }
 
-// SAFETY : les champs dans des UnsafeCell (`contexte`, `programme`) ne sont
+// SAFETY: les champs dans des UnsafeCell (`contexte`, `programme`) ne sont
 // lus et écrits que par `basculer_vers`, interruptions coupées, sur notre
 // seul processeur (UNIPROCESSEUR : avec plusieurs, une tâche ne tourne que
 // sur un à la fois, ce que la bascule devra garantir, le `on_cpu` de
 // Linux) ; `entree_attente`, que sous le verrou de la file d'attente
 // où elle est inscrite ; le reste est atomique ou sous Verrou.
 unsafe impl Sync for Tache {}
+// SAFETY: voir ci-dessus.
 unsafe impl Send for Tache {}
 
 /// Ce qui a manqué pour créer une tâche.
@@ -388,7 +389,7 @@ impl Tache {
     /// programme, le cadre de son retour vers l'anneau 3 au-dessus.
     fn preparer(&self, depart: unsafe extern "C" fn(), r12: u64, cadre: Option<Cadre>) {
         let mut sommet = self.haut;
-        // SAFETY : la pile vient d'être allouée pour cette tâche, qui n'a
+        // SAFETY: la pile vient d'être allouée pour cette tâche, qui n'a
         // jamais tourné : personne d'autre ne s'en sert. On y écrit, de haut
         // en bas, le cadre éventuel, l'adresse du départ, et les registres
         // que dépilera `basculer` (r15, r14, r13, r12, rbx, rbp, dans
@@ -626,7 +627,7 @@ pub fn en_service() -> bool {
 
 /// La tâche courante.
 pub fn courante() -> &'static Tache {
-    // SAFETY : COURANTE désigne toujours une tâche vivante : la tâche
+    // SAFETY: COURANTE désigne toujours une tâche vivante : la tâche
     // courante ne peut pas être rendue pendant qu'elle s'exécute (sa
     // structure vit tant qu'un Arc la tient : celui de qui l'a créée, et
     // la tâche inactive pour toujours).
@@ -693,7 +694,7 @@ pub fn processus_du_fil(tid: u32) -> Option<u32> {
 /// Un Arc de la tâche courante (pour la mettre dans une file).
 pub fn courante_arc() -> Arc<Tache> {
     let p = COURANTE.load(Ordering::Relaxed);
-    // SAFETY : toute tâche vient d'un Arc (Arc::new, ou Arc::into_raw pour
+    // SAFETY: toute tâche vient d'un Arc (Arc::new, ou Arc::into_raw pour
     // l'inactive), toujours tenu tant qu'elle s'exécute (voir `courante`) :
     // en prendre un de plus est permis.
     unsafe {
@@ -714,7 +715,7 @@ pub fn inactive() -> *const Tache {
 pub fn basculer_vers(nouvelle: &Tache) {
     let interruptions = cpu::couper_interruptions();
     let ancienne = courante();
-    // SAFETY : interruptions coupées, sur notre seul processeur : personne
+    // SAFETY: interruptions coupées, sur notre seul processeur : personne
     // d'autre ne touche à l'état des deux tâches (UNIPROCESSEUR, voir
     // `unsafe impl Sync for Tache`). Les registres et MSR
     // écrits sont ceux du programme de la nouvelle tâche (le noyau n'en
@@ -764,7 +765,7 @@ pub fn basculer_vers(nouvelle: &Tache) {
 extern "C" fn fin_de_bascule() {
     let morte = A_RENDRE.swap(core::ptr::null_mut(), Ordering::Relaxed);
     if !morte.is_null() {
-        // SAFETY : `morte` vient d'Arc::into_raw dans `terminer`, rendu une
+        // SAFETY: `morte` vient d'Arc::into_raw dans `terminer`, rendu une
         // seule fois, ici ; elle ne s'exécute plus.
         let t = unsafe { Arc::from_raw(morte) };
         drop(t.pile.verrouiller().take());
@@ -913,7 +914,7 @@ extern "C" fn debut_de_fil() {
         cpu::activer_interruptions();
         let _ = crate::copie_utilisateur::copier_vers_utilisateur(adresse, &t.tid.to_le_bytes());
     }
-    // SAFETY : le cadre du premier départ, préparé en haut de sa pile
+    // SAFETY: le cadre du premier départ, préparé en haut de sa pile
     // (`preparer`) ; rien d'autre ne s'en sert.
     verifier_au_retour(unsafe { &mut *t.cadre_du_programme() });
 }
@@ -984,7 +985,7 @@ pub fn lancer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> Option<
 /// Le corps d'une tâche du noyau (depart_noyau) : sa fonction, puis sa fin.
 #[unsafe(no_mangle)]
 extern "C" fn tache_noyau(f: *mut FonctionNoyau) -> ! {
-    // SAFETY : `f` vient de Box::into_raw dans `executer_noyau`, rendu une
+    // SAFETY: `f` vient de Box::into_raw dans `executer_noyau`, rendu une
     // seule fois, ici.
     let f = unsafe { Box::from_raw(f) };
     f();
@@ -1009,7 +1010,7 @@ pub fn terminer(code: i32) -> ! {
         // chargera la PML4 du noyau, jamais des tables qu'on détruit.
         let interruptions = cpu::couper_interruptions();
         t.espace.store(pagination::pml4_noyau(), Ordering::Relaxed);
-        // SAFETY : la PML4 du noyau est complète.
+        // SAFETY: la PML4 du noyau est complète.
         unsafe { pagination::activer(pagination::pml4_noyau()) };
         if interruptions {
             cpu::activer_interruptions();

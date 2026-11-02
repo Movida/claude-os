@@ -134,7 +134,7 @@ impl MsiX {
 
     fn ecrire(&self, entree: u16, champ: u64, valeur: u32) {
         let adresse = self.table.adresse() + entree as u64 * ENTREE + champ;
-        // SAFETY : la table est projetée sans cache sur `entrees` entrées
+        // SAFETY: la table est projetée sans cache sur `entrees` entrées
         // (activer), l'entrée en fait partie (les appelants le vérifient) ;
         // un mot de 32 bits aligné, ce qu'exige MSI-X.
         unsafe { (adresse as *mut u32).write_volatile(valeur) }
@@ -142,7 +142,7 @@ impl MsiX {
 
     fn lire(&self, entree: u16, champ: u64) -> u32 {
         let adresse = self.table.adresse() + entree as u64 * ENTREE + champ;
-        // SAFETY : comme `ecrire`.
+        // SAFETY: comme `ecrire`.
         unsafe { (adresse as *const u32).read_volatile() }
     }
 

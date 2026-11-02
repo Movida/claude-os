@@ -118,14 +118,14 @@ struct Liens {
 /// `bloc` doit être un bloc libre de l'allocateur : personne d'autre ne s'en
 /// sert, et la projection directe le couvre.
 unsafe fn liens(bloc: u64) -> &'static mut Liens {
-    // SAFETY : garanti par l'appelant.
+    // SAFETY: garanti par l'appelant.
     unsafe { &mut *(espace::virtuelle(bloc) as *mut Liens) }
 }
 
 impl Pages {
     fn inserer(&mut self, bloc: u64, ordre: u32) {
         let tete = self.listes[ordre as usize];
-        // SAFETY : `bloc` devient un bloc libre ; `tete` en est un.
+        // SAFETY: `bloc` devient un bloc libre ; `tete` en est un.
         unsafe {
             *liens(bloc) = Liens { suivant: tete, precedent: 0 };
             if tete != 0 {
@@ -137,7 +137,7 @@ impl Pages {
     }
 
     fn retirer(&mut self, bloc: u64, ordre: u32) {
-        // SAFETY : `bloc` est un bloc libre de la liste `ordre`, ses voisins
+        // SAFETY: `bloc` est un bloc libre de la liste `ordre`, ses voisins
         // aussi.
         unsafe {
             let Liens { suivant, precedent } = *liens(bloc);
@@ -222,7 +222,7 @@ pub fn initialiser() -> Bilan {
     let nombre = cadres::nombre();
     let taille = (nombre * size_of::<Descripteur>()).next_multiple_of(PAGE as usize);
     let adresse = cadres::allouer_contigus(taille / PAGE as usize).expect("pas de place pour les descripteurs des cadres");
-    // SAFETY : ces cadres viennent d'être alloués, d'un seul tenant, et la
+    // SAFETY: ces cadres viennent d'être alloués, d'un seul tenant, et la
     // projection directe couvre toute la mémoire ; l'adresse est alignée
     // sur la page, donc sur un descripteur.
     let descripteurs = unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(adresse) as *mut Descripteur, nombre) };

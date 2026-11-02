@@ -167,7 +167,7 @@ pub fn initialiser(fin_noyau: u64, archive: Option<Etendue>) -> Result<Bilan, &'
             .min()
             .ok_or("pas de place pour la carte de bits")?;
 
-        // SAFETY : cette plage est de la mémoire libre d'après le BIOS,
+        // SAFETY: cette plage est de la mémoire libre d'après le BIOS,
         // sous la limite projetée, hors du noyau, et n'appartient qu'à nous
         // à partir de maintenant (on la marque occupée juste après). On la
         // voit par la projection directe.

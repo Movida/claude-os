@@ -452,7 +452,7 @@ impl Element {
         let n = self.inscrites.swap(0, Relaxed);
         for e in &self.entrees[..n] {
             let file = e.file.load(Relaxed);
-            // SAFETY : la file vit tant que son fichier est ouvert, et une
+            // SAFETY: la file vit tant que son fichier est ouvert, et une
             // entrée est retirée avant qu'il ne soit fermé (à DEL, ou à sa
             // fermeture, sous le verrou des fichiers).
             if let Some(f) = unsafe { file.as_ref() } {
@@ -514,7 +514,7 @@ impl Element {
 
 impl Rappel for EntreeElement {
     fn rappel(&self, cle: u32) -> bool {
-        // SAFETY : l'élément contient l'entrée, et vit tant qu'elle est
+        // SAFETY: l'élément contient l'entrée, et vit tant qu'elle est
         // inscrite (il est retiré des files avant d'être rendu).
         let e = unsafe { &*self.element.load(Relaxed) };
         e.reveil(cle)
@@ -538,10 +538,10 @@ impl Inscrire for Inscription<'_> {
         e.file.store(file as *const FileAttente as *mut FileAttente, Relaxed);
         let qui: *const dyn Rappel = e;
         let exclusive = self.element.evenements.load(Relaxed) & EPOLLEXCLUSIVE != 0;
-        // SAFETY : l'entrée est dans l'élément, qui est dans un Arc (il ne
+        // SAFETY: l'entrée est dans l'élément, qui est dans un Arc (il ne
         // bouge pas) et n'est rendu qu'après `desinscrire`.
         unsafe { e.entree.preparer_rappel(qui, exclusive) };
-        // SAFETY : comme ci-dessus.
+        // SAFETY: comme ci-dessus.
         file.ajouter(unsafe { Pin::new_unchecked(&e.entree) });
         self.element.inscrites.store(n + 1, Relaxed);
     }

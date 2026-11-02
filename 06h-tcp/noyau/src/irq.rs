@@ -100,7 +100,7 @@ pub fn libres() -> usize {
 fn gestionnaire(v: u8) -> Option<(fn(usize), usize)> {
     let g = &GESTIONNAIRES[v as usize];
     let f = g.fonction.load(Ordering::Acquire);
-    // SAFETY : une valeur non nulle n'a été écrite que par `allouer`, à
+    // SAFETY: une valeur non nulle n'a été écrite que par `allouer`, à
     // partir d'un `fn(usize)`.
     (f != 0).then(|| (unsafe { core::mem::transmute::<usize, fn(usize)>(f) }, g.argument.load(Ordering::Relaxed)))
 }

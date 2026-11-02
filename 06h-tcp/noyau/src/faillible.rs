@@ -85,12 +85,12 @@ pub fn boite_vide<T>() -> Result<Box<MaybeUninit<T>>, PlusDeMemoire> {
         #[allow(clippy::disallowed_methods)]
         return Ok(Box::new_uninit());
     }
-    // SAFETY : la taille n'est pas nulle (le seul cas interdit à alloc).
+    // SAFETY: la taille n'est pas nulle (le seul cas interdit à alloc).
     let p = unsafe { alloc(layout) } as *mut MaybeUninit<T>;
     if p.is_null() {
         return Err(PlusDeMemoire);
     }
-    // SAFETY : `p` vient d'être alloué par l'allocateur global avec le
+    // SAFETY: `p` vient d'être alloué par l'allocateur global avec le
     // Layout de son type : la documentation de Box le permet (« memory
     // layout », alloc::boxed). Un MaybeUninit n'a pas besoin d'être écrit.
     Ok(unsafe { Box::from_raw(p) })

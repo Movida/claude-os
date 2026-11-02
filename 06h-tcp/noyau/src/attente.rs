@@ -124,10 +124,11 @@ enum Genre {
     Rappel(*const dyn Rappel),
 }
 
-// SAFETY : une entrée n'est lue et écrite que par qui l'inscrit, avant de
+// SAFETY: une entrée n'est lue et écrite que par qui l'inscrit, avant de
 // l'inscrire et après l'avoir retirée, et sous le verrou de sa file entre
 // les deux.
 unsafe impl Sync for EntreeAttente {}
+// SAFETY: voir ci-dessus.
 unsafe impl Send for EntreeAttente {}
 
 impl EntreeAttente {
@@ -174,7 +175,7 @@ struct Liste {
     queue: *const EntreeAttente,
 }
 
-// SAFETY : la liste n'est touchée que sous son verrou, et ses entrées
+// SAFETY: la liste n'est touchée que sous son verrou, et ses entrées
 // restent à leur place tant qu'elles y sont (dans leur tâche, ou épinglées).
 unsafe impl Send for Liste {}
 
@@ -189,7 +190,7 @@ impl Liste {
         e.inscrite.set(true);
         let p: *const EntreeAttente = e;
         e.suivante.set(core::ptr::null());
-        // SAFETY : les entrées de la liste sont valables (dans leur tâche tenue, ou épinglées).
+        // SAFETY: les entrées de la liste sont valables (dans leur tâche tenue, ou épinglées).
         match unsafe { self.queue.as_ref() } {
             Some(q) => q.suivante.set(p),
             None => self.tete = p,
@@ -212,7 +213,7 @@ impl Liste {
     /// Délie `e`, qui suit `precedente` (nulle : `e` est en tête).
     fn delier(&mut self, precedente: *const EntreeAttente, e: &EntreeAttente) {
         let suivante = e.suivante.get();
-        // SAFETY : comme `placer`.
+        // SAFETY: comme `placer`.
         match unsafe { precedente.as_ref() } {
             Some(pr) => pr.suivante.set(suivante),
             None => self.tete = suivante,
@@ -230,7 +231,7 @@ impl Liste {
     fn chercher(&self, mut choisir: impl FnMut(&EntreeAttente) -> bool) -> Option<(*const EntreeAttente, *const EntreeAttente)> {
         let mut precedente: *const EntreeAttente = core::ptr::null();
         let mut p = self.tete;
-        // SAFETY : comme `placer`.
+        // SAFETY: comme `placer`.
         while let Some(e) = unsafe { p.as_ref() } {
             if choisir(e) {
                 return Some((precedente, p));
@@ -274,7 +275,7 @@ impl FileAttente {
     /// réveillé le premier (le plus chaud dans les caches).
     pub fn inscrire_exclusive_en_tete(&self) {
         let p = Arc::into_raw(tache::courante_arc());
-        // SAFETY : comme `inscrire_tache_en`.
+        // SAFETY: comme `inscrire_tache_en`.
         let e = unsafe { (*p).entree_attente() };
         let mut l = self.liste.verrouiller();
         e.genre.set(Genre::Tache(p));
@@ -297,7 +298,7 @@ impl FileAttente {
     fn inscrire_tache_en(&self, t: Arc<Tache>, exclusive: bool) {
         // Un Arc de plus, tenu par la file : la tâche vit tant qu'elle y est.
         let p = Arc::into_raw(t);
-        // SAFETY : `p` vient d'être tenu ; une tâche n'attend qu'une chose à
+        // SAFETY: `p` vient d'être tenu ; une tâche n'attend qu'une chose à
         // la fois, son entrée est donc libre (`placer` le vérifie).
         let e = unsafe { (*p).entree_attente() };
         let mut l = self.liste.verrouiller();
@@ -326,7 +327,7 @@ impl FileAttente {
     fn sortir_tache(l: &mut Liste, precedente: *const EntreeAttente, e: &EntreeAttente) -> Arc<Tache> {
         let t = tache_de(e).expect("une entree de rappel sortie comme une tache");
         l.delier(precedente, e);
-        // SAFETY : l'Arc pris par `inscrire_tache_en`, tenu par la file
+        // SAFETY: l'Arc pris par `inscrire_tache_en`, tenu par la file
         // jusqu'ici, passe à l'appelant.
         unsafe { Arc::from_raw(t) }
     }
@@ -341,7 +342,7 @@ impl FileAttente {
         let l = self.liste.verrouiller();
         let mut n = 0;
         l.chercher(|e| {
-            // SAFETY : la tâche d'une entrée inscrite est tenue par la file.
+            // SAFETY: la tâche d'une entrée inscrite est tenue par la file.
             n += tache_de(e).is_some_and(|t| choisir(unsafe { &*t })) as usize;
             false
         });
@@ -352,8 +353,9 @@ impl FileAttente {
     /// la rend (avec l'Arc que tenait la file).
     pub fn retirer_si(&self, mut choisir: impl FnMut(&Tache) -> bool) -> Option<Arc<Tache>> {
         let mut l = self.liste.verrouiller();
-        // SAFETY : comme `compter` ; l'entrée trouvée est inscrite.
+        // SAFETY: comme `compter` ; l'entrée trouvée est inscrite.
         let (precedente, e) = l.chercher(|e| tache_de(e).is_some_and(|t| choisir(unsafe { &*t })))?;
+        // SAFETY: l'entrée trouvée est inscrite, sous le verrou de la file.
         Some(Self::sortir_tache(&mut l, precedente, unsafe { &*e }))
     }
 
@@ -379,12 +381,12 @@ impl FileAttente {
         let mut reste = exclusives;
         let mut precedente: *const EntreeAttente = core::ptr::null();
         let mut p = l.tete;
-        // SAFETY : comme `Liste::placer`.
+        // SAFETY: comme `Liste::placer`.
         while let Some(e) = unsafe { p.as_ref() } {
             let suivante = e.suivante.get();
             let reveille = match e.genre.get() {
                 Genre::Tache(t) => {
-                    // SAFETY : l'Arc de la file tient la tâche ; on en
+                    // SAFETY: l'Arc de la file tient la tâche ; on en
                     // prend un pour le réveil.
                     let a = unsafe {
                         Arc::increment_strong_count(t);
@@ -396,7 +398,7 @@ impl FileAttente {
                     }
                     reveillee
                 }
-                // SAFETY : `qui` reste valable tant que l'entrée est
+                // SAFETY: `qui` reste valable tant que l'entrée est
                 // inscrite (`preparer_rappel`).
                 Genre::Rappel(qui) => unsafe { (*qui).rappel(cle) },
             };
@@ -607,7 +609,7 @@ struct EtatMutex {
     file: FileAttente,
 }
 
-// SAFETY : la donnée n'est touchée qu'à travers une GardeMutex, et `pris`
+// SAFETY: la donnée n'est touchée qu'à travers une GardeMutex, et `pris`
 // garantit qu'il n'en existe qu'une à la fois.
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
@@ -671,14 +673,14 @@ pub struct GardeMutex<'a, T> {
 impl<T> Deref for GardeMutex<'_, T> {
     type Target = T;
     fn deref(&self) -> &T {
-        // SAFETY : la garde prouve qu'on tient le Mutex.
+        // SAFETY: la garde prouve qu'on tient le Mutex.
         unsafe { &*self.mutex.donnee.get() }
     }
 }
 
 impl<T> DerefMut for GardeMutex<'_, T> {
     fn deref_mut(&mut self) -> &mut T {
-        // SAFETY : idem, et &mut self garantit l'exclusivité locale.
+        // SAFETY: idem, et &mut self garantit l'exclusivité locale.
         unsafe { &mut *self.mutex.donnee.get() }
     }
 }
@@ -752,9 +754,10 @@ pub struct Possession<T: Possede> {
     pub(crate) file: FileAttente,
 }
 
-// SAFETY : la donnée n'est touchée que par le possesseur (au plus un, par
+// SAFETY: la donnée n'est touchée que par le possesseur (au plus un, par
 // `possede`), ou sous le verrou court quand personne ne possède.
 unsafe impl<T: Possede + Send> Sync for Possession<T> where T::Court: Send, T::Element: Send {}
+// SAFETY: voir ci-dessus.
 unsafe impl<T: Possede + Send> Send for Possession<T> where T::Court: Send, T::Element: Send {}
 
 impl<T: Possede> Possession<T> {
@@ -808,7 +811,7 @@ impl<T: Possede> Possession<T> {
             c.taille += taille;
             return true;
         }
-        // SAFETY : personne ne possède, et le verrou court est tenu : nul
+        // SAFETY: personne ne possède, et le verrou court est tenu : nul
         // autre ne touche la donnée.
         let d = unsafe { &mut *self.donnee.get() };
         d.traiter(e);
@@ -833,7 +836,7 @@ impl<T: Possede> Possession<T> {
             c.minuteur = true;
             return;
         }
-        // SAFETY : comme `du_reseau`.
+        // SAFETY: comme `du_reseau`.
         let d = unsafe { &mut *self.donnee.get() };
         d.minuteur();
         let m = d.publier(&mut c.premier);
@@ -863,7 +866,7 @@ impl<T: Possede> Possession<T> {
                 c.taille = 0;
                 (core::mem::take(&mut c.file), core::mem::take(&mut c.minuteur))
             };
-            // SAFETY : nous possédons : nul autre ne touche la donnée (la
+            // SAFETY: nous possédons : nul autre ne touche la donnée (la
             // réception, qui voit `possede`, met ce qui arrive dans la file).
             let d = unsafe { &mut *self.donnee.get() };
             while let Some(e) = file.pop_front() {
@@ -892,7 +895,7 @@ pub struct Garde<'a, T: Possede> {
 impl<'a, T: Possede> Garde<'a, T> {
     /// La donnée.
     pub fn donnee(&mut self) -> &mut T {
-        // SAFETY : la garde prouve qu'on possède ; `&mut self` garantit
+        // SAFETY: la garde prouve qu'on possède ; `&mut self` garantit
         // l'exclusivité locale.
         unsafe { &mut *self.p.donnee.get() }
     }
@@ -900,7 +903,7 @@ impl<'a, T: Possede> Garde<'a, T> {
     /// La donnée et le premier étage ensemble, sous le verrou court.
     pub fn avec_court<R>(&mut self, f: impl FnOnce(&mut T, &mut T::Court) -> R) -> R {
         let mut c = self.p.court.verrouiller();
-        // SAFETY : on possède.
+        // SAFETY: on possède.
         f(unsafe { &mut *self.p.donnee.get() }, &mut c.premier)
     }
 

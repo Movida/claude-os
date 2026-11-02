@@ -80,7 +80,7 @@ struct Liens {
 /// `objet` doit être un objet libre du tas (personne d'autre ne s'en sert),
 /// d'au moins 16 octets, aligné sur 8.
 unsafe fn liens(objet: usize) -> &'static mut Liens {
-    // SAFETY : garanti par l'appelant.
+    // SAFETY: garanti par l'appelant.
     unsafe { &mut *(objet as *mut Liens) }
 }
 
@@ -119,7 +119,7 @@ impl Tas {
             return null_mut();
         }
         let objet = self.libres[c];
-        // SAFETY : `objet` est le premier objet libre de la classe.
+        // SAFETY: `objet` est le premier objet libre de la classe.
         unsafe { self.retirer(c, objet) };
         pages::compter_objets(page_de(objet), true);
         objet as *mut u8
@@ -130,7 +130,7 @@ impl Tas {
     /// utilisé.
     unsafe fn liberer(&mut self, c: usize, objet: *mut u8) {
         let objet = objet as usize;
-        // SAFETY : garanti par l'appelant.
+        // SAFETY: garanti par l'appelant.
         unsafe { self.inserer(c, objet) };
         let page = page_de(objet);
         if pages::compter_objets(page, false) == 0 {
@@ -138,7 +138,7 @@ impl Tas {
             // en retire, et la page retourne à l'allocateur de pages.
             let debut = objet & !(PAGE - 1);
             for o in (debut..debut + PAGE).step_by(PLUS_PETITE << c) {
-                // SAFETY : un objet de la page vide, donc libre.
+                // SAFETY: un objet de la page vide, donc libre.
                 unsafe { self.retirer(c, o) };
             }
             pages::liberer(page, 0);
@@ -152,7 +152,7 @@ impl Tas {
     /// hors de la liste.
     unsafe fn inserer(&mut self, c: usize, objet: usize) {
         let tete = self.libres[c];
-        // SAFETY : `objet` est libre (l'appelant), `tete` aussi.
+        // SAFETY: `objet` est libre (l'appelant), `tete` aussi.
         unsafe {
             *liens(objet) = Liens { suivant: tete, precedent: 0 };
             if tete != 0 {
@@ -167,7 +167,7 @@ impl Tas {
     /// # Safety
     /// `objet` doit être dans cette liste.
     unsafe fn retirer(&mut self, c: usize, objet: usize) {
-        // SAFETY : `objet` et ses voisins sont des objets libres de la liste.
+        // SAFETY: `objet` et ses voisins sont des objets libres de la liste.
         unsafe {
             let Liens { suivant, precedent } = *liens(objet);
             if precedent == 0 {
@@ -188,14 +188,14 @@ impl Tas {
         let debut = espace::virtuelle(page) as usize;
         // À l'envers, pour que la liste les donne ensuite dans l'ordre.
         for objet in (debut..debut + PAGE).step_by(PLUS_PETITE << c).rev() {
-            // SAFETY : la page vient d'être allouée, ses objets sont à nous.
+            // SAFETY: la page vient d'être allouée, ses objets sont à nous.
             unsafe { self.inserer(c, objet) };
         }
         true
     }
 }
 
-// SAFETY : les blocs rendus sont à nous jusqu'à leur libération, alignés
+// SAFETY: les blocs rendus sont à nous jusqu'à leur libération, alignés
 // comme demandé (voir `classe` et `ordre`), et le verrou empêche deux
 // allocations de se croiser, même depuis une interruption.
 unsafe impl GlobalAlloc for Allocateur {
@@ -209,7 +209,7 @@ unsafe impl GlobalAlloc for Allocateur {
 
     unsafe fn dealloc(&self, objet: *mut u8, layout: Layout) {
         match classe(layout) {
-            // SAFETY : `objet` vient de `alloc` avec ce `layout` (contrat de
+            // SAFETY: `objet` vient de `alloc` avec ce `layout` (contrat de
             // GlobalAlloc), donc de cette classe.
             Some(c) => unsafe { TAS.verrouiller().liberer(c, objet) },
             None => pages::liberer(espace::physique(objet as u64), ordre(layout)),

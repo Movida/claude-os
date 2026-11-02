@@ -9,7 +9,7 @@ const COM1: u16 = 0x3F8;
 
 /// Programme l'UART : 115200 bauds, 8 bits, sans parité, 1 bit de stop.
 pub fn initialiser() {
-    // SAFETY : ce sont les registres documentés du 16550 de COM1, dans
+    // SAFETY: ce sont les registres documentés du 16550 de COM1, dans
     // l'ordre prévu par sa fiche technique.
     unsafe {
         port::ecrire(COM1 + 1, 0x00); // IER : aucune interruption de l'UART.
@@ -24,7 +24,7 @@ pub fn initialiser() {
 
 /// Envoie un octet, en attendant que le registre d'émission soit libre.
 pub fn ecrire_octet(octet: u8) {
-    // SAFETY : lecture du registre d'état (LSR) puis écriture du registre
+    // SAFETY: lecture du registre d'état (LSR) puis écriture du registre
     // de données de COM1, sans effet sur le reste de la machine.
     unsafe {
         while port::lire(COM1 + 5) & 0x20 == 0 {}

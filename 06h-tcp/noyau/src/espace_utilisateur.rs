@@ -171,7 +171,7 @@ pub fn adresse_permise(adresse: u64) -> bool {
 /// (pages::allouer_pour_programme).
 fn cadre_neuf() -> Option<u64> {
     let cadre = pages::allouer_pour_programme()?;
-    // SAFETY : le cadre vient d'être alloué, personne d'autre ne le voit.
+    // SAFETY: le cadre vient d'être alloué, personne d'autre ne le voit.
     // Il contenait ce qu'y avait laissé son précédent occupant (le noyau,
     // un autre programme) : le donner tel quel ferait fuir ces données.
     unsafe { core::ptr::write_bytes(espace::virtuelle(cadre) as *mut u8, 0, PAGE as usize) };
@@ -206,7 +206,7 @@ impl EspaceUtilisateur {
     /// Un espace neuf : moitié basse vide, moitié haute du noyau.
     pub fn creer() -> Result<EspaceUtilisateur, Erreur> {
         let pml4 = pages::allouer_pour_programme().ok_or(Erreur::PlusDeMemoire)?;
-        // SAFETY : `pml4` vient d'être alloué, il est à nous ; la PML4 du
+        // SAFETY: `pml4` vient d'être alloué, il est à nous ; la PML4 du
         // noyau est une table en place, qu'on ne fait que lire.
         unsafe {
             let nouvelle = &mut *(espace::virtuelle(pml4) as *mut [u64; 512]);
@@ -255,7 +255,7 @@ impl EspaceUtilisateur {
     fn entree(&mut self, adresse: u64) -> Result<&'static mut u64, Erreur> {
         let mut table = self.pml4;
         for niveau in (1..4).rev() {
-            // SAFETY : `table` est une table de cet espace (la PML4, ou une
+            // SAFETY: `table` est une table de cet espace (la PML4, ou une
             // table que désigne une entrée présente), que nous possédons.
             let e = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, niveau)] };
             if *e & PRESENTE == 0 {
@@ -266,7 +266,7 @@ impl EspaceUtilisateur {
             }
             table = *e & ADRESSE;
         }
-        // SAFETY : `table` est maintenant une PT de cet espace.
+        // SAFETY: `table` est maintenant une PT de cet espace.
         Ok(unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, 0)] })
     }
 
@@ -311,7 +311,7 @@ impl EspaceUtilisateur {
         if !present || (ecriture && (cadre == zeros || a_copier)) {
             let neuve = if ecriture { self.prendre_cadre()? } else { zeros };
             if ecriture && a_copier {
-                // SAFETY : `neuve` vient d'être allouée, à nous ; `cadre` est
+                // SAFETY: `neuve` vient d'être allouée, à nous ; `cadre` est
                 // tenu par cette entrée (il ne sera lâché qu'après) : deux
                 // pages distinctes, entières, dans la projection directe.
                 unsafe {
@@ -348,14 +348,14 @@ impl EspaceUtilisateur {
         }
         let mut table = self.pml4;
         for niveau in (1..4).rev() {
-            // SAFETY : `table` est une de nos tables.
+            // SAFETY: `table` est une de nos tables.
             let e = unsafe { pagination::lire_table(table) }[pagination::index(page, niveau)];
             if e & PRESENTE == 0 {
                 return false;
             }
             table = e & ADRESSE;
         }
-        // SAFETY : une PT de cet espace.
+        // SAFETY: une PT de cet espace.
         occupee(unsafe { pagination::lire_table(table) }[pagination::index(page, 0)])
     }
 
@@ -453,7 +453,7 @@ impl EspaceUtilisateur {
             }
             Visite::Table(entree) => {
                 let table = *entree & ADRESSE;
-                // SAFETY : une table de cet espace, que nous possédons.
+                // SAFETY: une table de cet espace, que nous possédons.
                 if rendre_tables && unsafe { pagination::lire_table(table) }.iter().all(|&e| e == 0) {
                     *entree = 0;
                     lot.rendre_table(table);
@@ -513,7 +513,7 @@ impl EspaceUtilisateur {
             let decalage = (a % PAGE) as usize;
             let n = (PAGE as usize - decalage).min(octets.len() - fait);
             let (cadre, _) = self.traduire(a / PAGE * PAGE).ok_or(Erreur::NonProjetee)?;
-            // SAFETY : `cadre` est une page de cet espace (traduire l'a
+            // SAFETY: `cadre` est une page de cet espace (traduire l'a
             // trouvée dans ses tables), que nous possédons ; on y écrit
             // `n` octets à partir de `decalage`, sans sortir de la page.
             unsafe {
@@ -535,7 +535,7 @@ impl EspaceUtilisateur {
             let decalage = (a % PAGE) as usize;
             let n = (PAGE as usize - decalage).min(octets.len() - fait);
             let (cadre, _) = self.traduire(a / PAGE * PAGE).ok_or(Erreur::NonProjetee)?;
-            // SAFETY : comme dans `ecrire`, en lecture.
+            // SAFETY: comme dans `ecrire`, en lecture.
             unsafe {
                 let source = (espace::virtuelle(cadre) as *const u8).add(decalage);
                 core::ptr::copy_nonoverlapping(source, octets[fait..].as_mut_ptr(), n);
@@ -556,7 +556,7 @@ impl EspaceUtilisateur {
         }
         let mut table = self.pml4;
         for niveau in (0..4).rev() {
-            // SAFETY : `table` est une de nos tables (la PML4, puis celles
+            // SAFETY: `table` est une de nos tables (la PML4, puis celles
             // que désignent ses entrées présentes).
             let e = unsafe { pagination::lire_table(table) }[pagination::index(adresse, niveau)];
             if e & PRESENTE == 0 {
@@ -601,7 +601,7 @@ fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl F
     let mut adresse = debut;
     while adresse < fin {
         let suivante = (adresse / couverture + 1) * couverture;
-        // SAFETY : `table` est une table de cet espace (la PML4, ou une
+        // SAFETY: `table` est une table de cet espace (la PML4, ou une
         // table que désigne une entrée présente), que nous possédons ;
         // l'espace n'est changé que sous le verrou de son processus, que
         // tient l'appelant (ou par sa dernière tâche, qui l'a retiré de la
@@ -712,7 +712,7 @@ impl Drop for Lot {
 fn rendre(table: u64, niveau: u32) {
     let entrees = if niveau == 3 { 256 } else { 512 };
     for i in 0..entrees {
-        // SAFETY : `table` est une table de l'espace, plus utilisée par
+        // SAFETY: `table` est une table de l'espace, plus utilisée par
         // personne (voir Drop).
         let e = unsafe { pagination::lire_table(table) }[i];
         if !(e & PRESENTE != 0 || niveau == 0 && occupee(e)) {
@@ -742,7 +742,7 @@ impl Drop for EspaceUtilisateur {
         // tables dont le processeur se sert encore. La PML4 du noyau a la
         // même moitié haute : l'exécution continue sans heurt.
         if pagination::courante() == self.pml4 {
-            // SAFETY : la PML4 du noyau est complète.
+            // SAFETY: la PML4 du noyau est complète.
             unsafe { pagination::activer(pagination::pml4_noyau()) };
         }
         rendre(self.pml4, 3);

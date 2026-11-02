@@ -145,7 +145,7 @@ fn interruption_configuration(_: usize) {
 /// L'adresse de la carte, passée en argument aux gestionnaires de ses
 /// files.
 fn carte_de(argument: usize) -> &'static Carte {
-    // SAFETY : l'argument est l'adresse d'une `Carte` laissée pour toujours
+    // SAFETY: l'argument est l'adresse d'une `Carte` laissée pour toujours
     // dans le tas (`ouvrir`), donné à `irq::allouer` par elle seule.
     unsafe { &*(argument as *const Carte) }
 }
@@ -395,7 +395,7 @@ impl Carte {
         }
         let Some(case) = e.libres.pop() else { return false };
         let physique = self.pages_emission.adresse(case);
-        // SAFETY : la case est à nous (libre, pas dans l'anneau), 2 Kio dans
+        // SAFETY: la case est à nous (libre, pas dans l'anneau), 2 Kio dans
         // une page vue par la projection directe ; la trame y tient (vérifié).
         unsafe {
             let o = espace::virtuelle(physique) as *mut u8;
@@ -452,7 +452,7 @@ impl Carte {
             for (k, &(jeton, longueur)) in lot[..n].iter().enumerate() {
                 let longueur = longueur as usize;
                 let physique = self.pages_reception.adresse(jeton as u16);
-                // SAFETY : la carte nous a rendu ce tampon (obtenir), elle
+                // SAFETY: la carte nous a rendu ce tampon (obtenir), elle
                 // n'y écrit plus jusqu'à ce qu'on le lui redonne ; la
                 // longueur est bornée à celle du tampon.
                 let octets = unsafe { core::slice::from_raw_parts(espace::virtuelle(physique) as *const u8, longueur.min(TAILLE_TAMPON as usize)) };

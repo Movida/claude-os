@@ -106,7 +106,7 @@ impl fmt::Display for Nom<'_> {
 /// temps du déballage (voir `demarrer`).
 fn archive() -> Option<&'static [u8]> {
     let etendue = demarrage::archive()?;
-    // SAFETY : l'étendue est celle que le chargeur a remplie avec l'archive ;
+    // SAFETY: l'étendue est celle que le chargeur a remplie avec l'archive ;
     // l'allocateur de démarrage l'a réservée (cadres.rs), elle n'a donc été
     // donnée à personne d'autre, et personne ne l'écrit. Elle est dans la
     // mémoire libre de la carte (le chargeur l'a vérifié), donc dans la

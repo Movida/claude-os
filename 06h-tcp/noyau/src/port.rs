@@ -14,9 +14,11 @@ use core::arch::asm;
 
 /// Écrit un octet sur un port.
 pub unsafe fn ecrire(port: u16, valeur: u8) {
-    // nomem : ne touche pas la mémoire ; nostack : pas la pile ;
+    // SAFETY: le port et la valeur, garantis par l'appelant (voir
+    // l'en-tête). nomem : ne touche pas la mémoire ; nostack : pas la pile ;
     // preserves_flags : ne modifie pas les drapeaux. Ces promesses laissent
     // le compilateur optimiser le code autour.
+    // SAFETY: comme `ecrire`.
     unsafe {
         asm!("out dx, al", in("dx") port, in("al") valeur,
              options(nomem, nostack, preserves_flags));
@@ -26,6 +28,7 @@ pub unsafe fn ecrire(port: u16, valeur: u8) {
 /// Lit un octet sur un port.
 pub unsafe fn lire(port: u16) -> u8 {
     let valeur: u8;
+    // SAFETY: comme `ecrire`.
     unsafe {
         asm!("in al, dx", in("dx") port, out("al") valeur,
              options(nomem, nostack, preserves_flags));
@@ -35,6 +38,7 @@ pub unsafe fn lire(port: u16) -> u8 {
 
 /// Écrit un mot de 16 bits sur un port.
 pub unsafe fn ecrire16(port: u16, valeur: u16) {
+    // SAFETY: comme `ecrire`.
     unsafe {
         asm!("out dx, ax", in("dx") port, in("ax") valeur,
              options(nomem, nostack, preserves_flags));
@@ -44,6 +48,7 @@ pub unsafe fn ecrire16(port: u16, valeur: u16) {
 /// Lit un mot de 16 bits sur un port.
 pub unsafe fn lire16(port: u16) -> u16 {
     let valeur: u16;
+    // SAFETY: comme `ecrire`.
     unsafe {
         asm!("in ax, dx", in("dx") port, out("ax") valeur,
              options(nomem, nostack, preserves_flags));
@@ -53,6 +58,7 @@ pub unsafe fn lire16(port: u16) -> u16 {
 
 /// Écrit un mot de 32 bits sur un port.
 pub unsafe fn ecrire32(port: u16, valeur: u32) {
+    // SAFETY: comme `ecrire`.
     unsafe {
         asm!("out dx, eax", in("dx") port, in("eax") valeur,
              options(nomem, nostack, preserves_flags));
@@ -62,6 +68,7 @@ pub unsafe fn ecrire32(port: u16, valeur: u32) {
 /// Lit un mot de 32 bits sur un port.
 pub unsafe fn lire32(port: u16) -> u32 {
     let valeur: u32;
+    // SAFETY: comme `ecrire`.
     unsafe {
         asm!("in eax, dx", in("dx") port, out("eax") valeur,
              options(nomem, nostack, preserves_flags));

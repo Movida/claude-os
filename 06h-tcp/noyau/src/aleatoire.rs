@@ -99,7 +99,7 @@ fn a_rdseed() -> bool {
 fn rdrand() -> Option<u64> {
     for _ in 0..ESSAIS {
         let (valeur, ok): (u64, u8);
-        // SAFETY : RDRAND existe (a_rdrand), et ne fait que rendre un nombre.
+        // SAFETY: RDRAND existe (a_rdrand), et ne fait que rendre un nombre.
         unsafe { asm!("rdrand {v}", "setc {ok}", v = out(reg) valeur, ok = out(reg_byte) ok, options(nomem, nostack)) };
         if ok != 0 {
             return Some(valeur);
@@ -111,7 +111,7 @@ fn rdrand() -> Option<u64> {
 fn rdseed() -> Option<u64> {
     for _ in 0..ESSAIS {
         let (valeur, ok): (u64, u8);
-        // SAFETY : RDSEED existe (a_rdseed), et ne fait que rendre un nombre.
+        // SAFETY: RDSEED existe (a_rdseed), et ne fait que rendre un nombre.
         unsafe { asm!("rdseed {v}", "setc {ok}", v = out(reg) valeur, ok = out(reg_byte) ok, options(nomem, nostack)) };
         if ok != 0 {
             return Some(valeur);
@@ -123,7 +123,7 @@ fn rdseed() -> Option<u64> {
 /// Le compteur de cycles (le `random_get_entropy` de Linux sur x86).
 fn cycles() -> u64 {
     let (bas, haut): (u32, u32);
-    // SAFETY : RDTSC ne fait que lire le compteur de cycles.
+    // SAFETY: RDTSC ne fait que lire le compteur de cycles.
     unsafe { asm!("rdtsc", out("eax") bas, out("edx") haut, options(nomem, nostack)) };
     (haut as u64) << 32 | bas as u64
 }

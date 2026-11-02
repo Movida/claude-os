@@ -116,7 +116,7 @@ pub fn resolution(h: u64) -> Temps {
 }
 
 fn lire_registre(r: u8) -> u8 {
-    // SAFETY : les ports de l'horloge CMOS ; le bit 7 de l'index à 0 laisse
+    // SAFETY: les ports de l'horloge CMOS ; le bit 7 de l'index à 0 laisse
     // les NMI actifs. Sous le verrou CMOS, que tient l'appelant.
     unsafe {
         port::ecrire(CMOS_INDEX, r);

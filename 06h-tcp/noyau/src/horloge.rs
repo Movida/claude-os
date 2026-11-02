@@ -107,7 +107,7 @@ pub fn initialiser(apic: bool) -> Source {
         // Le PIT arrêté, comme le `pit_shutdown` de Linux : le canal 0 en
         // mode 0 (un seul compte à rebours, sans recharge), décompte nul.
         // Son IRQ n'a jamais été démasquée.
-        // SAFETY : registres documentés du PIT.
+        // SAFETY: registres documentés du PIT.
         unsafe {
             port::ecrire(PIT_COMMANDE, 0x30);
             port::ecrire(PIT_CANAL0, 0);
@@ -115,7 +115,7 @@ pub fn initialiser(apic: bool) -> Source {
         }
         return Source::Apic(hz);
     }
-    // SAFETY : registres documentés du PIT (commande, puis canal 0).
+    // SAFETY: registres documentés du PIT (commande, puis canal 0).
     unsafe {
         // Octet de commande 0x34 = 00 11 010 0 :
         //   00  : canal 0,

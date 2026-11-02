@@ -138,7 +138,7 @@ pub fn garde_touchee(adresse: u64) -> Option<&'static str> {
 /// `physique` doit être une table de pages qui n'appartient qu'à nous, et
 /// projetée.
 unsafe fn table(physique: u64) -> &'static mut Table {
-    // SAFETY : garanti par l'appelant.
+    // SAFETY: garanti par l'appelant.
     unsafe { &mut *(espace::virtuelle(physique) as *mut Table) }
 }
 
@@ -162,7 +162,7 @@ fn nouvelle_table() -> Option<u64> {
         assert!(cadre < LIMITE_DEMARRAGE, "table de pages au-dela du 1er Gio : {cadre:#x}");
         cadre
     };
-    // SAFETY : le cadre vient d'être alloué, et la projection directe le
+    // SAFETY: le cadre vient d'être alloué, et la projection directe le
     // couvre (voir plus haut).
     let t = unsafe { table(cadre) };
     t.fill(0);
@@ -174,7 +174,7 @@ fn nouvelle_table() -> Option<u64> {
 /// plus de « présente, inscriptible »), et on rend son adresse. None : plus
 /// de mémoire pour une nouvelle table.
 fn suivante(parent: u64, index: usize, droits: u64) -> Option<u64> {
-    // SAFETY : `parent` est une de nos tables, créée par nouvelle_table.
+    // SAFETY: `parent` est une de nos tables, créée par nouvelle_table.
     let entree = &mut unsafe { table(parent) }[index];
     if *entree & PRESENTE == 0 {
         *entree = nouvelle_table()? | PRESENTE | ECRITURE | droits;
@@ -195,7 +195,7 @@ fn entree(pml4: u64, virtuelle: u64) -> Option<&'static mut u64> {
     let pdpt = suivante(pml4, index(virtuelle, 3), u)?;
     let pd = suivante(pdpt, index(virtuelle, 2), u)?;
     let pt = suivante(pd, index(virtuelle, 1), u)?;
-    // SAFETY : `pt` est une de nos tables.
+    // SAFETY: `pt` est une de nos tables.
     Some(&mut unsafe { table(pt) }[index(virtuelle, 0)])
 }
 
@@ -220,7 +220,7 @@ pub fn preparer(pml4: u64, virtuelle: u64) -> Option<()> {
 fn entree_existante(pml4: u64, virtuelle: u64) -> Option<&'static mut u64> {
     let mut t = pml4;
     for niveau in (1..=3).rev() {
-        // SAFETY : `t` est une de nos tables (la PML4, puis ce que ses
+        // SAFETY: `t` est une de nos tables (la PML4, puis ce que ses
         // entrées présentes désignent).
         let e = unsafe { table(t) }[index(virtuelle, niveau)];
         if e & PRESENTE == 0 || e & GRANDE != 0 {
@@ -228,7 +228,7 @@ fn entree_existante(pml4: u64, virtuelle: u64) -> Option<&'static mut u64> {
         }
         t = e & ADRESSE;
     }
-    // SAFETY : `t` est une PT présente.
+    // SAFETY: `t` est une PT présente.
     Some(&mut unsafe { table(t) }[index(virtuelle, 0)])
 }
 
@@ -265,7 +265,7 @@ pub fn pml4_noyau() -> u64 {
 /// # Safety
 /// Comme `table` : une de nos tables, projetée.
 pub unsafe fn lire_table(physique: u64) -> &'static Table {
-    // SAFETY : garanti par l'appelant.
+    // SAFETY: garanti par l'appelant.
     unsafe { table(physique) }
 }
 
@@ -275,7 +275,7 @@ pub unsafe fn lire_table(physique: u64) -> &'static Table {
 /// Comme `table` : une de nos tables, projetée, que personne d'autre ne
 /// modifie en même temps.
 pub unsafe fn table_modifiable(physique: u64) -> &'static mut Table {
-    // SAFETY : garanti par l'appelant.
+    // SAFETY: garanti par l'appelant.
     unsafe { table(physique) }
 }
 
@@ -286,7 +286,7 @@ pub unsafe fn table_modifiable(physique: u64) -> &'static mut Table {
 /// doivent l'oublier aussi : une interruption entre processeurs (IPI), le
 /// « TLB shootdown » de Linux. De même pour `vider_tlb`.
 pub fn invalider(adresse: u64) {
-    // SAFETY : invlpg ne fait qu'oublier une traduction ; le processeur la
+    // SAFETY: invlpg ne fait qu'oublier une traduction ; le processeur la
     // relira dans les tables.
     unsafe { asm!("invlpg [{}]", in(reg) adresse, options(nostack)) };
 }
@@ -295,7 +295,7 @@ pub fn invalider(adresse: u64) {
 /// rechargeant CR3 avec la même PML4 : plus rapide que des dizaines
 /// d'invlpg (voir espace_utilisateur.rs, Lot).
 pub fn vider_tlb() {
-    // SAFETY : on recharge la PML4 déjà en service : rien ne change, sinon
+    // SAFETY: on recharge la PML4 déjà en service : rien ne change, sinon
     // que le processeur relira les tables.
     unsafe { asm!("mov {t}, cr3", "mov cr3, {t}", t = out(reg) _, options(nostack)) };
 }
@@ -308,14 +308,14 @@ pub fn vider_tlb() {
 /// `pml4` doit être une PML4 complète, dont la moitié haute est celle du
 /// noyau (sinon, l'instruction suivante est introuvable).
 pub unsafe fn activer(pml4: u64) {
-    // SAFETY : garanti par l'appelant.
+    // SAFETY: garanti par l'appelant.
     unsafe { asm!("mov cr3, {}", in(reg) pml4, options(nostack)) };
 }
 
 /// La PML4 courante (CR3, sans ses bits de contrôle).
 pub fn courante() -> u64 {
     let cr3: u64;
-    // SAFETY : lecture d'un registre de contrôle, sans effet.
+    // SAFETY: lecture d'un registre de contrôle, sans effet.
     unsafe { asm!("mov {}, cr3", out(reg) cr3, options(nomem, nostack)) };
     cr3 & ADRESSE
 }
@@ -325,7 +325,7 @@ pub fn courante() -> u64 {
 fn projeter_2mio(pml4: u64, virtuelle: u64, physique: u64, droits: u64) {
     let pdpt = suivante(pml4, index(virtuelle, 3), 0).expect(PLUS_DE_TABLES);
     let pd = suivante(pdpt, index(virtuelle, 2), 0).expect(PLUS_DE_TABLES);
-    // SAFETY : `pd` est une de nos tables.
+    // SAFETY: `pd` est une de nos tables.
     let pd = unsafe { table(pd) };
     pd[index(virtuelle, 1)] = physique | PRESENTE | GRANDE | droits;
 }
@@ -351,7 +351,7 @@ fn a_le_bit_nx() -> bool {
     if (fabricant.ebx, fabricant.edx, fabricant.ecx) != (0x756e_6547, 0x4965_6e69, 0x6c65_746e) {
         return false;
     }
-    // SAFETY : IA32_MISC_ENABLE (0x1A0) existe sur tout processeur Intel 64
+    // SAFETY: IA32_MISC_ENABLE (0x1A0) existe sur tout processeur Intel 64
     // bits ; effacer le bit 34 ne fait que rendre NX visible.
     unsafe {
         asm!(
@@ -458,7 +458,7 @@ pub fn initialiser() -> Bilan {
     //   - CR3 : l'adresse physique de la nouvelle PML4. L'écrire vide aussi
     //     le cache des traductions (TLB) : plus rien de l'ancien arbre ne
     //     sert.
-    // SAFETY : les nouvelles tables projettent tout ce dont le noyau se sert
+    // SAFETY: les nouvelles tables projettent tout ce dont le noyau se sert
     // (son image, la mémoire par la projection directe), aux mêmes adresses
     // virtuelles qu'avant ; l'exécution continue donc sans heurt.
     unsafe {

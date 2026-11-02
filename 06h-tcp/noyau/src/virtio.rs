@@ -174,7 +174,7 @@ macro_rules! acces {
     ($lire:ident, $ecrire:ident, $t:ty) => {
         fn $lire(f: &Fenetre, position: u64) -> $t {
             debug_assert!(position + size_of::<$t>() as u64 <= f.longueur as u64);
-            // SAFETY : la fenêtre est projetée sans cache sur toute sa
+            // SAFETY: la fenêtre est projetée sans cache sur toute sa
             // longueur, la position y est (les appelants passent des
             // positions de la spécification, vérifiées contre la longueur à
             // la projection) ; un accès aligné de la largeur du champ.
@@ -182,7 +182,7 @@ macro_rules! acces {
         }
         fn $ecrire(f: &Fenetre, position: u64, valeur: $t) {
             debug_assert!(position + size_of::<$t>() as u64 <= f.longueur as u64);
-            // SAFETY : comme la lecture.
+            // SAFETY: comme la lecture.
             unsafe { ((f.adresse + position) as *mut $t).write_volatile(valeur) }
         }
     };
@@ -387,7 +387,7 @@ pub struct Notifieur {
 
 impl Notifieur {
     pub fn notifier(&self) {
-        // SAFETY : une adresse de la zone de notification projetée, que
+        // SAFETY: une adresse de la zone de notification projetée, que
         // `installer_file` a vérifiée ; la projection vit autant que la
         // carte, et la carte toujours.
         unsafe { (self.adresse as *mut u16).write_volatile(self.file) }

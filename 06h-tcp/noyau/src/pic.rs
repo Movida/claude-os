@@ -47,7 +47,7 @@ const LIRE_ISR: u8 = 0x0B;
 /// d'origine avait besoin de ce délai entre deux commandes. Linux fait de
 /// même (outb_p, « p » comme pause).
 fn pause() {
-    // SAFETY : le port 0x80 n'est relié à rien qui compte.
+    // SAFETY: le port 0x80 n'est relié à rien qui compte.
     unsafe { port::ecrire(0x80, 0) };
 }
 
@@ -58,7 +58,7 @@ pub fn initialiser() {
     // La séquence d'initialisation est imposée par la fiche technique :
     // ICW1 sur le port de commande, puis ICW2, ICW3, ICW4 sur le port de
     // données (ICW = Initialization Command Word).
-    // SAFETY : ports documentés des deux 8259, séquence de la fiche
+    // SAFETY: ports documentés des deux 8259, séquence de la fiche
     // technique d'Intel ; les IRQ restent masquées pendant ce temps.
     unsafe {
         // ICW1 : 0x11 = « initialisation, il y aura un ICW4, mode cascade ».
@@ -102,7 +102,7 @@ fn controleur(irq: u8) -> (u16, u8) {
 /// Masque toutes les IRQ, la cascade comprise : le 8259 ne livre plus
 /// rien (quand l'IO-APIC le remplace, irq.rs).
 pub fn masquer_tout() {
-    // SAFETY : les registres de masque des deux contrôleurs.
+    // SAFETY: les registres de masque des deux contrôleurs.
     unsafe {
         port::ecrire(MAITRE_DONNEES, 0xFF);
         port::ecrire(ESCLAVE_DONNEES, 0xFF);
@@ -112,7 +112,7 @@ pub fn masquer_tout() {
 /// Laisse passer une IRQ.
 pub fn demasquer(irq: u8) {
     let (port_masque, ligne) = controleur(irq);
-    // SAFETY : lecture-modification-écriture du masque, qui ne touche que
+    // SAFETY: lecture-modification-écriture du masque, qui ne touche que
     // le bit de cette ligne.
     unsafe {
         let masque = port::lire(port_masque);
@@ -123,7 +123,7 @@ pub fn demasquer(irq: u8) {
 /// Lit le registre ISR (In-Service Register) des deux contrôleurs : les
 /// IRQ transmises au CPU et pas encore acquittées par un EOI.
 fn en_service() -> u16 {
-    // SAFETY : OCW3 ne fait que choisir le registre que rendra la
+    // SAFETY: OCW3 ne fait que choisir le registre que rendra la
     // prochaine lecture du port de commande.
     unsafe {
         port::ecrire(MAITRE_COMMANDE, LIRE_ISR);
@@ -144,7 +144,7 @@ pub fn est_fantome(irq: u8) -> bool {
     match irq {
         7 if en_service() & (1 << 7) == 0 => true,
         15 if en_service() & (1 << 15) == 0 => {
-            // SAFETY : EOI au maître seul, pour la cascade (voir plus haut).
+            // SAFETY: EOI au maître seul, pour la cascade (voir plus haut).
             unsafe { port::ecrire(MAITRE_COMMANDE, EOI) };
             true
         }
@@ -157,7 +157,7 @@ pub fn est_fantome(irq: u8) -> bool {
 /// Une IRQ de l'esclave doit être acquittée aux deux : à l'esclave, et au
 /// maître qui l'a relayée par la cascade.
 pub fn fin_interruption(irq: u8) {
-    // SAFETY : commande EOI non spécifique, sur les ports de commande.
+    // SAFETY: commande EOI non spécifique, sur les ports de commande.
     unsafe {
         if irq >= 8 {
             port::ecrire(ESCLAVE_COMMANDE, EOI);

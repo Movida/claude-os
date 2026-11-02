@@ -163,7 +163,7 @@ pub struct Bilan {
 /// Tout processeur 64 bits a SSE, SSE2 et FXSAVE (l'architecture x86_64 les
 /// exige) : rien à vérifier pour eux.
 pub fn initialiser() -> Bilan {
-    // SAFETY : les bits écrits sont ceux décrits plus haut ; le noyau ne
+    // SAFETY: les bits écrits sont ceux décrits plus haut ; le noyau ne
     // se sert pas de SSE, rien ne change pour lui.
     unsafe {
         asm!(
@@ -181,7 +181,7 @@ pub fn initialiser() -> Bilan {
     use core::arch::x86_64::{__cpuid, __cpuid_count};
     // MXCSR_MASK : les octets 28 à 31 d'une image FXSAVE.
     let mut image = Initial([0; TAILLE_MAX]);
-    // SAFETY : FXSAVE écrit 512 octets dans une zone alignée à nous ; le
+    // SAFETY: FXSAVE écrit 512 octets dans une zone alignée à nous ; le
     // processeur n'a encore l'état d'aucun programme.
     unsafe { asm!("fxsave64 [{}]", in(reg) image.0.as_mut_ptr(), options(nostack)) };
     let masque = u32::from_le_bytes([image.0[28], image.0[29], image.0[30], image.0[31]]);
@@ -196,7 +196,7 @@ pub fn initialiser() -> Bilan {
     let d = __cpuid_count(0xD, 0);
     let offerts = (d.edx as u64) << 32 | d.eax as u64;
     let composants = (X87 | SSE | AVX) & offerts;
-    // SAFETY : CR4.OSXSAVE (bit 18) permet xsetbv ; XCR0 ne reçoit que des
+    // SAFETY: CR4.OSXSAVE (bit 18) permet xsetbv ; XCR0 ne reçoit que des
     // composants que le processeur offre, x87 compris (obligatoire).
     unsafe {
         asm!("mov {t}, cr4", "or {t}, 1 << 18", "mov cr4, {t}", t = out(reg) _, options(nostack));
@@ -231,7 +231,7 @@ pub fn masque_mxcsr() -> u32 {
 /// un programme) dans `zone`, au format standard (cadre_signal.rs).
 pub fn sauver_dans(zone: &mut ImageFpu) {
     let c = composants();
-    // SAFETY : la zone est alignée sur 64 et assez grande (TAILLE_MAX) ;
+    // SAFETY: la zone est alignée sur 64 et assez grande (TAILLE_MAX) ;
     // le noyau ne se sert pas de SSE : l'état est celui du programme.
     unsafe {
         if c == 0 {
@@ -247,7 +247,7 @@ pub fn sauver_dans(zone: &mut ImageFpu) {
 /// gestionnaire de signal : `fpu__clear_user_states`).
 pub fn charger_initial() {
     let c = composants();
-    // SAFETY : l'image initiale est valide (en-tête nul, MXCSR permis).
+    // SAFETY: l'image initiale est valide (en-tête nul, MXCSR permis).
     unsafe {
         if c == 0 {
             fxrstor_protege(INITIAL.0.as_ptr());
@@ -261,7 +261,7 @@ pub fn charger_initial() {
 /// FXRSTOR si `rfbm` vaut 0). Faux si le processeur l'a refusé (une faute
 /// de protection générale, reprise par la table d'exceptions).
 pub fn charger(zone: &ImageFpu, rfbm: u64) -> bool {
-    // SAFETY : la zone est alignée et assez grande ; un contenu refusé fait
+    // SAFETY: la zone est alignée et assez grande ; un contenu refusé fait
     // une faute reprise.
     unsafe {
         if rfbm == 0 {
@@ -283,7 +283,7 @@ pub struct ZoneFpu {
     octets: NonNull<u8>,
 }
 
-// SAFETY : la zone n'est lue et écrite que par la bascule (tache.rs),
+// SAFETY: la zone n'est lue et écrite que par la bascule (tache.rs),
 // interruptions coupées, et par qui la crée ou la copie.
 unsafe impl Send for ZoneFpu {}
 
@@ -295,9 +295,9 @@ impl ZoneFpu {
     /// Une zone à l'état initial (`initiale` : l'image de 512 octets de
     /// l'état initial, au format de FXSAVE) ; None : plus de mémoire.
     pub fn neuve(initiale: &[u8; 512]) -> Option<ZoneFpu> {
-        // SAFETY : la disposition a une taille non nulle (512 au moins).
+        // SAFETY: la disposition a une taille non nulle (512 au moins).
         let p = NonNull::new(unsafe { alloc_zeroed(disposition()) })?;
-        // SAFETY : la zone fait au moins 512 octets, et vient d'être allouée.
+        // SAFETY: la zone fait au moins 512 octets, et vient d'être allouée.
         unsafe { core::ptr::copy_nonoverlapping(initiale.as_ptr(), p.as_ptr(), 512) };
         Some(ZoneFpu { octets: p })
     }
@@ -307,11 +307,11 @@ impl ZoneFpu {
     /// `fpu_clone` de Linux : un fil hérite de son mode d'arrondi, mesuré).
     /// None : plus de mémoire.
     pub fn du_processeur() -> Option<ZoneFpu> {
-        // SAFETY : comme `neuve`.
+        // SAFETY: comme `neuve`.
         let p = NonNull::new(unsafe { alloc_zeroed(disposition()) })?;
         let mut zone = ZoneFpu { octets: p };
         let interruptions = crate::cpu::couper_interruptions();
-        // SAFETY : interruptions coupées, l'état du processeur est celui de
+        // SAFETY: interruptions coupées, l'état du processeur est celui de
         // la tâche courante ; la copie va dans une zone à nous.
         unsafe { zone.sauver() };
         if interruptions {
@@ -327,7 +327,7 @@ impl ZoneFpu {
     /// la zone.
     pub unsafe fn sauver(&mut self) {
         let composants = COMPOSANTS.load(Ordering::Relaxed);
-        // SAFETY : la zone est alignée sur 64 et de la taille que dit le
+        // SAFETY: la zone est alignée sur 64 et de la taille que dit le
         // processeur ; garanti par l'appelant pour le reste.
         unsafe {
             if composants == 0 {
@@ -345,7 +345,7 @@ impl ZoneFpu {
     /// Comme `sauver`, et la zone a été écrite par `sauver` ou `neuve`.
     pub unsafe fn retablir(&self) {
         let composants = COMPOSANTS.load(Ordering::Relaxed);
-        // SAFETY : comme `sauver` ; l'en-tête d'une zone neuve est nul et
+        // SAFETY: comme `sauver` ; l'en-tête d'une zone neuve est nul et
         // son MXCSR valide : XRSTOR ne fait pas de faute.
         unsafe {
             if composants == 0 {
@@ -360,7 +360,7 @@ impl ZoneFpu {
 
 impl Drop for ZoneFpu {
     fn drop(&mut self) {
-        // SAFETY : la zone vient d'alloc_zeroed, avec la même disposition.
+        // SAFETY: la zone vient d'alloc_zeroed, avec la même disposition.
         unsafe { dealloc(self.octets.as_ptr(), disposition()) };
     }
 }

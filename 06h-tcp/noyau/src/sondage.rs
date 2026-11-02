@@ -170,7 +170,7 @@ impl Rappel for EntreeSondage {
         if cle != 0 && cle & self.cle == 0 {
             return false;
         }
-        // SAFETY : l'attente vit plus longtemps que ses entrées (`Entrees`
+        // SAFETY: l'attente vit plus longtemps que ses entrées (`Entrees`
         // l'emprunte, et retire ses entrées avant de la rendre).
         let a = unsafe { &*self.attente };
         a.declenchee.set(true);
@@ -216,11 +216,11 @@ impl Inscrire for Entrees<'_> {
         bloc.ajouter_dans_la_place(EntreeSondage { entree: EntreeAttente::new(), file, cle, _tenu: tenu.dupliquer(), attente });
         let Some(e) = bloc.last() else { return };
         let qui: *const dyn Rappel = e;
-        // SAFETY : l'entrée est dans `e`, qui ne bouge plus (son bloc n'est
+        // SAFETY: l'entrée est dans `e`, qui ne bouge plus (son bloc n'est
         // jamais agrandi) et n'est rendu qu'après qu'elle a été retirée
         // (`drop`).
         unsafe { e.entree.preparer_rappel(qui, false) };
-        // SAFETY : comme ci-dessus.
+        // SAFETY: comme ci-dessus.
         file.ajouter(unsafe { Pin::new_unchecked(&e.entree) });
     }
 }
@@ -230,7 +230,7 @@ impl Drop for Entrees<'_> {
     /// fichiers rendus ensuite, avec les blocs.
     fn drop(&mut self) {
         for e in self.blocs.iter().flatten() {
-            // SAFETY : la file vit tant que l'entrée tient son fichier.
+            // SAFETY: la file vit tant que l'entrée tient son fichier.
             unsafe { (*e.file).enlever(&e.entree) };
         }
     }

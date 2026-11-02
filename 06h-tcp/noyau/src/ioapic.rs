@@ -61,7 +61,7 @@ struct IoApic {
 
 impl IoApic {
     fn lire(&self, registre: u32) -> u32 {
-        // SAFETY : les registres sont projetés sans cache (initialiser) ;
+        // SAFETY: les registres sont projetés sans cache (initialiser) ;
         // l'appelant tient le verrou des IO-APIC : la paire IOREGSEL,
         // IOWIN ne peut pas être coupée.
         unsafe {
@@ -71,7 +71,7 @@ impl IoApic {
     }
 
     fn ecrire(&self, registre: u32, valeur: u32) {
-        // SAFETY : comme `lire`.
+        // SAFETY: comme `lire`.
         unsafe {
             ((self.registres + IOREGSEL) as *mut u32).write_volatile(registre);
             ((self.registres + IOWIN) as *mut u32).write_volatile(valeur);

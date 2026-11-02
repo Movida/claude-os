@@ -1566,7 +1566,7 @@ pub fn signal_de_l_exception(vecteur: usize, cadre: &Cadre, cr2: u64, cause: Opt
 fn code_fpu(vecteur: usize) -> i32 {
     let erreur: u32 = if vecteur == 16 {
         let (mut controle, mut etat) = (0u16, 0u16);
-        // SAFETY : lire le mot de contrôle et le mot d'état x87 ne change
+        // SAFETY: lire le mot de contrôle et le mot d'état x87 ne change
         // rien ; ce sont ceux du programme (le noyau ne s'en sert pas).
         unsafe {
             asm!("fnstcw [{}]", in(reg) &mut controle, options(nostack));
@@ -1575,7 +1575,7 @@ fn code_fpu(vecteur: usize) -> i32 {
         (etat & !controle) as u32
     } else {
         let mut mxcsr = 0u32;
-        // SAFETY : lire MXCSR ne change rien ; c'est celui du programme.
+        // SAFETY: lire MXCSR ne change rien ; c'est celui du programme.
         unsafe { asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack)) };
         !(mxcsr >> 7) & mxcsr
     };

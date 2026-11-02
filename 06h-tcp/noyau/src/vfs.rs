@@ -65,7 +65,7 @@ pub struct CadresDuNoyau;
 impl Cadres for CadresDuNoyau {
     fn allouer(&mut self) -> Option<u64> {
         let cadre = pages::allouer_pour_programme()?;
-        // SAFETY : le cadre vient d'être alloué, personne d'autre ne le
+        // SAFETY: le cadre vient d'être alloué, personne d'autre ne le
         // voit ; il contenait ce qu'y avait laissé son précédent occupant.
         unsafe { core::ptr::write_bytes(espace::virtuelle(cadre) as *mut u8, 0, PAGE as usize) };
         // Une page de fichier : jamais inscriptible dans une projection
@@ -80,7 +80,7 @@ impl Cadres for CadresDuNoyau {
 
     fn ecrire(&mut self, page: u64, decalage: usize, octets: &[u8]) {
         assert!(decalage + octets.len() <= PAGE as usize);
-        // SAFETY : `page` est une page d'un fichier, tenue par le système de
+        // SAFETY: `page` est une page d'un fichier, tenue par le système de
         // fichiers (dont on tient le verrou) ; on reste dans la page.
         unsafe {
             let destination = (espace::virtuelle(page) as *mut u8).add(decalage);
@@ -90,7 +90,7 @@ impl Cadres for CadresDuNoyau {
 
     fn lire(&self, page: u64, decalage: usize, tampon: &mut [u8]) {
         assert!(decalage + tampon.len() <= PAGE as usize);
-        // SAFETY : comme `ecrire`, en lecture.
+        // SAFETY: comme `ecrire`, en lecture.
         unsafe {
             let source = (espace::virtuelle(page) as *const u8).add(decalage);
             core::ptr::copy_nonoverlapping(source, tampon.as_mut_ptr(), tampon.len());
@@ -309,7 +309,7 @@ pub fn avec_systeme<R>(f: impl FnOnce(&mut Systeme, &mut CadresDuNoyau) -> R) ->
 pub fn copier_vers_programme(cadre: u64, decalage: usize, n: usize, destination: u64) -> usize {
     assert!(decalage + n <= PAGE as usize);
     let source = (espace::virtuelle(cadre) as *const u8).wrapping_add(decalage);
-    // SAFETY : le cadre est une page allouée, vue par la projection directe,
+    // SAFETY: le cadre est une page allouée, vue par la projection directe,
     // et tenue par l'appelant : elle ne sera pas rendue pendant la copie ; on
     // reste dans la page (vérifié).
     unsafe { copie_utilisateur::copier_vers_utilisateur_brut(destination, source, n) }
@@ -325,7 +325,7 @@ pub fn copier_vers_programme(cadre: u64, decalage: usize, n: usize, destination:
 pub fn copier_depuis_programme(cadre: u64, decalage: usize, n: usize, source: u64) -> usize {
     assert!(decalage + n <= PAGE as usize);
     let destination = (espace::virtuelle(cadre) as *mut u8).wrapping_add(decalage);
-    // SAFETY : comme `copier_vers_programme`, en écriture.
+    // SAFETY: comme `copier_vers_programme`, en écriture.
     unsafe { copie_utilisateur::copier_depuis_utilisateur_brut(destination, source, n) }
 }
 

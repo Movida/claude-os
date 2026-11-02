@@ -77,7 +77,7 @@ pub enum Absence {
 /// projection directe.
 fn memoire_basse(debut: u64, longueur: usize) -> &'static [u8] {
     assert!(debut + longueur as u64 <= 1 << 20);
-    // SAFETY : le premier Mio est projeté en entier par la projection
+    // SAFETY: le premier Mio est projeté en entier par la projection
     // directe (pagination.rs) et n'est donné à aucun allocateur (cadres.rs) :
     // personne ne l'écrit pendant qu'on le lit (le BIOS n'y touche plus).
     unsafe { core::slice::from_raw_parts(espace::virtuelle(debut) as *const u8, longueur) }
@@ -102,7 +102,7 @@ fn chercher_rsdp() -> Option<(u64, acpi::Rsdp)> {
 fn avec_table<R>(adresse: u64, f: impl FnOnce(&acpi::Table) -> R) -> Result<R, acpi::Erreur> {
     let longueur = {
         let entete = vmalloc::memremap(adresse, acpi::TAILLE_ENTETE as u64).ok_or(acpi::Erreur::Tronquee)?;
-        // SAFETY : la projection couvre l'en-tête, en lecture seule ; ce
+        // SAFETY: la projection couvre l'en-tête, en lecture seule ; ce
         // sont des tables du micrologiciel, que personne n'écrit.
         let octets = unsafe { core::slice::from_raw_parts(entete.adresse() as *const u8, acpi::TAILLE_ENTETE) };
         acpi::longueur(octets)?
@@ -111,7 +111,7 @@ fn avec_table<R>(adresse: u64, f: impl FnOnce(&acpi::Table) -> R) -> Result<R, a
         return Err(acpi::Erreur::Longueur);
     }
     let table = vmalloc::memremap(adresse, longueur as u64).ok_or(acpi::Erreur::Tronquee)?;
-    // SAFETY : comme ci-dessus, pour toute la table.
+    // SAFETY: comme ci-dessus, pour toute la table.
     let octets = unsafe { core::slice::from_raw_parts(table.adresse() as *const u8, longueur) };
     Ok(f(&acpi::lire_table(octets)?))
 }

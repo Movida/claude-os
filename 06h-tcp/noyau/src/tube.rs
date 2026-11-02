@@ -121,7 +121,7 @@ struct Tampon {
 impl Tampon {
     /// Ses octets, dans la page.
     fn octets(&mut self) -> &mut [u8] {
-        // SAFETY : la page est au tube, qui ne la touche que sous son Mutex
+        // SAFETY: la page est au tube, qui ne la touche que sous son Mutex
         // (que tient l'appelant, qui a la case en &mut) ; personne d'autre
         // ne la projette.
         unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(self.cadre) as *mut u8, PAGE) }

@@ -66,7 +66,7 @@ fn est_virtio_rng(f: &Fonction) -> bool {
 
 /// L'interruption de la file : le tampon est rendu, la tâche réveillée.
 fn interruption(argument: usize) {
-    // SAFETY : l'argument est l'adresse de la carte, laissée pour toujours
+    // SAFETY: l'argument est l'adresse de la carte, laissée pour toujours
     // dans le tas (`Box::leak`) avant que l'interruption ne soit posée.
     let c = unsafe { &*(argument as *const Carte) };
     c.attente.reveiller_toutes();
@@ -151,7 +151,7 @@ fn boucle(c: &'static Carte) {
     loop {
         let n = lire(c);
         let mut octets = [0u8; LECTURE];
-        // SAFETY : la page est à nous, et la carte a fini d'y écrire (elle
+        // SAFETY: la page est à nous, et la carte a fini d'y écrire (elle
         // a rendu le tampon) ; `n` octets au plus, sous la taille du tampon.
         unsafe { core::ptr::copy_nonoverlapping(espace::virtuelle(c.page) as *const u8, octets.as_mut_ptr(), n) };
         crate::aleatoire::verser(&octets[..n], n as u32 * 8, "virtio-rng");

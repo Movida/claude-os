@@ -51,7 +51,7 @@ static INFOS: Verrou<Infos> = Verrou::new(Infos { archive: None });
 /// `adresse` doit être celle que le chargeur a passée au noyau dans rdi,
 /// et la mémoire basse ne doit pas encore avoir été réutilisée.
 pub unsafe fn recopier(adresse: u64) -> Result<(), &'static str> {
-    // SAFETY : garanti par l'appelant ; la mémoire basse est vue par la
+    // SAFETY: garanti par l'appelant ; la mémoire basse est vue par la
     // projection directe (tables de démarrage, premier Gio).
     let source = unsafe { &*(crate::espace::virtuelle(adresse) as *const InfosChargeur) };
     if &source.signature != b"INFO" {

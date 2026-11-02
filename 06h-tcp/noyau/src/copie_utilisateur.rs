@@ -156,7 +156,7 @@ pub fn cmpxchg_u32(adresse: u64, attendu: u32, nouveau: u32) -> Result<u32, Faut
     if adresse % 4 != 0 || !dans_les_bornes(adresse, 4) {
         return Err(Faute);
     }
-    // SAFETY : l'adresse est dans la moitié basse, alignée ; une faute est
+    // SAFETY: l'adresse est dans la moitié basse, alignée ; une faute est
     // reprise par la table d'exceptions (la page est servie, ou la copie
     // échoue, comme pour copie_brute).
     let r = unsafe { cmpxchg_brut(adresse, attendu, nouveau) };
@@ -177,7 +177,7 @@ pub fn copier_depuis_utilisateur(destination: &mut [u8], source: u64) -> Result<
     if !dans_les_bornes(source, destination.len() as u64) {
         return Err(Faute);
     }
-    // SAFETY : `destination` est à nous ; la source est dans les adresses
+    // SAFETY: `destination` est à nous ; la source est dans les adresses
     // des programmes (vérifié), lue par `rep movsb` sous la protection de
     // la table d'exceptions : une page absente fait reprendre la copie à
     // son adresse de reprise, jamais une lecture hors des bornes.
@@ -190,7 +190,7 @@ pub fn copier_vers_utilisateur(destination: u64, source: &[u8]) -> Result<(), Fa
     if !dans_les_bornes(destination, source.len() as u64) {
         return Err(Faute);
     }
-    // SAFETY : comme copier_depuis_utilisateur, dans l'autre sens. Les
+    // SAFETY: comme copier_depuis_utilisateur, dans l'autre sens. Les
     // pages du programme en lecture seule font faute (CR0.WP : le noyau
     // respecte les droits des pages).
     let reste = unsafe { copie_brute(destination as *mut u8, source.as_ptr(), source.len()) };
@@ -208,7 +208,7 @@ pub fn copier_depuis_utilisateur_partiel(destination: &mut [u8], source: u64) ->
     if !dans_les_bornes(source, destination.len() as u64) {
         return 0;
     }
-    // SAFETY : comme copier_depuis_utilisateur.
+    // SAFETY: comme copier_depuis_utilisateur.
     let reste = unsafe { copie_brute(destination.as_mut_ptr(), source as *const u8, destination.len()) };
     destination.len() - reste
 }
@@ -219,7 +219,7 @@ pub fn copier_vers_utilisateur_partiel(destination: u64, source: &[u8]) -> usize
     if !dans_les_bornes(destination, source.len() as u64) {
         return 0;
     }
-    // SAFETY : comme copier_vers_utilisateur.
+    // SAFETY: comme copier_vers_utilisateur.
     let reste = unsafe { copie_brute(destination as *mut u8, source.as_ptr(), source.len()) };
     source.len() - reste
 }
@@ -235,7 +235,7 @@ pub unsafe fn copier_vers_utilisateur_brut(destination: u64, source: *const u8, 
     if !dans_les_bornes(destination, n as u64) {
         return 0;
     }
-    // SAFETY : la source, d'après l'appelant ; la destination, comme
+    // SAFETY: la source, d'après l'appelant ; la destination, comme
     // copier_vers_utilisateur.
     let reste = unsafe { copie_brute(destination as *mut u8, source, n) };
     n - reste
@@ -252,7 +252,7 @@ pub unsafe fn copier_depuis_utilisateur_brut(destination: *mut u8, source: u64, 
     if !dans_les_bornes(source, n as u64) {
         return 0;
     }
-    // SAFETY : la destination, d'après l'appelant ; la source, comme
+    // SAFETY: la destination, d'après l'appelant ; la source, comme
     // copier_depuis_utilisateur.
     let reste = unsafe { copie_brute(destination, source as *const u8, n) };
     n - reste
@@ -264,7 +264,7 @@ pub unsafe fn copier_depuis_utilisateur_brut(destination: *mut u8, source: u64, 
 /// la parcourt ; Linux, qui en a des milliers, la trie et cherche par
 /// dichotomie.
 pub fn reprise(rip: u64) -> Option<u64> {
-    // SAFETY : la table est rangée par l'éditeur de liens entre ces deux
+    // SAFETY: la table est rangée par l'éditeur de liens entre ces deux
     // symboles (linker.ld), en paires d'adresses de 8 octets, en lecture
     // seule.
     let table = unsafe {
@@ -309,7 +309,7 @@ pub fn activer_protections() -> Protections {
     // SMAP_ACTIF avant CR4 : dès que SMAP est en service, les talons
     // doivent faire `clac`.
     SMAP_ACTIF.store(p.smap, Ordering::Relaxed);
-    // SAFETY : on n'active que ce que CPUID annonce ; le noyau ne touche la
+    // SAFETY: on n'active que ce que CPUID annonce ; le noyau ne touche la
     // mémoire des programmes que par les copies de ce module, et n'exécute
     // jamais leurs pages.
     unsafe {
@@ -323,7 +323,7 @@ pub fn activer_protections() -> Protections {
 /// page du programme projetée à `adresse` doit faire faute. (Sans SMAP,
 /// elle réussit : rien à vérifier.)
 pub fn smap_verifie(adresse: u64) -> bool {
-    // SAFETY : la lecture est protégée par la table d'exceptions ;
+    // SAFETY: la lecture est protégée par la table d'exceptions ;
     // `adresse` est une page projetée de l'espace actif.
     unsafe { lire_octet_direct(adresse) == -1 }
 }

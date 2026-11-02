@@ -51,7 +51,7 @@ const ENTREE_PLEINE: u8 = 1 << 1;
 /// toujours (Linux : i8042_wait_read, même principe).
 fn attendre_etat(bit: u8, voulu: bool) -> Result<(), ()> {
     for _ in 0..100_000 {
-        // SAFETY : lecture du registre d'état, sans effet.
+        // SAFETY: lecture du registre d'état, sans effet.
         if (unsafe { port::lire(ETAT_COMMANDE) } & bit != 0) == voulu {
             return Ok(());
         }
@@ -62,21 +62,21 @@ fn attendre_etat(bit: u8, voulu: bool) -> Result<(), ()> {
 
 fn commande(octet: u8) -> Result<(), ()> {
     attendre_etat(ENTREE_PLEINE, false)?;
-    // SAFETY : commande documentée du 8042, sur son port de commande.
+    // SAFETY: commande documentée du 8042, sur son port de commande.
     unsafe { port::ecrire(ETAT_COMMANDE, octet) };
     Ok(())
 }
 
 fn ecrire_donnee(octet: u8) -> Result<(), ()> {
     attendre_etat(ENTREE_PLEINE, false)?;
-    // SAFETY : réponse à une commande qui attend un octet de données.
+    // SAFETY: réponse à une commande qui attend un octet de données.
     unsafe { port::ecrire(DONNEES, octet) };
     Ok(())
 }
 
 fn lire_donnee() -> Result<u8, ()> {
     attendre_etat(SORTIE_PLEINE, true)?;
-    // SAFETY : un octet est disponible (bit SORTIE_PLEINE).
+    // SAFETY: un octet est disponible (bit SORTIE_PLEINE).
     Ok(unsafe { port::lire(DONNEES) })
 }
 
@@ -106,8 +106,9 @@ pub fn initialiser() -> Result<(), ()> {
 
     // Vider ce que le 8042 aurait gardé (touches tapées pendant le
     // démarrage) : sinon il attendrait qu'on le lise pour lever l'IRQ.
-    // SAFETY : lectures du port de données tant qu'il a quelque chose.
+    // SAFETY: lectures du port de données tant qu'il a quelque chose.
     while unsafe { port::lire(ETAT_COMMANDE) } & SORTIE_PLEINE != 0 {
+        // SAFETY: comme ci-dessus.
         unsafe { port::lire(DONNEES) };
     }
 
@@ -173,7 +174,7 @@ static FILE: Verrou<File> = Verrou::new(File { octets: [0; 64], debut: 0, nombre
 /// Il FAUT le lire : tant que le port 0x60 est plein, le 8042 n'envoie
 /// plus rien, et le clavier semblerait mort.
 pub fn interruption() {
-    // SAFETY : l'IRQ 1 signifie qu'un octet attend sur le port 0x60.
+    // SAFETY: l'IRQ 1 signifie qu'un octet attend sur le port 0x60.
     let code = unsafe { port::lire(DONNEES) };
     let mut f = FILE.verrouiller();
     f.ajouter(code);

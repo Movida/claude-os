@@ -51,6 +51,10 @@ all = { level = "allow", priority = -1 }
 # Les méthodes et macros de clippy.toml : les allocations qui paniquent.
 disallowed_methods = "deny"
 disallowed_macros = "deny"
+# Chaque bloc `unsafe` (et chaque `unsafe impl`) dit pourquoi il est sûr,
+# par un commentaire qui commence par SAFETY: juste avant. (Où `unsafe` est
+# permis : main.rs, #![deny(unsafe_code)] et la liste des modules.)
+undocumented_unsafe_blocks = "deny"
 
 # panic = "abort" : en cas de panique, pas de « déroulement » de la pile
 # (unwinding), qui demanderait une bibliothèque d'exécution qu'on n'a pas.

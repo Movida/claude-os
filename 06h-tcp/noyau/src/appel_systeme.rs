@@ -216,7 +216,7 @@ entree_syscall_compat:
 /// # Safety
 /// `msr` doit exister, et `valeur` y avoir un sens.
 unsafe fn ecrire_msr(msr: u32, valeur: u64) {
-    // SAFETY : garanti par l'appelant.
+    // SAFETY: garanti par l'appelant.
     unsafe {
         asm!("wrmsr", in("ecx") msr, in("eax") valeur as u32, in("edx") (valeur >> 32) as u32,
              options(nostack, preserves_flags));
@@ -229,7 +229,7 @@ unsafe fn ecrire_msr(msr: u32, valeur: u64) {
 /// `msr` doit exister.
 unsafe fn lire_msr(msr: u32) -> u64 {
     let (bas, haut): (u32, u32);
-    // SAFETY : garanti par l'appelant.
+    // SAFETY: garanti par l'appelant.
     unsafe { asm!("rdmsr", in("ecx") msr, out("eax") bas, out("edx") haut, options(nomem, nostack, preserves_flags)) };
     (haut as u64) << 32 | bas as u64
 }
@@ -241,7 +241,7 @@ pub fn initialiser() {
         fn entree_syscall_compat();
     }
     let star = (gdt::BASE_UTILISATEUR as u64) << 48 | (gdt::CODE_NOYAU as u64) << 32;
-    // SAFETY : ces MSR existent sur tout processeur 64 bits (`syscall` fait
+    // SAFETY: ces MSR existent sur tout processeur 64 bits (`syscall` fait
     // partie du mode long) ; les valeurs suivent la GDT (gdt.rs) et les
     // entrées ci-dessus.
     unsafe {

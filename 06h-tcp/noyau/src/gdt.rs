@@ -126,7 +126,7 @@ struct Tss {
 #[repr(transparent)]
 pub struct TssPartagee(UnsafeCell<Tss>);
 
-// SAFETY : voir plus haut ; un seul processeur, accès interruptions
+// SAFETY: voir plus haut ; un seul processeur, accès interruptions
 // coupées (UNIPROCESSEUR, voir plus haut).
 unsafe impl Sync for TssPartagee {}
 
@@ -170,7 +170,7 @@ const DONNEES_UTILISATEUR_DESC: u64 = 0x00CF_F300_0000_FFFF;
 
 pub fn initialiser() {
     let base_tss = TSS_PROCESSEUR.0.get() as u64;
-    // SAFETY : au démarrage, interruptions coupées, personne d'autre ne
+    // SAFETY: au démarrage, interruptions coupées, personne d'autre ne
     // touche à la TSS.
     unsafe {
         let tss = &mut *TSS_PROCESSEUR.0.get();
@@ -205,7 +205,7 @@ pub fn initialiser() {
         base: gdt.as_ptr() as u64,
     };
 
-    // SAFETY : la GDT est statique (elle vivra aussi longtemps que le
+    // SAFETY: la GDT est statique (elle vivra aussi longtemps que le
     // noyau) et ses sélecteurs correspondent à ce qu'on charge ensuite.
     unsafe {
         asm!(
@@ -243,7 +243,7 @@ pub fn initialiser() {
 /// champ), et `sommet` doit être le sommet d'une pile du noyau réservée
 /// à ce programme.
 pub unsafe fn definir_pile_noyau(sommet: u64) {
-    // SAFETY : garanti par l'appelant ; écriture d'un champ non aligné
+    // SAFETY: garanti par l'appelant ; écriture d'un champ non aligné
     // d'une structure packed, par un pointeur brut.
     unsafe { (&raw mut (*TSS_PROCESSEUR.0.get()).rsp[0]).write_unaligned(sommet) };
 }

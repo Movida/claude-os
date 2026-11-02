@@ -62,7 +62,7 @@ static ORIGINE: AtomicU64 = AtomicU64::new(0);
 /// Linux, qui choisit LFENCE sur Intel comme sur AMD).
 pub fn lire() -> u64 {
     let (bas, haut): (u32, u32);
-    // SAFETY : LFENCE et RDTSC ne font que lire ; RDTSC est permis en
+    // SAFETY: LFENCE et RDTSC ne font que lire ; RDTSC est permis en
     // anneau 0 quel que soit CR4.TSD.
     unsafe { asm!("lfence", "rdtsc", out("eax") bas, out("edx") haut, options(nomem, nostack, preserves_flags)) };
     (haut as u64) << 32 | bas as u64
@@ -98,7 +98,7 @@ fn essai(ms: u64) -> Option<u64> {
     // l'instant du départ est pris au milieu de deux lectures du TSC qui
     // encadrent cette écriture, et celui de la fin, entre la dernière
     // lecture qui précède la sortie montée et celle qui la suit.
-    // SAFETY : la porte du canal 2, sans le haut-parleur ; le canal 2 en
+    // SAFETY: la porte du canal 2, sans le haut-parleur ; le canal 2 en
     // mode 0 (« compte à rebours, puis la sortie monte »), comptage
     // binaire, décompte en deux octets. Le canal 2 ne sert qu'ici.
     let avant = unsafe {
@@ -112,7 +112,7 @@ fn essai(ms: u64) -> Option<u64> {
     let apres = lire();
     let mut fin = apres;
     let mut lectures = 0u32;
-    // SAFETY : lire la porte ne change rien.
+    // SAFETY: lire la porte ne change rien.
     while unsafe { port::lire(PORTE) } & 0x20 == 0 {
         fin = lire();
         lectures += 1;

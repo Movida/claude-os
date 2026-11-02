@@ -248,7 +248,7 @@ adresses_talons:
 /// quel, et la suite s'arrête (`exception_fatale`).
 #[unsafe(no_mangle)]
 extern "C" fn reparer_iret(faute: *mut Cadre) -> *mut Cadre {
-    // SAFETY : `faute` est le cadre que vient d'empiler interruption_commune ;
+    // SAFETY: `faute` est le cadre que vient d'empiler interruption_commune ;
     // son RSP désigne les cinq mots que dépilait iretq, sur la même pile.
     let (mut nouveau, cible) = unsafe {
         let f = *faute;
@@ -265,7 +265,7 @@ extern "C" fn reparer_iret(faute: *mut Cadre) -> *mut Cadre {
     nouveau.rsp = cible[3];
     nouveau.ss = cible[4];
     let destination = tache::courante().cadre_du_programme();
-    // SAFETY : le haut de la pile noyau de la tâche courante ; tout ce qu'il y
+    // SAFETY: le haut de la pile noyau de la tâche courante ; tout ce qu'il y
     // avait est dans `nouveau` et `cible`, des copies.
     unsafe { destination.write(nouveau) };
     destination
@@ -307,7 +307,7 @@ pub fn initialiser() {
     }
     let mut idt = IDT.verrouiller();
     for vecteur in 0..NB_TALONS {
-        // SAFETY : tableau constant défini dans le global_asm! ci-dessus.
+        // SAFETY: tableau constant défini dans le global_asm! ci-dessus.
         let adresse = unsafe { adresses_talons[vecteur] };
         // La double faute bascule sur la pile de secours. Le scénario visé
         // est le débordement de la pile du noyau : sous la pile, une page
@@ -344,7 +344,7 @@ pub fn initialiser() {
         limite: (size_of::<[Entree; 256]>() - 1) as u16,
         base: idt.as_ptr() as u64,
     };
-    // SAFETY : l'IDT est statique et chaque entrée présente pointe vers un
+    // SAFETY: l'IDT est statique et chaque entrée présente pointe vers un
     // talon valide.
     unsafe { asm!("lidt [{}]", in(reg) &descripteur, options(nostack)) };
 }
@@ -437,7 +437,7 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
 /// repos (DR6_RESERVED : les bits réservés à 1, les autres à 0).
 fn lire_et_effacer_dr6() -> u64 {
     let dr6: u64;
-    // SAFETY : lire et écrire DR6 en anneau 0 ne touche que ce registre.
+    // SAFETY: lire et écrire DR6 en anneau 0 ne touche que ce registre.
     unsafe {
         asm!("mov {}, dr6", out(reg) dr6, options(nomem, nostack));
         asm!("mov dr6, {}", in(reg) 0xFFFF_0FF0u64, options(nomem, nostack));
@@ -448,7 +448,7 @@ fn lire_et_effacer_dr6() -> u64 {
 /// L'adresse de la dernière faute de page (CR2).
 pub fn lire_cr2() -> u64 {
     let cr2: u64;
-    // SAFETY : lecture d'un registre de contrôle, sans effet.
+    // SAFETY: lecture d'un registre de contrôle, sans effet.
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
     cr2
 }

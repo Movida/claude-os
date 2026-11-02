@@ -19,7 +19,7 @@ use core::arch::asm;
 /// RFLAGS qu'en l'empilant (pushfq).
 pub fn couper_interruptions() -> bool {
     let rflags: u64;
-    // SAFETY : pushfq/pop lisent RFLAGS ; cli ne fait que masquer les
+    // SAFETY: pushfq/pop lisent RFLAGS ; cli ne fait que masquer les
     // interruptions.
     unsafe { asm!("pushfq", "pop {}", "cli", out(reg) rflags) };
     rflags & (1 << 9) != 0
@@ -28,13 +28,13 @@ pub fn couper_interruptions() -> bool {
 /// Les interruptions sont-elles actives (IF) ?
 pub fn interruptions_actives() -> bool {
     let rflags: u64;
-    // SAFETY : pushfq/pop ne font que lire RFLAGS.
+    // SAFETY: pushfq/pop ne font que lire RFLAGS.
     unsafe { asm!("pushfq", "pop {}", out(reg) rflags) };
     rflags & (1 << 9) != 0
 }
 
 pub fn activer_interruptions() {
-    // SAFETY : l'IDT est en place (interruptions::initialiser) avant tout
+    // SAFETY: l'IDT est en place (interruptions::initialiser) avant tout
     // appel ; une interruption trouvera son gestionnaire.
     unsafe { asm!("sti", options(nostack)) };
 }
@@ -49,7 +49,7 @@ pub fn activer_interruptions() {
 /// interruptions, vérifie s'il a quelque chose à faire, et sinon appelle
 /// cette fonction : c'est la boucle d'attente de Linux (safe_halt).
 pub fn attendre_interruption() {
-    // SAFETY : comme activer_interruptions ; hlt ne fait qu'attendre.
+    // SAFETY: comme activer_interruptions ; hlt ne fait qu'attendre.
     unsafe { asm!("sti", "hlt", options(nostack)) };
 }
 
@@ -58,7 +58,7 @@ pub fn attendre_interruption() {
 /// réveille.
 pub fn arreter() -> ! {
     loop {
-        // SAFETY : cli et hlt n'ont pas d'autre effet que d'arrêter le
+        // SAFETY: cli et hlt n'ont pas d'autre effet que d'arrêter le
         // processeur, ce qu'on veut ici.
         unsafe { asm!("cli", "hlt", options(nomem, nostack)) };
     }
@@ -72,7 +72,7 @@ const FS_BASE: u32 = 0xC000_0100;
 
 /// Fixe la base de FS du programme en cours.
 pub fn ecrire_base_fs(base: u64) {
-    // SAFETY : le MSR existe sur tout processeur 64 bits ; le noyau ne se
+    // SAFETY: le MSR existe sur tout processeur 64 bits ; le noyau ne se
     // sert pas de FS. L'appelant vérifie que `base` est une adresse
     // canonique (sinon wrmsr fait une faute de protection générale).
     unsafe {
@@ -84,7 +84,7 @@ pub fn ecrire_base_fs(base: u64) {
 /// La base de FS du programme en cours.
 pub fn lire_base_fs() -> u64 {
     let (bas, haut): (u32, u32);
-    // SAFETY : lecture d'un MSR qui existe, sans effet.
+    // SAFETY: lecture d'un MSR qui existe, sans effet.
     unsafe { asm!("rdmsr", in("ecx") FS_BASE, out("eax") bas, out("edx") haut, options(nomem, nostack, preserves_flags)) };
     (haut as u64) << 32 | bas as u64
 }

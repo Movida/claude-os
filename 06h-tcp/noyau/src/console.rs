@@ -26,7 +26,7 @@ pub fn initialiser() {
 /// l'écran montrera une ligne à moitié écrite.
 pub fn preparer_panique() {
     crate::cpu::couper_interruptions();
-    // SAFETY : on ne revient pas de la panique, le détenteur éventuel du
+    // SAFETY: on ne revient pas de la panique, le détenteur éventuel du
     // verrou ne reprendra jamais la main.
     unsafe { ECRAN.forcer_liberation() };
 }

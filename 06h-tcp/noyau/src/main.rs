@@ -14,78 +14,147 @@
 // Pas de `main` classique : personne ne prépare d'arguments ni d'environnement.
 // Le point d'entrée est _start, ci-dessous.
 #![no_main]
+#![deny(unsafe_code)]
 
 // Les collections de Rust (Box, Vec, String), servies par notre tas (tas.rs).
 extern crate alloc;
 
-#[macro_use] // Les macros afficher! et afficherln! servent dans tous les modules.
+// Où `unsafe` est permis : seulement dans les modules d'abstraction de bas
+// niveau, chacun avec #[allow(unsafe_code)], rangés ci-dessous par famille
+// (comme la crate `kernel` de Rust pour Linux : `kernel::io`, `page`,
+// `uaccess`, `sync`). Partout ailleurs, `#![deny(unsafe_code)]` le refuse :
+// la logique (les appels système, les protocoles) passe par les fonctions
+// sûres de ces modules. Chaque bloc `unsafe` dit pourquoi il est sûr (un
+// commentaire SAFETY, exigé par clippy : Cargo.toml).
+//
+// La console d'abord : ses macros afficher! et afficherln! servent dans
+// tous les modules. Elle force son verrou en cas de panique.
+#[macro_use]
+#[allow(unsafe_code)]
 mod console;
+
+// Le matériel : les ports, la mémoire des périphériques (MMIO), l'assembleur
+// (`asm!`), les registres et les tables du processeur, les tables du
+// BIOS et de l'ACPI.
+#[allow(unsafe_code)]
 mod acpi;
+#[allow(unsafe_code)]
 mod aleatoire;
+#[allow(unsafe_code)]
 mod apic;
+#[allow(unsafe_code)]
+mod clavier;
+#[allow(unsafe_code)]
+mod cpu;
+#[allow(unsafe_code)]
+mod demarrage;
+#[allow(unsafe_code)]
+mod gdt;
+#[allow(unsafe_code)]
+mod horloge;
+#[allow(unsafe_code)]
+mod interruptions;
+#[allow(unsafe_code)]
+mod ioapic;
+#[allow(unsafe_code)]
+mod linux;
+#[allow(unsafe_code)]
+mod msix;
+#[allow(unsafe_code)]
+mod pci;
+#[allow(unsafe_code)]
+mod pic;
+#[allow(unsafe_code)]
+mod port;
+#[allow(unsafe_code)]
+mod serie;
+#[allow(unsafe_code)]
+mod sse;
+#[allow(unsafe_code)]
+mod temps;
+#[allow(unsafe_code)]
+mod tsc;
+#[allow(unsafe_code)]
+mod vga;
+#[allow(unsafe_code)]
+mod virtio;
+#[allow(unsafe_code)]
+mod virtio_rng;
+#[allow(unsafe_code)]
+mod virtqueue;
+
+// La mémoire physique, vue par la projection directe ; et le tas.
+#[allow(unsafe_code)]
+mod cadres;
+#[allow(unsafe_code)]
+mod espace_utilisateur;
+#[allow(unsafe_code)]
+mod faillible;
+#[allow(unsafe_code)]
+mod pages;
+#[allow(unsafe_code)]
+mod pagination;
+#[allow(unsafe_code)]
+mod programmes;
+#[allow(unsafe_code)]
+mod tas;
+#[allow(unsafe_code)]
+mod tube;
+#[allow(unsafe_code)]
+mod vfs;
+
+// Les copies vers et depuis les programmes (l'anneau 3).
+#[allow(unsafe_code)]
+mod copie_utilisateur;
+
+// La synchronisation : les verrous, les files d'attente et leurs entrées
+// liées (des listes intrusives), les valeurs partagées.
+#[allow(unsafe_code)]
 mod attente;
+#[allow(unsafe_code)]
+mod epoll;
+#[allow(unsafe_code)]
+mod irq;
+#[allow(unsafe_code)]
+mod ordonnanceur;
+#[allow(unsafe_code)]
+mod partage;
+#[allow(unsafe_code)]
+mod sondage;
+#[allow(unsafe_code)]
+mod verrou;
+
+// La bascule d'une tâche à l'autre, et l'entrée dans le noyau.
+#[allow(unsafe_code)]
 mod appel_systeme;
+#[allow(unsafe_code)]
+mod tache;
+
+// Tout le reste : sans unsafe.
 mod appels_fichiers;
 mod appels_reseau;
 mod cadre_signal;
-mod cadres;
 mod carte_memoire;
 mod chargeur_elf;
-mod copie_utilisateur;
-mod clavier;
-mod cpu;
-mod demarrage;
 mod descripteurs;
-mod epoll;
 mod espace;
-mod espace_utilisateur;
 mod evenements;
-mod faillible;
 mod faute_de_page;
 mod futex;
-mod gdt;
-mod horloge;
-mod interruptions;
-mod msix;
 mod fil;
-mod ioapic;
-mod irq;
-mod linux;
 mod memoire;
-mod pagination;
-mod partage;
-mod pci;
 mod pile;
-mod ordonnanceur;
-mod pages;
-mod pic;
-mod port;
 mod procfs;
 mod processus;
-mod programmes;
 mod reseau;
 mod reprise;
 mod rusage;
-mod serie;
 mod signaux;
-mod sondage;
 mod sysfs;
-mod sse;
-mod tache;
-mod tas;
-mod tsc;
-mod tube;
-mod temps;
-mod verrou;
-mod vfs;
 mod vmalloc;
-mod vga;
-mod virtio;
-mod virtio_rng;
-mod virtqueue;
 mod wasi;
 
-use core::arch::{asm, global_asm};
+use core::arch::asm;
 use core::panic::PanicInfo;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -118,7 +187,14 @@ use core::sync::atomic::{AtomicBool, Ordering};
 // Le chargeur passe l'adresse des informations de démarrage dans rdi ; or
 // rep stosb se sert de rdi : on la met de côté dans r15, puis on la rend à
 // rdi, 1er argument de noyau_main.
-global_asm!(
+//
+// Ce fichier n'est pas un module d'abstraction, mais le démarrage touche
+// le matériel et la mémoire physique avant que tout soit en place : son
+// entrée, `noyau_main` et les auto-tests qui lisent la mémoire par ses
+// adresses ont chacun leur #[allow(unsafe_code)].
+#[allow(unsafe_code)]
+mod entree {
+    core::arch::global_asm!(
     r#"
     .section .text.debut, "ax"
     .global _start
@@ -178,8 +254,10 @@ demarrage_pdpt_directe: .skip 4096
 demarrage_pdpt_noyau: .skip 4096
 demarrage_pd: .skip 4096
     "#
-);
+    );
+}
 
+#[allow(unsafe_code)]
 unsafe extern "C" {
     // Défini dans le global_asm! ci-dessus : seule son adresse nous intéresse.
     static _start: u8;
@@ -188,6 +266,7 @@ unsafe extern "C" {
     static __bss_fin: u8;
 }
 
+#[allow(unsafe_code)]
 #[unsafe(no_mangle)]
 extern "C" fn noyau_main(infos: u64) -> ! {
     console::initialiser();
@@ -204,13 +283,13 @@ extern "C" fn noyau_main(infos: u64) -> ! {
 
     // Test volontaire : int3 déclenche l'exception 3. Si l'IDT est fausse,
     // c'est une triple faute et QEMU redémarre ; sinon, on revient ici.
-    // SAFETY : int3 ne fait qu'appeler notre gestionnaire, qui revient.
+    // SAFETY: int3 ne fait qu'appeler notre gestionnaire, qui revient.
     unsafe { asm!("int3") };
     afficherln!("[noyau] Retour apres int3 : les exceptions sont gerees.");
 
     // La mémoire physique : les informations du chargeur (dont la carte du
     // BIOS), puis l'allocateur de cadres.
-    // SAFETY : `infos` est l'adresse passée par notre chargeur, et rien n'a
+    // SAFETY: `infos` est l'adresse passée par notre chargeur, et rien n'a
     // encore réutilisé la mémoire basse.
     if let Err(e) = unsafe { demarrage::recopier(infos) } {
         panic!("informations de demarrage illisibles ({})", e);
@@ -390,7 +469,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         #[cfg(feature = "test-programmes")]
         {
             afficherln!("[noyau] Fin des tests : extinction de QEMU.");
-            // SAFETY : le port 0xf4 est celui d'isa-debug-exit dans
+            // SAFETY: le port 0xf4 est celui d'isa-debug-exit dans
             // `make tests-qemu` ; QEMU s'arrête aussitôt.
             unsafe { port::ecrire(0xf4, 0) };
         }
@@ -511,6 +590,7 @@ fn tester_voisins() {
 /// nombre de pages libres revient à ce qu'il était). Le plus grand bloc
 /// possible : sur une très petite machine, il n'y a pas forcément de bloc
 /// de 4 Mio. Une page prise deux fois n'est rendue qu'au second `lacher`.
+#[allow(unsafe_code)]
 fn tester_pages() {
     let libres_avant = pages::libres();
     let a = pages::allouer(0).expect("plus de memoire");
@@ -518,7 +598,7 @@ fn tester_pages() {
     let (c, ordre_c) = (0..=pages::ORDRE_MAX).rev().find_map(|o| pages::allouer(o).map(|c| (c, o))).expect("plus de memoire");
     let taille_c = 4096 << ordre_c;
     assert!(a % 4096 == 0 && b % (4096 << 3) == 0 && c % taille_c == 0);
-    // SAFETY : `c` vient d'être alloué, il est à nous, de bout en bout.
+    // SAFETY: `c` vient d'être alloué, il est à nous, de bout en bout.
     unsafe {
         let debut = espace::virtuelle(c) as *mut u8;
         debut.write_volatile(1);
@@ -538,6 +618,7 @@ fn tester_pages() {
 /// directe, puis tout détruire. Toutes les pages (la page, les quatre
 /// tables) doivent revenir à l'allocateur, et les adresses interdites être
 /// refusées.
+#[allow(unsafe_code)]
 fn tester_espace_utilisateur() {
     use espace_utilisateur::{EspaceUtilisateur, Erreur, ADRESSE_MAX, ADRESSE_MIN};
     const ADRESSE: u64 = 0x40_0000;
@@ -557,7 +638,7 @@ fn tester_espace_utilisateur() {
     // On écrit par l'adresse du programme, comme un appel système : par la
     // copie protégée (et SMAP doit refuser une lecture directe), puis on
     // relit par la projection directe du cadre.
-    // SAFETY : l'espace a la moitié haute du noyau (pile, code) : on
+    // SAFETY: l'espace a la moitié haute du noyau (pile, code) : on
     // continue de s'exécuter après avoir changé CR3 ; on revient sur la
     // PML4 du noyau avant de le détruire.
     unsafe { pagination::activer(e.pml4()) };
@@ -566,9 +647,9 @@ fn tester_espace_utilisateur() {
     let absente = copie_utilisateur::copier_vers_utilisateur(ADRESSE + 4096 - 4, &[0; 8]);
     let smap_ok = !copie_utilisateur::SMAP_ACTIF.load(core::sync::atomic::Ordering::Relaxed)
         || copie_utilisateur::smap_verifie(ADRESSE);
-    // SAFETY : la PML4 du noyau est complète.
+    // SAFETY: la PML4 du noyau est complète.
     unsafe { pagination::activer(pagination::pml4_noyau()) };
-    // SAFETY : `cadre` est la page projetée, à nous jusqu'à la destruction
+    // SAFETY: `cadre` est la page projetée, à nous jusqu'à la destruction
     // de l'espace.
     let relu = unsafe { (espace::virtuelle(cadre) as *const u64).read_volatile() };
     let refus = [refus.iter().all(|&r| r), copie.is_ok(), hors_bornes.is_err(), absente.is_err(), smap_ok];
@@ -587,6 +668,7 @@ fn tester_espace_utilisateur() {
 /// vidéo (dans le premier Mio, déjà vue par la projection directe)
 /// projetée une seconde fois sans cache, comme des registres : les deux
 /// vues lisent le même caractère.
+#[allow(unsafe_code)]
 fn tester_vmalloc() {
     let libres_avant = pages::libres();
     let pml4 = pagination::pml4_noyau();
@@ -594,7 +676,7 @@ fn tester_vmalloc() {
         return afficherln!("[noyau] vmalloc : pas de pile : ECHEC.");
     };
     let (bas, haut) = (pile.bas(), pile.haut());
-    // SAFETY : la pile vient d'être projetée, elle est à nous ; ses deux
+    // SAFETY: la pile vient d'être projetée, elle est à nous ; ses deux
     // bouts sont dans ses pages.
     unsafe {
         (bas as *mut u64).write_volatile(0x1234);
@@ -602,7 +684,7 @@ fn tester_vmalloc() {
     }
     let relu = |v: u64| {
         pagination::traduire(pml4, v / 4096 * 4096)
-            // SAFETY : un cadre de la pile, vu par la projection directe.
+            // SAFETY: un cadre de la pile, vu par la projection directe.
             .map(|c| unsafe { (espace::virtuelle(c + v % 4096) as *const u64).read_volatile() })
     };
     let ecrite = relu(bas) == Some(0x1234) && relu(haut - 8) == Some(0x5678);
@@ -613,7 +695,7 @@ fn tester_vmalloc() {
     // La mémoire vidéo en mode texte : 0xB8000, un caractère et sa
     // couleur par mot.
     let video = vmalloc::ioremap(0xB8000, 4096).map(|p| {
-        // SAFETY : la page projetée est la mémoire vidéo, comme sa vue par
+        // SAFETY: la page projetée est la mémoire vidéo, comme sa vue par
         // la projection directe ; lire un mot ne change rien.
         unsafe { (p.adresse() as *const u16).read_volatile() == (espace::virtuelle(0xB8000) as *const u16).read_volatile() }
     }) == Some(true);
@@ -621,7 +703,7 @@ fn tester_vmalloc() {
     // micrologiciel ; une page de la mémoire vive donnée à l'allocateur,
     // refusée.
     let bios = vmalloc::memremap(0xF0000 + 0x10, 8).map(|p| {
-        // SAFETY : une page du BIOS, vue aussi par la projection directe.
+        // SAFETY: une page du BIOS, vue aussi par la projection directe.
         unsafe { (p.adresse() as *const u64).read_volatile() == (espace::virtuelle(0xF0010) as *const u64).read_volatile() }
     }) == Some(true);
     let vive = pages::allouer(0).map(|c| {
@@ -685,7 +767,7 @@ fn tester_vecteurs() {
 /// `alloc` (Box::new, vec!, format!, collect), celles que clippy.toml
 /// refuse ailleurs : c'est elles qu'on essaie, au démarrage, où un échec
 /// est l'échec du test.
-#[allow(clippy::disallowed_methods, clippy::disallowed_macros)]
+#[allow(clippy::disallowed_methods, clippy::disallowed_macros, unsafe_code)]
 fn tester_tas() {
     use alloc::{boxed::Box, format, vec, vec::Vec};
     // Un Vec qui grandit : il passe par plusieurs classes, puis par des
@@ -700,7 +782,7 @@ fn tester_tas() {
     // comparaison par « faux » sans l'exécuter.
     let a = Box::into_raw(Box::new(1u32));
     let adresse_a = core::hint::black_box(a as usize);
-    // SAFETY : `a` vient de Box::into_raw, rendu une seule fois.
+    // SAFETY: `a` vient de Box::into_raw, rendu une seule fois.
     drop(unsafe { Box::from_raw(a) });
     let b = Box::new(2u32);
     let reutilise = core::hint::black_box(&*b as *const u32 as usize) == adresse_a;
@@ -770,6 +852,7 @@ fn verifier_gros() {
 
 /// Vérifie l'allocateur : trois cadres distincts et alignés, et un cadre
 /// rendu est bien redonné ensuite.
+#[allow(unsafe_code)]
 fn tester_cadres() {
     let libres_avant = cadres::libres();
     let a = cadres::allouer().expect("plus de memoire");
@@ -778,7 +861,7 @@ fn tester_cadres() {
     assert!(a != b && b != c && a != c && (a | b | c) % cadres::TAILLE_CADRE == 0);
     // On écrit dans un cadre, par la projection directe : il est bien
     // projeté et à nous.
-    // SAFETY : `b` vient d'être alloué, personne d'autre ne s'en sert.
+    // SAFETY: `b` vient d'être alloué, personne d'autre ne s'en sert.
     unsafe { core::ptr::write_bytes(espace::virtuelle(b) as *mut u8, 0, cadres::TAILLE_CADRE as usize) };
     cadres::liberer(b);
     let d = cadres::allouer().expect("plus de memoire");

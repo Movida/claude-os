@@ -284,7 +284,7 @@ pub fn ordonnancer() {
     if !core::ptr::eq(suivante, tache::courante()) {
         BASCULES.fetch_add(1, Ordering::Relaxed);
         tache::courante().usage().compter_bascule(volontaire);
-        // SAFETY : `suivante` est dans la file (ou l'inactive, qui ne meurt
+        // SAFETY: `suivante` est dans la file (ou l'inactive, qui ne meurt
         // pas) : elle vit au moins jusqu'à ce qu'elle quitte la file, ce
         // qu'elle seule peut faire, en s'exécutant.
         tache::basculer_vers(unsafe { &*suivante });
