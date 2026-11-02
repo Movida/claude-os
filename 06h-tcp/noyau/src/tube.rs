@@ -39,7 +39,8 @@ use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, 
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::faillible::{self, VecFaillible};
-use crate::{cpu, espace, pages, processus, signaux, temps, vfs};
+use crate::pages::Page;
+use crate::{cpu, processus, signaux, temps, vfs};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use fichiers::tmpfs::Ouvert;
@@ -106,10 +107,10 @@ fn trop(compte: u64) -> (bool, bool) {
 }
 
 /// Une page de l'anneau (la `pipe_buffer` de Linux).
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct Tampon {
-    /// Le cadre de la page ; 0 : la case est vide.
-    cadre: u64,
+    /// La page ; None : la case est vide.
+    page: Option<Page>,
     debut: usize,
     longueur: usize,
     /// Un paquet (O_DIRECT) : lu d'un coup, le reste jeté.
@@ -119,13 +120,19 @@ struct Tampon {
 }
 
 impl Tampon {
-    /// Ses octets, dans la page.
+    /// Ses octets, dans la page (une case pleine).
     fn octets(&mut self) -> &mut [u8] {
-        // SAFETY: la page est au tube, qui ne la touche que sous son Mutex
-        // (que tient l'appelant, qui a la case en &mut) ; personne d'autre
-        // ne la projette.
-        unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(self.cadre) as *mut u8, PAGE) }
+        self.page.as_mut().expect("case de tube sans page").octets()
     }
+}
+
+/// Un anneau de `n` cases vides.
+fn vides(n: usize) -> Result<Vec<Tampon>, faillible::PlusDeMemoire> {
+    let mut anneau = faillible::avec_capacite(n)?;
+    for _ in 0..n {
+        anneau.ajouter_dans_la_place(Tampon::default());
+    }
+    Ok(anneau)
 }
 
 /// Ce que lisent les attentes et le sondage, sous le Verrou.
@@ -262,7 +269,7 @@ impl Tube {
             compte = compter(n as u64, PAGES_AU_MOINS as u64);
             n = PAGES_AU_MOINS;
         }
-        let anneau = match faillible::remplie(n as usize, Tampon::default()) {
+        let anneau = match vides(n as usize) {
             Ok(a) if !trop(compte).1 => a,
             _ => {
                 compter(n as u64, 0);
@@ -321,7 +328,7 @@ impl Tube {
                 }
                 if t.longueur == 0 {
                     reveiller_ecrivain |= e.plein();
-                    pages::lacher(t.cadre);
+                    // La page est rendue avec son tampon.
                     *t = Tampon::default();
                     self.etat.verrouiller().queue = e.queue.wrapping_add(1);
                 }
@@ -424,16 +431,17 @@ impl Tube {
                 }
                 apres_attente = false;
                 if !e.plein() {
-                    let Some(cadre) = pages::allouer_pour_programme() else {
+                    let Some(page) = Page::pour_programme() else {
                         if r == 0 {
                             r = -ENOMEM;
                         }
                         break;
                     };
-                    let mut t = Tampon { cadre, debut: 0, longueur: 0, paquet: paquets, fusionnable: !paquets };
+                    let mut t = Tampon { page: Some(page), debut: 0, longueur: 0, paquet: paquets, fusionnable: !paquets };
                     let copies = m.depuis(t.octets());
                     if copies < PAGE && m.restant() != 0 {
-                        pages::lacher(cadre);
+                        // La page est rendue avec le tampon.
+                        drop(t);
                         if r == 0 {
                             r = -EFAULT;
                         }
@@ -568,13 +576,17 @@ impl Tube {
             rendre();
             return -EBUSY;
         }
-        let mut neuf = Vec::new();
-        let copie = neuf.try_reserve_exact(n as usize).is_ok()
-            && neuf.ajouter_tout((0..presentes).map(|i| anneau[(e.queue.wrapping_add(i) & (e.taille - 1)) as usize])).is_ok()
-            && neuf.redimensionner(n as usize, Tampon::default()).is_ok();
-        if !copie {
+        let Ok(mut neuf) = faillible::avec_capacite(n as usize) else {
             rendre();
             return -ENOMEM;
+        };
+        // Les tampons passent de l'ancien anneau au neuf, dans la place prise
+        // juste au-dessus (rien n'échoue plus) ; les cases vides ensuite.
+        for i in 0..presentes {
+            neuf.ajouter_dans_la_place(core::mem::take(&mut anneau[(e.queue.wrapping_add(i) & (e.taille - 1)) as usize]));
+        }
+        for _ in presentes..n {
+            neuf.ajouter_dans_la_place(Tampon::default());
         }
         *anneau = neuf;
         {
@@ -644,11 +656,9 @@ impl Drop for Tube {
             *tubes = Vec::new();
         }
         drop(tubes);
-        // Le dernier Arc rendu, souvent sous le verrou des fichiers (le
-        // dernier close) : l'anneau sans son Mutex, que personne ne tient.
-        for t in self.anneau.seul().iter().filter(|t| t.cadre != 0) {
-            pages::lacher(t.cadre);
-        }
+        // Les pages de l'anneau sont rendues avec lui, juste après (le
+        // dernier Arc rendu, souvent sous le verrou des fichiers : le
+        // dernier close).
         compter(self.comptees.load(Relaxed), 0);
     }
 }

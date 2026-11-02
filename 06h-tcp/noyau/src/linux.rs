@@ -32,7 +32,6 @@
 //! Les numéros de fichier sont des `unsigned int` pour Linux : on n'en
 //! regarde que les 32 bits bas, comme lui.
 
-use core::arch::asm;
 use core::fmt;
 
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
@@ -1564,22 +1563,7 @@ pub fn signal_de_l_exception(vecteur: usize, cadre: &Cadre, cr2: u64, cause: Opt
 /// de Linux) : les exceptions signalées et non masquées (x87 : le mot
 /// d'état et le mot de contrôle ; SIMD : MXCSR), dans l'ordre de Linux.
 fn code_fpu(vecteur: usize) -> i32 {
-    let erreur: u32 = if vecteur == 16 {
-        let (mut controle, mut etat) = (0u16, 0u16);
-        // SAFETY: lire le mot de contrôle et le mot d'état x87 ne change
-        // rien ; ce sont ceux du programme (le noyau ne s'en sert pas).
-        unsafe {
-            asm!("fnstcw [{}]", in(reg) &mut controle, options(nostack));
-            asm!("fnstsw [{}]", in(reg) &mut etat, options(nostack));
-        }
-        (etat & !controle) as u32
-    } else {
-        let mut mxcsr = 0u32;
-        // SAFETY: lire MXCSR ne change rien ; c'est celui du programme.
-        unsafe { asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack)) };
-        !(mxcsr >> 7) & mxcsr
-    };
-    match erreur {
+    match crate::sse::exceptions_en_attente(vecteur) {
         e if e & 0x001 != 0 => 7, // FPE_FLTINV
         e if e & 0x004 != 0 => 3, // FPE_FLTDIV
         e if e & 0x008 != 0 => 4, // FPE_FLTOVF

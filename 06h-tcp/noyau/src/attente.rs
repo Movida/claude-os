@@ -656,13 +656,6 @@ impl<T> Mutex<T> {
         e.pris = true;
         Some(GardeMutex { mutex: self })
     }
-
-    /// La donnée, sans prendre le verrou, quand on la tient seul (`&mut
-    /// self` : personne d'autre ne peut la prendre ; le `get_mut` de Rust) :
-    /// dans un `Drop`, sous un Verrou.
-    pub fn seul(&mut self) -> &mut T {
-        self.donnee.get_mut()
-    }
 }
 
 /// Tant qu'elle existe, on tient le Mutex.

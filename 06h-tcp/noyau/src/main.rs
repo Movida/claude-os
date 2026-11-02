@@ -47,8 +47,6 @@ mod clavier;
 #[allow(unsafe_code)]
 mod cpu;
 #[allow(unsafe_code)]
-mod demarrage;
-#[allow(unsafe_code)]
 mod gdt;
 #[allow(unsafe_code)]
 mod horloge;
@@ -56,8 +54,6 @@ mod horloge;
 mod interruptions;
 #[allow(unsafe_code)]
 mod ioapic;
-#[allow(unsafe_code)]
-mod linux;
 #[allow(unsafe_code)]
 mod msix;
 #[allow(unsafe_code)]
@@ -87,6 +83,8 @@ mod virtqueue;
 #[allow(unsafe_code)]
 mod cadres;
 #[allow(unsafe_code)]
+mod demarrage;
+#[allow(unsafe_code)]
 mod espace_utilisateur;
 #[allow(unsafe_code)]
 mod faillible;
@@ -95,11 +93,10 @@ mod pages;
 #[allow(unsafe_code)]
 mod pagination;
 #[allow(unsafe_code)]
-mod programmes;
-#[allow(unsafe_code)]
 mod tas;
-#[allow(unsafe_code)]
-mod tube;
+// vfs.rs : les pages des fichiers, que le tmpfs désigne par leur numéro de
+// cadre ; un type qui les possède les sortira d'ici, avec la couche VFS de
+// 6m (« Reste à faire »).
 #[allow(unsafe_code)]
 mod vfs;
 
@@ -111,6 +108,9 @@ mod copie_utilisateur;
 // liées (des listes intrusives), les valeurs partagées.
 #[allow(unsafe_code)]
 mod attente;
+// epoll.rs et sondage.rs : leurs entrées de rappel dans les files
+// d'attente ; une interface sûre dans attente.rs les sortira d'ici, avec
+// 6j (« Reste à faire »).
 #[allow(unsafe_code)]
 mod epoll;
 #[allow(unsafe_code)]
@@ -140,17 +140,20 @@ mod descripteurs;
 mod espace;
 mod evenements;
 mod faute_de_page;
-mod futex;
 mod fil;
+mod futex;
+mod linux;
 mod memoire;
 mod pile;
-mod procfs;
 mod processus;
-mod reseau;
+mod procfs;
+mod programmes;
 mod reprise;
+mod reseau;
 mod rusage;
 mod signaux;
 mod sysfs;
+mod tube;
 mod vmalloc;
 mod wasi;
 

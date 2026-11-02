@@ -227,6 +227,30 @@ pub fn masque_mxcsr() -> u32 {
     MASQUE_MXCSR.load(Ordering::Relaxed)
 }
 
+/// Les exceptions flottantes signalées et non masquées du programme, lues
+/// dans ses registres, encore en place après sa faute : pour #MF (16), le
+/// mot d'état x87 moins son mot de contrôle (les bits masqués) ; pour #XM
+/// (19), MXCSR, ses drapeaux moins ses masques (7 bits plus haut). Les
+/// mêmes bits pour les deux (invalide, dénormal, division par zéro,
+/// débordements, inexact), que linux.rs traduit en si_code.
+pub fn exceptions_en_attente(vecteur: usize) -> u32 {
+    if vecteur == 16 {
+        let (mut controle, mut etat) = (0u16, 0u16);
+        // SAFETY: lire le mot de contrôle et le mot d'état x87 ne change
+        // rien ; ce sont ceux du programme (le noyau ne s'en sert pas).
+        unsafe {
+            asm!("fnstcw [{}]", in(reg) &mut controle, options(nostack));
+            asm!("fnstsw [{}]", in(reg) &mut etat, options(nostack));
+        }
+        (etat & !controle) as u32
+    } else {
+        let mut mxcsr = 0u32;
+        // SAFETY: lire MXCSR ne change rien ; c'est celui du programme.
+        unsafe { asm!("stmxcsr [{}]", in(reg) &mut mxcsr, options(nostack)) };
+        !(mxcsr >> 7) & mxcsr
+    }
+}
+
 /// Sauve l'état x87/SSE/AVX du processeur (celui de la tâche courante,
 /// un programme) dans `zone`, au format standard (cadre_signal.rs).
 pub fn sauver_dans(zone: &mut ImageFpu) {

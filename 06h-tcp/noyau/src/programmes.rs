@@ -24,7 +24,7 @@ use crate::descripteurs::Descripteurs;
 use crate::faillible::{self, VecFaillible};
 use crate::memoire::Acces;
 use crate::partage::Arc;
-use crate::{appels_fichiers, chargeur_elf, demarrage, espace, pages, pile, processus, tache, vfs, wasi};
+use crate::{appels_fichiers, chargeur_elf, demarrage, pages, pile, processus, tache, vfs, wasi};
 use fichiers::Identite;
 use alloc::vec::Vec;
 use core::fmt;
@@ -101,53 +101,32 @@ impl fmt::Display for Nom<'_> {
     }
 }
 
-/// L'archive de démarrage, telle que le chargeur l'a déposée : une tranche
-/// de mémoire physique, vue par la projection directe. Elle ne sert que le
-/// temps du déballage (voir `demarrer`).
-fn archive() -> Option<&'static [u8]> {
-    let etendue = demarrage::archive()?;
-    // SAFETY: l'étendue est celle que le chargeur a remplie avec l'archive ;
-    // l'allocateur de démarrage l'a réservée (cadres.rs), elle n'a donc été
-    // donnée à personne d'autre, et personne ne l'écrit. Elle est dans la
-    // mémoire libre de la carte (le chargeur l'a vérifié), donc dans la
-    // projection directe. Elle n'est rendue à l'allocateur de pages qu'une
-    // fois déballée, quand plus personne ne la lit.
-    Some(unsafe {
-        core::slice::from_raw_parts(espace::virtuelle(etendue.debut) as *const u8, (etendue.fin - etendue.debut) as usize)
-    })
-}
-
 /// Déballe l'archive de démarrage dans le système de fichiers de la racine
 /// (vfs.rs), rend sa mémoire, puis lance les commandes de /etc/demarrage.
 /// Une archive mal formée est refusée en entier, avant de rien déballer :
 /// on ne lance pas la moitié d'un système.
 pub fn demarrer() {
-    let octets = archive();
-    let mut valide = octets;
-    match octets {
-        None => afficherln!("[noyau] Pas d'archive de programmes."),
-        Some(o) => {
-            afficherln!("[noyau] Archive de programmes : {} octets a {:#x}.", o.len(), demarrage::archive().map_or(0, |a| a.debut));
-            if let Some(Err(e)) = formats::cpio::lire(o).find(Result::is_err) {
-                afficherln!("[noyau] Archive refusee : {}", e);
-                valide = None;
+    // L'archive, telle que le chargeur l'a déposée, prêtée le temps du
+    // déballage ; sa mémoire retourne ensuite à l'allocateur de pages.
+    let ((valide, bilan), rendus) = demarrage::deballer_archive(|archive| {
+        let mut valide = archive.is_some();
+        match archive {
+            None => afficherln!("[noyau] Pas d'archive de programmes."),
+            Some((o, adresse)) => {
+                afficherln!("[noyau] Archive de programmes : {} octets a {:#x}.", o.len(), adresse);
+                if let Some(Err(e)) = formats::cpio::lire(o).find(Result::is_err) {
+                    afficherln!("[noyau] Archive refusee : {}", e);
+                    valide = false;
+                }
             }
         }
-    }
-    let bilan = match vfs::initialiser(valide) {
+        (valide, vfs::initialiser(archive.map(|(o, _)| o).filter(|_| valide)))
+    });
+    let bilan = match bilan {
         Ok(b) => b,
         Err(e) => return afficherln!("[noyau] Systeme de fichiers impossible a monter (errno {}).", e.errno()),
     };
-    // L'archive retourne à l'allocateur de pages : ses pages entières (les
-    // deux du bord peuvent être partagées avec ce qui la touche).
-    let rendus = demarrage::archive().map_or(0, |a| {
-        let (debut, fin) = (a.debut.next_multiple_of(4096), a.fin / 4096 * 4096);
-        if fin > debut {
-            pages::ajouter_memoire(debut, fin);
-        }
-        fin.saturating_sub(debut)
-    });
-    if valide.is_some() {
+    if valide {
         afficherln!("[noyau] Archive deballee : dossiers {}, fichiers {}, liens symboliques {}, liens physiques {}{} ; archive rendue ({} Kio).",
                     bilan.dossiers, bilan.fichiers, bilan.liens_symboliques, bilan.liens_physiques,
                     if bilan.refusees > 0 { " (des entrees refusees)" } else { "" }, rendus >> 10);

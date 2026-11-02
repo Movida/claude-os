@@ -284,6 +284,35 @@ pub fn liberer(bloc: u64, ordre: u32) {
     pages.liberer(bloc, ordre);
 }
 
+/// Une page que l'on possède seul : un cadre pris comme pour un programme
+/// (`allouer_pour_programme`, au-dessus de la réserve), que personne
+/// d'autre ne voit : ni un autre objet du noyau, ni un programme (elle
+/// n'est jamais projetée). Ses octets se lisent et s'écrivent donc sans
+/// `unsafe`, par la projection directe, et le cadre est rendu quand on la
+/// lâche. Les pages d'un tube (tube.rs), les `struct page` des
+/// `pipe_buffer` de Linux.
+pub struct Page(u64);
+
+impl Page {
+    pub fn pour_programme() -> Option<Page> {
+        allouer_pour_programme().map(Page)
+    }
+
+    /// Ses 4096 octets.
+    pub fn octets(&mut self) -> &mut [u8] {
+        // SAFETY: le cadre n'est qu'à cette Page (personne d'autre ne le
+        // voit, ni ne le projette), et `&mut self` n'en laisse qu'un emprunt
+        // à la fois ; il est vu par la projection directe.
+        unsafe { core::slice::from_raw_parts_mut(espace::virtuelle(self.0) as *mut u8, 4096) }
+    }
+}
+
+impl Drop for Page {
+    fn drop(&mut self) {
+        lacher(self.0);
+    }
+}
+
 /// Le cadre `cadre` (une page allouée) est pris une fois de plus : une
 /// projection de plus, une lecture en cours.
 pub fn prendre(cadre: u64) {

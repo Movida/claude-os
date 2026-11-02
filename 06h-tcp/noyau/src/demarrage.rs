@@ -13,6 +13,7 @@
 
 use crate::carte_memoire::{self, Zone};
 use crate::verrou::Verrou;
+use crate::{espace, pages};
 use core::mem::size_of;
 
 /// Le format écrit par le chargeur (voir INFOS dans ../boot.asm).
@@ -80,4 +81,34 @@ pub unsafe fn recopier(adresse: u64) -> Result<(), &'static str> {
 /// Où le chargeur a déposé l'archive de programmes, s'il y en a une.
 pub fn archive() -> Option<Etendue> {
     INFOS.verrouiller().archive
+}
+
+/// Prête à `f` les octets de l'archive de démarrage (et son adresse
+/// physique), le temps de la déballer, puis rend sa mémoire à
+/// l'allocateur de pages : ses pages entières, les deux du bord pouvant
+/// être partagées avec ce qui la touche (le `free_initrd_mem` de Linux).
+/// Rend ce que rend `f`, et le nombre d'octets rendus. Une seule fois :
+/// ensuite, il n'y a plus d'archive. La tranche ne peut pas sortir de `f`
+/// (sa durée de vie est celle de l'appel) : personne ne la lit après que
+/// sa mémoire est rendue.
+pub fn deballer_archive<R>(f: impl FnOnce(Option<(&[u8], u64)>) -> R) -> (R, u64) {
+    let archive = INFOS.verrouiller().archive.take();
+    // SAFETY: l'étendue est celle que le chargeur a remplie avec l'archive ;
+    // l'allocateur de démarrage l'a réservée (cadres.rs), elle n'a donc été
+    // donnée à personne d'autre, et personne ne l'écrit. Elle est dans la
+    // mémoire libre de la carte (le chargeur l'a vérifié), donc dans la
+    // projection directe. Elle n'est rendue qu'après `f`, et une seule fois
+    // (`take`).
+    let octets = archive.map(|a| unsafe {
+        core::slice::from_raw_parts(espace::virtuelle(a.debut) as *const u8, (a.fin - a.debut) as usize)
+    });
+    let r = f(octets.map(|o| (o, archive.map_or(0, |a| a.debut))));
+    let rendus = archive.map_or(0, |a| {
+        let (debut, fin) = (a.debut.next_multiple_of(4096), a.fin / 4096 * 4096);
+        if fin > debut {
+            pages::ajouter_memoire(debut, fin);
+        }
+        fin.saturating_sub(debut)
+    });
+    (r, rendus)
 }
