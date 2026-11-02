@@ -46,7 +46,7 @@
 //! compte ce travail en carburant. Seul `poll_oneoff` peut durer : il dort
 //! jusqu'à l'échéance qu'on lui donne, comme nanosleep pour un programme
 //! Linux (le processeur passe aux autres) ; un programme WebAssembly n'a pas
-//! de signal pour l'interrompre (ni de ^C avant le terminal, 6j).
+//! de signal pour l'interrompre (ni de ^C avant le terminal, 6k).
 
 use alloc::vec::Vec;
 use core::fmt;

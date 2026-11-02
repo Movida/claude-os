@@ -66,7 +66,7 @@ pub const PILE_INITIALE: u64 = 128 << 10;
 
 /// Où se trouve quoi dans l'espace d'un programme. Une seule fonction le
 /// calcule (l'arch_pick_mmap_layout de Linux) : c'est là que viendra se
-/// brancher l'aléa de l'ASLR (6m). D'ici là, les adresses sont fixes, ce
+/// brancher l'aléa de l'ASLR (6n). D'ici là, les adresses sont fixes, ce
 /// qui aide à mettre ld-linux et `claude` au point (les développeurs de
 /// Linux font de même, avec `setarch -R`).
 pub struct Disposition {

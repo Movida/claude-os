@@ -26,7 +26,7 @@
 //! (/proc/self ne pourrait pas dépendre de qui lit, root pourrait les
 //! effacer, et `st_dev` serait celui de la racine) ; intercepter les chemins
 //! qui commencent par « /proc » dans `open` (un « .. », un lien, un dossier
-//! courant dans /proc le contourneraient). Et le disque de 6l se montera de
+//! courant dans /proc le contourneraient). Et le disque de 6m se montera de
 //! la même façon.
 
 use crate::chemins::{Arbre, Dernier, Fin, PATH_MAX, Texte};

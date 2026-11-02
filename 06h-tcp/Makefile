@@ -1097,7 +1097,7 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin sans-resea
 # appel (`-o /dev/fd/3`), jamais au terminal ; ce qu'écrit claude, à
 # /dev/null. Sous Linux, les horloges (clock_gettime...) passent par le
 # vDSO, sans appel système : notre trace en a de plus (pas de vDSO avant
-# 6m).
+# 6n).
 trace: test-trace.bin $(CLAUDE)
 	-timeout $(DUREE) qemu-system-x86_64 -display none -no-reboot -drive format=raw,file=test-trace.bin,if=$(QEMU_DISQUE) \
 	  $(QEMU_OPTIONS) -serial file:trace.log

@@ -367,7 +367,7 @@ pub fn lire_caractere() -> Option<char> {
 
 /// La tâche du clavier : elle dort tant qu'aucune touche n'est tapée, puis
 /// affiche ce qui l'a été (l'écho du terminal, que fera la discipline de
-/// ligne en 6j). Ne revient pas.
+/// ligne en 6k). Ne revient pas.
 pub fn tache() {
     loop {
         cpu::couper_interruptions();

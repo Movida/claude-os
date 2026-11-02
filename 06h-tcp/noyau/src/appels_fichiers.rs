@@ -904,7 +904,7 @@ pub fn close(fd: u64) -> i64 {
 /// puis fermer dans sa copie : ce que fait un programme avant execve) : sans
 /// objet pour un processus d'un seul fil ; avec plusieurs, la table est au
 /// processus (processus.rs), un fil ne peut pas en avoir une à lui : EINVAL,
-/// avec un message (un écart, jusqu'à execve, 6k).
+/// avec un message (un écart, jusqu'à execve, 6l).
 pub fn close_range(premier: u64, dernier: u64, drapeaux: u64) -> i64 {
     const CLOSE_RANGE_UNSHARE: u64 = 1 << 1;
     const CLOSE_RANGE_CLOEXEC: u64 = 1 << 2;
@@ -1134,7 +1134,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         }
         Sorte::Dossier => Err(errno(Erreur::EISDIR)),
         Sorte::Console if position.is_some() => Err(-ESPIPE),
-        // La console n'est pas encore un terminal (6j) : rien à lire.
+        // La console n'est pas encore un terminal (6k) : rien à lire.
         Sorte::Null | Sorte::Console => Ok(0),
         Sorte::Zero | Sorte::Plein => produire(tampon, longueur, |m| m.fill(0)),
         // /dev/random attend que le générateur soit prêt (EAGAIN en
@@ -1940,13 +1940,13 @@ pub fn flock(fd: u64, operation: u64) -> i64 {
 ///     Linux ne borne pas). Les fichiers de /proc et de /sys en sont : ce
 ///     qu'en dit stat, 0 ou une page, moins la position (mesuré : -3 après
 ///     avoir lu 3 octets de maps). Pour le reste, c'est au pilote d'y
-///     répondre : ENOTTY pour les nôtres (un terminal le fera, 6j), sauf
+///     répondre : ENOTTY pour les nôtres (un terminal le fera, 6k), sauf
 ///     ceux qui ont leurs propres requêtes ;
 ///   - un epoll répond lui-même à toute autre requête : EINVAL
 ///     (`ep_eventpoll_ioctl`, mesuré), et /dev/random et /dev/urandom
 ///     aussi, après les leurs (`ioctl_aleatoire`) ;
 ///   - les requêtes des terminaux (TCGETS, la question d'isatty, et les
-///     autres) : ENOTTY, la console n'en est pas encore un (6j). La glibc
+///     autres) : ENOTTY, la console n'en est pas encore un (6k). La glibc
 ///     met alors la sortie standard dans un tampon complet, vidé à la
 ///     sortie.
 pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
@@ -2561,7 +2561,7 @@ pub fn ftruncate(fd: u64, taille: u64) -> i64 {
 }
 
 /// fsync(fd) et fdatasync(fd) : tout est déjà en mémoire, rien à écrire
-/// sur un disque (il viendra en 6l). Le descripteur doit exister (EBADF),
+/// sur un disque (il viendra en 6m). Le descripteur doit exister (EBADF),
 /// et ne pas être O_PATH. Puis, comme `vfs_fsync_range`, le fichier doit
 /// avoir une opération fsync, sinon EINVAL. Mesuré sous Linux 6.18 : les
 /// fichiers et dossiers du tmpfs en ont une (`noop_fsync`), et les
@@ -2581,7 +2581,7 @@ pub fn fsync(fd: u64) -> i64 {
 }
 
 /// syncfs(fd) : le système de fichiers du fichier écrit sur son disque.
-/// Aucun n'en a (6l) : 0, pour tout descripteur qui n'est pas O_PATH
+/// Aucun n'en a (6m) : 0, pour tout descripteur qui n'est pas O_PATH
 /// (EBADF), quelle que soit la sorte du fichier (mesuré).
 pub fn syncfs(fd: u64) -> i64 {
     match tenir(fd) {

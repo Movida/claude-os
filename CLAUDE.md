@@ -63,7 +63,7 @@ Puis lire `serial.log`. Pour une capture de l'écran, envoyer `screendump ecran.
 3. Noyau Rust : interruptions, horloge, clavier, mémoire physique (fait)
 4. Interpréteur WebAssembly dans le noyau (d'abord une bibliothèque testée sur l'hôte avec la suite de tests officielle de Wasm), puis WASI minimal (`fd_write`, `proc_exit`) (fait)
 5. Chargeur ELF et premiers appels système Linux : un programme C compilé par `gcc -static` tourne dans l'anneau 3 (fait)
-6. Jusqu'à Claude Code, en treize sous-étapes (le découpage et le plan de chacune : `etape-06/plan.md` dans les fichiers du projet) :
+6. Jusqu'à Claude Code, en quatorze sous-étapes (le découpage et le plan de chacune : `etape-06/plan.md` dans les fichiers du projet ; le multiprocesseur, 6j, ajouté par la relecture globale du 2 novembre 2026, qui a décalé les lettres suivantes, voir `HISTORIQUE.md`) :
    - 6a. Mémoire virtuelle à la demande : zones, fautes de page servies, page de zéros, pile qui grandit, surengagement et OOM, mmap/munmap/mprotect/madvise anonymes (fait)
    - 6b. Système de fichiers en mémoire, descripteurs, cache des pages, mmap de fichiers (fait)
    - 6c. Programmes dynamiques : ET_DYN, PT_INTERP, ld-linux et la glibc partagée, un lanceur (`/etc/demarrage`) (fait)
@@ -72,10 +72,15 @@ Puis lire `serial.log`. Pour une capture de l'écran, envoyer `screendump ecran.
    - 6f. Signaux, `epoll`, `eventfd`, tubes (fait)
    - 6g. PCI, virtio-net, Ethernet, IPv4, UDP, DNS (fait)
    - 6h. TCP, sockets, générateur aléatoire (ChaCha20)
-   - 6i. `claude -p "bonjour"` : la première réponse de Claude
-   - 6j. Le port série devient un vrai terminal (termios, `/dev/tty`)
-   - 6k. `fork`, `execve`, un shell : l'outil Bash de Claude Code
-   - 6l. virtio-blk et un système de fichiers persistant
-   - 6m. Durcissement : KPTI, PCID, pages globales, ASLR, vDSO
+   - 6i. `claude -p "bonjour"` : la première réponse de Claude ; le verrou du processus devient un verrou qui dort (le `mmap_lock` de Linux)
+   - 6j. Le multiprocesseur : les processeurs secondaires (INIT-SIPI-SIPI), une zone par processeur et `swapgs`, des verrous qui attendent vraiment, le vidage des TLB par IPI, une file des prêtes par processeur ; la liste de ce qui suppose un seul processeur : `grep -rn UNIPROCESSEUR`
+   - 6k. Le port série devient un vrai terminal (termios, `/dev/tty`)
+   - 6l. `fork`, `execve`, un shell : l'outil Bash de Claude Code
+   - 6m. virtio-blk et un système de fichiers persistant (avec une couche VFS : des opérations par système de fichiers, que demandera ext2)
+   - 6n. Durcissement : KPTI, PCID, pages globales, ASLR, vDSO
 
-Plus tard : un chargeur UEFI, nécessaire pour démarrer sur les PC récents sans mode Legacy/CSM.
+Plus tard :
+
+- un chargeur UEFI, nécessaire pour démarrer sur les PC récents sans mode Legacy/CSM ;
+- un compilateur WebAssembly vers x86_64 dans le noyau (du code compilé en anneau 0, isolé par des pages de garde : ce qui fait la force de Nebulet), puis les flottants du processeur, dans une section « FPU du noyau » (le `kernel_fpu_begin` de Linux), à la place des flottants en arithmétique entière de l'interpréteur ;
+- les pilotes du vrai matériel : un disque (AHCI ou NVMe), une carte réseau (e1000e ou Realtek), le clavier USB (xHCI), PCI Express par ECAM et l'AML de l'ACPI, et le BPB factice pour démarrer sur une clé USB.

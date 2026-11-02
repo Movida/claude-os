@@ -133,7 +133,7 @@ pub fn sonder(o: &FichierTenu, table: &mut Table) -> u32 {
         Sorte::Tube => o.tube().sonder(table, o),
         Sorte::Socket => o.socket().sonder(table, o),
         // Les autres n'ont pas d'opération de sondage chez nous : toujours
-        // prêts. La console n'est pas encore un terminal (6j) : sa lecture
+        // prêts. La console n'est pas encore un terminal (6k) : sa lecture
         // rend « fin de fichier » sans attendre. Une valeur de /proc/sys ou
         // un attribut de /sys en ont une chez Linux, mais ne changent jamais
         // d'eux-mêmes ici : DEFAULT_POLLMASK aussi (mesuré).

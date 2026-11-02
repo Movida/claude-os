@@ -30,7 +30,7 @@
 //!     (le `hiwater_rss` de l'espace d'adressage, espace_utilisateur.rs) ;
 //!   - `ru_minflt` : les fautes de page servies, celles du programme et
 //!     celles des copies du noyau vers lui (`mm_account_fault`) ;
-//!     `ru_majflt` : 0, aucune n'attend un disque (6l) ;
+//!     `ru_majflt` : 0, aucune n'attend un disque (6m) ;
 //!   - `ru_nvcsw` : les bascules où la tâche a cédé le processeur parce
 //!     qu'elle s'endormait (ou mourait) ; `ru_nivcsw` : celles où elle a été
 //!     préemptée, ou a cédé par sched_yield en restant prête (`__schedule`) ;
@@ -41,7 +41,7 @@
 //! laissé à leur processus en finissant (le `signal_struct` de Linux) ;
 //! pour RUSAGE_THREAD, le fil seul (le temps est celui de la tâche
 //! courante, le reste de même, maxrss celle du processus) ; RUSAGE_CHILDREN,
-//! les enfants recueillis : aucun programme n'en a avant 6k (fork), tout est
+//! les enfants recueillis : aucun programme n'en a avant 6l (fork), tout est
 //! à 0, ce que dirait Linux pour un processus sans enfant recueilli.
 
 use core::sync::atomic::{AtomicU64, Ordering};

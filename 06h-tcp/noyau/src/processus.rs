@@ -74,7 +74,7 @@ static PROCHAIN: AtomicU32 = AtomicU32::new(2);
 
 /// Un numéro neuf, de processus ou de fil (le même compteur, comme les pid
 /// et les tid de Linux) : 2, puis 3, 4... Le 1 est celui de l'init,
-/// dont le noyau tient le rôle tant qu'il n'y a pas de `/init` (6k) : il
+/// dont le noyau tient le rôle tant qu'il n'y a pas de `/init` (6l) : il
 /// lance chaque ligne de /etc/demarrage, comme un init lance ses
 /// services, et `getppid` rend 1. Option écartée : donner le 1 à chaque
 /// programme (ce que faisaient les étapes 5 à 6c). Sous Linux, le pid 1

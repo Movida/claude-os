@@ -247,7 +247,7 @@ impl Systeme {
         }
         // Les systèmes montés, vus le temps de l'appel : /proc avec ce qu'il
         // fabrique des processus (procfs.rs), /sys tel qu'il est ; eux deux
-        // seuls, montés au démarrage (un système de plus, le disque de 6l,
+        // seuls, montés au démarrage (un système de plus, le disque de 6m,
         // devra prendre place ici).
         let montes: [(Numero, Montage); 2] = core::array::from_fn(|i| {
             let (point, fs) = &self.montes[i];

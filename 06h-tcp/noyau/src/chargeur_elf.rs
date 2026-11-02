@@ -154,7 +154,7 @@ pub fn verifier(taille: u64, lire: impl Fn(u64, &mut [u8]) -> bool) -> Result<(E
 ///   - un ET_DYN qui a un interpréteur (un PIE ordinaire) : à
 ///     ELF_ET_DYN_BASE, arrondi en dessous à son alignement (`p_align`) et
 ///     à la page : 0x555555554000, l'adresse que tout développeur
-///     reconnaît dans GDB (sans ASLR, 6m) ;
+///     reconnaît dans GDB (sans ASLR, 6n) ;
 ///   - un ET_DYN sans interpréteur (un `gcc -static-pie`, ou ld-linux
 ///     lancé directement) : comme une projection, du haut vers le bas sous
 ///     la base des projections, à une adresse multiple de son alignement,

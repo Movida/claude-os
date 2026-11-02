@@ -149,7 +149,7 @@ struct Demande {
 /// `cadre` : celui de l'appel du créateur.
 pub fn clone(drapeaux: u64, pile: u64, parent_tid: u64, child_tid: u64, tls: u64, cadre: &Cadre) -> i64 {
     let bas = drapeaux & 0xffff_ffff;
-    // Le signal de fin (l'octet bas) ne sert qu'à un processus neuf (6k) :
+    // Le signal de fin (l'octet bas) ne sert qu'à un processus neuf (6l) :
     // celui d'un fil est ignoré, comme chez Linux.
     let d = Demande { drapeaux: bas & !CSIGNAL, pidfd: parent_tid, child_tid, parent_tid, pile, tls };
     cloner(d, cadre)
@@ -254,7 +254,7 @@ pub fn clone3(adresse: u64, taille: u64, cadre: &Cadre) -> i64 {
 /// ERESTARTNOINTR, pour qu'il soit livré avant la création, puis l'appel
 /// refait, même sans SA_RESTART (« Force any signals received before this
 /// point to be delivered before the fork happens », `copy_process`). Un
-/// nouveau processus (fork, vfork, posix_spawn) viendra en 6k : ENOSYS, avec
+/// nouveau processus (fork, vfork, posix_spawn) viendra en 6l : ENOSYS, avec
 /// un message. Puis la base de FS de
 /// CLONE_SETTLS, vérifiée tard comme le `set_new_tls` de Linux (EPERM hors
 /// des adresses des programmes), et le fil (tache::lancer_fil).
@@ -285,7 +285,7 @@ fn cloner(d: Demande, cadre: &Cadre) -> i64 {
     }
     let geres = UN_FIL | SANS_EFFET | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
     if f & UN_FIL != UN_FIL || f & !geres != 0 {
-        afficherln!("[noyau] clone : seulement des fils (pthread_create) ; un processus neuf (fork, vfork) viendra en 6k");
+        afficherln!("[noyau] clone : seulement des fils (pthread_create) ; un processus neuf (fork, vfork) viendra en 6l");
         return -ENOSYS;
     }
     let tls = if f & CLONE_SETTLS != 0 {

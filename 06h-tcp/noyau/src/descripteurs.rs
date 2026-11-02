@@ -8,7 +8,7 @@
 //!     que font read, write, lseek... sur lui (les `file_operations` de
 //!     Linux : un fichier du tmpfs, un dossier, /dev/null, la console...).
 //!     Il est partagé : `dup` en fait un second descripteur, avec la même
-//!     position (fork en fera autant, en 6k). Il vit tant qu'on le tient
+//!     position (fork en fera autant, en 6l). Il vit tant qu'on le tient
 //!     (un compteur), dans une table du noyau (`Ouverts`) ;
 //!   - le DESCRIPTEUR : un petit nombre propre à un processus (la
 //!     `files_struct` de Linux), qui désigne un fichier ouvert, avec un
@@ -65,7 +65,7 @@ pub enum Sorte {
     /// (il attendait jadis que la réserve d'aléa soit pleine).
     Aleatoire { random: bool },
     /// /dev/console : l'écran et le port série. Pas encore un terminal
-    /// (6j) : la lecture rend « fin de fichier ».
+    /// (6k) : la lecture rend « fin de fichier ».
     Console,
     /// Un compteur que se partagent ceux qui s'attendent (eventfd, 6d) :
     /// son objet dans `Prive::EventFd`.
@@ -310,7 +310,7 @@ impl Ouverts {
 #[derive(Clone, Copy, Debug)]
 pub struct Descripteur {
     pub fichier: Fichier,
-    /// FD_CLOEXEC : fermé par execve (6k).
+    /// FD_CLOEXEC : fermé par execve (6l).
     pub fermer_a_l_exec: bool,
 }
 

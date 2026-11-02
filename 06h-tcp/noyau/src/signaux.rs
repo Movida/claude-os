@@ -500,7 +500,7 @@ pub enum Fin {
     /// Son action par défaut le termine.
     ParDefaut,
     /// Son action par défaut l'arrête (SIGSTOP) : sans contrôle des tâches
-    /// (6k), personne ne pourrait lui envoyer SIGCONT. Il est terminé.
+    /// (6l), personne ne pourrait lui envoyer SIGCONT. Il est terminé.
     Suspendu,
 }
 

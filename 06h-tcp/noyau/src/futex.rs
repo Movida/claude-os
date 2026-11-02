@@ -11,7 +11,7 @@
 //! d'adressage), l'adresse, et si le futex est partagé. Linux, pour un
 //! futex partagé d'une page de fichier projetée en commun (MAP_SHARED),
 //! prend l'inode et la position dans le fichier, pour que deux processus
-//! se rencontrent ; sans MAP_SHARED ni fork (6k), un futex partagé ne peut
+//! se rencontrent ; sans MAP_SHARED ni fork (6l), un futex partagé ne peut
 //! être vu que par son processus, et la clé de Linux pour une page anonyme
 //! est la nôtre (`get_futex_key`). Une attente privée et une partagée à la
 //! même adresse ne se rencontrent jamais (mesuré : la clé dit « partagé »).
@@ -27,7 +27,7 @@
 //! qui réveille) serait perdu : une condition de la glibc ne se réveillerait
 //! plus. Relire l'entier sous un verrou demande une lecture qui ne SERT
 //! PAS une faute de page (servir prend le verrou du processus, et attendra
-//! le disque en 6l) : en cas de faute, on rend le verrou, on fait venir la
+//! le disque en 6m) : en cas de faute, on rend le verrou, on fait venir la
 //! page par une lecture ordinaire, et on recommence (`futex_wait_setup`).
 //!
 //! Les futex à héritage de priorité (LOCK_PI...) : ENOSYS, avec un

@@ -1,6 +1,6 @@
 //! Les lignes de /etc/demarrage : ce que le noyau lance au démarrage.
 //!
-//! Sans `fork` ni `execve` (6k), aucun programme ne peut en lancer un autre :
+//! Sans `fork` ni `execve` (6l), aucun programme ne peut en lancer un autre :
 //! le noyau joue le rôle d'`init`, et lit dans un fichier ce qu'il doit
 //! lancer, une commande par ligne, dans l'ordre (un petit `inittab`).
 //! Pourquoi un fichier de l'archive plutôt que la liste des fichiers de
@@ -16,7 +16,7 @@
 //! le `/bin/sh` d'Ubuntu) : tout ce que cette fonction accepte, il le
 //! découpe et le lance de la même façon (les tests le vérifient avec le
 //! `sh` de la machine, et un relecteur l'a fait sur 300 000 lignes tirées
-//! au hasard). En 6k, le même fichier pourra donc être lancé tel quel par
+//! au hasard). En 6l, le même fichier pourra donc être lancé tel quel par
 //! un shell, comme un `/etc/rc`. (bash, lui, diffère sur deux points :
 //! `_=x` en tête, qu'il remplace par le chemin du programme, et `A+=x`,
 //! une affectation par ajout ; chez nous, `_=x` est une affectation comme

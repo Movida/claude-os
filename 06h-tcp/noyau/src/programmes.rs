@@ -7,8 +7,8 @@
 //! fichiers (vfs.rs), puis lit /etc/demarrage : une commande par ligne,
 //! avec ses arguments et son environnement, lancées l'une après l'autre
 //! (la syntaxe : ../formats/src/commande.rs). Sans `fork` ni `execve`
-//! (6k), aucun programme ne peut en lancer un autre : le noyau joue le
-//! rôle d'`init` en attendant. En 6k, un vrai /init, lancé par son chemin
+//! (6l), aucun programme ne peut en lancer un autre : le noyau joue le
+//! rôle d'`init` en attendant. En 6l, un vrai /init, lancé par son chemin
 //! comme sous Linux, lancera un shell, et ce fichier deviendra un script.
 //!
 //! Le format d'un programme se reconnaît à ses premiers octets, sa

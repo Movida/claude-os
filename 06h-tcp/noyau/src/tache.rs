@@ -1290,7 +1290,7 @@ pub fn tuer_au_retour() {
 ///   - une limite écrite dans /etc/demarrage (un `--cpu=`, comme `--dir=`) :
 ///     une seconde entorse à la syntaxe de sh, pour une chose que Linux ne
 ///     fait pas à l'exec ; un programme qui veut une limite la pose
-///     (setrlimit), et le shell de 6k aura `ulimit -t`.
+///     (setrlimit), et le shell de 6l aura `ulimit -t`.
 pub fn verifier_au_retour(cadre: &mut Cadre) {
     let arret = loop {
         cpu::couper_interruptions();
@@ -1346,7 +1346,7 @@ pub fn verifier_au_retour(cadre: &mut Cadre) {
         Arret::Signal(sig, signaux::Fin::ParDefaut) => mourir(signaux::signal(sig), "arrete par un signal"),
         Arret::Signal(sig, signaux::Fin::Suspendu) => mourir(
             signaux::signal(sig),
-            "suspendu par un signal ; sans controle des taches (6k), personne ne pourrait le relancer : termine",
+            "suspendu par un signal ; sans controle des taches (6l), personne ne pourrait le relancer : termine",
         ),
         Arret::Gestionnaire { .. } | Arret::RendreMasque => unreachable!("un gestionnaire, un masque : dans la boucle"),
     }

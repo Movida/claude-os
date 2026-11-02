@@ -208,7 +208,7 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
         (AT_CLKTCK, USER_HZ),
         (AT_PLATFORM, plateforme),
         (AT_EXECFN, execfn),
-        // Linux 6.18 donne en plus AT_SYSINFO_EHDR (l'adresse du vDSO, 6m)
+        // Linux 6.18 donne en plus AT_SYSINFO_EHDR (l'adresse du vDSO, 6n)
         // et AT_RSEQ_FEATURE_SIZE, AT_RSEQ_ALIGN (rseq, que nous n'avons
         // pas) : la glibc a un repli pour chacune (vrais appels de
         // clock_gettime, rseq désactivé).

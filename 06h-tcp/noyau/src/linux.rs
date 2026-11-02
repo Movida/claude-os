@@ -575,8 +575,9 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
 /// Rien n'est mis à zéro d'avance : agrandir le tas ne coûte que la zone.
 /// Le reculer rend les pages que le programme avait touchées, verrou du
 /// processus tenu, donc interruptions coupées : une page rendue prend une
-/// centaine de nanosecondes. Avec l'ordonnanceur, ce verrou deviendra un
-/// verrou qui dort (le mmap_lock de Linux).
+/// centaine de nanosecondes. L'ordonnanceur est là (6e), mais ce verrou
+/// coupe encore les interruptions : un verrou qui dort, en lecture et
+/// écriture (le mmap_lock de Linux), est prévu en 6i.
 fn brk(demande: u64) -> i64 {
     processus::avec(|p| {
         let m = &mut p.memoire;
@@ -654,7 +655,7 @@ fn droits_de(prot: u64) -> Droits {
 ///   - MAP_SHARED (après ses vérifications de droits : écrire demande un
 ///     descripteur ouvert en écriture, EACCES), MAP_GROWSDOWN, MAP_HUGETLB,
 ///     MAP_32BIT, MAP_SYNC : refusés (EINVAL), avec un message du noyau qui
-///     le dit ; `claude` ne s'en sert pas, fork (6k) en aura besoin.
+///     le dit ; `claude` ne s'en sert pas, fork (6l) en aura besoin.
 fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage: u64) -> i64 {
     const MAP_SHARED: u64 = 0x01;
     const MAP_PRIVATE: u64 = 0x02;
@@ -798,7 +799,7 @@ fn peupler(debut: u64, fin: u64, ecriture: bool) -> Result<(), Echec> {
 /// pleine : ENOMEM. Les pages touchées sont rendues verrou du processus
 /// tenu, donc interruptions coupées : une centaine de nanosecondes par
 /// page, des tics d'horloge perdus pour un munmap de centaines de Mio
-/// touchés (le mmap_lock qui dort, avec l'ordonnanceur, y remédiera).
+/// touchés (le mmap_lock qui dort, prévu en 6i, y remédiera).
 fn munmap(adresse: u64, longueur: u64) -> i64 {
     if adresse % PAGE != 0 || longueur == 0 {
         return -EINVAL;
@@ -909,7 +910,7 @@ fn mprotect(adresse: u64, longueur: u64, prot: u64) -> i64 {
 ///     d'avance. Une zone qui ne permet pas l'accès : EINVAL ; plus de
 ///     mémoire : ENOMEM ;
 ///   - MADV_DONTFORK, DOFORK, WIPEONFORK, KEEPONFORK : des drapeaux de
-///     zone, pour le futur fork (6k) ; ils coupent les zones, comme
+///     zone, pour le futur fork (6l) ; ils coupent les zones, comme
 ///     mprotect. WIPEONFORK n'a de sens que pour la mémoire anonyme :
 ///     EINVAL sur un fichier ;
 ///   - MADV_MERGEABLE, UNMERGEABLE : EINVAL, comme un Linux sans KSM (la
@@ -1375,7 +1376,7 @@ fn ecrire_timespec(adresse: u64, t: fichiers::Temps) -> Result<(), ()> {
 /// clock_gettime(horloge, temps) : l'heure d'une des horloges de Linux
 /// (temps.rs). Une horloge inconnue : EINVAL. Sous Linux, la glibc passe
 /// d'ordinaire par le vDSO, une page du noyau projetée chez le programme
-/// qui lit l'heure sans appel système ; sans vDSO (6m), elle fait l'appel.
+/// qui lit l'heure sans appel système ; sans vDSO (6n), elle fait l'appel.
 fn clock_gettime(horloge: u64, adresse: u64) -> i64 {
     let Some(t) = temps::horloge(horloge) else { return -EINVAL };
     match ecrire_timespec(adresse, t) {

@@ -20,7 +20,7 @@
 //! La faute est servie interruptions coupées (porte d'interruption), sous
 //! le verrou du processus : trouver la zone et mettre une page à zéro, une
 //! microseconde. Linux rouvre les interruptions parce qu'une faute peut
-//! attendre un disque ; ce sera le cas avec 6l, pas avant.
+//! attendre un disque ; ce sera le cas avec 6m, pas avant.
 
 use crate::copie_utilisateur::{self, SMAP_ACTIF};
 use crate::espace_utilisateur::ADRESSE_MAX;

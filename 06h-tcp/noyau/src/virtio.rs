@@ -20,7 +20,7 @@
 //! état, files), la zone de NOTIFICATION (où l'on écrit pour dire « une file
 //! a du nouveau »), le registre ISR (seulement pour INTx), et la
 //! configuration du PÉRIPHÉRIQUE. Le pilote d'une sorte de périphérique
-//! (reseau/virtio_net.rs) s'en sert ; le disque (virtio-blk, 6l) s'en
+//! (reseau/virtio_net.rs) s'en sert ; le disque (virtio-blk, 6m) s'en
 //! servira de même.
 //!
 //! Options écartées :

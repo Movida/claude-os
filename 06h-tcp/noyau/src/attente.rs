@@ -548,7 +548,7 @@ pub fn tic() {
 /// dorment : ni une
 /// échéance, ni une autre tâche (aucune ne s'exécute), ni un périphérique
 /// (le clavier ne réveille que sa tâche du noyau, jusqu'au terminal de
-/// 6j). Linux les laisserait endormis pour toujours ; sans terminal,
+/// 6k). Linux les laisserait endormis pour toujours ; sans terminal,
 /// personne ne pourrait les interrompre (pas de ^C) : chacun est arrêté
 /// par SIGKILL, en le disant. Un écart voulu, qui généralise celui de 6d
 /// (une attente de futex sans délai dans un programme d'un seul fil). Les

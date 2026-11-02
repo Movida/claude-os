@@ -24,7 +24,7 @@
 //!     des machines sans pagination) : plus d'isolation entre eux ;
 //!   - une moitié haute sans le noyau (KPTI, la parade de Linux contre
 //!     Meltdown, 2018) : à chaque entrée dans le noyau, il faut changer de
-//!     CR3, et sans PCID chaque changement vide le TLB. En 6m, avec PCID
+//!     CR3, et sans PCID chaque changement vide le TLB. En 6n, avec PCID
 //!     (Meltdown touche les Intel d'avant 2018).
 //!
 //! Adresses permises : de 64 Kio à la dernière page de la moitié basse,
@@ -74,7 +74,7 @@ const SANS_ACCES: u64 = 1 << 9;
 /// mémoire. La première écriture fait une faute (la page est en lecture
 /// seule), et le noyau donne alors une page neuve à la place : la COPIE À
 /// L'ÉCRITURE, le mécanisme qui servira aussi aux fichiers projetés en
-/// privé (6b) et à fork (6k).
+/// privé (6b) et à fork (6l).
 ///
 /// Elle est dans les constantes du noyau (.rodata) : la pagination W^X la
 /// projette en lecture seule pour le noyau aussi, y compris par la
@@ -298,7 +298,7 @@ impl EspaceUtilisateur {
     /// Le cadre neuf est mis à zéro ici, interruptions coupées (on tient le
     /// verrou du processus) : 4 Kio, une microseconde. (Linux rouvre les
     /// interruptions pendant une faute, parce qu'elle peut attendre un
-    /// disque ; ce sera le cas avec le disque de 6l.)
+    /// disque ; ce sera le cas avec le disque de 6m.)
     pub fn servir(&mut self, page: u64, droits: Droits, ecriture: bool) -> Result<(), Erreur> {
         if !adresse_permise(page) {
             return Err(Erreur::AdresseInterdite);
