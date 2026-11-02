@@ -368,57 +368,88 @@ Pendant 6h, à la demande de David, une relecture du projet entier face à ses v
 
 ## 22. Reste à faire
 
-**Dans le noyau**
+Deux listes, depuis la relecture globale (section 21) : les **dettes**, à rembourser, chacune avec l'étape qui le fera, ou ce qui la déclenchera ; puis les **écarts voulus avec Linux**, permanents, chacun justifié.
 
-- **Allocations faillibles, dans les bibliothèques.** Le noyau n'en a plus aucune qui panique (6h, reste de 6g : `faillible.rs`, notre `Arc`, et `cargo clippy` qui le vérifie). Les bibliothèques qu'il embarque en gardent : `wasm` (plus d'une centaine d'appels, et le module d'un programme dans l'`Arc` de `alloc`), `fichiers` (environ 70), `formats` (environ 35), `inet` et `zones` (une dizaine chacune). Le même passage, et la même règle de clippy pour chacune.
-- **Grandes allocations.** Un bloc du tas ne dépasse pas 4 Mio (l'ordre maximal du buddy) : il faudra projeter des pages éparses d'un seul tenant (`vmalloc`). Pour les mémoires WebAssembly, réserver 4 Gio d'adresses suivies de pages de garde (comme wasmtime), ce qui supprimera aussi le contrôle des bornes une fois le code compilé.
-- **Console non bloquante.** Le port série fait attendre activement (87 µs par octet sur du vrai matériel) : un pilote à interruptions et une file d'attente, comme le tty de Linux.
-- **Pages globales** (CR4.PGE) pour le noyau, maintenant qu'il y a un espace d'adressage par programme ; KPTI et PCID : en 6n.
-- **La carte des zones et la réserve** : la carte d'un programme vient du tas du noyau, qui peut puiser dans la réserve (3 Mio au plus, 5 le temps de l'agrandir) ; Linux prend ses `vm_area_struct` au-dessus du seuil. Avec les allocations faillibles.
-- **Le verrou du processus coupe les interruptions** : un munmap ou la fin d'un programme qui a touché des centaines de Mio rend ses cadres d'un trait, et des tics d'horloge se perdent ; il sérialise aussi les fautes de page de tous les fils. Un verrou qui dort, en lecture et écriture (le `mmap_lock` de Linux) : en 6i.
-- **MAP_SHARED d'un fichier** reste refusé : il faudra écrire les pages dans le fichier, et les retrouver dans chaque processus qui le projette (la carte inverse `i_mmap`, 6l). Pour la même raison, raccourcir un fichier ne retire ses pages que des projections du processus en cours : un autre programme qui le projette (`&`) y lit l'ancien contenu au lieu d'un SIGBUS.
-- **Les verrous de fichiers** (fcntl, flock) sont vérifiés mais toujours accordés : deux programmes lancés par `&` ne s'excluent pas. Une vraie table des verrous.
-- **Le tueur OOM** tue le programme qui faute, pas le plus gros : avec plusieurs programmes à la fois, un petit peut payer pour un gros.
-- **/proc** (6f) : fabriqué à la demande, mais avec seulement ce que demandent nos programmes et `claude` (maps, statm, comm, exe, task, fd) ; ni `stat`, ni `status`, ni `/proc/version`, ni `ns/`, que `claude -p` cherche et dont il se passe. Écart voulu, décidé avec David le 1er novembre 2026 : /proc/<pid>/maps et statm montrent la mémoire du processus tant qu'il vit, même quand son fil principal a fini (Linux, qui la range dans la tâche du fil principal, les montre alors vides : un effet de son organisation, qu'aucun programme n'attend ; l'imiter serait une ligne de `ProcVue`). Le texte d'un lien de fd/ et de maps garde le chemin de l'ouverture, et « (deleted) » se décide par le nombre de liens de l'inode : Linux suit le nom ouvert (son dentry), qui montre un renommage, et « (deleted) » pour un nom effacé dont un autre lien physique garde l'inode ; il faudrait au tmpfs ce dentry. Chercher dans le dossier d'un processus parti rend ENOENT (Linux : ESRCH, par la permission de traverser).
-- **Les fils** : CLOSE_RANGE_UNSHARE refusé avec plusieurs fils (la table est au processus) ; CLONE_PIDFD, set_tid, CLONE_INTO_CGROUP, CLONE_CLEAR_SIGHAND, un processus neuf (fork, vfork : 6l) rendent ENOSYS, un espace de noms EPERM (CLONE_NEWUSER compris, que Linux permet) ; la base de GS n'est pas sauvée par tâche (arch_prctl refuse ARCH_SET_GS).
-- **Préempter en rendant un verrou** (Linux le fait) : chez nous, un réveil fait dans le noyau ne prend effet qu'au retour vers l'anneau 3 ou au tic suivant.
-- **Le test « lignes »** ne peut pas prouver le verrou des écritures de la console sous QEMU sans accélération (TCG ne livre l'horloge qu'entre deux blocs traduits) ; à revoir sur un vrai processeur ou avec le multiprocesseur.
-- **WebAssembly** : l'O_TRUNC de path_open se fait sans le verrou d'écriture de l'inode.
-- **Les limites de ressources** autres que celle des descripteurs sont gardées et rendues, pas appliquées (la pile reste à 8 Mio quoi qu'on demande).
-- **Un seul utilisateur** (1000, root pour le noyau), sans groupes supplémentaires ni setuid : `protected_symlinks` et `protected_regular` ne sont pas suivis, ils ne protégeraient de rien.
-- **O_TMPFILE et RENAME_WHITEOUT** : refusés (EOPNOTSUPP, EINVAL) ; le premier pour des fichiers sans nom, le second pour overlayfs.
-- **La recherche d'un nom dans un dossier** parcourt ses entrées ; une table de hachage (le dcache de Linux) si une mesure le demande.
-- **Écarts voulus avec Linux**, écrits en commentaire : un interpréteur passe par toutes les vérifications du programme (Linux ne vérifie son genre et ses segments qu'après le point de non-retour, et tue le processus), et un interpréteur qui chevauche le programme est refusé (Linux le pose par-dessus) ; un ET_DYN dont un `p_vaddr` relatif dépasse TASK_SIZE est accepté si l'image posée est permise ; mprotect sur une plage avec un trou ne change rien (Linux change ce qui précède le trou) ; MAP_FIXED est refusé à une zone du maximum même quand les fusions l'auraient fait tenir ; une zone rendue inscriptible deux fois est recomptée (pas de VM_ACCOUNT).
-- **Archive cpio** : archives concaténées et compressées.
-- **La console écrit au plus 1024 octets par appel**, et ld-linux ne reprend pas une écriture courte (`ld.so --help` est coupé ; stdio et Bun reprennent). Linux n'écrit jamais court sur un terminal, mais il peut attendre et être interrompu ; notre port série fait attendre activement : le terminal à interruptions et sa file (6k).
-- **Le lanceur `/etc/demarrage`** cède la place à un vrai `/init` et à un shell avec `fork` et `execve` (6l) ; son dossier courant est `/`, que l'utilisateur 1000 ne peut pas écrire (à revoir pour `claude`, 6i). Une limite de temps : le programme la pose (setrlimit), et le shell aura `ulimit -t` (6l).
-- **Le vecteur auxiliaire** n'a pas AT_SYSINFO_EHDR (le vDSO, 6n), AT_RSEQ_* ; `rseq` rend ENOSYS : la glibc a un repli pour chacun.
-- **`unsafe` encore hors des modules d'abstraction** : `vfs.rs` lit et écrit les pages des fichiers par leur numéro de cadre (celui que donne le tmpfs) : un type qui les possède, avec la couche VFS (6m). `epoll.rs` et `sondage.rs` inscrivent leurs entrées de rappel dans les files d'attente : une interface sûre dans `attente.rs`, une entrée qui garde sa file et se retire d'elle-même quand on la lâche (celles d'epoll ne gardent pas leur fichier, comme chez Linux : il les retire en fermant), avec le multiprocesseur (6j), qui reprend `attente.rs`.
-- **Le multiprocesseur** (6j) : tout ce que disent les lignes `UNIPROCESSEUR` du code, dont les listes par processeur du tas, et un ordre total des verrous des fichiers et des processus (deux ordres coexistent depuis /proc à la demande, 6f, sans danger sur un seul processeur : vfs.rs).
-- **Les signaux** (6f) : livrés à leurs gestionnaires, mais un programme qui devrait s'arrêter (SIGSTOP, SIGTSTP) est terminé, faute de contrôle des tâches pour lui envoyer SIGCONT (6k, 6l) ; ni `signalfd`, ni `timerfd`, ni minuteries de processus (`setitimer`, `alarm`, `timer_create`) ; pas de fichier core ; le pid 1 n'a pas le statut à part de Linux ; un signal envoyé au processus est pris par le premier de ses fils qui retourne vers l'anneau 3 sans le bloquer (Linux le laisse au fil qu'il a choisi et prévenu, `complete_signal`). Une attente que rien ne finira (plus aucune tâche prête ni minuterie) arrête les programmes qui dorment, par SIGKILL et en le disant, faute de terminal pour les interrompre.
-- **/proc et /sys** (6d) : root ne peut pas changer les droits de la racine de /proc ni d'un nœud de sysfs (Linux le permet).
-- **epoll** (6f) : Linux refuse un ajout qui ferait plus de 1000 chemins de réveil vers un même fichier (`reverse_path_check`), pas nous.
-- **Ce que `claude -p` demande encore** : TCP (`socket(AF_INET, SOCK_STREAM)` rend ESOCKTNOSUPPORT jusqu'à 6h), et `socketpair`, `copy_file_range`, `sendfile`, `fadvise64`, `inotify_init1`, qui rendent ENOSYS et dont il se passe (copies par read et write, pas de surveillance des fichiers). Sa vérification « memoire rendue » (`make claude-p`) échoue, à raison : les fichiers qu'il laisse dans HOME restent dans le tmpfs.
-- **`mknodat`** (259) est encore un appel inconnu (avec le shell, 6l).
+### Les dettes
 
-**Le réseau** (6g)
+**6h** (en cours)
 
 - **L'identifiant IP** d'un paquet d'une socket non connectée (sauf IP_PMTUDISC_DO et PROBE) et de chaque réponse ou erreur ICMP vient d'un compteur global : un tiers peut y compter, par deux pings, les ICMP que la machine envoie aux autres. Linux hache la destination avec une clé secrète (`__ip_select_ident`) : avec le générateur ChaCha20 de 6h, qui servira aussi aux numéros de séquence de TCP.
-- **Ni fragmentation ni réassemblage** : un datagramme plus grand que la MTU du chemin rend EMSGSIZE (Linux le fragmente avec IP_PMTUDISC_WANT, le réglage par défaut), un fragment reçu est jeté. Une « fragmentation nécessaire » reçue n'est pas retenue pour la route (la MTU du chemin).
-- **ICMP** : la limite des erreurs par destination (`inet_peer`) manque, seule la limite globale est faite. Les options IP ne sont pas validées une à une (`ip_options_compile`) : seules les routes sources sont jetées, sans « problème de paramètre » pour une option fausse.
-- **Une diffusion envoyée** n'est pas rendue aussi aux sockets de la machine (Linux en fait une copie par la boucle) ; ni multidiffusion, ni MSG_MORE et UDP_CORK, ni IP_OPTIONS et IP_RECVTTL (ENOPROTOOPT) ; SO_SNDBUF ne fait jamais attendre. L'interface d'IP_PKTINFO à l'envoi n'est que vérifiée (ENODEV), pas prise pour sortie.
-- **Le DHCP** : les valeurs de l'ACK plutôt que de l'offre (ce que demande la RFC 2131 ; Linux garde l'offre), la porteuse pas attendue (Linux l'attend jusqu'à 120 s), pas de renouvellement du bail (celui de slirp dure un jour).
 - **Le détecteur d'interblocage** épargne un programme bloqué pour toujours dès qu'une de ses sockets est dans un epoll, même que personne n'attend (épargner trop rejoint Linux, qui ne tue jamais personne) : à revoir en 6h si la boucle de Bun le montre.
-- **Pas d'espaces de noms réseau** : /proc/net est un dossier fixe (Linux : un lien vers self/net). Pas d'IPv6, pas d'AF_UNIX (6h) ni d'AF_NETLINK : la glibc s'en passe.
+- **AF_UNIX** (6h).
 
-**Pour le vrai matériel**
+**6i** (`claude -p`)
 
-- **PCI** : seul le premier pont hôte est parcouru ; les bus d'un autre (un serveur à plusieurs complexes racines, l'expandeur `pxb` de QEMU) se trouvent par l'ACPI (l'AML de chaque pont hôte), et l'espace de configuration de PCI Express par ECAM (la table MCFG) : avec le vrai matériel.
+- **Le verrou du processus coupe les interruptions** : un munmap ou la fin d'un programme qui a touché des centaines de Mio rend ses cadres d'un trait, et des tics d'horloge se perdent ; il sérialise aussi les fautes de page de tous les fils. Un verrou qui dort, en lecture et écriture (le `mmap_lock` de Linux).
+- **Ce que `claude -p` demande encore** : `socketpair`, `copy_file_range`, `sendfile`, `fadvise64`, `inotify_init1`, qui rendent ENOSYS et dont il se passe (copies par read et write, pas de surveillance des fichiers). Sa vérification « memoire rendue » (`make claude-p`) échoue, à raison : les fichiers qu'il laisse dans HOME restent dans le tmpfs ; mieux : faire lister par `arbre` ce qu'il y laisse, et vérifier que l'écart de mémoire correspond exactement.
+- **Le dossier courant du lanceur** est `/`, que l'utilisateur 1000 ne peut pas écrire (à revoir pour `claude`).
+
+**6j** (le multiprocesseur)
+
+- **Tout ce que disent les lignes `UNIPROCESSEUR`** du code, dont les listes par processeur du tas, et un ordre total des verrous des fichiers et des processus (deux ordres coexistent depuis /proc à la demande, 6f, sans danger sur un seul processeur : vfs.rs).
+- **Préempter en rendant un verrou** (Linux le fait) : chez nous, un réveil fait dans le noyau ne prend effet qu'au retour vers l'anneau 3 ou au tic suivant. Avec le compte de préemption que demandera le multiprocesseur.
+- **Le test « lignes »** ne peut pas prouver le verrou des écritures de la console sous QEMU sans accélération (TCG ne livre l'horloge qu'entre deux blocs traduits) : avec plusieurs processeurs, ou sur un vrai processeur.
+- **`unsafe` dans epoll.rs et sondage.rs**, pour inscrire leurs entrées de rappel dans les files d'attente : une interface sûre dans `attente.rs`, une entrée qui garde sa file et se retire d'elle-même quand on la lâche (celles d'epoll ne gardent pas leur fichier, comme chez Linux : il les retire en fermant), avec la reprise d'`attente.rs`.
+
+**6k** (le terminal)
+
+- **Console non bloquante.** Le port série fait attendre activement (87 µs par octet sur du vrai matériel) : un pilote à interruptions et une file d'attente, comme le tty de Linux.
+- **La console écrit au plus 1024 octets par appel**, et ld-linux ne reprend pas une écriture courte (`ld.so --help` est coupé ; stdio et Bun reprennent). Linux n'écrit jamais court sur un terminal, mais il peut attendre et être interrompu.
+- **Les signaux** (6f) : un programme qui devrait s'arrêter (SIGSTOP, SIGTSTP) est terminé, faute de contrôle des tâches pour lui envoyer SIGCONT (6k, 6l) ; une attente que rien ne finira (plus aucune tâche prête ni minuterie) arrête les programmes qui dorment, par SIGKILL et en le disant, faute de terminal pour les interrompre.
+
+**6l** (`fork`, `execve`, un shell)
+
+- **Le lanceur `/etc/demarrage`** cède la place à un vrai `/init` et à un shell avec `fork` et `execve`. Une limite de temps : le programme la pose (setrlimit), et le shell aura `ulimit -t`.
+- **Les fils** : un processus neuf (fork, vfork), CLONE_PIDFD, set_tid, CLONE_INTO_CGROUP, CLONE_CLEAR_SIGHAND rendent ENOSYS, un espace de noms EPERM (CLONE_NEWUSER compris, que Linux permet) ; CLOSE_RANGE_UNSHARE est refusé avec plusieurs fils (la table est au processus) ; la base de GS n'est pas sauvée par tâche (arch_prctl refuse ARCH_SET_GS).
+- **MAP_SHARED d'un fichier** reste refusé : il faudra écrire les pages dans le fichier, et les retrouver dans chaque processus qui le projette (la carte inverse `i_mmap`). Pour la même raison, raccourcir un fichier ne retire ses pages que des projections du processus en cours : un autre programme qui le projette (`&`) y lit l'ancien contenu au lieu d'un SIGBUS.
+- **Les verrous de fichiers** (fcntl, flock) sont vérifiés mais toujours accordés : deux programmes lancés par `&` ne s'excluent pas. Une vraie table des verrous ; et l'O_TRUNC de `path_open` (WebAssembly) avec le verrou d'écriture de l'inode.
+- **Le tueur OOM** tue le programme qui faute, pas le plus gros : avec plusieurs programmes à la fois, un petit peut payer pour un gros.
+- **Les limites de ressources** autres que celle des descripteurs sont gardées et rendues, pas appliquées (la pile reste à 8 Mio quoi qu'on demande).
+- **`mknodat`** (259) est encore un appel inconnu.
+- **Les signaux**, le reste : ni `signalfd`, ni `timerfd`, ni minuteries de processus (`setitimer`, `alarm`, `timer_create`) ; pas de fichier core ; le pid 1 n'a pas le statut à part de Linux ; un signal envoyé au processus est pris par le premier de ses fils qui retourne vers l'anneau 3 sans le bloquer (Linux le laisse au fil qu'il a choisi et prévenu, `complete_signal`).
+
+**6m** (le disque)
+
+- **Une couche VFS**, avec des opérations par système de fichiers (le trait `Arbre`/`Monte` couvre la résolution, pas les données), que demandera ext2 ; et un dentry au tmpfs : le texte d'un lien de /proc/<pid>/fd et de maps garde le chemin de l'ouverture, et « (deleted) » se décide par le nombre de liens de l'inode, quand Linux suit le nom ouvert (un renommage s'y voit, et « (deleted) » pour un nom effacé dont un autre lien physique garde l'inode).
+- **`unsafe` dans vfs.rs**, qui lit et écrit les pages des fichiers par leur numéro de cadre (celui que donne le tmpfs) : un type qui les possède, avec cette couche.
+
+**6n** (le durcissement)
+
+- **Pages globales** (CR4.PGE), KPTI, PCID ; **le vecteur auxiliaire** n'a pas AT_SYSINFO_EHDR (le vDSO), ni AT_RSEQ_* ; `rseq` rend ENOSYS : la glibc a un repli pour chacun.
+- **Les allocations des bibliothèques.** Le noyau n'en a plus aucune qui panique (6h : `faillible.rs`, notre `Arc`, et `cargo clippy` qui le vérifie). Les bibliothèques qu'il embarque en gardent : `wasm` (plus d'une centaine d'appels, et le module d'un programme dans l'`Arc` de `alloc`), `fichiers` (environ 70), `formats` (environ 35), `inet` et `zones` (une dizaine chacune). Le même passage, et la même règle de clippy pour chacune, `fichiers` et `inet` d'abord (un programme ou un client du dehors peut les faire allouer).
+- **La carte des zones et la réserve** : la carte d'un programme vient du tas du noyau, qui peut puiser dans la réserve (3 Mio au plus, 5 le temps de l'agrandir) ; Linux prend ses `vm_area_struct` au-dessus du seuil. Avec les allocations de `zones`.
+
+**Avec les pilotes du vrai matériel** (« Plus tard »)
+
+- **PCI** : seul le premier pont hôte est parcouru ; les bus d'un autre (un serveur à plusieurs complexes racines, l'expandeur `pxb` de QEMU) se trouvent par l'ACPI (l'AML de chaque pont hôte), et l'espace de configuration de PCI Express par ECAM (la table MCFG).
 - **virtio-net** veut trois entrées MSI-X (la configuration, une par file) ; une carte qui en a moins reste éteinte, là où Linux se replie sur un vecteur partagé puis sur INTx (dont la ligne se lit dans la table `_PRT` de l'ACPI). Aucune carte de QEMU n'en a moins, sauf demandé.
 - **L'APIC n'est vérifié que sous QEMU**, en xAPIC ; x2APIC (que TCG n'imite pas) fait revenir au 8259. Non vérifiés faute de pouvoir les imiter : `sysretq` avec un SS nul après une bascule sur AMD (le `X86_BUG_SYSRET_SS_ATTRS` de Linux), une adresse ACPI au-delà de MAXPHYADDR (Linux la refuse).
-
 - **NMI pendant le passage éclair en mode protégé du chargeur** : non masqué (Linux le masque par le port 0x70 pour son passage définitif). Risque infime, à revoir si un essai sur vrai matériel le montre.
 - **Démarrage sur clé USB : réserver un BPB factice dans le secteur 0.** Pour une clé, certains BIOS « émulent » une disquette et croient trouver au début du secteur 0 un BPB (BIOS Parameter Block, la description d'un système de fichiers FAT) : ils réécrivent les octets 3 à 0x5A avec leurs propres valeurs, ce qui écraserait notre code. Avant le premier essai sur clé, le secteur 0 devra commencer par un saut court par-dessus une zone de 0x5A octets laissée libre.
+- **Le DHCP** : les valeurs de l'ACK plutôt que de l'offre (ce que demande la RFC 2131 ; Linux garde l'offre), la porteuse pas attendue (Linux l'attend jusqu'à 120 s), pas de renouvellement du bail (celui de slirp dure un jour).
+
+**Si une mesure ou un programme le demande**
+
+- **Grandes allocations.** Un bloc du tas ne dépasse pas 4 Mio (l'ordre maximal du buddy). `vmalloc.rs` projette déjà des pages éparses d'un seul tenant (les piles depuis 6e, `ioremap`) ; ce qui manque, c'est l'allocation générale au-delà de 4 Mio. Pour les mémoires WebAssembly, avec le compilateur (« Plus tard ») : 4 Gio d'adresses suivies de pages de garde (comme wasmtime), ce qui supprimera aussi le contrôle des bornes.
+- **La recherche d'un nom dans un dossier** parcourt ses entrées ; une table de hachage (le dcache de Linux) si une mesure le demande.
+- **Archive cpio** : archives concaténées et compressées.
+- **O_TMPFILE et RENAME_WHITEOUT** : refusés (EOPNOTSUPP, EINVAL) ; le premier pour des fichiers sans nom, le second pour overlayfs.
+- **/proc** (6f) : fabriqué à la demande, mais avec seulement ce que demandent nos programmes et `claude` (maps, statm, comm, exe, task, fd) ; ni `stat`, ni `status`, ni `/proc/version`, ni `ns/`, que `claude -p` cherche et dont il se passe. Chercher dans le dossier d'un processus parti rend ENOENT (Linux : ESRCH, par la permission de traverser). **/proc et /sys** (6d) : root ne peut pas changer les droits de la racine de /proc ni d'un nœud de sysfs (Linux le permet).
+- **epoll** (6f) : Linux refuse un ajout qui ferait plus de 1000 chemins de réveil vers un même fichier (`reverse_path_check`), pas nous.
+- **Ni fragmentation ni réassemblage** : un datagramme plus grand que la MTU du chemin rend EMSGSIZE (Linux le fragmente avec IP_PMTUDISC_WANT, le réglage par défaut), un fragment reçu est jeté. Une « fragmentation nécessaire » reçue n'est pas retenue pour la route (la MTU du chemin). Slirp n'en envoie pas.
+- **ICMP** : la limite des erreurs par destination (`inet_peer`) manque, seule la limite globale est faite. Les options IP ne sont pas validées une à une (`ip_options_compile`) : seules les routes sources sont jetées, sans « problème de paramètre » pour une option fausse.
+- **Une diffusion envoyée** n'est pas rendue aussi aux sockets de la machine (Linux en fait une copie par la boucle) ; ni multidiffusion, ni MSG_MORE et UDP_CORK, ni IP_OPTIONS et IP_RECVTTL (ENOPROTOOPT) ; SO_SNDBUF ne fait jamais attendre. L'interface d'IP_PKTINFO à l'envoi n'est que vérifiée (ENODEV), pas prise pour sortie.
+- **La glibc vient de la machine hôte** (`glibc/`, refaite d'après une empreinte du contenu) : le résultat dépend de l'Ubuntu de l'hôte. WSL et la CI sont tous deux en 24.04 ; une empreinte attendue, comme pour `claude`, arrêterait une construction faite avec une autre glibc, mais aussi chaque mise à jour de sécurité d'Ubuntu : à faire si les deux divergent un jour.
+- **Les tests du démarrage** : `verifier.sh` cherche chaque ligne attendue n'importe où dans le journal, sans en vérifier l'ordre (une ligne peut être satisfaite par un autre programme, plus loin), et quelques morceaux attendus sont très courts (« [noyau] TSC : »). Depuis 6h, il échoue sur tout « ECHEC » ou « PANIQUE » du journal. Vérifier l'ordre, si un test passe un jour à tort.
+
+### Les écarts voulus avec Linux
+
+- **Les programmes** : un interpréteur passe par toutes les vérifications du programme (Linux ne vérifie son genre et ses segments qu'après le point de non-retour, et tue le processus), et un interpréteur qui chevauche le programme est refusé (Linux le pose par-dessus) ; un ET_DYN dont un `p_vaddr` relatif dépasse TASK_SIZE est accepté si l'image posée est permise. Écrits en commentaire.
+- **La mémoire** : mprotect sur une plage avec un trou ne change rien (Linux change ce qui précède le trou) ; MAP_FIXED est refusé à une zone du maximum même quand les fusions l'auraient fait tenir ; une zone rendue inscriptible deux fois est recomptée (pas de VM_ACCOUNT). Écrits en commentaire.
+- **/proc/<pid>/maps et statm** montrent la mémoire du processus tant qu'il vit, même quand son fil principal a fini (Linux, qui la range dans la tâche du fil principal, les montre alors vides : un effet de son organisation, qu'aucun programme n'attend ; l'imiter serait une ligne de `ProcVue`). Décidé avec David le 1er novembre 2026.
+- **Un seul utilisateur** (1000, root pour le noyau), sans groupes supplémentaires ni setuid : `protected_symlinks` et `protected_regular` ne sont pas suivis, ils ne protégeraient de rien.
+- **Pas d'espaces de noms réseau** : /proc/net est un dossier fixe (Linux : un lien vers self/net). Pas d'IPv6, ni d'AF_NETLINK : la glibc s'en passe.
+- **Le DHCP est dans le noyau**, comme l'`ipconfig.c` de Linux, qui ne sert chez lui qu'à démarrer sur le réseau (d'habitude, c'est un programme qui le fait) : faute de shell avant 6l. Il pourra passer dans un programme ensuite.
 
 ## 23. Questions ouvertes
 
