@@ -686,3 +686,276 @@ impl<T> Drop for GardeMutex<'_, T> {
         e.file.reveiller_une();
     }
 }
+
+/// Ce que doit savoir faire la donnée d'une `Possession` : traiter un
+/// élément mis de côté pendant qu'un appel la possédait (un segment reçu),
+/// et un minuteur échu pendant ce temps ; puis recopier son premier étage.
+pub trait Possede {
+    /// Le premier étage : ce qui se lit sous le verrou court, même quand
+    /// un autre possède (l'état, ce qui est lisible... : `poll`).
+    type Court;
+    /// Ce que la réception met de côté (un segment).
+    type Element;
+    /// Traite `e` : par la réception sous le verrou court quand personne ne
+    /// possède, ou par le possesseur qui rend la possession, SANS le verrou
+    /// court.
+    fn traiter(&mut self, e: Self::Element);
+    /// Fait le travail d'un minuteur échu (de même).
+    fn minuteur(&mut self);
+    /// Recopie le premier étage, sous le verrou court ; rend les
+    /// événements à réveiller dans la file de la possession (0 : rien).
+    fn publier(&self, court: &mut Self::Court) -> u32;
+}
+
+struct Court<U, B> {
+    possede: bool,
+    premier: U,
+    /// La file `backlog` de Linux, et sa taille (en unités de l'appelant).
+    file: alloc::collections::VecDeque<B>,
+    taille: usize,
+    /// Un minuteur est tombé pendant qu'on possédait (le
+    /// `TCP_*_TIMER_DEFERRED` de Linux) : un drapeau, jamais perdu.
+    minuteur: bool,
+}
+
+/// La possession d'une socket (le `lock_sock` de Linux, et sa file
+/// `backlog`), pour TCP.
+///
+/// Deux étages, comme 6g pour UDP. Le PREMIER (`Court`) se lit et s'écrit
+/// sous un verrou court (`Verrou`, interruptions coupées), par tous : la
+/// réception, `poll`, epoll. Le SECOND (`T`, la connexion entière) n'est
+/// touché que par qui POSSÈDE la socket (un appel du programme, qui peut y
+/// dormir, s'y faire interrompre, fauter dans une copie), ou par la
+/// réception quand personne ne possède, sous le verrou court. Ce qui
+/// arrive pendant une possession va dans la FILE (le `backlog`) : la
+/// possession rendue la vide (le `release_sock`), jusqu'à la trouver vide
+/// (ce qu'elle émet par `lo` peut y remettre quelque chose). C'est
+/// obligatoire ici : par `lo`, la réponse de l'autre côté revient dans
+/// l'appel même qui possède la socket, qui ne peut ni l'attendre ni la
+/// traiter au milieu de son propre travail.
+///
+/// Option écartée : le `Mutex` de 6g. La tâche du réseau dormirait sur un
+/// appel du programme, et la réponse revenue par `lo` dans l'appel qui
+/// tient le Mutex s'interbloquerait.
+pub struct Possession<T: Possede> {
+    court: Verrou<Court<T::Court, T::Element>>,
+    donnee: UnsafeCell<T>,
+    /// Ceux qui attendent la possession (exclusifs : une seule passe).
+    attente: FileAttente,
+    /// Ceux qui attendent la socket elle-même (lecteurs, écrivains, poll,
+    /// epoll : le `sk_wq`), réveillés de ce que rendent `traiter` et
+    /// `minuteur`.
+    pub(crate) file: FileAttente,
+}
+
+// SAFETY : la donnée n'est touchée que par le possesseur (au plus un, par
+// `possede`), ou sous le verrou court quand personne ne possède.
+unsafe impl<T: Possede + Send> Sync for Possession<T> where T::Court: Send, T::Element: Send {}
+unsafe impl<T: Possede + Send> Send for Possession<T> where T::Court: Send, T::Element: Send {}
+
+impl<T: Possede> Possession<T> {
+    pub fn new(donnee: T, premier: T::Court) -> Possession<T> {
+        Possession {
+            court: Verrou::new(Court { possede: false, premier, file: alloc::collections::VecDeque::new(), taille: 0, minuteur: false }),
+            donnee: UnsafeCell::new(donnee),
+            attente: FileAttente::new(),
+            file: FileAttente::new(),
+        }
+    }
+
+    /// Prend la possession (le `lock_sock`), en dormant tant qu'un autre
+    /// l'a (ininterruptible : comme Linux, un `lock_sock` ne s'interrompt
+    /// pas ; la possession est toujours courte).
+    pub fn posseder(&self) -> Garde<'_, T> {
+        let interruptions = cpu::couper_interruptions();
+        loop {
+            {
+                let mut c = self.court.verrouiller();
+                if !c.possede {
+                    c.possede = true;
+                    break;
+                }
+                self.attente.inscrire_exclusive();
+            }
+            dormir(None, Sommeil::Ininterruptible);
+            self.attente.retirer(tache::courante());
+        }
+        if interruptions {
+            cpu::activer_interruptions();
+        }
+        Garde { p: self }
+    }
+
+    /// Lit le premier étage, sous le verrou court (pour `poll`).
+    pub fn court<R>(&self, f: impl FnOnce(&mut T::Court) -> R) -> R {
+        f(&mut self.court.verrouiller().premier)
+    }
+
+    /// Ce que la réception a pour la donnée : traité tout de suite sous le
+    /// verrou court si personne ne possède ; sinon mis dans la file (taille
+    /// `taille`, refusé au-delà de `limite` : jeté, comme `sk_add_backlog`).
+    /// Rend faux si l'élément est jeté.
+    pub fn du_reseau(&self, e: T::Element, taille: usize, limite: usize) -> bool {
+        let mut c = self.court.verrouiller();
+        if c.possede {
+            if c.taille + taille > limite || c.file.try_reserve(1).is_err() {
+                return false;
+            }
+            c.taille += taille;
+            c.file.push_back(e);
+            return true;
+        }
+        // SAFETY : personne ne possède, et le verrou court est tenu : nul
+        // autre ne touche la donnée.
+        let d = unsafe { &mut *self.donnee.get() };
+        d.traiter(e);
+        let m = d.publier(&mut c.premier);
+        drop(c);
+        self.reveiller(m);
+        true
+    }
+
+    /// Réveille la file de la socket pour les événements `m`.
+    fn reveiller(&self, m: u32) {
+        if m != 0 {
+            self.file.reveiller(m, 0);
+        }
+    }
+
+    /// Un minuteur échu : son travail tout de suite si personne ne
+    /// possède, sinon un drapeau que la possession rendue verra.
+    pub fn minuteur_du_reseau(&self) {
+        let mut c = self.court.verrouiller();
+        if c.possede {
+            c.minuteur = true;
+            return;
+        }
+        // SAFETY : comme `du_reseau`.
+        let d = unsafe { &mut *self.donnee.get() };
+        d.minuteur();
+        let m = d.publier(&mut c.premier);
+        drop(c);
+        self.reveiller(m);
+    }
+
+    /// Rend la possession (le `release_sock`) : la file prise sous le
+    /// verrou court, puis vidée et les minuteurs différés faits SANS lui, en
+    /// possédant encore, comme le `__release_sock` de Linux ; jusqu'à ne
+    /// plus rien trouver ; puis la possession rendue, et le suivant
+    /// réveillé. Sans le verrou court parce que ce traitement émet : par
+    /// `lo`, la réponse de l'autre côté peut revenir aussitôt à cette
+    /// socket, et doit trouver le verrou libre (elle va dans la file, que
+    /// le tour suivant reprend) ; sous le verrou, ce serait une panique
+    /// (« verrou deja pris »).
+    fn rendre(&self) {
+        let mut m = 0;
+        loop {
+            let (mut file, minuteur) = {
+                let mut c = self.court.verrouiller();
+                if c.file.is_empty() && !c.minuteur {
+                    c.possede = false;
+                    c.taille = 0;
+                    break;
+                }
+                c.taille = 0;
+                (core::mem::take(&mut c.file), core::mem::take(&mut c.minuteur))
+            };
+            // SAFETY : nous possédons : nul autre ne touche la donnée (la
+            // réception, qui voit `possede`, met ce qui arrive dans la file).
+            let d = unsafe { &mut *self.donnee.get() };
+            while let Some(e) = file.pop_front() {
+                d.traiter(e);
+            }
+            if minuteur {
+                d.minuteur();
+            }
+            let mut c = self.court.verrouiller();
+            m |= d.publier(&mut c.premier);
+            // La place de la file revient, si rien n'y est arrivé entre-temps.
+            if c.file.is_empty() {
+                c.file = file;
+            }
+        }
+        self.reveiller(m);
+        self.attente.reveiller_une();
+    }
+}
+
+/// Tant qu'elle existe, on possède.
+pub struct Garde<'a, T: Possede> {
+    p: &'a Possession<T>,
+}
+
+impl<'a, T: Possede> Garde<'a, T> {
+    /// La donnée.
+    pub fn donnee(&mut self) -> &mut T {
+        // SAFETY : la garde prouve qu'on possède ; `&mut self` garantit
+        // l'exclusivité locale.
+        unsafe { &mut *self.p.donnee.get() }
+    }
+
+    /// La donnée et le premier étage ensemble, sous le verrou court.
+    pub fn avec_court<R>(&mut self, f: impl FnOnce(&mut T, &mut T::Court) -> R) -> R {
+        let mut c = self.p.court.verrouiller();
+        // SAFETY : on possède.
+        f(unsafe { &mut *self.p.donnee.get() }, &mut c.premier)
+    }
+
+    /// Recopie le premier étage par `f` (qui rend les événements à
+    /// réveiller), puis réveille.
+    pub fn publier(&mut self, f: impl FnOnce(&mut T, &mut T::Court) -> u32) {
+        let m = self.avec_court(f);
+        self.p.reveiller(m);
+    }
+
+    /// Attend que `pret` soit vrai du premier étage, au plus jusqu'à
+    /// `echeance`, en rendant la possession pendant l'attente (sinon ce
+    /// qui finirait l'attente resterait dans la file) : la possession
+    /// rendue (ce qui vide la file, et peut tout changer), puis,
+    /// interruptions coupées, la condition vérifiée sous le verrou court,
+    /// l'inscription dans `file`, le sommeil ; réveillée, la possession
+    /// reprise. L'ordre de Linux (`sk_wait_event` : s'inscrire, rendre,
+    /// dormir) perdrait le réveil ici : `dormir` efface un réveil venu
+    /// avant lui, et `reveiller` retire la tâche de la file. Rend la
+    /// raison du réveil (Reveillee si la condition est vraie).
+    pub fn attendre(&mut self, file: &FileAttente, sommeil: Sommeil, echeance: Option<u64>,
+                    mut pret: impl FnMut(&T::Court) -> bool) -> Reveil {
+        self.p.rendre();
+        let interruptions = cpu::couper_interruptions();
+        let t = tache::courante();
+        let r = loop {
+            {
+                let c = self.p.court.verrouiller();
+                if pret(&c.premier) {
+                    break Reveil::Reveillee;
+                }
+                if sommeil == Sommeil::Interruptible && tache::signal_en_attente() {
+                    break Reveil::Signal;
+                }
+                if echeance.is_some_and(|e| e <= crate::temps::ns_monotone()) {
+                    break Reveil::Echeance;
+                }
+                file.inscrire();
+            }
+            let r = dormir(echeance, sommeil);
+            file.retirer(&t);
+            if r != Reveil::Reveillee {
+                let c = self.p.court.verrouiller();
+                break if pret(&c.premier) { Reveil::Reveillee } else { r };
+            }
+        };
+        if interruptions {
+            cpu::activer_interruptions();
+        }
+        // La possession reprise (le Garde reste valable).
+        let g = self.p.posseder();
+        core::mem::forget(g);
+        r
+    }
+}
+
+impl<T: Possede> Drop for Garde<'_, T> {
+    fn drop(&mut self) {
+        self.p.rendre();
+    }
+}

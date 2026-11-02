@@ -33,7 +33,8 @@
  * qui l'attendait revient en ICMP « hôte injoignable », de nous à nous :
  * une socket connectée sans IP_RECVERR n'en voit rien (l'erreur n'est pas
  * fatale), une socket UDP et une socket de ping avec IP_RECVERR l'ont
- * dans leur file d'erreurs (EHOSTUNREACH, ICMP 3/1, dite par 10.0.2.15).
+ * dans leur file d'erreurs (EHOSTUNREACH, ICMP 3/1, dite par 10.0.2.15) ;
+ * un connect TCP en cours échoue aussitôt (6h : EHOSTUNREACH).
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -131,12 +132,26 @@ static int muet(void)
     int partis = send(connectee, "muet", 4, 0) == 4 && sendto(libre, "muet", 4, 0, (struct sockaddr *)&a, sizeof a) == 4
                  && sendto(ping, m, sizeof m, 0, (struct sockaddr *)&a, sizeof a) == sizeof m;
     verifier(partis, "10.0.2.99 : trois paquets partent (le voisin se cherche)");
+    /* Et un connect TCP non bloquant : son SYN attend le voisin aussi. */
+    struct sockaddr_in at = adresse(0x0a000263, 80);
+    int t = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int rt = connect(t, (struct sockaddr *)&at, sizeof at) < 0 ? errno : 0;
     /* Les deux erreurs, 10 s au plus chacune (le voisin échoue en 3 s). */
     struct pollfd p = { libre, 0, 0 }, q = { ping, 0, 0 };
     poll(&p, 1, 10000);
     poll(&q, 1, 10000);
     verifier(hote_injoignable(libre) == 0, "UDP avec IP_RECVERR : EHOSTUNREACH, ICMP 3/1 de 10.0.2.15");
     verifier(hote_injoignable(ping) == 0, "ping avec IP_RECVERR : EHOSTUNREACH, ICMP 3/1 de 10.0.2.15");
+    /* TCP : avant la fin de la poignée de main, toute erreur ICMP ferme la
+     * connexion (`tcp_v4_err`) : EHOSTUNREACH, sans attendre l'abandon. */
+    struct pollfd tp = { t, POLLOUT, 0 };
+    poll(&tp, 1, 10000);
+    int so = -1;
+    socklen_t lso = sizeof so;
+    getsockopt(t, SOL_SOCKET, SO_ERROR, &so, &lso);
+    verifier(rt == EINPROGRESS && (tp.revents & POLLERR) && so == EHOSTUNREACH,
+             "TCP vers 10.0.2.99 : EHOSTUNREACH apres l'echec du voisin (connect non bloquant)");
+    close(t);
     struct pollfd c = { connectee, POLLIN, 0 };
     char o[8];
     verifier(poll(&c, 1, 0) == 0 && recv(connectee, o, sizeof o, MSG_DONTWAIT) == -1 && errno == EAGAIN,

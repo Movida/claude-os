@@ -174,6 +174,7 @@ fn erreur_recue(i: &'static Interface, h: &format_ipv4::Ipv4, m: &Icmp, donnees:
     };
     match interne.protocole {
         format_ipv4::UDP => super::udp::erreur(&e),
+        format_ipv4::TCP => super::tcp::erreur(&e),
         format_ipv4::ICMP => super::ping::erreur(&e),
         _ => {}
     }

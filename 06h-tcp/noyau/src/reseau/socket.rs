@@ -133,6 +133,8 @@ pub enum Protocole {
     Udp,
     /// Les sockets de ping (ping.rs) : SOCK_DGRAM et IPPROTO_ICMP.
     Ping,
+    /// TCP (tcp.rs, 6h) : SOCK_STREAM.
+    Tcp,
 }
 
 /// La règle qui accepte un datagramme en file.
@@ -298,6 +300,8 @@ pub struct Socket {
     /// La suivante des sockets qu'une tâche a à fermer (sa liste
     /// `Tache::fermetures`, voir `fichier_ferme`).
     suivante: Verrou<Option<Arc<Socket>>>,
+    /// Le flux d'une socket TCP (tcp.rs) : sa possession et sa connexion.
+    pub flux: Option<alloc::boxed::Box<crate::attente::Possession<super::tcp::Partie>>>,
 }
 
 impl Socket {
@@ -318,7 +322,32 @@ impl Socket {
             recverr: AtomicBool::new(false),
             pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
             suivante: Verrou::new(None),
+            flux: None,
         }
+    }
+
+    /// Une socket TCP : son flux, et ses tampons de départ (`tcp_rmem[1]`,
+    /// `tcp_wmem[1]`).
+    pub fn tcp(mut self) -> Socket {
+        self.flux = Some(alloc::boxed::Box::new(super::tcp::nouvelle(self.numero)));
+        self.rcvbuf.store(super::tcp::RCVBUF_DEFAUT, Ordering::Relaxed);
+        self.sndbuf.store(super::tcp::SNDBUF_DEFAUT, Ordering::Relaxed);
+        self
+    }
+
+    /// La même, avec un flux déjà fait (la fille d'une écoute, à
+    /// `accept`).
+    pub fn avec_flux(mut self, f: alloc::boxed::Box<crate::attente::Possession<super::tcp::Partie>>) -> Socket {
+        self.flux = Some(f);
+        self.rcvbuf.store(super::tcp::RCVBUF_DEFAUT, Ordering::Relaxed);
+        self.sndbuf.store(super::tcp::SNDBUF_DEFAUT, Ordering::Relaxed);
+        self
+    }
+
+    /// La même, avec le numéro `n` (celui de la fille, déjà dans la table).
+    pub fn avec_numero(mut self, n: u64) -> Socket {
+        self.numero = n;
+        self
     }
 
     /// Dépose un datagramme reçu (dans la tâche du réseau), si la règle
@@ -410,6 +439,10 @@ impl Socket {
     /// datagramme en file (POLLIN), et toujours l'écriture (nos envois ne
     /// comptent pas dans SO_SNDBUF : « Reste à faire »).
     pub fn sonder(&self, table: &mut Table, tenu: &FichierTenu) -> u32 {
+        if let Some(f) = &self.flux {
+            table.attendre(&f.file, tenu);
+            return super::tcp::sonder(self);
+        }
         table.attendre(&self.attente, tenu);
         let r = self.reception.verrouiller();
         let mut m = POLLOUT | POLLWRNORM | POLLWRBAND;
@@ -605,6 +638,14 @@ pub fn fermer_les_differees() {
             *tete = s.suivante.verrouiller().take();
             s
         };
-        super::datagramme::table::retirer(&s);
+        match s.protocole {
+            Protocole::Tcp => super::tcp::fermer(&s),
+            _ => super::datagramme::table::retirer(&s),
+        }
     }
+}
+
+/// Un numéro de socket neuf (la fille d'une écoute en prend un).
+pub fn nouveau_numero() -> u64 {
+    NUMEROS.fetch_add(1, Ordering::Relaxed)
 }

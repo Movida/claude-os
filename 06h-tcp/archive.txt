@@ -41,6 +41,7 @@ file  /bin/ajout           linux/construits/ajout 755 0 0
 file  /bin/reseau          linux/construits/reseau 755 0 0
 file  /bin/dns             linux/construits/dns 755 0 0
 file  /bin/aleatoire       linux/construits/aleatoire 755 0 0
+file  /bin/tcp             linux/construits/tcp 755 0 0
 file  /bin/passerelle      linux/construits/passerelle 755 0 0
 
 # Les commandes que lance le noyau (formats/src/commande.rs). Écrit avant

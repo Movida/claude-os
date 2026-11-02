@@ -196,6 +196,10 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
             }
         }
         ipv4::ICMP => super::icmp::recevoir(i, &h, diffusion, p),
+        // TCP : jamais pour une diffusion (`tcp_v4_rcv` jette tout ce qui
+        // n'est pas pour une seule machine).
+        ipv4::TCP if !diffusion => super::tcp::recevoir(h.source, h.destination, i.boucle(), p),
+        ipv4::TCP => {}
         _ => injoignable(icmp::PROTOCOLE, p),
     }
 }

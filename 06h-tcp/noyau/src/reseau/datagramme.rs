@@ -31,6 +31,8 @@ pub mod table {
         match s.protocole {
             Protocole::Udp => udp::inscrire(s, inet, port),
             Protocole::Ping => ping::inscrire(s, inet, port),
+            // TCP a sa propre table (tcp.rs).
+            Protocole::Tcp => Ok(()),
         }
     }
 
@@ -38,6 +40,7 @@ pub mod table {
         match s.protocole {
             Protocole::Udp => udp::changer(s, inet),
             Protocole::Ping => ping::changer(s, inet),
+            Protocole::Tcp => {}
         }
     }
 
@@ -45,6 +48,7 @@ pub mod table {
         match s.protocole {
             Protocole::Udp => udp::liberer(s),
             Protocole::Ping => ping::liberer(s),
+            Protocole::Tcp => {}
         }
     }
 
@@ -52,6 +56,7 @@ pub mod table {
         match s.protocole {
             Protocole::Udp => udp::reutilisation_changee(s, inet),
             Protocole::Ping => ping::reutilisation_changee(s, inet),
+            Protocole::Tcp => super::super::tcp::reutilisation_changee(s, inet),
         }
     }
 }

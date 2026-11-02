@@ -29,6 +29,7 @@ pub mod ping;
 pub mod proc;
 pub mod socket;
 pub mod tache;
+pub mod tcp;
 pub mod udp;
 pub mod virtio_net;
 
@@ -49,6 +50,7 @@ pub fn demarrer() {
     udp::initialiser();
     ping::initialiser();
     tache::initialiser();
+    tcp::initialiser();
     boucle::ajouter();
     virtio_net::sonder();
     tache::lancer();
@@ -57,7 +59,7 @@ pub fn demarrer() {
 /// Le nombre de sockets liées dont quelqu'un attend une lecture (le
 /// détecteur d'interblocage, attente.rs).
 pub fn attentes() -> usize {
-    udp::attentes() + ping::attentes()
+    udp::attentes() + ping::attentes() + tcp::attentes()
 }
 
 /// Le réseau est-il au repos : plus rien dans une file du noyau (celle de
@@ -67,7 +69,7 @@ pub fn attentes() -> usize {
 /// programme : un paquet qu'il a envoyé peut encore être en route, et tenir
 /// de la mémoire, quand il finit.
 pub fn au_repos() -> bool {
-    boucle::au_repos() && virtio_net::au_repos() && !arp::en_attente() && tache::au_repos()
+    boucle::au_repos() && virtio_net::au_repos() && !arp::en_attente() && tache::au_repos() && tcp::orphelines() == 0
 }
 
 /// Configure le réseau par DHCP, et attend la fin : dans le lanceur, avant

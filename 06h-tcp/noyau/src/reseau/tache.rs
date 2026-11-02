@@ -114,7 +114,7 @@ pub fn lancer() {
 /// pour qui. Faites au démarrage, à leur taille définitive.
 static ECHEANCES: Verrou<Option<Echeances>> = Verrou::new(None);
 /// Le nombre d'objets qui peuvent avoir une échéance à la fois.
-const MAX_ECHEANCES: usize = 64;
+const MAX_ECHEANCES: usize = 8192;
 /// L'objet « table des voisins » (arp.rs) ; les connexions TCP prendront
 /// le numéro de leur socket, qui part de 1.
 pub const OBJET_VOISINS: u64 = u64::MAX;
@@ -125,6 +125,16 @@ pub fn initialiser() {
     if ECHEANCES.verrouiller().is_none() {
         afficherln!("[reseau] plus de memoire pour les echeances du reseau.");
     }
+}
+
+/// L'objet `objet` veut la tâche du réseau à `echeance` (None : plus
+/// jamais), et la réveille pour qu'elle recalcule son sommeil. false :
+/// la liste est pleine (l'objet ne sera pas servi à l'heure : à lui de
+/// s'en accommoder).
+pub fn armer(objet: u64, echeance: Option<u64>) -> bool {
+    let ok = inscrire(objet, echeance);
+    reveiller();
+    ok
 }
 
 /// Réveille la tâche du réseau, pour qu'elle recalcule son sommeil (après
@@ -185,6 +195,9 @@ fn boucle() {
         while let Some(objet) = prendre_echu(maintenant) {
             if objet == OBJET_VOISINS {
                 voisins = true;
+            } else {
+                // Une connexion TCP, ou une entrée de TIME_WAIT.
+                super::tcp::echeance(objet);
             }
         }
         if core::mem::take(&mut voisins) {

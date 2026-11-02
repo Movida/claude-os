@@ -5,7 +5,10 @@
 # interruptions, la gigue ; getrandom, /dev/random, linux/aleatoire.c),
 # et virtio-rng, le générateur matériel de QEMU (noyau/src/virtio_rng.rs) ;
 # les échéances du réseau (inet/src/echeances.rs), le contexte réseau
-# (noyau/src/reseau/contexte.rs) et la fermeture différée des sockets.
+# (noyau/src/reseau/contexte.rs) et la fermeture différée des sockets ;
+# TCP (inet/src/tcp.rs, la machine à états, et inet/src/ports_tcp.rs ;
+# noyau/src/reseau/tcp.rs, et la possession d'une socket dans
+# noyau/src/attente.rs ; linux/tcp.c), jusqu'à l'API pour claude -p.
 # De 6g : le réseau. Le bus PCI (formats/src/pci.rs et
 # noyau/src/pci.rs), les vecteurs d'interruption à la demande et MSI-X,
 # virtio (noyau/src/virtio.rs, virtqueue.rs) et la carte virtio-net, ses
@@ -54,8 +57,9 @@
 #                  une carte sans MSI-X laissée éteinte ; le câble
 #                  débranché puis rebranché, vu ; un réseau sans DHCP ;
 #                  et make claude-p
-#   make claude-p -> le jalon de 6f et de 6g, dans une image à part :
-#                  claude -p bonjour jusqu'à la connexion à l'API
+#   make claude-p -> le jalon de 6f à 6h, dans une image à part :
+#                  claude -p bonjour jusqu'à l'API (6h : TLS par Bun
+#                  sur notre TCP, et la réponse de l'API à une fausse clé)
 #                  (claude-p-attendu.txt)
 #   make tests-hote -> les tests sur la machine hôte : ceux de la
 #                  bibliothèque des formats (formats/ : archive cpio,
@@ -66,8 +70,8 @@
 #                  système de fichiers (fichiers/ : une règle de Linux par
 #                  cas, puis des milliers d'opérations au hasard comparées
 #                  à un modèle naïf) ; ceux de la pile d'IPv4 (inet/ :
-#                  les routes, le client DHCP, les échéances, à
-#                  l'horloge simulée) ; ceux
+#                  les routes, le client DHCP, les échéances, TCP et ses
+#                  ports, à l'horloge simulée) ; ceux
 #                  de la bibliothèque crypto (crypto/ : ChaCha20, BLAKE2s
 #                  et SipHash, contre les vecteurs officiels, et les règles
 #                  du générateur de Linux) ; puis
@@ -89,7 +93,8 @@
 #                  linux/courses (des programmes à plusieurs fils),
 #                  linux/reseau (les sockets UDP et ICMP, sur lo) et
 #                  linux/dns (getaddrinfo, par un DNS du programme),
-#                  et linux/aleatoire (getrandom, /dev/random)
+#                  linux/aleatoire (getrandom, /dev/random) et
+#                  linux/tcp (les sockets TCP, sur lo)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -234,6 +239,9 @@ boot.bin: programmes.cpio FORCE
 #   - dns : gcc sans option (la glibc partagée, comme claude), getaddrinfo
 #     par un serveur DNS du programme (des réponses de travers, NXDOMAIN,
 #     /etc/hosts) ; sur l'hôte aussi ;
+#   - tcp : gcc -static, les sockets TCP sur lo (les appels et leurs refus,
+#     les options, l'écoute et sa file, les fermetures, epoll par front,
+#     1 Mio en aller-retour entre deux fils) ; sur l'hôte aussi ;
 #   - aleatoire : gcc -static, le générateur (getrandom et ses refus,
 #     /dev/random, /dev/urandom, /proc/sys/kernel/random) ; sur l'hôte
 #     aussi ;
@@ -364,6 +372,10 @@ $(LINUX)/reseau: linux/reseau.c
 $(LINUX)/dns: linux/dns.c
 	mkdir -p $(LINUX)
 	gcc $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/tcp: linux/tcp.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/aleatoire: linux/aleatoire.c
 	mkdir -p $(LINUX)
@@ -749,7 +761,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -782,8 +794,9 @@ claude-p.bin: claude-p.cpio FORCE
 DUREE_CLAUDE_P = 240
 
 # claude -p bonjour, dans notre noyau : il doit aller jusqu'à l'appel de
-# l'API, trouver son adresse par le DNS, et dire que la connexion est
-# refusée (pas de TCP avant 6h). Sa ligne de fin ne dit pas « memoire
+# l'API, trouver son adresse par le DNS, s'y connecter par notre TCP, et
+# rapporter ce que l'API répond à une fausse clé, par TLS (« Invalid API
+# key », claude-p-attendu.txt). Sa ligne de fin ne dit pas « memoire
 # rendue : ok » : Claude laisse dans HOME sa configuration (.claude.json et
 # ses copies) et la télémétrie qu'il n'a pas pu envoyer (environ 300 Kio),
 # que le tmpfs garde, à raison. Le contrôle ne sait pas les distinguer
@@ -796,7 +809,7 @@ claude-p: claude-p.bin
 	  grep -qF -- "arbre : termine" claude-p.log 2>/dev/null && break; kill -0 $$q 2>/dev/null || break; sleep 0.1; \
 	done; \
 	kill $$q 2>/dev/null; wait $$q 2>/dev/null; \
-	grep -E "API Error|claude : termine" claude-p.log; \
+	grep -E "API Error|API key|claude : termine" claude-p.log; \
 	while IFS= read -r ligne; do \
 	  grep -qF -- "$$ligne" claude-p.log || { echo "claude -p : manque « $$ligne »"; exit 1; }; \
 	done < claude-p-attendu.txt
@@ -907,7 +920,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -944,6 +957,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	timeout 60 ./$(LINUX)/reseau | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/dns | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/aleatoire | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	timeout 120 ./$(LINUX)/tcp | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	rm -rf /tmp/ajout; \
 	  ./$(LINUX)/ajout ecrire a 500 & a=$$!; ./$(LINUX)/ajout ecrire b 500 & b=$$!; \
 	  ./$(LINUX)/ajout verifier 500 | tee /dev/stderr | (! grep -q ECHEC); r=$$?; wait $$a $$b; exit $$r

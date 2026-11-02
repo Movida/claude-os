@@ -761,7 +761,7 @@ fn fermer_descripteur(fd: u64) -> Result<(), i64> {
 /// une fois le fichier installé (`installer`, le `fd_install`). Une garde,
 /// comme les plus récentes de Linux (`CLASS(get_unused_fd, ...)`,
 /// include/linux/file.h) : aucun chemin d'erreur ne peut l'oublier.
-struct NumeroReserve(u64);
+pub struct NumeroReserve(u64);
 
 impl NumeroReserve {
     /// Installe `fichier` (tenu une fois, pour le descripteur) au numéro
@@ -782,7 +782,7 @@ impl Drop for NumeroReserve {
 
 /// Réserve le plus petit numéro libre du processus en cours (EMFILE,
 /// ENOMEM).
-fn reserver() -> Result<NumeroReserve, i64> {
+pub fn reserver() -> Result<NumeroReserve, i64> {
     processus::avec(|p| p.descripteurs.reserver(0)).map(NumeroReserve).map_err(errno_table)
 }
 
@@ -854,29 +854,40 @@ pub fn installer_paire(a: FichierOuvert, b: FichierOuvert, fermer_a_l_exec: bool
 /// est dans la table, avant que son descripteur n'existe (personne ne peut
 /// encore s'en servir) : un epoll y apprend sa case.
 pub fn installer_fichier_puis(f: FichierOuvert, fermer_a_l_exec: bool, range: impl FnOnce(Fichier)) -> i64 {
-    // Refusé, le fichier rend son inode s'il en tient un du tmpfs (celui
-    // d'une socket : 6g).
-    let rendre = |f: FichierOuvert| {
-        if let Tenu::Tmpfs(o) = f.tenu {
-            vfs::avec(|fs, cadres| fs.fermer(&o, cadres));
-        }
-    };
     let fd = match reserver() {
         Ok(fd) => fd,
         Err(e) => {
-            rendre(f);
+            rendre_fichier(f);
             return e;
         }
     };
-    match vfs::avec_systeme(|s, _| s.ouverts.ajouter(f)) {
-        Ok(fichier) => {
-            range(fichier);
-            fd.installer(fichier, fermer_a_l_exec) as i64
-        }
+    match installer_reserve_puis(fd, f, fermer_a_l_exec, range) {
+        Ok(fd) => fd as i64,
         Err(f) => {
-            rendre(f);
+            rendre_fichier(f);
             -ENOMEM
         }
+    }
+}
+
+/// Range le fichier ouvert neuf `f` dans la table, puis l'installe au
+/// numéro réservé `fd` (le `fd_install`), en appelant `range` entre les deux
+/// (voir `installer_fichier_puis`) : le numéro ; sans place dans la table
+/// (ENOMEM), le fichier est rendu à l'appelant, et le numéro libéré.
+pub fn installer_reserve_puis(fd: NumeroReserve, f: FichierOuvert, fermer_a_l_exec: bool, range: impl FnOnce(Fichier))
+    -> Result<u64, FichierOuvert> {
+    let fichier = vfs::avec_systeme(|s, _| s.ouverts.ajouter(f))?;
+    range(fichier);
+    Ok(fd.installer(fichier, fermer_a_l_exec))
+}
+
+/// Un fichier ouvert neuf qui n'entrera pas dans la table : il rend son
+/// inode s'il en tient un du tmpfs (celui d'une socket, 6g). Son objet du
+/// noyau, lui, est à l'appelant (une socket se ferme comme à son dernier
+/// `close`).
+pub fn rendre_fichier(f: FichierOuvert) {
+    if let Tenu::Tmpfs(o) = f.tenu {
+        vfs::avec(|fs, cadres| fs.fermer(&o, cadres));
     }
 }
 

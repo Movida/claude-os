@@ -5,7 +5,7 @@
 //! bonne raison ; puis des mutations au hasard, à graine fixe : aucune
 //! panique, et ce qui est accepté reste dans les octets reçus.
 
-use formats::reseau::{self, Erreur, arp, dhcp, ethernet, icmp, ipv4, udp};
+use formats::reseau::{self, Erreur, arp, dhcp, ethernet, icmp, ipv4, tcp, udp};
 use std::path::PathBuf;
 
 fn trame(nom: &str) -> Vec<u8> {
@@ -329,4 +329,106 @@ fn mutations() {
         }
     }
     assert!(acceptes > 10_000, "trop peu de messages acceptés ({acceptes}) : le test ne mord plus");
+}
+
+/// Un segment écrit par `tcp::ecrire` : l'en-tête, ses options, la charge.
+fn segment(t: &tcp::Tcp, charge: &[u8], s: [u8; 4], d: [u8; 4], somme: bool) -> Vec<u8> {
+    let n = tcp::longueur_entete(&t.options);
+    let mut o = vec![0u8; n + charge.len()];
+    o[n..].copy_from_slice(charge);
+    tcp::ecrire(&mut o, t, s, d, somme);
+    o
+}
+
+#[test]
+fn tcp_ecrit_puis_relu() {
+    let (s, d) = ([10, 0, 2, 15], [160, 79, 104, 10]);
+    let syn = tcp::Tcp {
+        source: 40000, destination: 443, seq: 0xdead_beef, ack: 0, drapeaux: tcp::SYN, fenetre: 65535, urgent: 0,
+        options: tcp::Options { mss: Some(1460), echelle: Some(7) },
+    };
+    let o = segment(&syn, &[], s, d, true);
+    assert_eq!(o.len(), 28);
+    // Les options comme Linux les aligne : MSS, puis NOP et l'échelle.
+    assert_eq!(&o[20..], &[2, 4, 0x05, 0xb4, 1, 3, 3, 7]);
+    assert_eq!(tcp::lire(&o, s, d, true), Ok((syn, &[][..])));
+    // Avec une charge, sans options.
+    let t = tcp::Tcp { drapeaux: tcp::ACK | tcp::PSH, seq: 1, ack: 2, fenetre: 512, options: tcp::Options::default(), ..syn };
+    let o = segment(&t, b"bonjour", s, d, true);
+    assert_eq!(tcp::lire(&o, s, d, true), Ok((t, &b"bonjour"[..])));
+    // Une charge de longueur impaire : la somme compte l'octet seul.
+    let o = segment(&t, b"abc", s, d, true);
+    assert!(tcp::lire(&o, s, d, true).is_ok());
+    // Sans somme (lo) : relu sans la vérifier.
+    let o = segment(&t, b"abc", s, d, false);
+    assert_eq!(&o[16..18], &[0, 0]);
+    assert_eq!(tcp::lire(&o, s, d, true), Err(Erreur::Somme));
+    assert!(tcp::lire(&o, s, d, false).is_ok());
+}
+
+#[test]
+fn tcp_abime() {
+    let (s, d) = ([127, 0, 0, 1], [127, 0, 0, 1]);
+    let t = tcp::Tcp { source: 1, destination: 2, seq: 3, ack: 4, drapeaux: tcp::ACK, fenetre: 5, ..Default::default() };
+    let o = segment(&t, b"xy", s, d, true);
+    assert_eq!(tcp::lire(&o[..19], s, d, true), Err(Erreur::Tronque));
+    // Une longueur d'en-tête sous 20, ou au-delà du segment.
+    let mut m = o.clone();
+    m[12] = 4 << 4;
+    assert_eq!(tcp::lire(&m, s, d, false), Err(Erreur::Invalide));
+    m[12] = 6 << 4;
+    assert_eq!(tcp::lire(&m[..22], s, d, false), Err(Erreur::Tronque));
+    // Un octet changé : la somme ne va plus ; une autre adresse non plus.
+    let mut m = o.clone();
+    m[21] ^= 1;
+    assert_eq!(tcp::lire(&m, s, d, true), Err(Erreur::Somme));
+    assert_eq!(tcp::lire(&o, s, [127, 0, 0, 2], true), Err(Erreur::Somme));
+}
+
+#[test]
+fn tcp_options_comme_linux() {
+    let (s, d) = ([1, 1, 1, 1], [2, 2, 2, 2]);
+    // Un en-tête de 32 octets aux options écrites à la main.
+    let avec = |drapeaux: u8, opts: &[u8]| {
+        let mut o = vec![0u8; 20 + opts.len()];
+        o[12] = (((20 + opts.len()) / 4) as u8) << 4;
+        o[13] = drapeaux;
+        o[20..].copy_from_slice(opts);
+        tcp::lire(&o, s, d, false).unwrap().0.options
+    };
+    // MSS et l'échelle, dans un SYN ; pas ailleurs.
+    assert_eq!(avec(tcp::SYN, &[2, 4, 0, 200, 1, 3, 3, 9]), tcp::Options { mss: Some(200), echelle: Some(9) });
+    assert_eq!(avec(tcp::ACK, &[2, 4, 0, 200, 1, 3, 3, 9]), tcp::Options::default());
+    // Une échelle au-delà de 14 : 14.
+    assert_eq!(avec(tcp::SYN, &[1, 3, 3, 20]).echelle, Some(14));
+    // Les horodatages (8, longueur 10) et SACK permis (4, 2) : sautés.
+    assert_eq!(avec(tcp::SYN, &[4, 2, 8, 10, 0, 0, 0, 1, 0, 0, 0, 0, 2, 4, 5, 0]).mss, Some(0x500));
+    // Une mauvaise longueur de MSS : ignorée ; une longueur 0 ou 1, ou qui
+    // déborde : la lecture s'arrête, le segment reste bon.
+    assert_eq!(avec(tcp::SYN, &[2, 3, 0, 1, 3, 3, 1, 0]).mss, None);
+    assert_eq!(avec(tcp::SYN, &[8, 1, 2, 4, 0, 1, 0, 0]), tcp::Options::default());
+    assert_eq!(avec(tcp::SYN, &[1, 1, 2, 9]), tcp::Options::default());
+    // EOL arrête tout.
+    assert_eq!(avec(tcp::SYN, &[0, 0, 2, 4, 0, 1, 0, 0]), tcp::Options::default());
+}
+
+#[test]
+fn tcp_mutations() {
+    // 200 000 segments abîmés au hasard : jamais de panique.
+    let (s, d) = ([10, 0, 2, 15], [10, 0, 2, 2]);
+    let t = tcp::Tcp { source: 9, destination: 80, drapeaux: tcp::SYN, options: tcp::Options { mss: Some(1460), echelle: Some(7) }, ..Default::default() };
+    let base = segment(&t, b"donnees", s, d, true);
+    let mut x = 0x1234_5678_9abc_def0u64;
+    for _ in 0..200_000 {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        let mut m = base.clone();
+        for k in 0..(x % 4 + 1) {
+            let i = ((x >> (8 * k)) as usize) % m.len();
+            m[i] = (x >> 32) as u8 ^ (k as u8);
+        }
+        m.truncate((x >> 40) as usize % (base.len() + 1));
+        let _ = tcp::lire(&m, s, d, x & 1 == 0);
+    }
 }

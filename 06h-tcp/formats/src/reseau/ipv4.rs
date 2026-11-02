@@ -11,6 +11,7 @@ use super::{Erreur, adresse, mot16, plier, somme};
 pub const ENTETE: usize = 20;
 /// Les protocoles.
 pub const ICMP: u8 = 1;
+pub const TCP: u8 = 6;
 pub const UDP: u8 = 17;
 /// L'adresse de diffusion limitée : tout le réseau local.
 pub const DIFFUSION: [u8; 4] = [255; 4];
