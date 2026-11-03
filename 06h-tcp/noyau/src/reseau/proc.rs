@@ -6,7 +6,8 @@
 //!     de fib_trie.c), chaque ligne complétée à 127 colonnes ;
 //!   - `dev` : les compteurs de chaque interface (le `dev_seq_show` de
 //!     net-procfs.c) ;
-//!   - `arp` : la table des voisins (le `arp_seq_show` d'arp.c).
+//!   - `arp` : la table des voisins (le `arp_seq_show` d'arp.c) ;
+//!   - `tcp` : les sockets TCP (le `tcp4_seq_show` de tcp_ipv4.c, 6h).
 //! Les adresses de `route` s'écrivent comme Linux les imprime : le mot de
 //! 32 bits gros-boutiste lu comme un nombre de la machine (petit-boutiste),
 //! en hexadécimal : 10.0.2.2 donne 0202000A.
@@ -25,6 +26,7 @@ pub enum Fichier {
     Route,
     Dev,
     Arp,
+    Tcp,
 }
 
 /// Un bloc du tas où écrire avec `write!`, qui échoue sans paniquer.
@@ -51,6 +53,7 @@ pub fn ligne(f: Fichier, n: u64) -> Result<Option<Vec<u8>>, ()> {
         Fichier::Route => route(&mut t, n),
         Fichier::Dev => dev(&mut t, n),
         Fichier::Arp => super::arp::ligne_proc(n, &mut t),
+        Fichier::Tcp => super::tcp::ligne_proc(n, &mut t),
     };
     match ecrite {
         Ok(true) => Ok(Some(t.0)),

@@ -46,8 +46,22 @@
 //!     plus de place, on lui demande régulièrement s'il en a refait (sinon
 //!     un ACK perdu qui la rouvrait bloquerait les deux côtés pour
 //!     toujours).
-//! Le débit (Nagle, TCP_CORK, l'échelle de fenêtre), le keepalive et
-//! l'octet urgent viennent au commit suivant.
+//!
+//! LE DÉBIT ET LES OPTIONS (commit 7) :
+//!   - l'ÉCHELLE DE FENÊTRE (RFC 7323) : la fenêtre de 16 bits décalée,
+//!     proposée dans le SYN, pour annoncer plus de 64 Kio (sur `lo`) ;
+//!   - NAGLE (RFC 896, avec la règle de Minshall de Linux) : un petit
+//!     segment attend tant qu'un autre petit segment n'est pas acquitté,
+//!     sauf TCP_NODELAY ; TCP_CORK et MSG_MORE retiennent tout segment
+//!     incomplet, que pousse au plus tard la sonde (un RTO : 200 ms et
+//!     plus) ;
+//!   - le KEEPALIVE (SO_KEEPALIVE, TCP_KEEPIDLE, TCP_KEEPINTVL,
+//!     TCP_KEEPCNT) : une connexion muette est sondée, et coupée si l'autre
+//!     ne répond plus ;
+//!   - l'OCTET URGENT (MSG_OOB) : un octet marqué par le pointeur urgent,
+//!     lu à part (sauf SO_OOBINLINE), comme Linux ;
+//!   - l'agrandissement de SO_SNDBUF (`tcp_sndbuf_expand`), et ce que
+//!     rendent TCP_INFO et /proc/net/tcp (`Info`).
 //!
 //! LES TAMPONS : les données à envoyer, des blocs de 64 Kio au plus (la
 //! `size_goal` de Linux), remplis par `ecrire`, découpés au MSS par
@@ -96,12 +110,50 @@ pub const MSS_MIN: u16 = 88;
 /// la correction de CVE-2019-11479 : sans plancher, un pair qui annonce un
 /// MSS de 1 fait découper tout ce qu'on envoie en segments d'un octet).
 pub const MSS_ENVOI_MIN: u16 = 48;
+/// Où en est la mémoire de TCP de toute la machine (`tcp_mem`), que le
+/// noyau dit à chaque connexion avant de la faire travailler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Memoire {
+    /// Sous le premier seuil (`tcp_mem[0]`) : rien ne change.
+    Libre,
+    /// Au-delà : SO_SNDBUF ne grandit plus de lui-même
+    /// (`tcp_should_expand_sndbuf`).
+    Pression,
+    /// Au-delà du dernier (`tcp_mem[2]`) : plus rien de neuf n'est gardé,
+    /// sauf pour qu'une connexion avance (`__sk_mem_raise_allocated` qui
+    /// échoue) : un envoi n'écrit que dans un tampon vide, une réception ne
+    /// garde un segment dans l'ordre que si sa file est vide
+    /// (`sk_forced_mem_schedule`), et la file hors d'ordre ne prend plus
+    /// rien (`tcp_data_queue_ofo`) ; l'autre retransmettra.
+    Limite,
+}
+
 /// L'intervalle entre deux ACK « hors fenêtre » ou « de défi » d'une
 /// connexion (`tcp_invalid_ratelimit` : 500 ms) : deux pairs dont les
 /// numéros ne se correspondent plus ne s'échangent pas d'ACK sans fin.
 pub const LIMITE_ACK_INVALIDE: u64 = 500_000_000;
 /// La plus grande fenêtre sans échelle.
 pub const FENETRE_MAX: u32 = 65_535;
+/// La plus grande échelle de fenêtre (`TCP_MAX_WSCALE`, RFC 7323 2.3) :
+/// celle d'un pair qui en propose plus est ramenée à 14, comme Linux.
+pub const ECHELLE_MAX: u8 = 14;
+
+/// L'échelle que nous proposons (`tcp_select_initial_window`) : de quoi
+/// annoncer en 16 bits la plus grande place de réception que la connexion
+/// pourra avoir, ilog2(place) - 15, entre 0 et 14. Cette place : la moitié
+/// de SO_RCVBUF (`tcp_full_space`) s'il a été fixé par le programme
+/// (`SOCK_RCVBUF_LOCK` : la fenêtre ne la dépassera jamais) ; sinon la plus
+/// grande que la machine permet, `reception_max` (`tcp_rmem[2]` et
+/// `rmem_max`), que le noyau calcule d'après sa mémoire, comme `tcp_init`.
+/// Linux 6.18 propose ainsi 10 sur une machine de 12 Gio, et 7 avec
+/// SO_RCVBUF fixé à 8 Mio (mesuré sur l'hôte).
+pub fn echelle(rcvbuf: usize, rcvbuf_fixe: bool, reception_max: usize) -> u8 {
+    let pleine = rcvbuf / 2;
+    let place = if rcvbuf_fixe { pleine } else { pleine.max(reception_max).min(65_535 << ECHELLE_MAX) };
+    (place.max(1).ilog2() as i64 - 15).clamp(0, ECHELLE_MAX as i64) as u8
+}
+/// Le plafond de SO_SNDBUF agrandi (`tcp_wmem[2]`, 4 Mio).
+pub const SNDBUF_MAX: usize = 4 << 20;
 
 /// Les retransmissions d'un SYN avant d'abandonner (`tcp_syn_retries`, la
 /// valeur de TCP_SYNCNT quand le programme n'en a pas donné), et d'un
@@ -129,6 +181,8 @@ const ATO_RECEPTION: u64 = 500_000_000;
 const ACK_RAPIDES_MAX: u32 = 16;
 
 // Les errno que voit le programme.
+pub const EAGAIN: i32 = 11;
+pub const EINVAL: i32 = 22;
 pub const ECONNREFUSED: i32 = 111;
 pub const ECONNRESET: i32 = 104;
 pub const EPIPE: i32 = 32;
@@ -247,10 +301,83 @@ pub struct Reglages {
     /// Le programme a fermé la socket (le `SOCK_DEAD` de Linux) : personne
     /// n'attend plus la fin de cette connexion, qui abandonne plus tôt.
     pub orpheline: bool,
+    /// TCP_NODELAY (pas de Nagle) et TCP_CORK (aucun segment incomplet).
+    pub nodelay: bool,
+    pub cork: bool,
+    /// SO_KEEPALIVE, et TCP_KEEPIDLE, TCP_KEEPINTVL (en nanosecondes),
+    /// TCP_KEEPCNT.
+    pub keepalive: bool,
+    pub keepidle: u64,
+    pub keepintvl: u64,
+    pub keepcnt: u32,
+    /// SO_OOBINLINE : l'octet urgent reste dans le flux.
+    pub oobinline: bool,
 }
 
 impl Reglages {
-    pub const DEFAUT: Reglages = Reglages { syn_essais: 0, delai_utilisateur: 0, orpheline: false };
+    /// Ceux de Linux : keepalive après 2 h de silence, une sonde toutes les
+    /// 75 s, 9 sans réponse (TCP_KEEPALIVE_TIME, _INTVL, _PROBES).
+    pub const DEFAUT: Reglages = Reglages {
+        syn_essais: 0, delai_utilisateur: 0, orpheline: false, nodelay: false, cork: false, keepalive: false,
+        keepidle: 7200 * 1_000_000_000, keepintvl: 75 * 1_000_000_000, keepcnt: 9, oobinline: false,
+    };
+}
+
+/// L'octet urgent reçu (le `urg_data` de Linux).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Urgent {
+    Aucun,
+    /// Le pointeur est arrivé, pas encore l'octet (TCP_URG_NOTYET).
+    Attendu,
+    /// L'octet est là, à lire par MSG_OOB (TCP_URG_VALID).
+    Valide(u8),
+    /// Il a été lu par MSG_OOB (TCP_URG_READ) ; sa place dans le flux reste
+    /// marquée jusqu'à ce que la lecture la passe.
+    Lu,
+}
+
+/// Ce que rendent TCP_INFO et /proc/net/tcp (les champs de `struct
+/// tcp_info` que nous tenons ; les durées en microsecondes, les heures en
+/// millisecondes depuis l'événement).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Info {
+    pub etat: u8,
+    /// La phase de la congestion (`TCP_CA_Open` 0, `Disorder` 1,
+    /// `Recovery` 3, `Loss` 4).
+    pub phase: u8,
+    pub retransmissions: u8,
+    pub sondes: u8,
+    pub recul: u8,
+    /// TCPI_OPT_WSCALE (4) si l'échelle de fenêtre est en service.
+    pub options: u8,
+    pub echelle_envoi: u8,
+    pub echelle_reception: u8,
+    pub rto: u32,
+    pub ato: u32,
+    pub snd_mss: u32,
+    pub rcv_mss: u32,
+    /// Les segments en vol, et ceux qui ont été retransmis.
+    pub non_acquittes: u32,
+    pub retransmis: u32,
+    pub dernier_envoi: u32,
+    pub dernier_recu: u32,
+    pub dernier_ack: u32,
+    pub rtt: u32,
+    pub rttvar: u32,
+    pub ssthresh: u32,
+    pub cwnd: u32,
+    pub advmss: u32,
+    pub reordonnancement: u32,
+    pub total_retrans: u32,
+    /// Les échéances, pour /proc/net/tcp : la retransmission (ou la sonde,
+    /// `sonde`) et le keepalive, en ns depuis l'appel (None : aucune) ;
+    /// les ACK rapides qui restent, et le ping-pong.
+    pub t_retrans: Option<u64>,
+    pub sonde: bool,
+    pub t_keepalive: Option<u64>,
+    pub ack_rapides: u32,
+    pub pingpong: bool,
+    pub demarrage_lent: bool,
 }
 
 /// Les ACK retardés (le `icsk_ack` de Linux).
@@ -316,6 +443,18 @@ pub struct Tcb<P: Charge> {
     snd_wl1: u32,
     /// La plus grande fenêtre que l'autre ait annoncée (`max_window`).
     max_fenetre: u32,
+    /// L'échelle de fenêtre (RFC 7323) : de combien de bits décaler la
+    /// fenêtre que l'autre annonce, et celle que nous annonçons. En service
+    /// (`wscale_ok`) seulement si les deux SYN la portent (slirp ne la
+    /// propose pas) ; une échelle de 0 est une échelle en service.
+    echelle_envoi: u8,
+    echelle_reception: u8,
+    echelle_ok: bool,
+    /// La fin du dernier petit segment envoyé (`snd_sml`, pour Nagle).
+    snd_sml: u32,
+    /// Le pointeur urgent à envoyer (`snd_up`) : le numéro qui suit
+    /// l'octet urgent ; égal à SND.UNA hors du « mode urgent ».
+    snd_up: u32,
     /// Notre SYN a été acquitté.
     syn_acquitte: bool,
     // La réception.
@@ -349,11 +488,19 @@ pub struct Tcb<P: Charge> {
     hors_ordre: HorsOrdre<P>,
     /// Le numéro du FIN de l'autre, arrivé après un trou.
     fin_hors_ordre: Option<u32>,
+    /// Le numéro du prochain octet que lira le programme (`copied_seq`).
+    rcv_lu: u32,
+    /// L'octet urgent reçu, et son numéro (`urg_seq`).
+    urgent: Urgent,
+    urg_seq: u32,
     /// L'autre a fermé son sens (FIN reçu et accepté).
     fin_recue: bool,
-    /// Les tailles des tampons (SO_RCVBUF, SO_SNDBUF, déjà doublées).
+    /// Les tailles des tampons (SO_RCVBUF, SO_SNDBUF, déjà doublées), et
+    /// SO_SNDBUF fixé par le programme (`SOCK_SNDBUF_LOCK` : il ne grandit
+    /// plus de lui-même).
     pub rcvbuf: usize,
     pub sndbuf: usize,
+    pub sndbuf_fixe: bool,
     /// L'erreur à rendre au programme (`sk_err`), et l'erreur « douce »
     /// d'un ICMP (`sk_err_soft`), que rendra un abandon.
     erreur: i32,
@@ -364,6 +511,8 @@ pub struct Tcb<P: Charge> {
     lecture_fermee: bool,
     /// L'heure du dernier ACK hors fenêtre ou de défi (`last_oow_ack_time`).
     dernier_ack_invalide: Option<u64>,
+    /// La mémoire de TCP de toute la machine, posée par le noyau.
+    pub memoire: Memoire,
     // Ce qui doit partir au prochain `emettre`.
     syn_du: bool,
     rst_du: Option<(u32, u32, u8)>,
@@ -372,8 +521,14 @@ pub struct Tcb<P: Charge> {
     /// Le premier segment non acquitté, à retransmettre (la retransmission
     /// rapide, et NewReno).
     retransmettre_tete: bool,
-    /// Une sonde de fenêtre.
+    /// Une sonde de fenêtre, ou de keepalive.
     sonde_due: bool,
+    /// Pousser ce qui attend, une fois, malgré Nagle et TCP_CORK (le
+    /// `TCP_NAGLE_PUSH` de Linux : TCP_NODELAY posé, TCP_CORK retiré).
+    pousser: bool,
+    /// MSG_MORE : le prochain `emettre` garde un segment incomplet (le
+    /// `send` qui l'a écrit annonce une suite).
+    pub plus_a_venir: bool,
     pub reglages: Reglages,
     // Le temps.
     rtt: Rtt,
@@ -402,6 +557,8 @@ pub struct Tcb<P: Charge> {
     t_sonde: Option<u64>,
     sondes: u32,
     sondes_debut: Option<u64>,
+    /// L'échéance du keepalive.
+    t_keepalive: Option<u64>,
     ack: Ack,
     cc: Congestion,
     /// L'heure du dernier envoi de données (`lsndtime`), et du dernier
@@ -424,6 +581,12 @@ impl<P: Charge> Tcb<P> {
             snd_wnd: 0,
             snd_wl1: 0,
             max_fenetre: 0,
+            echelle_envoi: 0,
+            echelle_reception: 0,
+            echelle_ok: false,
+            snd_sml: iss,
+            // Hors du mode urgent : SND.UNA une fois le SYN acquitté.
+            snd_up: iss.wrapping_add(1),
             syn_acquitte: false,
             irs: 0,
             rcv_nxt: 0,
@@ -442,18 +605,25 @@ impl<P: Charge> Tcb<P> {
             taille_vraie_reception: 0,
             hors_ordre: HorsOrdre::new(),
             fin_hors_ordre: None,
+            rcv_lu: 0,
+            urgent: Urgent::Aucun,
+            urg_seq: 0,
             fin_recue: false,
             rcvbuf,
             sndbuf,
+            sndbuf_fixe: false,
             erreur: 0,
             erreur_douce: 0,
             lecture_fermee: false,
             dernier_ack_invalide: None,
+            memoire: Memoire::Libre,
             syn_du: false,
             rst_du: None,
             ack_maintenant: false,
             retransmettre_tete: false,
             sonde_due: false,
+            pousser: false,
+            plus_a_venir: false,
             reglages: Reglages::DEFAUT,
             rtt: Rtt::new(),
             rto: RTO_INITIAL,
@@ -468,6 +638,7 @@ impl<P: Charge> Tcb<P> {
             t_sonde: None,
             sondes: 0,
             sondes_debut: None,
+            t_keepalive: None,
             ack: Ack::new(),
             cc: Congestion::new(),
             dernier_envoi: 0,
@@ -475,22 +646,32 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// Une connexion qui s'ouvre (`connect`) : SYN_SENT, le SYN à envoyer.
-    pub fn connecter(port_local: u16, port_distant: u16, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize) -> Tcb<P> {
+    /// Une connexion qui s'ouvre (`connect`) : SYN_SENT, le SYN à envoyer ;
+    /// `echelle`, l'échelle à proposer (`echelle`).
+    pub fn connecter(port_local: u16, port_distant: u16, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize, echelle: u8)
+        -> Tcb<P> {
         let mut t = Tcb::vide(port_local, port_distant, iss, mss_local, rcvbuf, sndbuf);
         t.etat = Etat::SynEnvoye;
         t.syn_du = true;
+        // L'échelle est proposée, même 0 (comme Linux) ; elle ne vaudra que
+        // si l'autre la propose aussi.
+        t.echelle_reception = echelle.min(ECHELLE_MAX);
+        t.echelle_ok = true;
         t
     }
 
     /// La fille d'une écoute, pour le SYN `syn` reçu : SYN_RECEIVED, le
-    /// SYN-ACK à envoyer.
-    pub fn depuis_syn(syn: &Tcp, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize) -> Tcb<P> {
+    /// SYN-ACK à envoyer ; `echelle`, la nôtre, si l'autre a proposé la
+    /// sienne.
+    pub fn depuis_syn(syn: &Tcp, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Tcb<P> {
         let mut t = Tcb::vide(syn.destination, syn.source, iss, mss_local, rcvbuf, sndbuf);
         t.etat = Etat::SynRecu;
         t.fille = true;
         t.irs = syn.seq;
         t.rcv_nxt = syn.seq.wrapping_add(1);
+        t.rcv_lu = t.rcv_nxt;
+        t.echelle_reception = echelle.min(ECHELLE_MAX);
+        t.accepter_echelle(syn.options.echelle);
         t.snd_wnd = syn.fenetre as u32;
         t.max_fenetre = t.snd_wnd;
         t.snd_wl1 = syn.seq;
@@ -502,6 +683,22 @@ impl<P: Charge> Tcb<P> {
 
     pub fn etat(&self) -> Etat {
         self.etat
+    }
+
+    /// Le SYN de l'autre dit son échelle, ou rien : sans elle des deux
+    /// côtés, aucune (RFC 7323 2.2) ; plus de 14, 14 (`tcp_parse_options`).
+    fn accepter_echelle(&mut self, echelle: Option<u8>) {
+        match echelle {
+            Some(e) => {
+                self.echelle_envoi = e.min(ECHELLE_MAX);
+                self.echelle_ok = true;
+            }
+            None => {
+                self.echelle_envoi = 0;
+                self.echelle_reception = 0;
+                self.echelle_ok = false;
+            }
+        }
     }
 
     /// SND.UNA, le plus loin envoyé (SND.MAX) et RCV.NXT (/proc/net/tcp,
@@ -552,9 +749,24 @@ impl<P: Charge> Tcb<P> {
 
     // --- La réception, vue du programme ---
 
-    /// Les octets à lire.
+    /// Les octets en file de réception, l'octet urgent compris.
     pub fn lisibles(&self) -> usize {
         self.octets_reception
+    }
+
+    /// Ce que dit FIONREAD (`tcp_inq`) : rien pendant la poignée de main ;
+    /// avec un octet urgent hors du flux encore devant, les octets jusqu'à
+    /// lui (la lecture s'y arrête) ; sinon tout.
+    pub fn lisibles_fionread(&self) -> usize {
+        if matches!(self.etat, Etat::SynEnvoye | Etat::SynRecu) {
+            return 0;
+        }
+        let devant = self.urg_seq.wrapping_sub(self.rcv_lu) as usize;
+        if self.urgent != Urgent::Aucun && !self.reglages.oobinline && devant < self.octets_reception {
+            devant
+        } else {
+            self.octets_reception
+        }
     }
 
     /// La mémoire que garde la réception, en taille vraie : la file de
@@ -567,6 +779,42 @@ impl<P: Charge> Tcb<P> {
     /// Plus personne ne lira (`close` d'une orpheline, shutdown(SHUT_RD)).
     pub fn fermer_lecture(&mut self) {
         self.lecture_fermee = true;
+    }
+
+    /// Ceux qu'une lecture peut rendre, pour `poll` : l'octet urgent en
+    /// tête, hors du flux, ne compte pas (`tcp_stream_is_readable`).
+    pub fn lisibles_dans_le_flux(&self) -> usize {
+        self.octets_reception - usize::from(self.a_la_marque() && !self.reglages.oobinline)
+    }
+
+    /// La lecture est-elle à la marque urgente (SIOCATMARK) ?
+    pub fn a_la_marque(&self) -> bool {
+        self.urgent != Urgent::Aucun && self.urg_seq == self.rcv_lu && self.octets_reception > 0
+    }
+
+    /// Un octet urgent attend-il d'être lu par MSG_OOB (POLLPRI) ?
+    pub fn urgent_a_lire(&self) -> bool {
+        matches!(self.urgent, Urgent::Valide(_))
+    }
+
+    /// recv(MSG_OOB) (`tcp_recv_urg`) : l'octet urgent (Some), ou rien
+    /// s'il ne viendra plus (None : la fin) ; EINVAL sans octet urgent, déjà
+    /// lu, ou avec SO_OOBINLINE ; EAGAIN s'il n'est pas encore arrivé.
+    /// `garder` : MSG_PEEK.
+    pub fn lire_urgent(&mut self, garder: bool) -> Result<Option<u8>, i32> {
+        if self.reglages.oobinline || matches!(self.urgent, Urgent::Aucun | Urgent::Lu) {
+            return Err(EINVAL);
+        }
+        if let Urgent::Valide(o) = self.urgent {
+            if !garder {
+                self.urgent = Urgent::Lu;
+            }
+            return Ok(Some(o));
+        }
+        if self.etat == Etat::Fermee || self.fin_recue {
+            return Ok(None);
+        }
+        Err(EAGAIN)
     }
 
     /// L'autre a-t-il fermé son sens (une lecture rendra 0 après les
@@ -594,11 +842,36 @@ impl<P: Charge> Tcb<P> {
     /// copié d'un morceau, ou une erreur) ; `garder` : MSG_PEEK, rien n'est
     /// retiré. Rend le nombre d'octets copiés (moins si `copier` en prend
     /// moins). L'appelant appelle ensuite `lu` (la fenêtre).
+    ///
+    /// La marque urgente (`tcp_recvmsg`) : une lecture s'arrête devant elle
+    /// (SIOCATMARK le dira) ; à la marque, l'octet urgent est sauté, sauf
+    /// SO_OOBINLINE (MSG_OOB le lit à part).
     pub fn lire<E>(&mut self, n: usize, garder: bool, mut copier: impl FnMut(&[u8]) -> Result<usize, E>) -> Result<usize, E> {
+        let mut n = n;
+        let mut saut = 0;
+        if self.urgent != Urgent::Aucun {
+            let devant = self.urg_seq.wrapping_sub(self.rcv_lu) as usize;
+            if devant == 0 && self.octets_reception > 0 {
+                saut = usize::from(!self.reglages.oobinline);
+            } else if devant < self.octets_reception {
+                n = n.min(devant);
+            }
+        }
         let mut fait = 0;
         let mut i = 0;
+        // Le décalage dans le premier morceau regardé (MSG_PEEK saute
+        // l'octet urgent sans le retirer).
+        let mut decalage = 0;
+        if saut > 0 {
+            if garder {
+                decalage = 1;
+            } else {
+                self.retirer_tete(1);
+            }
+        }
         while fait < n && i < self.reception.len() {
-            let morceau = self.reception[i].octets();
+            let morceau = &self.reception[i].octets()[decalage.min(self.reception[i].octets().len())..];
+            decalage = 0;
             let m = morceau.len().min(n - fait);
             // Une copie qui échoue après des octets déjà pris rend ce qui a
             // été lu ; l'erreur, seulement si rien ne l'a été
@@ -616,17 +889,33 @@ impl<P: Charge> Tcb<P> {
                 i += 1;
                 continue;
             }
-            let p = &mut self.reception[i];
-            p.avancer(c);
-            self.octets_reception -= c;
-            if p.octets().is_empty() {
-                let p = self.reception.pop_front().expect("le premier paquet");
-                self.taille_vraie_reception = self.taille_vraie_reception.saturating_sub(p.taille_vraie());
-            } else if c < m {
+            self.retirer_tete(c);
+            if c < m {
                 break;
             }
         }
+        if !garder && self.urgent != Urgent::Aucun && apres(self.rcv_lu, self.urg_seq) {
+            // La marque est passée.
+            self.urgent = Urgent::Aucun;
+        }
         Ok(fait)
+    }
+
+    /// Retire `n` octets lus du début de la file de réception.
+    fn retirer_tete(&mut self, mut n: usize) {
+        while n > 0 {
+            let Some(p) = self.reception.front_mut() else { break };
+            let m = n.min(p.octets().len());
+            p.avancer(m);
+            n -= m;
+            self.octets_reception -= m;
+            self.rcv_lu = self.rcv_lu.wrapping_add(m as u32);
+            if p.octets().is_empty()
+                && let Some(p) = self.reception.pop_front()
+            {
+                self.taille_vraie_reception = self.taille_vraie_reception.saturating_sub(p.taille_vraie());
+            }
+        }
     }
 
     /// Jette jusqu'à `n` octets reçus (MSG_TRUNC de TCP) ; rend combien.
@@ -640,22 +929,26 @@ impl<P: Charge> Tcb<P> {
         self.rcvbuf.saturating_sub(self.taille_vraie_reception + self.hors_ordre.taille_vraie)
     }
 
-    /// La plus grande fenêtre qu'on puisse annoncer (`window_clamp`).
+    /// La plus grande fenêtre qu'on puisse annoncer (`window_clamp`) : sans
+    /// échelle, 65 535.
     fn fenetre_max(&self) -> u32 {
-        ((self.rcvbuf / 2) as u32).min(FENETRE_MAX)
+        ((self.rcvbuf / 2) as u32).min(FENETRE_MAX << self.echelle_reception)
     }
 
     /// La fenêtre que permet la place libre : la moitié (le `scaling_ratio`
     /// de Linux à sa valeur de départ, 50 % : une charge reçue occupe à peu
-    /// près le double de ses octets en mémoire), sans échelle au plus
-    /// 65 535 ; moins d'un MSS : 0 (le récepteur n'annonce pas de petite
-    /// fenêtre, RFC 9293 3.8.6.2.2, le SWS).
+    /// près le double de ses octets en mémoire), au plus `fenetre_max` ;
+    /// moins d'un MSS : 0 (le récepteur n'annonce pas de petite fenêtre, RFC
+    /// 9293 3.8.6.2.2, le SWS).
     fn fenetre_possible(&self) -> u32 {
-        let f = ((self.libre() / 2) as u32).min(FENETRE_MAX);
+        let f = ((self.libre() / 2) as u32).min(FENETRE_MAX << self.echelle_reception);
         if f < self.mss_local as u32 && f < (self.rcvbuf / 4) as u32 { 0 } else { f }
     }
 
-    /// Pose le bord droit annoncé, sans jamais le reculer.
+    /// Pose le bord droit annoncé, sans jamais le reculer ; avec l'échelle,
+    /// la fenêtre arrondie au multiple supérieur de son unité (sinon le
+    /// décalage la tronquerait, et le bord reculerait : le `ALIGN` de
+    /// `tcp_select_window`).
     fn annoncer(&mut self) {
         let bord = self.rcv_nxt.wrapping_add(self.fenetre_possible());
         if !self.bord_pose || apres(bord, self.rcv_bord) {
@@ -665,11 +958,15 @@ impl<P: Charge> Tcb<P> {
         if avant(self.rcv_bord, self.rcv_nxt) {
             self.rcv_bord = self.rcv_nxt;
         }
+        let e = self.echelle_reception;
+        let w = self.rcv_bord.wrapping_sub(self.rcv_nxt);
+        self.rcv_bord = self.rcv_nxt.wrapping_add(w.div_ceil(1 << e) << e);
     }
 
-    /// La fenêtre à annoncer dans un segment.
+    /// La fenêtre à annoncer dans un segment (hors SYN), décalée de notre
+    /// échelle.
     fn fenetre(&self) -> u16 {
-        self.rcv_bord.wrapping_sub(self.rcv_nxt).min(FENETRE_MAX) as u16
+        (self.rcv_bord.wrapping_sub(self.rcv_nxt) >> self.echelle_reception).min(FENETRE_MAX) as u16
     }
 
     /// Le programme a lu (`tcp_cleanup_rbuf`) : un ACK part tout de suite
@@ -703,7 +1000,17 @@ impl<P: Charge> Tcb<P> {
 
     /// La place libre du tampon d'émission, en octets.
     pub fn place(&self) -> usize {
+        if self.memoire == Memoire::Limite && self.octets_envoi > 0 {
+            return 0;
+        }
         self.sndbuf.saturating_sub(self.octets_envoi)
+    }
+
+    /// La mémoire que garde la connexion, en octets : la réception (en
+    /// taille vraie) et ce qui attend d'être acquitté (le compte de
+    /// `tcp_mem`).
+    pub fn memoire(&self) -> usize {
+        self.memoire_reception() + self.octets_envoi
     }
 
     /// Les octets pas encore acquittés (SIOCOUTQ), et pas encore envoyés
@@ -869,6 +1176,7 @@ impl<P: Charge> Tcb<P> {
             // TIME_WAIT réacquitte ce qui revient, tout de suite.
             self.t_retrans = None;
             self.t_sonde = None;
+            self.t_keepalive = None;
             self.ack.t = None;
             self.hors_ordre.vider();
             self.fin_hors_ordre = None;
@@ -894,6 +1202,14 @@ impl<P: Charge> Tcb<P> {
     /// TIME_WAIT).
     pub fn fenetre_annoncee(&self) -> u32 {
         self.rcv_wnd()
+    }
+
+    /// Ce qui reste de la fenêtre annoncée tient-il en un segment de
+    /// l'autre (`tcp_receive_window(tp) <= icsk_ack.rcv_mss`) ? Alors poll
+    /// dit POLLIN même sous SO_RCVLOWAT : l'autre ne peut plus rien envoyer
+    /// avant qu'on lise.
+    pub fn fenetre_presque_fermee(&self) -> bool {
+        self.rcv_wnd() <= self.ack.rcv_mss
     }
 
     /// La fenêtre de réception, pour l'acceptabilité.
@@ -951,7 +1267,9 @@ impl<P: Charge> Tcb<P> {
                 }
                 self.irs = t.seq;
                 self.rcv_nxt = t.seq.wrapping_add(1);
+                self.rcv_lu = self.rcv_nxt;
                 self.mss = self.mss_effectif(t.options.mss);
+                self.accepter_echelle(t.options.echelle);
                 self.bord_pose = false;
                 self.annoncer();
                 self.dernier_recu = maintenant;
@@ -1087,6 +1405,17 @@ impl<P: Charge> Tcb<P> {
         if self.etat == Etat::Fermee {
             return e;
         }
+        // 6. URG (`tcp_urg`) : un pointeur urgent neuf, puis l'octet qu'il
+        // désigne, quand il arrive (dans ce segment, ou un suivant).
+        if t.drapeaux & tcp::URG != 0 && self.etat.recoit() {
+            self.pointeur_urgent(t.urgent, seq);
+        }
+        if self.urgent == Urgent::Attendu
+            && let Some(&o) = charge.octets().get(self.urg_seq.wrapping_sub(seq) as usize)
+        {
+            self.urgent = Urgent::Valide(o);
+            e.lisible = true;
+        }
         // 7. Le texte. Pour une lecture fermée, en FIN_WAIT, des données
         // neuves coupent la connexion : RST, comme BSD et Linux (« RFC 793
         // says to queue data in these states, RFC 1122 says we MUST send a
@@ -1149,8 +1478,9 @@ impl<P: Charge> Tcb<P> {
         let rien_en_vol = self.snd_max == una_avant;
         let avance = apres(t.ack, una_avant);
         // La fenêtre de l'autre (`tcp_may_update_window`) : d'un segment
-        // plus récent que celui qui l'a donnée la dernière fois.
-        let fenetre = t.fenetre as u32;
+        // plus récent que celui qui l'a donnée la dernière fois ; décalée
+        // de son échelle (jamais dans un SYN : ce segment n'en est pas un).
+        let fenetre = (t.fenetre as u32) << self.echelle_envoi;
         let maj_fenetre = avance || apres(t.seq, self.snd_wl1) || (t.seq == self.snd_wl1 && (fenetre > self.snd_wnd || fenetre == 0));
         if maj_fenetre {
             if self.snd_wnd == 0 && fenetre != 0 {
@@ -1163,6 +1493,10 @@ impl<P: Charge> Tcb<P> {
         let acquittes = t.ack.wrapping_sub(una_avant);
         if avance {
             self.acquitter_jusqu_a(t.ack, e);
+            // Le mode urgent finit quand l'octet urgent est acquitté.
+            if !avant(self.snd_up, una_avant) && !apres(self.snd_up, t.ack) {
+                self.snd_up = t.ack;
+            }
             self.retransmissions = 0;
             self.retrans_debut = None;
             self.mesurer(t.ack, maintenant);
@@ -1186,7 +1520,30 @@ impl<P: Charge> Tcb<P> {
         }
         let dupack = !avance && !porte && !maj_fenetre;
         self.controler_congestion(avance, acquittes, dupack);
+        // De la place libérée, et la fenêtre de congestion n'est pas pleine :
+        // SO_SNDBUF suit (`tcp_new_space`).
+        if avance && self.paquets_en_vol() < self.cc.cwnd {
+            self.agrandir_sndbuf();
+        }
         true
+    }
+
+    /// SO_SNDBUF agrandi pour deux fenêtres de congestion de segments
+    /// pleins, chacun compté avec sa place dans la mémoire du noyau, comme
+    /// Linux (`tcp_sndbuf_expand` : le MSS plus 640 octets d'en-têtes et de
+    /// structures, arrondi à la puissance de deux, plus 256 ; au moins 10
+    /// segments ; au plus `tcp_wmem[2]`, 4 Mio). Sur `lo` (MSS 65 495) : 2 626 560
+    /// (mesuré chez Linux). Rien si le programme a fixé SO_SNDBUF.
+    fn agrandir_sndbuf(&mut self) {
+        if self.sndbuf_fixe || self.memoire != Memoire::Libre {
+            return;
+        }
+        let par_segment = (self.mss as usize + 640).next_power_of_two() + 256;
+        let segments = (self.cc.cwnd.max(CWND_INITIALE).max(REORDONNANCEMENT + 1)) as usize;
+        let voulu = (2 * segments * par_segment).min(SNDBUF_MAX);
+        if self.sndbuf < voulu {
+            self.sndbuf = voulu;
+        }
     }
 
     /// SND.UNA avance jusqu'à `ack` : le SYN, les octets, le FIN acquittés.
@@ -1258,6 +1615,107 @@ impl<P: Charge> Tcb<P> {
             .max(MSS_MIN as u32);
         self.ack.rcv_wup = self.rcv_nxt;
         self.ack.fenetre = rcv_wnd;
+        // `tcp_init_buffer_space` ; et le keepalive, s'il est demandé.
+        self.agrandir_sndbuf();
+        if self.reglages.keepalive {
+            self.t_keepalive = Some(maintenant + self.reglages.keepidle);
+        }
+    }
+
+    /// Change les réglages (setsockopt) : TCP_NODELAY posé ou TCP_CORK
+    /// retiré poussent ce qui attend (`__tcp_sock_set_nodelay`,
+    /// `__tcp_sock_set_cork`) ; SO_KEEPALIVE arme ou arrête le keepalive
+    /// (`tcp_set_keepalive`), TCP_KEEPIDLE le recale sur le dernier
+    /// segment reçu (`tcp_sock_set_keepidle_locked`).
+    pub fn regler(&mut self, r: Reglages, maintenant: u64) -> Effets {
+        let ancien = core::mem::replace(&mut self.reglages, r);
+        let mut e = Effets::default();
+        if (r.nodelay && !ancien.nodelay) || (ancien.cork && !r.cork) {
+            self.pousser = true;
+            e.a_emettre = true;
+        }
+        let vivante = !matches!(self.etat, Etat::Fermee | Etat::SynEnvoye | Etat::SynRecu | Etat::TempsAttente);
+        if !r.keepalive || !vivante {
+            self.t_keepalive = None;
+        } else if !ancien.keepalive {
+            self.t_keepalive = Some(maintenant + r.keepidle);
+        } else if r.keepidle != ancien.keepidle {
+            let ecoule = maintenant.saturating_sub(self.ack.lrcvtime.max(self.dernier_recu));
+            self.t_keepalive = Some(maintenant + r.keepidle.saturating_sub(ecoule));
+        }
+        e
+    }
+
+    /// TCP_QUICKACK (`__tcp_sock_set_quickack`) : 1 quitte le ping-pong et
+    /// envoie tout de suite un ACK dû ; 0 entre en ping-pong.
+    pub fn quickack(&mut self, oui: bool) -> Effets {
+        let mut e = Effets::default();
+        if oui {
+            self.ack.pingpong = 0;
+            if self.ack.programme {
+                self.ack_maintenant = true;
+                e.a_emettre = true;
+            }
+        } else {
+            self.ack.pingpong = self.ack.pingpong.max(1);
+        }
+        e
+    }
+
+    /// send(MSG_OOB) (`tcp_mark_urg`) : le dernier octet écrit est urgent ;
+    /// le pointeur urgent le suit.
+    pub fn marquer_urgent(&mut self) {
+        self.snd_up = self.seq_envoi.wrapping_add(self.octets_envoi as u32);
+    }
+
+    /// Le mode urgent : un octet urgent pas encore acquitté
+    /// (`tcp_urg_mode`).
+    fn mode_urgent(&self) -> bool {
+        self.snd_up != self.snd_una
+    }
+
+    /// Ce que rendent TCP_INFO et /proc/net/tcp (`tcp_get_info`).
+    pub fn info(&self, maintenant: u64) -> Info {
+        let us = |ns: u64| (ns / 1000).min(u32::MAX as u64) as u32;
+        let ms = |depuis: u64| (maintenant.saturating_sub(depuis) / 1_000_000).min(u32::MAX as u64) as u32;
+        let echelle = self.etat.synchronise() && self.echelle_ok;
+        Info {
+            etat: self.etat.linux(),
+            phase: match self.cc.phase {
+                Phase::Ouverte => 0,
+                Phase::Desordre => 1,
+                Phase::Reprise => 3,
+                Phase::Perte => 4,
+            },
+            retransmissions: self.retransmissions.min(255) as u8,
+            sondes: self.sondes.min(255) as u8,
+            recul: self.recul.min(255) as u8,
+            options: if echelle { 4 } else { 0 },
+            echelle_envoi: if echelle { self.echelle_envoi } else { 0 },
+            echelle_reception: if echelle { self.echelle_reception } else { 0 },
+            rto: us(self.rto),
+            ato: us(self.ack.ato),
+            snd_mss: self.mss_courant(),
+            rcv_mss: self.ack.rcv_mss,
+            non_acquittes: self.paquets_sortis(),
+            retransmis: u32::from(self.retransmettre_tete || avant(self.snd_nxt, self.snd_max)),
+            dernier_envoi: ms(self.dernier_envoi),
+            dernier_recu: ms(self.ack.lrcvtime),
+            dernier_ack: ms(self.dernier_recu),
+            rtt: us(self.rtt.srtt()),
+            rttvar: us(self.rtt.ecart()),
+            ssthresh: self.cc.ssthresh,
+            cwnd: self.cc.cwnd,
+            advmss: self.mss_local as u32,
+            reordonnancement: REORDONNANCEMENT,
+            total_retrans: self.total_retrans,
+            t_retrans: self.t_retrans.or(self.t_sonde).map(|t| t.saturating_sub(maintenant)),
+            sonde: self.t_retrans.is_none() && self.t_sonde.is_some(),
+            t_keepalive: self.t_keepalive.map(|t| t.saturating_sub(maintenant)),
+            ack_rapides: self.ack.rapides,
+            pingpong: self.ack.pingpong > 0,
+            demarrage_lent: self.cc.ssthresh >= congestion::SSTHRESH_INFINI,
+        }
     }
 
     /// Les segments en vol, estimés : les octets de SND.UNA à SND.NXT
@@ -1341,6 +1799,26 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
+    /// Un pointeur urgent reçu (`tcp_check_urg`) : à la façon de BSD, que
+    /// suit Linux (`tcp_stdurg` à 0), il désigne l'octet qui PRÉCÈDE
+    /// SEG.SEQ + pointeur. Ignoré s'il est déjà lu, déjà reçu, ou pas plus
+    /// loin que celui qu'on a ; un ancien octet urgent en tête de lecture,
+    /// hors du flux, est retiré.
+    fn pointeur_urgent(&mut self, pointeur: u16, seq: u32) {
+        let p = seq.wrapping_add((pointeur as u32).saturating_sub(1));
+        if apres(self.rcv_lu, p) || avant(p, self.rcv_nxt) {
+            return;
+        }
+        if self.urgent != Urgent::Aucun && !apres(p, self.urg_seq) {
+            return;
+        }
+        if self.urgent != Urgent::Aucun && self.urg_seq == self.rcv_lu && !self.reglages.oobinline && self.octets_reception > 0 {
+            self.retirer_tete(1);
+        }
+        self.urgent = Urgent::Attendu;
+        self.urg_seq = p;
+    }
+
     /// Des données dans un segment acceptable (`tcp_data_queue`).
     fn recevoir_donnees(&mut self, seq: u32, mut charge: P, maintenant: u64, e: &mut Effets) {
         let n = charge.octets().len() as u32;
@@ -1354,8 +1832,9 @@ impl<P: Charge> Tcb<P> {
         if apres(seq, self.rcv_nxt) {
             // Un trou devant : la file hors d'ordre ; l'ACK dupliqué part
             // tout de suite (il dit le trou à l'émetteur).
-            // La même borne que dans l'ordre (plus bas) ; au-delà, jeté.
-            if self.taille_vraie_reception + self.hors_ordre.taille_vraie + charge.taille_vraie() <= 2 * self.rcvbuf {
+            // La même borne que dans l'ordre (plus bas) ; au-delà, jeté ; et
+            // rien au-delà de la limite de toute la machine.
+            if self.memoire != Memoire::Limite && self.taille_vraie_reception + self.hors_ordre.taille_vraie + charge.taille_vraie() <= 2 * self.rcvbuf {
                 self.hors_ordre.ranger(seq, charge);
             }
             self.ack.programme = true;
@@ -1377,6 +1856,14 @@ impl<P: Charge> Tcb<P> {
                 self.ack_maintenant = true;
                 return;
             }
+        }
+        // Au-delà de la limite de toute la machine : gardé seulement si la
+        // file de lecture est vide (la connexion doit pouvoir avancer), la
+        // file hors d'ordre rendue d'abord (`tcp_prune_ofo_queue`).
+        if self.memoire == Memoire::Limite && !self.reception.is_empty() {
+            while self.hors_ordre.jeter_la_derniere() {}
+            self.ack_maintenant = true;
+            return;
         }
         if !self.ajouter_recu(charge) {
             self.ack_maintenant = true;
@@ -1612,7 +2099,7 @@ impl<P: Charge> Tcb<P> {
 
     /// La prochaine échéance de la connexion (None : aucune).
     pub fn echeance(&self) -> Option<u64> {
-        [self.t_retrans, self.t_sonde, self.ack.t].into_iter().flatten().min()
+        [self.t_retrans, self.t_sonde, self.t_keepalive, self.ack.t].into_iter().flatten().min()
     }
 
     /// Fait ce qui est échu à l'heure `maintenant` : l'ACK retardé, la
@@ -1631,7 +2118,44 @@ impl<P: Charge> Tcb<P> {
             self.t_sonde = None;
             self.minuteur_sonde(maintenant, &mut e);
         }
+        if self.t_keepalive.is_some_and(|t| t <= maintenant) {
+            self.t_keepalive = None;
+            self.minuteur_keepalive(maintenant, &mut e);
+        }
         e
+    }
+
+    /// Le keepalive est échu (`tcp_keepalive_timer`) : une connexion qui a
+    /// quelque chose en vol ou à envoyer est vivante sans lui ; sinon, après
+    /// TCP_KEEPIDLE de silence, une sonde (un segment d'un numéro déjà
+    /// acquitté, que l'autre ne peut qu'acquitter) toutes les
+    /// TCP_KEEPINTVL ; TCP_KEEPCNT sans réponse (ou TCP_USER_TIMEOUT
+    /// passé), la connexion est coupée : RST, et ETIMEDOUT.
+    fn minuteur_keepalive(&mut self, maintenant: u64, e: &mut Effets) {
+        let r = self.reglages;
+        if !r.keepalive || matches!(self.etat, Etat::Fermee | Etat::SynEnvoye | Etat::TempsAttente) {
+            return;
+        }
+        if self.snd_max != self.snd_una || self.prochain_segment().is_some() {
+            self.t_keepalive = Some(maintenant + r.keepidle);
+            return;
+        }
+        let ecoule = maintenant.saturating_sub(self.ack.lrcvtime.max(self.dernier_recu));
+        if ecoule < r.keepidle {
+            self.t_keepalive = Some(maintenant + (r.keepidle - ecoule));
+            return;
+        }
+        let u = r.delai_utilisateur;
+        if (u != 0 && ecoule >= u && self.sondes > 0) || (u == 0 && self.sondes >= r.keepcnt) {
+            self.rst_du = Some((self.snd_max, self.rcv_nxt, tcp::RST | tcp::ACK));
+            self.abandonner(e);
+            e.a_emettre = true;
+            return;
+        }
+        self.sonde_due = true;
+        self.sondes += 1;
+        self.t_keepalive = Some(maintenant + r.keepintvl);
+        e.a_emettre = true;
     }
 
     /// L'ACK retardé est échu (`tcp_delack_timer_handler`) : il part ; et
@@ -1867,7 +2391,7 @@ impl<P: Charge> Tcb<P> {
 
     /// L'en-tête d'un segment de cette connexion.
     fn entete(&self, seq: u32, drapeaux: u8) -> Tcp {
-        Tcp {
+        let mut h = Tcp {
             source: self.port_local,
             destination: self.port_distant,
             seq,
@@ -1876,7 +2400,20 @@ impl<P: Charge> Tcb<P> {
             fenetre: if drapeaux & tcp::SYN != 0 { self.fenetre_possible().min(FENETRE_MAX) as u16 } else { self.fenetre() },
             urgent: 0,
             options: tcp::Options::default(),
+        };
+        // Le pointeur urgent, dans tout segment qui précède l'octet urgent
+        // (`__tcp_transmit_skb`) ; trop loin pour 16 bits, 0xFFFF, tant
+        // que le segment reste en deçà.
+        if drapeaux & (tcp::SYN | tcp::RST) == 0 && self.mode_urgent() && avant(seq, self.snd_up) {
+            if avant(self.snd_up, seq.wrapping_add(0x10000)) {
+                h.urgent = self.snd_up.wrapping_sub(seq) as u16;
+                h.drapeaux |= tcp::URG;
+            } else if apres(seq.wrapping_add(0xFFFF), self.snd_max) {
+                h.urgent = 0xFFFF;
+                h.drapeaux |= tcp::URG;
+            }
         }
+        h
     }
 
     /// Ce que la fenêtre de l'autre laisse d'un segment renvoyé, qui
@@ -1913,6 +2450,10 @@ impl<P: Charge> Tcb<P> {
         }
         sortir(Sortant { entete: self.entete(self.snd_nxt, drapeaux), debut, longueur: n });
         let fin_segment = self.snd_nxt.wrapping_add(n as u32 + u32::from(avec_fin));
+        if n < self.mss_courant() as usize {
+            // Un petit segment (`tcp_minshall_update`).
+            self.snd_sml = fin_segment;
+        }
         if self.snd_nxt == self.snd_max {
             if self.chrono.is_none() {
                 self.chrono = Some((fin_segment, maintenant));
@@ -1965,6 +2506,11 @@ impl<P: Charge> Tcb<P> {
             let drapeaux = if self.etat == Etat::SynRecu { tcp::SYN | tcp::ACK } else { tcp::SYN };
             let mut h = self.entete(self.iss, drapeaux);
             h.options.mss = Some(self.mss_local);
+            // L'échelle : proposée dans notre SYN ; rendue dans le SYN-ACK
+            // seulement si l'autre l'a proposée (RFC 7323 1.3).
+            if self.echelle_ok {
+                h.options.echelle = Some(self.echelle_reception);
+            }
             sortir(Sortant { entete: h, debut: 0, longueur: 0 });
             self.snd_nxt = self.iss.wrapping_add(1);
             self.snd_max = self.snd_nxt;
@@ -2035,6 +2581,7 @@ impl<P: Charge> Tcb<P> {
         // (`__tcp_retransmit_skb`).
         let mut limite_cwnd = false;
         let mut bloque_fenetre = false;
+        let mut retenu = false;
         loop {
             let debut = self.snd_nxt.wrapping_sub(self.seq_envoi) as usize;
             let reste = self.octets_envoi.saturating_sub(debut);
@@ -2063,6 +2610,22 @@ impl<P: Charge> Tcb<P> {
                 limite_cwnd = true;
                 break;
             }
+            // Nagle (`tcp_nagle_test`) : le dernier segment, incomplet,
+            // attend ; TCP_CORK et MSG_MORE le retiennent toujours ; sinon,
+            // tant qu'un petit segment déjà envoyé n'est pas acquitté (la
+            // règle de Minshall : de gros segments en vol ne retiennent
+            // pas le petit qui suit), sauf TCP_NODELAY. Ni le FIN, ni le
+            // mode urgent, ni une poussée n'attendent.
+            let partiel = n < self.mss_courant() as usize && n == reste;
+            if partiel && !avec_fin && !avant(self.snd_nxt, self.snd_max) && !self.pousser && !self.mode_urgent() {
+                let bouchon = self.reglages.cork || self.plus_a_venir;
+                let petit_en_vol = apres(self.snd_sml, self.snd_una) && !apres(self.snd_sml, self.snd_max);
+                let nagle = !self.reglages.nodelay && self.snd_max != self.snd_una && petit_en_vol;
+                if bouchon || nagle {
+                    retenu = true;
+                    break;
+                }
+            }
             if self.snd_nxt == self.snd_una && self.snd_nxt == self.snd_max {
                 // Rien en vol : après un long silence, la cwnd ne vaut plus.
                 let silence = maintenant.saturating_sub(self.dernier_envoi);
@@ -2075,11 +2638,14 @@ impl<P: Charge> Tcb<P> {
                 break;
             }
         }
+        self.pousser = false;
+        self.plus_a_venir = false;
         let sortis = self.paquets_sortis();
         self.cc.valider(limite_cwnd, sortis, self.snd_una, self.snd_nxt);
-        // Rien en vol, et la fenêtre de l'autre ne laisse rien passer : la
-        // sonde (`tcp_check_probe_timer`).
-        if bloque_fenetre && self.snd_max == self.snd_una && self.t_retrans.is_none() && self.t_sonde.is_none() {
+        // Rien en vol, et des données qui attendent (la fenêtre de l'autre ne
+        // les laisse pas passer, ou TCP_CORK les retient) : la sonde
+        // (`tcp_check_probe_timer`), qui les poussera au plus tard.
+        if (bloque_fenetre || retenu) && self.snd_max == self.snd_una && self.t_retrans.is_none() && self.t_sonde.is_none() {
             self.t_sonde = Some(maintenant + self.rto.max(RTO_MIN));
         }
         if self.ack_maintenant {

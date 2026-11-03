@@ -297,6 +297,10 @@ pub struct Socket {
     pub connectee: AtomicBool,
     pub recverr: AtomicBool,
     pub pmtudisc: AtomicU8,
+    /// Le numéro de son inode (/proc/net/tcp le montre), posé quand son
+    /// fichier est fait ; 0 avant (une fille d'une écoute pas encore
+    /// acceptée n'en a pas, chez Linux non plus).
+    pub inode: AtomicU32,
     /// La suivante des sockets qu'une tâche a à fermer (sa liste
     /// `Tache::fermetures`, voir `fichier_ferme`).
     suivante: Verrou<Option<Arc<Socket>>>,
@@ -321,6 +325,7 @@ impl Socket {
             connectee: AtomicBool::new(false),
             recverr: AtomicBool::new(false),
             pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
+            inode: AtomicU32::new(0),
             suivante: Verrou::new(None),
             flux: None,
         }

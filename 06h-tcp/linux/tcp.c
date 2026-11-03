@@ -22,7 +22,14 @@
  *     et 2 s : Linux 6.x ne double pas les premiers délais d'un SYN) ;
  *   - la socket vue comme fichier (fstat) ; UDP et TCP sur le même port ;
  *   - un connect non bloquant suivi par epoll en déclenchement par front,
- *     comme Bun ; deux fils qui s'échangent 1 Mio en aller-retour.
+ *     comme Bun ; deux fils qui s'échangent 1 Mio en aller-retour ;
+ *   - l'octet urgent (MSG_OOB : POLLPRI, lu à part, sauté dans le flux,
+ *     SIOCATMARK) ; SO_SNDBUF agrandi à l'établissement, puis plein sans
+ *     lecteur (EAGAIN, poll 0) ; SO_LINGER d'une seconde (close attend) ;
+ *     le keepalive court sur une connexion vivante ; TCP_INFO ;
+ *     /proc/net/tcp (l'écoute, comme la lisent ss et netstat) ; 64 Mio
+ *     d'un fil à l'autre, la somme vérifiée (le débit affiché, sans être
+ *     comparé).
  * Rien ne compare de valeur qui dépend de la configuration de Linux (le
  * MSS sur lo, SO_SNDBUF agrandi, TCP_CONGESTION : « cubic » chez Linux,
  * « reno » chez nous). Sur l'hôte comme chez nous. Les délais sont des
@@ -740,6 +747,247 @@ static void faute(void)
     close(a);
 }
 
+static void urgent(void)
+{
+    int c, a;
+    char b[16];
+    paire(&c, &a);
+    verifier(erreur(recv(a, b, 1, MSG_OOB)) == EINVAL, "recv(MSG_OOB) sans donnee urgente : EINVAL");
+    verifier(send(c, "abc", 3, MSG_OOB) == 3, "send(MSG_OOB) : 3");
+    attendre_ms(20);
+    struct pollfd p = { a, POLLPRI, 0 };
+    verifier(poll(&p, 1, 0) == 1 && (p.revents & POLLPRI), "l'autre : POLLPRI");
+    verifier(recv(a, b, 1, MSG_OOB) == 1 && b[0] == 'c', "recv(MSG_OOB) : l'octet urgent");
+    int marque = -1;
+    long n = recv(a, b, 16, 0);
+    ioctl(a, SIOCATMARK, &marque);
+    verifier(n == 2 && memcmp(b, "ab", 2) == 0 && marque == 1, "le flux s'arrete a la marque (ab), SIOCATMARK 1");
+    send(c, "de", 2, 0);
+    attendre_ms(20);
+    n = recv(a, b, 16, 0);
+    verifier(n == 2 && memcmp(b, "de", 2) == 0, "l'octet urgent n'est pas dans le flux");
+    /* Seul l'octet urgent en file : rien à lire (EAGAIN), pas la fin du
+     * flux ; avant comme après recv(MSG_OOB). */
+    send(c, "x", 1, MSG_OOB);
+    attendre_ms(20);
+    long e1 = erreur(recv(a, b, 16, MSG_DONTWAIT));
+    recv(a, b, 1, MSG_OOB);
+    send(c, "y", 1, MSG_OOB);
+    attendre_ms(20);
+    recv(a, b, 1, MSG_OOB);
+    long e2 = erreur(recv(a, b, 16, MSG_DONTWAIT));
+    verifier(e1 == EAGAIN && e2 == EAGAIN, "seul l'octet urgent en file : recv rend EAGAIN, pas la fin");
+    close(c);
+    close(a);
+    /* FIONREAD s'arrête à la marque (`tcp_inq`). */
+    paire(&c, &a);
+    send(c, "ab", 2, 0);
+    send(c, "c", 1, MSG_OOB);
+    attendre_ms(20);
+    int avant = -1, apres = -1;
+    ioctl(a, FIONREAD, &avant);
+    recv(a, b, 16, 0);
+    ioctl(a, FIONREAD, &apres);
+    verifier(avant == 2 && apres == 0, "FIONREAD : les octets avant la marque (2), puis 0");
+    close(c);
+    close(a);
+}
+
+/* SO_SNDBUF grandit à l'établissement (Linux : 2 626 560 sur lo, une
+ * valeur qui dépend du MSS : seule sa croissance est comparée) ; sans
+ * lecteur, les envois finissent par EAGAIN, et poll ne dit plus POLLOUT. */
+static void sans_lecteur(void)
+{
+    int c, a;
+    paire(&c, &a);
+    int sndbuf = option(c, SOL_SOCKET, SO_SNDBUF);
+    verifier(sndbuf > 16384, "SO_SNDBUF agrandi a l'etablissement");
+    static char b[65536];
+    long envois = 0, r;
+    while ((r = send(c, b, sizeof b, MSG_DONTWAIT)) > 0)
+        envois++;
+    verifier(envois > 0 && errno == EAGAIN && (masque(c) & POLLOUT) == 0, "sans lecteur : des envois, puis EAGAIN, poll sans POLLOUT");
+    /* SO_LINGER d'une seconde : close attend que tout soit acquitté, en
+     * vain (l'autre ne lit pas), une seconde. */
+    struct linger lg = { 1, 1 };
+    setsockopt(c, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    int f = close(c);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    verifier(f == 0 && ms >= 900 && ms < 3000, "SO_LINGER 1 s, rien d'acquitte : close attend 1 s");
+    close(a);
+}
+
+/* Le keepalive sur une connexion vivante : sondée chaque seconde, elle
+ * répond, et reste. TCP_INFO : l'état, le RTO, la fenêtre de
+ * congestion. */
+static void keepalive_et_info(void)
+{
+    int c, a, un = 1;
+    paire(&c, &a);
+    setsockopt(c, SOL_SOCKET, SO_KEEPALIVE, &un, sizeof un);
+    setsockopt(c, IPPROTO_TCP, TCP_KEEPIDLE, &un, sizeof un);
+    setsockopt(c, IPPROTO_TCP, TCP_KEEPINTVL, &un, sizeof un);
+    setsockopt(c, IPPROTO_TCP, TCP_KEEPCNT, &un, sizeof un);
+    attendre_ms(2500);
+    char b[4];
+    verifier(option(c, SOL_SOCKET, SO_ERROR) == 0 && send(c, "k", 1, 0) == 1 && recv(a, b, 4, 0) == 1,
+             "keepalive d'une seconde, l'autre repond : la connexion reste");
+    struct tcp_info i;
+    socklen_t l = sizeof i;
+    memset(&i, 0, sizeof i);
+    verifier(getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &l) == 0 && i.tcpi_state == 1 && i.tcpi_rto >= 200000 && i.tcpi_snd_cwnd > 0 &&
+             i.tcpi_snd_mss > 0, "TCP_INFO : etablie, RTO de 200 ms au moins, une fenetre de congestion");
+    close(c);
+    close(a);
+}
+
+/* /proc/net/tcp : la ligne de l'écoute (état 0A), le port en hexadécimal. */
+static void proc_net_tcp(void)
+{
+    int port, l = ecoute(&port, 1);
+    FILE *f = fopen("/proc/net/tcp", "r");
+    char ligne[256], cherche[32];
+    snprintf(cherche, sizeof cherche, ":%04X 00000000:0000 0A", port);
+    int trouve = 0, entete = 0;
+    if (f) {
+        if (fgets(ligne, sizeof ligne, f))
+            entete = strncmp(ligne, "  sl  local_address rem_address   st tx_queue rx_queue", 54) == 0;
+        while (fgets(ligne, sizeof ligne, f))
+            trouve |= strstr(ligne, cherche) != NULL;
+        fclose(f);
+    }
+    verifier(entete && trouve, "/proc/net/tcp : l'en-tete, et l'ecoute (etat 0A)");
+    close(l);
+}
+
+/* 64 Mio d'un fil à l'autre, par morceaux de tailles variées, la somme
+ * vérifiée ; le débit est affiché (il change d'une machine à l'autre). */
+#define GROS (64 << 20)
+static int gros_fd;
+
+static void *gros_ecrivain(void *arg)
+{
+    (void)arg;
+    static unsigned char b[65536];
+    long fait = 0;
+    int pas = 1000;
+    while (fait < GROS) {
+        long n = GROS - fait < pas ? GROS - fait : pas;
+        for (long k = 0; k < n; k++)
+            b[k] = (unsigned char)((fait + k) * 13 + ((fait + k) >> 12));
+        long r = send(gros_fd, b, n, 0);
+        if (r <= 0)
+            break;
+        fait += r;
+        pas = pas * 7 % 65536 + 1;
+    }
+    shutdown(gros_fd, SHUT_WR);
+    return NULL;
+}
+
+static void debit(void)
+{
+    int c, a;
+    paire(&c, &a);
+    gros_fd = c;
+    pthread_t f;
+    pthread_create(&f, NULL, gros_ecrivain, NULL);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    static unsigned char b[131072];
+    long recu = 0, n;
+    int bon = 1;
+    while ((n = recv(a, b, sizeof b, 0)) > 0) {
+        for (long k = 0; bon && k < n; k++)
+            bon = b[k] == (unsigned char)((recu + k) * 13 + ((recu + k) >> 12));
+        recu += n;
+    }
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    pthread_join(f, NULL);
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    verifier(bon && recu == GROS, "64 Mio d'un fil a l'autre, chaque octet a sa place");
+    printf("[linux] tcp : 64 Mio en %ld ms (%ld Mio/s)\n", ms, ms ? 64000 / ms : 0);
+    close(c);
+    close(a);
+}
+
+/* SO_RCVLOWAT (`sock_rcvlowat`, `tcp_epollin_ready`) : poll attend le
+ * seuil, et recv aussi. */
+static void seuil(void)
+{
+    int c, a;
+    paire(&c, &a);
+    int dix = 10;
+    setsockopt(a, SOL_SOCKET, SO_RCVLOWAT, &dix, sizeof dix);
+    send(c, "12345", 5, 0);
+    attendre_ms(20);
+    struct pollfd p = { a, POLLIN, 0 };
+    int n0 = poll(&p, 1, 0);
+    send(c, "67890", 5, 0);
+    attendre_ms(20);
+    int n1 = poll(&p, 1, 0);
+    char b[64];
+    long r = recv(a, b, sizeof b, 0);
+    verifier(n0 == 0 && n1 == 1 && r == 10, "SO_RCVLOWAT 10 : poll 0 a 5 octets, 1 a 10, recv 10");
+    close(c);
+    close(a);
+}
+
+/* Une connexion fermée d'un côté puis de l'autre, en TIME_WAIT : TCP_INFO
+ * dit TCP_CLOSE (7) pour la socket que le programme tient encore. */
+static void info_en_time_wait(void)
+{
+    int c, a;
+    paire(&c, &a);
+    shutdown(c, SHUT_WR);
+    attendre_ms(20);
+    close(a);
+    attendre_ms(20);
+    struct tcp_info i;
+    socklen_t li = sizeof i;
+    getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
+    verifier(i.tcpi_state == 7, "une connexion en TIME_WAIT, vue de sa socket : TCP_INFO dit TCP_CLOSE (7)");
+    close(c);
+}
+
+/* L'échelle de fenêtre proposée (`tcp_select_initial_window`) : avec
+ * SO_RCVBUF fixé, celle de sa moitié, ilog2 - 15 ; sans, celle de
+ * `tcp_rmem[2]`, qui dépend de la mémoire de la machine, et au moins celle
+ * de SO_RCVBUF. Linux 6.18 : 5 avec 1 Mio demandé (rmem_max 4 Mio dans WSL),
+ * 10 sans ; nous : 2 (rmem_max 208 Kio), 8 sans (2 Gio). */
+static void echelle(void)
+{
+    for (int fixe = 0; fixe <= 1; fixe++) {
+        int port, l = ecoute(&port, 1);
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        int v = 1 << 20;
+        if (fixe)
+            setsockopt(c, SOL_SOCKET, SO_RCVBUF, &v, sizeof v);
+        struct sockaddr_in x = lo(port);
+        connect(c, (void *)&x, sizeof x);
+        int a = accept(l, NULL, NULL);
+        struct tcp_info i;
+        socklen_t li = sizeof i;
+        getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
+        int bits = 0;
+        for (int place = option(c, SOL_SOCKET, SO_RCVBUF) / 2; place > 1; place >>= 1)
+            bits++;
+        int attendue = bits - 15 < 0 ? 0 : bits - 15 > 14 ? 14 : bits - 15;
+        if (fixe)
+            verifier((i.tcpi_options & TCPI_OPT_WSCALE) && i.tcpi_rcv_wscale == attendue,
+                     "SO_RCVBUF fixe : l'echelle de sa moitie, ilog2 - 15");
+        else
+            verifier((i.tcpi_options & TCPI_OPT_WSCALE) && i.tcpi_rcv_wscale >= attendue && i.tcpi_rcv_wscale >= 7,
+                     "sans SO_RCVBUF : l'echelle de la machine (tcp_rmem[2]), au moins 7");
+        close(a);
+        close(c);
+        close(l);
+    }
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -757,6 +1005,14 @@ int main(void)
     options_de_linux();
     orpheline_et_poignee();
     faute();
+    urgent();
+    sans_lecteur();
+    keepalive_et_info();
+    proc_net_tcp();
+    debit();
+    seuil();
+    info_en_time_wait();
+    echelle();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

@@ -62,9 +62,14 @@ impl Rtt {
         self.srtt8 != 0
     }
 
-    /// SRTT (la borne des ACK retardés).
+    /// SRTT (la borne des ACK retardés, TCP_INFO) et l'écart moyen MDEV
+    /// (le `tcpi_rttvar` de TCP_INFO).
     pub fn srtt(&self) -> u64 {
         self.srtt8 >> 3
+    }
+
+    pub fn ecart(&self) -> u64 {
+        self.mdev4 >> 2
     }
 
     /// Le RTO que donne l'estimateur, sans recul (`__tcp_set_rto`, borné
@@ -162,9 +167,9 @@ mod tests {
     fn estimateur_de_linux() {
         let mut r = Rtt::new();
         r.echantillon(100 * MS, 0, 10);
-        assert_eq!((r.srtt(), r.mdev4 >> 2, r.rto()), (100 * MS, 50 * MS, 300 * MS));
+        assert_eq!((r.srtt(), r.ecart(), r.rto()), (100 * MS, 50 * MS, 300 * MS));
         r.echantillon(10 * MS, 0, 10);
-        assert_eq!((r.srtt(), r.mdev4 >> 2), (88_750_000, 51_250_000));
+        assert_eq!((r.srtt(), r.ecart()), (88_750_000, 51_250_000));
         assert_eq!(r.rto(), 88_750_000 + 205 * MS);
         // Le RTT monte : l'erreur compte pour 1/4. 88,75 + (200 - 88,75) / 8.
         r.echantillon(200 * MS, 0, 10);
