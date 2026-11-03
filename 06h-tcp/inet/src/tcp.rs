@@ -152,7 +152,8 @@ pub fn echelle(rcvbuf: usize, rcvbuf_fixe: bool, reception_max: usize) -> u8 {
     let place = if rcvbuf_fixe { pleine } else { pleine.max(reception_max).min(65_535 << ECHELLE_MAX) };
     (place.max(1).ilog2() as i64 - 15).clamp(0, ECHELLE_MAX as i64) as u8
 }
-/// Le plafond de SO_SNDBUF agrandi (`tcp_wmem[2]`, 4 Mio).
+/// Le plafond de SO_SNDBUF agrandi sur une machine assez grande
+/// (`tcp_wmem[2]`, 4 Mio ; moins sur une petite : `Tcb::sndbuf_max`).
 pub const SNDBUF_MAX: usize = 4 << 20;
 
 /// Les retransmissions d'un SYN avant d'abandonner (`tcp_syn_retries`, la
@@ -497,10 +498,11 @@ pub struct Tcb<P: Charge> {
     fin_recue: bool,
     /// Les tailles des tampons (SO_RCVBUF, SO_SNDBUF, déjà doublées), et
     /// SO_SNDBUF fixé par le programme (`SOCK_SNDBUF_LOCK` : il ne grandit
-    /// plus de lui-même).
+    /// plus de lui-même), et son plafond sur cette machine (`tcp_wmem[2]`).
     pub rcvbuf: usize,
     pub sndbuf: usize,
     pub sndbuf_fixe: bool,
+    pub sndbuf_max: usize,
     /// L'erreur à rendre au programme (`sk_err`), et l'erreur « douce »
     /// d'un ICMP (`sk_err_soft`), que rendra un abandon.
     erreur: i32,
@@ -612,6 +614,7 @@ impl<P: Charge> Tcb<P> {
             rcvbuf,
             sndbuf,
             sndbuf_fixe: false,
+            sndbuf_max: SNDBUF_MAX,
             erreur: 0,
             erreur_douce: 0,
             lecture_fermee: false,
@@ -1532,7 +1535,7 @@ impl<P: Charge> Tcb<P> {
     /// pleins, chacun compté avec sa place dans la mémoire du noyau, comme
     /// Linux (`tcp_sndbuf_expand` : le MSS plus 640 octets d'en-têtes et de
     /// structures, arrondi à la puissance de deux, plus 256 ; au moins 10
-    /// segments ; au plus `tcp_wmem[2]`, 4 Mio). Sur `lo` (MSS 65 495) : 2 626 560
+    /// segments ; au plus `tcp_wmem[2]`). Sur `lo` (MSS 65 495) : 2 626 560
     /// (mesuré chez Linux). Rien si le programme a fixé SO_SNDBUF.
     fn agrandir_sndbuf(&mut self) {
         if self.sndbuf_fixe || self.memoire != Memoire::Libre {
@@ -1540,7 +1543,7 @@ impl<P: Charge> Tcb<P> {
         }
         let par_segment = (self.mss as usize + 640).next_power_of_two() + 256;
         let segments = (self.cc.cwnd.max(CWND_INITIALE).max(REORDONNANCEMENT + 1)) as usize;
-        let voulu = (2 * segments * par_segment).min(SNDBUF_MAX);
+        let voulu = (2 * segments * par_segment).min(self.sndbuf_max);
         if self.sndbuf < voulu {
             self.sndbuf = voulu;
         }

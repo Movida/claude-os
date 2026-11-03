@@ -89,8 +89,8 @@ pub const SOCK_STREAM: u64 = 1;
 pub const IPPROTO_TCP: u64 = 6;
 
 /// Les tailles de départ des tampons d'une socket TCP (`tcp_rmem[1]`,
-/// `tcp_wmem[1]`, mesurées : 131 072 et 16 384), et leurs plafonds
-/// (`tcp_rmem[2]`, `tcp_wmem[2]` de Linux : 6 Mio et 4 Mio).
+/// `tcp_wmem[1]`, mesurées : 131 072 et 16 384) ; leurs plafonds dépendent de
+/// la mémoire de la machine (`RECEPTION_MAX`, `ENVOI_MAX`).
 pub const RCVBUF_DEFAUT: u32 = 131_072;
 pub const SNDBUF_DEFAUT: u32 = 16_384;
 /// La plus longue file d'écoute (`somaxconn`).
@@ -163,10 +163,18 @@ static MEMOIRE: AtomicUsize = AtomicUsize::new(0);
 /// 9,4 % de la mémoire. (`tcp_mem[1]`, la « pression » de Linux, borne
 /// aussi la croissance des fenêtres, que nous n'ajustons pas : un écart.)
 static SEUILS: [AtomicUsize; 2] = [AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX)];
-/// La plus grande place de réception que la machine permet (`tcp_rmem[2]`,
-/// et au moins `rmem_max`), posée au démarrage : l'échelle de fenêtre que
-/// proposent les connexions en dépend (`itcp::echelle`).
-static RECEPTION_MAX: AtomicUsize = AtomicUsize::new(socket::TAMPON_MAX as usize);
+/// Les plafonds des tampons d'une connexion que la machine permet
+/// (`tcp_rmem[2]`, `tcp_wmem[2]`), posés au démarrage. L'échelle de fenêtre
+/// que proposent les connexions dépend du premier (et de `rmem_max`,
+/// `itcp::echelle`) ; SO_SNDBUF grandit jusqu'au second.
+static RECEPTION_MAX: AtomicUsize = AtomicUsize::new(RCVBUF_DEFAUT as usize);
+static ENVOI_MAX: AtomicUsize = AtomicUsize::new(itcp::SNDBUF_MAX);
+
+/// La plus grande place de réception possible, pour l'échelle de fenêtre
+/// (`tcp_select_initial_window` : `tcp_rmem[2]`, au moins `rmem_max`).
+fn reception_max() -> usize {
+    RECEPTION_MAX.load(Ordering::Relaxed).max(socket::TAMPON_MAX as usize)
+}
 
 /// Où en est la mémoire de TCP de toute la machine.
 fn niveau_memoire() -> itcp::Memoire {
@@ -189,16 +197,20 @@ static MINUTEURS: AtomicUsize = AtomicUsize::new(0);
 
 /// Fait la table des ports et celle des TIME_WAIT. Au démarrage.
 pub fn initialiser() {
-    // Les seuils de `tcp_mem` (`tcp_init_mem`), d'après la mémoire de la
-    // machine : un seizième de ses pages, au moins 128 ; 3/4 de cela, puis
-    // le double.
-    let limite = (crate::pages::total() / 16).max(128);
+    // Tout d'après les pages LIBRES à cet instant (`nr_free_buffer_pages`),
+    // pas toute la mémoire : l'image et le noyau n'en font pas partie.
+    let libres = crate::pages::libres();
+    // Les seuils de `tcp_mem` (`tcp_init_mem`) : un seizième de ces pages,
+    // au moins 128 ; 3/4 de cela, puis le double.
+    let limite = (libres / 16).max(128);
     SEUILS[0].store(limite / 4 * 3 * 4096, Ordering::Relaxed);
     SEUILS[1].store(limite / 4 * 3 * 2 * 4096, Ordering::Relaxed);
-    // `tcp_rmem[2]` (`tcp_init`) : un 128e de la mémoire, entre 128 Kio et
-    // 32 Mio (15 Mio sur la machine de l'étape, 2 Gio : une échelle de 8).
-    let rmem2 = (crate::pages::total() * 4096 / 128).clamp(131_072, 32 << 20);
-    RECEPTION_MAX.store(rmem2.max(socket::TAMPON_MAX as usize), Ordering::Relaxed);
+    // `tcp_rmem[2]` et `tcp_wmem[2]` (`tcp_init`) : un 128e de ces pages, au
+    // plus 32 Mio et 4 Mio, au moins 128 Kio et 64 Kio. Sur la machine de
+    // l'étape (2 Gio) : 12 à 15 Mio selon l'image, une échelle de 8.
+    let par_socket = libres * 4096 / 128;
+    RECEPTION_MAX.store(par_socket.min(32 << 20).max(131_072), Ordering::Relaxed);
+    ENVOI_MAX.store(par_socket.min(itcp::SNDBUF_MAX).max(64 << 10), Ordering::Relaxed);
     *TABLE.verrouiller() = ports_tcp::Table::new(MAX_PORTS, crate::aleatoire::u32);
     let mut tw = TW.verrouiller();
     if TABLE.verrouiller().is_none() || tw.try_reserve_exact(MAX_TW).is_err() {
@@ -874,11 +886,12 @@ impl Partie {
         // c'est ainsi qu'un serveur règle ses connexions, et la fenêtre que
         // la fille annonce (son échelle est choisie ici, au SYN).
         let rcvbuf = moi.rcvbuf.load(Ordering::Relaxed) as usize;
-        let echelle = itcp::echelle(rcvbuf, self.options.rcvbuf_fixe, RECEPTION_MAX.load(Ordering::Relaxed));
+        let echelle = itcp::echelle(rcvbuf, self.options.rcvbuf_fixe, reception_max());
         let mut tcb = Tcb::depuis_syn(&h, iss, mss, rcvbuf, moi.sndbuf.load(Ordering::Relaxed) as usize, echelle);
         tcb.mss_utilisateur = self.options.maxseg;
         tcb.reglages = self.options.reglages(false);
         tcb.sndbuf_fixe = self.options.sndbuf_fixe;
+        tcb.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
         tcb.memoire = niveau_memoire();
         let lien = Lien {
             sorte: Sorte::Connectee, adresse: s.destination, port: h.destination, distante: s.source, port_distant: h.source,
@@ -898,14 +911,16 @@ impl Partie {
 }
 
 /// Le numéro de séquence initial d'une connexion (`secure_tcp_seq`, RFC
-/// 6528) : SipHash du quadruplet sous une clé secrète, plus l'horloge en
-/// unités de 64 ns (elle fait le tour des 32 bits en 274 s : deux
-/// connexions successives du même quadruplet ne se recouvrent pas).
+/// 6528) : SipHash du quadruplet sous une clé secrète, plus l'horloge du
+/// calendrier en unités de 64 ns (`seq_scale` : elle fait le tour des 32
+/// bits en 274 s, et deux connexions successives du même quadruplet ne se
+/// recouvrent pas). Le calendrier plutôt que le temps depuis le démarrage :
+/// c'est celle de Linux, et elle ne repart pas de zéro avec la machine.
 pub fn numero_initial(locale: [u8; 4], distante: [u8; 4], port: u16, port_distant: u16) -> u32 {
     let cle = cle_secrete();
     let h = crypto::siphash::siphash_3u32(u32::from_ne_bytes(locale), u32::from_ne_bytes(distante),
                                           (port as u32) << 16 | port_distant as u32, &cle);
-    (h as u32).wrapping_add((crate::temps::ns_monotone() >> 6) as u32)
+    (h as u32).wrapping_add((crate::temps::ns_calendrier() >> 6) as u32)
 }
 
 /// La clé secrète des numéros de séquence et des ports (`net_secret`),
@@ -1345,12 +1360,13 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 p.hors_table = false;
                 let iss = numero_initial(source, destination, port, a.port);
                 let rcvbuf = s.rcvbuf.load(Ordering::Relaxed) as usize;
-                let echelle = itcp::echelle(rcvbuf, p.options.rcvbuf_fixe, RECEPTION_MAX.load(Ordering::Relaxed));
+                let echelle = itcp::echelle(rcvbuf, p.options.rcvbuf_fixe, reception_max());
                 let mut t = Tcb::connecter(port, a.port, iss, mss_vers(destination), rcvbuf, s.sndbuf.load(Ordering::Relaxed) as usize,
                                            echelle);
                 t.mss_utilisateur = p.options.maxseg;
                 t.reglages = p.options.reglages(false);
                 t.sndbuf_fixe = p.options.sndbuf_fixe;
+                t.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
                 t.memoire = niveau_memoire();
                 p.mode = Mode::Connexion(t);
                 p.identifiant = crate::aleatoire::u32() as u16;

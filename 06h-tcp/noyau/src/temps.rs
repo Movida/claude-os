@@ -214,6 +214,12 @@ pub fn maintenant() -> Temps {
     date(ns_monotone())
 }
 
+/// La date en nanosecondes depuis 1970 (`ktime_get_real_ns`).
+pub fn ns_calendrier() -> u64 {
+    let t = maintenant();
+    t.secondes as u64 * 1_000_000_000 + t.nanosecondes as u64
+}
+
 /// La date à l'instant `ns` du temps monotone.
 fn date(ns: u64) -> Temps {
     let ecoule = depuis_nanosecondes(ns.saturating_sub(INSTANT_DE_LECTURE.load(Ordering::Relaxed)));
