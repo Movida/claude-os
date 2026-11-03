@@ -476,3 +476,60 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   fil), vérifier une copie de l'arbre à commiter (`git checkout-index -a
   --prefix=...`, puis `VERIF_RACINE`) pendant qu'on avance dans le clone,
   et ne lancer qu'un QEMU à la fois.
+
+## Pièges rencontrés en 6h (3 novembre 2026)
+
+- **48 corrections dans des commits que les suivants réécrivent** (2 600
+  lignes, dont la moitié dans le commit des connexions TCP, que la
+  fiabilité et le débit avaient transformé ensuite) : ni `rebase
+  --autosquash`, ni un fixup par correction. Ce qui a marché, par la
+  plomberie, dans un dossier de notes (pas le brouillon) :
+  - les COUCHES : l'arbre final d'origine (F), plus les corrections de
+    chaque commit visé, dans l'ordre (F1, F2...), la dernière égale à
+    l'arbre corrigé et vérifié ; chaque couche écrite par morceaux du
+    `git diff -U0` (une table « morceau → commit visé ») et des éditions
+    qui retirent d'une couche ce qui n'arrive qu'avec un commit plus
+    tardif ;
+  - les INSTANTANÉS : pour chaque commit d'origine, la fusion à trois
+    (`git merge-file`) de son propre changement dans l'instantané corrigé
+    précédent, puis celle de sa couche (base Fk-1, le leur Fk) ; quand la
+    première conflicte, essayer la fusion « directe » (l'origine du commit
+    plus toutes les couches d'avant), souvent propre quand le commit est
+    proche de la fin ;
+  - chaque conflit résolu à la main, une fois, dans un fichier rangé par
+    commit et par étape de fusion, avec le résultat automatique qu'il
+    remplace : un résultat qui change ensuite (une couche corrigée) le
+    signale, au lieu d'appliquer en silence une résolution périmée ;
+  - le dernier instantané doit être l'arbre corrigé, octet pour octet ;
+    puis chaque commit construit (clippy compris), testé, et vérifié dans
+    QEMU, et les commits faits par `commit-tree`, sans signer, re-signés
+    d'un coup à la fin.
+- **Une correction se replie sous la forme qu'avait le code alors** :
+  `accept4` en TCP seul dans le commit des connexions, puis TCP et AF_UNIX,
+  puis `socket::fermer` quand WASI l'apporte ; `fatale` avant que la
+  fiabilité ne le renomme `injoignable`. Et ce qui MANQUAIT n'est pas un
+  défaut : une correction qui demande une machinerie plus tardive (l'heure
+  dans la `Tcb`, pour limiter les ACK) va dans le commit qui l'apporte.
+  Noter chaque reciblage, pour les messages.
+- **Un commentaire corrigé doit être vrai au commit visé** : « `Arc::new`
+  ne sait pas échouer » était vrai au commit des connexions, et n'est
+  devenu faux qu'avec le `Arc` faillible de la relecture globale ; c'est
+  là que se replie sa nouvelle raison.
+- **Les tests ajoutés par la relecture vont avec les tests de leur
+  commit**, pas à la fin du fichier : sinon chaque repli conflicte en fin
+  de fichier, et l'arbre final diffère de celui qui a été vérifié. Ranger
+  d'abord l'arbre corrigé (et le revérifier), puis replier ; couper un
+  test qui mêle deux commits (un `seuil_et_faute` devient `faute` et
+  `seuil`), et déplacer un utilitaire de test vers le commit de son
+  premier usage.
+- **Vérifier une chaîne repliée** : `verifier-historique.sh` relance toutes
+  les étapes à chaque commit (des heures pour 22 commits : les `claude -p`
+  de 6f, 6g et 6h à chacun). Quand seul le dossier de l'étape change
+  (`git diff --name-only` contre `origin/main`), vérifier cette étape
+  seule, en deux voies parallèles (deux worktrees, au plus deux QEMU de
+  2 Gio), et sauter les commits qui ne la changent pas.
+- **La signature par 1Password** demande l'accord de David, et cet accord
+  ne dure que quelques minutes : sa notification arrive dans le systray de
+  Windows (pas toujours visible), et un redémarrage de 1Password l'a
+  réparée quand elle ne venait plus. Ses messages n'arrivent qu'à la fin
+  d'un tour : si la signature échoue, finir le tour pour lire sa réponse.
