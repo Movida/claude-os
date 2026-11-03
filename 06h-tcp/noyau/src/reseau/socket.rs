@@ -135,6 +135,8 @@ pub enum Protocole {
     Ping,
     /// TCP (tcp.rs, 6h) : SOCK_STREAM.
     Tcp,
+    /// AF_UNIX (unix.rs, 6h) : les trois sortes.
+    Unix,
 }
 
 /// La règle qui accepte un datagramme en file.
@@ -306,6 +308,8 @@ pub struct Socket {
     suivante: Verrou<Option<Arc<Socket>>>,
     /// Le flux d'une socket TCP (tcp.rs) : sa possession et sa connexion.
     pub flux: Option<alloc::boxed::Box<crate::attente::Possession<super::tcp::Partie>>>,
+    /// La partie d'une socket AF_UNIX (unix.rs).
+    pub unix: Option<alloc::boxed::Box<super::unix::Unix>>,
 }
 
 impl Socket {
@@ -328,7 +332,14 @@ impl Socket {
             inode: AtomicU32::new(0),
             suivante: Verrou::new(None),
             flux: None,
+            unix: None,
         }
+    }
+
+    /// Une socket AF_UNIX de sorte `sorte`. None : plus de mémoire.
+    pub fn unix(mut self, sorte: super::unix::Sorte) -> Option<Socket> {
+        self.unix = Some(faillible::boite(super::unix::Unix::new(sorte)?).ok()?);
+        Some(self)
     }
 
     /// Une socket TCP : son flux, et ses tampons de départ (`tcp_rmem[1]`,
@@ -447,6 +458,10 @@ impl Socket {
         if let Some(f) = &self.flux {
             table.attendre(&f.file, tenu);
             return super::tcp::sonder(self);
+        }
+        if self.unix.is_some() {
+            table.attendre(&self.attente, tenu);
+            return super::unix::sonder(self);
         }
         table.attendre(&self.attente, tenu);
         let r = self.reception.verrouiller();
@@ -643,6 +658,7 @@ pub fn fermer_les_differees() {
         };
         match s.protocole {
             Protocole::Tcp => super::tcp::fermer(&s),
+            Protocole::Unix => super::unix::fermer(&s),
             _ => super::datagramme::table::retirer(&s),
         }
     }

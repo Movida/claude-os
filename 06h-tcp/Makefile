@@ -95,8 +95,9 @@
 #                  linux/courses (des programmes à plusieurs fils),
 #                  linux/reseau (les sockets UDP et ICMP, sur lo) et
 #                  linux/dns (getaddrinfo, par un DNS du programme),
-#                  linux/aleatoire (getrandom, /dev/random) et
-#                  linux/tcp (les sockets TCP, sur lo)
+#                  linux/aleatoire (getrandom, /dev/random),
+#                  linux/tcp (les sockets TCP, sur lo) et
+#                  linux/unix (les sockets AF_UNIX)
 #   make suite  -> seulement télécharger et convertir la suite
 #   make clean  -> supprime les fichiers générés, la suite, wabt et la compilation
 #
@@ -248,6 +249,9 @@ boot.bin: programmes.cpio FORCE
 #   - tcp : gcc -static, les sockets TCP sur lo (les appels et leurs refus,
 #     les options, l'écoute et sa file, les fermetures, epoll par front,
 #     1 Mio en aller-retour entre deux fils) ; sur l'hôte aussi ;
+#   - unix : gcc -static, les sockets AF_UNIX (les trois sortes, les noms,
+#     les connexions et leurs fermetures, socketpair, /proc/net/unix, un
+#     serveur et trois clients en fils) ; sur l'hôte aussi ;
 #   - aleatoire : gcc -static, le générateur (getrandom et ses refus,
 #     /dev/random, /dev/urandom, /proc/sys/kernel/random) ; sur l'hôte
 #     aussi ;
@@ -380,6 +384,10 @@ $(LINUX)/dns: linux/dns.c
 	gcc $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/tcp: linux/tcp.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/unix: linux/unix.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -767,7 +775,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -928,7 +936,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -966,6 +974,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	timeout 60 ./$(LINUX)/dns | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/aleatoire | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 120 ./$(LINUX)/tcp | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	timeout 60 ./$(LINUX)/unix | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	rm -rf /tmp/ajout; \
 	  ./$(LINUX)/ajout ecrire a 500 & a=$$!; ./$(LINUX)/ajout ecrire b 500 & b=$$!; \
 	  ./$(LINUX)/ajout verifier 500 | tee /dev/stderr | (! grep -q ECHEC); r=$$?; wait $$a $$b; exit $$r

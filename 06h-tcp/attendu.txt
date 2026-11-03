@@ -53,8 +53,8 @@ rendues et recollees : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 49, liens symboliques 6, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 45 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 50, liens symboliques 6, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 46 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -179,6 +179,8 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] aleatoire : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] tcp : toutes les verifications : ok
 [noyau] tcp : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] unix : toutes les verifications : ok
+[noyau] unix : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] passerelle : /proc/net/route comme Linux : ok
 [linux] passerelle : /proc/net/route lu par morceaux : ok
 [linux] passerelle : /etc/resolv.conf -> /proc/net/pnp : ok

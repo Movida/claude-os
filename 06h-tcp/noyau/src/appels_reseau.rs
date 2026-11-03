@@ -11,12 +11,9 @@
 //! eux-mêmes (on leur passe de quoi le faire : une adresse déjà copiée, une
 //! fonction qui copie la charge).
 //!
-//! Les familles : AF_INET seule (6h ajoutera AF_UNIX) ; une autre rend
-//! EAFNOSUPPORT, comme un Linux qui ne l'a pas compilée. Les sortes
-//! d'AF_INET : SOCK_DGRAM et UDP ; SOCK_STREAM rend ESOCKTNOSUPPORT (ce que
-//! rend `inet_create` pour une sorte sans protocole inscrit : un Linux sans
-//! TCP, jusqu'à 6h ; mesuré, `claude -p` le prend pour une connexion
-//! refusée).
+//! Les familles : AF_INET (UDP, ping, et TCP depuis 6h) et AF_UNIX (6h,
+//! reseau/unix.rs) ; une autre rend EAFNOSUPPORT, comme un Linux qui ne
+//! l'a pas compilée.
 
 use crate::appels_fichiers::{self, FichierTenu, installer_fichier};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
@@ -26,7 +23,7 @@ use crate::reseau::socket::{self, Protocole, Socket, AF_INET, ARRET_ECRITURE, AR
                             IPPROTO_ICMP, IPPROTO_UDP, NPROTO, RCVBUF_MIN, SNDBUF_MIN, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_MAX,
                             SOCK_NONBLOCK, SOCK_RAW, TAMPON_MAX};
 use crate::reseau::datagramme::{self, Controle};
-use crate::reseau::{ping, tcp, udp};
+use crate::reseau::{ping, tcp, udp, unix};
 use crate::{faillible, processus, temps, vfs};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
@@ -112,6 +109,8 @@ const SO_BSDCOMPAT: i32 = 14;
 const SO_REUSEPORT: i32 = 15;
 const SO_RCVLOWAT: i32 = 18;
 const SO_SNDLOWAT: i32 = 19;
+const SO_PASSCRED: i32 = 16;
+const SO_PEERCRED: i32 = 17;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const SO_ACCEPTCONN: i32 = 30;
@@ -219,6 +218,18 @@ fn choisir(famille: i32, sorte: i32, protocole: i32) -> Result<(Protocole, u16),
     if sorte < 0 || sorte as u64 >= SOCK_MAX {
         return Err(-EINVAL);
     }
+    if famille as u16 == unix::AF_UNIX {
+        // `unix_create` : le protocole d'abord (0, ou PF_UNIX), puis la
+        // sorte (SOCK_RAW devient SOCK_DGRAM ; SOCK_RDM : ESOCKTNOSUPPORT,
+        // mesuré).
+        if protocole != 0 && protocole != unix::AF_UNIX as i32 {
+            return Err(-EPROTONOSUPPORT);
+        }
+        return match unix::Sorte::de(sorte as u16) {
+            Some(_) => Ok((Protocole::Unix, protocole as u16)),
+            None => Err(-ESOCKTNOSUPPORT),
+        };
+    }
     if famille as u16 != AF_INET || sorte == SOCK_PACKET {
         return Err(-EAFNOSUPPORT);
     }
@@ -283,9 +294,30 @@ pub fn socket(famille: u64, sorte: u64, protocole: u64) -> i64 {
     // Dans l'ordre de `__sock_create` : la socket d'abord (`sock_alloc` :
     // ENFILE), puis ce que demande son protocole (`sk_alloc` : ENOBUFS).
     let Ok(place) = ArcVide::new() else { return -ENFILE };
-    let s = Socket::new(p, sorte as u16, proto, identite.uid);
-    let Some(s) = (if p == Protocole::Tcp { s.tcp() } else { Some(s) }) else { return -ENOBUFS };
-    installer(place.remplir(s), drapeaux)
+    let s = match creer(p, sorte, proto, identite.uid, place) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    installer(s, drapeaux)
+}
+
+/// La socket d'un protocole choisi : TCP a son flux, AF_UNIX sa partie (sa
+/// sorte : SOCK_RAW y devient SOCK_DGRAM), inscrite. ENOBUFS : plus de
+/// mémoire.
+fn creer(p: Protocole, sorte: i32, proto: u16, uid: u32, place: ArcVide<Socket>) -> Result<Arc<Socket>, i64> {
+    let s = match p {
+        Protocole::Tcp => Socket::new(p, sorte as u16, proto, uid).tcp(),
+        Protocole::Unix => {
+            let u = unix::Sorte::de(sorte as u16).ok_or(-ESOCKTNOSUPPORT)?;
+            Socket::new(p, u.linux(), proto, uid).unix(u)
+        }
+        _ => Some(Socket::new(p, sorte as u16, proto, uid)),
+    };
+    let s = place.remplir(s.ok_or(-ENOBUFS)?);
+    if p == Protocole::Unix {
+        unix::inscrire(&s)?;
+    }
+    Ok(s)
 }
 
 /// Le fichier ouvert d'une socket neuve (`sock_alloc_file`) : son inode
@@ -324,7 +356,7 @@ fn fichier_sans_socket(identite: fichiers::Identite, non_bloquant: bool) -> Resu
 }
 
 /// Met la socket `s` dans le fichier `f`, de `fichier_sans_socket` : elle y
-/// apprend son inode (/proc/net/tcp).
+/// apprend son inode (/proc/net/tcp, /proc/net/unix).
 fn attacher(f: &mut FichierOuvert, s: Arc<Socket>) {
     s.inode.store(f.inode().0, Ordering::Relaxed);
     f.prive = Prive::Socket(s);
@@ -337,15 +369,53 @@ fn attacher(f: &mut FichierOuvert, s: Arc<Socket>) {
 /// écrit leurs numéros (EMFILE, EFAULT) avant de créer les sockets : nous
 /// ne les réservons pas pour rien (un écart, sans effet sur ce qui est
 /// rendu quand tout va bien).
-pub fn socketpair(famille: u64, sorte: u64, protocole: u64, _tableau: u64) -> i64 {
-    let (sorte, _) = match separer(sorte) {
+pub fn socketpair(famille: u64, sorte: u64, protocole: u64, tableau: u64) -> i64 {
+    let (sorte, drapeaux) = match separer(sorte) {
         Ok(x) => x,
         Err(e) => return e,
     };
-    match choisir(famille as i32, sorte, protocole as i32) {
-        Ok(_) => -EOPNOTSUPP,
-        Err(e) => e,
+    let (p, proto) = match choisir(famille as i32, sorte, protocole as i32) {
+        Ok(x) => x,
+        Err(e) => return e,
+    };
+    if p != Protocole::Unix {
+        return -EOPNOTSUPP;
     }
+    // AF_UNIX (`unix_socketpair`) : deux sockets connectées l'une à
+    // l'autre, puis leurs fichiers, puis leurs numéros écrits (une faute :
+    // EFAULT, les deux fermés).
+    let identite = processus::avec(|p| p.identite);
+    let Ok(place) = ArcVide::new() else { return -ENFILE };
+    let premiere = match creer(p, sorte, proto, identite.uid, place) {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let seconde = match unix::paire(&premiere) {
+        Ok(s) => s,
+        Err(e) => {
+            unix::fermer(&premiere);
+            return e;
+        }
+    };
+    let a = installer(premiere, drapeaux);
+    if a < 0 {
+        unix::fermer(&seconde);
+        return a;
+    }
+    let b = installer(seconde, drapeaux);
+    if b < 0 {
+        appels_fichiers::close(a as u64);
+        return b;
+    }
+    let mut o = [0u8; 8];
+    o[..4].copy_from_slice(&(a as i32).to_le_bytes());
+    o[4..].copy_from_slice(&(b as i32).to_le_bytes());
+    if copier_vers_utilisateur(tableau, &o).is_err() {
+        appels_fichiers::close(a as u64);
+        appels_fichiers::close(b as u64);
+        return -EFAULT;
+    }
+    0
 }
 
 /// bind(fd, adresse, longueur).
@@ -356,6 +426,7 @@ pub fn bind(fd: u64, adresse: u64, longueur: u64) -> i64 {
         match o.socket().protocole {
             Protocole::Udp | Protocole::Ping => datagramme::lier(o.socket(), a.octets()).map(|()| 0),
             Protocole::Tcp => tcp::lier(o.socket(), a.octets()).map(|()| 0),
+            Protocole::Unix => unix::lier(o.socket(), a.octets()).map(|()| 0),
         }
     })())
 }
@@ -371,6 +442,7 @@ pub fn connect(fd: u64, adresse: u64, longueur: u64) -> i64 {
         match o.socket().protocole {
             Protocole::Udp | Protocole::Ping => datagramme::connecter(o.socket(), a.octets()).map(|()| 0),
             Protocole::Tcp => tcp::connecter(o.socket(), a.octets(), non_bloquant(&o)).map(|()| 0),
+            Protocole::Unix => unix::connecter(o.socket(), a.octets(), non_bloquant(&o)).map(|()| 0),
         }
     })())
 }
@@ -380,6 +452,7 @@ pub fn connect(fd: u64, adresse: u64, longueur: u64) -> i64 {
 pub fn listen(fd: u64, file: u64) -> i64 {
     match tenir(fd) {
         Ok(o) if o.socket().protocole == Protocole::Tcp => en_i64(tcp::ecouter(o.socket(), file as i32).map(|()| 0)),
+        Ok(o) if o.socket().protocole == Protocole::Unix => en_i64(unix::ecouter(o.socket(), file as i32).map(|()| 0)),
         Ok(_) => -EOPNOTSUPP,
         Err(e) => e,
     }
@@ -403,14 +476,30 @@ pub fn accept4(fd: u64, adresse: u64, longueur: u64, drapeaux: u64) -> i64 {
             return Err(-EINVAL);
         }
         let o = socket_de(o)?;
-        if o.socket().protocole != Protocole::Tcp {
+        let protocole = o.socket().protocole;
+        if !matches!(protocole, Protocole::Tcp | Protocole::Unix) {
             return Err(-EOPNOTSUPP);
         }
         let numero = appels_fichiers::reserver()?;
         let identite = processus::avec(|p| p.identite);
         let mut f = fichier_sans_socket(identite, drapeaux & SOCK_NONBLOCK != 0)?;
-        // La fille, devenue socket, et l'adresse de son pair.
-        let (enfant, distante, port) = match tcp::accepter(o.socket(), non_bloquant(&o)) {
+        // La fille, et l'adresse de son pair : pour AF_UNIX, celle du
+        // client (sans nom, la famille seule, mesuré) ; pour TCP, son
+        // adresse et son port.
+        let mut pair = [0u8; ADRESSE_MAX];
+        let pris = if protocole == Protocole::Unix {
+            unix::accepter(o.socket(), non_bloquant(&o)).map(|enfant| {
+                let nom = unix::pair(&enfant).ok().unwrap_or_else(|| unix::nom(&enfant));
+                pair[..nom.octets().len()].copy_from_slice(nom.octets());
+                (enfant, nom.octets().len())
+            })
+        } else {
+            tcp::accepter(o.socket(), non_bloquant(&o)).map(|(enfant, distante, port)| {
+                pair[..socket::SOCKADDR_IN].copy_from_slice(&socket::sockaddr_in(distante, port));
+                (enfant, socket::SOCKADDR_IN)
+            })
+        };
+        let (enfant, n) = match pris {
             Ok(p) => p,
             Err(e) => {
                 appels_fichiers::rendre_fichier(f);
@@ -422,11 +511,15 @@ pub fn accept4(fd: u64, adresse: u64, longueur: u64, drapeaux: u64) -> i64 {
         // socket : elle se ferme ici, comme à son dernier `close`.
         let abandonner = |f, e| {
             appels_fichiers::rendre_fichier(f);
-            tcp::fermer(&enfant);
+            if protocole == Protocole::Unix {
+                unix::fermer(&enfant);
+            } else {
+                tcp::fermer(&enfant);
+            }
             Err(e)
         };
         if adresse != 0
-            && let Err(e) = rendre_adresse(&socket::sockaddr_in(distante, port), adresse, longueur)
+            && let Err(e) = rendre_adresse(&pair[..n], adresse, longueur)
         {
             return abandonner(f, e);
         }
@@ -442,6 +535,9 @@ pub fn accept4(fd: u64, adresse: u64, longueur: u64, drapeaux: u64) -> i64 {
 pub fn getsockname(fd: u64, adresse: u64, longueur: u64) -> i64 {
     en_i64((|| {
         let o = tenir(fd)?;
+        if o.socket().protocole == Protocole::Unix {
+            return rendre_adresse(unix::nom(o.socket()).octets(), adresse, longueur).map(|()| 0);
+        }
         let (a, port) = match o.socket().protocole {
             Protocole::Tcp => tcp::nom(o.socket()),
             _ => datagramme::nom(o.socket()),
@@ -455,6 +551,9 @@ pub fn getsockname(fd: u64, adresse: u64, longueur: u64) -> i64 {
 pub fn getpeername(fd: u64, adresse: u64, longueur: u64) -> i64 {
     en_i64((|| {
         let o = tenir(fd)?;
+        if o.socket().protocole == Protocole::Unix {
+            return rendre_adresse(unix::pair(o.socket())?.octets(), adresse, longueur).map(|()| 0);
+        }
         let (a, port) = match o.socket().protocole {
             Protocole::Tcp => tcp::pair(o.socket()),
             _ => datagramme::pair(o.socket()),
@@ -555,6 +654,22 @@ fn envoyer(o: &FichierTenu, nom: Option<&[u8]>, morceaux: &[(u64, u64)], mut dra
             }
             r
         }
+        // AF_UNIX : SCM_RIGHTS et SCM_CREDENTIALS attendent 6l (EINVAL) ;
+        // EPIPE d'un flux envoie SIGPIPE, sauf MSG_NOSIGNAL (un DGRAM ou
+        // SEQPACKET, non : `unix_dgram_sendmsg` ne le fait pas).
+        Protocole::Unix => {
+            const MSG_NOSIGNAL: u64 = 0x4000;
+            match controle {
+                Err(e) => return e,
+                Ok(c) if c.droits => return -EINVAL,
+                Ok(_) => {}
+            }
+            let r = unix::envoyer(o.socket(), nom, longueur, drapeaux, remplir);
+            if r == Err(-EPIPE) && drapeaux & MSG_NOSIGNAL == 0 && o.socket().sorte == unix::SOCK_STREAM {
+                crate::signaux::au_fil_courant(13);
+            }
+            r
+        }
     };
     en_i64(r.map(|n| n as i64))
 }
@@ -562,6 +677,8 @@ fn envoyer(o: &FichierTenu, nom: Option<&[u8]>, morceaux: &[(u64, u64)], mut dra
 /// Ce qu'a rendu une réception, et ce qu'il faut en dire au programme.
 struct Reception {
     recu: socket::Recu,
+    /// L'adresse de l'émetteur d'un DGRAM AF_UNIX (None : sans nom).
+    nom_unix: Option<unix::Nom>,
     /// MSG_TRUNC, MSG_CTRUNC, MSG_ERRQUEUE.
     drapeaux: u32,
     /// L'erreur prise de la file d'erreurs (MSG_ERRQUEUE).
@@ -587,7 +704,7 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
             coupe: copie < total,
         };
         let d = if recu.coupe { MSG_TRUNC } else { 0 } | MSG_ERRQUEUE as u32;
-        return Ok(Reception { recu, drapeaux: d, erreur: Some(e) });
+        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: Some(e) });
     }
     if o.socket().protocole == Protocole::Tcp && drapeaux & MSG_OOB != 0 {
         // L'octet urgent (`tcp_recv_urg`) : MSG_OOB dans `msg_flags`, et
@@ -596,7 +713,15 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let n = tcp::recevoir_urgent(o.socket(), drapeaux, place, |octet| copier_vers_morceaux(morceaux, &[octet]).map(|_| ()))?;
         let recu = socket::Recu { vide: true, longueur: n.unwrap_or(0), source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: false };
         let d = if n.is_some() { MSG_OOB as u32 | if place == 0 { MSG_TRUNC } else { 0 } } else { 0 };
-        return Ok(Reception { recu, drapeaux: d, erreur: None });
+        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: None });
+    }
+    if o.socket().protocole == Protocole::Unix {
+        let u = unix::recevoir(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |decalage, octets| {
+            copier_vers_morceaux_depuis(morceaux, decalage, octets)
+        })?;
+        let recu = socket::Recu { vide: true, longueur: u.longueur, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: u.coupe };
+        let d = if u.coupe { MSG_TRUNC } else { 0 };
+        return Ok(Reception { recu, nom_unix: u.adresse, drapeaux: d, erreur: None });
     }
     if o.socket().protocole == Protocole::Tcp {
         // Un flux : les octets à la suite dans les morceaux, sans émetteur
@@ -605,11 +730,11 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
             copier_vers_morceaux_depuis(morceaux, decalage, octets)
         })?;
         let recu = socket::Recu { vide: true, longueur: n, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: false };
-        return Ok(Reception { recu, drapeaux: 0, erreur: None });
+        return Ok(Reception { recu, nom_unix: None, drapeaux: 0, erreur: None });
     }
     let recu = socket::prendre(o.socket(), drapeaux, non_bloquant(o), |octets| copier_vers_morceaux(morceaux, octets))?;
     let drapeaux = if recu.coupe { MSG_TRUNC } else { 0 };
-    Ok(Reception { recu, drapeaux, erreur: None })
+    Ok(Reception { recu, nom_unix: None, drapeaux, erreur: None })
 }
 
 /// sendto(fd, tampon, longueur, drapeaux, adresse, longueur de l'adresse) :
@@ -640,7 +765,12 @@ pub fn recvfrom(fd: u64, tampon: u64, longueur: u64, drapeaux: u64, adresse: u64
         let r = recevoir(&o, &[(tampon, longueur)], drapeaux as u32 as u64)?;
         if adresse != 0 {
             let source = socket::sockaddr_in(r.recu.source, r.recu.port);
-            rendre_adresse(if r.recu.vide { &[] } else { &source }, adresse, longueur_adresse)?;
+            let a = match &r.nom_unix {
+                Some(n) => n.octets(),
+                None if r.recu.vide => &[],
+                None => &source,
+            };
+            rendre_adresse(a, adresse, longueur_adresse)?;
         }
         Ok(r.recu.longueur as i64)
     })())
@@ -732,7 +862,7 @@ fn lire_controle(c: &[u8]) -> Result<Controle, i64> {
                 r.tos = Some(v as u8);
             }
             (SOL_IP, _) | (SOL_UDP, _) => return Err(-EINVAL),
-            (SOL_SOCKET, SCM_RIGHTS | SCM_CREDENTIALS) => {}
+            (SOL_SOCKET, SCM_RIGHTS | SCM_CREDENTIALS) => r.droits = true,
             (SOL_SOCKET, _) => return Err(-EINVAL),
             _ => {}
         }
@@ -865,7 +995,12 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
     };
     if m.nom != 0 {
         let source = socket::sockaddr_in(r.recu.source, r.recu.port);
-        if let Err(e) = rendre_adresse(if r.recu.vide { &[] } else { &source }, m.nom, adresse + 8) {
+        let a = match &r.nom_unix {
+            Some(n) => n.octets(),
+            None if r.recu.vide => &[],
+            None => &source,
+        };
+        if let Err(e) = rendre_adresse(a, m.nom, adresse + 8) {
             return e;
         }
     }
@@ -1054,6 +1189,11 @@ pub fn shutdown(fd: u64, comment: u64) -> i64 {
     if s.protocole == Protocole::Tcp {
         return en_i64(tcp::arreter(s, arret).map(|()| 0));
     }
+    // AF_UNIX (`unix_shutdown`) : 0, connectée ou non.
+    if s.protocole == Protocole::Unix {
+        unix::arreter(s, arret);
+        return 0;
+    }
     let connecte = s.appels.verrouiller().connecte;
     s.arreter(arret);
     if connecte { 0 } else { -ENOTCONN }
@@ -1197,6 +1337,8 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         }
         SO_RCVTIMEO | SO_RCVTIMEO_NEW => op.rcvtimeo = delai(valeur, longueur)?,
         SO_SNDTIMEO | SO_SNDTIMEO_NEW => op.sndtimeo = delai(valeur, longueur)?,
+        // Gardée par AF_UNIX (le nom automatique) ; sans effet ailleurs.
+        SO_PASSCRED => {}
         _ => return Err(-ENOPROTOOPT),
     }
     let (keepalive, oobinline) = (inet.options.keepalive, inet.options.oobinline);
@@ -1206,6 +1348,9 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
     }
     if s.protocole == Protocole::Tcp && matches!(option, SO_KEEPALIVE | SO_OOBINLINE) {
         tcp::options_socket_changees(s, keepalive, oobinline);
+    }
+    if s.protocole == Protocole::Unix && option == SO_PASSCRED {
+        unix::changer_passcred(s, oui);
     }
     Ok(())
 }
@@ -1509,6 +1654,7 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
         SO_DONTROUTE => entier(&mut o, op.dontroute as i32),
         SO_OOBINLINE => entier(&mut o, op.oobinline as i32),
         SO_NO_CHECK => entier(&mut o, op.no_check as i32),
+        SO_ACCEPTCONN if s.protocole == Protocole::Unix => entier(&mut o, unix::ecoute(s) as i32),
         SO_ACCEPTCONN => entier(&mut o, (s.protocole == Protocole::Tcp && tcp::ecoute(s)) as i32),
         SO_BSDCOMPAT => entier(&mut o, 0),
         SO_BROADCAST => entier(&mut o, op.broadcast as i32),
@@ -1521,9 +1667,20 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
         SO_KEEPALIVE => entier(&mut o, op.keepalive as i32),
         SO_TYPE => entier(&mut o, s.sorte as i32),
         SO_PROTOCOL => entier(&mut o, s.proto as i32),
+        SO_DOMAIN if s.protocole == Protocole::Unix => entier(&mut o, unix::AF_UNIX as i32),
         SO_DOMAIN => entier(&mut o, AF_INET as i32),
         // Lue et effacée (`sock_error`).
         SO_ERROR if s.protocole == Protocole::Tcp => entier(&mut o, tcp::prendre_erreur(s)),
+        SO_ERROR if s.protocole == Protocole::Unix => entier(&mut o, unix::prendre_erreur(s)),
+        SO_PASSCRED => entier(&mut o, (s.protocole == Protocole::Unix && unix::passcred(s)) as i32),
+        // La `struct ucred` du pair : AF_UNIX seule en a un.
+        SO_PEERCRED => {
+            let d = if s.protocole == Protocole::Unix { unix::droits_du_pair(s) } else { unix::Droits { pid: 0, uid: 65_534, gid: 65_534 } };
+            o[..4].copy_from_slice(&d.pid.to_le_bytes());
+            o[4..8].copy_from_slice(&d.uid.to_le_bytes());
+            o[8..12].copy_from_slice(&d.gid.to_le_bytes());
+            12
+        }
         SO_ERROR => entier(&mut o, s.prendre_erreur()),
         SO_PRIORITY => entier(&mut o, op.priority as i32),
         SO_LINGER => {
@@ -1586,6 +1743,22 @@ pub fn ioctl(o: &FichierTenu, requete: u64, argument: u64) -> i64 {
     const SIOCOUTQ: u64 = 0x5411;
     const SIOCOUTQNSD: u64 = 0x894b;
     const SIOCATMARK: u64 = 0x8905;
+    if o.socket().protocole == Protocole::Unix {
+        // `unix_ioctl` : ce qui est à lire, ce qui n'a pas encore été lu
+        // par le pair.
+        let v = match requete {
+            SIOCINQ => match unix::a_lire(o.socket()) {
+                Ok(n) => n,
+                Err(e) => return e,
+            },
+            SIOCOUTQ => unix::en_route(o.socket()),
+            _ => return -ENOTTY,
+        } as i32;
+        return match copier_vers_utilisateur(argument, &v.to_le_bytes()) {
+            Ok(()) => 0,
+            Err(_) => -EFAULT,
+        };
+    }
     if o.socket().protocole == Protocole::Tcp {
         // `tcp_ioctl` : ce qui est à lire, pas encore acquitté, pas encore
         // envoyé, la lecture à la marque urgente ; une écoute : EINVAL.

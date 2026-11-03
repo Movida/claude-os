@@ -118,6 +118,7 @@ const NET_ROUTE: u32 = 21;
 const NET_DEV: u32 = 22;
 const NET_ARP: u32 = 23;
 const NET_TCP: u32 = 24;
+const NET_UNIX: u32 = 25;
 
 /// Le périphérique de procfs (un numéro anonyme, après celui du tmpfs de la
 /// racine, 0:20).
@@ -166,6 +167,7 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     p.ajouter(net, b"pnp", 0o444, (0, 0), net_fichier(NET_PNP), maintenant)?;
     p.ajouter(net, b"route", 0o444, (0, 0), net_fichier(NET_ROUTE), maintenant)?;
     p.ajouter(net, b"tcp", 0o444, (0, 0), net_fichier(NET_TCP), maintenant)?;
+    p.ajouter(net, b"unix", 0o444, (0, 0), net_fichier(NET_UNIX), maintenant)?;
     p.ajouter(racine, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), maintenant)?;
     p.ajouter(racine, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), maintenant)?;
     Ok(p)
@@ -771,12 +773,13 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
         MAPS => ligne_maps(argument, curseur),
         STATM if curseur == 0 => statm(argument).map(|t| Some((t, u64::MAX))),
         COMM if curseur == 0 => comm(argument).map(|t| Some((t, u64::MAX))),
-        NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP => {
+        NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP | NET_UNIX => {
             let f = match source {
                 NET_PNP => crate::reseau::proc::Fichier::Pnp,
                 NET_ROUTE => crate::reseau::proc::Fichier::Route,
                 NET_DEV => crate::reseau::proc::Fichier::Dev,
                 NET_TCP => crate::reseau::proc::Fichier::Tcp,
+                NET_UNIX => crate::reseau::proc::Fichier::Unix,
                 _ => crate::reseau::proc::Fichier::Arp,
             };
             match crate::reseau::proc::ligne(f, curseur) {

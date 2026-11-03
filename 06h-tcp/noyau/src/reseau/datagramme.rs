@@ -31,8 +31,8 @@ pub mod table {
         match s.protocole {
             Protocole::Udp => udp::inscrire(s, inet, port),
             Protocole::Ping => ping::inscrire(s, inet, port),
-            // TCP a sa propre table (tcp.rs).
-            Protocole::Tcp => Ok(()),
+            // TCP a sa propre table (tcp.rs) ; AF_UNIX, ses noms (unix.rs).
+            Protocole::Tcp | Protocole::Unix => Ok(()),
         }
     }
 
@@ -40,7 +40,7 @@ pub mod table {
         match s.protocole {
             Protocole::Udp => udp::changer(s, inet),
             Protocole::Ping => ping::changer(s, inet),
-            Protocole::Tcp => {}
+            Protocole::Tcp | Protocole::Unix => {}
         }
     }
 
@@ -48,7 +48,7 @@ pub mod table {
         match s.protocole {
             Protocole::Udp => udp::liberer(s),
             Protocole::Ping => ping::liberer(s),
-            Protocole::Tcp => {}
+            Protocole::Tcp | Protocole::Unix => {}
         }
     }
 
@@ -57,6 +57,7 @@ pub mod table {
             Protocole::Udp => udp::reutilisation_changee(s, inet),
             Protocole::Ping => ping::reutilisation_changee(s, inet),
             Protocole::Tcp => super::super::tcp::reutilisation_changee(s, inet),
+            Protocole::Unix => {}
         }
     }
 }
@@ -206,6 +207,9 @@ pub struct Controle {
     pub tos: Option<u8>,
     pub source: Option<[u8; 4]>,
     pub interface: Option<u32>,
+    /// SCM_RIGHTS ou SCM_CREDENTIALS (qu'UDP ignore, et qu'AF_UNIX refuse
+    /// jusqu'à 6l).
+    pub droits: bool,
 }
 
 /// Ce que donne la route d'un envoi ou d'une connexion.

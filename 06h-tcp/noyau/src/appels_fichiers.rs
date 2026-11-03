@@ -2129,6 +2129,56 @@ pub fn entree_sur_null(descripteurs: &mut crate::descripteurs::Descripteurs) -> 
     }
 }
 
+// ----- Les sockets nommées (AF_UNIX, 6h) -----
+
+/// Crée l'inode d'une socket nommée au chemin `chemin` (le `vfs_mknod` de
+/// `unix_bind_bsd`) : S_IFSOCK, 0777 moins l'umask (mesuré : 0755 sous
+/// l'umask 022). Le nom pris : EADDRINUSE (Linux traduit EEXIST, mesuré :
+/// un fichier ordinaire aussi) ; sinon les refus de toute création
+/// (ENOENT, EACCES, ENOTDIR...). L'inode est tenu : la socket le garde
+/// jusqu'à sa fermeture (`lacher_noeud`), pour qu'un inode neuf qui
+/// reprendrait son numéro ne soit jamais pris pour elle.
+pub fn creer_noeud_socket(chemin: &[u8]) -> Result<u32, i64> {
+    const EADDRINUSE: i64 = 98;
+    const EACCES: i64 = 13;
+    let umask = processus::avec(|p| p.umask);
+    avec_fin(AT_FDCWD as u64, chemin, Suivre::Jamais, |s, _, fin, depart, pid| match en_tmpfs(fin) {
+        Ok(fin) => {
+            let n = s.fs.creer(depart.qui, &fin, S_IFSOCK | (0o777 & !umask), (0, 0), &[], temps::maintenant())
+                .map_err(|e| if e == Erreur::EEXIST { -EADDRINUSE } else { errno(e) })?;
+            s.fs.prendre(n);
+            Ok(n.0)
+        }
+        Err(fin) => match refus(s, pid, depart.qui, Modification::Creer(&fin, Creation::Autre)) {
+            0 => Err(-EACCES),
+            e => Err(e),
+        },
+    })
+}
+
+/// L'inode de la socket nommée au chemin `chemin`, pour `connect` et
+/// `sendto` (`unix_find_bsd`) : le chemin suivi jusqu'au bout (ENOENT...),
+/// le droit d'y écrire (EACCES), une socket (sinon ECONNREFUSED, mesuré).
+pub fn trouver_noeud_socket(chemin: &[u8]) -> Result<u32, i64> {
+    const ENOENT: i64 = 2;
+    const ECONNREFUSED: i64 = 111;
+    avec_fin(AT_FDCWD as u64, chemin, Suivre::Toujours, |s, _, fin, depart, _| {
+        let objet = fin.objet.ok_or(-ENOENT)?;
+        let Some(n) = objet.tmpfs() else { return Err(-ECONNREFUSED) };
+        s.fs.acces(depart.qui, n, fichiers::ECRIRE).map_err(errno)?;
+        if s.fs.mode(n) & S_IFMT != S_IFSOCK {
+            return Err(-ECONNREFUSED);
+        }
+        Ok(n.0)
+    })
+}
+
+/// Rend l'inode d'une socket nommée (à sa fermeture) : effacé, il
+/// disparaît.
+pub fn lacher_noeud(n: u32) {
+    vfs::avec(|fs, cadres| fs.lacher(Numero(n), cadres));
+}
+
 // ----- L'arborescence -----
 
 const ERANGE: i64 = 34;

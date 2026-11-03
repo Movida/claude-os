@@ -31,6 +31,7 @@ pub mod socket;
 pub mod tache;
 pub mod tcp;
 pub mod udp;
+pub mod unix;
 // La carte virtio-net : de la mémoire partagée avec elle (ses tampons).
 #[allow(unsafe_code)]
 pub mod virtio_net;

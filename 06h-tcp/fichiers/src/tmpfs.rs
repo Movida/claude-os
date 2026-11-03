@@ -546,6 +546,9 @@ impl Tmpfs {
     ///   - dossier effacé (ENOENT), pas le droit d'y écrire (EACCES) ;
     ///   - un périphérique, sans être root : EPERM ;
     ///   - plus d'inode (ENOSPC), plus de mémoire (ENOMEM).
+    /// Une socket (S_IFSOCK, 6h) : le nom d'une socket AF_UNIX liée à un
+    /// chemin (le `vfs_mknod` d'`unix_bind`), un inode sans contenu ; le
+    /// rouvrir rend ENXIO (le noyau le dit).
     /// Le nouvel inode appartient à `qui` ; son groupe est celui du dossier
     /// si le dossier a le bit S_ISGID (et un sous-dossier en hérite), comme
     /// Linux. Un fichier créé là, setgid et exécutable par le groupe, par
@@ -580,7 +583,7 @@ impl Tmpfs {
             }
             S_IFLNK => Contenu::Lien(copie(cible)?),
             S_IFCHR if !qui.root() => return Err(Erreur::EPERM),
-            S_IFCHR => Contenu::Rien,
+            S_IFCHR | crate::S_IFSOCK => Contenu::Rien,
             _ => return Err(Erreur::EINVAL),
         };
         let parent = self.inode(fin.dossier);

@@ -596,6 +596,108 @@ pub fn detecter_interblocage() -> bool {
     trouve
 }
 
+/// Ce qui porte une file d'attente qu'un `Relais` peut écouter.
+pub trait PorteFile {
+    fn file_ecoutee(&self) -> &FileAttente;
+}
+
+/// Un relais (le `peer_wake` de la `unix_sock` de Linux, et
+/// `unix_dgram_peer_wake_relay`) : une entrée de rappel qu'un objet inscrit
+/// dans la file d'un AUTRE objet ; réveillée, elle réveille une file de son
+/// propre objet (sa « cible »). Ainsi une socket AF_UNIX DGRAM qui attend
+/// dans `poll` que la file pleine de son pair se vide est réveillée quand le
+/// pair lit, sans que le pair la connaisse.
+///
+/// Épinglé dans sa boîte (`nouveau` le rend ainsi) : la file le désigne par
+/// son adresse. Inscrit dans une seule file à la fois ; l'objet de cette
+/// file est tenu (son Arc) tant qu'il y est : il ne peut pas disparaître
+/// sous lui. La cible, elle, doit vivre autant que le relais : celle de
+/// l'objet qui le contient. Retiré à sa destruction. La file écoutée ne
+/// doit contenir QUE des relais (la `peer_wait` de Linux, à part de la
+/// file de l'objet) : un relais qui réveillerait une file où d'autres
+/// relais sont inscrits pourrait boucler.
+pub struct Relais<T: PorteFile + 'static> {
+    entree: EntreeAttente,
+    cible: Cell<*const FileAttente>,
+    chez: Verrou<Option<Arc<T>>>,
+}
+
+// SAFETY: `entree` et `cible` ne sont touchées que par `inscrire` et
+// `retirer` (sous le verrou `chez`) et par le rappel (sous le verrou de la
+// file écoutée, où le relais n'est inscrit qu'entre les deux).
+unsafe impl<T: PorteFile + Send + Sync> Sync for Relais<T> {}
+// SAFETY: voir ci-dessus.
+unsafe impl<T: PorteFile + Send + Sync> Send for Relais<T> {}
+
+impl<T: PorteFile + 'static> Relais<T> {
+    /// Un relais neuf, pas inscrit, dans sa boîte ; None : plus de mémoire.
+    pub fn nouveau() -> Option<Pin<alloc::boxed::Box<Relais<T>>>> {
+        let r = Relais { entree: EntreeAttente::new(), cible: Cell::new(core::ptr::null()), chez: Verrou::new(None) };
+        crate::faillible::boite(r).ok().map(alloc::boxed::Box::into_pin)
+    }
+
+    /// Inscrit le relais dans la file de `chez`, pour réveiller `cible`
+    /// (une file de l'objet qui contient le relais). Déjà inscrit chez lui :
+    /// rien ; ailleurs : retiré d'abord.
+    pub fn inscrire(self: Pin<&Self>, chez: &Arc<T>, cible: &FileAttente) {
+        let ancien = {
+            let mut c = self.chez.verrouiller();
+            if c.as_ref().is_some_and(|a| Arc::ptr_eq(a, chez)) {
+                return;
+            }
+            let ancien = c.take();
+            if let Some(a) = &ancien {
+                a.file_ecoutee().enlever(&self.entree);
+            }
+            self.cible.set(cible);
+            let qui: *const dyn Rappel = &*self;
+            // SAFETY: le relais est épinglé (il ne bougera pas), et il se
+            // retire de la file avant d'être détruit (`Drop`).
+            unsafe { self.entree.preparer_rappel(qui, false) };
+            // SAFETY: le relais est épinglé (`self: Pin<&Self>`).
+            chez.file_ecoutee().ajouter(unsafe { Pin::new_unchecked(&self.entree) });
+            *c = Some(chez.clone());
+            ancien
+        };
+        // L'ancien objet rendu hors du verrou (son dernier Arc pourrait le
+        // détruire).
+        drop(ancien);
+    }
+
+    /// Retire le relais de la file où il est inscrit, s'il l'est.
+    pub fn retirer(&self) {
+        let ancien = {
+            let mut c = self.chez.verrouiller();
+            let ancien = c.take();
+            if let Some(a) = &ancien {
+                a.file_ecoutee().enlever(&self.entree);
+            }
+            ancien
+        };
+        drop(ancien);
+    }
+}
+
+impl<T: PorteFile + 'static> Rappel for Relais<T> {
+    /// La file écoutée est réveillée : la cible l'est à son tour, avec la
+    /// même clé.
+    fn rappel(&self, cle: u32) -> bool {
+        let c = self.cible.get();
+        // SAFETY: la cible est une file de l'objet qui contient le relais,
+        // posée avant l'inscription, et qui vit autant que lui.
+        if let Some(c) = unsafe { c.as_ref() } {
+            c.reveiller(cle, 0);
+        }
+        false
+    }
+}
+
+impl<T: PorteFile + 'static> Drop for Relais<T> {
+    fn drop(&mut self) {
+        self.retirer();
+    }
+}
+
 /// Un verrou qui DORT (le `mutex` de Linux) : une tâche qui le trouve pris
 /// s'endort au lieu de boucler, et celui qui le rend réveille la première
 /// qui attend. Pour ce qui peut durer (écrire une ligne sur le port série),
