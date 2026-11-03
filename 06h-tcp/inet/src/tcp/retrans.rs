@@ -1,0 +1,772 @@
+//! La file de retransmission et la reprise après une perte : le modèle de
+//! Linux (`tcp_rtx_queue`, `tcp_clean_rtx_queue`, `tcp_fastretrans_alert`,
+//! `tcp_enter_loss`, `tcp_xmit_retransmit_queue`, net/ipv4/tcp_input.c et
+//! tcp_output.c), fonction par fonction, pour qu'on puisse lire les deux côte
+//! à côte.
+//!
+//! LA FILE. Chaque segment envoyé et pas encore acquitté y a son entrée : ses
+//! numéros, l'heure de son dernier envoi, et ce qu'on sait de lui. Les octets
+//! restent dans le tampon d'émission : une entrée ne fait que les désigner.
+//! SND.NXT ne recule jamais : un segment se renvoie depuis sa place dans la
+//! file, marqué perdu, sans que rien d'autre ne bouge. (Le modèle de BSD
+//! recule SND.NXT après un RTO et ré-émet tout de là : pas besoin de liste,
+//! mais il renverrait ce que l'autre a déjà dit avoir reçu, et il ne pourrait
+//! pas envoyer du neuf après un RTO, ce que demandent SACK et F-RTO.)
+//!
+//! CE QUI EST EN VOL. `tcp_packets_in_flight` :
+//!     packets_out - (sacked_out + lost_out) + retrans_out
+//! c'est-à-dire tout ce qui a été envoyé, moins ce qui a quitté le réseau
+//! (arrivé hors d'ordre, ou réputé perdu), plus ce qui a été renvoyé. Sans
+//! SACK, `sacked_out` compte les ACK dupliqués : chacun dit qu'un segment de
+//! plus est arrivé, sans dire lequel (`tcp_add_reno_sack`).
+//!
+//! LES ÉTATS (`icsk_ca_state`, congestion.rs : `Phase`) ne changent pas ce qui
+//! est envoyé par eux-mêmes : un ACK fait son chemin dans `traiter_ack` (le
+//! `tcp_ack` de Linux, dans tcp.rs), qui appelle `alerte` s'il a quelque chose
+//! d'anormal ; `alerte` marque ce qui est perdu et change d'état ;
+//! `controler_congestion` règle ensuite la cwnd ; `emettre` renvoie enfin ce
+//! qui est marqué, dans la limite de la cwnd.
+//!
+//! La mesure du RTT est faite à chaque ACK, par l'heure d'envoi du segment
+//! acquitté le plus ancien et jamais renvoyé (Karn : si un segment renvoyé est
+//! dans ce que couvre l'ACK, pas de mesure).
+
+use super::congestion::{Phase, TCP_REORDERING};
+use super::rtt::RTO_MAX;
+use super::{Charge, Effets, Etat, Sortant, Tcb, apres, avant, reculer};
+use formats::reseau::tcp;
+
+// Les drapeaux d'un ACK (les FLAG_ de net/ipv4/tcp_input.c).
+pub(super) const FLAG_DATA: u32 = 0x01;
+pub(super) const FLAG_WIN_UPDATE: u32 = 0x02;
+pub(super) const FLAG_DATA_ACKED: u32 = 0x04;
+pub(super) const FLAG_RETRANS_DATA_ACKED: u32 = 0x08;
+pub(super) const FLAG_SYN_ACKED: u32 = 0x10;
+pub(super) const FLAG_LOST_RETRANS: u32 = 0x80;
+pub(super) const FLAG_ORIG_SACK_ACKED: u32 = 0x200;
+pub(super) const FLAG_SND_UNA_ADVANCED: u32 = 0x400;
+pub(super) const FLAG_SET_XMIT_TIMER: u32 = 0x1000;
+pub(super) const FLAG_NO_CHALLENGE_ACK: u32 = 0x8000;
+pub(super) const FLAG_ACKED: u32 = FLAG_DATA_ACKED | FLAG_SYN_ACKED;
+pub(super) const FLAG_NOT_DUP: u32 = FLAG_DATA | FLAG_WIN_UPDATE | FLAG_ACKED;
+
+// Ce qu'on sait d'un segment envoyé (les TCPCB_ de include/net/tcp.h).
+/// Réputé perdu (TCPCB_LOST).
+const PERDU: u8 = 1;
+/// Renvoyé, et ce renvoi est encore en vol (TCPCB_SACKED_RETRANS).
+const EN_RENVOI: u8 = 2;
+/// Renvoyé au moins une fois (TCPCB_EVER_RETRANS).
+const DEJA_RENVOYE: u8 = 4;
+
+/// Un segment envoyé (le `sk_buff` de la `tcp_rtx_queue`, et son `tcp_skb_cb`).
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Envoye {
+    /// Son premier numéro, et celui qui le suit (son FIN compris).
+    seq: u32,
+    fin_seq: u32,
+    /// L'heure de son dernier envoi (`skb_mstamp_ns`).
+    pub(super) envoi: u64,
+    marques: u8,
+    /// Ses drapeaux d'origine : un renvoi les redit (PSH, FIN).
+    drapeaux: u8,
+}
+
+/// Ce que `emettre` doit renvoyer après un ACK (les REXMIT_ de Linux).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Rexmit {
+    Rien,
+    /// Les segments marqués perdus.
+    Perdus,
+}
+
+/// Ce qu'a donné l'ACK d'un segment (ce que rend `tcp_ack`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ResultatAck {
+    /// Un ACK normal.
+    Traite,
+    /// Un vieil ACK (en deçà de SND.UNA) : la suite du segment vaut encore.
+    Vieux,
+    /// Il acquitte ce qui n'a jamais été envoyé, ou il est bien trop vieux :
+    /// le segment s'arrête là.
+    Rejete,
+}
+
+impl Envoye {
+    pub(super) fn neuf(seq: u32, fin_seq: u32, envoi: u64, drapeaux: u8) -> Envoye {
+        Envoye { seq, fin_seq, envoi, marques: 0, drapeaux }
+    }
+
+    /// Ses octets de données, sans le FIN.
+    fn longueur(&self) -> u32 {
+        self.fin_seq.wrapping_sub(self.seq) - u32::from(self.drapeaux & tcp::FIN != 0)
+    }
+}
+
+impl<P: Charge> Tcb<P> {
+    /// Les segments encore dans le réseau (`tcp_packets_in_flight`).
+    pub(super) fn paquets_en_vol(&self) -> u32 {
+        (self.file.len() as u32).saturating_sub(self.sacked_out + self.lost_out) + self.retrans_out
+    }
+
+    /// CWR ou la reprise rapide : la cwnd est en train de réduire
+    /// (`tcp_in_cwnd_reduction`).
+    pub(super) fn en_reduction(&self) -> bool {
+        self.cc.en_reduction()
+    }
+
+    // --- L'ACK et la file ---
+
+    /// Retire de la file ce que SND.UNA couvre (`tcp_clean_rtx_queue`), mesure
+    /// le RTT, et compte ce qui est arrivé. Un segment acquitté en partie
+    /// reste : sa tête sera retirée s'il faut le renvoyer (`tcp_trim_head`).
+    pub(super) fn nettoyer_file(&mut self, maintenant: u64) -> u32 {
+        let mut flag = 0;
+        let mut premier = None;
+        let mut acquittes = 0;
+        while let Some(e) = self.file.front().copied() {
+            if apres(e.fin_seq, self.snd_una) {
+                break;
+            }
+            if e.marques & (EN_RENVOI | DEJA_RENVOYE) != 0 {
+                if e.marques & EN_RENVOI != 0 {
+                    self.retrans_out -= 1;
+                }
+                flag |= FLAG_RETRANS_DATA_ACKED;
+            } else {
+                premier.get_or_insert(e.envoi);
+                if !apres(e.fin_seq, self.high_seq) {
+                    flag |= FLAG_ORIG_SACK_ACKED;
+                }
+            }
+            if e.marques & PERDU != 0 {
+                self.lost_out -= 1;
+            }
+            acquittes += 1;
+            flag |= FLAG_DATA_ACKED;
+            self.file.pop_front();
+            if self.indice_renvoi == Some(e.seq) {
+                self.indice_renvoi = None;
+            }
+        }
+        // Karn : un segment renvoyé dans ce qui est acquitté, pas de mesure.
+        let mesure = premier.filter(|_| flag & FLAG_RETRANS_DATA_ACKED == 0);
+        self.mettre_a_jour_rtt(mesure.map(|p| maintenant.saturating_sub(p)));
+        if flag & FLAG_ACKED != 0 {
+            flag |= FLAG_SET_XMIT_TIMER;
+            self.retirer_reno_sacks(acquittes);
+            // Sans SACK, un ACK cumulatif qui couvre un segment renvoyé ne dit
+            // pas si l'original y est pour quelque chose.
+            if flag & FLAG_RETRANS_DATA_ACKED != 0 {
+                flag &= !FLAG_ORIG_SACK_ACKED;
+            }
+        }
+        flag
+    }
+
+    /// Une mesure du RTT, s'il y en a une (`tcp_ack_update_rtt`) : le RTO
+    /// repart de l'estimateur, sans recul (RFC 6298 5.7 : seulement sur une
+    /// vraie mesure).
+    pub(super) fn mettre_a_jour_rtt(&mut self, mesure: Option<u64>) {
+        if let Some(m) = mesure {
+            self.rtt.echantillon(m, self.snd_una, self.snd_nxt);
+            self.rto = self.rtt.rto();
+            self.recul = 0;
+        }
+    }
+
+    // --- Les ACK dupliqués, faute de SACK ---
+
+    /// `sacked_out` + un trou au moins ne dépassent pas ce qui est en file
+    /// (`tcp_limit_reno_sacked`) ; rend vrai s'il a fallu le réduire.
+    pub(super) fn limiter_reno_sacked(&mut self) -> bool {
+        let packets_out = self.file.len() as u32;
+        let trous = self.lost_out.max(1).min(packets_out);
+        if self.sacked_out + trous > packets_out {
+            self.sacked_out = packets_out - trous;
+            return true;
+        }
+        false
+    }
+
+    /// Plus d'ACK dupliqués que de segments en vol : c'est du désordre, pas une
+    /// perte (`tcp_check_reno_reordering`).
+    fn verifier_reordonnancement_reno(&mut self, en_plus: u32) {
+        if !self.limiter_reno_sacked() {
+            return;
+        }
+        self.reordering = (self.file.len() as u32 + en_plus).min(super::TCP_MAX_REORDERING);
+        self.reord_seen += 1;
+    }
+
+    /// Un ACK dupliqué de plus (`tcp_add_reno_sack`).
+    fn ajouter_reno_sack(&mut self, num_dupack: u32) {
+        if num_dupack > 0 {
+            let avant = self.sacked_out;
+            self.sacked_out += num_dupack;
+            self.verifier_reordonnancement_reno(0);
+            self.livres += self.sacked_out.saturating_sub(avant);
+        }
+    }
+
+    /// Un ACK cumulatif : un segment comble le trou, les autres consomment des
+    /// ACK dupliqués (`tcp_remove_reno_sacks`).
+    fn retirer_reno_sacks(&mut self, acquittes: u32) {
+        if acquittes > 0 {
+            self.livres += acquittes.saturating_sub(self.sacked_out).max(1);
+            if acquittes - 1 >= self.sacked_out {
+                self.sacked_out = 0;
+            } else {
+                self.sacked_out -= acquittes - 1;
+            }
+        }
+        self.verifier_reordonnancement_reno(acquittes);
+    }
+
+    // --- La perte ---
+
+    /// Un segment est réputé perdu (`tcp_mark_skb_lost`) ; déjà marqué et
+    /// renvoyé : c'est son renvoi qui est perdu.
+    fn marquer_perdu(&mut self, i: usize) {
+        let seq = self.file[i].seq;
+        // Le prochain à renvoyer ne peut pas être plus loin que lui
+        // (`tcp_verify_retransmit_hint`).
+        let plus_tot = self.indice_renvoi.is_some_and(|h| avant(seq, h));
+        if (self.indice_renvoi.is_none() && self.retrans_out >= self.lost_out) || plus_tot {
+            self.indice_renvoi = Some(seq);
+        }
+        let m = self.file[i].marques;
+        if m & PERDU != 0 {
+            if m & EN_RENVOI != 0 {
+                self.file[i].marques &= !EN_RENVOI;
+                self.retrans_out -= 1;
+                self.perdus += 1;
+            }
+        } else {
+            self.lost_out += 1;
+            self.file[i].marques |= PERDU;
+            self.perdus += 1;
+        }
+    }
+
+    /// NewReno (`tcp_newreno_mark_lost`) : au troisième ACK dupliqué, la tête ;
+    /// pendant la reprise, à chaque ACK partiel, la nouvelle tête.
+    fn marquer_tete_perdue(&mut self, una_avance: bool) {
+        let declenche = (self.cc.phase < Phase::Reprise && self.sacked_out >= self.reordering) || (self.cc.phase == Phase::Reprise && una_avance);
+        if declenche && let Some(e) = self.file.front() && e.marques & PERDU == 0 {
+            self.marquer_perdu(0);
+        }
+    }
+
+    /// `tcp_identify_packet_loss`, sans SACK.
+    fn identifier_pertes(&mut self, flag: u32) {
+        if !self.file.is_empty() {
+            self.marquer_tete_perdue(flag & FLAG_SND_UNA_ADVANCED != 0);
+        }
+    }
+
+    /// `tcp_init_undo` : d'où partira l'annulation (F-RTO).
+    fn poser_annulation(&mut self) {
+        self.undo_marker = Some(self.snd_una);
+        self.undo_retrans = self.retrans_out as i32;
+        if self.undo_retrans == 0 {
+            self.undo_retrans = -1;
+        }
+    }
+
+    /// Un RTO : tout ce qui est en vol est réputé perdu (`tcp_enter_loss`,
+    /// `tcp_timeout_mark_lost`). Le seuil tombe, une seule fois par fenêtre (pas
+    /// si l'on était déjà en reprise ou en perte pour les mêmes données, sauf à
+    /// la première retransmission de la perte).
+    pub(super) fn entrer_perte(&mut self) {
+        self.sacked_out = 0;
+        for i in 0..self.file.len() {
+            self.marquer_perdu(i);
+        }
+        self.indice_renvoi = None;
+        let phase = self.cc.phase;
+        if phase <= Phase::Desordre || !apres(self.high_seq, self.snd_una) || (phase == Phase::Perte && self.retransmissions == 0) {
+            self.prior_ssthresh = self.cc.ssthresh_courant();
+            self.prior_cwnd = self.cc.cwnd;
+            self.cc.ssthresh = self.cc.seuil();
+            self.poser_annulation();
+        }
+        self.cc.cwnd = self.paquets_en_vol() + 1;
+        self.cc.remettre_compte();
+        // Un RTO en désordre après beaucoup d'ACK dupliqués : le degré de
+        // réordonnancement estimé était trop grand.
+        if phase <= Phase::Desordre && self.sacked_out >= TCP_REORDERING {
+            self.reordering = self.reordering.min(TCP_REORDERING);
+        }
+        self.cc.phase = Phase::Perte;
+        self.high_seq = self.snd_nxt;
+    }
+
+    /// Une réduction de la cwnd commence (`tcp_init_cwnd_reduction`).
+    fn commencer_reduction(&mut self) {
+        self.high_seq = self.snd_nxt;
+        self.cc.remettre_compte();
+        self.prior_cwnd = self.cc.cwnd;
+        self.prr_livres = 0;
+        self.prr_sortis = 0;
+        self.cc.ssthresh = self.cc.seuil();
+    }
+
+    /// La réduction est finie : la cwnd au seuil (`tcp_end_cwnd_reduction`),
+    /// sauf si elle a été annulée.
+    fn finir_reduction(&mut self) {
+        if self.cc.ssthresh < super::congestion::SSTHRESH_INFINI && (self.cc.phase == Phase::Reduction || self.undo_marker.is_some()) {
+            self.cc.cwnd = self.cc.ssthresh;
+        }
+    }
+
+    /// La reprise rapide commence (`tcp_enter_recovery`).
+    fn entrer_reprise(&mut self) {
+        self.nettoyer_retrans_stamp();
+        self.prior_ssthresh = 0;
+        self.poser_annulation();
+        if !self.en_reduction() {
+            self.prior_ssthresh = self.cc.ssthresh_courant();
+            self.commencer_reduction();
+        }
+        self.cc.phase = Phase::Reprise;
+    }
+
+    /// Reste-t-il un renvoi dans la fenêtre (`tcp_any_retrans_done`) ?
+    fn renvoi_fait(&self) -> bool {
+        self.retrans_out > 0 || self.file.front().is_some_and(|e| e.marques & DEJA_RENVOYE != 0)
+    }
+
+    /// `tcp_retrans_stamp_cleanup` : la reprise est finie, plus rien de renvoyé
+    /// en vol : le prochain épisode compte son temps à partir de lui.
+    fn nettoyer_retrans_stamp(&mut self) {
+        if !self.renvoi_fait() {
+            self.retrans_stamp = 0;
+        }
+    }
+
+    /// Sans SACK, l'état reste jusqu'à ce qu'un ACK passe `high_seq`
+    /// (`tcp_is_non_sack_preventing_reopen`, RFC 2582 : sinon, les ACK
+    /// dupliqués de nos propres renvois déclencheraient une fausse
+    /// retransmission rapide).
+    fn reno_empeche_de_rouvrir(&mut self) -> bool {
+        if self.snd_una == self.high_seq {
+            self.nettoyer_retrans_stamp();
+            return true;
+        }
+        false
+    }
+
+    /// La fin d'une reprise (`tcp_try_undo_recovery`) : rend vrai si l'état doit
+    /// rester.
+    fn fin_de_reprise(&mut self) -> bool {
+        if self.reno_empeche_de_rouvrir() {
+            return true;
+        }
+        self.cc.phase = Phase::Ouverte;
+        false
+    }
+
+    /// `tcp_try_keep_open`.
+    fn rester_ouverte(&mut self) {
+        let etat = if self.sacked_out + self.lost_out > 0 || self.renvoi_fait() { Phase::Desordre } else { Phase::Ouverte };
+        if self.cc.phase != etat {
+            self.cc.phase = etat;
+            self.high_seq = self.snd_nxt;
+        }
+    }
+
+    /// `tcp_try_to_open`.
+    fn essayer_d_ouvrir(&mut self) {
+        self.nettoyer_retrans_stamp();
+        if self.cc.phase != Phase::Reduction {
+            self.rester_ouverte();
+        }
+    }
+
+    /// Un ACK dans l'état de perte (`tcp_process_loss`) : tout est réparé, ou
+    /// on continue de renvoyer.
+    fn traiter_perte(&mut self, flag: u32) {
+        if !avant(self.snd_una, self.high_seq) {
+            self.fin_de_reprise();
+            return;
+        }
+        if flag & FLAG_SND_UNA_ADVANCED != 0 {
+            self.sacked_out = 0;
+        }
+        self.rexmit = Rexmit::Perdus;
+    }
+
+    /// Un ACK anormal, ou n'importe quel ACK hors de l'état ouvert : ce qui
+    /// est perdu, et ce que devient l'état (`tcp_fastretrans_alert`).
+    pub(super) fn alerte(&mut self, num_dupack: u32, flag: &mut u32) {
+        if self.file.is_empty() && self.sacked_out > 0 {
+            self.sacked_out = 0;
+        }
+        // Les conditions de sortie : `high_seq` est acquitté.
+        if self.cc.phase == Phase::Ouverte {
+            self.retrans_stamp = 0;
+        } else if !avant(self.snd_una, self.high_seq) {
+            match self.cc.phase {
+                Phase::Reduction => {
+                    if self.snd_una != self.high_seq {
+                        self.finir_reduction();
+                        self.cc.phase = Phase::Ouverte;
+                    }
+                }
+                Phase::Reprise => {
+                    self.sacked_out = 0;
+                    if self.fin_de_reprise() {
+                        return;
+                    }
+                    self.finir_reduction();
+                }
+                _ => {}
+            }
+        }
+        match self.cc.phase {
+            Phase::Reprise => {
+                if *flag & FLAG_SND_UNA_ADVANCED == 0 {
+                    self.ajouter_reno_sack(num_dupack);
+                }
+                self.identifier_pertes(*flag);
+            }
+            Phase::Perte => {
+                self.traiter_perte(*flag);
+                self.identifier_pertes(*flag);
+                if !(self.cc.phase == Phase::Ouverte || *flag & FLAG_LOST_RETRANS != 0) {
+                    return;
+                }
+                self.alerte_ouverte(num_dupack, flag);
+                return;
+            }
+            _ => {
+                self.alerte_ouverte(num_dupack, flag);
+                return;
+            }
+        }
+        self.rexmit = Rexmit::Perdus;
+    }
+
+    /// Le cas général de `tcp_fastretrans_alert`.
+    fn alerte_ouverte(&mut self, num_dupack: u32, flag: &mut u32) {
+        if *flag & FLAG_SND_UNA_ADVANCED != 0 {
+            self.sacked_out = 0;
+        }
+        self.ajouter_reno_sack(num_dupack);
+        self.identifier_pertes(*flag);
+        if self.lost_out == 0 {
+            self.essayer_d_ouvrir();
+            return;
+        }
+        self.entrer_reprise();
+        self.rexmit = Rexmit::Perdus;
+    }
+
+    /// La cwnd après un ACK (`tcp_cong_control`) : elle réduit si l'état le
+    /// veut, grandit sinon, si l'ACK a acquitté des données.
+    pub(super) fn controler_congestion(&mut self, livres: u32, perdus: u32, flag: u32) {
+        if self.en_reduction() {
+            self.reduire_cwnd(livres, perdus, flag);
+        } else {
+            // `tcp_may_raise_cwnd`, sans SACK : si l'ACK couvre des données ; un
+            // fort réordonnancement estimé rend moins prudent.
+            let peut = if self.reordering > TCP_REORDERING { flag & FLAG_ACKED != 0 } else { flag & FLAG_DATA_ACKED != 0 };
+            if peut {
+                self.cc.croitre(livres);
+            }
+        }
+    }
+
+    /// PRR (`tcp_cwnd_reduction`, RFC 6937) : `livres` segments de plus ont
+    /// quitté le réseau ; la cwnd devient ce qui est en vol plus ce qu'on a le
+    /// droit d'envoyer. Tant qu'il y a plus en vol que le seuil, on envoie en
+    /// proportion de ce qui arrive (seuil / cwnd d'avant : à peu près un segment
+    /// pour deux reçus) ; en dessous, on remonte vers le seuil, sans dépasser ce
+    /// qui arrive plus un (la variante « SSRB » de la RFC, celle de Linux).
+    /// Toujours au moins un segment au début de la reprise : la retransmission
+    /// rapide elle-même.
+    fn reduire_cwnd(&mut self, livres: u32, perdus: u32, flag: u32) {
+        if livres == 0 || self.prior_cwnd == 0 {
+            return;
+        }
+        let en_vol = self.paquets_en_vol();
+        let delta = self.cc.ssthresh as i64 - en_vol as i64;
+        self.prr_livres += livres;
+        let mut envoyer = if delta < 0 {
+            let dividende = self.cc.ssthresh as u64 * self.prr_livres as u64 + self.prior_cwnd as u64 - 1;
+            (dividende / self.prior_cwnd as u64) as i64 - self.prr_sortis as i64
+        } else {
+            let mut s = (self.prr_livres as i64 - self.prr_sortis as i64).max(livres as i64);
+            if flag & FLAG_SND_UNA_ADVANCED != 0 && perdus == 0 {
+                s += 1;
+            }
+            s.min(delta)
+        };
+        envoyer = envoyer.max(if self.prr_sortis > 0 { 0 } else { 1 });
+        self.cc.cwnd = (en_vol as i64 + envoyer).max(1) as u32;
+    }
+
+    // --- Le renvoi ---
+
+    /// La place de `seq` dans la file : elle est triée par numéro.
+    fn indice_de(&self, seq: u32) -> usize {
+        self.file.partition_point(|e| avant(e.seq, seq))
+    }
+
+    /// Coupe l'entrée `i` après `n` octets (`tcp_fragment`) : la seconde moitié
+    /// prend ses marques et ses drapeaux d'origine, la première perd PSH et FIN.
+    /// Faux si la mémoire manque.
+    fn couper(&mut self, i: usize, n: u32) -> bool {
+        if self.file.try_reserve(1).is_err() {
+            return false;
+        }
+        let e = self.file[i];
+        let suite = Envoye { seq: e.seq.wrapping_add(n), ..e };
+        self.file[i].fin_seq = suite.seq;
+        self.file[i].drapeaux &= !(tcp::FIN | tcp::PSH);
+        if e.marques & EN_RENVOI != 0 {
+            self.retrans_out += 1;
+        }
+        if e.marques & PERDU != 0 {
+            self.lost_out += 1;
+        }
+        self.file.insert(i + 1, suite);
+        true
+    }
+
+    /// Accole à l'entrée `i` les suivantes, tant qu'elles tiennent dans `place`
+    /// octets (`tcp_retrans_try_collapse`) : renvoyer une série de petits
+    /// segments en un seul coûte moins au réseau.
+    fn accoler(&mut self, i: usize, mut place: i64) {
+        place -= self.file[i].longueur() as i64;
+        while let Some(s) = self.file.get(i + 1).copied() {
+            place -= s.longueur() as i64;
+            if place < 0 || apres(s.fin_seq, self.snd_una.wrapping_add(self.snd_wnd)) || self.file[i].drapeaux & tcp::FIN != 0 {
+                break;
+            }
+            if self.indice_renvoi == Some(s.seq) {
+                self.indice_renvoi = Some(self.file[i].seq);
+            }
+            let e = &mut self.file[i];
+            e.fin_seq = s.fin_seq;
+            e.drapeaux |= s.drapeaux;
+            e.marques |= s.marques & DEJA_RENVOYE;
+            if s.marques & EN_RENVOI != 0 {
+                self.retrans_out -= 1;
+            }
+            if s.marques & PERDU != 0 {
+                self.lost_out -= 1;
+            }
+            self.file.remove(i + 1);
+        }
+    }
+
+    /// Renvoie l'entrée `i` (`__tcp_retransmit_skb`). Coupée à ce que laisse la
+    /// fenêtre de l'autre ; une fenêtre fermée n'arrête que ce qui n'est pas la
+    /// tête : la tête part entière, et sert de sonde (sinon une fenêtre réduite à
+    /// rien sur des données en vol bloquerait tout). Rend faux si rien n'a pu
+    /// partir.
+    fn envoyer_entree(&mut self, i: usize, maintenant: u64, sortir: &mut impl FnMut(Sortant)) -> bool {
+        // Sa tête a pu être acquittée depuis (`tcp_trim_head`).
+        if avant(self.file[i].seq, self.snd_una) {
+            self.file[i].seq = self.snd_una;
+        }
+        let e = self.file[i];
+        let mss = self.mss_courant() as i64;
+        let mut place = self.snd_una.wrapping_add(self.snd_wnd).wrapping_sub(e.seq) as i32 as i64;
+        if place <= 0 {
+            if e.seq != self.snd_una {
+                return false;
+            }
+            place = mss;
+        }
+        let mut n = mss;
+        if n > place {
+            n = place - place % mss;
+            if n == 0 {
+                n = place;
+            }
+        }
+        if e.longueur() as i64 > n {
+            if !self.couper(i, n as u32) {
+                return false;
+            }
+        } else if (e.longueur() as i64) < place.min(mss) {
+            self.accoler(i, place.min(mss));
+        }
+        let e = self.file[i];
+        self.total_retrans += 1;
+        let debut = e.seq.wrapping_sub(self.seq_envoi) as usize;
+        sortir(Sortant { entete: self.entete(e.seq, e.drapeaux), debut, longueur: e.longueur() as usize });
+        self.file[i].envoi = maintenant;
+        self.file[i].marques |= DEJA_RENVOYE;
+        self.segment_de_donnees_parti(maintenant);
+        true
+    }
+
+    /// `tcp_retransmit_skb` : l'entrée `i` part, marquée renvoyée ; le temps
+    /// du premier renvoi est retenu (`retrans_stamp` : les abandons le lisent).
+    fn renvoyer(&mut self, i: usize, maintenant: u64, sortir: &mut impl FnMut(Sortant)) -> bool {
+        let ok = self.envoyer_entree(i, maintenant, sortir);
+        if ok {
+            self.file[i].marques |= EN_RENVOI;
+            self.retrans_out += 1;
+        }
+        if self.retrans_stamp == 0 {
+            self.retrans_stamp = self.file[i].envoi;
+        }
+        if self.undo_retrans < 0 {
+            self.undo_retrans = 0;
+        }
+        self.undo_retrans += 1;
+        ok
+    }
+
+    /// La tête, après un RTO (`tcp_retransmit_skb(sk, head, 1)`).
+    pub(super) fn renvoyer_tete(&mut self, maintenant: u64, sortir: &mut impl FnMut(Sortant)) {
+        if !self.file.is_empty() {
+            self.renvoyer(0, maintenant, sortir);
+        }
+    }
+
+    /// Les segments marqués perdus, dans la limite de la cwnd
+    /// (`tcp_xmit_retransmit_queue`) ; la tête renvoyée fait repartir le RTO.
+    pub(super) fn renvoyer_perdus(&mut self, maintenant: u64, sortir: &mut impl FnMut(Sortant)) {
+        if self.file.is_empty() {
+            return;
+        }
+        let mut i = self.indice_renvoi.map_or(0, |h| self.indice_de(h));
+        let mut trou = false;
+        let mut rearmer = false;
+        while i < self.file.len() {
+            if !trou {
+                self.indice_renvoi = Some(self.file[i].seq);
+            }
+            if self.cc.cwnd as i64 - self.paquets_en_vol() as i64 <= 0 {
+                break;
+            }
+            let m = self.file[i].marques;
+            if self.retrans_out >= self.lost_out {
+                break;
+            }
+            if m & PERDU == 0 {
+                if !trou && m & EN_RENVOI == 0 {
+                    trou = true;
+                }
+                i += 1;
+                continue;
+            }
+            if m & EN_RENVOI != 0 {
+                i += 1;
+                continue;
+            }
+            if !self.renvoyer(i, maintenant, sortir) {
+                break;
+            }
+            if self.en_reduction() {
+                self.prr_sortis += 1;
+            }
+            if i == 0 {
+                rearmer = true;
+            }
+            i += 1;
+        }
+        if rearmer {
+            self.armer_rto(maintenant);
+        }
+    }
+
+    // --- Les minuteurs ---
+
+    /// Arme le minuteur de retransmission à `maintenant` + RTO
+    /// (`tcp_reset_xmit_timer`, ICSK_TIME_RETRANS).
+    pub(super) fn armer_rto(&mut self, maintenant: u64) {
+        self.armer_xmit(super::Minuteur::Retransmission, self.rto, maintenant);
+    }
+
+    /// Le minuteur de la connexion, pour `sorte`, dans `delai` au plus RTO_MAX
+    /// (`inet_csk_reset_xmit_timer`). Un seul à la fois : chez Linux, retransmission
+    /// et sonde partagent `icsk_retransmit_timer`, et `icsk_pending` dit laquelle.
+    pub(super) fn armer_xmit(&mut self, sorte: super::Minuteur, delai: u64, maintenant: u64) {
+        self.t_xmit = Some(maintenant + delai.min(RTO_MAX));
+        self.t_sorte = sorte;
+    }
+
+    /// `tcp_rearm_rto` : après un progrès, le RTO repart de maintenant ; plus
+    /// rien en file : il s'arrête.
+    pub(super) fn rearmer_rto(&mut self, maintenant: u64) {
+        if self.file.is_empty() {
+            if self.t_sorte == super::Minuteur::Retransmission {
+                self.t_xmit = None;
+            }
+        } else {
+            self.armer_rto(maintenant);
+        }
+    }
+
+    /// `tcp_ld_RTO_revert` (RFC 6069) : un cran de recul de moins, et
+    /// l'échéance recalculée depuis le dernier envoi de la tête ; déjà passée :
+    /// la retransmission tout de suite.
+    pub(super) fn defaire_recul(&mut self, seq: u32, maintenant: u64, e: &mut Effets) {
+        if seq != self.snd_una || self.retransmissions == 0 || self.recul == 0 {
+            return;
+        }
+        let Some(tete) = self.file.front().copied() else { return };
+        self.recul -= 1;
+        let base = if self.rtt.mesure() { self.rtt.rto() } else { super::RTO_INITIAL };
+        self.rto = reculer(base, self.recul);
+        let ecoule = maintenant.saturating_sub(tete.envoi);
+        if self.rto > ecoule {
+            self.armer_xmit(super::Minuteur::Retransmission, self.rto - ecoule, maintenant);
+        } else {
+            self.minuteur_retrans(maintenant, e);
+        }
+    }
+
+    /// Le RTO est échu (`tcp_retransmit_timer`) : abandonner (`tcp_write_timeout`),
+    /// ou renvoyer la tête (le SYN, le SYN-ACK, ou le premier segment de la file),
+    /// et doubler le RTO (sauf pour les quatre premières retransmissions d'un SYN).
+    pub(super) fn minuteur_retrans(&mut self, maintenant: u64, e: &mut Effets) {
+        let syn = matches!(self.etat, Etat::SynEnvoye | Etat::SynRecu);
+        if self.etat == Etat::Fermee || (!syn && self.file.is_empty()) {
+            return;
+        }
+        if !syn && self.snd_wnd == 0 && !self.reglages.orpheline {
+            // L'autre a refermé sa fenêtre sur des données déjà en vol :
+            // nos retransmissions deviennent des sondes, qui n'abandonnent
+            // pas tant qu'il répond (Linux : « Receiver dastardly shrinks
+            // window »). Une orpheline, elle, abandonne comme d'habitude.
+            let depuis = if self.retrans_stamp != 0 { self.retrans_stamp } else { self.file.front().map_or(maintenant, |t| t.envoi) };
+            if self.fenetre_nulle_echue(maintenant, maintenant.saturating_sub(depuis)) {
+                self.abandonner(e);
+                return;
+            }
+            self.entrer_perte();
+        } else {
+            if self.temps_ecoule(maintenant) {
+                self.abandonner(e);
+                return;
+            }
+            self.entrer_perte();
+            self.retransmissions += 1;
+            self.total_rto += 1;
+        }
+        if syn {
+            self.syn_du = true;
+            self.total_retrans += 1;
+            self.syn_envoi = None;
+        } else {
+            self.rto_du = true;
+            if self.retrans_stamp == 0 {
+                self.retrans_stamp = maintenant;
+            }
+        }
+        if !(self.etat == Etat::SynEnvoye && self.total_rto <= super::SYN_LINEAIRES) {
+            self.recul += 1;
+            self.rto = (self.rto * 2).min(RTO_MAX);
+        }
+        let d = self.borne_utilisateur(maintenant, self.rto);
+        self.armer_xmit(super::Minuteur::Retransmission, d, maintenant);
+        e.a_emettre = true;
+    }
+}

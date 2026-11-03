@@ -210,6 +210,12 @@ impl Simulation {
         let Some(c) = cote.tcb.as_mut() else { return };
         let mut sortants: Vec<Sortant> = Vec::new();
         c.emettre(heure, |s| sortants.push(s));
+        // Les comptes de la file (`tcp_verify_left_out`) : ils ne dépassent
+        // jamais ce qui est en file. (Un compte retombé sous zéro y ferait un
+        // très grand nombre.)
+        let i = c.info(heure);
+        assert!(i.sackes + i.perdus <= i.non_acquittes && i.retransmis <= i.non_acquittes && i.cwnd >= 1,
+                "graine {} : en file {}, arrivés {}, perdus {}, renvoyés {}, cwnd {}", self.graine, i.non_acquittes, i.sackes, i.perdus, i.retransmis, i.cwnd);
         let segments: Vec<(Tcp, Vec<u8>)> = sortants
             .into_iter()
             .map(|s| {

@@ -794,8 +794,8 @@ impl Partie {
     /// injoignable » forgé) ne la touche pas.
     fn erreur_icmp(&mut self, errno: i32, injoignable: bool, seq: u32, fille: Option<u64>, recverr: bool, abandon: bool) {
         let en_vol = |t: &Tcb<Paquet>| {
-            let (una, max, _) = t.numeros();
-            !itcp::avant(seq, una) && itcp::avant(seq, max)
+            let (una, nxt, _) = t.numeros();
+            !itcp::avant(seq, una) && !itcp::apres(seq, nxt)
         };
         match (&mut self.mode, fille) {
             (Mode::Connexion(t), None) if en_vol(t) => {

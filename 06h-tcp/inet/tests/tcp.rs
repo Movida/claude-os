@@ -723,14 +723,19 @@ fn sans_reponse(reglages: impl FnOnce(&mut Connexion), icmp: bool) -> (u64, usiz
 
 #[test]
 fn abandons_comme_linux() {
-    // `tcp_retries2` (15) : le temps modélisé, 924,6 s depuis l'envoi,
-    // quinze retransmissions.
+    // `tcp_retries2` (15) : le temps modélisé est 924,6 s, compté depuis la
+    // première retransmission (`retrans_stamp`, 0,2 s après l'envoi) ; c'est
+    // un minimum (« a lower bound for the effective timeout », dit
+    // ip-sysctl.rst) : l'abandon tombe au premier RTO qui le dépasse, 1 044,6 s
+    // après l'envoi, seize retransmissions.
     assert_eq!(t::temps_modele(15, t::RTO_MIN) / MS, 924_600);
-    assert_eq!(sans_reponse(|_| {}, false), (924_600, 15, t::ETIMEDOUT));
-    // Une orpheline : 8 (`tcp_orphan_retries`), 102,2 s.
-    assert_eq!(sans_reponse(|c| c.reglages.orpheline = true, false), (102_200, 8, t::ETIMEDOUT));
-    // TCP_USER_TIMEOUT de 5 s : le dernier RTO raccourci pour tomber pile.
-    assert_eq!(sans_reponse(|c| c.reglages.delai_utilisateur = 5000 * MS, false).0, 5000);
+    assert_eq!(sans_reponse(|_| {}, false), (1_044_600, 16, t::ETIMEDOUT));
+    // Une orpheline : 8 (`tcp_orphan_retries`), 102,2 s de temps modélisé ;
+    // l'abandon au RTO suivant, 204,6 s après l'envoi.
+    assert_eq!(sans_reponse(|c| c.reglages.orpheline = true, false), (204_600, 9, t::ETIMEDOUT));
+    // TCP_USER_TIMEOUT de 5 s, compté aussi depuis la première retransmission :
+    // le dernier RTO raccourci pour tomber pile.
+    assert_eq!(sans_reponse(|c| c.reglages.delai_utilisateur = 5000 * MS, false).0, 5200);
     // Une erreur ICMP en route : c'est elle que rend l'abandon.
     assert_eq!(sans_reponse(|_| {}, true).2, 113);
 }
@@ -783,9 +788,15 @@ fn ack_retardes() {
     echeance_suivante(&mut f);
     assert_eq!(sortants(&mut f).len(), 1);
     // Deux segments pleins que le programme ne lit pas : la fenêtre
-    // n'avance pas, l'ACK attend ; la lecture le fait partir.
-    lire(&mut f, 100);
-    calmer(&mut c, &mut f);
+    // n'avance pas, l'ACK attend ; la lecture le fait partir. (Une connexion
+    // neuve : dans celle-ci, le RTO a renvoyé un segment déjà reçu, et un
+    // doublon remet le récepteur en mode « quickack ».)
+    let (mut c, mut f) = paire();
+    for _ in 0..16 {
+        ecrire(&mut c, b"a");
+        livrer(&mut c, &mut f);
+        livrer(&mut f, &mut c);
+    }
     ecrire(&mut c, &vec![1u8; 2 * MSS as usize]);
     livrer(&mut c, &mut f);
     assert!(sortants(&mut f).is_empty());
@@ -891,10 +902,9 @@ fn ack_au_deuxieme_segment_plein() {
 /// d'un octet derrière un trou ne fait pas tout garder.
 #[test]
 fn file_hors_d_ordre_bornee() {
-    let (mut c, mut f) = paire_avec(MSS, 16_384, 16_384);
-    let _ = &mut c;
+    let (_c, mut f) = paire_avec(MSS, 16_384, 16_384);
     let bord = bord(&f);
-    let modele = Tcp { drapeaux: tcp::ACK, ack: c.numeros().0, fenetre: 65_535, ..Tcp::default() };
+    let modele = Tcp { drapeaux: tcp::ACK, ack: f.numeros().0, fenetre: 65_535, ..Tcp::default() };
     for i in 1..4000u32 {
         f.recevoir(&Tcp { seq: bord.wrapping_add(i), ..modele }, Octets(vec![1], 0), maintenant());
     }
@@ -1286,7 +1296,7 @@ fn memoire_de_toute_la_machine() {
     // jeté ; hors d'ordre, rien.
     f.memoire = t::Memoire::Limite;
     let bord = bord(&f);
-    let modele = Tcp { drapeaux: tcp::ACK, ack: c.numeros().0, fenetre: 65_535, ..Tcp::default() };
+    let modele = Tcp { drapeaux: tcp::ACK, ack: f.numeros().0, fenetre: 65_535, ..Tcp::default() };
     f.recevoir(&Tcp { seq: bord.wrapping_add(10), ..modele }, Octets(vec![9; 5], 0), maintenant());
     assert_eq!(f.memoire_reception(), 0);
     f.recevoir(&Tcp { seq: bord, ..modele }, Octets(vec![1; 5], 0), maintenant());
@@ -1557,4 +1567,126 @@ fn fin_wait_2_d_une_orpheline() {
     let r = a.recevoir(&Tcp { drapeaux: tcp::ACK | tcp::FIN, ..modele }, 0, maintenant());
     assert!(r.ack && r.prolonger && !a.fin_attente2);
     assert_eq!(a.rcv_nxt, n.wrapping_add(1));
+}
+
+/// Le modèle de Linux : SND.NXT ne recule jamais ; après un RTO, tout est
+/// marqué perdu, la tête part, et le reste un par un à mesure que les ACK
+/// ouvrent la cwnd (`tcp_enter_loss`, `tcp_xmit_retransmit_queue`).
+#[test]
+fn le_rto_ne_recule_pas_snd_nxt() {
+    let (mut c, _f) = paire();
+    ecrire(&mut c, &vec![5u8; 4 * MSS as usize]);
+    assert_eq!(sortants(&mut c).len(), 4);
+    let (una, nxt, _) = c.numeros();
+    echeance_suivante(&mut c);
+    assert_eq!(c.numeros().1, nxt, "SND.NXT reste");
+    let i = c.info(maintenant());
+    assert_eq!((i.phase, i.perdus, i.non_acquittes), (4, 4, 4));
+    assert_eq!(i.cwnd, 1);
+    // La tête seule, marquée renvoyée.
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].0.seq == una && s[0].1.len() == MSS as usize);
+    let i = c.info(maintenant());
+    assert_eq!((i.retransmis, i.total_retrans), (1, 1));
+    // Son ACK : deux segments de plus (la cwnd de 1 à 2, le démarrage lent).
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una.wrapping_add(MSS as u32), fenetre: 65_535, ..Tcp::default() };
+    c.recevoir(&m, vide(), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(s.iter().map(|x| x.0.seq).collect::<Vec<_>>(), [una.wrapping_add(MSS as u32), una.wrapping_add(2 * MSS as u32)]);
+    assert_eq!(c.numeros().1, nxt);
+    // Tout acquitté : la file est vide, le minuteur arrêté. Sans SACK, l'état
+    // reste jusqu'à ce qu'un ACK passe `high_seq`
+    // (`tcp_is_non_sack_preventing_reopen`, RFC 2582).
+    c.recevoir(&Tcp { ack: nxt, ..m }, vide(), maintenant());
+    let i = c.info(maintenant());
+    assert_eq!((i.phase, i.non_acquittes, i.retransmis, i.perdus), (4, 0, 0, 0));
+    assert_eq!(c.echeance(), None);
+    ecrire(&mut c, b"x");
+    assert_eq!(sortants(&mut c).len(), 1);
+    c.recevoir(&Tcp { ack: nxt.wrapping_add(1), ..m }, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).phase, 0);
+}
+
+/// Un segment acquitté en partie reste en file ; s'il faut le renvoyer, sa
+/// tête est retirée (`tcp_trim_head`). Karn : un ACK qui couvre un segment
+/// renvoyé ne mesure rien ; un ACK d'un segment jamais renvoyé, si.
+#[test]
+fn file_acquittement_partiel_et_karn() {
+    let (mut c, _f) = paire();
+    ecrire(&mut c, &vec![5u8; 2 * MSS as usize]);
+    sortants(&mut c);
+    let (una, _, _) = c.numeros();
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una.wrapping_add(100), fenetre: 65_535, ..Tcp::default() };
+    c.recevoir(&m, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).non_acquittes, 2);
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].0.seq == una.wrapping_add(100) && s[0].1.len() == MSS as usize - 100);
+    // Le renvoi acquitté : pas de mesure, le RTO reculé reste.
+    let rto = c.congestion().2;
+    avancer(50 * MS);
+    c.recevoir(&Tcp { ack: una.wrapping_add(MSS as u32), ..m }, vide(), maintenant());
+    assert_eq!(c.congestion().2, rto);
+    // Un autre acquitté, jamais renvoyé : hors perte... il était marqué perdu,
+    // mais pas renvoyé : une mesure, et le RTO revient à l'estimateur.
+    avancer(50 * MS);
+    c.recevoir(&Tcp { ack: una.wrapping_add(2 * MSS as u32), ..m }, vide(), maintenant());
+    assert!(c.congestion().2 < rto);
+}
+
+/// Un segment renvoyé trop grand pour ce que laisse la fenêtre est coupé
+/// (`tcp_fragment`) : la suite garde ses marques, et ce qui est en file reste
+/// exact.
+#[test]
+fn renvoi_coupe_par_la_fenetre() {
+    let (mut c, _f) = paire();
+    ecrire(&mut c, &vec![5u8; MSS as usize]);
+    sortants(&mut c);
+    let (una, nxt, _) = c.numeros();
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una, fenetre: 2, ..Tcp::default() };
+    // L'échelle de l'autre multiplie par 128 : 256 octets.
+    c.recevoir(&Tcp { seq: bord(&c).wrapping_add(0), ..m }, vide(), maintenant());
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].1.len() == 256, "{:?}", s.iter().map(|x| x.1.len()).collect::<Vec<_>>());
+    let i = c.info(maintenant());
+    assert_eq!((i.non_acquittes, i.perdus, i.retransmis), (2, 2, 1));
+    assert_eq!(c.numeros().1, nxt);
+    // La suite part quand l'ACK ouvre la fenêtre et la cwnd.
+    c.recevoir(&Tcp { ack: una.wrapping_add(256), fenetre: 100, ..m }, vide(), maintenant());
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].0.seq == una.wrapping_add(256) && s[0].1.len() == MSS as usize - 256);
+    // Un FIN porté par un segment coupé reste sur la dernière moitié : ici,
+    // le dernier ACK vide la file.
+    c.recevoir(&Tcp { ack: nxt, fenetre: 100, ..m }, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).non_acquittes, 0);
+}
+
+/// RFC 5961 5.2 et `tcp_ack` : un ACK de ce qui n'a jamais été envoyé jette le
+/// segment, sans réponse ; un ACK plus vieux que la plus grande fenêtre reçoit
+/// un ACK de défi et le segment est jeté aussi ; un vieil ACK ordinaire
+/// n'empêche pas ses données d'entrer.
+#[test]
+fn ack_impossible_et_ack_trop_vieux() {
+    let (mut c, mut f) = paire();
+    ecrire(&mut c, &vec![5u8; 3000]);
+    calmer(&mut c, &mut f);
+    let (una, nxt, _) = c.numeros();
+    assert_eq!(una, nxt);
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: nxt, fenetre: 65_535, ..Tcp::default() };
+    // Trop loin : rien n'entre, rien ne part.
+    c.recevoir(&Tcp { ack: nxt.wrapping_add(1), ..m }, Octets(vec![1; 10], 0), maintenant());
+    assert_eq!(c.lisibles(), 0);
+    assert!(sortants(&mut c).is_empty());
+    // Un peu vieux : ses données entrent.
+    c.recevoir(&Tcp { ack: nxt.wrapping_sub(1000), ..m }, Octets(vec![1; 10], 0), maintenant());
+    assert_eq!(c.lisibles(), 10);
+    sortants(&mut c);
+    // Plus vieux que ce qu'on a jamais acquitté : un ACK de défi, et rien
+    // n'entre.
+    avancer(500 * MS);
+    c.recevoir(&Tcp { seq: bord(&c), ack: nxt.wrapping_sub(100_000), ..m }, Octets(vec![1; 10], 0), maintenant());
+    assert_eq!(c.lisibles(), 10);
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].1.is_empty());
 }
