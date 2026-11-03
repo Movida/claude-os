@@ -873,7 +873,8 @@ impl Partie {
         let rcvbuf = moi.rcvbuf.load(Ordering::Relaxed) as usize;
         let echelle = itcp::echelle(rcvbuf, self.options.rcvbuf_fixe, reception_max());
         let mut tcb = Tcb::depuis_syn(&h, iss, mss, rcvbuf, moi.sndbuf.load(Ordering::Relaxed) as usize, echelle);
-        tcb.mss_utilisateur = self.options.maxseg;
+        tcb.poser_mss_utilisateur(self.options.maxseg);
+        tcb.decalage_horodatages(decalage_horodatages(s.destination, s.source));
         tcb.reglages = self.options.reglages(false);
         tcb.sndbuf_fixe = self.options.sndbuf_fixe;
         tcb.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
@@ -906,6 +907,21 @@ pub fn numero_initial(locale: [u8; 4], distante: [u8; 4], port: u16, port_distan
     let h = crypto::siphash::siphash_3u32(u32::from_ne_bytes(locale), u32::from_ne_bytes(distante),
                                           (port as u32) << 16 | port_distant as u32, &cle);
     (h as u32).wrapping_add((crate::temps::ns_calendrier() >> 6) as u32)
+}
+
+/// Le décalage des horodatages entre deux adresses (`secure_tcp_ts_off`) :
+/// SipHash du couple sous une clé secrète, la même pour toutes les connexions
+/// de ce couple, une autre que celle des numéros de séquence (`ts_secret`) :
+/// PAWS suppose une seule horloge par machine distante, et notre heure de
+/// démarrage reste cachée.
+fn decalage_horodatages(locale: [u8; 4], distante: [u8; 4]) -> u32 {
+    static CLE: Verrou<Option<crypto::siphash::Cle>> = Verrou::new(None);
+    let cle = *CLE.verrouiller();
+    let cle = cle.unwrap_or_else(|| {
+        let c = [crate::aleatoire::u64(), crate::aleatoire::u64()];
+        *CLE.verrouiller().get_or_insert(c)
+    });
+    crypto::siphash::siphash_2u32(u32::from_ne_bytes(locale), u32::from_ne_bytes(distante), &cle) as u32
 }
 
 /// La clé secrète des numéros de séquence et des ports (`net_secret`),
@@ -1025,7 +1041,7 @@ fn temps_attente(n: u64, s: Segment) {
 
 /// L'ACK d'une entrée de TIME_WAIT (`tcp_v4_timewait_ack`).
 fn envoyer_ack_tw(e: &TempsAttente) {
-    let r = e.regles.entete_ack();
+    let r = e.regles.entete_ack(crate::temps::ns_monotone());
     let mut id = crate::aleatoire::u32() as u16;
     envoyer_segment(&r, e.locale, e.distante, &mut id, Ip::SYSTEME, 0, |_| {});
 }
@@ -1264,8 +1280,20 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 let cle = cle_secrete();
                 let decalage = crypto::siphash::siphash_4u32(u32::from_ne_bytes(source), u32::from_ne_bytes(destination), a.port as u32,
                                                              (crate::temps::ns_monotone() / 10_000_000_000) as u32, &cle);
+                // Une entrée de TIME_WAIT du quadruplet peut être reprise
+                // (`tcp_twsk_unique`) : ses règles le disent ; la neuve part de
+                // son numéro et de ses horodatages.
+                let boucle = fipv4::boucle(source) || fipv4::boucle(destination);
+                let heure = maintenant();
+                let mut reprise = None;
                 let port = TABLE.verrouiller().as_mut().map(|t| {
-                    t.connecter(p.numero, source, destination, a.port, lien, Cible::Socket(s.clone()), decalage, crate::aleatoire::u32())
+                    t.connecter(p.numero, source, destination, a.port, lien, Cible::Socket(s.clone()), decalage, crate::aleatoire::u32(), |n, lie| {
+                        let r = TW.verrouiller().iter().find(|e| e.numero == n).and_then(|e| e.regles.reprise(lie, boucle, heure));
+                        if r.is_some() {
+                            reprise = r.map(|(isn, ts)| (n, isn, ts));
+                        }
+                        r.is_some()
+                    })
                 });
                 let port = match port {
                     Some(Ok(port)) => port,
@@ -1274,7 +1302,11 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 };
                 p.adresses = Adresses { lie: true, adresse: p.adresses.adresse, port, port_choisi: p.adresses.port_choisi, distante: destination, port_distant: a.port, source };
                 p.hors_table = false;
-                let iss = numero_initial(source, destination, port, a.port);
+                let iss = reprise.map_or_else(|| numero_initial(source, destination, port, a.port), |(_, isn, _)| isn);
+                if let Some((n, _, _)) = reprise {
+                    TW.verrouiller().retain(|e| e.numero != n);
+                    super::tache::armer(n, None);
+                }
                 let rcvbuf = s.rcvbuf.load(Ordering::Relaxed) as usize;
                 let echelle = itcp::echelle(rcvbuf, p.options.rcvbuf_fixe, reception_max());
                 let mut t = Tcb::connecter(port, a.port, iss, mss_vers(destination), rcvbuf, s.sndbuf.load(Ordering::Relaxed) as usize,
@@ -1284,6 +1316,10 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 t.sndbuf_fixe = p.options.sndbuf_fixe;
                 t.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
                 t.memoire = niveau_memoire();
+                t.proposer_horodatages(decalage_horodatages(source, destination));
+                if let Some((_, _, ts)) = reprise {
+                    t.reprendre_horodatages(ts);
+                }
                 p.mode = Mode::Connexion(t);
                 p.identifiant = crate::aleatoire::u32() as u16;
                 p.connexion_en_cours = non_bloquant;

@@ -1517,7 +1517,7 @@ fn time_wait_comme_linux() {
     let r = a.recevoir(&fin, 0, maintenant());
     assert!(r.ack && r.prolonger);
     assert!(a.recevoir(&fin, 0, maintenant()).ack);
-    let h = a.entete_ack();
+    let h = a.entete_ack(maintenant());
     assert_eq!((h.seq, h.ack, h.drapeaux), (a.snd_nxt, n, tcp::ACK));
     // Sa fenêtre : celle de la connexion, à son échelle (pas 0).
     assert_eq!(h.fenetre as u32, a.rcv_wnd >> a.echelle);
@@ -1689,4 +1689,325 @@ fn ack_impossible_et_ack_trop_vieux() {
     assert_eq!(c.lisibles(), 10);
     let s = sortants(&mut c);
     assert!(s.len() == 1 && s[0].1.is_empty());
+}
+
+/// Une paire qui a négocié les horodatages.
+fn paire_ts() -> (Connexion, Connexion) {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.proposer_horodatages(1_000_000);
+    let (syn, _) = sortants(&mut c)[0];
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    f.decalage_horodatages(5_000_000);
+    let s = sortants(&mut f);
+    c.recevoir(&s[0].0, vide(), maintenant());
+    livrer(&mut c, &mut f);
+    assert_eq!((c.etat(), f.etat()), (Etat::Etablie, Etat::Etablie));
+    (c, f)
+}
+
+/// La négociation (RFC 7323 3.2) : TSval, notre horloge en ms plus le décalage ;
+/// TSecr, le dernier reçu ; dans chaque segment une fois en service ; sinon
+/// jamais. Ils prennent 12 octets à chaque segment (`tcp_sync_mss`) et à ce
+/// qu'on dit pouvoir recevoir (`advmss`).
+#[test]
+fn horodatages_negocies() {
+    avancer(3 * MS);
+    let ms = (maintenant() / MS) as u32;
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.proposer_horodatages(1_000_000);
+    let (syn, _) = sortants(&mut c)[0];
+    assert_eq!(syn.options.horodatage, Some((1_000_000 + ms, 0)));
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    f.decalage_horodatages(5_000_000);
+    let (sa, _) = sortants(&mut f)[0];
+    assert_eq!(sa.options.horodatage, Some((5_000_000 + ms, 1_000_000 + ms)));
+    avancer(2 * MS);
+    c.recevoir(&sa, vide(), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.options.horodatage, Some((1_000_002 + ms, 5_000_000 + ms)));
+    f.recevoir(&s[0].0, vide(), maintenant());
+    assert_eq!((c.etat(), f.etat()), (Etat::Etablie, Etat::Etablie));
+    // Les deux côtés : TCPI_OPT_TIMESTAMPS, 12 octets de moins.
+    for x in [&c, &f] {
+        let i = x.info(maintenant());
+        assert_eq!((i.options & 1, i.snd_mss, i.advmss, i.pmtu), (1, MSS as u32 - 12, MSS as u32 - 12, MSS as u32 + 40));
+    }
+    // Un segment plein fait donc 1448 octets, et porte l'option.
+    ecrire(&mut c, &vec![1u8; MSS as usize]);
+    let s = sortants(&mut c);
+    assert_eq!(s[0].1.len(), MSS as usize - 12);
+    assert!(s.iter().all(|x| x.0.options.horodatage.is_some()));
+    // Le SYN sans l'option : jamais en service, ni l'un ni l'autre.
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let (syn, _) = sortants(&mut c)[0];
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let (sa, _) = sortants(&mut f)[0];
+    assert_eq!(sa.options.horodatage, None);
+    c.recevoir(&sa, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).options & 1, 0);
+    // Proposés, mais pas de l'autre côté : retirés, MSS entier.
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.proposer_horodatages(1);
+    let (syn, _) = sortants(&mut c)[0];
+    let sans = Tcp { options: tcp::Options { horodatage: None, ..syn.options }, ..syn };
+    let mut f = Connexion::depuis_syn(&sans, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let (sa, _) = sortants(&mut f)[0];
+    c.recevoir(&sa, vide(), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.options.horodatage, None);
+    assert_eq!(c.info(maintenant()).snd_mss, MSS as u32);
+}
+
+/// PAWS (`tcp_validate_incoming`, les six règles).
+#[test]
+fn paws_comme_linux() {
+    let (mut c, mut f) = paire_ts();
+    calmer(&mut c, &mut f);
+    avancer(100 * MS);
+    let n = bord(&c);
+    let una = c.numeros().0;
+    let r = |ts: u32| Tcp { drapeaux: tcp::ACK, seq: n, ack: una, fenetre: 1000, options: tcp::Options { horodatage: Some((ts, 0)), ..Default::default() }, ..Tcp::default() };
+    // Un TSval d'un cran plus vieux que le dernier passe encore (fenêtre 1).
+    let (val, _) = { ecrire(&mut f, b"x"); sortants(&mut f)[0].0.options.horodatage.unwrap() };
+    let d = Tcp { seq: n, ..r(val) };
+    let mut f2 = d;
+    f2.ack = una;
+    c.recevoir(&f2, Octets(vec![1; 10], 0), maintenant());
+    assert_eq!(c.lisibles(), 10);
+    let _ = sortants(&mut c);
+    let n = bord(&c);
+    c.recevoir(&Tcp { seq: n, ..r(val.wrapping_sub(1)) }, Octets(vec![2; 10], 0), maintenant());
+    assert_eq!(c.lisibles(), 20);
+    let _ = sortants(&mut c);
+    // Deux crans : des données refusées, avec un ACK.
+    let n = bord(&c);
+    avancer(600 * MS);
+    c.recevoir(&Tcp { seq: n, ..r(val.wrapping_sub(2)) }, Octets(vec![3; 10], 0), maintenant());
+    assert_eq!(c.lisibles(), 20);
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].1.is_empty());
+    // Un ACK pur au bord gauche, dupliqué, sans changement de fenêtre, un peu
+    // vieux : accepté (`tcp_disordered_ack_check`), rien en réponse. (Le premier,
+    // à jour, pose `snd_wl1` ; un numéro plus loin changerait la fenêtre.)
+    avancer(600 * MS);
+    c.recevoir(&Tcp { seq: n, ..r(val) }, vide(), maintenant());
+    let _ = sortants(&mut c);
+    avancer(600 * MS);
+    c.recevoir(&Tcp { seq: n, ..r(val.wrapping_sub(2)) }, vide(), maintenant());
+    assert!(sortants(&mut c).is_empty());
+    // Avec un changement de fenêtre, le même reçoit un ACK.
+    c.recevoir(&Tcp { seq: n, fenetre: 2000, ..r(val.wrapping_sub(2)) }, vide(), maintenant());
+    assert_eq!(sortants(&mut c).len(), 1);
+    // Un ACK pur plus vieux que le bord gauche : jeté, sans réponse (nouveau en
+    // 6.x : PAWS_OLD_ACK), même après la limite des 500 ms.
+    avancer(600 * MS);
+    c.recevoir(&Tcp { seq: n.wrapping_sub(5), ..r(val.wrapping_sub(2)) }, vide(), maintenant());
+    assert!(sortants(&mut c).is_empty());
+    // Un SYN : l'ACK de défi.
+    avancer(600 * MS);
+    c.recevoir(&Tcp { seq: n, drapeaux: tcp::SYN, ..r(val.wrapping_sub(2)) }, vide(), maintenant());
+    assert_eq!(sortants(&mut c).len(), 1);
+    assert_eq!(c.etat(), Etat::Etablie);
+    // Un RST passe toujours PAWS, dans une connexion : sa propre règle le juge.
+    c.recevoir(&Tcp { seq: n, drapeaux: tcp::RST, ..r(val.wrapping_sub(1000)) }, vide(), maintenant());
+    assert_eq!(c.etat(), Etat::Fermee);
+    // Passé 2147 s (`TCP_PAWS_WRAP`), `ts_recent` ne vaut plus.
+    let (mut c, mut f) = paire_ts();
+    calmer(&mut c, &mut f);
+    let n = bord(&c);
+    let una = c.numeros().0;
+    let (val, _) = { ecrire(&mut f, b"x"); sortants(&mut f)[0].0.options.horodatage.unwrap() };
+    let m = Tcp { drapeaux: tcp::ACK, seq: n, ack: una, fenetre: 1000, options: tcp::Options { horodatage: Some((val, 0)), ..Default::default() }, ..Tcp::default() };
+    c.recevoir(&m, Octets(vec![1; 10], 0), maintenant());
+    let _ = sortants(&mut c);
+    let vieux = Tcp { seq: bord(&c), options: tcp::Options { horodatage: Some((val.wrapping_sub(5000), 0)), ..Default::default() }, ..m };
+    avancer(2146 * 1000 * MS);
+    c.recevoir(&vieux, Octets(vec![2; 10], 0), maintenant());
+    assert_eq!(c.lisibles(), 10);
+    let _ = sortants(&mut c);
+    avancer(1000 * MS);
+    c.recevoir(&vieux, Octets(vec![2; 10], 0), maintenant());
+    assert_eq!(c.lisibles(), 20);
+}
+
+/// `ts_recent` : seulement d'un segment qui couvre `rcv_wup` (RFC 7323 4.3 : un
+/// segment plus loin ne dit rien de l'ordre du réseau) et qui passe PAWS.
+#[test]
+fn ts_recent_d_un_segment_au_bord() {
+    let (mut c, mut f) = paire_ts();
+    calmer(&mut c, &mut f);
+    let n = bord(&c);
+    let una = c.numeros().0;
+    let m = |ts: u32, seq: u32| Tcp { drapeaux: tcp::ACK, seq, ack: una, fenetre: 1000, options: tcp::Options { horodatage: Some((ts, 0)), ..Default::default() }, ..Tcp::default() };
+    let (val, _) = { ecrire(&mut f, b"x"); sortants(&mut f)[0].0.options.horodatage.unwrap() };
+    // Hors d'ordre : gardé, mais `ts_recent` ne bouge pas.
+    c.recevoir(&m(val + 50, n.wrapping_add(100)), Octets(vec![1; 10], 0), maintenant());
+    let s = sortants(&mut c);
+    assert_ne!(s[0].0.options.horodatage.unwrap().1, val + 50);
+    // Au bord : il devient celui que nos segments renvoient.
+    c.recevoir(&m(val + 60, n), Octets(vec![1; 10], 0), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.options.horodatage.unwrap().1, val + 60);
+}
+
+/// `tcp_ack_update_rtt` : TSecr seulement si l'heure d'envoi ne dit rien (Karn :
+/// tout l'acquitté a été renvoyé) ; pas sans cela : l'horloge de TSecr compte en
+/// ms, une boucle de quelques µs verrait son SRTT monter à 1 ms.
+#[test]
+fn rtt_par_tsecr_seulement_apres_un_renvoi() {
+    // Sans renvoi : le SRTT suit l'heure d'envoi, TSecr n'y fait rien.
+    let (mut c, mut f) = paire_ts();
+    calmer(&mut c, &mut f);
+    ecrire(&mut c, &vec![1u8; 3 * 1448]);
+    avancer(10 * MS);
+    let s = sortants(&mut c);
+    avancer(10 * MS);
+    let una = c.numeros().0;
+    let (val, ecr) = s[0].0.options.horodatage.unwrap();
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una.wrapping_add(1448), fenetre: 1000, options: tcp::Options { horodatage: Some((val, val.wrapping_sub(1000))), ..Default::default() }, ..Tcp::default() };
+    let _ = ecr;
+    c.recevoir(&m, vide(), maintenant());
+    let i = c.info(maintenant());
+    assert!(i.rtt / 1000 <= 11, "SRTT {} us", i.rtt);
+    // Un renvoi : Karn interdit l'heure d'envoi ; TSecr donne 30 ms, l'écart à
+    // l'horodatage du renvoi qu'il cite.
+    let (mut c, mut f) = paire_ts();
+    calmer(&mut c, &mut f);
+    ecrire(&mut c, b"abc");
+    let _ = sortants(&mut c);
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    let (val, ecr) = s[0].0.options.horodatage.unwrap();
+    avancer(30 * MS);
+    let una = c.numeros().0;
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una.wrapping_add(3), fenetre: 1000, options: tcp::Options { horodatage: Some((ecr, val)), ..Default::default() }, ..Tcp::default() };
+    // Le SRTT partait de presque rien (la poignée de main à l'heure 0) : un
+    // huitième de 30 ms.
+    assert_eq!(c.info(maintenant()).rtt, 0);
+    c.recevoir(&m, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).rtt, 3750);
+}
+
+/// Un SYN-ACK dont TSecr n'est pas entre notre premier SYN et maintenant : RST
+/// (`PAWSACTIVEREJECTED`), SYN_SENT reste. Une fille : un TSecr qui n'est
+/// aucun de ceux de ses SYN-ACK (`tsecr_reject`, 6.18), et un TSval trop vieux :
+/// un ACK, et elle reste.
+#[test]
+fn tsecr_de_la_poignee_de_main() {
+    avancer(10 * MS);
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.proposer_horodatages(1_000_000);
+    let (syn, _) = sortants(&mut c)[0];
+    let val_syn = syn.options.horodatage.unwrap().0;
+    avancer(5 * MS);
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    f.decalage_horodatages(5_000_000);
+    let (sa, _) = sortants(&mut f)[0];
+    let faux = Tcp { options: tcp::Options { horodatage: Some((9, val_syn.wrapping_sub(1))), ..sa.options }, ..sa };
+    c.recevoir(&faux, vide(), maintenant());
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].0.drapeaux == tcp::RST && s[0].0.options == tcp::Options::default());
+    assert_eq!(c.etat(), Etat::SynEnvoye);
+    let (val_sa, _) = sa.options.horodatage.unwrap();
+    let bon = Tcp { source: syn.source, destination: syn.destination, seq: syn.seq.wrapping_add(1), ack: 7001, drapeaux: tcp::ACK, fenetre: 1000, options: tcp::Options { horodatage: Some((val_syn, val_sa)), ..Default::default() }, ..Tcp::default() };
+    // TSecr hors de nos SYN-ACK.
+    f.recevoir(&Tcp { options: tcp::Options { horodatage: Some((val_syn, val_sa.wrapping_add(1))), ..Default::default() }, ..bon }, vide(), maintenant());
+    assert_eq!(f.etat(), Etat::SynRecu);
+    let s = sortants(&mut f);
+    assert!(s.len() == 1 && s[0].0.drapeaux == tcp::ACK);
+    // TSval plus vieux que celui du SYN : PAWS, fenêtre 0.
+    avancer(500 * MS);
+    f.recevoir(&Tcp { options: tcp::Options { horodatage: Some((val_syn.wrapping_sub(1), val_sa)), ..Default::default() }, ..bon }, vide(), maintenant());
+    assert_eq!(f.etat(), Etat::SynRecu);
+    assert_eq!(sortants(&mut f).len(), 1);
+    // Le bon : établie.
+    f.recevoir(&bon, vide(), maintenant());
+    assert_eq!(f.etat(), Etat::Etablie);
+}
+
+/// TIME_WAIT et les horodatages (`tcp_timewait_state_process`, `tcp_paws_reject`,
+/// `tcp_twsk_unique`).
+#[test]
+fn time_wait_avec_horodatages() {
+    let (mut c, mut f) = paire_ts();
+    c.fermer_envoi();
+    calmer(&mut c, &mut f);
+    f.fermer_envoi();
+    calmer(&mut c, &mut f);
+    assert_eq!(c.etat(), Etat::TempsAttente);
+    let mut a = c.en_attente(false);
+    let n = bord(&c);
+    let ts = a.ts.unwrap();
+    let snd_nxt = a.snd_nxt;
+    let m = |val: u32| Tcp { source: 80, destination: 40000, seq: n, ack: snd_nxt, drapeaux: tcp::ACK, fenetre: 1000, options: tcp::Options { horodatage: Some((val, 0)), ..Default::default() }, ..Tcp::default() };
+    // Son ACK porte les horodatages : TSval à notre heure, TSecr le dernier reçu.
+    avancer(7 * MS);
+    let h = a.entete_ack(maintenant());
+    assert_eq!(h.options.horodatage, Some((ts.valeur(maintenant()), ts.recent)));
+    // Un ACK nu au bord gauche, plus récent : retenu.
+    let r = a.recevoir(&m(ts.recent + 10), 0, maintenant());
+    assert!(r.prolonger && !r.ack);
+    assert_eq!(a.ts.unwrap().recent, ts.recent + 10);
+    // Plus vieux : rejeté, un ACK, et elle est prolongée.
+    let r = a.recevoir(&m(ts.recent), 0, maintenant());
+    assert!(r.ack && r.prolonger);
+    // Un SYN en deçà du bord, d'un horodatage plus récent : le quadruplet repris.
+    let syn = Tcp { seq: n.wrapping_sub(100), ack: 0, drapeaux: tcp::SYN, ..m(ts.recent + 20) };
+    assert!(a.recevoir(&syn, 0, maintenant()).reprendre.is_some());
+    // Plus vieux, même plus loin : non.
+    avancer(500 * MS);
+    let r = a.recevoir(&Tcp { seq: n.wrapping_add(100), ..syn_ts(syn, ts.recent) }, 0, maintenant());
+    assert!(r.reprendre.is_none() && r.ack);
+    // Un RST trop vieux : rien, tant que l'entrée n'a pas 60 s depuis son dernier
+    // horodatage ; ensuite, cru (`TCP_PAWS_MSL`).
+    let rst = Tcp { seq: n, drapeaux: tcp::RST, ..m(ts.recent) };
+    assert!(!a.recevoir(&rst, 0, maintenant()).effacer);
+    avancer(60_000 * MS);
+    assert!(a.recevoir(&rst, 0, maintenant()).effacer);
+
+    // La reprise par `connect`.
+    let (mut c, mut f) = paire_ts();
+    c.fermer_envoi();
+    calmer(&mut c, &mut f);
+    f.fermer_envoi();
+    calmer(&mut c, &mut f);
+    let a = c.en_attente(false);
+    let t0 = maintenant();
+    // Un port de `bind` : sans délai, et même hors de la boucle.
+    assert!(a.reprise(true, false, t0).is_some());
+    // Un port de `connect` : par la boucle, après une seconde.
+    assert!(a.reprise(false, true, t0).is_none());
+    assert!(a.reprise(false, true, t0 + 1000 * MS).is_none());
+    assert!(a.reprise(false, true, t0 + 1000 * MS + 1).is_some());
+    assert!(a.reprise(false, false, t0 + 2000 * MS).is_none());
+    // Le numéro initial : loin devant tout ce que l'ancienne a envoyé.
+    assert_eq!(a.reprise(true, false, t0).unwrap().0, a.snd_nxt.wrapping_add(65_537));
+    // Sans horodatages : jamais.
+    let (mut c, mut f) = paire();
+    c.fermer_envoi();
+    calmer(&mut c, &mut f);
+    f.fermer_envoi();
+    calmer(&mut c, &mut f);
+    assert!(c.en_attente(false).reprise(true, true, t0 + 9000 * MS).is_none());
+}
+
+fn syn_ts(s: Tcp, val: u32) -> Tcp {
+    Tcp { options: tcp::Options { horodatage: Some((val, 0)), ..Default::default() }, ..s }
+}
+
+/// TCP_MAXSEG borne ce qu'annonce le SYN (`tcp_mss_clamp`) et le MSS d'envoi, y
+/// compris pour une fille, qui en hérite de son écoute.
+#[test]
+fn tcp_maxseg_dans_le_syn_et_a_l_envoi() {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.mss_utilisateur = 1000;
+    let (syn, _) = sortants(&mut c)[0];
+    assert_eq!(syn.options.mss, Some(1000));
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    f.poser_mss_utilisateur(800);
+    let (sa, _) = sortants(&mut f)[0];
+    assert_eq!(sa.options.mss, Some(800));
+    c.recevoir(&sa, vide(), maintenant());
+    livrer(&mut c, &mut f);
+    assert_eq!((c.mss(), f.mss()), (800, 800));
 }

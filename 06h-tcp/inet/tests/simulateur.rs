@@ -187,7 +187,12 @@ impl Simulation {
         // Des numéros de séquence initiaux au hasard : ils font le tour
         // des 32 bits.
         let iss = alea.suivant() as u32;
-        a.tcb = Some(Connexion::connecter(40_000, 80, iss, MSS, 131_072, 65_536, ECHELLE));
+        let mut c = Connexion::connecter(40_000, 80, iss, MSS, 131_072, 65_536, ECHELLE);
+        // Un essai sur deux avec les horodatages ; sans, le cas de slirp.
+        if alea.sous(2) == 0 {
+            c.proposer_horodatages(alea.suivant() as u32);
+        }
+        a.tcb = Some(c);
         Simulation { graine, alea, lien, heure: 0, ordre: 0, en_route: Vec::new(), a, b, segments: 0, perdus: 0, renvois: 0, plus_loin: [None; 2] }
     }
 
@@ -337,7 +342,9 @@ impl Simulation {
                 // B n'existe qu'au premier SYN (la fille d'une écoute).
                 if s.entete.drapeaux & (tcp::SYN | tcp::ACK) == tcp::SYN {
                     let iss = self.alea.suivant() as u32;
-                    cote.tcb = Some(Connexion::depuis_syn(&s.entete, iss, MSS, 131_072, 65_536, ECHELLE));
+                    let mut c = Connexion::depuis_syn(&s.entete, iss, MSS, 131_072, 65_536, ECHELLE);
+                    c.decalage_horodatages(iss);
+                    cote.tcb = Some(c);
                 }
             }
         }

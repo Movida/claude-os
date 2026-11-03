@@ -29,7 +29,9 @@
  *     le keepalive court sur une connexion vivante ; TCP_INFO ;
  *     /proc/net/tcp (l'écoute, comme la lisent ss et netstat) ; 64 Mio
  *     d'un fil à l'autre, la somme vérifiée (le débit affiché, sans être
- *     comparé).
+ *     comparé) ;
+ *   - les horodatages sur lo (advmss 65 483), TCP_MAXSEG dans le SYN, et
+ *     un `connect` qui reprend le quadruplet d'un TIME_WAIT.
  * Rien ne compare de valeur qui dépend de la configuration de Linux (le
  * MSS sur lo, SO_SNDBUF agrandi, TCP_CONGESTION : « cubic » chez Linux,
  * « reno » chez nous). Sur l'hôte comme chez nous. Les délais sont des
@@ -988,6 +990,75 @@ static void echelle(void)
     }
 }
 
+/* Les horodatages sur lo (mesuré sur l'hôte) : TCPI_OPT_TIMESTAMPS, et 12
+ * octets de moins à ce qu'on dit pouvoir recevoir (advmss 65 483, sa MTU 65 535
+ * reste) ; le MSS lu vaut au plus advmss. TCP_MAXSEG borne le MSS d'un côté
+ * et de l'autre (`tcp_mss_clamp` : l'option du SYN). */
+static void horodatages(void)
+{
+    int port, l = ecoute(&port, 1);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in x = lo(port);
+    connect(c, (void *)&x, sizeof x);
+    int a = accept(l, NULL, NULL);
+    struct tcp_info i, j;
+    socklen_t li = sizeof i;
+    getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
+    getsockopt(a, IPPROTO_TCP, TCP_INFO, &j, &li);
+    verifier((i.tcpi_options & TCPI_OPT_TIMESTAMPS) && (j.tcpi_options & TCPI_OPT_TIMESTAMPS), "lo : les horodatages en service, des deux cotes");
+    verifier(i.tcpi_advmss == 65483 && j.tcpi_advmss == 65483 && i.tcpi_pmtu == 65535, "lo : advmss 65 483 (12 octets pour l'option), MTU 65 535");
+    verifier(option(c, IPPROTO_TCP, TCP_MAXSEG) <= 65483 && option(a, IPPROTO_TCP, TCP_MAXSEG) <= 65483, "lo : TCP_MAXSEG au plus 65 483");
+    close(a);
+    close(c);
+    int v = 1000;
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, IPPROTO_TCP, TCP_MAXSEG, &v, sizeof v);
+    connect(c, (void *)&x, sizeof x);
+    a = accept(l, NULL, NULL);
+    verifier(option(c, IPPROTO_TCP, TCP_MAXSEG) == 988 && option(a, IPPROTO_TCP, TCP_MAXSEG) == 988,
+             "TCP_MAXSEG 1000 avant connect : annonce dans le SYN ; 988 lu des deux cotes, sans l'option");
+    close(a);
+    close(c);
+    close(l);
+}
+
+/* Reprendre le quadruplet d'un TIME_WAIT (`tcp_twsk_unique`) : un `connect`
+ * d'une socket liée par `bind` au même port, avec SO_REUSEADDR ici et sur
+ * l'ancienne, passe tout de suite (les horodatages protègent la neuve ; sans
+ * délai, et sans `tcp_tw_reuse`, pour un port déjà lié) ; d'une socket sans
+ * SO_REUSEADDR, `bind` refuse. */
+static void reprise_time_wait(void)
+{
+    int port, l = ecoute(&port, 4), v = 1;
+    struct sockaddr_in x = lo(port), moi = lo(0);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, SOL_SOCKET, SO_REUSEADDR, &v, sizeof v);
+    bind(c, (void *)&moi, sizeof moi);
+    socklen_t lm = sizeof moi;
+    getsockname(c, (void *)&moi, &lm);
+    connect(c, (void *)&x, sizeof x);
+    int a = accept(l, NULL, NULL);
+    /* Le client ferme le premier : TIME_WAIT de son côté. */
+    close(c);
+    attendre_ms(20);
+    close(a);
+    attendre_ms(20);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(erreur(bind(c, (void *)&moi, sizeof moi)) == EADDRINUSE, "le port d'un TIME_WAIT, sans SO_REUSEADDR : EADDRINUSE");
+    close(c);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, SOL_SOCKET, SO_REUSEADDR, &v, sizeof v);
+    verifier(bind(c, (void *)&moi, sizeof moi) == 0, "le port d'un TIME_WAIT, avec SO_REUSEADDR : bind passe");
+    verifier(connect(c, (void *)&x, sizeof x) == 0, "le meme quadruplet que le TIME_WAIT : connect le reprend, tout de suite");
+    a = accept(l, NULL, NULL);
+    verifier(a >= 0 && write(c, "x", 1) == 1, "et la connexion neuve marche");
+    char o;
+    verifier(read(a, &o, 1) == 1 && o == 'x', "et ce qu'elle envoie arrive");
+    close(a);
+    close(c);
+    close(l);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1013,6 +1084,8 @@ int main(void)
     seuil();
     info_en_time_wait();
     echelle();
+    horodatages();
+    reprise_time_wait();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

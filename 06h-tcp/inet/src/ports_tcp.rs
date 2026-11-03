@@ -211,15 +211,26 @@ impl<T: Clone> Table<T> {
     }
 
     /// Le quadruplet (`locale`, `port`, `distante`, `port_distant`) est-il
-    /// déjà pris (une connexion ou un TIME_WAIT) ?
-    fn quadruplet_pris(&self, locale: [u8; 4], port: u16, distante: [u8; 4], port_distant: u16) -> bool {
-        self.entrees.iter().any(|e| {
+    /// pris (`__inet_check_established`) ? Par une connexion, oui ; par une
+    /// entrée de TIME_WAIT, sauf si `reprendre` la reprend (son numéro, et si le
+    /// port vient de `bind`) : l'entrée disparaît alors de la table.
+    fn quadruplet_pris(&mut self, locale: [u8; 4], port: u16, distante: [u8; 4], port_distant: u16, port_lie: bool,
+                       reprendre: &mut impl FnMut(u64, bool) -> bool) -> bool {
+        let Some(i) = self.entrees.iter().position(|e| {
             matches!(e.lien.sorte, Sorte::Connectee | Sorte::TempsAttente)
                 && e.lien.port == port
                 && e.lien.adresse == locale
                 && e.lien.distante == distante
                 && e.lien.port_distant == port_distant
-        })
+        }) else {
+            return false;
+        };
+        let e = &self.entrees[i];
+        if e.lien.sorte == Sorte::TempsAttente && reprendre(e.numero, port_lie) {
+            self.entrees.remove(i);
+            return false;
+        }
+        true
     }
 
     /// Connecte la socket `numero` (`connect`) depuis `locale` vers
@@ -227,12 +238,14 @@ impl<T: Clone> Table<T> {
     /// si le quadruplet est libre. Sinon : un port éphémère, pair d'abord,
     /// à partir du décalage secret `decalage` (64 bits : l'index de la
     /// perturbation dans les bits bas, le reste dans les hauts), et le
-    /// `hasard` qui fait avancer la perturbation. Rend le port local.
+    /// `hasard` qui fait avancer la perturbation. `reprendre` dit si une
+    /// entrée de TIME_WAIT du quadruplet peut être reprise. Rend le port local.
+    #[allow(clippy::too_many_arguments)]
     pub fn connecter(&mut self, numero: u64, locale: [u8; 4], distante: [u8; 4], port_distant: u16, lien: Lien, objet: T,
-                     decalage: u64, hasard: u32) -> Result<u16, Refus> {
+                     decalage: u64, hasard: u32, mut reprendre: impl FnMut(u64, bool) -> bool) -> Result<u16, Refus> {
         if let Some(e) = self.entrees.iter().find(|e| e.numero == numero) {
             let port = e.lien.port;
-            if self.quadruplet_pris(locale, port, distante, port_distant) {
+            if self.quadruplet_pris(locale, port, distante, port_distant, true, &mut reprendre) {
                 return Err(Refus::Pris);
             }
             let e = self.entree(numero).expect("l'entree");
@@ -261,7 +274,7 @@ impl<T: Clone> Table<T> {
                 if self.entrees.iter().filter(du_port).any(|e| !e.lien.par_connect) {
                     continue;
                 }
-                if self.quadruplet_pris(locale, port, distante, port_distant) {
+                if self.quadruplet_pris(locale, port, distante, port_distant, false, &mut reprendre) {
                     continue;
                 }
                 // La perturbation avance (d'au moins deux, d'un peu plus au

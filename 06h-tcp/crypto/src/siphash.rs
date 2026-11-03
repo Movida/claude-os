@@ -79,6 +79,15 @@ pub fn siphash(k: &Cle, message: &[u8]) -> u64 {
     v[0] ^ v[1] ^ v[2] ^ v[3]
 }
 
+/// SipHash de deux mots de 32 bits (`siphash_2u32` : l'horodatage de TCP,
+/// `secure_tcp_ts_off`).
+pub fn siphash_2u32(a: u32, b: u32, k: &Cle) -> u64 {
+    let mut o = [0u8; 8];
+    o[..4].copy_from_slice(&a.to_le_bytes());
+    o[4..].copy_from_slice(&b.to_le_bytes());
+    siphash(k, &o)
+}
+
 /// SipHash de trois et de quatre mots de 32 bits, mis bout à bout en
 /// petit-boutiste (les `siphash_3u32` et `siphash_4u32` de Linux, qui
 /// donnent la même valeur que le hachage de ces 12 ou 16 octets).

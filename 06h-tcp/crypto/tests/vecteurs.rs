@@ -196,6 +196,7 @@ fn siphash_mots_de_32_bits() {
     let k = siphash::cle(&core::array::from_fn(|i| i as u8));
     let o: Vec<u8> = (0..16u8).collect();
     let mot = |i: usize| u32::from_le_bytes([o[i], o[i + 1], o[i + 2], o[i + 3]]);
+    assert_eq!(siphash::siphash_2u32(mot(0), mot(4), &k), SIPHASH[8]);
     assert_eq!(siphash::siphash_3u32(mot(0), mot(4), mot(8), &k), SIPHASH[12]);
     assert_eq!(siphash::siphash_4u32(mot(0), mot(4), mot(8), mot(12), &k), SIPHASH[16]);
 }

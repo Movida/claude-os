@@ -4,14 +4,15 @@
 //! UDP), le pointeur urgent, puis des options.
 //!
 //! Les options que nous lisons et écrivons : MSS (la plus grande charge que
-//! l'autre veut recevoir, dans un SYN) et l'échelle de fenêtre (RFC 7323,
-//! dans un SYN : la fenêtre annoncée sera décalée d'autant de bits). Les
-//! autres (horodatages, SACK...) sont sautées, par leur longueur, comme
-//! slirp, et ne sont jamais proposées (plan de 6h, section 4). La lecture
-//! suit `tcp_parse_options` de Linux : EOL arrête, NOP fait un octet, une
-//! longueur de moins de 2 ou qui déborde arrête la lecture des options
-//! SANS refuser le segment (Linux non plus) ; MSS et l'échelle ne valent
-//! que dans un SYN, et avec leur longueur exacte.
+//! l'autre veut recevoir, dans un SYN), l'échelle de fenêtre (RFC 7323, dans
+//! un SYN : la fenêtre annoncée sera décalée d'autant de bits), et les
+//! horodatages (RFC 7323, dans tout segment : notre heure, et la dernière
+//! heure reçue de l'autre). Les autres sont sautées, par leur longueur. La
+//! lecture suit `tcp_parse_options` de Linux : EOL arrête, NOP fait un octet,
+//! une longueur de moins de 2 ou qui déborde arrête la lecture des options
+//! SANS refuser le segment (Linux non plus) ; MSS et l'échelle ne valent que
+//! dans un SYN, et toutes avec leur longueur exacte. L'écriture suit
+//! `tcp_options_write` : chaque option alignée sur 32 bits par des NOP.
 
 use super::{Erreur, mot16, mot32, plier, somme};
 
@@ -33,12 +34,15 @@ const EOL: u8 = 0;
 const NOP: u8 = 1;
 const MSS: u8 = 2;
 const ECHELLE: u8 = 3;
+const HORODATAGE: u8 = 8;
 
 /// Les options qui nous intéressent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Options {
     pub mss: Option<u16>,
     pub echelle: Option<u8>,
+    /// Les horodatages : (TSval, TSecr).
+    pub horodatage: Option<(u32, u32)>,
 }
 
 /// Un en-tête TCP.
@@ -82,6 +86,7 @@ fn options(mut o: &[u8], syn: bool) -> Options {
                     // Une échelle au-delà de 14 compte pour 14 (Linux le
                     // dit, et la borne).
                     (ECHELLE, 3) if syn => r.echelle = Some(o[2].min(ECHELLE_MAX)),
+                    (HORODATAGE, 10) => r.horodatage = mot32(o, 2).zip(mot32(o, 6)),
                     _ => {}
                 }
                 o = &o[longueur..];
@@ -123,10 +128,10 @@ pub fn lire(o: &[u8], source: [u8; 4], destination: [u8; 4], verifier: bool) -> 
 }
 
 /// La longueur de l'en-tête qu'écrira `ecrire` pour ces options : 20, plus
-/// 4 pour MSS, plus 4 pour l'échelle (NOP puis l'option de 3 octets, pour
-/// rester aligné sur 32 bits, comme Linux).
+/// 4 pour MSS, plus 12 pour les horodatages (deux NOP, puis l'option de 10
+/// octets), plus 4 pour l'échelle (NOP puis l'option de 3 octets).
 pub fn longueur_entete(o: &Options) -> usize {
-    ENTETE + if o.mss.is_some() { 4 } else { 0 } + if o.echelle.is_some() { 4 } else { 0 }
+    ENTETE + if o.mss.is_some() { 4 } else { 0 } + if o.horodatage.is_some() { 12 } else { 0 } + if o.echelle.is_some() { 4 } else { 0 }
 }
 
 /// Écrit l'en-tête de `t` au début de `o` (la place de l'en-tête, puis la
@@ -149,6 +154,12 @@ pub fn ecrire(o: &mut [u8], t: &Tcp, source: [u8; 4], destination: [u8; 4], somm
         o[i + 1] = 4;
         o[i + 2..i + 4].copy_from_slice(&mss.to_be_bytes());
         i += 4;
+    }
+    if let Some((val, ecr)) = t.options.horodatage {
+        o[i..i + 4].copy_from_slice(&[NOP, NOP, HORODATAGE, 10]);
+        o[i + 4..i + 8].copy_from_slice(&val.to_be_bytes());
+        o[i + 8..i + 12].copy_from_slice(&ecr.to_be_bytes());
+        i += 12;
     }
     if let Some(e) = t.options.echelle {
         o[i..i + 4].copy_from_slice(&[NOP, ECHELLE, 3, e]);

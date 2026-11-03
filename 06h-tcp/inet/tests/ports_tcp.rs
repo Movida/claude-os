@@ -57,12 +57,12 @@ fn ephemeres() {
     // connect : pair, et deux connexions vers le même pair ont des ports
     // différents.
     let mut t = table();
-    let a = t.connecter(1, LO, LO, 80, lien(LO, 0), 1, 0x1234_5678_9abc, 3).unwrap();
-    let b = t.connecter(2, LO, LO, 80, lien(LO, 0), 2, 0x1234_5678_9abc, 5).unwrap();
+    let a = t.connecter(1, LO, LO, 80, lien(LO, 0), 1, 0x1234_5678_9abc, 3, |_, _| false).unwrap();
+    let b = t.connecter(2, LO, LO, 80, lien(LO, 0), 2, 0x1234_5678_9abc, 5, |_, _| false).unwrap();
     assert!(a % 2 == 0 && b % 2 == 0 && a != b, "{} {}", a, b);
     // Vers un autre pair, le même port local peut resservir (un port de
     // connect se partage, le quadruplet diffère) : au moins, il est pair.
-    let c = t.connecter(3, LO, [10, 0, 2, 2], 80, lien(LO, 0), 3, 0x1234_5678_9abc, 7).unwrap();
+    let c = t.connecter(3, LO, [10, 0, 2, 2], 80, lien(LO, 0), 3, 0x1234_5678_9abc, 7, |_, _| false).unwrap();
     assert!(c % 2 == 0);
 }
 
@@ -77,7 +77,7 @@ fn connect_saute_les_ports_de_bind() {
             n += 1;
         }
     }
-    let p = t.connecter(1, LO, LO, 22, lien(LO, 0), 1, (40000u64 - EPHEMERE_MIN as u64 - 10) << 32, 0).unwrap();
+    let p = t.connecter(1, LO, LO, 22, lien(LO, 0), 1, (40000u64 - EPHEMERE_MIN as u64 - 10) << 32, 0, |_, _| false).unwrap();
     assert!(p % 2 == 0);
     assert!(t.lien(1).is_some());
 }
@@ -86,22 +86,22 @@ fn connect_saute_les_ports_de_bind() {
 fn quadruplet_et_temps_attente() {
     let mut t = table();
     assert_eq!(t.lier(1, lien(LO, 5000), 1, 0), Ok(5000));
-    assert_eq!(t.connecter(1, LO, LO, 80, lien(LO, 0), 1, 0, 0), Ok(5000));
+    assert_eq!(t.connecter(1, LO, LO, 80, lien(LO, 0), 1, 0, 0, |_, _| false), Ok(5000));
     // Une autre socket liée au même port (SO_REUSEADDR) vers le même pair :
     // le quadruplet est pris.
     let r = Lien { reuseaddr: true, ..lien(LO, 5001) };
     assert_eq!(t.lier(2, r, 2, 0), Ok(5001));
     assert_eq!(t.lier(3, r, 3, 0), Ok(5001));
-    assert_eq!(t.connecter(2, LO, LO, 80, r, 2, 0, 0), Ok(5001));
-    assert_eq!(t.connecter(3, LO, LO, 80, r, 3, 0, 0), Err(Refus::Pris));
+    assert_eq!(t.connecter(2, LO, LO, 80, r, 2, 0, 0, |_, _| false), Ok(5001));
+    assert_eq!(t.connecter(3, LO, LO, 80, r, 3, 0, 0, |_, _| false), Err(Refus::Pris));
     // La connexion passe en TIME_WAIT, sous un numéro à elle : le
     // quadruplet reste pris, sans objet, et le numéro de la socket est libre.
     t.temps_attente(2, 20);
     assert_eq!(t.trouver(LO, 80, LO, 5001), Some(Destinataire::TempsAttente(20)));
-    assert_eq!(t.connecter(3, LO, LO, 80, r, 3, 0, 0), Err(Refus::Pris));
+    assert_eq!(t.connecter(3, LO, LO, 80, r, 3, 0, 0, |_, _| false), Err(Refus::Pris));
     assert_eq!((t.nombre_temps_attente(), t.objet(2), t.lien(2).is_none()), (1, None, true));
     t.retirer(20);
-    assert_eq!(t.connecter(3, LO, LO, 80, r, 3, 0, 0), Ok(5001));
+    assert_eq!(t.connecter(3, LO, LO, 80, r, 3, 0, 0, |_, _| false), Ok(5001));
 }
 
 #[test]
@@ -126,4 +126,41 @@ fn recherche_d_un_segment() {
     t.ecouter(2).unwrap();
     assert_eq!(t.trouver([9, 9, 9, 9], 1, LO, 80), Some(Destinataire::Ecoute(20)));
     assert_eq!(t.trouver([9, 9, 9, 9], 1, [10, 0, 2, 15], 80), Some(Destinataire::Ecoute(10)));
+}
+
+/// Un `connect` reprend une entrée de TIME_WAIT du même quadruplet, si la
+/// règle (`Attente::reprise`) le dit : elle sait si le port vient de `bind`.
+#[test]
+fn reprise_d_un_time_wait() {
+    let mut t = Table::<u32>::new(10, || 1).unwrap();
+    // Un port de `connect`.
+    let p = t.connecter(1, LO, LO, 80, lien(LO, 0), 1, 0, 0, |_, _| false).unwrap();
+    t.temps_attente(1, 100);
+    // Refusée, le quadruplet reste pris : ce port-là est sauté.
+    let q = t.connecter(2, LO, LO, 80, lien(LO, 0), 2, 0, 0, |n, lie| {
+        assert_eq!((n, lie), (100, false));
+        false
+    }).unwrap();
+    assert_ne!(p, q);
+    t.retirer(2);
+    // Acceptée : le même port, et l'entrée disparaît. (Le décalage ramène le
+    // départ du balayage sur ce port : la perturbation a avancé deux fois de 4.)
+    let retour = ((EPHEMERE_MAX as u64 - EPHEMERE_MIN as u64 + 1) & !1) - 8;
+    let r = t.connecter(3, LO, LO, 80, lien(LO, 0), 3, retour << 32, 0, |n, _| n == 100).unwrap();
+    assert_eq!(r, p);
+    assert_eq!(t.nombre_temps_attente(), 0);
+    // Un port lié par `bind` : refusée, EADDRNOTAVAIL ; acceptée, le port reste.
+    let mut t = Table::<u32>::new(10, || 1).unwrap();
+    let mut l = lien(LO, 5000);
+    l.reuseaddr = true;
+    t.lier(1, l, 1, 0).unwrap();
+    t.connecter(1, LO, LO, 80, l, 1, 0, 0, |_, _| false).unwrap();
+    t.temps_attente(1, 100);
+    t.lier(2, l, 2, 0).unwrap();
+    assert_eq!(t.connecter(2, LO, LO, 80, l, 2, 0, 0, |n, lie| {
+        assert_eq!((n, lie), (100, true));
+        false
+    }), Err(Refus::Pris));
+    assert_eq!(t.connecter(2, LO, LO, 80, l, 2, 0, 0, |_, _| true), Ok(5000));
+    assert_eq!(t.nombre_temps_attente(), 0);
 }

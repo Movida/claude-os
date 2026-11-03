@@ -1512,7 +1512,7 @@ fn ecrire_info(o: &mut [u8; 104], i: &inet::tcp::Info) {
     o[..8].copy_from_slice(&[i.etat, i.phase, i.retransmissions, i.sondes, i.recul, i.options, i.echelle_envoi | i.echelle_reception << 4, 0]);
     let mots = [
         (8, i.rto), (12, i.ato), (16, i.snd_mss), (20, i.rcv_mss), (24, i.non_acquittes), (28, i.sackes), (32, i.perdus), (36, i.retransmis),
-        (44, i.dernier_envoi), (52, i.dernier_recu), (56, i.dernier_ack), (60, i.advmss + 40), (68, i.rtt), (72, i.rttvar),
+        (44, i.dernier_envoi), (52, i.dernier_recu), (56, i.dernier_ack), (60, i.pmtu), (68, i.rtt), (72, i.rttvar),
         (76, i.ssthresh), (80, i.cwnd), (84, i.advmss), (88, i.reordonnancement), (100, i.total_retrans),
     ];
     for (decalage, v) in mots {

@@ -149,8 +149,13 @@ impl<P: Charge> Tcb<P> {
             }
         }
         // Karn : un segment renvoyé dans ce qui est acquitté, pas de mesure.
-        let mesure = premier.filter(|_| flag & FLAG_RETRANS_DATA_ACKED == 0);
-        self.mettre_a_jour_rtt(mesure.map(|p| maintenant.saturating_sub(p)));
+        let mesure = premier.filter(|_| flag & FLAG_RETRANS_DATA_ACKED == 0).map(|p| maintenant.saturating_sub(p));
+        // Sans mesure par l'heure d'envoi, TSecr, si l'ACK acquitte quelque
+        // chose (`tcp_ack_update_rtt`) ; pas avant : une mesure en ms ferait
+        // monter à 1 ms le SRTT d'une boucle de 30 µs.
+        if flag & FLAG_ACKED != 0 {
+            self.mettre_a_jour_rtt(mesure, maintenant);
+        }
         if flag & FLAG_ACKED != 0 {
             flag |= FLAG_SET_XMIT_TIMER;
             self.retirer_reno_sacks(acquittes);
@@ -163,11 +168,11 @@ impl<P: Charge> Tcb<P> {
         flag
     }
 
-    /// Une mesure du RTT, s'il y en a une (`tcp_ack_update_rtt`) : le RTO
-    /// repart de l'estimateur, sans recul (RFC 6298 5.7 : seulement sur une
-    /// vraie mesure).
-    pub(super) fn mettre_a_jour_rtt(&mut self, mesure: Option<u64>) {
-        if let Some(m) = mesure {
+    /// Une mesure du RTT, par l'heure d'envoi, ou à défaut par TSecr
+    /// (`tcp_ack_update_rtt`) : le RTO repart de l'estimateur, sans recul (RFC
+    /// 6298 5.7 : seulement sur une vraie mesure).
+    pub(super) fn mettre_a_jour_rtt(&mut self, mesure: Option<u64>, maintenant: u64) {
+        if let Some(m) = mesure.or_else(|| self.rtt_par_tsecr(maintenant, 1)) {
             self.rtt.echantillon(m, self.snd_una, self.snd_nxt);
             self.rto = self.rtt.rto();
             self.recul = 0;

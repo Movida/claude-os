@@ -52,6 +52,11 @@
 //! LE DÉBIT ET LES OPTIONS (commit 7) :
 //!   - l'ÉCHELLE DE FENÊTRE (RFC 7323) : la fenêtre de 16 bits décalée,
 //!     proposée dans le SYN, pour annoncer plus de 64 Kio (sur `lo`) ;
+//!   - les HORODATAGES (RFC 7323) : chaque segment porte notre heure, en ms,
+//!     et renvoie la dernière heure reçue de l'autre. Ils protègent des
+//!     numéros de séquence qui reviennent (PAWS : un segment plus vieux que
+//!     le dernier vu est refusé) et mesurent le RTT d'un segment renvoyé, là
+//!     où Karn l'interdirait. slirp ne les propose pas ;
 //!   - NAGLE (RFC 896, avec la règle de Minshall de Linux) : un petit
 //!     segment attend tant qu'un autre petit segment n'est pas acquitté,
 //!     sauf TCP_NODELAY ; TCP_CORK et MSG_MORE retiennent tout segment
@@ -132,6 +137,9 @@ pub enum Memoire {
 pub const LIMITE_ACK_INVALIDE: u64 = 500_000_000;
 /// La plus grande fenêtre sans échelle.
 pub const FENETRE_MAX: u32 = 65_535;
+/// La place de l'option des horodatages dans chaque segment
+/// (TCPOLEN_TSTAMP_ALIGNED).
+const TS_ALIGNE: u16 = 12;
 /// La plus grande échelle de fenêtre (`TCP_MAX_WSCALE`, RFC 7323 2.3) :
 /// celle d'un pair qui en propose plus est ramenée à 14, comme Linux.
 pub const ECHELLE_MAX: u8 = 14;
@@ -207,6 +215,70 @@ pub fn dans_la_fenetre(seq: u32, fin_seq: u32, debut: u32, fin: u32) -> bool {
     seq == debut || (apres(fin_seq, debut) && avant(seq, fin)) || (seq == fin && seq == fin_seq)
 }
 
+/// Ce qu'une connexion, ou une entrée de TIME_WAIT, retient des horodatages.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Horodatages {
+    /// Le dernier TSval reçu et accepté (`ts_recent`), que nos segments
+    /// renvoient ; 0 : aucun encore (`tcp_paws_check` n'en juge rien).
+    pub recent: u32,
+    /// L'heure de sa réception (`ts_recent_stamp`, ici en ns) : passé
+    /// PAWS_ENVELOPPE, il ne vaut plus rien.
+    pub instant: u64,
+    /// Notre décalage (`tsoffset`) : ajouté à notre horloge, tiré par couple
+    /// d'adresses. Il cache notre heure de démarrage, et lie les connexions
+    /// entre les mêmes machines par une même horloge, ce que PAWS demande.
+    pub decalage: u32,
+}
+
+impl Horodatages {
+    /// Notre TSval à l'heure `maintenant`.
+    pub fn valeur(&self, maintenant: u64) -> u32 {
+        horloge_ts(maintenant).wrapping_add(self.decalage)
+    }
+
+    /// Retient TSval `val`, reçu à l'heure `maintenant` (`tcp_store_ts_recent`).
+    pub fn retenir(&mut self, val: u32, maintenant: u64) {
+        self.recent = val;
+        self.instant = maintenant;
+    }
+}
+
+/// Notre horloge des horodatages : des ms (`tcp_clock_ts`, sans l'option de
+/// route `usec_ts`, que rien ne pose).
+fn horloge_ts(maintenant: u64) -> u32 {
+    (maintenant / 1_000_000) as u32
+}
+
+/// La fenêtre de PAWS dans une connexion (TCP_PAWS_WINDOW) : un TSval d'une
+/// unité en arrière passe encore.
+const PAWS_FENETRE: i32 = 1;
+/// Passé ce temps, un `ts_recent` ne vaut plus (TCP_PAWS_WRAP, 2147 s : ce
+/// qu'il faut à une horloge d'1 MHz, la plus rapide permise, pour faire le tour
+/// de la moitié des 32 bits).
+const PAWS_ENVELOPPE: u64 = 2147 * 1_000_000_000;
+/// Passé ce temps, un RST d'un TSval trop vieux est cru, dans TIME_WAIT et une
+/// fille (TCP_PAWS_MSL) : l'autre a pu redémarrer, son horloge avec lui.
+const PAWS_MSL: u64 = 60 * 1_000_000_000;
+
+/// `tcp_paws_check` : TSval `val` est-il acceptable, à `fenetre` près ? Oui
+/// aussi si `ts_recent` a passé son temps, ou s'il est nul (« some OSes send
+/// SYN and SYNACK messages with tsval=0 »).
+pub(crate) fn paws_controle(ts: &Horodatages, val: u32, fenetre: i32, maintenant: u64) -> bool {
+    (ts.recent.wrapping_sub(val) as i32) <= fenetre || maintenant.saturating_sub(ts.instant) >= PAWS_ENVELOPPE || ts.recent == 0
+}
+
+/// `tcp_paws_reject`, pour une entrée de TIME_WAIT et une fille : fenêtre 0, et
+/// un RST relâché après 60 s. Dans une connexion, un RST passe toujours
+/// (`tcp_validate_incoming`), et la fenêtre vaut 1.
+pub(crate) fn paws_rejet(ts: &Horodatages, val: u32, rst: bool, maintenant: u64) -> bool {
+    !paws_controle(ts, val, 0, maintenant) && !(rst && maintenant.saturating_sub(ts.instant) >= PAWS_MSL)
+}
+
+/// `seq` est-il entre `s1` et `s2`, modulo 2³² (le `between` de Linux) ?
+fn entre(seq: u32, s1: u32, s2: u32) -> bool {
+    s2.wrapping_sub(s1) >= seq.wrapping_sub(s1)
+}
+
 /// Ce que garde le minuteur de transmission d'une connexion (`icsk_pending`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Minuteur {
@@ -258,6 +330,14 @@ impl Etat {
     fn recoit(self) -> bool {
         matches!(self, Etat::Etablie | Etat::FinAttente1 | Etat::FinAttente2)
     }
+}
+
+/// Ce que dit `ack_desordonne` d'un segment qui a échoué PAWS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Desordonne {
+    Accepte,
+    Refuse,
+    VieilAck,
 }
 
 /// Une charge reçue, gardée telle quelle dans la file de réception : le
@@ -366,7 +446,7 @@ pub struct Info {
     pub retransmissions: u8,
     pub sondes: u8,
     pub recul: u8,
-    /// TCPI_OPT_WSCALE (4) si l'échelle de fenêtre est en service.
+    /// TCPI_OPT_TIMESTAMPS (1) et TCPI_OPT_WSCALE (4), si en service.
     pub options: u8,
     pub echelle_envoi: u8,
     pub echelle_reception: u8,
@@ -389,8 +469,12 @@ pub struct Info {
     pub ssthresh: u32,
     pub cwnd: u32,
     pub advmss: u32,
+    /// La MTU du chemin (`tcpi_pmtu`).
+    pub pmtu: u32,
     pub reordonnancement: u32,
     pub total_retrans: u32,
+    /// Le RTT vu du récepteur (`tcpi_rcv_rtt`).
+    pub rcv_rtt: u32,
     /// Les échéances, pour /proc/net/tcp : la retransmission (ou la sonde,
     /// `sonde`) et le keepalive, en ns depuis l'appel (None : aucune) ;
     /// les ACK rapides qui restent, et le ping-pong.
@@ -485,12 +569,36 @@ pub struct Tcb<P: Charge> {
     rcv_bord: u32,
     /// Une fenêtre a déjà été annoncée (le bord droit a un sens).
     bord_pose: bool,
-    /// Le MSS qu'on envoie : celui de l'autre, borné par le nôtre.
+    /// Le MSS d'envoi (`mss_cache`) : celui de l'autre, borné par le nôtre et
+    /// par TCP_MAXSEG, moins la place des options de tout segment
+    /// (`tcp_sync_mss`).
     mss: u16,
-    /// Le MSS qu'on annonce (la MTU de notre chemin moins 40).
+    /// L'offre de l'autre, dans son SYN.
+    mss_offre: Option<u16>,
+    /// La plus grande charge que permet notre route (sa MTU moins 40).
+    mss_route: u16,
+    /// La charge qu'on dit pouvoir recevoir (`advmss`) : `mss_route` au départ,
+    /// borné par TCP_MAXSEG à la première émission du SYN, et moins 12 quand les horodatages
+    /// entrent en service.
     mss_local: u16,
     /// TCP_MAXSEG demandé (0 : rien).
     pub mss_utilisateur: u16,
+    /// Les horodatages : proposés (avant le SYN de l'autre), ou en service
+    /// (`tstamp_ok`). Ceux du segment en cours (`saw_tstamp`, `rcv_tsval`,
+    /// `rcv_tsecr`, notre décalage retiré), l'heure de l'événement en cours
+    /// (`tcp_mstamp`), et pour une fille, les TSval du premier et du dernier
+    /// SYN-ACK (`snt_tsval_first`, `snt_tsval_last`).
+    ts: Option<Horodatages>,
+    ts_recu: Option<(u32, u32)>,
+    heure: u64,
+    ts_synack: Option<(u32, u32)>,
+    /// La mesure du RTT par le récepteur (`rcv_rtt_est`) : RTT × 8, le numéro
+    /// et l'heure de la fenêtre chronométrée ; et le dernier TSecr regardé
+    /// (`rcv_rtt_last_tsecr`).
+    rcv_rtt8: u64,
+    rcv_rtt_seq: u32,
+    rcv_rtt_debut: u64,
+    rcv_rtt_tsecr: u32,
     // Le tampon d'émission : les octets non acquittés et ceux qui restent
     // à envoyer, par blocs ; le premier bloc commence à `decalage_envoi`,
     // et son premier octet porte le numéro `seq_envoi`.
@@ -536,7 +644,11 @@ pub struct Tcb<P: Charge> {
     pub memoire: Memoire,
     // Ce qui doit partir au prochain `emettre`.
     syn_du: bool,
+    /// Un RST : son numéro, son ACK, ses drapeaux ; et s'il coupe la connexion
+    /// (`tcp_send_active_reset`, avec nos options), plutôt qu'il ne répond à un
+    /// segment refusé (`tcp_v4_send_reset`, sans).
     rst_du: Option<(u32, u32, u8)>,
+    rst_actif: bool,
     /// Un ACK, tout de suite.
     ack_maintenant: bool,
     /// Ce qu'il faut renvoyer après un ACK, et la tête de la file après un RTO.
@@ -646,8 +758,18 @@ impl<P: Charge> Tcb<P> {
             rcv_bord: 0,
             bord_pose: false,
             mss: MSS_DEFAUT,
+            mss_offre: None,
+            mss_route: mss_local,
             mss_local,
             mss_utilisateur: 0,
+            ts: None,
+            ts_recu: None,
+            heure: 0,
+            ts_synack: None,
+            rcv_rtt8: 0,
+            rcv_rtt_seq: 0,
+            rcv_rtt_debut: 0,
+            rcv_rtt_tsecr: 0,
             envoi: VecDeque::new(),
             decalage_envoi: 0,
             octets_envoi: 0,
@@ -673,6 +795,7 @@ impl<P: Charge> Tcb<P> {
             memoire: Memoire::Libre,
             syn_du: false,
             rst_du: None,
+            rst_actif: false,
             ack_maintenant: false,
             rexmit: Rexmit::Rien,
             rto_du: false,
@@ -717,6 +840,23 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
+    /// Propose les horodatages dans le SYN de `connect` (`tcp_timestamps`) :
+    /// `decalage`, notre décalage (`secure_tcp_ts_off`). Sans cet appel, la
+    /// connexion n'en propose pas.
+    pub fn proposer_horodatages(&mut self, decalage: u32) {
+        self.ts = Some(Horodatages { recent: 0, instant: 0, decalage });
+    }
+
+    /// Le `connect` reprend le quadruplet d'une entrée de TIME_WAIT
+    /// (`tcp_twsk_unique`) : la neuve garde son dernier TSval reçu, à quoi
+    /// PAWS comparera ce que l'autre enverra.
+    pub fn reprendre_horodatages(&mut self, ts: Horodatages) {
+        if let Some(n) = self.ts.as_mut() {
+            n.recent = ts.recent;
+            n.instant = ts.instant;
+        }
+    }
+
     /// Une connexion qui s'ouvre (`connect`) : SYN_SENT, le SYN à envoyer ;
     /// `echelle`, l'échelle à proposer (`echelle`).
     pub fn connecter(port_local: u16, port_distant: u16, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize, echelle: u8)
@@ -733,7 +873,8 @@ impl<P: Charge> Tcb<P> {
 
     /// La fille d'une écoute, pour le SYN `syn` reçu : SYN_RECEIVED, le
     /// SYN-ACK à envoyer ; `echelle`, la nôtre, si l'autre a proposé la
-    /// sienne.
+    /// sienne. Les horodatages, s'il les a proposés ; le noyau pose notre
+    /// décalage par `decalage_horodatages`, avant d'émettre.
     pub fn depuis_syn(syn: &Tcp, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Tcb<P> {
         let mut t = Tcb::vide(syn.destination, syn.source, iss, mss_local, rcvbuf, sndbuf);
         t.etat = Etat::SynRecu;
@@ -746,10 +887,25 @@ impl<P: Charge> Tcb<P> {
         t.snd_wnd = syn.fenetre as u32;
         t.max_fenetre = t.snd_wnd;
         t.snd_wl1 = syn.seq;
-        t.mss = t.mss_effectif(syn.options.mss);
+        t.ts = syn.options.horodatage.map(|(val, _)| Horodatages { recent: val, instant: 0, decalage: 0 });
+        t.mss_offre = syn.options.mss;
+        t.synchroniser_mss();
         t.annoncer();
         t.syn_du = true;
         t
+    }
+
+    /// Le décalage de nos horodatages, pour une fille (`tcp_v4_init_ts_off`).
+    pub fn decalage_horodatages(&mut self, decalage: u32) {
+        if let Some(t) = self.ts.as_mut() {
+            t.decalage = decalage;
+        }
+    }
+
+    /// TCP_MAXSEG d'une fille, hérité de son écoute : il borne son MSS d'envoi.
+    pub fn poser_mss_utilisateur(&mut self, mss: u16) {
+        self.mss_utilisateur = mss;
+        self.synchroniser_mss();
     }
 
     pub fn etat(&self) -> Etat {
@@ -784,23 +940,25 @@ impl<P: Charge> Tcb<P> {
         (self.cc.cwnd, self.cc.ssthresh, self.rto)
     }
 
-    /// Le MSS d'envoi pour ce que l'autre propose : son offre (536 s'il ne
-    /// dit rien, ou dit 0 : `tcp_parse_options` l'ignore), bornée par le
-    /// nôtre et par TCP_MAXSEG, et jamais sous MSS_ENVOI_MIN
-    /// (`__tcp_mtu_to_mss`).
-    fn mss_effectif(&self, offre: Option<u16>) -> u16 {
-        let mut m = offre.filter(|&o| o != 0).unwrap_or(MSS_DEFAUT).min(self.mss_local);
+    /// Le MSS d'envoi (`tcp_sync_mss`, `__tcp_mtu_to_mss`) : l'offre de l'autre
+    /// (536 s'il ne dit rien, ou dit 0 : `tcp_parse_options` l'ignore), bornée
+    /// par notre route et par TCP_MAXSEG, jamais sous MSS_ENVOI_MIN, moins la
+    /// place des horodatages (`tcp_mtu_to_mss` : ils sont dans chaque segment,
+    /// et l'offre de l'autre compte les options).
+    fn synchroniser_mss(&mut self) {
+        let mut m = self.mss_offre.filter(|&o| o != 0).unwrap_or(MSS_DEFAUT).min(self.mss_route);
         if self.mss_utilisateur != 0 {
             m = m.min(self.mss_utilisateur);
         }
-        m.max(MSS_ENVOI_MIN)
+        self.mss = m.max(MSS_ENVOI_MIN) - if self.ts.is_some() { TS_ALIGNE } else { 0 };
     }
 
     /// Ce que rend TCP_MAXSEG : le MSS d'envoi une fois la connexion
-    /// établie ; avant, ce qu'a demandé le programme, ou 536 (mesuré).
+    /// établie (`mss_cache`, borné à la moitié de la plus grande fenêtre de
+    /// l'autre) ; avant, ce qu'a demandé le programme, ou 536 (mesuré).
     pub fn mss(&self) -> u16 {
         if self.etat.synchronise() {
-            self.mss
+            self.mss_courant() as u16
         } else if self.mss_utilisateur != 0 {
             self.mss_utilisateur
         } else {
@@ -810,12 +968,19 @@ impl<P: Charge> Tcb<P> {
 
     /// La taille des segments qu'on envoie : le MSS, sauf face à un
     /// récepteur minuscule, la moitié de la plus grande fenêtre qu'il ait
-    /// annoncée (`tcp_bound_to_half_wnd`) : sinon un segment plein ne
-    /// tiendrait jamais dans sa fenêtre, et rien ne partirait.
+    /// annoncée (`tcp_bound_to_half_wnd`, au moins 68 octets d'IP moins les
+    /// en-têtes de TCP) : sinon un segment plein ne tiendrait jamais dans sa
+    /// fenêtre, et rien ne partirait.
     fn mss_courant(&self) -> u32 {
         let mss = self.mss as u32;
         let coupure = if self.max_fenetre > MSS_DEFAUT as u32 { self.max_fenetre / 2 } else { self.max_fenetre };
-        if coupure > 0 && mss > coupure { coupure.max(48) } else { mss }
+        let plancher = 48 - if self.ts.is_some() { TS_ALIGNE as u32 } else { 0 };
+        if coupure > 0 && mss > coupure { coupure.max(plancher) } else { mss }
+    }
+
+    /// La charge qu'annonce notre SYN (`tcp_advertise_mss`, `tcp_mss_clamp`).
+    fn mss_annonce(&self) -> u16 {
+        if self.mss_utilisateur != 0 { self.mss_local.min(self.mss_utilisateur) } else { self.mss_local }
     }
 
     // --- La réception, vue du programme ---
@@ -1224,10 +1389,33 @@ impl<P: Charge> Tcb<P> {
         let mut e = Effets::default();
         if matches!(self.etat, Etat::Etablie | Etat::AttenteFermeture | Etat::FinAttente1 | Etat::FinAttente2 | Etat::SynRecu) {
             self.rst_du = Some((self.seq_acceptable(), self.rcv_nxt, tcp::RST | tcp::ACK));
+            self.rst_actif = true;
             e.a_emettre = true;
         }
         self.passer(Etat::Fermee, &mut e);
         e
+    }
+
+    /// `close` avec des données non lues (`tcp_close`) : un RST, quel que soit l'état : ni
+    /// LAST_ACK ni CLOSING n'y échappent, à la différence de `tcp_disconnect`.
+    pub fn avorter_sur_donnees(&mut self) -> Effets {
+        let mut e = Effets::default();
+        if self.etat != Etat::Fermee {
+            self.rst_du = Some((self.seq_acceptable(), self.rcv_nxt, tcp::RST | tcp::ACK));
+            self.rst_actif = true;
+            e.a_emettre = true;
+        }
+        self.passer(Etat::Fermee, &mut e);
+        e
+    }
+
+    /// L'état au moment de `tcp_disconnect` : faut-il un RST, et une erreur en attente
+    /// (`tcp_need_reset`, ce qui reste à envoyer en CLOSING et LAST_ACK) ? Et sans RST, une erreur
+    /// (`TCP_SYN_SENT`).
+    pub fn deconnexion(&self) -> (bool, bool) {
+        let rst = matches!(self.etat, Etat::Etablie | Etat::AttenteFermeture | Etat::FinAttente1 | Etat::FinAttente2 | Etat::SynRecu)
+            || (matches!(self.etat, Etat::Fermeture | Etat::DernierAck) && self.snd_nxt != self.write_seq());
+        (rst, rst || self.etat == Etat::SynEnvoye)
     }
 
     /// Le numéro d'un segment sans données, ACK ou RST (`tcp_acceptable_seq`) :
@@ -1288,7 +1476,7 @@ impl<P: Charge> Tcb<P> {
     /// L'entrée de TIME_WAIT de cette connexion (`tcp_time_wait`) ;
     /// `fin_attente2` : une orpheline qui attend encore le FIN de l'autre.
     pub fn en_attente(&self, fin_attente2: bool) -> Attente {
-        Attente::new(self.port_local, self.port_distant, self.snd_nxt, self.rcv_nxt, self.rcv_wnd(), self.echelle_reception, fin_attente2)
+        Attente::new(self.port_local, self.port_distant, self.snd_nxt, self.rcv_nxt, self.rcv_wnd(), self.echelle_reception, fin_attente2, self.ts, self.heure)
     }
 
     /// Ce qui reste de la fenêtre annoncée tient-il en un segment de
@@ -1341,10 +1529,24 @@ impl<P: Charge> Tcb<P> {
         let drapeaux = t.drapeaux & (tcp::RST | tcp::SYN | tcp::ACK);
         let (syn, fin) = (t.drapeaux & tcp::SYN != 0, t.drapeaux & tcp::FIN != 0);
         let fin_seq = t.seq.wrapping_add(longueur_charge + u32::from(syn) + u32::from(fin));
+        // Les horodatages : PAWS, et un TSecr qui n'est aucun de ceux de nos
+        // SYN-ACK (nouveau en 6.18, `tsecr_reject`). La fille n'a pas retenu
+        // l'heure de son `ts_recent` : Linux l'estime, à l'heure de son prochain
+        // SYN-ACK en arrière (`reqsk_timeout`).
+        let (mut rejet_paws, mut rejet_tsecr) = (false, false);
+        if let (Some(ts), Some((val, ecr))) = (self.ts, t.options.horodatage) {
+            if ecr != 0
+                && let Some((premier, dernier)) = self.ts_synack
+            {
+                rejet_tsecr = !entre(ecr, premier, dernier);
+            }
+            let estime = Horodatages { instant: maintenant.saturating_sub(self.rto), ..ts };
+            rejet_paws = paws_rejet(&estime, val, drapeaux & tcp::RST != 0, maintenant);
+        }
         // Le SYN répété, seul : notre SYN-ACK a dû se perdre. Il repart, le
         // minuteur repart aussi (« comme une retransmission rapide »), sauf
         // limite des réponses à ce qui n'a rien à faire ici.
-        if t.seq == self.irs && drapeaux == tcp::SYN {
+        if t.seq == self.irs && drapeaux == tcp::SYN && !rejet_paws {
             if !self.ack_invalide_limite(maintenant) {
                 self.syn_du = true;
                 self.syn_envoi = None;
@@ -1363,8 +1565,9 @@ impl<P: Charge> Tcb<P> {
             }
             return false;
         }
-        // Hors de la fenêtre : un ACK (limité, sauf s'il porte des données).
-        if !dans_la_fenetre(t.seq, fin_seq, self.rcv_nxt, self.rcv_nxt.wrapping_add(self.rcv_wnd())) {
+        // Hors de la fenêtre, ou rejeté : un ACK (limité, sauf s'il porte des
+        // données).
+        if rejet_paws || rejet_tsecr || !dans_la_fenetre(t.seq, fin_seq, self.rcv_nxt, self.rcv_nxt.wrapping_add(self.rcv_wnd())) {
             if drapeaux & tcp::RST == 0 && ((fin_seq != t.seq && !syn) || !self.ack_invalide_limite(maintenant)) {
                 self.ack_maintenant = true;
                 e.a_emettre = true;
@@ -1383,7 +1586,51 @@ impl<P: Charge> Tcb<P> {
             self.passer(Etat::Fermee, e);
             return false;
         }
-        sans_syn & tcp::ACK != 0
+        if sans_syn & tcp::ACK == 0 {
+            return false;
+        }
+        // La connexion naît (`tcp_create_openreq_child`).
+        if let Some(ts) = self.ts.as_mut() {
+            ts.instant = maintenant;
+        }
+        true
+    }
+
+    /// Un segment refusé reçoit un ACK (`tcp_send_dupack`), limité s'il ne
+    /// porte pas de données (`tcp_oow_rate_limited`) ; des données déjà reçues
+    /// disent que notre ACK s'est perdu : le mode « quickack ».
+    fn repondre_doublon(&mut self, seq: u32, longueur: u32, syn: bool, maintenant: u64, e: &mut Effets) {
+        if longueur > 0 && !syn && avant(seq, self.rcv_nxt) {
+            self.entrer_mode_rapide();
+        }
+        if (longueur > 0 && !syn) || !self.ack_invalide_limite(maintenant) {
+            self.ack_maintenant = true;
+            e.a_emettre = true;
+        }
+    }
+
+    /// `tcp_disordered_ack_check` : un segment qui échoue PAWS passe quand même
+    /// si c'est un ACK pur, au bord gauche, dupliqué, qui ne change pas la
+    /// fenêtre, et dont TSval n'a reculé que de moins d'un RTO (`tcp_tsval_replay`,
+    /// en unités de 1/1200 s, l'horloge la plus rapide que Linux suppose à
+    /// l'autre) : l'ACK d'un segment et celui du suivant se croisent souvent.
+    /// Rend aussi vrai pour un ACK pur plus vieux que le bord gauche, jeté sans
+    /// réponse par l'appelant (`PAWS_OLD_ACK`).
+    fn ack_desordonne(&self, t: &Tcp, val: u32, fin_seq: u32) -> Desordonne {
+        if t.drapeaux & tcp::ACK == 0 || t.seq != fin_seq {
+            return Desordonne::Refuse;
+        }
+        if t.seq != self.rcv_nxt {
+            return if avant(t.seq, self.rcv_nxt) { Desordonne::VieilAck } else { Desordonne::Refuse };
+        }
+        if t.ack != self.snd_una || self.fenetre_a_jour(t) {
+            return Desordonne::Refuse;
+        }
+        let rejeu = (self.rto / 1_000 * 1200 / 1_000_000) as i64;
+        match self.ts {
+            Some(ts) if (ts.recent.wrapping_sub(val) as i32 as i64) <= rejeu => Desordonne::Accepte,
+            _ => Desordonne::Refuse,
+        }
     }
 
     /// Reçoit le segment `t`, de charge `charge` (vide pour un segment sans
@@ -1391,6 +1638,10 @@ impl<P: Charge> Tcb<P> {
     /// (3.10.7) et de `tcp_rcv_state_process`.
     pub fn recevoir(&mut self, t: &Tcp, charge: P, maintenant: u64) -> Effets {
         let mut e = Effets::default();
+        self.heure = maintenant;
+        // Les horodatages du segment, seulement s'ils sont en service (ou
+        // proposés, pour le SYN de l'autre), notre décalage retiré de TSecr.
+        self.ts_recu = self.ts.and(t.options.horodatage).map(|(val, ecr)| (val, if ecr != 0 { ecr.wrapping_sub(self.ts.map_or(0, |x| x.decalage)) } else { 0 }));
         let longueur_charge = charge.octets().len() as u32;
         let syn = t.drapeaux & tcp::SYN != 0;
         let fin = t.drapeaux & tcp::FIN != 0;
@@ -1411,6 +1662,20 @@ impl<P: Charge> Tcb<P> {
                     }
                     return e;
                 }
+                // Un SYN-ACK dont TSecr n'est pas entre notre premier SYN et
+                // maintenant : RST (`PAWSACTIVEREJECTED`).
+                if ack
+                    && let Some((_, ecr)) = self.ts_recu
+                    && ecr != 0
+                    && !entre(ecr, horloge_ts(self.retrans_stamp), horloge_ts(maintenant))
+                {
+                    // (`reset_and_undo` passe par `tcp_v4_send_reset` : pas de RST pour un RST.)
+                    if !rst {
+                        self.rst_du = Some((t.ack, 0, tcp::RST));
+                        e.a_emettre = true;
+                    }
+                    return e;
+                }
                 if rst {
                     // Un RST qui acquitte notre SYN : refusé.
                     if ack {
@@ -1424,8 +1689,20 @@ impl<P: Charge> Tcb<P> {
                 self.irs = t.seq;
                 self.rcv_nxt = t.seq.wrapping_add(1);
                 self.rcv_lu = self.rcv_nxt;
-                self.mss = self.mss_effectif(t.options.mss);
+                self.ack.rcv_wup = self.rcv_nxt;
+                self.mss_offre = t.options.mss;
                 self.accepter_echelle(t.options.echelle);
+                // Les horodatages n'entrent en service que si l'autre les porte
+                // aussi.
+                match self.ts_recu {
+                    Some((val, _)) => {
+                        if let Some(ts) = self.ts.as_mut() {
+                            ts.retenir(val, maintenant);
+                        }
+                    }
+                    None => self.ts = None,
+                }
+                self.synchroniser_mss();
                 self.bord_pose = false;
                 self.annoncer();
                 self.dernier_recu = maintenant;
@@ -1474,27 +1751,35 @@ impl<P: Charge> Tcb<P> {
             syn = false;
             seq = self.rcv_nxt;
         }
-        // 1. Le numéro de séquence. Hors de la fenêtre : un ACK, tout de
-        // suite (`tcp_send_dupack`) ; des données déjà reçues disent que
-        // notre ACK s'est perdu : le mode « quickack ».
-        // Un ACK hors fenêtre ou de défi part au plus toutes les 500 ms, sauf
-        // pour un segment qui porte des données (sans SYN) : lui ne fait pas
-        // partie d'une boucle d'ACK (`tcp_oow_rate_limited`).
         let longueur = longueur_charge + u32::from(syn) + u32::from(fin);
         let fin_seq = seq.wrapping_add(longueur);
+        // PAWS, avant tout (`tcp_validate_incoming`) : un segment dont TSval est
+        // plus vieux que le dernier vu vient d'une autre époque de ces numéros.
+        // Un RST passe toujours ici : c'est sa propre règle qui le jugera. Un
+        // SYN reçoit l'ACK de défi ; un vieil ACK pur, rien (ils sont fréquents,
+        // et sans danger) ; le reste, un ACK limité.
+        if let (Some(ts), Some((val, _))) = (self.ts, self.ts_recu)
+            && !paws_controle(&ts, val, PAWS_FENETRE, maintenant)
+            && !rst
+        {
+            match self.ack_desordonne(t, val, fin_seq) {
+                Desordonne::Accepte => {}
+                Desordonne::VieilAck => return e,
+                Desordonne::Refuse => {
+                    self.repondre_doublon(seq, longueur, syn, maintenant, &mut e);
+                    return e;
+                }
+            }
+        }
+        // 1. Le numéro de séquence. Hors de la fenêtre : un ACK, tout de
+        // suite (`tcp_send_dupack`).
         if !self.acceptable(seq, fin_seq) {
             if rst {
                 if self.rst_apres_fin(t.seq) {
                     self.reinitialiser(&mut e);
                 }
             } else {
-                if longueur > 0 && !syn && avant(seq, self.rcv_nxt) {
-                    self.entrer_mode_rapide();
-                }
-                if (longueur > 0 && !syn) || !self.ack_invalide_limite(maintenant) {
-                    self.ack_maintenant = true;
-                    e.a_emettre = true;
-                }
+                self.repondre_doublon(seq, longueur, syn, maintenant, &mut e);
             }
             return e;
         }
@@ -1558,6 +1843,7 @@ impl<P: Charge> Tcb<P> {
         if self.etat == Etat::Fermee {
             return e;
         }
+        self.rtt_reception_ts(fin_seq.wrapping_sub(seq), maintenant);
         // 6. URG (`tcp_urg`) : un pointeur urgent neuf, puis l'octet qu'il
         // désigne, quand il arrive (dans ce segment, ou un suivant).
         if t.drapeaux & tcp::URG != 0 && self.etat.recoit() {
@@ -1628,6 +1914,7 @@ impl<P: Charge> Tcb<P> {
             flag |= FLAG_SND_UNA_ADVANCED;
             self.retransmissions = 0;
         }
+        self.remplacer_ts_recent(t.seq, maintenant);
         flag |= self.maj_fenetre(t, e);
         // SND.UNA, et les octets acquittés rendus.
         if flag & FLAG_SND_UNA_ADVANCED != 0 {
@@ -1674,11 +1961,10 @@ impl<P: Charge> Tcb<P> {
     /// donnée la dernière fois ; décalée de son échelle (jamais dans un SYN : ce
     /// segment n'en est pas un).
     fn maj_fenetre(&mut self, t: &Tcp, e: &mut Effets) -> u32 {
-        let fenetre = (t.fenetre as u32) << self.echelle_envoi;
-        let maj = apres(t.ack, self.snd_una) || apres(t.seq, self.snd_wl1) || (t.seq == self.snd_wl1 && (fenetre > self.snd_wnd || fenetre == 0));
-        if !maj {
+        if !self.fenetre_a_jour(t) {
             return 0;
         }
+        let fenetre = (t.fenetre as u32) << self.echelle_envoi;
         self.snd_wl1 = t.seq;
         if self.snd_wnd != fenetre {
             if self.snd_wnd == 0 {
@@ -1688,6 +1974,26 @@ impl<P: Charge> Tcb<P> {
             self.max_fenetre = self.max_fenetre.max(fenetre);
         }
         FLAG_WIN_UPDATE
+    }
+
+    /// `tcp_may_update_window`.
+    fn fenetre_a_jour(&self, t: &Tcp) -> bool {
+        let fenetre = (t.fenetre as u32) << self.echelle_envoi;
+        apres(t.ack, self.snd_una) || apres(t.seq, self.snd_wl1) || (t.seq == self.snd_wl1 && (fenetre > self.snd_wnd || fenetre == 0))
+    }
+
+    /// `tcp_replace_ts_recent` : TSval d'un segment qui ne vient pas d'au-delà
+    /// du bord (RFC 7323 4.3 : le plus ancien segment acquitté par notre
+    /// prochain ACK) et qui passe PAWS strictement devient celui qu'on renvoie.
+    /// Seulement une fois le segment jugé bon : un TSval faux dans un segment
+    /// abîmé bloquerait la connexion.
+    fn remplacer_ts_recent(&mut self, seq: u32, maintenant: u64) {
+        if let (Some(ts), Some((val, _))) = (self.ts.as_mut(), self.ts_recu)
+            && !apres(seq, self.ack.rcv_wup)
+            && paws_controle(ts, val, 0, maintenant)
+        {
+            ts.retenir(val, maintenant);
+        }
     }
 
     /// SO_SNDBUF agrandi pour deux fenêtres de congestion de segments
@@ -1700,7 +2006,9 @@ impl<P: Charge> Tcb<P> {
         if self.sndbuf_fixe || self.memoire != Memoire::Libre {
             return;
         }
-        let par_segment = (self.mss as usize + 640).next_power_of_two() + 256;
+        // `max(mss_clamp, mss_cache)`, le premier sans la place des options.
+        let clamp = self.mss_offre.filter(|&o| o != 0).unwrap_or(MSS_DEFAUT).min(if self.mss_utilisateur != 0 { self.mss_utilisateur } else { u16::MAX });
+        let par_segment = (clamp.max(self.mss) as usize + 640).next_power_of_two() + 256;
         let segments = (self.cc.cwnd.max(CWND_INITIALE).max(self.reordering + 1)) as usize;
         let voulu = (2 * segments * par_segment).min(self.sndbuf_max);
         if self.sndbuf < voulu {
@@ -1739,10 +2047,64 @@ impl<P: Charge> Tcb<P> {
     }
 
     /// Le SYN ou le SYN-ACK est acquitté : une première mesure du RTT, s'il n'a
-    /// pas été renvoyé (Karn : `tcp_clean_rtx_queue`, `tcp_synack_rtt_meas`).
+    /// pas été renvoyé (Karn : `tcp_clean_rtx_queue`, `tcp_synack_rtt_meas`) ;
+    /// renvoyé : par TSecr, s'il y en a un.
     fn mesurer_syn(&mut self, maintenant: u64) {
-        if let Some(envoi) = self.syn_envoi.take() {
-            self.mettre_a_jour_rtt(Some(maintenant.saturating_sub(envoi)));
+        let mesure = self.syn_envoi.take().map(|envoi| maintenant.saturating_sub(envoi));
+        self.mettre_a_jour_rtt(mesure, maintenant);
+    }
+
+    /// Le RTT que donne TSecr, en ns (`tcp_rtt_tsopt_us`), l'horloge comptant en
+    /// ms : `min` si l'écart est nul (1 ms pour l'estimateur ; 0 pour le
+    /// récepteur, qui jette alors la mesure).
+    fn rtt_par_tsecr(&self, maintenant: u64, min: u32) -> Option<u64> {
+        let (_, ecr) = self.ts_recu.filter(|&(_, e)| e != 0)?;
+        let delta = horloge_ts(maintenant).wrapping_sub(ecr);
+        if delta >= i32::MAX as u32 / 1000 {
+            return None;
+        }
+        Some(if delta == 0 { min } else { delta } as u64 * 1_000_000)
+    }
+
+    /// Une mesure du RTT par le récepteur (`tcp_rcv_rtt_update`) : le minimum
+    /// sans horodatages (`depend_fenetre` : la mesure par fenêtre grossit toute
+    /// seule avec un programme lent) ; avec, une moyenne, si le programme suit.
+    fn rtt_reception(&mut self, m: u64, depend_fenetre: bool) {
+        let m8 = m << 3;
+        if self.rcv_rtt8 == 0 || m8 < self.rcv_rtt8 {
+            self.rcv_rtt8 = m8;
+        } else if !depend_fenetre && self.rcv_nxt == self.rcv_lu {
+            self.rcv_rtt8 = self.rcv_rtt8 - (self.rcv_rtt8 >> 3) + m;
+        }
+    }
+
+    /// Le RTT du récepteur par une fenêtre de données reçue
+    /// (`tcp_rcv_rtt_measure`).
+    fn rtt_reception_fenetre(&mut self, maintenant: u64) {
+        if self.rcv_rtt_debut != 0 {
+            if avant(self.rcv_nxt, self.rcv_rtt_seq) {
+                return;
+            }
+            self.rtt_reception(maintenant.saturating_sub(self.rcv_rtt_debut).max(1), true);
+        }
+        self.rcv_rtt_seq = self.rcv_nxt.wrapping_add(self.rcv_wnd());
+        self.rcv_rtt_debut = maintenant;
+    }
+
+    /// Le RTT du récepteur par TSecr (`tcp_rcv_rtt_measure_ts`) : un seul par
+    /// valeur, et d'un segment plein (l'autre n'envoie un petit segment que
+    /// quand il n'a plus rien, et le TSecr dirait son silence).
+    fn rtt_reception_ts(&mut self, longueur: u32, maintenant: u64) {
+        let Some((_, ecr)) = self.ts_recu else { return };
+        if ecr == self.rcv_rtt_tsecr {
+            return;
+        }
+        self.rcv_rtt_tsecr = ecr;
+        if longueur >= self.ack.rcv_mss
+            && let Some(m) = self.rtt_par_tsecr(maintenant, 0)
+            && m > 0
+        {
+            self.rtt_reception(m, false);
         }
     }
 
@@ -1756,6 +2118,10 @@ impl<P: Charge> Tcb<P> {
         } else {
             self.rtt.repli();
             self.rto = RTO_REPLI;
+        }
+        // Les horodatages retirent leur place de ce qu'on dit pouvoir recevoir.
+        if self.ts.is_some() {
+            self.mss_local -= TS_ALIGNE;
         }
         self.cc.cwnd = if self.total_retrans > 1 { 1 } else { CWND_INITIALE };
         // La perte du SYN est réparée ; le seuil, lui, garde sa moitié
@@ -1849,7 +2215,7 @@ impl<P: Charge> Tcb<P> {
             retransmissions: self.retransmissions.min(255) as u8,
             sondes: self.sondes.min(255) as u8,
             recul: self.recul.min(255) as u8,
-            options: if echelle { 4 } else { 0 },
+            options: if echelle { 4 } else { 0 } | u8::from(self.etat.synchronise() && self.ts.is_some()),
             echelle_envoi: if echelle { self.echelle_envoi } else { 0 },
             echelle_reception: if echelle { self.echelle_reception } else { 0 },
             rto: us(self.rto),
@@ -1868,8 +2234,10 @@ impl<P: Charge> Tcb<P> {
             ssthresh: self.cc.ssthresh,
             cwnd: self.cc.cwnd,
             advmss: self.mss_local as u32,
+            pmtu: self.mss_route as u32 + 40,
             reordonnancement: self.reordering,
             total_retrans: self.total_retrans,
+            rcv_rtt: us(self.rcv_rtt8 >> 3),
             t_retrans: self.t_xmit.map(|t| t.saturating_sub(maintenant)),
             sonde: self.t_sorte == Minuteur::Sonde,
             t_keepalive: self.t_keepalive.map(|t| t.saturating_sub(maintenant)),
@@ -2056,6 +2424,7 @@ impl<P: Charge> Tcb<P> {
         if longueur >= self.ack.rcv_mss {
             self.ack.rcv_mss = longueur.min(self.mss_local as u32);
         }
+        self.rtt_reception_fenetre(maintenant);
         if self.ack.ato == 0 {
             // Les premières données : le mode « quickack ».
             self.ajouter_ack_rapides();
@@ -2203,6 +2572,7 @@ impl<P: Charge> Tcb<P> {
     /// retransmission, la sonde de fenêtre.
     pub fn minuteur(&mut self, maintenant: u64) -> Effets {
         let mut e = Effets::default();
+        self.heure = maintenant;
         if self.ack.t.is_some_and(|t| t <= maintenant) {
             self.ack.t = None;
             self.minuteur_ack(&mut e);
@@ -2244,6 +2614,7 @@ impl<P: Charge> Tcb<P> {
         let u = r.delai_utilisateur;
         if (u != 0 && ecoule >= u && self.sondes > 0) || (u == 0 && self.sondes >= r.keepcnt) {
             self.rst_du = Some((self.seq_acceptable(), self.rcv_nxt, tcp::RST | tcp::ACK));
+            self.rst_actif = true;
             self.abandonner(e);
             e.a_emettre = true;
             return;
@@ -2447,7 +2818,7 @@ impl<P: Charge> Tcb<P> {
             drapeaux,
             fenetre: if drapeaux & tcp::SYN != 0 { self.fenetre_possible().min(FENETRE_MAX) as u16 } else { self.fenetre() },
             urgent: 0,
-            options: tcp::Options::default(),
+            options: tcp::Options { horodatage: self.ts.map(|ts| (ts.valeur(self.heure), ts.recent)), ..tcp::Options::default() },
         };
         // Le pointeur urgent, dans tout segment qui précède l'octet urgent
         // (`__tcp_transmit_skb`) ; trop loin pour 16 bits, 0xFFFF, tant
@@ -2514,10 +2885,14 @@ impl<P: Charge> Tcb<P> {
     /// de congestion, le FIN, et l'ACK s'il en faut un tout de suite et
     /// qu'aucun segment ne l'a porté.
     pub fn emettre(&mut self, maintenant: u64, mut sortir: impl FnMut(Sortant)) {
+        self.heure = maintenant;
         if let Some((seq, ack, drapeaux)) = self.rst_du.take() {
             let mut h = self.entete(seq, drapeaux);
             h.ack = ack;
             h.fenetre = 0;
+            if !core::mem::take(&mut self.rst_actif) {
+                h.options = tcp::Options::default();
+            }
             sortir(Sortant { entete: h, debut: 0, longueur: 0 });
             if self.etat == Etat::Fermee {
                 return;
@@ -2531,7 +2906,16 @@ impl<P: Charge> Tcb<P> {
             self.syn_du = false;
             let drapeaux = if self.etat == Etat::SynRecu { tcp::SYN | tcp::ACK } else { tcp::SYN };
             let mut h = self.entete(self.iss, drapeaux);
-            h.options.mss = Some(self.mss_local);
+            h.options.mss = Some(self.mss_annonce());
+            // Le TSval de nos SYN-ACK (`tcp_synack_options`) : jamais nul le
+            // premier, et l'intervalle d'une réponse valide.
+            if let Some((val, ecr)) = h.options.horodatage
+                && self.fille
+            {
+                let val = if self.ts_synack.is_none() && val == 0 { u32::MAX } else { val };
+                h.options.horodatage = Some((val, ecr));
+                self.ts_synack = Some((self.ts_synack.map_or(val, |(premier, _)| premier), val));
+            }
             // L'échelle : proposée dans notre SYN ; rendue dans le SYN-ACK
             // seulement si l'autre l'a proposée (RFC 7323 1.3).
             if self.echelle_ok {
