@@ -300,6 +300,8 @@ impl<T> Table<T> {
             while let Some((paquet, _)) = v.attente.pop_front() {
                 faire(Action::Envoyer { interface, mac, paquet });
             }
+            // Vide, la file rend sa place (voir l'échec, plus bas).
+            v.attente = VecDeque::new();
             v.octets = 0;
         }
     }
@@ -353,6 +355,11 @@ impl<T> Table<T> {
                 while let Some((paquet, _)) = v.attente.pop_front() {
                     faire(Action::Jeter { paquet, echec: true });
                 }
+                // La place de la file vide est rendue : une VecDeque garde
+                // sa capacité quand on la vide, et un voisin qui ne répond
+                // jamais garderait celle de la plus longue attente
+                // (« mémoire rendue », mesurée après chaque programme).
+                v.attente = VecDeque::new();
                 continue;
             }
             v.sondes += 1;
