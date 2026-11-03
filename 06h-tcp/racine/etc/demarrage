@@ -90,6 +90,9 @@ wait
 # Le réseau (6g), tel que l'a configuré le DHCP du démarrage : /proc/net,
 # /etc/resolv.conf, un datagramme vers la passerelle.
 /bin/passerelle
+# Le jalon de 6h : une page HTTP de 4 Mio, par TCP, de la carte réseau
+# jusqu'au serveur que QEMU lance sur l'hôte (outils/serveur-http).
+/bin/telecharger
 # Et le jalon de 6d, et de 6e : le vrai Claude Code, en dernier (ce qui
 # précède a déjà dit si le noyau va bien).
 /usr/local/bin/claude --version

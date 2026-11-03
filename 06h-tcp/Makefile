@@ -120,8 +120,14 @@
 # option de réseau, QEMU ajoute d'office une Intel e1000 (mesuré). Et par
 # -netdev et -device : la forme courte -nic user,model=virtio-net-pci donne
 # une carte sans MSI-X (vectors = 0, mesuré avec QEMU 8.2).
+# Et un serveur HTTP (6h) : chaque connexion du système invité vers
+# 10.0.2.100:80 est servie par outils/serveur-http, que QEMU lance sur
+# l'hôte (guestfwd, cmd:), sans port ouvert sur l'hôte ni Internet ; par son
+# chemin absolu, QEMU pouvant être lancé d'ailleurs (verifier.sh, depuis la
+# racine du dépôt). Sans virgule ni espace dans le chemin du dépôt (la
+# syntaxe de -netdev).
 QEMU_DISQUE = virtio
-QEMU_RESEAU = -netdev user,id=n0 -device virtio-net-pci,netdev=n0
+QEMU_RESEAU = -netdev user,id=n0,guestfwd=tcp:10.0.2.100:80-cmd:$(CURDIR)/outils/serveur-http -device virtio-net-pci,netdev=n0
 #
 # Le générateur matériel (6h) : virtio-rng, l'aléa de l'hôte, comme Linux
 # l'emploie dans une machine virtuelle ; sans lui, et sans RDRAND (Nehalem
@@ -255,6 +261,9 @@ boot.bin: programmes.cpio FORCE
 #   - client-tcp : gcc -static, le client du serveur WebAssembly
 #     bonjour-tcp.wasm (deux lignes envoyées, rendues à l'envers) ; dans
 #     notre noyau seulement (son serveur est un programme WebAssembly) ;
+#   - telecharger : gcc sans option (getaddrinfo, comme claude), une page
+#     HTTP de 4 Mio que sert QEMU (outils/serveur-http, par guestfwd),
+#     vérifiée octet par octet ; dans notre noyau seulement ;
 #   - aleatoire : gcc -static, le générateur (getrandom et ses refus,
 #     /dev/random, /dev/urandom, /proc/sys/kernel/random) ; sur l'hôte
 #     aussi ;
@@ -397,6 +406,10 @@ $(LINUX)/unix: linux/unix.c
 $(LINUX)/client-tcp: linux/client-tcp.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/telecharger: linux/telecharger.c
+	mkdir -p $(LINUX)
+	gcc $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/aleatoire: linux/aleatoire.c
 	mkdir -p $(LINUX)
@@ -788,7 +801,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release

@@ -45,6 +45,7 @@ file  /bin/aleatoire       linux/construits/aleatoire 755 0 0
 file  /bin/tcp             linux/construits/tcp 755 0 0
 file  /bin/unix            linux/construits/unix 755 0 0
 file  /bin/client-tcp      linux/construits/client-tcp 755 0 0
+file  /bin/telecharger     linux/construits/telecharger 755 0 0
 file  /bin/passerelle      linux/construits/passerelle 755 0 0
 
 # Les commandes que lance le noyau (formats/src/commande.rs). Écrit avant

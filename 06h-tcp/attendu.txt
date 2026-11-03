@@ -53,8 +53,8 @@ rendues et recollees : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 52, liens symboliques 6, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 49 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 53, liens symboliques 6, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 50 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -206,6 +206,11 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] passerelle : nexistepas-claude-os.anthropic.com : EAI_NONAME : ok
 [linux] passerelle : toutes les verifications : ok
 [noyau] passerelle : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] telecharger : GET /page : 200, Content-Length 4194304 : ok
+[linux] telecharger : page de 4194304 octets, chacun a sa place, puis la fin de la connexion : ok
+[linux] telecharger : GET /absente : 404, sans corps : ok
+[linux] telecharger : toutes les verifications : ok
+[noyau] telecharger : termine, code de sortie 0 ; memoire rendue : ok.
 [noyau] claude : programme Linux (ELF ET_EXEC), 291638640 octets, point d'entree 0x1be7900, segments :
 2.1.310 (Claude Code)
 [noyau] claude : termine, code de sortie 0 ; memoire rendue : ok.
