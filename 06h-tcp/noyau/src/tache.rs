@@ -190,6 +190,10 @@ pub struct Tache {
     programme: Option<UnsafeCell<EtatProgramme>>,
     /// Elle s'est terminée : sa pile est à rendre.
     morte: AtomicBool,
+    /// Une tâche du noyau qui exécute un programme WebAssembly (6h) : ses
+    /// minuteries comptent pour le détecteur d'interblocage comme celles
+    /// d'un programme Linux (attente.rs).
+    webassembly: AtomicBool,
     /// Pour un fil créé avec CLONE_CHILD_SETTID : l'adresse où il écrit son
     /// numéro à son premier départ (le `set_child_tid` de Linux), 0 sinon.
     ecrire_tid: AtomicU64,
@@ -345,6 +349,7 @@ impl Tache {
             processus,
             programme,
             morte: AtomicBool::new(false),
+            webassembly: AtomicBool::new(false),
             ecrire_tid: AtomicU64::new(0),
             effacer_tid: AtomicU64::new(0),
             liste_robuste: AtomicU64::new(0),
@@ -446,6 +451,17 @@ impl Tache {
     /// Est-ce un programme (et pas une tâche du noyau) ?
     pub fn est_programme(&self) -> bool {
         self.programme.is_some()
+    }
+
+    /// La tâche courante exécute désormais un programme WebAssembly
+    /// (programmes.rs).
+    pub fn marquer_webassembly(&self) {
+        self.webassembly.store(true, Ordering::Relaxed);
+    }
+
+    /// Exécute-t-elle un programme WebAssembly ?
+    pub fn est_webassembly(&self) -> bool {
+        self.webassembly.load(Ordering::Relaxed)
     }
 
     /// Dort-elle, interruptible ?
@@ -574,6 +590,7 @@ pub fn initialiser() {
         processus: None,
         programme: None,
         morte: AtomicBool::new(false),
+        webassembly: AtomicBool::new(false),
         ecrire_tid: AtomicU64::new(0),
         effacer_tid: AtomicU64::new(0),
         liste_robuste: AtomicU64::new(0),

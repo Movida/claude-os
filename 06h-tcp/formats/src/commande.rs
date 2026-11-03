@@ -37,9 +37,12 @@
 //!     lettres, chiffres et `_`, sans guillemets avant le `=`, comme pour
 //!     `sh`) ajoutent une variable à l'environnement du programme, ou
 //!     remplacent celle du noyau ;
-//!   - LA SEULE ENTORSE à `sh` : des options `--dir=CHEMIN`, entre les
+//!   - LES SEULES ENTORSES à `sh` : des options `--dir=CHEMIN`, entre les
 //!     affectations et le programme, donnent un dossier pré-ouvert à un
-//!     programme WebAssembly (comme `wasmtime --dir`) ;
+//!     programme WebAssembly (comme `wasmtime --dir`), et des options
+//!     `--tcplisten=ADRESSE:PORT` (6h) une écoute TCP pré-ouverte (comme
+//!     le `--tcplisten` de wasmtime, qu'il écrit maintenant
+//!     `-S tcplisten=`) : l'adresse d'IPv4 en chiffres, et le port ;
 //!   - puis le programme, par son CHEMIN ABSOLU (qui devient aussi
 //!     argv[0]), et ses arguments. Un mot qui commence par `/` n'est ni un
 //!     mot réservé de sh (`if`, `while`...), ni une commande interne
@@ -70,6 +73,9 @@ pub enum Erreur {
     Caractere(u8),
     /// Une option `--dir=` sans chemin.
     DossierVide,
+    /// Une option `--tcplisten=` dont la valeur n'est pas ADRESSE:PORT
+    /// (l'adresse d'IPv4 en chiffres).
+    Ecoute,
     /// Des affectations ou des options, mais pas de programme.
     SansProgramme,
     /// Le programme n'est pas un chemin absolu.
@@ -90,6 +96,7 @@ impl fmt::Display for Erreur {
             Erreur::Caractere(c) if c.is_ascii_graphic() => write!(f, "caractere special '{}' hors des guillemets", *c as char),
             Erreur::Caractere(c) => write!(f, "octet {c:#04x} interdit"),
             Erreur::DossierVide => f.write_str("--dir= sans chemin"),
+            Erreur::Ecoute => f.write_str("--tcplisten= attend ADRESSE:PORT (IPv4, en chiffres)"),
             Erreur::SansProgramme => f.write_str("pas de programme a lancer"),
             Erreur::CheminRelatif => f.write_str("le programme doit etre donne par son chemin absolu"),
             Erreur::TamponTropPetit => f.write_str("ligne trop longue"),
@@ -122,6 +129,9 @@ pub enum Genre {
     Affectation,
     /// `--dir=CHEMIN` : les octets du mot sont le chemin.
     Dossier,
+    /// `--tcplisten=ADRESSE:PORT` : les octets du mot sont l'adresse et le
+    /// port, vérifiés.
+    Ecoute,
     /// Le programme, ou l'un de ses arguments.
     Argument,
 }
@@ -156,6 +166,7 @@ impl<'t> Commande<'t> {
             let genre = match genre {
                 b'a' => Genre::Affectation,
                 b'd' => Genre::Dossier,
+                b'e' => Genre::Ecoute,
                 _ => Genre::Argument,
             };
             Some((genre, mot))
@@ -170,6 +181,13 @@ impl<'t> Commande<'t> {
     /// Les chemins des options `--dir=`.
     pub fn dossiers(&self) -> impl Iterator<Item = &'t [u8]> + 't {
         self.mots().filter(|(g, _)| *g == Genre::Dossier).map(|(_, m)| m)
+    }
+
+    /// Les écoutes des options `--tcplisten=` : l'adresse et le port de
+    /// chacune (vérifiés par `decouper`), et le mot tel qu'écrit, pour les
+    /// messages.
+    pub fn ecoutes(&self) -> impl Iterator<Item = ([u8; 4], u16, &'t [u8])> + 't {
+        self.mots().filter(|(g, _)| *g == Genre::Ecoute).filter_map(|(_, m)| adresse_et_port(m).map(|(a, p)| (a, p, m)))
     }
 
     /// Le programme puis ses arguments : argv.
@@ -193,6 +211,33 @@ impl<'t> Commande<'t> {
 /// de 0x80 et plus, l'UTF-8, aussi : `sh` ne les interprète pas.)
 fn ordinaire(o: u8) -> bool {
     o.is_ascii_alphanumeric() || b"_-./,:+=@%#".contains(&o) || o >= 0x80
+}
+
+/// `ADRESSE:PORT` : quatre nombres décimaux de 0 à 255 séparés par des
+/// points, sans zéro en tête (« 010 » serait de l'octal pour inet_aton : on
+/// refuse plutôt que de deviner, comme inet_pton et le Rust de wasmtime),
+/// puis un port de 0 à 65535. Pas de nom de machine : le noyau ne résout
+/// pas de noms (wasmtime, si : il passe par le DNS de son hôte), et pas
+/// d'IPv6, que nous n'avons pas.
+pub fn adresse_et_port(texte: &[u8]) -> Option<([u8; 4], u16)> {
+    let deux_points = texte.iter().rposition(|&o| o == b':')?;
+    let (adresse, port) = (&texte[..deux_points], &texte[deux_points + 1..]);
+    // Un nombre décimal d'au plus `chiffres` chiffres, sans zéro en tête.
+    let nombre = |t: &[u8], chiffres: usize| -> Option<u32> {
+        if t.is_empty() || t.len() > chiffres || !t.iter().all(u8::is_ascii_digit) || (t.len() > 1 && t[0] == b'0') {
+            return None;
+        }
+        Some(t.iter().fold(0, |n, &c| n * 10 + (c - b'0') as u32))
+    };
+    let mut octets = [0u8; 4];
+    let mut parties = adresse.split(|&o| o == b'.');
+    for o in &mut octets {
+        *o = u8::try_from(nombre(parties.next()?, 3)?).ok()?;
+    }
+    if parties.next().is_some() {
+        return None;
+    }
+    Some((octets, u16::try_from(nombre(port, 5)?).ok()?))
 }
 
 /// `mot` (brut, avec ses guillemets) commence-t-il par `NOM=`, sans
@@ -296,6 +341,16 @@ pub fn decouper<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<Option<Ligne<'
                 return Err(Erreur::DossierVide);
             }
             b'd'
+        } else if en_tete && brut.starts_with(b"--tcplisten=") {
+            // L'adresse et le port seuls, vérifiés ici : une ligne fautive
+            // est refusée en entier, comme les autres.
+            let mot = place + 1;
+            tampon.copy_within(mot + 12..ecrit, mot);
+            ecrit -= 12;
+            if adresse_et_port(&tampon[mot..ecrit]).is_none() {
+                return Err(Erreur::Ecoute);
+            }
+            b'e'
         } else {
             // Le premier mot qui n'est ni une affectation ni une option : le
             // programme, par son chemin absolu.
@@ -441,6 +496,26 @@ mod tests {
         assert_eq!(decoupe("--dir=\"\" /bin/x"), Err(Erreur::DossierVide));
     }
 
+    /// Les écoutes : rangées à part, leur adresse et leur port lus ; après
+    /// le programme, un argument comme un autre ; une valeur qui n'est pas
+    /// ADRESSE:PORT d'IPv4 en chiffres refuse la ligne.
+    #[test]
+    fn ecoutes() {
+        let ligne = "--dir=/ --tcplisten=127.0.0.1:8080 --tcplisten='0.0.0.0:0' /bin/s.wasm --tcplisten=1.2.3.4:5";
+        let mut tampon = std::vec![0u8; taille_tampon(ligne.as_bytes())];
+        let Ok(Some(Ligne::Commande(c))) = decouper(ligne.as_bytes(), &mut tampon) else { panic!("{ligne}") };
+        let e: Vec<_> = c.ecoutes().collect();
+        assert_eq!(e, [([127, 0, 0, 1], 8080, &b"127.0.0.1:8080"[..]), ([0; 4], 0, &b"0.0.0.0:0"[..])]);
+        assert_eq!(c.dossiers().collect::<Vec<_>>(), [b"/"]);
+        assert_eq!(c.arguments().collect::<Vec<_>>(), [&b"/bin/s.wasm"[..], b"--tcplisten=1.2.3.4:5"]);
+        for v in ["", "8080", "127.0.0.1", "127.0.0.1:", ":80", "127.0.0:1", "127.0.0.1.2:1", "256.0.0.1:1", "01.0.0.1:1",
+                  "1.2.3.4:65536", "1.2.3.4:080", "1.2.3.4:-1", "localhost:80", "[::1]:80", "1..2.3:4", "1.2.3.4:5:6"] {
+            assert_eq!(decoupe(&std::format!("--tcplisten='{v}' /bin/x")), Err(Erreur::Ecoute), "{v}");
+        }
+        assert_eq!(adresse_et_port(b"255.255.255.255:65535"), Some(([255; 4], 65535)));
+        assert_eq!(adresse_et_port(b"10.0.2.15:0"), Some(([10, 0, 2, 15], 0)));
+    }
+
     /// Le programme par son chemin absolu : ni un chemin relatif, ni un mot
     /// que sh comprendrait autrement (un mot réservé, une commande interne),
     /// même entre guillemets.
@@ -479,7 +554,7 @@ mod tests {
 
     #[test]
     fn messages_sans_accents() {
-        for e in [Erreur::GuillemetNonFerme, Erreur::Caractere(b'$'), Erreur::Caractere(1), Erreur::DossierVide,
+        for e in [Erreur::GuillemetNonFerme, Erreur::Caractere(b'$'), Erreur::Caractere(1), Erreur::DossierVide, Erreur::Ecoute,
                   Erreur::SansProgramme, Erreur::CheminRelatif, Erreur::TamponTropPetit, Erreur::ApresEsperluette,
                   Erreur::Attendre] {
             assert!(std::format!("{e}").is_ascii());
@@ -489,8 +564,8 @@ mod tests {
     /// Le cœur de la promesse : ce que nous acceptons, le `sh` de la
     /// machine le découpe pareil. Pour chaque ligne, sh reçoit les mêmes
     /// octets ; il affiche ses arguments (printf '%s\0') et son
-    /// environnement (env -0). Les options --dir= (notre seule entorse)
-    /// n'y sont pas.
+    /// environnement (env -0). Les options --dir= et --tcplisten= (nos
+    /// seules entorses) n'y sont pas.
     #[test]
     fn comme_sh() {
         let lignes = [

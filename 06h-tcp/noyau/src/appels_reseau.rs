@@ -320,18 +320,25 @@ fn creer(p: Protocole, sorte: i32, proto: u16, uid: u32, place: ArcVide<Socket>)
     Ok(s)
 }
 
-/// Le fichier ouvert d'une socket neuve (`sock_alloc_file`) : son inode
-/// (S_IFSOCK 0777, sans nom : ENFILE s'il n'y en a plus), ouvert en
-/// lecture et écriture, O_NONBLOCK et FD_CLOEXEC si demandés.
+/// Installe une socket neuve dans un descripteur du programme : son fichier
+/// (`fichier_de_socket`), O_NONBLOCK et FD_CLOEXEC si demandés.
 fn installer(s: Arc<Socket>, drapeaux: u64) -> i64 {
     let identite = processus::avec(|p| p.identite);
-    match fichier_sans_socket(identite, drapeaux & SOCK_NONBLOCK != 0) {
-        Ok(mut f) => {
-            attacher(&mut f, s);
-            installer_fichier(f, drapeaux & SOCK_CLOEXEC != 0)
-        }
+    match fichier_de_socket(s, identite, drapeaux & SOCK_NONBLOCK != 0) {
+        Ok(f) => installer_fichier(f, drapeaux & SOCK_CLOEXEC != 0),
         Err(e) => e,
     }
+}
+
+/// Le fichier ouvert d'une socket neuve (`sock_alloc_file`) : son inode
+/// (S_IFSOCK 0777, sans nom, à `identite` : ENFILE s'il n'y en a plus),
+/// ouvert en lecture et écriture, O_NONBLOCK si demandé. Pour un programme
+/// Linux (`installer`), et pour un programme WebAssembly, qui a sa propre
+/// table de descripteurs (wasi.rs).
+pub fn fichier_de_socket(s: Arc<Socket>, identite: fichiers::Identite, non_bloquant: bool) -> Result<FichierOuvert, i64> {
+    let mut f = fichier_sans_socket(identite, non_bloquant)?;
+    attacher(&mut f, s);
+    Ok(f)
 }
 
 /// Le fichier ouvert d'une socket, encore sans elle : `accept` le prépare
@@ -339,7 +346,7 @@ fn installer(s: Arc<Socket>, drapeaux: u64) -> i64 {
 /// (`sock_alloc`, `sock_alloc_file`, puis `ops->accept`) : sans inode
 /// (ENFILE), la connexion reste dans la file de l'écoute. Refusé, il se
 /// rend par `appels_fichiers::rendre_fichier`.
-fn fichier_sans_socket(identite: fichiers::Identite, non_bloquant: bool) -> Result<FichierOuvert, i64> {
+pub fn fichier_sans_socket(identite: fichiers::Identite, non_bloquant: bool) -> Result<FichierOuvert, i64> {
     let maintenant = temps::maintenant();
     let Ok(numero) = vfs::avec(|fs, _| {
         let n = fs.creer_socket(identite, maintenant)?;
@@ -357,7 +364,7 @@ fn fichier_sans_socket(identite: fichiers::Identite, non_bloquant: bool) -> Resu
 
 /// Met la socket `s` dans le fichier `f`, de `fichier_sans_socket` : elle y
 /// apprend son inode (/proc/net/tcp, /proc/net/unix).
-fn attacher(f: &mut FichierOuvert, s: Arc<Socket>) {
+pub fn attacher(f: &mut FichierOuvert, s: Arc<Socket>) {
     s.inode.store(f.inode().0, Ordering::Relaxed);
     f.prive = Prive::Socket(s);
 }
@@ -511,11 +518,7 @@ pub fn accept4(fd: u64, adresse: u64, longueur: u64, drapeaux: u64) -> i64 {
         // socket : elle se ferme ici, comme à son dernier `close`.
         let abandonner = |f, e| {
             appels_fichiers::rendre_fichier(f);
-            if protocole == Protocole::Unix {
-                unix::fermer(&enfant);
-            } else {
-                tcp::fermer(&enfant);
-            }
+            socket::fermer(&enfant);
             Err(e)
         };
         if adresse != 0

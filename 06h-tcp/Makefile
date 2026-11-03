@@ -252,6 +252,9 @@ boot.bin: programmes.cpio FORCE
 #   - unix : gcc -static, les sockets AF_UNIX (les trois sortes, les noms,
 #     les connexions et leurs fermetures, socketpair, /proc/net/unix, un
 #     serveur et trois clients en fils) ; sur l'hôte aussi ;
+#   - client-tcp : gcc -static, le client du serveur WebAssembly
+#     bonjour-tcp.wasm (deux lignes envoyées, rendues à l'envers) ; dans
+#     notre noyau seulement (son serveur est un programme WebAssembly) ;
 #   - aleatoire : gcc -static, le générateur (getrandom et ses refus,
 #     /dev/random, /dev/urandom, /proc/sys/kernel/random) ; sur l'hôte
 #     aussi ;
@@ -388,6 +391,10 @@ $(LINUX)/tcp: linux/tcp.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/unix: linux/unix.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/client-tcp: linux/client-tcp.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -702,7 +709,10 @@ tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_L
 # programmes (ligne 2 : un guillemet non fermé ; 3 : --dir= devant un
 # programme Linux ; 4 : un chemin relatif ; 5 : un programme absent ; 6 :
 # un dossier ; 7 : une barre finale après un fichier ; 8 : un fichier sans
-# le droit d'exécution) ; puis chaque programme de TESTS_LINUX et de
+# le droit d'exécution ; 9 : --tcplisten= devant un programme Linux ; 10 :
+# --tcplisten= sans port ; 11 : deux écoutes à la même adresse, la seconde
+# refusée par EADDRINUSE, et la première fermée avec elle, le programme
+# n'est pas lancé) ; puis chaque programme de TESTS_LINUX et de
 # TESTS_INTERP, ceux de TESTS_PARALLELES par deux, un fil qui fait une
 # faute (fils faute : tout le groupe meurt), les courses entre fils et les
 # gestionnaires de signaux (sous qemu64 et max, en plus de Nehalem au
@@ -719,6 +729,9 @@ tests-demarrage.txt: Makefile
 	  echo "/bin"; \
 	  echo "/bin/bonjour-asm/"; \
 	  echo "/etc/demarrage"; \
+	  echo "--tcplisten=127.0.0.1:8080 /bin/bonjour-asm"; \
+	  echo "--tcplisten=127.0.0.1 /bin/lecteur.wasm"; \
+	  echo "--tcplisten=127.0.0.1:8080 --tcplisten=127.0.0.1:8080 /bin/lecteur.wasm"; \
 	  for p in $(TESTS_LINUX) $(TESTS_INTERP); do echo "/bin/$$p"; done; \
 	  echo "/bin/lignes a 200 &"; \
 	  echo "/bin/lignes b 200 &"; \
@@ -775,11 +788,12 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
+	cd bonjour-tcp && cargo build --release
 	{ cat archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } | sh archive.sh $@ -
 
 # L'archive du jalon de 6f et de 6g : celle de l'étape, dont /etc/demarrage
@@ -1158,6 +1172,7 @@ clean:
 	cd wasm && cargo clean
 	cd bonjour && cargo clean
 	cd lecteur && cargo clean
+	cd bonjour-tcp && cargo clean
 	cd formats && cargo clean
 	cd zones && cargo clean
 	cd fichiers && cargo clean

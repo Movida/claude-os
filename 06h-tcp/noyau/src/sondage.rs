@@ -279,13 +279,14 @@ pub fn delai_timespec(adresse: u64) -> Result<Delai, i64> {
     delai(s, ns)
 }
 
-/// La boucle de `do_poll` et de `do_select` : `tour` sonde tout avec la
-/// table qu'il reçoit (qui n'inscrit qu'au premier tour) et rend le nombre
-/// de prêts ; tant qu'il n'y en a pas, la tâche dort, jusqu'au délai, au
-/// réveil d'une de ses entrées, ou à un signal (ERESTARTNOHAND, après un
-/// dernier tour : ce qui est prêt passe avant le signal). Un délai nul ne
-/// dort ni n'inscrit rien.
-fn attendre_prets(delai: Delai, mut tour: impl FnMut(&mut Table) -> usize) -> Result<usize, i64> {
+/// La boucle de `do_poll` et de `do_select` (et de `poll_oneoff` pour un
+/// programme WebAssembly, wasi.rs) : `tour` sonde tout avec la table qu'il
+/// reçoit (qui n'inscrit qu'au premier tour) et rend le nombre de prêts ;
+/// tant qu'il n'y en a pas, la tâche dort, jusqu'au délai, au réveil d'une
+/// de ses entrées, ou à un signal (ERESTARTNOHAND, après un dernier tour :
+/// ce qui est prêt passe avant le signal). Un délai nul ne dort ni
+/// n'inscrit rien.
+pub fn attendre_prets(delai: Delai, mut tour: impl FnMut(&mut Table) -> usize) -> Result<usize, i64> {
     let attente = Attente { tache: tache::courante_arc(), declenchee: core::cell::Cell::new(false) };
     let mut entrees = Entrees { attente: &attente, blocs: Vec::new(), erreur: false };
     let mut fini = matches!(delai, Delai::Nul);

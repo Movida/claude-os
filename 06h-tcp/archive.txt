@@ -8,6 +8,7 @@
 dir   /bin 755 0 0
 file  /bin/bonjour.wasm    bonjour/target/wasm32-unknown-unknown/release/bonjour.wasm 755 0 0
 file  /bin/lecteur.wasm    lecteur/target/wasm32-unknown-unknown/release/lecteur.wasm 755 0 0
+file  /bin/bonjour-tcp.wasm bonjour-tcp/target/wasm32-unknown-unknown/release/bonjour_tcp.wasm 755 0 0
 file  /bin/bonjour-asm     linux/construits/bonjour-asm 755 0 0
 file  /bin/pile            linux/construits/pile 755 0 0
 file  /bin/sse             linux/construits/sse 755 0 0
@@ -43,6 +44,7 @@ file  /bin/dns             linux/construits/dns 755 0 0
 file  /bin/aleatoire       linux/construits/aleatoire 755 0 0
 file  /bin/tcp             linux/construits/tcp 755 0 0
 file  /bin/unix            linux/construits/unix 755 0 0
+file  /bin/client-tcp      linux/construits/client-tcp 755 0 0
 file  /bin/passerelle      linux/construits/passerelle 755 0 0
 
 # Les commandes que lance le noyau (formats/src/commande.rs). Écrit avant

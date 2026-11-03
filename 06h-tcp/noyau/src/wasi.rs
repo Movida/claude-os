@@ -17,6 +17,10 @@
 //!   - clock_time_get : l'heure (temps.rs) ;
 //!   - poll_oneoff : attendre une échéance, ou qu'un descripteur soit prêt
 //!     (6f) ; sched_yield : céder le processeur (6f) ;
+//!   - sock_accept, sock_recv, sock_send, sock_shutdown (6h) : les sockets
+//!     TCP, sur une écoute pré-ouverte (les `--tcplisten=` de sa ligne) ;
+//!     fd_read, fd_write, fd_close, fd_fdstat_get et poll_oneoff s'en
+//!     servent aussi ; fd_fdstat_set_flags (6h) : APPEND et NONBLOCK ;
 //!   - proc_exit : terminer le programme.
 //!
 //! Tout passe par la mémoire du programme : il donne des adresses dans SA
@@ -40,13 +44,35 @@
 //! vérifie plus vraiment ; les droits Unix du fichier, eux, s'appliquent
 //! (le programme est l'utilisateur 1000, comme les programmes Linux).
 //!
+//! Les sockets suivent le modèle de capacités de WASI preview 1 : un
+//! programme ne crée pas de socket (ni `socket`, ni `connect`, ni `bind` :
+//! preview 1 ne les a pas), il reçoit des écoutes du lanceur, et les
+//! connexions qu'il y accepte. Preview 2 (`wasi:sockets`) en crée, mais
+//! demande le modèle de composants : hors de propos. Notre modèle est
+//! l'ancienne implémentation de wasmtime, `wasi-common` (gardée pour
+//! wasi-threads) : le preview 1 du wasmtime d'aujourd'hui, bâti sur preview
+//! 2, n'a plus de sockets (ses `sock_*` rendent ENOTSOCK), mais son lanceur
+//! crée encore les écoutes de `--tcplisten`. Les écoutes viennent APRÈS les
+//! dossiers pré-ouverts (3, 4... pour les dossiers, puis les écoutes) :
+//! wasi-libc cherche ses dossiers en parcourant 3, 4... jusqu'au premier
+//! EBADF de `fd_prestat_get`, qu'une socket rend (wasmtime, qui les met
+//! avant, cache ainsi les dossiers à wasi-libc). Un programme trouve son
+//! écoute par `fd_fdstat_get` (une SOCKET_STREAM).
+//!
 //! Un appel système ne doit pas non plus prendre la machine en otage : il
 //! n'est pas interrompu par le carburant (voir wasm::Hote). Chaque appel
-//! fait donc un travail borné (au plus 1024 octets lus ou écrits), et
-//! compte ce travail en carburant. Seul `poll_oneoff` peut durer : il dort
-//! jusqu'à l'échéance qu'on lui donne, comme nanosleep pour un programme
-//! Linux (le processeur passe aux autres) ; un programme WebAssembly n'a pas
-//! de signal pour l'interrompre (ni de ^C avant le terminal, 6k).
+//! fait donc un travail borné (au plus 1024 octets lus ou écrits, sauf
+//! RECV_WAITALL, voir `sock_recv`), et compte ce travail en carburant.
+//! Mais il peut ATTENDRE, en dormant (le processeur passe aux autres) :
+//! `poll_oneoff` jusqu'à son échéance ou un descripteur prêt (6f, et une
+//! socket depuis 6h), comme nanosleep et poll pour un programme Linux ; et
+//! depuis 6h, la réception d'une socket bloquante, son envoi quand la place
+//! manque, et `sock_accept` d'une écoute que le programme a rendue
+//! bloquante (`fd_fdstat_set_flags`), comme dans wasi-common. Un
+//! programme WebAssembly n'a pas de signal pour l'interrompre (ni de ^C
+//! avant le terminal, 6k) : un client qui ne vient jamais le laisse
+//! attendre pour toujours (le détecteur d'interblocage ne s'occupe que des
+//! programmes Linux, qu'il peut arrêter par SIGKILL).
 
 use alloc::vec::Vec;
 use core::fmt;
@@ -54,9 +80,14 @@ use wasm::module::{DescriptionImport, TypeFonction, TypeValeur};
 use wasm::validateur::ModuleValide;
 use wasm::{Externe, Hote, Magasin, Piege, Valeur};
 
-use crate::descripteurs::{Descripteur, Descripteurs, FichierOuvert, Refus, Sorte};
+use crate::appels_fichiers::FichierTenu;
+use crate::descripteurs::{Descripteur, Descripteurs, Fichier, FichierOuvert, Refus, Sorte};
 use crate::faillible::{self, VecFaillible};
-use crate::{appels_fichiers, console, temps, vfs};
+use crate::partage::ArcVide;
+use crate::reseau::socket::{self, Protocole, Socket};
+use crate::reseau::tcp;
+use crate::sondage::{self, Delai, POLLERR, POLLHUP, POLLIN, POLLOUT, Table};
+use crate::{appels_fichiers, appels_reseau, console, temps, vfs};
 use crate::descripteurs::Tenu;
 use fichiers::chemins::Depart;
 use fichiers::montages::{Creation, Modification, Objet, en_tmpfs};
@@ -70,11 +101,18 @@ const MODULE: &str = "wasi_snapshot_preview1";
 // la liste de wasi_snapshot_preview1).
 const SUCCES: u32 = 0;
 const EACCES: u32 = 2;
+const EADDRINUSE: u32 = 3;
+const EADDRNOTAVAIL: u32 = 4;
+const EAGAIN: u32 = 6;
 const EBADF: u32 = 8;
 const EBUSY: u32 = 10;
+const ECONNABORTED: u32 = 13;
+const ECONNREFUSED: u32 = 14;
+const ECONNRESET: u32 = 15;
 const EEXIST: u32 = 20;
 const EFAULT: u32 = 21;
 const EFBIG: u32 = 22;
+const EHOSTUNREACH: u32 = 23;
 const EINTR: u32 = 27;
 const EINVAL: u32 = 28;
 const EIO: u32 = 29;
@@ -82,16 +120,25 @@ const EISDIR: u32 = 31;
 const ELOOP: u32 = 32;
 const EMFILE: u32 = 33;
 const EMLINK: u32 = 34;
+const EMSGSIZE: u32 = 35;
 const ENAMETOOLONG: u32 = 37;
+const ENETDOWN: u32 = 38;
+const ENETUNREACH: u32 = 40;
+const ENFILE: u32 = 41;
+const ENOBUFS: u32 = 42;
 const ENOENT: u32 = 44;
 const ENOMEM: u32 = 48;
 const ENOSPC: u32 = 51;
+const ENOTCONN: u32 = 53;
 const ENOTDIR: u32 = 54;
 const ENOTEMPTY: u32 = 55;
+const ENOTSOCK: u32 = 57;
 const ENOTSUP: u32 = 58;
 const ENXIO: u32 = 60;
 const EPERM: u32 = 63;
+const EPIPE: u32 = 64;
 const ESPIPE: u32 = 70;
+const ETIMEDOUT: u32 = 73;
 const ETXTBSY: u32 = 74;
 
 /// Une erreur du système de fichiers, en errno de WASI. Sortir du dossier
@@ -119,6 +166,51 @@ fn errno(e: Erreur) -> u32 {
     }
 }
 
+/// Une erreur d'une socket (l'errno de Linux, négatif, que rendent
+/// reseau/tcp.rs et appels_reseau.rs), en errno de WASI : les mêmes noms,
+/// numérotés autrement. ERESTARTSYS (une attente interrompue : la tâche
+/// qu'on arrête, un programme WebAssembly n'a pas de signaux) : EINTR.
+/// Toutes les erreurs que rendent nos sockets TCP ; une autre (il n'y en a
+/// pas aujourd'hui) : EIO.
+fn errno_reseau(e: i64) -> u32 {
+    const EAFNOSUPPORT_: u32 = 5;
+    const EALREADY_: u32 = 7;
+    const EINPROGRESS_: u32 = 26;
+    const EISCONN_: u32 = 30;
+    match -e {
+        1 => EPERM,
+        88 => ENOTSOCK,
+        97 => EAFNOSUPPORT_,
+        106 => EISCONN_,
+        114 => EALREADY_,
+        115 => EINPROGRESS_,
+        4 | 512 => EINTR,
+        9 => EBADF,
+        11 => EAGAIN,
+        12 => ENOMEM,
+        13 => EACCES,
+        14 => EFAULT,
+        22 => EINVAL,
+        23 => ENFILE,
+        24 => EMFILE,
+        32 => EPIPE,
+        90 => EMSGSIZE,
+        95 => ENOTSUP,
+        98 => EADDRINUSE,
+        99 => EADDRNOTAVAIL,
+        100 => ENETDOWN,
+        101 => ENETUNREACH,
+        103 => ECONNABORTED,
+        104 => ECONNRESET,
+        105 => ENOBUFS,
+        107 => ENOTCONN,
+        110 => ETIMEDOUT,
+        111 => ECONNREFUSED,
+        113 => EHOSTUNREACH,
+        _ => EIO,
+    }
+}
+
 /// Les numéros de nos fonctions hôtes, donnés à `Magasin::ajouter_fonction_hote`.
 const FD_WRITE: u32 = 0;
 const PROC_EXIT: u32 = 1;
@@ -140,6 +232,11 @@ const ENVIRON_SIZES_GET: u32 = 16;
 const ENVIRON_GET: u32 = 17;
 const POLL_ONEOFF: u32 = 18;
 const SCHED_YIELD: u32 = 19;
+const SOCK_ACCEPT: u32 = 20;
+const SOCK_RECV: u32 = 21;
+const SOCK_SEND: u32 = 22;
+const SOCK_SHUTDOWN: u32 = 23;
+const FD_FDSTAT_SET_FLAGS: u32 = 24;
 
 /// Le plus de morceaux qu'un fd_write ou un fd_read peut décrire : l'IOV_MAX
 /// de POSIX, que Linux impose aussi (UIO_MAXIOV). Au-delà : EINVAL.
@@ -153,6 +250,87 @@ const TRANSFERT_MAX: u32 = 1024;
 
 /// Le premier descripteur pré-ouvert (après la console, 0, 1 et 2).
 const PREMIER_PREOUVERT: u64 = 3;
+
+/// Le `backlog` d'une écoute pré-ouverte : 128, celui de la bibliothèque
+/// standard de Rust (`TcpListener::bind`), qui crée celles de wasmtime.
+const BACKLOG: i32 = 128;
+
+/// Les drapeaux d'un fichier ouvert (ceux de Linux, F_GETFL).
+const O_APPEND: u32 = 0o2000;
+const O_NONBLOCK: u32 = 0o4000;
+/// Les `fdflags` de WASI : APPEND, NONBLOCK.
+const FDFLAGS_APPEND: u16 = 1;
+const FDFLAGS_NONBLOCK: u16 = 4;
+
+/// Les écoutes TCP pré-ouvertes d'un programme (les `--tcplisten=` de sa
+/// ligne), créées par le lanceur AVANT sa tâche, comme le lanceur de
+/// wasmtime avant d'instancier le module : une adresse prise refuse la
+/// ligne, et la ligne suivante de /etc/demarrage (un client) trouve déjà
+/// l'écoute. Leurs fichiers ouverts, dans l'ordre ; ceux que le programme
+/// n'a pas reçus (sa tâche n'a pas pu partir, ses descripteurs n'ont pas pu
+/// être faits) sont lâchés, et leurs sockets fermées, à la disparition de
+/// `Ecoutes`.
+pub struct Ecoutes(Vec<Fichier>);
+
+impl Ecoutes {
+    pub fn new() -> Ecoutes {
+        Ecoutes(Vec::new())
+    }
+
+    /// Ajoute l'écoute de `adresse`:`port` pour le programme `qui` : une
+    /// socket TCP à lui, liée, qui écoute, dans un fichier ouvert NON
+    /// BLOQUANT, comme celles du lanceur de wasmtime (`set_nonblocking(true)` :
+    /// un programme attend un client par poll_oneoff, puis l'accepte ; il
+    /// peut la rendre bloquante, `fd_fdstat_set_flags`, comme le font mio et
+    /// tokio pour leurs propres réglages). L'errno de Linux sinon (les
+    /// refus de `bind` et `listen` : EADDRINUSE, EADDRNOTAVAIL, EACCES pour
+    /// un port sous 1024...), et rien ne reste.
+    pub fn ouvrir(&mut self, qui: Identite, adresse: [u8; 4], port: u16) -> Result<(), i64> {
+        const ENOMEM_: i64 = 12;
+        const ENFILE_: i64 = 23;
+        const ENOBUFS_: i64 = 105;
+        self.0.try_reserve(1).map_err(|_| -ENOMEM_)?;
+        let place = ArcVide::new().map_err(|_| -ENFILE_)?;
+        let s = Socket::new(Protocole::Tcp, tcp::SOCK_STREAM as u16, tcp::IPPROTO_TCP as u16, qui.uid).tcp().ok_or(-ENOBUFS_)?;
+        let s = place.remplir(s);
+        // Liée, la socket est dans la table des ports : un refus doit la
+        // fermer, pour qu'elle en sorte.
+        let ecoute = tcp::lier(&s, &socket::sockaddr_in(adresse, port))
+            .and_then(|()| tcp::ecouter(&s, BACKLOG))
+            .and_then(|()| appels_reseau::fichier_de_socket(s.clone(), qui, true));
+        let f = match ecoute {
+            Ok(f) => f,
+            Err(e) => {
+                socket::fermer(&s);
+                return Err(e);
+            }
+        };
+        match vfs::avec_systeme(|sys, _| sys.ouverts.ajouter(f)) {
+            Ok(fichier) => {
+                self.0.ajouter_dans_la_place(fichier);
+                Ok(())
+            }
+            Err(f) => {
+                if let Tenu::Tmpfs(o) = f.tenu {
+                    vfs::avec(|fs, cadres| fs.fermer(&o, cadres));
+                }
+                socket::fermer(&s);
+                Err(-ENOMEM_)
+            }
+        }
+    }
+}
+
+impl Drop for Ecoutes {
+    /// Les écoutes que le programme n'a pas reçues : leurs fichiers lâchés
+    /// (le dernier `close`), leurs sockets fermées tout de suite.
+    fn drop(&mut self) {
+        for f in self.0.drain(..) {
+            vfs::avec_systeme(|s, cadres| s.lacher(f, cadres));
+        }
+        socket::fermer_les_differees();
+    }
+}
 
 /// Un dossier pré-ouvert : son descripteur, et le nom que voit le
 /// programme (le chemin donné à `--dir=`).
@@ -194,10 +372,11 @@ fn a_la_suite(chaines: &[&[u8]]) -> Result<(Vec<u8>, u32), Erreur> {
 impl Wasi {
     /// Un hôte neuf pour l'identité `identite` : la console en 0, 1 et 2,
     /// puis les `dossiers` pré-ouverts en 3, 4... (ouverts avec ses droits :
-    /// il doit pouvoir les traverser et les lire), ses `arguments` et son
-    /// `environnement`. En cas d'échec, l'erreur, et le dossier en cause
-    /// (aucun pour la console ou la mémoire) ; rien ne reste ouvert.
-    pub fn new<'a>(identite: Identite, dossiers: &[&'a [u8]], arguments: &[&[u8]], environnement: &[&[u8]])
+    /// il doit pouvoir les traverser et les lire), puis ses `ecoutes`, ses
+    /// `arguments` et son `environnement`. En cas d'échec, l'erreur, et le
+    /// dossier en cause (aucun pour la console ou la mémoire) ; rien ne
+    /// reste ouvert.
+    pub fn new<'a>(identite: Identite, dossiers: &[&'a [u8]], mut ecoutes: Ecoutes, arguments: &[&[u8]], environnement: &[&[u8]])
         -> Result<Wasi, (Erreur, Option<&'a [u8]>)> {
         // Les chaînes d'abord : rien n'est encore ouvert si la place
         // manque (Descripteurs ne ferme rien en disparaissant).
@@ -222,6 +401,17 @@ impl Wasi {
                 return Err((Erreur::ENOMEM, None));
             }
             wasi.preouverts.ajouter(Preouvert { fd, nom }).map_err(|_| (Erreur::ENOMEM, None))?;
+        }
+        // Les écoutes, après les dossiers : prises de la fin, chacune à son
+        // numéro ; celles qui restent si l'une échoue sont lâchées avec
+        // `ecoutes`, celles qui sont rangées avec `wasi`.
+        let premiere = PREMIER_PREOUVERT + dossiers.len() as u64;
+        while let Some(f) = ecoutes.0.pop() {
+            let fd = premiere + ecoutes.0.len() as u64;
+            if wasi.descripteurs.remplacer(fd, Descripteur { fichier: f, fermer_a_l_exec: false }).is_err() {
+                vfs::avec_systeme(|s, cadres| s.lacher(f, cadres));
+                return Err((Erreur::ENOMEM, None));
+            }
         }
         Ok(wasi)
     }
@@ -292,6 +482,8 @@ pub fn imports<'a>(magasin: &mut Magasin, module: &'a ModuleValide) -> Result<Ve
             "path_open" => (PATH_OPEN, &[I32, I32, I32, I32, I32, I64, I64, I32, I32], &[I32]),
             // fd_fdstat_get(fichier, fdstat) -> errno
             "fd_fdstat_get" => (FD_FDSTAT_GET, &[I32, I32], &[I32]),
+            // fd_fdstat_set_flags(fichier, fdflags) -> errno
+            "fd_fdstat_set_flags" => (FD_FDSTAT_SET_FLAGS, &[I32, I32], &[I32]),
             // fd_filestat_get(fichier, filestat) -> errno
             "fd_filestat_get" => (FD_FILESTAT_GET, &[I32, I32], &[I32]),
             // path_filestat_get(dossier, drapeaux, chemin, longueur, filestat) -> errno
@@ -312,6 +504,14 @@ pub fn imports<'a>(magasin: &mut Magasin, module: &'a ModuleValide) -> Result<Ve
             "poll_oneoff" => (POLL_ONEOFF, &[I32, I32, I32, I32], &[I32]),
             // sched_yield() -> errno
             "sched_yield" => (SCHED_YIELD, &[], &[I32]),
+            // sock_accept(ecoute, fdflags, fichier) -> errno
+            "sock_accept" => (SOCK_ACCEPT, &[I32, I32, I32], &[I32]),
+            // sock_recv(socket, morceaux, nombre, riflags, recus, roflags) -> errno
+            "sock_recv" => (SOCK_RECV, &[I32, I32, I32, I32, I32, I32], &[I32]),
+            // sock_send(socket, morceaux, nombre, siflags, envoyes) -> errno
+            "sock_send" => (SOCK_SEND, &[I32, I32, I32, I32, I32], &[I32]),
+            // sock_shutdown(socket, sdflags) -> errno
+            "sock_shutdown" => (SOCK_SHUTDOWN, &[I32, I32], &[I32]),
             // proc_exit(code)
             "proc_exit" => (PROC_EXIT, &[I32], &[]),
             _ => return Err(inconnu),
@@ -377,6 +577,11 @@ impl Hote for Wasi {
             ARGS_GET => chaines(&self.arguments, a(0), a(1), m, cout),
             ENVIRON_SIZES_GET => tailles(&self.environnement, a(0), a(1), m),
             ENVIRON_GET => chaines(&self.environnement, a(0), a(1), m, cout),
+            SOCK_ACCEPT => self.sock_accept(a(0), a(1), a(2), m),
+            SOCK_RECV => self.sock_recv(a(0), a(1), a(2), a(3), a(4), a(5), m, cout),
+            SOCK_SEND => self.sock_send(a(0), a(1), a(2), a(3), a(4), m, cout),
+            SOCK_SHUTDOWN => self.sock_shutdown(a(0), a(1)),
+            FD_FDSTAT_SET_FLAGS => self.fd_fdstat_set_flags(a(0), a(1)),
             _ => unreachable!("fonction hote inconnue"),
         };
         // Les sockets dont l'appel a fait le dernier `close` (comme à la
@@ -452,6 +657,100 @@ fn morceau(memoire: &[u8], morceaux: u32, i: u32) -> Option<(u32, u32)> {
     Some((adresse, longueur))
 }
 
+/// Les `nombre` morceaux décrits à `morceaux`, copiés d'abord (comme
+/// l'`import_iovec` de Linux : ce que la réception écrira ne peut plus les
+/// changer), chacun dans la mémoire : EINVAL au-delà de MORCEAUX_MAX,
+/// EFAULT, ENOMEM.
+fn lire_morceaux(m: &[u8], morceaux: u32, nombre: u32) -> Result<Vec<(u32, u32)>, u32> {
+    if nombre > MORCEAUX_MAX {
+        return Err(EINVAL);
+    }
+    let mut v = faillible::avec_capacite(nombre as usize).map_err(|_| ENOMEM)?;
+    for i in 0..nombre {
+        v.ajouter_dans_la_place(morceau(m, morceaux, i).ok_or(EFAULT)?);
+    }
+    Ok(v)
+}
+
+/// Copie `octets` dans les morceaux `v` (déjà vérifiés), à partir de
+/// l'octet `decalage` de leur suite.
+fn vers_morceaux(m: &mut [u8], v: &[(u32, u32)], mut decalage: usize, octets: &[u8]) {
+    let mut fait = 0;
+    for &(adresse, longueur) in v {
+        let longueur = longueur as usize;
+        if decalage >= longueur {
+            decalage -= longueur;
+            continue;
+        }
+        let n = (longueur - decalage).min(octets.len() - fait);
+        if let Some(d) = plage_mut(m, adresse + decalage as u32, n as u32) {
+            d.copy_from_slice(&octets[fait..fait + n]);
+        }
+        fait += n;
+        decalage = 0;
+        if fait == octets.len() {
+            return;
+        }
+    }
+}
+
+/// Remplit `destination` des octets des morceaux `v` (déjà vérifiés), à
+/// partir de l'octet `decalage` de leur suite.
+fn des_morceaux(m: &[u8], v: &[(u32, u32)], mut decalage: usize, destination: &mut [u8]) {
+    let mut fait = 0;
+    for &(adresse, longueur) in v {
+        let longueur = longueur as usize;
+        if decalage >= longueur {
+            decalage -= longueur;
+            continue;
+        }
+        let n = (longueur - decalage).min(destination.len() - fait);
+        if let Some(o) = plage(m, adresse + decalage as u32, n as u32) {
+            destination[fait..fait + n].copy_from_slice(o);
+        }
+        fait += n;
+        decalage = 0;
+        if fait == destination.len() {
+            return;
+        }
+    }
+}
+
+/// Reçoit d'une socket TCP dans les morceaux `v`, avec les drapeaux de
+/// `recvmsg` (MSG_PEEK, MSG_WAITALL), sans attendre si son fichier est
+/// NONBLOCK (EAGAIN) : le nombre d'octets reçus, compté en carburant. Au
+/// plus TRANSFERT_MAX octets, sauf MSG_WAITALL (voir `sock_recv`).
+fn recevoir(o: &FichierTenu, v: &[(u32, u32)], m: &mut [u8], drapeaux: u64, cout: &mut u64) -> Result<u32, u32> {
+    const MSG_WAITALL: u64 = 0x100;
+    let place: usize = v.iter().map(|&(_, l)| l as usize).sum();
+    let longueur = if drapeaux & MSG_WAITALL != 0 { place } else { place.min(TRANSFERT_MAX as usize) };
+    let n = tcp::recevoir_programme(o.socket(), longueur, drapeaux, o.drapeaux & O_NONBLOCK != 0, |decalage, octets| {
+        vers_morceaux(m, v, decalage, octets);
+        Ok(octets.len())
+    })
+    .map_err(errno_reseau)?;
+    *cout += n as u64 + v.len() as u64;
+    Ok(n as u32)
+}
+
+/// Envoie les morceaux `v` par une socket TCP, au plus TRANSFERT_MAX octets,
+/// sans attendre la place si son fichier est NONBLOCK (MSG_DONTWAIT :
+/// EAGAIN si rien n'est parti) : le nombre d'octets envoyés, compté en
+/// carburant.
+fn envoyer(o: &FichierTenu, v: &[(u32, u32)], m: &[u8], cout: &mut u64) -> Result<u32, u32> {
+    const MSG_DONTWAIT: u64 = 0x40;
+    let place: usize = v.iter().map(|&(_, l)| l as usize).sum();
+    let longueur = place.min(TRANSFERT_MAX as usize);
+    let drapeaux = if o.drapeaux & O_NONBLOCK != 0 { MSG_DONTWAIT } else { 0 };
+    let n = tcp::envoyer(o.socket(), longueur, drapeaux, |decalage, d| {
+        des_morceaux(m, v, decalage, d);
+        Ok(())
+    })
+    .map_err(errno_reseau)?;
+    *cout += n as u64 + v.len() as u64;
+    Ok(n as u32)
+}
+
 /// Le chemin à `adresse` dans la mémoire du programme (WASI le donne avec
 /// sa longueur, sans zéro final).
 fn chemin(memoire: &[u8], adresse: u32, longueur: u32) -> Result<Vec<u8>, u32> {
@@ -464,14 +763,19 @@ const TYPE_INCONNU: u8 = 0;
 const TYPE_CARACTERE: u8 = 2;
 const TYPE_DOSSIER: u8 = 3;
 const TYPE_FICHIER: u8 = 4;
+const TYPE_SOCKET_STREAM: u8 = 6;
 const TYPE_LIEN: u8 = 7;
 
+/// Le type WASI d'un mode. Une socket : SOCKET_STREAM, la seule sorte de
+/// socket d'un programme WebAssembly (TCP), et ce que rend wasmtime pour
+/// un fichier de socket (AF_UNIX) dans un dossier.
 fn type_wasi(mode: u32) -> u8 {
     match mode & S_IFMT {
         S_IFDIR => TYPE_DOSSIER,
         S_IFLNK => TYPE_LIEN,
         S_IFCHR => TYPE_CARACTERE,
         fichiers::S_IFREG => TYPE_FICHIER,
+        fichiers::S_IFSOCK => TYPE_SOCKET_STREAM,
         _ => TYPE_INCONNU,
     }
 }
@@ -562,19 +866,19 @@ impl Wasi {
     /// `evenements` (32 octets chacun), leur nombre à `publies`. Comme
     /// wasmtime : aucun abonnement, EINVAL ; une horloge inconnue (seules
     /// celles de la date et du temps monotone ont une échéance), EINVAL.
-    /// Un abonnement à un descripteur (lire, écrire) est prêt tout de suite :
-    /// nos programmes WebAssembly n'ont que des fichiers, des dossiers et la
-    /// console, qui n'attendent jamais. S'il y en a un, rien n'attend ;
-    /// sinon le programme dort jusqu'à la première échéance. Puis tout ce
-    /// qui est prêt est publié : les descripteurs, et les horloges échues
-    /// (une échéance nulle ou passée l'est même à côté d'un descripteur).
-    /// Tout est vérifié avant d'attendre. Deux écarts voulus avec le
+    /// Tout est vérifié avant d'attendre. Puis l'attente de `poll` (le
+    /// `do_poll` de sondage.rs, sa table et ses entrées) : jusqu'à ce qu'un
+    /// abonnement soit prêt, ou la première échéance. Un fichier, un
+    /// dossier, la console sont toujours prêts ; une socket (6h), quand
+    /// `poll` le dirait (`evenement`). Tout ce qui est prêt est publié : les
+    /// descripteurs, et les horloges échues (une échéance nulle ou passée
+    /// l'est même à côté d'un descripteur). Deux écarts voulus avec le
     /// wasmtime d'aujourd'hui (p1.rs), qui fait échouer tout l'appel pour un
     /// mauvais descripteur (EBADF) et annonce 1 octet à lire : ce que dit la
     /// spécification (l'`error` d'un événement), et ce que faisait l'ancien
     /// wasi-common de wasmtime ; un descripteur qui n'est pas à lui, ou un
     /// dossier : l'événement porte EBADF ; lire un fichier : combien
-    /// d'octets restent (`nbytes`).
+    /// d'octets restent (`nbytes`) ; une socket : combien sont arrivés.
     fn poll_oneoff(&self, entree: u32, sortie: u32, nombre: u32, publies: u32, m: &mut [u8], cout: &mut u64) -> u32 {
         if nombre == 0 {
             return EINVAL;
@@ -587,10 +891,8 @@ impl Wasi {
             return EFAULT;
         };
         *cout += nombre as u64;
-        // La première échéance, et s'il y a un descripteur (prêt tout de
-        // suite).
+        // Les horloges, et la première échéance.
         let (maintenant, reel) = (temps::ns_monotone(), nanosecondes(temps::maintenant()));
-        let mut prets = false;
         let mut premiere: Option<u64> = None;
         for i in 0..nombre {
             let a = abonnement(m, entree, i);
@@ -599,44 +901,29 @@ impl Wasi {
                     let Some(e) = echeance(&a, maintenant, reel) else { return EINVAL };
                     premiere = Some(premiere.map_or(e, |p| p.min(e)));
                 }
-                LECTURE | ECRITURE => prets = true,
+                LECTURE | ECRITURE => {}
                 _ => return EINVAL,
             }
         }
-        if !prets && let Some(e) = premiere {
-            let interruptions = crate::cpu::couper_interruptions();
-            while temps::ns_monotone() < e {
-                crate::attente::dormir(Some(e), crate::attente::Sommeil::Ininterruptible);
-            }
-            if interruptions {
-                crate::cpu::activer_interruptions();
-            }
+        // Attendre que l'un soit prêt : chaque tour les regarde tous (le
+        // premier inscrit la tâche dans la file de chaque socket).
+        let delai = premiere.map_or(Delai::Infini, Delai::Jusqua);
+        let attente = sondage::attendre_prets(delai, |table| {
+            (0..nombre).filter(|&i| self.evenement(&abonnement(m, entree, i), maintenant, reel, table).is_some()).count()
+        });
+        match attente {
+            Ok(_) => {}
+            // La place des entrées de sondage a manqué.
+            Err(-12) => return ENOMEM,
+            // La tâche est arrêtée (ERESTARTNOHAND : elle n'a pas de signal
+            // à recevoir, seulement sa fin).
+            Err(_) => return EINTR,
         }
-        // Les événements : les descripteurs, ou les horloges échues.
-        let apres = temps::ns_monotone();
+        // Les événements : ce qui est prêt maintenant.
         let mut n = 0u32;
         for i in 0..nombre {
             let a = abonnement(m, entree, i);
-            let mut e = [0u8; 32];
-            e[..8].copy_from_slice(&a[..8]);
-            e[10] = a[8];
-            let publier = if a[8] == HORLOGE {
-                echeance(&a, maintenant, reel).is_some_and(|x| x <= apres)
-            } else {
-                let fd = u32::from_le_bytes([a[16], a[17], a[18], a[19]]);
-                let (erreur, restant) = match self.ouvert(fd) {
-                    Ok((_, Sorte::Fichier, objet, _, _, _, position)) if a[8] == LECTURE => {
-                        let taille = objet.tmpfs().map_or(0, |n| vfs::avec(|fs, _| fs.attributs(n).taille));
-                        (0u16, taille.saturating_sub(position))
-                    }
-                    Ok((_, Sorte::Dossier | Sorte::Chemin, ..)) | Err(_) => (EBADF as u16, 0),
-                    Ok(_) => (0, 0),
-                };
-                e[8..10].copy_from_slice(&erreur.to_le_bytes());
-                e[16..24].copy_from_slice(&restant.to_le_bytes());
-                true
-            };
-            if publier {
+            if let Some(e) = self.evenement(&a, maintenant, reel, &mut Table::new(None)) {
                 let _ = ecrire(m, sortie + n * EVENEMENT, &e);
                 n += 1;
             }
@@ -645,6 +932,74 @@ impl Wasi {
             Ok(()) => SUCCES,
             Err(e) => e,
         }
+    }
+
+    /// L'événement de l'abonnement `a` s'il est arrivé (son `event`, 32
+    /// octets), None sinon, en inscrivant par `table` la tâche dans la file
+    /// d'une socket. Une horloge : son échéance passée. Un descripteur :
+    /// celui d'une socket, quand son sondage le dit (lire : POLLIN, avec ce
+    /// qui est arrivé, FIONREAD ; écrire : POLLOUT ; puis POLLHUP, prêt avec
+    /// FD_READWRITE_HANGUP, comme l'ancien wasi-common ; POLLERR seul :
+    /// l'erreur EIO, que lire ou écrire précisera) ; un autre, tout de
+    /// suite.
+    fn evenement(&self, a: &[u8; 48], maintenant: u64, reel: u64, table: &mut Table) -> Option<[u8; 32]> {
+        /// `eventrwflags` : l'autre bout a raccroché.
+        const RACCROCHE: u16 = 1;
+        let mut e = [0u8; 32];
+        e[..8].copy_from_slice(&a[..8]);
+        e[10] = a[8];
+        if a[8] == HORLOGE {
+            return echeance(a, maintenant, reel).filter(|&x| x <= temps::ns_monotone()).map(|_| e);
+        }
+        let fd = u32::from_le_bytes([a[16], a[17], a[18], a[19]]);
+        let (erreur, octets, drapeaux) = match self.ouvert(fd) {
+            Ok((_, Sorte::Socket, ..)) => {
+                let o = self.tenir(fd).ok()?;
+                let voulu = if a[8] == LECTURE { POLLIN } else { POLLOUT };
+                table.changer_cle(voulu | POLLERR | POLLHUP);
+                let masque = sondage::sonder(&o, table);
+                let raccroche = if masque & POLLHUP != 0 { RACCROCHE } else { 0 };
+                if masque & voulu != 0 {
+                    let arrives = if a[8] == LECTURE { tcp::files(o.socket()).map_or(0, |f| f.0) } else { 0 };
+                    (0u16, arrives as u64, raccroche)
+                } else if raccroche != 0 {
+                    (0, 0, raccroche)
+                } else if masque & POLLERR != 0 {
+                    (EIO as u16, 0, 0)
+                } else {
+                    return None;
+                }
+            }
+            Ok((_, Sorte::Fichier, objet, _, _, _, position)) if a[8] == LECTURE => {
+                let taille = objet.tmpfs().map_or(0, |n| vfs::avec(|fs, _| fs.attributs(n).taille));
+                (0, taille.saturating_sub(position), 0)
+            }
+            Ok((_, Sorte::Dossier | Sorte::Chemin, ..)) | Err(_) => (EBADF as u16, 0, 0),
+            Ok(_) => (0, 0, 0),
+        };
+        e[8..10].copy_from_slice(&erreur.to_le_bytes());
+        e[16..24].copy_from_slice(&octets.to_le_bytes());
+        e[24..26].copy_from_slice(&drapeaux.to_le_bytes());
+        Some(e)
+    }
+
+    /// Le fichier du descripteur `fd`, tenu (comme `appels_fichiers::tenir`
+    /// pour un programme Linux) : ce qu'il faut pour une socket, son objet
+    /// et ses drapeaux.
+    fn tenir(&self, fd: u32) -> Result<FichierTenu, u32> {
+        let d = self.descripteurs.get(fd as u64).ok_or(EBADF)?;
+        Ok(vfs::avec_systeme(|s, _| appels_fichiers::tenir_ouvert(s, d.fichier)))
+    }
+
+    /// La socket TCP du descripteur `fd` : EBADF (pas de descripteur),
+    /// ENOTSOCK (un autre fichier). (Un programme WebAssembly n'a que des
+    /// sockets TCP : ses écoutes, et ce qu'il y accepte.)
+    fn socket(&self, fd: u32) -> Result<FichierTenu, u32> {
+        let o = self.tenir(fd)?;
+        if o.sorte != Sorte::Socket || o.socket().protocole != Protocole::Tcp {
+            return Err(ENOTSOCK);
+        }
+        Ok(o)
     }
 
     /// Le fichier ouvert du descripteur `fd`, et ce qu'il faut en savoir. Sans
@@ -681,7 +1036,18 @@ impl Wasi {
         if (0..nombre).any(|i| morceau(m, morceaux, i).is_none()) || plage(m, total, 4).is_none() {
             return EFAULT;
         }
-        const O_APPEND: u32 = 0o2000;
+        if sorte == Sorte::Socket {
+            // Une socket (6h) : lire et écrire, c'est recevoir et envoyer
+            // sans drapeaux, comme read et write sur une socket Linux.
+            let r = self.socket(fd).and_then(|o| {
+                let v = lire_morceaux(m, morceaux, nombre)?;
+                if ecriture { envoyer(&o, &v, m, cout) } else { recevoir(&o, &v, m, 0, cout) }
+            });
+            return match r.and_then(|n| ecrire(m, total, &n.to_le_bytes())) {
+                Ok(()) => SUCCES,
+                Err(e) => e,
+            };
+        }
         // Le verrou d'écriture de l'inode, comme pour un programme Linux
         // (appels_fichiers.rs) : la fin lue et l'écriture ne se séparent pas.
         let _ecriture = (ecriture && sorte == Sorte::Fichier).then(|| crate::appels_fichiers::verrou_d_ecriture(n()));
@@ -737,8 +1103,8 @@ impl Wasi {
                 }
                 (Sorte::Dossier, _) => Err(EISDIR),
                 // Un programme WebAssembly n'a ni eventfd, ni epoll, ni
-                // tube, ni socket (6g : WASI n'en a que de pré-ouvertes, à
-                // venir avec TCP) : ce descripteur ne peut pas être à lui.
+                // tube : ce descripteur ne peut pas être à lui (une socket
+                // est passée plus haut).
                 (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket, _) => Err(EBADF),
                 // Un fichier de /proc ou de /sys : son contenu fabriqué à la
                 // lecture, comme pour un programme Linux (seule une mémoire
@@ -778,14 +1144,15 @@ impl Wasi {
     }
 
     /// fd_seek(fd, décalage, d'où, nouvelle) et fd_tell : SET (0), CUR (1),
-    /// END (2) ; une position négative : EINVAL ; la console : ESPIPE.
+    /// END (2) ; une position négative : EINVAL ; la console, une socket :
+    /// ESPIPE.
     fn fd_seek(&mut self, fd: u32, decalage: i64, depuis: u32, adresse: u32, m: &mut [u8]) -> u32 {
         let (d, sorte, objet, _, _, _, position) = match self.ouvert(fd) {
             Ok(o) => o,
             Err(e) => return e,
         };
         let base = match (sorte, depuis) {
-            (Sorte::Console, _) => return ESPIPE,
+            (Sorte::Console | Sorte::Socket, _) => return ESPIPE,
             (Sorte::Chemin, _) => return EBADF,
             (_, 0) => 0,
             (_, 1) => position as i64,
@@ -798,6 +1165,145 @@ impl Wasi {
         }
         vfs::avec_systeme(|s, _| s.ouverts.fichier(d.fichier).position = nouvelle as u64);
         SUCCES
+    }
+
+    /// sock_accept(écoute, fdflags, fichier) : une connexion de l'écoute,
+    /// dans un descripteur neuf (le plus petit libre), NON BLOQUANT si
+    /// `fdflags` le demande, son numéro écrit à `fichier`. Comme l'ancien
+    /// wasi-common de wasmtime : d'autres drapeaux que NONBLOCK, EINVAL
+    /// (lui acceptait d'abord et perdait la connexion : nous vérifions
+    /// avant) ; une écoute non bloquante sans client : EAGAIN, sinon on
+    /// attend. Une socket qui n'écoute pas : EINVAL (`inet_accept`).
+    /// L'adresse du client n'est pas rendue : preview 1 n'a pas d'adresses.
+    /// Tout ce qui peut échouer passe avant de prendre la connexion
+    /// (l'adresse du résultat, un numéro libre, le fichier de la socket),
+    /// comme le `do_accept` de Linux et notre `accept4` : la connexion reste
+    /// alors dans la file ; après, seule la place de la table des fichiers
+    /// peut manquer, et la connexion est fermée, pas perdue.
+    fn sock_accept(&mut self, fd: u32, fdflags: u32, sortie: u32, m: &mut [u8]) -> u32 {
+        let o = match self.socket(fd) {
+            Ok(o) => o,
+            Err(e) => return e,
+        };
+        if fdflags & !(FDFLAGS_NONBLOCK as u32) != 0 {
+            return EINVAL;
+        }
+        if plage(m, sortie, 4).is_none() {
+            return EFAULT;
+        }
+        let numero = match self.descripteurs.reserver(0) {
+            Ok(n) => n,
+            Err(Refus::PlusDeMemoire) => return ENOMEM,
+            Err(_) => return EMFILE,
+        };
+        let mut f = match appels_reseau::fichier_sans_socket(self.identite, fdflags & FDFLAGS_NONBLOCK as u32 != 0) {
+            Ok(f) => f,
+            Err(e) => {
+                self.descripteurs.liberer(numero);
+                return errno_reseau(e);
+            }
+        };
+        let enfant = match tcp::accepter(o.socket(), o.drapeaux & O_NONBLOCK != 0) {
+            Ok((enfant, _, _)) => enfant,
+            Err(e) => {
+                appels_fichiers::rendre_fichier(f);
+                self.descripteurs.liberer(numero);
+                return errno_reseau(e);
+            }
+        };
+        appels_reseau::attacher(&mut f, enfant.clone());
+        match vfs::avec_systeme(|s, _| s.ouverts.ajouter(f)) {
+            Ok(fichier) => {
+                self.descripteurs.installer(numero, Descripteur { fichier, fermer_a_l_exec: false });
+                let _ = ecrire(m, sortie, &(numero as u32).to_le_bytes());
+                SUCCES
+            }
+            Err(f) => {
+                appels_fichiers::rendre_fichier(f);
+                self.descripteurs.liberer(numero);
+                socket::fermer(&enfant);
+                ENOMEM
+            }
+        }
+    }
+
+    /// sock_recv(socket, morceaux, nombre, riflags, reçus, roflags) :
+    /// recevoir dans les morceaux, comme `recvmsg` : RECV_PEEK (MSG_PEEK)
+    /// laisse les octets, RECV_WAITALL (MSG_WAITALL) attend qu'ils soient
+    /// tous là (moins seulement à la fin du flux, ou sur une erreur, comme
+    /// Linux) ; un autre drapeau : ENOTSUP (wasi-common). Le nombre d'octets
+    /// à `recus`, et `roflags` à 0 (RECV_DATA_TRUNCATED ne concerne que les
+    /// datagrammes). Au plus 1024 octets, comme fd_read, sauf RECV_WAITALL :
+    /// le programme a demandé de tout recevoir, et le recevoir par morceaux
+    /// le lui refuserait ; ce travail reste borné par la place de ses
+    /// morceaux (qui peuvent se recouvrir : au plus 1024 fois sa mémoire) et
+    /// compté en carburant, et l'attente dort entre les arrivées.
+    #[allow(clippy::too_many_arguments)]
+    fn sock_recv(&mut self, fd: u32, morceaux: u32, nombre: u32, riflags: u32, recus: u32, roflags: u32, m: &mut [u8],
+                 cout: &mut u64) -> u32 {
+        const RECV_PEEK: u32 = 1;
+        const RECV_WAITALL: u32 = 2;
+        const MSG_PEEK: u64 = 2;
+        const MSG_WAITALL: u64 = 0x100;
+        let r = self.socket(fd).and_then(|o| {
+            if riflags & !(RECV_PEEK | RECV_WAITALL) != 0 {
+                return Err(ENOTSUP);
+            }
+            let v = lire_morceaux(m, morceaux, nombre)?;
+            if plage(m, recus, 4).is_none() || plage(m, roflags, 2).is_none() {
+                return Err(EFAULT);
+            }
+            let drapeaux = if riflags & RECV_PEEK != 0 { MSG_PEEK } else { 0 } | if riflags & RECV_WAITALL != 0 { MSG_WAITALL } else { 0 };
+            recevoir(&o, &v, m, drapeaux, cout)
+        });
+        match r.and_then(|n| ecrire(m, recus, &n.to_le_bytes())).and_then(|()| ecrire(m, roflags, &0u16.to_le_bytes())) {
+            Ok(()) => SUCCES,
+            Err(e) => e,
+        }
+    }
+
+    /// sock_send(socket, morceaux, nombre, siflags, envoyés) : envoyer les
+    /// morceaux, au plus 1024 octets (comme fd_write : le nombre envoyé le
+    /// dit, le programme recommence avec la suite). `siflags` n'a aucun
+    /// drapeau défini : autre chose que 0, ENOTSUP (wasi-common). Une
+    /// connexion fermée : EPIPE, sans signal (un programme WebAssembly n'en
+    /// a pas ; MSG_NOSIGNAL).
+    #[allow(clippy::too_many_arguments)]
+    fn sock_send(&mut self, fd: u32, morceaux: u32, nombre: u32, siflags: u32, envoyes: u32, m: &mut [u8], cout: &mut u64) -> u32 {
+        let r = self.socket(fd).and_then(|o| {
+            if siflags != 0 {
+                return Err(ENOTSUP);
+            }
+            let v = lire_morceaux(m, morceaux, nombre)?;
+            if plage(m, envoyes, 4).is_none() {
+                return Err(EFAULT);
+            }
+            envoyer(&o, &v, m, cout)
+        });
+        match r.and_then(|n| ecrire(m, envoyes, &n.to_le_bytes())) {
+            Ok(()) => SUCCES,
+            Err(e) => e,
+        }
+    }
+
+    /// sock_shutdown(socket, sdflags) : arrêter la lecture (RD, 1),
+    /// l'écriture (WR, 2 : FIN), ou les deux, comme `shutdown` ; aucun ou un
+    /// autre drapeau : EINVAL (wasi-common) ; pas connectée : ENOTCONN.
+    fn sock_shutdown(&mut self, fd: u32, sdflags: u32) -> u32 {
+        const RD: u32 = 1;
+        const WR: u32 = 2;
+        let o = match self.socket(fd) {
+            Ok(o) => o,
+            Err(e) => return e,
+        };
+        if sdflags == 0 || sdflags & !(RD | WR) != 0 {
+            return EINVAL;
+        }
+        let arret = if sdflags & RD != 0 { socket::ARRET_LECTURE } else { 0 } | if sdflags & WR != 0 { socket::ARRET_ECRITURE } else { 0 };
+        match tcp::arreter(o.socket(), arret) {
+            Ok(()) => SUCCES,
+            Err(e) => errno_reseau(e),
+        }
     }
 
     /// fd_close.
@@ -888,7 +1394,7 @@ impl Wasi {
         };
         let qui = self.identite;
         let maintenant = temps::maintenant();
-        let drapeaux = if fdflags & 1 != 0 { 0o2000 } else { 0 };
+        let drapeaux = if fdflags & FDFLAGS_APPEND as u32 != 0 { O_APPEND } else { 0 };
         let ouvert = vfs::avec_systeme(|s, cadres| {
             let racine = s.racine();
             let depart = Depart { racine, dossier: base, qui, sous: true };
@@ -923,6 +1429,12 @@ impl Wasi {
                 S_IFCHR if a.rdev == vfs::RANDOM => Sorte::Aleatoire { random: true },
                 S_IFCHR if a.rdev == vfs::URANDOM => Sorte::Aleatoire { random: false },
                 S_IFCHR if a.rdev == vfs::FULL => Sorte::Plein,
+                // Un fichier de socket (AF_UNIX) ne s'ouvre pas : ENXIO,
+                // comme pour un programme Linux.
+                fichiers::S_IFSOCK => {
+                    s.fs.fermer(&ouvert, cadres);
+                    return Err(ENXIO);
+                }
                 _ => {
                     s.fs.fermer(&ouvert, cadres);
                     return Err(EIO);
@@ -952,9 +1464,9 @@ impl Wasi {
         }
     }
 
-    /// fd_fdstat_get : le type du fichier, ses drapeaux (APPEND), et ses
-    /// droits : tous, sauf se déplacer pour la console (c'est ce qui dit à
-    /// wasi-libc que c'est un terminal, pour isatty).
+    /// fd_fdstat_get : le type du fichier, ses drapeaux (APPEND, NONBLOCK),
+    /// et ses droits : tous, sauf se déplacer pour la console (c'est ce qui
+    /// dit à wasi-libc que c'est un terminal, pour isatty) et une socket.
     fn fd_fdstat_get(&self, fd: u32, adresse: u32, m: &mut [u8]) -> u32 {
         let (_, sorte, objet, _, _, drapeaux, _) = match self.ouvert(fd) {
             Ok(o) => o,
@@ -963,14 +1475,37 @@ impl Wasi {
         const SE_DEPLACER: u64 = (1 << 2) | (1 << 5); // FD_SEEK, FD_TELL
         let mut s = [0u8; 24];
         s[0] = type_wasi(appels_fichiers::attributs(objet).mode);
-        s[2..4].copy_from_slice(&(if drapeaux & 0o2000 != 0 { 1u16 } else { 0 }).to_le_bytes());
-        let droits = if sorte == Sorte::Console { u64::MAX & !SE_DEPLACER } else { u64::MAX };
+        let fdflags = if drapeaux & O_APPEND != 0 { FDFLAGS_APPEND } else { 0 } | if drapeaux & O_NONBLOCK != 0 { FDFLAGS_NONBLOCK } else { 0 };
+        s[2..4].copy_from_slice(&fdflags.to_le_bytes());
+        let droits = if matches!(sorte, Sorte::Console | Sorte::Socket) { u64::MAX & !SE_DEPLACER } else { u64::MAX };
         s[8..16].copy_from_slice(&droits.to_le_bytes());
         s[16..24].copy_from_slice(&u64::MAX.to_le_bytes());
         match ecrire(m, adresse, &s) {
             Ok(()) => SUCCES,
             Err(e) => e,
         }
+    }
+
+    /// fd_fdstat_set_flags(fichier, fdflags) : APPEND et NONBLOCK, posés ou
+    /// retirés (le F_SETFL de POSIX) ; DSYNC, RSYNC, SYNC : EINVAL, comme
+    /// wasmtime (on ne les change pas après l'ouverture).
+    fn fd_fdstat_set_flags(&mut self, fd: u32, fdflags: u32) -> u32 {
+        const SYNCS: u32 = 2 | 8 | 16;
+        let Some(d) = self.descripteurs.get(fd as u64) else { return EBADF };
+        if fdflags & SYNCS != 0 || fdflags > 0xffff {
+            return EINVAL;
+        }
+        vfs::avec_systeme(|s, _| {
+            let f = s.ouverts.fichier(d.fichier);
+            f.drapeaux &= !(O_APPEND | O_NONBLOCK);
+            if fdflags & FDFLAGS_APPEND as u32 != 0 {
+                f.drapeaux |= O_APPEND;
+            }
+            if fdflags & FDFLAGS_NONBLOCK as u32 != 0 {
+                f.drapeaux |= O_NONBLOCK;
+            }
+        });
+        SUCCES
     }
 
     /// fd_filestat_get : l'objet est tenu par son descripteur.

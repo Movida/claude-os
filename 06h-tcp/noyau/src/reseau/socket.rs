@@ -656,11 +656,18 @@ pub fn fermer_les_differees() {
             *tete = s.suivante.verrouiller().take();
             s
         };
-        match s.protocole {
-            Protocole::Tcp => super::tcp::fermer(&s),
-            Protocole::Unix => super::unix::fermer(&s),
-            _ => super::datagramme::table::retirer(&s),
-        }
+        fermer(&s);
+    }
+}
+
+/// Ferme la socket `s` (le `sock_close`) : à son dernier `close`, ou quand
+/// elle n'a jamais eu de fichier (un `sock_accept` de WASI qui échoue après
+/// avoir pris la connexion, wasi.rs). Sans verrou tenu.
+pub fn fermer(s: &Arc<Socket>) {
+    match s.protocole {
+        Protocole::Tcp => super::tcp::fermer(s),
+        Protocole::Unix => super::unix::fermer(s),
+        _ => super::datagramme::table::retirer(s),
     }
 }
 

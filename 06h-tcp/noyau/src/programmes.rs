@@ -407,11 +407,12 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
         afficherln!("[noyau] {}, ligne {} : refusee : {}", Nom(DEMARRAGE), numero, raison);
         None
     };
-    let (mut environnement, mut arguments, mut dossiers) = (Vec::new(), Vec::new(), Vec::new());
+    let (mut environnement, mut arguments, mut dossiers, mut ecoutes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let place = ENVIRONNEMENT.len() + commande.affectations().count();
     if environnement.try_reserve_exact(place).is_err()
         || arguments.try_reserve_exact(commande.arguments().count()).is_err()
         || dossiers.try_reserve_exact(commande.dossiers().count()).is_err()
+        || ecoutes.try_reserve_exact(commande.ecoutes().count()).is_err()
     {
         return refus(&"plus de memoire");
     }
@@ -429,6 +430,7 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
     }
     commande.arguments().for_each(|a| arguments.ajouter_dans_la_place(a));
     commande.dossiers().for_each(|d| dossiers.ajouter_dans_la_place(d));
+    commande.ecoutes().for_each(|e| ecoutes.ajouter_dans_la_place(e));
     let (n, complet) = match appels_fichiers::trouver_pour(IDENTITE, programme) {
         Ok(n) => n,
         Err(e) => return refus(&format_args!("{} : introuvable (errno {})", Nom(programme), e.errno())),
@@ -439,6 +441,7 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
         arguments: &arguments,
         environnement: &environnement,
         dossiers: &dossiers,
+        ecoutes: &ecoutes,
         fond: commande.arriere_plan(),
     };
     let t = executer(l, numero, n, &lancement);
@@ -470,6 +473,9 @@ struct Lancement<'a> {
     environnement: &'a [&'a [u8]],
     /// Les dossiers pré-ouverts d'un programme WebAssembly.
     dossiers: &'a [&'a [u8]],
+    /// Ses écoutes TCP pré-ouvertes (6h) : l'adresse, le port, et le mot
+    /// `--tcplisten=` tel qu'écrit (pour les messages).
+    ecoutes: &'a [([u8; 4], u16, &'a [u8])],
     /// Lancé par `&` : son entrée standard est /dev/null, comme sous `sh`.
     fond: bool,
 }
@@ -491,9 +497,14 @@ fn executer(l: &mut Lanceur, numero: usize, n: Numero, lancement: &Lancement) ->
     match &signature[..lus] {
         [0, b'a', b's', b'm'] => executer_wasm(l, nom, n, lancement),
         // Les dossiers pré-ouverts sont une affaire de WebAssembly : un
-        // programme Linux voit tout l'arbre, avec ses droits.
+        // programme Linux voit tout l'arbre, avec ses droits. Les écoutes
+        // aussi : un programme Linux crée les siennes.
         [0x7f, b'E', b'L', b'F'] if !lancement.dossiers.is_empty() => {
             afficherln!("[noyau] {}, ligne {} : refusee : --dir= pour un programme Linux", Nom(DEMARRAGE), numero);
+            None
+        }
+        [0x7f, b'E', b'L', b'F'] if !lancement.ecoutes.is_empty() => {
+            afficherln!("[noyau] {}, ligne {} : refusee : --tcplisten= pour un programme Linux", Nom(DEMARRAGE), numero);
             None
         }
         [0x7f, b'E', b'L', b'F'] => executer_elf(l, nom, n, lancement),
@@ -883,11 +894,20 @@ fn executer_wasm(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancemen
     else {
         refus!("[noyau] {} : plus de memoire pour ses arguments", nom);
     };
+    // Ses écoutes, ici, avant sa tâche (wasi::Ecoutes) : la ligne suivante
+    // les trouve déjà. Une écoute impossible refuse la ligne ; celles déjà
+    // ouvertes sont alors fermées (en disparaissant avec `ecoutes`).
+    let mut ecoutes = wasi::Ecoutes::new();
+    for &(adresse, port, mot) in lancement.ecoutes {
+        if let Err(e) = ecoutes.ouvrir(IDENTITE, adresse, port) {
+            refus!("[noyau] {} : --tcplisten={} impossible (errno {})", nom, Nom(mot), -e);
+        }
+    }
     let lancee = tache::lancer_noyau(nom, move || {
         let (Some(a), Some(e), Some(d)) = (tranches(&arguments), tranches(&environnement), tranches(&dossiers)) else {
             return afficherln!("[noyau] {} : plus de memoire pour ses arguments", nom);
         };
-        executer_module(nom, &octets, &a, &e, &d)
+        executer_module(nom, &octets, &a, &e, &d, ecoutes)
     });
     match lancee {
         Some(t) => {
@@ -918,7 +938,8 @@ fn tranches(v: &[Vec<u8>]) -> Option<Vec<&[u8]>> {
 
 /// Le corps d'un programme WebAssembly, dans sa tâche (voir
 /// `executer_wasm`).
-fn executer_module(nom: NomCourt, octets: &[u8], arguments: &[&[u8]], environnement: &[&[u8]], dossiers: &[&[u8]]) {
+fn executer_module(nom: NomCourt, octets: &[u8], arguments: &[&[u8]], environnement: &[&[u8]], dossiers: &[&[u8]],
+                   ecoutes: wasi::Ecoutes) {
     use wasm::{Etat, Externe, Magasin, Piege};
 
     const TRANCHE: u64 = 1000;
@@ -936,9 +957,10 @@ fn executer_module(nom: NomCourt, octets: &[u8], arguments: &[&[u8]], environnem
     // Son budget de mémoire : 16 Mio pour ses tables et sa mémoire, chacune
     // d'au plus 4 Mio (un bloc du tas, voir tas.rs).
     let mut magasin = Magasin::avec_budget(16 << 20);
-    // Ses descripteurs : la console, et les dossiers pré-ouverts de sa
-    // ligne ; ses arguments et son environnement.
-    let mut hote = match wasi::Wasi::new(IDENTITE, dossiers, arguments, environnement) {
+    tache::courante().marquer_webassembly();
+    // Ses descripteurs : la console, les dossiers pré-ouverts de sa ligne et
+    // ses écoutes ; ses arguments et son environnement.
+    let mut hote = match wasi::Wasi::new(IDENTITE, dossiers, ecoutes, arguments, environnement) {
         Ok(h) => h,
         Err((e, Some(dossier))) => {
             return afficherln!("[noyau] {} : --dir={} impossible (errno {})", nom, Nom(dossier), e.errno());

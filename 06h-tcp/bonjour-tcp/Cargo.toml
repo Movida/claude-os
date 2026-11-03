@@ -1,0 +1,23 @@
+# Un serveur TCP en WebAssembly (6h) : écrit en Rust sans bibliothèque
+# standard, compilé en WebAssembly par rustc, il déclare à la main les
+# fonctions de WASI dont il se sert, dont les sockets de preview 1. Le noyau
+# l'embarque et l'exécute (../noyau/src/wasi.rs), sur une écoute que lui
+# ouvre le lanceur (--tcplisten= dans /etc/demarrage).
+[package]
+name = "bonjour-tcp"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# Une bibliothèque « C » : rustc produit alors un module .wasm, avec les
+# fonctions marquées no_mangle pour exports.
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+debug = false
+strip = true

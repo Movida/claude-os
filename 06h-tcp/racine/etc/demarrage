@@ -1,7 +1,8 @@
 # Ce que le noyau lance au démarrage, une commande par ligne, dans l'ordre
 # (voir formats/src/commande.rs : un sous-ensemble strict de la syntaxe de
-# sh, plus --dir= pour les dossiers pré-ouverts d'un programme
-# WebAssembly). Chaque programme par son chemin absolu.
+# sh, plus --dir= et --tcplisten= pour les dossiers et les écoutes
+# pré-ouverts d'un programme WebAssembly). Chaque programme par son chemin
+# absolu.
 
 # Le format natif de l'OS : deux programmes WebAssembly, avec la racine
 # pour dossier pré-ouvert (le second lit et écrit des fichiers, et affiche
@@ -81,6 +82,11 @@ wait
 /bin/tcp
 # Les sockets AF_UNIX (6h).
 /bin/unix
+# Les sockets de WASI (6h) : un serveur WebAssembly sur une écoute que le
+# lanceur lui ouvre, et un client Linux ; ils se parlent par lo.
+--tcplisten=127.0.0.1:8080 /bin/bonjour-tcp.wasm &
+/bin/client-tcp 8080
+wait
 # Le réseau (6g), tel que l'a configuré le DHCP du démarrage : /proc/net,
 # /etc/resolv.conf, un datagramme vers la passerelle.
 /bin/passerelle

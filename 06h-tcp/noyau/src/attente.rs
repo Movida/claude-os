@@ -559,7 +559,10 @@ pub fn tic() {
 /// tâches du noyau (6g : les voisins du réseau, que la tâche du réseau fait
 /// vieillir pendant des dizaines de secondes) ne réveillent pas un programme
 /// ; sans cela, un programme bloqué pour toujours attendrait la prochaine
-/// échéance de la tâche du réseau pour être arrêté. Une réponse du réseau
+/// échéance de la tâche du réseau pour être arrêté. Celles d'un programme
+/// WebAssembly comptent (6h) : il tourne dans une tâche du noyau, mais il
+/// peut, à son échéance, écrire à un programme Linux par une socket (un
+/// serveur qui répond après un poll_oneoff). Une réponse du réseau
 /// le peut aussi : tant qu'une socket liée a quelqu'un dans sa file
 /// d'attente (un `recv`, un `poll`, un epoll qui la surveille) et qu'une
 /// carte a son lien, un datagramme peut encore venir du dehors, et le
@@ -576,7 +579,7 @@ pub fn tic() {
 /// file serait plus juste, à voir quand la boucle de Bun aura des sockets
 /// (6h). Rend vrai s'il a arrêté quelqu'un.
 pub fn detecter_interblocage() -> bool {
-    if MINUTERIES.verrouiller().iter().any(|(_, t)| t.est_programme()) || !ATTENTES_CALCUL.verrouiller().is_empty() {
+    if MINUTERIES.verrouiller().iter().any(|(_, t)| t.est_programme() || t.est_webassembly()) || !ATTENTES_CALCUL.verrouiller().is_empty() {
         return false;
     }
     if crate::reseau::attentes() > 0 && (crate::reseau::interface::une_carte_a_son_lien() || crate::reseau::minuteur_tcp_arme()) {

@@ -53,8 +53,8 @@ rendues et recollees : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 50, liens symboliques 6, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 46 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 52, liens symboliques 6, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 49 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -181,6 +181,16 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] tcp : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] unix : toutes les verifications : ok
 [noyau] unix : termine, code de sortie 0 ; memoire rendue : ok.
+[wasm] bonjour-tcp : ecoute pre-ouverte en 3 : SOCKET_STREAM, non bloquante, pas un dossier : ok
+[wasm] bonjour-tcp : connexion 1 (poll_oneoff, sock_recv, sock_send, sock_shutdown) : recu 'bonjour', rendu 'ruojnob', puis 'merci' apres sock_shutdown : ok
+[wasm] bonjour-tcp : connexion 2 (accept bloquant, fd_read, fd_write) : recu 'Claude Code', rendu 'edoC edualC' : ok
+[wasm] bonjour-tcp : sans client : EAGAIN, et poll_oneoff ne publie que l'horloge : ok
+[wasm] bonjour-tcp : refus : ENOTCONN, ESPIPE, ENOTSOCK, EINVAL : ok
+[noyau] bonjour-tcp.was : termine, code de sortie 0,
+[linux] client-tcp : echange 1 avec bonjour-tcp.wasm : envoye 'bonjour', recu 'ruojnob' : ok
+[linux] client-tcp : echange 2 avec bonjour-tcp.wasm : envoye 'Claude Code', recu 'edoC edualC' : ok
+[linux] client-tcp : les deux echanges : ok
+[noyau] client-tcp : termine, code de sortie 0.
 [linux] passerelle : /proc/net/route comme Linux : ok
 [linux] passerelle : /proc/net/route lu par morceaux : ok
 [linux] passerelle : /etc/resolv.conf -> /proc/net/pnp : ok
