@@ -75,12 +75,14 @@ pub const IPPROTO_MAX: u64 = 263;
 pub const ARRET_LECTURE: u8 = 1;
 pub const ARRET_ECRITURE: u8 = 2;
 
-/// Les tailles des files, comme Linux sur une machine nue : la valeur par
-/// défaut (`rmem_default`, `wmem_default`) et le plafond d'une demande
-/// (`rmem_max`, `wmem_max`), puis le minimum (SOCK_MIN_RCVBUF,
-/// SOCK_MIN_SNDBUF : 2048 et deux fois 2048, plus la taille d'un sk_buff).
+/// Les tailles des files, celles de Linux 6.18 (`sysctl_rmem_max` dans
+/// net/core/sock.c, et mesurées) : la valeur par défaut (`rmem_default`,
+/// `wmem_default`), le plafond d'une demande (`rmem_max`, `wmem_max` : 4 Mio,
+/// qu'un SO_RCVBUF ou un SO_SNDBUF double ensuite), puis le minimum
+/// (SOCK_MIN_RCVBUF, SOCK_MIN_SNDBUF : 2048 et deux fois 2048, plus la taille
+/// d'un sk_buff).
 pub const TAMPON_DEFAUT: u32 = 212_992;
-pub const TAMPON_MAX: u32 = 212_992;
+pub const TAMPON_MAX: u32 = 4 << 20;
 pub const RCVBUF_MIN: u32 = 2304;
 pub const SNDBUF_MIN: u32 = 4608;
 

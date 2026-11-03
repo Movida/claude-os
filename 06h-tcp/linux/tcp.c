@@ -956,8 +956,8 @@ static void info_en_time_wait(void)
 /* L'échelle de fenêtre proposée (`tcp_select_initial_window`) : avec
  * SO_RCVBUF fixé, celle de sa moitié, ilog2 - 15 ; sans, celle de
  * `tcp_rmem[2]`, qui dépend de la mémoire de la machine, et au moins celle
- * de SO_RCVBUF. Linux 6.18 : 5 avec 1 Mio demandé (rmem_max 4 Mio dans WSL),
- * 10 sans ; nous : 2 (rmem_max 208 Kio), 8 sans (2 Gio). */
+ * de SO_RCVBUF. Linux 6.18 : 5 avec 1 Mio demandé (rmem_max vaut 4 Mio), 10
+ * sans sur l'hôte (12 Gio) ; nous, 5 aussi, et 8 sans (2 Gio). */
 static void echelle(void)
 {
     for (int fixe = 0; fixe <= 1; fixe++) {

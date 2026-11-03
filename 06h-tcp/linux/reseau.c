@@ -380,6 +380,20 @@ static void options(void)
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, &v, sizeof v);
     getsockopt(s, SOL_SOCKET, SO_RCVBUF, &v, &l);
     verifier(ok && v == 8000, "SO_RCVBUF et SO_SNDBUF : doubles, au moins 2304 et 4608");
+    /* Le plafond d'une demande : `rmem_max`, 4 Mio dans Linux 6.18. C'est un
+     * réglage : l'hôte le dit dans /proc, s'il l'a changé (ou un noyau plus
+     * ancien, 212 992) ; sans ce fichier, la valeur de la source. */
+    int rmem_max = 4 << 20;
+    FILE *f = fopen("/proc/sys/net/core/rmem_max", "r");
+    if (f) {
+        if (fscanf(f, "%d", &rmem_max) != 1)
+            rmem_max = -1;
+        fclose(f);
+    }
+    v = rmem_max + 4096;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &v, sizeof v);
+    getsockopt(s, SOL_SOCKET, SO_RCVBUF, &v, &l);
+    verifier(v == 2 * rmem_max, "SO_RCVBUF borne par rmem_max, puis double");
     struct timeval tv = { 0, 8000 }, lu;
     l = sizeof lu;
     verifier(setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv) == 0 && getsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &lu, &l) == 0
