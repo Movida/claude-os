@@ -199,6 +199,13 @@ pub fn apres(a: u32, b: u32) -> bool {
     avant(b, a)
 }
 
+/// Un segment de `seq` à `fin_seq` tombe-t-il dans la fenêtre [`debut`, `fin`]
+/// (`tcp_in_window`) ? Ce que regardent une fille et une entrée de TIME_WAIT ;
+/// une connexion a sa règle (`Tcb::acceptable`).
+pub fn dans_la_fenetre(seq: u32, fin_seq: u32, debut: u32, fin: u32) -> bool {
+    seq == debut || (apres(fin_seq, debut) && avant(seq, fin)) || (seq == fin && seq == fin_seq)
+}
+
 /// Les états d'une connexion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Etat {
@@ -1220,17 +1227,86 @@ impl<P: Charge> Tcb<P> {
         self.rcv_bord.wrapping_sub(self.rcv_nxt)
     }
 
-    /// Un segment est-il acceptable (RFC 9293, 3.10.7.4, le tableau des
-    /// quatre cas) ?
-    fn acceptable(&self, seq: u32, longueur: u32) -> bool {
-        let wnd = self.rcv_wnd();
-        let dans = |s: u32| !avant(s, self.rcv_nxt) && avant(s, self.rcv_nxt.wrapping_add(wnd));
-        match (longueur, wnd) {
-            (0, 0) => seq == self.rcv_nxt,
-            (0, _) => dans(seq),
-            (_, 0) => false,
-            _ => dans(seq) || dans(seq.wrapping_add(longueur - 1)),
+    /// Un segment de `seq` à `fin_seq` est-il acceptable (`tcp_sequence`) ?
+    /// Le bord gauche est `rcv_wup`, pas RCV.NXT (l'autre n'a pas encore vu
+    /// l'ACK de ce que nous avons reçu depuis : un RST ou un ACK qu'il envoie
+    /// peut porter ce numéro-là). Linux ne suit pas le tableau de la RFC 9293
+    /// (3.10.7.4) pour le bord droit : un segment à cheval passe, mais
+    /// seulement si la file de réception est vide (sinon, un récepteur lent
+    /// verrait grandir sa mémoire au-delà de ce qu'il a annoncé).
+    fn acceptable(&self, seq: u32, fin_seq: u32) -> bool {
+        if avant(fin_seq, self.ack.rcv_wup) {
+            return false;
         }
+        let bord = self.rcv_nxt.wrapping_add(self.rcv_wnd());
+        !apres(fin_seq, bord) || (!apres(seq, bord) && self.reception.is_empty())
+    }
+
+    /// Un RST au numéro RCV.NXT - 1 vaut aussi après le FIN de l'autre
+    /// (`tcp_reset_check`) : certains systèmes coupent ainsi une connexion,
+    /// un FIN puis un RST du même numéro.
+    fn rst_apres_fin(&self, seq: u32) -> bool {
+        seq == self.rcv_nxt.wrapping_sub(1) && matches!(self.etat, Etat::AttenteFermeture | Etat::DernierAck | Etat::Fermeture)
+    }
+
+    /// Un RST accepté (`tcp_reset`) : l'erreur que voit le programme, comme
+    /// BSD. La connexion se ferme ; ce qui avait été reçu se lit encore.
+    fn reinitialiser(&mut self, e: &mut Effets) {
+        let erreur = if self.etat == Etat::AttenteFermeture { EPIPE } else { ECONNRESET };
+        self.finir(erreur, e);
+    }
+
+    /// Un segment pour une fille encore en SYN_RECEIVED (`tcp_check_req`,
+    /// dans son ordre, qui n'est pas celui d'une connexion). Rend vrai si la
+    /// poignée de main est finie : ce segment la fait entrer dans ESTABLISHED
+    /// et continue comme tout segment.
+    fn verifier_fille(&mut self, t: &Tcp, longueur_charge: u32, maintenant: u64, e: &mut Effets) -> bool {
+        let drapeaux = t.drapeaux & (tcp::RST | tcp::SYN | tcp::ACK);
+        let (syn, fin) = (t.drapeaux & tcp::SYN != 0, t.drapeaux & tcp::FIN != 0);
+        let fin_seq = t.seq.wrapping_add(longueur_charge + u32::from(syn) + u32::from(fin));
+        // Le SYN répété, seul : notre SYN-ACK a dû se perdre. Il repart, le
+        // minuteur repart aussi (« comme une retransmission rapide »), sauf
+        // limite des réponses à ce qui n'a rien à faire ici.
+        if t.seq == self.irs && drapeaux == tcp::SYN {
+            if !self.ack_invalide_limite(maintenant) {
+                self.syn_du = true;
+                self.chrono = None;
+                self.total_retrans += 1;
+                self.armer_rto(maintenant);
+                e.a_emettre = true;
+            }
+            return false;
+        }
+        // Un ACK qui n'acquitte pas notre SYN : pour Linux, le segment repart
+        // vers l'écoute, qui répond RST (sauf à un RST) ; la fille reste.
+        if drapeaux & tcp::ACK != 0 && t.ack != self.iss.wrapping_add(1) {
+            if drapeaux & tcp::RST == 0 {
+                self.rst_du = Some((t.ack, 0, tcp::RST));
+                e.a_emettre = true;
+            }
+            return false;
+        }
+        // Hors de la fenêtre : un ACK (limité, sauf s'il porte des données).
+        if !dans_la_fenetre(t.seq, fin_seq, self.rcv_nxt, self.rcv_nxt.wrapping_add(self.rcv_wnd())) {
+            if drapeaux & tcp::RST == 0 && ((fin_seq != t.seq && !syn) || !self.ack_invalide_limite(maintenant)) {
+                self.ack_maintenant = true;
+                e.a_emettre = true;
+            }
+            return false;
+        }
+        // Le SYN d'origine dans un segment de la fenêtre (un SYN-ACK) ne
+        // compte plus ; un autre SYN, ou un RST, défait la fille : RST
+        // (pas à un RST), sans rien dire à personne.
+        let sans_syn = if t.seq == self.irs { drapeaux & !tcp::SYN } else { drapeaux };
+        if sans_syn & (tcp::RST | tcp::SYN) != 0 {
+            if sans_syn & tcp::RST == 0 {
+                self.rst_du = Some(if drapeaux & tcp::ACK != 0 { (t.ack, 0, tcp::RST) } else { (0, fin_seq, tcp::RST | tcp::ACK) });
+                e.a_emettre = true;
+            }
+            self.passer(Etat::Fermee, e);
+            return false;
+        }
+        sans_syn & tcp::ACK != 0
     }
 
     /// Reçoit le segment `t`, de charge `charge` (vide pour un segment sans
@@ -1308,11 +1384,13 @@ impl<P: Charge> Tcb<P> {
             }
             _ => {}
         }
-        // TIME_WAIT : un FIN retransmis est réacquitté ; un RST l'efface
-        // (`tcp_timewait_state_process`, rfc1337 à 0).
-        // L'ouverture simultanée : en SYN_RECEIVED, le SYN-ACK de l'autre,
-        // qui acquitte notre SYN, vaut un ACK (son SYN déjà reçu est
-        // ignoré : le `goto pass` de `tcp_validate_incoming`).
+        // La fille d'une écoute a ses propres règles jusqu'au troisième ACK.
+        if self.etat == Etat::SynRecu && self.fille && !self.verifier_fille(t, longueur_charge, maintenant, &mut e) {
+            return e;
+        }
+        // L'ouverture simultanée, et la fille : en SYN_RECEIVED, le SYN-ACK
+        // de l'autre, qui acquitte notre SYN, vaut un ACK (son SYN déjà reçu
+        // est ignoré : le `goto pass` de `tcp_validate_incoming`).
         let mut syn = syn;
         let mut seq = t.seq;
         if self.etat == Etat::SynRecu && syn && ack && t.seq.wrapping_add(1) == self.rcv_nxt && t.ack == self.snd_max {
@@ -1326,9 +1404,14 @@ impl<P: Charge> Tcb<P> {
         // pour un segment qui porte des données (sans SYN) : lui ne fait pas
         // partie d'une boucle d'ACK (`tcp_oow_rate_limited`).
         let longueur = longueur_charge + u32::from(syn) + u32::from(fin);
-        if !self.acceptable(seq, longueur) {
-            if !rst {
-                if longueur_charge > 0 && avant(seq, self.rcv_nxt) {
+        let fin_seq = seq.wrapping_add(longueur);
+        if !self.acceptable(seq, fin_seq) {
+            if rst {
+                if self.rst_apres_fin(t.seq) {
+                    self.reinitialiser(&mut e);
+                }
+            } else {
+                if longueur > 0 && !syn && avant(seq, self.rcv_nxt) {
                     self.entrer_mode_rapide();
                 }
                 if (longueur > 0 && !syn) || !self.ack_invalide_limite(maintenant) {
@@ -1341,39 +1424,18 @@ impl<P: Charge> Tcb<P> {
         // 2. RST (RFC 5961 : exactement au bord gauche ; sinon, dans la
         // fenêtre, un ACK « de défi », limité comme ci-dessus).
         if rst {
-            if t.seq != self.rcv_nxt {
-                if !self.ack_invalide_limite(maintenant) {
-                    self.ack_maintenant = true;
-                    e.a_emettre = true;
-                }
-                return e;
-            }
-            let erreur = match self.etat {
-                Etat::SynRecu | Etat::Fermeture | Etat::DernierAck | Etat::TempsAttente => 0,
-                Etat::AttenteFermeture => EPIPE,
-                _ => ECONNRESET,
-            };
-            if self.etat == Etat::SynRecu {
-                // La fille d'une écoute : elle disparaît, sans erreur
-                // (l'écoute ne l'avait pas encore donnée).
-                self.passer(Etat::Fermee, &mut e);
-            } else {
-                self.finir(erreur, &mut e);
-                if erreur == 0 {
-                    self.erreur = 0;
-                }
+            if t.seq == self.rcv_nxt || self.rst_apres_fin(t.seq) {
+                self.reinitialiser(&mut e);
+            } else if !self.ack_invalide_limite(maintenant) {
+                self.ack_maintenant = true;
+                e.a_emettre = true;
             }
             return e;
         }
         // 4. SYN dans une connexion synchronisée : un ACK de défi (RFC 5961,
-        // 4.2) ; en SYN_RECEIVED, un SYN retransmis : notre SYN-ACK repart
-        // (et ne se mesure plus : Karn).
+        // 4.2).
         if syn {
-            if self.etat == Etat::SynRecu && t.seq.wrapping_add(1) == self.rcv_nxt {
-                self.syn_du = true;
-                self.chrono = None;
-                e.a_emettre = true;
-            } else if !self.ack_invalide_limite(maintenant) {
+            if !self.ack_invalide_limite(maintenant) {
                 self.ack_maintenant = true;
                 e.a_emettre = true;
             }
@@ -1419,34 +1481,22 @@ impl<P: Charge> Tcb<P> {
             self.urgent = Urgent::Valide(o);
             e.lisible = true;
         }
-        // 7. Le texte. Pour une lecture fermée, en FIN_WAIT, des données
-        // neuves coupent la connexion : RST, comme BSD et Linux (« RFC 793
-        // says to queue data in these states, RFC 1122 says we MUST send a
-        // reset », `tcp_rcv_state_process`) ; l'autre apprend que ce qu'il
-        // envoie ne sera jamais lu.
-        if self.lecture_fermee
-            && matches!(self.etat, Etat::FinAttente1 | Etat::FinAttente2)
-            && longueur_charge > 0
-            && apres(seq.wrapping_add(longueur_charge), self.rcv_nxt)
-        {
+        // 7. Le texte (`tcp_rcv_state_process`). Après le FIN de l'autre, ce
+        // qui vient de plus loin est ignoré ; un doublon reçoit son ACK, comme
+        // dans les états qui reçoivent encore. Pour une lecture fermée, en
+        // FIN_WAIT, des données neuves coupent la connexion : RST, comme BSD
+        // et Linux (« RFC 793 says to queue data in these states, RFC 1122
+        // says we MUST send a reset ») ; l'autre apprend que ce qu'il envoie
+        // ne sera jamais lu.
+        let recoit = self.etat.recoit() || avant(seq, self.rcv_nxt);
+        if recoit && self.etat != Etat::Etablie && (self.lecture_fermee || self.fin_recue) && longueur > 0 && apres(seq.wrapping_add(longueur_charge), self.rcv_nxt) {
             self.rst_du = Some((t.ack, 0, tcp::RST));
-            self.finir(ECONNRESET, &mut e);
+            self.reinitialiser(&mut e);
             e.a_emettre = true;
             return e;
         }
-        if longueur_charge > 0 && self.etat.recoit() {
-            self.recevoir_donnees(seq, charge, maintenant, &mut e);
-        }
-        // 8. FIN, s'il arrive à son tour ; après un trou, il attend que le
-        // trou se comble.
-        if fin && self.etat.recoit() {
-            let position = seq.wrapping_add(longueur_charge);
-            if position == self.rcv_nxt {
-                self.recevoir_fin(&mut e);
-            } else if apres(position, self.rcv_nxt) {
-                self.fin_hors_ordre = Some(position);
-                self.ack_maintenant = true;
-            }
+        if recoit {
+            self.recevoir_texte(seq, charge, fin, maintenant, &mut e);
         }
         if self.fin_hors_ordre == Some(self.rcv_nxt) && self.etat.recoit() {
             self.fin_hors_ordre = None;
@@ -1822,58 +1872,86 @@ impl<P: Charge> Tcb<P> {
         self.urg_seq = p;
     }
 
-    /// Des données dans un segment acceptable (`tcp_data_queue`).
-    fn recevoir_donnees(&mut self, seq: u32, mut charge: P, maintenant: u64, e: &mut Effets) {
+    /// Le texte d'un segment acceptable, ses données et son FIN
+    /// (`tcp_data_queue`).
+    fn recevoir_texte(&mut self, seq: u32, mut charge: P, fin: bool, maintenant: u64, e: &mut Effets) {
         let n = charge.octets().len() as u32;
-        if !apres(seq.wrapping_add(n), self.rcv_nxt) {
-            // Déjà reçues : l'autre n'a pas eu notre ACK. Un ACK tout de
-            // suite, et le mode « quickack ».
-            self.entrer_mode_rapide();
-            self.ack_maintenant = true;
+        let fin_seq = seq.wrapping_add(n + u32::from(fin));
+        if fin_seq == seq {
             return;
         }
-        if apres(seq, self.rcv_nxt) {
-            // Un trou devant : la file hors d'ordre ; l'ACK dupliqué part
-            // tout de suite (il dit le trou à l'émetteur).
-            // La même borne que dans l'ordre (plus bas) ; au-delà, jeté ; et
-            // rien au-delà de la limite de toute la machine.
+        let wnd = self.rcv_wnd();
+        if seq == self.rcv_nxt {
+            // Dans l'ordre. Une fenêtre fermée ne laisse passer qu'un FIN
+            // seul (« Some stacks are known to send bare FIN packets in a
+            // loop even if we send RWIN 0 »).
+            if wnd == 0 && !(n == 0 && fin) {
+                self.hors_fenetre();
+                return;
+            }
+        } else if !apres(fin_seq, self.rcv_nxt) {
+            // Déjà reçu : l'autre n'a pas eu notre ACK.
+            self.hors_fenetre();
+            return;
+        } else if !avant(seq, self.rcv_nxt.wrapping_add(wnd)) {
+            // Au-delà de la fenêtre : une sonde, par exemple.
+            self.hors_fenetre();
+            return;
+        } else if avant(seq, self.rcv_nxt) {
+            // Le début déjà reçu ; fenêtre fermée, la suite n'entre pas.
+            if wnd == 0 {
+                self.hors_fenetre();
+                return;
+            }
+            charge.avancer(self.rcv_nxt.wrapping_sub(seq) as usize);
+        } else {
+            // Un trou devant : la file hors d'ordre (le FIN attend que le
+            // trou se comble) ; l'ACK dupliqué part tout de suite (il dit le
+            // trou à l'émetteur). La même borne que dans l'ordre (plus bas) ;
+            // au-delà, jeté ; et rien au-delà de la limite de toute la machine.
             if self.memoire != Memoire::Limite && self.taille_vraie_reception + self.hors_ordre.taille_vraie + charge.taille_vraie() <= 2 * self.rcvbuf {
                 self.hors_ordre.ranger(seq, charge);
+            }
+            if fin {
+                self.fin_hors_ordre = Some(fin_seq.wrapping_sub(1));
             }
             self.ack.programme = true;
             self.ack_maintenant = true;
             return;
         }
-        // Dans l'ordre (le début peut être déjà reçu).
-        charge.avancer(self.rcv_nxt.wrapping_sub(seq) as usize);
         let longueur = charge.octets().len() as u32;
-        // La fenêtre annoncée est une promesse : ce qui y tient est gardé,
-        // même si sa taille vraie dépasse un peu SO_RCVBUF (de petits
-        // segments occupent plus que prévu : Linux les recopie alors en
-        // gros blocs, le « collapse » de `tcp_prune_queue`, que nous
-        // n'avons pas). Au-delà du double de SO_RCVBUF, la mémoire prime :
-        // d'abord la file hors d'ordre, par la fin
-        // (`tcp_prune_ofo_queue`), puis le segment lui-même.
-        while self.taille_vraie_reception + self.hors_ordre.taille_vraie + charge.taille_vraie() > 2 * self.rcvbuf {
-            if !self.hors_ordre.jeter_la_derniere() {
+        if longueur > 0 {
+            // La fenêtre annoncée est une promesse : ce qui y tient est gardé,
+            // même si sa taille vraie dépasse un peu SO_RCVBUF (de petits
+            // segments occupent plus que prévu : Linux les recopie alors en
+            // gros blocs, le « collapse » de `tcp_prune_queue`, que nous
+            // n'avons pas). Au-delà du double de SO_RCVBUF, la mémoire prime :
+            // d'abord la file hors d'ordre, par la fin
+            // (`tcp_prune_ofo_queue`), puis le segment lui-même.
+            while self.taille_vraie_reception + self.hors_ordre.taille_vraie + charge.taille_vraie() > 2 * self.rcvbuf {
+                if !self.hors_ordre.jeter_la_derniere() {
+                    self.ack_maintenant = true;
+                    return;
+                }
+            }
+            // Au-delà de la limite de toute la machine : gardé seulement si la
+            // file de lecture est vide (la connexion doit pouvoir avancer), la
+            // file hors d'ordre rendue d'abord (`tcp_prune_ofo_queue`).
+            if self.memoire == Memoire::Limite && !self.reception.is_empty() {
+                while self.hors_ordre.jeter_la_derniere() {}
                 self.ack_maintenant = true;
                 return;
             }
+            if !self.ajouter_recu(charge) {
+                self.ack_maintenant = true;
+                return;
+            }
+            self.donnees_recues(longueur, maintenant);
+            e.lisible = true;
         }
-        // Au-delà de la limite de toute la machine : gardé seulement si la
-        // file de lecture est vide (la connexion doit pouvoir avancer), la
-        // file hors d'ordre rendue d'abord (`tcp_prune_ofo_queue`).
-        if self.memoire == Memoire::Limite && !self.reception.is_empty() {
-            while self.hors_ordre.jeter_la_derniere() {}
-            self.ack_maintenant = true;
-            return;
+        if fin {
+            self.recevoir_fin(e);
         }
-        if !self.ajouter_recu(charge) {
-            self.ack_maintenant = true;
-            return;
-        }
-        self.donnees_recues(longueur, maintenant);
-        e.lisible = true;
         if !self.hors_ordre.vide() {
             while let Some(p) = self.hors_ordre.suivante(self.rcv_nxt) {
                 if !self.ajouter_recu(p) {
@@ -1885,6 +1963,14 @@ impl<P: Charge> Tcb<P> {
                 self.ack.urgent = true;
             }
         }
+    }
+
+    /// Un segment qui n'a pas sa place, ou qui revient : un ACK tout de suite
+    /// et le mode « quickack » (le `out_of_window` de `tcp_data_queue`).
+    fn hors_fenetre(&mut self) {
+        self.entrer_mode_rapide();
+        self.ack.programme = true;
+        self.ack_maintenant = true;
     }
 
     /// Ajoute une charge qui commence à RCV.NXT à la file de réception ;

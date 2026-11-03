@@ -1297,3 +1297,191 @@ fn memoire_de_toute_la_machine() {
     f.recevoir(&Tcp { seq: bord.wrapping_add(5), ..modele }, Octets(vec![2; 5], 0), maintenant());
     assert_eq!(f.lisibles(), 10);
 }
+
+/// `tcp_sequence` : un segment à cheval sur le bord droit n'entre que si la
+/// file de réception est vide ; le bord gauche est `rcv_wup`, pas RCV.NXT.
+#[test]
+fn segments_acceptables_comme_linux() {
+    let (mut c, _f) = paire();
+    let modele = Tcp { drapeaux: tcp::ACK, ack: c.numeros().0, fenetre: 1000, ..Tcp::default() };
+    let n = bord(&c);
+    let w = c.fenetre_annoncee() as usize;
+    // À cheval, file vide : gardé en entier, au-delà du bord.
+    c.recevoir(&Tcp { seq: n, ..modele }, Octets(vec![1; w + 100], 0), maintenant());
+    assert_eq!(c.lisibles(), w + 100);
+    let _ = sortants(&mut c);
+    // Le même, la file n'étant plus vide : refusé, avec un ACK.
+    let n = bord(&c);
+    let garde = c.lisibles();
+    let w = c.fenetre_annoncee() as usize;
+    c.recevoir(&Tcp { seq: n, ..modele }, Octets(vec![2; w + 100], 0), maintenant());
+    assert_eq!(c.lisibles(), garde);
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].0.ack == n);
+
+    let (mut c, _f) = paire();
+    ecrire(&mut c, b"abc");
+    let _ = sortants(&mut c);
+    let (una, n) = (c.numeros().0, bord(&c));
+    let modele = Tcp { drapeaux: tcp::ACK, ack: una, fenetre: 1000, ..Tcp::default() };
+    // Des données arrivent, notre ACK n'est pas encore parti : un ACK de
+    // l'autre, du numéro d'avant (`rcv_wup`), passe encore...
+    c.recevoir(&Tcp { seq: n, ..modele }, Octets(vec![3; 100], 0), maintenant());
+    c.recevoir(&Tcp { seq: n, ack: una.wrapping_add(2), ..modele }, vide(), maintenant());
+    assert_eq!(c.numeros().0, una.wrapping_add(2));
+    // ... notre ACK parti, ce numéro est vieux : il reçoit l'ACK à jour, et
+    // ne compte pas.
+    let _ = sortants(&mut c);
+    c.recevoir(&Tcp { seq: n, ack: una.wrapping_add(3), ..modele }, vide(), maintenant());
+    assert_eq!(c.numeros().0, una.wrapping_add(2));
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].0.ack == n.wrapping_add(100));
+}
+
+/// Une fenêtre fermée ne laisse passer qu'un FIN seul.
+#[test]
+fn fenetre_fermee_seul_un_fin_passe() {
+    let (mut c, _f) = paire();
+    let modele = Tcp { drapeaux: tcp::ACK, ack: c.numeros().0, fenetre: 1000, ..Tcp::default() };
+    // Remplir jusqu'à fermer la fenêtre, sans lire.
+    let mut n = bord(&c);
+    for _ in 0..1000 {
+        if c.fenetre_annoncee() == 0 {
+            break;
+        }
+        let m = (c.fenetre_annoncee() as usize).min(1000);
+        c.recevoir(&Tcp { seq: n, ..modele }, Octets(vec![1; m], 0), maintenant());
+        n = bord(&c);
+        let _ = sortants(&mut c);
+    }
+    assert_eq!(c.fenetre_annoncee(), 0);
+    let lus = c.lisibles();
+    // Une donnée au bord : jetée, avec un ACK.
+    c.recevoir(&Tcp { seq: n, ..modele }, Octets(vec![2; 1], 0), maintenant());
+    assert_eq!(c.lisibles(), lus);
+    assert_eq!(sortants(&mut c).len(), 1);
+    // Un FIN avec une donnée : refusé de même (il attend la fenêtre).
+    c.recevoir(&Tcp { seq: n, drapeaux: tcp::ACK | tcp::FIN, ..modele }, Octets(vec![2; 1], 0), maintenant());
+    assert!(!c.fin_recue());
+    let _ = sortants(&mut c);
+    // Un FIN seul, la file pleine : `tcp_sequence` le refuse aussi (il est
+    // au-delà du bord, et la file n'est pas vide).
+    c.recevoir(&Tcp { seq: n, drapeaux: tcp::ACK | tcp::FIN, ..modele }, vide(), maintenant());
+    assert!(!c.fin_recue());
+    let _ = sortants(&mut c);
+    // Tout lu, la fenêtre pas encore rouverte : un FIN seul passe ; une
+    // donnée, non.
+    let _ = c.lire::<()>(usize::MAX, false, |m| Ok(m.len()));
+    assert_eq!(c.fenetre_annoncee(), 0);
+    c.recevoir(&Tcp { seq: n, ..modele }, Octets(vec![2; 1], 0), maintenant());
+    assert_eq!(c.lisibles(), 0);
+    c.recevoir(&Tcp { seq: n, drapeaux: tcp::ACK | tcp::FIN, ..modele }, vide(), maintenant());
+    assert!(c.fin_recue());
+    assert_eq!(c.etat(), Etat::AttenteFermeture);
+}
+
+/// `tcp_reset` et `tcp_reset_check` : RCV.NXT - 1 vaut après un FIN ; EPIPE
+/// en CLOSE_WAIT, ECONNRESET ailleurs, LAST_ACK et CLOSING compris.
+#[test]
+fn rst_apres_le_fin() {
+    for (fermer, attendu) in [(false, t::EPIPE), (true, t::ECONNRESET)] {
+        let (mut c, mut f) = paire();
+        f.fermer_envoi();
+        calmer(&mut c, &mut f);
+        assert_eq!(c.etat(), Etat::AttenteFermeture);
+        if fermer {
+            c.fermer_envoi();
+            let _ = sortants(&mut c);
+            assert_eq!(c.etat(), Etat::DernierAck);
+        }
+        let n = bord(&c);
+        // Deux de moins : hors de la fenêtre, rien (un RST n'a pas d'ACK).
+        c.recevoir(&Tcp { drapeaux: tcp::RST, seq: n.wrapping_sub(2), ..Tcp::default() }, vide(), maintenant());
+        assert!(c.etat() != Etat::Fermee);
+        // Un de moins, le numéro du FIN : accepté.
+        c.recevoir(&Tcp { drapeaux: tcp::RST, seq: n.wrapping_sub(1), ..Tcp::default() }, vide(), maintenant());
+        assert_eq!((c.etat(), c.prendre_erreur()), (Etat::Fermee, attendu));
+    }
+    // En ESTABLISHED, le même numéro n'est qu'hors de la fenêtre.
+    let (mut c, _f) = paire();
+    let n = bord(&c);
+    c.recevoir(&Tcp { drapeaux: tcp::RST, seq: n.wrapping_sub(1), ..Tcp::default() }, vide(), maintenant());
+    assert_eq!(c.etat(), Etat::Etablie);
+}
+
+/// Un FIN retransmis en CLOSE_WAIT reçoit son ACK (le chemin de
+/// `tcp_data_queue` pour ce qui précède RCV.NXT) ; de nouvelles données après
+/// le FIN sont ignorées.
+#[test]
+fn apres_le_fin_doublons_acquittes() {
+    let (mut c, mut f) = paire();
+    f.fermer_envoi();
+    let s = sortants(&mut f);
+    let fin = s.iter().find(|x| x.0.drapeaux & tcp::FIN != 0).unwrap().0;
+    c.recevoir(&fin, vide(), maintenant());
+    let _ = sortants(&mut c);
+    assert_eq!(c.etat(), Etat::AttenteFermeture);
+    c.recevoir(&fin, vide(), maintenant());
+    let s = sortants(&mut c);
+    assert!(s.len() == 1 && s[0].0.drapeaux == tcp::ACK && s[0].0.ack == fin.seq.wrapping_add(1));
+    c.recevoir(&Tcp { seq: fin.seq.wrapping_add(1), ack: fin.ack, drapeaux: tcp::ACK, fenetre: 1000, ..Tcp::default() },
+               Octets(vec![1; 10], 0), maintenant());
+    assert_eq!(c.lisibles(), 0);
+}
+
+/// `tcp_check_req`, chaque cas à sa place : le SYN répété, l'ACK qui
+/// n'acquitte pas notre SYN, hors de la fenêtre, un autre SYN, un RST.
+#[test]
+fn fille_comme_tcp_check_req() {
+    let cree = || {
+        let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+        let (syn, _) = sortants(&mut c)[0];
+        let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+        let _ = sortants(&mut f);
+        (syn, f)
+    };
+    // Le SYN répété : un SYN-ACK, la fille reste ; limité à un par 500 ms.
+    let (syn, mut f) = cree();
+    f.recevoir(&syn, vide(), maintenant());
+    let s = sortants(&mut f);
+    assert!(s.len() == 1 && s[0].0.drapeaux == tcp::SYN | tcp::ACK);
+    f.recevoir(&syn, vide(), maintenant());
+    assert!(sortants(&mut f).is_empty());
+    avancer(500 * MS);
+    f.recevoir(&syn, vide(), maintenant());
+    assert_eq!(sortants(&mut f).len(), 1);
+    // Un ACK faux : RST de son numéro ; la fille reste.
+    let (syn, mut f) = cree();
+    let modele = Tcp { source: syn.source, destination: syn.destination, seq: syn.seq.wrapping_add(1), ack: 7001, drapeaux: tcp::ACK, fenetre: 1000, ..Tcp::default() };
+    f.recevoir(&Tcp { ack: 9999, ..modele }, vide(), maintenant());
+    let s = sortants(&mut f);
+    assert!(s.len() == 1 && s[0].0.drapeaux == tcp::RST && s[0].0.seq == 9999);
+    assert_eq!(f.etat(), Etat::SynRecu);
+    // Le même avec RST : pas de réponse, la fille reste.
+    f.recevoir(&Tcp { ack: 9999, drapeaux: tcp::ACK | tcp::RST, ..modele }, vide(), maintenant());
+    assert!(sortants(&mut f).is_empty());
+    assert_eq!(f.etat(), Etat::SynRecu);
+    // Hors de la fenêtre : un ACK, et rien d'autre.
+    f.recevoir(&Tcp { seq: syn.seq.wrapping_add(1 << 30), ..modele }, vide(), maintenant());
+    let s = sortants(&mut f);
+    assert!(s.len() == 1 && s[0].0.drapeaux == tcp::ACK);
+    assert_eq!(f.etat(), Etat::SynRecu);
+    // Un RST dans la fenêtre : elle disparaît, sans réponse.
+    f.recevoir(&Tcp { drapeaux: tcp::RST, ack: 0, ..modele }, vide(), maintenant());
+    assert!(sortants(&mut f).is_empty());
+    assert_eq!(f.etat(), Etat::Fermee);
+    // Un autre SYN dans la fenêtre : RST, et elle disparaît.
+    let (syn, mut f) = cree();
+    f.recevoir(&Tcp { seq: syn.seq.wrapping_add(10), drapeaux: tcp::SYN, ..syn }, vide(), maintenant());
+    let s = sortants(&mut f);
+    assert!(s.len() == 1 && s[0].0.drapeaux == tcp::RST | tcp::ACK && s[0].0.ack == syn.seq.wrapping_add(11));
+    assert_eq!(f.etat(), Etat::Fermee);
+    // Un segment sans ACK : jeté.
+    let (syn, mut f) = cree();
+    f.recevoir(&Tcp { seq: syn.seq.wrapping_add(1), drapeaux: tcp::PSH, ..syn }, Octets(vec![1; 10], 0), maintenant());
+    assert!(sortants(&mut f).is_empty());
+    assert_eq!((f.etat(), f.lisibles()), (Etat::SynRecu, 0));
+    // Le bon ACK, avec des données : établie, et les données gardées.
+    f.recevoir(&Tcp { seq: syn.seq.wrapping_add(1), ack: 7001, drapeaux: tcp::ACK, fenetre: 1000, ..syn }, Octets(vec![1; 10], 0), maintenant());
+    assert_eq!((f.etat(), f.lisibles()), (Etat::Etablie, 10));
+}
