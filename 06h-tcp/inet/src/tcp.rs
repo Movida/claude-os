@@ -88,10 +88,12 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use formats::reseau::tcp::{self, Tcp};
 
+pub mod attente;
 mod congestion;
 mod hors_ordre;
 mod rtt;
 
+use attente::Attente;
 use congestion::{Congestion, Phase, REORDONNANCEMENT};
 use hors_ordre::HorsOrdre;
 use rtt::Rtt;
@@ -1208,10 +1210,15 @@ impl<P: Charge> Tcb<P> {
 
     // --- Les segments reçus ---
 
-    /// La fenêtre de réception annoncée (`tw_rcv_wnd` d'une entrée de
-    /// TIME_WAIT).
+    /// La fenêtre de réception annoncée.
     pub fn fenetre_annoncee(&self) -> u32 {
         self.rcv_wnd()
+    }
+
+    /// L'entrée de TIME_WAIT de cette connexion (`tcp_time_wait`) ;
+    /// `fin_attente2` : une orpheline qui attend encore le FIN de l'autre.
+    pub fn en_attente(&self, fin_attente2: bool) -> Attente {
+        Attente::new(self.port_local, self.port_distant, self.snd_max, self.rcv_nxt, self.rcv_wnd(), self.echelle_reception, fin_attente2)
     }
 
     /// Ce qui reste de la fenêtre annoncée tient-il en un segment de

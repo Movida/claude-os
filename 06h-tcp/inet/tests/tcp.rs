@@ -1485,3 +1485,76 @@ fn fille_comme_tcp_check_req() {
     f.recevoir(&Tcp { seq: syn.seq.wrapping_add(1), ack: 7001, drapeaux: tcp::ACK, fenetre: 1000, ..syn }, Octets(vec![1; 10], 0), maintenant());
     assert_eq!((f.etat(), f.lisibles()), (Etat::Etablie, 10));
 }
+
+/// Une entrée de TIME_WAIT (`tcp_timewait_state_process`).
+#[test]
+fn time_wait_comme_linux() {
+    let (mut c, mut f) = paire();
+    c.fermer_envoi();
+    calmer(&mut c, &mut f);
+    f.fermer_envoi();
+    calmer(&mut c, &mut f);
+    assert_eq!(c.etat(), Etat::TempsAttente);
+    let mut a = c.en_attente(false);
+    let n = bord(&c);
+    let modele = Tcp { source: 80, destination: 40000, seq: n, ack: a.snd_nxt, drapeaux: tcp::ACK, fenetre: 1000, ..Tcp::default() };
+    // Un ACK nu au bord gauche : prolongée, sans réponse.
+    let r = a.recevoir(&modele, 0, maintenant());
+    assert!(r.prolonger && !r.ack && !r.effacer);
+    // Un FIN retransmis : réacquitté, prolongée. Il compte comme des données
+    // sans SYN : sa réponse n'est jamais limitée.
+    let fin = Tcp { seq: n.wrapping_sub(1), drapeaux: tcp::ACK | tcp::FIN, ..modele };
+    let r = a.recevoir(&fin, 0, maintenant());
+    assert!(r.ack && r.prolonger);
+    assert!(a.recevoir(&fin, 0, maintenant()).ack);
+    let h = a.entete_ack();
+    assert_eq!((h.seq, h.ack, h.drapeaux), (a.snd_nxt, n, tcp::ACK));
+    // Sa fenêtre : celle de la connexion, à son échelle (pas 0).
+    assert_eq!(h.fenetre as u32, a.rcv_wnd >> a.echelle);
+    assert!(h.fenetre > 0);
+    // Un ACK nu hors du bord : réponse limitée à une par 500 ms.
+    let vieux = Tcp { seq: n.wrapping_add(1000), ..modele };
+    assert!(a.recevoir(&vieux, 0, maintenant()).ack);
+    assert!(!a.recevoir(&vieux, 0, maintenant()).ack);
+    avancer(500 * MS);
+    assert!(a.recevoir(&vieux, 0, maintenant()).ack);
+    // Un SYN plus loin : le quadruplet repris, le numéro initial bien au-delà.
+    let syn = Tcp { seq: n.wrapping_add(5), drapeaux: tcp::SYN, ack: 0, ..modele };
+    assert_eq!(a.recevoir(&syn, 0, maintenant()).reprendre, Some(a.snd_nxt.wrapping_add(65_537)));
+    // Un SYN plus vieux : l'ACK, sans prolonger (il peut être neuf et tiré au
+    // hasard en deçà).
+    avancer(500 * MS);
+    let r = a.recevoir(&Tcp { seq: n.wrapping_sub(5), ..syn }, 0, maintenant());
+    assert!(r.reprendre.is_none() && r.ack && !r.prolonger);
+    // Un RST au bord gauche l'efface ; ailleurs, rien.
+    assert_eq!(a.recevoir(&Tcp { seq: n.wrapping_add(9), drapeaux: tcp::RST, ..modele }, 0, maintenant()), Default::default());
+    assert!(a.recevoir(&Tcp { drapeaux: tcp::RST, ..modele }, 0, maintenant()).effacer);
+}
+
+/// Une orpheline en FIN_WAIT_2 : son sous-état.
+#[test]
+fn fin_wait_2_d_une_orpheline() {
+    let (mut c, mut f) = paire();
+    c.fermer_envoi();
+    calmer(&mut c, &mut f);
+    assert_eq!(c.etat(), Etat::FinAttente2);
+    let mut a = c.en_attente(true);
+    let n = bord(&c);
+    let modele = Tcp { source: 80, destination: 40000, seq: n, ack: a.snd_nxt, drapeaux: tcp::ACK, fenetre: 1000, ..Tcp::default() };
+    // Un ACK seul : rien.
+    assert_eq!(a.recevoir(&modele, 0, maintenant()), Default::default());
+    // Hors de la fenêtre : un ACK.
+    assert!(a.recevoir(&Tcp { seq: n.wrapping_add(1 << 30), ..modele }, 0, maintenant()).ack);
+    // Des données : RST, et l'entrée disparaît.
+    let r = a.recevoir(&modele, 10, maintenant());
+    assert!(r.rst && r.effacer);
+    // Un SYN : de même.
+    let r = a.recevoir(&Tcp { drapeaux: tcp::SYN, ..modele }, 0, maintenant());
+    assert!(r.rst && r.effacer);
+    // Un RST : effacée.
+    assert!(a.recevoir(&Tcp { drapeaux: tcp::RST, ..modele }, 0, maintenant()).effacer);
+    // Le FIN de l'autre : un vrai TIME_WAIT, son numéro acquitté.
+    let r = a.recevoir(&Tcp { drapeaux: tcp::ACK | tcp::FIN, ..modele }, 0, maintenant());
+    assert!(r.ack && r.prolonger && !a.fin_attente2);
+    assert_eq!(a.rcv_nxt, n.wrapping_add(1));
+}

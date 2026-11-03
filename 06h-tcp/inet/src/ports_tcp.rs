@@ -345,9 +345,15 @@ impl<T: Clone> Table<T> {
                 };
             }
         }
+        self.ecoute(destination, port).map(Destinataire::Ecoute)
+    }
+
+    /// L'écoute de `destination`:`port`, ou de 0.0.0.0:`port`
+    /// (`inet_lookup_listener`).
+    pub fn ecoute(&self, destination: [u8; 4], port: u16) -> Option<T> {
         for locale in [destination, [0; 4]] {
             if let Some(e) = self.entrees.iter().find(|e| e.lien.sorte == Sorte::Ecoute && e.lien.port == port && e.lien.adresse == locale) {
-                return e.objet.clone().map(Destinataire::Ecoute);
+                return e.objet.clone();
             }
         }
         None

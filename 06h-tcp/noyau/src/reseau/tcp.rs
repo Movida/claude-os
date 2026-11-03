@@ -125,28 +125,18 @@ pub enum Cible {
     Fille(Arc<Socket>, u64),
 }
 
-/// Une entrée de TIME_WAIT : de quoi réacquitter un FIN retransmis.
+/// Une entrée de TIME_WAIT : ses règles (inet::tcp::attente), et ce que le
+/// noyau en garde.
 #[derive(Clone, Copy)]
 struct TempsAttente {
     /// Son numéro à elle, dans la table et la liste des échéances (pas
     /// celui de la socket : voir `ports_tcp::Table::temps_attente`).
     numero: u64,
     locale: [u8; 4],
-    port: u16,
     distante: [u8; 4],
-    port_distant: u16,
-    snd_nxt: u32,
-    rcv_nxt: u32,
-    /// La fenêtre de réception annoncée (`tw_rcv_wnd`), pour la fenêtre
-    /// d'une orpheline en FIN_WAIT_2.
-    rcv_wnd: u32,
-    /// Le sous-état FIN_WAIT_2 (une orpheline dont l'autre n'a pas encore
-    /// fermé), ou TIME_WAIT.
-    fin_attente2: bool,
+    regles: itcp::attente::Attente,
     /// Son échéance (/proc/net/tcp la montre).
     echeance: u64,
-    /// L'heure de son dernier ACK hors fenêtre (`tw_last_oow_ack_time`).
-    dernier_ack: Option<u64>,
 }
 
 static TABLE: Verrou<Option<ports_tcp::Table<Cible>>> = Verrou::new(None);
@@ -535,7 +525,6 @@ impl Partie {
             return;
         }
         if etat == Etat::TempsAttente || fin_orpheline {
-            let (_, snd_nxt, rcv_nxt) = t.numeros();
             // Une orpheline en FIN_WAIT_2 attend TCP_LINGER2 (60 s par
             // défaut, `tcp_fin_timeout`), au moins 3,5 RTO (`tcp_fin_time`) ;
             // TIME_WAIT, 60 s.
@@ -548,11 +537,7 @@ impl Partie {
             };
             let echeance = crate::temps::ns_monotone() + duree;
             let numero = socket::nouveau_numero();
-            let e = TempsAttente {
-                numero, locale: self.adresses.source, port: self.adresses.port, distante: self.adresses.distante,
-                port_distant: self.adresses.port_distant, snd_nxt, rcv_nxt, rcv_wnd: t.fenetre_annoncee(), fin_attente2: fin_orpheline,
-                echeance, dernier_ack: None,
-            };
+            let e = TempsAttente { numero, locale: self.adresses.source, distante: self.adresses.distante, regles: t.en_attente(fin_orpheline), echeance };
             // L'entrée de TIME_WAIT prend un numéro neuf, et l'échéance
             // qui va avec ; la socket n'a plus d'entrée dans la table.
             self.desarmer();
@@ -1000,116 +985,47 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     vers_socket(&sock, Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon });
 }
 
-/// Un segment pour une entrée de TIME_WAIT, dans l'ordre de
-/// `tcp_timewait_state_process`. En FIN_WAIT_2 (une orpheline) : hors de
-/// la fenêtre, un ACK ; un RST l'efface ; un SYN, ou des données après
-/// une fermeture d'un côté, RST et l'entrée disparaît ; le FIN de l'autre
-/// en fait un vrai TIME_WAIT, de 60 s. En TIME_WAIT : au bord gauche, un
-/// RST l'efface (rfc1337 à 0) et un ACK nu la prolonge, sans réponse ; un
-/// SYN plus loin que ce qu'elle a reçu l'efface et va à l'écoute (une
-/// connexion nouvelle du même quadruplet), avec un numéro initial plus
-/// loin que tout ce qu'elle a envoyé ; tout le reste (un FIN retransmis...)
-/// est réacquitté, et un ACK la prolonge de 60 s ; un RST ailleurs, rien.
-/// Chaque réponse hors fenêtre au plus toutes les 500 ms (comme une
-/// connexion, `tcp_timewait_check_oow_rate_limit`).
+/// Un segment pour une entrée de TIME_WAIT : ses règles disent quoi faire
+/// (inet::tcp::attente). Un SYN qui reprend le quadruplet va à l'écoute,
+/// s'il y en a une ; sinon, l'entrée lui répond par un ACK.
 fn temps_attente(n: u64, s: Segment) {
-    let e = TW.verrouiller().iter().find(|e| e.numero == n).copied();
-    let Some(e) = e else { return };
-    let h = s.entete;
-    let rst = h.drapeaux & ftcp::RST != 0;
-    let syn = h.drapeaux & ftcp::SYN != 0;
-    let ack = h.drapeaux & ftcp::ACK != 0;
-    let fin = h.drapeaux & ftcp::FIN != 0;
-    let fin_seq = h.seq.wrapping_add(s.charge.longueur() as u32).wrapping_add(u32::from(syn)).wrapping_add(u32::from(fin));
     let maintenant = crate::temps::ns_monotone();
-    // Réacquitter, au plus toutes les 500 ms.
-    let reacquitter = |ack_num: u32| {
-        let limite = {
-            let mut tw = TW.verrouiller();
-            let Some(x) = tw.iter_mut().find(|x| x.numero == n) else { return };
-            if x.dernier_ack.is_some_and(|d| maintenant.saturating_sub(d) < itcp::LIMITE_ACK_INVALIDE) {
-                true
-            } else {
-                x.dernier_ack = Some(maintenant);
-                false
-            }
-        };
-        if !limite {
-            envoyer_ack_tw(&e, ack_num);
+    let h = s.entete;
+    let (issue, e) = {
+        let mut tw = TW.verrouiller();
+        let Some(e) = tw.iter_mut().find(|e| e.numero == n) else { return };
+        let issue = e.regles.recevoir(&h, s.charge.longueur() as u32, maintenant);
+        if issue.prolonger {
+            e.echeance = maintenant + TEMPS_ATTENTE;
         }
+        (issue, *e)
     };
-    let prolonger = |echeance: u64, rcv_nxt: Option<u32>| {
-        if let Some(x) = TW.verrouiller().iter_mut().find(|x| x.numero == n) {
-            x.echeance = echeance;
-            if let Some(r) = rcv_nxt {
-                x.fin_attente2 = false;
-                x.rcv_nxt = r;
-            }
-        }
-        super::tache::armer(n, Some(echeance));
-    };
-    if e.fin_attente2 {
-        let fin_fenetre = e.rcv_nxt.wrapping_add(e.rcv_wnd);
-        let dans = h.seq == e.rcv_nxt
-            || (itcp::apres(fin_seq, e.rcv_nxt) && itcp::avant(h.seq, fin_fenetre))
-            || (h.seq == fin_fenetre && h.seq == fin_seq);
-        if !dans {
-            reacquitter(e.rcv_nxt);
-            return;
-        }
-        if rst {
+    if let Some(isn) = issue.reprendre {
+        if TABLE.verrouiller().as_ref().and_then(|t| t.ecoute(s.destination, h.destination)).is_some() {
             effacer_temps_attente(n);
-            return;
-        }
-        if syn && !itcp::avant(h.seq, e.rcv_nxt) {
-            effacer_temps_attente(n);
-            repondre_rst(&h, s.charge.longueur(), s.destination, s.source);
-            return;
-        }
-        if !ack || !itcp::apres(fin_seq, e.rcv_nxt) || fin_seq == h.seq {
-            // Un ACK seul, un vieux segment : rien.
-            return;
-        }
-        if !fin || fin_seq != e.rcv_nxt.wrapping_add(1) {
-            // Des données après une fermeture d'un côté : RST, et l'entrée
-            // disparaît (`TCP_TW_RST`).
-            effacer_temps_attente(n);
-            repondre_rst(&h, s.charge.longueur(), s.destination, s.source);
-            return;
-        }
-        // Le FIN de l'autre : un vrai TIME_WAIT, de 60 s.
-        prolonger(maintenant + TEMPS_ATTENTE, Some(fin_seq));
-        envoyer_ack_tw(&e, fin_seq);
-        return;
-    }
-    if h.seq == e.rcv_nxt && (h.seq == fin_seq || rst) {
-        if rst {
-            effacer_temps_attente(n);
+            livrer(Segment { isn: Some(isn), ..s });
         } else {
-            prolonger(maintenant + TEMPS_ATTENTE, None);
+            envoyer_ack_tw(&e);
         }
         return;
     }
-    if syn && !rst && !ack && itcp::apres(h.seq, e.rcv_nxt) {
+    if issue.prolonger {
+        super::tache::armer(n, Some(e.echeance));
+    }
+    if issue.effacer {
         effacer_temps_attente(n);
-        let isn = e.snd_nxt.wrapping_add(65_535 + 2);
-        livrer(Segment { isn: Some(if isn == 0 { 1 } else { isn }), ..s });
-        return;
     }
-    if !rst {
-        if ack {
-            prolonger(maintenant + TEMPS_ATTENTE, None);
-        }
-        reacquitter(e.rcv_nxt);
+    if issue.rst {
+        repondre_rst(&h, s.charge.longueur(), s.destination, s.source);
+    }
+    if issue.ack {
+        envoyer_ack_tw(&e);
     }
 }
 
 /// L'ACK d'une entrée de TIME_WAIT (`tcp_v4_timewait_ack`).
-fn envoyer_ack_tw(e: &TempsAttente, ack: u32) {
-    let r = Tcp {
-        source: e.port, destination: e.port_distant, seq: e.snd_nxt, ack, drapeaux: ftcp::ACK,
-        fenetre: 0, urgent: 0, options: ftcp::Options::default(),
-    };
+fn envoyer_ack_tw(e: &TempsAttente) {
+    let r = e.regles.entete_ack();
     let mut id = crate::aleatoire::u32() as u16;
     envoyer_segment(&r, e.locale, e.distante, &mut id, Ip::SYSTEME, 0, |_| {});
 }
@@ -2003,7 +1919,7 @@ pub fn ligne_proc(n: u64, sortie: &mut dyn core::fmt::Write) -> Result<bool, cor
         match (lien.sorte, objet) {
             (Sorte::TempsAttente, _) => {
                 let e = TW.verrouiller().iter().find(|e| e.numero == numero).copied();
-                let (etat, reste) = e.map_or((6, 0), |e| (if e.fin_attente2 { 5 } else { 6 }, e.echeance.saturating_sub(maintenant)));
+                let (etat, reste) = e.map_or((6, 0), |e| (if e.regles.fin_attente2 { 5 } else { 6 }, e.echeance.saturating_sub(maintenant)));
                 write!(l, "{:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x}", etat, 0, 0, 3, clock_t(reste), 0, 0, 0, 0, 1, 0)?;
             }
             (_, Some(Cible::Socket(s))) => {
