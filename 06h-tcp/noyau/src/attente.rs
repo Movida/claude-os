@@ -564,7 +564,10 @@ pub fn tic() {
 /// d'attente (un `recv`, un `poll`, un epoll qui la surveille) et qu'une
 /// carte a son lien, un datagramme peut encore venir du dehors, et le
 /// détecteur ne tue personne (6g : un ping attendu sans délai). Par `lo`,
-/// non : seul un programme qui s'exécute peut s'y envoyer quelque chose.
+/// seulement si une connexion TCP a un minuteur armé (6h : une
+/// retransmission, un ACK retardé, une sonde peuvent encore faire bouger
+/// l'autre côté) ; sinon, seul un programme qui s'exécute peut s'y envoyer
+/// quelque chose.
 /// Il épargne ainsi plus qu'il ne faudrait : un élément d'epoll reste
 /// inscrit dans la file de sa socket même quand personne n'attend l'epoll,
 /// et un programme bloqué pour toujours ailleurs (un futex, `pause`) n'est
@@ -576,7 +579,7 @@ pub fn detecter_interblocage() -> bool {
     if MINUTERIES.verrouiller().iter().any(|(_, t)| t.est_programme()) || !ATTENTES_CALCUL.verrouiller().is_empty() {
         return false;
     }
-    if crate::reseau::attentes() > 0 && crate::reseau::interface::une_carte_a_son_lien() {
+    if crate::reseau::attentes() > 0 && (crate::reseau::interface::une_carte_a_son_lien() || crate::reseau::minuteur_tcp_arme()) {
         return false;
     }
     let mut bloquees: Vec<Arc<Tache>> = Vec::new();

@@ -92,15 +92,17 @@ pub fn envoyer(i: &'static Interface, prochain: [u8; 4], p: Paquet, confirmer: b
     // sous son verrou : calculée sous lui puis inscrite après, une plus
     // ancienne pourrait écraser une plus neuve (une autre tâche passant
     // entre les deux), et une résolution perdre son minuteur.
-    match v.as_mut() {
+    let plus_tot = match v.as_mut() {
         Some(t) => {
             t.envoyer(i.index, prochain, p, taille, confirmer, temps::ns_monotone(), &mut faire);
-            super::tache::inscrire(super::tache::OBJET_VOISINS, t.echeance());
+            super::tache::inscrire(super::tache::OBJET_VOISINS, t.echeance()).1
         }
         None => return faire(Action::Jeter { paquet: p, echec: false }),
-    }
+    };
     drop(v);
-    super::tache::reveiller();
+    if plus_tot {
+        super::tache::reveiller();
+    }
 }
 
 /// Les minuteurs des voisins (dans la tâche du réseau), et la prochaine

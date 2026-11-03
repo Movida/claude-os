@@ -1205,7 +1205,7 @@ fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Resu
         return if &nom[..fin] == b"reno" { Ok(()) } else { Err(-ENOENT) };
     }
     let v = entier(valeur, longueur)?;
-    tcp::avec_options(s, |op, tcb| {
+    tcp::avec_options(s, |op, mut tcb| {
         match option {
             TCP_NODELAY => op.nodelay = v != 0,
             TCP_CORK => op.cork = v != 0,
@@ -1214,7 +1214,7 @@ fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Resu
                     return Err(-EINVAL);
                 }
                 op.maxseg = v as u16;
-                if let Some(t) = tcb {
+                if let Some(t) = tcb.as_deref_mut() {
                     t.mss_utilisateur = v as u16;
                 }
             }
@@ -1247,6 +1247,10 @@ fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Resu
             }
             _ => return Err(-ENOPROTOOPT),
         }
+        // Ce que la connexion en retient (TCP_SYNCNT, TCP_USER_TIMEOUT).
+        if let Some(t) = tcb {
+            t.reglages = op.reglages(t.reglages.orpheline);
+        }
         Ok(())
     })
 }
@@ -1265,7 +1269,8 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; 104], usize), i
             TCP_KEEPIDLE => op.keepidle as i32,
             TCP_KEEPINTVL => op.keepintvl as i32,
             TCP_KEEPCNT => op.keepcnt as i32,
-            TCP_SYNCNT => op.syncnt as i32,
+            // 0 : celui du système, `tcp_syn_retries`.
+            TCP_SYNCNT => if op.syncnt == 0 { inet::tcp::SYN_ESSAIS as i32 } else { op.syncnt as i32 },
             TCP_LINGER2 => if op.linger2 == 0 { 60 } else { op.linger2 },
             TCP_DEFER_ACCEPT => essais_en_secondes(op.defer_accept),
             TCP_QUICKACK => op.quickack as i32,

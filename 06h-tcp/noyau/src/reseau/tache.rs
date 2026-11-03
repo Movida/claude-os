@@ -21,7 +21,8 @@
 //! par trame.
 //!
 //! Les minuteurs du réseau : une liste d'échéances, une par objet (la
-//! table des voisins, arp.rs ; puis les connexions TCP), inet::echeances.
+//! table des voisins, arp.rs ; les sockets TCP et les entrées de
+//! TIME_WAIT, tcp.rs), inet::echeances.
 //! La tâche dort jusqu'à la plus proche, ou un réveil, et fait le travail
 //! des objets échus.
 //!
@@ -128,35 +129,51 @@ pub fn initialiser() {
 }
 
 /// L'objet `objet` veut la tâche du réseau à `echeance` (None : plus
-/// jamais), et la réveille pour qu'elle recalcule son sommeil. false :
-/// la liste est pleine (l'objet ne sera pas servi à l'heure : à lui de
-/// s'en accommoder).
+/// jamais), et la réveille pour qu'elle recalcule son sommeil si la
+/// prochaine échéance est maintenant plus proche (plus loin, elle se
+/// réveillera pour rien, et se rendormira : moins coûteux qu'un réveil à
+/// chaque ACK, qui repousse le minuteur de retransmission d'une
+/// connexion). false : la liste est pleine (l'objet ne sera pas servi à
+/// l'heure : à lui de s'en accommoder).
 pub fn armer(objet: u64, echeance: Option<u64>) -> bool {
-    let ok = inscrire(objet, echeance);
-    reveiller();
+    let (ok, plus_tot) = inscrire(objet, echeance);
+    if plus_tot {
+        reveiller();
+    }
     ok
 }
 
-/// Réveille la tâche du réseau, pour qu'elle recalcule son sommeil (après
-/// `inscrire`).
+/// Réveille la tâche du réseau, pour une échéance plus proche que son
+/// sommeil (après `inscrire`).
 pub fn reveiller() {
     signaler(ECHEANCE);
 }
 
 /// Inscrit l'échéance de `objet` (None : retirée), sans réveiller la tâche
-/// du réseau (qui l'appelle elle-même ; un autre appelant la réveille,
-/// `reveiller`, une fois ses propres verrous rendus) : rend si
-/// l'inscription a pu se faire.
-pub fn inscrire(objet: u64, echeance: Option<u64>) -> bool {
+/// du réseau : rend si l'inscription a pu se faire, et si la première
+/// échéance de la liste est maintenant plus proche (l'appelant réveille
+/// alors la tâche, `reveiller`, une fois ses propres verrous rendus). La
+/// première échéance d'avant et celle d'après sont lues dans le même
+/// passage sous le verrou de la liste que l'inscription : la tâche du
+/// réseau lit la sienne sous ce verrou avant de dormir ; ou elle voit
+/// l'inscription, ou bien celle d'avant est son sommeil. (Lue hors de ce
+/// passage, la première échéance pourrait avoir été prise entre-temps par
+/// la tâche : le réveil manquerait.)
+pub fn inscrire(objet: u64, echeance: Option<u64>) -> (bool, bool) {
     match ECHEANCES.verrouiller().as_mut() {
-        Some(e) => match echeance {
-            Some(t) => e.armer(objet, t).is_ok(),
-            None => {
-                e.desarmer(objet);
-                true
-            }
-        },
-        None => false,
+        Some(e) => {
+            let avant = e.prochaine();
+            let ok = match echeance {
+                Some(t) => e.armer(objet, t).is_ok(),
+                None => {
+                    e.desarmer(objet);
+                    true
+                }
+            };
+            let apres = e.prochaine();
+            (ok, apres.is_some_and(|a| avant.is_none_or(|b| a < b)))
+        }
+        None => (false, false),
     }
 }
 

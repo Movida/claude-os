@@ -36,6 +36,15 @@
 //! ou orpheline en FIN_WAIT_2, devient une petite entrée de TIME_WAIT
 //! (`TempsAttente`), et la socket est rendue, comme `tcp_time_wait`.
 //!
+//! LES MINUTEURS (commit 6 : la retransmission, l'ACK retardé, la sonde de
+//! fenêtre) sont tenus par la connexion (inet::tcp, `echeance` et
+//! `minuteur`) ; la socket inscrit la prochaine échéance de sa connexion,
+//! ou de ses filles pour une écoute, dans la liste des échéances du
+//! réseau (tache.rs, sous le numéro de la socket), et la tâche du réseau
+//! la réveille à l'heure (`minuteur_du_reseau` : tout de suite, ou par un
+//! drapeau que verra la possession rendue). Une entrée de TIME_WAIT reprend
+//! le numéro de sa socket pour sa propre échéance.
+//!
 //! LES VERROUS, dans l'ordre de Linux : la possession d'une socket, son
 //! verrou court, puis la table des ports (au plus profond). Ce qui se fait
 //! sous le verrou court se fait dans le contexte réseau (contexte.rs) :
@@ -134,6 +143,8 @@ struct TempsAttente {
     /// Le sous-état FIN_WAIT_2 (une orpheline dont l'autre n'a pas encore
     /// fermé), ou TIME_WAIT.
     fin_attente2: bool,
+    /// L'heure de son dernier ACK hors fenêtre (`tw_last_oow_ack_time`).
+    dernier_ack: Option<u64>,
 }
 
 static TABLE: Verrou<Option<ports_tcp::Table<Cible>>> = Verrou::new(None);
@@ -141,6 +152,9 @@ static TW: Verrou<Vec<TempsAttente>> = Verrou::new(Vec::new());
 /// Les sockets orphelines (fermées par le programme, connexion pas finie) :
 /// le repos du réseau les attend.
 static ORPHELINES: AtomicUsize = AtomicUsize::new(0);
+/// Les sockets qui ont une échéance inscrite (le détecteur
+/// d'interblocage : un minuteur peut encore réveiller un programme).
+static MINUTEURS: AtomicUsize = AtomicUsize::new(0);
 
 /// Fait la table des ports et celle des TIME_WAIT. Au démarrage.
 pub fn initialiser() {
@@ -154,6 +168,16 @@ pub fn initialiser() {
 /// Les orphelines en vie (le repos du réseau).
 pub fn orphelines() -> usize {
     ORPHELINES.load(Ordering::Relaxed)
+}
+
+/// Les sockets dont un minuteur est armé (le détecteur d'interblocage).
+pub fn minuteurs_armes() -> usize {
+    MINUTEURS.load(Ordering::Relaxed)
+}
+
+/// L'heure, pour les connexions (en nanosecondes).
+fn maintenant() -> u64 {
+    crate::temps::ns_monotone()
 }
 
 /// L'adresse locale et distante, le port local et distant d'une socket.
@@ -235,6 +259,8 @@ pub struct Partie {
     pub etablie_un_jour: bool,
     /// Un `connect` non bloquant est en cours.
     pub connexion_en_cours: bool,
+    /// L'échéance inscrite dans la liste du réseau pour cette socket.
+    echeance_armee: Option<u64>,
 }
 
 /// Les options de SOL_TCP.
@@ -259,11 +285,19 @@ pub struct OptionsTcp {
 }
 
 impl OptionsTcp {
+    /// `syncnt` à 0 : celui du système (TCP_SYNCNT se lit alors 6), comme
+    /// le `icsk_syn_retries` de Linux ; une fille en hérite pour ses
+    /// SYN-ACK (5 par défaut).
     pub const DEFAUT: OptionsTcp = OptionsTcp {
-        nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 6, linger2: 60, maxseg: 0,
+        nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0,
         ttl: 64, tos: 0,
     };
+
+    /// Ce que la connexion en retient (TCP_USER_TIMEOUT est en ms).
+    pub fn reglages(&self, orpheline: bool) -> itcp::Reglages {
+        itcp::Reglages { syn_essais: self.syncnt, delai_utilisateur: self.user_timeout as u64 * 1_000_000, orpheline }
+    }
 }
 
 /// Le premier étage, lu par `poll` sous le verrou court.
@@ -285,10 +319,10 @@ pub struct Premier {
 /// erreur ICMP pour un de ses paquets.
 pub enum Arrivee {
     Segment(Segment),
-    /// L'errno et sa fatalité (`icmp_err_convert`), le numéro de séquence
-    /// du segment d'origine (vérifié contre ce qui est en vol), la fille
-    /// visée ; IP_RECVERR de la socket.
-    Erreur { errno: i32, fatale: bool, seq: u32, fille: Option<u64>, recverr: bool, abandon: bool },
+    /// L'errno (`icmp_err_convert`), le réseau ou la machine injoignables
+    /// (RFC 6069), le numéro de séquence du segment d'origine (vérifié
+    /// contre ce qui est en vol), la fille visée ; IP_RECVERR de la socket.
+    Erreur { errno: i32, injoignable: bool, seq: u32, fille: Option<u64>, recverr: bool, abandon: bool },
 }
 
 /// Un segment reçu, pour une socket (ou la fille d'une écoute).
@@ -357,7 +391,10 @@ impl Partie {
     /// quadruplet pris, jusqu'au `close`, ou jusqu'à ce qu'elle redevienne
     /// neuve, `redevenir_neuve`.)
     fn apres(&mut self) {
-        let Mode::Connexion(t) = &self.mode else { return };
+        let Mode::Connexion(t) = &self.mode else {
+            self.armer();
+            return;
+        };
         if self.hors_table {
             return;
         }
@@ -374,15 +411,19 @@ impl Partie {
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.retirer(self.numero);
             }
+            self.desarmer();
             self.quitter_la_table();
             return;
         }
         if etat == Etat::TempsAttente || fin_orpheline {
             let (_, snd_nxt, rcv_nxt) = t.numeros();
             // Une orpheline en FIN_WAIT_2 attend TCP_LINGER2 (60 s par
-            // défaut, `tcp_fin_timeout`) ; TIME_WAIT, 60 s.
-            let duree = if fin_orpheline && self.options.linger2 > 0 {
-                self.options.linger2 as u64 * 1_000_000_000
+            // défaut, `tcp_fin_timeout`), au moins 3,5 RTO (`tcp_fin_time`) ;
+            // TIME_WAIT, 60 s.
+            let duree = if fin_orpheline {
+                let linger2 = if self.options.linger2 > 0 { self.options.linger2 as u64 * 1_000_000_000 } else { TEMPS_ATTENTE };
+                let rto = t.congestion().2;
+                linger2.max(4 * rto - rto / 2)
             } else {
                 TEMPS_ATTENTE
             };
@@ -391,9 +432,11 @@ impl Partie {
             let e = TempsAttente {
                 numero, locale: self.adresses.source, port: self.adresses.port, distante: self.adresses.distante,
                 port_distant: self.adresses.port_distant, snd_nxt, rcv_nxt, rcv_wnd: t.fenetre_annoncee(), fin_attente2: fin_orpheline,
+                dernier_ack: None,
             };
             // L'entrée de TIME_WAIT prend un numéro neuf, et l'échéance
             // qui va avec ; la socket n'a plus d'entrée dans la table.
+            self.desarmer();
             let mut tw = TW.verrouiller();
             // La place prise au démarrage : MAX_TW entrées, ou aucune si le
             // tas n'avait pas pu la donner (`initialiser`).
@@ -413,13 +456,57 @@ impl Partie {
                 }
             }
             self.quitter_la_table();
-        } else if etat == Etat::Fermee {
-            if self.orpheline {
-                if let Some(t) = TABLE.verrouiller().as_mut() {
-                    t.retirer(self.numero);
-                }
-                self.quitter_la_table();
+        } else if etat == Etat::Fermee && self.orpheline {
+            if let Some(t) = TABLE.verrouiller().as_mut() {
+                t.retirer(self.numero);
             }
+            self.desarmer();
+            self.quitter_la_table();
+        } else {
+            self.armer();
+        }
+    }
+
+    /// Inscrit la prochaine échéance de la connexion (ou de ses filles)
+    /// dans la liste du réseau, si elle a changé.
+    fn armer(&mut self) {
+        if self.hors_table {
+            return;
+        }
+        let e = match &self.mode {
+            Mode::Connexion(t) => t.echeance(),
+            Mode::Ecoute { filles, .. } => filles.iter().filter_map(|f| f.tcb.echeance()).min(),
+            Mode::Neuve => None,
+        };
+        if e == self.echeance_armee {
+            return;
+        }
+        match (self.echeance_armee, e) {
+            (None, Some(_)) => {
+                MINUTEURS.fetch_add(1, Ordering::Relaxed);
+            }
+            (Some(_), None) => {
+                MINUTEURS.fetch_sub(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        self.echeance_armee = e;
+        super::tache::armer(self.numero, e);
+    }
+
+    /// La socket n'a plus d'échéance : retirée de la liste.
+    fn desarmer(&mut self) {
+        if self.echeance_armee.is_some() {
+            super::tache::armer(self.numero, None);
+            self.oublier_echeance();
+        }
+    }
+
+    /// L'échéance n'est plus dans la liste (tombée, ou reprise par une
+    /// entrée de TIME_WAIT) : la socket l'oublie.
+    fn oublier_echeance(&mut self) {
+        if self.echeance_armee.take().is_some() {
+            MINUTEURS.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -434,6 +521,7 @@ impl Partie {
         {
             t.retirer(self.numero);
         }
+        self.desarmer();
         self.mode = Mode::Neuve;
         self.hors_table = false;
         self.etablie_un_jour = false;
@@ -462,6 +550,15 @@ impl Partie {
     }
 }
 
+impl Drop for Partie {
+    /// Une socket rendue : elle ne compte plus pour le détecteur (son
+    /// échéance, si elle en avait encore une, tombera sur une socket
+    /// absente, sans effet).
+    fn drop(&mut self) {
+        self.oublier_echeance();
+    }
+}
+
 /// Émet les segments de la connexion `t`, de `source` à `distante`.
 /// Ce qu'une connexion met dans l'en-tête IPv4 de ses segments : IP_TTL et
 /// IP_TOS de sa socket (ses copies, dans les options).
@@ -483,7 +580,7 @@ impl Ip {
 
 fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip) {
     let mut a_envoyer: Vec<itcp::Sortant> = Vec::new();
-    t.emettre(|s| {
+    t.emettre(maintenant(), |s| {
         // Sans place, le segment ne part pas : la retransmission y pourvoira.
         let _ = a_envoyer.ajouter(s);
     });
@@ -529,15 +626,16 @@ impl Possede for Partie {
         let _contexte = contexte::entrer();
         let s = match a {
             Arrivee::Segment(s) => s,
-            Arrivee::Erreur { errno, fatale, seq, fille, recverr, abandon } => {
-                self.erreur_icmp(errno, fatale, seq, fille, recverr, abandon);
+            Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon } => {
+                self.erreur_icmp(errno, injoignable, seq, fille, recverr, abandon);
+                self.emettre();
                 self.apres();
                 return;
             }
         };
         match &mut self.mode {
             Mode::Connexion(t) => {
-                t.recevoir(&s.entete, s.charge);
+                t.recevoir(&s.entete, s.charge, maintenant());
             }
             Mode::Ecoute { .. } => self.traiter_ecoute(s),
             Mode::Neuve => {
@@ -554,9 +652,29 @@ impl Possede for Partie {
         self.rafraichir(court)
     }
 
+    /// L'échéance de la socket est tombée (elle n'est plus dans la liste) :
+    /// la connexion, ou chaque fille d'une écoute, fait ce qui est échu ;
+    /// une fille dont les SYN-ACK sont restés sans réponse s'en va.
     fn minuteur(&mut self) {
-        // Les minuteurs d'une connexion viennent au commit suivant ; une
-        // orpheline en FIN_WAIT_2 est déjà une entrée de TIME_WAIT.
+        let _contexte = contexte::entrer();
+        self.oublier_echeance();
+        let maintenant = maintenant();
+        let ip = Ip::de(&self.options);
+        match &mut self.mode {
+            Mode::Connexion(t) => {
+                t.minuteur(maintenant);
+            }
+            Mode::Ecoute { filles, .. } => {
+                for f in filles.iter_mut() {
+                    f.tcb.minuteur(maintenant);
+                    emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip);
+                }
+                ranger_filles(filles);
+            }
+            Mode::Neuve => {}
+        }
+        self.emettre();
+        self.apres();
     }
 }
 
@@ -569,14 +687,14 @@ impl Partie {
     /// exact) et une erreur d'`abandon` (réseau ou hôte injoignable, TTL
     /// dépassé, paramètre), sans rien dire ; une autre erreur (un « port
     /// injoignable » forgé) ne la touche pas.
-    fn erreur_icmp(&mut self, errno: i32, fatale: bool, seq: u32, fille: Option<u64>, recverr: bool, abandon: bool) {
+    fn erreur_icmp(&mut self, errno: i32, injoignable: bool, seq: u32, fille: Option<u64>, recverr: bool, abandon: bool) {
         let en_vol = |t: &Tcb<Paquet>| {
-            let (una, nxt, _) = t.numeros();
-            !itcp::avant(seq, una) && itcp::avant(seq, nxt)
+            let (una, max, _) = t.numeros();
+            !itcp::avant(seq, una) && itcp::avant(seq, max)
         };
         match (&mut self.mode, fille) {
             (Mode::Connexion(t), None) if en_vol(t) => {
-                t.erreur_icmp(errno, fatale, recverr);
+                t.erreur_icmp(errno, seq, injoignable, recverr, maintenant());
             }
             (Mode::Ecoute { filles, .. }, Some(n)) => {
                 let Some(f) = filles.iter_mut().find(|f| f.numero == n) else { return };
@@ -590,7 +708,7 @@ impl Partie {
                 } else if en_vol(&f.tcb) {
                     // Une fille établie, en attente d'accept : une connexion
                     // comme une autre (chez Linux, déjà une socket).
-                    f.tcb.erreur_icmp(errno, fatale, recverr);
+                    f.tcb.erreur_icmp(errno, seq, injoignable, recverr, maintenant());
                     ranger_filles(filles);
                 }
             }
@@ -605,7 +723,7 @@ impl Partie {
         let Mode::Ecoute { backlog, filles } = &mut self.mode else { return };
         if let Some(n) = s.fille {
             if let Some(f) = filles.iter_mut().find(|f| f.numero == n) {
-                f.tcb.recevoir(&s.entete, s.charge);
+                f.tcb.recevoir(&s.entete, s.charge, maintenant());
                 emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip);
                 ranger_filles(filles);
                 return;
@@ -649,6 +767,7 @@ impl Partie {
         // la fille annonce (son échelle est choisie ici, au SYN).
         let mut tcb = Tcb::depuis_syn(&h, iss, mss, moi.rcvbuf.load(Ordering::Relaxed) as usize, moi.sndbuf.load(Ordering::Relaxed) as usize);
         tcb.mss_utilisateur = self.options.maxseg;
+        tcb.reglages = self.options.reglages(false);
         let lien = Lien {
             sorte: Sorte::Connectee, adresse: s.destination, port: h.destination, distante: s.source, port_distant: h.source,
             reuseaddr: false, reuseport: false, uid: 0, par_connect: false,
@@ -745,15 +864,13 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     if e.genre == icmp::INJOIGNABLE && e.code == icmp::FRAGMENTATION {
         return;
     }
-    let Some((errno, fatale)) = super::udp::convertir(e.genre, e.code, true) else { return };
-    // Ce qui retire une fille (l'`abort` de `tcp_req_err`) : le réseau ou
-    // la machine injoignables, le TTL dépassé, un paramètre.
-    let abandon = (e.genre == icmp::INJOIGNABLE && (e.code == icmp::RESEAU || e.code == icmp::HOTE))
-        || e.genre == icmp::TEMPS_DEPASSE
-        || e.genre == icmp::PARAMETRE;
+    let Some((errno, _)) = super::udp::convertir(e.genre, e.code, true) else { return };
+    let injoignable = e.genre == icmp::INJOIGNABLE && (e.code == icmp::RESEAU || e.code == icmp::HOTE);
+    // Ce qui retire une fille (l'`abort` de `tcp_req_err`).
+    let abandon = injoignable || e.genre == icmp::TEMPS_DEPASSE || e.genre == icmp::PARAMETRE;
     let recverr = sock.recverr.load(Ordering::Relaxed);
     let _contexte = contexte::entrer();
-    vers_socket(&sock, Arrivee::Erreur { errno, fatale, seq, fille, recverr, abandon });
+    vers_socket(&sock, Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon });
 }
 
 /// Un segment pour une entrée de TIME_WAIT, dans l'ordre de
@@ -766,6 +883,8 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
 /// connexion nouvelle du même quadruplet), avec un numéro initial plus
 /// loin que tout ce qu'elle a envoyé ; tout le reste (un FIN retransmis...)
 /// est réacquitté, et un ACK la prolonge de 60 s ; un RST ailleurs, rien.
+/// Chaque réponse hors fenêtre au plus toutes les 500 ms (comme une
+/// connexion, `tcp_timewait_check_oow_rate_limit`).
 fn temps_attente(n: u64, s: Segment) {
     let e = TW.verrouiller().iter().find(|e| e.numero == n).copied();
     let Some(e) = e else { return };
@@ -776,7 +895,22 @@ fn temps_attente(n: u64, s: Segment) {
     let fin = h.drapeaux & ftcp::FIN != 0;
     let fin_seq = h.seq.wrapping_add(s.charge.longueur() as u32).wrapping_add(u32::from(syn)).wrapping_add(u32::from(fin));
     let maintenant = crate::temps::ns_monotone();
-    let reacquitter = |ack_num: u32| envoyer_ack_tw(&e, ack_num);
+    // Réacquitter, au plus toutes les 500 ms.
+    let reacquitter = |ack_num: u32| {
+        let limite = {
+            let mut tw = TW.verrouiller();
+            let Some(x) = tw.iter_mut().find(|x| x.numero == n) else { return };
+            if x.dernier_ack.is_some_and(|d| maintenant.saturating_sub(d) < itcp::LIMITE_ACK_INVALIDE) {
+                true
+            } else {
+                x.dernier_ack = Some(maintenant);
+                false
+            }
+        };
+        if !limite {
+            envoyer_ack_tw(&e, ack_num);
+        }
+    };
     let prolonger = |echeance: u64, rcv_nxt: Option<u32>| {
         if let Some(r) = rcv_nxt
             && let Some(x) = TW.verrouiller().iter_mut().find(|x| x.numero == n)
@@ -903,7 +1037,7 @@ pub fn recevoir(source: [u8; 4], destination: [u8; 4], par_lo: bool, mut p: Paqu
 pub fn nouvelle(numero: u64) -> Possession<Partie> {
     let partie = Partie {
         numero, mode: Mode::Neuve, adresses: Adresses::default(), identifiant: 0, orpheline: false, hors_table: false,
-        options: OptionsTcp::DEFAUT, etablie_un_jour: false, connexion_en_cours: false,
+        options: OptionsTcp::DEFAUT, etablie_un_jour: false, connexion_en_cours: false, echeance_armee: None,
     };
     let premier = partie.premier(0, SNDBUF_DEFAUT as usize);
     Possession::new(partie, premier)
@@ -1100,11 +1234,13 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 let mut t = Tcb::connecter(port, a.port, iss, mss_vers(destination), s.rcvbuf.load(Ordering::Relaxed) as usize,
                                            s.sndbuf.load(Ordering::Relaxed) as usize);
                 t.mss_utilisateur = p.options.maxseg;
+                t.reglages = p.options.reglages(false);
                 p.mode = Mode::Connexion(t);
                 p.identifiant = crate::aleatoire::u32() as u16;
                 p.connexion_en_cours = non_bloquant;
                 let _contexte = contexte::entrer();
                 p.emettre();
+                p.apres();
                 drop(_contexte);
                 g.publier(|p, c| p.rafraichir(c));
                 if non_bloquant {
@@ -1176,7 +1312,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 numero, mode: Mode::Connexion(f.tcb),
                 adresses: Adresses { lie: true, adresse: locale, port, port_choisi: false, distante, port_distant, source: locale },
                 identifiant: f.identifiant, orpheline: false, hors_table, options: p.options, etablie_un_jour: true,
-                connexion_en_cours: false,
+                connexion_en_cours: false, echeance_armee: None,
             };
             let premier = partie.premier(0, SNDBUF_DEFAUT as usize);
             let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
@@ -1189,6 +1325,12 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.changer_objet(numero, Cible::Socket(enfant.clone()));
             }
+            // Ses minuteurs : à sa socket maintenant, sous son numéro ; ceux
+            // de l'écoute, recalculés sans elle.
+            if let Some(f) = enfant.flux.as_ref() {
+                f.posseder().donnee().armer();
+            }
+            p.armer();
             g.publier(|p, c| p.rafraichir(c));
             return Ok((enfant, distante, port_distant));
         }
@@ -1264,6 +1406,7 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, non_bloquant: bool, mut remplir
             fait += n;
             let _contexte = contexte::entrer();
             p.emettre();
+            p.apres();
             drop(_contexte);
             g.publier(|p, c| p.rafraichir(c));
             if fait == longueur {
@@ -1331,6 +1474,7 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
             let _contexte = contexte::entrer();
             t.lu();
             p.emettre();
+            p.apres();
             drop(_contexte);
             g.publier(|p, c| p.rafraichir(c));
             match faute {
@@ -1390,6 +1534,7 @@ pub fn arreter(s: &Arc<Socket>, arret: u8) -> Result<(), i64> {
             t.fermer_envoi();
             let _contexte = contexte::entrer();
             p.emettre();
+            p.apres();
         }
     }
     g.publier(|p, c| p.rafraichir(c));
@@ -1412,6 +1557,7 @@ pub fn fermer(s: &Arc<Socket>) {
             if p.adresses.lie && let Some(t) = TABLE.verrouiller().as_mut() {
                 t.retirer(p.numero);
             }
+            p.desarmer();
             p.hors_table = true;
         }
         Mode::Ecoute { filles, .. } => {
@@ -1426,17 +1572,19 @@ pub fn fermer(s: &Arc<Socket>) {
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.retirer(p.numero);
             }
+            p.desarmer();
             p.hors_table = true;
         }
         Mode::Connexion(t) => {
-            // Plus personne ne lira : des données neuves, en FIN_WAIT,
-            // couperont la connexion (inet::tcp).
-            t.fermer_lecture();
             if t.lisibles() > 0 || (linger.0 && linger.1 == 0) {
                 t.avorter();
             } else {
                 t.fermer_envoi();
             }
+            // Orpheline : personne n'attend plus la fin, elle abandonnera
+            // plus tôt (`tcp_orphan_retries`), et plus personne ne lira.
+            t.reglages.orpheline = true;
+            t.fermer_lecture();
             if !p.hors_table {
                 p.orpheline = true;
                 ORPHELINES.fetch_add(1, Ordering::Relaxed);
@@ -1447,6 +1595,7 @@ pub fn fermer(s: &Arc<Socket>) {
                 if let Some(tb) = TABLE.verrouiller().as_mut() {
                     tb.retirer(p.numero);
                 }
+                p.desarmer();
                 p.quitter_la_table();
             }
         }

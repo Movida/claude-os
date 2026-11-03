@@ -11,11 +11,17 @@
 //! par centaines de milliers et sont presque tous annulés avant de tomber
 //! (celui de retransmission de TCP est réarmé à chaque ACK), d'où des
 //! opérations en temps constant, au prix d'une précision qui baisse avec
-//! l'éloignement. Nous en aurons quelques dizaines : une liste triée est
-//! exacte, simple, et, réservée d'avance, ne prend jamais de mémoire
-//! pendant un programme (le lanceur mesure la mémoire rendue). Option
-//! écartée aussi : un tas binaire dont on laisse les entrées périmées en
-//! place (rien n'en borne le nombre, et il garde sa capacité).
+//! l'éloignement. Nous en avons quelques dizaines à la fois (la table des
+//! voisins, les connexions de claude et de nos tests, leurs TIME_WAIT) :
+//! une liste triée est exacte, simple, et, réservée d'avance, ne prend
+//! jamais de mémoire pendant un programme (le lanceur mesure la mémoire
+//! rendue). Armer coûte un parcours et un déplacement des entrées
+//! PRÉSENTES (pas de la capacité, réservée pour 8192 objets depuis TCP),
+//! sous un verrou court, à chaque changement d'échéance : quelques
+//! centaines d'octets aujourd'hui ; un serveur aux milliers de connexions
+//! demandera la roue de Linux. Option écartée aussi : un tas binaire dont
+//! on laisse les entrées périmées en place (rien n'en borne le nombre, et
+//! il garde sa capacité).
 //!
 //! L'heure est un argument (en nanosecondes) : testé sur l'hôte contre un
 //! modèle naïf.

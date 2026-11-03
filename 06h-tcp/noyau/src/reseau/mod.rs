@@ -64,6 +64,13 @@ pub fn attentes() -> usize {
     udp::attentes() + ping::attentes() + tcp::attentes()
 }
 
+/// Une connexion TCP a-t-elle un minuteur armé (une retransmission, un ACK
+/// retardé, une sonde) ? Même par `lo`, il peut encore réveiller un
+/// programme (le détecteur d'interblocage).
+pub fn minuteur_tcp_arme() -> bool {
+    tcp::minuteurs_armes() > 0
+}
+
 /// Le réseau est-il au repos : plus rien dans une file du noyau (celle de
 /// `lo`, la petite file d'émission d'une carte, la file d'un voisin qui se
 /// cherche), ni de travail en attente ou en cours de la tâche du réseau ?

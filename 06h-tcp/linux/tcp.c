@@ -18,7 +18,8 @@
  *   - la file d'écoute (listen(0) : un client établi, listen(2) : trois) ;
  *   - un connect vers une écoute dont la file est pleine (un « trou noir »
  *     sur lo : chaque SYN y est jeté) : SO_SNDTIMEO de 300 ms, EINPROGRESS,
- *     puis EALREADY ;
+ *     puis EALREADY ; TCP_SYNCNT 1 : ETIMEDOUT vers 3 s (trois SYN, à 0, 1
+ *     et 2 s : Linux 6.x ne double pas les premiers délais d'un SYN) ;
  *   - la socket vue comme fichier (fstat) ; UDP et TCP sur le même port ;
  *   - un connect non bloquant suivi par epoll en déclenchement par front,
  *     comme Bun ; deux fils qui s'échangent 1 Mio en aller-retour.
@@ -383,6 +384,17 @@ static void file_d_ecoute(void)
     verifier(r == EINPROGRESS && ms >= 290 && ms < 2000, "connect vers une ecoute pleine, SO_SNDTIMEO 300 ms : EINPROGRESS");
     verifier(masque(c) == 0 && erreur(connect(c, (void *)&x, sizeof x)) == EALREADY, "poll 0, puis connect : EALREADY");
     close(c);
+    /* Les SYN sans réponse, dans le même trou noir : avec TCP_SYNCNT 1,
+     * trois SYN puis ETIMEDOUT, vers 3 s (Linux 6.18 : 3,06 s). */
+    int d = socket(AF_INET, SOCK_STREAM, 0);
+    int un = 1;
+    setsockopt(d, IPPROTO_TCP, TCP_SYNCNT, &un, sizeof un);
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    r = erreur(connect(d, (void *)&x, sizeof x));
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    verifier(r == ETIMEDOUT && ms >= 2900 && ms < 4000, "TCP_SYNCNT 1, sans reponse : ETIMEDOUT vers 3 s");
+    close(d);
     close(c1);
     close(l);
 }
