@@ -91,6 +91,7 @@ pub mod attente;
 mod carte;
 mod congestion;
 mod cubic;
+mod debit;
 mod hors_ordre;
 mod minmax;
 mod reception;
@@ -100,6 +101,7 @@ mod sack;
 
 use attente::Attente;
 use congestion::{Congestion, Phase, TCP_REORDERING};
+use debit::{Chrono, Mesures};
 use hors_ordre::HorsOrdre;
 use minmax::MinMax;
 use reception::{EspaceLu, RATIO_DEFAUT};
@@ -559,6 +561,31 @@ pub struct Info {
     pub total_rto: u32,
     /// Le débit calculé (`tcpi_pacing_rate`), en octets par seconde.
     pub pacing: u64,
+    /// Les segments reçus et envoyés, ceux qui portent des données, les octets de
+    /// données envoyés (renvois compris), renvoyés, reçus (le FIN compte pour un,
+    /// comme chez Linux), et ce qui attend de partir (`tcpi_notsent_bytes`).
+    pub segs_in: u32,
+    pub segs_out: u32,
+    pub data_segs_in: u32,
+    pub data_segs_out: u32,
+    pub octets_envoyes: u64,
+    pub octets_renvoyes: u64,
+    pub octets_recus: u64,
+    pub non_envoyes: u32,
+    /// Le débit livré (`tcpi_delivery_rate`), en octets par seconde, et s'il est limité
+    /// par le programme. Une socket neuve n'a encore rien montré : limité.
+    pub debit: u64,
+    pub debit_limite: bool,
+    /// Le temps passé à avoir de quoi envoyer, et la part de la fenêtre de l'autre et du
+    /// tampon, en µs (`tcpi_busy_time`, `tcpi_rwnd_limited`, `tcpi_sndbuf_limited`).
+    pub occupe: u64,
+    pub fenetre_limitee: u64,
+    pub tampon_limite: u64,
+    /// Les segments reçus hors d'ordre (`tcpi_rcv_ooopack`), les épisodes de RTO, et
+    /// leur temps en ms (`tcpi_total_rto_recoveries`, `tcpi_total_rto_time`).
+    pub hors_ordre: u32,
+    pub rto_reprises: u32,
+    pub rto_temps: u32,
     /// Les échéances, pour /proc/net/tcp : la retransmission (ou la sonde,
     /// `sonde`) et le keepalive, en ns depuis l'appel (None : aucune) ;
     /// les ACK rapides qui restent, et le ping-pong.
@@ -585,6 +612,7 @@ impl Info {
             reordonnancement: TCP_REORDERING,
             min_rtt: u32::MAX,
             pacing: PACING_MAX,
+            debit_limite: true,
             ..Info::default()
         }
     }
@@ -910,7 +938,7 @@ pub struct Tcb<P: Charge> {
     /// La file par heure d'envoi (`tsorted_sent_queue`), nettoyée à la lecture,
     /// et l'heure d'envoi du dernier segment acquitté (`first_tx_mstamp`).
     tri: VecDeque<(u32, u64)>,
-    tx_acquitte: u64,
+    mesures: Mesures,
     /// L'heure du dernier envoi de données (`lsndtime`), et du dernier
     /// ACK reçu (`rcv_tstamp`).
     dernier_envoi: u64,
@@ -1057,7 +1085,7 @@ impl<P: Charge> Tcb<P> {
             tlp_high_seq: None,
             tlp_renvoi: false,
             tri: VecDeque::new(),
-            tx_acquitte: 0,
+            mesures: Mesures::new(),
             dernier_envoi: 0,
             dernier_recu: 0,
         }
@@ -1503,6 +1531,7 @@ impl<P: Charge> Tcb<P> {
         }
         if self.place() >= self.sndbuf / 3 {
             self.sans_place = false;
+            self.chrono_arreter(Chrono::TamponPlein, maintenant);
         }
     }
 
@@ -1733,6 +1762,7 @@ impl<P: Charge> Tcb<P> {
         self.retrans_out = 0;
         self.indice_renvoi = None;
         self.tri.clear();
+        self.chrono_arreter(Chrono::Occupee, self.heure);
         self.passer(Etat::Fermee, e);
         e.lisible = true;
         e.place = true;
@@ -1867,6 +1897,7 @@ impl<P: Charge> Tcb<P> {
         if let Some(ts) = self.ts.as_mut() {
             ts.instant = maintenant;
         }
+        self.compter_naissance(longueur_charge, maintenant);
         true
     }
 
@@ -1924,6 +1955,10 @@ impl<P: Charge> Tcb<P> {
         let fin = t.drapeaux & tcp::FIN != 0;
         let rst = t.drapeaux & tcp::RST != 0;
         let ack = t.drapeaux & tcp::ACK != 0;
+        // Ce que voit `tcp_v4_rcv` pour cette socket ; une fille compte à sa naissance.
+        if !matches!(self.etat, Etat::Fermee | Etat::TempsAttente) && !(self.fille && self.etat == Etat::SynRecu) {
+            self.mesures.segment_recu(longueur_charge);
+        }
         match self.etat {
             Etat::Fermee => {
                 // Une connexion fermée n'a plus de table : le noyau répond
@@ -1985,6 +2020,7 @@ impl<P: Charge> Tcb<P> {
                 if ack {
                     self.snd_una = t.ack;
                     self.syn_acquitte = true;
+                    self.octets_acquittes += 1;
                     if apres(self.snd_una, self.snd_nxt) {
                         self.snd_nxt = self.snd_una;
                     }
@@ -1999,6 +2035,7 @@ impl<P: Charge> Tcb<P> {
                     self.t_xmit = None;
                     self.passer(Etat::Etablie, &mut e);
                     self.etablir(maintenant);
+                    self.debit_du_syn(maintenant);
                     // L'ACK de la poignée de main part tout de suite ; sauf si
                     // des données vont le porter (`tcp_rcv_synsent_state_process` : un
                     // programme qui attend d'écrire, TCP_DEFER_ACCEPT, TCP_QUICKACK à 0) :
@@ -2127,6 +2164,17 @@ impl<P: Charge> Tcb<P> {
         if etablissement {
             self.syn_renvoye_pour_rien();
             self.mesurer_syn(maintenant);
+            // L'heure du SYN-ACK ne vaut plus : un futur RTO comptera depuis lui-même.
+            self.retrans_stamp = 0;
+            // L'ouverture simultanée a les deux à la fois.
+            if !self.fille {
+                self.livres += 1;
+            } else {
+                // La socket naît ici (`inet_csk_clone_lock`, `tcp_create_openreq_child`) : rien des
+                // échéances de la simple demande, et la fenêtre que dit ce segment.
+                self.recul = 0;
+                self.max_fenetre = (t.fenetre as u32) << self.echelle_envoi;
+            }
             self.etablir(maintenant);
             self.maj_pacing(self.mss_borne());
         }
@@ -2182,6 +2230,7 @@ impl<P: Charge> Tcb<P> {
         let una_avant = self.snd_una;
         let packets_avant = self.file.len();
         let (livres_avant, perdus_avant) = (self.livres, self.perdus);
+        let renie_avant = self.sack_renie;
         let a_des_blocs = self.sack_ok && t.options.nb_blocs > 0;
         let mut etat = EtatSack::default();
         if avant(t.ack, una_avant) {
@@ -2257,6 +2306,7 @@ impl<P: Charge> Tcb<P> {
         if flag & FLAG_SET_XMIT_TIMER != 0 && !self.programmer_sonde_de_perte(true, maintenant) {
             self.rearmer_rto(maintenant);
         }
+        self.generer_debit(self.livres.wrapping_sub(livres_avant), renie_avant, &etat, maintenant);
         self.controler_congestion(self.livres.wrapping_sub(livres_avant), self.perdus.wrapping_sub(perdus_avant), flag, maintenant);
         if self.rexmit != Rexmit::Rien {
             e.a_emettre = true;
@@ -2330,9 +2380,13 @@ impl<P: Charge> Tcb<P> {
         let mut n = ack.wrapping_sub(self.snd_una) as usize;
         self.octets_acquittes += n as u64;
         if !self.syn_acquitte {
-            // Le SYN compte pour un, pas dans le tampon.
+            // Le SYN compte pour un, pas dans le tampon ; et pas du tout pour une fille :
+            // chez Linux, son `snd_una` part d'après lui (`tcp_create_openreq_child`).
             self.syn_acquitte = true;
             n -= 1;
+            if self.fille {
+                self.octets_acquittes -= 1;
+            }
         }
         if self.fin_seq().is_some_and(|f| apres(ack, f)) {
             n = n.saturating_sub(1);
@@ -2421,6 +2475,10 @@ impl<P: Charge> Tcb<P> {
     /// départ, d'un segment seulement si le SYN a dû être renvoyé plus
     /// d'une fois, et pas pour rien.
     fn etablir(&mut self, maintenant: u64) {
+        // Le SYN-ACK de la fille (`tp->delivered++`, faute d'une entrée dans sa file), le SYN
+        // du client (`tcp_clean_rtx_queue`) : livrés.
+        self.livres += 1;
+        self.ack.lrcvtime = maintenant;
         if self.rtt.mesure() {
             self.rto = self.rtt.rto();
         } else {
@@ -2436,6 +2494,9 @@ impl<P: Charge> Tcb<P> {
         // (Linux aussi).
         if self.cc.phase == Phase::Perte {
             self.changer_phase(Phase::Ouverte);
+        }
+        if self.cc.phase != Phase::Perte {
+            self.rto_fini(maintenant);
         }
         self.cc.etablir(self.snd_nxt, maintenant);
         self.dernier_envoi = maintenant;
@@ -2507,6 +2568,7 @@ impl<P: Charge> Tcb<P> {
 
     /// Ce que rendent TCP_INFO et /proc/net/tcp (`tcp_get_info`).
     pub fn info(&self, maintenant: u64) -> Info {
+        let (occupe, fenetre_limitee, tampon_limite) = self.mesures.chronos(maintenant);
         let us = |ns: u64| (ns / 1000).min(u32::MAX as u64) as u32;
         let ms = |depuis: u64| (maintenant.saturating_sub(depuis) / 1_000_000).min(u32::MAX as u64) as u32;
         let echelle = self.etat.synchronise() && self.echelle_ok;
@@ -2556,6 +2618,22 @@ impl<P: Charge> Tcb<P> {
             rcv_space: self.espace.octets,
             total_rto: self.total_rto,
             pacing: self.cc.pacing,
+            segs_in: self.mesures.segs_in,
+            segs_out: self.mesures.segs_out,
+            data_segs_in: self.mesures.data_segs_in,
+            data_segs_out: self.mesures.data_segs_out,
+            octets_envoyes: self.mesures.octets_envoyes,
+            octets_renvoyes: self.mesures.octets_renvoyes,
+            octets_recus: self.mesures.octets_recus,
+            non_envoyes: self.non_envoyes() as u32,
+            debit: self.mesures.debit(self.mss_borne()),
+            debit_limite: self.mesures.rate_app_limite,
+            occupe,
+            fenetre_limitee,
+            tampon_limite,
+            hors_ordre: self.mesures.hors_ordre,
+            rto_reprises: self.mesures.rto_reprises,
+            rto_temps: self.mesures.temps_de_rto(maintenant),
             t_retrans: self.t_xmit.map(|t| t.saturating_sub(maintenant)),
             sonde: self.t_sorte == Minuteur::Sonde,
             t_keepalive: self.t_keepalive.map(|t| t.saturating_sub(maintenant)),
@@ -2681,6 +2759,7 @@ impl<P: Charge> Tcb<P> {
         let vraie = charge.taille_vraie();
         self.mesurer_rcv_mss(n, vraie, t);
         self.ack.programme = true;
+        self.mesures.hors_ordre += 1;
         let premier = self.hors_ordre.vide();
         // Plus de mémoire : jeté, et surtout pas annoncé : l'émetteur le croirait arrivé.
         let Ok(doublon) = self.hors_ordre.ranger(seq, charge) else { return };
@@ -2725,6 +2804,7 @@ impl<P: Charge> Tcb<P> {
         self.taille_vraie_reception += charge.taille_vraie();
         self.octets_reception += n;
         self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
+        self.mesures.octets_recus += n as u64;
         self.reception.push_back(charge);
         true
     }
@@ -2732,6 +2812,7 @@ impl<P: Charge> Tcb<P> {
     /// Le FIN de l'autre, à son tour (`tcp_fin`).
     fn recevoir_fin(&mut self, e: &mut Effets) {
         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
+        self.mesures.octets_recus += 1;
         self.fin_recue = true;
         self.ack.programme = true;
         e.lisible = true;
@@ -3319,6 +3400,7 @@ impl<P: Charge> Tcb<P> {
         }
         let h = self.entete(self.snd_nxt, drapeaux);
         let numero = self.compter_envoi(n);
+        self.compter_sortie(n);
         sortir(Sortant { entete: h, debut, longueur: n, numero });
         let fin_segment = self.snd_nxt.wrapping_add(n as u32 + u32::from(avec_fin));
         if n < self.mss_courant() as usize {
@@ -3334,7 +3416,8 @@ impl<P: Charge> Tcb<P> {
         }
         // Une sonde de fin de rafale armée laisse la place au RTO (`tcp_event_new_data_sent`).
         let rearmer = self.file.is_empty() || (self.t_xmit.is_some() && self.t_sorte == Minuteur::SondeDePerte);
-        self.file.push_back(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, self.livres, numero));
+        let tx = self.debit_parti(maintenant);
+        self.file.push_back(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, tx, numero));
         self.tri_ajouter(self.snd_nxt, maintenant);
         self.snd_nxt = fin_segment;
         if rearmer {
@@ -3356,12 +3439,16 @@ impl<P: Charge> Tcb<P> {
             // Un RST qui coupe la connexion est un segment comme un autre
             // (`tcp_send_active_reset`) ; celui qui répond à un segment refusé n'a
             // ni fenêtre ni options (`tcp_v4_send_reset`).
-            let mut h = if core::mem::take(&mut self.rst_actif) {
+            let actif = core::mem::take(&mut self.rst_actif);
+            let mut h = if actif {
                 self.entete(seq, drapeaux)
             } else {
                 Tcp { options: tcp::Options::default(), ..self.entete_avec(seq, drapeaux, 0) }
             };
             h.ack = ack;
+            if actif {
+                self.compter_sortie(0);
+            }
             sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
             if self.etat == Etat::Fermee {
                 return;
@@ -3398,6 +3485,7 @@ impl<P: Charge> Tcb<P> {
             if self.echelle_ok {
                 h.options.echelle = Some(self.echelle_reception);
             }
+            self.compter_sortie(0);
             sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
             self.snd_nxt = self.iss.wrapping_add(1);
             // Le premier SYN est chronométré ; pas ceux qui le répètent.
@@ -3419,10 +3507,15 @@ impl<P: Charge> Tcb<P> {
             // à acquitter.
             if self.etat == Etat::SynRecu && self.ack_maintenant {
                 let h = self.entete(self.seq_acceptable(), tcp::ACK);
+                self.compter_sortie(0);
                 sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
                 self.ack_envoye();
             }
             return;
+        }
+        // Du nouveau à envoyer (`tcp_add_write_queue_tail`).
+        if self.non_envoyes() > 0 {
+            self.chrono_commencer(Chrono::Occupee, maintenant);
         }
         // La sonde de fenêtre (`tcp_write_wakeup`) : ce qui tient dans une
         // fenêtre trop petite pour un segment entier ; une fenêtre nulle :
@@ -3439,6 +3532,7 @@ impl<P: Charge> Tcb<P> {
                 self.envoyer_donnees(n, avec_fin, maintenant, &mut sortir);
             } else {
                 let h = self.entete(self.snd_una.wrapping_sub(1), tcp::ACK);
+                self.compter_sortie(0);
                 sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
                 self.ack_envoye();
             }
@@ -3468,6 +3562,7 @@ impl<P: Charge> Tcb<P> {
         self.envoyer_neuf(maintenant, &mut sortir);
         if self.ack_maintenant {
             let h = self.entete(self.seq_acceptable(), tcp::ACK);
+            self.compter_sortie(0);
             sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
             self.ack_envoye();
         }
@@ -3483,6 +3578,8 @@ impl<P: Charge> Tcb<P> {
     fn envoyer_neuf(&mut self, maintenant: u64, sortir: &mut impl FnMut(Sortant)) {
         let retenu = self.autocork();
         let mut sortis = 0;
+        let a_envoyer = self.non_envoyes() > 0;
+        let mut fenetre_de_l_autre = false;
         loop {
             let debut = self.snd_nxt.wrapping_sub(self.seq_envoi) as usize;
             let reste = self.octets_envoi.saturating_sub(debut);
@@ -3499,6 +3596,7 @@ impl<P: Charge> Tcb<P> {
             let n = reste.min(self.mss_courant() as usize);
             let avec_fin = fin_ici && n == reste;
             if apres(self.snd_nxt.wrapping_add(n as u32 + u32::from(avec_fin)), self.snd_una.wrapping_add(self.snd_wnd)) {
+                fenetre_de_l_autre = true;
                 break;
             }
             // Nagle (`tcp_nagle_test`) : le dernier segment, incomplet,
@@ -3536,10 +3634,22 @@ impl<P: Charge> Tcb<P> {
         }
         self.pousser = false;
         self.plus_a_venir = false;
+        if a_envoyer {
+            if fenetre_de_l_autre {
+                self.chrono_commencer(Chrono::FenetreDeLAutre, maintenant);
+            } else {
+                self.chrono_arreter(Chrono::FenetreDeLAutre, maintenant);
+            }
+        }
         let limitee = self.paquets_en_vol() >= self.cc.cwnd;
         if sortis > 0 || limitee {
             let relachable = self.cc.phase == Phase::Ouverte && !self.reglages.orpheline && !self.sans_place;
-            self.cc.valider(limitee, self.file.len() as u32, self.snd_una, self.snd_nxt, self.rto, relachable, maintenant);
+            let affamee = self.cc.valider(limitee, self.file.len() as u32, self.snd_una, self.snd_nxt, self.rto, relachable, maintenant);
+            // La fin de `tcp_cwnd_validate` : rien à faire partir, pas la faute de la
+            // cwnd, et un programme qui attend : c'est le tampon qui limite.
+            if affamee && self.non_envoyes() == 0 && self.sans_place && matches!(self.etat, Etat::Etablie | Etat::AttenteFermeture) {
+                self.chrono_commencer(Chrono::TamponPlein, maintenant);
+            }
         }
         if sortis > 0 {
             // Une sonde par fin de rafale.

@@ -1455,7 +1455,7 @@ fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Resu
 }
 
 /// La taille de la `struct tcp_info` de Linux 6.18.
-const TAILLE_INFO: usize = 248;
+const TAILLE_INFO: usize = 280;
 
 /// La valeur d'une option de SOL_TCP (`do_tcp_getsockopt`), et sa
 /// longueur : un entier ; TCP_CONGESTION, son nom ; TCP_INFO, la
@@ -1542,12 +1542,13 @@ fn essais_en_secondes(essais: u32) -> i32 {
 /// zéro ailleurs (dont `tcpi_fackets` et `tcpi_last_ack_sent`, que Linux laisse
 /// aussi à 0).
 fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
-    o[..8].copy_from_slice(&[i.etat, i.phase, i.retransmissions, i.sondes, i.recul, i.options, i.echelle_envoi | i.echelle_reception << 4, 0]);
+    o[..8].copy_from_slice(&[i.etat, i.phase, i.retransmissions, i.sondes, i.recul, i.options, i.echelle_envoi | i.echelle_reception << 4, u8::from(i.debit_limite)]);
     let mots = [
         (8, i.rto), (12, i.ato), (16, i.snd_mss), (20, i.rcv_mss), (24, i.non_acquittes), (28, i.sackes), (32, i.perdus), (36, i.retransmis),
         (44, i.dernier_envoi), (52, i.dernier_recu), (56, i.dernier_ack), (60, i.pmtu), (68, i.rtt), (72, i.rttvar),
         (76, i.ssthresh), (80, i.cwnd), (84, i.advmss), (88, i.reordonnancement), (92, i.rcv_rtt), (96, i.rcv_space), (100, i.total_retrans), (64, i.rcv_ssthresh),
-        (148, i.min_rtt), (192, i.livres), (216, i.dsack_doublons), (220, i.reord_seen), (228, i.snd_wnd), (232, i.rcv_wnd),
+        (136, i.segs_out), (140, i.segs_in), (144, i.non_envoyes), (148, i.min_rtt), (152, i.data_segs_in), (156, i.data_segs_out),
+        (192, i.livres), (224, i.hors_ordre), (244, i.rto_temps), (216, i.dsack_doublons), (220, i.reord_seen), (228, i.snd_wnd), (232, i.rcv_wnd),
     ];
     for (decalage, v) in mots {
         o[decalage..decalage + 4].copy_from_slice(&v.to_le_bytes());
@@ -1555,8 +1556,16 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
     o[104..112].copy_from_slice(&i.pacing.to_le_bytes());
     // SO_MAX_PACING_RATE n'existe pas chez nous : aucune limite (`~0ULL`).
     o[112..120].copy_from_slice(&inet::tcp::PACING_MAX.to_le_bytes());
-    o[120..128].copy_from_slice(&i.octets_acquittes.to_le_bytes());
+    let longs = [
+        (120, i.octets_acquittes), (128, i.octets_recus), (160, i.debit), (168, i.occupe), (176, i.fenetre_limitee), (184, i.tampon_limite),
+        (200, i.octets_envoyes), (208, i.octets_renvoyes),
+    ];
+    for (decalage, v) in longs {
+        o[decalage..decalage + 8].copy_from_slice(&v.to_le_bytes());
+    }
     o[240..242].copy_from_slice(&(i.total_rto.min(u16::MAX as u32) as u16).to_le_bytes());
+    o[242..244].copy_from_slice(&(i.rto_reprises.min(u16::MAX as u32) as u16).to_le_bytes());
+    // Le reste (`tcpi_received_ce` et ceux d'ECN précis) : 0, nous n'avons pas ECN.
 }
 
 /// Les options de SOL_IP (`do_ip_setsockopt`) : la valeur lue en entier

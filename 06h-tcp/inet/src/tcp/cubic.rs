@@ -53,7 +53,7 @@
 use super::apres;
 use super::sack::JIFFY;
 
-const HZ: u32 = 250;
+pub(super) const HZ: u32 = 250;
 /// β × 1024 (`beta`), et l'échelle de son dénominateur (BICTCP_BETA_SCALE).
 const BETA: u32 = 717;
 const BETA_ECHELLE: u32 = 1024;

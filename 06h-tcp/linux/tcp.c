@@ -37,10 +37,14 @@
  *     un programme qui attend de la place ;
  *   - la réception qui s'ajuste : les fenêtres du SYN et du SYN-ACK, SO_RCVBUF qui
  *     suit le débit, TCP_WINDOW_CLAMP, SO_RCVLOWAT ;
- *   - TCP_DEFER_ACCEPT, et /proc/sys/net.
- * Rien ne compare de valeur qui dépend de la configuration de Linux (le
- * MSS sur lo, SO_SNDBUF agrandi). Sur l'hôte comme chez nous. Les délais sont
- * des multiples de 4 ms (le tic de l'hôte : HZ = 250).
+ *   - TCP_DEFER_ACCEPT, et /proc/sys/net ;
+ *   - TCP_INFO jusqu'au bout : les compteurs, le débit livré, les chronomètres ;
+ *   - les coupures : un FIN puis un RST, shutdown en SYN_SENT et d'une écoute,
+ *     connect(AF_UNSPEC), le connect qui suit une erreur ; les lectures sans copie
+ *     ni retrait ; une connexion morte qui garde son port, le SO_REUSEADDR des filles.
+ * Les valeurs comparées sont celles d'un Linux 6.18 à sa configuration par défaut ; sur un autre
+ * noyau, une différence se dit, sans compter (`verifier`). Sur l'hôte comme chez nous. Les délais
+ * sont des multiples de 4 ms (le tic de l'hôte : HZ = 250).
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -1408,9 +1412,136 @@ static void defer_accept(void)
         getsockopt(a, IPPROTO_TCP, TCP_INFO, &i, &li);
         long attendu = defer == 1 ? 1000 : 3000;
         verifier(pret == 1 && ms >= attendu - 100 && ms < attendu + 500 && i.tcpi_total_retrans == 1, defer == 1 ? "TCP_DEFER_ACCEPT 1, client muet : pret a 1 s, un SYN-ACK renvoye" : "TCP_DEFER_ACCEPT 2, client muet : pret a 3 s, un SYN-ACK renvoye");
+        /* Les RTO de la demande (`tcp_create_openreq_child`) : autant que d'échéances, un
+         * épisode, et son temps, 1 s ou 3 s. */
+        uint32_t rtos = champ(a, 240), temps = champ(a, 244);
+        verifier((rtos & 0xFFFF) == (uint32_t)defer && (rtos >> 16) == 1 && temps + 100 >= (uint32_t)attendu && temps < (uint32_t)attendu + 500,
+                 "la fille : ses RTO, un episode, et son temps");
         close(a);
         close(c);
     }
+    close(l);
+}
+
+static uint64_t champ64(int s, int decalage)
+{
+    unsigned char b[280];
+    socklen_t l = sizeof b;
+    uint64_t v = 0;
+    if (getsockopt(s, IPPROTO_TCP, TCP_INFO, b, &l) == 0 && l >= (socklen_t)decalage + 8)
+        memcpy(&v, b + decalage, 8);
+    return v;
+}
+
+/* Les décalages de `struct tcp_info` (Linux 6.18, 280 octets), qui ne sont pas dans l'en-tête
+ * de la glibc. */
+enum { BYTES_ACKED = 120, BYTES_RECEIVED = 128, SEGS_OUT = 136, SEGS_IN = 140, NOTSENT = 144, DATA_SEGS_IN = 152, DATA_SEGS_OUT = 156,
+       DELIVERY_RATE = 160, BUSY = 168, RWND_LIMITED = 176, DELIVERED = 192, BYTES_SENT = 200, BYTES_RETRANS = 208, OOOPACK = 224,
+       TOTAL_RTO = 240, RTO_TIME = 244 };
+
+/* Le bit de `tcpi_delivery_rate_app_limited`, et les deux mots de 16 bits. */
+static unsigned app_limite(int s)
+{
+    unsigned char b[8];
+    socklen_t l = sizeof b;
+    getsockopt(s, IPPROTO_TCP, TCP_INFO, b, &l);
+    return b[7] & 1;
+}
+
+/* Attend que tout ce qu'a envoyé `s` soit acquitté. */
+static void attendre_acquittement(int s)
+{
+    for (int k = 0; k < 100 && champ(s, 24) != 0; k++)
+        attendre_ms(5);
+}
+
+/* TCP_INFO, jusqu'au bout (`tcp_get_info`) : les compteurs d'une conversation, comptés
+ * exactement ; le débit livré ; les chronomètres. */
+static void info_complete(void)
+{
+    unsigned char t[512];
+    socklen_t lt = sizeof t;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(getsockopt(s, IPPROTO_TCP, TCP_INFO, t, &lt) == 0 && lt == 280, "TCP_INFO : 280 octets");
+    verifier(app_limite(s) == 1 && champ64(s, DELIVERY_RATE) == 0, "TCP_INFO d'une socket neuve : pas de debit, limite par le programme");
+    close(s);
+    int port, l = ecoute(&port, 2);
+    verifier(app_limite(l) == 0, "TCP_INFO d'une ecoute : pas limite");
+    struct sockaddr_in x = lo(port);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    int v = 1;
+    setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &v, sizeof v);
+    connect(c, (void *)&x, sizeof x);
+    int a = accept(l, NULL, NULL);
+    setsockopt(a, IPPROTO_TCP, TCP_NODELAY, &v, sizeof v);
+    /* La poignée de main : le SYN et l'ACK du client ; le SYN et l'ACK vus par la fille, dont
+     * le SYN-ACK n'est pas compté (il part de la demande). */
+    verifier(champ(c, SEGS_OUT) == 2 && champ(c, SEGS_IN) == 1, "le client : 2 segments envoyes, 1 recu");
+    verifier(champ(a, SEGS_OUT) == 0 && champ(a, SEGS_IN) == 2, "la fille : 0 envoye, 2 recus");
+    verifier(champ(c, DELIVERED) == 1 && champ(a, DELIVERED) == 1, "le SYN et le SYN-ACK : livres");
+    verifier(champ64(c, BYTES_ACKED) == 1 && champ64(a, BYTES_ACKED) == 0, "tcpi_bytes_acked : le SYN compte pour le client");
+    /* Le SYN n'a pas de `delivered_mstamp`, compté dans `packets_out` avant de partir. */
+    verifier(champ64(c, DELIVERY_RATE) == 0 && app_limite(c) == 1 && champ64(a, DELIVERY_RATE) == 0 && app_limite(a) == 1,
+             "la poignee de main : pas encore de debit");
+    static char o[4096];
+    verifier(write(c, o, 1000) == 1000 && read(a, o, 1000) == 1000, "1000 octets");
+    attendre_acquittement(c);
+    verifier(champ(c, SEGS_OUT) == 3 && champ(c, DATA_SEGS_OUT) == 1 && champ64(c, BYTES_SENT) == 1000 && champ64(c, BYTES_ACKED) == 1001,
+             "le client : 3 segments envoyes, dont 1 de donnees, 1000 octets, 1001 acquittes");
+    verifier(champ(c, SEGS_IN) == 2 && champ(a, SEGS_IN) == 3 && champ(a, DATA_SEGS_IN) == 1 && champ64(a, BYTES_RECEIVED) == 1000,
+             "la fille : 3 recus, dont 1 de donnees, 1000 octets");
+    verifier(champ(c, DELIVERED) == 2, "tcpi_delivered : 2");
+    verifier(champ64(c, DELIVERY_RATE) > 0, "le client : un debit, celui de ce segment");
+    verifier(write(a, o, 500) == 500 && read(c, o, 500) == 500, "500 octets dans l'autre sens");
+    attendre_acquittement(a);
+    verifier(champ(a, DATA_SEGS_OUT) == 1 && champ64(a, BYTES_SENT) == 500 && champ64(c, BYTES_RECEIVED) == 500 && champ64(a, BYTES_ACKED) == 500,
+             "dans l'autre sens : 1 segment de donnees, 500 octets");
+    verifier(champ(c, NOTSENT) == 0, "tcpi_notsent_bytes : 0");
+    setsockopt(c, IPPROTO_TCP, TCP_CORK, &v, sizeof v);
+    verifier(write(c, o, 10) == 10 && champ(c, NOTSENT) == 10, "TCP_CORK : 10 octets retenus, dans tcpi_notsent_bytes");
+    int zero = 0;
+    setsockopt(c, IPPROTO_TCP, TCP_CORK, &zero, sizeof zero);
+    verifier(champ(c, NOTSENT) == 0 && read(a, o, 10) == 10, "et ils partent");
+    verifier(champ64(c, BYTES_RETRANS) == 0 && champ(c, OOOPACK) == 0 && champ(a, OOOPACK) == 0 && (champ(c, TOTAL_RTO) >> 16) == 0 && champ(c, RTO_TIME) == 0,
+             "rien de renvoye, ni de hors d'ordre, ni de RTO");
+    /* Le FIN compte dans tcpi_bytes_received (`tcp_rcv_nxt_update`). */
+    uint64_t recus = champ64(a, BYTES_RECEIVED);
+    shutdown(c, SHUT_WR);
+    verifier(read(a, o, 1) == 0 && champ64(a, BYTES_RECEIVED) == recus + 1, "le FIN : un octet de plus recu");
+    close(a);
+    close(c);
+    /* Sans lecteur : la fenêtre de l'autre borne, et le temps passe à son compte. */
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&x, sizeof x);
+    a = accept(l, NULL, NULL);
+    fcntl(c, F_SETFL, O_NONBLOCK);
+    static char gros[1 << 20];
+    while (write(c, gros, sizeof gros) > 0)
+        ;
+    attendre_ms(60);
+    while (write(c, gros, sizeof gros) > 0)
+        ;
+    verifier(champ64(c, BUSY) > 0 && champ64(c, RWND_LIMITED) > 0, "sans lecteur : occupe, limite par la fenetre de l'autre");
+    verifier(champ(c, NOTSENT) > 0, "des octets qui attendent de partir");
+    int lu = 0;
+    fcntl(a, F_SETFL, O_NONBLOCK);
+    for (int k = 0; k < 1000; k++) {
+        long n = read(a, gros, sizeof gros);
+        if (n > 0) {
+            lu += n;
+            k = 0;
+        } else {
+            attendre_ms(5);
+        }
+        if (champ(c, NOTSENT) == 0 && champ(c, 24) == 0 && n <= 0)
+            break;
+    }
+    verifier(lu > 0 && champ64(c, DELIVERY_RATE) > 0, "le debit livre d'un gros envoi");
+    uint64_t occupe = champ64(c, BUSY);
+    attendre_ms(30);
+    verifier(champ64(c, BUSY) == occupe && occupe > 0, "tout acquitte : plus occupe, le temps reste");
+    close(a);
+    close(c);
     close(l);
 }
 
@@ -1505,6 +1636,7 @@ int main(void)
     rcvlowat();
     defer_accept();
     reglages();
+    info_complete();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

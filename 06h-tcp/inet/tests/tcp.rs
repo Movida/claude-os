@@ -1561,6 +1561,412 @@ fn le_client_retient_son_ack() {
     assert_eq!(f.etat(), Etat::Etablie);
 }
 
+// --- TCP_INFO : les compteurs, le débit livré, les chronomètres (debit.rs) ---
+
+/// Une conversation comptée ; `linux/tcp.c` compte la même sur le vrai Linux.
+#[test]
+fn info_les_compteurs() {
+    let (mut c, mut f) = paire();
+    let (i, j) = (c.info(maintenant()), f.info(maintenant()));
+    // Le SYN-ACK de la fille ne compte pas : chez Linux, il part d'une simple demande.
+    assert_eq!((i.segs_out, i.segs_in, j.segs_out, j.segs_in), (2, 1, 0, 2));
+    assert_eq!((i.livres, j.livres, i.octets_acquittes, j.octets_acquittes), (1, 1, 1, 0));
+    assert_eq!((j.rto_reprises, j.rto_temps), (0, 0));
+    assert_eq!((i.debit, i.debit_limite, j.debit, j.debit_limite), (0, true, 0, true));
+    ecrire(&mut c, &[0; 1000]);
+    livrer(&mut c, &mut f);
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    let (i, j) = (c.info(maintenant()), f.info(maintenant()));
+    assert_eq!((i.segs_out, i.data_segs_out, i.octets_envoyes, i.octets_acquittes, i.segs_in, i.data_segs_in), (3, 1, 1000, 1001, 2, 0));
+    assert_eq!((j.segs_out, j.data_segs_out, j.segs_in, j.data_segs_in, j.octets_recus), (1, 0, 3, 1, 1000));
+    assert_eq!(i.livres, 2);
+    // TCP_CORK : ce qui attend.
+    c.reglages.cork = true;
+    ecrire(&mut c, &[0; 10]);
+    sortants(&mut c);
+    assert_eq!(c.info(maintenant()).non_envoyes, 10);
+    c.reglages.cork = false;
+    livrer(&mut c, &mut f);
+    assert_eq!(c.info(maintenant()).non_envoyes, 0);
+    // Le FIN compte dans ce qui est reçu.
+    c.fermer_envoi();
+    livrer(&mut c, &mut f);
+    assert_eq!(f.info(maintenant()).octets_recus, 1011);
+}
+
+/// Les segments rangés hors d'ordre.
+#[test]
+fn info_hors_ordre() {
+    let (mut c, mut f) = paire();
+    ecrire(&mut c, &[0; 3 * MSS as usize]);
+    let s = sortants(&mut c);
+    f.recevoir(&s[1].0, Octets(s[1].1.clone(), 0), maintenant());
+    f.recevoir(&s[2].0, Octets(s[2].1.clone(), 0), maintenant());
+    assert_eq!(f.info(maintenant()).hors_ordre, 2);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    assert_eq!(f.info(maintenant()).hors_ordre, 2);
+}
+
+/// `octets` envoyés à `f`, et leur ACK `ms` plus tard.
+fn envoyer_et_acquitter(c: &mut Connexion, f: &mut Connexion, octets: usize, ms: u64) {
+    assert_eq!(ecrire(c, &vec![0u8; octets]), octets);
+    f.quickack(true);
+    livrer(c, f);
+    avancer(ms * MS);
+    assert!(livrer(f, c) >= 1);
+}
+
+/// Le débit livré, à la main (`tcp_rate_gen`) : un aller-retour de 10 ms pour le SYN ; le
+/// dernier échantillon s'il n'est pas limité par le programme, sinon le plus haut.
+#[test]
+fn debit_livre() {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let sa = sortants(&mut f)[0].0;
+    avancer(10 * MS);
+    c.recevoir(&sa, vide(), maintenant());
+    livrer(&mut c, &mut f);
+    let mss = c.info(maintenant()).snd_mss as usize;
+    let debit = |c: &Connexion| {
+        let i = c.info(maintenant());
+        (i.debit / mss as u64, i.debit_limite)
+    };
+    assert_eq!(debit(&c), (0, true));
+    // 5 segments en 20 ms : 250 par seconde.
+    envoyer_et_acquitter(&mut c, &mut f, 5 * mss, 20);
+    assert_eq!(debit(&c), (250, false));
+    // Le programme s'est fait attendre, et 1 segment en 40 ms est plus lent : il ne compte pas.
+    c.verifier_app_limite(0);
+    envoyer_et_acquitter(&mut c, &mut f, mss, 40);
+    assert_eq!(debit(&c), (250, false));
+    // Limité aussi, mais plus haut que ce qu'on savait : retenu, et dit limité.
+    c.verifier_app_limite(0);
+    envoyer_et_acquitter(&mut c, &mut f, 10 * mss, 20);
+    assert_eq!(debit(&c), (500, true));
+    // Limité, plus bas : non (la comparaison : 2 en 20 ms, contre 10 en 20 ms).
+    c.verifier_app_limite(0);
+    envoyer_et_acquitter(&mut c, &mut f, 2 * mss, 20);
+    assert_eq!(debit(&c), (500, true));
+    // Pas limité : retenu, même plus bas.
+    envoyer_et_acquitter(&mut c, &mut f, 2 * mss, 40);
+    assert_eq!(debit(&c), (50, false));
+    // Un aller-retour égal au plus petit RTT : un échantillon comme un autre.
+    envoyer_et_acquitter(&mut c, &mut f, mss, 10);
+    assert_eq!(debit(&c), (100, false));
+    // Encore en attente dans la carte : ce n'est pas le programme.
+    c.verifier_app_limite(1);
+    envoyer_et_acquitter(&mut c, &mut f, mss, 40);
+    assert_eq!(debit(&c), (25, false));
+}
+
+/// Rien de mesurable : pas de débit (et pas de division par zéro) : l'horloge n'a pas bougé.
+#[test]
+fn debit_sans_temps() {
+    let (mut c, mut f) = paire();
+    envoyer_et_acquitter(&mut c, &mut f, 1000, 0);
+    assert_eq!(c.info(maintenant()).debit, 0);
+}
+
+/// Une connexion établie, avec SACK, de 10 ms d'aller-retour : le client, sa fille, et son MSS.
+fn paire_mesuree() -> (Connexion, Connexion, usize) {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.proposer_sack();
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    f.proposer_sack();
+    let sa = sortants(&mut f)[0].0;
+    avancer(10 * MS);
+    c.recevoir(&sa, vide(), maintenant());
+    livrer(&mut c, &mut f);
+    f.quickack(true);
+    let mss = c.info(maintenant()).snd_mss as usize;
+    (c, f, mss)
+}
+
+/// Un segment vieux, le premier que couvre cet ACK : c'est lui l'échantillon, même s'il est parti
+/// avant le dernier acquitté (`!rs->prior_delivered`).
+#[test]
+fn debit_du_plus_vieux_quand_il_est_seul() {
+    let (mut c, mut f, mss) = paire_mesuree();
+    let un = mss as u64 * 1_000_000;
+    assert_eq!(ecrire(&mut c, &vec![0u8; mss]), mss);
+    let s1 = sortants(&mut c);
+    avancer(10 * MS);
+    assert_eq!(ecrire(&mut c, &vec![0u8; mss]), mss);
+    let s2 = sortants(&mut c);
+    assert_eq!((s1.len(), s2.len()), (1, 1));
+    // Le second d'abord, SACKé : 1 segment, en 30 ms depuis la dernière livraison.
+    avancer(20 * MS);
+    f.recevoir(&s2[0].0, Octets(s2[0].1.clone(), 0), maintenant());
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    assert_eq!(c.info(maintenant()).debit, un / 30_000);
+    // Le premier : 2 segments en 40 ms.
+    avancer(10 * MS);
+    f.recevoir(&s1[0].0, Octets(s1[0].1.clone(), 0), maintenant());
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    assert_eq!(c.info(maintenant()).debit, 2 * un / 40_000);
+}
+
+/// Une livraison déplace le départ des mesures (`delivered_mstamp`) : ce qui part ensuite compte de
+/// là, pas de plus loin.
+#[test]
+fn debit_depuis_la_derniere_livraison() {
+    let (mut c, mut f, mss) = paire_mesuree();
+    let un = mss as u64 * 1_000_000;
+    assert_eq!(ecrire(&mut c, &vec![0u8; mss]), mss);
+    let s1 = sortants(&mut c);
+    avancer(5 * MS);
+    assert_eq!(ecrire(&mut c, &vec![0u8; mss]), mss);
+    let s2 = sortants(&mut c);
+    avancer(10 * MS);
+    f.recevoir(&s1[0].0, Octets(s1[0].1.clone(), 0), maintenant());
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    assert_eq!(ecrire(&mut c, &vec![0u8; mss]), mss);
+    let s3 = sortants(&mut c);
+    avancer(20 * MS);
+    f.recevoir(&s2[0].0, Octets(s2[0].1.clone(), 0), maintenant());
+    f.recevoir(&s3[0].0, Octets(s3[0].1.clone(), 0), maintenant());
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    // s3 : 2 segments de plus, en 20 ms depuis la livraison de s1.
+    assert_eq!(c.info(maintenant()).debit, 2 * un / 20_000);
+}
+
+/// La bulle du programme court tant que ce qui était en vol n'est pas livré (`app_limited`), et ce
+/// qui part pendant ce temps est dit limité.
+#[test]
+fn la_bulle_du_programme() {
+    let (mut c, mut f, mss) = paire_mesuree();
+    // Un premier échantillon, pas limité, à battre : 10 par seconde... un seul segment en 100 ms.
+    envoyer_et_acquitter(&mut c, &mut f, mss, 100);
+    assert_eq!(c.info(maintenant()).debit_limite, false);
+    // A en vol ; le programme se fait attendre : la bulle va jusqu'à A.
+    assert_eq!(ecrire(&mut c, &vec![0u8; mss]), mss);
+    let a = sortants(&mut c);
+    c.verifier_app_limite(0);
+    // B part pendant la bulle ; A est livré : il ne la dépasse pas : C aussi est limité.
+    assert_eq!(ecrire(&mut c, &vec![0u8; mss]), mss);
+    let b = sortants(&mut c);
+    avancer(100 * MS);
+    f.recevoir(&a[0].0, Octets(a[0].1.clone(), 0), maintenant());
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    assert_eq!(ecrire(&mut c, &vec![0u8; mss]), mss);
+    let d = sortants(&mut c);
+    // B puis C, lents : limités, plus lents que ce qu'on sait : le débit ne change pas.
+    let avant = c.info(maintenant()).debit;
+    avancer(400 * MS);
+    f.recevoir(&b[0].0, Octets(b[0].1.clone(), 0), maintenant());
+    f.recevoir(&d[0].0, Octets(d[0].1.clone(), 0), maintenant());
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    let i = c.info(maintenant());
+    assert_eq!((i.debit, i.debit_limite), (avant, false));
+}
+
+/// Ce qui ne fait pas une bulle : autant qu'un segment qui attend, ou la cwnd pleine.
+#[test]
+fn pas_de_bulle() {
+    let (mut c, mut f, mss) = paire_mesuree();
+    envoyer_et_acquitter(&mut c, &mut f, mss, 10);
+    // Ce qui suit, s'il n'y a pas de bulle, est retenu, même plus lent : 1 par seconde.
+    let lent = |c: &mut Connexion, f: &mut Connexion| {
+        envoyer_et_acquitter(c, f, mss, 1000);
+        let i = c.info(maintenant());
+        assert_eq!((i.debit / mss as u64, i.debit_limite), (1, false));
+    };
+    let tout_acquitter = |c: &mut Connexion, f: &mut Connexion, s: Vec<(Tcp, Vec<u8>)>| {
+        avancer(10 * MS);
+        for (h, o) in s {
+            f.recevoir(&h, Octets(o, 0), maintenant());
+        }
+        assert!(livrer(f, c) >= 1);
+        assert_eq!(c.info(maintenant()).non_acquittes, 0);
+    };
+    // Un segment entier qui attend.
+    c.reglages.cork = true;
+    assert_eq!(ecrire(&mut c, &vec![0u8; mss]), mss);
+    c.verifier_app_limite(0);
+    let s = sortants(&mut c);
+    assert_eq!(s.len(), 1);
+    c.reglages.cork = false;
+    tout_acquitter(&mut c, &mut f, s);
+    lent(&mut c, &mut f);
+    // La cwnd pleine.
+    let cwnd = c.info(maintenant()).cwnd as usize;
+    assert_eq!(ecrire(&mut c, &vec![0u8; cwnd * mss]), cwnd * mss);
+    let s = sortants(&mut c);
+    assert_eq!(s.len(), cwnd);
+    c.verifier_app_limite(0);
+    tout_acquitter(&mut c, &mut f, s);
+    lent(&mut c, &mut f);
+    // Encore dans la carte.
+    c.verifier_app_limite(1);
+    lent(&mut c, &mut f);
+}
+
+/// Un segment SACKé n'est compté qu'une fois : l'ACK cumulatif qui le couvre ensuite garde,
+/// parmi les autres, le plus récent (`tcp_rate_skb_delivered`).
+#[test]
+fn debit_livre_avec_sack() {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.proposer_sack();
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    f.proposer_sack();
+    let sa = sortants(&mut f)[0].0;
+    avancer(10 * MS);
+    c.recevoir(&sa, vide(), maintenant());
+    livrer(&mut c, &mut f);
+    let mss = c.info(maintenant()).snd_mss as usize;
+    assert_eq!(ecrire(&mut c, &vec![0u8; 3 * mss]), 3 * mss);
+    let s = sortants(&mut c);
+    assert_eq!(s.len(), 3);
+    f.recevoir(&s[2].0, Octets(s[2].1.clone(), 0), maintenant());
+    avancer(30 * MS);
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    let i = c.info(maintenant());
+    assert_eq!((i.livres, i.debit), (2, mss as u64 * 1_000_000 / 30_000));
+    avancer(10 * MS);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    f.recevoir(&s[1].0, Octets(s[1].1.clone(), 0), maintenant());
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    let i = c.info(maintenant());
+    assert_eq!((i.livres, i.debit), (4, 3 * mss as u64 * 1_000_000 / 40_000));
+}
+
+/// Le temps occupé : tant que quelque chose attend, d'être envoyé ou acquitté.
+#[test]
+fn chronos_occupee() {
+    let (mut c, mut f) = paire();
+    assert_eq!(c.info(maintenant()).occupe, 0);
+    ecrire(&mut c, &[0; 5 * 1000]);
+    f.quickack(true);
+    livrer(&mut c, &mut f);
+    avancer(20 * MS);
+    assert_eq!(c.info(maintenant()).occupe, 20_000);
+    assert!(livrer(&mut f, &mut c) >= 1);
+    avancer(20 * MS);
+    let i = c.info(maintenant());
+    assert_eq!((i.occupe, i.fenetre_limitee, i.tampon_limite), (20_000, 0, 0));
+}
+
+/// La fenêtre de l'autre : le temps passe à son compte, jusqu'à ce qu'elle s'ouvre.
+#[test]
+fn chronos_fenetre_de_l_autre() {
+    let (mut c, mut f) = paire_avec(MSS, 8192, 262_144);
+    assert_eq!(ecrire(&mut c, &vec![0u8; 64 * 1024]), 64 * 1024);
+    calmer(&mut c, &mut f);
+    assert!(c.info(maintenant()).non_envoyes > 0);
+    let avant = c.info(maintenant());
+    avancer(40 * MS);
+    let i = c.info(maintenant());
+    assert_eq!(i.fenetre_limitee - avant.fenetre_limitee, 40_000);
+    assert_eq!(i.occupe - avant.occupe, 40_000);
+    // L'autre lit : elle s'ouvre, et ce n'est plus sa faute.
+    while !lire(&mut f, 1 << 20).is_empty() {
+        calmer(&mut c, &mut f);
+    }
+    let avant = c.info(maintenant());
+    avancer(40 * MS);
+    assert_eq!(c.info(maintenant()).fenetre_limitee, avant.fenetre_limitee);
+}
+
+/// Elle s'ouvre, et il reste de quoi envoyer (ici, retenu par TCP_CORK) : la connexion reste occupée,
+/// mais plus à cause de la fenêtre (`tcp_chrono_stop`).
+#[test]
+fn chronos_fenetre_qui_s_ouvre_en_restant_occupee() {
+    let (mut c, mut f) = paire_avec(MSS, 8192, 262_144);
+    c.reglages.cork = true;
+    let octets = 16 * MSS as usize + 100;
+    assert_eq!(ecrire(&mut c, &vec![0u8; octets]), octets);
+    calmer(&mut c, &mut f);
+    avancer(8 * MS);
+    let i = c.info(maintenant());
+    assert!(i.fenetre_limitee >= 8000, "{}", i.fenetre_limitee);
+    while !lire(&mut f, 1 << 20).is_empty() {
+        calmer(&mut c, &mut f);
+    }
+    assert_eq!(c.info(maintenant()).non_envoyes, 100);
+    let avant = c.info(maintenant());
+    avancer(40 * MS);
+    let i = c.info(maintenant());
+    assert_eq!(i.fenetre_limitee, avant.fenetre_limitee);
+    assert_eq!(i.occupe - avant.occupe, 40_000);
+}
+
+/// Le tampon du programme : tout est parti, sans que la cwnd n'y soit pour rien, et il attend de
+/// la place : c'est lui qui limite (`tcp_cwnd_validate`). Jusqu'à ce que la place revienne.
+#[test]
+fn chronos_tampon_plein() {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 8192, ECHELLE);
+    c.sndbuf_fixe = true;
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    calmer(&mut c, &mut f);
+    assert_eq!(ecrire(&mut c, &[0; 6000]), 6000);
+    c.marquer_sans_place();
+    f.quickack(true);
+    livrer(&mut c, &mut f);
+    avancer(8 * MS);
+    let i = c.info(maintenant());
+    assert_eq!((i.tampon_limite, i.occupe), (8000, 8000));
+    assert!(livrer(&mut f, &mut c) >= 1);
+    avancer(8 * MS);
+    assert_eq!(c.info(maintenant()).tampon_limite, 8000);
+}
+
+/// Les épisodes de RTO : un seul pour des RTO de suite, son temps court jusqu'à la sortie de
+/// l'état de perte, puis reste.
+#[test]
+fn info_rto() {
+    let (mut c, mut f) = paire();
+    ecrire(&mut c, &[0; 1000]);
+    sortants(&mut c);
+    echeance_suivante(&mut c);
+    sortants(&mut c);
+    let i = c.info(maintenant());
+    assert_eq!((i.total_rto, i.rto_reprises, i.rto_temps), (1, 1, 0));
+    avancer(50 * MS);
+    assert_eq!(c.info(maintenant()).rto_temps, 50);
+    let debut = maintenant() - 50 * MS;
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    assert_eq!(s.len(), 1);
+    let i = c.info(maintenant());
+    assert_eq!((i.total_rto, i.rto_reprises), (2, 1));
+    assert_eq!(i.rto_temps as u64, (maintenant() - debut) / MS);
+    assert_eq!((i.octets_envoyes, i.octets_renvoyes, i.data_segs_out), (3000, 2000, 3));
+    f.quickack(true);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    assert_eq!(livrer(&mut f, &mut c), 1);
+    // Sans SACK, l'état de perte attend un ACK au-delà de `high_seq`
+    // (`tcp_try_undo_recovery`) : le temps court encore.
+    avancer(10 * MS);
+    assert_eq!(c.info(maintenant()).rto_temps as u64, (maintenant() - debut) / MS);
+    envoyer_et_acquitter(&mut c, &mut f, 1000, 0);
+    let fin = c.info(maintenant()).rto_temps;
+    assert_eq!(fin as u64, (maintenant() - debut) / MS);
+    avancer(50 * MS);
+    assert_eq!(c.info(maintenant()).rto_temps, fin);
+}
+
+/// Ce que les RTO de ses SYN-ACK laissent à la fille (`tcp_create_openreq_child`).
+#[test]
+fn info_rto_d_une_fille() {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let sa = sortants(&mut f)[0].0;
+    c.recevoir(&sa, vide(), maintenant());
+    let ack = sortants(&mut c)[0].0;
+    echeance_suivante(&mut f);
+    assert_eq!(sortants(&mut f).len(), 1);
+    f.recevoir(&ack, vide(), maintenant());
+    assert_eq!(f.etat(), Etat::Etablie);
+    let i = f.info(maintenant());
+    assert_eq!((i.total_rto, i.rto_reprises, i.rto_temps), (1, 1, 1000));
+    assert_eq!((i.segs_in, i.segs_out, i.total_retrans), (2, 0, 1));
+}
+
 // --- La MTU du chemin (`tcp_v4_mtu_reduced`) ---
 
 /// Une « fragmentation nécessaire » : le MSS baisse (les horodatages comptés : 1000 - 40 -

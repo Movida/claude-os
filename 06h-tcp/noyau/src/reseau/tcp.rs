@@ -1690,6 +1690,13 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
     let echeance = delai.map(|d| crate::temps::ns_monotone().saturating_add(d));
     let mut g = flux(s).posseder();
     let mut fait = 0;
+    {
+        let p = g.donnee();
+        let retenue = p.retenue.octets();
+        if let Mode::Connexion(t) = &mut p.mode {
+            t.verifier_app_limite(retenue);
+        }
+    }
     loop {
         let arret = g.avec_court(|_, c| c.arret);
         let p = g.donnee();

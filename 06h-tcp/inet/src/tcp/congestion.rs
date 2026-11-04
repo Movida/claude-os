@@ -287,7 +287,7 @@ impl Congestion {
     /// plus d'un RTO (RFC 2861, le programme n'a pas de quoi la remplir), elle
     /// redescend vers ce qui a servi : `relachable`, si rien n'est à reprendre
     /// et que le programme n'est pas bloqué sur son tampon d'envoi.
-    pub fn valider(&mut self, limitee: bool, sortis: u32, snd_una: u32, snd_nxt: u32, rto: u64, relachable: bool, maintenant: u64) {
+    pub fn valider(&mut self, limitee: bool, sortis: u32, snd_una: u32, snd_nxt: u32, rto: u64, relachable: bool, maintenant: u64) -> bool {
         if !avant(snd_una, self.fin_usage) || limitee || (!self.limitee && sortis > self.max_sortis) {
             self.limitee = limitee;
             self.max_sortis = sortis;
@@ -296,12 +296,13 @@ impl Congestion {
         if self.a_servi() {
             self.utilisee = 0;
             self.instant = maintenant;
-        } else {
-            self.utilisee = self.utilisee.max(sortis);
-            if maintenant.saturating_sub(self.instant) >= rto {
-                self.limitee_par_le_programme(relachable, maintenant);
-            }
+            return false;
         }
+        self.utilisee = self.utilisee.max(sortis);
+        if maintenant.saturating_sub(self.instant) >= rto {
+            self.limitee_par_le_programme(relachable, maintenant);
+        }
+        true
     }
 
     /// `tcp_cwnd_application_limited` : la moitié de l'écart entre la cwnd et ce

@@ -32,8 +32,9 @@
 //! dans ce que couvre l'ACK, pas de mesure).
 
 use super::congestion::{Phase, TCP_REORDERING};
+use super::debit::{Chrono, TxDebit};
 use super::rtt::RTO_MAX;
-use super::sack::{JIFFY, MIN_RTT_FENETRE, en_jiffies, parti_apres};
+use super::sack::{JIFFY, MIN_RTT_FENETRE, en_jiffies};
 use super::{Charge, Effets, Etat, Sortant, Tcb, apres, avant, reculer};
 use formats::reseau::tcp;
 
@@ -68,7 +69,7 @@ pub(super) const DEJA_RENVOYE: u8 = 4;
 /// Arrivé hors d'ordre, dit par SACK (TCPCB_SACKED_ACKED).
 pub(super) const SACKE: u8 = 8;
 /// Déjà compté dans la mesure du débit (`tx.delivered_mstamp` remis à 0).
-const COMPTE: u8 = 16;
+pub(super) const COMPTE: u8 = 16;
 
 /// Un segment envoyé (le `sk_buff` de la `tcp_rtx_queue`, et son `tcp_skb_cb`).
 #[derive(Debug, Clone, Copy)]
@@ -81,14 +82,14 @@ pub(super) struct Envoye {
     pub(super) marques: u8,
     /// Ses drapeaux d'origine : un renvoi les redit (PSH, FIN).
     drapeaux: u8,
-    /// Les segments livrés à son dernier envoi (`tx.delivered`).
-    livres_tx: u32,
+    /// Ce qu'il retient de son dernier envoi, pour la mesure du débit (debit.rs).
+    pub(super) tx: TxDebit,
     /// Le numéro de son dernier envoi (carte.rs).
     pub(super) numero: u64,
 }
 
-/// Ce que les blocs d'un ACK ont appris (`tcp_sacktag_state`), et ce que la
-/// mesure du débit en retient (`rate_sample`, seulement `prior_delivered`).
+/// Ce que les blocs d'un ACK ont appris (`tcp_sacktag_state`), et l'échantillon de
+/// débit qui se prépare (`rate_sample`, debit.rs).
 #[derive(Debug, Clone, Copy, Default)]
 pub(super) struct EtatSack {
     /// Les heures d'envoi du premier et du dernier segment SACKé jamais renvoyé.
@@ -101,6 +102,11 @@ pub(super) struct EtatSack {
     pub flag: u32,
     /// Les segments livrés à l'envoi du segment acquitté parti le plus récemment.
     pub prior_livres: Option<u32>,
+    /// À quelle heure, ce qu'il avait de limité par le programme, et le temps d'envoi
+    /// de sa fenêtre (`prior_mstamp`, `is_app_limited`, `interval_us`).
+    pub prior_livre_a: u64,
+    pub app_limite: bool,
+    pub intervalle: u64,
     pub derniere_fin: u32,
 }
 
@@ -127,8 +133,8 @@ pub(super) enum ResultatAck {
 }
 
 impl Envoye {
-    pub(super) fn neuf(seq: u32, fin_seq: u32, envoi: u64, drapeaux: u8, livres_tx: u32, numero: u64) -> Envoye {
-        Envoye { seq, fin_seq, envoi, marques: 0, drapeaux, livres_tx, numero }
+    pub(super) fn neuf(seq: u32, fin_seq: u32, envoi: u64, drapeaux: u8, tx: TxDebit, numero: u64) -> Envoye {
+        Envoye { seq, fin_seq, envoi, marques: 0, drapeaux, tx, numero }
     }
 
     /// Ses octets de données, sans le FIN.
@@ -199,6 +205,9 @@ impl<P: Charge> Tcb<P> {
                 self.indice_renvoi = None;
             }
         }
+        if self.file.is_empty() {
+            self.chrono_arreter(Chrono::Occupee, maintenant);
+        }
         if self.file.front().is_some_and(|e| e.marques & SACKE != 0) {
             flag |= FLAG_SACK_RENEGING;
         }
@@ -255,22 +264,6 @@ impl<P: Charge> Tcb<P> {
     fn renvoi_inutile(&self, e: &Envoye) -> bool {
         e.marques & (EN_RENVOI | DEJA_RENVOYE) != 0
             && self.ts_recu.is_some_and(|(_, ecr)| ecr != 0 && avant(ecr, super::horloge_ts(e.envoi)))
-    }
-
-    /// `tcp_rate_skb_delivered`, réduit à ce que lisent RACK et la détection des
-    /// ACK retardés : les segments livrés à l'envoi du segment parti le plus
-    /// récemment parmi ceux que cet ACK couvre.
-    pub(super) fn taux_segment_livre(&mut self, i: usize, etat: &mut EtatSack) {
-        let e = self.file[i];
-        if e.marques & COMPTE != 0 {
-            return;
-        }
-        if etat.prior_livres.is_none() || parti_apres(e.envoi, self.tx_acquitte, e.fin_seq, etat.derniere_fin) {
-            etat.prior_livres = Some(e.livres_tx);
-            etat.derniere_fin = e.fin_seq;
-            self.tx_acquitte = e.envoi;
-        }
-        self.file[i].marques |= COMPTE;
     }
 
     /// Une mesure du RTT (`tcp_ack_update_rtt`) : par l'heure d'envoi, par SACK,
@@ -795,6 +788,9 @@ impl<P: Charge> Tcb<P> {
             }
             Phase::Perte => {
                 self.traiter_perte(*flag, num_dupack);
+                if self.cc.phase != Phase::Perte {
+                    self.rto_fini(maintenant);
+                }
                 self.identifier_pertes(flag, maintenant);
                 if !(self.cc.phase == Phase::Ouverte || *flag & FLAG_LOST_RETRANS != 0) {
                     return;
@@ -996,14 +992,16 @@ impl<P: Charge> Tcb<P> {
         }
         let e = self.file[i];
         self.total_retrans += 1;
+        self.mesures.octets_renvoyes += e.longueur() as u64;
         let debut = e.seq.wrapping_sub(self.seq_envoi) as usize;
         let h = self.entete(e.seq, e.drapeaux);
         let numero = self.compter_envoi(e.longueur() as usize);
+        self.compter_sortie(e.longueur() as usize);
         sortir(Sortant { entete: h, debut, longueur: e.longueur() as usize, numero });
         self.file[i].numero = numero;
         self.file[i].envoi = maintenant;
         self.file[i].marques = (self.file[i].marques | DEJA_RENVOYE) & !COMPTE;
-        self.file[i].livres_tx = self.livres;
+        self.file[i].tx = self.debit_parti(maintenant);
         self.tri_ajouter(e.seq, maintenant);
         // L'ACK d'abord : sortir du mode rapide remet `ato` au plus bas, ce que lit le test du
         // ping-pong (`__tcp_transmit_skb`).
@@ -1177,6 +1175,7 @@ impl<P: Charge> Tcb<P> {
                 return;
             }
             self.entrer_perte(maintenant);
+            self.rto_compter(maintenant);
             self.retransmissions += 1;
             self.total_rto += 1;
         }
