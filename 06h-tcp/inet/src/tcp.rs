@@ -3534,8 +3534,22 @@ impl<P: Charge> Tcb<P> {
             if self.prochain_segment().is_some() && avant(self.snd_nxt, bord) {
                 let n = reste.min(self.mss_courant() as usize).min(fenetre as usize);
                 let avec_fin = self.fin_seq().is_some_and(|f| !apres(self.snd_nxt, f)) && n == reste && (n as u32) < fenetre;
-                self.envoyer_donnees(n, avec_fin, maintenant, &mut sortir);
+                // Quelque chose est parti : ce n'est plus une sonde, et le recul ne vaut plus :
+                // c'est le RTO qui veille (`tcp_send_probe0`).
+                if self.envoyer_donnees(n, avec_fin, maintenant, &mut sortir) {
+                    self.sondes = 0;
+                    self.sondes_debut = None;
+                    self.recul = 0;
+                }
             } else {
+                // Un octet urgent pas encore acquitté : le signaler à l'autre, par un segment au
+                // numéro attendu, qu'il prendra en compte : il y lit le pointeur urgent. Puis la
+                // vraie sonde (`tcp_xmit_probe_skb`).
+                if entre(self.snd_up, self.snd_una.wrapping_add(1), self.snd_una.wrapping_add(0xFFFF)) {
+                    let h = self.entete(self.snd_una, tcp::ACK);
+                    self.compter_sortie(0);
+                    sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
+                }
                 let h = self.entete(self.snd_una.wrapping_sub(1), tcp::ACK);
                 self.compter_sortie(0);
                 sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
@@ -3647,7 +3661,8 @@ impl<P: Charge> Tcb<P> {
             }
         }
         let limitee = self.paquets_en_vol() >= self.cc.cwnd;
-        if sortis > 0 || limitee {
+        // Sans rien à envoyer, `tcp_write_xmit` n'est même pas appelé (`tcp_push_pending_frames`).
+        if a_envoyer && (sortis > 0 || limitee) {
             let relachable = self.cc.phase == Phase::Ouverte && !self.reglages.orpheline && !self.sans_place;
             let affamee = self.cc.valider(limitee, self.file.len() as u32, self.snd_una, self.snd_nxt, self.rto, relachable, maintenant);
             // La fin de `tcp_cwnd_validate` : rien à faire partir, pas la faute de la

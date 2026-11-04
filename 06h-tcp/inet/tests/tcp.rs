@@ -1421,6 +1421,75 @@ fn rcvlowat_de_tcp() {
     assert_eq!(f.rcvbuf, 16_384);
 }
 
+// --- La sonde de fenêtre (`tcp_write_wakeup`, `tcp_send_probe0`) ---
+
+/// Une fenêtre fermée à l'autre bout, des données qui attendent : la connexion, et sa fille.
+fn fenetre_fermee(octets: usize) -> (Connexion, Connexion) {
+    let (mut c, mut f) = paire_avec(MSS, 2048, 262_144);
+    assert_eq!(ecrire(&mut c, &vec![0u8; octets]), octets);
+    calmer(&mut c, &mut f);
+    assert_eq!(c.info(maintenant()).non_acquittes, 0);
+    assert!(c.info(maintenant()).non_envoyes > 0);
+    assert_eq!(c.info(maintenant()).snd_wnd, 0);
+    (c, f)
+}
+
+/// Un ACK de la fille, à refaire à sa guise.
+fn sortants_de_fille(f: &mut Connexion, c: &mut Connexion) -> Tcp {
+    // Une sonde de plus lui en fait dire un.
+    echeance_suivante(c);
+    let s = sortants(c);
+    f.recevoir(&s[0].0, vide(), maintenant());
+    sortants(f)[0].0
+}
+
+/// Un octet urgent en attente : avant la sonde, un segment au numéro attendu, qui porte le
+/// pointeur (`tcp_xmit_probe_skb(sk, 1, mib)`).
+#[test]
+fn sonde_avec_un_octet_urgent() {
+    let (mut c, _f) = fenetre_fermee(32 * 1024);
+    // Sans urgent : la sonde seule, en deçà de ce qui est attendu.
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    let una = s[0].0.seq.wrapping_add(1);
+    assert_eq!((s.len(), s[0].1.len(), s[0].0.drapeaux & tcp::URG), (1, 0, 0));
+    assert_eq!(c.info(maintenant()).sondes, 1);
+    // Avec.
+    assert_eq!(ecrire(&mut c, b"u"), 1);
+    c.marquer_urgent();
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    assert_eq!(s.len(), 2);
+    assert_eq!((s[0].0.seq, s[0].0.drapeaux & tcp::URG, s[0].1.len()), (una, tcp::URG, 0));
+    assert_eq!((s[1].0.seq, s[1].1.len()), (una.wrapping_sub(1), 0));
+}
+
+/// La fenêtre s'est ouverte de moins qu'un segment : la sonde emporte ce qui tient. Ce n'est plus
+/// une sonde : le recul retombe, et c'est le RTO qui veille (`tcp_send_probe0`).
+#[test]
+fn sonde_qui_emporte_des_donnees() {
+    let (mut c, mut f) = fenetre_fermee(32 * 1024);
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    let una = s[0].0.seq.wrapping_add(1);
+    echeance_suivante(&mut c);
+    sortants(&mut c);
+    let i = c.info(maintenant());
+    assert_eq!((i.sondes, i.recul), (2, 2));
+    // Un ACK ouvre la fenêtre, de moins d'un segment : elle n'a de sens que multipliée par l'échelle.
+    let mut h = sortants_de_fille(&mut f, &mut c);
+    h.ack = una;
+    h.fenetre = 1;
+    c.recevoir(&h, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).snd_wnd, 1 << ECHELLE);
+    assert!(sortants(&mut c).is_empty());
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    assert_eq!((s.len(), s[0].1.len()), (1, 1 << ECHELLE));
+    let i = c.info(maintenant());
+    assert_eq!((i.sondes, i.recul, i.non_acquittes), (0, 0, 1));
+}
+
 // --- TCP_DEFER_ACCEPT ---
 
 /// Une fille d'une écoute avec TCP_DEFER_ACCEPT `defer`, et le client qui lui répond. Rend
