@@ -603,7 +603,7 @@ impl<P: Charge> Tcb<P> {
             self.tlp_high_seq = None;
         } else if apres(ack, haut) {
             self.commencer_reduction();
-            self.cc.phase = Phase::Reduction;
+            self.changer_phase(Phase::Reduction);
             self.finir_reduction();
             self.rester_ouverte();
         } else if flag & (FLAG_SND_UNA_ADVANCED | FLAG_NOT_DUP | FLAG_DATA_SACKED) == 0 {

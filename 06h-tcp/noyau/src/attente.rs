@@ -812,6 +812,10 @@ pub trait Possede {
     /// Recopie le premier étage, sous le verrou court ; rend les
     /// événements à réveiller dans la file de la possession (0 : rien).
     fn publier(&self, court: &mut Self::Court) -> u32;
+    /// Le sens inverse : ce que `poll`, qui ne possède pas, a laissé au
+    /// premier étage pour la donnée (SOCK_NOSPACE), pris juste avant de traiter
+    /// ce qui arrive.
+    fn descendre(&mut self, court: &mut Self::Court);
 }
 
 struct Court<U, B> {
@@ -915,6 +919,7 @@ impl<T: Possede> Possession<T> {
         // SAFETY: personne ne possède, et le verrou court est tenu : nul
         // autre ne touche la donnée.
         let d = unsafe { &mut *self.donnee.get() };
+        d.descendre(&mut c.premier);
         d.traiter(e);
         let m = d.publier(&mut c.premier);
         drop(c);
@@ -965,6 +970,8 @@ impl<T: Possede> Possession<T> {
                     break;
                 }
                 c.taille = 0;
+                // SAFETY: nous possédons : nul autre ne touche la donnée.
+                unsafe { &mut *self.donnee.get() }.descendre(&mut c.premier);
                 (core::mem::take(&mut c.file), core::mem::take(&mut c.minuteur))
             };
             // SAFETY: nous possédons : nul autre ne touche la donnée (la

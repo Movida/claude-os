@@ -1359,17 +1359,28 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
 }
 
 /// Les options de SOL_TCP (`do_tcp_setsockopt`), sous la possession de la
-/// socket : TCP_CONGESTION, une chaîne (seul « reno » existe : ENOENT
-/// sinon) ; les autres, un entier d'au moins 4 octets (EINVAL), avec les
-/// bornes de Linux (mesurées) ; une inconnue : ENOPROTOOPT.
+/// socket : TCP_CONGESTION, une chaîne (ENOENT : un contrôle que le noyau n'a
+/// pas ; sans longueur, EINVAL) ; les autres, un entier d'au moins 4 octets
+/// (EINVAL), avec les bornes de Linux (mesurées) ; une inconnue : ENOPROTOOPT.
 fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Result<(), i64> {
     const ENOENT: i64 = 2;
     if option == TCP_CONGESTION {
+        if longueur < 1 {
+            return Err(-EINVAL);
+        }
         let mut nom = [0u8; 16];
-        let n = (longueur.max(0) as usize).min(15);
+        // (`strncpy_from_sockptr` : jusqu'au premier zéro, 15 octets au plus.)
+        let n = (longueur as usize).min(15);
         copier_depuis_utilisateur(&mut nom[..n], valeur).map_err(|_| -EFAULT)?;
         let fin = nom[..n].iter().position(|&o| o == 0).unwrap_or(n);
-        return if &nom[..fin] == b"reno" { Ok(()) } else { Err(-ENOENT) };
+        let controle = inet::tcp::Controle::par_nom(&nom[..fin]).ok_or(-ENOENT)?;
+        tcp::avec_options(s, |op, tcb| {
+            op.controle = controle;
+            if let Some(t) = tcb {
+                t.choisir_controle(controle, crate::temps::ns_monotone());
+            }
+        });
+        return Ok(());
     }
     let v = entier(valeur, longueur)?;
     tcp::avec_options(s, |op, mut tcb| {
@@ -1436,7 +1447,7 @@ const TAILLE_INFO: usize = 248;
 /// `struct tcp_info` (voir `ecrire_info`).
 fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], usize), i64> {
     let mut o = [0u8; TAILLE_INFO];
-    let ecoute = tcp::ecoute(s);
+    let ecoute = tcp::ecoute(s).then(|| tcp::file_d_ecoute(s));
     let n = tcp::avec_options(s, |op, tcb| {
         let v = match option {
             TCP_NODELAY => op.nodelay as i32,
@@ -1452,7 +1463,9 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], u
             TCP_QUICKACK => op.quickack as i32,
             TCP_USER_TIMEOUT => op.user_timeout as i32,
             TCP_CONGESTION => {
-                o[..4].copy_from_slice(b"reno");
+                // Le nom, complété de zéros (`TCP_CA_NAME_MAX`, mesuré).
+                let nom = op.controle.nom();
+                o[..nom.len()].copy_from_slice(nom);
                 return Ok(16);
             }
             TCP_INFO => {
@@ -1466,8 +1479,10 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], u
                         }
                         ecrire_info(&mut o, &i)
                     }
-                    // TCP_LISTEN, ou TCP_CLOSE.
-                    None => o[0] = if ecoute { 10 } else { 7 },
+                    None => match ecoute {
+                        Some((pretes, file)) => ecrire_info(&mut o, &inet::tcp::Info::ecoute(pretes, file)),
+                        None => ecrire_info(&mut o, &inet::tcp::Info::sans_connexion()),
+                    },
                 }
                 return Ok(TAILLE_INFO);
             }
@@ -1521,6 +1536,9 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
     for (decalage, v) in mots {
         o[decalage..decalage + 4].copy_from_slice(&v.to_le_bytes());
     }
+    o[104..112].copy_from_slice(&i.pacing.to_le_bytes());
+    // SO_MAX_PACING_RATE n'existe pas chez nous : aucune limite (`~0ULL`).
+    o[112..120].copy_from_slice(&inet::tcp::PACING_MAX.to_le_bytes());
     o[120..128].copy_from_slice(&i.octets_acquittes.to_le_bytes());
     o[240..242].copy_from_slice(&(i.total_rto.min(u16::MAX as u32) as u16).to_le_bytes());
 }

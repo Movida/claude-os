@@ -36,8 +36,8 @@
 //!     `tcp_retries2`, 924,6 s ; une orpheline plus tôt ; TCP_USER_TIMEOUT) ;
 //!   - la FILE DE RETRANSMISSION et la reprise (retrans.rs), le modèle de
 //!     Linux : chaque segment envoyé a son entrée, marquée perdue ou renvoyée ;
-//!   - la CONGESTION (congestion.rs) : Reno, la retransmission rapide au
-//!     troisième ACK dupliqué, la reprise NewReno et PRR ;
+//!   - la CONGESTION (congestion.rs, cubic.rs) : CUBIC, ou Reno ; la retransmission
+//!     rapide au troisième ACK dupliqué, la reprise NewReno et PRR ;
 //!   - la FILE HORS D'ORDRE (hors_ordre.rs) : ce qui arrive après un trou
 //!     est gardé, et l'ACK dupliqué part aussitôt ;
 //!   - les ACK RETARDÉS (`tcp_send_delayed_ack`) : un ACK attend jusqu'à
@@ -89,6 +89,7 @@ use formats::reseau::tcp::{self, Tcp};
 
 pub mod attente;
 mod congestion;
+mod cubic;
 mod hors_ordre;
 mod minmax;
 mod retrans;
@@ -99,11 +100,11 @@ use attente::Attente;
 use congestion::{Congestion, Phase, TCP_REORDERING};
 use hors_ordre::HorsOrdre;
 use minmax::MinMax;
-use retrans::{Envoye, EtatSack, Rexmit, ResultatAck, FLAG_ACKED, FLAG_CA_ALERT, FLAG_DATA, FLAG_DSACKING_ACK, FLAG_NO_CHALLENGE_ACK, FLAG_NOT_DUP, FLAG_SET_XMIT_TIMER, FLAG_SND_UNA_ADVANCED, FLAG_SYN_ACKED, FLAG_WIN_UPDATE};
+use retrans::{Envoye, EtatSack, Rexmit, ResultatAck, FLAG_CA_ALERT, FLAG_DATA, FLAG_DSACKING_ACK, FLAG_NO_CHALLENGE_ACK, FLAG_NOT_DUP, FLAG_SET_XMIT_TIMER, FLAG_SND_UNA_ADVANCED, FLAG_SYN_ACKED, FLAG_WIN_UPDATE};
 use rtt::Rtt;
 use sack::Rack;
 
-pub use congestion::CWND_INITIALE;
+pub use congestion::{CWND_INITIALE, Controle, PACING_MAX};
 pub use rtt::{RTO_INITIAL, RTO_MAX, RTO_MIN, RTO_REPLI, temps_modele};
 
 /// La plus grande taille d'un bloc du tampon d'émission.
@@ -498,6 +499,8 @@ pub struct Info {
     pub snd_wnd: u32,
     pub rcv_wnd: u32,
     pub total_rto: u32,
+    /// Le débit calculé (`tcpi_pacing_rate`), en octets par seconde.
+    pub pacing: u64,
     /// Les échéances, pour /proc/net/tcp : la retransmission (ou la sonde,
     /// `sonde`) et le keepalive, en ns depuis l'appel (None : aucune) ;
     /// les ACK rapides qui restent, et le ping-pong.
@@ -507,6 +510,32 @@ pub struct Info {
     pub ack_rapides: u32,
     pub pingpong: bool,
     pub demarrage_lent: bool,
+}
+
+impl Info {
+    /// Ce que dit TCP_INFO d'une socket sans connexion (TCP_CLOSE) : les valeurs de
+    /// départ de `tcp_init_sock` (mesuré ; pas les heures, que Linux y compte depuis
+    /// l'origine de ses jiffies, et qui ne disent rien).
+    pub fn sans_connexion() -> Info {
+        Info {
+            etat: 7,
+            rto: (RTO_INITIAL / 1000) as u32,
+            snd_mss: MSS_DEFAUT as u32,
+            rttvar: (RTO_INITIAL / 4 / 1000) as u32,
+            ssthresh: congestion::SSTHRESH_INFINI,
+            cwnd: CWND_INITIALE,
+            reordonnancement: TCP_REORDERING,
+            min_rtt: u32::MAX,
+            pacing: PACING_MAX,
+            ..Info::default()
+        }
+    }
+
+    /// Et d'une écoute (`tcp_get_info`, mesuré) : presque rien ; les filles prêtes
+    /// et la longueur de sa file à la place de `tcpi_unacked` et `tcpi_sacked`.
+    pub fn ecoute(pretes: u32, file: u32) -> Info {
+        Info { etat: 10, non_acquittes: pretes, sackes: file, cwnd: CWND_INITIALE, reordonnancement: TCP_REORDERING, pacing: PACING_MAX, ..Info::default() }
+    }
 }
 
 /// Les ACK retardés (le `icsk_ack` de Linux).
@@ -632,6 +661,11 @@ pub struct Tcb<P: Charge> {
     /// Le programme ne veut plus écrire : un FIN suit les données (son
     /// numéro : `fin_seq`).
     fin_voulue: bool,
+    /// Le programme a voulu écrire plus que la place (`SOCK_NOSPACE`) : il attend,
+    /// et sa limite est le tampon d'envoi, pas ce qu'il a à dire. Et un segment
+    /// est arrivé depuis le dernier regard (`tcp_data_snd_check`).
+    sans_place: bool,
+    place_a_voir: bool,
     // La réception.
     reception: VecDeque<P>,
     octets_reception: usize,
@@ -830,6 +864,8 @@ impl<P: Charge> Tcb<P> {
             octets_envoi: 0,
             seq_envoi: iss.wrapping_add(1),
             fin_voulue: false,
+            sans_place: false,
+            place_a_voir: false,
             reception: VecDeque::new(),
             octets_reception: 0,
             taille_vraie_reception: 0,
@@ -985,6 +1021,25 @@ impl<P: Charge> Tcb<P> {
 
     pub fn etat(&self) -> Etat {
         self.etat
+    }
+
+    /// Le contrôle de congestion d'une connexion qui naît (`tcp_assign_congestion_control`,
+    /// `tcp_ca_openreq_child`).
+    pub fn poser_controle(&mut self, c: Controle) {
+        self.cc.choisir(c, false, self.snd_nxt, self.heure);
+    }
+
+    /// Le contrôle en service (TCP_CONGESTION).
+    pub fn controle(&self) -> Controle {
+        self.cc.controle()
+    }
+
+    /// TCP_CONGESTION sur une connexion en route (`tcp_reinit_congestion_control`).
+    pub fn choisir_controle(&mut self, c: Controle, maintenant: u64) {
+        if c != self.cc.controle() {
+            self.prior_ssthresh = 0;
+            self.cc.choisir(c, self.etat != Etat::Fermee, self.snd_nxt, maintenant);
+        }
     }
 
     /// Le SYN de l'autre dit son échelle, ou rien : sans elle des deux
@@ -1322,6 +1377,28 @@ impl<P: Charge> Tcb<P> {
         self.sndbuf.saturating_sub(self.octets_envoi)
     }
 
+    /// `poll` a trouvé le tampon d'envoi trop plein (`tcp_poll`, SOCK_NOSPACE).
+    pub fn marquer_sans_place(&mut self) {
+        self.sans_place = true;
+    }
+
+    /// `tcp_check_space`, après chaque segment neuf envoyé et chaque segment reçu :
+    /// pour un programme qui attend de la place, SO_SNDBUF suit la cwnd
+    /// (`tcp_new_space`), si elle n'est pas pleine ; et il n'attend plus quand un
+    /// tiers du tampon est libre (`sk_stream_write_space`).
+    fn verifier_place(&mut self, maintenant: u64) {
+        if !self.sans_place {
+            return;
+        }
+        if !self.sndbuf_fixe && self.memoire == Memoire::Libre && self.paquets_en_vol() < self.cc.cwnd {
+            self.agrandir_sndbuf();
+            self.cc.poser_instant(maintenant);
+        }
+        if self.place() >= self.sndbuf / 3 {
+            self.sans_place = false;
+        }
+    }
+
     /// La mémoire que garde la connexion, en octets : la réception (en
     /// taille vraie) et ce qui attend d'être acquitté (le compte de
     /// `tcp_mem`).
@@ -1356,6 +1433,9 @@ impl<P: Charge> Tcb<P> {
     /// place ; rend combien. Moins si la mémoire manque (0 : rien n'a pu
     /// être ajouté). Le programme ne doit plus écrire après `fermer_envoi`.
     pub fn ecrire<E>(&mut self, n: usize, mut remplir: impl FnMut(&mut [u8]) -> Result<(), E>) -> Result<usize, E> {
+        if n > self.place() {
+            self.sans_place = true;
+        }
         let n = n.min(self.place());
         let mut fait = 0;
         while fait < n {
@@ -1725,6 +1805,7 @@ impl<P: Charge> Tcb<P> {
     pub fn recevoir(&mut self, t: &Tcp, charge: P, maintenant: u64) -> Effets {
         let mut e = Effets::default();
         self.heure = maintenant;
+        self.place_a_voir = true;
         // Les horodatages du segment, seulement s'ils sont en service (ou
         // proposés, pour le SYN de l'autre), notre décalage retiré de TSecr.
         self.ts_recu = self.ts.and(t.options.horodatage).map(|(val, ecr)| (val, if ecr != 0 { ecr.wrapping_sub(self.ts.map_or(0, |x| x.decalage)) } else { 0 }));
@@ -1804,6 +1885,7 @@ impl<P: Charge> Tcb<P> {
                     self.snd_wl1 = t.seq;
                     self.syn_renvoye_pour_rien();
                     self.mesurer_syn(maintenant);
+                    self.maj_pacing(self.mss_borne());
                     self.retransmissions = 0;
                     self.retrans_stamp = 0;
                     self.t_xmit = None;
@@ -1929,6 +2011,7 @@ impl<P: Charge> Tcb<P> {
             self.syn_renvoye_pour_rien();
             self.mesurer_syn(maintenant);
             self.etablir(maintenant);
+            self.maj_pacing(self.mss_borne());
         }
         self.apres_notre_fin(&mut e);
         if self.etat == Etat::Fermee {
@@ -2058,14 +2141,9 @@ impl<P: Charge> Tcb<P> {
         if flag & FLAG_SET_XMIT_TIMER != 0 && !self.programmer_sonde_de_perte(true, maintenant) {
             self.rearmer_rto(maintenant);
         }
-        self.controler_congestion(self.livres.wrapping_sub(livres_avant), self.perdus.wrapping_sub(perdus_avant), flag);
+        self.controler_congestion(self.livres.wrapping_sub(livres_avant), self.perdus.wrapping_sub(perdus_avant), flag, maintenant);
         if self.rexmit != Rexmit::Rien {
             e.a_emettre = true;
-        }
-        // De la place libérée, et la fenêtre de congestion n'est pas pleine :
-        // SO_SNDBUF suit (`tcp_new_space`).
-        if flag & FLAG_ACKED != 0 && self.paquets_en_vol() < self.cc.cwnd {
-            self.agrandir_sndbuf();
         }
         ResultatAck::Traite
     }
@@ -2117,7 +2195,7 @@ impl<P: Charge> Tcb<P> {
     /// segments ; au plus `tcp_wmem[2]`). Sur `lo` (MSS 65 495) : 2 626 560
     /// (mesuré chez Linux). Rien si le programme a fixé SO_SNDBUF.
     fn agrandir_sndbuf(&mut self) {
-        if self.sndbuf_fixe || self.memoire != Memoire::Libre {
+        if self.sndbuf_fixe {
             return;
         }
         // `max(mss_clamp, mss_cache)`, le premier sans la place des options.
@@ -2238,11 +2316,12 @@ impl<P: Charge> Tcb<P> {
             self.mss_local -= TS_ALIGNE;
         }
         self.cc.cwnd = if self.total_retrans > 1 && self.undo_marker.is_some() { 1 } else { CWND_INITIALE };
-        // La perte du SYN est réparée ; le seuil, lui, garde sa moitié
+        // La perte du SYN est réparée ; le seuil, lui, garde sa réduction
         // (Linux aussi).
         if self.cc.phase == Phase::Perte {
-            self.cc.phase = Phase::Ouverte;
+            self.changer_phase(Phase::Ouverte);
         }
+        self.cc.etablir(self.snd_nxt, maintenant);
         self.dernier_envoi = maintenant;
         // `tcp_initialize_rcv_mss` : au plus 536 avant d'avoir vu un segment.
         let rcv_wnd = self.rcv_wnd();
@@ -2360,6 +2439,7 @@ impl<P: Charge> Tcb<P> {
             snd_wnd: self.snd_wnd,
             rcv_wnd: self.rcv_wnd(),
             total_rto: self.total_rto,
+            pacing: self.cc.pacing,
             t_retrans: self.t_xmit.map(|t| t.saturating_sub(maintenant)),
             sonde: self.t_sorte == Minuteur::Sonde,
             t_keepalive: self.t_keepalive.map(|t| t.saturating_sub(maintenant)),
@@ -2716,6 +2796,7 @@ impl<P: Charge> Tcb<P> {
     /// retour.
     pub fn erreur_icmp(&mut self, erreur: i32, seq: u32, injoignable: bool, recverr: bool, maintenant: u64) -> Effets {
         let mut e = Effets::default();
+        self.heure = maintenant;
         match self.etat {
             Etat::SynEnvoye | Etat::SynRecu => self.finir(erreur, &mut e),
             Etat::Fermee | Etat::TempsAttente => {}
@@ -3036,6 +3117,9 @@ impl<P: Charge> Tcb<P> {
     /// (`tcp_event_data_sent`) : une réponse rapide à ce qui vient d'arriver,
     /// c'est une conversation (le ping-pong).
     fn segment_de_donnees_parti(&mut self, maintenant: u64) {
+        if self.paquets_en_vol() == 0 {
+            self.cc.depart(self.dernier_envoi, maintenant);
+        }
         self.dernier_envoi = maintenant;
         if maintenant.saturating_sub(self.ack.lrcvtime) < self.ack.ato {
             self.ack.pingpong = self.ack.pingpong.saturating_add(1);
@@ -3065,6 +3149,13 @@ impl<P: Charge> Tcb<P> {
             // Un petit segment (`tcp_minshall_update`).
             self.snd_sml = fin_segment;
         }
+        // L'ACK d'abord, puis la donnée (`__tcp_transmit_skb`) : sortir du mode rapide remet `ato` au
+        // plus bas, ce que lit le test du ping-pong. Avant que le segment ne compte comme en vol ; un
+        // FIN seul n'est pas une donnée.
+        self.ack_envoye();
+        if n > 0 {
+            self.segment_de_donnees_parti(maintenant);
+        }
         // Une sonde de fin de rafale armée laisse la place au RTO (`tcp_event_new_data_sent`).
         let rearmer = self.file.is_empty() || (self.t_xmit.is_some() && self.t_sorte == Minuteur::SondeDePerte);
         self.file.push_back(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, self.livres));
@@ -3073,8 +3164,8 @@ impl<P: Charge> Tcb<P> {
         if rearmer {
             self.rearmer_rto(maintenant);
         }
-        self.segment_de_donnees_parti(maintenant);
         self.ack_envoye();
+        self.verifier_place(maintenant);
         true
     }
 
@@ -3191,6 +3282,9 @@ impl<P: Charge> Tcb<P> {
             sortir(Sortant { entete: self.entete(self.seq_acceptable(), tcp::ACK), debut: 0, longueur: 0 });
             self.ack_envoye();
         }
+        if core::mem::take(&mut self.place_a_voir) {
+            self.verifier_place(maintenant);
+        }
     }
 
     /// Les données neuves, et le FIN (`tcp_write_xmit`), tant que la fenêtre
@@ -3228,11 +3322,11 @@ impl<P: Charge> Tcb<P> {
                     break;
                 }
             }
-            if self.file.is_empty() {
+            if self.file.is_empty() && n > 0 {
                 // Rien en vol : après un long silence, la cwnd ne vaut plus.
                 let silence = maintenant.saturating_sub(self.dernier_envoi);
                 if silence > self.rto {
-                    self.cc.redemarrer(silence, self.rto);
+                    self.cc.redemarrer(silence, self.rto, maintenant);
                 }
             }
             if !self.envoyer_donnees(n, avec_fin, maintenant, sortir) {
@@ -3247,7 +3341,8 @@ impl<P: Charge> Tcb<P> {
         self.plus_a_venir = false;
         let limitee = self.paquets_en_vol() >= self.cc.cwnd;
         if sortis > 0 || limitee {
-            self.cc.valider(limitee, self.file.len() as u32, self.snd_una, self.snd_nxt);
+            let relachable = self.cc.phase == Phase::Ouverte && !self.reglages.orpheline && !self.sans_place;
+            self.cc.valider(limitee, self.file.len() as u32, self.snd_una, self.snd_nxt, self.rto, relachable, maintenant);
         }
         if sortis > 0 {
             // Une sonde par fin de rafale.

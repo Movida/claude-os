@@ -32,10 +32,12 @@
  *     comparé) ;
  *   - les horodatages sur lo (advmss 65 483), TCP_MAXSEG dans le SYN, et
  *     un `connect` qui reprend le quadruplet d'un TIME_WAIT.
+ *   - TCP_CONGESTION (cubic, reno, les refus, l'héritage par une fille) ;
+ *     le débit calculé (`tcpi_pacing_rate`) ; SO_SNDBUF qui ne grandit que pour
+ *     un programme qui attend de la place.
  * Rien ne compare de valeur qui dépend de la configuration de Linux (le
- * MSS sur lo, SO_SNDBUF agrandi, TCP_CONGESTION : « cubic » chez Linux,
- * « reno » chez nous). Sur l'hôte comme chez nous. Les délais sont des
- * multiples de 4 ms (le tic de l'hôte : HZ = 250).
+ * MSS sur lo, SO_SNDBUF agrandi). Sur l'hôte comme chez nous. Les délais sont
+ * des multiples de 4 ms (le tic de l'hôte : HZ = 250).
  */
 #define _GNU_SOURCE
 #include <arpa/inet.h>
@@ -1078,6 +1080,163 @@ static void reprise_time_wait(void)
     close(l);
 }
 
+/* TCP_CONGESTION (`tcp_set_congestion_control`, mesuré) : le nom sur 16 octets
+ * complétés de zéros, ou coupé à la longueur demandée, sans zéro final ; à
+ * l'écriture, 15 octets au plus, jusqu'au premier zéro ; un nom inconnu, ENOENT ;
+ * sans longueur, EINVAL. Une fille prend le contrôle de son écoute, s'il a été
+ * choisi par le programme. Sur l'hôte comme chez nous, cubic par défaut. */
+static void lire_controle(int s, char *nom)
+{
+    socklen_t ln = 16;
+    memset(nom, 0, 16);
+    getsockopt(s, IPPROTO_TCP, TCP_CONGESTION, nom, &ln);
+}
+
+static void congestion(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    char nom[32];
+    socklen_t ln = sizeof nom;
+    memset(nom, 'x', sizeof nom);
+    verifier(getsockopt(s, IPPROTO_TCP, TCP_CONGESTION, nom, &ln) == 0 && ln == 16 && strcmp(nom, "cubic") == 0 && nom[15] == 0 && nom[16] == 'x',
+             "TCP_CONGESTION : cubic, sur 16 octets");
+    ln = 4;
+    memset(nom, 'x', sizeof nom);
+    verifier(getsockopt(s, IPPROTO_TCP, TCP_CONGESTION, nom, &ln) == 0 && ln == 4 && memcmp(nom, "cubi", 4) == 0 && nom[4] == 'x',
+             "TCP_CONGESTION lu sur 4 octets : cubi, sans zero final");
+    verifier(erreur(setsockopt(s, IPPROTO_TCP, TCP_CONGESTION, "nimporte", 8)) == ENOENT, "TCP_CONGESTION : un nom inconnu, ENOENT");
+    verifier(erreur(setsockopt(s, IPPROTO_TCP, TCP_CONGESTION, "", 1)) == ENOENT, "TCP_CONGESTION : un nom vide, ENOENT");
+    verifier(erreur(setsockopt(s, IPPROTO_TCP, TCP_CONGESTION, "reno", 0)) == EINVAL, "TCP_CONGESTION : sans longueur, EINVAL");
+    verifier(erreur(setsockopt(s, IPPROTO_TCP, TCP_CONGESTION, "cubic", 5)) == 0, "TCP_CONGESTION : le meme, 0");
+    verifier(erreur(setsockopt(s, IPPROTO_TCP, TCP_CONGESTION, "renoXYZ", 4)) == 0, "TCP_CONGESTION : coupe a sa longueur, reno");
+    lire_controle(s, nom);
+    verifier(strcmp(nom, "reno") == 0, "TCP_CONGESTION relu : reno");
+    verifier(erreur(setsockopt(s, IPPROTO_TCP, TCP_CONGESTION, "cubic\0zz", 8)) == 0, "TCP_CONGESTION : jusqu'au premier zero");
+    lire_controle(s, nom);
+    verifier(strcmp(nom, "cubic") == 0, "TCP_CONGESTION relu : cubic");
+    /* Une écoute en reno : sa fille aussi, le client garde le sien. */
+    int port, l = ecoute(&port, 2);
+    setsockopt(l, IPPROTO_TCP, TCP_CONGESTION, "reno", 4);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in x = lo(port);
+    connect(c, (void *)&x, sizeof x);
+    int a = accept(l, NULL, NULL);
+    lire_controle(a, nom);
+    verifier(strcmp(nom, "reno") == 0, "la fille d'une ecoute en reno : reno");
+    lire_controle(c, nom);
+    verifier(strcmp(nom, "cubic") == 0, "le client : cubic");
+    /* Il change en route. */
+    verifier(erreur(setsockopt(c, IPPROTO_TCP, TCP_CONGESTION, "reno", 4)) == 0, "TCP_CONGESTION sur une connexion etablie");
+    lire_controle(c, nom);
+    verifier(strcmp(nom, "reno") == 0, "relu : reno");
+    close(a);
+    close(c);
+    close(l);
+    close(s);
+}
+
+/* Le débit calculé (`tcp_update_pacing_rate`, `tcpi_pacing_rate`) : l'infini sur
+ * une socket neuve ; dès le premier ACK : MSS × cwnd / SRTT, à 200 % ; et de même
+ * pour la fille. Les décalages, comme plus haut. SRTT lu en µs, arrondi par Linux,
+ * d'où la marge. */
+static uint64_t debit_de(int s, uint32_t *srtt, uint32_t *cwnd, uint32_t *ssthresh, uint32_t *mss, uint64_t *max)
+{
+    unsigned char b[248];
+    socklen_t lb = sizeof b;
+    uint64_t r = 0;
+    getsockopt(s, IPPROTO_TCP, TCP_INFO, b, &lb);
+    memcpy(&r, b + 104, 8);
+    memcpy(max, b + 112, 8);
+    memcpy(srtt, b + 68, 4);
+    memcpy(ssthresh, b + 76, 4);
+    memcpy(cwnd, b + 80, 4);
+    memcpy(mss, b + 16, 4);
+    return r;
+}
+
+/* MSS × cwnd × 200 % / SRTT, à 15 % près : Linux divise par SRTT × 8, que TCP_INFO
+ * arrondit. */
+static int debit_attendu(uint64_t debit, uint32_t mss, uint32_t cwnd, uint32_t srtt)
+{
+    uint64_t attendu = (uint64_t)mss * 80000 * 200 * cwnd / (8ULL * srtt);
+    return debit > attendu - attendu * 15 / 100 && debit < attendu + attendu * 15 / 100;
+}
+
+static void debit_calcule(void)
+{
+    uint32_t srtt, cwnd, ssthresh, mss;
+    uint64_t max;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    uint64_t d = debit_de(s, &srtt, &cwnd, &ssthresh, &mss, &max);
+    verifier(d == ~0ULL && max == ~0ULL, "tcpi_pacing_rate d'une socket neuve : ~0");
+    /* TCP_INFO sans connexion : les valeurs de départ ; une écoute : presque rien,
+     * les filles prêtes et sa file à la place de tcpi_unacked et tcpi_sacked. */
+    struct tcp_info i;
+    socklen_t li = sizeof i;
+    getsockopt(s, IPPROTO_TCP, TCP_INFO, &i, &li);
+    verifier(i.tcpi_state == 7 && i.tcpi_rto == 1000000 && i.tcpi_snd_mss == 536 && i.tcpi_rttvar == 250000 && i.tcpi_snd_ssthresh == 0x7fffffff
+             && i.tcpi_snd_cwnd == 10 && i.tcpi_reordering == 3 && i.tcpi_rtt == 0, "TCP_INFO d'une socket neuve");
+    close(s);
+    int port, l = ecoute(&port, 2);
+    d = debit_de(l, &srtt, &cwnd, &ssthresh, &mss, &max);
+    getsockopt(l, IPPROTO_TCP, TCP_INFO, &i, &li);
+    verifier(d == ~0ULL && i.tcpi_state == 10 && i.tcpi_rto == 0 && i.tcpi_unacked == 0 && i.tcpi_sacked == 2 && i.tcpi_snd_cwnd == 10 && i.tcpi_reordering == 3,
+             "TCP_INFO d'une ecoute, sans fille : sa file dans tcpi_sacked");
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in x = lo(port);
+    connect(c, (void *)&x, sizeof x);
+    /* (Le dernier ACK de la poignée de main arrive par lo avant que connect rende,
+     * chez Linux comme chez nous.) */
+    getsockopt(l, IPPROTO_TCP, TCP_INFO, &i, &li);
+    verifier(i.tcpi_unacked == 1 && i.tcpi_sacked == 2, "une fille prete : tcpi_unacked 1");
+    int a = accept(l, NULL, NULL);
+    d = debit_de(c, &srtt, &cwnd, &ssthresh, &mss, &max);
+    verifier(srtt > 0 && cwnd == 10 && max == ~0ULL && debit_attendu(d, mss, cwnd, srtt), "tcpi_pacing_rate apres connect : MSS x cwnd / SRTT, a 200 %");
+    d = debit_de(a, &srtt, &cwnd, &ssthresh, &mss, &max);
+    verifier(srtt > 0 && cwnd == 10 && debit_attendu(d, mss, cwnd, srtt), "tcpi_pacing_rate de la fille : de meme");
+    char o;
+    verifier(write(c, "x", 1) == 1 && read(a, &o, 1) == 1 && write(a, "y", 1) == 1 && read(c, &o, 1) == 1, "un aller-retour");
+    d = debit_de(c, &srtt, &cwnd, &ssthresh, &mss, &max);
+    verifier(srtt > 0 && debit_attendu(d, mss, cwnd, srtt), "tcpi_pacing_rate apres un ACK de donnees : de meme");
+    close(a);
+    close(c);
+    close(l);
+}
+
+/* SO_SNDBUF ne grandit que pour un programme qui attend de la place
+ * (`tcp_check_space`, SOCK_NOSPACE) : des envois qui tiennent ne le changent
+ * pas, même lus et acquittés ; remplir le tampon, puis tout lire, oui. Avec un
+ * petit MSS, pour que le tampon ait de la marge sous `tcp_wmem[2]`. */
+static void sndbuf_seulement_si_plein(void)
+{
+    int port, l = ecoute(&port, 1), v = 1000;
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, IPPROTO_TCP, TCP_MAXSEG, &v, sizeof v);
+    struct sockaddr_in x = lo(port);
+    connect(c, (void *)&x, sizeof x);
+    int a = accept(l, NULL, NULL);
+    close(l);
+    int depart = option(c, SOL_SOCKET, SO_SNDBUF);
+    static char b[1 << 20];
+    int ok = 1;
+    for (int i = 0; i < 64; i++)
+        ok &= write(c, b, 100) == 100 && read(a, b, 100) == 100;
+    attendre_ms(20);
+    verifier(ok && option(c, SOL_SOCKET, SO_SNDBUF) == depart, "SO_SNDBUF inchange par des envois qui tiennent");
+    long total = 0, r;
+    while ((r = send(c, b, sizeof b, MSG_DONTWAIT)) > 0)
+        total += r;
+    verifier(total > 0 && errno == EAGAIN, "le tampon plein : EAGAIN");
+    while (total > 0 && (r = read(a, b, sizeof b)) > 0)
+        total -= r;
+    attendre_ms(20);
+    int apres = option(c, SOL_SOCKET, SO_SNDBUF);
+    printf("[linux] tcp : SO_SNDBUF %d, puis %d une fois plein\n", depart, apres);
+    verifier(total == 0 && apres > depart, "le programme a attendu de la place : SO_SNDBUF grandit");
+    close(a);
+    close(c);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1105,6 +1264,9 @@ int main(void)
     echelle();
     horodatages();
     reprise_time_wait();
+    congestion();
+    debit_calcule();
+    sndbuf_seulement_si_plein();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

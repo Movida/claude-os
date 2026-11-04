@@ -68,6 +68,11 @@ impl Rtt {
         self.srtt8 >> 3
     }
 
+    /// SRTT × 8, en µs (le `srtt_us` de Linux) : 0 sans mesure.
+    pub fn srtt8_us(&self) -> u64 {
+        self.srtt8 / 1000
+    }
+
     pub fn ecart(&self) -> u64 {
         self.mdev4 >> 2
     }

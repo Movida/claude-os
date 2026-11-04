@@ -221,7 +221,7 @@ impl<P: Charge> Tcb<P> {
         if let Some(d) = etat.dernier {
             ca_rtt = Some(maintenant.saturating_sub(d));
         }
-        let mesure = self.mettre_a_jour_rtt(flag, seq_rtt, sack_rtt, ca_rtt, maintenant);
+        let (mesure, rtt_dernier) = self.mettre_a_jour_rtt(flag, seq_rtt, sack_rtt, ca_rtt, maintenant);
         if flag & FLAG_ACKED != 0 {
             flag |= FLAG_SET_XMIT_TIMER;
             if self.sack_ok {
@@ -244,6 +244,7 @@ impl<P: Charge> Tcb<P> {
             // dernier envoi de la tête : le RTO reculerait sans fin pendant la reprise.
             flag |= FLAG_SET_XMIT_TIMER;
         }
+        self.cc.segments_acquittes(rtt_dernier, self.snd_una, self.snd_nxt, maintenant);
         flag
     }
 
@@ -275,14 +276,16 @@ impl<P: Charge> Tcb<P> {
     /// mesure en ms ferait monter à 1 ms le SRTT d'une boucle de 30 µs. Le RTO
     /// repart de l'estimateur, sans recul (RFC 6298 5.7 : seulement sur une vraie
     /// mesure) ; `min_rtt` suit la mesure du dernier segment (`tcp_update_rtt_min`).
-    pub(super) fn mettre_a_jour_rtt(&mut self, flag: u32, seq: Option<u64>, sack: Option<u64>, ca: Option<u64>, maintenant: u64) -> bool {
+    /// Rend si l'estimateur a eu une mesure, et le RTT du dernier segment
+    /// (`rs->rtt_us`), que lit le contrôle de congestion.
+    pub(super) fn mettre_a_jour_rtt(&mut self, flag: u32, seq: Option<u64>, sack: Option<u64>, ca: Option<u64>, maintenant: u64) -> (bool, Option<u64>) {
         let mut seq = seq.or(sack);
         let mut ca = ca;
         if seq.is_none() && flag & FLAG_ACKED != 0 && let Some(m) = self.rtt_par_tsecr(maintenant, 1) {
             seq = Some(m);
             ca = Some(m);
         }
-        let Some(m) = seq else { return false };
+        let Some(m) = seq else { return (false, ca) };
         let c = ca.unwrap_or(m);
         if !(flag & FLAG_ACK_MAYBE_DELAYED != 0 && c > self.min_rtt.valeur()) {
             // Une mesure de moins d'une µs compte pour un jiffy (`rtt_us ?:
@@ -292,7 +295,7 @@ impl<P: Charge> Tcb<P> {
         self.rtt.echantillon(m, self.snd_una, self.snd_nxt);
         self.rto = self.rtt.rto();
         self.recul = 0;
-        true
+        (true, Some(c))
     }
 
     // --- Les ACK dupliqués, faute de SACK ---
@@ -446,12 +449,13 @@ impl<P: Charge> Tcb<P> {
         }
         self.cc.cwnd = self.paquets_en_vol() + 1;
         self.cc.remettre_compte();
+        self.cc.poser_instant(maintenant);
         // Un RTO en désordre après beaucoup d'ACK dupliqués : le degré de
         // réordonnancement estimé était trop grand.
         if phase <= Phase::Desordre && self.sacked_out >= TCP_REORDERING {
             self.reordering = self.reordering.min(TCP_REORDERING);
         }
-        self.cc.phase = Phase::Perte;
+        self.changer_phase(Phase::Perte);
         self.high_seq = self.snd_nxt;
         self.tlp_high_seq = None;
         // F-RTO (RFC 5682, 3.1, étape 1) : seulement hors d'une autre reprise,
@@ -476,6 +480,7 @@ impl<P: Charge> Tcb<P> {
     pub(super) fn finir_reduction(&mut self) {
         if self.cc.ssthresh < super::congestion::SSTHRESH_INFINI && (self.cc.phase == Phase::Reduction || self.undo_marker.is_some()) {
             self.cc.cwnd = self.cc.ssthresh;
+            self.cc.poser_instant(self.heure);
         }
     }
 
@@ -488,7 +493,7 @@ impl<P: Charge> Tcb<P> {
             self.prior_ssthresh = self.cc.ssthresh_courant();
             self.commencer_reduction();
         }
-        self.cc.phase = Phase::Reprise;
+        self.changer_phase(Phase::Reprise);
     }
 
     /// Reste-t-il un renvoi dans la fenêtre (`tcp_any_retrans_done`) ?
@@ -555,11 +560,12 @@ impl<P: Charge> Tcb<P> {
             self.indice_renvoi = None;
         }
         if self.prior_ssthresh != 0 {
-            self.cc.cwnd = self.cc.annuler(self.prior_cwnd);
+            self.cc.cwnd = self.cc.annuler(self.prior_cwnd, self.heure);
             if self.prior_ssthresh > self.cc.ssthresh {
                 self.cc.ssthresh = self.prior_ssthresh;
             }
         }
+        self.cc.poser_instant(self.heure);
         self.undo_marker = None;
         self.rack.avance = true;
     }
@@ -575,7 +581,7 @@ impl<P: Charge> Tcb<P> {
         if self.reno_empeche_de_rouvrir() {
             return true;
         }
-        self.cc.phase = Phase::Ouverte;
+        self.changer_phase(Phase::Ouverte);
         self.sack_renie = false;
         false
     }
@@ -599,7 +605,7 @@ impl<P: Charge> Tcb<P> {
                 return true;
             }
             if par_frto || self.sack_ok {
-                self.cc.phase = Phase::Ouverte;
+                self.changer_phase(Phase::Ouverte);
                 self.sack_renie = false;
             }
             return true;
@@ -639,7 +645,7 @@ impl<P: Charge> Tcb<P> {
     pub(super) fn rester_ouverte(&mut self) {
         let etat = if self.sacked_out + self.lost_out > 0 || self.renvoi_fait() { Phase::Desordre } else { Phase::Ouverte };
         if self.cc.phase != etat {
-            self.cc.phase = etat;
+            self.changer_phase(etat);
             self.high_seq = self.snd_nxt;
         }
     }
@@ -721,7 +727,7 @@ impl<P: Charge> Tcb<P> {
                 Phase::Reduction => {
                     if self.snd_una != self.high_seq {
                         self.finir_reduction();
-                        self.cc.phase = Phase::Ouverte;
+                        self.changer_phase(Phase::Ouverte);
                     }
                 }
                 Phase::Reprise => {
@@ -795,9 +801,19 @@ impl<P: Charge> Tcb<P> {
         self.rexmit = Rexmit::Perdus;
     }
 
+    /// L'état de la reprise change (`tcp_set_ca_state`).
+    pub(super) fn changer_phase(&mut self, phase: Phase) {
+        self.cc.changer_phase(phase, self.snd_nxt, self.heure);
+    }
+
+    /// Le débit calculé, à chaque ACK (`tcp_update_pacing_rate`).
+    pub(super) fn maj_pacing(&mut self, mss: u32) {
+        self.cc.maj_pacing(mss, self.file.len() as u32, self.rtt.srtt8_us());
+    }
+
     /// La cwnd après un ACK (`tcp_cong_control`) : elle réduit si l'état le
-    /// veut, grandit sinon, si l'ACK a acquitté des données.
-    pub(super) fn controler_congestion(&mut self, livres: u32, perdus: u32, flag: u32) {
+    /// veut, grandit sinon, si l'ACK a acquitté des données ; puis le débit calculé.
+    pub(super) fn controler_congestion(&mut self, livres: u32, perdus: u32, flag: u32, maintenant: u64) {
         if self.en_reduction() {
             self.reduire_cwnd(livres, perdus, flag);
         } else {
@@ -805,9 +821,10 @@ impl<P: Charge> Tcb<P> {
             // réordonnancement estimé rend moins prudent.
             let peut = if self.reordering > TCP_REORDERING { flag & FLAG_FORWARD_PROGRESS != 0 } else { flag & FLAG_DATA_ACKED != 0 };
             if peut {
-                self.cc.croitre(livres);
+                self.cc.croitre(livres, maintenant);
             }
         }
+        self.maj_pacing(self.mss_borne());
     }
 
     /// PRR (`tcp_cwnd_reduction`, RFC 6937) : `livres` segments de plus ont
@@ -952,7 +969,12 @@ impl<P: Charge> Tcb<P> {
         self.file[i].marques = (self.file[i].marques | DEJA_RENVOYE) & !COMPTE;
         self.file[i].livres_tx = self.livres;
         self.tri_ajouter(e.seq, maintenant);
-        self.segment_de_donnees_parti(maintenant);
+        // L'ACK d'abord : sortir du mode rapide remet `ato` au plus bas, ce que lit le test du
+        // ping-pong (`__tcp_transmit_skb`).
+        self.ack_envoye();
+        if e.longueur() > 0 {
+            self.segment_de_donnees_parti(maintenant);
+        }
         true
     }
 

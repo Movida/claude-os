@@ -90,6 +90,8 @@ fn calmer(a: &mut Connexion, b: &mut Connexion) {
 }
 
 const MSS: u16 = 1460;
+/// Le seuil d'avant toute perte (TCP_INFINITE_SSTHRESH).
+const SEUIL_INFINI: u32 = 0x7fff_ffff;
 /// L'échelle de fenêtre que proposent les connexions de ces tests : celle
 /// d'une machine où `tcp_rmem[2]` vaut 6 Mio (ilog2(6 Mio) - 15 ; voir
 /// `echelle_comme_linux`).
@@ -597,12 +599,238 @@ fn retransmission_rapide_au_troisieme_ack_duplique() {
     assert_eq!(renvoyes.len(), 1);
     assert_eq!((renvoyes[0].0.seq, renvoyes[0].1.len()), (tete, MSS as usize));
     // Elle arrive : le trou se comble, l'ACK couvre tout ; la reprise
-    // s'achève, la fenêtre de congestion au seuil, la moitié de dix.
+    // s'achève, la fenêtre de congestion au seuil : pour CUBIC, 70 % de dix.
     let fin = livrer_sauf(&mut c, &mut f, renvoyes, &[]);
     assert!(fin.is_empty());
     assert_eq!(f.lisibles(), 10 * MSS as usize);
-    assert_eq!((c.congestion().0, c.congestion().1), (5, 5));
+    assert_eq!((c.congestion().0, c.congestion().1), (7, 7));
     assert_eq!(c.non_acquittes(), 0);
+}
+
+/// La même perte, avec Reno : la moitié (TCP_CONGESTION « reno »).
+#[test]
+fn reno_reduit_de_moitie() {
+    let (mut c, mut f) = paire();
+    assert_eq!(c.controle(), t::Controle::Cubic);
+    c.choisir_controle(t::Controle::Reno, maintenant());
+    assert_eq!(c.controle(), t::Controle::Reno);
+    let s = dix_segments(&mut c);
+    let renvoyes = livrer_sauf(&mut c, &mut f, s, &[0]);
+    assert!(livrer_sauf(&mut c, &mut f, renvoyes, &[]).is_empty());
+    assert_eq!((c.congestion().0, c.congestion().1), (5, 5));
+}
+
+/// Les noms des contrôles (`tcp_ca_find`), et celui d'une socket neuve.
+#[test]
+fn noms_des_controles() {
+    use t::Controle;
+    assert_eq!((Controle::par_nom(b"cubic"), Controle::par_nom(b"reno")), (Some(Controle::Cubic), Some(Controle::Reno)));
+    assert_eq!((Controle::par_nom(b""), Controle::par_nom(b"bbr"), Controle::par_nom(b"cubi")), (None, None, None));
+    assert_eq!((Controle::DEFAUT, Controle::Cubic.nom(), Controle::Reno.nom()), (Controle::Cubic, &b"cubic"[..], &b"reno"[..]));
+}
+
+/// La cwnd portée à `n` segments au moins, par Reno (l'heure n'avançant que pour
+/// les ACK retardés, HyStart n'y verrait rien).
+fn grandir(c: &mut Connexion, f: &mut Connexion, n: u32) {
+    for _ in 0..30 {
+        if c.congestion().0 >= n {
+            return;
+        }
+        let cwnd = c.congestion().0 as usize;
+        ecrire(c, &vec![0u8; cwnd * MSS as usize]);
+        calmer(c, f);
+        let _ = lire(f, 1 << 30);
+    }
+    panic!("la cwnd ne grandit pas : {}", c.congestion().0);
+}
+
+/// Le débit calculé (`tcp_update_pacing_rate`) : cwnd × MSS / SRTT, à 200 % en
+/// démarrage lent, à 120 % ensuite. L'infini avant toute mesure ; puis dès le
+/// premier ACK du client, et l'établissement de la fille (`tcp_rcv_state_process`).
+#[test]
+fn debit_calcule() {
+    let mss = MSS as u64;
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 1 << 24, 1 << 24, ECHELLE);
+    assert_eq!(c.info(maintenant()).pacing, t::PACING_MAX);
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 1 << 24, 1 << 24, ECHELLE);
+    let synack = sortants(&mut f)[0].0;
+    avancer(10 * MS);
+    c.recevoir(&synack, vide(), maintenant());
+    // 1460 × 10 segments / 10 ms = 1,46 Mo/s, à 200 %.
+    assert_eq!(c.info(maintenant()).pacing, 2_920_000);
+    let ack = sortants(&mut c)[0].0;
+    avancer(10 * MS);
+    f.recevoir(&ack, vide(), maintenant());
+    // La fille a vu 20 ms.
+    assert_eq!(f.info(maintenant()).pacing, 2 * mss * 10 * 1000 / 20);
+    // Un ACK de données, après 10 ms (la mesure ne change pas SRTT). Démarrage
+    // lent : 200 %. (La cwnd ne grandit pas : ces deux segments ne la remplissaient
+    // pas.)
+    ecrire(&mut c, &vec![0u8; 2 * MSS as usize]);
+    let s = sortants(&mut c);
+    assert_eq!(s.len(), 2);
+    for (h, o) in s {
+        f.recevoir(&h, Octets(o, 0), maintenant());
+    }
+    let acks = sortants(&mut f);
+    avancer(10 * MS);
+    for (h, _) in acks {
+        c.recevoir(&h, vide(), maintenant());
+    }
+    let i = c.info(maintenant());
+    assert_eq!((i.rtt, i.cwnd), (10_000, 10));
+    assert_eq!(i.pacing, 2 * mss * 10 * 1000 / 10);
+    // Passé le seuil : 120 %.
+    let _ = lire(&mut f, 1 << 30);
+    let s = dix_segments(&mut c);
+    let renvoyes = livrer_sauf(&mut c, &mut f, s, &[0]);
+    assert!(livrer_sauf(&mut c, &mut f, renvoyes, &[]).is_empty());
+    let i = c.info(maintenant());
+    assert!(i.cwnd >= i.ssthresh && i.ssthresh < 12, "cwnd {}, seuil {}", i.cwnd, i.ssthresh);
+    assert_eq!(i.pacing, mss * 12 * i.cwnd as u64 * 100 / 10);
+}
+
+/// Une salve de `cwnd` segments, un RTT de 10 ms, et des ACK qui reviennent à 1 ms
+/// d'intervalle, comme à travers un goulet : le train d'ACK de HyStart. Rend
+/// (cwnd, seuil).
+fn tour_en_train(c: &mut Connexion, f: &mut Connexion) -> (u32, u32) {
+    let s = sortants(c);
+    avancer(5 * MS);
+    let mut acks = Vec::new();
+    for (h, o) in s {
+        f.recevoir(&h, Octets(o, 0), maintenant());
+        acks.extend(sortants(f));
+        let _ = lire(f, 1 << 30);
+    }
+    avancer(5 * MS);
+    for (h, _) in acks {
+        c.recevoir(&h, vide(), maintenant());
+        avancer(MS);
+    }
+    (c.congestion().0, c.congestion().1)
+}
+
+/// HyStart (CUBIC) : le train d'ACK dure plus d'un demi-RTT, le démarrage lent
+/// s'arrête là : le seuil devient la cwnd, sans aucune perte. Reno, lui, continue
+/// jusqu'à la perte.
+#[test]
+fn hystart_sort_du_demarrage_lent_sans_perte() {
+    let (mut c, mut f) = paire_avec(MSS, 1 << 25, 1 << 25);
+    ecrire(&mut c, &vec![0u8; 1 << 24]);
+    let mut seuil = SEUIL_INFINI;
+    for _ in 0..10 {
+        (_, seuil) = tour_en_train(&mut c, &mut f);
+    }
+    assert!((16..200).contains(&seuil), "seuil {seuil}");
+    assert!(c.congestion().0 < 2 * seuil, "la cwnd ne double plus : {} pour un seuil de {seuil}", c.congestion().0);
+    assert_eq!(c.info(maintenant()).total_rto, 0);
+
+    let (mut c, mut f) = paire_avec(MSS, 1 << 25, 1 << 25);
+    c.choisir_controle(t::Controle::Reno, maintenant());
+    ecrire(&mut c, &vec![0u8; 1 << 24]);
+    for _ in 0..10 {
+        (_, seuil) = tour_en_train(&mut c, &mut f);
+    }
+    assert_eq!(seuil, SEUIL_INFINI);
+    assert!(c.congestion().0 > 400);
+}
+
+/// `tcp_cwnd_application_limited` (RFC 2861) : la cwnd ne sert plus depuis un RTO
+/// (le dernier ACK date, et il reste du vol) : elle redescend à mi-chemin de ce qui
+/// a servi, 10 segments au moins ; le seuil en garde les trois quarts. Pas si le
+/// programme attend de la place : il n'est pas à court de quoi envoyer.
+#[test]
+fn cwnd_relachee_quand_le_programme_ne_la_remplit_pas() {
+    let essai = |bloque: bool| {
+        let (mut c, mut f) = paire_avec(MSS, 1 << 24, 1 << 24);
+        c.choisir_controle(t::Controle::Reno, maintenant());
+        grandir(&mut c, &mut f, 30);
+        let cwnd = c.congestion().0;
+        if bloque {
+            c.marquer_sans_place();
+        }
+        let rto = c.congestion().2;
+        let r = t::Reglages { nodelay: true, ..c.reglages };
+        c.regler(r, maintenant());
+        // Le premier petit envoi, moins d'un RTO après le dernier ACK : rien ne
+        // bouge encore.
+        avancer(rto * 3 / 4);
+        ecrire(&mut c, b"a");
+        assert_eq!(sortants(&mut c).len(), 1);
+        assert_eq!(c.congestion().0, cwnd);
+        // Le second, un RTO passé, le premier encore en vol.
+        avancer(rto / 2);
+        ecrire(&mut c, b"b");
+        assert_eq!(sortants(&mut c).len(), 1);
+        (cwnd, c.congestion().0, c.congestion().1)
+    };
+    let (cwnd, apres, seuil) = essai(false);
+    assert_eq!(apres, (cwnd + 10) / 2);
+    assert_eq!(seuil, SEUIL_INFINI, "le seuil ne baisse pas : sa valeur infinie reste la plus grande");
+    let (cwnd, apres, _) = essai(true);
+    assert_eq!(apres, cwnd, "un programme qui attend de la place ne relâche rien");
+}
+
+/// `tcp_cwnd_restart` (RFC 2861), après un silence, rien en vol : la moitié par
+/// RTO écoulé, sans passer sous la fenêtre de départ, et le temps du silence ne
+/// compte pas pour la courbe de CUBIC.
+#[test]
+fn cwnd_apres_un_long_silence() {
+    let (mut c, mut f) = paire_avec(MSS, 1 << 24, 1 << 24);
+    c.choisir_controle(t::Controle::Reno, maintenant());
+    grandir(&mut c, &mut f, 30);
+    calmer(&mut c, &mut f);
+    let cwnd = c.congestion().0;
+    avancer(c.congestion().2 * 3 / 2);
+    ecrire(&mut c, b"a");
+    assert_eq!(sortants(&mut c).len(), 1);
+    assert_eq!(c.congestion().0, cwnd / 2);
+    // Un FIN seul ne redémarre pas la cwnd (`tcp_send_fin` n'y passe pas : elle
+    // aurait été divisée par deux à chaque RTO) ; il la relâche (il est sorti, et
+    // la cwnd n'a pas servi depuis plus d'un RTO).
+    let (mut c, mut f) = paire_avec(MSS, 1 << 24, 1 << 24);
+    grandir(&mut c, &mut f, 30);
+    calmer(&mut c, &mut f);
+    let cwnd = c.congestion().0;
+    avancer(c.congestion().2 * 3);
+    c.fermer_envoi();
+    assert_eq!(sortants(&mut c).len(), 1);
+    assert_eq!(c.congestion().0, (cwnd + 10) / 2);
+}
+
+/// SO_SNDBUF ne suit la cwnd que pour un programme qui attend de la place
+/// (`tcp_check_space`, SOCK_NOSPACE) : deux fenêtres de congestion, à l'envoi
+/// d'un segment neuf, ou à un segment reçu, si la cwnd n'est pas pleine.
+#[test]
+fn sndbuf_suit_la_cwnd_si_le_programme_attend() {
+    let (mut c, mut f) = paire_avec(MSS, 1 << 24, 87_040);
+    let depart = c.sndbuf;
+    c.choisir_controle(t::Controle::Reno, maintenant());
+    // Des envois qui tiennent : la cwnd grandit, SO_SNDBUF non.
+    for _ in 0..3 {
+        assert_eq!(ecrire(&mut c, &vec![0u8; 50 * MSS as usize]), 50 * MSS as usize);
+        calmer(&mut c, &mut f);
+        let _ = lire(&mut f, 1 << 30);
+    }
+    let cwnd = c.congestion().0 as usize;
+    assert!(cwnd > 60, "cwnd {cwnd}");
+    assert_eq!(c.sndbuf, depart);
+    // Le programme veut écrire plus que la place : au premier segment qui part,
+    // la cwnd n'étant pas pleine, SO_SNDBUF suit.
+    assert_eq!(ecrire(&mut c, &vec![0u8; 2 * depart]), depart);
+    assert_eq!(c.sndbuf, depart);
+    for (h, o) in sortants(&mut c) {
+        f.recevoir(&h, Octets(o, 0), maintenant());
+    }
+    assert_eq!(c.sndbuf, 2 * cwnd * (4096 + 256));
+    // Il n'attend plus (tout est acquitté, la place revenue) : un envoi qui tient,
+    // une autre fenêtre de congestion, SO_SNDBUF ne bouge pas.
+    let n = c.sndbuf;
+    calmer(&mut c, &mut f);
+    let _ = lire(&mut f, 1 << 30);
+    grandir(&mut c, &mut f, 2 * cwnd as u32);
+    assert_eq!(c.sndbuf, n);
 }
 
 #[test]
@@ -1239,6 +1467,15 @@ fn so_sndbuf_agrandi() {
     assert_eq!(c.sndbuf, 16_384);
 }
 
+/// TCP_INFO sans connexion, et d'une écoute : ce qu'en rend Linux (mesuré).
+#[test]
+fn info_sans_connexion() {
+    let i = t::Info::sans_connexion();
+    assert_eq!((i.etat, i.rto, i.snd_mss, i.rttvar, i.ssthresh, i.cwnd, i.reordonnancement, i.min_rtt, i.pacing), (7, 1_000_000, 536, 250_000, SEUIL_INFINI, 10, 3, u32::MAX, u64::MAX));
+    let i = t::Info::ecoute(1, 7);
+    assert_eq!((i.etat, i.rto, i.snd_mss, i.non_acquittes, i.sackes, i.cwnd, i.reordonnancement, i.min_rtt, i.pacing), (10, 0, 0, 1, 7, 10, 3, 0, u64::MAX));
+}
+
 #[test]
 fn info() {
     let (c, _) = paire();
@@ -1279,15 +1516,26 @@ fn minshall_petit_apres_des_pleins() {
 /// et la file hors d'ordre ne prend plus rien.
 #[test]
 fn memoire_de_toute_la_machine() {
-    // Libre : SO_SNDBUF agrandi à l'établissement ; sous pression, non.
-    let (c, _f) = paire();
-    assert!(c.sndbuf > 16_384);
+    // SO_SNDBUF agrandi à l'établissement, sous pression aussi
+    // (`tcp_init_buffer_space` ne la regarde pas) ; ensuite, plus : pour un
+    // programme qui attend de la place, le même envoi le ferait grandir sans elle
+    // (`sndbuf_suit_la_cwnd_si_le_programme_attend`).
+    let (mut c, mut f) = paire();
+    c.memoire = t::Memoire::Pression;
+    let depart = c.sndbuf;
+    assert!(depart > 16_384);
+    c.choisir_controle(t::Controle::Reno, maintenant());
+    grandir(&mut c, &mut f, 30);
+    c.marquer_sans_place();
+    ecrire(&mut c, b"a");
+    calmer(&mut c, &mut f);
+    assert_eq!(c.sndbuf, depart);
     let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.memoire = t::Memoire::Pression;
     let syn = sortants(&mut c)[0].0;
     let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     calmer(&mut c, &mut f);
-    assert_eq!(c.sndbuf, 16_384);
+    assert_eq!(c.sndbuf, depart);
     // Limite : un envoi dans un tampon vide passe, puis plus rien.
     c.memoire = t::Memoire::Limite;
     assert_eq!(ecrire(&mut c, b"abc"), 3);

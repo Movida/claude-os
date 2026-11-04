@@ -336,6 +336,9 @@ pub struct OptionsTcp {
     pub rcvlowat: u32,
     pub ttl: u8,
     pub tos: u8,
+    /// TCP_CONGESTION : le contrôle de la socket, et de ses filles
+    /// (`tcp_ca_openreq_child`).
+    pub controle: itcp::Controle,
 }
 
 impl OptionsTcp {
@@ -345,7 +348,7 @@ impl OptionsTcp {
     pub const DEFAUT: OptionsTcp = OptionsTcp {
         nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
-        rcvbuf_fixe: false, rcvlowat: 1, ttl: 64, tos: 0,
+        rcvbuf_fixe: false, rcvlowat: 1, ttl: 64, tos: 0, controle: itcp::Controle::DEFAUT,
     };
 
     /// Ce que la connexion en retient (TCP_USER_TIMEOUT est en ms, les
@@ -370,8 +373,9 @@ pub struct Premier {
     pub erreur: i32,
     pub place: usize,
     pub sndbuf: usize,
-    /// Les filles établies, prêtes pour `accept`.
+    /// Les filles établies, prêtes pour `accept`, et la longueur de la file d'écoute.
     pub pretes: usize,
+    pub file: usize,
     /// Un octet urgent à lire (POLLPRI).
     pub urgent: bool,
     pub arret: u8,
@@ -380,6 +384,9 @@ pub struct Premier {
     /// place ne serait jamais atteint, `tcp_epollin_ready`).
     pub rcvlowat: usize,
     pub fenetre_basse: bool,
+    /// `poll` a trouvé le tampon d'envoi trop plein (SOCK_NOSPACE) : à dire à la
+    /// connexion (`Possede::descendre`), qu'il ne peut pas toucher.
+    pub sans_place: bool,
 }
 
 /// Ce qui arrive à une socket depuis le réseau : un segment, ou une
@@ -422,20 +429,21 @@ impl Partie {
                                    t.fenetre_presque_fermee()),
             _ => (None, 0, false, 0, sndbuf, sndbuf, false, false),
         };
-        let (ecoute, pretes) = match &self.mode {
-            Mode::Ecoute { filles, .. } => (true, filles.iter().filter(|f| f.prete()).count()),
-            _ => (false, 0),
+        let (ecoute, pretes, file) = match &self.mode {
+            Mode::Ecoute { filles, backlog } => (true, filles.iter().filter(|f| f.prete()).count(), *backlog),
+            _ => (false, 0, 0),
         };
         Premier {
-            etat, ecoute, lisibles, fin_recue, erreur, place, sndbuf, pretes, urgent, arret, rcvlowat: self.options.rcvlowat as usize,
-            fenetre_basse,
+            etat, ecoute, lisibles, fin_recue, erreur, place, sndbuf, pretes, file, urgent, arret, rcvlowat: self.options.rcvlowat as usize,
+            fenetre_basse, sans_place: false,
         }
     }
 
     /// Recopie le premier étage, et rend les événements qui ont changé
     /// (pour réveiller).
     fn rafraichir(&self, court: &mut Premier) -> u32 {
-        let neuf = self.premier(court.arret, court.sndbuf);
+        let mut neuf = self.premier(court.arret, court.sndbuf);
+        neuf.sans_place = court.sans_place;
         let mut m = 0;
         if neuf.lisibles > court.lisibles || neuf.fin_recue != court.fin_recue || neuf.pretes > court.pretes {
             m |= POLLIN | POLLRDNORM;
@@ -757,6 +765,12 @@ impl Possede for Partie {
         self.rafraichir(court)
     }
 
+    fn descendre(&mut self, court: &mut Premier) {
+        if core::mem::take(&mut court.sans_place) && let Mode::Connexion(t) = &mut self.mode {
+            t.marquer_sans_place();
+        }
+    }
+
     /// L'échéance de la socket est tombée (elle n'est plus dans la liste) :
     /// la connexion, ou chaque fille d'une écoute, fait ce qui est échu ;
     /// une fille dont les SYN-ACK sont restés sans réponse s'en va.
@@ -879,6 +893,7 @@ impl Partie {
         tcb.sndbuf_fixe = self.options.sndbuf_fixe;
         tcb.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
         tcb.memoire = niveau_memoire();
+        tcb.poser_controle(self.options.controle);
         let lien = Lien {
             sorte: Sorte::Connectee, adresse: s.destination, port: h.destination, distante: s.source, port_distant: h.source,
             reuseaddr: false, reuseport: false, uid: 0, par_connect: false,
@@ -1316,6 +1331,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 t.sndbuf_fixe = p.options.sndbuf_fixe;
                 t.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
                 t.memoire = niveau_memoire();
+                t.poser_controle(p.options.controle);
                 t.proposer_horodatages(decalage_horodatages(source, destination));
                 t.proposer_sack();
                 if let Some((_, _, ts)) = reprise {
@@ -1783,7 +1799,14 @@ fn t_ferme(p: &Partie) -> bool {
 
 /// Ce qu'on peut faire de la socket sans attendre (`tcp_poll`).
 pub fn sonder(s: &Socket) -> u32 {
-    flux(s).court(|c| masque(c))
+    flux(s).court(|c| {
+        let m = masque(c);
+        // Pas écrivable : la connexion devra le savoir (`tcp_poll`, SOCK_NOSPACE).
+        if m & POLLOUT == 0 && !c.ecoute && !matches!(c.etat, Some(Etat::SynEnvoye | Etat::SynRecu)) {
+            c.sans_place = true;
+        }
+        m
+    })
 }
 
 /// Le masque de `tcp_poll`, d'après le premier étage.
@@ -2020,6 +2043,11 @@ fn ligne_connexion(l: &mut LigneProc, t: &Tcb<Paquet>, maintenant: u64, uid: u32
 /// La socket écoute-t-elle (SO_ACCEPTCONN) ?
 pub fn ecoute(s: &Socket) -> bool {
     flux(s).court(|c| c.ecoute)
+}
+
+/// Une écoute : ses filles prêtes, et la longueur de sa file (TCP_INFO).
+pub fn file_d_ecoute(s: &Socket) -> (u32, u32) {
+    flux(s).court(|c| (c.pretes as u32, c.file as u32))
 }
 
 /// Quelqu'un attend-il sur une socket TCP (le détecteur d'interblocage) ?

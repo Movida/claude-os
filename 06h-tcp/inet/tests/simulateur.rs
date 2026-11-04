@@ -196,6 +196,10 @@ impl Simulation {
         if alea.sous(2) == 0 {
             c.proposer_sack();
         }
+        // Et le contrôle de congestion, ici et chez l'autre : CUBIC, ou Reno.
+        if alea.sous(2) == 0 {
+            c.poser_controle(t::Controle::Reno);
+        }
         a.tcb = Some(c);
         Simulation { graine, alea, lien, heure: 0, ordre: 0, en_route: Vec::new(), a, b, segments: 0, perdus: 0, renvois: 0, plus_loin: [None; 2] }
     }
@@ -348,6 +352,9 @@ impl Simulation {
                     let iss = self.alea.suivant() as u32;
                     let mut c = Connexion::depuis_syn(&s.entete, iss, MSS, 131_072, 65_536, ECHELLE);
                     c.decalage_horodatages(iss);
+                    if self.alea.sous(2) == 0 {
+                        c.poser_controle(t::Controle::Reno);
+                    }
                     cote.tcb = Some(c);
                 }
             }
