@@ -1428,12 +1428,14 @@ fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Resu
     })
 }
 
+/// La taille de la `struct tcp_info` de Linux 6.18.
+const TAILLE_INFO: usize = 248;
+
 /// La valeur d'une option de SOL_TCP (`do_tcp_getsockopt`), et sa
 /// longueur : un entier ; TCP_CONGESTION, son nom ; TCP_INFO, la
-/// `struct tcp_info` jusqu'à `tcpi_total_retrans` (104 octets : les champs
-/// que nous tenons, zéro ailleurs).
-fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; 104], usize), i64> {
-    let mut o = [0u8; 104];
+/// `struct tcp_info` (voir `ecrire_info`).
+fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], usize), i64> {
+    let mut o = [0u8; TAILLE_INFO];
     let ecoute = tcp::ecoute(s);
     let n = tcp::avec_options(s, |op, tcb| {
         let v = match option {
@@ -1467,7 +1469,7 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; 104], usize), i
                     // TCP_LISTEN, ou TCP_CLOSE.
                     None => o[0] = if ecoute { 10 } else { 7 },
                 }
-                return Ok(104);
+                return Ok(TAILLE_INFO);
             }
             _ => return Err(-ENOPROTOOPT),
         };
@@ -1505,19 +1507,22 @@ fn essais_en_secondes(essais: u32) -> i32 {
     periode
 }
 
-/// La `struct tcp_info` de Linux jusqu'à `tcpi_total_retrans` (104
-/// octets) : les champs que nous tenons, zéro ailleurs (dont `tcpi_fackets` et
-/// `tcpi_last_ack_sent`, que Linux laisse aussi à 0).
-fn ecrire_info(o: &mut [u8; 104], i: &inet::tcp::Info) {
+/// La `struct tcp_info` de Linux 6.18 (280 octets) : les champs que nous tenons,
+/// zéro ailleurs (dont `tcpi_fackets` et `tcpi_last_ack_sent`, que Linux laisse
+/// aussi à 0).
+fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
     o[..8].copy_from_slice(&[i.etat, i.phase, i.retransmissions, i.sondes, i.recul, i.options, i.echelle_envoi | i.echelle_reception << 4, 0]);
     let mots = [
         (8, i.rto), (12, i.ato), (16, i.snd_mss), (20, i.rcv_mss), (24, i.non_acquittes), (28, i.sackes), (32, i.perdus), (36, i.retransmis),
         (44, i.dernier_envoi), (52, i.dernier_recu), (56, i.dernier_ack), (60, i.pmtu), (68, i.rtt), (72, i.rttvar),
-        (76, i.ssthresh), (80, i.cwnd), (84, i.advmss), (88, i.reordonnancement), (100, i.total_retrans),
+        (76, i.ssthresh), (80, i.cwnd), (84, i.advmss), (88, i.reordonnancement), (92, i.rcv_rtt), (100, i.total_retrans),
+        (148, i.min_rtt), (192, i.livres), (216, i.dsack_doublons), (220, i.reord_seen), (228, i.snd_wnd), (232, i.rcv_wnd),
     ];
     for (decalage, v) in mots {
         o[decalage..decalage + 4].copy_from_slice(&v.to_le_bytes());
     }
+    o[120..128].copy_from_slice(&i.octets_acquittes.to_le_bytes());
+    o[240..242].copy_from_slice(&(i.total_rto.min(u16::MAX as u32) as u16).to_le_bytes());
 }
 
 /// Les options de SOL_IP (`do_ip_setsockopt`) : la valeur lue en entier

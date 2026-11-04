@@ -192,6 +192,10 @@ impl Simulation {
         if alea.sous(2) == 0 {
             c.proposer_horodatages(alea.suivant() as u32);
         }
+        // De même avec SACK, indépendamment.
+        if alea.sous(2) == 0 {
+            c.proposer_sack();
+        }
         a.tcb = Some(c);
         Simulation { graine, alea, lien, heure: 0, ordre: 0, en_route: Vec::new(), a, b, segments: 0, perdus: 0, renvois: 0, plus_loin: [None; 2] }
     }

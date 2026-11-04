@@ -1008,6 +1008,25 @@ static void horodatages(void)
     verifier((i.tcpi_options & TCPI_OPT_TIMESTAMPS) && (j.tcpi_options & TCPI_OPT_TIMESTAMPS), "lo : les horodatages en service, des deux cotes");
     verifier(i.tcpi_advmss == 65483 && j.tcpi_advmss == 65483 && i.tcpi_pmtu == 65535, "lo : advmss 65 483 (12 octets pour l'option), MTU 65 535");
     verifier(option(c, IPPROTO_TCP, TCP_MAXSEG) <= 65483 && option(a, IPPROTO_TCP, TCP_MAXSEG) <= 65483, "lo : TCP_MAXSEG au plus 65 483");
+    verifier((i.tcpi_options & TCPI_OPT_SACK) && (j.tcpi_options & TCPI_OPT_SACK), "lo : SACK en service, des deux cotes");
+    verifier(i.tcpi_sacked == 0 && i.tcpi_lost == 0 && i.tcpi_retrans == 0 && i.tcpi_reordering == 3, "lo, sans perte : rien de SACKe, ni perdu, ni renvoye ; reordering 3");
+    /* De quoi mesurer : un aller-retour, et son plus petit RTT. La suite de
+     * `struct tcp_info` (Linux 6.18, 248 octets) n'est pas dans l'en-tête de
+     * la glibc : lue à ses décalages. */
+    char o;
+    verifier(write(c, "x", 1) == 1 && read(a, &o, 1) == 1 && write(a, "y", 1) == 1 && read(c, &o, 1) == 1, "un aller-retour");
+    attendre_ms(20);
+    unsigned char b[248];
+    socklen_t lb = sizeof b;
+    getsockopt(c, IPPROTO_TCP, TCP_INFO, b, &lb);
+    uint32_t min_rtt, delivered, snd_wnd;
+    uint64_t bytes_acked;
+    memcpy(&min_rtt, b + 148, 4);
+    memcpy(&delivered, b + 192, 4);
+    memcpy(&snd_wnd, b + 228, 4);
+    memcpy(&bytes_acked, b + 120, 8);
+    verifier(lb >= 232 && min_rtt > 0 && min_rtt != ~0u && bytes_acked >= 1 && delivered >= 1 && snd_wnd > 0,
+             "TCP_INFO, la suite : min_rtt, bytes_acked, delivered, snd_wnd");
     close(a);
     close(c);
     int v = 1000;

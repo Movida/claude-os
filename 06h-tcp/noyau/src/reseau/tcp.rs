@@ -1317,6 +1317,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 t.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
                 t.memoire = niveau_memoire();
                 t.proposer_horodatages(decalage_horodatages(source, destination));
+                t.proposer_sack();
                 if let Some((_, _, ts)) = reprise {
                     t.reprendre_horodatages(ts);
                 }

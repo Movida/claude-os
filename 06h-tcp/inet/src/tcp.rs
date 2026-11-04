@@ -90,14 +90,18 @@ use formats::reseau::tcp::{self, Tcp};
 pub mod attente;
 mod congestion;
 mod hors_ordre;
+mod minmax;
 mod retrans;
 mod rtt;
+mod sack;
 
 use attente::Attente;
 use congestion::{Congestion, Phase, TCP_REORDERING};
 use hors_ordre::HorsOrdre;
-use retrans::{Envoye, Rexmit, ResultatAck, FLAG_ACKED, FLAG_DATA, FLAG_NO_CHALLENGE_ACK, FLAG_NOT_DUP, FLAG_SET_XMIT_TIMER, FLAG_SND_UNA_ADVANCED, FLAG_WIN_UPDATE};
+use minmax::MinMax;
+use retrans::{Envoye, EtatSack, Rexmit, ResultatAck, FLAG_ACKED, FLAG_CA_ALERT, FLAG_DATA, FLAG_DSACKING_ACK, FLAG_NO_CHALLENGE_ACK, FLAG_NOT_DUP, FLAG_SET_XMIT_TIMER, FLAG_SND_UNA_ADVANCED, FLAG_SYN_ACKED, FLAG_WIN_UPDATE};
 use rtt::Rtt;
+use sack::Rack;
 
 pub use congestion::CWND_INITIALE;
 pub use rtt::{RTO_INITIAL, RTO_MAX, RTO_MIN, RTO_REPLI, temps_modele};
@@ -189,6 +193,9 @@ const ATO_MIN: u64 = 40_000_000;
 const DELACK_MAX: u64 = 200_000_000;
 const ATO_RECEPTION: u64 = 500_000_000;
 const ACK_RAPIDES_MAX: u32 = 16;
+/// La compression des ACK dupliqués (`tcp_comp_sack_nr`, `tcp_comp_sack_delay_ns`).
+const COMP_SACK_MAX: u32 = 44;
+const COMP_SACK_DELAI: u64 = 1_000_000;
 
 // Les errno que voit le programme.
 pub const EAGAIN: i32 = 11;
@@ -286,6 +293,8 @@ enum Minuteur {
     Retransmission,
     /// La sonde de fenêtre nulle (ICSK_TIME_PROBE0).
     Sonde,
+    /// La fenêtre de réordonnancement de RACK (ICSK_TIME_REO_TIMEOUT).
+    Reordonnancement,
 }
 
 /// Les états d'une connexion.
@@ -446,7 +455,8 @@ pub struct Info {
     pub retransmissions: u8,
     pub sondes: u8,
     pub recul: u8,
-    /// TCPI_OPT_TIMESTAMPS (1) et TCPI_OPT_WSCALE (4), si en service.
+    /// TCPI_OPT_TIMESTAMPS (1), TCPI_OPT_SACK (2) et TCPI_OPT_WSCALE (4), si en
+    /// service.
     pub options: u8,
     pub echelle_envoi: u8,
     pub echelle_reception: u8,
@@ -475,6 +485,17 @@ pub struct Info {
     pub total_retrans: u32,
     /// Le RTT vu du récepteur (`tcpi_rcv_rtt`).
     pub rcv_rtt: u32,
+    /// Le plus petit RTT récent (`tcpi_min_rtt`), les octets acquittés, les
+    /// segments livrés, les doublons dits par D-SACK, les réordonnancements vus,
+    /// les fenêtres, et les RTO.
+    pub min_rtt: u32,
+    pub octets_acquittes: u64,
+    pub livres: u32,
+    pub dsack_doublons: u32,
+    pub reord_seen: u32,
+    pub snd_wnd: u32,
+    pub rcv_wnd: u32,
+    pub total_rto: u32,
     /// Les échéances, pour /proc/net/tcp : la retransmission (ou la sonde,
     /// `sonde`) et le keepalive, en ns depuis l'appel (None : aucune) ;
     /// les ACK rapides qui restent, et le ping-pong.
@@ -727,6 +748,31 @@ pub struct Tcb<P: Charge> {
     reord_seen: u32,
     /// Tous les octets acquittés (`bytes_acked`).
     octets_acquittes: u64,
+    // SACK et RACK (sack.rs).
+    /// SACK : proposé (avant le SYN de l'autre), ou en service (`sack_ok`).
+    sack_ok: bool,
+    /// Ce qu'on dit à l'autre : les blocs (`selective_acks`), un doublon
+    /// (`duplicate_sack`).
+    blocs: [(u32, u32); tcp::BLOCS_MAX],
+    nb_blocs: u8,
+    dsack: Option<(u32, u32)>,
+    /// La compression des ACK dupliqués (`compressed_ack`,
+    /// `compressed_ack_rcv_nxt`, `dup_ack_counter`, et son minuteur).
+    ack_comprimes: u32,
+    comprime_rcv_nxt: u32,
+    ack_dupliques: u32,
+    t_comprime: Option<u64>,
+    /// Ce qu'on sait de l'autre : le plus haut SACKé, les doublons qu'il a dits
+    /// (`dsack_dups`), et s'il a oublié des SACK (`is_sack_reneg`).
+    fack: u32,
+    dsack_doublons: u32,
+    sack_renie: bool,
+    rack: Rack,
+    min_rtt: MinMax,
+    /// La file par heure d'envoi (`tsorted_sent_queue`), nettoyée à la lecture,
+    /// et l'heure d'envoi du dernier segment acquitté (`first_tx_mstamp`).
+    tri: VecDeque<(u32, u64)>,
+    tx_acquitte: u64,
     /// L'heure du dernier envoi de données (`lsndtime`), et du dernier
     /// ACK reçu (`rcv_tstamp`).
     dernier_envoi: u64,
@@ -835,6 +881,21 @@ impl<P: Charge> Tcb<P> {
             reordering: TCP_REORDERING,
             reord_seen: 0,
             octets_acquittes: 0,
+            sack_ok: false,
+            blocs: [(0, 0); tcp::BLOCS_MAX],
+            nb_blocs: 0,
+            dsack: None,
+            ack_comprimes: 0,
+            comprime_rcv_nxt: 0,
+            ack_dupliques: 0,
+            t_comprime: None,
+            fack: iss,
+            dsack_doublons: 0,
+            sack_renie: false,
+            rack: Rack::new(),
+            min_rtt: MinMax::new(),
+            tri: VecDeque::new(),
+            tx_acquitte: 0,
             dernier_envoi: 0,
             dernier_recu: 0,
         }
@@ -888,6 +949,7 @@ impl<P: Charge> Tcb<P> {
         t.max_fenetre = t.snd_wnd;
         t.snd_wl1 = syn.seq;
         t.ts = syn.options.horodatage.map(|(val, _)| Horodatages { recent: val, instant: 0, decalage: 0 });
+        t.sack_ok = syn.options.sack_permis;
         t.mss_offre = syn.options.mss;
         t.synchroniser_mss();
         t.annoncer();
@@ -958,7 +1020,7 @@ impl<P: Charge> Tcb<P> {
     /// l'autre) ; avant, ce qu'a demandé le programme, ou 536 (mesuré).
     pub fn mss(&self) -> u16 {
         if self.etat.synchronise() {
-            self.mss_courant() as u16
+            self.mss_borne() as u16
         } else if self.mss_utilisateur != 0 {
             self.mss_utilisateur
         } else {
@@ -966,16 +1028,21 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// La taille des segments qu'on envoie : le MSS, sauf face à un
-    /// récepteur minuscule, la moitié de la plus grande fenêtre qu'il ait
-    /// annoncée (`tcp_bound_to_half_wnd`, au moins 68 octets d'IP moins les
-    /// en-têtes de TCP) : sinon un segment plein ne tiendrait jamais dans sa
-    /// fenêtre, et rien ne partirait.
-    fn mss_courant(&self) -> u32 {
+    /// Le MSS, sauf face à un récepteur minuscule : la moitié de la plus grande
+    /// fenêtre qu'il ait annoncée (`tcp_bound_to_half_wnd`, au moins 68 octets
+    /// d'IP moins les en-têtes de TCP) : sinon un segment plein ne tiendrait
+    /// jamais dans sa fenêtre, et rien ne partirait.
+    fn mss_borne(&self) -> u32 {
         let mss = self.mss as u32;
         let coupure = if self.max_fenetre > MSS_DEFAUT as u32 { self.max_fenetre / 2 } else { self.max_fenetre };
         let plancher = 48 - if self.ts.is_some() { TS_ALIGNE as u32 } else { 0 };
         if coupure > 0 && mss > coupure { coupure.max(plancher) } else { mss }
+    }
+
+    /// La taille des segments qu'on envoie (`tcp_current_mss`) : les blocs SACK
+    /// du prochain segment prennent leur place.
+    fn mss_courant(&self) -> u32 {
+        self.mss_borne().saturating_sub(self.place_des_blocs()).max(1)
     }
 
     /// La charge qu'annonce notre SYN (`tcp_advertise_mss`, `tcp_mss_clamp`).
@@ -1443,8 +1510,11 @@ impl<P: Charge> Tcb<P> {
             self.t_xmit = None;
             self.t_keepalive = None;
             self.ack.t = None;
+            self.t_comprime = None;
             self.hors_ordre.vider();
             self.fin_hors_ordre = None;
+            self.nb_blocs = 0;
+            self.dsack = None;
         }
     }
 
@@ -1461,6 +1531,7 @@ impl<P: Charge> Tcb<P> {
         self.lost_out = 0;
         self.retrans_out = 0;
         self.indice_renvoi = None;
+        self.tri.clear();
         self.passer(Etat::Fermee, e);
         e.lisible = true;
         e.place = true;
@@ -1602,6 +1673,8 @@ impl<P: Charge> Tcb<P> {
     fn repondre_doublon(&mut self, seq: u32, longueur: u32, syn: bool, maintenant: u64, e: &mut Effets) {
         if longueur > 0 && !syn && avant(seq, self.rcv_nxt) {
             self.entrer_mode_rapide();
+            let fin = seq.wrapping_add(longueur);
+            self.poser_doublon(seq, if apres(fin, self.rcv_nxt) { self.rcv_nxt } else { fin });
         }
         if (longueur > 0 && !syn) || !self.ack_invalide_limite(maintenant) {
             self.ack_maintenant = true;
@@ -1692,6 +1765,7 @@ impl<P: Charge> Tcb<P> {
                 self.ack.rcv_wup = self.rcv_nxt;
                 self.mss_offre = t.options.mss;
                 self.accepter_echelle(t.options.echelle);
+                self.sack_ok &= t.options.sack_permis;
                 // Les horodatages n'entrent en service que si l'autre les porte
                 // aussi.
                 match self.ts_recu {
@@ -1786,7 +1860,9 @@ impl<P: Charge> Tcb<P> {
         // 2. RST (RFC 5961 : exactement au bord gauche ; sinon, dans la
         // fenêtre, un ACK « de défi », limité comme ci-dessus).
         if rst {
-            if t.seq == self.rcv_nxt || self.rst_apres_fin(t.seq) {
+            // Le bord du bloc SACK le plus à droite vaut aussi (`tcp_validate_incoming`).
+            let bord_sack = self.blocs[..self.nb_blocs as usize].iter().map(|b| b.1).reduce(|a, b| if apres(b, a) { b } else { a });
+            if t.seq == self.rcv_nxt || self.rst_apres_fin(t.seq) || bord_sack == Some(t.seq) {
                 self.reinitialiser(&mut e);
             } else if !self.ack_invalide_limite(maintenant) {
                 self.ack_maintenant = true;
@@ -1885,13 +1961,15 @@ impl<P: Charge> Tcb<P> {
     }
 
     /// L'ACK d'un segment acceptable (`tcp_ack`, dans son ordre) : la fenêtre
-    /// de l'autre, ce qui est acquitté, la mesure du RTT, le minuteur de
-    /// retransmission, l'état de la reprise, la congestion. `flag` : les
-    /// FLAG_ que connaît déjà l'appelant.
+    /// de l'autre, ce qui est acquitté, les blocs SACK, la mesure du RTT, le
+    /// minuteur de retransmission, l'état de la reprise, la congestion. `flag` :
+    /// les FLAG_ que connaît déjà l'appelant.
     fn traiter_ack(&mut self, t: &Tcp, mut flag: u32, maintenant: u64, e: &mut Effets) -> ResultatAck {
         let una_avant = self.snd_una;
         let packets_avant = self.file.len();
         let (livres_avant, perdus_avant) = (self.livres, self.perdus);
+        let a_des_blocs = self.sack_ok && t.options.nb_blocs > 0;
+        let mut etat = EtatSack::default();
         if avant(t.ack, una_avant) {
             // RFC 5961 5.2 : un ACK plus vieux que ce qu'on a jamais pu avoir
             // envoyé dans la fenêtre : une injection à l'aveugle.
@@ -1902,6 +1980,14 @@ impl<P: Charge> Tcb<P> {
                     e.a_emettre = true;
                 }
                 return ResultatAck::Rejete;
+            }
+            // Ses blocs valent encore.
+            if a_des_blocs {
+                flag |= self.marquer_blocs(t, una_avant, &mut etat, maintenant);
+                self.alerte(0, &mut flag, maintenant);
+                if self.rexmit != Rexmit::Rien {
+                    e.a_emettre = true;
+                }
             }
             return ResultatAck::Vieux;
         }
@@ -1914,6 +2000,7 @@ impl<P: Charge> Tcb<P> {
             flag |= FLAG_SND_UNA_ADVANCED;
             self.retransmissions = 0;
         }
+        let fack_avant = if self.sack_ok { self.plus_haut_sack() } else { una_avant };
         self.remplacer_ts_recent(t.seq, maintenant);
         flag |= self.maj_fenetre(t, e);
         // SND.UNA, et les octets acquittés rendus.
@@ -1926,20 +2013,29 @@ impl<P: Charge> Tcb<P> {
             e.place = true;
             e.a_emettre = true;
         }
+        if a_des_blocs {
+            flag |= self.marquer_blocs(t, una_avant, &mut etat, maintenant);
+            self.livres += etat.livres;
+        }
         // Quelque chose est revenu : l'erreur douce d'un ICMP ne vaut plus,
         // les sondes ont une réponse.
         self.erreur_douce = 0;
         self.sondes = 0;
         self.dernier_recu = maintenant;
         if packets_avant == 0 {
+            // Un D-SACK sans rien en vol peut encore annuler une réduction.
+            if flag & FLAG_DSACKING_ACK != 0 {
+                self.alerte(0, &mut flag, maintenant);
+            }
             self.ack_de_sonde(maintenant);
             return ResultatAck::Traite;
         }
-        flag |= self.nettoyer_file(maintenant);
+        flag |= self.nettoyer_file(fack_avant, una_avant, &mut etat, maintenant);
+        self.rack_maj_fenetre(etat.prior_livres);
         // `tcp_ack_is_dubious`.
-        if flag & FLAG_NOT_DUP == 0 || self.cc.phase != Phase::Ouverte {
-            let dupack = u32::from(flag & (FLAG_SND_UNA_ADVANCED | FLAG_NOT_DUP) == 0);
-            self.alerte(dupack, &mut flag);
+        if flag & FLAG_NOT_DUP == 0 || flag & FLAG_CA_ALERT != 0 || self.cc.phase != Phase::Ouverte {
+            let dupack = u32::from(flag & (FLAG_SND_UNA_ADVANCED | FLAG_NOT_DUP | FLAG_DSACKING_ACK) == 0);
+            self.alerte(dupack, &mut flag, maintenant);
         }
         if flag & FLAG_SET_XMIT_TIMER != 0 {
             self.rearmer_rto(maintenant);
@@ -2051,7 +2147,7 @@ impl<P: Charge> Tcb<P> {
     /// renvoyé : par TSecr, s'il y en a un.
     fn mesurer_syn(&mut self, maintenant: u64) {
         let mesure = self.syn_envoi.take().map(|envoi| maintenant.saturating_sub(envoi));
-        self.mettre_a_jour_rtt(mesure, maintenant);
+        self.mettre_a_jour_rtt(FLAG_SYN_ACKED, mesure, None, mesure, maintenant);
     }
 
     /// Le RTT que donne TSecr, en ns (`tcp_rtt_tsopt_us`), l'horloge comptant en
@@ -2215,12 +2311,12 @@ impl<P: Charge> Tcb<P> {
             retransmissions: self.retransmissions.min(255) as u8,
             sondes: self.sondes.min(255) as u8,
             recul: self.recul.min(255) as u8,
-            options: if echelle { 4 } else { 0 } | u8::from(self.etat.synchronise() && self.ts.is_some()),
+            options: if echelle { 4 } else { 0 } | u8::from(self.etat.synchronise() && self.ts.is_some()) | if self.etat.synchronise() && self.sack_ok { 2 } else { 0 },
             echelle_envoi: if echelle { self.echelle_envoi } else { 0 },
             echelle_reception: if echelle { self.echelle_reception } else { 0 },
             rto: us(self.rto),
             ato: us(self.ack.ato),
-            snd_mss: self.mss_courant(),
+            snd_mss: self.mss_borne(),
             rcv_mss: self.ack.rcv_mss,
             non_acquittes: self.file.len() as u32,
             sackes: self.sacked_out,
@@ -2238,6 +2334,14 @@ impl<P: Charge> Tcb<P> {
             reordonnancement: self.reordering,
             total_retrans: self.total_retrans,
             rcv_rtt: us(self.rcv_rtt8 >> 3),
+            min_rtt: if self.min_rtt.valeur() == u64::MAX { u32::MAX } else { us(self.min_rtt.valeur()) },
+            octets_acquittes: self.octets_acquittes,
+            livres: self.livres,
+            dsack_doublons: self.dsack_doublons,
+            reord_seen: self.reord_seen,
+            snd_wnd: self.snd_wnd,
+            rcv_wnd: self.rcv_wnd(),
+            total_rto: self.total_rto,
             t_retrans: self.t_xmit.map(|t| t.saturating_sub(maintenant)),
             sonde: self.t_sorte == Minuteur::Sonde,
             t_keepalive: self.t_keepalive.map(|t| t.saturating_sub(maintenant)),
@@ -2275,6 +2379,7 @@ impl<P: Charge> Tcb<P> {
         if fin_seq == seq {
             return;
         }
+        self.dsack = None;
         let wnd = self.rcv_wnd();
         if seq == self.rcv_nxt {
             // Dans l'ordre. Une fenêtre fermée ne laisse passer qu'un FIN
@@ -2286,6 +2391,7 @@ impl<P: Charge> Tcb<P> {
             }
         } else if !apres(fin_seq, self.rcv_nxt) {
             // Déjà reçu : l'autre n'a pas eu notre ACK.
+            self.poser_doublon(seq, fin_seq);
             self.hors_fenetre();
             return;
         } else if !avant(seq, self.rcv_nxt.wrapping_add(wnd)) {
@@ -2294,6 +2400,7 @@ impl<P: Charge> Tcb<P> {
             return;
         } else if avant(seq, self.rcv_nxt) {
             // Le début déjà reçu ; fenêtre fermée, la suite n'entre pas.
+            self.poser_doublon(seq, self.rcv_nxt);
             if wnd == 0 {
                 self.hors_fenetre();
                 return;
@@ -2301,17 +2408,28 @@ impl<P: Charge> Tcb<P> {
             charge.avancer(self.rcv_nxt.wrapping_sub(seq) as usize);
         } else {
             // Un trou devant : la file hors d'ordre (le FIN attend que le
-            // trou se comble) ; l'ACK dupliqué part tout de suite (il dit le
-            // trou à l'émetteur). La même borne que dans l'ordre (plus bas) ;
+            // trou se comble) ; l'ACK dupliqué le dit à l'émetteur
+            // (`verifier_ack`). La même borne que dans l'ordre (plus bas) ;
             // au-delà, jeté ; et rien au-delà de la limite de toute la machine.
+            self.ack.programme = true;
             if self.memoire != Memoire::Limite && self.taille_vraie_reception + self.hors_ordre.taille_vraie + charge.taille_vraie() <= 2 * self.rcvbuf {
-                self.hors_ordre.ranger(seq, charge);
+                let premier = self.hors_ordre.vide();
+                let doublon = self.hors_ordre.ranger(seq, charge);
+                if self.sack_ok {
+                    if premier {
+                        self.blocs[0] = (seq, fin_seq);
+                        self.nb_blocs = 1;
+                    } else {
+                        if let Some((d, f)) = doublon {
+                            self.poser_doublon(d, f);
+                        }
+                        self.nouveau_bloc(seq, fin_seq);
+                    }
+                }
             }
             if fin {
                 self.fin_hors_ordre = Some(fin_seq.wrapping_sub(1));
             }
-            self.ack.programme = true;
-            self.ack_maintenant = true;
             return;
         }
         let longueur = charge.octets().len() as u32;
@@ -2324,6 +2442,7 @@ impl<P: Charge> Tcb<P> {
             // d'abord la file hors d'ordre, par la fin
             // (`tcp_prune_ofo_queue`), puis le segment lui-même.
             while self.taille_vraie_reception + self.hors_ordre.taille_vraie + charge.taille_vraie() > 2 * self.rcvbuf {
+                self.nb_blocs = 0;
                 if !self.hors_ordre.jeter_la_derniere() {
                     self.ack_maintenant = true;
                     return;
@@ -2334,6 +2453,7 @@ impl<P: Charge> Tcb<P> {
             // file hors d'ordre rendue d'abord (`tcp_prune_ofo_queue`).
             if self.memoire == Memoire::Limite && !self.reception.is_empty() {
                 while self.hors_ordre.jeter_la_derniere() {}
+                self.nb_blocs = 0;
                 self.ack_maintenant = true;
                 return;
             }
@@ -2348,15 +2468,23 @@ impl<P: Charge> Tcb<P> {
             self.recevoir_fin(e);
         }
         if !self.hors_ordre.vide() {
-            while let Some(p) = self.hors_ordre.suivante(self.rcv_nxt) {
+            let haut = self.rcv_nxt;
+            let mut doublon = self.dsack;
+            while let Some(p) = self.hors_ordre.suivante(self.rcv_nxt, haut, &mut doublon) {
                 if !self.ajouter_recu(p) {
                     break;
                 }
+            }
+            if self.sack_ok {
+                self.dsack = doublon;
             }
             // Le trou est comblé : un ACK sans attendre (RFC 5681 4.2).
             if self.hors_ordre.vide() {
                 self.ack.urgent = true;
             }
+        }
+        if self.nb_blocs > 0 {
+            self.retirer_blocs();
         }
     }
 
@@ -2413,6 +2541,7 @@ impl<P: Charge> Tcb<P> {
         }
         // Ce qui serait hors d'ordre après le FIN ne viendra jamais : jeté.
         self.hors_ordre.vider();
+        self.nb_blocs = 0;
     }
 
     // --- Les ACK retardés ---
@@ -2464,9 +2593,13 @@ impl<P: Charge> Tcb<P> {
     /// Un ACK est dû : maintenant, ou plus tard (`__tcp_ack_snd_check`) ?
     /// Maintenant si plus d'un segment plein attend son ACK et que la
     /// fenêtre avance (l'émetteur grandit par ACK : un pour deux segments,
-    /// RFC 5681 4.2), au début d'une connexion (« quickack »), après un
-    /// trou comblé, ou tant que la file hors d'ordre a quelque chose (les
-    /// ACK dupliqués qui déclenchent la retransmission rapide).
+    /// RFC 5681 4.2), au début d'une connexion (« quickack »), ou après un
+    /// trou comblé. Tant que la file hors d'ordre a quelque chose : sans SACK,
+    /// chaque ACK dupliqué part (l'émetteur les compte) ; avec SACK, les trois
+    /// premiers pour un même RCV.NXT, puis ils sont comprimés : un seul, après 5 %
+    /// du RTT (au plus 1 ms), ou le 44e (`tcp_comp_sack_*`) : sur un long chemin à
+    /// grande fenêtre, un ACK par segment hors d'ordre charge le réseau pour
+    /// rien, les blocs redisant la même chose.
     fn verifier_ack(&mut self, maintenant: u64) {
         if !self.ack.programme || self.ack_maintenant {
             return;
@@ -2475,10 +2608,33 @@ impl<P: Charge> Tcb<P> {
         // La fenêtre qu'on annoncerait maintenant ne recule pas sur la
         // dernière annoncée (`__tcp_select_window(sk) >= tp->rcv_wnd`).
         let fenetre_avance = self.fenetre_possible() >= self.ack.fenetre;
-        if (recus > self.ack.rcv_mss && fenetre_avance) || self.ack.rapide() || self.ack.urgent || !self.hors_ordre.vide() {
+        if (recus > self.ack.rcv_mss && fenetre_avance) || self.ack.rapide() || self.ack.urgent {
             self.ack_maintenant = true;
-        } else {
+            return;
+        }
+        // (Un FIN après le trou compte : chez Linux, il est dans la file.)
+        if self.hors_ordre.vide() && self.fin_hors_ordre.is_none() {
             self.retarder_ack(maintenant);
+            return;
+        }
+        if !self.sack_ok || self.ack_comprimes >= COMP_SACK_MAX {
+            self.ack_maintenant = true;
+            return;
+        }
+        if self.comprime_rcv_nxt != self.rcv_nxt {
+            self.comprime_rcv_nxt = self.rcv_nxt;
+            self.ack_dupliques = 0;
+        }
+        if self.ack_dupliques < TCP_REORDERING {
+            self.ack_dupliques += 1;
+            self.ack_maintenant = true;
+            return;
+        }
+        self.ack_comprimes += 1;
+        if self.t_comprime.is_none() {
+            let srtt8 = self.rtt.srtt() << 3;
+            let rtt8 = if srtt8 != 0 && srtt8 < self.rcv_rtt8 { srtt8 } else { self.rcv_rtt8 };
+            self.t_comprime = Some(maintenant + COMP_SACK_DELAI.min(rtt8 / 8 / 20));
         }
     }
 
@@ -2520,6 +2676,9 @@ impl<P: Charge> Tcb<P> {
         self.ack.urgent = false;
         self.ack.t = None;
         self.ack_maintenant = false;
+        self.ack_comprimes = 0;
+        self.t_comprime = None;
+        self.dsack = None;
         self.ack.rcv_wup = self.rcv_nxt;
         self.ack.fenetre = self.rcv_wnd();
     }
@@ -2565,7 +2724,7 @@ impl<P: Charge> Tcb<P> {
 
     /// La prochaine échéance de la connexion (None : aucune).
     pub fn echeance(&self) -> Option<u64> {
-        [self.t_xmit, self.t_keepalive, self.ack.t].into_iter().flatten().min()
+        [self.t_xmit, self.t_keepalive, self.ack.t, self.t_comprime].into_iter().flatten().min()
     }
 
     /// Fait ce qui est échu à l'heure `maintenant` : l'ACK retardé, la
@@ -2577,11 +2736,20 @@ impl<P: Charge> Tcb<P> {
             self.ack.t = None;
             self.minuteur_ack(&mut e);
         }
+        if self.t_comprime.is_some_and(|t| t <= maintenant) {
+            self.t_comprime = None;
+            if self.ack_comprimes > 0 {
+                self.ack_comprimes -= 1;
+                self.ack_maintenant = true;
+                e.a_emettre = true;
+            }
+        }
         if self.t_xmit.is_some_and(|t| t <= maintenant) {
             self.t_xmit = None;
             match self.t_sorte {
                 Minuteur::Retransmission => self.minuteur_retrans(maintenant, &mut e),
                 Minuteur::Sonde => self.minuteur_sonde(maintenant, &mut e),
+                Minuteur::Reordonnancement => self.minuteur_reordonnancement(maintenant, &mut e),
             }
         }
         if self.t_keepalive.is_some_and(|t| t <= maintenant) {
@@ -2760,7 +2928,9 @@ impl<P: Charge> Tcb<P> {
             return delai;
         }
         let ecoule = maintenant.saturating_sub(debut);
-        if ecoule >= u { 1 } else { delai.min(u - ecoule) }
+        // Au moins deux tics (TCP_TIMEOUT_MIN) ; passé le délai, Linux déborde en non signé, et
+        // reste au délai de la sonde : c'est `minuteur_sonde` qui abandonnera.
+        if ecoule >= u { delai } else { delai.min((u - ecoule).max(2 * sack::JIFFY)) }
     }
 
     /// La sonde est échue (`tcp_probe_timer`) : une de plus, ou abandonner
@@ -2820,6 +2990,11 @@ impl<P: Charge> Tcb<P> {
             urgent: 0,
             options: tcp::Options { horodatage: self.ts.map(|ts| (ts.valeur(self.heure), ts.recent)), ..tcp::Options::default() },
         };
+        if drapeaux & tcp::SYN == 0 {
+            let (blocs, n) = self.blocs_a_envoyer();
+            h.options.blocs = blocs;
+            h.options.nb_blocs = n;
+        }
         // Le pointeur urgent, dans tout segment qui précède l'octet urgent
         // (`__tcp_transmit_skb`) ; trop loin pour 16 bits, 0xFFFF, tant
         // que le segment reste en deçà.
@@ -2869,7 +3044,8 @@ impl<P: Charge> Tcb<P> {
             self.snd_sml = fin_segment;
         }
         let vide = self.file.is_empty();
-        self.file.push_back(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux));
+        self.file.push_back(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, self.livres));
+        self.tri_ajouter(self.snd_nxt, maintenant);
         self.snd_nxt = fin_segment;
         if vide {
             self.rearmer_rto(maintenant);
@@ -2907,6 +3083,7 @@ impl<P: Charge> Tcb<P> {
             let drapeaux = if self.etat == Etat::SynRecu { tcp::SYN | tcp::ACK } else { tcp::SYN };
             let mut h = self.entete(self.iss, drapeaux);
             h.options.mss = Some(self.mss_annonce());
+            h.options.sack_permis = self.sack_ok;
             // Le TSval de nos SYN-ACK (`tcp_synack_options`) : jamais nul le
             // premier, et l'intervalle d'une réponse valide.
             if let Some((val, ecr)) = h.options.horodatage

@@ -2011,3 +2011,328 @@ fn tcp_maxseg_dans_le_syn_et_a_l_envoi() {
     livrer(&mut c, &mut f);
     assert_eq!((c.mss(), f.mss()), (800, 800));
 }
+
+/// Une paire qui a négocié SACK.
+fn paire_sack(ts: bool) -> (Connexion, Connexion) {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 1 << 20, 1 << 20, ECHELLE);
+    c.proposer_sack();
+    if ts {
+        c.proposer_horodatages(1_000_000);
+    }
+    let (syn, _) = sortants(&mut c)[0];
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 1 << 20, 1 << 20, ECHELLE);
+    f.decalage_horodatages(5_000_000);
+    let s = sortants(&mut f);
+    c.recevoir(&s[0].0, vide(), maintenant());
+    livrer(&mut c, &mut f);
+    (c, f)
+}
+
+/// Des blocs vus d'un segment.
+fn blocs(h: &Tcp) -> Vec<(u32, u32)> {
+    h.options.blocs[..h.options.nb_blocs as usize].to_vec()
+}
+
+/// Le SYN propose, l'autre répond : SACK en service seulement si les deux le
+/// disent ; TCPI_OPT_SACK.
+#[test]
+fn sack_negocie() {
+    let (c, f) = paire_sack(false);
+    assert_eq!((c.info(maintenant()).options & 2, f.info(maintenant()).options & 2), (2, 2));
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.proposer_sack();
+    let (syn, _) = sortants(&mut c)[0];
+    assert!(syn.options.sack_permis);
+    let sans = Tcp { options: tcp::Options { sack_permis: false, ..syn.options }, ..syn };
+    let mut f = Connexion::depuis_syn(&sans, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let (sa, _) = sortants(&mut f)[0];
+    assert!(!sa.options.sack_permis);
+    c.recevoir(&sa, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).options & 2, 0);
+}
+
+/// Le récepteur (`tcp_sack_new_ofo_skb`, `tcp_sack_maybe_coalesce`,
+/// `tcp_sack_remove`) : le bloc le plus récent en tête, la fusion, au plus 4
+/// (3 avec les horodatages), retirés quand RCV.NXT les passe.
+#[test]
+fn blocs_du_recepteur() {
+    let (mut c, _f) = paire_sack(false);
+    let n = bord(&c);
+    let m = Tcp { drapeaux: tcp::ACK, ack: c.numeros().0, fenetre: 1000, ..Tcp::default() };
+    let d = |i: u32| n.wrapping_add(100 * i);
+    // Le quatrième ACK dupliqué d'un même RCV.NXT est comprimé : on laisse son
+    // minuteur tomber, le contenu des blocs seul compte ici.
+    let ack = |c: &mut Connexion| {
+        let s = sortants(c);
+        if !s.is_empty() {
+            return s;
+        }
+        avancer(c.echeance().unwrap() - maintenant());
+        c.minuteur(maintenant());
+        sortants(c)
+    };
+    let recoit = |c: &mut Connexion, i: u32| {
+        c.recevoir(&Tcp { seq: d(i), ..m }, Octets(vec![1; 50], 0), maintenant());
+        sortants(c)
+    };
+    // Un trou : un bloc, et l'ACK du bord.
+    let s = recoit(&mut c, 1);
+    assert_eq!(s[0].0.ack, n);
+    assert_eq!(blocs(&s[0].0), [(d(1), d(1) + 50)]);
+    // Un autre plus loin, en tête.
+    let s = recoit(&mut c, 3);
+    assert_eq!(blocs(&s[0].0), [(d(3), d(3) + 50), (d(1), d(1) + 50)]);
+    // Un bloc touché remonte, grandi.
+    c.recevoir(&Tcp { seq: d(1) + 50, ..m }, Octets(vec![1; 50], 0), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(blocs(&s[0].0), [(d(1), d(2)), (d(3), d(3) + 50)]);
+    // Celui qui comble l'écart : fusion en un seul.
+    c.recevoir(&Tcp { seq: d(2), ..m }, Octets(vec![1; 100], 0), maintenant());
+    let s = ack(&mut c);
+    assert_eq!(blocs(&s[0].0), [(d(1), d(3) + 50)]);
+    // Le trou comblé : plus de blocs, tout reçu.
+    c.recevoir(&Tcp { seq: n, ..m }, Octets(vec![1; 100], 0), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.ack, d(3) + 50);
+    assert!(blocs(&s[0].0).is_empty());
+    // Sans horodatages, 4 blocs tiennent ; avec, 3, et ce n'est pas plus de 40
+    // octets d'options.
+    for (ts, attendus) in [(false, 4), (true, 3)] {
+        let (mut c, _f) = paire_sack(ts);
+        let n = bord(&c);
+        let un = c.numeros().0;
+        let val = c.info(maintenant()).etat as u32;
+        let _ = val;
+        for i in 1..=5u32 {
+            let h = Tcp { drapeaux: tcp::ACK, seq: n.wrapping_add(100 * i), ack: un, fenetre: 1000, ..Tcp::default() };
+            c.recevoir(&h, Octets(vec![1; 50], 0), maintenant());
+            let s = sortants(&mut c);
+            if i == 5 {
+                let b = blocs(&s[0].0);
+                assert_eq!(b.len(), attendus);
+                assert_eq!(b[0].0, n.wrapping_add(500));
+                assert!(tcp::longueur_entete(&s[0].0.options) <= 60);
+            }
+        }
+    }
+}
+
+/// D-SACK (RFC 2883, `tcp_dsack_set`) : un doublon est dit en premier bloc, une
+/// seule fois.
+#[test]
+fn dsack_du_recepteur() {
+    let (mut c, _f) = paire_sack(false);
+    let n = bord(&c);
+    let m = Tcp { drapeaux: tcp::ACK, ack: c.numeros().0, fenetre: 1000, ..Tcp::default() };
+    c.recevoir(&Tcp { seq: n, ..m }, Octets(vec![1; 100], 0), maintenant());
+    let _ = sortants(&mut c);
+    // Déjà reçu : le premier bloc le dit, sous l'ACK.
+    c.recevoir(&Tcp { seq: n, ..m }, Octets(vec![1; 100], 0), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.ack, n.wrapping_add(100));
+    assert_eq!(blocs(&s[0].0), [(n, n.wrapping_add(100))]);
+    // Le segment suivant ne le redit pas.
+    c.recevoir(&Tcp { seq: n.wrapping_add(100), ..m }, Octets(vec![1; 10], 0), maintenant());
+    let s = sortants(&mut c);
+    assert!(s.is_empty() || blocs(&s[0].0).is_empty());
+    // À cheval : seulement ce qui est déjà reçu.
+    let n = bord(&c);
+    c.recevoir(&Tcp { seq: n.wrapping_sub(5), ..m }, Octets(vec![1; 10], 0), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(blocs(&s[0].0), [(n.wrapping_sub(5), n)]);
+    // Un doublon hors d'ordre : le premier bloc dans le deuxième (RFC 2883 4.2).
+    let n = bord(&c);
+    let loin = n.wrapping_add(1000);
+    c.recevoir(&Tcp { seq: loin, ..m }, Octets(vec![1; 100], 0), maintenant());
+    let _ = sortants(&mut c);
+    c.recevoir(&Tcp { seq: loin, ..m }, Octets(vec![1; 100], 0), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(blocs(&s[0].0), [(loin, loin.wrapping_add(100)), (loin, loin.wrapping_add(100))]);
+}
+
+/// Les trois premiers ACK dupliqués d'un même RCV.NXT partent ; puis ils sont
+/// comprimés (`__tcp_ack_snd_check`) : un seul, peu après, ou le 44e.
+#[test]
+fn ack_dupliques_comprimes() {
+    let (mut c, mut f) = paire_sack(false);
+    // Une mesure du RTT, pour le délai de compression ; puis le mode « quickack »
+    // du début consommé : il envoie chaque ACK.
+    ecrire(&mut c, b"x");
+    let s = sortants(&mut c);
+    avancer(10 * MS);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    livrer(&mut f, &mut c);
+    for _ in 0..16 {
+        ecrire(&mut f, b"a");
+        livrer(&mut f, &mut c);
+        livrer(&mut c, &mut f);
+    }
+    let n = bord(&c);
+    let m = Tcp { drapeaux: tcp::ACK, ack: c.numeros().0, fenetre: 1000, ..Tcp::default() };
+    let recoit = |c: &mut Connexion, i: u32| {
+        c.recevoir(&Tcp { seq: n.wrapping_add(100 * i), ..m }, Octets(vec![1; 50], 0), maintenant());
+        sortants(c).len()
+    };
+    assert_eq!((recoit(&mut c, 1), recoit(&mut c, 2), recoit(&mut c, 3)), (1, 1, 1));
+    assert_eq!(recoit(&mut c, 4), 0, "le quatrième attend");
+    let e = c.echeance().unwrap();
+    // 5 % du RTT du récepteur, pas encore mesuré ici : tout de suite ; au plus 1 ms.
+    assert!(e <= maintenant() + MS);
+    avancer(e - maintenant());
+    c.minuteur(maintenant());
+    assert_eq!(sortants(&mut c).len(), 1);
+}
+
+/// L'émetteur marque la file (`tcp_sacktag_write_queue`) : un segment dit arrivé
+/// sort du vol ; un bloc faux est ignoré.
+#[test]
+fn tableau_de_l_emetteur() {
+    let (mut c, _f) = paire_sack(false);
+    let mss = MSS as u32;
+    ecrire(&mut c, &vec![1u8; 5 * MSS as usize]);
+    assert_eq!(sortants(&mut c).len(), 5);
+    let (una, nxt, _) = c.numeros();
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una, fenetre: 65_535, ..Tcp::default() };
+    let ack = |premier: u32, fin: u32| {
+        let mut o = tcp::Options { nb_blocs: 1, ..Default::default() };
+        o.blocs[0] = (premier, fin);
+        Tcp { options: o, ..m }
+    };
+    // Le deuxième segment arrivé.
+    c.recevoir(&ack(una + mss, una + 2 * mss), vide(), maintenant());
+    assert_eq!(c.info(maintenant()).sackes, 1);
+    // Redit : pas compté deux fois.
+    c.recevoir(&ack(una + mss, una + 2 * mss), vide(), maintenant());
+    assert_eq!(c.info(maintenant()).sackes, 1);
+    // Un bloc qui coupe un segment : le segment entier seulement.
+    c.recevoir(&ack(una + 2 * mss, una + 2 * mss + 10), vide(), maintenant());
+    assert_eq!(c.info(maintenant()).sackes, 1);
+    // Faux : au-delà de SND.NXT, à l'envers, sous SND.UNA.
+    c.recevoir(&ack(una + mss, nxt + 1), vide(), maintenant());
+    c.recevoir(&ack(una + 4 * mss, una + 3 * mss), vide(), maintenant());
+    c.recevoir(&ack(una.wrapping_sub(100), una), vide(), maintenant());
+    assert_eq!(c.info(maintenant()).sackes, 1);
+    assert_eq!(c.info(maintenant()).phase, 1, "Disorder");
+    // L'ACK cumulatif le couvre : plus de compte.
+    c.recevoir(&Tcp { ack: una + 2 * mss, ..m }, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).sackes, 0);
+}
+
+/// RACK : trois segments arrivés après un trou (`sacked_out` >= `reordering`,
+/// sans réordonnancement vu : fenêtre nulle) : la tête est perdue tout de suite,
+/// et seule elle repart, pas ce qui est SACKé.
+#[test]
+fn rack_marque_le_trou() {
+    let (mut c, mut f) = paire_sack(false);
+    // Une mesure du RTT, de 10 ms.
+    ecrire(&mut c, b"x");
+    let s = sortants(&mut c);
+    avancer(10 * MS);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    livrer(&mut f, &mut c);
+    let mss = MSS as u32;
+    ecrire(&mut c, &vec![1u8; 5 * MSS as usize]);
+    assert_eq!(sortants(&mut c).len(), 5);
+    avancer(MS);
+    let (una, _, _) = c.numeros();
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una, fenetre: 65_535, ..Tcp::default() };
+    let ack = |fin: u32| {
+        let mut o = tcp::Options { nb_blocs: 1, ..Default::default() };
+        o.blocs[0] = (una + mss, una + fin * mss);
+        Tcp { options: o, ..m }
+    };
+    // Deux segments après le trou : rien encore.
+    c.recevoir(&ack(3), vide(), maintenant());
+    assert_eq!(c.info(maintenant()).perdus, 0);
+    // Trois : le trou est perdu ; RTT, c'est-à-dire 1 ms depuis l'envoi, ne suffit
+    // pas encore pour la fenêtre nulle : `rack.rtt` vaut 1 ms, il faut l'écoulé.
+    avancer(MS);
+    c.recevoir(&ack(4), vide(), maintenant());
+    let i = c.info(maintenant());
+    assert_eq!((i.perdus, i.phase), (1, 3), "le trou perdu, la reprise");
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.seq, una);
+    assert_eq!(s[0].1.len(), MSS as usize, "la tête seule, renvoyée");
+    assert!(s.iter().skip(1).all(|x| !t::avant(x.0.seq, una + 4 * mss)), "rien de SACKé ne repart");
+    // Un ACK qui couvre tout : la reprise finie, sans attendre au-delà de
+    // `high_seq` (SACK n'a pas ce souci).
+    let (_, nxt, _) = c.numeros();
+    c.recevoir(&Tcp { ack: nxt, ..m }, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).phase, 0);
+}
+
+/// Un trou comblé par un segment jamais renvoyé : du réordonnancement
+/// (`tcp_check_sack_reordering`) : le degré grandit, la fenêtre de RACK s'ouvre.
+#[test]
+fn reordonnancement_vu() {
+    let (mut c, mut f) = paire_sack(false);
+    ecrire(&mut c, b"x");
+    let s = sortants(&mut c);
+    avancer(10 * MS);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    livrer(&mut f, &mut c);
+    let mss = MSS as u32;
+    ecrire(&mut c, &vec![1u8; 8 * MSS as usize]);
+    sortants(&mut c);
+    let (una, _, _) = c.numeros();
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una, fenetre: 65_535, ..Tcp::default() };
+    let mut o = tcp::Options { nb_blocs: 1, ..Default::default() };
+    o.blocs[0] = (una + 4 * mss, una + 6 * mss);
+    c.recevoir(&Tcp { options: o, ..m }, vide(), maintenant());
+    let avant = c.info(maintenant()).reord_seen;
+    // Le cinquième avant le deuxième : un bloc plus bas, jamais renvoyé.
+    o.blocs[0] = (una + 3 * mss, una + 6 * mss);
+    c.recevoir(&Tcp { options: o, ..m }, vide(), maintenant());
+    let i = c.info(maintenant());
+    assert_eq!(i.reord_seen, avant + 1);
+    assert_eq!(i.reordonnancement, 3);
+    // Plus loin encore, un écart plus grand que le degré : il grandit.
+    o.blocs[0] = (una + mss, una + 6 * mss);
+    c.recevoir(&Tcp { options: o, ..m }, vide(), maintenant());
+    assert!(c.info(maintenant()).reordonnancement >= 5);
+}
+
+/// Le bord gauche tombe sur du SACKé : l'autre a peut-être oublié. Le RTO est
+/// avancé (`tcp_check_sack_reneging`) ; s'il tombe, les SACK sont oubliés
+/// (`tcp_timeout_mark_lost`), et tout repart.
+#[test]
+fn sack_renie() {
+    let (mut c, mut f) = paire_sack(false);
+    ecrire(&mut c, b"x");
+    let s = sortants(&mut c);
+    avancer(100 * MS);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    livrer(&mut f, &mut c);
+    let mss = MSS as u32;
+    ecrire(&mut c, &vec![1u8; 4 * MSS as usize]);
+    sortants(&mut c);
+    let (una, _, _) = c.numeros();
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una, fenetre: 65_535, ..Tcp::default() };
+    let mut o = tcp::Options { nb_blocs: 1, ..Default::default() };
+    o.blocs[0] = (una + 2 * mss, una + 3 * mss);
+    c.recevoir(&Tcp { options: o, ..m }, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).sackes, 1);
+    // L'ACK avance jusqu'au segment SACKé, sans le couvrir : `reneging`.
+    c.recevoir(&Tcp { ack: una + 2 * mss, options: o, ..m }, vide(), maintenant());
+    let e = c.echeance().unwrap();
+    assert!(e - maintenant() <= 60 * MS, "le RTO avancé : la moitié du RTT");
+    avancer(e - maintenant());
+    c.minuteur(maintenant());
+    let i = c.info(maintenant());
+    assert_eq!((i.sackes, i.phase), (0, 4), "les SACK oubliés, Loss");
+    assert_eq!(i.perdus, 2);
+}
+
+/// Les segments portent leurs blocs à la place de leur charge (`tcp_current_mss`).
+#[test]
+fn les_blocs_prennent_la_place_de_la_charge() {
+    let (mut c, _f) = paire_sack(false);
+    let n = bord(&c);
+    let m = Tcp { drapeaux: tcp::ACK, ack: c.numeros().0, fenetre: 65_535, ..Tcp::default() };
+    c.recevoir(&Tcp { seq: n.wrapping_add(1000), ..m }, Octets(vec![1; 50], 0), maintenant());
+    let _ = sortants(&mut c);
+    ecrire(&mut c, &vec![1u8; 3000]);
+    let s = sortants(&mut c);
+    assert_eq!(s[0].1.len(), MSS as usize - 12, "un bloc : 4 + 8 octets");
+    assert_eq!(blocs(&s[0].0).len(), 1);
+}

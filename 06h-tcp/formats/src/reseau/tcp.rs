@@ -7,7 +7,9 @@
 //! l'autre veut recevoir, dans un SYN), l'échelle de fenêtre (RFC 7323, dans
 //! un SYN : la fenêtre annoncée sera décalée d'autant de bits), et les
 //! horodatages (RFC 7323, dans tout segment : notre heure, et la dernière
-//! heure reçue de l'autre). Les autres sont sautées, par leur longueur. La
+//! heure reçue de l'autre), SACK permis (RFC 2018, dans un SYN), et les blocs
+//! SACK (ce qui est arrivé au-delà d'un trou). Les autres sont sautées, par
+//! leur longueur. La
 //! lecture suit `tcp_parse_options` de Linux : EOL arrête, NOP fait un octet,
 //! une longueur de moins de 2 ou qui déborde arrête la lecture des options
 //! SANS refuser le segment (Linux non plus) ; MSS et l'échelle ne valent que
@@ -34,7 +36,12 @@ const EOL: u8 = 0;
 const NOP: u8 = 1;
 const MSS: u8 = 2;
 const ECHELLE: u8 = 3;
+const SACK_PERMIS: u8 = 4;
+const SACK: u8 = 5;
 const HORODATAGE: u8 = 8;
+/// Le plus de blocs SACK qu'un segment puisse porter (TCP_NUM_SACKS) : 40
+/// octets d'options, 4 pour l'en-tête de l'option, 8 par bloc.
+pub const BLOCS_MAX: usize = 4;
 
 /// Les options qui nous intéressent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -43,6 +50,11 @@ pub struct Options {
     pub echelle: Option<u8>,
     /// Les horodatages : (TSval, TSecr).
     pub horodatage: Option<(u32, u32)>,
+    /// SACK permis, dans un SYN.
+    pub sack_permis: bool,
+    /// Les blocs SACK : (premier numéro, numéro qui suit le dernier).
+    pub blocs: [(u32, u32); BLOCS_MAX],
+    pub nb_blocs: u8,
 }
 
 /// Un en-tête TCP.
@@ -87,6 +99,16 @@ fn options(mut o: &[u8], syn: bool) -> Options {
                     // dit, et la borne).
                     (ECHELLE, 3) if syn => r.echelle = Some(o[2].min(ECHELLE_MAX)),
                     (HORODATAGE, 10) => r.horodatage = mot32(o, 2).zip(mot32(o, 6)),
+                    (SACK_PERMIS, 2) if syn => r.sack_permis = true,
+                    (SACK, l) if l >= 10 && (l - 2) % 8 == 0 => {
+                        let n = ((l - 2) / 8).min(BLOCS_MAX);
+                        for i in 0..n {
+                            if let Some(b) = mot32(o, 2 + 8 * i).zip(mot32(o, 6 + 8 * i)) {
+                                r.blocs[i] = b;
+                                r.nb_blocs = (i + 1) as u8;
+                            }
+                        }
+                    }
                     _ => {}
                 }
                 o = &o[longueur..];
@@ -128,10 +150,16 @@ pub fn lire(o: &[u8], source: [u8; 4], destination: [u8; 4], verifier: bool) -> 
 }
 
 /// La longueur de l'en-tête qu'écrira `ecrire` pour ces options : 20, plus
-/// 4 pour MSS, plus 12 pour les horodatages (deux NOP, puis l'option de 10
-/// octets), plus 4 pour l'échelle (NOP puis l'option de 3 octets).
+/// 4 pour MSS, plus 12 pour les horodatages (SACK permis, ou deux NOP, puis
+/// l'option de 10 octets), plus 4 pour SACK permis sans eux, plus 4 pour
+/// l'échelle (NOP puis l'option de 3 octets), plus 4 et 8 par bloc SACK.
 pub fn longueur_entete(o: &Options) -> usize {
-    ENTETE + if o.mss.is_some() { 4 } else { 0 } + if o.horodatage.is_some() { 12 } else { 0 } + if o.echelle.is_some() { 4 } else { 0 }
+    ENTETE
+        + if o.mss.is_some() { 4 } else { 0 }
+        + if o.horodatage.is_some() { 12 } else { 0 }
+        + if o.sack_permis && o.horodatage.is_none() { 4 } else { 0 }
+        + if o.echelle.is_some() { 4 } else { 0 }
+        + if o.nb_blocs > 0 { 4 + 8 * o.nb_blocs as usize } else { 0 }
 }
 
 /// Écrit l'en-tête de `t` au début de `o` (la place de l'en-tête, puis la
@@ -156,13 +184,28 @@ pub fn ecrire(o: &mut [u8], t: &Tcp, source: [u8; 4], destination: [u8; 4], somm
         i += 4;
     }
     if let Some((val, ecr)) = t.options.horodatage {
-        o[i..i + 4].copy_from_slice(&[NOP, NOP, HORODATAGE, 10]);
+        let debut = if t.options.sack_permis { [SACK_PERMIS, 2] } else { [NOP, NOP] };
+        o[i..i + 4].copy_from_slice(&[debut[0], debut[1], HORODATAGE, 10]);
         o[i + 4..i + 8].copy_from_slice(&val.to_be_bytes());
         o[i + 8..i + 12].copy_from_slice(&ecr.to_be_bytes());
         i += 12;
+    } else if t.options.sack_permis {
+        o[i..i + 4].copy_from_slice(&[NOP, NOP, SACK_PERMIS, 2]);
+        i += 4;
     }
     if let Some(e) = t.options.echelle {
         o[i..i + 4].copy_from_slice(&[NOP, ECHELLE, 3, e]);
+        i += 4;
+    }
+    if t.options.nb_blocs > 0 {
+        let n = t.options.nb_blocs as usize;
+        o[i..i + 4].copy_from_slice(&[NOP, NOP, SACK, (2 + 8 * n) as u8]);
+        i += 4;
+        for &(debut, fin) in &t.options.blocs[..n] {
+            o[i..i + 4].copy_from_slice(&debut.to_be_bytes());
+            o[i + 4..i + 8].copy_from_slice(&fin.to_be_bytes());
+            i += 8;
+        }
     }
     if somme_voulue {
         let s = plier(somme(o, pseudo(source, destination, o.len() as u16)));

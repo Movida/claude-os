@@ -345,14 +345,28 @@ fn tcp_ecrit_puis_relu() {
     let (s, d) = ([10, 0, 2, 15], [160, 79, 104, 10]);
     let syn = tcp::Tcp {
         source: 40000, destination: 443, seq: 0xdead_beef, ack: 0, drapeaux: tcp::SYN, fenetre: 65535, urgent: 0,
-        options: tcp::Options { mss: Some(1460), echelle: Some(7), horodatage: Some((0x0102_0304, 0x0506_0708)) },
+        options: tcp::Options { mss: Some(1460), echelle: Some(7), horodatage: Some((0x0102_0304, 0x0506_0708)), sack_permis: true, ..tcp::Options::default() },
     };
     let o = segment(&syn, &[], s, d, true);
     assert_eq!(o.len(), 40);
-    // Les options comme Linux les aligne : MSS, deux NOP et les horodatages,
-    // NOP et l'échelle.
-    assert_eq!(&o[20..], &[2, 4, 0x05, 0xb4, 1, 1, 8, 10, 1, 2, 3, 4, 5, 6, 7, 8, 1, 3, 3, 7]);
+    // Les options comme Linux les aligne : MSS, SACK permis et les horodatages
+    // dans le même mot, NOP et l'échelle.
+    assert_eq!(&o[20..], &[2, 4, 0x05, 0xb4, 4, 2, 8, 10, 1, 2, 3, 4, 5, 6, 7, 8, 1, 3, 3, 7]);
     assert_eq!(tcp::lire(&o, s, d, true), Ok((syn, &[][..])));
+    // SACK permis sans horodatages : deux NOP devant.
+    let sans = tcp::Tcp { options: tcp::Options { mss: Some(1460), sack_permis: true, ..tcp::Options::default() }, ..syn };
+    let o = segment(&sans, &[], s, d, true);
+    assert_eq!(&o[20..], &[2, 4, 0x05, 0xb4, 1, 1, 4, 2]);
+    assert_eq!(tcp::lire(&o, s, d, true), Ok((sans, &[][..])));
+    // Des blocs, après les horodatages.
+    let mut b = tcp::Options { horodatage: Some((1, 2)), nb_blocs: 2, ..tcp::Options::default() };
+    b.blocs[0] = (0x10, 0x20);
+    b.blocs[1] = (0x30, 0x40);
+    let blocs = tcp::Tcp { drapeaux: tcp::ACK, options: b, ..syn };
+    let o = segment(&blocs, &[], s, d, true);
+    assert_eq!(o.len(), 20 + 12 + 4 + 16);
+    assert_eq!(&o[32..36], &[1, 1, 5, 18]);
+    assert_eq!(tcp::lire(&o, s, d, true), Ok((blocs, &[][..])));
     // Avec une charge, sans options.
     let t = tcp::Tcp { drapeaux: tcp::ACK | tcp::PSH, seq: 1, ack: 2, fenetre: 512, options: tcp::Options::default(), ..syn };
     let o = segment(&t, b"bonjour", s, d, true);
@@ -402,10 +416,15 @@ fn tcp_options_comme_linux() {
     assert_eq!(avec(tcp::ACK, &[2, 4, 0, 200, 1, 3, 3, 9]), tcp::Options::default());
     // Une échelle au-delà de 14 : 14.
     assert_eq!(avec(tcp::SYN, &[1, 3, 3, 20]).echelle, Some(14));
-    // SACK permis (4, 2) : sauté. Les horodatages (8, longueur 10) : lus, dans
-    // tout segment ; une autre longueur : ignorés.
+    // SACK permis (4, 2), dans un SYN seulement. Les horodatages (8, longueur
+    // 10) : lus, dans tout segment ; une autre longueur : ignorés.
     let o = avec(tcp::SYN, &[4, 2, 8, 10, 0, 0, 0, 1, 0, 0, 0, 2, 2, 4, 5, 0]);
-    assert_eq!((o.mss, o.horodatage), (Some(0x500), Some((1, 2))));
+    assert_eq!((o.mss, o.horodatage, o.sack_permis), (Some(0x500), Some((1, 2)), true));
+    assert!(!avec(tcp::ACK, &[4, 2, 1, 1]).sack_permis);
+    // Un bloc SACK : une longueur de 10, 18, 26 ou 34 ; une autre : ignoré.
+    let o = avec(tcp::ACK, &[1, 1, 5, 10, 0, 0, 0, 3, 0, 0, 0, 4]);
+    assert_eq!((o.nb_blocs, o.blocs[0]), (1, (3, 4)));
+    assert_eq!(avec(tcp::ACK, &[1, 1, 5, 9, 0, 0, 0, 3, 0, 0, 0, 4]).nb_blocs, 0);
     assert_eq!(avec(tcp::ACK, &[1, 1, 8, 10, 0, 0, 0, 7, 0, 0, 0, 8]).horodatage, Some((7, 8)));
     assert_eq!(avec(tcp::ACK, &[8, 9, 0, 0, 0, 7, 0, 0, 0, 0, 0, 0]).horodatage, None);
     // Une mauvaise longueur de MSS : ignorée ; une longueur 0 ou 1, ou qui
@@ -421,7 +440,7 @@ fn tcp_options_comme_linux() {
 fn tcp_mutations() {
     // 200 000 segments abîmés au hasard : jamais de panique.
     let (s, d) = ([10, 0, 2, 15], [10, 0, 2, 2]);
-    let t = tcp::Tcp { source: 9, destination: 80, drapeaux: tcp::SYN, options: tcp::Options { mss: Some(1460), echelle: Some(7), horodatage: Some((0x0102_0304, 0x0506_0708)) }, ..Default::default() };
+    let t = tcp::Tcp { source: 9, destination: 80, drapeaux: tcp::SYN, options: tcp::Options { mss: Some(1460), echelle: Some(7), horodatage: Some((0x0102_0304, 0x0506_0708)), ..tcp::Options::default() }, ..Default::default() };
     let base = segment(&t, b"donnees", s, d, true);
     let mut x = 0x1234_5678_9abc_def0u64;
     for _ in 0..200_000 {
