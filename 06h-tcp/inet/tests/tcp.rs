@@ -37,6 +37,12 @@ impl Charge for Octets {
     fn taille_vraie(&self) -> usize {
         2 * self.0.len() + 64
     }
+    fn neuve(n: usize) -> Option<Octets> {
+        Some(Octets(Vec::with_capacity(n), 0))
+    }
+    fn completer(&mut self, o: &[u8]) {
+        self.0.extend_from_slice(o);
+    }
 }
 
 fn vide() -> Octets {
@@ -134,7 +140,7 @@ fn lire(c: &mut Connexion, n: usize) -> Vec<u8> {
         Ok(m.len())
     })
     .unwrap();
-    c.lu();
+    c.lu(v.len(), maintenant());
     v
 }
 
@@ -444,25 +450,24 @@ fn ack_des_donnees_sans_le_fin() {
 
 /// Le récepteur n'ouvre pas sa fenêtre par petits morceaux (RFC 9293
 /// 3.8.6.2.2, le syndrome de la fenêtre stupide) : tant que la place rendue
-/// ne fait ni un MSS ni le quart de SO_RCVBUF, la fenêtre ne s'ouvre pas ;
-/// ensuite, si.
+/// ne fait pas un MSS, la fenêtre ne s'ouvre pas ; ensuite, si.
 #[test]
 fn pas_de_petite_fenetre() {
     let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 65_536, ECHELLE);
     let syn = sortants(&mut c)[0].0;
     let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 16_384, 16_384, ECHELLE);
     calmer(&mut c, &mut f);
-    // La fenêtre de départ, la moitié de SO_RCVBUF : 8192 octets, envoyés
-    // tous. Elle est alors presque fermée (pas toujours tout à fait : son
-    // bord n'est jamais reculé, et peut être arrondi, `tcp_select_window`).
-    assert_eq!(f.fenetre_annoncee(), 8192);
-    ecrire(&mut c, &[1u8; 8192]);
+    // La fenêtre de départ, la moitié de SO_RCVBUF arrondie au MSS : 7300 octets,
+    // envoyés tous. Elle est alors fermée.
+    assert_eq!(f.fenetre_annoncee(), 7300);
+    ecrire(&mut c, &[1u8; 7300]);
     calmer(&mut c, &mut f);
     let w0 = f.fenetre_annoncee();
     assert!(w0 < 512, "{w0}");
-    lire(&mut f, MSS as usize);
+    // Un peu lu : aucune mémoire rendue, rien.
+    lire(&mut f, 100);
     sortants(&mut f);
-    assert_eq!(f.fenetre_annoncee(), w0, "un segment lu : la place rendue ne fait pas un MSS");
+    assert_eq!(f.fenetre_annoncee(), w0, "la place rendue ne fait pas un MSS");
     lire(&mut f, 2 * MSS as usize);
     sortants(&mut f);
     assert!(f.fenetre_annoncee() >= MSS as u32, "{}", f.fenetre_annoncee());
@@ -1106,16 +1111,20 @@ fn paire_avec(mss: u16, rcvbuf: usize, sndbuf: usize) -> (Connexion, Connexion) 
 /// fenêtre ne recule pas (un SO_RCVBUF au-delà de ce que l'échelle peut
 /// annoncer : elle reste à sa borne, 8 Mio) : un ACK tout de suite, un pour
 /// deux segments (RFC 5681 4.2, `__tcp_ack_snd_check`) ; un seul attend.
-/// (Chez Linux, `rcv_ssthresh` borne aussi la fenêtre en régime établi :
-/// nous n'avons pas cet ajustement de la réception, un écart écrit.)
 #[test]
 fn ack_au_deuxieme_segment_plein() {
-    let (mut c, mut f) = paire_avec(MSS, 1 << 25, 1 << 20);
+    let (mut c, mut f) = paire_avec(MSS, 131_072, 1 << 20);
     for _ in 0..16 {
         ecrire(&mut c, b"a");
         livrer(&mut c, &mut f);
         livrer(&mut f, &mut c);
     }
+    calmer(&mut c, &mut f);
+    // La fenêtre se pose : jusque-là, la promesse du SYN, un peu plus grande que ce
+    // que SO_RCVBUF permet ensuite, retarde les ACK (ce que Linux fait aussi).
+    ecrire(&mut c, &vec![1u8; 4 * MSS as usize]);
+    calmer(&mut c, &mut f);
+    let _ = lire(&mut f, 1 << 20);
     calmer(&mut c, &mut f);
     ecrire(&mut c, &vec![2u8; MSS as usize]);
     livrer(&mut c, &mut f);
@@ -1125,21 +1134,319 @@ fn ack_au_deuxieme_segment_plein() {
     assert_eq!(sortants(&mut f).len(), 1);
 }
 
-/// La file hors d'ordre est bornée en taille vraie (deux fois SO_RCVBUF,
-/// avec la file de réception) : un pair qui envoie des milliers de segments
-/// d'un octet derrière un trou ne fait pas tout garder.
+// --- La réception qui s'ajuste (reception.rs) ---
+
+/// Un SYN et un SYN-ACK : la fenêtre de chaque connexion, et ce qu'elles annoncent.
+fn poignee(mss: u16, rcvbuf: usize, echelle: u8, horodatages: bool, regler: impl Fn(&mut Connexion)) -> (Connexion, Connexion, u16, u16) {
+    let mut c = Connexion::connecter(40000, 80, 1000, mss, rcvbuf, 16_384, echelle);
+    regler(&mut c);
+    if horodatages {
+        c.proposer_horodatages(1);
+    }
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, mss, rcvbuf, 16_384, echelle);
+    regler(&mut f);
+    let s = sortants(&mut f)[0].0;
+    c.recevoir(&s, vide(), maintenant());
+    (c, f, syn.fenetre, s.fenetre)
+}
+
+/// `tcp_select_initial_window`, comme Linux (mesuré sur `lo`, et bien connu sur
+/// Ethernet) : le plein de SO_RCVBUF (131 072, à 50 %) arrondi au MSS annoncé, moins
+/// les options pour la fille. Sur `lo` : 65 495 et 65 483. Sur Ethernet : 64 240, et
+/// 64 240 pour une fille sans horodatages. Le premier ACK dit 65 536 sur `lo`, 64 256
+/// sur Ethernet (64 240 promis, arrondis à l'échelle).
+#[test]
+fn fenetre_initiale_comme_linux() {
+    let (mut c, _, syn, synack) = poignee(65_495, 131_072, 7, true, |_| {});
+    assert_eq!((syn, synack), (65_495, 65_483));
+    let ack = sortants(&mut c)[0].0;
+    assert_eq!(ack.fenetre as u32 * 128, 65_536);
+    let (mut c, _, syn, synack) = poignee(1460, 131_072, 7, false, |_| {});
+    assert_eq!((syn, synack), (64_240, 64_240));
+    let ack = sortants(&mut c)[0].0;
+    assert_eq!(ack.fenetre as u32 * 128, 64_256);
+    // Sans échelle chez l'autre : au plus 65 535, sur 16 bits sans décalage.
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 1 << 20, 16_384, 7);
+    let mut syn = sortants(&mut c)[0].0;
+    assert_eq!(syn.fenetre, 65_535);
+    syn.options.echelle = None;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 1 << 20, 16_384, 7);
+    let s = sortants(&mut f)[0].0;
+    assert_eq!((s.fenetre, s.options.echelle), (65_535, None));
+    // SO_RCVBUF fixé : sa moitié, et le plafond tient compte de l'unique segment réservé.
+    let (c, _, syn, _) = poignee(1460, 16_384, 0, false, |t| t.rcvbuf_fixe = true);
+    assert_eq!((syn, c.window_clamp), (7300, 8192 - 1460));
+    // TCP_WINDOW_CLAMP : la fenêtre, et ce qui suit.
+    let (c, _, syn, _) = poignee(1460, 131_072, 0, false, |t| t.window_clamp = 5000);
+    assert_eq!((syn, c.window_clamp), (4380, 5000));
+}
+
+/// La promesse tient : une fenêtre annoncée ne recule pas, même quand la place manque
+/// (`tcp_select_window`) ; elle revient à ce que permet la place, le bord étant passé.
+#[test]
+fn la_fenetre_ne_recule_pas() {
+    let (mut c, mut f) = paire();
+    calmer(&mut c, &mut f);
+    let (_, _, r0) = f.numeros();
+    let bord0 = r0.wrapping_add(f.fenetre_annoncee());
+    for _ in 0..8 {
+        ecrire(&mut c, &vec![1u8; 4 * MSS as usize]);
+        calmer(&mut c, &mut f);
+        let (_, _, r) = f.numeros();
+        assert!(!t::avant(r.wrapping_add(f.fenetre_annoncee()), bord0));
+    }
+}
+
+/// `rcv_ssthresh` monte par paliers, pour des segments de bon rendement (le rapport
+/// mesuré suit), jamais au-delà du plafond ; une fenêtre annoncée le suit. Sous
+/// pression : quatre segments (`tcp_adjust_rcv_ssthresh`).
+#[test]
+fn le_seuil_de_la_fenetre_monte_par_paliers() {
+    let (mut c, mut f) = paire_avec(MSS, 131_072, 1 << 22);
+    // De la place en réserve (DRS en donnerait) : le seuil part de la fenêtre du SYN.
+    f.rcvbuf = 1 << 22;
+    f.poser_fenetre_max(1 << 21);
+    let debut = f.info(maintenant()).rcv_ssthresh;
+    assert!(debut < 65_536);
+    let mut suite = Vec::new();
+    for _ in 0..30 {
+        ecrire(&mut c, &vec![1u8; 10 * MSS as usize]);
+        calmer(&mut c, &mut f);
+        let _ = lire(&mut f, 1 << 24);
+        suite.push(f.info(maintenant()).rcv_ssthresh);
+    }
+    assert!(suite.windows(2).all(|d| d[0] <= d[1]), "{suite:?}");
+    assert!(*suite.last().unwrap() >= debut + 100 * MSS as u32, "{debut} puis {suite:?}");
+    assert!(*suite.last().unwrap() <= f.window_clamp);
+    let i = f.info(maintenant());
+    assert!(i.rcv_wnd > 0);
+    // Sous pression.
+    f.memoire = t::Memoire::Pression;
+    ecrire(&mut c, &vec![1u8; 2 * MSS as usize]);
+    calmer(&mut c, &mut f);
+    assert!(f.info(maintenant()).rcv_ssthresh <= 4 * MSS as u32, "{}", f.info(maintenant()).rcv_ssthresh);
+}
+
+/// Un aller-retour de données, un RTT de 10 ms : `tours` fois le programme lit ce
+/// qui arrive, `n` segments par tour. Rend le SO_RCVBUF de la fille.
+fn transfert(c: &mut Connexion, f: &mut Connexion, tours: usize, n: usize, lit: bool) -> usize {
+    for _ in 0..tours {
+        ecrire(c, &vec![1u8; n * MSS as usize]);
+        loop {
+            let s = sortants(c);
+            if s.is_empty() {
+                break;
+            }
+            avancer(5 * MS);
+            for (h, o) in s {
+                f.recevoir(&h, Octets(o, 0), maintenant());
+            }
+            if lit {
+                let _ = lire(f, 1 << 30);
+            }
+            let r = sortants(f);
+            avancer(5 * MS);
+            for (h, _) in r {
+                c.recevoir(&h, vide(), maintenant());
+            }
+        }
+        calmer(c, f);
+    }
+    f.rcvbuf
+}
+
+/// Dynamic Right Sizing (`tcp_rcv_space_adjust`, `tcp_rcvbuf_grow`) : SO_RCVBUF suit ce
+/// que le programme lit en un RTT, jusqu'à `tcp_rmem[2]`. Pas s'il est fixé ; pas si le
+/// programme ne lit pas (le RTT du récepteur fait la mesure).
+#[test]
+fn so_rcvbuf_suit_le_debit() {
+    let (mut c, mut f) = paire_avec(MSS, 131_072, 1 << 24);
+    f.proposer_horodatages(0);
+    f.rcvbuf_max = 1 << 24;
+    let apres = transfert(&mut c, &mut f, 20, 40, true);
+    assert!(apres > 131_072, "{apres}");
+    assert!(apres <= 1 << 24);
+    let i = f.info(maintenant());
+    assert!(i.rcv_space > 64_240 && i.rcv_rtt > 0, "{} {}", i.rcv_space, i.rcv_rtt);
+    // Le plafond.
+    let (mut c, mut f) = paire_avec(MSS, 131_072, 1 << 24);
+    f.rcvbuf_max = 200_000;
+    assert_eq!(transfert(&mut c, &mut f, 20, 40, true), 200_000);
+    // Fixé : il ne bouge pas.
+    let (mut c, mut f) = paire_avec(MSS, 131_072, 1 << 24);
+    f.rcvbuf_fixe = true;
+    assert_eq!(transfert(&mut c, &mut f, 20, 40, true), 131_072);
+    // Le programme ne lit pas : la fenêtre se ferme, il ne fait rien grandir.
+    let (mut c, mut f) = paire_avec(MSS, 131_072, 1 << 24);
+    assert!(transfert(&mut c, &mut f, 1, 40, false) <= 131_072 + 3000);
+}
+
+/// Le rapport (`scaling_ratio`) est mesuré : un segment plein de rendement 50 %
+/// environ, la fenêtre suit ; deux petits segments égaux, sans PSH ni le reste : c'est
+/// le MSS de l'autre (`tcp_measure_rcv_mss`, `last_seg_size`).
+#[test]
+fn rcv_mss_et_rapport() {
+    let (_c, mut f) = paire();
+    let bord = bord(&f);
+    let modele = Tcp { drapeaux: tcp::ACK, ack: f.numeros().0, fenetre: 65_535, ..Tcp::default() };
+    assert_eq!(f.info(maintenant()).rcv_mss, 536);
+    f.recevoir(&Tcp { seq: bord, ..modele }, Octets(vec![1; 300], 0), maintenant());
+    assert_eq!(f.info(maintenant()).rcv_mss, 536, "un seul : rien");
+    f.recevoir(&Tcp { seq: bord.wrapping_add(300), ..modele }, Octets(vec![1; 300], 0), maintenant());
+    assert_eq!(f.info(maintenant()).rcv_mss, 300, "deux de suite : c'est son MSS");
+    f.recevoir(&Tcp { seq: bord.wrapping_add(600), ..modele }, Octets(vec![1; 1000], 0), maintenant());
+    assert_eq!(f.info(maintenant()).rcv_mss, 1000);
+    // Pas au-delà de ce qu'on a annoncé (une agrégation, chez d'autres).
+    f.recevoir(&Tcp { seq: bord.wrapping_add(1600), ..modele }, Octets(vec![1; 9000], 0), maintenant());
+    assert_eq!(f.info(maintenant()).rcv_mss, MSS as u32);
+}
+
+/// `tcp_cleanup_rbuf` : une lecture qui vide tout, après un petit segment (l'autre a
+/// peut-être fini, et attend), fait partir un ACK, hors d'une conversation.
+#[test]
+fn lecture_qui_vide_tout_fait_partir_l_ack() {
+    let (mut c, mut f) = paire();
+    // Assez d'ACK rapides pour en sortir.
+    for _ in 0..20 {
+        ecrire(&mut c, b"a");
+        calmer(&mut c, &mut f);
+        lire(&mut f, 1);
+    }
+    let r = t::Reglages { nodelay: true, ..c.reglages };
+    c.regler(r, maintenant());
+    // Sortir aussi du ping-pong.
+    f.quickack(false);
+    f.quickack(true);
+    ecrire(&mut c, b"z");
+    livrer(&mut c, &mut f);
+    let delai = sortants(&mut f).len();
+    if delai == 0 {
+        assert_eq!(lire(&mut f, 1), b"z");
+        assert_eq!(sortants(&mut f).len(), 1);
+    }
+}
+
+/// La mémoire manque, malgré tout (SO_RCVBUF fixé, la file pleine) : le segment est
+/// jeté, et l'ACK annonce une fenêtre nulle (ICSK_ACK_NOMEM) ; la lecture la rouvre.
+#[test]
+fn fenetre_nulle_quand_la_memoire_manque() {
+    let (_c, mut f) = paire_avec(MSS, 16_384, 16_384);
+    f.rcvbuf_fixe = true;
+    let bord = bord(&f);
+    let modele = Tcp { drapeaux: tcp::ACK, ack: f.numeros().0, fenetre: 65_535, ..Tcp::default() };
+    // Plus de mémoire pour TCP : le premier, la file vide, est gardé quand même (la
+    // connexion doit avancer), avec une fenêtre nulle.
+    f.memoire = t::Memoire::Limite;
+    f.recevoir(&Tcp { seq: bord, ..modele }, Octets(vec![1; 100], 0), maintenant());
+    assert_eq!(f.lisibles(), 100);
+    let s = sortants(&mut f);
+    assert_eq!((s.len(), s[0].0.fenetre), (1, 0));
+    assert_eq!(f.fenetre_annoncee(), 0);
+    // La fenêtre fermée : jeté, et l'ACK dit ce qui reste de place : ce n'est pas
+    // SO_RCVBUF qui manque.
+    f.recevoir(&Tcp { seq: bord.wrapping_add(100), ..modele }, Octets(vec![1; 100], 0), maintenant());
+    assert_eq!(f.lisibles(), 100);
+    assert!(sortants(&mut f)[0].0.fenetre > 0);
+    // Il y a de quoi lire : le suivant est jeté, et de nouveau une fenêtre nulle.
+    f.recevoir(&Tcp { seq: bord.wrapping_add(100), ..modele }, Octets(vec![1; 100], 0), maintenant());
+    assert_eq!(f.lisibles(), 100);
+    assert_eq!(sortants(&mut f)[0].0.fenetre, 0);
+    // La mémoire revient, le programme lit : la fenêtre se rouvre.
+    f.memoire = t::Memoire::Libre;
+    lire(&mut f, 100);
+    let s = sortants(&mut f);
+    assert!(s[0].0.fenetre > 0, "{:?}", s[0].0.fenetre);
+}
+
+/// `tcp_collapse` : la mémoire manque pour de tout petits segments : la file de
+/// lecture est recopiée, dense, sans qu'un octet change ni se perde. Et SO_RCVBUF, s'il
+/// n'est pas fixé, a suivi ce que garde la file (`tcp_clamp_window`).
+#[test]
+fn file_de_lecture_fondue() {
+    let (_c, mut f) = paire_avec(MSS, 16_384, 16_384);
+    f.rcvbuf_fixe = true;
+    let bord = bord(&f);
+    let modele = Tcp { drapeaux: tcp::ACK, ack: f.numeros().0, fenetre: 65_535, ..Tcp::default() };
+    let n = 2000u32;
+    for i in 0..n {
+        f.recevoir(&Tcp { seq: bord.wrapping_add(i), ..modele }, Octets(vec![i as u8], 0), maintenant());
+    }
+    assert_eq!(f.lisibles(), n as usize);
+    assert!(f.memoire_reception() <= 16_384 + 66, "{}", f.memoire_reception());
+    let lu = lire(&mut f, 1 << 20);
+    assert_eq!(lu, (0..n).map(|i| i as u8).collect::<Vec<u8>>());
+    assert_eq!(f.memoire_reception(), 0);
+    // Pas fixé : la limite suit, sans qu'on fonde tant qu'elle grandit.
+    let (_c, mut f) = paire_avec(MSS, 16_384, 16_384);
+    let bord = crate::bord(&f);
+    for i in 0..n {
+        f.recevoir(&Tcp { seq: bord.wrapping_add(i), ..modele }, Octets(vec![i as u8], 0), maintenant());
+    }
+    assert_eq!(f.lisibles(), n as usize);
+    assert!(f.rcvbuf >= 16_384);
+    assert_eq!(lire(&mut f, 1 << 20), (0..n).map(|i| i as u8).collect::<Vec<u8>>());
+}
+
+/// TCP_WINDOW_CLAMP en route (`tcp_set_window_clamp`) : plus bas, le seuil baisse aussi ;
+/// plus haut, le seuil remonte jusqu'à la fenêtre annoncée. Au moins 1152.
+#[test]
+fn window_clamp_en_route() {
+    let (_c, mut f) = paire();
+    let ss = f.info(maintenant()).rcv_ssthresh;
+    f.poser_fenetre_max(3000);
+    assert_eq!((f.window_clamp, f.info(maintenant()).rcv_ssthresh), (3000, 3000));
+    f.poser_fenetre_max(100);
+    assert_eq!(f.window_clamp, 1152);
+    f.poser_fenetre_max(1 << 20);
+    assert_eq!((f.window_clamp, f.info(maintenant()).rcv_ssthresh), (1 << 20, f.info(maintenant()).rcv_wnd.min(1 << 20).max(1152)));
+    let _ = ss;
+}
+
+/// SO_RCVLOWAT (`tcp_set_rcvlowat`) : borné par la moitié de `tcp_rmem[2]`, ou de SO_RCVBUF
+/// s'il est fixé ; SO_RCVBUF grandit pour le tenir, sauf s'il est fixé.
+#[test]
+fn rcvlowat_de_tcp() {
+    let (_c, mut f) = paire_avec(MSS, 131_072, 16_384);
+    f.rcvbuf_max = 1 << 20;
+    assert_eq!(f.poser_rcvlowat(100), 100);
+    assert_eq!(f.rcvbuf, 131_072);
+    assert_eq!(f.poser_rcvlowat(100_000), 100_000);
+    assert!(f.rcvbuf >= 200_000);
+    assert_eq!(f.poser_rcvlowat(u32::MAX), 1 << 19);
+    assert_eq!(f.poser_rcvlowat(0), 1);
+    let (_c, mut f) = paire_avec(MSS, 16_384, 16_384);
+    f.rcvbuf_fixe = true;
+    assert_eq!(f.poser_rcvlowat(100_000), 8192);
+    assert_eq!(f.rcvbuf, 16_384);
+}
+
+/// La file hors d'ordre est bornée par SO_RCVBUF : un pair qui envoie des milliers de
+/// segments d'un octet derrière un trou ne fait pas tout garder. Sans trous entre eux,
+/// ils sont fondus en paquets denses (`tcp_collapse_ofo_queue`), et tous gardés ;
+/// séparés, au-delà de la limite, jetés par la fin (`tcp_prune_ofo_queue`).
 #[test]
 fn file_hors_d_ordre_bornee() {
     let (_c, mut f) = paire_avec(MSS, 16_384, 16_384);
+    f.rcvbuf_fixe = true;
     let bord = bord(&f);
     let modele = Tcp { drapeaux: tcp::ACK, ack: f.numeros().0, fenetre: 65_535, ..Tcp::default() };
     for i in 1..4000u32 {
         f.recevoir(&Tcp { seq: bord.wrapping_add(i), ..modele }, Octets(vec![1], 0), maintenant());
     }
-    assert!(f.memoire_reception() <= 2 * 16_384, "{}", f.memoire_reception());
+    assert!(f.memoire_reception() <= 16_384 + 66, "{}", f.memoire_reception());
     f.recevoir(&Tcp { seq: bord, ..modele }, Octets(vec![0], 0), maintenant());
-    let n = f.lisibles();
-    assert!(n > 1 && n < 4000, "{n} octets gardés");
+    assert_eq!(f.lisibles(), 4000);
+    let (_c, mut f) = paire_avec(MSS, 16_384, 16_384);
+    f.rcvbuf_fixe = true;
+    let bord = crate::bord(&f);
+    let modele = Tcp { drapeaux: tcp::ACK, ack: f.numeros().0, fenetre: 65_535, ..Tcp::default() };
+    for i in 1..4000u32 {
+        f.recevoir(&Tcp { seq: bord.wrapping_add(2 * i), ..modele }, Octets(vec![1], 0), maintenant());
+    }
+    assert!(f.memoire_reception() <= 16_384 + 66, "{}", f.memoire_reception());
+    f.recevoir(&Tcp { seq: bord, ..modele }, Octets(vec![0], 0), maintenant());
+    assert_eq!(f.lisibles(), 1, "le segment qui comble le trou passe toujours");
 }
 
 /// Une fenêtre qui se ferme sur des données en vol : le RTO renvoie quand
@@ -1289,10 +1596,10 @@ fn echelle_de_fenetre() {
 /// l'autre, 14.
 #[test]
 fn echelle_comme_linux() {
-    assert_eq!(t::echelle(131_072, false, 32 << 20), 10);
-    assert_eq!(t::echelle(8 << 20, true, 32 << 20), 7);
-    assert_eq!(t::echelle(131_072, false, 15 << 20), 8);
-    assert_eq!(t::echelle(4096, true, 32 << 20), 0);
+    assert_eq!(t::echelle(131_072, false, 32 << 20, 0), 10);
+    assert_eq!(t::echelle(8 << 20, true, 32 << 20, 0), 7);
+    assert_eq!(t::echelle(131_072, false, 15 << 20, 0), 8);
+    assert_eq!(t::echelle(4096, true, 32 << 20, 0), 0);
     let mut c = Connexion::connecter(1, 2, 0, MSS, 131_072, 16_384, 0);
     let syn = sortants(&mut c)[0].0;
     assert_eq!(syn.options.echelle, Some(0));

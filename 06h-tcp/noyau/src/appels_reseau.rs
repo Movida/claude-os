@@ -88,6 +88,7 @@ const TCP_KEEPCNT: i32 = 6;
 const TCP_SYNCNT: i32 = 7;
 const TCP_LINGER2: i32 = 8;
 const TCP_DEFER_ACCEPT: i32 = 9;
+const TCP_WINDOW_CLAMP: i32 = 10;
 const TCP_INFO: i32 = 11;
 const TCP_QUICKACK: i32 = 12;
 const TCP_CONGESTION: i32 = 13;
@@ -1290,11 +1291,10 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         }
         // Négatif : le plus grand ; 0 se relit 1.
         SO_RCVLOWAT => {
-            let v = if v < 0 { i32::MAX as u32 } else { (v as u32).max(1) };
+            let v = if v < 0 { i32::MAX as u32 } else { v as u32 };
+            // TCP le borne, et fait grandir SO_RCVBUF pour le tenir ; les autres : tel quel, au moins 1.
+            let v = if s.protocole == Protocole::Tcp { tcp::poser_rcvlowat(s, v) } else { v.max(1) };
             s.appels.verrouiller().options.rcvlowat = v;
-            if s.protocole == Protocole::Tcp {
-                tcp::avec_options(s, |op, _| op.rcvlowat = v);
-            }
             return Ok(());
         }
         _ => {}
@@ -1383,6 +1383,7 @@ fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Resu
         return Ok(());
     }
     let v = entier(valeur, longueur)?;
+    let ecoute = tcp::ecoute(s);
     tcp::avec_options(s, |op, mut tcb| {
         match option {
             TCP_NODELAY => op.nodelay = v != 0,
@@ -1416,6 +1417,21 @@ fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Resu
             // couvrent (5 s → 7 s). Sans effet chez nous : la fille est
             // donnée à accept dès sa poignée de main (un écart écrit).
             TCP_DEFER_ACCEPT => op.defer_accept = secondes_en_essais(v),
+            // `tcp_set_window_clamp` : 0 ne vaut que pour une socket fermée ; au moins
+            // la moitié de SOCK_MIN_RCVBUF (un négatif aussi : mesuré).
+            TCP_WINDOW_CLAMP => {
+                if v == 0 {
+                    if ecoute || tcb.as_deref().is_some_and(|t| t.etat() != inet::tcp::Etat::Fermee) {
+                        return Err(-EINVAL);
+                    }
+                    op.window_clamp = 0;
+                } else {
+                    op.window_clamp = v.max(1152) as u32;
+                    if let Some(t) = tcb.as_deref_mut() {
+                        t.poser_fenetre_max(op.window_clamp);
+                    }
+                }
+            }
             TCP_QUICKACK => {
                 op.quickack = v != 0;
                 if let Some(t) = tcb.as_deref_mut() {
@@ -1460,6 +1476,7 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], u
             TCP_SYNCNT => if op.syncnt == 0 { inet::tcp::SYN_ESSAIS as i32 } else { op.syncnt as i32 },
             TCP_LINGER2 => if op.linger2 == 0 { 60 } else { op.linger2 },
             TCP_DEFER_ACCEPT => essais_en_secondes(op.defer_accept),
+            TCP_WINDOW_CLAMP => tcb.map_or(op.window_clamp, |t| t.window_clamp) as i32,
             TCP_QUICKACK => op.quickack as i32,
             TCP_USER_TIMEOUT => op.user_timeout as i32,
             TCP_CONGESTION => {
@@ -1530,7 +1547,7 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
     let mots = [
         (8, i.rto), (12, i.ato), (16, i.snd_mss), (20, i.rcv_mss), (24, i.non_acquittes), (28, i.sackes), (32, i.perdus), (36, i.retransmis),
         (44, i.dernier_envoi), (52, i.dernier_recu), (56, i.dernier_ack), (60, i.pmtu), (68, i.rtt), (72, i.rttvar),
-        (76, i.ssthresh), (80, i.cwnd), (84, i.advmss), (88, i.reordonnancement), (92, i.rcv_rtt), (100, i.total_retrans),
+        (76, i.ssthresh), (80, i.cwnd), (84, i.advmss), (88, i.reordonnancement), (92, i.rcv_rtt), (96, i.rcv_space), (100, i.total_retrans), (64, i.rcv_ssthresh),
         (148, i.min_rtt), (192, i.livres), (216, i.dsack_doublons), (220, i.reord_seen), (228, i.snd_wnd), (232, i.rcv_wnd),
     ];
     for (decalage, v) in mots {
@@ -1687,6 +1704,7 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
         // Celui d'une connexion TCP grandit de lui-même.
         SO_SNDBUF if s.protocole == Protocole::Tcp => entier(&mut o, tcp::sndbuf(s) as i32),
         SO_SNDBUF => entier(&mut o, s.sndbuf.load(Ordering::Relaxed) as i32),
+        SO_RCVBUF if s.protocole == Protocole::Tcp => entier(&mut o, tcp::rcvbuf(s) as i32),
         SO_RCVBUF => entier(&mut o, s.rcvbuf.load(Ordering::Relaxed) as i32),
         SO_REUSEADDR => entier(&mut o, op.reuseaddr as i32),
         SO_REUSEPORT => entier(&mut o, op.reuseport as i32),

@@ -92,6 +92,7 @@ mod congestion;
 mod cubic;
 mod hors_ordre;
 mod minmax;
+mod reception;
 mod retrans;
 mod rtt;
 mod sack;
@@ -100,6 +101,7 @@ use attente::Attente;
 use congestion::{Congestion, Phase, TCP_REORDERING};
 use hors_ordre::HorsOrdre;
 use minmax::MinMax;
+use reception::{EspaceLu, RATIO_DEFAUT};
 use retrans::{Envoye, EtatSack, Rexmit, ResultatAck, FLAG_CA_ALERT, FLAG_DATA, FLAG_DSACKING_ACK, FLAG_NO_CHALLENGE_ACK, FLAG_NOT_DUP, FLAG_SET_XMIT_TIMER, FLAG_SND_UNA_ADVANCED, FLAG_SYN_ACKED, FLAG_WIN_UPDATE};
 use rtt::Rtt;
 use sack::Rack;
@@ -119,14 +121,22 @@ pub const MSS_MIN: u16 = 88;
 /// MSS de 1 fait découper tout ce qu'on envoie en segments d'un octet).
 pub const MSS_ENVOI_MIN: u16 = 48;
 /// Où en est la mémoire de TCP de toute la machine (`tcp_mem`), que le
-/// noyau dit à chaque connexion avant de la faire travailler.
+/// noyau dit à chaque connexion avant de la faire travailler
+/// (`__sk_mem_raise_allocated`, `sk_memory_allocated`, `tcp_memory_pressure`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Memoire {
     /// Sous le premier seuil (`tcp_mem[0]`) : rien ne change.
     Libre,
-    /// Au-delà : SO_SNDBUF ne grandit plus de lui-même
-    /// (`tcp_should_expand_sndbuf`).
+    /// Au-delà : SO_SNDBUF et SO_RCVBUF ne grandissent plus d'eux-mêmes
+    /// (`tcp_should_expand_sndbuf`, `tcp_clamp_window`).
+    Souple,
+    /// Passé le second (`tcp_mem[1]`), et jusqu'à redescendre sous le premier : la
+    /// pression (`tcp_memory_pressure`) : la fenêtre se resserre.
     Pression,
+    /// Sous pression, et cette socket a plus que sa juste part (la limite divisée
+    /// par le nombre de sockets) : plus rien de neuf au-delà du minimum
+    /// (`tcp_rmem[0]`, `tcp_wmem[0]`).
+    Excedent,
     /// Au-delà du dernier (`tcp_mem[2]`) : plus rien de neuf n'est gardé,
     /// sauf pour qu'une connexion avance (`__sk_mem_raise_allocated` qui
     /// échoue) : un envoi n'écrit que dans un tampon vide, une réception ne
@@ -155,17 +165,32 @@ pub const ECHELLE_MAX: u8 = 14;
 /// de SO_RCVBUF (`tcp_full_space`) s'il a été fixé par le programme
 /// (`SOCK_RCVBUF_LOCK` : la fenêtre ne la dépassera jamais) ; sinon la plus
 /// grande que la machine permet, `reception_max` (`tcp_rmem[2]` et
-/// `rmem_max`), que le noyau calcule d'après sa mémoire, comme `tcp_init`.
-/// Linux 6.18 propose ainsi 10 sur une machine de 12 Gio, et 7 avec
-/// SO_RCVBUF fixé à 8 Mio (mesuré sur l'hôte).
-pub fn echelle(rcvbuf: usize, rcvbuf_fixe: bool, reception_max: usize) -> u8 {
+/// `rmem_max`), que le noyau calcule d'après sa mémoire, comme `tcp_init` ;
+/// au plus TCP_WINDOW_CLAMP (`clamp`, 0 : rien). Linux 6.18 propose ainsi 10
+/// sur une machine de 12 Gio, et 7 avec SO_RCVBUF fixé à 8 Mio (mesuré sur
+/// l'hôte).
+pub fn echelle(rcvbuf: usize, rcvbuf_fixe: bool, reception_max: usize, clamp: u32) -> u8 {
     let pleine = rcvbuf / 2;
-    let place = if rcvbuf_fixe { pleine } else { pleine.max(reception_max).min(65_535 << ECHELLE_MAX) };
+    let mut plafond = if clamp == 0 { 65_535 << ECHELLE_MAX } else { clamp as usize };
+    if rcvbuf_fixe && (clamp == 0 || plafond > pleine) {
+        plafond = pleine;
+    }
+    let place = pleine.max(reception_max).min(plafond);
     (place.max(1).ilog2() as i64 - 15).clamp(0, ECHELLE_MAX as i64) as u8
 }
+
+/// ICSK_ACK_PUSHED, et PUSHED2 : un segment, puis un deuxième, qui ne remplit pas
+/// le MSS est arrivé : l'autre a sans doute fini d'écrire, et attend peut-être un ACK.
+const ACK_POUSSE: u8 = 1;
+const ACK_POUSSE2: u8 = 2;
+
 /// Le plafond de SO_SNDBUF agrandi sur une machine assez grande
 /// (`tcp_wmem[2]`, 4 Mio ; moins sur une petite : `Tcb::sndbuf_max`).
 pub const SNDBUF_MAX: usize = 4 << 20;
+/// De même pour SO_RCVBUF (`tcp_rmem[2]`, 32 Mio ; `Tcb::rcvbuf_max`).
+pub const RCVBUF_MAX: usize = 32 << 20;
+/// La mémoire garantie à une socket au-delà de sa juste part (`tcp_wmem[0]`).
+const WMEM0: usize = 4096;
 
 /// Le plus grand degré de réordonnancement qu'on estime (`tcp_max_reordering`).
 const TCP_MAX_REORDERING: u32 = 300;
@@ -362,6 +387,11 @@ pub trait Charge {
     /// Ce qu'elle occupe en mémoire (la taille vraie, que compte
     /// SO_RCVBUF).
     fn taille_vraie(&self) -> usize;
+    /// Une charge neuve, pour `n` octets à recopier (`tcp_collapse`) ; None : plus de
+    /// mémoire.
+    fn neuve(n: usize) -> Option<Self> where Self: Sized;
+    /// Ajoute ces octets à sa fin : la place a été prise par `neuve`.
+    fn completer(&mut self, o: &[u8]);
 }
 
 /// Un segment à envoyer : son en-tête, et sa charge, désignée dans le
@@ -484,6 +514,10 @@ pub struct Info {
     pub advmss: u32,
     /// La MTU du chemin (`tcpi_pmtu`).
     pub pmtu: u32,
+    /// Ce qui borne la fenêtre annoncée (`tcpi_rcv_ssthresh`), et le plus que le
+    /// programme ait lu en un RTT (`tcpi_rcv_space`).
+    pub rcv_ssthresh: u32,
+    pub rcv_space: u32,
     pub reordonnancement: u32,
     pub total_retrans: u32,
     /// Le RTT vu du récepteur (`tcpi_rcv_rtt`).
@@ -558,12 +592,15 @@ struct Ack {
     /// Le mode « ping-pong » : nous répondons vite à ce qui arrive (une
     /// conversation) ; l'ACK attend alors la réponse pour partir avec elle.
     pingpong: u8,
-    /// La taille des segments de l'autre, estimée (`rcv_mss`).
+    /// La taille des segments de l'autre, estimée (`rcv_mss`), et celle du dernier
+    /// segment plus petit (`last_seg_size`).
     rcv_mss: u32,
-    /// RCV.NXT au dernier ACK envoyé (`rcv_wup`), et la fenêtre qu'il
-    /// annonçait (`rcv_wnd`) : le bord droit, lui, avance à chaque arrivée.
-    rcv_wup: u32,
-    fenetre: u32,
+    dernier_segment: u32,
+    /// ACK_POUSSE et ACK_POUSSE2 (ICSK_ACK_PUSHED, PUSHED2).
+    pousse: u8,
+    /// Un segment vient d'être jeté, faute de mémoire : le prochain ACK annonce une
+    /// fenêtre nulle (ICSK_ACK_NOMEM).
+    sans_memoire: bool,
     /// L'heure de la dernière arrivée de données (`lrcvtime`).
     lrcvtime: u64,
     /// L'échéance de l'ACK retardé.
@@ -572,8 +609,7 @@ struct Ack {
 
 impl Ack {
     const fn new() -> Ack {
-        Ack { programme: false, urgent: false, ato: 0, rapides: 0, pingpong: 0, rcv_mss: MSS_DEFAUT as u32, rcv_wup: 0, fenetre: 0, lrcvtime: 0,
-              t: None }
+        Ack { programme: false, urgent: false, ato: 0, rapides: 0, pingpong: 0, rcv_mss: MSS_DEFAUT as u32, dernier_segment: 0, pousse: 0, sans_memoire: false, lrcvtime: 0, t: None }
     }
 
     /// Le mode « quickack », hors ping-pong (`tcp_in_quickack_mode`).
@@ -616,11 +652,19 @@ pub struct Tcb<P: Charge> {
     // La réception.
     irs: u32,
     rcv_nxt: u32,
-    /// Le bord droit de la fenêtre annoncée (rcv_nxt + fenêtre), qui ne
-    /// recule jamais (RFC 9293, 3.8.6.2.2).
-    rcv_bord: u32,
-    /// Une fenêtre a déjà été annoncée (le bord droit a un sens).
-    bord_pose: bool,
+    /// La dernière fenêtre annoncée (`rcv_wnd`), et RCV.NXT à ce moment (`rcv_wup`) :
+    /// son bord droit, rcv_wup + rcv_wnd, ne recule jamais (RFC 9293, 3.8.6.2.2).
+    rcv_wnd: u32,
+    rcv_wup: u32,
+    /// `rcv_wnd` a été choisie (le premier SYN ou SYN-ACK : `tcp_select_initial_window`).
+    fenetre_posee: bool,
+    /// Ce qui borne la fenêtre (reception.rs) : `rcv_ssthresh`, `window_clamp`, et le
+    /// rapport octets de données sur mémoire, sur 256 (`scaling_ratio`).
+    rcv_ssthresh: u32,
+    pub window_clamp: u32,
+    ratio: u8,
+    /// Le plus que le programme ait lu en un RTT (`rcvq_space`).
+    espace: EspaceLu,
     /// Le MSS d'envoi (`mss_cache`) : celui de l'autre, borné par le nôtre et
     /// par TCP_MAXSEG, moins la place des options de tout segment
     /// (`tcp_sync_mss`).
@@ -681,12 +725,19 @@ pub struct Tcb<P: Charge> {
     /// L'autre a fermé son sens (FIN reçu et accepté).
     fin_recue: bool,
     /// Les tailles des tampons (SO_RCVBUF, SO_SNDBUF, déjà doublées), et
-    /// SO_SNDBUF fixé par le programme (`SOCK_SNDBUF_LOCK` : il ne grandit
-    /// plus de lui-même), et son plafond sur cette machine (`tcp_wmem[2]`).
+    /// s'ils sont fixés par le programme (`SOCK_RCVBUF_LOCK`, `SOCK_SNDBUF_LOCK` :
+    /// ils ne grandissent plus d'eux-mêmes), et leurs plafonds sur cette machine
+    /// (`tcp_rmem[2]`, `tcp_wmem[2]`).
     pub rcvbuf: usize,
     pub sndbuf: usize,
+    pub rcvbuf_fixe: bool,
     pub sndbuf_fixe: bool,
+    pub rcvbuf_max: usize,
     pub sndbuf_max: usize,
+    /// SO_RCVLOWAT (`sk_rcvlowat`), et si un programme tient cette connexion
+    /// (`sk_socket` : ni une fille pas encore acceptée, ni une orpheline).
+    pub rcvlowat: u32,
+    pub attachee: bool,
     /// L'erreur à rendre au programme (`sk_err`), et l'erreur « douce »
     /// d'un ICMP (`sk_err_soft`), que rendra un abandon.
     erreur: i32,
@@ -844,8 +895,13 @@ impl<P: Charge> Tcb<P> {
             syn_acquitte: false,
             irs: 0,
             rcv_nxt: 0,
-            rcv_bord: 0,
-            bord_pose: false,
+            rcv_wnd: 0,
+            rcv_wup: 0,
+            fenetre_posee: false,
+            rcv_ssthresh: 0,
+            window_clamp: 0,
+            ratio: RATIO_DEFAUT,
+            espace: EspaceLu { octets: 0, seq: 0, temps: 0 },
             mss: MSS_DEFAUT,
             mss_offre: None,
             mss_route: mss_local,
@@ -877,8 +933,12 @@ impl<P: Charge> Tcb<P> {
             fin_recue: false,
             rcvbuf,
             sndbuf,
+            rcvbuf_fixe: false,
             sndbuf_fixe: false,
+            rcvbuf_max: RCVBUF_MAX,
             sndbuf_max: SNDBUF_MAX,
+            rcvlowat: 1,
+            attachee: true,
             erreur: 0,
             erreur_douce: 0,
             lecture_fermee: false,
@@ -1001,7 +1061,7 @@ impl<P: Charge> Tcb<P> {
         t.sack_ok = syn.options.sack_permis;
         t.mss_offre = syn.options.mss;
         t.synchroniser_mss();
-        t.annoncer();
+        t.rcv_wup = t.rcv_nxt;
         t.syn_du = true;
         t
     }
@@ -1054,6 +1114,9 @@ impl<P: Charge> Tcb<P> {
                 self.echelle_envoi = 0;
                 self.echelle_reception = 0;
                 self.echelle_ok = false;
+                if self.window_clamp != 0 {
+                    self.window_clamp = self.window_clamp.min(FENETRE_MAX);
+                }
             }
         }
     }
@@ -1294,69 +1357,29 @@ impl<P: Charge> Tcb<P> {
         self.lire::<()>(n, false, |m| Ok(m.len())).unwrap_or(0)
     }
 
-    /// La place libre de la réception, en taille vraie (la file hors
-    /// d'ordre compte, comme chez Linux).
-    fn libre(&self) -> usize {
-        self.rcvbuf.saturating_sub(self.taille_vraie_reception + self.hors_ordre.taille_vraie)
-    }
-
-    /// La plus grande fenêtre qu'on puisse annoncer (`window_clamp`) : sans
-    /// échelle, 65 535.
-    fn fenetre_max(&self) -> u32 {
-        ((self.rcvbuf / 2) as u32).min(FENETRE_MAX << self.echelle_reception)
-    }
-
-    /// La fenêtre que permet la place libre : la moitié (le `scaling_ratio`
-    /// de Linux à sa valeur de départ, 50 % : une charge reçue occupe à peu
-    /// près le double de ses octets en mémoire), au plus `fenetre_max` ;
-    /// moins d'un MSS : 0 (le récepteur n'annonce pas de petite fenêtre, RFC
-    /// 9293 3.8.6.2.2, le SWS).
-    fn fenetre_possible(&self) -> u32 {
-        let f = ((self.libre() / 2) as u32).min(FENETRE_MAX << self.echelle_reception);
-        if f < self.mss_local as u32 && f < (self.rcvbuf / 4) as u32 { 0 } else { f }
-    }
-
-    /// Pose le bord droit annoncé, sans jamais le reculer ; avec l'échelle,
-    /// la fenêtre arrondie au multiple supérieur de son unité (sinon le
-    /// décalage la tronquerait, et le bord reculerait : le `ALIGN` de
-    /// `tcp_select_window`).
-    fn annoncer(&mut self) {
-        let bord = self.rcv_nxt.wrapping_add(self.fenetre_possible());
-        if !self.bord_pose || apres(bord, self.rcv_bord) {
-            self.rcv_bord = bord;
-            self.bord_pose = true;
-        }
-        if avant(self.rcv_bord, self.rcv_nxt) {
-            self.rcv_bord = self.rcv_nxt;
-        }
-        let e = self.echelle_reception;
-        let w = self.rcv_bord.wrapping_sub(self.rcv_nxt);
-        self.rcv_bord = self.rcv_nxt.wrapping_add(w.div_ceil(1 << e) << e);
-    }
-
-    /// La fenêtre à annoncer dans un segment (hors SYN), décalée de notre
-    /// échelle.
-    fn fenetre(&self) -> u16 {
-        (self.rcv_bord.wrapping_sub(self.rcv_nxt) >> self.echelle_reception).min(FENETRE_MAX) as u16
-    }
-
-    /// Le programme a lu (`tcp_cleanup_rbuf`) : un ACK part tout de suite
-    /// si un ACK dû attend plus d'un segment plein (`verifier_ack` l'avait
-    /// retardé parce que la fenêtre n'avançait pas), ou si la fenêtre
-    /// qu'on pourrait annoncer a au moins doublé depuis la dernière
-    /// annonce (sans cela, un émetteur bloqué par une fenêtre nulle
-    /// attendrait sa prochaine sonde).
-    pub fn lu(&mut self) -> Effets {
+    /// Le programme a lu `copie` octets (`tcp_rcv_space_adjust`, `tcp_cleanup_rbuf`) :
+    /// SO_RCVBUF suit ce débit ; et un ACK part tout de suite si un ACK dû attend
+    /// plus d'un segment plein (`verifier_ack` l'avait retardé parce que la fenêtre
+    /// n'avançait pas), si cette lecture a vidé la file après un petit segment (l'autre
+    /// attend peut-être cet ACK pour continuer, hors d'une conversation), ou si la
+    /// fenêtre qu'on pourrait annoncer a au moins doublé depuis la dernière annonce
+    /// (sans cela, un émetteur bloqué par une fenêtre nulle attendrait sa prochaine
+    /// sonde).
+    pub fn lu(&mut self, copie: usize, maintenant: u64) -> Effets {
+        self.ajuster_espace(maintenant);
         if !self.etat.synchronise() && self.etat != Etat::SynRecu {
             return Effets::default();
         }
-        let mut tout_de_suite = self.ack.programme && self.rcv_nxt.wrapping_sub(self.ack.rcv_wup) > self.ack.rcv_mss;
-        if !tout_de_suite && !self.fin_recue {
-            let annoncee = self.rcv_bord.wrapping_sub(self.rcv_nxt);
-            let possible = self.fenetre_possible();
-            if 2 * annoncee <= self.fenetre_max() && possible > 0 && possible >= 2 * annoncee {
-                self.annoncer();
-                tout_de_suite = true;
+        let mut tout_de_suite = false;
+        if self.ack.programme {
+            let pousse = self.ack.pousse & ACK_POUSSE2 != 0 || (self.ack.pousse & ACK_POUSSE != 0 && self.ack.pingpong == 0);
+            tout_de_suite = self.rcv_nxt.wrapping_sub(self.rcv_wup) > self.ack.rcv_mss || (copie > 0 && pousse && self.memoire_reception() == 0);
+        }
+        if copie > 0 && !tout_de_suite && !self.fin_recue && !self.lecture_fermee {
+            let annoncee = self.fenetre_restante();
+            if 2 * annoncee as u64 <= self.window_clamp as u64 {
+                let neuve = self.choisir_fenetre();
+                tout_de_suite = neuve != 0 && neuve as u64 >= 2 * annoncee as u64;
             }
         }
         let mut e = Effets::default();
@@ -1371,7 +1394,8 @@ impl<P: Charge> Tcb<P> {
 
     /// La place libre du tampon d'émission, en octets.
     pub fn place(&self) -> usize {
-        if self.memoire == Memoire::Limite && self.octets_envoi > 0 {
+        // (`sk_wmem_schedule` qui échoue, sauf pour un tampon vide : `sk_forced_mem_schedule`.)
+        if (self.memoire == Memoire::Limite && self.octets_envoi > 0) || (self.memoire == Memoire::Excedent && self.octets_envoi >= WMEM0) {
             return 0;
         }
         self.sndbuf.saturating_sub(self.octets_envoi)
@@ -1634,26 +1658,21 @@ impl<P: Charge> Tcb<P> {
 
     /// La fenêtre de réception annoncée.
     pub fn fenetre_annoncee(&self) -> u32 {
-        self.rcv_wnd()
+        self.fenetre_restante()
     }
 
     /// L'entrée de TIME_WAIT de cette connexion (`tcp_time_wait`) ;
     /// `fin_attente2` : une orpheline qui attend encore le FIN de l'autre.
     pub fn en_attente(&self, fin_attente2: bool) -> Attente {
-        Attente::new(self.port_local, self.port_distant, self.snd_nxt, self.rcv_nxt, self.rcv_wnd(), self.echelle_reception, fin_attente2, self.ts, self.heure)
+        Attente::new(self.port_local, self.port_distant, self.snd_nxt, self.rcv_nxt, self.fenetre_restante(), self.echelle_reception, fin_attente2, self.ts, self.heure)
     }
 
     /// Ce qui reste de la fenêtre annoncée tient-il en un segment de
-    /// l'autre (`tcp_receive_window(tp) <= icsk_ack.rcv_mss`) ? Alors poll
-    /// dit POLLIN même sous SO_RCVLOWAT : l'autre ne peut plus rien envoyer
-    /// avant qu'on lise.
+    /// l'autre (`tcp_receive_window(tp) <= icsk_ack.rcv_mss`), ou la mémoire
+    /// presse-t-elle (`tcp_rmem_pressure`) ? Alors poll dit POLLIN même sous
+    /// SO_RCVLOWAT : l'autre ne peut plus rien envoyer avant qu'on lise.
     pub fn fenetre_presque_fermee(&self) -> bool {
-        self.rcv_wnd() <= self.ack.rcv_mss
-    }
-
-    /// La fenêtre de réception, pour l'acceptabilité.
-    fn rcv_wnd(&self) -> u32 {
-        self.rcv_bord.wrapping_sub(self.rcv_nxt)
+        self.fenetre_restante() <= self.ack.rcv_mss || self.reception_pressee()
     }
 
     /// Un segment de `seq` à `fin_seq` est-il acceptable (`tcp_sequence`) ?
@@ -1664,10 +1683,10 @@ impl<P: Charge> Tcb<P> {
     /// seulement si la file de réception est vide (sinon, un récepteur lent
     /// verrait grandir sa mémoire au-delà de ce qu'il a annoncé).
     fn acceptable(&self, seq: u32, fin_seq: u32) -> bool {
-        if avant(fin_seq, self.ack.rcv_wup) {
+        if avant(fin_seq, self.rcv_wup) {
             return false;
         }
-        let bord = self.rcv_nxt.wrapping_add(self.rcv_wnd());
+        let bord = self.rcv_nxt.wrapping_add(self.fenetre_restante());
         !apres(fin_seq, bord) || (!apres(seq, bord) && self.reception.is_empty())
     }
 
@@ -1731,7 +1750,7 @@ impl<P: Charge> Tcb<P> {
         }
         // Hors de la fenêtre, ou rejeté : un ACK (limité, sauf s'il porte des
         // données).
-        if rejet_paws || rejet_tsecr || !dans_la_fenetre(t.seq, fin_seq, self.rcv_nxt, self.rcv_nxt.wrapping_add(self.rcv_wnd())) {
+        if rejet_paws || rejet_tsecr || !dans_la_fenetre(t.seq, fin_seq, self.rcv_nxt, self.rcv_nxt.wrapping_add(self.rcv_wnd.min(FENETRE_MAX))) {
             if drapeaux & tcp::RST == 0 && ((fin_seq != t.seq && !syn) || !self.ack_invalide_limite(maintenant)) {
                 self.ack_maintenant = true;
                 e.a_emettre = true;
@@ -1856,7 +1875,7 @@ impl<P: Charge> Tcb<P> {
                 self.irs = t.seq;
                 self.rcv_nxt = t.seq.wrapping_add(1);
                 self.rcv_lu = self.rcv_nxt;
-                self.ack.rcv_wup = self.rcv_nxt;
+                self.rcv_wup = self.rcv_nxt;
                 self.mss_offre = t.options.mss;
                 self.accepter_echelle(t.options.echelle);
                 self.sack_ok &= t.options.sack_permis;
@@ -1871,8 +1890,6 @@ impl<P: Charge> Tcb<P> {
                     None => self.ts = None,
                 }
                 self.synchroniser_mss();
-                self.bord_pose = false;
-                self.annoncer();
                 self.dernier_recu = maintenant;
                 if ack {
                     self.snd_una = t.ack;
@@ -2044,7 +2061,7 @@ impl<P: Charge> Tcb<P> {
             return e;
         }
         if recoit {
-            self.recevoir_texte(seq, charge, fin, maintenant, &mut e);
+            self.recevoir_texte(t, seq, charge, fin, maintenant, &mut e);
         }
         if self.fin_hors_ordre == Some(self.rcv_nxt) && self.etat.recoit() {
             self.fin_hors_ordre = None;
@@ -2054,7 +2071,6 @@ impl<P: Charge> Tcb<P> {
         if self.ack_maintenant {
             e.a_emettre = true;
         }
-        self.annoncer();
         e
     }
 
@@ -2181,7 +2197,7 @@ impl<P: Charge> Tcb<P> {
     /// abîmé bloquerait la connexion.
     fn remplacer_ts_recent(&mut self, seq: u32, maintenant: u64) {
         if let (Some(ts), Some((val, _))) = (self.ts.as_mut(), self.ts_recu)
-            && !apres(seq, self.ack.rcv_wup)
+            && !apres(seq, self.rcv_wup)
             && paws_controle(ts, val, 0, maintenant)
         {
             ts.retenir(val, maintenant);
@@ -2279,7 +2295,7 @@ impl<P: Charge> Tcb<P> {
             }
             self.rtt_reception(maintenant.saturating_sub(self.rcv_rtt_debut).max(1), true);
         }
-        self.rcv_rtt_seq = self.rcv_nxt.wrapping_add(self.rcv_wnd());
+        self.rcv_rtt_seq = self.rcv_nxt.wrapping_add(self.rcv_wnd);
         self.rcv_rtt_debut = maintenant;
     }
 
@@ -2324,16 +2340,14 @@ impl<P: Charge> Tcb<P> {
         self.cc.etablir(self.snd_nxt, maintenant);
         self.dernier_envoi = maintenant;
         // `tcp_initialize_rcv_mss` : au plus 536 avant d'avoir vu un segment.
-        let rcv_wnd = self.rcv_wnd();
         self.ack.rcv_mss = (self.mss_local as u32)
-            .min(self.mss as u32)
-            .min(rcv_wnd / 2)
+            .min(self.mss_borne())
+            .min(self.rcv_wnd / 2)
             .min(MSS_DEFAUT as u32)
             .max(MSS_MIN as u32);
-        self.ack.rcv_wup = self.rcv_nxt;
-        self.ack.fenetre = rcv_wnd;
         // `tcp_init_buffer_space` ; et le keepalive, s'il est demandé.
         self.agrandir_sndbuf();
+        self.espace_initial(maintenant);
         if self.reglages.keepalive {
             self.t_keepalive = Some(maintenant + self.reglages.keepidle);
         }
@@ -2437,7 +2451,9 @@ impl<P: Charge> Tcb<P> {
             dsack_doublons: self.dsack_doublons,
             reord_seen: self.reord_seen,
             snd_wnd: self.snd_wnd,
-            rcv_wnd: self.rcv_wnd(),
+            rcv_wnd: self.rcv_wnd,
+            rcv_ssthresh: self.rcv_ssthresh,
+            rcv_space: self.espace.octets,
             total_rto: self.total_rto,
             pacing: self.cc.pacing,
             t_retrans: self.t_xmit.map(|t| t.saturating_sub(maintenant)),
@@ -2471,14 +2487,14 @@ impl<P: Charge> Tcb<P> {
 
     /// Le texte d'un segment acceptable, ses données et son FIN
     /// (`tcp_data_queue`).
-    fn recevoir_texte(&mut self, seq: u32, mut charge: P, fin: bool, maintenant: u64, e: &mut Effets) {
+    fn recevoir_texte(&mut self, t: &Tcp, seq: u32, mut charge: P, fin: bool, maintenant: u64, e: &mut Effets) {
         let n = charge.octets().len() as u32;
         let fin_seq = seq.wrapping_add(n + u32::from(fin));
         if fin_seq == seq {
             return;
         }
         self.dsack = None;
-        let wnd = self.rcv_wnd();
+        let wnd = self.fenetre_restante();
         if seq == self.rcv_nxt {
             // Dans l'ordre. Une fenêtre fermée ne laisse passer qu'un FIN
             // seul (« Some stacks are known to send bare FIN packets in a
@@ -2505,61 +2521,28 @@ impl<P: Charge> Tcb<P> {
             }
             charge.avancer(self.rcv_nxt.wrapping_sub(seq) as usize);
         } else {
-            // Un trou devant : la file hors d'ordre (le FIN attend que le
-            // trou se comble) ; l'ACK dupliqué le dit à l'émetteur
-            // (`verifier_ack`). La même borne que dans l'ordre (plus bas) ;
-            // au-delà, jeté ; et rien au-delà de la limite de toute la machine.
-            self.ack.programme = true;
-            if self.memoire != Memoire::Limite && self.taille_vraie_reception + self.hors_ordre.taille_vraie + charge.taille_vraie() <= 2 * self.rcvbuf {
-                let premier = self.hors_ordre.vide();
-                let doublon = self.hors_ordre.ranger(seq, charge);
-                if self.sack_ok {
-                    if premier {
-                        self.blocs[0] = (seq, fin_seq);
-                        self.nb_blocs = 1;
-                    } else {
-                        if let Some((d, f)) = doublon {
-                            self.poser_doublon(d, f);
-                        }
-                        self.nouveau_bloc(seq, fin_seq);
-                    }
-                }
-            }
-            if fin {
-                self.fin_hors_ordre = Some(fin_seq.wrapping_sub(1));
-            }
+            self.recevoir_hors_ordre(t, seq, charge, fin, fin_seq);
             return;
         }
-        let longueur = charge.octets().len() as u32;
-        if longueur > 0 {
-            // La fenêtre annoncée est une promesse : ce qui y tient est gardé,
-            // même si sa taille vraie dépasse un peu SO_RCVBUF (de petits
-            // segments occupent plus que prévu : Linux les recopie alors en
-            // gros blocs, le « collapse » de `tcp_prune_queue`, que nous
-            // n'avons pas). Au-delà du double de SO_RCVBUF, la mémoire prime :
-            // d'abord la file hors d'ordre, par la fin
-            // (`tcp_prune_ofo_queue`), puis le segment lui-même.
-            while self.taille_vraie_reception + self.hors_ordre.taille_vraie + charge.taille_vraie() > 2 * self.rcvbuf {
-                self.nb_blocs = 0;
-                if !self.hors_ordre.jeter_la_derniere() {
-                    self.ack_maintenant = true;
-                    return;
-                }
-            }
-            // Au-delà de la limite de toute la machine : gardé seulement si la
-            // file de lecture est vide (la connexion doit pouvoir avancer), la
-            // file hors d'ordre rendue d'abord (`tcp_prune_ofo_queue`).
-            if self.memoire == Memoire::Limite && !self.reception.is_empty() {
-                while self.hors_ordre.jeter_la_derniere() {}
-                self.nb_blocs = 0;
-                self.ack_maintenant = true;
+        let vraie = charge.taille_vraie();
+        // La mémoire (reception.rs) : malgré tout ce qu'on sait faire, pas de place :
+        // une fenêtre nulle, tout de suite ; le segment n'est gardé que s'il ne reste
+        // rien à lire, ou qu'il ne porte rien : la connexion doit pouvoir avancer.
+        if !self.reserver_reception(seq, n as usize) {
+            self.ack.sans_memoire = true;
+            self.ack.urgent = true;
+            self.ack.programme = true;
+            e.lisible = true;
+            if !self.reception.is_empty() && n > 0 {
                 return;
             }
+        }
+        if !charge.octets().is_empty() {
             if !self.ajouter_recu(charge) {
                 self.ack_maintenant = true;
                 return;
             }
-            self.donnees_recues(longueur, maintenant);
+            self.donnees_recues(t, n, vraie, maintenant);
             e.lisible = true;
         }
         if fin {
@@ -2583,6 +2566,41 @@ impl<P: Charge> Tcb<P> {
         }
         if self.nb_blocs > 0 {
             self.retirer_blocs();
+        }
+    }
+
+    /// Un trou devant (`tcp_data_queue_ofo`) : la file hors d'ordre (le FIN attend
+    /// que le trou se comble) ; l'ACK dupliqué le dit à l'émetteur (`verifier_ack`).
+    /// La fenêtre ne grandit que pour un pair SACK : à un autre, il faut les ACK
+    /// dupliqués, que la fenêtre qui bouge empêcherait de compter.
+    fn recevoir_hors_ordre(&mut self, t: &Tcp, seq: u32, charge: P, fin: bool, fin_seq: u32) {
+        let n = charge.octets().len() as u32;
+        if !self.reserver_reception(seq, n as usize) {
+            return;
+        }
+        let vraie = charge.taille_vraie();
+        self.mesurer_rcv_mss(n, vraie, t);
+        self.ack.programme = true;
+        let premier = self.hors_ordre.vide();
+        // Plus de mémoire : jeté, et surtout pas annoncé : l'émetteur le croirait arrivé.
+        let Ok(doublon) = self.hors_ordre.ranger(seq, charge) else { return };
+        if self.sack_ok {
+            if premier {
+                self.blocs[0] = (seq, fin_seq);
+                self.nb_blocs = 1;
+            } else {
+                if let Some((d, f)) = doublon {
+                    self.poser_doublon(d, f);
+                }
+                self.nouveau_bloc(seq, fin_seq);
+            }
+            self.agrandir_fenetre(n, vraie);
+        }
+        if self.attachee {
+            self.rcvbuf_suit(self.espace.octets);
+        }
+        if fin {
+            self.fin_hors_ordre = Some(fin_seq.wrapping_sub(1));
         }
     }
 
@@ -2645,12 +2663,11 @@ impl<P: Charge> Tcb<P> {
     // --- Les ACK retardés ---
 
     /// Des données sont arrivées (`tcp_event_data_recv`, avec
-    /// `tcp_measure_rcv_mss`) : l'`ato` suit l'écart entre les arrivées.
-    fn donnees_recues(&mut self, longueur: u32, maintenant: u64) {
+    /// `tcp_measure_rcv_mss`) : l'`ato` suit l'écart entre les arrivées ;
+    /// et la fenêtre peut grandir, pour tout segment qui n'est pas minuscule.
+    fn donnees_recues(&mut self, t: &Tcp, longueur: u32, vraie: usize, maintenant: u64) {
         self.ack.programme = true;
-        if longueur >= self.ack.rcv_mss {
-            self.ack.rcv_mss = longueur.min(self.mss_local as u32);
-        }
+        self.mesurer_rcv_mss(longueur, vraie, t);
         self.rtt_reception_fenetre(maintenant);
         if self.ack.ato == 0 {
             // Les premières données : le mode « quickack ».
@@ -2668,12 +2685,15 @@ impl<P: Charge> Tcb<P> {
             }
         }
         self.ack.lrcvtime = maintenant;
+        if longueur >= 128 {
+            self.agrandir_fenetre(longueur, vraie);
+        }
     }
 
     /// Des ACK immédiats en plus (`tcp_incr_quickack`) : de quoi couvrir
     /// la moitié de la fenêtre annoncée, au moins 2, au plus 16.
     fn ajouter_ack_rapides(&mut self) {
-        let mut n = self.rcv_wnd() / (2 * self.ack.rcv_mss.max(1));
+        let mut n = self.rcv_wnd / (2 * self.ack.rcv_mss.max(1));
         if n == 0 {
             n = 2;
         }
@@ -2702,11 +2722,12 @@ impl<P: Charge> Tcb<P> {
         if !self.ack.programme || self.ack_maintenant {
             return;
         }
-        let recus = self.rcv_nxt.wrapping_sub(self.ack.rcv_wup);
-        // La fenêtre qu'on annoncerait maintenant ne recule pas sur la
-        // dernière annoncée (`__tcp_select_window(sk) >= tp->rcv_wnd`).
-        let fenetre_avance = self.fenetre_possible() >= self.ack.fenetre;
-        if (recus > self.ack.rcv_mss && fenetre_avance) || self.ack.rapide() || self.ack.urgent {
+        let recus = self.rcv_nxt.wrapping_sub(self.rcv_wup);
+        // Pas assez à lire pour SO_RCVLOWAT : l'autre doit continuer ; sinon, seulement
+        // si le bord droit avance : la fenêtre qu'on annoncerait maintenant ne recule
+        // pas sur la dernière (la lecture enverra l'ACK, sinon).
+        let plein = recus > self.ack.rcv_mss && (self.rcv_nxt.wrapping_sub(self.rcv_lu) < self.rcvlowat || self.choisir_fenetre() >= self.rcv_wnd);
+        if plein || self.ack.rapide() || self.ack.urgent {
             self.ack_maintenant = true;
             return;
         }
@@ -2772,13 +2793,13 @@ impl<P: Charge> Tcb<P> {
         }
         self.ack.programme = false;
         self.ack.urgent = false;
+        self.ack.sans_memoire = false;
+        self.ack.pousse = 0;
         self.ack.t = None;
         self.ack_maintenant = false;
         self.ack_comprimes = 0;
         self.t_comprime = None;
         self.dsack = None;
-        self.ack.rcv_wup = self.rcv_nxt;
-        self.ack.fenetre = self.rcv_wnd();
     }
 
     // --- Les erreurs du réseau ---
@@ -3081,15 +3102,21 @@ impl<P: Charge> Tcb<P> {
 
     // --- Ce qu'il faut envoyer ---
 
-    /// L'en-tête d'un segment de cette connexion.
-    fn entete(&self, seq: u32, drapeaux: u8) -> Tcp {
+    /// L'en-tête d'un segment de cette connexion ; sa fenêtre, comme `__tcp_transmit_skb` :
+    /// celle du SYN, jamais décalée ; sinon choisie à l'instant (`tcp_select_window`).
+    pub(super) fn entete(&mut self, seq: u32, drapeaux: u8) -> Tcp {
+        let fenetre = if drapeaux & tcp::SYN != 0 { self.rcv_wnd.min(FENETRE_MAX) as u16 } else { self.fenetre_a_annoncer() };
+        self.entete_avec(seq, drapeaux, fenetre)
+    }
+
+    fn entete_avec(&self, seq: u32, drapeaux: u8, fenetre: u16) -> Tcp {
         let mut h = Tcp {
             source: self.port_local,
             destination: self.port_distant,
             seq,
             ack: if drapeaux & tcp::ACK != 0 { self.rcv_nxt } else { 0 },
             drapeaux,
-            fenetre: if drapeaux & tcp::SYN != 0 { self.fenetre_possible().min(FENETRE_MAX) as u16 } else { self.fenetre() },
+            fenetre,
             urgent: 0,
             options: tcp::Options { horodatage: self.ts.map(|ts| (ts.valeur(self.heure), ts.recent)), ..tcp::Options::default() },
         };
@@ -3143,7 +3170,8 @@ impl<P: Charge> Tcb<P> {
         if avec_fin {
             drapeaux |= tcp::FIN;
         }
-        sortir(Sortant { entete: self.entete(self.snd_nxt, drapeaux), debut, longueur: n });
+        let h = self.entete(self.snd_nxt, drapeaux);
+        sortir(Sortant { entete: h, debut, longueur: n });
         let fin_segment = self.snd_nxt.wrapping_add(n as u32 + u32::from(avec_fin));
         if n < self.mss_courant() as usize {
             // Un petit segment (`tcp_minshall_update`).
@@ -3177,12 +3205,15 @@ impl<P: Charge> Tcb<P> {
     pub fn emettre(&mut self, maintenant: u64, mut sortir: impl FnMut(Sortant)) {
         self.heure = maintenant;
         if let Some((seq, ack, drapeaux)) = self.rst_du.take() {
-            let mut h = self.entete(seq, drapeaux);
+            // Un RST qui coupe la connexion est un segment comme un autre
+            // (`tcp_send_active_reset`) ; celui qui répond à un segment refusé n'a
+            // ni fenêtre ni options (`tcp_v4_send_reset`).
+            let mut h = if core::mem::take(&mut self.rst_actif) {
+                self.entete(seq, drapeaux)
+            } else {
+                Tcp { options: tcp::Options::default(), ..self.entete_avec(seq, drapeaux, 0) }
+            };
             h.ack = ack;
-            h.fenetre = 0;
-            if !core::mem::take(&mut self.rst_actif) {
-                h.options = tcp::Options::default();
-            }
             sortir(Sortant { entete: h, debut: 0, longueur: 0 });
             if self.etat == Etat::Fermee {
                 return;
@@ -3191,10 +3222,17 @@ impl<P: Charge> Tcb<P> {
         if self.etat == Etat::Fermee {
             return;
         }
-        self.annoncer();
         if self.syn_du {
             self.syn_du = false;
             let drapeaux = if self.etat == Etat::SynRecu { tcp::SYN | tcp::ACK } else { tcp::SYN };
+            if !core::mem::replace(&mut self.fenetre_posee, true) {
+                // TCP_MAXSEG borne ce qu'on annonce, et tout ce qui en découle (`tcp_mss_clamp`).
+                self.mss_local = self.mss_annonce();
+                // `tcp_openreq_init_rwin` : les options de la fille comptent ;
+                // `tcp_connect_init` : pas encore, sauf reprise d'un TIME_WAIT.
+                let options = if self.fille { self.ts.is_some() } else { self.ts.is_some_and(|t| t.instant != 0) };
+                self.fenetre_initiale((self.mss_annonce() as u32).saturating_sub(if options { TS_ALIGNE as u32 } else { 0 }));
+            }
             let mut h = self.entete(self.iss, drapeaux);
             h.options.mss = Some(self.mss_annonce());
             h.options.sack_permis = self.sack_ok;
@@ -3232,7 +3270,8 @@ impl<P: Charge> Tcb<P> {
             // un segment inacceptable) ; en SYN_SENT, on ne sait encore rien
             // à acquitter.
             if self.etat == Etat::SynRecu && self.ack_maintenant {
-                sortir(Sortant { entete: self.entete(self.seq_acceptable(), tcp::ACK), debut: 0, longueur: 0 });
+                let h = self.entete(self.seq_acceptable(), tcp::ACK);
+                sortir(Sortant { entete: h, debut: 0, longueur: 0 });
                 self.ack_envoye();
             }
             return;
@@ -3251,7 +3290,8 @@ impl<P: Charge> Tcb<P> {
                 let avec_fin = self.fin_seq().is_some_and(|f| !apres(self.snd_nxt, f)) && n == reste && (n as u32) < fenetre;
                 self.envoyer_donnees(n, avec_fin, maintenant, &mut sortir);
             } else {
-                sortir(Sortant { entete: self.entete(self.snd_una.wrapping_sub(1), tcp::ACK), debut: 0, longueur: 0 });
+                let h = self.entete(self.snd_una.wrapping_sub(1), tcp::ACK);
+                sortir(Sortant { entete: h, debut: 0, longueur: 0 });
                 self.ack_envoye();
             }
         }
@@ -3279,7 +3319,8 @@ impl<P: Charge> Tcb<P> {
         }
         self.envoyer_neuf(maintenant, &mut sortir);
         if self.ack_maintenant {
-            sortir(Sortant { entete: self.entete(self.seq_acceptable(), tcp::ACK), debut: 0, longueur: 0 });
+            let h = self.entete(self.seq_acceptable(), tcp::ACK);
+            sortir(Sortant { entete: h, debut: 0, longueur: 0 });
             self.ack_envoye();
         }
         if core::mem::take(&mut self.place_a_voir) {

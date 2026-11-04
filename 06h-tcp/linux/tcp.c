@@ -34,7 +34,9 @@
  *     un `connect` qui reprend le quadruplet d'un TIME_WAIT.
  *   - TCP_CONGESTION (cubic, reno, les refus, l'héritage par une fille) ;
  *     le débit calculé (`tcpi_pacing_rate`) ; SO_SNDBUF qui ne grandit que pour
- *     un programme qui attend de la place.
+ *     un programme qui attend de la place ;
+ *   - la réception qui s'ajuste : les fenêtres du SYN et du SYN-ACK, SO_RCVBUF qui
+ *     suit le débit, TCP_WINDOW_CLAMP, SO_RCVLOWAT.
  * Rien ne compare de valeur qui dépend de la configuration de Linux (le
  * MSS sur lo, SO_SNDBUF agrandi). Sur l'hôte comme chez nous. Les délais sont
  * des multiples de 4 ms (le tic de l'hôte : HZ = 250).
@@ -1237,6 +1239,126 @@ static void sndbuf_seulement_si_plein(void)
     close(c);
 }
 
+/* La réception qui s'ajuste : la fenêtre du SYN (`tcp_select_initial_window`), vue
+ * de l'autre côté : 65 495 (65 536 arrondis au MSS annoncé), 65 483 pour la fille ;
+ * SO_RCVBUF qui suit le débit d'un programme qui lit, `tcpi_rcv_ssthresh` et
+ * `tcpi_rcv_space` qui grandissent ; pas avec SO_RCVBUF fixé. */
+static uint32_t champ(int s, int decalage)
+{
+    unsigned char b[248];
+    socklen_t lb = sizeof b;
+    uint32_t v = 0;
+    getsockopt(s, IPPROTO_TCP, TCP_INFO, b, &lb);
+    memcpy(&v, b + decalage, 4);
+    return v;
+}
+
+#define TCPI_RCV_SSTHRESH 64
+#define TCPI_RCV_SPACE 96
+#define TCPI_SND_WND 228
+#define TCPI_RCV_WND 232
+
+static void *lire_tout(void *p)
+{
+    int a = *(int *)p;
+    static char b[1 << 20];
+    while (read(a, b, sizeof b) > 0)
+        ;
+    return NULL;
+}
+
+static void reception_qui_s_ajuste(void)
+{
+    int port, l = ecoute(&port, 2);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in x = lo(port);
+    connect(c, (void *)&x, sizeof x);
+    int a = accept(l, NULL, NULL);
+    verifier(champ(c, TCPI_SND_WND) == 65483, "lo : le SYN-ACK annonce 65 483");
+    verifier(champ(a, TCPI_SND_WND) == 65536, "lo : le premier ACK du client annonce 65 536");
+    verifier(champ(c, TCPI_RCV_SSTHRESH) == 65495 && champ(a, TCPI_RCV_SSTHRESH) == 65483, "lo : tcpi_rcv_ssthresh 65 495, et 65 483 pour la fille");
+    verifier(champ(c, TCPI_RCV_SPACE) == 65495 && champ(a, TCPI_RCV_SPACE) == 65483, "lo : tcpi_rcv_space de meme");
+    int rcvbuf = option(a, SOL_SOCKET, SO_RCVBUF), ss = champ(a, TCPI_RCV_SSTHRESH), esp = champ(a, TCPI_RCV_SPACE);
+    pthread_t t;
+    pthread_create(&t, NULL, lire_tout, &a);
+    static char b[1 << 20];
+    int ok = 1;
+    for (int i = 0; i < 64; i++)
+        ok &= write(c, b, sizeof b) == sizeof b;
+    shutdown(c, SHUT_WR);
+    pthread_join(t, NULL);
+    verifier(ok && option(a, SOL_SOCKET, SO_RCVBUF) > rcvbuf, "64 Mio lus : SO_RCVBUF a grandi");
+    verifier((int)champ(a, TCPI_RCV_SSTHRESH) > ss && (int)champ(a, TCPI_RCV_SPACE) > esp, "tcpi_rcv_ssthresh et tcpi_rcv_space ont grandi");
+    close(a);
+    close(c);
+    /* SO_RCVBUF fixé (sur l'écoute, avant l'accept) : il ne bouge pas. */
+    int v = 65536;
+    setsockopt(l, SOL_SOCKET, SO_RCVBUF, &v, sizeof v);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&x, sizeof x);
+    a = accept(l, NULL, NULL);
+    rcvbuf = option(a, SOL_SOCKET, SO_RCVBUF);
+    pthread_create(&t, NULL, lire_tout, &a);
+    for (int i = 0; i < 16; i++)
+        ok &= write(c, b, sizeof b) == sizeof b;
+    shutdown(c, SHUT_WR);
+    pthread_join(t, NULL);
+    verifier(ok && rcvbuf == 131072 && option(a, SOL_SOCKET, SO_RCVBUF) == rcvbuf, "SO_RCVBUF fixe : il ne bouge pas");
+    close(a);
+    close(c);
+    close(l);
+}
+
+/* TCP_WINDOW_CLAMP (`tcp_set_window_clamp`, mesuré) : 0 sur une socket neuve, écrit
+ * tel quel, au moins 1152 ; 0 refusé hors de TCP_CLOSE ; hérité par une fille, et la
+ * fenêtre de son SYN-ACK le suit. */
+static void window_clamp(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(option(s, IPPROTO_TCP, TCP_WINDOW_CLAMP) == 0, "TCP_WINDOW_CLAMP d'une socket neuve : 0");
+    int v = 100;
+    verifier(setsockopt(s, IPPROTO_TCP, TCP_WINDOW_CLAMP, &v, sizeof v) == 0 && option(s, IPPROTO_TCP, TCP_WINDOW_CLAMP) == 1152, "TCP_WINDOW_CLAMP 100 : 1152");
+    v = -5;
+    verifier(setsockopt(s, IPPROTO_TCP, TCP_WINDOW_CLAMP, &v, sizeof v) == 0 && option(s, IPPROTO_TCP, TCP_WINDOW_CLAMP) == 1152, "TCP_WINDOW_CLAMP negatif : 1152");
+    v = 0;
+    verifier(setsockopt(s, IPPROTO_TCP, TCP_WINDOW_CLAMP, &v, sizeof v) == 0 && option(s, IPPROTO_TCP, TCP_WINDOW_CLAMP) == 0, "TCP_WINDOW_CLAMP 0 d'une socket fermee : 0");
+    close(s);
+    int port, l = ecoute(&port, 2);
+    v = 0;
+    verifier(erreur(setsockopt(l, IPPROTO_TCP, TCP_WINDOW_CLAMP, &v, sizeof v)) == EINVAL, "TCP_WINDOW_CLAMP 0 d'une ecoute : EINVAL");
+    v = 20000;
+    setsockopt(l, IPPROTO_TCP, TCP_WINDOW_CLAMP, &v, sizeof v);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in x = lo(port);
+    connect(c, (void *)&x, sizeof x);
+    int a = accept(l, NULL, NULL);
+    verifier(option(a, IPPROTO_TCP, TCP_WINDOW_CLAMP) == 20000, "la fille de l'ecoute : TCP_WINDOW_CLAMP 20 000");
+    verifier(champ(c, TCPI_SND_WND) == 20000, "son SYN-ACK annonce 20 000");
+    v = 0;
+    verifier(erreur(setsockopt(a, IPPROTO_TCP, TCP_WINDOW_CLAMP, &v, sizeof v)) == EINVAL, "TCP_WINDOW_CLAMP 0 d'une connexion : EINVAL");
+    close(a);
+    close(c);
+    close(l);
+}
+
+/* SO_RCVLOWAT de TCP (`tcp_set_rcvlowat`) : au plus la moitié de `tcp_rmem[2]`, et
+ * SO_RCVBUF grandit pour le tenir ; 0 vaut 1 ; négatif : le plafond. */
+static void rcvlowat(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int v = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVLOWAT, &v, sizeof v);
+    verifier(option(s, SOL_SOCKET, SO_RCVLOWAT) == 1, "SO_RCVLOWAT 0 : 1");
+    int rcvbuf = option(s, SOL_SOCKET, SO_RCVBUF);
+    v = 200000;
+    setsockopt(s, SOL_SOCKET, SO_RCVLOWAT, &v, sizeof v);
+    verifier(option(s, SOL_SOCKET, SO_RCVLOWAT) == 200000 && option(s, SOL_SOCKET, SO_RCVBUF) >= 400000 && rcvbuf < 400000, "SO_RCVLOWAT 200 000 : SO_RCVBUF grandit pour le tenir");
+    v = -1;
+    setsockopt(s, SOL_SOCKET, SO_RCVLOWAT, &v, sizeof v);
+    verifier(option(s, SOL_SOCKET, SO_RCVLOWAT) > 200000, "SO_RCVLOWAT negatif : la moitie de tcp_rmem[2]");
+    close(s);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1267,6 +1389,9 @@ int main(void)
     congestion();
     debit_calcule();
     sndbuf_seulement_si_plein();
+    reception_qui_s_ajuste();
+    window_clamp();
+    rcvlowat();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

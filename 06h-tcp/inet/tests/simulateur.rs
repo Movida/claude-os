@@ -52,6 +52,12 @@ impl Charge for Octets {
     fn taille_vraie(&self) -> usize {
         2 * self.0.len() + 64
     }
+    fn neuve(n: usize) -> Option<Octets> {
+        Some(Octets(Vec::with_capacity(n), 0))
+    }
+    fn completer(&mut self, o: &[u8]) {
+        self.0.extend_from_slice(o);
+    }
 }
 
 type Connexion = Tcb<Octets>;
@@ -289,7 +295,7 @@ impl Simulation {
             })
             .unwrap();
             cote.lus = i;
-            c.lu();
+            c.lu(i - debut, heure);
             fait = i > debut;
         }
         if c.fin_recue() && c.lisibles() == 0 && !cote.fin_vue {

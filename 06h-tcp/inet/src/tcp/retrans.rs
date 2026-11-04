@@ -964,7 +964,8 @@ impl<P: Charge> Tcb<P> {
         let e = self.file[i];
         self.total_retrans += 1;
         let debut = e.seq.wrapping_sub(self.seq_envoi) as usize;
-        sortir(Sortant { entete: self.entete(e.seq, e.drapeaux), debut, longueur: e.longueur() as usize });
+        let h = self.entete(e.seq, e.drapeaux);
+        sortir(Sortant { entete: h, debut, longueur: e.longueur() as usize });
         self.file[i].envoi = maintenant;
         self.file[i].marques = (self.file[i].marques | DEJA_RENVOYE) & !COMPTE;
         self.file[i].livres_tx = self.livres;

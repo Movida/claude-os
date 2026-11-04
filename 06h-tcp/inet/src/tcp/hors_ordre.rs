@@ -17,6 +17,7 @@
 
 use super::{Charge, apres, avant};
 use alloc::collections::VecDeque;
+use alloc::vec::Vec;
 
 pub struct HorsOrdre<P> {
     /// (numéro du premier octet, charge), triées, sans recouvrement.
@@ -64,13 +65,17 @@ impl<P: Charge> HorsOrdre<P> {
 
     /// Range `charge`, dont le premier octet porte le numéro `seq` ; rend le
     /// doublon qu'elle contenait, à dire par D-SACK (`tcp_data_queue_ofo`).
-    /// Si la mémoire manque, la charge est jetée : l'émetteur la renverra.
-    pub fn ranger(&mut self, mut seq: u32, mut charge: P) -> Option<(u32, u32)> {
+    /// Si la mémoire manque, la charge est jetée, et Err le dit : l'émetteur la renverra, pourvu
+    /// qu'on ne la lui ait pas annoncée.
+    pub fn ranger(&mut self, mut seq: u32, mut charge: P) -> Result<Option<(u32, u32)>, ()> {
         let debut = seq;
         let fin_charge = seq.wrapping_add(charge.octets().len() as u32);
         let mut doublon = None;
-        if charge.octets().is_empty() || self.file.try_reserve(1).is_err() {
-            return None;
+        if charge.octets().is_empty() {
+            return Ok(None);
+        }
+        if self.file.try_reserve(1).is_err() {
+            return Err(());
         }
         // La première charge rangée qui finit après le début de la nôtre.
         let mut i = self.file.iter().position(|e| apres(fin(e), seq)).unwrap_or(self.file.len());
@@ -81,7 +86,7 @@ impl<P: Charge> HorsOrdre<P> {
             // entier, rien de neuf.
             let f = fin(e);
             if !apres(fin_charge, f) {
-                return Some((debut, fin_charge));
+                return Ok(Some((debut, fin_charge)));
             }
             doublon = Some((debut, f));
             charge.avancer(f.wrapping_sub(seq) as usize);
@@ -111,7 +116,7 @@ impl<P: Charge> HorsOrdre<P> {
         self.taille_vraie += charge.taille_vraie();
         // La place est prise plus haut.
         self.file.insert(i, (seq, charge));
-        doublon
+        Ok(doublon)
     }
 
     /// La prochaine charge qui commence au plus tard à `rcv_nxt` (le trou
@@ -141,16 +146,100 @@ impl<P: Charge> HorsOrdre<P> {
         }
     }
 
+    /// Le numéro de la charge la plus lointaine, et celui qui la suit (`ooo_last_skb`).
+    pub fn derniere_seq(&self) -> Option<u32> {
+        self.file.back().map(|e| e.0)
+    }
+
+    pub fn derniere_fin(&self) -> Option<u32> {
+        self.file.back().map(fin)
+    }
+
     /// Jette la charge la plus lointaine, pour faire de la place à ce qui
-    /// arrive dans l'ordre (`tcp_prune_ofo_queue`) ; faux : il n'y avait
-    /// rien.
-    pub fn jeter_la_derniere(&mut self) -> bool {
+    /// arrive dans l'ordre (`tcp_prune_ofo_queue`) ; rend sa taille vraie (0 :
+    /// il n'y avait rien).
+    pub fn jeter_la_derniere(&mut self) -> usize {
         match self.file.pop_back() {
             Some((_, p)) => {
-                self.taille_vraie = self.taille_vraie.saturating_sub(p.taille_vraie());
-                true
+                let v = p.taille_vraie();
+                self.taille_vraie = self.taille_vraie.saturating_sub(v);
+                v
             }
-            None => false,
+            None => 0,
+        }
+    }
+
+    /// `tcp_collapse_ofo_queue` : chaque suite sans trou recopiée en paquets denses
+    /// de `taille` octets, à partir de son premier paquet de mauvais rendement (d'après
+    /// `ratio`). Une suite d'un seul petit paquet n'y gagnerait rien, et s'il y en a
+    /// beaucoup (plus de `limite` en taille vraie), la mémoire n'est pas là : on s'arrête.
+    pub fn fondre(&mut self, taille: usize, limite: usize, ratio: u8) {
+        let mut petits = 0;
+        let mut i = 0;
+        while i < self.file.len() {
+            let debut = self.file[i].0;
+            let mut bout = fin(&self.file[i]);
+            let mut vraie = self.file[i].1.taille_vraie();
+            let mut j = i + 1;
+            while let Some(e) = self.file.get(j) {
+                if apres(e.0, bout) {
+                    break;
+                }
+                vraie += e.1.taille_vraie();
+                bout = fin(e);
+                j += 1;
+            }
+            if j > i + 1 || bout.wrapping_sub(debut) as usize >= taille {
+                let avant_ = self.file.len();
+                self.recopier(i, j, taille, ratio);
+                // Toute la suite occupe maintenant moins, ou autant, de places.
+                i = (j + self.file.len()).saturating_sub(avant_);
+            } else {
+                petits += vraie;
+                if petits > limite {
+                    return;
+                }
+                i = j;
+            }
+        }
+    }
+
+    /// Recopie les entrées `i..j`, à partir de la première de mauvais rendement.
+    fn recopier(&mut self, i: usize, j: usize, taille: usize, ratio: u8) {
+        let gaspille = |p: &P| ((p.taille_vraie() as i64 * ratio as i64) >> 8) > p.octets().len() as i64;
+        let Some(premier) = (i..j).find(|&k| gaspille(&self.file[k].1)) else { return };
+        let total: usize = (premier..j).map(|k| self.file[k].1.octets().len()).sum();
+        let mut seq = self.file[premier].0;
+        let mut neuves: Vec<(u32, P)> = Vec::new();
+        if neuves.try_reserve(total.div_ceil(taille)).is_err() || self.file.try_reserve(total.div_ceil(taille)).is_err() {
+            return;
+        }
+        let (mut k, mut decalage, mut reste) = (premier, 0, total);
+        while reste > 0 {
+            let n = reste.min(taille);
+            let Some(mut neuve) = P::neuve(n) else { return };
+            let mut fait = 0;
+            while fait < n {
+                let o = &self.file[k].1.octets()[decalage..];
+                let m = o.len().min(n - fait);
+                neuve.completer(&o[..m]);
+                fait += m;
+                decalage += m;
+                if decalage == self.file[k].1.octets().len() {
+                    k += 1;
+                    decalage = 0;
+                }
+            }
+            neuves.push((seq, neuve));
+            seq = seq.wrapping_add(n as u32);
+            reste -= n;
+        }
+        for (_, p) in self.file.drain(premier..j) {
+            self.taille_vraie = self.taille_vraie.saturating_sub(p.taille_vraie());
+        }
+        for (n, e) in neuves.into_iter().enumerate() {
+            self.taille_vraie += e.1.taille_vraie();
+            self.file.insert(premier + n, e);
         }
     }
 

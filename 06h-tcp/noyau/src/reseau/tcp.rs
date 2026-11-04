@@ -62,7 +62,7 @@ use crate::tache::Reveil;
 use crate::verrou::Verrou;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use formats::reseau::ipv4 as fipv4;
 use formats::reseau::tcp::{self as ftcp, Tcp};
 use inet::ports_tcp::{self, Destinataire, Lien, Sorte};
@@ -115,6 +115,14 @@ impl Charge for Paquet {
     fn taille_vraie(&self) -> usize {
         Paquet::taille_vraie(self)
     }
+    fn neuve(n: usize) -> Option<Paquet> {
+        Paquet::vide(n)
+    }
+    fn completer(&mut self, o: &[u8]) {
+        if let Some(d) = self.ajouter_fin(o.len()) {
+            d.copy_from_slice(o);
+        }
+    }
 }
 
 /// À qui va un segment, dans la table des ports.
@@ -149,10 +157,15 @@ static TABLE: Verrou<Option<ports_tcp::Table<Cible>>> = Verrou::new(None);
 /// programme ordinaire, ouvrant des connexions qu'il ne lit pas, ferait
 /// garder toute la mémoire de la machine au noyau.
 static MEMOIRE: AtomicUsize = AtomicUsize::new(0);
-/// Ses seuils (`tcp_mem[0]` et `tcp_mem[2]`), posés au démarrage : 4,7 % et
-/// 9,4 % de la mémoire. (`tcp_mem[1]`, la « pression » de Linux, borne
-/// aussi la croissance des fenêtres, que nous n'ajustons pas : un écart.)
-static SEUILS: [AtomicUsize; 2] = [AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX)];
+/// Ses seuils (`tcp_mem`), posés au démarrage : 4,7 %, 6,25 % et 9,4 % de la
+/// mémoire.
+static SEUILS: [AtomicUsize; 3] = [AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX), AtomicUsize::new(usize::MAX)];
+/// La pression (`tcp_memory_pressure`) : entrée au-delà du deuxième seuil, sortie
+/// seulement sous le premier (une hystérésis : la mémoire qui hésite autour d'un
+/// seuil ne ferait pas battre les fenêtres de toutes les connexions).
+static PRESSION: AtomicBool = AtomicBool::new(false);
+/// Les sockets TCP vivantes (`tcp_sockets_allocated`), pour la juste part de chacune.
+static SOCKETS: AtomicUsize = AtomicUsize::new(0);
 /// Les plafonds des tampons d'une connexion que la machine permet
 /// (`tcp_rmem[2]`, `tcp_wmem[2]`), posés au démarrage. L'échelle de fenêtre
 /// que proposent les connexions dépend du premier (et de `rmem_max`,
@@ -166,17 +179,35 @@ fn reception_max() -> usize {
     RECEPTION_MAX.load(Ordering::Relaxed).max(socket::TAMPON_MAX as usize)
 }
 
-/// Où en est la mémoire de TCP de toute la machine.
+/// Où en est la mémoire de TCP de toute la machine (`__sk_mem_raise_allocated`,
+/// `__sk_mem_reduce_allocated`).
 fn niveau_memoire() -> itcp::Memoire {
     let m = MEMOIRE.load(Ordering::Relaxed);
-    if m >= SEUILS[1].load(Ordering::Relaxed) {
+    if m <= SEUILS[0].load(Ordering::Relaxed) {
+        PRESSION.store(false, Ordering::Relaxed);
+    } else if m > SEUILS[1].load(Ordering::Relaxed) {
+        PRESSION.store(true, Ordering::Relaxed);
+    }
+    if m > SEUILS[2].load(Ordering::Relaxed) {
         itcp::Memoire::Limite
-    } else if m >= SEUILS[0].load(Ordering::Relaxed) {
+    } else if PRESSION.load(Ordering::Relaxed) {
         itcp::Memoire::Pression
+    } else if m > SEUILS[0].load(Ordering::Relaxed) {
+        itcp::Memoire::Souple
     } else {
         itcp::Memoire::Libre
     }
 }
+
+/// Le niveau pour une socket qui garde `m` octets : sous pression, celle qui a
+/// plus que sa juste part de la limite se fait refuser ce qui dépasse le minimum
+/// (`__sk_mem_raise_allocated`, « Try to be fair among all the sockets »). `sk_mem_pages`
+/// compte en pages.
+fn niveau_pour(niveau: itcp::Memoire, m: usize) -> itcp::Memoire {
+    let part = SOCKETS.load(Ordering::Relaxed).saturating_mul(m.div_ceil(4096) * 4096);
+    if niveau == itcp::Memoire::Pression && SEUILS[2].load(Ordering::Relaxed) <= part { itcp::Memoire::Excedent } else { niveau }
+}
+
 static TW: Verrou<Vec<TempsAttente>> = Verrou::new(Vec::new());
 /// Les sockets orphelines (fermées par le programme, connexion pas finie) :
 /// le repos du réseau les attend.
@@ -191,10 +222,11 @@ pub fn initialiser() {
     // pas toute la mémoire : l'image et le noyau n'en font pas partie.
     let libres = crate::pages::libres();
     // Les seuils de `tcp_mem` (`tcp_init_mem`) : un seizième de ces pages,
-    // au moins 128 ; 3/4 de cela, puis le double.
+    // au moins 128 ; 3/4 de cela, cela, puis le double du premier.
     let limite = (libres / 16).max(128);
     SEUILS[0].store(limite / 4 * 3 * 4096, Ordering::Relaxed);
-    SEUILS[1].store(limite / 4 * 3 * 2 * 4096, Ordering::Relaxed);
+    SEUILS[1].store(limite * 4096, Ordering::Relaxed);
+    SEUILS[2].store(limite / 4 * 3 * 2 * 4096, Ordering::Relaxed);
     // `tcp_rmem[2]` et `tcp_wmem[2]` (`tcp_init`) : un 128e de ces pages, au
     // plus 32 Mio et 4 Mio, au moins 128 Kio et 64 Kio. Sur la machine de
     // l'étape (2 Gio) : 12 à 15 Mio selon l'image, une échelle de 8.
@@ -336,6 +368,9 @@ pub struct OptionsTcp {
     pub rcvlowat: u32,
     pub ttl: u8,
     pub tos: u8,
+    /// TCP_WINDOW_CLAMP (0 : rien), d'une socket pas encore connectée, et d'une
+    /// écoute : ses filles en héritent (`tcp_openreq_init_rwin`).
+    pub window_clamp: u32,
     /// TCP_CONGESTION : le contrôle de la socket, et de ses filles
     /// (`tcp_ca_openreq_child`).
     pub controle: itcp::Controle,
@@ -348,7 +383,7 @@ impl OptionsTcp {
     pub const DEFAUT: OptionsTcp = OptionsTcp {
         nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
-        rcvbuf_fixe: false, rcvlowat: 1, ttl: 64, tos: 0, controle: itcp::Controle::DEFAUT,
+        rcvbuf_fixe: false, rcvlowat: 1, ttl: 64, tos: 0, window_clamp: 0, controle: itcp::Controle::DEFAUT,
     };
 
     /// Ce que la connexion en retient (TCP_USER_TIMEOUT est en ms, les
@@ -373,6 +408,8 @@ pub struct Premier {
     pub erreur: i32,
     pub place: usize,
     pub sndbuf: usize,
+    /// SO_RCVBUF (la borne de la file `backlog`).
+    pub rcvbuf: usize,
     /// Les filles établies, prêtes pour `accept`, et la longueur de la file d'écoute.
     pub pretes: usize,
     pub file: usize,
@@ -423,18 +460,18 @@ fn taille(a: &Arrivee) -> usize {
 impl Partie {
     /// Le premier étage d'après la partie ; `sndbuf` : SO_SNDBUF d'une
     /// socket sans connexion (une connexion a le sien, qui grandit).
-    fn premier(&self, arret: u8, sndbuf: usize) -> Premier {
-        let (etat, lisibles, fin_recue, erreur, place, sndbuf, urgent, fenetre_basse) = match &self.mode {
-            Mode::Connexion(t) => (Some(t.etat()), t.lisibles_dans_le_flux(), t.fin_recue(), t.erreur(), t.place(), t.sndbuf, t.urgent_a_lire(),
+    fn premier(&self, arret: u8, sndbuf: usize, rcvbuf: usize) -> Premier {
+        let (etat, lisibles, fin_recue, erreur, place, sndbuf, rcvbuf, urgent, fenetre_basse) = match &self.mode {
+            Mode::Connexion(t) => (Some(t.etat()), t.lisibles_dans_le_flux(), t.fin_recue(), t.erreur(), t.place(), t.sndbuf, t.rcvbuf, t.urgent_a_lire(),
                                    t.fenetre_presque_fermee()),
-            _ => (None, 0, false, 0, sndbuf, sndbuf, false, false),
+            _ => (None, 0, false, 0, sndbuf, sndbuf, rcvbuf, false, false),
         };
         let (ecoute, pretes, file) = match &self.mode {
             Mode::Ecoute { filles, backlog } => (true, filles.iter().filter(|f| f.prete()).count(), *backlog),
             _ => (false, 0, 0),
         };
         Premier {
-            etat, ecoute, lisibles, fin_recue, erreur, place, sndbuf, pretes, file, urgent, arret, rcvlowat: self.options.rcvlowat as usize,
+            etat, ecoute, lisibles, fin_recue, erreur, place, sndbuf, rcvbuf, pretes, file, urgent, arret, rcvlowat: self.options.rcvlowat as usize,
             fenetre_basse, sans_place: false,
         }
     }
@@ -442,7 +479,7 @@ impl Partie {
     /// Recopie le premier étage, et rend les événements qui ont changé
     /// (pour réveiller).
     fn rafraichir(&self, court: &mut Premier) -> u32 {
-        let mut neuf = self.premier(court.arret, court.sndbuf);
+        let mut neuf = self.premier(court.arret, court.sndbuf, court.rcvbuf);
         neuf.sans_place = court.sans_place;
         let mut m = 0;
         if neuf.lisibles > court.lisibles || neuf.fin_recue != court.fin_recue || neuf.pretes > court.pretes {
@@ -481,13 +518,13 @@ impl Partie {
         let niveau = niveau_memoire();
         let m = match &mut self.mode {
             Mode::Connexion(t) => {
-                t.memoire = niveau;
+                t.memoire = niveau_pour(niveau, t.memoire());
                 t.memoire()
             }
             Mode::Ecoute { filles, .. } => filles
                 .iter_mut()
                 .map(|f| {
-                    f.tcb.memoire = niveau;
+                    f.tcb.memoire = niveau_pour(niveau, f.tcb.memoire());
                     f.tcb.memoire()
                 })
                 .sum(),
@@ -628,6 +665,11 @@ impl Partie {
     /// table est rendue ; un port choisi par `bind` est gardé
     /// (SOCK_BINDPORT_LOCK), lié de nouveau à son adresse.
     fn redevenir_neuve(&mut self, s: &Arc<Socket>) {
+        // Ce que les tampons sont devenus reste (`tcp_disconnect` n'y touche pas).
+        if let Mode::Connexion(t) = &self.mode {
+            s.rcvbuf.store(t.rcvbuf.min(i32::MAX as usize) as u32, Ordering::Relaxed);
+            s.sndbuf.store(t.sndbuf.min(i32::MAX as usize) as u32, Ordering::Relaxed);
+        }
         if !self.hors_table
             && let Some(t) = TABLE.verrouiller().as_mut()
         {
@@ -669,6 +711,7 @@ impl Drop for Partie {
     fn drop(&mut self) {
         self.oublier_echeance();
         MEMOIRE.fetch_sub(self.memoire_comptee, Ordering::Relaxed);
+        SOCKETS.fetch_sub(1, Ordering::Relaxed);
     }
 }
 
@@ -885,9 +928,15 @@ impl Partie {
         // c'est ainsi qu'un serveur règle ses connexions, et la fenêtre que
         // la fille annonce (son échelle est choisie ici, au SYN).
         let rcvbuf = moi.rcvbuf.load(Ordering::Relaxed) as usize;
-        let echelle = itcp::echelle(rcvbuf, self.options.rcvbuf_fixe, reception_max());
+        let echelle = itcp::echelle(rcvbuf, self.options.rcvbuf_fixe, reception_max(), self.options.window_clamp);
         let mut tcb = Tcb::depuis_syn(&h, iss, mss, rcvbuf, moi.sndbuf.load(Ordering::Relaxed) as usize, echelle);
         tcb.poser_mss_utilisateur(self.options.maxseg);
+        tcb.window_clamp = self.options.window_clamp;
+        tcb.rcvbuf_fixe = self.options.rcvbuf_fixe;
+        tcb.rcvbuf_max = RECEPTION_MAX.load(Ordering::Relaxed);
+        tcb.rcvlowat = self.options.rcvlowat;
+        // Pas de programme encore : `accept` la lui donnera.
+        tcb.attachee = false;
         tcb.decalage_horodatages(decalage_horodatages(s.destination, s.source));
         tcb.reglages = self.options.reglages(false);
         tcb.sndbuf_fixe = self.options.sndbuf_fixe;
@@ -980,7 +1029,7 @@ fn livrer(s: Segment) {
 /// deux fois SO_RCVBUF, plus la moitié de SO_SNDBUF, plus 64 Kio).
 fn vers_socket(sock: &Arc<Socket>, a: Arrivee) {
     let Some(flux) = sock.flux.as_ref() else { return };
-    let limite = 2 * sock.rcvbuf.load(Ordering::Relaxed) as usize + sock.sndbuf.load(Ordering::Relaxed) as usize / 2 + 65_536;
+    let limite = flux.court(|c| 2 * c.rcvbuf + c.sndbuf / 2 + 65_536);
     let t = taille(&a);
     flux.du_reseau(a, t, limite);
 }
@@ -1110,11 +1159,12 @@ pub fn recevoir(source: [u8; 4], destination: [u8; 4], par_lo: bool, mut p: Paqu
 /// Une socket TCP neuve (`tcp_v4_init_sock`) : SO_RCVBUF et SO_SNDBUF de
 /// TCP, son flux.
 pub fn nouvelle(numero: u64) -> Possession<Partie> {
+    SOCKETS.fetch_add(1, Ordering::Relaxed);
     let partie = Partie {
         numero, mode: Mode::Neuve, adresses: Adresses::default(), identifiant: 0, orpheline: false, hors_table: false,
         options: OptionsTcp::DEFAUT, etablie_un_jour: false, connexion_en_cours: false, echeance_armee: None, memoire_comptee: 0,
     };
-    let premier = partie.premier(0, SNDBUF_DEFAUT as usize);
+    let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
     Possession::new(partie, premier)
 }
 
@@ -1323,10 +1373,14 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                     super::tache::armer(n, None);
                 }
                 let rcvbuf = s.rcvbuf.load(Ordering::Relaxed) as usize;
-                let echelle = itcp::echelle(rcvbuf, p.options.rcvbuf_fixe, reception_max());
+                let echelle = itcp::echelle(rcvbuf, p.options.rcvbuf_fixe, reception_max(), p.options.window_clamp);
                 let mut t = Tcb::connecter(port, a.port, iss, mss_vers(destination), rcvbuf, s.sndbuf.load(Ordering::Relaxed) as usize,
                                            echelle);
                 t.mss_utilisateur = p.options.maxseg;
+                t.window_clamp = p.options.window_clamp;
+                t.rcvbuf_fixe = p.options.rcvbuf_fixe;
+                t.rcvbuf_max = RECEPTION_MAX.load(Ordering::Relaxed);
+                t.rcvlowat = p.options.rcvlowat;
                 t.reglages = p.options.reglages(false);
                 t.sndbuf_fixe = p.options.sndbuf_fixe;
                 t.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
@@ -1410,13 +1464,16 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             // Une fille fermée avant l'accept (un RST) a déjà quitté la
             // table : sa lecture dira son erreur.
             let hors_table = f.tcb.etat() == Etat::Fermee;
+            let mut tcb = f.tcb;
+            tcb.attachee = true;
+            SOCKETS.fetch_add(1, Ordering::Relaxed);
             let partie = Partie {
-                numero, mode: Mode::Connexion(f.tcb),
+                numero, mode: Mode::Connexion(tcb),
                 adresses: Adresses { lie: true, adresse: locale, port, port_choisi: false, distante, port_distant, source: locale },
                 identifiant: f.identifiant, orpheline: false, hors_table, options: p.options, etablie_un_jour: true,
                 connexion_en_cours: false, echeance_armee: None, memoire_comptee: 0,
             };
-            let premier = partie.premier(0, SNDBUF_DEFAUT as usize);
+            let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
             let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
             let enfant = place_socket.remplir(enfant.avec_flux(flux));
             enfant.rcvbuf.store(s.rcvbuf.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -1615,7 +1672,7 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
             };
             fait += n;
             let _contexte = contexte::entrer();
-            t.lu();
+            t.lu(n, maintenant());
             p.emettre();
             p.apres();
             drop(_contexte);
@@ -1773,6 +1830,7 @@ pub fn fermer(s: &Arc<Socket>) {
             // Orpheline : personne n'attend plus la fin, elle abandonnera
             // plus tôt (`tcp_orphan_retries`), et plus personne ne lira.
             t.reglages.orpheline = true;
+            t.attachee = false;
             t.fermer_lecture();
             if !p.hors_table {
                 p.orpheline = true;
@@ -1917,6 +1975,36 @@ pub fn sndbuf(s: &Socket) -> u32 {
         Mode::Connexion(t) => t.sndbuf.min(i32::MAX as usize) as u32,
         _ => s.sndbuf.load(Ordering::Relaxed),
     }
+}
+
+/// SO_RCVBUF, qui grandit de même (reception.rs).
+pub fn rcvbuf(s: &Socket) -> u32 {
+    let mut g = flux(s).posseder();
+    match &g.donnee().mode {
+        Mode::Connexion(t) => t.rcvbuf.min(i32::MAX as usize) as u32,
+        _ => s.rcvbuf.load(Ordering::Relaxed),
+    }
+}
+
+/// `tcp_set_rcvlowat` (SO_RCVLOWAT) : borné par la moitié de SO_RCVBUF fixé, sinon de
+/// `tcp_rmem[2]` ; et SO_RCVBUF grandit pour le tenir, sauf s'il est fixé. Rend le seuil.
+pub fn poser_rcvlowat(s: &Socket, v: u32) -> u32 {
+    avec_options(s, |op, t| {
+        let lu = match t {
+            Some(t) => t.poser_rcvlowat(v),
+            None => {
+                let plafond = if op.rcvbuf_fixe { s.rcvbuf.load(Ordering::Relaxed) >> 1 } else { RECEPTION_MAX.load(Ordering::Relaxed) as u32 >> 1 };
+                let val = v.min(plafond);
+                // Le rapport de départ : 50 % (`tcp_space_from_win`).
+                if !op.rcvbuf_fixe && val.saturating_mul(2) > s.rcvbuf.load(Ordering::Relaxed) {
+                    s.rcvbuf.store(val.saturating_mul(2), Ordering::Relaxed);
+                }
+                val.max(1)
+            }
+        };
+        op.rcvlowat = lu;
+        lu
+    })
 }
 
 /// Une ligne de /proc/net/tcp, complétée à 149 colonnes (le `seq_setwidth`
@@ -2083,9 +2171,15 @@ pub fn tampons_changes(s: &Socket, sndbuf_fixe: bool, rcvbuf_fixe: bool) {
         op.sndbuf_fixe |= sndbuf_fixe;
         op.rcvbuf_fixe |= rcvbuf_fixe;
         if let Some(t) = t {
-            t.rcvbuf = r;
-            t.sndbuf = e;
-            t.sndbuf_fixe = op.sndbuf_fixe;
+            // Seulement celui qui a changé : l'autre a pu grandir depuis.
+            if rcvbuf_fixe {
+                t.rcvbuf = r;
+                t.rcvbuf_fixe = true;
+            }
+            if sndbuf_fixe {
+                t.sndbuf = e;
+                t.sndbuf_fixe = true;
+            }
         }
     });
 }
