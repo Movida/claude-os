@@ -66,12 +66,20 @@
 //! (attente.rs) : une socket que personne d'autre ne tient ne recevra
 //! rien.
 //!
-//! ÉCARTS : SCM_RIGHTS et SCM_CREDENTIALS (passer un descripteur, ou ses
-//! droits) attendent 6l (avec `fork`, et le ramasse-miettes des sockets en
-//! vol) : EINVAL, ce que rend `__scm_send` pour un genre inconnu. MSG_OOB
+//! LES DESCRIPTEURS EN VOL (SCM_RIGHTS) : un message tient des fichiers (`fichiers`), rendus à la
+//! lecture : un flux s'arrête après le message qui en porte, MSG_PEEK sur lui (`recevoir_flux`).
+//! Une file qui tient une socket peut la tenir sans fin, dans un cycle : le ramasse-miettes
+//! (`ramasser`, `GRAPHE`, inet::en_vol) les retrouve à chaque fermeture tant qu'il en reste en
+//! vol. Choix de conception : synchrone, à la fin de `fermer`. Linux passe par une file de travail
+//! pour ne pas ralentir `close` : là où il y a des milliers de sockets en vol. Ici, le graphe est
+//! petit ; et « mémoire rendue » n'a pas à attendre qu'il se soit passé quelque chose.
+//!
+//! ÉCARTS : SCM_CREDENTIALS : EINVAL, ce que rend `__scm_send` pour un genre inconnu. MSG_OOB
 //! sur un flux AF_UNIX (Linux l'a depuis 5.15) : EOPNOTSUPP.
 
-use super::socket::{Socket, ARRET_ECRITURE, ARRET_LECTURE, POLLRDHUP};
+use super::socket::{Protocole, Socket, ARRET_ECRITURE, ARRET_LECTURE, POLLRDHUP};
+use crate::appels_fichiers::FichierTenu;
+use crate::descripteurs::{Fichier, Sorte as SorteFichier};
 use crate::attente::{self, FileAttente, GardeMutex, Mutex, PorteFile, Relais, Sommeil};
 use crate::faillible::{self, FileFaillible, VecFaillible};
 use crate::partage::{Arc, Weak};
@@ -82,7 +90,8 @@ use crate::{cpu, processus, temps};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use inet::en_vol::{self, Arete};
 
 pub const AF_UNIX: u16 = 1;
 pub const SOCK_STREAM: u16 = 1;
@@ -103,6 +112,11 @@ const SOMAXCONN: usize = 4096;
 /// en route, et des allocations qui restent petites).
 const MESSAGE_MAX: usize = (4096 - 320) + (32 << 10);
 
+/// La limite d'un envoi (SCM_MAX_FD).
+pub const SCM_MAX_FD: usize = 253;
+/// Au-delà de tant de sockets en vol, un envoi ramasse d'abord (`UNIX_INFLIGHT_TRIGGER_GC`).
+const EN_VOL_TROP: usize = 16_000;
+
 const EPERM: i64 = 1;
 const EINTR: i64 = 4;
 const EAGAIN: i64 = 11;
@@ -114,6 +128,8 @@ const EOPNOTSUPP: i64 = 95;
 const EADDRINUSE: i64 = 98;
 const ECONNRESET: i64 = 104;
 const ENOBUFS: i64 = 105;
+const ENOMEM: i64 = 12;
+const ETOOMANYREFS: i64 = 109;
 const EISCONN: i64 = 106;
 const ENOTCONN: i64 = 107;
 const ECONNREFUSED: i64 = 111;
@@ -233,6 +249,10 @@ struct Message {
     taille: usize,
     emetteur: Option<Arc<Socket>>,
     enfant: Option<Arc<Socket>>,
+    /// Les fichiers qu'il tient (`UNIXCB(skb).fp`), et son numéro dans `GRAPHE` s'il y a des sockets
+    /// parmi eux (0 : aucune).
+    fichiers: Vec<FichierTenu>,
+    vol: u64,
 }
 
 impl Message {
@@ -251,6 +271,10 @@ struct Etat {
     /// Fermée (`SOCK_DEAD`) : plus rien n'y entre.
     morte: bool,
     passcred: bool,
+    /// Elle accepte qu'on lui envoie des descripteurs (SO_PASSRIGHTS, `sk_scm_rights`).
+    passrights: bool,
+    /// Une fille pas encore acceptée : le numéro de l'écoute qui la tient (`u->listener`).
+    ecoute: Option<u64>,
     /// Les droits du pair (pour une écoute, les siens, posés à `listen`).
     droits: Option<Droits>,
     file: VecDeque<Message>,
@@ -280,7 +304,7 @@ impl Unix {
         Some(Unix {
             sorte,
             etat: Verrou::new(Etat {
-                phase: Phase::Neuve, nom: None, pair: None, arret: 0, erreur: 0, morte: false, passcred: false, droits: None,
+                phase: Phase::Neuve, nom: None, pair: None, arret: 0, erreur: 0, morte: false, passcred: false, passrights: true, ecoute: None, droits: None,
                 file: VecDeque::new(),
             }),
             envoyes: AtomicUsize::new(0),
@@ -351,6 +375,11 @@ fn desinscrire(numero: u64) {
         if r.is_empty() { Some(core::mem::take(&mut *r)) } else { None }
     };
     drop(rendue);
+}
+
+/// La socket de numéro `numero`.
+fn par_numero(numero: u64) -> Option<Arc<Socket>> {
+    REGISTRE.verrouiller().iter().find(|i| i.numero == numero).and_then(|i| i.socket.upgrade())
 }
 
 /// La socket liée au nom `n` : par son inode pour un chemin, par ses octets
@@ -496,6 +525,15 @@ pub fn droits_du_pair(s: &Socket) -> Droits {
     unix(s).etat.verrouiller().droits.unwrap_or(Droits { pid: 0, uid: 65_534, gid: 65_534 })
 }
 
+/// SO_PASSRIGHTS.
+pub fn passrights(s: &Socket) -> bool {
+    unix(s).etat.verrouiller().passrights
+}
+
+pub fn changer_passrights(s: &Socket, oui: bool) {
+    unix(s).etat.verrouiller().passrights = oui;
+}
+
 /// SO_PASSCRED.
 pub fn passcred(s: &Socket) -> bool {
     unix(s).etat.verrouiller().passcred
@@ -565,10 +603,103 @@ fn reveiller(s: &Socket, m: u32) {
 /// d'un message d'écoute, ou l'émetteur, peuvent être rendus ici. Pour un
 /// message déposé seulement (`deposer` a compté sa place) : un message
 /// refusé avant est simplement jeté.
-fn liberer(m: Message) {
+fn liberer(mut m: Message) {
+    drop(detacher(&mut m));
     if let Some(e) = &m.emetteur {
         unix(e).envoyes.fetch_sub(m.taille, Ordering::Relaxed);
         reveiller(e, POLLOUT | POLLWRNORM | POLLWRBAND);
+    }
+}
+
+// --- Les descripteurs en vol ---
+
+/// Les sockets en vol, en arêtes (`unix_add_edges`), sous ce verrou avec le dépôt du message, et
+/// qui se prend avant l'état d'une socket, et le verrou des fichiers.
+static GRAPHE: Verrou<Vec<Arete>> = Verrou::new(Vec::new());
+
+/// Les fichiers en vol, sockets ou non (`user->unix_inflight`) : un seul compte, pour tous : tous
+/// nos programmes sont le même utilisateur (pile.rs).
+static EN_VOL: AtomicUsize = AtomicUsize::new(0);
+
+/// Les numéros des messages de `GRAPHE`.
+static NUMEROS_DE_VOL: AtomicU64 = AtomicU64::new(1);
+
+/// Le fichier `f` est-il une socket AF_UNIX (`unix_get_socket`) ?
+fn socket_du_fichier(f: &FichierTenu) -> Option<&Arc<Socket>> {
+    (f.sorte == SorteFichier::Socket && f.socket().protocole == Protocole::Unix).then(|| f.socket())
+}
+
+/// Un message quitte sa file avec ses fichiers (`unix_detach_fds`) : ils ne sont plus en vol. Rendus à
+/// l'appelant, qui les lâche sans verrou tenu.
+fn detacher(m: &mut Message) -> Vec<FichierTenu> {
+    if !m.fichiers.is_empty() {
+        EN_VOL.fetch_sub(m.fichiers.len(), Ordering::Relaxed);
+        if m.vol != 0 {
+            let vol = core::mem::take(&mut m.vol);
+            GRAPHE.verrouiller().retain(|a| a.message != vol);
+        }
+    }
+    core::mem::take(&mut m.fichiers)
+}
+
+/// `too_many_unix_fds` : un utilisateur ne fait pas voler plus de fichiers que RLIMIT_NOFILE (sinon
+/// un programme pourrait fermer tous ses descripteurs, en ayant mis ses fichiers en vol,
+/// et en ouvrir sans fin).
+fn trop_en_vol() -> bool {
+    EN_VOL.load(Ordering::Relaxed) as u64 > processus::avec(|p| p.descripteurs.limite.0)
+}
+
+/// Le ramasse-miettes (`__unix_gc`) : jette les files des sockets en vol que plus rien ne peut lire
+/// (inet::en_vol). Sans verrou tenu. Le graphe et les comptes sont lus ensemble sous `GRAPHE` :
+/// sinon, une lecture ferait sortir une socket de la file, en gardant sa référence, entre les deux,
+/// et son nouveau descripteur passerait pour un exemplaire encore en vol. Ce qu'il jette ne ferme
+/// rien ici : le dernier `close` des sockets qu'il lâche est différé (`socket::fichier_ferme`),
+/// et chacun ramassera à son tour. Plus de mémoire pour le parcours : rien, la prochaine
+/// fermeture réessaiera.
+fn ramasser() {
+    let mut jetees: Vec<(Arc<Socket>, VecDeque<Message>)> = Vec::new();
+    {
+        let graphe = GRAPHE.verrouiller();
+        if graphe.is_empty() {
+            return;
+        }
+        let mortes = crate::vfs::avec_systeme(|s, _| en_vol::mortes(&graphe, |f| s.ouverts.references(Fichier::de(f))));
+        let Ok(mortes) = mortes else { return };
+        for numero in mortes {
+            // Une socket en vol a son fichier : elle n'a pas quitté le registre, et ce qui la tient
+            // ici n'est pas sa dernière référence : le message la tient encore.
+            let Some(s) = par_numero(numero) else { continue };
+            let e = unix(&s).etat.verrouiller();
+            if !matches!(e.phase, Phase::Ecoute { .. }) {
+                drop(e);
+                jeter(&mut jetees, s);
+                continue;
+            }
+            // La file d'une écoute apporte ses filles : c'est la leur qu'on jette
+            // (`unix_collect_skb`).
+            let mut enfants = Vec::new();
+            if enfants.ajouter_tout(e.file.iter().filter_map(|m| m.enfant.clone())).is_err() {
+                continue;
+            }
+            drop(e);
+            for enfant in enfants {
+                jeter(&mut jetees, enfant);
+            }
+        }
+    }
+    for (_, file) in jetees {
+        for m in file {
+            liberer(m);
+        }
+    }
+}
+
+/// La file de `s`, parmi ce qu'on jette ; plus de mémoire : elle reste où elle était, jusqu'à la
+/// prochaine fois.
+fn jeter(jetees: &mut Vec<(Arc<Socket>, VecDeque<Message>)>, s: Arc<Socket>) {
+    if jetees.try_reserve(1).is_ok() {
+        let file = core::mem::take(&mut unix(&s).etat.verrouiller().file);
+        jetees.ajouter_dans_la_place((s, file));
     }
 }
 
@@ -622,13 +753,13 @@ fn connecter_flux(s: &Arc<Socket>, n: &Nom, non_bloquant: bool) -> Result<(), i6
         };
         let ua = unix(&autre);
         // L'écoute, et sa file.
-        let (ecoute, pleine, nom_ecoute, droits_ecoute, passcred_ecoute) = {
+        let (ecoute, pleine, nom_ecoute, droits_ecoute, passcred_ecoute, passrights_ecoute) = {
             let e = ua.etat.verrouiller();
             match e.phase {
                 Phase::Ecoute { backlog } if !e.morte && e.arret & ARRET_LECTURE == 0 => {
-                    (true, e.file.len() > backlog, e.nom, e.droits, e.passcred)
+                    (true, e.file.len() > backlog, e.nom, e.droits, e.passcred, e.passrights)
                 }
-                _ => (false, false, None, None, false),
+                _ => (false, false, None, None, false, true),
             }
         };
         if !ecoute {
@@ -668,10 +799,12 @@ fn connecter_flux(s: &Arc<Socket>, n: &Nom, non_bloquant: bool) -> Result<(), i6
             // Les drapeaux de réception de l'écoute (SO_PASSCRED :
             // `sk_scm_recv_flags`).
             e.passcred = passcred_ecoute;
+            e.passrights = passrights_ecoute;
+            e.ecoute = Some(autre.numero);
         }
         // Le message qui apporte la fille à l'écoute.
         let mut ea = ua.etat.verrouiller();
-        let deposee = !ea.morte && ea.file.ajouter_derriere(Message { octets: Vec::new(), lus: 0, taille: 0, emetteur: None, enfant: Some(enfant.clone()) }).is_ok();
+        let deposee = !ea.morte && ea.file.ajouter_derriere(Message { octets: Vec::new(), lus: 0, taille: 0, emetteur: None, fichiers: Vec::new(), vol: 0, enfant: Some(enfant.clone()) }).is_ok();
         drop(ea);
         if !deposee {
             // L'écoute vient de fermer, ou plus de mémoire : défaire, des deux
@@ -761,7 +894,17 @@ pub fn accepter(s: &Socket, non_bloquant: bool) -> Result<Arc<Socket>, i64> {
         if let Some(mut m) = m {
             // Une place de plus dans l'écoute.
             reveiller(s, POLLOUT | POLLWRNORM);
-            return m.enfant.take().ok_or(-EINVAL);
+            let enfant = m.enfant.take().ok_or(-EINVAL)?;
+            // Elle a maintenant son fichier : plus la peine de passer par l'écoute
+            // (`unix_update_edges`).
+            let numero = enfant.numero;
+            let mut graphe = GRAPHE.verrouiller();
+            unix(&enfant).etat.verrouiller().ecoute = None;
+            for a in graphe.iter_mut().filter(|a| a.receveuse == numero) {
+                a.ecoute = None;
+            }
+            drop(graphe);
+            return Ok(enfant);
         }
         if non_bloquant {
             return Err(-EAGAIN);
@@ -792,15 +935,22 @@ pub fn paire(s: &Arc<Socket>) -> Result<Arc<Socket>, i64> {
 
 /// Envoie `longueur` octets remplis par `remplir`, à `destination` (un DGRAM
 /// non connecté), avec `drapeaux` (MSG_DONTWAIT). Rend ce qui a été envoyé.
-pub fn envoyer(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64,
+pub fn envoyer(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, fichiers: Vec<FichierTenu>,
                remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_OOB: u64 = 1;
     if drapeaux & MSG_OOB != 0 {
         return Err(-EOPNOTSUPP);
     }
+    // `wait_for_unix_gc`.
+    if !fichiers.is_empty() && GRAPHE.verrouiller().len() > EN_VOL_TROP {
+        ramasser();
+    }
+    if !fichiers.is_empty() && trop_en_vol() {
+        return Err(-ETOOMANYREFS);
+    }
     match unix(s).sorte {
-        Sorte::Flux => envoyer_flux(s, destination, longueur, drapeaux, remplir),
-        _ => envoyer_message(s, destination, longueur, drapeaux, remplir),
+        Sorte::Flux => envoyer_flux(s, destination, longueur, drapeaux, fichiers, remplir),
+        _ => envoyer_message(s, destination, longueur, drapeaux, fichiers, remplir),
     }
 }
 
@@ -833,13 +983,14 @@ fn attendre_place(s: &Socket, non_bloquant: bool, echeance: Option<u64>, delai: 
 fn message(s: &Arc<Socket>, n: usize, decalage: usize, remplir: &mut impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<Message, i64> {
     let mut octets = faillible::remplie(n, 0u8).map_err(|_| -ENOBUFS)?;
     remplir(decalage, &mut octets)?;
-    Ok(Message { octets, lus: 0, taille: taille_vraie(unix(s).sorte, n), emetteur: Some(s.clone()), enfant: None })
+    Ok(Message { octets, lus: 0, taille: taille_vraie(unix(s).sorte, n), emetteur: Some(s.clone()), enfant: None, fichiers: Vec::new(), vol: 0 })
 }
 
 /// Met le message `m` dans la file de `autre` et compte sa place chez
 /// l'émetteur ; `autre` fermée, ou sa lecture arrêtée : rend le message
-/// (Err).
-fn deposer(autre: &Socket, m: Message) -> Result<(), Message> {
+/// (Err, avec EPIPE) ; elle refuse les descripteurs qu'il porte (SO_PASSRIGHTS) : EPERM ; plus de
+/// mémoire pour leurs arêtes (`unix_prepare_fpl`) : ENOMEM.
+fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
     // Comptée d'abord : le destinataire peut la lire, et la rendre, dès
     // que le verrou est lâché.
     let compter = |m: &Message, plus: bool| {
@@ -854,11 +1005,35 @@ fn deposer(autre: &Socket, m: Message) -> Result<(), Message> {
     };
     compter(&m, true);
     {
-        let mut e = unix(autre).etat.verrouiller();
-        if e.morte || e.arret & ARRET_LECTURE != 0 || e.file.try_reserve(1).is_err() {
-            drop(e);
+        let en_vol = m.fichiers.iter().filter(|f| socket_du_fichier(f).is_some()).count();
+        let mut graphe = (en_vol > 0).then(|| GRAPHE.verrouiller());
+        if let Some(g) = &mut graphe
+            && g.try_reserve(en_vol).is_err()
+        {
+            drop(graphe);
             compter(&m, false);
-            return Err(m);
+            return Err((m, -ENOMEM));
+        }
+        let mut e = unix(autre).etat.verrouiller();
+        let refus = if e.morte || e.arret & ARRET_LECTURE != 0 || e.file.try_reserve(1).is_err() {
+            Some(-EPIPE)
+        } else if !m.fichiers.is_empty() && !e.passrights {
+            Some(-EPERM)
+        } else {
+            None
+        };
+        if let Some(errno) = refus {
+            drop(e);
+            drop(graphe);
+            compter(&m, false);
+            return Err((m, errno));
+        }
+        EN_VOL.fetch_add(m.fichiers.len(), Ordering::Relaxed);
+        if let Some(g) = &mut graphe {
+            m.vol = NUMEROS_DE_VOL.fetch_add(1, Ordering::Relaxed);
+            for s in m.fichiers.iter().filter_map(|f| socket_du_fichier(f).map(|s| (s.numero, f.fichier().numero()))) {
+                g.ajouter_dans_la_place(Arete { message: m.vol, envolee: s.0, fichier: s.1, receveuse: autre.numero, ecoute: e.ecoute });
+            }
         }
         e.file.ajouter_derriere_dans_la_place(m);
     }
@@ -871,7 +1046,7 @@ fn deposer(autre: &Socket, m: Message) -> Result<(), Message> {
 /// fermé ou qui ne lit plus : EPIPE ; des messages d'au plus la moitié de
 /// SO_SNDBUF, chacun quand il y a la place. Rend ce qui a été envoyé, ou
 /// l'erreur si rien ne l'a été.
-fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64,
+fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, mut fichiers: Vec<FichierTenu>,
                 mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_DONTWAIT: u64 = 0x40;
     let u = unix(s);
@@ -893,13 +1068,16 @@ fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dr
             return if fait > 0 { Ok(fait) } else { Err(e) };
         }
         let n = (longueur - fait).min((s.sndbuf.load(Ordering::Relaxed) as usize / 2).saturating_sub(64).max(1)).min(MESSAGE_MAX);
-        let m = match message(s, n, fait, &mut remplir) {
+        let mut m = match message(s, n, fait, &mut remplir) {
             Ok(m) => m,
             Err(e) => return if fait > 0 { Ok(fait) } else { Err(e) },
         };
-        if let Err(m) = deposer(&pair, m) {
+        // Les descripteurs : avec le premier message seulement ; sans octet, il n'y en a pas, et ils
+        // sont perdus (`unix_stream_sendmsg`).
+        m.fichiers = core::mem::take(&mut fichiers);
+        if let Err((m, errno)) = deposer(&pair, m) {
             drop(m);
-            return if fait > 0 { Ok(fait) } else { Err(-EPIPE) };
+            return if fait > 0 { Ok(fait) } else { Err(errno) };
         }
         fait += n;
     }
@@ -911,7 +1089,7 @@ fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dr
 /// nom, ou le pair ; SEQPACKET : le pair seul, ENOTCONN sans) ; il en a un
 /// autre que nous : EPERM ; fermé : ECONNREFUSED (ou EPIPE pour SEQPACKET) ;
 /// sa file pleine (un DGRAM qui n'est pas son pair) : attendre, ou EAGAIN.
-fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64,
+fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, fichiers: Vec<FichierTenu>,
                    mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_DONTWAIT: u64 = 0x40;
     let u = unix(s);
@@ -948,6 +1126,7 @@ fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize,
         None => pair.clone().ok_or(-ENOTCONN)?,
     };
     let mut m = message(s, longueur, 0, &mut remplir)?;
+    m.fichiers = fichiers;
     loop {
         let ua = unix(&autre);
         let (morte, son_pair_ok, pleine) = {
@@ -994,8 +1173,12 @@ fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize,
         }
         match deposer(&autre, m) {
             Ok(()) => return Ok(longueur),
-            Err(r) => {
+            Err((r, errno)) => {
                 m = r;
+                if errno != -EPIPE {
+                    drop(m);
+                    return Err(errno);
+                }
                 let lecture_arretee = ua.etat.verrouiller().arret & ARRET_LECTURE != 0;
                 drop(m);
                 return Err(if lecture_arretee { -EPIPE } else { -ENOBUFS });
@@ -1012,6 +1195,8 @@ pub struct Recu {
     pub longueur: usize,
     pub adresse: Option<Nom>,
     pub coupe: bool,
+    /// Les descripteurs qui arrivent (`scm.fp`), à installer, ou à lâcher.
+    pub fichiers: Vec<FichierTenu>,
 }
 
 /// Reçoit au plus `longueur` octets par `copier` (`decalage`, octets) avec
@@ -1100,6 +1285,7 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
     let cible = if drapeaux & MSG_WAITALL != 0 { longueur } else { rcvlowat.min(longueur) };
     let mut adresse = None;
     let mut fait = 0;
+    let mut fichiers = Vec::new();
     // MSG_PEEK : les messages déjà regardés, remis en tête à la fin.
     let mut vus: VecDeque<Message> = VecDeque::new();
     let r = loop {
@@ -1135,20 +1321,43 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
                 remettre(u, m);
                 break Ok(());
             }
+            // Regardé : des copies de ses descripteurs (`unix_peek_fds`), et on s'arrête sur lui.
+            let porte = !m.fichiers.is_empty();
+            fichiers = copies(&m.fichiers);
             vus.ajouter_derriere_dans_la_place(m);
+            if porte {
+                break Ok(());
+            }
             continue;
         }
         m.lus += c;
+        // Ses descripteurs, au premier octet lu, et la lecture ne va pas plus loin que lui.
+        let porte = !m.fichiers.is_empty();
+        if porte {
+            fichiers = detacher(&mut m);
+        }
         if !m.restant().is_empty() {
             remettre(u, m);
             break Ok(());
         }
         liberer(m);
+        if porte {
+            break Ok(());
+        }
     };
     while let Some(m) = vus.pop_back() {
         remettre(u, m);
     }
-    r.map(|()| Recu { longueur: fait, adresse: adresse.flatten(), coupe: false })
+    r.map(|()| Recu { longueur: fait, adresse: adresse.flatten(), coupe: false, fichiers })
+}
+
+/// Des copies de ses descripteurs (`scm_fp_dup`) ; plus de mémoire : aucune, comme lui.
+fn copies(fichiers: &[FichierTenu]) -> Vec<FichierTenu> {
+    let mut v = Vec::new();
+    if v.ajouter_tout(fichiers.iter().map(FichierTenu::dupliquer)).is_err() {
+        return Vec::new();
+    }
+    v
 }
 
 /// Remet un message en tête de la file (sorti pour être copié, et pas tout
@@ -1183,11 +1392,11 @@ fn recevoir_message(s: &Socket, longueur: usize, drapeaux: u64, a: &mut Attente,
             let non_bloquant = a.non_bloquant;
             match rien_a_lire(s, a, non_bloquant) {
                 Ok(Some(())) => continue,
-                Ok(None) => return Ok(Recu { longueur: 0, adresse: None, coupe: false }),
+                Ok(None) => return Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new() }),
                 Err(e) => {
                     // SEQPACKET non bloquante, connexion défaite : 0 (la fin).
                     let fin = u.sorte == Sorte::Paquets && e == -EAGAIN && u.etat.verrouiller().arret & ARRET_LECTURE != 0;
-                    return if fin { Ok(Recu { longueur: 0, adresse: None, coupe: false }) } else { Err(e) };
+                    return if fin { Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new() }) } else { Err(e) };
                 }
             }
         };
@@ -1200,13 +1409,21 @@ fn recevoir_message(s: &Socket, longueur: usize, drapeaux: u64, a: &mut Attente,
         let n = total.min(longueur);
         let adresse = m.emetteur.as_ref().and_then(|e| unix(e).etat.verrouiller().nom);
         let r = copier(0, &m.restant()[..n]);
+        let mut m = m;
+        let fichiers = if r.is_err() {
+            Vec::new()
+        } else if drapeaux & MSG_PEEK != 0 {
+            copies(&m.fichiers)
+        } else {
+            detacher(&mut m)
+        };
         if drapeaux & MSG_PEEK != 0 {
             remettre(u, m);
         } else {
             liberer(m);
         }
         let c = r?;
-        return Ok(Recu { longueur: if drapeaux & MSG_TRUNC != 0 { total } else { c }, adresse, coupe: n < total });
+        return Ok(Recu { longueur: if drapeaux & MSG_TRUNC != 0 { total } else { c }, adresse, coupe: n < total, fichiers });
     }
 }
 
@@ -1241,6 +1458,8 @@ pub fn arreter(s: &Socket, arret: u8) {
 /// Le dernier `close` (`unix_release_sock`).
 pub fn fermer(s: &Socket) {
     fermer_avec(s, false);
+    // Une fermeture peut avoir laissé un cycle sans lecteur (`unix_release_sock`).
+    ramasser();
 }
 
 /// Ferme `s` : retirée du registre, morte, ses deux sens arrêtés ; son pair

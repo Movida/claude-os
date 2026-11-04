@@ -25,6 +25,7 @@ extern crate alloc;
 
 pub mod dhcp;
 pub mod echeances;
+pub mod en_vol;
 pub mod fragments;
 pub mod idents;
 pub mod pmtu;

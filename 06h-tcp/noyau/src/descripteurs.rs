@@ -272,6 +272,11 @@ impl Ouverts {
         self.cases.get_mut(f.0 as usize).and_then(Option::as_mut)
     }
 
+    /// Combien le tiennent (`file_count`).
+    pub fn references(&self, f: Fichier) -> u32 {
+        self.voir(f).map_or(0, |o| o.references)
+    }
+
     /// Le fichier est tenu une fois de plus (dup).
     pub fn prendre(&mut self, f: Fichier) {
         self.fichier(f).references += 1;

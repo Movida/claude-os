@@ -793,6 +793,17 @@ fn errno_table(r: Refus) -> i64 {
     }
 }
 
+/// Un fichier arrive d'une autre socket (`receive_fd`) : un descripteur de plus, le plus petit
+/// libre, que `ecrire` donne au programme avant qu'il n'existe (faux : EFAULT, rien ne reste).
+pub fn recevoir_fichier(o: &FichierTenu, fermer_a_l_exec: bool, ecrire: impl FnOnce(u64) -> bool) -> Result<u64, i64> {
+    let fd = reserver()?;
+    if !ecrire(fd.0) {
+        return Err(-EFAULT);
+    }
+    vfs::avec_systeme(|s, _| s.ouverts.prendre(o.fichier));
+    Ok(fd.installer(o.fichier, fermer_a_l_exec))
+}
+
 /// Range un fichier ouvert neuf (eventfd, epoll : sans chemin) au plus petit
 /// numéro libre, avec FD_CLOEXEC si demandé : rend le numéro, EMFILE s'il
 /// n'y en a plus, ENOMEM si une table ne peut pas grandir (rien ne reste).

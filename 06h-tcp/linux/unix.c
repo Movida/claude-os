@@ -14,8 +14,10 @@
  *     une écoute fermée) ; le nom abstrait (comparé avec sa longueur) ;
  *   - DGRAM : sendto, FIONREAD du premier, MSG_TRUNC, la file de dix,
  *     EMSGSIZE, EPROTOTYPE ; socketpair des trois sortes ; SEQPACKET garde
- *     les limites ; unlink pendant la liaison ; /proc/net/unix (SCM_RIGHTS
- *     attend 6l : chez nous, EINVAL ; pas de ligne) ;
+ *     les limites ; unlink pendant la liaison ; /proc/net/unix ;
+ *   - SCM_RIGHTS : ses limites, ce que la lecture d'un flux en fait, MSG_CTRUNC, SO_PASSRIGHTS,
+ *     ETOOMANYREFS ; le ramasse-miettes : un bout de tube voyage avec les sockets, et le lecteur
+ *     du tube voit la fin quand elles sont ramassées ;
  *   - un serveur et trois clients, en fils.
  * La place que prend un message dans le noyau (sa taille vraie) change
  * d'un noyau à l'autre : les lignes qui en dépendent ne comparent que leur
@@ -40,6 +42,10 @@
 #include <unistd.h>
 
 static int echecs;
+
+#ifndef SO_PASSRIGHTS
+#define SO_PASSRIGHTS 83
+#endif
 
 static void verifier(int ok, const char *quoi)
 {
@@ -814,6 +820,316 @@ static void fils(void)
     unlink("serveur");
 }
 
+/* --- SCM_RIGHTS (`scm_fp_copy`, `scm_detach_fds`, `unix_stream_read_generic`) --- */
+
+/* Envoie `n` octets de `o` sur `s`, avec `nfd` descripteurs. */
+static long envoyer_fds(int s, const void *o, size_t n, const int *fds, int nfd, int drapeaux)
+{
+    struct iovec iov = { (void *)o, n };
+    static char c[CMSG_SPACE(sizeof(int) * 600)];
+    struct msghdr m = { 0 };
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    if (nfd >= 0) {
+        memset(c, 0, sizeof c);
+        m.msg_control = c;
+        m.msg_controllen = CMSG_SPACE(sizeof(int) * nfd);
+        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+        h->cmsg_level = SOL_SOCKET;
+        h->cmsg_type = SCM_RIGHTS;
+        h->cmsg_len = CMSG_LEN(sizeof(int) * nfd);
+        memcpy(CMSG_DATA(h), fds, sizeof(int) * nfd);
+    }
+    return sendmsg(s, &m, drapeaux);
+}
+
+/* Reçoit dans `o`, avec `place` octets pour les messages de contrôle : les descripteurs dans
+ * `fds`, `*nfd` (0 : aucun), les drapeaux dans `*fl`. */
+static long recevoir_fds(int s, void *o, size_t n, int *fds, int *nfd, size_t place, int drapeaux, int *fl)
+{
+    struct iovec iov = { o, n };
+    static char c[CMSG_SPACE(sizeof(int) * 600)];
+    struct msghdr m = { 0 };
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = place ? c : NULL;
+    m.msg_controllen = place;
+    long r = recvmsg(s, &m, drapeaux);
+    *nfd = 0;
+    if (fl)
+        *fl = m.msg_flags;
+    if (r < 0)
+        return r;
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+        if (h->cmsg_level == SOL_SOCKET && h->cmsg_type == SCM_RIGHTS) {
+            int k = (h->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+            memcpy(fds + *nfd, CMSG_DATA(h), sizeof(int) * k);
+            *nfd += k;
+        }
+    }
+    return r;
+}
+
+/* Le même fichier ouvert : sa position est partagée. */
+static int meme_fichier(int a, int b)
+{
+    off_t avant = lseek(a, 0, SEEK_CUR);
+    lseek(a, avant + 7, SEEK_SET);
+    int oui = lseek(b, 0, SEEK_CUR) == avant + 7;
+    lseek(a, avant, SEEK_SET);
+    return oui;
+}
+
+static int fichier_de_test(void)
+{
+    int f = open("fichier-de-test", O_CREAT | O_RDWR, 0600);
+    unlink("fichier-de-test");
+    return f;
+}
+
+static void droits(void)
+{
+    int s[2], fds[600], n, fl;
+    char o[64];
+    verifier(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0, "SCM_RIGHTS : une paire");
+    int f = fichier_de_test();
+    verifier(f >= 0, "SCM_RIGHTS : un fichier");
+    /* Le descripteur reçu : un autre numéro, le même fichier ouvert ; pas de FD_CLOEXEC. */
+    verifier(envoyer_fds(s[0], "ab", 2, &f, 1, 0) == 2, "un descripteur et 2 octets");
+    long r = recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4), 0, &fl);
+    verifier(r == 2 && n == 1 && fds[0] != f && meme_fichier(f, fds[0]) && !(fl & MSG_CTRUNC), "recu : un autre numero, le meme fichier ouvert");
+    verifier(fcntl(fds[0], F_GETFD) == 0, "sans FD_CLOEXEC");
+    close(fds[0]);
+    verifier(envoyer_fds(s[0], "ab", 2, &f, 1, 0) == 2 && recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4), MSG_CMSG_CLOEXEC, &fl) == 2 && n == 1
+             && fcntl(fds[0], F_GETFD) == FD_CLOEXEC && (fl & MSG_CMSG_CLOEXEC), "MSG_CMSG_CLOEXEC : FD_CLOEXEC");
+    close(fds[0]);
+    /* Les erreurs de l'envoi. */
+    int mauvais = 9999;
+    verifier(envoyer_fds(s[0], "ab", 2, &mauvais, 1, 0) == -1 && errno == EBADF, "un descripteur ferme : EBADF");
+    int negatif = -1;
+    verifier(envoyer_fds(s[0], "ab", 2, &negatif, 1, 0) == -1 && errno == EBADF, "un descripteur negatif : EBADF");
+    for (int k = 0; k < 254; k++)
+        fds[k] = f;
+    verifier(envoyer_fds(s[0], "ab", 2, fds, 254, 0) == -1 && errno == EINVAL, "254 descripteurs : EINVAL");
+    verifier(envoyer_fds(s[0], "ab", 2, fds, 253, 0) == 2, "253 : accepte");
+    static int recus[600];
+    verifier(recevoir_fds(s[1], o, sizeof o, recus, &n, CMSG_SPACE(4 * 253), 0, &fl) == 2 && n == 253, "253 recus");
+    for (int k = 0; k < n; k++)
+        close(recus[k]);
+    /* Sans octet, un flux ne porte rien (la boucle de `unix_stream_sendmsg`). */
+    verifier(envoyer_fds(s[0], "", 0, &f, 1, 0) == 0, "un flux, 0 octet : 0");
+    verifier(recv(s[1], o, sizeof o, MSG_DONTWAIT) == -1 && errno == EAGAIN, "et rien n'arrive");
+    /* Pas de place : MSG_CTRUNC, et ils sont fermés. */
+    verifier(envoyer_fds(s[0], "ab", 2, &f, 1, 0) == 2 && recevoir_fds(s[1], o, sizeof o, fds, &n, 0, 0, &fl) == 2 && n == 0 && (fl & MSG_CTRUNC),
+             "sans place : MSG_CTRUNC");
+    int a[3] = { f, f, f };
+    verifier(envoyer_fds(s[0], "ab", 2, a, 3, 0) == 2 && recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(8), 0, &fl) == 2 && (fl & MSG_CTRUNC) && n == 2,
+             "2 places pour 3 : MSG_CTRUNC");
+    for (int k = 0; k < n; k++)
+        close(fds[k]);
+    /* Un `read` jette les descripteurs. */
+    verifier(envoyer_fds(s[0], "ab", 2, &f, 1, 0) == 2 && read(s[1], o, sizeof o) == 2, "read : les octets, pas les descripteurs");
+    /* La lecture d'un flux : elle s'arrête après le message qui en porte ; MSG_PEEK, sur lui, en donnant des copies. */
+    int g = fichier_de_test();
+    verifier(envoyer_fds(s[0], "ab", 2, a, 2, 0) == 2 && write(s[0], "cd", 2) == 2 && envoyer_fds(s[0], "ef", 2, &g, 1, 0) == 2, "ab+2, cd, ef+1");
+    r = recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4 * 8), MSG_PEEK, &fl);
+    verifier(r == 2 && n == 2 && memcmp(o, "ab", 2) == 0 && meme_fichier(f, fds[0]), "MSG_PEEK : ab et des copies des 2");
+    close(fds[0]);
+    close(fds[1]);
+    r = recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4 * 8), 0, &fl);
+    verifier(r == 2 && n == 2 && memcmp(o, "ab", 2) == 0, "la lecture : ab et ses 2");
+    close(fds[0]);
+    close(fds[1]);
+    r = recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4 * 8), 0, &fl);
+    verifier(r == 4 && n == 1 && memcmp(o, "cdef", 4) == 0 && meme_fichier(g, fds[0]), "la suivante : cdef et 1, elle entre dans le message et s'arrete apres");
+    close(fds[0]);
+    close(g);
+    /* Lu en partie : les descripteurs viennent au premier octet. */
+    verifier(envoyer_fds(s[0], "abcd", 4, &f, 1, 0) == 4 && recevoir_fds(s[1], o, 1, fds, &n, CMSG_SPACE(4), 0, &fl) == 1 && n == 1, "lu en partie : les descripteurs avec le premier octet");
+    close(fds[0]);
+    verifier(recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4), 0, &fl) == 3 && n == 0, "le reste, sans eux");
+    /* Plus de descripteurs libres à la réception. */
+    struct rlimit lim, petite;
+    getrlimit(RLIMIT_NOFILE, &lim);
+    verifier(envoyer_fds(s[0], "ab", 2, &f, 1, 0) == 2, "encore un");
+    petite = lim;
+    int plus_haut = dup(0);
+    petite.rlim_cur = plus_haut;
+    close(plus_haut);
+    int bouche = dup(0);
+    setrlimit(RLIMIT_NOFILE, &petite);
+    r = recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4), 0, &fl);
+    setrlimit(RLIMIT_NOFILE, &lim);
+    close(bouche);
+    verifier(r == 2 && n == 0 && (fl & MSG_CTRUNC), "plus de numero libre : MSG_CTRUNC, les octets quand meme");
+    close(s[0]);
+    close(s[1]);
+    /* SEQPACKET et DGRAM : par message ; MSG_PEEK donne des copies. */
+    verifier(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, s) == 0, "SEQPACKET");
+    verifier(envoyer_fds(s[0], "", 0, &f, 1, 0) == 0, "un message vide porte le descripteur");
+    r = recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4), MSG_PEEK, &fl);
+    verifier(r == 0 && n == 1, "MSG_PEEK : une copie");
+    close(fds[0]);
+    r = recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4), 0, &fl);
+    verifier(r == 0 && n == 1 && meme_fichier(f, fds[0]), "la lecture : le descripteur");
+    close(fds[0]);
+    close(s[0]);
+    close(s[1]);
+    verifier(socketpair(AF_UNIX, SOCK_DGRAM, 0, s) == 0, "DGRAM");
+    verifier(envoyer_fds(s[0], "x", 1, &f, 1, 0) == 1 && recevoir_fds(s[1], o, sizeof o, fds, &n, CMSG_SPACE(4), 0, &fl) == 1 && n == 1 && meme_fichier(f, fds[0]), "un datagramme");
+    close(fds[0]);
+    close(s[0]);
+    close(s[1]);
+    /* TCP ignore SCM_RIGHTS (`__sock_cmsg_send`). */
+    /* SO_PASSRIGHTS : le lecteur refuse. */
+    verifier(socketpair(AF_UNIX, SOCK_STREAM, 0, s) == 0, "une paire");
+    int oui;
+    socklen_t lo = sizeof oui;
+    verifier(getsockopt(s[1], SOL_SOCKET, SO_PASSRIGHTS, &oui, &lo) == 0 && oui == 1, "SO_PASSRIGHTS : 1");
+    oui = 0;
+    verifier(setsockopt(s[1], SOL_SOCKET, SO_PASSRIGHTS, &oui, sizeof oui) == 0, "SO_PASSRIGHTS 0");
+    verifier(envoyer_fds(s[0], "ab", 2, &f, 1, 0) == -1 && errno == EPERM, "le lecteur refuse : EPERM");
+    verifier(write(s[0], "ab", 2) == 2 && read(s[1], o, sizeof o) == 2, "les octets seuls passent");
+    close(s[0]);
+    close(s[1]);
+    int tcp = socket(AF_INET, SOCK_STREAM, 0);
+    oui = 1;
+    verifier(setsockopt(tcp, SOL_SOCKET, SO_PASSRIGHTS, &oui, sizeof oui) == -1 && errno == EOPNOTSUPP, "SO_PASSRIGHTS sur TCP : EOPNOTSUPP");
+    close(tcp);
+    /* La borne par utilisateur : plus en vol que RLIMIT_NOFILE (`too_many_unix_fds`). */
+    verifier(socketpair(AF_UNIX, SOCK_DGRAM, 0, s) == 0, "une paire");
+    petite = lim;
+    petite.rlim_cur = 8;
+    int v = 1 << 22;
+    setsockopt(s[0], SOL_SOCKET, SO_SNDBUF, &v, sizeof v);
+    int envoyes = 0, erreur = 0;
+    setrlimit(RLIMIT_NOFILE, &petite);
+    for (int k = 0; k < 100; k++) {
+        if (envoyer_fds(s[0], "a", 1, &f, 1, MSG_DONTWAIT) != 1) {
+            erreur = errno;
+            break;
+        }
+        envoyes++;
+    }
+    setrlimit(RLIMIT_NOFILE, &lim);
+    /* Au plus 9 : le compte est celui de l'utilisateur, tous ses programmes. */
+    verifier(erreur == ETOOMANYREFS && envoyes >= 1 && envoyes <= 9, "RLIMIT_NOFILE 8 : 9 en vol au plus, puis ETOOMANYREFS");
+    close(s[0]);
+    close(s[1]);
+    close(f);
+}
+
+static void tube(int p[2])
+{
+    if (pipe(p) < 0)
+        verifier(0, "un tube");
+}
+
+static void chercher_fin(int p, const char *quoi)
+{
+    /* La mort des sockets en vol se voit au bout d'écriture d'un tube qui voyage avec elles : le
+     * lecteur voit la fin. Le ramassage n'est pas synchrone chez Linux : attendre un peu. */
+    struct pollfd q = { p, POLLIN, 0 };
+    int r = poll(&q, 1, 2000);
+    char c;
+    verifier(r == 1 && read(p, &c, 1) == 0, quoi);
+}
+
+static void pas_de_fin(int p, const char *quoi)
+{
+    struct pollfd q = { p, POLLIN, 0 };
+    verifier(poll(&q, 1, 100) == 0, quoi);
+}
+
+/* Le ramasse-miettes (net/unix/garbage.c) : un cycle de sockets que plus aucun descripteur ne
+ * désigne. Chaque cycle garde en vol le bout d'écriture d'un tube. */
+static void ramasse_miettes(void)
+{
+    int s[2], t[2], p[2];
+    int fds[2];
+    /* Une socket dans sa propre file. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    tube(p);
+    fds[0] = s[1];
+    fds[1] = p[1];
+    verifier(envoyer_fds(s[0], "a", 1, fds, 2, 0) == 1, "une socket dans sa propre file, avec un bout de tube");
+    close(p[1]);
+    pas_de_fin(p[0], "encore ouverte : le tube reste ouvert");
+    close(s[0]);
+    pas_de_fin(p[0], "un descripteur de la socket tient encore");
+    close(s[1]);
+    /* Ce `close` n'est pas le dernier : la file tient la socket, et rien ne se ferme. Le
+     * ramassage suit la fermeture d'une socket, quelle qu'elle soit (`unix_release_sock`). */
+    close(socket(AF_UNIX, SOCK_STREAM, 0));
+    chercher_fin(p[0], "le dernier ferme : le cycle ramasse, le tube ferme");
+    close(p[0]);
+    /* Sans cycle : la fermeture ordinaire suffit. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    tube(p);
+    verifier(envoyer_fds(s[0], "a", 1, &p[1], 1, 0) == 1, "un bout de tube dans une file");
+    close(p[1]);
+    close(s[1]);
+    chercher_fin(p[0], "la socket fermee : sa file jetee");
+    close(p[0]);
+    close(s[0]);
+    /* Deux paires qui se tiennent l'une l'autre. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, t);
+    tube(p);
+    fds[0] = t[1];
+    fds[1] = p[1];
+    verifier(envoyer_fds(s[0], "a", 1, fds, 2, 0) == 1, "t[1] et le tube dans la file de s[1]");
+    verifier(envoyer_fds(t[0], "b", 1, &s[1], 1, 0) == 1, "s[1] dans la file de t[1]");
+    close(p[1]);
+    close(s[1]);
+    close(t[1]);
+    close(s[0]);
+    close(t[0]);
+    chercher_fin(p[0], "deux sockets qui se tiennent : ramassees");
+    close(p[0]);
+    /* Un cycle en vie : on peut encore le lire. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, t);
+    tube(p);
+    fds[0] = t[1];
+    fds[1] = p[1];
+    envoyer_fds(s[0], "a", 1, fds, 2, 0);
+    envoyer_fds(t[0], "b", 1, &s[1], 1, 0);
+    close(p[1]);
+    close(t[1]);
+    close(t[0]);
+    close(s[0]);
+    /* s[1] tient le cycle : un ramassage (déclenché par ces fermetures) ne doit rien prendre. */
+    pas_de_fin(p[0], "s[1] encore ouverte : rien de ramasse");
+    int r[4], n;
+    char o[8];
+    long k = recevoir_fds(s[1], o, sizeof o, r, &n, CMSG_SPACE(8), 0, NULL);
+    verifier(k == 1 && n == 2, "et sa file se lit encore : t[1] et le tube");
+    close(s[1]);
+    close(r[1]);
+    chercher_fin(p[0], "le tube ferme, une fois lu et ferme");
+    close(r[0]);
+    close(p[0]);
+    /* La fille pas encore acceptée d'une écoute : l'écoute la tient. */
+    struct sockaddr_un adr = { .sun_family = AF_UNIX };
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    socklen_t la = offsetof(struct sockaddr_un, sun_path) + 1;
+    verifier(bind(l, (void *)&adr, offsetof(struct sockaddr_un, sun_family) + sizeof adr.sun_family) == 0 && listen(l, 1) == 0, "une ecoute");
+    la = sizeof adr;
+    getsockname(l, (void *)&adr, &la);
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    verifier(connect(c, (void *)&adr, la) == 0, "un client, pas accepte");
+    tube(p);
+    fds[0] = l;
+    fds[1] = p[1];
+    verifier(envoyer_fds(c, "a", 1, fds, 2, 0) == 1, "l'ecoute et le tube dans la file de la fille");
+    close(p[1]);
+    close(l);
+    close(c);
+    chercher_fin(p[0], "l'ecoute dans la file de sa fille : ramassee");
+    close(p[0]);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -837,6 +1153,8 @@ int main(void)
     datagrammes();
     paires();
     unlink_et_proc();
+    droits();
+    ramasse_miettes();
     fils();
     if (chdir("/") < 0 || rmdir(dossier) < 0)
         verifier(0, "le dossier efface");
