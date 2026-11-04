@@ -14,7 +14,8 @@
  *     suivi de leur adresse IPv4) ;
  *   - un ping de la passerelle, attendu par un recv sans délai : aucune
  *     minuterie armée, le détecteur d'interblocage doit le laisser
- *     attendre (une réponse peut venir du réseau) ;
+ *     attendre (une réponse peut venir du réseau) ; puis de 4000 octets :
+ *     des fragments dans les deux sens, avec une autre pile que la nôtre ;
  *   - une socket connectée à 10.0.2.2:9 : slirp répond par un ICMP « port
  *     injoignable » venu de 127.0.0.1 (ce que lui dit l'hôte), un martien
  *     que Linux jette : aucune erreur ;
@@ -280,6 +281,22 @@ int main(int argc, char **argv)
     n = recvfrom(q, rep, sizeof rep, 0, (struct sockaddr *)&a, &l);
     verifier(parti && n == sizeof e && rep[0] == ICMP_ECHOREPLY && memcmp(rep + 8, "ping", 4) == 0 && a.sin_addr.s_addr == htonl(0x0a000202),
              "ping de 10.0.2.2 : la reponse, attendue sans delai");
+    /* Un écho plus grand que la MTU d'Ethernet : découpé à l'aller (IP_PMTUDISC_WANT),
+     * recollé par slirp, redécoupé par lui au retour, et recollé par nous. */
+    static char grand[4000], retour[4000];
+    memcpy(grand, e, sizeof e);
+    for (size_t i = 12; i < sizeof grand; i++)
+        grand[i] = (char)(i * 7);
+    a = adresse(0x0a000202, 0);
+    struct timeval delai_ping = { .tv_sec = 5 };
+    setsockopt(q, SOL_SOCKET, SO_RCVTIMEO, &delai_ping, sizeof delai_ping);
+    parti = sendto(q, grand, sizeof grand, 0, (struct sockaddr *)&a, sizeof a) == sizeof grand;
+    n = recv(q, retour, sizeof retour, 0);
+    verifier(parti && n == sizeof grand && retour[0] == ICMP_ECHOREPLY && memcmp(retour + 8, grand + 8, sizeof grand - 8) == 0,
+             "ping de 4000 octets : fragmente a l'aller, recolle au retour");
+    int df = IP_PMTUDISC_DO;
+    setsockopt(q, IPPROTO_IP, IP_MTU_DISCOVER, &df, sizeof df);
+    verifier(sendto(q, grand, sizeof grand, 0, (struct sockaddr *)&a, sizeof a) < 0 && errno == EMSGSIZE, "avec IP_PMTUDISC_DO : EMSGSIZE");
     close(q);
 
     /* 10.0.2.2:9, connectée : l'ICMP de slirp, de 127.0.0.1, est jeté. */

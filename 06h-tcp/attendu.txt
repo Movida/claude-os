@@ -201,6 +201,8 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] passerelle : a 10.0.2.15 par lo : IP_PKTINFO dit eth0 (2) : ok
 [linux] passerelle : /proc/net/arp : la passerelle et le DNS, comme Linux : ok
 [linux] passerelle : ping de 10.0.2.2 : la reponse, attendue sans delai : ok
+[linux] passerelle : ping de 4000 octets : fragmente a l'aller, recolle au retour : ok
+[linux] passerelle : avec IP_PMTUDISC_DO : EMSGSIZE : ok
 [linux] passerelle : 10.0.2.2:9 connectee : l'ICMP de 127.0.0.1 est un martien, aucune erreur : ok
 [linux] passerelle : api.anthropic.com : adresse trouvee : ok
 [linux] passerelle : localhost : 127.0.0.1, par /etc/hosts : ok

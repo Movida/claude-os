@@ -788,7 +788,7 @@ fn envoyer_segment(h: &Tcp, source: [u8; 4], distante: [u8; 4], identifiant: &mu
     *identifiant = identifiant.wrapping_add(1);
     let envoi = ipv4::Envoi {
         source, destination, protocole: fipv4::TCP, ttl: ip.ttl, tos: ip.tos, identifiant: *identifiant,
-        ne_pas_fragmenter: true, confirmer: false,
+        ne_pas_fragmenter: true, mtu: ipv4::mtu(&chemin), confirmer: false,
     };
     ipv4::emettre(chemin, &envoi, p);
 }

@@ -101,6 +101,18 @@ pub fn lire_entete(o: &[u8]) -> Result<Ipv4, Erreur> {
     })
 }
 
+/// Un paquet recollé : l'en-tête `o` (celui de son premier fragment, options comprises,
+/// `ip_frag_reasm`) dit sa longueur totale, plus de fragment, et les bits ECN réunis ;
+/// sa somme refaite.
+pub fn finir_recollage(o: &mut [u8], longueur: u16, ecn: u8) {
+    o[1] |= ecn;
+    o[2..4].copy_from_slice(&longueur.to_be_bytes());
+    o[6..8].fill(0);
+    o[10..12].fill(0);
+    let s = plier(somme(o, 0));
+    o[10..12].copy_from_slice(&s.to_be_bytes());
+}
+
 /// Écrit l'en-tête `h` (sans options : `longueur_entete` est ignoré) dans
 /// les 20 premiers octets de `o`, sa somme comprise.
 pub fn ecrire(o: &mut [u8; ENTETE], h: &Ipv4) {

@@ -10,7 +10,8 @@
 //! (voisins.rs), à quelle socket UDP va un datagramme et quels ports une
 //! socket peut prendre (ports.rs), et de même pour les sockets de ping et
 //! leurs identifiants (idents.rs) ; et quand la tâche du réseau doit
-//! se réveiller, et pour qui (echeances.rs, 6h). Rien
+//! se réveiller, et pour qui (echeances.rs, 6h), comment recoller un paquet en
+//! fragments (fragments.rs). Rien
 //! ici ne lit l'horloge ni ne tire au hasard : l'heure (en nanosecondes) et
 //! le hasard sont des arguments, si bien qu'un test peut faire passer 45
 //! secondes en une ligne, et rejouer exactement un cas.
@@ -24,6 +25,7 @@ extern crate alloc;
 
 pub mod dhcp;
 pub mod echeances;
+pub mod fragments;
 pub mod idents;
 pub mod ports;
 pub mod ports_tcp;

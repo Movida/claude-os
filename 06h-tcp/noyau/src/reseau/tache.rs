@@ -119,6 +119,8 @@ const MAX_ECHEANCES: usize = 8192;
 /// L'objet « table des voisins » (arp.rs) ; les connexions TCP prendront
 /// le numéro de leur socket, qui part de 1.
 pub const OBJET_VOISINS: u64 = u64::MAX;
+/// L'objet « files de fragments » (ipv4.rs).
+pub const OBJET_FRAGMENTS: u64 = u64::MAX - 1;
 
 /// Fait la liste des échéances. Au démarrage, avant la tâche.
 pub fn initialiser() {
@@ -212,6 +214,8 @@ fn boucle() {
         while let Some(objet) = prendre_echu(maintenant) {
             if objet == OBJET_VOISINS {
                 voisins = true;
+            } else if objet == OBJET_FRAGMENTS {
+                super::ipv4::fragments_echus();
             } else {
                 // Une connexion TCP, ou une entrée de TIME_WAIT.
                 super::tcp::echeance(objet);

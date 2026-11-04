@@ -9,10 +9,7 @@
 //! à toutes les sockets (recevoir, attendre, l'erreur en attente, l'arrêt)
 //! dans socket.rs.
 //!
-//! Ce qui manque, écrit : la fragmentation (un datagramme plus grand que la
-//! MTU du chemin rend EMSGSIZE, comme Linux avec IP_PMTUDISC_DO ; avec
-//! IP_PMTUDISC_WANT, le réglage par défaut, Linux le fragmenterait) ;
-//! SO_SNDBUF ne fait jamais attendre (un datagramme part tout de suite vers
+//! Ce qui manque, écrit : SO_SNDBUF ne fait jamais attendre (un datagramme part tout de suite vers
 //! la carte, ou sa petite file) ; MSG_MORE et UDP_CORK ; la multidiffusion.
 
 use super::datagramme::{self, Controle};

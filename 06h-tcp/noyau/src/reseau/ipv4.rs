@@ -32,10 +32,8 @@
 //! LA SORTIE (`ip_queue_xmit`, `ip_make_skb`) : la route (`router`), puis
 //! l'en-tête, puis l'interface : `lo` pour une de nos adresses (Linux
 //! aussi : la route locale passe par `lo`), la diffusion d'Ethernet pour
-//! une diffusion, le voisin (ARP) pour le reste. Pas de fragmentation : un
-//! paquet plus grand que la MTU est refusé avant (EMSGSIZE, udp.rs ; un
-//! écart, Linux le fragmente avec IP_PMTUDISC_WANT, le réglage par
-//! défaut). Une diffusion envoyée n'est pas rendue aussi aux sockets de la
+//! une diffusion, le voisin (ARP) pour le reste. Un paquet plus grand que la MTU
+//! part en fragments, sauf DF (`ip_do_fragment`). Une diffusion envoyée n'est pas rendue aussi aux sockets de la
 //! machine (Linux en fait toujours une copie par la boucle, `ip_mc_output` ;
 //! IP_MULTICAST_LOOP ne règle que la multidiffusion) : un écart écrit.
 
@@ -44,6 +42,7 @@ use super::paquet::Paquet;
 use crate::verrou::Verrou;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use formats::reseau::{dhcp as format_dhcp, ethernet, icmp, ipv4, udp};
+use inet::fragments::{Cle, Issue, Morceau, Reassemblage};
 use inet::routes::{Chemin, Table};
 
 const ENETUNREACH: i64 = 101;
@@ -51,12 +50,27 @@ const ENETUNREACH: i64 = 101;
 /// Les adresses et les routes ; faites au démarrage.
 static TABLE: Verrou<Option<Table>> = Verrou::new(None);
 
+/// Les paquets en morceaux qui nous arrivent (inet::fragments), et ceux qu'on a pu
+/// recoller ou non : faits au démarrage.
+static REASSEMBLAGE: Verrou<Option<Reassemblage<Paquet>>> = Verrou::new(None);
+
+impl Morceau for Paquet {
+    fn octets(&self) -> &[u8] {
+        self.donnees()
+    }
+    fn couper(&mut self, n: usize) {
+        Paquet::couper(self, n);
+    }
+    fn taille_vraie(&self) -> usize {
+        Paquet::taille_vraie(self)
+    }
+}
+
 /// Les paquets jetés à l'entrée (les compteurs d'`/proc/net/snmp` de Linux,
-/// pas encore montrés) : en-tête faux, martiens, pas pour nous, fragments.
+/// pas encore montrés) : en-tête faux, martiens, pas pour nous.
 static ENTETES_FAUX: AtomicU64 = AtomicU64::new(0);
 static MARTIENS: AtomicU64 = AtomicU64::new(0);
 static PAS_POUR_NOUS: AtomicU64 = AtomicU64::new(0);
-static FRAGMENTS: AtomicU64 = AtomicU64::new(0);
 static OPTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Les identifiants des paquets qui en demandent un sans être d'une
@@ -73,6 +87,7 @@ static CLE_IDENTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Au démarrage.
 pub fn initialiser() {
     *TABLE.verrouiller() = Table::new(inet::routes::MAX);
+    *REASSEMBLAGE.verrouiller() = Reassemblage::new();
     for c in &IDENTS_COMPTEURS {
         c.store(crate::aleatoire::u32(), Ordering::Relaxed);
     }
@@ -166,12 +181,18 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
         Some(Err(c)) => return compter(c),
         None => return,
     }
-    if h.est_un_fragment() {
-        return compter(&FRAGMENTS);
-    }
     if !options_acceptees(&p.donnees()[..h.longueur_entete]) {
         return compter(&OPTIONS);
     }
+    // Un morceau : ce qui suit ne voit que des paquets entiers (`ip_local_deliver`).
+    let (h, p) = if h.est_un_fragment() {
+        match recoller(i, &h, p) {
+            Some(x) => x,
+            None => return,
+        }
+    } else {
+        (h, p)
+    };
     // Une diffusion (la limitée, ou celle d'un réseau de l'interface) va à
     // chaque socket qui l'accepte.
     let diffusion = TABLE.verrouiller().as_ref().is_some_and(|t| t.est_diffusion(i.index, h.destination)) || de_rien_a_rien(&h);
@@ -204,6 +225,55 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
     }
 }
 
+/// Le morceau `p` du paquet que dit son en-tête `h` : gardé (None), ou le dernier : le
+/// paquet recopié d'un seul tenant, derrière l'en-tête de son premier morceau
+/// (`ip_defrag`, `ip_frag_reasm`). Linux enchaîne les morceaux sans les recopier ; nos
+/// paquets ont un tampon d'un seul tenant, que relisent UDP, ICMP et TCP.
+fn recoller(i: &'static Interface, h: &ipv4::Ipv4, mut p: Paquet) -> Option<(ipv4::Ipv4, Paquet)> {
+    p.retirer_entete(h.longueur_entete)?;
+    p.couper(h.longueur as usize - h.longueur_entete);
+    let cle = Cle { source: h.source, destination: h.destination, identifiant: h.identifiant, protocole: h.protocole };
+    let (issue, echeance) = {
+        let mut t = REASSEMBLAGE.verrouiller();
+        let r = t.as_mut()?;
+        let issue = r.recevoir(cle, h.decalage as u32 * 8, h.fragments_suivants, h.tos, h.longueur_entete as u32, p, i.index, crate::temps::ns_monotone());
+        (issue, r.echeance())
+    };
+    super::tache::armer(super::tache::OBJET_FRAGMENTS, echeance);
+    let Issue::Complet { mut morceaux, longueur, entete, ecn } = issue else { return None };
+    let (longueur, entete) = (longueur as usize, entete as usize);
+    let mut neuf = Paquet::vide(entete + longueur)?;
+    let o = neuf.ajouter_fin(entete + longueur)?;
+    let tete = morceaux.first_mut()?.ajouter_entete(entete)?;
+    o[..entete].copy_from_slice(tete);
+    let mut k = entete;
+    for (n, m) in morceaux.iter().enumerate() {
+        let d = if n == 0 { &m.donnees()[entete..] } else { m.donnees() };
+        o[k..k + d.len()].copy_from_slice(d);
+        k += d.len();
+    }
+    ipv4::finir_recollage(&mut o[..entete], (entete + longueur) as u16, ecn);
+    let (h, _) = ipv4::lire(neuf.donnees()).ok()?;
+    Some((h, neuf))
+}
+
+/// Les files de fragments échues (`ip_expire`) : si leur premier morceau était là,
+/// l'émetteur l'apprend (« temps de réassemblage dépassé », RFC 792). Dans la tâche du réseau.
+pub fn fragments_echus() {
+    let maintenant = crate::temps::ns_monotone();
+    loop {
+        let Some(e) = REASSEMBLAGE.verrouiller().as_mut().and_then(|r| r.prendre_echue(maintenant)) else { break };
+        if let Some(mut p) = e.premier
+            && p.ajouter_entete(e.entete as usize).is_some()
+        {
+            let par_lo = interface::par_index(e.interface).is_some_and(|i| i.boucle());
+            super::icmp::envoyer_erreur(icmp::TEMPS_DEPASSE, 1, 0, p.donnees(), par_lo, true, false);
+        }
+    }
+    let prochaine = REASSEMBLAGE.verrouiller().as_ref().and_then(|r| r.echeance());
+    super::tache::armer(super::tache::OBJET_FRAGMENTS, prochaine);
+}
+
 /// Ce que précise l'envoi d'un paquet (le `flowi4` et l'`ipcm_cookie` de
 /// Linux) : les adresses, le protocole, et les champs de l'en-tête.
 pub struct Envoi {
@@ -214,6 +284,8 @@ pub struct Envoi {
     pub tos: u8,
     pub identifiant: u16,
     pub ne_pas_fragmenter: bool,
+    /// La taille au-delà de laquelle il faudra le découper (`ip_skb_dst_mtu`).
+    pub mtu: u32,
     /// MSG_CONFIRM : la machine voisine est là (arp.rs).
     pub confirmer: bool,
 }
@@ -301,23 +373,62 @@ pub fn identifiant(destination: [u8; 4], source: [u8; 4], protocole: u8) -> u16 
 /// l'interface du chemin, dans le contexte de qui envoie (le
 /// `dev_queue_xmit` de Linux). Rien ne revient : un paquet perdu en route
 /// (file pleine, voisin muet) l'est sans le dire, comme sur un câble.
-pub fn emettre(c: Chemin, e: &Envoi, mut p: Paquet) {
-    let longueur = (p.longueur() + ipv4::ENTETE) as u16;
-    let Some(entete) = p.ajouter_entete(ipv4::ENTETE) else { return };
-    let entete: &mut [u8; ipv4::ENTETE] = entete.try_into().expect("20 octets");
-    ipv4::ecrire(entete, &ipv4::Ipv4 {
+pub fn emettre(c: Chemin, e: &Envoi, p: Paquet) {
+    if p.longueur() + ipv4::ENTETE > e.mtu as usize {
+        return fragmenter(c, e, p);
+    }
+    envoyer(c, e, p, 0, false);
+}
+
+/// `ip_fragment`, `ip_do_fragment` : un paquet trop grand. Avec DF, il ne passera pas :
+/// l'erreur ICMP, à nous-mêmes (« fragmentation nécessaire », avec la MTU) ; sinon, en
+/// morceaux, chacun un multiple de 8 octets sauf le dernier, sa place et MF dans son
+/// en-tête. Un morceau qu'on ne peut pas faire : le paquet est perdu.
+fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
+    if e.ne_pas_fragmenter {
+        let total = (p.longueur() + ipv4::ENTETE) as u16;
+        let Some(entete) = p.ajouter_entete(ipv4::ENTETE) else { return };
+        let entete: &mut [u8; ipv4::ENTETE] = entete.try_into().expect("20 octets");
+        ipv4::ecrire(entete, &en_tete(e, total, 0, false));
+        return super::icmp::envoyer_erreur(icmp::INJOIGNABLE, icmp::FRAGMENTATION, e.mtu, p.donnees(), par_lo(&c), false, false);
+    }
+    let place = (e.mtu as usize - ipv4::ENTETE) & !7;
+    let mut debut = 0;
+    let donnees = p.donnees();
+    while debut < donnees.len() {
+        let reste = donnees.len() - debut;
+        let n = if reste > place { place } else { reste };
+        let Some(mut q) = Paquet::vide(n) else { return };
+        let Some(o) = q.ajouter_fin(n) else { return };
+        o.copy_from_slice(&donnees[debut..debut + n]);
+        envoyer(c, e, q, (debut / 8) as u16, n < reste);
+        debut += n;
+    }
+}
+
+/// L'en-tête d'un paquet ou d'un morceau de l'envoi `e`.
+fn en_tete(e: &Envoi, longueur: u16, decalage: u16, suite: bool) -> ipv4::Ipv4 {
+    ipv4::Ipv4 {
         tos: e.tos,
         longueur,
         identifiant: e.identifiant,
         ne_pas_fragmenter: e.ne_pas_fragmenter,
-        fragments_suivants: false,
-        decalage: 0,
+        fragments_suivants: suite,
+        decalage,
         ttl: e.ttl,
         protocole: e.protocole,
         source: e.source,
         destination: e.destination,
         longueur_entete: ipv4::ENTETE,
-    });
+    }
+}
+
+/// L'en-tête IPv4 devant `p`, puis l'interface du chemin.
+fn envoyer(c: Chemin, e: &Envoi, mut p: Paquet, decalage: u16, suite: bool) {
+    let longueur = (p.longueur() + ipv4::ENTETE) as u16;
+    let Some(entete) = p.ajouter_entete(ipv4::ENTETE) else { return };
+    let entete: &mut [u8; ipv4::ENTETE] = entete.try_into().expect("20 octets");
+    ipv4::ecrire(entete, &en_tete(e, longueur, decalage, suite));
     let Some(i) = interface_de(&c) else { return };
     match c {
         // lo : pas de voisin (IFF_NOARP), une adresse matérielle nulle.

@@ -260,9 +260,11 @@ pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64) ->
 /// La suite d'un envoi, une fois sa destination connue (`ip_make_skb`,
 /// `__ip_append_data`, `sock_alloc_send_pskb`), commune à UDP et ping, sous
 /// le `Mutex` : la route et ses refus (`router`) ; `charge` octets
-/// (l'en-tête du protocole compris) plus l'en-tête IPv4 au-delà de la MTU
-/// du chemin : EMSGSIZE, et avec IP_RECVERR une erreur « locale » en file
-/// (`ip_local_error` : la destination, le port de la connexion, la MTU) ;
+/// (l'en-tête du protocole compris) plus l'en-tête IPv4 au-delà de ce qu'on
+/// a le droit d'envoyer : 65 535 octets si la fragmentation est permise (IP_PMTUDISC_DONT,
+/// WANT, OMIT : `ip_sk_ignore_df`), sinon la MTU (DO, PROBE, INTERFACE) : EMSGSIZE, et
+/// avec IP_RECVERR une erreur « locale » en file (`ip_local_error` : la
+/// destination, le port de la connexion, la MTU) ;
 /// l'erreur en attente (lue et effacée : un ECONNREFUSED revenu après
 /// l'envoi précédent sort ici) ; l'écriture arrêtée : EPIPE, sans SIGPIPE
 /// (le signal est l'affaire de TCP). Rend le chemin et ce qu'il faut à
@@ -274,7 +276,9 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
     const EMSGSIZE: i64 = 90;
     let Trajet { chemin, destination, source } = router(inet, destination, c, drapeaux)?;
     let mtu = ipv4::mtu(&chemin);
-    if charge + format_ipv4::ENTETE > mtu as usize {
+    let pmtudisc = inet.options.pmtudisc;
+    let permis = if pmtudisc < 2 || pmtudisc == 5 { 0xFFFF } else { mtu as usize };
+    if charge + format_ipv4::ENTETE > permis {
         if inet.options.recverr {
             if let Some(e) = socket::ErreurEnFile::locale(EMSGSIZE as i32, mtu, destination, inet.port_distant) {
                 s.mettre_en_file(e);
@@ -289,12 +293,12 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
     if s.reception.verrouiller().arret & socket::ARRET_ECRITURE != 0 {
         return Err(-EPIPE);
     }
-    // DF avec IP_PMTUDISC_WANT, DO et PROBE (`__ip_make_skb`) ;
+    // DF avec DO et PROBE, et WANT si le paquet n'a pas à être découpé (`__ip_make_skb`) ;
     // l'identifiant comme `ip_select_ident_segs` : celui de la socket si
     // elle est connectée (même pour un autre destinataire) ; 0 avec DO et
     // PROBE (un paquet que rien ne fragmentera, pas même nous :
     // `ignore_df` faux) ; sinon `ipv4::identifiant`.
-    let ne_pas_fragmenter = matches!(inet.options.pmtudisc, 1..=3);
+    let ne_pas_fragmenter = matches!(pmtudisc, 2 | 3) || (pmtudisc == 1 && charge + format_ipv4::ENTETE <= mtu as usize);
     let identifiant = if inet.connecte {
         inet.identifiant = inet.identifiant.wrapping_add(1);
         inet.identifiant
@@ -305,6 +309,6 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
     };
     Ok((chemin, ipv4::Envoi {
         source, destination, protocole, ttl: c.ttl.or(inet.options.ttl).unwrap_or(64), tos: c.tos.unwrap_or(inet.options.tos),
-        identifiant, ne_pas_fragmenter, confirmer: drapeaux & MSG_CONFIRM != 0,
+        identifiant, ne_pas_fragmenter, mtu, confirmer: drapeaux & MSG_CONFIRM != 0,
     }))
 }

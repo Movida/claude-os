@@ -196,7 +196,7 @@ fn repondre(h: &format_ipv4::Ipv4, reponse: &Icmp, morceaux: &[&[u8]]) {
     icmp::ecrire(o, reponse);
     let envoi = Envoi {
         source: h.destination, destination, protocole: format_ipv4::ICMP, ttl: 64, tos: h.tos,
-        identifiant: ipv4::identifiant(destination, h.destination, format_ipv4::ICMP), ne_pas_fragmenter: false, confirmer: false,
+        identifiant: ipv4::identifiant(destination, h.destination, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu(&chemin), confirmer: false,
     };
     ipv4::emettre(chemin, &envoi, p);
 }
@@ -245,7 +245,7 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
     // « contrôle de l'Internet » (`IPTOS_PREC_INTERNETCONTROL`).
     let envoi = Envoi {
         source, destination, protocole: format_ipv4::ICMP, ttl: 64, tos: (h.tos & 0x1E) | 0xC0,
-        identifiant: ipv4::identifiant(destination, source, format_ipv4::ICMP), ne_pas_fragmenter: false, confirmer: false,
+        identifiant: ipv4::identifiant(destination, source, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu(&chemin), confirmer: false,
     };
     ipv4::emettre(chemin, &envoi, p);
 }
