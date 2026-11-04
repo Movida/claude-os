@@ -218,3 +218,4 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] claude : programme Linux (ELF ET_EXEC), 291638640 octets, point d'entree 0x1be7900, segments :
 2.1.310 (Claude Code)
 [noyau] claude : termine, code de sortie 0 ; memoire rendue : ok.
+il reste de la marge : ok.

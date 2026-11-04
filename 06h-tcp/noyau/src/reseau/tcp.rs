@@ -60,8 +60,10 @@ use crate::partage::{Arc, ArcVide};
 use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use crate::tache::Reveil;
 use crate::verrou::Verrou;
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use formats::reseau::ipv4 as fipv4;
 use formats::reseau::tcp::{self as ftcp, Tcp};
@@ -286,7 +288,7 @@ pub struct Adresses {
 /// Une fille d'une écoute, avant `accept`.
 pub struct Fille {
     numero: u64,
-    tcb: Tcb<Paquet>,
+    tcb: Box<Tcb<Paquet>>,
     locale: [u8; 4],
     distante: [u8; 4],
     identifiant: u16,
@@ -328,7 +330,9 @@ fn ranger_filles(filles: &mut VecDeque<Fille>) {
 pub enum Mode {
     Neuve,
     Ecoute { backlog: usize, filles: VecDeque<Fille> },
-    Connexion(Tcb<Paquet>),
+    /// Dans le tas, comme la `tcp_sock` de Linux (`sk_prot_alloc`) : plus d'un Kio qui ne doit
+    /// ni passer par la pile de 16 Kio de qui la manipule, ni grossir chaque `Partie`.
+    Connexion(Box<Tcb<Paquet>>),
 }
 
 /// La partie possédée.
@@ -829,35 +833,10 @@ impl Possede for Partie {
     type Element = Arrivee;
 
     fn traiter(&mut self, a: Arrivee) {
+        // Le garde ici, à part du reste : `lo` se vide quand il tombe, et ce vidage reçoit à
+        // son tour, sur la même pile : autant que le cadre de ce qui suit n'y soit plus.
         let _contexte = contexte::entrer();
-        let s = match a {
-            Arrivee::Segment(s) => s,
-            Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon } => {
-                self.erreur_icmp(errno, injoignable, seq, fille, recverr, abandon);
-                self.emettre();
-                self.apres();
-                return;
-            }
-            Arrivee::Mtu { info, seq, fille } => {
-                self.mtu_reduite(info, seq, fille);
-                self.emettre();
-                self.apres();
-                return;
-            }
-        };
-        match &mut self.mode {
-            Mode::Connexion(t) => {
-                t.recevoir(&s.entete, s.charge, maintenant());
-            }
-            Mode::Ecoute { .. } => self.traiter_ecoute(s),
-            Mode::Neuve => {
-                // Plus rien n'écoute ici (un `listen` défait par un
-                // `connect` qui a échoué...) : RST.
-                repondre_rst(&s.entete, s.charge.longueur(), s.destination, s.source);
-            }
-        }
-        self.emettre();
-        self.apres();
+        self.traiter_arrivee(a);
     }
 
     fn publier(&self, court: &mut Premier) -> u32 {
@@ -909,6 +888,39 @@ impl Possede for Partie {
 }
 
 impl Partie {
+    /// Ce qui vient d'arriver du réseau.
+    #[inline(never)]
+    fn traiter_arrivee(&mut self, a: Arrivee) {
+        let s = match a {
+            Arrivee::Segment(s) => s,
+            Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon } => {
+                self.erreur_icmp(errno, injoignable, seq, fille, recverr, abandon);
+                self.emettre();
+                self.apres();
+                return;
+            }
+            Arrivee::Mtu { info, seq, fille } => {
+                self.mtu_reduite(info, seq, fille);
+                self.emettre();
+                self.apres();
+                return;
+            }
+        };
+        match &mut self.mode {
+            Mode::Connexion(t) => {
+                t.recevoir(&s.entete, s.charge, maintenant());
+            }
+            Mode::Ecoute { .. } => self.traiter_ecoute(s),
+            Mode::Neuve => {
+                // Plus rien n'écoute ici (un `listen` défait par un
+                // `connect` qui a échoué...) : RST.
+                repondre_rst(&s.entete, s.charge.longueur(), s.destination, s.source);
+            }
+        }
+        self.emettre();
+        self.apres();
+    }
+
     /// « Fragmentation nécessaire » (`tcp_v4_err`, TCP_MTU_REDUCED_DEFERRED) : ignorée si
     /// le segment d'origine n'est pas en vol (la route non plus ne change pas : mesuré) ;
     /// sinon la route la retient, et la connexion suit. Ni une écoute, ni une fille en
@@ -973,6 +985,7 @@ impl Partie {
 
     /// Un segment pour une écoute : un SYN (une fille neuve), ou un
     /// segment d'une fille.
+    #[inline(never)]
     fn traiter_ecoute(&mut self, mut s: Segment) {
         let ip = Ip::de(&self.options);
         let defer = self.options.defer_accept;
@@ -1014,6 +1027,7 @@ impl Partie {
         if pretes > *backlog || filles.len() > *backlog || filles.try_reserve(1).is_err() {
             return;
         }
+        let Ok(place) = faillible::boite_vide() else { return };
         let numero = socket::nouveau_numero();
         let iss = s.isn.unwrap_or_else(|| numero_initial(s.destination, s.source, h.destination, h.source));
         let mss = mss_vers(s.source);
@@ -1024,7 +1038,7 @@ impl Partie {
         // la fille annonce (son échelle est choisie ici, au SYN).
         let rcvbuf = moi.rcvbuf.load(Ordering::Relaxed) as usize;
         let echelle = itcp::echelle(rcvbuf, self.options.rcvbuf_fixe, reception_max(), self.options.window_clamp);
-        let mut tcb = Tcb::depuis_syn(&h, iss, mss, rcvbuf, moi.sndbuf.load(Ordering::Relaxed) as usize, echelle);
+        let mut tcb = tcb_de_syn(place, &h, iss, mss, rcvbuf, moi.sndbuf.load(Ordering::Relaxed) as usize, echelle);
         tcb.poser_mss_utilisateur(self.options.maxseg);
         tcb.window_clamp = self.options.window_clamp;
         tcb.rcvbuf_fixe = self.options.rcvbuf_fixe;
@@ -1054,6 +1068,20 @@ impl Partie {
         // La place est prise plus haut, avant tout changement.
         filles.ajouter_derriere_dans_la_place(f);
     }
+}
+
+/// Écrit dans sa place du tas le bloc d'une fille, à part : `Tcb::depuis_syn` le rend par
+/// valeur, plus d'un Kio qui resterait sur la pile de qui l'appelle, tant qu'il dure.
+#[inline(never)]
+fn tcb_de_syn(place: Box<MaybeUninit<Tcb<Paquet>>>, h: &Tcp, iss: u32, mss: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Box<Tcb<Paquet>> {
+    Box::write(place, Tcb::depuis_syn(h, iss, mss, rcvbuf, sndbuf, echelle))
+}
+
+/// De même pour `connect`, qui dort ensuite sur sa pile, jusqu'à la fin de la poignée de main.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn tcb_de_connect(place: Box<MaybeUninit<Tcb<Paquet>>>, port: u16, port_distant: u16, iss: u32, mss: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Box<Tcb<Paquet>> {
+    Box::write(place, Tcb::connecter(port, port_distant, iss, mss, rcvbuf, sndbuf, echelle))
 }
 
 /// Le numéro de séquence initial d'une connexion (`secure_tcp_seq`, RFC
@@ -1447,6 +1475,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 }
                 let (reuseaddr, reuseport) = partage(s);
                 let lien = Lien { sorte: Sorte::Liee, adresse: source, port: 0, distante: [0; 4], port_distant: 0, reuseaddr, reuseport, uid: s.uid, par_connect: false };
+                let place = faillible::boite_vide().map_err(|_| -ENOBUFS)?;
                 let cle = cle_secrete();
                 let decalage = crypto::siphash::siphash_4u32(u32::from_ne_bytes(source), u32::from_ne_bytes(destination), a.port as u32,
                                                              (crate::temps::ns_monotone() / 10_000_000_000) as u32, &cle);
@@ -1479,7 +1508,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 }
                 let rcvbuf = s.rcvbuf.load(Ordering::Relaxed) as usize;
                 let echelle = itcp::echelle(rcvbuf, p.options.rcvbuf_fixe, reception_max(), p.options.window_clamp);
-                let mut t = Tcb::connecter(port, a.port, iss, mss_vers(destination), rcvbuf, s.sndbuf.load(Ordering::Relaxed) as usize,
+                let mut t = tcb_de_connect(place, port, a.port, iss, mss_vers(destination), rcvbuf, s.sndbuf.load(Ordering::Relaxed) as usize,
                                            echelle);
                 t.mss_utilisateur = p.options.maxseg;
                 t.window_clamp = p.options.window_clamp;
@@ -2069,7 +2098,7 @@ pub fn avec_options<R>(s: &Socket, f: impl FnOnce(&mut OptionsTcp, Option<&mut T
     let mut g = flux(s).posseder();
     let p = g.donnee();
     let tcb = match &mut p.mode {
-        Mode::Connexion(t) => Some(t),
+        Mode::Connexion(t) => Some(&mut **t),
         _ => None,
     };
     let r = f(&mut p.options, tcb);

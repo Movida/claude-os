@@ -63,7 +63,7 @@ use core::arch::{asm, global_asm};
 use core::cell::{Cell, UnsafeCell};
 use core::fmt;
 use core::mem::size_of;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 
 use crate::attente::EntreeAttente;
 use crate::faillible::{self, VecFaillible};
@@ -336,6 +336,7 @@ impl Tache {
     fn creer(nom: NomCourt, espace: u64, programme: Option<EtatProgramme>, processus: Option<Arc<crate::processus::Entree>>,
              tid: u32) -> Result<Arc<Tache>, Manque> {
         let pile = Pile::allouer().ok_or(Manque::Pile)?;
+        marquer_pile(&pile);
         let haut = pile.haut();
         let programme = programme.map(UnsafeCell::new);
         let noyau = processus.is_none();
@@ -773,6 +774,40 @@ pub fn basculer_vers(nouvelle: &Tache) {
     }
 }
 
+/// Ce que porte une pile neuve : là où ce motif reste, elle n'est jamais descendue (le
+/// `stack_not_used` de CONFIG_DEBUG_STACK_USAGE, chez nous toujours là : 16 Kio à écrire à
+/// la naissance d'un fil, contre une page de garde qui ne dit rien de la marge qui restait
+/// jusqu'au jour où un chemin de plus la franchit). Écarté : une limite vérifiée à chaque
+/// appel système, qui ne voit rien de ce qui descend et remonte entre deux.
+const MOTIF_PILE: u64 = 0x5A5A_5A5A_5A5A_5A5A;
+
+/// La pile qui est descendue le plus bas, parmi celles des tâches finies.
+static PILE_LA_PLUS_PROFONDE: AtomicUsize = AtomicUsize::new(0);
+
+fn marquer_pile(p: &Pile) {
+    // SAFETY: la pile vient d'être allouée, projetée tout entière, et à personne d'autre.
+    unsafe { core::slice::from_raw_parts_mut(p.bas() as *mut u64, ((p.haut() - p.bas()) / 8) as usize) }.fill(MOTIF_PILE);
+}
+
+/// Combien d'octets la pile `p` a servi, au plus.
+fn profondeur(p: &Pile) -> usize {
+    let mut v = p.bas();
+    // SAFETY: la pile est projetée tout entière ; sa partie basse n'est écrite que par
+    // sa tâche, finie ou qui nous exécute, et un mot lu à part n'a pas à être cohérent.
+    while v < p.haut() && unsafe { (v as *const u64).read_volatile() } == MOTIF_PILE {
+        v += 8;
+    }
+    (p.haut() - v) as usize
+}
+
+/// La pile la plus profonde, parmi les tâches finies et la courante. Une tâche encore en
+/// vie n'est pas lue : son chemin (la tâche du réseau) est plus court que celui d'un appel
+/// système, qui passe aussi par le réseau.
+pub fn plus_grande_profondeur() -> usize {
+    let ici = courante().pile.verrouiller().as_ref().map_or(0, profondeur);
+    PILE_LA_PLUS_PROFONDE.load(Ordering::Relaxed).max(ici)
+}
+
 /// La fin d'une bascule, dans la tâche qui reprend (ou démarre) : si la
 /// précédente est morte, sa pile est rendue ici, puisqu'on n'est plus
 /// dessus, puis la référence qu'elle avait gardée pour elle-même (le
@@ -785,7 +820,9 @@ extern "C" fn fin_de_bascule() {
         // SAFETY: `morte` vient d'Arc::into_raw dans `terminer`, rendu une
         // seule fois, ici ; elle ne s'exécute plus.
         let t = unsafe { Arc::from_raw(morte) };
-        drop(t.pile.verrouiller().take());
+        if let Some(p) = t.pile.verrouiller().take() {
+            PILE_LA_PLUS_PROFONDE.fetch_max(profondeur(&p), Ordering::Relaxed);
+        }
         // Un fil de programme : sa tâche rendue (si rien d'autre ne la
         // tient), son processus est peut-être fini.
         let processus = t.processus.clone();

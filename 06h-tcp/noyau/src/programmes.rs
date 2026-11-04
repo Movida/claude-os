@@ -189,6 +189,11 @@ pub fn demarrer() {
     // Comme init, qui recueille ses enfants : le noyau attend ceux qui
     // tournent encore.
     l.attendre_tous();
+    // La pile de 16 Kio a-t-elle encore de la marge ? Ce qu'elle a vu de pire, une fois tout
+    // fait. Un quart de réserve, pour les chemins que ces programmes n'ont pas pris.
+    let (profondeur, taille) = (tache::plus_grande_profondeur(), crate::vmalloc::TAILLE_PILE as usize);
+    let marge = if profondeur <= taille / 4 * 3 { "ok" } else { "ECHEC" };
+    afficherln!("[noyau] Piles du noyau : {} octets au plus, sur {}, il reste de la marge : {}.", profondeur, taille, marge);
 }
 
 /// Ce que fait une ligne.
