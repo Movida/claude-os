@@ -112,6 +112,8 @@ const RANDOM_POOLSIZE: u32 = 33;
 /// Linux 5.18, mais montrés à tous (256 et 60).
 const RANDOM_WAKEUP: u32 = 34;
 const RANDOM_RESEED: u32 = 35;
+/// /proc/sys/net (6h, reseau/proc.rs, `REGLAGES`) : ce numéro, plus le rang du réglage.
+const SYSCTL_NET: u32 = 100;
 /// /proc/net/pnp, route, dev et arp (6g, reseau/proc.rs).
 const NET_PNP: u32 = 20;
 const NET_ROUTE: u32 = 21;
@@ -156,6 +158,20 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     p.ajouter(random, b"urandom_min_reseed_secs", 0o644, (0, 0), reglage(RANDOM_RESEED), maintenant)?;
     p.ajouter(random, b"uuid", 0o444, (0, 0), reglage(RANDOM_UUID), maintenant)?;
     p.ajouter(random, b"write_wakeup_threshold", 0o644, (0, 0), reglage(RANDOM_WAKEUP), maintenant)?;
+    // /proc/sys/net : les réglages du réseau, 0644 à root comme chez Linux (nos programmes
+    // ne sont pas root : EACCES pour y écrire, et rien n'y change).
+    let net_sys = p.ajouter(sys, b"net", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    let core = p.ajouter(net_sys, b"core", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    let ipv4 = p.ajouter(net_sys, b"ipv4", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    let route = p.ajouter(ipv4, b"route", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    for (k, r) in crate::reseau::proc::REGLAGES.iter().enumerate() {
+        let dossier = match r.dossier {
+            crate::reseau::proc::Dossier::Core => core,
+            crate::reseau::proc::Dossier::Ipv4 => ipv4,
+            crate::reseau::proc::Dossier::Route => route,
+        };
+        p.ajouter(dossier, r.nom, r.droits, (0, 0), reglage(SYSCTL_NET + k as u32), maintenant)?;
+    }
     // /proc/net : chez Linux, un lien vers self/net, le réseau de l'espace
     // de noms du processus qui lit ; sans espaces de noms (un seul réseau),
     // un dossier de la partie fixe : un écart, qu'aucun programme ne voit
@@ -611,6 +627,7 @@ impl Monte for ProcVue<'_> {
 /// séquences et les valeurs de /proc, les attributs de /sys.
 pub fn lecture(source: u32) -> Lecture {
     match source {
+        s if s >= SYSCTL_NET => Lecture::Valeur,
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD | RANDOM_BOOT_ID
         | RANDOM_UUID | RANDOM_ENTROPY_AVAIL | RANDOM_POOLSIZE | RANDOM_WAKEUP | RANDOM_RESEED => Lecture::Valeur,
         MAPS | STATM | COMM | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP => Lecture::Sequence,
@@ -735,6 +752,7 @@ fn ecrire_uuid(t: &mut Ecrit, u: [u8; 16]) -> fmt::Result {
 fn valeur(source: u32) -> Result<Vec<u8>, Erreur> {
     let mut t = Ecrit(Vec::new());
     let r = match source {
+        s if s >= SYSCTL_NET => crate::reseau::proc::valeur_de_reglage(s - SYSCTL_NET, &mut t),
         // OVERCOMMIT_GUESS : la politique de 6a (memoire.rs).
         OVERCOMMIT_MEMORY => writeln!(t, "0"),
         PIPE_MAX_SIZE => writeln!(t, "{}", crate::tube::TAILLE_MAX),

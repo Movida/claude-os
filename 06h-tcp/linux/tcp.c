@@ -36,7 +36,8 @@
  *     le débit calculé (`tcpi_pacing_rate`) ; SO_SNDBUF qui ne grandit que pour
  *     un programme qui attend de la place ;
  *   - la réception qui s'ajuste : les fenêtres du SYN et du SYN-ACK, SO_RCVBUF qui
- *     suit le débit, TCP_WINDOW_CLAMP, SO_RCVLOWAT.
+ *     suit le débit, TCP_WINDOW_CLAMP, SO_RCVLOWAT ;
+ *   - TCP_DEFER_ACCEPT, et /proc/sys/net.
  * Rien ne compare de valeur qui dépend de la configuration de Linux (le
  * MSS sur lo, SO_SNDBUF agrandi). Sur l'hôte comme chez nous. Les délais sont
  * des multiples de 4 ms (le tic de l'hôte : HZ = 250).
@@ -1359,6 +1360,116 @@ static void rcvlowat(void)
     close(s);
 }
 
+/* TCP_DEFER_ACCEPT (`tcp_check_req`, `syn_ack_recalc`, mesuré) : relu arrondi à ses
+ * périodes de SYN-ACK ; un client qui se connecte sans rien envoyer n'est pas accepté
+ * avant ses données ; muet, à la fin de la période : 1 s pour 1, avec un SYN-ACK renvoyé ; 3 s
+ * pour 2, avec un SYN-ACK renvoyé, à 3 s. */
+static void defer_accept(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    const int demande[][2] = { {0, 0}, {1, 1}, {2, 3}, {3, 3}, {5, 7}, {10, 15}, {100, 127}, {1000, 1087} };
+    int ok = 1;
+    for (size_t i = 0; i < sizeof demande / sizeof demande[0]; i++) {
+        setsockopt(s, IPPROTO_TCP, TCP_DEFER_ACCEPT, &demande[i][0], sizeof(int));
+        ok &= option(s, IPPROTO_TCP, TCP_DEFER_ACCEPT) == demande[i][1];
+    }
+    verifier(ok, "TCP_DEFER_ACCEPT relu : 1, 3, 3, 7, 15, 127, 1087");
+    close(s);
+    /* Les premières données le font accepter. */
+    int port, l = ecoute(&port, 2);
+    int v = 1;
+    setsockopt(l, IPPROTO_TCP, TCP_DEFER_ACCEPT, &v, sizeof v);
+    struct sockaddr_in x = lo(port);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&x, sizeof x);
+    attendre_ms(100);
+    struct pollfd p = { l, POLLIN, 0 };
+    int r0 = poll(&p, 1, 0);
+    verifier(write(c, "a", 1) == 1, "TCP_DEFER_ACCEPT 1 : le client ecrit");
+    int r1 = poll(&p, 1, 500);
+    int a = accept(l, NULL, NULL);
+    char o;
+    verifier(r0 == 0 && r1 == 1 && read(a, &o, 1) == 1 && o == 'a', "TCP_DEFER_ACCEPT 1 : pas pret sans donnees, pret des qu'elles arrivent");
+    close(a);
+    close(c);
+    /* Un client muet : à la fin de la période, et le temps qu'elle dure. */
+    for (int defer = 1; defer <= 2; defer++) {
+        setsockopt(l, IPPROTO_TCP, TCP_DEFER_ACCEPT, &defer, sizeof defer);
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        c = socket(AF_INET, SOCK_STREAM, 0);
+        connect(c, (void *)&x, sizeof x);
+        int pret = poll(&p, 1, 6000);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+        a = accept(l, NULL, NULL);
+        struct tcp_info i;
+        socklen_t li = sizeof i;
+        getsockopt(a, IPPROTO_TCP, TCP_INFO, &i, &li);
+        long attendu = defer == 1 ? 1000 : 3000;
+        verifier(pret == 1 && ms >= attendu - 100 && ms < attendu + 500 && i.tcpi_total_retrans == 1, defer == 1 ? "TCP_DEFER_ACCEPT 1, client muet : pret a 1 s, un SYN-ACK renvoye" : "TCP_DEFER_ACCEPT 2, client muet : pret a 3 s, un SYN-ACK renvoye");
+        close(a);
+        close(c);
+    }
+    close(l);
+}
+
+/* /proc/sys/net : les réglages que suit notre TCP, lisibles par tous, avec les valeurs d'un
+ * Linux 6.18 ; ceux qui dépendent de la mémoire, en forme. Écrire demande root : EACCES.
+ * (tcp_mem n'existe que dans l'espace réseau initial : absent d'un conteneur.) */
+static int reglage(const char *nom, char *o, size_t n)
+{
+    char c[128];
+    snprintf(c, sizeof c, "/proc/sys/net/%s", nom);
+    int f = open(c, O_RDONLY);
+    if (f < 0)
+        return -1;
+    long r = read(f, o, n - 1);
+    close(f);
+    o[r < 0 ? 0 : r] = 0;
+    return r;
+}
+
+static void reglages(void)
+{
+    static const struct { const char *nom, *valeur; } connus[] = {
+        {"ipv4/tcp_timestamps", "1\n"}, {"ipv4/tcp_sack", "1\n"}, {"ipv4/tcp_dsack", "1\n"}, {"ipv4/tcp_window_scaling", "1\n"},
+        {"ipv4/tcp_congestion_control", "cubic\n"}, {"ipv4/tcp_available_congestion_control", "reno cubic\n"},
+        {"ipv4/tcp_allowed_congestion_control", "reno cubic\n"}, {"ipv4/tcp_fin_timeout", "60\n"}, {"ipv4/tcp_keepalive_time", "7200\n"},
+        {"ipv4/tcp_keepalive_intvl", "75\n"}, {"ipv4/tcp_keepalive_probes", "9\n"}, {"ipv4/tcp_syn_retries", "6\n"}, {"ipv4/tcp_synack_retries", "5\n"},
+        {"ipv4/tcp_retries2", "15\n"}, {"ipv4/tcp_orphan_retries", "0\n"}, {"ipv4/tcp_tw_reuse", "2\n"}, {"ipv4/tcp_recovery", "1\n"},
+        {"ipv4/tcp_early_retrans", "3\n"}, {"ipv4/tcp_frto", "2\n"}, {"ipv4/tcp_moderate_rcvbuf", "1\n"}, {"ipv4/tcp_autocorking", "1\n"},
+        {"ipv4/tcp_comp_sack_nr", "44\n"}, {"ipv4/tcp_comp_sack_delay_ns", "1000000\n"}, {"ipv4/tcp_comp_sack_slack_ns", "100000\n"},
+        {"ipv4/tcp_min_rtt_wlen", "300\n"}, {"ipv4/tcp_reordering", "3\n"}, {"ipv4/tcp_max_reordering", "300\n"},
+        {"ipv4/tcp_limit_output_bytes", "4194304\n"}, {"ipv4/tcp_app_win", "31\n"}, {"ipv4/tcp_pingpong_thresh", "1\n"}, {"ipv4/tcp_mtu_probing", "0\n"},
+        {"ipv4/tcp_slow_start_after_idle", "1\n"}, {"ipv4/tcp_pacing_ss_ratio", "200\n"}, {"ipv4/tcp_pacing_ca_ratio", "120\n"},
+        {"ipv4/ip_no_pmtu_disc", "0\n"}, {"ipv4/ip_local_port_range", "32768\t60999\n"}, {"ipv4/ip_default_ttl", "64\n"},
+        {"ipv4/ipfrag_high_thresh", "4194304\n"}, {"ipv4/ipfrag_time", "30\n"}, {"ipv4/ipfrag_max_dist", "64\n"},
+        {"ipv4/route/mtu_expires", "600\n"}, {"ipv4/route/min_pmtu", "552\n"},
+        {"core/somaxconn", "4096\n"}, {"core/rmem_max", "4194304\n"}, {"core/wmem_max", "4194304\n"}, {"core/rmem_default", "212992\n"}, {"core/wmem_default", "212992\n"},
+    };
+    char o[128];
+    int ok = 1;
+    for (size_t i = 0; i < sizeof connus / sizeof connus[0]; i++) {
+        if (reglage(connus[i].nom, o, sizeof o) < 0 || strcmp(o, connus[i].valeur) != 0) {
+            printf("[linux] tcp : %s : %s", connus[i].nom, o);
+            ok = 0;
+        }
+    }
+    verifier(ok, "/proc/sys/net : les valeurs d'un Linux 6.18");
+    long a, b, c;
+    verifier(reglage("ipv4/tcp_rmem", o, sizeof o) > 0 && sscanf(o, "%ld\t%ld\t%ld", &a, &b, &c) == 3 && a == 4096 && b == 131072 && c >= 131072,
+             "/proc/sys/net/ipv4/tcp_rmem : 4096, 131072, et d'apres la memoire");
+    verifier(reglage("ipv4/tcp_wmem", o, sizeof o) > 0 && sscanf(o, "%ld\t%ld\t%ld", &a, &b, &c) == 3 && a == 4096 && b == 16384 && c >= 65536,
+             "/proc/sys/net/ipv4/tcp_wmem : 4096, 16384, et d'apres la memoire");
+    verifier(reglage("ipv4/tcp_mem", o, sizeof o) < 0 || (sscanf(o, "%ld\t%ld\t%ld", &a, &b, &c) == 3 && a < b && b < c),
+             "/proc/sys/net/ipv4/tcp_mem : trois seuils croissants, en pages");
+    verifier(open("/proc/sys/net/ipv4/tcp_sack", O_WRONLY) < 0 && errno == EACCES, "/proc/sys/net : ecrire demande root : EACCES");
+    struct stat st;
+    verifier(stat("/proc/sys/net/ipv4/tcp_sack", &st) == 0 && st.st_mode == (S_IFREG | 0644) && stat("/proc/sys/net/ipv4/tcp_available_congestion_control", &st) == 0
+             && st.st_mode == (S_IFREG | 0444), "/proc/sys/net : les droits, 0644, et 0444");
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1392,6 +1503,8 @@ int main(void)
     reception_qui_s_ajuste();
     window_clamp();
     rcvlowat();
+    defer_accept();
+    reglages();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

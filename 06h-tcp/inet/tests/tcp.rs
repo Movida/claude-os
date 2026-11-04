@@ -1421,6 +1421,146 @@ fn rcvlowat_de_tcp() {
     assert_eq!(f.rcvbuf, 16_384);
 }
 
+// --- TCP_DEFER_ACCEPT ---
+
+/// Une fille d'une écoute avec TCP_DEFER_ACCEPT `defer`, et le client qui lui répond. Rend
+/// le client, la fille, et le dernier ACK du client.
+fn fille_differee(defer: u32) -> (Connexion, Connexion, Tcp) {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    f.reglages.defer_accept = defer;
+    let synack = sortants(&mut f)[0].0;
+    c.recevoir(&synack, vide(), maintenant());
+    let ack = sortants(&mut c)[0].0;
+    (c, f, ack)
+}
+
+/// L'ACK nu de la poignée de main ne fait pas naître la connexion ; les premières données,
+/// si (`tcp_check_req`).
+#[test]
+fn defer_accept_les_donnees_font_naitre() {
+    let (mut c, mut f, ack) = fille_differee(1);
+    f.recevoir(&ack, vide(), maintenant());
+    assert_eq!(f.etat(), Etat::SynRecu);
+    assert!(sortants(&mut f).is_empty());
+    ecrire(&mut c, b"bonjour");
+    let s = sortants(&mut c);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    assert_eq!(f.etat(), Etat::Etablie);
+    assert_eq!(lire(&mut f, 100), b"bonjour");
+}
+
+/// Les instants, mesurés sur Linux : `defer` = 1 : à 1 s, le SYN-ACK repart (la dernière
+/// période), et l'ACK redit fait naître la fille. `defer` = 2 : à 1 s, rien ne repart ; à 3 s,
+/// le SYN-ACK : un seul renvoi. (`syn_ack_recalc`.)
+#[test]
+fn defer_accept_les_instants() {
+    for (defer, instants) in [(1u32, &[1000u64][..]), (2, &[1000, 3000])] {
+        let t0 = maintenant();
+        let (mut c, mut f, ack) = fille_differee(defer);
+        f.recevoir(&ack, vide(), maintenant());
+        let mut renvois = 0;
+        for (k, &t) in instants.iter().enumerate() {
+            assert_eq!(f.echeance(), Some(t0 + t * MS), "defer {defer}, echeance {k}");
+            avancer(t0 + t * MS - maintenant());
+            f.minuteur(maintenant());
+            let s = sortants(&mut f);
+            renvois += s.len();
+            if k + 1 == instants.len() {
+                assert_eq!(s.len(), 1, "defer {defer} : le dernier");
+                assert_eq!(s[0].0.drapeaux, tcp::SYN | tcp::ACK);
+                c.recevoir(&s[0].0, vide(), maintenant());
+                for (a, _) in sortants(&mut c) {
+                    f.recevoir(&a, vide(), maintenant());
+                }
+            } else {
+                assert!(s.is_empty());
+            }
+        }
+        assert_eq!(renvois, 1);
+        assert_eq!(f.etat(), Etat::Etablie);
+        assert_eq!(f.info(maintenant()).total_retrans, 1);
+    }
+}
+
+/// Le client se tait toujours : la fille meurt après `max(tcp_synack_retries, defer)`
+/// échéances, sans réponse : 5 SYN-ACK sans TCP_DEFER_ACCEPT ; avec, moins de renvois, car
+/// son ACK est arrivé (`syn_ack_recalc`). Et une fille ne perd jamais de fenêtre.
+#[test]
+fn fille_qui_meurt_en_silence() {
+    let f0 = maintenant();
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    sortants(&mut f);
+    let mut n = 0;
+    while f.etat() != Etat::Fermee {
+        echeance_suivante(&mut f);
+        n += sortants(&mut f).len();
+    }
+    assert_eq!((n, (maintenant() - f0) / MS), (5, 63_000));
+    assert_eq!(f.congestion().1, SEUIL_INFINI);
+    // Avec TCP_DEFER_ACCEPT 10 : ni renvoi jusqu'à la 9e période ; elle meurt après la 10e.
+    let (_c, mut f, ack) = fille_differee(10);
+    f.recevoir(&ack, vide(), maintenant());
+    let mut n = 0;
+    let mut tours = 0;
+    while f.etat() != Etat::Fermee {
+        echeance_suivante(&mut f);
+        n += sortants(&mut f).len();
+        tours += 1;
+    }
+    assert_eq!((n, tours), (1, 11));
+}
+
+/// `reqsk_timer_handler` : la file à moitié pleine retire des essais, jusqu'à 2 ; TCP_SYNCNT
+/// en sert de départ, et un départ de 1 y reste.
+#[test]
+fn essais_des_filles_sous_la_charge() {
+    use inet::tcp::essais_de_filles as essais;
+    // Moins de la moitié de la file (et jamais sous 8) : rien ne change.
+    assert_eq!(essais(0, 4, 0, 8), 5);
+    assert_eq!(essais(0, 4, 0, 4), 5);
+    assert_eq!(essais(0, 50, 0, 128), 5);
+    // Aucune jeune : tout y passe, jusqu'à 2.
+    assert_eq!(essais(0, 100, 0, 128), 2);
+    // Toutes jeunes : rien (qlen < 2 x jeunes).
+    assert_eq!(essais(0, 100, 100, 128), 5);
+    // Une jeune sur deux : qlen = 2 x jeunes : 2 x jeunes, puis 4 x jeunes : un essai de moins.
+    assert_eq!(essais(0, 100, 50, 128), 4);
+    // Une sur quatre, une sur huit : deux, trois de moins.
+    assert_eq!(essais(0, 100, 25, 128), 3);
+    assert_eq!(essais(0, 100, 12, 128), 2);
+    // TCP_SYNCNT.
+    assert_eq!(essais(1, 100, 0, 128), 1);
+    assert_eq!(essais(2, 100, 0, 128), 2);
+    assert_eq!(essais(10, 100, 50, 128), 9);
+    assert_eq!(essais(10, 100, 0, 128), 2);
+    assert_eq!(essais(255, 4000, 0, 4096), 2);
+}
+
+/// Le client : l'ACK de la poignée de main attend s'il va porter des données : TCP_DEFER_ACCEPT,
+/// ou un programme qui attend d'écrire, au plus 200 ms.
+#[test]
+fn le_client_retient_son_ack() {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.ecrivains_en_attente = 1;
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let s = sortants(&mut f)[0].0;
+    c.recevoir(&s, vide(), maintenant());
+    assert_eq!(c.etat(), Etat::Etablie);
+    assert!(sortants(&mut c).is_empty());
+    assert_eq!(c.echeance(), Some(maintenant() + 200 * MS));
+    // Les données le portent.
+    ecrire(&mut c, b"a");
+    let d = sortants(&mut c);
+    assert_eq!((d.len(), d[0].0.drapeaux & tcp::ACK), (1, tcp::ACK));
+    f.recevoir(&d[0].0, Octets(d[0].1.clone(), 0), maintenant());
+    assert_eq!(f.etat(), Etat::Etablie);
+}
+
 // --- La MTU du chemin (`tcp_v4_mtu_reduced`) ---
 
 /// Une « fragmentation nécessaire » : le MSS baisse (les horodatages comptés : 1000 - 40 -

@@ -1414,8 +1414,7 @@ fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Resu
             TCP_LINGER2 => op.linger2 = if v < 0 { -1 } else { v.min(120) },
             // Gardé en retransmissions de SYN-ACK, comme Linux
             // (`secs_to_retrans`) : il se relit arrondi au délai qu'elles
-            // couvrent (5 s → 7 s). Sans effet chez nous : la fille est
-            // donnée à accept dès sa poignée de main (un écart écrit).
+            // couvrent (5 s → 7 s).
             TCP_DEFER_ACCEPT => op.defer_accept = secondes_en_essais(v),
             // `tcp_set_window_clamp` : 0 ne vaut que pour une socket fermée ; au moins
             // la moitié de SOCK_MIN_RCVBUF (un négatif aussi : mesuré).

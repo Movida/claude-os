@@ -1153,6 +1153,9 @@ impl<P: Charge> Tcb<P> {
     /// ou renvoyer la tête (le SYN, le SYN-ACK, ou le premier segment de la file),
     /// et doubler le RTO (sauf pour les quatre premières retransmissions d'un SYN).
     pub(super) fn minuteur_retrans(&mut self, maintenant: u64, e: &mut Effets) {
+        if self.etat == Etat::SynRecu && self.fille {
+            return self.minuteur_fille(maintenant, e);
+        }
         let syn = matches!(self.etat, Etat::SynEnvoye | Etat::SynRecu);
         if self.etat == Etat::Fermee || (!syn && self.file.is_empty()) {
             return;

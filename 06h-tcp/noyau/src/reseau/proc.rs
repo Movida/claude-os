@@ -9,6 +9,7 @@
 //!   - `arp` : la table des voisins (le `arp_seq_show` d'arp.c) ;
 //!   - `tcp` : les sockets TCP (le `tcp4_seq_show` de tcp_ipv4.c, 6h) ;
 //!   - `unix` : les sockets AF_UNIX (le `unix_seq_show` d'af_unix.c, 6h).
+//! Et /proc/sys/net (`REGLAGES`).
 //! Les adresses de `route` s'écrivent comme Linux les imprime : le mot de
 //! 32 bits gros-boutiste lu comme un nombre de la machine (petit-boutiste),
 //! en hexadécimal : 10.0.2.2 donne 0202000A.
@@ -154,4 +155,132 @@ fn dev(t: &mut Texte, n: u64) -> Result<bool, fmt::Error> {
         }
     }
     Ok(true)
+}
+
+/// Où est un réglage de /proc/sys/net.
+#[derive(Clone, Copy)]
+pub enum Dossier {
+    Core,
+    Ipv4,
+    Route,
+}
+
+/// Ce qu'il vaut : un entier, ou plusieurs (séparés de tabulations, comme les affiche
+/// `proc_dointvec`), ou un texte ; fonction d'une valeur calculée au démarrage.
+#[derive(Clone, Copy)]
+enum Valeur {
+    Entier(i64),
+    Texte(&'static str),
+    Memoire,
+    Reception,
+    Envoi,
+    Ports,
+}
+
+/// Un réglage : son fichier, ses droits (`ctl_table`), et ce qu'il vaut.
+pub struct Reglage {
+    pub dossier: Dossier,
+    pub nom: &'static [u8],
+    pub droits: u32,
+    valeur: Valeur,
+}
+
+const fn entier(dossier: Dossier, nom: &'static [u8], v: i64) -> Reglage {
+    Reglage { dossier, nom, droits: 0o644, valeur: Valeur::Entier(v) }
+}
+
+const fn calcule(nom: &'static [u8], valeur: Valeur) -> Reglage {
+    Reglage { dossier: Dossier::Ipv4, nom, droits: 0o644, valeur }
+}
+
+use Dossier::{Core, Ipv4, Route};
+
+/// Les réglages du réseau : ceux que ce noyau applique réellement, à leur valeur ; et deux que
+/// Linux 6.18 montre sans plus s'en servir, de même chez nous (`tcp_adv_win_scale`, posé, jamais lu ;
+/// `ipfrag_low_thresh`, qui ne borne que `ipfrag_high_thresh`). Rien n'y change (écrire demande
+/// root, qu'aucun de nos programmes n'est). Écarté : montrer ce que nous n'avons pas (`tcp_ecn`,
+/// `tcp_fastopen`, `tcp_syncookies`...) : un programme y croirait. Les valeurs, celles d'un Linux 6.18
+/// (lues par `sysctl` sur l'hôte) ; ce qui en diffère, la mémoire de la machine, et
+/// `tcp_max_tw_buckets`, notre table de TIME_WAIT.
+pub const REGLAGES: [Reglage; 58] = [
+    entier(Core, b"rmem_default", super::socket::TAMPON_DEFAUT as i64),
+    entier(Core, b"rmem_max", super::socket::TAMPON_MAX as i64),
+    entier(Core, b"somaxconn", super::tcp::SOMAXCONN as i64),
+    entier(Core, b"wmem_default", super::socket::TAMPON_DEFAUT as i64),
+    entier(Core, b"wmem_max", super::socket::TAMPON_MAX as i64),
+    entier(Ipv4, b"ip_default_ttl", 64),
+    calcule(b"ip_local_port_range", Valeur::Ports),
+    entier(Ipv4, b"ip_no_pmtu_disc", 0),
+    entier(Ipv4, b"ipfrag_high_thresh", inet::fragments::MEMOIRE_MAX as i64),
+    entier(Ipv4, b"ipfrag_low_thresh", 3 << 20),
+    entier(Ipv4, b"ipfrag_max_dist", 64),
+    entier(Ipv4, b"ipfrag_time", 30),
+    entier(Ipv4, b"tcp_abort_on_overflow", 0),
+    entier(Ipv4, b"tcp_adv_win_scale", 1),
+    Reglage { dossier: Ipv4, nom: b"tcp_allowed_congestion_control", droits: 0o644, valeur: Valeur::Texte("reno cubic") },
+    entier(Ipv4, b"tcp_app_win", 31),
+    entier(Ipv4, b"tcp_autocorking", 1),
+    Reglage { dossier: Ipv4, nom: b"tcp_available_congestion_control", droits: 0o444, valeur: Valeur::Texte("reno cubic") },
+    entier(Ipv4, b"tcp_challenge_ack_limit", i32::MAX as i64),
+    entier(Ipv4, b"tcp_comp_sack_delay_ns", 1_000_000),
+    entier(Ipv4, b"tcp_comp_sack_nr", 44),
+    entier(Ipv4, b"tcp_comp_sack_slack_ns", 100_000),
+    Reglage { dossier: Ipv4, nom: b"tcp_congestion_control", droits: 0o644, valeur: Valeur::Texte("cubic") },
+    entier(Ipv4, b"tcp_dsack", 1),
+    entier(Ipv4, b"tcp_early_retrans", 3),
+    entier(Ipv4, b"tcp_fin_timeout", 60),
+    entier(Ipv4, b"tcp_frto", 2),
+    entier(Ipv4, b"tcp_invalid_ratelimit", 500),
+    entier(Ipv4, b"tcp_keepalive_intvl", 75),
+    entier(Ipv4, b"tcp_keepalive_probes", 9),
+    entier(Ipv4, b"tcp_keepalive_time", 7200),
+    entier(Ipv4, b"tcp_limit_output_bytes", 4 << 20),
+    entier(Ipv4, b"tcp_max_reordering", 300),
+    entier(Ipv4, b"tcp_max_tw_buckets", super::tcp::MAX_TW as i64),
+    calcule(b"tcp_mem", Valeur::Memoire),
+    entier(Ipv4, b"tcp_min_rtt_wlen", 300),
+    entier(Ipv4, b"tcp_min_snd_mss", inet::tcp::MSS_ENVOI_MIN as i64),
+    entier(Ipv4, b"tcp_moderate_rcvbuf", 1),
+    entier(Ipv4, b"tcp_mtu_probing", 0),
+    entier(Ipv4, b"tcp_orphan_retries", 0),
+    entier(Ipv4, b"tcp_pacing_ca_ratio", 120),
+    entier(Ipv4, b"tcp_pacing_ss_ratio", 200),
+    entier(Ipv4, b"tcp_pingpong_thresh", 1),
+    entier(Ipv4, b"tcp_recovery", 1),
+    entier(Ipv4, b"tcp_reordering", 3),
+    entier(Ipv4, b"tcp_retries2", inet::tcp::RETRIES2 as i64),
+    calcule(b"tcp_rmem", Valeur::Reception),
+    entier(Ipv4, b"tcp_sack", 1),
+    entier(Ipv4, b"tcp_slow_start_after_idle", 1),
+    entier(Ipv4, b"tcp_stdurg", 0),
+    entier(Ipv4, b"tcp_syn_retries", inet::tcp::SYN_ESSAIS as i64),
+    entier(Ipv4, b"tcp_synack_retries", inet::tcp::SYNACK_ESSAIS as i64),
+    entier(Ipv4, b"tcp_timestamps", 1),
+    entier(Ipv4, b"tcp_tw_reuse", 2),
+    entier(Ipv4, b"tcp_window_scaling", 1),
+    calcule(b"tcp_wmem", Valeur::Envoi),
+    entier(Route, b"min_pmtu", inet::pmtu::MTU_MIN as i64),
+    entier(Route, b"mtu_expires", (inet::pmtu::EXPIRATION / 1_000_000_000) as i64),
+];
+
+/// La valeur du réglage de rang `k`, avec son saut de ligne.
+pub fn valeur_de_reglage(k: u32, t: &mut impl Write) -> fmt::Result {
+    let Some(r) = REGLAGES.get(k as usize) else { return Ok(()) };
+    match r.valeur {
+        Valeur::Entier(v) => writeln!(t, "{v}"),
+        Valeur::Texte(v) => writeln!(t, "{v}"),
+        Valeur::Ports => writeln!(t, "{}\t{}", inet::ports::EPHEMERE_MIN, inet::ports::EPHEMERE_MAX),
+        Valeur::Memoire => {
+            let [a, b, c] = super::tcp::seuils_memoire();
+            writeln!(t, "{}\t{}\t{}", a / 4096, b / 4096, c / 4096)
+        }
+        Valeur::Reception => {
+            let (defaut, max) = super::tcp::reception_reglee();
+            writeln!(t, "4096\t{defaut}\t{max}")
+        }
+        Valeur::Envoi => {
+            let (defaut, max) = super::tcp::envoi_regle();
+            writeln!(t, "4096\t{defaut}\t{max}")
+        }
+    }
 }

@@ -243,6 +243,23 @@ pub fn apres(a: u32, b: u32) -> bool {
     avant(b, a)
 }
 
+/// Combien de SYN-ACK pour les filles d'une écoute, de TCP_SYNCNT `syncnt`, avec `qlen` filles
+/// sans ACK dont `jeunes` n'ont encore vu aucune échéance (`reqsk_timer_handler`). « Essentially,
+/// we reserve half of room for young embrions; and abort old ones without pity, if old ones are
+/// about to clog our table. » : passé la moitié de la file, chaque moitié de plus d'anciennes
+/// retire un essai, jusqu'à 2.
+pub fn essais_de_filles(syncnt: u32, qlen: u32, jeunes: u32, backlog: u32) -> u32 {
+    let mut max = if syncnt != 0 { syncnt } else { SYNACK_ESSAIS };
+    if qlen << 1 > backlog.max(8) {
+        let mut jeunes = jeunes << 1;
+        while max > 2 && qlen >= jeunes {
+            max -= 1;
+            jeunes <<= 1;
+        }
+    }
+    max
+}
+
 /// Un segment de `seq` à `fin_seq` tombe-t-il dans la fenêtre [`debut`, `fin`]
 /// (`tcp_in_window`) ? Ce que regardent une fille et une entrée de TIME_WAIT ;
 /// une connexion a sa règle (`Tcb::acceptable`).
@@ -457,6 +474,8 @@ pub struct Reglages {
     pub keepcnt: u32,
     /// SO_OOBINLINE : l'octet urgent reste dans le flux.
     pub oobinline: bool,
+    /// TCP_DEFER_ACCEPT, en périodes de SYN-ACK (`rskq_defer_accept`).
+    pub defer_accept: u32,
 }
 
 impl Reglages {
@@ -464,7 +483,7 @@ impl Reglages {
     /// 75 s, 9 sans réponse (TCP_KEEPALIVE_TIME, _INTVL, _PROBES).
     pub const DEFAUT: Reglages = Reglages {
         syn_essais: 0, delai_utilisateur: 0, orpheline: false, nodelay: false, cork: false, keepalive: false,
-        keepidle: 7200 * 1_000_000_000, keepintvl: 75 * 1_000_000_000, keepcnt: 9, oobinline: false,
+        keepidle: 7200 * 1_000_000_000, keepintvl: 75 * 1_000_000_000, keepcnt: 9, oobinline: false, defer_accept: 0,
     };
 }
 
@@ -654,6 +673,14 @@ pub struct Tcb<P: Charge> {
     snd_up: u32,
     /// Notre SYN a été acquitté.
     syn_acquitte: bool,
+    /// Une fille : son dernier ACK est arrivé, sans données, et attend sa fin de
+    /// TCP_DEFER_ACCEPT (`inet_rsk(req)->acked`). Et la limite de ses SYN-ACK sous la
+    /// charge (`reqsk_timer_handler`, posée par le noyau, qui voit toute la file).
+    ack_differe: bool,
+    essais_reduits: u32,
+    /// Les programmes qui attendent dans `send` que la poignée de main finisse
+    /// (`sk_write_pending`) : pas d'ACK seul, leurs données le porteront.
+    pub ecrivains_en_attente: u32,
     // La réception.
     irs: u32,
     rcv_nxt: u32,
@@ -910,6 +937,9 @@ impl<P: Charge> Tcb<P> {
             // Hors du mode urgent : SND.UNA une fois le SYN acquitté.
             snd_up: iss.wrapping_add(1),
             syn_acquitte: false,
+            ack_differe: false,
+            essais_reduits: u32::MAX,
+            ecrivains_en_attente: 0,
             irs: 0,
             rcv_nxt: 0,
             rcv_wnd: 0,
@@ -1826,6 +1856,13 @@ impl<P: Charge> Tcb<P> {
         if sans_syn & tcp::ACK == 0 {
             return false;
         }
+        // TCP_DEFER_ACCEPT : un ACK sans rien avec lui ne fait pas naître la connexion : un
+        // serveur qui écrit le premier n'a pas à être réveillé pour rien. Passée la période,
+        // le prochain ACK la fait naître.
+        if self.retransmissions < self.reglages.defer_accept && fin_seq == self.irs.wrapping_add(1) {
+            self.ack_differe = true;
+            return false;
+        }
         // La connexion naît (`tcp_create_openreq_child`).
         if let Some(ts) = self.ts.as_mut() {
             ts.instant = maintenant;
@@ -1962,8 +1999,17 @@ impl<P: Charge> Tcb<P> {
                     self.t_xmit = None;
                     self.passer(Etat::Etablie, &mut e);
                     self.etablir(maintenant);
-                    // L'ACK de la poignée de main part tout de suite.
-                    self.ack_maintenant = true;
+                    // L'ACK de la poignée de main part tout de suite ; sauf si
+                    // des données vont le porter (`tcp_rcv_synsent_state_process` : un
+                    // programme qui attend d'écrire, TCP_DEFER_ACCEPT, TCP_QUICKACK à 0) :
+                    // il attend alors au plus 200 ms.
+                    if self.ecrivains_en_attente > 0 || self.reglages.defer_accept != 0 || self.ack.pingpong > 0 {
+                        self.ack.programme = true;
+                        self.entrer_mode_rapide();
+                        self.ack.t = Some(maintenant + DELACK_MAX);
+                    } else {
+                        self.ack_maintenant = true;
+                    }
                     e.a_emettre = true;
                     e.place = true;
                 } else {
@@ -2987,6 +3033,53 @@ impl<P: Charge> Tcb<P> {
         }
         self.ack_maintenant = true;
         e.a_emettre = true;
+    }
+
+    /// Combien de SYN-ACK pour une fille, TCP_SYNCNT, ou `tcp_synack_retries`.
+    pub fn essais_de_fille(&self) -> u32 {
+        if self.reglages.syn_essais != 0 { self.reglages.syn_essais } else { SYNACK_ESSAIS }
+    }
+
+    /// La limite que lui donne son écoute (`essais_de_filles`).
+    pub fn reduire_essais(&mut self, n: u32) {
+        self.essais_reduits = n;
+    }
+
+    /// Une fille encore jeune : aucun SYN-ACK n'a échu (`req->num_timeout == 0`) ?
+    pub fn fille_jeune(&self) -> bool {
+        self.retransmissions == 0
+    }
+
+    /// Le minuteur d'une fille (`reqsk_timer_handler`, `syn_ack_recalc`) : chez Linux, une
+    /// simple demande, ni RTO ni congestion : le seuil reste infini, et la fenêtre de départ
+    /// se décide à la naissance. Elle abandonne au bout de ses essais, en silence : personne
+    /// ne la connaît. Avec TCP_DEFER_ACCEPT, une fois son ACK reçu, les SYN-ACK ne repartent
+    /// plus avant la dernière période, qui donne une dernière chance à l'autre : un ACK
+    /// redit la fera naître ; elle ne meurt qu'une fois cette période passée.
+    pub(super) fn minuteur_fille(&mut self, maintenant: u64, e: &mut Effets) {
+        let max = self.essais_de_fille().min(self.essais_reduits);
+        let (n, defer) = (self.retransmissions, self.reglages.defer_accept);
+        let (expire, renvoi) = if defer == 0 {
+            (n >= max, true)
+        } else {
+            (n >= max && (!self.ack_differe || n >= defer), !self.ack_differe || n + 1 >= defer)
+        };
+        if expire {
+            self.abandonner(e);
+            return;
+        }
+        if renvoi {
+            self.syn_du = true;
+            self.total_retrans += 1;
+            self.syn_envoi = None;
+            e.a_emettre = true;
+        }
+        self.retransmissions += 1;
+        self.total_rto += 1;
+        self.undo_marker = Some(self.snd_una);
+        self.recul += 1;
+        self.rto = (self.rto * 2).min(RTO_MAX);
+        self.armer_xmit(Minuteur::Retransmission, self.rto, maintenant);
     }
 
     /// Faut-il abandonner (`tcp_write_timeout`) ? Dans la poignée de main,

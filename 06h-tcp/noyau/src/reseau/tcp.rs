@@ -173,6 +173,21 @@ static SOCKETS: AtomicUsize = AtomicUsize::new(0);
 static RECEPTION_MAX: AtomicUsize = AtomicUsize::new(RCVBUF_DEFAUT as usize);
 static ENVOI_MAX: AtomicUsize = AtomicUsize::new(itcp::SNDBUF_MAX);
 
+/// `tcp_mem`, en octets.
+pub fn seuils_memoire() -> [usize; 3] {
+    [SEUILS[0].load(Ordering::Relaxed), SEUILS[1].load(Ordering::Relaxed), SEUILS[2].load(Ordering::Relaxed)]
+}
+
+/// `tcp_rmem[1]` et `tcp_rmem[2]`.
+pub fn reception_reglee() -> (u32, usize) {
+    (RCVBUF_DEFAUT, RECEPTION_MAX.load(Ordering::Relaxed))
+}
+
+/// `tcp_wmem[1]` et `tcp_wmem[2]`.
+pub fn envoi_regle() -> (u32, usize) {
+    (SNDBUF_DEFAUT, ENVOI_MAX.load(Ordering::Relaxed))
+}
+
 /// La plus grande place de réception possible, pour l'échelle de fenêtre
 /// (`tcp_select_initial_window` : `tcp_rmem[2]`, au moins `rmem_max`).
 fn reception_max() -> usize {
@@ -400,7 +415,7 @@ impl OptionsTcp {
         itcp::Reglages {
             syn_essais: self.syncnt, delai_utilisateur: self.user_timeout as u64 * 1_000_000, orpheline,
             nodelay: self.nodelay, cork: self.cork, keepalive: self.keepalive, keepidle: self.keepidle as u64 * S,
-            keepintvl: self.keepintvl as u64 * S, keepcnt: self.keepcnt, oobinline: self.oobinline,
+            keepintvl: self.keepintvl as u64 * S, keepcnt: self.keepcnt, oobinline: self.oobinline, defer_accept: self.defer_accept,
         }
     }
 }
@@ -863,6 +878,7 @@ impl Possede for Partie {
         self.oublier_echeance();
         let maintenant = maintenant();
         let ip = Ip::de(&self.options);
+        let (defer, syncnt) = (self.options.defer_accept, self.options.syncnt);
         let pousse = self.retenue.pousse();
         match &mut self.mode {
             Mode::Connexion(t) => {
@@ -871,8 +887,15 @@ impl Possede for Partie {
                     t.fin_d_emission();
                 }
             }
-            Mode::Ecoute { filles, .. } => {
+            Mode::Ecoute { filles, backlog } => {
+                let embryons = filles.iter().filter(|f| f.tcb.etat() == Etat::SynRecu);
+                let qlen = embryons.clone().count() as u32;
+                let jeunes = embryons.filter(|f| f.tcb.fille_jeune()).count() as u32;
+                let essais = itcp::essais_de_filles(syncnt, qlen, jeunes, *backlog as u32);
                 for f in filles.iter_mut() {
+                    f.tcb.reglages.defer_accept = defer;
+                    f.tcb.reglages.syn_essais = syncnt;
+                    f.tcb.reduire_essais(essais);
                     f.tcb.minuteur(maintenant);
                     emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
                 }
@@ -952,9 +975,11 @@ impl Partie {
     /// segment d'une fille.
     fn traiter_ecoute(&mut self, mut s: Segment) {
         let ip = Ip::de(&self.options);
+        let defer = self.options.defer_accept;
         let Mode::Ecoute { backlog, filles } = &mut self.mode else { return };
         if let Some(n) = s.fille {
             if let Some(f) = filles.iter_mut().find(|f| f.numero == n) {
+                f.tcb.reglages.defer_accept = defer;
                 f.tcb.recevoir(&s.entete, s.charge, maintenant());
                 emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
                 ranger_filles(filles);
@@ -1467,6 +1492,10 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 t.memoire = niveau_memoire();
                 t.poser_controle(p.options.controle);
                 t.sans_file = sans_carte(destination);
+                // TCP_QUICKACK à 0 (`inet_csk_enter_pingpong_mode`), posé avant.
+                if !p.options.quickack {
+                    t.quickack(false);
+                }
                 t.proposer_horodatages(decalage_horodatages(source, destination));
                 t.proposer_sack();
                 if let Some((_, _, ts)) = reprise {
@@ -1683,6 +1712,11 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
         // au plus, comme le `vm_wait` de `sk_stream_wait_memory`.
         let limite = niveau_memoire() == itcp::Memoire::Limite;
         let regard = limite.then(|| crate::temps::ns_monotone() + 200_000_000);
+        if poignee {
+            if let Mode::Connexion(t) = &mut g.donnee().mode {
+                t.ecrivains_en_attente += 1;
+            }
+        }
         let echeance_ici = match (echeance, regard) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
@@ -1692,6 +1726,11 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
             let fin_poignee = !matches!(c.etat, Some(Etat::SynEnvoye | Etat::SynRecu));
             c.erreur != 0 || !vivante || if poignee { fin_poignee } else { c.place > 0 }
         });
+        if poignee {
+            if let Mode::Connexion(t) = &mut g.donnee().mode {
+                t.ecrivains_en_attente = t.ecrivains_en_attente.saturating_sub(1);
+            }
+        }
         match r {
             Reveil::Reveillee => {}
             // Le regard de la mémoire, avant l'échéance du programme.
