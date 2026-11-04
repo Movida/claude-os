@@ -196,7 +196,7 @@ pub fn mtu(s: &Socket) -> Option<u32> {
     if !inet.connecte {
         return None;
     }
-    ipv4::router(inet.distante, None).ok().map(|(c, _)| ipv4::mtu(&c))
+    ipv4::router(inet.distante, None).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
 }
 
 /// Ce que précisent les messages de contrôle d'un envoi (`ip_cmsg_send`) :
@@ -262,7 +262,8 @@ pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64) ->
 /// le `Mutex` : la route et ses refus (`router`) ; `charge` octets
 /// (l'en-tête du protocole compris) plus l'en-tête IPv4 au-delà de ce qu'on
 /// a le droit d'envoyer : 65 535 octets si la fragmentation est permise (IP_PMTUDISC_DONT,
-/// WANT, OMIT : `ip_sk_ignore_df`), sinon la MTU (DO, PROBE, INTERFACE) : EMSGSIZE, et
+/// WANT, OMIT : `ip_sk_ignore_df`), sinon la MTU (celle du chemin pour DO ; celle de la carte
+/// pour PROBE et INTERFACE, qui ne veulent pas de la découverte) : EMSGSIZE, et
 /// avec IP_RECVERR une erreur « locale » en file (`ip_local_error` : la
 /// destination, le port de la connexion, la MTU) ;
 /// l'erreur en attente (lue et effacée : un ECONNREFUSED revenu après
@@ -275,8 +276,8 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
     const EPIPE: i64 = 32;
     const EMSGSIZE: i64 = 90;
     let Trajet { chemin, destination, source } = router(inet, destination, c, drapeaux)?;
-    let mtu = ipv4::mtu(&chemin);
     let pmtudisc = inet.options.pmtudisc;
+    let mtu = ipv4::mtu_d_envoi(pmtudisc, &chemin, destination);
     let permis = if pmtudisc < 2 || pmtudisc == 5 { 0xFFFF } else { mtu as usize };
     if charge + format_ipv4::ENTETE > permis {
         if inet.options.recverr {
@@ -298,7 +299,7 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
     // elle est connectée (même pour un autre destinataire) ; 0 avec DO et
     // PROBE (un paquet que rien ne fragmentera, pas même nous :
     // `ignore_df` faux) ; sinon `ipv4::identifiant`.
-    let ne_pas_fragmenter = matches!(pmtudisc, 2 | 3) || (pmtudisc == 1 && charge + format_ipv4::ENTETE <= mtu as usize);
+    let ne_pas_fragmenter = matches!(pmtudisc, 2 | 3) || (charge + format_ipv4::ENTETE <= ipv4::mtu_vers(&chemin, destination) as usize && ipv4::ne_pas_fragmenter(pmtudisc, destination));
     let identifiant = if inet.connecte {
         inet.identifiant = inet.identifiant.wrapping_add(1);
         inet.identifiant

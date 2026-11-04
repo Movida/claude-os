@@ -415,6 +415,10 @@ $(LINUX)/aleatoire: linux/aleatoire.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
+$(LINUX)/pmtu: linux/pmtu.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
 $(LINUX)/passerelle: linux/passerelle.c
 	mkdir -p $(LINUX)
 	gcc $(CFLAGS_LINUX) $< -o $@
@@ -1002,9 +1006,16 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	timeout 60 ./$(LINUX)/aleatoire | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 120 ./$(LINUX)/tcp | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/unix | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	if sudo -n true 2>/dev/null; then $(MAKE) tests-hote-root; else echo "tests-hote-root : pas de sudo, sautes"; fi
 	rm -rf /tmp/ajout; \
 	  ./$(LINUX)/ajout ecrire a 500 & a=$$!; ./$(LINUX)/ajout ecrire b 500 & b=$$!; \
 	  ./$(LINUX)/ajout verifier 500 | tee /dev/stderr | (! grep -q ECHEC); r=$$?; wait $$a $$b; exit $$r
+
+# La MTU du chemin sur l'hôte : le seul test qui demande root (une socket brute forge
+# l'ICMP vers lo). Ce qu'il pose sur la route ne vise qu'une adresse 127.x.y.z tirée au
+# hasard, et expire en 10 min. `tests-hote` le lance quand `sudo -n` marche.
+tests-hote-root: $(LINUX)/pmtu
+	sudo -n timeout 60 ./$(LINUX)/pmtu | tee /dev/stderr | grep -q "toutes les verifications : ok"
 
 suite: $(SUITE)/.convertie
 
@@ -1192,4 +1203,4 @@ clean:
 	cd inet && cargo clean
 	cd crypto && cargo clean
 
-.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace tests-hote tests-qemu claude-p suite clean FORCE
+.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace tests-hote tests-hote-root tests-qemu claude-p suite clean FORCE

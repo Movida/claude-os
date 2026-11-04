@@ -463,6 +463,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         tester_ordonnanceur();
         reseau::configurer();
         tester_voisins();
+        reseau::autotest::lancer();
         programmes::demarrer();
         // Le scénario des programmes de test de `make tests-qemu` : une
         // fois l'archive exécutée, éteindre QEMU par son périphérique

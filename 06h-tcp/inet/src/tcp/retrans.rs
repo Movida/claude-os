@@ -477,6 +477,33 @@ impl<P: Charge> Tcb<P> {
         self.cc.ssthresh = self.cc.seuil();
     }
 
+    /// `tcp_simple_retransmit` : ce qui est en vol et plus long que le nouveau MSS ne
+    /// passera pas : perdu. Pas de réduction de la cwnd : rien ne dit que le réseau
+    /// est encombré ; c'est seulement l'unité qui a changé
+    /// (`tcp_non_congestion_loss_retransmit`).
+    pub(super) fn renvoyer_trop_longs(&mut self) {
+        let mss = self.mss_courant();
+        for i in 0..self.file.len() {
+            if self.file[i].longueur() > mss {
+                self.marquer_perdu(i);
+            }
+        }
+        if self.lost_out == 0 {
+            return;
+        }
+        if !self.sack_ok {
+            self.limiter_reno_sacked();
+        }
+        if self.cc.phase != Phase::Perte {
+            self.high_seq = self.snd_nxt;
+            self.cc.ssthresh = self.cc.ssthresh_courant();
+            self.prior_ssthresh = 0;
+            self.undo_marker = None;
+            self.changer_phase(Phase::Perte);
+        }
+        self.rexmit = Rexmit::Perdus;
+    }
+
     /// La réduction est finie : la cwnd au seuil (`tcp_end_cwnd_reduction`),
     /// sauf si elle a été annulée.
     pub(super) fn finir_reduction(&mut self) {

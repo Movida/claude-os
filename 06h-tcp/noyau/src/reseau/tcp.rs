@@ -373,6 +373,8 @@ pub struct OptionsTcp {
     pub rcvlowat: u32,
     pub ttl: u8,
     pub tos: u8,
+    /// La copie d'IP_MTU_DISCOVER (DF, et la MTU à suivre), pour la même raison.
+    pub pmtudisc: u8,
     /// TCP_WINDOW_CLAMP (0 : rien), d'une socket pas encore connectée, et d'une
     /// écoute : ses filles en héritent (`tcp_openreq_init_rwin`).
     pub window_clamp: u32,
@@ -388,7 +390,7 @@ impl OptionsTcp {
     pub const DEFAUT: OptionsTcp = OptionsTcp {
         nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
-        rcvbuf_fixe: false, rcvlowat: 1, ttl: 64, tos: 0, window_clamp: 0, controle: itcp::Controle::DEFAUT,
+        rcvbuf_fixe: false, rcvlowat: 1, ttl: 64, tos: 0, pmtudisc: 1, window_clamp: 0, controle: itcp::Controle::DEFAUT,
     };
 
     /// Ce que la connexion en retient (TCP_USER_TIMEOUT est en ms, les
@@ -439,6 +441,8 @@ pub enum Arrivee {
     /// (RFC 6069), le numéro de séquence du segment d'origine (vérifié
     /// contre ce qui est en vol), la fille visée ; IP_RECVERR de la socket.
     Erreur { errno: i32, injoignable: bool, seq: u32, fille: Option<u64>, recverr: bool, abandon: bool },
+    /// « Fragmentation nécessaire » : la MTU qu'elle dit, et de même le numéro et la fille.
+    Mtu { info: u32, seq: u32, fille: Option<u64> },
 }
 
 /// Un segment reçu, pour une socket (ou la fille d'une écoute).
@@ -458,7 +462,7 @@ pub struct Segment {
 fn taille(a: &Arrivee) -> usize {
     match a {
         Arrivee::Segment(s) => s.charge.taille_vraie(),
-        Arrivee::Erreur { .. } => 64,
+        Arrivee::Erreur { .. } | Arrivee::Mtu { .. } => 64,
     }
 }
 
@@ -730,21 +734,25 @@ impl Drop for Partie {
 struct Ip {
     ttl: u8,
     tos: u8,
+    pmtudisc: u8,
 }
 
 impl Ip {
     /// Celui d'un segment sans socket (un RST, l'ACK d'une entrée de
     /// TIME_WAIT) : le TTL du système, 64.
-    const SYSTEME: Ip = Ip { ttl: 64, tos: 0 };
+    const SYSTEME: Ip = Ip { ttl: 64, tos: 0, pmtudisc: 2 };
 
     fn de(o: &OptionsTcp) -> Ip {
-        Ip { ttl: o.ttl, tos: o.tos }
+        Ip { ttl: o.ttl, tos: o.tos, pmtudisc: o.pmtudisc }
     }
 }
 
 fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, retenue: Option<&Arc<Retenue>>) {
     if let Some(r) = retenue {
         t.poser_en_file(r.octets(), r.rendu());
+    }
+    if let Ok((c, d)) = ipv4::router(distante, Some(source)) {
+        t.verifier_mtu(ipv4::mtu_vers(&c, d));
     }
     let mut a_envoyer: Vec<itcp::Sortant> = Vec::new();
     t.emettre(maintenant(), |s| {
@@ -788,7 +796,7 @@ fn envoyer_segment(h: &Tcp, source: [u8; 4], distante: [u8; 4], identifiant: &mu
     *identifiant = identifiant.wrapping_add(1);
     let envoi = ipv4::Envoi {
         source, destination, protocole: fipv4::TCP, ttl: ip.ttl, tos: ip.tos, identifiant: *identifiant,
-        ne_pas_fragmenter: true, mtu: ipv4::mtu(&chemin), confirmer: false,
+        ne_pas_fragmenter: ipv4::ne_pas_fragmenter(ip.pmtudisc, destination), mtu: ipv4::mtu_d_envoi(ip.pmtudisc, &chemin, destination), confirmer: false,
     };
     ipv4::emettre(chemin, &envoi, p);
 }
@@ -811,6 +819,12 @@ impl Possede for Partie {
             Arrivee::Segment(s) => s,
             Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon } => {
                 self.erreur_icmp(errno, injoignable, seq, fille, recverr, abandon);
+                self.emettre();
+                self.apres();
+                return;
+            }
+            Arrivee::Mtu { info, seq, fille } => {
+                self.mtu_reduite(info, seq, fille);
                 self.emettre();
                 self.apres();
                 return;
@@ -872,6 +886,31 @@ impl Possede for Partie {
 }
 
 impl Partie {
+    /// « Fragmentation nécessaire » (`tcp_v4_err`, TCP_MTU_REDUCED_DEFERRED) : ignorée si
+    /// le segment d'origine n'est pas en vol (la route non plus ne change pas : mesuré) ;
+    /// sinon la route la retient, et la connexion suit. Ni une écoute, ni une fille en
+    /// SYN_RECEIVED (`tcp_req_err` : ses SYN-ACK sont toujours petits).
+    fn mtu_reduite(&mut self, info: u32, seq: u32, fille: Option<u64>) {
+        let pmtudisc = self.options.pmtudisc;
+        let (t, distante) = match (&mut self.mode, fille) {
+            (Mode::Connexion(t), None) => (t, self.adresses.distante),
+            (Mode::Ecoute { filles, .. }, Some(n)) => {
+                let Some(f) = filles.iter_mut().find(|f| f.numero == n && f.tcb.etat() != Etat::SynRecu) else { return };
+                (&mut f.tcb, f.distante)
+            }
+            _ => return,
+        };
+        let (una, nxt, _) = t.numeros();
+        if itcp::avant(seq, una) || itcp::apres(seq, nxt) {
+            return;
+        }
+        ipv4::apprendre_mtu(distante, info);
+        let Ok((c, d)) = ipv4::router(distante, None) else { return };
+        // (`ip_sk_accept_pmtu`, et IP_PMTUDISC_DONT.)
+        let suivre = !matches!(pmtudisc, 0 | 4 | 5);
+        t.mtu_reduite(info, ipv4::mtu_vers(&c, d), ipv4::ne_pas_fragmenter(pmtudisc, d), suivre);
+    }
+
     /// Une erreur ICMP (`tcp_v4_err`) : ignorée si le segment d'origine
     /// n'est pas en vol (entre SND.UNA et SND.NXT : un ICMP forgé ne peut
     /// pas couper une connexion sans connaître ses numéros) ; sinon la
@@ -1039,8 +1078,10 @@ fn sans_carte(distante: [u8; 4]) -> bool {
 }
 
 fn mss_vers(distante: [u8; 4]) -> u16 {
+    // (`ipv4_default_advmss` : d'après la MTU du chemin, ce qu'on en a appris compris, et au
+    // moins `ip_rt_min_advmss`.)
     match ipv4::router(distante, None) {
-        Ok((c, _)) => (ipv4::mtu(&c).saturating_sub(40)).clamp(itcp::MSS_MIN as u32, 65_495) as u16,
+        Ok((c, d)) => (ipv4::mtu_vers(&c, d).saturating_sub(40)).clamp(256, 65_495) as u16,
         Err(_) => itcp::MSS_DEFAUT,
     }
 }
@@ -1087,10 +1128,11 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
         _ => return,
     };
     use formats::reseau::icmp;
-    // « Fragmentation nécessaire » : pour Linux, la découverte de la MTU du
-    // chemin, qui réduit le MSS (`tcp_v4_mtu_reduced`), jamais une erreur ;
-    // nous ne la faisons pas encore (un écart) : ignorée.
+    // « Fragmentation nécessaire » : la MTU du chemin, qui réduit le MSS
+    // (`tcp_v4_mtu_reduced`), jamais une erreur, même avec IP_RECVERR (mesuré).
     if e.genre == icmp::INJOIGNABLE && e.code == icmp::FRAGMENTATION {
+        let _contexte = contexte::entrer();
+        vers_socket(&sock, Arrivee::Mtu { info: e.info, seq, fille });
         return;
     }
     let Some((errno, _)) = super::udp::convertir(e.genre, e.code, true) else { return };
@@ -2020,6 +2062,35 @@ pub fn sndbuf(s: &Socket) -> u32 {
         Mode::Connexion(t) => t.sndbuf.min(i32::MAX as usize) as u32,
         _ => s.sndbuf.load(Ordering::Relaxed),
     }
+}
+
+/// Pour l'auto-test : la source et le port, SND.UNA et SND.NXT d'une connexion.
+pub fn numeros_de(s: &Socket) -> Option<([u8; 4], u16, u32, u32)> {
+    let mut g = flux(s).posseder();
+    let p = g.donnee();
+    let Mode::Connexion(t) = &p.mode else { return None };
+    let (una, nxt, _) = t.numeros();
+    Some((p.adresses.source, p.adresses.port, una, nxt))
+}
+
+/// Pour l'auto-test : TCP_MAXSEG et `tcpi_pmtu`.
+pub fn mss_et_pmtu(s: &Socket) -> Option<(u16, u32)> {
+    avec_options(s, |_, t| t.map(|t| (t.mss(), t.info(maintenant()).pmtu)))
+}
+
+/// Pour l'auto-test : `tcpi_advmss`.
+pub fn advmss_de(s: &Socket) -> Option<u32> {
+    avec_options(s, |_, t| t.map(|t| t.info(maintenant()).advmss))
+}
+
+/// IP_MTU d'une connexion (`dst_mtu`) ; None : pas de connexion (ENOTCONN).
+pub fn mtu_du_chemin(s: &Socket) -> Option<u32> {
+    let mut g = flux(s).posseder();
+    let p = g.donnee();
+    if !matches!(p.mode, Mode::Connexion(_)) {
+        return None;
+    }
+    ipv4::router(p.adresses.distante, None).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
 }
 
 /// SO_RCVBUF, qui grandit de même (reception.rs).

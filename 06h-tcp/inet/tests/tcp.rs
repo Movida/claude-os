@@ -1421,6 +1421,61 @@ fn rcvlowat_de_tcp() {
     assert_eq!(f.rcvbuf, 16_384);
 }
 
+// --- La MTU du chemin (`tcp_v4_mtu_reduced`) ---
+
+/// Une « fragmentation nécessaire » : le MSS baisse (les horodatages comptés : 1000 - 40 -
+/// 12 = 948, mesuré), et ce qui est en vol et trop long repart tout de suite, découpé, sans
+/// toucher à la cwnd, en Perte. Ce qui repart couvre tout, sans rien de neuf.
+#[test]
+fn mtu_reduite_redecoupe_ce_qui_est_en_vol() {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 1 << 20, ECHELLE);
+    c.proposer_horodatages(1);
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 1 << 20, ECHELLE);
+    f.decalage_horodatages(2);
+    calmer(&mut c, &mut f);
+    let mss_avant = c.mss() as usize;
+    assert_eq!(mss_avant, MSS as usize - 12);
+    ecrire(&mut c, &vec![1u8; 3 * mss_avant]);
+    let s = sortants(&mut c);
+    assert_eq!(s.len(), 3);
+    let (una, nxt, _) = c.numeros();
+    let cwnd = c.congestion().0;
+    assert!(c.mtu_reduite(1000, 1000, true, true).a_emettre);
+    assert_eq!(c.mss(), 948);
+    assert_eq!(c.info(maintenant()).pmtu, 1000);
+    let i = c.info(maintenant());
+    assert_eq!((i.phase, i.perdus, i.cwnd), (4, 3, cwnd));
+    let r = sortants(&mut c);
+    assert!(r.len() >= 3 && r.iter().all(|(_, o)| o.len() <= 948), "{:?}", r.iter().map(|(_, o)| o.len()).collect::<Vec<_>>());
+    assert_eq!(r[0].0.seq, una);
+    assert_eq!(c.numeros().1, nxt, "SND.NXT ne bouge pas");
+    assert_eq!(c.erreur(), 0);
+    // Sous le plancher (dit 400, retenu 552) et DF : l'erreur douce, sans plus.
+    assert!(!c.mtu_reduite(400, 1000, true, true).a_emettre);
+    assert_eq!(c.erreur_douce(), t::EMSGSIZE);
+    // IP_PMTUDISC_DONT : rien ne change, le RTO s'en occupera.
+    let (mut c, _f) = paire();
+    ecrire(&mut c, &vec![1u8; MSS as usize]);
+    sortants(&mut c);
+    assert!(!c.mtu_reduite(1000, 1000, false, false).a_emettre);
+    assert_eq!(c.mss(), MSS);
+    // Plus haut que ce qu'on suppose : rien.
+    assert!(!c.mtu_reduite(2000, 2000, true, true).a_emettre);
+    assert_eq!(c.mss(), MSS);
+}
+
+/// La MTU qui remonte (une exception expirée, `tcp_current_mss`) : le MSS suit.
+#[test]
+fn mtu_qui_remonte() {
+    let (mut c, _f) = paire();
+    c.mtu_reduite(1000, 1000, true, true);
+    assert_eq!(c.mss(), 960);
+    c.verifier_mtu(1500);
+    assert_eq!(c.mss(), MSS);
+    assert_eq!(c.info(maintenant()).pmtu, 1500);
+}
+
 // --- TSQ et l'autocork (carte.rs) ---
 
 /// Une connexion par une carte, qui garde `octets` octets et n'a pas encore fini.

@@ -43,12 +43,16 @@ use crate::verrou::Verrou;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use formats::reseau::{dhcp as format_dhcp, ethernet, icmp, ipv4, udp};
 use inet::fragments::{Cle, Issue, Morceau, Reassemblage};
+use inet::pmtu::Exceptions;
 use inet::routes::{Chemin, Table};
 
 const ENETUNREACH: i64 = 101;
 
 /// Les adresses et les routes ; faites au démarrage.
 static TABLE: Verrou<Option<Table>> = Verrou::new(None);
+
+/// La MTU du chemin de chaque destination apprise par ICMP (inet::pmtu).
+static EXCEPTIONS: Verrou<Exceptions> = Verrou::new(Exceptions::new());
 
 /// Les paquets en morceaux qui nous arrivent (inet::fragments), et ceux qu'on a pu
 /// recoller ou non : faits au démarrage.
@@ -338,6 +342,41 @@ fn interface_de(c: &Chemin) -> Option<&'static Interface> {
 /// ICMP « fragmentation nécessaire » : pas encore.
 pub fn mtu(c: &Chemin) -> u32 {
     interface_de(c).map_or(super::boucle::MTU, |i| i.mtu()).min(0xFFFF)
+}
+
+/// La MTU du chemin `c` vers `destination`, ce que l'ICMP a appris compris (`dst_mtu`).
+pub fn mtu_vers(c: &Chemin, destination: [u8; 4]) -> u32 {
+    EXCEPTIONS.verrouiller().mtu(destination, mtu(c), crate::temps::ns_monotone())
+}
+
+/// Cette MTU est-elle verrouillée (sous le plancher : `ip_mtu_locked`) ?
+pub fn mtu_verrouillee(destination: [u8; 4]) -> bool {
+    EXCEPTIONS.verrouiller().verrouillee(destination, crate::temps::ns_monotone())
+}
+
+/// ICMP dit `info` vers `destination` (`__ip_rt_update_pmtu`).
+pub fn apprendre_mtu(destination: [u8; 4], info: u32) {
+    if let Ok((c, d)) = router(destination, None) {
+        EXCEPTIONS.verrouiller().apprendre(d, info, mtu(&c), crate::temps::ns_monotone());
+    }
+}
+
+/// Oublie ce qu'on sait de `destination` (l'auto-test du démarrage).
+pub fn oublier_mtu(destination: [u8; 4]) {
+    EXCEPTIONS.verrouiller().oublier(destination);
+}
+
+/// `ip_dont_fragment` : DF pour un paquet de cette socket, d'après IP_MTU_DISCOVER :
+/// IP_PMTUDISC_DO, ou WANT tant que la MTU n'est pas verrouillée : sous le plancher,
+/// qu'un vrai petit lien le découpe.
+pub fn ne_pas_fragmenter(pmtudisc: u8, destination: [u8; 4]) -> bool {
+    pmtudisc == 2 || (pmtudisc == 1 && !mtu_verrouillee(destination))
+}
+
+/// La taille où découper un paquet de cette socket (`ip_skb_dst_mtu`) : la MTU du chemin,
+/// sauf IP_PMTUDISC_PROBE, INTERFACE et OMIT (`ip_sk_use_pmtu`), qui n'en veulent pas.
+pub fn mtu_d_envoi(pmtudisc: u8, c: &Chemin, destination: [u8; 4]) -> u32 {
+    if pmtudisc < 3 { mtu_vers(c, destination) } else { mtu(c) }
 }
 
 /// Un identifiant pour un paquet qui n'est pas d'une socket connectée :

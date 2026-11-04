@@ -16,6 +16,7 @@
 //! sur l'hôte ; les en-têtes, dans formats::reseau.
 
 pub mod arp;
+pub mod autotest;
 pub mod boucle;
 pub mod contexte;
 pub mod datagramme;

@@ -227,6 +227,7 @@ const COMP_SACK_DELAI: u64 = 1_000_000;
 // Les errno que voit le programme.
 pub const EAGAIN: i32 = 11;
 pub const EINVAL: i32 = 22;
+pub const EMSGSIZE: i32 = 90;
 pub const ECONNREFUSED: i32 = 111;
 pub const ECONNRESET: i32 = 104;
 pub const EPIPE: i32 = 32;
@@ -1153,6 +1154,36 @@ impl<P: Charge> Tcb<P> {
     /// (TCP_INFO, les tests).
     pub fn congestion(&self) -> (u32, u32, u64) {
         (self.cc.cwnd, self.cc.ssthresh, self.rto)
+    }
+
+    /// La MTU du chemin a changé (`tcp_sync_mss`) : le MSS suit, dans les deux sens
+    /// (`tcp_current_mss` : une exception qui expire le fait remonter).
+    pub fn verifier_mtu(&mut self, mtu: u32) {
+        if self.mss_route as u32 + 40 != mtu {
+            self.mss_route = mtu.saturating_sub(40).min(u16::MAX as u32) as u16;
+            self.synchroniser_mss();
+        }
+    }
+
+    /// `tcp_v4_mtu_reduced` : ICMP dit `info`, et la route dit maintenant `mtu`.
+    /// Plus bas que ce que dit la route (sous le plancher), et DF : une erreur douce, que
+    /// rendra un abandon. Plus bas que ce qu'on suppose (`suivre` : ni IP_PMTUDISC_DONT, ni
+    /// INTERFACE, ni OMIT) : le MSS baisse, et ce qui est en vol et trop gros est perdu :
+    /// renvoyé tout de suite, découpé (`tcp_simple_retransmit`).
+    pub fn mtu_reduite(&mut self, info: u32, mtu: u32, ne_pas_fragmenter: bool, suivre: bool) -> Effets {
+        let mut e = Effets::default();
+        if self.etat == Etat::Fermee {
+            return e;
+        }
+        if info < mtu && ne_pas_fragmenter {
+            self.erreur_douce = EMSGSIZE;
+        }
+        if suivre && self.mss_route as u32 + 40 > mtu {
+            self.verifier_mtu(mtu);
+            self.renvoyer_trop_longs();
+            e.a_emettre = true;
+        }
+        e
     }
 
     /// Le MSS d'envoi (`tcp_sync_mss`, `__tcp_mtu_to_mss`) : l'offre de l'autre

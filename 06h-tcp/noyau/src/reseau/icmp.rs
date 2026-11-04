@@ -196,7 +196,7 @@ fn repondre(h: &format_ipv4::Ipv4, reponse: &Icmp, morceaux: &[&[u8]]) {
     icmp::ecrire(o, reponse);
     let envoi = Envoi {
         source: h.destination, destination, protocole: format_ipv4::ICMP, ttl: 64, tos: h.tos,
-        identifiant: ipv4::identifiant(destination, h.destination, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu(&chemin), confirmer: false,
+        identifiant: ipv4::identifiant(destination, h.destination, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu_vers(&chemin, destination), confirmer: false,
     };
     ipv4::emettre(chemin, &envoi, p);
 }
@@ -232,7 +232,7 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
     let source = if pour_nous { h.destination } else { ipv4::source(&chemin) };
     // Autant du paquet d'origine que tient en 576 octets ; au moins un
     // en-tête IPv4, sinon le message n'aurait pas de sens.
-    let place = (ipv4::mtu(&chemin) as usize).min(576).saturating_sub(format_ipv4::ENTETE + icmp::ENTETE);
+    let place = (ipv4::mtu_vers(&chemin, destination) as usize).min(576).saturating_sub(format_ipv4::ENTETE + icmp::ENTETE);
     if place <= format_ipv4::ENTETE {
         return;
     }
@@ -245,7 +245,7 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
     // « contrôle de l'Internet » (`IPTOS_PREC_INTERNETCONTROL`).
     let envoi = Envoi {
         source, destination, protocole: format_ipv4::ICMP, ttl: 64, tos: (h.tos & 0x1E) | 0xC0,
-        identifiant: ipv4::identifiant(destination, source, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu(&chemin), confirmer: false,
+        identifiant: ipv4::identifiant(destination, source, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu_vers(&chemin, destination), confirmer: false,
     };
     ipv4::emettre(chemin, &envoi, p);
 }

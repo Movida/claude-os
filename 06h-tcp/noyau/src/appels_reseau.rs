@@ -1609,12 +1609,13 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         _ => return Err(-ENOPROTOOPT),
     }
     // TCP émet ses segments sans le Mutex : ses copies d'IP_TTL et d'IP_TOS.
-    let (ttl, tos) = (op.ttl.unwrap_or(64), op.tos);
+    let (ttl, tos, pmtudisc) = (op.ttl.unwrap_or(64), op.tos, op.pmtudisc);
     drop(inet);
-    if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS) {
+    if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER) {
         tcp::avec_options(s, |o, _| {
             o.ttl = ttl;
             o.tos = tos;
+            o.pmtudisc = pmtudisc;
         });
     }
     Ok(())
@@ -1745,7 +1746,8 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
 /// d'une socket non connectée : ENOTCONN.
 fn lire_option_ip(s: &Socket, option: i32) -> Result<i32, i64> {
     if option == IP_MTU {
-        return datagramme::mtu(s).map(|m| m as i32).ok_or(-ENOTCONN);
+        let m = if s.protocole == Protocole::Tcp { tcp::mtu_du_chemin(s) } else { datagramme::mtu(s) };
+        return m.map(|m| m as i32).ok_or(-ENOTCONN);
     }
     let op = s.appels.verrouiller().options;
     Ok(match option {

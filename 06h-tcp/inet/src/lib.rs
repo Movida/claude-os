@@ -27,6 +27,7 @@ pub mod dhcp;
 pub mod echeances;
 pub mod fragments;
 pub mod idents;
+pub mod pmtu;
 pub mod ports;
 pub mod ports_tcp;
 pub mod routes;

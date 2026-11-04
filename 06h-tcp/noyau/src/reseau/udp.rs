@@ -224,9 +224,8 @@ pub fn convertir(genre: u8, code: u8, pmtudisc: bool) -> Option<(i32, bool)> {
         (EHOSTUNREACH, true),
     ];
     match genre {
-        // La fragmentation nécessaire : la découverte de la MTU du chemin
-        // (Linux la retient pour la route : pas encore, un écart) ; une
-        // erreur fatale, sauf avec IP_PMTUDISC_DONT.
+        // La fragmentation nécessaire : retenue pour la route par `apprendre_si_mtu` ;
+        // une erreur fatale, sauf avec IP_PMTUDISC_DONT.
         icmp::INJOIGNABLE if code == icmp::FRAGMENTATION => pmtudisc.then_some((EMSGSIZE, true)),
         icmp::INJOIGNABLE => Some(TABLE.get(code as usize).copied().unwrap_or((EHOSTUNREACH, false))),
         icmp::PARAMETRE => Some((EPROTO, true)),
@@ -250,8 +249,18 @@ pub fn erreur(e: &ErreurRecue) {
     let Some(s) = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source)) else {
         return;
     };
+    apprendre_si_mtu(e);
     let Some((errno, fatale)) = convertir(e.genre, e.code, fragmentation_dite(&s)) else { return };
     signaler(&s, e, errno, fatale, port_destination, udp::ENTETE);
+}
+
+/// « Fragmentation nécessaire », pour un paquet d'une socket qu'on a retrouvée :
+/// sa route retient la MTU (`ipv4_sk_update_pmtu`).
+pub fn apprendre_si_mtu(e: &ErreurRecue) {
+    use formats::reseau::icmp;
+    if e.genre == icmp::INJOIGNABLE && e.code == icmp::FRAGMENTATION {
+        ipv4::apprendre_mtu(e.interne.destination, e.info);
+    }
 }
 
 /// Faut-il dire à la socket `s` qu'un paquet devait être fragmenté (ICMP

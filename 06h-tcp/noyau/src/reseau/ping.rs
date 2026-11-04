@@ -174,6 +174,7 @@ pub fn erreur(e: &ErreurRecue) {
     }
     let Some(ident) = e.origine.get(debut + 4..debut + 6).map(|o| u16::from_be_bytes([o[0], o[1]])) else { return };
     let Some(s) = IDENTS.verrouiller().as_ref().and_then(|t| t.trouver(ident, e.destination)) else { return };
+    super::udp::apprendre_si_mtu(e);
     let (errno, fatale) = match e.genre {
         icmp::ETOUFFEMENT | icmp::REDIRECTION => (EREMOTEIO, false),
         _ => match super::udp::convertir(e.genre, e.code, super::udp::fragmentation_dite(&s)) {
