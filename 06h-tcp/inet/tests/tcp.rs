@@ -2445,3 +2445,149 @@ fn tlp_rien_de_perdu() {
     c.recevoir(&Tcp { ack: nxt.wrapping_add(1), options: tcp::Options::default(), ..m }, vide(), maintenant());
     assert!(c.congestion().0 >= cwnd);
 }
+
+/// F-RTO (RFC 5682) : un RTO pour rien. La tête repart ; l'ACK qui avance fait
+/// envoyer du NEUF, pas tout le reste ; et un ACK de segments jamais renvoyés dit
+/// que tout était arrivé : la perte est annulée, la cwnd et le seuil reviennent.
+/// Sans SACK ni horodatages : c'est le cas de slirp.
+#[test]
+fn frto_un_rto_pour_rien() {
+    let (mut c, _f) = paire();
+    let mss = MSS as u32;
+    ecrire(&mut c, &vec![1u8; 8 * MSS as usize]);
+    let s = sortants(&mut c);
+    let cwnd = c.congestion().0 as usize;
+    assert_eq!(s.len(), cwnd.min(8));
+    let (una, nxt, _) = c.numeros();
+    let avant_rto = c.congestion().0;
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    assert_eq!(s.iter().map(|x| x.0.seq).collect::<Vec<_>>(), [una]);
+    assert_eq!(c.info(maintenant()).phase, 4);
+    assert!(c.congestion().0 <= 2);
+    // L'ACK du renvoi : pas de renvoi de plus, mais du neuf, s'il y en a.
+    ecrire(&mut c, &vec![2u8; 4 * MSS as usize]);
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una + mss, fenetre: 65_535, ..Tcp::default() };
+    c.recevoir(&m, vide(), maintenant());
+    let s = sortants(&mut c);
+    assert!(!s.is_empty() && s.iter().all(|x| !t::avant(x.0.seq, nxt)), "du neuf seulement : {:?}", s.iter().map(|x| x.0.seq - una).collect::<Vec<_>>());
+    // Un ACK des segments jamais renvoyés : la perte n'en était pas une.
+    let i = c.info(maintenant());
+    assert_eq!(i.perdus, cwnd.min(8) as u32 - 1);
+    c.recevoir(&Tcp { ack: una + 3 * mss, ..m }, vide(), maintenant());
+    let i = c.info(maintenant());
+    assert_eq!((i.phase, i.perdus), (0, 0), "annulée");
+    assert!(c.congestion().0 >= avant_rto);
+}
+
+/// F-RTO : un ACK dupliqué après le neuf : la perte était vraie, on renvoie.
+#[test]
+fn frto_une_vraie_perte() {
+    let (mut c, _f) = paire();
+    let mss = MSS as u32;
+    ecrire(&mut c, &vec![1u8; 8 * MSS as usize]);
+    sortants(&mut c);
+    let (una, nxt, _) = c.numeros();
+    echeance_suivante(&mut c);
+    sortants(&mut c);
+    ecrire(&mut c, &vec![2u8; 4 * MSS as usize]);
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una + mss, fenetre: 65_535, ..Tcp::default() };
+    c.recevoir(&m, vide(), maintenant());
+    assert!(sortants(&mut c).iter().all(|x| !t::avant(x.0.seq, nxt)));
+    // L'ACK dupliqué : les segments neufs sont arrivés, pas les autres.
+    c.recevoir(&m, vide(), maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.seq, una + mss, "le renvoi repart");
+    assert_eq!(c.info(maintenant()).phase, 4);
+}
+
+/// L'annulation par les horodatages : la reprise a renvoyé la tête, mais l'ACK
+/// répond à un envoi antérieur à ce renvoi : le segment n'était que retardé.
+#[test]
+fn annulation_par_tsecr() {
+    let (mut c, mut f) = paire_ts();
+    calmer(&mut c, &mut f);
+    avancer(100 * MS);
+    let mss = MSS as u32 - 12;
+    ecrire(&mut c, &vec![1u8; 6 * mss as usize]);
+    let s = sortants(&mut c);
+    let (val0, recent) = s[0].0.options.horodatage.unwrap();
+    let (una, nxt, _) = c.numeros();
+    let (cwnd, seuil, _) = c.congestion();
+    avancer(10 * MS);
+    // Trois ACK dupliqués : la reprise, la tête renvoyée. (Le premier met à jour la
+    // fenêtre : il ne compte pas.)
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una, fenetre: 65_535, options: tcp::Options { horodatage: Some((recent, val0)), ..Default::default() }, ..Tcp::default() };
+    for _ in 0..4 {
+        c.recevoir(&m, vide(), maintenant());
+    }
+    assert_eq!(c.info(maintenant()).phase, 3);
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.seq, una);
+    assert!(c.congestion().0 < cwnd);
+    assert!(c.congestion().1 < seuil);
+    // L'ACK de tout : son écho précède le renvoi : la reprise est défaite, le seuil
+    // revient. (Sans SACK, l'état reste jusqu'à un ACK qui passe `high_seq`, et PRR
+    // règle la cwnd jusque-là, comme chez Linux ; le seuil revenu, elle remonte
+    // en démarrage lent.)
+    avancer(10 * MS);
+    c.recevoir(&Tcp { ack: nxt, ..m }, vide(), maintenant());
+    assert_eq!(c.congestion().1, seuil);
+    ecrire(&mut c, b"x");
+    sortants(&mut c);
+    c.recevoir(&Tcp { ack: nxt.wrapping_add(1), ..m }, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).phase, 0);
+    assert_eq!(c.congestion().1, seuil);
+}
+
+/// L'annulation par D-SACK : le seul renvoi de la reprise est démenti par un
+/// doublon : la réduction était pour rien.
+#[test]
+fn annulation_par_dsack() {
+    let (mut c, _f) = paire_sack_rtt();
+    let mss = MSS as u32;
+    ecrire(&mut c, &vec![1u8; 6 * MSS as usize]);
+    sortants(&mut c);
+    let (una, nxt, _) = c.numeros();
+    let (cwnd, seuil, _) = c.congestion();
+    avancer(MS);
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una, fenetre: 65_535, ..Tcp::default() };
+    let mut o = tcp::Options { nb_blocs: 1, ..Default::default() };
+    o.blocs[0] = (una + mss, una + 5 * mss);
+    c.recevoir(&Tcp { options: o, ..m }, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).phase, 3);
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.seq, una);
+    assert!(c.congestion().0 < cwnd);
+    // L'ACK de tout, et le D-SACK de la tête : son renvoi était un doublon.
+    let mut o = tcp::Options { nb_blocs: 1, ..Default::default() };
+    o.blocs[0] = (una, una + mss);
+    c.recevoir(&Tcp { ack: nxt, options: o, ..m }, vide(), maintenant());
+    let (cwnd2, seuil2, _) = c.congestion();
+    assert_eq!(c.info(maintenant()).phase, 0);
+    assert_eq!(c.info(maintenant()).dsack_doublons, 1);
+    assert!(cwnd2 >= cwnd && seuil2 == seuil, "{cwnd2} contre {cwnd}, seuil {seuil2} contre {seuil}");
+}
+
+/// Un SYN renvoyé pour rien : l'écho est celui du premier : la fenêtre de départ
+/// reste de 10 (`tcp_try_undo_spurious_syn`) ; renvoyé deux fois et sans cet écho :
+/// 1 (`tcp_init_transfer`).
+#[test]
+fn syn_renvoye_pour_rien() {
+    for (ecart, attendu) in [(0, 10), (1, 1)] {
+        avancer(10 * MS);
+        let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+        c.proposer_horodatages(1000);
+        let (syn, _) = sortants(&mut c)[0];
+        let val = syn.options.horodatage.unwrap().0;
+        for _ in 0..2 {
+            echeance_suivante(&mut c);
+            let _ = sortants(&mut c);
+        }
+        let sa = Tcp { source: 80, destination: 40000, seq: 7000, ack: 1001, drapeaux: tcp::SYN | tcp::ACK, fenetre: 65_535,
+                       options: tcp::Options { mss: Some(MSS), horodatage: Some((5, val + ecart)), ..Default::default() }, ..Tcp::default() };
+        c.recevoir(&sa, vide(), maintenant());
+        assert_eq!(c.etat(), Etat::Etablie);
+        assert_eq!(c.congestion().0, attendu);
+    }
+}

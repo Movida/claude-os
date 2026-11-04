@@ -35,10 +35,7 @@
 //! une fonction cubique du temps depuis la dernière perte, et HyStart pour
 //! quitter le démarrage lent) : derrière slirp ou sur `lo`, rien ne se
 //! perd, et la cwnd ne limite jamais rien ; Linux garde Reno comme
-//! référence. TCP_CONGESTION rend « reno ». Pas non plus d'« annulation »
-//! (Linux revient sur une réduction quand il découvre qu'une
-//! retransmission était inutile : il lui faut les horodatages ou les
-//! D-SACK, que nous n'avons pas), ni de F-RTO (RFC 5682).
+//! référence. TCP_CONGESTION rend « reno ».
 
 use super::avant;
 
@@ -110,6 +107,11 @@ impl Congestion {
     /// (`tcp_reno_ssthresh`).
     pub fn seuil(&self) -> u32 {
         (self.cwnd >> 1).max(2)
+    }
+
+    /// La cwnd d'une réduction défaite (`tcp_reno_undo_cwnd`).
+    pub fn annuler(&self, avant: u32) -> u32 {
+        self.cwnd.max(avant)
     }
 
     /// Le compte vers le prochain segment repart de zéro.

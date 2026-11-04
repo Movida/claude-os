@@ -738,10 +738,11 @@ pub struct Tcb<P: Charge> {
     prior_cwnd: u32,
     prr_livres: u32,
     prr_sortis: u32,
-    /// Le début de l'épisode qu'on pourrait annuler (`undo_marker`), et les
-    /// renvois pas encore démentis (`undo_retrans`).
+    /// Le début de l'épisode qu'on pourrait annuler (`undo_marker`), les
+    /// renvois pas encore démentis (`undo_retrans`), et F-RTO en cours (`frto`).
     undo_marker: Option<u32>,
     undo_retrans: i32,
+    frto: bool,
     /// Les segments livrés et perdus depuis le début (`delivered`, `lost`) : leur
     /// différence, sur un ACK, règle la cwnd.
     livres: u32,
@@ -885,6 +886,7 @@ impl<P: Charge> Tcb<P> {
             prr_sortis: 0,
             undo_marker: None,
             undo_retrans: -1,
+            frto: false,
             livres: 0,
             perdus: 0,
             reordering: TCP_REORDERING,
@@ -1800,6 +1802,7 @@ impl<P: Charge> Tcb<P> {
                     self.snd_wnd = t.fenetre as u32;
                     self.max_fenetre = self.snd_wnd;
                     self.snd_wl1 = t.seq;
+                    self.syn_renvoye_pour_rien();
                     self.mesurer_syn(maintenant);
                     self.retransmissions = 0;
                     self.retrans_stamp = 0;
@@ -1923,6 +1926,7 @@ impl<P: Charge> Tcb<P> {
             return e;
         }
         if etablissement {
+            self.syn_renvoye_pour_rien();
             self.mesurer_syn(maintenant);
             self.etablir(maintenant);
         }
@@ -1995,7 +1999,7 @@ impl<P: Charge> Tcb<P> {
             // Ses blocs valent encore.
             if a_des_blocs {
                 flag |= self.marquer_blocs(t, una_avant, &mut etat, maintenant);
-                self.alerte(0, &mut flag, maintenant);
+                self.alerte(una_avant, 0, &mut flag, maintenant);
                 if self.rexmit != Rexmit::Rien {
                     e.a_emettre = true;
                 }
@@ -2036,7 +2040,7 @@ impl<P: Charge> Tcb<P> {
         if packets_avant == 0 {
             // Un D-SACK sans rien en vol peut encore annuler une réduction.
             if flag & FLAG_DSACKING_ACK != 0 {
-                self.alerte(0, &mut flag, maintenant);
+                self.alerte(una_avant, 0, &mut flag, maintenant);
             }
             self.ack_de_sonde(maintenant);
             self.traiter_ack_de_sonde(t.ack, flag);
@@ -2048,7 +2052,7 @@ impl<P: Charge> Tcb<P> {
         // `tcp_ack_is_dubious`.
         if flag & FLAG_NOT_DUP == 0 || flag & FLAG_CA_ALERT != 0 || self.cc.phase != Phase::Ouverte {
             let dupack = u32::from(flag & (FLAG_SND_UNA_ADVANCED | FLAG_NOT_DUP | FLAG_DSACKING_ACK) == 0);
-            self.alerte(dupack, &mut flag, maintenant);
+            self.alerte(una_avant, dupack, &mut flag, maintenant);
         }
         // `tcp_set_xmit_timer` : la sonde de fin de rafale, sinon le RTO.
         if flag & FLAG_SET_XMIT_TIMER != 0 && !self.programmer_sonde_de_perte(true, maintenant) {
@@ -2221,7 +2225,7 @@ impl<P: Charge> Tcb<P> {
     /// La poignée de main est finie (`tcp_init_transfer`) : sans mesure du
     /// RTT (le SYN retransmis), le RTO de 3 s ; la fenêtre de congestion de
     /// départ, d'un segment seulement si le SYN a dû être renvoyé plus
-    /// d'une fois.
+    /// d'une fois, et pas pour rien.
     fn etablir(&mut self, maintenant: u64) {
         if self.rtt.mesure() {
             self.rto = self.rtt.rto();
@@ -2233,7 +2237,7 @@ impl<P: Charge> Tcb<P> {
         if self.ts.is_some() {
             self.mss_local -= TS_ALIGNE;
         }
-        self.cc.cwnd = if self.total_retrans > 1 { 1 } else { CWND_INITIALE };
+        self.cc.cwnd = if self.total_retrans > 1 && self.undo_marker.is_some() { 1 } else { CWND_INITIALE };
         // La perte du SYN est réparée ; le seuil, lui, garde sa moitié
         // (Linux aussi).
         if self.cc.phase == Phase::Perte {
@@ -3165,15 +3169,34 @@ impl<P: Charge> Tcb<P> {
         if core::mem::take(&mut self.rto_du) {
             self.renvoyer_tete(maintenant, &mut sortir);
         }
-        if core::mem::replace(&mut self.rexmit, Rexmit::Rien) == Rexmit::Perdus {
-            self.renvoyer_perdus(maintenant, &mut sortir);
+        match core::mem::replace(&mut self.rexmit, Rexmit::Rien) {
+            Rexmit::Rien => {}
+            Rexmit::Perdus => self.renvoyer_perdus(maintenant, &mut sortir),
+            Rexmit::Neuf => {
+                // F-RTO (`tcp_xmit_recovery`) : du neuf ; s'il n'a pas pu partir,
+                // la reprise ordinaire.
+                self.pousser = true;
+                self.envoyer_neuf(maintenant, &mut sortir);
+                if !apres(self.snd_nxt, self.high_seq) {
+                    self.frto = false;
+                    self.renvoyer_perdus(maintenant, &mut sortir);
+                }
+            }
         }
         if core::mem::take(&mut self.tlp_du) {
             self.envoyer_sonde_de_perte(maintenant, &mut sortir);
         }
-        // Les données neuves, et le FIN (`tcp_write_xmit`), tant que la fenêtre
-        // de congestion a de la place : un segment entier dans la fenêtre de
-        // l'autre (`tcp_snd_wnd_test` : on attend plutôt que de le couper).
+        self.envoyer_neuf(maintenant, &mut sortir);
+        if self.ack_maintenant {
+            sortir(Sortant { entete: self.entete(self.seq_acceptable(), tcp::ACK), debut: 0, longueur: 0 });
+            self.ack_envoye();
+        }
+    }
+
+    /// Les données neuves, et le FIN (`tcp_write_xmit`), tant que la fenêtre
+    /// de congestion a de la place : un segment entier dans la fenêtre de
+    /// l'autre (`tcp_snd_wnd_test` : on attend plutôt que de le couper).
+    fn envoyer_neuf(&mut self, maintenant: u64, sortir: &mut impl FnMut(Sortant)) {
         let mut sortis = 0;
         loop {
             let debut = self.snd_nxt.wrapping_sub(self.seq_envoi) as usize;
@@ -3212,7 +3235,7 @@ impl<P: Charge> Tcb<P> {
                     self.cc.redemarrer(silence, self.rto);
                 }
             }
-            if !self.envoyer_donnees(n, avec_fin, maintenant, &mut sortir) {
+            if !self.envoyer_donnees(n, avec_fin, maintenant, sortir) {
                 break;
             }
             sortis += 1;
@@ -3235,10 +3258,6 @@ impl<P: Charge> Tcb<P> {
         // (`tcp_check_probe_timer`), qui les poussera au plus tard.
         if self.file.is_empty() && self.prochain_segment().is_some() && self.t_xmit.is_none() {
             self.armer_xmit(Minuteur::Sonde, self.rto.max(RTO_MIN), maintenant);
-        }
-        if self.ack_maintenant {
-            sortir(Sortant { entete: self.entete(self.seq_acceptable(), tcp::ACK), debut: 0, longueur: 0 });
-            self.ack_envoye();
         }
     }
 }

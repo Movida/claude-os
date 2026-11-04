@@ -108,6 +108,8 @@ pub(super) enum Rexmit {
     Rien,
     /// Les segments marqués perdus.
     Perdus,
+    /// Des segments neufs, à la façon de F-RTO, sinon les perdus.
+    Neuf,
 }
 
 /// Ce qu'a donné l'ACK d'un segment (ce que rend `tcp_ack`).
@@ -397,7 +399,7 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// `tcp_init_undo` : d'où partira l'annulation (F-RTO).
+    /// `tcp_init_undo` : d'où partira l'annulation.
     fn poser_annulation(&mut self) {
         self.undo_marker = Some(self.snd_una);
         self.undo_retrans = self.retrans_out as i32;
@@ -414,6 +416,7 @@ impl<P: Charge> Tcb<P> {
     /// si l'on était déjà en reprise ou en perte pour les mêmes données, sauf à
     /// la première retransmission de la perte).
     pub(super) fn entrer_perte(&mut self, maintenant: u64) {
+        let nouvelle_reprise = self.cc.phase < Phase::Reprise;
         // `tcp_timeout_mark_lost` : la tête marquée SACKée veut dire que l'autre a
         // oublié ce qu'il avait dit recevoir (« reneging ») : tout est oublié.
         // Sinon, les SACK restent, et ce qui vient de partir (moins d'un RTT de
@@ -451,6 +454,10 @@ impl<P: Charge> Tcb<P> {
         self.cc.phase = Phase::Perte;
         self.high_seq = self.snd_nxt;
         self.tlp_high_seq = None;
+        // F-RTO (RFC 5682, 3.1, étape 1) : seulement hors d'une autre reprise,
+        // ou pour des RTO répétés du même SND.UNA (3.2). (`tcp_frto` vaut 2 sur
+        // l'hôte ; toute valeur non nulle dit la même chose dans 6.18.)
+        self.frto = nouvelle_reprise || self.retransmissions > 0;
     }
 
     /// Une réduction de la cwnd commence (`tcp_init_cwnd_reduction`).
@@ -509,16 +516,123 @@ impl<P: Charge> Tcb<P> {
         false
     }
 
-    /// La fin d'une reprise (`tcp_try_undo_recovery`) : rend vrai si l'état doit
-    /// rester.
+    // --- L'annulation ---
+
+    /// TSecr répond-il à un envoi antérieur à `quand` (`tcp_tsopt_ecr_before`) ?
+    fn tsecr_avant(&self, quand: u64) -> bool {
+        self.ts_recu.is_some_and(|(_, ecr)| ecr != 0 && avant(ecr, super::horloge_ts(quand)))
+    }
+
+    /// Rien n'a été renvoyé, ou l'écho dit que ce qui arrive précède le premier
+    /// renvoi : le paquet n'était que retardé (`tcp_packet_delayed`).
+    fn paquet_retarde(&self) -> bool {
+        if self.retrans_stamp != 0 {
+            return self.tsecr_avant(self.retrans_stamp);
+        }
+        // `retrans_stamp` nul, ce qui veut dire d'ordinaire : rien de renvoyé ;
+        // sauf deux cas où il a été effacé après un renvoi.
+        if !self.sack_ok && !avant(self.snd_una, self.high_seq) {
+            return false;
+        }
+        self.etat != Etat::SynEnvoye
+    }
+
+    /// `tcp_may_undo` : il y a un épisode à annuler, et tous ses renvois sont
+    /// démentis par des D-SACK, ou c'était un retard.
+    fn annulation_possible(&self) -> bool {
+        self.undo_marker.is_some() && (self.undo_retrans == 0 || self.paquet_retarde())
+    }
+
+    /// La réduction est défaite (`tcp_undo_cwnd_reduction`) : la cwnd et le seuil
+    /// d'avant ; `sans_pertes` : ce qui était marqué perdu ne l'est plus. Le recul
+    /// du RTO, lui, reste jusqu'à la prochaine vraie mesure.
+    fn annuler_reduction(&mut self, sans_pertes: bool) {
+        if sans_pertes {
+            for e in self.file.iter_mut() {
+                e.marques &= !PERDU;
+            }
+            self.lost_out = 0;
+            self.indice_renvoi = None;
+        }
+        if self.prior_ssthresh != 0 {
+            self.cc.cwnd = self.cc.annuler(self.prior_cwnd);
+            if self.prior_ssthresh > self.cc.ssthresh {
+                self.cc.ssthresh = self.prior_ssthresh;
+            }
+        }
+        self.undo_marker = None;
+        self.rack.avance = true;
+    }
+
+    /// La fin d'une reprise (`tcp_try_undo_recovery`) : défaite, si elle l'a été
+    /// pour rien. Rend vrai si l'état doit rester.
     fn fin_de_reprise(&mut self) -> bool {
-        self.rack.persiste = self.rack.persiste.saturating_sub(1);
+        if self.annulation_possible() {
+            self.annuler_reduction(false);
+        } else {
+            self.rack.persiste = self.rack.persiste.saturating_sub(1);
+        }
         if self.reno_empeche_de_rouvrir() {
             return true;
         }
         self.cc.phase = Phase::Ouverte;
         self.sack_renie = false;
         false
+    }
+
+    /// Les D-SACK ont démenti tous les renvois (`tcp_try_undo_dsack`).
+    fn annuler_par_dsack(&mut self) -> bool {
+        if self.undo_marker.is_some() && self.undo_retrans == 0 {
+            self.rack.persiste = (self.rack.persiste + 1).min(super::sack::RACK_PERSISTE);
+            self.annuler_reduction(false);
+            return true;
+        }
+        false
+    }
+
+    /// Pendant une perte, après un ACK partiel ou par F-RTO (`tcp_try_undo_loss`).
+    fn annuler_la_perte(&mut self, par_frto: bool) -> bool {
+        if par_frto || self.annulation_possible() {
+            self.annuler_reduction(true);
+            self.retransmissions = 0;
+            if self.reno_empeche_de_rouvrir() {
+                return true;
+            }
+            if par_frto || self.sack_ok {
+                self.cc.phase = Phase::Ouverte;
+                self.sack_renie = false;
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Pendant une reprise rapide, après un ACK partiel (`tcp_try_undo_partial`) :
+    /// le trou a été comblé par le paquet retardé, pas par son renvoi : c'est du
+    /// réordonnancement, et il est plus grand qu'on ne le croyait. Rend vrai s'il
+    /// reste des renvois en vol : on continue d'envoyer, sans rien marquer de plus.
+    fn annuler_partiel(&mut self, una_avant: u32) -> bool {
+        if self.undo_marker.is_some() && self.paquet_retarde() {
+            self.verifier_reordonnancement(una_avant);
+            if self.retrans_out > 0 {
+                return true;
+            }
+            self.nettoyer_retrans_stamp();
+            self.annuler_reduction(true);
+            self.rester_ouverte();
+        }
+        false
+    }
+
+    /// `tcp_try_undo_spurious_syn` : le SYN (ou le SYN-ACK) a été renvoyé, mais
+    /// l'écho est celui du premier : le renvoi était inutile.
+    pub(super) fn syn_renvoye_pour_rien(&mut self) {
+        if self.undo_marker.is_some()
+            && self.retrans_stamp != 0
+            && self.ts_recu.is_some_and(|(_, ecr)| ecr == super::horloge_ts(self.retrans_stamp))
+        {
+            self.undo_marker = None;
+        }
     }
 
     /// `tcp_try_keep_open`.
@@ -538,22 +652,55 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// Un ACK dans l'état de perte (`tcp_process_loss`) : tout est réparé, ou
-    /// on continue de renvoyer.
-    fn traiter_perte(&mut self, flag: u32) {
-        if !avant(self.snd_una, self.high_seq) {
+    /// Un ACK dans l'état de perte (`tcp_process_loss`) : la perte était fausse, ou
+    /// est réparée, ou on continue. F-RTO (RFC 5682, la variante SACK, qui vaut
+    /// aussi sans) : après le renvoi de la tête, si l'ACK avance sans tout couvrir,
+    /// DEUX SEGMENTS NEUFS plutôt que de tout renvoyer (étape 2.b) ; si ce qui revient
+    /// ensuite acquitte des segments jamais renvoyés, le RTO s'est déclenché pour
+    /// rien : tout est annulé (3.b) ; un ACK dupliqué ou un SACK : la perte était
+    /// vraie (3.a). Le RTO pour rien vient d'un chemin dont le délai a sauté ; sans
+    /// F-RTO, tout serait renvoyé, et tous ces doublons feraient croire à une perte.
+    fn traiter_perte(&mut self, flag: u32, num_dupack: u32) {
+        let repare = !avant(self.snd_una, self.high_seq);
+        if flag & FLAG_SND_UNA_ADVANCED != 0 && self.annuler_la_perte(false) {
+            return;
+        }
+        if self.frto {
+            if flag & FLAG_ORIG_SACK_ACKED != 0 && self.annuler_la_perte(true) {
+                return;
+            }
+            if apres(self.snd_nxt, self.high_seq) {
+                if flag & FLAG_DATA_SACKED != 0 || num_dupack > 0 {
+                    self.frto = false;
+                }
+            } else if flag & FLAG_SND_UNA_ADVANCED != 0 && !repare {
+                self.high_seq = self.snd_nxt;
+                if self.prochain_segment().is_some() && apres(self.snd_una.wrapping_add(self.snd_wnd), self.snd_nxt) {
+                    self.rexmit = Rexmit::Neuf;
+                    return;
+                }
+                self.frto = false;
+            }
+        }
+        if repare {
             self.fin_de_reprise();
             return;
         }
-        if !self.sack_ok && flag & FLAG_SND_UNA_ADVANCED != 0 {
-            self.sacked_out = 0;
+        if !self.sack_ok {
+            // Un ACK dupliqué : les segments neufs de F-RTO sont arrivés ; moins
+            // en vol, de quoi renvoyer.
+            if apres(self.snd_nxt, self.high_seq) && num_dupack > 0 {
+                self.ajouter_reno_sack(num_dupack);
+            } else if flag & FLAG_SND_UNA_ADVANCED != 0 {
+                self.sacked_out = 0;
+            }
         }
         self.rexmit = Rexmit::Perdus;
     }
 
     /// Un ACK anormal, ou n'importe quel ACK hors de l'état ouvert : ce qui
     /// est perdu, et ce que devient l'état (`tcp_fastretrans_alert`).
-    pub(super) fn alerte(&mut self, num_dupack: u32, flag: &mut u32, maintenant: u64) {
+    pub(super) fn alerte(&mut self, una_avant: u32, num_dupack: u32, flag: &mut u32, maintenant: u64) {
         if self.file.is_empty() && self.sacked_out > 0 {
             self.sacked_out = 0;
         }
@@ -591,13 +738,28 @@ impl<P: Charge> Tcb<P> {
         }
         match self.cc.phase {
             Phase::Reprise => {
-                if *flag & FLAG_SND_UNA_ADVANCED == 0 && !self.sack_ok {
-                    self.ajouter_reno_sack(num_dupack);
+                if *flag & FLAG_SND_UNA_ADVANCED == 0 {
+                    if !self.sack_ok {
+                        self.ajouter_reno_sack(num_dupack);
+                    }
+                } else if self.annuler_partiel(una_avant) {
+                    return;
+                }
+                if self.annuler_par_dsack() {
+                    self.essayer_d_ouvrir();
                 }
                 self.identifier_pertes(flag, maintenant);
+                // L'annulation a défait la reprise ; si une perte est là malgré
+                // tout (du désordre, puis une vraie), une nouvelle reprise.
+                if self.cc.phase != Phase::Reprise {
+                    if self.lost_out == 0 {
+                        return;
+                    }
+                    self.entrer_reprise();
+                }
             }
             Phase::Perte => {
-                self.traiter_perte(*flag);
+                self.traiter_perte(*flag, num_dupack);
                 self.identifier_pertes(flag, maintenant);
                 if !(self.cc.phase == Phase::Ouverte || *flag & FLAG_LOST_RETRANS != 0) {
                     return;
@@ -620,6 +782,9 @@ impl<P: Charge> Tcb<P> {
                 self.sacked_out = 0;
             }
             self.ajouter_reno_sack(num_dupack);
+        }
+        if self.cc.phase <= Phase::Desordre {
+            self.annuler_par_dsack();
         }
         self.identifier_pertes(flag, maintenant);
         if self.lost_out == 0 {
@@ -796,8 +961,13 @@ impl<P: Charge> Tcb<P> {
     fn renvoyer(&mut self, i: usize, maintenant: u64, sortir: &mut impl FnMut(Sortant)) -> bool {
         let ok = self.envoyer_entree(i, maintenant, sortir);
         if ok {
+            // Déjà marqué : une annulation a pu retirer sa perte en lui laissant son
+            // renvoi, et le RTO le renvoie encore. Linux le compte alors deux fois
+            // (« retrans_out leaked », dit son journal de débogage) ; pas nous.
+            if self.file[i].marques & EN_RENVOI == 0 {
+                self.retrans_out += 1;
+            }
             self.file[i].marques |= EN_RENVOI;
-            self.retrans_out += 1;
         }
         if self.retrans_stamp == 0 {
             self.retrans_stamp = self.file[i].envoi;
