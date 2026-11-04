@@ -347,7 +347,7 @@ impl Socket {
     /// Une socket TCP : son flux, et ses tampons de départ (`tcp_rmem[1]`,
     /// `tcp_wmem[1]`). None : plus de mémoire pour le flux.
     pub fn tcp(mut self) -> Option<Socket> {
-        self.flux = Some(faillible::boite(super::tcp::nouvelle(self.numero)).ok()?);
+        self.flux = Some(faillible::boite(super::tcp::nouvelle(self.numero)?).ok()?);
         self.rcvbuf.store(super::tcp::RCVBUF_DEFAUT, Ordering::Relaxed);
         self.sndbuf.store(super::tcp::SNDBUF_DEFAUT, Ordering::Relaxed);
         Some(self)

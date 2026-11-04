@@ -83,6 +83,8 @@ pub(super) struct Envoye {
     drapeaux: u8,
     /// Les segments livrés à son dernier envoi (`tx.delivered`).
     livres_tx: u32,
+    /// Le numéro de son dernier envoi (carte.rs).
+    pub(super) numero: u64,
 }
 
 /// Ce que les blocs d'un ACK ont appris (`tcp_sacktag_state`), et ce que la
@@ -125,8 +127,8 @@ pub(super) enum ResultatAck {
 }
 
 impl Envoye {
-    pub(super) fn neuf(seq: u32, fin_seq: u32, envoi: u64, drapeaux: u8, livres_tx: u32) -> Envoye {
-        Envoye { seq, fin_seq, envoi, marques: 0, drapeaux, livres_tx }
+    pub(super) fn neuf(seq: u32, fin_seq: u32, envoi: u64, drapeaux: u8, livres_tx: u32, numero: u64) -> Envoye {
+        Envoye { seq, fin_seq, envoi, marques: 0, drapeaux, livres_tx, numero }
     }
 
     /// Ses octets de données, sans le FIN.
@@ -934,6 +936,10 @@ impl<P: Charge> Tcb<P> {
     /// rien sur des données en vol bloquerait tout). Rend faux si rien n'a pu
     /// partir.
     pub(super) fn envoyer_entree(&mut self, i: usize, maintenant: u64, sortir: &mut impl FnMut(Sortant)) -> bool {
+        // Toujours dans la carte (`skb_still_in_host_queue`) : il n'est pas perdu.
+        if self.encore_dans_la_carte(i) {
+            return false;
+        }
         // Sa tête a pu être acquittée depuis (`tcp_trim_head`).
         if avant(self.file[i].seq, self.snd_una) {
             self.file[i].seq = self.snd_una;
@@ -965,7 +971,9 @@ impl<P: Charge> Tcb<P> {
         self.total_retrans += 1;
         let debut = e.seq.wrapping_sub(self.seq_envoi) as usize;
         let h = self.entete(e.seq, e.drapeaux);
-        sortir(Sortant { entete: h, debut, longueur: e.longueur() as usize });
+        let numero = self.compter_envoi(e.longueur() as usize);
+        sortir(Sortant { entete: h, debut, longueur: e.longueur() as usize, numero });
+        self.file[i].numero = numero;
         self.file[i].envoi = maintenant;
         self.file[i].marques = (self.file[i].marques | DEJA_RENVOYE) & !COMPTE;
         self.file[i].livres_tx = self.livres;
@@ -1002,7 +1010,10 @@ impl<P: Charge> Tcb<P> {
         ok
     }
 
-    /// La tête, après un RTO (`tcp_retransmit_skb(sk, head, 1)`).
+    /// La tête, après un RTO (`tcp_retransmit_skb(sk, head, 1)`). Qu'elle n'ait pas pu partir
+    /// (encore dans la carte, ou plus de mémoire) ne change rien : le recul vaut quand même :
+    /// -EBUSY et -ENOMEM ne sont pas la « congestion locale » de `tcp_retransmit_timer`, qui
+    /// réessaie plus vite : un NET_XMIT_DROP de la couche du dessous, qu'aucun chemin ne nous dit.
     pub(super) fn renvoyer_tete(&mut self, maintenant: u64, sortir: &mut impl FnMut(Sortant)) {
         if !self.file.is_empty() {
             self.renvoyer(0, maintenant, sortir);
@@ -1027,6 +1038,9 @@ impl<P: Charge> Tcb<P> {
             }
             let m = self.file[i].marques;
             if self.retrans_out >= self.lost_out {
+                break;
+            }
+            if m & PERDU != 0 && m & (EN_RENVOI | SACKE) == 0 && self.carte_trop_pleine(self.file[i].longueur() as usize, 1) {
                 break;
             }
             if m & PERDU == 0 {

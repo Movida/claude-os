@@ -79,7 +79,9 @@ pub fn interface() -> Option<&'static Interface> {
 /// Émet la trame `p` par `lo` : dans la file (comptée, voir l'en-tête),
 /// puis la file vidée tout de suite, dans le contexte de qui l'envoie. Sans
 /// aucun verrou tenu : la réception en prendra.
-pub fn emettre(i: &Interface, p: Paquet) {
+pub fn emettre(i: &Interface, mut p: Paquet) {
+    // Rien n'attend ici (`loopback_xmit` : `skb_orphan`).
+    p.orpheliner();
     let longueur = p.longueur().saturating_sub(ethernet::ENTETE) as u64;
     {
         let mut f = FILE.verrouiller();

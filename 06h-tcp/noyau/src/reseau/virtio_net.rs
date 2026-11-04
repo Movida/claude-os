@@ -45,7 +45,7 @@
 //! (une trame arrivée entre les deux n'est pas perdue).
 
 use super::interface::{self, Interface, Materiel};
-use super::paquet::Paquet;
+use super::paquet::{Paquet, Proprietaire};
 use crate::faillible::{self, FileFaillible, VecFaillible};
 use crate::pci::{self, Fonction};
 use crate::virtio::{self, Notifieur, Virtio};
@@ -103,6 +103,11 @@ struct Emission {
     libres: Vec<u16>,
     /// Les trames qui attendent une case.
     attente: VecDeque<Paquet>,
+    /// La socket de la trame de chaque case (le `skb->sk` d'un paquet que la carte n'a
+    /// pas encore fini), et combien il y en a. Tant qu'il en reste, l'interruption
+    /// d'émission reste allumée : la socket attend peut-être cette fin d'émission (TSQ).
+    proprietaires: Vec<Option<Proprietaire>>,
+    suivies: usize,
 }
 
 /// La carte en service.
@@ -280,11 +285,13 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
     // La place de toutes les cases, et de la petite file : l'émission
     // n'alloue jamais (elle rend une case à sa place, met un paquet en
     // attente dans la sienne).
-    if libres.try_reserve_exact(TAILLE_FILE as usize).is_err() || attente.try_reserve_exact(ATTENTE_MAX).is_err() {
+    let mut proprietaires = Vec::new();
+    if libres.try_reserve_exact(TAILLE_FILE as usize).is_err() || attente.try_reserve_exact(ATTENTE_MAX).is_err() || proprietaires.try_reserve_exact(TAILLE_FILE as usize).is_err() {
         return Err(renoncer(v, virtio::Refus::Memoire));
     }
     for case in (0..TAILLE_FILE).rev() {
         libres.ajouter_dans_la_place(case);
+        proprietaires.ajouter_dans_la_place(None);
     }
     // Les files d'abord, puis leurs interruptions : la carte est dans le
     // tas (son adresse, l'argument des gestionnaires, ne bouge plus), et
@@ -305,7 +312,7 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
         pages_reception,
         pages_emission,
         reception: Verrou::new(Reception { file: rx, notifieur: rx_notifieur }),
-        emission: Verrou::new(Emission { file: tx, notifieur: tx_notifieur, libres, attente }),
+        emission: Verrou::new(Emission { file: tx, notifieur: tx_notifieur, libres, attente, proprietaires, suivies: 0 }),
     });
     let argument = &*carte as *const Carte as usize;
     // Un échec à partir d'ici rend les vecteurs déjà donnés, puis la carte
@@ -351,7 +358,10 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
 /// La petite file d'émission de la carte est-elle vide (vrai sans carte) ?
 pub fn au_repos() -> bool {
     let carte = *CARTE.verrouiller();
-    carte.is_none_or(|c| c.emission.verrouiller().attente.is_empty())
+    carte.is_none_or(|c| {
+        let e = c.emission.verrouiller();
+        e.attente.is_empty() && e.suivies == 0
+    })
 }
 
 impl Carte {
@@ -359,13 +369,14 @@ impl Carte {
     /// la petite file. false : jetée (plus grande qu'une case : elle ne
     /// partirait jamais, et bloquerait la petite file ; ou la petite file
     /// est pleine).
-    pub fn emettre(&self, p: Paquet) -> bool {
+    pub fn emettre(&self, mut p: Paquet) -> bool {
         if p.longueur() > TAILLE_TAMPON as usize - ENTETE {
             return false;
         }
         let mut e = self.emission.verrouiller();
         self.reprendre_cases(&mut e);
-        if e.attente.is_empty() && self.poser(&mut e, &p) {
+        if e.attente.is_empty() && self.poser(&mut e, &mut p) {
+            self.suivre_les_cases(&mut e);
             return true;
         }
         if e.attente.len() >= ATTENTE_MAX {
@@ -379,16 +390,29 @@ impl Carte {
         true
     }
 
-    /// Reprend les cases que la carte a finies d'émettre.
+    /// Reprend les cases que la carte a finies d'émettre : leurs sockets sont
+    /// prévenues (`tcp_wfree`).
     fn reprendre_cases(&self, e: &mut Emission) {
         while let Some((case, _)) = e.file.obtenir() {
             e.libres.ajouter_dans_la_place(case as u16);
+            if let Some(p) = e.proprietaires[case as usize].take() {
+                p.rendre();
+                e.suivies -= 1;
+            }
+        }
+    }
+
+    /// Des sockets attendent la fin d'émission de leurs trames : l'interruption allumée,
+    /// en revenant tout de suite si c'est déjà fait.
+    fn suivre_les_cases(&self, e: &mut Emission) {
+        if e.suivies > 0 && !e.file.rallumer() {
+            super::tache::signaler_interface(self.interface.load(Ordering::Relaxed));
         }
     }
 
     /// Copie `p` dans une case libre, derrière un en-tête nul, et la confie
-    /// à la carte. false : pas de case libre.
-    fn poser(&self, e: &mut Emission, p: &Paquet) -> bool {
+    /// à la carte, avec le lien à sa socket. false : pas de case libre.
+    fn poser(&self, e: &mut Emission, p: &mut Paquet) -> bool {
         let donnees = p.donnees();
         if donnees.len() > TAILLE_TAMPON as usize - ENTETE || e.file.libres() == 0 {
             return false;
@@ -404,6 +428,10 @@ impl Carte {
         }
         let t = Tampon { physique, longueur: (ENTETE + donnees.len()) as u32, drapeaux: 0 };
         e.file.ajouter(&[t], case as u32);
+        if let Some(q) = p.prendre_proprietaire() {
+            e.proprietaires[case as usize] = Some(q);
+            e.suivies += 1;
+        }
         if e.file.faut_il_notifier() {
             e.notifieur.notifier();
         }
@@ -419,16 +447,16 @@ impl Carte {
         {
             let mut e = self.emission.verrouiller();
             self.reprendre_cases(&mut e);
-            while let Some(p) = e.attente.pop_front() {
-                if !self.poser(&mut e, &p) {
+            while let Some(mut p) = e.attente.pop_front() {
+                if !self.poser(&mut e, &mut p) {
                     e.attente.ajouter_devant_dans_la_place(p);
                     break;
                 }
             }
-            // La petite file vide : plus besoin d'interruption d'émission ;
-            // sinon, être prévenu des prochaines cases libérées (et
-            // revenir tout de suite si c'est déjà fait).
-            if e.attente.is_empty() {
+            // La petite file vide, et aucune socket n'attend de fin d'émission :
+            // plus besoin d'interruption d'émission ; sinon, être prévenu des
+            // prochaines cases libérées (et revenir tout de suite si c'est déjà fait).
+            if e.attente.is_empty() && e.suivies == 0 {
                 e.file.couper();
             } else if !e.file.rallumer() {
                 super::tache::signaler_interface(i.index);

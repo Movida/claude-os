@@ -88,6 +88,7 @@ use alloc::vec::Vec;
 use formats::reseau::tcp::{self, Tcp};
 
 pub mod attente;
+mod carte;
 mod congestion;
 mod cubic;
 mod hors_ordre;
@@ -403,6 +404,9 @@ pub struct Sortant {
     /// longueur.
     pub debut: usize,
     pub longueur: usize,
+    /// Le numéro de cet envoi, pour suivre ce paquet dans la file de la carte
+    /// (`Tcb::poser_en_file`) ; 0 : il ne tient pas la socket (un ACK pur, un RST).
+    pub numero: u64,
 }
 
 /// Ce qu'un événement a changé, pour réveiller qui attend.
@@ -705,6 +709,18 @@ pub struct Tcb<P: Charge> {
     /// Le programme ne veut plus écrire : un FIN suit les données (son
     /// numéro : `fin_seq`).
     fin_voulue: bool,
+    // Ce que la carte a encore de cette connexion (`sk_wmem_alloc`, TSQ : carte.rs).
+    /// Les octets (en taille vraie) qu'elle garde, et jusqu'à quel envoi elle a fini
+    /// (`Tcb::poser_en_file`) ; le numéro du dernier envoi.
+    en_file: usize,
+    rendu: u64,
+    envois: u64,
+    /// Rien n'attend jamais dans une carte (`lo` : `skb_orphan` à l'émission).
+    pub sans_file: bool,
+    /// Il faudra pousser à la fin d'émission (TSQ_THROTTLED) ; et un `send` vient
+    /// d'écrire : `tcp_push`, où l'autocork se décide.
+    etrangle: bool,
+    ecrit: bool,
     /// Le programme a voulu écrire plus que la place (`SOCK_NOSPACE`) : il attend,
     /// et sa limite est le tampon d'envoi, pas ce qu'il a à dire. Et un segment
     /// est arrivé depuis le dernier regard (`tcp_data_snd_check`).
@@ -920,6 +936,12 @@ impl<P: Charge> Tcb<P> {
             octets_envoi: 0,
             seq_envoi: iss.wrapping_add(1),
             fin_voulue: false,
+            en_file: 0,
+            rendu: u64::MAX,
+            envois: 0,
+            sans_file: true,
+            etrangle: false,
+            ecrit: false,
             sans_place: false,
             place_a_voir: false,
             reception: VecDeque::new(),
@@ -1490,6 +1512,7 @@ impl<P: Charge> Tcb<P> {
             }
             fait += m;
             self.octets_envoi += m;
+            self.ecrit = true;
         }
         Ok(fait)
     }
@@ -3171,7 +3194,8 @@ impl<P: Charge> Tcb<P> {
             drapeaux |= tcp::FIN;
         }
         let h = self.entete(self.snd_nxt, drapeaux);
-        sortir(Sortant { entete: h, debut, longueur: n });
+        let numero = self.compter_envoi(n);
+        sortir(Sortant { entete: h, debut, longueur: n, numero });
         let fin_segment = self.snd_nxt.wrapping_add(n as u32 + u32::from(avec_fin));
         if n < self.mss_courant() as usize {
             // Un petit segment (`tcp_minshall_update`).
@@ -3186,7 +3210,7 @@ impl<P: Charge> Tcb<P> {
         }
         // Une sonde de fin de rafale armée laisse la place au RTO (`tcp_event_new_data_sent`).
         let rearmer = self.file.is_empty() || (self.t_xmit.is_some() && self.t_sorte == Minuteur::SondeDePerte);
-        self.file.push_back(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, self.livres));
+        self.file.push_back(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, self.livres, numero));
         self.tri_ajouter(self.snd_nxt, maintenant);
         self.snd_nxt = fin_segment;
         if rearmer {
@@ -3214,7 +3238,7 @@ impl<P: Charge> Tcb<P> {
                 Tcp { options: tcp::Options::default(), ..self.entete_avec(seq, drapeaux, 0) }
             };
             h.ack = ack;
-            sortir(Sortant { entete: h, debut: 0, longueur: 0 });
+            sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
             if self.etat == Etat::Fermee {
                 return;
             }
@@ -3250,7 +3274,7 @@ impl<P: Charge> Tcb<P> {
             if self.echelle_ok {
                 h.options.echelle = Some(self.echelle_reception);
             }
-            sortir(Sortant { entete: h, debut: 0, longueur: 0 });
+            sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
             self.snd_nxt = self.iss.wrapping_add(1);
             // Le premier SYN est chronométré ; pas ceux qui le répètent.
             if self.retransmissions == 0 && self.total_retrans == 0 {
@@ -3271,7 +3295,7 @@ impl<P: Charge> Tcb<P> {
             // à acquitter.
             if self.etat == Etat::SynRecu && self.ack_maintenant {
                 let h = self.entete(self.seq_acceptable(), tcp::ACK);
-                sortir(Sortant { entete: h, debut: 0, longueur: 0 });
+                sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
                 self.ack_envoye();
             }
             return;
@@ -3291,7 +3315,7 @@ impl<P: Charge> Tcb<P> {
                 self.envoyer_donnees(n, avec_fin, maintenant, &mut sortir);
             } else {
                 let h = self.entete(self.snd_una.wrapping_sub(1), tcp::ACK);
-                sortir(Sortant { entete: h, debut: 0, longueur: 0 });
+                sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
                 self.ack_envoye();
             }
         }
@@ -3320,7 +3344,7 @@ impl<P: Charge> Tcb<P> {
         self.envoyer_neuf(maintenant, &mut sortir);
         if self.ack_maintenant {
             let h = self.entete(self.seq_acceptable(), tcp::ACK);
-            sortir(Sortant { entete: h, debut: 0, longueur: 0 });
+            sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
             self.ack_envoye();
         }
         if core::mem::take(&mut self.place_a_voir) {
@@ -3330,14 +3354,19 @@ impl<P: Charge> Tcb<P> {
 
     /// Les données neuves, et le FIN (`tcp_write_xmit`), tant que la fenêtre
     /// de congestion a de la place : un segment entier dans la fenêtre de
-    /// l'autre (`tcp_snd_wnd_test` : on attend plutôt que de le couper).
+    /// l'autre (`tcp_snd_wnd_test` : on attend plutôt que de le couper) ; sauf ce
+    /// que l'autocork retient (carte.rs), et tant que la carte n'en garde pas trop.
     fn envoyer_neuf(&mut self, maintenant: u64, sortir: &mut impl FnMut(Sortant)) {
+        let retenu = self.autocork();
         let mut sortis = 0;
         loop {
             let debut = self.snd_nxt.wrapping_sub(self.seq_envoi) as usize;
             let reste = self.octets_envoi.saturating_sub(debut);
             let fin_ici = self.fin_seq().is_some_and(|f| !apres(self.snd_nxt, f));
             if reste == 0 && !fin_ici {
+                break;
+            }
+            if retenu > 0 && reste <= retenu {
                 break;
             }
             if self.paquets_en_vol() >= self.cc.cwnd {
@@ -3369,6 +3398,9 @@ impl<P: Charge> Tcb<P> {
                 if silence > self.rto {
                     self.cc.redemarrer(silence, self.rto, maintenant);
                 }
+            }
+            if self.carte_trop_pleine(n, 0) {
+                break;
             }
             if !self.envoyer_donnees(n, avec_fin, maintenant, sortir) {
                 break;

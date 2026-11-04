@@ -19,8 +19,9 @@
 //! dise tout de suite s'il vient d'une file du réseau.
 
 use crate::faillible;
+use crate::partage::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 /// Les octets des tampons de tous les paquets vivants.
 static VIVANTS: AtomicUsize = AtomicUsize::new(0);
@@ -40,10 +41,94 @@ pub const MARGE: usize = 96;
 /// sockets) : son `sk_buff` (256 octets) et sa `skb_shared_info` (320).
 pub const SURCOUT: usize = 576;
 
+/// Ce qu'une socket a encore dans les files d'en bas (la file de la carte, celle des
+/// voisins) : le `sk_wmem_alloc` de Linux et ses TSQ_THROTTLED, partagés avec ses
+/// paquets (inet::tcp::carte dit à quoi ils servent). Un `Arc` à part, plutôt que le
+/// paquet qui tiendrait la socket elle-même comme chez Linux : notre partie de la socket
+/// (la `Possession`) ne connaît pas son `Arc<Socket>`, et un paquet encore dans la carte
+/// ne doit pas faire durer toute une socket fermée.
+pub struct Retenue {
+    octets: AtomicUsize,
+    etranglee: AtomicBool,
+    /// La fin d'émission est venue pour une socket étranglée : à pousser.
+    a_pousser: AtomicBool,
+    /// Le plus grand numéro d'envoi que la carte ait fini.
+    rendu: AtomicU64,
+    /// Le numéro de la socket, pour la rappeler.
+    socket: u64,
+}
+
+impl Retenue {
+    pub const fn new(socket: u64) -> Retenue {
+        Retenue { octets: AtomicUsize::new(0), etranglee: AtomicBool::new(false), a_pousser: AtomicBool::new(false), rendu: AtomicU64::new(0), socket }
+    }
+
+    pub fn octets(&self) -> usize {
+        self.octets.load(Ordering::Relaxed)
+    }
+
+    pub fn rendu(&self) -> u64 {
+        self.rendu.load(Ordering::Relaxed)
+    }
+
+    /// Le paquet de cet envoi ne partira jamais (pas de route, plus de mémoire).
+    pub fn envoi_perdu(&self, numero: u64) {
+        self.rendu.fetch_max(numero, Ordering::Relaxed);
+    }
+
+    /// TSQ_THROTTLED : rappeler la socket à la prochaine fin d'émission. Tout a pu
+    /// être rendu avant ce drapeau : personne ne le verrait, on se rappelle soi-même.
+    pub fn etrangler(&self) {
+        self.etranglee.store(true, Ordering::Relaxed);
+        if self.octets() == 0 && self.etranglee.swap(false, Ordering::Relaxed) {
+            self.rappeler();
+        }
+    }
+
+    /// La socket a-t-elle été rappelée ? Le drapeau reste : voir `pousse`.
+    pub fn a_pousser(&self) -> bool {
+        self.a_pousser.load(Ordering::Relaxed)
+    }
+
+    /// Le rappel a eu lieu : rend s'il y en avait un.
+    pub fn pousse(&self) -> bool {
+        self.a_pousser.swap(false, Ordering::Relaxed)
+    }
+
+    /// `tcp_wfree`, jusqu'à la file : une échéance tout de suite pour cette socket (la
+    /// tâche du réseau la fera travailler, comme un minuteur).
+    fn rappeler(&self) {
+        self.a_pousser.store(true, Ordering::Relaxed);
+        super::tache::armer(self.socket, Some(0));
+    }
+}
+
+/// Le lien d'un paquet à sa socket, jusqu'à ce que la carte l'ait fini (le `skb->sk`
+/// et son destructeur).
+pub struct Proprietaire {
+    retenue: Arc<Retenue>,
+    taille: usize,
+    numero: u64,
+}
+
+impl Proprietaire {
+    /// La carte a fini (`tcp_wfree`) ; ou le paquet n'attend pas (`skb_orphan`), ou il
+    /// est jeté.
+    pub fn rendre(self) {
+        let r = &self.retenue;
+        r.octets.fetch_sub(self.taille, Ordering::Relaxed);
+        r.rendu.fetch_max(self.numero, Ordering::Relaxed);
+        if r.etranglee.swap(false, Ordering::Relaxed) {
+            r.rappeler();
+        }
+    }
+}
+
 pub struct Paquet {
     tampon: Vec<u8>,
     debut: usize,
     fin: usize,
+    proprietaire: Option<Proprietaire>,
 }
 
 impl Paquet {
@@ -52,14 +137,14 @@ impl Paquet {
     pub fn vide(longueur: usize) -> Option<Paquet> {
         let tampon = faillible::remplie(MARGE + longueur, 0).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: MARGE, fin: MARGE })
+        Some(Paquet { tampon, debut: MARGE, fin: MARGE, proprietaire: None })
     }
 
     /// Une copie de la trame `octets` (reçue), sans marge.
     pub fn copie(octets: &[u8]) -> Option<Paquet> {
         let tampon = faillible::copie(octets).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: 0, fin: octets.len() })
+        Some(Paquet { tampon, debut: 0, fin: octets.len(), proprietaire: None })
     }
 
     /// Les données.
@@ -117,8 +202,31 @@ impl Paquet {
     }
 }
 
+impl Paquet {
+    /// Ce paquet tient sa socket jusqu'à ce que la carte l'ait fini (`skb_set_owner_w`,
+    /// `tcp_wfree`) ; `numero`, celui de cet envoi.
+    pub fn attacher(&mut self, retenue: &Arc<Retenue>, numero: u64) {
+        let taille = self.taille_vraie();
+        retenue.octets.fetch_add(taille, Ordering::Relaxed);
+        self.proprietaire = Some(Proprietaire { retenue: retenue.clone(), taille, numero });
+    }
+
+    /// `skb_orphan` : il n'attendra pas (`lo`).
+    pub fn orpheliner(&mut self) {
+        if let Some(p) = self.proprietaire.take() {
+            p.rendre();
+        }
+    }
+
+    /// Le lien passe à ce qui garde la trame (une case de la carte).
+    pub fn prendre_proprietaire(&mut self) -> Option<Proprietaire> {
+        self.proprietaire.take()
+    }
+}
+
 impl Drop for Paquet {
     fn drop(&mut self) {
         VIVANTS.fetch_sub(self.tampon.capacity(), Ordering::Relaxed);
+        self.orpheliner();
     }
 }

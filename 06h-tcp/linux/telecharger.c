@@ -11,7 +11,9 @@
  *     chacune leur position (15 chiffres hexadécimaux, une fin de ligne) ;
  *     la première différence est dite (sa position, ce qui était attendu,
  *     ce qui est venu) ; puis la fin de la connexion (Connection: close) ;
- *   - une seconde connexion, GET /absente : 404, sans corps.
+ *   - une seconde connexion, GET /absente : 404, sans corps ; sa requête écrite
+ *     par petits morceaux, sans Nagle (l'autocork, et le rappel de fin d'émission de
+ *     la carte : sans lui, les derniers morceaux attendraient).
  * La durée et le débit sont affichés à part, hors des lignes comparées
  * (ils changent d'une fois à l'autre). SO_RCVTIMEO borne chaque attente
  * (60 s) : un serveur muet fait échouer le test au lieu de le bloquer.
@@ -19,6 +21,8 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <netdb.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -50,7 +54,7 @@ static char attendu(unsigned long o)
 
 /* Une connexion à 10.0.2.100:80 (getaddrinfo, socket, connect), la
    requête `chemin` envoyée ; -1 si quelque chose échoue (dit). */
-static int demander(const char *chemin)
+static int demander(const char *chemin, int morceaux)
 {
     struct addrinfo indices = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM }, *r;
     int e = getaddrinfo("10.0.2.100", "80", &indices, &r);
@@ -66,7 +70,14 @@ static int demander(const char *chemin)
     freeaddrinfo(r);
     char requete[256];
     int n = snprintf(requete, sizeof requete, "GET %s HTTP/1.1\r\nHost: 10.0.2.100\r\nConnection: close\r\n\r\n", chemin);
-    if (ok)
+    if (ok && morceaux > 0) {
+        int oui = 1;
+        ok = setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &oui, sizeof oui) == 0;
+        for (int i = 0; ok && i < n; i += morceaux) {
+            int m = n - i < morceaux ? n - i : morceaux;
+            ok = send(s, requete + i, m, 0) == m;
+        }
+    } else if (ok)
         ok = send(s, requete, n, 0) == n;
     if (!ok) {
         printf("[linux] telecharger : connexion a 10.0.2.100:80 (%s) : ECHEC\n", strerror(errno));
@@ -109,7 +120,7 @@ int main(void)
 {
     struct timespec debut, fin;
     clock_gettime(CLOCK_MONOTONIC, &debut);
-    int s = demander("/page");
+    int s = demander("/page", 0);
     if (s >= 0) {
         static char tampon[65536];
         long longueur;
@@ -139,7 +150,7 @@ int main(void)
         double secondes = (fin.tv_sec - debut.tv_sec) + (fin.tv_nsec - debut.tv_nsec) / 1e9;
         printf("[linux] telecharger : %.2f s, %.0f Kio/s\n", secondes, recu / 1024.0 / secondes);
     }
-    s = demander("/absente");
+    s = demander("/absente", 4);
     if (s >= 0) {
         char reste[4096];
         long longueur;

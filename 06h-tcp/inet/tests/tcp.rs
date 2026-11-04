@@ -1421,6 +1421,147 @@ fn rcvlowat_de_tcp() {
     assert_eq!(f.rcvbuf, 16_384);
 }
 
+// --- TSQ et l'autocork (carte.rs) ---
+
+/// Une connexion par une carte, qui garde `octets` octets et n'a pas encore fini.
+fn par_une_carte() -> (Connexion, Connexion) {
+    let (mut c, f) = paire_avec(MSS, 1 << 20, 1 << 20);
+    c.sans_file = false;
+    (c, f)
+}
+
+/// L'autocork (`tcp_should_autocork`) : un petit `send` alors que la carte a de quoi
+/// s'occuper et que du vol reste : retenu ; le suivant s'y ajoute, et la fin d'émission
+/// les envoie ensemble (`tcp_write_xmit`), comme un ACK le ferait. Aucune aide du
+/// programme, même sous TCP_NODELAY.
+#[test]
+fn autocork_retient_les_petits_envois() {
+    let (mut c, _f) = par_une_carte();
+    let r = t::Reglages { nodelay: true, ..c.reglages };
+    c.regler(r, maintenant());
+    // Rien en vol : le premier part tout de suite.
+    c.poser_en_file(100_000, 0);
+    ecrire(&mut c, b"un");
+    assert_eq!(sortants(&mut c).len(), 1);
+    assert!(!c.prendre_etrangle());
+    // La carte le garde encore : les suivants sont retenus.
+    c.poser_en_file(100_000, 0);
+    ecrire(&mut c, b"deux");
+    assert_eq!(sortants(&mut c).len(), 0);
+    assert!(c.prendre_etrangle());
+    c.poser_en_file(100_000, 0);
+    ecrire(&mut c, b"trois");
+    assert_eq!(sortants(&mut c).len(), 0);
+    assert!(c.prendre_etrangle());
+    // La fin d'émission : tout part, en un segment.
+    c.poser_en_file(0, 1);
+    let s = sortants(&mut c);
+    assert_eq!(s.iter().map(|(_, o)| o.as_slice()).collect::<Vec<_>>(), [b"deuxtrois".as_slice()]);
+    assert!(!c.prendre_etrangle());
+    // Une carte qui a presque tout fini (moins qu'un segment) : pas de retenue.
+    c.poser_en_file(10, 2);
+    ecrire(&mut c, b"quatre");
+    assert_eq!(sortants(&mut c).len(), 1);
+    // Par `lo` : jamais.
+    let (mut c, _f) = paire_avec(MSS, 1 << 20, 1 << 20);
+    let r = t::Reglages { nodelay: true, ..c.reglages };
+    c.regler(r, maintenant());
+    c.poser_en_file(1 << 20, 0);
+    ecrire(&mut c, b"a");
+    sortants(&mut c);
+    c.poser_en_file(1 << 20, 0);
+    ecrire(&mut c, b"b");
+    assert_eq!(sortants(&mut c).len(), 1);
+}
+
+/// Les blocs d'écriture pleins partent toujours ; seule la queue, en dessous d'un bloc,
+/// est retenue.
+#[test]
+fn autocork_laisse_passer_les_blocs_pleins() {
+    let (mut c, _f) = par_une_carte();
+    let r = t::Reglages { nodelay: true, ..c.reglages };
+    c.regler(r, maintenant());
+    grandir_sans_carte(&mut c);
+    ecrire(&mut c, b"un");
+    assert_eq!(sortants(&mut c).len(), 1);
+    c.poser_en_file(100_000, 0);
+    // Un bloc fait 44 MSS sur Ethernet (64 Kio moins les en-têtes, le TSO de Linux).
+    let bloc = (65_536 - 321) / MSS as usize * MSS as usize;
+    ecrire(&mut c, &vec![1u8; bloc + 100]);
+    let s = sortants(&mut c);
+    assert_eq!(s.iter().map(|(_, o)| o.len()).sum::<usize>(), bloc, "la queue de 100 octets reste");
+}
+
+/// `tcp_small_queue_check` : pas plus d'environ 1 ms de débit dans la carte, et jamais
+/// plus de 4 Mio : le reste attend la fin d'émission. Toujours un segment s'il est seul
+/// en vol.
+#[test]
+fn tsq_borne_ce_que_garde_la_carte() {
+    let (mut c, _f) = par_une_carte();
+    grandir_sans_carte(&mut c);
+    let cwnd = c.congestion().0 as usize;
+    assert!(cwnd > 20);
+    ecrire(&mut c, &vec![1u8; cwnd * MSS as usize]);
+    c.poser_en_file(5 << 20, 0);
+    let s = sortants(&mut c);
+    assert_eq!(s.len(), 2, "la carte déborde : le premier, seul en vol, et le suivant : la règle regarde avant d'envoyer");
+    assert!(c.prendre_etrangle());
+    // La fin d'émission : la suite ; sans doublon.
+    c.poser_en_file(0, u64::MAX);
+    let s2 = sortants(&mut c);
+    assert_eq!(s2.len(), cwnd - 2);
+    assert_eq!(s2[0].0.seq, s[1].0.seq.wrapping_add(MSS as u32));
+    assert!(!c.prendre_etrangle());
+}
+
+/// La cwnd portée à plus de 20 segments, par Reno, la carte vide à chaque tour ; l'ACK de
+/// chaque segment vient de la main.
+fn grandir_sans_carte(c: &mut Connexion) {
+    c.choisir_controle(t::Controle::Reno, maintenant());
+    let modele = Tcp { drapeaux: tcp::ACK, seq: c.numeros().2, fenetre: 65_535, ..Tcp::default() };
+    for _ in 0..4 {
+        let cwnd = c.congestion().0 as usize;
+        ecrire(c, &vec![0u8; cwnd * MSS as usize]);
+        loop {
+            c.poser_en_file(0, u64::MAX);
+            let s = sortants(c);
+            if s.is_empty() {
+                break;
+            }
+            for (h, o) in &s {
+                c.recevoir(&Tcp { ack: h.seq.wrapping_add(o.len() as u32), ..modele }, vide(), maintenant());
+            }
+        }
+    }
+    assert_eq!(c.non_acquittes(), 0);
+}
+
+/// `skb_still_in_host_queue` : un segment que la carte n'a pas fini n'est pas perdu :
+/// le RTO ne le renvoie pas, ne recule pas, et réessaie dans 500 ms ; la sonde de fin de
+/// rafale ne le renvoie pas non plus.
+#[test]
+fn encore_dans_la_carte_pas_de_renvoi() {
+    let (mut c, _f) = par_une_carte();
+    ecrire(&mut c, &vec![1u8; MSS as usize]);
+    c.poser_en_file(0, 0);
+    assert_eq!(sortants(&mut c).len(), 1);
+    let rto = c.congestion().2;
+    let e = c.echeance().unwrap();
+    avancer(e.saturating_sub(maintenant()));
+    c.minuteur(maintenant());
+    c.poser_en_file(5000, 0);
+    assert_eq!(sortants(&mut c).len(), 0);
+    assert!(c.prendre_etrangle());
+    // Le recul vaut quand même (`tcp_retransmit_timer` : -EBUSY n'est pas > 0).
+    assert_eq!(c.congestion().2, 2 * rto);
+    assert_eq!(c.echeance().unwrap() - maintenant(), 2 * rto);
+    // La carte a fini : le prochain essai part.
+    avancer(2 * rto);
+    c.minuteur(maintenant());
+    c.poser_en_file(0, 1);
+    assert_eq!(sortants(&mut c).len(), 1);
+}
+
 /// La file hors d'ordre est bornée par SO_RCVBUF : un pair qui envoie des milliers de
 /// segments d'un octet derrière un trou ne fait pas tout garder. Sans trous entre eux,
 /// ils sont fondus en paquets denses (`tcp_collapse_ofo_queue`), et tous gardés ;

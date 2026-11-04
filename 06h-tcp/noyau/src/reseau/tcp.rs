@@ -52,7 +52,7 @@
 
 use super::contexte;
 use super::ipv4;
-use super::paquet::Paquet;
+use super::paquet::{Paquet, Retenue};
 use super::socket::{self, Protocole, Socket};
 use crate::attente::{FileAttente, Possede, Possession, Sommeil};
 use crate::faillible::{self, FileFaillible, VecFaillible};
@@ -338,6 +338,11 @@ pub struct Partie {
     echeance_armee: Option<u64>,
     /// La mémoire que la socket a comptée dans celle de TCP (`MEMOIRE`).
     memoire_comptee: usize,
+    /// L'erreur d'une socket redevenue neuve (`sk_err`, après `tcp_disconnect`) : plus de connexion
+    /// pour la tenir, mais SO_ERROR, `poll` et la lecture la disent encore.
+    erreur_seule: i32,
+    /// Ce que la carte a encore d'elle (`sk_wmem_alloc`, TSQ).
+    retenue: Arc<Retenue>,
 }
 
 /// Les options de SOL_TCP.
@@ -464,7 +469,7 @@ impl Partie {
         let (etat, lisibles, fin_recue, erreur, place, sndbuf, rcvbuf, urgent, fenetre_basse) = match &self.mode {
             Mode::Connexion(t) => (Some(t.etat()), t.lisibles_dans_le_flux(), t.fin_recue(), t.erreur(), t.place(), t.sndbuf, t.rcvbuf, t.urgent_a_lire(),
                                    t.fenetre_presque_fermee()),
-            _ => (None, 0, false, 0, sndbuf, sndbuf, rcvbuf, false, false),
+            _ => (None, 0, false, self.erreur_seule, sndbuf, sndbuf, rcvbuf, false, false),
         };
         let (ecoute, pretes, file) = match &self.mode {
             Mode::Ecoute { filles, backlog } => (true, filles.iter().filter(|f| f.prete()).count(), *backlog),
@@ -501,7 +506,7 @@ impl Partie {
     /// Émet ce que la connexion a à envoyer.
     fn emettre(&mut self) {
         let Mode::Connexion(t) = &mut self.mode else { return };
-        emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, Ip::de(&self.options));
+        emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, Ip::de(&self.options), Some(&self.retenue));
     }
 
     /// Après un événement : ce que devient la connexion (`apres_l_etat`),
@@ -627,6 +632,9 @@ impl Partie {
             Mode::Ecoute { filles, .. } => filles.iter().filter_map(|f| f.tcb.echeance()).min(),
             Mode::Neuve => None,
         };
+        // Une fin d'émission a rappelé la socket, sans passer par ici : son échéance à
+        // elle (tout de suite) tient jusqu'à ce qu'elle tombe.
+        let e = if self.retenue.a_pousser() { Some(0) } else { e };
         if e == self.echeance_armee {
             return;
         }
@@ -734,14 +742,24 @@ impl Ip {
     }
 }
 
-fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip) {
+fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, retenue: Option<&Arc<Retenue>>) {
+    if let Some(r) = retenue {
+        t.poser_en_file(r.octets(), r.rendu());
+    }
     let mut a_envoyer: Vec<itcp::Sortant> = Vec::new();
     t.emettre(maintenant(), |s| {
         // Sans place, le segment ne part pas : la retransmission y pourvoira.
         let _ = a_envoyer.ajouter(s);
     });
     for s in a_envoyer {
-        envoyer_segment(&s.entete, source, distante, identifiant, ip, s.longueur, |o| t.copier_envoi(s.debut, o));
+        // Un ACK pur, un RST ne tiennent pas la socket (`skb_is_tcp_pure_ack`).
+        let suivi = retenue.filter(|_| s.numero != 0).map(|r| (r, s.numero));
+        envoyer_segment(&s.entete, source, distante, identifiant, ip, s.longueur, suivi, |o| t.copier_envoi(s.debut, o));
+    }
+    if t.prendre_etrangle()
+        && let Some(r) = retenue
+    {
+        r.etrangler();
     }
 }
 
@@ -750,14 +768,23 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
 /// 6g). La somme n'est pas calculée par `lo` (comme Linux). Un segment
 /// qui ne part pas (plus de mémoire, pas de route) est perdu, comme sur
 /// un câble.
-fn envoyer_segment(h: &Tcp, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, longueur: usize,
+fn envoyer_segment(h: &Tcp, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, longueur: usize, suivi: Option<(&Arc<Retenue>, u64)>,
                    remplir: impl FnOnce(&mut [u8])) {
-    let Ok((chemin, destination)) = ipv4::router(distante, Some(source)) else { return };
     let n = ftcp::longueur_entete(&h.options);
-    let Some(mut p) = Paquet::vide(n + longueur) else { return };
+    let prets = ipv4::router(distante, Some(source)).ok().zip(Paquet::vide(n + longueur));
+    let Some(((chemin, destination), mut p)) = prets else {
+        // Il ne partira pas : personne ne le rendra.
+        if let Some((r, numero)) = suivi {
+            r.envoi_perdu(numero);
+        }
+        return;
+    };
     let Some(o) = p.ajouter_fin(n + longueur) else { return };
     remplir(&mut o[n..]);
     ftcp::ecrire(o, h, source, destination, !ipv4::par_lo(&chemin));
+    if let Some((r, numero)) = suivi {
+        p.attacher(r, numero);
+    }
     *identifiant = identifiant.wrapping_add(1);
     let envoi = ipv4::Envoi {
         source, destination, protocole: fipv4::TCP, ttl: ip.ttl, tos: ip.tos, identifiant: *identifiant,
@@ -770,7 +797,7 @@ fn envoyer_segment(h: &Tcp, source: [u8; 4], distante: [u8; 4], identifiant: &mu
 fn repondre_rst(h: &Tcp, longueur_charge: usize, locale: [u8; 4], distante: [u8; 4]) {
     if let Some(r) = itcp::reponse_sans_connexion(h, longueur_charge) {
         let mut id = crate::aleatoire::u32() as u16;
-        envoyer_segment(&r, locale, distante, &mut id, Ip::SYSTEME, 0, |_| {});
+        envoyer_segment(&r, locale, distante, &mut id, Ip::SYSTEME, 0, None, |_| {});
     }
 }
 
@@ -822,14 +849,18 @@ impl Possede for Partie {
         self.oublier_echeance();
         let maintenant = maintenant();
         let ip = Ip::de(&self.options);
+        let pousse = self.retenue.pousse();
         match &mut self.mode {
             Mode::Connexion(t) => {
                 t.minuteur(maintenant);
+                if pousse {
+                    t.fin_d_emission();
+                }
             }
             Mode::Ecoute { filles, .. } => {
                 for f in filles.iter_mut() {
                     f.tcb.minuteur(maintenant);
-                    emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip);
+                    emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
                 }
                 ranger_filles(filles);
             }
@@ -886,7 +917,7 @@ impl Partie {
         if let Some(n) = s.fille {
             if let Some(f) = filles.iter_mut().find(|f| f.numero == n) {
                 f.tcb.recevoir(&s.entete, s.charge, maintenant());
-                emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip);
+                emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
                 ranger_filles(filles);
                 return;
             }
@@ -943,6 +974,7 @@ impl Partie {
         tcb.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
         tcb.memoire = niveau_memoire();
         tcb.poser_controle(self.options.controle);
+        tcb.sans_file = sans_carte(s.source);
         let lien = Lien {
             sorte: Sorte::Connectee, adresse: s.destination, port: h.destination, distante: s.source, port_distant: h.source,
             reuseaddr: false, reuseport: false, uid: 0, par_connect: false,
@@ -954,7 +986,7 @@ impl Partie {
         let mut f = Fille {
             numero, tcb, locale: s.destination, distante: s.source, identifiant: crate::aleatoire::u32() as u16, etablie: false,
         };
-        emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip);
+        emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
         // La place est prise plus haut, avant tout changement.
         filles.ajouter_derriere_dans_la_place(f);
     }
@@ -1001,6 +1033,11 @@ fn cle_secrete() -> crypto::siphash::Cle {
 
 /// Le MSS qu'on annonce pour parler à `distante` : la MTU du chemin moins
 /// 40 (les en-têtes d'IPv4 et de TCP).
+/// Vers cette adresse, un paquet n'attend-il dans aucune carte (`lo`) ?
+fn sans_carte(distante: [u8; 4]) -> bool {
+    ipv4::router(distante, None).is_ok_and(|(c, _)| ipv4::par_lo(&c))
+}
+
 fn mss_vers(distante: [u8; 4]) -> u16 {
     match ipv4::router(distante, None) {
         Ok((c, _)) => (ipv4::mtu(&c).saturating_sub(40)).clamp(itcp::MSS_MIN as u32, 65_495) as u16,
@@ -1107,7 +1144,7 @@ fn temps_attente(n: u64, s: Segment) {
 fn envoyer_ack_tw(e: &TempsAttente) {
     let r = e.regles.entete_ack(crate::temps::ns_monotone());
     let mut id = crate::aleatoire::u32() as u16;
-    envoyer_segment(&r, e.locale, e.distante, &mut id, Ip::SYSTEME, 0, |_| {});
+    envoyer_segment(&r, e.locale, e.distante, &mut id, Ip::SYSTEME, 0, None, |_| {});
 }
 
 fn effacer_temps_attente(n: u64) {
@@ -1158,14 +1195,15 @@ pub fn recevoir(source: [u8; 4], destination: [u8; 4], par_lo: bool, mut p: Paqu
 
 /// Une socket TCP neuve (`tcp_v4_init_sock`) : SO_RCVBUF et SO_SNDBUF de
 /// TCP, son flux.
-pub fn nouvelle(numero: u64) -> Possession<Partie> {
+pub fn nouvelle(numero: u64) -> Option<Possession<Partie>> {
+    let retenue = Arc::new(Retenue::new(numero)).ok()?;
     SOCKETS.fetch_add(1, Ordering::Relaxed);
     let partie = Partie {
         numero, mode: Mode::Neuve, adresses: Adresses::default(), identifiant: 0, orpheline: false, hors_table: false,
-        options: OptionsTcp::DEFAUT, etablie_un_jour: false, connexion_en_cours: false, echeance_armee: None, memoire_comptee: 0,
+        options: OptionsTcp::DEFAUT, etablie_un_jour: false, connexion_en_cours: false, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
     };
     let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
-    Possession::new(partie, premier)
+    Some(Possession::new(partie, premier))
 }
 
 fn flux(s: &Socket) -> &Possession<Partie> {
@@ -1386,6 +1424,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 t.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
                 t.memoire = niveau_memoire();
                 t.poser_controle(p.options.controle);
+                t.sans_file = sans_carte(destination);
                 t.proposer_horodatages(decalage_horodatages(source, destination));
                 t.proposer_sack();
                 if let Some((_, _, ts)) = reprise {
@@ -1455,7 +1494,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             // La place de la socket neuve d'abord : sans mémoire, la fille
             // reste dans la file, pour un prochain accept (ENFILE, comme le
             // `sock_alloc` de `do_accept`).
-            let (Ok(place_flux), Ok(place_socket)) = (faillible::boite_vide(), ArcVide::new()) else { return Err(-ENFILE) };
+            let (Ok(place_flux), Ok(place_socket), Ok(retenue)) = (faillible::boite_vide(), ArcVide::new(), Arc::new(Retenue::new(filles[i].numero))) else { return Err(-ENFILE) };
             let f = filles.remove(i).expect("la fille");
             let (port, distante, port_distant, locale) = (f.tcb.port_local, f.distante, f.tcb.port_distant, f.locale);
             let numero = f.numero;
@@ -1469,9 +1508,15 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             SOCKETS.fetch_add(1, Ordering::Relaxed);
             let partie = Partie {
                 numero, mode: Mode::Connexion(tcb),
-                adresses: Adresses { lie: true, adresse: locale, port, port_choisi: false, distante, port_distant, source: locale },
-                identifiant: f.identifiant, orpheline: false, hors_table, options: p.options, etablie_un_jour: true,
-                connexion_en_cours: false, echeance_armee: None, memoire_comptee: 0,
+                // Comme ses verrous de `bind` (`sk_userlocks`, recopié) : déconnectée, elle redevient
+                // ce qu'était son écoute, liée à son port si `bind` l'a nommé.
+                adresses: Adresses { lie: true, adresse: p.adresses.adresse, port, port_choisi: p.adresses.port_choisi, distante, port_distant, source: locale },
+                identifiant: f.identifiant, orpheline: false, hors_table,
+                // Tout, sauf ce qui est propre à une écoute (`inet_csk_clone_lock`,
+                // `inet_csk_delack_init`) : la fille n'attend pas de données pour naître deux fois.
+                options: OptionsTcp { defer_accept: 0, quickack: true, ..p.options },
+                etablie_un_jour: true,
+                connexion_en_cours: false, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
             };
             let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
             let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
@@ -1814,7 +1859,7 @@ pub fn fermer(s: &Arc<Socket>) {
         Mode::Ecoute { filles, .. } => {
             for f in filles.iter_mut() {
                 f.tcb.avorter();
-                emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip);
+                emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
                 if let Some(t) = TABLE.verrouiller().as_mut() {
                     t.retirer(f.numero);
                 }
