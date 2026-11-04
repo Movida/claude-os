@@ -3028,6 +3028,11 @@ impl<P: Charge> Tcb<P> {
         [self.t_xmit, self.t_keepalive, self.ack.t, self.t_comprime].into_iter().flatten().min()
     }
 
+    /// Celle qui ne peut pas attendre un tic de la roue, s'il y en a une : un hrtimer chez Linux.
+    pub fn echeance_fine(&self) -> Option<u64> {
+        self.t_comprime
+    }
+
     /// Fait ce qui est échu à l'heure `maintenant` : l'ACK retardé, la
     /// retransmission, la sonde de fenêtre.
     pub fn minuteur(&mut self, maintenant: u64) -> Effets {

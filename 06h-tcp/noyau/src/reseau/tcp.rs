@@ -39,7 +39,7 @@
 //! LES MINUTEURS (commit 6 : la retransmission, l'ACK retardé, la sonde de
 //! fenêtre) sont tenus par la connexion (inet::tcp, `echeance` et
 //! `minuteur`) ; la socket inscrit la prochaine échéance de sa connexion,
-//! ou de ses filles pour une écoute, dans la liste des échéances du
+//! ou de ses filles pour une écoute, dans les échéances du
 //! réseau (tache.rs, sous le numéro de la socket), et la tâche du réseau
 //! la réveille à l'heure (`minuteur_du_reseau` : tout de suite, ou par un
 //! drapeau que verra la possession rendue). Une entrée de TIME_WAIT prend
@@ -661,6 +661,13 @@ impl Partie {
         if e == self.echeance_armee {
             return;
         }
+        // La seule à ne pas attendre le tic de la roue : la compression des SACK, moins d'une
+        // milliseconde (`compressed_ack_timer`, un hrtimer).
+        let fine = match &self.mode {
+            Mode::Connexion(t) => t.echeance_fine(),
+            Mode::Ecoute { filles, .. } => filles.iter().filter_map(|f| f.tcb.echeance_fine()).min(),
+            Mode::Neuve => None,
+        };
         match (self.echeance_armee, e) {
             (None, Some(_)) => {
                 MINUTEURS.fetch_add(1, Ordering::Relaxed);
@@ -671,7 +678,14 @@ impl Partie {
             _ => {}
         }
         self.echeance_armee = e;
-        super::tache::armer(self.numero, e);
+        match e {
+            Some(t) if t == 0 || fine == e => {
+                super::tache::armer_precis(self.numero, t);
+            }
+            _ => {
+                super::tache::armer(self.numero, e);
+            }
+        }
     }
 
     /// La socket n'a plus d'échéance : retirée de la liste.

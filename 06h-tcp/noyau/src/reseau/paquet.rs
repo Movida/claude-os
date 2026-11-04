@@ -99,7 +99,7 @@ impl Retenue {
     /// tâche du réseau la fera travailler, comme un minuteur).
     fn rappeler(&self) {
         self.a_pousser.store(true, Ordering::Relaxed);
-        super::tache::armer(self.socket, Some(0));
+        super::tache::armer_precis(self.socket, 0);
     }
 }
 

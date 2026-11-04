@@ -25,6 +25,9 @@ inet = { path = "../inet" }
 # ChaCha20, BLAKE2s et SipHash (6h), notre propre bibliothèque, sans
 # unsafe, testée sur l'hôte avec les vecteurs officiels.
 crypto = { path = "../crypto" }
+# La roue des minuteurs de Linux (6h), notre propre bibliothèque, sans
+# unsafe, testée sur l'hôte contre un modèle naïf.
+roue = { path = "../roue" }
 
 # Les scénarios de `make tests-qemu` : des versions du noyau qui
 # provoquent exprès une situation à tester (voir src/main.rs).

@@ -1,27 +1,12 @@
-//! Les échéances du réseau (6h) : quand la tâche du réseau doit se
-//! réveiller, et pour qui. Chaque objet (la table des voisins, puis chaque
-//! connexion TCP, chaque entrée de TIME_WAIT) a AU PLUS UNE échéance, la
-//! plus proche des siennes ; la tâche dort jusqu'à la première, puis prend
-//! celles qui sont échues et fait le travail de leur objet.
+//! Les échéances précises du réseau : celles qui ne peuvent pas attendre le tic de la roue
+//! (../roue) : ce que Linux confie à ses hrtimers (la compression des SACK), ou à une tâche sans
+//! délai (la fin d'émission de TSQ). Chaque objet a AU PLUS UNE échéance ; il n'y en a jamais
+//! que quelques-unes à la fois.
 //!
-//! Choix de conception. Une liste triée, de capacité fixée à sa création
-//! (au démarrage), une entrée par objet : armer déplace l'entrée de
-//! l'objet (plus tôt ou plus tard), désarmer la retire. Linux prend une
-//! « roue » de minuteurs (kernel/time/timer.c) : ses minuteurs se comptent
-//! par centaines de milliers et sont presque tous annulés avant de tomber
-//! (celui de retransmission de TCP est réarmé à chaque ACK), d'où des
-//! opérations en temps constant, au prix d'une précision qui baisse avec
-//! l'éloignement. Nous en avons quelques dizaines à la fois (la table des
-//! voisins, les connexions de claude et de nos tests, leurs TIME_WAIT) :
-//! une liste triée est exacte, simple, et, réservée d'avance, ne prend
-//! jamais de mémoire pendant un programme (le lanceur mesure la mémoire
-//! rendue). Armer coûte un parcours et un déplacement des entrées
-//! PRÉSENTES (pas de la capacité, réservée pour 8192 objets depuis TCP),
-//! sous un verrou court, à chaque changement d'échéance : quelques
-//! centaines d'octets aujourd'hui ; un serveur aux milliers de connexions
-//! demandera la roue de Linux. Option écartée aussi : un tas binaire dont
-//! on laisse les entrées périmées en place (rien n'en borne le nombre, et
-//! il garde sa capacité).
+//! Choix de conception. Une liste triée, de capacité fixée à sa création (au démarrage), une
+//! entrée par objet : armer déplace l'entrée de l'objet, désarmer la retire. Exacte, simple, et
+//! réservée d'avance. Option écartée : un tas binaire dont on laisse les entrées périmées en
+//! place (rien n'en borne le nombre, et il garde sa capacité).
 //!
 //! L'heure est un argument (en nanosecondes) : testé sur l'hôte contre un
 //! modèle naïf.

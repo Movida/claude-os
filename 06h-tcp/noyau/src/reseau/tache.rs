@@ -20,10 +20,10 @@
 //! est reprise au tour suivant. Une rafale coûte une interruption, pas une
 //! par trame.
 //!
-//! Les minuteurs du réseau : une liste d'échéances, une par objet (la
-//! table des voisins, arp.rs ; les sockets TCP et les entrées de
-//! TIME_WAIT, tcp.rs), inet::echeances.
-//! La tâche dort jusqu'à la plus proche, ou un réveil, et fait le travail
+//! Les minuteurs du réseau : une échéance par objet (la table des voisins, arp.rs ; les
+//! sockets TCP et les entrées de TIME_WAIT, tcp.rs ; les fragments, ipv4.rs), dans la roue de Linux
+//! (../roue) ; quelques-unes, qui n'attendent pas son tic, dans une liste exacte
+//! (inet::echeances). La tâche dort jusqu'à la plus proche, ou un réveil, et fait le travail
 //! des objets échus.
 //!
 //! Sans réveil perdu : le travail est un mot de bits, sous un verrou ; une
@@ -37,6 +37,7 @@ use crate::programmes::NomCourt;
 use crate::verrou::Verrou;
 use crate::{cpu, tache, temps};
 use inet::echeances::Echeances;
+use roue::Roue;
 
 /// Du travail à faire : un changement dans la configuration d'une carte
 /// (son lien).
@@ -111,23 +112,39 @@ pub fn lancer() {
     }
 }
 
-/// Les échéances du réseau (inet::echeances) : quand se réveiller, et
-/// pour qui. Faites au démarrage, à leur taille définitive.
-static ECHEANCES: Verrou<Option<Echeances>> = Verrou::new(None);
-/// Le nombre d'objets qui peuvent avoir une échéance à la fois.
+/// Les échéances du réseau : quand se réveiller, et pour qui. Faites au démarrage, à leur taille
+/// définitive.
+struct Minuteurs {
+    roue: Roue,
+    precises: Echeances,
+}
+
+impl Minuteurs {
+    fn prochaine(&mut self) -> Option<u64> {
+        match (self.roue.prochaine(), self.precises.prochaine()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+static MINUTEURS: Verrou<Option<Minuteurs>> = Verrou::new(None);
+/// Le nombre d'objets qui peuvent avoir une échéance à la fois, dans la roue, et dans la liste.
 const MAX_ECHEANCES: usize = 8192;
+const MAX_PRECISES: usize = 64;
 /// L'objet « table des voisins » (arp.rs) ; les connexions TCP prendront
 /// le numéro de leur socket, qui part de 1.
 pub const OBJET_VOISINS: u64 = u64::MAX;
 /// L'objet « files de fragments » (ipv4.rs).
 pub const OBJET_FRAGMENTS: u64 = u64::MAX - 1;
 
-/// Fait la liste des échéances. Au démarrage, avant la tâche.
+/// Fait les échéances. Au démarrage, avant la tâche.
 pub fn initialiser() {
-    *ECHEANCES.verrouiller() = Echeances::new(MAX_ECHEANCES);
-    if ECHEANCES.verrouiller().is_none() {
+    let m = Roue::new(MAX_ECHEANCES).zip(Echeances::new(MAX_PRECISES)).map(|(roue, precises)| Minuteurs { roue, precises });
+    if m.is_none() {
         afficherln!("[reseau] plus de memoire pour les echeances du reseau.");
     }
+    *MINUTEURS.verrouiller() = m;
 }
 
 /// L'objet `objet` veut la tâche du réseau à `echeance` (None : plus
@@ -139,6 +156,15 @@ pub fn initialiser() {
 /// l'heure : à lui de s'en accommoder).
 pub fn armer(objet: u64, echeance: Option<u64>) -> bool {
     let (ok, plus_tot) = inscrire(objet, echeance);
+    if plus_tot {
+        reveiller();
+    }
+    ok
+}
+
+/// De même, à l'instant dit, sans le tic de la roue (Linux : un hrtimer, ou une tâche sans délai).
+pub fn armer_precis(objet: u64, echeance: u64) -> bool {
+    let (ok, plus_tot) = inscrire_en(objet, Some(echeance), true);
     if plus_tot {
         reveiller();
     }
@@ -162,17 +188,35 @@ pub fn reveiller() {
 /// passage, la première échéance pourrait avoir été prise entre-temps par
 /// la tâche : le réveil manquerait.)
 pub fn inscrire(objet: u64, echeance: Option<u64>) -> (bool, bool) {
-    match ECHEANCES.verrouiller().as_mut() {
-        Some(e) => {
-            let avant = e.prochaine();
+    inscrire_en(objet, echeance, false)
+}
+
+/// Un objet n'est que dans l'une des deux. La liste pleine (ce qui ne devrait pas arriver : elle se
+/// vide vite) : la roue, un peu plus tard qu'on ne voulait.
+fn inscrire_en(objet: u64, echeance: Option<u64>, precise: bool) -> (bool, bool) {
+    let maintenant = temps::ns_monotone();
+    match MINUTEURS.verrouiller().as_mut() {
+        Some(m) => {
+            let avant = m.prochaine();
             let ok = match echeance {
-                Some(t) => e.armer(objet, t).is_ok(),
+                Some(t) if precise && m.precises.armer(objet, t).is_ok() => {
+                    m.roue.desarmer(objet);
+                    true
+                }
+                Some(t) => {
+                    let ok = m.roue.armer(objet, t, maintenant).is_ok();
+                    if ok {
+                        m.precises.desarmer(objet);
+                    }
+                    ok
+                }
                 None => {
-                    e.desarmer(objet);
+                    m.roue.desarmer(objet);
+                    m.precises.desarmer(objet);
                     true
                 }
             };
-            let apres = e.prochaine();
+            let apres = m.prochaine();
             (ok, apres.is_some_and(|a| avant.is_none_or(|b| a < b)))
         }
         None => (false, false),
@@ -180,11 +224,11 @@ pub fn inscrire(objet: u64, echeance: Option<u64>) -> (bool, bool) {
 }
 
 fn prochaine() -> Option<u64> {
-    ECHEANCES.verrouiller().as_ref().and_then(Echeances::prochaine)
+    MINUTEURS.verrouiller().as_mut().and_then(Minuteurs::prochaine)
 }
 
 fn prendre_echu(maintenant: u64) -> Option<u64> {
-    ECHEANCES.verrouiller().as_mut().and_then(|e| e.prendre_echu(maintenant))
+    MINUTEURS.verrouiller().as_mut().and_then(|m| m.precises.prendre_echu(maintenant).or_else(|| m.roue.prendre_echu(maintenant)))
 }
 
 fn boucle() {

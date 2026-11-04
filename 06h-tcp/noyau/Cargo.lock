@@ -29,9 +29,14 @@ dependencies = [
  "fichiers",
  "formats",
  "inet",
+ "roue",
  "wasm",
  "zones",
 ]
+
+[[package]]
+name = "roue"
+version = "0.1.0"
 
 [[package]]
 name = "wasm"

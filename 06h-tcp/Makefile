@@ -4,7 +4,7 @@
 # noyau/src/aleatoire.rs : le réservoir, RDSEED et RDRAND, les
 # interruptions, la gigue ; getrandom, /dev/random, linux/aleatoire.c),
 # et virtio-rng, le générateur matériel de QEMU (noyau/src/virtio_rng.rs) ;
-# les échéances du réseau (inet/src/echeances.rs), le contexte réseau
+# les échéances du réseau (inet/src/echeances.rs, et la roue de Linux : roue/), le contexte réseau
 # (noyau/src/reseau/contexte.rs) et la fermeture différée des sockets ;
 # TCP (inet/src/tcp.rs, la machine à états, et inet/src/ports_tcp.rs ;
 # noyau/src/reseau/tcp.rs, et la possession d'une socket dans
@@ -978,6 +978,8 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	cd inet && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd crypto && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd crypto && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	cd roue && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	cd roue && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd wasm && cargo test --release -q -- --nocapture suite_officielle 2>/dev/null | grep -v '^running\|^test \|^$$'
@@ -1202,5 +1204,6 @@ clean:
 	cd fichiers && cargo clean
 	cd inet && cargo clean
 	cd crypto && cargo clean
+	cd roue && cargo clean
 
 .PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace tests-hote tests-hote-root tests-qemu claude-p suite clean FORCE
