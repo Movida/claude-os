@@ -52,6 +52,7 @@ pub(super) const FLAG_SET_XMIT_TIMER: u32 = 0x1000;
 pub(super) const FLAG_SACK_RENEGING: u32 = 0x2000;
 pub(super) const FLAG_NO_CHALLENGE_ACK: u32 = 0x8000;
 pub(super) const FLAG_ACK_MAYBE_DELAYED: u32 = 0x10000;
+pub(super) const FLAG_DSACK_TLP: u32 = 0x20000;
 pub(super) const FLAG_ACKED: u32 = FLAG_DATA_ACKED | FLAG_SYN_ACKED;
 pub(super) const FLAG_NOT_DUP: u32 = FLAG_DATA | FLAG_WIN_UPDATE | FLAG_ACKED;
 pub(super) const FLAG_CA_ALERT: u32 = FLAG_DATA_SACKED | FLAG_DSACKING_ACK;
@@ -400,6 +401,9 @@ impl<P: Charge> Tcb<P> {
     fn poser_annulation(&mut self) {
         self.undo_marker = Some(self.snd_una);
         self.undo_retrans = self.retrans_out as i32;
+        if self.tlp_high_seq.is_some() && self.tlp_renvoi {
+            self.undo_retrans += 1;
+        }
         if self.undo_retrans == 0 {
             self.undo_retrans = -1;
         }
@@ -446,11 +450,13 @@ impl<P: Charge> Tcb<P> {
         }
         self.cc.phase = Phase::Perte;
         self.high_seq = self.snd_nxt;
+        self.tlp_high_seq = None;
     }
 
     /// Une réduction de la cwnd commence (`tcp_init_cwnd_reduction`).
-    fn commencer_reduction(&mut self) {
+    pub(super) fn commencer_reduction(&mut self) {
         self.high_seq = self.snd_nxt;
+        self.tlp_high_seq = None;
         self.cc.remettre_compte();
         self.prior_cwnd = self.cc.cwnd;
         self.prr_livres = 0;
@@ -460,7 +466,7 @@ impl<P: Charge> Tcb<P> {
 
     /// La réduction est finie : la cwnd au seuil (`tcp_end_cwnd_reduction`),
     /// sauf si elle a été annulée.
-    fn finir_reduction(&mut self) {
+    pub(super) fn finir_reduction(&mut self) {
         if self.cc.ssthresh < super::congestion::SSTHRESH_INFINI && (self.cc.phase == Phase::Reduction || self.undo_marker.is_some()) {
             self.cc.cwnd = self.cc.ssthresh;
         }
@@ -516,7 +522,7 @@ impl<P: Charge> Tcb<P> {
     }
 
     /// `tcp_try_keep_open`.
-    fn rester_ouverte(&mut self) {
+    pub(super) fn rester_ouverte(&mut self) {
         let etat = if self.sacked_out + self.lost_out > 0 || self.renvoi_fait() { Phase::Desordre } else { Phase::Ouverte };
         if self.cc.phase != etat {
             self.cc.phase = etat;
@@ -745,7 +751,7 @@ impl<P: Charge> Tcb<P> {
     /// tête : la tête part entière, et sert de sonde (sinon une fenêtre réduite à
     /// rien sur des données en vol bloquerait tout). Rend faux si rien n'a pu
     /// partir.
-    fn envoyer_entree(&mut self, i: usize, maintenant: u64, sortir: &mut impl FnMut(Sortant)) -> bool {
+    pub(super) fn envoyer_entree(&mut self, i: usize, maintenant: u64, sortir: &mut impl FnMut(Sortant)) -> bool {
         // Sa tête a pu être acquittée depuis (`tcp_trim_head`).
         if avant(self.file[i].seq, self.snd_una) {
             self.file[i].seq = self.snd_una;
@@ -882,7 +888,7 @@ impl<P: Charge> Tcb<P> {
         };
         // Le temps déjà passé compte, si l'échéance en cours n'était pas un RTO
         // (`tcp_rto_delta_us`).
-        if self.t_xmit.is_some() && self.t_sorte == super::Minuteur::Reordonnancement {
+        if matches!(self.t_sorte, super::Minuteur::Reordonnancement | super::Minuteur::SondeDePerte) {
             let d = (tete.envoi + self.rto).saturating_sub(maintenant).max(1);
             self.armer_xmit(super::Minuteur::Retransmission, d, maintenant);
         } else {

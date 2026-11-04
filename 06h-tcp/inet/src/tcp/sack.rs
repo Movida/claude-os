@@ -16,6 +16,11 @@
 //! pendant une reprise, ou dès trois segments arrivés hors d'ordre : les trois
 //! ACK dupliqués survivent ainsi.
 //!
+//! TLP (RFC 8985, la sonde de fin de rafale) : le dernier segment d'une rafale
+//! perdu n'a personne après lui pour le dire. Si rien ne revient après 2 × SRTT,
+//! un segment repart (un neuf, sinon le dernier) ; son ACK déclenche la reprise par
+//! les blocs, sans attendre le RTO. Sans SACK : pas de TLP.
+//!
 //! Écarté : `recv_sack_cache` et `tcp_shift_skb_data`, deux économies de Linux :
 //! ne pas reparcourir ce qu'un bloc redit, et fondre les segments SACKés. Nos
 //! files sont petites, et chaque ACK ne coûte qu'un parcours de ce que ses blocs
@@ -25,8 +30,9 @@
 
 use super::congestion::Phase;
 use super::hors_ordre::etendre_bloc;
-use super::retrans::{DEJA_RENVOYE, EN_RENVOI, EtatSack, FLAG_DATA_SACKED, FLAG_DSACKING_ACK, FLAG_ORIG_SACK_ACKED, PERDU, SACKE};
-use super::{Charge, Tcb, Tcp, apres, avant};
+use super::retrans::{DEJA_RENVOYE, EN_RENVOI, EtatSack, FLAG_DATA_SACKED, FLAG_DSACK_TLP, FLAG_DSACKING_ACK, FLAG_NOT_DUP, FLAG_ORIG_SACK_ACKED, FLAG_SND_UNA_ADVANCED, PERDU, SACKE};
+use super::rtt::{RTO_INITIAL, RTO_MIN};
+use super::{Charge, Sortant, Tcb, Tcp, apres, avant};
 use formats::reseau::tcp::BLOCS_MAX;
 
 /// Les blocs qu'un segment attend de trouver sans ACK à part (TCP_SACK_BLOCKS_EXPECTED).
@@ -205,11 +211,17 @@ impl<P: Charge> Tcb<P> {
             return 0;
         }
         let segments = if n > self.mss as u32 { n.div_ceil(self.mss as u32) } else { 1 };
+        // Le doublon de notre sonde (un segment renvoyé par TLP, arrivé en plus de
+        // l'original) n'est pas dû au réordonnancement.
+        let de_la_sonde = n <= self.mss as u32 && self.tlp_high_seq == Some(fin);
+        if de_la_sonde {
+            etat.flag |= FLAG_DSACK_TLP;
+        }
         self.dsack_doublons += segments;
         if self.dsack_doublons > self.total_retrans {
             return 0;
         }
-        if self.reord_seen > 0 {
+        if self.reord_seen > 0 && !de_la_sonde {
             self.rack.dsack_vu = true;
         }
         etat.flag |= FLAG_DSACKING_ACK;
@@ -524,6 +536,79 @@ impl<P: Charge> Tcb<P> {
             e.a_emettre = true;
         }
         self.rearmer_rto(maintenant);
+    }
+
+    // --- TLP ---
+
+    /// Arme la sonde de fin de rafale (`tcp_schedule_loss_probe`) : avec SACK,
+    /// hors de toute reprise, 2 × SRTT plus de quoi laisser partir un ACK retardé
+    /// s'il n'y a qu'un segment en vol (200 ms), sinon 2 ms ; sans mesure, 1 s ; pas
+    /// après le RTO. Rend vrai si elle est armée.
+    pub(super) fn programmer_sonde_de_perte(&mut self, rto_repart: bool, maintenant: u64) -> bool {
+        if !self.sack_ok || !matches!(self.cc.phase, Phase::Ouverte | Phase::Reduction) {
+            return false;
+        }
+        let Some(tete) = self.file.front().copied() else { return false };
+        let mut d = if self.rtt.mesure() {
+            en_jiffies(2 * self.rtt.srtt() + if self.file.len() == 1 { RTO_MIN } else { TIMEOUT_MIN })
+        } else {
+            RTO_INITIAL
+        };
+        let rto = if rto_repart { self.rto as i64 } else { (tete.envoi + self.rto) as i64 - maintenant as i64 };
+        if rto > 0 {
+            d = d.min(en_jiffies(rto as u64));
+        }
+        self.armer_xmit(super::Minuteur::SondeDePerte, d, maintenant);
+        true
+    }
+
+    /// La sonde part (`tcp_send_loss_probe`) : une seule à la fois ; un segment
+    /// neuf, si la fenêtre de l'autre le laisse (la cwnd, non : c'est toute
+    /// l'idée) ; sinon le dernier, renvoyé. Puis le RTO repart.
+    pub(super) fn envoyer_sonde_de_perte(&mut self, maintenant: u64, sortir: &mut impl FnMut(Sortant)) {
+        if self.tlp_high_seq.is_none() {
+            self.tlp_renvoi = false;
+            let mut partie = false;
+            let bord = self.snd_una.wrapping_add(self.snd_wnd);
+            if let Some(l) = self.prochain_segment()
+                && !apres(self.snd_nxt.wrapping_add(l), bord)
+            {
+                let debut = self.snd_nxt.wrapping_sub(self.seq_envoi) as usize;
+                let reste = self.octets_envoi.saturating_sub(debut);
+                let n = reste.min(self.mss_courant() as usize);
+                let avec_fin = self.fin_seq().is_some_and(|f| !apres(self.snd_nxt, f)) && n == reste;
+                partie = self.envoyer_donnees(n, avec_fin, maintenant, sortir);
+            } else if !self.file.is_empty() && self.envoyer_entree(self.file.len() - 1, maintenant, sortir) {
+                self.tlp_renvoi = true;
+                partie = true;
+            }
+            if partie {
+                self.tlp_high_seq = Some(self.snd_nxt);
+                self.t_sorte = super::Minuteur::Retransmission;
+            }
+        }
+        self.rearmer_rto(maintenant);
+    }
+
+    /// L'ACK pendant une sonde (`tcp_process_tlp_ack`) : l'original et la sonde sont
+    /// arrivés (un D-SACK d'elle, ou un ACK dupliqué pur) : rien de perdu ; un ACK
+    /// qui passe la sonde renvoyée : il y avait bien une perte, la cwnd réduit, en
+    /// CWR : le renvoi l'a réparée, sans reprise.
+    pub(super) fn traiter_ack_de_sonde(&mut self, ack: u32, flag: u32) {
+        let Some(haut) = self.tlp_high_seq else { return };
+        if avant(ack, haut) {
+            return;
+        }
+        if !self.tlp_renvoi || flag & FLAG_DSACK_TLP != 0 {
+            self.tlp_high_seq = None;
+        } else if apres(ack, haut) {
+            self.commencer_reduction();
+            self.cc.phase = Phase::Reduction;
+            self.finir_reduction();
+            self.rester_ouverte();
+        } else if flag & (FLAG_SND_UNA_ADVANCED | FLAG_NOT_DUP | FLAG_DATA_SACKED) == 0 {
+            self.tlp_high_seq = None;
+        }
     }
 
     /// Retient l'envoi d'un segment, pour RACK (`tsorted_sent_queue`) ; nettoie la

@@ -2336,3 +2336,112 @@ fn les_blocs_prennent_la_place_de_la_charge() {
     assert_eq!(s[0].1.len(), MSS as usize - 12, "un bloc : 4 + 8 octets");
     assert_eq!(blocs(&s[0].0).len(), 1);
 }
+
+/// Une paire avec SACK, et une mesure du RTT de 10 ms (le SRTT part de la poignée
+/// de main, à l'heure 0 : il en prend un huitième).
+fn paire_sack_rtt() -> (Connexion, Connexion) {
+    let (mut c, mut f) = paire_sack(false);
+    ecrire(&mut c, b"x");
+    let s = sortants(&mut c);
+    avancer(10 * MS);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    livrer(&mut f, &mut c);
+    let _ = lire(&mut f, 1);
+    (c, f)
+}
+
+/// TLP : la dernière salve sans réponse. Après 2 × SRTT + 2 ms (arrondis au
+/// jiffy), le dernier segment repart, sans toucher au RTO reculé ni à la cwnd
+/// (`tcp_schedule_loss_probe`, `tcp_send_loss_probe`).
+#[test]
+fn tlp_renvoie_le_dernier() {
+    let (mut c, _f) = paire_sack_rtt();
+    let mss = MSS as u32;
+    ecrire(&mut c, &vec![1u8; 3 * MSS as usize]);
+    assert_eq!(sortants(&mut c).len(), 3);
+    let (una, nxt, _) = c.numeros();
+    let cwnd = c.congestion().0;
+    // 2 × SRTT + 2 ms, arrondis au jiffy (4 ms : HZ = 250).
+    let e = c.echeance().unwrap();
+    let srtt = c.info(maintenant()).rtt as u64 * 1000;
+    assert_eq!(e - maintenant(), (2 * srtt + 2 * MS).div_ceil(4 * MS) * 4 * MS);
+    avancer(e - maintenant());
+    c.minuteur(maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(s.iter().map(|x| x.0.seq).collect::<Vec<_>>(), [una + 2 * mss]);
+    let i = c.info(maintenant());
+    assert_eq!((i.phase, i.total_rto, i.retransmis, i.cwnd), (0, 0, 0, cwnd));
+    assert_eq!(c.numeros().1, nxt);
+    // Une seule à la fois : le suivant est le RTO, du dernier envoi.
+    let e = c.echeance().unwrap();
+    assert!(e - maintenant() > 100 * MS);
+    // L'ACK du tout, d'un seul coup : la perte est réparée ; la cwnd réduit (CWR :
+    // `tcp_process_tlp_ack` le voit à un ACK qui passe la sonde), sans reprise.
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: nxt, fenetre: 65_535, ..Tcp::default() };
+    c.recevoir(&m, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).phase, 0);
+    ecrire(&mut c, b"y");
+    sortants(&mut c);
+    c.recevoir(&Tcp { ack: nxt.wrapping_add(1), ..m }, vide(), maintenant());
+    assert!(c.congestion().0 < cwnd, "{} contre {}", c.congestion().0, cwnd);
+    assert_eq!(c.info(maintenant()).phase, 0);
+}
+
+/// Un seul segment en vol : la sonde attend aussi un ACK retardé possible (200 ms),
+/// bornée par le RTO. Sans SACK : pas de sonde.
+#[test]
+fn tlp_un_seul_segment_et_sans_sack() {
+    let (mut c, _f) = paire_sack_rtt();
+    ecrire(&mut c, b"x");
+    sortants(&mut c);
+    let attente = c.echeance().unwrap() - maintenant();
+    assert_eq!(attente, c.congestion().2.div_ceil(4 * MS) * 4 * MS, "le RTO la borne : il est de 210 ms");
+    let (mut c, mut f) = paire();
+    ecrire(&mut c, b"x");
+    let s = sortants(&mut c);
+    avancer(10 * MS);
+    f.recevoir(&s[0].0, Octets(s[0].1.clone(), 0), maintenant());
+    livrer(&mut f, &mut c);
+    ecrire(&mut c, b"y");
+    sortants(&mut c);
+    assert_eq!(c.echeance().unwrap() - maintenant(), c.congestion().2);
+}
+
+/// La sonde préfère un segment neuf, hors de la cwnd (`push_one = 2`).
+#[test]
+fn tlp_prefere_du_neuf() {
+    let (mut c, _f) = paire_sack_rtt();
+    let cwnd = c.congestion().0 as usize;
+    ecrire(&mut c, &vec![1u8; (cwnd + 1) * MSS as usize]);
+    assert_eq!(sortants(&mut c).len(), cwnd);
+    let nxt = c.numeros().1;
+    avancer(c.echeance().unwrap() - maintenant());
+    c.minuteur(maintenant());
+    let s = sortants(&mut c);
+    assert_eq!(s.iter().map(|x| x.0.seq).collect::<Vec<_>>(), [nxt]);
+    assert_eq!(c.numeros().1, nxt.wrapping_add(MSS as u32));
+    assert_eq!(c.info(maintenant()).phase, 0);
+}
+
+/// La sonde et l'original sont arrivés : le D-SACK de la sonde dit qu'il n'y avait
+/// rien de perdu : la cwnd reste.
+#[test]
+fn tlp_rien_de_perdu() {
+    let (mut c, _f) = paire_sack_rtt();
+    let mss = MSS as u32;
+    ecrire(&mut c, &vec![1u8; 3 * MSS as usize]);
+    sortants(&mut c);
+    let (una, nxt, _) = c.numeros();
+    let cwnd = c.congestion().0;
+    avancer(c.echeance().unwrap() - maintenant());
+    c.minuteur(maintenant());
+    sortants(&mut c);
+    let mut o = tcp::Options { nb_blocs: 1, ..Default::default() };
+    o.blocs[0] = (una + 2 * mss, nxt);
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: nxt, fenetre: 65_535, options: o, ..Tcp::default() };
+    c.recevoir(&m, vide(), maintenant());
+    ecrire(&mut c, b"y");
+    sortants(&mut c);
+    c.recevoir(&Tcp { ack: nxt.wrapping_add(1), options: tcp::Options::default(), ..m }, vide(), maintenant());
+    assert!(c.congestion().0 >= cwnd);
+}

@@ -295,6 +295,8 @@ enum Minuteur {
     Sonde,
     /// La fenêtre de réordonnancement de RACK (ICSK_TIME_REO_TIMEOUT).
     Reordonnancement,
+    /// La sonde de fin de rafale (ICSK_TIME_LOSS_PROBE).
+    SondeDePerte,
 }
 
 /// Les états d'une connexion.
@@ -672,9 +674,11 @@ pub struct Tcb<P: Charge> {
     rst_actif: bool,
     /// Un ACK, tout de suite.
     ack_maintenant: bool,
-    /// Ce qu'il faut renvoyer après un ACK, et la tête de la file après un RTO.
+    /// Ce qu'il faut renvoyer après un ACK, la tête de la file après un RTO, et
+    /// la sonde de fin de rafale.
     rexmit: Rexmit,
     rto_du: bool,
+    tlp_du: bool,
     /// Une sonde de fenêtre, ou de keepalive.
     sonde_due: bool,
     /// Pousser ce qui attend, une fois, malgré Nagle et TCP_CORK (le
@@ -769,6 +773,10 @@ pub struct Tcb<P: Charge> {
     sack_renie: bool,
     rack: Rack,
     min_rtt: MinMax,
+    /// La sonde de fin de rafale en cours : SND.NXT à son envoi (`tlp_high_seq`),
+    /// et si c'était un renvoi (`tlp_retrans`).
+    tlp_high_seq: Option<u32>,
+    tlp_renvoi: bool,
     /// La file par heure d'envoi (`tsorted_sent_queue`), nettoyée à la lecture,
     /// et l'heure d'envoi du dernier segment acquitté (`first_tx_mstamp`).
     tri: VecDeque<(u32, u64)>,
@@ -845,6 +853,7 @@ impl<P: Charge> Tcb<P> {
             ack_maintenant: false,
             rexmit: Rexmit::Rien,
             rto_du: false,
+            tlp_du: false,
             sonde_due: false,
             pousser: false,
             plus_a_venir: false,
@@ -894,6 +903,8 @@ impl<P: Charge> Tcb<P> {
             sack_renie: false,
             rack: Rack::new(),
             min_rtt: MinMax::new(),
+            tlp_high_seq: None,
+            tlp_renvoi: false,
             tri: VecDeque::new(),
             tx_acquitte: 0,
             dernier_envoi: 0,
@@ -2028,16 +2039,19 @@ impl<P: Charge> Tcb<P> {
                 self.alerte(0, &mut flag, maintenant);
             }
             self.ack_de_sonde(maintenant);
+            self.traiter_ack_de_sonde(t.ack, flag);
             return ResultatAck::Traite;
         }
         flag |= self.nettoyer_file(fack_avant, una_avant, &mut etat, maintenant);
         self.rack_maj_fenetre(etat.prior_livres);
+        self.traiter_ack_de_sonde(t.ack, flag);
         // `tcp_ack_is_dubious`.
         if flag & FLAG_NOT_DUP == 0 || flag & FLAG_CA_ALERT != 0 || self.cc.phase != Phase::Ouverte {
             let dupack = u32::from(flag & (FLAG_SND_UNA_ADVANCED | FLAG_NOT_DUP | FLAG_DSACKING_ACK) == 0);
             self.alerte(dupack, &mut flag, maintenant);
         }
-        if flag & FLAG_SET_XMIT_TIMER != 0 {
+        // `tcp_set_xmit_timer` : la sonde de fin de rafale, sinon le RTO.
+        if flag & FLAG_SET_XMIT_TIMER != 0 && !self.programmer_sonde_de_perte(true, maintenant) {
             self.rearmer_rto(maintenant);
         }
         self.controler_congestion(self.livres.wrapping_sub(livres_avant), self.perdus.wrapping_sub(perdus_avant), flag);
@@ -2750,6 +2764,10 @@ impl<P: Charge> Tcb<P> {
                 Minuteur::Retransmission => self.minuteur_retrans(maintenant, &mut e),
                 Minuteur::Sonde => self.minuteur_sonde(maintenant, &mut e),
                 Minuteur::Reordonnancement => self.minuteur_reordonnancement(maintenant, &mut e),
+                Minuteur::SondeDePerte => {
+                    self.tlp_du = true;
+                    e.a_emettre = true;
+                }
             }
         }
         if self.t_keepalive.is_some_and(|t| t <= maintenant) {
@@ -3043,11 +3061,12 @@ impl<P: Charge> Tcb<P> {
             // Un petit segment (`tcp_minshall_update`).
             self.snd_sml = fin_segment;
         }
-        let vide = self.file.is_empty();
+        // Une sonde de fin de rafale armée laisse la place au RTO (`tcp_event_new_data_sent`).
+        let rearmer = self.file.is_empty() || (self.t_xmit.is_some() && self.t_sorte == Minuteur::SondeDePerte);
         self.file.push_back(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, self.livres));
         self.tri_ajouter(self.snd_nxt, maintenant);
         self.snd_nxt = fin_segment;
-        if vide {
+        if rearmer {
             self.rearmer_rto(maintenant);
         }
         self.segment_de_donnees_parti(maintenant);
@@ -3149,6 +3168,9 @@ impl<P: Charge> Tcb<P> {
         if core::mem::replace(&mut self.rexmit, Rexmit::Rien) == Rexmit::Perdus {
             self.renvoyer_perdus(maintenant, &mut sortir);
         }
+        if core::mem::take(&mut self.tlp_du) {
+            self.envoyer_sonde_de_perte(maintenant, &mut sortir);
+        }
         // Les données neuves, et le FIN (`tcp_write_xmit`), tant que la fenêtre
         // de congestion a de la place : un segment entier dans la fenêtre de
         // l'autre (`tcp_snd_wnd_test` : on attend plutôt que de le couper).
@@ -3204,8 +3226,9 @@ impl<P: Charge> Tcb<P> {
         if sortis > 0 || limitee {
             self.cc.valider(limitee, self.file.len() as u32, self.snd_una, self.snd_nxt);
         }
-        if sortis > 0 && self.en_reduction() {
-            self.prr_sortis += sortis;
+        if sortis > 0 {
+            // Une sonde par fin de rafale.
+            self.programmer_sonde_de_perte(false, maintenant);
         }
         // Rien en vol, et des données qui attendent (la fenêtre de l'autre ne
         // les laisse pas passer, ou TCP_CORK les retient) : la sonde
