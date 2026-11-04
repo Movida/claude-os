@@ -638,7 +638,7 @@ fn total(morceaux: &[(u64, u64)]) -> usize {
 /// Envoie les morceaux `morceaux` (le `sock_sendmsg` de Linux), à `nom`
 /// (None : la destination de la connexion), avec `drapeaux` et les messages
 /// de contrôle `controle`.
-fn envoyer(o: &FichierTenu, nom: Option<&[u8]>, morceaux: &[(u64, u64)], mut drapeaux: u64, controle: Result<Controle, i64>, fichiers: Vec<FichierTenu>) -> i64 {
+fn envoyer(o: &FichierTenu, nom: Option<&[u8]>, morceaux: &[(u64, u64)], mut drapeaux: u64, controle: Result<Controle, i64>, scm: unix::Scm) -> i64 {
     if non_bloquant(o) {
         drapeaux |= MSG_DONTWAIT;
     }
@@ -667,7 +667,7 @@ fn envoyer(o: &FichierTenu, nom: Option<&[u8]>, morceaux: &[(u64, u64)], mut dra
             if let Err(e) = controle {
                 return e;
             }
-            let r = unix::envoyer(o.socket(), nom, longueur, drapeaux, fichiers, remplir);
+            let r = unix::envoyer(o.socket(), nom, longueur, drapeaux, scm, remplir);
             if r == Err(-EPIPE) && drapeaux & MSG_NOSIGNAL == 0 && o.socket().sorte == unix::SOCK_STREAM {
                 crate::signaux::au_fil_courant(13);
             }
@@ -686,8 +686,9 @@ struct Reception {
     drapeaux: u32,
     /// L'erreur prise de la file d'erreurs (MSG_ERRQUEUE).
     erreur: Option<socket::ErreurEnFile>,
-    /// Les descripteurs arrivés par AF_UNIX (SCM_RIGHTS).
+    /// Les descripteurs arrivés par AF_UNIX (SCM_RIGHTS), et ses droits s'il y en a à dire.
     fichiers: Vec<FichierTenu>,
+    droits: Option<unix::Droits>,
 }
 
 /// Reçoit dans les morceaux `morceaux` (le `sock_recvmsg`) : une socket de
@@ -709,7 +710,7 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
             coupe: copie < total,
         };
         let d = if recu.coupe { MSG_TRUNC } else { 0 } | MSG_ERRQUEUE as u32;
-        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: Some(e), fichiers: Vec::new() });
+        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: Some(e), fichiers: Vec::new(), droits: None });
     }
     if o.socket().protocole == Protocole::Tcp && drapeaux & MSG_OOB != 0 {
         // L'octet urgent (`tcp_recv_urg`) : MSG_OOB dans `msg_flags`, et
@@ -718,15 +719,16 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let n = tcp::recevoir_urgent(o.socket(), drapeaux, place, |octet| copier_vers_morceaux(morceaux, &[octet]).map(|_| ()))?;
         let recu = socket::Recu { vide: true, longueur: n.unwrap_or(0), source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: false };
         let d = if n.is_some() { MSG_OOB as u32 | if place == 0 { MSG_TRUNC } else { 0 } } else { 0 };
-        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: None, fichiers: Vec::new() });
+        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: None, fichiers: Vec::new(), droits: None });
     }
     if o.socket().protocole == Protocole::Unix {
         let u = unix::recevoir(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |decalage, octets| {
             copier_vers_morceaux_depuis(morceaux, decalage, octets)
         })?;
         let recu = socket::Recu { vide: true, longueur: u.longueur, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: u.coupe };
-        let d = if u.coupe { MSG_TRUNC } else { 0 };
-        return Ok(Reception { recu, nom_unix: u.adresse, drapeaux: d, erreur: None, fichiers: u.fichiers });
+        let d = if u.coupe { MSG_TRUNC } else { 0 } | if u.urgent { MSG_OOB as u32 } else { 0 };
+        let droits = u.scm.then_some(u.droits);
+        return Ok(Reception { recu, nom_unix: u.adresse, drapeaux: d, erreur: None, fichiers: u.fichiers, droits });
     }
     if o.socket().protocole == Protocole::Tcp {
         // Un flux : les octets à la suite dans les morceaux, sans émetteur
@@ -735,11 +737,11 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
             copier_vers_morceaux_depuis(morceaux, decalage, octets)
         })?;
         let recu = socket::Recu { vide: true, longueur: n, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: false };
-        return Ok(Reception { recu, nom_unix: None, drapeaux: 0, erreur: None, fichiers: Vec::new() });
+        return Ok(Reception { recu, nom_unix: None, drapeaux: 0, erreur: None, fichiers: Vec::new(), droits: None });
     }
     let recu = socket::prendre(o.socket(), drapeaux, non_bloquant(o), |octets| copier_vers_morceaux(morceaux, octets))?;
     let drapeaux = if recu.coupe { MSG_TRUNC } else { 0 };
-    Ok(Reception { recu, nom_unix: None, drapeaux, erreur: None, fichiers: Vec::new() })
+    Ok(Reception { recu, nom_unix: None, drapeaux, erreur: None, fichiers: Vec::new(), droits: None })
 }
 
 /// sendto(fd, tampon, longueur, drapeaux, adresse, longueur de l'adresse) :
@@ -753,7 +755,7 @@ pub fn sendto(fd: u64, tampon: u64, longueur: u64, drapeaux: u64, adresse: u64, 
     en_i64((|| {
         let o = tenir(fd)?;
         let a = if adresse != 0 { Some(copier_adresse(adresse, longueur_adresse)?) } else { None };
-        Ok(envoyer(&o, a.as_ref().map(Adresse::octets), &[(tampon, longueur)], drapeaux as u32 as u64, Ok(Controle::default()), Vec::new()))
+        Ok(envoyer(&o, a.as_ref().map(Adresse::octets), &[(tampon, longueur)], drapeaux as u32 as u64, Ok(Controle::default()), unix::Scm::default()))
     })())
 }
 
@@ -878,9 +880,11 @@ fn lire_controle(c: &[u8]) -> Result<Controle, i64> {
 
 /// Les messages de contrôle d'un envoi par AF_UNIX (`__scm_send`) : sur SOL_SOCKET seulement,
 /// SCM_RIGHTS, en les tenant (au plus 253 en tout, EINVAL ; un qui n'est pas ouvert, EBADF ; ceux
-/// d'O_PATH aussi : `fget_raw`) ; un autre genre : EINVAL.
-fn lire_controle_unix(c: &[u8]) -> Result<Vec<FichierTenu>, i64> {
-    let mut fichiers = Vec::new();
+/// d'O_PATH aussi : `fget_raw`) ; SCM_CREDENTIALS, ses droits, ou ceux qu'il a le droit de donner
+/// (`scm_check_creds`) : EINVAL pour -1, EPERM pour un autre pid, ou une identité qui n'est pas la
+/// sienne (nos programmes n'ont aucune capacité) ; un autre genre : EINVAL.
+fn lire_controle_unix(c: &[u8]) -> Result<unix::Scm, i64> {
+    let mut scm = unix::Scm::default();
     let mut i = 0;
     while c.len() >= i + CMSG_ENTETE {
         let longueur = u64::from_le_bytes(c[i..i + 8].try_into().unwrap_or([0; 8])) as usize;
@@ -889,26 +893,39 @@ fn lire_controle_unix(c: &[u8]) -> Result<Vec<FichierTenu>, i64> {
         }
         let niveau = i32::from_le_bytes(c[i + 8..i + 12].try_into().unwrap_or([0; 4]));
         let sorte = i32::from_le_bytes(c[i + 12..i + 16].try_into().unwrap_or([0; 4]));
-        if niveau == SOL_SOCKET {
-            if sorte != SCM_RIGHTS {
-                return Err(-EINVAL);
-            }
-            let d = &c[i + CMSG_ENTETE..i + longueur];
-            if d.len() / 4 > unix::SCM_MAX_FD || fichiers.len() + d.len() / 4 > unix::SCM_MAX_FD {
-                return Err(-EINVAL);
-            }
-            fichiers.try_reserve(d.len() / 4).map_err(|_| -ENOMEM)?;
-            for fd in d.chunks_exact(4) {
-                let fd = i32::from_le_bytes([fd[0], fd[1], fd[2], fd[3]]);
-                if fd < 0 {
-                    return Err(-EBADF);
+        let d = &c[i + CMSG_ENTETE..i + longueur];
+        match (niveau, sorte) {
+            (SOL_SOCKET, SCM_RIGHTS) => {
+                if d.len() / 4 > unix::SCM_MAX_FD || scm.fichiers.len() + d.len() / 4 > unix::SCM_MAX_FD {
+                    return Err(-EINVAL);
                 }
-                fichiers.ajouter_dans_la_place(appels_fichiers::tenir(fd as u64)?);
+                scm.fichiers.try_reserve(d.len() / 4).map_err(|_| -ENOMEM)?;
+                for fd in d.chunks_exact(4) {
+                    let fd = i32::from_le_bytes([fd[0], fd[1], fd[2], fd[3]]);
+                    if fd < 0 {
+                        return Err(-EBADF);
+                    }
+                    scm.fichiers.ajouter_dans_la_place(appels_fichiers::tenir(fd as u64)?);
+                }
             }
+            (SOL_SOCKET, SCM_CREDENTIALS) => {
+                let [p0, p1, p2, p3, u0, u1, u2, u3, g0, g1, g2, g3] = *d else { return Err(-EINVAL) };
+                let (pid, uid, gid) = (u32::from_le_bytes([p0, p1, p2, p3]), u32::from_le_bytes([u0, u1, u2, u3]), u32::from_le_bytes([g0, g1, g2, g3]));
+                if uid == u32::MAX || gid == u32::MAX {
+                    return Err(-EINVAL);
+                }
+                let permis = processus::avec(|p| pid == p.pid && uid == p.identite.uid && gid == p.identite.gid);
+                if !permis {
+                    return Err(-EPERM);
+                }
+                scm.droits = Some(unix::Droits { pid, uid, gid });
+            }
+            (SOL_SOCKET, _) => return Err(-EINVAL),
+            _ => {}
         }
         i += aligner(longueur);
     }
-    Ok(fichiers)
+    Ok(scm)
 }
 
 /// Envoie un `msghdr` déjà lu (`____sys_sendmsg`) : ses messages de
@@ -923,7 +940,7 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
     } else {
         None
     };
-    let mut fichiers = Vec::new();
+    let mut scm = unix::Scm::default();
     let controle = if m.longueur_controle > 0 {
         if m.longueur_controle > OPTMEM_MAX {
             return -ENOBUFS;
@@ -934,7 +951,7 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
         }
         if o.socket().protocole == Protocole::Unix {
             match lire_controle_unix(&c) {
-                Ok(f) => fichiers = f,
+                Ok(s) => scm = s,
                 Err(e) => return e,
             }
             Ok(Controle::default())
@@ -944,7 +961,7 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
     } else {
         Ok(Controle::default())
     };
-    envoyer(o, nom.as_ref().map(Adresse::octets), &m.morceaux, drapeaux, controle, fichiers)
+    envoyer(o, nom.as_ref().map(Adresse::octets), &m.morceaux, drapeaux, controle, scm)
 }
 
 /// sendmsg(fd, message, drapeaux) : MSG_CMSG_COMPAT (EINVAL), le
@@ -1138,12 +1155,25 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
         }
         c.ecrire(SOL_IP, IP_RECVERR, &o, &mut r.drapeaux);
     }
-    // Les descripteurs : sans place du tout, seulement MSG_CTRUNC (`__scm_recv_common`).
-    if !r.fichiers.is_empty() {
+    // Les droits et les descripteurs (`__scm_recv_common`) : sans place du tout, seulement
+    // MSG_CTRUNC.
+    if let Some(d) = r.droits {
+        let passcred = unix::passcred(o.socket());
         if m.controle == 0 {
-            r.drapeaux |= MSG_CTRUNC;
+            if passcred || !r.fichiers.is_empty() {
+                r.drapeaux |= MSG_CTRUNC;
+            }
         } else {
-            c.ecrire_descripteurs(&r.fichiers, drapeaux & MSG_CMSG_CLOEXEC != 0, &mut r.drapeaux);
+            if passcred {
+                let mut u = [0u8; 12];
+                u[..4].copy_from_slice(&d.pid.to_le_bytes());
+                u[4..8].copy_from_slice(&d.uid.to_le_bytes());
+                u[8..12].copy_from_slice(&d.gid.to_le_bytes());
+                c.ecrire(SOL_SOCKET, SCM_CREDENTIALS, &u, &mut r.drapeaux);
+            }
+            if !r.fichiers.is_empty() {
+                c.ecrire_descripteurs(&r.fichiers, drapeaux & MSG_CMSG_CLOEXEC != 0, &mut r.drapeaux);
+            }
         }
     }
     if copier_vers_utilisateur(adresse + 48, &r.drapeaux.to_le_bytes()).is_err()
@@ -1425,10 +1455,9 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         }
         SO_RCVTIMEO | SO_RCVTIMEO_NEW => op.rcvtimeo = delai(valeur, longueur)?,
         SO_SNDTIMEO | SO_SNDTIMEO_NEW => op.sndtimeo = delai(valeur, longueur)?,
-        // Gardée par AF_UNIX (le nom automatique) ; sans effet ailleurs.
-        SO_PASSCRED => {}
-        SO_PASSRIGHTS if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
-        SO_PASSRIGHTS => {}
+        // Seulement pour AF_UNIX (`sk_may_scm_recv`).
+        SO_PASSCRED | SO_PASSRIGHTS if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
+        SO_PASSCRED | SO_PASSRIGHTS => {}
         _ => return Err(-ENOPROTOOPT),
     }
     let (keepalive, oobinline) = (inet.options.keepalive, inet.options.oobinline);
@@ -1815,8 +1844,8 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
         // Lue et effacée (`sock_error`).
         SO_ERROR if s.protocole == Protocole::Tcp => entier(&mut o, tcp::prendre_erreur(s)),
         SO_ERROR if s.protocole == Protocole::Unix => entier(&mut o, unix::prendre_erreur(s)),
-        SO_PASSCRED => entier(&mut o, (s.protocole == Protocole::Unix && unix::passcred(s)) as i32),
-        SO_PASSRIGHTS if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
+        SO_PASSCRED | SO_PASSRIGHTS if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
+        SO_PASSCRED => entier(&mut o, unix::passcred(s) as i32),
         SO_PASSRIGHTS => entier(&mut o, unix::passrights(s) as i32),
         // La `struct ucred` du pair : AF_UNIX seule en a un.
         SO_PEERCRED => {
@@ -1876,7 +1905,7 @@ pub fn lire(o: &FichierTenu, morceaux: &[(u64, u64)]) -> i64 {
 /// destination (celle de la connexion ; pas connectée : EDESTADDRREQ, même
 /// pour 0 octet).
 pub fn ecrire(o: &FichierTenu, morceaux: &[(u64, u64)]) -> i64 {
-    envoyer(o, None, morceaux, 0, Ok(Controle::default()), Vec::new())
+    envoyer(o, None, morceaux, 0, Ok(Controle::default()), unix::Scm::default())
 }
 
 /// ioctl d'une socket, une fois passées celles de tous les fichiers
@@ -1898,6 +1927,10 @@ pub fn ioctl(o: &FichierTenu, requete: u64, argument: u64) -> i64 {
                 Err(e) => return e,
             },
             SIOCOUTQ => unix::en_route(o.socket()),
+            SIOCATMARK => match unix::a_la_marque(o.socket()) {
+                Ok(m) => m as usize,
+                Err(e) => return e,
+            },
             _ => return -ENOTTY,
         } as i32;
         return match copier_vers_utilisateur(argument, &v.to_le_bytes()) {

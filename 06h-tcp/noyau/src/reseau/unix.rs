@@ -74,8 +74,22 @@
 //! pour ne pas ralentir `close` : là où il y a des milliers de sockets en vol. Ici, le graphe est
 //! petit ; et « mémoire rendue » n'a pas à attendre qu'il se soit passé quelque chose.
 //!
-//! ÉCARTS : SCM_CREDENTIALS : EINVAL, ce que rend `__scm_send` pour un genre inconnu. MSG_OOB
-//! sur un flux AF_UNIX (Linux l'a depuis 5.15) : EOPNOTSUPP.
+//! LES DROITS (SCM_CREDENTIALS) : un message porte ceux qu'a donnés l'émetteur, ou les siens dès que
+//! l'une des deux sockets a SO_PASSCRED, ou que la receveuse n'a pas encore été acceptée, et qu'elle
+//! pourrait donc le demander (« Some apps rely on write() giving SCM_CREDENTIALS »). Une lecture ne
+//! colle jamais deux messages de droits différents.
+//!
+//! L'OCTET URGENT (MSG_OOB, un flux seulement ; Linux l'a depuis 5.15) : le dernier octet de
+//! l'envoi, un message à lui, que la socket désigne (`oob`). Une lecture ordinaire s'arrête devant lui,
+//! et le saute ensuite, sauf SO_OOBINLINE. Un second envoi urgent ne fait que le remplacer : le
+//! précédent redevient un octet comme un autre. Lu à part, il reste en file, vide : une marque
+//! (SIOCATMARK), où s'arrête la lecture d'avant, et que jette celle d'après (`prochain_du_flux`).
+//!
+//! ÉCARTS : pas de SIGURG au propriétaire de la socket (`sk_send_sigurg`) : F_SETOWN n'existe pas
+//! chez nous, et le TCP non plus ne l'envoie pas. SIOCINQ dit ce qui reste à lire : Linux 6.18 tient un
+//! compte à part (`inq_len`), qui ne descend qu'à la fin d'un message (mesuré : 6 à lire, 1 lu : 6
+//! encore), et qui oublie l'octet urgent sauté (il dit 1, la file vide, pour toujours) : pas un
+//! comportement sur lequel un programme peut compter.
 
 use super::socket::{Protocole, Socket, ARRET_ECRITURE, ARRET_LECTURE, POLLRDHUP};
 use crate::appels_fichiers::FichierTenu;
@@ -83,7 +97,7 @@ use crate::descripteurs::{Fichier, Sorte as SorteFichier};
 use crate::attente::{self, FileAttente, GardeMutex, Mutex, PorteFile, Relais, Sommeil};
 use crate::faillible::{self, FileFaillible, VecFaillible};
 use crate::partage::{Arc, Weak};
-use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM};
+use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::{cpu, processus, temps};
@@ -129,6 +143,7 @@ const EADDRINUSE: i64 = 98;
 const ECONNRESET: i64 = 104;
 const ENOBUFS: i64 = 105;
 const ENOMEM: i64 = 12;
+const EFAULT: i64 = 14;
 const ETOOMANYREFS: i64 = 109;
 const EISCONN: i64 = 106;
 const ENOTCONN: i64 = 107;
@@ -220,11 +235,23 @@ fn chemin(n: &Nom) -> &[u8] {
 }
 
 /// Les droits du pair (SO_PEERCRED : la `struct ucred`).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub struct Droits {
     pub pid: u32,
     pub uid: u32,
     pub gid: u32,
+}
+
+/// Ceux d'un message qui n'en porte pas, tels que les lit qui les demande (pas de pid, et
+/// `overflowuid` : `from_kuid_munged`, mesuré).
+const SANS_DROITS: Droits = Droits { pid: 0, uid: 65534, gid: 65534 };
+
+/// Ce que porte un envoi, en plus de ses octets (la `scm_cookie`).
+#[derive(Default)]
+pub struct Scm {
+    pub fichiers: Vec<FichierTenu>,
+    /// Les droits donnés par l'émetteur, déjà vérifiés (`scm_check_creds`).
+    pub droits: Option<Droits>,
 }
 
 /// Ceux du processus courant (`init_peercred`).
@@ -253,6 +280,10 @@ struct Message {
     /// parmi eux (0 : aucune).
     fichiers: Vec<FichierTenu>,
     vol: u64,
+    /// Ses droits (`UNIXCB(skb).pid`, `uid`, `gid`).
+    droits: Option<Droits>,
+    /// Un octet urgent : son numéro, à comparer à `oob` de la socket (0 : un message ordinaire).
+    numero_oob: u64,
 }
 
 impl Message {
@@ -275,6 +306,8 @@ struct Etat {
     passrights: bool,
     /// Une fille pas encore acceptée : le numéro de l'écoute qui la tient (`u->listener`).
     ecoute: Option<u64>,
+    /// L'octet urgent en file, son numéro (`u->oob_skb` ; 0 : aucun).
+    oob: u64,
     /// Les droits du pair (pour une écoute, les siens, posés à `listen`).
     droits: Option<Droits>,
     file: VecDeque<Message>,
@@ -304,7 +337,7 @@ impl Unix {
         Some(Unix {
             sorte,
             etat: Verrou::new(Etat {
-                phase: Phase::Neuve, nom: None, pair: None, arret: 0, erreur: 0, morte: false, passcred: false, passrights: true, ecoute: None, droits: None,
+                phase: Phase::Neuve, nom: None, pair: None, arret: 0, erreur: 0, morte: false, passcred: false, passrights: true, ecoute: None, oob: 0, droits: None,
                 file: VecDeque::new(),
             }),
             envoyes: AtomicUsize::new(0),
@@ -621,8 +654,8 @@ static GRAPHE: Verrou<Vec<Arete>> = Verrou::new(Vec::new());
 /// nos programmes sont le même utilisateur (pile.rs).
 static EN_VOL: AtomicUsize = AtomicUsize::new(0);
 
-/// Les numéros des messages de `GRAPHE`.
-static NUMEROS_DE_VOL: AtomicU64 = AtomicU64::new(1);
+/// Les numéros des messages de `GRAPHE`, et des octets urgents.
+static NUMEROS_DE_MESSAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Le fichier `f` est-il une socket AF_UNIX (`unix_get_socket`) ?
 fn socket_du_fichier(f: &FichierTenu) -> Option<&Arc<Socket>> {
@@ -804,7 +837,7 @@ fn connecter_flux(s: &Arc<Socket>, n: &Nom, non_bloquant: bool) -> Result<(), i6
         }
         // Le message qui apporte la fille à l'écoute.
         let mut ea = ua.etat.verrouiller();
-        let deposee = !ea.morte && ea.file.ajouter_derriere(Message { octets: Vec::new(), lus: 0, taille: 0, emetteur: None, fichiers: Vec::new(), vol: 0, enfant: Some(enfant.clone()) }).is_ok();
+        let deposee = !ea.morte && ea.file.ajouter_derriere(Message { octets: Vec::new(), lus: 0, taille: 0, emetteur: None, fichiers: Vec::new(), vol: 0, droits: None, numero_oob: 0, enfant: Some(enfant.clone()) }).is_ok();
         drop(ea);
         if !deposee {
             // L'écoute vient de fermer, ou plus de mémoire : défaire, des deux
@@ -935,22 +968,21 @@ pub fn paire(s: &Arc<Socket>) -> Result<Arc<Socket>, i64> {
 
 /// Envoie `longueur` octets remplis par `remplir`, à `destination` (un DGRAM
 /// non connecté), avec `drapeaux` (MSG_DONTWAIT). Rend ce qui a été envoyé.
-pub fn envoyer(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, fichiers: Vec<FichierTenu>,
+pub fn envoyer(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, scm: Scm,
                remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_OOB: u64 = 1;
-    if drapeaux & MSG_OOB != 0 {
-        return Err(-EOPNOTSUPP);
-    }
     // `wait_for_unix_gc`.
-    if !fichiers.is_empty() && GRAPHE.verrouiller().len() > EN_VOL_TROP {
+    if !scm.fichiers.is_empty() && GRAPHE.verrouiller().len() > EN_VOL_TROP {
         ramasser();
     }
-    if !fichiers.is_empty() && trop_en_vol() {
+    if !scm.fichiers.is_empty() && trop_en_vol() {
         return Err(-ETOOMANYREFS);
     }
     match unix(s).sorte {
-        Sorte::Flux => envoyer_flux(s, destination, longueur, drapeaux, fichiers, remplir),
-        _ => envoyer_message(s, destination, longueur, drapeaux, fichiers, remplir),
+        Sorte::Flux => envoyer_flux(s, destination, longueur, drapeaux, scm, remplir),
+        // Seul un flux a un octet urgent (`unix_dgram_sendmsg`).
+        _ if drapeaux & MSG_OOB != 0 => Err(-EOPNOTSUPP),
+        _ => envoyer_message(s, destination, longueur, drapeaux, scm, remplir),
     }
 }
 
@@ -983,7 +1015,7 @@ fn attendre_place(s: &Socket, non_bloquant: bool, echeance: Option<u64>, delai: 
 fn message(s: &Arc<Socket>, n: usize, decalage: usize, remplir: &mut impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<Message, i64> {
     let mut octets = faillible::remplie(n, 0u8).map_err(|_| -ENOBUFS)?;
     remplir(decalage, &mut octets)?;
-    Ok(Message { octets, lus: 0, taille: taille_vraie(unix(s).sorte, n), emetteur: Some(s.clone()), enfant: None, fichiers: Vec::new(), vol: 0 })
+    Ok(Message { octets, lus: 0, taille: taille_vraie(unix(s).sorte, n), emetteur: Some(s.clone()), enfant: None, fichiers: Vec::new(), vol: 0, droits: None, numero_oob: 0 })
 }
 
 /// Met le message `m` dans la file de `autre` et compte sa place chez
@@ -991,6 +1023,12 @@ fn message(s: &Arc<Socket>, n: usize, decalage: usize, remplir: &mut impl FnMut(
 /// (Err, avec EPIPE) ; elle refuse les descripteurs qu'il porte (SO_PASSRIGHTS) : EPERM ; plus de
 /// mémoire pour leurs arêtes (`unix_prepare_fpl`) : ENOMEM.
 fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
+    // Les droits, si l'une des deux sockets les demande (`unix_maybe_add_creds`) : lus avant de
+    // prendre le verrou de la receveuse : ni deux sockets, ni le processus, sous lui.
+    let (moi, passcred) = match &m.emetteur {
+        Some(e) if m.droits.is_none() => (Some(droits_courants()), unix(e).etat.verrouiller().passcred),
+        _ => (None, false),
+    };
     // Comptée d'abord : le destinataire peut la lire, et la rendre, dès
     // que le verrou est lâché.
     let compter = |m: &Message, plus: bool| {
@@ -1028,9 +1066,15 @@ fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
             compter(&m, false);
             return Err((m, errno));
         }
+        if passcred || e.passcred || e.ecoute.is_some() {
+            m.droits = m.droits.or(moi);
+        }
+        if m.numero_oob != 0 {
+            e.oob = m.numero_oob;
+        }
         EN_VOL.fetch_add(m.fichiers.len(), Ordering::Relaxed);
         if let Some(g) = &mut graphe {
-            m.vol = NUMEROS_DE_VOL.fetch_add(1, Ordering::Relaxed);
+            m.vol = NUMEROS_DE_MESSAGE.fetch_add(1, Ordering::Relaxed);
             for s in m.fichiers.iter().filter_map(|f| socket_du_fichier(f).map(|s| (s.numero, f.fichier().numero()))) {
                 g.ajouter_dans_la_place(Arete { message: m.vol, envolee: s.0, fichier: s.1, receveuse: autre.numero, ecoute: e.ecoute });
             }
@@ -1046,9 +1090,15 @@ fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
 /// fermé ou qui ne lit plus : EPIPE ; des messages d'au plus la moitié de
 /// SO_SNDBUF, chacun quand il y a la place. Rend ce qui a été envoyé, ou
 /// l'erreur si rien ne l'a été.
-fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, mut fichiers: Vec<FichierTenu>,
+fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, scm: Scm,
                 mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_DONTWAIT: u64 = 0x40;
+    const MSG_OOB: u64 = 1;
+    let oob = drapeaux & MSG_OOB != 0;
+    if oob && longueur == 0 {
+        return Err(-EOPNOTSUPP);
+    }
+    let Scm { mut fichiers, droits } = scm;
     let u = unix(s);
     let (pair, arret, phase) = {
         let e = u.etat.verrouiller();
@@ -1063,11 +1113,14 @@ fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dr
     }
     let (echeance, delai) = echeance(s.appels.verrouiller().options.sndtimeo);
     let mut fait = 0;
+    // Le dernier octet d'un envoi urgent part à part (`queue_oob`).
+    let ordinaires = longueur - usize::from(oob);
     while fait < longueur {
         if let Err(e) = attendre_place(s, drapeaux & MSG_DONTWAIT != 0, echeance, delai) {
             return if fait > 0 { Ok(fait) } else { Err(e) };
         }
-        let n = (longueur - fait).min((s.sndbuf.load(Ordering::Relaxed) as usize / 2).saturating_sub(64).max(1)).min(MESSAGE_MAX);
+        let urgent = fait == ordinaires;
+        let n = if urgent { 1 } else { (ordinaires - fait).min((s.sndbuf.load(Ordering::Relaxed) as usize / 2).saturating_sub(64).max(1)).min(MESSAGE_MAX) };
         let mut m = match message(s, n, fait, &mut remplir) {
             Ok(m) => m,
             Err(e) => return if fait > 0 { Ok(fait) } else { Err(e) },
@@ -1075,6 +1128,10 @@ fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dr
         // Les descripteurs : avec le premier message seulement ; sans octet, il n'y en a pas, et ils
         // sont perdus (`unix_stream_sendmsg`).
         m.fichiers = core::mem::take(&mut fichiers);
+        m.droits = droits;
+        if urgent {
+            m.numero_oob = NUMEROS_DE_MESSAGE.fetch_add(1, Ordering::Relaxed);
+        }
         if let Err((m, errno)) = deposer(&pair, m) {
             drop(m);
             return if fait > 0 { Ok(fait) } else { Err(errno) };
@@ -1089,7 +1146,7 @@ fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dr
 /// nom, ou le pair ; SEQPACKET : le pair seul, ENOTCONN sans) ; il en a un
 /// autre que nous : EPERM ; fermé : ECONNREFUSED (ou EPIPE pour SEQPACKET) ;
 /// sa file pleine (un DGRAM qui n'est pas son pair) : attendre, ou EAGAIN.
-fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, fichiers: Vec<FichierTenu>,
+fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, scm: Scm,
                    mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_DONTWAIT: u64 = 0x40;
     let u = unix(s);
@@ -1126,7 +1183,8 @@ fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize,
         None => pair.clone().ok_or(-ENOTCONN)?,
     };
     let mut m = message(s, longueur, 0, &mut remplir)?;
-    m.fichiers = fichiers;
+    m.fichiers = scm.fichiers;
+    m.droits = scm.droits;
     loop {
         let ua = unix(&autre);
         let (morte, son_pair_ok, pleine) = {
@@ -1197,18 +1255,23 @@ pub struct Recu {
     pub coupe: bool,
     /// Les descripteurs qui arrivent (`scm.fp`), à installer, ou à lâcher.
     pub fichiers: Vec<FichierTenu>,
+    /// Les droits de ce qui a été lu, et s'il y a de quoi les dire : pas à la fin d'un SEQPACKET.
+    pub droits: Droits,
+    pub scm: bool,
+    /// C'était l'octet urgent (MSG_OOB dans `msg_flags`).
+    pub urgent: bool,
 }
 
 /// Reçoit au plus `longueur` octets par `copier` (`decalage`, octets) avec
-/// `drapeaux` (MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL, MSG_TRUNC).
+/// `drapeaux` (MSG_OOB, MSG_PEEK, MSG_DONTWAIT, MSG_WAITALL, MSG_TRUNC).
 pub fn recevoir(s: &Socket, longueur: usize, drapeaux: u64, non_bloquant: bool,
                 copier: impl FnMut(usize, &[u8]) -> Result<usize, i64>) -> Result<Recu, i64> {
     const MSG_OOB: u64 = 1;
     const MSG_DONTWAIT: u64 = 0x40;
-    if drapeaux & MSG_OOB != 0 {
+    let u = unix(s);
+    if drapeaux & MSG_OOB != 0 && u.sorte != Sorte::Flux {
         return Err(-EOPNOTSUPP);
     }
-    let u = unix(s);
     let (delai, rcvlowat) = {
         let i = s.appels.verrouiller();
         (i.options.rcvtimeo, i.options.rcvlowat as usize)
@@ -1217,6 +1280,7 @@ pub fn recevoir(s: &Socket, longueur: usize, drapeaux: u64, non_bloquant: bool,
     let (echeance, delai) = echeance(delai);
     let mut a = Attente { lecteur: Some(u.lecteurs.verrouiller()), lecteurs: &u.lecteurs, non_bloquant, echeance, delai };
     match u.sorte {
+        Sorte::Flux if drapeaux & MSG_OOB != 0 => recevoir_urgent(s, longueur, drapeaux, copier),
         Sorte::Flux => recevoir_flux(s, longueur, drapeaux, rcvlowat, &mut a, copier),
         _ => recevoir_message(s, longueur, drapeaux, &mut a, copier),
     }
@@ -1267,6 +1331,82 @@ fn rien_a_lire(s: &Socket, a: &mut Attente, non_bloquant: bool) -> Result<Option
     Ok(Some(()))
 }
 
+/// L'octet urgent (`unix_stream_recv_urg`) : SO_OOBINLINE, ou aucun : EINVAL. Rend 1 même sans
+/// place pour lui (mesuré : `recv(s, o, 0, MSG_OOB)`, 1, et il est perdu). Sans MSG_PEEK, il reste
+/// en file, vide : une marque ; celle d'avant, s'il y en avait une juste devant, s'en va.
+fn recevoir_urgent(s: &Socket, place: usize, drapeaux: u64, mut copier: impl FnMut(usize, &[u8]) -> Result<usize, i64>) -> Result<Recu, i64> {
+    const MSG_PEEK: u64 = 2;
+    let u = unix(s);
+    let en_ligne = s.appels.verrouiller().options.oobinline;
+    let (octet, jete) = {
+        let mut e = u.etat.verrouiller();
+        if e.phase != Phase::Connectee || en_ligne || e.oob == 0 {
+            return Err(-EINVAL);
+        }
+        let oob = e.oob;
+        let k = e.file.iter().position(|m| m.numero_oob == oob).ok_or(-EINVAL)?;
+        let octet = e.file[k].restant().first().copied().ok_or(-EINVAL)?;
+        let mut jete = None;
+        if drapeaux & MSG_PEEK == 0 {
+            e.oob = 0;
+            e.file[k].lus += 1;
+            if k > 0 && e.file[k - 1].restant().is_empty() {
+                jete = e.file.remove(k - 1);
+            }
+        }
+        (octet, jete)
+    };
+    // Sans place, rien à copier, donc pas de faute (le `short_copy` de `skb_copy_datagram_iter`).
+    let r = if place > 0 { copier(0, &[octet]) } else { Ok(0) };
+    if let Some(m) = jete {
+        liberer(m);
+    }
+    r.map_err(|_| -EFAULT)?;
+    Ok(Recu { longueur: 1, adresse: None, coupe: false, fichiers: Vec::new(), droits: SANS_DROITS, scm: false, urgent: true })
+}
+
+/// Le message suivant d'un flux, compte tenu de l'octet urgent (`manage_oob`). None : plus rien, ou
+/// une marque qui arrête la lecture (`copie` : déjà des octets de lus). Ce qu'on saute : `vus`
+/// pour MSG_PEEK (sa place est prise), `jetes` sinon, à lâcher hors du verrou.
+fn prochain_du_flux(e: &mut Etat, regarder: bool, en_ligne: bool, copie: bool, vus: &mut VecDeque<Message>, jetes: &mut [Option<Message>; 2]) -> Option<Message> {
+    let oob = e.oob;
+    let est_oob = move |m: &Message| m.numero_oob != 0 && m.numero_oob == oob;
+    let tete = e.file.front()?;
+    if !tete.restant().is_empty() && !est_oob(tete) {
+        return e.file.pop_front();
+    }
+    if tete.restant().is_empty() {
+        if copie && (oob == 0 || est_oob(tete)) {
+            return None;
+        }
+        let marque = e.file.pop_front()?;
+        if regarder {
+            vus.ajouter_derriere_dans_la_place(marque);
+        } else {
+            jetes[0] = Some(marque);
+        }
+    }
+    let tete = e.file.front()?;
+    if !est_oob(tete) {
+        return e.file.pop_front();
+    }
+    if copie {
+        return None;
+    }
+    if !regarder {
+        e.oob = 0;
+        if !en_ligne {
+            jetes[1] = e.file.pop_front();
+        }
+        return e.file.pop_front();
+    }
+    if !en_ligne {
+        let saute = e.file.pop_front()?;
+        vus.ajouter_derriere_dans_la_place(saute);
+    }
+    e.file.pop_front()
+}
+
 /// Un flux (`unix_stream_read_generic`) : pas connectée : EINVAL (mesuré) ;
 /// les messages à la suite, jusqu'à `longueur` (MSG_WAITALL : en attendant
 /// le reste ; sinon SO_RCVLOWAT, 1 par défaut : `sock_rcvlowat`) ; un
@@ -1283,17 +1423,38 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
     }
     let regarder = drapeaux & MSG_PEEK != 0;
     let cible = if drapeaux & MSG_WAITALL != 0 { longueur } else { rcvlowat.min(longueur) };
+    let en_ligne = s.appels.verrouiller().options.oobinline;
     let mut adresse = None;
     let mut fait = 0;
     let mut fichiers = Vec::new();
+    // Les droits de la lecture : aucun avant le premier message (à la fin du flux, mesuré : tout à
+    // zéro), puis ceux du premier, s'ils sont demandés ; et on ne colle pas ceux d'un autre.
+    let mut droits = Droits { pid: 0, uid: 0, gid: 0 };
+    let mut droits_vus = false;
     // MSG_PEEK : les messages déjà regardés, remis en tête à la fin.
     let mut vus: VecDeque<Message> = VecDeque::new();
     let r = loop {
         if fait >= longueur && longueur > 0 {
             break Ok(());
         }
-        let m = u.etat.verrouiller().file.pop_front();
+        // Pour MSG_PEEK : la place de ce qu'on saute, et de ce message.
+        if regarder && vus.try_reserve(3).is_err() {
+            break Ok(());
+        }
+        let mut jetes = [None, None];
+        let (m, avait, passcred) = {
+            let mut e = u.etat.verrouiller();
+            let avait = !e.file.is_empty();
+            (prochain_du_flux(&mut e, regarder, en_ligne, fait > 0, &mut vus, &mut jetes), avait, e.passcred)
+        };
+        for j in jetes.into_iter().flatten() {
+            liberer(j);
+        }
         let Some(mut m) = m else {
+            // Arrêtée par la marque, quoi qu'attende la lecture.
+            if avait && fait > 0 {
+                break Ok(());
+            }
             if fait >= cible || longueur == 0 {
                 break Ok(());
             }
@@ -1304,6 +1465,15 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
                 Err(e) => break if fait > 0 { Ok(()) } else { Err(e) },
             }
         };
+        if droits_vus {
+            if m.droits.unwrap_or(SANS_DROITS) != droits {
+                remettre(u, m);
+                break Ok(());
+            }
+        } else if passcred {
+            droits = m.droits.unwrap_or(SANS_DROITS);
+            droits_vus = true;
+        }
         if adresse.is_none() {
             adresse = Some(m.emetteur.as_ref().and_then(|e| unix(e).etat.verrouiller().nom));
         }
@@ -1317,10 +1487,6 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
         };
         fait += c;
         if regarder {
-            if vus.try_reserve(1).is_err() {
-                remettre(u, m);
-                break Ok(());
-            }
             // Regardé : des copies de ses descripteurs (`unix_peek_fds`), et on s'arrête sur lui.
             let porte = !m.fichiers.is_empty();
             fichiers = copies(&m.fichiers);
@@ -1348,7 +1514,7 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
     while let Some(m) = vus.pop_back() {
         remettre(u, m);
     }
-    r.map(|()| Recu { longueur: fait, adresse: adresse.flatten(), coupe: false, fichiers })
+    r.map(|()| Recu { longueur: fait, adresse: adresse.flatten(), coupe: false, fichiers, droits, scm: true, urgent: false })
 }
 
 /// Des copies de ses descripteurs (`scm_fp_dup`) ; plus de mémoire : aucune, comme lui.
@@ -1392,11 +1558,11 @@ fn recevoir_message(s: &Socket, longueur: usize, drapeaux: u64, a: &mut Attente,
             let non_bloquant = a.non_bloquant;
             match rien_a_lire(s, a, non_bloquant) {
                 Ok(Some(())) => continue,
-                Ok(None) => return Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new() }),
+                Ok(None) => return Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new(), droits: SANS_DROITS, scm: false, urgent: false }),
                 Err(e) => {
                     // SEQPACKET non bloquante, connexion défaite : 0 (la fin).
                     let fin = u.sorte == Sorte::Paquets && e == -EAGAIN && u.etat.verrouiller().arret & ARRET_LECTURE != 0;
-                    return if fin { Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new() }) } else { Err(e) };
+                    return if fin { Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new(), droits: SANS_DROITS, scm: false, urgent: false }) } else { Err(e) };
                 }
             }
         };
@@ -1409,6 +1575,7 @@ fn recevoir_message(s: &Socket, longueur: usize, drapeaux: u64, a: &mut Attente,
         let n = total.min(longueur);
         let adresse = m.emetteur.as_ref().and_then(|e| unix(e).etat.verrouiller().nom);
         let r = copier(0, &m.restant()[..n]);
+        let droits = m.droits.unwrap_or(SANS_DROITS);
         let mut m = m;
         let fichiers = if r.is_err() {
             Vec::new()
@@ -1423,7 +1590,7 @@ fn recevoir_message(s: &Socket, longueur: usize, drapeaux: u64, a: &mut Attente,
             liberer(m);
         }
         let c = r?;
-        return Ok(Recu { longueur: if drapeaux & MSG_TRUNC != 0 { total } else { c }, adresse, coupe: n < total, fichiers });
+        return Ok(Recu { longueur: if drapeaux & MSG_TRUNC != 0 { total } else { c }, adresse, coupe: n < total, fichiers, droits, scm: true, urgent: false });
     }
 }
 
@@ -1521,11 +1688,14 @@ fn fermer_avec(s: &Socket, embryon: bool) {
 /// attend).
 pub fn sonder(s: &Socket) -> u32 {
     let u = unix(s);
-    let (phase, arret, erreur, vide, pair) = {
+    let (phase, arret, erreur, vide, pair, oob) = {
         let e = u.etat.verrouiller();
-        (e.phase, e.arret, e.erreur, e.file.is_empty(), e.pair.clone())
+        (e.phase, e.arret, e.erreur, e.file.is_empty(), e.pair.clone(), e.oob != 0)
     };
     let mut m = 0;
+    if oob {
+        m |= POLLPRI;
+    }
     if erreur != 0 {
         m |= POLLERR;
     }
@@ -1580,6 +1750,20 @@ pub fn a_lire(s: &Socket) -> Result<usize, i64> {
         Sorte::Datagrammes => e.file.front().map_or(0, |m| m.restant().len()),
         _ => e.file.iter().map(|m| m.restant().len()).sum(),
     })
+}
+
+/// SIOCATMARK : la lecture est-elle devant l'octet urgent, ou sur sa marque ?
+pub fn a_la_marque(s: &Socket) -> Result<bool, i64> {
+    let u = unix(s);
+    if u.sorte != Sorte::Flux {
+        return Err(-EOPNOTSUPP);
+    }
+    // Sous l'iolock : un lecteur peut avoir la tête entre ses mains.
+    let _lecteur = u.lecteurs.verrouiller();
+    let e = u.etat.verrouiller();
+    let Some(tete) = e.file.front() else { return Ok(false) };
+    let est_oob = |m: &Message| m.numero_oob != 0 && m.numero_oob == e.oob;
+    Ok(est_oob(tete) || (tete.restant().is_empty() && (e.oob == 0 || e.file.get(1).is_some_and(est_oob))))
 }
 
 /// SIOCOUTQ (`unix_outq_len`) : ce qu'elle a envoyé, pas encore lu, en

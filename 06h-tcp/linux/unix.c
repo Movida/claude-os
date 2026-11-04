@@ -18,6 +18,7 @@
  *   - SCM_RIGHTS : ses limites, ce que la lecture d'un flux en fait, MSG_CTRUNC, SO_PASSRIGHTS,
  *     ETOOMANYREFS ; le ramasse-miettes : un bout de tube voyage avec les sockets, et le lecteur
  *     du tube voit la fin quand elles sont ramassées ;
+ *   - SCM_CREDENTIALS, et l'octet urgent (MSG_OOB) ;
  *   - un serveur et trois clients, en fils.
  * La place que prend un message dans le noyau (sa taille vraie) change
  * d'un noyau à l'autre : les lignes qui en dépendent ne comparent que leur
@@ -38,6 +39,7 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
+#include <linux/sockios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -1130,6 +1132,213 @@ static void ramasse_miettes(void)
     close(p[0]);
 }
 
+/* --- SCM_CREDENTIALS (`scm_check_creds`, `unix_maybe_add_creds`, `__scm_recv_common`) --- */
+
+/* Lit un message : ce qu'il rend, ses octets, ses drapeaux, et ses droits : `*pid` : -1, aucun. */
+static long lire_droits(int s, char *o, size_t n, int *fl, long *pid, long *uid, long *gid)
+{
+    static char c[64];
+    struct iovec iov = { o, n };
+    struct msghdr m = { 0 };
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = c;
+    m.msg_controllen = sizeof c;
+    memset(o, 0, n);
+    long r = recvmsg(s, &m, MSG_DONTWAIT);
+    *fl = m.msg_flags;
+    *pid = -1;
+    if (r < 0)
+        return r;
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+        if (h->cmsg_level == SOL_SOCKET && h->cmsg_type == SCM_CREDENTIALS) {
+            struct ucred u;
+            memcpy(&u, CMSG_DATA(h), sizeof u);
+            *pid = u.pid;
+            *uid = u.uid;
+            *gid = u.gid;
+        }
+    }
+    return r;
+}
+
+static long envoyer_droits(int s, pid_t pid, uid_t uid, gid_t gid, int longueur)
+{
+    struct iovec iov = { "e", 1 };
+    struct msghdr m = { 0 };
+    char c[CMSG_SPACE(16)];
+    memset(c, 0, sizeof c);
+    m.msg_iov = &iov;
+    m.msg_iovlen = 1;
+    m.msg_control = c;
+    m.msg_controllen = CMSG_SPACE(longueur);
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_SOCKET;
+    h->cmsg_type = SCM_CREDENTIALS;
+    h->cmsg_len = CMSG_LEN(longueur);
+    struct ucred u = { pid, uid, gid };
+    memcpy(CMSG_DATA(h), &u, sizeof u);
+    return sendmsg(s, &m, 0);
+}
+
+static void droits_du_message(void)
+{
+    int s[2], fl, oui = 1;
+    long pid, uid, gid;
+    char o[16];
+    long moi = getpid(), u = getuid(), g = getgid();
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    /* Personne ne les demandait à l'envoi : pas de pid, `overflowuid`. */
+    verifier(write(s[0], "av", 2) == 2 && setsockopt(s[1], SOL_SOCKET, SO_PASSCRED, &oui, sizeof oui) == 0, "un message avant SO_PASSCRED");
+    verifier(lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 2 && pid == 0 && uid == 65534 && gid == 65534, "ses droits : pid 0, 65534");
+    /* Le lecteur les demande : un simple `write` les porte. */
+    verifier(write(s[0], "xy", 2) == 2 && lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 2 && pid == moi && uid == u && gid == g && !(fl & MSG_CTRUNC),
+             "SO_PASSCRED du lecteur : les droits d'un simple write");
+    /* Pas de place pour eux : MSG_CTRUNC. */
+    {
+        char p[8];
+        struct iovec v = { p, sizeof p };
+        struct msghdr m = { 0 };
+        m.msg_iov = &v;
+        m.msg_iovlen = 1;
+        verifier(write(s[0], "x", 1) == 1 && recvmsg(s[1], &m, 0) == 1 && (m.msg_flags & MSG_CTRUNC), "sans place : MSG_CTRUNC");
+    }
+    /* Deux écrits, les mêmes droits : une lecture. */
+    verifier(write(s[0], "ab", 2) == 2 && write(s[0], "cd", 2) == 2 && lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 4, "les memes droits : colles");
+    /* À la fin d'un flux : tout à zéro (mesuré, `scm` encore vide). */
+    shutdown(s[0], SHUT_WR);
+    verifier(lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 0 && pid == 0 && uid == 0 && gid == 0, "la fin d'un flux : droits a zero");
+    close(s[0]);
+    close(s[1]);
+    /* SO_PASSCRED de l'émetteur suffit à les faire porter. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    setsockopt(s[0], SOL_SOCKET, SO_PASSCRED, &oui, sizeof oui);
+    verifier(write(s[0], "ab", 2) == 2 && setsockopt(s[1], SOL_SOCKET, SO_PASSCRED, &oui, sizeof oui) == 0 && lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 2 && pid == moi,
+             "SO_PASSCRED de l'emetteur : portes");
+    close(s[0]);
+    close(s[1]);
+    /* Sans droits, puis avec : on ne les colle pas. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    verifier(write(s[0], "ab", 2) == 2 && setsockopt(s[1], SOL_SOCKET, SO_PASSCRED, &oui, sizeof oui) == 0 && write(s[0], "cd", 2) == 2, "deux messages, des droits differents");
+    verifier(lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 2 && memcmp(o, "ab", 2) == 0 && pid == 0, "pas colles : ab, sans");
+    verifier(lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 2 && memcmp(o, "cd", 2) == 0 && pid == moi, "pas colles : cd, avec");
+    /* Donnés par l'émetteur (`scm_check_creds`). */
+    verifier(envoyer_droits(s[0], moi, u, g, 12) == 1 && lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 1 && pid == moi && uid == u, "SCM_CREDENTIALS justes");
+    verifier(envoyer_droits(s[0], 1, u, g, 12) == -1 && errno == EPERM, "un autre pid : EPERM");
+    verifier(envoyer_droits(s[0], moi, u + 1, g, 12) == -1 && errno == EPERM, "un autre uid : EPERM");
+    verifier(envoyer_droits(s[0], moi, u, g + 1, 12) == -1 && errno == EPERM, "un autre gid : EPERM");
+    verifier(envoyer_droits(s[0], moi, (uid_t)-1, g, 12) == -1 && errno == EINVAL, "uid -1 : EINVAL");
+    verifier(envoyer_droits(s[0], moi, u, g, 8) == -1 && errno == EINVAL, "longueur 8 : EINVAL");
+    close(s[0]);
+    close(s[1]);
+    /* Le lecteur ne les demande pas : rien. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    verifier(envoyer_droits(s[0], moi, u, g, 12) == 1 && lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 1 && pid == -1, "le lecteur ne demande pas : rien");
+    close(s[0]);
+    close(s[1]);
+    /* Un datagramme ; la fin d'un SEQPACKET n'en dit rien. */
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, s);
+    setsockopt(s[1], SOL_SOCKET, SO_PASSCRED, &oui, sizeof oui);
+    verifier(send(s[0], "d", 1, 0) == 1 && lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 1 && pid == moi, "un datagramme : ses droits");
+    close(s[0]);
+    close(s[1]);
+    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, s);
+    setsockopt(s[1], SOL_SOCKET, SO_PASSCRED, &oui, sizeof oui);
+    shutdown(s[0], SHUT_RDWR);
+    verifier(lire_droits(s[1], o, sizeof o, &fl, &pid, &uid, &gid) == 0 && pid == -1, "la fin d'un SEQPACKET : rien");
+    close(s[0]);
+    close(s[1]);
+    /* Rien d'autre qu'AF_UNIX (`sk_may_scm_recv`). */
+    int tcp = socket(AF_INET, SOCK_STREAM, 0);
+    socklen_t l = sizeof oui;
+    verifier(setsockopt(tcp, SOL_SOCKET, SO_PASSCRED, &oui, sizeof oui) == -1 && errno == EOPNOTSUPP, "SO_PASSCRED sur TCP : EOPNOTSUPP");
+    verifier(getsockopt(tcp, SOL_SOCKET, SO_PASSCRED, &oui, &l) == -1 && errno == EOPNOTSUPP, "relu : EOPNOTSUPP");
+    close(tcp);
+}
+
+/* --- MSG_OOB (`queue_oob`, `manage_oob`, `unix_stream_recv_urg`) --- */
+
+static int a_la_marque(int s)
+{
+    int v = -1;
+    ioctl(s, SIOCATMARK, &v);
+    return v;
+}
+
+static int en_alerte(int s)
+{
+    struct pollfd p = { s, POLLPRI, 0 };
+    poll(&p, 1, 0);
+    return (p.revents & POLLPRI) != 0;
+}
+
+/* Lit, et compare : `attendu` NULL : une erreur, `errno` valant `e`. */
+static int lu(int s, int drapeaux, const char *attendu, int e)
+{
+    char o[16];
+    memset(o, 0, sizeof o);
+    long r = recv(s, o, sizeof o, drapeaux | MSG_DONTWAIT);
+    if (attendu == NULL)
+        return r == -1 && errno == e;
+    return r == (long)strlen(attendu) && memcmp(o, attendu, r) == 0;
+}
+
+static void octet_urgent(void)
+{
+    int s[2], d[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    verifier(send(s[0], "", 0, MSG_OOB) == -1 && errno == EOPNOTSUPP, "MSG_OOB, 0 octet : EOPNOTSUPP");
+    verifier(lu(s[1], MSG_OOB, NULL, EINVAL), "MSG_OOB, rien : EINVAL");
+    verifier(send(s[0], "abc", 3, MSG_OOB) == 3 && a_la_marque(s[1]) == 0 && en_alerte(s[1]), "abc urgent : 3, POLLPRI, pas a la marque");
+    verifier(lu(s[1], 0, "ab", 0) && a_la_marque(s[1]) == 1, "la lecture s'arrete devant : ab, a la marque");
+    verifier(lu(s[1], MSG_OOB | MSG_PEEK, "c", 0) && en_alerte(s[1]), "MSG_OOB | MSG_PEEK : c, il reste");
+    {
+        char o[4];
+        struct iovec v = { o, sizeof o };
+        struct msghdr m = { 0 };
+        m.msg_iov = &v;
+        m.msg_iovlen = 1;
+        verifier(recvmsg(s[1], &m, MSG_OOB) == 1 && o[0] == 'c' && (m.msg_flags & MSG_OOB), "MSG_OOB : c, et MSG_OOB dans msg_flags");
+    }
+    verifier(!en_alerte(s[1]) && a_la_marque(s[1]) == 1 && lu(s[1], MSG_OOB, NULL, EINVAL), "lu : plus de POLLPRI, encore la marque, une seconde fois EINVAL");
+    verifier(lu(s[1], 0, NULL, EAGAIN) && a_la_marque(s[1]) == 0, "la lecture jette la marque : EAGAIN, plus a la marque");
+    /* Pas lu à part : sauté. */
+    verifier(send(s[0], "12", 2, MSG_OOB) == 2 && send(s[0], "34", 2, 0) == 2, "12 urgent, 34");
+    verifier(lu(s[1], MSG_PEEK, "1", 0), "MSG_PEEK s'arrete aussi devant");
+    verifier(lu(s[1], 0, "1", 0) && a_la_marque(s[1]) == 1, "1, a la marque");
+    verifier(lu(s[1], MSG_PEEK, "34", 0), "MSG_PEEK le saute");
+    verifier(lu(s[1], 0, "34", 0) && !en_alerte(s[1]), "34 : l'urgent saute, et oublie");
+    /* Un second urgent remplace le premier, redevenu ordinaire. */
+    verifier(send(s[0], "a", 1, MSG_OOB) == 1 && send(s[0], "b", 1, MSG_OOB) == 1 && a_la_marque(s[1]) == 0, "deux urgents");
+    verifier(lu(s[1], MSG_OOB, "b", 0) && lu(s[1], 0, "a", 0) && a_la_marque(s[1]) == 1 && lu(s[1], 0, NULL, EAGAIN), "le second est l'urgent, le premier se lit, puis la marque");
+    /* Lu à part : la lecture s'arrête encore à sa marque. */
+    verifier(send(s[0], "xy", 2, MSG_OOB) == 2 && send(s[0], "zw", 2, 0) == 2 && lu(s[1], MSG_OOB, "y", 0), "xy urgent, zw, y lu");
+    verifier(lu(s[1], 0, "x", 0) && a_la_marque(s[1]) == 1 && lu(s[1], 0, "zw", 0), "x, la marque, zw");
+    /* SO_OOBINLINE : dans le flux, à sa place ; MSG_OOB ne le voit pas. */
+    int oui = 1, non = 0;
+    setsockopt(s[1], SOL_SOCKET, SO_OOBINLINE, &oui, sizeof oui);
+    verifier(send(s[0], "12", 2, MSG_OOB) == 2 && send(s[0], "34", 2, 0) == 2 && lu(s[1], MSG_OOB, NULL, EINVAL), "SO_OOBINLINE : MSG_OOB, EINVAL");
+    verifier(lu(s[1], 0, "1", 0) && lu(s[1], 0, "234", 0), "SO_OOBINLINE : 1, puis 234");
+    setsockopt(s[1], SOL_SOCKET, SO_OOBINLINE, &non, sizeof non);
+    /* Sans place : 1 quand même, et il est perdu (mesuré). */
+    char o[4];
+    verifier(send(s[0], "q", 1, MSG_OOB) == 1 && recv(s[1], o, 0, MSG_OOB | MSG_DONTWAIT) == 1 && lu(s[1], MSG_OOB, NULL, EINVAL), "MSG_OOB sans place : 1, et perdu");
+    verifier(lu(s[1], 0, NULL, EAGAIN), "et rien a lire");
+    /* Un envoi fermé, et la mémoire : l'urgent part avec la file. */
+    verifier(send(s[0], "r", 1, MSG_OOB) == 1, "un urgent encore en file");
+    close(s[0]);
+    close(s[1]);
+    /* Seul un flux. */
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, d);
+    verifier(send(d[0], "a", 1, MSG_OOB) == -1 && errno == EOPNOTSUPP && lu(d[1], MSG_OOB, NULL, EOPNOTSUPP), "DGRAM : EOPNOTSUPP");
+    close(d[0]);
+    close(d[1]);
+    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, d);
+    verifier(send(d[0], "a", 1, MSG_OOB) == -1 && errno == EOPNOTSUPP && lu(d[1], MSG_OOB, NULL, EOPNOTSUPP), "SEQPACKET : EOPNOTSUPP");
+    close(d[0]);
+    close(d[1]);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1155,6 +1364,8 @@ int main(void)
     unlink_et_proc();
     droits();
     ramasse_miettes();
+    droits_du_message();
+    octet_urgent();
     fils();
     if (chdir("/") < 0 || rmdir(dossier) < 0)
         verifier(0, "le dossier efface");
