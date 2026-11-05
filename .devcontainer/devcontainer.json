@@ -4,7 +4,30 @@
   // Plafonne la mémoire du conteneur à 8 Go, sans swap (--memory seul en
   // laisserait autant) : un programme qui s'emballe est tué dans le conteneur
   // au lieu d'épuiser la mémoire de WSL, qui se fige avec Docker et VS Code.
-  "runArgs": ["--memory=8g", "--memory-swap=8g"],
+  //
+  // --stop-timeout : à l'arrêt, le serveur Remote Control a jusqu'à 30 s pour ses
+  // sessions, puis prévient claude.ai ; les 10 s par défaut le couperaient.
+  //
+  // --restart=on-failure : le conteneur repart si son processus principal meurt,
+  // mais pas au démarrage de Docker Desktop, où les montages de WSL peuvent
+  // manquer (voir demarrer-conteneur.sh, qui s'en charge).
+  "runArgs": [
+    "--memory=8g",
+    "--memory-swap=8g",
+    "--stop-timeout=45",
+    "--restart=on-failure"
+  ],
+  // Le processus principal du conteneur est le CMD de l'image, le superviseur de
+  // Remote Control (voir remote-control.sh), et non la boucle d'attente que met
+  // VS Code par défaut. Il tourne donc sans fenêtre VS Code et reçoit SIGTERM à
+  // l'arrêt, sous l'utilisateur vscode, celui des sessions.
+  "overrideCommand": false,
+  "containerUser": "vscode",
+  // docker-init en PID 1 : il transmet SIGTERM au superviseur et ramasse les
+  // processus orphelins (QEMU, sessions) à sa place.
+  "init": true,
+  // Fermer la fenêtre de VS Code n'arrête plus le conteneur, ni donc les sessions.
+  "shutdownAction": "none",
   "features": {
     // Node.js, puis Claude Code lui-même dans le conteneur.
     "ghcr.io/devcontainers/features/node:1": {},
@@ -23,8 +46,6 @@
   "containerEnv": {
     "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
   },
-  // Démarre Claude Code en mode Remote Control (voir le script).
-  "postStartCommand": "bash .devcontainer/remote-control.sh ${containerWorkspaceFolder}",
   "customizations": {
     "vscode": {
       "extensions": [

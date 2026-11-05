@@ -41,3 +41,11 @@ USER vscode
 RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
 ENV PATH="/home/vscode/.cargo/bin:${PATH}"
 USER root
+
+# Le superviseur de Remote Control, processus principal du conteneur
+# ("overrideCommand": false, dans devcontainer.json). Il est copié dans l'image
+# et non lu dans le dépôt : le dossier de travail change de branche, et un vieux
+# commit sans ce script empêcherait le conteneur de démarrer. Le modifier demande
+# donc de reconstruire le conteneur.
+COPY remote-control.sh /usr/local/bin/remote-control.sh
+CMD ["/usr/local/bin/remote-control.sh", "/workspaces/claude-os"]
