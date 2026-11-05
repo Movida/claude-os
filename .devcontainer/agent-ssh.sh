@@ -5,15 +5,10 @@
 # Git s'en sert pour pousser et pour signer les commits, dans le conteneur
 # seulement : WSL lit le même .git sous un autre chemin, où ce script
 # n'existe pas (le push et la signature y échouaient). Les deux réglages
-# sont donc dans .git/conteneur.config, que .git/config n'inclut que sous
-# /workspaces :
-#   git config 'includeIf.gitdir:/workspaces/claude-os/.path' conteneur.config
-# avec, dans .git/conteneur.config :
-#   [core]
-#       sshCommand = /workspaces/claude-os/.devcontainer/agent-ssh.sh ssh
-#   [gpg "ssh"]
-#       program = /workspaces/claude-os/.devcontainer/agent-ssh.sh
-# Appelé sans commande (cas de gpg.ssh.program), il lance ssh-keygen.
+# (core.sshCommand et gpg.ssh.program) sont donc hors du dépôt, dans la
+# configuration git du conteneur, que remote-control.sh écrit à chaque
+# démarrage. Appelé sans commande (cas de gpg.ssh.program), il lance
+# ssh-keygen.
 #
 # VS Code ouvre une prise /tmp/vscode-ssh-auth-*.sock à chaque connexion de
 # la fenêtre, et n'en donne le chemin (SSH_AUTH_SOCK) qu'aux processus qu'il

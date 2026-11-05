@@ -28,6 +28,22 @@ noter() {
     echo "$(date '+%F %T') remote-control.sh : $*" | tee -a "$JOURNAL"
 }
 
+# Les réglages git propres au conteneur (l'agent SSH, voir agent-ssh.sh). Ils
+# sont réécrits à chaque démarrage, avant tout le reste, car une reconstruction
+# efface ~/.config : ils ne doivent dépendre ni du serveur ni de la connexion.
+#
+# Pourquoi ~/.config/git/config, git le lit en plus de ~/.gitconfig :
+# - pas ~/.gitconfig : VS Code le recopie depuis WSL à chaque démarrage ;
+# - pas .git/config, même sous un includeIf : ce fichier est partagé avec WSL,
+#   et Claude Code refuse de créer un worktree dès que la configuration du
+#   dépôt contient un includeIf (il ne peut plus savoir quels filtres git
+#   chargerait). Chaque session Remote Control mourait alors à son démarrage.
+AGENT_SSH=/workspaces/claude-os/.devcontainer/agent-ssh.sh
+CONFIG_GIT="${XDG_CONFIG_HOME:-$HOME/.config}/git/config"
+mkdir -p "$(dirname "$CONFIG_GIT")"
+git config --file "$CONFIG_GIT" core.sshCommand "$AGENT_SSH ssh"
+git config --file "$CONFIG_GIT" gpg.ssh.program "$AGENT_SSH"
+
 # Un seul serveur à la fois : si postStartCommand est rejoué sans que le
 # conteneur ait redémarré, ou si le serveur a été lancé à la main dans un
 # terminal (sa sortie va alors dans ce terminal, pas dans le journal), on ne
