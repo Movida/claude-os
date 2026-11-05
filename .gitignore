@@ -27,3 +27,7 @@ target/
 # La glibc de la machine, copiée par make avec sa racine de préparation
 # (depuis 6c) : des binaires que nous n'avons pas écrits, jamais commités.
 */glibc/
+
+# Les worktrees que Claude Code crée pour les sessions Remote Control : chacun
+# est un dépôt à part entière, qu'un `git add -A` embarquerait sinon ici.
+.claude/worktrees/
