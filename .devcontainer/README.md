@@ -53,3 +53,7 @@ Register-ScheduledTask -TaskName 'claude-os conteneur' -Action $action -Trigger 
 Pour l'essayer sans redémarrer : conteneur arrêté, `Start-ScheduledTask -TaskName 'claude-os conteneur'`, puis `docker ps` dans WSL. Pour la retirer : `Unregister-ScheduledTask -TaskName 'claude-os conteneur'`.
 
 Cette partie n'a pas pu être essayée depuis le conteneur, qui n'a ni Windows ni Docker. Si le script dit `aucun conteneur`, comparer `$HOME/claude-os` avec le label `devcontainer.local_folder` donné par `docker inspect <conteneur>`.
+
+## La mémoire
+
+Le conteneur est plafonné à 8 Go (`devcontainer.json`), la machine WSL en a 12 : ce plafond protège WSL, rien à changer de ce côté. Quand il est atteint, le noyau tue un processus, et `sacrifiable.sh` fait que ce soit une commande (QEMU, cargo, un mutant) et non une session ou le serveur. Cela ne remplace pas la règle du projet (au plus deux QEMU à la fois, sous `timeout`) : avant de tuer, le noyau vide le cache des fichiers, et tout ralentit.

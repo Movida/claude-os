@@ -48,4 +48,5 @@ USER root
 # commit sans ce script empêcherait le conteneur de démarrer. Le modifier demande
 # donc de reconstruire le conteneur.
 COPY remote-control.sh /usr/local/bin/remote-control.sh
+COPY sacrifiable.sh /usr/local/share/remote-control/sacrifiable.sh
 CMD ["/usr/local/bin/remote-control.sh", "/workspaces/claude-os"]

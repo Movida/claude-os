@@ -43,8 +43,12 @@
   // qu'on relance `claude` à la main. Le dossier est celui que Claude Code
   // prend déjà par défaut ; seul .claude.json change de place (le script de
   // Remote Control l'y reprend la première fois).
+  //
+  // CLAUDE_ENV_FILE : les commandes des sessions passent avant elles quand la
+  // mémoire manque (voir sacrifiable.sh).
   "containerEnv": {
-    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude"
+    "CLAUDE_CONFIG_DIR": "/home/vscode/.claude",
+    "CLAUDE_ENV_FILE": "/usr/local/share/remote-control/sacrifiable.sh"
   },
   "customizations": {
     "vscode": {
