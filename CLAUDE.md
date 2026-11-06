@@ -24,7 +24,7 @@ Le vrai Claude Code plutôt qu'un agent maison, parce que David veut utiliser so
 Le dépôt (github.com/Movida/claude-os) doit se lire étape par étape.
 
 - Un commit = un changement logique. Sujet sans accents : `Etape NN : ...`, `Outillage : ...` ou `Projet : ...`.
-- Nouvelle étape : pas de commit de copie. Pour voir ce qu'une étape ajoute à la précédente, comparer les fichiers : `git diff --no-index 01-boot/boot.asm 02-mode-protege/boot.asm`. Une correction tardive ne touche que l'étape courante : les dossiers des étapes passées gardent ce qu'ils étaient.
+- Nouvelle étape : pas de commit de copie. Pour voir ce qu'une étape ajoute à la précédente, comparer les fichiers : `git diff --no-index 01-boot/boot.asm 02-mode-protege/boot.asm`. Une correction tardive ne touche que l'étape courante : les dossiers des étapes passées gardent ce qu'ils étaient. Seule exception : ce qui empêche `verifier.sh` de passer sur la machine de la CI, où il repasse toutes les étapes (6h : l'adresse d'un BAR sous QEMU 8.2.10, la dernière page sur une machine à cinq niveaux de tables).
 - Un choix de conception important est écrit dans le message du commit qui l'implémente (« Choix de conception »), à côté de son code : `git log --grep='hoix de conception'` les retrouve. (La règle de départ voulait un commit à part ; depuis l'étape 4, le choix vit avec son code, ce qui se relit mieux.)
 - Avant le premier push d'une étape : relecture de fond, et chaque correction repliée dans le commit qui avait introduit le défaut. La marche à suivre est dans le skill `fin-d-etape` (`.claude/skills/fin-d-etape/`).
 - Étape vérifiée dans QEMU : tag `etape-NN` (à pousser depuis la VM de David, le proxy de la session cloud refuse les tags).

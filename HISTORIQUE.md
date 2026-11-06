@@ -406,6 +406,8 @@ Le repli a été lourd : 2 600 lignes de corrections dans des commits que les su
 
 D'où QEMU 8.2.10 compilé dans le Dockerfile et la CI (`.devcontainer/construire-qemu.sh`), et `linux/autocode` à chaque démarrage, qui dit le bogue au lieu d'un plantage rare. La leçon pour les prochains : devant un plantage qu'on ne reproduit pas à volonté, le témoin d'abord (le même programme, le vrai Linux, la même machine), avant d'instrumenter le noyau.
 
+**La CI rouge depuis 6d (6 novembre 2026).** En regardant la CI après le push de 6h : elle échouait sur `main` à chaque envoi depuis le 26 octobre, et personne ne l'avait vu. Le journal du dernier run (celui de `baacc67` ; ceux d'avant n'ont pas été lus) : `linux/memoire`, lancé sur l'hôte, y dit ECHEC pour la dernière page de l'espace d'un programme, dans toutes les étapes de 6a à 6h. Pour Linux à cinq niveaux de tables (LA57), `0x7ffffffff000` est une page comme une autre, et elle était écrite en dur. Le même témoin que pour QEMU l'a montré : le vrai Linux 6.8 sous QEMU, `-cpu qemu64,+la57` : ces deux mêmes échecs ; `-cpu Nehalem` : aucun. Que les machines de GitHub soient en LA57 s'en déduit, sans mesure directe (leur journal ne le dit pas). Le test demande maintenant au noyau où est sa dernière page. Comme `make tests-hote` s'arrêtait là, le reste des tests sur l'hôte n'a pas tourné sur ces runs. La leçon : regarder la CI après chaque push (`fin-d-etape`).
+
 ## 23. Reste à faire
 
 Deux listes, depuis la relecture globale (section 21) : les **dettes**, à rembourser, chacune avec l'étape qui le fera, ou ce qui la déclenchera ; puis les **écarts voulus avec Linux**, permanents, chacun justifié.

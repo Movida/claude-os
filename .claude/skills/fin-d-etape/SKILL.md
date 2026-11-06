@@ -115,6 +115,11 @@ avec les commandes données à la fin.
    ```
    (Le tag se pose depuis la VM de David : le proxy de la session cloud
    refuse les tags.)
+9. **Regarder la CI**, une fois le push fait. Son état se lit sans jeton :
+   `curl -s https://api.github.com/repos/Movida/claude-os/actions/runs?per_page=2`.
+   Ses journaux demandent les droits d'administrateur : David les copie depuis
+   la page du run (roue dentée, « View raw logs »). Elle est restée rouge onze
+   jours sans que personne le voie.
 
 ## B. Exceptionnel : replier dans un historique déjà poussé
 
@@ -557,3 +562,7 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   puis `git restore --source=<arbre> --worktree -- .` dans le worktree du
   nouveau fil, et une comparaison `diff -rq` avec l'ancien, qui reste en
   lecture seule jusqu'au tag.
+- **Un test sur l'hôte ne suit pas que le noyau, mais aussi le processeur** :
+  `0x7ffffffff000` n'est la dernière page qu'avec quatre niveaux de tables. Sur
+  une machine LA57, Linux y projette sans rien dire. Ces différences se
+  reproduisent sans la machine : le vrai Linux sous QEMU, avec `-cpu qemu64,+la57`.

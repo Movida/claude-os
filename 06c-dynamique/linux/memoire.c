@@ -111,10 +111,25 @@ static void adresses(void)
     munmap(p, 3 * PAGE);
 }
 
+/* La dernière page de l'espace d'un programme, que Linux ne donne jamais : sous 47 bits avec quatre
+ * niveaux de tables ; sous 56 bits avec cinq (LA57, sur les machines de la CI, où le 0x7ffffffff000
+ * de quatre niveaux est une page comme une autre), même si mmap n'y va jamais de lui-même. Demander
+ * une page au-delà de 47 bits le dit, sans dépendre du processeur : notre noyau, comme Linux à quatre
+ * niveaux, refuse. Écarté : le drapeau la57 de /proc/cpuinfo, qui dit le processeur, pas le noyau. */
+static char *derniere_page(void)
+{
+    void *haut = mmap((void *)(1UL << 47), PAGE, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (haut == MAP_FAILED)
+        return (char *)0x7ffffffff000;
+    munmap(haut, PAGE);
+    return (char *)0xfffffffffff000;
+}
+
 /* Les refus, avec les codes d'erreur de Linux. */
 static void erreurs(void)
 {
     int rw = PROT_READ | PROT_WRITE, pa = MAP_PRIVATE | MAP_ANONYMOUS;
+    char *derniere = derniere_page();
     verifier(erreur_mmap(NULL, 0, rw, pa, -1, 0) == EINVAL, "mmap de longueur nulle : EINVAL");
     verifier(erreur_mmap(NULL, PAGE, rw, MAP_ANONYMOUS, -1, 0) == EINVAL, "mmap ni prive ni partage : EINVAL");
     verifier(erreur_mmap((void *)0x200000001, PAGE, rw, pa | MAP_FIXED, -1, 0) == EINVAL,
@@ -123,11 +138,11 @@ static void erreurs(void)
     verifier(erreur_mmap(NULL, 1UL << 47, rw, pa | MAP_NORESERVE, -1, 0) == ENOMEM, "128 Tio : ENOMEM");
     verifier(erreur_mmap(NULL, PAGE, rw, MAP_PRIVATE, -1, 0) == EBADF, "sans MAP_ANONYMOUS ni fichier : EBADF");
     verifier(erreur_mmap(NULL, PAGE, rw, pa | MAP_FIXED, -1, 0) == EPERM, "MAP_FIXED a l'adresse 0 : EPERM");
-    verifier(erreur_mmap((void *)0x7ffffffff000, PAGE, rw, pa | MAP_FIXED, -1, 0) == ENOMEM,
+    verifier(erreur_mmap(derniere, PAGE, rw, pa | MAP_FIXED, -1, 0) == ENOMEM,
              "MAP_FIXED dans la derniere page : ENOMEM");
     verifier(erreur_de(munmap((void *)0x200000001, PAGE)) == EINVAL, "munmap non aligne : EINVAL");
     verifier(erreur_de(munmap((void *)0x200000000, 0)) == EINVAL, "munmap de longueur nulle : EINVAL");
-    verifier(erreur_de(munmap((void *)0x7ffffffff000, PAGE)) == EINVAL, "munmap de la derniere page : EINVAL");
+    verifier(erreur_de(munmap(derniere, PAGE)) == EINVAL, "munmap de la derniere page : EINVAL");
     verifier(munmap((void *)0x500000000, PAGE) == 0, "munmap ou rien n'est projete : 0");
 }
 
