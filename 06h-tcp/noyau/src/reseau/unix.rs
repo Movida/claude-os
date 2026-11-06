@@ -942,9 +942,14 @@ pub fn accepter(s: &Socket, non_bloquant: bool) -> Result<Arc<Socket>, i64> {
         if non_bloquant {
             return Err(-EAGAIN);
         }
+        // `shutdown` sur l'écoute : la façon ordinaire d'arrêter un fil d'accept : EINVAL (« This
+        // means receive shutdown »).
+        if u.etat.verrouiller().arret & ARRET_LECTURE != 0 {
+            return Err(-EINVAL);
+        }
         attendre(&s.attente, echeance, delai, || {
             let e = u.etat.verrouiller();
-            !e.file.is_empty() || !matches!(e.phase, Phase::Ecoute { .. })
+            !e.file.is_empty() || !matches!(e.phase, Phase::Ecoute { .. }) || e.arret & ARRET_LECTURE != 0
         })?;
     }
 }
@@ -986,9 +991,9 @@ pub fn envoyer(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dra
     }
 }
 
-/// Attend que l'émetteur ait de la place (`sock_alloc_send_pskb` :
-/// moins que SO_SNDBUF en route) ; MSG_DONTWAIT : EAGAIN ; l'écriture
-/// arrêtée, ou une erreur, entre-temps : EPIPE.
+/// Attend que l'émetteur ait de la place (`sock_alloc_send_pskb`, dans son ordre) : une erreur en
+/// attente, prise, et rendue telle quelle ; l'écriture arrêtée : EPIPE ; moins que SO_SNDBUF en
+/// route : la place ; MSG_DONTWAIT : EAGAIN ; sinon attendre, et revoir tout cela.
 fn attendre_place(s: &Socket, non_bloquant: bool, echeance: Option<u64>, delai: bool) -> Result<(), i64> {
     let u = unix(s);
     let sndbuf = || s.sndbuf.load(Ordering::Relaxed) as usize;
@@ -1085,6 +1090,15 @@ fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
     Ok(())
 }
 
+/// SIGPIPE, où Linux va à `out_pipe` : à l'entrée, ou le pair mort ou qui ne lit plus, et rien
+/// d'envoyé. Pas sur ce qui attendait de la place : ni l'erreur qu'on y prend, ni l'arrêt qu'on y voit.
+fn signaler_tube(drapeaux: u64) {
+    const MSG_NOSIGNAL: u64 = 0x4000;
+    if drapeaux & MSG_NOSIGNAL == 0 {
+        crate::signaux::au_fil_courant(13);
+    }
+}
+
 /// Un flux (`unix_stream_sendmsg`) : une adresse donnée : EISCONN connecté,
 /// EOPNOTSUPP sinon ; sans pair : ENOTCONN ; l'écriture arrêtée, ou le pair
 /// fermé ou qui ne lit plus : EPIPE ; des messages d'au plus la moitié de
@@ -1109,6 +1123,7 @@ fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dr
     }
     let pair = pair.ok_or(-ENOTCONN)?;
     if arret & ARRET_ECRITURE != 0 {
+        signaler_tube(drapeaux);
         return Err(-EPIPE);
     }
     let (echeance, delai) = echeance(s.appels.verrouiller().options.sndtimeo);
@@ -1134,7 +1149,14 @@ fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dr
         }
         if let Err((m, errno)) = deposer(&pair, m) {
             drop(m);
-            return if fait > 0 { Ok(fait) } else { Err(errno) };
+            if fait > 0 {
+                return Ok(fait);
+            }
+            // L'octet urgent n'envoie pas le signal (`queue_oob` : `out_err`).
+            if errno == -EPIPE && !urgent {
+                signaler_tube(drapeaux);
+            }
+            return Err(errno);
         }
         fait += n;
     }
@@ -1152,12 +1174,12 @@ fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize,
     let u = unix(s);
     let non_bloquant = drapeaux & MSG_DONTWAIT != 0;
     let paquets = u.sorte == Sorte::Paquets;
-    let (pair, phase, passcred, arret, erreur) = {
+    let (pair, phase, passcred, erreur) = {
         let mut e = u.etat.verrouiller();
         // SEQPACKET : l'erreur en attente d'abord (`unix_seqpacket_sendmsg` :
         // `sock_error`), ECONNRESET d'un pair fermé sans tout lire.
         let erreur = if paquets { core::mem::take(&mut e.erreur) } else { 0 };
-        (e.pair.clone(), e.phase, e.passcred, e.arret, erreur)
+        (e.pair.clone(), e.phase, e.passcred, erreur)
     };
     if erreur != 0 {
         return Err(-(erreur as i64));
@@ -1172,9 +1194,6 @@ fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize,
     }
     if longueur > (s.sndbuf.load(Ordering::Relaxed) as usize).saturating_sub(32) {
         return Err(-EMSGSIZE);
-    }
-    if paquets && arret & ARRET_ECRITURE != 0 {
-        return Err(-EPIPE);
     }
     let (echeance, delai) = echeance(s.appels.verrouiller().options.sndtimeo);
     attendre_place(s, non_bloquant, echeance, delai)?;
@@ -1422,7 +1441,8 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
         return Err(-EINVAL);
     }
     let regarder = drapeaux & MSG_PEEK != 0;
-    let cible = if drapeaux & MSG_WAITALL != 0 { longueur } else { rcvlowat.min(longueur) };
+    // Au moins 1, même pour une longueur nulle (`sock_rcvlowat` : `v ?: 1`) : elle attend aussi.
+    let cible = (if drapeaux & MSG_WAITALL != 0 { longueur } else { rcvlowat.min(longueur) }).max(1);
     let en_ligne = s.appels.verrouiller().options.oobinline;
     let mut adresse = None;
     let mut fait = 0;
@@ -1434,7 +1454,9 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
     // MSG_PEEK : les messages déjà regardés, remis en tête à la fin.
     let mut vus: VecDeque<Message> = VecDeque::new();
     let r = loop {
-        if fait >= longueur && longueur > 0 {
+        // MSG_PEEK ne s'arrête pas là : il va jusqu'au prochain message qui porte des descripteurs,
+        // pour les donner (`goto again`, sans regarder ce qu'il reste de place).
+        if !regarder && fait >= longueur && longueur > 0 {
             break Ok(());
         }
         // Pour MSG_PEEK : la place de ce qu'on saute, et de ce message.
@@ -1455,7 +1477,7 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
             if avait && fait > 0 {
                 break Ok(());
             }
-            if fait >= cible || longueur == 0 {
+            if fait >= cible {
                 break Ok(());
             }
             let non_bloquant = a.non_bloquant || !vus.is_empty();
@@ -1659,7 +1681,13 @@ fn fermer_avec(s: &Socket, embryon: bool) {
             {
                 let mut e = unix(&p).etat.verrouiller();
                 e.arret = ARRET_LECTURE | ARRET_ECRITURE;
-                if !file.is_empty() || embryon {
+                // Des données non lues ; une tête vide (la marque de l'octet urgent, un message
+                // SEQPACKET vide) ne compte pas, seulement ce qui la suit (`unix_release_sock`).
+                let reste = match file.front() {
+                    Some(m) if m.restant().is_empty() => file.len() > 1,
+                    tete => tete.is_some(),
+                };
+                if reste || embryon {
                     e.erreur = ECONNRESET as i32;
                 }
             }
