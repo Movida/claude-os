@@ -16,9 +16,22 @@ jobs:
       # de test de l'étape 5. Préinstallés sur les machines de GitHub, mais
       # nommés quand même : la CI ne dépend pas de ce qu'elles ont par hasard.
       # netcat-openbsd (nc) : make tests-qemu envoie une touche au moniteur
-      # de QEMU par sa socket (6e).
-      - name: Installer nasm, QEMU et gcc
-        run: sudo apt-get update && sudo apt-get install -y nasm qemu-system-x86 gcc libc6-dev netcat-openbsd
+      # de QEMU par sa socket (6e). Les autres : de quoi compiler QEMU (6h).
+      - name: Installer nasm, gcc et les outils pour compiler QEMU
+        run: sudo apt-get update && sudo apt-get install -y nasm gcc libc6-dev netcat-openbsd libglib2.0-dev libpixman-1-dev libslirp-dev libncurses-dev libpng-dev ninja-build python3-venv pkg-config flex bison
+      # QEMU compilé, pas le paquet d'Ubuntu, dont un bogue fait planter le
+      # compilateur à la volée de claude (.devcontainer/construire-qemu.sh) ;
+      # gardé d'un envoi à l'autre : sa compilation prend plusieurs minutes.
+      - uses: actions/cache@v4
+        id: cache-qemu
+        with:
+          path: ~/qemu
+          key: qemu-${{ runner.os }}-${{ hashFiles('.devcontainer/construire-qemu.sh') }}
+      - name: Compiler QEMU
+        if: steps.cache-qemu.outputs.cache-hit != 'true'
+        run: sh .devcontainer/construire-qemu.sh "$HOME/qemu"
+      - name: Mettre QEMU dans le PATH
+        run: echo "$HOME/qemu/bin" >> "$GITHUB_PATH"
       # rustup est préinstallé sur les machines de GitHub ; il installe la
       # version de Rust figée dans rust-toolchain.toml, avec la cible du noyau
       # (et clippy, depuis 6h : make le lance, rustup l'ajoute tout seul en

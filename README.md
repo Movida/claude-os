@@ -48,7 +48,7 @@ La feuille de route complète (la première réponse de Claude, le multiprocesse
 
 ## Essayer
 
-Outils : `nasm`, `qemu-system-x86_64`, `gcc`, `libc6-dev`, et Rust via `rustup` (la version est figée dans `rust-toolchain.toml`). Le plus simple est d'ouvrir le dépôt dans son devcontainer (`.devcontainer/`), qui installe tout.
+Outils : `nasm`, `qemu-system-x86_64` (8.2.3 ou plus : `.devcontainer/construire-qemu.sh`, le paquet d'Ubuntu 24.04 a un bogue qui fait planter `claude`), `gcc`, `libc6-dev`, et Rust via `rustup` (la version est figée dans `rust-toolchain.toml`). Le plus simple est d'ouvrir le dépôt dans son devcontainer (`.devcontainer/`), qui installe tout.
 
 ```sh
 cd 03-noyau-rust

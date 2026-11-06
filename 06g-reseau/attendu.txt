@@ -32,7 +32,8 @@ rendues et recollees : ok.
 [noyau] ACPI : IRQ ISA remplacees : 0 -> GSI 2 ; 5 -> GSI 5 en niveau ; 9 -> GSI 9 en niveau ; 10 -> GSI 10 en niveau ; 11 -> GSI 11 en niveau ; NMI sur LINT1.
 [pci] 7 fonctions sur le bus (ports 0xCF8 et 0xCFC).
 [pci] 00:00.0 8086:1237 pont hote.
-[pci] 00:03.0 1af4:1000 Ethernet, BAR0 ports 0xc080 (32), BAR1 0xfeb91000 (4 Kio), BAR4 0xfe000000 (16 Kio, 64 bits, prefetchable), MSI-X (4 entrees).
+[pci] 00:03.0 1af4:1000 Ethernet, BAR0 ports 0x
+(16 Kio, 64 bits, prefetchable), MSI-X (4 entrees).
 [noyau] Vecteurs a la demande : 0x40 donne, IPI a soi-meme recue par son gestionnaire : ok ; rendu : ok.
 [noyau] MSI-X de 00:03.0 : 4 entrees, entree 1 programmee et relue : ok.
 [virtio] 00:03.0 : reseau, fonctionnalites VERSION_1 MAC STATUS EVENT_IDX, 3 files.

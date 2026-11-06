@@ -2,13 +2,13 @@
 # et Rust pour le noyau. Depuis l'étape 5 : un compilateur C et la glibc
 # statique (libc.a, dans libc6-dev), pour compiler les programmes Linux de
 # test (`gcc -static`), et strace, pour comparer leurs appels système à ce
-# que voit notre noyau.
+# que voit notre noyau. Depuis 6h : QEMU compilé, pas le paquet d'Ubuntu (voir
+# construire-qemu.sh) ; d'où glib, pixman, slirp, curses, PNG, ninja, le venv de Python...
 FROM mcr.microsoft.com/devcontainers/base:ubuntu-24.04
 
 RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
     && apt-get install -y --no-install-recommends \
         nasm \
-        qemu-system-x86 \
         gdb \
         make \
         netcat-openbsd \
@@ -18,7 +18,21 @@ RUN apt-get update && export DEBIAN_FRONTEND=noninteractive \
         gcc \
         libc6-dev \
         strace \
+        libglib2.0-dev \
+        libpixman-1-dev \
+        libslirp-dev \
+        libncurses-dev \
+        libpng-dev \
+        ninja-build \
+        python3-venv \
+        pkg-config \
+        flex \
+        bison \
+        xz-utils \
     && rm -rf /var/lib/apt/lists/*
+
+COPY construire-qemu.sh /tmp/construire-qemu.sh
+RUN sh /tmp/construire-qemu.sh /usr/local && rm /tmp/construire-qemu.sh
 
 # rustup, pour l'utilisateur du conteneur, sans version de Rust : la version
 # exacte est figée dans 03-noyau-rust/noyau/rust-toolchain.toml, et rustup

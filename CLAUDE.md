@@ -32,7 +32,7 @@ Le dépôt (github.com/Movida/claude-os) doit se lire étape par étape.
 
 ## Outils
 
-- `nasm` et `qemu-system-x86_64` (`sudo apt install nasm qemu-system-x86`).
+- `nasm` (`sudo apt install nasm`) et `qemu-system-x86_64`. Depuis 6h, QEMU 8.2.10 compilé par `.devcontainer/construire-qemu.sh` (dans le Dockerfile et la CI), pas le paquet d'Ubuntu 24.04 : sa version 8.2.2 n'invalide pas un bloc traduit quand on écrit dans sa deuxième page, ce qui fait planter `claude` (`linux/autocode.c` le détecte, `HISTORIQUE.md`, 6h).
 - Depuis l'étape 4 : `make tests-hote` télécharge la suite de tests officielle de WebAssembly et `wast2json` (wabt 1.0.39, binaire officiel pour Linux x86_64), qui la convertit, à des versions figées vérifiées par SHA-256.
 - Étape 5 : `gcc`, `libc6-dev` (la glibc statique, pour `gcc -static`) et `strace` (installés par le Dockerfile). Les programmes Linux de test (`05-elf/linux/`) tournent aussi tels quels sur la machine hôte. `make trace` montre les appels système d'un programme C dans notre noyau, à côté de `strace` sur l'hôte.
 - Depuis 6a : `make tests-hote` lance aussi `linux/memoire` et `linux/claude-version` sur l'hôte : nos appels de la mémoire (mmap, munmap, mprotect, madvise) doivent s'y comporter comme sous le vrai Linux. Depuis 6b, de même `linux/temps`, `linux/fichiers` et `linux/segments` ; depuis 6c, `linux/dynamique` (avec `LD_LIBRARY_PATH` pour sa bibliothèque de test).
