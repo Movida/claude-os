@@ -1623,6 +1623,575 @@ static void reglages(void)
              && st.st_mode == (S_IFREG | 0444), "/proc/sys/net : les droits, 0644, et 0444");
 }
 
+/* Une écoute sur un port donné, SO_REUSEADDR ou non : -1 si le port est pris. */
+static int ecoute_sur(int port, int partage)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = lo(port);
+    setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &partage, sizeof partage);
+    if (bind(s, (void *)&a, sizeof a) < 0 || listen(s, 4) < 0) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+/* Une connexion établie sur l'écoute `l` : le client, la fille. */
+static void paire_sur(int l, int port, int *c, int *f)
+{
+    struct sockaddr_in x = lo(port);
+    *c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(*c, (void *)&x, sizeof x);
+    *f = accept(l, 0, 0);
+}
+
+/* SO_LINGER 0 : la fermeture envoie un RST. */
+static void couper(int s)
+{
+    struct linger g = { 1, 0 };
+    setsockopt(s, SOL_SOCKET, SO_LINGER, &g, sizeof g);
+    close(s);
+}
+
+static int etat_de(int s)
+{
+    struct tcp_info i;
+    socklen_t n = sizeof i;
+    getsockopt(s, IPPROTO_TCP, TCP_INFO, &i, &n);
+    return i.tcpi_state;
+}
+
+/* Un FIN puis un RST : la fin se lit (SOCK_DONE vient avant l'erreur), SO_ERROR dit EPIPE
+ * (`tcp_reset` en CLOSE_WAIT), et l'écriture EPIPE. */
+static void fin_puis_rst(void)
+{
+    int port, l = ecoute(&port, 4), c, f;
+    char o[8];
+    paire_sur(l, port, &c, &f);
+    shutdown(f, SHUT_WR);
+    attendre_ms(40);
+    couper(f);
+    attendre_ms(40);
+    verifier(etat_de(c) == TCP_CLOSE && recv(c, o, 8, 0) == 0, "un FIN puis un RST : recv rend la fin");
+    verifier(option(c, SOL_SOCKET, SO_ERROR) == EPIPE, "un FIN puis un RST : SO_ERROR EPIPE");
+    verifier(recv(c, o, 8, 0) == 0, "un FIN puis un RST : recv rend encore la fin");
+    close(c);
+    paire_sur(l, port, &c, &f);
+    shutdown(f, SHUT_WR);
+    attendre_ms(40);
+    verifier(recv(c, o, 8, 0) == 0, "le FIN lu d'abord : 0");
+    couper(f);
+    attendre_ms(40);
+    verifier(recv(c, o, 8, 0) == 0, "le FIN lu d'abord, puis un RST : 0");
+    verifier(masque(c) == (POLLIN | POLLOUT | POLLERR | POLLHUP | POLLRDHUP), "le FIN lu d'abord, puis un RST : poll");
+    verifier(send(c, "x", 1, MSG_NOSIGNAL) < 0 && errno == EPIPE, "le FIN lu d'abord, puis un RST : send EPIPE");
+    close(c);
+    /* MSG_WAITALL coupé par un RST : les octets, puis l'erreur, puis la fin. */
+    paire_sur(l, port, &c, &f);
+    send(f, "abcde", 5, 0);
+    attendre_ms(40);
+    couper(f);
+    attendre_ms(40);
+    char m[100];
+    verifier(recv(c, m, 100, MSG_WAITALL) == 5, "MSG_WAITALL coupe par un RST : les octets d'abord");
+    long r = recv(c, m, 100, 0);
+    verifier(r < 0 && errno == ECONNRESET, "MSG_WAITALL coupe par un RST : puis ECONNRESET");
+    verifier(recv(c, m, 100, 0) == 0, "MSG_WAITALL coupe par un RST : puis 0");
+    close(c);
+    close(l);
+}
+
+/* shutdown en SYN_SENT, quel que soit le sens, défait la connexion, comme AF_UNSPEC : 0, CLOSE,
+ * ECONNRESET en attente. Une écoute pleine ne répond pas au SYN. */
+static void arret_en_syn(void)
+{
+    int port, l = ecoute(&port, 0);
+    struct sockaddr_in x = lo(port);
+    int d = socket(AF_INET, SOCK_STREAM, 0);
+    connect(d, (void *)&x, sizeof x);
+    for (int sens = 0; sens < 3; sens++) {
+        int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        char o[1];
+        connect(c, (void *)&x, sizeof x);
+        attendre_ms(20);
+        int avant = etat_de(c);
+        int r = shutdown(c, sens);
+        int ok = avant == TCP_SYN_SENT && r == 0 && etat_de(c) == TCP_CLOSE;
+        ok &= masque(c) == (POLLOUT | POLLERR | POLLHUP);
+        ok &= option(c, SOL_SOCKET, SO_ERROR) == ECONNRESET;
+        long lu = recv(c, o, 1, MSG_DONTWAIT);
+        ok &= lu < 0 && errno == ENOTCONN;
+        lu = send(c, o, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+        ok &= lu < 0 && errno == EPIPE;
+        char quoi[64];
+        snprintf(quoi, sizeof quoi, "shutdown(%d) en SYN_SENT : defaite, ECONNRESET", sens);
+        verifier(ok, quoi);
+        close(c);
+    }
+    close(d);
+    close(l);
+}
+
+/* shutdown d'une écoute : SHUT_WR, rien ; SHUT_RD la défait, ses filles coupées, elle peut écouter
+ * de nouveau. connect(AF_UNSPEC) de même. */
+static void arret_d_ecoute(void)
+{
+    int port, l = ecoute(&port, 4);
+    verifier(shutdown(l, SHUT_WR) == 0 && option(l, SOL_SOCKET, SO_ACCEPTCONN) == 1, "une ecoute, SHUT_WR : rien");
+    struct sockaddr_in x = lo(port);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(connect(c, (void *)&x, sizeof x) == 0, "une ecoute, SHUT_WR : les clients passent");
+    verifier(shutdown(l, SHUT_RD) == 0 && option(l, SOL_SOCKET, SO_ACCEPTCONN) == 0, "une ecoute, SHUT_RD : defaite");
+    char o[1];
+    long r = recv(c, o, 1, 0);
+    verifier(r < 0 && errno == ECONNRESET, "une ecoute, SHUT_RD : la fille en attente est coupee");
+    close(c);
+    fcntl(l, F_SETFL, O_NONBLOCK);
+    verifier(accept(l, 0, 0) < 0 && errno == EINVAL, "une ecoute, SHUT_RD : accept EINVAL");
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(connect(c, (void *)&x, sizeof x) < 0 && errno == ECONNREFUSED, "une ecoute, SHUT_RD : un client est refuse");
+    close(c);
+    verifier(listen(l, 4) == 0, "une ecoute, SHUT_RD : listen de nouveau");
+    struct sockaddr u = { .sa_family = AF_UNSPEC };
+    verifier(connect(l, &u, sizeof u) == 0 && option(l, SOL_SOCKET, SO_ACCEPTCONN) == 0, "connect(AF_UNSPEC) d'une ecoute : defaite");
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(connect(c, (void *)&x, sizeof x) < 0 && errno == ECONNREFUSED, "connect(AF_UNSPEC) d'une ecoute : un client est refuse");
+    close(c);
+    close(l);
+    /* Un port nommé par bind reste à elle, et avec lui une fille : déconnectées, liées. */
+    l = ecoute(&port, 4);
+    close(l);
+    l = ecoute_sur(port, 0);
+    if (l >= 0) {
+        shutdown(l, SHUT_RD);
+        listen(l, 4);
+        verifier(port_de(l) == port, "une ecoute a un port nomme, SHUT_RD : elle le garde");
+        int cf, ff;
+        paire_sur(l, port, &cf, &ff);
+        verifier(connect(ff, &u, sizeof u) == 0 && port_de(ff) == port, "sa fille, AF_UNSPEC : le port de bind reste");
+        close(cf);
+        close(ff);
+        close(l);
+    }
+    /* Une connexion établie : RST, l'erreur reste à lire. */
+    int f;
+    l = ecoute(&port, 4);
+    paire_sur(l, port, &c, &f);
+    verifier(connect(c, &u, sizeof u) == 0 && etat_de(c) == TCP_CLOSE, "connect(AF_UNSPEC) d'une connexion : 0, CLOSE");
+    verifier(masque(c) == (POLLOUT | POLLERR | POLLHUP), "connect(AF_UNSPEC) d'une connexion : poll");
+    verifier(option(c, SOL_SOCKET, SO_ERROR) == ECONNRESET, "connect(AF_UNSPEC) d'une connexion : SO_ERROR");
+    r = recv(f, o, 1, 0);
+    verifier(r < 0 && errno == ECONNRESET, "connect(AF_UNSPEC) d'une connexion : l'autre recoit le RST");
+    close(c);
+    close(f);
+    close(l);
+}
+
+/* Le backlog se compare sans signe (`__sys_listen_socket`) : un négatif, le plus grand. Un autre
+ * `listen` le change (tcpi_sacked : le backlog d'une écoute). */
+static void backlog_sans_signe(void)
+{
+    verifier(etablis(-1, 8) == 8 && etablis(-2147483647, 8) == 8, "listen(-1) : le plus grand backlog");
+    verifier(etablis(0, 8) == 1, "listen(0) : un client");
+    int port, l = ecoute(&port, -1);
+    verifier(champ(l, 28) == 4096, "listen(-1) : relu 4096");
+    listen(l, 7);
+    verifier(champ(l, 28) == 7, "listen(7) ensuite : relu 7");
+    close(l);
+}
+
+/* L'erreur d'un connect non bloquant et les connect suivants (`__inet_stream_connect`). */
+static void connect_apres_erreur(void)
+{
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in a = lo(0);
+    socklen_t n = sizeof a;
+    bind(t, (void *)&a, sizeof a);
+    getsockname(t, (void *)&a, &n);
+    close(t);
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    verifier(connect(c, (void *)&a, sizeof a) < 0 && errno == EINPROGRESS, "connect refuse : EINPROGRESS");
+    attendre_ms(20);
+    verifier(option(c, SOL_SOCKET, SO_ERROR) == ECONNREFUSED, "connect refuse : SO_ERROR");
+    verifier(connect(c, (void *)&a, sizeof a) < 0 && errno == ECONNABORTED, "connect refuse, erreur lue : ECONNABORTED");
+    verifier(connect(c, (void *)&a, sizeof a) < 0 && errno == EINPROGRESS, "connect refuse, puis un autre : EINPROGRESS");
+    attendre_ms(20);
+    verifier(connect(c, (void *)&a, sizeof a) < 0 && errno == ECONNREFUSED, "connect refuse, erreur pas lue : ECONNREFUSED");
+    verifier(connect(c, (void *)&a, sizeof a) < 0 && errno == EINPROGRESS, "connect refuse, et encore un autre : EINPROGRESS");
+    close(c);
+    /* Établie par un connect non bloquant jamais redit : pour `connect`, elle est encore en
+     * cours (SS_CONNECTING) : elle n'a jamais abouti, et `listen` la prend. */
+    int port, l = ecoute(&port, 4), f;
+    struct sockaddr_in x = lo(port);
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&x, sizeof x);
+    attendre_ms(20);
+    f = accept(l, 0, 0);
+    couper(f);
+    attendre_ms(20);
+    verifier(option(c, SOL_SOCKET, SO_ERROR) == ECONNRESET && etat_de(c) == TCP_CLOSE, "connect jamais redit, un RST : SO_ERROR");
+    verifier(connect(c, (void *)&x, sizeof x) < 0 && errno == ECONNABORTED, "connect jamais redit, un RST : ECONNABORTED");
+    verifier(listen(c, 1) == 0, "connect jamais redit, un RST : listen");
+    close(c);
+    /* Établie par un connect bloquant : EISCONN, et l'erreur n'est pas prise. */
+    paire_sur(l, port, &c, &f);
+    couper(f);
+    attendre_ms(20);
+    verifier(connect(c, (void *)&x, sizeof x) < 0 && errno == EISCONN, "connect bloquant, un RST : EISCONN");
+    verifier(option(c, SOL_SOCKET, SO_ERROR) == ECONNRESET, "connect bloquant, un RST : l'erreur reste");
+    verifier(listen(c, 1) < 0 && errno == EINVAL, "connect bloquant, un RST : listen EINVAL");
+    close(c);
+    close(l);
+}
+
+static int plus_tard_fd;
+
+static void *ecrire_plus_tard(void *p)
+{
+    (void)p;
+    attendre_ms(100);
+    send(plus_tard_fd, "4567", 4, 0);
+    return 0;
+}
+
+/* Les lectures sans copie ou sans retrait : MSG_TRUNC, MSG_PEEK, une place de 0, SHUT_RD. */
+static void lectures_fines(void)
+{
+    int port, l = ecoute(&port, 4), c, f, q = -1;
+    char o[32] = { 0 };
+    paire_sur(l, port, &c, &f);
+    send(f, "0123456789", 10, 0);
+    attendre_ms(20);
+    verifier(recv(c, 0, 100, MSG_PEEK | MSG_TRUNC) == 10, "MSG_PEEK|MSG_TRUNC : compte sans copier");
+    ioctl(c, FIONREAD, &q);
+    verifier(q == 10, "MSG_PEEK|MSG_TRUNC : rien de retire");
+    verifier(recv(c, o, 4, 0) == 4 && !memcmp(o, "0123", 4), "apres MSG_PEEK|MSG_TRUNC : recv");
+    verifier(recv(c, 0, 3, MSG_TRUNC) == 3, "MSG_TRUNC : retire sans copier");
+    ioctl(c, FIONREAD, &q);
+    verifier(q == 3 && recv(c, o, 3, 0) == 3 && !memcmp(o, "789", 3), "apres MSG_TRUNC : la suite");
+    /* MSG_PEEK|MSG_WAITALL attend tout, et relit depuis la tête. */
+    send(f, "0123", 4, 0);
+    attendre_ms(20);
+    plus_tard_fd = f;
+    pthread_t t;
+    pthread_create(&t, 0, ecrire_plus_tard, 0);
+    struct timeval d = { 2, 0 };
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &d, sizeof d);
+    memset(o, 0, sizeof o);
+    verifier(recv(c, o, 8, MSG_PEEK | MSG_WAITALL) == 8 && !memcmp(o, "01234567", 8), "MSG_PEEK|MSG_WAITALL : attend tout");
+    pthread_join(t, 0);
+    verifier(recv(c, o, 8, 0) == 8, "apres MSG_PEEK|MSG_WAITALL : tout est encore la");
+    /* SO_RCVLOWAT : le délai passé, ce qu'il y a. */
+    int v = 4;
+    setsockopt(c, SOL_SOCKET, SO_RCVLOWAT, &v, sizeof v);
+    send(f, "01", 2, 0);
+    attendre_ms(20);
+    struct timeval court = { 0, 100000 };
+    setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &court, sizeof court);
+    verifier(recv(c, o, 8, MSG_PEEK) == 2, "SO_RCVLOWAT et MSG_PEEK : apres le delai, ce qu'il y a");
+    verifier(recv(c, o, 8, 0) == 2, "SO_RCVLOWAT : apres le delai, ce qu'il y a");
+    long r = recv(c, o, 8, 0);
+    verifier(r < 0 && errno == EAGAIN, "SO_RCVLOWAT : plus rien, EAGAIN");
+    v = 1;
+    setsockopt(c, SOL_SOCKET, SO_RCVLOWAT, &v, sizeof v);
+    /* Une place de 0. */
+    r = recv(c, o, 0, MSG_DONTWAIT);
+    verifier(r < 0 && errno == EAGAIN, "recv(0), file vide, sans attendre : EAGAIN");
+    verifier(recv(c, o, 0, 0) == 0, "recv(0), file vide : 0 une fois le delai passe");
+    send(f, "x", 1, 0);
+    attendre_ms(20);
+    verifier(recv(c, o, 0, MSG_DONTWAIT) == 0, "recv(0), un octet en file : 0");
+    recv(c, o, 1, 0);
+    /* SHUT_RD : la fin, mais ce qui arrive se lit encore. */
+    shutdown(c, SHUT_RD);
+    verifier(recv(c, o, 8, 0) == 0, "SHUT_RD : 0");
+    send(f, "apres", 5, 0);
+    attendre_ms(20);
+    verifier(recv(c, o, 8, 0) == 5, "SHUT_RD : ce qui arrive ensuite se lit");
+    verifier(recv(c, o, 8, 0) == 0, "SHUT_RD : puis 0");
+    close(c);
+    close(f);
+    close(l);
+}
+
+/* Une fille hérite du SO_REUSEADDR de son écoute : un serveur redémarre tant que vivent ses
+ * connexions, et même en TIME_WAIT. */
+static void serveur_qui_redemarre(void)
+{
+    int port, s0 = socket(AF_INET, SOCK_STREAM, 0), oui = 1, c, f;
+    setsockopt(s0, SOL_SOCKET, SO_REUSEADDR, &oui, sizeof oui);
+    struct sockaddr_in a = lo(0);
+    socklen_t n = sizeof a;
+    bind(s0, (void *)&a, sizeof a);
+    getsockname(s0, (void *)&a, &n);
+    port = ntohs(a.sin_port);
+    listen(s0, 4);
+    /* Le serveur ferme le premier : TIME_WAIT de son côté. */
+    paire_sur(s0, port, &c, &f);
+    close(f);
+    attendre_ms(20);
+    close(c);
+    attendre_ms(20);
+    close(s0);
+    int l = ecoute_sur(port, 1);
+    verifier(l >= 0, "SO_REUSEADDR : le serveur redemarre sur son TIME_WAIT");
+    /* Une connexion encore vivante. */
+    paire_sur(l, port, &c, &f);
+    close(l);
+    l = ecoute_sur(port, 1);
+    verifier(l >= 0, "SO_REUSEADDR : le serveur redemarre sur une connexion vivante");
+    close(l);
+    l = ecoute_sur(port, 0);
+    verifier(l < 0 && errno == EADDRINUSE, "sans SO_REUSEADDR : refus");
+    if (l >= 0)
+        close(l);
+    close(f);
+    attendre_ms(20);
+    close(c);
+    attendre_ms(20);
+    /* Le TIME_WAIT d'une écoute sans SO_REUSEADDR : la neuve, même avec, ne passe pas. */
+    int b = ecoute(&port, 4);
+    paire_sur(b, port, &c, &f);
+    close(f);
+    attendre_ms(20);
+    close(c);
+    attendre_ms(20);
+    close(b);
+    l = ecoute_sur(port, 1);
+    verifier(l < 0 && errno == EADDRINUSE, "le TIME_WAIT d'une ecoute sans SO_REUSEADDR : refus");
+    if (l >= 0)
+        close(l);
+}
+
+/* Une connexion morte quitte son quadruplet : un nouveau SYN du même client ne va pas à elle. Et
+ * son port reste à elle s'il vient de bind, jusqu'à sa fermeture. */
+static void morte_mais_tenue(void)
+{
+    int port, l = ecoute(&port, 4), f;
+    struct sockaddr_in x = lo(port);
+    /* Un client au port nommé, coupé par un RST, le descripteur gardé. */
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in moi = lo(0);
+    socklen_t n = sizeof moi;
+    int oui = 1;
+    setsockopt(c, SOL_SOCKET, SO_REUSEADDR, &oui, sizeof oui);
+    bind(c, (void *)&moi, sizeof moi);
+    getsockname(c, (void *)&moi, &n);
+    int port_moi = ntohs(moi.sin_port);
+    connect(c, (void *)&x, sizeof x);
+    /* bind l'a nommé (port 0 : non) : on refait la même chose à un port nommé, celui-ci. */
+    close(c);
+    attendre_ms(20);
+    f = accept(l, 0, 0);
+    close(f);
+    attendre_ms(20);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, SOL_SOCKET, SO_REUSEADDR, &oui, sizeof oui);
+    moi = lo(port_moi);
+    verifier(bind(c, (void *)&moi, sizeof moi) == 0, "un port nomme : bind");
+    verifier(connect(c, (void *)&x, sizeof x) == 0, "un port nomme : connect");
+    f = accept(l, 0, 0);
+    couper(f);
+    attendre_ms(20);
+    verifier(etat_de(c) == TCP_CLOSE, "un port nomme, un RST : la connexion est morte");
+    int d = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(bind(d, (void *)&moi, sizeof moi) < 0 && errno == EADDRINUSE, "un port nomme, un RST : il reste pris, sans SO_REUSEADDR");
+    setsockopt(d, SOL_SOCKET, SO_REUSEADDR, &oui, sizeof oui);
+    verifier(bind(d, (void *)&moi, sizeof moi) == 0, "un port nomme, un RST : pris par SO_REUSEADDR");
+    verifier(connect(d, (void *)&x, sizeof x) == 0, "un port nomme, un RST : le quadruplet est libre");
+    f = accept(l, 0, 0);
+    close(d);
+    close(f);
+    close(c);
+    close(l);
+}
+
+/* Ce qu'une fille hérite ou non, IP_TOS et ses bits d'ECN, TCP_QUICKACK et l'état vivant,
+ * TCP_MAXSEG et ce qu'on annonce (advmss, sans les 12 octets d'horodatage). */
+static void herites(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0), v = 0xFF;
+    setsockopt(s, IPPROTO_IP, IP_TOS, &v, sizeof v);
+    verifier(option(s, IPPROTO_IP, IP_TOS) == 0xFC, "IP_TOS sur TCP : les bits d'ECN restent a TCP");
+    close(s);
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(s, IPPROTO_IP, IP_TOS, &v, sizeof v);
+    verifier(option(s, IPPROTO_IP, IP_TOS) == 0xFF, "IP_TOS sur UDP : tout");
+    close(s);
+    int l = socket(AF_INET, SOCK_STREAM, 0), c, f;
+    struct sockaddr_in a = lo(0);
+    socklen_t n = sizeof a;
+    bind(l, (void *)&a, sizeof a);
+    getsockname(l, (void *)&a, &n);
+    v = 0;
+    setsockopt(l, IPPROTO_TCP, TCP_QUICKACK, &v, sizeof v);
+    verifier(option(l, IPPROTO_TCP, TCP_QUICKACK) == 0, "TCP_QUICKACK a 0 : relu");
+    v = 1;
+    setsockopt(l, IPPROTO_TCP, TCP_NODELAY, &v, sizeof v);
+    setsockopt(l, IPPROTO_TCP, TCP_CORK, &v, sizeof v);
+    v = 30;
+    setsockopt(l, IPPROTO_TCP, TCP_DEFER_ACCEPT, &v, sizeof v);
+    v = 1234;
+    setsockopt(l, IPPROTO_TCP, TCP_USER_TIMEOUT, &v, sizeof v);
+    listen(l, 4);
+    verifier(option(l, IPPROTO_TCP, TCP_QUICKACK) == 1, "listen efface TCP_QUICKACK a 0");
+    /* Les premières données font accepter (TCP_DEFER_ACCEPT). */
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&a, sizeof a);
+    send(c, "x", 1, 0);
+    attendre_ms(20);
+    f = accept(l, 0, 0);
+    int ok = option(f, IPPROTO_TCP, TCP_NODELAY) == 1 && option(f, IPPROTO_TCP, TCP_CORK) == 1;
+    ok &= option(f, IPPROTO_TCP, TCP_USER_TIMEOUT) == 1234;
+    verifier(ok, "une fille herite TCP_NODELAY, TCP_CORK, TCP_USER_TIMEOUT");
+    verifier(option(f, IPPROTO_TCP, TCP_DEFER_ACCEPT) == 0 && option(f, IPPROTO_TCP, TCP_QUICKACK) == 1, "une fille n'herite pas TCP_DEFER_ACCEPT ni TCP_QUICKACK");
+    close(c);
+    close(f);
+    close(l);
+    /* TCP_QUICKACK relu : l'état vivant ; une conversation entre dans le ping-pong. */
+    int port;
+    l = ecoute(&port, 4);
+    paire_sur(l, port, &c, &f);
+    verifier(option(c, IPPROTO_TCP, TCP_QUICKACK) == 1, "TCP_QUICKACK d'un client neuf : 1");
+    char o[100] = { 0 };
+    send(f, o, 100, 0);
+    attendre_ms(4);
+    recv(c, o, 100, 0);
+    send(c, o, 100, 0);
+    attendre_ms(4);
+    verifier(option(c, IPPROTO_TCP, TCP_QUICKACK) == 0, "TCP_QUICKACK apres un echange : le ping-pong");
+    close(c);
+    close(f);
+    close(l);
+    /* TCP_MAXSEG : ce qu'on annonce, ce qu'on envoie. */
+    l = socket(AF_INET, SOCK_STREAM, 0);
+    a = lo(0);
+    n = sizeof a;
+    bind(l, (void *)&a, sizeof a);
+    getsockname(l, (void *)&a, &n);
+    v = 1000;
+    setsockopt(l, IPPROTO_TCP, TCP_MAXSEG, &v, sizeof v);
+    listen(l, 4);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    v = 1200;
+    setsockopt(c, IPPROTO_TCP, TCP_MAXSEG, &v, sizeof v);
+    connect(c, (void *)&a, sizeof a);
+    f = accept(l, 0, 0);
+    struct tcp_info i, j;
+    n = sizeof i;
+    getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &n);
+    getsockopt(f, IPPROTO_TCP, TCP_INFO, &j, &n);
+    verifier(i.tcpi_advmss == 1188 && j.tcpi_advmss == 988, "TCP_MAXSEG : advmss 1188 et 988");
+    verifier(i.tcpi_snd_mss == 988 && j.tcpi_snd_mss == 988, "TCP_MAXSEG : le plus petit des deux, pour envoyer");
+    verifier(i.tcpi_rcv_space == 11880 && j.tcpi_rcv_space == 9880, "TCP_MAXSEG : rcv_space, dix fois advmss");
+    close(c);
+    close(f);
+    close(l);
+}
+
+/* SO_PEEK_OFF (6.18 : `sk_set_peek_off` aussi pour TCP) : où MSG_PEEK reprend. */
+static int peek_off(int s)
+{
+    return option(s, SOL_SOCKET, SO_PEEK_OFF);
+}
+
+static void pose_peek_off(int s, int v)
+{
+    setsockopt(s, SOL_SOCKET, SO_PEEK_OFF, &v, sizeof v);
+}
+
+static int peek_fd;
+
+static void *peek_plus_tard(void *p)
+{
+    (void)p;
+    attendre_ms(60);
+    send(peek_fd, "XYZ", 3, 0);
+    return 0;
+}
+
+static void peek_avec_decalage(void)
+{
+    int port, l = ecoute(&port, 4), c, f;
+    char o[32];
+    long r;
+    verifier(peek_off(l) == -1, "SO_PEEK_OFF : -1 au depart");
+    paire_sur(l, port, &c, &f);
+    send(c, "abcdefgh", 8, 0);
+    attendre_ms(20);
+    pose_peek_off(f, 2);
+    verifier(peek_off(f) == 2, "SO_PEEK_OFF : relu");
+    r = recv(f, o, 3, MSG_PEEK);
+    verifier(r == 3 && !memcmp(o, "cde", 3) && peek_off(f) == 5, "SO_PEEK_OFF 2 : MSG_PEEK cde, il avance");
+    r = recv(f, o, 10, MSG_PEEK);
+    verifier(r == 3 && !memcmp(o, "fgh", 3) && peek_off(f) == 8, "SO_PEEK_OFF 5 : MSG_PEEK fgh, la suite");
+    r = recv(f, o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r < 0 && errno == EAGAIN && peek_off(f) == 8, "SO_PEEK_OFF au bout : EAGAIN");
+    r = recv(f, o, 4, 0);
+    verifier(r == 4 && !memcmp(o, "abcd", 4) && peek_off(f) == 4, "une lecture part de la tete, et le fait reculer");
+    r = recv(f, o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r < 0 && errno == EAGAIN && peek_off(f) == 4, "SO_PEEK_OFF toujours au bout : EAGAIN");
+    /* Il attend ce qui viendra après. */
+    pthread_t t;
+    peek_fd = c;
+    pthread_create(&t, 0, peek_plus_tard, 0);
+    r = recv(f, o, 10, MSG_PEEK);
+    verifier(r == 3 && !memcmp(o, "XYZ", 3) && peek_off(f) == 7, "SO_PEEK_OFF au bout : MSG_PEEK attend la suite");
+    pthread_join(t, 0);
+    /* Négatif : relu tel quel, et MSG_PEEK revient à la tête, sans y toucher. */
+    pose_peek_off(f, -5);
+    verifier(peek_off(f) == -5, "SO_PEEK_OFF negatif : relu tel quel");
+    r = recv(f, o, 4, MSG_PEEK);
+    verifier(r == 4 && !memcmp(o, "efgh", 4) && peek_off(f) == -5, "SO_PEEK_OFF negatif : MSG_PEEK a la tete");
+    recv(f, o, 2, 0);
+    verifier(peek_off(f) == -5, "SO_PEEK_OFF negatif : une lecture n'y touche pas");
+    /* Loin devant, et la fin. */
+    pose_peek_off(f, 100);
+    r = recv(f, o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r < 0 && errno == EAGAIN && peek_off(f) == 100, "SO_PEEK_OFF loin devant : EAGAIN");
+    shutdown(c, SHUT_WR);
+    attendre_ms(20);
+    verifier(recv(f, o, 10, MSG_PEEK) == 0, "SO_PEEK_OFF loin devant, le FIN : 0");
+    close(c);
+    close(f);
+    /* Une marque urgente : la place de l'octet compte, pas ce qu'on en rend. */
+    paire_sur(l, port, &c, &f);
+    send(c, "abc", 3, MSG_OOB);
+    send(c, "de", 2, 0);
+    attendre_ms(20);
+    pose_peek_off(f, 1);
+    r = recv(f, o, 32, MSG_PEEK);
+    verifier(r == 1 && o[0] == 'b' && peek_off(f) == 2, "SO_PEEK_OFF 1, urgent : b, on s'arrete a la marque");
+    r = recv(f, o, 32, MSG_PEEK);
+    verifier(r == 2 && !memcmp(o, "de", 2) && peek_off(f) == 4, "SO_PEEK_OFF 2, a la marque : on la saute, de");
+    r = recv(f, o, 32, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r == 1 && o[0] == 'e' && peek_off(f) == 5, "SO_PEEK_OFF 4 : le saut ne compte pas, e");
+    pose_peek_off(f, -1);
+    /* MSG_WAITALL s'arrête aussi à la marque. */
+    r = recv(f, o, 32, MSG_WAITALL | MSG_DONTWAIT);
+    verifier(r == 2 && !memcmp(o, "ab", 2), "MSG_WAITALL s'arrete a la marque");
+    r = recv(f, o, 32, MSG_DONTWAIT);
+    verifier(r == 2 && !memcmp(o, "de", 2), "puis une lecture la saute");
+    close(c);
+    close(f);
+    /* MSG_TRUNC : compté, sans rien copier. */
+    paire_sur(l, port, &c, &f);
+    send(c, "abcdefgh", 8, 0);
+    attendre_ms(20);
+    pose_peek_off(f, 2);
+    verifier(recv(f, 0, 3, MSG_PEEK | MSG_TRUNC) == 3 && peek_off(f) == 5, "SO_PEEK_OFF et MSG_TRUNC : compte, il avance");
+    verifier(recv(f, 0, 2, MSG_TRUNC) == 2 && peek_off(f) == 3, "MSG_TRUNC qui retire : il recule");
+    close(c);
+    close(f);
+    /* Une écoute le garde, et une fille en hérite. */
+    pose_peek_off(l, 5);
+    paire_sur(l, port, &c, &f);
+    verifier(peek_off(l) == 5 && peek_off(f) == 5, "SO_PEEK_OFF : une fille herite");
+    close(c);
+    close(f);
+    close(l);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1659,6 +2228,16 @@ int main(void)
     defer_accept();
     reglages();
     info_complete();
+    fin_puis_rst();
+    arret_en_syn();
+    arret_d_ecoute();
+    backlog_sans_signe();
+    connect_apres_erreur();
+    lectures_fines();
+    serveur_qui_redemarre();
+    morte_mais_tenue();
+    herites();
+    peek_avec_decalage();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

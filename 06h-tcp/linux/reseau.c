@@ -942,6 +942,93 @@ static void icmp(void)
              "SOCK_RAW sans CAP_NET_RAW : EPERM ; de protocole 0 : EPROTONOSUPPORT");
 }
 
+/* SO_PEEK_OFF (`udp_set_peek_off`) : le décalage passe d'un datagramme à l'autre. */
+static int peek_lu(int s)
+{
+    int v = -99;
+    socklen_t n = sizeof v;
+    if (getsockopt(s, SOL_SOCKET, SO_PEEK_OFF, &v, &n) < 0)
+        return -1000 - errno;
+    return v;
+}
+
+static void decalage_de_peek(void)
+{
+    int a = socket(AF_INET, SOCK_DGRAM, 0), b = socket(AF_INET, SOCK_DGRAM, 0), v;
+    struct sockaddr_in x = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK) };
+    socklen_t n = sizeof x;
+    char o[16];
+    long r;
+    bind(b, (void *)&x, sizeof x);
+    getsockname(b, (void *)&x, &n);
+    connect(a, (void *)&x, sizeof x);
+    verifier(peek_lu(b) == -1, "SO_PEEK_OFF : -1 au depart");
+    send(a, "abcd", 4, 0);
+    send(a, "efgh", 4, 0);
+    v = 1;
+    setsockopt(b, SOL_SOCKET, SO_PEEK_OFF, &v, sizeof v);
+    verifier(peek_lu(b) == 1, "SO_PEEK_OFF : relu");
+    r = recv(b, o, 2, MSG_PEEK);
+    verifier(r == 2 && !memcmp(o, "bc", 2) && peek_lu(b) == 3, "SO_PEEK_OFF 1 : bc, il avance");
+    r = recv(b, o, 10, MSG_PEEK);
+    verifier(r == 1 && o[0] == 'd' && peek_lu(b) == 4, "SO_PEEK_OFF 3 : le reste du premier");
+    r = recv(b, o, 10, MSG_PEEK);
+    verifier(r == 4 && !memcmp(o, "efgh", 4) && peek_lu(b) == 8, "SO_PEEK_OFF 4 : le second");
+    r = recv(b, o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r < 0 && errno == EAGAIN && peek_lu(b) == 8, "SO_PEEK_OFF au bout : EAGAIN");
+    /* Coupé, ou pas : la place de ce qui reste, et celle du datagramme. */
+    struct msghdr m = { 0 };
+    struct iovec iv = { o, 3 };
+    m.msg_iov = &iv;
+    m.msg_iovlen = 1;
+    v = 1;
+    setsockopt(b, SOL_SOCKET, SO_PEEK_OFF, &v, sizeof v);
+    r = recvmsg(b, &m, MSG_PEEK);
+    verifier(r == 3 && (m.msg_flags & MSG_TRUNC), "juste la place de ce qui reste : MSG_TRUNC (`udp_recvmsg`)");
+    v = 1;
+    setsockopt(b, SOL_SOCKET, SO_PEEK_OFF, &v, sizeof v);
+    iv.iov_len = 4;
+    m.msg_flags = 0;
+    r = recvmsg(b, &m, MSG_PEEK);
+    verifier(r == 3 && !(m.msg_flags & MSG_TRUNC), "plus de place que ce qui reste : pas MSG_TRUNC");
+    /* MSG_TRUNC : la vraie longueur, et il avance d'autant. */
+    v = 1;
+    setsockopt(b, SOL_SOCKET, SO_PEEK_OFF, &v, sizeof v);
+    r = recv(b, o, 2, MSG_PEEK | MSG_TRUNC);
+    verifier(r == 4 && peek_lu(b) == 5, "MSG_PEEK | MSG_TRUNC : la vraie longueur, il avance d'autant");
+    v = 8;
+    setsockopt(b, SOL_SOCKET, SO_PEEK_OFF, &v, sizeof v);
+    r = recv(b, o, 10, MSG_DONTWAIT);
+    verifier(r == 4 && !memcmp(o, "abcd", 4) && peek_lu(b) == 4, "une lecture part de la tete, et le fait reculer");
+    r = recv(b, o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r < 0 && errno == EAGAIN && peek_lu(b) == 4, "SO_PEEK_OFF toujours au bout : EAGAIN");
+    r = recv(b, o, 10, MSG_DONTWAIT);
+    verifier(r == 4 && !memcmp(o, "efgh", 4) && peek_lu(b) == 0, "encore une lecture : 0");
+    /* Un datagramme vide se voit une fois. */
+    send(a, "", 0, 0);
+    send(a, "z", 1, 0);
+    r = recv(b, o, 10, MSG_PEEK);
+    verifier(r == 0, "SO_PEEK_OFF 0 : le datagramme vide, une fois");
+    r = recv(b, o, 10, MSG_PEEK);
+    verifier(r == 1 && o[0] == 'z', "SO_PEEK_OFF 0 : puis le suivant");
+    /* Négatif : relu tel quel, à la tête. */
+    v = -3;
+    setsockopt(b, SOL_SOCKET, SO_PEEK_OFF, &v, sizeof v);
+    verifier(peek_lu(b) == -3, "SO_PEEK_OFF negatif : relu tel quel");
+    r = recv(b, o, 10, MSG_PEEK);
+    verifier(r == 0 && peek_lu(b) == -3, "SO_PEEK_OFF negatif : la tete, sans y toucher");
+    close(a);
+    close(b);
+    /* Ping n'en a pas (s'il est permis ici). */
+    int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (p >= 0) {
+        v = 1;
+        verifier(setsockopt(p, SOL_SOCKET, SO_PEEK_OFF, &v, sizeof v) < 0 && errno == EOPNOTSUPP, "ping : SO_PEEK_OFF, EOPNOTSUPP");
+        verifier(peek_lu(p) == -1000 - EOPNOTSUPP, "ping : relu, EOPNOTSUPP");
+        close(p);
+    }
+}
+
 int main(void)
 {
     creation();
@@ -955,6 +1042,7 @@ int main(void)
     aller_retour();
     routes_et_messages();
     icmp();
+    decalage_de_peek();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

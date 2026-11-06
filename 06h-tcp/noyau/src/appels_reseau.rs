@@ -118,6 +118,7 @@ const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const SO_ACCEPTCONN: i32 = 30;
 const SO_PROTOCOL: i32 = 38;
+const SO_PEEK_OFF: i32 = 42;
 const SO_DOMAIN: i32 = 39;
 const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
@@ -695,7 +696,8 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
     if drapeaux & MSG_OOB != 0 && o.socket().protocole == Protocole::Ping {
         return Err(-EOPNOTSUPP);
     }
-    if drapeaux & MSG_ERRQUEUE != 0 {
+    // AF_UNIX n'a pas de file d'erreurs, et ne regarde pas ce drapeau.
+    if drapeaux & MSG_ERRQUEUE != 0 && o.socket().protocole != Protocole::Unix {
         let e = o.socket().prendre_en_file().ok_or(-EAGAIN)?;
         let total = e.donnees.longueur();
         let copie = copier_vers_morceaux(morceaux, e.donnees.donnees())?;
@@ -736,7 +738,7 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let recu = socket::Recu { vide: true, longueur: n, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: false };
         return Ok(Reception { recu, nom_unix: None, drapeaux: 0, erreur: None, fichiers: Vec::new(), droits: None });
     }
-    let recu = socket::prendre(o.socket(), drapeaux, non_bloquant(o), |octets| copier_vers_morceaux(morceaux, octets))?;
+    let recu = socket::prendre(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |octets| copier_vers_morceaux(morceaux, octets))?;
     let drapeaux = if recu.coupe { MSG_TRUNC } else { 0 };
     Ok(Reception { recu, nom_unix: None, drapeaux, erreur: None, fichiers: Vec::new(), droits: None })
 }
@@ -1401,6 +1403,20 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             s.appels.verrouiller().options.priority = v as u32;
             return Ok(());
         }
+        // Toute valeur, relue telle quelle ; négative : sans effet sur MSG_PEEK. Pas pour ping
+        // (`inet_sockraw_ops` n'a pas de `set_peek_off`), ni pendant une lecture d'AF_UNIX
+        // (`unix_set_peek_off` : l'iolock).
+        SO_PEEK_OFF => {
+            if s.protocole == Protocole::Ping {
+                return Err(-EOPNOTSUPP);
+            }
+            if s.protocole == Protocole::Unix {
+                unix::poser_peek_off(s, v);
+            } else {
+                s.peek_off.store(v, Ordering::Relaxed);
+            }
+            return Ok(());
+        }
         // Négatif : le plus grand ; 0 se relit 1.
         SO_RCVLOWAT => {
             let v = if v < 0 { i32::MAX as u32 } else { v as u32 };
@@ -1867,6 +1883,8 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
         SO_SNDTIMEO | SO_SNDTIMEO_NEW => timeval(&mut o, op.sndtimeo),
         SO_RCVLOWAT => entier(&mut o, op.rcvlowat as i32),
         SO_SNDLOWAT => entier(&mut o, 1),
+        SO_PEEK_OFF if s.protocole == Protocole::Ping => return Err(-EOPNOTSUPP),
+        SO_PEEK_OFF => entier(&mut o, s.peek_off.load(Ordering::Relaxed)),
         _ => return Err(-ENOPROTOOPT),
     };
     Ok((o, n))

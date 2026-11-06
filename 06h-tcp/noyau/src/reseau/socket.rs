@@ -47,7 +47,7 @@ use crate::verrou::Verrou;
 use crate::faillible::{self, FileFaillible};
 use crate::{cpu, temps};
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// POLLRDHUP : l'autre côté a fermé (ou la lecture est arrêtée).
 pub const POLLRDHUP: u32 = 0x2000;
@@ -184,6 +184,8 @@ pub struct ErreurEnFile {
 /// l'a envoyé, à quelle adresse et par quelle interface il est arrivé (pour
 /// IP_PKTINFO), et sa taille vraie (ce qu'il compte dans SO_RCVBUF).
 pub struct Datagramme {
+    /// Un datagramme vide déjà vu par MSG_PEEK (`skb->peeked`) : SO_PEEK_OFF passe au suivant.
+    pub regarde: bool,
     pub paquet: Paquet,
     pub source: [u8; 4],
     pub port: u16,
@@ -308,6 +310,9 @@ pub struct Socket {
     /// fichier est fait ; 0 avant (une fille d'une écoute pas encore
     /// acceptée n'en a pas, chez Linux non plus).
     pub inode: AtomicU32,
+    /// SO_PEEK_OFF (`sk_peek_off`) : où MSG_PEEK reprend, en octets depuis le début de ce qui est à
+    /// lire ; négatif : il ne s'en sert pas, et regarde toujours la tête (-1, le défaut).
+    pub peek_off: AtomicI32,
     /// La suivante des sockets qu'une tâche a à fermer (sa liste
     /// `Tache::fermetures`, voir `fichier_ferme`).
     suivante: Verrou<Option<Arc<Socket>>>,
@@ -336,6 +341,7 @@ impl Socket {
             pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
             asynchrone: crate::asynchrone::ListeAsync::new(),
             inode: AtomicU32::new(0),
+            peek_off: AtomicI32::new(-1),
             suivante: Verrou::new(None),
             flux: None,
             unix: None,
@@ -354,6 +360,28 @@ impl Socket {
     pub fn unix(mut self, sorte: super::unix::Sorte) -> Option<Socket> {
         self.unix = Some(faillible::boite(super::unix::Unix::new(sorte)?).ok()?);
         Some(self)
+    }
+
+    /// Où MSG_PEEK commence (`max(sk_peek_offset(sk, flags), 0)`).
+    pub fn decalage_de_peek(&self) -> usize {
+        self.peek_off.load(Ordering::Relaxed).max(0) as usize
+    }
+
+    /// `n` octets regardés (`sk_peek_offset_fwd`).
+    pub fn peek_avance(&self, n: usize) {
+        let o = self.peek_off.load(Ordering::Relaxed);
+        if o >= 0 {
+            self.peek_off.store(o.saturating_add(n.min(i32::MAX as usize) as i32), Ordering::Relaxed);
+        }
+    }
+
+    /// `n` octets retirés (`sk_peek_offset_bwd`) : la place de MSG_PEEK, comptée depuis le début de ce
+    /// qui est à lire, recule d'autant.
+    pub fn peek_recule(&self, n: usize) {
+        let o = self.peek_off.load(Ordering::Relaxed);
+        if o >= 0 {
+            self.peek_off.store(o.saturating_sub(n.min(i32::MAX as usize) as i32).max(0), Ordering::Relaxed);
+        }
     }
 
     /// Une socket TCP : son flux, et ses tampons de départ (`tcp_rmem[1]`,
@@ -509,11 +537,11 @@ impl Socket {
     /// a un délai n'est pas refait). L'attente est exclusive : un datagramme
     /// arrivé ne réveille qu'un des fils qui attendent (le
     /// `prepare_to_wait_exclusive` de Linux), pas tous pour un seul.
-    pub fn attendre_lecture(&self, echeance: Option<u64>) -> Result<(), i64> {
+    pub fn attendre_lecture(&self, echeance: Option<u64>, deja: usize) -> Result<(), i64> {
         const EINTR: i64 = 4;
         let pret = || {
             let r = self.reception.verrouiller();
-            !r.file.is_empty() || r.erreur != 0 || r.arret & ARRET_LECTURE != 0
+            r.file.len() > deja || r.erreur != 0 || r.arret & ARRET_LECTURE != 0
         };
         if pret() {
             return Ok(());
@@ -590,7 +618,7 @@ pub struct Recu {
 /// copié d'abord dans un tampon du noyau, sous le `Verrou`, puis de là au
 /// programme : une copie de plus (un écart, pour MSG_PEEK seulement), et
 /// pas de paquet partagé entre la file et l'appel.
-pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl FnMut(&[u8]) -> Result<usize, i64>)
+pub fn prendre(s: &Socket, place: usize, drapeaux: u64, non_bloquant: bool, mut copier: impl FnMut(&[u8]) -> Result<usize, i64>)
                -> Result<Recu, i64> {
     // MSG_TRUNC fait rendre la vraie longueur à UDP (`udp_recvmsg`), pas à
     // ping (`ping_recvmsg` rend ce qu'il a copié).
@@ -602,6 +630,8 @@ pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl F
     let echeance = delai.map(|d| crate::temps::ns_monotone().saturating_add(d));
     // SO_RCVTIMEO négatif : 0, une réception qui n'attend pas (Linux).
     let non_bloquant = non_bloquant || drapeaux & MSG_DONTWAIT != 0 || delai == Some(0);
+    // Les datagrammes que le décalage de MSG_PEEK a déjà passés : il en faut un de plus.
+    let mut deja;
     loop {
         let erreur = s.prendre_erreur();
         if erreur != 0 {
@@ -610,11 +640,28 @@ pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl F
         {
             let _appel = s.appels.verrouiller();
             let mut r = s.reception.verrouiller();
-            if let Some(premier) = r.file.front() {
+            // MSG_PEEK et SO_PEEK_OFF (`__skb_try_recv_from_queue`) : le datagramme où tombe le
+            // décalage, et la place dedans ; un datagramme vide compte une fois, regardé.
+            let regarder = drapeaux & MSG_PEEK != 0;
+            let decalage = if regarder { s.peek_off.load(Ordering::Relaxed) } else { -1 };
+            let mut reste = decalage.max(0) as usize;
+            let k = r.file.iter().position(|d| {
+                let n = d.paquet.longueur();
+                if decalage >= 0 && reste >= n && (reste > 0 || d.regarde) {
+                    reste -= n;
+                    return false;
+                }
+                true
+            });
+            deja = if k.is_none() { r.file.len() } else { 0 };
+            if let Some(k) = k {
+                let premier = &mut r.file[k];
                 let (source, port, destination, interface) = (premier.source, premier.port, premier.destination, premier.interface);
                 let total = premier.paquet.longueur();
-                let copie = if drapeaux & MSG_PEEK != 0 {
-                    let v = faillible::copie(premier.paquet.donnees()).map_err(|_| -ENOMEM)?;
+                let dispo = total - reste;
+                let copie = if regarder {
+                    premier.regarde |= total == 0;
+                    let v = faillible::copie(&premier.paquet.donnees()[reste..]).map_err(|_| -ENOMEM)?;
                     drop(r);
                     copier(&v)?
                 } else {
@@ -623,11 +670,16 @@ pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl F
                     drop(r);
                     copier(d.paquet.donnees())?
                 };
-                return Ok(Recu {
-                    vide: false,
-                    longueur: if vraie && drapeaux & MSG_TRUNC != 0 { total } else { copie },
-                    source, port, destination, interface, coupe: copie < total,
-                });
+                // `udp_recvmsg` : plus de place qu'il n'en reste à copier : rien de coupé, même si
+                // le décalage en a passé ; sinon, moins de place que le datagramme : coupé.
+                let coupe = place <= dispo && place < total;
+                let longueur = if vraie && drapeaux & MSG_TRUNC != 0 { total } else { copie };
+                if regarder {
+                    s.peek_avance(longueur);
+                } else {
+                    s.peek_recule(longueur);
+                }
+                return Ok(Recu { vide: false, longueur, source, port, destination, interface, coupe });
             }
         }
         // Rien en file : EAGAIN sans attendre, même après l'arrêt de la
@@ -639,7 +691,7 @@ pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl F
         if s.reception.verrouiller().arret & ARRET_LECTURE != 0 {
             return Ok(Recu { vide: true, longueur: 0, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: false });
         }
-        s.attendre_lecture(echeance)?;
+        s.attendre_lecture(echeance, deja)?;
     }
 }
 

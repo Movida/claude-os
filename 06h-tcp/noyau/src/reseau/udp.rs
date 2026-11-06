@@ -196,7 +196,7 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion
 
 fn deposer(s: &Socket, p: Paquet, source: [u8; 4], port: u16, destination: [u8; 4], interface: u32) {
     let taille = p.taille_vraie();
-    let d = Datagramme { paquet: p, source, port, destination, interface, taille };
+    let d = Datagramme { regarde: false, paquet: p, source, port, destination, interface, taille };
     if !s.deposer(d, Admission::Udp) {
         FILE_PLEINE.fetch_add(1, Ordering::Relaxed);
     }

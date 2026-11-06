@@ -250,6 +250,9 @@ pub trait FileFaillible<T> {
     /// `push_front` dans la place déjà réservée.
     #[track_caller]
     fn ajouter_devant_dans_la_place(&mut self, valeur: T);
+    /// `insert` à la place `i` dans la place déjà réservée.
+    #[track_caller]
+    fn inserer_dans_la_place(&mut self, i: usize, valeur: T);
     /// `append` (tous les éléments de `autre`, au bout) dans la place déjà
     /// réservée.
     #[track_caller]
@@ -273,6 +276,11 @@ impl<T> FileFaillible<T> for VecDeque<T> {
     fn ajouter_devant_dans_la_place(&mut self, valeur: T) {
         assert!(self.len() < self.capacity(), "VecDeque sans la place reservee");
         self.push_front(valeur);
+    }
+
+    fn inserer_dans_la_place(&mut self, i: usize, valeur: T) {
+        assert!(self.len() < self.capacity(), "VecDeque sans la place reservee");
+        self.insert(i, valeur);
     }
 
     fn deplacer_dans_la_place(&mut self, autre: &mut VecDeque<T>) {

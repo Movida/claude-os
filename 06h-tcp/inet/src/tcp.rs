@@ -1433,14 +1433,23 @@ impl<P: Charge> Tcb<P> {
     /// La marque urgente (`tcp_recvmsg`) : une lecture s'arrête devant elle
     /// (SIOCATMARK le dira) ; à la marque, l'octet urgent est sauté, sauf
     /// SO_OOBINLINE (MSG_OOB le lit à part).
-    pub fn lire<E>(&mut self, n: usize, garder: bool, mut copier: impl FnMut(&[u8]) -> Result<usize, E>) -> Result<usize, E> {
+    pub fn lire<E>(&mut self, n: usize, garder: bool, copier: impl FnMut(&[u8]) -> Result<usize, E>) -> Result<usize, E> {
+        self.lire_depuis(&mut 0, n, garder, copier)
+    }
+
+    /// Comme `lire`, à `debut` octets de la tête pour qui regarde (MSG_PEEK : le `peek_seq` de
+    /// Linux, moins `copied_seq`), qui y avance, l'octet urgent sauté compris (`urg_hole`). Une
+    /// lecture qui retire part toujours de la tête : `debut` vaut 0.
+    pub fn lire_depuis<E>(&mut self, debut: &mut usize, n: usize, garder: bool, mut copier: impl FnMut(&[u8]) -> Result<usize, E>) -> Result<usize, E> {
         let mut n = n;
         let mut saut = 0;
         if self.urgent != Urgent::Aucun {
-            let devant = self.urg_seq.wrapping_sub(self.rcv_lu) as usize;
-            if devant == 0 && self.octets_reception > 0 {
+            // (Sur 32 bits : une marque déjà passée est très loin devant.)
+            let devant = self.urg_seq.wrapping_sub(self.rcv_lu.wrapping_add(*debut as u32)) as usize;
+            let reste = self.octets_reception.saturating_sub(*debut);
+            if devant == 0 && reste > 0 {
                 saut = usize::from(!self.reglages.oobinline);
-            } else if devant < self.octets_reception {
+            } else if devant < reste {
                 n = n.min(devant);
             }
         }
@@ -1449,12 +1458,16 @@ impl<P: Charge> Tcb<P> {
         // Le décalage dans le premier morceau regardé (MSG_PEEK saute
         // l'octet urgent sans le retirer).
         let mut decalage = 0;
-        if saut > 0 {
-            if garder {
-                decalage = 1;
-            } else {
-                self.retirer_tete(1);
+        if garder {
+            decalage = *debut + saut;
+            while let Some(p) = self.reception.get(i)
+                && decalage >= p.octets().len()
+            {
+                decalage -= p.octets().len();
+                i += 1;
             }
+        } else if saut > 0 {
+            self.retirer_tete(1);
         }
         while fait < n && i < self.reception.len() {
             let morceau = &self.reception[i].octets()[decalage.min(self.reception[i].octets().len())..];
@@ -1481,7 +1494,9 @@ impl<P: Charge> Tcb<P> {
                 break;
             }
         }
-        if !garder && self.urgent != Urgent::Aucun && apres(self.rcv_lu, self.urg_seq) {
+        if garder {
+            *debut += saut + fait;
+        } else if self.urgent != Urgent::Aucun && apres(self.rcv_lu, self.urg_seq) {
             // La marque est passée.
             self.urgent = Urgent::Aucun;
         }

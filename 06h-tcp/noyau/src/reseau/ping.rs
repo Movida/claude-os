@@ -154,7 +154,7 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], p: Paquet
         return;
     };
     let taille = p.taille_vraie();
-    let d = Datagramme { paquet: p, source, port: 0, destination, interface, taille };
+    let d = Datagramme { regarde: false, paquet: p, source, port: 0, destination, interface, taille };
     if !s.deposer(d, Admission::Ordinaire) {
         FILE_PLEINE.fetch_add(1, Ordering::Relaxed);
     }

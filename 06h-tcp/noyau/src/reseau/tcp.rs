@@ -1756,6 +1756,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             enfant.sndbuf.store(s.sndbuf.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.recverr.store(options.recverr, Ordering::Relaxed);
             enfant.pmtudisc.store(options.pmtudisc, Ordering::Relaxed);
+            enfant.peek_off.store(s.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.appels.verrouiller().options = options;
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.changer_objet(numero, Cible::Socket(enfant.clone()));
@@ -1947,21 +1948,60 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
     let cible = if drapeaux & MSG_WAITALL != 0 { longueur } else { rcvlowat.min(longueur) };
     let mut g = flux(s).posseder();
     let mut fait = 0;
+    // MSG_PEEK : où l'on regarde, depuis le début de ce qui est à lire (`peek_seq`) : SO_PEEK_OFF,
+    // puis ce qu'on a déjà vu ; et la lecture à laquelle cela se rapporte.
+    let decalage_de_depart = if peek { s.decalage_de_peek() } else { 0 };
+    let mut debut = decalage_de_depart;
+    let mut lu_au_depart = None;
     loop {
         let arret = g.avec_court(|_, c| c.arret);
         let p = g.donnee();
-        let Mode::Connexion(t) = &mut p.mode else { return Err(-ENOTCONN) };
+        let Mode::Connexion(t) = &mut p.mode else {
+            // Une socket neuve, l'erreur de sa déconnexion d'abord.
+            let e = core::mem::take(&mut p.erreur_seule);
+            g.publier(|p, c| p.rafraichir(c));
+            return Err(if e != 0 { -(e as i64) } else { -ENOTCONN });
+        };
+        // Un autre lecteur a retiré des octets pendant qu'on attendait (« Application bug, race in
+        // MSG_PEEK ») : on repart de là où il en est.
+        if peek {
+            let lu = t.numero_lu();
+            if lu_au_depart.is_some_and(|l| l != lu) {
+                debut = decalage_de_depart;
+            }
+            lu_au_depart = Some(lu);
+        }
+        // À la marque urgente (`tcp_recvmsg_locked`), une lecture s'arrête : ce qu'elle a déjà suffit,
+        // même MSG_WAITALL ; et rien encore : un signal passe d'abord, sans doute SIGURG, pour que
+        // le programme lise l'octet urgent avant de continuer.
+        if t.a_la_marque_depuis(debut) {
+            if fait > 0 {
+                return Ok(fait);
+            }
+            if crate::tache::signal_en_attente() {
+                return Err(if non_bloquant {
+                    -EAGAIN
+                } else if delai.is_some() {
+                    -EINTR
+                } else {
+                    -crate::reprise::ERESTARTSYS
+                });
+            }
+        }
         // L'octet urgent seul en tête, hors du flux : MSG_PEEK n'a rien à
         // voir ; une lecture le passe (et l'oublie : `urg_data` effacé, un
         // recv(MSG_OOB) suivant rend EINVAL, comme Linux), puis regarde ce
         // qui suit, ou attend.
-        let a_lire = if peek { t.lisibles_dans_le_flux() } else { t.lisibles() };
+        let a_lire = if peek { t.lisibles_depuis(debut) } else { t.lisibles() };
         if a_lire > 0 {
-            let lu = if drapeaux & MSG_TRUNC != 0 {
+            let lu = if drapeaux & MSG_TRUNC != 0 && peek {
+                // Rien n'est retiré, rien n'est copié : on compte (`tcp_recvmsg_locked`).
+                t.lire_depuis(&mut debut, longueur - fait, true, |o| Ok::<usize, i64>(o.len()))
+            } else if drapeaux & MSG_TRUNC != 0 {
                 Ok(t.jeter(longueur - fait))
             } else {
                 let mut decalage = fait;
-                t.lire(longueur - fait, peek, |o| {
+                t.lire_depuis(&mut debut, longueur - fait, peek, |o| {
                     let n = copier(decalage, o)?;
                     decalage += n;
                     Ok::<usize, i64>(n)
@@ -1975,6 +2015,11 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
                 Err(e) => (0, Some(e)),
             };
             fait += n;
+            if peek {
+                s.peek_avance(n);
+            } else {
+                s.peek_recule(n);
+            }
             let _contexte = contexte::entrer();
             t.lu(n, maintenant());
             p.emettre();

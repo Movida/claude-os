@@ -1298,6 +1298,238 @@ static int lu(int s, int drapeaux, const char *attendu, int e)
     return r == (long)strlen(attendu) && memcmp(o, attendu, r) == 0;
 }
 
+/* Ce qui attend sans MSG_DONTWAIT, à deux fils. */
+static void *ecrire_ab_plus_tard(void *x)
+{
+    usleep(100000);
+    if (write(*(int *)x, "ab", 2) != 2)
+        verifier(0, "le fil ecrit");
+    return NULL;
+}
+
+static void *fermer_plus_tard(void *x)
+{
+    usleep(100000);
+    close(*(int *)x);
+    return NULL;
+}
+
+static void *arreter_plus_tard(void *x)
+{
+    usleep(100000);
+    shutdown(*(int *)x, SHUT_RDWR);
+    return NULL;
+}
+
+static void *urgent_plus_tard(void *x)
+{
+    usleep(100000);
+    if (send(*(int *)x, "u", 1, MSG_OOB) != 1)
+        verifier(0, "le fil envoie l'urgent");
+    return NULL;
+}
+
+/* Combien de SIGPIPE, pour ce qui suit. */
+static volatile sig_atomic_t tubes;
+static void compter_tube(int n)
+{
+    (void)n;
+    tubes++;
+}
+
+/* Remplit `s`, jusqu'à ce qu'il n'y ait plus de place. */
+static void remplir(int s)
+{
+    static char o[4096];
+    while (send(s, o, sizeof o, MSG_DONTWAIT) > 0)
+        ;
+}
+
+/* Ce qui bloque, puis change sous l'appel (`sock_alloc_send_pskb`, `unix_accept`). */
+static void attentes(void)
+{
+    int s[2];
+    pthread_t f;
+    char o[8];
+    struct sigaction a = { 0 }, ancien;
+    a.sa_handler = compter_tube;
+    sigaction(SIGPIPE, &a, &ancien);
+    /* L'écrivain attend de la place, le pair ferme : ECONNRESET, pas de SIGPIPE, et l'erreur est prise. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    remplir(s[0]);
+    tubes = 0;
+    pthread_create(&f, NULL, fermer_plus_tard, &s[1]);
+    verifier(send(s[0], "x", 1, 0) == -1 && errno == ECONNRESET && tubes == 0, "ecrivain bloque, le pair ferme : ECONNRESET, sans SIGPIPE");
+    pthread_join(f, NULL);
+    verifier(recv(s[0], o, sizeof o, MSG_DONTWAIT) == 0, "et l'erreur est prise : la fin");
+    verifier(send(s[0], "x", 1, 0) == -1 && errno == EPIPE && tubes == 1, "le send d'apres : EPIPE, et SIGPIPE");
+    close(s[0]);
+    /* Le pair fait `shutdown` : EPIPE, toujours pas de SIGPIPE. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    remplir(s[0]);
+    tubes = 0;
+    pthread_create(&f, NULL, arreter_plus_tard, &s[1]);
+    verifier(send(s[0], "x", 1, 0) == -1 && errno == EPIPE && tubes == 0, "ecrivain bloque, le pair arrete : EPIPE, sans SIGPIPE");
+    pthread_join(f, NULL);
+    close(s[0]);
+    close(s[1]);
+    /* SEQPACKET : ECONNRESET, puis EPIPE. */
+    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, s);
+    remplir(s[0]);
+    pthread_create(&f, NULL, fermer_plus_tard, &s[1]);
+    int e1 = send(s[0], "x", 1, 0) == -1 ? errno : 0;
+    pthread_join(f, NULL);
+    int e2 = send(s[0], "x", 1, 0) == -1 ? errno : 0;
+    verifier(e1 == ECONNRESET && e2 == EPIPE, "SEQPACKET : ECONNRESET, puis EPIPE");
+    close(s[0]);
+    /* SEQPACKET : l'erreur passe avant la file ; un flux, après. */
+    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, s);
+    verifier(send(s[0], "abc", 3, 0) == 3 && send(s[1], "x", 1, 0) == 1, "des messages dans les deux sens");
+    close(s[1]);
+    long r1 = recv(s[0], o, sizeof o, MSG_DONTWAIT);
+    int e = errno;
+    long r2 = recv(s[0], o, sizeof o, MSG_DONTWAIT);
+    long r3 = recv(s[0], o, sizeof o, MSG_DONTWAIT);
+    verifier(r1 == -1 && e == ECONNRESET && r2 == 1 && r3 == 0, "SEQPACKET : l'erreur d'abord, le message, la fin");
+    close(s[0]);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    verifier(send(s[0], "abc", 3, 0) == 3 && send(s[1], "x", 1, 0) == 1, "de meme, sur un flux");
+    close(s[1]);
+    r1 = recv(s[0], o, sizeof o, MSG_DONTWAIT);
+    r2 = recv(s[0], o, sizeof o, MSG_DONTWAIT);
+    e = errno;
+    verifier(r1 == 1 && r2 == -1 && e == ECONNRESET, "un flux : le message, puis l'erreur");
+    close(s[0]);
+    /* DGRAM : l'écriture arrêtée se regarde aussi. */
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, s);
+    shutdown(s[0], SHUT_WR);
+    tubes = 0;
+    verifier(send(s[0], "m", 1, 0) == -1 && errno == EPIPE && tubes == 0, "DGRAM, SHUT_WR : EPIPE, sans SIGPIPE");
+    close(s[0]);
+    close(s[1]);
+    /* DGRAM qui quitte son pair (`unix_dgram_disconnected`) : sa file est jetée, le pair l'apprend. */
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, s);
+    struct sockaddr sans = { .sa_family = AF_UNSPEC };
+    verifier(send(s[1], "m", 1, 0) == 1 && connect(s[0], &sans, sizeof sans) == 0, "un message, puis connect(AF_UNSPEC)");
+    verifier(recv(s[0], o, sizeof o, MSG_DONTWAIT) == -1 && errno == EAGAIN, "sa file est jetee");
+    verifier(send(s[1], "n", 1, 0) == -1 && errno == ECONNRESET, "le pair le sait : ECONNRESET");
+    close(s[0]);
+    close(s[1]);
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, s);
+    verifier(send(s[1], "m", 1, 0) == 1, "un message");
+    close(s[1]);
+    verifier(send(s[0], "n", 1, 0) == -1 && errno == ECONNREFUSED, "le pair mort : ECONNREFUSED");
+    verifier(recv(s[0], o, sizeof o, MSG_DONTWAIT) == -1 && errno == EAGAIN, "et sa file est jetee");
+    close(s[0]);
+    /* `shutdown` d'une écoute : accept finit (la façon ordinaire d'arrêter un fil d'accept). */
+    struct sockaddr_un adr = { .sun_family = AF_UNIX };
+    int l = socket(AF_UNIX, SOCK_STREAM, 0);
+    socklen_t la = sizeof adr;
+    verifier(bind(l, (void *)&adr, offsetof(struct sockaddr_un, sun_path)) == 0 && listen(l, 1) == 0 && getsockname(l, (void *)&adr, &la) == 0, "une ecoute");
+    pthread_create(&f, NULL, arreter_plus_tard, &l);
+    verifier(accept(l, NULL, NULL) == -1 && errno == EINVAL, "un accept qui dort, shutdown : EINVAL");
+    pthread_join(f, NULL);
+    verifier(accept(l, NULL, NULL) == -1 && errno == EINVAL, "un accept bloquant apres : EINVAL");
+    fcntl(l, F_SETFL, O_NONBLOCK);
+    verifier(accept(l, NULL, NULL) == -1 && errno == EAGAIN, "non bloquant : EAGAIN");
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    verifier(connect(c, (void *)&adr, la) == -1 && errno == ECONNREFUSED, "connect : ECONNREFUSED");
+    close(c);
+    close(l);
+    sigaction(SIGPIPE, &ancien, NULL);
+}
+
+/* La lecture d'un flux, côté marque et longueur nulle. */
+static void lectures_qui_attendent(void)
+{
+    int s[2];
+    pthread_t f;
+    char o[8];
+    /* Une longueur nulle n'est pas la fin : elle attend, ou EAGAIN (`sock_rcvlowat` : `v ?: 1`). */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    verifier(recv(s[1], o, 0, MSG_DONTWAIT) == -1 && errno == EAGAIN, "recv de 0 octet, rien : EAGAIN");
+    double t0 = maintenant();
+    pthread_create(&f, NULL, ecrire_ab_plus_tard, &s[0]);
+    verifier(recv(s[1], o, 0, 0) == 0 && maintenant() - t0 > 0.05, "recv de 0 octet : il attend un message");
+    pthread_join(f, NULL);
+    verifier(read(s[1], o, sizeof o) == 2, "les octets restent");
+    /* MSG_PEEK devant la seule marque : il attend, lui aussi. */
+    verifier(send(s[0], "a", 1, MSG_OOB) == 1 && recv(s[1], o, 1, MSG_OOB) == 1, "un urgent lu : reste sa marque");
+    t0 = maintenant();
+    pthread_create(&f, NULL, ecrire_ab_plus_tard, &s[0]);
+    verifier(recv(s[1], o, sizeof o, MSG_PEEK) == 2 && memcmp(o, "ab", 2) == 0 && maintenant() - t0 > 0.05, "MSG_PEEK devant la marque seule : il attend");
+    pthread_join(f, NULL);
+    verifier(recv(s[1], o, sizeof o, 0) == 2, "puis se lit");
+    close(s[0]);
+    close(s[1]);
+    /* La marque seule, à la fermeture : pas des données non lues. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    verifier(send(s[0], "a", 1, MSG_OOB) == 1 && recv(s[1], o, 1, MSG_OOB) == 1, "un urgent lu");
+    close(s[1]);
+    verifier(recv(s[0], o, sizeof o, MSG_DONTWAIT) == 0, "le pair ferme avec sa seule marque : la fin, pas ECONNRESET");
+    close(s[0]);
+    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, s);
+    verifier(send(s[0], "", 0, 0) == 0, "un message SEQPACKET vide");
+    close(s[1]);
+    verifier(recv(s[0], o, sizeof o, MSG_DONTWAIT) == 0, "de meme");
+    close(s[0]);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    verifier(send(s[0], "a", 1, MSG_OOB) == 1 && recv(s[1], o, 1, MSG_OOB) == 1 && send(s[0], "z", 1, 0) == 1, "la marque, et une donnee derriere");
+    close(s[1]);
+    verifier(recv(s[0], o, sizeof o, MSG_DONTWAIT) == -1 && errno == ECONNRESET, "ECONNRESET");
+    close(s[0]);
+    /* epoll sur POLLPRI seul : l'octet urgent le réveille. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    int ep = epoll_create1(0);
+    struct epoll_event ev = { .events = EPOLLPRI, .data.fd = s[1] };
+    epoll_ctl(ep, EPOLL_CTL_ADD, s[1], &ev);
+    pthread_create(&f, NULL, urgent_plus_tard, &s[0]);
+    struct epoll_event re;
+    verifier(epoll_wait(ep, &re, 1, 3000) == 1 && (re.events & EPOLLPRI), "epoll sur EPOLLPRI seul : l'urgent le reveille");
+    pthread_join(f, NULL);
+    close(ep);
+    close(s[0]);
+    close(s[1]);
+    /* MSG_ERRQUEUE : AF_UNIX n'en a pas, et lit. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    verifier(send(s[0], "xy", 2, 0) == 2 && recv(s[1], o, sizeof o, MSG_ERRQUEUE | MSG_DONTWAIT) == 2, "MSG_ERRQUEUE : les octets");
+    close(s[0]);
+    close(s[1]);
+    /* SIOCATMARK : un flux seulement. */
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, s);
+    int v;
+    verifier(ioctl(s[0], SIOCATMARK, &v) == -1 && errno == EOPNOTSUPP, "SIOCATMARK d'un DGRAM : EOPNOTSUPP");
+    close(s[0]);
+    close(s[1]);
+    /* MSG_PEEK va au message qui porte des descripteurs, même sans place pour ses octets. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    int fds[4], n, fl, fichier = fichier_de_test();
+    verifier(write(s[0], "abc", 3) == 3 && envoyer_fds(s[0], "de", 2, &fichier, 1, 0) == 2, "abc, puis de et un descripteur");
+    verifier(recevoir_fds(s[1], o, 3, fds, &n, CMSG_SPACE(4), MSG_PEEK, &fl) == 3 && n == 1, "MSG_PEEK de 3 octets : et le descripteur d'apres");
+    close(fds[0]);
+    verifier(recevoir_fds(s[1], o, 3, fds, &n, CMSG_SPACE(4), 0, &fl) == 3 && n == 0, "la lecture de 3 octets : sans lui");
+    close(fichier);
+    close(s[0]);
+    close(s[1]);
+    /* Une copie qui faute : EFAULT, et rien de consommé d'un flux ; un datagramme est perdu. */
+    long page = sysconf(_SC_PAGESIZE);
+    char *bord = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    mprotect(bord + page, page, PROT_NONE);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, s);
+    static char lot[200];
+    verifier(write(s[0], lot, 200) == 200, "200 octets");
+    v = -1;
+    verifier(recv(s[1], bord + page - 100, 200, MSG_DONTWAIT) == -1 && errno == EFAULT && ioctl(s[1], FIONREAD, &v) == 0 && v == 200, "une faute au milieu : EFAULT, rien de consomme");
+    close(s[0]);
+    close(s[1]);
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, s);
+    verifier(write(s[0], lot, 200) == 200 && recv(s[1], bord + page - 100, 200, MSG_DONTWAIT) == -1 && errno == EFAULT, "un datagramme : EFAULT");
+    verifier(recv(s[1], o, sizeof o, MSG_DONTWAIT) == -1 && errno == EAGAIN, "et perdu");
+    close(s[0]);
+    close(s[1]);
+    munmap(bord, 2 * page);
+}
+
 static void octet_urgent(void)
 {
     int s[2], d[2];
@@ -1354,6 +1586,127 @@ static void octet_urgent(void)
     close(d[1]);
 }
 
+static int ecrivain_fd;
+
+static void *ecrire_plus_tard(void *p)
+{
+    (void)p;
+    usleep(60000);
+    if (write(ecrivain_fd, "XYZ", 3) != 3)
+        verifier(0, "ecrire XYZ");
+    return NULL;
+}
+
+static void pose_peek(int s, int v)
+{
+    setsockopt(s, SOL_SOCKET, SO_PEEK_OFF, &v, sizeof v);
+}
+
+/* SO_PEEK_OFF (`unix_set_peek_off`) : où MSG_PEEK reprend. */
+static void decalage_de_peek(void)
+{
+    int u[2];
+    char o[32];
+    long r;
+    pthread_t t;
+    /* Un flux. */
+    socketpair(AF_UNIX, SOCK_STREAM, 0, u);
+    verifier(option(u[1], SO_PEEK_OFF) == -1, "SO_PEEK_OFF : -1 au depart");
+    verifier(send(u[0], "abcdefgh", 8, 0) == 8, "flux : abcdefgh");
+    pose_peek(u[1], 2);
+    verifier(option(u[1], SO_PEEK_OFF) == 2, "SO_PEEK_OFF : relu");
+    r = recv(u[1], o, 3, MSG_PEEK);
+    verifier(r == 3 && !memcmp(o, "cde", 3) && option(u[1], SO_PEEK_OFF) == 5, "SO_PEEK_OFF 2 : MSG_PEEK cde, il avance");
+    r = recv(u[1], o, 3, MSG_PEEK);
+    verifier(r == 3 && !memcmp(o, "fgh", 3) && option(u[1], SO_PEEK_OFF) == 8, "SO_PEEK_OFF 5 : fgh");
+    r = recv(u[1], o, 4, MSG_DONTWAIT);
+    verifier(r == 4 && !memcmp(o, "abcd", 4) && option(u[1], SO_PEEK_OFF) == 4, "une lecture part de la tete, et le fait reculer");
+    r = recv(u[1], o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r < 0 && errno == EAGAIN && option(u[1], SO_PEEK_OFF) == 4, "SO_PEEK_OFF au bout : EAGAIN");
+    /* Il attend ce qui viendra. */
+    ecrivain_fd = u[0];
+    pthread_create(&t, NULL, ecrire_plus_tard, NULL);
+    r = recv(u[1], o, 10, MSG_PEEK);
+    verifier(r == 3 && !memcmp(o, "XYZ", 3) && option(u[1], SO_PEEK_OFF) == 7, "SO_PEEK_OFF au bout : MSG_PEEK attend la suite");
+    pthread_join(t, NULL);
+    /* À cheval sur plusieurs messages, en tombant au milieu d'un autre. */
+    pose_peek(u[1], 6);
+    r = recv(u[1], o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r == 1 && o[0] == 'Z', "SO_PEEK_OFF 6 : a cheval, le dernier octet");
+    /* Négatif : à la tête, sans y toucher. */
+    pose_peek(u[1], -5);
+    verifier(option(u[1], SO_PEEK_OFF) == -5, "SO_PEEK_OFF negatif : relu tel quel");
+    r = recv(u[1], o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r == 7 && !memcmp(o, "efghXYZ", 7) && option(u[1], SO_PEEK_OFF) == -5, "SO_PEEK_OFF negatif : MSG_PEEK a la tete");
+    recv(u[1], o, 2, MSG_DONTWAIT);
+    verifier(option(u[1], SO_PEEK_OFF) == -5, "SO_PEEK_OFF negatif : une lecture n'y touche pas");
+    /* Loin devant ; et la fin de l'autre côté : 0. */
+    pose_peek(u[1], 100);
+    r = recv(u[1], o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r < 0 && errno == EAGAIN && option(u[1], SO_PEEK_OFF) == 100, "SO_PEEK_OFF loin devant : EAGAIN");
+    close(u[0]);
+    r = recv(u[1], o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r == 0, "SO_PEEK_OFF loin devant, l'autre ferme : 0");
+    close(u[1]);
+    /* Des datagrammes : le décalage passe d'un message à l'autre. */
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, u);
+    verifier(send(u[0], "abcd", 4, 0) == 4 && send(u[0], "efgh", 4, 0) == 4, "DGRAM : deux messages");
+    pose_peek(u[1], 1);
+    r = recv(u[1], o, 2, MSG_PEEK);
+    verifier(r == 2 && !memcmp(o, "bc", 2) && option(u[1], SO_PEEK_OFF) == 3, "DGRAM, SO_PEEK_OFF 1 : bc, coupe");
+    struct msghdr m = { 0 };
+    struct iovec v = { o, 2 };
+    m.msg_iov = &v;
+    m.msg_iovlen = 1;
+    pose_peek(u[1], 1);
+    r = recvmsg(u[1], &m, MSG_PEEK);
+    verifier(r == 2 && (m.msg_flags & MSG_TRUNC), "DGRAM, moins de place que ce qui reste : MSG_TRUNC");
+    pose_peek(u[1], 1);
+    v.iov_len = 3;
+    m.msg_flags = 0;
+    r = recvmsg(u[1], &m, MSG_PEEK);
+    verifier(r == 3 && !(m.msg_flags & MSG_TRUNC), "DGRAM, juste la place de ce qui reste : pas MSG_TRUNC");
+    pose_peek(u[1], 3);
+    r = recv(u[1], o, 10, MSG_PEEK);
+    verifier(r == 1 && o[0] == 'd' && option(u[1], SO_PEEK_OFF) == 4, "DGRAM, SO_PEEK_OFF 3 : le reste du premier");
+    r = recv(u[1], o, 10, MSG_PEEK);
+    verifier(r == 4 && !memcmp(o, "efgh", 4) && option(u[1], SO_PEEK_OFF) == 8, "DGRAM, SO_PEEK_OFF 4 : le second");
+    pose_peek(u[1], 5);
+    r = recv(u[1], 0, 0, MSG_PEEK | MSG_TRUNC);
+    verifier(r == 3, "DGRAM, MSG_TRUNC : la longueur, sans ce qui est passe");
+    pose_peek(u[1], 8);
+    r = recv(u[1], o, 10, MSG_PEEK | MSG_DONTWAIT);
+    verifier(r < 0 && errno == EAGAIN && option(u[1], SO_PEEK_OFF) == 8, "DGRAM, au bout : EAGAIN");
+    r = recv(u[1], o, 10, 0);
+    verifier(r == 4 && !memcmp(o, "abcd", 4) && option(u[1], SO_PEEK_OFF) == 4, "DGRAM : une lecture recule de tout le message");
+    /* Il attend le suivant. */
+    ecrivain_fd = u[0];
+    pthread_create(&t, NULL, ecrire_plus_tard, NULL);
+    r = recv(u[1], o, 10, MSG_PEEK);
+    verifier(r == 3 && !memcmp(o, "XYZ", 3), "DGRAM, au bout : MSG_PEEK attend le suivant");
+    pthread_join(t, NULL);
+    close(u[0]);
+    close(u[1]);
+    /* Un message vide se voit une fois. */
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, u);
+    verifier(send(u[0], "", 0, 0) == 0 && send(u[0], "a", 1, 0) == 1, "DGRAM : un vide, puis a");
+    pose_peek(u[1], 0);
+    r = recv(u[1], o, 10, MSG_PEEK);
+    verifier(r == 0, "DGRAM, SO_PEEK_OFF 0 : le message vide, une fois");
+    r = recv(u[1], o, 10, MSG_PEEK);
+    verifier(r == 1 && o[0] == 'a', "DGRAM, SO_PEEK_OFF 0 : puis le suivant");
+    close(u[0]);
+    close(u[1]);
+    /* SEQPACKET de même. */
+    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, u);
+    verifier(send(u[0], "abcd", 4, 0) == 4, "SEQPACKET : abcd");
+    pose_peek(u[1], 1);
+    r = recv(u[1], o, 10, MSG_PEEK);
+    verifier(r == 3 && !memcmp(o, "bcd", 3) && option(u[1], SO_PEEK_OFF) == 4, "SEQPACKET, SO_PEEK_OFF 1 : bcd");
+    close(u[0]);
+    close(u[1]);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -1381,6 +1734,9 @@ int main(void)
     ramasse_miettes();
     droits_du_message();
     octet_urgent();
+    attentes();
+    lectures_qui_attendent();
+    decalage_de_peek();
     fils();
     if (chdir("/") < 0 || rmdir(dossier) < 0)
         verifier(0, "le dossier efface");
