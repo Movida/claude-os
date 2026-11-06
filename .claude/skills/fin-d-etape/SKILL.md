@@ -533,3 +533,27 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   Windows (pas toujours visible), et un redémarrage de 1Password l'a
   réparée quand elle ne venait plus. Ses messages n'arrivent qu'à la fin
   d'un tour : si la signature échoue, finir le tour pour lire sa réponse.
+
+## Pièges rencontrés en finissant 6h (6 novembre 2026)
+
+- **`cargo mutants` sur un gros fichier** (1 467 mutants, 15 s chacun) :
+  `--shard k/n` coupe en parts de moins de 2 h, la limite d'une commande en
+  arrière-plan. Une part coupée ne le dit pas dans ses listes : comparer
+  `mutants.json` à caught, missed, timeout et unviable. Pour repasser
+  seulement les survivants, sur les seuls tests internes (quelques secondes
+  au lieu d'heures) : `--iterate`, et un `caught.txt` écrit à la main qui
+  contient toute la liste (`--list`) sauf eux. Un mutant s'y reconnaît à son
+  fichier, sa ligne et sa colonne : une ligne ajoutée en tête du fichier les
+  décale tous.
+- **Un mutant équivalent, c'est parfois du code qui ne sert à rien** : à
+  lire comme tel, avant de le classer. Noter pour chacun pourquoi il est
+  équivalent, et dire que ce n'est prouvé que par la lecture.
+- **Un instantané par `git add -A` prend tout ce qui traîne** : deux
+  binaires compilés à la main par un relecteur (`linux/tcp`, `linux/unix`)
+  sont entrés ainsi dans l'arbre à replier. Relire la liste des fichiers
+  nouveaux (`git status --short | grep '^??'`) avant chaque instantané.
+- **Le fil qui reprend** repart d'un arbre sauvé, pas de sa mémoire :
+  l'arbre en commit de plomberie sur une branche locale (jamais poussée),
+  puis `git restore --source=<arbre> --worktree -- .` dans le worktree du
+  nouveau fil, et une comparaison `diff -rq` avec l'ancien, qui reste en
+  lecture seule jusqu'au tag.
