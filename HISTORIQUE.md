@@ -412,6 +412,8 @@ D'où QEMU 8.2.10 compilé dans le Dockerfile et la CI (`.devcontainer/construir
 - `gestionnaires`, une erreur du test : il copiait 1792 octets du cadre, et MAGIC2 est plus loin dès qu'il y a PKRU ou AVX-512 ; les composants de XSAVE suivent aussi le processeur ;
 - `tubes` : O_NOTIFICATION_PIPE crée un tube là où CONFIG_WATCH_QUEUE est compilé (WSL : ENOPKG, comme nous) ;
 - `clone` : une adresse de TLS interdite à quatre niveaux, permise à cinq (LA57).
+- `attente`, vu au run suivant : `select` au-delà de la table des descripteurs supposait 128 cases, alors qu'elle vient aussi des ancêtres. Un numéro 300 hérité le reproduit ici ; que la CI en hérite ainsi se déduit, sans mesure. Sur l'hôte, le test se fait désormais dans un petit-fils à table neuve ;
+- `systeme` : « aucune faute majeure » comptait aussi les pages du programme lui-même, s'il n'est pas encore dans le cache (vu après le redémarrage du conteneur, reproduit en vidant le cache de ce fichier). Seul notre noyau, où tout est en mémoire, y est tenu.
 
 Dans notre noyau (`/etc/bonjour.txt` le dit à ces programmes), chaque vérification reste aussi stricte qu'avant ; seul l'hôte a droit à la variante. La leçon : regarder la CI après chaque push (`fin-d-etape`).
 

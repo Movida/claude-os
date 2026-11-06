@@ -575,5 +575,10 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   s'arrêter, montre tout d'un coup. Pour ressembler à la CI : l'utilisateur 1000,
   les fichiers à lui, la sortie dans un tube qu'il a créé, /tmp sur la même
   partition que la racine, un /etc/hosts.
+- **Le témoin n'imite pas tout** : sous `/init`, rien n'est hérité, et le cache
+  des pages est plein. Deux conditions de plus, à poser avant `verifier.sh` :
+  `exec 300</dev/null` (la table de descripteurs vient des ancêtres), et
+  `dd if=PROGRAMME iflag=nocache count=0` après un `sync` (un programme absent
+  du cache prend des fautes majeures).
 - **Une fonction entre le test et `errno`** l'écrase : `access(...) && errno ==
   ENOMEM` lisait ENOENT. Garder `errno` dans une variable d'abord.

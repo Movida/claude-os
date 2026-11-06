@@ -32,6 +32,7 @@
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <ucontext.h>
 #include <unistd.h>
@@ -308,6 +309,23 @@ static long brut_select(int n, void *l, void *e, void *x, struct timeval *tv)
     return syscall(SYS_select, n, l, e, x, tv);
 }
 
+/* Au-delà de la table des descripteurs de Linux (64 cases, puis des puissances de deux : un numéro 100
+ * pris l'a fait passer à 128) : les bits ne sont ni lus ni écrits. */
+static int select_au_dela_de_la_table(int pret)
+{
+    dup2(pret, 100);
+    close(100);
+    uint64_t grand[32];
+    memset(grand, 0, sizeof grand);
+    grand[pret / 64] |= 1ull << (pret % 64);
+    grand[200 / 64] |= 1ull << (200 % 64);
+    grand[1500 / 64] |= 1ull << (1500 % 64);
+    struct timeval tv = { 0, 0 };
+    int r = brut_select(2048, grand, NULL, NULL, &tv);
+    return r == 1 && grand[pret / 64] == 1ull << (pret % 64) && grand[200 / 64] == 1ull << (200 % 64)
+           && grand[1500 / 64] == 1ull << (1500 % 64);
+}
+
 static void selects(void)
 {
     int pret = eventfd(1, 0), vide = eventfd(0, 0), chemin = open("/tmp", O_PATH);
@@ -352,21 +370,30 @@ static void selects(void)
     verifier(r == 0 && duree >= 100 && duree < 900 && tv.tv_sec == 0 && tv.tv_usec == 0,
              "select, {-1 s, 1 100 000 us} : 0,1 s (les microsecondes en trop comptent comme des secondes), le reste ecrit a zero");
 
-    /* Au-delà de la table des descripteurs de Linux (64 cases, puis des
-     * puissances de deux : un numéro 100 pris l'a fait passer à 128) : les
-     * bits ne sont ni lus ni écrits. */
-    dup2(pret, 100);
-    close(100);
-    uint64_t grand[32];
-    memset(grand, 0, sizeof grand);
-    grand[pret / 64] |= 1ull << (pret % 64);
-    grand[200 / 64] |= 1ull << (200 % 64);
-    grand[1500 / 64] |= 1ull << (1500 % 64);
-    tv = (struct timeval){ 0, 0 };
-    r = brut_select(2048, grand, NULL, NULL, &tv);
-    verifier(r == 1 && grand[pret / 64] == 1ull << (pret % 64) && grand[200 / 64] == 1ull << (200 % 64)
-             && grand[1500 / 64] == 1ull << (1500 % 64),
-             "select au-dela de la table des descripteurs (128 cases) : ces bits ni lus ni ecrits");
+    /* Chez nous, la table est celle que le programme a faite. Sur l'hôte, elle vient aussi de ses
+     * ancêtres : un numéro hérité au-delà de 128 l'a déjà agrandie, et ces bits seraient lus (mesuré :
+     * un 300 hérité y suffit). Une table neuve, donc : fork la taille d'après ce qui est ouvert. Un
+     * fils ne garde que 0, 1, 2 et le descripteur prêt, et c'est son fils qui fait le test. */
+    int au_dela;
+    if (access("/etc/bonjour.txt", F_OK) == 0) {
+        au_dela = select_au_dela_de_la_table(pret);
+    } else {
+        int etat;
+        pid_t fils = fork();
+        if (fils == 0) {
+            dup2(pret, 10);
+            syscall(SYS_close_range, 3, 9, 0);
+            syscall(SYS_close_range, 11, ~0u, 0);
+            pid_t petit_fils = fork();
+            if (petit_fils == 0)
+                _exit(select_au_dela_de_la_table(10) ? 0 : 1);
+            waitpid(petit_fils, &etat, 0);
+            _exit(WIFEXITED(etat) && WEXITSTATUS(etat) == 0 ? 0 : 1);
+        }
+        waitpid(fils, &etat, 0);
+        au_dela = WIFEXITED(etat) && WEXITSTATUS(etat) == 0;
+    }
+    verifier(au_dela, "select au-dela de la table des descripteurs (128 cases) : ces bits ni lus ni ecrits");
     close(pret);
     close(vide);
     close(chemin);
