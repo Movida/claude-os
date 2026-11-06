@@ -194,6 +194,27 @@ impl Congestion {
         self.initialise = true;
     }
 
+    /// L'algorithme a-t-il été initialisé (pour les tests de `tcp.rs`) ?
+    #[cfg(test)]
+    pub(super) fn initialise(&self) -> bool {
+        self.initialise
+    }
+
+    /// La cwnd a-t-elle arrêté l'émission (pour les tests de `tcp.rs`) ?
+    #[cfg(test)]
+    pub(super) fn limitee(&self) -> bool {
+        self.limitee
+    }
+
+    /// Le début de l'époque de CUBIC (pour les tests de `tcp.rs`).
+    #[cfg(test)]
+    pub(super) fn epoque(&mut self) -> Option<&mut u32> {
+        match &mut self.algo {
+            Algo::Cubic(c) => Some(&mut c.debut_epoque),
+            Algo::Reno => None,
+        }
+    }
+
     /// L'établissement : initialisé, si TCP_CONGESTION ne l'a pas déjà fait
     /// (`tcp_init_transfer`).
     pub fn etablir(&mut self, snd_nxt: u32, maintenant: u64) {
@@ -391,5 +412,296 @@ impl Congestion {
         } else {
             self.ssthresh.max((self.cwnd >> 1) + (self.cwnd >> 2))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: u64 = 1_000_000;
+    const H: u64 = 7_000 * MS;
+
+    fn reno() -> Congestion {
+        let mut c = Congestion::new();
+        c.choisir(Controle::Reno, false, 0, 0);
+        c
+    }
+
+    fn cubic(c: &Congestion) -> &Cubic {
+        match &c.algo {
+            Algo::Cubic(x) => x,
+            Algo::Reno => panic!("pas CUBIC"),
+        }
+    }
+
+    #[test]
+    fn le_demarrage_lent_s_arrete_au_seuil() {
+        let mut c = reno();
+        c.cwnd = 10;
+        c.ssthresh = 10;
+        assert!(!c.demarrage_lent());
+        c.ssthresh = 11;
+        assert!(c.demarrage_lent());
+    }
+
+    /// `tcp_init_transfer` : une fois, si TCP_CONGESTION ne l'a pas fait.
+    #[test]
+    fn l_etablissement_initialise_une_fois() {
+        let mut c = Congestion::new();
+        c.etablir(100, H);
+        assert_eq!(cubic(&c).fin_tour, 100);
+        assert_eq!(c.instant, H);
+        c.etablir(200, H + 1);
+        assert_eq!(cubic(&c).fin_tour, 100, "pas deux fois");
+        assert_eq!(c.instant, H + 1);
+        // Déjà fait par `choisir`, sur une connexion ouverte.
+        let mut c = reno();
+        c.choisir(Controle::Cubic, true, 300, H);
+        c.etablir(400, H);
+        assert_eq!(cubic(&c).fin_tour, 300);
+    }
+
+    /// `cubictcp_state` : seule la perte oublie la courbe.
+    #[test]
+    fn la_perte_oublie_la_courbe() {
+        let mut c = Congestion::new();
+        c.cwnd = 100;
+        assert_eq!(c.seuil(), 70);
+        assert_eq!(cubic(&c).wmax, 100);
+        c.changer_phase(Phase::Reprise, 50, H);
+        assert_eq!(cubic(&c).wmax, 100);
+        assert_eq!(c.phase, Phase::Reprise);
+        c.changer_phase(Phase::Perte, 50, H);
+        assert_eq!(cubic(&c).wmax, 0);
+        assert_eq!(cubic(&c).fin_tour, 50);
+        assert_eq!(c.phase, Phase::Perte);
+    }
+
+    /// Ce que CUBIC reçoit de la connexion.
+    #[test]
+    fn ce_que_cubic_recoit() {
+        let mut c = Congestion::new();
+        c.initialiser(0, H);
+        // Le silence décale la courbe, si elle a commencé.
+        if let Algo::Cubic(x) = &mut c.algo {
+            x.debut_epoque = 1000;
+        }
+        c.depart(H, H + 40 * MS);
+        assert_eq!(cubic(&c).debut_epoque, 1010);
+        // Le RTT, en µs ; pas de mesure : rien.
+        c.segments_acquittes(None, 0, 0, H);
+        assert_eq!(cubic(&c).delai_min, 0);
+        if let Algo::Cubic(x) = &mut c.algo {
+            x.debut_epoque = 0;
+        }
+        c.segments_acquittes(Some(5 * MS), 0, 0, H);
+        assert_eq!(cubic(&c).delai_min, 5000);
+    }
+
+    /// HyStart dit de quitter le démarrage lent : le seuil devient la cwnd.
+    #[test]
+    fn hystart_pose_le_seuil() {
+        let mut c = Congestion::new();
+        c.initialiser(0, H);
+        c.cwnd = 100;
+        c.segments_acquittes(Some(MS), 0, 0, H);
+        let mut h = H;
+        for k in 1..=9u32 {
+            h += 100 * MS;
+            c.segments_acquittes(Some(50 * MS), k, k + 100, h);
+        }
+        assert_eq!(c.ssthresh, 100);
+    }
+
+    /// `tcp_update_pacing_rate`.
+    #[test]
+    fn le_debit_calcule() {
+        let mut c = reno();
+        c.cwnd = 10;
+        c.ssthresh = 20;
+        // À la moitié du seuil tout juste : 120 %.
+        c.maj_pacing(1000, 0, 8000);
+        assert_eq!(c.pacing, 1000 * (10_000 << 3) * 120 * 10 / 8000);
+        c.cwnd = 9;
+        c.maj_pacing(1000, 0, 8000);
+        assert_eq!(c.pacing, 1000 * (10_000 << 3) * 200 * 9 / 8000);
+        // Plus en vol que la cwnd ; sans mesure, pas de division.
+        c.maj_pacing(1000, 30, 8000);
+        assert_eq!(c.pacing, 1000 * (10_000 << 3) * 200 * 30 / 8000);
+        c.maj_pacing(1000, 0, 0);
+        assert_eq!(c.pacing, 1000 * (10_000 << 3) * 200 * 9);
+    }
+
+    #[test]
+    fn la_cwnd_a_t_elle_servi() {
+        let mut c = reno();
+        c.cwnd = 10;
+        c.ssthresh = 100;
+        c.max_sortis = 5;
+        assert!(!c.a_servi(), "le double de ce qui a été en vol, tout juste");
+        c.max_sortis = 6;
+        assert!(c.a_servi());
+        c.ssthresh = 10;
+        assert!(!c.a_servi(), "pas en démarrage lent");
+        c.limitee = true;
+        assert!(c.a_servi());
+    }
+
+    /// `tcp_cwnd_validate` : ce qui se retient pour l'aller-retour.
+    #[test]
+    fn valider_retient_l_aller_retour() {
+        let mut c = reno();
+        c.cwnd = 100;
+        c.ssthresh = 10;
+        c.fin_usage = 1000;
+        c.max_sortis = 5;
+        // Pendant l'aller-retour, sans être limité : seulement plus en vol qu'avant.
+        c.valider(false, 5, 500, 2000, 1 << 40, false, H);
+        assert_eq!((c.max_sortis, c.fin_usage), (5, 1000));
+        c.valider(false, 6, 500, 2000, 1 << 40, false, H);
+        assert_eq!((c.max_sortis, c.fin_usage), (6, 2000));
+        // Limitée : retenu, même pour moins.
+        c.valider(true, 3, 500, 3000, 1 << 40, false, H);
+        assert_eq!((c.max_sortis, c.fin_usage, c.limitee), (3, 3000, true));
+        // Déjà limitée : plus en vol ne l'efface pas.
+        c.valider(false, 9, 500, 4000, 1 << 40, false, H);
+        assert_eq!((c.max_sortis, c.fin_usage, c.limitee), (3, 3000, true));
+        // L'aller-retour fini : repart de ce qu'il y a.
+        c.valider(false, 2, 3000, 5000, 1 << 40, false, H);
+        assert_eq!((c.max_sortis, c.fin_usage, c.limitee), (2, 5000, false));
+    }
+
+    /// `tcp_cwnd_validate` : elle a servi : rien à faire ; sinon, le temps d'un RTO, elle redescend.
+    #[test]
+    fn valider_rend_si_elle_a_servi() {
+        let mut c = reno();
+        c.cwnd = 100;
+        c.ssthresh = 10;
+        c.fin_usage = 1000;
+        c.instant = H;
+        assert!(c.valider(false, 20, 500, 2000, 1000, true, H));
+        assert_eq!(c.utilisee, 20);
+        assert!(c.valider(false, 20, 500, 2000, 1000, true, H + 999));
+        assert_eq!(c.cwnd, 100, "pas encore un RTO");
+        assert!(c.valider(false, 20, 500, 2000, 1000, true, H + 1000));
+        assert_eq!(c.cwnd, 60);
+        assert_eq!(c.ssthresh, 75, "le seuil garde la trace");
+        assert_eq!(c.utilisee, 0);
+        assert_eq!(c.instant, H + 1000);
+        // Limitée : elle a servi.
+        assert!(!c.valider(true, 20, 500, 2000, 1000, true, H + 2000));
+        assert_eq!(c.instant, H + 2000);
+        assert_eq!(c.utilisee, 0);
+    }
+
+    /// `tcp_cwnd_application_limited`.
+    #[test]
+    fn limitee_par_le_programme_() {
+        let mut c = reno();
+        c.cwnd = 100;
+        c.ssthresh = 10;
+        c.utilisee = 40;
+        c.limitee_par_le_programme(false, H);
+        assert_eq!((c.cwnd, c.utilisee, c.instant), (100, 40, H), "pas relâchable");
+        c.limitee_par_le_programme(true, H + 1);
+        assert_eq!((c.cwnd, c.utilisee, c.instant), (70, 0, H + 1));
+        // Jamais sous la fenêtre de départ ; et à elle : rien, pas même le seuil.
+        c.cwnd = 10;
+        c.ssthresh = 2;
+        c.limitee_par_le_programme(true, H);
+        assert_eq!((c.cwnd, c.ssthresh), (10, 2));
+        c.cwnd = 12;
+        c.limitee_par_le_programme(true, H);
+        assert_eq!(c.cwnd, 11);
+    }
+
+    /// `tcp_slow_start` et `tcp_cong_avoid_ai`.
+    #[test]
+    fn croitre_() {
+        let mut c = reno();
+        c.limitee = true;
+        c.cwnd = 10;
+        c.ssthresh = 10;
+        c.croitre(3, H);
+        assert_eq!((c.cwnd, c.compte, c.instant), (10, 3, H));
+        c.croitre(7, H);
+        assert_eq!((c.cwnd, c.compte), (11, 0));
+        // Plusieurs segments d'un coup.
+        c.cwnd = 10;
+        c.compte = 0;
+        c.croitre(25, H);
+        assert_eq!((c.cwnd, c.compte), (12, 5));
+        // Déjà un compte plein : un segment d'abord, le compte repart.
+        c.cwnd = 10;
+        c.compte = 11;
+        c.croitre(1, H);
+        assert_eq!((c.cwnd, c.compte), (11, 1));
+        c.cwnd = 10;
+        c.compte = 10;
+        c.croitre(1, H);
+        assert_eq!((c.cwnd, c.compte), (11, 1));
+        // Le démarrage lent, jusqu'au seuil ; le reste compte après lui.
+        c.cwnd = 10;
+        c.ssthresh = 12;
+        c.compte = 0;
+        c.croitre(5, H);
+        assert_eq!((c.cwnd, c.compte), (12, 3));
+        c.cwnd = 10;
+        c.ssthresh = 15;
+        c.compte = 0;
+        c.croitre(5, H);
+        assert_eq!((c.cwnd, c.compte), (15, 0));
+        // Elle n'a pas servi : rien, sauf l'heure.
+        c.limitee = false;
+        c.max_sortis = 0;
+        c.cwnd = 10;
+        c.croitre(5, H + 1);
+        assert_eq!((c.cwnd, c.instant), (10, H + 1));
+    }
+
+    /// `tcp_cwnd_restart` : divisée par deux par RTO écoulé.
+    #[test]
+    fn redemarrer_() {
+        let mut c = reno();
+        c.cwnd = 80;
+        c.ssthresh = 2;
+        c.utilisee = 5;
+        c.redemarrer(3000, 1000, H);
+        assert_eq!((c.cwnd, c.ssthresh, c.utilisee, c.instant), (20, 60, 0, H));
+        c.cwnd = 80;
+        c.redemarrer(3001, 1000, H);
+        assert_eq!(c.cwnd, 10);
+        // Jamais sous la fenêtre de départ, ni plus haut qu'elle n'était.
+        c.cwnd = 12;
+        c.redemarrer(1 << 40, 1000, H);
+        assert_eq!(c.cwnd, 10);
+        c.cwnd = 4;
+        c.redemarrer(1 << 40, 1000, H);
+        assert_eq!(c.cwnd, 4);
+    }
+
+    #[test]
+    fn le_seuil_courant() {
+        let mut c = reno();
+        c.cwnd = 100;
+        c.ssthresh = 10;
+        assert_eq!(c.ssthresh_courant(), 75);
+        c.ssthresh = 90;
+        assert_eq!(c.ssthresh_courant(), 90);
+        c.ssthresh = 10;
+        c.phase = Phase::Reduction;
+        assert_eq!(c.ssthresh_courant(), 10);
+        c.phase = Phase::Reprise;
+        assert_eq!(c.ssthresh_courant(), 10);
+    }
+
+    /// `tp->snd_cwnd_cnt = 0`.
+    #[test]
+    fn remettre_le_compte() {
+        let mut c = reno();
+        c.compte = 7;
+        c.remettre_compte();
+        assert_eq!(c.compte, 0);
     }
 }

@@ -118,3 +118,170 @@ impl<P: Charge> Tcb<P> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::essais::*;
+    use super::super::Etat;
+    use super::*;
+
+    #[test]
+    fn la_carte_trop_pleine_aux_bornes() {
+        let mut c = etablie(true);
+        en_vol(&mut c, 2);
+        c.sans_file = false;
+        c.cc.pacing = 0;
+        let n = 1000;
+        let v = n + 96 + 32 + 576;
+        // `tcp_small_queue_check` : max(2 * truesize, débit >> 10), au plus 4 Mio, << facteur.
+        for (en_file, facteur, oui) in [(2 * v, 0, false), (2 * v + 1, 0, true), (4 * v, 1, false), (4 * v + 1, 1, true)] {
+            c.en_file = en_file;
+            c.etrangle = false;
+            assert_eq!(c.carte_trop_pleine(n, facteur), oui, "{en_file} {facteur}");
+            assert_eq!(c.etrangle, oui);
+        }
+        c.cc.pacing = 10_000 << 10;
+        c.en_file = 10_000;
+        assert!(!c.carte_trop_pleine(n, 0));
+        c.en_file = 10_001;
+        assert!(c.carte_trop_pleine(n, 0));
+        c.cc.pacing = u64::MAX >> 1;
+        c.en_file = 4 << 20;
+        assert!(!c.carte_trop_pleine(n, 0));
+        c.en_file = (4 << 20) + 1;
+        assert!(c.carte_trop_pleine(n, 0));
+        // Un très gros segment ne fait pas monter le plafond.
+        c.cc.pacing = 0;
+        assert!(c.carte_trop_pleine(5 << 20, 0));
+        // Seul en vol : il part toujours. Sans file : jamais de limite.
+        c.file.truncate(1);
+        c.en_file = 1 << 30;
+        c.etrangle = false;
+        assert!(!c.carte_trop_pleine(n, 0));
+        assert!(!c.etrangle);
+        let mut d = etablie(true);
+        en_vol(&mut d, 2);
+        d.sans_file = true;
+        d.en_file = 1 << 30;
+        assert!(!d.carte_trop_pleine(n, 0));
+    }
+
+    #[test]
+    fn compter_un_envoi() {
+        let mut c = etablie(true);
+        let a = c.compter_envoi(100);
+        assert_eq!(c.compter_envoi(100), a + 1, "des numéros qui se suivent");
+        assert_eq!(c.en_file, 0, "sans file, rien de compté");
+        c.sans_file = false;
+        c.compter_envoi(100);
+        assert_eq!(c.en_file, 100 + 96 + 32 + 576);
+    }
+
+    #[test]
+    fn le_but_d_ecriture() {
+        let mut c = etablie(true);
+        c.mss = 100;
+        // `tcp_bound_to_half_wnd` : au-delà de 536, la moitié de la plus grande fenêtre.
+        for (fenetre, but) in [(536, 500), (537, 200), (0, 65_200), (10_000, 5_000), (130_430, 65_200), (130_600, 65_200), (50, 50)] {
+            c.max_fenetre = fenetre;
+            assert_eq!(c.but_d_ecriture(), but, "fenetre {fenetre}");
+        }
+        c.mss = 1;
+        c.max_fenetre = 0;
+        assert_eq!(c.but_d_ecriture(), 65_215);
+        // Au plus 65 535 segments, si petit soit le segment : sans objet ici, GSO_MAX les borne.
+        assert!(c.but_d_ecriture() <= 65_535);
+    }
+
+    #[test]
+    fn l_autocork() {
+        let mut c = etablie(true);
+        en_vol(&mut c, 1);
+        c.sans_file = false;
+        c.max_fenetre = 1 << 20;
+        // Ce qui reste de l'écriture, après ce qui est parti.
+        c.octets_envoi = c.snd_nxt.wrapping_sub(c.seq_envoi) as usize + 300;
+        let seuil = 300 + 96 + 32 + 576;
+        c.en_file = seuil;
+        c.ecrit = true;
+        assert_eq!(c.autocork(), 0);
+        assert!(!c.etrangle);
+        assert!(!c.ecrit, "une seule fois par écriture");
+        c.en_file = seuil + 1;
+        c.ecrit = true;
+        assert_eq!(c.autocork(), 300);
+        assert!(c.etrangle);
+        assert_eq!(c.autocork(), 0, "déjà pris");
+        // Un multiple exact du but : tout part, même si la carte est bien occupée.
+        let but = c.but_d_ecriture();
+        c.octets_envoi = c.snd_nxt.wrapping_sub(c.seq_envoi) as usize + but;
+        c.en_file = 1 << 20;
+        c.etrangle = false;
+        c.ecrit = true;
+        assert_eq!(c.autocork(), 0);
+        assert!(!c.etrangle);
+        // Plus d'un but : seul ce qui dépasse attend.
+        c.octets_envoi = c.snd_nxt.wrapping_sub(c.seq_envoi) as usize + but + 10;
+        c.en_file = 10_000;
+        c.ecrit = true;
+        assert_eq!(c.autocork(), 10);
+        // Rien en vol, ou pas de file : rien à attendre.
+        c.ecrit = true;
+        c.sans_file = true;
+        assert_eq!(c.autocork(), 0);
+        c.sans_file = false;
+        c.ecrit = true;
+        c.file.clear();
+        assert_eq!(c.autocork(), 0);
+    }
+
+    /// `skb_still_in_host_queue` : son dernier envoi n'est pas encore rendu.
+    #[test]
+    fn encore_dans_la_carte_() {
+        let mut c = etablie(true);
+        en_vol(&mut c, 1);
+        c.sans_file = false;
+        c.file[0].numero = 10;
+        c.poser_en_file(5000, 9);
+        assert_eq!(c.en_file, 5000);
+        assert!(c.encore_dans_la_carte(0));
+        assert!(c.prendre_etrangle());
+        assert!(!c.prendre_etrangle(), "lu une fois");
+        c.poser_en_file(0, 10);
+        assert!(!c.encore_dans_la_carte(0));
+        assert!(!c.prendre_etrangle());
+        c.poser_en_file(0, 11);
+        assert!(!c.encore_dans_la_carte(0));
+        c.sans_file = true;
+        c.poser_en_file(0, 9);
+        assert!(!c.encore_dans_la_carte(0));
+    }
+
+    #[test]
+    fn la_fin_d_emission() {
+        let mut c = etablie(true);
+        en_vol(&mut c, 3);
+        c.lost_out = 1;
+        c.retrans_out = 0;
+        c.cc.cwnd = c.paquets_en_vol() + 1;
+        c.rexmit = Rexmit::Rien;
+        c.fin_d_emission();
+        assert_eq!(c.rexmit, Rexmit::Perdus);
+        // Tout ce qui est perdu est déjà renvoyé.
+        c.rexmit = Rexmit::Rien;
+        c.retrans_out = 1;
+        c.cc.cwnd = c.paquets_en_vol() + 1;
+        c.fin_d_emission();
+        assert_eq!(c.rexmit, Rexmit::Rien);
+        // La cwnd pleine.
+        c.retrans_out = 0;
+        c.cc.cwnd = c.paquets_en_vol();
+        c.fin_d_emission();
+        assert_eq!(c.rexmit, Rexmit::Rien);
+        // La connexion est finie.
+        c.cc.cwnd = c.paquets_en_vol() + 1;
+        c.etat = Etat::Fermee;
+        c.fin_d_emission();
+        assert_eq!(c.rexmit, Rexmit::Rien);
+    }
+}

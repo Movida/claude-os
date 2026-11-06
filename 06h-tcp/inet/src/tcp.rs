@@ -92,6 +92,18 @@ mod carte;
 mod congestion;
 mod cubic;
 mod debit;
+#[cfg(test)]
+mod essais;
+#[cfg(test)]
+mod essais_api;
+#[cfg(test)]
+mod essais_segments;
+#[cfg(test)]
+mod essais_ack;
+#[cfg(test)]
+mod essais_minuteurs;
+#[cfg(test)]
+mod essais_emission;
 mod hors_ordre;
 mod minmax;
 mod reception;

@@ -296,3 +296,76 @@ impl<P: Charge> Tcb<P> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::essais::*;
+    use super::*;
+
+    /// `tcp_compute_delivery_rate` : sans durée, ou sans livraison, pas de débit (et pas de division).
+    #[test]
+    fn un_debit_sans_duree() {
+        let mut m = Mesures::new();
+        m.rate_livres = 3;
+        m.rate_intervalle = 0;
+        assert_eq!(m.debit(1000), 0);
+        m.rate_livres = 0;
+        m.rate_intervalle = 1000;
+        assert_eq!(m.debit(1000), 0);
+        m.rate_livres = 3;
+        assert_eq!(m.debit(1000), 3_000_000);
+    }
+
+    /// Plus court qu'un aller-retour : pas d'échantillon ; tout juste un aller-retour : oui.
+    #[test]
+    fn un_echantillon_plus_court_qu_un_aller_retour() {
+        let prete = || {
+            let mut c = etablie(true);
+            c.min_rtt.mesure(crate::tcp::sack::MIN_RTT_FENETRE, HEURE, 10 * MS);
+            c.livres = 5;
+            c
+        };
+        let etat = |intervalle: u64| EtatSack { prior_livres: Some(0), intervalle, prior_livre_a: HEURE, ..EtatSack::default() };
+        let mut c = prete();
+        c.generer_debit(5, false, &etat(10 * MS - 1000), HEURE);
+        assert_eq!(c.mesures.rate_livres, 0);
+        let mut c = prete();
+        c.generer_debit(5, false, &etat(10 * MS), HEURE);
+        assert_eq!(c.mesures.rate_livres, 5);
+    }
+
+    /// Le programme s'est fait attendre : moins d'un MSS prêt à partir, rien dans la carte, ni la
+    /// cwnd ni les pertes pour retenir (`tcp_rate_check_app_limited`).
+    #[test]
+    fn le_programme_se_fait_attendre() {
+        let prete = |n: usize| {
+            let mut c = etablie(true);
+            c.reglages.nodelay = true;
+            if n > 0 {
+                assert_eq!(c.ecrire::<()>(n, |d| { d.fill(1); Ok(()) }), Ok(n));
+            }
+            c.mesures.app_limite = 0;
+            c
+        };
+        let mut c = prete(MSS as usize - 1);
+        c.verifier_app_limite(0);
+        assert_ne!(c.mesures.app_limite, 0, "moins d'un MSS");
+        let mut c = prete(MSS as usize);
+        c.verifier_app_limite(0);
+        assert_eq!(c.mesures.app_limite, 0, "tout juste un MSS");
+    }
+
+    /// `tcp_chrono_stop` : seule la cause courante cesse, et la connexion reste occupée.
+    #[test]
+    fn arreter_un_chrono() {
+        let mut c = etablie(true);
+        en_vol(&mut c, 1);
+        c.chrono_poser(Chrono::Occupee, HEURE);
+        c.chrono_commencer(Chrono::FenetreDeLAutre, HEURE);
+        assert_eq!(c.mesures.chrono, Chrono::FenetreDeLAutre);
+        c.chrono_arreter(Chrono::TamponPlein, HEURE + MS);
+        assert_eq!(c.mesures.chrono, Chrono::FenetreDeLAutre, "pas la cause courante");
+        c.chrono_arreter(Chrono::FenetreDeLAutre, HEURE + MS);
+        assert_eq!(c.mesures.chrono, Chrono::Occupee);
+    }
+}

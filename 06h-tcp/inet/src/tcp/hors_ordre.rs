@@ -249,3 +249,127 @@ impl<P: Charge> HorsOrdre<P> {
         self.taille_vraie = 0;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::essais::{octets, Octets};
+    use super::*;
+    use alloc::vec;
+
+    fn charge(n: usize) -> Octets {
+        Octets(vec![1; n], 0, 2 * n)
+    }
+
+    #[test]
+    fn etendre_le_doublon() {
+        let mut d = None;
+        etendre_doublon(&mut d, 10, 20);
+        assert_eq!(d, Some((10, 20)));
+        etendre_doublon(&mut d, 20, 30);
+        assert_eq!(d, Some((10, 30)));
+    }
+
+    /// `tcp_data_queue_ofo` : ce qui est déjà là, et ce qui le chevauche.
+    #[test]
+    fn ranger_() {
+        let mut h: HorsOrdre<Octets> = HorsOrdre::new();
+        assert_eq!(h.ranger(100, charge(10)), Ok(None));
+        assert_eq!(h.taille_vraie, 20);
+        // Entièrement couvert : le doublon, rien de plus.
+        assert_eq!(h.ranger(102, charge(4)), Ok(Some((102, 106))));
+        assert_eq!(h.ranger(100, charge(10)), Ok(Some((100, 110))));
+        assert_eq!(h.file.len(), 1);
+        // Son début est déjà là : retiré, et dit.
+        assert_eq!(h.ranger(105, charge(10)), Ok(Some((105, 110))));
+        assert_eq!(h.file.len(), 2);
+        assert_eq!(h.file[1].0, 110);
+        assert_eq!(h.file[1].1.octets().len(), 5);
+        // Il couvre tout un autre : celui-là disparaît, et sa taille avec lui.
+        let mut h: HorsOrdre<Octets> = HorsOrdre::new();
+        h.ranger(100, charge(5)).unwrap();
+        assert_eq!(h.ranger(90, charge(30)), Ok(Some((100, 105))));
+        assert_eq!(h.file.len(), 1);
+        assert_eq!(h.taille_vraie, 60);
+        // Vide : rien.
+        assert_eq!(h.ranger(500, charge(0)), Ok(None));
+        assert_eq!(h.file.len(), 1);
+    }
+
+    /// `tcp_collapse_ofo_queue` : une suite sans trou se recopie, si elle a des gaspilleurs.
+    #[test]
+    fn fondre_une_suite() {
+        let mut h: HorsOrdre<Octets> = HorsOrdre::new();
+        // Deux suites : 100..300 (mauvais rendement), 500..600 (seule, petite).
+        h.ranger(100, octets(100, 1000)).unwrap();
+        h.ranger(200, octets(100, 1000)).unwrap();
+        h.ranger(500, octets(100, 1000)).unwrap();
+        h.fondre(150, 1 << 20, 128);
+        // 100..300, recopié par 150 ; le reste, tel quel.
+        assert_eq!(h.file.len(), 3);
+        assert_eq!((h.file[0].0, h.file[0].1.octets().len()), (100, 150));
+        assert_eq!((h.file[1].0, h.file[1].1.octets().len()), (250, 50));
+        assert_eq!((h.file[2].0, h.file[2].1.taille_vraie()), (500, 1000));
+        let vraie: usize = h.file.iter().map(|e| e.1.taille_vraie()).sum();
+        assert_eq!(h.taille_vraie, vraie);
+        // Une seule entrée, assez grande pour la taille : recopiée aussi.
+        let mut h: HorsOrdre<Octets> = HorsOrdre::new();
+        h.ranger(100, octets(100, 1000)).unwrap();
+        h.fondre(100, 1 << 20, 128);
+        assert_ne!(h.file[0].1.taille_vraie(), 1000);
+        // Une de plus petite que la taille : non.
+        let mut h: HorsOrdre<Octets> = HorsOrdre::new();
+        h.ranger(100, octets(100, 1000)).unwrap();
+        h.fondre(101, 1 << 20, 128);
+        assert_eq!(h.file[0].1.taille_vraie(), 1000);
+    }
+
+    /// `tcp_collapse_ofo_queue` : les petites suites gardées ne vont pas au-delà de la limite : la
+    /// suite ne vaut plus la peine.
+    #[test]
+    fn fondre_s_arrete_a_la_limite() {
+        let prete = || {
+            let mut h: HorsOrdre<Octets> = HorsOrdre::new();
+            h.ranger(100, octets(10, 1000)).unwrap();
+            h.ranger(200, octets(10, 1000)).unwrap();
+            h.ranger(300, octets(10, 1000)).unwrap();
+            h.ranger(310, octets(10, 1000)).unwrap();
+            h
+        };
+        // Au-delà de la limite : la dernière suite n'est pas vue.
+        let mut h = prete();
+        h.fondre(3000, 1999, 128);
+        assert_eq!(h.file.len(), 4);
+        // Tout juste à la limite : on continue.
+        let mut h = prete();
+        h.fondre(3000, 2000, 128);
+        assert_eq!(h.file.len(), 3);
+    }
+
+    /// Seulement à partir du premier de mauvais rendement, et rien s'il n'y en a pas.
+    #[test]
+    fn recopier_le_mauvais_rendement() {
+        // Rendement : (vraie × ratio) >> 8 > longueur.
+        let mut h: HorsOrdre<Octets> = HorsOrdre::new();
+        h.ranger(100, octets(100, 200)).unwrap();
+        h.ranger(200, octets(100, 200)).unwrap();
+        h.fondre(1000, 1 << 20, 128);
+        assert_eq!(h.file.len(), 2, "tout juste bon : (200 × 128) >> 8 = 100");
+        let mut h: HorsOrdre<Octets> = HorsOrdre::new();
+        h.ranger(100, octets(100, 200)).unwrap();
+        h.ranger(200, octets(100, 202)).unwrap();
+        h.fondre(1000, 1 << 20, 128);
+        assert_eq!(h.file.len(), 2, "le premier reste, le second recopié");
+        assert_eq!(h.file[0].1.taille_vraie(), 200);
+        assert_ne!(h.file[1].1.taille_vraie(), 202);
+    }
+
+    /// La connexion se ferme : tout s'en va.
+    #[test]
+    fn vider_() {
+        let mut h: HorsOrdre<Octets> = HorsOrdre::new();
+        h.ranger(1000, octets(100, 200)).unwrap();
+        h.vider();
+        assert!(h.vide());
+        assert_eq!(h.taille_vraie, 0);
+    }
+}

@@ -189,3 +189,48 @@ impl Attente {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const H: u64 = 7_000_000_000;
+
+    fn segment(seq: u32, drapeaux: u8) -> Tcp {
+        Tcp { seq, ack: 1, drapeaux, fenetre: 100, ..Tcp::default() }
+    }
+
+    fn en_fin_attente2() -> Attente {
+        Attente::new(80, 40000, 1, 1000, 500, 0, true, None, H)
+    }
+
+    /// `tcp_timewait_state_process`, en FIN_WAIT_2.
+    #[test]
+    fn fin_attente2_ce_qui_ne_compte_pas() {
+        // Rien de neuf : ni données, ni FIN.
+        let r = en_fin_attente2().recevoir(&segment(1000, tcp::ACK), 0, H);
+        assert!(!r.effacer && !r.rst);
+        // Pas d'ACK : rien, même avec des données.
+        let r = en_fin_attente2().recevoir(&segment(1000, 0), 10, H);
+        assert!(!r.effacer && !r.rst, "pas d'ACK");
+        // Un vieux segment, qui finit au bord gauche.
+        let r = en_fin_attente2().recevoir(&segment(990, tcp::ACK), 10, H);
+        assert!(!r.effacer && !r.rst, "vieux");
+    }
+
+    #[test]
+    fn fin_attente2_des_donnees_apres_la_fermeture() {
+        // Des données, sans FIN : RST.
+        let r = en_fin_attente2().recevoir(&segment(1000, tcp::ACK), 10, H);
+        assert!(r.effacer && r.rst);
+        // Le FIN, avec des données : RST aussi.
+        let r = en_fin_attente2().recevoir(&segment(1000, tcp::ACK | tcp::FIN), 10, H);
+        assert!(r.effacer && r.rst);
+        // Le FIN tout seul : un vrai TIME_WAIT.
+        let mut a = en_fin_attente2();
+        let r = a.recevoir(&segment(1000, tcp::ACK | tcp::FIN), 0, H);
+        assert!(!r.effacer && !r.rst);
+        assert!(!a.fin_attente2);
+        assert_eq!(a.rcv_nxt, 1001);
+    }
+}

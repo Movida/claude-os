@@ -441,3 +441,20 @@ impl Roue {
         self.nombre == 0
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Des numéros qui se suivent ne doivent pas se suivre dans la table : sinon, une longue suite à
+    /// parcourir, et armer ne serait plus en temps constant.
+    #[test]
+    fn le_hachage_etale_les_numeros() {
+        let r = Roue::new(512).unwrap();
+        let mut vus = alloc::vec![false; r.places.len()];
+        for n in 1..=512 {
+            vus[r.hachage(n)] = true;
+        }
+        assert_eq!(vus.iter().filter(|&&v| v).count(), 512);
+    }
+}

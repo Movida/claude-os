@@ -634,3 +634,837 @@ impl<P: Charge> Tcb<P> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::essais::*;
+    use super::super::retrans::{DEJA_RENVOYE, EN_RENVOI, FLAG_DATA, FLAG_DATA_ACKED, FLAG_RETRANS_DATA_ACKED, FLAG_SYN_ACKED, FLAG_WIN_UPDATE, PERDU, SACKE};
+    use super::*;
+    use formats::reseau::tcp;
+
+    fn avec(sack: bool, n: usize) -> C {
+        let mut c = etablie(sack);
+        en_vol(&mut c, n);
+        c
+    }
+
+    /// `tcp_dsack_seen`.
+    #[test]
+    fn un_doublon_vu() {
+        let mut c = avec(true, 3);
+        c.mss = 1000;
+        c.max_fenetre = 10_000;
+        c.total_retrans = 100;
+        let mut e = EtatSack::default();
+        // Vide, ou à l'envers.
+        assert_eq!(c.doublon_vu(50, 50, &mut e), 0);
+        assert_eq!(c.doublon_vu(50, 49, &mut e), 0);
+        assert_eq!((c.dsack_doublons, e.flag), (0, 0));
+        // Plus grand que la fenêtre.
+        assert_eq!(c.doublon_vu(0, 10_001, &mut e), 0);
+        assert_eq!(c.dsack_doublons, 0);
+        // Exactement la fenêtre.
+        assert_eq!(c.doublon_vu(0, 10_000, &mut e), 10);
+        assert_eq!((c.dsack_doublons, e.livres), (10, 10));
+        assert_ne!(e.flag & FLAG_DSACKING_ACK, 0);
+        // Des segments : arrondi au-dessus, au moins un.
+        assert_eq!(c.doublon_vu(0, 1001, &mut e), 2);
+        assert_eq!(c.doublon_vu(0, 1000, &mut e), 1);
+        assert_eq!(c.doublon_vu(0, 1, &mut e), 1);
+        assert_eq!(e.flag & FLAG_DSACK_TLP, 0);
+        assert!(!c.rack.dsack_vu, "aucun désordre vu");
+        // Du désordre vu : RACK élargit sa fenêtre.
+        c.reord_seen = 1;
+        c.doublon_vu(0, 1, &mut e);
+        assert!(c.rack.dsack_vu);
+        // Plus de doublons que de renvois : pas cru. Tout juste autant : oui.
+        let mut c = avec(true, 1);
+        c.max_fenetre = 10_000;
+        c.total_retrans = 2;
+        let mut e = EtatSack::default();
+        assert_eq!(c.doublon_vu(0, 2000, &mut e), 2);
+        assert_ne!(e.flag & FLAG_DSACKING_ACK, 0);
+        let mut e = EtatSack::default();
+        assert_eq!(c.doublon_vu(0, 1, &mut e), 0);
+        assert_eq!((e.flag, e.livres, c.dsack_doublons), (0, 0, 3));
+    }
+
+    /// Le doublon de notre sonde.
+    #[test]
+    fn le_doublon_de_la_sonde() {
+        let mut c = avec(true, 1);
+        c.max_fenetre = 10_000;
+        c.total_retrans = 10;
+        c.reord_seen = 1;
+        c.tlp_high_seq = Some(1000);
+        let mut e = EtatSack::default();
+        c.doublon_vu(0, 1000, &mut e);
+        assert_ne!(e.flag & FLAG_DSACK_TLP, 0);
+        assert!(!c.rack.dsack_vu, "pas du désordre");
+        // Une autre fin, ou plus d'un MSS : non.
+        let mut e = EtatSack::default();
+        c.doublon_vu(0, 999, &mut e);
+        assert_eq!(e.flag & FLAG_DSACK_TLP, 0);
+        c.tlp_high_seq = Some(1001);
+        let mut e = EtatSack::default();
+        c.doublon_vu(0, 1001, &mut e);
+        assert_eq!(e.flag & FLAG_DSACK_TLP, 0);
+    }
+
+    fn segment(ack: u32, blocs: &[(u32, u32)]) -> Tcp {
+        let mut t = Tcp { ack, ..Tcp::default() };
+        for (k, b) in blocs.iter().enumerate() {
+            t.options.blocs[k] = *b;
+        }
+        t.options.nb_blocs = blocs.len() as u8;
+        t
+    }
+
+    /// `tcp_check_dsack`.
+    #[test]
+    fn verifier_un_doublon() {
+        let prete = || {
+            let mut c = avec(true, 1);
+            c.max_fenetre = 100_000;
+            c.total_retrans = 100;
+            c
+        };
+        let ack = 10_000;
+        // Le premier bloc sous l'ACK : un doublon.
+        let mut c = prete();
+        let mut e = EtatSack::default();
+        assert!(c.verifier_doublon(&segment(ack, &[(ack - 100, ack)]), ack, &mut e));
+        // Au-dessus, seul : non.
+        let mut c = prete();
+        assert!(!c.verifier_doublon(&segment(ack, &[(ack, ack + 100)]), ack, &mut e));
+        assert_eq!(c.dsack_doublons, 0);
+        // Au-dessus, dans le second : oui, bords compris.
+        let mut c = prete();
+        assert!(c.verifier_doublon(&segment(ack, &[(ack + 100, ack + 200), (ack + 100, ack + 200)]), ack, &mut e));
+        // Il dépasse du second, d'un côté ou de l'autre : non.
+        let mut c = prete();
+        assert!(!c.verifier_doublon(&segment(ack, &[(ack + 100, ack + 201), (ack + 100, ack + 200)]), ack, &mut e));
+        assert!(!c.verifier_doublon(&segment(ack, &[(ack + 99, ack + 200), (ack + 100, ack + 200)]), ack, &mut e));
+        assert_eq!(c.dsack_doublons, 0);
+        // Pas cru : faux.
+        let mut c = prete();
+        c.total_retrans = 0;
+        assert!(!c.verifier_doublon(&segment(ack, &[(ack - 100, ack)]), ack, &mut e));
+    }
+
+    /// Un doublon de ce qui est déjà acquitté : l'annulation avance.
+    #[test]
+    fn un_doublon_compte_pour_l_annulation() {
+        let prete = || {
+            let mut c = avec(true, 1);
+            c.max_fenetre = 100_000;
+            c.total_retrans = 100;
+            c.mss = 1000;
+            c.undo_marker = Some(5000);
+            c.undo_retrans = 3;
+            c
+        };
+        let ack = 10_000;
+        let mut e = EtatSack::default();
+        let mut c = prete();
+        c.verifier_doublon(&segment(ack, &[(6000, 8000)]), 8000, &mut e);
+        assert_eq!(c.undo_retrans, 1, "deux segments");
+        c.verifier_doublon(&segment(ack, &[(6000, 8000)]), 8000, &mut e);
+        assert_eq!(c.undo_retrans, 0);
+        c.verifier_doublon(&segment(ack, &[(6000, 8000)]), 8000, &mut e);
+        assert_eq!(c.undo_retrans, 0, "pas sous zéro");
+        // Au-dessus de l'ancien SND.UNA : `marquer_segment` s'en occupe.
+        let mut c = prete();
+        c.verifier_doublon(&segment(ack, &[(6000, 8001)]), 8000, &mut e);
+        assert_eq!(c.undo_retrans, 3);
+        // Sous le début de l'épisode.
+        let mut c = prete();
+        c.verifier_doublon(&segment(ack, &[(4000, 5000)]), 8000, &mut e);
+        assert_eq!(c.undo_retrans, 3);
+        let mut c = prete();
+        c.verifier_doublon(&segment(ack, &[(4000, 5001)]), 8000, &mut e);
+        assert_eq!(c.undo_retrans, 1, "deux segments, dont un bout dans l'épisode");
+        // Pas d'épisode, ou rien à annuler.
+        let mut c = prete();
+        c.undo_marker = None;
+        c.verifier_doublon(&segment(ack, &[(6000, 8000)]), 8000, &mut e);
+        assert_eq!(c.undo_retrans, 3);
+        let mut c = prete();
+        c.undo_retrans = 0;
+        c.verifier_doublon(&segment(ack, &[(6000, 8000)]), 8000, &mut e);
+        assert_eq!(c.undo_retrans, 0);
+    }
+
+    /// `tcp_sacktag_one`.
+    #[test]
+    fn marquer_un_segment_neuf() {
+        let mut c = avec(true, 3);
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.high_seq = fin(2);
+        c.marquer_segment(2, false, &mut e, HEURE + MS);
+        assert_ne!(c.file[2].marques & SACKE, 0);
+        assert_eq!((c.sacked_out, e.livres), (1, 1));
+        assert_ne!(e.flag & FLAG_DATA_SACKED, 0);
+        assert_ne!(e.flag & FLAG_ORIG_SACK_ACKED, 0);
+        assert_eq!((e.premier, e.dernier), (Some(HEURE), Some(HEURE)));
+        assert_eq!(c.fack, fin(2));
+        assert!(c.rack.avance);
+        assert_eq!(e.reord, c.snd_nxt, "le plus haut : pas de désordre");
+        // Un trou comblé plus bas : du désordre ; le plus haut ne recule pas.
+        c.high_seq = fin(0) - 1;
+        c.file[0].envoi = HEURE + 1;
+        c.marquer_segment(0, false, &mut e, HEURE + MS);
+        assert_eq!(e.reord, debut(0));
+        assert_eq!(c.fack, fin(2));
+        assert_eq!(e.dernier, Some(HEURE + 1));
+        assert_eq!(e.premier, Some(HEURE));
+        // Déjà SACKé : rien de plus.
+        let f = e.flag;
+        c.marquer_segment(2, false, &mut e, HEURE + MS);
+        assert_eq!((c.sacked_out, e.livres, e.flag), (2, 2, f));
+    }
+
+    #[test]
+    fn marquer_un_segment_perdu_ou_renvoye() {
+        // Perdu, jamais renvoyé : plus perdu.
+        let mut c = avec(true, 3);
+        c.file[0].marques = PERDU;
+        c.lost_out = 1;
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.marquer_segment(0, false, &mut e, HEURE + MS);
+        assert_eq!(c.lost_out, 0);
+        assert_eq!(c.file[0].marques & PERDU, 0);
+        // Perdu et renvoyé : fini pour les deux comptes.
+        let mut c = avec(true, 3);
+        c.file[0].marques = PERDU | EN_RENVOI | DEJA_RENVOYE;
+        c.lost_out = 1;
+        c.retrans_out = 1;
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.marquer_segment(0, false, &mut e, HEURE + MS);
+        assert_eq!((c.lost_out, c.retrans_out), (0, 0));
+        assert_eq!(c.file[0].marques & (PERDU | EN_RENVOI), 0);
+        assert_eq!(e.premier, None, "renvoyé : pas de mesure");
+        // En renvoi, pas perdu : le renvoi reste en vol.
+        let mut c = avec(true, 3);
+        c.file[0].marques = EN_RENVOI | DEJA_RENVOYE;
+        c.retrans_out = 1;
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.marquer_segment(0, false, &mut e, HEURE + MS);
+        assert_eq!(c.retrans_out, 1);
+        assert_ne!(c.file[0].marques & EN_RENVOI, 0);
+        // Déjà renvoyé, plus en vol, et perdu : le perdu tombe, sans mesure ni désordre.
+        let mut c = avec(true, 3);
+        c.file[0].marques = PERDU | DEJA_RENVOYE;
+        c.lost_out = 1;
+        c.fack = fin(2);
+        c.sacked_out = 1;
+        c.high_seq = fin(2);
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.marquer_segment(0, false, &mut e, HEURE + MS);
+        assert_eq!(c.lost_out, 0);
+        assert_eq!((e.premier, e.reord), (None, c.snd_nxt));
+        assert_eq!(e.flag & FLAG_ORIG_SACK_ACKED, 0);
+    }
+
+    #[test]
+    fn marquer_un_doublon() {
+        // Le doublon d'un renvoi : ce renvoi était inutile.
+        let mut c = avec(true, 3);
+        c.file[1].marques = EN_RENVOI | DEJA_RENVOYE;
+        c.retrans_out = 1;
+        c.undo_marker = Some(debut(0));
+        c.undo_retrans = 1;
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.marquer_segment(1, true, &mut e, HEURE + MS);
+        assert_eq!(c.undo_retrans, 0);
+        assert_eq!(c.retrans_out, 0);
+        assert_eq!(c.file[1].marques & EN_RENVOI, 0);
+        // Rien à annuler : pas sous 0 ; pas d'épisode ; sous l'épisode.
+        for (marque, retrans, attendu) in [(Some(debut(0)), 0, 0), (None, 1, 1), (Some(fin(1)), 1, 1)] {
+            let mut c = avec(true, 3);
+            c.file[1].marques = DEJA_RENVOYE;
+            c.undo_marker = marque;
+            c.undo_retrans = retrans;
+            let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+            c.marquer_segment(1, true, &mut e, HEURE + MS);
+            assert_eq!(c.undo_retrans, attendu, "{marque:?} {retrans}");
+        }
+        // Jamais renvoyé : un doublon n'y change rien.
+        let mut c = avec(true, 3);
+        c.undo_marker = Some(debut(0));
+        c.undo_retrans = 1;
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.marquer_segment(1, true, &mut e, HEURE + MS);
+        assert_eq!(c.undo_retrans, 1);
+        // Pas un doublon : le renvoi reste.
+        let mut c = avec(true, 3);
+        c.file[1].marques = EN_RENVOI | DEJA_RENVOYE;
+        c.retrans_out = 1;
+        c.undo_marker = Some(debut(0));
+        c.undo_retrans = 1;
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.marquer_segment(1, false, &mut e, HEURE + MS);
+        assert_eq!((c.undo_retrans, c.retrans_out), (1, 1));
+        // Déjà SACKé et renvoyé, le doublon dit où commence le désordre.
+        let mut c = avec(true, 3);
+        c.file[1].marques = SACKE | DEJA_RENVOYE;
+        c.sacked_out = 1;
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.marquer_segment(1, true, &mut e, HEURE + MS);
+        assert_eq!(e.reord, debut(1));
+        let mut e = EtatSack { reord: debut(0), ..EtatSack::default() };
+        c.marquer_segment(1, true, &mut e, HEURE + MS);
+        assert_eq!(e.reord, debut(0));
+        let mut c = avec(true, 3);
+        c.file[1].marques = DEJA_RENVOYE;
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.fack = fin(1);
+        c.marquer_segment(1, true, &mut e, HEURE + MS);
+        assert_eq!(e.reord, c.snd_nxt, "pas SACKé");
+        // Sous SND.UNA : compté pour l'annulation, sans plus.
+        let mut c = avec(true, 3);
+        c.file[0].marques = DEJA_RENVOYE;
+        c.undo_marker = Some(debut(0));
+        c.undo_retrans = 1;
+        c.snd_una = fin(0);
+        let mut e = EtatSack { reord: c.snd_nxt, ..EtatSack::default() };
+        c.marquer_segment(0, true, &mut e, HEURE + MS);
+        assert_eq!(c.undo_retrans, 0);
+        assert_eq!((c.sacked_out, e.livres), (0, 0));
+    }
+
+    /// `tcp_check_sack_reordering`.
+    #[test]
+    fn verifier_le_reordonnancement() {
+        let mut c = avec(true, 1);
+        c.mss = 100;
+        c.sacked_out = 1;
+        c.fack = 10_000;
+        c.reordering = 3;
+        c.verifier_reordonnancement(10_000);
+        assert_eq!(c.reord_seen, 0, "pas sous le plus haut");
+        c.verifier_reordonnancement(9700);
+        assert_eq!((c.reord_seen, c.reordering), (1, 3), "tout juste trois");
+        c.verifier_reordonnancement(9699);
+        assert_eq!((c.reord_seen, c.reordering), (2, 4), "arrondi au-dessus");
+        c.verifier_reordonnancement(9000);
+        assert_eq!(c.reordering, 10);
+        c.reordering = 3;
+        c.fack = 1 << 20;
+        c.verifier_reordonnancement(0);
+        assert_eq!(c.reordering, crate::tcp::TCP_MAX_REORDERING);
+    }
+
+    /// `tcp_rack_advance`.
+    #[test]
+    fn rack_avancer_() {
+        let mut c = avec(true, 1);
+        c.min_rtt.mesure(1 << 40, HEURE, 10 * MS);
+        // Un renvoi revenu trop vite : c'est l'original.
+        for m in [EN_RENVOI, DEJA_RENVOYE] {
+            c.rack.avance = false;
+            c.rack_avancer(m, 100, HEURE, HEURE + 10 * MS - 1);
+            assert!(!c.rack.avance, "{m}");
+        }
+        // Pas si vite, ou jamais renvoyé : il compte.
+        c.rack_avancer(EN_RENVOI, 100, HEURE, HEURE + 10 * MS);
+        assert!(c.rack.avance);
+        assert_eq!((c.rack.rtt, c.rack.mstamp, c.rack.fin_seq), (10 * MS, HEURE, 100));
+        c.rack_avancer(0, 200, HEURE, HEURE + MS);
+        assert_eq!((c.rack.rtt, c.rack.mstamp, c.rack.fin_seq), (MS, HEURE, 200), "même heure, plus loin");
+        // Parti avant : le RTT suit, le reste non.
+        c.rack_avancer(0, 300, HEURE - MS, HEURE + MS);
+        assert_eq!((c.rack.rtt, c.rack.mstamp, c.rack.fin_seq), (2 * MS, HEURE, 200));
+        c.rack_avancer(0, 100, HEURE, HEURE + MS);
+        assert_eq!(c.rack.fin_seq, 200, "même heure, plus près");
+    }
+
+    /// `tcp_rack_detect_loss`.
+    #[test]
+    fn rack_detecter_() {
+        let prete = || {
+            let mut c = avec(true, 3);
+            c.rack.rtt = 10 * MS;
+            c.rack.mstamp = HEURE;
+            c.rack.fin_seq = fin(2);
+            c.reord_seen = 0;
+            c.cc.phase = Phase::Reprise;
+            c
+        };
+        // Fenêtre nulle en reprise, sans désordre vu ; assez de temps : tout est perdu, sauf ce qui
+        // part après ce qui est arrivé.
+        let mut c = prete();
+        c.rack.fin_seq = fin(1);
+        assert_eq!(c.rack_detecter(HEURE + 10 * MS), 0);
+        assert_eq!((c.file[0].marques & PERDU, c.file[1].marques & PERDU, c.file[2].marques & PERDU), (PERDU, 0, 0));
+        assert_eq!(c.tri.len(), 2, "le perdu quitte le tri");
+        // Encore à attendre : la plus longue attente.
+        let mut c = prete();
+        c.file[0].envoi = HEURE - 3 * MS;
+        c.tri.clear();
+        c.tri.push_back((debut(0), HEURE - 3 * MS));
+        c.tri.push_back((debut(1), HEURE));
+        c.rack.fin_seq = fin(2);
+        assert_eq!(c.rack_detecter(HEURE + 4 * MS), 6 * MS);
+        assert_eq!(c.lost_out, 0);
+        assert_eq!(c.tri.len(), 2);
+        // Un renvoi déjà marqué, en vol : son renvoi peut être perdu. Marqué et pas renvoyé : sauté.
+        let mut c = prete();
+        c.file[0].marques = PERDU;
+        c.lost_out = 1;
+        c.file[1].marques = PERDU | EN_RENVOI;
+        c.lost_out = 2;
+        c.retrans_out = 1;
+        assert_eq!(c.rack_detecter(HEURE + 100 * MS), 0);
+        assert_eq!(c.retrans_out, 0);
+        assert_eq!(c.tri.len(), 2, "le premier reste, marqué, pas renvoyé ; le dernier n'est pas parti avant");
+        // SACKé, ou renvoyé depuis : l'entrée du tri est vieille, elle s'en va.
+        let mut c = prete();
+        c.file[0].marques = SACKE;
+        c.file[1].envoi = HEURE + 1;
+        c.rack.fin_seq = fin(2);
+        c.rack.mstamp = HEURE + 1;
+        c.rack_detecter(HEURE + 100 * MS);
+        assert!(c.tri.len() <= 1);
+        assert_eq!(c.file[0].marques & PERDU, 0);
+    }
+
+    #[test]
+    fn rack_marquer_() {
+        let mut c = avec(true, 2);
+        c.rack.rtt = 10 * MS;
+        c.rack.mstamp = HEURE;
+        c.rack.fin_seq = fin(1);
+        c.cc.phase = Phase::Reprise;
+        // Rien de neuf : rien.
+        c.rack.avance = false;
+        assert!(!c.rack_marquer(HEURE + 100 * MS));
+        assert_eq!(c.lost_out, 0);
+        // Il y a à attendre : le minuteur, borné par le RTO, en tics.
+        c.rack.avance = true;
+        c.rto = 1000 * MS;
+        assert!(c.rack_marquer(HEURE + 4 * MS));
+        assert!(!c.rack.avance);
+        assert_eq!(c.t_sorte, crate::tcp::Minuteur::Reordonnancement);
+        assert_eq!(c.t_xmit, Some(HEURE + 4 * MS + en_jiffies(6 * MS + TIMEOUT_MIN)));
+        c.rack.avance = true;
+        c.rto = MS;
+        assert!(c.rack_marquer(HEURE + 4 * MS));
+        assert_eq!(c.t_xmit, Some(HEURE + 4 * MS + MS));
+        // Plus rien à attendre : tout marqué.
+        c.rack.avance = true;
+        assert!(!c.rack_marquer(HEURE + 100 * MS));
+        assert_eq!(c.lost_out, 1, "le dernier arrivé lui-même n'est pas parti avant");
+    }
+
+    /// `tcp_current_mss` : quatre octets, et huit par bloc.
+    #[test]
+    fn la_place_des_blocs() {
+        let mut c = etablie(true);
+        assert_eq!(c.place_des_blocs(), 0);
+        for (n, place) in [(1, 12), (2, 20), (3, 28)] {
+            c.nb_blocs = n;
+            for i in 0..n as usize {
+                c.blocs[i] = (1000 * (i as u32 + 1), 1000 * (i as u32 + 1) + 500);
+            }
+            assert_eq!(c.place_des_blocs(), place, "{n}");
+        }
+    }
+
+    /// Un ACK comprimé part quand un bloc qui n'est pas des tout premiers est touché, ou qu'il
+    /// y en aurait trop.
+    #[test]
+    fn un_nouveau_bloc_et_l_ack_comprime() {
+        let prete = |n: usize| {
+            let mut c = etablie(true);
+            for i in 0..n {
+                c.blocs[i] = (10_000 * (i as u32 + 1), 10_000 * (i as u32 + 1) + 500);
+            }
+            c.nb_blocs = n as u8;
+            c.ack_comprimes = 2;
+            c
+        };
+        // Le premier bloc touché : l'ACK attend encore.
+        let mut c = prete(3);
+        c.nouveau_bloc(10_500, 10_600);
+        assert_eq!(c.ack_comprimes, 2);
+        // Le deuxième, non plus.
+        let mut c = prete(3);
+        c.nouveau_bloc(20_500, 20_600);
+        assert_eq!(c.ack_comprimes, 2);
+        // Le troisième : il part.
+        let mut c = prete(3);
+        c.nouveau_bloc(30_500, 30_600);
+        assert_eq!(c.ack_comprimes, 0);
+        assert_eq!(c.blocs[0], (30_000, 30_600));
+    }
+
+    /// Le premier bloc mange ceux qu'il touche, les autres remontent d'une place.
+    #[test]
+    fn fusionner_les_blocs() {
+        let mut c = etablie(true);
+        c.blocs[0] = (1000, 2000);
+        c.blocs[1] = (2000, 3000);
+        c.blocs[2] = (5000, 6000);
+        c.blocs[3] = (7000, 8000);
+        c.nb_blocs = 4;
+        c.fusionner_blocs();
+        assert_eq!(c.nb_blocs, 3);
+        assert_eq!(&c.blocs[..3], &[(1000, 3000), (5000, 6000), (7000, 8000)]);
+    }
+
+    /// Les blocs que RCV.NXT a dépassés partent, l'ordre des autres reste.
+    #[test]
+    fn retirer_les_blocs() {
+        let mut c = etablie(true);
+        let base = c.rcv_nxt;
+        c.hors_ordre.ranger(base + 1000, octets(100, 200)).unwrap();
+        c.blocs[0] = (base + 1000, base + 1100);
+        c.blocs[1] = (base.wrapping_sub(500), base);
+        c.blocs[2] = (base + 3000, base + 3100);
+        c.blocs[3] = (base.wrapping_sub(900), base.wrapping_sub(800));
+        c.nb_blocs = 4;
+        c.retirer_blocs();
+        assert_eq!(c.nb_blocs, 2);
+        assert_eq!(&c.blocs[..2], &[(base + 1000, base + 1100), (base + 3000, base + 3100)]);
+        // Tout juste RCV.NXT au début du bloc : dépassé.
+        c.blocs[0] = (base, base + 100);
+        c.nb_blocs = 1;
+        c.retirer_blocs();
+        assert_eq!(c.nb_blocs, 0);
+    }
+
+    /// Un D-SACK dans le deuxième bloc, quel que soit le nombre de blocs, et ce qu'il défait.
+    #[test]
+    fn verifier_un_doublon_dans_le_deuxieme_bloc() {
+        let prete = || {
+            let mut c = avec(true, 4);
+            c.max_fenetre = 100_000;
+            c.total_retrans = 100;
+            c
+        };
+        let segment = |blocs: &[(u32, u32)]| {
+            let mut o = tcp::Options::default();
+            for (i, b) in blocs.iter().enumerate() {
+                o.blocs[i] = *b;
+            }
+            o.nb_blocs = blocs.len() as u8;
+            Tcp { ack: debut(0), drapeaux: tcp::ACK, options: o, ..Tcp::default() }
+        };
+        let dedans = (debut(1), fin(1));
+        let large = (debut(1), fin(2));
+        for blocs in [&[dedans, large][..], &[dedans, large, (debut(3), fin(3))][..]] {
+            let mut c = prete();
+            let mut e = EtatSack::default();
+            assert!(c.verifier_doublon(&segment(blocs), debut(0), &mut e), "{}", blocs.len());
+        }
+        // Seul, au-dessus de l'ACK : pas un doublon.
+        let mut c = prete();
+        let mut e = EtatSack::default();
+        assert!(!c.verifier_doublon(&segment(&[dedans]), debut(0), &mut e));
+        // Sous l'ACK : un de moins à démentir, pas une division.
+        let mut c = prete();
+        c.undo_marker = Some(debut(0).wrapping_sub(5000));
+        c.undo_retrans = 3;
+        let mut s = segment(&[(debut(0).wrapping_sub(2000), debut(0).wrapping_sub(1000))]);
+        s.ack = debut(0);
+        let mut e = EtatSack::default();
+        assert!(c.verifier_doublon(&s, debut(0), &mut e));
+        assert_eq!(c.undo_retrans, 2);
+    }
+
+    /// `tcp_is_sackblock_valid` : à l'envers, jamais.
+    #[test]
+    fn un_bloc_a_l_envers() {
+        let c = avec(true, 3);
+        assert!(c.bloc_valide(false, debut(1), fin(1)));
+        assert!(!c.bloc_valide(false, fin(1), debut(1)));
+        assert!(!c.bloc_valide(false, debut(1), debut(1)));
+    }
+
+    /// `tcp_is_sackblock_valid`, pour un D-SACK sous SND.UNA : jusqu'à `undo_marker`, ou le recoupant
+    /// de moins d'une fenêtre.
+    #[test]
+    fn un_doublon_valide() {
+        let mut c = avec(true, 3);
+        c.snd_una = debut(1);
+        c.undo_marker = Some(debut(0));
+        c.max_fenetre = 3000;
+        // Entier, depuis `undo_marker` ou au-dessus.
+        assert!(c.bloc_valide(true, debut(0), fin(0)));
+        assert!(!c.bloc_valide(false, debut(0), fin(0)), "pas un D-SACK");
+        // Entier sous `undo_marker` : trop vieux.
+        assert!(!c.bloc_valide(true, debut(0) - 500, debut(0)));
+        // À cheval sur `undo_marker`, de moins d'une fenêtre ; tout juste une ; plus.
+        assert!(c.bloc_valide(true, debut(0) - 500, debut(0) + 500));
+        assert!(c.bloc_valide(true, fin(0) - 3000, fin(0)));
+        assert!(!c.bloc_valide(true, fin(0) - 3001, fin(0)));
+    }
+
+    fn segment_avec(blocs: &[(u32, u32)]) -> Tcp {
+        let mut o = tcp::Options::default();
+        for (i, b) in blocs.iter().enumerate() {
+            o.blocs[i] = *b;
+        }
+        o.nb_blocs = blocs.len() as u8;
+        Tcp { ack: debut(0), drapeaux: tcp::ACK, options: o, ..Tcp::default() }
+    }
+
+    /// Seul le premier bloc d'un ACK peut être un D-SACK, et seulement si `verifier_doublon` l'a dit ;
+    /// un D-SACK suivi de plus large : ses segments restent des doublons.
+    #[test]
+    fn marquer_les_blocs_et_les_doublons() {
+        let prete = || {
+            let mut c = avec(true, 4);
+            c.max_fenetre = 100_000;
+            c.total_retrans = 100;
+            c.undo_marker = Some(debut(0));
+            c.undo_retrans = 2;
+            for i in 1..4 {
+                c.file[i].marques = DEJA_RENVOYE;
+            }
+            c
+        };
+        // Un SACK ordinaire d'un segment renvoyé : l'annulation n'y croit pas.
+        let mut c = prete();
+        c.marquer_blocs(&segment_avec(&[(debut(1), fin(1))]), debut(0), &mut EtatSack::default(), HEURE + MS);
+        assert_eq!(c.undo_retrans, 2);
+        // Le D-SACK de la RFC 2883 dans le bloc plus large qui suit : le segment est un doublon.
+        let mut c = prete();
+        c.marquer_blocs(&segment_avec(&[(debut(2), fin(2)), (debut(1), fin(3))]), debut(0), &mut EtatSack::default(), HEURE + MS);
+        assert_eq!(c.undo_retrans, 1, "un seul : celui du doublon");
+        assert_eq!(c.sacked_out, 3);
+    }
+
+    /// Un seuil en segments, pas autre chose : deux MSS de distance, sous trois de `reordering`.
+    #[test]
+    fn verifier_le_reordonnancement_sous_le_seuil() {
+        let mut c = avec(true, 1);
+        c.mss = 100;
+        c.sacked_out = 1;
+        c.fack = 10_000;
+        c.reordering = 3;
+        c.verifier_reordonnancement(9800);
+        assert_eq!((c.reord_seen, c.reordering), (1, 3));
+        // Pas de MSS : pas de division, le désordre est compté quand même.
+        c.mss = 0;
+        c.verifier_reordonnancement(9000);
+        assert_eq!((c.reord_seen, c.reordering), (2, 3));
+    }
+
+    /// `tcp_rack_reo_wnd` : le quart de `min_rtt`, par pas, au plus SRTT.
+    #[test]
+    fn la_fenetre_de_rack() {
+        let mut c = avec(true, 1);
+        c.reord_seen = 1;
+        c.min_rtt.mesure(MIN_RTT_FENETRE, HEURE, 8 * MS);
+        c.rtt.echantillon(100 * MS, 0, 10);
+        assert_eq!(c.rack_fenetre(), 2 * MS);
+        c.rack.pas = 3;
+        assert_eq!(c.rack_fenetre(), 6 * MS);
+        c.rack.pas = 255;
+        assert_eq!(c.rack_fenetre(), c.rtt.srtt());
+    }
+
+    /// Ce qui reste dans le tri : un segment SACKé, ou renvoyé depuis, n'y est plus jugé.
+    #[test]
+    fn rack_oublie_ce_qui_a_change() {
+        let prete = || {
+            let mut c = avec(true, 3);
+            c.rack.rtt = 10 * MS;
+            c.rack.mstamp = HEURE + MS;
+            c.rack.fin_seq = fin(2);
+            c.cc.phase = Phase::Reprise;
+            c
+        };
+        // SACKé : il n'est pas perdu.
+        let mut c = prete();
+        c.file[0].marques = SACKE;
+        c.sacked_out = 1;
+        c.rack_detecter(HEURE + 100 * MS);
+        assert_eq!(c.file[0].marques & PERDU, 0);
+        assert_eq!(c.lost_out, 2);
+        // Renvoyé depuis : l'entrée du tri n'est plus la sienne, elle part sans être jugée.
+        let mut c = prete();
+        c.file[0].envoi = HEURE + 50 * MS;
+        let n = c.tri.len();
+        c.rack_detecter(HEURE + 100 * MS);
+        assert_eq!(c.file[0].marques & PERDU, 0);
+        assert_eq!(c.tri.len(), n - 3, "la sienne et les deux perdus");
+        // Le numéro a disparu : de même.
+        let mut c = prete();
+        c.file[0].seq = debut(0) + 1;
+        c.rack_detecter(HEURE + 100 * MS);
+        assert_eq!(c.file[0].marques & PERDU, 0);
+    }
+
+    /// `tcp_rack_update_reo_wnd`.
+    #[test]
+    fn la_fenetre_de_rack_grandit() {
+        let mut c = etablie(true);
+        c.livres = 100;
+        c.rack.pas = 1;
+        c.rack.dernier_livre = 50;
+        c.rack.dsack_vu = true;
+        // Pas d'échantillon : rien du tout.
+        c.rack_maj_fenetre(None);
+        assert_eq!((c.rack.pas, c.rack.dsack_vu), (1, true));
+        // Un D-SACK d'avant la dernière hausse ne compte pas.
+        c.rack_maj_fenetre(Some(49));
+        assert_eq!((c.rack.pas, c.rack.dsack_vu), (1, false));
+        // Une hausse par aller-retour : un pas de plus, gardé RACK_PERSISTE reprises.
+        c.rack.dsack_vu = true;
+        c.rack_maj_fenetre(Some(50));
+        assert_eq!((c.rack.pas, c.rack.dsack_vu, c.rack.dernier_livre, c.rack.persiste), (2, false, 100, RACK_PERSISTE));
+        c.rack.dsack_vu = true;
+        c.rack_maj_fenetre(Some(100));
+        assert_eq!(c.rack.pas, 3);
+        // Sans D-SACK, tant qu'il persiste : le pas reste ; ensuite, il retombe.
+        c.rack_maj_fenetre(Some(100));
+        assert_eq!(c.rack.pas, 3);
+        c.rack.persiste = 0;
+        c.rack_maj_fenetre(Some(100));
+        assert_eq!(c.rack.pas, 1);
+        // Au plus 255.
+        c.rack.pas = 255;
+        c.rack.dsack_vu = true;
+        c.rack_maj_fenetre(Some(100));
+        assert_eq!(c.rack.pas, 255);
+    }
+
+    /// `tcp_rack_reo_timeout` : ce qui devient perdu ouvre la reprise, si elle ne l'est pas déjà.
+    #[test]
+    fn le_minuteur_de_reordonnancement() {
+        let prete = |phase| {
+            let mut c = avec(true, 2);
+            c.rack.rtt = 10 * MS;
+            c.rack.mstamp = HEURE;
+            c.rack.fin_seq = fin(1);
+            c.cc.phase = phase;
+            c.cc.ssthresh = 100;
+            c.cc.cwnd = 10;
+            c
+        };
+        let mut e = crate::tcp::Effets::default();
+        let mut c = prete(Phase::Ouverte);
+        c.minuteur_reordonnancement(HEURE + 100 * MS, &mut e);
+        assert_eq!(c.lost_out, 1);
+        assert_eq!(c.cc.phase, Phase::Reprise);
+        assert_ne!(c.undo_marker, None, "une reprise qui commence");
+        assert_eq!(c.rexmit, crate::tcp::Rexmit::Perdus);
+        assert!(e.a_emettre);
+        // Déjà en reprise : pas une deuxième.
+        let mut e = crate::tcp::Effets::default();
+        let mut c = prete(Phase::Reprise);
+        c.minuteur_reordonnancement(HEURE + 100 * MS, &mut e);
+        assert_eq!(c.lost_out, 1);
+        assert_eq!(c.undo_marker, None);
+        assert!(e.a_emettre);
+        // Rien de perdu : rien à faire.
+        let mut e = crate::tcp::Effets::default();
+        let mut c = prete(Phase::Ouverte);
+        c.minuteur_reordonnancement(HEURE + MS, &mut e);
+        assert_eq!(c.lost_out, 0);
+        assert_eq!(c.cc.phase, Phase::Ouverte);
+        assert!(!e.a_emettre);
+    }
+
+    /// `tcp_schedule_loss_probe` : jamais après le RTO qui reste, s'il en reste.
+    #[test]
+    fn la_sonde_avant_le_rto() {
+        let prete = || {
+            let mut c = avec(true, 2);
+            c.rtt.echantillon(100 * MS, 0, 10);
+            c.rto = 50 * MS;
+            c
+        };
+        let d = en_jiffies(2 * 100 * MS + TIMEOUT_MIN);
+        // Il reste 40 ms.
+        let mut c = prete();
+        assert!(c.programmer_sonde_de_perte(false, HEURE + 10 * MS));
+        assert_eq!(c.t_xmit, Some(HEURE + 10 * MS + en_jiffies(40 * MS)));
+        // Tout juste échu, ou dépassé : la borne ne s'applique plus.
+        for t in [HEURE + 50 * MS, HEURE + 60 * MS] {
+            let mut c = prete();
+            assert!(c.programmer_sonde_de_perte(false, t));
+            assert_eq!(c.t_xmit, Some(t + d), "{t}");
+        }
+        // Le RTO va repartir : tout le RTO.
+        let mut c = prete();
+        assert!(c.programmer_sonde_de_perte(true, HEURE + 60 * MS));
+        assert_eq!(c.t_xmit, Some(HEURE + 60 * MS + en_jiffies(50 * MS)));
+    }
+
+    /// La sonde peut emporter le FIN, s'il suit ce qu'elle envoie.
+    #[test]
+    fn la_sonde_et_le_fin() {
+        let prete = |fin_voulue: bool| {
+            let mut c = avec(true, 1);
+            c.reglages.nodelay = false;
+            c.ecrire::<()>(500, |d| {
+                d.fill(1);
+                Ok(())
+            })
+            .unwrap();
+            c.fin_voulue = fin_voulue;
+            c
+        };
+        for (voulue, attendu) in [(true, tcp::FIN), (false, 0)] {
+            let mut c = prete(voulue);
+            let mut vus = alloc::vec::Vec::new();
+            c.envoyer_sonde_de_perte(HEURE + MS, &mut |s: Sortant| vus.push(s.entete.drapeaux));
+            assert_eq!(vus.len(), 1);
+            assert_eq!(vus[0] & tcp::FIN, attendu, "{voulue}");
+        }
+    }
+
+    /// `tcp_process_tlp_ack` : l'ACK tout juste à la sonde renvoyée : un ACK pur, c'est que l'original
+    /// et elle sont arrivés ; autre chose (il avance, il dit du neuf) : on ne sait pas encore.
+    #[test]
+    fn l_ack_de_la_sonde() {
+        for (f, fini) in [
+            (0, true),
+            (FLAG_RETRANS_DATA_ACKED, true),
+            (FLAG_SND_UNA_ADVANCED, false),
+            (FLAG_DATA, false),
+            (FLAG_WIN_UPDATE, false),
+            (FLAG_DATA_ACKED, false),
+            (FLAG_SYN_ACKED, false),
+            (FLAG_DATA_SACKED, false),
+        ] {
+            let mut c = avec(true, 1);
+            c.tlp_high_seq = Some(fin(0));
+            c.tlp_renvoi = true;
+            c.traiter_ack_de_sonde(fin(0), f);
+            assert_eq!(c.tlp_high_seq.is_none(), fini, "{f:#x}");
+        }
+    }
+
+    /// Le tri se nettoie à plus de deux fois la file, plus 16 : de ce qui n'y est plus.
+    #[test]
+    fn le_tri_se_nettoie() {
+        let prete = |n: usize| {
+            let mut c = avec(true, 3);
+            let (s0, t0) = c.tri[0];
+            c.tri.clear();
+            // Le bon, puis des périmés : d'autres heures, d'autres numéros.
+            c.tri.push_back((s0, t0));
+            for k in 1..n {
+                let k = k as u64;
+                c.tri.push_back(if k % 2 == 0 { (s0, t0 + k) } else { (s0 + 1, t0) });
+            }
+            c
+        };
+        // Tout juste à la limite : pas encore.
+        let mut c = prete(2 * 3 + 16);
+        c.tri_ajouter(fin(2), HEURE);
+        assert_eq!(c.tri.len(), 2 * 3 + 16 + 1);
+        // Au-delà : il ne reste que le bon, et le nouveau.
+        let mut c = prete(2 * 3 + 16 + 1);
+        let bon = c.tri[0];
+        c.tri_ajouter(fin(2), HEURE);
+        assert_eq!(c.tri.len(), 2);
+        assert_eq!(c.tri[0], bon);
+        assert_eq!(c.tri[1], (fin(2), HEURE));
+    }
+}

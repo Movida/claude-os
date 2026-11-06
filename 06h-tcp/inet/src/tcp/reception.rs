@@ -532,3 +532,903 @@ fn revenir<P: Charge>(file: &alloc::collections::VecDeque<P>, mut i: usize, mut 
     }
     (i, decalage - n)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::essais::*;
+    use super::*;
+    use alloc::{vec, vec::Vec};
+
+    /// Un ratio d'une moitié, 100 000 octets de tampon, rien de reçu : la pleine vaut 50 000.
+    fn cas() -> C {
+        let mut c = etablie(true);
+        c.ratio = 128;
+        c.rcvbuf = 100_000;
+        c.window_clamp = 1 << 24;
+        c.rcv_ssthresh = 1 << 24;
+        c.ack.rcv_mss = 1000;
+        c.echelle_reception = 0;
+        c.rcv_wnd = 0;
+        c.ack.rapides = 3;
+        c
+    }
+
+    /// `__tcp_select_window`, sans échelle : un multiple du MSS, à moins d'un MSS de l'annonce
+    /// précédente, celle-ci.
+    #[test]
+    fn la_fenetre_sans_echelle() {
+        let mut c = cas();
+        c.rcv_ssthresh = 30_500;
+        // (annonce précédente, résultat)
+        for (avant, apres_) in [(0, 30_000), (29_500, 30_000), (29_501, 29_501), (29_700, 29_700), (30_000, 30_000), (30_500, 30_500), (30_501, 30_000)] {
+            c.rcv_wnd = avant;
+            assert_eq!(c.choisir_fenetre(), apres_, "avant {avant}");
+        }
+    }
+
+    /// Le MSS vaut la pleine : on ne garde pas une annonce trop petite.
+    #[test]
+    fn la_fenetre_quand_le_mss_est_la_pleine() {
+        let mut c = cas();
+        c.window_clamp = 2000;
+        c.ack.rcv_mss = 2000;
+        c.rcv_ssthresh = 5000;
+        c.rcv_wnd = 3500;
+        assert_eq!(c.choisir_fenetre(), 5000);
+        c.rcv_wnd = 4000;
+        assert_eq!(c.choisir_fenetre(), 4000, "pas plus d'une demi-pleine d'écart : on la garde");
+        // Le MSS plus grand que la pleine : borné par elle.
+        c.ack.rcv_mss = 3000;
+        c.rcv_wnd = 3500;
+        assert_eq!(c.choisir_fenetre(), 5000);
+        // Pas de pleine du tout : 0.
+        c.window_clamp = 0;
+        assert_eq!(c.choisir_fenetre(), 0);
+        c.window_clamp = 1 << 24;
+        c.rcvbuf = 0;
+        assert_eq!(c.choisir_fenetre(), 0);
+    }
+
+    /// Le tampon se remplit : le mode rapide cesse sous la moitié, 0 sous le seizième ou un MSS.
+    #[test]
+    fn la_fenetre_quand_le_tampon_se_remplit() {
+        let mut c = cas();
+        // Libre : la moitié de ce qui reste. Exactement la moitié de la pleine : rien ne change.
+        c.taille_vraie_reception = 50_000;
+        assert_eq!(c.choisir_fenetre(), 25_000);
+        assert_eq!(c.ack.rapides, 3);
+        c.taille_vraie_reception = 50_002;
+        assert_eq!(c.choisir_fenetre(), 24_000);
+        assert_eq!(c.ack.rapides, 0);
+        assert_eq!(c.rcv_ssthresh, 1 << 24, "pas de pression, pas de seuil réduit");
+        // Le seizième : 3125 ; juste au-dessus et au-dessous.
+        c.taille_vraie_reception = 93_750;
+        assert_eq!(c.choisir_fenetre(), 3000);
+        c.taille_vraie_reception = 93_752;
+        assert_eq!(c.choisir_fenetre(), 0);
+        // Un MSS plus grand : c'est lui qui compte.
+        c.ack.rcv_mss = 4000;
+        c.taille_vraie_reception = 92_000;
+        assert_eq!(c.choisir_fenetre(), 4000);
+        c.taille_vraie_reception = 92_002;
+        assert_eq!(c.choisir_fenetre(), 0);
+        // Sous pression : `tcp_adjust_rcv_ssthresh`, quatre segments.
+        c.ack.rcv_mss = 1000;
+        c.memoire = Memoire::Pression;
+        c.taille_vraie_reception = 60_000;
+        assert_eq!(c.choisir_fenetre(), 4 * c.mss_local as u32);
+        assert_eq!(c.rcv_ssthresh, 4 * c.mss_local as u32);
+        // Plus de mémoire qu'il n'en faut : négatif, 0.
+        c.memoire = Memoire::Libre;
+        c.rcv_ssthresh = 1 << 24;
+        c.taille_vraie_reception = 200_000;
+        assert_eq!(c.choisir_fenetre(), 0);
+    }
+
+    /// Avec une échelle : `ALIGN` vers le haut, mais une petite place s'arrondit d'abord vers le
+    /// bas : l'échelle ne doit pas l'augmenter.
+    #[test]
+    fn la_fenetre_avec_une_echelle() {
+        let mut c = cas();
+        c.echelle_reception = 4;
+        c.rcv_ssthresh = 30_500;
+        assert_eq!(c.choisir_fenetre(), 30_512);
+        c.rcv_ssthresh = 30_496;
+        assert_eq!(c.choisir_fenetre(), 30_496);
+        c.rcv_ssthresh = 1 << 24;
+        c.taille_vraie_reception = 89_990;
+        assert_eq!(c.choisir_fenetre(), 4992);
+    }
+
+    fn entete(drapeaux: u8) -> Tcp {
+        Tcp { drapeaux, ..Tcp::default() }
+    }
+
+    /// `tcp_measure_rcv_mss` : un segment au moins aussi grand que l'estimation.
+    #[test]
+    fn le_mss_mesure_sur_un_grand_segment() {
+        let mut c = cas();
+        c.mss_local = 1460;
+        c.ack.rcv_mss = 500;
+        c.ack.pousse = 0;
+        // Le rendement change : (1000 << 8) / 4000 = 64 ; le plafond suit.
+        c.mesurer_rcv_mss(1000, 4000, &entete(tcp::ACK));
+        assert_eq!(c.ack.rcv_mss, 1000);
+        assert_eq!(c.ratio, 64);
+        assert_eq!(c.window_clamp, 25_000);
+        assert_eq!(c.ack.pousse, 0, "sans PSH");
+        // Rien ne change à longueur égale, même de rendement différent.
+        c.mesurer_rcv_mss(1000, 8000, &entete(tcp::ACK));
+        assert_eq!(c.ratio, 64);
+        // Avec PSH : la fin d'une écriture.
+        c.mesurer_rcv_mss(1000, 8000, &entete(tcp::ACK | tcp::PSH));
+        assert_eq!(c.ack.pousse, ACK_POUSSE);
+        // Borné par ce qu'on a annoncé.
+        c.mesurer_rcv_mss(2000, 8000, &entete(tcp::ACK));
+        assert_eq!(c.ack.rcv_mss, 1460);
+        // Un rendement hors de 1..255.
+        c.ack.rcv_mss = 1000;
+        c.mesurer_rcv_mss(1100, 1 << 30, &entete(tcp::ACK));
+        assert_eq!(c.ratio, 1);
+        c.mesurer_rcv_mss(1200, 1, &entete(tcp::ACK));
+        assert_eq!(c.ratio, 255);
+        // Le même rendement : `espace` ne change pas.
+        c.ratio = 64;
+        c.espace.octets = 1 << 30;
+        c.window_clamp = 1 << 24;
+        c.ack.rcv_mss = 1000;
+        c.mesurer_rcv_mss(1100, 4400, &entete(tcp::ACK));
+        assert_eq!(c.window_clamp, 1 << 24);
+        assert_eq!(c.espace.octets, 1 << 30);
+        // Un autre rendement : `espace` est borné par le nouveau plafond.
+        c.ack.rcv_mss = 1000;
+        c.mesurer_rcv_mss(1100, 2200, &entete(tcp::ACK));
+        assert_eq!(c.ratio, 128);
+        assert_eq!(c.espace.octets, c.window_clamp);
+    }
+
+    /// Un segment plus petit que l'estimation : deux de même taille la font baisser ; sinon, seuls
+    /// les « poussés » s'en souviennent.
+    #[test]
+    fn le_mss_mesure_sur_de_petits_segments() {
+        let mut c = cas();
+        c.ack.rcv_mss = 1000;
+        c.ack.pousse = 0;
+        // 536 + 20 d'en-tête tout juste : il compte, même avec PSH.
+        c.mesurer_rcv_mss(536, 2000, &entete(tcp::ACK | tcp::PSH));
+        assert_eq!(c.ack.rcv_mss, 1000);
+        assert_eq!(c.ack.dernier_segment, 536);
+        assert_eq!(c.ack.pousse, ACK_POUSSE);
+        c.mesurer_rcv_mss(536, 2000, &entete(tcp::ACK));
+        assert_eq!(c.ack.rcv_mss, 536, "deux de suite");
+        assert_eq!(c.ack.pousse, ACK_POUSSE, "il revient avant d'avoir compté");
+        // En dessous de 536, avec un des drapeaux : il n'est pas mesuré.
+        for d in [tcp::FIN, tcp::URG, tcp::SYN, tcp::PSH] {
+            c.ack.rcv_mss = 1000;
+            c.ack.dernier_segment = 300;
+            c.mesurer_rcv_mss(300, 2000, &entete(tcp::ACK | d));
+            assert_eq!(c.ack.rcv_mss, 1000, "{d:#x}");
+            assert_eq!(c.ack.dernier_segment, 0, "{d:#x}");
+        }
+        // Sans drapeau : à partir de 88 + 20.
+        c.ack.dernier_segment = 88;
+        c.mesurer_rcv_mss(88, 2000, &entete(tcp::ACK));
+        assert_eq!(c.ack.rcv_mss, 88);
+        c.ack.rcv_mss = 1000;
+        c.ack.dernier_segment = 87;
+        c.mesurer_rcv_mss(87, 2000, &entete(tcp::ACK));
+        assert_eq!(c.ack.rcv_mss, 1000);
+        assert_eq!(c.ack.dernier_segment, 0);
+        // Pas la même taille : retenue pour la prochaine fois.
+        c.ack.dernier_segment = 200;
+        c.mesurer_rcv_mss(300, 2000, &entete(tcp::ACK));
+        assert_eq!(c.ack.rcv_mss, 1000);
+        assert_eq!(c.ack.dernier_segment, 300);
+        // Les « poussés » : un, puis deux.
+        c.ack.pousse = 0;
+        c.ack.dernier_segment = 0;
+        c.mesurer_rcv_mss(50, 2000, &entete(tcp::ACK));
+        assert_eq!(c.ack.pousse, ACK_POUSSE);
+        c.mesurer_rcv_mss(50, 2000, &entete(tcp::ACK));
+        assert_eq!(c.ack.pousse, ACK_POUSSE | ACK_POUSSE2);
+        // Les horodatages ne comptent pas dans la taille retenue, les autres options comptent dans
+        // le seuil.
+        c.ts = Some(crate::tcp::Horodatages { recent: 0, instant: 0, decalage: 0 });
+        c.ack.rcv_mss = 1000;
+        c.ack.dernier_segment = 0;
+        let mut t = entete(tcp::ACK);
+        t.options.horodatage = Some((1, 2));
+        c.mesurer_rcv_mss(100, 2000, &t);
+        assert_eq!(c.ack.dernier_segment, 100, "(100 + 32 - 20 - 12)");
+    }
+
+    #[test]
+    fn la_memoire_accordee() {
+        let mut c = cas();
+        for m in [Memoire::Libre, Memoire::Souple, Memoire::Pression] {
+            c.memoire = m;
+            assert!(c.memoire_accordee());
+        }
+        c.memoire = Memoire::Limite;
+        assert!(!c.memoire_accordee());
+        c.memoire = Memoire::Excedent;
+        c.taille_vraie_reception = RMEM0 - 1;
+        assert!(c.memoire_accordee());
+        c.taille_vraie_reception = RMEM0;
+        assert!(!c.memoire_accordee());
+    }
+
+    /// `tcp_select_initial_window`.
+    #[test]
+    fn la_fenetre_initiale() {
+        let mut c = cas();
+        c.rcvbuf_fixe = false;
+        c.window_clamp = 0;
+        c.echelle_reception = 2;
+        c.fenetre_initiale(1000);
+        assert_eq!(c.rcv_wnd, 50_000);
+        assert_eq!(c.rcv_ssthresh, 50_000);
+        assert_eq!(c.window_clamp, 65_535 << 2);
+        // Un arrondi au MSS, sauf si le MSS est plus grand, ou nul.
+        c.rcvbuf = 2500;
+        c.window_clamp = 0;
+        c.fenetre_initiale(1000);
+        assert_eq!(c.rcv_wnd, 1000);
+        c.window_clamp = 0;
+        c.fenetre_initiale(1250);
+        assert_eq!(c.rcv_wnd, 1250);
+        c.window_clamp = 0;
+        c.fenetre_initiale(5000);
+        assert_eq!(c.rcv_wnd, 1250);
+        c.window_clamp = 0;
+        c.fenetre_initiale(0);
+        assert_eq!(c.rcv_wnd, 1250);
+        // TCP_WINDOW_CLAMP.
+        c.rcvbuf = 100_000;
+        c.window_clamp = 7000;
+        c.fenetre_initiale(1000);
+        assert_eq!(c.rcv_wnd, 7000);
+        assert_eq!(c.window_clamp, 7000);
+        // SO_RCVBUF fixé : le plafond ne le dépasse pas.
+        c.rcvbuf_fixe = true;
+        c.window_clamp = 70_000;
+        c.fenetre_initiale(1000);
+        assert_eq!(c.window_clamp, 50_000);
+        c.window_clamp = 50_000;
+        c.fenetre_initiale(1000);
+        assert_eq!(c.window_clamp, 50_000);
+        c.window_clamp = 0;
+        c.fenetre_initiale(1000);
+        assert_eq!(c.window_clamp, 50_000);
+        c.window_clamp = 7000;
+        c.fenetre_initiale(1000);
+        assert_eq!(c.window_clamp, 7000);
+    }
+
+    /// `tcp_init_buffer_space`.
+    #[test]
+    fn l_espace_initial() {
+        let mut c = cas();
+        c.mss_local = 1000;
+        c.rcv_lu = 1234;
+        // Un plafond plus grand que la pleine : la pleine, moins un segment réservé.
+        c.window_clamp = 70_000;
+        c.rcv_ssthresh = 90_000;
+        c.rcv_wnd = 90_000;
+        c.espace_initial(HEURE);
+        assert_eq!(c.window_clamp, 49_000);
+        assert_eq!(c.rcv_ssthresh, 49_000);
+        assert_eq!(c.espace.octets, 10_000, "au plus la cwnd initiale");
+        assert_eq!((c.espace.temps, c.espace.seq), (HEURE, 1234));
+        // À un segment de la pleine exactement : la réserve s'applique ; plus loin, non.
+        c.window_clamp = 49_000;
+        c.espace_initial(HEURE);
+        assert_eq!(c.window_clamp, 49_000);
+        c.window_clamp = 49_001;
+        c.espace_initial(HEURE);
+        assert_eq!(c.window_clamp, 49_000);
+        c.window_clamp = 40_000;
+        c.espace_initial(HEURE);
+        assert_eq!(c.window_clamp, 40_000);
+        // Au plus deux segments : on n'y touche pas. Une petite pleine : au moins deux segments.
+        c.rcvbuf = 4000;
+        c.window_clamp = 2000;
+        c.espace_initial(HEURE);
+        assert_eq!(c.window_clamp, 2000);
+        c.window_clamp = 2000 + 1;
+        c.rcvbuf = 4004;
+        c.espace_initial(HEURE);
+        assert_eq!(c.window_clamp, 2000);
+        // Le plus petit de la fenêtre et du seuil.
+        let mut d = cas();
+        d.mss_local = 1000;
+        d.window_clamp = 40_000;
+        d.rcv_ssthresh = 3000;
+        d.rcv_wnd = 2000;
+        d.espace_initial(HEURE);
+        assert_eq!(d.espace.octets, 2000);
+        d.rcv_ssthresh = 2000;
+        d.rcv_wnd = 3000;
+        d.espace_initial(HEURE);
+        assert_eq!(d.espace.octets, 2000);
+    }
+
+    /// `tcp_set_rcvlowat`.
+    #[test]
+    fn so_rcvlowat() {
+        let mut c = cas();
+        c.rcvbuf_max = 1 << 20;
+        c.rcvbuf_fixe = false;
+        assert_eq!(c.poser_rcvlowat(0), 1);
+        assert_eq!(c.rcvbuf, 100_000);
+        // De quoi le loger : SO_RCVBUF grandit, et le plafond s'il est trop bas.
+        c.window_clamp = 60_000;
+        assert_eq!(c.poser_rcvlowat(100_000), 100_000);
+        assert_eq!(c.rcvbuf, 200_000);
+        assert_eq!(c.window_clamp, 100_000);
+        // Déjà assez grand : rien.
+        c.window_clamp = 120_000;
+        assert_eq!(c.poser_rcvlowat(100_000), 100_000);
+        assert_eq!(c.rcvbuf, 200_000);
+        assert_eq!(c.window_clamp, 120_000);
+        c.rcvbuf = 100_000;
+        c.window_clamp = 120_000;
+        c.poser_rcvlowat(100_000);
+        assert_eq!(c.window_clamp, 120_000);
+        // Un plafond nul reste nul.
+        c.rcvbuf = 100_000;
+        c.window_clamp = 0;
+        c.poser_rcvlowat(100_000);
+        assert_eq!(c.window_clamp, 0);
+        // Borné par la moitié du maximum, ou de SO_RCVBUF fixé (qui ne bouge pas).
+        assert_eq!(c.poser_rcvlowat(1 << 30), 1 << 19);
+        c.rcvbuf_fixe = true;
+        c.rcvbuf = 100_000;
+        assert_eq!(c.poser_rcvlowat(1 << 30), 50_000);
+        assert_eq!(c.rcvbuf, 100_000);
+    }
+
+    /// `tcp_grow_window`.
+    #[test]
+    fn agrandir_la_fenetre() {
+        let mut c = cas();
+        c.mss_local = 1000;
+        c.rcvbuf_max = 1 << 20;
+        c.window_clamp = 40_000;
+        c.rcv_ssthresh = 10_000;
+        c.ack.rapides = 0;
+        // Un bon rendement (fenetre_de(2000) = 1000 <= 1000) : au moins deux MSS, ou deux segments.
+        c.agrandir_fenetre(1000, 2000);
+        assert_eq!(c.rcv_ssthresh, 12_000);
+        assert_eq!(c.ack.rapides, 1);
+        c.agrandir_fenetre(1500, 3000);
+        assert_eq!(c.rcv_ssthresh, 15_000);
+        // Borné par ce qui reste de place.
+        c.rcv_ssthresh = 39_000;
+        c.agrandir_fenetre(1000, 2000);
+        assert_eq!(c.rcv_ssthresh, 40_000);
+        // Plus de place : rien. Et de même si la place libre est plus petite que le plafond.
+        c.ack.rapides = 0;
+        c.agrandir_fenetre(1000, 2000);
+        assert_eq!(c.rcv_ssthresh, 40_000);
+        assert_eq!(c.ack.rapides, 0);
+        c.rcv_ssthresh = 10_000;
+        c.taille_vraie_reception = 80_000;
+        c.agrandir_fenetre(1000, 2000);
+        assert_eq!(c.rcv_ssthresh, 10_000);
+        c.taille_vraie_reception = 79_000;
+        c.agrandir_fenetre(1000, 2000);
+        assert_eq!(c.rcv_ssthresh, 10_500);
+        // Sous pression : réduit, plus d'agrandissement.
+        c.taille_vraie_reception = 0;
+        c.memoire = Memoire::Pression;
+        c.rcv_ssthresh = 10_000;
+        c.agrandir_fenetre(1000, 2000);
+        assert_eq!(c.rcv_ssthresh, 4000);
+        c.memoire = Memoire::Souple;
+        // Un mauvais rendement (fenetre_de(32 000) = 16 000) : `__tcp_grow_window`.
+        c.ack.rcv_mss = 700;
+        c.window_clamp = 60_000;
+        c.rcv_ssthresh = 40_000;
+        assert_eq!(c.agrandir_lentement(1000, 32_000), 0, "(trop grande pour ce rendement)");
+        c.agrandir_fenetre(1000, 32_000);
+        assert_eq!(c.rcv_ssthresh, 40_000);
+        // Une fenêtre plus petite : elle grandit, de deux rcv_mss (ou deux segments).
+        c.rcv_ssthresh = 3000;
+        assert_eq!(c.agrandir_lentement(1000, 32_000), 1400);
+        c.agrandir_fenetre(1000, 32_000);
+        assert_eq!(c.rcv_ssthresh, 5000);
+    }
+
+    /// `__tcp_grow_window`, pas à pas : v et la fenêtre sont divisés par deux ensemble.
+    #[test]
+    fn agrandir_lentement_aux_bornes() {
+        let mut c = cas();
+        c.rcvbuf_max = 1 << 20;
+        c.ack.rcv_mss = 700;
+        // fenetre_de(2^20) >> 1 = 2^18, v = 8000 ; il faut 3 pas pour v <= 1000 : la fenêtre 2^15.
+        for (seuil, attendu) in [(1 << 15, 1400), ((1 << 15) + 1, 0), ((1 << 18) + 1, 0)] {
+            c.rcv_ssthresh = seuil;
+            assert_eq!(c.agrandir_lentement(1000, 32_000), attendu, "seuil {seuil}");
+        }
+        // Une longueur exacte : v <= longueur.
+        c.rcv_ssthresh = 1 << 18;
+        assert_eq!(c.agrandir_lentement(8000, 32_000), 1400);
+        assert_eq!(c.agrandir_lentement(7999, 32_000), 0);
+    }
+
+    /// `tcp_clamp_window`.
+    #[test]
+    fn resserrer() {
+        let mut c = cas();
+        c.mss_local = 1000;
+        c.rcvbuf_max = 200_000;
+        c.window_clamp = 50_000;
+        c.rcv_ssthresh = 30_000;
+        c.rcvbuf_fixe = false;
+        c.memoire = Memoire::Libre;
+        // SO_RCVBUF prend ce que garde la file ; le seuil ne bouge pas.
+        c.taille_vraie_reception = 150_000;
+        c.resserrer();
+        assert_eq!(c.ack.rapides, 0);
+        assert_eq!(c.rcvbuf, 150_000);
+        assert_eq!(c.rcv_ssthresh, 30_000);
+        // Borné par le maximum : il dépasse encore, le seuil tombe à deux segments.
+        c.rcvbuf = 100_000;
+        c.taille_vraie_reception = 300_000;
+        c.resserrer();
+        assert_eq!(c.rcvbuf, 200_000);
+        assert_eq!(c.rcv_ssthresh, 2000);
+        // ... ou au plafond, s'il est plus petit.
+        c.window_clamp = 1500;
+        c.rcv_ssthresh = 30_000;
+        c.resserrer();
+        assert_eq!(c.rcv_ssthresh, 1500);
+        // SO_RCVBUF fixé, au maximum, ou la mémoire tendue : il ne grandit pas.
+        for (fixe, buf, mem) in [(true, 100_000, Memoire::Libre), (false, 100_000, Memoire::Souple), (false, 200_000, Memoire::Libre)] {
+            c.rcvbuf_fixe = fixe;
+            c.rcvbuf = buf;
+            c.memoire = mem;
+            c.resserrer();
+            assert_eq!(c.rcvbuf, buf, "{fixe} {buf}");
+        }
+        // Une file égale à SO_RCVBUF ne dépasse pas.
+        c.rcvbuf_fixe = true;
+        c.rcvbuf = 100_000;
+        c.memoire = Memoire::Libre;
+        c.taille_vraie_reception = 100_000;
+        c.window_clamp = 50_000;
+        c.rcv_ssthresh = 30_000;
+        c.resserrer();
+        assert_eq!(c.rcv_ssthresh, 30_000);
+    }
+
+    #[test]
+    fn la_reception_pressee() {
+        let mut c = cas();
+        c.taille_vraie_reception = 87_500;
+        assert!(!c.reception_pressee(), "7/8 tout juste");
+        c.taille_vraie_reception = 87_501;
+        assert!(c.reception_pressee());
+        c.taille_vraie_reception = 0;
+        assert!(!c.reception_pressee());
+        c.memoire = Memoire::Souple;
+        assert!(!c.reception_pressee());
+        c.memoire = Memoire::Pression;
+        assert!(c.reception_pressee());
+    }
+
+    /// `tcp_prune_ofo_queue` : par la fin, jamais ce qui précède le segment, un huitième à la fois.
+    #[test]
+    fn elaguer_le_hors_ordre() {
+        let mut c = cas();
+        c.rcvbuf = 8000;
+        let base = c.rcv_nxt;
+        let places = [1000u32, 2000, 3000, 4000, 5000];
+        for p in places {
+            c.hors_ordre.ranger(base + p, octets(500, 1000)).unwrap();
+        }
+        c.nb_blocs = 2;
+        // Le segment arrive après tout : rien à jeter.
+        assert!(!c.elaguer_hors_ordre(base + 6000, 100));
+        assert_eq!(c.nb_blocs, 2);
+        assert_eq!(c.hors_ordre.taille_vraie, 5000);
+        // Pour 4000 octets, une place : 1000 à la fois (rcvbuf >> 3), jusqu'à ce qu'il tienne.
+        assert!(c.elaguer_hors_ordre(base + 500, 4000));
+        assert_eq!(c.nb_blocs, 0, "les blocs sont oubliés");
+        assert_eq!(c.hors_ordre.taille_vraie, 4000);
+        // Jamais ce qui le précède.
+        assert!(c.elaguer_hors_ordre(base + 3500, 100_000));
+        assert_eq!(c.hors_ordre.derniere_seq(), Some(base + 3000));
+        // Sous pression, on va jusqu'au bout, même s'il tient déjà.
+        c.memoire = Memoire::Pression;
+        assert!(c.elaguer_hors_ordre(base, 0));
+        assert!(c.hors_ordre.vide());
+    }
+
+    /// `tcp_collapse`.
+    #[test]
+    fn fondre_la_reception() {
+        let mut c = cas();
+        c.ratio = 128;
+        // Le premier de bon rendement reste ; ensuite, recopiés en paquets denses.
+        c.reception.push_back(octets(1000, 2000));
+        c.reception.push_back(octets(100, 2000));
+        c.reception.push_back(octets(3700, 8000));
+        c.taille_vraie_reception = 12_000;
+        c.fondre_reception();
+        let tailles: Vec<usize> = c.reception.iter().map(|p| p.octets().len()).collect();
+        assert_eq!(tailles, vec![1000, TAILLE_FONTE, 24]);
+        // Le tout, moins ce qui a été rendu, plus ce qui a été fait.
+        let vraie: usize = c.reception.iter().map(|p| p.taille_vraie()).sum();
+        assert_eq!(c.taille_vraie_reception, vraie);
+        assert_eq!(c.reception[0].taille_vraie(), 2000);
+        // Rien de mauvais rendement : rien.
+        let mut d = cas();
+        d.reception.push_back(octets(1000, 2000));
+        d.taille_vraie_reception = 2000;
+        d.fondre_reception();
+        assert_eq!(d.reception[0].taille_vraie(), 2000);
+        assert_eq!(d.reception.len(), 1);
+    }
+
+    #[test]
+    fn revenir_en_arriere() {
+        let mut f = alloc::collections::VecDeque::new();
+        f.push_back(octets(10, 0));
+        f.push_back(octets(20, 0));
+        f.push_back(octets(30, 0));
+        assert_eq!(revenir(&f, 2, 5, 3), (2, 2));
+        assert_eq!(revenir(&f, 2, 5, 5), (2, 0));
+        assert_eq!(revenir(&f, 2, 5, 6), (1, 19));
+        assert_eq!(revenir(&f, 2, 5, 26), (0, 9));
+    }
+
+    /// `tcp_rcvbuf_grow` : 2 × lu ; plus ce qui a crû depuis la dernière fois, proportionnellement
+    /// et deux fois ; plus ce qui attend hors d'ordre ; ramené de fenêtre en mémoire.
+    #[test]
+    fn rcvbuf_suit_le_debit() {
+        let mut c = cas();
+        c.rcvbuf_fixe = true;
+        c.espace.octets = 1000;
+        c.rcvbuf_suit(5000);
+        assert_eq!(c.espace.octets, 5000);
+        assert_eq!(c.rcvbuf, 100_000, "SO_RCVBUF fixé");
+        c.rcvbuf_fixe = false;
+        c.rcvbuf_max = 1 << 30;
+        c.rcvbuf = 1000;
+        c.espace.octets = 40_000;
+        // 2 × 50 000 = 100 000 ; croissance 100 000 × 10 000 / 40 000 = 25 000, deux fois.
+        c.rcvbuf_suit(50_000);
+        assert_eq!(c.espace.octets, 50_000);
+        assert_eq!(c.rcvbuf, 2 * 150_000);
+        assert_eq!(c.window_clamp, 150_000);
+        // Rien de plus lu : le double seulement. Et plus petit : on n'y touche pas.
+        let mut d = cas();
+        d.rcvbuf_max = 1 << 30;
+        d.rcvbuf = 2 * 100_000 - 1;
+        d.espace.octets = 50_000;
+        d.rcvbuf_suit(50_000);
+        assert_eq!(d.rcvbuf, 2 * 100_000);
+        assert_eq!(d.window_clamp, 100_000);
+        d.window_clamp = 77;
+        d.rcvbuf_suit(50_000);
+        assert_eq!((d.rcvbuf, d.window_clamp), (2 * 100_000, 77), "le même");
+        // Borné par tcp_rmem[2].
+        d.rcvbuf_max = 300_000;
+        d.espace.octets = 50_000;
+        d.rcvbuf_suit(200_000);
+        assert_eq!(d.rcvbuf, 300_000);
+        // Ce qui attend hors d'ordre.
+        let mut e = cas();
+        e.rcvbuf_max = 1 << 30;
+        e.rcvbuf = 1000;
+        e.espace.octets = 50_000;
+        e.hors_ordre.ranger(e.rcv_nxt + 1000, octets(500, 1000)).unwrap();
+        e.rcvbuf_suit(50_000);
+        assert_eq!(e.rcvbuf, 2 * (100_000 + 1500));
+    }
+
+    /// `tcp_rcv_space_adjust`.
+    #[test]
+    fn ajuster_l_espace() {
+        let mut c = cas();
+        c.rcvbuf_max = 1 << 30;
+        c.rcvbuf = 1000;
+        c.espace.temps = HEURE;
+        c.espace.seq = c.rcv_lu;
+        c.espace.octets = 1000;
+        // Pas de RTT du récepteur : rien.
+        c.rcv_rtt8 = 0;
+        c.rcv_lu = c.rcv_lu.wrapping_add(5000);
+        c.rcv_nxt = c.rcv_lu;
+        c.ajuster_espace(HEURE + 100 * MS);
+        assert_eq!(c.espace.octets, 1000);
+        // Pas encore un RTT : rien. Tout juste un RTT : oui.
+        c.rcv_rtt8 = 8 * 10 * MS;
+        c.ajuster_espace(HEURE + 10 * MS - 1);
+        assert_eq!(c.espace.octets, 1000);
+        c.ajuster_espace(HEURE + 10 * MS);
+        assert_eq!(c.espace.octets, 5000);
+        assert_eq!(c.espace.temps, HEURE + 10 * MS);
+        assert_eq!(c.espace.seq, c.rcv_lu);
+        assert!(c.rcvbuf > 1000);
+        // Ce qui reste en file ne compte pas : 4000 lus, 1000 en file : 3000 ; pas le plus grand.
+        let t = c.espace.temps;
+        c.rcv_lu = c.rcv_lu.wrapping_add(4000);
+        c.rcv_nxt = c.rcv_lu.wrapping_add(1000);
+        c.ajuster_espace(t + 10 * MS);
+        assert_eq!(c.espace.octets, 5000);
+        assert_eq!(c.espace.temps, t + 10 * MS, "la mesure repart quand même");
+        // Égal au plus grand : rien ; au-dessus : oui.
+        let t = c.espace.temps;
+        c.rcv_nxt = c.rcv_lu;
+        c.rcv_lu = c.rcv_lu.wrapping_add(5000);
+        c.rcv_nxt = c.rcv_lu;
+        c.ajuster_espace(t + 10 * MS);
+        assert_eq!(c.espace.octets, 5000);
+        let t = c.espace.temps;
+        c.rcv_lu = c.rcv_lu.wrapping_add(5001);
+        c.rcv_nxt = c.rcv_lu;
+        c.ajuster_espace(t + 10 * MS);
+        assert_eq!(c.espace.octets, 5001);
+    }
+
+    /// `tcp_set_window_clamp` : plus bas, `rcv_ssthresh` suit.
+    #[test]
+    fn la_fenetre_maximale() {
+        let mut c = cas();
+        c.window_clamp = 20_000;
+        c.rcv_ssthresh = 15_000;
+        c.poser_fenetre_max(0);
+        assert_eq!(c.window_clamp, 20_000);
+        c.poser_fenetre_max(10_000);
+        assert_eq!(c.window_clamp, 10_000);
+        assert_eq!(c.rcv_ssthresh, 10_000);
+        // Plus haut : le seuil suit ce qu'on a déjà annoncé, au plus le plafond.
+        c.rcv_wnd = 25_000;
+        c.rcv_ssthresh = 5000;
+        c.poser_fenetre_max(30_000);
+        assert_eq!(c.window_clamp, 30_000);
+        assert_eq!(c.rcv_ssthresh, 25_000);
+        c.rcv_wnd = 60_000;
+        c.rcv_ssthresh = 5000;
+        c.poser_fenetre_max(40_000);
+        assert_eq!(c.rcv_ssthresh, 40_000);
+        // Le même plafond : rien ne bouge. Et jamais sous la moitié du tampon minimal.
+        c.rcv_ssthresh = 5000;
+        c.poser_fenetre_max(40_000);
+        assert_eq!(c.rcv_ssthresh, 5000);
+        c.poser_fenetre_max(1);
+        assert_eq!(c.window_clamp, FENETRE_MAX_MIN);
+    }
+
+    /// `tcp_prune_queue` et `tcp_try_rmem_schedule`.
+    #[test]
+    fn faire_de_la_place() {
+        let mut c = cas();
+        c.rcvbuf = 10_000;
+        c.rcvbuf_fixe = true;
+        let base = c.rcv_nxt;
+        // De la place : rien à faire, et la mémoire est accordée.
+        assert!(c.peut_recevoir(10_000));
+        assert!(!c.peut_recevoir(10_001));
+        assert!(c.reserver_reception(base, 10_000));
+        // Rien en mémoire : `elaguer` ne peut rien.
+        assert!(!c.elaguer(base, 20_000));
+        assert!(!c.reserver_reception(base, 20_000));
+        // Du hors d'ordre à jeter après `seq` : il tiendra.
+        for k in 1..=4u32 {
+            c.hors_ordre.ranger(base + k * 1000, octets(100, 2000)).unwrap();
+        }
+        assert_eq!(c.memoire_reception(), 8000);
+        assert!(c.reserver_reception(base, 4000));
+        assert!(c.memoire_reception() <= 6000);
+        // Le hors d'ordre qui précède reste : pas de place, faux.
+        assert!(!c.reserver_reception(base + 500_000, 9000));
+        // Sous pression, avec de la place : `rcv_ssthresh` réduit.
+        c.memoire = Memoire::Pression;
+        c.rcv_ssthresh = 100_000;
+        assert!(c.elaguer(base, 100));
+        assert_eq!(c.rcv_ssthresh, 4 * c.mss_local as u32);
+        // Sans pression, sans toucher au seuil.
+        c.memoire = Memoire::Souple;
+        c.rcv_ssthresh = 100_000;
+        assert!(c.elaguer(base, 100));
+        assert_eq!(c.rcv_ssthresh, 100_000);
+        // La mémoire refusée : on jette jusqu'à ce qu'elle passe, ou faux.
+        let mut d = cas();
+        d.rcvbuf = 100_000;
+        let b = d.rcv_nxt;
+        d.hors_ordre.ranger(b + 1000, octets(100, 3000)).unwrap();
+        d.hors_ordre.ranger(b + 2000, octets(100, 3000)).unwrap();
+        d.memoire = Memoire::Excedent;
+        assert!(d.reserver_reception(b, 100));
+        assert!(d.hors_ordre.vide(), "sous pression, on va jusqu'au bout");
+        d.memoire = Memoire::Limite;
+        assert!(!d.reserver_reception(b, 100));
+    }
+
+    /// Le rendement qui ne dépasse pas la limite d'une page, et la fin de la file.
+    #[test]
+    fn fondre_garde_la_memoire_bonne() {
+        let mut c = cas();
+        c.reception.push_back(octets(100, 2000));
+        c.taille_vraie_reception = 2000;
+        // Rendement mauvais : (2000 * 128 >> 8) = 1000 > 100 : recopié.
+        c.fondre_reception();
+        assert_eq!(c.reception[0].octets().len(), 100);
+        assert_eq!(c.reception.len(), 1);
+        assert_eq!(c.taille_vraie_reception, 96 + 100 + 576);
+    }
+
+    /// Ni MSS du récepteur, ni plafond : `mss > plein` est faux, on continue (seul un MSS plus
+    /// grand que la pleine rend 0, quand la pleine est nulle).
+    #[test]
+    fn la_fenetre_sans_mss_ni_plafond() {
+        let mut c = cas();
+        c.window_clamp = 0;
+        c.ack.rcv_mss = 0;
+        c.rcv_ssthresh = 5000;
+        c.rcv_wnd = 3000;
+        assert_eq!(c.choisir_fenetre(), 5000);
+    }
+
+    /// Tout juste une demi-pleine d'écart : on garde encore l'annonce précédente.
+    #[test]
+    fn la_fenetre_a_une_demi_pleine_d_ecart() {
+        let mut c = cas();
+        c.window_clamp = 2000;
+        c.ack.rcv_mss = 2000;
+        c.rcv_ssthresh = 5000;
+        c.rcv_wnd = 4000;
+        assert_eq!(c.choisir_fenetre(), 4000);
+        // Une de moins : l'écart dépasse.
+        c.rcv_wnd = 3999;
+        assert_eq!(c.choisir_fenetre(), 5000);
+    }
+
+    /// La réserve d'un segment ne touche pas un plafond d'au plus deux segments.
+    #[test]
+    fn l_espace_initial_un_petit_plafond() {
+        let mut c = cas();
+        c.mss_local = 1000;
+        c.rcvbuf = 4000;
+        let plein = c.espace_plein().max(0) as u32;
+        assert_eq!(plein, 2000);
+        c.window_clamp = 1500;
+        c.rcv_ssthresh = 90_000;
+        c.rcv_wnd = 90_000;
+        c.espace_initial(HEURE);
+        assert_eq!(c.window_clamp, 1500);
+    }
+
+    /// Juste sous le MSS par défaut, avec PSH : pas mesuré (`tcp_measure_rcv_mss`).
+    #[test]
+    fn le_mss_pas_mesure_juste_sous_le_defaut() {
+        let mut c = cas();
+        let entete = Tcp { drapeaux: tcp::ACK | tcp::PSH, options: tcp::Options::default(), ..Tcp::default() };
+        c.ack.rcv_mss = 1000;
+        c.ack.dernier_segment = 535;
+        c.mesurer_rcv_mss(535, 2000, &entete);
+        assert_eq!(c.ack.rcv_mss, 1000);
+        assert_eq!(c.ack.dernier_segment, 0);
+        c.ack.dernier_segment = 536;
+        c.mesurer_rcv_mss(536, 2000, &entete);
+        assert_eq!(c.ack.rcv_mss, 536);
+    }
+
+    /// SO_RCVBUF tient déjà tout juste le seuil : ni lui, ni le plafond ne bougent.
+    #[test]
+    fn so_rcvlowat_tout_juste() {
+        let mut c = cas();
+        c.rcvbuf_max = 1 << 20;
+        c.rcvbuf_fixe = false;
+        c.rcvbuf = c.espace_de(100_000) as usize;
+        let r = c.rcvbuf;
+        c.window_clamp = 60_000;
+        assert_eq!(c.poser_rcvlowat(100_000), 100_000);
+        assert_eq!((c.rcvbuf, c.window_clamp), (r, 60_000));
+    }
+
+    /// Deux fois la longueur du segment, quand elle dépasse deux MSS ; sinon, deux MSS.
+    #[test]
+    fn agrandir_de_deux_segments() {
+        let mut c = cas();
+        c.mss_local = 1000;
+        c.rcvbuf_max = 1 << 20;
+        c.window_clamp = 40_000;
+        c.rcv_ssthresh = 10_000;
+        c.agrandir_fenetre(1500, 3000);
+        assert_eq!(c.rcv_ssthresh, 13_000);
+        c.rcv_ssthresh = 10_000;
+        c.agrandir_fenetre(500, 1000);
+        assert_eq!(c.rcv_ssthresh, 12_000);
+    }
+
+    /// Tout juste autant lu que la mesure précédente : SO_RCVBUF ne suit pas.
+    #[test]
+    fn ajuster_l_espace_tout_juste() {
+        let mut c = cas();
+        c.rcvbuf_max = 1 << 30;
+        c.rcvbuf = 1000;
+        c.espace.temps = HEURE;
+        c.espace.seq = c.rcv_lu;
+        c.espace.octets = 1000;
+        c.rcv_rtt8 = 8 * 10 * MS;
+        c.rcv_lu = c.rcv_lu.wrapping_add(1000);
+        c.rcv_nxt = c.rcv_lu;
+        c.ajuster_espace(HEURE + 100 * MS);
+        assert_eq!((c.rcvbuf, c.espace.octets), (1000, 1000));
+        assert_eq!(c.espace.temps, HEURE + 100 * MS, "la mesure repart quand même");
+    }
+
+    /// SO_RCVBUF déjà au maximum ne redescend pas vers ce que garde la file.
+    #[test]
+    fn resserrer_au_maximum() {
+        let mut c = cas();
+        c.mss_local = 1000;
+        c.rcvbuf_max = 200_000;
+        c.rcvbuf = 200_000;
+        c.rcvbuf_fixe = false;
+        c.memoire = Memoire::Libre;
+        c.taille_vraie_reception = 1000;
+        c.resserrer();
+        assert_eq!(c.rcvbuf, 200_000);
+    }
+
+    /// Le segment ne tient toujours pas : le but repart d'un huitième de SO_RCVBUF, et pas de
+    /// huit fois : une entrée de plus suffit à regarder de nouveau.
+    #[test]
+    fn elaguer_un_huitieme_a_la_fois() {
+        let mut c = cas();
+        c.rcvbuf = 8000;
+        let base = c.rcv_nxt;
+        for p in [1000u32, 2000, 3000, 4000, 5000] {
+            c.hors_ordre.ranger(base + p, octets(500, 1000)).unwrap();
+        }
+        // Au départ tout tient (la taille vraie du hors d'ordre : 5000) ; il reste à jeter.
+        c.taille_vraie_reception = 0;
+        assert!(c.elaguer_hors_ordre(base + 500, 4000));
+        assert_eq!(c.hors_ordre.taille_vraie, 4000, "1000 suffisent");
+        // 6000 ne tiendraient qu'une fois descendu à 2000 : deux passes de 1000.
+        assert!(c.elaguer_hors_ordre(base + 500, 6000));
+        assert_eq!(c.hors_ordre.taille_vraie, 2000);
+    }
+
+    /// La mémoire manque au milieu d'un paquet : ce qui a été recopié n'y reste pas, et le flux
+    /// ne perd ni ne double rien.
+    #[test]
+    fn fondre_quand_la_memoire_manque() {
+        let mut c = cas();
+        // TAILLE_FONTE octets recopiés, puis le reste n'a pas de quoi être créé.
+        c.reception.push_back(octets(TAILLE_FONTE + REFUSEE, 2 * TAILLE_FONTE + 8000));
+        c.taille_vraie_reception = 2 * TAILLE_FONTE + 8000;
+        c.fondre_reception();
+        let tailles: Vec<usize> = c.reception.iter().map(|p| p.octets().len()).collect();
+        assert_eq!(tailles, vec![TAILLE_FONTE, REFUSEE]);
+    }
+
+    /// `tcp_collapse_ofo_queue` : au plus un huitième de SO_RCVBUF de petits en suivant.
+    #[test]
+    fn fondre_le_hors_ordre_un_huitieme() {
+        let prete = |rcvbuf: usize| {
+            let mut c = cas();
+            c.rcvbuf = rcvbuf;
+            let base = c.rcv_nxt;
+            // Trois petits isolés, de 1000 en taille vraie, puis une suite de deux à fondre.
+            for p in [1000u32, 3000, 5000] {
+                c.hors_ordre.ranger(base + p, octets(100, 1000)).unwrap();
+            }
+            c.hors_ordre.ranger(base + 7000, octets(100, 2000)).unwrap();
+            c.hors_ordre.ranger(base + 7100, octets(100, 2000)).unwrap();
+            c
+        };
+        let mut c = prete(8000);
+        c.fondre_hors_ordre();
+        assert_eq!(c.hors_ordre.taille_vraie, 7000, "2000 de petits dépassent le huitième : on s'arrête avant la suite");
+        let mut c = prete(32_000);
+        c.fondre_hors_ordre();
+        assert_eq!(c.hors_ordre.taille_vraie, 3000 + 96 + 200 + 576, "3000 de petits n'atteignent pas le huitième");
+    }
+}
