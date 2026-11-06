@@ -319,10 +319,15 @@ static void bornes(void)
     int ouverts[8], n = 0, dernier;
     while (n < 8 && (dernier = open("/dev/null", O_RDONLY)) >= 0)
         ouverts[n++] = dernier;
+    /* Le chemin d'abord : Linux 6.18, et notre noyau. Sur l'hôte, un noyau plus récent peut réserver
+     * d'abord le numéro : EMFILE (mesuré : 7.0, celui de la CI). */
+    int hote = access("/etc/bonjour.txt", F_OK) != 0;
     errno = 0;
-    verifier(ERREUR(syscall(SYS_openat, AT_FDCWD, NULL, O_RDONLY), EFAULT), "table pleine, chemin nul : EFAULT");
+    verifier(syscall(SYS_openat, AT_FDCWD, NULL, O_RDONLY) == -1 && (errno == EFAULT || (hote && errno == EMFILE)),
+             "table pleine, chemin nul : EFAULT");
     errno = 0;
-    verifier(ERREUR(open("", O_RDONLY), ENOENT), "table pleine, chemin vide : ENOENT");
+    verifier(open("", O_RDONLY) == -1 && (errno == ENOENT || (hote && errno == EMFILE)),
+             "table pleine, chemin vide : ENOENT");
     errno = 0;
     verifier(ERREUR(open("/tmp/fichiers-absent/x", O_RDONLY), EMFILE), "table pleine, chemin absent : EMFILE");
     while (n > 0)

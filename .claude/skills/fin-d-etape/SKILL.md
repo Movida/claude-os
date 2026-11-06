@@ -566,3 +566,14 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   `0x7ffffffff000` n'est la dernière page qu'avec quatre niveaux de tables. Sur
   une machine LA57, Linux y projette sans rien dire. Ces différences se
   reproduisent sans la machine : le vrai Linux sous QEMU, avec `-cpu qemu64,+la57`.
+- **Le noyau de la CI n'est pas le nôtre, et il change** : Linux 7.0-azure en
+  novembre 2026, dans les notes de chaque image (releases de
+  `actions/runner-images`, « Kernel Version »). `make` s'arrête au premier
+  échec : un push par écart prendrait des heures. Son paquet exact
+  (`apt-get download linux-image-unsigned-...`), sous QEMU avec `-cpu max` et
+  une carte virtio, un `/init` statique qui lance la liste de `tests-hote` sans
+  s'arrêter, montre tout d'un coup. Pour ressembler à la CI : l'utilisateur 1000,
+  les fichiers à lui, la sortie dans un tube qu'il a créé, /tmp sur la même
+  partition que la racine, un /etc/hosts.
+- **Une fonction entre le test et `errno`** l'écrase : `access(...) && errno ==
+  ENOMEM` lisait ENOENT. Garder `errno` dans une variable d'abord.

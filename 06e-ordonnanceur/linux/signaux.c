@@ -170,9 +170,14 @@ static void pile_de_secours(void)
     verifier(sigaltstack(NULL, &lue) == 0 && lue.ss_sp == NULL && lue.ss_flags == SS_DISABLE && lue.ss_size == 0,
              "sigaltstack : au depart {NULL, SS_DISABLE, 0}");
     /* Linux garde les drapeaux tels que posés (0 au départ) : redonner la
-     * pile qu'on a ne change rien et réussit, sans vérifier la taille. */
+     * pile qu'on a ne change rien et réussit, sans vérifier la taille. Sur
+     * l'hôte, ces drapeaux viennent de nos ancêtres, exec n'y touche pas : un
+     * fil sans pile de secours laisse SS_DISABLE, et la taille est alors
+     * vérifiée (mesuré sous un init lancé par le noyau : ENOMEM). */
     s = (stack_t){ .ss_sp = NULL, .ss_flags = 0, .ss_size = 0 };
-    verifier(sigaltstack(&s, NULL) == 0, "redonner {NULL, 0, 0}, la pile de depart : 0");
+    int redonne = sigaltstack(&s, NULL) == 0 ? 0 : errno;
+    verifier(redonne == 0 || (access("/etc/bonjour.txt", F_OK) != 0 && redonne == ENOMEM),
+             "redonner {NULL, 0, 0}, la pile de depart : 0");
     s = (stack_t){ .ss_sp = pile, .ss_flags = 0, .ss_size = 2047 };
     verifier(sigaltstack(&s, NULL) == -1 && errno == ENOMEM, "2047 octets : ENOMEM");
     s.ss_size = 2048;

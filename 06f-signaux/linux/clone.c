@@ -132,7 +132,13 @@ static void refus_clone(void)
         verifier(clone_brut(CLONE_FS | CLONE_NEWNS, NULL, NULL, NULL, 0) == EINVAL, "clone, CLONE_FS et CLONE_NEWNS : EINVAL");
     verifier(clone_brut(CLONE_PIDFD | CLONE_PARENT_SETTID, NULL, &a, NULL, 0) == EINVAL,
              "clone, CLONE_PIDFD et CLONE_PARENT_SETTID au meme endroit : EINVAL");
-    verifier(clone_brut(UN_FIL | CLONE_SETTLS, NULL, NULL, NULL, 0x800000000000UL) == EPERM,
+    /* La première adresse interdite à un programme : 47 bits, ou 56 avec cinq niveaux de tables
+     * (LA57 ; voir linux/memoire.c, `derniere_page`). */
+    void *haut = mmap((void *)(1UL << 47), 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    uint64_t interdite = haut == MAP_FAILED ? 1UL << 47 : 1UL << 56;
+    if (haut != MAP_FAILED)
+        munmap(haut, 4096);
+    verifier(clone_brut(UN_FIL | CLONE_SETTLS, NULL, NULL, NULL, interdite) == EPERM,
              "clone, CLONE_SETTLS hors des adresses : EPERM");
 }
 

@@ -83,7 +83,16 @@ void copier_cadre(void)
      * octets avec XSAVE, mesuré) : 1792 octets, sans sortir de la pile (le
      * RSP interrompu est 256 octets sous celui de cadre_de_signal, et
      * au-dessus il y a encore argv, envp et le vecteur auxiliaire). */
-    memcpy(cadre, (void *)vu_rsp, 1792);
+    /* Le cadre et son état étendu, jusqu'à MAGIC2 : l'état grandit avec le processeur (2 700 octets
+     * avec PKRU, mesuré sous QEMU ; 836 avec x87, SSE et AVX seuls). */
+    size_t n = 1792;
+    if (xsave) {
+        unsigned char *fp = *(unsigned char **)(vu_rsp + 48 + 23 * 8);
+        size_t jusqu_a_magic2 = (size_t)(fp - (unsigned char *)vu_rsp) + *(uint32_t *)(fp + 480) + 4;
+        if (jusqu_a_magic2 > n)
+            n = jusqu_a_magic2 < sizeof cadre ? jusqu_a_magic2 : sizeof cadre;
+    }
+    memcpy(cadre, (void *)vu_rsp, n);
     sigset_t m;
     sigprocmask(SIG_BLOCK, NULL, &m);
     memcpy(&masque_dedans, &m, 8);
@@ -185,7 +194,9 @@ static void cadre_de_signal(void)
     /* L'ucontext. */
     uint64_t uc_flags = LIRE64(8);
     verifier(uc_flags == (xsave ? 7u : 6u) && LIRE64(16) == 0, "uc_flags : 7 avec XSAVE, 6 sans ; uc_link nul");
-    verifier(LIRE64(24) == 0 && LIRE32(32) == 0 && LIRE64(40) == 0, "uc_stack : la pile de secours, ici aucune {0, 0, 0}");
+    /* (Sur l'hôte, ss_flags vient de nos ancêtres : SS_DISABLE, si l'un d'eux était un fil sans pile
+     * de secours ; voir linux/signaux.c.) */
+    verifier(LIRE64(24) == 0 && (LIRE32(32) == 0 || (!chez_nous && LIRE32(32) == SS_DISABLE)) && LIRE64(40) == 0, "uc_stack : la pile de secours, ici aucune {0, 0, 0}");
     const int mc = 48;
     verifier(LIRE64(mc + 4 * 8) == 0x1212121212121212 && LIRE64(mc + 0) == 0x0808080808080808 && LIRE64(mc + 15 * 8) == s
              && LIRE64(mc + 16 * 8) == apres_syscall, "le sigcontext : r12, r8, rsp et rip du programme");
@@ -214,7 +225,7 @@ static void cadre_de_signal(void)
         uint32_t magic1 = *(uint32_t *)(fp + 464), etendue = *(uint32_t *)(fp + 468), xsz = *(uint32_t *)(fp + 480);
         uint64_t xfeat = *(uint64_t *)(fp + 472);
         taille = xsz + 4;
-        verifier(magic1 == 0x46505853 && etendue == xsz + 4 && xfeat == (xcr0 & 7) && *(uint32_t *)(fp + xsz) == 0x46505845,
+        verifier(magic1 == 0x46505853 && etendue == xsz + 4 && (chez_nous ? xfeat == (xcr0 & 7) : (xfeat & 7) == (xcr0 & 7) && (xfeat & ~xcr0) == 0) && *(uint32_t *)(fp + xsz) == 0x46505845,
                  "XSAVE : les octets du logiciel (magie, tailles, composants) et MAGIC2");
         verifier((*(uint64_t *)(fp + 512) & 3) == 3 && *(uint64_t *)(fp + 520) == 0, "XSAVE : l'en-tete, x87 et SSE presents, format standard");
     } else if (chez_nous) {

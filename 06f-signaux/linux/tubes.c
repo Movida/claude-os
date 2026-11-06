@@ -66,7 +66,15 @@ static void creation(void)
              "pipe2(O_DIRECT) : O_DIRECT sur le bout d'ecriture seulement");
     close(t[0]);
     close(t[1]);
-    verifier(erreur(syscall(SYS_pipe2, t, O_EXCL)) == ENOPKG, "pipe2(O_NOTIFICATION_PIPE) : ENOPKG");
+    /* ENOPKG sans CONFIG_WATCH_QUEUE : notre noyau, et celui de WSL. Sur l'hôte, avec (le noyau de
+     * la CI), un tube, comme les autres. */
+    int notification = erreur(syscall(SYS_pipe2, t, O_EXCL));
+    if (notification == 0) {
+        close(t[0]);
+        close(t[1]);
+    }
+    verifier(notification == ENOPKG || (access("/etc/bonjour.txt", F_OK) != 0 && notification == 0),
+             "pipe2(O_NOTIFICATION_PIPE) : ENOPKG");
     verifier(erreur(syscall(SYS_pipe2, t, O_APPEND)) == EINVAL, "pipe2(O_APPEND) : EINVAL");
     verifier(erreur(syscall(SYS_pipe2, (void *)8, 0)) == EFAULT, "pipe2 vers l'adresse 8 : EFAULT");
 
