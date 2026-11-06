@@ -272,6 +272,8 @@ pub struct Tache {
     /// sortie de son appel (la liste chaînée par les sockets elles-mêmes :
     /// le `task_work` de Linux ; reseau/socket.rs).
     pub fermetures: Verrou<Option<Arc<crate::reseau::socket::Socket>>>,
+    /// Les tubes dont elle a fermé un bout, à signaler (tube::fichier_ferme), au même moment.
+    pub tubes_fermes: Verrou<Option<Arc<crate::tube::Tube>>>,
 }
 
 /// Ce qu'un programme a de plus qu'une tâche du noyau.
@@ -374,6 +376,7 @@ impl Tache {
             reprise: Verrou::new(None),
             contexte_reseau: AtomicU32::new(0),
             fermetures: Verrou::new(None),
+            tubes_fermes: Verrou::new(None),
         })
         .map_err(|_| Manque::Memoire)?;
         Ok(t)
@@ -613,6 +616,7 @@ pub fn initialiser() {
         reprise: Verrou::new(None),
         contexte_reseau: AtomicU32::new(0),
         fermetures: Verrou::new(None),
+        tubes_fermes: Verrou::new(None),
     };
     let t = Arc::into_raw(Arc::new(pile_demarrage).expect("plus de memoire pour la tache du demarrage")) as *mut Tache;
     INACTIVE.store(t, Ordering::Relaxed);

@@ -85,19 +85,19 @@
 //! précédent redevient un octet comme un autre. Lu à part, il reste en file, vide : une marque
 //! (SIOCATMARK), où s'arrête la lecture d'avant, et que jette celle d'après (`prochain_du_flux`).
 //!
-//! ÉCARTS : pas de SIGURG au propriétaire de la socket (`sk_send_sigurg`) : F_SETOWN n'existe pas
-//! chez nous, et le TCP non plus ne l'envoie pas. SIOCINQ dit ce qui reste à lire : Linux 6.18 tient un
+//! ÉCART : SIOCINQ dit ce qui reste à lire : Linux 6.18 tient un
 //! compte à part (`inq_len`), qui ne descend qu'à la fin d'un message (mesuré : 6 à lire, 1 lu : 6
 //! encore), et qui oublie l'octet urgent sauté (il dit 1, la file vide, pour toujours) : pas un
 //! comportement sur lequel un programme peut compter.
 
 use super::socket::{Protocole, Socket, ARRET_ECRITURE, ARRET_LECTURE, POLLRDHUP};
+use crate::asynchrone::Raison;
 use crate::appels_fichiers::FichierTenu;
 use crate::descripteurs::{Fichier, Sorte as SorteFichier};
 use crate::attente::{self, FileAttente, GardeMutex, Mutex, PorteFile, Relais, Sommeil};
 use crate::faillible::{self, FileFaillible, VecFaillible};
 use crate::partage::{Arc, Weak};
-use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRBAND, POLLWRNORM};
+use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND, POLLWRNORM};
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::{cpu, processus, temps};
@@ -641,6 +641,10 @@ fn liberer(mut m: Message) {
     if let Some(e) = &m.emetteur {
         unix(e).envoyes.fetch_sub(m.taille, Ordering::Relaxed);
         reveiller(e, POLLOUT | POLLWRNORM | POLLWRBAND);
+        // (`unix_write_space` : au quart de SO_SNDBUF, comme `unix_writable`.)
+        if unix(e).envoyes.load(Ordering::Relaxed) * 4 <= e.sndbuf.load(Ordering::Relaxed) as usize {
+            e.asynchrone.place();
+        }
     }
 }
 
@@ -854,6 +858,7 @@ fn connecter_flux(s: &Arc<Socket>, n: &Nom, non_bloquant: bool) -> Result<(), i6
             break Err(-ECONNREFUSED);
         }
         reveiller(&autre, POLLIN | POLLRDNORM);
+        autre.asynchrone.lecture(Raison::Entree);
         break Ok(());
     };
     if r.is_err() {
@@ -889,10 +894,44 @@ fn connecter_datagrammes(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
         e.phase = if autre.is_some() { Phase::Connectee } else { Phase::Neuve };
         core::mem::replace(&mut e.pair, autre)
     };
-    // L'ancien pair ne nous concerne plus (`unix_dgram_peer_wake_disconnect`).
-    u.relais.retirer();
-    drop(ancien);
+    // L'ancien pair ne nous concerne plus (`unix_dgram_peer_wake_disconnect_wakeup`) : qui attend de
+    // pouvoir écrire revoit où il en est.
+    if let Some(ancien) = ancien {
+        u.relais.retirer();
+        reveiller(s, POLLOUT | POLLWRNORM | POLLWRBAND);
+        let meme = u.etat.verrouiller().pair.as_ref().is_some_and(|p| Arc::ptr_eq(p, &ancien));
+        if !meme {
+            dgram_deconnectee(s, &ancien);
+        }
+    }
     Ok(())
+}
+
+/// Un DGRAM a quitté son pair (`unix_dgram_disconnected`) : sa file est jetée (il ne doit recevoir
+/// que de son pair, et la place ne se compte plus que chez l'émetteur) ; si l'ancien pair était
+/// connecté à lui, ses messages sont perdus : il l'apprend : ECONNRESET. Une file vide : rien.
+fn dgram_deconnectee(s: &Arc<Socket>, ancien: &Arc<Socket>) {
+    let u = unix(s);
+    let file = core::mem::take(&mut u.etat.verrouiller().file);
+    if file.is_empty() {
+        return;
+    }
+    for m in file {
+        liberer(m);
+    }
+    u.attente_pairs.reveiller(POLLOUT | POLLWRNORM | POLLWRBAND, 0);
+    let touche = {
+        let mut e = unix(ancien).etat.verrouiller();
+        let touche = !e.morte && e.pair.as_ref().is_some_and(|p| Arc::ptr_eq(p, s));
+        if touche {
+            e.erreur = ECONNRESET as i32;
+        }
+        touche
+    };
+    if touche {
+        reveiller(ancien, POLLERR);
+        ancien.asynchrone.evenement(Raison::Erreur);
+    }
 }
 
 /// connect.
@@ -998,21 +1037,30 @@ fn attendre_place(s: &Socket, non_bloquant: bool, echeance: Option<u64>, delai: 
     let u = unix(s);
     let sndbuf = || s.sndbuf.load(Ordering::Relaxed) as usize;
     let place = || u.envoyes.load(Ordering::Relaxed) < sndbuf();
-    if place() {
-        return Ok(());
+    loop {
+        {
+            let mut e = u.etat.verrouiller();
+            let erreur = core::mem::take(&mut e.erreur);
+            if erreur != 0 {
+                return Err(-(erreur as i64));
+            }
+            if e.arret & ARRET_ECRITURE != 0 {
+                return Err(-EPIPE);
+            }
+        }
+        if place() {
+            return Ok(());
+        }
+        // (`sock_alloc_send_pskb` : SOCKWQ_ASYNC_NOSPACE.)
+        s.asynchrone.marquer_sans_place();
+        if non_bloquant {
+            return Err(-EAGAIN);
+        }
+        attendre(&s.attente, echeance, delai, || {
+            let e = u.etat.verrouiller();
+            place() || e.arret & ARRET_ECRITURE != 0 || e.erreur != 0
+        })?;
     }
-    if non_bloquant {
-        return Err(-EAGAIN);
-    }
-    attendre(&s.attente, echeance, delai, || {
-        let e = u.etat.verrouiller();
-        place() || e.arret & ARRET_ECRITURE != 0 || e.erreur != 0
-    })?;
-    let e = u.etat.verrouiller();
-    if e.arret & ARRET_ECRITURE != 0 || e.erreur != 0 {
-        return Err(-EPIPE);
-    }
-    Ok(())
 }
 
 /// Un message de `n` octets, rempli par `remplir` à partir de l'octet
@@ -1047,6 +1095,7 @@ fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
         }
     };
     compter(&m, true);
+    let mut urgent = false;
     {
         let en_vol = m.fichiers.iter().filter(|f| socket_du_fichier(f).is_some()).count();
         let mut graphe = (en_vol > 0).then(|| GRAPHE.verrouiller());
@@ -1076,6 +1125,7 @@ fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
         }
         if m.numero_oob != 0 {
             e.oob = m.numero_oob;
+            urgent = true;
         }
         EN_VOL.fetch_add(m.fichiers.len(), Ordering::Relaxed);
         if let Some(g) = &mut graphe {
@@ -1086,7 +1136,13 @@ fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
         }
         e.file.ajouter_derriere_dans_la_place(m);
     }
-    reveiller(autre, POLLIN | POLLRDNORM);
+    // Tout ce que dit `sock_def_readable`, POLLPRI compris : un epoll sur l'octet urgent seul.
+    // L'octet urgent passe par SIGURG d'abord (`queue_oob` : `sk_send_sigurg`).
+    if urgent {
+        autre.asynchrone.urgent();
+    }
+    reveiller(autre, POLLIN | POLLPRI | POLLRDNORM | POLLRDBAND);
+    autre.asynchrone.lecture(Raison::Entree);
     Ok(())
 }
 
@@ -1230,7 +1286,11 @@ fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize,
                     None
                 }
             };
-            drop(ancien);
+            if let Some(ancien) = ancien {
+                u.relais.retirer();
+                reveiller(s, POLLOUT | POLLWRNORM | POLLWRBAND);
+                dgram_deconnectee(s, &ancien);
+            }
             return Err(-ECONNREFUSED);
         }
         // Une file pleine n'arrête qu'un DGRAM qui n'est pas son pair.
@@ -1341,10 +1401,18 @@ fn rien_a_lire(s: &Socket, a: &mut Attente, non_bloquant: bool) -> Result<Option
         return Err(-EAGAIN);
     }
     drop(a.lecteur.take());
+    // (`unix_stream_data_wait` : SOCKWQ_ASYNC_WAITDATA ; un DGRAM n'y passe pas.)
+    let flux = u.sorte == Sorte::Flux;
+    if flux {
+        s.asynchrone.attendre_donnees(true);
+    }
     let attendu = attendre(&s.attente, a.echeance, a.delai, || {
         let e = u.etat.verrouiller();
         !e.file.is_empty() || e.erreur != 0 || e.arret & ARRET_LECTURE != 0
     });
+    if flux {
+        s.asynchrone.attendre_donnees(false);
+    }
     a.lecteur = Some(a.lecteurs.verrouiller());
     attendu?;
     Ok(Some(()))
@@ -1641,6 +1709,12 @@ pub fn arreter(s: &Socket, arret: u8) {
         }
         unix(&p).etat.verrouiller().arret |= miroir;
         reveiller(&p, 0);
+        // `unix_shutdown`.
+        if miroir == ARRET_LECTURE | ARRET_ECRITURE {
+            p.asynchrone.lecture(Raison::Coupure);
+        } else if miroir & ARRET_LECTURE != 0 {
+            p.asynchrone.lecture(Raison::Entree);
+        }
     }
 }
 
@@ -1692,6 +1766,7 @@ fn fermer_avec(s: &Socket, embryon: bool) {
                 }
             }
             reveiller(&p, POLLIN | POLLOUT | POLLERR | POLLHUP);
+            p.asynchrone.lecture(Raison::Coupure);
         }
         drop(p);
     }
@@ -1761,6 +1836,9 @@ pub fn sonder(s: &Socket) -> u32 {
     }
     if ecrire {
         m |= POLLOUT | POLLWRNORM | POLLWRBAND;
+    } else {
+        // (`unix_poll` : SOCKWQ_ASYNC_NOSPACE.)
+        s.asynchrone.marquer_sans_place();
     }
     drop(pair);
     m

@@ -32,6 +32,8 @@ extern crate alloc;
 #[macro_use]
 #[allow(unsafe_code)]
 mod console;
+// Les signaux d'entrée-sortie : le propriétaire d'un fichier, O_ASYNC.
+mod asynchrone;
 
 // Le matériel : les ports, la mémoire des périphériques (MMIO), l'assembleur
 // (`asm!`), les registres et les tables du processeur, les tables du

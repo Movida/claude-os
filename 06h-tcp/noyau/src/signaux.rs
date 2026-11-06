@@ -136,6 +136,14 @@ impl Info {
         Info::nouveau(sig, SI_KERNEL)
     }
 
+    /// Celui d'une entrée-sortie (`send_sigio_to_task` : les champs `_sigpoll` : si_band, si_fd).
+    pub fn entree_sortie(sig: u64, code: i32, bande: i64, fd: i32) -> Info {
+        let mut i = Info::nouveau(sig, code);
+        i.0[16..24].copy_from_slice(&bande.to_le_bytes());
+        i.0[24..28].copy_from_slice(&fd.to_le_bytes());
+        i
+    }
+
     /// Celui d'une faute du programme : sa raison (SEGV_MAPERR...) et
     /// l'adresse en cause (les champs `_sigfault` : si_addr).
     pub fn faute(sig: u64, code: i32, adresse: u64) -> Info {
@@ -1025,6 +1033,32 @@ fn envoyer_a(pid: u32, sig: u64, a: Destinataire, info: Info) -> i64 {
             0
         }
         None => 0,
+    }
+}
+
+/// Un signal a-t-il ses propres `si_code` (SIG_SPECIFIC_SICODES_MASK) ?
+pub fn a_ses_propres_codes(sig: u64) -> bool {
+    // SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV, SIGCHLD, SIGPOLL, SIGSYS.
+    matches!(sig, 4 | 5 | 7 | 8 | 11 | 17 | 29 | 31)
+}
+
+/// Le signal du propriétaire d'un fichier (asynchrone.rs : `do_send_sig_info`), si `uid`, qui l'a
+/// posé, en a le droit sur ce processus (`sigio_perm`). Un processus parti : rien. Err : la file des
+/// signaux est pleine. Sans verrou tenu.
+pub fn du_proprietaire(pid: u32, a: Destinataire, sig: u64, info: Info, uid: u32) -> Result<(), i64> {
+    let r = processus::avec_pid(pid, |p| {
+        if uid != 0 && p.identite.uid != uid {
+            return Ok(None);
+        }
+        envoyer(p, sig, a, info, false)
+    });
+    match r {
+        Some(Err(e)) => Err(e),
+        Some(Ok(t)) => {
+            reveiller(t);
+            Ok(())
+        }
+        None => Ok(()),
     }
 }
 

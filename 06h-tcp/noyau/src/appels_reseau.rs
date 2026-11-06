@@ -1919,6 +1919,25 @@ pub fn ioctl(o: &FichierTenu, requete: u64, argument: u64) -> i64 {
     const SIOCOUTQ: u64 = 0x5411;
     const SIOCOUTQNSD: u64 = 0x894b;
     const SIOCATMARK: u64 = 0x8905;
+    const FIOSETOWN: u64 = 0x8901;
+    const SIOCSPGRP: u64 = 0x8902;
+    const FIOGETOWN: u64 = 0x8903;
+    const SIOCGPGRP: u64 = 0x8904;
+    // Le propriétaire de son fichier, pour toutes les sockets (`sock_ioctl`).
+    if matches!(requete, FIOSETOWN | SIOCSPGRP) {
+        let mut v = [0u8; 4];
+        if copier_depuis_utilisateur(&mut v, argument).is_err() {
+            return -EFAULT;
+        }
+        return crate::asynchrone::f_setown(o.fichier_ouvert(), i32::from_le_bytes(v));
+    }
+    if matches!(requete, FIOGETOWN | SIOCGPGRP) {
+        let v = crate::asynchrone::f_getown(o.fichier_ouvert()) as i32;
+        return match copier_vers_utilisateur(argument, &v.to_le_bytes()) {
+            Ok(()) => 0,
+            Err(_) => -EFAULT,
+        };
+    }
     if o.socket().protocole == Protocole::Unix {
         // `unix_ioctl` : ce qui est à lire, ce qui n'a pas encore été lu
         // par le pair.

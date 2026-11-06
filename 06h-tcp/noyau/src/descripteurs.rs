@@ -169,6 +169,8 @@ pub struct FichierOuvert {
     pub prive: Prive,
     /// Les éléments d'epoll qui le surveillent (le `f_ep` de Linux).
     pub surveillants: Vec<Arc<crate::epoll::Element>>,
+    /// Son propriétaire (F_SETOWN, F_SETSIG, O_ASYNC), à la première demande (`f_owner`).
+    pub proprietaire: Option<Arc<crate::asynchrone::Proprietaire>>,
     /// Le nom de base du chemin par lequel il a été ouvert, pour les
     /// messages (« dans libc.so.6[...] »).
     pub nom: NomCourt,
@@ -189,7 +191,7 @@ impl FichierOuvert {
     pub fn new(sorte: Sorte, tenu: Tenu, lecture: bool, ecriture: bool, drapeaux: u32, chemin: &[u8]) -> FichierOuvert {
         let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').find(|n| !n.is_empty()).unwrap_or(chemin));
         FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, donnees: Donnees::Aucune, prive: Prive::Aucun,
-                       surveillants: Vec::new(), nom, chemin: Vec::new(), references: 1 }
+                       surveillants: Vec::new(), proprietaire: None, nom, chemin: Vec::new(), references: 1 }
     }
 
     /// Le même, avec son chemin canonique.
@@ -298,8 +300,8 @@ impl Ouverts {
         let mut ferme = self.cases[f.0 as usize].take();
         if let Some(o) = ferme.as_mut() {
             crate::epoll::fichier_ferme(self, o);
-            crate::tube::fichier_ferme(o);
-            crate::reseau::socket::fichier_ferme(o);
+            crate::tube::fichier_ferme(o, f);
+            crate::reseau::socket::fichier_ferme(o, f);
         }
         while self.cases.last().is_some_and(Option::is_none) {
             self.cases.pop();

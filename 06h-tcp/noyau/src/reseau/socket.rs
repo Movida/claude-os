@@ -301,6 +301,9 @@ pub struct Socket {
     pub connectee: AtomicBool,
     pub recverr: AtomicBool,
     pub pmtudisc: AtomicU8,
+    /// Ceux qui veulent un signal (O_ASYNC) et le propriétaire de son fichier ; pour TCP, ils sont
+    /// avec sa possession : voir `liste_async`.
+    pub asynchrone: crate::asynchrone::ListeAsync,
     /// Le numéro de son inode (/proc/net/tcp le montre), posé quand son
     /// fichier est fait ; 0 avant (une fille d'une écoute pas encore
     /// acceptée n'en a pas, chez Linux non plus).
@@ -331,10 +334,19 @@ impl Socket {
             connectee: AtomicBool::new(false),
             recverr: AtomicBool::new(false),
             pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
+            asynchrone: crate::asynchrone::ListeAsync::new(),
             inode: AtomicU32::new(0),
             suivante: Verrou::new(None),
             flux: None,
             unix: None,
+        }
+    }
+
+    /// La liste O_ASYNC de la socket : celle qui suit la réception (`socket_wq`).
+    pub fn liste_async(&self) -> &crate::asynchrone::ListeAsync {
+        match &self.flux {
+            Some(f) => &f.asynchrone,
+            None => &self.asynchrone,
         }
     }
 
@@ -389,6 +401,7 @@ impl Socket {
             r.octets += taille;
         }
         self.attente.reveiller(POLLIN | POLLRDNORM, 1);
+        self.asynchrone.lecture(crate::asynchrone::Raison::Entree);
         true
     }
 
@@ -396,12 +409,15 @@ impl Socket {
     pub fn signaler_erreur(&self, errno: i32) {
         self.reception.verrouiller().erreur = errno;
         self.attente.reveiller(POLLERR, 1);
+        self.asynchrone.evenement(crate::asynchrone::Raison::Erreur);
     }
 
     /// Met l'erreur `e` dans la file d'erreurs, s'il y a la place
     /// (`sock_queue_err_skb` : elle compte avec les datagrammes, et doit
     /// laisser de la place sous SO_RCVBUF), et réveille. false : jetée.
     pub fn mettre_en_file(&self, e: ErreurEnFile) -> bool {
+        // (`sock_queue_err_skb` : `sk_error_report`.)
+        let raison = crate::asynchrone::Raison::Erreur;
         let rcvbuf = self.rcvbuf.load(Ordering::Relaxed) as usize;
         {
             let mut r = self.reception.verrouiller();
@@ -412,6 +428,7 @@ impl Socket {
             r.octets += taille;
         }
         self.attente.reveiller(POLLERR, 1);
+        self.asynchrone.evenement(raison);
         true
     }
 
@@ -434,6 +451,7 @@ impl Socket {
         };
         if reste {
             self.attente.reveiller(POLLERR, 1);
+            self.asynchrone.evenement(crate::asynchrone::Raison::Erreur);
         }
         Some(e)
     }
@@ -634,8 +652,9 @@ pub fn prendre(s: &Socket, drapeaux: u64, non_bloquant: bool, mut copier: impl F
 /// socket TCP (envoyer FIN, attendre SO_LINGER) ; une socket UDP s'en
 /// passerait, mais toutes suivent le même chemin, comme chez Linux. Sans
 /// allocation : la liste est chaînée par les sockets elles-mêmes.
-pub fn fichier_ferme(ferme: &FichierOuvert) {
+pub fn fichier_ferme(ferme: &FichierOuvert, fichier: crate::descripteurs::Fichier) {
     if let Prive::Socket(s) = &ferme.prive {
+        s.liste_async().fichier_ferme(fichier);
         let t = tache::courante();
         let mut tete = t.fermetures.verrouiller();
         *s.suivante.verrouiller() = tete.take();
@@ -650,6 +669,7 @@ pub fn fichier_ferme(ferme: &FichierOuvert) {
 /// `udp_lib_unhash`) : elle ne reçoit plus rien, et ce qui restait dans sa
 /// file est rendu avec elle.
 pub fn fermer_les_differees() {
+    crate::tube::signaler_les_fermes();
     let t = tache::courante();
     loop {
         let s = {

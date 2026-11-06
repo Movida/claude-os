@@ -31,9 +31,10 @@
 //! servent ; son lien dans /proc/self/fd est « pipe:[numero] ».
 
 use crate::appels_fichiers::{FichierTenu, installer_paire};
+use crate::asynchrone::{self, ListeAsync, Raison};
 use crate::attente::{self, FileAttente, Mutex, Sommeil};
 use crate::copie_utilisateur::{copier_depuis_utilisateur_partiel, copier_vers_utilisateur, copier_vers_utilisateur_partiel};
-use crate::descripteurs::{FichierOuvert, Prive, Sorte, Tenu};
+use crate::descripteurs::{Fichier, FichierOuvert, Prive, Sorte, Tenu};
 use crate::partage::{Arc, Weak};
 use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, Table};
 use crate::tache::{self, Reveil};
@@ -173,6 +174,12 @@ pub struct Tube {
     sonde: AtomicBool,
     /// Les pages comptées à l'utilisateur (`nr_accounted`).
     comptees: AtomicU64,
+    /// O_ASYNC (`fasync_readers`, `fasync_writers`) : prévenus de ce qui s'écrit, de ce qui se lit.
+    pub async_lecteurs: ListeAsync,
+    pub async_ecrivains: ListeAsync,
+    /// La suivante des tubes qu'une tâche a à signaler (voir `fichier_ferme`), et s'il y est déjà.
+    suivant_ferme: Verrou<Option<Arc<Tube>>>,
+    a_signaler: AtomicBool,
 }
 
 /// Un morceau d'un tampon du programme (un iovec) parcouru par un appel.
@@ -283,6 +290,10 @@ impl Tube {
             wr_wait: FileAttente::new(),
             sonde: AtomicBool::new(false),
             comptees: AtomicU64::new(n as u64),
+            async_lecteurs: ListeAsync::new(),
+            async_ecrivains: ListeAsync::new(),
+            suivant_ferme: Verrou::new(None),
+            a_signaler: AtomicBool::new(false),
         })
     }
 
@@ -368,6 +379,7 @@ impl Tube {
         if reveiller_lecteur {
             self.rd_wait.reveiller(POLLIN | POLLRDNORM, 1);
         }
+        self.async_ecrivains.tuer(asynchrone::SIGIO, Raison::Sortie);
         r
     }
 
@@ -472,6 +484,7 @@ impl Tube {
                 if etait_vide {
                     self.rd_wait.reveiller(POLLIN | POLLRDNORM, 1);
                 }
+                self.async_lecteurs.tuer(asynchrone::SIGIO, Raison::Entree);
                 let inscriptible = || {
                     let e = self.etat();
                     !e.plein() || e.lecteurs == 0
@@ -493,6 +506,7 @@ impl Tube {
         if reveiller_ecrivain {
             self.wr_wait.reveiller(POLLOUT | POLLWRNORM, 1);
         }
+        self.async_lecteurs.tuer(asynchrone::SIGIO, Raison::Entree);
         r
     }
 
@@ -736,9 +750,44 @@ pub fn rouvrir(numero: fichiers::tmpfs::Numero, lecture: bool, ecriture: bool) -
     Some((tube, chemin(numero.0)))
 }
 
-/// Le bout `tenu` d'un tube, fermé pour la dernière fois.
-pub fn fichier_ferme(ferme: &FichierOuvert) {
+/// Le bout `tenu` d'un tube, fermé pour la dernière fois. Sous le verrou des fichiers : le signal
+/// aux inscrits O_ASYNC de l'autre bout (`pipe_release` : `kill_fasync`) attendra la sortie de
+/// l'appel (`signaler_les_fermes`, à côté de la fermeture des sockets) : un signal prend le verrou
+/// d'un processus, qui passe avant celui-ci. Sans allocation : la liste est chaînée par les tubes.
+pub fn fichier_ferme(ferme: &FichierOuvert, fichier: Fichier) {
+    if let Prive::Tube(t) = &ferme.prive {
+        t.async_lecteurs.retirer(fichier);
+        t.async_ecrivains.retirer(fichier);
+        let fin = t.fermer_bout(ferme.lecture, ferme.ecriture);
+        if fin && (t.async_lecteurs.occupee() || t.async_ecrivains.occupee()) && !t.a_signaler.swap(true, Relaxed) {
+            let tache = tache::courante();
+            let mut tete = tache.tubes_fermes.verrouiller();
+            *t.suivant_ferme.verrouiller() = tete.take();
+            *tete = Some(t.clone());
+        }
+    }
+}
+
+/// Le bout d'un tube qui n'a jamais eu de place dans la table des fichiers : personne n'a pu s'y
+/// inscrire.
+pub fn fichier_jamais_ouvert(ferme: &FichierOuvert) {
     if let Prive::Tube(t) = &ferme.prive {
         t.fermer_bout(ferme.lecture, ferme.ecriture);
+    }
+}
+
+/// Les signaux des tubes dont la tâche courante a fermé un bout. Sans verrou tenu.
+pub fn signaler_les_fermes() {
+    let tache = tache::courante();
+    loop {
+        let t = {
+            let mut tete = tache.tubes_fermes.verrouiller();
+            let Some(t) = tete.take() else { return };
+            *tete = t.suivant_ferme.verrouiller().take();
+            t
+        };
+        t.a_signaler.store(false, Relaxed);
+        t.async_lecteurs.tuer(asynchrone::SIGIO, Raison::Entree);
+        t.async_ecrivains.tuer(asynchrone::SIGIO, Raison::Sortie);
     }
 }

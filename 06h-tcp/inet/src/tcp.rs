@@ -790,6 +790,9 @@ pub struct Tcb<P: Charge> {
     fin_hors_ordre: Option<u32>,
     /// Le numéro du prochain octet que lira le programme (`copied_seq`).
     rcv_lu: u32,
+    /// Combien de pointeurs urgents neufs ont été vus : chacun fait envoyer SIGURG
+    /// (`sk_send_sigurg`, que décide le noyau).
+    urgents_annonces: u32,
     /// L'octet urgent reçu, et son numéro (`urg_seq`).
     urgent: Urgent,
     urg_seq: u32,
@@ -1008,6 +1011,7 @@ impl<P: Charge> Tcb<P> {
             hors_ordre: HorsOrdre::new(),
             fin_hors_ordre: None,
             rcv_lu: 0,
+            urgents_annonces: 0,
             urgent: Urgent::Aucun,
             urg_seq: 0,
             fin_recue: false,
@@ -1334,6 +1338,27 @@ impl<P: Charge> Tcb<P> {
     /// tête, hors du flux, ne compte pas (`tcp_stream_is_readable`).
     pub fn lisibles_dans_le_flux(&self) -> usize {
         self.octets_reception - usize::from(self.a_la_marque() && !self.reglages.oobinline)
+    }
+
+    /// Ceux que peut encore rendre un MSG_PEEK arrivé à `debut` octets de la tête.
+    pub fn lisibles_depuis(&self, debut: usize) -> usize {
+        let reste = self.octets_reception.saturating_sub(debut);
+        reste - usize::from(self.a_la_marque_depuis(debut) && !self.reglages.oobinline)
+    }
+
+    /// Une lecture à `debut` octets de la tête est-elle à la marque urgente ?
+    pub fn a_la_marque_depuis(&self, debut: usize) -> bool {
+        self.urgent != Urgent::Aucun && self.urg_seq == self.rcv_lu.wrapping_add(debut as u32) && self.octets_reception > debut
+    }
+
+    /// Combien de pointeurs urgents neufs ont été vus.
+    pub fn urgents_annonces(&self) -> u32 {
+        self.urgents_annonces
+    }
+
+    /// Où en est la lecture (`copied_seq`).
+    pub fn numero_lu(&self) -> u32 {
+        self.rcv_lu
     }
 
     /// La lecture est-elle à la marque urgente (SIOCATMARK) ?
@@ -2700,6 +2725,7 @@ impl<P: Charge> Tcb<P> {
         }
         self.urgent = Urgent::Attendu;
         self.urg_seq = p;
+        self.urgents_annonces = self.urgents_annonces.wrapping_add(1);
     }
 
     /// Le texte d'un segment acceptable, ses données et son FIN

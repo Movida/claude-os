@@ -430,6 +430,9 @@ pub struct Premier {
     pub etat: Option<Etat>,
     pub ecoute: bool,
     pub lisibles: usize,
+    /// Tout ce qui est reçu et pas lu (`rcv_nxt - copied_seq`), l'octet urgent compris ; et RCV.NXT.
+    pub en_file: usize,
+    pub rcv_nxt: u32,
     pub fin_recue: bool,
     pub erreur: i32,
     pub place: usize,
@@ -450,6 +453,8 @@ pub struct Premier {
     /// `poll` a trouvé le tampon d'envoi trop plein (SOCK_NOSPACE) : à dire à la
     /// connexion (`Possede::descendre`), qu'il ne peut pas toucher.
     pub sans_place: bool,
+    /// Combien de pointeurs urgents neufs vus (`tcp_check_urg` : `sk_send_sigurg`).
+    pub urgents: u32,
 }
 
 /// Ce qui arrive à une socket depuis le réseau : un segment, ou une
@@ -501,6 +506,9 @@ impl Partie {
         Premier {
             etat, ecoute, lisibles, fin_recue, erreur, place, sndbuf, rcvbuf, pretes, file, urgent, arret, rcvlowat: self.options.rcvlowat as usize,
             fenetre_basse, sans_place: false,
+            en_file: if let Mode::Connexion(t) = &self.mode { t.lisibles() } else { 0 },
+            rcv_nxt: if let Mode::Connexion(t) = &self.mode { t.numeros().2 } else { 0 },
+            urgents: if let Mode::Connexion(t) = &self.mode { t.urgents_annonces() } else { 0 },
         }
     }
 
@@ -522,7 +530,45 @@ impl Partie {
         if neuf.urgent && !court.urgent {
             m |= POLLPRI;
         }
+        m |= Partie::evenements_asynchrones(court, &neuf);
         *court = neuf;
+        m
+    }
+
+    /// Ce qu'il y a à dire à ceux qui veulent un signal (`sk_wake_async`), d'après ce qui a changé : ce
+    /// que `sk_data_ready` et `tcp_fin` (la lecture), `tcp_rcv_synsent_state_process` (établie),
+    /// `sk_error_report`, `sk_stream_write_space` (la place, au tiers de SO_SNDBUF) et `tcp_check_urg`.
+    fn evenements_asynchrones(avant: &Premier, neuf: &Premier) -> u32 {
+        use crate::asynchrone::{A_COUPURE, A_ERREUR, A_ETABLIE, A_FIN, A_LECTURE, A_OCTET_URGENT, A_PLACE, A_URGENT};
+        let mut m = 0;
+        // `tcp_data_ready` : à chaque avancée, si `tcp_epollin_ready` (tout ce qui est reçu compte,
+        // l'octet urgent compris) ou si le FIN est là. Le FIN seul y passe donc aussi, en plus de
+        // ce que dit `tcp_fin`.
+        let assez = neuf.en_file >= neuf.rcvlowat || neuf.fenetre_basse || neuf.fin_recue;
+        if (neuf.rcv_nxt != avant.rcv_nxt && assez) || neuf.pretes > avant.pretes {
+            m |= A_LECTURE;
+        }
+        if neuf.fin_recue && !avant.fin_recue {
+            // Pas de POLL_HUP pour une fermeture à moitié (`tcp_fin`).
+            let fini = neuf.arret == socket::ARRET_LECTURE | socket::ARRET_ECRITURE || neuf.etat == Some(Etat::Fermee);
+            m |= if fini { A_COUPURE } else { A_FIN };
+        }
+        let en_syn = |e: Option<Etat>| matches!(e, Some(Etat::SynEnvoye | Etat::SynRecu));
+        if en_syn(avant.etat) && !en_syn(neuf.etat) && neuf.etat != Some(Etat::Fermee) {
+            m |= A_ETABLIE;
+        }
+        if neuf.erreur != 0 && neuf.erreur != avant.erreur {
+            m |= A_ERREUR;
+        }
+        if neuf.place > avant.place && neuf.place >= neuf.sndbuf / 3 && neuf.arret & socket::ARRET_ECRITURE == 0 {
+            m |= A_PLACE;
+        }
+        if neuf.urgents != avant.urgents {
+            m |= A_URGENT;
+        }
+        if neuf.urgent && !avant.urgent {
+            m |= A_OCTET_URGENT;
+        }
         m
     }
 
@@ -1832,6 +1878,8 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
                 return Ok(fait);
             }
         }
+        // (`sk_stream_wait_memory` : SOCKWQ_ASYNC_NOSPACE.)
+        flux(s).asynchrone.marquer_sans_place();
         if non_bloquant {
             return if fait > 0 { Ok(fait) } else { Err(-EAGAIN) };
         }
@@ -1968,9 +2016,13 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
         if non_bloquant {
             return if fait > 0 { Ok(fait) } else { Err(-EAGAIN) };
         }
+        // Ce qui arrive de neuf, plus ce qui est déjà là (que MSG_PEEK a déjà vu).
+        let vu = t.lisibles_dans_le_flux();
+        flux(s).asynchrone.attendre_donnees(true);
         let r = g.attendre(flux(s).file(), Sommeil::Interruptible, echeance, |c| {
-            c.lisibles > 0 || c.fin_recue || c.erreur != 0 || c.arret & socket::ARRET_LECTURE != 0 || c.etat == Some(Etat::Fermee)
+            c.lisibles > vu || c.fin_recue || c.erreur != 0 || c.arret & socket::ARRET_LECTURE != 0 || c.etat == Some(Etat::Fermee)
         });
+        flux(s).asynchrone.attendre_donnees(false);
         match r {
             // Une place de 0 : un seul tour, attente comprise (le `while (len > 0)` de
             // `tcp_recvmsg_locked`), et 0 quoi qu'il en sorte, même si le délai est passé (mesuré).
@@ -2152,9 +2204,10 @@ fn t_ferme(p: &Partie) -> bool {
 pub fn sonder(s: &Socket) -> u32 {
     flux(s).court(|c| {
         let m = masque(c);
-        // Pas écrivable : la connexion devra le savoir (`tcp_poll`, SOCK_NOSPACE).
+        // Pas écrivable : la connexion devra le savoir (`tcp_poll`, SOCK_NOSPACE), et O_ASYNC aussi.
         if m & POLLOUT == 0 && !c.ecoute && !matches!(c.etat, Some(Etat::SynEnvoye | Etat::SynRecu)) {
             c.sans_place = true;
+            flux(s).asynchrone.marquer_sans_place();
         }
         m
     })

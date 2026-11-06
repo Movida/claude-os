@@ -122,6 +122,9 @@ const GETGID: u64 = 104;
 const GETEUID: u64 = 107;
 const GETEGID: u64 = 108;
 const GETPPID: u64 = 110;
+const GETPGRP: u64 = 111;
+const GETPGID: u64 = 121;
+const GETSID: u64 = 124;
 const GETTID: u64 = 186;
 const ARCH_PRCTL: u64 = 158;
 const TIME: u64 = 201;
@@ -210,6 +213,23 @@ fn pid() -> i64 {
 /// Le numéro du fil en cours : celui du processus pour son fil principal.
 fn tid() -> i64 {
     tache::courante().tid() as i64
+}
+
+/// getpgid, getsid : 0, soi ; un processus, ou le fil d'un processus (`find_task_by_vpid`) : le
+/// sien ; sinon ESRCH.
+fn groupe_de(qui: i32) -> i64 {
+    const ESRCH: i64 = 3;
+    if qui == 0 {
+        return pid();
+    }
+    if qui < 0 {
+        return -ESRCH;
+    }
+    let qui = qui as u32;
+    if processus::existe(qui) {
+        return qui as i64;
+    }
+    tache::processus_du_fil(qui).map_or(-ESRCH, |p| p as i64)
 }
 
 /// Exécute l'appel système `numero` : un résultat, ou -errno. `cadre` :
@@ -367,6 +387,9 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         GETPID => pid(),
         GETTID => tid(),
         GETPPID => 1,
+        // Chaque programme mène son propre groupe et sa session (processus.rs), jusqu'au shell de 6l.
+        GETPGRP => crate::processus::avec(|p| p.pid) as i64,
+        GETPGID | GETSID => groupe_de(a[0] as u32 as i32),
         GETUID | GETEUID => processus::avec(|p| p.identite.uid) as i64,
         GETGID | GETEGID => processus::avec(|p| p.identite.gid) as i64,
         CLOCK_GETTIME => clock_gettime(a[0], a[1]),
@@ -537,6 +560,9 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         GETPID => ("getpid", 0),
         GETTID => ("gettid", 0),
         GETPPID => ("getppid", 0),
+        GETPGRP => ("getpgrp", 0),
+        GETPGID => ("getpgid", 1),
+        GETSID => ("getsid", 1),
         GETUID => ("getuid", 0),
         GETEUID => ("geteuid", 0),
         GETGID => ("getgid", 0),

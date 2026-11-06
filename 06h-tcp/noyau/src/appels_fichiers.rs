@@ -88,6 +88,7 @@ const O_NOCTTY: u64 = 0o400;
 const O_TRUNC: u64 = 0o1000;
 const O_APPEND: u64 = 0o2000;
 const O_NONBLOCK: u64 = 0o4000;
+const O_ASYNC: u64 = 0o20000;
 const O_LARGEFILE: u64 = 0o100000;
 const O_DIRECT: u64 = 0o40000;
 const O_DIRECTORY: u64 = 0o200000;
@@ -210,6 +211,11 @@ impl FichierTenu {
     }
 
     /// La socket d'un fichier de sorte Socket.
+    /// Son fichier ouvert.
+    pub fn fichier_ouvert(&self) -> Fichier {
+        self.fichier
+    }
+
     pub fn socket(&self) -> &crate::partage::Arc<crate::reseau::socket::Socket> {
         match &self.prive {
             Prive::Socket(s) => s,
@@ -712,7 +718,7 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
         }
         let fichier = s.ouverts.ajouter(f)
             .map_err(|f| {
-                crate::tube::fichier_ferme(&f);
+                crate::tube::fichier_jamais_ouvert(&f);
                 if let Tenu::Tmpfs(ouvert) = f.tenu {
                     s.fs.fermer(&ouvert, cadres);
                 }
@@ -750,6 +756,49 @@ pub fn creat(adresse: u64, mode: u64) -> i64 {
 fn fermer_descripteur(fd: u64) -> Result<(), i64> {
     let d = processus::avec(|p| p.descripteurs.retirer(fd)).ok_or(-EBADF)?;
     vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
+    Ok(())
+}
+
+/// Ce fichier a-t-il de quoi retenir O_ASYNC (un `fasync`) ?
+fn a_une_liste(o: &FichierTenu) -> bool {
+    matches!(o.sorte, Sorte::Socket | Sorte::Tube)
+}
+
+/// `f_op->fasync`, et le drapeau qu'il pose : la socket (`sock_fasync`) ou les bouts du tube
+/// (`pipe_fasync`) inscrivent le fichier sous le descripteur `fd`, ou le retirent. Sans liste : rien.
+fn basculer_async(o: &FichierTenu, fd: u64, oui: bool) -> Result<(), i64> {
+    if !a_une_liste(o) {
+        return Ok(());
+    }
+    let (lecture, ecriture) = vfs::avec_systeme(|s, _| {
+        let f = s.ouverts.fichier(o.fichier);
+        (f.lecture, f.ecriture)
+    });
+    let listes = match o.sorte {
+        Sorte::Tube => [lecture.then(|| &o.tube().async_lecteurs), ecriture.then(|| &o.tube().async_ecrivains)],
+        _ => [Some(o.socket().liste_async()), None],
+    };
+    if oui {
+        let p = crate::asynchrone::du_fichier(o.fichier)?;
+        for (k, l) in listes.iter().enumerate() {
+            if let Some(l) = l
+                && let Err(e) = l.inscrire(o.fichier, fd as i32, &p)
+            {
+                if let Some(Some(a)) = listes.get(..k).and_then(|a| a.first()) {
+                    a.retirer(o.fichier);
+                }
+                return Err(e);
+            }
+        }
+    } else {
+        for l in listes.into_iter().flatten() {
+            l.retirer(o.fichier);
+        }
+    }
+    vfs::avec_systeme(|s, _| {
+        let f = s.ouverts.fichier(o.fichier);
+        f.drapeaux = if oui { f.drapeaux | O_ASYNC as u32 } else { f.drapeaux & !(O_ASYNC as u32) };
+    });
     Ok(())
 }
 
@@ -821,7 +870,7 @@ pub fn installer_paire(a: FichierOuvert, b: FichierOuvert, fermer_a_l_exec: bool
         if let Tenu::Tmpfs(o) = f.tenu {
             s.fs.fermer(&o, cadres);
         }
-        crate::tube::fichier_ferme(&f);
+        crate::tube::fichier_jamais_ouvert(&f);
     });
     let (fa, fb) = match (reserver(), reserver()) {
         (Ok(x), Ok(y)) => (x, y),
@@ -1782,8 +1831,10 @@ pub fn dup2(ancien: u64, nouveau: u64) -> i64 {
 ///     de `argument` ; un argument au-delà de la limite : EINVAL ; plus de
 ///     numéro libre au-dessus : EMFILE ;
 ///   - F_GETFD, F_SETFD : le drapeau FD_CLOEXEC ;
+///   - F_GETOWN, F_SETOWN et leurs versions _EX, F_GETOWNER_UIDS, F_GETSIG, F_SETSIG : le
+///     propriétaire du fichier (asynchrone.rs) ;
 ///   - F_GETFL : le mode d'ouverture et les drapeaux d'état ; F_SETFL :
-///     seuls O_APPEND et O_NONBLOCK (et O_ASYNC, O_DIRECT, O_NOATIME, sans
+///     seuls O_APPEND, O_NONBLOCK, O_ASYNC (asynchrone.rs, sur ce qui a une liste) (et O_DIRECT, O_NOATIME, sans
 ///     effet ici) changent, le reste est ignoré, comme Linux ;
 ///   - F_GETLK, F_SETLK, F_SETLKW et leurs versions « OFD » : les verrous
 ///     de fichiers (`verrou_posix`). Ils ne sont pas encore tenus : poser
@@ -1795,6 +1846,7 @@ pub fn dup2(ancien: u64, nouveau: u64) -> i64 {
 /// Sur un descripteur O_PATH, seules F_DUPFD*, F_GETFD, F_SETFD et F_GETFL
 /// sont permises (EBADF sinon).
 pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
+    use crate::asynchrone;
     const F_DUPFD: u64 = 0;
     const F_GETFD: u64 = 1;
     const F_SETFD: u64 = 2;
@@ -1810,7 +1862,14 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
     const F_SETPIPE_SZ: u64 = 1031;
     const F_GETPIPE_SZ: u64 = 1032;
     const FD_CLOEXEC: u64 = 1;
-    const CHANGEABLES: u64 = O_APPEND | O_NONBLOCK | 0o20000 | 0o40000 | 0o1000000;
+    const F_SETOWN: u64 = 8;
+    const F_GETOWN: u64 = 9;
+    const F_SETSIG: u64 = 10;
+    const F_GETSIG: u64 = 11;
+    const F_SETOWN_EX: u64 = 15;
+    const F_GETOWN_EX: u64 = 16;
+    const F_GETOWNER_UIDS: u64 = 17;
+    const CHANGEABLES: u64 = O_APPEND | O_NONBLOCK | 0o40000 | 0o1000000;
     let d = match tenir(fd) {
         Ok(d) => d,
         Err(e) => return e,
@@ -1833,12 +1892,27 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
         }
         F_GETFL => d.drapeaux as i64,
         F_SETFL => {
+            // O_ASYNC (`setfl`) : ce n'est pas un drapeau comme un autre : il inscrit le fichier (une
+            // faute de mémoire, et rien n'a changé), et sans inscription possible, il ne reste pas.
+            let voulu = argument & O_ASYNC != 0;
+            if voulu != (d.drapeaux as u64 & O_ASYNC != 0)
+                && let Err(e) = basculer_async(&d, fd, voulu)
+            {
+                return e;
+            }
             vfs::avec_systeme(|s, _| {
                 let f = s.ouverts.fichier(d.fichier);
                 f.drapeaux = ((f.drapeaux as u64 & !CHANGEABLES) | (argument & CHANGEABLES)) as u32;
             });
             0
         }
+        F_GETOWN => asynchrone::f_getown(d.fichier),
+        F_SETOWN => asynchrone::f_setown(d.fichier, argument as u32 as i32),
+        F_GETOWN_EX => asynchrone::f_getown_ex(d.fichier, argument),
+        F_SETOWN_EX => asynchrone::f_setown_ex(d.fichier, argument),
+        F_GETOWNER_UIDS => asynchrone::f_getowner_uids(d.fichier, argument),
+        F_GETSIG => asynchrone::f_getsig(d.fichier),
+        F_SETSIG => asynchrone::f_setsig(d.fichier, argument as u32 as i32),
         F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => {
             verrou_posix(fd, argument, false, matches!(commande, F_OFD_SETLK | F_OFD_SETLKW))
         }
@@ -1964,6 +2038,7 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
     const FIONCLEX: u64 = 0x5450;
     const FIOCLEX: u64 = 0x5451;
     const FIONBIO: u64 = 0x5421;
+    const FIOASYNC: u64 = 0x5452;
     const FIONREAD: u64 = 0x541b;
     let o = match tenir(fd) {
         Ok(o) => o,
@@ -1991,6 +2066,24 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
                 };
             });
             0
+        }
+        // `ioctl_fioasync` : un fichier sans liste : ENOTTY, si cela change quelque chose.
+        FIOASYNC => {
+            let mut valeur = [0u8; 4];
+            if copier_depuis_utilisateur(&mut valeur, argument).is_err() {
+                return -EFAULT;
+            }
+            let voulu = i32::from_le_bytes(valeur) != 0;
+            if voulu == (o.drapeaux as u64 & O_ASYNC != 0) {
+                return 0;
+            }
+            if !a_une_liste(&o) {
+                return -ENOTTY;
+            }
+            match basculer_async(&o, fd, voulu) {
+                Ok(()) => 0,
+                Err(e) => e,
+            }
         }
         FIONREAD if attributs(o.objet).mode & S_IFMT == S_IFREG => {
             let taille = attributs(o.objet).taille;

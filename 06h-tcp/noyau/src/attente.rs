@@ -857,6 +857,8 @@ pub struct Possession<T: Possede> {
     /// epoll : le `sk_wq`), réveillés de ce que rendent `traiter` et
     /// `minuteur`.
     pub(crate) file: FileAttente,
+    /// Ceux qui veulent un signal (`socket_wq`, avec `file`) : la réception les atteint d'ici.
+    pub(crate) asynchrone: crate::asynchrone::ListeAsync,
 }
 
 // SAFETY: la donnée n'est touchée que par le possesseur (au plus un, par
@@ -872,6 +874,7 @@ impl<T: Possede> Possession<T> {
             donnee: UnsafeCell::new(donnee),
             attente: FileAttente::new(),
             file: FileAttente::new(),
+            asynchrone: crate::asynchrone::ListeAsync::new(),
         }
     }
 
@@ -930,8 +933,12 @@ impl<T: Possede> Possession<T> {
     /// Réveille la file de la socket pour les événements `m` ; puis les signaux d'entrée-sortie
     /// (les bits A_* : ceux à qui parle `sk_wake_async`, après `wake_up`, comme Linux).
     fn reveiller(&self, m: u32) {
-        if m != 0 {
-            self.file.reveiller(m, 0);
+        let poll = m & !crate::asynchrone::A_TOUS;
+        if poll != 0 {
+            self.file.reveiller(poll, 0);
+        }
+        if m != poll {
+            self.asynchrone.evenements(m);
         }
     }
 
