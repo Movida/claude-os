@@ -8,6 +8,7 @@ Le conteneur a pour processus principal un superviseur (`remote-control.sh`, cop
 - **Relancer le serveur :** `kill <pid>`, avec le pid donné par `pgrep -f '^claude remote-control'`. Le superviseur le relance, et le serveur réveille les sessions de fils qu'il avait notées en s'arrêtant.
 - **L'arrêter un moment** (pour le lancer à la main dans un terminal, par exemple) : `touch ~/.claude/remote-control.pause`. Il repart après `rm ~/.claude/remote-control.pause`.
 - **Arrêter le conteneur :** il survit à la fermeture de VS Code, c'est voulu. Depuis WSL : `docker stop <conteneur>`, avec le nom donné par `docker ps`.
+- **Après un redémarrage du conteneur :** recharger les fenêtres VS Code restées ouvertes (« Developer: Reload Window »). Sinon, chacune essaie de se reconnecter toutes les 30 s pendant 3 heures, sans y arriver, et lance à chaque essai un serveur de connexion. Le superviseur arrête ceux qui sont en trop et le note au journal (`serveurs de connexion en trop`), mais la fenêtre reste morte tant qu'on ne la recharge pas.
 - **Modifier le superviseur :** il est dans l'image, donc il faut reconstruire le conteneur (voir plus bas). Tester d'abord avec `.devcontainer/test-remote-control.sh`, qui utilise un faux serveur et peut tourner à côté du vrai.
 - **Au démarrage, `CCR v2 worker registration failed` avec un 404 :** sans effet. C'est la session que `bridge-pointer.json` garde pour l'environnement, terminée depuis ; le serveur continue et réveille les autres. Ne pas toucher à ce fichier, qui garde aussi l'environnement : sans lui, le serveur en inscrit un nouveau et oublie les sessions.
 
@@ -22,7 +23,7 @@ La reconstruction commence par `docker rm -f` (CLI devcontainer 0.90.0), avant d
 3. Dans VS Code : « Dev Containers: Rebuild Container ».
 4. Dans un terminal du nouveau conteneur : `rm ~/.claude/remote-control.pause`. Le fichier est dans le volume : tant qu'il reste, le serveur ne repart pas (le journal le rappelle).
 5. Vérifier le processus principal : `tr '\0' ' ' </proc/1/cmdline` commence par `/sbin/docker-init`, et `pgrep -a -f remote-control.sh` montre le superviseur.
-6. Vérifier l'arrêt propre, depuis WSL : `docker restart <conteneur>`. Le journal doit alors contenir `Environment preserved` s'il y avait une session, puis `superviseur arrete` et `superviseur lance`.
+6. Vérifier l'arrêt propre, depuis WSL : `docker restart <conteneur>`. Le journal doit alors contenir `Environment preserved` s'il y avait une session, puis `superviseur arrete` et `superviseur lance`. Recharger ensuite la fenêtre VS Code.
 
 Si le conteneur ne démarre plus, `docker logs <conteneur>` depuis WSL montre le superviseur. Pour revenir en arrière : remettre l'ancien `.devcontainer/` dans `~/claude-os`, puis reconstruire.
 

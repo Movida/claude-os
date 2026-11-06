@@ -129,7 +129,7 @@ superviser() {
     env -i PATH="$PATH" HOME="$HOME_TEST" CLAUDE_CONFIG_DIR="$CONFIG" \
         XDG_CONFIG_HOME="$T/xdg" FAUX_DIR="$T" CLAUDECODE=1 CLAUDE_CODE_ENTRYPOINT=test \
         RC_CLAUDE="$FAUX" RC_PERIODE=1 RC_DUREE_STABLE=2 RC_TAILLE_MAX=20000 \
-        RC_EVENEMENTS_MEMOIRE="$OOM" "$@" >>"$T/sortie" 2>&1 &
+        RC_EVENEMENTS_MEMOIRE="$OOM" RC_PREFIXE_CONNEXION="$T/connexion-" "$@" >>"$T/sortie" 2>&1 &
     dernier=$!
     superviseurs+=("$dernier")
 }
@@ -203,6 +203,46 @@ head -c 30000 /dev/zero | tr '\0' x >>"$JOURNAL"
 attendre "le journal trop gros est deplace" test -s "$JOURNAL.1"
 attendre "le journal repart" au_journal "journal deplace dans"
 verifier "un seul fichier garde, plus petit que le plafond" test "$(stat -c %s "$JOURNAL")" -lt 20000
+
+echo "== les serveurs de connexion de VS Code"
+# Un faux serveur de connexion, comme le vrai : `<chemin>/node <prise>.js` et rien
+# d'autre sur la ligne de commande, sous un sh qui mène son groupe. `cat` sur un tube
+# nommé, sous le nom de node, attend sans fin. La prise est dans le dossier du test
+# (RC_PREFIXE_CONNEXION) : le superviseur de ce test ne voit pas ceux de VS Code.
+ln -s "$(command -v cat)" "$T/bin/node"
+lancer_connexion() {
+    [ -p "$T/connexion-$1.js" ] || mkfifo "$T/connexion-$1.js"
+    setsid sh -c '"$0" "$1"; sleep 1000' "$T/bin/node" "$T/connexion-$1.js" &
+    connexion=$!
+    autres+=("$connexion")
+    sleep 0.1
+}
+vivant() { kill -0 "$1" 2>/dev/null; }
+lancer_connexion seule
+c_seule=$connexion
+lancer_connexion double
+c_ancienne=$connexion
+lancer_connexion double
+c_moyenne=$connexion
+lancer_connexion double
+c_recente=$connexion
+# Une commande qui cite le chemin, comme un grep d'une session, sans en être un.
+bash -c "sleep 1000; echo $T/bin/node $T/connexion-double.js" &
+c_citee=$!
+autres+=("$c_citee")
+attendre "l'ancien serveur d'une fenetre est arrete, avec son sh" mort "$c_ancienne"
+attendre "le suivant aussi" mort "$c_moyenne"
+verifier "le plus recent reste" vivant "$c_recente"
+verifier "le serveur seul d'une autre fenetre reste" vivant "$c_seule"
+verifier "une commande qui cite le chemin reste" vivant "$c_citee"
+attendre "le journal le dit" au_journal "fenetre VS Code double : serveurs de connexion en trop"
+verifier "le superviseur est toujours la" vivant "$s"
+lancer_connexion double
+c_suivant=$connexion
+attendre "un essai de plus : le precedent part a son tour" mort "$c_recente"
+verifier "le dernier reste" vivant "$c_suivant"
+verifier "la fenetre n'est notee qu'une fois" compte_au_journal "fenetre VS Code double" 1
+kill -TERM -- "-$c_seule" "-$c_suivant" "$c_citee" 2>/dev/null
 
 echo "== la pause"
 touch "$CONFIG/remote-control.pause"

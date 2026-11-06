@@ -64,6 +64,10 @@ EVENEMENTS_MEMOIRE="${RC_EVENEMENTS_MEMOIRE:-/sys/fs/cgroup/memory.events}"
 # Le filtre ne garde que l'essentiel : quelques dizaines de lignes par jour. Ce
 # plafond ne joue donc que si une erreur se répète en boucle.
 TAILLE_MAX="${RC_TAILLE_MAX:-$((10 * 1024 * 1024))}"
+# Les serveurs de connexion des fenêtres VS Code (voir balayer_connexions), et le
+# rythme du balayage : celui des essais de reconnexion de VS Code, 30 s.
+PREFIXE_CONNEXION="${RC_PREFIXE_CONNEXION:-/tmp/vscode-remote-containers-server-}"
+PERIODE_BALAYAGE=$((PERIODE * 6))
 
 arret=
 serveur=
@@ -238,6 +242,59 @@ surveiller() {
         mv -f "$JOURNAL" "$JOURNAL.1"
         noter "journal deplace dans $JOURNAL.1 (il faisait $taille octets)"
     fi
+
+    if [ $((EPOCHSECONDS - balayage)) -ge "$PERIODE_BALAYAGE" ]; then
+        balayage=$EPOCHSECONDS
+        balayer_connexions
+    fi
+}
+
+# Quand le conteneur redémarre, une fenêtre VS Code restée ouverte a perdu son serveur
+# et tente de se reconnecter : toutes les 30 s, pendant 3 heures (la table et le délai
+# de reconnexion de VS Code). À chaque essai, l'extension Dev Containers lance par
+# `docker exec` un nouveau serveur de connexion, et n'arrête jamais le précédent. Le 6
+# novembre, un seul `docker restart` en a laissé 329 en 2 h 42 : 3,8 Go, et le quota
+# de tubes de l'utilisateur épuisé, au point de faire échouer `linux/tubes`.
+#
+# Seul le plus récent d'une fenêtre sert : en démarrant, il retire puis reprend les
+# prises de la fenêtre, et les précédents ne sont plus joignables. On arrête donc ces
+# derniers, avec le /bin/sh de leur `docker exec`, qui mène leur groupe : il attendrait
+# sinon sur son entrée. SIGTERM les tue net : ils n'ont pas de gestionnaire, et ne
+# retirent donc pas en partant les prises du plus récent.
+#
+# Le motif prend toute la ligne de commande : une session qui cite ce chemin dans une
+# commande ne doit pas être visée. La fenêtre est notée une fois, ou le journal
+# prendrait une ligne toutes les 30 s pendant 3 heures.
+#
+# Pourquoi pas les autres façons de faire :
+# - la consigne seule (recharger la fenêtre, README) : un conteneur redémarre aussi sans
+#   qu'on y pense, avec Docker Desktop, et la mémoire se perd en silence ;
+# - couper la boucle : elle est dans VS Code, hors du conteneur ;
+# - un seuil de mémoire avant d'agir : ces processus ne servent déjà plus à rien.
+balayage=0
+declare -A fenetres_notees=()
+balayer_connexions() {
+    local -A vues=()
+    local pid parent groupe commande fenetre
+    local motif="^[^ ]*/node ${PREFIXE_CONNEXION}([0-9a-zA-Z-]+)\.js$"
+    # Du plus récent au plus ancien ; le pid départage ceux d'un même instant.
+    while read -r pid parent groupe commande; do
+        [[ $commande =~ $motif ]] || continue
+        fenetre=${BASH_REMATCH[1]}
+        if [ -z "${vues[$fenetre]}" ]; then
+            vues[$fenetre]=1
+            continue
+        fi
+        if [ "$groupe" = "$parent" ] && [ "$groupe" != "$$" ]; then
+            kill -TERM -- "-$groupe" 2>/dev/null
+        else
+            kill -TERM "$pid" 2>/dev/null
+        fi
+        if [ -z "${fenetres_notees[$fenetre]}" ]; then
+            fenetres_notees[$fenetre]=1
+            noter "fenetre VS Code ${fenetre:0:8} : serveurs de connexion en trop arretes ; la recharger (Developer: Reload Window)"
+        fi
+    done < <(ps -eo pid=,ppid=,pgid=,args= --sort=-start_time,-pid 2>/dev/null)
 }
 
 # Le filtre a son propre descripteur, ouvert avant le serveur et fermé ensuite :
