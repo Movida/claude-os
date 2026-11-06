@@ -1106,7 +1106,7 @@ QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot $(QEMU_
 
 tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin sans-reseau.bin claude-p
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
-	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"Clavier PS/2 pret",:)
+	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"generateur laisse eteint.",:)
 	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
 	grep -F "MSI-X de 00:03.0 : pas d'APIC local : pas de MSI-X." test-sans-acpi.log
 	grep -F "generateur laisse eteint." test-sans-acpi.log

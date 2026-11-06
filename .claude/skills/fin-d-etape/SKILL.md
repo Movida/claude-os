@@ -117,9 +117,11 @@ avec les commandes données à la fin.
    refuse les tags.)
 9. **Regarder la CI**, une fois le push fait. Son état se lit sans jeton :
    `curl -s https://api.github.com/repos/Movida/claude-os/actions/runs?per_page=2`.
-   Ses journaux demandent les droits d'administrateur : David les copie depuis
-   la page du run (roue dentée, « View raw logs »). Elle est restée rouge onze
-   jours sans que personne le voie.
+   Ses journaux demandent les droits d'administrateur, mais ses échecs sont
+   dans les annotations, sans jeton : `.../check-runs/<id du job>/annotations`
+   (l'id : `.../actions/runs/<run>/jobs`). Le détail complet, David le copie
+   depuis la page du run (roue dentée, « View raw logs »). Elle est restée
+   rouge onze jours sans que personne le voie.
 
 ## B. Exceptionnel : replier dans un historique déjà poussé
 
@@ -579,6 +581,7 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   des pages est plein. Deux conditions de plus, à poser avant `verifier.sh` :
   `exec 300</dev/null` (la table de descripteurs vient des ancêtres), et
   `dd if=PROGRAMME iflag=nocache count=0` après un `sync` (un programme absent
-  du cache prend des fautes majeures).
+  du cache prend des fautes majeures). `RES_OPTIONS=edns0` imite le
+  `/etc/resolv.conf` d'une machine sous systemd-resolved.
 - **Une fonction entre le test et `errno`** l'écrase : `access(...) && errno ==
   ENOMEM` lisait ENOENT. Garder `errno` dans une variable d'abord.

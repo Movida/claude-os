@@ -69,7 +69,10 @@ int main(void)
              "gettimeofday d'accord avec CLOCK_REALTIME");
     time_t t = 0;
     time_t r = time(&t);
-    verifier(r == t && r - reel.tv_sec <= 1 && r >= reel.tv_sec, "time d'accord avec CLOCK_REALTIME");
+    /* Sur l'hôte, time() lit l'horloge grossière (le vDSO,
+     * CLOCK_REALTIME_COARSE, en retard d'un tic au plus) : juste après un
+     * changement de seconde, il peut encore dire la précédente. */
+    verifier(r == t && r - reel.tv_sec <= 1 && r >= reel.tv_sec - 1, "time d'accord avec CLOCK_REALTIME");
 
     struct timespec grossier;
     clock_gettime(CLOCK_MONOTONIC_COARSE, &grossier);

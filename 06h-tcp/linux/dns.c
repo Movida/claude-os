@@ -58,14 +58,24 @@ static void *repondre(void *arg)
         if (questions < 8)
             ports[questions] = ntohs(de.sin_port);
         questions++;
-        int genre = q[n - 4] << 8 | q[n - 3];
-        int essai = memmem(q + 12, n - 12, "\005essai\007exemple", 15) != NULL;
-        memcpy(r, q, n);
+        /* La question : son nom, son genre et sa classe. Ce qui suit ne se recopie pas : le OPT d'EDNS0,
+         * si /etc/resolv.conf demande « options edns0 » (celui de la CI, avec systemd-resolved) ; une
+         * réponse doit avoir ses enregistrements dans l'ordre de l'en-tête. */
+        int fin = 12;
+        while (fin < n && q[fin] != 0)
+            fin += q[fin] + 1;
+        fin += 5;
+        if (fin > n)
+            continue;
+        int genre = q[fin - 4] << 8 | q[fin - 3];
+        int essai = memmem(q + 12, fin - 12, "\005essai\007exemple", 15) != NULL;
+        memcpy(r, q, fin);
         r[2] = 0x81; /* une réponse, récursion demandée */
         r[3] = essai ? 0x80 : 0x83; /* récursion possible ; NOERROR, ou NXDOMAIN */
         r[6] = 0;
         r[7] = essai && genre == 1;
-        int m = n;
+        r[10] = r[11] = 0; /* pas d'enregistrement additionnel */
+        int m = fin;
         if (r[7]) {
             unsigned char rr[] = { 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 192, 0, 2, 7 };
             memcpy(r + m, rr, sizeof rr);

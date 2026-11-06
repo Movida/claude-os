@@ -414,6 +414,11 @@ D'où QEMU 8.2.10 compilé dans le Dockerfile et la CI (`.devcontainer/construir
 - `clone` : une adresse de TLS interdite à quatre niveaux, permise à cinq (LA57).
 - `attente`, vu au run suivant : `select` au-delà de la table des descripteurs supposait 128 cases, alors qu'elle vient aussi des ancêtres. Un numéro 300 hérité le reproduit ici ; que la CI en hérite ainsi se déduit, sans mesure. Sur l'hôte, le test se fait désormais dans un petit-fils à table neuve ;
 - `systeme` : « aucune faute majeure » comptait aussi les pages du programme lui-même, s'il n'est pas encore dans le cache (vu après le redémarrage du conteneur, reproduit en vidant le cache de ce fichier). Seul notre noyau, où tout est en mémoire, y est tenu.
+- `dns`, au run d'après : le serveur DNS du test recopiait toute la question, le OPT d'EDNS0 compris, et sa réponse était mal formée dès que `/etc/resolv.conf` demande « options edns0 ». `RES_OPTIONS=edns0` le reproduit ; que ce soit la raison sur la CI s'en déduit. Il répond maintenant à la question seule.
+- `temps`, de 6b à 6f, vu en imitant la CI : `time` lit l'horloge grossière et peut encore dire la seconde d'avant juste après un changement de seconde. 6g et 6h le savaient déjà ; ces copies-là échouaient une fois de temps en temps ;
+- `tests-qemu` de 6h, vu de même : le scénario sans ACPI arrêtait QEMU dès « Clavier PS/2 pret », puis cherchait une ligne du générateur, écrite juste après. Il attend maintenant cette ligne.
+
+Pour ne plus demander ses journaux à David à chaque tour (ils exigent les droits d'administrateur), la CI écrit ses échecs dans des annotations, que l'API de GitHub rend sans jeton.
 
 Dans notre noyau (`/etc/bonjour.txt` le dit à ces programmes), chaque vérification reste aussi stricte qu'avant ; seul l'hôte a droit à la variante. La leçon : regarder la CI après chaque push (`fin-d-etape`).
 

@@ -39,4 +39,14 @@ jobs:
       - name: Installer Rust
         run: cd 03-noyau-rust/noyau && rustup toolchain install
       - name: Tester chaque etape
-        run: ./verifier.sh
+        run: |
+          set -o pipefail
+          ./verifier.sh 2>&1 | tee verifier.log
+      # Les journaux d'une action demandent les droits d'administrateur du
+      # dépôt ; ses annotations se lisent sans jeton, par l'API de GitHub
+      # (/check-runs/<id>/annotations). Chaque échec y est dit une fois, le
+      # détail d'abord : GitHub en garde dix par étape.
+      - name: Dire les echecs dans les annotations
+        if: failure()
+        run: |
+          grep -E ': ECHEC$|^ECHEC ' verifier.log | sort -s -t' ' -k1,1r | awk '!vu[$0]++' | sed 's/^/::error::/'
