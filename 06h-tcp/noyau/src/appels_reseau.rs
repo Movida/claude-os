@@ -660,18 +660,12 @@ fn envoyer(o: &FichierTenu, nom: Option<&[u8]>, morceaux: &[(u64, u64)], mut dra
             }
             r
         }
-        // AF_UNIX : EPIPE d'un flux envoie SIGPIPE, sauf MSG_NOSIGNAL (un DGRAM ou
-        // SEQPACKET, non : `unix_dgram_sendmsg` ne le fait pas).
+        // AF_UNIX décide lui-même de SIGPIPE : pas pour tout EPIPE (`out_pipe`).
         Protocole::Unix => {
-            const MSG_NOSIGNAL: u64 = 0x4000;
             if let Err(e) = controle {
                 return e;
             }
-            let r = unix::envoyer(o.socket(), nom, longueur, drapeaux, scm, remplir);
-            if r == Err(-EPIPE) && drapeaux & MSG_NOSIGNAL == 0 && o.socket().sorte == unix::SOCK_STREAM {
-                crate::signaux::au_fil_courant(13);
-            }
-            r
+            unix::envoyer(o.socket(), nom, longueur, drapeaux, scm, remplir)
         }
     };
     en_i64(r.map(|n| n as i64))
@@ -722,8 +716,11 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: None, fichiers: Vec::new(), droits: None });
     }
     if o.socket().protocole == Protocole::Unix {
+        // Un morceau se copie en entier, ou pas du tout (`skb_copy_datagram_msg`) : une faute au
+        // milieu ne consomme rien de lui.
         let u = unix::recevoir(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |decalage, octets| {
-            copier_vers_morceaux_depuis(morceaux, decalage, octets)
+            let c = copier_vers_morceaux_depuis(morceaux, decalage, octets)?;
+            if c < octets.len() { Err(-EFAULT) } else { Ok(c) }
         })?;
         let recu = socket::Recu { vide: true, longueur: u.longueur, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: u.coupe };
         let d = if u.coupe { MSG_TRUNC } else { 0 } | if u.urgent { MSG_OOB as u32 } else { 0 };
@@ -1553,7 +1550,7 @@ fn options_tcp(s: &Arc<Socket>, option: i32, valeur: u64, longueur: i32) -> Resu
             TCP_QUICKACK => {
                 op.quickack = v != 0;
                 if let Some(t) = tcb.as_deref_mut() {
-                    t.quickack(v != 0);
+                    t.quickack_valeur(v, crate::temps::ns_monotone());
                 }
             }
             TCP_USER_TIMEOUT => {
@@ -1595,7 +1592,8 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], u
             TCP_LINGER2 => if op.linger2 == 0 { 60 } else { op.linger2 },
             TCP_DEFER_ACCEPT => essais_en_secondes(op.defer_accept),
             TCP_WINDOW_CLAMP => tcb.map_or(op.window_clamp, |t| t.window_clamp) as i32,
-            TCP_QUICKACK => op.quickack as i32,
+            // L'état vivant (`inet_csk_in_pingpong_mode`) : une conversation y entre d'elle-même.
+            TCP_QUICKACK => tcb.map_or(op.quickack, |t| t.hors_du_ping_pong()) as i32,
             TCP_USER_TIMEOUT => op.user_timeout as i32,
             TCP_CONGESTION => {
                 // Le nom, complété de zéros (`TCP_CA_NAME_MAX`, mesuré).
@@ -1714,12 +1712,15 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
                 s.vider_erreurs();
             }
         }
-        // La priorité ne suit que si le TOS change (`__ip_sock_set_tos`).
-        IP_TOS if op.tos != v as u8 => {
-            op.tos = v as u8;
-            op.priority = priorite_du_tos(v as u8);
+        // La priorité ne suit que si le TOS change (`__ip_sock_set_tos`). Sur un flux, les deux bits
+        // d'ECN sont à TCP, le programme ne les touche pas.
+        IP_TOS => {
+            let tos = if s.protocole == Protocole::Tcp { (v as u8 & !3) | (op.tos & 3) } else { v as u8 };
+            if op.tos != tos {
+                op.tos = tos;
+                op.priority = priorite_du_tos(tos);
+            }
         }
-        IP_TOS => {}
         IP_TTL => {
             if longueur < 1 || (v != -1 && !(1..=255).contains(&v)) {
                 return Err(-EINVAL);

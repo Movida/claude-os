@@ -622,7 +622,7 @@ impl Tube {
     /// fichiers : un lecteur ou un écrivain de moins ; si c'était le dernier
     /// d'un côté seulement, tout le monde est réveillé (clé nulle : tous les
     /// événements), pour voir la fin ou l'erreur.
-    pub fn fermer_bout(&self, lecture: bool, ecriture: bool) {
+    pub fn fermer_bout(&self, lecture: bool, ecriture: bool) -> bool {
         let (fin, plus_aucun) = {
             let mut e = self.etat.verrouiller();
             if lecture {
@@ -643,6 +643,7 @@ impl Tube {
             self.rd_wait.reveiller_toutes();
             self.wr_wait.reveiller_toutes();
         }
+        fin
     }
 }
 

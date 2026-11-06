@@ -57,7 +57,7 @@ use super::socket::{self, Protocole, Socket};
 use crate::attente::{FileAttente, Possede, Possession, Sommeil};
 use crate::faillible::{self, FileFaillible, VecFaillible};
 use crate::partage::{Arc, ArcVide};
-use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRBAND, POLLWRNORM};
+use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRNORM};
 use crate::tache::Reveil;
 use crate::verrou::Verrou;
 use alloc::boxed::Box;
@@ -639,6 +639,23 @@ impl Partie {
             }
             self.desarmer();
             self.quitter_la_table();
+        } else if etat == Etat::Fermee {
+            // Finie, mais le programme tient le descripteur (`tcp_done`, `tcp_set_state`) : elle ne
+            // garde pas son quadruplet : un SYN du même client irait à une connexion morte. Son port
+            // reste s'il vient de `bind` ; sinon, il est rendu (`inet_put_port`).
+            if let Some(t) = TABLE.verrouiller().as_mut() {
+                if self.adresses.port_choisi {
+                    t.redevenir_liee(self.numero, self.adresses.source);
+                } else {
+                    t.retirer(self.numero);
+                    self.hors_table = true;
+                }
+            }
+            if self.hors_table {
+                self.desarmer();
+            } else {
+                self.armer();
+            }
         } else {
             self.armer();
         }
@@ -715,19 +732,28 @@ impl Partie {
             s.rcvbuf.store(t.rcvbuf.min(i32::MAX as usize) as u32, Ordering::Relaxed);
             s.sndbuf.store(t.sndbuf.min(i32::MAX as usize) as u32, Ordering::Relaxed);
         }
-        if !self.hors_table
+        let a = self.adresses;
+        let dans_la_table = !self.hors_table;
+        if dans_la_table
             && let Some(t) = TABLE.verrouiller().as_mut()
         {
-            t.retirer(self.numero);
+            // Le port de `bind` n'a jamais été rendu (une fille d'une écoute à port nommé : l'écoute
+            // le tient aussi, ce qui ne se heurte pas).
+            if a.port_choisi {
+                t.redevenir_liee(self.numero, a.adresse);
+            } else {
+                t.retirer(self.numero);
+            }
         }
         self.desarmer();
         self.mode = Mode::Neuve;
         self.hors_table = false;
         self.etablie_un_jour = false;
         self.connexion_en_cours = false;
-        let a = self.adresses;
         self.adresses = Adresses::default();
-        if a.port_choisi {
+        if a.port_choisi && dans_la_table {
+            self.adresses = Adresses { lie: true, adresse: a.adresse, port: a.port, port_choisi: true, ..Adresses::default() };
+        } else if a.port_choisi {
             let (reuseaddr, reuseport) = partage(s);
             let lien = Lien {
                 sorte: Sorte::Liee, adresse: a.adresse, port: a.port, distante: [0; 4], port_distant: 0, reuseaddr, reuseport, uid: s.uid,
@@ -738,6 +764,32 @@ impl Partie {
                 self.adresses = Adresses { lie: true, adresse: a.adresse, port, port_choisi: true, ..Adresses::default() };
             }
         }
+        // Ce qu'elle tenait est rendu : `tcp_mem` n'a plus à le compter.
+        self.compter();
+    }
+
+    /// `tcp_disconnect`, depuis `connect(AF_UNSPEC)` et `shutdown` : plus rien de la connexion ou de
+    /// l'écoute ; un RST s'il en faut un, et l'erreur que verra le programme.
+    fn deconnecter(&mut self, s: &Arc<Socket>) {
+        let _contexte = contexte::entrer();
+        let ip = Ip::de(&self.options);
+        match &mut self.mode {
+            Mode::Connexion(t) => {
+                let (rst, erreur) = t.deconnexion();
+                if erreur {
+                    self.erreur_seule = inet::tcp::ECONNRESET;
+                } else {
+                    self.erreur_seule = t.prendre_erreur();
+                }
+                if rst {
+                    t.avorter_sur_donnees();
+                    self.emettre();
+                }
+            }
+            Mode::Ecoute { filles, .. } => arreter_les_filles(filles, ip),
+            Mode::Neuve => {}
+        }
+        self.redevenir_neuve(s);
     }
 
     /// La socket ne tient plus d'entrée dans la table.
@@ -789,8 +841,15 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
     }
     let mut a_envoyer: Vec<itcp::Sortant> = Vec::new();
     t.emettre(maintenant(), |s| {
-        // Sans place, le segment ne part pas : la retransmission y pourvoira.
-        let _ = a_envoyer.ajouter(s);
+        // Sans place, le segment ne part pas : la retransmission y pourvoira, et personne ne doit
+        // le croire encore dans la carte.
+        let numero = s.numero;
+        if a_envoyer.ajouter(s).is_err()
+            && let Some(r) = retenue
+            && numero != 0
+        {
+            r.envoi_perdu(numero);
+        }
     });
     for s in a_envoyer {
         // Un ACK pur, un RST ne tiennent pas la socket (`skb_is_tcp_pure_ack`).
@@ -1003,6 +1062,7 @@ impl Partie {
     fn traiter_ecoute(&mut self, mut s: Segment) {
         let ip = Ip::de(&self.options);
         let defer = self.options.defer_accept;
+        let numero_ecoute = self.numero;
         let Mode::Ecoute { backlog, filles } = &mut self.mode else { return };
         if let Some(n) = s.fille {
             if let Some(f) = filles.iter_mut().find(|f| f.numero == n) {
@@ -1030,9 +1090,14 @@ impl Partie {
         if h.drapeaux & ftcp::RST != 0 {
             return;
         }
-        if h.drapeaux & ftcp::ACK != 0 || h.drapeaux & ftcp::SYN == 0 {
-            // Un ACK pour une fille qu'on n'a plus : RST (`tcp_v4_rcv`).
+        if h.drapeaux & ftcp::ACK != 0 {
+            // Un ACK pour une fille qu'on n'a plus : RST (`tcp_rcv_state_process`, TCP_LISTEN).
             repondre_rst(&h, s.charge.longueur(), s.destination, s.source);
+            return;
+        }
+        // Ni un SYN, ni un SYN|FIN : rien, pas même un RST : ce que distinguent les balayages FIN et
+        // NULL (`TCP_FLAGS`).
+        if h.drapeaux & ftcp::SYN == 0 || h.drapeaux & ftcp::FIN != 0 {
             return;
         }
         // Un SYN : jeté si la file d'acceptation est pleine, ou s'il y a
@@ -1067,11 +1132,16 @@ impl Partie {
         tcb.memoire = niveau_memoire();
         tcb.poser_controle(self.options.controle);
         tcb.sans_file = sans_carte(s.source);
-        let lien = Lien {
-            sorte: Sorte::Connectee, adresse: s.destination, port: h.destination, distante: s.source, port_distant: h.source,
-            reuseaddr: false, reuseport: false, uid: 0, par_connect: false,
-        };
-        let ajoutee = TABLE.verrouiller().as_mut().is_some_and(|t| t.ajouter_fille(numero, lien, Cible::Fille(moi, numero)).is_ok());
+        // Elle hérite de ce que l'écoute permet (`sk_clone_lock`) : un serveur SO_REUSEADDR doit
+        // pouvoir redémarrer tant que vivent ses connexions, et jusqu'en TIME_WAIT (`tw_reuse`).
+        let ajoutee = TABLE.verrouiller().as_mut().is_some_and(|t| {
+            let (reuseaddr, reuseport, uid) = t.lien(numero_ecoute).map_or((false, false, 0), |l| (l.reuseaddr, l.reuseport, l.uid));
+            let lien = Lien {
+                sorte: Sorte::Connectee, adresse: s.destination, port: h.destination, distante: s.source, port_distant: h.source,
+                reuseaddr, reuseport, uid, par_connect: false,
+            };
+            t.ajouter_fille(numero, lien, Cible::Fille(moi, numero)).is_ok()
+        });
         if !ajoutee {
             return;
         }
@@ -1370,12 +1440,14 @@ pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
 /// listen (`inet_listen`) : une socket neuve (liée, ou un port éphémère),
 /// ou qui écoute déjà (le backlog change) ; une socket connectée : EINVAL.
 pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
-    let backlog = (backlog.max(0) as usize).min(SOMAXCONN);
+    // Comparé sans signe : un négatif, le plus grand permis (`__sys_listen_socket`).
+    let backlog = (backlog as u32 as usize).min(SOMAXCONN);
     let mut g = flux(s).posseder();
     let p = g.donnee();
     match &mut p.mode {
         Mode::Ecoute { backlog: b, .. } => {
             *b = backlog;
+            g.publier(|p, c| p.rafraichir(c));
             return Ok(());
         }
         // Une connexion qui n'a jamais abouti : la socket est neuve pour
@@ -1401,6 +1473,8 @@ pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
         return Err(-EADDRINUSE);
     }
     p.mode = Mode::Ecoute { backlog, filles: VecDeque::new() };
+    // `inet_csk_listen_start` efface l'état des ACK : TCP_QUICKACK à 0 ne survit pas à `listen`.
+    p.options.quickack = true;
     g.publier(|p, c| p.rafraichir(c));
     Ok(())
 }
@@ -1408,15 +1482,13 @@ pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
 /// connect (`inet_stream_connect`, `tcp_v4_connect`).
 pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i64> {
     if o.len() >= 2 && socket::famille(o) == Some(socket::AF_UNSPEC) {
-        // Déconnecter : RST, et la socket redevient neuve (`tcp_disconnect`).
+        // Déconnecter (`tcp_disconnect`), une connexion ou une écoute.
         let mut g = flux(s).posseder();
-        let p = g.donnee();
-        if let Mode::Connexion(t) = &mut p.mode {
-            t.avorter();
-            p.emettre();
-            p.redevenir_neuve(s);
-        }
+        g.donnee().deconnecter(s);
+        g.avec_court(|_, c| c.arret = 0);
         g.publier(|p, c| p.rafraichir(c));
+        // Un `accept` en attente n'a pas d'état qui change à voir (`sk_error_report`).
+        flux(s).file().reveiller_toutes();
         return Ok(());
     }
     let a = adresse(o)?;
@@ -1428,20 +1500,18 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
     let mut deja = false;
     {
         let p = g.donnee();
-        // Une connexion qui n'a jamais abouti (refusée, abandonnée) : son
-        // erreur, une fois, si personne ne l'a lue ; puis la socket
-        // redevient neuve, et ce `connect` repart (`inet_stream_connect` :
-        // TCP_CLOSE), même si une écoute est apparue entre-temps.
+        // Une connexion qui n'a jamais abouti aux yeux de `connect` (refusée, abandonnée, ou
+        // coupée avant que `connect` ne l'ait vue établie : SS_CONNECTING, TCP_CLOSE) : son erreur,
+        // ou ECONNABORTED si elle a déjà été lue (`__inet_stream_connect` : `sock_error`) ; la
+        // socket redevient neuve, et c'est le `connect` suivant qui repart.
         if let Mode::Connexion(t) = &mut p.mode
             && t.etat() == Etat::Fermee
             && !p.etablie_un_jour
         {
             let e = t.prendre_erreur();
             p.redevenir_neuve(s);
-            if e != 0 {
-                g.publier(|p, c| p.rafraichir(c));
-                return Err(-(e as i64));
-            }
+            g.publier(|p, c| p.rafraichir(c));
+            return Err(if e != 0 { -(e as i64) } else { -ECONNABORTED });
         }
         let p = g.donnee();
         match &p.mode {
@@ -1460,15 +1530,9 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                         // si le délai passe (`inet_stream_connect`).
                         deja = true;
                     }
-                    Etat::Fermee => {
-                        // Établie un jour, puis fermée : son erreur, une
-                        // fois, puis EISCONN.
-                        let e = if let Mode::Connexion(t) = &mut p.mode { t.prendre_erreur() } else { 0 };
-                        if e != 0 {
-                            return Err(-(e as i64));
-                        }
-                        return Err(-EISCONN);
-                    }
+                    // Vue établie, puis fermée : EISCONN (SS_CONNECTED), l'erreur reste en attente
+                    // (mesuré).
+                    Etat::Fermee => return Err(-EISCONN),
                     _ => {
                         if p.connexion_en_cours {
                             // Le premier `connect` qui suit l'établissement
@@ -1547,6 +1611,8 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 p.mode = Mode::Connexion(t);
                 p.identifiant = crate::aleatoire::u32() as u16;
                 p.connexion_en_cours = non_bloquant;
+                // Une connexion neuve repart sans erreur (`tcp_connect_init`).
+                p.erreur_seule = 0;
                 let _contexte = contexte::entrer();
                 p.emettre();
                 p.apres();
@@ -1567,15 +1633,21 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
         Reveil::Echeance => return Err(if deja { -EALREADY } else { -EINPROGRESS }),
         Reveil::Signal => return Err(if delai.is_some() { -EINTR } else { -crate::reprise::ERESTARTSYS }),
     }
-    let Mode::Connexion(t) = &mut p.mode else { return Err(-ECONNABORTED) };
+    // Défaite pendant qu'on attendait (`shutdown`, AF_UNSPEC, d'un autre fil) : son erreur.
+    let Mode::Connexion(t) = &mut p.mode else {
+        let e = core::mem::take(&mut p.erreur_seule);
+        g.publier(|p, c| p.rafraichir(c));
+        return Err(if e != 0 { -(e as i64) } else { -ECONNABORTED });
+    };
     if t.etat() == Etat::Fermee {
         // Un connect bloquant qui échoue remet la socket à neuf
         // (`tcp_disconnect`) : elle peut se reconnecter, et poll ne dit
-        // plus que POLLOUT | POLLHUP.
+        // plus que POLLOUT | POLLHUP. Son erreur déjà lue par un autre fil : ECONNABORTED
+        // (`__inet_stream_connect`).
         let e = t.prendre_erreur();
         p.redevenir_neuve(s);
         g.publier(|p, c| p.rafraichir(c));
-        return Err(-(if e != 0 { e } else { itcp::ECONNREFUSED }) as i64);
+        return Err(if e != 0 { -(e as i64) } else { -ECONNABORTED });
     }
     p.etablie_un_jour = true;
     p.connexion_en_cours = false;
@@ -1595,8 +1667,7 @@ impl Possession<Partie> {
 pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8; 4], u16), i64> {
     // Les options de l'écoute, que la socket neuve hérite (`sk_clone_lock`
     // recopie la socket entière : SO_LINGER, SO_RCVTIMEO, SO_SNDTIMEO,
-    // SO_KEEPALIVE, SO_OOBINLINE, IP_TTL...), lues avant la possession
-    // (l'ordre de nos verrous : le Mutex de la socket d'abord).
+    // SO_KEEPALIVE, SO_OOBINLINE, IP_TTL...), lues une fois, avant d'attendre.
     let options = s.appels.verrouiller().options;
     let delai = options.rcvtimeo;
     let echeance = delai.map(|d| crate::temps::ns_monotone().saturating_add(d));
@@ -1714,11 +1785,20 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
     loop {
         let arret = g.avec_court(|_, c| c.arret);
         let p = g.donnee();
-        let Mode::Connexion(t) = &mut p.mode else { return Err(-EPIPE) };
-        let e = t.prendre_erreur();
-        if e != 0 {
+        let Mode::Connexion(t) = &mut p.mode else {
+            // Une socket neuve, l'erreur de sa déconnexion d'abord.
+            let e = core::mem::take(&mut p.erreur_seule);
             g.publier(|p, c| p.rafraichir(c));
-            return if fait > 0 { Ok(fait) } else { Err(-(e as i64)) };
+            return Err(if e != 0 { -(e as i64) } else { -EPIPE });
+        };
+        // Des octets déjà pris : rendus ; l'erreur attend l'appel suivant (`do_error`).
+        if t.erreur() != 0 {
+            if fait > 0 {
+                return Ok(fait);
+            }
+            let e = t.prendre_erreur();
+            g.publier(|p, c| p.rafraichir(c));
+            return Err(-(e as i64));
         }
         if arret & socket::ARRET_ECRITURE != 0 || !matches!(t.etat(), Etat::Etablie | Etat::AttenteFermeture | Etat::SynEnvoye | Etat::SynRecu) {
             return if fait > 0 { Ok(fait) } else { Err(-EPIPE) };
@@ -1858,7 +1938,7 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
                 Some(_) => return Ok(fait),
                 None => {}
             }
-            if fait == longueur || fait >= cible.max(1) || peek {
+            if fait == longueur || fait >= cible.max(1) {
                 return Ok(fait);
             }
             continue;
@@ -1866,10 +1946,18 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
         if fait >= cible.max(1) {
             return Ok(fait);
         }
-        let e = t.prendre_erreur();
-        if e != 0 {
+        let p = g.donnee();
+        let Mode::Connexion(t) = &mut p.mode else { return Ok(fait) };
+        // Rien de copié : le FIN d'abord (SOCK_DONE), puis l'erreur : un RST après le FIN laisse
+        // lire la fin (`tcp_recvmsg_locked`), SO_ERROR dira l'erreur. Des octets copiés : ils sont
+        // rendus, l'erreur attend l'appel suivant.
+        if t.erreur() != 0 && !t.fin_recue() {
+            if fait > 0 {
+                return Ok(fait);
+            }
+            let e = t.prendre_erreur();
             g.publier(|p, c| p.rafraichir(c));
-            return if fait > 0 { Ok(fait) } else { Err(-(e as i64)) };
+            return Err(-(e as i64));
         }
         if t.fin_recue() || arret & socket::ARRET_LECTURE != 0 || t.etat() == Etat::Fermee {
             return Ok(fait);
@@ -1884,6 +1972,9 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
             c.lisibles > 0 || c.fin_recue || c.erreur != 0 || c.arret & socket::ARRET_LECTURE != 0 || c.etat == Some(Etat::Fermee)
         });
         match r {
+            // Une place de 0 : un seul tour, attente comprise (le `while (len > 0)` de
+            // `tcp_recvmsg_locked`), et 0 quoi qu'il en sorte, même si le délai est passé (mesuré).
+            Reveil::Reveillee | Reveil::Echeance if longueur == 0 => return Ok(0),
             Reveil::Reveillee => {}
             _ if fait > 0 => return Ok(fait),
             Reveil::Echeance => return Err(-EAGAIN),
@@ -1901,6 +1992,7 @@ pub fn recevoir_urgent(s: &Arc<Socket>, drapeaux: u64, place: usize, copier: imp
     const MSG_TRUNC: u64 = 0x20;
     const EINVAL_: i64 = 22;
     let mut g = flux(s).posseder();
+    let arret = g.avec_court(|_, c| c.arret);
     let p = g.donnee();
     let t = match &mut p.mode {
         Mode::Ecoute { .. } => return Err(-ENOTCONN),
@@ -1911,6 +2003,8 @@ pub fn recevoir_urgent(s: &Arc<Socket>, drapeaux: u64, place: usize, copier: imp
         Ok(Some(o)) if place > 0 && drapeaux & MSG_TRUNC == 0 => copier(o).map(|()| Some(1)),
         Ok(Some(_)) => Ok(Some(0)),
         Ok(None) => Ok(None),
+        // Pas encore là, et la lecture est fermée : il ne viendra plus (`tcp_recv_urg`).
+        Err(inet::tcp::EAGAIN) if arret & socket::ARRET_LECTURE != 0 => Ok(None),
         Err(e) => Err(-(e as i64)),
     };
     g.publier(|p, c| p.rafraichir(c));
@@ -1919,10 +2013,26 @@ pub fn recevoir_urgent(s: &Arc<Socket>, drapeaux: u64, place: usize, copier: imp
 
 /// shutdown (`inet_shutdown`, `tcp_shutdown`) : les drapeaux posés ;
 /// SHUT_WR d'une connexion envoie FIN. Pas connectée : ENOTCONN, mais les
-/// drapeaux posés (mesuré) ; une écoute : SHUT_RD la défait.
+/// drapeaux posés (mesuré). Une écoute : SHUT_RD la défait, SHUT_WR ne fait rien ; en
+/// SYN_SENT, la connexion est défaite (`tcp_disconnect`), et ce n'est pas une erreur.
 pub fn arreter(s: &Arc<Socket>, arret: u8) -> Result<(), i64> {
     let mut g = flux(s).posseder();
-    let connectee = matches!(&g.donnee().mode, Mode::Connexion(t) if !matches!(t.etat(), Etat::Fermee | Etat::SynEnvoye));
+    let (ecoute, en_syn) = match &g.donnee().mode {
+        Mode::Ecoute { .. } => (true, false),
+        Mode::Connexion(t) => (false, t.etat() == Etat::SynEnvoye),
+        Mode::Neuve => (false, false),
+    };
+    if en_syn || (ecoute && arret & socket::ARRET_LECTURE != 0) {
+        g.donnee().deconnecter(s);
+        g.avec_court(|_, c| c.arret = 0);
+        g.publier(|p, c| p.rafraichir(c));
+        flux(s).file().reveiller_toutes();
+        return Ok(());
+    }
+    if ecoute {
+        return Ok(());
+    }
+    let connectee = matches!(&g.donnee().mode, Mode::Connexion(t) if t.etat() != Etat::Fermee);
     g.avec_court(|_, c| c.arret |= arret);
     if arret & socket::ARRET_LECTURE != 0
         && let Mode::Connexion(t) = &mut g.donnee().mode
@@ -1958,7 +2068,9 @@ pub fn fermer(s: &Arc<Socket>) {
     {
         let p = g.donnee();
         if let Mode::Connexion(t) = &mut p.mode {
-            if t.lisibles() > 0 || (linger.0 && linger.1 == 0) {
+            if t.lisibles() > 0 {
+                t.avorter_sur_donnees();
+            } else if linger.0 && linger.1 == 0 {
                 t.avorter();
             } else {
                 t.fermer_envoi();
@@ -1988,14 +2100,7 @@ pub fn fermer(s: &Arc<Socket>) {
             p.hors_table = true;
         }
         Mode::Ecoute { filles, .. } => {
-            for f in filles.iter_mut() {
-                f.tcb.avorter();
-                emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
-                if let Some(t) = TABLE.verrouiller().as_mut() {
-                    t.retirer(f.numero);
-                }
-            }
-            filles.clear();
+            arreter_les_filles(filles, ip);
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.retirer(p.numero);
             }
@@ -2025,6 +2130,18 @@ pub fn fermer(s: &Arc<Socket>) {
     }
     drop(_contexte);
     g.publier(|p, c| p.rafraichir(c));
+}
+
+/// Les filles d'une écoute qui s'arrête (`inet_csk_listen_stop`) : coupées, rendues.
+fn arreter_les_filles(filles: &mut VecDeque<Fille>, ip: Ip) {
+    for f in filles.iter_mut() {
+        f.tcb.avorter();
+        emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
+        if let Some(t) = TABLE.verrouiller().as_mut() {
+            t.retirer(f.numero);
+        }
+    }
+    filles.clear();
 }
 
 fn t_ferme(p: &Partie) -> bool {
@@ -2074,7 +2191,7 @@ fn masque(c: &Premier) -> u32 {
         if c.arret & ARRET_ECRITURE == 0 {
             // Un tiers de SO_SNDBUF libre (`__sk_stream_is_writeable`).
             if fermee || c.place >= c.sndbuf / 3 {
-                m |= POLLOUT | POLLWRNORM | POLLWRBAND;
+                m |= POLLOUT | POLLWRNORM;
             }
         } else {
             m |= POLLOUT | POLLWRNORM;
@@ -2092,9 +2209,10 @@ fn masque(c: &Premier) -> u32 {
 /// SO_ERROR : l'erreur en attente, lue et effacée.
 pub fn prendre_erreur(s: &Socket) -> i32 {
     let mut g = flux(s).posseder();
-    let e = match &mut g.donnee().mode {
-        Mode::Connexion(t) => t.prendre_erreur(),
-        _ => 0,
+    let p = g.donnee();
+    let e = match &mut p.mode {
+        Mode::Connexion(t) => t.prendre_erreur_so(),
+        _ => core::mem::take(&mut p.erreur_seule),
     };
     g.publier(|p, c| p.rafraichir(c));
     e

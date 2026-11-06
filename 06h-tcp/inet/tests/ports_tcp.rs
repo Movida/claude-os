@@ -164,3 +164,26 @@ fn reprise_d_un_time_wait() {
     assert_eq!(t.connecter(2, LO, LO, 80, l, 2, 0, 0, |_, _| true), Ok(5000));
     assert_eq!(t.nombre_temps_attente(), 0);
 }
+
+/// Une connexion morte dont le port vient de `bind` : son quadruplet est libre, son port non ;
+/// elle ne repasse pas par les conflits, même à côté de son écoute.
+#[test]
+fn une_morte_garde_son_port() {
+    let mut t = table();
+    let mut l = lien(LO, 8080);
+    l.reuseaddr = false;
+    assert_eq!(t.lier(1, l, 1, 0), Ok(8080));
+    t.ecouter(1).unwrap();
+    let fille = Lien { sorte: Sorte::Connectee, distante: [10, 0, 2, 2], port_distant: 40000, ..l };
+    t.ajouter_fille(2, fille, 2).unwrap();
+    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080), Some(Destinataire::Connexion(2)));
+    t.redevenir_liee(2, LO);
+    assert_eq!(t.lien(2).map(|x| (x.sorte, x.distante, x.port_distant)), Some((Sorte::Liee, TOUT, 0)));
+    // Le segment suivant du même client va à l'écoute.
+    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080), Some(Destinataire::Ecoute(1)));
+    t.retirer(1);
+    // L'écoute partie, le port reste pris par elle.
+    assert_eq!(t.lier(3, lien(LO, 8080), 3, 0), Err(Refus::Pris));
+    t.retirer(2);
+    assert_eq!(t.lier(3, lien(LO, 8080), 3, 0), Ok(8080));
+}

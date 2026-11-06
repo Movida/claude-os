@@ -215,12 +215,10 @@ pub const RETRIES2: u32 = 15;
 const ORPHELINE_ESSAIS: u32 = 8;
 
 /// Les ACK retardés : le plus petit délai (TCP_ATO_MIN, TCP_DELACK_MIN),
-/// le plus grand (TCP_DELACK_MAX), celui d'une connexion qui ne fait que
-/// recevoir (HZ/2), et le nombre d'ACK immédiats au début d'une connexion
-/// (TCP_MAX_QUICKACKS).
+/// le plus grand (TCP_DELACK_MAX), et le nombre d'ACK immédiats au début
+/// d'une connexion (TCP_MAX_QUICKACKS).
 const ATO_MIN: u64 = 40_000_000;
 const DELACK_MAX: u64 = 200_000_000;
-const ATO_RECEPTION: u64 = 500_000_000;
 const ACK_RAPIDES_MAX: u32 = 16;
 /// La compression des ACK dupliqués (`tcp_comp_sack_nr`, `tcp_comp_sack_delay_ns`).
 const COMP_SACK_MAX: u32 = 44;
@@ -233,6 +231,7 @@ pub const EMSGSIZE: i32 = 90;
 pub const ECONNREFUSED: i32 = 111;
 pub const ECONNRESET: i32 = 104;
 pub const EPIPE: i32 = 32;
+pub const ENOTCONN: i32 = 107;
 pub const ETIMEDOUT: i32 = 110;
 
 /// `a` est-il avant `b`, modulo 2³² (le `before` de Linux) ?
@@ -1315,10 +1314,15 @@ impl<P: Charge> Tcb<P> {
     }
 
     /// La mémoire que garde la réception, en taille vraie : la file de
-    /// lecture et la file hors d'ordre (bornées ensemble à deux fois
-    /// SO_RCVBUF, voir `recevoir_donnees`).
+    /// lecture et la file hors d'ordre (bornées ensemble à SO_RCVBUF par
+    /// `tcp_try_rmem_schedule`, tcp/reception.rs).
     pub fn memoire_reception(&self) -> usize {
         self.taille_vraie_reception + self.hors_ordre.taille_vraie
+    }
+
+    /// La part de la file hors d'ordre.
+    pub fn memoire_hors_ordre(&self) -> usize {
+        self.hors_ordre.taille_vraie
     }
 
     /// Plus personne ne lira (`close` d'une orpheline, shutdown(SHUT_RD)).
@@ -1349,6 +1353,10 @@ impl<P: Charge> Tcb<P> {
     pub fn lire_urgent(&mut self, garder: bool) -> Result<Option<u8>, i32> {
         if self.reglages.oobinline || matches!(self.urgent, Urgent::Aucun | Urgent::Lu) {
             return Err(EINVAL);
+        }
+        // Coupée sans avoir reçu de FIN (`tcp_recv_urg` : `TCP_CLOSE && !SOCK_DONE`).
+        if self.etat == Etat::Fermee && !self.fin_recue {
+            return Err(ENOTCONN);
         }
         if let Urgent::Valide(o) = self.urgent {
             if !garder {
@@ -1381,6 +1389,15 @@ impl<P: Charge> Tcb<P> {
     /// L'erreur douce (d'un ICMP), que rendra un abandon.
     pub fn erreur_douce(&self) -> i32 {
         self.erreur_douce
+    }
+
+    /// SO_ERROR : l'erreur en attente, sinon l'erreur douce (d'un ICMP), lue une fois
+    /// (`sk_getsockopt`).
+    pub fn prendre_erreur_so(&mut self) -> i32 {
+        match self.prendre_erreur() {
+            0 => core::mem::take(&mut self.erreur_douce),
+            e => e,
+        }
     }
 
     /// Copie jusqu'à `n` octets reçus par `copier` (qui rend combien elle a
@@ -1972,6 +1989,11 @@ impl<P: Charge> Tcb<P> {
                         self.rst_du = Some((t.ack, 0, tcp::RST));
                         e.a_emettre = true;
                     }
+                    // « Previous FIN/ACK or RST/ACK might be ignored » : l'autre garde le reste
+                    // d'une ancienne connexion ; notre RST le nettoie, et le SYN repart vite.
+                    if self.retransmissions == 0 {
+                        self.armer_xmit(Minuteur::Retransmission, 2 * sack::JIFFY, maintenant);
+                    }
                     return e;
                 }
                 // Un SYN-ACK dont TSecr n'est pas entre notre premier SYN et
@@ -2212,7 +2234,9 @@ impl<P: Charge> Tcb<P> {
             self.recevoir_texte(t, seq, charge, fin, maintenant, &mut e);
         }
         if self.fin_hors_ordre == Some(self.rcv_nxt) && self.etat.recoit() {
-            self.fin_hors_ordre = None;
+            // Le trou est comblé : un ACK sans attendre, comme pour la file hors d'ordre
+            // (le FIN y serait, chez Linux : `tcp_ofo_queue`).
+            self.ack.urgent = true;
             self.recevoir_fin(&mut e);
         }
         self.verifier_ack(maintenant);
@@ -2491,8 +2515,9 @@ impl<P: Charge> Tcb<P> {
         }
         self.cc.cwnd = if self.total_retrans > 1 && self.undo_marker.is_some() { 1 } else { CWND_INITIALE };
         // La perte du SYN est réparée ; le seuil, lui, garde sa réduction
-        // (Linux aussi).
-        if self.cc.phase == Phase::Perte {
+        // (Linux aussi). Sans SACK, l'état attend un ACK au-delà de `high_seq`
+        // (`tcp_is_non_sack_preventing_reopen`) : le premier ACK de données.
+        if self.cc.phase == Phase::Perte && self.sack_ok {
             self.changer_phase(Phase::Ouverte);
         }
         if self.cc.phase != Phase::Perte {
@@ -2538,20 +2563,34 @@ impl<P: Charge> Tcb<P> {
         e
     }
 
-    /// TCP_QUICKACK (`__tcp_sock_set_quickack`) : 1 quitte le ping-pong et
-    /// envoie tout de suite un ACK dû ; 0 entre en ping-pong.
-    pub fn quickack(&mut self, oui: bool) -> Effets {
-        let mut e = Effets::default();
-        if oui {
-            self.ack.pingpong = 0;
-            if self.ack.programme {
-                self.ack_maintenant = true;
-                e.a_emettre = true;
-            }
-        } else {
+    /// TCP_QUICKACK (`__tcp_sock_set_quickack`) : 0 entre en ping-pong ; sinon, il le quitte, et un
+    /// ACK dû part selon `tcp_cleanup_rbuf`, connexion établie ou en CLOSE_WAIT ; une valeur paire y
+    /// revient ensuite.
+    pub fn quickack_valeur(&mut self, valeur: i32, maintenant: u64) -> Effets {
+        if valeur == 0 {
             self.ack.pingpong = self.ack.pingpong.max(1);
+            return Effets::default();
+        }
+        self.ack.pingpong = 0;
+        let mut e = Effets::default();
+        if matches!(self.etat, Etat::Etablie | Etat::AttenteFermeture) && self.ack.programme {
+            self.ack.pousse |= ACK_POUSSE;
+            e = self.lu(1, maintenant);
+            if valeur & 1 == 0 {
+                self.ack.pingpong = self.ack.pingpong.max(1);
+            }
         }
         e
+    }
+
+    /// De même, pour oui ou non.
+    pub fn quickack(&mut self, oui: bool) -> Effets {
+        self.quickack_valeur(i32::from(oui), self.heure)
+    }
+
+    /// TCP_QUICKACK relu : hors du ping-pong ? C'est l'état vivant, pas ce qu'on a écrit.
+    pub fn hors_du_ping_pong(&self) -> bool {
+        self.ack.pingpong == 0
     }
 
     /// send(MSG_OOB) (`tcp_mark_urg`) : le dernier octet écrit est urgent ;
@@ -2811,6 +2850,7 @@ impl<P: Charge> Tcb<P> {
 
     /// Le FIN de l'autre, à son tour (`tcp_fin`).
     fn recevoir_fin(&mut self, e: &mut Effets) {
+        self.fin_hors_ordre = None;
         self.rcv_nxt = self.rcv_nxt.wrapping_add(1);
         self.mesures.octets_recus += 1;
         self.fin_recue = true;
@@ -2938,18 +2978,15 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// Arme l'ACK retardé (`tcp_send_delayed_ack`) : l'`ato`, au plus
-    /// 200 ms (500 ms pour un récepteur pur hors ping-pong, mais pas plus
-    /// que le RTT mesuré) ; une échéance déjà plus proche est gardée, et
-    /// une échéance presque échue fait partir l'ACK tout de suite.
+    /// Arme l'ACK retardé (`tcp_send_delayed_ack`) : l'`ato`, pas plus que le
+    /// RTT mesuré, au plus 200 ms (Linux calcule aussi 500 ms pour un récepteur
+    /// pur hors ping-pong, que `icsk_delack_max` ramène aussitôt à 200 ms : un
+    /// seul plafond ici) ; une échéance déjà plus proche est gardée, et une
+    /// échéance presque échue fait partir l'ACK tout de suite.
     fn retarder_ack(&mut self, maintenant: u64) {
         let mut ato = self.ack.ato;
-        if ato > ATO_MIN {
-            let mut max_ato = if self.ack.pingpong > 0 { DELACK_MAX } else { ATO_RECEPTION };
-            if self.rtt.mesure() {
-                max_ato = max_ato.min(self.rtt.srtt().max(ATO_MIN));
-            }
-            ato = ato.min(max_ato);
+        if ato > ATO_MIN && self.rtt.mesure() {
+            ato = ato.min(self.rtt.srtt().max(ATO_MIN));
         }
         ato = ato.min(DELACK_MAX);
         let mut echeance = maintenant + ato;
@@ -3389,15 +3426,15 @@ impl<P: Charge> Tcb<P> {
     /// Envoie un segment neuf de `n` octets à partir de SND.NXT, et le FIN si
     /// `avec_fin` ; son entrée va dans la file (`tcp_event_new_data_sent`). Faux
     /// si la place manque dans la file : rien n'est parti, on réessaiera.
-    fn envoyer_donnees(&mut self, n: usize, avec_fin: bool, maintenant: u64, sortir: &mut impl FnMut(Sortant)) -> bool {
+    fn envoyer_donnees(&mut self, n: usize, avec_fin: bool, maintenant: u64, pousser: bool, sortir: &mut impl FnMut(Sortant)) -> bool {
         if self.file.try_reserve(1).is_err() {
             return false;
         }
         let debut = self.snd_nxt.wrapping_sub(self.seq_envoi) as usize;
         let reste = self.octets_envoi.saturating_sub(debut);
         let mut drapeaux = tcp::ACK;
-        // PSH : la fin de ce que le programme a écrit.
-        if n > 0 && n == reste {
+        // PSH : la fin de ce que le programme a écrit, ou une sonde de fenêtre (`tcp_write_wakeup`).
+        if n > 0 && (n == reste || pousser) {
             drapeaux |= tcp::PSH;
         }
         if avec_fin {
@@ -3428,7 +3465,6 @@ impl<P: Charge> Tcb<P> {
         if rearmer {
             self.rearmer_rto(maintenant);
         }
-        self.ack_envoye();
         self.verifier_place(maintenant);
         true
     }
@@ -3536,7 +3572,7 @@ impl<P: Charge> Tcb<P> {
                 let avec_fin = self.fin_seq().is_some_and(|f| !apres(self.snd_nxt, f)) && n == reste && (n as u32) < fenetre;
                 // Quelque chose est parti : ce n'est plus une sonde, et le recul ne vaut plus :
                 // c'est le RTO qui veille (`tcp_send_probe0`).
-                if self.envoyer_donnees(n, avec_fin, maintenant, &mut sortir) {
+                if self.envoyer_donnees(n, avec_fin, maintenant, true, &mut sortir) {
                     self.sondes = 0;
                     self.sondes_debut = None;
                     self.recul = 0;
@@ -3643,7 +3679,7 @@ impl<P: Charge> Tcb<P> {
             if self.carte_trop_pleine(n, 0) {
                 break;
             }
-            if !self.envoyer_donnees(n, avec_fin, maintenant, sortir) {
+            if !self.envoyer_donnees(n, avec_fin, maintenant, false, sortir) {
                 break;
             }
             sortis += 1;
@@ -3660,16 +3696,9 @@ impl<P: Charge> Tcb<P> {
                 self.chrono_arreter(Chrono::FenetreDeLAutre, maintenant);
             }
         }
-        let limitee = self.paquets_en_vol() >= self.cc.cwnd;
         // Sans rien à envoyer, `tcp_write_xmit` n'est même pas appelé (`tcp_push_pending_frames`).
-        if a_envoyer && (sortis > 0 || limitee) {
-            let relachable = self.cc.phase == Phase::Ouverte && !self.reglages.orpheline && !self.sans_place;
-            let affamee = self.cc.valider(limitee, self.file.len() as u32, self.snd_una, self.snd_nxt, self.rto, relachable, maintenant);
-            // La fin de `tcp_cwnd_validate` : rien à faire partir, pas la faute de la
-            // cwnd, et un programme qui attend : c'est le tampon qui limite.
-            if affamee && self.non_envoyes() == 0 && self.sans_place && matches!(self.etat, Etat::Etablie | Etat::AttenteFermeture) {
-                self.chrono_commencer(Chrono::TamponPlein, maintenant);
-            }
+        if a_envoyer {
+            self.apres_xmit(sortis, maintenant);
         }
         if sortis > 0 {
             // Une sonde par fin de rafale.
@@ -3680,6 +3709,26 @@ impl<P: Charge> Tcb<P> {
         // (`tcp_check_probe_timer`), qui les poussera au plus tard.
         if self.file.is_empty() && self.prochain_segment().is_some() && self.t_xmit.is_none() {
             self.armer_xmit(Minuteur::Sonde, self.rto.max(RTO_MIN), maintenant);
+        }
+    }
+}
+
+impl<P: Charge> Tcb<P> {
+    /// La fin de `tcp_write_xmit`, `sortis` segments neufs partis : la cwnd a-t-elle servi
+    /// (`tcp_cwnd_validate`), et ce qui compte dans une réduction.
+    fn apres_xmit(&mut self, sortis: u32, maintenant: u64) {
+        let limitee = self.paquets_en_vol() >= self.cc.cwnd;
+        if sortis > 0 || limitee {
+            let relachable = self.cc.phase == Phase::Ouverte && !self.reglages.orpheline && !self.sans_place;
+            let affamee = self.cc.valider(limitee, self.file.len() as u32, self.snd_una, self.snd_nxt, self.rto, relachable, maintenant);
+            // La fin de `tcp_cwnd_validate` : rien à faire partir, pas la faute de la
+            // cwnd, et un programme qui attend : c'est le tampon qui limite.
+            if affamee && self.non_envoyes() == 0 && self.sans_place && matches!(self.etat, Etat::Etablie | Etat::AttenteFermeture) {
+                self.chrono_commencer(Chrono::TamponPlein, maintenant);
+            }
+        }
+        if sortis > 0 && self.en_reduction() {
+            self.prr_sortis += sortis;
         }
     }
 }

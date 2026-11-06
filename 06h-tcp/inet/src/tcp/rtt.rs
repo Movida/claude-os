@@ -180,4 +180,108 @@ mod tests {
         r.echantillon(200 * MS, 0, 10);
         assert_eq!(r.srtt(), 102_656_250);
     }
+
+    /// `tcp_rtt_estimator`, recopié du C, ligne à ligne (`long m`, le reste non signé) : la référence.
+    #[derive(Default)]
+    struct Reference {
+        srtt_us: u64,
+        mdev_us: u64,
+        mdev_max_us: u64,
+        rttvar_us: u64,
+        rtt_seq: u32,
+    }
+
+    impl Reference {
+        fn estimer(&mut self, mrtt: i64, snd_una: u32, snd_nxt: u32) {
+            let mut m = mrtt;
+            let mut srtt = self.srtt_us as i64;
+            if srtt != 0 {
+                m -= srtt >> 3;
+                srtt += m;
+                if m < 0 {
+                    m = -m;
+                    m -= (self.mdev_us >> 2) as i64;
+                    if m > 0 {
+                        m >>= 3;
+                    }
+                } else {
+                    m -= (self.mdev_us >> 2) as i64;
+                }
+                self.mdev_us = (self.mdev_us as i64 + m) as u64;
+                if self.mdev_us > self.mdev_max_us {
+                    self.mdev_max_us = self.mdev_us;
+                    if self.mdev_max_us > self.rttvar_us {
+                        self.rttvar_us = self.mdev_max_us;
+                    }
+                }
+                if (self.rtt_seq.wrapping_sub(snd_una) as i32) < 0 {
+                    if self.mdev_max_us < self.rttvar_us {
+                        self.rttvar_us -= (self.rttvar_us - self.mdev_max_us) >> 2;
+                    }
+                    self.rtt_seq = snd_nxt;
+                    self.mdev_max_us = RTO_MIN;
+                }
+            } else {
+                srtt = m << 3;
+                self.mdev_us = (m << 1) as u64;
+                self.rttvar_us = self.mdev_us.max(RTO_MIN);
+                self.mdev_max_us = self.rttvar_us;
+                self.rtt_seq = snd_nxt;
+            }
+            self.srtt_us = (srtt as u64).max(1);
+        }
+    }
+
+    /// Des mesures au hasard, qui montent et descendent, des aller-retours : les valeurs de Linux.
+    #[test]
+    fn comme_le_c_de_linux() {
+        for graine in 1..=40u64 {
+            let mut x = graine.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+            let mut hasard = move |m: u64| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                x % m
+            };
+            let mut r = Rtt::new();
+            let mut c = Reference::default();
+            let mut una = 0xFFFF_FF00u32;
+            let plage = [1_000, 100 * MS, 3000 * MS][hasard(3) as usize];
+            for _ in 0..2000 {
+                let m = 1 + hasard(plage);
+                una = una.wrapping_add(hasard(40) as u32);
+                let nxt = una.wrapping_add(hasard(40) as u32);
+                r.echantillon(m, una, nxt);
+                c.estimer(m as i64, una, nxt);
+                assert_eq!((r.srtt8, r.mdev4, r.mdev_max, r.rttvar, r.rtt_seq), (c.srtt_us, c.mdev_us, c.mdev_max_us, c.rttvar_us, c.rtt_seq));
+                assert_eq!(r.rto(), ((c.srtt_us >> 3) + c.rttvar_us).min(RTO_MAX));
+            }
+        }
+    }
+
+    #[test]
+    fn une_mesure_nulle_compte_pour_une() {
+        let mut r = Rtt::new();
+        assert!(!r.mesure());
+        r.echantillon(0, 0, 10);
+        assert!(r.mesure());
+        assert_eq!(r.srtt8, 8);
+        assert_eq!(r.srtt8_us(), 0);
+        assert_eq!(r.ecart(), 0);
+        r.echantillon(8000, 0, 10);
+        assert_eq!(r.srtt8_us(), 8);
+    }
+
+    #[test]
+    fn le_repli_et_le_temps_modele() {
+        let mut r = Rtt::new();
+        r.repli();
+        assert_eq!(r.rto(), RTO_REPLI);
+        // Le chiffre de la documentation de `tcp_retries2`.
+        assert_eq!(temps_modele(15, RTO_MIN), 924_600_000_000);
+        // Tout juste sous le plafond (200 ms × 2^9 = 102,4 s).
+        assert_eq!(temps_modele(9, RTO_MIN), 1023 * RTO_MIN);
+        assert_eq!(temps_modele(0, RTO_MIN), RTO_MIN);
+        assert_eq!(temps_modele(10, RTO_MIN), 1023 * RTO_MIN + RTO_MAX);
+    }
 }

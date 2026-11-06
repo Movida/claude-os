@@ -196,7 +196,8 @@ impl<P: Charge> Tcb<P> {
 
     /// Le numéro qui suit le plus haut segment SACKé (`tcp_highest_sack_seq`).
     pub(super) fn plus_haut_sack(&self) -> u32 {
-        if self.sacked_out == 0 { self.snd_una } else { self.fack }
+        // Sans SACK, `sacked_out` ne compte que des ACK dupliqués : rien de plus haut que la tête.
+        if self.sacked_out == 0 || !self.sack_ok { self.snd_una } else { self.fack }
     }
 
     /// Un D-SACK vu (`tcp_dsack_seen`) : rend le nombre de segments doublons, ou
@@ -577,7 +578,11 @@ impl<P: Charge> Tcb<P> {
                 let reste = self.octets_envoi.saturating_sub(debut);
                 let n = reste.min(self.mss_courant() as usize);
                 let avec_fin = self.fin_seq().is_some_and(|f| !apres(self.snd_nxt, f)) && n == reste;
-                partie = self.envoyer_donnees(n, avec_fin, maintenant, sortir);
+                // `tcp_write_xmit` (`push_one` à 2) : TSQ a son mot à dire, et ce qui part compte.
+                partie = !self.carte_trop_pleine(n, 0) && self.envoyer_donnees(n, avec_fin, maintenant, false, sortir);
+                if partie {
+                    self.apres_xmit(1, maintenant);
+                }
             } else if !self.file.is_empty() && self.envoyer_entree(self.file.len() - 1, maintenant, sortir) {
                 self.tlp_renvoi = true;
                 partie = true;

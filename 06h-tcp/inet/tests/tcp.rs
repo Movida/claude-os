@@ -8,9 +8,10 @@ use inet::tcp::{self as t, Charge, Etat, Sortant, Tcb};
 use std::cell::Cell;
 
 // L'horloge des tests, en nanosecondes : elle n'avance que quand un test
-// le demande (`avancer`), ou quand `calmer` laisse partir un ACK retardé.
+// le demande (`avancer`), ou quand `calmer` laisse partir un ACK retardé. Elle ne part pas de 0 :
+// pour la connexion, 0 veut dire « aucune heure » (`retrans_stamp`).
 thread_local! {
-    static HEURE: Cell<u64> = const { Cell::new(0) };
+    static HEURE: Cell<u64> = const { Cell::new(7_000_000_000) };
 }
 
 fn maintenant() -> u64 {
@@ -985,10 +986,21 @@ fn icmp_injoignable_defait_un_recul() {
     sortants(&mut c);
     assert_eq!(c.echeance(), Some(t1 + c.congestion().2));
     assert_eq!(c.congestion().2 / MS, 400);
+    // Un peu plus tard : le RTO défait moins ce qui a déjà passé.
+    avancer(50 * MS);
     let una = c.numeros().0;
     c.erreur_icmp(113, una, true, false, maintenant());
     assert_eq!(c.congestion().2 / MS, 200);
     assert_eq!(c.echeance(), Some(t1 + c.congestion().2));
+    // Déjà passé : tout de suite.
+    echeance_suivante(&mut c);
+    let t2 = maintenant();
+    sortants(&mut c);
+    avancer(300 * MS);
+    let una = c.numeros().0;
+    c.erreur_icmp(113, una, true, false, maintenant());
+    assert!(!sortants(&mut c).is_empty(), "renvoye tout de suite");
+    assert!(c.echeance().unwrap() >= t2);
 }
 
 #[test]
@@ -1419,6 +1431,327 @@ fn rcvlowat_de_tcp() {
     f.rcvbuf_fixe = true;
     assert_eq!(f.poser_rcvlowat(100_000), 8192);
     assert_eq!(f.rcvbuf, 16_384);
+}
+
+// --- Ce qu'a trouvé la relecture de `tcp_ack` et de ses voisins ---
+
+/// Deux blocs neufs dans un même ACK, le plus récent en tête : pas de réordonnancement
+/// (`tcp_sacktag_write_queue` les trie).
+#[test]
+fn sack_deux_blocs_neufs_pas_de_reordonnancement() {
+    let (mut c, mut f) = paire_avec_sack();
+    assert_eq!(ecrire(&mut c, &vec![0u8; 8 * MSS as usize]), 8 * MSS as usize);
+    let s = sortants(&mut c);
+    assert_eq!(s.len(), 8);
+    // Le dernier reçu d'abord, puis un plus bas : l'ACK dit le plus récent en tête.
+    f.recevoir(&s[1].0, Octets(s[1].1.clone(), 0), maintenant());
+    f.recevoir(&s[5].0, Octets(s[5].1.clone(), 0), maintenant());
+    let a = sortants(&mut f);
+    let ack = a.last().unwrap().0;
+    assert!(ack.options.nb_blocs >= 2);
+    assert!(apres_seq(ack.options.blocs[0].0, ack.options.blocs[1].0));
+    c.recevoir(&ack, vide(), maintenant());
+    let i = c.info(maintenant());
+    assert_eq!((i.reord_seen, i.reordonnancement, i.sackes), (0, 3, 2));
+}
+
+/// Un D-SACK au milieu d'un bloc : ses segments sont des doublons, le reste non ; un seul passage.
+#[test]
+fn sack_un_doublon_dans_un_bloc() {
+    let (mut c, _f) = paire_avec_sack();
+    let m = MSS as u32;
+    assert_eq!(ecrire(&mut c, &vec![0u8; 8 * MSS as usize]), 8 * MSS as usize);
+    let s = sortants(&mut c);
+    let una = s[0].0.seq;
+    // Le segment 3 renvoyé, et son doublon dit au milieu d'un bloc qui couvre 2..5.
+    let mut h = Tcp { source: 80, destination: 40000, seq: s[0].0.ack, ack: una, drapeaux: tcp::ACK, fenetre: s[0].0.fenetre, urgent: 0, options: tcp::Options::default() };
+    h.options.blocs[0] = (una + 3 * m, una + 4 * m);
+    h.options.blocs[1] = (una + 2 * m, una + 5 * m);
+    h.options.nb_blocs = 2;
+    c.recevoir(&h, vide(), maintenant());
+    let i = c.info(maintenant());
+    assert_eq!((i.sackes, i.dsack_doublons, i.reord_seen), (3, 1, 0));
+}
+
+fn apres_seq(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
+}
+
+/// Une connexion avec SACK, à toute heure.
+fn paire_avec_sack() -> (Connexion, Connexion) {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    c.proposer_sack();
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    f.proposer_sack();
+    let sa = sortants(&mut f)[0].0;
+    c.recevoir(&sa, vide(), maintenant());
+    livrer(&mut c, &mut f);
+    (c, f)
+}
+
+/// Une fille ne garde rien de sa poignée de main pour ses RTO : ni l'heure de son SYN-ACK, ni son
+/// recul (`tcp_rcv_state_process` : `retrans_stamp = 0` ; `inet_csk_clone_lock`).
+#[test]
+fn une_vieille_fille_abandonne_comme_les_autres() {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let sa = sortants(&mut f)[0].0;
+    c.recevoir(&sa, vide(), maintenant());
+    let ack = sortants(&mut c)[0].0;
+    echeance_suivante(&mut f);
+    sortants(&mut f);
+    f.recevoir(&ack, vide(), maintenant());
+    assert_eq!((f.etat(), f.info(maintenant()).recul), (Etat::Etablie, 0));
+    // 1000 s de silence, puis une perte : 15 minutes de renvois, pas deux.
+    avancer(1000 * 1000 * MS);
+    let t0 = maintenant();
+    assert_eq!(ecrire(&mut f, b"x"), 1);
+    sortants(&mut f);
+    let mut rto = 0;
+    while f.etat() != Etat::Fermee {
+        echeance_suivante(&mut f);
+        sortants(&mut f);
+        rto += 1;
+    }
+    assert!(maintenant() - t0 > 900 * 1000 * MS, "abandon apres {} ms, {rto} RTO", (maintenant() - t0) / MS);
+}
+
+/// Une connexion sans SACK, avec les horodatages.
+fn reno_avec_horodatages() -> (Connexion, Connexion) {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 1 << 22, 1 << 22, ECHELLE);
+    c.proposer_horodatages(1_000_000);
+    let (syn, _) = sortants(&mut c)[0];
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 1 << 22, 1 << 22, ECHELLE);
+    f.decalage_horodatages(5_000_000);
+    let s = sortants(&mut f);
+    c.recevoir(&s[0].0, vide(), maintenant());
+    livrer(&mut c, &mut f);
+    calmer(&mut c, &mut f);
+    (c, f)
+}
+
+/// Une reprise sans SACK, et un ACK partiel de `segments`, dont l'écho précède le renvoi : l'original
+/// est arrivé : un réordonnancement, compté depuis la tête (`tcp_try_undo_partial`).
+fn reno_ack_partiel(c: &mut Connexion, segments: u32) -> t::Info {
+    let mss = MSS as u32 - 12;
+    avancer(100 * MS);
+    assert_eq!(ecrire(c, &vec![1u8; 8 * mss as usize]), 8 * mss as usize);
+    let s = sortants(c);
+    assert_eq!(s.len(), 8);
+    let (val0, recent) = s[0].0.options.horodatage.unwrap();
+    let (una, _, _) = c.numeros();
+    avancer(10 * MS);
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(c), ack: una, fenetre: 65_535, options: tcp::Options { horodatage: Some((recent, val0)), ..Default::default() }, ..Tcp::default() };
+    for _ in 0..4 {
+        c.recevoir(&m, vide(), maintenant());
+    }
+    assert_eq!(c.info(maintenant()).phase, 3);
+    let s = sortants(c);
+    assert_eq!(s[0].0.seq, una);
+    avancer(10 * MS);
+    c.recevoir(&Tcp { ack: una.wrapping_add(segments * mss), ..m }, vide(), maintenant());
+    c.info(maintenant())
+}
+
+/// Sans SACK, le plus haut « SACKé » est la tête (`tcp_highest_sack_replace`).
+#[test]
+fn reno_annulation_partielle_compte_le_reordonnancement() {
+    let (mut c, _f) = reno_avec_horodatages();
+    let i = reno_ack_partiel(&mut c, 5);
+    assert_eq!((i.reord_seen, i.reordonnancement), (1, 5));
+}
+
+/// Même après 2 Gio : un `fack` resté à l'ISS tomberait « devant » SND.UNA, à l'écart de presque
+/// 2^31, et `reordering` à 300 : plus de retransmission rapide.
+#[test]
+fn reno_apres_2_gio() {
+    let (mut c, _f) = reno_avec_horodatages();
+    let mss = MSS as u32 - 12;
+    let bloc = vec![1u8; 8 * mss as usize];
+    let mut fait = 0u64;
+    while fait < (1u64 << 31) + 16 * mss as u64 {
+        avancer(MS);
+        assert_eq!(ecrire(&mut c, &bloc), bloc.len());
+        let s = sortants(&mut c);
+        let (val0, recent) = s[0].0.options.horodatage.unwrap();
+        let (_, nxt, _) = c.numeros();
+        let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: nxt, fenetre: 65_535, options: tcp::Options { horodatage: Some((recent, val0)), ..Default::default() }, ..Tcp::default() };
+        avancer(MS);
+        c.recevoir(&m, vide(), maintenant());
+        fait += bloc.len() as u64;
+    }
+    assert_eq!(c.info(maintenant()).reordonnancement, 3);
+    assert!(reno_ack_partiel(&mut c, 1).reordonnancement <= 3);
+}
+
+/// Sans SACK, accoler de petits segments en retire de la file : aussi du compte des ACK dupliqués
+/// (`tcp_adjust_pcount`).
+#[test]
+fn reno_accoler_rend_les_ack_dupliques() {
+    let (mut c, mut f) = paire();
+    calmer(&mut c, &mut f);
+    let mut r = c.reglages;
+    r.nodelay = true;
+    c.regler(r, maintenant());
+    for _ in 0..6 {
+        assert_eq!(ecrire(&mut c, &[1u8; 100]), 100);
+        assert_eq!(sortants(&mut c).len(), 1);
+    }
+    let (una, _, _) = c.numeros();
+    avancer(MS);
+    let m = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una, fenetre: 65_535, ..Tcp::default() };
+    // Le premier ne compte pas : il met la fenêtre à jour.
+    for _ in 0..4 {
+        c.recevoir(&m, vide(), maintenant());
+    }
+    let r = sortants(&mut c);
+    assert_eq!(r[0].1.len(), 600, "le renvoi accole");
+    let i = c.info(maintenant());
+    assert_eq!((i.non_acquittes, i.sackes, i.perdus), (1, 0, 1));
+}
+
+/// `tcpi_last_data_recv` compte depuis l'établissement, pas depuis le démarrage de la machine.
+#[test]
+fn info_derniere_reception_depuis_l_etablissement() {
+    let (c, f) = paire();
+    assert_eq!((c.info(maintenant()).dernier_recu, f.info(maintenant()).dernier_recu), (0, 0));
+}
+
+/// Un vieil ACK ne compte pas ses SACK dans ce qui est livré (`old_ack`).
+#[test]
+fn un_vieil_ack_ne_livre_rien() {
+    let (mut c, _f) = paire_avec_sack();
+    let m = MSS as u32;
+    assert_eq!(ecrire(&mut c, &vec![0u8; 6 * MSS as usize]), 6 * MSS as usize);
+    let s = sortants(&mut c);
+    let una = s[0].0.seq;
+    let mut h = Tcp { source: 80, destination: 40000, seq: s[0].0.ack, ack: una + m, drapeaux: tcp::ACK, fenetre: s[0].0.fenetre, urgent: 0, options: tcp::Options::default() };
+    c.recevoir(&h, vide(), maintenant());
+    let livres = c.info(maintenant()).livres;
+    // En retard : son ACK est sous SND.UNA, son bloc est neuf.
+    h.ack = una;
+    h.options.blocs[0] = (una + 3 * m, una + 4 * m);
+    h.options.nb_blocs = 1;
+    c.recevoir(&h, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).livres, livres);
+}
+
+/// Une connexion avec SACK, un aller-retour de mesuré, et une carte.
+fn par_une_carte_sack() -> (Connexion, Connexion) {
+    let (mut c, mut f) = paire_avec_sack();
+    assert_eq!(ecrire(&mut c, b"a"), 1);
+    livrer(&mut c, &mut f);
+    avancer(10 * MS);
+    f.quickack(true);
+    assert!(livrer(&mut f, &mut c) >= 1);
+    c.sans_file = false;
+    (c, f)
+}
+
+/// La sonde de fin de rafale passe par `tcp_write_xmit` : TSQ peut lui dire non.
+#[test]
+fn tlp_et_tsq() {
+    let (mut c, _f) = par_une_carte_sack();
+    let cwnd = c.congestion().0 as usize;
+    assert_eq!(ecrire(&mut c, &vec![1u8; (cwnd + 1) * MSS as usize]), (cwnd + 1) * MSS as usize);
+    c.poser_en_file(0, u64::MAX);
+    assert_eq!(sortants(&mut c).len(), cwnd);
+    avancer(c.echeance().unwrap() - maintenant());
+    c.minuteur(maintenant());
+    c.poser_en_file(8 << 20, u64::MAX);
+    assert!(sortants(&mut c).is_empty(), "tcp_small_queue_check : rien ne part");
+}
+
+/// Du neuf part alors que la sonde de fin de rafale est armée, la reprise ouverte et la tête encore
+/// dans la carte : c'est le RTO qui reprend (`tcp_event_new_data_sent`).
+#[test]
+fn neuf_en_reprise_le_tlp_laisse_la_place_au_rto() {
+    let (mut c, _f) = par_une_carte_sack();
+    let m = MSS as u32;
+    assert_eq!(ecrire(&mut c, &vec![1u8; 6 * MSS as usize]), 6 * MSS as usize);
+    c.poser_en_file(0, u64::MAX);
+    assert_eq!(sortants(&mut c).len(), 6);
+    let (una, _, _) = c.numeros();
+    let tlp = c.echeance().unwrap() - maintenant();
+    assert!(tlp < c.congestion().2);
+    let t0 = maintenant();
+    avancer(MS);
+    let mut o = tcp::Options { nb_blocs: 1, ..Default::default() };
+    o.blocs[0] = (una + m, una + 5 * m);
+    let h = Tcp { drapeaux: tcp::ACK, seq: bord(&c), ack: una, fenetre: 65_535, options: o, ..Tcp::default() };
+    c.recevoir(&h, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).phase, 3);
+    assert_eq!(c.echeance(), Some(t0 + tlp), "le minuteur reste celui de la sonde");
+    // La carte a toujours tout : la tête ne repart pas ; du neuf part.
+    assert_eq!(ecrire(&mut c, &vec![2u8; MSS as usize]), MSS as usize);
+    c.poser_en_file(0, 0);
+    let s = sortants(&mut c);
+    assert!(s.iter().any(|x| !x.1.is_empty()), "du neuf");
+    assert_eq!(c.echeance(), Some(t0 + c.congestion().2), "le RTO, depuis l'envoi de la tete");
+}
+
+/// Sans SACK, le SYN renvoyé laisse l'état de perte jusqu'au premier ACK au-delà (`tcp_is_non_sack_preventing_reopen`) ;
+/// avec SACK, il rouvre.
+#[test]
+fn syn_renvoye_et_l_etat_de_perte() {
+    for sack in [false, true] {
+        let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+        if sack {
+            c.proposer_sack();
+        }
+        let syn = sortants(&mut c)[0].0;
+        echeance_suivante(&mut c);
+        sortants(&mut c);
+        assert_eq!(c.info(maintenant()).phase, 4);
+        let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+        if sack {
+            f.proposer_sack();
+        }
+        let sa = sortants(&mut f)[0].0;
+        c.recevoir(&sa, vide(), maintenant());
+        assert_eq!(c.info(maintenant()).phase, if sack { 0 } else { 4 });
+        livrer(&mut c, &mut f);
+        f.quickack(true);
+        assert_eq!(ecrire(&mut c, b"a"), 1);
+        livrer(&mut c, &mut f);
+        assert!(livrer(&mut f, &mut c) >= 1);
+        assert_eq!(c.info(maintenant()).phase, 0);
+    }
+}
+
+/// La sonde de fenêtre porte PSH, même coupée (`tcp_write_wakeup`).
+#[test]
+fn sonde_coupee_porte_psh() {
+    let (mut c, _f) = fenetre_fermee(32 * 1024);
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    let una = s[0].0.seq.wrapping_add(1);
+    let mut h = Tcp { source: 80, destination: 40000, seq: s[0].0.ack, ack: una, drapeaux: tcp::ACK, fenetre: 1, urgent: 0, options: tcp::Options::default() };
+    h.options.horodatage = s[0].0.options.horodatage.map(|(v, e)| (e, v));
+    c.recevoir(&h, vide(), maintenant());
+    assert!(sortants(&mut c).is_empty());
+    echeance_suivante(&mut c);
+    let s = sortants(&mut c);
+    assert_eq!((s.len(), s[0].0.drapeaux & tcp::PSH), (1, tcp::PSH));
+    assert_eq!(s[0].1.len(), 1 << ECHELLE);
+}
+
+/// La fille prend la fenêtre de son troisième ACK : `max_fenetre` n'a rien à garder du SYN
+/// (`tcp_create_openreq_child`), et le MSS suit sa moitié (`tcp_bound_to_half_wnd`).
+#[test]
+fn la_fille_oublie_la_fenetre_de_son_syn() {
+    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, 0);
+    let syn = sortants(&mut c)[0].0;
+    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, 0);
+    let sa = sortants(&mut f)[0].0;
+    c.recevoir(&sa, vide(), maintenant());
+    let mut ack = sortants(&mut c)[0].0;
+    ack.fenetre = 1000;
+    f.recevoir(&ack, vide(), maintenant());
+    assert_eq!(f.etat(), Etat::Etablie);
+    assert_eq!(f.info(maintenant()).snd_mss, 500);
 }
 
 // --- La sonde de fenêtre (`tcp_write_wakeup`, `tcp_send_probe0`) ---
@@ -2329,6 +2662,8 @@ fn retransmissions_remises_a_zero() {
 #[test]
 fn prr_envoie_la_retransmission_rapide() {
     let (mut c, mut f) = paire();
+    // Le seuil de Reno : 5. (CUBIC : 7 : `delta` positif, et la borne n'est jamais atteinte.)
+    c.choisir_controle(t::Controle::Reno, maintenant());
     ecrire(&mut c, &vec![0u8; 9 * MSS as usize]);
     let s = sortants(&mut c);
     assert_eq!(s.len(), 9);
@@ -3956,4 +4291,157 @@ fn syn_renvoye_pour_rien() {
         assert_eq!(c.etat(), Etat::Etablie);
         assert_eq!(c.congestion().0, attendu);
     }
+}
+
+/// Une fille établie, sans échange ; RCV.NXT : le second membre.
+fn fille_etablie(rcvbuf: usize) -> (Connexion, u32) {
+    let syn = Tcp { source: 40000, destination: 80, seq: 1000, drapeaux: tcp::SYN, fenetre: 65535, options: tcp::Options { mss: Some(1460), sack_permis: true, echelle: Some(7), ..tcp::Options::default() }, ..Tcp::default() };
+    let mut f = Connexion::depuis_syn(&syn, 7000, 1460, rcvbuf, 16_384, 7);
+    sortants(&mut f);
+    f.recevoir(&Tcp { seq: 1001, ack: 7001, drapeaux: tcp::ACK, fenetre: 1000, options: tcp::Options::default(), ..syn }, vide(), maintenant());
+    assert_eq!(f.etat(), Etat::Etablie);
+    (f, 1001)
+}
+
+/// Des données au-delà du FIN, en CLOSE_WAIT : le RST de `tcp_rcv_state_process` (RCV_SHUTDOWN, posé
+/// par `tcp_fin`), et rien de plus à lire.
+#[test]
+fn des_donnees_apres_le_fin() {
+    let (mut f, s) = fille_etablie(131_072);
+    let m = Tcp { source: 40000, destination: 80, ack: 7001, fenetre: 1000, ..Tcp::default() };
+    f.recevoir(&Tcp { seq: s, drapeaux: tcp::ACK | tcp::FIN, ..m }, vide(), maintenant());
+    assert_eq!(f.etat(), Etat::AttenteFermeture);
+    sortants(&mut f);
+    f.recevoir(&Tcp { seq: s, drapeaux: tcp::ACK, ..m }, Octets(vec![1; 100], 0), maintenant());
+    assert_eq!(f.lisibles(), 0, "des octets lisibles apres la fin de l'autre");
+    assert!(sortants(&mut f).iter().any(|(h, _)| h.drapeaux & tcp::RST != 0));
+    assert_eq!(f.etat(), Etat::Fermee);
+}
+
+/// SYN_SENT : un RST|ACK ne reçoit jamais de RST, même avec un TSecr faux ; un ACK faux, si, et
+/// le SYN repart vite pour nettoyer ce qui reste de l'ancienne connexion.
+#[test]
+fn syn_envoye_pas_de_rst_pour_un_rst() {
+    let mut c = Connexion::connecter(40000, 80, 5000, 1460, 131_072, 16_384, 7);
+    c.proposer_horodatages(0);
+    sortants(&mut c);
+    let m = Tcp { source: 80, destination: 40000, seq: 9, fenetre: 65535, ..Tcp::default() };
+    let faux = tcp::Options { horodatage: Some((1, 12_345)), ..tcp::Options::default() };
+    c.recevoir(&Tcp { ack: 5001, drapeaux: tcp::RST | tcp::ACK, options: faux, ..m }, vide(), maintenant());
+    assert!(sortants(&mut c).iter().all(|(h, _)| h.drapeaux & tcp::RST == 0), "un RST repond a un RST");
+    assert_eq!(c.etat(), Etat::SynEnvoye);
+    c.recevoir(&Tcp { ack: 4000, drapeaux: tcp::ACK, ..m }, vide(), maintenant());
+    assert!(sortants(&mut c).iter().any(|(h, _)| h.drapeaux & tcp::RST != 0 && h.seq == 4000));
+    assert_eq!(c.etat(), Etat::SynEnvoye);
+    avancer(8 * MS);
+    c.minuteur(maintenant());
+    assert!(sortants(&mut c).iter().any(|(h, _)| h.drapeaux & tcp::SYN != 0), "le SYN repart sans attendre la seconde");
+}
+
+/// TCP_MAXSEG borne ce qu'on annonce, dès le SYN, et tout ce qui en découle (`tcp_mss_clamp`).
+#[test]
+fn tcp_maxseg_borne_advmss() {
+    let mut c = Connexion::connecter(40000, 80, 5000, 65_495, 131_072, 16_384, 7);
+    c.mss_utilisateur = 1200;
+    let s = sortants(&mut c);
+    assert_eq!(s[0].0.options.mss, Some(1200));
+    let sa = Tcp { source: 80, destination: 40000, seq: 9, ack: 5001, drapeaux: tcp::SYN | tcp::ACK, fenetre: 65535, options: tcp::Options { mss: Some(1460), ..tcp::Options::default() }, ..Tcp::default() };
+    c.recevoir(&sa, vide(), maintenant());
+    assert_eq!(c.info(maintenant()).advmss, 1200);
+}
+
+/// Un trou comblé, seul un FIN attendait derrière : l'ACK part sans attendre.
+#[test]
+fn le_fin_derriere_un_trou() {
+    let (mut f, s) = fille_etablie(131_072);
+    let m = Tcp { source: 40000, destination: 80, ack: 7001, fenetre: 1000, ..Tcp::default() };
+    f.recevoir(&Tcp { seq: s.wrapping_add(10), drapeaux: tcp::ACK | tcp::FIN, ..m }, vide(), maintenant());
+    sortants(&mut f);
+    f.recevoir(&Tcp { seq: s, drapeaux: tcp::ACK, ..m }, Octets(vec![1; 10], 0), maintenant());
+    assert_eq!(f.etat(), Etat::AttenteFermeture);
+    let a = sortants(&mut f);
+    assert_eq!(a.last().map(|(h, _)| h.ack), Some(s.wrapping_add(11)));
+}
+
+/// Un segment hors d'ordre jeté faute de mémoire ne doit pas s'annoncer par un SACK : l'émetteur le
+/// croirait arrivé et ne le renverrait pas.
+#[test]
+fn un_segment_jete_ne_s_annonce_pas() {
+    let (mut f, s) = fille_etablie(16_384);
+    f.rcvbuf_fixe = true;
+    let m = Tcp { source: 40000, destination: 80, ack: 7001, drapeaux: tcp::ACK, fenetre: 1000, ..Tcp::default() };
+    for i in 1..200u32 {
+        f.recevoir(&Tcp { seq: s + i * 2000, ..m }, Octets(vec![1; 1000], 0), maintenant());
+        for (x, _) in sortants(&mut f) {
+            for b in &x.options.blocs[..x.options.nb_blocs as usize] {
+                assert!(t::apres(b.1, s), "{b:?}");
+                assert!(f.memoire_hors_ordre() > 0, "un bloc annonce, rien de garde");
+            }
+        }
+    }
+    assert!(f.memoire_hors_ordre() <= 2 * f.rcvbuf + 4096, "{}", f.memoire_hors_ordre());
+}
+
+/// TCP_QUICKACK : l'état vivant, relu ; 1 fait partir l'ACK dû ; une valeur paire revient ensuite
+/// au ping-pong (`__tcp_sock_set_quickack`).
+#[test]
+fn tcp_quickack_vivant() {
+    let (mut c, mut f) = paire();
+    calmer(&mut c, &mut f);
+    assert!(f.hors_du_ping_pong());
+    f.quickack(false);
+    assert!(!f.hors_du_ping_pong());
+    ecrire(&mut c, b"bonjour");
+    livrer(&mut c, &mut f);
+    assert!(sortants(&mut f).is_empty(), "en ping-pong, l'ACK attend");
+    // (`tcp_cleanup_rbuf` : pas d'ACK anticipé tant que la file de lecture n'est pas vide.)
+    f.lire::<()>(7, false, |o| Ok(o.len())).unwrap();
+    assert!(sortants(&mut f).is_empty(), "en ping-pong, lire ne le fait pas partir");
+    let e = f.quickack_valeur(2, maintenant());
+    assert!(e.a_emettre);
+    assert_eq!(sortants(&mut f).len(), 1, "l'ACK du part");
+    assert!(!f.hors_du_ping_pong(), "une valeur paire revient au ping-pong");
+    f.quickack_valeur(1, maintenant());
+    assert!(f.hors_du_ping_pong());
+}
+
+/// SO_ERROR dit aussi l'erreur douce, une fois.
+#[test]
+fn so_error_prend_l_erreur_douce() {
+    let (mut c, _) = paire();
+    let una = c.numeros().0;
+    c.erreur_icmp(113, una, true, false, maintenant());
+    assert_eq!(c.erreur(), 0);
+    assert_eq!(c.prendre_erreur_so(), 113);
+    assert_eq!(c.prendre_erreur_so(), 0);
+}
+
+/// `close` avec des données non lues : un RST en tout état, même LAST_ACK ; `tcp_disconnect`, lui, n'en
+/// veut en LAST_ACK que s'il reste à envoyer.
+#[test]
+fn le_rst_des_donnees_non_lues() {
+    let (mut c, mut f) = paire();
+    calmer(&mut c, &mut f);
+    ecrire(&mut f, b"abc");
+    f.fermer_envoi();
+    livrer(&mut f, &mut c);
+    c.fermer_envoi();
+    assert_eq!(c.etat(), Etat::DernierAck);
+    assert_eq!(c.deconnexion(), (true, true), "le FIN n'est pas encore parti : RST et erreur");
+    sortants(&mut c);
+    assert_eq!(c.deconnexion(), (false, false), "tout est parti : ni RST ni erreur");
+    assert!(c.avorter_sur_donnees().a_emettre);
+    assert!(sortants(&mut c).iter().any(|(h, _)| h.drapeaux & tcp::RST != 0));
+    assert_eq!(c.etat(), Etat::Fermee);
+}
+
+/// `tcp_disconnect`, selon l'état.
+#[test]
+fn deconnexion_selon_l_etat() {
+    let (mut c, _f) = paire();
+    assert_eq!(c.deconnexion(), (true, true));
+    let s = Connexion::connecter(40000, 80, 5000, 1460, 131_072, 16_384, 7);
+    assert_eq!(s.deconnexion(), (false, true), "SYN_SENT : l'erreur, sans RST");
+    c.avorter();
+    assert_eq!(c.deconnexion(), (false, false));
 }

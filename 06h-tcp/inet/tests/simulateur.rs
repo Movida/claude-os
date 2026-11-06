@@ -501,5 +501,10 @@ fn simulateur() {
         octets += s.a.lus + s.b.lus;
         erreurs += u64::from(s.a.erreur != 0 || s.b.erreur != 0);
     }
+    // Une seule graine, rejouée : ce qu'elle exerce est son affaire. Toutes : elles doivent exercer
+    // ce pour quoi elles sont là.
+    if std::env::var("SIMULATEUR_GRAINE").is_err() {
+        assert!(pertes > 0 && renvois > 0 && octets > 0, "le simulateur n'exerce plus rien : {pertes} pertes, {renvois} renvois");
+    }
     eprintln!("[simulateur] {segments} segments, {pertes} perdus, {renvois} renvoyés, {octets} octets livrés, {erreurs} abandons");
 }

@@ -17,8 +17,8 @@
 //! (ce que dit l'hôte), et Linux le jette. Puis la destination : une de nos
 //! adresses, ou une diffusion de l'interface ; sinon, le paquet n'est pas
 //! pour nous (pas de routage entre interfaces : nous ne sommes pas un
-//! routeur, `ip_forward` = 0). Un fragment est jeté (pas de réassemblage :
-//! « Reste à faire »). Les options : un paquet à route source (LSRR, SSRR)
+//! routeur, `ip_forward` = 0). Un fragment va au réassemblage
+//! (inet::fragments). Les options : un paquet à route source (LSRR, SSRR)
 //! est jeté, comme Linux par défaut (`accept_source_route` à 0), et un
 //! en-tête dont les options ne se lisent pas aussi ; les autres sont
 //! sautées (Linux les vérifie une à une, `ip_options_compile`, et répond à
@@ -338,8 +338,8 @@ fn interface_de(c: &Chemin) -> Option<&'static Interface> {
 
 /// La MTU du chemin `c` : celle de son interface, au plus 65 535 (la plus
 /// grande longueur que dit un en-tête IPv4 : `ipv4_mtu` borne aussi celle
-/// de lo, 65 536, à IP_MAX_MTU). Linux mémorise aussi celle qu'apprend un
-/// ICMP « fragmentation nécessaire » : pas encore.
+/// de lo, 65 536, à IP_MAX_MTU). Celle qu'apprend un ICMP « fragmentation
+/// nécessaire » est dans inet::pmtu.
 pub fn mtu(c: &Chemin) -> u32 {
     interface_de(c).map_or(super::boucle::MTU, |i| i.mtu()).min(0xFFFF)
 }

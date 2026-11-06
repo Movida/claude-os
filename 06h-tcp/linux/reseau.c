@@ -132,8 +132,8 @@ static double maintenant(void)
     return t.tv_sec + t.tv_nsec / 1e9;
 }
 
-/* La plage des ports éphémères : celle de l'hôte, ou celle de Linux par
- * défaut (notre /proc n'a pas encore /proc/sys/net). */
+/* La plage des ports éphémères : celle de la machine, ou celle de Linux par
+ * défaut, si elle ne le dit pas. */
 static void plage(int *bas, int *haut)
 {
     *bas = 32768;

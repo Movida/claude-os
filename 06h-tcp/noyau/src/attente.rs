@@ -927,7 +927,8 @@ impl<T: Possede> Possession<T> {
         true
     }
 
-    /// Réveille la file de la socket pour les événements `m`.
+    /// Réveille la file de la socket pour les événements `m` ; puis les signaux d'entrée-sortie
+    /// (les bits A_* : ceux à qui parle `sk_wake_async`, après `wake_up`, comme Linux).
     fn reveiller(&self, m: u32) {
         if m != 0 {
             self.file.reveiller(m, 0);

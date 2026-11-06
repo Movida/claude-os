@@ -27,8 +27,8 @@
 //!     peut pas deviner le port suivant d'après le précédent) ; un port déjà
 //!     pris par `bind` est sauté ; un port pris par d'autres `connect` sert
 //!     encore, si le quadruplet est neuf. Un TIME_WAIT du même quadruplet
-//!     n'est jamais repris : Linux ne le fait qu'avec les horodatages
-//!     (`tcp_twsk_unique`), que nous n'avons pas ;
+//!     est repris s'il a des horodatages (`tcp_twsk_unique` : les règles sont
+//!     celles de la connexion, inet::tcp::attente) ;
 //!   - un segment reçu (`__inet_lookup`) : d'abord la connexion de son
 //!     quadruplet exact (une socket connectée ou un TIME_WAIT), puis
 //!     l'écoute de son adresse de destination, puis celle de 0.0.0.0.
@@ -333,6 +333,18 @@ impl<T: Clone> Table<T> {
         if let Some(e) = self.entree(numero) {
             e.lien.reuseaddr = reuseaddr;
             e.lien.reuseport = reuseport;
+        }
+    }
+
+    /// Une connexion finie dont le port vient de `bind` : elle quitte son quadruplet, garde son
+    /// port (SOCK_BINDPORT_LOCK), sans repasser par les conflits : elle ne l'a jamais rendu.
+    /// `adresse` : celle qu'elle garde (`tcp_disconnect` efface celle que `bind` n'a pas nommée).
+    pub fn redevenir_liee(&mut self, numero: u64, adresse: [u8; 4]) {
+        if let Some(e) = self.entree(numero) {
+            e.lien.sorte = Sorte::Liee;
+            e.lien.adresse = adresse;
+            e.lien.distante = [0; 4];
+            e.lien.port_distant = 0;
         }
     }
 
