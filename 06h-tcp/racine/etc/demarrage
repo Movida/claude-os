@@ -82,6 +82,11 @@ wait
 /bin/tcp
 # Les sockets AF_UNIX (6h).
 /bin/unix
+# Le propriétaire d'un fichier : F_SETOWN, SIGURG, O_ASYNC (6h).
+/bin/proprietaire
+# Du code qui se modifie, à cheval sur deux pages (6h) : ce que le compilateur à
+# la volée de claude demande à la machine, et que QEMU 8.2.2 ne tient pas.
+/bin/autocode
 # Les sockets de WASI (6h) : un serveur WebAssembly sur une écoute que le
 # lanceur lui ouvre, et un client Linux ; ils se parlent par lo.
 --tcplisten=127.0.0.1:8080 /bin/bonjour-tcp.wasm &

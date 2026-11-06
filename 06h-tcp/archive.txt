@@ -44,6 +44,8 @@ file  /bin/dns             linux/construits/dns 755 0 0
 file  /bin/aleatoire       linux/construits/aleatoire 755 0 0
 file  /bin/tcp             linux/construits/tcp 755 0 0
 file  /bin/unix            linux/construits/unix 755 0 0
+file  /bin/proprietaire    linux/construits/proprietaire 755 0 0
+file  /bin/autocode        linux/construits/autocode 755 0 0
 file  /bin/client-tcp      linux/construits/client-tcp 755 0 0
 file  /bin/telecharger     linux/construits/telecharger 755 0 0
 file  /bin/passerelle      linux/construits/passerelle 755 0 0

@@ -55,8 +55,8 @@ rendues et recollees : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 53, liens symboliques 6, liens physiques 1 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 50 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 55, liens symboliques 6, liens physiques 1 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 52 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -183,6 +183,14 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] tcp : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] unix : toutes les verifications : ok
 [noyau] unix : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] proprietaire : toutes les verifications : ok
+[noyau] proprietaire : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] autocode : une seule page : 0 lectures perimees sur 1000 : ok
+[linux] autocode : l'operande sur la page suivante : 0 lectures perimees sur 1000 : ok
+[linux] autocode : l'operande coupee en deux : 0 lectures perimees sur 1000 : ok
+[linux] autocode : le call coupe apres son premier octet : 0 lectures perimees sur 1000 : ok
+[linux] autocode : toutes les verifications : ok
+[noyau] autocode : termine, code de sortie 0 ; memoire rendue : ok.
 [wasm] bonjour-tcp : ecoute pre-ouverte en 3 : SOCKET_STREAM, non bloquante, pas un dossier : ok
 [wasm] bonjour-tcp : connexion 1 (poll_oneoff, sock_recv, sock_send, sock_shutdown) : recu 'bonjour', rendu 'ruojnob', puis 'merci' apres sock_shutdown : ok
 [wasm] bonjour-tcp : connexion 2 (accept bloquant, fd_read, fd_write) : recu 'Claude Code', rendu 'edoC edualC' : ok
