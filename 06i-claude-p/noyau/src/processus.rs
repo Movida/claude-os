@@ -2,8 +2,9 @@
 //! leurs appels système doivent pouvoir modifier (sa mémoire : zones,
 //! tables de pages, tas ; ses descripteurs de fichiers ; son dossier
 //! courant ; l'action de ses signaux). Le `signal_struct`, le `mm_struct`,
-//! le `files_struct` et le `fs_struct` de Linux, en une structure ; ce qui
-//! est à chaque fil est dans sa tâche (tache.rs) et dans son `Fil` (fil.rs).
+//! le `files_struct` et le `fs_struct` de Linux, en une `Entree` (la
+//! mémoire sous son propre verrou, voir plus bas) ; ce qui est à chaque fil
+//! est dans sa tâche (tache.rs) et dans son `Fil` (fil.rs).
 //!
 //! Chaque processus est une `Entree` de la TABLE DES PROCESSUS, tenue par
 //! chacun de ses fils (leurs tâches) et par la table : `avec` donne celui
@@ -19,17 +20,37 @@
 //! Règle : jamais de copie depuis ou vers la mémoire du programme sous le
 //! verrou d'un processus (une copie peut fauter, et plus tard attendre le
 //! disque). On y lit ou change l'état, on rend le verrou, puis on copie.
+//!
+//! La MÉMOIRE du processus est à part (6i), sous un verrou qui dort, en
+//! lecture et en écriture : le `mmap_lock` de Linux (`memoire_lue`,
+//! `memoire_ecrite`, `servir_faute`). Avant, elle était sous le verrou du
+//! processus, qui coupe les interruptions : un munmap ou un madvise de
+//! centaines de Mio rendait ses pages d'un trait, les tics d'horloge se
+//! perdaient, et les fautes de page de tous les fils se suivaient une à
+//! une. Le reste (descripteurs, signaux, dossier courant, fils) ne tient
+//! son verrou que le temps de lire ou changer un champ : il reste un
+//! verrou court, comme les `file_lock`, `siglock` et `fs->lock` de Linux.
+//! Ordre des verrous : ceux qui dorment d'abord, jamais sous un verrou
+//! court (les verrous d'un fichier, sa position et son écriture,
+//! appels_fichiers.rs, puis la mémoire : write copie sous le premier, et sa
+//! copie peut fauter) ; puis les courts, celui du processus, celui des
+//! tables de pages (memoire.rs), celui des fichiers, dans cet ordre quand
+//! on en tient plusieurs (une faute dans une projection de fichier prend
+//! celui des fichiers sous celui des tables, jamais l'inverse). La même
+//! règle des copies vaut pour la mémoire : une copie qui faute sous elle la
+//! redemanderait (voir faute_de_page.rs).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
 
 use crate::descripteurs::{Descripteurs, LIMITE_DESCRIPTEURS};
+use crate::attente::VerrouLE;
 use crate::faillible::{self, VecFaillible};
 use crate::fil::Fil;
+use crate::memoire::{Acces, Echec, Memoire};
 use crate::partage::Arc;
 use crate::programmes::NomCourt;
 use crate::tache::Tache;
-use crate::memoire::Memoire;
 use crate::signaux::Signaux;
 use crate::verrou::Verrou;
 use crate::vfs;
@@ -41,8 +62,6 @@ pub struct Processus {
     /// Son numéro (pid), qui est aussi celui de son fil principal et de son
     /// groupe de processus (voir `numero_neuf`).
     pub pid: u32,
-    /// Sa mémoire (la mm_struct de Linux, voir memoire.rs).
-    pub memoire: Memoire,
     /// Ses descripteurs de fichiers (la files_struct, descripteurs.rs).
     pub descripteurs: Descripteurs,
     /// Son dossier courant, d'où partent les chemins relatifs ; et sa
@@ -172,7 +191,8 @@ impl Processus {
 
 impl Drop for Processus {
     /// La fin d'un processus : ses descripteurs fermés, son dossier courant
-    /// et sa racine lâchés. Sa mémoire, elle, se rend d'elle-même (memoire.rs).
+    /// et sa racine lâchés. Sa mémoire, à part, se rend d'elle-même
+    /// (memoire.rs), juste avant (`fil_termine`).
     fn drop(&mut self) {
         loop {
             let Some(fd) = self.descripteurs.ouverts(0, u64::MAX).next() else { break };
@@ -196,6 +216,10 @@ impl Drop for Processus {
 pub struct Entree {
     pid: u32,
     processus: Verrou<Option<Processus>>,
+    /// Sa mémoire (la mm_struct de Linux, memoire.rs), sous son verrou qui
+    /// dort, en lecture et en écriture (le `mmap_lock`, voir l'en-tête).
+    /// None une fois son dernier fil mort, comme `processus`.
+    memoire: VerrouLE<Option<Memoire>>,
     code: AtomicI32,
     /// Son temps de calcul, en nanosecondes : celui de tous ses fils,
     /// vivants et morts, compté avec celui de chaque fil (tache.rs), sans
@@ -263,6 +287,16 @@ impl Entree {
             self.code.store(p.fin_de_groupe.unwrap_or(code), Ordering::Relaxed);
             garde.take()
         };
+        // La mémoire d'abord, puis les descripteurs, comme Linux (`exit_mm`
+        // avant `exit_files`), chacune rendue hors de tout verrou :
+        // interruptions actives. Prendre la mémoire en écriture attend un
+        // lecteur de /proc/<pid>/maps qui la lirait encore.
+        // UNIPROCESSEUR : Linux ne prend pas le mmap_lock pour la défaire
+        // (`exit_mmap`, quand plus personne ne la tient : `mmput`) ; sur un
+        // seul processeur, l'écriture ne fait attendre personne de plus. En
+        // 6j.
+        let memoire = self.memoire.ecrire().take();
+        drop(memoire);
         drop(fini);
     }
 
@@ -362,7 +396,7 @@ pub fn initialiser(max: usize) {
 /// principal le rejoint à sa création, tache::lancer_programme), avec la
 /// tâche courante pour parent ; None si elle est pleine (pas plus de
 /// processus que de tâches), ou le tas.
-pub fn ajouter(processus: Processus, nom: NomCourt) -> Option<Arc<Entree>> {
+pub fn ajouter(processus: Processus, memoire: Memoire, nom: NomCourt) -> Option<Arc<Entree>> {
     let mut table = TABLE.verrouiller();
     if table.len() == table.capacity() {
         return None;
@@ -371,6 +405,7 @@ pub fn ajouter(processus: Processus, nom: NomCourt) -> Option<Arc<Entree>> {
     let e = Arc::new(Entree {
         pid: processus.pid,
         processus: Verrou::new(Some(processus)),
+        memoire: VerrouLE::new(Some(memoire)),
         code: AtomicI32::new(0),
         calcul: AtomicU64::new(0),
         vivants: AtomicU32::new(0),
@@ -481,6 +516,92 @@ pub fn avec_pid<R>(pid: u32, f: impl FnOnce(&mut Processus) -> R) -> Option<R> {
     let e = TABLE.verrouiller().iter().find(|e| e.pid == pid)?.clone();
     let mut p = e.processus.verrouiller();
     p.as_mut().map(f)
+}
+
+/// La garde de la mémoire de son processus que tient (ou attend) la tâche
+/// courante : elle le note dans sa tâche (`Tache::tient_sa_memoire`), pour
+/// qu'une copie faite dessous soit reconnue (copie_utilisateur.rs) au lieu
+/// de s'endormir pour toujours derrière elle-même ; pour refuser de la
+/// reprendre (pas de prise récursive : derrière un écrivain qui attend, un
+/// second `lire` de la même tâche attendrait sans fin, phase-fair oblige) ;
+/// et pour que le détecteur d'interblocage voie un programme qui l'attend
+/// alors que plus rien n'est prêt (attente.rs).
+struct Tenue;
+
+impl Tenue {
+    #[track_caller]
+    fn prendre() -> Tenue {
+        let t = crate::tache::courante();
+        assert!(!t.tient_sa_memoire(), "memoire du processus reprise par la tache qui la tient");
+        t.tenir_sa_memoire(true);
+        Tenue
+    }
+}
+
+impl Drop for Tenue {
+    fn drop(&mut self) {
+        crate::tache::courante().tenir_sa_memoire(false);
+    }
+}
+
+/// La mémoire du processus de la tâche courante, tenue en LECTURE le temps
+/// de `f` (le `mmap_read_lock` de Linux) : les fautes de page, /proc, ce
+/// qui lit les zones. Peut dormir (jamais sous un verrou court), ne coupe
+/// pas les interruptions ; `f` ne copie rien depuis ou vers le programme.
+#[track_caller]
+pub fn memoire_lue<R>(f: impl FnOnce(&Memoire) -> R) -> R {
+    let e = crate::tache::courante().processus().expect("memoire d'un processus sans processus").clone();
+    let _tenue = Tenue::prendre();
+    let m = e.memoire.lire();
+    f(m.as_ref().expect("memoire d'un processus mort"))
+}
+
+/// La mémoire du processus de la tâche courante, tenue en ÉCRITURE le
+/// temps de `f` (le `mmap_write_lock`) : mmap, munmap, mprotect, brk,
+/// madvise. Mêmes règles que `memoire_lue`.
+#[track_caller]
+pub fn memoire_ecrite<R>(f: impl FnOnce(&mut Memoire) -> R) -> R {
+    let e = crate::tache::courante().processus().expect("memoire d'un processus sans processus").clone();
+    let _tenue = Tenue::prendre();
+    let mut m = e.memoire.ecrire();
+    f(m.as_mut().expect("memoire d'un processus mort"))
+}
+
+/// La mémoire du processus `pid` (vivant), en lecture le temps de `f` :
+/// /proc/<pid>/maps et statm. None pour un zombie ou un inconnu.
+#[track_caller]
+pub fn memoire_du_pid<R>(pid: u32, f: impl FnOnce(&Memoire) -> R) -> Option<R> {
+    let e = TABLE.verrouiller().iter().find(|e| e.pid == pid)?.clone();
+    let _tenue = Tenue::prendre();
+    let m = e.memoire.lire();
+    m.as_ref().map(f)
+}
+
+/// Sert une faute de page à `adresse` pour la tâche courante : le
+/// `lock_mm_and_find_vma` de Linux 6.18, puis `handle_mm_fault`. La mémoire
+/// en lecture ; si l'adresse n'est dans aucune zone mais juste sous la
+/// pile, il faut l'étendre, ce qui change la carte : la lecture est rendue,
+/// l'écriture prise, la pile étendue (tout est revérifié : un autre fil a
+/// pu changer la carte entre les deux), puis l'écriture RÉTROGRADÉE en
+/// lecture pour servir la page. Linux faisait autrefois grandir la pile en
+/// lecture, sous un verrou à part ; deux fautes à la fois pouvaient alors
+/// corrompre la carte (StackRot, CVE-2023-3269, corrigée ainsi dans 6.5).
+/// Sans processus (une tâche du noyau) : None.
+pub fn servir_faute(adresse: u64, acces: Acces) -> Option<Result<(), Echec>> {
+    let e = crate::tache::courante().processus()?.clone();
+    let _tenue = Tenue::prendre();
+    let lu = e.memoire.lire();
+    let m = lu.as_ref()?;
+    if m.zones.trouver(adresse).is_some() || !m.pile_au_dessus(adresse) {
+        return Some(m.servir(adresse, acces));
+    }
+    drop(lu);
+    let mut ecrit = e.memoire.ecrire();
+    if !ecrit.as_mut()?.etendre_pile(adresse) {
+        return Some(Err(Echec::SansZone));
+    }
+    let lu = ecrit.retrograder();
+    Some(lu.as_ref()?.servir(adresse, acces))
 }
 
 /// Le fichier ouvert du descripteur `fd` du processus `pid` (/proc/<pid>/fd).

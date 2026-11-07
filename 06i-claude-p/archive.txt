@@ -35,6 +35,8 @@ file  /bin/systeme         linux/construits/systeme 755 0 0
 file  /bin/clone           linux/construits/clone 755 0 0
 file  /bin/fils            linux/construits/fils 755 0 0
 file  /bin/courses         linux/construits/courses 755 0 0
+file  /bin/fautes          linux/construits/fautes 755 0 0 /bin/fautes-fin-1 /bin/fautes-fin-2 /bin/fautes-fin-3
+file  /bin/troncature      linux/construits/troncature 755 0 0
 file  /bin/evenements      linux/construits/evenements 755 0 0
 file  /bin/proc            linux/construits/proc 755 0 0
 file  /bin/partage         linux/construits/partage 755 0 0

@@ -418,7 +418,12 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
         // la copie du noyau rend EFAULT (faute_de_page.rs).
         14 => faute_de_page::gerer(cadre),
         _ if depuis_programme => {
-            let zone = processus::essayer_avec(|p| p.memoire.zone_du_code(cadre.rip)).flatten();
+            // Pour le message, la zone du code fautif : lue dans la mémoire
+            // du processus, un verrou qui dort. Les interruptions reviennent
+            // d'abord (le `cond_local_irq_enable` des pièges de Linux) : on
+            // vient du programme, rien n'est tenu.
+            crate::cpu::activer_interruptions();
+            let zone = processus::memoire_lue(|m| m.zone_du_code(cadre.rip));
             // Pour #DB, DR6 dit pourquoi ; il est remis à son état de repos
             // (Linux le lit en entrant, puis l'efface : sinon ses bits
             // resteraient pour le #DB suivant).

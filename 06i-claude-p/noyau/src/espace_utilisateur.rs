@@ -135,6 +135,18 @@ pub const ADRESSE_MIN: u64 = 0x1_0000;
 /// La fin des adresses projetables, exclue (TASK_SIZE_MAX de Linux).
 pub const ADRESSE_MAX: u64 = 0x7fff_ffff_f000;
 
+/// Ce qu'a fait `EspaceUtilisateur::servir`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Servi {
+    /// L'entrée est en place : l'instruction peut reprendre.
+    Fait,
+    /// Il faut une page neuve : la préparer (`cadre_neuf`) et recommencer.
+    PageNeuve,
+    /// L'entrée d'une zone de fichier a disparu : recommencer par le
+    /// fichier.
+    ARefaire,
+}
+
 /// Pourquoi une projection est refusée.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Erreur {
@@ -190,10 +202,11 @@ pub fn rendre_cadre(cadre: u64) {
 /// portée) rend toutes ses pages et toutes ses tables.
 ///
 /// Depuis 6i, il est sous son propre verrou court dans la mémoire du
-/// processus (`Memoire::espace`, le `page_table_lock` de Linux) : une
-/// faute de page ne fait que LIRE la carte des zones, et ne prend que lui
-/// pour poser ses entrées. Qui change la mémoire (munmap, mprotect...) y
-/// accède sans ce verrou (`Verrou::get_mut`) : il a `&mut Memoire`,
+/// processus (`Memoire::espace`, le `page_table_lock` de Linux) : plusieurs
+/// fautes de page, qui ne tiennent la mémoire qu'en lecture, peuvent être
+/// en cours à la fois (préemptées, et en 6j sur plusieurs processeurs), et
+/// poser chacune ses entrées. Celui qui tient la mémoire en écriture
+/// (munmap, mprotect...) y accède sans ce verrou (`Verrou::get_mut`) :
 /// personne d'autre ne peut l'avoir.
 pub struct EspaceUtilisateur {
     /// L'adresse physique de sa PML4.
@@ -308,14 +321,25 @@ impl EspaceUtilisateur {
     ///     page partagée lue reste en lecture seule (entree_finale).
     ///
     /// La page d'un fichier qui n'est pas encore là est posée avant, par
-    /// `poser_fichier` (memoire.rs) : `servir` ne sait rien des fichiers.
+    /// `poser_fichier` (memoire.rs) : `servir` ne sait rien des fichiers,
+    /// sauf qu'une entrée vide dans une zone de fichier (`fichier`) ne se
+    /// remplit pas ici (ni page de zéros, ni page neuve) : elle a disparu
+    /// depuis que la page du fichier y a été posée (un `ftruncate`, qui ne
+    /// prend la mémoire qu'en lecture, comme la faute), et c'est le fichier
+    /// qui doit dire ce qu'il y a là (`Servi::ARefaire` ; SIGBUS s'il a été
+    /// raccourci). C'est le `pte_same` de Linux : la décision prise hors du
+    /// verrou des tables est revérifiée sous lui.
     ///
     /// Une écriture qui demande une page neuve prend `neuve`, un cadre mis à
     /// zéro que l'appelant a préparé hors du verrou des tables (`cadre_neuf`)
     /// et qu'on laisse à None ; sinon il reste là, et l'appelant le rend.
-    /// Sans lui, l'écriture en prend un ici (le chargeur, qui tient la
-    /// mémoire seul).
-    pub fn servir(&mut self, page: u64, droits: Droits, ecriture: bool, neuve: &mut Option<u64>) -> Result<(), Erreur> {
+    /// Sans lui : `Servi::PageNeuve`, rien n'est fait, et l'appelant en
+    /// prépare un puis recommence. Une page n'est donc préparée que si la
+    /// faute en demande une (une faute sur une page déjà à lui, celle d'un
+    /// futex partagé ou de MADV_POPULATE_WRITE, n'alloue rien, comme chez
+    /// Linux).
+    pub fn servir(&mut self, page: u64, droits: Droits, ecriture: bool, fichier: bool, neuve: &mut Option<u64>)
+        -> Result<Servi, Erreur> {
         if !adresse_permise(page) {
             return Err(Erreur::AdresseInterdite);
         }
@@ -323,6 +347,9 @@ impl EspaceUtilisateur {
         let cadre = *entree & ADRESSE;
         let zeros = page_de_zeros();
         let present = occupee(*entree);
+        if !present && fichier {
+            return Ok(Servi::ARefaire);
+        }
         let a_copier = present && cadre != zeros && partage(cadre);
         if !present || (ecriture && (cadre == zeros || a_copier)) {
             let neuve = if !ecriture {
@@ -331,7 +358,7 @@ impl EspaceUtilisateur {
                 self.compter_cadre();
                 c
             } else {
-                self.prendre_cadre()?
+                return Ok(Servi::PageNeuve);
             };
             if ecriture && a_copier {
                 // SAFETY: `neuve` vient d'être allouée, à nous ; `cadre` est
@@ -360,7 +387,7 @@ impl EspaceUtilisateur {
             *entree = entree_finale(cadre, droits);
             self.invalider(page);
         }
-        Ok(())
+        Ok(Servi::Fait)
     }
 
     /// Une entrée occupe-t-elle la page `page` (présente, ou rendue
@@ -442,6 +469,24 @@ impl EspaceUtilisateur {
     fn compter_cadre(&mut self) {
         self.pages += 1;
         self.suivre_pic();
+    }
+
+    /// Retire de [debut, fin[ les pages des projections d'un fichier (les
+    /// copies privées comprises), comme `retirer_plage` sans rendre les
+    /// tables, par tranches de 2 Mio (une table de dernier niveau), en
+    /// prenant le verrou des tables pour chacune : pour qui ne tient la
+    /// mémoire qu'en lecture (la troncature d'un fichier, appels_fichiers.rs).
+    /// Les interruptions ne restent coupées que le temps de 512 entrées au
+    /// plus, quelle que soit la plage (le `zap_pte_range` de Linux, qui prend
+    /// le verrou de chaque table de pages tour à tour).
+    pub fn retirer_par_tranches(espace: &crate::verrou::Verrou<EspaceUtilisateur>, debut: u64, fin: u64) {
+        const TRANCHE: u64 = PAGE << 9;
+        let mut a = debut;
+        while a < fin {
+            let b = ((a / TRANCHE + 1) * TRANCHE).min(fin);
+            espace.verrouiller().retirer_plage(a, b, false);
+            a = b;
+        }
     }
 
     /// Cet espace est-il celui du processeur (CR3) ? Sinon, il n'y a rien
@@ -634,10 +679,10 @@ fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl F
         // SAFETY: `table` est une table de cet espace (la PML4, ou une
         // table que désigne une entrée présente), que nous possédons ;
         // l'espace n'est changé que sous son verrou (`Memoire::espace`),
-        // ou par qui a `&mut Memoire` (sous le verrou du processus, ou sa
-        // dernière tâche, qui l'a retirée du processus pour la rendre) :
-        // tous passent par &mut EspaceUtilisateur, personne ne la change en
-        // même temps.
+        // ou par qui tient la mémoire du processus en écriture, ou par sa
+        // dernière tâche, qui l'a retirée du processus pour la rendre : tous
+        // passent par &mut EspaceUtilisateur, personne ne la change en même
+        // temps.
         let entree = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, niveau)] };
         if niveau == 0 {
             if occupee(*entree) {

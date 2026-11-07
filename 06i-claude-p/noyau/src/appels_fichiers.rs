@@ -10,9 +10,9 @@
 //!      fichier ouvert (une référence) ; sous celui des fichiers (vfs.rs),
 //!      l'inode, la page ;
 //!   3. rendre les verrous, puis seulement copier entre la page et le
-//!      programme : une copie peut faire une faute de page, qui prend le
-//!      verrou du processus, et celui des fichiers pour une page projetée
-//!      d'un fichier (memoire.rs). La page est
+//!      programme : une copie peut faire une faute de page, qui prend la
+//!      mémoire du processus (un verrou qui dort, depuis 6i), et celui des
+//!      fichiers pour une page projetée d'un fichier (memoire.rs). La page est
 //!      tenue (pages::prendre) pendant la copie : elle ne peut pas
 //!      disparaître sous elle, comme dans le `filemap_read` de Linux.
 //!
@@ -39,8 +39,8 @@
 //! Option écartée : faire tout l'appel sous le verrou du processus, celui
 //! des fichiers pris dedans (l'ordre le permet). Une copie depuis ou vers
 //! le programme ne peut pas s'y faire (elle peut fauter, et servir la
-//! faute prend le verrou du processus), et un fil qui résout un long
-//! chemin arrêterait les fautes de page de tous les autres.
+//! faute prend la mémoire du processus, qu'on ne prend pas sous un verrou
+//! court), et un fil qui résout un long chemin arrêterait tous les autres.
 
 use alloc::vec::Vec;
 
@@ -728,7 +728,8 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
     })?;
     let (fichier, ouvert) = fichier;
     // O_TRUNC, hors du verrou des fichiers : il faut d'abord retirer les
-    // pages des projections, sous celui du processus (`tronquer`). Le
+    // pages des projections, sous la mémoire du processus, en lecture
+    // (`tronquer`). Le
     // fichier est ouvert : vider ne peut plus échouer (une taille nulle
     // n'est jamais trop grande).
     if let Some(ouvert) = ouvert
@@ -2649,13 +2650,18 @@ fn tronquer(n: Numero, taille: u64) -> i64 {
 
 /// Retire des projections du processus en cours les pages du fichier `n`
 /// de numéro `premiere` ou plus (le `unmap_mapping_range` de Linux, copies
-/// comprises). Les zones restent : un accès y refera une faute.
+/// comprises). Les zones restent : un accès y refera une faute. La mémoire
+/// tenue en lecture (Linux ne prend pas même le `mmap_lock` : il passe par
+/// la carte inverse du fichier, `i_mmap`), les tables sous leur verrou,
+/// tranche par tranche (EspaceUtilisateur::retirer_par_tranches) ; le
+/// verrou des fichiers est rendu avant celui des tables (memoire.rs, l'ordre
+/// des deux). Sans processus (une tâche du noyau), rien à faire.
 fn retirer_projections(n: Numero, premiere: u64) {
-    processus::essayer_avec(|p| {
-        let m = &mut p.memoire;
-        let mut i = 0;
-        while let Some(z) = m.zones.zones().get(i).copied() {
-            i += 1;
+    if tache::courante().processus().is_none() {
+        return;
+    }
+    processus::memoire_lue(|m| {
+        for z in m.zones.zones() {
             let Some(projection) = z.fichier else { continue };
             let numero = vfs::avec_systeme(|s, _| s.ouverts.fichier(Fichier::de(projection.fichier)).numero());
             let fin = projection.page + z.taille() / PAGE;
@@ -2663,7 +2669,7 @@ fn retirer_projections(n: Numero, premiere: u64) {
                 continue;
             }
             let debut = z.debut + premiere.saturating_sub(projection.page) * PAGE;
-            m.tables().retirer_plage(debut, z.fin, false);
+            crate::espace_utilisateur::EspaceUtilisateur::retirer_par_tranches(&m.espace, debut, z.fin);
         }
     });
 }

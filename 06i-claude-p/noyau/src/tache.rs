@@ -234,6 +234,10 @@ pub struct Tache {
     interruptible: AtomicBool,
     /// Le futex qu'elle attend (futex.rs), sous le verrou de son seau.
     futex: Cell<Option<crate::futex::Attente>>,
+    /// Elle tient la mémoire de son processus, en lecture ou en écriture
+    /// (processus::memoire_lue, memoire_ecrite, servir_faute) : une faute
+    /// d'une copie du noyau ne peut pas la redemander (faute_de_page.rs).
+    tient_sa_memoire: AtomicBool,
     /// Une faute de page du noyau, dans une copie depuis ou vers son
     /// programme, ne doit pas être servie : la copie échoue (la lecture
     /// d'un futex sous le verrou de son seau, futex.rs ; le
@@ -366,6 +370,7 @@ impl Tache {
             reveil: AtomicU8::new(0),
             interruptible: AtomicBool::new(false),
             futex: Cell::new(None),
+            tient_sa_memoire: AtomicBool::new(false),
             sans_faute: AtomicBool::new(false),
             temps_a_verifier: AtomicBool::new(false),
             a_tuer: AtomicBool::new(false),
@@ -491,6 +496,16 @@ impl Tache {
         &self.futex
     }
 
+    /// Tient-elle la mémoire de son processus ?
+    pub fn tient_sa_memoire(&self) -> bool {
+        self.tient_sa_memoire.load(Ordering::Relaxed)
+    }
+
+    /// Elle prend, ou rend, la mémoire de son processus.
+    pub fn tenir_sa_memoire(&self, oui: bool) {
+        self.tient_sa_memoire.store(oui, Ordering::Relaxed);
+    }
+
     /// Faut-il servir une faute de page du noyau dans une copie pour elle ?
     pub fn faute_servie(&self) -> bool {
         !self.sans_faute.load(Ordering::Relaxed)
@@ -606,6 +621,7 @@ pub fn initialiser() {
         reveil: AtomicU8::new(0),
         interruptible: AtomicBool::new(false),
         futex: Cell::new(None),
+        tient_sa_memoire: AtomicBool::new(false),
         sans_faute: AtomicBool::new(false),
         temps_a_verifier: AtomicBool::new(false),
         a_tuer: AtomicBool::new(false),
@@ -1182,14 +1198,14 @@ pub fn forcer(signal: Signal, raison: impl fmt::Display) {
 }
 
 /// Arrête le programme en cours faute de mémoire (SIGKILL, le tueur OOM de
-/// Linux), en disant ce qu'il occupait. Le verrou du processus est rendu
-/// avant d'arrêter : `terminer` ne revient pas, et un verrou emporté dans
-/// une tâche abandonnée ne serait jamais rendu.
+/// Linux), en disant ce qu'il occupait. La mémoire du processus, lue pour
+/// le message, est rendue avant d'arrêter : `terminer` ne revient pas, et
+/// une mémoire emportée dans une tâche abandonnée ne serait jamais rendue
+/// (le dernier fil l'attendrait pour toujours, dans `fil_termine`).
 fn arreter_plus_de_memoire() -> ! {
-    let (virtuelle, en_place, fichiers, tables) = processus::avec(|p| {
-        let virtuelle = p.memoire.taille_virtuelle();
-        let e = p.memoire.tables();
-        (virtuelle, e.pages() as u64 * 4096, e.pages_fichier() as u64 * 4096, e.tables() as u64 * 4096)
+    let (virtuelle, en_place, fichiers, tables) = processus::memoire_lue(|m| {
+        let e = m.espace.verrouiller();
+        (m.taille_virtuelle(), e.pages() as u64 * 4096, e.pages_fichier() as u64 * 4096, e.tables() as u64 * 4096)
     });
     // Le message de Linux : « Out of memory: Killed process 1234 (a.out)
     // total-vm:...kB, anon-rss:...kB, file-rss:...kB, ... pgtables:...kB ».

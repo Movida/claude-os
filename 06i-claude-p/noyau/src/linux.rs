@@ -598,14 +598,11 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
 /// est promis, et ses pages ne viennent qu'à la faute.
 ///
 /// Rien n'est mis à zéro d'avance : agrandir le tas ne coûte que la zone.
-/// Le reculer rend les pages que le programme avait touchées, verrou du
-/// processus tenu, donc interruptions coupées : une page rendue prend une
-/// centaine de nanosecondes. L'ordonnanceur est là (6e), mais ce verrou
-/// coupe encore les interruptions : un verrou qui dort, en lecture et
-/// écriture (le mmap_lock de Linux), est prévu en 6i.
+/// Le reculer rend les pages que le programme avait touchées, mémoire du
+/// processus tenue en écriture (6i : un verrou qui dort, le mmap_lock de
+/// Linux), interruptions actives.
 fn brk(demande: u64) -> i64 {
-    processus::avec(|p| {
-        let m = &mut p.memoire;
+    processus::memoire_ecrite(|m| {
         let actuelle = m.fin_tas as i64;
         if demande < m.debut_tas || demande >= ADRESSE_MAX {
             return actuelle;
@@ -774,8 +771,7 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage
     if droits.ecriture && !sans_reserve && !engagement_possible(taille) {
         return -ENOMEM;
     }
-    let resultat = processus::avec(|p| {
-        let m = &mut p.memoire;
+    let resultat = processus::memoire_ecrite(|m| {
         let debut = if fixe {
             if drapeaux & MAP_FIXED_NOREPLACE != 0 && !m.zones.libre(adresse, adresse + taille, 0) {
                 return Err(-EEXIST);
@@ -802,17 +798,14 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage
 
 /// Met en place d'avance les pages de [debut, fin[, comme si le programme
 /// les avait touchées (en écriture si `ecriture`) : MAP_POPULATE,
-/// MADV_POPULATE_*. Une page à la fois, en rendant le verrou du processus
-/// entre deux : mettre en place des Mio, interruptions coupées, ferait
-/// perdre ses tics à l'horloge. S'arrête au premier échec, et dit lequel.
-/// Seulement dans des zones : peupler n'étend pas la pile.
+/// MADV_POPULATE_*. Une page à la fois, mémoire tenue en lecture (comme
+/// une faute), rendue entre deux : un munmap d'un autre fil n'attend pas
+/// des Mio. S'arrête au premier échec, et dit lequel. Seulement dans des
+/// zones : peupler n'étend pas la pile (Memoire::servir).
 fn peupler(debut: u64, fin: u64, ecriture: bool) -> Result<(), Echec> {
     let acces = if ecriture { Acces::Ecriture } else { Acces::Lecture };
     for page in (debut..fin).step_by(PAGE as usize) {
-        processus::avec(|p| {
-            p.memoire.zones.trouver(page).ok_or(Echec::SansZone)?;
-            p.memoire.servir(page, acces)
-        })?;
+        processus::memoire_lue(|m| m.servir(page, acces))?;
     }
     Ok(())
 }
@@ -821,10 +814,14 @@ fn peupler(debut: u64, fin: u64, ecriture: bool) -> Result<(), Echec> {
 /// pages. Comme Linux : adresse non alignée, longueur nulle, ou plage qui
 /// sort des adresses des programmes : EINVAL ; une plage où il n'y a rien
 /// n'est pas une erreur ; couper une zone en deux quand la carte est
-/// pleine : ENOMEM. Les pages touchées sont rendues verrou du processus
-/// tenu, donc interruptions coupées : une centaine de nanosecondes par
-/// page, des tics d'horloge perdus pour un munmap de centaines de Mio
-/// touchés (le mmap_lock qui dort, prévu en 6i, y remédiera).
+/// pleine : ENOMEM. Les pages touchées sont rendues mémoire du processus
+/// tenue en écriture (un verrou qui dort, depuis 6i), interruptions
+/// actives : un munmap de centaines de Mio ne fait plus perdre ses tics à
+/// l'horloge.
+/// UNIPROCESSEUR : Linux retire les zones en écriture, puis rétrograde en
+/// lecture pour rendre les pages (`do_vmi_align_munmap`), et les fautes des
+/// autres fils reprennent pendant ce temps ; sur un seul processeur,
+/// l'écriture ne fait attendre personne de plus. En 6j.
 fn munmap(adresse: u64, longueur: u64) -> i64 {
     if adresse % PAGE != 0 || longueur == 0 {
         return -EINVAL;
@@ -835,7 +832,7 @@ fn munmap(adresse: u64, longueur: u64) -> i64 {
     if fin > ADRESSE_MAX {
         return -EINVAL;
     }
-    match processus::avec(|p| p.memoire.retirer(adresse, fin)) {
+    match processus::memoire_ecrite(|m| m.retirer(adresse, fin)) {
         Ok(()) => 0,
         Err(_) => -ENOMEM,
     }
@@ -887,8 +884,7 @@ fn mprotect(adresse: u64, longueur: u64, prot: u64) -> i64 {
     if fin > ADRESSE_MAX {
         return -ENOMEM;
     }
-    processus::avec(|p| {
-        let m = &mut p.memoire;
+    processus::memoire_ecrite(|m| {
         // La première zone de la plage.
         let Some(&premiere) = m.zones.suivante(adresse).filter(|z| z.debut < fin) else {
             return -ENOMEM;
@@ -983,10 +979,11 @@ fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
     }
     // Au-delà des adresses des programmes, il n'y a aucune zone.
     let (debut, fin_zones) = (adresse.min(ADRESSE_MAX), fin.min(ADRESSE_MAX));
-    let couverte = fin <= ADRESSE_MAX && processus::avec(|p| p.memoire.zones.couverte(debut, fin_zones));
+    let couverte = fin <= ADRESSE_MAX && processus::memoire_lue(|m| m.zones.couverte(debut, fin_zones));
     let resultat = match conseil {
-        DONTNEED | FREE | DONTNEED_LOCKED => processus::avec(|p| {
-            let m = &mut p.memoire;
+        // Mémoire tenue en écriture : les pages sont rendues interruptions
+        // actives (Memoire::oublier dit pourquoi pas en lecture, comme Linux).
+        DONTNEED | FREE | DONTNEED_LOCKED => processus::memoire_ecrite(|m| {
             if conseil == FREE && m.zones.morceaux(debut, fin_zones).any(|z| z.fichier.is_some()) {
                 return Err(-EINVAL);
             }
@@ -1002,8 +999,7 @@ fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
             Err(_) => Err(-ENOMEM),
             Ok(()) => Ok(()),
         },
-        DONTFORK | DOFORK | WIPEONFORK | KEEPONFORK => processus::avec(|p| {
-            let m = &mut p.memoire;
+        DONTFORK | DOFORK | WIPEONFORK | KEEPONFORK => processus::memoire_ecrite(|m| {
             if conseil == WIPEONFORK && m.zones.morceaux(debut, fin_zones).any(|z| z.fichier.is_some()) {
                 return Err(-EINVAL);
             }

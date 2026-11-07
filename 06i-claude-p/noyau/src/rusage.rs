@@ -215,8 +215,14 @@ pub fn getrusage(qui: u64, tampon: u64) -> i64 {
     } else {
         let t = tache::courante();
         let entree = t.processus().expect("getrusage sans processus").clone();
+        // Le pic de la mémoire, sous son propre verrou (6i), pris et rendu
+        // avant celui du processus : un verrou qui dort ne se prend pas
+        // sous un verrou court.
+        // UNIPROCESSEUR : Linux lit un compteur (`hiwater_rss`), sans le
+        // mmap_lock ; sur un seul processeur, la lecture ne fait attendre
+        // personne de plus. En 6j.
+        let maxrss = processus::memoire_lue(|m| m.espace.verrouiller().pic() as u64 * 4);
         let (cumul, maxrss) = processus::avec(|p| {
-            let maxrss = p.memoire.tables().pic() as u64 * 4;
             if qui == RUSAGE_THREAD {
                 return (t.usage().lire(), maxrss);
             }

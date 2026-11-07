@@ -72,6 +72,17 @@ wait
 /bin/fils
 /bin/fils groupe
 /bin/courses
+# La mémoire disputée par les fils (6i) : sous un verrou qui dort, en
+# lecture pour les fautes, en écriture pour mmap, munmap, mprotect et
+# madvise. Puis exit_group au milieu de tout cela, trois fois (sous trois
+# noms, des liens physiques : la fin de chacune se vérifie à part). Puis des
+# fautes sur un fichier pendant qu'un autre fil le raccourcit.
+/bin/fautes
+/bin/fautes-fin-1 fin
+/bin/fautes-fin-2 fin
+/bin/fautes-fin-3 fin
+/bin/troncature lecture
+/bin/troncature copie
 # Les sockets UDP et ICMP (6g), sur lo ; et le DNS de la glibc, par un
 # serveur du programme.
 /bin/reseau

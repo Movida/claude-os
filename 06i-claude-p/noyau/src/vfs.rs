@@ -26,9 +26,11 @@
 //! pages (ENOSPC au-delà).
 //!
 //! Le système de fichiers est sous un verrou. Règles :
-//!   - l'ordre : le verrou d'un processus, puis celui des fichiers (une
-//!     faute de page dans une projection de fichier tient le premier et
-//!     prend le second) ; mais une vue de /proc, sous celui des fichiers,
+//!   - l'ordre : le verrou d'un processus, puis celui des fichiers (le
+//!     dossier de départ d'une résolution, getcwd), et celui des tables de
+//!     pages, puis celui des fichiers (une faute de page dans une
+//!     projection de fichier, sous la mémoire du processus, un verrou qui
+//!     dort : memoire.rs) ; mais une vue de /proc, sous celui des fichiers,
 //!     prend la table des processus puis un processus (procfs.rs). Ce qui
 //!     se fait sous le verrou d'un processus ne résout donc jamais de
 //!     chemin.

@@ -57,8 +57,9 @@
 //! (celui de la résolution des chemins), et y prend celui de la table des
 //! processus, puis d'un processus. L'inverse se fait aussi : le verrou des
 //! fichiers pris sous celui d'un processus, pour le dossier de départ d'une
-//! résolution (appels_fichiers.rs, rendu avant de résoudre), getcwd, la
-//! faute de page d'une projection, et ici `ligne_maps` (le chemin du
+//! résolution (appels_fichiers.rs, rendu avant de résoudre) et getcwd ; et
+//! sous la mémoire d'un processus (un verrou qui dort, processus.rs), pour
+//! la faute de page d'une projection et ici `ligne_maps` (le chemin du
 //! fichier d'une zone). Aucun de ces endroits ne résout de chemin ni
 //! n'entre dans une vue de /proc : le verrou d'un processus n'est jamais
 //! pris deux fois.
@@ -858,9 +859,11 @@ pub fn ecrire(source: u32, argument: u32, octets: &[u8], longueur: u64) -> Resul
 /// privées inscriptibles, hors pile, plus la pile : `data_vm + stack_vm`) ;
 /// 0. Les compteurs du résident sont ceux que tient déjà l'espace
 /// d'adressage (les `rss_stat` de Linux) ; le reste, sommé sur les zones.
+/// UNIPROCESSEUR : Linux les lit sans le mmap_lock (`task_statm`, des
+/// compteurs) ; nous, mémoire tenue en lecture : sur un seul processeur,
+/// elle ne fait attendre personne de plus. En 6j.
 fn statm(pid: u32) -> Result<Vec<u8>, Erreur> {
-    let (taille, resident, partage, code, donnees) = processus::avec_pid(pid, |p| {
-        let m = &p.memoire;
+    let (taille, resident, partage, code, donnees) = processus::memoire_du_pid(pid, |m| {
         let (debut, fin) = m.code;
         let code = if fin > debut { (fin.next_multiple_of(4096) - (debut & !4095)) / 4096 } else { 0 };
         let donnees: u64 = m.zones.zones().iter()
@@ -880,7 +883,8 @@ fn statm(pid: u32) -> Result<Vec<u8>, Erreur> {
 
 /// Ce que montre maps du fichier que projette la zone `z` (s'il y en a un) :
 /// son chemin, son inode, s'il est effacé, et le décalage de la projection
-/// en octets. Sous le verrou du processus de la zone (`ligne_maps`).
+/// en octets. Sous la mémoire du processus de la zone, tenue en lecture
+/// (`ligne_maps`).
 fn fichier_de_zone(z: &Zone) -> Result<Option<(Vec<u8>, u32, bool, u64)>, Erreur> {
     let Some(projection) = z.fichier else { return Ok(None) };
     vfs::avec_systeme(|s, _| {
@@ -907,13 +911,13 @@ fn fichier_de_zone(z: &Zone) -> Result<Option<(Vec<u8>, u32, bool, u64)>, Erreur
 fn ligne_maps(pid: u32, curseur: u64) -> Result<Enregistrement, Erreur> {
     // La zone, et le fichier qu'elle projette : son chemin (copié : les
     // verrous ne restent pas pris), son inode, s'il a encore un nom. Lus
-    // sous le verrou du processus, celui des fichiers pris dedans : la zone
-    // tient son fichier tant qu'elle existe, mais le processus peut la
-    // retirer (munmap) dès qu'on rend son verrou, et le numéro du fichier
-    // servir à un autre. Linux lit de même maps sous le verrou de la
-    // mémoire du processus (`mmap_read_lock`).
-    let Some(lu) = processus::avec_pid(pid, |p| {
-        let z = p.memoire.zones.zones().iter().find(|z| z.fin > curseur).copied()?;
+    // mémoire du processus tenue en lecture, celui des fichiers pris
+    // dedans : la zone tient son fichier tant qu'elle existe, mais le
+    // processus peut la retirer (munmap) dès qu'on rend la mémoire, et le
+    // numéro du fichier servir à un autre. Linux lit de même maps sous le
+    // verrou de la mémoire du processus (`mmap_read_lock`).
+    let Some(lu) = processus::memoire_du_pid(pid, |m| {
+        let z = m.zones.zones().iter().find(|z| z.fin > curseur).copied()?;
         Some(fichier_de_zone(&z).map(|fichier| (z, fichier)))
     })
     .flatten() else {

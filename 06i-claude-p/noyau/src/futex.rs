@@ -26,8 +26,9 @@
 //! reprise.rs ; `futex_unqueue`). Sinon, un WAKE compté (et rendu à
 //! qui réveille) serait perdu : une condition de la glibc ne se réveillerait
 //! plus. Relire l'entier sous un verrou demande une lecture qui ne SERT
-//! PAS une faute de page (servir prend le verrou du processus, et attendra
-//! le disque en 6m) : en cas de faute, on rend le verrou, on fait venir la
+//! PAS une faute de page (servir prend la mémoire du processus, un verrou
+//! qui dort, et attendra le disque en 6m ; sous le verrou du seau, on ne
+//! dort pas) : en cas de faute, on rend le verrou, on fait venir la
 //! page par une lecture ordinaire, et on recommence (`futex_wait_setup`).
 //!
 //! Les futex à héritage de priorité (LOCK_PI...) : ENOSYS, avec un
@@ -201,7 +202,7 @@ fn cle(adresse: u64, partage: bool) -> Result<Cle, i64> {
     if adresse.checked_add(4).is_none_or(|fin| fin > ADRESSE_MAX) {
         return Err(-EFAULT);
     }
-    if partage && processus::avec(|p| p.memoire.servir(adresse, Acces::Ecriture)).is_err() {
+    if partage && processus::memoire_lue(|m| m.servir(adresse, Acces::Ecriture)).is_err() {
         return Err(-EFAULT);
     }
     Ok(Cle { pid: processus::avec(|p| p.pid), adresse, partage })
@@ -507,7 +508,7 @@ fn operer(adresse: u64, partage: bool, val: u32, val2: u64, adresse2: u64, codee
         }
         // La page à écrire : la faire venir en écriture (un futex partagé
         // l'a déjà fait), verrous rendus.
-        if processus::avec(|p| p.memoire.servir(adresse2, Acces::Ecriture)).is_err() {
+        if processus::memoire_lue(|m| m.servir(adresse2, Acces::Ecriture)).is_err() {
             return -EFAULT;
         }
     }

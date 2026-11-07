@@ -17,16 +17,27 @@
 //!   4. elle vient du programme : servie si une zone la permet, sinon le
 //!      programme est arrêté (SIGSEGV, ou SIGKILL quand la mémoire manque).
 //!
-//! La faute est servie interruptions coupées (porte d'interruption), sous
-//! le verrou du processus : trouver la zone et mettre une page à zéro, une
-//! microseconde. Linux rouvre les interruptions parce qu'une faute peut
-//! attendre un disque ; ce sera le cas avec 6m, pas avant.
+//! Depuis 6i, la faute est servie INTERRUPTIONS ACTIVES, comme chez Linux :
+//! la porte d'interruption les a coupées en entrant ; on les rouvre pour
+//! une faute du programme dès CR2 lu et le bit réservé regardé, et pour une
+//! faute du noyau seulement une fois sûr qu'elle sera servie (une copie,
+//! une adresse du programme, les contrôles de `faute_du_noyau` passés),
+//! comme `do_user_addr_fault`, qui ne les rouvre qu'après ses contrôles ;
+//! jamais pour une erreur du noyau, ni pour une adresse du noyau
+//! (`do_kern_addr_fault`), qui s'arrête sans laisser tourner personne sur
+//! un état faux. Puis la mémoire du processus est prise
+//! en lecture : un verrou qui dort (processus::servir_faute), qu'un munmap
+//! d'un autre fil peut tenir. La faute peut donc dormir, être préemptée,
+//! et laisser passer le tic d'horloge pendant qu'elle met une page à zéro.
+//! Avant, sous le verrou du processus, elle les coupait : correct tant
+//! qu'elle était courte, mais elle attendait aussi, interruptions coupées,
+//! tout ce que les autres fils faisaient de la mémoire.
 
 use crate::copie_utilisateur::{self, SMAP_ACTIF};
 use crate::espace_utilisateur::ADRESSE_MAX;
 use crate::interruptions::{Cadre, exception_fatale, lire_cr2};
 use crate::memoire::{Acces, Echec};
-use crate::{linux, processus, tache};
+use crate::{cpu, linux, processus, tache};
 use core::sync::atomic::Ordering;
 
 // Les bits du code d'erreur d'une faute de page.
@@ -41,6 +52,9 @@ const INSTRUCTION: u64 = 1 << 4;
 /// Le drapeau AC de RFLAGS : avec SMAP, le noyau ne touche une page du
 /// programme que s'il vaut 1 (entre `stac` et `clac`).
 const AC: u64 = 1 << 18;
+/// Le drapeau IF de RFLAGS : le code interrompu avait les interruptions
+/// actives.
+const IF: u64 = 1 << 9;
 
 /// Appelée par gerer_interruption pour le vecteur 14.
 pub fn gerer(cadre: &mut Cadre) {
@@ -56,18 +70,16 @@ pub fn gerer(cadre: &mut Cadre) {
     } else {
         Acces::Lecture
     };
+    // CR2 et le code lus : pour une faute du programme, les interruptions
+    // peuvent revenir (le `local_irq_enable` de `do_user_addr_fault`) ; pour
+    // une faute du noyau, voir `faute_du_noyau`. Elles seront coupées de
+    // nouveau par `iretq`, qui rend au code interrompu ses drapeaux.
     if cadre.cs & 3 == 3 {
+        cpu::activer_interruptions();
         faute_du_programme(cadre, cr2, acces);
     } else {
         faute_du_noyau(cadre, cr2, acces);
     }
-}
-
-/// Sert une faute à `adresse` : la pile d'abord étendue jusqu'à elle s'il
-/// le faut (la carte change), puis la page mise en place.
-fn servir(m: &mut crate::memoire::Memoire, adresse: u64, acces: Acces) -> Result<(), Echec> {
-    m.etendre_pile(adresse);
-    m.servir(adresse, acces)
 }
 
 /// Une faute du programme : servie, ou le programme sera arrêté au retour
@@ -76,12 +88,16 @@ fn servir(m: &mut crate::memoire::Memoire, adresse: u64, acces: Acces) -> Result
 fn faute_du_programme(cadre: &Cadre, cr2: u64, acces: Acces) {
     // Une adresse de la moitié haute (le noyau), ou la dernière page de la
     // moitié basse : jamais une zone.
-    let resultat = if cr2 < ADRESSE_MAX { processus::avec(|p| servir(&mut p.memoire, cr2, acces)) } else { Err(Echec::SansZone) };
+    let resultat = if cr2 < ADRESSE_MAX {
+        processus::servir_faute(cr2, acces).expect("faute d'un programme sans processus")
+    } else {
+        Err(Echec::SansZone)
+    };
     match resultat {
         Ok(()) => tache::courante().usage().compter_faute(),
         Err(Echec::PlusDeMemoire) => tache::tuer_au_retour(),
         Err(cause) => {
-            let zone = processus::avec(|p| p.memoire.zone_du_code(cadre.rip));
+            let zone = processus::memoire_lue(|m| m.zone_du_code(cadre.rip));
             let (signal, raison) = linux::signal_de_l_exception(14, cadre, cr2, Some(cause), zone, 0);
             tache::forcer_par_faute(signal, raison)
         }
@@ -110,17 +126,45 @@ fn faute_du_programme(cadre: &Cadre, cr2: u64, acces: Acces) {
 ///     après avoir fait venir la page autrement).
 /// Une page qui manque, faute de mémoire, rend aussi EFAULT, et le
 /// programme sera tué à son retour (tache::tuer_au_retour).
+///
+/// Servir la faute prend la mémoire du processus, un verrou qui dort. Dans
+/// l'ordre de Linux 6.18 (`do_user_addr_fault`) :
+///   - SMAP, puis une copie qui ne fait pas servir ses fautes
+///     (`sans_faute_servie`, le `faulthandler_disabled` de Linux), ou pas
+///     de processus (le test du démarrage, une tâche du noyau) : EFAULT ;
+///   - une copie sous un verrou court, ou sous la mémoire du processus que
+///     la tâche tient déjà : on ne peut pas dormir, ou on s'attendrait
+///     soi-même. Chaque copie le vérifie déjà (copie_utilisateur.rs, le
+///     `__might_fault` de Linux) : arriver ici est une erreur du noyau, on
+///     s'arrête en le disant ;
+///   - le code interrompu avait coupé les interruptions : de même (Linux
+///     l'avertit, « WARN_ON_ONCE(!(regs->flags & X86_EFLAGS_IF)) », et ne
+///     sert jamais cette faute) : une copie au milieu d'une section qu'il
+///     protège ainsi la couperait en deux en dormant ;
+///   - sinon les interruptions reviennent (le code interrompu les avait),
+///     et la faute est servie. Une erreur du noyau, elle, s'arrête
+///     interruptions coupées.
 fn faute_du_noyau(cadre: &mut Cadre, cr2: u64, acces: Acces) {
     let Some(reprise) = copie_utilisateur::reprise(cadre.rip) else {
         exception_fatale(cadre);
     };
     let smap_viole = SMAP_ACTIF.load(Ordering::Relaxed) && cadre.rflags & AC == 0;
-    let permise = !crate::tache::en_service() || crate::tache::courante().faute_servie();
-    let servie = !smap_viole
-        && permise
+    let a_servir = !smap_viole
+        && tache::en_service()
+        && tache::courante().faute_servie()
+        && tache::courante().processus().is_some()
         && cr2 < ADRESSE_MAX
-        && acces != Acces::Execution
-        && match processus::essayer_avec(|p| servir(&mut p.memoire, cr2, acces)) {
+        && acces != Acces::Execution;
+    if a_servir {
+        let tenus = crate::verrou::tenus();
+        assert!(tenus == 0, "faute d'une copie sous {} verrou(s) court(s), a RIP={:#x}", tenus, cadre.rip);
+        assert!(!tache::courante().tient_sa_memoire(),
+                "faute d'une copie sous le verrou de la memoire de son processus, a RIP={:#x}", cadre.rip);
+        assert!(cadre.rflags & IF != 0, "faute d'une copie interruptions coupees, a RIP={:#x}", cadre.rip);
+        cpu::activer_interruptions();
+    }
+    let servie = a_servir
+        && match processus::servir_faute(cr2, acces) {
             Some(Ok(())) => true,
             Some(Err(Echec::PlusDeMemoire)) => {
                 tache::tuer_au_retour();

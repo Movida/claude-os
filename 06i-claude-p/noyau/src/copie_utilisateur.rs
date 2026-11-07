@@ -49,7 +49,8 @@
 //! utiles : plus rapide, mais un mécanisme entier pour quelques cycles.
 //!
 //! Jamais sous un verrou : une copie peut fauter, et servir la faute prend
-//! le verrou du processus (et, plus tard, attendra le disque). On copie
+//! la mémoire du processus, un verrou qui dort (et, plus tard, attendra le
+//! disque) ; ni la mémoire tenue, qu'elle redemanderait (`peut_fauter`). On copie
 //! dans un tampon du noyau, puis on s'en sert. Une exception : la lecture
 //! d'un futex sous le verrou de son seau (futex.rs), faite sans servir de
 //! faute (`tache::sans_faute_servie`) ; une page absente la fait échouer,
@@ -147,12 +148,40 @@ unsafe extern "C" {
     static __fin_ex_table: [u64; 0];
 }
 
+/// Une copie va peut-être fauter, et servir la faute peut dormir (la
+/// mémoire du processus est un verrou qui dort, depuis 6i) : jamais sous un
+/// verrou court, ni interruptions coupées (la faute d'une telle copie
+/// arrête le noyau : faute_de_page.rs), ni sous la mémoire du processus que
+/// la tâche tient déjà (elle s'attendrait elle-même). Vérifié à CHAQUE copie, et pas seulement
+/// quand la page manque, comme le `__might_fault` de Linux : une copie mal
+/// placée se voit au premier passage, pas le jour rare où sa page est
+/// absente. Sauf pour une tâche qui ne fait pas servir ses fautes
+/// (`tache::sans_faute_servie`, la lecture d'un futex sous le verrou de son
+/// seau : sa faute rend EFAULT, rien ne dort), ou qui n'a pas de processus
+/// (le test du démarrage, une tâche du noyau).
+#[track_caller]
+fn peut_fauter() {
+    if !crate::tache::en_service() {
+        return;
+    }
+    let t = crate::tache::courante();
+    if !t.faute_servie() || t.processus().is_none() {
+        return;
+    }
+    let tenus = crate::verrou::tenus();
+    assert!(tenus == 0, "copie depuis ou vers un programme sous {} verrou(s) court(s)", tenus);
+    assert!(crate::cpu::interruptions_actives(), "copie depuis ou vers un programme interruptions coupees");
+    assert!(!t.tient_sa_memoire(), "copie depuis ou vers un programme sous le verrou de sa memoire");
+}
+
 /// Compare l'entier de 32 bits à `adresse` du programme à `attendu`, et
 /// le remplace par `nouveau` s'il lui est égal, en une instruction
 /// indivisible (`lock cmpxchg`, le `futex_atomic_cmpxchg_inatomic` de
 /// Linux) : rend la valeur trouvée. Une adresse hors du programme, non
 /// alignée sur 4, ou une page absente qu'on ne sert pas : Faute.
+#[track_caller]
 pub fn cmpxchg_u32(adresse: u64, attendu: u32, nouveau: u32) -> Result<u32, Faute> {
+    peut_fauter();
     if adresse % 4 != 0 || !dans_les_bornes(adresse, 4) {
         return Err(Faute);
     }
@@ -173,7 +202,9 @@ pub fn dans_les_bornes(adresse: u64, n: u64) -> bool {
 /// Copie `destination.len()` octets depuis l'adresse `source` du programme
 /// en cours. En cas de faute, une partie a pu être copiée : le contenu de
 /// `destination` n'a alors pas de sens.
+#[track_caller]
 pub fn copier_depuis_utilisateur(destination: &mut [u8], source: u64) -> Result<(), Faute> {
+    peut_fauter();
     if !dans_les_bornes(source, destination.len() as u64) {
         return Err(Faute);
     }
@@ -186,7 +217,9 @@ pub fn copier_depuis_utilisateur(destination: &mut [u8], source: u64) -> Result<
 }
 
 /// Copie `source` à l'adresse `destination` du programme en cours.
+#[track_caller]
 pub fn copier_vers_utilisateur(destination: u64, source: &[u8]) -> Result<(), Faute> {
+    peut_fauter();
     if !dans_les_bornes(destination, source.len() as u64) {
         return Err(Faute);
     }
@@ -204,7 +237,9 @@ pub fn copier_vers_utilisateur(destination: u64, source: &[u8]) -> Result<(), Fa
 /// qui écrit 300 octets dont les 100 premiers sont valides apprend que 100
 /// sont écrits, et ils le sont). `rep movsb` laisse dans RCX ce qui reste :
 /// la copie s'est arrêtée exactement à la première page absente.
+#[track_caller]
 pub fn copier_depuis_utilisateur_partiel(destination: &mut [u8], source: u64) -> usize {
+    peut_fauter();
     if !dans_les_bornes(source, destination.len() as u64) {
         return 0;
     }
@@ -215,7 +250,9 @@ pub fn copier_depuis_utilisateur_partiel(destination: &mut [u8], source: u64) ->
 
 /// Copie `source` à l'adresse `destination` du programme, comme
 /// `copier_depuis_utilisateur_partiel` : rend le nombre d'octets copiés.
+#[track_caller]
 pub fn copier_vers_utilisateur_partiel(destination: u64, source: &[u8]) -> usize {
+    peut_fauter();
     if !dans_les_bornes(destination, source.len() as u64) {
         return 0;
     }
@@ -231,7 +268,9 @@ pub fn copier_vers_utilisateur_partiel(destination: u64, source: &[u8]) -> usize
 /// # Safety
 /// [source, source + n[ est de la mémoire du noyau, lisible, qui reste
 /// allouée pendant la copie.
+#[track_caller]
 pub unsafe fn copier_vers_utilisateur_brut(destination: u64, source: *const u8, n: usize) -> usize {
+    peut_fauter();
     if !dans_les_bornes(destination, n as u64) {
         return 0;
     }
@@ -248,7 +287,9 @@ pub unsafe fn copier_vers_utilisateur_brut(destination: u64, source: *const u8, 
 /// [destination, destination + n[ est de la mémoire du noyau, inscriptible,
 /// qui reste allouée pendant la copie, et qu'aucune référence Rust ne
 /// désigne.
+#[track_caller]
 pub unsafe fn copier_depuis_utilisateur_brut(destination: *mut u8, source: u64, n: usize) -> usize {
+    peut_fauter();
     if !dans_les_bornes(source, n as u64) {
         return 0;
     }
@@ -334,7 +375,9 @@ pub fn smap_verifie(adresse: u64) -> bool {
 /// sans le zéro. La copie avance page par page et s'arrête au zéro : elle
 /// ne touche jamais une page au-delà, qui pourrait ne pas exister (le
 /// `strncpy_from_user` de Linux).
+#[track_caller]
 pub fn chaine_depuis_utilisateur(source: u64, max: usize) -> Result<alloc::vec::Vec<u8>, ErreurChaine> {
+    peut_fauter();
     let mut chaine = alloc::vec::Vec::new();
     chaine.try_reserve_exact(max).map_err(|_| ErreurChaine::PlusDeMemoire)?;
     let mut adresse = source;

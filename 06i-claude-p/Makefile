@@ -250,6 +250,15 @@ boot.bin: programmes.cpio FORCE
 #     aussi ;
 #   - courses : gcc -static, quatre fils qui ferment, changent de dossier et
 #     se servent en même temps des mêmes descripteurs ; sur l'hôte aussi ;
+#   - fautes : gcc -static, la mémoire disputée par ses fils (6i) : quatre
+#     qui fautent pendant qu'un autre rend des pages et qu'un autre projette,
+#     protège et retire des zones, la pile qui grandit ; puis exit_group au
+#     milieu de tout cela (sous trois noms, fautes-fin-1 à 3, des liens
+#     physiques : chaque fin se vérifie à part) ; sur l'hôte aussi ;
+#   - troncature : gcc -static, des fautes de page sur un fichier projeté
+#     pendant qu'un autre fil le raccourcit (6i) : la première lecture, ou
+#     la copie à l'écriture ; aucune page relue au-delà de la fin ; sur
+#     l'hôte aussi, dans /dev/shm ;
 #   - reseau : gcc -static, les sockets UDP et ICMP sur lo (les appels et
 #     leurs refus, les options, la socket vue comme fichier, les attentes
 #     d'un fil à l'autre, 10 000 allers-retours, les erreurs ICMP, le ping) ;
@@ -389,6 +398,14 @@ $(LINUX)/fils: linux/fils.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@ -lm
 
 $(LINUX)/courses: linux/courses.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/fautes: linux/fautes.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/troncature: linux/troncature.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -818,7 +835,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -890,8 +907,10 @@ texte: boot.bin
 # machine : d'où la marge. En 6h, les temps d'attente de tcp (le SYN sans
 # réponse, 3 s ; le keepalive, 2,5 s ; SO_LINGER, 1 s) et ses 64 Mio
 # (1,1 s) : 26 s en tout au milieu de l'étape, 39 s à sa fin (tcp seul :
-# 17 s), mesurées en 6i ; d'où 90 s depuis, le double. verifier.sh le
-# demande par `make duree` ; ne pas le lancer sur une machine saturée.
+# 17 s), mesurées en 6i ; d'où 90 s depuis, le double. En 6i, les fautes
+# disputées par des fils (fautes, quatre fois) et les troncatures (3 s) :
+# 43 s en tout, mesurées. verifier.sh le demande par `make duree` ; ne pas
+# le lancer sur une machine saturée.
 DUREE = 90
 
 duree:
@@ -981,7 +1000,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -1017,6 +1036,10 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/fils | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	./$(LINUX)/fils groupe; test $$? = 7
 	./$(LINUX)/courses | tee /dev/stderr | (! grep -q ECHEC)
+	./$(LINUX)/fautes | tee /dev/stderr | grep -q "fautes : .* : ok"
+	./$(LINUX)/fautes fin
+	./$(LINUX)/troncature lecture 1500 /dev/shm | tee /dev/stderr | grep -q "troncature : .* : ok"
+	./$(LINUX)/troncature copie 1500 /dev/shm | tee /dev/stderr | grep -q "troncature : .* : ok"
 	timeout 60 ./$(LINUX)/reseau | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/dns | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/aleatoire | tee /dev/stderr | grep -q "toutes les verifications : ok"

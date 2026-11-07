@@ -2,13 +2,14 @@
 //! toucher, ../zones), ses tables de pages (ce qui est en place,
 //! espace_utilisateur.rs) et son tas. C'est la mm_struct de Linux.
 //!
-//! Depuis 6i, une faute de page ne fait que LIRE la mémoire (`servir`,
-//! `&self`) : les tables de pages, qu'elle change, ont leur propre verrou
-//! court (`espace`, le `page_table_lock` de Linux) ; mmap, munmap,
-//! mprotect, brk, madvise la CHANGENT (`&mut self`), et touchent les tables
-//! sans ce verrou (`Verrou::get_mut`) : ils l'ont seuls. C'est ce qui
-//! permettra de mettre la mémoire sous un verrou qui dort, en lecture et
-//! en écriture (le `mmap_lock`, processus.rs).
+//! Depuis 6i, elle est sous un verrou qui dort, en lecture et en écriture
+//! (le `mmap_lock` de Linux, processus.rs) : les fautes de page la LISENT
+//! (`servir`, `&self`), et peuvent être plusieurs à la fois ; mmap,
+//! munmap, mprotect, brk, madvise la CHANGENT (`&mut self`), seuls. Les
+//! tables de pages, que les fautes changent aussi, ont leur propre verrou
+//! court (`espace`, le `page_table_lock`), que les écrivains n'ont pas à
+//! prendre (`Verrou::get_mut`) : un munmap de centaines de Mio rend ses
+//! pages interruptions actives.
 //!
 //! La carte fait foi : une page n'est projetée que dans une zone, avec les
 //! droits de sa zone. Toute opération (brk, mprotect) change d'abord la
@@ -50,7 +51,7 @@
 use core::fmt;
 
 use crate::descripteurs::Fichier;
-use crate::espace_utilisateur::{self, Erreur, EspaceUtilisateur};
+use crate::espace_utilisateur::{self, Erreur, EspaceUtilisateur, Servi};
 use crate::verrou::Verrou;
 use crate::vfs;
 use crate::programmes::NomCourt;
@@ -119,8 +120,8 @@ pub fn engagement_possible(octets: u64) -> bool {
 /// fusion, un retrait) : son fichier ouvert est tenu une fois de plus, ou
 /// de moins (descripteurs.rs). Chaque zone de fichier tient ainsi son
 /// fichier, qui survit à `close` tant qu'il est projeté (voir ../zones).
-/// Appelée sous le verrou du processus : prend celui des fichiers, dans
-/// l'ordre permis.
+/// Appelée mémoire tenue en écriture : prend celui des fichiers, dans
+/// l'ordre permis (processus.rs).
 pub fn references(fichier: u32, delta: i32) {
     let f = Fichier::de(fichier);
     vfs::avec_systeme(|s, cadres| if delta > 0 { s.ouverts.prendre(f) } else { s.lacher(f, cadres) });
@@ -218,9 +219,9 @@ impl fmt::Display for ZoneDuCode {
 
 pub struct Memoire {
     /// Les tables de pages, sous leur verrou court (le `page_table_lock`
-    /// de Linux) : une faute, qui ne fait que lire la mémoire, le prend
-    /// pour poser son entrée ; qui la change y accède sans lui
-    /// (`get_mut`). UNIPROCESSEUR : un verrou pour tout l'espace ;
+    /// de Linux) : une faute, qui ne tient la mémoire qu'en lecture, le
+    /// prend pour poser son entrée ; qui la tient en écriture y accède sans
+    /// lui (`get_mut`). UNIPROCESSEUR : un verrou pour tout l'espace ;
     /// Linux en a un par table de dernier niveau (les « split PTE
     /// ptlocks »), pour que des fautes sur plusieurs processeurs ne
     /// s'attendent pas : à voir en 6j, d'après les statistiques des verrous.
@@ -256,30 +257,30 @@ impl Memoire {
         Ok(Memoire { espace: Verrou::new(EspaceUtilisateur::creer()?), zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0) })
     }
 
-    /// Les tables de pages, sans leur verrou : qui a `&mut Memoire` (qui la
-    /// change, ou le chargeur qui la construit) les a seul.
+    /// Les tables de pages, sans leur verrou : qui a `&mut Memoire` (la
+    /// mémoire en écriture, ou le chargeur qui la construit) les a seul.
     pub fn tables(&mut self) -> &mut EspaceUtilisateur {
         self.espace.get_mut()
     }
 
-    /// Sert une faute de page à `adresse`, pour l'accès `acces`, en ne
-    /// faisant que lire la mémoire : la page est mise en place si une zone la permet
+    /// Sert une faute de page à `adresse`, pour l'accès `acces`, mémoire
+    /// tenue en lecture : la page est mise en place si une zone la permet
     /// (voir EspaceUtilisateur::servir), et l'instruction peut reprendre.
     /// Hors de toute zone : `SansZone`, sans étendre la pile (qui change la
-    /// carte : `etendre_pile`, d'abord, pour une faute du programme ou du
-    /// noyau ; jamais pour le futex ni MAP_POPULATE, comme le
-    /// `fixup_user_fault` de Linux).
+    /// carte : `etendre_pile`, en écriture ; processus::servir_faute choisit).
     ///
     /// Le contrôle des droits : une écriture demande le droit d'écrire, une
     /// exécution celui d'exécuter, une lecture un droit quelconque (x86 ne
     /// sait pas interdire la lecture d'une page présente).
     ///
-    /// Ce qui peut attendre ou prendre du temps se fait AVANT de prendre le
-    /// verrou des tables (comme Linux) : la page neuve d'une écriture, mise
-    /// à zéro ; la page du fichier, prise au tmpfs et tenue. Sous le verrou,
-    /// seulement poser l'entrée, si elle est encore vide : un autre fil a pu
-    /// fauter à la même page entre-temps, et sa page reste (la nôtre est
-    /// rendue).
+    /// Ce qui peut attendre ou prendre du temps se fait hors du verrou des
+    /// tables (comme Linux) : la page du fichier, prise au tmpfs et tenue ;
+    /// la page neuve d'une écriture, mise à zéro, seulement si l'entrée en
+    /// demande une. Sous le verrou, la décision est revérifiée (le
+    /// `pte_same` de Linux) : un autre fil a pu fauter à la même page
+    /// entre-temps (sa page reste, la nôtre est rendue), ou une troncature
+    /// retirer la page du fichier (on recommence par le fichier : SIGBUS
+    /// s'il est raccourci, jamais une page neuve à sa place).
     pub fn servir(&self, adresse: u64, acces: Acces) -> Result<(), Echec> {
         let page = adresse & !(PAGE - 1);
         let zone = *self.zones.trouver(page).ok_or(Echec::SansZone)?;
@@ -291,28 +292,48 @@ impl Memoire {
         if !permis {
             return Err(Echec::AccesInterdit);
         }
-        if self.poser_page_du_fichier(page, &zone)? && acces != Acces::Ecriture {
-            return Ok(());
-        }
-        let mut neuve = if acces == Acces::Ecriture {
-            Some(espace_utilisateur::cadre_neuf().ok_or(Echec::PlusDeMemoire)?)
-        } else {
-            None
+        let ecriture = acces == Acces::Ecriture;
+        let mut neuve = None;
+        let resultat = loop {
+            match self.poser_page_du_fichier(page, &zone) {
+                Ok(true) if !ecriture => break Ok(()),
+                Ok(_) => {}
+                Err(e) => break Err(e),
+            }
+            match self.espace.verrouiller().servir(page, zone.droits, ecriture, zone.fichier.is_some(), &mut neuve) {
+                Ok(Servi::Fait) => break Ok(()),
+                // L'entrée du fichier a disparu (raccourci pendant la
+                // faute) : on recommence par lui.
+                Ok(Servi::ARefaire) => {}
+                Ok(Servi::PageNeuve) => match espace_utilisateur::cadre_neuf() {
+                    Some(c) => neuve = Some(c),
+                    None => break Err(Echec::PlusDeMemoire),
+                },
+                Err(_) => break Err(Echec::PlusDeMemoire),
+            }
         };
-        let resultat = self.espace.verrouiller().servir(page, zone.droits, acces == Acces::Ecriture, &mut neuve);
         if let Some(c) = neuve {
             espace_utilisateur::rendre_cadre(c);
         }
-        resultat.map_err(|_| Echec::PlusDeMemoire)
+        resultat
     }
 
     /// Étend la pile jusqu'à la page de `adresse` (le `expand_stack` de
-    /// Linux), la carte changée : vrai si la page est maintenant dans une
-    /// zone (celle de la pile, ou une zone qui y était déjà). Sous la pile, à moins de PILE_MAX de son
+    /// Linux), mémoire tenue en écriture : vrai si la page est maintenant
+    /// dans la zone de la pile. Sous la pile, à moins de PILE_MAX de son
     /// sommet, et pas à moins de l'écart de garde d'une autre zone.
     pub fn etendre_pile(&mut self, adresse: u64) -> bool {
         let page = adresse & !(PAGE - 1);
         self.zones.trouver(page).is_some() || self.zones.etendre_pile(page, PILE_MAX, ECART_GARDE)
+    }
+
+    /// La zone qui suit `adresse` grandit-elle vers le bas (la pile) ? Une
+    /// faute hors de toute zone juste sous elle peut alors l'étendre : il
+    /// faut la mémoire en écriture (le test `VM_GROWSDOWN` de
+    /// `lock_mm_and_find_vma`, qui évite de la prendre pour une simple
+    /// faute hors des zones).
+    pub fn pile_au_dessus(&self, adresse: u64) -> bool {
+        self.zones.suivante(adresse).is_some_and(|z| z.drapeaux.vers_le_bas && z.debut > adresse)
     }
 
     /// Dans une zone de fichier dont la page n'est pas encore là : la page
@@ -375,7 +396,15 @@ impl Memoire {
                 Echec::PlusDeMemoire => Erreur::PlusDeMemoire,
                 _ => Erreur::NonProjetee,
             })?;
-            self.tables().servir(page, zone.droits, true, &mut None)?;
+            // Seul à tenir la mémoire : rien ne change entre deux essais.
+            let mut neuve = None;
+            loop {
+                match self.tables().servir(page, zone.droits, true, zone.fichier.is_some(), &mut neuve)? {
+                    Servi::Fait => break,
+                    Servi::PageNeuve => neuve = Some(espace_utilisateur::cadre_neuf().ok_or(Erreur::PlusDeMemoire)?),
+                    Servi::ARefaire => return Err(Erreur::NonProjetee),
+                }
+            }
             page += PAGE;
         }
         self.tables().ecrire(adresse, octets)
@@ -472,7 +501,11 @@ impl Memoire {
     /// Retire les pages de [debut, fin[ sans toucher aux zones
     /// (MADV_DONTNEED) : elles se reliront à zéro, ou depuis le fichier
     /// projeté (les segments du programme compris). Les tables restent, la
-    /// zone aussi.
+    /// zone aussi. En écriture, interruptions actives.
+    /// UNIPROCESSEUR : Linux le fait mémoire tenue en LECTURE (des fautes
+    /// d'autres fils peuvent continuer pendant ce temps), les tables sous
+    /// leur verrou, table par table (`zap_pte_range`) ; sur un seul
+    /// processeur, l'écriture ne fait attendre personne de plus. En 6j.
     pub fn oublier(&mut self, debut: u64, fin: u64) {
         let espace = self.espace.get_mut();
         for z in self.zones.morceaux(debut, fin) {
@@ -484,7 +517,7 @@ impl Memoire {
     pub fn zone_du_code(&self, adresse: u64) -> Option<ZoneDuCode> {
         let z = self.zones.trouver(adresse)?;
         // Le nom du fichier projeté, s'il y en a un (sous le verrou des
-        // fichiers, pris après celui du processus).
+        // fichiers, pris sous la mémoire du processus).
         let nom = z.fichier.map_or(self.nom, |p| vfs::avec_systeme(|s, _| s.ouverts.fichier(Fichier::de(p.fichier)).nom));
         Some(ZoneDuCode { nom, nature: z.nature, fichier: z.fichier.is_some(), debut: z.debut, taille: z.taille() })
     }

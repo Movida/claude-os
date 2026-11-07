@@ -624,6 +624,21 @@ pub fn tic() {
 /// file serait plus juste, à voir quand la boucle de Bun aura des sockets
 /// (6h). Rend vrai s'il a arrêté quelqu'un.
 pub fn detecter_interblocage() -> bool {
+    // D'abord, un programme qui attend la mémoire de son processus (6i) :
+    // celui qui la tient ne dort jamais en la tenant (processus.rs), il
+    // serait donc prêt. Plus rien de prêt et quelqu'un qui l'attend : le
+    // verrou est perdu (une erreur du noyau), et rien ne le rendra. On
+    // s'arrête en le disant, plutôt que de laisser le programme figé sans un
+    // mot (le `hung_task` de Linux, qui le dit au bout de 120 s).
+    let mut attend = None;
+    tache::pour_chaque(|t| {
+        if t.est_programme() && t.tient_sa_memoire() {
+            attend = Some(t.nom());
+        }
+    });
+    if let Some(nom) = attend {
+        panic!("interblocage : {} attend la memoire de son processus, et plus rien ne peut la rendre", nom);
+    }
     if MINUTERIES.verrouiller().iter().any(|(_, t)| t.est_programme() || t.est_webassembly()) || !ATTENTES_CALCUL.verrouiller().is_empty() {
         return false;
     }
