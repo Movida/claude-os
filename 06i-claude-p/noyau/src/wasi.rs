@@ -425,12 +425,7 @@ impl Wasi {
 impl Drop for Wasi {
     /// La fin du programme : ses descripteurs fermés.
     fn drop(&mut self) {
-        loop {
-            let Some(fd) = self.descripteurs.ouverts(0, u64::MAX).next() else { break };
-            if let Some(d) = self.descripteurs.retirer(fd) {
-                vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
-            }
-        }
+        self.descripteurs.fermer_tous();
         crate::reseau::socket::fermer_les_differees();
     }
 }

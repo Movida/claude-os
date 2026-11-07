@@ -428,13 +428,30 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
         None
     };
     let (mut environnement, mut arguments, mut dossiers, mut ecoutes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+    let mut entrees = Entrees(Vec::new());
     let place = ENVIRONNEMENT.len() + commande.affectations().count();
     if environnement.try_reserve_exact(place).is_err()
         || arguments.try_reserve_exact(commande.arguments().count()).is_err()
         || dossiers.try_reserve_exact(commande.dossiers().count()).is_err()
         || ecoutes.try_reserve_exact(commande.ecoutes().count()).is_err()
+        || entrees.0.try_reserve_exact(commande.redirections().count()).is_err()
     {
         return refus(&"plus de memoire");
+    }
+    // Les redirections d'abord, de gauche à droite, comme sh (avant même de
+    // chercher le programme) : chaque fichier ouvert en lecture, avec les
+    // droits du noyau (un init, un shell de root, ou systemd, qui ouvre
+    // StandardInput=file: avant de changer d'utilisateur : un programme
+    // peut ainsi recevoir un fichier qu'il ne pourrait pas ouvrir). Un
+    // fichier qui ne s'ouvre pas : la commande n'est pas lancée, et
+    // les lignes suivantes, si (« cannot open » de dash). Les fichiers
+    // ouverts sont lâchés en sortant (`Entrees`), le programme tenant les
+    // siens.
+    for (fd, chemin) in commande.redirections() {
+        match appels_fichiers::ouvrir_pour_le_noyau(chemin, true, false) {
+            Ok(f) => entrees.0.ajouter_dans_la_place((fd, f)),
+            Err(e) => return refus(&format_args!("{} : impossible a ouvrir (errno {})", Nom(chemin), e.errno())),
+        }
     }
     // Dans la place réservée juste au-dessus : plus rien n'échoue.
     for &v in ENVIRONNEMENT {
@@ -462,6 +479,7 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
         environnement: &environnement,
         dossiers: &dossiers,
         ecoutes: &ecoutes,
+        entrees: &entrees.0,
         fond: commande.arriere_plan(),
     };
     let t = executer(l, numero, n, &lancement);
@@ -471,6 +489,21 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
         vfs::avec(|fs, cadres| fs.lacher(n, cadres));
     }
     t
+}
+
+/// Les fichiers ouverts pour les redirections d'une ligne (`N< chemin`) :
+/// le descripteur, le fichier ouvert. Lâchés quand la ligne est lancée (ou
+/// refusée) : un programme lancé tient ceux qu'il a reçus.
+struct Entrees(Vec<(u8, crate::descripteurs::Fichier)>);
+
+impl Drop for Entrees {
+    fn drop(&mut self) {
+        vfs::avec_systeme(|s, cadres| {
+            for &(_, f) in &self.0 {
+                s.lacher(f, cadres);
+            }
+        });
+    }
 }
 
 /// Une copie de `octets` dans un bloc du tas, vide s'il n'y a pas la place
@@ -496,7 +529,11 @@ struct Lancement<'a> {
     /// Ses écoutes TCP pré-ouvertes (6h) : l'adresse, le port, et le mot
     /// `--tcplisten=` tel qu'écrit (pour les messages).
     ecoutes: &'a [([u8; 4], u16, &'a [u8])],
-    /// Lancé par `&` : son entrée standard est /dev/null, comme sous `sh`.
+    /// Ses redirections (6i), ouvertes, dans l'ordre de la ligne : le
+    /// descripteur, le fichier ouvert (que tient encore la ligne).
+    entrees: &'a [(u8, crate::descripteurs::Fichier)],
+    /// Lancé par `&` : son entrée standard est /dev/null, comme sous `sh`
+    /// (sauf redirection).
     fond: bool,
 }
 
@@ -515,6 +552,12 @@ fn executer(l: &mut Lanceur, numero: usize, n: Numero, lancement: &Lancement) ->
     let mut signature = [0u8; 4];
     let lus = vfs::lire(n, 0, &mut signature);
     match &signature[..lus] {
+        // WASI a ses propres descripteurs (les dossiers pré-ouverts, à
+        // partir de 3) : une redirection n'y a pas encore de sens.
+        [0, b'a', b's', b'm'] if !lancement.entrees.is_empty() => {
+            afficherln!("[noyau] {}, ligne {} : refusee : une redirection pour un programme WebAssembly", Nom(DEMARRAGE), numero);
+            None
+        }
         [0, b'a', b's', b'm'] => executer_wasm(l, nom, n, lancement),
         // Les dossiers pré-ouverts sont une affaire de WebAssembly : un
         // programme Linux voit tout l'arbre, avec ses droits. Les écoutes
@@ -721,8 +764,10 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         Err(e) => refus!("[noyau] {} : pile initiale impossible : {}", nom, e),
     };
     // Son processus : avec la console en 0, 1 et 2 (/dev/null en 0 s'il
-    // est lancé par `&`, comme sous sh), la racine pour dossier courant,
-    // l'umask de Linux, et l'identité de l'utilisateur 1000.
+    // est lancé par `&`, comme sous sh), puis ses redirections, la racine
+    // pour dossier courant, l'umask de Linux, et l'identité de l'utilisateur
+    // 1000. Un refus après l'ouverture de la console ferme ce que la table
+    // tient déjà (Descripteurs::drop).
     let mut descripteurs = Descripteurs::new();
     if let Err(e) = appels_fichiers::ouvrir_console(&mut descripteurs) {
         refus!("[noyau] {} : pas de console (errno {})", nom, e.errno());
@@ -730,6 +775,14 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     if lancement.fond {
         if let Err(e) = appels_fichiers::entree_sur_null(&mut descripteurs) {
             refus!("[noyau] {} : pas de /dev/null pour son entree (errno {})", nom, e.errno());
+        }
+    }
+    // Ses redirections, dans l'ordre : chacune remplace ce qu'avait déjà ce
+    // numéro (la console, /dev/null, une redirection précédente), sans
+    // FD_CLOEXEC, comme sous sh.
+    for &(fd, f) in lancement.entrees {
+        if let Err(e) = appels_fichiers::installer_pour_le_noyau(&mut descripteurs, fd as u64, f) {
+            refus!("[noyau] {} : pas de place pour son descripteur {} (errno {})", nom, fd, e.errno());
         }
     }
     // Plus personne ne peut écrire le fichier tant qu'il s'exécute

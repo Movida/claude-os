@@ -2215,6 +2215,26 @@ pub fn ouvrir_console(descripteurs: &mut crate::descripteurs::Descripteurs) -> R
     Ok(())
 }
 
+/// Installe le fichier ouvert `f` (tenu par l'appelant, qui le garde) au
+/// numéro `fd` de `descripteurs`, sans FD_CLOEXEC, à la place de ce qui y
+/// était : une redirection de /etc/demarrage (6i, programmes.rs).
+pub fn installer_pour_le_noyau(descripteurs: &mut crate::descripteurs::Descripteurs, fd: u64, f: Fichier)
+    -> Result<(), Erreur> {
+    vfs::avec_systeme(|s, _| s.ouverts.prendre(f));
+    match descripteurs.remplacer(fd, Descripteur { fichier: f, fermer_a_l_exec: false }) {
+        Ok(ancien) => {
+            if let Some(d) = ancien {
+                vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
+            }
+            Ok(())
+        }
+        Err(_) => {
+            vfs::avec_systeme(|s, cadres| s.lacher(f, cadres));
+            Err(Erreur::ENOMEM)
+        }
+    }
+}
+
 /// L'entrée standard d'un programme lancé par `&` : /dev/null, ouvert en
 /// lecture au numéro 0, à la place de la console (POSIX, pour un `sh` sans
 /// contrôle des tâches : « asynchronous lists »).

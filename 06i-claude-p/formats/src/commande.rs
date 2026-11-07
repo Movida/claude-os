@@ -53,7 +53,20 @@
 //!     arrière-plan », sans l'attendre, comme le fait `sh` ; rien d'autre
 //!     ne peut suivre (`a & b`, deux commandes, et `&&` sont refusés) ;
 //!   - et la commande interne `wait`, seule sur sa ligne, sans guillemets
-//!     ni arguments : elle attend toutes les commandes lancées par `&`.
+//!     ni arguments : elle attend toutes les commandes lancées par `&` ;
+//!   - depuis 6i, des redirections d'entrée, n'importe où dans la commande
+//!     (avant le programme comme après) : `< CHEMIN` donne le fichier pour
+//!     entrée standard (le descripteur 0), `N< CHEMIN` pour le descripteur
+//!     N. Comme pour `dash` : N est UN chiffre, collé au `<` et en tête de
+//!     son mot (`3<f` : le descripteur 3 ; `3 <f`, `a3<f`, `'3'<f`, `10<f` :
+//!     un argument, puis l'entrée standard) ; `<` finit un mot, comme `&` ;
+//!     le chemin suit, collé ou non, avec les mêmes guillemets qu'un mot,
+//!     mais jamais un commentaire. `<<`, `<>`, `<&`, `<|`, `<(` (d'autres
+//!     redirections de sh) et `>` sont refusés ; les fichiers s'ouvrent de
+//!     gauche à droite (`< a < b` : a, puis b), et une redirection laisse les
+//!     mots suivants en tête (`<f A=1 /bin/x` : A=1 est une affectation).
+//!     Pour `claude -p < /dev/null` (sinon il attend 3 s son entrée), et le
+//!     jeton de l'abonnement, donné par un descripteur (6i).
 //! Pas de `\` en fin de ligne, pas de variables, pas d'échappements : ce
 //! n'est pas un shell, seulement de quoi écrire une commande.
 //!
@@ -86,6 +99,9 @@ pub enum Erreur {
     ApresEsperluette,
     /// `wait` avec des arguments, des affectations ou `&`.
     Attendre,
+    /// Un `<` sans chemin après lui (la fin de la ligne, ou un
+    /// commentaire).
+    RedirectionSansChemin,
 }
 
 // Affichés par le noyau : sans accents.
@@ -102,6 +118,7 @@ impl fmt::Display for Erreur {
             Erreur::TamponTropPetit => f.write_str("ligne trop longue"),
             Erreur::ApresEsperluette => f.write_str("rien ne peut suivre &"),
             Erreur::Attendre => f.write_str("wait s'emploie seul"),
+            Erreur::RedirectionSansChemin => f.write_str("< sans chemin"),
         }
     }
 }
@@ -134,6 +151,9 @@ pub enum Genre {
     Ecoute,
     /// Le programme, ou l'un de ses arguments.
     Argument,
+    /// `N< CHEMIN` : le premier octet du mot est le numéro du descripteur,
+    /// en chiffre ASCII (« 0 » à « 9 »), les suivants le chemin.
+    Redirection,
 }
 
 /// Ce que dit une ligne qui n'est pas vide.
@@ -167,6 +187,7 @@ impl<'t> Commande<'t> {
                 b'a' => Genre::Affectation,
                 b'd' => Genre::Dossier,
                 b'e' => Genre::Ecoute,
+                b'r' => Genre::Redirection,
                 _ => Genre::Argument,
             };
             Some((genre, mot))
@@ -188,6 +209,12 @@ impl<'t> Commande<'t> {
     /// messages.
     pub fn ecoutes(&self) -> impl Iterator<Item = ([u8; 4], u16, &'t [u8])> + 't {
         self.mots().filter(|(g, _)| *g == Genre::Ecoute).filter_map(|(_, m)| adresse_et_port(m).map(|(a, p)| (a, p, m)))
+    }
+
+    /// Les redirections, dans l'ordre de la ligne (celui où les ouvrir) :
+    /// le descripteur, et le chemin.
+    pub fn redirections(&self) -> impl Iterator<Item = (u8, &'t [u8])> + 't {
+        self.mots().filter(|(g, _)| *g == Genre::Redirection).filter_map(|(_, m)| m.split_first().map(|(&n, c)| (n - b'0', c)))
     }
 
     /// Le programme puis ses arguments : argv.
@@ -250,6 +277,46 @@ fn est_affectation(brut: &[u8]) -> bool {
         && nom.iter().all(|&o| o.is_ascii_alphanumeric() || o == b'_')
 }
 
+/// Lit un mot brut de `ligne` à partir de `i`, jusqu'au prochain blanc hors
+/// des guillemets, ou un `&` ou un `<` (des opérateurs pour sh, même collés
+/// au mot) ; l'écrit, guillemets retirés, dans `tampon` à partir de
+/// `ecrit`. `i` et `ecrit` avancent d'autant.
+fn lire_mot(ligne: &[u8], i: &mut usize, tampon: &mut [u8], ecrit: &mut usize) -> Result<(), Erreur> {
+    while *i < ligne.len() && ligne[*i] != b' ' && ligne[*i] != b'\t' && ligne[*i] != b'&' && ligne[*i] != b'<' {
+        match ligne[*i] {
+            b'\'' => {
+                let fin = ligne[*i + 1..].iter().position(|&o| o == b'\'').ok_or(Erreur::GuillemetNonFerme)?;
+                for &o in &ligne[*i + 1..*i + 1 + fin] {
+                    if o == 0 || o == b'\n' {
+                        return Err(Erreur::Caractere(o));
+                    }
+                    tampon[*ecrit] = o;
+                    *ecrit += 1;
+                }
+                *i += fin + 2;
+            }
+            b'"' => {
+                let fin = ligne[*i + 1..].iter().position(|&o| o == b'"').ok_or(Erreur::GuillemetNonFerme)?;
+                for &o in &ligne[*i + 1..*i + 1 + fin] {
+                    if o == b'$' || o == b'`' || o == b'\\' || o == 0 || o == b'\n' {
+                        return Err(Erreur::Caractere(o));
+                    }
+                    tampon[*ecrit] = o;
+                    *ecrit += 1;
+                }
+                *i += fin + 2;
+            }
+            o if ordinaire(o) => {
+                tampon[*ecrit] = o;
+                *ecrit += 1;
+                *i += 1;
+            }
+            o => return Err(Erreur::Caractere(o)),
+        }
+    }
+    Ok(())
+}
+
 /// Découpe `ligne` en mots, dans `tampon` (au moins `taille_tampon(ligne)`
 /// octets). Rend `None` pour une ligne sans commande (vide, ou seulement
 /// un commentaire).
@@ -292,43 +359,50 @@ pub fn decouper<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<Option<Ligne<'
             i += 1;
             continue;
         }
+        // Une redirection : `<`, ou un chiffre seul collé à `<` en tête d'un
+        // mot (le IO_NUMBER de la grammaire de sh).
+        let numero = match (ligne[i], ligne.get(i + 1)) {
+            (b'<', _) => Some(0),
+            (n @ b'0'..=b'9', Some(b'<')) => {
+                i += 1;
+                Some(n - b'0')
+            }
+            _ => None,
+        };
+        if let Some(n) = numero {
+            i += 1; // Le `<`.
+            // Les autres redirections de sh, qu'on n'a pas.
+            if let Some(&o @ (b'<' | b'>' | b'&' | b'|' | b'(')) = ligne.get(i) {
+                return Err(Erreur::Caractere(o));
+            }
+            while i < ligne.len() && (ligne[i] == b' ' || ligne[i] == b'\t') {
+                i += 1;
+            }
+            // Pas de chemin : la fin, un commentaire, `&`, ou une autre
+            // redirection (`<`, ou un chiffre collé à `<` : pour sh, un
+            // numéro de descripteur, pas un mot ; dash dit « redirection
+            // unexpected »).
+            let redirection = ligne.get(i) == Some(&b'<')
+                || (ligne.get(i).is_some_and(u8::is_ascii_digit) && ligne.get(i + 1) == Some(&b'<'));
+            if i == ligne.len() || ligne[i] == b'#' || ligne[i] == b'&' || redirection {
+                return Err(Erreur::RedirectionSansChemin);
+            }
+            // Le numéro en chiffre ASCII : un mot ne contient jamais d'octet
+            // nul (il les sépare).
+            tampon[ecrit] = b'r';
+            tampon[ecrit + 1] = b'0' + n;
+            ecrit += 2;
+            lire_mot(ligne, &mut i, tampon, &mut ecrit)?;
+            tampon[ecrit] = 0;
+            ecrit += 1;
+            continue;
+        }
         // Un mot brut : jusqu'au prochain blanc hors des guillemets, ou un
-        // `&` (un opérateur pour sh, même collé au mot).
+        // `&` ou un `<` (des opérateurs pour sh, même collés au mot).
         let debut = i;
         let place = ecrit;
         ecrit += 1; // Le genre, écrit à la fin.
-        while i < ligne.len() && ligne[i] != b' ' && ligne[i] != b'\t' && ligne[i] != b'&' {
-            match ligne[i] {
-                b'\'' => {
-                    let fin = ligne[i + 1..].iter().position(|&o| o == b'\'').ok_or(Erreur::GuillemetNonFerme)?;
-                    for &o in &ligne[i + 1..i + 1 + fin] {
-                        if o == 0 || o == b'\n' {
-                            return Err(Erreur::Caractere(o));
-                        }
-                        tampon[ecrit] = o;
-                        ecrit += 1;
-                    }
-                    i += fin + 2;
-                }
-                b'"' => {
-                    let fin = ligne[i + 1..].iter().position(|&o| o == b'"').ok_or(Erreur::GuillemetNonFerme)?;
-                    for &o in &ligne[i + 1..i + 1 + fin] {
-                        if o == b'$' || o == b'`' || o == b'\\' || o == 0 || o == b'\n' {
-                            return Err(Erreur::Caractere(o));
-                        }
-                        tampon[ecrit] = o;
-                        ecrit += 1;
-                    }
-                    i += fin + 2;
-                }
-                o if ordinaire(o) => {
-                    tampon[ecrit] = o;
-                    ecrit += 1;
-                    i += 1;
-                }
-                o => return Err(Erreur::Caractere(o)),
-            }
-        }
+        lire_mot(ligne, &mut i, tampon, &mut ecrit)?;
         let brut = &ligne[debut..i];
         let genre = if en_tete && est_affectation(brut) {
             b'a'
@@ -450,7 +524,7 @@ mod tests {
 
     #[test]
     fn caracteres_speciaux_refuses() {
-        for c in ["$", "*", "?", ";", "|", "<", ">", "(", ")", "`", "\\", "~", "[", "]", "{", "}", "!", "^"] {
+        for c in ["$", "*", "?", ";", "|", ">", "(", ")", "`", "\\", "~", "[", "]", "{", "}", "!", "^"] {
             assert_eq!(decoupe(&std::format!("/bin/x a{c}b")), Err(Erreur::Caractere(c.as_bytes()[0])), "{c}");
         }
         // Un octet de contrôle, même entre guillemets.
@@ -516,6 +590,106 @@ mod tests {
         assert_eq!(adresse_et_port(b"10.0.2.15:0"), Some(([10, 0, 2, 15], 0)));
     }
 
+    /// Les redirections d'une ligne : (descripteur, chemin), et ses arguments.
+    fn redir(ligne: &str) -> Result<(Vec<(u8, std::string::String)>, Vec<std::string::String>, Vec<std::string::String>), Erreur> {
+        let mut tampon = std::vec![0u8; taille_tampon(ligne.as_bytes())];
+        let texte = |m: &[u8]| std::string::String::from_utf8(m.to_vec()).unwrap();
+        match decouper(ligne.as_bytes(), &mut tampon)? {
+            Some(Ligne::Commande(c)) => Ok((c.redirections().map(|(n, m)| (n, texte(m))).collect(),
+                                           c.affectations().map(texte).collect(), c.arguments().map(texte).collect())),
+            _ => panic!("{ligne} : pas une commande"),
+        }
+    }
+
+    /// Les redirections, d'après `dash` (la relecture du plan de 6i les y a
+    /// mesurées) : un seul chiffre collé au `<` et en tête de son mot fait
+    /// un numéro ; tout autre mot collé reste un argument.
+    #[test]
+    fn redirections() {
+        let r = |v: &[(u8, &str)]| v.iter().map(|&(n, c)| (n, c.into())).collect::<Vec<_>>();
+        let a = |v: &[&str]| v.iter().map(|&m| m.into()).collect::<Vec<std::string::String>>();
+        assert_eq!(redir("/bin/x 3<f").unwrap(), (r(&[(3, "f")]), a(&[]), a(&["/bin/x"])));
+        assert_eq!(redir("/bin/x 3 <f").unwrap(), (r(&[(0, "f")]), a(&[]), a(&["/bin/x", "3"])));
+        assert_eq!(redir("/bin/x a3<f").unwrap(), (r(&[(0, "f")]), a(&[]), a(&["/bin/x", "a3"])));
+        assert_eq!(redir("/bin/x '3'<f").unwrap(), (r(&[(0, "f")]), a(&[]), a(&["/bin/x", "3"])));
+        assert_eq!(redir("/bin/x 10<f").unwrap(), (r(&[(0, "f")]), a(&[]), a(&["/bin/x", "10"])));
+        assert_eq!(redir("/bin/x 03<f").unwrap(), (r(&[(0, "f")]), a(&[]), a(&["/bin/x", "03"])));
+        // Collé ou non au chemin, guillemets compris ; dans l'ordre de la
+        // ligne ; avant le programme, les mots suivants restent en tête.
+        assert_eq!(redir("/bin/x < 'a b' 3<\"c\" d").unwrap(), (r(&[(0, "a b"), (3, "c")]), a(&[]), a(&["/bin/x", "d"])));
+        assert_eq!(redir("<f A=1 B=2 /bin/x").unwrap(), (r(&[(0, "f")]), a(&["A=1", "B=2"]), a(&["/bin/x"])));
+        assert_eq!(redir("/bin/x<f").unwrap(), (r(&[(0, "f")]), a(&[]), a(&["/bin/x"])));
+        assert_eq!(redir("/bin/x < a < b").unwrap(), (r(&[(0, "a"), (0, "b")]), a(&[]), a(&["/bin/x"])));
+        // Avec `&` : l'entrée donnée remplace celle de l'arrière-plan.
+        assert!(fond("/bin/x <f&") && fond("/bin/x < f &"));
+        assert_eq!(redir("/bin/x <f&").unwrap().0, r(&[(0, "f")]));
+        // Un chemin vide est permis (sh dira qu'il ne peut pas l'ouvrir).
+        assert_eq!(redir("/bin/x < ''").unwrap().0, r(&[(0, "")]));
+        // Sans chemin ; les autres redirections de sh.
+        for ligne in ["/bin/x <", "/bin/x < #x", "/bin/x 3<", "/bin/x < &", "<"] {
+            assert_eq!(decoupe(ligne), Err(Erreur::RedirectionSansChemin), "{ligne}");
+        }
+        // Une redirection là où sh attend le chemin : refusée, et par dash
+        // aussi (« redirection unexpected »).
+        for ligne in ["/bin/x < 3<g", "/bin/x <3<g", "/bin/x 3<4<g", "/bin/x < <g", "/bin/x 3< <g"] {
+            assert_eq!(decoupe(ligne), Err(Erreur::RedirectionSansChemin), "{ligne}");
+            let sortie = std::process::Command::new("sh").arg("-n").arg("-c").arg(ligne).output().unwrap();
+            assert!(!sortie.status.success(), "sh accepte {ligne}");
+        }
+        for (ligne, c) in [("/bin/x <<f", b'<'), ("/bin/x <>f", b'>'), ("/bin/x <&3", b'&'), ("/bin/x <|f", b'|'),
+                           ("/bin/x <(f)", b'('), ("/bin/x >f", b'>'), ("/bin/x 2>f", b'>')] {
+            assert_eq!(decoupe(ligne), Err(Erreur::Caractere(c)), "{ligne}");
+        }
+        // Des redirections sans programme.
+        assert_eq!(decoupe("<f"), Err(Erreur::SansProgramme));
+        assert_eq!(decoupe("A=1 3<f"), Err(Erreur::SansProgramme));
+    }
+
+    /// Ce que nous ouvrons, `sh` l'ouvre aussi : pour chaque ligne, sh lance
+    /// `readlink` à la place du programme, qui dit ce que désigne chacun de
+    /// ses descripteurs 0 à 9 ; on compare aux redirections découpées.
+    #[test]
+    fn redirections_comme_sh() {
+        let dossier = std::env::temp_dir().join(std::format!("commande-{}", std::process::id()));
+        std::fs::create_dir_all(&dossier).unwrap();
+        for nom in ["a", "b", "c d"] {
+            std::fs::write(dossier.join(nom), nom).unwrap();
+        }
+        let d = dossier.to_str().unwrap();
+        let lignes = [
+            std::format!("/bin/x < {d}/a"),
+            std::format!("/bin/x 3<{d}/a un < '{d}/c d'"),
+            std::format!("<{d}/b A=1 /bin/x 7<{d}/a"),
+            std::format!("/bin/x 5<{d}/a 5<{d}/b"),
+            std::format!("/bin/x 3 <{d}/b"),
+        ];
+        for ligne in &lignes {
+            let (redirections, _, _) = redir(ligne).unwrap();
+            // Le programme et ses arguments remplacés par readlink, les
+            // redirections et les affectations gardées : on retire les mots
+            // qui ne sont ni l'un ni l'autre.
+            let mut attendu: std::collections::BTreeMap<u8, std::string::String> = std::collections::BTreeMap::new();
+            for (n, c) in &redirections {
+                attendu.insert(*n, std::fs::canonicalize(c).unwrap().to_str().unwrap().into());
+            }
+            let script = std::format!(
+                "{} /usr/bin/env sh -c 'for n in 0 1 2 3 4 5 6 7 8 9; do printf \"%s %s\\n\" $n \"$(readlink /proc/$$/fd/$n)\"; done'",
+                ligne.replace("/bin/x", "").replace(" un ", " ").replace(" 3 <", " <"));
+            let sortie = std::process::Command::new("sh").arg("-c").arg(&script).output().unwrap();
+            let texte = std::string::String::from_utf8(sortie.stdout).unwrap();
+            for l in texte.lines() {
+                let (n, cible) = l.split_once(' ').unwrap();
+                let n: u8 = n.parse().unwrap();
+                if let Some(c) = attendu.get(&n) {
+                    assert_eq!(cible, c, "{ligne} : descripteur {n}");
+                } else if n >= 3 {
+                    assert!(cible.is_empty() || !cible.starts_with(d), "{ligne} : descripteur {n} ouvert par sh : {cible}");
+                }
+            }
+        }
+        std::fs::remove_dir_all(&dossier).unwrap();
+    }
+
     /// Le programme par son chemin absolu : ni un chemin relatif, ni un mot
     /// que sh comprendrait autrement (un mot réservé, une commande interne),
     /// même entre guillemets.
@@ -556,7 +730,7 @@ mod tests {
     fn messages_sans_accents() {
         for e in [Erreur::GuillemetNonFerme, Erreur::Caractere(b'$'), Erreur::Caractere(1), Erreur::DossierVide, Erreur::Ecoute,
                   Erreur::SansProgramme, Erreur::CheminRelatif, Erreur::TamponTropPetit, Erreur::ApresEsperluette,
-                  Erreur::Attendre] {
+                  Erreur::Attendre, Erreur::RedirectionSansChemin] {
             assert!(std::format!("{e}").is_ascii());
         }
     }

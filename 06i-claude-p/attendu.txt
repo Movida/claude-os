@@ -56,8 +56,8 @@ rendues et recollees : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 57, liens symboliques 6, liens physiques 4 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 58 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 59, liens symboliques 6, liens physiques 4 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 59 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -183,6 +183,8 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] troncature : premiere lecture pendant ftruncate, aucune page relue au-dela de la fin : ok
 [linux] troncature : copie a l'ecriture pendant ftruncate, aucune page relue au-dela de la fin : ok
 [noyau] troncature : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] redirections : 0 et 3 sont les fichiers donnes, en lecture, sans FD_CLOEXEC ; /proc/self/fd/3 d'un fichier sans droits : EACCES, le descripteur reste lisible : ok
+[noyau] redirections : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] reseau : toutes les verifications : ok
 [noyau] reseau : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] dns : toutes les verifications : ok

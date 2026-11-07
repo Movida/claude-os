@@ -83,6 +83,9 @@ wait
 /bin/fautes-fin-3 fin
 /bin/troncature lecture
 /bin/troncature copie
+# Les redirections (6i) : le lanceur ouvre les fichiers, avec les droits du
+# noyau, et les donne au programme sous ces numéros.
+/bin/redirections /etc/bonjour.txt /tmp/redirige < /etc/bonjour.txt 3< /tmp/redirige
 # Les sockets UDP et ICMP (6g), sur lo ; et le DNS de la glibc, par un
 # serveur du programme.
 /bin/reseau

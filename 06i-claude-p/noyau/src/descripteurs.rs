@@ -370,9 +370,30 @@ pub struct Descripteurs {
     plus_haut: u64,
 }
 
+impl Drop for Descripteurs {
+    /// Une table jetée avec ses fichiers (un lancement refusé après l'avoir
+    /// remplie : programmes.rs) les ferme. Une table vide (la fin ordinaire
+    /// d'un processus, qui ferme les siens d'abord : Processus::drop) ne
+    /// prend aucun verrou.
+    fn drop(&mut self) {
+        self.fermer_tous();
+    }
+}
+
 impl Descripteurs {
     pub fn new() -> Descripteurs {
         Descripteurs { cases: Vec::new(), limite: LIMITE_DESCRIPTEURS, plus_haut: 0 }
+    }
+
+    /// Ferme tous les descripteurs : chaque fichier est tenu une fois de
+    /// moins. Jamais sous le verrou des fichiers (on le prend).
+    pub fn fermer_tous(&mut self) {
+        loop {
+            let Some(fd) = self.ouverts(0, u64::MAX).next() else { break };
+            if let Some(d) = self.retirer(fd) {
+                crate::vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
+            }
+        }
     }
 
     /// La case `fd` (libre au-delà de la fin de la table). Linux ne regarde

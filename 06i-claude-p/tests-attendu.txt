@@ -158,6 +158,9 @@
 [noyau] /etc/demarrage, ligne 9 : refusee : --tcplisten= pour un programme Linux
 [noyau] /etc/demarrage, ligne 10 : refusee : --tcplisten= attend ADRESSE:PORT (IPv4, en chiffres)
 [noyau] lecteur.wasm : --tcplisten=127.0.0.1:8080 impossible (errno 98)
+[noyau] /etc/demarrage, ligne 12 : refusee : /absent : impossible a ouvrir (errno 2)
+[noyau] /etc/demarrage, ligne 13 : refusee : une redirection pour un programme WebAssembly
+[noyau] /etc/demarrage, ligne 14 : refusee : caractere special '<' hors des guillemets
 [noyau] interp-absent : interpreteur /lib/absent : introuvable (errno 2)
 [noyau] interp-dossier : interpreteur /tmp : pas le droit de l'executer (errno 13)
 [noyau] interp-non-exec : interpreteur /etc/demarrage : pas le droit de l'executer (errno 13)
