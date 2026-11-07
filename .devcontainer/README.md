@@ -7,7 +7,7 @@ Le conteneur a pour processus principal un superviseur (`remote-control.sh`, cop
 - **Voir ce qui se passe :** `tail -f ~/.claude/remote-control.log`. Le journal ne garde que ce qui change : quelques dizaines de lignes par jour. Il note aussi les gels (veille de Windows, mémoire saturée) et les processus tués par le plafond de mémoire.
 - **Relancer le serveur :** `kill <pid>`, avec le pid donné par `pgrep -f '^claude remote-control'`. Le superviseur le relance, et le serveur réveille les sessions de fils qu'il avait notées en s'arrêtant.
 - **L'arrêter un moment** (pour le lancer à la main dans un terminal, par exemple) : `touch ~/.claude/remote-control.pause`. Il repart après `rm ~/.claude/remote-control.pause`.
-- **Arrêter le conteneur :** il survit à la fermeture de VS Code, c'est voulu. Depuis WSL : `docker stop <conteneur>`, avec le nom donné par `docker ps`.
+- **Arrêter le conteneur :** il survit à la fermeture de VS Code, c'est voulu. Depuis WSL : `~/claude-os/.devcontainer/arreter-conteneur.sh` (`docker stop`, puis `sync`) ; pour éteindre le PC, le raccourci « Eteindre claude-os » (plus bas).
 - **Après un redémarrage du conteneur :** recharger les fenêtres VS Code restées ouvertes (« Developer: Reload Window »). Sinon, chacune essaie de se reconnecter toutes les 30 s pendant 3 heures, sans y arriver, et lance à chaque essai un serveur de connexion. Le superviseur arrête ceux qui sont en trop et le note au journal (`serveurs de connexion en trop`), mais la fenêtre reste morte tant qu'on ne la recharge pas.
 - **Modifier le superviseur :** il est dans l'image, donc il faut reconstruire le conteneur (voir plus bas). Tester d'abord avec `.devcontainer/test-remote-control.sh`, qui utilise un faux serveur et peut tourner à côté du vrai.
 - **Après un arrêt brutal** (Windows éteint ou redémarré sans arrêter le conteneur, coupure de courant) : le serveur n'a pas pu noter ses sessions, et `bridge-pointer.json`, qui garde son environnement, est resté à sa dernière heure. Le serveur jette ce fichier quand il a plus de 4 heures, et en inscrivait alors un nouveau : les fils perdaient leur machine pour de bon. Le superviseur remet sa date à l'heure avant chaque lancement, et le journal le dit (`pointeur vieux de N h, remis a l'heure`) ; l'adresse que donne ensuite le serveur (`environment=env_…`) doit garder le même identifiant. S'il écrit `Could not reuse the previous environment`, le service a refusé l'ancien : les fils de la veille sont à relancer.
@@ -44,7 +44,19 @@ powercfg /setactive SCHEME_CURRENT
 
 La batterie garde ses réglages. Pour revenir à 30 minutes : `powercfg /change standby-timeout-ac 30`. Vérifier ce qui a réveillé ou endormi le PC : `powercfg /lastwake` et `powercfg /requests`.
 
-**Tout redémarrer à l'ouverture de session**, après un redémarrage de Windows :
+**Éteindre le PC par le raccourci « Eteindre claude-os »**, pas par le menu Démarrer. Éteindre Windows arrête la machine WSL sans attendre le conteneur : le 6 novembre, le serveur n'a pas pu noter ses sessions, et rien n'est resté au journal. Le raccourci lance `arreter-conteneur.sh --eteindre` : `docker stop` (45 s au plus), `sync`, puis l'extinction. En cas d'échec, il l'affiche et attend Entrée avant d'éteindre quand même. Pour le créer sur le bureau, dans PowerShell (ajouter `-d <distribution>` au début de `Arguments` si le dépôt n'est pas dans la distribution WSL par défaut) :
+
+```powershell
+$raccourci = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Desktop'))\Eteindre claude-os.lnk")
+$raccourci.TargetPath = "$env:WINDIR\System32\wsl.exe"
+$raccourci.Arguments = '-e bash -lc "~/claude-os/.devcontainer/arreter-conteneur.sh --eteindre"'
+$raccourci.IconLocation = "$env:WINDIR\System32\shell32.dll,27"
+$raccourci.Save()
+```
+
+Un clic droit sur le raccourci l'épingle au menu Démarrer. `--redemarrer` au lieu de `--eteindre` redémarre le PC. Pour l'essayer sans rien éteindre, dans WSL : `~/claude-os/.devcontainer/arreter-conteneur.sh`, qui doit dire `conteneur arrete proprement`, puis `~/claude-os/.devcontainer/demarrer-conteneur.sh` pour le relancer. Une mise à jour qui redémarre le PC d'elle-même ne passe pas par le raccourci : le serveur garde alors son environnement, mais une session en cours ne repart qu'au prochain message de son fil.
+
+**Tout redémarrer à l'ouverture de session**, après un redémarrage de Windows. Indispensable avec le raccourci : après un arrêt propre, Docker ne relance pas le conteneur (`--restart=on-failure` ne relance que les échecs).
 
 1. Docker Desktop, Settings, General : cocher « Start Docker Desktop when you sign in to your computer ».
 2. Créer la tâche, dans un PowerShell en administrateur (ajouter `-d <distribution>` au début de `-Argument` si le dépôt n'est pas dans la distribution WSL par défaut) :

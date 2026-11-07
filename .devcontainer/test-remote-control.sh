@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Teste le superviseur (remote-control.sh) avec un faux serveur, dans un dossier
+# Teste le superviseur (remote-control.sh) avec un faux serveur, et l'arrêt d'avant
+# l'extinction de Windows (arreter-conteneur.sh) avec de faux docker et shutdown.exe, dans un dossier
 # temporaire : ni le vrai serveur, ni le vrai journal, ni la configuration git ne
 # sont touchés, et il peut tourner à côté d'un serveur en service. Les processus
 # sont arrêtés par leur pid, jamais par leur nom (un pkill tuerait le vrai).
@@ -360,6 +361,61 @@ attendre "un pointeur d'une heure est aussi remis a l'heure" age_au_lancement 2
 verifier "sans le dire au journal" compte_au_journal "pointeur vieux de" 1
 kill -TERM "$s"
 attendre "le superviseur sort" mort "$s"
+
+echo "== l'arret avant d'eteindre Windows (arreter-conteneur.sh)"
+# De faux docker, shutdown.exe et sync, qui notent leurs arguments. L'état du faux
+# Docker : absent (il ne répond pas), arrete (pas de conteneur en marche), propre (le
+# superviseur sort avec 0) ou tue (Docker l'a tué au bout du délai : 137).
+AC="$T/ac"
+mkdir -p "$AC"
+cat >"$AC/docker" <<'FIN'
+#!/usr/bin/env bash
+echo "$*" >>"$AC_DIR/appels-docker"
+etat=$(cat "$AC_DIR/etat")
+case $1 in
+    info) [ "$etat" != absent ] ;;
+    ps) [ "$etat" = propre ] || [ "$etat" = tue ] && echo c0ffee ;;
+    stop) echo "$2" ;;
+    inspect) if [ "$etat" = tue ]; then echo 137; else echo 0; fi ;;
+esac
+FIN
+printf '#!/usr/bin/env bash\necho "$*" >>"$AC_DIR/appels-shutdown"\n' >"$AC/shutdown"
+printf '#!/usr/bin/env bash\necho sync >>"$AC_DIR/appels-sync"\n' >"$AC/sync"
+chmod +x "$AC/docker" "$AC/shutdown" "$AC/sync"
+arreter() {
+    echo "$1" >"$AC/etat"
+    shift
+    rm -f "$AC"/appels-*
+    AC_DIR="$AC" AC_DOCKER="$AC/docker" AC_SHUTDOWN="$AC/shutdown" AC_SYNC="$AC/sync" \
+        bash "$ICI/arreter-conteneur.sh" "$@" >"$AC/sortie" 2>&1 </dev/null
+    code=$?
+}
+appel() { grep -qx -- "$2" "$AC/appels-$1" 2>/dev/null; }
+sans_appel() { [ ! -e "$AC/appels-$1" ]; }
+
+arreter propre --redemarrer
+verifier "il vise le conteneur du depot, par son label" \
+    appel docker "ps -q --filter label=devcontainer.local_folder=$(cd "$ICI/.." && pwd)"
+verifier "il l'arrete par docker stop" appel docker "stop c0ffee"
+verifier "puis sync" appel sync sync
+verifier "puis redemarre Windows" appel shutdown "/r /t 0"
+verifier "et le dit" grep -q "arrete proprement" "$AC/sortie"
+arreter propre
+verifier "sans option, il n'eteint pas Windows" sans_appel shutdown
+verifier "et sort avec 0" test "$code" -eq 0
+arreter tue --eteindre
+verifier "tue au bout du delai : il le dit, avec le code" grep -q "code 137" "$AC/sortie"
+verifier "et eteint quand meme Windows" appel shutdown "/s /t 0"
+arreter tue
+verifier "sans option, il sort en echec" test "$code" -eq 1
+arreter arrete --eteindre
+verifier "pas de conteneur en marche : pas de docker stop" sh -c "! grep -q '^stop' '$AC/appels-docker'"
+verifier "mais sync et l'extinction" sh -c "[ -e '$AC/appels-sync' ] && grep -qx '/s /t 0' '$AC/appels-shutdown'"
+arreter absent --eteindre
+verifier "Docker absent : il le dit" grep -q "Docker ne repond pas" "$AC/sortie"
+verifier "et eteint quand meme Windows" appel shutdown "/s /t 0"
+arreter propre --nimporte
+verifier "une option inconnue : code 2, rien d'arrete" sh -c "[ $code -eq 2 ] && [ ! -e '$AC/appels-docker' ]"
 
 if [ "$echecs" -eq 0 ]; then
     echo "tout est bon"
