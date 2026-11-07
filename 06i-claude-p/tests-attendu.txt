@@ -164,6 +164,10 @@
 [noyau] /etc/demarrage, ligne 15 : cd /absent impossible (errno 2)
 [noyau] /etc/demarrage, ligne 16 : cd /etc/demarrage impossible (errno 20)
 [noyau] /etc/demarrage, ligne 17 : refusee : cd s'emploie seul, avec un chemin absolu
+[noyau] /etc/demarrage, lignes 18 a 19 : groupe refuse : vide
+[noyau] /etc/demarrage, lignes 20 a 23 : groupe refuse : ligne 22 : guillemet non ferme
+[noyau] /etc/demarrage, lignes 24 a 27 : groupe refuse : un programme lance par & sans wait avant }
+[noyau] /etc/demarrage, ligne 28 : refusee : } sans {
 [noyau] interp-absent : interpreteur /lib/absent : introuvable (errno 2)
 [noyau] interp-dossier : interpreteur /tmp : pas le droit de l'executer (errno 13)
 [noyau] interp-non-exec : interpreteur /etc/demarrage : pas le droit de l'executer (errno 13)

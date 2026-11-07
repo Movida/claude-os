@@ -254,6 +254,10 @@ boot.bin: programmes.cpio FORCE
 #     descripteurs 0 et 3 sont ces fichiers, et /proc/self/fd/3 d'un
 #     fichier sans droits rend EACCES, le descripteur restant lisible ; sur
 #     l'hôte aussi ;
+#   - effacer : gcc -static, efface comme `rm -rf` (6i), ou seulement le
+#     contenu d'un dossier, ou en crée un pour l'essayer : ce qu'un groupe
+#     de /etc/demarrage a laissé, pour qu'il rende toute sa mémoire ; sur
+#     l'hôte aussi ;
 #   - dossier : gcc -static, son dossier courant, PWD et OLDPWD, après un
 #     `cd` de /etc/demarrage (6i) ; sur l'hôte, la même suite de `cd`,
 #     jouée par dash (/bin/sh), sans environnement, doit donner ce que
@@ -422,6 +426,10 @@ $(LINUX)/redirections: linux/redirections.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/dossier: linux/dossier.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/effacer: linux/effacer.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -778,7 +786,10 @@ tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_L
 # n'est pas lancé ; 12 : une redirection d'un fichier absent ; 13 : une
 # redirection pour un programme WebAssembly ; 14 : `<<`, une autre
 # redirection de sh, refusée ; 15 : cd vers un dossier absent ; 16 : cd
-# vers un fichier ; 17 : cd par un chemin relatif) ; puis chaque programme de TESTS_LINUX et de
+# vers un fichier ; 17 : cd par un chemin relatif ; 18-19 : un groupe vide ;
+# 20-23 : un groupe dont une ligne est refusée, refusé en entier ; 24-27 : un
+# programme lancé par & sans wait dans un groupe ; 28 : } seul) ; puis chaque
+# programme de TESTS_LINUX et de
 # TESTS_INTERP, ceux de TESTS_PARALLELES par deux, un fil qui fait une
 # faute (fils faute : tout le groupe meurt), les courses entre fils et les
 # gestionnaires de signaux (sous qemu64 et max, en plus de Nehalem au
@@ -804,6 +815,10 @@ tests-demarrage.txt: Makefile
 	  echo "cd /absent"; \
 	  echo "cd /etc/demarrage"; \
 	  echo "cd tmp"; \
+	  echo "{"; echo "}"; \
+	  echo "{"; echo "/bin/lecteur.wasm groupe-refuse"; echo "/bin/bonjour-asm \"pas ferme"; echo "}"; \
+	  echo "{"; echo "/bin/lecteur.wasm groupe-refuse &"; echo "/bin/lecteur.wasm groupe-refuse"; echo "}"; \
+	  echo "}"; \
 	  for p in $(TESTS_LINUX) $(TESTS_INTERP); do echo "/bin/$$p"; done; \
 	  echo "/bin/lignes a 200 &"; \
 	  echo "/bin/lignes b 200 &"; \
@@ -860,7 +875,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -933,9 +948,10 @@ texte: boot.bin
 # réponse, 3 s ; le keepalive, 2,5 s ; SO_LINGER, 1 s) et ses 64 Mio
 # (1,1 s) : 26 s en tout au milieu de l'étape, 39 s à sa fin (tcp seul :
 # 17 s), mesurées en 6i ; d'où 90 s depuis, le double. En 6i, les fautes
-# disputées par des fils (fautes, quatre fois) et les troncatures (3 s) :
-# 43 s en tout, mesurées. verifier.sh le demande par `make duree` ; ne pas
-# le lancer sur une machine saturée.
+# disputées par des fils (fautes, quatre fois), les troncatures (3 s), un
+# programme ouvert en écriture qu'un groupe attend (1,5 s) : 45 s en tout,
+# mesurées. verifier.sh le demande par `make duree` ; ne pas le lancer sur
+# une machine saturée.
 DUREE = 90
 
 duree:
@@ -1025,7 +1041,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -1070,6 +1086,9 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	  | tee /dev/stderr | grep -q "redirections : .* : ok"
 	env -i /bin/sh -c "cd / && $(CURDIR)/$(LINUX)/dossier / / '*' && cd /tmp && $(CURDIR)/$(LINUX)/dossier /tmp /tmp / \
 	  && cd /etc/../tmp// && $(CURDIR)/$(LINUX)/dossier /tmp /tmp /tmp" | tee /dev/stderr | test $$(grep -c "dossier : .* : ok") = 3
+	./$(LINUX)/effacer --creer $(LINUX)/effacer.d 6 && ./$(LINUX)/effacer --contenu $(LINUX)/effacer.d \
+	  && ./$(LINUX)/effacer --creer $(LINUX)/effacer.d 3 && ./$(LINUX)/effacer $(LINUX)/effacer.d \
+	  && test ! -e $(LINUX)/effacer.d
 	timeout 60 ./$(LINUX)/reseau | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/dns | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/aleatoire | tee /dev/stderr | grep -q "toutes les verifications : ok"
@@ -1126,7 +1145,9 @@ $(WAST2JSON):
 #     les fonctions que QEMU sait imiter (-cpu max : SMEP, SMAP, UMIP...),
 #     pour passer aussi par les chemins « si le processeur l'a » ; avec, en
 #     plus, les lignes propres à chacun (tests-attendu-qemu64.txt,
-#     tests-attendu-max.txt). Et aucun ECHEC dans le journal (depuis 6e :
+#     tests-attendu-max.txt). Rien des lignes d'un groupe refusé (6i : elles
+#     lancent lecteur.wasm avec l'argument « groupe-refuse », qu'il
+#     afficherait). Et aucun ECHEC dans le journal (depuis 6e :
 #     « memoire rendue » de plusieurs groupes de programmes en parallèle
 #     s'écrit pareil, un ECHEC serait caché par un ok ; cible dit ECHEC
 #     si le signal ne l'a pas réveillée).
@@ -1203,6 +1224,7 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin sans-resea
 	  while IFS= read -r ligne; do \
 	    grep -qF -- "$$ligne" test-programmes-$$cpu.log || { echo "-cpu $$cpu : manque « $$ligne »"; exit 1; }; \
 	  done < tests-attendu-$$cpu.txt; \
+	  ! grep -n groupe-refuse $$journal || { echo "-cpu $$cpu : une ligne d'un groupe refuse a ete lancee"; exit 1; }; \
 	  ! grep -n ECHEC $$journal || { echo "-cpu $$cpu : un ECHEC dans le journal"; exit 1; }; \
 	done
 

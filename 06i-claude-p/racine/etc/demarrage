@@ -95,6 +95,25 @@ cd /tmp
 cd /etc/../home//utilisateur/
 /bin/dossier /home/utilisateur /home/utilisateur /tmp
 cd /
+# Un groupe (6i) : sa mémoire se mesure entière, du { au }, et pas pour
+# chacun de ses programmes. Des fichiers créés, listés, puis effacés : le
+# groupe doit tout rendre, à la page près.
+{
+/bin/effacer --creer /tmp/groupe 12
+/bin/arbre /tmp/groupe
+/bin/effacer /tmp/groupe
+}
+# Un programme refusé après que le lanceur a ouvert ses redirections (il est
+# ouvert en écriture ailleurs : ETXTBSY) : elles sont refermées, et le
+# groupe rend toute sa mémoire, le fichier redirigé effacé compris.
+{
+/bin/effacer --creer /tmp/fuite 4
+/bin/redirections --ecrire /tmp/prog 1500 &
+/bin/redirections --dormir 500
+/tmp/prog < /tmp/fuite/sous-dossier/fichier-3
+wait
+/bin/effacer /tmp/fuite
+}
 # Les sockets UDP et ICMP (6g), sur lo ; et le DNS de la glibc, par un
 # serveur du programme.
 /bin/reseau

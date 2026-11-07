@@ -72,7 +72,14 @@
 //!     des commandes suivantes. Comme `cd` de dash (son -L par défaut), le
 //!     chemin est d'abord ramené à sa forme simple (`/a/./b/../c//` :
 //!     `/a/c`), sans regarder les liens, et c'est lui que reçoit la variable
-//!     PWD des programmes.
+//!     PWD des programmes ;
+//!   - depuis 6i, le groupe : `{` seul sur sa ligne, des lignes, puis `}`
+//!     seul sur la sienne (le « brace group » de sh, sur plusieurs lignes).
+//!     Le lanceur mesure la mémoire rendue du groupe entier, et pas de
+//!     chacun de ses programmes. Comme sh, il le lit en entier avant d'en
+//!     lancer une ligne, et le refuse en entier s'il est vide, sans `}`, ou
+//!     si l'une de ses lignes l'est (programmes.rs) ; pas de groupe dans un
+//!     groupe, ni de `} &`.
 //! Pas de `\` en fin de ligne, pas de variables, pas d'échappements : ce
 //! n'est pas un shell, seulement de quoi écrire une commande.
 //!
@@ -110,6 +117,8 @@ pub enum Erreur {
     RedirectionSansChemin,
     /// `cd` sans un seul chemin absolu, ou avec des affectations ou `&`.
     Cd,
+    /// `{` ou `}` avec autre chose sur leur ligne.
+    Groupe,
 }
 
 // Affichés par le noyau : sans accents.
@@ -128,6 +137,7 @@ impl fmt::Display for Erreur {
             Erreur::Attendre => f.write_str("wait s'emploie seul"),
             Erreur::RedirectionSansChemin => f.write_str("< sans chemin"),
             Erreur::Cd => f.write_str("cd s'emploie seul, avec un chemin absolu"),
+            Erreur::Groupe => f.write_str("{ et } s'emploient seuls sur leur ligne"),
         }
     }
 }
@@ -175,6 +185,10 @@ pub enum Ligne<'t> {
     /// `cd CHEMIN` : le dossier courant des commandes suivantes, son chemin
     /// absolu ramené à sa forme simple.
     Dossier(&'t [u8]),
+    /// `{` : le début d'un groupe.
+    DebutDeGroupe,
+    /// `}` : sa fin.
+    FinDeGroupe,
 }
 
 /// Une ligne découpée : ses mots, guillemets retirés, dans le tampon de
@@ -391,6 +405,27 @@ pub fn forme_simple(chemin: &mut [u8]) -> usize {
     fin
 }
 
+/// La ligne est-elle `{` (vrai) ou `}` (faux), seule, des blancs et un
+/// commentaire autour (ce que `decouper` rend `DebutDeGroupe` et
+/// `FinDeGroupe`) ? Sans tampon : le lanceur sait ainsi où finit un groupe
+/// même quand la mémoire manque pour découper ses lignes.
+pub fn accolade(ligne: &[u8]) -> Option<bool> {
+    let mots = match ligne.iter().position(|&o| o == b'#') {
+        Some(p) if p == 0 || ligne[p - 1] == b' ' || ligne[p - 1] == b'\t' => &ligne[..p],
+        _ => ligne,
+    };
+    let mut seuls = mots.split(|&o| o == b' ' || o == b'\t').filter(|m| !m.is_empty());
+    let premier = seuls.next()?;
+    if seuls.next().is_some() {
+        return None;
+    }
+    match premier {
+        b"{" => Some(true),
+        b"}" => Some(false),
+        _ => None,
+    }
+}
+
 /// Découpe `ligne` en mots, dans `tampon` (au moins `taille_tampon(ligne)`
 /// octets). Rend `None` pour une ligne sans commande (vide, ou seulement
 /// un commentaire).
@@ -408,6 +443,10 @@ pub fn decouper<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<Option<Ligne<'
     match seuls.next() {
         Some(b"wait") => return if seuls.next().is_none() { Ok(Some(Ligne::Attendre)) } else { Err(Erreur::Attendre) },
         Some(b"cd") => return dossier(ligne, tampon).map(|d| Some(Ligne::Dossier(d))),
+        Some(b"{") => return if seuls.next().is_none() { Ok(Some(Ligne::DebutDeGroupe)) } else { Err(Erreur::Groupe) },
+        Some(b"}") => return if seuls.next().is_none() { Ok(Some(Ligne::FinDeGroupe)) } else { Err(Erreur::Groupe) },
+        // `}}`, `{{` : un seul mot pour sh, qui n'y voit pas un groupe.
+        Some(m) if m.starts_with(b"{") || m.starts_with(b"}") => return Err(Erreur::Groupe),
         // `A=1 cd /x` : dash n'y changerait le dossier que pour cd lui-même.
         // (Le premier mot qui n'est pas une affectation : `A=1 /bin/x cd`
         // lance /bin/x.)
@@ -541,6 +580,8 @@ mod tests {
             }
             Ligne::Attendre => (Vec::new(), Vec::new(), std::vec!["wait".into()]),
             Ligne::Dossier(d) => (Vec::new(), Vec::new(), std::vec!["cd".into(), std::string::String::from_utf8(d.to_vec()).unwrap()]),
+            Ligne::DebutDeGroupe => (Vec::new(), Vec::new(), std::vec!["{".into()]),
+            Ligne::FinDeGroupe => (Vec::new(), Vec::new(), std::vec!["}".into()]),
         }))
     }
 
@@ -823,6 +864,41 @@ mod tests {
         std::fs::remove_dir_all(&dossier).unwrap();
     }
 
+    #[test]
+    fn groupes() {
+        let ligne = |l: &str| {
+            let mut tampon = std::vec![0u8; taille_tampon(l.as_bytes())];
+            match decouper(l.as_bytes(), &mut tampon) {
+                Ok(Some(Ligne::DebutDeGroupe)) => "{",
+                Ok(Some(Ligne::FinDeGroupe)) => "}",
+                Ok(_) => "autre",
+                Err(Erreur::Groupe) => "refus",
+                Err(_) => "autre refus",
+            }
+        };
+        assert_eq!(ligne("{"), "{");
+        assert_eq!(ligne("  {  # un groupe"), "{");
+        // `accolade` dit la même chose, sans tampon.
+        for (l, a) in [("{", Some(true)), ("  {  # un groupe", Some(true)), ("\t}", Some(false)), ("{ /bin/x", None),
+                       ("} &", None), ("}}", None), ("/bin/x", None), ("# }", None)] {
+            assert_eq!(accolade(l.as_bytes()), a, "{l}");
+        }
+        assert_eq!(ligne("}"), "}");
+        assert_eq!(ligne("\t}"), "}");
+        for refus in ["{ /bin/x", "} &", "}}", "{{", "{x", "} /bin/x"] {
+            assert_eq!(ligne(refus), "refus", "{refus}");
+        }
+        // Un groupe sur plusieurs lignes : sh l'accepte tel quel.
+        let texte = "{\n/bin/x a\nwait\n}\n";
+        let sortie = std::process::Command::new("sh").arg("-n").arg("-c").arg(texte).output().unwrap();
+        assert!(sortie.status.success());
+        // Et refuse un groupe vide, ou sans sa fin (le lanceur aussi).
+        for texte in ["{\n}\n", "{\n/bin/x\n"] {
+            let sortie = std::process::Command::new("sh").arg("-n").arg("-c").arg(texte).output().unwrap();
+            assert!(!sortie.status.success(), "{texte:?}");
+        }
+    }
+
     /// Le programme par son chemin absolu : ni un chemin relatif, ni un mot
     /// que sh comprendrait autrement (un mot réservé, une commande interne),
     /// même entre guillemets.
@@ -863,7 +939,7 @@ mod tests {
     fn messages_sans_accents() {
         for e in [Erreur::GuillemetNonFerme, Erreur::Caractere(b'$'), Erreur::Caractere(1), Erreur::DossierVide, Erreur::Ecoute,
                   Erreur::SansProgramme, Erreur::CheminRelatif, Erreur::TamponTropPetit, Erreur::ApresEsperluette,
-                  Erreur::Attendre, Erreur::RedirectionSansChemin, Erreur::Cd] {
+                  Erreur::Attendre, Erreur::RedirectionSansChemin, Erreur::Cd, Erreur::Groupe] {
             assert!(std::format!("{e}").is_ascii());
         }
     }

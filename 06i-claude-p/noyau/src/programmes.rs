@@ -149,10 +149,16 @@ pub fn demarrer() {
     #[cfg(feature = "verrous")]
     crate::verrou::statistiques::afficher("Demarrage");
     let mut l = Lanceur::new(commandes);
+    // Les lignes d'un groupe refusé, sautées jusqu'à celle-ci comprise.
+    let mut sauter = 0;
     for (numero, ligne) in formats::commande::lignes(&texte) {
+        if numero <= sauter {
+            continue;
+        }
         // La mémoire libre quand aucun programme ne tourne, avant tout ce
-        // que la ligne fait prendre (voir `Lanceur`).
-        if l.en_cours == 0 {
+        // que la ligne fait prendre (voir `Lanceur`) ; dans un groupe, celle
+        // de son début.
+        if l.en_cours == 0 && l.groupe.is_none() {
             l.libres = pages::libres();
             l.paralleles = false;
         }
@@ -168,6 +174,21 @@ pub fn demarrer() {
                 Ok(Some(formats::commande::Ligne::Attendre)) => Some(Action::Attendre),
                 Ok(Some(formats::commande::Ligne::Dossier(chemin))) => {
                     l.changer_de_dossier(numero, chemin);
+                    None
+                }
+                Ok(Some(formats::commande::Ligne::DebutDeGroupe)) => {
+                    match verifier_groupe(&texte, numero) {
+                        Ok(fin) => l.commencer_groupe(numero, fin),
+                        Err((fin, raison)) => {
+                            afficherln!("[noyau] {}, lignes {} a {} : groupe refuse : {}", Nom(DEMARRAGE), numero, fin, raison);
+                            sauter = fin;
+                        }
+                    }
+                    None
+                }
+                Ok(Some(formats::commande::Ligne::FinDeGroupe)) if l.groupe.is_some() => Some(Action::FinDeGroupe),
+                Ok(Some(formats::commande::Ligne::FinDeGroupe)) => {
+                    afficherln!("[noyau] {}, ligne {} : refusee : }} sans {{", Nom(DEMARRAGE), numero);
                     None
                 }
                 Ok(Some(formats::commande::Ligne::Commande(commande))) => {
@@ -192,6 +213,7 @@ pub fn demarrer() {
                 }
             }
             Some(Action::Attendre) => l.attendre_tous(),
+            Some(Action::FinDeGroupe) => l.finir_groupe(),
         }
     }
     // Comme init, qui recueille ses enfants : le noyau attend ceux qui
@@ -225,6 +247,103 @@ enum Action {
     Fond(Tache),
     /// `wait`.
     Attendre,
+    /// `}` : la fin d'un groupe.
+    FinDeGroupe,
+}
+
+/// Un groupe de /etc/demarrage (6i) : ses lignes, et la mémoire libre à son
+/// début, si rien ne tournait (sinon, rien n'est mesuré pour lui).
+struct Groupe {
+    debut: usize,
+    fin: usize,
+    mesure: bool,
+}
+
+/// Lit le groupe qui commence à la ligne `debut` de `texte` jusqu'à son `}`,
+/// avant d'en lancer une ligne, comme sh : rend la ligne du `}`, ou, s'il
+/// est refusé, la dernière ligne lue et pourquoi. Refusé, comme par sh, s'il
+/// est vide ou sans `}`, ou si l'une de ses lignes l'est ; et, ce que sh
+/// permet mais que nous ne savons pas mesurer, un groupe dans un groupe, ou
+/// un programme lancé par `&` sans `wait` avant le `}` (sh ne l'attend pas :
+/// il tournerait encore quand on mesure la mémoire rendue du groupe).
+fn verifier_groupe(texte: &[u8], debut: usize) -> Result<usize, (usize, Refus)> {
+    use formats::commande::Ligne;
+    let (mut commandes, mut en_fond) = (0, false);
+    // La première raison de le refuser ; on lit quand même jusqu'à son `}`,
+    // pour sauter tout le groupe (les groupes qu'il contient compris).
+    let mut refus = None;
+    let mut profondeur = 0;
+    let mut derniere = debut;
+    for (numero, ligne) in formats::commande::lignes(texte).skip(debut) {
+        derniere = numero;
+        let Some(mut tampon) = tampon_pour(ligne) else {
+            // Plus de mémoire pour découper la ligne : le groupe est refusé,
+            // mais lu jusqu'à son `}` (ses accolades se voient sans tampon),
+            // pour le sauter en entier.
+            refus.get_or_insert(Refus::Memoire);
+            match formats::commande::accolade(ligne) {
+                Some(true) => profondeur += 1,
+                Some(false) if profondeur > 0 => profondeur -= 1,
+                Some(false) => return Err((numero, refus.take().unwrap_or(Refus::Memoire))),
+                None => {}
+            }
+            continue;
+        };
+        match formats::commande::decouper(ligne, &mut tampon) {
+            Ok(None) => {}
+            // `cd` et `wait` sont des commandes pour sh : un groupe qui n'a
+            // qu'elles n'est pas vide.
+            Ok(Some(Ligne::Dossier(_))) => commandes += 1,
+            Ok(Some(Ligne::Commande(c))) => {
+                commandes += 1;
+                en_fond |= c.arriere_plan();
+            }
+            Ok(Some(Ligne::Attendre)) => {
+                commandes += 1;
+                en_fond = false;
+            }
+            Ok(Some(Ligne::DebutDeGroupe)) => {
+                profondeur += 1;
+                refus.get_or_insert(Refus::Imbrique(numero));
+            }
+            Ok(Some(Ligne::FinDeGroupe)) if profondeur > 0 => profondeur -= 1,
+            Ok(Some(Ligne::FinDeGroupe)) => {
+                return match refus {
+                    Some(r) => Err((numero, r)),
+                    None if commandes == 0 => Err((numero, Refus::Vide)),
+                    None if en_fond => Err((numero, Refus::SansWait)),
+                    None => Ok(numero),
+                };
+            }
+            Err(e) => {
+                refus.get_or_insert(Refus::Ligne(numero, e));
+            }
+        }
+    }
+    Err((derniere, Refus::SansFin))
+}
+
+/// Pourquoi un groupe est refusé (sans accents : affiché).
+enum Refus {
+    Memoire,
+    Vide,
+    SansFin,
+    SansWait,
+    Imbrique(usize),
+    Ligne(usize, formats::commande::Erreur),
+}
+
+impl fmt::Display for Refus {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Refus::Memoire => f.write_str("plus de memoire pour le lire"),
+            Refus::Vide => f.write_str("vide"),
+            Refus::SansFin => f.write_str("pas de } avant la fin du fichier"),
+            Refus::SansWait => f.write_str("un programme lance par & sans wait avant }"),
+            Refus::Imbrique(n) => write!(f, "un groupe dans le groupe, ligne {}", n),
+            Refus::Ligne(n, e) => write!(f, "ligne {} : {}", n, e),
+        }
+    }
 }
 
 /// Un programme lancé, que le lanceur recueillera.
@@ -260,6 +379,9 @@ struct Lanceur {
     dossier: Objet,
     pwd: Vec<u8>,
     oldpwd: Vec<u8>,
+    /// Le groupe en cours (6i) : ses programmes ne disent pas leur mémoire
+    /// rendue, le groupe la dit à son `}`.
+    groupe: Option<Groupe>,
 }
 
 impl Lanceur {
@@ -278,7 +400,32 @@ impl Lanceur {
             }
             r
         });
-        Lanceur { fond, en_cours: 0, libres: 0, paralleles: false, dossier, pwd: copie(b"/"), oldpwd: Vec::new() }
+        Lanceur { fond, en_cours: 0, libres: 0, paralleles: false, dossier, pwd: copie(b"/"), oldpwd: Vec::new(), groupe: None }
+    }
+
+    /// `{` d'un groupe vérifié, qui finit à la ligne `fin` : la mémoire
+    /// libre maintenant, si rien ne tourne.
+    fn commencer_groupe(&mut self, debut: usize, fin: usize) {
+        let mesure = self.en_cours == 0;
+        if mesure {
+            self.libres = pages::libres();
+            self.paralleles = false;
+        }
+        self.groupe = Some(Groupe { debut, fin, mesure });
+    }
+
+    /// `}` : tous ses programmes sont recueillis (ceux lancés par `&` l'ont
+    /// été par un `wait`, `verifier_groupe` l'exige) ; sa mémoire rendue,
+    /// s'il a été mesuré.
+    fn finir_groupe(&mut self) {
+        let Some(g) = self.groupe.take() else { return };
+        if g.mesure && self.en_cours == 0 {
+            attendre_le_reseau();
+            afficherln!("[noyau] Groupe des lignes {} a {} : memoire rendue : {}.", g.debut, g.fin,
+                        Rendue(self.libres, pages::libres(), crate::signaux::en_file(), crate::reseau::paquet::vivants()));
+        } else {
+            afficherln!("[noyau] Groupe des lignes {} a {} : termine (des programmes tournaient deja : pas de mesure).", g.debut, g.fin);
+        }
     }
 
     /// `cd CHEMIN` (absolu, en forme simple) : le dossier courant des lignes
@@ -360,14 +507,15 @@ impl Lanceur {
             attendre_le_reseau();
         }
         let rendue = || Rendue(self.libres, pages::libres(), crate::signaux::en_file(), crate::reseau::paquet::vivants());
+        let groupe = self.groupe.is_some();
         match fin {
-            Some((nom, code)) if self.en_cours == 0 && !self.paralleles => {
+            Some((nom, code)) if self.en_cours == 0 && !self.paralleles && !groupe => {
                 afficherln!("[noyau] {} : termine, code de sortie {} ; memoire rendue : {}.", nom, code, rendue())
             }
             Some((nom, code)) => afficherln!("[noyau] {} : termine, code de sortie {}.", nom, code),
             None => {}
         }
-        if self.en_cours == 0 && self.paralleles {
+        if self.en_cours == 0 && self.paralleles && !groupe {
             afficherln!("[noyau] Programmes en parallele : memoire rendue : {}.", rendue());
         }
         // Ce que les verrous ont fait pendant ce programme (et ceux qui

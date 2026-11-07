@@ -11,13 +11,24 @@
  * droits au fichier.
  * Il tourne dans notre noyau et sur l'hôte (pas sous root : root lirait
  * le fichier sans droits).
+ *
+ *     redirections --ecrire CHEMIN MS
+ *     redirections --dormir MS
+ *
+ * La première tient CHEMIN ouvert en écriture pendant MS millisecondes : un
+ * programme qu'on lance alors est refusé (ETXTBSY), après que le lanceur a
+ * ouvert ses redirections, qui doivent être refermées (un groupe de
+ * /etc/demarrage le vérifie : « memoire rendue ») ; la seconde lui laisse
+ * le temps de l'ouvrir, avant que la ligne suivante ne lance le programme.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 static int ecarts;
@@ -44,6 +55,20 @@ static int est(int fd, const char *chemin)
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
+    if (argc == 3 && strcmp(argv[1], "--dormir") == 0) {
+        struct timespec t = {atoi(argv[2]) / 1000, atoi(argv[2]) % 1000 * 1000000L};
+        nanosleep(&t, NULL);
+        return 0;
+    }
+    if (argc == 4 && strcmp(argv[1], "--ecrire") == 0) {
+        int f = open(argv[2], O_WRONLY);
+        struct timespec t = {atoi(argv[3]) / 1000, atoi(argv[3]) % 1000 * 1000000L};
+        nanosleep(&t, NULL);
+        if (f >= 0)
+            close(f);
+        printf("[linux] redirections : %s tenu en ecriture : %s\n", argv[2], f >= 0 ? "ok" : "ECHEC");
+        return f < 0;
+    }
     if (argc != 3) {
         printf("[linux] redirections : usage : redirections CHEMIN0 CHEMIN3 < CHEMIN0 3< CHEMIN3 : ECHEC\n");
         return 1;

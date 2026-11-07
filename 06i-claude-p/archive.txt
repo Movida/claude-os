@@ -39,6 +39,7 @@ file  /bin/fautes          linux/construits/fautes 755 0 0 /bin/fautes-fin-1 /bi
 file  /bin/troncature      linux/construits/troncature 755 0 0
 file  /bin/redirections    linux/construits/redirections 755 0 0
 file  /bin/dossier         linux/construits/dossier 755 0 0
+file  /bin/effacer         linux/construits/effacer 755 0 0
 file  /bin/evenements      linux/construits/evenements 755 0 0
 file  /bin/proc            linux/construits/proc 755 0 0
 file  /bin/partage         linux/construits/partage 755 0 0
@@ -89,6 +90,9 @@ file  /tmp/a-root          racine/etc/bonjour.txt 666 0 0
 # Un fichier de l'utilisateur 1000, pour linux/redirections (6i) : il en
 # retire puis rend les droits.
 file  /tmp/redirige         racine/etc/bonjour.txt 644 1000 1000
+# Un programme de l'utilisateur 1000, qu'un autre tient ouvert en écriture
+# pendant qu'on le lance (6i : ETXTBSY, linux/redirections).
+file  /tmp/prog             linux/construits/bonjour-asm 755 1000 1000
 # Le dossier personnel de l'utilisateur 1000, celui des programmes (HOME).
 dir   /home 755 0 0
 dir   /home/utilisateur 755 1000 1000
