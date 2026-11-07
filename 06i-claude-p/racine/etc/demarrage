@@ -114,6 +114,8 @@ cd /
 wait
 /bin/effacer /tmp/fuite
 }
+# Les transferts dans le noyau (6i) : copy_file_range, sendfile, fadvise64.
+/bin/copies
 # Les sockets UDP et ICMP (6g), sur lo ; et le DNS de la glibc, par un
 # serveur du programme.
 /bin/reseau

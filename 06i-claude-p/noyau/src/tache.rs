@@ -206,6 +206,10 @@ pub struct Tache {
     liste_robuste: AtomicU64,
     /// Son code de sortie, posé par `terminer`.
     code_sortie: AtomicI32,
+    /// Les cases de son tube interne, celui de sendfile et copy_file_range
+    /// vers autre chose qu'un tube (le `splice_pipe` de Linux, 6i : voir
+    /// `tube::cases_du_tube_interne`), 0 tant qu'elle n'en a pas eu besoin.
+    pub tube_interne: AtomicU32,
     /// Son temps de calcul, en nanosecondes : compté par l'ordonnanceur à
     /// chaque tic et à chaque bascule, d'après le temps monotone (le TSC
     /// quand il est fiable : le `sum_exec_runtime` de Linux), en anneau 3
@@ -361,6 +365,7 @@ impl Tache {
             effacer_tid: AtomicU64::new(0),
             liste_robuste: AtomicU64::new(0),
             code_sortie: AtomicI32::new(0),
+            tube_interne: AtomicU32::new(0),
             calcul: AtomicU64::new(0),
             lag: AtomicI64::new(0),
             // (La tâche inactive n'attend personne : elle ne doit jamais
@@ -614,6 +619,7 @@ pub fn initialiser() {
         effacer_tid: AtomicU64::new(0),
         liste_robuste: AtomicU64::new(0),
         code_sortie: AtomicI32::new(0),
+        tube_interne: AtomicU32::new(0),
         calcul: AtomicU64::new(0),
         lag: AtomicI64::new(0),
         attendant: Verrou::new(None),
@@ -1095,6 +1101,9 @@ pub fn terminer(code: i32) -> ! {
         // leurs sockets, maintenant (la fermeture différée, socket.rs).
         crate::reseau::socket::fermer_les_differees();
     }
+    // Son tube interne n'est plus compté à l'utilisateur (`do_exit` :
+    // `free_pipe_info(tsk->splice_pipe)`).
+    crate::tube::rendre_le_tube_interne(t.tube_interne.swap(0, Ordering::Relaxed));
     cpu::couper_interruptions();
     t.morte.store(true, Ordering::Relaxed);
     // Une référence à elle-même, pour la fin de bascule qui rendra sa pile.

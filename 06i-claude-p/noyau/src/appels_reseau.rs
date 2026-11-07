@@ -639,12 +639,17 @@ fn total(morceaux: &[(u64, u64)]) -> usize {
 /// Envoie les morceaux `morceaux` (le `sock_sendmsg` de Linux), à `nom`
 /// (None : la destination de la connexion), avec `drapeaux` et les messages
 /// de contrôle `controle`.
-fn envoyer(o: &FichierTenu, nom: Option<&[u8]>, morceaux: &[(u64, u64)], mut drapeaux: u64, controle: Result<Controle, i64>, scm: unix::Scm) -> i64 {
+fn envoyer(o: &FichierTenu, nom: Option<&[u8]>, morceaux: &[(u64, u64)], drapeaux: u64, controle: Result<Controle, i64>, scm: unix::Scm) -> i64 {
+    envoyer_avec(o, nom, total(morceaux), |decalage, d: &mut [u8]| copier_des_morceaux(morceaux, decalage, d), drapeaux, controle, scm)
+}
+
+/// `envoyer`, les octets venant de `remplir` (`longueur` en tout) : ceux
+/// du programme, ou depuis 6i ceux du noyau (`ecrire_noyau`).
+fn envoyer_avec(o: &FichierTenu, nom: Option<&[u8]>, longueur: usize, remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>,
+                mut drapeaux: u64, controle: Result<Controle, i64>, scm: unix::Scm) -> i64 {
     if non_bloquant(o) {
         drapeaux |= MSG_DONTWAIT;
     }
-    let longueur = total(morceaux);
-    let remplir = |decalage, d: &mut [u8]| copier_des_morceaux(morceaux, decalage, d);
     let r = match o.socket().protocole {
         Protocole::Udp => udp::envoyer(o.socket(), nom, longueur, drapeaux, controle, remplir),
         Protocole::Ping => ping::envoyer(o.socket(), nom, longueur, drapeaux, controle, remplir),
@@ -1925,6 +1930,82 @@ pub fn lire(o: &FichierTenu, morceaux: &[(u64, u64)]) -> i64 {
 /// pour 0 octet).
 pub fn ecrire(o: &FichierTenu, morceaux: &[(u64, u64)]) -> i64 {
     envoyer(o, None, morceaux, 0, Ok(Controle::default()), unix::Scm::default())
+}
+
+/// Un envoi d'octets du noyau sur une socket, une ronde de sendfile (6i :
+/// un `sock_sendmsg` de `splice_to_socket`), avec MSG_MORE s'il en vient
+/// d'autres (`plus_a_venir` : TCP attend alors pour remplir ses segments ;
+/// AF_UNIX n'en fait rien ; UDP, qui n'a pas son « bouchon » : EOPNOTSUPP,
+/// voir `udp::envoyer`) : rend ce qui est parti, ou l'erreur.
+pub fn ecrire_noyau(o: &FichierTenu, octets: &[u8], plus_a_venir: bool) -> i64 {
+    const MSG_MORE: u64 = 0x8000;
+    let remplir = |decalage: usize, d: &mut [u8]| {
+        d.copy_from_slice(&octets[decalage..decalage + d.len()]);
+        Ok(())
+    };
+    let drapeaux = if plus_a_venir { MSG_MORE } else { 0 };
+    envoyer_avec(o, None, octets.len(), remplir, drapeaux, Ok(Controle::default()), unix::Scm::default())
+}
+
+/// La socket `o` a-t-elle un `splice_read` à elle (sendfile vers un tube,
+/// 6i) : un flux, AF_UNIX (`unix_stream_splice_read`) ou TCP
+/// (`tcp_splice_read`) ? Les autres (UDP, ping, AF_UNIX en datagrammes ou
+/// en paquets) passent par `copy_splice_read` : une réception ordinaire,
+/// `lire_noyau`.
+pub fn s_episse(o: &FichierTenu) -> bool {
+    const SOCK_STREAM: u16 = 1;
+    let s = o.socket();
+    s.protocole == Protocole::Tcp || (s.protocole == Protocole::Unix && s.sorte == SOCK_STREAM)
+}
+
+/// sendfile d'un flux (`s_episse`) vers un tube : au plus `longueur`
+/// octets, donnés à `poser` morceau par morceau (décalage, octets), qui
+/// rend ce qu'il en a pris (moins : le tube est plein, le reste attend
+/// dans la socket). Comme une lecture, sauf :
+///   - AF_UNIX (`unix_stream_splice_read`) : non bloquant si la socket
+///     l'est, ou le tube (SPLICE_F_NONBLOCK) ; les descripteurs qui
+///     arrivent sont lâchés (pas de message pour les recevoir) ;
+///   - TCP (`tcp_splice_read`) : non bloquant si la socket l'est (le tube
+///     n'y compte pas) ; rend dès qu'il a quelque chose, SO_RCVLOWAT n'y
+///     comptant pas (`tcp::MSG_EPISSER`).
+pub fn episser(o: &FichierTenu, longueur: usize, tube_non_bloquant: bool,
+               poser: impl FnMut(usize, &[u8]) -> Result<usize, i64>) -> Result<usize, i64> {
+    const MSG_DONTWAIT: u64 = 0x40;
+    if o.socket().protocole == Protocole::Tcp {
+        return tcp::recevoir_programme(o.socket(), longueur, tcp::MSG_EPISSER, non_bloquant(o), poser);
+    }
+    let drapeaux = if tube_non_bloquant { MSG_DONTWAIT } else { 0 };
+    // Les descripteurs reçus (`unix_detach_fds`, puis `scm_destroy`) sont
+    // lâchés avec le reçu.
+    unix::recevoir(o.socket(), longueur, drapeaux, non_bloquant(o), poser).map(|u| u.longueur)
+}
+
+/// read d'une socket dans `tampon`, du noyau (`sock_read_iter`, par le
+/// `copy_splice_read` de sendfile vers un tube, 6i) : une réception sans
+/// drapeau, non bloquante si la socket l'est ; un datagramme plus long
+/// que le tampon y est coupé, le reste jeté.
+pub fn lire_noyau(o: &FichierTenu, tampon: &mut [u8]) -> Result<usize, i64> {
+    if tampon.is_empty() {
+        return Ok(0);
+    }
+    let longueur = tampon.len();
+    let s = o.socket();
+    match s.protocole {
+        Protocole::Unix => unix::recevoir(s, longueur, 0, non_bloquant(o), |decalage, octets| {
+            tampon[decalage..decalage + octets.len()].copy_from_slice(octets);
+            Ok(octets.len())
+        })
+        .map(|u| u.longueur),
+        Protocole::Tcp => tcp::recevoir_programme(s, longueur, 0, non_bloquant(o), |decalage, octets| {
+            tampon[decalage..decalage + octets.len()].copy_from_slice(octets);
+            Ok(octets.len())
+        }),
+        Protocole::Udp | Protocole::Ping => socket::prendre(s, longueur, 0, non_bloquant(o), |octets| {
+            tampon[..octets.len()].copy_from_slice(octets);
+            Ok(octets.len())
+        })
+        .map(|r| r.longueur),
+    }
 }
 
 /// ioctl d'une socket, une fois passées celles de tous les fichiers

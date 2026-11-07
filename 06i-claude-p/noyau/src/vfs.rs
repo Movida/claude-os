@@ -333,6 +333,34 @@ pub fn copier_depuis_programme(cadre: u64, decalage: usize, n: usize, source: u6
     unsafe { copie_utilisateur::copier_depuis_utilisateur_brut(destination, source, n) }
 }
 
+/// Copie `destination.len()` octets de la page `cadre` d'un fichier, que
+/// l'appelant tient, à partir de `decalage`, dans un tampon du noyau
+/// (sendfile, copy_file_range, 6i). Par `rep movsb`, comme les copies vers
+/// un programme : une autre tâche peut écrire la page en même temps.
+pub fn copier_page_vers_noyau(cadre: u64, decalage: usize, destination: &mut [u8]) {
+    assert!(decalage + destination.len() <= PAGE as usize);
+    let source = (espace::virtuelle(cadre) as *const u8).wrapping_add(decalage);
+    // SAFETY: le cadre est une page allouée, tenue par l'appelant, vue par
+    // la projection directe, et qu'aucune référence Rust ne désigne (un
+    // write du même fichier peut l'écrire pendant la copie) ; on reste dans
+    // la page (vérifié) ; la destination est un tampon du noyau, désigné
+    // seulement par l'emprunt exclusif d'où vient son pointeur.
+    unsafe { copie_utilisateur::copier_dans_le_noyau(destination.as_mut_ptr(), source, destination.len()) }
+}
+
+/// Copie `source`, octets du noyau, dans la page `cadre` d'un fichier, que
+/// l'appelant tient, à `decalage` (sendfile, copy_file_range, 6i).
+pub fn copier_noyau_vers_page(cadre: u64, decalage: usize, source: &[u8]) {
+    assert!(decalage + source.len() <= PAGE as usize);
+    let destination = (espace::virtuelle(cadre) as *mut u8).wrapping_add(decalage);
+    // SAFETY: comme `copier_page_vers_noyau`, en écriture : la page n'est
+    // désignée par aucune référence Rust (une lecture du même fichier peut
+    // la lire pendant la copie : voir `copier_vers_programme`) ; la source
+    // est un tampon du noyau, désigné seulement par l'emprunt partagé d'où
+    // vient son pointeur.
+    unsafe { copie_utilisateur::copier_dans_le_noyau(destination, source.as_ptr(), source.len()) }
+}
+
 /// La page numéro `index` du fichier ouvert `f`, pour une faute de page
 /// dans une zone qui le projette : créée si c'est un trou (comme le
 /// `shmem_fault` de Linux, pour qu'une page privée pas encore copiée soit

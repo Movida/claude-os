@@ -313,6 +313,33 @@ impl Drop for Page {
     }
 }
 
+/// Une page prise une fois de plus par un objet qui la garde, et lâchée
+/// avec lui (le `get_page`, puis le `put_page`, d'une `pipe_buffer` de
+/// Linux) : une case de tube qui désigne une page du cache d'un fichier
+/// (tube.rs, 6i). La page reste à son fichier, qui peut l'écrire, ou la
+/// quitter (une troncature) : elle n'est rendue qu'au dernier qui la tient.
+pub struct Tenue(u64);
+
+impl Tenue {
+    /// Prend le cadre `cadre`, une page allouée que l'appelant tient (sous
+    /// le verrou de son fichier, par exemple) : elle ne peut pas être rendue
+    /// entre-temps.
+    pub fn prendre(cadre: u64) -> Tenue {
+        prendre(cadre);
+        Tenue(cadre)
+    }
+
+    pub fn cadre(&self) -> u64 {
+        self.0
+    }
+}
+
+impl Drop for Tenue {
+    fn drop(&mut self) {
+        lacher(self.0);
+    }
+}
+
 /// Le cadre `cadre` (une page allouée) est pris une fois de plus : une
 /// projection de plus, une lecture en cours.
 pub fn prendre(cadre: u64) {

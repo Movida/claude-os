@@ -88,6 +88,11 @@ const ECONNABORTED: i64 = 103;
 
 /// SOCK_STREAM, et le protocole d'IPv4.
 pub const SOCK_STREAM: u64 = 1;
+/// Un drapeau du noyau pour `recevoir_programme` (ceux d'un programme
+/// tiennent dans 32 bits) : sendfile d'une socket vers un tube
+/// (`tcp_splice_read`, 6i), qui rend dès qu'il a quelque chose, sans
+/// regarder SO_RCVLOWAT.
+pub const MSG_EPISSER: u64 = 1 << 32;
 pub const IPPROTO_TCP: u64 = 6;
 
 /// Les tailles de départ des tampons d'une socket TCP (`tcp_rmem[1]`,
@@ -1944,8 +1949,14 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
     let peek = drapeaux & MSG_PEEK != 0;
     // Combien rendre avant de revenir (`sock_rcvlowat`) : tout avec
     // MSG_WAITALL, sinon SO_RCVLOWAT (1 par défaut), jamais plus que la
-    // place.
-    let cible = if drapeaux & MSG_WAITALL != 0 { longueur } else { rcvlowat.min(longueur) };
+    // place ; pour sendfile, un octet.
+    let cible = if drapeaux & MSG_WAITALL != 0 {
+        longueur
+    } else if drapeaux & MSG_EPISSER != 0 {
+        1
+    } else {
+        rcvlowat.min(longueur)
+    };
     let mut g = flux(s).posseder();
     let mut fait = 0;
     // MSG_PEEK : où l'on regarde, depuis le début de ce qui est à lire (`peek_seq`) : SO_PEEK_OFF,

@@ -299,6 +299,27 @@ pub unsafe fn copier_depuis_utilisateur_brut(destination: *mut u8, source: u64, 
     n - reste
 }
 
+/// Copie `n` octets d'une zone du noyau à une autre par la même routine
+/// (`rep movsb`), qui ne suppose rien de ce que d'autres tâches font de la
+/// source pendant la copie : une page de fichier, qu'un autre fil peut
+/// écrire en même temps (sendfile, copy_file_range, 6i ; vfs.rs). Une copie
+/// Rust (`copy_nonoverlapping`) le supposerait. Ni l'une ni l'autre des
+/// zones n'est au programme : aucune faute n'est prévue, ni servie.
+///
+/// # Safety
+/// [source, source + n[ est de la mémoire du noyau lisible, [destination,
+/// destination + n[ du noyau inscriptible, toutes deux allouées pendant la
+/// copie. Aucune n'est désignée par une référence Rust, sinon l'emprunt
+/// d'où vient son pointeur (exclusif pour la destination, partagé pour la
+/// source : un tampon du noyau à l'appelant) ; et celle que d'autres tâches
+/// peuvent écrire pendant la copie, la page d'un fichier, par aucune.
+pub unsafe fn copier_dans_le_noyau(destination: *mut u8, source: *const u8, n: usize) {
+    // SAFETY: d'après l'appelant ; deux zones du noyau présentes : aucune
+    // faute, la copie va jusqu'au bout.
+    let reste = unsafe { copie_brute(destination, source, n) };
+    debug_assert!(reste == 0, "copie dans le noyau interrompue");
+}
+
 /// L'adresse de reprise prévue pour une faute du noyau à l'adresse `rip`,
 /// s'il y en a une (search_exception_tables de Linux). La table est petite
 /// (une entrée par instruction qui touche la mémoire des programmes) : on

@@ -59,6 +59,8 @@ use crate::vfs::Montage;
 use fichiers::tmpfs::{Attributs, Numero, Ouverture, limite_ecriture, suivre_pour};
 use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, permis};
 use crate::attente::{GardeMutex, Mutex};
+use crate::pages::Page;
+use crate::tube::Poseur;
 
 // Les numéros d'erreur de Linux qui ne viennent pas du tmpfs.
 const EBADF: i64 = 9;
@@ -70,6 +72,8 @@ const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
 const ENOTTY: i64 = 25;
 const ENOSPC: i64 = 28;
+const EXDEV: i64 = 18;
+const EOVERFLOW: i64 = 75;
 const ESPIPE: i64 = 29;
 const ENAMETOOLONG: i64 = 36;
 const EOPNOTSUPP: i64 = 95;
@@ -1135,6 +1139,14 @@ fn retirer_les_privileges(n: Numero) {
 /// rendre ce qui l'est). Une faute : ce qui a été copié, ou EFAULT si
 /// rien.
 pub fn alea_vers_programme(tampon: u64, longueur: u64) -> Result<u64, i64> {
+    alea_vers(longueur, |decalage, octets| copier_vers_utilisateur_partiel(tampon + decalage, octets))
+}
+
+/// Ce que fait `alea_vers_programme`, vers `copier` (le décalage, les
+/// octets ; rend ce qui a été copié, moins à une faute) : la mémoire d'un
+/// programme, ou un tampon du noyau (sendfile, 6i : le même
+/// `get_random_bytes_user`, par `copy_splice_read`).
+fn alea_vers(longueur: u64, mut copier: impl FnMut(u64, &[u8]) -> usize) -> Result<u64, i64> {
     if longueur == 0 {
         return Ok(0);
     }
@@ -1146,7 +1158,7 @@ pub fn alea_vers_programme(tampon: u64, longueur: u64) -> Result<u64, i64> {
     tirage.changer_de_cle(&premiers);
     if longueur <= 32 {
         let n = longueur as usize;
-        let copies = copier_vers_utilisateur_partiel(tampon, &premiers[..n]);
+        let copies = copier(0, &premiers[..n]);
         crypto::effacer(&mut premiers);
         return if copies == 0 { Err(-EFAULT) } else { Ok(copies as u64) };
     }
@@ -1156,7 +1168,7 @@ pub fn alea_vers_programme(tampon: u64, longueur: u64) -> Result<u64, i64> {
     let r = loop {
         tirage.suite(&mut bloc);
         let n = (longueur - fait).min(64) as usize;
-        let copies = copier_vers_utilisateur_partiel(tampon + fait, &bloc[..n]);
+        let copies = copier(fait, &bloc[..n]);
         fait += copies as u64;
         if fait == longueur || copies < n {
             break if fait == 0 { Err(-EFAULT) } else { Ok(fait) };
@@ -2996,4 +3008,640 @@ pub fn utimensat(dirfd: u64, adresse: u64, dates: u64, drapeaux: u64) -> i64 {
         Ok(()) => 0,
         Err(e) => errno(e),
     }
+}
+
+// ----- Les transferts du noyau : fadvise64, copy_file_range, sendfile (6i) -----
+//
+// Trois appels que `claude -p` faisait déjà, et dont il se passait (ENOSYS) :
+// Bun copie un fichier par copy_file_range, puis sendfile s'il manque, puis
+// read et write ; et conseille sa lecture par fadvise64. Les deux premiers
+// font passer les octets d'un fichier à l'autre sans les montrer au
+// programme : par un tampon du noyau d'une page, lu par `lire_pour_le_noyau`
+// et écrit par `ecrire_pour_le_noyau`, page après page. Linux le fait par
+// un tube interne (`do_splice_direct`), dont les pages vont d'un fichier à
+// l'autre sans copie ; le tampon fait une copie de plus (une page, une
+// microseconde), et sert aussi bien un fichier, un tube, une socket ou un
+// périphérique en sortie. Les vérifications et les codes d'erreur sont
+// ceux de Linux 6.18 (fs/read_write.c, fs/splice.c, mm/fadvise.c), dans
+// leur ordre, mesurés par linux/copies.c (sur l'hôte aussi) et par la
+// relecture du plan de 6i.
+
+/// fadvise64(fd, position, longueur, conseil) : un conseil sur la façon
+/// dont le programme lira le fichier (le `generic_fadvise` de Linux). Sur
+/// tmpfs, Linux n'en fait rien (pas de lecture anticipée sans disque : la
+/// branche `noop_backing_dev_info`), et nous non plus ; restent ses refus :
+/// un descripteur fermé, ou O_PATH : EBADF ; un tube : ESPIPE (avant tout le
+/// reste) ; une longueur négative, ou un conseil inconnu (au-delà de
+/// POSIX_FADV_NOREUSE, 5) : EINVAL. Une position négative est permise. Le
+/// reste (une socket, un eventfd, /proc...) : 0, comme Linux.
+pub fn fadvise64(fd: u64, _position: u64, longueur: u64, conseil: u64) -> i64 {
+    let o = match tenir(fd) {
+        Ok(o) => o,
+        Err(e) => return e,
+    };
+    match o.sorte {
+        Sorte::Chemin => -EBADF,
+        Sorte::Tube => -ESPIPE,
+        _ if (longueur as i64) < 0 || conseil as u32 > 5 => -EINVAL,
+        _ => 0,
+    }
+}
+
+// Les transferts dans le noyau (6i) : sendfile et copy_file_range.
+//
+// Linux les fait passer par un TUBE : les pages lues de l'entrée y sont
+// posées (le `splice_read` de l'entrée), puis données à la sortie (son
+// `splice_write`). Vers un tube, c'est celui de la sortie, et une seule
+// lecture ; vers autre chose, un tube interne à la tâche, par rondes
+// (`splice_direct_to_actor`). Ce qu'un programme en voit est écrit ici
+// sorte par sorte, mesuré sous Linux 6.18 (les sondes de la relecture de
+// 6i, que `linux/copies.c` reprend, sur l'hôte et chez nous).
+
+/// Une position donnée a un sens (FMODE_PREAD ; sinon ESPIPE) : pas pour un
+/// tube, une socket, la console (`nonseekable_open`), un eventfd, un epoll.
+fn a_des_positions(o: &FichierTenu) -> bool {
+    !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console | Sorte::EventFd | Sorte::Epoll)
+}
+
+/// Le fichier se positionne (FMODE_LSEEK, que `splice_direct_to_actor`
+/// demande à l'entrée d'un transfert qui ne va pas vers un tube, même de 0
+/// octet) : tout ce qui a un llseek, `noop_llseek` compris (un eventfd, un
+/// epoll : mesuré) ; pas un tube, une socket, la console.
+fn se_positionne(o: &FichierTenu) -> bool {
+    !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console)
+}
+
+/// L'entrée a un `splice_read` : un fichier ordinaire (ses pages),
+/// /dev/zero, /dev/full, /dev/random, /dev/urandom, la console, une valeur
+/// de /proc/sys, un attribut de /sys (`copy_splice_read` : une lecture),
+/// une socket. Pas un dossier, /dev/null, un tube, un eventfd, un epoll,
+/// ni les séquences de /proc (maps, statm, comm, /proc/net : `seq_read`,
+/// sans `read_iter`).
+fn lisible_par_le_noyau(o: &FichierTenu) -> bool {
+    matches!(o.sorte, Sorte::Fichier | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. } | Sorte::Console | Sorte::Socket
+        | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
+}
+
+/// La sortie a un `splice_write` : un fichier ordinaire, /dev/null et
+/// /dev/zero (`splice_write_null`), /dev/random et /dev/urandom, la
+/// console, un tube, une socket. Pas /dev/full (mesuré : EINVAL, pas
+/// ENOSPC), un eventfd, un epoll, ni comm, le seul fichier de /proc qui
+/// s'écrive chez nous (`.write` seulement).
+fn ecrivable_par_le_noyau(o: &FichierTenu) -> bool {
+    matches!(o.sorte, Sorte::Fichier | Sorte::Null | Sorte::Zero | Sorte::Aleatoire { .. } | Sorte::Console | Sorte::Tube | Sorte::Socket)
+}
+
+/// La plus grande position du système du fichier (son `s_maxbytes`) :
+/// 2^31 - 1 pour /proc et /sys (MAX_NON_LFS, qu'ils ne changent pas :
+/// mesuré, EOVERFLOW à la position 0x7fffffff), la plus grande taille de
+/// fichier pour le reste (tmpfs, et les systèmes sans nom des tubes, des
+/// sockets, des eventfd).
+fn position_max(o: &FichierTenu) -> u64 {
+    match o.sorte {
+        Sorte::Noyau { .. } => 0x7fff_ffff,
+        _ => fichiers::tmpfs::TAILLE_MAX,
+    }
+}
+
+/// La position de l'entrée avance de ce qui en est lu : un fichier
+/// ordinaire, une valeur de /proc/sys, un attribut de /sys ; pas /dev/zero,
+/// /dev/full, /dev/random, /dev/urandom (`read_iter_zero` et
+/// `get_random_bytes_user` ne la touchent pas : mesuré, une position donnée
+/// revient telle quelle).
+fn avance_en_lisant(o: &FichierTenu) -> bool {
+    matches!(o.sorte, Sorte::Fichier | Sorte::Noyau { .. })
+}
+
+/// Lit `o` (`lisible_par_le_noyau`) à `position` dans `tampon`, du noyau,
+/// comme read : un fichier ordinaire, page par page (un trou se lit en
+/// zéros) ; /dev/zero et /dev/full, des zéros, un signal regardé après
+/// chaque page (`read_iter_zero` : il fait rendre ce qui l'est) ;
+/// /dev/random, qui attend d'être prêt (EAGAIN en O_NONBLOCK), et
+/// /dev/urandom, de l'aléa (`get_random_bytes_user`) ; une valeur de
+/// /proc/sys, un attribut de /sys, comme read ; la console, rien (elle
+/// n'est pas encore un terminal, 6k) ; une socket, une réception. Rend ce
+/// qui est lu, 0 à la fin.
+fn lire_pour_le_noyau(o: &FichierTenu, position: u64, tampon: &mut [u8]) -> Result<usize, i64> {
+    match o.sorte {
+        Sorte::Fichier => Ok(lire_pages_noyau(o.numero(), position, tampon)),
+        Sorte::Zero | Sorte::Plein => {
+            let mut fait = 0;
+            for morceau in tampon.chunks_mut(PAGE as usize) {
+                morceau.fill(0);
+                fait += morceau.len();
+                if tache::signal_en_attente() {
+                    break;
+                }
+            }
+            Ok(fait)
+        }
+        Sorte::Aleatoire { random } => {
+            if random && !aleatoire::pret() {
+                if o.drapeaux as u64 & O_NONBLOCK != 0 {
+                    return Err(-EAGAIN);
+                }
+                aleatoire::attendre_pret()?;
+            } else if !random {
+                aleatoire::essayer_la_gigue();
+            }
+            let longueur = tampon.len() as u64;
+            let copier = |decalage: u64, octets: &[u8]| {
+                tampon[decalage as usize..decalage as usize + octets.len()].copy_from_slice(octets);
+                octets.len()
+            };
+            alea_vers(longueur, copier).map(|n| n as usize)
+        }
+        Sorte::Noyau { .. } => {
+            let contenu = procfs::lire(o.fichier(), position, tampon.len() as u64)?;
+            tampon[..contenu.len()].copy_from_slice(&contenu);
+            Ok(contenu.len())
+        }
+        Sorte::Console => Ok(0),
+        Sorte::Socket => crate::appels_reseau::lire_noyau(o, tampon),
+        _ => Err(-EINVAL),
+    }
+}
+
+/// Lit le fichier `n` à `position` dans `tampon`, page par page comme
+/// `lire_pages` : un trou se lit en zéros, la fin du fichier arrête. Rend ce
+/// qui est lu.
+fn lire_pages_noyau(n: Numero, position: u64, tampon: &mut [u8]) -> usize {
+    let mut lus = 0;
+    while lus < tampon.len() {
+        let ici = position + lus as u64;
+        let (page, reste) = vfs::avec(|fs, _| {
+            let page = fs.page(n, ici / PAGE);
+            if let Some(p) = page {
+                pages::prendre(p);
+            }
+            (page, fs.attributs(n).taille.saturating_sub(ici))
+        });
+        let decalage = (ici % PAGE) as usize;
+        let morceau = (tampon.len() - lus).min(PAGE as usize - decalage).min(reste as usize);
+        if morceau == 0 {
+            if let Some(p) = page {
+                pages::lacher(p);
+            }
+            break;
+        }
+        match page {
+            Some(p) => {
+                vfs::copier_page_vers_noyau(p, decalage, &mut tampon[lus..lus + morceau]);
+                pages::lacher(p);
+            }
+            None => tampon[lus..lus + morceau].fill(0),
+        }
+        lus += morceau;
+    }
+    vfs::avec(|fs, _| fs.acceder(n, temps::maintenant()));
+    lus
+}
+
+/// Écrit `octets`, du noyau, dans `o` (`ecrivable_par_le_noyau`, pas un
+/// tube : voir `Tube::episser`), à `position` pour un fichier ordinaire,
+/// comme write (une ronde du `splice_write` de Linux) : un fichier
+/// ordinaire, page par page ; /dev/null et /dev/zero, dans le vide ;
+/// /dev/random et /dev/urandom, mêlé au générateur, sans crédit, par blocs
+/// de 64 octets, un signal regardé à chaque page (`write_pool_user` : il
+/// fait rendre ce qui l'est) ; la console ; une socket, par envois
+/// jusqu'à ce que tout soit parti (`splice_to_socket`, qui regarde les
+/// signaux avant chacun : ERESTARTSYS si rien n'est parti), avec MSG_MORE
+/// si `plus_a_venir`. Rend ce qui est écrit.
+fn ecrire_pour_le_noyau(o: &FichierTenu, position: u64, octets: &[u8], plus_a_venir: bool) -> Result<usize, i64> {
+    match o.sorte {
+        // Chaque ronde est un write (`vfs_iter_write`) : la limite, puis les
+        // bits setuid et setgid (voir `ecrire_ouvert`).
+        Sorte::Fichier => {
+            limite_ecriture(position, octets.len()).map_err(errno)?;
+            if !octets.is_empty() {
+                retirer_les_privileges(o.numero());
+            }
+            ecrire_pages_noyau(o.numero(), position, octets)
+        }
+        Sorte::Null | Sorte::Zero => Ok(octets.len()),
+        Sorte::Aleatoire { .. } => {
+            let mut fait = 0;
+            for bloc in octets.chunks(64) {
+                aleatoire::melanger(bloc);
+                fait += bloc.len();
+                if fait < octets.len() && fait % PAGE as usize == 0 && tache::signal_en_attente() {
+                    break;
+                }
+            }
+            Ok(fait)
+        }
+        Sorte::Console => {
+            console::ecrire_octets(octets);
+            Ok(octets.len())
+        }
+        Sorte::Socket => {
+            let mut fait = 0;
+            while fait < octets.len() {
+                if tache::signal_en_attente() {
+                    return if fait > 0 { Ok(fait) } else { Err(-crate::reprise::ERESTARTSYS) };
+                }
+                match crate::appels_reseau::ecrire_noyau(o, &octets[fait..], plus_a_venir) {
+                    r if r > 0 => fait += r as usize,
+                    r if fait > 0 || r == 0 => break,
+                    r => return Err(r),
+                }
+            }
+            Ok(fait)
+        }
+        _ => Err(-EINVAL),
+    }
+}
+
+/// Écrit `octets`, du noyau, dans le fichier `n` à `position`, page par
+/// page comme `ecrire_pages` (la taille suit chaque morceau ; plus de place
+/// après des octets écrits : leur nombre, avant : ENOSPC ; au-delà de la
+/// plus grande taille de fichier : EFBIG).
+fn ecrire_pages_noyau(n: Numero, position: u64, octets: &[u8]) -> Result<usize, i64> {
+    let longueur = limite_ecriture(position, octets.len()).map_err(errno)?;
+    let mut ecrits = 0;
+    while ecrits < longueur {
+        let ici = position + ecrits as u64;
+        let page = vfs::avec(|fs, cadres| {
+            let p = fs.page_pour_ecrire(n, ici / PAGE, cadres)?;
+            pages::prendre(p);
+            Ok(p)
+        });
+        let page = match page {
+            Ok(p) => p,
+            Err(e) if ecrits == 0 => return Err(errno(e)),
+            Err(_) => break,
+        };
+        let decalage = (ici % PAGE) as usize;
+        let morceau = (longueur - ecrits).min(PAGE as usize - decalage);
+        vfs::copier_noyau_vers_page(page, decalage, &octets[ecrits..ecrits + morceau]);
+        pages::lacher(page);
+        ecrits += morceau;
+        vfs::avec(|fs, _| fs.ecrit(n, position + ecrits as u64, temps::maintenant()));
+    }
+    Ok(ecrits)
+}
+
+/// Transfère au plus `longueur` octets de `entree`, lus à `*position` (qui
+/// avance de ce qui est écrit, si `avance_en_lisant`), vers `sortie`, à
+/// `vers` pour un fichier ordinaire, ni l'une ni l'autre un tube : le
+/// `splice_direct_to_actor` de Linux, par le tube interne de la tâche
+/// (`tube::cases_du_tube_interne`, ENOMEM), en rondes. Chaque ronde lit ce
+/// que tiennent ses cases : autant de morceaux de pages d'un fichier
+/// ordinaire (le premier s'arrête à la fin de sa page), autant de pages du
+/// reste (une seule lecture, `copy_splice_read`) ; puis l'écrit, MSG_MORE
+/// pour une socket s'il reste à lire après elle. Jusqu'à la fin de
+/// l'entrée, une sortie qui ne prend plus tout, ou une erreur : avant tout
+/// octet, elle (une entrée sans `splice_read`, une sortie sans
+/// `splice_write` : EINVAL) ; après, ce qui est fait. Aucun signal n'arrête
+/// la boucle, comme chez Linux : seules les lectures et écritures qui le
+/// regardent (/dev/zero, /dev/random, une socket). Le tampon d'une ronde
+/// est effacé sur tous les chemins : il a pu recevoir des pages d'un
+/// fichier, ou de l'aléa. Le verrou d'écriture de la sortie est tenu tout
+/// du long (celui d'un write), jamais celui de l'entrée : deux inodes
+/// peuvent tomber dans le même des 64 verrous (`verrou_d_ecriture`), et la
+/// tâche s'y attendrait elle-même.
+fn transferer(entree: &FichierTenu, position: &mut u64, sortie: &FichierTenu, vers: u64, longueur: u64) -> Result<u64, i64> {
+    let cases = crate::tube::cases_du_tube_interne()?;
+    if longueur == 0 {
+        return Ok(0);
+    }
+    let ronde = (cases as u64 * PAGE).min(longueur) as usize;
+    let Ok(mut tampon) = faillible::remplie(ronde, 0u8) else { return Err(-ENOMEM) };
+    let _ecriture = (sortie.sorte == Sorte::Fichier).then(|| verrou_d_ecriture(sortie.numero()));
+    let pages_du_fichier = entree.sorte == Sorte::Fichier && entree.drapeaux as u64 & O_DIRECT == 0;
+    let mut fait = 0u64;
+    let r = loop {
+        if fait >= longueur {
+            break Ok(());
+        }
+        let reste = longueur - fait;
+        let decalage = if pages_du_fichier { *position % PAGE } else { 0 };
+        let n = reste.min(cases as u64 * PAGE - decalage) as usize;
+        let lus = if lisible_par_le_noyau(entree) { lire_pour_le_noyau(entree, *position, &mut tampon[..n]) } else { Err(-EINVAL) };
+        let lus = match lus {
+            Ok(0) => break Ok(()),
+            Ok(l) => l,
+            Err(e) if fait == 0 => break Err(e),
+            Err(_) => break Ok(()),
+        };
+        let ecrits = if ecrivable_par_le_noyau(sortie) {
+            ecrire_pour_le_noyau(sortie, vers + fait, &tampon[..lus], (lus as u64) < reste)
+        } else {
+            Err(-EINVAL)
+        };
+        let ecrits = match ecrits {
+            Ok(e) => e,
+            Err(e) if fait == 0 => break Err(e),
+            Err(_) => break Ok(()),
+        };
+        fait += ecrits as u64;
+        if avance_en_lisant(entree) {
+            *position += ecrits as u64;
+        }
+        if ecrits < lus {
+            break Ok(());
+        }
+    };
+    crypto::effacer(&mut tampon);
+    r.map(|()| fait)
+}
+
+/// Pose dans un tube, par `p`, au plus `longueur` octets de `entree` lus à
+/// `*position` (qui avance, si `avance_en_lisant`) : le `splice_read` de
+/// l'entrée (`do_splice_read` : sans lui, EINVAL). Un fichier ordinaire :
+/// ses pages elles-mêmes, une case par morceau de page, la page de zéros
+/// pour un trou, jusqu'à sa fin (`shmem_file_splice_read`) ; sauf en
+/// O_DIRECT, une copie (`copy_splice_read`), comme pour tout ce qui n'est
+/// pas un flux. Un flux (AF_UNIX, TCP) : ce qu'il reçoit, une case par
+/// morceau, coupé à la page (Linux coupe aux pages de la mémoire de ses
+/// paquets, qu'un programme ne peut pas prévoir) ; non bloquant si la
+/// socket l'est, ou pour AF_UNIX la sortie (`tube_non_bloquant`). Rend ce
+/// qui est posé.
+fn poser_dans_le_tube(entree: &FichierTenu, position: &mut u64, tube_non_bloquant: bool, p: &mut Poseur, longueur: usize) -> Result<usize, i64> {
+    if !lisible_par_le_noyau(entree) {
+        return Err(-EINVAL);
+    }
+    if entree.sorte == Sorte::Fichier && entree.drapeaux as u64 & O_DIRECT == 0 {
+        return Ok(poser_les_pages(entree.numero(), position, p, longueur));
+    }
+    if entree.sorte == Sorte::Socket && crate::appels_reseau::s_episse(entree) {
+        let poser = |_decalage: usize, octets: &[u8]| {
+            if octets.is_empty() {
+                return Ok(0);
+            }
+            let mut pris = 0;
+            while pris < octets.len() && p.libres() > 0 {
+                let Some(page) = Page::pour_programme() else { break };
+                let n = (octets.len() - pris).min(PAGE as usize);
+                p.poser_copie(page, n, |d| d.copy_from_slice(&octets[pris..pris + n]));
+                pris += n;
+            }
+            if pris == 0 && p.libres() > 0 { Err(-ENOMEM) } else { Ok(pris) }
+        };
+        return crate::appels_reseau::episser(entree, longueur, tube_non_bloquant, poser);
+    }
+    // `copy_splice_read` : les pages d'abord, avant de rien lire (une
+    // socket garde son datagramme si la mémoire manque), une lecture,
+    // puis les pages remplies posées, les autres rendues.
+    let n = longueur.div_ceil(PAGE as usize).min(p.libres());
+    let longueur = longueur.min(n * PAGE as usize);
+    let mut neuves: Vec<Page> = Vec::new();
+    if neuves.try_reserve_exact(n).is_err() {
+        return Err(-ENOMEM);
+    }
+    for _ in 0..n {
+        let Some(page) = Page::pour_programme() else { return Err(-ENOMEM) };
+        neuves.ajouter_dans_la_place(page);
+    }
+    let Ok(mut tampon) = faillible::remplie(longueur, 0u8) else { return Err(-ENOMEM) };
+    let r = lire_pour_le_noyau(entree, *position, &mut tampon);
+    if let Ok(lus) = r {
+        for (morceau, page) in tampon[..lus].chunks(PAGE as usize).zip(neuves.drain(..)) {
+            p.poser_copie(page, morceau.len(), |d| d.copy_from_slice(morceau));
+        }
+        if avance_en_lisant(entree) {
+            *position += lus as u64;
+        }
+    }
+    crypto::effacer(&mut tampon);
+    r
+}
+
+/// Les pages du fichier `n` posées dans un tube, à partir de `*position`
+/// (`shmem_file_splice_read`) : une case par morceau de page, jusqu'à
+/// `longueur` octets, la fin du fichier ou des cases ; un trou, la page de
+/// zéros. Rend ce qui est posé.
+fn poser_les_pages(n: Numero, position: &mut u64, p: &mut Poseur, mut longueur: usize) -> usize {
+    let mut fait = 0;
+    while longueur > 0 && p.libres() > 0 {
+        let ici = *position;
+        let (page, taille) = vfs::avec(|fs, _| (fs.page(n, ici / PAGE).map(pages::Tenue::prendre), fs.attributs(n).taille));
+        if ici >= taille {
+            break;
+        }
+        let decalage = (ici % PAGE) as usize;
+        let morceau = (longueur as u64).min(taille - ici).min(PAGE - decalage as u64) as usize;
+        match page {
+            Some(page) => p.poser_page(page, decalage, morceau),
+            None => p.poser_zeros(decalage, morceau),
+        }
+        longueur -= morceau;
+        fait += morceau;
+        *position += morceau as u64;
+    }
+    vfs::avec(|fs, _| fs.acceder(n, temps::maintenant()));
+    fait
+}
+
+/// La position de l'entrée ou de la sortie : celle que donne le programme à
+/// l'adresse `adresse` (un loff_t), ou celle du fichier (0 : pas
+/// d'adresse).
+fn position_donnee(o: &FichierTenu, adresse: u64) -> Result<u64, i64> {
+    if adresse == 0 {
+        return Ok(o.position());
+    }
+    let mut p = [0u8; 8];
+    copier_depuis_utilisateur(&mut p, adresse).map_err(|_| -EFAULT)?;
+    Ok(u64::from_le_bytes(p))
+}
+
+/// copy_file_range(entrée, &position, sortie, &position, longueur,
+/// drapeaux) : copie d'un fichier ordinaire à un autre, dans le noyau.
+/// L'ordre de Linux 6.18 (`SYSCALL_DEFINE6(copy_file_range)`, puis
+/// `vfs_copy_file_range`, `generic_copy_file_checks`), mesuré :
+///   - les deux descripteurs (EBADF ; O_PATH aussi) ;
+///   - les positions données lues (EFAULT), sinon celles des fichiers ;
+///   - des drapeaux : EINVAL ;
+///   - un dossier : EISDIR ; autre chose qu'un fichier ordinaire (un tube,
+///     une socket, /dev/null) : EINVAL ; l'entrée pas en lecture, la sortie
+///     pas en écriture ou en O_APPEND : EBADF ;
+///   - deux systèmes de fichiers différents (un fichier de /proc) : EXDEV ;
+///   - une position plus la longueur qui fait le tour, comptées sans signe :
+///     EOVERFLOW (une position négative ne le fait que plus près de 0 que
+///     la longueur) ;
+///   - la longueur ramenée à la fin de l'entrée ;
+///   - la position de la sortie, avec son signe, à la plus grande taille
+///     de fichier ou au-delà : EFBIG, même pour 0 octet ; la longueur
+///     ramenée à elle (`generic_write_check_limits`) ;
+///   - les deux plages qui se chevauchent dans le même fichier : EINVAL ;
+///   - `rw_verify_area`, pour l'entrée puis la sortie : une position
+///     négative, ou plus la longueur au-delà de la plus grande : EINVAL ;
+///   - rien à copier : 0 ; sinon au plus MAX_RW_COUNT, par `transferer`,
+///     puis les positions avancées d'autant (rendues au programme, EFAULT
+///     si on ne peut pas).
+pub fn copy_file_range(fd_entree: u64, adresse_entree: u64, fd_sortie: u64, adresse_sortie: u64, longueur: u64, drapeaux: u64) -> i64 {
+    let (entree, sortie) = match (tenir(fd_entree), tenir(fd_sortie)) {
+        (Ok(e), Ok(s)) => (e, s),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    if entree.sorte == Sorte::Chemin || sortie.sorte == Sorte::Chemin {
+        return -EBADF;
+    }
+    let (depuis, vers) = match (position_donnee(&entree, adresse_entree), position_donnee(&sortie, adresse_sortie)) {
+        (Ok(d), Ok(v)) => (d, v),
+        (Err(e), _) | (_, Err(e)) => return e,
+    };
+    if drapeaux as u32 != 0 {
+        return -EINVAL;
+    }
+    // `generic_file_rw_checks` : un fichier de /proc est ordinaire pour
+    // Linux (S_IFREG), d'un autre système : il ira jusqu'à EXDEV.
+    let ordinaire = |o: &FichierTenu| matches!(o.sorte, Sorte::Fichier | Sorte::Noyau { .. });
+    if entree.sorte == Sorte::Dossier || sortie.sorte == Sorte::Dossier {
+        return errno(Erreur::EISDIR);
+    }
+    if !ordinaire(&entree) || !ordinaire(&sortie) {
+        return -EINVAL;
+    }
+    if !entree.lecture || !sortie.ecriture || sortie.drapeaux as u64 & O_APPEND != 0 {
+        return -EBADF;
+    }
+    if entree.sorte != Sorte::Fichier || sortie.sorte != Sorte::Fichier {
+        return -EXDEV;
+    }
+    if depuis.checked_add(longueur).is_none() || vers.checked_add(longueur).is_none() {
+        return -EOVERFLOW;
+    }
+    let taille = vfs::avec(|fs, _| fs.attributs(entree.numero()).taille);
+    let longueur = if depuis as i64 >= taille as i64 { 0 } else { longueur.min(taille.wrapping_sub(depuis)) };
+    let max = fichiers::tmpfs::TAILLE_MAX;
+    if vers as i64 >= max as i64 {
+        return errno(Erreur::EFBIG);
+    }
+    let longueur = longueur.min(max.wrapping_sub(vers));
+    if entree.numero() == sortie.numero() && vers + longueur > depuis && vers < depuis + longueur {
+        return -EINVAL;
+    }
+    let hors = |p: u64| (p as i64) < 0 || (p as i64).checked_add(longueur as i64).is_none() || (longueur as i64) < 0;
+    if hors(depuis) || hors(vers) {
+        return -EINVAL;
+    }
+    if longueur == 0 {
+        return 0;
+    }
+    let mut ici = depuis;
+    let fait = match transferer(&entree, &mut ici, &sortie, vers, longueur.min(RW_MAX)) {
+        Ok(f) => f,
+        Err(e) => return e,
+    };
+    if fait == 0 {
+        return 0;
+    }
+    let mut r = fait as i64;
+    for (o, adresse, position) in [(&entree, adresse_entree, depuis + fait), (&sortie, adresse_sortie, vers + fait)] {
+        if adresse == 0 {
+            o.changer_position(position);
+        } else if copier_vers_utilisateur(adresse, &position.to_le_bytes()).is_err() {
+            r = -EFAULT;
+        }
+    }
+    r
+}
+
+/// sendfile(sortie, entrée, &position, longueur) : envoie des octets d'un
+/// fichier vers un autre, dans le noyau. L'ordre de Linux 6.18
+/// (`SYSCALL_DEFINE4(sendfile64)`, puis `do_sendfile`), mesuré :
+///   - la position donnée lue (EFAULT), avant même les descripteurs ;
+///   - l'entrée : EBADF (aussi pas ouverte en lecture) ; une position
+///     donnée, et un fichier qui n'en a pas (`a_des_positions`) : ESPIPE ;
+///   - `rw_verify_area` : une longueur ou une position négative, ou leur
+///     somme au-delà de la plus grande : EINVAL ; la longueur ramenée à
+///     MAX_RW_COUNT ;
+///   - la sortie : EBADF (aussi pas ouverte en écriture) ;
+///   - la plus grande position des deux systèmes (`position_max`) : la
+///     longueur ramenée à elle, et une position déjà à elle : EOVERFLOW
+///     (pas pour 0 octet) ;
+///   - vers un tube (`Tube::episser`) : sa place d'abord (sans lecteur :
+///     SIGPIPE et EPIPE ; plein et non bloquant : EAGAIN), puis 0 octet :
+///     0, puis une entrée sans `splice_read` : EINVAL ; une seule lecture,
+///     au plus ce que tiennent ses cases libres (`poser_dans_le_tube`) ;
+///   - vers autre chose : la position de la sortie plus la longueur
+///     au-delà de la plus grande (`rw_verify_area`), O_APPEND, une entrée
+///     qui ne se positionne pas (même pour 0 octet) : EINVAL ; puis les
+///     rondes de `transferer` ;
+///   - la position donnée rendue au programme, même après une erreur
+///     (EFAULT, qui l'emporte alors) ; sans elle, celle de l'entrée avance
+///     (si `avance_en_lisant`) ; celle d'une sortie ordinaire aussi.
+pub fn sendfile(fd_sortie: u64, fd_entree: u64, adresse_position: u64, longueur: u64) -> i64 {
+    let mut donnee = None;
+    if adresse_position != 0 {
+        let mut p = [0u8; 8];
+        if copier_depuis_utilisateur(&mut p, adresse_position).is_err() {
+            return -EFAULT;
+        }
+        donnee = Some(u64::from_le_bytes(p));
+    }
+    let mut position = donnee.unwrap_or(0);
+    let r = envoyer_le_fichier(fd_sortie, fd_entree, donnee.is_some(), &mut position, longueur);
+    if donnee.is_some() && copier_vers_utilisateur(adresse_position, &position.to_le_bytes()).is_err() {
+        return -EFAULT;
+    }
+    r
+}
+
+/// `do_sendfile` : `position` est celle que le programme a donnée
+/// (`donnee`), qui avance de ce qui est envoyé ; sans elle, celle de
+/// l'entrée.
+fn envoyer_le_fichier(fd_sortie: u64, fd_entree: u64, donnee: bool, position: &mut u64, longueur: u64) -> i64 {
+    let entree = match tenir(fd_entree) {
+        Ok(o) if o.lecture => o,
+        Ok(_) => return -EBADF,
+        Err(e) => return e,
+    };
+    if donnee && !a_des_positions(&entree) {
+        return -ESPIPE;
+    }
+    let depuis = if donnee { *position } else { entree.position() };
+    if (longueur as i64) < 0 || (depuis as i64) < 0 || (depuis as i64).checked_add(longueur as i64).is_none() {
+        return -EINVAL;
+    }
+    let mut longueur = longueur.min(RW_MAX);
+    let sortie = match tenir(fd_sortie) {
+        Ok(o) if o.ecriture => o,
+        Ok(_) => return -EBADF,
+        Err(e) => return e,
+    };
+    let max = position_max(&entree).min(position_max(&sortie));
+    if depuis + longueur > max {
+        if depuis >= max {
+            return -EOVERFLOW;
+        }
+        longueur = max - depuis;
+    }
+    let mut ici = depuis;
+    let vers = sortie.position();
+    let fait = if sortie.sorte == Sorte::Tube {
+        let non_bloquant = sortie.drapeaux as u64 & O_NONBLOCK != 0;
+        let r = sortie.tube().episser(non_bloquant, longueur as usize, |p, longueur| {
+            poser_dans_le_tube(&entree, &mut ici, non_bloquant, p, longueur)
+        });
+        if r < 0 {
+            return r;
+        }
+        r as u64
+    } else {
+        if (vers as i64) < 0 || (vers as i64).checked_add(longueur as i64).is_none() {
+            return -EINVAL;
+        }
+        if sortie.drapeaux as u64 & O_APPEND != 0 || !se_positionne(&entree) {
+            return -EINVAL;
+        }
+        match transferer(&entree, &mut ici, &sortie, vers, longueur) {
+            Ok(f) => f,
+            Err(e) => return e,
+        }
+    };
+    if fait > 0 {
+        // Les positions, la sortie d'abord (le même fichier des deux côtés :
+        // celle de l'entrée l'emporte).
+        if sortie.sorte == Sorte::Fichier {
+            sortie.changer_position(vers + fait);
+        }
+        if donnee {
+            *position = ici;
+        } else {
+            entree.changer_position(ici);
+        }
+    }
+    fait as i64
 }

@@ -101,6 +101,10 @@ const MADVISE: u64 = 28;
 const BRK: u64 = 12;
 const IOCTL: u64 = 16;
 const PREAD64: u64 = 17;
+// Les transferts dans le noyau (6i).
+const SENDFILE: u64 = 40;
+const FADVISE64: u64 = 221;
+const COPY_FILE_RANGE: u64 = 326;
 const PWRITE64: u64 = 18;
 const READV: u64 = 19;
 const WRITEV: u64 = 20;
@@ -252,6 +256,9 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         STATX => f::statx(a[0], a[1], a[2], a[3], a[4]),
         LSEEK => f::lseek(a[0], a[1], a[2]),
         PREAD64 => f::pread64(a[0], a[1], a[2], a[3]),
+        SENDFILE => f::sendfile(a[0], a[1], a[2], a[3]),
+        COPY_FILE_RANGE => f::copy_file_range(a[0], a[1], a[2], a[3], a[4], a[5]),
+        FADVISE64 => f::fadvise64(a[0], a[1], a[2], a[3]),
         PWRITE64 => f::pwrite64(a[0], a[1], a[2], a[3]),
         READV => f::readv(a[0], a[1], a[2]),
         WRITEV => f::writev(a[0], a[1], a[2]),
@@ -445,6 +452,9 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         STATX => ("statx", 5),
         LSEEK => ("lseek", 3),
         PREAD64 => ("pread64", 4),
+        SENDFILE => ("sendfile", 4),
+        COPY_FILE_RANGE => ("copy_file_range", 6),
+        FADVISE64 => ("fadvise64", 4),
         PWRITE64 => ("pwrite64", 4),
         READV => ("readv", 3),
         WRITEV => ("writev", 3),

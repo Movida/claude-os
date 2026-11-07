@@ -40,8 +40,8 @@ use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRNORM, 
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::faillible::{self, VecFaillible};
-use crate::pages::Page;
-use crate::{cpu, processus, signaux, temps, vfs};
+use crate::pages::{self, Page};
+use crate::{cpu, espace_utilisateur, processus, signaux, temps, vfs};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use fichiers::tmpfs::Ouvert;
@@ -107,23 +107,103 @@ fn trop(compte: u64) -> (bool, bool) {
     (PAGES_UTILISATEUR_DOUCE != 0 && compte > PAGES_UTILISATEUR_DOUCE, PAGES_UTILISATEUR_DURE != 0 && compte > PAGES_UTILISATEUR_DURE)
 }
 
-/// Une page de l'anneau (la `pipe_buffer` de Linux).
+/// La page d'une case (la `page` d'une `pipe_buffer`, et ses `ops`).
+///
+/// Choix de conception (6i) : comme chez Linux, une case peut DÉSIGNER une
+/// page qui n'est pas à elle. sendfile d'un fichier vers un tube y pose les
+/// pages du cache du fichier, sans copie (`shmem_file_splice_read`) : ce qui
+/// s'écrit dans le fichier avant la lecture du tube se lit donc (mesuré sous
+/// Linux 6.18 : sendfile de « 01234567 », pwrite de « XYZ », le tube rend
+/// « XYZ34567 »), et une troncature ôte la page au fichier, pas au tube, qui
+/// rend l'ancienne. Un trou du fichier : la page de zéros. Option écartée :
+/// copier les octets dans une page à la case (le premier sendfile de 6i),
+/// un écart qu'un programme voit, alors que splice, tee et vmsplice, plus
+/// tard, demanderont de toute façon des cases qui désignent.
+#[derive(Default)]
+enum Contenu {
+    /// La case est vide.
+    #[default]
+    Vide,
+    /// Une page à elle (`anon_pipe_buf_ops`) : celle d'un write, ou la copie
+    /// d'un sendfile dont l'entrée ne prête pas ses pages (/dev/zero, une
+    /// socket : `copy_splice_read`).
+    Propre(Page),
+    /// Une page du cache d'un fichier, tenue (`page_cache_pipe_buf_ops`).
+    Cache(pages::Tenue),
+    /// La page de zéros du noyau (`zero_pipe_buf_ops`) : un trou.
+    Zeros,
+}
+
+/// Les cases d'un tube neuf (`alloc_pipe_info`), comptées à l'utilisateur :
+/// seize, ou moins si pipe-max-size est plus petit, ou deux au-delà de sa
+/// limite douce ; None au-delà de sa limite dure (rien ne reste compté).
+fn compter_un_tube_neuf() -> Option<u32> {
+    let mut n = PAGES_PAR_DEFAUT;
+    if n as u64 * PAGE as u64 > TAILLE_MAX {
+        n = (TAILLE_MAX / PAGE as u64) as u32;
+    }
+    let mut compte = compter(0, n as u64);
+    if trop(compte).0 {
+        compte = compter(n as u64, PAGES_AU_MOINS as u64);
+        n = PAGES_AU_MOINS;
+    }
+    if trop(compte).1 {
+        compter(n as u64, 0);
+        return None;
+    }
+    Some(n)
+}
+
+/// Les cases du tube interne de la tâche courante (le `current->splice_pipe`
+/// de Linux, 6i) : sendfile et copy_file_range vers autre chose qu'un tube
+/// y font passer les octets, par rondes d'autant de pages
+/// (`splice_direct_to_actor`), ce qu'un programme voit : un datagramme par
+/// ronde vers une socket AF_UNIX (mesuré : 100 000 octets arrivent en 65 536
+/// et 34 464). Fait au premier besoin, comme un tube neuf, ENOMEM au-delà
+/// de la limite dure, et compté à l'utilisateur jusqu'à la fin de la tâche
+/// (`rendre_le_tube_interne`). Sans pages : celles de Linux ne sont prises
+/// qu'en le remplissant, et nos rondes passent par un tampon du noyau
+/// (`appels_fichiers::transferer`).
+pub fn cases_du_tube_interne() -> Result<usize, i64> {
+    let t = tache::courante();
+    let n = t.tube_interne.load(Relaxed);
+    if n != 0 {
+        return Ok(n as usize);
+    }
+    let n = compter_un_tube_neuf().ok_or(-ENOMEM)?;
+    t.tube_interne.store(n, Relaxed);
+    Ok(n as usize)
+}
+
+/// La fin d'une tâche qui avait un tube interne de `cases` cases (0 :
+/// aucun) : elles ne sont plus comptées.
+pub fn rendre_le_tube_interne(cases: u32) {
+    if cases != 0 {
+        compter(cases as u64, 0);
+    }
+}
+
+/// Une case de l'anneau (la `pipe_buffer` de Linux).
 #[derive(Default)]
 struct Tampon {
-    /// La page ; None : la case est vide.
-    page: Option<Page>,
+    contenu: Contenu,
     debut: usize,
     longueur: usize,
     /// Un paquet (O_DIRECT) : lu d'un coup, le reste jeté.
     paquet: bool,
-    /// Une écriture peut s'y ajouter (PIPE_BUF_FLAG_CAN_MERGE).
+    /// Une écriture peut s'y ajouter (PIPE_BUF_FLAG_CAN_MERGE) : seulement
+    /// une page à elle, posée par write.
     fusionnable: bool,
 }
 
 impl Tampon {
-    /// Ses octets, dans la page (une case pleine).
+    /// Les octets de sa page, une page à elle (seules celles-là s'écrivent :
+    /// une case neuve de write, ou une fusionnable).
     fn octets(&mut self) -> &mut [u8] {
-        self.page.as_mut().expect("case de tube sans page").octets()
+        match &mut self.contenu {
+            Contenu::Propre(page) => page.octets(),
+            _ => unreachable!("ecriture dans une case de tube qui n'a pas sa page"),
+        }
     }
 }
 
@@ -211,6 +291,26 @@ impl Morceaux<'_> {
         copies
     }
 
+    /// Copie vers le programme `n` octets de la page `cadre`, à partir de
+    /// `decalage` : une page qui n'est pas à la case (celle d'un fichier, que
+    /// d'autres écrivent peut-être pendant la copie, ou celle des zéros), par
+    /// `vfs::copier_vers_programme`, qui ne suppose rien de ce qu'il lit. Rend
+    /// ce qui a été copié (moins à une faute).
+    fn vers_page(&mut self, cadre: u64, decalage: usize, n: usize) -> usize {
+        let mut copies = 0;
+        while copies < n {
+            let Some(&(base, longueur)) = self.reste.first() else { break };
+            let m = (longueur - self.fait).min((n - copies) as u64) as usize;
+            let c = vfs::copier_vers_programme(cadre, decalage + copies, m, base + self.fait);
+            copies += c;
+            self.avancer(c as u64, longueur);
+            if c < m {
+                break;
+            }
+        }
+        copies
+    }
+
     /// Copie du programme vers `octets` : rend ce qui a été copié.
     fn depuis(&mut self, octets: &mut [u8]) -> usize {
         let mut copies = 0;
@@ -241,7 +341,13 @@ impl Morceaux<'_> {
 
 /// Attend dans `file`, en exclusive, que `condition` soit vraie
 /// (`wait_event_interruptible_exclusive`) ; faux : un signal.
-fn attendre(file: &FileAttente, mut condition: impl FnMut() -> bool) -> bool {
+fn attendre(file: &FileAttente, condition: impl FnMut() -> bool) -> bool {
+    attendre_en(file, true, condition)
+}
+
+/// Comme `attendre`, exclusive ou non (`wait_event_interruptible` : réveillée
+/// par tout réveil de la file, sans compter parmi les exclusives).
+fn attendre_en(file: &FileAttente, exclusive: bool, mut condition: impl FnMut() -> bool) -> bool {
     let interruptions = cpu::couper_interruptions();
     let t = tache::courante();
     let mut signal = false;
@@ -252,7 +358,11 @@ fn attendre(file: &FileAttente, mut condition: impl FnMut() -> bool) -> bool {
         if signal {
             break false;
         }
-        file.inscrire_exclusive();
+        if exclusive {
+            file.inscrire_exclusive();
+        } else {
+            file.inscrire();
+        }
         signal = attente::dormir(None, Sommeil::Interruptible) == Reveil::Signal;
         file.retirer(t);
     };
@@ -263,22 +373,13 @@ fn attendre(file: &FileAttente, mut condition: impl FnMut() -> bool) -> bool {
 }
 
 impl Tube {
-    /// Un tube neuf (`alloc_pipe_info`) : seize pages, ou moins si
-    /// pipe-max-size est plus petit, ou deux au-delà de la limite douce de
-    /// l'utilisateur ; None au-delà de sa limite dure.
+    /// Un tube neuf (`alloc_pipe_info`) : ses cases (`compter_un_tube_neuf`) ;
+    /// None au-delà de la limite dure de l'utilisateur, ou sans mémoire.
     fn new() -> Option<Tube> {
-        let mut n = PAGES_PAR_DEFAUT;
-        if n as u64 * PAGE as u64 > TAILLE_MAX {
-            n = (TAILLE_MAX / PAGE as u64) as u32;
-        }
-        let mut compte = compter(0, n as u64);
-        if trop(compte).0 {
-            compte = compter(n as u64, PAGES_AU_MOINS as u64);
-            n = PAGES_AU_MOINS;
-        }
+        let n = compter_un_tube_neuf()?;
         let anneau = match vides(n as usize) {
-            Ok(a) if !trop(compte).1 => a,
-            _ => {
+            Ok(a) => a,
+            Err(_) => {
                 compter(n as u64, 0);
                 return None;
             }
@@ -322,8 +423,13 @@ impl Tube {
                 let case = (e.queue & (e.taille - 1)) as usize;
                 let t = &mut anneau[case];
                 let n = t.longueur.min(total);
-                let (debut, octets) = (t.debut, t.octets());
-                let copies = m.vers(&octets[debut..debut + n]);
+                let debut = t.debut;
+                let copies = match &mut t.contenu {
+                    Contenu::Propre(page) => m.vers(&page.octets()[debut..debut + n]),
+                    Contenu::Cache(page) => m.vers_page(page.cadre(), debut, n),
+                    Contenu::Zeros => m.vers_page(espace_utilisateur::page_de_zeros(), debut, n),
+                    Contenu::Vide => unreachable!("case de tube pleine sans page"),
+                };
                 if copies < n {
                     if r == 0 {
                         r = -EFAULT;
@@ -449,7 +555,7 @@ impl Tube {
                         }
                         break;
                     };
-                    let mut t = Tampon { page: Some(page), debut: 0, longueur: 0, paquet: paquets, fusionnable: !paquets };
+                    let mut t = Tampon { contenu: Contenu::Propre(page), debut: 0, longueur: 0, paquet: paquets, fusionnable: !paquets };
                     let copies = m.depuis(t.octets());
                     if copies < PAGE && m.restant() != 0 {
                         // La page est rendue avec le tampon.
@@ -508,6 +614,63 @@ impl Tube {
         }
         self.async_lecteurs.tuer(asynchrone::SIGIO, Raison::Entree);
         r
+    }
+
+    /// sendfile vers ce tube (`splice_file_to_pipe`, 6i), l'anneau tenu tout
+    /// du long (le `pipe_lock` de Linux, qui le garde aussi pendant que
+    /// l'entrée attend, une socket vide par exemple). De la place d'abord
+    /// (`wait_for_space`) : sans lecteur, SIGPIPE et EPIPE ; plein, EAGAIN
+    /// en non bloquant, ERESTARTSYS sur un signal, sinon attendre qu'un
+    /// lecteur en fasse (sans être exclusive : `pipe_wait_writable`). Puis,
+    /// rien à poser : 0 ; sinon `remplir` pose, une fois, au plus `longueur`
+    /// octets et ce que tiennent les cases libres (`do_splice_read`), par le
+    /// `Poseur`, et rend combien, ou son erreur s'il n'a rien posé. Une
+    /// seule lecture de l'entrée, comme Linux : ce qui ne tient pas dans le
+    /// tube reste à un autre appel, que le programme refait. Ce qui est posé
+    /// réveille les lecteurs (`wakeup_pipe_readers`, sans clé) et leur
+    /// SIGIO.
+    pub fn episser(&self, non_bloquant: bool, longueur: usize, remplir: impl FnOnce(&mut Poseur, usize) -> Result<usize, i64>) -> i64 {
+        let mut anneau = self.anneau.verrouiller();
+        loop {
+            let e = self.etat();
+            if e.lecteurs == 0 {
+                signaux::au_fil_courant(SIGPIPE);
+                return -EPIPE;
+            }
+            if !e.plein() {
+                break;
+            }
+            if non_bloquant {
+                return -EAGAIN;
+            }
+            if tache::signal_en_attente() {
+                return -crate::reprise::ERESTARTSYS;
+            }
+            drop(anneau);
+            let inscriptible = || {
+                let e = self.etat();
+                !e.plein() || e.lecteurs == 0
+            };
+            attendre_en(&self.wr_wait, false, inscriptible);
+            anneau = self.anneau.verrouiller();
+        }
+        if longueur == 0 {
+            return 0;
+        }
+        let e = self.etat();
+        let libres = e.max.saturating_sub(e.tete.wrapping_sub(e.queue)) as usize;
+        let mut poseur = Poseur { tube: self, anneau: &mut anneau, libres };
+        let r = remplir(&mut poseur, longueur.min(libres * PAGE));
+        drop(anneau);
+        match r {
+            Ok(0) => 0,
+            Ok(n) => {
+                self.rd_wait.reveiller(0, 1);
+                self.async_lecteurs.tuer(asynchrone::SIGIO, Raison::Entree);
+                n as i64
+            }
+            Err(e) => e,
+        }
     }
 
     /// Le sondage d'un bout (`pipe_poll`) : ses files d'abord, puis l'état.
@@ -675,6 +838,52 @@ impl Drop for Tube {
         // dernier Arc rendu, souvent sous le verrou des fichiers : le
         // dernier close).
         compter(self.comptees.load(Relaxed), 0);
+    }
+}
+
+/// Ce qui pose des cases dans un tube pour sendfile (`Tube::episser`),
+/// l'anneau tenu : les cases libres, et trois façons de les remplir, celles
+/// des `splice_read` de Linux. Une case posée n'est jamais fusionnable ni un
+/// paquet, même dans un tube O_DIRECT (mesuré : deux sendfile de 6 et 4
+/// octets se lisent d'un coup, 10).
+pub struct Poseur<'a> {
+    tube: &'a Tube,
+    anneau: &'a mut Vec<Tampon>,
+    libres: usize,
+}
+
+impl Poseur<'_> {
+    /// Les cases qu'on peut encore remplir.
+    pub fn libres(&self) -> usize {
+        self.libres
+    }
+
+    fn poser(&mut self, contenu: Contenu, debut: usize, longueur: usize) {
+        debug_assert!(self.libres > 0 && debut + longueur <= PAGE);
+        let mut e = self.tube.etat.verrouiller();
+        self.anneau[(e.tete & (e.taille - 1)) as usize] = Tampon { contenu, debut, longueur, paquet: false, fusionnable: false };
+        e.tete = e.tete.wrapping_add(1);
+        self.libres -= 1;
+    }
+
+    /// `longueur` octets à `debut` d'une page du cache d'un fichier,
+    /// tenue (`splice_folio_into_pipe`).
+    pub fn poser_page(&mut self, page: pages::Tenue, debut: usize, longueur: usize) {
+        self.poser(Contenu::Cache(page), debut, longueur);
+    }
+
+    /// `longueur` octets de la page de zéros, à `debut` (un trou :
+    /// `splice_zeropage_into_pipe`).
+    pub fn poser_zeros(&mut self, debut: usize, longueur: usize) {
+        self.poser(Contenu::Zeros, debut, longueur);
+    }
+
+    /// Une page à la case, prise d'avance (`copy_splice_read` les alloue
+    /// avant de lire), qui reçoit `longueur` octets (au plus une page) par
+    /// `remplir`.
+    pub fn poser_copie(&mut self, mut page: Page, longueur: usize, remplir: impl FnOnce(&mut [u8])) {
+        remplir(&mut page.octets()[..longueur]);
+        self.poser(Contenu::Propre(page), 0, longueur);
     }
 }
 
