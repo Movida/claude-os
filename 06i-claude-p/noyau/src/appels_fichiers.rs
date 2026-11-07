@@ -52,7 +52,7 @@ use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Prive, R
 use crate::faillible::{self, VecFaillible};
 use crate::processus::Processus;
 use crate::vfs::{self, CadresDuNoyau, Systeme};
-use crate::{aleatoire, console, evenements, pages, processus, procfs, tache, temps};
+use crate::{aleatoire, console, evenements, pages, processus, procfs, surveillance, tache, temps};
 use fichiers::chemins::{Arbre, Depart, Dernier, Fin, PATH_MAX, Suivre};
 use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_tmpfs};
 use crate::vfs::Montage;
@@ -61,6 +61,7 @@ use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFM
 use crate::attente::{GardeMutex, Mutex};
 use crate::pages::Page;
 use crate::tube::Poseur;
+use crate::surveillance::{IN_ACCESS, IN_ATTRIB, IN_CREATE, IN_DELETE, IN_MODIFY, IN_OPEN};
 
 // Les numéros d'erreur de Linux qui ne viennent pas du tmpfs.
 const EBADF: i64 = 9;
@@ -227,6 +228,15 @@ impl FichierTenu {
         }
     }
 
+    /// L'instance d'inotify d'un fichier de sorte Inotify ; None pour une
+    /// autre sorte.
+    pub fn inotify(&self) -> Option<&crate::partage::Arc<surveillance::Groupe>> {
+        match &self.prive {
+            Prive::Inotify(g) => Some(g),
+            _ => None,
+        }
+    }
+
     /// L'epoll d'un fichier de sorte Epoll.
     pub fn epoll(&self) -> &crate::epoll::Epoll {
         match &self.prive {
@@ -235,10 +245,6 @@ impl FichierTenu {
         }
     }
 
-    /// Son objet, tenu à son tour (le fichier peut ensuite être rendu).
-    fn tenir_objet(&self) -> ObjetTenu {
-        vfs::avec_systeme(|s, _| ObjetTenu::tenir(s, self.objet))
-    }
 }
 
 impl Drop for FichierTenu {
@@ -446,6 +452,152 @@ fn canonique(s: &Systeme, pid: u32, fin: &Fin<Objet>) -> Vec<u8> {
     .unwrap_or_default()
 }
 
+/// Le fichier ouvert que désigne `fin`, si son dernier composant est un lien
+/// magique (/proc/<pid>/fd/N) : Linux rouvre alors son `struct path`.
+fn saut(s: &Systeme, pid: u32, fin: &Fin<Objet>) -> Option<Fichier> {
+    if fin.dernier != Dernier::Nom {
+        return None;
+    }
+    let objet = fin.objet?;
+    s.avec_vue(pid, |vue| {
+        let lien = vue.chercher(fin.dossier, &fin.nom)?;
+        if vue.saut(lien) != Some(objet) {
+            return None;
+        }
+        procfs::fichier_du_saut(lien)
+    })
+}
+
+/// Le lieu de ce que désigne `fin` (pour inotify : surveillance::Lieu),
+/// préparé : le dernier composant et son dossier ; pour « . », « .. » et la
+/// racine, le dossier dans son parent ; au bout d'un lien magique, le lieu
+/// du fichier ouvert qu'il désigne. Dans un système monté aussi, sauf pour
+/// sa racine (un point de montage). ENOMEM s'il n'y a pas la place du nom.
+pub fn preparer_lieu(s: &Systeme, pid: u32, fin: &Fin<Objet>) -> Result<Option<surveillance::LieuPrepare>, i64> {
+    if let Some(f) = saut(s, pid, fin) {
+        return match s.ouverts.voir(f).and_then(|o| o.lieu.as_ref()) {
+            Some(l) => surveillance::LieuPrepare::copie(l).map(Some).map_err(|_| -ENOMEM),
+            None => Ok(None),
+        };
+    }
+    let r = match (fin.dernier, fin.dossier, fin.objet) {
+        (Dernier::Nom, d @ Objet::Tmpfs(_), None | Some(Objet::Tmpfs(_))) | (Dernier::Nom, d @ Objet::Monte(..), Some(Objet::Monte(..))) => {
+            surveillance::LieuPrepare::entree(d, &fin.nom).map(Some)
+        }
+        (Dernier::Point | Dernier::PointPoint | Dernier::Racine, _, Some(Objet::Tmpfs(n))) => {
+            surveillance::LieuPrepare::du_dossier(&s.fs, n)
+        }
+        (Dernier::Point | Dernier::PointPoint | Dernier::Racine, _, Some(o @ Objet::Monte(..))) => {
+            s.avec_vue(pid, |vue| surveillance::LieuPrepare::du_dossier_monte(vue, o))
+        }
+        _ => Ok(None),
+    };
+    r.map_err(|_| -ENOMEM)
+}
+
+/// Un chemin tenu le temps d'un appel (le `struct path` que Linux garde de
+/// la résolution jusqu'à la fin de l'appel) : un fichier ouvert O_PATH, qui
+/// ne dit rien à inotify, mais dont le lieu suit un renommage (vfs.rs) :
+/// l'événement de l'appel (chmod, truncate...) va au dossier et au nom que
+/// l'objet a à ce moment-là, comme chez Linux. Lâché à la fin de la garde.
+pub struct CheminTenu {
+    fichier: Fichier,
+    objet: Objet,
+}
+
+impl CheminTenu {
+    pub fn objet(&self) -> Objet {
+        self.objet
+    }
+
+    pub fn fichier(&self) -> Fichier {
+        self.fichier
+    }
+}
+
+impl Drop for CheminTenu {
+    /// Jamais sous un verrou.
+    fn drop(&mut self) {
+        vfs::avec_systeme(|s, cadres| s.lacher(self.fichier, cadres));
+    }
+}
+
+/// Un fichier ouvert O_PATH neuf pour `objet`, avec son lieu (`CheminTenu`).
+fn chemin_ouvert(s: &mut Systeme, objet: Objet, lieu: Option<surveillance::LieuPrepare>, cadres: &mut CadresDuNoyau)
+    -> Result<CheminTenu, i64> {
+    let tenu = match objet {
+        Objet::Tmpfs(n) => {
+            s.fs.prendre(n);
+            Tenu::Tmpfs(fichiers::tmpfs::Ouvert { numero: n, cree: false, tronquer: false, ecrivain: false })
+        }
+        o => Tenu::Noyau(o),
+    };
+    let f = FichierOuvert::new(Sorte::Chemin, tenu, false, false, O_PATH as u32, b"");
+    match s.ouverts.ajouter(f) {
+        Ok(fichier) => {
+            if let Some(l) = lieu {
+                s.ouverts.fichier(fichier).lieu = l.achever(&mut s.fs, objet);
+            }
+            Ok(CheminTenu { fichier, objet })
+        }
+        Err(f) => {
+            if let Tenu::Tmpfs(o) = f.tenu {
+                s.fs.fermer(&o, cadres);
+            }
+            Err(-ENOMEM)
+        }
+    }
+}
+
+/// Comme `objet`, tenu par un `CheminTenu`. Un chemin vide (AT_EMPTY_PATH)
+/// : le fichier ouvert du descripteur lui-même, tenu une fois de plus, ou
+/// le dossier courant.
+fn tenir_chemin(dirfd: u64, chemin: &[u8], suivre: bool, vide_permis: bool) -> Result<CheminTenu, i64> {
+    if chemin.is_empty() {
+        if !vide_permis {
+            return Err(errno(Erreur::ENOENT));
+        }
+        return processus::avec(|p| {
+            vfs::avec_systeme(|s, cadres| {
+                if dirfd as i32 != AT_FDCWD {
+                    let fichier = p.descripteurs.get(dirfd).ok_or(-EBADF)?.fichier;
+                    s.ouverts.prendre(fichier);
+                    return Ok(CheminTenu { fichier, objet: s.ouverts.fichier(fichier).objet() });
+                }
+                let lieu = match p.dossier {
+                    Objet::Tmpfs(n) => surveillance::LieuPrepare::du_dossier(&s.fs, n),
+                    o => s.avec_vue(p.pid, |vue| surveillance::LieuPrepare::du_dossier_monte(vue, o)),
+                }
+                .map_err(|_| -ENOMEM)?;
+                chemin_ouvert(s, p.dossier, lieu, cadres)
+            })
+        });
+    }
+    let tenu = depart(dirfd, chemin)?;
+    vfs::avec_systeme(|s, cadres| {
+        let fin = s.resoudre(tenu.pid, &tenu.depart(), chemin, if suivre { Suivre::Toujours } else { Suivre::AvecBarre })
+            .map_err(errno)?;
+        let objet = fin.objet.ok_or(errno(Erreur::ENOENT))?;
+        if fin.barre && !s.avec_vue(tenu.pid, |vue| fichiers::montages::est_dossier(vue, objet)) {
+            return Err(errno(Erreur::ENOTDIR));
+        }
+        let lieu = preparer_lieu(s, tenu.pid, &fin)?;
+        chemin_ouvert(s, objet, lieu, cadres)
+    })
+}
+
+/// Ce que surveille inotify_add_watch (surveillance.rs) : l'objet de
+/// `adresse`, tenu (le lien final suivi si `suivre`), s'il est un dossier,
+/// et si l'appelant a le droit de le lire (`path_permission(MAY_READ)`).
+pub fn objet_pour_surveiller(adresse: u64, suivre: bool) -> Result<(ObjetTenu, bool, bool), i64> {
+    const LIRE: u32 = 4;
+    let chemin = chemin(adresse)?;
+    let o = objet(AT_FDCWD as u64, &chemin, suivre, false)?;
+    let qui = processus::avec(|p| p.identite);
+    let a = attributs(o.objet());
+    Ok((o, a.mode & S_IFMT == S_IFDIR, permis(a.mode, a.uid, a.gid, qui, LIRE)))
+}
+
 /// L'objet désigné par `chemin` depuis `dirfd`, qui doit exister (stat,
 /// access...), tenu. Avec AT_EMPTY_PATH, un chemin vide désigne `dirfd`
 /// lui-même.
@@ -547,12 +699,15 @@ fn ouvrir_depuis(qui: fichiers::Identite, depuis: Option<Objet>, chemin: &[u8], 
             | if ecriture && lecture { 2 } else if ecriture { O_WRONLY } else { O_RDONLY }
             | if dossier { O_DIRECTORY } else { 0 };
         let complet = canonique(s, 0, &fin);
+        let lieu = preparer_lieu(s, 0, &fin).map_err(|_| Erreur::ENOMEM)?;
         let fin = match en_tmpfs(fin) {
             Ok(fin) => fin,
             Err(fin) => {
                 let objet = fin.objet.ok_or(Erreur::ENOENT)?;
                 let f = s.avec_vue(0, |vue| ouvrir_monte(vue, qui, objet, &o, drapeaux as u32, chemin))?;
-                return s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| Erreur::ENOMEM);
+                let fichier = s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| Erreur::ENOMEM)?;
+                surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
+                return Ok(fichier);
             }
         };
         let ouvert = s.fs.ouvrir(qui, &fin, &o, temps::maintenant())?;
@@ -561,13 +716,17 @@ fn ouvrir_depuis(qui: fichiers::Identite, depuis: Option<Objet>, chemin: &[u8], 
             s.fs.fermer(&ouvert, cadres);
             return Err(Erreur::ENXIO);
         };
-        s.ouverts.ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), lecture, ecriture, drapeaux as u32, chemin).avec_chemin(complet))
+        let fichier = s.ouverts
+            .ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), lecture, ecriture, drapeaux as u32, chemin).avec_chemin(complet))
             .map_err(|f| {
                 if let Tenu::Tmpfs(ouvert) = f.tenu {
                     s.fs.fermer(&ouvert, cadres);
                 }
                 Erreur::ENOMEM
-            })
+            })?;
+        s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, Objet::Tmpfs(ouvert.numero)));
+        surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
+        Ok(fichier)
     })
 }
 
@@ -631,9 +790,10 @@ pub fn ouvrir_monte(vue: &Vue<Montage>, qui: Identite, objet: Objet, o: &Ouvertu
 /// L'inode est tenu une fois : à lâcher après usage. Seul un fichier du
 /// tmpfs peut être un programme : ce qu'on trouve dans un système monté
 /// n'est pas exécutable (EACCES, comme `do_open_execat` pour un fichier
-/// sans le droit x).
-pub fn trouver_pour(qui: fichiers::Identite, chemin: &[u8]) -> Result<(Numero, Vec<u8>), Erreur> {
-    vfs::avec_systeme(|s, _| {
+/// sans le droit x). Et le chemin, tenu jusqu'à l'ouverture
+/// (`ouvrir_inode`) : son lieu, pour inotify.
+pub fn trouver_pour(qui: fichiers::Identite, chemin: &[u8]) -> Result<(Numero, Vec<u8>, CheminTenu), Erreur> {
+    vfs::avec_systeme(|s, cadres| {
         let racine = s.racine();
         let depart = Depart { racine, dossier: racine, qui, sous: false };
         let fin = s.resoudre(0, &depart, chemin, Suivre::Toujours)?;
@@ -643,8 +803,10 @@ pub fn trouver_pour(qui: fichiers::Identite, chemin: &[u8]) -> Result<(Numero, V
         }
         let n = o.tmpfs().ok_or(Erreur::EACCES)?;
         let complet = canonique(s, 0, &fin);
+        let lieu = preparer_lieu(s, 0, &fin).map_err(|_| Erreur::ENOMEM)?;
+        let tenu = chemin_ouvert(s, o, lieu, cadres).map_err(|_| Erreur::ENOMEM)?;
         s.fs.prendre(n);
-        Ok((n, complet))
+        Ok((n, complet, tenu))
     })
 }
 
@@ -710,6 +872,9 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
     let gardes = (drapeaux & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC)) | largefile;
     let fichier = avec_fin(dirfd, &chemin, suivre_pour(&o, drapeaux & O_NOFOLLOW != 0), |s, cadres, fin, depart, pid| {
         let complet = canonique(s, pid, &fin);
+        // Le lieu du fichier (inotify), préparé d'abord : une fois le
+        // fichier créé ou ouvert, plus rien ne doit échouer.
+        let lieu = preparer_lieu(s, pid, &fin)?;
         let fin = match en_tmpfs(fin) {
             Ok(fin) => fin,
             Err(fin) => {
@@ -726,7 +891,10 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
                     return Err(if e == 0 { errno(Erreur::ENOENT) } else { e });
                 };
                 let f = s.avec_vue(pid, |vue| ouvrir_monte(vue, depart.qui, objet, &o, gardes as u32, &chemin)).map_err(errno)?;
-                return Ok((s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| -ENOMEM)?, None));
+                let fichier = s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| -ENOMEM)?;
+                s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, objet));
+                surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
+                return Ok((fichier, None));
             }
         };
         let ouvert = s.fs.ouvrir(depart.qui, &fin, &o, maintenant).map_err(errno)?;
@@ -759,6 +927,13 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
                 }
                 -ENOMEM
             })?;
+        // Ce qu'en voit inotify : la création (au dossier), puis
+        // l'ouverture (`fsnotify_create`, puis `fsnotify_open`).
+        s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, Objet::Tmpfs(ouvert.numero)));
+        if ouvert.cree {
+            surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_CREATE, false, 0);
+        }
+        surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
         Ok((fichier, Some(ouvert)))
     })?;
     let (fichier, ouvert) = fichier;
@@ -770,7 +945,7 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
     if let Some(ouvert) = ouvert
         && ouvert.tronquer
     {
-        tronquer(ouvert.numero, 0);
+        tronquer(ouvert.numero, 0, fichier);
     }
     Ok(fd.installer(fichier, drapeaux & O_CLOEXEC != 0))
 }
@@ -797,7 +972,7 @@ fn fermer_descripteur(fd: u64) -> Result<(), i64> {
 
 /// Ce fichier a-t-il de quoi retenir O_ASYNC (un `fasync`) ?
 fn a_une_liste(o: &FichierTenu) -> bool {
-    matches!(o.sorte, Sorte::Socket | Sorte::Tube)
+    matches!(o.sorte, Sorte::Socket | Sorte::Tube | Sorte::Inotify)
 }
 
 /// `f_op->fasync`, et le drapeau qu'il pose : la socket (`sock_fasync`) ou les bouts du tube
@@ -812,6 +987,9 @@ fn basculer_async(o: &FichierTenu, fd: u64, oui: bool) -> Result<(), i64> {
     });
     let listes = match o.sorte {
         Sorte::Tube => [lecture.then(|| &o.tube().async_lecteurs), ecriture.then(|| &o.tube().async_ecrivains)],
+        // Une instance d'inotify (`fsnotify_fasync`) : SIGIO à chaque
+        // événement ajouté.
+        Sorte::Inotify => [o.inotify().map(|g| &g.async_lecteurs), None],
         _ => [Some(o.socket().liste_async()), None],
     };
     if oui {
@@ -1122,12 +1300,19 @@ fn ecrire_pages(n: Numero, position: u64, tampon: u64, longueur: u64) -> Result<
     Ok(ecrits)
 }
 
-/// Une écriture du fichier `n` par la tâche courante : ses bits setuid et
-/// setgid tombent s'il le faut (Tmpfs::retirer_les_privileges ; une tâche
-/// du noyau est root). Une troncature fait de même dans `tronquer`.
-fn retirer_les_privileges(n: Numero) {
+/// Une écriture du fichier `n`, tenu par le fichier ouvert `par`, par la
+/// tâche courante : ses bits setuid et setgid tombent s'il le faut
+/// (Tmpfs::retirer_les_privileges ; une tâche du noyau est root), ce
+/// qu'inotify voit (IN_ATTRIB, celui du `notify_change` de
+/// `file_remove_privs`). Une troncature fait de même dans `tronquer`, d'un
+/// seul événement avec son IN_MODIFY.
+fn retirer_les_privileges(n: Numero, par: Fichier) {
     let qui = processus::essayer_avec(|p| p.identite).unwrap_or(Identite::ROOT);
-    vfs::avec(|fs, _| fs.retirer_les_privileges(qui, n, temps::maintenant()));
+    vfs::avec_systeme(|s, _| {
+        if s.fs.retirer_les_privileges(qui, n, temps::maintenant()) {
+            surveillance::changement(&s.fs, s.ouverts.fichier(par), IN_ATTRIB);
+        }
+    });
 }
 
 /// Des octets aléatoires vers le programme (`get_random_bytes_user`) :
@@ -1230,7 +1415,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
     // se lit pas (pas d'opération read : EINVAL, avant de regarder le
     // tampon).
     match o.sorte {
-        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket if position.is_some() => return Err(-ESPIPE),
+        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify if position.is_some() => return Err(-ESPIPE),
         Sorte::Epoll => return Err(-EINVAL),
         _ => {}
     }
@@ -1270,6 +1455,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         }
         Sorte::Chemin => Err(-EBADF),
         Sorte::EventFd => evenements::lire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::Inotify => surveillance::lire(o.inotify().expect("une instance"), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Tube => en_resultat(o.tube().lire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0)),
         Sorte::Socket => en_resultat(crate::appels_reseau::lire(o, &[(tampon, longueur)])),
         Sorte::Epoll => Err(-EINVAL),
@@ -1308,7 +1494,7 @@ pub fn verrou_d_ecriture(n: Numero) -> GardeMutex<'static, ()> {
 fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
     // Comme pour lire : ESPIPE, puis EINVAL pour un epoll.
     match o.sorte {
-        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket if position.is_some() => return Err(-ESPIPE),
+        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify if position.is_some() => return Err(-ESPIPE),
         Sorte::Epoll => return Err(-EINVAL),
         _ => {}
     }
@@ -1327,7 +1513,7 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
             // d'écrire (`generic_write_checks`, puis `file_remove_privs`).
             limite_ecriture(ici, longueur as usize).map_err(errno)?;
             if longueur > 0 {
-                retirer_les_privileges(o.numero());
+                retirer_les_privileges(o.numero(), o.fichier);
             }
             let ecrits = ecrire_pages(o.numero(), ici, tampon, longueur)?;
             if position.is_none() {
@@ -1376,7 +1562,8 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
             if fait == 0 && longueur > 0 { Err(-EFAULT) } else { Ok(fait) }
         }
         Sorte::Plein => Err(-ENOSPC),
-        Sorte::Dossier | Sorte::Chemin => Err(-EBADF),
+        // Une instance d'inotify ne s'ouvre qu'en lecture.
+        Sorte::Dossier | Sorte::Chemin | Sorte::Inotify => Err(-EBADF),
         Sorte::EventFd => evenements::ecrire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Tube => en_resultat(o.tube().ecrire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0,
                                                o.drapeaux as u64 & O_DIRECT != 0)),
@@ -1413,15 +1600,27 @@ fn resultat(r: Result<u64, i64>) -> i64 {
 pub fn read(fd: u64, tampon: u64, longueur: u64) -> i64 {
     resultat(tenir(fd).and_then(|o| {
         let _verrous = verrous(&o, true, false);
-        lire_ouvert(&o, None, tampon, longueur)
+        annoncer(&o, IN_ACCESS, lire_ouvert(&o, None, tampon, longueur))
     }))
+}
+
+/// Ce qu'inotify voit d'un transfert : IN_ACCESS pour une lecture,
+/// IN_MODIFY pour une écriture, si au moins un octet est passé
+/// (`fsnotify_access`, `fsnotify_modify` de `vfs_read`, `vfs_write`) ; sur
+/// toute sorte de fichier (un tube, une socket, /dev/null : mesuré).
+/// readv et writev ont leur règle (`vecteur`).
+fn annoncer(o: &FichierTenu, masque: u32, r: Result<u64, i64>) -> Result<u64, i64> {
+    if r.is_ok_and(|n| n > 0) {
+        surveillance::apres_l_appel(o, masque);
+    }
+    r
 }
 
 /// write(fd, tampon, longueur).
 pub fn write(fd: u64, tampon: u64, longueur: u64) -> i64 {
     resultat(tenir(fd).and_then(|o| {
         let _verrous = verrous(&o, true, true);
-        ecrire_ouvert(&o, None, tampon, longueur)
+        annoncer(&o, IN_MODIFY, ecrire_ouvert(&o, None, tampon, longueur))
     }))
 }
 
@@ -1434,7 +1633,7 @@ pub fn pread64(fd: u64, tampon: u64, longueur: u64, position: u64) -> i64 {
     }
     resultat(tenir(fd).and_then(|o| {
         let _verrous = verrous(&o, false, false);
-        lire_ouvert(&o, Some(position), tampon, longueur)
+        annoncer(&o, IN_ACCESS, lire_ouvert(&o, Some(position), tampon, longueur))
     }))
 }
 
@@ -1445,7 +1644,7 @@ pub fn pwrite64(fd: u64, tampon: u64, longueur: u64, position: u64) -> i64 {
     }
     resultat(tenir(fd).and_then(|o| {
         let _verrous = verrous(&o, false, true);
-        ecrire_ouvert(&o, Some(position), tampon, longueur)
+        annoncer(&o, IN_MODIFY, ecrire_ouvert(&o, Some(position), tampon, longueur))
     }))
 }
 
@@ -1493,6 +1692,18 @@ fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
         Ok(o) => o,
         Err(e) => return e,
     };
+    let r = vecteur_tenu(&o, adresse, nombre, ecrire);
+    // Ce qu'en voit inotify : writev comme write (au moins un octet) ;
+    // readv, même 0 octet, une fin de fichier ou des morceaux vides
+    // (`vfs_readv` : `if (ret >= 0) fsnotify_access(file)`, mesuré).
+    if if ecrire { r > 0 } else { r >= 0 } {
+        surveillance::apres_l_appel(&o, if ecrire { IN_MODIFY } else { IN_ACCESS });
+    }
+    r
+}
+
+/// readv ou writev de `o`.
+fn vecteur_tenu(o: &FichierTenu, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
     if (ecrire && !o.ecriture) || (!ecrire && !o.lecture) {
         return -EBADF;
     }
@@ -1514,7 +1725,11 @@ fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
     // Une socket aussi : un seul datagramme, de tous les morceaux, ou dans
     // tous les morceaux (le `sock_read_iter` et le `sock_write_iter`).
     if o.sorte == Sorte::Socket {
-        return if ecrire { crate::appels_reseau::ecrire(&o, &morceaux) } else { crate::appels_reseau::lire(&o, &morceaux) };
+        return if ecrire { crate::appels_reseau::ecrire(o, &morceaux) } else { crate::appels_reseau::lire(o, &morceaux) };
+    }
+    // Une instance d'inotify : morceau par morceau (surveillance.rs).
+    if o.sorte == Sorte::Inotify {
+        return resultat(surveillance::lire_morceaux(o.inotify().expect("une instance"), o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux));
     }
     // Un eventfd se lit d'un coup, sur tous les morceaux (evenements.rs).
     if !ecrire && o.sorte == Sorte::EventFd {
@@ -1525,13 +1740,13 @@ fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
     }
     // Les verrous tenus sur tous les morceaux : chacun part de la position
     // où s'est arrêté le précédent, sans qu'un autre fil s'intercale.
-    let _verrous = verrous(&o, true, ecrire);
+    let _verrous = verrous(o, true, ecrire);
     let mut total = 0u64;
     for (base, longueur) in morceaux {
         if longueur == 0 {
             continue;
         }
-        let r = if ecrire { ecrire_ouvert(&o, None, base, longueur) } else { lire_ouvert(&o, None, base, longueur) };
+        let r = if ecrire { ecrire_ouvert(o, None, base, longueur) } else { lire_ouvert(o, None, base, longueur) };
         match r {
             Ok(n) => {
                 total += n;
@@ -1586,7 +1801,7 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
         (Sorte::Console | Sorte::Tube | Sorte::Socket, _) => return -ESPIPE,
         (Sorte::Null | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. }, _) => return 0,
         // Ni position ni taille : `noop_llseek`, qui rend la position, nulle.
-        (Sorte::EventFd | Sorte::Epoll, _) => return position as i64,
+        (Sorte::EventFd | Sorte::Epoll | Sorte::Inotify, _) => return position as i64,
         (Sorte::Noyau { lecture }, _) => match procfs::deplacer(lecture, position, decalage, depuis) {
             p if p >= 0 => Some(p),
             e => return e,
@@ -2161,6 +2376,7 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
         },
         _ if o.sorte == Sorte::Epoll => -EINVAL,
         _ if o.sorte == Sorte::Socket => crate::appels_reseau::ioctl(&o, requete as u32 as u64, argument),
+        _ if o.sorte == Sorte::Inotify => surveillance::ioctl(o.inotify().expect("une instance"), requete as u32 as u64, argument),
         _ if matches!(o.sorte, Sorte::Aleatoire { .. }) => ioctl_aleatoire(requete as u32 as u64, argument),
         _ => -ENOTTY,
     }
@@ -2213,7 +2429,28 @@ pub fn unlinkat(dirfd: u64, adresse: u64, drapeaux: u64) -> i64 {
     let maintenant = temps::maintenant();
     let rmdir = drapeaux & AT_REMOVEDIR != 0;
     let r = avec_fin(dirfd, &chemin, Suivre::Jamais, |s, cadres, fin, depart, pid| match en_tmpfs(fin) {
-        Ok(fin) => s.fs.effacer(depart.qui, &fin, rmdir, maintenant, cadres).map_err(errno),
+        Ok(fin) => {
+            let victime = fin.objet.filter(|_| fin.dernier == Dernier::Nom);
+            let dossier = victime.is_some_and(|v| s.fs.est_un_dossier(v));
+            let entree = victime.and_then(|_| s.fs.entree(fin.dossier, &fin.nom));
+            s.fs.effacer(depart.qui, &fin, rmdir, maintenant, cadres).map_err(errno)?;
+            // Ce qu'en voit inotify, dans l'ordre de `vfs_unlink` et
+            // `vfs_rmdir` : le nombre de liens du fichier (pas d'un dossier) ;
+            // la fin de l'inode, s'il n'est plus tenu, ou s'il n'a plus de
+            // nom et que personne ne tenait celui-ci (IN_DELETE_SELF :
+            // `Systeme::entree_morte`) ; l'entrée effacée, au dossier.
+            if let Some(v) = victime
+                && !rmdir
+            {
+                surveillance::de_l_inode(v, false, IN_ATTRIB);
+            }
+            cadres.annoncer_les_fins();
+            if let Some((v, cookie)) = entree {
+                s.entree_morte(v, fin.dossier, cookie);
+            }
+            surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_DELETE, dossier, 0);
+            Ok(())
+        }
         Err(fin) => Err(refus(s, pid, depart.qui, Modification::Effacer(&fin, rmdir))),
     });
     match r {
@@ -2235,18 +2472,36 @@ pub fn rmdir(adresse: u64) -> i64 {
 /// Ouvre en lecture l'inode `n` (de chemin `chemin`, tel que donné, et
 /// `complet`, canonique, et de sorte `sorte`), pour le noyau : le programme
 /// à exécuter, que ses zones projetteront (le `bprm->file` de Linux), ou
-/// son interpréteur. Rend le fichier ouvert, tenu une fois.
-pub fn ouvrir_inode(n: Numero, chemin: &[u8], complet: Vec<u8>, sorte: Sorte) -> Result<Fichier, Erreur> {
+/// son interpréteur. Rend le fichier ouvert, tenu une fois. Son lieu est
+/// celui de `trouve` (trouver_pour). Comme l'`execve` de Linux, inotify
+/// voit son ouverture (IN_OPEN), puis sa lecture, quand le lanceur la dit
+/// (`annoncer_la_lecture` : IN_ACCESS), et, quand ses zones le lâcheront à
+/// la fin du programme, sa fermeture (IN_CLOSE_NOWRITE ; mesuré).
+pub fn ouvrir_inode(n: Numero, chemin: &[u8], complet: Vec<u8>, sorte: Sorte, trouve: &CheminTenu) -> Result<Fichier, Erreur> {
     vfs::avec_systeme(|s, cadres| {
+        let lieu = match s.ouverts.voir(trouve.fichier).and_then(|f| f.lieu.as_ref()) {
+            Some(l) => Some(surveillance::LieuPrepare::copie(l).map_err(|_| Erreur::ENOMEM)?),
+            None => None,
+        };
         s.fs.prendre(n);
         let ouvert = fichiers::tmpfs::Ouvert { numero: n, cree: false, tronquer: false, ecrivain: false };
         let fichier = FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), true, false, (O_RDONLY | O_LARGEFILE) as u32, chemin)
             .avec_chemin(complet);
-        s.ouverts.ajouter(fichier).map_err(|_| {
+        let fichier = s.ouverts.ajouter(fichier).map_err(|_| {
             s.fs.fermer(&ouvert, cadres);
             Erreur::ENOMEM
-        })
+        })?;
+        s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, Objet::Tmpfs(n)));
+        surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
+        Ok(fichier)
     })
+}
+
+/// Le noyau lit le fichier ouvert `fichier` (le programme ou
+/// l'interpréteur que lance le lanceur : le `kernel_read` de
+/// `prepare_binprm` et de `load_elf_binary`) : IN_ACCESS.
+pub fn annoncer_la_lecture(fichier: Fichier) {
+    vfs::avec_systeme(|s, _| surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_ACCESS));
 }
 
 /// Les descripteurs d'un programme qui commence : la console, ouverte en
@@ -2332,6 +2587,8 @@ pub fn creer_noeud_socket(chemin: &[u8]) -> Result<u32, i64> {
             let n = s.fs.creer(depart.qui, &fin, S_IFSOCK | (0o777 & !umask), (0, 0), &[], temps::maintenant())
                 .map_err(|e| if e == Erreur::EEXIST { -EADDRINUSE } else { errno(e) })?;
             s.fs.prendre(n);
+            // `vfs_mknod` : `fsnotify_create`.
+            surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_CREATE, false, 0);
             Ok(n.0)
         }
         Err(fin) => match refus(s, pid, depart.qui, Modification::Creer(&fin, Creation::Autre)) {
@@ -2379,7 +2636,11 @@ pub fn mkdirat(dirfd: u64, adresse: u64, mode: u64) -> i64 {
     let umask = processus::avec(|p| p.umask);
     let droits = (mode as u32 & 0o1777) & !umask;
     let r = avec_fin(dirfd, &chemin, Suivre::Jamais, |s, _, fin, depart, pid| match en_tmpfs(fin) {
-        Ok(fin) => s.fs.creer(depart.qui, &fin, S_IFDIR | droits, (0, 0), &[], temps::maintenant()).map_err(errno),
+        Ok(fin) => {
+            let n = s.fs.creer(depart.qui, &fin, S_IFDIR | droits, (0, 0), &[], temps::maintenant()).map_err(errno)?;
+            surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_CREATE, true, 0);
+            Ok(n)
+        }
         Err(fin) => Err(refus(s, pid, depart.qui, Modification::Creer(&fin, Creation::Dossier))),
     });
     match r {
@@ -2405,7 +2666,11 @@ pub fn symlinkat(cible: u64, dirfd: u64, adresse: u64) -> i64 {
         return errno(Erreur::ENOENT);
     }
     let r = avec_fin(dirfd, &chemin, Suivre::Jamais, |s, _, fin, depart, pid| match en_tmpfs(fin) {
-        Ok(fin) => s.fs.creer(depart.qui, &fin, S_IFLNK | 0o777, (0, 0), &cible, temps::maintenant()).map_err(errno),
+        Ok(fin) => {
+            let n = s.fs.creer(depart.qui, &fin, S_IFLNK | 0o777, (0, 0), &cible, temps::maintenant()).map_err(errno)?;
+            surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_CREATE, false, 0);
+            Ok(n)
+        }
         Err(fin) => Err(refus(s, pid, depart.qui, Modification::Creer(&fin, Creation::Autre))),
     });
     match r {
@@ -2505,7 +2770,14 @@ pub fn linkat(ancien_dossier: u64, ancien: u64, nouveau_dossier: u64, nouveau: u
         let source = source.objet();
         match (source.tmpfs(), dans_le_tmpfs(&fin)) {
             (Some(source), true) => match en_tmpfs(fin) {
-                Ok(fin) => s.fs.lier(depart.qui, source, &fin, temps::maintenant()).map_err(errno),
+                // Ce qu'en voit inotify (`fsnotify_link`) : le nombre de
+                // liens de l'inode, puis l'entrée créée.
+                Ok(fin) => {
+                    s.fs.lier(depart.qui, source, &fin, temps::maintenant()).map_err(errno)?;
+                    surveillance::de_l_inode(source, false, IN_ATTRIB);
+                    surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_CREATE, false, 0);
+                    Ok(())
+                }
                 Err(_) => Err(-EINVAL),
             },
             _ => Err(refus(s, pid, depart.qui, Modification::Lier(source, &fin))),
@@ -2548,7 +2820,7 @@ pub fn renameat2(ancien_dossier: u64, ancien: u64, nouveau_dossier: u64, nouveau
             return Err(refus(s, pid, depart_ancien.qui, Modification::Renommer(&fa, &fn_, drapeaux as u32)));
         }
         let (Ok(fa), Ok(fn_)) = (en_tmpfs(fa), en_tmpfs(fn_)) else { return Err(-EINVAL) };
-        s.fs.renommer(depart_ancien.qui, &fa, &fn_, drapeaux as u32, temps::maintenant(), cadres).map_err(errno)
+        s.renommer(depart_ancien.qui, &fa, &fn_, drapeaux as u32, cadres).map_err(errno)
     });
     match r {
         Ok(()) => 0,
@@ -2606,6 +2878,12 @@ pub fn getdents64(fd: u64, tampon: u64, taille: u64) -> i64 {
         }));
         if let Some(n) = o.objet.tmpfs() {
             s.fs.acceder(n, temps::maintenant());
+        }
+        // Lu, même vide ou trop petit (`iterate_dir` : son
+        // fsnotify_access suit la lecture, quoi qu'elle ait rendu ; pas un
+        // dossier effacé, ENOENT avant).
+        if r.is_ok() {
+            surveillance::du_fichier(&s.fs, s.ouverts.fichier(o.fichier), IN_ACCESS);
         }
         r
     });
@@ -2717,15 +2995,19 @@ pub fn fchdir(fd: u64) -> i64 {
 /// projette le même fichier (`&`, 6e) garde ses pages (elles sont tenues :
 /// la mémoire reste sûre) et y lit l'ancien contenu au lieu d'un SIGBUS :
 /// un écart, noté dans « Reste à faire ».
-fn tronquer(n: Numero, taille: u64) -> i64 {
+fn tronquer(n: Numero, taille: u64, par: Fichier) -> i64 {
     let _ecriture = verrou_d_ecriture(n);
     retirer_projections(n, taille.div_ceil(PAGE));
     let qui = processus::essayer_avec(|p| p.identite).unwrap_or(Identite::ROOT);
-    // Les bits setuid et setgid tombent avec la taille (`do_truncate`).
-    let r = vfs::avec(|fs, cadres| {
+    // IN_MODIFY, au dossier et au nom qu'a l'objet à ce moment
+    // (`fsnotify_change` d'ATTR_SIZE), par le fichier qui le tient ; avec
+    // IN_ATTRIB, d'un seul événement, si les bits setuid et setgid tombent
+    // (ATTR_MODE, dans le même `notify_change` : `do_truncate`, mesuré).
+    let r = vfs::avec_systeme(|s, cadres| {
         let maintenant = temps::maintenant();
-        fs.tronquer(n, taille, maintenant, cadres)?;
-        fs.retirer_les_privileges(qui, n, maintenant);
+        s.fs.tronquer(n, taille, maintenant, cadres)?;
+        let attrib = if s.fs.retirer_les_privileges(qui, n, maintenant) { IN_ATTRIB } else { 0 };
+        surveillance::changement(&s.fs, s.ouverts.fichier(par), IN_MODIFY | attrib);
         Ok(())
     });
     retirer_projections(n, taille.div_ceil(PAGE));
@@ -2772,7 +3054,7 @@ pub fn truncate(adresse: u64, taille: u64) -> i64 {
         Err(e) => return e,
     };
     let (qui, pid) = processus::avec(|p| (p.identite, p.pid));
-    let tenu = match objet(AT_FDCWD as u64, &chemin, true, false) {
+    let tenu = match tenir_chemin(AT_FDCWD as u64, &chemin, true, false) {
         Ok(o) => o,
         Err(e) => return e,
     };
@@ -2783,7 +3065,7 @@ pub fn truncate(adresse: u64, taille: u64) -> i64 {
     if let Err(e) = vfs::avec(|fs, _| fs.verifier_tronquer(qui, n)) {
         return errno(e);
     }
-    tronquer(n, taille)
+    tronquer(n, taille, tenu.fichier())
 }
 
 /// ftruncate(fd, taille) : une taille négative, EINVAL avant même le
@@ -2804,7 +3086,7 @@ pub fn ftruncate(fd: u64, taille: u64) -> i64 {
     if o.sorte != Sorte::Fichier || !o.ecriture {
         return -EINVAL;
     }
-    tronquer(o.numero(), taille)
+    tronquer(o.numero(), taille, o.fichier)
 }
 
 /// fsync(fd) et fdatasync(fd) : tout est déjà en mémoire, rien à écrire
@@ -2846,15 +3128,20 @@ pub fn umask(masque: u64) -> i64 {
 
 /// Change les droits de `o` (chmod et ses voisins) : Tmpfs::changer_mode,
 /// ou le refus d'un système monté.
-fn changer_mode(o: Objet, mode: u64) -> i64 {
+/// Les droits de `o`, tenu par le fichier ouvert `par` : IN_ATTRIB s'ils
+/// ont changé (`fsnotify_change` d'ATTR_MODE), au lieu du fichier.
+fn changer_mode(o: Objet, par: Fichier, mode: u64) -> i64 {
     let (qui, pid) = processus::avec(|p| (p.identite, p.pid));
-    let Some(n) = o.tmpfs() else {
-        return vfs::avec_systeme(|s, _| refus(s, pid, qui, Modification::ChangerMode(o)));
-    };
-    match vfs::avec(|fs, _| fs.changer_mode(qui, n, mode as u32, temps::maintenant())) {
-        Ok(()) => 0,
-        Err(e) => errno(e),
-    }
+    vfs::avec_systeme(|s, _| {
+        let r = match o.tmpfs() {
+            Some(n) => s.fs.changer_mode(qui, n, mode as u32, temps::maintenant()).map_or_else(errno, |()| 0),
+            None => refus(s, pid, qui, Modification::ChangerMode(o)),
+        };
+        if r == 0 {
+            surveillance::changement(&s.fs, s.ouverts.fichier(par), IN_ATTRIB);
+        }
+        r
+    })
 }
 
 /// fchmodat2(dossier, chemin, droits, drapeaux) : AT_SYMLINK_NOFOLLOW
@@ -2869,14 +3156,14 @@ pub fn fchmodat2(dirfd: u64, adresse: u64, mode: u64, drapeaux: u64) -> i64 {
         Ok(c) => c,
         Err(e) => return e,
     };
-    let o = match objet(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
+    let o = match tenir_chemin(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
         Ok(o) => o,
         Err(e) => return e,
     };
     if attributs(o.objet()).mode & S_IFMT == S_IFLNK {
         return -EOPNOTSUPP;
     }
-    changer_mode(o.objet(), mode)
+    changer_mode(o.objet(), o.fichier(), mode)
 }
 
 /// chmod(chemin, droits).
@@ -2887,7 +3174,7 @@ pub fn chmod(adresse: u64, mode: u64) -> i64 {
 /// fchmod(fd, droits).
 pub fn fchmod(fd: u64, mode: u64) -> i64 {
     match tenir(fd) {
-        Ok(o) if o.sorte != Sorte::Chemin => changer_mode(o.objet, mode),
+        Ok(o) if o.sorte != Sorte::Chemin => changer_mode(o.objet, o.fichier, mode),
         Ok(_) => -EBADF,
         Err(e) => e,
     }
@@ -2899,16 +3186,28 @@ fn identifiant(valeur: u64) -> Option<u32> {
     (valeur as u32 != u32::MAX).then_some(valeur as u32)
 }
 
-fn changer_proprietaire(o: Objet, uid: u64, gid: u64) -> i64 {
+/// Le propriétaire de `o`, tenu par le fichier ouvert `par` : IN_ATTRIB si
+/// l'uid ou le gid est donné, même inchangé (`fsnotify_change` d'ATTR_UID
+/// ou ATTR_GID), ou si le mode a changé (-1 et -1 d'un fichier setuid : le
+/// bit tombe, ATTR_MODE ; sinon, rien : mesuré).
+fn changer_proprietaire(o: Objet, par: Fichier, uid: u64, gid: u64) -> i64 {
     let (qui, pid) = processus::avec(|p| (p.identite, p.pid));
-    let Some(n) = o.tmpfs() else {
-        let m = Modification::ChangerProprietaire(o, identifiant(uid), identifiant(gid));
-        return vfs::avec_systeme(|s, _| refus(s, pid, qui, m));
-    };
-    match vfs::avec(|fs, _| fs.changer_proprietaire(qui, n, identifiant(uid), identifiant(gid), temps::maintenant())) {
-        Ok(()) => 0,
-        Err(e) => errno(e),
-    }
+    let (uid, gid) = (identifiant(uid), identifiant(gid));
+    vfs::avec_systeme(|s, _| {
+        // Le mode, qui peut changer même avec -1 et -1 : les bits setuid et
+        // setgid tombent (ATTR_KILL_SUID, dont `notify_change` fait un
+        // ATTR_MODE).
+        let mode = o.tmpfs().map(|n| s.fs.attributs(n).mode);
+        let r = match o.tmpfs() {
+            Some(n) => s.fs.changer_proprietaire(qui, n, uid, gid, temps::maintenant()).map_or_else(errno, |()| 0),
+            None => refus(s, pid, qui, Modification::ChangerProprietaire(o, uid, gid)),
+        };
+        let mode_change = o.tmpfs().is_some_and(|n| Some(s.fs.attributs(n).mode) != mode);
+        if r == 0 && (uid.is_some() || gid.is_some() || mode_change) {
+            surveillance::changement(&s.fs, s.ouverts.fichier(par), IN_ATTRIB);
+        }
+        r
+    })
 }
 
 /// fchownat(dossier, chemin, uid, gid, drapeaux) : Tmpfs::changer_proprietaire
@@ -2921,8 +3220,8 @@ pub fn fchownat(dirfd: u64, adresse: u64, uid: u64, gid: u64, drapeaux: u64) -> 
         Ok(c) => c,
         Err(e) => return e,
     };
-    match objet(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
-        Ok(o) => changer_proprietaire(o.objet(), uid, gid),
+    match tenir_chemin(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
+        Ok(o) => changer_proprietaire(o.objet(), o.fichier(), uid, gid),
         Err(e) => e,
     }
 }
@@ -2930,7 +3229,7 @@ pub fn fchownat(dirfd: u64, adresse: u64, uid: u64, gid: u64, drapeaux: u64) -> 
 /// fchown(fd, uid, gid).
 pub fn fchown(fd: u64, uid: u64, gid: u64) -> i64 {
     match tenir(fd) {
-        Ok(o) if o.sorte != Sorte::Chemin => changer_proprietaire(o.objet, uid, gid),
+        Ok(o) if o.sorte != Sorte::Chemin => changer_proprietaire(o.objet, o.fichier, uid, gid),
         Ok(_) => -EBADF,
         Err(e) => e,
     }
@@ -2972,7 +3271,7 @@ pub fn utimensat(dirfd: u64, adresse: u64, dates: u64, drapeaux: u64) -> i64 {
             return -EINVAL;
         }
         match tenir(dirfd) {
-            Ok(o) if o.sorte != Sorte::Chemin => o.tenir_objet(),
+            Ok(o) if o.sorte != Sorte::Chemin => Tenue::Fichier(o),
             Ok(_) => return -EBADF,
             Err(e) => return e,
         }
@@ -2984,12 +3283,15 @@ pub fn utimensat(dirfd: u64, adresse: u64, dates: u64, drapeaux: u64) -> i64 {
             Ok(c) => c,
             Err(e) => return e,
         };
-        match objet(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
-            Ok(o) => o,
+        match tenir_chemin(dirfd, &chemin, drapeaux & AT_SYMLINK_NOFOLLOW == 0, drapeaux & AT_EMPTY_PATH != 0) {
+            Ok(o) => Tenue::Chemin(o),
             Err(e) => return e,
         }
     };
-    let o = tenu.objet();
+    let (o, par) = match &tenu {
+        Tenue::Fichier(f) => (f.objet, f.fichier),
+        Tenue::Chemin(c) => (c.objet(), c.fichier()),
+    };
     let horodatage = |(secondes, nano): (i64, i64)| match nano {
         UTIME_NOW => Some(Horodatage::Maintenant),
         UTIME_OMIT => Some(Horodatage::Garder),
@@ -3000,14 +3302,33 @@ pub fn utimensat(dirfd: u64, adresse: u64, dates: u64, drapeaux: u64) -> i64 {
         return -EINVAL;
     };
     let (qui, pid) = processus::avec(|p| (p.identite, p.pid));
-    let Some(n) = o.tmpfs() else {
-        let maintenant = matches!((acces, modification), (Horodatage::Maintenant, Horodatage::Maintenant));
-        return vfs::avec_systeme(|s, _| refus(s, pid, qui, Modification::ChangerTemps(o, maintenant)));
+    // Ce qu'en voit inotify (`fsnotify_change`) : les deux dates, IN_ATTRIB ;
+    // l'accès seul, IN_ACCESS ; la modification seule, IN_MODIFY.
+    let masque = match (acces, modification) {
+        (Horodatage::Garder, _) => IN_MODIFY,
+        (_, Horodatage::Garder) => IN_ACCESS,
+        _ => IN_ATTRIB,
     };
-    match vfs::avec(|fs, _| fs.changer_temps(qui, n, acces, modification, temps::maintenant())) {
-        Ok(()) => 0,
-        Err(e) => errno(e),
-    }
+    vfs::avec_systeme(|s, _| {
+        let r = match o.tmpfs() {
+            Some(n) => s.fs.changer_temps(qui, n, acces, modification, temps::maintenant()).map_or_else(errno, |()| 0),
+            None => {
+                let maintenant = matches!((acces, modification), (Horodatage::Maintenant, Horodatage::Maintenant));
+                refus(s, pid, qui, Modification::ChangerTemps(o, maintenant))
+            }
+        };
+        if r == 0 {
+            surveillance::changement(&s.fs, s.ouverts.fichier(par), masque);
+        }
+        r
+    })
+}
+
+/// Ce que tient utimensat : le fichier du descripteur (futimens), ou un
+/// chemin.
+enum Tenue {
+    Fichier(FichierTenu),
+    Chemin(CheminTenu),
 }
 
 // ----- Les transferts du noyau : fadvise64, copy_file_range, sendfile (6i) -----
@@ -3058,15 +3379,16 @@ pub fn fadvise64(fd: u64, _position: u64, longueur: u64, conseil: u64) -> i64 {
 // 6i, que `linux/copies.c` reprend, sur l'hôte et chez nous).
 
 /// Une position donnée a un sens (FMODE_PREAD ; sinon ESPIPE) : pas pour un
-/// tube, une socket, la console (`nonseekable_open`), un eventfd, un epoll.
+/// tube, une socket, la console (`nonseekable_open`), un eventfd, un epoll,
+/// une instance d'inotify.
 fn a_des_positions(o: &FichierTenu) -> bool {
-    !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console | Sorte::EventFd | Sorte::Epoll)
+    !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console | Sorte::EventFd | Sorte::Epoll | Sorte::Inotify)
 }
 
 /// Le fichier se positionne (FMODE_LSEEK, que `splice_direct_to_actor`
 /// demande à l'entrée d'un transfert qui ne va pas vers un tube, même de 0
 /// octet) : tout ce qui a un llseek, `noop_llseek` compris (un eventfd, un
-/// epoll : mesuré) ; pas un tube, une socket, la console.
+/// epoll, inotify : mesuré) ; pas un tube, une socket, la console.
 fn se_positionne(o: &FichierTenu) -> bool {
     !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console)
 }
@@ -3075,8 +3397,8 @@ fn se_positionne(o: &FichierTenu) -> bool {
 /// /dev/zero, /dev/full, /dev/random, /dev/urandom, la console, une valeur
 /// de /proc/sys, un attribut de /sys (`copy_splice_read` : une lecture),
 /// une socket. Pas un dossier, /dev/null, un tube, un eventfd, un epoll,
-/// ni les séquences de /proc (maps, statm, comm, /proc/net : `seq_read`,
-/// sans `read_iter`).
+/// inotify, ni les séquences de /proc (maps, statm, comm, /proc/net :
+/// `seq_read`, sans `read_iter`).
 fn lisible_par_le_noyau(o: &FichierTenu) -> bool {
     matches!(o.sorte, Sorte::Fichier | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. } | Sorte::Console | Sorte::Socket
         | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
@@ -3214,7 +3536,7 @@ fn ecrire_pour_le_noyau(o: &FichierTenu, position: u64, octets: &[u8], plus_a_ve
         Sorte::Fichier => {
             limite_ecriture(position, octets.len()).map_err(errno)?;
             if !octets.is_empty() {
-                retirer_les_privileges(o.numero());
+                retirer_les_privileges(o.numero(), o.fichier);
             }
             ecrire_pages_noyau(o.numero(), position, octets)
         }
@@ -3527,6 +3849,8 @@ pub fn copy_file_range(fd_entree: u64, adresse_entree: u64, fd_sortie: u64, adre
     if fait == 0 {
         return 0;
     }
+    surveillance::apres_l_appel(&entree, IN_ACCESS);
+    surveillance::apres_l_appel(&sortie, IN_MODIFY);
     let mut r = fait as i64;
     for (o, adresse, position) in [(&entree, adresse_entree, depuis + fait), (&sortie, adresse_sortie, vers + fait)] {
         if adresse == 0 {
@@ -3632,8 +3956,11 @@ fn envoyer_le_fichier(fd_sortie: u64, fd_entree: u64, donnee: bool, position: &m
         }
     };
     if fait > 0 {
-        // Les positions, la sortie d'abord (le même fichier des deux côtés :
-        // celle de l'entrée l'emporte).
+        // Ce qu'en voit inotify : la lecture de l'entrée, puis l'écriture
+        // de la sortie ; puis les positions, la sortie d'abord (le même
+        // fichier des deux côtés : celle de l'entrée l'emporte).
+        surveillance::apres_l_appel(&entree, IN_ACCESS);
+        surveillance::apres_l_appel(&sortie, IN_MODIFY);
         if sortie.sorte == Sorte::Fichier {
             sortie.changer_position(vers + fait);
         }

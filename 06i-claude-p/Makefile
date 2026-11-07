@@ -261,6 +261,9 @@ boot.bin: programmes.cpio FORCE
 #     descripteurs 0 et 3 sont ces fichiers, et /proc/self/fd/3 d'un
 #     fichier sans droits rend EACCES, le descripteur restant lisible ; sur
 #     l'hôte aussi ;
+#   - surveillance : gcc -static, inotify (6i) : chaque événement de Linux,
+#     dans son ordre, et les refus de ses appels ; sur l'hôte aussi, dans
+#     /dev/shm (un tmpfs, comme notre /tmp) ;
 #   - copies : gcc -static, copy_file_range, sendfile et fadvise64 (6i),
 #     leurs transferts et leurs refus, ceux de Linux, pour chaque sorte de
 #     fichier ; sur l'hôte aussi, dans /dev/shm (un tmpfs, comme notre /tmp :
@@ -445,6 +448,10 @@ $(LINUX)/effacer: linux/effacer.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/copies: linux/copies.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/surveillance: linux/surveillance.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -890,7 +897,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -899,8 +906,8 @@ programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/
 	{ cat archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } | sh archive.sh $@ -
 
 # L'archive du jalon de 6f à 6i : celle de l'étape, dont /etc/demarrage ne
-# lance que claude -p, deux fois, puis la liste de HOME et son effacement
-# (racine/etc/demarrage-claude-p).
+# lance que claude -p, deux fois, puis la liste de ce qu'il a laissé dans
+# HOME et dans /tmp, et son effacement (racine/etc/demarrage-claude-p).
 claude-p.cpio: programmes.cpio racine/etc/demarrage-claude-p
 	{ sed 's|racine/etc/demarrage |racine/etc/demarrage-claude-p |' archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } \
 	  | sh archive.sh $@ -
@@ -929,8 +936,8 @@ DUREE_CLAUDE_P = 240
 # par le DNS, s'y connecter par notre TCP, et rapporter ce que l'API répond
 # à une fausse clé, par TLS (« Invalid API key ») ; puis, contre la fausse
 # API, afficher sa réponse et finir par 0 (claude-p-attendu.txt). Les deux
-# lancements, la liste de ce qu'ils ont laissé dans HOME, puis son
-# effacement, forment un groupe, qui doit rendre toute sa mémoire.
+# lancements, la liste de ce qu'ils ont laissé dans HOME et dans /tmp, puis
+# son effacement, forment un groupe, qui doit rendre toute sa mémoire.
 #
 # On attend la ligne du groupe, la dernière ; si QEMU s'arrête avant, ou au
 # bout de DUREE_CLAUDE_P, les lignes qui manquent le disent.
@@ -1036,9 +1043,10 @@ texte: boot.bin
 # (1,1 s) : 26 s en tout au milieu de l'étape, 39 s à sa fin (tcp seul :
 # 17 s), mesurées en 6i ; d'où 90 s depuis, le double. En 6i, les fautes
 # disputées par des fils (fautes, quatre fois), les troncatures (3 s), un
-# programme ouvert en écriture qu'un groupe attend (1,5 s) : 45 s en tout,
-# mesurées. verifier.sh le demande par `make duree` ; ne pas le lancer sur
-# une machine saturée.
+# programme ouvert en écriture qu'un groupe attend (1,5 s), inotify (sa
+# file pleine, ses 128 instances, ses guetteurs : 2 s d'attente) : 48 s
+# en tout, mesurées. verifier.sh le demande par `make duree` ; ne pas le
+# lancer sur une machine saturée.
 DUREE = 90
 
 duree:
@@ -1128,7 +1136,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -1177,6 +1185,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	  && ./$(LINUX)/effacer --creer $(LINUX)/effacer.d 3 && ./$(LINUX)/effacer $(LINUX)/effacer.d \
 	  && test ! -e $(LINUX)/effacer.d
 	./$(LINUX)/copies /dev/shm | tee /dev/stderr | grep -q "copies : toutes les verifications : ok"
+	./$(LINUX)/surveillance /dev/shm | tee /dev/stderr | grep -q "surveillance : toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/reseau | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/dns | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/aleatoire | tee /dev/stderr | grep -q "toutes les verifications : ok"

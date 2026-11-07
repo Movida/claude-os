@@ -82,6 +82,17 @@ pub trait Cadres {
         const ZEROS: [u8; PAGE as usize] = [0; PAGE as usize];
         self.ecrire(page, debut, &ZEROS[..fin - debut]);
     }
+    /// La fin de l'inode `n` (6i) : il n'a plus ni nom ni référence, son
+    /// numéro va resservir. `anonyme` : un tube ou une socket, qui n'a
+    /// jamais eu de nom. Le noyau en retire ses surveillances (inotify) :
+    /// c'est, sauf pour un fichier à plusieurs noms, le moment du
+    /// `fsnotify_inoderemove` de Linux (IN_DELETE_SELF, puis IN_IGNORED),
+    /// qui vient quand un dentry d'un inode sans lien meurt ; le noyau voit
+    /// l'autre cas (vfs::Systeme::entree_morte). Le trait des pages, parce
+    /// que c'est lui que reçoivent déjà toutes les opérations qui peuvent
+    /// finir un inode (effacer, renommer, lâcher, fermer) ; option écartée :
+    /// un trait de plus, à passer partout avec lui.
+    fn inode_detruit(&mut self, _n: Numero, _anonyme: bool) {}
 }
 
 /// Un numéro d'inode (1 : la racine).
@@ -459,6 +470,7 @@ impl Tmpfs {
         let i = n.0 as usize - 1;
         let (b, c) = (i / PAR_BLOC, i % PAR_BLOC);
         let inode = self.blocs[b].cases[c].take().expect("tmpfs : inode deja detruit");
+        cadres.inode_detruit(n, matches!(inode.contenu, Contenu::Tube | Contenu::Socket));
         self.blocs[b].prises -= 1;
         self.inodes -= 1;
         self.non_plein = self.non_plein.min(b);
@@ -524,6 +536,47 @@ impl Tmpfs {
     /// L'inode est-il celui d'une socket ?
     pub fn est_socket(&self, n: Numero) -> bool {
         matches!(self.inode(n).contenu, Contenu::Socket)
+    }
+
+    // ----- Les entrées, pour inotify (6i) -----
+
+    /// L'entrée `nom` du dossier `dossier` : l'inode qu'elle désigne et son
+    /// cookie. Le cookie distingue cette entrée de toute autre du dossier,
+    /// passée ou à venir, même sous le même nom : le noyau le garde, avec
+    /// le dossier et le nom, pour un fichier ouvert (le `dentry` de son
+    /// ouverture chez Linux), à qui inotify adresse ses événements.
+    pub fn entree(&self, dossier: Numero, nom: &[u8]) -> Option<(Numero, u64)> {
+        self.inode(dossier).dossier().entrees.iter().find(|e| e.nom == nom).map(|e| (e.numero, e.cookie))
+    }
+
+    /// L'entrée de cookie `cookie` est-elle toujours dans `dossier`, et
+    /// désigne-t-elle toujours `n` ? Non une fois son nom effacé, déplacé
+    /// (un renommage donne un cookie neuf), ou échangé (RENAME_EXCHANGE
+    /// garde les entrées, et échange leurs inodes) : le `d_unlinked` de
+    /// Linux. Un dossier effacé n'a plus d'entrées. Les cookies croissent le
+    /// long de la liste : une recherche dichotomique.
+    pub fn a_l_entree(&self, dossier: Numero, cookie: u64, n: Numero) -> bool {
+        let Contenu::Dossier(d) = &self.inode(dossier).contenu else { return false };
+        d.entrees.binary_search_by_key(&cookie, |e| e.cookie).is_ok_and(|i| d.entrees[i].numero == n)
+    }
+
+    /// Le parent du dossier `n`, son entrée et son nom (ce que la
+    /// résolution d'un chemin ne donne pas pour « . », « .. » et la
+    /// racine) ; None pour la racine, un dossier effacé (son propre parent)
+    /// ou ce qui n'est pas un dossier.
+    pub fn nom_du_dossier(&self, n: Numero) -> Option<(Numero, u64, &[u8])> {
+        let Contenu::Dossier(d) = &self.inode(n).contenu else { return None };
+        let parent = d.parent;
+        if parent == n {
+            return None;
+        }
+        let e = self.inode(parent).dossier().entrees.iter().find(|e| e.numero == n)?;
+        Some((parent, e.cookie, &e.nom))
+    }
+
+    /// L'inode est-il un dossier ?
+    pub fn est_un_dossier(&self, n: Numero) -> bool {
+        self.est_dossier(n)
     }
 
     /// Le mode de l'inode (type et droits).
@@ -1446,7 +1499,7 @@ impl Tmpfs {
     /// groupe), sauf pour root (CAP_FSETID) : le `file_remove_privs` de
     /// Linux, à chaque write qui écrit quelque chose, et à chaque troncature
     /// (`do_truncate`), même par le propriétaire. Rend vrai si le mode a
-    /// changé (la date de changement aussi).
+    /// changé (la date de changement aussi) : inotify le voit (IN_ATTRIB).
     pub fn retirer_les_privileges(&mut self, qui: Identite, n: Numero, maintenant: Temps) -> bool {
         let i = self.inode_mut(n);
         if i.genre() != S_IFREG || qui.root() {
@@ -1615,10 +1668,12 @@ mod tests {
     use alloc::boxed::Box;
     use alloc::vec;
 
-    /// Les pages, sur l'hôte : des tableaux, comptés.
+    /// Les pages, sur l'hôte : des tableaux, comptés ; et les inodes finis,
+    /// dans l'ordre (inotify, 6i).
     #[derive(Default)]
     struct Hote {
         pages: Vec<Option<Box<[u8; 4096]>>>,
+        detruits: Vec<(Numero, bool)>,
     }
 
     impl Hote {
@@ -1640,6 +1695,9 @@ mod tests {
         }
         fn lire(&self, page: u64, decalage: usize, tampon: &mut [u8]) {
             tampon.copy_from_slice(&self.pages[page as usize - 1].as_ref().unwrap()[decalage..decalage + tampon.len()]);
+        }
+        fn inode_detruit(&mut self, n: Numero, anonyme: bool) {
+            self.detruits.push((n, anonyme));
         }
     }
 
@@ -2311,6 +2369,59 @@ mod tests {
         assert_eq!(t.fs.changer_temps(AUTRE, f, garder, maintenant, T0), Err(EPERM));
         assert_eq!(t.fs.changer_temps(AUTRE, f, maintenant, garder, T0), Err(EPERM));
         t.fs.changer_temps(AUTRE, f, maintenant, maintenant, T0).unwrap();
+        t.verifier();
+    }
+
+    #[test]
+    fn entrees_et_fins_pour_inotify() {
+        // Ce que le noyau garde d'un fichier ouvert (son dossier, le cookie
+        // de son entrée) dit s'il a encore ce nom (6i) ; et la fin de chaque
+        // inode lui est annoncée, avec « anonyme » pour un tube.
+        let mut t = T::new();
+        let tmp = t.trouver(b"/tmp").unwrap();
+        let a = t.fichier(b"/tmp/a").unwrap();
+        let (n, ca) = t.fs.entree(tmp, b"a").unwrap();
+        assert_eq!(n, a);
+        assert!(t.fs.a_l_entree(tmp, ca, a));
+        assert_eq!(t.fs.entree(tmp, b"z"), None);
+        // Renommé : une entrée neuve ; l'ancienne n'est plus.
+        t.rename(b"/tmp/a", b"/tmp/b", 0).unwrap();
+        let (_, cb) = t.fs.entree(tmp, b"b").unwrap();
+        assert!(cb > ca && !t.fs.a_l_entree(tmp, ca, a) && t.fs.a_l_entree(tmp, cb, a));
+        // Échangé : les entrées restent, leurs inodes s'échangent.
+        let c = t.fichier(b"/tmp/c").unwrap();
+        let (_, cc) = t.fs.entree(tmp, b"c").unwrap();
+        t.rename(b"/tmp/b", b"/tmp/c", RENAME_EXCHANGE).unwrap();
+        assert!(t.fs.a_l_entree(tmp, cb, c) && t.fs.a_l_entree(tmp, cc, a) && !t.fs.a_l_entree(tmp, cb, a));
+        // Le nom d'un dossier dans son parent ; aucun pour la racine.
+        let home = t.trouver(b"/home").unwrap();
+        let david = t.trouver(b"/home/david").unwrap();
+        let (parent, cookie, nom) = t.fs.nom_du_dossier(david).unwrap();
+        assert_eq!((parent, nom), (home, &b"david"[..]));
+        assert!(t.fs.a_l_entree(home, cookie, david));
+        assert_eq!(t.fs.nom_du_dossier(t.fs.racine()), None);
+        assert_eq!(t.fs.nom_du_dossier(a), None);
+        assert!(t.fs.est_un_dossier(david) && !t.fs.est_un_dossier(a));
+        // Effacé sans être tenu : fini aussitôt. Tenu : à la dernière
+        // référence.
+        t.unlink(b"/tmp/b").unwrap();
+        assert_eq!(t.c.detruits, vec![(c, false)]);
+        let o = t.ouvrir(b"/tmp/c", lecture(), false).unwrap();
+        t.unlink(b"/tmp/c").unwrap();
+        assert_eq!(t.c.detruits.len(), 1);
+        t.fs.fermer(&o, &mut t.c);
+        assert_eq!(t.c.detruits, vec![(c, false), (a, false)]);
+        // Un dossier effacé, sans nom dans son parent ; puis un tube.
+        let d = t.mkdir(b"/tmp/d").unwrap();
+        t.fs.prendre(d);
+        t.rmdir(b"/tmp/d").unwrap();
+        assert_eq!(t.fs.nom_du_dossier(d), None);
+        assert!(!t.fs.a_l_entree(d, 0, d));
+        t.fs.lacher(d, &mut t.c);
+        let p = t.fs.creer_tube(DAVID, T0).unwrap();
+        t.fs.prendre(p);
+        t.fs.lacher(p, &mut t.c);
+        assert_eq!(t.c.detruits, vec![(c, false), (a, false), (d, false), (p, true)]);
         t.verifier();
     }
 

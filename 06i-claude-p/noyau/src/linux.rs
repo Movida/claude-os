@@ -177,6 +177,11 @@ const EVENTFD: u64 = 284;
 const PIPE: u64 = 22;
 const PIPE2: u64 = 293;
 const EVENTFD2: u64 = 290;
+// inotify (6i, surveillance.rs).
+const INOTIFY_INIT: u64 = 253;
+const INOTIFY_ADD_WATCH: u64 = 254;
+const INOTIFY_RM_WATCH: u64 = 255;
+const INOTIFY_INIT1: u64 = 294;
 const EPOLL_CREATE1: u64 = 291;
 const EPOLL_PWAIT2: u64 = 441;
 const POLL: u64 = 7;
@@ -303,6 +308,10 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         PIPE => crate::tube::pipe(a[0]),
         PIPE2 => crate::tube::pipe2(a[0], a[1]),
         EVENTFD2 => evenements::eventfd2(a[0], a[1]),
+        INOTIFY_INIT => crate::surveillance::inotify_init(),
+        INOTIFY_INIT1 => crate::surveillance::inotify_init1(a[0]),
+        INOTIFY_ADD_WATCH => crate::surveillance::inotify_add_watch(a[0], a[1], a[2]),
+        INOTIFY_RM_WATCH => crate::surveillance::inotify_rm_watch(a[0], a[1]),
         EPOLL_CREATE => crate::epoll::epoll_create(a[0]),
         EPOLL_CREATE1 => crate::epoll::epoll_create1(a[0]),
         EPOLL_CTL => crate::epoll::epoll_ctl(a[0], a[1], a[2], a[3]),
@@ -487,6 +496,10 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         PIPE => ("pipe", 1),
         PIPE2 => ("pipe2", 2),
         EVENTFD2 => ("eventfd2", 2),
+        INOTIFY_INIT => ("inotify_init", 0),
+        INOTIFY_INIT1 => ("inotify_init1", 1),
+        INOTIFY_ADD_WATCH => ("inotify_add_watch", 3),
+        INOTIFY_RM_WATCH => ("inotify_rm_watch", 2),
         EPOLL_CREATE => ("epoll_create", 1),
         EPOLL_CREATE1 => ("epoll_create1", 1),
         EPOLL_CTL => ("epoll_ctl", 4),

@@ -1038,6 +1038,14 @@ impl Wasi {
                 let v = lire_morceaux(m, morceaux, nombre)?;
                 if ecriture { envoyer(&o, &v, m, cout) } else { recevoir(&o, &v, m, 0, cout) }
             });
+            if let Ok(n) = r
+                && n > 0
+            {
+                let masque = if ecriture { crate::surveillance::IN_MODIFY } else { crate::surveillance::IN_ACCESS };
+                if crate::surveillance::actif() {
+                    vfs::avec_systeme(|s, _| crate::surveillance::du_fichier(&s.fs, s.ouverts.fichier(d.fichier), masque));
+                }
+            }
             return match r.and_then(|n| ecrire(m, total, &n.to_le_bytes())) {
                 Ok(()) => SUCCES,
                 Err(e) => e,
@@ -1050,7 +1058,11 @@ impl Wasi {
         // chose, comme pour un programme Linux (`file_remove_privs`).
         if ecriture && sorte == Sorte::Fichier && (0..nombre).any(|i| morceau(m, morceaux, i).is_some_and(|(_, l)| l > 0)) {
             let qui = self.identite;
-            vfs::avec(|fs, _| fs.retirer_les_privileges(qui, n(), temps::maintenant()));
+            vfs::avec_systeme(|s, _| {
+                if s.fs.retirer_les_privileges(qui, n(), temps::maintenant()) {
+                    crate::surveillance::changement(&s.fs, s.ouverts.fichier(d.fichier), crate::surveillance::IN_ATTRIB);
+                }
+            });
         }
         let maintenant = temps::maintenant();
         let mut ici = if ecriture && drapeaux & O_APPEND != 0 && sorte == Sorte::Fichier {
@@ -1106,7 +1118,7 @@ impl Wasi {
                 // Un programme WebAssembly n'a ni eventfd, ni epoll, ni
                 // tube : ce descripteur ne peut pas être à lui (une socket
                 // est passée plus haut).
-                (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket, _) => Err(EBADF),
+                (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify, _) => Err(EBADF),
                 // Un fichier de /proc ou de /sys : son contenu fabriqué à la
                 // lecture, comme pour un programme Linux (seule une mémoire
                 // qui manque peut échouer) ; il ne s'écrit pas.
@@ -1135,6 +1147,12 @@ impl Wasi {
             if !ecriture && sorte == Sorte::Fichier {
                 vfs::avec(|fs, _| fs.acceder(n(), maintenant));
             }
+        }
+        // Ce qu'en voit inotify, comme d'un read ou d'un write d'un
+        // programme Linux (surveillance.rs).
+        if fait > 0 && crate::surveillance::actif() {
+            let masque = if ecriture { crate::surveillance::IN_MODIFY } else { crate::surveillance::IN_ACCESS };
+            vfs::avec_systeme(|s, _| crate::surveillance::du_fichier(&s.fs, s.ouverts.fichier(d.fichier), masque));
         }
         // Le travail : une unité de carburant par octet, et par morceau lu.
         *cout += fait as u64 + nombre as u64;
@@ -1401,6 +1419,9 @@ impl Wasi {
             let depart = Depart { racine, dossier: base, qui, sous: true };
             let fin = s.resoudre(0, &depart, &chemin, suivre_pour(&o, suivre & 1 == 0)).map_err(errno)?;
             let complet = s.avec_vue(0, |vue| vue.chemin_de(&fin)).unwrap_or_default();
+            // Le lieu du fichier, pour inotify : préparé d'abord, rien ne
+            // doit échouer une fois le fichier créé ou ouvert.
+            let lieu = appels_fichiers::preparer_lieu(s, 0, &fin).map_err(|_| ENOMEM)?;
             // Un programme WebAssembly voit les systèmes montés comme un
             // programme Linux.
             let fin = match en_tmpfs(fin) {
@@ -1416,7 +1437,10 @@ impl Wasi {
                         return Err(errno(if o.creer { refus.err().unwrap_or(Erreur::ENOENT) } else { Erreur::ENOENT }));
                     };
                     let f = s.avec_vue(0, |vue| appels_fichiers::ouvrir_monte(vue, qui, objet, &o, drapeaux, &chemin)).map_err(errno)?;
-                    return s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| ENOMEM);
+                    let fichier = s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| ENOMEM)?;
+                    s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, objet));
+                    crate::surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), crate::surveillance::IN_OPEN);
+                    return Ok(fichier);
                 }
             };
             let ouvert = s.fs.ouvrir(qui, &fin, &o, maintenant).map_err(errno)?;
@@ -1443,16 +1467,29 @@ impl Wasi {
             };
             // O_TRUNC : vidé, et ses bits setuid et setgid tombent
             // (`do_truncate`).
-            if ouvert.tronquer {
+            let attrib = ouvert.tronquer && {
                 let _ = s.fs.tronquer(ouvert.numero, 0, maintenant, cadres);
-                s.fs.retirer_les_privileges(qui, ouvert.numero, maintenant);
-            }
-            s.ouverts
+                s.fs.retirer_les_privileges(qui, ouvert.numero, maintenant)
+            };
+            let fichier = s.ouverts
                 .ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, drapeaux, &chemin).avec_chemin(complet))
                 .map_err(|_| {
                     s.fs.fermer(&ouvert, cadres);
                     ENOMEM
-                })
+                })?;
+            // Ce qu'en voit inotify, comme d'un open d'un programme Linux :
+            // la création, l'ouverture, puis la troncature (O_TRUNC).
+            use crate::surveillance::{IN_CREATE, IN_MODIFY, IN_OPEN};
+            s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, Objet::Tmpfs(ouvert.numero)));
+            if ouvert.cree {
+                crate::surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_CREATE, false, 0);
+            }
+            crate::surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
+            if ouvert.tronquer {
+                let attrib = if attrib { crate::surveillance::IN_ATTRIB } else { 0 };
+                crate::surveillance::changement(&s.fs, s.ouverts.fichier(fichier), IN_MODIFY | attrib);
+            }
+            Ok(fichier)
         });
         let fichier = match ouvert {
             Ok(f) => f,
@@ -1569,7 +1606,7 @@ impl Wasi {
     #[allow(clippy::too_many_arguments)]
     fn fd_readdir(&self, dossier: u32, tampon: u32, longueur: u32, cookie: u64, utilises: u32, m: &mut [u8],
                   cout: &mut u64) -> u32 {
-        let (_, sorte, objet, ..) = match self.ouvert(dossier) {
+        let (d, sorte, objet, ..) = match self.ouvert(dossier) {
             Ok(o) => o,
             Err(e) => return e,
         };
@@ -1603,6 +1640,7 @@ impl Wasi {
                 }
                 true
             }))
+            .inspect(|_| crate::surveillance::du_fichier(&s.fs, s.ouverts.fichier(d.fichier), crate::surveillance::IN_ACCESS))
         });
         if let Err(e) = r {
             return errno(e);

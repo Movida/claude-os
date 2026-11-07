@@ -41,6 +41,7 @@ file  /bin/redirections    linux/construits/redirections 755 0 0
 file  /bin/dossier         linux/construits/dossier 755 0 0
 file  /bin/effacer         linux/construits/effacer 755 0 0
 file  /bin/copies          linux/construits/copies 755 0 0
+file  /bin/surveillance    linux/construits/surveillance 755 0 0
 file  /bin/evenements      linux/construits/evenements 755 0 0
 file  /bin/proc            linux/construits/proc 755 0 0
 file  /bin/partage         linux/construits/partage 755 0 0

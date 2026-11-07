@@ -722,6 +722,7 @@ pub fn fichier_ferme(ferme: &FichierOuvert, fichier: crate::descripteurs::Fichie
 /// file est rendu avec elle.
 pub fn fermer_les_differees() {
     crate::tube::signaler_les_fermes();
+    crate::surveillance::signaler_les_instances();
     let t = tache::courante();
     loop {
         let s = {

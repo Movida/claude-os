@@ -113,6 +113,11 @@ const RANDOM_POOLSIZE: u32 = 33;
 /// Linux 5.18, mais montrés à tous (256 et 60).
 const RANDOM_WAKEUP: u32 = 34;
 const RANDOM_RESEED: u32 = 35;
+/// /proc/sys/fs/inotify (6i) : max_queued_events, max_user_instances,
+/// max_user_watches (surveillance.rs).
+const INOTIFY_EVENEMENTS: u32 = 36;
+const INOTIFY_INSTANCES: u32 = 37;
+const INOTIFY_SURVEILLANCES: u32 = 38;
 /// /proc/sys/net (6h, reseau/proc.rs, `REGLAGES`) : ce numéro, plus le rang du réglage.
 const SYSCTL_NET: u32 = 100;
 /// /proc/net/pnp, route, dev et arp (6g, reseau/proc.rs).
@@ -146,6 +151,12 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     p.ajouter(fs, b"pipe-max-size", 0o644, (0, 0), reglage(PIPE_MAX_SIZE), maintenant)?;
     p.ajouter(fs, b"pipe-user-pages-hard", 0o644, (0, 0), reglage(PIPE_USER_PAGES_HARD), maintenant)?;
     p.ajouter(fs, b"pipe-user-pages-soft", 0o644, (0, 0), reglage(PIPE_USER_PAGES_SOFT), maintenant)?;
+    // Les limites d'inotify (`inotify_table`), dans l'ordre de Linux, en
+    // 0644 à root : root seul pourrait les changer.
+    let inotify = p.ajouter(fs, b"inotify", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    p.ajouter(inotify, b"max_queued_events", 0o644, (0, 0), reglage(INOTIFY_EVENEMENTS), maintenant)?;
+    p.ajouter(inotify, b"max_user_instances", 0o644, (0, 0), reglage(INOTIFY_INSTANCES), maintenant)?;
+    p.ajouter(inotify, b"max_user_watches", 0o644, (0, 0), reglage(INOTIFY_SURVEILLANCES), maintenant)?;
     // Le générateur aléatoire (le `random_table` de drivers/char/random.c) :
     // ses six fichiers ; les deux réglages sans effet depuis Linux 5.18,
     // que root peut y écrire, en 0644 à root comme chez lui (nos programmes
@@ -630,7 +641,8 @@ pub fn lecture(source: u32) -> Lecture {
     match source {
         s if s >= SYSCTL_NET => Lecture::Valeur,
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD | RANDOM_BOOT_ID
-        | RANDOM_UUID | RANDOM_ENTROPY_AVAIL | RANDOM_POOLSIZE | RANDOM_WAKEUP | RANDOM_RESEED => Lecture::Valeur,
+        | RANDOM_UUID | RANDOM_ENTROPY_AVAIL | RANDOM_POOLSIZE | RANDOM_WAKEUP | RANDOM_RESEED | INOTIFY_EVENEMENTS
+        | INOTIFY_INSTANCES | INOTIFY_SURVEILLANCES => Lecture::Valeur,
         MAPS | STATM | COMM | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP | NET_UNIX => Lecture::Sequence,
         // Nommées une à une, sans cas par défaut : /proc/net/tcp et unix
         // (6h) y étaient tombés, et se comportaient en attributs de /sys
@@ -638,6 +650,18 @@ pub fn lecture(source: u32) -> Lecture {
         crate::sysfs::CPU_ONLINE | crate::sysfs::CPU_POSSIBLE | crate::sysfs::CPU_PRESENT | crate::sysfs::THP_ENABLED => Lecture::Attribut,
         _ => unreachable!("source de fichier du noyau inconnue"),
     }
+}
+
+/// Le fichier ouvert que désigne le lien magique `lien` (/proc/<pid>/fd/N),
+/// s'il en est un (6i : appels_fichiers::saut, le lieu d'un fichier qu'on
+/// rouvre par lui).
+pub fn fichier_du_saut(lien: Objet) -> Option<crate::descripteurs::Fichier> {
+    let Objet::Monte(fichiers::montages::Systeme(s), i) = lien else { return None };
+    let (genre, n, fd) = decoder(i);
+    if s as usize != crate::vfs::PROC || genre != LIEN_FD {
+        return None;
+    }
+    processus::descripteur(processus_de(n)?, fd as u64)
 }
 
 /// Les données du fichier ouvert d'une source.
@@ -772,6 +796,9 @@ fn valeur(source: u32) -> Result<Vec<u8>, Erreur> {
         RANDOM_POOLSIZE => writeln!(t, "256"),
         RANDOM_WAKEUP => writeln!(t, "256"),
         RANDOM_RESEED => writeln!(t, "60"),
+        INOTIFY_EVENEMENTS => writeln!(t, "{}", crate::surveillance::EVENEMENTS_MAX),
+        INOTIFY_INSTANCES => writeln!(t, "{}", crate::surveillance::INSTANCES_MAX),
+        INOTIFY_SURVEILLANCES => writeln!(t, "{}", crate::surveillance::surveillances_max()),
         // La plus petite adresse qu'un programme peut projeter.
         _ => writeln!(t, "{}", ADRESSE_MIN),
     };

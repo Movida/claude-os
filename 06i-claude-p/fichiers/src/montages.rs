@@ -294,6 +294,18 @@ impl<'a, M: Monte> Vue<'a, M> {
         }
     }
 
+    /// Le dossier `o` d'un système monté dans son parent, et son nom dedans
+    /// (inotify, 6i : à qui s'annonce ce qu'on ouvre par « . » ou « .. ») ;
+    /// None pour la racine du système et pour ce qui n'est pas monté.
+    pub fn dans_son_parent(&self, o: Objet) -> Option<(Objet, Texte<'_>)> {
+        let Objet::Monte(s, n) = o else { return None };
+        let m = self.monte(s);
+        if n == m.racine() {
+            return None;
+        }
+        Some((Objet::Monte(s, m.parent(n)), m.nom(n)))
+    }
+
     /// Le chemin absolu du dossier `o` (getcwd), à travers les montages :
     /// celui du point de montage, puis les noms dans le système monté.
     /// ENOENT pour un dossier effacé, ENAMETOOLONG au-delà de PATH_MAX,

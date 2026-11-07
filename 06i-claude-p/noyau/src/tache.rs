@@ -282,6 +282,10 @@ pub struct Tache {
     pub fermetures: Verrou<Option<Arc<crate::reseau::socket::Socket>>>,
     /// Les tubes dont elle a fermé un bout, à signaler (tube::fichier_ferme), au même moment.
     pub tubes_fermes: Verrou<Option<Arc<crate::tube::Tube>>>,
+    /// Les instances d'inotify où elle a posé un événement, à signaler à
+    /// leurs inscrits O_ASYNC (surveillance::Groupe::deposer), au même
+    /// moment.
+    pub instances_a_signaler: Verrou<Option<Arc<crate::surveillance::Groupe>>>,
 }
 
 /// Ce qu'un programme a de plus qu'une tâche du noyau.
@@ -387,6 +391,7 @@ impl Tache {
             contexte_reseau: AtomicU32::new(0),
             fermetures: Verrou::new(None),
             tubes_fermes: Verrou::new(None),
+            instances_a_signaler: Verrou::new(None),
         })
         .map_err(|_| Manque::Memoire)?;
         Ok(t)
@@ -639,6 +644,7 @@ pub fn initialiser() {
         contexte_reseau: AtomicU32::new(0),
         fermetures: Verrou::new(None),
         tubes_fermes: Verrou::new(None),
+        instances_a_signaler: Verrou::new(None),
     };
     let t = Arc::into_raw(Arc::new(pile_demarrage).expect("plus de memoire pour la tache du demarrage")) as *mut Tache;
     INACTIVE.store(t, Ordering::Relaxed);
@@ -1097,10 +1103,12 @@ pub fn terminer(code: i32) -> ! {
         }
         p.usage().garder(&t.usage);
         p.fil_termine(t.tid, code);
-        // Le dernier fil ferme les fichiers du processus (fil_termine) :
-        // leurs sockets, maintenant (la fermeture différée, socket.rs).
-        crate::reseau::socket::fermer_les_differees();
     }
+    // Ce que la tâche a différé : pour un programme, les fichiers que son
+    // dernier fil vient de fermer (fil_termine), leurs sockets, maintenant
+    // (la fermeture différée, socket.rs) ; pour toute tâche, les SIGIO
+    // d'inotify qu'elle a prévus (une tâche du noyau qui ouvre un fichier).
+    crate::reseau::socket::fermer_les_differees();
     // Son tube interne n'est plus compté à l'utilisateur (`do_exit` :
     // `free_pipe_info(tsk->splice_pipe)`).
     crate::tube::rendre_le_tube_interne(t.tube_interne.swap(0, Ordering::Relaxed));

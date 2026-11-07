@@ -52,17 +52,39 @@ use crate::descripteurs::{Fichier, Ouverts, Tenu};
 use crate::memoire::Echec;
 use crate::verrou::Verrou;
 use crate::faillible::{self, VecFaillible};
-use crate::{copie_utilisateur, espace, pages, pile, temps};
-use fichiers::chemins::{Depart, Fin, Suivre, Texte, resoudre};
+use crate::{copie_utilisateur, espace, pages, pile, surveillance, temps};
+use fichiers::chemins::{Depart, Dernier, Fin, Suivre, Texte, resoudre};
 use fichiers::montages::{Interne, Monte, Objet, Vue};
 use fichiers::noyaufs::NoyauFs;
 use fichiers::tmpfs::Attributs;
-use fichiers::tmpfs::{Cadres, Horodatage, Limites, Numero, Tmpfs};
+use fichiers::tmpfs::{Cadres, Horodatage, Limites, Numero, RENAME_EXCHANGE, Tmpfs};
 use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Temps};
 
 /// Les pages des fichiers : des cadres de la mémoire, pris au-dessus de la
-/// réserve du noyau, lus et écrits par la projection directe.
-pub struct CadresDuNoyau;
+/// réserve du noyau, lus et écrits par la projection directe. Et les
+/// inodes finis pendant l'opération, que des surveillances d'inotify
+/// regardaient (6i) : leur fin est annoncée (surveillance::inode_fini)
+/// avant que le verrou des fichiers ne soit rendu, avant que leur numéro
+/// ne puisse resservir, et au moment où le dit Linux : une opération qui
+/// pose d'abord un autre événement (unlink : IN_ATTRIB, puis la fin, puis
+/// IN_DELETE au dossier) l'annonce elle-même entre les deux
+/// (`annoncer_les_fins`), sinon la fin de `avec_systeme` s'en charge.
+pub struct CadresDuNoyau {
+    /// Au plus deux par opération (l'inode effacé ou écrasé, le dossier
+    /// d'un fichier qu'on ferme) ; au-delà, annoncés aussitôt.
+    finis: [Option<(Numero, bool)>; 4],
+}
+
+impl CadresDuNoyau {
+    /// Annonce la fin des inodes finis jusqu'ici, dans l'ordre.
+    pub fn annoncer_les_fins(&mut self) {
+        for f in &mut self.finis {
+            if let Some((n, anonyme)) = f.take() {
+                crate::surveillance::inode_fini(n, anonyme);
+            }
+        }
+    }
+}
 
 impl Cadres for CadresDuNoyau {
     fn allouer(&mut self) -> Option<u64> {
@@ -96,6 +118,19 @@ impl Cadres for CadresDuNoyau {
         unsafe {
             let source = (espace::virtuelle(page) as *const u8).add(decalage);
             core::ptr::copy_nonoverlapping(source, tampon.as_mut_ptr(), tampon.len());
+        }
+    }
+
+    fn inode_detruit(&mut self, n: Numero, anonyme: bool) {
+        if !crate::surveillance::actif() {
+            return;
+        }
+        match self.finis.iter_mut().find(|f| f.is_none()) {
+            Some(place) => *place = Some((n, anonyme)),
+            None => {
+                self.annoncer_les_fins();
+                crate::surveillance::inode_fini(n, anonyme);
+            }
         }
     }
 }
@@ -222,12 +257,147 @@ impl Systeme {
     /// Le fichier ouvert `f` est tenu une fois de moins ; au dernier, il est
     /// fermé : le tmpfs rend son inode (et ses pages, si plus rien ne le
     /// tient).
+    ///
+    /// Sa fermeture se voit d'inotify (6i) : IN_CLOSE_WRITE s'il était
+    /// ouvert en écriture, IN_CLOSE_NOWRITE sinon (`fsnotify_close`, dans
+    /// le `__fput` de Linux), avant la fin de son inode et celle de son
+    /// dossier, que son lieu tenait.
     pub fn lacher(&mut self, f: Fichier, cadres: &mut CadresDuNoyau) {
-        if let Some(ferme) = self.ouverts.lacher(f)
-            && let Tenu::Tmpfs(ouvert) = ferme.tenu
-        {
-            self.fs.fermer(&ouvert, cadres);
+        if let Some(ferme) = self.ouverts.lacher(f) {
+            let fermeture = if ferme.ecriture { surveillance::IN_CLOSE_WRITE } else { surveillance::IN_CLOSE_NOWRITE };
+            surveillance::du_fichier(&self.fs, &ferme, fermeture);
+            // Le dernier fichier ouvert par une entrée effacée : elle meurt.
+            if let (Some(l), Some(n)) = (&ferme.lieu, ferme.numero())
+                && let Objet::Tmpfs(d) = l.dossier
+                && !self.fs.a_l_entree(d, l.cookie, n)
+            {
+                self.entree_morte(n, d, l.cookie);
+            }
+            if let Tenu::Tmpfs(ouvert) = ferme.tenu {
+                self.fs.fermer(&ouvert, cadres);
+            }
+            if let Some(Objet::Tmpfs(d)) = ferme.lieu.map(|l| l.dossier) {
+                self.fs.lacher(d, cadres);
+            }
         }
+    }
+
+    /// L'entrée `cookie` du dossier `dossier`, qui désignait l'inode `n`,
+    /// a disparu (effacée, écrasée par un renommage), ou le dernier fichier
+    /// ouvert par elle vient d'être fermé : si plus aucun fichier ouvert ne
+    /// la tient, elle meurt (le `dentry_unlink_inode` de Linux : un dentry
+    /// tenu attend sa dernière référence), et si l'inode n'a plus aucun
+    /// nom, inotify annonce sa fin maintenant (IN_DELETE_SELF, puis
+    /// IN_IGNORED : `if (!inode->i_nlink) fsnotify_inoderemove(inode)`),
+    /// même si un fichier ouvert par un AUTRE nom le tient encore. Mesuré
+    /// sous Linux 6.18 : un fichier ouvert par f, lié en h, effacé par f
+    /// puis par h : la fin à l'effacement de h (personne ne tenait ce
+    /// nom-là), rien au close ; ouvert par f et par h, effacé deux fois :
+    /// la fin au premier close. Sans lien physique, c'est la fin de l'inode
+    /// (`Cadres::inode_detruit`), qui n'aura plus rien à dire. Pas pour un
+    /// dossier : il n'a qu'un nom, et le dossier courant d'un processus le
+    /// tient aussi (hors de la table des fichiers ouverts) ; sa fin d'inode
+    /// est le bon moment.
+    pub fn entree_morte(&self, n: Numero, dossier: Numero, cookie: u64) {
+        if !surveillance::actif() || !self.fs.existe(n) || self.fs.est_un_dossier(n) {
+            return;
+        }
+        if self.fs.attributs(n).nlink == 0 && !self.ouverts.tient_l_entree(dossier, cookie) {
+            surveillance::inode_fini(n, false);
+        }
+    }
+
+    /// Renomme le dernier composant de `ancien` en celui de `nouveau`
+    /// (renameat2 : Tmpfs::renommer), puis ce qu'en voient les fichiers
+    /// ouverts et inotify (6i), comme le `d_move` et le `fsnotify_move` de
+    /// Linux :
+    ///   - les fichiers ouverts par l'entrée déplacée la suivent (leur lieu :
+    ///     le nouveau dossier, le nouveau nom) ; avec RENAME_EXCHANGE, ceux de
+    ///     l'autre entrée aussi, à l'ancien nom ; ceux d'un fichier écrasé
+    ///     gardent le leur (leur entrée a disparu). Leurs noms sont copiés
+    ///     d'avance : ENOMEM avant de rien changer ;
+    ///   - IN_MOVED_FROM à l'ancien dossier, IN_MOVED_TO au nouveau, avec
+    ///     le même cookie, neuf ; IN_ATTRIB à un inode écrasé (un nom de
+    ///     moins) ; IN_MOVE_SELF à l'inode déplacé ; avec RENAME_EXCHANGE,
+    ///     le déplacement inverse, avec son propre cookie. La fin d'un inode
+    ///     écrasé vient ensuite (IN_DELETE_SELF : à la fin de `avec_systeme`,
+    ///     ou par `entree_morte` s'il vit par un autre nom).
+    /// Rien si les deux noms désignent le même inode.
+    pub fn renommer(&mut self, qui: Identite, ancien: &Fin<Numero>, nouveau: &Fin<Numero>, drapeaux: u32,
+                    cadres: &mut CadresDuNoyau) -> Result<(), Erreur> {
+        let echange = drapeaux & RENAME_EXCHANGE != 0;
+        let source = (ancien.dernier == Dernier::Nom).then(|| self.fs.entree(ancien.dossier, &ancien.nom)).flatten();
+        let cible = (nouveau.dernier == Dernier::Nom).then(|| self.fs.entree(nouveau.dossier, &nouveau.nom)).flatten();
+        let est_dossier = |fs: &Tmpfs, e: Option<(Numero, u64)>| e.is_some_and(|(n, _)| fs.est_un_dossier(n));
+        let (dossier_source, dossier_cible) = (est_dossier(&self.fs, source), est_dossier(&self.fs, cible));
+        // Les fichiers ouverts qui suivront chaque entrée, et leurs noms.
+        let suit = |f: &crate::descripteurs::FichierOuvert, dossier: Numero, e: Option<(Numero, u64)>| {
+            e.is_some_and(|(n, c)| f.numero() == Some(n) && f.lieu.as_ref().is_some_and(|l| l.dossier == Objet::Tmpfs(dossier) && l.cookie == c))
+        };
+        let a_suivre = self.ouverts.tous().filter(|f| suit(f, ancien.dossier, source)).count();
+        let b_suivre = if echange { self.ouverts.tous().filter(|f| suit(f, nouveau.dossier, cible)).count() } else { 0 };
+        let mut noms_a: Vec<Vec<u8>> = faillible::avec_capacite(a_suivre)?;
+        let mut noms_b: Vec<Vec<u8>> = faillible::avec_capacite(b_suivre)?;
+        for _ in 0..a_suivre {
+            noms_a.ajouter_dans_la_place(faillible::copie(&nouveau.nom)?);
+        }
+        for _ in 0..b_suivre {
+            noms_b.ajouter_dans_la_place(faillible::copie(&ancien.nom)?);
+        }
+        self.fs.renommer(qui, ancien, nouveau, drapeaux, temps::maintenant(), cadres)?;
+        let Some((source, cookie_a)) = source else { return Ok(()) };
+        if cible.is_some_and(|(c, _)| c == source) {
+            return Ok(());
+        }
+        // Les entrées après : RENAME_EXCHANGE les garde, en échangeant leurs
+        // inodes ; sinon, une entrée neuve au nouveau nom.
+        let cookie_nouveau = match (echange, cible) {
+            (true, Some((_, c))) => c,
+            _ => self.fs.entree(nouveau.dossier, &nouveau.nom).map_or(0, |(_, c)| c),
+        };
+        let Systeme { fs, ouverts, .. } = self;
+        for f in ouverts.tous() {
+            let n = f.numero();
+            let Some(l) = f.lieu.as_mut() else { continue };
+            let (dossier, cookie, nom) = if n == Some(source) && l.dossier == Objet::Tmpfs(ancien.dossier) && l.cookie == cookie_a {
+                (nouveau.dossier, cookie_nouveau, noms_a.pop())
+            } else if let Some((c, cookie_c)) = cible.filter(|_| echange)
+                && n == Some(c)
+                && l.dossier == Objet::Tmpfs(nouveau.dossier)
+                && l.cookie == cookie_c
+            {
+                (ancien.dossier, cookie_a, noms_b.pop())
+            } else {
+                continue;
+            };
+            fs.prendre(dossier);
+            if let Objet::Tmpfs(ancien) = l.dossier {
+                fs.lacher(ancien, cadres);
+            }
+            l.dossier = Objet::Tmpfs(dossier);
+            l.cookie = cookie;
+            l.nom = nom.expect("un nom par fichier qui suit");
+        }
+        let cookie = surveillance::cookie();
+        surveillance::dans_le_dossier(ancien.dossier, &ancien.nom, surveillance::IN_MOVED_FROM, dossier_source, cookie);
+        surveillance::dans_le_dossier(nouveau.dossier, &nouveau.nom, surveillance::IN_MOVED_TO, dossier_source, cookie);
+        match cible {
+            Some((c, _)) if !echange => surveillance::de_l_inode(c, dossier_cible, surveillance::IN_ATTRIB),
+            _ => {}
+        }
+        surveillance::de_l_inode(source, dossier_source, surveillance::IN_MOVE_SELF);
+        if let Some((c, _)) = cible.filter(|_| echange) {
+            let cookie = surveillance::cookie();
+            surveillance::dans_le_dossier(nouveau.dossier, &nouveau.nom, surveillance::IN_MOVED_FROM, dossier_cible, cookie);
+            surveillance::dans_le_dossier(ancien.dossier, &ancien.nom, surveillance::IN_MOVED_TO, dossier_cible, cookie);
+            surveillance::de_l_inode(c, dossier_cible, surveillance::IN_MOVE_SELF);
+        }
+        // L'entrée écrasée meurt (le `dput(new_dentry)` de `do_renameat2`),
+        // après les déplacements.
+        if let Some((c, cookie_c)) = cible.filter(|_| !echange) {
+            self.entree_morte(c, nouveau.dossier, cookie_c);
+        }
+        Ok(())
     }
 
     /// Appelle `f` avec la vue de tous les systèmes de fichiers, telle que
@@ -294,7 +464,10 @@ pub fn avec<R>(f: impl FnOnce(&mut Tmpfs, &mut CadresDuNoyau) -> R) -> R {
 #[track_caller]
 pub fn avec_systeme<R>(f: impl FnOnce(&mut Systeme, &mut CadresDuNoyau) -> R) -> R {
     let mut racine = RACINE.verrouiller();
-    f(racine.as_mut().expect("systeme de fichiers pas encore monte"), &mut CadresDuNoyau)
+    let mut cadres = CadresDuNoyau { finis: [None; 4] };
+    let r = f(racine.as_mut().expect("systeme de fichiers pas encore monte"), &mut cadres);
+    cadres.annoncer_les_fins();
+    r
 }
 
 /// Copie `n` octets de la page `cadre` d'un fichier, que l'appelant tient

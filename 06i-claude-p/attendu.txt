@@ -56,8 +56,8 @@ rendues et recollees : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 63, liens symboliques 6, liens physiques 4 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 80 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 64, liens symboliques 6, liens physiques 4 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 93 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -205,6 +205,18 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] copies : sendfile vers une socket : ok
 [linux] copies : toutes les verifications : ok
 [noyau] copies : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] surveillance : trois write : six evenements, sans fusion (seulement avec le dernier) : ok
+[linux] surveillance : rmdir d'un dossier dont un fichier est encore ouvert : il attend : ok
+[linux] surveillance : le close du fichier : le dossier finit : ok
+[linux] surveillance : le dernier : IN_Q_OVERFLOW, numero -1, sans nom : ok
+[linux] surveillance : au-dela de max_user_instances : EMFILE : ok
+[linux] surveillance : toutes les verifications : ok
+[noyau] surveillance : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Bonjour depuis l'anneau 3
+[linux] surveillance : guetter bonjour-asm dans /bin : OPEN ACCESS CLOSE_NOWRITE, et SIGIO : ok
+[wasm] lecteur : ecrire puis relire /tmp/lecteur.txt : ok
+[linux] surveillance : guetter bonjour.txt dans /etc : OPEN ACCESS CLOSE_NOWRITE OPEN ACCESS CLOSE_NOWRITE, et SIGIO : ok
+[linux] surveillance : guetter bonjour-c-dynamique dans /bin : bonjour-c-dynamique:OPEN bonjour-c-dynamique:ACCESS ld-linux-x86-64.so.2:OPEN ld-linux-x86-64.so.2:ACCESS, et SIGIO : ok
 [linux] reseau : toutes les verifications : ok
 [noyau] reseau : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] dns : toutes les verifications : ok

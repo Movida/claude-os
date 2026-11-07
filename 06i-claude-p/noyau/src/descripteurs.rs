@@ -79,6 +79,8 @@ pub enum Sorte {
     /// Une socket (6g) : son objet dans `Prive::Socket`, son inode dans le
     /// tmpfs (sans nom, celui de sockfs chez Linux).
     Socket,
+    /// Une instance d'inotify (6i) : son objet dans `Prive::Inotify`.
+    Inotify,
     /// Un fichier d'un système du noyau (/proc, /sys, 6d), dont le contenu
     /// est fabriqué à la lecture (`Donnees::Noyau`), d'une des trois façons
     /// de Linux.
@@ -112,7 +114,7 @@ impl Sorte {
     /// /dev/random et les terminaux acceptés.
     pub fn sait_attendre(self) -> bool {
         matches!(self, Sorte::Aleatoire { random: true } | Sorte::Console | Sorte::EventFd | Sorte::Epoll | Sorte::Tube
-                       | Sorte::Socket | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
+                       | Sorte::Socket | Sorte::Inotify | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
     }
 }
 
@@ -140,6 +142,7 @@ pub enum Prive {
     Epoll(Arc<crate::epoll::Epoll>),
     Tube(Arc<crate::tube::Tube>),
     Socket(Arc<crate::reseau::socket::Socket>),
+    Inotify(Arc<crate::surveillance::Groupe>),
 }
 
 /// Ce que tient un fichier ouvert : un inode du tmpfs, avec ce qu'a rendu
@@ -182,6 +185,11 @@ pub struct FichierOuvert {
     /// voulu : il faudrait au tmpfs le parent de chaque fichier, qu'un lien
     /// physique rend ambigu (Linux tient le `dentry` de l'ouverture).
     pub chemin: Vec<u8>,
+    /// Le dossier et l'entrée par lesquels il a été ouvert, s'il est du
+    /// tmpfs et a un nom (6i) : à qui inotify adresse ses événements, comme
+    /// au parent de son `dentry` chez Linux. Un renommage le suit (vfs.rs).
+    /// Il tient son dossier : rendu à la fermeture (`Systeme::lacher`).
+    pub lieu: Option<crate::surveillance::Lieu>,
     /// Combien le tiennent : ses descripteurs, les zones qui le projettent,
     /// et les appels système qui s'en servent (appels_fichiers::FichierTenu).
     references: u32,
@@ -191,7 +199,7 @@ impl FichierOuvert {
     pub fn new(sorte: Sorte, tenu: Tenu, lecture: bool, ecriture: bool, drapeaux: u32, chemin: &[u8]) -> FichierOuvert {
         let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').find(|n| !n.is_empty()).unwrap_or(chemin));
         FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, donnees: Donnees::Aucune, prive: Prive::Aucun,
-                       surveillants: Vec::new(), proprietaire: None, nom, chemin: Vec::new(), references: 1 }
+                       surveillants: Vec::new(), proprietaire: None, nom, chemin: Vec::new(), lieu: None, references: 1 }
     }
 
     /// Le même, avec son chemin canonique.
@@ -274,6 +282,17 @@ impl Ouverts {
         self.cases.get_mut(f.0 as usize).and_then(Option::as_mut)
     }
 
+    /// Tous les fichiers ouverts (pour suivre un renommage : vfs.rs).
+    pub fn tous(&mut self) -> impl Iterator<Item = &mut FichierOuvert> {
+        self.cases.iter_mut().flatten()
+    }
+
+    /// Un fichier ouvert tient-il l'entrée `cookie` du dossier `dossier`
+    /// (son lieu) : le `dentry` de Linux est-il encore tenu ?
+    pub fn tient_l_entree(&self, dossier: Numero, cookie: u64) -> bool {
+        self.cases.iter().flatten().any(|f| f.lieu.as_ref().is_some_and(|l| l.dossier == Objet::Tmpfs(dossier) && l.cookie == cookie))
+    }
+
     /// Combien le tiennent (`file_count`).
     pub fn references(&self, f: Fichier) -> u32 {
         self.voir(f).map_or(0, |o| o.references)
@@ -302,6 +321,7 @@ impl Ouverts {
             crate::epoll::fichier_ferme(self, o);
             crate::tube::fichier_ferme(o, f);
             crate::reseau::socket::fichier_ferme(o, f);
+            crate::surveillance::fichier_ferme(o, f);
         }
         while self.cases.last().is_some_and(Option::is_none) {
             self.cases.pop();

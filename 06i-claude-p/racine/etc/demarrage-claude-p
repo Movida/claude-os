@@ -15,7 +15,11 @@
 #
 # Puis ce que Claude a laissé, effacé : dans HOME, sa configuration, sa copie
 # de sauvegarde, le journal de la session ; dans /tmp, le dossier de ses
-# sockets (cc-socks) et son dossier temporaire (claude-1000). Le groupe
+# sockets (cc-socks) et son dossier temporaire (claude-1000). Depuis qu'il a
+# inotify, il y range la sonde qui lui sert à vérifier que la surveillance
+# des fichiers marche (fswatch-probe-*) : il l'efface si cet essai, en tâche
+# de fond, finit avant lui, et la laisse sinon (sous Linux, plus rapide,
+# toujours : mesuré six fois sur six ; ici, selon le moment). Le groupe
 # mesure sa mémoire du { au }, et doit tout rendre (« memoire rendue : ok »),
 # ce qu'aucun des deux lancements ne peut dire seul, puisque ses fichiers
 # restent, à raison, dans le tmpfs. Le cd vient avant lui : le dossier

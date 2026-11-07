@@ -116,6 +116,24 @@ wait
 }
 # Les transferts dans le noyau (6i) : copy_file_range, sendfile, fadvise64.
 /bin/copies
+# inotify (6i) : chaque événement, dans l'ordre de Linux. Puis, vus par un
+# guetteur lancé avant eux (et le temps de poser sa surveillance), en
+# O_ASYNC (SIGIO) : un programme lancé par le lanceur ; un fichier lu par un
+# programme WebAssembly (deux fois : par son nom, puis par un lien) ; un
+# programme dynamique, puis son interpréteur.
+/bin/surveillance
+/bin/surveillance --guetter /bin bonjour-asm "OPEN ACCESS CLOSE_NOWRITE" &
+/bin/surveillance --dormir 500
+/bin/bonjour-asm
+wait
+/bin/surveillance --guetter /etc bonjour.txt "OPEN ACCESS CLOSE_NOWRITE OPEN ACCESS CLOSE_NOWRITE" &
+/bin/surveillance --dormir 500
+--dir=/ /bin/lecteur.wasm un-argument
+wait
+/bin/surveillance --guetter /bin bonjour-c-dynamique "bonjour-c-dynamique:OPEN bonjour-c-dynamique:ACCESS ld-linux-x86-64.so.2:OPEN ld-linux-x86-64.so.2:ACCESS" /usr/lib/x86_64-linux-gnu ld-linux-x86-64.so.2 &
+/bin/surveillance --dormir 500
+/bin/bonjour-c-dynamique
+wait
 # Les sockets UDP et ICMP (6g), sur lo ; et le DNS de la glibc, par un
 # serveur du programme.
 /bin/reseau

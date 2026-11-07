@@ -201,6 +201,14 @@ pub fn demarrer() {
                 }
             }
         };
+        // Ce que la ligne a différé, comme à la sortie d'un appel système
+        // (`reseau::socket::fermer_les_differees`) : le SIGIO des instances
+        // d'inotify en O_ASYNC où elle a posé des événements (l'ouverture
+        // d'un programme, d'une redirection), avant d'attendre le
+        // programme ; les fichiers qu'a fermés un lancement refusé. Sans
+        // cela, une instance restait chaînée au lanceur : plus aucun SIGIO
+        // pour elle, et jamais rendue.
+        crate::reseau::socket::fermer_les_differees();
         match action {
             None => {}
             Some(Action::Premier(t)) => l.attendre(t),
@@ -215,10 +223,13 @@ pub fn demarrer() {
             Some(Action::Attendre) => l.attendre_tous(),
             Some(Action::FinDeGroupe) => l.finir_groupe(),
         }
+        // Et ce qu'a différé le recueil d'un programme.
+        crate::reseau::socket::fermer_les_differees();
     }
     // Comme init, qui recueille ses enfants : le noyau attend ceux qui
     // tournent encore.
     l.attendre_tous();
+    crate::reseau::socket::fermer_les_differees();
     // La pile de 16 Kio a-t-elle encore de la marge ? Ce qu'elle a vu de pire, une fois tout
     // fait. Un quart de réserve, pour les chemins que ces programmes n'ont pas pris.
     let (profondeur, taille) = (tache::plus_grande_profondeur(), crate::vmalloc::TAILLE_PILE as usize);
@@ -591,7 +602,7 @@ fn tampon_pour(ligne: &[u8]) -> Option<Vec<u8>> {
 /// Le contenu de /etc/demarrage, lu en root (comme `init` lit son
 /// `inittab`), dans un bloc du tas.
 fn lire_demarrage() -> Result<Vec<u8>, fichiers::Erreur> {
-    let (n, _) = appels_fichiers::trouver_pour(Identite::ROOT, DEMARRAGE)?;
+    let (n, _, _trouve) = appels_fichiers::trouver_pour(Identite::ROOT, DEMARRAGE)?;
     let (mode, taille) = vfs::avec(|fs, _| {
         let a = fs.attributs(n);
         (a.mode, a.taille)
@@ -676,13 +687,14 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
     commande.arguments().for_each(|a| arguments.ajouter_dans_la_place(a));
     commande.dossiers().for_each(|d| dossiers.ajouter_dans_la_place(d));
     commande.ecoutes().for_each(|e| ecoutes.ajouter_dans_la_place(e));
-    let (n, complet) = match appels_fichiers::trouver_pour(IDENTITE, programme) {
+    let (n, complet, trouve) = match appels_fichiers::trouver_pour(IDENTITE, programme) {
         Ok(n) => n,
         Err(e) => return refus(&format_args!("{} : introuvable (errno {})", Nom(programme), e.errno())),
     };
     let lancement = Lancement {
         chemin: programme,
         complet: &complet,
+        trouve: &trouve,
         arguments: &arguments,
         environnement: &environnement,
         dossiers: &dossiers,
@@ -729,6 +741,9 @@ struct Lancement<'a> {
     /// Son chemin canonique (liens résolus), vide s'il n'a pas pu être
     /// calculé : celui de son fichier ouvert (FichierOuvert::chemin).
     complet: &'a [u8],
+    /// Son chemin, tenu depuis qu'on l'a trouvé : le lieu de son fichier
+    /// ouvert (inotify, 6i).
+    trouve: &'a appels_fichiers::CheminTenu,
     /// argv : le chemin, puis les arguments.
     arguments: &'a [&'a [u8]],
     /// envp : des « NOM=valeur ».
@@ -781,23 +796,87 @@ fn executer(l: &mut Lanceur, numero: usize, n: Numero, lancement: &Lancement) ->
             afficherln!("[noyau] {}, ligne {} : refusee : --tcplisten= pour un programme Linux", Nom(DEMARRAGE), numero);
             None
         }
-        [0x7f, b'E', b'L', b'F'] => executer_elf(l, nom, n, lancement),
         _ => {
+            // Comme l'`execve` de Linux : le fichier ouvert (`do_open_execat` :
+            // IN_OPEN), protégé contre l'écriture (ETXTBSY : refermé aussitôt,
+            // IN_CLOSE_NOWRITE, sans rien lire), puis lu (`prepare_binprm` :
+            // IN_ACCESS s'il n'est pas vide), avant de savoir s'il est
+            // exécutable (un format inconnu : ENOEXEC, refermé ; mesuré).
+            let fichier = match appels_fichiers::ouvrir_inode(n, chemin, copie(lancement.complet), crate::descripteurs::Sorte::Fichier,
+                                                             lancement.trouve) {
+                Ok(f) => f,
+                Err(e) => {
+                    afficherln!("[noyau] {} : ouverture impossible (errno {})", nom, e.errno());
+                    return None;
+                }
+            };
+            let lacher = || vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
+            let Some(protection) = Protection::prendre(n) else {
+                lacher();
+                afficherln!("[noyau] {} : ouvert en ecriture, ne peut pas etre execute (ETXTBSY)", nom);
+                return None;
+            };
+            if lus > 0 {
+                appels_fichiers::annoncer_la_lecture(fichier);
+            }
+            if signature[..lus] == [0x7f, b'E', b'L', b'F'] {
+                return executer_elf(l, nom, n, lancement, fichier, protection);
+            }
+            drop(protection);
+            lacher();
             afficherln!("[noyau] {} : format inconnu, ignore.", nom);
             None
         }
     }
 }
 
+/// La protection d'un programme contre l'écriture (ETXTBSY : ses pages
+/// seront bientôt celles du programme), prise à son ouverture
+/// (`exe_file_deny_write_access`, dans le `do_open_execat` de Linux) :
+/// rendue si son lancement est refusé ensuite ; gardée par le lanceur s'il
+/// est lancé, jusqu'à son recueil (`Lanceur::recueillir`).
+struct Protection(Numero);
+
+impl Protection {
+    /// None : le fichier est ouvert en écriture.
+    fn prendre(n: Numero) -> Option<Protection> {
+        vfs::avec(|fs, _| fs.refuser_ecriture(n)).ok().map(|()| Protection(n))
+    }
+
+    /// Le programme est lancé : la protection reste, jusqu'à son recueil.
+    fn garder(self) {
+        core::mem::forget(self);
+    }
+}
+
+impl Drop for Protection {
+    fn drop(&mut self) {
+        vfs::avec(|fs, _| fs.permettre_ecriture(self.0));
+    }
+}
+
 /// Un programme Linux : on vérifie le fichier, on le charge dans un espace
 /// d'adressage neuf, puis on l'exécute, dans l'anneau 3, jusqu'à ce qu'il se
 /// termine. Son espace est alors détruit, et doit rendre toute sa mémoire.
-fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement) -> Option<Tache> {
-    // Un refus : le dire, et rien n'est lancé.
+///
+/// `fichier` : le programme ouvert (que tiendront ses zones), lâché ici ;
+/// `protection` : sa protection contre l'écriture, que garde le lanceur
+/// s'il est lancé (rendue sinon, avec elle).
+fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement, fichier: crate::descripteurs::Fichier,
+                protection: Protection) -> Option<Tache> {
+    let lacher_le_programme = || vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
+    // Un refus : le dire, et rien n'est lancé ; avant le chargement, le
+    // fichier du programme encore ouvert est lâché (IN_CLOSE_NOWRITE).
     macro_rules! refus {
         ($($t:tt)*) => {{
             afficherln!($($t)*);
             return None;
+        }};
+    }
+    macro_rules! refus_ouvert {
+        ($($t:tt)*) => {{
+            lacher_le_programme();
+            refus!($($t)*)
         }};
     }
     let chemin = lancement.chemin;
@@ -807,11 +886,11 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     let taille = vfs::avec(|fs, _| fs.attributs(n).taille);
     let (entete, table) = match chargeur_elf::verifier(taille, lire) {
         Ok(v) => v,
-        Err(e) => refus!("[noyau] {} : programme Linux refuse : {}", nom, e),
+        Err(e) => refus_ouvert!("[noyau] {} : programme Linux refuse : {}", nom, e),
     };
     let executable = match formats::elf::lire_entetes(&entete, &table, taille) {
         Ok(x) => x,
-        Err(e) => refus!("[noyau] {} : programme Linux refuse : {}", nom, e),
+        Err(e) => refus_ouvert!("[noyau] {} : programme Linux refuse : {}", nom, e),
     };
     // Un programme dynamique : le chemin de son interpréteur, lu dans le
     // fichier (hors de la table des en-têtes), dans un bloc du tas (4 Kio
@@ -819,30 +898,31 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     let mut chemin_interpreteur = Vec::new();
     if let Some((position, longueur)) = executable.interpreteur() {
         if chemin_interpreteur.redimensionner(longueur, 0).is_err() {
-            refus!("[noyau] {} : plus de memoire pour le chemin de l'interpreteur", nom);
+            refus_ouvert!("[noyau] {} : plus de memoire pour le chemin de l'interpreteur", nom);
         }
         if !lire(position, &mut chemin_interpreteur) {
-            refus!("[noyau] {} : programme Linux refuse : {}", nom, formats::elf::Erreur::InterpreteurHorsDuFichier);
+            refus_ouvert!("[noyau] {} : programme Linux refuse : {}", nom, formats::elf::Erreur::InterpreteurHorsDuFichier);
         }
         match formats::elf::chemin_interpreteur(&chemin_interpreteur) {
             Ok(c) => {
                 let longueur = c.len();
                 chemin_interpreteur.truncate(longueur);
             }
-            Err(e) => refus!("[noyau] {} : programme Linux refuse : {}", nom, e),
+            Err(e) => refus_ouvert!("[noyau] {} : programme Linux refuse : {}", nom, e),
         }
     }
     let identite = IDENTITE;
-    // L'interpréteur : trouvé, vérifié, son fichier ouvert (voir
-    // `ouvrir_interpreteur`). Il reste protégé contre l'écriture jusqu'à
-    // la fin du chargement, comme chez Linux.
+    // L'interpréteur, après le programme, comme l'ouvre `load_elf_binary`
+    // (inotify voit le programme d'abord, mesuré : IN_OPEN et IN_ACCESS du
+    // programme, puis ceux de ld-linux ; et, s'il manque, la fermeture du
+    // programme après la sienne) : trouvé, vérifié, son fichier ouvert (voir
+    // `ouvrir_interpreteur`). Il reste protégé contre l'écriture jusqu'à la
+    // fin du chargement, comme chez Linux.
     let interpreteur = match executable.interpreteur() {
         None => None,
         Some(_) => match ouvrir_interpreteur(&chemin_interpreteur) {
             Ok(i) => Some(i),
-            Err(e) => {
-                refus!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno());
-            }
+            Err(e) => refus_ouvert!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno()),
         },
     };
     let executable_interpreteur = match &interpreteur {
@@ -852,21 +932,12 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
             Err(e) => {
                 let e = EchecInterpreteur::Format(chargeur_elf::Refus::Format(e));
                 fermer_interpreteur(interpreteur.as_ref());
-                refus!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno());
+                refus_ouvert!("[noyau] {} : interpreteur {} : {} (errno {})", nom, Nom(&chemin_interpreteur), e, e.errno());
             }
         },
     };
-    // Le fichier ouvert que projetteront ses segments : chaque zone le
-    // tiendra ; l'ouverture du chargeur est lâchée ensuite.
-    let fichier = match appels_fichiers::ouvrir_inode(n, chemin, copie(lancement.complet), crate::descripteurs::Sorte::Fichier) {
-        Ok(f) => f,
-        Err(e) => {
-            fermer_interpreteur(interpreteur.as_ref());
-            refus!("[noyau] {} : ouverture impossible (errno {})", nom, e.errno());
-        }
-    };
     let charge = chargeur_elf::charger(&executable, nom, fichier, executable_interpreteur.as_ref().map(|(x, f)| (x, *f)));
-    vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
+    lacher_le_programme();
     let (mut programme, images) = match charge {
         Ok(p) => p,
         Err(e) => {
@@ -996,11 +1067,6 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
             refus!("[noyau] {} : pas de place pour son descripteur {} (errno {})", nom, fd, e.errno());
         }
     }
-    // Plus personne ne peut écrire le fichier tant qu'il s'exécute
-    // (ETXTBSY) : ses pages seront bientôt celles du programme.
-    if vfs::avec(|fs, _| fs.refuser_ecriture(n)).is_err() {
-        refus!("[noyau] {} : ouvert en ecriture, ne peut pas etre execute (ETXTBSY)", nom);
-    }
     let racine = vfs::avec(|fs, _| {
         let r = fs.racine();
         // Le dossier courant (celui du lanceur) et la racine tiennent chacun
@@ -1034,12 +1100,15 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         Some(processus) => {
             l.commencer();
             vfs::avec(|fs, _| fs.prendre(n));
+            // Plus personne ne peut écrire le fichier tant qu'il s'exécute :
+            // la protection prise à son ouverture reste, jusqu'au recueil.
+            protection.garder();
             Some(Tache::Linux { processus, nom, fichier: n })
         }
         None => {
             afficherln!("[noyau] {} : plus de place pour sa tache ou son processus", nom);
             processus::recueillir(pid);
-            vfs::avec(|fs, _| fs.permettre_ecriture(n));
+            drop(protection);
             None
         }
     }
@@ -1093,42 +1162,47 @@ impl fmt::Display for EchecInterpreteur {
     }
 }
 
-/// Trouve l'interpréteur `chemin`, comme Linux (open_exec) : résolu depuis
-/// la racine (le dossier courant du programme, aussi la racine), avec les
-/// droits de l'utilisateur 1000 (traverser, exécuter : EACCES sinon, et
-/// pour un dossier), protégé contre l'écriture (ETXTBSY s'il est ouvert en
-/// écriture), puis lu par ses en-têtes. En cas d'échec, pourquoi ; rien ne
-/// reste tenu.
+/// Trouve l'interpréteur `chemin`, comme Linux (`open_exec`, puis
+/// `load_elf_binary`) : résolu depuis la racine (le dossier courant du
+/// programme, aussi la racine), avec les droits de l'utilisateur 1000
+/// (traverser, exécuter : EACCES sinon, et pour un dossier), ouvert
+/// (IN_OPEN), protégé contre l'écriture (ETXTBSY s'il est ouvert en
+/// écriture : refermé, IN_CLOSE_NOWRITE), puis lu par ses en-têtes
+/// (IN_ACCESS). En cas d'échec, pourquoi ; rien ne reste tenu.
 fn ouvrir_interpreteur(chemin: &[u8]) -> Result<Interpreteur, EchecInterpreteur> {
     use EchecInterpreteur::Fichier;
-    let (n, complet) = appels_fichiers::trouver_pour(IDENTITE, chemin).map_err(|e| Fichier("introuvable", e))?;
+    let (n, complet, trouve) = appels_fichiers::trouver_pour(IDENTITE, chemin).map_err(|e| Fichier("introuvable", e))?;
     let lacher = || vfs::avec(|fs, cadres| fs.lacher(n, cadres));
     if let Err(e) = vfs::avec(|fs, _| fs.peut_executer(IDENTITE, n)) {
         lacher();
         return Err(Fichier("pas le droit de l'executer", e));
     }
-    if let Err(e) = vfs::avec(|fs, _| fs.refuser_ecriture(n)) {
-        lacher();
-        return Err(Fichier("ouvert en ecriture", e));
-    }
-    let relacher = || {
-        vfs::avec(|fs, _| fs.permettre_ecriture(n));
+    let fichier = match appels_fichiers::ouvrir_inode(n, chemin, complet, crate::descripteurs::Sorte::Fichier, &trouve) {
+        Ok(f) => f,
+        Err(e) => {
+            lacher();
+            return Err(Fichier("ouverture impossible", e));
+        }
+    };
+    let fermer = || {
+        vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
         lacher();
     };
+    if let Err(e) = vfs::avec(|fs, _| fs.refuser_ecriture(n)) {
+        fermer();
+        return Err(Fichier("ouvert en ecriture", e));
+    }
     let taille = vfs::avec(|fs, _| fs.attributs(n).taille);
+    if taille > 0 {
+        appels_fichiers::annoncer_la_lecture(fichier);
+    }
     let lire = |position: u64, tampon: &mut [u8]| vfs::lire(n, position, tampon) == tampon.len();
     let (entete, table) = match chargeur_elf::verifier(taille, lire) {
         Ok(v) => v,
         Err(e) => {
-            relacher();
+            vfs::avec(|fs, _| fs.permettre_ecriture(n));
+            fermer();
             return Err(EchecInterpreteur::Format(e));
-        }
-    };
-    let fichier = match appels_fichiers::ouvrir_inode(n, chemin, complet, crate::descripteurs::Sorte::Fichier) {
-        Ok(f) => f,
-        Err(e) => {
-            relacher();
-            return Err(Fichier("ouverture impossible", e));
         }
     };
     Ok(Interpreteur { numero: n, fichier, taille, entete, table })

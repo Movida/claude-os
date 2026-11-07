@@ -154,6 +154,7 @@ mod reprise;
 mod reseau;
 mod rusage;
 mod signaux;
+mod surveillance;
 mod sysfs;
 mod tube;
 mod vmalloc;

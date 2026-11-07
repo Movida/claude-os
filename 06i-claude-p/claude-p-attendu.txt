@@ -7,4 +7,4 @@ Bonjour ! Ici la fausse API de claude-os : aucune requete n'a quitte la machine.
 /home/utilisateur/.claude/projects/-home-utilisateur/
 [linux] effacer : /home/utilisateur vide : ok
 [linux] effacer : /tmp/claude-1000 efface : ok
-[noyau] Groupe des lignes 25 a 31 : memoire rendue : ok.
+[noyau] Groupe des lignes 29 a 35 : memoire rendue : ok.

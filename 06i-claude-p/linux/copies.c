@@ -25,6 +25,7 @@
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
@@ -139,6 +140,7 @@ static void entrees(const char *d)
         { "/dev/urandom", NULL, open("/dev/urandom", O_RDWR), 0, 0, 8, 0, 8 },
         { "un eventfd", NULL, eventfd(0, EFD_NONBLOCK), -ESPIPE, 0, -EINVAL, 0, -EINVAL },
         { "un epoll", NULL, epoll_create1(0), -ESPIPE, 0, -EINVAL, 0, -EINVAL },
+        { "inotify", NULL, inotify_init1(IN_NONBLOCK), -ESPIPE, 0, -EINVAL, 0, -EINVAL },
         { "un tube", NULL, t2[0], -ESPIPE, -EINVAL, -EINVAL, 0, -EINVAL },
         { "un flux AF_UNIX", NULL, sv[0], -ESPIPE, -EINVAL, -EINVAL, 0, 3 },
         { "des datagrammes AF_UNIX", NULL, dg[0], -ESPIPE, -EINVAL, -EINVAL, 0, 3 },
