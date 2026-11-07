@@ -1,0 +1,3 @@
+# La machine sans carte (make tests-qemu, -nic none) : le DNS de la glibc,
+# sans serveur, doit échouer vite (EAI_AGAIN), par l'ICMP de lo.
+/bin/passerelle sans-reseau

@@ -1,0 +1,103 @@
+# Ce que le noyau lance au démarrage, une commande par ligne, dans l'ordre
+# (voir formats/src/commande.rs : un sous-ensemble strict de la syntaxe de
+# sh, plus --dir= et --tcplisten= pour les dossiers et les écoutes
+# pré-ouverts d'un programme WebAssembly). Chaque programme par son chemin
+# absolu.
+
+# Le format natif de l'OS : deux programmes WebAssembly, avec la racine
+# pour dossier pré-ouvert (le second lit et écrit des fichiers, et affiche
+# ses arguments).
+--dir=/ /bin/bonjour.wasm
+--dir=/ /bin/lecteur.wasm un-argument
+
+# Les programmes Linux. pile affiche ses arguments et son environnement :
+# HOME remplacé, LANG ajouté, et un argument entre guillemets.
+/bin/bonjour-asm
+LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
+/bin/sse
+/bin/bonjour-c
+# Le même, en ET_DYN : gcc -static-pie, qui se reloge lui-même.
+/bin/bonjour-c-pie
+# Et en programme dynamique (gcc sans option) : le noyau charge aussi
+# ld-linux, son interpréteur, qui projette la glibc partagée. Puis ld-linux
+# lancé à la main, qui charge lui-même le programme.
+/bin/bonjour-c-dynamique
+/lib64/ld-linux-x86-64.so.2 /bin/bonjour-c-dynamique
+# Les cinq bibliothèques de claude, et dlopen d'une bibliothèque à nous.
+/bin/dynamique
+/bin/memoire
+/bin/claude-version
+/bin/temps
+/bin/fichiers
+/bin/arbre
+/bin/segments
+# Les signaux (6d) : enregistrés et rendus comme Linux, puis leur file et
+# leur siginfo (6f) ; et livrés à leurs gestionnaires (6f) : le cadre de
+# signal, rt_sigreturn, la pile de secours.
+/bin/signaux
+/bin/gestionnaires
+# Les appels interrompus par un gestionnaire (6f) : EINTR, ou repris ; et
+# des fils suspendus par signal, comme le fait JavaScriptCore.
+/bin/reprise
+/bin/suspendre
+# Attendre plusieurs fichiers à la fois (6f) : poll, ppoll, select, pselect6,
+# epoll.
+/bin/attente
+# Les tubes (6f), et un programme qui meurt de SIGPIPE.
+/bin/tubes
+/bin/tubes sigpipe
+# Les petits appels de claude (6d) : uname, sched_getaffinity, futex, prctl.
+/bin/systeme
+# eventfd et epoll (6d) : la boucle d'événements de Bun, créée mais pas encore attendue.
+/bin/evenements
+# /proc et /sys (6d) : ce qu'y lit Bun, maps, statm, exe, /proc/sys/vm, cpu/online.
+/bin/proc
+# Le fichier de /proc d'un processus recueilli, gardé ouvert : ESRCH (6e).
+/bin/proc cible &
+/bin/proc autre
+# Deux programmes à la fois (6e) : lancés par `&`, ils se partagent le
+# processeur ; deux autres ajoutent au même fichier, sans rien perdre.
+/bin/partage a b &
+/bin/partage b a
+wait
+/bin/ajout ecrire a 300 &
+/bin/ajout ecrire b 300 &
+/bin/ajout verifier 300
+wait
+# clone et clone3 (6e) : les refus de Linux, puis un fil par l'appel brut.
+/bin/clone
+# Des programmes à plusieurs fils (6e) : par la glibc, le processus qui
+# finit avec son dernier fil (0), puis avec son groupe (exit dans un fil :
+# 7) ; et des courses entre quatre fils sur les mêmes descripteurs.
+/bin/fils
+/bin/fils groupe
+/bin/courses
+# Les sockets UDP et ICMP (6g), sur lo ; et le DNS de la glibc, par un
+# serveur du programme.
+/bin/reseau
+/bin/dns
+# Le générateur aléatoire (6h) : getrandom, /dev/random, /proc/sys/kernel/random.
+/bin/aleatoire
+# Les sockets TCP (6h), sur lo.
+/bin/tcp
+# Les sockets AF_UNIX (6h).
+/bin/unix
+# Le propriétaire d'un fichier : F_SETOWN, SIGURG, O_ASYNC (6h).
+/bin/proprietaire
+# Du code qui se modifie, à cheval sur deux pages (6h) : ce que le compilateur à
+# la volée de claude demande à la machine, et que QEMU 8.2.2 ne tient pas.
+/bin/autocode
+# Les sockets de WASI (6h) : un serveur WebAssembly sur une écoute que le
+# lanceur lui ouvre, et un client Linux ; ils se parlent par lo.
+--tcplisten=127.0.0.1:8080 /bin/bonjour-tcp.wasm &
+/bin/client-tcp 8080
+wait
+# Le réseau (6g), tel que l'a configuré le DHCP du démarrage : /proc/net,
+# /etc/resolv.conf, un datagramme vers la passerelle.
+/bin/passerelle
+# Le jalon de 6h : une page HTTP de 4 Mio, par TCP, de la carte réseau
+# jusqu'au serveur que QEMU lance sur l'hôte (outils/serveur-http).
+/bin/telecharger
+# Et le jalon de 6d, et de 6e : le vrai Claude Code, en dernier (ce qui
+# précède a déjà dit si le noyau va bien).
+/usr/local/bin/claude --version

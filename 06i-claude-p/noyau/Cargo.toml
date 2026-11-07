@@ -1,0 +1,77 @@
+# Le noyau : un programme Rust sans système d'exploitation en dessous.
+# Aucune dépendance : tout ce qui touche le matériel est écrit ici.
+[package]
+name = "noyau"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# L'interpréteur WebAssembly de l'étape 4, notre propre bibliothèque.
+wasm = { path = "../wasm" }
+# La lecture des formats : l'archive de programmes (cpio), les exécutables
+# ELF, les tables de l'ACPI, l'espace de configuration PCI, les paquets du
+# réseau, les lignes de /etc/demarrage. Notre propre bibliothèque, sans
+# unsafe, testée sur l'hôte.
+formats = { path = "../formats" }
+# La carte des zones des programmes, notre propre bibliothèque, sans
+# unsafe, testée sur l'hôte.
+zones = { path = "../zones" }
+# Le système de fichiers en mémoire (le tmpfs) et la résolution des
+# chemins, notre propre bibliothèque, sans unsafe, testée sur l'hôte.
+fichiers = { path = "../fichiers" }
+# La pile d'IPv4 sans le matériel (les routes, le client DHCP), notre
+# propre bibliothèque, sans unsafe, testée sur l'hôte.
+inet = { path = "../inet" }
+# ChaCha20, BLAKE2s et SipHash (6h), notre propre bibliothèque, sans
+# unsafe, testée sur l'hôte avec les vecteurs officiels.
+crypto = { path = "../crypto" }
+# La roue des minuteurs de Linux (6h), notre propre bibliothèque, sans
+# unsafe, testée sur l'hôte contre un modèle naïf.
+roue = { path = "../roue" }
+
+# Les scénarios de `make tests-qemu` : des versions du noyau qui
+# provoquent exprès une situation à tester (voir src/main.rs).
+[features]
+# Déborder de la pile du noyau : la page de garde doit l'arrêter.
+test-garde = []
+# Un noyau gonflé au-delà de 1 Mio : le chargeur doit le lire en entier,
+# chaque secteur à sa place.
+test-gros = []
+# Exécuter l'archive des programmes de test (fautifs, refusés...), puis
+# éteindre QEMU (isa-debug-exit).
+test-programmes = []
+# Afficher chaque appel système des programmes Linux, à la façon de strace
+# (make trace).
+trace = []
+# Mesurer, pour chaque endroit qui prend un verrou, combien de temps il garde
+# les interruptions coupées, et l'afficher après chaque programme (make
+# verrous, 6i : le lock_stat de Linux ; voir src/verrou.rs).
+verrous = []
+
+# Les règles que `cargo clippy` vérifie (make le lance avant de compiler,
+# la CI aussi) : les nôtres, refusées comme des erreurs. Pas l'ensemble
+# par défaut de clippy (`all`), des conseils de style : sur ce noyau, 279
+# avertissements, dont 220 sur la mise en forme des listes dans les
+# commentaires de documentation, écrites pour se lire en français. Une
+# règle choisie et justifiée, plutôt que d'en suivre beaucoup sans les
+# avoir choisies.
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+# Les méthodes et macros de clippy.toml : les allocations qui paniquent.
+disallowed_methods = "deny"
+disallowed_macros = "deny"
+# Chaque bloc `unsafe` (et chaque `unsafe impl`) dit pourquoi il est sûr,
+# par un commentaire qui commence par SAFETY: juste avant. (Où `unsafe` est
+# permis : main.rs, #![deny(unsafe_code)] et la liste des modules.)
+undocumented_unsafe_blocks = "deny"
+
+# panic = "abort" : en cas de panique, pas de « déroulement » de la pile
+# (unwinding), qui demanderait une bibliothèque d'exécution qu'on n'a pas.
+# Le noyau affiche le message et arrête le processeur.
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+opt-level = "s"     # Optimise pour la taille : moins de secteurs à lire au démarrage.
+debug = false

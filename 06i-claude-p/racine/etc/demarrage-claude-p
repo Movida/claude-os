@@ -1,0 +1,11 @@
+# Le jalon de 6f, et de 6g, dans une image à part (make claude-p, que lance
+# make tests-qemu) : 30 s de plus dans QEMU sans accélération, au-delà de ce
+# que le démarrage ordinaire peut attendre. Le vrai Claude Code, avec une
+# fausse clé et sans réessai, jusqu'à l'appel de l'API : depuis 6g, son DNS
+# trouve api.anthropic.com (par le relais de slirp), puis la connexion TCP
+# est refusée (pas encore de TCP : 6h), et il le dit. Puis ce qu'il a laissé dans HOME (sa configuration, la
+# télémétrie qu'il n'a pas pu envoyer) : c'est pourquoi sa ligne dit
+# « memoire rendue : ECHEC » (des fichiers gardés par le tmpfs, voir le
+# Makefile).
+HOME=/home/utilisateur ANTHROPIC_API_KEY=faux CLAUDE_CODE_MAX_RETRIES=0 DISABLE_AUTOUPDATER=1 /usr/local/bin/claude -p bonjour
+/bin/arbre /home/utilisateur
