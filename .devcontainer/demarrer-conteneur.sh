@@ -10,21 +10,26 @@
 set -u
 
 depot=$(cd "$(dirname "$0")/.." && pwd)
+# Les variables AC_* ne servent qu'aux tests (test-remote-control.sh).
+DOCKER="${AC_DOCKER:-docker}"
+ATTENTE="${AC_ATTENTE:-5}"
+. "$(dirname "$0")/conteneur-du-depot.sh"
 
 # Docker Desktop met un moment à démarrer après l'ouverture de session.
 essai=0
-until docker info >/dev/null 2>&1; do
+until "$DOCKER" info >/dev/null 2>&1; do
     essai=$((essai + 1))
     if [ "$essai" -ge 60 ]; then
         echo "demarrer-conteneur : Docker ne repond pas apres 5 minutes" >&2
         exit 1
     fi
-    sleep 5
+    sleep "$ATTENTE"
 done
 
-conteneur=$(docker ps -aq --filter "label=devcontainer.local_folder=$depot")
-if [ -z "$conteneur" ]; then
+conteneurs=$(conteneurs_du_depot "$depot" -a)
+if [ -z "$conteneurs" ]; then
     echo "demarrer-conteneur : aucun conteneur pour $depot ; ouvrir le dossier une fois dans VS Code" >&2
     exit 1
 fi
-exec docker start $conteneur
+# Un identifiant par ligne : le découpage en mots est voulu.
+exec "$DOCKER" start $conteneurs

@@ -69,7 +69,7 @@ Register-ScheduledTask -TaskName 'claude-os conteneur' -Action $action -Trigger 
 
 Pour l'essayer sans redémarrer : conteneur arrêté, `Start-ScheduledTask -TaskName 'claude-os conteneur'`, puis `docker ps` dans WSL. Pour la retirer : `Unregister-ScheduledTask -TaskName 'claude-os conteneur'`.
 
-Cette partie n'a pas pu être essayée depuis le conteneur, qui n'a ni Windows ni Docker. Si le script dit `aucun conteneur`, comparer `$HOME/claude-os` avec le label `devcontainer.local_folder` donné par `docker inspect <conteneur>`.
+Cette partie n'a pas pu être essayée depuis le conteneur, qui n'a ni Windows ni Docker. Les deux scripts trouvent le conteneur par ses labels `devcontainer.local_folder` (le chemin vu de Windows, `\\wsl.localhost\Ubuntu\...`) et `devcontainer.config_file` (le chemin de WSL), voir `conteneur-du-depot.sh`. S'ils disent `aucun conteneur` ou `ne tourne pas` à tort, comparer `$HOME/claude-os` avec ces labels : `docker inspect <conteneur> --format '{{json .Config.Labels}}'`.
 
 ## La mémoire
 

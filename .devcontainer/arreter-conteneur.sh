@@ -40,6 +40,7 @@ set -u
 
 depot=$(cd "$(dirname "$0")/.." && pwd)
 DOCKER="${AC_DOCKER:-docker}"
+. "$(dirname "$0")/conteneur-du-depot.sh"
 SHUTDOWN="${AC_SHUTDOWN:-shutdown.exe}"
 SYNC="${AC_SYNC:-sync}"
 
@@ -72,20 +73,24 @@ if ! "$DOCKER" info >/dev/null 2>&1; then
     finir 1
 fi
 
-conteneur=$("$DOCKER" ps -q --filter "label=devcontainer.local_folder=$depot")
-if [ -z "$conteneur" ]; then
+conteneurs=$(conteneurs_du_depot "$depot")
+if [ -z "$conteneurs" ]; then
     echo "arreter-conteneur : le conteneur de $depot ne tourne pas"
     finir 0
 fi
 
-echo "arreter-conteneur : arret du conteneur $conteneur (45 s au plus)..."
-"$DOCKER" stop "$conteneur" >/dev/null
-# Le superviseur sort avec 0 quand le serveur a fini proprement ; 137, c'est que
-# Docker a dû le tuer au bout des 45 s.
-code=$("$DOCKER" inspect -f '{{.State.ExitCode}}' "$conteneur")
-if [ "$code" = 0 ]; then
-    echo "arreter-conteneur : conteneur arrete proprement"
-    finir 0
-fi
-echo "arreter-conteneur : le conteneur s'est arrete avec le code $code (journal : ~/.claude/remote-control.log)" >&2
-finir 1
+resultat=0
+for conteneur in $conteneurs; do
+    echo "arreter-conteneur : arret du conteneur $conteneur (45 s au plus)..."
+    "$DOCKER" stop "$conteneur" >/dev/null
+    # Le superviseur sort avec 0 quand le serveur a fini proprement ; 137, c'est que
+    # Docker a dû le tuer au bout des 45 s.
+    code=$("$DOCKER" inspect -f '{{.State.ExitCode}}' "$conteneur")
+    if [ "$code" = 0 ]; then
+        echo "arreter-conteneur : conteneur arrete proprement"
+    else
+        echo "arreter-conteneur : le conteneur s'est arrete avec le code $code (journal : ~/.claude/remote-control.log)" >&2
+        resultat=1
+    fi
+done
+finir "$resultat"

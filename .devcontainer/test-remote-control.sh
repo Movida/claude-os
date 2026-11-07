@@ -362,9 +362,11 @@ verifier "sans le dire au journal" compte_au_journal "pointeur vieux de" 1
 kill -TERM "$s"
 attendre "le superviseur sort" mort "$s"
 
-echo "== l'arret avant d'eteindre Windows (arreter-conteneur.sh)"
-# De faux docker, shutdown.exe et sync, qui notent leurs arguments. L'état du faux
-# Docker : absent (il ne répond pas), arrete (pas de conteneur en marche), propre (le
+echo "== l'arret avant d'eteindre Windows et la relance (arreter- et demarrer-conteneur.sh)"
+# De faux docker, shutdown.exe et sync, qui notent leurs arguments. Le faux Docker a deux
+# conteneurs : c0ffee, celui du dépôt, marqué comme le 7 novembre (local_folder vu de
+# Windows, config_file vu de WSL), et beef, d'un autre dépôt, qui tourne toujours. Son
+# état : absent (il ne répond pas), arrete (c0ffee ne tourne pas), propre (son
 # superviseur sort avec 0) ou tue (Docker l'a tué au bout du délai : 137).
 AC="$T/ac"
 mkdir -p "$AC"
@@ -374,32 +376,68 @@ echo "$*" >>"$AC_DIR/appels-docker"
 etat=$(cat "$AC_DIR/etat")
 case $1 in
     info) [ "$etat" != absent ] ;;
-    ps) [ "$etat" = propre ] || [ "$etat" = tue ] && echo c0ffee ;;
-    stop) echo "$2" ;;
-    inspect) if [ "$etat" = tue ]; then echo 137; else echo 0; fi ;;
+    ps)
+        if [[ " $* " == *" -a "* ]] || [ "$etat" = propre ] || [ "$etat" = tue ]; then
+            echo c0ffee
+        fi
+        echo beef
+        ;;
+    inspect)
+        case "$3:$4" in
+            *local_folder*:c0ffee) echo "$AC_DOSSIER" ;;
+            *config_file*:c0ffee) echo "$AC_CONFIG" ;;
+            *local_folder*:beef) echo '\\wsl.localhost\Ubuntu\home\autre\projet' ;;
+            *config_file*:beef) echo /home/autre/projet/.devcontainer/devcontainer.json ;;
+            *ExitCode*) if [ "$etat" = tue ]; then echo 137; else echo 0; fi ;;
+        esac
+        ;;
+    stop|start) echo "$2" ;;
 esac
 FIN
 printf '#!/usr/bin/env bash\necho "$*" >>"$AC_DIR/appels-shutdown"\n' >"$AC/shutdown"
 printf '#!/usr/bin/env bash\necho sync >>"$AC_DIR/appels-sync"\n' >"$AC/sync"
 chmod +x "$AC/docker" "$AC/shutdown" "$AC/sync"
-arreter() {
-    echo "$1" >"$AC/etat"
-    shift
+DEPOT_REEL=$(cd "$ICI/.." && pwd)
+# Les labels du conteneur du dépôt, tels que les met l'extension Dev Containers.
+DOSSIER_WINDOWS='\\wsl.localhost\Ubuntu'$(printf '%s' "$DEPOT_REEL" | tr / '\\')
+CONFIG_WSL="$DEPOT_REEL/.devcontainer/devcontainer.json"
+# lancer SCRIPT ETAT [OPTION] : les labels viennent de AC_DOSSIER et AC_CONFIG.
+lancer() {
+    local script=$1
+    echo "$2" >"$AC/etat"
+    shift 2
     rm -f "$AC"/appels-*
     AC_DIR="$AC" AC_DOCKER="$AC/docker" AC_SHUTDOWN="$AC/shutdown" AC_SYNC="$AC/sync" \
-        bash "$ICI/arreter-conteneur.sh" "$@" >"$AC/sortie" 2>&1 </dev/null
+        AC_ATTENTE=0 AC_DOSSIER="$AC_DOSSIER" AC_CONFIG="$AC_CONFIG" \
+        bash "$ICI/$script" "$@" >"$AC/sortie" 2>&1 </dev/null
     code=$?
 }
+arreter() { lancer arreter-conteneur.sh "$@"; }
 appel() { grep -qx -- "$2" "$AC/appels-$1" 2>/dev/null; }
 sans_appel() { [ ! -e "$AC/appels-$1" ]; }
+pas_d_appel_docker() { ! grep -qx -- "$1" "$AC/appels-docker" 2>/dev/null; }
 
+AC_DOSSIER=$DOSSIER_WINDOWS
+AC_CONFIG=$CONFIG_WSL
 arreter propre --redemarrer
-verifier "il vise le conteneur du depot, par son label" \
-    appel docker "ps -q --filter label=devcontainer.local_folder=$(cd "$ICI/.." && pwd)"
-verifier "il l'arrete par docker stop" appel docker "stop c0ffee"
+verifier "il arrete le conteneur du depot" appel docker "stop c0ffee"
+verifier "et pas celui d'un autre depot" pas_d_appel_docker "stop beef"
 verifier "puis sync" appel sync sync
 verifier "puis redemarre Windows" appel shutdown "/r /t 0"
 verifier "et le dit" grep -q "arrete proprement" "$AC/sortie"
+AC_CONFIG=""
+arreter propre
+verifier "trouve par le seul chemin vu de Windows" appel docker "stop c0ffee"
+AC_DOSSIER=""
+AC_CONFIG=$CONFIG_WSL
+arreter propre
+verifier "trouve par le seul chemin de WSL" appel docker "stop c0ffee"
+AC_DOSSIER='\\wsl.localhost\Ubuntu\home\autre'
+AC_CONFIG=/home/autre/.devcontainer/devcontainer.json
+arreter propre
+verifier "un dossier qui n'est pas le depot : rien d'arrete" pas_d_appel_docker "stop c0ffee"
+AC_DOSSIER=$DOSSIER_WINDOWS
+AC_CONFIG=$CONFIG_WSL
 arreter propre
 verifier "sans option, il n'eteint pas Windows" sans_appel shutdown
 verifier "et sort avec 0" test "$code" -eq 0
@@ -409,13 +447,21 @@ verifier "et eteint quand meme Windows" appel shutdown "/s /t 0"
 arreter tue
 verifier "sans option, il sort en echec" test "$code" -eq 1
 arreter arrete --eteindre
-verifier "pas de conteneur en marche : pas de docker stop" sh -c "! grep -q '^stop' '$AC/appels-docker'"
+verifier "pas de conteneur en marche : pas de docker stop" pas_d_appel_docker "stop c0ffee"
 verifier "mais sync et l'extinction" sh -c "[ -e '$AC/appels-sync' ] && grep -qx '/s /t 0' '$AC/appels-shutdown'"
 arreter absent --eteindre
 verifier "Docker absent : il le dit" grep -q "Docker ne repond pas" "$AC/sortie"
 verifier "et eteint quand meme Windows" appel shutdown "/s /t 0"
 arreter propre --nimporte
 verifier "une option inconnue : code 2, rien d'arrete" sh -c "[ $code -eq 2 ] && [ ! -e '$AC/appels-docker' ]"
+
+lancer demarrer-conteneur.sh arrete
+verifier "la relance trouve le conteneur arrete du depot" appel docker "start c0ffee"
+AC_DOSSIER='\\wsl.localhost\Ubuntu\home\autre'
+AC_CONFIG=/home/autre/.devcontainer/devcontainer.json
+lancer demarrer-conteneur.sh arrete
+verifier "sans conteneur du depot : elle le dit" grep -q "aucun conteneur pour" "$AC/sortie"
+verifier "sans rien relancer" pas_d_appel_docker "start beef"
 
 if [ "$echecs" -eq 0 ]; then
     echo "tout est bon"
