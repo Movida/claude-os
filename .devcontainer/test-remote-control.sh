@@ -31,8 +31,9 @@ while sleep 1 & wait $!; do :; done'
 
 nettoyer() {
     local p
+    # Le groupe aussi, pour ceux qui en mènent un : leurs enfants partent avec eux.
     for p in "${superviseurs[@]}" "${autres[@]}"; do
-        kill -TERM "$p" 2>/dev/null
+        kill -TERM -- "-$p" "$p" 2>/dev/null
     done
     sleep 0.5
     [ -f "$T/pids" ] && while read -r p _; do kill -9 "$p" 2>/dev/null; done <"$T/pids"
@@ -78,11 +79,14 @@ mkdir -p "$T/bin" "$DEPOT/.git" "$HOME_TEST" "$CONFIG"
 # s'arrêter sur SIGTERM.
 cat >"$FAUX" <<'FIN'
 #!/usr/bin/env bash
+# Le scénario est lu avant que le pid soit noté : le test, qui attend ce pid pour changer
+# de scénario, ne peut pas le changer sous le nez de ce lancement-ci.
+scenario=$(cat "$FAUX_DIR/scenario")
 echo "$$ $*" >>"$FAUX_DIR/pids"
 env >"$FAUX_DIR/env"
 readlink /proc/$$/fd/0 >"$FAUX_DIR/entree"
 [ -e /proc/$$/fd/9 ] && echo oui >"$FAUX_DIR/fd9"
-if [ "$(cat "$FAUX_DIR/scenario")" = panne ]; then
+if [ "$scenario" = panne ]; then
     echo "[12:00:00] Error: panne simulee"
     exit 3
 fi
@@ -195,8 +199,28 @@ verifier "pas de second serveur" appels_exactement 1
 echo "== ce qui ne se voyait pas"
 echo "oom_kill 2" >"$OOM"
 attendre "les processus tues par le plafond de memoire" au_journal "2 processus tue(s)"
-kill -STOP "$s"
-sleep 6
+# Le gel ne se mesure que dans dormir. Arrêté juste après la ligne ci-dessus, le
+# superviseur était souvent encore dans surveiller, et le gel passait inaperçu. On l'arrête
+# donc, puis on regarde s'il a un enfant sleep, vivant ou mort mais pas encore attendu : il
+# est alors entre le lancement de son minuteur et la mesure. Sinon, on le relâche et on
+# recommence.
+#
+# Le gel dure 10 s, quand 5 suffiraient : dormir le mesure à l'horloge murale, et celle de
+# la machine WSL recule de 1,5 s toutes les 30 s (son horloge monotone avance 5 % trop vite,
+# et la synchronisation avec Windows la rattrape ; mesuré le 7 novembre). Avec 6 s, un recul
+# pendant le gel le faisait passer sous le seuil (4 s), une fois sur sept.
+figer_pendant_le_sommeil() {
+    local essai
+    for essai in $(seq 50); do
+        kill -STOP "$1"
+        pgrep -P "$1" -x sleep >/dev/null && return 0
+        kill -CONT "$1"
+        sleep 0.1
+    done
+    return 1
+}
+verifier "le superviseur est arrete pendant qu'il dort" figer_pendant_le_sommeil "$s"
+sleep 10
 kill -CONT "$s"
 attendre "le conteneur fige (veille simulee)" au_journal "conteneur fige pendant"
 head -c 30000 /dev/zero | tr '\0' x >>"$JOURNAL"
@@ -226,8 +250,9 @@ lancer_connexion double
 c_moyenne=$connexion
 lancer_connexion double
 c_recente=$connexion
-# Une commande qui cite le chemin, comme un grep d'une session, sans en être un.
-bash -c "sleep 1000; echo $T/bin/node $T/connexion-double.js" &
+# Une commande qui cite le chemin, comme un grep d'une session, sans en être un. Elle
+# mène son groupe : arrêter bash seul laisserait son sleep, et la sortie du test ouverte.
+setsid bash -c "sleep 1000; echo $T/bin/node $T/connexion-double.js" &
 c_citee=$!
 autres+=("$c_citee")
 attendre "l'ancien serveur d'une fenetre est arrete, avec son sh" mort "$c_ancienne"
@@ -242,7 +267,7 @@ c_suivant=$connexion
 attendre "un essai de plus : le precedent part a son tour" mort "$c_recente"
 verifier "le dernier reste" vivant "$c_suivant"
 verifier "la fenetre n'est notee qu'une fois" compte_au_journal "fenetre VS Code double" 1
-kill -TERM -- "-$c_seule" "-$c_suivant" "$c_citee" 2>/dev/null
+kill -TERM -- "-$c_seule" "-$c_suivant" "-$c_citee" 2>/dev/null
 
 echo "== la pause"
 touch "$CONFIG/remote-control.pause"
@@ -257,6 +282,11 @@ attendre "pause retiree : il repart" appels_au_moins 2
 echo "== les pannes"
 kill -TERM "$(pid_faux)"
 attendre "un serveur arrete a la main repart seul" appels_au_moins 3
+# Une durée stable d'abord, sans quoi l'attente de départ dépend de l'arrondi des
+# secondes : 1 ou 2 s, et les trois relances dépassaient parfois le délai du test. 4 s
+# plutôt que les 2 de RC_DUREE_STABLE : l'horloge murale peut reculer de 1,5 s entre-temps
+# (voir le gel simulé).
+sleep 4
 echo panne >"$T/scenario"
 kill -TERM "$(pid_faux)"
 attendre "pannes en serie : 3 relances" appels_au_moins 6
@@ -266,7 +296,7 @@ verifier "l'erreur du serveur est au journal" au_journal "Error: panne simulee"
 echo normal >"$T/scenario"
 n=$(wc -l <"$T/pids")
 attendre "la panne finie, il repart" appels_au_moins $((n + 1))
-sleep 2.5
+sleep 4
 kill -TERM "$(pid_faux)"
 attendre "apres une duree stable, l'attente repart de zero" au_journal "serveur arrete (code 0).*relance dans 1s"
 attendre "il repart" appels_au_moins $((n + 2))
