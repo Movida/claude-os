@@ -1,5 +1,6 @@
-//! Dormir et se réveiller : les files d'attente, les minuteries, le
-//! verrou qui dort.
+//! Dormir et se réveiller : les files d'attente, les minuteries, les
+//! verrous qui dorment (le `Mutex`, et depuis 6i le `VerrouLE`, en lecture
+//! et en écriture).
 //!
 //! Une tâche qui attend quelque chose (un caractère du clavier, un verrou
 //! tenu par une autre, une échéance) quitte la file des prêtes de
@@ -109,6 +110,10 @@ pub struct EntreeAttente {
     exclusive: Cell<bool>,
     /// Dans une file en ce moment : une entrée n'est que dans une à la fois.
     inscrite: Cell<bool>,
+    /// Ce que celui qui s'inscrit laisse pour celui qui réveille : la sorte
+    /// d'attente d'un `VerrouLE`, en lecture ou en écriture (le `type` d'un
+    /// `rwsem_waiter` de Linux). 0 pour les autres.
+    marque: Cell<u32>,
     genre: Cell<Genre>,
     _epinglee: PhantomPinned,
 }
@@ -138,6 +143,7 @@ impl EntreeAttente {
             suivante: Cell::new(core::ptr::null()),
             exclusive: Cell::new(false),
             inscrite: Cell::new(false),
+            marque: Cell::new(0),
             genre: Cell::new(Genre::Tache(core::ptr::null())),
             _epinglee: PhantomPinned,
         }
@@ -280,6 +286,7 @@ impl FileAttente {
         let mut l = self.liste.verrouiller();
         e.genre.set(Genre::Tache(p));
         e.exclusive.set(true);
+        e.marque.set(0);
         l.placer_en_tete(e);
     }
 
@@ -296,6 +303,10 @@ impl FileAttente {
     }
 
     fn inscrire_tache_en(&self, t: Arc<Tache>, exclusive: bool) {
+        self.inscrire_tache_marquee(t, exclusive, 0);
+    }
+
+    fn inscrire_tache_marquee(&self, t: Arc<Tache>, exclusive: bool, marque: u32) {
         // Un Arc de plus, tenu par la file : la tâche vit tant qu'elle y est.
         let p = Arc::into_raw(t);
         // SAFETY: `p` vient d'être tenu ; une tâche n'attend qu'une chose à
@@ -304,7 +315,41 @@ impl FileAttente {
         let mut l = self.liste.verrouiller();
         e.genre.set(Genre::Tache(p));
         e.exclusive.set(exclusive);
+        e.marque.set(marque);
         l.placer(e);
+    }
+
+    /// Inscrit la tâche courante, exclusive, en queue, avec la marque
+    /// `marque` (voir `EntreeAttente`) : un `VerrouLE`.
+    pub fn inscrire_marquee(&self, marque: u32) {
+        self.inscrire_tache_marquee(tache::courante_arc(), true, marque);
+    }
+
+    /// La marque de la tâche en tête de la file, s'il y en a une.
+    pub fn marque_en_tete(&self) -> Option<u32> {
+        let l = self.liste.verrouiller();
+        // SAFETY: comme `Liste::placer`.
+        unsafe { l.tete.as_ref() }.map(|e| e.marque.get())
+    }
+
+    /// Retire de la file la première tâche de marque `marque`, et la rend
+    /// (avec l'Arc que tenait la file), sans la réveiller.
+    pub fn retirer_marquee(&self, marque: u32) -> Option<Arc<Tache>> {
+        let mut l = self.liste.verrouiller();
+        let (precedente, e) = l.chercher(|e| tache_de(e).is_some() && e.marque.get() == marque)?;
+        // SAFETY: l'entrée trouvée est inscrite, sous le verrou de la file.
+        Some(Self::sortir_tache(&mut l, precedente, unsafe { &*e }))
+    }
+
+    /// Le nombre d'entrées de la file (tâches et rappels).
+    pub fn longueur(&self) -> usize {
+        let l = self.liste.verrouiller();
+        let mut n = 0;
+        l.chercher(|_| {
+            n += 1;
+            false
+        });
+        n
     }
 
     /// Inscrit l'entrée d'un rappel (`EntreeAttente::preparer_rappel`) : en
@@ -791,6 +836,309 @@ impl<T> Drop for GardeMutex<'_, T> {
         let mut e = self.mutex.etat.verrouiller();
         e.pris = false;
         e.file.reveiller_une();
+    }
+}
+
+/// Un verrou qui dort, en LECTURE ou en ÉCRITURE (le `rw_semaphore` de
+/// Linux) : plusieurs lecteurs à la fois, ou un seul écrivain. Pour ce que
+/// beaucoup lisent et peu changent, longtemps parfois : la mémoire d'un
+/// processus (son `mmap_lock`, processus.rs), que lisent toutes les fautes
+/// de page de ses fils, et que changent mmap, munmap, mprotect.
+///
+/// Comme le `Mutex`, il ne coupe pas les interruptions (celui qui le tient
+/// peut être préempté, ou fauter), ne se prend jamais sous un `Verrou` ni
+/// dans un gestionnaire d'interruption, et une tâche qui le trouve pris
+/// s'endort. Ce qui change, c'est qui passe, et dans quel ordre :
+///   - une seule file, dans l'ordre d'arrivée, chaque entrée marquée
+///     LECTEUR ou ECRIVAIN ;
+///   - qui arrive alors que quelqu'un attend se range dans la file, même un
+///     lecteur quand des lecteurs tiennent le verrou : sinon un flot de
+///     lecteurs (les fautes de page de plusieurs fils) ferait attendre un
+///     écrivain (un munmap) sans fin ;
+///   - à la libération, si la première qui attend est un écrivain, elle
+///     reçoit le verrou ; si c'est un lecteur, TOUS les lecteurs de la file
+///     le reçoivent ensemble (256 au plus, MAX_READERS_WAKEUP), où qu'ils
+///     soient, les écrivains gardant leur place (la « phase » des lecteurs
+///     du « phase-fair » de Linux) ;
+///   - le verrou est REMIS à qui est réveillé, déjà compté : il n'a pas à
+///     le reprendre. Être sorti de la file, sous le verrou de l'état, est
+///     la preuve qu'on l'a reçu (le `waiter.task` remis à NULL de Linux) ;
+///     l'attente est ininterruptible, aucun autre réveil ne la finit ;
+///   - `retrograder` (le `downgrade_write`) : l'écrivain devient lecteur
+///     sans rendre le verrou, et si un lecteur est en tête de la file, tous
+///     les lecteurs de la file entrent avec lui (la faute de page qui a dû
+///     étendre la pile, en écriture, finit en lecture).
+///
+/// C'est la politique de Linux 6.18 (`kernel/locking/rwsem.c`) pour les
+/// lecteurs. Pour les écrivains, un écart : Linux réveille l'écrivain en
+/// tête sans lui remettre le verrou, et le laisse se le faire voler (par un
+/// autre écrivain, ou un lecteur qui arrive alors qu'il est libre) jusqu'à
+/// ce qu'il ait attendu 4 ms (RWSEM_WAIT_TIMEOUT : le drapeau HANDOFF le lui
+/// réserve alors). Le vol évite, sur plusieurs processeurs, d'attendre que
+/// la tâche réveillée soit choisie : celle qui tourne déjà continue. Sur un
+/// seul, il ne ferait gagner que la bascule vers elle, au prix d'un
+/// écrivain qui peut attendre 4 ms de plus ; la remise stricte coûte, elle,
+/// une bascule à chaque libération disputée entre écrivains (un « convoi »),
+/// et ne laisse jamais attendre personne plus que son rang. Écrit pour le
+/// relire simplement, et sans ce drapeau.
+///
+/// Options écartées :
+///   - réveiller tout le monde et laisser chacun retenter (le `Mutex`
+///     d'ici, avec une seule passe) : les lecteurs se bousculeraient ;
+///   - la priorité aux écrivains (un lecteur n'entre jamais tant qu'un
+///     écrivain attend, même derrière des lecteurs) : ce sont alors les
+///     lecteurs qui peuvent attendre sans fin ;
+///   - un verrou à attente active en lecture et écriture (le `rwlock_t` de
+///     Linux) : il coupe les interruptions, c'est justement ce qu'on quitte ;
+///   - un sommeil « tuable » (`mmap_read_lock_killable`, TASK_KILLABLE),
+///     qu'un signal mortel interrompt : chez Linux, celui qui tient la
+///     mémoire d'un processus peut attendre le disque (une faute de page
+///     d'un fichier), et le tueur OOM doit pouvoir arrêter ceux qui
+///     attendent derrière lui ; chez nous, celui qui la tient n'attend
+///     jamais rien d'autre (pas de disque avant 6m, et une allocation qui
+///     manque échoue au lieu d'attendre) : l'attente est toujours courte.
+///     Avec le disque (6m).
+/// UNIPROCESSEUR : l'état est sous un `Verrou` court, et les interruptions
+/// coupées de la vérification au sommeil tiennent lieu de verrou (voir
+/// l'en-tête). Avec plusieurs processeurs, Linux fait d'abord tourner un
+/// écrivain qui arrive tant que celui qui tient le verrou s'exécute sur un
+/// autre processeur (`rwsem_optimistic_spin`) : il le prend en le volant à
+/// la libération, ce qui demande le vol et le drapeau HANDOFF de Linux à la
+/// place de la remise stricte des écrivains (6j).
+pub struct VerrouLE<T> {
+    etat: Verrou<EtatLE>,
+    donnee: UnsafeCell<T>,
+}
+
+struct EtatLE {
+    /// Les lecteurs qui le tiennent.
+    lecteurs: u32,
+    /// Un écrivain le tient.
+    ecrivain: bool,
+    /// Ceux qui attendent, dans l'ordre d'arrivée, marqués LECTEUR ou
+    /// ECRIVAIN.
+    file: FileAttente,
+}
+
+/// Les marques des entrées de la file d'un `VerrouLE`.
+const LECTEUR: u32 = 1;
+const ECRIVAIN: u32 = 2;
+/// Les lecteurs qui reçoivent le verrou à une même libération, au plus
+/// (le MAX_READERS_WAKEUP de Linux) : un réveil reste borné.
+const LECTEURS_PAR_REVEIL: u32 = 256;
+
+// SAFETY: la donnée n'est touchée qu'à travers une garde : partagée (&T)
+// entre des lecteurs, qui peuvent être sur des tâches différentes (d'où
+// T: Sync), ou à un seul écrivain (&mut T, d'où T: Send) ; l'état compte
+// les gardes sous son verrou.
+unsafe impl<T: Send + Sync> Sync for VerrouLE<T> {}
+
+impl EtatLE {
+    /// Peut-on le prendre tout de suite, pour `sorte` ? Libre pour elle, et
+    /// personne qui attende (on ne passe pas devant la file).
+    fn libre_pour(&self, sorte: u32) -> bool {
+        let libre = if sorte == LECTEUR { !self.ecrivain } else { !self.ecrivain && self.lecteurs == 0 };
+        libre && !self.file.active()
+    }
+
+    /// Le prend pour `sorte`.
+    fn accorder(&mut self, sorte: u32) {
+        if sorte == LECTEUR {
+            self.lecteurs += 1;
+        } else {
+            self.ecrivain = true;
+        }
+    }
+
+    /// Les lecteurs qui attendent reçoivent le verrou, tous ensemble (256
+    /// au plus), où qu'ils soient dans la file : comptés d'abord, réveillés
+    /// ensuite (ils ne s'exécuteront qu'après nous, interruptions coupées).
+    fn remettre_aux_lecteurs(&mut self) {
+        for _ in 0..LECTEURS_PAR_REVEIL {
+            let Some(t) = self.file.retirer_marquee(LECTEUR) else { break };
+            self.lecteurs += 1;
+            tache::reveiller(t, Reveil::Reveillee);
+        }
+    }
+
+    /// Le verrou vient d'être rendu par le dernier qui le tenait : il passe
+    /// à la file (le `rwsem_mark_wake` de Linux, RWSEM_WAKE_ANY).
+    fn passer_la_main(&mut self) {
+        match self.file.marque_en_tete() {
+            Some(ECRIVAIN) => {
+                if let Some(t) = self.file.retirer_marquee(ECRIVAIN) {
+                    self.ecrivain = true;
+                    tache::reveiller(t, Reveil::Reveillee);
+                }
+            }
+            Some(_) => self.remettre_aux_lecteurs(),
+            None => {}
+        }
+    }
+}
+
+impl<T> VerrouLE<T> {
+    pub const fn new(donnee: T) -> VerrouLE<T> {
+        VerrouLE { etat: Verrou::new(EtatLE { lecteurs: 0, ecrivain: false, file: FileAttente::new() }), donnee: UnsafeCell::new(donnee) }
+    }
+
+    /// Le prend en lecture, en dormant tant qu'il le faut.
+    #[track_caller]
+    pub fn lire(&self) -> GardeLecture<'_, T> {
+        self.prendre(LECTEUR);
+        GardeLecture { verrou: self }
+    }
+
+    /// Le prend en écriture, en dormant tant qu'il le faut.
+    #[track_caller]
+    pub fn ecrire(&self) -> GardeEcriture<'_, T> {
+        self.prendre(ECRIVAIN);
+        GardeEcriture { verrou: self }
+    }
+
+    /// Le prend en lecture s'il est libre pour elle, sans dormir (le
+    /// `down_read_trylock` de Linux) : possible sous un `Verrou`.
+    pub fn essayer_lire(&self) -> Option<GardeLecture<'_, T>> {
+        // `then`, pas `then_some` : la garde ne doit exister que si le
+        // verrou est pris (la détruire le rendrait).
+        self.essayer(LECTEUR).then(|| GardeLecture { verrou: self })
+    }
+
+    /// Le prend en écriture s'il est libre, sans dormir.
+    pub fn essayer_ecrire(&self) -> Option<GardeEcriture<'_, T>> {
+        self.essayer(ECRIVAIN).then(|| GardeEcriture { verrou: self })
+    }
+
+    /// Le nombre de tâches qui attendent (pour les tests).
+    pub fn en_attente(&self) -> usize {
+        self.etat.verrouiller().file.longueur()
+    }
+
+    fn essayer(&self, sorte: u32) -> bool {
+        let mut e = self.etat.verrouiller();
+        let libre = e.libre_pour(sorte);
+        if libre {
+            e.accorder(sorte);
+        }
+        libre
+    }
+
+    /// Le prend pour `sorte`, en dormant tant qu'il le faut.
+    #[track_caller]
+    fn prendre(&self, sorte: u32) {
+        // On va peut-être dormir : jamais sous un verrou court, ni dans un
+        // gestionnaire d'interruption (le `might_sleep` de Linux).
+        // `ordonnancer` refuserait le premier aussi, mais plus loin, sans
+        // dire qui ; ici, la panique nomme l'appelant.
+        let tenus = crate::verrou::tenus();
+        assert!(tenus == 0, "verrou qui dort pris sous {} verrou(s) court(s)", tenus);
+        assert!(!crate::interruptions::dans_une_interruption(), "verrou qui dort pris dans un gestionnaire d'interruption");
+        let interruptions = cpu::couper_interruptions();
+        {
+            let mut e = self.etat.verrouiller();
+            if e.libre_pour(sorte) {
+                e.accorder(sorte);
+                drop(e);
+                if interruptions {
+                    cpu::activer_interruptions();
+                }
+                return;
+            }
+            e.file.inscrire_marquee(sorte);
+        }
+        // Celui qui le rend nous le remet en nous retirant de la file
+        // (`passer_la_main`) : tant qu'on y est, on ne l'a pas. Un sommeil
+        // ininterruptible n'a pas d'autre réveil ; revérifier ne coûte rien.
+        loop {
+            dormir(None, Sommeil::Ininterruptible);
+            if !self.etat.verrouiller().file.contient(tache::courante()) {
+                break;
+            }
+        }
+        if interruptions {
+            cpu::activer_interruptions();
+        }
+    }
+
+    /// Un lecteur le rend.
+    fn rendre_lecture(&self) {
+        let mut e = self.etat.verrouiller();
+        e.lecteurs -= 1;
+        if e.lecteurs == 0 {
+            e.passer_la_main();
+        }
+    }
+
+    /// L'écrivain le rend.
+    fn rendre_ecriture(&self) {
+        let mut e = self.etat.verrouiller();
+        e.ecrivain = false;
+        e.passer_la_main();
+    }
+}
+
+/// Tant qu'elle existe, on tient le `VerrouLE` en lecture.
+pub struct GardeLecture<'a, T> {
+    verrou: &'a VerrouLE<T>,
+}
+
+impl<T> Deref for GardeLecture<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: la garde prouve qu'on le tient en lecture : personne ne
+        // l'a en écriture.
+        unsafe { &*self.verrou.donnee.get() }
+    }
+}
+
+impl<T> Drop for GardeLecture<'_, T> {
+    fn drop(&mut self) {
+        self.verrou.rendre_lecture();
+    }
+}
+
+/// Tant qu'elle existe, on tient le `VerrouLE` en écriture.
+pub struct GardeEcriture<'a, T> {
+    verrou: &'a VerrouLE<T>,
+}
+
+impl<'a, T> GardeEcriture<'a, T> {
+    /// L'écrivain devient lecteur, sans rendre le verrou entre les deux (le
+    /// `downgrade_write` de Linux) : les lecteurs en tête de la file entrent
+    /// avec lui ; un écrivain en tête, lui, attend la fin de tous.
+    pub fn retrograder(self) -> GardeLecture<'a, T> {
+        let verrou = self.verrou;
+        // Le verrou n'est pas rendu : la garde d'écriture disparaît sans
+        // son Drop, la garde de lecture prend sa place.
+        core::mem::forget(self);
+        let mut e = verrou.etat.verrouiller();
+        e.ecrivain = false;
+        e.lecteurs += 1;
+        if e.file.marque_en_tete() == Some(LECTEUR) {
+            e.remettre_aux_lecteurs();
+        }
+        GardeLecture { verrou }
+    }
+}
+
+impl<T> Deref for GardeEcriture<'_, T> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        // SAFETY: la garde prouve qu'on le tient en écriture, seul.
+        unsafe { &*self.verrou.donnee.get() }
+    }
+}
+
+impl<T> DerefMut for GardeEcriture<'_, T> {
+    fn deref_mut(&mut self) -> &mut T {
+        // SAFETY: idem, et &mut self garantit l'exclusivité locale.
+        unsafe { &mut *self.verrou.donnee.get() }
+    }
+}
+
+impl<T> Drop for GardeEcriture<'_, T> {
+    fn drop(&mut self) {
+        self.verrou.rendre_ecriture();
     }
 }
 

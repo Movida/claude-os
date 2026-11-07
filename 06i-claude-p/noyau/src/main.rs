@@ -463,6 +463,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // tâche.
     let init = || {
         tester_ordonnanceur();
+        tester_verrou_le();
         reseau::configurer();
         tester_voisins();
         reseau::autotest::lancer();
@@ -533,6 +534,160 @@ fn tester_ordonnanceur() {
     let ok = a.is_some() && b.is_some() && VU.iter().all(|v| v.load(Ordering::Relaxed));
     afficherln!("[noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : {} ({} bascules).",
                 if ok { "ok" } else { "ECHEC" }, ordonnanceur::bascules() - bascules);
+}
+
+/// Vérifie le verrou qui dort en lecture et en écriture (attente.rs,
+/// `VerrouLE`) par des tâches du noyau, dont chacune note ce qu'elle fait
+/// dans un journal, une lettre par pas ; l'ordre de leurs arrivées est
+/// forcé (chacune n'est lancée qu'une fois la précédente rangée dans la
+/// file), ce qui rend le journal attendu exact :
+///   1. un écrivain (E) tient le verrou ; arrivent un lecteur (L), un
+///      écrivain (F), un lecteur ; à sa libération (e), les deux lecteurs
+///      passent ENSEMBLE (chacun attend l'autre avant de rendre le verrou),
+///      le second devant l'écrivain qui attendait avant lui (la phase des
+///      lecteurs), puis l'écrivain : « EeLLllFf » ;
+///   2. un lecteur (M) tient le verrou ; arrive un écrivain (G), puis un
+///      lecteur (N), qui doit se ranger derrière l'écrivain au lieu
+///      d'entrer avec M (sinon l'écrivain pourrait attendre sans fin) ;
+///      l'écrivain passe, puis rétrograde (D) : le lecteur entre pendant
+///      qu'il lit encore. L'écrivain attend de le voir entré pour rendre le
+///      verrou (d), et le lecteur, de le voir rendu (n) : « MmGDNdn ».
+fn tester_verrou_le() {
+    use core::sync::atomic::{AtomicU8, AtomicUsize};
+    static V: attente::VerrouLE<()> = attente::VerrouLE::new(());
+    static JOURNAL: [AtomicU8; 32] = [const { AtomicU8::new(0) }; 32];
+    static PAS: AtomicUsize = AtomicUsize::new(0);
+    static RENDRE: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    // Le lecteur N est entré ; l'écrivain rétrogradé a rendu le verrou.
+    static ENTRE: AtomicBool = AtomicBool::new(false);
+    static RENDU: AtomicBool = AtomicBool::new(false);
+    fn noter(lettre: u8) {
+        let i = PAS.fetch_add(1, Ordering::Relaxed);
+        if let Some(j) = JOURNAL.get(i) {
+            j.store(lettre, Ordering::Relaxed);
+        }
+    }
+    fn dormir_ms(ms: u64) {
+        let interruptions = cpu::couper_interruptions();
+        attente::dormir(Some(temps::ns_monotone() + ms * 1_000_000), attente::Sommeil::Ininterruptible);
+        if interruptions {
+            cpu::activer_interruptions();
+        }
+    }
+    // Attend (une seconde au plus) que `vrai` le devienne.
+    fn attendre_que(vrai: impl Fn() -> bool) -> bool {
+        (0..1000).any(|_| {
+            if vrai() {
+                return true;
+            }
+            dormir_ms(1);
+            false
+        })
+    }
+    // Un lecteur de la phase 1 : il attend que l'autre soit entré aussi
+    // avant de rendre le verrou (ce qui n'arrive que s'ils le tiennent
+    // ensemble ; sinon l'attente finit au bout d'une seconde, et le journal
+    // le montre).
+    fn lecteur() {
+        static DEDANS: AtomicUsize = AtomicUsize::new(0);
+        let g = V.lire();
+        noter(b'L');
+        DEDANS.fetch_add(1, Ordering::Relaxed);
+        attendre_que(|| DEDANS.load(Ordering::Relaxed) == 2);
+        noter(b'l');
+        drop(g);
+    }
+    // Les tâches lancées, pour les attendre à la fin.
+    let mut taches: [Option<partage::Arc<tache::Tache>>; 7] = Default::default();
+    let mut lancees = taches.iter_mut();
+    let mut lancer = |nom: &[u8], f: fn()| {
+        let t = tache::lancer_noyau(programmes::NomCourt::de(nom), f);
+        let ok = t.is_some();
+        if let Some(place) = lancees.next() {
+            *place = t;
+        }
+        ok
+    };
+    let mut ok = true;
+    // 1. La phase des lecteurs.
+    ok &= lancer(b"verrou-e", || {
+        let g = V.ecrire();
+        noter(b'E');
+        attendre_que(|| RENDRE[0].load(Ordering::Relaxed));
+        noter(b'e');
+        drop(g);
+    });
+    ok &= attendre_que(|| PAS.load(Ordering::Relaxed) == 1);
+    ok &= lancer(b"verrou-l1", lecteur);
+    ok &= attendre_que(|| V.en_attente() == 1);
+    ok &= lancer(b"verrou-f", || {
+        let g = V.ecrire();
+        noter(b'F');
+        // Remis par les lecteurs (`passer_la_main`) : personne n'entre
+        // tant qu'il le tient. La file est vide : seul l'état du verrou peut
+        // refuser (un « ! » au journal sinon).
+        if V.essayer_lire().is_some() || V.essayer_ecrire().is_some() {
+            noter(b'!');
+        }
+        noter(b'f');
+        drop(g);
+    });
+    ok &= attendre_que(|| V.en_attente() == 2);
+    ok &= lancer(b"verrou-l2", lecteur);
+    ok &= attendre_que(|| V.en_attente() == 3);
+    RENDRE[0].store(true, Ordering::Relaxed);
+    ok &= attendre_que(|| PAS.load(Ordering::Relaxed) == 8);
+    // 2. Un lecteur ne passe pas devant un écrivain qui attend ; la
+    // rétrogradation.
+    ok &= lancer(b"verrou-m", || {
+        let g = V.lire();
+        noter(b'M');
+        attendre_que(|| RENDRE[1].load(Ordering::Relaxed));
+        noter(b'm');
+        drop(g);
+    });
+    ok &= attendre_que(|| PAS.load(Ordering::Relaxed) == 9);
+    ok &= lancer(b"verrou-g", || {
+        let g = V.ecrire();
+        noter(b'G');
+        let g = g.retrograder();
+        noter(b'D');
+        attendre_que(|| ENTRE.load(Ordering::Relaxed));
+        noter(b'd');
+        RENDU.store(true, Ordering::Relaxed);
+        drop(g);
+    });
+    ok &= attendre_que(|| V.en_attente() == 1);
+    ok &= lancer(b"verrou-n", || {
+        let g = V.lire();
+        noter(b'N');
+        ENTRE.store(true, Ordering::Relaxed);
+        attendre_que(|| RENDU.load(Ordering::Relaxed));
+        noter(b'n');
+        drop(g);
+    });
+    // Rangé derrière l'écrivain, et pas entré avec M ; sans dormir non plus
+    // (le `down_read_trylock` de Linux refuse aussi, un écrivain attend),
+    // ni en écriture.
+    ok &= attendre_que(|| V.en_attente() == 2);
+    ok &= V.essayer_lire().is_none() && V.essayer_ecrire().is_none();
+    RENDRE[1].store(true, Ordering::Relaxed);
+    drop(lancer);
+    for t in taches.iter().flatten() {
+        tache::attendre(t);
+    }
+    // Libre : pris sans dormir, en écriture puis en lecture (chaque garde
+    // rendue à la fin de sa ligne).
+    let libre_en_ecriture = V.essayer_ecrire().is_some();
+    let libre_en_lecture = V.essayer_lire().is_some();
+    ok &= libre_en_ecriture && libre_en_lecture;
+    let mut lu = [0u8; 15];
+    for (l, j) in lu.iter_mut().zip(&JOURNAL) {
+        *l = j.load(Ordering::Relaxed);
+    }
+    ok &= &lu == b"EeLLllFfMmGDNdn" && PAS.load(Ordering::Relaxed) == 15;
+    afficherln!("[noyau] Verrou qui dort en lecture et ecriture : les lecteurs passent ensemble, un ecrivain qui attend n'est pas double, retrogradation : {} ({}).",
+                if ok { "ok" } else { "ECHEC" }, core::str::from_utf8(&lu).unwrap_or("?"));
 }
 
 /// Vérifie ARP et la table des voisins, une fois le réseau configuré : un

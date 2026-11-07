@@ -27,6 +27,7 @@ use crate::{clavier, faute_de_page, gdt, horloge, irq, linux, ordonnanceur, proc
 use crate::verrou::Verrou;
 use core::arch::{asm, global_asm};
 use core::mem::size_of;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// Une entrée de l'IDT : 16 octets, l'adresse du gestionnaire éclatée en
 /// trois morceaux (encore un héritage des formats 16 puis 32 bits).
@@ -349,6 +350,23 @@ pub fn initialiser() {
     unsafe { asm!("lidt [{}]", in(reg) &descripteur, options(nostack)) };
 }
 
+/// Le nombre d'interruptions matérielles en cours de traitement (la part
+/// HARDIRQ du `preempt_count` de Linux, que lit `in_hardirq()`) : un
+/// gestionnaire d'interruption ne s'exécute pour aucune tâche, il ne doit
+/// jamais dormir. Les verrous qui dorment le vérifient (attente.rs, le
+/// `might_sleep` de Linux) ; les interruptions coupées ne le disent pas,
+/// puisqu'on dort aussi interruptions coupées (attente.rs). Les exceptions
+/// (une faute de page) ne comptent pas : elles s'exécutent pour la tâche
+/// interrompue, qui peut dormir.
+/// UNIPROCESSEUR : un compteur pour le processeur ; un par processeur avec
+/// plusieurs (dans la zone propre à chacun).
+static DANS_UNE_INTERRUPTION: AtomicU32 = AtomicU32::new(0);
+
+/// Une interruption matérielle est-elle en cours de traitement ?
+pub fn dans_une_interruption() -> bool {
+    DANS_UNE_INTERRUPTION.load(Ordering::Relaxed) != 0
+}
+
 /// Appelée par le code commun pour chaque interruption.
 ///
 /// Pour TOUS les vecteurs, ce qui compte d'abord est le privilège du code
@@ -374,6 +392,7 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     let depuis_programme = cadre.cs & 3 == 3;
     match vecteur {
         32.. => {
+            DANS_UNE_INTERRUPTION.fetch_add(1, Ordering::Relaxed);
             irq::gerer(vecteur as u8, |source| match source {
                 irq::Source::TimerApic | irq::Source::Isa(horloge::IRQ) => {
                     horloge::tic();
@@ -388,6 +407,10 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
             if irq::est_un_peripherique(vecteur as u8) {
                 crate::aleatoire::ajouter_interruption(vecteur as u64, cadre.rip);
             }
+            // Avant la préemption éventuelle (plus bas) : la tâche suivante
+            // ne doit pas hériter du compte (Linux : `irq_exit`, avant
+            // `preempt_schedule_irq`).
+            DANS_UNE_INTERRUPTION.fetch_sub(1, Ordering::Relaxed);
         }
         2 | 8 | 18 => exception_fatale(cadre),
         // La faute de page, d'où qu'elle vienne : le plus souvent servie

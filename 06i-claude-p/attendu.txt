@@ -21,6 +21,7 @@
 [noyau] Clavier PS/2 pret : tapez du texte.
 [noyau] Ordonnanceur EEVDF : tranche de 0.70 ms, preemption du noyau.
 [noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : ok
+[noyau] Verrou qui dort en lecture et ecriture : les lecteurs passent ensemble, un ecrivain qui attend n'est pas double, retrogradation : ok (EeLLllFfMmGDNdn).
 [noyau] Carte de la memoire (E820)
 [noyau] Memoire libre : 
 [noyau] Pagination W^X en place
