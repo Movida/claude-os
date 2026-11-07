@@ -254,6 +254,10 @@ boot.bin: programmes.cpio FORCE
 #     descripteurs 0 et 3 sont ces fichiers, et /proc/self/fd/3 d'un
 #     fichier sans droits rend EACCES, le descripteur restant lisible ; sur
 #     l'hôte aussi ;
+#   - dossier : gcc -static, son dossier courant, PWD et OLDPWD, après un
+#     `cd` de /etc/demarrage (6i) ; sur l'hôte, la même suite de `cd`,
+#     jouée par dash (/bin/sh), sans environnement, doit donner ce que
+#     /etc/demarrage attend ;
 #   - fautes : gcc -static, la mémoire disputée par ses fils (6i) : quatre
 #     qui fautent pendant qu'un autre rend des pages et qu'un autre projette,
 #     protège et retire des zones, la pile qui grandit ; puis exit_group au
@@ -414,6 +418,10 @@ $(LINUX)/troncature: linux/troncature.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/redirections: linux/redirections.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/dossier: linux/dossier.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -769,7 +777,8 @@ tests.cpio: archive.sh tests-demarrage.txt $(addprefix $(LINUX)/tests/,$(TESTS_L
 # refusée par EADDRINUSE, et la première fermée avec elle, le programme
 # n'est pas lancé ; 12 : une redirection d'un fichier absent ; 13 : une
 # redirection pour un programme WebAssembly ; 14 : `<<`, une autre
-# redirection de sh, refusée) ; puis chaque programme de TESTS_LINUX et de
+# redirection de sh, refusée ; 15 : cd vers un dossier absent ; 16 : cd
+# vers un fichier ; 17 : cd par un chemin relatif) ; puis chaque programme de TESTS_LINUX et de
 # TESTS_INTERP, ceux de TESTS_PARALLELES par deux, un fil qui fait une
 # faute (fils faute : tout le groupe meurt), les courses entre fils et les
 # gestionnaires de signaux (sous qemu64 et max, en plus de Nehalem au
@@ -792,6 +801,9 @@ tests-demarrage.txt: Makefile
 	  echo "/bin/bonjour-asm < /absent"; \
 	  echo "/bin/lecteur.wasm < /etc/demarrage"; \
 	  echo "/bin/bonjour-asm <<x"; \
+	  echo "cd /absent"; \
+	  echo "cd /etc/demarrage"; \
+	  echo "cd tmp"; \
 	  for p in $(TESTS_LINUX) $(TESTS_INTERP); do echo "/bin/$$p"; done; \
 	  echo "/bin/lignes a 200 &"; \
 	  echo "/bin/lignes b 200 &"; \
@@ -848,7 +860,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -1013,7 +1025,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -1056,6 +1068,8 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	mkdir -p $(LINUX)/redirige && echo bonjour > $(LINUX)/redirige/a && echo jeton > $(LINUX)/redirige/b && \
 	  ./$(LINUX)/redirections $(LINUX)/redirige/a $(LINUX)/redirige/b < $(LINUX)/redirige/a 3< $(LINUX)/redirige/b \
 	  | tee /dev/stderr | grep -q "redirections : .* : ok"
+	env -i /bin/sh -c "cd / && $(CURDIR)/$(LINUX)/dossier / / '*' && cd /tmp && $(CURDIR)/$(LINUX)/dossier /tmp /tmp / \
+	  && cd /etc/../tmp// && $(CURDIR)/$(LINUX)/dossier /tmp /tmp /tmp" | tee /dev/stderr | test $$(grep -c "dossier : .* : ok") = 3
 	timeout 60 ./$(LINUX)/reseau | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/dns | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/aleatoire | tee /dev/stderr | grep -q "toutes les verifications : ok"

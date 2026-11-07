@@ -66,7 +66,13 @@
 //!     gauche à droite (`< a < b` : a, puis b), et une redirection laisse les
 //!     mots suivants en tête (`<f A=1 /bin/x` : A=1 est une affectation).
 //!     Pour `claude -p < /dev/null` (sinon il attend 3 s son entrée), et le
-//!     jeton de l'abonnement, donné par un descripteur (6i).
+//!     jeton de l'abonnement, donné par un descripteur (6i) ;
+//!   - depuis 6i, la commande interne `cd CHEMIN`, seule sur sa ligne, avec
+//!     un chemin absolu (entre guillemets s'il le faut) : le dossier courant
+//!     des commandes suivantes. Comme `cd` de dash (son -L par défaut), le
+//!     chemin est d'abord ramené à sa forme simple (`/a/./b/../c//` :
+//!     `/a/c`), sans regarder les liens, et c'est lui que reçoit la variable
+//!     PWD des programmes.
 //! Pas de `\` en fin de ligne, pas de variables, pas d'échappements : ce
 //! n'est pas un shell, seulement de quoi écrire une commande.
 //!
@@ -102,6 +108,8 @@ pub enum Erreur {
     /// Un `<` sans chemin après lui (la fin de la ligne, ou un
     /// commentaire).
     RedirectionSansChemin,
+    /// `cd` sans un seul chemin absolu, ou avec des affectations ou `&`.
+    Cd,
 }
 
 // Affichés par le noyau : sans accents.
@@ -119,6 +127,7 @@ impl fmt::Display for Erreur {
             Erreur::ApresEsperluette => f.write_str("rien ne peut suivre &"),
             Erreur::Attendre => f.write_str("wait s'emploie seul"),
             Erreur::RedirectionSansChemin => f.write_str("< sans chemin"),
+            Erreur::Cd => f.write_str("cd s'emploie seul, avec un chemin absolu"),
         }
     }
 }
@@ -163,6 +172,9 @@ pub enum Ligne<'t> {
     Commande(Commande<'t>),
     /// `wait` : attendre les commandes lancées par `&`.
     Attendre,
+    /// `cd CHEMIN` : le dossier courant des commandes suivantes, son chemin
+    /// absolu ramené à sa forme simple.
+    Dossier(&'t [u8]),
 }
 
 /// Une ligne découpée : ses mots, guillemets retirés, dans le tampon de
@@ -317,6 +329,68 @@ fn lire_mot(ligne: &[u8], i: &mut usize, tampon: &mut [u8], ecrit: &mut usize) -
     Ok(())
 }
 
+/// `cd CHEMIN`, puis peut-être un commentaire : le chemin, un seul mot
+/// absolu (ses guillemets compris : un `#` y est un caractère, comme collé
+/// à un mot), ramené à sa forme simple dans `tampon`.
+fn dossier<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<&'t [u8], Erreur> {
+    let mut i = ligne.iter().position(|&o| o != b' ' && o != b'\t').unwrap_or(0) + 2;
+    while i < ligne.len() && (ligne[i] == b' ' || ligne[i] == b'\t') {
+        i += 1;
+    }
+    let mut ecrit = 0;
+    if i < ligne.len() && ligne[i] != b'#' {
+        lire_mot(ligne, &mut i, tampon, &mut ecrit)?;
+    }
+    while i < ligne.len() && (ligne[i] == b' ' || ligne[i] == b'\t') {
+        i += 1;
+    }
+    let commentaire = i < ligne.len() && ligne[i] == b'#';
+    if (i < ligne.len() && !commentaire) || ecrit == 0 || tampon[0] != b'/' {
+        return Err(Erreur::Cd);
+    }
+    let n = forme_simple(&mut tampon[..ecrit]);
+    Ok(&tampon[..n])
+}
+
+/// Ramène le chemin absolu `chemin` à sa forme simple, sur place, comme
+/// `cd` de dash : sans « . », sans « / » en double ni à la fin, chaque
+/// « .. » ôtant le nom qui le précède (pas au-dessus de la racine), sans
+/// regarder si ce nom est un lien. Un « // » de tête reste (exactement
+/// deux : POSIX laisse son sens à chaque système, et dash le garde, comme
+/// une racine à part : `cd //tmp/..` donne « // ») ; trois ou plus n'en
+/// font qu'un. Rend sa nouvelle longueur.
+pub fn forme_simple(chemin: &mut [u8]) -> usize {
+    let double = chemin.len() >= 2 && chemin[1] == b'/' && chemin.get(2) != Some(&b'/');
+    // Ce qui est écrit : « » ou « /a/b » ; avec « // », « / » d'abord (le
+    // premier caractère du chemin), puis « /a/b » à sa suite.
+    let base = double as usize;
+    let mut fin = base;
+    let mut i = base;
+    while i < chemin.len() {
+        while i < chemin.len() && chemin[i] == b'/' {
+            i += 1;
+        }
+        let debut = i;
+        while i < chemin.len() && chemin[i] != b'/' {
+            i += 1;
+        }
+        match &chemin[debut..i] {
+            b"" | b"." => {}
+            b".." => fin = chemin[..fin].iter().rposition(|&o| o == b'/').unwrap_or(0).max(base),
+            _ => {
+                chemin[fin] = b'/';
+                chemin.copy_within(debut..i, fin + 1);
+                fin += 1 + i - debut;
+            }
+        }
+    }
+    if fin == base {
+        chemin[..=base].fill(b'/');
+        fin = base + 1;
+    }
+    fin
+}
+
 /// Découpe `ligne` en mots, dans `tampon` (au moins `taille_tampon(ligne)`
 /// octets). Rend `None` pour une ligne sans commande (vide, ou seulement
 /// un commentaire).
@@ -331,8 +405,14 @@ pub fn decouper<'t>(ligne: &[u8], tampon: &'t mut [u8]) -> Result<Option<Ligne<'
         _ => ligne,
     };
     let mut seuls = mots.split(|&o| o == b' ' || o == b'\t').filter(|m| !m.is_empty());
-    if seuls.next() == Some(b"wait") {
-        return if seuls.next().is_none() { Ok(Some(Ligne::Attendre)) } else { Err(Erreur::Attendre) };
+    match seuls.next() {
+        Some(b"wait") => return if seuls.next().is_none() { Ok(Some(Ligne::Attendre)) } else { Err(Erreur::Attendre) },
+        Some(b"cd") => return dossier(ligne, tampon).map(|d| Some(Ligne::Dossier(d))),
+        // `A=1 cd /x` : dash n'y changerait le dossier que pour cd lui-même.
+        // (Le premier mot qui n'est pas une affectation : `A=1 /bin/x cd`
+        // lance /bin/x.)
+        Some(m) if est_affectation(m) && seuls.find(|m| !est_affectation(m)) == Some(&b"cd"[..]) => return Err(Erreur::Cd),
+        _ => {}
     }
     let mut ecrit = 0; // Ce qui est écrit dans le tampon.
     let mut i = 0;
@@ -460,6 +540,7 @@ mod tests {
                 (c.affectations().map(texte).collect(), c.dossiers().map(texte).collect(), c.arguments().map(texte).collect())
             }
             Ligne::Attendre => (Vec::new(), Vec::new(), std::vec!["wait".into()]),
+            Ligne::Dossier(d) => (Vec::new(), Vec::new(), std::vec!["cd".into(), std::string::String::from_utf8(d.to_vec()).unwrap()]),
         }))
     }
 
@@ -690,6 +771,58 @@ mod tests {
         std::fs::remove_dir_all(&dossier).unwrap();
     }
 
+    /// Le chemin d'une ligne `cd`.
+    fn cd(ligne: &str) -> Result<std::string::String, Erreur> {
+        let mut tampon = std::vec![0u8; taille_tampon(ligne.as_bytes())];
+        match decouper(ligne.as_bytes(), &mut tampon)? {
+            Some(Ligne::Dossier(d)) => Ok(std::string::String::from_utf8(d.to_vec()).unwrap()),
+            _ => panic!("{ligne} : pas un cd"),
+        }
+    }
+
+    #[test]
+    fn cd_seul() {
+        assert_eq!(cd("cd /tmp").unwrap(), "/tmp");
+        assert_eq!(cd("  cd\t'/a b'  # commentaire").unwrap(), "/a b");
+        assert_eq!(cd("cd /a/./b/../c//").unwrap(), "/a/c");
+        assert_eq!(cd("cd /../..").unwrap(), "/");
+        assert_eq!(cd("cd /").unwrap(), "/");
+        // Un `#` dans un mot ou entre guillemets n'est pas un commentaire.
+        assert_eq!(cd("cd '/a #b'").unwrap(), "/a #b");
+        assert_eq!(cd("cd /a#b # c").unwrap(), "/a#b");
+        assert_eq!(cd("cd # /a"), Err(Erreur::Cd));
+        // « cd » en argument, après une affectation : un programme.
+        assert_eq!(mots("A=1 /bin/x cd"), ["/bin/x", "cd"]);
+        for refus in ["cd", "cd tmp", "cd /a /b", "cd /a &", "A=1 cd /a", "cd ''", "cd /a <f"] {
+            assert!(decoupe(refus).is_err(), "{refus}");
+        }
+        assert_eq!(decoupe("cd"), Err(Erreur::Cd));
+        assert_eq!(decoupe("A=1 cd /a"), Err(Erreur::Cd));
+        // Pas la commande interne : un chemin, ou entre guillemets.
+        assert_eq!(decoupe("'cd' /tmp"), Err(Erreur::CheminRelatif));
+        assert_eq!(mots("/bin/cd /tmp"), ["/bin/cd", "/tmp"]);
+    }
+
+    /// La forme simple d'un chemin, et le PWD que dash donne après `cd` :
+    /// les mêmes. Avec des dossiers qui existent (dash refuse les autres),
+    /// et un lien : dash ne le suit pas pour calculer PWD (`cd -L`).
+    #[test]
+    fn cd_comme_sh() {
+        let dossier = std::env::temp_dir().join(std::format!("commande-cd-{}", std::process::id()));
+        std::fs::create_dir_all(dossier.join("a/b")).unwrap();
+        let _ = std::os::unix::fs::symlink(dossier.join("a/b"), dossier.join("lien"));
+        let d = dossier.to_str().unwrap();
+        for chemin in [std::format!("{d}/a/b"), std::format!("{d}/./a//b/"), std::format!("{d}/a/b/../b/.."),
+                       std::format!("{d}/lien/.."), std::format!("{d}/lien"), "/".into(), "/tmp/..".into(),
+                       "//tmp".into(), "//".into(), "//tmp/..".into(), "///tmp".into(), "//tmp/./../tmp".into()] {
+            let script = std::format!("cd '{chemin}' && printf %s \"$PWD\"");
+            let sortie = std::process::Command::new("sh").arg("-c").arg(&script).env_clear().output().unwrap();
+            assert!(sortie.status.success(), "{chemin}");
+            assert_eq!(cd(&std::format!("cd '{chemin}'")).unwrap(), std::string::String::from_utf8(sortie.stdout).unwrap(), "{chemin}");
+        }
+        std::fs::remove_dir_all(&dossier).unwrap();
+    }
+
     /// Le programme par son chemin absolu : ni un chemin relatif, ni un mot
     /// que sh comprendrait autrement (un mot réservé, une commande interne),
     /// même entre guillemets.
@@ -730,7 +863,7 @@ mod tests {
     fn messages_sans_accents() {
         for e in [Erreur::GuillemetNonFerme, Erreur::Caractere(b'$'), Erreur::Caractere(1), Erreur::DossierVide, Erreur::Ecoute,
                   Erreur::SansProgramme, Erreur::CheminRelatif, Erreur::TamponTropPetit, Erreur::ApresEsperluette,
-                  Erreur::Attendre, Erreur::RedirectionSansChemin] {
+                  Erreur::Attendre, Erreur::RedirectionSansChemin, Erreur::Cd] {
             assert!(std::format!("{e}").is_ascii());
         }
     }

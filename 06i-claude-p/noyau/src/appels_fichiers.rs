@@ -503,9 +503,40 @@ pub fn ouvrir_pour_le_noyau(chemin: &[u8], lecture: bool, ecriture: bool) -> Res
 /// programme WebAssembly (`dossier` : il doit en être un, ENOTDIR sinon).
 pub fn ouvrir_pour(qui: fichiers::Identite, chemin: &[u8], lecture: bool, ecriture: bool, dossier: bool)
     -> Result<Fichier, Erreur> {
+    ouvrir_depuis(qui, None, chemin, lecture, ecriture, dossier)
+}
+
+/// Ouvre en lecture `chemin` pour une redirection de /etc/demarrage (6i),
+/// en root, un chemin relatif partant de `dossier`, le dossier courant du
+/// lanceur (après `cd`).
+pub fn ouvrir_pour_le_lanceur(dossier: Objet, chemin: &[u8]) -> Result<Fichier, Erreur> {
+    ouvrir_depuis(fichiers::Identite::ROOT, Some(dossier), chemin, true, false, false)
+}
+
+/// Le dossier `chemin` (absolu), pour le `cd` de /etc/demarrage (6i) :
+/// trouvé en root, en suivant les liens, un dossier (ENOTDIR sinon), tenu
+/// s'il est du tmpfs (le lanceur le lâchera).
+pub fn dossier_pour_le_lanceur(chemin: &[u8]) -> Result<Objet, Erreur> {
+    vfs::avec_systeme(|s, _| {
+        let racine = s.racine();
+        let depart = Depart { racine, dossier: racine, qui: fichiers::Identite::ROOT, sous: false };
+        let o = s.resoudre(0, &depart, chemin, Suivre::Toujours)?.objet.ok_or(Erreur::ENOENT)?;
+        if !s.avec_vue(0, |vue| fichiers::montages::est_dossier(vue, o)) {
+            return Err(Erreur::ENOTDIR);
+        }
+        if let Some(n) = o.tmpfs() {
+            s.fs.prendre(n);
+        }
+        Ok(o)
+    })
+}
+
+/// `ouvrir_pour`, un chemin relatif partant de `depuis` (la racine sinon).
+fn ouvrir_depuis(qui: fichiers::Identite, depuis: Option<Objet>, chemin: &[u8], lecture: bool, ecriture: bool, dossier: bool)
+    -> Result<Fichier, Erreur> {
     vfs::avec_systeme(|s, cadres| {
         let racine = s.racine();
-        let depart = Depart { racine, dossier: racine, qui, sous: false };
+        let depart = Depart { racine, dossier: depuis.unwrap_or(racine), qui, sous: false };
         let fin = s.resoudre(0, &depart, chemin, Suivre::Toujours)?;
         let o = Ouverture { lecture, ecriture, dossier, ..Ouverture::default() };
         let drapeaux = O_LARGEFILE

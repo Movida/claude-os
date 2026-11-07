@@ -166,6 +166,10 @@ pub fn demarrer() {
             match formats::commande::decouper(ligne, &mut tampon) {
                 Ok(None) => None,
                 Ok(Some(formats::commande::Ligne::Attendre)) => Some(Action::Attendre),
+                Ok(Some(formats::commande::Ligne::Dossier(chemin))) => {
+                    l.changer_de_dossier(numero, chemin);
+                    None
+                }
                 Ok(Some(formats::commande::Ligne::Commande(commande))) => {
                     let fond = commande.arriere_plan();
                     lancer(&mut l, numero, &commande).map(|t| if fond { Action::Fond(t) } else { Action::Premier(t) })
@@ -198,6 +202,19 @@ pub fn demarrer() {
     let (profondeur, taille) = (tache::plus_grande_profondeur(), crate::vmalloc::TAILLE_PILE as usize);
     let marge = if profondeur <= taille / 4 * 3 { "ok" } else { "ECHEC" };
     afficherln!("[noyau] Piles du noyau : {} octets au plus, sur {}, il reste de la marge : {}.", profondeur, taille, marge);
+}
+
+/// Lâche un dossier tenu par le lanceur (un inode du tmpfs).
+fn lacher_dossier(o: Objet) {
+    if let Some(n) = o.tmpfs() {
+        vfs::avec(|fs, cadres| fs.lacher(n, cadres));
+    }
+}
+
+impl Drop for Lanceur {
+    fn drop(&mut self) {
+        lacher_dossier(self.dossier);
+    }
 }
 
 /// Ce que fait une ligne.
@@ -235,6 +252,14 @@ struct Lanceur {
     libres: usize,
     /// Un programme a été lancé pendant qu'un autre tournait.
     paralleles: bool,
+    /// Son dossier courant (6i) : la racine, puis celui du dernier `cd`,
+    /// tenu ; celui de chaque programme lancé, et le départ d'une
+    /// redirection par un chemin relatif. Le chemin qu'en donne `cd`, en
+    /// forme simple, pour PWD ; le précédent, pour OLDPWD (vide avant le
+    /// premier `cd`), comme dash.
+    dossier: Objet,
+    pwd: Vec<u8>,
+    oldpwd: Vec<u8>,
 }
 
 impl Lanceur {
@@ -246,7 +271,31 @@ impl Lanceur {
         // Sans cette place, chaque programme lancé en fond retentera (voir
         // `demarrer`).
         let _ = fond.try_reserve_exact(commandes);
-        Lanceur { fond, en_cours: 0, libres: 0, paralleles: false }
+        let dossier = vfs::avec_systeme(|s, _| {
+            let r = s.racine();
+            if let Some(n) = r.tmpfs() {
+                s.fs.prendre(n);
+            }
+            r
+        });
+        Lanceur { fond, en_cours: 0, libres: 0, paralleles: false, dossier, pwd: copie(b"/"), oldpwd: Vec::new() }
+    }
+
+    /// `cd CHEMIN` (absolu, en forme simple) : le dossier courant des lignes
+    /// suivantes. Un dossier introuvable, ou qui n'en est pas un : rien ne
+    /// change, et les lignes suivantes tournent dans l'ancien (le « can't
+    /// cd » de dash).
+    fn changer_de_dossier(&mut self, numero: usize, chemin: &[u8]) {
+        let nouveau = match appels_fichiers::dossier_pour_le_lanceur(chemin) {
+            Ok(o) => o,
+            Err(e) => return afficherln!("[noyau] {}, ligne {} : cd {} impossible (errno {})", Nom(DEMARRAGE), numero, Nom(chemin), e.errno()),
+        };
+        let Ok(pwd) = faillible::copie(chemin) else {
+            lacher_dossier(nouveau);
+            return afficherln!("[noyau] {}, ligne {} : cd : plus de memoire", Nom(DEMARRAGE), numero);
+        };
+        lacher_dossier(core::mem::replace(&mut self.dossier, nouveau));
+        self.oldpwd = core::mem::replace(&mut self.pwd, pwd);
     }
 
     /// Un programme va être lancé.
@@ -429,7 +478,8 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
     };
     let (mut environnement, mut arguments, mut dossiers, mut ecoutes) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
     let mut entrees = Entrees(Vec::new());
-    let place = ENVIRONNEMENT.len() + commande.affectations().count();
+    // L'environnement du noyau, PWD et OLDPWD, puis les affectations.
+    let place = ENVIRONNEMENT.len() + 2 + commande.affectations().count();
     if environnement.try_reserve_exact(place).is_err()
         || arguments.try_reserve_exact(commande.arguments().count()).is_err()
         || dossiers.try_reserve_exact(commande.dossiers().count()).is_err()
@@ -448,14 +498,24 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
     // ouverts sont lâchés en sortant (`Entrees`), le programme tenant les
     // siens.
     for (fd, chemin) in commande.redirections() {
-        match appels_fichiers::ouvrir_pour_le_noyau(chemin, true, false) {
+        match appels_fichiers::ouvrir_pour_le_lanceur(l.dossier, chemin) {
             Ok(f) => entrees.0.ajouter_dans_la_place((fd, f)),
             Err(e) => return refus(&format_args!("{} : impossible a ouvrir (errno {})", Nom(chemin), e.errno())),
         }
     }
+    // PWD (et OLDPWD après un `cd`), comme dash les donne aux commandes
+    // qu'il lance (même sans `cd` : PWD=/).
+    let (Ok(pwd), Ok(oldpwd)) = (faillible::concatenation(&[b"PWD=", &l.pwd]), faillible::concatenation(&[b"OLDPWD=", &l.oldpwd]))
+    else {
+        return refus(&"plus de memoire");
+    };
     // Dans la place réservée juste au-dessus : plus rien n'échoue.
     for &v in ENVIRONNEMENT {
         environnement.ajouter_dans_la_place(v);
+    }
+    environnement.ajouter_dans_la_place(&pwd);
+    if !l.oldpwd.is_empty() {
+        environnement.ajouter_dans_la_place(&oldpwd);
     }
     for affectation in commande.affectations() {
         // « NOM=... » remplace la variable NOM du noyau, comme le shell.
@@ -480,6 +540,7 @@ fn lancer(l: &mut Lanceur, numero: usize, commande: &formats::commande::Commande
         dossiers: &dossiers,
         ecoutes: &ecoutes,
         entrees: &entrees.0,
+        dossier: l.dossier,
         fond: commande.arriere_plan(),
     };
     let t = executer(l, numero, n, &lancement);
@@ -532,6 +593,8 @@ struct Lancement<'a> {
     /// Ses redirections (6i), ouvertes, dans l'ordre de la ligne : le
     /// descripteur, le fichier ouvert (que tient encore la ligne).
     entrees: &'a [(u8, crate::descripteurs::Fichier)],
+    /// Son dossier courant : celui du lanceur (tenu par lui).
+    dossier: Objet,
     /// Lancé par `&` : son entrée standard est /dev/null, comme sous `sh`
     /// (sauf redirection).
     fond: bool,
@@ -764,10 +827,10 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         Err(e) => refus!("[noyau] {} : pile initiale impossible : {}", nom, e),
     };
     // Son processus : avec la console en 0, 1 et 2 (/dev/null en 0 s'il
-    // est lancé par `&`, comme sous sh), puis ses redirections, la racine
-    // pour dossier courant, l'umask de Linux, et l'identité de l'utilisateur
-    // 1000. Un refus après l'ouverture de la console ferme ce que la table
-    // tient déjà (Descripteurs::drop).
+    // est lancé par `&`, comme sous sh), puis ses redirections, le dossier
+    // courant du lanceur (la racine, ou celui d'un `cd`), l'umask de Linux,
+    // et l'identité de l'utilisateur 1000. Un refus après l'ouverture de la
+    // console ferme ce que la table tient déjà (Descripteurs::drop).
     let mut descripteurs = Descripteurs::new();
     if let Err(e) = appels_fichiers::ouvrir_console(&mut descripteurs) {
         refus!("[noyau] {} : pas de console (errno {})", nom, e.errno());
@@ -792,9 +855,12 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     }
     let racine = vfs::avec(|fs, _| {
         let r = fs.racine();
-        // Le dossier courant et la racine tiennent chacun l'inode.
+        // Le dossier courant (celui du lanceur) et la racine tiennent chacun
+        // leur inode.
         fs.prendre(r);
-        fs.prendre(r);
+        if let Some(d) = lancement.dossier.tmpfs() {
+            fs.prendre(d);
+        }
         r
     });
     let (pml4, depart) = (programme.memoire.tables().pml4(), programme.depart);
@@ -802,7 +868,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     let entree = processus::ajouter(processus::Processus {
         pid,
         descripteurs,
-        dossier: Objet::Tmpfs(racine),
+        dossier: lancement.dossier,
         racine: Objet::Tmpfs(racine),
         umask: 0o022,
         identite,

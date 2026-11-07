@@ -161,6 +161,9 @@
 [noyau] /etc/demarrage, ligne 12 : refusee : /absent : impossible a ouvrir (errno 2)
 [noyau] /etc/demarrage, ligne 13 : refusee : une redirection pour un programme WebAssembly
 [noyau] /etc/demarrage, ligne 14 : refusee : caractere special '<' hors des guillemets
+[noyau] /etc/demarrage, ligne 15 : cd /absent impossible (errno 2)
+[noyau] /etc/demarrage, ligne 16 : cd /etc/demarrage impossible (errno 20)
+[noyau] /etc/demarrage, ligne 17 : refusee : cd s'emploie seul, avec un chemin absolu
 [noyau] interp-absent : interpreteur /lib/absent : introuvable (errno 2)
 [noyau] interp-dossier : interpreteur /tmp : pas le droit de l'executer (errno 13)
 [noyau] interp-non-exec : interpreteur /etc/demarrage : pas le droit de l'executer (errno 13)
