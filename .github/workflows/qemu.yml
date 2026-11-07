@@ -22,7 +22,10 @@ jobs:
       # QEMU compilé, pas le paquet d'Ubuntu, dont un bogue fait planter le
       # compilateur à la volée de claude (.devcontainer/construire-qemu.sh) ;
       # gardé d'un envoi à l'autre : sa compilation prend plusieurs minutes.
-      - uses: actions/cache@v4
+      # La version 6 : la 4 tournait sur Node 20, que GitHub retire (un
+      # avertissement à chaque envoi) ; la 5 et la 6 tournent sur Node 24,
+      # avec les mêmes paramètres, et la 6 est la dernière.
+      - uses: actions/cache@v6
         id: cache-qemu
         with:
           path: ~/qemu
