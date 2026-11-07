@@ -67,6 +67,12 @@
 #                  sur notre TCP, et la réponse de l'API à une fausse clé),
 #                  puis sa réponse, venue d'une fausse API que sert QEMU
 #                  (6i : outils/serveur-http) (claude-p-attendu.txt)
+#   make jeton  -> enregistre le jeton de l'abonnement de David, celui de
+#                  `claude setup-token`, dans ~/.config/claude-os/jeton
+#                  (outils/jeton-claude) : sur sa machine seulement
+#   make claude-bonjour -> le jalon de 6i : la réponse de Claude à
+#                  « bonjour », par la vraie API, avec ce jeton ; jamais
+#                  dans la CI
 #   make tests-hote -> les tests sur la machine hôte : ceux de la
 #                  bibliothèque des formats (formats/ : archive cpio,
 #                  exécutables ELF, essayés aussi sur de vrais programmes
@@ -941,6 +947,75 @@ claude-p: claude-p.bin
 	  grep -qF -- "$$ligne" claude-p.log || { echo "claude -p : manque « $$ligne »"; exit 1; }; \
 	done < claude-p-attendu.txt
 
+# Le jalon de 6i : la vraie réponse de Claude, avec l'abonnement de David.
+#
+# Le jeton (make jeton, outils/jeton-claude) est un fichier de sa machine,
+# hors du dépôt et hors de ~/.claude (que parcourent les sessions de Claude
+# Code). Il ne passe que de fichier à fichier : jamais par une variable de
+# make ou du shell, jamais sur une ligne de commande. Le Makefile ne connaît
+# que son chemin.
+#
+# make claude-bonjour construit l'image dans un dossier à part, PRIVE
+# (0700, umask 077 : tout ce qui y naît est à David seul), puisque son
+# archive porte le jeton (/etc/claude/jeton, 0400, à l'utilisateur 1000 ;
+# voir racine/etc/demarrage-claude-bonjour) : ni dans le dossier de l'étape, ni
+# dans le dépôt. Ses fichiers sont effacés avant (ce qu'un arrêt brutal
+# aurait laissé) et après, quoi qu'il arrive : la commande entière tourne
+# dans un seul shell, dont le piège (trap) les efface à sa sortie, et qui
+# construit l'archive et l'image par un make de plus (pour garder une seule
+# recette de l'image, la macro image). On efface ces fichiers-là, par leurs
+# noms, puis le dossier s'il est vide, plutôt que tout le dossier : un
+# effacement récursif d'un chemin fait de variables ferait trop de dégâts
+# si l'une d'elles était fausse.
+#
+# Ni la mémoire du système invité dans un fichier core de QEMU (elle garde
+# le jeton) : -machine dump-guest-core=off la retire de tout vidage
+# (madvise MADV_DONTDUMP). ulimit -c 0 ne suffirait pas : quand
+# core_pattern est un tube (WSL : |/wsl-capture-crash), Linux ignore
+# RLIMIT_CORE (fs/coredump.c) ; on le garde pour les autres fichiers. Ni
+# moniteur de QEMU. Un Ctrl-C arrête QEMU avant
+# d'effacer : un programme lancé par & dans un shell sans contrôle des
+# tâches ignore SIGINT, il faut le tuer soi-même.
+#
+# Puis on attend la ligne du groupe, comme make claude-p, et on montre ce
+# que le noyau et Claude ont écrit sur le port série depuis le lancement,
+# sans le détail des chargements ; réussi si Claude finit par 0.
+JETON = $(HOME)/.config/claude-os/jeton
+PRIVE = $(HOME)/.config/claude-os/image
+PRIVE_FICHIERS = $(addprefix $(PRIVE)/,claude-bonjour.cpio claude-bonjour-noyau.bin claude-bonjour-chargeur.bin claude-bonjour.bin serie.log)
+DUREE_CLAUDE_BONJOUR = $(DUREE_CLAUDE_P)
+
+jeton:
+	sh outils/jeton-claude $(JETON)
+
+claude-bonjour:
+	@test -s $(JETON) || { echo "make claude-bonjour : pas de jeton ($(JETON)) : claude setup-token dans un terminal, puis make jeton"; exit 1; }
+	umask 077; ulimit -c 0; q=; \
+	trap 'rm -f $(PRIVE_FICHIERS); rmdir $(PRIVE) 2>/dev/null' EXIT; \
+	trap 'test -n "$$q" && kill $$q 2>/dev/null; exit 130' INT TERM HUP; \
+	rm -f $(PRIVE_FICHIERS); mkdir -p $(PRIVE); chmod 700 $(PRIVE); \
+	$(MAKE) --no-print-directory $(PRIVE)/claude-bonjour.bin || exit 1; \
+	timeout $(DUREE_CLAUDE_BONJOUR) $(QEMU_TEST) -machine dump-guest-core=off \
+	  -drive format=raw,file=$(PRIVE)/claude-bonjour.bin,if=$(QEMU_DISQUE) $(QEMU_OPTIONS) \
+	  -serial file:$(PRIVE)/serie.log & q=$$!; \
+	for i in $$(seq $$(( $(DUREE_CLAUDE_BONJOUR) * 10 ))); do \
+	  grep -qF -- "[noyau] Groupe des lignes" $(PRIVE)/serie.log 2>/dev/null && break; kill -0 $$q 2>/dev/null || break; sleep 0.1; \
+	done; \
+	kill $$q 2>/dev/null; wait $$q 2>/dev/null; \
+	sed -n '/Lancement/,$$p' $(PRIVE)/serie.log | grep -v -E '^        |programme Linux \(ELF|Piles du noyau'; \
+	grep -qF -- "[noyau] claude : termine, code de sortie 0" $(PRIVE)/serie.log
+
+# L'archive et l'image de make claude-bonjour, dans PRIVE (que seul make
+# claude-bonjour prépare, puis vide) : celles de l'étape, dont
+# /etc/demarrage lance Claude avec le jeton, qu'elles portent en plus.
+$(PRIVE)/claude-bonjour.cpio: programmes.cpio racine/etc/demarrage-claude-bonjour $(JETON)
+	{ sed 's|racine/etc/demarrage |racine/etc/demarrage-claude-bonjour |' archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; \
+	  echo "dir /etc/claude 500 1000 1000"; echo "file /etc/claude/jeton $(JETON) 400 1000 1000"; } | sh archive.sh $@ -
+
+$(PRIVE)/claude-bonjour.bin: $(PRIVE)/claude-bonjour.cpio FORCE
+	cd noyau && cargo build --release
+	$(call image,$(NOYAU_ELF),$<,$(PRIVE)/claude-bonjour)
+
 FORCE:
 
 run: boot.bin
@@ -1310,6 +1385,8 @@ clean:
 	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio \
 	  tests-demarrage.txt serial.log trace.log verrous.log \
 	  capture.log qemu.log ecran.png test-*.log claude-p.log $(MON_TESTS)
+	rm -f $(PRIVE_FICHIERS)
+	rmdir $(PRIVE) 2>/dev/null || true
 	rm -rf $(LINUX)
 	rm -rf $(GLIBC)
 	rm -rf $(SUITE)
@@ -1325,4 +1402,4 @@ clean:
 	cd crypto && cargo clean
 	cd roue && cargo clean
 
-.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace verrous tests-hote tests-hote-root tests-qemu claude-p suite clean FORCE
+.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace verrous tests-hote tests-hote-root tests-qemu claude-p jeton claude-bonjour suite clean FORCE
