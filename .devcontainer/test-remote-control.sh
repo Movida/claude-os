@@ -18,6 +18,9 @@ HOME_TEST="$T/home"
 CONFIG="$T/config"
 JOURNAL="$CONFIG/remote-control.log"
 OOM="$T/memory.events"
+# Là où Claude Code range le pointeur de l'environnement pour le dossier du dépôt de
+# test : le chemin est recalculé ici, et non repris du superviseur, pour vérifier le sien.
+POINTEUR="$CONFIG/projects/$(printf '%s' "$DEPOT" | tr -c 'a-zA-Z0-9' -)/bridge-pointer.json"
 echecs=0
 superviseurs=()
 autres=()
@@ -86,6 +89,10 @@ echo "$$ $*" >>"$FAUX_DIR/pids"
 env >"$FAUX_DIR/env"
 readlink /proc/$$/fd/0 >"$FAUX_DIR/entree"
 [ -e /proc/$$/fd/9 ] && echo oui >"$FAUX_DIR/fd9"
+# L'âge du pointeur quand le serveur part, comme le vrai le lit à son démarrage.
+if [ -f "$FAUX_POINTEUR" ]; then
+    echo $(($(date +%s) - $(stat -c %Y "$FAUX_POINTEUR"))) >>"$FAUX_DIR/ages"
+fi
 if [ "$scenario" = panne ]; then
     echo "[12:00:00] Error: panne simulee"
     exit 3
@@ -131,7 +138,7 @@ echo '{"projects":{}}' >"$T/sans-confiance.json"
 # Lance un superviseur sans rien de la session d'où part le test.
 superviser() {
     env -i PATH="$PATH" HOME="$HOME_TEST" CLAUDE_CONFIG_DIR="$CONFIG" \
-        XDG_CONFIG_HOME="$T/xdg" FAUX_DIR="$T" CLAUDECODE=1 CLAUDE_CODE_ENTRYPOINT=test \
+        XDG_CONFIG_HOME="$T/xdg" FAUX_DIR="$T" FAUX_POINTEUR="$POINTEUR" CLAUDECODE=1 CLAUDE_CODE_ENTRYPOINT=test \
         RC_CLAUDE="$FAUX" RC_PERIODE=1 RC_DUREE_STABLE=2 RC_TAILLE_MAX=20000 \
         RC_EVENEMENTS_MEMOIRE="$OOM" RC_PREFIXE_CONNEXION="$T/connexion-" "$@" >>"$T/sortie" 2>&1 &
     dernier=$!
@@ -174,6 +181,7 @@ verifier "CLAUDECODE retire" env_absent "CLAUDECODE="
 verifier "CLAUDE_CODE_* retire" env_absent "CLAUDE_CODE_"
 verifier "reglage git : sshCommand" grep -q 'agent-ssh.sh ssh' "$T/xdg/git/config"
 verifier "reglage git : gpg" grep -q 'program = .*agent-ssh.sh' "$T/xdg/git/config"
+verifier "sans pointeur, il n'en cree pas" test ! -e "$POINTEUR"
 
 echo "== le filtre du journal"
 attendre "la fin de l'affichage est arrivee" au_journal "une ligne inconnue"
@@ -327,6 +335,31 @@ attendre "il prend la suite quand l'autre s'arrete" appels_au_moins 1
 verifier "la sortie du conteneur a le journal du superviseur (docker logs)" grep -q "superviseur lance" "$T/sortie"
 kill -TERM "$s"
 attendre "arret par la commande de Docker : le superviseur sort" mort "$s"
+
+echo "== l'environnement, apres un arret brutal"
+# Le pointeur comme l'écrit le vrai serveur, resté à sa dernière heure : la veille au
+# soir, la machine s'est arrêtée sans que le superviseur reçoive SIGTERM.
+: >"$T/pids"
+: >"$T/ages"
+mkdir -p "$(dirname "$POINTEUR")"
+echo '{"sessionId":"","environmentId":"env_01VIEUX","source":"standalone","pid":27,"procStart":"40005"}' >"$POINTEUR"
+cp "$POINTEUR" "$T/pointeur-avant"
+touch -d '-13 hours -30 minutes' "$POINTEUR"
+superviser bash "$SCRIPT" "$DEPOT"
+s=$dernier
+# L'âge vu par le n-ième serveur lancé : 2 s au plus (l'horloge murale peut aussi reculer).
+age_au_lancement() {
+    [ "$(lignes "$T/ages")" -ge "$1" ] && [ "$(sed -n "${1}p" "$T/ages")" -le 2 ]
+}
+attendre "le serveur le trouve remis a l'heure" age_au_lancement 1
+verifier "son contenu n'a pas change" cmp -s "$POINTEUR" "$T/pointeur-avant"
+verifier "le journal le dit, avec l'environnement" au_journal "environnement env_01VIEUX : pointeur vieux de 13 h"
+touch -d '-1 hour' "$POINTEUR"
+kill -TERM "$(pid_faux)"
+attendre "un pointeur d'une heure est aussi remis a l'heure" age_au_lancement 2
+verifier "sans le dire au journal" compte_au_journal "pointeur vieux de" 1
+kill -TERM "$s"
+attendre "le superviseur sort" mort "$s"
 
 if [ "$echecs" -eq 0 ]; then
     echo "tout est bon"

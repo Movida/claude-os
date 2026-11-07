@@ -68,6 +68,12 @@ TAILLE_MAX="${RC_TAILLE_MAX:-$((10 * 1024 * 1024))}"
 # rythme du balayage : celui des essais de reconnexion de VS Code, 30 s.
 PREFIXE_CONNEXION="${RC_PREFIXE_CONNEXION:-/tmp/vscode-remote-containers-server-}"
 PERIODE_BALAYAGE=$((PERIODE * 6))
+# Le pointeur de l'environnement (voir garder_environnement). Claude Code range les
+# fichiers d'un dossier sous projects/, à un nom où tout ce qui n'est ni lettre ni
+# chiffre devient un tiret : /workspaces/claude-os y est -workspaces-claude-os.
+POINTEUR="$CONFIG/projects/${DOSSIER//[^a-zA-Z0-9]/-}/bridge-pointer.json"
+# Au-delà de cet âge, le serveur jette le pointeur sans le lire (4 heures).
+AGE_MAX_POINTEUR=$((4 * 3600))
 
 arret=
 serveur=
@@ -297,6 +303,47 @@ balayer_connexions() {
     done < <(ps -eo pid=,ppid=,pgid=,args= --sort=-start_time,-pid 2>/dev/null)
 }
 
+# Le serveur note dans bridge-pointer.json l'environnement auquel il s'est inscrit, et
+# le redemande au démarrage suivant : les fils de claude.ai retrouvent ainsi leur
+# machine, et les messages qui l'attendaient lui arrivent. Mais il jette ce fichier,
+# sans le lire, quand sa date a plus de 4 heures (BRIDGE_POINTER_TTL_MS, binaire
+# 2.1.318). En marche, il le réécrit toutes les heures, et à l'arrêt propre ; un arrêt
+# brutal (Windows éteint sans arrêter le conteneur, une coupure de courant) le laisse à
+# sa dernière heure. Redémarré le lendemain matin, le serveur inscrivait donc un nouvel
+# environnement, et l'ancien restait hors ligne pour de bon, avec tous ses fils : le 6
+# novembre à 06:45, puis le 7 à 09:36, après un arrêt vers 20 h la veille sans une
+# ligne au journal (ni « Shutting down », ni « superviseur arrete »).
+#
+# On remet donc sa date à l'heure avant chaque lancement, sans toucher à son contenu.
+# C'est sans risque : le serveur ne fait que redemander l'ancien environnement. Si le
+# service le refuse, il le dit (« Could not reuse the previous environment »), en
+# inscrit un nouveau et efface le pointeur, comme avant. Les listes de sessions à
+# réveiller ont dans le fichier leurs propres dates (7 jours, 15 minutes), que `touch`
+# ne change pas : on ne ressuscite pas de vieilles sessions.
+#
+# Pourquoi pas les autres façons de faire :
+# - arrêter le conteneur avant d'éteindre Windows : utile, car le serveur note
+#   alors ses sessions, mais rien ne couvre une coupure, un plantage ou une mise à jour
+#   qui redémarre le PC d'elle-même ;
+# - réécrire le contenu (les dates des listes, l'environnement) : ce serait écrire le
+#   format interne de Claude Code, quand la date du fichier suffit ;
+# - `claude remote-control --continue` : il reprend une seule session et ne sert plus
+#   qu'elle, alors que le serveur doit accueillir tous les fils du projet.
+#
+# Si une version future range le pointeur ailleurs (le binaire prévoit déjà un autre
+# stockage) ou abrège le nom du dossier (au-delà de 200 caractères), le fichier n'est
+# plus trouvé : rien ne change, mais le journal ne donne plus jamais la ligne ci-dessous.
+garder_environnement() {
+    local date environnement age
+    date=$(stat -c %Y -- "$POINTEUR" 2>/dev/null) || return
+    touch -c -- "$POINTEUR"
+    age=$((EPOCHSECONDS - date))
+    if [ "$age" -gt "$AGE_MAX_POINTEUR" ]; then
+        environnement=$(jq -r '.environmentId // "?"' "$POINTEUR" 2>/dev/null)
+        noter "environnement ${environnement:-?} : pointeur vieux de $((age / 3600)) h, remis a l'heure pour que le serveur le reprenne"
+    fi
+}
+
 # Le filtre a son propre descripteur, ouvert avant le serveur et fermé ensuite :
 # `$!` donne ainsi le pid du serveur, ce que `claude | filtre &` ne donnerait pas.
 lancer_serveur() {
@@ -379,6 +426,7 @@ while [ -z "$arret" ]; do
     [ -n "$arret" ] && break
 
     debut=$EPOCHSECONDS
+    garder_environnement
     lancer_serveur
     if [ -z "$serveur" ]; then
         noter "lancement impossible depuis $DOSSIER"
