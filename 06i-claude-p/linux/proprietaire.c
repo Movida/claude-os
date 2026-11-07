@@ -54,11 +54,16 @@ static void verifier(int ok, const char *quoi)
 /* Ce que le gestionnaire a vu, par signal. */
 static volatile int vus[65];
 static volatile int vu_code, vu_bande, vu_fd, vu_fil;
+/* Les descripteurs des signaux 34 (F_SETSIG), dans l'ordre : ils se
+ * mettent en file, un par événement. */
+static volatile int fds_34[8], nombre_34;
 
 static void gestionnaire(int sig, siginfo_t *i, void *c)
 {
     (void)c;
     vus[sig]++;
+    if (sig == 34 && nombre_34 < 8)
+        fds_34[nombre_34++] = i->si_fd;
     vu_code = i->si_code;
     vu_bande = i->si_band;
     vu_fd = i->si_fd;
@@ -349,14 +354,32 @@ static void urgent_tcp(void)
     verifier(compte(SIGIO) >= 1, "TCP, la place revient : SIGIO");
     close(c);
     close(f);
-    /* Une connexion à accepter, et l'établissement. */
+    /* Le FIN de c chez f : deux POLL_IN (mesuré sous Linux, par F_SETSIG),
+     * en un seul SIGIO s'ils arrivent ensemble, ou deux. Absorbés ici : ils
+     * ne doivent pas compter dans la mesure suivante (6i : ils y comptaient,
+     * et le test ne passait que si les signaux de la connexion se fondaient
+     * aussi en un). */
+    compte(SIGIO);
+    /* Une connexion à accepter, et l'établissement : un signal de chacun.
+     * Par un signal temps réel (F_SETSIG 34), qui se met en file avec son
+     * descripteur : deux SIGIO ordinaires arrivés ensemble n'en font qu'un. */
     fcntl(l, F_SETOWN, pid);
+    fcntl(l, F_SETSIG, 34);
     fcntl(l, F_SETFL, fcntl(l, F_GETFL) | O_ASYNC);
     int s = socket(AF_INET, SOCK_STREAM, 0);
     fcntl(s, F_SETOWN, pid);
+    fcntl(s, F_SETSIG, 34);
     fcntl(s, F_SETFL, O_ASYNC | O_NONBLOCK);
+    nombre_34 = 0;
     connect(s, (void *)&x, sizeof x);
-    verifier(compte(SIGIO) == 2, "TCP, un connect : SIGIO a l'ecoute, et au client etabli");
+    int n34 = compte(34);
+    int l_vue = 0, s_vue = 0;
+    for (int k = 0; k < nombre_34; k++) {
+        l_vue += fds_34[k] == l;
+        s_vue += fds_34[k] == s;
+    }
+    verifier(n34 == 2 && l_vue == 1 && s_vue == 1 && compte(SIGIO) == 0, "TCP, un connect : un signal a l'ecoute, un au client etabli");
+    fcntl(l, F_SETSIG, 0);
     int a = accept(l, NULL, NULL);
     verifier(brut(a, F_GETOWN, 0) == 0 && !(fcntl(a, F_GETFL) & O_ASYNC), "TCP, une fille : ni proprietaire, ni O_ASYNC");
     /* Un RST : POLL_ERR. */
