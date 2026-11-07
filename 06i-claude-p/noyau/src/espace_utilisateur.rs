@@ -168,8 +168,11 @@ pub fn adresse_permise(adresse: u64) -> bool {
 
 /// Un cadre neuf, mis à zéro, pour une page d'un programme ou une table de
 /// son espace : pris au-dessus de la réserve du noyau
-/// (pages::allouer_pour_programme).
-fn cadre_neuf() -> Option<u64> {
+/// (pages::allouer_pour_programme). Une faute le prépare AVANT de prendre
+/// le verrou des tables (memoire.rs) : mettre 4 Kio à zéro n'a pas à se
+/// faire interruptions coupées (le `do_anonymous_page` de Linux alloue de
+/// même avant `pte_offset_map_lock`) ; s'il ne sert pas, `rendre_cadre`.
+pub fn cadre_neuf() -> Option<u64> {
     let cadre = pages::allouer_pour_programme()?;
     // SAFETY: le cadre vient d'être alloué, personne d'autre ne le voit.
     // Il contenait ce qu'y avait laissé son précédent occupant (le noyau,
@@ -178,8 +181,20 @@ fn cadre_neuf() -> Option<u64> {
     Some(cadre)
 }
 
+/// Rend un cadre préparé par `cadre_neuf` qui n'a pas servi.
+pub fn rendre_cadre(cadre: u64) {
+    pages::lacher(cadre);
+}
+
 /// L'espace d'adressage d'un programme. Le détruire (le laisser sortir de
 /// portée) rend toutes ses pages et toutes ses tables.
+///
+/// Depuis 6i, il est sous son propre verrou court dans la mémoire du
+/// processus (`Memoire::espace`, le `page_table_lock` de Linux) : une
+/// faute de page ne fait que LIRE la carte des zones, et ne prend que lui
+/// pour poser ses entrées. Qui change la mémoire (munmap, mprotect...) y
+/// accède sans ce verrou (`Verrou::get_mut`) : il a `&mut Memoire`,
+/// personne d'autre ne peut l'avoir.
 pub struct EspaceUtilisateur {
     /// L'adresse physique de sa PML4.
     pml4: u64,
@@ -295,11 +310,12 @@ impl EspaceUtilisateur {
     /// La page d'un fichier qui n'est pas encore là est posée avant, par
     /// `poser_fichier` (memoire.rs) : `servir` ne sait rien des fichiers.
     ///
-    /// Le cadre neuf est mis à zéro ici, interruptions coupées (on tient le
-    /// verrou du processus) : 4 Kio, une microseconde. (Linux rouvre les
-    /// interruptions pendant une faute, parce qu'elle peut attendre un
-    /// disque ; ce sera le cas avec le disque de 6m.)
-    pub fn servir(&mut self, page: u64, droits: Droits, ecriture: bool) -> Result<(), Erreur> {
+    /// Une écriture qui demande une page neuve prend `neuve`, un cadre mis à
+    /// zéro que l'appelant a préparé hors du verrou des tables (`cadre_neuf`)
+    /// et qu'on laisse à None ; sinon il reste là, et l'appelant le rend.
+    /// Sans lui, l'écriture en prend un ici (le chargeur, qui tient la
+    /// mémoire seul).
+    pub fn servir(&mut self, page: u64, droits: Droits, ecriture: bool, neuve: &mut Option<u64>) -> Result<(), Erreur> {
         if !adresse_permise(page) {
             return Err(Erreur::AdresseInterdite);
         }
@@ -309,7 +325,14 @@ impl EspaceUtilisateur {
         let present = occupee(*entree);
         let a_copier = present && cadre != zeros && partage(cadre);
         if !present || (ecriture && (cadre == zeros || a_copier)) {
-            let neuve = if ecriture { self.prendre_cadre()? } else { zeros };
+            let neuve = if !ecriture {
+                zeros
+            } else if let Some(c) = neuve.take() {
+                self.compter_cadre();
+                c
+            } else {
+                self.prendre_cadre()?
+            };
             if ecriture && a_copier {
                 // SAFETY: `neuve` vient d'être allouée, à nous ; `cadre` est
                 // tenu par cette entrée (il ne sera lâché qu'après) : deux
@@ -360,9 +383,12 @@ impl EspaceUtilisateur {
     }
 
     /// Pose à `page` (où il n'y a rien) la page `cadre` d'un fichier, avec
-    /// les droits de la zone, sans jamais celui d'écrire (entree_finale) :
-    /// le cadre est pris une fois de plus, par cette entrée. Le processeur
-    /// ne garde pas en cache les entrées absentes : rien à invalider.
+    /// les droits de la zone, sans jamais celui d'écrire (entree_finale).
+    /// L'entrée garde la référence que l'appelant a prise sur le cadre
+    /// (vfs::page_projetee, sous le verrou des fichiers : sans elle, le
+    /// fichier raccourci entre les deux l'aurait rendu) ; en cas d'échec,
+    /// elle reste à l'appelant. Le processeur ne garde pas en cache les
+    /// entrées absentes : rien à invalider.
     pub fn poser_fichier(&mut self, page: u64, cadre: u64, droits: Droits) -> Result<(), Erreur> {
         if !adresse_permise(page) {
             return Err(Erreur::AdresseInterdite);
@@ -371,7 +397,6 @@ impl EspaceUtilisateur {
         if occupee(*entree) {
             return Err(Erreur::DejaProjetee);
         }
-        pages::prendre(cadre);
         *entree = entree_finale(cadre, droits);
         self.pages_fichier += 1;
         self.suivre_pic();
@@ -409,9 +434,14 @@ impl EspaceUtilisateur {
     /// Un cadre neuf pour une page de l'espace, compté.
     fn prendre_cadre(&mut self) -> Result<u64, Erreur> {
         let cadre = cadre_neuf().ok_or(Erreur::PlusDeMemoire)?;
+        self.compter_cadre();
+        Ok(cadre)
+    }
+
+    /// Une page à lui de plus.
+    fn compter_cadre(&mut self) {
         self.pages += 1;
         self.suivre_pic();
-        Ok(cadre)
     }
 
     /// Cet espace est-il celui du processeur (CR3) ? Sinon, il n'y a rien
@@ -603,9 +633,11 @@ fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl F
         let suivante = (adresse / couverture + 1) * couverture;
         // SAFETY: `table` est une table de cet espace (la PML4, ou une
         // table que désigne une entrée présente), que nous possédons ;
-        // l'espace n'est changé que sous le verrou de son processus, que
-        // tient l'appelant (ou par sa dernière tâche, qui l'a retiré de la
-        // table pour le rendre) : personne ne la change en même temps.
+        // l'espace n'est changé que sous son verrou (`Memoire::espace`),
+        // ou par qui a `&mut Memoire` (sous le verrou du processus, ou sa
+        // dernière tâche, qui l'a retirée du processus pour la rendre) :
+        // tous passent par &mut EspaceUtilisateur, personne ne la change en
+        // même temps.
         let entree = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, niveau)] };
         if niveau == 0 {
             if occupee(*entree) {

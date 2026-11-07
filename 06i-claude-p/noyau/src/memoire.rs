@@ -2,6 +2,14 @@
 //! toucher, ../zones), ses tables de pages (ce qui est en place,
 //! espace_utilisateur.rs) et son tas. C'est la mm_struct de Linux.
 //!
+//! Depuis 6i, une faute de page ne fait que LIRE la mémoire (`servir`,
+//! `&self`) : les tables de pages, qu'elle change, ont leur propre verrou
+//! court (`espace`, le `page_table_lock` de Linux) ; mmap, munmap,
+//! mprotect, brk, madvise la CHANGENT (`&mut self`), et touchent les tables
+//! sans ce verrou (`Verrou::get_mut`) : ils l'ont seuls. C'est ce qui
+//! permettra de mettre la mémoire sous un verrou qui dort, en lecture et
+//! en écriture (le `mmap_lock`, processus.rs).
+//!
 //! La carte fait foi : une page n'est projetée que dans une zone, avec les
 //! droits de sa zone. Toute opération (brk, mprotect) change d'abord la
 //! carte, qui peut refuser (trop de zones, plus de mémoire) sans rien avoir
@@ -43,6 +51,7 @@ use core::fmt;
 
 use crate::descripteurs::Fichier;
 use crate::espace_utilisateur::{self, Erreur, EspaceUtilisateur};
+use crate::verrou::Verrou;
 use crate::vfs;
 use crate::programmes::NomCourt;
 use zones::{Droits, Nature, Sens, Zone, Zones};
@@ -208,7 +217,14 @@ impl fmt::Display for ZoneDuCode {
 }
 
 pub struct Memoire {
-    pub espace: EspaceUtilisateur,
+    /// Les tables de pages, sous leur verrou court (le `page_table_lock`
+    /// de Linux) : une faute, qui ne fait que lire la mémoire, le prend
+    /// pour poser son entrée ; qui la change y accède sans lui
+    /// (`get_mut`). UNIPROCESSEUR : un verrou pour tout l'espace ;
+    /// Linux en a un par table de dernier niveau (les « split PTE
+    /// ptlocks »), pour que des fautes sur plusieurs processeurs ne
+    /// s'attendent pas : à voir en 6j, d'après les statistiques des verrous.
+    pub espace: Verrou<EspaceUtilisateur>,
     pub zones: Zones,
     /// Le début du tas : la page qui suit le dernier segment (le .bss).
     pub debut_tas: u64,
@@ -237,23 +253,35 @@ impl Memoire {
         // qu'avec le dernier d'entre eux, et la vérification « memoire
         // rendue » de chaque programme se tromperait.
         let zones = Zones::avec_capacite(PAGE as usize / size_of::<Zone>())?;
-        Ok(Memoire { espace: EspaceUtilisateur::creer()?, zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0) })
+        Ok(Memoire { espace: Verrou::new(EspaceUtilisateur::creer()?), zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0) })
     }
 
-    /// Sert une faute de page à `adresse`, pour l'accès `acces` : la page
-    /// est mise en place si une zone la permet (voir
-    /// EspaceUtilisateur::servir), et l'instruction peut reprendre. Sous la
-    /// pile, à moins de PILE_MAX de son sommet, la pile s'étend d'abord
-    /// jusqu'à la page (le expand_stack de Linux).
+    /// Les tables de pages, sans leur verrou : qui a `&mut Memoire` (qui la
+    /// change, ou le chargeur qui la construit) les a seul.
+    pub fn tables(&mut self) -> &mut EspaceUtilisateur {
+        self.espace.get_mut()
+    }
+
+    /// Sert une faute de page à `adresse`, pour l'accès `acces`, en ne
+    /// faisant que lire la mémoire : la page est mise en place si une zone la permet
+    /// (voir EspaceUtilisateur::servir), et l'instruction peut reprendre.
+    /// Hors de toute zone : `SansZone`, sans étendre la pile (qui change la
+    /// carte : `etendre_pile`, d'abord, pour une faute du programme ou du
+    /// noyau ; jamais pour le futex ni MAP_POPULATE, comme le
+    /// `fixup_user_fault` de Linux).
     ///
     /// Le contrôle des droits : une écriture demande le droit d'écrire, une
     /// exécution celui d'exécuter, une lecture un droit quelconque (x86 ne
     /// sait pas interdire la lecture d'une page présente).
-    pub fn servir(&mut self, adresse: u64, acces: Acces) -> Result<(), Echec> {
+    ///
+    /// Ce qui peut attendre ou prendre du temps se fait AVANT de prendre le
+    /// verrou des tables (comme Linux) : la page neuve d'une écriture, mise
+    /// à zéro ; la page du fichier, prise au tmpfs et tenue. Sous le verrou,
+    /// seulement poser l'entrée, si elle est encore vide : un autre fil a pu
+    /// fauter à la même page entre-temps, et sa page reste (la nôtre est
+    /// rendue).
+    pub fn servir(&self, adresse: u64, acces: Acces) -> Result<(), Echec> {
         let page = adresse & !(PAGE - 1);
-        if self.zones.trouver(page).is_none() && !self.zones.etendre_pile(page, PILE_MAX, ECART_GARDE) {
-            return Err(Echec::SansZone);
-        }
         let zone = *self.zones.trouver(page).ok_or(Echec::SansZone)?;
         let permis = match acces {
             Acces::Lecture => zone.droits.accessible(),
@@ -266,23 +294,68 @@ impl Memoire {
         if self.poser_page_du_fichier(page, &zone)? && acces != Acces::Ecriture {
             return Ok(());
         }
-        self.espace.servir(page, zone.droits, acces == Acces::Ecriture).map_err(|_| Echec::PlusDeMemoire)
+        let mut neuve = if acces == Acces::Ecriture {
+            Some(espace_utilisateur::cadre_neuf().ok_or(Echec::PlusDeMemoire)?)
+        } else {
+            None
+        };
+        let resultat = self.espace.verrouiller().servir(page, zone.droits, acces == Acces::Ecriture, &mut neuve);
+        if let Some(c) = neuve {
+            espace_utilisateur::rendre_cadre(c);
+        }
+        resultat.map_err(|_| Echec::PlusDeMemoire)
+    }
+
+    /// Étend la pile jusqu'à la page de `adresse` (le `expand_stack` de
+    /// Linux), la carte changée : vrai si la page est maintenant dans une
+    /// zone (celle de la pile, ou une zone qui y était déjà). Sous la pile, à moins de PILE_MAX de son
+    /// sommet, et pas à moins de l'écart de garde d'une autre zone.
+    pub fn etendre_pile(&mut self, adresse: u64) -> bool {
+        let page = adresse & !(PAGE - 1);
+        self.zones.trouver(page).is_some() || self.zones.etendre_pile(page, PILE_MAX, ECART_GARDE)
     }
 
     /// Dans une zone de fichier dont la page n'est pas encore là : la page
-    /// du fichier, en lecture seule (entree_finale), tenue une fois de plus.
-    /// Rend vrai si elle a été posée. Pour une écriture, la copie à
-    /// l'écriture la remplacera ensuite par une page à lui (le
+    /// du fichier, en lecture seule (entree_finale), tenue par l'entrée.
+    /// Rend vrai si elle a été posée ; faux si l'entrée était déjà occupée
+    /// (avant, ou par un autre fil entre-temps : `servir` refait alors
+    /// l'entrée, voir EspaceUtilisateur::servir). Pour une écriture, la
+    /// copie à l'écriture la remplacera ensuite par une page à lui (le
     /// `do_cow_fault` de Linux, en deux temps).
-    fn poser_page_du_fichier(&mut self, page: u64, zone: &Zone) -> Result<bool, Echec> {
+    ///
+    /// La page vient tenue du tmpfs (vfs::page_projetee) ; une fois
+    /// l'entrée posée, sous le verrou des tables, on revérifie qu'elle est
+    /// toujours celle du fichier : sinon le fichier a été raccourci pendant
+    /// la faute, l'entrée est retirée et tout recommence (la faute rendra
+    /// alors `HorsDuFichier`, SIGBUS, comme le veut la troncature). Le
+    /// verrou des fichiers est pris SOUS celui des tables : jamais l'inverse
+    /// (une troncature lit les zones, puis prend celui des tables pour
+    /// retirer les pages, sans tenir celui des fichiers).
+    fn poser_page_du_fichier(&self, page: u64, zone: &Zone) -> Result<bool, Echec> {
         let Some(projection) = zone.fichier else { return Ok(false) };
-        if self.espace.occupee(page) {
-            return Ok(false);
-        }
         let index = zone.page_de(page).unwrap_or(0);
-        let cadre = vfs::page_projetee(Fichier::de(projection.fichier), index)?;
-        self.espace.poser_fichier(page, cadre, zone.droits).map_err(|_| Echec::PlusDeMemoire)?;
-        Ok(true)
+        let fichier = Fichier::de(projection.fichier);
+        loop {
+            if self.espace.verrouiller().occupee(page) {
+                return Ok(false);
+            }
+            let cadre = vfs::page_projetee(fichier, index)?;
+            let mut espace = self.espace.verrouiller();
+            match espace.poser_fichier(page, cadre, zone.droits) {
+                Ok(()) if vfs::page_encore_projetable(fichier, index, cadre) => return Ok(true),
+                // Raccourci entre-temps : l'entrée est retirée (elle tenait
+                // le cadre), et on recommence.
+                Ok(()) => espace.retirer_plage(page, page + PAGE, false),
+                Err(Erreur::DejaProjetee) => {
+                    crate::pages::lacher(cadre);
+                    return Ok(false);
+                }
+                Err(_) => {
+                    crate::pages::lacher(cadre);
+                    return Err(Echec::PlusDeMemoire);
+                }
+            }
+        }
     }
 
     /// Écrit `octets` à l'adresse `adresse` du programme, par la projection
@@ -302,10 +375,10 @@ impl Memoire {
                 Echec::PlusDeMemoire => Erreur::PlusDeMemoire,
                 _ => Erreur::NonProjetee,
             })?;
-            self.espace.servir(page, zone.droits, true)?;
+            self.tables().servir(page, zone.droits, true, &mut None)?;
             page += PAGE;
         }
-        self.espace.ecrire(adresse, octets)
+        self.tables().ecrire(adresse, octets)
     }
 
     /// Retire [debut, fin[ (alignés) de la carte, puis des tables, dont
@@ -314,7 +387,7 @@ impl Memoire {
     /// plus de place (ENOMEM).
     pub fn retirer(&mut self, debut: u64, fin: u64) -> Result<(), Erreur> {
         self.zones.retirer(debut, fin, |_| (), &mut references)?;
-        self.espace.retirer_plage(debut, fin, true);
+        self.tables().retirer_plage(debut, fin, true);
         Ok(())
     }
 
@@ -392,7 +465,7 @@ impl Memoire {
             return Err(Erreur::PlusDeMemoire);
         }
         self.zones.changer(debut, fin, |z| z.droits = droits, &mut references)?;
-        self.espace.proteger_plage(debut, fin, droits);
+        self.tables().proteger_plage(debut, fin, droits);
         Ok(())
     }
 
@@ -401,8 +474,9 @@ impl Memoire {
     /// projeté (les segments du programme compris). Les tables restent, la
     /// zone aussi.
     pub fn oublier(&mut self, debut: u64, fin: u64) {
+        let espace = self.espace.get_mut();
         for z in self.zones.morceaux(debut, fin) {
-            self.espace.retirer_plage(z.debut, z.fin, false);
+            espace.retirer_plage(z.debut, z.fin, false);
         }
     }
 

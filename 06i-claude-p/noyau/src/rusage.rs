@@ -216,7 +216,7 @@ pub fn getrusage(qui: u64, tampon: u64) -> i64 {
         let t = tache::courante();
         let entree = t.processus().expect("getrusage sans processus").clone();
         let (cumul, maxrss) = processus::avec(|p| {
-            let maxrss = p.memoire.espace.pic() as u64 * 4;
+            let maxrss = p.memoire.tables().pic() as u64 * 4;
             if qui == RUSAGE_THREAD {
                 return (t.usage().lire(), maxrss);
             }

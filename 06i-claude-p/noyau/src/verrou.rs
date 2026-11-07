@@ -101,6 +101,15 @@ impl<T> Verrou<T> {
         }
     }
 
+    /// La donnée, sans prendre le verrou : `&mut self` prouve que personne
+    /// d'autre ne peut l'avoir (le `get_mut` des verrous de la bibliothèque
+    /// standard). Les interruptions restent comme elles sont : celui qui
+    /// tient la mémoire d'un processus en écriture touche ainsi ses tables
+    /// de pages sans les couper (memoire.rs).
+    pub fn get_mut(&mut self) -> &mut T {
+        self.donnee.get_mut()
+    }
+
     /// Libère le verrou de force, même si quelqu'un le tient.
     ///
     /// # Safety

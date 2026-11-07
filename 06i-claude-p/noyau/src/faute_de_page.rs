@@ -63,13 +63,20 @@ pub fn gerer(cadre: &mut Cadre) {
     }
 }
 
+/// Sert une faute à `adresse` : la pile d'abord étendue jusqu'à elle s'il
+/// le faut (la carte change), puis la page mise en place.
+fn servir(m: &mut crate::memoire::Memoire, adresse: u64, acces: Acces) -> Result<(), Echec> {
+    m.etendre_pile(adresse);
+    m.servir(adresse, acces)
+}
+
 /// Une faute du programme : servie, ou le programme sera arrêté au retour
 /// vers l'anneau 3 (tache.rs), qui suit aussitôt : il ne reprend pas
 /// l'instruction fautive.
 fn faute_du_programme(cadre: &Cadre, cr2: u64, acces: Acces) {
     // Une adresse de la moitié haute (le noyau), ou la dernière page de la
     // moitié basse : jamais une zone.
-    let resultat = if cr2 < ADRESSE_MAX { processus::avec(|p| p.memoire.servir(cr2, acces)) } else { Err(Echec::SansZone) };
+    let resultat = if cr2 < ADRESSE_MAX { processus::avec(|p| servir(&mut p.memoire, cr2, acces)) } else { Err(Echec::SansZone) };
     match resultat {
         Ok(()) => tache::courante().usage().compter_faute(),
         Err(Echec::PlusDeMemoire) => tache::tuer_au_retour(),
@@ -113,7 +120,7 @@ fn faute_du_noyau(cadre: &mut Cadre, cr2: u64, acces: Acces) {
         && permise
         && cr2 < ADRESSE_MAX
         && acces != Acces::Execution
-        && match processus::essayer_avec(|p| p.memoire.servir(cr2, acces)) {
+        && match processus::essayer_avec(|p| servir(&mut p.memoire, cr2, acces)) {
             Some(Ok(())) => true,
             Some(Err(Echec::PlusDeMemoire)) => {
                 tache::tuer_au_retour();

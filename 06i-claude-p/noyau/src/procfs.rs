@@ -867,7 +867,10 @@ fn statm(pid: u32) -> Result<Vec<u8>, Erreur> {
             .filter(|z| z.nature == Nature::Pile || z.droits.ecriture)
             .map(|z| z.taille() / 4096)
             .sum();
-        let (pages, fichier) = (m.espace.pages() as u64, m.espace.pages_fichier() as u64);
+        let (pages, fichier) = {
+            let e = m.espace.verrouiller();
+            (e.pages() as u64, e.pages_fichier() as u64)
+        };
         (m.taille_virtuelle() / 4096, pages + fichier, fichier, code, donnees)
     }).unwrap_or((0, 0, 0, 0, 0));
     let mut t = Ecrit(Vec::new());

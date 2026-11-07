@@ -2663,7 +2663,7 @@ fn retirer_projections(n: Numero, premiere: u64) {
                 continue;
             }
             let debut = z.debut + premiere.saturating_sub(projection.page) * PAGE;
-            m.espace.retirer_plage(debut, z.fin, false);
+            m.tables().retirer_plage(debut, z.fin, false);
         }
     });
 }

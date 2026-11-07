@@ -338,17 +338,41 @@ pub fn copier_depuis_programme(cadre: u64, decalage: usize, n: usize, source: u6
 /// près) : `HorsDuFichier` (SIGBUS) ; le tmpfs plein : `PlusDePlace`
 /// (SIGBUS aussi, comme Linux) ; plus de mémoire : `PlusDeMemoire` (le
 /// tueur OOM).
+///
+/// Le cadre est pris une fois de plus (pages::prendre) pour l'appelant,
+/// qui le passe à l'entrée qui le projettera, ou le lâche. Sans cette
+/// référence, une troncature du fichier entre ce moment et la pose de
+/// l'entrée (la faute ne tient plus que la mémoire en lecture, et peut être
+/// préemptée, depuis 6i) rendrait le cadre à l'allocateur, et la faute
+/// projetterait une page qui est déjà à quelqu'un d'autre. Linux rend de
+/// même la page tenue (`filemap_fault`, `folio_get`).
 pub fn page_projetee(f: Fichier, index: u64) -> Result<u64, Echec> {
     avec_systeme(|s, cadres| {
         let n = s.ouverts.fichier(f).inode();
         if index >= s.fs.attributs(n).taille.div_ceil(PAGE) {
             return Err(Echec::HorsDuFichier);
         }
-        s.fs.page_pour_ecrire(n, index, cadres).map_err(|e| match e {
+        let cadre = s.fs.page_pour_ecrire(n, index, cadres).map_err(|e| match e {
             Erreur::ENOSPC => Echec::PlusDePlace,
             Erreur::ENOMEM => Echec::PlusDeMemoire,
             _ => Echec::HorsDuFichier,
-        })
+        })?;
+        crate::pages::prendre(cadre);
+        Ok(cadre)
+    })
+}
+
+/// La page numéro `index` du fichier ouvert `f` est-elle toujours `cadre`
+/// (le fichier n'a pas été raccourci entre-temps) ? Après qu'une faute a
+/// posé l'entrée, sous le verrou des tables : si non, elle la retire et
+/// recommence, et c'est la troncature qui l'emporte (SIGBUS au-delà de la
+/// fin), comme le contrôle de Linux sous le verrou de la page (`folio->mapping`
+/// et `i_size` revus dans `filemap_fault`). Ordre des verrous : celui des
+/// tables, puis celui des fichiers.
+pub fn page_encore_projetable(f: Fichier, index: u64, cadre: u64) -> bool {
+    avec_systeme(|s, _| {
+        let n = s.ouverts.fichier(f).inode();
+        index < s.fs.attributs(n).taille.div_ceil(PAGE) && s.fs.page(n, index) == Some(cadre)
     })
 }
 

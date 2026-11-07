@@ -1187,8 +1187,9 @@ pub fn forcer(signal: Signal, raison: impl fmt::Display) {
 /// une tâche abandonnée ne serait jamais rendu.
 fn arreter_plus_de_memoire() -> ! {
     let (virtuelle, en_place, fichiers, tables) = processus::avec(|p| {
-        let e = &p.memoire.espace;
-        (p.memoire.taille_virtuelle(), e.pages() as u64 * 4096, e.pages_fichier() as u64 * 4096, e.tables() as u64 * 4096)
+        let virtuelle = p.memoire.taille_virtuelle();
+        let e = p.memoire.tables();
+        (virtuelle, e.pages() as u64 * 4096, e.pages_fichier() as u64 * 4096, e.tables() as u64 * 4096)
     });
     // Le message de Linux : « Out of memory: Killed process 1234 (a.out)
     // total-vm:...kB, anon-rss:...kB, file-rss:...kB, ... pgtables:...kB ».

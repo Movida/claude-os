@@ -687,7 +687,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     // instruction du programme (elle n'est en place qu'à la faute).
     let mut code = [0u8; 16];
     let mut code_ok = programme.memoire.servir(programme.entree, Acces::Lecture).is_ok()
-        && programme.memoire.espace.lire(programme.entree, &mut code[..longueur]).is_ok()
+        && programme.memoire.tables().lire(programme.entree, &mut code[..longueur]).is_ok()
         && code[..longueur] == attendu[..longueur];
     // Et celui de l'interpréteur, par où le programme commence : relu dans
     // l'espace, comparé à son fichier.
@@ -704,7 +704,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
             .unwrap_or(0);
         code_ok &= longueur > 0
             && programme.memoire.servir(programme.depart, Acces::Lecture).is_ok()
-            && programme.memoire.espace.lire(programme.depart, &mut code[..longueur]).is_ok()
+            && programme.memoire.tables().lire(programme.depart, &mut code[..longueur]).is_ok()
             && code[..longueur] == attendu[..longueur];
     }
     fermer_interpreteur(interpreteur.as_ref());
@@ -744,7 +744,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         fs.prendre(r);
         r
     });
-    let (pml4, depart) = (programme.memoire.espace.pml4(), programme.depart);
+    let (pml4, depart) = (programme.memoire.tables().pml4(), programme.depart);
     let pid = processus::numero_neuf();
     let entree = processus::ajouter(processus::Processus {
         pid,
