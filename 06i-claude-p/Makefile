@@ -62,10 +62,11 @@
 #                  une carte sans MSI-X laissée éteinte ; le câble
 #                  débranché puis rebranché, vu ; un réseau sans DHCP ;
 #                  et make claude-p
-#   make claude-p -> le jalon de 6f à 6h, dans une image à part :
+#   make claude-p -> le jalon de 6f à 6i, dans une image à part :
 #                  claude -p bonjour jusqu'à l'API (6h : TLS par Bun
-#                  sur notre TCP, et la réponse de l'API à une fausse clé)
-#                  (claude-p-attendu.txt)
+#                  sur notre TCP, et la réponse de l'API à une fausse clé),
+#                  puis sa réponse, venue d'une fausse API que sert QEMU
+#                  (6i : outils/serveur-http) (claude-p-attendu.txt)
 #   make tests-hote -> les tests sur la machine hôte : ceux de la
 #                  bibliothèque des formats (formats/ : archive cpio,
 #                  exécutables ELF, essayés aussi sur de vrais programmes
@@ -891,9 +892,9 @@ programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/
 	cd bonjour-tcp && cargo build --release
 	{ cat archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } | sh archive.sh $@ -
 
-# L'archive du jalon de 6f et de 6g : celle de l'étape, dont /etc/demarrage
-# ne lance que claude -p (racine/etc/demarrage-claude-p), puis la liste de
-# HOME.
+# L'archive du jalon de 6f à 6i : celle de l'étape, dont /etc/demarrage ne
+# lance que claude -p, deux fois, puis la liste de HOME et son effacement
+# (racine/etc/demarrage-claude-p).
 claude-p.cpio: programmes.cpio racine/etc/demarrage-claude-p
 	{ sed 's|racine/etc/demarrage |racine/etc/demarrage-claude-p |' archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } \
 	  | sh archive.sh $@ -
@@ -913,26 +914,29 @@ claude-p.bin: claude-p.cpio FORCE
 
 # Le temps que met claude -p dans QEMU sans accélération (28 s mesurées ici
 # en 6f ; 33 s en 6g, l'image construite comprise, avec le DNS et la
-# connexion refusée ; le double ou plus sur une machine de la CI).
+# connexion refusée ; en 6i, ses deux lancements et le groupe, 19 s ; le
+# double ou plus sur une machine de la CI).
 DUREE_CLAUDE_P = 240
 
-# claude -p bonjour, dans notre noyau : il doit aller jusqu'à l'appel de
-# l'API, trouver son adresse par le DNS, s'y connecter par notre TCP, et
-# rapporter ce que l'API répond à une fausse clé, par TLS (« Invalid API
-# key », claude-p-attendu.txt). Sa ligne de fin ne dit pas « memoire
-# rendue : ok » : Claude laisse dans HOME sa configuration (.claude.json et
-# ses copies) et la télémétrie qu'il n'a pas pu envoyer (environ 300 Kio),
-# que le tmpfs garde, à raison. Le contrôle ne sait pas les distinguer
-# d'une fuite ; `arbre` les montre, et sa propre mémoire, elle, est rendue.
+# claude -p bonjour, deux fois, dans notre noyau (racine/etc/demarrage-
+# claude-p) : il doit aller jusqu'à l'appel de l'API, trouver son adresse
+# par le DNS, s'y connecter par notre TCP, et rapporter ce que l'API répond
+# à une fausse clé, par TLS (« Invalid API key ») ; puis, contre la fausse
+# API, afficher sa réponse et finir par 0 (claude-p-attendu.txt). Les deux
+# lancements, la liste de ce qu'ils ont laissé dans HOME, puis son
+# effacement, forment un groupe, qui doit rendre toute sa mémoire.
+#
+# On attend la ligne du groupe, la dernière ; si QEMU s'arrête avant, ou au
+# bout de DUREE_CLAUDE_P, les lignes qui manquent le disent.
 claude-p: claude-p.bin
 	rm -f claude-p.log; \
 	timeout $(DUREE_CLAUDE_P) $(QEMU_TEST) -drive format=raw,file=claude-p.bin,if=$(QEMU_DISQUE) $(QEMU_OPTIONS) \
 	  -serial file:claude-p.log & q=$$!; \
 	for i in $$(seq $$(( $(DUREE_CLAUDE_P) * 10 ))); do \
-	  grep -qF -- "arbre : termine" claude-p.log 2>/dev/null && break; kill -0 $$q 2>/dev/null || break; sleep 0.1; \
+	  grep -qF -- "[noyau] Groupe des lignes" claude-p.log 2>/dev/null && break; kill -0 $$q 2>/dev/null || break; sleep 0.1; \
 	done; \
 	kill $$q 2>/dev/null; wait $$q 2>/dev/null; \
-	grep -E "API Error|API key|claude : termine" claude-p.log; \
+	grep -E "API Error|API key|fausse API|claude : termine|Groupe des lignes" claude-p.log; \
 	while IFS= read -r ligne; do \
 	  grep -qF -- "$$ligne" claude-p.log || { echo "claude -p : manque « $$ligne »"; exit 1; }; \
 	done < claude-p-attendu.txt

@@ -1,11 +1,31 @@
-# Le jalon de 6f, et de 6g, dans une image à part (make claude-p, que lance
-# make tests-qemu) : 30 s de plus dans QEMU sans accélération, au-delà de ce
-# que le démarrage ordinaire peut attendre. Le vrai Claude Code, avec une
-# fausse clé et sans réessai, jusqu'à l'appel de l'API : depuis 6g, son DNS
-# trouve api.anthropic.com (par le relais de slirp), puis la connexion TCP
-# est refusée (pas encore de TCP : 6h), et il le dit. Puis ce qu'il a laissé dans HOME (sa configuration, la
-# télémétrie qu'il n'a pas pu envoyer) : c'est pourquoi sa ligne dit
-# « memoire rendue : ECHEC » (des fichiers gardés par le tmpfs, voir le
-# Makefile).
-HOME=/home/utilisateur ANTHROPIC_API_KEY=faux CLAUDE_CODE_MAX_RETRIES=0 DISABLE_AUTOUPDATER=1 /usr/local/bin/claude -p bonjour
-/bin/arbre /home/utilisateur
+# Le jalon de 6f à 6i, dans une image à part (make claude-p, que lance make
+# tests-qemu) : une minute de plus dans QEMU sans accélération, au-delà de
+# ce que le démarrage ordinaire peut attendre. Le vrai Claude Code, deux
+# fois, sans réessai, avec une fausse clé et dans le dossier de
+# l'utilisateur, l'entrée sur /dev/null (sinon il attend 3 s ce qu'on
+# pourrait lui envoyer) :
+#   - contre la vraie API : le DNS (le relais de slirp), notre TCP, TLS, et
+#     ce que l'API répond à la fausse clé (6h) ;
+#   - contre la fausse API (6i), que QEMU sert à 10.0.2.100
+#     (outils/serveur-http) : sa réponse fixe, affichée, et le code 0. C'est
+#     tout le chemin de la vraie réponse de Claude (make claude-bonjour),
+#     sans jeton ni Internet : ce que la CI peut vérifier.
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC : ni télémétrie, ni rapport
+# d'erreur, ni mise à jour ; seulement l'appel de l'API.
+#
+# Puis ce que Claude a laissé, effacé : dans HOME, sa configuration, sa copie
+# de sauvegarde, le journal de la session ; dans /tmp, le dossier de ses
+# sockets (cc-socks) et son dossier temporaire (claude-1000). Le groupe
+# mesure sa mémoire du { au }, et doit tout rendre (« memoire rendue : ok »),
+# ce qu'aucun des deux lancements ne peut dire seul, puisque ses fichiers
+# restent, à raison, dans le tmpfs. Le cd vient avant lui : le dossier
+# courant est au lanceur, et reste après le groupe (son chemin, au tas du
+# noyau) ; le groupe ne mesure que ce que font ses programmes.
+cd /home/utilisateur
+{
+HOME=/home/utilisateur ANTHROPIC_API_KEY=faux CLAUDE_CODE_MAX_RETRIES=0 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 /usr/local/bin/claude -p bonjour < /dev/null
+HOME=/home/utilisateur ANTHROPIC_BASE_URL=http://10.0.2.100 ANTHROPIC_API_KEY=faux CLAUDE_CODE_MAX_RETRIES=0 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 /usr/local/bin/claude -p bonjour < /dev/null
+/bin/arbre /home/utilisateur /tmp/claude-1000 /tmp/cc-socks
+/bin/effacer --contenu /home/utilisateur
+/bin/effacer /tmp/claude-1000 /tmp/cc-socks
+}

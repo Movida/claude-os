@@ -1,8 +1,9 @@
 #!/bin/sh
-# Le serveur HTTP de la page de test (6h) : QEMU le lance pour chaque
-# connexion du système invité vers 10.0.2.100:80 (guestfwd de son réseau
-# « utilisateur », voir QEMU_RESEAU dans le Makefile), son entrée et sa
-# sortie reliées à la connexion. Ni port ouvert sur l'hôte, ni Internet.
+# Le serveur HTTP de l'étape : QEMU le lance pour chaque connexion du
+# système invité vers 10.0.2.100:80 (guestfwd de son réseau « utilisateur »,
+# voir QEMU_RESEAU dans le Makefile), son entrée et sa sortie reliées à la
+# connexion. Ni port ouvert sur l'hôte, ni Internet. Il sert deux choses :
+# la page de test de TCP (6h), et une fausse API de Claude (6i).
 #
 # libslirp le lance sans shell (g_shell_parse_argv, puis g_spawn) : d'où la
 # ligne #! ; et sa sortie d'erreur part, elle aussi, dans la connexion : on
@@ -10,28 +11,65 @@
 # tôt, arriverait chez lui au milieu de la page).
 exec 2>/dev/null
 
+# Le dossier de ce script : la réponse de la fausse API est à côté de lui.
+# QEMU le lance par son chemin absolu (le Makefile écrit $(CURDIR)).
+ici=${0%/*}
+
 # La requête : sa première ligne, puis ses en-têtes jusqu'à la ligne vide
-# (chacune finit par CR LF : read garde le CR).
+# (chacune finit par CR LF : read garde le CR). En passant, la longueur du
+# corps, Content-Length, dont le nom ne tient pas compte de la casse (RFC
+# 9110, 5.1) : Bun l'écrit « Content-Length », un autre client pourrait
+# écrire « content-length ». Seuls ses chiffres comptent (ni espaces, ni
+# CR).
+#
+# Le read de sh lit octet par octet sur une connexion (POSIX : il ne doit
+# rien prendre au-delà de la fin de ligne d'une entrée qu'on ne peut pas
+# rembobiner), si bien que le corps reste entier dans l'entrée, pour head.
 IFS= read -r requete || exit 0
+longueur=0
 while IFS= read -r ligne; do
     case $ligne in
         "" | "$(printf '\r')") break ;;
+        [Cc][Oo][Nn][Tt][Ee][Nn][Tt]-[Ll][Ee][Nn][Gg][Tt][Hh]:*)
+            longueur=$(printf '%s' "${ligne#*:}" | tr -dc 0-9)
+            ;;
     esac
 done
 
-# GET /page : 4 Mio de texte, en lignes de 16 octets qui disent chacune leur
-# propre position dans la page (en hexadécimal, sur 15 chiffres, puis une
-# fin de ligne). Le client (linux/telecharger.c) recalcule chaque octet : un
-# segment TCP perdu, doublé ou mis dans le désordre (1460 octets, pas un
-# multiple de 16) casse une ligne à sa place, et il dit laquelle. Autre
-# chose : 404, sans corps. Connection: close : la fin de la page est la fin
-# de la connexion, comme HTTP/1.0.
 case $requete in
+    # GET /page : 4 Mio de texte, en lignes de 16 octets qui disent chacune
+    # leur propre position dans la page (en hexadécimal, sur 15 chiffres,
+    # puis une fin de ligne). Le client (linux/telecharger.c) recalcule
+    # chaque octet : un segment TCP perdu, doublé ou mis dans le désordre
+    # (1460 octets, pas un multiple de 16) casse une ligne à sa place, et
+    # il dit laquelle. Connection: close : la fin de la page est la fin de
+    # la connexion, comme HTTP/1.0.
     "GET /page "*)
         printf 'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 4194304\r\nConnection: close\r\n\r\n'
         awk 'BEGIN { for (i = 0; i < 4194304; i += 16) printf "%015x\n", i }'
         ;;
+    # POST /v1/messages (et ses paramètres, comme ?beta=true) : la fausse
+    # API de Messages, pour `claude -p` dans la CI (make claude-p), sans
+    # jeton ni Internet. Toujours la même réponse, en flux (Server-Sent
+    # Events, ce que demande Claude Code : "stream": true), le flux tout
+    # écrit dans fausse-api.sse : les sept événements d'une réponse de
+    # l'API, dans leur ordre.
+    #
+    # Le corps de la requête (le prompt, le contexte et les outils de
+    # Claude Code, une centaine de Kio) est lu jusqu'au bout avant de
+    # répondre, sans être gardé. Fermer la connexion avec des octets non
+    # lus ferait envoyer un RST par la pile de l'hôte (RFC 1122, 4.2.2.13,
+    # ce que fait Linux), que le client pourrait recevoir avant la fin de la
+    # réponse. head -c ne lit pas plus que ce qu'on lui demande.
+    "POST /v1/messages "* | "POST /v1/messages?"*)
+        head -c "$longueur" >/dev/null
+        printf 'HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n'
+        cat "$ici/fausse-api.sse"
+        ;;
+    # Autre chose : 404, sans corps (après avoir lu le corps, pour la même
+    # raison).
     *)
+        head -c "$longueur" >/dev/null
         printf 'HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n'
         ;;
 esac
