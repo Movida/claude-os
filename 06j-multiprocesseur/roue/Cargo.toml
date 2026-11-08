@@ -1,0 +1,11 @@
+# La roue des minuteurs (6h) : kernel/time/timer.c de Linux, sans le matériel : armer, désarmer en
+# temps constant, sans allouer, et la plus proche échéance par les bits des cases occupées. Comme
+# ../formats, une bibliothèque sans `unsafe` et sans dépendance : testée sur la machine hôte
+# (`make tests-hote`) contre un modèle naïf, puis compilée dans le noyau. `alloc`, pour sa
+# réserve, prise une fois pour toutes à sa création.
+[package]
+name = "roue"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

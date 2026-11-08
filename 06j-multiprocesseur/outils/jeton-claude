@@ -1,0 +1,61 @@
+#!/bin/sh
+# make jeton (6i) : enregistre le jeton longue durée de l'abonnement de
+# David, celui que donne `claude setup-token`, pour make claude-bonjour.
+#
+#   sh outils/jeton-claude FICHIER
+#
+# FICHIER : ~/.config/claude-os/jeton (le Makefile, JETON). Ni dans le
+# dépôt, ni dans ~/.claude (que les sessions de Claude Code parcourent, et
+# dont le volume survit aux reconstructions du conteneur : un secret de plus
+# n'a rien à y faire), ni dans la CI. Après une reconstruction du conteneur,
+# ~/.config est neuf : make jeton à refaire, depuis 1Password où David garde
+# le jeton.
+#
+# Le jeton ne passe que du clavier au fichier, et du fichier au fichier :
+# jamais par une variable du shell ou de make (qu'un `set -x`, une trace de
+# make ou /proc/<pid>/environ pourraient montrer), jamais sur une ligne de
+# commande (que montre ps). head le lit du terminal, l'écho coupé, et
+# l'écrit directement ; grep le vérifie dans le fichier.
+set -eu
+
+fichier=${1:?usage : jeton-claude FICHIER}
+dossier=${fichier%/*}
+
+# Il faut un terminal : le jeton se colle au clavier, l'écho coupé.
+if ! test -t 0; then
+    echo "make jeton : il faut un terminal (le jeton se colle au clavier)" >&2
+    exit 1
+fi
+
+# Le dossier et le fichier, lisibles par David seul : umask 077 avant toute
+# création (le fichier naît 0600, jamais lisible par d'autres, même un
+# instant), et le dossier remis à 0700 s'il existait déjà.
+umask 077
+mkdir -p "$dossier"
+chmod 700 "$dossier"
+
+# Écrit d'abord à côté, puis mis en place d'un coup (mv, un rename dans le
+# même dossier) : un jeton refusé, ou un Ctrl-C au milieu, laisse l'ancien
+# intact. L'écho est rétabli quoi qu'il arrive : un terminal laissé sans
+# écho n'afficherait plus ce qu'on tape.
+nouveau=$(mktemp "$dossier/jeton.XXXXXX")
+trap 'stty echo 2>/dev/null; rm -f "$nouveau"' EXIT
+trap 'exit 130' INT TERM HUP
+
+echo "Le jeton vient de \`claude setup-token\` (dans un terminal du conteneur), ou de 1Password."
+printf "Collez-le, puis Entree (il ne s'affiche pas) : "
+stty -echo
+head -n 1 > "$nouveau"
+stty echo
+echo
+
+# Ce qu'est un jeton de setup-token : sk-ant-oat01- puis des lettres, des
+# chiffres, - et _ (base64url), sur une seule ligne. Autre chose est une
+# erreur de copie (un espace, un retour à la ligne, un autre texte) : refusé
+# sans rien en afficher.
+if ! grep -qxE 'sk-ant-oat01-[A-Za-z0-9_-]{20,}' "$nouveau"; then
+    echo "make jeton : ce n'est pas un jeton de claude setup-token (sk-ant-oat01-..., une ligne) : rien n'est change" >&2
+    exit 1
+fi
+mv -f "$nouveau" "$fichier"
+echo "make jeton : jeton enregistre dans $fichier (droits 0600)"

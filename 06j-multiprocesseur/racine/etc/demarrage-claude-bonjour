@@ -1,0 +1,33 @@
+# Le jalon de 6i, dans une image à part que make claude-bonjour construit
+# dans un dossier privé, sur la machine de David seulement (jamais dans la
+# CI) : le vrai Claude Code répond à « bonjour », avec l'abonnement de
+# David, par la vraie API.
+#
+# Le jeton est dans /etc/claude/jeton, que l'archive de cette image seule
+# contient : un fichier en lecture seule, à l'utilisateur 1000 seul, dans un
+# dossier à lui (0400 et 0500), comme les identifiants que systemd donne à
+# un service (LoadCredential=). Ni dans l'environnement (que
+# /proc/<pid>/environ montre, et que Claude passerait à ses propres
+# programmes), ni dans ce fichier : le lanceur l'ouvre et le donne à Claude
+# sous le numéro 3 (3<), et CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=3 lui dit
+# de l'y lire. Claude le lit par /proc/self/fd/3 (il lui faut le droit de
+# lire le fichier, comme sous Linux) ; il ne lit le descripteur lui-même
+# que si c'est un tube ou une socket (« refusing to read fd 3: not a pipe or
+# socket », mesuré sur l'hôte avec un faux jeton), d'où le fichier à lui
+# plutôt qu'à root.
+#
+# CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC : ni télémétrie, ni rapport
+# d'erreur, ni mise à jour, depuis un système que Claude ne connaît pas ;
+# seulement ce qu'il faut pour répondre. L'entrée sur /dev/null : sinon il
+# attend 3 s ce qu'on pourrait lui envoyer.
+#
+# Puis ce qu'il a laissé dans HOME et dans /tmp (noms et tailles seulement :
+# voir demarrage-claude-p), effacé : le groupe doit rendre toute sa mémoire
+# (le cd avant lui, comme dans demarrage-claude-p).
+cd /home/utilisateur
+{
+HOME=/home/utilisateur CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR=3 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 DISABLE_AUTOUPDATER=1 /usr/local/bin/claude -p bonjour < /dev/null 3< /etc/claude/jeton
+/bin/arbre /home/utilisateur /tmp/claude-1000 /tmp/cc-socks
+/bin/effacer --contenu /home/utilisateur
+/bin/effacer /tmp/claude-1000 /tmp/cc-socks
+}

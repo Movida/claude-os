@@ -1,0 +1,21 @@
+# Un premier programme pour notre OS : écrit en Rust, compilé en
+# WebAssembly par rustc, il ne connaît du système que WASI (deux fonctions :
+# écrire, terminer). Le noyau l'embarque et l'exécute (../noyau/src/wasi.rs).
+[package]
+name = "bonjour"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+# Une bibliothèque « C » : rustc produit alors un module .wasm, avec les
+# fonctions marquées no_mangle pour exports.
+crate-type = ["cdylib"]
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+opt-level = "s"
+lto = true
+debug = false
+strip = true

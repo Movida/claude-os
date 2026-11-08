@@ -1,0 +1,273 @@
+[16 bits] Noyau lu sur le disque, recopie a 1 Mio en mode irreel.
+[64 bits] Mode long actif !
+[noyau] Bonjour depuis le noyau Rust !
+[noyau] Mode long 64 bits, noyau a 0xffffffff80100000 (charge a 0x100000).
+[noyau] Processeur 0 : GDT, TSS et IDT en place, sa zone dans GS ; syscall pret (swapgs).
+[noyau] Exception 3 (point d'arret (int3)) a RIP=
+[noyau] Retour apres int3 : les exceptions sont gerees.
+[alea] pas encore pret (ni RDRAND ni RDSEED)
+[alea] ChaCha20, BLAKE2s, SipHash : vecteurs des RFC : ok.
+[virtio] 00:04.0 : alea.
+[alea] pret (virtio-rng).
+[noyau] APIC local 0 a 0xfee00000 (xAPIC, version 0x14), IO-APIC 0 a 0xfec00000 (GSI 0-23) ; 8259 masque.
+[noyau] Clavier : IRQ 1 sur le GSI 1, vecteur 0x31.
+[noyau] TSC : 
+ : l'heure a la nanoseconde.
+[noyau] Horloge : timer de l'APIC (
+1000 Hz, vecteur 0xec ; PIT arrete.
+[linux] temps : CLOCK_MONOTONIC a la nanoseconde (resolution 1 ns) : ok
+[noyau] 100 ms plus tard : 
+[noyau] Heure (UTC) : 20
+[noyau] Clavier PS/2 pret : tapez du texte.
+[noyau] Ordonnanceur EEVDF : tranche de 0.70 ms, preemption du noyau.
+[noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : ok
+[noyau] Verrou qui dort en lecture et ecriture : les lecteurs passent ensemble, un ecrivain qui attend n'est pas double, retrogradation : ok (EeLLllFfMmGDNdn).
+[noyau] Carte de la memoire (E820)
+[noyau] Memoire libre : 
+[noyau] Pagination W^X en place
+[noyau] Protections contre les programmes : 
+rendu puis redonne : ok.
+[noyau] Allocateur buddy :
+[noyau] Memoire des programmes : surengagement (OVERCOMMIT_GUESS), reserve du noyau de 
+rendues et recollees : ok.
+[noyau] Adresses du noyau a la demande (vmalloc) : 
+[noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : ok ; garde sans projection : ok ; rendue : ok ; memoire video projetee sans cache : ok ; BIOS projete en lecture seule : ok, memoire vive refusee : ok.
+[noyau] ACPI : RSDP v0 (BOCHS), RSDT : FACP APIC HPET WAET.
+[noyau] ACPI : 1 processeur, APIC local a 0xfee00000, IO-APIC 0 a 0xfec00000 (GSI a partir de 0), 8259 present.
+[noyau] ACPI : IRQ ISA remplacees : 0 -> GSI 2 ; 5 -> GSI 5 en niveau ; 9 -> GSI 9 en niveau ; 10 -> GSI 10 en niveau ; 11 -> GSI 11 en niveau ; NMI sur LINT1.
+[pci] 8 fonctions sur le bus (ports 0xCF8 et 0xCFC).
+[pci] 00:00.0 8086:1237 pont hote.
+[pci] 00:03.0 1af4:1000 Ethernet, BAR0 ports 0x
+(16 Kio, 64 bits, prefetchable), MSI-X (4 entrees).
+[pci] 00:04.0 1af4:1005 autre, BAR0 ports
+[noyau] Vecteurs a la demande : 0x40 donne, IPI a soi-meme recue par son gestionnaire : ok ; rendu : ok.
+[noyau] MSI-X de 00:03.0 : 4 entrees, entree 1 programmee et relue : ok.
+[virtio] 00:03.0 : reseau, fonctionnalites VERSION_1 MAC STATUS EVENT_IDX, 3 files.
+[reseau] lo : boucle locale, 127.0.0.1/8, mtu 65536.
+[reseau] eth0 : virtio-net 52:54:00:12:34:56, mtu 1500, lien actif.
+[reseau] eth0 : 10.0.2.15/24, passerelle 10.0.2.2, DNS 10.0.2.3 (DHCP de 10.0.2.2, 
+[reseau] eth0 : voisin 10.0.2.2 : 52:55:0a:00:02:02, joignable (ARP).
+[reseau] eth0 : voisin 10.0.2.3 : 52:55:0a:00:02:03, joignable (ARP).
+[reseau] eth0 : la passerelle et le DNS resolus par ARP : ok.
+[reseau] la MTU du chemin, par un ICMP recu : ok.
+[noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
+[noyau] Espace d'un programme : page 0x400000 ecrite par son adresse (copie protegee), relue par le cadre
+[16 bits] Archive de programmes lue, placee apres le noyau.
+[noyau] Archive de programmes : 
+[noyau] procfs monte sur /proc.
+[noyau] sysfs monte sur /sys.
+[noyau] Archive deballee : dossiers 12, fichiers 64, liens symboliques 6, liens physiques 4 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 93 commandes.
+[noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
+[wasm] Bonjour depuis WebAssembly !
+[wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
+[noyau] bonjour.wasm : termine, code de sortie 0
+[wasm] lecteur : argc = 2, argv = /bin/lecteur.wasm un-argument
+[wasm] lecteur : dossier pre-ouvert 3 : ok
+[wasm] lecteur : /etc/bonjour.txt : Bonjour depuis un fichier de /etc !
+[wasm] lecteur : /etc/lien-bonjour : Bonjour depuis un fichier de /etc !
+[wasm] lecteur : /etc contient : . .. lien-absolu lien-bonjour salut.txt bonjour.txt
+[wasm] lecteur : ecrire puis relire /tmp/lecteur.txt : ok
+[wasm] lecteur : ../../etc/bonjour.txt refuse (EPERM) : ok
+[wasm] lecteur : etc/lien-absolu refuse (EPERM) : ok
+[wasm] lecteur : le 3 ferme puis repris n'est plus pre-ouvert : ok
+[wasm] lecteur : poll_oneoff d'une horloge de 20 ms : attendu, un evenement : ok
+[wasm] lecteur : poll_oneoff, une heure et la sortie a ecrire : la sortie, sans attendre : ok
+[wasm] lecteur : poll_oneoff, une horloge echue et la sortie a ecrire : les deux : ok
+[wasm] lecteur : poll_oneoff sans abonnement : EINVAL ; sched_yield : 0 : ok
+[noyau] lecteur.wasm : termine, code de sortie 0
+[noyau] bonjour-asm : programme Linux (ELF ET_EXEC), 
+        0x00401000-0x00401024 r-x (36 octets du fichier)
+        en-tetes de programme a 0x400040 (3 de 56 octets), tas a partir de 0x403000, code en place : ok.
+[linux] Bonjour depuis l'anneau 3
+[noyau] bonjour-asm : termine, code de sortie 42 ; memoire rendue : ok.
+[linux] argc = 3, argv[0] = /bin/pile
+[linux] argv[1] = un
+[linux] argv[2] = deux mots
+[linux] envp[0] = HOME=/tmp
+[linux] envp[1] = TERM=linux
+[linux] envp[2] = PWD=/
+[linux] envp[3] = LANG=C.UTF-8
+[linux] Environnement : 4 variables.
+[linux] Pile alignee sur 16, AT_PAGESZ = 4096, AT_ENTRY = _start : ok.
+[noyau] pile : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] SSE pour les programmes : FXSAVE (x87, SSE, pas d'AVX), 512 octets par tache.
+[linux] SSE2 : racine de 2 x 1000000 = 1414213, (1,2,3,4) + (10,20,30,40) = (11,22,33,44) : ok.
+[noyau] sse : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c
+[linux] Somme des 10000 premiers carres (malloc) : 333283335000
+[linux] Taille de page (AT_PAGESZ) : 4096
+[linux] /bin/bonjour-c : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
+[noyau] bonjour-c : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] bonjour-c-pie : programme Linux (ELF ET_DYN), 
+tout en haut sous la base des projections : ok.
+tas a partir de 0x555555555000, code en place : ok.
+[linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c-pie
+[linux] /bin/bonjour-c-pie : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
+[noyau] bonjour-c-pie : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] bonjour-c-dynam : programme Linux (ELF ET_DYN), 
+        image a 0x555555554000-
+, tout en haut sous la base des projections : ok, point d'entree 0x
+[linux] Bonjour depuis un programme C, argc=1, argv[0]=/bin/bonjour-c-dynamique
+[linux] /bin/bonjour-c-dynamique : AT_BASE non nul (interpreteur charge par le noyau), AT_ENTRY = _start : ok.
+[noyau] bonjour-c-dynam : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] ld-linux-x86-64 : programme Linux (ELF ET_DYN), 
+[linux] /bin/bonjour-c-dynamique : AT_BASE nul (sans interpreteur), AT_ENTRY = _start : ok.
+[noyau] ld-linux-x86-64 : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] dynamique : les cinq bibliotheques de claude chargees par ld-linux : ok
+[linux] dynamique : toutes les verifications : ok
+[noyau] dynamique : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] memoire : 8 Gio reserves (MAP_NORESERVE), trois pages ecrites loin l'une de l'autre, rendus : ok
+[linux] memoire : 64 Gio reserves puis rendus d'un seul munmap : ok
+[linux] memoire : toutes les verifications : ok
+[noyau] memoire : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Memoire de claude --version rejouee : ok.
+[noyau] claude-version : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] temps : toutes les verifications : ok
+[noyau] temps : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] fichiers : toutes les verifications : ok
+[noyau] fichiers : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] arbre : - 0644    0    0       36 /etc/bonjour.txt (2 liens)
+[linux] arbre : l 0777    0    0       11 /etc/lien-bonjour -> bonjour.txt
+[linux] arbre : - 0644    0    0       36 /etc/salut.txt (2 liens)
+[linux] arbre : d 0755 1000 1000       40 /home/utilisateur
+[linux] arbre : c 0620 1000 1000   5,   1 /dev/console
+[linux] arbre : c 0666    0    0   1,   3 /dev/null
+[noyau] arbre : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] segments : toutes les verifications : ok
+[noyau] segments : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] signaux : toutes les verifications : ok
+[noyau] signaux : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] gestionnaires : processeur : FXSAVE
+[linux] gestionnaires : toutes les verifications : ok
+[noyau] gestionnaires : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] reprise : toutes les verifications : ok
+[noyau] reprise : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] suspendre : toutes les verifications : ok
+[noyau] suspendre : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] attente : toutes les verifications : ok
+[noyau] attente : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] tubes : toutes les verifications : ok
+[noyau] tubes : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] tubes : ecrire sans lecteur, SIGPIPE par defaut
+[noyau] tubes : termine, code de sortie 141 ; memoire rendue : ok.
+[linux] systeme : toutes les verifications : ok
+[noyau] systeme : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] evenements : toutes les verifications : ok
+[noyau] evenements : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] proc : toutes les verifications : ok
+[noyau] proc : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] proc : maps et statm d'un autre processus, vivant : lus : ok
+[linux] proc : ses fichiers gardes ouverts, une fois recueilli : ESRCH : ok
+[linux] proc : son dossier garde ouvert, une fois recueilli : le meme mode, a root : ok
+[linux] proc autre : toutes les verifications : ok
+[linux] partage a : temps reel / temps de calcul entre 1,6 et 2,6 : ok
+[linux] partage b : temps reel / temps de calcul entre 1,6 et 2,6 : ok
+[linux] ajout a : 300 lignes ecrites : ok
+[linux] ajout b : 300 lignes ecrites : ok
+[linux] ajout : 300 lignes de chacun, entieres et dans l'ordre : ok
+[noyau] Programmes en parallele : memoire rendue : ok.
+[linux] clone : toutes les verifications : ok
+[noyau] clone : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] fils : toutes les verifications : ok
+[noyau] fils : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] fils : exit(7) dans un fil, le principal attend
+[noyau] fils : termine, code de sortie 7 ; memoire rendue : ok.
+[linux] courses : ok
+[noyau] courses : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] fautes : quatre fils fautent pendant madvise, mmap, mprotect et munmap, la pile grandit : ok
+[noyau] fautes : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] fautes : exit_group au milieu des fautes, des madvise et des munmap des autres fils
+[noyau] fautes-fin-1 : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] fautes-fin-2 : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] fautes-fin-3 : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] troncature : premiere lecture pendant ftruncate, aucune page relue au-dela de la fin : ok
+[linux] troncature : copie a l'ecriture pendant ftruncate, aucune page relue au-dela de la fin : ok
+[noyau] troncature : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] redirections : 0 et 3 sont les fichiers donnes, en lecture, sans FD_CLOEXEC ; /proc/self/fd/3 d'un fichier sans droits : EACCES, le descripteur reste lisible : ok
+[noyau] redirections : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] dossier : getcwd = /, PWD = /, OLDPWD = * : ok
+[linux] dossier : getcwd = /tmp, PWD = /tmp, OLDPWD = / : ok
+[linux] dossier : getcwd = /home/utilisateur, PWD = /home/utilisateur, OLDPWD = /tmp : ok
+[noyau] dossier : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] effacer : /tmp/groupe cree, 12 fichiers : ok
+[linux] arbre : - 0644 1000 1000    40964 /tmp/groupe/fichier-10
+[linux] arbre : - 0644 1000 1000    36868 /tmp/groupe/sous-dossier/fichier-9
+[noyau] effacer : termine, code de sortie 0.
+[linux] effacer : /tmp/groupe efface : ok
+[noyau] Groupe des lignes 101 a 105 : memoire rendue : ok.
+[linux] effacer : /tmp/fuite cree, 4 fichiers : ok
+[noyau] prog : ouvert en ecriture, ne peut pas etre execute (ETXTBSY)
+[linux] redirections : /tmp/prog tenu en ecriture : ok
+[linux] effacer : /tmp/fuite efface : ok
+[noyau] Groupe des lignes 109 a 116 : memoire rendue : ok.
+[linux] copies : copy_file_range de trois pages et 100 octets : ok
+[linux] copies : sendfile vers une socket : ok
+[linux] copies : toutes les verifications : ok
+[noyau] copies : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] surveillance : trois write : six evenements, sans fusion (seulement avec le dernier) : ok
+[linux] surveillance : rmdir d'un dossier dont un fichier est encore ouvert : il attend : ok
+[linux] surveillance : le close du fichier : le dossier finit : ok
+[linux] surveillance : le dernier : IN_Q_OVERFLOW, numero -1, sans nom : ok
+[linux] surveillance : au-dela de max_user_instances : EMFILE : ok
+[linux] surveillance : toutes les verifications : ok
+[noyau] surveillance : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] Bonjour depuis l'anneau 3
+[linux] surveillance : guetter bonjour-asm dans /bin : OPEN ACCESS CLOSE_NOWRITE, et SIGIO : ok
+[wasm] lecteur : ecrire puis relire /tmp/lecteur.txt : ok
+[linux] surveillance : guetter bonjour.txt dans /etc : OPEN ACCESS CLOSE_NOWRITE OPEN ACCESS CLOSE_NOWRITE, et SIGIO : ok
+[linux] surveillance : guetter bonjour-c-dynamique dans /bin : bonjour-c-dynamique:OPEN bonjour-c-dynamique:ACCESS ld-linux-x86-64.so.2:OPEN ld-linux-x86-64.so.2:ACCESS, et SIGIO : ok
+[linux] reseau : toutes les verifications : ok
+[noyau] reseau : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] dns : toutes les verifications : ok
+[noyau] dns : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] aleatoire : toutes les verifications : ok
+[noyau] aleatoire : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] tcp : toutes les verifications : ok
+[noyau] tcp : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] unix : toutes les verifications : ok
+[noyau] unix : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] proprietaire : toutes les verifications : ok
+[noyau] proprietaire : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] autocode : une seule page : 0 lectures perimees sur 1000 : ok
+[linux] autocode : l'operande sur la page suivante : 0 lectures perimees sur 1000 : ok
+[linux] autocode : l'operande coupee en deux : 0 lectures perimees sur 1000 : ok
+[linux] autocode : le call coupe apres son premier octet : 0 lectures perimees sur 1000 : ok
+[linux] autocode : toutes les verifications : ok
+[noyau] autocode : termine, code de sortie 0 ; memoire rendue : ok.
+[wasm] bonjour-tcp : ecoute pre-ouverte en 3 : SOCKET_STREAM, non bloquante, pas un dossier : ok
+[wasm] bonjour-tcp : connexion 1 (poll_oneoff, sock_recv, sock_send, sock_shutdown) : recu 'bonjour', rendu 'ruojnob', puis 'merci' apres sock_shutdown : ok
+[wasm] bonjour-tcp : connexion 2 (accept bloquant, fd_read, fd_write) : recu 'Claude Code', rendu 'edoC edualC' : ok
+[wasm] bonjour-tcp : sans client : EAGAIN, et poll_oneoff ne publie que l'horloge : ok
+[wasm] bonjour-tcp : refus : ENOTCONN, ESPIPE, ENOTSOCK, EINVAL : ok
+[noyau] bonjour-tcp.was : termine, code de sortie 0,
+[linux] client-tcp : echange 1 avec bonjour-tcp.wasm : envoye 'bonjour', recu 'ruojnob' : ok
+[linux] client-tcp : echange 2 avec bonjour-tcp.wasm : envoye 'Claude Code', recu 'edoC edualC' : ok
+[linux] client-tcp : les deux echanges : ok
+[noyau] client-tcp : termine, code de sortie 0.
+[linux] passerelle : /proc/net/route comme Linux : ok
+[linux] passerelle : /proc/net/route lu par morceaux : ok
+[linux] passerelle : /etc/resolv.conf -> /proc/net/pnp : ok
+[linux] passerelle : /etc/resolv.conf : le DNS de slirp : ok
+[linux] passerelle : /proc/net/dev : en-tete, lo puis eth0 : ok
+[linux] passerelle : un datagramme vers 10.0.2.2:9 part par eth0 : ok
+[linux] passerelle : a 10.0.2.15 par lo : IP_PKTINFO dit eth0 (2) : ok
+[linux] passerelle : /proc/net/arp : la passerelle et le DNS, comme Linux : ok
+[linux] passerelle : ping de 10.0.2.2 : la reponse, attendue sans delai : ok
+[linux] passerelle : ping de 4000 octets : fragmente a l'aller, recolle au retour : ok
+[linux] passerelle : avec IP_PMTUDISC_DO : EMSGSIZE : ok
+[linux] passerelle : 10.0.2.2:9 connectee : l'ICMP de 127.0.0.1 est un martien, aucune erreur : ok
+[linux] passerelle : api.anthropic.com : adresse trouvee : ok
+[linux] passerelle : localhost : 127.0.0.1, par /etc/hosts : ok
+[linux] passerelle : nexistepas-claude-os.anthropic.com : EAI_NONAME : ok
+[linux] passerelle : toutes les verifications : ok
+[noyau] passerelle : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] telecharger : GET /page : 200, Content-Length 4194304 : ok
+[linux] telecharger : page de 4194304 octets, chacun a sa place, puis la fin de la connexion : ok
+[linux] telecharger : GET /absente : 404, sans corps : ok
+[linux] telecharger : toutes les verifications : ok
+[noyau] telecharger : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] claude : programme Linux (ELF ET_EXEC), 291638640 octets, point d'entree 0x1be7900, segments :
+2.1.310 (Claude Code)
+[noyau] claude : termine, code de sortie 0 ; memoire rendue : ok.
+il reste de la marge : ok.
