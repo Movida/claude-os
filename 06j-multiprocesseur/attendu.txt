@@ -40,6 +40,7 @@ rendues et recollees : ok.
 [noyau] Processeur 2 (APIC 2) en service.
 [noyau] Processeur 3 (APIC 3) en service.
 [noyau] 4 processeurs en service.
+[noyau] IPI : chaque autre processeur a recu la sienne : ok ; un appel de fonction aux 3 autres, tous repondent : ok.
 [noyau] ACPI : IRQ ISA remplacees : 0 -> GSI 2 ; 5 -> GSI 5 en niveau ; 9 -> GSI 9 en niveau ; 10 -> GSI 10 en niveau ; 11 -> GSI 11 en niveau ; NMI sur LINT1.
 [pci] 8 fonctions sur le bus (ports 0xCF8 et 0xCFC).
 [pci] 00:00.0 8086:1237 pont hote.

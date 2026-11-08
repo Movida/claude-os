@@ -5,6 +5,7 @@
 [noyau] Horloge : timer de l'APIC (
 mesure contre le PIT), 1000 Hz, vecteur 0xec ; PIT arrete.
 [noyau] 4 processeurs en service.
+[noyau] IPI : chaque autre processeur a recu la sienne : ok ; un appel de fonction aux 3 autres, tous repondent : ok.
 [linux] mmx-ecrit : mm0, mm7 et xmm0 remplis, arrondi x87 change.
 [linux] mmx-lit : registres x87, MMX et SSE a l'etat initial : ok.
 [noyau] mmx-lit : termine, code de sortie 0 ; memoire rendue : ok.

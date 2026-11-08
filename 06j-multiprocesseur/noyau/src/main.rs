@@ -1058,6 +1058,38 @@ fn tester_vecteurs() {
         }
         None => afficherln!("[noyau] Vecteurs a la demande : pas d'APIC local, pas de vecteur."),
     }
+    // Les interruptions entre processeurs (6j) : une IPI à chaque autre
+    // processeur, sur un vecteur donné, reçue par lui (il note son numéro) ;
+    // puis un appel de fonction à tous les autres (smp::appeler), qui
+    // attend leurs réponses.
+    if processeur::nombre() > 1 {
+        use core::sync::atomic::{AtomicU32, AtomicU64};
+        static RECUS: AtomicU64 = AtomicU64::new(0);
+        static REPONSES: AtomicU32 = AtomicU32::new(0);
+        fn noter(_: usize) {
+            RECUS.fetch_or(1 << processeur::courant().numero, Ordering::Relaxed);
+        }
+        fn repondre(_: usize) {
+            REPONSES.fetch_add(1, Ordering::Relaxed);
+        }
+        let autres = processeur::masque_en_service() & !1;
+        if let Some(v) = irq::allouer(noter, 0) {
+            for n in 1..processeur::MAX {
+                if autres >> n & 1 != 0 {
+                    apic::ipi(processeur::zone(n).apic.load(Ordering::Relaxed), v);
+                }
+            }
+            let debut = horloge::tics();
+            while RECUS.load(Ordering::Relaxed) != autres && horloge::tics() - debut < 10 {
+                core::hint::spin_loop();
+            }
+            irq::liberer(v);
+            smp::appeler_les_autres(repondre, 0);
+            afficherln!("[noyau] IPI : chaque autre processeur a recu la sienne : {} ; un appel de fonction aux {} autres, tous repondent : {}.",
+                        ok(RECUS.load(Ordering::Relaxed) == autres), processeur::nombre() - 1,
+                        ok(REPONSES.load(Ordering::Relaxed) as usize == processeur::nombre() - 1));
+        }
+    }
     let carte = pci::fonctions().iter()
         .find(|f| f.entete.vendeur == 0x1af4 && f.capacites().any(|(_, n)| n == formats::pci::CAPACITE_MSIX));
     if let Some(f) = carte {
@@ -1189,13 +1221,8 @@ fn tester_cadres() {
 /// on affiche ce qu'on sait et on arrête tout.
 #[panic_handler]
 fn panique(info: &PanicInfo) -> ! {
-    // Une panique pendant l'affichage de la panique (un bogue dans la
-    // console elle-même) recommencerait sans fin : la deuxième fois, on
-    // s'arrête sans rien dire.
-    static EN_PANIQUE: AtomicBool = AtomicBool::new(false);
-    if EN_PANIQUE.swap(true, Ordering::Relaxed) {
-        cpu::arreter();
-    }
+    // Qui panique, qui se tait, et la panique dans la panique : console.rs
+    // (`preparer_panique`, un seul mot pour tous les processeurs).
     console::preparer_panique();
     afficherln!("[noyau] PANIQUE : {}", info);
     cpu::arreter()

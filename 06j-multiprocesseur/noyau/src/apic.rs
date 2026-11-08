@@ -33,6 +33,19 @@
 //! PREMIER processeur (`id_du_premier`), pas « l'APIC de ce processeur » :
 //! la répartition des interruptions entre processeurs n'est pas de 6j.
 //!
+//! LES INTERRUPTIONS ENTRE PROCESSEURS (IPI, 6j) : un processeur écrit dans
+//! l'ICR de SON APIC le numéro d'APIC d'un autre et un vecteur ; l'autre
+//! reçoit ce vecteur comme une interruption de périphérique. Trois vecteurs
+//! fixes, ceux de Linux (irq_vectors.h) : REPROGRAMMATION (0xFD,
+//! RESCHEDULE_VECTOR : le receveur n'a rien à faire, la sortie de
+//! l'interruption regarde s'il doit céder le processeur, et un processeur
+//! endormi dans `hlt` en sort), FONCTION (0xFC, CALL_FUNCTION_VECTOR :
+//! exécuter une fonction sur d'autres processeurs, smp.rs) et ARRET (0xF8,
+//! REBOOT_VECTOR : `cli ; hlt` pour toujours, la panique). Chaque
+//! processeur écrit l'ICR de son propre APIC : pas de verrou, les
+//! interruptions coupées le temps des deux écritures (une interruption qui
+//! enverrait elle-même une IPI entre les deux mêlerait les messages).
+//!
 //! L'initialisation d'un APIC suit `setup_local_APIC` de Linux :
 //!   - SVR (Spurious-interrupt Vector Register) : le bit 8 allume l'APIC,
 //!     et le vecteur des interruptions « fantômes » (0xFF, comme Linux) :
@@ -55,10 +68,14 @@ use crate::vmalloc;
 use core::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
 /// Les vecteurs de l'APIC, ceux de Linux (arch/x86/include/asm/irq_vectors.h).
-/// Le timer (LOCAL_TIMER_VECTOR), les erreurs, les fantômes.
+/// Le timer (LOCAL_TIMER_VECTOR), les erreurs, les fantômes ; et les trois
+/// vecteurs des interruptions entre processeurs (voir l'en-tête).
 pub const VECTEUR_TIMER: u8 = 0xEC;
 pub const VECTEUR_ERREUR: u8 = 0xFE;
 pub const VECTEUR_FANTOME: u8 = 0xFF;
+pub const VECTEUR_REPROGRAMMATION: u8 = 0xFD;
+pub const VECTEUR_FONCTION: u8 = 0xFC;
+pub const VECTEUR_ARRET: u8 = 0xF8;
 
 // Les registres, par leur position dans la page.
 const ID: usize = 0x20;
@@ -326,15 +343,18 @@ fn envoyer(destination: u8, bas: u32) {
 }
 
 /// Attend que l'APIC ait fini d'envoyer le message précédent (le bit « en
-/// cours » de l'ICR retombe) : au plus 100 ms, par pas de 100 µs (le
-/// `safe_apic_wait_icr_idle` de Linux). Faux si le message n'est jamais
-/// parti. Interruptions actives (l'attente passe par l'horloge).
+/// cours » de l'ICR retombe) : un million de lectures au plus (une lecture
+/// de l'APIC prend au moins une centaine de nanosecondes : un dixième de
+/// seconde et plus, bien plus que l'envoi d'un message ; le
+/// `safe_apic_wait_icr_idle` de Linux attend 100 ms). Faux si le message
+/// n'est jamais parti. Un nombre de tours, pas une durée : appelé aussi
+/// interruptions coupées, où le temps des tics n'avance pas.
 pub fn attendre_envoi() -> bool {
-    for _ in 0..1000 {
+    for _ in 0..1_000_000 {
         if lire(ICR_BAS) & ICR_EN_COURS == 0 {
             return true;
         }
-        crate::horloge::attendre_us(100);
+        core::hint::spin_loop();
     }
     false
 }
@@ -354,6 +374,19 @@ fn envoyer_protege(destination: u8, bas: u32) {
     if interruptions {
         crate::cpu::activer_interruptions();
     }
+}
+
+/// Envoie l'interruption `vecteur` au processeur dont l'APIC est
+/// `destination` (livraison fixe, en front) : une IPI, voir l'en-tête.
+pub fn ipi(destination: u8, vecteur: u8) {
+    envoyer_protege(destination, vecteur as u32);
+}
+
+/// Envoie un NMI au processeur dont l'APIC est `destination` : pour
+/// arrêter un processeur qui tourne interruptions coupées (la panique,
+/// smp.rs), comme le `NMI_VECTOR` de `native_stop_other_cpus`.
+pub fn ipi_nmi(destination: u8) {
+    envoyer_protege(destination, MODE_NMI);
 }
 
 /// Pose l'INIT sur l'APIC `destination` (en niveau) : le processeur revient
@@ -388,6 +421,11 @@ pub fn erreurs() -> u32 {
 /// comme celle d'un périphérique, dès que les interruptions sont permises.
 pub fn ipi_a_soi(vecteur: u8) {
     const A_SOI: u32 = 0b01 << 18;
+    let interruptions = crate::cpu::couper_interruptions();
+    attendre_envoi();
     ecrire(ICR_HAUT, 0);
     ecrire(ICR_BAS, A_SOI | vecteur as u32);
+    if interruptions {
+        crate::cpu::activer_interruptions();
+    }
 }

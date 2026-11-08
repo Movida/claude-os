@@ -1,0 +1,5 @@
+# Le scenario du NMI (make tests-qemu) : deux fils bouclent sur getpid sur
+# les processeurs 1 et 2 quand le moniteur de QEMU envoie le NMI a tous les
+# processeurs ; les deux autres sont inactifs (hlt). Le programme ne finit
+# jamais : QEMU est arrete une fois la panique affichee.
+/bin/processeurs boucle

@@ -88,7 +88,7 @@ use crate::tache::Tache;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU8, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 /// Le nombre maximal de processeurs : la taille du masque de
 /// `sched_getaffinity` (un `unsigned long`, 64 bits). Linux va bien
@@ -119,6 +119,24 @@ pub struct Processeur {
     /// et `sub gs:[...]` seulement (`couper_preemption`,
     /// `retablir_preemption`), lu par `gs:[...]`.
     preemption: UnsafeCell<u32>,
+    /// La tâche courante de ce processeur doit céder (le TIF_NEED_RESCHED
+    /// de Linux, qu'il range dans la tâche ; ici dans la zone, avec le
+    /// compte de préemption, comme son `preempt_count` l'a fait depuis
+    /// 2013) : posé interruptions coupées par l'ordonnanceur (le tic, un
+    /// réveil qui passe devant), lu en une instruction à la sortie d'une
+    /// interruption et au retour vers l'anneau 3 (`besoin_de_ceder`), remis
+    /// à zéro par `ordonnancer`. Un mot par processeur : un réveil fait
+    /// céder le processeur qui exécute la tâche à remplacer, pas celui qui
+    /// réveille (6j, la file des prêtes par processeur : il le pose dans la
+    /// zone de l'autre et lui envoie l'IPI de reprogrammation).
+    pub besoin_de_ceder: AtomicU32,
+    /// La demande d'exécution d'une fonction sur d'autres processeurs
+    /// qu'a faite ce processeur (smp::appeler) : la fonction, son argument,
+    /// et le masque des processeurs qui n'ont pas encore répondu.
+    pub appel: Appel,
+    /// Ce processeur s'est arrêté pour de bon (la panique, smp.rs) : celui
+    /// qui panique attend que tous les autres le disent.
+    pub arrete: AtomicBool,
     /// La tâche qui s'exécute sur ce processeur (le `current` de Linux).
     pub courante: AtomicPtr<Tache>,
     /// Sa tâche inactive, celle qui prend le processeur quand aucune autre
@@ -153,6 +171,9 @@ impl Processeur {
             tenus: AtomicU32::new(0),
             dans_une_interruption: AtomicU32::new(0),
             preemption: UnsafeCell::new(0),
+            besoin_de_ceder: AtomicU32::new(0),
+            appel: Appel { fonction: AtomicUsize::new(0), argument: AtomicUsize::new(0), cibles: AtomicU64::new(0) },
+            arrete: AtomicBool::new(false),
             courante: AtomicPtr::new(core::ptr::null_mut()),
             inactive: AtomicPtr::new(core::ptr::null_mut()),
             a_rendre: AtomicPtr::new(core::ptr::null_mut()),
@@ -160,6 +181,19 @@ impl Processeur {
             gdt: UnsafeCell::new([0; 10]),
         }
     }
+}
+
+/// Une demande d'exécution d'une fonction sur d'autres processeurs (le
+/// `call_function_data` de Linux, un par processeur appelant) : la
+/// fonction et son argument (lus par les receveurs), et les processeurs
+/// qui doivent encore répondre, un bit par numéro (posé par l'appelant en
+/// Release après la fonction et l'argument, effacé par chaque receveur en
+/// Release après avoir exécuté la fonction ; lu en Acquire des deux
+/// côtés) : voir smp.rs.
+pub struct Appel {
+    pub fonction: AtomicUsize,
+    pub argument: AtomicUsize,
+    pub cibles: AtomicU64,
 }
 
 /// Les zones, une par numéro.
@@ -331,6 +365,15 @@ pub fn interruptions_en_cours() -> u32 {
     // SAFETY: `dans_une_interruption` est un AtomicU32, écrit interruptions
     // coupées par ce processeur.
     unsafe { lire_gs_u32(offset_of!(Processeur, dans_une_interruption)) }
+}
+
+/// La tâche courante de ce processeur doit-elle céder (voir
+/// `besoin_de_ceder`) ? En une instruction : lisible interruptions actives
+/// (si le mot est posé, c'est pour la tâche qui s'exécute ici, nous).
+pub fn besoin_de_ceder() -> bool {
+    // SAFETY: `besoin_de_ceder` est un AtomicU32, écrit interruptions
+    // coupées.
+    unsafe { lire_gs_u32(offset_of!(Processeur, besoin_de_ceder)) != 0 }
 }
 
 /// Le numéro de ce processeur : une valeur qui peut être périmée dès

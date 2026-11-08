@@ -21,12 +21,31 @@ pub fn initialiser() {
 /// même temps (un NMI du moniteur de QEMU va à TOUS les processeurs
 /// virtuels ; une exception fatale sur un processeur pendant qu'un autre
 /// panique), s'arrêtent sans rien dire, sinon leurs messages se mêleraient
-/// (le `panic_cpu` et le `stopping_cpu` de Linux).
+/// (le `panic_cpu` et le `stopping_cpu` de Linux). Le gagnant arrête
+/// ensuite tous les autres (smp::arreter_les_autres) avant d'écrire. Et
+/// combien de fois le gagnant est entré ici (ENTREES) : une exception
+/// fatale écrit ses registres puis panique (deux entrées) ; une panique
+/// pendant l'affichage de la panique (un bogue dans la console elle-même)
+/// recommencerait sans fin : à la troisième entrée, on s'arrête sans rien
+/// dire. (Jusqu'à la relecture de 6j, un second mot, `EN_PANIQUE` dans
+/// main.rs, disait « quelqu'un a déjà paniqué » sans dire qui : le gagnant
+/// d'ici pouvait se taire parce qu'un perdant l'avait posé, et le perdant
+/// s'arrêtait sans poser `arrete`, ce qui coûtait au gagnant une seconde
+/// d'attente et un NMI.)
 static PANIQUE_PAR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static ENTREES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Ce processeur est-il celui qui panique ? Pour le gestionnaire du NMI
+/// (interruptions.rs) : un NMI reçu pendant qu'on écrit le message de la
+/// panique (celui du moniteur de QEMU, qui frappe tous les processeurs) ne
+/// doit pas nous arrêter. Interruptions coupées.
+pub fn je_panique() -> bool {
+    PANIQUE_PAR.load(core::sync::atomic::Ordering::Relaxed) == crate::processeur::numero() + 1
+}
 
 /// Prépare la console pour le message d'une panique. Ne revient que sur le
-/// premier processeur qui panique (voir PANIQUE_PAR) ; les autres s'arrêtent
-/// ici.
+/// premier processeur qui panique (voir PANIQUE_PAR), deux fois au plus ;
+/// les autres s'arrêtent ici.
 ///
 /// Si la panique (ou l'exception fatale) est survenue PENDANT un affichage,
 /// le verrou de l'écran est encore pris par le code qui a planté : le
@@ -35,16 +54,28 @@ static PANIQUE_PAR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU3
 /// puis zap_locks pour sa console), on remet le verrou à neuf : le code
 /// interrompu ne reprendra jamais, au pire l'écran montrera une ligne à
 /// moitié écrite. (Les autres processeurs, qui pourraient tenir ce verrou
-/// ou l'attendre, sont arrêtés avant : 6j, les IPI.)
+/// ou l'attendre, sont arrêtés d'abord, smp::arreter_les_autres : l'IPI
+/// d'arrêt, puis un NMI à ceux qui tournaient interruptions coupées.)
 pub fn preparer_panique() {
     use core::sync::atomic::Ordering;
     crate::cpu::couper_interruptions();
     let moi = crate::processeur::numero() + 1;
     if PANIQUE_PAR.compare_exchange(0, moi, Ordering::AcqRel, Ordering::Acquire).is_err() && PANIQUE_PAR.load(Ordering::Relaxed) != moi {
+        crate::smp::s_arreter();
+    }
+    if ENTREES.fetch_add(1, Ordering::Relaxed) >= 2 {
         crate::cpu::arreter();
     }
-    // SAFETY: on ne revient pas de la panique, le détenteur éventuel du
-    // verrou ne reprendra jamais la main.
+    crate::smp::arreter_les_autres();
+    // Les autres processeurs sont arrêtés, au mieux : `arreter_les_autres`
+    // a attendu leur `arrete` une seconde, puis dix millisecondes après un
+    // NMI ; un processeur qui ne répond toujours pas (figé par
+    // l'hyperviseur, ou par une erreur plus grave que la nôtre) pourrait
+    // tenir encore ce verrou, et son écriture se mêler à notre message :
+    // le prix d'un message qui part quoi qu'il arrive.
+    // SAFETY: on ne revient pas de la panique, et les autres processeurs
+    // sont arrêtés (voir ci-dessus) : le détenteur éventuel du verrou ne
+    // reprendra jamais la main.
     unsafe { ECRAN.forcer_liberation() };
 }
 

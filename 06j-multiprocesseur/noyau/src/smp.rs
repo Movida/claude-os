@@ -51,17 +51,51 @@
 //! réécrit pour le suivant, le trampoline lui-même l'arrête, avant qu'il
 //! ne touche à une pile qui n'est plus la sienne (trampoline.rs).
 //!
-//! À ce commit, un secondaire en service ne fait encore que `cli ; hlt` :
-//! le timer de son APIC reste masqué (sans file des prêtes par
-//! processeur, un tic sur un secondaire ferait choisir dans la file commune
-//! la tâche qui s'exécute sur le premier), et il ne reçoit pas encore
-//! d'interruption entre processeurs. Son tic, sa file et ses IPI viennent
-//! avec les commits suivants de 6j.
+//! Un secondaire en service ne fait encore que dormir (`sti ; hlt`) : le
+//! timer de son APIC reste masqué (sans file des prêtes par processeur, un
+//! tic sur un secondaire ferait choisir dans la file commune la tâche qui
+//! s'exécute sur le premier) ; il ne reçoit que les INTERRUPTIONS ENTRE
+//! PROCESSEURS (apic.rs : les trois vecteurs). Son tic et sa file viennent
+//! avec la file des prêtes par processeur.
+//!
+//! APPELER UNE FONCTION AILLEURS (`appeler`, le `smp_call_function_many`
+//! de Linux, avec attente) : une demande par processeur APPELANT, dans sa
+//! zone (`Processeur::appel` : la fonction, l'argument, le masque des
+//! processeurs qui doivent répondre), l'IPI FONCTION à chacun d'eux, et
+//! l'appelant attend, en tournant, que le masque soit vide. Un receveur
+//! (`recevoir_appel`, interruptions coupées) parcourt les demandes de TOUS
+//! les processeurs en service et exécute celles qui l'attendent, puis
+//! efface son bit (Release : ce que la fonction a fait est fini pour
+//! l'appelant, qui lit en Acquire). Option écartée : la file par
+//! DESTINATAIRE de Linux (`call_single_queue`, une liste sans verrou où
+//! chaque appelant dépose son `csd`) : elle évite le parcours des zones,
+//! mais demande une liste intrusive sans verrou ; soixante-quatre lectures
+//! atomiques par IPI reçue ne coûtent rien. Trois règles, vérifiées par des
+//! `assert!` : la préemption coupée (la demande est celle de CE processeur,
+//! et « les autres que moi » ne doit pas changer de sens au milieu : le
+//! `preempt_disable` que Linux exige ; `appeler` la coupe lui-même), les
+//! interruptions ACTIVES (deux processeurs qui s'appelleraient l'un
+//! l'autre interruptions coupées s'attendraient pour toujours, aucun ne
+//! pouvant répondre : le `WARN_ON(irqs_disabled())` de Linux, chez nous
+//! une panique), aucun `Verrou` tenu (un `Verrou` coupe les
+//! interruptions ; et la règle des attentes de verrou.rs : on n'attend
+//! jamais, un verrou tenu, une chose dont la fin attend une IPI). Une
+//! attente qui dépasse une seconde est dite, avec l'endroit (le
+//! `csd_lock_wait` de débogage de Linux).
+//!
+//! LA PANIQUE (`arreter_les_autres`, le `native_stop_other_cpus` de
+//! Linux) : le processeur qui panique envoie l'IPI ARRET à tous les autres
+//! en service, attend une seconde qu'ils se disent arrêtés (`arrete`), puis
+//! envoie un NMI à ceux qui ne le sont pas (ils tournaient interruptions
+//! coupées : le gestionnaire du NMI lit « arrêt demandé » en premier,
+//! interruptions.rs, et s'arrête sans un mot), et attend encore 10 ms.
+//! Seulement alors il écrit son message : plus personne n'écrit avec lui,
+//! et personne ne tient plus le verrou de la console qu'il va forcer.
 
 use crate::gdt::PilesIst;
 use crate::verrou::Verrou;
 use crate::vmalloc::Pile;
-use crate::{acpi, apic, appel_systeme, cpu, gdt, horloge, interruptions, pagination, processeur, sse, tache, trampoline, tsc};
+use crate::{acpi, apic, appel_systeme, cpu, gdt, horloge, interruptions, pagination, processeur, sse, tache, trampoline, tsc, verrou};
 use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 
 /// Les mots de la poignée de main (`Processeur::demarrage`).
@@ -433,9 +467,155 @@ extern "C" fn depart_secondaire(numero: u32) -> ! {
             _ => cpu::arreter(),
         }
     }
-    // En service. La boucle d'inactivité d'un secondaire, à ce commit :
-    // `cli ; hlt` pour toujours (voir l'en-tête).
+    // En service. La boucle d'inactivité d'un secondaire (voir l'en-tête) :
+    // dormir jusqu'à la prochaine interruption, qui ne peut être qu'une IPI
+    // (ou un NMI), dont le gestionnaire a fait le travail ; rien à
+    // regarder entre deux (la file des prêtes par processeur viendra ici).
+    loop {
+        cpu::attendre_interruption();
+    }
+}
+
+/// Exécute `fonction(argument)` sur chacun des processeurs en service de
+/// `masque`, sauf celui-ci, et attend que tous aient fini (voir l'en-tête ;
+/// la fonction s'exécute chez eux interruptions coupées, courte, sans
+/// verrou qui dort). Interruptions actives, aucun `Verrou` tenu.
+#[track_caller]
+pub fn appeler(masque: u64, fonction: fn(usize), argument: usize) {
+    assert!(cpu::interruptions_actives(), "appel aux autres processeurs interruptions coupees");
+    assert!(verrou::tenus() == 0, "appel aux autres processeurs un verrou tenu");
+    processeur::sans_preemption(|| {
+        let zone = processeur::courant();
+        let cibles = masque & processeur::masque_en_service() & !(1 << zone.numero);
+        if cibles == 0 {
+            return;
+        }
+        zone.appel.fonction.store(fonction as usize, Ordering::Relaxed);
+        zone.appel.argument.store(argument, Ordering::Relaxed);
+        // Release : la fonction et l'argument avant le masque, que les
+        // receveurs lisent en Acquire.
+        zone.appel.cibles.store(cibles, Ordering::Release);
+        for n in processeurs(cibles) {
+            apic::ipi(processeur::zone(n).apic.load(Ordering::Relaxed), apic::VECTEUR_FONCTION);
+        }
+        let debut = tsc::lire();
+        let mut dit = false;
+        // Acquire : ce que les receveurs ont fait avant d'effacer leur bit
+        // est visible ici.
+        while zone.appel.cibles.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+            if !dit && tsc::khz().is_some_and(|khz| tsc::lire().wrapping_sub(debut) > khz * 1000) {
+                dit = true;
+                let lieu = core::panic::Location::caller();
+                crate::console::urgence(format_args!(
+                    "[smp] {}:{} : le processeur {} attend depuis plus d'une seconde la reponse des processeurs {:#x}\n",
+                    lieu.file(), lieu.line(), zone.numero, zone.appel.cibles.load(Ordering::Relaxed)));
+            }
+        }
+    });
+}
+
+/// `appeler` sur tous les autres processeurs en service (le
+/// `smp_call_function` de Linux).
+#[track_caller]
+pub fn appeler_les_autres(fonction: fn(usize), argument: usize) {
+    appeler(u64::MAX, fonction, argument);
+}
+
+/// Les numéros des processeurs d'un masque.
+fn processeurs(masque: u64) -> impl Iterator<Item = usize> {
+    (0..processeur::MAX).filter(move |&n| masque >> n & 1 != 0)
+}
+
+/// L'IPI FONCTION reçue, interruptions coupées (interruptions.rs) : les
+/// demandes qui attendent ce processeur, exécutées, puis son bit effacé
+/// dans chacune (voir l'en-tête).
+pub fn recevoir_appel() {
+    let moi = 1u64 << processeur::courant().numero;
+    for n in processeurs(processeur::masque_en_service()) {
+        let appel = &processeur::zone(n).appel;
+        if appel.cibles.load(Ordering::Acquire) & moi == 0 {
+            continue;
+        }
+        let f = appel.fonction.load(Ordering::Relaxed);
+        // SAFETY: `appeler` n'y écrit que des `fn(usize)`, avant de poser
+        // le masque (Release) que nous venons de lire (Acquire).
+        let f = unsafe { core::mem::transmute::<usize, fn(usize)>(f) };
+        f(appel.argument.load(Ordering::Relaxed));
+        appel.cibles.fetch_and(!moi, Ordering::Release);
+    }
+}
+
+
+/// La panique a commencé : les autres processeurs doivent s'arrêter. Lu en
+/// tête du gestionnaire de NMI (interruptions.rs).
+static ARRET_DEMANDE: AtomicBool = AtomicBool::new(false);
+
+pub fn arret_demande() -> bool {
+    ARRET_DEMANDE.load(Ordering::SeqCst)
+}
+
+/// Arrête ce processeur pour toujours, et le dit (`arrete`) : l'IPI
+/// d'arrêt ou le NMI de la panique reçu, ou la panique perdue (console.rs).
+/// Interruptions coupées.
+pub fn s_arreter() -> ! {
+    processeur::courant().arrete.store(true, Ordering::Release);
     cpu::arreter()
+}
+
+/// Arrête tous les autres processeurs en service (voir l'en-tête) : sur le
+/// processeur qui panique, interruptions coupées, avant d'écrire son
+/// message.
+pub fn arreter_les_autres() {
+    ARRET_DEMANDE.store(true, Ordering::SeqCst);
+    let moi = processeur::numero();
+    let autres = processeur::masque_en_service() & !(1 << moi);
+    let restants = || {
+        let mut m = 0u64;
+        for n in processeurs(autres) {
+            if !processeur::zone(n).arrete.load(Ordering::Acquire) {
+                m |= 1 << n;
+            }
+        }
+        m
+    };
+    if restants() == 0 {
+        return;
+    }
+    for n in processeurs(restants()) {
+        apic::ipi(processeur::zone(n).apic.load(Ordering::Relaxed), apic::VECTEUR_ARRET);
+    }
+    if attendre_bornee(|| restants() == 0, 1_000_000) {
+        return;
+    }
+    for n in processeurs(restants()) {
+        apic::ipi_nmi(processeur::zone(n).apic.load(Ordering::Relaxed));
+    }
+    attendre_bornee(|| restants() == 0, 10_000);
+}
+
+/// Attend que `fini` soit vrai, au plus `us` microsecondes : par le TSC
+/// s'il est fiable ; sinon un nombre de tours (cent par microseconde : une
+/// borne, pas une durée). Interruptions coupées ou non, sans l'horloge
+/// (la panique tourne interruptions coupées, les tics n'avancent plus).
+fn attendre_bornee(fini: impl Fn() -> bool, us: u64) -> bool {
+    if let Some(khz) = tsc::khz() {
+        let debut = tsc::lire();
+        while !fini() {
+            if tsc::lire().wrapping_sub(debut) > khz * us / 1000 {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        return true;
+    }
+    for _ in 0..us.saturating_mul(100) {
+        if fini() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    fini()
 }
 
 /// Attend que `zone.demarrage` prenne l'une des valeurs `attendues`, et la

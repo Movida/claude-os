@@ -66,7 +66,7 @@ use crate::partage::Arc;
 use crate::tache::{self, Reveil, Tache};
 use crate::verrou::{self, Verrou};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU64, Ordering};
 
 /// La tranche de base, en nanosecondes de calcul (Linux 6.18, un
 /// processeur : 0,70 ms).
@@ -101,9 +101,9 @@ struct File {
 // UNIPROCESSEUR : une seule file des prêtes ; une par processeur avec
 // plusieurs (la `rq` de Linux), et l'équilibrage des charges entre elles.
 static FILE: Verrou<File> = Verrou::new(File { entites: Vec::new(), depuis: 0, zero: 0 });
-/// La tâche courante a fini sa tranche, ou une tâche réveillée devrait
-/// passer avant elle (le TIF_NEED_RESCHED de Linux).
-static BESOIN_DE_CEDER: AtomicBool = AtomicBool::new(false);
+// « La tâche courante doit céder » (le TIF_NEED_RESCHED de Linux) est
+// dans la zone du processeur (processeur.rs, `besoin_de_ceder`), depuis 6j.
+
 /// Le nombre de bascules, pour les tests.
 static BASCULES: AtomicU64 = AtomicU64::new(0);
 
@@ -271,7 +271,7 @@ fn ceder_si_une_autre_passe(f: &File) {
     let courante = tache::courante();
     let choisie = f.choisir().map(|e| Arc::as_ptr(&e.tache));
     if choisie.is_some_and(|c| !core::ptr::eq(c, courante)) {
-        BESOIN_DE_CEDER.store(true, Ordering::Relaxed);
+        crate::processeur::courant().besoin_de_ceder.store(1, Ordering::Relaxed);
     }
 }
 
@@ -280,12 +280,12 @@ fn ceder_si_une_autre_passe(f: &File) {
 pub fn tic() {
     let mut f = FILE.verrouiller();
     if f.compter_courante() && f.entites.len() > 1 {
-        BESOIN_DE_CEDER.store(true, Ordering::Relaxed);
+        crate::processeur::courant().besoin_de_ceder.store(1, Ordering::Relaxed);
     }
     // La tâche inactive, quand une tâche est prête (réveillée hors d'une
     // interruption), cède aussitôt.
     if f.position(tache::courante()).is_none() && !f.entites.is_empty() {
-        BESOIN_DE_CEDER.store(true, Ordering::Relaxed);
+        crate::processeur::courant().besoin_de_ceder.store(1, Ordering::Relaxed);
     }
 }
 
@@ -297,7 +297,7 @@ pub fn autres_pretes() -> bool {
 
 /// Faut-il céder le processeur ?
 pub fn besoin_de_ceder() -> bool {
-    BESOIN_DE_CEDER.load(Ordering::Relaxed)
+    crate::processeur::besoin_de_ceder()
 }
 
 /// Pourquoi on appelle `ordonnancer` (voir l'en-tête).
@@ -324,7 +324,7 @@ pub fn ordonnancer(bascule: Bascule) {
     // quand on bascule, et n'a rien à sauver par tâche (processeur.rs).
     assert!(crate::processeur::preemptible(), "ordonnancer preemption coupee ou dans une interruption");
     let interruptions = crate::cpu::couper_interruptions();
-    BESOIN_DE_CEDER.store(false, Ordering::Relaxed);
+    crate::processeur::courant().besoin_de_ceder.store(0, Ordering::Relaxed);
     let suivante = {
         let mut f = FILE.verrouiller();
         f.compter_courante();

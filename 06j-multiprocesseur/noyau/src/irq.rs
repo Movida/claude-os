@@ -200,6 +200,13 @@ pub enum Source {
     Isa(u8),
     /// Le timer de l'APIC local.
     TimerApic,
+    /// Une interruption entre processeurs (apic.rs, smp.rs) : exécuter une
+    /// fonction pour un autre processeur ; regarder si la tâche courante
+    /// doit céder (rien d'autre : la sortie de l'interruption le fait) ;
+    /// s'arrêter pour toujours (la panique).
+    Fonction,
+    Reprogrammation,
+    Arret,
 }
 
 /// Une interruption matérielle, de vecteur `vecteur` (32 à 255), arrivée.
@@ -228,6 +235,20 @@ pub fn gerer(vecteur: u8, traiter: impl FnOnce(Source)) {
         apic::VECTEUR_TIMER if APIC.load(Ordering::Relaxed) => {
             traiter(Source::TimerApic);
             apic::fin_interruption();
+        }
+        apic::VECTEUR_FONCTION if APIC.load(Ordering::Relaxed) => {
+            traiter(Source::Fonction);
+            apic::fin_interruption();
+        }
+        apic::VECTEUR_REPROGRAMMATION if APIC.load(Ordering::Relaxed) => {
+            traiter(Source::Reprogrammation);
+            apic::fin_interruption();
+        }
+        // L'arrêt : l'EOI d'abord (comme `sysvec_reboot`), puis le
+        // traitement, qui ne revient pas.
+        apic::VECTEUR_ARRET if APIC.load(Ordering::Relaxed) => {
+            apic::fin_interruption();
+            traiter(Source::Arret);
         }
         // Un fantôme de l'APIC : il n'est pas « en service », pas d'EOI
         // (manuel d'Intel, vol. 3A, 11.9).

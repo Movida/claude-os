@@ -8,9 +8,17 @@
  * honoré : un fil peut encore tourner sur un processeur qu'il a exclu
  * (le placement des tâches vient avec la file des prêtes par processeur).
  * Sur l'hôte, il l'est : sched_getcpu dit le processeur demandé. Compilé
- * avec gcc -static ; sur l'hôte aussi (make tests-hote). */
+ * avec gcc -static ; sur l'hôte aussi (make tests-hote).
+ *
+ * Avec l'argument « boucle » (make tests-qemu, le scénario du NMI) : deux
+ * fils qui bouclent sur getpid pour toujours (l'anneau 3, l'entrée et la
+ * sortie de syscall : là où un NMI trouve la base de GS du programme active
+ * dans le noyau), épinglés sur les processeurs 1 et 2 (honoré quand la file
+ * des prêtes sera par processeur) ; le programme dit quand ils tournent,
+ * puis attend. */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -21,6 +29,28 @@
 
 static int echecs;
 static int chez_nous;
+
+static void *boucleur(void *arg)
+{
+    cpu_set_t c;
+    CPU_ZERO(&c);
+    CPU_SET((int)(long)arg, &c);
+    pthread_setaffinity_np(pthread_self(), sizeof c, &c);
+    for (;;)
+        syscall(SYS_getpid);
+    return NULL;
+}
+
+static int boucler(void)
+{
+    pthread_t fils[2];
+    for (int i = 0; i < 2; i++)
+        pthread_create(&fils[i], NULL, boucleur, (void *)(long)(i + 1));
+    printf("[linux] processeurs : 2 fils bouclent sur getpid, processeurs 1 et 2\n");
+    fflush(stdout);
+    pause();
+    return 0;
+}
 
 static void verifier(int ok, const char *quoi)
 {
@@ -49,8 +79,10 @@ static int compter(const char *liste)
     return n;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    if (argc > 1 && strcmp(argv[1], "boucle") == 0)
+        return boucler();
     chez_nous = access("/etc/bonjour.txt", F_OK) == 0;
 
     /* Combien : get_nprocs lit /sys/devices/system/cpu/online. */

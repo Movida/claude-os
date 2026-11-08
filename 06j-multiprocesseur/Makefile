@@ -945,6 +945,15 @@ claude-p.cpio: programmes.cpio racine/etc/demarrage-claude-p
 sans-reseau.cpio: programmes.cpio racine/etc/demarrage-sans-reseau
 	sed 's|racine/etc/demarrage |racine/etc/demarrage-sans-reseau |' archive.txt | sh archive.sh $@ -
 
+# Le scénario du NMI (make tests-qemu) : l'archive de l'étape, dont
+# /etc/demarrage ne lance que `processeurs boucle` (racine/etc/demarrage-nmi).
+nmi.cpio: programmes.cpio racine/etc/demarrage-nmi
+	sed 's|racine/etc/demarrage |racine/etc/demarrage-nmi |' archive.txt | sh archive.sh $@ -
+
+nmi.bin: nmi.cpio FORCE
+	cd noyau && cargo build --release
+	$(call image,$(NOYAU_ELF),nmi.cpio,nmi)
+
 sans-reseau.bin: sans-reseau.cpio FORCE
 	cd noyau && cargo build --release
 	$(call image,$(NOYAU_ELF),sans-reseau.cpio,sans-reseau)
@@ -1298,6 +1307,13 @@ $(WAST2JSON):
 #     vite, EAI_AGAIN (6g) ;
 #   - un seul processeur (-smp 1), le noyau ordinaire sur l'archive vide :
 #     la MADT ne liste aucun secondaire, et le noyau le dit (6j) ;
+#   - un NMI envoyé par le moniteur de QEMU à TOUS les processeurs
+#     virtuels (`nmi`), le noyau ordinaire pendant que `processeurs boucle`
+#     (nmi.bin, racine/etc/demarrage-nmi) fait boucler deux fils sur getpid
+#     sur les processeurs 1 et 2, les deux autres inactifs : le NMI frappe
+#     l'anneau 3, l'entrée ou la sortie d'un appel système (le chemin
+#     paranoïaque, avec la base de GS du programme) et `hlt` ; un seul
+#     processeur dit l'exception et panique, les autres se taisent (6j) ;
 #   - le processeur secondaire 1 qui tarde six secondes (test-retard, sous
 #     -cpu Nehalem pour mesurer son retard au TSC) : abandonné au bout de
 #     cinq, il trouve ABANDONNE et s'arrête sans un mot ; trois
@@ -1321,7 +1337,7 @@ MON_TESTS = mon-tests.sock
 QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot $(QEMU_SMP) $(QEMU_RESEAU) \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
-tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-retard.bin vide.bin sans-reseau.bin claude-p
+tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-retard.bin vide.bin nmi.bin sans-reseau.bin claude-p
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
 	$(call attendre,$(QEMU_TEST_1) -smp 1 $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=vide.bin -serial file:test-smp1.log,test-smp1.log,"[noyau] 1 processeur en service : la MADT n'en liste pas d'autre.",:)
 	$(call attendre,$(QEMU_TEST) -cpu Nehalem $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-tsc.bin -serial file:test-tsc.log,test-tsc.log,"[noyau] Heure (UTC)",:)
@@ -1333,6 +1349,13 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	grep -F "[noyau] 3 processeurs en service." test-retard.log
 	! grep -F "Processeur 1 (APIC 1) en service" test-retard.log
 	! grep -E "ECHEC|PANIQUE" test-retard.log
+	rm -f test-nmi.log $(MON_TESTS); \
+	$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw,file=nmi.bin -serial file:test-nmi.log -monitor unix:$(MON_TESTS),server,nowait & q=$$!; \
+	ligne() { for i in $$(seq $$(( $(DUREE) * 10 ))); do grep -qF -- "$$1" test-nmi.log 2>/dev/null && return 0; \
+	  kill -0 $$q 2>/dev/null || return 1; sleep 0.1; done; return 1; }; \
+	ligne "[linux] processeurs : 2 fils bouclent sur getpid" && echo "nmi" | nc -U -q1 $(MON_TESTS) >/dev/null && ligne "[noyau] PANIQUE"; r=$$?; \
+	kill $$q 2>/dev/null; wait $$q 2>/dev/null; grep -F "EXCEPTION 2 (NMI)" test-nmi.log; \
+	[ $$r -eq 0 ] && [ $$(grep -c "EXCEPTION 2 (NMI)" test-nmi.log) -eq 1 ] && [ $$(grep -c "PANIQUE" test-nmi.log) -eq 1 ]
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"generateur laisse eteint.",:)
 	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
 	grep -F "MSI-X de 00:03.0 : pas d'APIC local : pas de MSI-X." test-sans-acpi.log
@@ -1443,7 +1466,7 @@ test-%.bin: vide.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio \
+	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin nmi*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio nmi.cpio \
 	  tests-demarrage.txt serial.log trace.log verrous.log \
 	  capture.log qemu.log ecran.png test-*.log claude-p.log $(MON_TESTS)
 	rm -f $(PRIVE_FICHIERS)

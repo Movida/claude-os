@@ -519,6 +519,12 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
                 }
                 irq::Source::Isa(clavier::IRQ) => clavier::interruption(),
                 irq::Source::Isa(_) => {}
+                irq::Source::Fonction => crate::smp::recevoir_appel(),
+                // Rien à faire : la sortie de l'interruption regarde si la
+                // tâche courante doit céder (plus bas), et un processeur
+                // endormi dans `hlt` est réveillé par l'interruption même.
+                irq::Source::Reprogrammation => {}
+                irq::Source::Arret => crate::smp::s_arreter(),
             });
             // L'instant d'une interruption de périphérique, pour le
             // générateur aléatoire (le `add_interrupt_randomness` que
@@ -530,6 +536,18 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
             // ne doit pas hériter du compte (Linux : `irq_exit`, avant
             // `preempt_schedule_irq`).
             dans_une_interruption.fetch_sub(1, Ordering::Relaxed);
+        }
+        // Un NMI pendant qu'un autre processeur panique : il nous
+        // l'envoie parce que nous ne répondions pas à son IPI d'arrêt
+        // (interruptions coupées) ; on s'arrête sans rien dire (smp.rs).
+        2 if crate::smp::arret_demande() => {
+            // Sauf si c'est NOUS qui paniquons (le NMI du moniteur de QEMU
+            // va à tous les processeurs, le nôtre compris) : on l'ignore,
+            // et le message continue ; la sortie du chemin paranoïaque
+            // rend la base de GS qu'il avait trouvée.
+            if !crate::console::je_panique() {
+                crate::smp::s_arreter();
+            }
         }
         2 | 8 | 18 => exception_fatale(cadre),
         // La faute de page, d'où qu'elle vienne : le plus souvent servie
