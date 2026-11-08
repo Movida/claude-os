@@ -218,6 +218,30 @@ pub const DT_LNK: u8 = 10;
 /// sauvegarde) voient autre chose que 0.
 const TAILLE_ENTREE: u64 = 20;
 
+/// Après une entrée retirée : une liste vide rend toute sa place ; une
+/// liste qui n'occupe plus que la moitié de la sienne en rend l'autre
+/// moitié, et sa place revient à ce qu'elle était avant de doubler (Vec
+/// double la sienne quand elle est pleine, à partir de 4). Ainsi un
+/// programme qui crée puis efface des entrées laisse le dossier comme il
+/// l'a trouvé : sans cela, `/tmp`, passé de 4 à 8 places pendant un
+/// `claude -p`, gardait 320 octets du tas, et le groupe qui le lance ne
+/// rendait pas toute sa mémoire. La nouvelle place se demande sans paniquer
+/// (`try_reserve_exact`) : sans mémoire, la liste garde l'ancienne. Une
+/// création puis un effacement juste à la limite recopient la liste à
+/// chaque fois, ce qui reste petit devant le reste de l'opération.
+fn rendre_la_place(entrees: &mut Vec<Entree>) {
+    let place = entrees.capacity();
+    if entrees.is_empty() {
+        *entrees = Vec::new();
+    } else if place > 4 && entrees.len() <= place / 2 {
+        let mut neuve = Vec::new();
+        if neuve.try_reserve_exact(place / 2).is_ok() {
+            neuve.extend(entrees.drain(..));
+            *entrees = neuve;
+        }
+    }
+}
+
 /// Une entrée de dossier.
 struct Entree {
     nom: Vec<u8>,
@@ -638,8 +662,8 @@ impl Tmpfs {
         let entrees = &mut d.dossier_mut().entrees;
         let i = entrees.iter().position(|e| e.nom == nom).expect("tmpfs : entree introuvable");
         entrees.remove(i);
-        if rendre && entrees.is_empty() {
-            *entrees = Vec::new();
+        if rendre {
+            rendre_la_place(entrees);
         }
     }
 
@@ -2187,6 +2211,34 @@ mod tests {
         t.qui = DAVID;
         let modes = [x, y, z].map(|o| t.fs.mode(o.numero));
         assert_eq!(modes, [S_IFREG | 0o755, S_IFREG | 0o2745, S_IFREG | 0o2755]);
+    }
+
+    /// Un dossier rend la place de ses entrées effacées : sa liste revient à
+    /// la place qu'elle avait avant d'en créer (« memoire rendue »).
+    #[test]
+    fn un_dossier_rend_la_place_de_ses_entrees() {
+        let mut t = T::new();
+        let d = t.mkdir(b"/tmp/d").unwrap();
+        let place = |t: &T| match &t.fs.inode(d).contenu {
+            Contenu::Dossier(x) => x.entrees.capacity(),
+            _ => unreachable!(),
+        };
+        for i in 0..3 {
+            t.fichier(alloc::format!("/tmp/d/f{i}").as_bytes()).unwrap();
+        }
+        let avant = place(&t);
+        for i in 3..40 {
+            t.fichier(alloc::format!("/tmp/d/f{i}").as_bytes()).unwrap();
+        }
+        assert!(place(&t) >= 40);
+        for i in 3..40 {
+            t.unlink(alloc::format!("/tmp/d/f{i}").as_bytes()).unwrap();
+        }
+        assert_eq!(place(&t), avant, "la place d'avant les créations");
+        for i in 0..3 {
+            t.unlink(alloc::format!("/tmp/d/f{i}").as_bytes()).unwrap();
+        }
+        assert_eq!(place(&t), 0, "vide : plus rien");
     }
 
     /// Une écriture ou une troncature : les bits setuid et setgid tombent
