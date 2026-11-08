@@ -159,6 +159,7 @@ pub fn demarrer() {
         // que la ligne fait prendre (voir `Lanceur`) ; dans un groupe, celle
         // de son début.
         if l.en_cours == 0 && l.groupe.is_none() {
+            attendre_le_repos();
             l.libres = pages::libres();
             l.paralleles = false;
         }
@@ -419,6 +420,7 @@ impl Lanceur {
     fn commencer_groupe(&mut self, debut: usize, fin: usize) {
         let mesure = self.en_cours == 0;
         if mesure {
+            attendre_le_repos();
             self.libres = pages::libres();
             self.paralleles = false;
         }
@@ -431,7 +433,7 @@ impl Lanceur {
     fn finir_groupe(&mut self) {
         let Some(g) = self.groupe.take() else { return };
         if g.mesure && self.en_cours == 0 {
-            attendre_le_reseau();
+            attendre_le_repos();
             afficherln!("[noyau] Groupe des lignes {} a {} : memoire rendue : {}.", g.debut, g.fin,
                         Rendue(self.libres, pages::libres(), crate::signaux::en_file(), crate::reseau::paquet::vivants()));
         } else {
@@ -515,7 +517,7 @@ impl Lanceur {
         };
         self.en_cours -= 1;
         if self.en_cours == 0 {
-            attendre_le_reseau();
+            attendre_le_repos();
         }
         let rendue = || Rendue(self.libres, pages::libres(), crate::signaux::en_file(), crate::reseau::paquet::vivants());
         let groupe = self.groupe.is_some();
@@ -567,12 +569,16 @@ impl fmt::Display for Rendue {
     }
 }
 
-/// Attend que le réseau soit au repos (reseau::au_repos), 4 s au plus,
-/// avant de mesurer la mémoire rendue : un programme qui a écrit à une
-/// machine muette juste avant de finir a laissé son paquet dans la file du
-/// voisin, jusqu'à l'échec de celui-ci (3 s, inet::voisins). Par tranches
-/// d'une milliseconde (le tic).
-fn attendre_le_reseau() {
+/// Attend le repos avant de mesurer la mémoire (celle d'avant un programme,
+/// celle d'après) : le rendeur a rendu les piles de toutes les tâches
+/// mortes (tache.rs), le cache des piles est vidé (vmalloc.rs : ses cadres
+/// ne sont pas libres), et le réseau est au repos (reseau::au_repos), 4 s
+/// au plus : un programme qui a écrit à une machine muette juste avant de
+/// finir a laissé son paquet dans la file du voisin, jusqu'à l'échec de
+/// celui-ci (3 s, inet::voisins). Par tranches d'une milliseconde (le tic).
+fn attendre_le_repos() {
+    tache::attendre_le_rendeur();
+    crate::vmalloc::vider_le_cache_des_piles();
     let fin = crate::temps::ns_monotone() + 4_000_000_000;
     while !crate::reseau::au_repos() && crate::temps::ns_monotone() < fin {
         let interruptions = crate::cpu::couper_interruptions();

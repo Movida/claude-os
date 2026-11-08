@@ -500,6 +500,9 @@ extern "C" fn noyau_main(infos: u64) -> ! {
             unsafe { port::ecrire(0xf4, 0) };
         }
     };
+    // Le rendeur des piles des tâches mortes (tache.rs), avant toute tâche
+    // qui puisse mourir.
+    tache::lancer_rendeur();
     if tache::lancer_noyau(programmes::NomCourt::de(b"init"), init).is_none() {
         afficherln!("[noyau] Pas de pile pour la tache init : rien a lancer.");
     }

@@ -135,10 +135,49 @@ pub struct Pile {
     case: u32,
 }
 
+/// Les piles rendues gardées projetées, prêtes à resservir (le cache de
+/// `NR_CACHED_STACKS` piles par processeur de Linux, `kernel/fork.c`) :
+/// une pile reprise pour un fil neuf garde ses adresses et ses cadres, rien
+/// à projeter, et surtout rien à faire oublier aux autres processeurs (6j :
+/// retirer une pile de la région demande une interruption entre
+/// processeurs). Deux par processeur ; au-delà, la pile est vraiment rendue
+/// (`Drop`). « Memoire rendue » (programmes.rs) vide le cache avant de
+/// compter : ces cadres ne sont pas libres.
+static CACHE_PILES: Verrou<Vec<Pile>> = Verrou::new(Vec::new());
+const PILES_EN_CACHE_PAR_PROCESSEUR: usize = 2;
+
+/// Range la pile `p`, rendue par le rendeur (tache.rs) : dans le cache
+/// s'il a de la place, sinon vraiment rendue.
+pub fn ranger_pile(p: Pile) {
+    let rendue = {
+        let mut cache = CACHE_PILES.verrouiller();
+        if cache.len() < PILES_EN_CACHE_PAR_PROCESSEUR * crate::processeur::nombre() { cache.ajouter_ou_rendre(p).err() } else { Some(p) }
+    };
+    // Vraiment rendue HORS du verrou du cache (le cache plein, ou sans place
+    // pour elle) : rendre une pile vide les TLB des autres processeurs, ce
+    // qui attend leurs réponses, interdit sous un Verrou (smp.rs).
+    // `ajouter` l'aurait lâchée sous le verrou si la place avait manqué
+    // (la relecture de 6j).
+    drop(rendue);
+}
+
+/// Vide le cache des piles : chacune est vraiment rendue. Avant de compter
+/// la mémoire rendue d'un programme.
+pub fn vider_le_cache_des_piles() {
+    loop {
+        let Some(p) = CACHE_PILES.verrouiller().pop() else { return };
+        drop(p);
+    }
+}
+
 impl Pile {
     /// Une pile neuve, ou None : plus de case (le maximum de fils), ou
-    /// plus de mémoire pour ses pages (rien ne reste alors).
+    /// plus de mémoire pour ses pages (rien ne reste alors). Une pile du
+    /// cache d'abord (voir CACHE_PILES) : déjà projetée.
     pub fn allouer() -> Option<Pile> {
+        if let Some(p) = CACHE_PILES.verrouiller().pop() {
+            return Some(p);
+        }
         let case = REGION.verrouiller().piles_libres.pop()?;
         let pile = Pile { case };
         let pml4 = pagination::pml4_noyau();

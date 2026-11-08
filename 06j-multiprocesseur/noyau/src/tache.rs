@@ -30,10 +30,11 @@
 //!      l'ancienne, prendre celui de la nouvelle, dépiler ses registres,
 //!      et `ret` : on revient là où la nouvelle avait elle-même basculé ;
 //!   5. la FIN DE BASCULE, dans la nouvelle tâche : si l'ancienne est
-//!      morte, rendre sa pile, et la référence qu'elle gardait sur
-//!      elle-même pour cela (une tâche ne peut pas rendre la pile sur
-//!      laquelle elle s'exécute : c'est la suivante qui le fait, le
-//!      `finish_task_switch` de Linux).
+//!      morte, la confier au rendeur (`fin_de_bascule`), avec la référence
+//!      qu'elle gardait sur elle-même pour cela ; il rendra sa pile
+//!      interruptions actives (une tâche ne peut pas rendre la pile sur
+//!      laquelle elle s'exécute ; jusqu'à 6i, c'est la suivante qui la
+//!      rendait, ici même : le `finish_task_switch` de Linux).
 //! Tout l'état d'une tâche suspendue tient donc dans sa pile, et son
 //! contexte n'est que l'adresse de son sommet.
 //!
@@ -78,7 +79,11 @@ use crate::{cpu, gdt, ordonnanceur, pagination, processeur, processus, signaux};
 global_asm!(
     r#"
     .section .text
-    /* basculer(ancien : *mut u64 (rdi), nouveau : *const u64 (rsi)) */
+    /* basculer(ancien : *mut u64 (rdi), nouveau : *const u64 (rsi),
+       tache_ancienne : *const Tache (rdx)) -> *const Tache (rax) : la tâche
+       qu'on quitte est rendue à celle qui reprend (dans rax, que rien ne
+       touche entre les deux), pour sa fin de bascule : c'est le `prev` que
+       `__switch_to_asm` passe à `schedule_tail` chez Linux. */
     .global basculer
 basculer:
     push rbp
@@ -95,6 +100,7 @@ basculer:
     pop r12
     pop rbx
     pop rbp
+    mov rax, rdx
     ret
 
     /* Le premier départ d'un fil de programme : la fin de bascule, puis la
@@ -110,6 +116,7 @@ basculer:
        executer() ou par clone. */
     .global premier_depart
 premier_depart:
+    mov rdi, rax
     call fin_de_bascule
     xor eax, eax
     xor edx, edx
@@ -127,6 +134,7 @@ premier_depart:
        faute. */
     .global depart_noyau
 depart_noyau:
+    mov rdi, rax
     call fin_de_bascule
     sti
     mov rdi, r12
@@ -151,7 +159,9 @@ etat_fpu_initial:
 );
 
 unsafe extern "C" {
-    fn basculer(ancien: *mut u64, nouveau: *const u64);
+    // La tâche quittée passe et revient en pointeur opaque : `Tache` n'a pas
+    // de disposition C, l'assembleur ne fait que la transporter.
+    fn basculer(ancien: *mut u64, nouveau: *const u64, tache_ancienne: *const core::ffi::c_void) -> *const core::ffi::c_void;
     fn premier_depart();
     fn depart_noyau();
     static etat_fpu_initial: EtatFpu;
@@ -196,6 +206,21 @@ pub struct Tache {
     /// Elle s'est terminée : sa pile est à rendre. Un état publié
     /// (Release dans `terminer`, lu SeqCst par `est_morte` : voir là).
     morte: AtomicBool,
+    /// Elle s'exécute sur un processeur, ou n'a pas fini de le quitter (le
+    /// `on_cpu` de Linux) : posé SOUS le verrou de la file des prêtes par
+    /// `ordonnancer`, pour la tâche qu'il choisit, AVANT de basculer ; remis
+    /// à faux par la tâche suivante, première chose de sa fin de bascule
+    /// (`fin_de_bascule`, le `finish_task`), en Release. Qui veut mettre
+    /// cette tâche dans une file (un réveil) ou l'en tirer (un autre
+    /// processeur, 6j) attend qu'il soit faux : elle est encore sur une pile
+    /// qu'un autre processeur exécute.
+    sur_processeur: AtomicBool,
+    /// Elle est dans une file des prêtes (le `on_rq`) : écrit sous le verrou
+    /// de cette file (`File::ajouter`, `retirer`), lu sous lui.
+    en_file: AtomicBool,
+    /// Le processeur dont la file la tient, ou la tenait en dernier (le
+    /// `task_cpu`) : écrit sous le verrou de cette file.
+    processeur: AtomicU32,
     /// Une tâche du noyau qui exécute un programme WebAssembly (6h) : ses
     /// minuteries comptent pour le détecteur d'interblocage comme celles
     /// d'un programme Linux (attente.rs).
@@ -379,6 +404,9 @@ impl Tache {
             processus,
             programme,
             morte: AtomicBool::new(false),
+            sur_processeur: AtomicBool::new(false),
+            en_file: AtomicBool::new(false),
+            processeur: AtomicU32::new(0),
             webassembly: AtomicBool::new(false),
             ecrire_tid: AtomicU64::new(0),
             effacer_tid: AtomicU64::new(0),
@@ -486,6 +514,35 @@ impl Tache {
     pub fn processus(&self) -> Option<&Arc<crate::processus::Entree>> {
         self.processus.as_ref()
     }
+
+    /// S'exécute-t-elle sur un processeur, ou n'a-t-elle pas fini de le
+    /// quitter (voir `sur_processeur`) ? Acquire : la paire du Release de
+    /// `fin_de_bascule`, qui dit que sa pile et ses registres sont rangés.
+    pub fn est_sur_processeur(&self) -> bool {
+        self.sur_processeur.load(Ordering::Acquire)
+    }
+
+    /// `ordonnancer` la choisit (sous le verrou de la file) : elle va
+    /// s'exécuter.
+    pub fn prend_le_processeur(&self) {
+        self.sur_processeur.store(true, Ordering::Relaxed);
+    }
+
+    /// Est-elle dans une file des prêtes (sous le verrou de cette file) ?
+    pub fn est_en_file(&self) -> bool {
+        self.en_file.load(Ordering::Relaxed)
+    }
+
+    /// Entre dans la file des prêtes du processeur `p`, ou en sort (sous le
+    /// verrou de cette file : ordonnanceur.rs).
+    pub fn poser_en_file(&self, oui: bool, p: u32) {
+        self.en_file.store(oui, Ordering::Relaxed);
+        if oui {
+            self.processeur.store(p, Ordering::Relaxed);
+        }
+    }
+
+
 
     /// Est-ce un programme (et pas une tâche du noyau) ?
     pub fn est_programme(&self) -> bool {
@@ -712,6 +769,10 @@ pub fn initialiser() {
         processus: None,
         programme: None,
         morte: AtomicBool::new(false),
+        // L'inactive s'exécute : c'est le code qui est en train de la créer.
+        sur_processeur: AtomicBool::new(true),
+        en_file: AtomicBool::new(false),
+        processeur: AtomicU32::new(0),
         webassembly: AtomicBool::new(false),
         ecrire_tid: AtomicU64::new(0),
         effacer_tid: AtomicU64::new(0),
@@ -743,6 +804,7 @@ pub fn initialiser() {
     p.inactive.store(t, Ordering::Relaxed);
     p.courante.store(t, Ordering::Relaxed);
     TOUTES.verrouiller().try_reserve_exact(crate::vmalloc::max_threads()).expect("plus de memoire pour la table des taches");
+    MORTES.verrouiller().try_reserve_exact(crate::vmalloc::max_threads()).expect("plus de memoire pour la liste des taches mortes");
 }
 
 /// Appelle `f` sur chaque tâche vivante (sauf l'inactive), table tenue :
@@ -969,9 +1031,9 @@ pub fn basculer_vers(nouvelle: &Tache) {
             gdt::definir_pile_noyau(nouvelle.haut);
         }
         processeur::courant().courante.store(nouvelle as *const Tache as *mut Tache, Ordering::Relaxed);
-        basculer(ancienne.contexte.get(), nouvelle.contexte.get());
+        let precedente = basculer(ancienne.contexte.get(), nouvelle.contexte.get(), ancienne as *const Tache as *const core::ffi::c_void);
+        fin_de_bascule(precedente);
     }
-    fin_de_bascule();
     if interruptions {
         cpu::activer_interruptions();
     }
@@ -1011,29 +1073,90 @@ pub fn plus_grande_profondeur() -> usize {
     PILE_LA_PLUS_PROFONDE.load(Ordering::Relaxed).max(ici)
 }
 
-/// La fin d'une bascule, dans la tâche qui reprend (ou démarre) : si la
-/// précédente est morte, sa pile est rendue ici, puisqu'on n'est plus
-/// dessus, puis la référence qu'elle avait gardée pour elle-même (le
-/// `put_task_stack` et le `put_task_struct` de `finish_task_switch`).
-/// Interruptions coupées.
+/// La fin d'une bascule, dans la tâche qui reprend (ou démarre), avec la
+/// tâche qu'on vient de quitter (`precedente`, rendue par `basculer`).
+/// Interruptions coupées. Dans l'ordre du `finish_task_switch` de Linux :
+///   1. la précédente a fini de quitter le processeur : ses registres et sa
+///      pile sont rangés, un autre processeur peut la reprendre (`finish_task`,
+///      `on_cpu = 0` en Release). EN PREMIER : qui l'attend (un réveil, un
+///      processeur qui tire) tourne pendant ce temps ;
+///   2. si elle est morte, elle est confiée au RENDEUR (une tâche du
+///      noyau, `rendeur`), qui rendra sa pile interruptions actives : la
+///      rendre demande de faire oublier ses traductions à tous les
+///      processeurs (6j, une interruption entre processeurs), ce qui ne se
+///      fait pas interruptions coupées. Jusqu'à 6i, la pile était rendue
+///      ici même. Linux de même : `put_task_stack` passe par un cache de
+///      piles par processeur ou par un `vfree` différé.
 #[unsafe(no_mangle)]
-extern "C" fn fin_de_bascule() {
+extern "C" fn fin_de_bascule(precedente: *const core::ffi::c_void) {
+    let precedente = precedente as *const Tache;
+    // SAFETY: la précédente vit : une tâche ne quitte son Arc que rendue par
+    // le rendeur, bien après cette fin de bascule.
+    unsafe { &*precedente }.sur_processeur.store(false, Ordering::Release);
     let morte = processeur::courant().a_rendre.swap(core::ptr::null_mut(), Ordering::Relaxed);
     if !morte.is_null() {
         // SAFETY: `morte` vient d'Arc::into_raw dans `terminer`, rendu une
         // seule fois, ici ; elle ne s'exécute plus.
         let t = unsafe { Arc::from_raw(morte) };
-        if let Some(p) = t.pile.verrouiller().take() {
-            PILE_LA_PLUS_PROFONDE.fetch_max(profondeur(&p), Ordering::Relaxed);
-        }
-        // Un fil de programme : sa tâche rendue (si rien d'autre ne la
-        // tient), son processus est peut-être fini.
-        let processus = t.processus.clone();
-        drop(t);
-        if let Some(p) = processus {
-            p.fil_disparu();
+        A_RENDRE_AU_RENDEUR.fetch_add(1, Ordering::Release);
+        // La place est réservée (`initialiser`) : autant de mortes au plus
+        // que de piles.
+        MORTES.verrouiller().ajouter_dans_la_place(t);
+        RENDEUR_ATTENTE.reveiller_toutes();
+    }
+}
+
+/// Les tâches mortes dont le rendeur doit rendre la pile, et leur compte
+/// (celles de la liste, et celle qu'il est en train de rendre) : « memoire
+/// rendue » (programmes.rs) attend qu'il soit nul.
+static MORTES: Verrou<Vec<Arc<Tache>>> = Verrou::new(Vec::new());
+static A_RENDRE_AU_RENDEUR: AtomicUsize = AtomicUsize::new(0);
+/// Le rendeur y attend du travail ; qui attend que tout soit rendu attend
+/// dans la seconde.
+static RENDEUR_ATTENTE: crate::attente::FileAttente = crate::attente::FileAttente::new();
+static RENDU_ATTENTE: crate::attente::FileAttente = crate::attente::FileAttente::new();
+
+/// Le rendeur : une tâche du noyau qui rend les piles des tâches mortes,
+/// interruptions actives, puis dit au processus de chacune qu'un fil a
+/// tout à fait disparu (`fil_disparu`, qui fait du processus un zombie au
+/// dernier). Une pile rendue va d'abord dans un cache (vmalloc.rs) : reprise
+/// pour un fil neuf, aux mêmes adresses et sur les mêmes cadres, elle ne
+/// demande rien à personne.
+fn rendeur() {
+    loop {
+        crate::attente::attendre_que(&RENDEUR_ATTENTE, crate::attente::Inscription::Ordinaire, crate::attente::Sommeil::Ininterruptible, None,
+                                     || !MORTES.verrouiller().is_empty());
+        while let Some(t) = MORTES.verrouiller().pop() {
+            if let Some(p) = t.pile.verrouiller().take() {
+                PILE_LA_PLUS_PROFONDE.fetch_max(profondeur(&p), Ordering::Relaxed);
+                crate::vmalloc::ranger_pile(p);
+            }
+            // Un fil de programme : sa tâche rendue (si rien d'autre ne la
+            // tient), son processus est peut-être fini.
+            let processus = t.processus.clone();
+            drop(t);
+            if let Some(p) = processus {
+                p.fil_disparu();
+            }
+            A_RENDRE_AU_RENDEUR.fetch_sub(1, Ordering::Release);
+            RENDU_ATTENTE.reveiller_toutes();
         }
     }
+}
+
+/// Lance le rendeur, au démarrage, dès que les tâches existent.
+pub fn lancer_rendeur() {
+    if lancer_noyau(NomCourt::de(b"rendeur"), rendeur).is_none() {
+        panic!("pas de pile pour le rendeur");
+    }
+}
+
+/// Attend que le rendeur ait rendu toutes les tâches mortes : avant de
+/// compter la mémoire rendue (programmes.rs), et de vider le cache des
+/// piles (vmalloc.rs).
+pub fn attendre_le_rendeur() {
+    crate::attente::attendre_que(&RENDU_ATTENTE, crate::attente::Inscription::Ordinaire, crate::attente::Sommeil::Ininterruptible, None,
+                                 || A_RENDRE_AU_RENDEUR.load(Ordering::SeqCst) == 0);
 }
 
 /// Attend la fin de la tâche `t` : la tâche courante dort jusqu'à ce que

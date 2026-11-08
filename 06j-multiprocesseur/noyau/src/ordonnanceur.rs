@@ -182,11 +182,12 @@ impl File {
         let tranche = if neuve { tranche_virtuelle(poids) / 2 } else { tranche_virtuelle(poids) };
         // Les deux invariants que le réveil sous verrou garantit (voir
         // `reveiller`) : jamais deux fois en file, jamais une morte.
-        assert!(self.position(&t).is_none(), "tache deja dans la file des pretes");
+        assert!(!t.est_en_file(), "tache deja dans la file des pretes");
         assert!(!t.est_morte(), "tache morte remise dans une file des pretes");
         // La place est réservée au démarrage (`initialiser`) : la file ne
         // grandit pas pendant un programme, et l'ordonnanceur n'appelle
         // jamais le tas (il tourne aussi dans les interruptions).
+        t.poser_en_file(true, 0);
         self.entites.ajouter_dans_la_place(Entite { tache: t, vruntime, echeance: vruntime + tranche, poids, protegee: false });
     }
 
@@ -197,6 +198,7 @@ impl File {
         let Some(i) = self.position(t) else { return };
         let moyenne = self.moyenne();
         let e = self.entites.swap_remove(i);
+        e.tache.poser_en_file(false, 0);
         if self.entites.is_empty() {
             self.zero = moyenne;
         }
@@ -216,32 +218,44 @@ pub fn initialiser(max: usize) {
 
 /// Réveille `t` (tache.rs, `reveiller`) : son état passe de « dort » à
 /// `pourquoi` SOUS le verrou de la file, dans la même section critique que
-/// la lecture de sa place dans la file (le `pi_lock` de Linux, tenu de
+/// la lecture de `en_file` (le `pi_lock` de Linux, tenu de
 /// `ttwu_state_match` à `ttwu_queue` ; chez nous le verrou de la file
 /// suffit : `ordonnancer` lit l'état et retire la tâche sous ce même
-/// verrou). Un compare_exchange gagné avec la tâche hors de la file dit
-/// alors qu'elle s'est retirée pour CE sommeil et ne s'exécutera plus
-/// d'elle-même : personne d'autre ne peut la remettre en file, et un second
-/// réveilleur trouve un état qui ne dort plus. Rend faux si elle ne dormait
-/// pas, ou pas d'un sommeil que `pourquoi` réveille.
+/// verrou). Un compare_exchange gagné avec `en_file` faux dit alors que la
+/// tâche s'est retirée pour CE sommeil et ne s'exécutera plus d'elle-même :
+/// personne d'autre ne peut la remettre en file, et un second réveilleur
+/// trouve un état qui ne dort plus. Rend faux si elle ne dormait pas, ou
+/// pas d'un sommeil que `pourquoi` réveille.
 pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) -> bool {
-    let mut f = FILE.verrouiller();
+    let f = FILE.verrouiller();
     if !t.passer_a_reveillee(pourquoi) {
         return false;
     }
     // Le `ttwu_runnable` de Linux : elle n'avait pas fini de s'endormir
     // (son état, réveillé, l'y garde), ou elle est préemptée : rien à
     // ajouter ; elle doit peut-être passer avant la courante.
-    if f.position(&t).is_none() {
-        f.compter_courante();
-        f.ajouter(t, false);
+    if t.est_en_file() {
+        ceder_si_une_autre_passe(&f);
+        return true;
     }
+    drop(f);
+    // Sortie de la file pour ce sommeil ; elle peut n'avoir pas FINI de
+    // quitter le processeur (`sur_processeur`, entre sa sortie de la file
+    // et la fin de bascule de la tâche suivante) : on attend, sans le
+    // verrou de la file (la fin de bascule n'a besoin de rien de nous,
+    // quelques centaines de cycles), puis on la met dans la file.
+    while t.est_sur_processeur() {
+        core::hint::spin_loop();
+    }
+    let mut f = FILE.verrouiller();
+    f.compter_courante();
+    f.ajouter(t, false);
     ceder_si_une_autre_passe(&f);
     true
 }
 
 /// Une tâche neuve (clone, un programme lancé) devient prête. Elle n'est
-/// pas dans la file : rien à vérifier.
+/// dans la file ni sur un processeur : rien à vérifier.
 pub fn rendre_prete(t: Arc<Tache>) {
     let mut f = FILE.verrouiller();
     f.compter_courante();
@@ -324,9 +338,16 @@ pub fn ordonnancer(bascule: Bascule) {
         // ne reprendra jamais la main (une morte) ne serait jamais rendu.
         let choisie = f.choisir().map(|e| Arc::as_ptr(&e.tache));
         // Celle qui reçoit le processeur le garde jusqu'au bout de sa
-        // tranche (RUN_TO_PARITY, le `set_next_entity` de Linux).
+        // tranche (RUN_TO_PARITY, le `set_next_entity` de Linux) ; et elle
+        // s'exécute (`sur_processeur`, le `prepare_task`), dit SOUS le verrou
+        // de la file, avant de basculer : un autre processeur qui la
+        // tirerait de la file entre les deux la verrait en cours.
         if let Some(i) = choisie.and_then(|c| f.entites.iter().position(|e| core::ptr::eq(Arc::as_ptr(&e.tache), c))) {
             f.entites[i].protegee = true;
+            f.entites[i].tache.prend_le_processeur();
+        } else {
+            // SAFETY: l'inactive de ce processeur vit pour toujours.
+            unsafe { &*tache::inactive() }.prend_le_processeur();
         }
         // Une bascule volontaire si la courante a quitté la file (elle
         // s'endort, ou elle meurt), forcée sinon (getrusage : `__schedule`).
