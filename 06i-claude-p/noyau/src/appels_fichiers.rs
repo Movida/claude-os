@@ -1118,6 +1118,14 @@ fn ecrire_pages(n: Numero, position: u64, tampon: u64, longueur: u64) -> Result<
     Ok(ecrits)
 }
 
+/// Une écriture du fichier `n` par la tâche courante : ses bits setuid et
+/// setgid tombent s'il le faut (Tmpfs::retirer_les_privileges ; une tâche
+/// du noyau est root). Une troncature fait de même dans `tronquer`.
+fn retirer_les_privileges(n: Numero) {
+    let qui = processus::essayer_avec(|p| p.identite).unwrap_or(Identite::ROOT);
+    vfs::avec(|fs, _| fs.retirer_les_privileges(qui, n, temps::maintenant()));
+}
+
 /// Des octets aléatoires vers le programme (`get_random_bytes_user`) :
 /// un tirage, dont la clé est remplacée par 32 octets neufs avant la
 /// première copie (une copie peut fauter et dormir : la clé d'avant
@@ -1303,6 +1311,12 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
             // bizarrerie de Linux, que décrit sa page de manuel).
             let fin = vfs::avec(|fs, _| fs.attributs(o.numero()).taille);
             let ici = if o.drapeaux as u64 & O_APPEND != 0 { fin } else { ici };
+            // La limite (EFBIG), puis les bits setuid et setgid, avant
+            // d'écrire (`generic_write_checks`, puis `file_remove_privs`).
+            limite_ecriture(ici, longueur as usize).map_err(errno)?;
+            if longueur > 0 {
+                retirer_les_privileges(o.numero());
+            }
             let ecrits = ecrire_pages(o.numero(), ici, tampon, longueur)?;
             if position.is_none() {
                 o.changer_position(ici + ecrits);
@@ -2694,7 +2708,14 @@ pub fn fchdir(fd: u64) -> i64 {
 fn tronquer(n: Numero, taille: u64) -> i64 {
     let _ecriture = verrou_d_ecriture(n);
     retirer_projections(n, taille.div_ceil(PAGE));
-    let r = vfs::avec(|fs, cadres| fs.tronquer(n, taille, temps::maintenant(), cadres));
+    let qui = processus::essayer_avec(|p| p.identite).unwrap_or(Identite::ROOT);
+    // Les bits setuid et setgid tombent avec la taille (`do_truncate`).
+    let r = vfs::avec(|fs, cadres| {
+        let maintenant = temps::maintenant();
+        fs.tronquer(n, taille, maintenant, cadres)?;
+        fs.retirer_les_privileges(qui, n, maintenant);
+        Ok(())
+    });
     retirer_projections(n, taille.div_ceil(PAGE));
     match r {
         Ok(()) => 0,

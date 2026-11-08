@@ -1046,6 +1046,12 @@ impl Wasi {
         // Le verrou d'écriture de l'inode, comme pour un programme Linux
         // (appels_fichiers.rs) : la fin lue et l'écriture ne se séparent pas.
         let _ecriture = (ecriture && sorte == Sorte::Fichier).then(|| crate::appels_fichiers::verrou_d_ecriture(n()));
+        // Les bits setuid et setgid tombent à une écriture qui écrit quelque
+        // chose, comme pour un programme Linux (`file_remove_privs`).
+        if ecriture && sorte == Sorte::Fichier && (0..nombre).any(|i| morceau(m, morceaux, i).is_some_and(|(_, l)| l > 0)) {
+            let qui = self.identite;
+            vfs::avec(|fs, _| fs.retirer_les_privileges(qui, n(), temps::maintenant()));
+        }
         let maintenant = temps::maintenant();
         let mut ici = if ecriture && drapeaux & O_APPEND != 0 && sorte == Sorte::Fichier {
             vfs::avec(|fs, _| fs.attributs(n()).taille)
@@ -1435,8 +1441,11 @@ impl Wasi {
                     return Err(EIO);
                 }
             };
+            // O_TRUNC : vidé, et ses bits setuid et setgid tombent
+            // (`do_truncate`).
             if ouvert.tronquer {
                 let _ = s.fs.tronquer(ouvert.numero, 0, maintenant, cadres);
+                s.fs.retirer_les_privileges(qui, ouvert.numero, maintenant);
             }
             s.ouverts
                 .ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, drapeaux, &chemin).avec_chemin(complet))

@@ -693,6 +693,16 @@ static void arborescence_bornes(void)
     /* chown(-1, -1) retire le setuid, même à son propriétaire. */
     fchmod(fd, 04755);
     verifier(fchown(fd, -1, -1) == 0 && fstat(fd, &a) == 0 && (a.st_mode & 07777) == 0755, "chown(-1, -1) retire S_ISUID");
+    /* Une écriture et une troncature aussi, sauf pour root
+     * (`file_remove_privs`, depuis 6i) ; une écriture de 0 octet, non. */
+    if (getuid() != 0) {
+        fchmod(fd, 04755);
+        int vide = write(fd, "", 0) == 0 && fstat(fd, &a) == 0 && (a.st_mode & 07777) == 04755;
+        int ecrit = write(fd, "x", 1) == 1 && fstat(fd, &a) == 0 && (a.st_mode & 07777) == 0755;
+        fchmod(fd, 06775);
+        int tronque = ftruncate(fd, 0) == 0 && fstat(fd, &a) == 0 && (a.st_mode & 07777) == 0775;
+        verifier(vide && ecrit && tronque, "write et ftruncate retirent S_ISUID (et S_ISGID avec le x du groupe) ; write de 0 octet, non");
+    }
     /* Un dossier effacé, encore ouvert : rien à y lire (ENOENT). */
     snprintf(e, sizeof e, "%s/efface", d);
     mkdir(e, 0755);

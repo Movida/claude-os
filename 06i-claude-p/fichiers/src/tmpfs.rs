@@ -1416,6 +1416,30 @@ impl Tmpfs {
         Ok(())
     }
 
+    /// Une écriture ou une troncature du fichier `n` par `qui` (6i, un reste
+    /// de 6b) : un fichier ordinaire perd son bit setuid, et son bit setgid
+    /// s'il est exécutable par le groupe (sinon, si `qui` n'est pas du
+    /// groupe), sauf pour root (CAP_FSETID) : le `file_remove_privs` de
+    /// Linux, à chaque write qui écrit quelque chose, et à chaque troncature
+    /// (`do_truncate`), même par le propriétaire. Rend vrai si le mode a
+    /// changé (la date de changement aussi).
+    pub fn retirer_les_privileges(&mut self, qui: Identite, n: Numero, maintenant: Temps) -> bool {
+        let i = self.inode_mut(n);
+        if i.genre() != S_IFREG || qui.root() {
+            return false;
+        }
+        let mut mode = i.mode & !S_ISUID;
+        if mode & S_ISGID != 0 && (mode & 0o010 != 0 || qui.gid != i.gid) {
+            mode &= !S_ISGID;
+        }
+        if mode == i.mode {
+            return false;
+        }
+        i.mode = mode;
+        i.ctime = maintenant;
+        true
+    }
+
     /// utimensat : poser les dates d'accès et de modification. Les deux à
     /// « maintenant » (le `touch` ordinaire) : le propriétaire, ou qui a le
     /// droit d'écrire (sinon EACCES) ; tout autre couple, même une seule
@@ -2163,6 +2187,33 @@ mod tests {
         t.qui = DAVID;
         let modes = [x, y, z].map(|o| t.fs.mode(o.numero));
         assert_eq!(modes, [S_IFREG | 0o755, S_IFREG | 0o2745, S_IFREG | 0o2755]);
+    }
+
+    /// Une écriture ou une troncature : les bits setuid et setgid tombent
+    /// comme le veut `file_remove_privs` (mesuré sous Linux 6.18, par un
+    /// utilisateur ordinaire : 04755 devient 0755 au premier write).
+    #[test]
+    fn ecrire_retire_les_privileges() {
+        let mut t = T::new();
+        let f = t.fichier(b"/tmp/f").unwrap();
+        t.fs.changer_mode(DAVID, f, 0o4755, T0).unwrap();
+        assert!(t.fs.retirer_les_privileges(DAVID, f, T0));
+        assert_eq!(t.fs.mode(f), S_IFREG | 0o755);
+        assert!(!t.fs.retirer_les_privileges(DAVID, f, T0), "plus rien a retirer");
+        // root (CAP_FSETID) garde les bits.
+        t.fs.changer_mode(DAVID, f, 0o6755, T0).unwrap();
+        assert!(!t.fs.retirer_les_privileges(Identite::ROOT, f, T0));
+        assert_eq!(t.fs.mode(f), S_IFREG | 0o6755);
+        // setgid sans le x du groupe : il reste pour un membre du groupe...
+        t.fs.changer_mode(DAVID, f, 0o2745, T0).unwrap();
+        assert!(!t.fs.retirer_les_privileges(DAVID, f, T0));
+        // ... et tombe pour qui n'en est pas.
+        assert!(t.fs.retirer_les_privileges(Identite { uid: 1000, gid: 5 }, f, T0));
+        assert_eq!(t.fs.mode(f), S_IFREG | 0o745);
+        // Un dossier garde les siens.
+        let d = t.mkdir(b"/tmp/d").unwrap();
+        t.fs.changer_mode(DAVID, d, 0o2755, T0).unwrap();
+        assert!(!t.fs.retirer_les_privileges(DAVID, d, T0));
     }
 
     /// chown et les bits setuid et setgid, et utimensat par un autre que le
