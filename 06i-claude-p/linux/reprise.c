@@ -12,10 +12,13 @@
  * sortent jamais du noyau : restart_syscall appelé par le programme rend
  * EINTR, et un fil qui calcule avec rax = -512 sous une pluie de signaux
  * ne voit ni rax ni RIP changer (le noyau ne doit refaire QUE des appels
- * système, jamais le code interrompu par une interruption).
+ * système, jamais le code interrompu par une interruption). Depuis 6i : un
+ * read de /dev/zero sous des signaux rend ce qu'il a copié, par pages
+ * (`read_zero`).
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/futex.h>
 #include <poll.h>
 #include <pthread.h>
@@ -26,6 +29,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
 #include <time.h>
@@ -519,6 +523,50 @@ static void calcul_sous_signaux(void)
     verifier(mauvais == 0 && rax_vu == -512 && appels >= 10, "un calcul avec rax = -512 sous des signaux : ni rax ni RIP ne changent");
 }
 
+/* read de /dev/zero : un signal pendant la copie la fait rendre ce qui est
+ * copié, un nombre de pages (`read_zero` regarde les signaux après chaque
+ * page ; SA_RESTART n'y change rien, la lecture n'est pas refaite). Un autre
+ * fil envoie SIGUSR1 sans arrêt pendant un read de 256 Mio (les fautes de
+ * page de la première fois le font durer) : jusqu'à cinq essais, pour le cas
+ * où le premier signal arriverait après la fin du read. */
+static volatile int lecture_finie;
+static pthread_t lecteur;
+
+static void *signaler_le_lecteur(void *rien)
+{
+    (void)rien;
+    while (!lecture_finie)
+        pthread_kill(lecteur, SIGUSR1);
+    return NULL;
+}
+
+static void zero_sous_signaux(void)
+{
+    size_t taille = 256UL << 20;
+    char *z = mmap(NULL, taille, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int fd = open("/dev/zero", O_RDONLY);
+    if (z == MAP_FAILED || fd < 0) {
+        verifier(0, "read de /dev/zero sous des signaux : preparation");
+        return;
+    }
+    poser(1);
+    lecteur = pthread_self();
+    int partiel = 0, par_pages = 1;
+    for (int essai = 0; essai < 5 && !partiel; essai++) {
+        lecture_finie = 0;
+        pthread_t t;
+        pthread_create(&t, NULL, signaler_le_lecteur, NULL);
+        ssize_t n = read(fd, z, taille);
+        lecture_finie = 1;
+        pthread_join(t, NULL);
+        partiel = n > 0 && (size_t)n < taille;
+        par_pages &= n > 0 && n % 4096 == 0;
+    }
+    verifier(partiel && par_pages, "read de 256 Mio de /dev/zero sous des signaux : rend ce qui est copie, par pages");
+    close(fd);
+    munmap(z, taille);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -557,6 +605,7 @@ int main(void)
     sigsuspend_refait();
     verifier(syscall(SYS_restart_syscall) == -1 && errno == EINTR, "restart_syscall sans rien a reprendre : EINTR");
     calcul_sous_signaux();
+    zero_sous_signaux();
     printf("[linux] reprise : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

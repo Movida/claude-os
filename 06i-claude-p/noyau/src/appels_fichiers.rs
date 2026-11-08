@@ -1161,19 +1161,22 @@ pub fn alea_vers_programme(tampon: u64, longueur: u64) -> Result<u64, i64> {
     r
 }
 
-/// Remplit `longueur` octets du programme à `tampon` avec `remplir`, par
-/// morceaux de 256 octets (des zéros, de l'aléa). Une faute : ce qui a été
-/// copié, ou EFAULT si rien.
-fn produire(tampon: u64, longueur: u64, mut remplir: impl FnMut(&mut [u8])) -> Result<u64, i64> {
+/// Des zéros vers le programme, à `tampon` (`read_zero`) : par pages,
+/// copiées de la page de zéros du noyau, un signal regardé après chacune
+/// (il fait rendre ce qui l'est : un read d'un Gio de /dev/zero ne fait
+/// pas attendre un SIGINT). Une faute : ce qui a été copié, ou EFAULT si
+/// rien.
+fn zeros_vers_programme(tampon: u64, longueur: u64) -> Result<u64, i64> {
     let mut fait = 0;
-    let mut morceau = [0u8; 256];
     while fait < longueur {
-        let n = (longueur - fait).min(morceau.len() as u64) as usize;
-        remplir(&mut morceau[..n]);
-        let copies = copier_vers_utilisateur_partiel(tampon + fait, &morceau[..n]);
+        let n = (longueur - fait).min(PAGE) as usize;
+        let copies = vfs::copier_vers_programme(crate::espace_utilisateur::page_de_zeros(), 0, n, tampon + fait);
         fait += copies as u64;
         if copies < n {
             return if fait == 0 { Err(-EFAULT) } else { Ok(fait) };
+        }
+        if tache::signal_en_attente() {
+            break;
         }
     }
     Ok(fait)
@@ -1228,7 +1231,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         Sorte::Console if position.is_some() => Err(-ESPIPE),
         // La console n'est pas encore un terminal (6k) : rien à lire.
         Sorte::Null | Sorte::Console => Ok(0),
-        Sorte::Zero | Sorte::Plein => produire(tampon, longueur, |m| m.fill(0)),
+        Sorte::Zero | Sorte::Plein => zeros_vers_programme(tampon, longueur),
         // /dev/random attend que le générateur soit prêt (EAGAIN en
         // O_NONBLOCK) ; /dev/urandom n'attend pas, mais lance la gigue
         // (`random_read_iter`, `urandom_read_iter`).
