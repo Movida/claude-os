@@ -14,7 +14,7 @@
 [noyau] TSC : 
  : l'heure a la nanoseconde.
 [noyau] Horloge : timer de l'APIC (
-1000 Hz, vecteur 0xec ; PIT arrete.
+mesure contre le TSC), 1000 Hz, vecteur 0xec ; PIT arrete.
 [linux] temps : CLOCK_MONOTONIC a la nanoseconde (resolution 1 ns) : ok
 [noyau] 100 ms plus tard : 
 [noyau] Heure (UTC) : 20
@@ -35,7 +35,11 @@ rendues et recollees : ok.
 [noyau] Adresses du noyau a la demande (vmalloc) : 
 [noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : ok ; garde sans projection : ok ; rendue : ok ; memoire video projetee sans cache : ok ; BIOS projete en lecture seule : ok, memoire vive refusee : ok.
 [noyau] ACPI : RSDP v0 (BOCHS), RSDT : FACP APIC HPET WAET.
-[noyau] ACPI : 1 processeur, APIC local a 0xfee00000, IO-APIC 0 a 0xfec00000 (GSI a partir de 0), 8259 present.
+[noyau] ACPI : 4 processeurs, APIC local a 0xfee00000, IO-APIC 0 a 0xfec00000 (GSI a partir de 0), 8259 present.
+[noyau] Processeur 1 (APIC 1) en service.
+[noyau] Processeur 2 (APIC 2) en service.
+[noyau] Processeur 3 (APIC 3) en service.
+[noyau] 4 processeurs en service.
 [noyau] ACPI : IRQ ISA remplacees : 0 -> GSI 2 ; 5 -> GSI 5 en niveau ; 9 -> GSI 9 en niveau ; 10 -> GSI 10 en niveau ; 11 -> GSI 11 en niveau ; NMI sur LINT1.
 [pci] 8 fonctions sur le bus (ports 0xCF8 et 0xCFC).
 [pci] 00:00.0 8086:1237 pont hote.
@@ -58,8 +62,8 @@ rendues et recollees : ok.
 [noyau] Archive de programmes : 
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 64, liens symboliques 6, liens physiques 4 ; archive rendue (
-[noyau] Lancement : /etc/demarrage, 93 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 65, liens symboliques 6, liens physiques 4 ; archive rendue (
+[noyau] Lancement : /etc/demarrage, 94 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -155,6 +159,8 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] tubes : termine, code de sortie 141 ; memoire rendue : ok.
 [linux] systeme : toutes les verifications : ok
 [noyau] systeme : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] processeurs : toutes les verifications : ok
+[noyau] processeurs : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] evenements : toutes les verifications : ok
 [noyau] evenements : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] proc : toutes les verifications : ok
@@ -197,12 +203,12 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] arbre : - 0644 1000 1000    36868 /tmp/groupe/sous-dossier/fichier-9
 [noyau] effacer : termine, code de sortie 0.
 [linux] effacer : /tmp/groupe efface : ok
-[noyau] Groupe des lignes 101 a 105 : memoire rendue : ok.
+[noyau] Groupe des lignes 103 a 107 : memoire rendue : ok.
 [linux] effacer : /tmp/fuite cree, 4 fichiers : ok
 [noyau] prog : ouvert en ecriture, ne peut pas etre execute (ETXTBSY)
 [linux] redirections : /tmp/prog tenu en ecriture : ok
 [linux] effacer : /tmp/fuite efface : ok
-[noyau] Groupe des lignes 109 a 116 : memoire rendue : ok.
+[noyau] Groupe des lignes 111 a 118 : memoire rendue : ok.
 [linux] copies : copy_file_range de trois pages et 100 octets : ok
 [linux] copies : sendfile vers une socket : ok
 [linux] copies : toutes les verifications : ok

@@ -64,6 +64,55 @@ pub fn arreter() -> ! {
     }
 }
 
+/// Les registres de contrôle CR0 et CR4, pour les comparer d'un processeur
+/// à l'autre (smp.rs) et les donner aux secondaires (trampoline.rs).
+pub fn lire_cr0() -> u64 {
+    let v: u64;
+    // SAFETY: lecture d'un registre de contrôle, sans effet.
+    unsafe { asm!("mov {}, cr0", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+pub fn lire_cr4() -> u64 {
+    let v: u64;
+    // SAFETY: comme `lire_cr0`.
+    unsafe { asm!("mov {}, cr4", out(reg) v, options(nomem, nostack, preserves_flags)) };
+    v
+}
+
+/// Lit un registre spécifique du modèle (MSR).
+///
+/// # Safety
+/// `msr` doit exister sur ce processeur (sinon, faute de protection
+/// générale).
+pub unsafe fn lire_msr(msr: u32) -> u64 {
+    let (bas, haut): (u32, u32);
+    // SAFETY: garanti par l'appelant.
+    unsafe { asm!("rdmsr", in("ecx") msr, out("eax") bas, out("edx") haut, options(nomem, nostack, preserves_flags)) };
+    (haut as u64) << 32 | bas as u64
+}
+
+/// Écrit un registre spécifique du modèle (MSR).
+///
+/// # Safety
+/// `msr` doit exister, et `valeur` y avoir un sens.
+pub unsafe fn ecrire_msr(msr: u32, valeur: u64) {
+    // SAFETY: garanti par l'appelant.
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") valeur as u32, in("edx") (valeur >> 32) as u32,
+             options(nostack, preserves_flags));
+    }
+}
+
+/// Le MSR EFER (Extended Feature Enable Register) : le mode long (LME,
+/// LMA), le bit NX (NXE), `syscall` (SCE).
+pub const EFER: u32 = 0xC000_0080;
+
+pub fn lire_efer() -> u64 {
+    // SAFETY: EFER existe sur tout processeur 64 bits.
+    unsafe { lire_msr(EFER) }
+}
+
 /// Le MSR de la base du segment FS : en 64 bits, le seul usage qui reste
 /// de FS est d'y ranger une adresse de base, que le programme fixe par
 /// arch_prctl. La glibc y met son bloc de « variables propres au fil

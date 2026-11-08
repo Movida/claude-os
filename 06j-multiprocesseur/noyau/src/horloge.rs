@@ -2,20 +2,26 @@
 //! compte le temps et rendra la main à l'ordonnanceur.
 //!
 //! Deux sources, choisies au démarrage :
-//!   - le TIMER DE L'APIC local (apic.rs), quand l'APIC est en service et
-//!     que le TSC est fiable (tsc.rs) : celle de Linux. Chaque processeur a
-//!     le sien, il ne passe ni par l'IO-APIC ni par le bus ISA. Sa
-//!     fréquence (celle du bus de l'APIC, divisée par 16) dépend de la
-//!     machine : on la MESURE contre le TSC pendant 10 ms, puis on le règle
-//!     en mode périodique pour une interruption par milliseconde. Le PIT
-//!     est alors arrêté ;
+//!   - le TIMER DE L'APIC local (apic.rs), dès que l'APIC est en service :
+//!     celle de Linux. Chaque processeur a le sien, il ne passe ni par
+//!     l'IO-APIC ni par le bus ISA : c'est ce qui donnera un tic à chaque
+//!     processeur (6j). Sa fréquence (celle du bus de l'APIC, divisée par
+//!     16) dépend de la machine : on la MESURE, contre le TSC pendant 10 ms
+//!     s'il est fiable (tsc.rs), sinon contre le canal 2 du PIT pendant
+//!     50 ms (ce que fait `calibrate_APIC_clock` de Linux contre son
+//!     horloge globale) ; puis on le règle en mode périodique pour une
+//!     interruption par milliseconde. Le PIT est alors arrêté. Jusqu'à 6i,
+//!     le timer de l'APIC n'était pris qu'avec un TSC fiable, et le PIT
+//!     gardé sinon ; or l'IRQ 0 du PIT ne va qu'au premier processeur, et
+//!     `make tests-qemu` lance l'archive de test sous `-cpu qemu64`, dont
+//!     le TSC n'est pas déclaré constant : des secondaires sans tic ne
+//!     préempteraient jamais un fil qui calcule ;
 //!   - sinon le PIT 8253/8254 (Programmable Interval Timer) des étapes 3 à
 //!     6d, qui reçoit un quartz à 1 193 182 Hz (un tiers de la fréquence
 //!     des télévisions NTSC : le quartz le moins cher en 1981 !). Son canal
 //!     0, câblé sur l'IRQ 0, compte à rebours depuis un « diviseur », puis
-//!     recommence. Sans TSC fiable, la période exacte du PIT est notre
-//!     seule mesure du temps (Linux prendrait le HPET, que nous n'avons
-//!     pas) : il reste l'horloge.
+//!     recommence. Sans APIC (une machine sans tables ACPI : un seul
+//!     processeur), il reste l'horloge.
 //!
 //! UNIPROCESSEUR : un seul timer réglé, celui du processeur de démarrage ;
 //! avec plusieurs, chaque processeur règle le sien (son tic fait tourner
@@ -72,26 +78,29 @@ static TICS: AtomicU64 = AtomicU64::new(0);
 
 /// La source du tic, pour l'afficher.
 pub enum Source {
-    /// Le timer de l'APIC, et sa fréquence mesurée (en Hz, après le
-    /// diviseur).
-    Apic(u64),
+    /// Le timer de l'APIC : sa fréquence mesurée (en Hz, après le
+    /// diviseur), et contre quoi (« TSC » ou « PIT »).
+    Apic { hz: u64, etalon: &'static str },
     Pit,
 }
 
-/// Démarre le tic : le timer de l'APIC si `apic` (l'APIC est en service)
-/// et si le TSC est fiable, le PIT sinon. Interruptions coupées.
-pub fn initialiser(apic: bool) -> Source {
-    if apic && crate::tsc::khz().is_some() {
-        // Les décomptes du timer pendant environ 10 ms, mesurées au TSC. Un
-        // accès aux registres de l'APIC prend du temps (sous QEMU, des
-        // dizaines de microsecondes : l'émulateur s'arrête à chaque fois) :
-        // l'instant où le timer démarre, et celui où on lit son compteur,
-        // sont pris au milieu de deux lectures du TSC qui encadrent
-        // l'accès. Sinon, la mesure surestimait sa fréquence de 0,7 %.
+/// Mesure la fréquence du timer de l'APIC, après son diviseur (en Hz), et
+/// dit contre quoi : le TSC pendant 10 ms s'il est fiable, sinon le canal 2
+/// du PIT pendant 50 ms. Un accès aux registres de l'APIC prend du temps
+/// (sous QEMU, des dizaines de microsecondes : l'émulateur s'arrête à
+/// chaque fois) : contre le TSC, l'instant où le timer démarre, et celui où
+/// on lit son compteur, sont pris au milieu de deux lectures du TSC qui
+/// encadrent l'accès (sinon, la mesure surestimait sa fréquence de 0,7 %) ;
+/// contre le PIT, qu'on ne lit pas aussi finement, c'est la durée de la
+/// mesure, 50 ms, qui rend ces dizaines de microsecondes négligeables (un
+/// millième). None : le PIT n'a pas répondu (alors il ne ferait pas
+/// d'horloge non plus ; on le garde quand même, comme avant).
+fn etalonner_apic() -> Option<(u64, &'static str)> {
+    if let Some(khz) = crate::tsc::khz() {
         let t0 = crate::tsc::lire();
         crate::apic::armer_etalonnage();
         let t1 = crate::tsc::lire();
-        let fin = t1 + crate::tsc::khz().unwrap_or(0) * 10;
+        let fin = t1 + khz * 10;
         while crate::tsc::lire() < fin {
             core::hint::spin_loop();
         }
@@ -99,7 +108,19 @@ pub fn initialiser(apic: bool) -> Source {
         let decomptes = crate::apic::decomptes_etalonnage();
         let t3 = crate::tsc::lire();
         let ns = crate::tsc::en_nanosecondes((t2 / 2 + t3 / 2) - (t0 / 2 + t1 / 2)).max(1);
-        let hz = (decomptes as u128 * 1_000_000_000 / ns as u128) as u64;
+        return Some(((decomptes as u128 * 1_000_000_000 / ns as u128) as u64, "TSC"));
+    }
+    crate::apic::armer_etalonnage();
+    if !crate::tsc::attendre_canal2(50) {
+        return None;
+    }
+    Some((crate::apic::decomptes_etalonnage() * 1000 / 50, "PIT"))
+}
+
+/// Démarre le tic : le timer de l'APIC si `apic` (l'APIC est en service),
+/// le PIT sinon. Interruptions coupées.
+pub fn initialiser(apic: bool) -> Source {
+    if apic && let Some((hz, etalon)) = etalonner_apic() {
         let decompte = (hz / HZ as u64).max(1);
         NUMERATEUR.store(decompte, Ordering::Relaxed);
         DENOMINATEUR.store(hz, Ordering::Relaxed);
@@ -113,7 +134,7 @@ pub fn initialiser(apic: bool) -> Source {
             port::ecrire(PIT_CANAL0, 0);
             port::ecrire(PIT_CANAL0, 0);
         }
-        return Source::Apic(hz);
+        return Source::Apic { hz, etalon };
     }
     // SAFETY: registres documentés du PIT (commande, puis canal 0).
     unsafe {
@@ -141,6 +162,18 @@ pub fn tic() {
 /// Nombre de tics depuis l'initialisation de l'horloge.
 pub fn tics() -> u64 {
     TICS.load(Ordering::Relaxed)
+}
+
+/// Attend au moins `us` microsecondes, sans dormir : par le TSC s'il est
+/// fiable, sinon par les tics, dont la finesse est la milliseconde
+/// (l'attente dure alors jusqu'à une milliseconde de plus : les délais du
+/// réveil des processeurs secondaires, smp.rs, sont des minimums). Les
+/// interruptions doivent être actives si l'heure vient des tics.
+pub fn attendre_us(us: u64) {
+    let debut = crate::temps::ns_monotone();
+    while crate::temps::ns_monotone().wrapping_sub(debut) < us * 1000 {
+        core::hint::spin_loop();
+    }
 }
 
 /// Endort le processeur jusqu'à ce que `ms` millisecondes soient passées.

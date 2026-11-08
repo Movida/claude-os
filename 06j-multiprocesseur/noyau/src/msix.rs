@@ -153,7 +153,7 @@ impl MsiX {
             return false;
         }
         self.ecrire(entree, CONTROLE, MASQUE);
-        self.ecrire(entree, ADRESSE_BASSE, FENETRE_APIC | (apic::id() as u32) << 12);
+        self.ecrire(entree, ADRESSE_BASSE, FENETRE_APIC | (apic::id_du_premier() as u32) << 12);
         self.ecrire(entree, ADRESSE_HAUTE, 0);
         self.ecrire(entree, DONNEE, vecteur as u32);
         // Relire avant de démasquer : les écritures dans la table, non

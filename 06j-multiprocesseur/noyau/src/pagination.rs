@@ -124,11 +124,27 @@ fn gardes() -> [(u64, &'static str); 5] {
 
 /// Si l'adresse est dans une page de garde : le nom de la pile qui a
 /// débordé.
-pub fn garde_touchee(adresse: u64) -> Option<&'static str> {
-    if crate::vmalloc::garde_touchee(adresse) {
-        return Some("la pile noyau d'une tache");
+pub fn garde_touchee(adresse: u64) -> Option<Garde> {
+    if let Some(p) = crate::vmalloc::garde_touchee(adresse) {
+        return Some(Garde::Pile(p));
     }
-    gardes().into_iter().find(|&(g, _)| (g..g + PAGE).contains(&adresse)).map(|(_, nom)| nom)
+    gardes().into_iter().find(|&(g, _)| (g..g + PAGE).contains(&adresse)).map(|(_, nom)| Garde::Statique(nom))
+}
+
+/// Ce qu'une page de garde touchée gardait : une pile de la zone de vmalloc
+/// (une tâche, l'IST d'un processeur), ou une des piles statiques du noyau.
+pub enum Garde {
+    Pile(crate::vmalloc::GardePile),
+    Statique(&'static str),
+}
+
+impl core::fmt::Display for Garde {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Garde::Pile(p) => write!(f, "{}", p),
+            Garde::Statique(nom) => write!(f, "{}", nom),
+        }
+    }
 }
 
 /// La table de pages d'adresse physique `physique`, vue par la projection
@@ -339,7 +355,10 @@ fn projeter_2mio(pml4: u64, virtuelle: u64, physique: u64, droits: u64) {
 ///
 /// Un BIOS peut pourtant le cacher sur un processeur Intel (l'option
 /// « Execute Disable » du BIOS, le bit 34 du registre IA32_MISC_ENABLE) :
-/// Linux efface ce bit et redemande (verify_cpu.S). On fait de même.
+/// Linux efface ce bit et redemande (verify_cpu.S). On fait de même, et on
+/// le note (XD_EFFACE) : les processeurs secondaires ont le même bit, et le
+/// trampoline doit l'effacer avant d'écrire EFER.NXE (trampoline.rs ; Linux
+/// repasse par verify_cpu pour chacun).
 fn a_le_bit_nx() -> bool {
     // cpuid existe sur tout processeur 64 bits : Rust le tient pour sûr.
     let nx = || core::arch::x86_64::__cpuid(0x8000_0001).edx & (1 << 20) != 0;
@@ -363,7 +382,16 @@ fn a_le_bit_nx() -> bool {
             options(nostack),
         );
     }
+    XD_EFFACE.store(true, Ordering::Relaxed);
     nx()
+}
+
+/// Le premier processeur a dû effacer XD_DISABLE pour voir le bit NX (voir
+/// `a_le_bit_nx`) : les secondaires devront le faire aussi.
+static XD_EFFACE: AtomicBool = AtomicBool::new(false);
+
+pub fn xd_efface() -> bool {
+    XD_EFFACE.load(Ordering::Relaxed)
 }
 
 /// Ce que l'initialisation a fait, pour l'afficher.

@@ -817,7 +817,7 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
         if curseur > 0 {
             return Ok(None);
         }
-        return Ok(Some((faillible::copie(valeur)?, 1)));
+        return Ok(Some((valeur?, 1)));
     }
     // Le processus `argument`. Un zombie (sa tâche est morte, il attend
     // d'être recueilli) n'a plus de mémoire : maps vide, statm à zéro,

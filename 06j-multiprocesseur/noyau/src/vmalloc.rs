@@ -51,7 +51,7 @@ use crate::faillible::VecFaillible;
 use crate::pages;
 use crate::verrou::Verrou;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const PAGE: u64 = 4096;
 
@@ -73,9 +73,46 @@ static PILES: AtomicUsize = AtomicUsize::new(0);
 /// Le nombre maximal de fils, la règle de Linux (`set_max_threads`,
 /// kernel/fork.c) : que les piles noyau de tous les fils ne prennent pas
 /// plus d'un huitième de la mémoire, soit mémoire / (8 × 16 Kio) ; au
-/// moins 20 (MIN_THREADS). 1024 pour 128 Mio, 16 384 pour 2 Gio.
+/// moins 20 (MIN_THREADS). 1024 pour 128 Mio, 16 384 pour 2 Gio ; moins
+/// les piles que les processeurs secondaires ont prises pour toujours pour
+/// leur IST (`garder_pour_ist`, quatre chacun), qu'aucun fil n'aura.
 pub fn max_threads() -> usize {
-    PILES.load(Ordering::Relaxed)
+    PILES.load(Ordering::Relaxed) - IST.iter().filter(|c| c.load(Ordering::Relaxed) != 0).count()
+}
+
+/// Les piles de tâche prises pour toujours par les piles de l'IST des
+/// processeurs secondaires (smp.rs) : par processeur et par rôle, le numéro
+/// de la case plus un (0 : aucune). Pour nommer un débordement
+/// (`garde_touchee` : « la pile IST (NMI) du processeur 2 », pas « la pile
+/// noyau d'une tache »), et pour les retrancher de `max_threads`.
+static IST: [AtomicU64; 4 * crate::processeur::MAX] = [const { AtomicU64::new(0) }; 4 * crate::processeur::MAX];
+/// Les quatre rôles, dans l'ordre des piles de l'IST (gdt.rs).
+const ROLES_IST: [&str; 4] = ["double faute", "NMI", "debogage", "verification machine"];
+
+/// Donne la pile `p` pour toujours à la pile de l'IST de rôle `role` (0 à
+/// 3) du processeur `processeur` ; rend son sommet. Jamais rendue : un
+/// processeur en service ne s'arrête pas.
+pub fn garder_pour_ist(p: Pile, processeur: usize, role: usize) -> u64 {
+    IST[processeur * 4 + role].store(p.case as u64 + 1, Ordering::Relaxed);
+    let haut = p.haut();
+    core::mem::forget(p);
+    haut
+}
+
+/// Ce que garde une page de garde de la zone des piles : la pile d'une
+/// tâche, ou une pile de l'IST d'un processeur secondaire.
+pub enum GardePile {
+    Tache,
+    Ist { processeur: usize, role: &'static str },
+}
+
+impl core::fmt::Display for GardePile {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            GardePile::Tache => write!(f, "la pile noyau d'une tache"),
+            GardePile::Ist { processeur, role } => write!(f, "la pile IST ({}) du processeur {}", role, processeur),
+        }
+    }
 }
 
 /// La zone des projections commence après celle des piles, à 1 Gio
@@ -222,11 +259,19 @@ impl Drop for Pile {
     }
 }
 
-/// Si `adresse` est dans la garde d'une pile de tâche : le message d'un
-/// débordement (voir pagination::garde_touchee).
-pub fn garde_touchee(adresse: u64) -> bool {
-    let piles = max_threads() as u64;
-    adresse >= DEBUT && adresse < DEBUT + piles * CASE && (adresse - DEBUT) % CASE < PAGE
+/// Si `adresse` est dans la garde d'une pile de la zone : laquelle (pour le
+/// message d'un débordement, voir pagination::garde_touchee).
+pub fn garde_touchee(adresse: u64) -> Option<GardePile> {
+    let piles = PILES.load(Ordering::Relaxed) as u64;
+    if !(adresse >= DEBUT && adresse < DEBUT + piles * CASE && (adresse - DEBUT) % CASE < PAGE) {
+        return None;
+    }
+    let case = (adresse - DEBUT) / CASE + 1;
+    let ist = IST.iter().position(|c| c.load(Ordering::Relaxed) == case);
+    Some(match ist {
+        Some(i) => GardePile::Ist { processeur: i / 4, role: ROLES_IST[i % 4] },
+        None => GardePile::Tache,
+    })
 }
 
 /// Comment projeter une plage de la zone des projections.

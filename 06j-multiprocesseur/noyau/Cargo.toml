@@ -40,6 +40,14 @@ test-gros = []
 # Exécuter l'archive des programmes de test (fautifs, refusés...), puis
 # éteindre QEMU (isa-debug-exit).
 test-programmes = []
+# Faire comme si le TSC du premier processeur secondaire n'était pas accordé
+# avec celui du premier, sans TSC_ADJUST : le TSC est déclassé en marche,
+# l'heure revient au tic sans sauter (smp.rs, tsc.rs ; make tests-qemu).
+test-tsc = []
+# Le processeur secondaire 1 tarde six secondes à se présenter : le premier
+# l'abandonne au bout de cinq, sans lui envoyer d'INIT, et il doit trouver
+# ABANDONNE et s'arrêter sans un mot (smp.rs ; make tests-qemu).
+test-retard = []
 # Afficher chaque appel système des programmes Linux, à la façon de strace
 # (make trace).
 trace = []

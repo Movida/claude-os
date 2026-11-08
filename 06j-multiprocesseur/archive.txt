@@ -32,6 +32,7 @@ file  /bin/suspendre       linux/construits/suspendre 755 0 0
 file  /bin/attente         linux/construits/attente 755 0 0
 file  /bin/tubes           linux/construits/tubes 755 0 0
 file  /bin/systeme         linux/construits/systeme 755 0 0
+file  /bin/processeurs     linux/construits/processeurs 755 0 0
 file  /bin/clone           linux/construits/clone 755 0 0
 file  /bin/fils            linux/construits/fils 755 0 0
 file  /bin/courses         linux/construits/courses 755 0 0

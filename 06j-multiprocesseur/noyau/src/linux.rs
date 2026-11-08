@@ -191,6 +191,7 @@ const PSELECT6: u64 = 270;
 const UNAME: u64 = 63;
 const PRCTL: u64 = 157;
 const FUTEX: u64 = 202;
+const SCHED_SETAFFINITY: u64 = 203;
 const SCHED_GETAFFINITY: u64 = 204;
 const GETCPU: u64 = 309;
 const RT_SIGACTION: u64 = 13;
@@ -342,6 +343,7 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         SELECT => crate::sondage::select(a[0], a[1], a[2], a[3], a[4]),
         PSELECT6 => crate::sondage::pselect6(a[0], a[1], a[2], a[3], a[4], a[5]),
         UNAME => uname(a[0]),
+        SCHED_SETAFFINITY => sched_setaffinity(a[0], a[1], a[2]),
         SCHED_GETAFFINITY => sched_getaffinity(a[0], a[1], a[2]),
         GETCPU => getcpu(a[0], a[1]),
         // Céder le processeur (ordonnanceur.rs).
@@ -531,6 +533,7 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         SELECT => ("select", 5),
         PSELECT6 => ("pselect6", 6),
         UNAME => ("uname", 1),
+        SCHED_SETAFFINITY => ("sched_setaffinity", 3),
         SCHED_GETAFFINITY => ("sched_getaffinity", 3),
         GETCPU => ("getcpu", 3),
         SCHED_YIELD => ("sched_yield", 0),
@@ -1141,31 +1144,78 @@ fn uname(tampon: u64) -> i64 {
 /// Linux) : un `unsigned long` suffit jusqu'à 64 processeurs.
 const MASQUE_PROCESSEURS: u64 = 8;
 
-/// sched_getaffinity(pid, longueur, masque) : sur quels processeurs le
-/// programme peut tourner.
-/// UNIPROCESSEUR : un seul processeur, le 0 ; avec plusieurs, ceux qui
-/// sont en service (et sched_setaffinity). Dans l'ordre de Linux : la longueur d'abord (au moins
-/// le masque du noyau, et un multiple de 8 : EINVAL, avant même de chercher
-/// le processus), puis le fil (0 : le courant ; tout processus qui existe,
-/// zombie compris, ou tout fil vivant ; sinon ESRCH) ; on écrit
-/// au plus le masque du noyau, et on rend sa taille (mesuré : 8 sur une
-/// machine de 12 processeurs, autant que pour un).
+/// sched_getaffinity(pid, longueur, masque) : sur quels processeurs le fil
+/// `pid` (0 : le courant) peut tourner : son masque (sched_setaffinity, ou
+/// celui de son créateur), restreint aux processeurs en service, ce que
+/// rend Linux (`cpumask_and(mask, &p->cpus_mask, cpu_active_mask)`). Dans
+/// l'ordre de Linux : la longueur d'abord (au moins le masque du noyau, et
+/// un multiple de 8 : EINVAL, avant même de chercher le processus), puis le
+/// fil (tout fil vivant, ou tout processus qui existe, zombie compris ;
+/// sinon ESRCH) ; on écrit au plus le masque du noyau, et on rend sa taille
+/// (mesuré : 8 sur une machine de 12 processeurs, autant que pour un).
 fn sched_getaffinity(pid: u64, longueur: u64, masque: u64) -> i64 {
     let longueur = longueur as u32 as u64;
     if longueur < MASQUE_PROCESSEURS || longueur % 8 != 0 {
         return -EINVAL;
     }
-    // Tout processus qui existe, ou tout fil vivant (le numéro est celui
-    // d'une tâche : sched_getaffinity vise un fil) : un seul processeur, le
-    // même masque pour tous.
-    let pid = pid as u32 as i32;
-    if pid != 0 && (pid < 0 || (!processus::existe(pid as u32) && tache::processus_du_fil(pid as u32).is_none())) {
-        return -ESRCH;
-    }
-    match copier_vers_utilisateur(masque, &1u64.to_le_bytes()) {
+    let Some(affinite) = affinite_du(pid) else { return -ESRCH };
+    let rendu = affinite & crate::processeur::masque_en_service();
+    match copier_vers_utilisateur(masque, &rendu.to_le_bytes()) {
         Ok(()) => MASQUE_PROCESSEURS as i64,
         Err(_) => -EFAULT,
     }
+}
+
+/// L'affinité du fil `pid` (0 : le courant) : celle de sa tâche s'il vit ;
+/// tous les processeurs pour un processus qui existe sans ce fil (un
+/// zombie : Linux garde la tâche de son fil principal et son masque ; nous
+/// rendons celui d'un fil neuf) ; None s'il n'y a ni l'un ni l'autre
+/// (ESRCH).
+fn affinite_du(pid: u64) -> Option<u64> {
+    let pid = pid as u32 as i32;
+    if pid == 0 {
+        return Some(tache::courante().affinite());
+    }
+    if pid < 0 {
+        return None;
+    }
+    tache::affinite_du_fil(pid as u32).or_else(|| processus::existe(pid as u32).then_some(u64::MAX))
+}
+
+/// sched_setaffinity(pid, longueur, masque) : sur quels processeurs le fil
+/// `pid` (0 : le courant) pourra tourner. Dans l'ordre de Linux
+/// (`get_user_cpu_mask`, puis `sched_setaffinity`) : le masque lu sur
+/// `longueur` octets (EFAULT), au plus ceux du masque du noyau (le reste
+/// n'est pas lu), les octets manquants valant zéro (pas d'EINVAL sur la
+/// longueur, contrairement à sched_getaffinity) ; puis le fil (tout fil
+/// vivant, ou tout processus qui existe ; sinon ESRCH) ; un masque sans
+/// aucun processeur en service : EINVAL (`__set_cpus_allowed_ptr`) ; le
+/// masque posé TEL QUEL, bits des processeurs absents compris (Linux garde
+/// `cpus_mask` tel que demandé ; sched_getaffinity le restreint). Un
+/// processus sans ce fil (un zombie) : 0, rien à poser (Linux pose le
+/// masque de sa tâche morte). Gardé dès ce commit ; honoré par le placement
+/// des tâches avec la file des prêtes par processeur (6j).
+fn sched_setaffinity(pid: u64, longueur: u64, masque: u64) -> i64 {
+    let longueur = (longueur as u32 as u64).min(MASQUE_PROCESSEURS) as usize;
+    let mut octets = [0u8; 8];
+    if longueur > 0 && copier_depuis_utilisateur(&mut octets[..longueur], masque).is_err() {
+        return -EFAULT;
+    }
+    let nouveau = u64::from_le_bytes(octets);
+    let pid = pid as u32 as i32;
+    let tid = match pid {
+        0 => tache::courante().tid(),
+        1.. => pid as u32,
+        _ => return -ESRCH,
+    };
+    if tache::affinite_du_fil(tid).is_none() && !processus::existe(tid) {
+        return -ESRCH;
+    }
+    if nouveau & crate::processeur::masque_en_service() == 0 {
+        return -EINVAL;
+    }
+    tache::poser_affinite_du_fil(tid, nouveau);
+    0
 }
 
 /// getcpu(processeur, nœud, inutilisé) : le processeur où le fil s'exécute,

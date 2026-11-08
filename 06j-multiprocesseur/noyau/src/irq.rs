@@ -151,7 +151,7 @@ pub fn initialiser() -> Bilan {
     pic::initialiser();
     let Some(r) = crate::acpi::avec(|c| {
         let Some(madt) = &c.madt else { return Bilan::Pic("pas de MADT") };
-        let a = match apic::initialiser(madt) {
+        let a = match apic::initialiser_machine(madt) {
             Ok(a) => a,
             Err(e) => return Bilan::PicSansApic(e),
         };

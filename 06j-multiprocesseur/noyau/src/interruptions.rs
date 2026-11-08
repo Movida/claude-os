@@ -431,7 +431,15 @@ pub fn initialiser() {
         let dpl = if vecteur == 3 { 3 } else { 0 };
         idt[vecteur] = Entree::new(adresse, ist, dpl);
     }
+    drop(idt);
+    charger_idt();
+}
 
+/// Charge l'IDT, commune à tous les processeurs, dans celui qui exécute
+/// ceci : le premier au démarrage (`initialiser`), chaque secondaire à son
+/// départ (smp.rs). Interruptions coupées.
+pub fn charger_idt() {
+    let idt = IDT.verrouiller();
     #[repr(C, packed)]
     struct Descripteur {
         limite: u16,

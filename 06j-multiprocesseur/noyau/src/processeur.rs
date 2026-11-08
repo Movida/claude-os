@@ -88,7 +88,7 @@ use crate::tache::Tache;
 use core::arch::asm;
 use core::cell::UnsafeCell;
 use core::mem::offset_of;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 /// Le nombre maximal de processeurs : la taille du masque de
 /// `sched_getaffinity` (un `unsigned long`, 64 bits). Linux va bien
@@ -102,8 +102,13 @@ pub struct Processeur {
     /// Son numéro (0 pour le processeur de démarrage) : l'index de sa zone
     /// dans ZONES_PROCESSEURS. À l'octet 0 : c'est lui que lit `gs:[0]`.
     pub numero: u32,
-    /// Le numéro de son APIC local (apic.rs), 0 tant qu'il n'est pas lu.
+    /// Le numéro de son APIC local (apic.rs) : lu dans ses registres pour
+    /// le premier, celui que dit la MADT pour un secondaire (smp.rs).
     pub apic: AtomicU8,
+    /// Où en est son démarrage (smp.rs, les valeurs du module `etape`) :
+    /// le mot de la poignée de main entre le premier processeur et lui,
+    /// écrit par l'un, lu par l'autre (Release, Acquire).
+    pub demarrage: AtomicU8,
     /// Le nombre de verrous tenus sur ce processeur (verrou.rs, la part
     /// « verrous » du `preempt_count` de Linux).
     pub tenus: AtomicU32,
@@ -144,6 +149,7 @@ impl Processeur {
         Processeur {
             numero,
             apic: AtomicU8::new(0),
+            demarrage: AtomicU8::new(0),
             tenus: AtomicU32::new(0),
             dans_une_interruption: AtomicU32::new(0),
             preemption: UnsafeCell::new(0),
@@ -189,13 +195,39 @@ fn numero_brut() -> u32 {
     n
 }
 
-/// Le nombre de processeurs en service : 1 jusqu'à ce que les secondaires
-/// démarrent (6j), puis autant qu'il y en a qui ont répondu.
-static EN_SERVICE: AtomicU32 = AtomicU32::new(1);
+/// Les processeurs en service, un bit par numéro (le `cpu_online_mask` de
+/// Linux) : le 0 dès le démarrage, les secondaires à mesure que le premier
+/// les voit répondre (smp.rs). Release à l'écriture, Acquire à la lecture :
+/// ce qu'un secondaire a préparé avant d'être compté est visible de qui le
+/// compte.
+static EN_SERVICE: AtomicU64 = AtomicU64::new(1);
+/// Les processeurs que la machine a (la MADT), en service ou non (le
+/// `cpu_possible_mask`) : /sys/devices/system/cpu/possible et present.
+static POSSIBLES: AtomicU64 = AtomicU64::new(1);
 
 /// Le nombre de processeurs en service.
 pub fn nombre() -> usize {
-    EN_SERVICE.load(Ordering::Acquire) as usize
+    EN_SERVICE.load(Ordering::Acquire).count_ones() as usize
+}
+
+/// Le masque des processeurs en service (un bit par numéro).
+pub fn masque_en_service() -> u64 {
+    EN_SERVICE.load(Ordering::Acquire)
+}
+
+/// Le masque des processeurs de la machine.
+pub fn masque_possible() -> u64 {
+    POSSIBLES.load(Ordering::Relaxed)
+}
+
+/// Le processeur `n` est en service (smp.rs, quand il a répondu).
+pub fn declarer_en_service(n: usize) {
+    EN_SERVICE.fetch_or(1 << n, Ordering::Release);
+}
+
+/// Le processeur `n` existe (la MADT), qu'il réponde ou non.
+pub fn declarer_possible(n: usize) {
+    POSSIBLES.fetch_or(1 << n, Ordering::Relaxed);
 }
 
 /// La zone de ce processeur. Interruptions coupées, ou préemption coupée
@@ -313,8 +345,21 @@ pub fn zone(n: usize) -> &'static Processeur {
     &ZONES_PROCESSEURS.0[n]
 }
 
-/// Le MSR de la base de GS du noyau (celle qui est active dans le noyau).
+/// Le MSR de la base de GS du noyau (celle qui est active dans le noyau),
+/// et celui de l'autre base, celle du programme (`swapgs` les échange).
 const GS_BASE: u32 = 0xC000_0101;
+const KERNEL_GS_BASE: u32 = 0xC000_0102;
+
+/// Met à zéro la base de GS du programme (celle que `swapgs` rendra active
+/// au retour vers l'anneau 3) : l'état de la mise sous tension, que le
+/// premier processeur a hérité et qu'un secondaire pose explicitement
+/// (smp.rs). Un programme qui veut une base de GS la demande par arch_prctl,
+/// qui la refuse (tache.rs).
+pub fn effacer_base_gs_programme() {
+    // SAFETY: KERNEL_GS_BASE existe sur tout processeur 64 bits ; zéro est
+    // une adresse canonique.
+    unsafe { asm!("wrmsr", in("ecx") KERNEL_GS_BASE, in("eax") 0u32, in("edx") 0u32, options(nostack, preserves_flags)) };
+}
 
 /// Fait de la zone `p` celle de ce processeur : GS_BASE y pointe. Au
 /// démarrage de chaque processeur, et après tout rechargement du sélecteur

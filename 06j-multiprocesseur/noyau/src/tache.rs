@@ -221,6 +221,14 @@ pub struct Tache {
     /// Le processeur dont la file la tient, ou la tenait en dernier (le
     /// `task_cpu`) : écrit sous le verrou de cette file.
     processeur: AtomicU32,
+    /// Les processeurs où elle a le droit de s'exécuter (le `cpus_mask` de
+    /// Linux), un bit par numéro : tous (u64::MAX) pour une tâche née du
+    /// noyau, ceux de son créateur pour un fil (sched_setaffinity, linux.rs,
+    /// les pose tels quels, bits des processeurs absents compris ; avec les
+    /// processeurs en service, c'est le masque que rend sched_getaffinity).
+    /// Lu pour sa valeur seule (Relaxed) ; honoré par le placement des
+    /// tâches (6j, la file des prêtes par processeur).
+    affinite: AtomicU64,
     /// Une tâche du noyau qui exécute un programme WebAssembly (6h) : ses
     /// minuteries comptent pour le détecteur d'interblocage comme celles
     /// d'un programme Linux (attente.rs).
@@ -393,20 +401,40 @@ impl Tache {
         let haut = pile.haut();
         let programme = programme.map(UnsafeCell::new);
         let noyau = processus.is_none();
-        let t = Arc::new(Tache {
+        // (La tâche inactive n'attend personne : elle ne doit jamais
+        // quitter son rôle pour entrer dans la file des prêtes.)
+        let attendant = (noyau && en_service() && !courante().inactive).then(courante_arc);
+        // Les processeurs permis : ceux de son créateur (le `copy_process`
+        // de Linux copie le `cpus_mask`) ; tous, pour les premières tâches
+        // du démarrage.
+        let affinite = if en_service() { courante().affinite() } else { u64::MAX };
+        Arc::new(Tache::brute(tid, false, nom, Some(pile), haut, espace, processus, programme, attendant, false, affinite))
+            .map_err(|_| Manque::Memoire)
+    }
+
+    /// Une tâche, champ par champ : ce que partagent l'inactive d'un
+    /// processeur (`initialiser`, `inactive_secondaire`) et une tâche
+    /// créée (`creer`). `sur_processeur` : vrai pour une inactive, qui
+    /// s'exécute déjà (c'est le code qui la crée, ou le processeur qui
+    /// démarre dessus).
+    fn brute(tid: u32, inactive: bool, nom: NomCourt, pile: Option<Pile>, haut: u64, espace: u64,
+             processus: Option<Arc<crate::processus::Entree>>, programme: Option<UnsafeCell<EtatProgramme>>,
+             attendant: Option<Arc<Tache>>, sur_processeur: bool, affinite: u64) -> Tache {
+        Tache {
             tid,
-            inactive: false,
+            inactive,
             nom: Verrou::new(nom),
             contexte: UnsafeCell::new(0),
-            pile: Verrou::new(Some(pile)),
+            pile: Verrou::new(pile),
             haut,
             espace: AtomicU64::new(espace),
             processus,
             programme,
             morte: AtomicBool::new(false),
-            sur_processeur: AtomicBool::new(false),
+            sur_processeur: AtomicBool::new(sur_processeur),
             en_file: AtomicBool::new(false),
             processeur: AtomicU32::new(0),
+            affinite: AtomicU64::new(affinite),
             webassembly: AtomicBool::new(false),
             ecrire_tid: AtomicU64::new(0),
             effacer_tid: AtomicU64::new(0),
@@ -415,9 +443,7 @@ impl Tache {
             tube_interne: AtomicU32::new(0),
             calcul: AtomicU64::new(0),
             lag: AtomicI64::new(0),
-            // (La tâche inactive n'attend personne : elle ne doit jamais
-            // quitter son rôle pour entrer dans la file des prêtes.)
-            attendant: Verrou::new((noyau && en_service() && !courante().inactive).then(courante_arc)),
+            attendant: Verrou::new(attendant),
             entree_attente: EntreeAttente::new(),
             etat: AtomicU8::new(etat::EN_COURS),
             futex: Verrou::new(None),
@@ -434,9 +460,22 @@ impl Tache {
             fermetures: Verrou::new(None),
             tubes_fermes: Verrou::new(None),
             instances_a_signaler: Verrou::new(None),
-        })
-        .map_err(|_| Manque::Memoire)?;
-        Ok(t)
+        }
+    }
+
+    /// Le sommet de sa pile noyau (pour le trampoline d'un processeur
+    /// secondaire, smp.rs : la pile de sa tâche inactive).
+    pub fn sommet_de_pile(&self) -> u64 {
+        self.haut
+    }
+
+    /// Les processeurs où elle a le droit de s'exécuter (voir `affinite`).
+    pub fn affinite(&self) -> u64 {
+        self.affinite.load(Ordering::Relaxed)
+    }
+
+    pub fn poser_affinite(&self, masque: u64) {
+        self.affinite.store(masque, Ordering::Relaxed);
     }
 
     /// Son numéro de fil (0 : une tâche du noyau).
@@ -758,47 +797,10 @@ static TOUTES: Verrou<Vec<Arc<Tache>>> = Verrou::new(Vec::new());
 /// inactive du premier processeur. Avant toute autre tâche, interruptions
 /// coupées.
 pub fn initialiser() {
-    let pile_demarrage = Tache {
-        tid: 0,
-        inactive: true,
-        nom: Verrou::new(NomCourt::de(b"inactive")),
-        contexte: UnsafeCell::new(0),
-        pile: Verrou::new(None),
-        haut: 0,
-        espace: AtomicU64::new(pagination::pml4_noyau()),
-        processus: None,
-        programme: None,
-        morte: AtomicBool::new(false),
-        // L'inactive s'exécute : c'est le code qui est en train de la créer.
-        sur_processeur: AtomicBool::new(true),
-        en_file: AtomicBool::new(false),
-        processeur: AtomicU32::new(0),
-        webassembly: AtomicBool::new(false),
-        ecrire_tid: AtomicU64::new(0),
-        effacer_tid: AtomicU64::new(0),
-        liste_robuste: AtomicU64::new(0),
-        code_sortie: AtomicI32::new(0),
-        tube_interne: AtomicU32::new(0),
-        calcul: AtomicU64::new(0),
-        lag: AtomicI64::new(0),
-        attendant: Verrou::new(None),
-        entree_attente: EntreeAttente::new(),
-        etat: AtomicU8::new(etat::EN_COURS),
-        futex: Verrou::new(None),
-        tient_sa_memoire: AtomicBool::new(false),
-        sans_faute: AtomicBool::new(false),
-        temps_a_verifier: AtomicBool::new(false),
-        a_tuer: AtomicBool::new(false),
-        fin: Verrou::new(None),
-        usage: crate::rusage::Compteurs::default(),
-        precedent: crate::rusage::Precedent::new(),
-        exception: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
-        reprise: Verrou::new(None),
-        contexte_reseau: AtomicU32::new(0),
-        fermetures: Verrou::new(None),
-        tubes_fermes: Verrou::new(None),
-        instances_a_signaler: Verrou::new(None),
-    };
+    // L'inactive s'exécute : c'est le code qui est en train de la créer ;
+    // sans pile à elle (celle du démarrage, haut = 0 : la TSS n'en a pas
+    // besoin, rien ne vient de l'anneau 3 vers elle).
+    let pile_demarrage = Tache::brute(0, true, NomCourt::de(b"inactive"), None, 0, pagination::pml4_noyau(), None, None, None, true, u64::MAX);
     let t = Arc::into_raw(Arc::new(pile_demarrage).expect("plus de memoire pour la tache du demarrage")) as *mut Tache;
     let p = processeur::courant();
     p.inactive.store(t, Ordering::Relaxed);
@@ -807,12 +809,60 @@ pub fn initialiser() {
     MORTES.verrouiller().try_reserve_exact(crate::vmalloc::max_threads()).expect("plus de memoire pour la liste des taches mortes");
 }
 
-/// Appelle `f` sur chaque tâche vivante (sauf l'inactive), table tenue :
+/// La tâche inactive du processeur secondaire `numero` (smp.rs) : comme
+/// celle du premier (`initialiser`), mais avec sa propre pile, de vmalloc
+/// sous sa page de garde (le premier garde la pile du démarrage) ; le
+/// processeur l'exécute dès sa première instruction Rust (sa pile, sa
+/// tâche courante), et pour toujours. Ni dans la table des tâches ni dans
+/// une file. None : plus de pile, ou plus de mémoire.
+pub fn inactive_secondaire(numero: usize) -> Option<Arc<Tache>> {
+    let pile = Pile::allouer()?;
+    marquer_pile(&pile);
+    let haut = pile.haut();
+    // « inactive-N » (N < 64 : deux chiffres au plus).
+    let mut nom = *b"inactive-00";
+    let longueur = if numero < 10 {
+        nom[9] = b'0' + numero as u8;
+        10
+    } else {
+        nom[9] = b'0' + (numero / 10) as u8;
+        nom[10] = b'0' + (numero % 10) as u8;
+        11
+    };
+    let nom = NomCourt::de(&nom[..longueur]);
+    Arc::new(Tache::brute(0, true, nom, Some(pile), haut, pagination::pml4_noyau(), None, None, None, true, u64::MAX)).ok()
+}
+
+/// Appelle `f` sur chaque tâche vivante (sauf les inactives), table tenue :
 /// `f` doit être court.
 pub fn pour_chaque(mut f: impl FnMut(&Arc<Tache>)) {
     for t in TOUTES.verrouiller().iter() {
         f(t);
     }
+}
+
+/// L'affinité du fil `tid` (sched_getaffinity), s'il vit.
+pub fn affinite_du_fil(tid: u32) -> Option<u64> {
+    let mut a = None;
+    pour_chaque(|t| {
+        if t.tid == tid {
+            a = Some(t.affinite());
+        }
+    });
+    a
+}
+
+/// Pose l'affinité du fil `tid` (sched_setaffinity) : faux s'il ne vit
+/// pas.
+pub fn poser_affinite_du_fil(tid: u32, masque: u64) -> bool {
+    let mut trouve = false;
+    pour_chaque(|t| {
+        if t.tid == tid {
+            t.poser_affinite(masque);
+            trouve = true;
+        }
+    });
+    trouve
 }
 
 /// Exécute `f` sans qu'une faute de page dans une copie de la tâche
@@ -1350,9 +1400,10 @@ pub fn arreter_avec_le_groupe(t: Arc<Tache>, code: i32) {
     reveiller(t, Reveil::Signal);
 }
 
-/// Le nombre de tâches (sysinfo : `procs`, le `nr_threads` de Linux).
+/// Le nombre de tâches (sysinfo : `procs`, le `nr_threads` de Linux), les
+/// inactives comptées, une par processeur en service.
 pub fn nombre() -> usize {
-    TOUTES.verrouiller().len() + 1
+    TOUTES.verrouiller().len() + processeur::nombre()
 }
 
 /// La fonction d'une tâche du noyau.

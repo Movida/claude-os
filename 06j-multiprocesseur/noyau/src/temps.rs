@@ -98,7 +98,11 @@ static INSTANT_DE_LECTURE: AtomicU64 = AtomicU64::new(0);
 /// Le temps depuis le démarrage, en nanosecondes : le TSC s'il est fiable,
 /// les tics sinon.
 pub fn ns_monotone() -> u64 {
-    crate::tsc::nanosecondes().unwrap_or_else(|| horloge::nanosecondes(horloge::tics()))
+    // Sans TSC fiable, le temps des tics ; si le TSC a été déclassé en
+    // marche (tsc.rs, un secondaire dont le TSC n'est pas accordé), plus le
+    // décalage qui fait que l'heure ne saute pas (nul sinon).
+    crate::tsc::nanosecondes()
+        .unwrap_or_else(|| horloge::nanosecondes(horloge::tics()).saturating_add_signed(crate::tsc::decalage()))
 }
 
 /// La durée d'un tic, arrondie à la nanoseconde au-dessus.

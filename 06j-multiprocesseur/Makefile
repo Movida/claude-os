@@ -114,6 +114,7 @@
 #                  linux/dynamique (ld-linux, la glibc partagée, dlopen),
 #                  linux/signaux (nos codes d'erreur des signaux),
 #                  linux/systeme (uname, futex, prctl...),
+#                  linux/processeurs (sched_setaffinity, getcpu, 6j),
 #                  linux/evenements (eventfd, epoll), linux/proc,
 #                  linux/clone (clone, clone3), linux/fils et
 #                  linux/courses (des programmes à plusieurs fils),
@@ -162,7 +163,13 @@ QEMU_RESEAU = -netdev user,id=n0,guestfwd=tcp:10.0.2.100:80-cmd:$(CURDIR)/outils
 # -cpu qemu64, elle passe par la gigue, le chemin de la machine sans
 # générateur.
 QEMU_ALEA = -device virtio-rng-pci
-QEMU_OPTIONS = -cpu Nehalem -m 2G $(QEMU_RESEAU) $(QEMU_ALEA)
+#
+# Les processeurs (6j) : quatre, comme la machine de la CI (4 vCPU). Le
+# noyau démarre les secondaires par INIT-SIPI-SIPI (noyau/src/smp.rs) ;
+# chaque machine de l'étape en a quatre, celles de tests-qemu comprises,
+# sauf le scénario « -smp 1 » qui vérifie le chemin d'un seul processeur.
+QEMU_SMP = -smp 4
+QEMU_OPTIONS = -cpu Nehalem -m 2G $(QEMU_SMP) $(QEMU_RESEAU) $(QEMU_ALEA)
 QEMU = qemu-system-x86_64 -drive format=raw,file=boot.bin,if=$(QEMU_DISQUE) $(QEMU_OPTIONS)
 MON  = /tmp/qemu-mon-os.sock
 NOYAU_ELF = noyau/target/x86_64-unknown-none/release/noyau
@@ -258,6 +265,9 @@ boot.bin: programmes.cpio FORCE
 #     l'hôte aussi ; `tubes sigpipe` meurt de SIGPIPE (code 141) ;
 #   - systeme : gcc -static, les petits appels de claude (uname,
 #     sched_getaffinity, futex, prctl) ; sur l'hôte aussi ;
+#   - processeurs : gcc -static, ce qu'un programme voit des processeurs
+#     (6j) : cpu/online et get_nprocs, sched_getaffinity, sched_setaffinity
+#     et ses refus, getcpu ; sur l'hôte aussi ;
 #   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi ;
 #   - proc : gcc -static, /proc (maps, statm, exe, /proc/sys) et /sys
 #     (cpu/online, transparent_hugepage) ; sur l'hôte aussi ;
@@ -426,6 +436,10 @@ $(LINUX)/tubes: linux/tubes.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/systeme: linux/systeme.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/processeurs: linux/processeurs.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -911,7 +925,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -1149,7 +1163,7 @@ SHELL = /bin/bash
 .DELETE_ON_ERROR:
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
-            $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
+            $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
             $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -1180,6 +1194,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	timeout 60 ./$(LINUX)/tubes | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 10 ./$(LINUX)/tubes sigpipe; test $$? = 141
 	./$(LINUX)/systeme | tee /dev/stderr | (! grep -q ECHEC)
+	./$(LINUX)/processeurs | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	./$(LINUX)/evenements | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/proc | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/clone | tee /dev/stderr | (! grep -q ECHEC)
@@ -1281,20 +1296,43 @@ $(WAST2JSON):
 #   - une machine sans carte (-nic none : sans cette option, QEMU ajoute
 #     une e1000), et `passerelle sans-reseau` : le DNS de la glibc échoue
 #     vite, EAI_AGAIN (6g) ;
+#   - un seul processeur (-smp 1), le noyau ordinaire sur l'archive vide :
+#     la MADT ne liste aucun secondaire, et le noyau le dit (6j) ;
+#   - le processeur secondaire 1 qui tarde six secondes (test-retard, sous
+#     -cpu Nehalem pour mesurer son retard au TSC) : abandonné au bout de
+#     cinq, il trouve ABANDONNE et s'arrête sans un mot ; trois
+#     processeurs en service, et le démarrage continue (6j) ;
+#   - le TSC du premier secondaire tenu pour non accordé (test-tsc, le
+#     noyau construit avec cette fonctionnalité, sous -cpu Nehalem : il
+#     faut un TSC fiable pour le déclasser) : le TSC est déclassé en
+#     marche, l'heure revient au tic sans sauter, le démarrage continue
+#     (6j : sous QEMU, les TSC sont toujours accordés, ce chemin ne se
+#     verrait jamais autrement) ;
 #   test-garde, test-gros, le démarrage sans ACPI et celui du pont ne
 #   s'éteignent pas : QEMU est arrêté dès que la ligne cherchée est venue
 #   (`attendre`), au lieu d'attendre DUREE.
-QEMU_TEST = qemu-system-x86_64 -display none -no-reboot
+QEMU_TEST_1 = qemu-system-x86_64 -display none -no-reboot
+QEMU_TEST = $(QEMU_TEST_1) $(QEMU_SMP)
 # Le moniteur de QEMU pendant les programmes de test (une touche envoyée
 # pendant que `dort` dort) : une socket dans le dossier de l'étape, pour
 # que deux vérifications en même temps (le dossier de travail et un
 # worktree de verifier-historique) ne se gênent pas.
 MON_TESTS = mon-tests.sock
-QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot $(QEMU_RESEAU) \
+QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot $(QEMU_SMP) $(QEMU_RESEAU) \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
-tests-qemu: test-garde.bin test-gros.bin test-programmes.bin vide.bin sans-reseau.bin claude-p
+tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-retard.bin vide.bin sans-reseau.bin claude-p
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
+	$(call attendre,$(QEMU_TEST_1) -smp 1 $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=vide.bin -serial file:test-smp1.log,test-smp1.log,"[noyau] 1 processeur en service : la MADT n'en liste pas d'autre.",:)
+	$(call attendre,$(QEMU_TEST) -cpu Nehalem $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-tsc.bin -serial file:test-tsc.log,test-tsc.log,"[noyau] Heure (UTC)",:)
+	grep -F "[noyau] TSC : le processeur 1 n'est pas accorde avec le premier (recul de 1000000 cycles, pas de TSC_ADJUST) : l'heure au tic, decalage de " test-tsc.log
+	grep -F "[noyau] 4 processeurs en service." test-tsc.log
+	grep -F "[noyau] 100 ms plus tard : " test-tsc.log
+	$(call attendre,$(QEMU_TEST) -cpu Nehalem $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-retard.bin -serial file:test-retard.log,test-retard.log,"[noyau] Heure (UTC)",:)
+	grep -F "[noyau] Processeur 1 (APIC 1) ne repond pas : abandonne." test-retard.log
+	grep -F "[noyau] 3 processeurs en service." test-retard.log
+	! grep -F "Processeur 1 (APIC 1) en service" test-retard.log
+	! grep -E "ECHEC|PANIQUE" test-retard.log
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -machine pc$(,)acpi=off -drive format=raw$(,)file=vide.bin -serial file:test-sans-acpi.log,test-sans-acpi.log,"generateur laisse eteint.",:)
 	grep -F "PIC 8259 (pas de tables ACPI) remappe sur les vecteurs 32-47" test-sans-acpi.log
 	grep -F "MSI-X de 00:03.0 : pas d'APIC local : pas de MSI-X." test-sans-acpi.log

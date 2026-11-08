@@ -159,10 +159,9 @@ pub struct Bilan {
     pub taille: u64,
 }
 
-/// Met SSE en service pour les programmes, et XSAVE si le processeur l'a.
-/// Tout processeur 64 bits a SSE, SSE2 et FXSAVE (l'architecture x86_64 les
-/// exige) : rien à vérifier pour eux.
-pub fn initialiser() -> Bilan {
+/// Les bits de CR0 et CR4 de SSE (voir l'en-tête), sur le processeur qui
+/// exécute ceci.
+fn activer_registres() {
     // SAFETY: les bits écrits sont ceux décrits plus haut ; le noyau ne
     // se sert pas de SSE, rien ne change pour lui.
     unsafe {
@@ -178,6 +177,58 @@ pub fn initialiser() -> Bilan {
             options(nostack),
         );
     }
+}
+
+/// CR4.OSXSAVE, puis XCR0 = `composants` (`xsetbv`), sur le processeur qui
+/// exécute ceci.
+///
+/// # Safety
+/// `composants` ne doit contenir que des composants que le processeur
+/// offre (CPUID 0xD), x87 compris.
+unsafe fn poser_xcr0(composants: u64) {
+    // SAFETY: CR4.OSXSAVE (bit 18) permet xsetbv ; garanti par l'appelant
+    // pour les composants.
+    unsafe {
+        asm!("mov {t}, cr4", "or {t}, 1 << 18", "mov cr4, {t}", t = out(reg) _, options(nostack));
+        asm!("xsetbv", in("ecx") 0, in("eax") composants as u32, in("edx") (composants >> 32) as u32, options(nostack));
+    }
+}
+
+/// Un processeur secondaire (smp.rs) : les mêmes registres que le premier
+/// (le trampoline les a déjà copiés, CR0 et CR4 compris ; reposés ici pour
+/// ne dépendre de rien, comme le `fpu__init_cpu` de Linux), et XCR0 à ce
+/// que le premier a choisi : tous les processeurs sauvent les mêmes
+/// composants, dans des zones de la même taille.
+pub fn initialiser_secondaire() {
+    activer_registres();
+    let composants = composants();
+    if composants != 0 {
+        // SAFETY: ces composants, le premier processeur les a trouvés
+        // offerts par CPUID ; les processeurs d'une machine sont les mêmes
+        // (smp.rs le vérifie ensuite en comparant XCR0).
+        unsafe { poser_xcr0(composants) };
+    }
+}
+
+/// XCR0 (`xgetbv`), 0 sans XSAVE : pour le comparer d'un processeur à
+/// l'autre (smp.rs).
+pub fn xcr0() -> u64 {
+    if composants() == 0 {
+        return 0;
+    }
+    let (bas, haut): (u32, u32);
+    // SAFETY: CR4.OSXSAVE est posé dès que COMPOSANTS n'est pas nul ;
+    // xgetbv ne fait que lire.
+    unsafe { asm!("xgetbv", in("ecx") 0, out("eax") bas, out("edx") haut, options(nomem, nostack, preserves_flags)) };
+    (haut as u64) << 32 | bas as u64
+}
+
+/// Met SSE en service pour les programmes, et XSAVE si le processeur l'a.
+/// Tout processeur 64 bits a SSE, SSE2 et FXSAVE (l'architecture x86_64 les
+/// exige) : rien à vérifier pour eux. Sur le premier processeur ; les
+/// secondaires reprennent ses choix (`initialiser_secondaire`).
+pub fn initialiser() -> Bilan {
+    activer_registres();
     use core::arch::x86_64::{__cpuid, __cpuid_count};
     // MXCSR_MASK : les octets 28 à 31 d'une image FXSAVE.
     let mut image = Initial([0; TAILLE_MAX]);
@@ -196,12 +247,9 @@ pub fn initialiser() -> Bilan {
     let d = __cpuid_count(0xD, 0);
     let offerts = (d.edx as u64) << 32 | d.eax as u64;
     let composants = (X87 | SSE | AVX) & offerts;
-    // SAFETY: CR4.OSXSAVE (bit 18) permet xsetbv ; XCR0 ne reçoit que des
-    // composants que le processeur offre, x87 compris (obligatoire).
-    unsafe {
-        asm!("mov {t}, cr4", "or {t}, 1 << 18", "mov cr4, {t}", t = out(reg) _, options(nostack));
-        asm!("xsetbv", in("ecx") 0, in("eax") composants as u32, in("edx") (composants >> 32) as u32, options(nostack));
-    }
+    // SAFETY: XCR0 ne reçoit que des composants que le processeur offre,
+    // x87 compris (obligatoire).
+    unsafe { poser_xcr0(composants) };
     // La taille de la zone pour les composants en service (EBX, une fois
     // XCR0 posé).
     let taille = __cpuid_count(0xD, 0).ebx as u64;

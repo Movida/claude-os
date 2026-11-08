@@ -24,7 +24,16 @@
 //!     priorité fixe par ligne, il ne sait parler qu'à un processeur, et
 //!     ne sait rien des interruptions des cartes PCI modernes (MSI, 6g).
 //!
-//! L'initialisation suit `setup_local_APIC` de Linux :
+//! Chaque processeur a le sien : la page des registres est la même adresse
+//! pour tous (chacun y voit le sien), projetée une fois
+//! (`initialiser_machine`, sur le premier processeur) ; chaque processeur
+//! met le sien en service (`initialiser_processeur` : le premier au
+//! démarrage, chaque secondaire à son départ, smp.rs). Les périphériques
+//! (l'IO-APIC, les MSI-X des cartes) visent explicitement l'APIC du
+//! PREMIER processeur (`id_du_premier`), pas « l'APIC de ce processeur » :
+//! la répartition des interruptions entre processeurs n'est pas de 6j.
+//!
+//! L'initialisation d'un APIC suit `setup_local_APIC` de Linux :
 //!   - SVR (Spurious-interrupt Vector Register) : le bit 8 allume l'APIC,
 //!     et le vecteur des interruptions « fantômes » (0xFF, comme Linux) :
 //!     celles que l'APIC a commencé à présenter puis retirées, qui n'ont
@@ -33,8 +42,11 @@
 //!   - les entrées locales (LVT) : LINT0, où arrivait le 8259 en mode
 //!     « ExtINT », masquée (les IRQ passent désormais par l'IO-APIC) ;
 //!     LINT1 en NMI, d'après la MADT (sous QEMU : tous les processeurs,
-//!     LINT1) ; le timer, le compteur de performance et le capteur
-//!     thermique masqués ; les erreurs de l'APIC sur le vecteur 0xFE ;
+//!     LINT1), sur le premier processeur seulement : sur les secondaires,
+//!     LINT0 et LINT1 restent masquées, comme chez Linux (« Only the BSP
+//!     sees the LINT1 NMI signal by default ») ; le timer, le compteur de
+//!     performance et le capteur thermique masqués ; les erreurs de l'APIC
+//!     sur le vecteur 0xFE ;
 //!   - ESR (Error Status Register) effacé (il s'écrit avant de se lire) ;
 //!   - un EOI, pour le cas où une interruption serait restée en service.
 
@@ -77,6 +89,17 @@ const MODE_EXTINT: u32 = 0b111 << 8;
 const ACTIF_BAS: u32 = 1 << 13;
 /// SVR : l'APIC est en service.
 const ALLUME: u32 = 1 << 8;
+
+/// Dans l'ICR (Interrupt Command Register, deux registres : le bas porte le
+/// message, le haut la destination, bits 24 à 31) : le mode de livraison
+/// INIT (101b) et STARTUP (110b, bits 8 à 10) ; « posé » (bit 14, le
+/// niveau de l'INIT : 1 pose, 0 lève) ; « en niveau » (bit 15) ; « envoi
+/// en cours » (bit 12, à attendre avant le message suivant).
+const ICR_INIT: u32 = 0b101 << 8;
+const ICR_DEMARRAGE: u32 = 0b110 << 8;
+const ICR_POSE: u32 = 1 << 14;
+const ICR_NIVEAU: u32 = 1 << 15;
+const ICR_EN_COURS: u32 = 1 << 12;
 
 /// Le MSR de l'adresse de l'APIC : bit 11, l'APIC est en service ; bit 10,
 /// en mode x2APIC ; bits 12 et plus, l'adresse physique de ses registres.
@@ -148,9 +171,11 @@ fn lire_msr(msr: u32) -> u64 {
     (haut as u64) << 32 | bas as u64
 }
 
-/// Met l'APIC local en service, d'après la MADT (`madt` : son adresse, ses
-/// NMI). Interruptions coupées.
-pub fn initialiser(madt: &acpi::ConfigurationMadt) -> Result<Bilan, Refus> {
+/// Ce qui vaut pour la machine : projette la page des registres, lit le
+/// numéro et la version de l'APIC du premier processeur, puis met son APIC
+/// en service (`initialiser_processeur`). D'après la MADT (`madt` : son
+/// adresse, ses NMI). Sur le premier processeur, interruptions coupées.
+pub fn initialiser_machine(madt: &acpi::ConfigurationMadt) -> Result<Bilan, Refus> {
     if core::arch::x86_64::__cpuid(1).edx & 1 << 9 == 0 {
         return Err(Refus::Absent);
     }
@@ -169,9 +194,19 @@ pub fn initialiser(madt: &acpi::ConfigurationMadt) -> Result<Bilan, Refus> {
     // Projetés pour toujours : la projection n'est jamais rendue.
     core::mem::forget(projection);
 
-    let id = (lire(ID) >> 24) as u8;
+    let id = id_local();
     ID_APIC.store(id, Ordering::Relaxed);
     let version = lire(VERSION) as u8;
+    initialiser_processeur(madt, true);
+    Ok(Bilan { id, adresse, version })
+}
+
+/// Met en service l'APIC local du processeur qui exécute ceci (le
+/// `setup_local_APIC` de Linux, voir l'en-tête) : le premier au démarrage
+/// (`premier` : son NMI d'après la MADT), chaque secondaire à son départ
+/// (smp.rs : LINT0 et LINT1 masquées). Interruptions coupées.
+pub fn initialiser_processeur(madt: &acpi::ConfigurationMadt, premier: bool) {
+    let id = id_local();
     // Le nombre d'entrées LVT moins un, bits 16 à 23 : le capteur thermique
     // et le compteur de performance n'existent que si l'APIC les a (5 et 4
     // entrées au moins, sur la cinquième et la sixième).
@@ -186,19 +221,23 @@ pub fn initialiser(madt: &acpi::ConfigurationMadt) -> Result<Bilan, Refus> {
         ecrire(LVT_THERMIQUE, MASQUEE);
     }
     ecrire(LVT_LINT0, MASQUEE);
-    // Le NMI : sur l'entrée que dit la MADT, pour ce processeur ou pour
-    // tous (0xFF) ; sans entrée, LINT1, la règle des PC (Linux fait de
-    // même). Polarité et déclenchement : ceux de la MADT, sinon ceux du
-    // bus (front montant, actif haut) ; un NMI est toujours par front.
-    let nmi = madt.nmi.iter().find(|&&(p, _, _)| p == 0xFF || madt.processeurs.iter().any(|&(n, a)| n == p && a == id));
-    let (lint, drapeaux) = nmi.map_or((1, 0), |&(_, d, l)| (l, d));
-    let polarite = if drapeaux & 3 == 3 { ACTIF_BAS } else { 0 };
-    let entree_nmi = MODE_NMI | polarite;
-    if lint == 0 {
-        ecrire(LVT_LINT0, entree_nmi);
-        ecrire(LVT_LINT1, MASQUEE);
+    if premier {
+        // Le NMI : sur l'entrée que dit la MADT, pour ce processeur ou pour
+        // tous (0xFF) ; sans entrée, LINT1, la règle des PC (Linux fait de
+        // même). Polarité et déclenchement : ceux de la MADT, sinon ceux du
+        // bus (front montant, actif haut) ; un NMI est toujours par front.
+        let nmi = madt.nmi.iter().find(|&&(p, _, _)| p == 0xFF || madt.processeurs.iter().any(|&(n, a)| n == p && a == id));
+        let (lint, drapeaux) = nmi.map_or((1, 0), |&(_, d, l)| (l, d));
+        let polarite = if drapeaux & 3 == 3 { ACTIF_BAS } else { 0 };
+        let entree_nmi = MODE_NMI | polarite;
+        if lint == 0 {
+            ecrire(LVT_LINT0, entree_nmi);
+            ecrire(LVT_LINT1, MASQUEE);
+        } else {
+            ecrire(LVT_LINT1, entree_nmi);
+        }
     } else {
-        ecrire(LVT_LINT1, entree_nmi);
+        ecrire(LVT_LINT1, MASQUEE);
     }
     ecrire(LVT_ERREUR, VECTEUR_ERREUR as u32);
     // ESR : une écriture fige les erreurs en cours dans le registre, la
@@ -206,7 +245,6 @@ pub fn initialiser(madt: &acpi::ConfigurationMadt) -> Result<Bilan, Refus> {
     ecrire(ESR, 0);
     ecrire(ESR, 0);
     fin_interruption();
-    Ok(Bilan { id, adresse, version })
 }
 
 /// Le repli sur le 8259 avec l'APIC local déjà en service (pas d'IO-APIC
@@ -267,9 +305,82 @@ pub fn demarrer_timer(decompte: u32) {
     ecrire(TIMER_INITIAL, decompte);
 }
 
-/// Le numéro de l'APIC local de ce processeur.
-pub fn id() -> u8 {
+/// Le numéro de l'APIC du PREMIER processeur : la destination des
+/// périphériques (ioapic.rs, msix.rs), voir l'en-tête.
+pub fn id_du_premier() -> u8 {
     ID_APIC.load(Ordering::Relaxed)
+}
+
+/// Le numéro de l'APIC du processeur qui exécute ceci, lu dans ses
+/// registres (bits 24 à 31 du registre ID, en xAPIC).
+pub fn id_local() -> u8 {
+    (lire(ID) >> 24) as u8
+}
+
+/// Envoie le message `bas` de l'ICR à l'APIC `destination` : le haut
+/// d'abord (la destination), puis le bas, dont l'écriture déclenche
+/// l'envoi.
+fn envoyer(destination: u8, bas: u32) {
+    ecrire(ICR_HAUT, (destination as u32) << 24);
+    ecrire(ICR_BAS, bas);
+}
+
+/// Attend que l'APIC ait fini d'envoyer le message précédent (le bit « en
+/// cours » de l'ICR retombe) : au plus 100 ms, par pas de 100 µs (le
+/// `safe_apic_wait_icr_idle` de Linux). Faux si le message n'est jamais
+/// parti. Interruptions actives (l'attente passe par l'horloge).
+pub fn attendre_envoi() -> bool {
+    for _ in 0..1000 {
+        if lire(ICR_BAS) & ICR_EN_COURS == 0 {
+            return true;
+        }
+        crate::horloge::attendre_us(100);
+    }
+    false
+}
+
+/// Envoie le message `bas` à `destination`, interruptions coupées le temps
+/// d'attendre que l'ICR soit libre et de l'écrire (ses deux moitiés) : un
+/// gestionnaire d'interruption qui enverrait une IPI entre les deux
+/// écritures (un réveil fait du tic, qui reprogramme un autre processeur)
+/// changerait la destination sous nous, et le message partirait ailleurs
+/// (le `local_irq_save` du `native_apic_icr_write` de Linux). Pour tout ce
+/// qui s'envoie : les IPI, le NMI, l'INIT et les SIPI du démarrage (la
+/// relecture de 6j : ces derniers s'écrivaient interruptions actives).
+fn envoyer_protege(destination: u8, bas: u32) {
+    let interruptions = crate::cpu::couper_interruptions();
+    attendre_envoi();
+    envoyer(destination, bas);
+    if interruptions {
+        crate::cpu::activer_interruptions();
+    }
+}
+
+/// Pose l'INIT sur l'APIC `destination` (en niveau) : le processeur revient
+/// à son état de mise sous tension, et attend un SIPI (smp.rs).
+pub fn envoyer_init(destination: u8) {
+    envoyer_protege(destination, ICR_INIT | ICR_NIVEAU | ICR_POSE);
+}
+
+/// Lève l'INIT (le `APIC_INT_LEVELTRIG | APIC_DM_INIT` de
+/// `send_init_sequence`), 10 ms après l'avoir posé.
+pub fn lever_init(destination: u8) {
+    envoyer_protege(destination, ICR_INIT | ICR_NIVEAU);
+}
+
+/// Envoie un SIPI à l'APIC `destination` : le processeur commence à
+/// exécuter la page `page` de la mémoire basse (adresse page × 4 Kio, en
+/// mode réel : CS = page × 0x100, IP = 0).
+pub fn envoyer_demarrage(destination: u8, page: u8) {
+    envoyer_protege(destination, ICR_DEMARRAGE | page as u32);
+}
+
+/// Les erreurs que l'APIC a notées depuis la dernière lecture (ESR, sans
+/// ses bits réservés : 0xEF, comme Linux), après les avoir figées ; 0 :
+/// aucune. Pour savoir si un SIPI a été accepté.
+pub fn erreurs() -> u32 {
+    ecrire(ESR, 0);
+    lire(ESR) & 0xEF
 }
 
 /// Envoie l'interruption `vecteur` à ce processeur lui-même (une IPI

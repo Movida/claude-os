@@ -80,8 +80,8 @@ static void processeurs(void)
         un |= masque[i];
     verifier(r > 0 && r % 8 == 0 && r <= 1024 && un, "sched_getaffinity : un multiple de 8, au moins un processeur");
     if (chez_nous)
-        verifier(r == 8 && masque[0] == 1 && masque[1] == 0 && masque[8] == 0xff,
-                 "sched_getaffinity, chez nous : 8 octets, le processeur 0 seul, rien d'ecrit apres");
+        verifier(r == 8 && masque[0] == 0x0f && masque[1] == 0 && masque[8] == 0xff,
+                 "sched_getaffinity, chez nous : 8 octets, les quatre processeurs, rien d'ecrit apres");
     verifier(erreur(syscall(SYS_sched_getaffinity, 0, 4, masque)) == EINVAL, "4 octets : EINVAL");
     verifier(erreur(syscall(SYS_sched_getaffinity, 0, 1028, masque)) == EINVAL, "1028 octets (pas un multiple de 8) : EINVAL");
     verifier(erreur(syscall(SYS_sched_getaffinity, 2147483000, 1024, masque)) == ESRCH,
@@ -91,14 +91,14 @@ static void processeurs(void)
     verifier(erreur(syscall(SYS_sched_getaffinity, 0, 1024, (void *)8)) == EFAULT, "a une adresse invalide : EFAULT");
 
     /* getcpu (6j) : le processeur du fil et son nœud ; chaque adresse peut
-       manquer ; une adresse invalide fait EFAULT. Chez nous, le processeur
-       0 et le nœud 0 ; sur l'hôte, un processeur de la machine, et le
-       nœud peut ne pas être 0 (une machine NUMA). sched_getcpu de la glibc
-       passe par là (ou par le vDSO, sur l'hôte). */
+       manquer ; une adresse invalide fait EFAULT. Chez nous, l'un des
+       quatre processeurs et le nœud 0 ; sur l'hôte, un processeur de la
+       machine, et le nœud peut ne pas être 0 (une machine NUMA).
+       sched_getcpu de la glibc passe par là (ou par le vDSO, sur l'hôte). */
     unsigned c = 99, n = 99;
     verifier(syscall(SYS_getcpu, &c, &n, NULL) == 0 && (int)c < get_nprocs(), "getcpu : un processeur de la machine");
     if (chez_nous)
-        verifier(c == 0 && n == 0, "getcpu, chez nous : le processeur 0, le noeud 0");
+        verifier(c < 4 && n == 0, "getcpu, chez nous : l'un des quatre processeurs, le noeud 0");
     verifier(syscall(SYS_getcpu, NULL, NULL, NULL) == 0, "getcpu sans adresse : 0");
     verifier(syscall(SYS_getcpu, &c, NULL, NULL) == 0, "getcpu, le processeur seul : 0");
     verifier(erreur(syscall(SYS_getcpu, (void *)8, NULL, NULL)) == EFAULT, "getcpu a une adresse invalide : EFAULT");

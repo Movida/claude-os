@@ -452,8 +452,8 @@ static void sys(void)
     verifier(compter(online) >= CPU_COUNT(&c) && compter(online) == get_nprocs() && compter(possible) == get_nprocs_conf()
              && compter(present) >= 1, "cpu/online, possible, present : des listes de Linux, celles de get_nprocs et get_nprocs_conf");
     if (chez_nous)
-        verifier(!strcmp(online, "0\n") && !strcmp(possible, "0\n") && !strcmp(present, "0\n") && get_nprocs() == 1
-                 && get_nprocs_conf() == 1, "chez nous : le processeur 0 seul");
+        verifier(!strcmp(online, "0-3\n") && !strcmp(possible, "0-3\n") && !strcmp(present, "0-3\n") && get_nprocs() == 4
+                 && get_nprocs_conf() == 4, "chez nous : quatre processeurs, 0-3");
     lire_tout("/sys/kernel/mm/transparent_hugepage/enabled", thp, sizeof thp, sizeof thp);
     const char *ouvre = strchr(thp, '['), *ferme = strchr(thp, ']');
     verifier(ouvre && ferme > ouvre && strchr(ouvre + 1, '[') == NULL, "transparent_hugepage/enabled : un choix entre crochets");

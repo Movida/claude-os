@@ -12,8 +12,9 @@
 //! programmes ne le sont jamais.
 //!
 //! Le contenu, ce que fait notre noyau :
-//!   - un processeur, le 0 : online, possible, present valent « 0 » (une
-//!     liste de processeurs, au format de Linux) ;
+//!   - les processeurs : online, ceux qui sont en service ; possible et
+//!     present, ceux de la machine (la MADT), répondu ou non (processeur.rs),
+//!     en listes au format de Linux : « 0-3 », « 0,2-3 » ;
 //!   - pas de grandes pages transparentes : « always madvise [never] »,
 //!     la valeur entre crochets étant celle en vigueur, ce que 6a a déjà
 //!     promis (MADV_HUGEPAGE accepté, sans effet).
@@ -21,6 +22,8 @@
 //! le crée qu'avec CONFIG_NUMA, lu), les `access(".../node1")` de Bun
 //! rendent ENOENT.
 
+use alloc::vec::Vec;
+use crate::faillible::{self, VecFaillible};
 use fichiers::noyaufs::{Contenu, Genre, NoyauFs};
 use fichiers::{Erreur, Temps};
 
@@ -53,11 +56,46 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     Ok(s)
 }
 
-/// La valeur de l'attribut `source`, s'il est de /sys.
-pub fn attribut(source: u32) -> Option<&'static [u8]> {
+/// La valeur de l'attribut `source`, s'il est de /sys, fabriquée à la
+/// lecture (ENOMEM si la mémoire manque).
+pub fn attribut(source: u32) -> Option<Result<Vec<u8>, Erreur>> {
     match source {
-        CPU_ONLINE | CPU_POSSIBLE | CPU_PRESENT => Some(b"0\n"),
-        THP_ENABLED => Some(b"always madvise [never]\n"),
+        CPU_ONLINE => Some(liste(crate::processeur::masque_en_service())),
+        CPU_POSSIBLE | CPU_PRESENT => Some(liste(crate::processeur::masque_possible())),
+        THP_ENABLED => Some(faillible::copie(b"always madvise [never]\n").map_err(|_| Erreur::ENOMEM)),
         _ => None,
     }
+}
+
+/// Une liste de processeurs au format de Linux (le `%*pbl` de lib/vsprintf.c,
+/// `bitmap_list_string`) : les plages de numéros consécutifs, « 0-3 »,
+/// séparées par des virgules, « 0,2-3 », et un saut de ligne.
+fn liste(masque: u64) -> Result<Vec<u8>, Erreur> {
+    let mut v: Vec<u8> = faillible::avec_capacite(64).map_err(|_| Erreur::ENOMEM)?;
+    let nombre = |v: &mut Vec<u8>, n: u32| -> Result<(), Erreur> {
+        let mut texte = [0u8; 10];
+        let d = crate::vfs::decimal(n, &mut texte);
+        v.ajouter_tranche(if d.is_empty() { b"0" } else { d }).map_err(|_| Erreur::ENOMEM)
+    };
+    let mut n = 0u32;
+    while n < 64 {
+        if masque >> n & 1 == 0 {
+            n += 1;
+            continue;
+        }
+        let debut = n;
+        while n < 64 && masque >> n & 1 == 1 {
+            n += 1;
+        }
+        if debut != 0 {
+            v.ajouter(b',').map_err(|_| Erreur::ENOMEM)?;
+        }
+        nombre(&mut v, debut)?;
+        if n - 1 > debut {
+            v.ajouter(b'-').map_err(|_| Erreur::ENOMEM)?;
+            nombre(&mut v, n - 1)?;
+        }
+    }
+    v.ajouter(b'\n').map_err(|_| Erreur::ENOMEM)?;
+    Ok(v)
 }

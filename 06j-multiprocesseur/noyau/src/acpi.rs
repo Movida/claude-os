@@ -133,8 +133,8 @@ fn lire_madt(t: &acpi::Table) -> Option<ConfigurationMadt> {
         let Ok(e) = e else { break };
         match e {
             // Activé, ou activable plus tard : on ne compte que les premiers.
-            // UNIPROCESSEUR : seul le processeur de démarrage sert ; les
-            // autres, listés ici, seront éveillés par INIT-SIPI-SIPI.
+            // Le premier de la liste est en général celui qui démarre ; les
+            // autres sont éveillés par INIT-SIPI-SIPI (smp.rs).
             Entree::Processeur { processeur, apic, drapeaux } if drapeaux & 1 != 0 => c.processeurs.ajouter((processeur, apic)).ok()?,
             Entree::IoApic { numero, adresse, gsi_base } => c.ioapics.ajouter((numero, adresse as u64, gsi_base)).ok()?,
             // Seul le bus 0, ISA, existe.

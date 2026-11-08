@@ -69,9 +69,13 @@ mod processeur;
 #[allow(unsafe_code)]
 mod serie;
 #[allow(unsafe_code)]
+mod smp;
+#[allow(unsafe_code)]
 mod sse;
 #[allow(unsafe_code)]
 mod temps;
+#[allow(unsafe_code)]
+mod trampoline;
 #[allow(unsafe_code)]
 mod tsc;
 #[allow(unsafe_code)]
@@ -190,7 +194,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 //   - à la place du noyau (PML4[511] puis PDPT[510], 0xffff_ffff_8000_0000).
 // Bits des entrées : 0x003 = présente, inscriptible ; 0x080 = page de 2 Mio.
 // Ce sont des tables provisoires, à grosses pages, sans protection : le
-// noyau les remplacera par les siennes, page par page.
+// noyau les remplacera par les siennes, page par page. Sauf la PDPT à
+// l'identique et sa PD, qui restent (6j) : elles sont la moitié basse de
+// la PML4 du trampoline des processeurs secondaires (trampoline.rs), qui
+// démarrent eux aussi à une adresse basse et doivent y lire quelques
+// instructions une fois leur pagination active ; d'où le symbole global.
 //
 // Une fois en haut, la base de GS du noyau reçoit l'adresse de la zone du
 // premier processeur (processeur.rs, ZONES_PROCESSEURS) : le premier
@@ -268,6 +276,7 @@ haut:
 
     .section .bss.demarrage, "aw", @nobits
     .p2align 12
+    .global demarrage_pdpt_identite
 demarrage_pml4: .skip 4096
 demarrage_pdpt_identite: .skip 4096
 demarrage_pdpt_directe: .skip 4096
@@ -425,10 +434,14 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         tsc::Bilan::Mesure => afficherln!("[noyau] TSC non fiable (mesures rejetees ou en desaccord) : l'heure au tic."),
     }
     match source {
-        horloge::Source::Apic(hz) => afficherln!("[noyau] Horloge : timer de l'APIC ({}.{:03} MHz apres le diviseur), {} Hz, vecteur {:#x} ; PIT arrete.",
-                                                 hz / 1_000_000, hz / 1000 % 1000, horloge::HZ, apic::VECTEUR_TIMER),
+        horloge::Source::Apic { hz, etalon } => afficherln!("[noyau] Horloge : timer de l'APIC ({}.{:03} MHz apres le diviseur, mesure contre le {}), {} Hz, vecteur {:#x} ; PIT arrete.",
+                                                            hz / 1_000_000, hz / 1000 % 1000, etalon, horloge::HZ, apic::VECTEUR_TIMER),
         horloge::Source::Pit => afficherln!("[noyau] Horloge : PIT, {} Hz, vecteur {:#x}.", horloge::HZ, irq::vecteur(horloge::IRQ)),
     }
+    // Les processeurs secondaires (smp.rs) : maintenant que l'APIC, l'horloge,
+    // vmalloc et les tâches sont en place, et que les registres de contrôle
+    // du premier ont leur valeur finale, qu'ils doivent reprendre.
+    smp::demarrer_secondaires();
     // Le compte affiché est celui depuis le démarrage de l'horloge : 100,
     // plus les tics passés à écrire les messages qui précèdent (sous QEMU,
     // un ou deux par ligne, le port série étant un fichier), plus parfois
@@ -1051,7 +1064,7 @@ fn tester_vecteurs() {
         match msix::MsiX::activer(f) {
             Ok(m) => {
                 let programme = m.programmer(1, 0x45);
-                let attendu = (0xfee0_0000 | (apic::id() as u64) << 12, 0x45, false);
+                let attendu = (0xfee0_0000 | (apic::id_du_premier() as u64) << 12, 0x45, false);
                 afficherln!("[noyau] MSI-X de {} : {} entrees, entree 1 programmee et relue : {}.",
                             f.adresse, m.entrees(), ok(programme && m.message(1) == Some(attendu)));
             }
