@@ -585,3 +585,69 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   `/etc/resolv.conf` d'une machine sous systemd-resolved.
 - **Une fonction entre le test et `errno`** l'écrase : `access(...) && errno ==
   ENOMEM` lisait ENOENT. Garder `errno` dans une variable d'abord.
+
+## Pièges rencontrés en 6i (8 novembre 2026)
+
+- **Les conflits d'adjacence** : `git merge-file` déclare un conflit dès que
+  les deux côtés changent des lignes VOISINES. Dans un repli par couches,
+  c'est le cas ordinaire : une correction insère une ligne juste à côté de
+  lignes qu'un commit plus tardif ajoutera (une règle du Makefile, une ligne
+  attendue, un programme de `/etc/demarrage`). Un petit résolveur
+  (`relecture-6i/repli/tolerante.py`) les tranche : dans chaque bloc, les
+  régions changées de chaque côté (difflib) ; si elles ne se recouvrent pas,
+  les deux s'appliquent ; deux insertions au même point prennent l'ordre de
+  l'arbre final ; une même ligne changée des deux côtés (une liste de
+  dépendances) se fusionne mot à mot. Chaque bloc tranché est noté, pour la
+  relecture. En 6i : près de quarante blocs tranchés seuls, cinq à la main.
+- **Les nombres qui se déduisent d'autres fichiers** (dans `attendu.txt` :
+  les comptes de l'archive, le nombre de commandes du lanceur, les lignes
+  d'un groupe) conflictent à chaque commit : les masquer pendant les
+  fusions, puis les recalculer pour chaque instantané (la valeur d'origine du
+  commit, plus ce que les corrections changent dans `archive.txt` et dans le
+  lanceur), après avoir vérifié que la règle retrouve l'origine elle-même.
+- **Un commit « Reste » neuf** n'a pas d'origine : son arbre de départ est
+  celui du commit qui le précède, et il n'apporte que sa couche. Le placer
+  avant le premier commit qui en a besoin.
+- **`main` a avancé pendant l'étape** (deux commits d'Outillage, dans
+  `.devcontainer`) : la chaîne repliée part du nouveau `main`, chaque arbre
+  prenant ses fichiers, après avoir vérifié que les deux ne touchent pas les
+  mêmes.
+- **Replier, c'est relire chaque correction sous sa forme d'alors** : en
+  écrivant la forme sans inotify d'une correction faite avec lui, un
+  paramètre toujours vrai et un résultat jamais lu sont apparus dans l'arbre
+  corrigé, qu'aucune relecture n'avait vus. Puis chercher les anachronismes :
+  un mot d'un commit plus tardif (inotify, sendfile, setuid) apparu par le
+  repli dans un commit plus ancien, en comparant chaque instantané à
+  l'origine du même commit (`relecture-6i/repli/anachronismes.py`) ; un test
+  ajouté dans le même morceau que celui d'un commit voisin part avec lui, et
+  ne se voit qu'à `make tests-hote` (construire chaque instantané ne suffit
+  pas).
+- **Deux voies de vérification en parallèle se gênent** : `tests-hote-root`
+  (`linux/pmtu`) change les routes de l'espace réseau de la machine, et deux
+  à la fois échouent l'un par l'autre ; et la charge des deux fait dépasser
+  à un démarrage la limite de `DUREE`, qui doit être mesurée seul (une ligne
+  datée par message du port série) à chaque commit qui allonge le
+  démarrage. Relancer seul un commit en échec avant d'y croire.
+- **« memoire rendue » d'un groupe voit les places qui doublent** : la liste
+  d'un dossier du tmpfs (un `Vec`) qui grandit pendant le groupe et ne
+  rétrécissait jamais, le chemin d'un `cd` que garde le lanceur, comptent
+  comme une page non rendue, sans fuite. Et un groupe qui passe « par
+  chance de place » : un fichier de plus dans l'archive (`/tmp/prog`) a
+  montré que celui de `claude -p` ne rendait sa mémoire que parce que ce
+  que claude laissait dans `/tmp` tenait dans la place de la liste. Un noyau instrumenté, jetable (une
+  copie dans le brouillon, jamais commitée), qui note chaque page prise et
+  rendue avec son appelant, les montre en une passe.
+- **Ce qu'un programme fait selon le moment** ne va pas dans un fichier
+  attendu : `claude -p` efface la sonde de sa surveillance des fichiers si
+  son essai, en tâche de fond, finit avant lui ; sous Linux, plus rapide, il
+  la laisse toujours (six fois sur six) ; sous QEMU, selon la charge.
+- **Une sonde en C** : l'ordre d'évaluation des arguments d'un `printf`
+  n'est pas défini, et deux appels système passés en arguments s'y font
+  dans l'ordre que choisit gcc (de droite à gauche ici) : les séquencer
+  dans des instructions à part. Et `alarm` (37) n'existe pas chez nous : une
+  limite de temps dans un test passe par `SO_RCVTIMEO`. Un test de signal
+  dit « je suis dans l'appel » juste avant l'appel système qui attend,
+  après ce qui le prépare (`epoll_create1`, `epoll_ctl`, `clock_gettime`) :
+  sinon un signal livré pendant la préparation arrive trop tôt, et le test
+  échoue sous la charge seulement. Un délai ajouté dans une copie jetable
+  rend ces courses certaines.
