@@ -889,9 +889,10 @@ texte: boot.bin
 # 14,6 s quand trois relectures se partageaient les 12 cœurs de la
 # machine : d'où la marge. En 6h, les temps d'attente de tcp (le SYN sans
 # réponse, 3 s ; le keepalive, 2,5 s ; SO_LINGER, 1 s) et ses 64 Mio
-# (1,1 s) : 26 s en tout, mesurées. verifier.sh le demande par `make
-# duree` ; ne pas le lancer sur une machine saturée.
-DUREE = 45
+# (1,1 s) : 26 s en tout au milieu de l'étape, 39 s à sa fin (tcp seul :
+# 17 s), mesurées en 6i ; d'où 90 s depuis, le double. verifier.sh le
+# demande par `make duree` ; ne pas le lancer sur une machine saturée.
+DUREE = 90
 
 duree:
 	@echo $(DUREE)
