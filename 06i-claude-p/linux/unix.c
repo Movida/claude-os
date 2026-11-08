@@ -769,6 +769,11 @@ static void unlink_et_proc(void)
         fclose(f);
     }
     verifier(entete && trouve, "/proc/net/unix : l'en-tete, et l'ecoute (son nom)");
+    /* Une séquence (`seq_lseek`) : SEEK_SET et SEEK_CUR seulement. */
+    int seq = open("/proc/net/unix", O_RDONLY);
+    verifier(erreur(lseek(seq, 0, SEEK_END)) == EINVAL && lseek(seq, 5, SEEK_SET) == 5,
+             "/proc/net/unix : lseek SEEK_END, EINVAL (une sequence)");
+    close(seq);
     close(c);
     close(s);
     unlink("visible");

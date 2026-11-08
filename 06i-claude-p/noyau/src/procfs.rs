@@ -631,8 +631,12 @@ pub fn lecture(source: u32) -> Lecture {
         s if s >= SYSCTL_NET => Lecture::Valeur,
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD | RANDOM_BOOT_ID
         | RANDOM_UUID | RANDOM_ENTROPY_AVAIL | RANDOM_POOLSIZE | RANDOM_WAKEUP | RANDOM_RESEED => Lecture::Valeur,
-        MAPS | STATM | COMM | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP => Lecture::Sequence,
-        _ => Lecture::Attribut,
+        MAPS | STATM | COMM | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP | NET_UNIX => Lecture::Sequence,
+        // Nommées une à une, sans cas par défaut : /proc/net/tcp et unix
+        // (6h) y étaient tombés, et se comportaient en attributs de /sys
+        // (lseek SEEK_END donnait 4096 ; Linux : EINVAL, `seq_lseek`).
+        crate::sysfs::CPU_ONLINE | crate::sysfs::CPU_POSSIBLE | crate::sysfs::CPU_PRESENT | crate::sysfs::THP_ENABLED => Lecture::Attribut,
+        _ => unreachable!("source de fichier du noyau inconnue"),
     }
 }
 

@@ -889,6 +889,11 @@ static void proc_net_tcp(void)
         fclose(f);
     }
     verifier(entete && trouve, "/proc/net/tcp : l'en-tete, et l'ecoute (etat 0A)");
+    /* Une séquence (`seq_lseek`) : SEEK_SET et SEEK_CUR seulement. */
+    int fd = open("/proc/net/tcp", O_RDONLY);
+    verifier(erreur(lseek(fd, 0, SEEK_END)) == EINVAL && lseek(fd, 5, SEEK_SET) == 5,
+             "/proc/net/tcp : lseek SEEK_END, EINVAL (une sequence)");
+    close(fd);
     close(l);
 }
 
