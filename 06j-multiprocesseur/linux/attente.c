@@ -480,6 +480,15 @@ static void epolls(void)
     int n = poll(&pf, 1, 0);
     verifier(a == 0 && b == EPOLLIN && pret == (POLLIN | POLLRDNORM) && n == 0 && evs(ep2) == 0,
              "un epoll dans un epoll : l'interieur pret rend l'exterieur pret ; poll d'un epoll pret 0x41, vide de nouveau 0");
+    /* Un epoll vide sondé AVEC un délai : 0 au bout du délai. (Dans notre
+     * noyau, le verrou qui dort de l'epoll effaçait « je vais dormir »,
+     * posé avant le tour, et le noyau s'arrêtait : la relecture de 6j.) */
+    int ep3 = epoll_create1(0);
+    struct pollfd pv = { ep3, POLLIN, 0 };
+    long long t1 = maintenant_ms();
+    n = poll(&pv, 1, 20);
+    verifier(n == 0 && maintenant_ms() - t1 >= 20, "poll d'un epoll vide pendant 20 ms : 0, apres 20 ms");
+    close(ep3);
 
     /* close d'un numéro qu'un dup double : l'inscription reste ; au dernier
      * close, elle disparaît. */

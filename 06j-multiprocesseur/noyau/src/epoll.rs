@@ -372,6 +372,8 @@ impl Epoll {
                 return -EINTR;
             }
             let interruptions = cpu::couper_interruptions();
+            // « Je vais dormir » avant de regarder les prêts (attente.rs).
+            t.preparer_sommeil(Sommeil::Interruptible);
             disponible = {
                 let p = self.prets.verrouiller();
                 let d = Self::disponible(&p);
@@ -397,6 +399,7 @@ impl Epoll {
                 }
                 self.wq.retirer(t);
             }
+            t.reveille();
             if interruptions {
                 cpu::activer_interruptions();
             }

@@ -1282,7 +1282,16 @@ pub fn pause() -> i64 {
 /// Dort jusqu'à ce qu'un signal non bloqué attende le fil courant (une
 /// attente sans file : seul un signal la réveille). Interruptions coupées.
 fn attendre_un_signal() {
-    while crate::attente::dormir(None, crate::attente::Sommeil::Interruptible) != tache::Reveil::Signal {}
+    let t = tache::courante();
+    loop {
+        // « Je vais dormir » à chaque tour (attente.rs) : celui qui envoie
+        // le signal le pose, puis tente le réveil.
+        t.preparer_sommeil(crate::attente::Sommeil::Interruptible);
+        if crate::attente::dormir(None, crate::attente::Sommeil::Interruptible) == tache::Reveil::Signal {
+            break;
+        }
+    }
+    t.reveille();
 }
 
 /// rt_sigtimedwait(ensemble, siginfo, délai, taille du masque) : attend un
@@ -1325,6 +1334,9 @@ pub fn rt_sigtimedwait(uthese: u64, uinfo: u64, delai: u64, taille: u64) -> i64 
     let mut r = -EAGAIN;
     if pris.is_none() && attendre != Some(0) {
         let echeance = attendre.map(|ns| crate::temps::ns_monotone().saturating_add(ns));
+        // « Je vais dormir » AVANT de débloquer l'ensemble (attente.rs) :
+        // un signal envoyé dès le déblocage trouve l'état posé.
+        tache::courante().preparer_sommeil(crate::attente::Sommeil::Interruptible);
         let avant = processus::avec(|p| {
             let f = &mut p.fil(tid).expect("appel systeme d'un fil qui a quitte son processus").signaux;
             let avant = f.bloques;
@@ -1333,6 +1345,7 @@ pub fn rt_sigtimedwait(uthese: u64, uinfo: u64, delai: u64, taille: u64) -> i64 
             avant
         });
         let reveil = crate::attente::dormir(echeance, crate::attente::Sommeil::Interruptible);
+        tache::courante().reveille();
         pris = processus::avec(|p| {
             let f = &mut p.fil(tid).expect("appel systeme d'un fil qui a quitte son processus").signaux;
             let rebloques = avant & !f.bloques;

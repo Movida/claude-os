@@ -184,6 +184,8 @@ pub fn configurer() {
         // (une réponse arrivée entre-temps réveille), interruptions
         // coupées entre les deux : rien ne se perd.
         let interruptions = cpu::couper_interruptions();
+        // « Je vais dormir » avant de regarder la fin (attente.rs).
+        tache::courante().preparer_sommeil(Sommeil::Ininterruptible);
         let echeance = match EN_COURS.verrouiller().as_ref() {
             Some(c) if !c.fini => {
                 c.attente.inscrire();
@@ -192,12 +194,18 @@ pub fn configurer() {
             _ => None,
         };
         let Some(echeance) = echeance else {
+            tache::courante().reveille();
             if interruptions {
                 cpu::activer_interruptions();
             }
             break;
         };
         attente::dormir(Some(echeance), Sommeil::Ininterruptible);
+        // « En cours » aussitôt : la suite affiche des messages (le verrou
+        // qui dort de la console), interdit avec un sommeil encore posé
+        // (attente.rs ; trouvé par la relecture de 6j, sur la machine sans
+        // serveur DHCP, qui dit chaque essai).
+        tache::courante().reveille();
         if let Some(c) = EN_COURS.verrouiller().as_ref() {
             c.attente.retirer(tache::courante());
         }

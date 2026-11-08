@@ -93,8 +93,12 @@ impl EventFd {
     /// (attente.rs).
     fn attendre<R>(&self, non_bloquant: bool, cle: u32, mut essayer: impl FnMut(&mut u64, bool) -> Option<R>) -> Result<R, i64> {
         let interruptions = cpu::couper_interruptions();
+        let t = tache::courante();
         let mut signal = false;
         let r = loop {
+            // « Je vais dormir » avant d'essayer (attente.rs) : qui écrit ou
+            // lit le compteur le change, puis réveille la file.
+            t.preparer_sommeil(Sommeil::Interruptible);
             let fait = essayer(&mut self.compteur.verrouiller(), self.semaphore);
             if let Some(r) = fait {
                 self.attente.reveiller(cle, 1);
@@ -110,8 +114,9 @@ impl EventFd {
             }
             self.attente.inscrire();
             signal = attente::dormir(None, Sommeil::Interruptible) == Reveil::Signal;
-            self.attente.retirer(tache::courante());
+            self.attente.retirer(t);
         };
+        t.reveille();
         if interruptions {
             cpu::activer_interruptions();
         }

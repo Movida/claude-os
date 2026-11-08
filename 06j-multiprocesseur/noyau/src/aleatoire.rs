@@ -347,7 +347,10 @@ fn gigue() {
     let mut echantillons = 0u32;
     while !pret() && !tache::signal_en_attente() {
         let interruptions = cpu::couper_interruptions();
+        // Un sommeil à échéance, sans file : « je vais dormir », puis dormir.
+        tache::courante().preparer_sommeil(Sommeil::Interruptible);
         attente::dormir(Some(temps::ns_monotone() + 1_000_000), Sommeil::Interruptible);
+        tache::courante().reveille();
         if interruptions {
             cpu::activer_interruptions();
         }
@@ -372,6 +375,8 @@ pub fn attendre_pret() -> Result<(), i64> {
         let interruptions = cpu::couper_interruptions();
         let t = tache::courante();
         let mut r = Ok(());
+        // « Je vais dormir » avant de regarder « prêt » (attente.rs).
+        t.preparer_sommeil(Sommeil::Interruptible);
         if !pret() {
             if tache::signal_en_attente() {
                 r = Err(-crate::reprise::ERESTARTSYS);
@@ -383,6 +388,7 @@ pub fn attendre_pret() -> Result<(), i64> {
                 PRET.retirer(&t);
             }
         }
+        t.reveille();
         if interruptions {
             cpu::activer_interruptions();
         }

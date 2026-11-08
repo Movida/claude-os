@@ -144,9 +144,12 @@ struct File {
     octets: [u8; 64],
     debut: usize,
     nombre: usize,
-    /// Les tâches qui attendent un code (la tâche du clavier).
-    attente: FileAttente,
 }
+
+/// Les tâches qui attendent un code (la tâche du clavier). Une file
+/// d'attente a son propre verrou (attente.rs) : à part de la file des
+/// codes, pas sous son verrou.
+static ATTENTE: FileAttente = FileAttente::new();
 
 impl File {
     fn ajouter(&mut self, octet: u8) {
@@ -168,7 +171,7 @@ impl File {
     }
 }
 
-static FILE: Verrou<File> = Verrou::new(File { octets: [0; 64], debut: 0, nombre: 0, attente: FileAttente::new() });
+static FILE: Verrou<File> = Verrou::new(File { octets: [0; 64], debut: 0, nombre: 0 });
 
 /// Le gestionnaire de l'IRQ 1 : lire l'octet, le ranger, c'est tout.
 /// Il FAUT le lire : tant que le port 0x60 est plein, le 8042 n'envoie
@@ -180,7 +183,8 @@ pub fn interruption() {
     f.ajouter(code);
     // Qui attendait un caractère peut le lire : il est réveillé, et le
     // traitera hors de l'interruption (la « moitié basse » de Linux).
-    f.attente.reveiller_toutes();
+    drop(f);
+    ATTENTE.reveiller_toutes();
 }
 
 // ---------------------------------------------------------------------------
@@ -372,15 +376,11 @@ pub fn lire_caractere() -> Option<char> {
 pub fn tache() {
     loop {
         cpu::couper_interruptions();
-        {
-            let f = FILE.verrouiller();
-            if f.nombre == 0 {
-                f.attente.inscrire();
-                drop(f);
-                attente::dormir(None, Sommeil::Ininterruptible);
-                FILE.verrouiller().attente.retirer(crate::tache::courante());
-            }
-        }
+        // Les sept pas d'attente.rs (`attendre_que`) : « je vais dormir »,
+        // inscrite, la file regardée, le sommeil que l'interruption du
+        // clavier finit (elle pose la touche, puis réveille).
+        attente::attendre_que(&ATTENTE, attente::Inscription::Ordinaire, Sommeil::Ininterruptible, None,
+                              || FILE.verrouiller().nombre != 0);
         cpu::activer_interruptions();
         while let Some(c) = lire_caractere() {
             afficher!("{}", c);

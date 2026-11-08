@@ -1392,14 +1392,19 @@ fn sommeil(calcul: bool, cible: u64, reste: Option<u64>) -> i64 {
         let r = crate::attente::dormir_calcul(compte, cible);
         (r, cible.saturating_sub(tache::temps_du_processus()))
     } else {
+        let t = tache::courante();
         let r = loop {
             // Rien d'autre que l'échéance ou un signal ne la réveille : un
-            // réveil sans raison se rendort.
+            // réveil sans raison se rendort. « Je vais dormir » à chaque
+            // tour (attente.rs) : sans file, seuls le tic et les signaux
+            // la réveillent, mais `dormir` l'exige.
+            t.preparer_sommeil(crate::attente::Sommeil::Interruptible);
             match crate::attente::dormir(Some(cible), crate::attente::Sommeil::Interruptible) {
                 tache::Reveil::Reveillee => continue,
                 r => break r,
             }
         };
+        t.reveille();
         (r, cible.saturating_sub(temps::ns_monotone()))
     };
     if interruptions {

@@ -129,19 +129,17 @@ fn lire(c: &Carte) -> usize {
             c.notifieur.notifier();
         }
     }
-    let interruptions = cpu::couper_interruptions();
-    let t = tache::courante();
-    let n = loop {
-        if let Some((_, n)) = c.file.verrouiller().obtenir() {
-            break n as usize;
+    // Les sept pas d'attente.rs (`attendre_que`) : « je vais dormir »,
+    // inscrite, la file regardée, et le sommeil que l'interruption de la
+    // carte finit.
+    let mut n = 0;
+    attente::attendre_que(&c.attente, attente::Inscription::Ordinaire, Sommeil::Ininterruptible, None, || {
+        if let Some((_, lus)) = c.file.verrouiller().obtenir() {
+            n = lus as usize;
+            return true;
         }
-        c.attente.inscrire();
-        attente::dormir(None, Sommeil::Ininterruptible);
-        c.attente.retirer(&t);
-    };
-    if interruptions {
-        cpu::activer_interruptions();
-    }
+        false
+    });
     n.min(LECTURE)
 }
 
@@ -158,7 +156,10 @@ fn boucle(c: &'static Carte) {
         crypto::effacer(&mut octets);
         let attente = crypto::alea::intervalle(temps::ns_monotone() / 1_000_000_000);
         let interruptions = cpu::couper_interruptions();
+        // Un sommeil à échéance, sans file : « je vais dormir », puis dormir.
+        tache::courante().preparer_sommeil(Sommeil::Ininterruptible);
         attente::dormir(Some(temps::ns_monotone() + attente * 1_000_000_000), Sommeil::Ininterruptible);
+        tache::courante().reveille();
         if interruptions {
             cpu::activer_interruptions();
         }

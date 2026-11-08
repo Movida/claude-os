@@ -939,11 +939,14 @@ pub fn lire(g: &Groupe, non_bloquant: bool, tampon: u64, longueur: u64) -> Resul
         // la file d'événements regardée encore une fois, interruptions
         // coupées jusqu'au sommeil (attente.rs).
         let interruptions = cpu::couper_interruptions();
+        let t = tache::courante();
+        t.preparer_sommeil(Sommeil::Interruptible);
         g.attente.inscrire();
         if g.file.verrouiller().evenements.is_empty() {
             signal = attente::dormir(None, Sommeil::Interruptible) == Reveil::Signal;
         }
-        g.attente.retirer(tache::courante());
+        g.attente.retirer(t);
+        t.reveille();
         if interruptions {
             cpu::activer_interruptions();
         }

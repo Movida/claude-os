@@ -147,7 +147,12 @@ pub fn sonder(o: &FichierTenu, table: &mut Table) -> u32 {
 /// réveillée depuis son dernier sommeil (le `triggered`).
 struct Attente {
     tache: Arc<Tache>,
-    declenchee: core::cell::Cell<bool>,
+    /// Écrit par le rappel (sous le verrou d'une file, sur un processeur
+    /// quelconque), lu et remis par la tâche sans verrou : atomique, en
+    /// SeqCst des deux côtés (le `smp_wmb` de `pollwake` et le
+    /// `smp_store_mb` de `poll_schedule_timeout` : le motif de Dekker,
+    /// contre « je vais dormir »).
+    declenchee: core::sync::atomic::AtomicBool,
 }
 
 /// Une entrée de sondage (la `poll_table_entry` de Linux), inscrite dans la
@@ -174,7 +179,7 @@ impl Rappel for EntreeSondage {
         // SAFETY: l'attente vit plus longtemps que ses entrées (`Entrees`
         // l'emprunte, et retire ses entrées avant de la rendre).
         let a = unsafe { &*self.attente };
-        a.declenchee.set(true);
+        a.declenchee.store(true, core::sync::atomic::Ordering::SeqCst);
         tache::reveiller(a.tache.clone(), Reveil::Reveillee)
     }
 }
@@ -288,10 +293,11 @@ pub fn delai_timespec(adresse: u64) -> Result<Delai, i64> {
 /// ce qui est prêt passe avant le signal). Un délai nul ne dort ni
 /// n'inscrit rien.
 pub fn attendre_prets(delai: Delai, mut tour: impl FnMut(&mut Table) -> usize) -> Result<usize, i64> {
-    let attente = Attente { tache: tache::courante_arc(), declenchee: core::cell::Cell::new(false) };
+    let attente = Attente { tache: tache::courante_arc(), declenchee: core::sync::atomic::AtomicBool::new(false) };
     let mut entrees = Entrees { attente: &attente, blocs: Vec::new(), erreur: false };
     let mut fini = matches!(delai, Delai::Nul);
     let mut premier = !fini;
+    let t = tache::courante();
     let r = loop {
         let n = if premier { tour(&mut Table::new(Some(&mut entrees as &mut dyn Inscrire))) } else { tour(&mut Table::new(None)) };
         premier = false;
@@ -307,22 +313,34 @@ pub fn attendre_prets(delai: Delai, mut tour: impl FnMut(&mut Table) -> usize) -
         if fini {
             break Ok(0);
         }
-        // Le `poll_schedule_timeout` de Linux : pas de sommeil si une entrée
-        // a déjà été réveillée ; interruptions coupées entre ce constat et
-        // le sommeil (attente.rs).
+        // Le `poll_schedule_timeout` de Linux : « je vais dormir » APRÈS le
+        // tour, interruptions coupées, puis « déclenchée » lue : un rappel
+        // venu pendant le tour l'a posée avant de nous réveiller, nous
+        // posons l'état puis la lisons (le motif de Dekker, attente.rs) ;
+        // l'un des deux voit l'autre, et pas de sommeil si elle est posée.
+        // Posé AVANT le tour, l'état était perdu : sonder peut dormir (une
+        // copie vers le programme qui faute, le Mutex d'un epoll), et tout
+        // sommeil finit par remettre « en cours » ; `dormir` arrêtait alors
+        // le noyau pour un `poll` d'un epoll avec un délai (la relecture de
+        // 6j ; `linux/attente` le vérifie).
         let interruptions = cpu::couper_interruptions();
-        if !attente.declenchee.get() {
+        t.preparer_sommeil(Sommeil::Interruptible);
+        if !attente.declenchee.load(core::sync::atomic::Ordering::SeqCst) {
             let echeance = match delai {
                 Delai::Jusqua(e) => Some(e),
                 Delai::Infini | Delai::Nul => None,
             };
             fini = attente::dormir(echeance, Sommeil::Interruptible) == Reveil::Echeance;
         }
-        attente.declenchee.set(false);
+        // « En cours » avant le tour suivant : la raison du réveil est lue
+        // (`fini`), et le tour peut prendre un verrou qui dort.
+        t.reveille();
+        attente.declenchee.store(false, core::sync::atomic::Ordering::SeqCst);
         if interruptions {
             cpu::activer_interruptions();
         }
     };
+    t.reveille();
     drop(entrees);
     r
 }

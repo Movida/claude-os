@@ -60,7 +60,7 @@
 use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::arch::{asm, global_asm};
-use core::cell::{Cell, UnsafeCell};
+use core::cell::UnsafeCell;
 use core::fmt;
 use core::mem::size_of;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
@@ -236,13 +236,20 @@ pub struct Tache {
     /// fois. Dans la tâche, elle ne bouge jamais (une tâche ne quitte pas son
     /// Arc).
     entree_attente: EntreeAttente,
-    /// Pourquoi elle a été réveillée (`Reveil`, en u8) : le premier qui la
-    /// réveille l'écrit ; 0 tant que personne ne l'a fait.
-    reveil: AtomicU8,
-    /// Elle dort, et un signal peut la réveiller (TASK_INTERRUPTIBLE).
-    interruptible: AtomicBool,
-    /// Le futex qu'elle attend (futex.rs), sous le verrou de son seau.
-    futex: Cell<Option<crate::futex::Attente>>,
+    /// Son état, UN SEUL mot (le `__state` de Linux ; les valeurs : le
+    /// module `etat`) : « en cours », « va dormir » (interruptible ou non),
+    /// la raison de son réveil, ou « morte ». C'est le mot que se partagent
+    /// celle qui s'endort et celui qui la réveille (attente.rs) : posé en
+    /// SeqCst par la tâche AVANT qu'elle vérifie ce qu'elle attend, changé
+    /// par un compare_exchange de qui la réveille. Jusqu'à 6i, deux mots
+    /// (`reveil` et `interruptible`), dont le second était posé après le
+    /// test des signaux : un signal envoyé entre les deux pouvait être perdu
+    /// sur deux processeurs.
+    etat: AtomicU8,
+    /// Le futex qu'elle attend (futex.rs) : écrit par elle, et par un
+    /// FUTEX_REQUEUE d'un autre fil (sous le verrou du seau où elle attend),
+    /// lu par elle sans ce verrou : d'où un verrou court à lui.
+    futex: Verrou<Option<crate::futex::Attente>>,
     /// Elle tient la mémoire de son processus, en lecture ou en écriture
     /// (processus::memoire_lue, memoire_ecrite, servir_faute) : une faute
     /// d'une copie du noyau ne peut pas la redemander (faute_de_page.rs).
@@ -382,9 +389,8 @@ impl Tache {
             // quitter son rôle pour entrer dans la file des prêtes.)
             attendant: Verrou::new((noyau && en_service() && !courante().inactive).then(courante_arc)),
             entree_attente: EntreeAttente::new(),
-            reveil: AtomicU8::new(0),
-            interruptible: AtomicBool::new(false),
-            futex: Cell::new(None),
+            etat: AtomicU8::new(etat::EN_COURS),
+            futex: Verrou::new(None),
             tient_sa_memoire: AtomicBool::new(false),
             sans_faute: AtomicBool::new(false),
             temps_a_verifier: AtomicBool::new(false),
@@ -465,7 +471,9 @@ impl Tache {
 
     /// Est-elle morte ?
     pub fn est_morte(&self) -> bool {
-        self.morte.load(Ordering::Relaxed)
+        // Acquire : la paire du Release de `terminer` (son code de sortie
+        // est écrit avant).
+        self.morte.load(Ordering::Acquire)
     }
 
     /// Son processus, pour un programme Linux.
@@ -489,14 +497,33 @@ impl Tache {
         self.webassembly.load(Ordering::Relaxed)
     }
 
-    /// Dort-elle, interruptible ?
+    /// Dort-elle (ou va-t-elle dormir), interruptible ?
     pub fn dort_interruptible_maintenant(&self) -> bool {
-        self.interruptible.load(Ordering::Relaxed)
+        self.etat.load(Ordering::Relaxed) == etat::DORT_INTERRUPTIBLE
     }
 
     /// Prévoit sa fin par `signal`, avec ce message (voir `forcer`).
     pub fn forcer(&self, signal: Signal, raison: impl fmt::Display) {
+        Self::forcer_sous(&mut self.fin.verrouiller(), signal, raison);
+    }
+
+    /// Comme `forcer`, mais seulement si `reveil` (le compare_exchange d'un
+    /// réveil, `reveiller`) réussit, le verrou de la fin tenu pendant le
+    /// réveil : la tâche réveillée, si elle regarde sa fin avant que nous
+    /// l'ayons écrite, attend ce verrou (le détecteur d'interblocage,
+    /// attente.rs : jusqu'à la relecture de 6j, le réveil précédait
+    /// l'écriture, et la tâche pouvait voir « réveillée par un signal » sans
+    /// signal, un EINTR sans raison). Rend ce que `reveil` a rendu.
+    pub fn forcer_apres(&self, signal: Signal, raison: impl fmt::Display, reveil: impl FnOnce() -> bool) -> bool {
         let mut fin = self.fin.verrouiller();
+        if !reveil() {
+            return false;
+        }
+        Self::forcer_sous(&mut fin, signal, raison);
+        true
+    }
+
+    fn forcer_sous(fin: &mut Option<Fin>, signal: Signal, raison: impl fmt::Display) {
         let remplacer = match &*fin {
             None => true,
             Some(Fin::Signal(s, _)) => signal.numero == linux::SIGKILL.numero && s.numero != linux::SIGKILL.numero,
@@ -508,7 +535,7 @@ impl Tache {
     }
 
     /// Le futex qu'elle attend (futex.rs).
-    pub fn futex(&self) -> &Cell<Option<crate::futex::Attente>> {
+    pub fn futex(&self) -> &Verrou<Option<crate::futex::Attente>> {
         &self.futex
     }
 
@@ -527,22 +554,78 @@ impl Tache {
         !self.sans_faute.load(Ordering::Relaxed)
     }
 
-    /// Avant de s'endormir : personne ne l'a encore réveillée.
-    pub fn preparer_sommeil(&self) {
-        self.reveil.store(0, Ordering::Relaxed);
+    /// « Je vais dormir » (le `set_current_state` de Linux) : à poser AVANT
+    /// de vérifier ce qu'on attend, au début de CHAQUE tour d'une boucle
+    /// d'attente (attente.rs). Un `swap` SeqCst, c'est-à-dire un `xchg`,
+    /// une barrière complète : la vérification qui suit ne peut pas être
+    /// faite avant que l'état soit visible de qui réveille. C'est le motif
+    /// de Dekker (processeur.rs) : celui qui réveille pose la condition,
+    /// puis lit notre état ; nous posons notre état, puis lisons la
+    /// condition ; l'un des deux voit l'autre.
+    pub fn preparer_sommeil(&self, sommeil: crate::attente::Sommeil) {
+        let e = if sommeil == crate::attente::Sommeil::Interruptible { etat::DORT_INTERRUPTIBLE } else { etat::DORT };
+        self.etat.swap(e, Ordering::SeqCst);
     }
 
-    /// Elle dort, et un signal peut la réveiller (ou plus).
-    pub fn dort_interruptible(&self, oui: bool) {
-        self.interruptible.store(oui, Ordering::Relaxed);
+    /// Fin d'une attente : « en cours » (le `__set_current_state(TASK_RUNNING)`
+    /// de `finish_wait`). Une raison de réveil restée ferait croire, au
+    /// prochain `dormir`, que l'état a été posé.
+    pub fn reveille(&self) {
+        self.etat.store(etat::EN_COURS, Ordering::Relaxed);
+    }
+
+    /// Le compare_exchange du réveil (ordonnanceur.rs, `reveiller`, SOUS le
+    /// verrou de la file de la tâche, celui sous lequel `ordonnancer` lit
+    /// son état pour la retirer) : « dort » devient `pourquoi`. SeqCst : la
+    /// paire de `preparer_sommeil` (le motif de Dekker, voir là), et ce que
+    /// celui qui réveille a écrit avant (la condition) est visible de la
+    /// tâche réveillée. Faux si elle ne dormait pas, ou plus.
+    pub fn passer_a_reveillee(&self, pourquoi: Reveil) -> bool {
+        loop {
+            let e = self.etat.load(Ordering::Relaxed);
+            if !reveillable(e, pourquoi) {
+                return false;
+            }
+            if self.etat.compare_exchange(e, pourquoi as u8, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+                REVEILS.fetch_add(1, Ordering::Relaxed);
+                return true;
+            }
+        }
+    }
+
+    /// Va-t-elle dormir (son état est « dort »), ou est-elle morte : la
+    /// tâche courante quitte alors la file des prêtes quand elle cède le
+    /// processeur pour dormir (ordonnanceur.rs). Une raison de réveil
+    /// posée entre-temps l'y garde.
+    pub fn quitte_la_file(&self) -> bool {
+        matches!(self.etat.load(Ordering::Relaxed), etat::DORT | etat::DORT_INTERRUPTIBLE | etat::MORTE)
+    }
+
+    /// Son état vaut-il encore « en cours », c'est-à-dire que personne n'a
+    /// posé « je vais dormir » pour ce tour : `dormir` le refuse.
+    pub fn sommeil_non_prepare(&self) -> bool {
+        self.etat.load(Ordering::Relaxed) == etat::EN_COURS
+    }
+
+    /// Pose la raison `pourquoi` si elle allait dormir, interruptible ou
+    /// non, sans la réveiller : pour qui vient de constater, dans sa propre
+    /// tâche, qu'il ne dormira pas (une échéance déjà passée, un signal en
+    /// attente : attente.rs). Si quelqu'un l'a déjà réveillée, sa raison
+    /// reste.
+    pub fn ne_dort_pas(&self, pourquoi: Reveil) {
+        for dort in [etat::DORT, etat::DORT_INTERRUPTIBLE] {
+            if self.etat.compare_exchange(dort, pourquoi as u8, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
+                return;
+            }
+        }
     }
 
     /// Pourquoi elle a été réveillée (par une file, si personne ne l'a dit :
     /// un réveil sans raison se revérifie de toute façon).
     pub fn raison_du_reveil(&self) -> Reveil {
-        match self.reveil.load(Ordering::Relaxed) {
-            2 => Reveil::Echeance,
-            3 => Reveil::Signal,
+        match self.etat.load(Ordering::Relaxed) {
+            etat::ECHEANCE => Reveil::Echeance,
+            etat::SIGNAL => Reveil::Signal,
             _ => Reveil::Reveillee,
         }
     }
@@ -633,9 +716,8 @@ pub fn initialiser() {
         lag: AtomicI64::new(0),
         attendant: Verrou::new(None),
         entree_attente: EntreeAttente::new(),
-        reveil: AtomicU8::new(0),
-        interruptible: AtomicBool::new(false),
-        futex: Cell::new(None),
+        etat: AtomicU8::new(etat::EN_COURS),
+        futex: Verrou::new(None),
         tient_sa_memoire: AtomicBool::new(false),
         sans_faute: AtomicBool::new(false),
         temps_a_verifier: AtomicBool::new(false),
@@ -691,40 +773,99 @@ pub fn courante() -> &'static Tache {
     unsafe { &*processeur::courant_sans_verification("la tache courante : toujours soi-meme").courante.load(Ordering::Relaxed) }
 }
 
-/// Pourquoi une tâche qui dormait a été réveillée (attente.rs).
+/// Les valeurs de l'état d'une tâche (`Tache::etat`, le `__state` de
+/// Linux). Les deux premières sont « elle dort, ou va dormir » ; les
+/// raisons de réveil valent celles de `Reveil`.
+pub mod etat {
+    /// Seul un réveil de sa file la réveille (TASK_UNINTERRUPTIBLE).
+    pub const DORT: u8 = 0;
+    /// Un signal la réveille aussi (TASK_INTERRUPTIBLE).
+    pub const DORT_INTERRUPTIBLE: u8 = 1;
+    /// Elle s'exécute, ou est prête, sans raison de réveil à lire (l'état
+    /// d'une tâche neuve, et celui que rend `reveille`) : TASK_RUNNING.
+    pub const EN_COURS: u8 = 2;
+    /// Réveillée par sa file (`Reveil::Reveillee`).
+    pub const REVEILLEE: u8 = 3;
+    /// Réveillée par son échéance (`Reveil::Echeance`).
+    pub const ECHEANCE: u8 = 4;
+    /// Réveillée par un signal (`Reveil::Signal`).
+    pub const SIGNAL: u8 = 5;
+    /// Morte : plus aucun réveil ne la touche (TASK_DEAD).
+    pub const MORTE: u8 = 6;
+}
+
+/// Pourquoi une tâche qui dormait a été réveillée (attente.rs). Les
+/// valeurs sont celles de `etat`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Reveil {
     /// Par la file où elle attendait : ce qu'elle attendait est peut-être
     /// là (elle revérifie).
-    Reveillee = 1,
+    Reveillee = etat::REVEILLEE as isize,
     /// Son échéance est passée.
-    Echeance = 2,
+    Echeance = etat::ECHEANCE as isize,
     /// Un signal (elle dormait interruptible) : l'appel rendra EINTR, ou
     /// sera refait (reprise.rs).
-    Signal = 3,
+    Signal = etat::SIGNAL as isize,
 }
 
-/// Réveille `t`, qui dort, pour la raison `pourquoi` : elle redevient
-/// prête. Si quelqu'un l'a déjà réveillée, la première raison reste (et
-/// elle n'est mise qu'une fois dans la file des prêtes). Rend vrai si c'est
-/// ce réveil-ci qui compte (le `try_to_wake_up` de Linux, qui rend faux pour
-/// une tâche déjà réveillée) : un réveil exclusif qui n'a réveillé personne
-/// passe à la suivante (attente.rs).
+/// Le nombre de réveils réussis depuis le démarrage : l'instantané du
+/// détecteur d'interblocage (attente.rs), qui recommence si un réveil a eu
+/// lieu pendant qu'il regardait.
+static REVEILS: AtomicU64 = AtomicU64::new(0);
+
+/// Le nombre de réveils réussis depuis le démarrage.
+pub fn reveils() -> u64 {
+    REVEILS.load(Ordering::Relaxed)
+}
+
+/// Réveille `t`, qui dort ou va dormir, pour la raison `pourquoi` : elle
+/// redevient prête. C'est le `try_to_wake_up` de Linux : un
+/// compare_exchange de son état, de « dort » vers la raison ; un signal
+/// (`Reveil::Signal`) ne réveille qu'un sommeil INTERRUPTIBLE (le
+/// `ttwu_state_match`). Perdu : quelqu'un l'a réveillée avant (sa raison
+/// reste, elle n'est mise qu'une fois dans la file des prêtes), ou elle ne
+/// dormait pas : rend faux, et un réveil exclusif qui n'a réveillé personne
+/// passe à la suivante (attente.rs). Gagné : rend vrai, et la tâche est
+/// prête ; si elle n'avait pas encore fini de s'endormir (elle est encore
+/// dans la file des prêtes), elle n'en sortira plus (ordonnanceur.rs ne
+/// retire qu'une tâche dont l'état dit encore « dort »).
 pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) -> bool {
-    if t.reveil.compare_exchange(0, pourquoi as u8, Ordering::Relaxed, Ordering::Relaxed).is_ok() {
-        ordonnanceur::rendre_prete(t, false);
-        return true;
+    // Une barrière complète AVANT de lire l'état (le `smp_mb__after_spinlock`
+    // de `try_to_wake_up`) : qui réveille vient d'écrire la condition (le
+    // plus souvent par une écriture ordinaire, ou en rendant un Verrou,
+    // une écriture Release), et sur x86 une lecture peut passer devant une
+    // écriture qui attend encore dans le tampon : sans la barrière, on
+    // pourrait lire « en cours » (l'ancien état) pendant que la tâche, qui
+    // a posé « dort » puis lu la condition, ne voit pas encore notre
+    // écriture : le réveil serait perdu. Un compare_exchange qui échoue
+    // n'est qu'une lecture, il ne l'ordonne pas.
+    core::sync::atomic::fence(Ordering::SeqCst);
+    // Un premier regard sans verrou : la plupart des réveils qui ne peuvent
+    // rien (un réveil exclusif qui passe à la suivante, une tâche déjà
+    // réveillée) s'arrêtent ici. Le changement d'état lui-même se fait
+    // SOUS le verrou de la file de la tâche (ordonnanceur.rs, `reveiller`) :
+    // fait avant, hors verrou, il laissait la tâche libre de continuer, de
+    // se rendormir ailleurs ou de mourir pendant que le réveilleur n'avait
+    // pas fini, et celui-ci la remettait en file (trouvé par la relecture
+    // de 6j).
+    if !reveillable(t.etat.load(Ordering::Relaxed), pourquoi) {
+        return false;
     }
-    false
+    ordonnanceur::reveiller(t, pourquoi)
+}
+
+/// `pourquoi` réveille-t-il une tâche dans l'état `e` ? Un signal ne
+/// réveille qu'un sommeil interruptible.
+fn reveillable(e: u8, pourquoi: Reveil) -> bool {
+    e == etat::DORT_INTERRUPTIBLE || (e == etat::DORT && pourquoi != Reveil::Signal)
 }
 
 /// Un signal vient d'être mis en attente pour le fil `t`, qui ne le bloque
 /// pas : s'il dort interruptible, il est réveillé (le `signal_wake_up` de
-/// Linux).
+/// Linux). Le compare_exchange décide seul : plus de lecture à part d'un
+/// drapeau « interruptible », qui pouvait être lu avant d'être posé.
 pub fn reveiller_par_signal(t: Arc<Tache>) {
-    if t.interruptible.load(Ordering::Relaxed) {
-        reveiller(t, Reveil::Signal);
-    }
+    reveiller(t, Reveil::Signal);
 }
 
 /// Un signal attend la tâche courante, qui doit finir son attente
@@ -889,10 +1030,9 @@ extern "C" fn fin_de_bascule() {
 }
 
 /// Attend la fin de la tâche `t` : la tâche courante dort jusqu'à ce que
-/// `terminer` la réveille. Sans réveil perdu : la fin est vérifiée, et
-/// l'attente inscrite, interruptions coupées, comme la fin elle-même.
-/// UNIPROCESSEUR : rien ne peut se glisser entre les deux ; avec plusieurs
-/// processeurs, la fin et l'inscription sous un même verrou.
+/// `terminer` la réveille. Sans réveil perdu : « je vais dormir » est posé
+/// avant de regarder si elle est morte, et `terminer` pose « morte » avant
+/// de réveiller (voir `dormir_tant_que`).
 pub fn attendre(t: &Tache) -> i32 {
     dormir_tant_que(|| !t.est_morte());
     t.code_sortie.load(Ordering::Relaxed)
@@ -900,15 +1040,23 @@ pub fn attendre(t: &Tache) -> i32 {
 
 /// La tâche courante dort tant que `encore` le dit, réveillée par la fin
 /// de l'une des tâches qu'elle a créées (le `wait` d'un parent : init qui
-/// recueille ses enfants, programmes.rs). Sans réveil perdu : `encore` est
-/// vérifié interruptions coupées, comme la fin elle-même.
+/// recueille ses enfants, programmes.rs). Sans file d'attente : la fin
+/// réveille directement (`terminer`, par `attendant`). Sans réveil perdu,
+/// par l'état (attente.rs) : « je vais dormir » est posé (une barrière
+/// complète) AVANT de vérifier `encore` ; `terminer` écrit « morte » puis
+/// tente le réveil ; ou bien nous voyons « morte », ou bien le réveil nous
+/// trouve « dort » et nous ne quittons pas la file des prêtes.
 pub fn dormir_tant_que(encore: impl Fn() -> bool) {
     let interruptions = cpu::couper_interruptions();
-    while encore() {
-        courante().preparer_sommeil();
-        ordonnanceur::retirer_courante();
-        ordonnanceur::ordonnancer();
+    let t = courante();
+    loop {
+        t.preparer_sommeil(crate::attente::Sommeil::Ininterruptible);
+        if !encore() {
+            break;
+        }
+        ordonnanceur::ordonnancer(ordonnanceur::Bascule::Sommeil);
     }
+    t.reveille();
     if interruptions {
         cpu::activer_interruptions();
     }
@@ -922,7 +1070,7 @@ const RFLAGS_INITIAL: u64 = 1 << 9 | 1 << 1;
 fn demarrer(t: &Arc<Tache>) {
     // La place est réservée : il n'y a jamais plus de tâches que de piles.
     TOUTES.verrouiller().ajouter_dans_la_place(t.clone());
-    ordonnanceur::rendre_prete(t.clone(), true);
+    ordonnanceur::rendre_prete(t.clone());
 }
 
 /// Lance le fil principal d'un programme, prêt aussitôt : `processus` son
@@ -1066,9 +1214,10 @@ fn liberer_le_fil(t: &Tache, p: &crate::processus::Entree) {
 /// EINTR). Sous le verrou de son processus.
 pub fn arreter_avec_le_groupe(t: Arc<Tache>, code: i32) {
     *t.fin.verrouiller() = Some(Fin::Sortie(code));
-    if t.interruptible.load(Ordering::Relaxed) {
-        reveiller(t, Reveil::Signal);
-    }
+    // Réveillé s'il dort interruptible : le compare_exchange de son état
+    // décide (un fil qui n'a pas encore posé « je vais dormir » verra sa
+    // fin prévue en la vérifiant, après l'avoir posé : attente.rs).
+    reveiller(t, Reveil::Signal);
 }
 
 /// Le nombre de tâches (sysinfo : `procs`, le `nr_threads` de Linux).
@@ -1136,7 +1285,12 @@ pub fn terminer(code: i32) -> ! {
     // `free_pipe_info(tsk->splice_pipe)`).
     crate::tube::rendre_le_tube_interne(t.tube_interne.swap(0, Ordering::Relaxed));
     cpu::couper_interruptions();
-    t.morte.store(true, Ordering::Relaxed);
+    // Morte : son état d'abord (plus aucun réveil ne la touche, et
+    // l'ordonnanceur la retirera de la file), puis `morte`, en Release : qui
+    // le lit (`attendre`, `est_morte`, en Acquire) voit tout ce qu'elle a
+    // écrit avant, son code de sortie compris.
+    t.etat.store(etat::MORTE, Ordering::Relaxed);
+    t.morte.store(true, Ordering::Release);
     // Une référence à elle-même, pour la fin de bascule qui rendra sa pile,
     // sur ce processeur.
     processeur::courant().a_rendre.store(Arc::into_raw(courante_arc()) as *mut Tache, Ordering::Relaxed);
@@ -1151,8 +1305,7 @@ pub fn terminer(code: i32) -> ! {
     if let Some(attendant) = t.attendant.verrouiller().take() {
         reveiller(attendant, Reveil::Reveillee);
     }
-    ordonnanceur::retirer_courante();
-    ordonnanceur::ordonnancer();
+    ordonnanceur::ordonnancer(ordonnanceur::Bascule::Sommeil);
     unreachable!("une tache morte a repris la main");
 }
 
@@ -1414,7 +1567,7 @@ pub fn verifier_au_retour(cadre: &mut Cadre) {
         // Céder le processeur d'abord, s'il le faut : on revient ici quand
         // la tâche le retrouve, et tout est revérifié.
         if ordonnanceur::besoin_de_ceder() {
-            ordonnanceur::ordonnancer();
+            ordonnanceur::ordonnancer(ordonnanceur::Bascule::Preemption);
             continue;
         }
         match decider() {

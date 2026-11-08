@@ -481,6 +481,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // tâche.
     let init = || {
         tester_ordonnanceur();
+        tester_sommeil();
         tester_verrou_le();
         reseau::configurer();
         tester_voisins();
@@ -515,7 +516,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         cpu::couper_interruptions();
         if ordonnanceur::autres_pretes() || attente::detecter_interblocage() {
             cpu::activer_interruptions();
-            ordonnanceur::ordonnancer();
+            ordonnanceur::ordonnancer(ordonnanceur::Bascule::Preemption);
         } else {
             cpu::attendre_interruption();
         }
@@ -590,6 +591,74 @@ fn tester_ordonnanceur() {
                 if ok { "ok" } else { "ECHEC" });
 }
 
+/// Vérifie le protocole de sommeil (attente.rs, tache.rs) : « je vais
+/// dormir » posé, une tâche PRÉEMPTÉE (elle calcule 5 ms, le tic la
+/// remplace) ne quitte pas la file des prêtes, trouve ensuite sa condition
+/// vraie et ne dort pas ; et une tâche RÉVEILLÉE entre « je vais dormir »
+/// et son sommeil (par une autre, pendant qu'elle attend ce réveil sans
+/// dormir) voit son `dormir`
+/// revenir tout de suite, avec la raison. Les deux pannes que le protocole
+/// exclut : une tâche perdue, un réveil perdu.
+fn tester_sommeil() {
+    static CONDITION: AtomicBool = AtomicBool::new(false);
+    static RESULTAT: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    /// L'éveilleuse a réveillé la dormeuse (REVEILLEE : `reveiller` l'a
+    /// trouvée endormie), puis l'a dit (REVEIL_FAIT).
+    static REVEILLEE: AtomicBool = AtomicBool::new(false);
+    static REVEIL_FAIT: AtomicBool = AtomicBool::new(false);
+    let dormeuse = tache::lancer_noyau(programmes::NomCourt::de(b"dormeuse"), || {
+        let t = tache::courante();
+        // 1. Préemptée entre « je vais dormir » et la condition.
+        t.preparer_sommeil(attente::Sommeil::Ininterruptible);
+        let debut = tache::temps_de_calcul();
+        while tache::temps_de_calcul() - debut < 5_000_000 {
+            core::hint::spin_loop();
+        }
+        // Toujours là : la préemption ne l'a pas retirée de la file.
+        RESULTAT[0].store(true, Ordering::Relaxed);
+        t.reveille();
+        // 2. Réveillée AVANT de dormir : elle pose l'état, puis attend, sans
+        // dormir, que l'éveilleuse ait posé la condition et l'ait réveillée
+        // (REVEIL_FAIT, écrit après `reveiller`) ; son `dormir` doit alors
+        // revenir sans dormir, avec la raison. (Jusqu'à la relecture de 6j,
+        // elle cédait le processeur et l'EEVDF pouvait la rechoisir avant
+        // l'éveilleuse : elle dormait pour de bon, et le test passait sans
+        // rien prouver.)
+        t.preparer_sommeil(attente::Sommeil::Ininterruptible);
+        while !REVEIL_FAIT.load(Ordering::Acquire) {
+            // Sur un seul processeur, l'éveilleuse a besoin du nôtre : une
+            // préemption, l'état posé reste.
+            ordonnanceur::ceder();
+        }
+        let interruptions = cpu::couper_interruptions();
+        let r = attente::dormir(None, attente::Sommeil::Ininterruptible);
+        if interruptions {
+            cpu::activer_interruptions();
+        }
+        RESULTAT[1].store(r == tache::Reveil::Reveillee && CONDITION.load(Ordering::Relaxed) && REVEILLEE.load(Ordering::Relaxed), Ordering::Relaxed);
+        t.reveille();
+    });
+    let eveilleuse = dormeuse.clone().and_then(|d| {
+        tache::lancer_noyau(programmes::NomCourt::de(b"eveilleuse"), move || {
+            // Attend que la dormeuse ait posé son second « je vais dormir »,
+            // puis la réveille, et le dit.
+            while !RESULTAT[0].load(Ordering::Relaxed) || d.sommeil_non_prepare() {
+                ordonnanceur::ceder();
+            }
+            CONDITION.store(true, Ordering::Relaxed);
+            REVEILLEE.store(tache::reveiller(d, tache::Reveil::Reveillee), Ordering::Relaxed);
+            REVEIL_FAIT.store(true, Ordering::Release);
+        })
+    });
+    if let (Some(d), Some(e)) = (&dormeuse, &eveilleuse) {
+        tache::attendre(d);
+        tache::attendre(e);
+    }
+    let ok = dormeuse.is_some() && eveilleuse.is_some() && RESULTAT.iter().all(|r| r.load(Ordering::Relaxed));
+    afficherln!("[noyau] Sommeil : une tache preemptee entre \"je vais dormir\" et sa condition n'est pas perdue, un reveil venu avant son sommeil n'est pas perdu : {}.",
+                if ok { "ok" } else { "ECHEC" });
+}
+
 /// Vérifie le verrou qui dort en lecture et en écriture (attente.rs,
 /// `VerrouLE`) par des tâches du noyau, dont chacune note ce qu'elle fait
 /// dans un journal, une lettre par pas ; l'ordre de leurs arrivées est
@@ -623,7 +692,9 @@ fn tester_verrou_le() {
     }
     fn dormir_ms(ms: u64) {
         let interruptions = cpu::couper_interruptions();
+        tache::courante().preparer_sommeil(attente::Sommeil::Ininterruptible);
         attente::dormir(Some(temps::ns_monotone() + ms * 1_000_000), attente::Sommeil::Ininterruptible);
+        tache::courante().reveille();
         if interruptions {
             cpu::activer_interruptions();
         }
@@ -767,7 +838,13 @@ fn tester_voisins() {
     let attendre = |adresse: [u8; 4], fini: fn(Etat) -> bool, ms: u64| {
         let debut = temps::ns_monotone();
         while !arp::voisin(i, adresse).is_some_and(|(e, _)| fini(e)) && temps::ns_monotone() - debut < ms * 1_000_000 {
+            let interruptions = cpu::couper_interruptions();
+            tache::courante().preparer_sommeil(attente::Sommeil::Ininterruptible);
             attente::dormir(Some(temps::ns_monotone() + 10_000_000), attente::Sommeil::Ininterruptible);
+            tache::courante().reveille();
+            if interruptions {
+                cpu::activer_interruptions();
+            }
         }
         ((temps::ns_monotone() - debut) / 1_000_000, arp::voisin(i, adresse))
     };

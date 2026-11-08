@@ -235,12 +235,19 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
     let echeance = echeance.map(Echeance::en_monotone);
     let interruptions = cpu::couper_interruptions();
     let r = loop {
+        // « Je vais dormir » avant de relire l'entier (attente.rs) : un
+        // FUTEX_WAKE qui le change puis réveille nous trouve « dort ».
+        tache::courante().preparer_sommeil(Sommeil::Interruptible);
         let s = TABLE[seau(&c)].verrouiller();
         match lire_sans_faute(adresse) {
             None => {
                 // La page n'est pas là : la faire venir, verrou rendu, et
-                // recommencer.
+                // recommencer. Ce tour de sommeil est abandonné d'abord
+                // (« en cours ») : la faute prend la mémoire du processus, un
+                // verrou qui dort, interdit entre « je vais dormir » et
+                // `dormir` (attente.rs) ; le tour suivant repose l'état.
                 drop(s);
+                tache::courante().reveille();
                 cpu::activer_interruptions();
                 let lue = lire(adresse);
                 cpu::couper_interruptions();
@@ -252,7 +259,7 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
             Some(v) if v != val => break -EAGAIN,
             Some(_) => {}
         }
-        tache::courante().futex().set(Some(Attente { cle: c, bitset }));
+        *tache::courante().futex().verrouiller() = Some(Attente { cle: c, bitset });
         // En queue : un FUTEX_WAKE réveille les plus anciennes d'abord (la
         // plist de Linux, à priorité égale).
         s.file.inscrire_exclusive();
@@ -260,14 +267,23 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
         let reveil = attente::dormir(echeance, Sommeil::Interruptible);
         // Réveillée : par un WAKE (elle n'est plus dans la file), ou par son
         // échéance ou un signal (elle y est encore). Un REQUEUE a pu la
-        // déplacer dans le seau d'une autre clé : sa clé le dit.
+        // déplacer dans le seau d'une autre clé : sa clé le dit ; et il
+        // peut le faire encore pendant qu'on la lit : on prend le seau de
+        // la clé lue, puis on relit la clé, et on recommence si elle a
+        // changé (le `futex_unqueue` de Linux, qui relit `lock_ptr` une
+        // fois le verrou pris).
         let t = tache::courante();
-        let ou = t.futex().get().map_or(c, |a| a.cle);
-        let s = TABLE[seau(&ou)].verrouiller();
-        let encore = s.file.contient(t);
-        s.file.retirer(t);
-        drop(s);
-        t.futex().set(None);
+        let encore = loop {
+            let ou = t.futex().verrouiller().map_or(c, |a| a.cle);
+            let s = TABLE[seau(&ou)].verrouiller();
+            if t.futex().verrouiller().map_or(c, |a| a.cle) != ou {
+                continue;
+            }
+            let encore = s.file.contient(t);
+            s.file.retirer(t);
+            break encore;
+        };
+        *t.futex().verrouiller() = None;
         if !encore {
             break 0;
         }
@@ -293,6 +309,7 @@ fn attendre(adresse: u64, partage: bool, val: u32, echeance: Option<Echeance>, b
             Reveil::Reveillee => continue,
         }
     };
+    tache::courante().reveille();
     if interruptions {
         cpu::activer_interruptions();
     }
@@ -315,7 +332,7 @@ fn lire_ok(r: Result<u32, i64>) -> Result<(), i64> {
 fn reveiller_dans(s: &mut Seau, c: &Cle, bitset: u32, n: u32) -> u32 {
     let mut faits = 0;
     while faits < n {
-        let Some(t) = s.file.retirer_si(|t| t.futex().get().is_some_and(|a| a.cle == *c && a.bitset & bitset != 0)) else { break };
+        let Some(t) = s.file.retirer_si(|t| t.futex().verrouiller().is_some_and(|a| a.cle == *c && a.bitset & bitset != 0)) else { break };
         tache::reveiller(t, Reveil::Reveillee);
         faits += 1;
     }
@@ -392,14 +409,14 @@ fn deplacer(adresse: u64, partage: bool, val: u32, val2: u64, adresse2: u64, att
             // les ferait retrouver sans fin : `val2` tours, interruptions
             // coupées (2^31 : des minutes de machine figée).
             if c1 == c2 {
-                let restantes = s1.file.compter(|t| t.futex().get().is_some_and(|a| a.cle == c1));
+                let restantes = s1.file.compter(|t| t.futex().verrouiller().is_some_and(|a| a.cle == c1));
                 return (reveillees as u64 + (restantes as u64).min(val2)) as i64;
             }
             let mut deplacees = 0;
             while deplacees < val2 as u32 {
-                let Some(t) = s1.file.retirer_si(|t| t.futex().get().is_some_and(|a| a.cle == c1)) else { break };
-                let bitset = t.futex().get().map_or(BITSET_TOUS, |a| a.bitset);
-                t.futex().set(Some(Attente { cle: c2, bitset }));
+                let Some(t) = s1.file.retirer_si(|t| t.futex().verrouiller().is_some_and(|a| a.cle == c1)) else { break };
+                let bitset = t.futex().verrouiller().map_or(BITSET_TOUS, |a| a.bitset);
+                *t.futex().verrouiller() = Some(Attente { cle: c2, bitset });
                 // Dans la file du seau de la seconde clé (le même, ou l'autre).
                 match s2.as_deref_mut() {
                     Some(s2) => s2.file.inscrire_tache(t),

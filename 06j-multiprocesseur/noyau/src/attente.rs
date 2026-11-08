@@ -9,20 +9,36 @@
 //! `wake_up` de Linux, et la difficulté est toujours la même : ne pas
 //! PERDRE de réveil. Si la tâche vérifie « rien à lire », puis qu'un
 //! caractère arrive et qu'on la réveille AVANT qu'elle se soit endormie,
-//! elle s'endort ensuite pour toujours. La règle, ici :
+//! elle s'endort ensuite pour toujours. La règle, celle de Linux
+//! (`___wait_event`, `prepare_to_wait_event`), depuis 6j :
 //!   1. couper les interruptions ;
-//!   2. sous le verrou de l'objet attendu, vérifier la condition, et sinon
-//!      s'inscrire dans sa file ;
-//!   3. rendre le verrou, les interruptions restant coupées ;
-//!   4. dormir (`dormir`), qui quitte la file des prêtes et cède le
-//!      processeur ;
-//!   5. réveillée, se retirer de la file si elle y est encore (réveillée
-//!      par une échéance ou un signal), et revérifier.
-//! UNIPROCESSEUR : les interruptions coupées de 1 à 4 tiennent lieu de
-//! verrou : personne ne peut s'exécuter entre la vérification et le
-//! sommeil, ni le gestionnaire qui réveillerait, ni une autre tâche. Avec
-//! plusieurs processeurs, le verrou de la file (et l'état de la tâche,
-//! changé avant de vérifier, comme `set_current_state` chez Linux).
+//!   2. poser « je vais dormir » (`Tache::preparer_sommeil`, le
+//!      `set_current_state` de Linux : un `xchg`, une barrière complète),
+//!      au début de CHAQUE tour ;
+//!   3. s'inscrire dans la file de l'objet attendu ;
+//!   4. vérifier la condition ; vraie : fini (se retirer de la file) ;
+//!   5. pour un sommeil interruptible, vérifier les signaux ;
+//!   6. dormir (`dormir`), qui cède le processeur : la tâche ne quitte la
+//!      file des prêtes que si son état dit ENCORE « dort » (ordonnanceur.rs) ;
+//!   7. réveillée, se retirer de la file si elle y est encore (réveillée
+//!      par une échéance ou un signal), et recommencer au 2.
+//! Pourquoi l'état avant la condition : celui qui réveille pose d'abord la
+//! condition, puis lit notre état (`tache::reveiller`, un compare_exchange
+//! précédé d'une barrière complète). Ou bien il voit « dort » et nous
+//! réveille (nous ne quitterons pas la file des prêtes) ; ou bien nous
+//! voyons sa condition. Sur deux processeurs, c'est le motif de Dekker
+//! (processeur.rs) : sans les deux barrières, chacun pourrait voir l'ancien
+//! état de l'autre, et le réveil se perdre. La condition n'a donc plus
+//! besoin d'être vérifiée sous le verrou de qui réveille : c'est ce qui
+//! rend le `wait_event` de Linux juste pour des conditions sans verrou.
+//! `attendre_que`, plus bas, fait les sept pas pour la plupart des
+//! attentes ; les autres (les verrous qui dorment, `poll`, les futex, les
+//! sommeils à échéance) suivent la même règle, écrite chez chacune.
+//! Jusqu'à 6i, les interruptions coupées de 1 à 6 tenaient lieu de tout
+//! cela : personne ne pouvait s'exécuter entre la vérification et le
+//! sommeil, ni le gestionnaire qui réveillerait, ni une autre tâche ; six
+//! endroits vérifiaient leur condition avant de s'inscrire, et une dizaine
+//! de sommeils sans file comptaient sur `dormir` pour remettre l'état.
 //!
 //! Une file d'attente ne demande aucune allocation : c'est une liste
 //! chaînée d'ENTRÉES posées par ceux qui attendent (les `wait_queue_entry`
@@ -484,30 +500,79 @@ pub enum Sommeil {
 
 /// La tâche courante dort, jusqu'à un réveil, l'instant `echeance` (temps
 /// monotone, en ns) s'il y en a un, ou un signal si elle dort
-/// interruptible. Interruptions coupées, aucun verrou tenu, et la tâche
-/// déjà inscrite dans la file de ce qu'elle attend (voir l'en-tête) ;
-/// revient interruptions coupées. Pour qu'un verrou ne soit pas tenu
-/// pendant le sommeil, ordonnancer le vérifie.
+/// interruptible. Interruptions coupées, aucun verrou tenu, « je vais
+/// dormir » déjà posé pour ce tour (`preparer_sommeil`, voir l'en-tête ;
+/// sinon, panique : la tâche ne quitterait jamais la file des prêtes, et
+/// tournerait), et la tâche inscrite dans la file de ce qu'elle attend s'il
+/// y en a une ; revient interruptions coupées, avec la raison du réveil.
+/// Un signal en attente, ou une échéance déjà passée : la raison est posée
+/// sans dormir (sauf si quelqu'un a réveillé entre-temps : sa raison
+/// reste). Pour qu'un verrou ne soit pas tenu pendant le sommeil,
+/// ordonnancer le vérifie.
 pub fn dormir(echeance: Option<u64>, sommeil: Sommeil) -> Reveil {
     let t = tache::courante();
-    t.preparer_sommeil();
+    assert!(!t.sommeil_non_prepare(), "dormir sans avoir pose \"je vais dormir\"");
     if sommeil == Sommeil::Interruptible && tache::signal_en_attente() {
-        return Reveil::Signal;
+        t.ne_dort_pas(Reveil::Signal);
+        return t.raison_du_reveil();
     }
     if let Some(e) = echeance {
         if e <= crate::temps::ns_monotone() {
-            return Reveil::Echeance;
+            t.ne_dort_pas(Reveil::Echeance);
+            return t.raison_du_reveil();
         }
         armer(e);
     }
-    t.dort_interruptible(sommeil == Sommeil::Interruptible);
-    ordonnanceur::retirer_courante();
-    ordonnanceur::ordonnancer();
+    ordonnanceur::ordonnancer(ordonnanceur::Bascule::Sommeil);
     if echeance.is_some() {
         annuler(t);
     }
-    t.dort_interruptible(false);
     t.raison_du_reveil()
+}
+
+/// Comment s'inscrire dans la file d'attente, pour `attendre_que`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Inscription {
+    /// Réveillée par tout réveil de la file (`inscrire`).
+    Ordinaire,
+    /// Une seule à la fois, dans l'ordre d'arrivée (`inscrire_exclusive`).
+    Exclusive,
+}
+
+/// Attend que `condition` soit vraie, inscrite dans `file`, au plus
+/// jusqu'à `echeance` (temps monotone), ou jusqu'à un signal si `sommeil`
+/// est interruptible : les sept pas de l'en-tête (le `___wait_event` de
+/// Linux), interruptions coupées pendant l'attente (rétablies au retour
+/// comme elles étaient). `condition` peut prendre des verrous courts (pas
+/// dormir). Rend Reveillee si la condition est devenue vraie (même si c'est
+/// l'échéance ou un signal qui a réveillé : la condition est revue une
+/// dernière fois, ce qui arrive en même temps se lit), Echeance ou Signal
+/// sinon. La tâche ressort de la file et de son état d'attente.
+pub fn attendre_que(file: &FileAttente, inscription: Inscription, sommeil: Sommeil, echeance: Option<u64>,
+                    mut condition: impl FnMut() -> bool) -> Reveil {
+    let interruptions = cpu::couper_interruptions();
+    let t = tache::courante();
+    let r = loop {
+        t.preparer_sommeil(sommeil);
+        match inscription {
+            Inscription::Ordinaire => file.inscrire(),
+            Inscription::Exclusive => file.inscrire_exclusive(),
+        }
+        if condition() {
+            file.retirer(t);
+            break Reveil::Reveillee;
+        }
+        let r = dormir(echeance, sommeil);
+        file.retirer(t);
+        if r != Reveil::Reveillee {
+            break if condition() { Reveil::Reveillee } else { r };
+        }
+    };
+    t.reveille();
+    if interruptions {
+        cpu::activer_interruptions();
+    }
+    r
 }
 
 /// Les échéances des tâches qui dorment, triées.
@@ -545,26 +610,27 @@ fn annuler(t: &Tache) {
 /// Interruptions coupées.
 pub fn dormir_calcul(compte: Arc<Entree>, cible: u64) -> Reveil {
     let t = tache::courante();
-    t.preparer_sommeil();
-    if tache::signal_en_attente() {
-        return Reveil::Signal;
-    }
-    if compte.temps_de_calcul() >= cible {
-        return Reveil::Echeance;
-    }
+    // « Je vais dormir » avant tout (l'en-tête), inscrite ensuite : le tic
+    // qui verra la cible atteinte nous réveillera, ou nous la verrons.
+    t.preparer_sommeil(Sommeil::Interruptible);
     // La place est réservée pour une attente par tâche (`initialiser`).
-    ATTENTES_CALCUL.verrouiller().ajouter_dans_la_place((cible, compte, tache::courante_arc()));
-    t.dort_interruptible(true);
-    ordonnanceur::retirer_courante();
-    ordonnanceur::ordonnancer();
+    ATTENTES_CALCUL.verrouiller().ajouter_dans_la_place((cible, compte.clone(), tache::courante_arc()));
+    if tache::signal_en_attente() {
+        t.ne_dort_pas(Reveil::Signal);
+    } else if compte.temps_de_calcul() >= cible {
+        t.ne_dort_pas(Reveil::Echeance);
+    } else {
+        ordonnanceur::ordonnancer(ordonnanceur::Bascule::Sommeil);
+    }
     {
         let mut a = ATTENTES_CALCUL.verrouiller();
         if let Some(i) = a.iter().position(|(_, _, x)| core::ptr::eq(Arc::as_ptr(x), t)) {
             a.remove(i);
         }
     }
-    t.dort_interruptible(false);
-    t.raison_du_reveil()
+    let r = t.raison_du_reveil();
+    t.reveille();
+    r
 }
 
 /// Le tic d'horloge, interruptions coupées : les échéances passées
@@ -646,15 +712,29 @@ pub fn detecter_interblocage() -> bool {
         return false;
     }
     let mut bloquees: Vec<Arc<Tache>> = Vec::new();
+    // Un instantané : un réveil réussi pendant le parcours (par un autre
+    // processeur, 6j) le périmerait ; on recommence alors.
+    let reveils = tache::reveils();
     tache::pour_chaque(|t| {
         if t.est_programme() && t.dort_interruptible_maintenant() {
             let _ = bloquees.ajouter(t.clone());
         }
     });
-    let trouve = !bloquees.is_empty();
+    if tache::reveils() != reveils {
+        return false;
+    }
+    let mut trouve = false;
     for t in bloquees {
-        t.forcer(crate::linux::SIGKILL, "plus rien ne peut le reveiller (interblocage)");
-        tache::reveiller(t, Reveil::Signal);
+        // Le réveil par le compare_exchange de son état, le verrou de sa fin
+        // tenu (`forcer_apres`) : s'il réussit, elle dormait encore
+        // interruptible, et c'est nous qui la tuons, la fin écrite avant
+        // qu'elle puisse la regarder ; s'il échoue, quelqu'un l'a réveillée
+        // entre-temps, et rien ne lui est prévu (jusqu'à 6i, la fin était
+        // prévue avant le réveil, et une tâche réveillée normalement entre
+        // les deux mourait quand même).
+        if t.forcer_apres(crate::linux::SIGKILL, "plus rien ne peut le reveiller (interblocage)", || tache::reveiller(t.clone(), Reveil::Signal)) {
+            trouve = true;
+        }
     }
     trouve
 }
@@ -788,13 +868,18 @@ impl<T> Mutex<T> {
 
     /// Prend le verrou, en dormant tant qu'il est pris.
     pub fn verrouiller(&self) -> GardeMutex<'_, T> {
+        let t = tache::courante();
         loop {
             let interruptions = cpu::couper_interruptions();
+            // « Je vais dormir » avant de regarder (l'en-tête) : qui rend le
+            // verrou le marque libre, puis nous réveille.
+            t.preparer_sommeil(Sommeil::Ininterruptible);
             {
                 let mut e = self.etat.verrouiller();
                 if !e.pris {
                     e.pris = true;
                     drop(e);
+                    t.reveille();
                     if interruptions {
                         cpu::activer_interruptions();
                     }
@@ -805,7 +890,7 @@ impl<T> Mutex<T> {
                 e.file.inscrire_exclusive();
             }
             dormir(None, Sommeil::Ininterruptible);
-            self.etat.verrouiller().file.retirer(tache::courante());
+            self.etat.verrouiller().file.retirer(t);
             if interruptions {
                 cpu::activer_interruptions();
             }
@@ -1049,11 +1134,15 @@ impl<T> VerrouLE<T> {
         assert!(tenus == 0, "verrou qui dort pris sous {} verrou(s) court(s)", tenus);
         assert!(!crate::interruptions::dans_une_interruption(), "verrou qui dort pris dans un gestionnaire d'interruption");
         let interruptions = cpu::couper_interruptions();
+        let t = tache::courante();
+        // « Je vais dormir » avant de regarder (l'en-tête).
+        t.preparer_sommeil(Sommeil::Ininterruptible);
         {
             let mut e = self.etat.verrouiller();
             if e.libre_pour(sorte) {
                 e.accorder(sorte);
                 drop(e);
+                t.reveille();
                 if interruptions {
                     cpu::activer_interruptions();
                 }
@@ -1064,12 +1153,19 @@ impl<T> VerrouLE<T> {
         // Celui qui le rend nous le remet en nous retirant de la file
         // (`passer_la_main`) : tant qu'on y est, on ne l'a pas. Un sommeil
         // ininterruptible n'a pas d'autre réveil ; revérifier ne coûte rien.
+        // « Je vais dormir » reposé à chaque tour : un réveil resté d'un
+        // tour précédent ferait sinon revenir `dormir` aussitôt, sans fin.
         loop {
             dormir(None, Sommeil::Ininterruptible);
-            if !self.etat.verrouiller().file.contient(tache::courante()) {
+            if !self.etat.verrouiller().file.contient(t) {
+                break;
+            }
+            t.preparer_sommeil(Sommeil::Ininterruptible);
+            if !self.etat.verrouiller().file.contient(t) {
                 break;
             }
         }
+        t.reveille();
         if interruptions {
             cpu::activer_interruptions();
         }
@@ -1246,7 +1342,10 @@ impl<T: Possede> Possession<T> {
     /// pas ; la possession est toujours courte).
     pub fn posseder(&self) -> Garde<'_, T> {
         let interruptions = cpu::couper_interruptions();
+        let t = tache::courante();
         loop {
+            // « Je vais dormir » avant de regarder (l'en-tête).
+            t.preparer_sommeil(Sommeil::Ininterruptible);
             {
                 let mut c = self.court.verrouiller();
                 if !c.possede {
@@ -1256,8 +1355,9 @@ impl<T: Possede> Possession<T> {
                 self.attente.inscrire_exclusive();
             }
             dormir(None, Sommeil::Ininterruptible);
-            self.attente.retirer(tache::courante());
+            self.attente.retirer(t);
         }
+        t.reveille();
         if interruptions {
             cpu::activer_interruptions();
         }
@@ -1399,16 +1499,19 @@ impl<'a, T: Possede> Garde<'a, T> {
     /// rendue (ce qui vide la file, et peut tout changer), puis,
     /// interruptions coupées, la condition vérifiée sous le verrou court,
     /// l'inscription dans `file`, le sommeil ; réveillée, la possession
-    /// reprise. L'ordre de Linux (`sk_wait_event` : s'inscrire, rendre,
-    /// dormir) perdrait le réveil ici : `dormir` efface un réveil venu
-    /// avant lui, et `reveiller` retire la tâche de la file. Rend la
-    /// raison du réveil (Reveillee si la condition est vraie).
+    /// reprise. La possession est rendue AVANT de s'inscrire (Linux,
+    /// `sk_wait_event`, s'inscrit d'abord puis rend) : le vidage de la file
+    /// qu'elle fait peut tout changer, et la condition est revue après ;
+    /// avec « je vais dormir » posé avant elle (l'en-tête), l'ordre
+    /// n'importe plus pour les réveils. Rend la raison du réveil (Reveillee
+    /// si la condition est vraie).
     pub fn attendre(&mut self, file: &FileAttente, sommeil: Sommeil, echeance: Option<u64>,
                     mut pret: impl FnMut(&T::Court) -> bool) -> Reveil {
         self.p.rendre();
         let interruptions = cpu::couper_interruptions();
         let t = tache::courante();
         let r = loop {
+            t.preparer_sommeil(sommeil);
             {
                 let c = self.p.court.verrouiller();
                 if pret(&c.premier) {
@@ -1429,6 +1532,7 @@ impl<'a, T: Possede> Garde<'a, T> {
                 break if pret(&c.premier) { Reveil::Reveillee } else { r };
             }
         };
+        t.reveille();
         if interruptions {
             cpu::activer_interruptions();
         }

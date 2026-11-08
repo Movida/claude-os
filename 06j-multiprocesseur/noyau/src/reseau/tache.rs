@@ -87,7 +87,11 @@ pub fn au_repos() -> bool {
 /// plus jusqu'à `echeance` (alors rien : c'est l'heure des minuteurs).
 fn attendre(echeance: Option<u64>) -> u32 {
     let interruptions = cpu::couper_interruptions();
+    let moi = tache::courante();
     let travail = loop {
+        // « Je vais dormir » avant de regarder le travail (attente.rs) :
+        // l'interruption d'une carte le pose, puis réveille.
+        moi.preparer_sommeil(Sommeil::Ininterruptible);
         let mut t = TRAVAIL.verrouiller();
         if t.a_faire != 0 || echeance.is_some_and(|e| e <= temps::ns_monotone()) {
             t.en_travail = true;
@@ -97,8 +101,9 @@ fn attendre(echeance: Option<u64>) -> u32 {
         t.attente.inscrire();
         drop(t);
         attente::dormir(echeance, Sommeil::Ininterruptible);
-        TRAVAIL.verrouiller().attente.retirer(tache::courante());
+        TRAVAIL.verrouiller().attente.retirer(moi);
     };
+    moi.reveille();
     if interruptions {
         cpu::activer_interruptions();
     }

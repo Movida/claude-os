@@ -39,21 +39,31 @@
 //! céder » quand la tâche courante a fini sa tranche ; la bascule se fait
 //! au retour vers l'anneau 3, ET à la fin d'une interruption qui a
 //! interrompu le noyau, si les interruptions y étaient actives (le
-//! `PREEMPT` de Linux). Un programme WebAssembly s'exécute dans
-//! l'interpréteur du noyau : sans préemption du noyau, il ne céderait
-//! jamais le processeur.
-//! UNIPROCESSEUR : avec des verrous qui coupent tous les interruptions,
-//! « les interruptions étaient actives » garantit qu'aucun verrou n'était
-//! tenu ; avec plusieurs processeurs (et des verrous qui ne les coupent
-//! pas tous), il faudra le compte de préemption de Linux, par tâche. La règle qui reste, vérifiée :
-//! ne jamais céder le processeur verrou tenu (`ordonnancer` panique,
+//! `PREEMPT` de Linux) et que la préemption n'est pas coupée
+//! (processeur.rs, le compte de préemption, 6j). Un programme WebAssembly
+//! s'exécute dans l'interpréteur du noyau : sans préemption du noyau, il
+//! ne céderait jamais le processeur. Tous les verrous courts coupent les
+//! interruptions (verrou.rs) : « les interruptions étaient actives »
+//! garantit qu'aucun n'était tenu. La règle, vérifiée : ne jamais céder le
+//! processeur verrou tenu ni préemption coupée (`ordonnancer` panique,
 //! comme le « scheduling while atomic » de Linux). Écart avec Linux : il
 //! préempte aussi en rendant un verrou ; chez nous, un réveil fait dans le
-//! noyau ne prend effet qu'au retour vers l'anneau 3 ou au tic suivant.
+//! noyau ne prend effet qu'au retour vers l'anneau 3 ou au tic suivant
+//! (6j le reprend).
+//!
+//! DORMIR OU ÊTRE PRÉEMPTÉE (6j) : `ordonnancer` dit pourquoi on l'appelle
+//! (`Bascule`). Pour un SOMMEIL, la tâche courante quitte la file des
+//! prêtes, mais seulement si son état dit encore « dort » (tache.rs,
+//! `quitte_la_file`) : si quelqu'un l'a réveillée entre « je vais dormir »
+//! et ici, elle reste prête, et son `dormir` revient tout de suite ; un
+//! réveil ne se perd pas. Pour une PRÉEMPTION, elle ne quitte JAMAIS la
+//! file, quel que soit son état : une tâche neuve, ou une tâche préemptée
+//! entre « je vais dormir » et son sommeil, serait sinon perdue. C'est le
+//! `!preempt && prev_state` du `__schedule` de Linux (SM_PREEMPT).
 
 use crate::faillible::VecFaillible;
 use crate::partage::Arc;
-use crate::tache::{self, Tache};
+use crate::tache::{self, Reveil, Tache};
 use crate::verrou::{self, Verrou};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -170,6 +180,10 @@ impl File {
         let lag = if charge > 0 { (t.lag() as i128 * (charge + poids) as i128 / charge as i128) as i64 } else { 0 };
         let vruntime = (self.moyenne() as i64).saturating_sub(lag).max(0) as u64;
         let tranche = if neuve { tranche_virtuelle(poids) / 2 } else { tranche_virtuelle(poids) };
+        // Les deux invariants que le réveil sous verrou garantit (voir
+        // `reveiller`) : jamais deux fois en file, jamais une morte.
+        assert!(self.position(&t).is_none(), "tache deja dans la file des pretes");
+        assert!(!t.est_morte(), "tache morte remise dans une file des pretes");
         // La place est réservée au démarrage (`initialiser`) : la file ne
         // grandit pas pendant un programme, et l'ordonnanceur n'appelle
         // jamais le tas (il tourne aussi dans les interruptions).
@@ -200,31 +214,51 @@ pub fn initialiser(max: usize) {
     f.depuis = crate::temps::ns_monotone();
 }
 
-/// Une tâche neuve, ou réveillée, devient prête. Si elle devrait passer
-/// avant la courante (éligible, et d'échéance plus proche, la courante
-/// n'étant pas protégée : `check_preempt_wakeup_fair`), la courante cédera
-/// le processeur au prochain point de préemption.
-pub fn rendre_prete(t: Arc<Tache>, neuve: bool) {
+/// Réveille `t` (tache.rs, `reveiller`) : son état passe de « dort » à
+/// `pourquoi` SOUS le verrou de la file, dans la même section critique que
+/// la lecture de sa place dans la file (le `pi_lock` de Linux, tenu de
+/// `ttwu_state_match` à `ttwu_queue` ; chez nous le verrou de la file
+/// suffit : `ordonnancer` lit l'état et retire la tâche sous ce même
+/// verrou). Un compare_exchange gagné avec la tâche hors de la file dit
+/// alors qu'elle s'est retirée pour CE sommeil et ne s'exécutera plus
+/// d'elle-même : personne d'autre ne peut la remettre en file, et un second
+/// réveilleur trouve un état qui ne dort plus. Rend faux si elle ne dormait
+/// pas, ou pas d'un sommeil que `pourquoi` réveille.
+pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) -> bool {
     let mut f = FILE.verrouiller();
-    if f.position(&t).is_some() {
-        return;
+    if !t.passer_a_reveillee(pourquoi) {
+        return false;
     }
+    // Le `ttwu_runnable` de Linux : elle n'avait pas fini de s'endormir
+    // (son état, réveillé, l'y garde), ou elle est préemptée : rien à
+    // ajouter ; elle doit peut-être passer avant la courante.
+    if f.position(&t).is_none() {
+        f.compter_courante();
+        f.ajouter(t, false);
+    }
+    ceder_si_une_autre_passe(&f);
+    true
+}
+
+/// Une tâche neuve (clone, un programme lancé) devient prête. Elle n'est
+/// pas dans la file : rien à vérifier.
+pub fn rendre_prete(t: Arc<Tache>) {
+    let mut f = FILE.verrouiller();
     f.compter_courante();
-    f.ajouter(t, neuve);
+    f.ajouter(t, true);
+    ceder_si_une_autre_passe(&f);
+}
+
+/// Si une autre tâche que la courante devrait avoir le processeur
+/// (éligible, et d'échéance plus proche, la courante n'étant pas protégée :
+/// `check_preempt_wakeup_fair`), la courante cédera au prochain point de
+/// préemption.
+fn ceder_si_une_autre_passe(f: &File) {
     let courante = tache::courante();
     let choisie = f.choisir().map(|e| Arc::as_ptr(&e.tache));
     if choisie.is_some_and(|c| !core::ptr::eq(c, courante)) {
         BESOIN_DE_CEDER.store(true, Ordering::Relaxed);
     }
-}
-
-/// La tâche courante quitte la file : elle s'endort, ou elle est morte. Il
-/// faudra ensuite `ordonnancer`.
-pub fn retirer_courante() {
-    let mut f = FILE.verrouiller();
-    f.compter_courante();
-    let courante = tache::courante();
-    f.retirer(courante);
 }
 
 /// Le tic d'horloge, interruptions coupées : le temps de la courante est
@@ -252,12 +286,23 @@ pub fn besoin_de_ceder() -> bool {
     BESOIN_DE_CEDER.load(Ordering::Relaxed)
 }
 
+/// Pourquoi on appelle `ordonnancer` (voir l'en-tête).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Bascule {
+    /// La tâche courante veut dormir (ou est morte) : elle quitte la file
+    /// si son état dit encore « dort ».
+    Sommeil,
+    /// Elle est préemptée (le tic, un réveil qui passe avant elle,
+    /// sched_yield) : elle reste dans la file.
+    Preemption,
+}
+
 /// Donne le processeur à la tâche que choisit l'EEVDF (la tâche inactive
 /// si la file est vide), et revient quand la courante le retrouve (jamais,
 /// si elle est morte). Jamais verrou tenu : une tâche qui céderait le
 /// processeur en tenant un verrou (qui coupe les interruptions) bloquerait
 /// tout le monde.
-pub fn ordonnancer() {
+pub fn ordonnancer(bascule: Bascule) {
     let tenus = verrou::tenus();
     assert!(tenus == 0, "ordonnancer avec {} verrou(s) tenu(s)", tenus);
     // Ni préemption coupée, ni dans une interruption (le « scheduling while
@@ -269,6 +314,11 @@ pub fn ordonnancer() {
     let suivante = {
         let mut f = FILE.verrouiller();
         f.compter_courante();
+        // Un sommeil : la courante quitte la file, sauf si un réveil l'a
+        // déjà changée d'avis (voir l'en-tête) ; une préemption : jamais.
+        if bascule == Bascule::Sommeil && tache::courante().quitte_la_file() {
+            f.retirer(tache::courante());
+        }
         // Un pointeur, pas un Arc : la file garde la tâche choisie tant
         // qu'elle est prête ou courante, et un Arc emporté par une tâche qui
         // ne reprendra jamais la main (une morte) ne serait jamais rendu.
@@ -305,7 +355,7 @@ pub fn ordonnancer() {
 /// dort, garde son processeur).
 pub fn preempter() {
     if besoin_de_ceder() && !crate::processeur::preemption_coupee() {
-        ordonnancer();
+        ordonnancer(Bascule::Preemption);
     }
 }
 
@@ -323,7 +373,7 @@ pub fn ceder() {
             e.protegee = false;
         }
     }
-    ordonnancer();
+    ordonnancer(Bascule::Preemption);
 }
 
 /// Le nombre de bascules depuis le démarrage.

@@ -41,7 +41,7 @@ use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::faillible::{self, VecFaillible};
 use crate::pages::{self, Page};
-use crate::{cpu, espace_utilisateur, processus, signaux, temps, vfs};
+use crate::{espace_utilisateur, processus, signaux, temps, vfs};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 use fichiers::tmpfs::Ouvert;
@@ -347,29 +347,12 @@ fn attendre(file: &FileAttente, condition: impl FnMut() -> bool) -> bool {
 
 /// Comme `attendre`, exclusive ou non (`wait_event_interruptible` : réveillée
 /// par tout réveil de la file, sans compter parmi les exclusives).
-fn attendre_en(file: &FileAttente, exclusive: bool, mut condition: impl FnMut() -> bool) -> bool {
-    let interruptions = cpu::couper_interruptions();
-    let t = tache::courante();
-    let mut signal = false;
-    let r = loop {
-        if condition() {
-            break true;
-        }
-        if signal {
-            break false;
-        }
-        if exclusive {
-            file.inscrire_exclusive();
-        } else {
-            file.inscrire();
-        }
-        signal = attente::dormir(None, Sommeil::Interruptible) == Reveil::Signal;
-        file.retirer(t);
-    };
-    if interruptions {
-        cpu::activer_interruptions();
-    }
-    r
+fn attendre_en(file: &FileAttente, exclusive: bool, condition: impl FnMut() -> bool) -> bool {
+    // Les sept pas d'attente.rs (`attendre_que`) ; un signal finit
+    // l'attente, la condition revue une dernière fois (ce qui arrive en
+    // même temps se lit).
+    let inscription = if exclusive { attente::Inscription::Exclusive } else { attente::Inscription::Ordinaire };
+    attente::attendre_que(file, inscription, Sommeil::Interruptible, None, condition) == Reveil::Reveillee
 }
 
 impl Tube {

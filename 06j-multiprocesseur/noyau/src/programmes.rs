@@ -576,7 +576,9 @@ fn attendre_le_reseau() {
     let fin = crate::temps::ns_monotone() + 4_000_000_000;
     while !crate::reseau::au_repos() && crate::temps::ns_monotone() < fin {
         let interruptions = crate::cpu::couper_interruptions();
+        tache::courante().preparer_sommeil(crate::attente::Sommeil::Ininterruptible);
         crate::attente::dormir(Some(crate::temps::ns_monotone() + 1_000_000), crate::attente::Sommeil::Ininterruptible);
+        tache::courante().reveille();
         if interruptions {
             crate::cpu::activer_interruptions();
         }

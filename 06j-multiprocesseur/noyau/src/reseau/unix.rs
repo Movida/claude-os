@@ -98,9 +98,9 @@ use crate::attente::{self, FileAttente, GardeMutex, Mutex, PorteFile, Relais, So
 use crate::faillible::{self, FileFaillible, VecFaillible};
 use crate::partage::{Arc, Weak};
 use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDBAND, POLLRDNORM, POLLWRBAND, POLLWRNORM};
-use crate::tache::{self, Reveil};
+use crate::tache::Reveil;
 use crate::verrou::Verrou;
-use crate::{cpu, processus, temps};
+use crate::{processus, temps};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::pin::Pin;
@@ -598,29 +598,13 @@ fn attendre(file: &FileAttente, echeance: Option<u64>, delai: bool, pret: impl F
     if pret() {
         return Ok(());
     }
-    let interruptions = cpu::couper_interruptions();
-    let t = tache::courante();
-    let r = loop {
-        if pret() {
-            break Ok(());
-        }
-        if tache::signal_en_attente() {
-            break Err(if delai { -EINTR } else { -crate::reprise::ERESTARTSYS });
-        }
-        if echeance.is_some_and(|e| e <= temps::ns_monotone()) {
-            break Err(-EAGAIN);
-        }
-        file.inscrire();
-        let reveil = attente::dormir(echeance, Sommeil::Interruptible);
-        file.retirer(&t);
-        if reveil == Reveil::Echeance && !pret() {
-            break Err(-EAGAIN);
-        }
-    };
-    if interruptions {
-        cpu::activer_interruptions();
+    // Les sept pas d'attente.rs (`attendre_que`) : la condition est revue
+    // une dernière fois après l'échéance ou le signal.
+    match attente::attendre_que(file, attente::Inscription::Ordinaire, Sommeil::Interruptible, echeance, pret) {
+        Reveil::Reveillee => Ok(()),
+        Reveil::Echeance => Err(-EAGAIN),
+        Reveil::Signal => Err(if delai { -EINTR } else { -crate::reprise::ERESTARTSYS }),
     }
-    r
 }
 
 /// L'échéance d'un délai (SO_SNDTIMEO, SO_RCVTIMEO), et s'il y en a un.

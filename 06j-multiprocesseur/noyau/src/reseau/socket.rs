@@ -45,7 +45,6 @@ use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, 
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::faillible::{self, FileFaillible};
-use crate::{cpu, temps};
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
 
@@ -546,31 +545,14 @@ impl Socket {
         if pret() {
             return Ok(());
         }
-        let interruptions = cpu::couper_interruptions();
-        let t = tache::courante();
-        let r = loop {
-            // La condition d'abord, à chaque tour, même réveillé par un
-            // signal : un datagramme arrivé en même temps se lit.
-            if pret() {
-                break Ok(());
-            }
-            if tache::signal_en_attente() {
-                break Err(if echeance.is_some() { -EINTR } else { -crate::reprise::ERESTARTSYS });
-            }
-            if echeance.is_some_and(|e| e <= temps::ns_monotone()) {
-                break Err(-EAGAIN);
-            }
-            self.attente.inscrire_exclusive();
-            let reveil = attente::dormir(echeance, Sommeil::Interruptible);
-            self.attente.retirer(t);
-            if reveil == Reveil::Echeance && !pret() {
-                break Err(-EAGAIN);
-            }
-        };
-        if interruptions {
-            cpu::activer_interruptions();
+        // Les sept pas d'attente.rs (`attendre_que`) : la condition est
+        // revue une dernière fois après l'échéance ou le signal (un
+        // datagramme arrivé en même temps se lit).
+        match attente::attendre_que(&self.attente, attente::Inscription::Exclusive, Sommeil::Interruptible, echeance, pret) {
+            Reveil::Reveillee => Ok(()),
+            Reveil::Echeance => Err(-EAGAIN),
+            Reveil::Signal => Err(if echeance.is_some() { -EINTR } else { -crate::reprise::ERESTARTSYS }),
         }
-        r
     }
 
     /// Arrête la lecture, l'écriture, ou les deux (les drapeaux de
