@@ -121,7 +121,12 @@ avec les commandes données à la fin.
    dans les annotations, sans jeton : `.../check-runs/<id du job>/annotations`
    (l'id : `.../actions/runs/<run>/jobs`). Le détail complet, David le copie
    depuis la page du run (roue dentée, « View raw logs »). Elle est restée
-   rouge onze jours sans que personne le voie.
+   rouge onze jours sans que personne le voie. Et AVANT le push : passer
+   sous le noyau de la CI les programmes de test sur l'hôte nouveaux ou
+   changés dans l'étape, puisque la CI s'arrête au premier échec (un push par
+   écart) : `sh .claude/skills/fin-d-etape/temoin-ci.sh ETAPE copies:/dev/shm
+   tcp ...` (le paquet du noyau, un /init statique, QEMU : 30 s). Ce que
+   les notes de l'image de GitHub donnent comme noyau va dans NOYAU.
 
 ## B. Exceptionnel : replier dans un historique déjà poussé
 
@@ -641,6 +646,13 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   attendu : `claude -p` efface la sonde de sa surveillance des fichiers si
   son essai, en tâche de fond, finit avant lui ; sous Linux, plus rapide, il
   la laisse toujours (six fois sur six) ; sous QEMU, selon la charge.
+- **La CI, après le push de 6i** : `copies` attendait sur l'hôte la limite
+  de /sys de Linux 6.18 (EOVERFLOW à 2^31) ; Linux 7.0, celui de la CI, l'a
+  levée (0, la fin du fichier). Le témoin de 6h, dans un brouillon, avait
+  disparu : il est maintenant dans le skill (`temoin-ci.sh`), et il a passé
+  sous 7.0 les quatre programmes que 6i ajoutait ou changeait. Un témoin à
+  monter soi-même doit avoir ce que les tests ouvrent (`/tmp` : sans lui,
+  deux faux échecs).
 - **Une sonde en C** : l'ordre d'évaluation des arguments d'un `printf`
   n'est pas défini, et deux appels système passés en arguments s'y font
   dans l'ordre que choisit gcc (de droite à gauche ici) : les séquencer
