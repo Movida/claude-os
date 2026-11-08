@@ -301,7 +301,8 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     gdt::initialiser(processeur::zone(0), gdt::piles_ist_du_premier());
     interruptions::initialiser();
     appel_systeme::initialiser();
-    afficherln!("[noyau] Processeur 0 : GDT, TSS et IDT en place, sa zone dans GS ; syscall pret (swapgs).");
+    afficherln!("[noyau] Processeur 0 : GDT, TSS et IDT en place, sa zone dans GS ; syscall pret (swapgs) ; {} processeur en service.",
+                processeur::nombre());
 
     // Test volontaire : int3 déclenche l'exception 3. Si l'IDT est fausse,
     // c'est une triple faute et QEMU redémarre ; sinon, on revient ici.
@@ -551,6 +552,42 @@ fn tester_ordonnanceur() {
     let ok = a.is_some() && b.is_some() && VU.iter().all(|v| v.load(Ordering::Relaxed));
     afficherln!("[noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : {} ({} bascules).",
                 if ok { "ok" } else { "ECHEC" }, ordonnanceur::bascules() - bascules);
+
+    // Le compte de préemption (processeur.rs) : une tâche qui calcule 10 ms
+    // préemption coupée ne doit pas être remplacée (le compteur d'une
+    // autre, prête, ne bouge pas : sur un seul processeur, l'autre n'a pas
+    // d'autre moyen de s'exécuter ; avec plusieurs, les deux sont
+    // épinglées sur le même, 6j), puis l'est dès qu'elle la rétablit. Le
+    // tic, lui, passe encore (il compte le temps de calcul qui sert ici).
+    static TEMOIN: AtomicU64 = AtomicU64::new(0);
+    static FINI: AtomicBool = AtomicBool::new(false);
+    static RESULTAT: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+    let c = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-c"), || {
+        let calculer_10_ms = || {
+            let debut = tache::temps_de_calcul();
+            while tache::temps_de_calcul() - debut < 10_000_000 {
+                core::hint::spin_loop();
+            }
+        };
+        let avant = TEMOIN.load(Ordering::Relaxed);
+        processeur::sans_preemption(calculer_10_ms);
+        RESULTAT[0].store(TEMOIN.load(Ordering::Relaxed) == avant, Ordering::Relaxed);
+        calculer_10_ms();
+        RESULTAT[1].store(TEMOIN.load(Ordering::Relaxed) != avant, Ordering::Relaxed);
+        FINI.store(true, Ordering::Relaxed);
+    });
+    let d = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-d"), || {
+        while !FINI.load(Ordering::Relaxed) {
+            TEMOIN.fetch_add(1, Ordering::Relaxed);
+        }
+    });
+    if let (Some(c), Some(d)) = (&c, &d) {
+        tache::attendre(c);
+        tache::attendre(d);
+    }
+    let ok = c.is_some() && d.is_some() && RESULTAT.iter().all(|r| r.load(Ordering::Relaxed));
+    afficherln!("[noyau] Preemption coupee : une tache qui calcule 10 ms n'est pas remplacee, puis l'est des qu'elle la retablit : {}.",
+                if ok { "ok" } else { "ECHEC" });
 }
 
 /// Vérifie le verrou qui dort en lecture et en écriture (attente.rs,

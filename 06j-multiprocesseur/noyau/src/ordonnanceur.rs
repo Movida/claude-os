@@ -260,6 +260,10 @@ pub fn besoin_de_ceder() -> bool {
 pub fn ordonnancer() {
     let tenus = verrou::tenus();
     assert!(tenus == 0, "ordonnancer avec {} verrou(s) tenu(s)", tenus);
+    // Ni préemption coupée, ni dans une interruption (le « scheduling while
+    // atomic » de Linux) : le compte de préemption est ainsi toujours nul
+    // quand on bascule, et n'a rien à sauver par tâche (processeur.rs).
+    assert!(crate::processeur::preemptible(), "ordonnancer preemption coupee ou dans une interruption");
     let interruptions = crate::cpu::couper_interruptions();
     BESOIN_DE_CEDER.store(false, Ordering::Relaxed);
     let suivante = {
@@ -296,9 +300,11 @@ pub fn ordonnancer() {
 
 /// Préempte la tâche courante si elle doit céder : à la fin d'une
 /// interruption qui a interrompu le noyau, interruptions actives (voir
-/// l'en-tête).
+/// l'en-tête), et préemption permise (processeur.rs : une tâche qui
+/// attend la réponse d'autres processeurs, ou qui tourne sur un verrou qui
+/// dort, garde son processeur).
 pub fn preempter() {
-    if besoin_de_ceder() {
+    if besoin_de_ceder() && !crate::processeur::preemption_coupee() {
         ordonnancer();
     }
 }

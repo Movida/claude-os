@@ -54,18 +54,36 @@
 //! passent par `courant_sans_verification`, qui dit pourquoi à chaque
 //! appel.
 //!
+//! LE COMPTE DE PRÉEMPTION (le `preempt_count` de Linux). Couper les
+//! interruptions interdit tout, y compris aux périphériques et aux autres
+//! processeurs de nous parler ; couper la PRÉEMPTION seule interdit
+//! seulement à l'ordonnanceur de nous remplacer (ou de nous déplacer) : le
+//! tic et les interruptions passent encore. Il le faut pour attendre la
+//! réponse d'autres processeurs (une IPI, smp.rs : la demande est dans
+//! notre zone, et « les autres que moi » ne doit pas changer de sens au
+//! milieu), ou pour tourner sur un verrou qui dort tant que son détenteur
+//! s'exécute ailleurs. Le compte est dans la zone, incrémenté par UNE
+//! instruction `add gs:[...]` : une interruption ne peut pas tomber au
+//! milieu, et un processeur n'écrit que son compte (Linux : `__preempt_count`
+//! par processeur, `incl %gs:...`). Il est toujours nul au moment de
+//! basculer d'une tâche à l'autre (ordonnanceur.rs le vérifie : une tâche
+//! ne cède pas le processeur préemption coupée) : il n'a donc rien à sauver
+//! par tâche. Les verrous tenus (`tenus`) et « dans une interruption »
+//! en sont, chez Linux, d'autres parts ; ici trois compteurs, que lit
+//! `preemptible`.
+//!
 //! Les champs sont des atomiques ou des `UnsafeCell`, jamais un `&mut
 //! Processeur` : une interruption imbriquée sur le même processeur en
 //! ferait deux. Ce que la zone contient grandit avec 6j : la file des
-//! prêtes du processeur (ordonnanceur.rs), le compte de préemption, les
-//! statistiques des verrous.
+//! prêtes du processeur (ordonnanceur.rs).
 
 use crate::cpu;
 use crate::gdt::TssAlignee;
 use crate::tache::Tache;
 use core::arch::asm;
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32};
+use core::mem::offset_of;
+use core::sync::atomic::{AtomicPtr, AtomicU8, AtomicU32, Ordering};
 
 /// Le nombre maximal de processeurs : la taille du masque de
 /// `sched_getaffinity` (un `unsigned long`, 64 bits). Linux va bien
@@ -87,6 +105,10 @@ pub struct Processeur {
     /// Le nombre d'interruptions matérielles en cours de traitement
     /// (interruptions.rs, la part HARDIRQ du `preempt_count`).
     pub dans_une_interruption: AtomicU32,
+    /// Le compte de préemption (voir l'en-tête) : écrit par `add gs:[...]`
+    /// et `sub gs:[...]` seulement (`couper_preemption`,
+    /// `retablir_preemption`), lu par `gs:[...]`.
+    preemption: UnsafeCell<u32>,
     /// La tâche qui s'exécute sur ce processeur (le `current` de Linux).
     pub courante: AtomicPtr<Tache>,
     /// Sa tâche inactive, celle qui prend le processeur quand aucune autre
@@ -119,6 +141,7 @@ impl Processeur {
             apic: AtomicU8::new(0),
             tenus: AtomicU32::new(0),
             dans_une_interruption: AtomicU32::new(0),
+            preemption: UnsafeCell::new(0),
             courante: AtomicPtr::new(core::ptr::null_mut()),
             inactive: AtomicPtr::new(core::ptr::null_mut()),
             a_rendre: AtomicPtr::new(core::ptr::null_mut()),
@@ -161,11 +184,65 @@ fn numero_brut() -> u32 {
     n
 }
 
-/// La zone de ce processeur. Interruptions coupées (voir l'en-tête).
+/// Le nombre de processeurs en service : 1 jusqu'à ce que les secondaires
+/// démarrent (6j), puis autant qu'il y en a qui ont répondu.
+static EN_SERVICE: AtomicU32 = AtomicU32::new(1);
+
+/// Le nombre de processeurs en service.
+pub fn nombre() -> usize {
+    EN_SERVICE.load(Ordering::Acquire) as usize
+}
+
+/// La zone de ce processeur. Interruptions coupées, ou préemption coupée
+/// (voir l'en-tête).
 #[track_caller]
 pub fn courant() -> &'static Processeur {
-    assert!(!cpu::interruptions_actives(), "zone du processeur lue interruptions actives");
+    assert!(!cpu::interruptions_actives() || preemption_coupee(), "zone du processeur lue interruptions et preemption actives");
     &ZONES_PROCESSEURS.0[numero_brut() as usize]
+}
+
+/// Coupe la préemption (le `preempt_disable` de Linux) : la tâche courante
+/// garde son processeur, interruptions actives ou non, jusqu'à
+/// `retablir_preemption`. Une instruction, indivisible pour une
+/// interruption de ce processeur ; aucun autre processeur n'écrit ce compte.
+pub fn couper_preemption() {
+    // SAFETY: `preemption` n'est écrit que par ces deux instructions
+    // gs-relatives, sur le compte de ce processeur ; la base de GS est
+    // posée avant tout code qui vient ici.
+    unsafe { asm!("add dword ptr gs:[{}], 1", const offset_of!(Processeur, preemption), options(nostack)) };
+}
+
+/// Rétablit la préemption. (Céder le processeur si une tâche l'attend, le
+/// `preempt_enable` complet de Linux : 6j, « préempter en rendant un
+/// verrou ».)
+pub fn retablir_preemption() {
+    // SAFETY: comme `couper_preemption`.
+    unsafe { asm!("sub dword ptr gs:[{}], 1", const offset_of!(Processeur, preemption), options(nostack)) };
+}
+
+/// La préemption est-elle coupée sur ce processeur ? Lisible interruptions
+/// actives : si le compte n'est pas nul, c'est nous qui l'avons coupée, et
+/// nous ne pouvons pas être déplacés ; s'il est nul, il le reste pour nous.
+pub fn preemption_coupee() -> bool {
+    let n: u32;
+    // SAFETY: une lecture gs-relative du compte de ce processeur.
+    unsafe { asm!("mov {:e}, gs:[{}]", out(reg) n, const offset_of!(Processeur, preemption), options(nostack, readonly, preserves_flags)) };
+    n != 0
+}
+
+/// Exécute `f` préemption coupée.
+pub fn sans_preemption<R>(f: impl FnOnce() -> R) -> R {
+    couper_preemption();
+    let r = f();
+    retablir_preemption();
+    r
+}
+
+/// Peut-on céder le processeur ici ? Aucun verrou tenu, pas dans une
+/// interruption, préemption permise (le `preemptible()` de Linux).
+pub fn preemptible() -> bool {
+    let p = courant_sans_verification("les compteurs du contexte courant");
+    p.tenus.load(Ordering::Relaxed) == 0 && p.dans_une_interruption.load(Ordering::Relaxed) == 0 && !preemption_coupee()
 }
 
 /// La zone de ce processeur, sans vérifier les interruptions : seulement

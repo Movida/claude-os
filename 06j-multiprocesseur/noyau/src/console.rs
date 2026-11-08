@@ -16,19 +16,46 @@ pub fn initialiser() {
     ECRAN.verrouiller().effacer();
 }
 
-/// Prépare la console pour le message d'une panique.
+/// Le processeur qui panique (ou dont l'exception est fatale), plus un ;
+/// 0 : aucun. Le premier qui arrive gagne : les autres, s'ils paniquent en
+/// même temps (un NMI du moniteur de QEMU va à TOUS les processeurs
+/// virtuels ; une exception fatale sur un processeur pendant qu'un autre
+/// panique), s'arrêtent sans rien dire, sinon leurs messages se mêleraient
+/// (le `panic_cpu` et le `stopping_cpu` de Linux).
+static PANIQUE_PAR: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+/// Prépare la console pour le message d'une panique. Ne revient que sur le
+/// premier processeur qui panique (voir PANIQUE_PAR) ; les autres s'arrêtent
+/// ici.
 ///
 /// Si la panique (ou l'exception fatale) est survenue PENDANT un affichage,
 /// le verrou de l'écran est encore pris par le code qui a planté : le
 /// message de panique l'attendrait pour toujours, et la machine se
-/// figerait sans un mot. Comme Linux pendant un « oops » (bust_spinlocks),
-/// on force la libération : le code interrompu ne reprendra jamais, au pire
-/// l'écran montrera une ligne à moitié écrite.
+/// figerait sans un mot. Comme Linux pendant un « oops » (bust_spinlocks,
+/// puis zap_locks pour sa console), on remet le verrou à neuf : le code
+/// interrompu ne reprendra jamais, au pire l'écran montrera une ligne à
+/// moitié écrite. (Les autres processeurs, qui pourraient tenir ce verrou
+/// ou l'attendre, sont arrêtés avant : 6j, les IPI.)
 pub fn preparer_panique() {
+    use core::sync::atomic::Ordering;
     crate::cpu::couper_interruptions();
+    let moi = crate::processeur::numero() + 1;
+    if PANIQUE_PAR.compare_exchange(0, moi, Ordering::AcqRel, Ordering::Acquire).is_err() && PANIQUE_PAR.load(Ordering::Relaxed) != moi {
+        crate::cpu::arreter();
+    }
     // SAFETY: on ne revient pas de la panique, le détenteur éventuel du
     // verrou ne reprendra jamais la main.
     unsafe { ECRAN.forcer_liberation() };
+}
+
+/// Un message d'urgence, sur le port série seul, SANS verrou : pour qui ne
+/// peut en prendre aucun, parce que c'est peut-être celui de la console
+/// qu'il attend (un `Verrou` attendu trop longtemps, verrou.rs). Les octets
+/// peuvent se mêler à ceux d'un autre processeur : c'est le prix d'un
+/// message qui part quoi qu'il arrive (le `printk` d'urgence de Linux
+/// écrit de même, directement, quand sa console est perdue).
+pub fn urgence(args: fmt::Arguments) {
+    let _ = Serie.write_fmt(args);
 }
 
 /// Le verrou des écritures, tenu pendant tout un `write` d'un programme et
