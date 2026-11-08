@@ -1089,7 +1089,6 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     let pid = processus::numero_neuf();
     let entree = processus::ajouter(processus::Processus {
         pid,
-        descripteurs,
         dossier: lancement.dossier,
         racine: Objet::Tmpfs(racine),
         umask: 0o022,
@@ -1098,7 +1097,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
         signaux: crate::signaux::Signaux::new(),
         fils: Vec::new(),
         fin_de_groupe: None,
-    }, programme.memoire, nom);
+    }, descripteurs, programme.memoire, nom);
     // Son exécutable, pour /proc/<pid>/exe (procfs.rs fabrique son dossier
     // d'après la table des processus) : son chemin, et son inode, tenu par
     // le lancement, puis par le lanceur jusqu'au recueil.

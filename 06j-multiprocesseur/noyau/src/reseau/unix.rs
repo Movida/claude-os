@@ -669,7 +669,7 @@ fn detacher(m: &mut Message) -> Vec<FichierTenu> {
 /// un programme pourrait fermer tous ses descripteurs, en ayant mis ses fichiers en vol,
 /// et en ouvrir sans fin).
 fn trop_en_vol() -> bool {
-    EN_VOL.load(Ordering::Relaxed) as u64 > processus::avec(|p| p.descripteurs.limite.0)
+    EN_VOL.load(Ordering::Relaxed) as u64 > processus::descripteurs(|d| d.limite.0)
 }
 
 /// Le ramasse-miettes (`__unix_gc`) : jette les files des sockets en vol que plus rien ne peut lire

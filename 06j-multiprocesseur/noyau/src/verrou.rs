@@ -193,6 +193,18 @@ impl<T> Verrou<T> {
         crate::tsc::lire().wrapping_sub(debut)
     }
 
+    /// Ce processeur tient-il ce verrou ? Pour un `assert!` d'ordre des
+    /// verrous (processus.rs : jamais celui d'un processus sous celui des
+    /// fichiers). S'il ne tient aucun verrou, non, et les deux lectures qui
+    /// suivent ne sont pas faites : interruptions actives, la tâche
+    /// pourrait être déplacée entre la lecture de son numéro de processeur
+    /// et celle du propriétaire, et se croire détentrice d'un verrou que
+    /// son ancien processeur vient de prendre. S'il en tient un, les
+    /// interruptions sont coupées et son numéro ne bouge pas.
+    pub fn tenu_par_ce_processeur(&self) -> bool {
+        tenus() != 0 && self.proprietaire.load(Ordering::Relaxed) == processeur::numero() + 1
+    }
+
     /// La donnée, sans prendre le verrou : `&mut self` prouve que personne
     /// d'autre ne peut l'avoir (le `get_mut` des verrous de la bibliothèque
     /// standard). Les interruptions restent comme elles sont : celui qui

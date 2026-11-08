@@ -367,7 +367,7 @@ fn sonder_pollfd(fd: i32, evenements: u16, table: &mut Table) -> u32 {
 /// interrompu, et pour chaque entrée (EFAULT). Rend le nombre d'entrées
 /// prêtes.
 fn sys_poll(tableau: u64, nombre: u32, delai: Delai) -> i64 {
-    if nombre as u64 > processus::avec(|p| p.descripteurs.limite.0) {
+    if nombre as u64 > processus::descripteurs(|d| d.limite.0) {
         return -EINVAL;
     }
     let Ok(mut octets) = faillible::remplie(nombre as usize * 8, 0u8) else { return -ENOMEM };
@@ -498,7 +498,7 @@ fn faire_select(n: u64, demandes: &Ensembles, resultats: &mut Ensembles, d: Dela
     let mut fin = 0;
     for fd in 0..n {
         if demande(fd) {
-            if !processus::avec(|p| p.descripteurs.pris(fd)) {
+            if !processus::descripteurs(|d| d.pris(fd)) {
                 return Err(-EBADF);
             }
             fin = fd + 1;
@@ -545,7 +545,7 @@ fn sys_select(n: u64, adresses: [u64; 3], d: Delai) -> i64 {
     if n < 0 {
         return -EINVAL;
     }
-    let n = (n as u64).min(processus::avec(|p| p.descripteurs.taille_linux()));
+    let n = (n as u64).min(processus::descripteurs(|d| d.taille_linux()));
     let mots = n.div_ceil(64) as usize;
     let mut demandes: Ensembles = [Vec::new(), Vec::new(), Vec::new()];
     let mut resultats: Ensembles = [Vec::new(), Vec::new(), Vec::new()];

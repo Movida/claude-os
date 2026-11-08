@@ -26,18 +26,19 @@
 //! pages (ENOSPC au-delà).
 //!
 //! Le système de fichiers est sous un verrou. Règles :
-//!   - l'ordre : le verrou d'un processus, puis celui des fichiers (le
-//!     dossier de départ d'une résolution, getcwd), et celui des tables de
-//!     pages, puis celui des fichiers (une faute de page dans une
-//!     projection de fichier, sous la mémoire du processus, un verrou qui
-//!     dort : memoire.rs) ; mais une vue de /proc, sous celui des fichiers,
-//!     prend la table des processus puis un processus (procfs.rs). Ce qui
-//!     se fait sous le verrou d'un processus ne résout donc jamais de
-//!     chemin.
-//!     UNIPROCESSEUR : un `Verrou` coupe les interruptions, ces deux
-//!     ordres ne s'interbloquent pas ; avec plusieurs processeurs, il
-//!     faudra un ordre total : lire les descripteurs d'un processus sans
-//!     son verrou (le RCU de `fget_task` chez Linux) ;
+//!   - l'ordre (le tableau complet : l'en-tête de processus.rs) : le verrou
+//!     d'un processus, puis celui des fichiers (le dossier de départ d'une
+//!     résolution, getcwd), et celui des tables de pages, puis celui des
+//!     fichiers (une faute de page dans une projection de fichier, sous la
+//!     mémoire du processus, un verrou qui dort : memoire.rs). Sous celui
+//!     des fichiers, une vue de /proc (procfs.rs) ne lit un processus que
+//!     par les verrous du dernier niveau : la table des processus, celle
+//!     des tâches, les descripteurs d'un processus (leur propre verrou,
+//!     6j) ; jamais le verrou du processus lui-même (`processus::avec` le
+//!     vérifie, par `tenu_ici`). Jusqu'à 6i, elle le prenait : l'ordre
+//!     inverse, sans danger sur un seul processeur (un `Verrou` coupe les
+//!     interruptions), un interblocage avec deux. Ce qui se fait sous le
+//!     verrou d'un processus ne résout jamais de chemin ;
 //!   - jamais de copie depuis ou vers un programme sous ce verrou : une
 //!     copie peut faire une faute de page.
 //! D'autres systèmes de fichiers se montent sur des dossiers du tmpfs
@@ -452,6 +453,12 @@ pub fn decimal(mut n: u32, texte: &mut [u8; 10]) -> &[u8] {
 }
 
 static RACINE: Verrou<Option<Systeme>> = Verrou::new(None);
+
+/// Ce processeur tient-il le verrou des fichiers ? Pour l'`assert!` d'ordre
+/// de processus.rs.
+pub fn tenu_ici() -> bool {
+    RACINE.tenu_par_ce_processeur()
+}
 
 /// Exécute `f` sur le système de fichiers, verrou tenu : court, et sans
 /// copie depuis ou vers un programme.

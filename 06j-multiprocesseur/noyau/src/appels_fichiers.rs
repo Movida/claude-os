@@ -259,15 +259,15 @@ impl Drop for FichierTenu {
 /// Tient le fichier du descripteur `fd` du processus en cours (EBADF s'il
 /// n'est pas ouvert).
 pub fn tenir(fd: u64) -> Result<FichierTenu, i64> {
-    processus::avec(|p| {
-        let d = p.descripteurs.get(fd)?;
-        // Le verrou des fichiers, pris sous celui du processus (l'ordre de
-        // vfs.rs) : le descripteur ne peut pas être fermé entre les deux.
-        Some(vfs::avec_systeme(|s, _| {
-            let mut o = tenir_ouvert(s, d.fichier);
-            o.fermer_a_l_exec = d.fermer_a_l_exec;
-            o
-        }))
+    vfs::avec_systeme(|s, _| {
+        // Le verrou des descripteurs, pris sous celui des fichiers (l'ordre
+        // de processus.rs) : un close d'un autre fil retire le descripteur
+        // sous le premier, puis lâche son fichier sous le second ; il
+        // attend donc que nous l'ayons tenu, ou nous ne le trouvons plus.
+        let d = processus::descripteurs(|d| d.get(fd))?;
+        let mut o = tenir_ouvert(s, d.fichier);
+        o.fermer_a_l_exec = d.fermer_a_l_exec;
+        Some(o)
     })
     .ok_or(-EBADF)
 }
@@ -386,7 +386,8 @@ fn tenir_dossier(p: &Processus, s: &mut Systeme, dirfd: u64, courant: bool) -> R
     let o = if courant || dirfd as i32 == AT_FDCWD {
         p.dossier
     } else {
-        let d = p.descripteurs.get(dirfd).ok_or(-EBADF)?;
+        // Celui des descripteurs, sous les deux (l'ordre de processus.rs).
+        let d = processus::descripteurs(|d| d.get(dirfd)).ok_or(-EBADF)?;
         s.ouverts.fichier(d.fichier).objet()
     };
     Ok(ObjetTenu::tenir(s, o))
@@ -560,7 +561,7 @@ fn tenir_chemin(dirfd: u64, chemin: &[u8], suivre: bool, vide_permis: bool) -> R
         return processus::avec(|p| {
             vfs::avec_systeme(|s, cadres| {
                 if dirfd as i32 != AT_FDCWD {
-                    let fichier = p.descripteurs.get(dirfd).ok_or(-EBADF)?.fichier;
+                    let fichier = processus::descripteurs(|d| d.get(dirfd)).ok_or(-EBADF)?.fichier;
                     s.ouverts.prendre(fichier);
                     return Ok(CheminTenu { fichier, objet: s.ouverts.fichier(fichier).objet() });
                 }
@@ -965,7 +966,7 @@ pub fn creat(adresse: u64, mode: u64) -> i64 {
 /// Ferme le descripteur `fd` du processus : son fichier est tenu une fois
 /// de moins.
 fn fermer_descripteur(fd: u64) -> Result<(), i64> {
-    let d = processus::avec(|p| p.descripteurs.retirer(fd)).ok_or(-EBADF)?;
+    let d = processus::descripteurs(|d| d.retirer(fd)).ok_or(-EBADF)?;
     vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
     Ok(())
 }
@@ -1030,21 +1031,21 @@ impl NumeroReserve {
     fn installer(self, fichier: Fichier, fermer_a_l_exec: bool) -> u64 {
         let fd = self.0;
         core::mem::forget(self);
-        processus::avec(|p| p.descripteurs.installer(fd, Descripteur { fichier, fermer_a_l_exec }));
+        processus::descripteurs(|d| d.installer(fd, Descripteur { fichier, fermer_a_l_exec }));
         fd
     }
 }
 
 impl Drop for NumeroReserve {
     fn drop(&mut self) {
-        processus::avec(|p| p.descripteurs.liberer(self.0));
+        processus::descripteurs(|d| d.liberer(self.0));
     }
 }
 
 /// Réserve le plus petit numéro libre du processus en cours (EMFILE,
 /// ENOMEM).
 pub fn reserver() -> Result<NumeroReserve, i64> {
-    processus::avec(|p| p.descripteurs.reserver(0)).map(NumeroReserve).map_err(errno_table)
+    processus::descripteurs(|d| d.reserver(0)).map(NumeroReserve).map_err(errno_table)
 }
 
 /// Le numéro d'erreur d'un refus de la table des descripteurs.
@@ -1190,9 +1191,9 @@ pub fn close_range(premier: u64, dernier: u64, drapeaux: u64) -> i64 {
         afficherln!("[noyau] close_range : CLOSE_RANGE_UNSHARE avec plusieurs fils pas pris en charge");
         return -EINVAL;
     }
-    let ouverts: Vec<u64> = match processus::avec(|p| {
-        let mut v = faillible::avec_capacite(p.descripteurs.ouverts(premier, dernier).count()).ok()?;
-        v.ajouter_tout(p.descripteurs.ouverts(premier, dernier)).ok()?;
+    let ouverts: Vec<u64> = match processus::descripteurs(|d| {
+        let mut v = faillible::avec_capacite(d.ouverts(premier, dernier).count()).ok()?;
+        v.ajouter_tout(d.ouverts(premier, dernier)).ok()?;
         Some(v)
     }) {
         Some(v) => v,
@@ -1200,7 +1201,7 @@ pub fn close_range(premier: u64, dernier: u64, drapeaux: u64) -> i64 {
     };
     for fd in ouverts {
         if drapeaux & CLOSE_RANGE_CLOEXEC != 0 {
-            processus::avec(|p| p.descripteurs.get_mut(fd).map(|d| d.fermer_a_l_exec = true));
+            processus::descripteurs(|t| t.get_mut(fd).map(|d| d.fermer_a_l_exec = true));
         } else {
             let _ = fermer_descripteur(fd);
         }
@@ -2021,14 +2022,17 @@ pub fn access(adresse: u64, droits: u64) -> i64 {
 
 /// Un second descripteur pour le fichier tenu `f`, au plus petit numéro
 /// libre à partir de `minimum` (dup, F_DUPFD) : réservé, le fichier tenu
-/// une fois de plus et installé, dans une seule section du processus,
+/// une fois de plus et installé, dans une seule section de la table des
+/// descripteurs, sous le verrou des fichiers (l'ordre de processus.rs),
 /// comme le `f_dupfd` de Linux sous le verrou de sa table. EMFILE, ENOMEM.
 fn dupliquer(f: &FichierTenu, minimum: u64, fermer_a_l_exec: bool) -> i64 {
-    let r = processus::avec(|p| {
-        let fd = p.descripteurs.reserver(minimum)?;
-        vfs::avec_systeme(|s, _| s.ouverts.prendre(f.fichier));
-        p.descripteurs.installer(fd, Descripteur { fichier: f.fichier, fermer_a_l_exec });
-        Ok(fd)
+    let r = vfs::avec_systeme(|s, _| {
+        processus::descripteurs(|d| {
+            let fd = d.reserver(minimum)?;
+            s.ouverts.prendre(f.fichier);
+            d.installer(fd, Descripteur { fichier: f.fichier, fermer_a_l_exec });
+            Ok(fd)
+        })
     });
     match r {
         Ok(fd) => fd as i64,
@@ -2041,21 +2045,24 @@ fn dupliquer(f: &FichierTenu, minimum: u64, fermer_a_l_exec: bool) -> i64 {
 /// était ouvert, il est remplacé d'un coup, puis son fichier lâché (le
 /// `do_dup2` de Linux) : pas d'instant où le numéro est libre, et si la
 /// table ne peut pas grandir (ENOMEM), l'ancien reste ouvert. Tout est
-/// fait sous le verrou du processus, avec les numéros comme Linux (pas un
+/// fait sous le verrou des descripteurs (et celui des fichiers, pour tenir
+/// le fichier une fois de plus), avec les numéros comme Linux (pas un
 /// fichier tenu) : dans l'ordre de `ksys_dup3`, un `nouveau` au-delà de la
 /// limite, EBADF ; un `ancien` fermé, EBADF ; la table qui ne grandit pas,
 /// ENOMEM ; un `nouveau` réservé par un appel en cours d'un autre fil,
-/// EBUSY. Le fichier remplacé est lâché hors du verrou du processus (le
-/// fermer peut rendre des pages).
+/// EBUSY. Le fichier remplacé est lâché hors des deux verrous (le fermer
+/// peut rendre des pages).
 fn installer_copie(ancien: u64, nouveau: u64, fermer_a_l_exec: bool) -> i64 {
-    let r = processus::avec(|p| {
-        if nouveau >= p.descripteurs.limite.0 {
-            return Err(-EBADF);
-        }
-        let d = p.descripteurs.get(ancien).ok_or(-EBADF)?;
-        let remplace = p.descripteurs.remplacer(nouveau, Descripteur { fichier: d.fichier, fermer_a_l_exec }).map_err(errno_table)?;
-        vfs::avec_systeme(|s, _| s.ouverts.prendre(d.fichier));
-        Ok(remplace)
+    let r = vfs::avec_systeme(|s, _| {
+        processus::descripteurs(|t| {
+            if nouveau >= t.limite.0 {
+                return Err(-EBADF);
+            }
+            let d = t.get(ancien).ok_or(-EBADF)?;
+            let remplace = t.remplacer(nouveau, Descripteur { fichier: d.fichier, fermer_a_l_exec }).map_err(errno_table)?;
+            s.ouverts.prendre(d.fichier);
+            Ok(remplace)
+        })
     });
     match r {
         Ok(remplace) => {
@@ -2094,7 +2101,7 @@ pub fn dup3(ancien: u64, nouveau: u64, drapeaux: u64) -> i64 {
 /// dup2(ancien, nouveau).
 pub fn dup2(ancien: u64, nouveau: u64) -> i64 {
     if ancien as u32 == nouveau as u32 {
-        return match processus::avec(|p| p.descripteurs.get(ancien)) {
+        return match processus::descripteurs(|d| d.get(ancien)) {
             Some(_) => nouveau as u32 as i64,
             None => -EBADF,
         };
@@ -2155,7 +2162,7 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
     }
     match commande {
         F_DUPFD | F_DUPFD_CLOEXEC => {
-            let (minimum, limite) = (argument as u32 as u64, processus::avec(|p| p.descripteurs.limite.0));
+            let (minimum, limite) = (argument as u32 as u64, processus::descripteurs(|d| d.limite.0));
             if minimum >= limite {
                 return -EINVAL;
             }
@@ -2163,7 +2170,7 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
         }
         F_GETFD => d.fermer_a_l_exec as i64,
         F_SETFD => {
-            processus::avec(|p| p.descripteurs.get_mut(fd).map(|d| d.fermer_a_l_exec = argument & FD_CLOEXEC != 0));
+            processus::descripteurs(|t| t.get_mut(fd).map(|d| d.fermer_a_l_exec = argument & FD_CLOEXEC != 0));
             0
         }
         F_GETFL => d.drapeaux as i64,
@@ -2325,7 +2332,7 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
     }
     match requete as u32 as u64 {
         FIOCLEX | FIONCLEX => {
-            processus::avec(|p| p.descripteurs.get_mut(fd).map(|d| d.fermer_a_l_exec = requete as u32 as u64 == FIOCLEX));
+            processus::descripteurs(|t| t.get_mut(fd).map(|d| d.fermer_a_l_exec = requete as u32 as u64 == FIOCLEX));
             0
         }
         FIONBIO => {

@@ -11,10 +11,12 @@
 //!     position (fork en fera autant, en 6l). Il vit tant qu'on le tient
 //!     (un compteur), dans une table du noyau (`Ouverts`) ;
 //!   - le DESCRIPTEUR : un petit nombre propre à un processus (la
-//!     `files_struct` de Linux), qui désigne un fichier ouvert, avec un
-//!     seul drapeau à lui, « fermer à l'exec » (FD_CLOEXEC). Le plus petit
-//!     numéro libre est toujours pris, comme le veut POSIX : c'est ce qui
-//!     permet le vieux `close(1); open(...)` des shells.
+//!     `files_struct` de Linux, dans l'entrée du processus sous son propre
+//!     verrou, le `file_lock` : processus.rs, `descripteurs`), qui désigne
+//!     un fichier ouvert, avec un seul drapeau à lui, « fermer à l'exec »
+//!     (FD_CLOEXEC). Le plus petit numéro libre est toujours pris, comme le
+//!     veut POSIX : c'est ce qui permet le vieux `close(1); open(...)` des
+//!     shells.
 //! Un appel système qui se sert d'un descripteur TIENT son fichier ouvert
 //! jusqu'à sa fin (appels_fichiers::FichierTenu, le `fdget` de Linux) : un
 //! autre fil du programme peut fermer le descripteur pendant ce temps, le
@@ -397,6 +399,14 @@ impl Drop for Descripteurs {
     /// prend aucun verrou.
     fn drop(&mut self) {
         self.fermer_tous();
+    }
+}
+
+impl Default for Descripteurs {
+    /// Une table vide : ce que `fil_termine` laisse à la place de celle du
+    /// processus qui finit (`core::mem::take`).
+    fn default() -> Descripteurs {
+        Descripteurs::new()
     }
 }
 

@@ -29,16 +29,35 @@
 //! perdaient, et les fautes de page de tous les fils se suivaient une à
 //! une. Le reste (descripteurs, signaux, dossier courant, fils) ne tient
 //! son verrou que le temps de lire ou changer un champ : il reste un
-//! verrou court, comme les `file_lock`, `siglock` et `fs->lock` de Linux.
-//! Ordre des verrous : ceux qui dorment d'abord, jamais sous un verrou
-//! court (les verrous d'un fichier, sa position et son écriture,
-//! appels_fichiers.rs, puis la mémoire : write copie sous le premier, et sa
-//! copie peut fauter) ; puis les courts, celui du processus, celui des
-//! tables de pages (memoire.rs), celui des fichiers, dans cet ordre quand
-//! on en tient plusieurs (une faute dans une projection de fichier prend
-//! celui des fichiers sous celui des tables, jamais l'inverse). La même
-//! règle des copies vaut pour la mémoire : une copie qui faute sous elle la
-//! redemanderait (voir faute_de_page.rs).
+//! verrou court, comme les `siglock` et `fs->lock` de Linux. Les
+//! DESCRIPTEURS (6j) ont le leur, dans l'`Entree`, le dernier de l'ordre :
+//! le `file_lock` de la `files_struct` de Linux.
+//!
+//! L'ORDRE DES VERROUS, total depuis 6j (deux processeurs qui prennent deux
+//! verrous dans deux ordres s'attendent l'un l'autre pour toujours ; un
+//! seul processeur ne le pouvait pas : le premier verrou coupait les
+//! interruptions, et l'autre ordre n'avait pas lieu entre-temps) :
+//!   1. ceux qui dorment, jamais sous un verrou court : les verrous d'un
+//!      fichier, sa position et son écriture (appels_fichiers.rs), puis la
+//!      mémoire du processus (write copie sous le premier, et sa copie peut
+//!      fauter, ce qui prend la mémoire) ;
+//!   2. le verrou du PROCESSUS (`avec`, `avec_pid`) ;
+//!   3. celui des tables de pages (memoire.rs) ;
+//!   4. celui des FICHIERS (vfs.rs) : le dossier de départ d'une résolution
+//!      et getcwd le prennent sous le processus, une faute dans une
+//!      projection de fichier sous les tables ;
+//!   5. la table des processus (TABLE), celle des tâches (tache::TOUTES) et
+//!      le verrou des DESCRIPTEURS d'un processus : pris seuls ou sous les
+//!      précédents, jamais l'un sous l'autre.
+//! La vue de /proc, sous celui des fichiers, lisait jusqu'à 6i les
+//! descripteurs d'un processus (fd/) et ses fils (task/) sous le verrou du
+//! processus : l'autre ordre. Elle les lit maintenant par les verrous du
+//! niveau 5 seuls (`descripteurs_du_pid`, `pour_chaque_fil`), comme Linux,
+//! dont `fget_task` lit la table d'un autre processus sans son verrou (par
+//! RCU) et dont /proc parcourt les fils par la liste des tâches ; `avec` et
+//! `avec_pid` refusent d'être appelés sous celui des fichiers (un
+//! `assert!`). La règle des copies vaut aussi pour la mémoire : une copie
+//! qui faute sous elle la redemanderait (voir faute_de_page.rs).
 
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, Ordering};
@@ -62,8 +81,6 @@ pub struct Processus {
     /// Son numéro (pid), qui est aussi celui de son fil principal et de son
     /// groupe de processus (voir `numero_neuf`).
     pub pid: u32,
-    /// Ses descripteurs de fichiers (la files_struct, descripteurs.rs).
-    pub descripteurs: Descripteurs,
     /// Son dossier courant, d'où partent les chemins relatifs ; et sa
     /// racine (chroot), d'où partent les chemins absolus. Des objets de la
     /// vue de tous les systèmes de fichiers (un dossier courant peut être
@@ -76,7 +93,8 @@ pub struct Processus {
     /// Qui il est, pour les droits des fichiers.
     pub identite: Identite,
     /// Ses limites de ressources (getrlimit, prlimit64), sauf celle des
-    /// descripteurs, que garde leur table (`Descripteurs::limite`).
+    /// descripteurs, que garde leur table (`Descripteurs::limite`, sous le
+    /// verrou des descripteurs : `regler_limite`).
     pub limites: [(u64, u64); LIMITES],
     /// Ses signaux : les actions, et ceux envoyés au processus (signaux.rs).
     pub signaux: Signaux,
@@ -175,26 +193,25 @@ impl Processus {
         code
     }
 
-    /// La limite `ressource` (sous LIMITES).
+    /// La limite `ressource` (sous LIMITES), sauf celle des descripteurs,
+    /// qui vit avec leur table sous leur verrou (`regler_limite` les sert
+    /// toutes).
     pub fn limite(&self, ressource: usize) -> (u64, u64) {
-        if ressource == RLIMIT_NOFILE { self.descripteurs.limite } else { self.limites[ressource] }
+        assert!(ressource != RLIMIT_NOFILE, "la limite des descripteurs est avec leur table");
+        self.limites[ressource]
     }
 
     pub fn changer_limite(&mut self, ressource: usize, limite: (u64, u64)) {
-        if ressource == RLIMIT_NOFILE {
-            self.descripteurs.limite = limite;
-        } else {
-            self.limites[ressource] = limite;
-        }
+        assert!(ressource != RLIMIT_NOFILE, "la limite des descripteurs est avec leur table");
+        self.limites[ressource] = limite;
     }
 }
 
 impl Drop for Processus {
-    /// La fin d'un processus : ses descripteurs fermés, son dossier courant
-    /// et sa racine lâchés. Sa mémoire, à part, se rend d'elle-même
-    /// (memoire.rs), juste avant (`fil_termine`).
+    /// La fin d'un processus : son dossier courant et sa racine lâchés (le
+    /// `exit_fs` de Linux). Sa mémoire et ses descripteurs, à part, se
+    /// rendent d'eux-mêmes juste avant (`fil_termine`).
     fn drop(&mut self) {
-        self.descripteurs.fermer_tous();
         vfs::avec(|fs, cadres| {
             for o in [self.dossier, self.racine] {
                 if let Some(n) = o.tmpfs() {
@@ -211,6 +228,15 @@ impl Drop for Processus {
 pub struct Entree {
     pid: u32,
     processus: Verrou<Option<Processus>>,
+    /// Ses descripteurs de fichiers (la `files_struct` de Linux,
+    /// descripteurs.rs), sous leur propre verrou (le `file_lock`), le
+    /// dernier de l'ordre (voir l'en-tête) : un appel qui tient un fichier
+    /// par son numéro le prend sous celui des fichiers
+    /// (appels_fichiers::tenir), et la vue de /proc lit fd/ par lui, sans
+    /// le verrou du processus. Vide une fois le dernier fil mort
+    /// (`fil_termine`) : un zombie n'a plus de descripteur, comme chez
+    /// Linux.
+    descripteurs: Verrou<Descripteurs>,
     /// Sa mémoire (la mm_struct de Linux, memoire.rs), sous son verrou qui
     /// dort, en lecture et en écriture (le `mmap_lock`, voir l'en-tête).
     /// None une fois son dernier fil mort, comme `processus`.
@@ -282,16 +308,22 @@ impl Entree {
             self.code.store(p.fin_de_groupe.unwrap_or(code), Ordering::Relaxed);
             garde.take()
         };
-        // La mémoire d'abord, puis les descripteurs, comme Linux (`exit_mm`
-        // avant `exit_files`), chacune rendue hors de tout verrou :
-        // interruptions actives. Prendre la mémoire en écriture attend un
-        // lecteur de /proc/<pid>/maps qui la lirait encore.
+        // La mémoire d'abord, puis les descripteurs, puis le dossier courant
+        // et la racine (`fini`), comme Linux (`exit_mm`, `exit_files`,
+        // `exit_fs`), chacun rendu hors de tout verrou : interruptions
+        // actives. Prendre la mémoire en écriture attend un lecteur de
+        // /proc/<pid>/maps qui la lirait encore. La table des descripteurs
+        // est sortie de son verrou (une table vide reste, pour un lecteur de
+        // /proc/<pid>/fd), puis fermée (`Descripteurs::drop`), ce qui prend
+        // celui des fichiers une fois par descripteur.
         // UNIPROCESSEUR : Linux ne prend pas le mmap_lock pour la défaire
         // (`exit_mmap`, quand plus personne ne la tient : `mmput`) ; sur un
         // seul processeur, l'écriture ne fait attendre personne de plus. En
         // 6j.
         let memoire = self.memoire.ecrire().take();
         drop(memoire);
+        let descripteurs = core::mem::take(&mut *self.descripteurs.verrouiller());
+        drop(descripteurs);
         drop(fini);
     }
 
@@ -398,19 +430,19 @@ pub fn initialiser(max: usize) {
     TABLE.verrouiller().try_reserve_exact(max).expect("plus de memoire pour la table des processus");
 }
 
-/// Range un processus neuf dans la table, sans fil encore (son fil
-/// principal le rejoint à sa création, tache::lancer_programme), avec la
-/// tâche courante pour parent ; None si elle est pleine (pas plus de
-/// processus que de tâches), ou le tas.
-pub fn ajouter(processus: Processus, memoire: Memoire, nom: NomCourt) -> Option<Arc<Entree>> {
-    let mut table = TABLE.verrouiller();
-    if table.len() == table.capacity() {
-        return None;
-    }
+/// Range un processus neuf dans la table, avec ses descripteurs, sans fil
+/// encore (son fil principal le rejoint à sa création,
+/// tache::lancer_programme), avec la tâche courante pour parent ; None si
+/// elle est pleine (pas plus de processus que de tâches), ou le tas. Un
+/// processus refusé est rendu (ses descripteurs fermés, son dossier lâché :
+/// le verrou des fichiers) une fois la table rendue : `e` est déclaré avant
+/// `table`, donc détruit après.
+pub fn ajouter(processus: Processus, descripteurs: Descripteurs, memoire: Memoire, nom: NomCourt) -> Option<Arc<Entree>> {
     let identite = processus.identite;
     let e = Arc::new(Entree {
         pid: processus.pid,
         processus: Verrou::new(Some(processus)),
+        descripteurs: Verrou::new(descripteurs),
         memoire: VerrouLE::new(Some(memoire)),
         code: AtomicI32::new(0),
         calcul: AtomicU64::new(0),
@@ -423,6 +455,10 @@ pub fn ajouter(processus: Processus, memoire: Memoire, nom: NomCourt) -> Option<
         lance: crate::temps::maintenant(),
         exe: Verrou::new((Vec::new(), None)),
     }).ok()?;
+    let mut table = TABLE.verrouiller();
+    if table.len() == table.capacity() {
+        return None;
+    }
     table.ajouter_dans_la_place(e.clone());
     Some(e)
 }
@@ -474,16 +510,19 @@ pub fn pid_suivant(depuis: u32) -> Option<u32> {
     TABLE.verrouiller().iter().map(|e| e.pid).filter(|&p| p >= depuis).min()
 }
 
-/// Les fils vivants du processus `pid`, dans l'ordre de leur création (le
-/// principal d'abord, s'il vit), pour /proc/<pid>/task.
+/// Les fils vivants du processus `pid`, dans un ordre quelconque, pour
+/// /proc/<pid>/task (procfs.rs les trie). Par la table des tâches, sans le
+/// verrou du processus : la vue de /proc appelle sous celui des fichiers
+/// (l'ordre de l'en-tête), et Linux aussi parcourt les fils d'un processus
+/// par ses tâches (`next_tid`, sous RCU). Un fil y reste un instant de plus
+/// que dans la liste du processus (de `fil_termine` à la fin de
+/// `tache::terminer`), ce que linux/proc attend.
 pub fn pour_chaque_fil(pid: u32, mut f: impl FnMut(u32)) {
-    if let Some(e) = entree(pid)
-        && let Some(p) = e.processus.verrouiller().as_ref()
-    {
-        for fil in &p.fils {
-            f(fil.tid);
+    crate::tache::pour_chaque(|t| {
+        if t.processus().is_some_and(|e| e.pid == pid) {
+            f(t.tid());
         }
-    }
+    });
 }
 
 /// Retire de la table le zombie `pid`, recueilli (programmes.rs) : son
@@ -496,7 +535,8 @@ pub fn recueillir(pid: u32) -> Option<i32> {
 
 /// Exécute `f` sur le processus de la tâche courante (il y en a toujours
 /// un pendant un appel système), verrou tenu : `f` doit être court, et ne
-/// pas toucher à la mémoire du programme par ses adresses.
+/// pas toucher à la mémoire du programme par ses adresses. Jamais sous le
+/// verrou des fichiers (l'ordre de l'en-tête).
 #[track_caller]
 pub fn avec<R>(f: impl FnOnce(&mut Processus) -> R) -> R {
     essayer_avec(f).expect("appel systeme sans processus en cours")
@@ -511,17 +551,65 @@ pub fn essayer_avec<R>(f: impl FnOnce(&mut Processus) -> R) -> Option<R> {
         return None;
     }
     let e = crate::tache::courante().processus()?;
+    assert!(!vfs::tenu_ici(), "verrou d'un processus pris sous celui des fichiers");
     let mut p = e.processus.verrouiller();
     p.as_mut().map(f)
 }
 
 /// Exécute `f` sur le processus `pid`, s'il est dans la table et vivant
-/// (pas un zombie). None sinon.
+/// (pas un zombie). None sinon. Jamais sous le verrou des fichiers.
 #[track_caller]
 pub fn avec_pid<R>(pid: u32, f: impl FnOnce(&mut Processus) -> R) -> Option<R> {
-    let e = TABLE.verrouiller().iter().find(|e| e.pid == pid)?.clone();
+    let e = entree(pid)?;
+    assert!(!vfs::tenu_ici(), "verrou d'un processus pris sous celui des fichiers");
     let mut p = e.processus.verrouiller();
     p.as_mut().map(f)
+}
+
+/// Exécute `f` sur la table des descripteurs du processus de la tâche
+/// courante, verrou tenu : court. Le dernier verrou de l'ordre : il se
+/// prend sous celui du processus (le dossier de départ d'un appel *at)
+/// comme sous celui des fichiers (appels_fichiers::tenir), jamais
+/// l'inverse.
+#[track_caller]
+pub fn descripteurs<R>(f: impl FnOnce(&mut Descripteurs) -> R) -> R {
+    let e = crate::tache::courante().processus().expect("appel systeme sans processus en cours");
+    let mut d = e.descripteurs.verrouiller();
+    f(&mut d)
+}
+
+/// Comme `descripteurs`, pour le processus `pid` (/proc/<pid>/fd, sous le
+/// verrou des fichiers) : None s'il n'est pas dans la table ; la table
+/// d'un zombie est vide.
+pub fn descripteurs_du_pid<R>(pid: u32, f: impl FnOnce(&mut Descripteurs) -> R) -> Option<R> {
+    let e = entree(pid)?;
+    let mut d = e.descripteurs.verrouiller();
+    Some(f(&mut d))
+}
+
+/// prlimit64 : la limite `ressource` du processus courant, qui devient
+/// `regle` si elle est donnée ; rend l'ancienne, ou Err si la dure serait
+/// relevée sans être root (CAP_SYS_RESOURCE). Celle des descripteurs
+/// (RLIMIT_NOFILE) vit avec leur table, sous le verrou des descripteurs,
+/// que `reserver` tient déjà quand il la lit ; les autres sous celui du
+/// processus. (Linux la lit sans verrou, `rlimit`, un READ_ONCE.)
+pub fn regler_limite(ressource: usize, regle: Option<(u64, u64)>) -> Result<(u64, u64), ()> {
+    let root = avec(|p| p.identite.root());
+    let changer = |limite: &mut (u64, u64)| {
+        let avant = *limite;
+        if let Some(l) = regle {
+            if l.1 > avant.1 && !root {
+                return Err(());
+            }
+            *limite = l;
+        }
+        Ok(avant)
+    };
+    if ressource == RLIMIT_NOFILE {
+        descripteurs(|d| changer(&mut d.limite))
+    } else {
+        avec(|p| changer(&mut p.limites[ressource]))
+    }
 }
 
 /// La garde de la mémoire de son processus que tient (ou attend) la tâche
@@ -610,19 +698,21 @@ pub fn servir_faute(adresse: u64, acces: Acces) -> Option<Result<(), Echec>> {
     Some(lu.as_ref()?.servir(adresse, acces))
 }
 
-/// Le fichier ouvert du descripteur `fd` du processus `pid` (/proc/<pid>/fd).
+/// Le fichier ouvert du descripteur `fd` du processus `pid`
+/// (/proc/<pid>/fd, sous le verrou des fichiers : par celui des
+/// descripteurs seul, jamais celui du processus).
 pub fn descripteur(pid: u32, fd: u64) -> Option<crate::descripteurs::Fichier> {
-    avec_pid(pid, |p| p.descripteurs.get(fd).map(|d| d.fichier)).flatten()
+    descripteurs_du_pid(pid, |d| d.get(fd).map(|d| d.fichier)).flatten()
 }
 
 /// Le plus petit descripteur ouvert du processus `pid` à partir de `depuis`.
 pub fn descripteur_suivant(pid: u32, depuis: u64) -> Option<u64> {
-    avec_pid(pid, |p| p.descripteurs.ouverts(depuis, u64::MAX).next()).flatten()
+    descripteurs_du_pid(pid, |d| d.ouverts(depuis, u64::MAX).next()).flatten()
 }
 
 /// Le nombre de descripteurs ouverts du processus `pid`.
 pub fn nombre_de_descripteurs(pid: u32) -> u64 {
-    avec_pid(pid, |p| p.descripteurs.ouverts(0, u64::MAX).count() as u64).unwrap_or(0)
+    descripteurs_du_pid(pid, |d| d.ouverts(0, u64::MAX).count() as u64).unwrap_or(0)
 }
 
 /// Appelle `f` sur le numéro de chaque processus de la table.

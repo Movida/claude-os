@@ -1101,19 +1101,9 @@ fn prlimit64(pid: u64, ressource: u64, nouvelle: u64, ancienne: u64) -> i64 {
         }
         regle = Some((c, m));
     }
-    let avant = processus::avec(|p| {
-        let avant = p.limite(ressource);
-        if let Some(limite) = regle {
-            if limite.1 > avant.1 && !p.identite.root() {
-                return Err(-EPERM);
-            }
-            p.changer_limite(ressource, limite);
-        }
-        Ok(avant)
-    });
-    let (courante, maximale) = match avant {
+    let (courante, maximale) = match processus::regler_limite(ressource, regle) {
         Ok(a) => a,
-        Err(e) => return e,
+        Err(()) => return -EPERM,
     };
     if ancienne != 0 {
         let mut octets = [0u8; 16];

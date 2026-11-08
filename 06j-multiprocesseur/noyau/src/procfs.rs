@@ -54,18 +54,21 @@
 //! (« aucune limite »).
 //!
 //! Les verrous : une vue de /proc travaille sous le verrou des fichiers
-//! (celui de la résolution des chemins), et y prend celui de la table des
-//! processus, puis d'un processus. L'inverse se fait aussi : le verrou des
-//! fichiers pris sous celui d'un processus, pour le dossier de départ d'une
-//! résolution (appels_fichiers.rs, rendu avant de résoudre) et getcwd ; et
-//! sous la mémoire d'un processus (un verrou qui dort, processus.rs), pour
-//! la faute de page d'une projection et ici `ligne_maps` (le chemin du
-//! fichier d'une zone). Aucun de ces endroits ne résout de chemin ni
-//! n'entre dans une vue de /proc : le verrou d'un processus n'est jamais
-//! pris deux fois.
-//! UNIPROCESSEUR : un `Verrou` coupe les interruptions, ces deux ordres ne
-//! peuvent donc pas s'interbloquer ; avec plusieurs processeurs, il faudra
-//! un ordre total (vfs.rs).
+//! (celui de la résolution des chemins), et n'y lit un processus que par
+//! les verrous du dernier niveau de l'ordre (processus.rs) : la table des
+//! processus (son existence, son identité, son nom, son exécutable), ses
+//! descripteurs sous leur propre verrou (fd/ : `processus::descripteur`),
+//! ses fils par la table des tâches (task/ : `processus::pour_chaque_fil`).
+//! Jamais le verrou du processus : il se prend AVANT celui des fichiers
+//! (le dossier de départ d'une résolution, appels_fichiers.rs, rendu avant
+//! de résoudre ; getcwd), et deux processeurs qui prendraient les deux dans
+//! les deux ordres s'attendraient pour toujours (jusqu'à 6i, la vue le
+//! prenait : sans danger sur un seul processeur, dont le premier `Verrou`
+//! coupait les interruptions). Le verrou des fichiers se prend aussi sous
+//! la mémoire d'un processus (un verrou qui dort, processus.rs), pour la
+//! faute de page d'une projection et ici `ligne_maps` (le chemin du fichier
+//! d'une zone) ; aucun de ces endroits ne résout de chemin ni n'entre dans
+//! une vue de /proc.
 //!
 //! Le contenu d'un fichier est fabriqué à la lecture, par une « source » :
 //! `maps` ligne par ligne (le parcours reprend à l'adresse de fin de la
