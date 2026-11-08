@@ -8,9 +8,13 @@
   // --stop-timeout : à l'arrêt, le serveur Remote Control a jusqu'à 30 s pour ses
   // sessions, puis prévient claude.ai ; les 10 s par défaut le couperaient.
   //
-  // --restart=on-failure : le conteneur repart si son processus principal meurt,
-  // mais pas au démarrage de Docker Desktop, où les montages de WSL peuvent
-  // manquer (voir demarrer-conteneur.sh, qui s'en charge).
+  // --restart=on-failure : le conteneur repart si son processus principal meurt.
+  // Après un arrêt brutal (Windows éteint sans arreter-conteneur.sh), Docker le
+  // prend aussi pour un échec et le relance à son propre démarrage, souvent avant
+  // que les dossiers de WSL soient montés. Ce démarrage-là échoue, ou laisse le
+  // superviseur attendre sans le dépôt ; le service claude-os-conteneur de WSL le
+  // refait ensuite (voir demarrer-conteneur.sh). Après un arrêt propre, Docker ne le
+  // relance pas.
   "runArgs": [
     "--memory=8g",
     "--memory-swap=8g",

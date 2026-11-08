@@ -1,0 +1,34 @@
+# Relance le conteneur de claude-os, et donc son serveur Remote Control, à chaque
+# démarrage de WSL. C'est un service de l'utilisateur dans la distribution WSL du dépôt,
+# pas dans le conteneur. Installation et essai : README.md, à côté.
+#
+# Pourquoi un service de WSL plutôt que la tâche planifiée de Windows d'avant
+# (wsl.exe ... demarrer-conteneur.sh à l'ouverture de session) :
+# - la tâche gardait une fenêtre console ouverte, et vide, tant que Docker ne répondait
+#   pas. Le 8 novembre, elle s'est terminée en 0xC000013A (STATUS_CONTROL_C_EXIT : sa
+#   console fermée ou interrompue) moins d'une minute après l'ouverture de session,
+#   avant d'avoir rien demandé à Docker. Un service n'a pas de fenêtre ;
+# - WSL démarre de toute façon à l'ouverture de session : Docker Desktop y lance son
+#   relais (wsl.exe -d Ubuntu ... docker-desktop-user-distro proxy), et systemd démarre
+#   alors les services de l'utilisateur, à condition que « linger » soit activé ;
+# - il joue aussi quand WSL redémarre sans Windows (après un wsl --shutdown), ce que la
+#   tâche ne voyait pas.
+#
+# Pourquoi pas Restart= : le script réessaie déjà lui-même (15 minutes pour que Docker
+# réponde, une minute pour que le conteneur démarre) et note pourquoi il renonce.
+# Relancer en boucle un conteneur qui ne démarre pas remplirait le journal sans rien
+# réparer.
+#
+# Pourquoi Type=exec et pas oneshot : le démarrage des services de l'utilisateur
+# (default.target) n'attend pas la fin du script, jusqu'à 15 minutes si Docker Desktop
+# tarde ; un script introuvable est tout de même signalé comme un échec.
+
+[Unit]
+Description=claude-os : relancer le conteneur et son serveur Remote Control
+
+[Service]
+Type=exec
+ExecStart=%h/claude-os/.devcontainer/demarrer-conteneur.sh
+
+[Install]
+WantedBy=default.target

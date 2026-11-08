@@ -366,18 +366,36 @@ echo "== l'arret avant d'eteindre Windows et la relance (arreter- et demarrer-co
 # De faux docker, shutdown.exe et sync, qui notent leurs arguments. Le faux Docker a deux
 # conteneurs : c0ffee, celui du dépôt, marqué comme le 7 novembre (local_folder vu de
 # Windows, config_file vu de WSL), et beef, d'un autre dépôt, qui tourne toujours. Son
-# état : absent (il ne répond pas), arrete (c0ffee ne tourne pas), propre (son
-# superviseur sort avec 0) ou tue (Docker l'a tué au bout du délai : 137).
+# état : absent (il ne répond pas), arrete (c0ffee ne tourne pas), propre (c0ffee tourne,
+# et son superviseur sort avec 0 à l'arrêt), tue (Docker l'a tué au bout du délai : 137)
+# ou vide (c0ffee tourne sans le dépôt, démarré par Docker avant le montage). Les
+# fichiers echecs-info et echecs-start disent combien de `docker info` et de `docker
+# start` échouent avant de réussir, avec les erreurs du 8 novembre.
 AC="$T/ac"
 mkdir -p "$AC"
 cat >"$AC/docker" <<'FIN'
 #!/usr/bin/env bash
 echo "$*" >>"$AC_DIR/appels-docker"
 etat=$(cat "$AC_DIR/etat")
+# echoue FICHIER MESSAGE : vrai, MESSAGE sur la sortie d'erreur, tant que FICHIER compte
+# des échecs à venir.
+echoue() {
+    local reste
+    reste=$(cat "$AC_DIR/$1")
+    [ "$reste" -gt 0 ] || return 1
+    echo $((reste - 1)) >"$AC_DIR/$1"
+    echo "$2" >&2
+}
 case $1 in
-    info) [ "$etat" != absent ] ;;
+    info)
+        if [ "$etat" = absent ]; then
+            echo "failed to connect to the docker API at unix:///var/run/docker.sock" >&2
+            exit 1
+        fi
+        ! echoue echecs-info "failed to connect to the docker API at unix:///var/run/docker.sock"
+        ;;
     ps)
-        if [[ " $* " == *" -a "* ]] || [ "$etat" = propre ] || [ "$etat" = tue ]; then
+        if [[ " $* " == *" -a "* ]] || [[ " propre tue vide " == *" $etat "* ]]; then
             echo c0ffee
         fi
         echo beef
@@ -389,33 +407,52 @@ case $1 in
             *local_folder*:beef) echo '\\wsl.localhost\Ubuntu\home\autre\projet' ;;
             *config_file*:beef) echo /home/autre/projet/.devcontainer/devcontainer.json ;;
             *ExitCode*) if [ "$etat" = tue ]; then echo 137; else echo 0; fi ;;
+            *Running*:c0ffee) if [[ " propre tue vide " == *" $etat "* ]]; then echo true; else echo false; fi ;;
         esac
         ;;
-    stop|start) echo "$2" ;;
+    exec) [ "$etat" != vide ] ;;
+    start)
+        if echoue echecs-start "Error response from daemon: failed to create task for container: failed to fulfil mount request: open /run/desktop/mnt/host/wsl/docker-desktop-bind-mounts/Ubuntu/8398: no such file or directory"; then
+            exit 1
+        fi
+        echo "$2"
+        ;;
+    stop) echo "$2" ;;
 esac
 FIN
 printf '#!/usr/bin/env bash\necho "$*" >>"$AC_DIR/appels-shutdown"\n' >"$AC/shutdown"
-printf '#!/usr/bin/env bash\necho sync >>"$AC_DIR/appels-sync"\n' >"$AC/sync"
+# Le faux sync note aussi combien de lignes le journal avait alors.
+printf '#!/usr/bin/env bash\necho sync >>"$AC_DIR/appels-sync"\nwc -l <"$AC_DIR/journal" >>"$AC_DIR/appels-sync"\n' >"$AC/sync"
 chmod +x "$AC/docker" "$AC/shutdown" "$AC/sync"
 DEPOT_REEL=$(cd "$ICI/.." && pwd)
 # Les labels du conteneur du dépôt, tels que les met l'extension Dev Containers.
 DOSSIER_WINDOWS='\\wsl.localhost\Ubuntu'$(printf '%s' "$DEPOT_REEL" | tr / '\\')
 CONFIG_WSL="$DEPOT_REEL/.devcontainer/devcontainer.json"
-# lancer SCRIPT ETAT [OPTION] : les labels viennent de AC_DOSSIER et AC_CONFIG.
+# lancer SCRIPT ETAT [OPTION] : les labels viennent de AC_DOSSIER et AC_CONFIG, les
+# échecs de docker de ECHECS_INFO et ECHECS_START (aucun par défaut). Le journal des
+# scripts de WSL est $AC/journal.
 lancer() {
     local script=$1
     echo "$2" >"$AC/etat"
     shift 2
-    rm -f "$AC"/appels-*
+    rm -f "$AC"/appels-* "$AC/journal"
+    echo "${ECHECS_INFO:-0}" >"$AC/echecs-info"
+    echo "${ECHECS_START:-0}" >"$AC/echecs-start"
     AC_DIR="$AC" AC_DOCKER="$AC/docker" AC_SHUTDOWN="$AC/shutdown" AC_SYNC="$AC/sync" \
-        AC_ATTENTE=0 AC_DOSSIER="$AC_DOSSIER" AC_CONFIG="$AC_CONFIG" \
+        AC_ATTENTE=0 AC_DOSSIER="$AC_DOSSIER" AC_CONFIG="$AC_CONFIG" AC_JOURNAL="$AC/journal" \
         bash "$ICI/$script" "$@" >"$AC/sortie" 2>&1 </dev/null
     code=$?
 }
 arreter() { lancer arreter-conteneur.sh "$@"; }
+demarrer() { lancer demarrer-conteneur.sh "$@"; }
 appel() { grep -qx -- "$2" "$AC/appels-$1" 2>/dev/null; }
 sans_appel() { [ ! -e "$AC/appels-$1" ]; }
 pas_d_appel_docker() { ! grep -qx -- "$1" "$AC/appels-docker" 2>/dev/null; }
+nb_appels_docker() { grep -cx -- "$1" "$AC/appels-docker"; }
+au_journal_wsl() { grep -q -- "$1" "$AC/journal"; }
+compte_au_journal_wsl() { [ "$(grep -c -- "$1" "$AC/journal")" -eq "$2" ]; }
+# Le dernier sync a vu tout le journal : il vient après la dernière ligne.
+sync_apres_le_journal() { [ "$(tail -n 1 "$AC/appels-sync")" -eq "$(wc -l <"$AC/journal")" ]; }
 
 AC_DOSSIER=$DOSSIER_WINDOWS
 AC_CONFIG=$CONFIG_WSL
@@ -425,6 +462,9 @@ verifier "et pas celui d'un autre depot" pas_d_appel_docker "stop beef"
 verifier "puis sync" appel sync sync
 verifier "puis redemarre Windows" appel shutdown "/r /t 0"
 verifier "et le dit" grep -q "arrete proprement" "$AC/sortie"
+verifier "au journal aussi, date" grep -qE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9:]{8} [A-Z+0-9-]+ arreter-conteneur.sh : conteneur c0ffee arrete proprement$' "$AC/journal"
+verifier "jusqu'au redemarrage de Windows" au_journal_wsl "shutdown /r /t 0"
+verifier "et le sync vient apres la derniere ligne" sync_apres_le_journal
 AC_CONFIG=""
 arreter propre
 verifier "trouve par le seul chemin vu de Windows" appel docker "stop c0ffee"
@@ -451,17 +491,53 @@ verifier "pas de conteneur en marche : pas de docker stop" pas_d_appel_docker "s
 verifier "mais sync et l'extinction" sh -c "[ -e '$AC/appels-sync' ] && grep -qx '/s /t 0' '$AC/appels-shutdown'"
 arreter absent --eteindre
 verifier "Docker absent : il le dit" grep -q "Docker ne repond pas" "$AC/sortie"
+verifier "avec la reponse de docker, au journal" au_journal_wsl "failed to connect to the docker API"
+verifier "apres 7 essais" test "$(nb_appels_docker info)" -eq 7
 verifier "et eteint quand meme Windows" appel shutdown "/s /t 0"
+verifier "le journal sur le disque avant" sync_apres_le_journal
+ECHECS_INFO=2 arreter propre --eteindre
+verifier "Docker lent a repondre : il l'attend, puis arrete le conteneur" appel docker "stop c0ffee"
+verifier "et note la premiere erreur et la reussite, pas chaque essai" sh -c "grep -c 'docker info' '$AC/journal' | grep -qx 2"
 arreter propre --nimporte
 verifier "une option inconnue : code 2, rien d'arrete" sh -c "[ $code -eq 2 ] && [ ! -e '$AC/appels-docker' ]"
 
-lancer demarrer-conteneur.sh arrete
+demarrer arrete
 verifier "la relance trouve le conteneur arrete du depot" appel docker "start c0ffee"
+verifier "le note au journal" au_journal_wsl "conteneur c0ffee demarre"
+verifier "et sort avec 0" test "$code" -eq 0
+ECHECS_INFO=3 demarrer arrete
+verifier "Docker lent a repondre : elle l'attend" appel docker "start c0ffee"
+verifier "et note sa reponse d'abord" au_journal_wsl "docker info : failed to connect to the docker API"
+verifier "puis qu'il repond" au_journal_wsl "docker info : reussi"
+demarrer absent
+verifier "Docker absent : 181 essais" test "$(nb_appels_docker info)" -eq 181
+verifier "puis elle renonce, et le dit" au_journal_wsl "Docker ne repond pas : conteneur non demarre"
+verifier "avec la derniere reponse de docker" au_journal_wsl "toujours en echec apres 0 s : failed to connect"
+verifier "et sort avec 1" test "$code" -eq 1
+ECHECS_START=2 demarrer arrete
+verifier "montage pas encore pret (8 novembre) : 3 docker start" test "$(nb_appels_docker "start c0ffee")" -eq 3
+verifier "l'erreur de Docker au journal, une fois" compte_au_journal_wsl "failed to fulfil mount request" 1
+verifier "puis le conteneur demarre" au_journal_wsl "conteneur c0ffee demarre"
+verifier "et elle sort avec 0" test "$code" -eq 0
+ECHECS_START=99 demarrer arrete
+verifier "un docker start qui echoue toujours : 13 essais" test "$(nb_appels_docker "start c0ffee")" -eq 13
+verifier "puis elle le dit" au_journal_wsl "conteneur c0ffee non demarre"
+verifier "et sort avec 1" test "$code" -eq 1
+demarrer propre
+verifier "deja en marche avec le depot : elle le regarde" appel docker "exec c0ffee test -e /workspaces/$(basename "$DEPOT_REEL")/.git"
+verifier "sans l'arreter" pas_d_appel_docker "stop c0ffee"
+verifier "ni le demarrer" pas_d_appel_docker "start c0ffee"
+verifier "et le note" au_journal_wsl "conteneur c0ffee deja en marche"
+demarrer vide
+verifier "en marche sans le depot : elle l'arrete" appel docker "stop c0ffee"
+verifier "puis le demarre" appel docker "start c0ffee"
+verifier "et dit pourquoi" au_journal_wsl "sans le depot dans /workspaces/$(basename "$DEPOT_REEL")"
 AC_DOSSIER='\\wsl.localhost\Ubuntu\home\autre'
 AC_CONFIG=/home/autre/.devcontainer/devcontainer.json
-lancer demarrer-conteneur.sh arrete
-verifier "sans conteneur du depot : elle le dit" grep -q "aucun conteneur pour" "$AC/sortie"
+demarrer arrete
+verifier "sans conteneur du depot : elle le dit" au_journal_wsl "aucun conteneur pour"
 verifier "sans rien relancer" pas_d_appel_docker "start beef"
+verifier "et sort avec 1" test "$code" -eq 1
 
 if [ "$echecs" -eq 0 ]; then
     echo "tout est bon"

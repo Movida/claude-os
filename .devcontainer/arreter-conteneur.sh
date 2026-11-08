@@ -32,14 +32,21 @@
 # garde l'environnement (garder_environnement), et un message dans un fil le réveille.
 #
 # Après un arrêt propre, le conteneur ne repart pas seul (--restart=on-failure ne
-# relance que les échecs) : la tâche planifiée de l'ouverture de session le relance
-# (demarrer-conteneur.sh, README.md).
+# relance que les échecs) : le service claude-os-conteneur de WSL le relance au
+# démarrage suivant de WSL (demarrer-conteneur.sh, README.md).
+#
+# Ce qu'il voit est noté dans ~/.local/state/claude-os/conteneur.log, et sur le disque
+# avant l'extinction (le sync vient après la dernière ligne). Le 7 novembre au soir, le
+# raccourci a lancé l'extinction sans un seul appel à Docker, d'après le journal de
+# Docker Desktop, et rien n'a gardé ce que le script avait vu. La réponse de docker est
+# maintenant notée, et Docker a 30 s pour répondre avant que le script renonce.
 #
 # Les variables AC_* ne servent qu'aux tests (test-remote-control.sh).
 set -u
 
 depot=$(cd "$(dirname "$0")/.." && pwd)
 DOCKER="${AC_DOCKER:-docker}"
+ATTENTE="${AC_ATTENTE:-5}"
 . "$(dirname "$0")/conteneur-du-depot.sh"
 SHUTDOWN="${AC_SHUTDOWN:-shutdown.exe}"
 SYNC="${AC_SYNC:-sync}"
@@ -58,6 +65,9 @@ esac
 # échec est affiché, et la fenêtre attend Entrée pour qu'on ait le temps de le lire.
 finir() {
     local code=$1
+    if [ -n "$ensuite" ]; then
+        noter "puis $SHUTDOWN $ensuite /t 0"
+    fi
     "$SYNC"
     if [ -n "$ensuite" ]; then
         if [ "$code" -ne 0 ] && [ -t 0 ]; then
@@ -68,28 +78,31 @@ finir() {
     exit "$code"
 }
 
-if ! "$DOCKER" info >/dev/null 2>&1; then
-    echo "arreter-conteneur : Docker ne repond pas, aucun conteneur a arreter" >&2
+noter "arret du conteneur demande${1:+ ($1)}"
+# 6 nouveaux essais à 5 s d'écart : 30 s au plus.
+if ! reessayer 7 "$DOCKER" info; then
+    noter "Docker ne repond pas, aucun conteneur a arreter"
     finir 1
 fi
 
 conteneurs=$(conteneurs_du_depot "$depot")
 if [ -z "$conteneurs" ]; then
-    echo "arreter-conteneur : le conteneur de $depot ne tourne pas"
+    noter "le conteneur de $depot ne tourne pas"
     finir 0
 fi
 
 resultat=0
+# Un identifiant par ligne : le découpage en mots est voulu.
 for conteneur in $conteneurs; do
-    echo "arreter-conteneur : arret du conteneur $conteneur (45 s au plus)..."
+    noter "arret du conteneur $conteneur (45 s au plus)..."
     "$DOCKER" stop "$conteneur" >/dev/null
     # Le superviseur sort avec 0 quand le serveur a fini proprement ; 137, c'est que
     # Docker a dû le tuer au bout des 45 s.
     code=$("$DOCKER" inspect -f '{{.State.ExitCode}}' "$conteneur")
     if [ "$code" = 0 ]; then
-        echo "arreter-conteneur : conteneur arrete proprement"
+        noter "conteneur $conteneur arrete proprement"
     else
-        echo "arreter-conteneur : le conteneur s'est arrete avec le code $code (journal : ~/.claude/remote-control.log)" >&2
+        noter "le conteneur $conteneur s'est arrete avec le code $code (journal du superviseur : ~/.claude/remote-control.log)"
         resultat=1
     fi
 done
