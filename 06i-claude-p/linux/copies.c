@@ -263,7 +263,13 @@ static void positions(void)
     long v2 = r(sendfile(b, sysfs, &o, 8));
     o = 0x80000000;
     long v3 = r(sendfile(b, maps, &o, 0));
-    verifier(v2 == -EOVERFLOW && v3 == -EOVERFLOW, "sendfile de /sys, et de /proc pour 0 octet, au-dela de 2^31 - 1 : EOVERFLOW");
+    /* /sys s'arrête à 2^31 - 1 sous Linux 6.18 et chez nous. Sur l'hôte, un
+     * noyau plus récent peut avoir levé sa limite : la fin du fichier, 0
+     * (mesuré : 7.0, celui de la CI, à 2^31 - 1 et à 2^31 ; /proc y garde la
+     * sienne). */
+    int hote = access("/etc/bonjour.txt", F_OK) != 0;
+    verifier((v2 == -EOVERFLOW || (hote && v2 == 0)) && v3 == -EOVERFLOW,
+             "sendfile de /sys, et de /proc pour 0 octet, au-dela de 2^31 - 1 : EOVERFLOW");
     o = 0x7ffffffe;
     verifier(r(sendfile(b, sys, &o, 8)) == 0, "sendfile de /proc/sys a 2^31 - 2 : ramene a 1 octet, rien a lire");
     o = 0;
