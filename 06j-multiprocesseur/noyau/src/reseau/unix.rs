@@ -1037,8 +1037,9 @@ fn attendre_place(s: &Socket, non_bloquant: bool, echeance: Option<u64>, delai: 
         if place() {
             return Ok(());
         }
-        // (`sock_alloc_send_pskb` : SOCKWQ_ASYNC_NOSPACE.)
-        s.asynchrone.marquer_sans_place();
+        // (`sock_alloc_send_pskb` : SOCKWQ_ASYNC_NOSPACE.) La place revue
+        // derrière le drapeau (asynchrone.rs).
+        s.asynchrone.marquer_sans_place(|| !place());
         if non_bloquant {
             return Err(-EAGAIN);
         }
@@ -1905,8 +1906,9 @@ pub fn sonder(s: &Socket) -> u32 {
     if ecrire {
         m |= POLLOUT | POLLWRNORM | POLLWRBAND;
     } else {
-        // (`unix_poll` : SOCKWQ_ASYNC_NOSPACE.)
-        s.asynchrone.marquer_sans_place();
+        // (`unix_poll` : SOCKWQ_ASYNC_NOSPACE.) La place revue derrière
+        // le drapeau (asynchrone.rs).
+        s.asynchrone.marquer_sans_place(|| ecoute || u.envoyes.load(Ordering::SeqCst) * 4 > s.sndbuf.load(Ordering::Relaxed) as usize);
     }
     drop(pair);
     m

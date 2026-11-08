@@ -48,11 +48,16 @@
 //! vérifie rien). Deux exceptions, écrites : la tâche courante (quel que
 //! soit le processeur, c'est toujours « soi-même » : `tache::courante`), et
 //! les compteurs du contexte courant lus interruptions actives (les
-//! verrous tenus, « dans une interruption » : s'ils ne sont pas nuls,
-//! c'est NOUS qui les tenons, et nous ne pouvons pas être déplacés ; s'ils
-//! sont nuls, ils le restent tant que nous ne prenons rien). Ces lectures
-//! passent par `courant_sans_verification`, qui dit pourquoi à chaque
-//! appel.
+//! verrous tenus, « dans une interruption », la préemption : s'ils ne sont
+//! pas nuls, c'est NOUS qui les tenons, et nous ne pouvons pas être
+//! déplacés ; s'ils sont nuls, ils le restent tant que nous ne prenons
+//! rien). Ces lectures-là se font en UNE SEULE instruction gs-relative
+//! (`mov rax, gs:[décalage]`, le `this_cpu_read` de Linux : `courante_brute`,
+//! `tenus_bruts`, `interruptions_en_cours`) : en deux temps (lire gs:[0],
+//! puis le champ de la zone de ce numéro), une préemption entre les deux
+//! suivie d'un déplacement sur un autre processeur ferait lire le champ de
+//! l'ANCIEN processeur, et « la tâche courante » serait celle qui s'exécute
+//! là-bas.
 //!
 //! LE COMPTE DE PRÉEMPTION (le `preempt_count` de Linux). Couper les
 //! interruptions interdit tout, y compris aux périphériques et aux autres
@@ -239,19 +244,61 @@ pub fn sans_preemption<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// Peut-on céder le processeur ici ? Aucun verrou tenu, pas dans une
-/// interruption, préemption permise (le `preemptible()` de Linux).
+/// interruption, préemption permise (le `preemptible()` de Linux). Trois
+/// lectures en une instruction chacune : entre deux, une préemption peut
+/// nous déplacer, mais chaque compteur lu nul le reste pour nous.
 pub fn preemptible() -> bool {
-    let p = courant_sans_verification("les compteurs du contexte courant");
-    p.tenus.load(Ordering::Relaxed) == 0 && p.dans_une_interruption.load(Ordering::Relaxed) == 0 && !preemption_coupee()
+    tenus_bruts() == 0 && interruptions_en_cours() == 0 && !preemption_coupee()
 }
 
-/// La zone de ce processeur, sans vérifier les interruptions : seulement
-/// pour les champs qu'une tâche peut lire interruptions actives sans
-/// risque (voir l'en-tête : la tâche courante, les compteurs du contexte
-/// courant). `pourquoi` le dit, pour qui relit l'appel.
-pub fn courant_sans_verification(pourquoi: &'static str) -> &'static Processeur {
-    let _ = pourquoi;
-    &ZONES_PROCESSEURS.0[numero_brut() as usize]
+/// Lit un champ de 64 bits de la zone de ce processeur en UNE instruction
+/// (voir l'en-tête), interruptions actives ou non.
+///
+/// # Safety
+/// `decalage` doit être celui d'un champ de 64 bits de `Processeur`
+/// (`offset_of!`) que ce processeur peut lire sans ordre particulier.
+unsafe fn lire_gs_u64(decalage: usize) -> u64 {
+    let v: u64;
+    // SAFETY: garanti par l'appelant ; la base de GS est posée avant tout
+    // code qui vient ici.
+    unsafe { asm!("mov {}, gs:[{}]", out(reg) v, in(reg) decalage, options(nostack, readonly, preserves_flags)) };
+    v
+}
+
+/// Comme `lire_gs_u64`, pour un champ de 32 bits.
+///
+/// # Safety
+/// Comme `lire_gs_u64`.
+unsafe fn lire_gs_u32(decalage: usize) -> u32 {
+    let v: u32;
+    // SAFETY: garanti par l'appelant.
+    unsafe { asm!("mov {:e}, gs:[{}]", out(reg) v, in(reg) decalage, options(nostack, readonly, preserves_flags)) };
+    v
+}
+
+/// La tâche courante de ce processeur, en une instruction : lisible
+/// interruptions actives (l'exception de l'en-tête). Nulle avant
+/// `tache::initialiser`.
+pub fn courante_brute() -> *mut Tache {
+    // SAFETY: `courante` est un AtomicPtr, 64 bits, écrit interruptions
+    // coupées par ce processeur (la bascule) : une lecture seule suffit.
+    unsafe { lire_gs_u64(offset_of!(Processeur, courante)) as *mut Tache }
+}
+
+/// Les verrous tenus par le contexte courant, en une instruction (voir
+/// l'en-tête).
+pub fn tenus_bruts() -> u32 {
+    // SAFETY: `tenus` est un AtomicU32, écrit interruptions coupées par ce
+    // processeur.
+    unsafe { lire_gs_u32(offset_of!(Processeur, tenus)) }
+}
+
+/// Le nombre d'interruptions matérielles en cours sur ce processeur, en
+/// une instruction (voir l'en-tête).
+pub fn interruptions_en_cours() -> u32 {
+    // SAFETY: `dans_une_interruption` est un AtomicU32, écrit interruptions
+    // coupées par ce processeur.
+    unsafe { lire_gs_u32(offset_of!(Processeur, dans_une_interruption)) }
 }
 
 /// Le numéro de ce processeur : une valeur qui peut être périmée dès

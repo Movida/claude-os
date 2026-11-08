@@ -1884,8 +1884,9 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
                 return Ok(fait);
             }
         }
-        // (`sk_stream_wait_memory` : SOCKWQ_ASYNC_NOSPACE.)
-        flux(s).asynchrone.marquer_sans_place();
+        // (`sk_stream_wait_memory` : SOCKWQ_ASYNC_NOSPACE.) La place est
+        // revue derrière le drapeau, sous le verrou court de la socket.
+        flux(s).asynchrone.marquer_sans_place(|| g.avec_court(|_, c| c.place == 0));
         if non_bloquant {
             return if fait > 0 { Ok(fait) } else { Err(-EAGAIN) };
         }
@@ -2263,7 +2264,9 @@ pub fn sonder(s: &Socket) -> u32 {
         // Pas écrivable : la connexion devra le savoir (`tcp_poll`, SOCK_NOSPACE), et O_ASYNC aussi.
         if m & POLLOUT == 0 && !c.ecoute && !matches!(c.etat, Some(Etat::SynEnvoye | Etat::SynRecu)) {
             c.sans_place = true;
-            flux(s).asynchrone.marquer_sans_place();
+            // Sous le verrou court, que prend aussi qui rend de la place : la
+            // revue derrière le drapeau trouve le même masque.
+            flux(s).asynchrone.marquer_sans_place(|| masque(c) & POLLOUT == 0);
         }
         m
     })

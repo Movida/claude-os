@@ -193,7 +193,8 @@ pub struct Tache {
     /// Pour un programme : son état x87/SSE, ses sélecteurs (DS, ES, FS,
     /// GS) et sa base de FS, quand il ne s'exécute pas.
     programme: Option<UnsafeCell<EtatProgramme>>,
-    /// Elle s'est terminée : sa pile est à rendre.
+    /// Elle s'est terminée : sa pile est à rendre. Un état publié
+    /// (Release dans `terminer`, lu SeqCst par `est_morte` : voir là).
     morte: AtomicBool,
     /// Une tâche du noyau qui exécute un programme WebAssembly (6h) : ses
     /// minuteries comptent pour le détecteur d'interblocage comme celles
@@ -219,7 +220,8 @@ pub struct Tache {
     /// chaque tic et à chaque bascule, d'après le temps monotone (le TSC
     /// quand il est fiable : le `sum_exec_runtime` de Linux), en anneau 3
     /// ou dans le noyau pour elle. Atomique : le gestionnaire d'horloge le
-    /// compte sans prendre de verrou.
+    /// compte sans prendre de verrou ; un compteur, lu pour sa valeur seule
+    /// (Relaxed).
     calcul: AtomicU64,
     /// Son retard (positif) ou son avance (négative) sur la moyenne des
     /// temps virtuels quand elle a quitté la file des prêtes (ordonnanceur.rs),
@@ -471,9 +473,13 @@ impl Tache {
 
     /// Est-elle morte ?
     pub fn est_morte(&self) -> bool {
-        // Acquire : la paire du Release de `terminer` (son code de sortie
-        // est écrit avant).
-        self.morte.load(Ordering::Acquire)
+        // SeqCst (un simple `mov` sur x86) : c'est une condition de
+        // sommeil lue sans verrou, après « je vais dormir » (attente.rs) ;
+        // `terminer` l'écrit en Release (son code de sortie est écrit
+        // avant), puis réveille derrière une barrière complète : le motif
+        // de Dekker, que le modèle de Rust ne ferme qu'avec une lecture
+        // SeqCst de ce côté-ci.
+        self.morte.load(Ordering::SeqCst)
     }
 
     /// Son processus, pour un programme Linux.
@@ -759,7 +765,7 @@ pub fn sans_faute_servie<R>(f: impl FnOnce() -> R) -> R {
 
 /// Les tâches existent-elles (après `initialiser`) ?
 pub fn en_service() -> bool {
-    !processeur::courant_sans_verification("la tache courante : toujours soi-meme").courante.load(Ordering::Relaxed).is_null()
+    !processeur::courante_brute().is_null()
 }
 
 /// La tâche courante. Lisible interruptions actives : sur quelque
@@ -769,8 +775,9 @@ pub fn courante() -> &'static Tache {
     // SAFETY: la tâche courante du processeur est toujours une tâche
     // vivante : elle ne peut pas être rendue pendant qu'elle s'exécute (sa
     // structure vit tant qu'un Arc la tient : celui de qui l'a créée, et
-    // la tâche inactive pour toujours).
-    unsafe { &*processeur::courant_sans_verification("la tache courante : toujours soi-meme").courante.load(Ordering::Relaxed) }
+    // la tâche inactive pour toujours). Lue en une instruction
+    // (processeur.rs) : c'est ce qui la rend juste interruptions actives.
+    unsafe { &*processeur::courante_brute() }
 }
 
 /// Les valeurs de l'état d'une tâche (`Tache::etat`, le `__state` de

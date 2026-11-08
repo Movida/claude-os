@@ -300,7 +300,8 @@ impl ListeAsync {
 
     /// SOCK_WAKE_SPACE : seulement si quelqu'un a vu qu'il n'y avait plus de place.
     pub fn place(&self) {
-        if self.occupee() && self.sans_place.swap(false, Ordering::Relaxed) {
+        // SeqCst : la paire de `marquer_sans_place`.
+        if self.occupee() && self.sans_place.swap(false, Ordering::SeqCst) {
             self.tuer(SIGIO, Raison::Sortie);
         }
     }
@@ -310,8 +311,18 @@ impl ListeAsync {
         self.tuer(SIGIO, raison);
     }
 
-    pub fn marquer_sans_place(&self) {
-        self.sans_place.store(true, Ordering::Relaxed);
+    /// SOCKWQ_ASYNC_NOSPACE : la place manquait ; `encore_sans_place` le
+    /// revérifie APRÈS que le drapeau est posé, derrière une barrière
+    /// complète (le `set_bit` puis `smp_mb__after_atomic` du `tcp_poll` de
+    /// Linux) : celui qui rend de la place sur un autre processeur lit le
+    /// drapeau après l'avoir rendue (`place`) ; ou bien il le voit, ou bien
+    /// nous voyons sa place, et nous signalons nous-mêmes. Sans cela, la
+    /// place rendue entre le constat et le drapeau ne donnait pas de SIGIO.
+    pub fn marquer_sans_place(&self, encore_sans_place: impl FnOnce() -> bool) {
+        self.sans_place.store(true, Ordering::SeqCst);
+        if !encore_sans_place() {
+            self.place();
+        }
     }
 
     /// Le temps d'une attente de données dans l'appel (`sk_wait_data`).

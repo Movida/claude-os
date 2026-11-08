@@ -438,6 +438,13 @@ impl FileAttente {
     /// une tâche déjà réveillée y reste, et ne compte pas. Un rappel reste,
     /// et dit s'il a réveillé quelqu'un.
     pub fn reveiller(&self, cle: u32, exclusives: usize) {
+        // Une barrière complète avant de lire quoi que ce soit : les rappels
+        // (poll, epoll) lisent ici ce que leur tâche a écrit avant de
+        // s'inscrire ou de réarmer (le masque d'un élément d'epoll), et qui
+        // réveille vient d'écrire la condition : le motif de Dekker des deux
+        // côtés (attente.rs, l'en-tête ; le `smp_mb__after_spinlock` de
+        // Linux sur le verrou de sa `wait_queue_head`).
+        core::sync::atomic::fence(core::sync::atomic::Ordering::SeqCst);
         let mut l = self.liste.verrouiller();
         let mut reste = exclusives;
         let mut precedente: *const EntreeAttente = core::ptr::null();

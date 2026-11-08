@@ -685,7 +685,10 @@ fn tester_verrou_le() {
     static ENTRE: AtomicBool = AtomicBool::new(false);
     static RENDU: AtomicBool = AtomicBool::new(false);
     fn noter(lettre: u8) {
-        let i = PAS.fetch_add(1, Ordering::Relaxed);
+        // AcqRel : « j'ai fait ce pas » est publié à la tâche que le test
+        // lance ensuite (après `attendre_que(PAS == n)`, en Acquire) : le
+        // journal prétend prouver un ordre, l'ordre mémoire doit le tenir.
+        let i = PAS.fetch_add(1, Ordering::AcqRel);
         if let Some(j) = JOURNAL.get(i) {
             j.store(lettre, Ordering::Relaxed);
         }
@@ -717,8 +720,8 @@ fn tester_verrou_le() {
         static DEDANS: AtomicUsize = AtomicUsize::new(0);
         let g = V.lire();
         noter(b'L');
-        DEDANS.fetch_add(1, Ordering::Relaxed);
-        attendre_que(|| DEDANS.load(Ordering::Relaxed) == 2);
+        DEDANS.fetch_add(1, Ordering::AcqRel);
+        attendre_que(|| DEDANS.load(Ordering::Acquire) == 2);
         noter(b'l');
         drop(g);
     }
@@ -742,7 +745,7 @@ fn tester_verrou_le() {
         noter(b'e');
         drop(g);
     });
-    ok &= attendre_que(|| PAS.load(Ordering::Relaxed) == 1);
+    ok &= attendre_que(|| PAS.load(Ordering::Acquire) == 1);
     ok &= lancer(b"verrou-l1", lecteur);
     ok &= attendre_que(|| V.en_attente() == 1);
     ok &= lancer(b"verrou-f", || {
@@ -761,7 +764,7 @@ fn tester_verrou_le() {
     ok &= lancer(b"verrou-l2", lecteur);
     ok &= attendre_que(|| V.en_attente() == 3);
     RENDRE[0].store(true, Ordering::Relaxed);
-    ok &= attendre_que(|| PAS.load(Ordering::Relaxed) == 8);
+    ok &= attendre_que(|| PAS.load(Ordering::Acquire) == 8);
     // 2. Un lecteur ne passe pas devant un écrivain qui attend ; la
     // rétrogradation.
     ok &= lancer(b"verrou-m", || {
@@ -771,23 +774,23 @@ fn tester_verrou_le() {
         noter(b'm');
         drop(g);
     });
-    ok &= attendre_que(|| PAS.load(Ordering::Relaxed) == 9);
+    ok &= attendre_que(|| PAS.load(Ordering::Acquire) == 9);
     ok &= lancer(b"verrou-g", || {
         let g = V.ecrire();
         noter(b'G');
         let g = g.retrograder();
         noter(b'D');
-        attendre_que(|| ENTRE.load(Ordering::Relaxed));
+        attendre_que(|| ENTRE.load(Ordering::Acquire));
         noter(b'd');
-        RENDU.store(true, Ordering::Relaxed);
+        RENDU.store(true, Ordering::Release);
         drop(g);
     });
     ok &= attendre_que(|| V.en_attente() == 1);
     ok &= lancer(b"verrou-n", || {
         let g = V.lire();
         noter(b'N');
-        ENTRE.store(true, Ordering::Relaxed);
-        attendre_que(|| RENDU.load(Ordering::Relaxed));
+        ENTRE.store(true, Ordering::Release);
+        attendre_que(|| RENDU.load(Ordering::Acquire));
         noter(b'n');
         drop(g);
     });
@@ -810,7 +813,7 @@ fn tester_verrou_le() {
     for (l, j) in lu.iter_mut().zip(&JOURNAL) {
         *l = j.load(Ordering::Relaxed);
     }
-    ok &= &lu == b"EeLLllFfMmGDNdn" && PAS.load(Ordering::Relaxed) == 15;
+    ok &= &lu == b"EeLLllFfMmGDNdn" && PAS.load(Ordering::Acquire) == 15;
     afficherln!("[noyau] Verrou qui dort en lecture et ecriture : les lecteurs passent ensemble, un ecrivain qui attend n'est pas double, retrogradation : {} ({}).",
                 if ok { "ok" } else { "ECHEC" }, core::str::from_utf8(&lu).unwrap_or("?"));
 }

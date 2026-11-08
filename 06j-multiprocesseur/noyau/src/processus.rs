@@ -300,8 +300,17 @@ impl Entree {
     /// dernier, le processus est un zombie, et son parent, qui attend
     /// peut-être, est réveillé.
     pub fn fil_disparu(&self) {
-        if self.vivants.fetch_sub(1, Ordering::Relaxed) == 1 {
-            self.zombie.store(true, Ordering::Relaxed);
+        // Le motif de notre Arc (partage.rs) : chaque fil qui disparaît
+        // publie ce qu'il a fait (sa pile rendue) par un Release, et le
+        // dernier, qui voit 1, acquiert tout cela par une barrière Acquire
+        // avant de poser « zombie » : « zombie » publie alors les piles de
+        // TOUS les fils, pas du seul dernier (« memoire rendue » le compte).
+        if self.vivants.fetch_sub(1, Ordering::Release) == 1 {
+            core::sync::atomic::fence(Ordering::Acquire);
+            // Release : le code de sortie et tout le reste sont écrits
+            // avant ; le réveil qui suit porte la barrière complète du motif
+            // de Dekker (tache::reveiller), et `est_zombie` lit en SeqCst.
+            self.zombie.store(true, Ordering::Release);
             if let Some(parent) = self.parent.verrouiller().take() {
                 crate::tache::reveiller(parent, crate::tache::Reveil::Reveillee);
             }
@@ -315,7 +324,9 @@ impl Entree {
 
     /// Est-il un zombie (tous ses fils morts, tout rendu) ?
     pub fn est_zombie(&self) -> bool {
-        self.zombie.load(Ordering::Relaxed)
+        // SeqCst (un `mov` sur x86) : une condition de sommeil du lanceur,
+        // lue sans verrou après « je vais dormir » (voir `Tache::est_morte`).
+        self.zombie.load(Ordering::SeqCst)
     }
 
     pub fn code(&self) -> i32 {

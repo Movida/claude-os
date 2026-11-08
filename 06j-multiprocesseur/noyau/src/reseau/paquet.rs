@@ -78,9 +78,18 @@ impl Retenue {
 
     /// TSQ_THROTTLED : rappeler la socket à la prochaine fin d'émission. Tout a pu
     /// être rendu avant ce drapeau : personne ne le verrait, on se rappelle soi-même.
+    /// Le motif de Dekker (processeur.rs) avec `Proprietaire::rendre` : ici « je pose
+    /// `etranglee`, puis je lis `octets` », là « je rends mes `octets`, puis je lis
+    /// `etranglee` » ; sans SeqCst des deux côtés (un `xchg` pour l'écriture), x86
+    /// laisse la lecture d'`octets` passer devant l'écriture encore dans le tampon :
+    /// la socket voit encore des octets en vol, la fin d'émission ne voit pas le
+    /// drapeau, personne ne rappelle la socket, et TCP attend un minuteur. C'est le
+    /// `smp_mb__after_atomic()` de `tcp_small_queue_check` (« It is possible TX
+    /// completion already happened before we set TSQ_THROTTLED »). Sur un seul
+    /// processeur, invisible.
     pub fn etrangler(&self) {
-        self.etranglee.store(true, Ordering::Relaxed);
-        if self.octets() == 0 && self.etranglee.swap(false, Ordering::Relaxed) {
+        self.etranglee.store(true, Ordering::SeqCst);
+        if self.octets.load(Ordering::SeqCst) == 0 && self.etranglee.swap(false, Ordering::SeqCst) {
             self.rappeler();
         }
     }
@@ -116,9 +125,10 @@ impl Proprietaire {
     /// est jeté.
     pub fn rendre(self) {
         let r = &self.retenue;
-        r.octets.fetch_sub(self.taille, Ordering::Relaxed);
+        // SeqCst : la paire d'`etrangler` (voir là).
+        r.octets.fetch_sub(self.taille, Ordering::SeqCst);
         r.rendu.fetch_max(self.numero, Ordering::Relaxed);
-        if r.etranglee.swap(false, Ordering::Relaxed) {
+        if r.etranglee.swap(false, Ordering::SeqCst) {
             r.rappeler();
         }
     }

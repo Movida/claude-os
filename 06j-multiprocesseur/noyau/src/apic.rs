@@ -84,8 +84,10 @@ const IA32_APIC_BASE: u32 = 0x1B;
 const APIC_EN: u64 = 1 << 11;
 const APIC_EXTD: u64 = 1 << 10;
 
-/// Le numéro de l'APIC de ce processeur (celui que visent les messages
-/// MSI).
+/// Le numéro de l'APIC du PREMIER processeur, celui que visent les messages
+/// MSI (msix.rs) et les entrées de l'IO-APIC : la destination des
+/// périphériques, pas « l'APIC de ce processeur » (chaque processeur a le
+/// sien dans sa zone, processeur.rs, 6j). Une constante du démarrage.
 static ID_APIC: AtomicU8 = AtomicU8::new(0);
 
 /// L'adresse virtuelle des registres (la projection, gardée pour

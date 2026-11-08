@@ -462,10 +462,7 @@ pub fn initialiser() {
 /// gestionnaire, qui ne peut pas être déplacé ; s'il est nul, il le reste
 /// pour nous (l'exception écrite dans processeur.rs).
 pub fn dans_une_interruption() -> bool {
-    crate::processeur::courant_sans_verification("le compte des interruptions du contexte courant")
-        .dans_une_interruption
-        .load(Ordering::Relaxed)
-        != 0
+    crate::processeur::interruptions_en_cours() != 0
 }
 
 /// Appelée par le code commun pour chaque interruption.

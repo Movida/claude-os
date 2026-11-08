@@ -61,10 +61,13 @@ static PRIS: Verrou<[u64; 4]> = Verrou::new([0; 4]);
 struct Gestionnaire {
     fonction: AtomicUsize,
     argument: AtomicUsize,
+    /// Le gestionnaire s'exécute en ce moment (sur un processeur) : `liberer`
+    /// l'attend avant de rendre le vecteur (le `synchronize_irq` de Linux).
+    en_cours: AtomicBool,
 }
 
 static GESTIONNAIRES: [Gestionnaire; 256] =
-    [const { Gestionnaire { fonction: AtomicUsize::new(0), argument: AtomicUsize::new(0) } }; 256];
+    [const { Gestionnaire { fonction: AtomicUsize::new(0), argument: AtomicUsize::new(0), en_cours: AtomicBool::new(false) } }; 256];
 
 /// Donne un vecteur libre, dont l'interruption appellera `fonction(argument)`
 /// (interruptions coupées, avant l'EOI). None : plus aucun libre, ou pas
@@ -83,11 +86,21 @@ pub fn allouer(fonction: fn(usize), argument: usize) -> Option<u8> {
 }
 
 /// Rend le vecteur `v` : son interruption doit déjà être masquée à la
-/// source.
+/// source. Puis attend qu'un gestionnaire de ce vecteur encore en cours sur
+/// un autre processeur ait fini (le `synchronize_irq` de `free_irq`) : le
+/// pilote va rendre l'objet que le gestionnaire reçoit en argument, et un
+/// vecteur redonné ensuite ne doit pas faire appeler l'ancienne fonction
+/// avec le nouvel argument. L'attente se fait verrou rendu, interruptions
+/// actives (verrou.rs, la règle des attentes).
 pub fn liberer(v: u8) {
-    let mut pris = PRIS.verrouiller();
-    GESTIONNAIRES[v as usize].fonction.store(0, Ordering::Release);
-    pris[v as usize / 64] &= !(1 << (v % 64));
+    {
+        let mut pris = PRIS.verrouiller();
+        GESTIONNAIRES[v as usize].fonction.store(0, Ordering::Release);
+        pris[v as usize / 64] &= !(1 << (v % 64));
+    }
+    while GESTIONNAIRES[v as usize].en_cours.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
 }
 
 /// Le nombre de vecteurs encore libres.
@@ -223,9 +236,14 @@ pub fn gerer(vecteur: u8, traiter: impl FnOnce(Source)) {
         // Un vecteur donné à la demande (une MSI-X) : son gestionnaire,
         // puis l'EOI.
         v if APIC.load(Ordering::Relaxed) && gestionnaire(v).is_some() => {
+            let g = &GESTIONNAIRES[v as usize];
+            g.en_cours.store(true, Ordering::Relaxed);
             if let Some((f, argument)) = gestionnaire(v) {
                 f(argument);
             }
+            // Release : ce que le gestionnaire a fait est fini pour qui
+            // attend dans `liberer`.
+            g.en_cours.store(false, Ordering::Release);
             apic::fin_interruption();
         }
         v => {

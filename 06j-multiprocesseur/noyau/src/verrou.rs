@@ -89,7 +89,7 @@ use core::sync::atomic::{AtomicU16, AtomicU32, Ordering};
 /// le reste tant que nous ne prenons rien (l'exception écrite dans
 /// processeur.rs).
 pub fn tenus() -> u32 {
-    processeur::courant_sans_verification("les verrous tenus par le contexte courant").tenus.load(Ordering::Relaxed)
+    processeur::tenus_bruts()
 }
 
 pub struct Verrou<T> {
@@ -140,7 +140,13 @@ impl<T> Verrou<T> {
         if self.proprietaire.load(Ordering::Relaxed) == moi {
             panic!("verrou deja pris par ce processeur : interblocage");
         }
-        let mon = self.prochain.fetch_add(1, Ordering::Relaxed);
+        // SeqCst, pour le modèle de Rust (sur x86, `lock xadd` quel que
+        // soit l'ordre demandé) : une tâche qui a posé « je vais dormir »
+        // (un xchg) puis prend un verrou pour lire sa condition doit voir
+        // ce qu'un autre processeur a écrit sous ce verrou avant de la
+        // réveiller (attente.rs : le motif de Dekker, fermé par deux
+        // barrières complètes).
+        let mon = self.prochain.fetch_add(1, Ordering::SeqCst);
         // Acquire : les écritures faites sous le verrou par le détenteur
         // précédent sont visibles une fois son `servi` (Release) lu.
         let attente = if self.servi.load(Ordering::Acquire) == mon { None } else { Some(self.attendre(mon)) };

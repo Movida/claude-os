@@ -49,7 +49,14 @@ use crate::port;
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// La fréquence mesurée, en kHz ; 0 : pas de TSC fiable.
+/// La fréquence mesurée, en kHz ; 0 : pas de TSC fiable. Écrite en
+/// dernier par l'étalonnage, après MULT et ORIGINE : une constante du
+/// démarrage, que tous les processeurs lisent (Relaxed ; les secondaires
+/// la reçoivent par la poignée de main de leur départ, 6j). Si le TSC
+/// devait être déclassé en marche (un secondaire dont le TSC n'est pas
+/// accordé), ces trois mots changeraient pendant que d'autres lisent
+/// l'heure : il faudrait alors un « seqlock » (le `tk_core.seq` de Linux),
+/// ou un seul mot publié qui désigne une structure immuable.
 static KHZ: AtomicU64 = AtomicU64::new(0);
 /// Le facteur de conversion en nanosecondes (voir l'en-tête).
 static MULT: AtomicU64 = AtomicU64::new(0);

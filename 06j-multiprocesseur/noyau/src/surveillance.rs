@@ -471,7 +471,10 @@ fn deposer(g: &Arc<Groupe>, wd: i32, masque: u32, cookie: u32, nom: &[u8]) {
         f.evenements.ajouter_derriere_dans_la_place(e);
     }
     g.attente.reveiller_une();
-    if g.async_lecteurs.occupee() && !g.a_signaler.swap(true, Ordering::Relaxed) {
+    // AcqRel et Release : le même motif que `a_signaler` d'un tube (tube.rs) :
+    // le chaînage `suivante` n'est réécrit par le prochain gagnant qu'après
+    // avoir été lu par celui qui efface le drapeau.
+    if g.async_lecteurs.occupee() && !g.a_signaler.swap(true, Ordering::AcqRel) {
         let mut tete = tache::courante().instances_a_signaler.verrouiller();
         *g.suivante.verrouiller() = tete.take();
         *tete = Some(g.clone());
@@ -490,7 +493,7 @@ pub fn signaler_les_instances() {
             *tete = g.suivante.verrouiller().take();
             g
         };
-        g.a_signaler.store(false, Ordering::Relaxed);
+        g.a_signaler.store(false, Ordering::Release);
         g.async_lecteurs.tuer(asynchrone::SIGIO, Raison::Entree);
     }
 }

@@ -43,7 +43,7 @@ use crate::faillible::{self, VecFaillible};
 use crate::pages::{self, Page};
 use crate::{espace_utilisateur, processus, signaux, temps, vfs};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Relaxed, Release}};
 use fichiers::tmpfs::Ouvert;
 
 const EPERM: i64 = 1;
@@ -951,7 +951,11 @@ pub fn fichier_ferme(ferme: &FichierOuvert, fichier: Fichier) {
         t.async_lecteurs.retirer(fichier);
         t.async_ecrivains.retirer(fichier);
         let fin = t.fermer_bout(ferme.lecture, ferme.ecriture);
-        if fin && (t.async_lecteurs.occupee() || t.async_ecrivains.occupee()) && !t.a_signaler.swap(true, Relaxed) {
+        // AcqRel : qui gagne ce drapeau va chaîner le tube dans sa liste à
+        // signaler ; celui qui l'efface (Release, plus bas) a d'abord pris
+        // `suivant_ferme` : le prochain gagnant ne doit pas écrire le
+        // chaînage avant que l'ancien l'ait lu.
+        if fin && (t.async_lecteurs.occupee() || t.async_ecrivains.occupee()) && !t.a_signaler.swap(true, AcqRel) {
             let tache = tache::courante();
             let mut tete = tache.tubes_fermes.verrouiller();
             *t.suivant_ferme.verrouiller() = tete.take();
@@ -978,7 +982,7 @@ pub fn signaler_les_fermes() {
             *tete = t.suivant_ferme.verrouiller().take();
             t
         };
-        t.a_signaler.store(false, Relaxed);
+        t.a_signaler.store(false, Release);
         t.async_lecteurs.tuer(asynchrone::SIGIO, Raison::Entree);
         t.async_ecrivains.tuer(asynchrone::SIGIO, Raison::Sortie);
     }

@@ -52,6 +52,12 @@ const PREFIXE: u8 = 8;
 static FILE: Verrou<VecDeque<Paquet>> = Verrou::new(VecDeque::new());
 
 /// Quelqu'un vide la file en ce moment.
+/// Un seul vidage à la fois, pour toute la machine (Acquire/Release : qui
+/// le prend voit la file telle que l'a laissée le précédent). Avec
+/// plusieurs processeurs, la promesse « livré quand sendto revient » demande
+/// que ce soit l'émetteur qui vide ce qu'il a déposé : une file par tâche
+/// émettrice (le `backlog` par processeur de Linux, vidé par son softirq
+/// avant le retour), 6j, avec les files des prêtes par processeur.
 static VIDAGE: AtomicBool = AtomicBool::new(false);
 
 /// L'interface, une fois faite.

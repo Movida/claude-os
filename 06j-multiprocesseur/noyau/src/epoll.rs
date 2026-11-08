@@ -57,7 +57,7 @@ use crate::{cpu, pages, signaux, temps, vfs};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::Relaxed};
+use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::{Relaxed, SeqCst}};
 use fichiers::montages::Objet;
 
 const EPERM: i64 = 1;
@@ -739,10 +739,16 @@ pub fn epoll_ctl(epfd: u64, operation: u64, fd: u64, evenement: u64) -> i64 {
         (EPOLL_CTL_MOD, Some(i)) if elements[i].evenements.load(Relaxed) & EPOLLEXCLUSIVE != 0 => -EINVAL,
         (EPOLL_CTL_MOD, Some(i)) => {
             let x = elements[i].clone();
-            x.evenements.store(evenements, Relaxed);
+            x.evenements.store(evenements, SeqCst);
             x.donnee.store(lu.1, Relaxed);
-            // Les nouveaux événements posés AVANT de sonder : un réveil qui
-            // suit voit l'élément réarmé (`ep_modify`).
+            // Les nouveaux événements posés AVANT de sonder, avec une
+            // barrière complète entre les deux (le `smp_mb()` d'`ep_modify`) :
+            // le motif de Dekker contre le rappel d'un autre processeur, qui
+            // voit le fichier changer d'état puis lit le masque (derrière la
+            // barrière de `FileAttente::reveiller`). Ou bien le rappel voit le
+            // masque réarmé, ou bien la sonde voit l'événement : sinon, le
+            // réarmement d'EPOLLONESHOT par MOD pourrait perdre un réveil.
+            core::sync::atomic::fence(SeqCst);
             if x.sonder(&mut Table::new(None)) != 0 {
                 ep.ranger(&x);
             }
