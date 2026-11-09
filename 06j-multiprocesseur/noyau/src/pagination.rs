@@ -193,7 +193,7 @@ fn suivante(parent: u64, index: usize, droits: u64) -> Option<u64> {
     // SAFETY: `parent` est une de nos tables, créée par nouvelle_table.
     let entree = &mut unsafe { table(parent) }[index];
     if *entree & PRESENTE == 0 {
-        *entree = nouvelle_table()? | PRESENTE | ECRITURE | droits;
+        poser(entree, nouvelle_table()? | PRESENTE | ECRITURE | droits);
     }
     assert!(*entree & GRANDE == 0, "une grande page est deja projetee ici");
     Some(*entree & ADRESSE)
@@ -219,8 +219,25 @@ fn entree(pml4: u64, virtuelle: u64) -> Option<&'static mut u64> {
 /// moitié basse, la page reçoit aussi le bit UTILISATEUR.
 pub fn projeter(pml4: u64, virtuelle: u64, physique: u64, droits: u64) -> Option<()> {
     let u = if virtuelle < MOITIE_HAUTE { UTILISATEUR } else { 0 };
-    *entree(pml4, virtuelle)? = physique | PRESENTE | droits | u;
+    poser(entree(pml4, virtuelle)?, physique | PRESENTE | droits | u);
     Some(())
+}
+
+/// Écrit dans `entree` une entrée présente, `valeur`, après une barrière du
+/// compilateur. La page ou la table que l'entrée désigne vient souvent
+/// d'être remplie (mise à zéro, copiée : `nouvelle_table`, `cadre_neuf`, la
+/// copie à l'écriture, la lecture d'un fichier), par des écritures à un
+/// autre emplacement que l'entrée : rien n'empêchait le compilateur de
+/// les différer après celle de l'entrée. Le processeur, lui, garde l'ordre
+/// des écritures (x86-TSO), et la MMU d'un autre processeur qui lit
+/// l'entrée puis la page verrait sinon une page à moitié remplie. Un reste
+/// de 6a (le `smp_wmb` que Linux met dans `__pte_alloc` et avant ses
+/// `set_pte_at` n'est, sur x86, que cette barrière du compilateur). Pour
+/// toute entrée présente, par uniformité : une barrière du compilateur ne
+/// coûte aucune instruction.
+pub fn poser(entree: &mut u64, valeur: u64) {
+    core::sync::atomic::compiler_fence(Ordering::Release);
+    *entree = valeur;
 }
 
 /// Crée, si elles manquent, les tables qui mènent à la page `virtuelle`,
@@ -343,7 +360,7 @@ fn projeter_2mio(pml4: u64, virtuelle: u64, physique: u64, droits: u64) {
     let pd = suivante(pdpt, index(virtuelle, 2), 0).expect(PLUS_DE_TABLES);
     // SAFETY: `pd` est une de nos tables.
     let pd = unsafe { table(pd) };
-    pd[index(virtuelle, 1)] = physique | PRESENTE | GRANDE | droits;
+    poser(&mut pd[index(virtuelle, 1)], physique | PRESENTE | GRANDE | droits);
 }
 
 /// Le processeur connaît-il le bit NX ? CPUID, feuille 0x80000001, bit 20

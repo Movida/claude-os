@@ -290,7 +290,7 @@ impl EspaceUtilisateur {
                 // Une table neuve : 512 entrées absentes.
                 let nouvelle = cadre_neuf().ok_or(Erreur::PlusDeMemoire)?;
                 self.tables += 1;
-                *e = nouvelle | PRESENTE | pagination::ECRITURE | pagination::UTILISATEUR;
+                pagination::poser(e, nouvelle | PRESENTE | pagination::ECRITURE | pagination::UTILISATEUR);
             }
             table = *e & ADRESSE;
         }
@@ -369,7 +369,7 @@ impl EspaceUtilisateur {
                                                    espace::virtuelle(neuve) as *mut u8, PAGE as usize);
                 }
             }
-            *entree = entree_finale(neuve, droits);
+            pagination::poser(entree, entree_finale(neuve, droits));
             if present {
                 self.invalider(page);
             }
@@ -384,7 +384,7 @@ impl EspaceUtilisateur {
                 pages::lacher(cadre);
             }
         } else {
-            *entree = entree_finale(cadre, droits);
+            pagination::poser(entree, entree_finale(cadre, droits));
             self.invalider(page);
         }
         Ok(Servi::Fait)
@@ -424,7 +424,7 @@ impl EspaceUtilisateur {
         if occupee(*entree) {
             return Err(Erreur::DejaProjetee);
         }
-        *entree = entree_finale(cadre, droits);
+        pagination::poser(entree, entree_finale(cadre, droits));
         self.pages_fichier += 1;
         self.suivre_pic();
         Ok(())
@@ -454,7 +454,7 @@ impl EspaceUtilisateur {
             return Err(Erreur::DejaProjetee);
         }
         let cadre = self.prendre_cadre()?;
-        *entree = entree_finale(cadre, droits);
+        pagination::poser(entree, entree_finale(cadre, droits));
         Ok(cadre)
     }
 
@@ -554,7 +554,7 @@ impl EspaceUtilisateur {
         let mut lot = Lot::new(self.actif());
         parcourir(self.pml4, debut, fin, &mut |visite| {
             if let Visite::Page(adresse, entree) = visite {
-                *entree = entree_finale(*entree & ADRESSE, droits);
+                pagination::poser(entree, entree_finale(*entree & ADRESSE, droits));
                 // Des droits retirés : l'ancienne traduction ne doit plus
                 // servir. Des droits ajoutés : le processeur relirait
                 // l'entrée de lui-même après une faute (manuel d'Intel,
