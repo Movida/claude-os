@@ -53,9 +53,20 @@ avec les commandes données à la fin.
      programme ?), le privilège d'origine (`CS & 3`) et ce qu'on en décide,
      et les registres qui pourraient fuir vers le programme : généraux,
      mais aussi x87/MMX/SSE (`fninit` n'efface pas ST0-ST7) et les bases de
-     FS et GS. Essayer chaque fois depuis un programme : `int n`, `icebp`,
-     TF avant `syscall`, `mov ss` puis `syscall`, NMI injecté par le
-     moniteur QEMU (`nmi`) pendant qu'il tourne.
+     FS et GS. Depuis 6j, une colonne de plus : QUEL GS est chargé à
+     chaque instruction (celui du noyau, avec la zone par processeur, ou
+     celui du programme : `swapgs` fait ou non), et deux lignes de plus
+     pour #DB : celui d'un point d'arrêt matériel sur une donnée lue par
+     `mov ss` juste avant `syscall`, qui frappe la première instruction du
+     noyau, en anneau 0 avec le GS du programme (le chemin « paranoïaque »
+     de interruptions.rs, qui décide d'après le signe du MSR GS_BASE,
+     jamais d'après CS) ; et celui du pas à pas (TF), que `syscall` efface
+     (FMASK) et qui ne frappe donc que la première instruction après
+     `sysretq`, en anneau 3 : le chemin ordinaire, d'après CS, avec la
+     copie de son cadre sur la pile de la tâche. Essayer chaque fois depuis un
+     programme : `int n`, `icebp`, TF avant `syscall`, `mov ss` puis
+     `syscall`, NMI injecté par le moniteur QEMU (`nmi`) pendant qu'il
+     tourne.
    - **Le temps** : une boucle d'appels système coûteux doit, elle aussi,
      épuiser le budget de temps d'un programme. Pas de gros travail
      interruptions coupées (les tics de l'horloge se perdent).
@@ -663,3 +674,120 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   sinon un signal livré pendant la préparation arrive trop tôt, et le test
   échoue sous la charge seulement. Un délai ajouté dans une copie jetable
   rend ces courses certaines.
+
+## Pièges rencontrés en 6j (9 novembre 2026)
+
+- **Les temporaires des motifs gardent un `Verrou`** : la garde prise dans le
+  sujet d'un `match`, d'un `if let` ou d'un `while let`
+  (`match X.verrouiller().op() { ... }`) vit jusqu'à la fin du bloc entier,
+  interruptions coupées ; ce que le bloc fait ensuite (vider un lot de TLB,
+  rendre une pile) attend alors les autres processeurs interruptions
+  coupées, et le noyau s'arrête. Écrire `let r = X.verrouiller().op();
+  match r { ... }`. Trois endroits trouvés ainsi en 6j (`memoire::servir`, le
+  rendeur de piles, deux fois) ; `smp::vider_tlb` nomme désormais l'endroit
+  fautif (`#[track_caller]`).
+- **Un test ne doit jamais supposer qu'un réveil ou une tâche neuve
+  préempte la courante** : l'EEVDF la protège jusqu'à sa première échéance
+  (RUN_TO_PARITY), et deux tâches neuves ont des échéances égales que le
+  premier de la liste gagne : un test « la neuve s'exécute dès que le verrou
+  est rendu » passait trois fois au démarrage et échouait dans
+  `tests-qemu`. Construire l'état voulu sans dépendre de ce choix : la
+  tâche s'interdit son propre processeur sous le verrou (l'affinité), et
+  doit être ailleurs à la ligne suivante.
+- **Les tests de temps sous QEMU** : une interruption (un tic : des dizaines
+  de microsecondes sous TCG) au mauvais moment fait manquer une fenêtre de
+  15 µs un démarrage sur dix. Répéter (vingt parties, au moins une gagnée),
+  et mettre les comptes qui varient à la FIN de la ligne attendue (la
+  vérification cherche un préfixe). Et `-cpu qemu64` n'a pas de TSC fiable :
+  l'heure y est au tic, une borne de 25 µs devient « le prochain tic », et
+  deux délais finissent au même tic ; un test de microsecondes doit le voir
+  (`tsc::khz().is_none()`) et le dire au lieu d'échouer.
+- **Un même journal pour deux ordres légitimes** : le réveil fait sous un
+  verrou qui dort prend le processeur dès que le verrou de l'état est rendu
+  (depuis c09), et la lettre notée après le réveil passait derrière celle du
+  réveillé (GNDdn au lieu de GDNdn). Quand l'ordre du journal n'est pas ce
+  que le test prouve, noter la lettre préemption coupée.
+- **Mesurer avant d'éclater un verrou, et la mesure se mesure** :
+  `make verrous-claude-p` a dit que le tas et le générateur ne se disputent
+  pas (moins de cinq attentes par lancement de `claude -p`), que le verrou
+  des tables de pages est le plus attendu (1,4 %), et qu'un verrou du
+  processus était pris par chaque futex pour lire un pid. Et les deux plus
+  longs endroits interruptions coupées étaient l'affichage des statistiques
+  lui-même (30 ms sous son verrou) et chaque message du noyau (7 ms pour
+  cent octets) : un outil de mesure est le premier à relire. Et à
+  remesurer après les corrections : la mesure ne comptait l'attente que du
+  premier verrou d'une série (les files des prêtes au tic, le tas sous un
+  verrou n'étaient pas comptés) ; comptée pour chaque prise, elle a montré
+  que les 256 places de sa table débordaient (76 000 mesures perdues par
+  lancement), et qu'un processeur inactif qui tire d'une file d'une seule
+  tâche (celle qui s'exécute : rien à tirer) prenait pour rien les deux
+  verrous à chaque tic, 7 % des prises de l'ordonnanceur attendues ; une
+  file d'au moins deux, et l'attente retombe à 1 %.
+- **Tourner sans borne coûte** : les verrous qui dorment pris en tournant sur
+  le détenteur, sans borne, ralentissaient les programmes de `tests-qemu`
+  de 15 % (27,5 s au lieu de 23,5, pour un budget de 30 s : le premier
+  échec de la vérification venait de là, sur `passerelle`), par les
+  sections longues (une ligne sur le port série, une copie) ; bornés à
+  25 µs, rien ne se perd. Les lecteurs ne tournent pas (Linux 5.11). Et un
+  budget de `timeout` doit être mesuré avec sa marge : à 27 s pour 30, un
+  tic de plus le fait tomber.
+- **La pile du noyau dépend des choix d'inclusion du compilateur** : ajouter
+  du code ailleurs a fait sortir `chargeur_elf::charger` de son appelant, et
+  la profondeur d'init a pris 800 octets sans qu'une ligne de son chemin
+  change. Lire les cadres dans le binaire (`objdump -d` : les
+  `sub $N, %rsp` par fonction, comparés entre deux noyaux), nommer la tâche
+  la plus profonde dans « Piles du noyau », et chasser les gros objets
+  passés par valeur (un `Processus` de 2 Kio copié trois fois) plutôt que
+  d'espérer de l'inclusion.
+- **Un lot qui ne peut pas se vider sous un verrou doit avoir sa place en
+  place** : un `try_reserve` qui échoue sous le verrou des tables aurait fait
+  vider le lot (attendre les autres processeurs) interruptions coupées, une
+  panique certaine au premier manque de mémoire. Huit cadres dans le lot
+  lui-même (la `mmu_gather` de Linux), et une tranche jamais plus grande
+  que la place ; 64 en place prenaient 3 Kio de pile de trop.
+- **Deux travaux dans l'arbre, un seul à commiter** : la plomberie
+  (`commit.sh`) prend tout le dossier ; pour commiter une correction seule
+  pendant qu'un autre commit est en cours dans l'arbre, restaurer ses
+  fichiers depuis la branche (`git show branche:chemin > chemin`), commiter,
+  puis réappliquer l'autre par son script. Garder chaque changement sous
+  forme de script rejouable (des remplacements exacts, qui refusent un texte
+  absent ou en double, et qui écrivent le fichier à CHAQUE remplacement : un
+  script qui relit l'origine à chaque fois et n'écrit qu'à la fin n'applique
+  que son dernier remplacement, vu en 6j) rend ce va-et-vient sûr.
+- **L'horloge du conteneur** (WSL) avance d'environ une heure sur l'heure
+  réelle : dater les notes d'après l'heure de David, pas d'après `date`.
+- **Avec quatre processeurs virtuels, deux QEMU à la fois restent la
+  limite** du conteneur (8 Go, douze cœurs) ; `make tests-hote` et
+  `make tests-qemu` partagent `programmes.cpio` et les dossiers de
+  compilation : ne rien construire pendant qu'une vérification tourne.
+- **Un test de course doit prouver qu'il mord** : couper le mécanisme qu'il
+  vérifie et le voir dire ECHEC. Le test « TLB périmée » de `fautes` disait
+  ok sans vidage à distance, deux fois : ses fils dormaient dans une
+  barrière de pthread (céder le processeur recharge CR3, ce qui vide le
+  TLB), puis, en tournant, le cadre rendu par `munmap` était repris et mis
+  à zéro par la première allocation venue, et une relecture périmée lisait
+  0 comme une relecture juste. Il a fallu un « puits » (un cadre pris exprès
+  après le munmap) et une valeur neuve dans la page reprojetée. Couper le
+  mécanisme dans le noyau fait aussi tomber le noyau lui-même (ses piles
+  de vmalloc) : ne le couper que pour les programmes, et jouer le test en
+  premier dans l'expérience.
+- **Une assertion de protocole vaut une relecture** : « aucun je-vais-dormir
+  posé quand on prend un verrou qui dort » (le `might_sleep` de Linux),
+  ajoutée pour un constat, a trouvé deux cas que trois relecteurs n'avaient
+  pas vus (une faute dans `futex`, le client DHCP qui affiche ses essais).
+- **Une correction se replie là où sa machinerie existe** : un constat
+  attribué au commit qui a défini une notion (la bascule publie la
+  courante) se corrige dans celui qui l'exploite entre processeurs (la file
+  par processeur) ; au commit visé d'abord, le repli conflictait sur du code
+  qui n'existait pas encore. Et un commit « réparé » peut être fondu dans
+  son parent par la plomberie (le test des vingt parties dans c10) en
+  comparant chaque commit à son parent réel, pas au précédent de la liste.
+- **Le shell en arrière-plan** : `a && b && cmd & q=$!` met TOUTE la liste
+  en arrière-plan (les variables posées par `a` manquent au premier plan) :
+  séparer par `;`. `pgrep -f motif` trouve le shell qui le lance (sa ligne
+  de commande contient le motif) : ancrer (`^make tests-qemu`). Jamais de
+  `pkill` par nom : le classifieur le refuse, et David aussi.
+- **QEMU ne sort pas seul après le démarrage** (le noyau finit en `hlt`) : le
+  « demarrage : N s » de `verifier.sh` est le timeout, pas une durée ;
+  mesurer le moment de la dernière ligne attendue (`chrono.sh`, 54 s en 6j)
+  et mettre DUREE à son double.
