@@ -83,6 +83,16 @@
 //! attente qui dépasse une seconde est dite, avec l'endroit (le
 //! `csd_lock_wait` de débogage de Linux).
 //!
+//! LE VIDAGE DES TLB (`vider_tlb`, le `flush_tlb_mm_range` et le
+//! `flush_tlb_kernel_range` de Linux ; le pourquoi : espace_utilisateur.rs) :
+//! préemption coupée (le `get_cpu()` de Linux : « les autres que moi » ne
+//! doit pas changer de sens), une barrière complète, le masque de l'espace
+//! lu, le vidage local si ce processeur l'a, puis `appeler` sur les autres
+//! processeurs du masque ; le receveur ne vide que s'il a bien cette PML4
+//! chargée (le `f->mm != loaded_mm` de `flush_tlb_func` : il a pu la
+//! quitter depuis la lecture du masque). Une adresse du noyau (pas de PML4)
+//! se vide chez tous.
+//!
 //! LA PANIQUE (`arreter_les_autres`, le `native_stop_other_cpus` de
 //! Linux) : le processeur qui panique envoie l'IPI ARRET à tous les autres
 //! en service, attend une seconde qu'ils se disent arrêtés (`arrete`), puis
@@ -482,14 +492,19 @@ extern "C" fn depart_secondaire(numero: u32) -> ! {
 /// verrou qui dort). Interruptions actives, aucun `Verrou` tenu.
 #[track_caller]
 pub fn appeler(masque: u64, fonction: fn(usize), argument: usize) {
-    assert!(cpu::interruptions_actives(), "appel aux autres processeurs interruptions coupees");
-    assert!(verrou::tenus() == 0, "appel aux autres processeurs un verrou tenu");
+    // L'endroit de l'appel (l'attribut track_caller), lu ici, hors de la
+    // fermeture : pour les messages.
+    let lieu = core::panic::Location::caller();
     processeur::sans_preemption(|| {
         let zone = processeur::courant();
         let cibles = masque & processeur::masque_en_service() & !(1 << zone.numero);
         if cibles == 0 {
+            // Personne à appeler (un seul processeur, le démarrage) : rien
+            // à attendre, donc rien à exiger.
             return;
         }
+        assert!(cpu::interruptions_actives(), "appel aux autres processeurs interruptions coupees ({}:{})", lieu.file(), lieu.line());
+        assert!(verrou::tenus() == 0, "appel aux autres processeurs un verrou tenu ({}:{})", lieu.file(), lieu.line());
         zone.appel.fonction.store(fonction as usize, Ordering::Relaxed);
         zone.appel.argument.store(argument, Ordering::Relaxed);
         // Release : la fonction et l'argument avant le masque, que les
@@ -506,7 +521,6 @@ pub fn appeler(masque: u64, fonction: fn(usize), argument: usize) {
             core::hint::spin_loop();
             if !dit && tsc::khz().is_some_and(|khz| tsc::lire().wrapping_sub(debut) > khz * 1000) {
                 dit = true;
-                let lieu = core::panic::Location::caller();
                 crate::console::urgence(format_args!(
                     "[smp] {}:{} : le processeur {} attend depuis plus d'une seconde la reponse des processeurs {:#x}\n",
                     lieu.file(), lieu.line(), zone.numero, zone.appel.cibles.load(Ordering::Relaxed)));
@@ -542,8 +556,86 @@ pub fn recevoir_appel() {
         // le masque (Release) que nous venons de lire (Acquire).
         let f = unsafe { core::mem::transmute::<usize, fn(usize)>(f) };
         f(appel.argument.load(Ordering::Relaxed));
+        processeur::courant().appels_recus.fetch_add(1, Ordering::Relaxed);
         appel.cibles.fetch_and(!moi, Ordering::Release);
     }
+}
+
+/// Une demande de vidage des TLB, lue par les receveurs : l'espace (sa
+/// PML4 ; 0 : des adresses du noyau, pour tous), les pages, ou « tout ».
+struct DemandeVidage {
+    pml4: u64,
+    pages: *const u64,
+    nombre: usize,
+    tout: bool,
+}
+
+/// Vide les TLB de `pages` (ou de tout, `tout`) de l'espace `pml4` (None :
+/// des adresses du noyau) sur les processeurs du `masque` (None : tous ceux
+/// en service) : ici, puis chez les autres par `appeler` (voir l'en-tête).
+/// Interruptions actives, aucun verrou court tenu, si d'autres
+/// processeurs sont concernés.
+#[track_caller]
+pub fn vider_tlb(pml4: Option<u64>, masque: Option<&AtomicU64>, pages: &[u64], tout: bool) {
+    let lieu = core::panic::Location::caller();
+    processeur::sans_preemption(|| {
+        let moi = 1u64 << processeur::courant().numero;
+        // Le motif de Dekker (espace_utilisateur.rs) : les entrées des
+        // tables sont écrites ; une barrière complète avant de lire le
+        // masque, la paire du `fetch_or` de qui charge l'espace.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let cibles = match masque {
+            Some(m) => m.load(Ordering::Acquire),
+            None => processeur::masque_en_service(),
+        };
+        if cibles & moi != 0 {
+            vider_ici(pages, tout);
+        }
+        let autres = cibles & !moi & processeur::masque_en_service();
+        if autres != 0 {
+            if !cpu::interruptions_actives() {
+                let t = tache::courante();
+                let nom = t.nom();
+                crate::console::urgence(format_args!("[smp] vidage a distance interruptions coupees depuis {}:{}, tache {} (tid {}), {} verrou(s)\n",
+                    lieu.file(), lieu.line(), core::str::from_utf8(nom.octets()).unwrap_or("?"), t.tid(), verrou::tenus()));
+            }
+            let demande = DemandeVidage { pml4: pml4.unwrap_or(0), pages: pages.as_ptr(), nombre: pages.len(), tout };
+            appeler(autres, vider_a_distance, &demande as *const DemandeVidage as usize);
+        }
+    });
+}
+
+/// Vide les TLB de tous les processeurs pour des adresses du noyau
+/// (`pages` ; tout le TLB au-delà de 33 pages, comme pour un espace) : une
+/// pile de tâche rendue, une projection rendue (vmalloc.rs).
+#[track_caller]
+pub fn vider_tlb_noyau(pages: &[u64]) {
+    vider_tlb(None, None, pages, pages.len() > 33);
+}
+
+fn vider_ici(pages: &[u64], tout: bool) {
+    if tout {
+        pagination::vider_tlb();
+    } else {
+        for &p in pages {
+            pagination::invalider(p);
+        }
+    }
+}
+
+/// Le vidage demandé par un autre processeur (`recevoir_appel`,
+/// interruptions coupées) : seulement si cette PML4 est celle qu'on a
+/// chargée (ou pour des adresses du noyau).
+fn vider_a_distance(demande: usize) {
+    // SAFETY: `vider_tlb` attend la fin de l'appel avant de rendre la
+    // demande, sur sa pile ; les pages de même.
+    let d = unsafe { &*(demande as *const DemandeVidage) };
+    if d.pml4 != 0 && pagination::courante() != d.pml4 {
+        return;
+    }
+    // SAFETY: comme ci-dessus.
+    let pages = unsafe { core::slice::from_raw_parts(d.pages, d.nombre) };
+    vider_ici(pages, d.tout);
 }
 
 

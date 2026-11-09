@@ -241,6 +241,11 @@ pub struct Entree {
     /// dort, en lecture et en écriture (le `mmap_lock`, voir l'en-tête).
     /// None une fois son dernier fil mort, comme `processus`.
     memoire: VerrouLE<Option<Memoire>>,
+    /// Les processeurs qui ont chargé l'espace de sa mémoire (le
+    /// `mm_cpumask` de Linux), partagé avec elle (espace_utilisateur.rs) :
+    /// ici, lisible sans le verrou qui dort, pour la bascule (tache.rs,
+    /// `charger_espace`), qui met et retire le bit de son processeur.
+    processeurs: Arc<crate::espace_utilisateur::MasqueProcesseurs>,
     code: AtomicI32,
     /// Son temps de calcul, en nanosecondes : celui de tous ses fils,
     /// vivants et morts, compté avec celui de chaque fil (tache.rs), sans
@@ -283,6 +288,11 @@ pub struct Entree {
 }
 
 impl Entree {
+    /// Les processeurs qui ont chargé son espace (voir le champ).
+    pub fn processeurs(&self) -> &crate::espace_utilisateur::MasqueProcesseurs {
+        &self.processeurs
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -437,13 +447,15 @@ pub fn initialiser(max: usize) {
 /// processus refusé est rendu (ses descripteurs fermés, son dossier lâché :
 /// le verrou des fichiers) une fois la table rendue : `e` est déclaré avant
 /// `table`, donc détruit après.
-pub fn ajouter(processus: Processus, descripteurs: Descripteurs, memoire: Memoire, nom: NomCourt) -> Option<Arc<Entree>> {
+pub fn ajouter(processus: Processus, descripteurs: Descripteurs, mut memoire: Memoire, nom: NomCourt) -> Option<Arc<Entree>> {
     let identite = processus.identite;
+    let processeurs = memoire.processeurs();
     let e = Arc::new(Entree {
         pid: processus.pid,
         processus: Verrou::new(Some(processus)),
         descripteurs: Verrou::new(descripteurs),
         memoire: VerrouLE::new(Some(memoire)),
+        processeurs,
         code: AtomicI32::new(0),
         calcul: AtomicU64::new(0),
         vivants: AtomicU32::new(0),

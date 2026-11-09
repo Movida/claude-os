@@ -137,6 +137,17 @@ pub struct Processeur {
     /// Ce processeur s'est arrêté pour de bon (la panique, smp.rs) : celui
     /// qui panique attend que tous les autres le disent.
     pub arrete: AtomicBool,
+    /// Le nombre de demandes d'autres processeurs qu'il a exécutées
+    /// (smp::recevoir_appel ; les « Function call interrupts » de
+    /// /proc/interrupts chez Linux) : pour le test du vidage des TLB.
+    pub appels_recus: AtomicU32,
+    /// Le masque des processeurs de l'espace qu'il a chargé (CR3), où il a
+    /// mis son bit (tache.rs, `charger_espace` ; espace_utilisateur.rs) ;
+    /// nul pour la PML4 du noyau. Un pointeur brut : le masque vit dans un
+    /// Arc que tient l'entrée du processus de la tâche qui s'exécute ici
+    /// (ou qui vient de le quitter, dans la même bascule), tant que le bit
+    /// y est.
+    pub espace_charge: AtomicPtr<crate::espace_utilisateur::MasqueProcesseurs>,
     /// La tâche qui s'exécute sur ce processeur (le `current` de Linux).
     pub courante: AtomicPtr<Tache>,
     /// Sa tâche inactive, celle qui prend le processeur quand aucune autre
@@ -174,6 +185,8 @@ impl Processeur {
             besoin_de_ceder: AtomicU32::new(0),
             appel: Appel { fonction: AtomicUsize::new(0), argument: AtomicUsize::new(0), cibles: AtomicU64::new(0) },
             arrete: AtomicBool::new(false),
+            appels_recus: AtomicU32::new(0),
+            espace_charge: AtomicPtr::new(core::ptr::null_mut()),
             courante: AtomicPtr::new(core::ptr::null_mut()),
             inactive: AtomicPtr::new(core::ptr::null_mut()),
             a_rendre: AtomicPtr::new(core::ptr::null_mut()),

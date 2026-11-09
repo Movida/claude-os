@@ -244,16 +244,26 @@ impl Pile {
 impl Drop for Pile {
     fn drop(&mut self) {
         let pml4 = pagination::pml4_noyau();
+        // Oublier les traductions AVANT de rendre les cadres : sinon une
+        // écriture par une traduction restée en cache irait dans un cadre
+        // déjà donné à quelqu'un d'autre. Sur TOUS les processeurs
+        // (smp::vider_tlb_noyau) : un autre a pu exécuter cette tâche, et
+        // garder une traduction de sa pile (les adresses du noyau sont les
+        // mêmes dans tous les espaces). Le rendeur (tache.rs) rend les piles
+        // interruptions actives, sans verrou : il peut attendre les autres.
+        const PAGES: usize = (TAILLE_PILE / PAGE) as usize;
+        let (mut adresses, mut cadres) = ([0u64; PAGES], [0u64; PAGES]);
+        let mut n = 0;
         for v in (self.bas()..self.haut()).step_by(PAGE as usize) {
             if let Some(cadre) = pagination::retirer(pml4, v) {
-                // Oublier la traduction AVANT de rendre le cadre : sinon une
-                // écriture par une traduction restée en cache irait dans un
-                // cadre déjà donné à quelqu'un d'autre. Les autres espaces
-                // n'ont pas de traduction de cette page en cache : chaque
-                // changement de CR3 vide le cache (pas de pages globales).
-                pagination::invalider(v);
-                pages::liberer(cadre, 0);
+                adresses[n] = v;
+                cadres[n] = cadre;
+                n += 1;
             }
+        }
+        crate::smp::vider_tlb_noyau(&adresses[..n]);
+        for &c in &cadres[..n] {
+            pages::liberer(c, 0);
         }
         REGION.verrouiller().piles_libres.ajouter_dans_la_place(self.case);
     }
@@ -365,7 +375,18 @@ impl Drop for Projection {
         for i in 0..self.projetees {
             // Les pages projetées ne sont pas à nous : rien à rendre au buddy.
             let _ = pagination::retirer(pml4, self.debut + i * PAGE);
-            pagination::invalider(self.debut + i * PAGE);
+        }
+        // Les traductions oubliées par tous les processeurs (voir
+        // Pile::drop) : page par page jusqu'à 33, tout le TLB au-delà.
+        let mut adresses = [0u64; 33];
+        let n = (self.projetees as usize).min(adresses.len());
+        for (i, a) in adresses[..n].iter_mut().enumerate() {
+            *a = self.debut + i as u64 * PAGE;
+        }
+        if self.projetees as usize > n {
+            crate::smp::vider_tlb(None, None, &[], true);
+        } else {
+            crate::smp::vider_tlb_noyau(&adresses[..n]);
         }
         // La plage et sa garde reviennent à la liste, recollées à leurs
         // voisines.

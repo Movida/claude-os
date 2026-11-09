@@ -449,6 +449,8 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     horloge::attendre_ms(100);
     afficherln!("[noyau] 100 ms plus tard : {} tics comptes.", horloge::tics());
     tester_vecteurs();
+    tester_tlb();
+    tester_remplacement();
     match temps::initialiser() {
         Some((annee, mois, jour, heure, minute, seconde)) => afficherln!(
             "[noyau] Heure (UTC) : {annee:04}-{mois:02}-{jour:02} {heure:02}:{minute:02}:{seconde:02}, de l'horloge CMOS."
@@ -1103,6 +1105,80 @@ fn tester_vecteurs() {
             Err(e) => afficherln!("[noyau] MSI-X de {} : {}.", f.adresse, e),
         }
     }
+}
+
+/// Vérifie le vidage des TLB entre processeurs (6j, espace_utilisateur.rs) :
+/// un espace dont on fait croire que tous les processeurs en service l'ont
+/// chargé (son masque), une page projetée puis retirée : le lot demande le
+/// vidage aux autres processeurs, et chacun l'a reçu (son compte d'appels
+/// reçus a monté : d'au moins un, un autre appel peut tomber en même
+/// temps). Le mécanisme seul : les secondaires ignorent une PML4 qu'ils
+/// n'ont pas chargée.
+fn tester_tlb() {
+    use espace_utilisateur::{EspaceUtilisateur, Lot};
+    if processeur::nombre() < 2 {
+        return;
+    }
+    let ok = |b: bool| if b { "ok" } else { "ECHEC" };
+    let autres = processeur::masque_en_service() & !1;
+    let recus = || -> [u32; processeur::MAX] { core::array::from_fn(|n| processeur::zone(n).appels_recus.load(Ordering::Relaxed)) };
+    let chacun_a_recu = |avant: &[u32; processeur::MAX]| {
+        (1..processeur::MAX).filter(|&n| autres >> n & 1 != 0).all(|n| processeur::zone(n).appels_recus.load(Ordering::Relaxed) >= avant[n] + 1)
+    };
+    let rw = zones::Droits { lecture: true, ecriture: true, execution: false };
+    let e = verrou::Verrou::new(EspaceUtilisateur::creer().expect("plus de memoire"));
+    let page = 0x40_0000;
+    let avant = recus();
+    e.verrouiller().projeter_neuve(page, rw).expect("plus de memoire");
+    e.verrouiller().processeurs().0.store(processeur::masque_en_service(), Ordering::Relaxed);
+    let mut lot = Lot::new(&e.verrouiller());
+    e.verrouiller().retirer_plage(page, page + 4096, true, &mut lot);
+    lot.vider();
+    let simple = chacun_a_recu(&avant);
+    e.verrouiller().processeurs().0.store(0, Ordering::Relaxed);
+    drop(e);
+    afficherln!("[noyau] TLB : une page retiree d'un espace que {} processeurs ont charge : vidage demande aux {} autres, recu par chacun : {}.",
+                processeur::nombre(), processeur::nombre() - 1, ok(simple));
+}
+
+/// Vérifie la marque de la copie à l'écriture (6j, espace_utilisateur.rs,
+/// `jeton_de_marque`) : A écrit une page lue (la page de zéros) et pose sa
+/// marque ; un madvise la retire ; B relit ; C écrit et pose la sienne.
+/// Quand A revient finir, `remplacer` doit refuser (la marque n'est plus
+/// la sienne) ; C, lui, finit. Un seul processeur suffit : c'est un ABA,
+/// pas une course.
+fn tester_remplacement() {
+    use espace_utilisateur::{EspaceUtilisateur, Lot, Servi};
+    let rw = zones::Droits { lecture: true, ecriture: true, execution: false };
+    let mut e = EspaceUtilisateur::creer().expect("plus de memoire");
+    let page = 0x50_0000;
+    let mut rien = None;
+    let lu = matches!(e.servir(page, rw, false, false, &mut rien), Ok(Servi::Fait));
+    let mut page_a = espace_utilisateur::cadre_neuf();
+    let Ok(Servi::Remplacement(mut lot_a, marque_a)) = e.servir(page, rw, true, false, &mut page_a) else {
+        afficherln!("[noyau] Copie a l'ecriture : la premiere ecriture ne pose pas de marque : ECHEC.");
+        return;
+    };
+    // Le madvise : la marque retirée, comme une page.
+    let mut lot = Lot::new(&e);
+    e.retirer_plage(page, page + 4096, false, &mut lot);
+    lot.vider();
+    let relu = matches!(e.servir(page, rw, false, false, &mut rien), Ok(Servi::Fait));
+    let mut page_c = espace_utilisateur::cadre_neuf();
+    let Ok(Servi::Remplacement(mut lot_c, marque_c)) = e.servir(page, rw, true, false, &mut page_c) else {
+        afficherln!("[noyau] Copie a l'ecriture : la seconde ecriture ne pose pas de marque : ECHEC.");
+        return;
+    };
+    lot_a.vider();
+    let a_refuse = matches!(e.remplacer(page, rw, &mut page_a, marque_a), Ok(Servi::ARefaire)) && page_a.is_some();
+    lot_c.vider();
+    let c_finit = matches!(e.remplacer(page, rw, &mut page_c, marque_c), Ok(Servi::Fait)) && page_c.is_none();
+    if let Some(c) = page_a {
+        espace_utilisateur::rendre_cadre(c);
+    }
+    drop(e);
+    afficherln!("[noyau] Copie a l'ecriture : une marque retiree par madvise puis reposee par un autre fil n'est pas prise pour la sienne : {}.",
+                if lu && relu && marque_a != marque_c && a_refuse && c_finit { "ok" } else { "ECHEC" });
 }
 
 /// Vérifie le tas : des collections de Rust de toutes tailles, et un objet

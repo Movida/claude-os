@@ -217,6 +217,10 @@ impl fmt::Display for ZoneDuCode {
     }
 }
 
+/// Les cadres qu'un lot de munmap ou de madvise garde avant de vider les
+/// TLB et de les rendre : 4096 (32 Kio), un vidage par 16 Mio rendus.
+const GRAND_LOT: usize = 4096;
+
 pub struct Memoire {
     /// Les tables de pages, sous leur verrou court (le `page_table_lock`
     /// de Linux) : une faute, qui ne tient la mémoire qu'en lecture, le
@@ -300,15 +304,43 @@ impl Memoire {
                 Ok(_) => {}
                 Err(e) => break Err(e),
             }
-            match self.espace.verrouiller().servir(page, zone.droits, ecriture, zone.fichier.is_some(), &mut neuve) {
+            // Le verrou des tables est rendu à la fin de cette ligne (la
+            // garde est un temporaire de l'appel, pas du `match` : un
+            // temporaire du `match` vivrait jusqu'à sa fin, et le lot d'un
+            // remplacement se viderait verrou tenu).
+            let servi = self.espace.verrouiller().servir(page, zone.droits, ecriture, zone.fichier.is_some(), &mut neuve);
+            match servi {
                 Ok(Servi::Fait) => break Ok(()),
                 // L'entrée du fichier a disparu (raccourci pendant la
-                // faute) : on recommence par lui.
-                Ok(Servi::ARefaire) => {}
+                // faute), ou un autre fil remplace la page : on recommence
+                // par le fichier (l'autre finit en quelques microsecondes,
+                // préemption coupée).
+                Ok(Servi::ARefaire) => core::hint::spin_loop(),
                 Ok(Servi::PageNeuve) => match espace_utilisateur::cadre_neuf() {
                     Some(c) => neuve = Some(c),
                     None => break Err(Echec::PlusDeMemoire),
                 },
+                // La copie à l'écriture : le verrou des tables est rendu
+                // (la garde était celle de l'appel), l'ancienne traduction
+                // vidée sur tous les processeurs qui ont l'espace, puis la
+                // nouvelle page posée si l'entrée n'a pas changé (sinon on
+                // recommence : espace_utilisateur.rs).
+                Ok(Servi::Remplacement(mut lot, marque)) => {
+                    // Préemption coupée de la marque à son remplacement : une
+                    // faute d'un autre fil qui la trouve recommence tant
+                    // qu'elle est là, et une préemption ici l'y laisserait
+                    // une tranche entière (la relecture de 6j). Le vidage
+                    // attend les autres processeurs interruptions actives.
+                    let r = crate::processeur::sans_preemption(|| {
+                        lot.vider();
+                        self.espace.verrouiller().remplacer(page, zone.droits, &mut neuve, marque)
+                    });
+                    match r {
+                        Ok(Servi::Fait) => break Ok(()),
+                        Ok(_) => {}
+                        Err(_) => break Err(Echec::PlusDeMemoire),
+                    }
+                }
                 Err(_) => break Err(Echec::PlusDeMemoire),
             }
         };
@@ -365,8 +397,14 @@ impl Memoire {
             match espace.poser_fichier(page, cadre, zone.droits) {
                 Ok(()) if vfs::page_encore_projetable(fichier, index, cadre) => return Ok(true),
                 // Raccourci entre-temps : l'entrée est retirée (elle tenait
-                // le cadre), et on recommence.
-                Ok(()) => espace.retirer_plage(page, page + PAGE, false),
+                // le cadre), et on recommence. Le lot se vide une fois le
+                // verrou des tables rendu (espace_utilisateur.rs).
+                Ok(()) => {
+                    let mut lot = espace_utilisateur::Lot::new(&espace);
+                    espace.retirer_plage(page, page + PAGE, false, &mut lot);
+                    drop(espace);
+                    drop(lot);
+                }
                 Err(Erreur::DejaProjetee) => {
                     crate::pages::lacher(cadre);
                     return Ok(false);
@@ -398,13 +436,28 @@ impl Memoire {
             })?;
             // Seul à tenir la mémoire : rien ne change entre deux essais.
             let mut neuve = None;
-            loop {
-                match self.tables().servir(page, zone.droits, true, zone.fichier.is_some(), &mut neuve)? {
-                    Servi::Fait => break,
-                    Servi::PageNeuve => neuve = Some(espace_utilisateur::cadre_neuf().ok_or(Erreur::PlusDeMemoire)?),
-                    Servi::ARefaire => return Err(Erreur::NonProjetee),
+            let r = (|| -> Result<(), Erreur> {
+                loop {
+                    match self.tables().servir(page, zone.droits, true, zone.fichier.is_some(), &mut neuve)? {
+                        Servi::Fait => return Ok(()),
+                        Servi::PageNeuve => neuve = Some(espace_utilisateur::cadre_neuf().ok_or(Erreur::PlusDeMemoire)?),
+                        Servi::ARefaire => return Err(Erreur::NonProjetee),
+                        Servi::Remplacement(mut lot, marque) => {
+                            lot.vider();
+                            match self.tables().remplacer(page, zone.droits, &mut neuve, marque)? {
+                                Servi::Fait => return Ok(()),
+                                _ => return Err(Erreur::NonProjetee),
+                            }
+                        }
+                    }
                 }
+            })();
+            // Une page préparée et pas posée (une erreur) est rendue, comme
+            // dans `servir` (la relecture de 6j).
+            if let Some(c) = neuve {
+                espace_utilisateur::rendre_cadre(c);
             }
+            r?;
             page += PAGE;
         }
         self.tables().ecrire(adresse, octets)
@@ -416,7 +469,12 @@ impl Memoire {
     /// plus de place (ENOMEM).
     pub fn retirer(&mut self, debut: u64, fin: u64) -> Result<(), Erreur> {
         self.zones.retirer(debut, fin, |_| (), &mut references)?;
-        self.tables().retirer_plage(debut, fin, true);
+        // Un grand lot : les TLB des autres processeurs vidés le moins
+        // souvent possible (voir espace_utilisateur::Lot) ; il se vide en
+        // sortant, sans verrou tenu (la mémoire est tenue en écriture).
+        let mut lot = espace_utilisateur::Lot::new(self.tables());
+        lot.reserver(GRAND_LOT);
+        self.tables().retirer_plage(debut, fin, true, &mut lot);
         Ok(())
     }
 
@@ -508,9 +566,17 @@ impl Memoire {
     /// processeur, l'écriture ne fait attendre personne de plus. En 6j.
     pub fn oublier(&mut self, debut: u64, fin: u64) {
         let espace = self.espace.get_mut();
+        let mut lot = espace_utilisateur::Lot::new(espace);
+        lot.reserver(GRAND_LOT);
         for z in self.zones.morceaux(debut, fin) {
-            espace.retirer_plage(z.debut, z.fin, false);
+            espace.retirer_plage(z.debut, z.fin, false, &mut lot);
         }
+    }
+
+    /// Les processeurs qui ont chargé l'espace (espace_utilisateur.rs), à
+    /// partager avec l'entrée du processus (processus.rs).
+    pub fn processeurs(&mut self) -> crate::partage::Arc<espace_utilisateur::MasqueProcesseurs> {
+        self.espace.get_mut().processeurs().clone()
     }
 
     /// La zone qui contient `adresse`, pour un message.

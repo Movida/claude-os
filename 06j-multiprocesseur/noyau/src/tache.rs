@@ -369,11 +369,14 @@ impl EtatProgramme {
 }
 
 // SAFETY: les champs dans des UnsafeCell (`contexte`, `programme`) ne sont
-// lus et écrits que par `basculer_vers`, interruptions coupées, sur notre
-// seul processeur (UNIPROCESSEUR : avec plusieurs, une tâche ne tourne que
-// sur un à la fois, ce que la bascule devra garantir, le `on_cpu` de
-// Linux) ; `entree_attente`, que sous le verrou de la file d'attente
-// où elle est inscrite ; le reste est atomique ou sous Verrou.
+// lus et écrits que par `basculer_vers`, interruptions coupées, sur le
+// processeur de la tâche (et, avant son premier départ, par qui la
+// prépare : `preparer`, quand personne d'autre ne la connaît), et une
+// tâche ne s'exécute que sur un processeur à la fois (`sur_processeur`, le
+// `on_cpu` de Linux : posé sous le verrou de la file des prêtes pour celle
+// qu'on choisit, retiré quand sa bascule est finie) ; `entree_attente`,
+// que sous le verrou de la file d'attente où elle est inscrite ; le reste
+// est atomique ou sous Verrou.
 unsafe impl Sync for Tache {}
 // SAFETY: voir ci-dessus.
 unsafe impl Send for Tache {}
@@ -1075,7 +1078,7 @@ pub fn basculer_vers(nouvelle: &Tache) {
         }
         let espace = nouvelle.espace.load(Ordering::Relaxed);
         if pagination::courante() != espace {
-            pagination::activer(espace);
+            charger_espace(nouvelle, espace);
         }
         if nouvelle.haut != 0 {
             gdt::definir_pile_noyau(nouvelle.haut);
@@ -1086,6 +1089,61 @@ pub fn basculer_vers(nouvelle: &Tache) {
     }
     if interruptions {
         cpu::activer_interruptions();
+    }
+}
+
+/// Charge la PML4 `espace` de la tâche `nouvelle` sur ce processeur, en
+/// tenant à jour les masques des processeurs des espaces (le `mm_cpumask`
+/// de Linux, espace_utilisateur.rs) : le bit de ce processeur mis dans le
+/// masque de l'espace qu'on charge AVANT de charger sa PML4, et retiré de
+/// celui de l'espace qu'on quitte APRÈS (un `fetch_or`, une instruction
+/// `lock` : la barrière complète du motif de Dekker avec le vidage des TLB à
+/// distance, qui lit le masque après avoir écrit ses tables). Interruptions
+/// coupées.
+///
+/// # Safety
+/// `espace` est la PML4 du noyau, ou celle du processus de `nouvelle`
+/// (une tâche de programme), complète.
+unsafe fn charger_espace(nouvelle: &Tache, espace: u64) {
+    let zone = processeur::courant();
+    let bit = 1u64 << zone.numero;
+    let ancien = zone.espace_charge.swap(core::ptr::null_mut(), Ordering::Relaxed);
+    if espace != pagination::pml4_noyau() {
+        let masque = nouvelle.processus.as_ref().expect("un espace de programme sans processus").processeurs();
+        masque.0.fetch_or(bit, Ordering::SeqCst);
+        zone.espace_charge.store(masque as *const _ as *mut _, Ordering::Relaxed);
+    }
+    // SAFETY: garanti par l'appelant.
+    unsafe { pagination::activer(espace) };
+    if !ancien.is_null() {
+        // Le bit de l'espace qu'on quitte, retiré APRÈS avoir chargé l'autre
+        // CR3 : « fini de parcourir ses tables » est alors vrai (jusqu'à la
+        // relecture de 6j, il était retiré avant, pendant que ce processeur
+        // pouvait encore, en spéculation, parcourir ces tables ; Linux
+        // d'avant la TLB paresseuse le retirait avant aussi). Une demande
+        // de vidage qui lit le masque entre les deux nous envoie une IPI de
+        // trop, que `vider_a_distance` ignore (ce n'est plus la PML4
+        // chargée).
+        // SAFETY: le masque est tenu par l'entrée du processus de la tâche
+        // qu'on quitte, vivante (voir processeur.rs, `espace_charge`).
+        // Release : fini de parcourir ses tables.
+        unsafe { (*ancien).0.fetch_and(!bit, Ordering::Release) };
+    }
+}
+
+/// La tâche courante quitte l'espace de son programme pour celui du noyau
+/// (`terminer`) : le bit de ce processeur retiré du masque, la PML4 du
+/// noyau chargée. Interruptions coupées.
+fn quitter_espace() {
+    let zone = processeur::courant();
+    let ancien = zone.espace_charge.swap(core::ptr::null_mut(), Ordering::Relaxed);
+    // SAFETY: la PML4 du noyau est complète.
+    unsafe { pagination::activer(pagination::pml4_noyau()) };
+    if !ancien.is_null() {
+        // Après CR3, comme dans `charger_espace`.
+        // SAFETY: comme dans `charger_espace` : la tâche courante tient son
+        // processus.
+        unsafe { (*ancien).0.fetch_and(!(1u64 << zone.numero), Ordering::Release) };
     }
 }
 
@@ -1176,8 +1234,18 @@ fn rendeur() {
     loop {
         crate::attente::attendre_que(&RENDEUR_ATTENTE, crate::attente::Inscription::Ordinaire, crate::attente::Sommeil::Ininterruptible, None,
                                      || !MORTES.verrouiller().is_empty());
-        while let Some(t) = MORTES.verrouiller().pop() {
-            if let Some(p) = t.pile.verrouiller().take() {
+        loop {
+            // La garde de MORTES rendue à la fin de cette ligne : dans un
+            // `while let`, un temporaire du motif vivrait tout le corps, et
+            // rendre une pile (ce qui demande aux autres processeurs
+            // d'oublier ses traductions, vmalloc.rs) se ferait verrou tenu,
+            // interruptions coupées.
+            let morte = MORTES.verrouiller().pop();
+            let Some(t) = morte else { break };
+            // De même pour la garde de sa pile (un `if let` la garderait
+            // tout le corps).
+            let pile = t.pile.verrouiller().take();
+            if let Some(p) = pile {
                 PILE_LA_PLUS_PROFONDE.fetch_max(profondeur(&p), Ordering::Relaxed);
                 crate::vmalloc::ranger_pile(p);
             }
@@ -1449,8 +1517,7 @@ pub fn terminer(code: i32) -> ! {
         // chargera la PML4 du noyau, jamais des tables qu'on détruit.
         let interruptions = cpu::couper_interruptions();
         t.espace.store(pagination::pml4_noyau(), Ordering::Relaxed);
-        // SAFETY: la PML4 du noyau est complète.
-        unsafe { pagination::activer(pagination::pml4_noyau()) };
+        quitter_espace();
         if interruptions {
             cpu::activer_interruptions();
         }

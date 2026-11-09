@@ -39,6 +39,80 @@
 //!     anneau 0 sur les processeurs Intel (CVE-2012-0217). Interdire la
 //!     page supprime le cas.
 //!
+//! LE VIDAGE DES TLB ENTRE PROCESSEURS (6j, le « TLB shootdown »). Deux fils
+//! d'un même programme sur deux processeurs : A fait `munmap` d'une page
+//! que B vient de lire ; le TLB du processeur de B garde la traduction, et
+//! B lit encore l'ancienne page, qui est peut-être déjà à quelqu'un
+//! d'autre. Le `invlpg` de A ne vide que son propre TLB. D'où :
+//!   - LE MASQUE DES PROCESSEURS de l'espace (`MasqueProcesseurs`, le
+//!     `mm_cpumask` de Linux), partagé avec l'entrée du processus
+//!     (processus.rs) : un processeur y met son bit AVANT de charger la
+//!     PML4 de l'espace (tache.rs, `charger_espace`, un `fetch_or` : une
+//!     instruction `lock`, une barrière complète), et le retire quand il
+//!     la quitte, pour une autre ou pour celle du noyau. Il peut le retirer
+//!     parce que nous n'avons pas de TLB paresseuse (6e) : changer de CR3
+//!     vide tout ce qui n'est pas global, et rien des programmes ne l'est
+//!     avant 6n. C'est la façon de Linux d'avant 6.x ; Linux 6.18 laisse le
+//!     bit et le retire paresseusement quand une demande le trouve sur un
+//!     autre espace. « L'espace est actif », décidé jusqu'à 6i par le CR3
+//!     de CE processeur, est remplacé par le masque : rien à invalider
+//!     seulement s'il est vide ;
+//!   - LA BARRIÈRE : l'émetteur écrit les entrées des tables, puis lit le
+//!     masque ; le receveur met son bit, puis charge CR3 et parcourt les
+//!     tables. C'est le motif de Dekker (verrou.rs) : sans barrière
+//!     complète, l'émetteur peut lire un masque sans le bit pendant que le
+//!     receveur lit l'ancienne entrée, et la page périmée est relue sans
+//!     bruit. Un `fence(SeqCst)` avant de lire le masque (smp::vider_tlb)
+//!     est la paire du `fetch_or` du receveur ; chez Linux, c'est
+//!     `inc_mm_tlb_gen` qui porte cette barrière (« callers are required to
+//!     order their read of mm_cpumask after their writes to the paging
+//!     structures ») ;
+//!   - LA DEMANDE (smp::vider_tlb) : l'espace (la PML4), une plage de pages
+//!     ou « tout » (au-delà de 33 pages, recharger CR3 plutôt qu'enchaîner
+//!     les `invlpg` : PLAFOND_INVLPG) ; préemption coupée, le vidage local
+//!     si ce processeur a l'espace, `smp::appeler` sur le masque sans soi,
+//!     l'attente des réponses. Le receveur vérifie que c'est bien cette
+//!     PML4 qu'il a chargée (sinon il ignore : le `f->mm != loaded_mm` de
+//!     `flush_tlb_func`, pour le processeur qui a retiré son bit après la
+//!     lecture du masque) ;
+//!   - LA RÈGLE : jamais sous un verrou court. Attendre une réponse
+//!     interruptions coupées, c'est le blocage mutuel de smp.rs. Le lot qui
+//!     rend les pages (`Lot`, notre `mmu_gather`) porte toutes les
+//!     invalidations ; `retirer_plage` REMPLIT le lot de l'appelant au lieu
+//!     de le vider, et l'appelant le vide une fois la garde du verrou des
+//!     tables lâchée (`retirer_par_tranches`, la troncature ; la pose d'une
+//!     page de fichier qui recommence, memoire.rs) ; qui tient la mémoire
+//!     en écriture (munmap, mprotect, madvise) n'a pas ce verrou et vide
+//!     quand il veut. Le lot vide les TLB partout, PUIS rend les cadres
+//!     (une page rendue avant que tous l'aient oubliée pourrait être relue
+//!     par l'autre fil une fois donnée à quelqu'un d'autre) ;
+//!   - LA COPIE À L'ÉCRITURE, dans l'ordre de Linux (`wp_page_copy`).
+//!     Remplacer une entrée (la page de zéros ou une page partagée, lue par
+//!     un fil, écrite par un autre) ne se fait pas en posant la nouvelle
+//!     entrée puis en vidant l'ancienne traduction : dans cette fenêtre, un
+//!     fil C écrit dans la page neuve pendant qu'un fil B lit encore la
+//!     page de zéros par sa traduction périmée, et B peut voir une écriture
+//!     de C faite après, dans une autre page, sans voir celle-ci (« that
+//!     left a window where the new PTE could be loaded into some TLBs while
+//!     the old PTE remains in others »). Linux efface l'entrée et vide
+//!     D'ABORD, sous le verrou des tables, parce que son verrou ne coupe pas
+//!     les interruptions ; le nôtre les coupe. Donc : l'entrée est remplacée
+//!     par une marque EN_REMPLACEMENT (une entrée absente avec un bit
+//!     logiciel, comme les « migration entries » de Linux), le verrou des
+//!     tables rendu, l'ancienne traduction vidée partout (`Servi::Remplacement`,
+//!     memoire.rs), le verrou repris, et la nouvelle entrée posée si la
+//!     marque y est encore (`remplacer`) ; une faute concurrente d'un autre
+//!     fil qui trouve la marque recommence (`Servi::ARefaire`, le mécanisme
+//!     de 6i). L'ancienne page n'est lâchée qu'après le vidage.
+//!   Les adresses du noyau (la pile d'un fil mort, une projection rendue :
+//!   vmalloc.rs) sont oubliées par TOUS les processeurs (smp::vider_tlb_noyau,
+//!   le `flush_tlb_kernel_range` de Linux). Options écartées : la TLB
+//!   paresseuse de Linux (un fil du noyau garde le CR3 du processus
+//!   précédent, au prix du filtrage des IPI par `is_lazy` : à revoir en 6n
+//!   avec PCID, quand changer de CR3 ne videra plus le TLB) ; la génération
+//!   `tlb_gen` (éviter de vider deux fois pour deux demandes concurrentes :
+//!   nos programmes ont peu de fils ; sa barrière, elle, est gardée).
+//!
 //! Toute allocation faite pour un programme est faillible : sans mémoire,
 //! il reçoit une erreur (ENOMEM), ou il est tué à la faute (le tueur OOM,
 //! memoire.rs) ; le noyau ne panique jamais. Pages et tables d'un
@@ -50,7 +124,11 @@
 //! vm_area_struct au-dessus du seuil ; à faire avec les allocations
 //! faillibles du noyau).
 
-use crate::{espace, pages, pagination};
+use crate::faillible::VecFaillible;
+use crate::partage::Arc;
+use crate::{espace, pages, pagination, smp};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use pagination::{ADRESSE, PRESENTE};
 use zones::Droits;
 
@@ -65,6 +143,37 @@ const PAGE: u64 = 4096;
 /// présente) : on le garde libre pour les pages globales du noyau. Un
 /// accès fait alors une faute de page.
 const SANS_ACCES: u64 = 1 << 9;
+
+/// Une page en cours de remplacement par la copie à l'écriture (voir
+/// l'en-tête) : l'entrée est absente, garde l'ancien cadre (qu'elle tient
+/// toujours), et porte ce bit, le second que le processeur laisse au
+/// système (le bit 10). Une faute qui la trouve recommence ; `retirer_plage`
+/// la retire comme une page (le cadre est alors lâché par lui, et le
+/// remplacement qui revient ne trouve plus sa marque : il recommence).
+const EN_REMPLACEMENT: u64 = 1 << 10;
+
+/// Le jeton d'une marque de remplacement : dans les bits qu'une entrée
+/// absente laisse libres (1 à 8, et 52 à 62 ; ni le 9, SANS_ACCES, ni le
+/// 10, ni le 63), 19 bits qui changent à chaque marque, si bien que deux
+/// marques posées sur la même page ne sont jamais égales et que `remplacer`
+/// reconnaît la sienne en comparant l'entrée entière. Sans lui, une marque
+/// retirée (madvise, la troncature, mémoire tenue en lecture) puis reposée
+/// par un autre fil était prise pour la sienne (un ABA, trouvé par la
+/// relecture de 6j) : la page du premier était posée pendant le vidage du
+/// second. Linux n'a pas ce cas : `wp_page_copy` garde le verrou de la
+/// table du `pte_same` au `set_pte_at`.
+static JETONS: AtomicU32 = AtomicU32::new(1);
+
+fn jeton_de_marque() -> u64 {
+    let j = u64::from(JETONS.fetch_add(1, Ordering::Relaxed));
+    ((j & 0xFF) << 1) | ((j >> 8) & 0x7FF) << 52
+}
+
+/// Les processeurs qui ont chargé la PML4 d'un espace, un bit par numéro
+/// (le `mm_cpumask` de Linux, voir l'en-tête) : partagé entre l'espace
+/// (qui le lit pour vider les TLB) et l'entrée du processus (processus.rs :
+/// la bascule l'écrit, tache.rs, sans le verrou qui dort de la mémoire).
+pub struct MasqueProcesseurs(pub AtomicU64);
 
 /// La page de zéros : une page du noyau, toujours nulle, que reçoit en
 /// lecture seule toute page d'un programme LUE avant d'avoir été écrite
@@ -97,9 +206,11 @@ pub fn page_de_zeros() -> u64 {
     espace::physique_du_noyau(&raw const PAGE_DE_ZEROS as u64)
 }
 
-/// Une entrée finale qui désigne un cadre du programme, accessible ou non.
+/// Une entrée finale qui désigne un cadre du programme : accessible,
+/// interdite (PROT_NONE), ou en cours de remplacement ; dans les trois cas,
+/// elle tient son cadre.
 fn occupee(entree: u64) -> bool {
-    entree & (PRESENTE | SANS_ACCES) != 0
+    entree & (PRESENTE | SANS_ACCES | EN_REMPLACEMENT) != 0
 }
 
 /// Le cadre est-il partagé : une page d'un fichier, ou une page tenue
@@ -136,15 +247,21 @@ pub const ADRESSE_MIN: u64 = 0x1_0000;
 pub const ADRESSE_MAX: u64 = 0x7fff_ffff_f000;
 
 /// Ce qu'a fait `EspaceUtilisateur::servir`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Servi {
     /// L'entrée est en place : l'instruction peut reprendre.
     Fait,
     /// Il faut une page neuve : la préparer (`cadre_neuf`) et recommencer.
     PageNeuve,
-    /// L'entrée d'une zone de fichier a disparu : recommencer par le
-    /// fichier.
+    /// L'entrée d'une zone de fichier a disparu, ou un autre fil remplace
+    /// cette page : recommencer par le fichier.
     ARefaire,
+    /// La copie à l'écriture (voir l'en-tête) : l'entrée porte sa marque
+    /// (rendue ici, jeton compris), le lot porte l'ancienne traduction à
+    /// vider partout. À l'appelant de rendre le verrou des tables, de vider
+    /// le lot, puis d'appeler `remplacer` avec la marque, préemption coupée
+    /// d'un bout à l'autre (une faute d'un autre fil qui trouve la marque
+    /// recommence tant qu'elle est là).
+    Remplacement(Lot, u64),
 }
 
 /// Pourquoi une projection est refusée.
@@ -228,11 +345,14 @@ pub struct EspaceUtilisateur {
     /// ce qui revient au même pour un maximum, sans oublier un chemin qui
     /// retire des pages.
     pic: usize,
+    /// Les processeurs qui ont chargé sa PML4 (voir l'en-tête).
+    processeurs: Arc<MasqueProcesseurs>,
 }
 
 impl EspaceUtilisateur {
     /// Un espace neuf : moitié basse vide, moitié haute du noyau.
     pub fn creer() -> Result<EspaceUtilisateur, Erreur> {
+        let processeurs = Arc::new(MasqueProcesseurs(AtomicU64::new(0))).map_err(|_| Erreur::PlusDeMemoire)?;
         let pml4 = pages::allouer_pour_programme().ok_or(Erreur::PlusDeMemoire)?;
         // SAFETY: `pml4` vient d'être alloué, il est à nous ; la PML4 du
         // noyau est une table en place, qu'on ne fait que lire.
@@ -242,12 +362,18 @@ impl EspaceUtilisateur {
             nouvelle[..256].fill(0);
             nouvelle[256..].copy_from_slice(&noyau[256..]);
         }
-        Ok(EspaceUtilisateur { pml4, pages: 0, pages_fichier: 0, tables: 1, pic: 0 })
+        Ok(EspaceUtilisateur { pml4, pages: 0, pages_fichier: 0, tables: 1, pic: 0, processeurs })
     }
 
     /// L'adresse physique de la PML4, pour CR3.
     pub fn pml4(&self) -> u64 {
         self.pml4
+    }
+
+    /// Les processeurs qui ont chargé sa PML4 (voir l'en-tête), à partager
+    /// avec l'entrée du processus.
+    pub fn processeurs(&self) -> &Arc<MasqueProcesseurs> {
+        &self.processeurs
     }
 
     /// Le nombre de cadres projetés à lui (la mémoire « résidente »
@@ -310,15 +436,23 @@ impl EspaceUtilisateur {
     ///   - La page de zéros, ou une page partagée (celle d'un fichier, voir
     ///     `partage`), et une écriture : une page neuve à sa place, copie de
     ///     l'ancienne (la copie à l'écriture, do_wp_page). L'ancienne
-    ///     traduction peut être dans le TLB : invlpg, puis l'ancienne page
-    ///     est lâchée.
+    ///     traduction peut être dans le TLB de plusieurs processeurs : la
+    ///     copie est faite, l'entrée marquée EN_REMPLACEMENT, et le reste
+    ///     (vider partout, poser la nouvelle entrée, lâcher l'ancienne page)
+    ///     revient à l'appelant, hors du verrou des tables
+    ///     (`Servi::Remplacement`, puis `remplacer` ; voir l'en-tête).
     ///   - Une page à lui : l'entrée est refaite d'après les droits de la
     ///     zone. C'est le cas d'une page restée en lecture seule dans une
     ///     zone inscriptible (do_wp_page la « réutilise » : personne d'autre
     ///     ne la voit), ou d'une faute « fantôme », quand l'entrée permet
     ///     déjà l'accès mais que le TLB gardait une traduction plus ancienne
-    ///     (manuel d'Intel, vol. 3A, 4.10.4.3). invlpg, et on reprend. Une
-    ///     page partagée lue reste en lecture seule (entree_finale).
+    ///     (manuel d'Intel, vol. 3A, 4.10.4.3). invlpg, ici seulement, et on
+    ///     reprend : des droits sont AJOUTÉS, un autre processeur qui garde
+    ///     l'ancienne traduction fautera et la refera lui-même (Linux :
+    ///     `ptep_set_access_flags`, un vidage local). Une page partagée lue
+    ///     reste en lecture seule (entree_finale).
+    ///   - Une marque EN_REMPLACEMENT : un autre fil remplace cette page en
+    ///     ce moment (il vide les TLB) : `Servi::ARefaire`, on recommence.
     ///
     /// La page d'un fichier qui n'est pas encore là est posée avant, par
     /// `poser_fichier` (memoire.rs) : `servir` ne sait rien des fichiers,
@@ -344,6 +478,9 @@ impl EspaceUtilisateur {
             return Err(Erreur::AdresseInterdite);
         }
         let entree = self.entree(page)?;
+        if *entree & EN_REMPLACEMENT != 0 {
+            return Ok(Servi::ARefaire);
+        }
         let cadre = *entree & ADRESSE;
         let zeros = page_de_zeros();
         let present = occupee(*entree);
@@ -351,7 +488,7 @@ impl EspaceUtilisateur {
             return Ok(Servi::ARefaire);
         }
         let a_copier = present && cadre != zeros && partage(cadre);
-        if !present || (ecriture && (cadre == zeros || a_copier)) {
+        if !present {
             let neuve = if !ecriture {
                 zeros
             } else if let Some(c) = neuve.take() {
@@ -360,7 +497,21 @@ impl EspaceUtilisateur {
             } else {
                 return Ok(Servi::PageNeuve);
             };
-            if ecriture && a_copier {
+            pagination::poser(entree, entree_finale(neuve, droits));
+        } else if ecriture && (cadre == zeros || a_copier) {
+            // La copie à l'écriture : la page neuve reste à l'appelant
+            // jusqu'à `remplacer` ; ici la copie, puis la marque. L'ancienne
+            // page est en lecture seule pour tous par les tables ; une page
+            // de fichier, elle, peut encore être écrite par `write` (un
+            // autre processus) pendant la copie, qui prend alors l'un ou
+            // l'autre état : comme chez Linux, dont `wp_page_copy` copie
+            // hors du verrou puis revérifie l'entrée (copier hors du verrou
+            // demanderait de tenir le cadre le temps de la copie : un écart
+            // écrit, HISTORIQUE.md). Le lot (400 octets, un clone d'Arc)
+            // n'est construit que sur ce chemin, pas à chaque faute.
+            let Some(neuve) = *neuve else { return Ok(Servi::PageNeuve) };
+            let mut lot = Lot::new(self);
+            if a_copier {
                 // SAFETY: `neuve` vient d'être allouée, à nous ; `cadre` est
                 // tenu par cette entrée (il ne sera lâché qu'après) : deux
                 // pages distinctes, entières, dans la projection directe.
@@ -369,23 +520,40 @@ impl EspaceUtilisateur {
                                                    espace::virtuelle(neuve) as *mut u8, PAGE as usize);
                 }
             }
-            pagination::poser(entree, entree_finale(neuve, droits));
-            if present {
-                self.invalider(page);
-            }
-            if a_copier {
-                // Après l'invalidation : plus aucune traduction ne mène à
-                // l'ancienne page par cette entrée.
-                if pages::drapeaux(cadre) & pages::FICHIER != 0 {
-                    self.pages_fichier -= 1;
-                } else {
-                    self.pages -= 1;
-                }
-                pages::lacher(cadre);
-            }
+            let marque = cadre | EN_REMPLACEMENT | jeton_de_marque();
+            *entree = marque;
+            lot.invalider(page);
+            return Ok(Servi::Remplacement(lot, marque));
         } else {
             pagination::poser(entree, entree_finale(cadre, droits));
             self.invalider(page);
+        }
+        Ok(Servi::Fait)
+    }
+
+    /// La fin d'une copie à l'écriture (voir `servir`), le lot vidé, le
+    /// verrou des tables repris : si NOTRE marque est encore là (l'entrée
+    /// entière, jeton compris), la page `neuve` prend la place de
+    /// l'ancienne, qui est lâchée (plus aucune traduction ne mène à elle
+    /// par cette entrée) ; sinon l'entrée a changé entre-temps (une
+    /// troncature ou un madvise l'ont retirée, un autre fil a posé la
+    /// sienne) : `Servi::ARefaire`, et `neuve` reste à l'appelant.
+    pub fn remplacer(&mut self, page: u64, droits: Droits, neuve: &mut Option<u64>, marque: u64) -> Result<Servi, Erreur> {
+        let entree = self.entree(page)?;
+        if *entree != marque {
+            return Ok(Servi::ARefaire);
+        }
+        let ancien = *entree & ADRESSE;
+        let c = neuve.take().expect("remplacement sans page neuve");
+        self.compter_cadre();
+        pagination::poser(entree, entree_finale(c, droits));
+        if ancien != page_de_zeros() {
+            if pages::drapeaux(ancien) & pages::FICHIER != 0 {
+                self.pages_fichier -= 1;
+            } else {
+                self.pages -= 1;
+            }
+            pages::lacher(ancien);
         }
         Ok(Servi::Fait)
     }
@@ -430,9 +598,13 @@ impl EspaceUtilisateur {
         Ok(())
     }
 
-    /// La traduction de `page` ne doit plus servir, si cet espace est actif.
+    /// La traduction de `page` ne doit plus servir SUR CE PROCESSEUR : pour
+    /// une entrée à laquelle on ajoute des droits (`servir`), ce qui ne
+    /// demande rien aux autres processeurs (voir là). L'espace est celui
+    /// du processeur : une faute est toujours servie sur celui qui l'a
+    /// faite, dans son espace.
     fn invalider(&self, page: u64) {
-        if self.actif() {
+        if pagination::courante() == self.pml4 {
             pagination::invalider(page);
         }
     }
@@ -473,26 +645,26 @@ impl EspaceUtilisateur {
 
     /// Retire de [debut, fin[ les pages des projections d'un fichier (les
     /// copies privées comprises), comme `retirer_plage` sans rendre les
-    /// tables, par tranches de 2 Mio (une table de dernier niveau), en
-    /// prenant le verrou des tables pour chacune : pour qui ne tient la
-    /// mémoire qu'en lecture (la troncature d'un fichier, appels_fichiers.rs).
-    /// Les interruptions ne restent coupées que le temps de 512 entrées au
-    /// plus, quelle que soit la plage (le `zap_pte_range` de Linux, qui prend
-    /// le verrou de chaque table de pages tour à tour).
+    /// tables, par tranches de 64 pages, en prenant le verrou des tables
+    /// pour chacune et en vidant le lot entre deux, sans lui : pour qui ne
+    /// tient la mémoire qu'en lecture (la troncature d'un fichier,
+    /// appels_fichiers.rs). Les interruptions ne restent coupées que le
+    /// temps de 64 entrées, quelle que soit la plage (le `zap_pte_range` de
+    /// Linux, qui prend le verrou de chaque table de pages tour à tour, et
+    /// le rend pour vider son lot quand il est plein), et le vidage des TLB
+    /// des autres processeurs, qui attend leurs réponses, ne se fait jamais
+    /// sous le verrou (voir l'en-tête). 64 : ce que le lot garde de cadres
+    /// sans grandir.
     pub fn retirer_par_tranches(espace: &crate::verrou::Verrou<EspaceUtilisateur>, debut: u64, fin: u64) {
-        const TRANCHE: u64 = PAGE << 9;
+        const TRANCHE: u64 = PAGE * CADRES_DU_LOT as u64;
+        let mut lot = Lot::new(&espace.verrouiller());
         let mut a = debut;
         while a < fin {
             let b = ((a / TRANCHE + 1) * TRANCHE).min(fin);
-            espace.verrouiller().retirer_plage(a, b, false);
+            espace.verrouiller().retirer_plage(a, b, false, &mut lot);
+            lot.vider();
             a = b;
         }
-    }
-
-    /// Cet espace est-il celui du processeur (CR3) ? Sinon, il n'y a rien
-    /// à invalider : le changement de CR3 qui l'activera vide le TLB.
-    fn actif(&self) -> bool {
-        pagination::courante() == self.pml4
     }
 
     /// Retire les pages de [debut, fin[ (alignés) et rend leurs cadres :
@@ -505,9 +677,14 @@ impl EspaceUtilisateur {
     /// simple que les bornes de la zone précédente et de la suivante qu'en
     /// tire Linux, et toujours juste (une entrée occupée n'existe que dans
     /// une zone). MADV_DONTNEED, lui, garde les tables : la zone reste, ses
-    /// pages reviendront.
-    pub fn retirer_plage(&mut self, debut: u64, fin: u64, rendre_tables: bool) {
-        let mut lot = Lot::new(self.actif());
+    /// pages reviendront. Les traductions à vider et les cadres à rendre
+    /// vont dans `lot`, celui de l'appelant, qui le vide quand il ne tient
+    /// plus le verrou des tables (voir l'en-tête) ; un lot plein se vide de
+    /// lui-même en chemin, ce qui demande qu'aucun verrou ne soit tenu : qui
+    /// tient le verrou des tables ne retire qu'une tranche de 64 pages
+    /// (`retirer_par_tranches`).
+    pub fn retirer_plage(&mut self, debut: u64, fin: u64, rendre_tables: bool, lot: &mut Lot) {
+        assert!(lot.pml4 == self.pml4, "un lot d'un autre espace");
         let (mut pages, mut pages_fichier, mut tables) = (0, 0, 0);
         let zeros = page_de_zeros();
         parcourir(self.pml4, debut, fin, &mut |visite| match visite {
@@ -536,8 +713,6 @@ impl EspaceUtilisateur {
                 }
             }
         });
-        // Le lot se vide en sortant : le TLB d'abord, les cadres ensuite.
-        drop(lot);
         self.pages -= pages;
         self.pages_fichier -= pages_fichier;
         self.tables -= tables;
@@ -551,7 +726,10 @@ impl EspaceUtilisateur {
     /// de JavaScriptCore, le moteur de Claude Code, écrit puis exécute son
     /// code dans les mêmes pages.
     pub fn proteger_plage(&mut self, debut: u64, fin: u64, droits: Droits) {
-        let mut lot = Lot::new(self.actif());
+        // Un lot sans cadre : il se vide en sortant (l'appelant tient la
+        // mémoire en écriture, sans verrou court : il peut attendre les
+        // autres processeurs).
+        let mut lot = Lot::new(self);
         parcourir(self.pml4, debut, fin, &mut |visite| {
             if let Visite::Page(adresse, entree) = visite {
                 pagination::poser(entree, entree_finale(*entree & ADRESSE, droits));
@@ -682,7 +860,11 @@ fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl F
         // ou par qui tient la mémoire du processus en écriture, ou par sa
         // dernière tâche, qui l'a retirée du processus pour la rendre : tous
         // passent par &mut EspaceUtilisateur, personne ne la change en même
-        // temps.
+        // temps. Sauf les MMU des autres processeurs qui ont cet espace
+        // chargé : elles posent les bits A et D (5 et 6) des entrées qu'elles
+        // parcourent, une écriture concurrente bénigne (nous ne lisons ces
+        // bits nulle part ; à reprendre pour MAP_SHARED, 6m, où le bit D
+        // dira quelle page réécrire, en le lisant par un échange atomique).
         let entree = unsafe { &mut pagination::table_modifiable(table)[pagination::index(adresse, niveau)] };
         if niveau == 0 {
             if occupee(*entree) {
@@ -702,26 +884,44 @@ fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl F
 /// traductions dont on a vraiment besoin.
 const PLAFOND_INVLPG: usize = 33;
 
+/// Le nombre de cadres qu'un lot garde sans grandir : ce que remplit une
+/// tranche de `retirer_par_tranches`, sous le verrou des tables.
+const CADRES_DU_LOT: usize = 64;
+
 /// Ce qu'un parcours des tables laisse à faire : des traductions à retirer
-/// du TLB, puis des cadres à rendre (le mmu_gather de Linux). L'ordre
-/// compte : un cadre rendu alors qu'une traduction vers lui reste dans le
-/// TLB pourrait encore être écrit par le programme, alors qu'il appartient
-/// déjà à quelqu'un d'autre. Le lot vide donc toujours le TLB AVANT de
-/// rendre ses cadres, et se vide de lui-même en disparaissant (Drop).
-struct Lot {
-    /// L'espace parcouru est-il actif ? Sinon, rien à invalider.
-    actif: bool,
+/// des TLB (de tous les processeurs qui ont l'espace : voir l'en-tête),
+/// puis des cadres à rendre (le mmu_gather de Linux). L'ordre compte : un
+/// cadre rendu alors qu'une traduction vers lui reste dans un TLB pourrait
+/// encore être écrit par le programme, alors qu'il appartient déjà à
+/// quelqu'un d'autre. Le lot vide donc toujours les TLB AVANT de rendre
+/// ses cadres, et se vide de lui-même en disparaissant (Drop). Vider
+/// attend les autres processeurs : jamais un verrou court tenu (smp.rs le
+/// vérifie).
+pub struct Lot {
+    /// L'espace parcouru : sa PML4 (ce que les receveurs comparent à leur
+    /// CR3) et ses processeurs.
+    pml4: u64,
+    masque: Arc<MasqueProcesseurs>,
     pages: [u64; PLAFOND_INVLPG],
     nombre_pages: usize,
     /// Plus de PLAFOND_INVLPG pages : on videra tout le TLB.
     tout: bool,
-    cadres: [u64; 64],
-    nombre_cadres: usize,
+    /// Les cadres à lâcher : 64 d'emblée (`rendre` réserve au premier),
+    /// plus si l'appelant l'a demandé (`reserver` : un munmap de 2 Gio
+    /// viderait sinon les TLB de tous les processeurs tous les 64 cadres).
+    /// Linux enchaîne de même des lots de 509 pages (`mmu_gather_batch`).
+    cadres: Vec<u64>,
 }
 
 impl Lot {
-    fn new(actif: bool) -> Lot {
-        Lot { actif, pages: [0; PLAFOND_INVLPG], nombre_pages: 0, tout: false, cadres: [0; 64], nombre_cadres: 0 }
+    pub fn new(espace: &EspaceUtilisateur) -> Lot {
+        Lot { pml4: espace.pml4, masque: espace.processeurs.clone(), pages: [0; PLAFOND_INVLPG], nombre_pages: 0, tout: false, cadres: Vec::new() }
+    }
+
+    /// Fait de la place pour `n` cadres : moins de vidages pour une grande
+    /// plage. Sans mémoire, le lot garde sa taille (il videra plus souvent).
+    pub fn reserver(&mut self, n: usize) {
+        let _ = self.cadres.try_reserve(n);
     }
 
     /// La traduction de la page `adresse` ne doit plus servir.
@@ -734,15 +934,23 @@ impl Lot {
         }
     }
 
-    /// Le cadre `cadre` est à lâcher, une fois le TLB vidé (il ne sera rendu
-    /// que si personne d'autre ne le tient, pages.rs). Toute page qui le
-    /// désignait doit déjà avoir été passée à `invalider`.
+    /// Le cadre `cadre` est à lâcher, une fois les TLB vidés (il ne sera
+    /// rendu que si personne d'autre ne le tient, pages.rs). Toute page qui
+    /// le désignait doit déjà avoir été passée à `invalider`. Un lot plein
+    /// se vide ; sans mémoire pour grandir d'un seul cadre, celui-ci est
+    /// lâché tout de suite, le TLB venant d'être vidé pour lui.
     fn rendre(&mut self, cadre: u64) {
-        if self.nombre_cadres == self.cadres.len() {
-            self.vider();
+        if self.cadres.len() == self.cadres.capacity() {
+            if !self.cadres.is_empty() {
+                self.vider();
+            }
+            if self.cadres.try_reserve(CADRES_DU_LOT).is_err() {
+                self.vider();
+                pages::lacher(cadre);
+                return;
+            }
         }
-        self.cadres[self.nombre_cadres] = cadre;
-        self.nombre_cadres += 1;
+        self.cadres.ajouter_dans_la_place(cadre);
     }
 
     /// La table `table` est à rendre ; l'entrée qui la désignait est déjà
@@ -760,20 +968,18 @@ impl Lot {
         self.tout = true;
     }
 
-    /// Vide le TLB de ce qu'on a noté, puis lâche les cadres.
-    fn vider(&mut self) {
-        if self.actif {
-            if self.tout {
-                pagination::vider_tlb();
-            } else {
-                self.pages[..self.nombre_pages].iter().for_each(|&p| pagination::invalider(p));
-            }
+    /// Vide les TLB de ce qu'on a noté, sur tous les processeurs qui ont
+    /// l'espace (smp::vider_tlb), puis lâche les cadres. Aucun verrou court
+    /// tenu, interruptions actives.
+    #[track_caller]
+    pub fn vider(&mut self) {
+        if self.tout || self.nombre_pages > 0 {
+            smp::vider_tlb(Some(self.pml4), Some(&self.masque.0), &self.pages[..self.nombre_pages], self.tout);
         }
         (self.nombre_pages, self.tout) = (0, false);
-        self.cadres[..self.nombre_cadres].iter().for_each(|&c| {
+        for c in self.cadres.drain(..) {
             pages::lacher(c);
-        });
-        self.nombre_cadres = 0;
+        }
     }
 }
 
@@ -815,13 +1021,19 @@ fn rendre(table: u64, niveau: u32) {
 
 impl Drop for EspaceUtilisateur {
     fn drop(&mut self) {
-        // D'abord quitter l'espace s'il est actif : on ne rend pas des
-        // tables dont le processeur se sert encore. La PML4 du noyau a la
-        // même moitié haute : l'exécution continue sans heurt.
+        // D'abord quitter l'espace s'il est actif (le test du démarrage,
+        // main.rs, qui le charge sans passer par une tâche) : on ne rend
+        // pas des tables dont le processeur se sert encore. La PML4 du
+        // noyau a la même moitié haute : l'exécution continue sans heurt.
         if pagination::courante() == self.pml4 {
             // SAFETY: la PML4 du noyau est complète.
             unsafe { pagination::activer(pagination::pml4_noyau()) };
         }
+        // Plus aucun processeur n'a cette PML4 : chaque fil du processus l'a
+        // quittée en mourant (tache.rs). Sinon, rendre ses tables serait
+        // rendre des pages qu'un processeur traverse encore.
+        assert!(self.processeurs.0.load(core::sync::atomic::Ordering::Acquire) == 0,
+                "espace detruit alors que des processeurs l'ont encore charge");
         rendre(self.pml4, 3);
         pages::liberer(self.pml4, 0);
     }
