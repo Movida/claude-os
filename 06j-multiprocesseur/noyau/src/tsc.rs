@@ -344,6 +344,9 @@ pub enum Role {
 /// deux doivent y être avant de mesurer), et la dernière heure lue, par
 /// l'un ou l'autre, sous son verrou (le `sync_lock` et le `last_tsc` de
 /// Linux). Remis à zéro entre deux secondaires (`fin_de_verification`).
+/// Les deux se disputent ce verrou exprès, 20 ms durant : `make verrous` le
+/// montre en tête des endroits attendus du démarrage (16 000 attentes) ;
+/// c'est le protocole, pas une contention à réduire.
 static PARTICIPANTS: AtomicU32 = AtomicU32::new(0);
 static DERNIERE_HEURE: Verrou<u64> = Verrou::new(0);
 

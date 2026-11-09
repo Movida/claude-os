@@ -105,7 +105,7 @@ impl Ecran {
     /// contrôleur CRT de la carte VGA, derrière les ports 0x3D4 (numéro du
     /// registre) et 0x3D5 (sa valeur) : 0x0E et 0x0F, octets haut et bas de
     /// la position, comptée en cases depuis le coin haut gauche.
-    fn placer_curseur(&self) {
+    pub fn placer_curseur(&self) {
         let position = (self.ligne * LARGEUR + self.colonne.min(LARGEUR - 1)) as u16;
         // SAFETY: registres documentés du contrôleur CRT ; ils ne règlent
         // que la position du curseur.
@@ -122,7 +122,7 @@ impl Ecran {
 /// VGA) qui correspond à un caractère Unicode. Rust manipule du texte en
 /// UTF-8, la carte des octets de 0 à 255 : il faut traduire. On ne garde
 /// que ce qu'un clavier français peut taper ; le reste devient un carré.
-fn cp437(c: char) -> u8 {
+pub fn cp437(c: char) -> u8 {
     match c {
         '\n' | '\t' | '\u{8}' | ' '..='~' => c as u8,
         'ç' => 0x87, 'é' => 0x82, 'â' => 0x83, 'à' => 0x85, 'ê' => 0x88,

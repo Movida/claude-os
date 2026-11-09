@@ -108,14 +108,70 @@ fn verrou_des_ecritures() -> Option<GardeMutex<'static, ()>> {
     (crate::tache::en_service() && crate::cpu::interruptions_actives()).then(|| ECRITURES.verrouiller())
 }
 
+/// Un message du noyau en cours de formatage : d'abord dans ce tampon,
+/// sur la pile, puis écrit par paquets de huit caractères sous le verrou
+/// de l'écran, rendu (et les interruptions avec lui) entre deux paquets,
+/// comme la sortie d'un programme (`ecrire_octets`). Jusqu'à 6j, tout le
+/// message s'écrivait d'un coup sous le verrou : un message de cent octets
+/// gardait les interruptions coupées 7 ms sous QEMU (mesuré par `make
+/// verrous`, le plus long de tous les endroits, à chaque programme), autant
+/// sur un vrai port série (87 µs par octet), et l'horloge perdait ses tics.
+/// Plein (128 octets), le tampon s'écrit et recommence ; il ne coupe jamais
+/// un caractère UTF-8 (l'écran les traduit en page de code 437 un par un).
+struct Tampon {
+    octets: [u8; 128],
+    n: usize,
+}
+
+impl Tampon {
+    /// Écrit ce qu'il contient, par paquets, et se vide. Le port série n'a
+    /// pas d'état à protéger, mais on l'écrit sous le même verrou pour que
+    /// les deux sorties gardent le même ordre.
+    fn ecrire(&mut self) {
+        let texte = core::str::from_utf8(&self.octets[..self.n]).unwrap_or("?");
+        let mut caracteres = texte.chars().peekable();
+        while caracteres.peek().is_some() {
+            let mut ecran = ECRAN.verrouiller();
+            for c in caracteres.by_ref().take(8) {
+                let mut utf8 = [0u8; 4];
+                let _ = Serie.write_str(c.encode_utf8(&mut utf8));
+                ecran.ecrire_octet(crate::vga::cp437(c));
+            }
+            if caracteres.peek().is_none() {
+                ecran.placer_curseur();
+            }
+        }
+        self.n = 0;
+    }
+}
+
+impl fmt::Write for Tampon {
+    fn write_str(&mut self, mut texte: &str) -> fmt::Result {
+        while !texte.is_empty() {
+            // Autant que la place le permet, sans couper un caractère ; plus
+            // de place (ou pas assez pour le caractère) : on écrit d'abord.
+            let mut fin = texte.len().min(self.octets.len() - self.n);
+            while !texte.is_char_boundary(fin) {
+                fin -= 1;
+            }
+            if fin == 0 {
+                self.ecrire();
+                continue;
+            }
+            self.octets[self.n..self.n + fin].copy_from_slice(&texte.as_bytes()[..fin]);
+            self.n += fin;
+            texte = &texte[fin..];
+        }
+        Ok(())
+    }
+}
+
 /// Appelée par les macros afficher! et afficherln!.
 pub fn _afficher(args: fmt::Arguments) {
     let _ecritures = verrou_des_ecritures();
-    let mut ecran = ECRAN.verrouiller();
-    // Le port série n'a pas d'état à protéger, mais on l'écrit sous le même
-    // verrou pour que les deux sorties gardent le même ordre.
-    let _ = Serie.write_fmt(args);
-    let _ = ecran.write_fmt(args);
+    let mut tampon = Tampon { octets: [0; 128], n: 0 };
+    let _ = tampon.write_fmt(args);
+    tampon.ecrire();
 }
 
 /// Écrit des octets tels quels, la sortie d'un programme par exemple : ils

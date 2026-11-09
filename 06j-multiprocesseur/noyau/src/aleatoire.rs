@@ -43,8 +43,11 @@
 //! qu'à lui. Le petit réservoir des interruptions a son propre verrou, le
 //! seul que prennent les interruptions.
 //!
-//! UNIPROCESSEUR : un seul verrou suffit ; avec plusieurs processeurs, un
-//! générateur et un lot par processeur, comme Linux.
+//! Un seul verrou pour tous les processeurs ; Linux a un générateur et un
+//! lot par processeur (`batched_entropy`). Mesuré en 6j pendant `claude -p`
+//! sur quatre processeurs (`make verrous-claude-p`) : ce verrou n'est pas
+//! parmi les seize endroits les plus attendus (moins de cinq attentes par
+//! lancement). Un lot par processeur quand une mesure le demandera.
 
 use crate::attente::{self, FileAttente, Sommeil};
 use crate::tache::{self, Reveil};

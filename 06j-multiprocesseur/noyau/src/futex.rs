@@ -205,7 +205,12 @@ fn cle(adresse: u64, partage: bool) -> Result<Cle, i64> {
     if partage && processus::memoire_lue(|m| m.servir(adresse, Acces::Ecriture)).is_err() {
         return Err(-EFAULT);
     }
-    Ok(Cle { pid: processus::avec(|p| p.pid), adresse, partage })
+    // Le pid sans le verrou du processus : chaque opération futex passait
+    // ici, et ce verrou était le quatrième endroit le plus attendu pendant
+    // `claude -p` (6j, `make verrous-claude-p` : une centaine d'attentes par
+    // lancement, 137 µs au plus).
+    let pid = crate::tache::courante().processus().expect("futex sans processus").pid();
+    Ok(Cle { pid, adresse, partage })
 }
 
 fn lire(adresse: u64) -> Result<u32, i64> {

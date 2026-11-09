@@ -35,9 +35,13 @@ static APIC: AtomicBool = AtomicBool::new(false);
 // pour un seul processeur : une carte des vecteurs libres, le premier libre
 // donné (comme `irq_matrix_alloc`) ; et la table `vector_irq` qui dit, pour
 // chaque vecteur, à qui il est.
-// UNIPROCESSEUR : une carte des vecteurs pour tout le noyau ; avec
-// plusieurs processeurs, une par processeur, et chaque interruption dirigée
-// vers l'un d'eux (son affinité).
+// Une carte des vecteurs pour tout le noyau, et toutes les interruptions
+// des périphériques vont au processeur 0 (l'IO-APIC et les MSI-X visent
+// son APIC, nommé : ioapic.rs, msix.rs). Décision (6j) : Linux les répartit
+// (une `irq_matrix` par processeur, l'affinité de chaque interruption,
+// `irqbalance`) ; chez nous, le réseau est une seule tâche, et rien n'y
+// gagnerait avant les pilotes du vrai matériel (« Plus tard » : plusieurs
+// files par carte).
 //
 // Le gestionnaire d'un vecteur est une fonction et son argument (l'adresse
 // de l'objet du pilote), lus sans verrou dans l'interruption : deux

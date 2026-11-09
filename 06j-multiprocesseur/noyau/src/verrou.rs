@@ -269,12 +269,13 @@ impl<T> Drop for Garde<'_, T> {
         // Dans cet ordre : rendre le verrou, puis seulement laisser revenir
         // les interruptions, sinon une interruption pourrait encore le
         // trouver pris.
+        // Chaque garde note son attente (la contention) ; le temps
+        // interruptions coupées, seul le premier verrou de la série, celui
+        // qui les a coupées et va les remettre : ceux qu'on a pris en le
+        // tenant sont dans son temps.
+        #[cfg(feature = "verrous")]
+        statistiques::noter(&self.debut, self.interruptions_actives);
         if self.interruptions_actives {
-            // Le premier verrou de la série, celui qui a coupé les
-            // interruptions : il les remet, on compte depuis lui. Ceux
-            // qu'on a pris en le tenant sont dans son temps.
-            #[cfg(feature = "verrous")]
-            statistiques::noter(&self.debut);
             cpu::activer_interruptions();
             // Le point de préemption du `spin_unlock` de Linux (son
             // `preempt_enable`) : une tâche réveillée sous le verrou qui
@@ -296,9 +297,13 @@ impl<T> Drop for Garde<'_, T> {
 /// coupe, et les remet en le rendant), le plus long temps qu'il les a
 /// gardées coupées, combien de fois au-delà d'une milliseconde, combien de
 /// prises ; et depuis 6j la CONTENTION : combien de fois il a dû attendre
-/// qu'un autre processeur rende le verrou, et le plus longtemps. Le
-/// lanceur les affiche après chaque programme (programmes.rs), et les
-/// remet à zéro.
+/// qu'un autre processeur rende le verrou, et le plus longtemps, comptée
+/// pour CHAQUE prise, imbriquée sous un autre verrou ou dans une
+/// interruption comprise (les files des prêtes au tic, le tas sous un
+/// verrou, le générateur sous TCP : la relecture de 6j, qui les trouvait
+/// jetées ; le temps interruptions coupées, lui, n'a de sens que pour la
+/// première de la série). Le lanceur les affiche après chaque programme
+/// (programmes.rs), et les remet à zéro.
 ///
 /// Pourquoi ce temps-là : tant que les interruptions sont coupées, le tic
 /// d'horloge attend (une échéance de TCP, un réveil, la préemption), et
@@ -399,11 +404,15 @@ pub mod statistiques {
         }
     }
 
-    /// Les endroits mesurés depuis la dernière remise à zéro, par
-    /// processeur. Une table fixe, pas un tableau qui grandit : mesurer ne
-    /// doit rien allouer. 256 places : le démarrage complet de 6h en prend
-    /// un peu plus de 120.
-    const PLACES: usize = 256;
+    /// Les endroits mesurés, par processeur. Une table fixe, pas un tableau
+    /// qui grandit : mesurer ne doit rien allouer. 1024 places (48 Kio par
+    /// processeur, dans la .bss, avec la fonctionnalité seulement), jamais
+    /// rendues (`remettre_a_zero`) : chaque prise comptant depuis la
+    /// relecture de 6j, imbriquée ou non, les 560 appels de `verrouiller`
+    /// du noyau et leurs appelants `#[track_caller]` font plusieurs
+    /// centaines d'endroits (256 places en perdaient 76 000 mesures par
+    /// lancement de `claude -p`) ; l'affichage dit combien sont prises.
+    const PLACES: usize = 1024;
     struct Table([Endroit; PLACES]);
     static TABLES: [Table; processeur::MAX] = [const { Table([const { Endroit::new() }; PLACES]) }; processeur::MAX];
     /// Les mesures perdues faute de place (dites à l'affichage).
@@ -421,9 +430,11 @@ pub mod statistiques {
         })
     }
 
-    /// Note la fin d'une série commencée à `debut`. Interruptions encore
-    /// coupées : la table est celle de ce processeur.
-    pub fn noter(debut: &Debut) {
+    /// Note la fin d'une prise commencée à `debut` : sa prise et son
+    /// attente toujours ; le temps interruptions coupées seulement pour la
+    /// `premiere` de la série (celle qui les a coupées). Interruptions
+    /// encore coupées : la table est celle de ce processeur.
+    pub fn noter(debut: &Debut, premiere: bool) {
         let duree = crate::tsc::lire().wrapping_sub(debut.tsc);
         let cle = debut.lieu as *const Location<'static> as *mut Location<'static>;
         let t = &TABLES[processeur::courant().numero as usize];
@@ -431,10 +442,12 @@ pub mod statistiques {
             PERDUES.fetch_add(1, Ordering::Relaxed);
             return;
         };
-        e.max.fetch_max(duree, Ordering::Relaxed);
         e.prises.fetch_add(1, Ordering::Relaxed);
-        if crate::tsc::en_nanosecondes(duree) > 1_000_000 {
-            e.longues.fetch_add(1, Ordering::Relaxed);
+        if premiere {
+            e.max.fetch_max(duree, Ordering::Relaxed);
+            if crate::tsc::en_nanosecondes(duree) > 1_000_000 {
+                e.longues.fetch_add(1, Ordering::Relaxed);
+            }
         }
         if let Some(attente) = debut.attente {
             e.attente_max.fetch_max(attente, Ordering::Relaxed);
@@ -459,12 +472,57 @@ pub mod statistiques {
     /// besoin pour lui : « Piles du noyau » le mesure).
     static REUNIS: crate::verrou::Verrou<[Option<Reuni>; PLACES]> = crate::verrou::Verrou::new([None; PLACES]);
 
-    /// Affiche les `n` endroits qui ont gardé les interruptions coupées le
-    /// plus longtemps depuis la dernière fois (pour `quoi` : un programme,
-    /// le démarrage), avec leur contention, puis remet tout à zéro. Les
-    /// tables des processeurs en service sont réunies endroit par endroit.
+    /// Affiche, pour `quoi` (un programme, le démarrage), les `N` endroits
+    /// qui ont gardé les interruptions coupées le plus longtemps depuis la
+    /// dernière fois, puis les `N` qu'un autre processeur a le plus souvent
+    /// attendus (la contention, ce que le `lock_stat` de Linux classe
+    /// aussi : c'est elle qui dit si un verrou doit être éclaté, 6j), et
+    /// remet tout à zéro. Les tables des processeurs en service sont
+    /// réunies endroit par endroit, sous le verrou de la table réunie ;
+    /// l'affichage, lui, se fait hors de ce verrou, depuis des copies :
+    /// écrire ces lignes sur le port série prend 30 ms (mesuré, 6j), et
+    /// c'était le plus long de tous les endroits interruptions coupées.
     pub fn afficher(quoi: impl core::fmt::Display) {
-        const N: usize = 8;
+        // Huit endroits longs ; seize attendus : la contention, rare, doit
+        // se voir jusqu'au bout de la liste (le tas, le générateur).
+        let (longs, attendus, perdues, endroits) = reunir::<8, 16>();
+        afficherln!("[verrous] {} : les interruptions coupees le plus longtemps, par endroit :", quoi);
+        for r in longs.into_iter().flatten() {
+            afficherln!("[verrous]   {}:{} : {} us au plus, {} fois plus d'1 ms, {} prises ; attendu {} fois, {} us au plus",
+                        r.lieu().file(), r.lieu().line(), crate::tsc::en_nanosecondes(r.max) / 1000, r.longues, r.prises,
+                        r.contentions, crate::tsc::en_nanosecondes(r.attente_max) / 1000);
+        }
+        afficherln!("[verrous] {} : les plus attendus par un autre processeur :", quoi);
+        if attendus[0].is_none() {
+            afficherln!("[verrous]   aucun");
+        }
+        for r in attendus.into_iter().flatten() {
+            afficherln!("[verrous]   {}:{} : attendu {} fois, {} us au plus, sur {} prises",
+                        r.lieu().file(), r.lieu().line(), r.contentions, crate::tsc::en_nanosecondes(r.attente_max) / 1000, r.prises);
+        }
+        afficherln!("[verrous]   {} endroits sur {} places{}", endroits, PLACES,
+                    if perdues > 0 { " : des mesures perdues, voir ci-dessous" } else { "" });
+        if perdues > 0 {
+            afficherln!("[verrous]   ({} mesures perdues : plus de {} endroits)", perdues, PLACES);
+        }
+    }
+
+    impl Reuni {
+        /// L'endroit, retrouvé de son adresse.
+        fn lieu(&self) -> &'static Location<'static> {
+            // SAFETY: on ne range dans `lieu` que des `&'static Location`
+            // (`noter`), jamais libérées ; non nul : un endroit réuni a été
+            // noté.
+            unsafe { &*(self.lieu as *const Location<'static>) }
+        }
+    }
+
+    /// Réunit les tables des processeurs, choisit les `N` endroits les plus
+    /// longs et les `N` les plus attendus (par sélection, sans allouer ni
+    /// trier la table), les copie, remet les tables à zéro ; le tout sous
+    /// le verrou de la table réunie. Rend aussi les mesures perdues, et le
+    /// nombre d'endroits réunis (pour dimensionner PLACES).
+    fn reunir<const L: usize, const A: usize>() -> ([Option<Reuni>; L], [Option<Reuni>; A], u64, usize) {
         let mut reunis = REUNIS.verrouiller();
         reunis.fill(None);
         let mut perdues = 0u64;
@@ -495,31 +553,24 @@ pub mod statistiques {
                 }
             }
         }
-        // Les N plus longs, par sélection (sans allouer ni trier la table).
-        let mut choisis: [Option<usize>; N] = [None; N];
-        for rang in 0..N {
-            let meilleur = (0..PLACES)
-                .filter(|&i| reunis[i].is_some() && !choisis.contains(&Some(i)))
-                .max_by_key(|&i| reunis[i].map_or(0, |r| r.max));
-            choisis[rang] = meilleur;
+        // Les N premiers selon `cle` (nulle : pas retenu).
+        fn choisir<const N: usize>(reunis: &[Option<Reuni>; PLACES], cle: impl Fn(&Reuni) -> u64) -> [Option<Reuni>; N] {
+            let mut choisis: [Option<usize>; N] = [None; N];
+            for rang in 0..N {
+                choisis[rang] = (0..PLACES)
+                    .filter(|&i| reunis[i].is_some_and(|r| cle(&r) > 0) && !choisis.contains(&Some(i)))
+                    .max_by_key(|&i| reunis[i].map_or(0, |r| cle(&r)));
+            }
+            choisis.map(|c| c.and_then(|i| reunis[i]))
         }
-        afficherln!("[verrous] {} : les interruptions coupees le plus longtemps, par endroit :", quoi);
-        for r in choisis.into_iter().flatten().filter_map(|i| reunis[i]) {
-            // SAFETY: on ne range dans `lieu` que des `&'static Location`
-            // (`noter`), jamais libérées ; non nul : filtré plus haut.
-            let lieu = unsafe { &*(r.lieu as *const Location<'static>) };
-            afficherln!("[verrous]   {}:{} : {} us au plus, {} fois plus d'1 ms, {} prises ; attendu {} fois, {} us au plus",
-                        lieu.file(), lieu.line(), crate::tsc::en_nanosecondes(r.max) / 1000, r.longues, r.prises,
-                        r.contentions, crate::tsc::en_nanosecondes(r.attente_max) / 1000);
-        }
-        let perdues = perdues + PERDUES.swap(0, Ordering::Relaxed);
-        if perdues > 0 {
-            afficherln!("[verrous]   ({} mesures perdues : plus de {} endroits)", perdues, PLACES);
-        }
+        let longs = choisir::<L>(&reunis, |r| r.max);
+        let attendus = choisir::<A>(&reunis, |r| u64::from(r.contentions));
+        let endroits = reunis.iter().filter(|r| r.is_some()).count();
         for n in 0..processeur::nombre() {
             for e in &TABLES[n].0 {
                 e.remettre_a_zero();
             }
         }
+        (longs, attendus, perdues + PERDUES.swap(0, Ordering::Relaxed), endroits)
     }
 }

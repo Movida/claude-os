@@ -48,6 +48,15 @@
 //! deux premiers mots de chacun : le suivant et le précédent) : un bloc
 //! libre ne contient rien d'utile, et la projection directe permet de
 //! l'écrire.
+//!
+//! Un seul verrou pour tous les processeurs ; Linux garde devant son buddy
+//! des listes de pages par processeur (les `per_cpu_pages`), que chacun
+//! prend et rend sans verrou. Mesuré en 6j pendant `claude -p` sur quatre
+//! processeurs (`make verrous-claude-p`, chaque prise comptée depuis la
+//! relecture) : 135 à 150 attentes sur 25 000 allocations par lancement
+//! (0,6 %), 400 sur 120 000 prises toutes entrées comprises (0,3 %), 204 µs
+//! au plus, le cinquième endroit le plus attendu. Des listes par processeur
+//! quand une mesure le demandera.
 
 use crate::verrou::Verrou;
 use crate::{cadres, espace};

@@ -1453,6 +1453,26 @@ test-verrous.bin: programmes.cpio FORCE
 	cd noyau && cargo build --release --features verrous --target-dir target/test-verrous 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	$(call image,noyau/target/test-verrous/x86_64-unknown-none/release/noyau,programmes.cpio,test-verrous)
 
+# Les mêmes statistiques pendant `claude -p` (6j) : le noyau avec la
+# fonctionnalité verrous sur l'archive de claude-p (la fausse API, sans
+# jeton). Ce que les verrous courts ont attendu pendant les deux lancements
+# (la contention : « attendu N fois, M us au plus »), et combien de fois les
+# verrous qui dorment ont été pris en tournant ou en dormant : c'est ce qui
+# décide d'un tas ou d'un générateur par processeur (tas.rs, aleatoire.rs).
+verrous-claude-p: test-verrous-claude-p.bin
+	rm -f test-verrous-claude-p.log; \
+	timeout $(DUREE_CLAUDE_P) $(QEMU_TEST) -drive format=raw,file=test-verrous-claude-p.bin,if=$(QEMU_DISQUE) $(QEMU_OPTIONS) \
+	  -serial file:test-verrous-claude-p.log & q=$$!; \
+	for i in $$(seq $$(( $(DUREE_CLAUDE_P) * 10 ))); do \
+	  grep -qF -- "[noyau] Groupe des lignes" test-verrous-claude-p.log 2>/dev/null && break; kill -0 $$q 2>/dev/null || break; sleep 0.1; \
+	done; \
+	kill $$q 2>/dev/null; wait $$q 2>/dev/null; \
+	grep -E '^\[verrous\]|claude : termine|Groupe des lignes' test-verrous-claude-p.log
+
+test-verrous-claude-p.bin: claude-p.cpio FORCE
+	cd noyau && cargo build --release --features verrous --target-dir target/test-verrous 2>&1 | tee /dev/stderr | (! grep -q '^warning')
+	$(call image,noyau/target/test-verrous/x86_64-unknown-none/release/noyau,claude-p.cpio,test-verrous-claude-p)
+
 test-programmes.bin: tests.cpio FORCE
 	cd noyau && cargo build --release --features test-programmes --target-dir target/test-programmes 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	$(call image,noyau/target/test-programmes/x86_64-unknown-none/release/noyau,tests.cpio,test-programmes)
@@ -1495,4 +1515,4 @@ clean:
 	cd crypto && cargo clean
 	cd roue && cargo clean
 
-.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace verrous tests-hote tests-hote-root tests-qemu claude-p jeton claude-bonjour suite clean FORCE
+.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace verrous verrous-claude-p tests-hote tests-hote-root tests-qemu claude-p jeton claude-bonjour suite clean FORCE

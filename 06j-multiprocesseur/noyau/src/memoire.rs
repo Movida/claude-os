@@ -226,10 +226,15 @@ pub struct Memoire {
     /// Les tables de pages, sous leur verrou court (le `page_table_lock`
     /// de Linux) : une faute, qui ne tient la mémoire qu'en lecture, le
     /// prend pour poser son entrée ; qui la tient en écriture y accède sans
-    /// lui (`get_mut`). UNIPROCESSEUR : un verrou pour tout l'espace ;
-    /// Linux en a un par table de dernier niveau (les « split PTE
-    /// ptlocks »), pour que des fautes sur plusieurs processeurs ne
-    /// s'attendent pas : à voir en 6j, d'après les statistiques des verrous.
+    /// lui (`get_mut`). Un verrou pour tout l'espace ; Linux en a un par
+    /// table de dernier niveau (les « split PTE ptlocks »), pour que des
+    /// fautes sur plusieurs processeurs ne s'attendent pas. Mesuré en 6j
+    /// pendant `claude -p` sur quatre processeurs (`make verrous-claude-p`,
+    /// chaque prise comptée depuis la relecture de 6j) : le plus attendu de
+    /// tous les verrous courts, 600 à 730 attentes sur 50 000 prises par
+    /// lancement (1,2 à 1,5 %), 166 µs au plus : trop peu pour un verrou par
+    /// table ; à remesurer quand `claude` travaillera pour de bon (6l, le
+    /// shell).
     pub espace: Verrou<EspaceUtilisateur>,
     /// Les compteurs de l'espace (ses pages en place, ses tables, son pic),
     /// les mêmes que derrière le verrou : lisibles ici sans lui (statm, le

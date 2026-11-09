@@ -592,10 +592,16 @@ fn par_charge_decroissante(moi: usize) -> impl Iterator<Item = usize> {
 }
 
 /// Un processeur qui n'a plus rien tire une tâche prête de la file la plus
-/// chargée qui en ait une à donner (le `newidle_balance` de Linux). Vrai
-/// si une tâche est arrivée dans sa file. Interruptions coupées.
+/// chargée qui en ait une à donner (le `newidle_balance` de Linux) : une
+/// file d'au moins deux entités (une seule, c'est celle qui s'exécute, et
+/// la charge se lit sans verrou : prendre les deux verrous pour rien
+/// faisait attendre l'ordonnanceur de l'autre processeur à chaque tic d'un
+/// processeur inactif, 7 % de ses prises pendant `claude -p`, mesuré par
+/// `make verrous-claude-p` à la relecture de 6j ; Linux ne regarde de même
+/// qu'une file dont `nr_running > 1`). Vrai si une tâche est arrivée dans
+/// sa file. Interruptions coupées.
 fn tirer(moi: usize) -> bool {
-    par_charge_decroissante(moi).any(|source| FILES[source].charge.load(Ordering::Relaxed) > 0 && tirer_de(source, moi))
+    par_charge_decroissante(moi).any(|source| FILES[source].charge.load(Ordering::Relaxed) > 1 && tirer_de(source, moi))
 }
 
 /// L'équilibrage du tic (voir l'en-tête) : d'abord une tâche qu'une file ne

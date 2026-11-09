@@ -37,10 +37,13 @@
 //!     classe (`min_partial`), pour ne pas rendre puis reprendre sans cesse
 //!     une page au buddy. Rendre tout de suite coûte de redécouper une page
 //!     de temps en temps, et garde exact le compte de la mémoire ;
-//!   - un seul verrou : SLUB a des listes par processeur, pour ne pas se
-//!     disputer le verrou.
-//!     UNIPROCESSEUR : un seul verrou pour tout le tas ; avec plusieurs
-//!     processeurs, un cache par processeur devant lui (les `cpu_slab`).
+//!   - un seul verrou : SLUB a des listes par processeur (les `cpu_slab`),
+//!     pour ne pas se disputer le verrou. Mesuré en 6j, sur quatre
+//!     processeurs, pendant `claude -p` (`make verrous-claude-p`) : le
+//!     verrou du tas n'est pas parmi les seize endroits les plus attendus
+//!     (moins de cinq attentes par lancement, quand le verrou des tables de
+//!     pages en compte 700). Un cache par processeur devant lui quand une
+//!     mesure le demandera.
 //!
 //! Un seul bloc ne dépasse pas 4 Mio (pages::ORDRE_MAX) : au-delà, une
 //! allocation échoue. `try_reserve` le dit proprement (memory.grow d'un
