@@ -32,6 +32,13 @@
  * cadre rendu était déjà repris et mis à zéro (la relecture de 6j, et deux
  * essais en coupant le vidage à distance dans le noyau ; le troisième dit
  * ECHEC dès le premier tour).
+ * Puis « munmap en lecture » (6j) : un fil A retire d'un coup 32 Mio
+ * (8192 pages) qu'il a touchées ; pendant ce temps un fil B, sur un autre
+ * processeur, faute dans une autre zone, et compte les fautes servies
+ * pendant le munmap (le drapeau d'A encore levé après la faute). Linux, et
+ * notre noyau depuis 6j, retirent les zones mémoire tenue en écriture puis
+ * rendent les pages en LECTURE (do_vmi_align_munmap) : B passe. Tout en
+ * écriture (jusqu'à 6i), B attendait la fin du munmap : zéro faute.
  * Il tourne dans notre noyau et sur l'hôte.
  */
 #define _GNU_SOURCE
@@ -277,6 +284,85 @@ static void tester_tlb(void)
                tlb_perimee, TOURS_TLB, tlb_cpu_a, tlb_cpu_b, a, b);
 }
 
+/* Le test « munmap en lecture » : la grande zone d'A, les drapeaux, le
+ * compte de B. */
+#define GRAND (32 << 20)
+static volatile int dans_munmap, b_pret;
+static long fautes_pendant;
+static int mu_cpu_a = -1, mu_cpu_b = -1;
+
+/* A : touche 8192 pages, attend que B soit en place, puis les retire d'un
+ * coup, drapeau levé. */
+static void *retireur(void *arg)
+{
+    mu_cpu_a = epingler((int)(long)arg);
+    unsigned char *grand = mmap(NULL, GRAND, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (grand == MAP_FAILED) {
+        ecart_vu("munmap en lecture : mmap d'A", errno);
+        return NULL;
+    }
+    for (long i = 0; i < GRAND / PAGE; i++)
+        grand[i * PAGE] = 1;
+    while (!__atomic_load_n(&b_pret, __ATOMIC_ACQUIRE))
+        ;
+    __atomic_store_n(&dans_munmap, 1, __ATOMIC_SEQ_CST);
+    if (munmap(grand, GRAND) != 0)
+        ecart_vu("munmap en lecture : munmap", errno);
+    __atomic_store_n(&dans_munmap, 0, __ATOMIC_SEQ_CST);
+    return NULL;
+}
+
+/* B : se met en place, puis faute page après page tant que le drapeau d'A
+ * est levé ; une faute servie drapeau encore levé a été servie pendant le
+ * munmap. */
+static void *fauteur(void *arg)
+{
+    mu_cpu_b = epingler((int)(long)arg);
+    unsigned char *z = mmap(NULL, GRAND, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (z == MAP_FAILED)
+        ecart_vu("munmap en lecture : mmap de B", errno);
+    __atomic_store_n(&b_pret, 1, __ATOMIC_RELEASE);
+    if (z == MAP_FAILED)
+        return NULL;
+    while (!__atomic_load_n(&dans_munmap, __ATOMIC_SEQ_CST))
+        ;
+    for (long i = 0; i < GRAND / PAGE && __atomic_load_n(&dans_munmap, __ATOMIC_SEQ_CST); i++) {
+        z[i * PAGE] = 1;
+        if (__atomic_load_n(&dans_munmap, __ATOMIC_SEQ_CST))
+            fautes_pendant++;
+    }
+    munmap(z, GRAND);
+    return NULL;
+}
+
+static void tester_munmap_lecture(void)
+{
+    int a, b, avant = ecarts;
+    if (!deux_processeurs(&a, &b)) {
+        printf("[linux] fautes : munmap en lecture : un seul processeur, rien a mesurer\n");
+        return;
+    }
+    pthread_t fa, fb;
+    pthread_create(&fa, NULL, retireur, (void *)(long)a);
+    pthread_create(&fb, NULL, fauteur, (void *)(long)b);
+    pthread_join(fa, NULL);
+    pthread_join(fb, NULL);
+    if (mu_cpu_a != a || mu_cpu_b != b)
+        ecart_vu("munmap en lecture : les deux fils ne sont pas chacun sur son processeur", (unsigned long)(mu_cpu_a * 64 + mu_cpu_b));
+    /* Plus de seize : une faute ou deux comptées pourraient avoir commencé
+       avant qu'A ne prenne la mémoire (elles finiraient pendant, même si le
+       noyau la tenait en écriture) ; des dizaines, servies pendant qu'il
+       retire 8192 pages, prouvent la lecture partagée (486 mesurées dans
+       notre noyau sous QEMU). */
+    if (fautes_pendant <= 16)
+        ecart_vu("munmap en lecture : trop peu de fautes servies pendant le munmap", fautes_pendant);
+    if (ecarts == avant)
+        printf("[linux] fautes : munmap en lecture : pendant qu'un fil retirait %d pages, un autre a faute %ld fois : ok\n", GRAND / PAGE, fautes_pendant);
+    else
+        printf("[linux] fautes : munmap en lecture : %ld fautes servies pendant le munmap de %d pages, fils sur les processeurs %d et %d (attendus %d et %d) : ECHEC\n",
+               fautes_pendant, GRAND / PAGE, mu_cpu_a, mu_cpu_b, a, b);
+}
+
 static void *finisseur(void *arg)
 {
     (void)arg;
@@ -331,5 +417,6 @@ int main(int argc, char **argv)
                ecarts, ecarts ? ecart : "aucun", assez ? "oui" : "non");
     int avant = ecarts;
     tester_tlb();
+    tester_munmap_lecture();
     return ecarts != 0 || !assez || avant != ecarts;
 }

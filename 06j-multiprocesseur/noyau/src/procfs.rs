@@ -891,11 +891,13 @@ pub fn ecrire(source: u32, argument: u32, octets: &[u8], longueur: u64) -> Resul
 /// segment exécutable du programme : `end_code - start_code`) ; 0 (les
 /// bibliothèques, toujours 0 depuis Linux 2.6) ; les données (les zones
 /// privées inscriptibles, hors pile, plus la pile : `data_vm + stack_vm`) ;
-/// 0. Les compteurs du résident sont ceux que tient déjà l'espace
-/// d'adressage (les `rss_stat` de Linux) ; le reste, sommé sur les zones.
-/// UNIPROCESSEUR : Linux les lit sans le mmap_lock (`task_statm`, des
-/// compteurs) ; nous, mémoire tenue en lecture : sur un seul processeur,
-/// elle ne fait attendre personne de plus. En 6j.
+/// 0. Le résident vient des compteurs de l'espace, lus sans verrou (les
+/// `rss_stat` de Linux, 6j) ; le reste est sommé sur les zones, mémoire
+/// tenue en lecture. Linux a aussi ceux-là en compteurs (`total_vm`,
+/// `data_vm`, `stack_vm`), entretenus à chaque changement de zone, et lit
+/// tout sans le mmap_lock ; sommer les zones sous la lecture, qui ne fait
+/// attendre qu'un mmap ou un munmap, jamais une faute, est plus simple à
+/// tenir juste.
 fn statm(pid: u32) -> Result<Vec<u8>, Erreur> {
     let (taille, resident, partage, code, donnees) = processus::memoire_du_pid(pid, |m| {
         let (debut, fin) = m.code;
@@ -904,11 +906,8 @@ fn statm(pid: u32) -> Result<Vec<u8>, Erreur> {
             .filter(|z| z.nature == Nature::Pile || z.droits.ecriture)
             .map(|z| z.taille() / 4096)
             .sum();
-        let (pages, fichier) = {
-            let e = m.espace.verrouiller();
-            (e.pages() as u64, e.pages_fichier() as u64)
-        };
-        (m.taille_virtuelle() / 4096, pages + fichier, fichier, code, donnees)
+        let c = m.compteurs();
+        (m.taille_virtuelle() / 4096, c.resident() as u64, c.pages_fichier() as u64, code, donnees)
     }).unwrap_or((0, 0, 0, 0, 0));
     let mut t = Ecrit(Vec::new());
     writeln!(t, "{} {} {} {} 0 {} 0", taille, resident, partage, code, donnees).map_err(|_| Erreur::ENOMEM)?;

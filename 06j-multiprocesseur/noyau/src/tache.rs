@@ -1149,7 +1149,7 @@ unsafe fn charger_espace(nouvelle: &Tache, espace: u64) {
     let ancien = zone.espace_charge.swap(core::ptr::null_mut(), Ordering::Relaxed);
     if espace != pagination::pml4_noyau() {
         let masque = nouvelle.processus.as_ref().expect("un espace de programme sans processus").processeurs();
-        masque.0.fetch_or(bit, Ordering::SeqCst);
+        masque.processeurs.fetch_or(bit, Ordering::SeqCst);
         zone.espace_charge.store(masque as *const _ as *mut _, Ordering::Relaxed);
     }
     // SAFETY: garanti par l'appelant.
@@ -1166,7 +1166,7 @@ unsafe fn charger_espace(nouvelle: &Tache, espace: u64) {
         // SAFETY: le masque est tenu par l'entrée du processus de la tâche
         // qu'on quitte, vivante (voir processeur.rs, `espace_charge`).
         // Release : fini de parcourir ses tables.
-        unsafe { (*ancien).0.fetch_and(!bit, Ordering::Release) };
+        unsafe { (*ancien).processeurs.fetch_and(!bit, Ordering::Release) };
     }
 }
 
@@ -1182,7 +1182,7 @@ fn quitter_espace() {
         // Après CR3, comme dans `charger_espace`.
         // SAFETY: comme dans `charger_espace` : la tâche courante tient son
         // processus.
-        unsafe { (*ancien).0.fetch_and(!(1u64 << zone.numero), Ordering::Release) };
+        unsafe { (*ancien).processeurs.fetch_and(!(1u64 << zone.numero), Ordering::Release) };
     }
 }
 
@@ -1693,8 +1693,8 @@ pub fn forcer(signal: Signal, raison: impl fmt::Display) {
 /// (le dernier fil l'attendrait pour toujours, dans `fil_termine`).
 fn arreter_plus_de_memoire() -> ! {
     let (virtuelle, en_place, fichiers, tables) = processus::memoire_lue(|m| {
-        let e = m.espace.verrouiller();
-        (m.taille_virtuelle(), e.pages() as u64 * 4096, e.pages_fichier() as u64 * 4096, e.tables() as u64 * 4096)
+        let c = m.compteurs();
+        (m.taille_virtuelle(), c.pages() as u64 * 4096, c.pages_fichier() as u64 * 4096, c.tables() as u64 * 4096)
     });
     // Le message de Linux : « Out of memory: Killed process 1234 (a.out)
     // total-vm:...kB, anon-rss:...kB, file-rss:...kB, ... pgtables:...kB ».

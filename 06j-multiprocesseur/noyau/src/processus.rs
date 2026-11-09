@@ -246,6 +246,10 @@ pub struct Entree {
     /// ici, lisible sans le verrou qui dort, pour la bascule (tache.rs,
     /// `charger_espace`), qui met et retire le bit de son processeur.
     processeurs: Arc<crate::espace_utilisateur::MasqueProcesseurs>,
+    /// Ses pages en place, ses tables, son pic (espace_utilisateur.rs,
+    /// `Compteurs`), partagés avec sa mémoire : lisibles sans le verrou qui
+    /// dort (getrusage, 6j).
+    compteurs: Arc<crate::espace_utilisateur::Compteurs>,
     code: AtomicI32,
     /// Son temps de calcul, en nanosecondes : celui de tous ses fils,
     /// vivants et morts, compté avec celui de chaque fil (tache.rs), sans
@@ -293,6 +297,11 @@ impl Entree {
         &self.processeurs
     }
 
+    /// Ses compteurs de mémoire en place (voir le champ).
+    pub fn compteurs(&self) -> &crate::espace_utilisateur::Compteurs {
+        &self.compteurs
+    }
+
     pub fn pid(&self) -> u32 {
         self.pid
     }
@@ -326,10 +335,12 @@ impl Entree {
         // est sortie de son verrou (une table vide reste, pour un lecteur de
         // /proc/<pid>/fd), puis fermée (`Descripteurs::drop`), ce qui prend
         // celui des fichiers une fois par descripteur.
-        // UNIPROCESSEUR : Linux ne prend pas le mmap_lock pour la défaire
-        // (`exit_mmap`, quand plus personne ne la tient : `mmput`) ; sur un
-        // seul processeur, l'écriture ne fait attendre personne de plus. En
-        // 6j.
+        // Linux ne prend pas le mmap_lock pour la défaire (`exit_mmap`,
+        // quand plus personne ne la tient : `mmput` compte les utilisateurs
+        // de la mm_struct, dont /proc). Décision (6j) : l'écriture reste,
+        // c'est elle qui attend qu'un lecteur de /proc ait fini ; la fin
+        // d'un processus n'a pas à aller vite, et un compte d'utilisateurs
+        // serait une seconde façon de dire la même chose.
         let memoire = self.memoire.ecrire().take();
         drop(memoire);
         let descripteurs = core::mem::take(&mut *self.descripteurs.verrouiller());
@@ -450,12 +461,14 @@ pub fn initialiser(max: usize) {
 pub fn ajouter(processus: Processus, descripteurs: Descripteurs, mut memoire: Memoire, nom: NomCourt) -> Option<Arc<Entree>> {
     let identite = processus.identite;
     let processeurs = memoire.processeurs();
+    let compteurs = memoire.compteurs().clone();
     let e = Arc::new(Entree {
         pid: processus.pid,
         processus: Verrou::new(Some(processus)),
         descripteurs: Verrou::new(descripteurs),
         memoire: VerrouLE::new(Some(memoire)),
         processeurs,
+        compteurs,
         code: AtomicI32::new(0),
         calcul: AtomicU64::new(0),
         vivants: AtomicU32::new(0),
@@ -671,6 +684,22 @@ pub fn memoire_ecrite<R>(f: impl FnOnce(&mut Memoire) -> R) -> R {
     let _tenue = Tenue::prendre();
     let mut m = e.memoire.ecrire();
     f(m.as_mut().expect("memoire d'un processus mort"))
+}
+
+/// La mémoire du processus de la tâche courante, tenue en ÉCRITURE le temps
+/// de `ecrit`, puis, s'il a réussi, RÉTROGRADÉE en lecture (le
+/// `mmap_write_downgrade` de Linux) le temps de `lu` : munmap retire ses
+/// zones en écriture et rend leurs pages en lecture, pendant que les fautes
+/// des autres fils continuent (6j, memoire.rs). Mêmes règles que
+/// `memoire_lue` ; la tâche tient sa mémoire d'un bout à l'autre.
+#[track_caller]
+pub fn memoire_ecrite_puis_lue<X, E, R>(ecrit: impl FnOnce(&mut Memoire) -> Result<X, E>, lu: impl FnOnce(&Memoire, X) -> R) -> Result<R, E> {
+    let e = crate::tache::courante().processus().expect("memoire d'un processus sans processus").clone();
+    let _tenue = Tenue::prendre();
+    let mut m = e.memoire.ecrire();
+    let x = ecrit(m.as_mut().expect("memoire d'un processus mort"))?;
+    let m = m.retrograder();
+    Ok(lu(m.as_ref().expect("memoire d'un processus mort"), x))
 }
 
 /// La mémoire du processus `pid` (vivant), en lecture le temps de `f` :

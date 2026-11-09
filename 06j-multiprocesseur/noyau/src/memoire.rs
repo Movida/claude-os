@@ -51,7 +51,8 @@
 use core::fmt;
 
 use crate::descripteurs::Fichier;
-use crate::espace_utilisateur::{self, Erreur, EspaceUtilisateur, Servi};
+use crate::espace_utilisateur::{self, Compteurs, Erreur, EspaceUtilisateur, Servi};
+use crate::partage::Arc;
 use crate::verrou::Verrou;
 use crate::vfs;
 use crate::programmes::NomCourt;
@@ -230,6 +231,10 @@ pub struct Memoire {
     /// ptlocks »), pour que des fautes sur plusieurs processeurs ne
     /// s'attendent pas : à voir en 6j, d'après les statistiques des verrous.
     pub espace: Verrou<EspaceUtilisateur>,
+    /// Les compteurs de l'espace (ses pages en place, ses tables, son pic),
+    /// les mêmes que derrière le verrou : lisibles ici sans lui (statm, le
+    /// tueur OOM ; espace_utilisateur.rs, `Compteurs`).
+    compteurs: Arc<Compteurs>,
     pub zones: Zones,
     /// Le début du tas : la page qui suit le dernier segment (le .bss).
     pub debut_tas: u64,
@@ -258,7 +263,9 @@ impl Memoire {
         // qu'avec le dernier d'entre eux, et la vérification « memoire
         // rendue » de chaque programme se tromperait.
         let zones = Zones::avec_capacite(PAGE as usize / size_of::<Zone>())?;
-        Ok(Memoire { espace: Verrou::new(EspaceUtilisateur::creer()?), zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0) })
+        let espace = EspaceUtilisateur::creer()?;
+        let compteurs = espace.compteurs().clone();
+        Ok(Memoire { espace: Verrou::new(espace), compteurs, zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0) })
     }
 
     /// Les tables de pages, sans leur verrou : qui a `&mut Memoire` (la
@@ -464,18 +471,35 @@ impl Memoire {
     }
 
     /// Retire [debut, fin[ (alignés) de la carte, puis des tables, dont
-    /// celles devenues vides : munmap, brk qui recule. Échoue, sans rien
-    /// changer, si une zone doit être coupée en deux et que la carte n'a
-    /// plus de place (ENOMEM).
+    /// celles devenues vides : brk qui recule, MAP_FIXED, la pile d'un
+    /// programme qu'on raccourcit (mémoire tenue en écriture). munmap, lui,
+    /// fait les deux temps lui-même, la carte en écriture et les tables en
+    /// lecture (linux.rs). Échoue, sans rien changer, si une zone doit être
+    /// coupée en deux et que la carte n'a plus de place (ENOMEM).
     pub fn retirer(&mut self, debut: u64, fin: u64) -> Result<(), Erreur> {
-        self.zones.retirer(debut, fin, |_| (), &mut references)?;
-        // Un grand lot : les TLB des autres processeurs vidés le moins
-        // souvent possible (voir espace_utilisateur::Lot) ; il se vide en
-        // sortant, sans verrou tenu (la mémoire est tenue en écriture).
-        let mut lot = espace_utilisateur::Lot::new(self.tables());
-        lot.reserver(GRAND_LOT);
-        self.tables().retirer_plage(debut, fin, true, &mut lot);
+        self.retirer_zones(debut, fin)?;
+        self.rendre_pages(debut, fin);
         Ok(())
+    }
+
+    /// Le premier temps : retire [debut, fin[ de la carte (mémoire tenue en
+    /// écriture : la carte change). Dès lors, aucune faute ne peut plus y
+    /// poser de page : il n'y a plus de zone, SIGSEGV.
+    pub fn retirer_zones(&mut self, debut: u64, fin: u64) -> Result<(), Erreur> {
+        self.zones.retirer(debut, fin, |_| (), &mut references)?;
+        Ok(())
+    }
+
+    /// Le second temps : rend les pages et les tables de [debut, fin[, dont
+    /// les zones ont été retirées. La mémoire tenue en LECTURE suffit (6j) :
+    /// les tables sont sous leur verrou, par tranches, chaque lot vidé sans
+    /// lui (espace_utilisateur.rs), et les fautes des autres fils, ailleurs,
+    /// continuent pendant ce temps ; un grand lot, pour vider les TLB des
+    /// autres processeurs le moins souvent possible. C'est le
+    /// `do_vmi_align_munmap` de Linux : les zones détachées en écriture,
+    /// `mmap_write_downgrade`, puis `unmap_region`.
+    pub fn rendre_pages(&self, debut: u64, fin: u64) {
+        EspaceUtilisateur::retirer_par_tranches(&self.espace, debut, fin, true, GRAND_LOT);
     }
 
     /// Où placer une nouvelle projection de `taille` octets (alignée, non
@@ -559,18 +583,21 @@ impl Memoire {
     /// Retire les pages de [debut, fin[ sans toucher aux zones
     /// (MADV_DONTNEED) : elles se reliront à zéro, ou depuis le fichier
     /// projeté (les segments du programme compris). Les tables restent, la
-    /// zone aussi. En écriture, interruptions actives.
-    /// UNIPROCESSEUR : Linux le fait mémoire tenue en LECTURE (des fautes
-    /// d'autres fils peuvent continuer pendant ce temps), les tables sous
-    /// leur verrou, table par table (`zap_pte_range`) ; sur un seul
-    /// processeur, l'écriture ne fait attendre personne de plus. En 6j.
-    pub fn oublier(&mut self, debut: u64, fin: u64) {
-        let espace = self.espace.get_mut();
-        let mut lot = espace_utilisateur::Lot::new(espace);
-        lot.reserver(GRAND_LOT);
+    /// zone aussi. Mémoire tenue en LECTURE (6j, le `zap_page_range_single`
+    /// de Linux sous `mmap_read_lock`), les tables sous leur verrou par
+    /// tranches (espace_utilisateur.rs), interruptions actives : les fautes
+    /// des autres fils continuent ; celles de la plage même peuvent poser
+    /// une page juste avant ou juste après notre passage, ce que madvise
+    /// permet (ses pages « peuvent » être rendues).
+    pub fn oublier(&self, debut: u64, fin: u64) {
         for z in self.zones.morceaux(debut, fin) {
-            espace.retirer_plage(z.debut, z.fin, false, &mut lot);
+            EspaceUtilisateur::retirer_par_tranches(&self.espace, z.debut, z.fin, false, GRAND_LOT);
         }
+    }
+
+    /// Ses compteurs (voir le champ).
+    pub fn compteurs(&self) -> &Arc<Compteurs> {
+        &self.compteurs
     }
 
     /// Les processeurs qui ont chargé l'espace (espace_utilisateur.rs), à

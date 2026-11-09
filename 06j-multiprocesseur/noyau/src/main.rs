@@ -1295,7 +1295,10 @@ fn tester_vecteurs() {
 /// chargé (son masque), une page projetée puis retirée : le lot demande le
 /// vidage aux autres processeurs, et chacun l'a reçu (son compte d'appels
 /// reçus a monté : d'au moins un, un autre appel peut tomber en même
-/// temps). Le mécanisme seul : les secondaires ignorent une PML4 qu'ils
+/// temps). Puis deux retraits en cours : le lot du premier, rempli et PAS
+/// vidé, pendant qu'un second retrait de la même page ne trouve rien ; il
+/// doit quand même demander le vidage aux autres (`MasqueProcesseurs::
+/// retraits`). Le mécanisme seul : les secondaires ignorent une PML4 qu'ils
 /// n'ont pas chargée.
 fn tester_tlb() {
     use espace_utilisateur::{EspaceUtilisateur, Lot};
@@ -1311,17 +1314,28 @@ fn tester_tlb() {
     let rw = zones::Droits { lecture: true, ecriture: true, execution: false };
     let e = verrou::Verrou::new(EspaceUtilisateur::creer().expect("plus de memoire"));
     let page = 0x40_0000;
+    // 1. Une page retirée.
     let avant = recus();
     e.verrouiller().projeter_neuve(page, rw).expect("plus de memoire");
-    e.verrouiller().processeurs().0.store(processeur::masque_en_service(), Ordering::Relaxed);
+    e.verrouiller().processeurs().processeurs.store(processeur::masque_en_service(), Ordering::Relaxed);
     let mut lot = Lot::new(&e.verrouiller());
     e.verrouiller().retirer_plage(page, page + 4096, true, &mut lot);
     lot.vider();
     let simple = chacun_a_recu(&avant);
-    e.verrouiller().processeurs().0.store(0, Ordering::Relaxed);
+    // 2. Deux retraits en cours.
+    e.verrouiller().projeter_neuve(page, rw).expect("plus de memoire");
+    let avant = recus();
+    let mut premier = Lot::new(&e.verrouiller());
+    e.verrouiller().processeurs().retraits.fetch_add(1, Ordering::SeqCst);
+    e.verrouiller().retirer_plage(page, page + 4096, false, &mut premier);
+    EspaceUtilisateur::retirer_par_tranches(&e, page, page + 4096, false, 0);
+    let emboite = chacun_a_recu(&avant);
+    e.verrouiller().processeurs().retraits.fetch_sub(1, Ordering::SeqCst);
+    premier.vider();
+    e.verrouiller().processeurs().processeurs.store(0, Ordering::Relaxed);
     drop(e);
-    afficherln!("[noyau] TLB : une page retiree d'un espace que {} processeurs ont charge : vidage demande aux {} autres, recu par chacun : {}.",
-                processeur::nombre(), processeur::nombre() - 1, ok(simple));
+    afficherln!("[noyau] TLB : une page retiree d'un espace que {} processeurs ont charge : vidage demande aux {} autres, recu par chacun : {} ; un second retrait pendant qu'un premier n'a pas vide : vidage demande quand meme : {}.",
+                processeur::nombre(), processeur::nombre() - 1, ok(simple), ok(emboite));
 }
 
 /// Vérifie la marque de la copie à l'écriture (6j, espace_utilisateur.rs,

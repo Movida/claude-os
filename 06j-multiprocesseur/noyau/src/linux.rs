@@ -843,14 +843,14 @@ fn peupler(debut: u64, fin: u64, ecriture: bool) -> Result<(), Echec> {
 /// pages. Comme Linux : adresse non alignée, longueur nulle, ou plage qui
 /// sort des adresses des programmes : EINVAL ; une plage où il n'y a rien
 /// n'est pas une erreur ; couper une zone en deux quand la carte est
-/// pleine : ENOMEM. Les pages touchées sont rendues mémoire du processus
-/// tenue en écriture (un verrou qui dort, depuis 6i), interruptions
-/// actives : un munmap de centaines de Mio ne fait plus perdre ses tics à
-/// l'horloge.
-/// UNIPROCESSEUR : Linux retire les zones en écriture, puis rétrograde en
-/// lecture pour rendre les pages (`do_vmi_align_munmap`), et les fautes des
-/// autres fils reprennent pendant ce temps ; sur un seul processeur,
-/// l'écriture ne fait attendre personne de plus. En 6j.
+/// pleine : ENOMEM. En deux temps, comme Linux (`do_vmi_align_munmap`) :
+/// les zones retirées mémoire du processus tenue en ÉCRITURE (un verrou qui
+/// dort, depuis 6i), puis le verrou RÉTROGRADÉ en lecture pour rendre les
+/// pages et les tables (6j, `mmap_write_downgrade`) : les fautes des autres
+/// fils, ailleurs dans la mémoire, continuent pendant ce temps ; dans la
+/// plage, il n'y a plus de zone, une faute y fait SIGSEGV comme après.
+/// Interruptions actives : un munmap de centaines de Mio ne fait pas perdre
+/// ses tics à l'horloge (memoire.rs, `rendre_pages`).
 fn munmap(adresse: u64, longueur: u64) -> i64 {
     if adresse % PAGE != 0 || longueur == 0 {
         return -EINVAL;
@@ -861,7 +861,7 @@ fn munmap(adresse: u64, longueur: u64) -> i64 {
     if fin > ADRESSE_MAX {
         return -EINVAL;
     }
-    match processus::memoire_ecrite(|m| m.retirer(adresse, fin)) {
+    match processus::memoire_ecrite_puis_lue(|m| m.retirer_zones(adresse, fin), |m, ()| m.rendre_pages(adresse, fin)) {
         Ok(()) => 0,
         Err(_) => -ENOMEM,
     }
@@ -1010,9 +1010,10 @@ fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
     let (debut, fin_zones) = (adresse.min(ADRESSE_MAX), fin.min(ADRESSE_MAX));
     let couverte = fin <= ADRESSE_MAX && processus::memoire_lue(|m| m.zones.couverte(debut, fin_zones));
     let resultat = match conseil {
-        // Mémoire tenue en écriture : les pages sont rendues interruptions
-        // actives (Memoire::oublier dit pourquoi pas en lecture, comme Linux).
-        DONTNEED | FREE | DONTNEED_LOCKED => processus::memoire_ecrite(|m| {
+        // Mémoire tenue en LECTURE, comme Linux (6j, Memoire::oublier) : les
+        // pages sont rendues interruptions actives, et les fautes des autres
+        // fils continuent.
+        DONTNEED | FREE | DONTNEED_LOCKED => processus::memoire_lue(|m| {
             if conseil == FREE && m.zones.morceaux(debut, fin_zones).any(|z| z.fichier.is_some()) {
                 return Err(-EINVAL);
             }

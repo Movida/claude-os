@@ -80,10 +80,11 @@
 //!     rend les pages (`Lot`, notre `mmu_gather`) porte toutes les
 //!     invalidations ; `retirer_plage` REMPLIT le lot de l'appelant au lieu
 //!     de le vider, et l'appelant le vide une fois la garde du verrou des
-//!     tables lâchée (`retirer_par_tranches`, la troncature ; la pose d'une
+//!     tables lâchée (`retirer_par_tranches` : munmap, madvise et la
+//!     troncature, qui ne tiennent la mémoire qu'en lecture ; la pose d'une
 //!     page de fichier qui recommence, memoire.rs) ; qui tient la mémoire
-//!     en écriture (munmap, mprotect, madvise) n'a pas ce verrou et vide
-//!     quand il veut. Le lot vide les TLB partout, PUIS rend les cadres
+//!     en écriture (mprotect, la dernière tâche qui rend l'espace) n'a pas
+//!     ce verrou et vide quand il veut. Le lot vide les TLB partout, PUIS rend les cadres
 //!     (une page rendue avant que tous l'aient oubliée pourrait être relue
 //!     par l'autre fil une fois donnée à quelqu'un d'autre) ;
 //!   - LA COPIE À L'ÉCRITURE, dans l'ordre de Linux (`wp_page_copy`).
@@ -128,7 +129,7 @@ use crate::faillible::VecFaillible;
 use crate::partage::Arc;
 use crate::{espace, pages, pagination, smp};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use pagination::{ADRESSE, PRESENTE};
 use zones::Droits;
 
@@ -173,7 +174,83 @@ fn jeton_de_marque() -> u64 {
 /// (le `mm_cpumask` de Linux, voir l'en-tête) : partagé entre l'espace
 /// (qui le lit pour vider les TLB) et l'entrée du processus (processus.rs :
 /// la bascule l'écrit, tache.rs, sans le verrou qui dort de la mémoire).
-pub struct MasqueProcesseurs(pub AtomicU64);
+/// Avec lui, le nombre de retraits de pages en cours dans l'espace.
+pub struct MasqueProcesseurs {
+    pub processeurs: AtomicU64,
+    /// Les retraits de pages en cours, mémoire tenue en lecture (madvise,
+    /// la troncature, le second temps de munmap : `retirer_par_tranches`),
+    /// le `tlb_flush_pending` de Linux. Deux retraits de la même plage en
+    /// même temps : le second ne trouve que des entrées déjà effacées, son
+    /// lot est vide, et il rendrait la main pendant que le lot du premier,
+    /// qui porte les traductions à vider, attend encore : un autre
+    /// processeur garderait la traduction après le retour de l'appel. Le
+    /// dernier vidage d'un retrait vide donc TOUT le TLB des processeurs
+    /// de l'espace dès qu'un autre retrait est en cours (le
+    /// `mm_tlb_flush_nested` de `tlb_finish_mmu`, le correctif de 2017
+    /// « mm: fix MADV_[FREE|DONTNEED] TLB flush miss problem »). SeqCst :
+    /// l'incrément du premier précède ses effacements (sous le verrou des
+    /// tables), que le second voit avant de lire le compte.
+    pub retraits: AtomicU32,
+}
+
+/// Ce que l'espace a en place, en pages, lisible SANS AUCUN VERROU (les
+/// `rss_stat` de Linux, 6j) : les cadres anonymes à lui (MM_ANONPAGES), les
+/// pages de fichiers projetées (MM_FILEPAGES ; les deux font le RSS, que
+/// /proc/self/statm dit à part, 6d), les tables de pages de sa moitié
+/// basse, PML4 comprise (`pgtables_bytes` : elles aussi sont de la mémoire
+/// prise pour lui, 8 Gio touchés page à page en demandent 16 Mio), et le
+/// plus grand RSS qu'il ait eu (`hiwater_rss`, le ru_maxrss de getrusage ;
+/// Linux le met à jour juste avant que le RSS baisse, ici à chaque page
+/// posée, ce qui revient au même pour un maximum, sans oublier un chemin qui
+/// retire des pages). Écrits par qui pose ou retire des pages : sous le
+/// verrou des tables, la mémoire du processus tenue en lecture (une faute,
+/// une page de fichier posée, un lot qui retire des pages : munmap,
+/// madvise, la troncature) ou en écriture (mprotect, la dernière tâche qui
+/// rend l'espace) ; lus par qui ne tient pas ce verrou (statm, getrusage,
+/// le tueur OOM, le message de fin d'un programme), la mémoire tenue en
+/// lecture ou pas du tout : Relaxed, une lecture à la fois, des indications
+/// (Linux somme de même des compteurs par processeur sans verrou). Partagé
+/// par l'espace et l'entrée du processus (processus.rs), comme
+/// `MasqueProcesseurs`.
+pub struct Compteurs {
+    pages: AtomicUsize,
+    pages_fichier: AtomicUsize,
+    tables: AtomicUsize,
+    pic: AtomicUsize,
+}
+
+impl Compteurs {
+    /// Le nombre de cadres projetés à lui (la mémoire « résidente »
+    /// anonyme).
+    pub fn pages(&self) -> usize {
+        self.pages.load(Ordering::Relaxed)
+    }
+
+    /// Le nombre de pages de fichiers projetées.
+    pub fn pages_fichier(&self) -> usize {
+        self.pages_fichier.load(Ordering::Relaxed)
+    }
+
+    /// Le RSS : les deux.
+    pub fn resident(&self) -> usize {
+        self.pages() + self.pages_fichier()
+    }
+
+    /// Le nombre de tables de pages de sa moitié basse.
+    pub fn tables(&self) -> usize {
+        self.tables.load(Ordering::Relaxed)
+    }
+
+    /// Le plus grand RSS qu'il ait eu, en pages.
+    pub fn pic(&self) -> usize {
+        self.pic.load(Ordering::Relaxed)
+    }
+
+    /// Le RSS vient de grandir : le plus grand suit.
+    fn suivre_pic(&self) {
+        self.pic.fetch_max(self.resident(), Ordering::Relaxed);
+    }
+}
 
 /// La page de zéros : une page du noyau, toujours nulle, que reçoit en
 /// lecture seule toute page d'un programme LUE avant d'avoir été écrite
@@ -328,23 +405,9 @@ pub fn rendre_cadre(cadre: u64) {
 pub struct EspaceUtilisateur {
     /// L'adresse physique de sa PML4.
     pml4: u64,
-    /// Le nombre de cadres projetés, à lui (sans compter les tables, ni la
-    /// page de zéros, ni les pages des fichiers) : le MM_ANONPAGES de Linux.
-    pages: usize,
-    /// Le nombre de pages de fichiers projetées (MM_FILEPAGES). Les deux
-    /// font ce qu'il a « en place » (le RSS) ; /proc/self/statm les dira à
-    /// part (6d).
-    pages_fichier: usize,
-    /// Le nombre de tables de pages de sa moitié basse, PML4 comprise (le
-    /// pgtables_bytes de Linux) : elles aussi sont de la mémoire prise pour
-    /// lui. 8 Gio touchés page à page en demandent 16 Mio.
-    tables: usize,
-    /// Le plus grand RSS (`pages` + `pages_fichier`) qu'il ait eu (le
-    /// `hiwater_rss` de Linux, que rend getrusage dans ru_maxrss). Linux le
-    /// met à jour juste avant que le RSS baisse ; ici à chaque page posée,
-    /// ce qui revient au même pour un maximum, sans oublier un chemin qui
-    /// retire des pages.
-    pic: usize,
+    /// Ses pages en place, ses tables, son pic (voir `Compteurs`) : écrits
+    /// ici, sous le verrou des tables ; lus partout sans lui.
+    compteurs: Arc<Compteurs>,
     /// Les processeurs qui ont chargé sa PML4 (voir l'en-tête).
     processeurs: Arc<MasqueProcesseurs>,
 }
@@ -352,7 +415,10 @@ pub struct EspaceUtilisateur {
 impl EspaceUtilisateur {
     /// Un espace neuf : moitié basse vide, moitié haute du noyau.
     pub fn creer() -> Result<EspaceUtilisateur, Erreur> {
-        let processeurs = Arc::new(MasqueProcesseurs(AtomicU64::new(0))).map_err(|_| Erreur::PlusDeMemoire)?;
+        let processeurs = Arc::new(MasqueProcesseurs { processeurs: AtomicU64::new(0), retraits: AtomicU32::new(0) }).map_err(|_| Erreur::PlusDeMemoire)?;
+        // Une table déjà : la PML4.
+        let compteurs = Compteurs { pages: AtomicUsize::new(0), pages_fichier: AtomicUsize::new(0), tables: AtomicUsize::new(1), pic: AtomicUsize::new(0) };
+        let compteurs = Arc::new(compteurs).map_err(|_| Erreur::PlusDeMemoire)?;
         let pml4 = pages::allouer_pour_programme().ok_or(Erreur::PlusDeMemoire)?;
         // SAFETY: `pml4` vient d'être alloué, il est à nous ; la PML4 du
         // noyau est une table en place, qu'on ne fait que lire.
@@ -362,7 +428,7 @@ impl EspaceUtilisateur {
             nouvelle[..256].fill(0);
             nouvelle[256..].copy_from_slice(&noyau[256..]);
         }
-        Ok(EspaceUtilisateur { pml4, pages: 0, pages_fichier: 0, tables: 1, pic: 0, processeurs })
+        Ok(EspaceUtilisateur { pml4, compteurs, processeurs })
     }
 
     /// L'adresse physique de la PML4, pour CR3.
@@ -376,30 +442,19 @@ impl EspaceUtilisateur {
         &self.processeurs
     }
 
-    /// Le nombre de cadres projetés à lui (la mémoire « résidente »
-    /// anonyme).
-    pub fn pages(&self) -> usize {
-        self.pages
+    /// Ses compteurs (voir `Compteurs`), à partager avec l'entrée du
+    /// processus.
+    pub fn compteurs(&self) -> &Arc<Compteurs> {
+        &self.compteurs
     }
 
-    /// Le nombre de pages de fichiers projetées.
-    pub fn pages_fichier(&self) -> usize {
-        self.pages_fichier
-    }
-
-    /// Le nombre de tables de pages de sa moitié basse.
-    pub fn tables(&self) -> usize {
-        self.tables
-    }
-
-    /// Le plus grand RSS qu'il ait eu, en pages.
-    pub fn pic(&self) -> usize {
-        self.pic
-    }
-
-    /// Le RSS vient de grandir : le plus grand suit.
-    fn suivre_pic(&mut self) {
-        self.pic = self.pic.max(self.pages + self.pages_fichier);
+    /// Une page de moins, à lui ou à un fichier selon `cadre`.
+    fn decompter(&self, cadre: u64) {
+        if pages::drapeaux(cadre) & pages::FICHIER != 0 {
+            self.compteurs.pages_fichier.fetch_sub(1, Ordering::Relaxed);
+        } else {
+            self.compteurs.pages.fetch_sub(1, Ordering::Relaxed);
+        }
     }
 
     /// L'entrée finale (dans une PT) de la page `adresse` (permise), en
@@ -415,7 +470,7 @@ impl EspaceUtilisateur {
             if *e & PRESENTE == 0 {
                 // Une table neuve : 512 entrées absentes.
                 let nouvelle = cadre_neuf().ok_or(Erreur::PlusDeMemoire)?;
-                self.tables += 1;
+                self.compteurs.tables.fetch_add(1, Ordering::Relaxed);
                 pagination::poser(e, nouvelle | PRESENTE | pagination::ECRITURE | pagination::UTILISATEUR);
             }
             table = *e & ADRESSE;
@@ -550,11 +605,7 @@ impl EspaceUtilisateur {
         // (`suivre_pic`) voyait une page de trop le temps de l'échange (un
         // reste de 6i, où la copie faisait de même).
         if ancien != page_de_zeros() {
-            if pages::drapeaux(ancien) & pages::FICHIER != 0 {
-                self.pages_fichier -= 1;
-            } else {
-                self.pages -= 1;
-            }
+            self.decompter(ancien);
         }
         self.compter_cadre();
         if ancien != page_de_zeros() {
@@ -598,8 +649,8 @@ impl EspaceUtilisateur {
             return Err(Erreur::DejaProjetee);
         }
         pagination::poser(entree, entree_finale(cadre, droits));
-        self.pages_fichier += 1;
-        self.suivre_pic();
+        self.compteurs.pages_fichier.fetch_add(1, Ordering::Relaxed);
+        self.compteurs.suivre_pic();
         Ok(())
     }
 
@@ -644,32 +695,55 @@ impl EspaceUtilisateur {
 
     /// Une page à lui de plus.
     fn compter_cadre(&mut self) {
-        self.pages += 1;
-        self.suivre_pic();
+        self.compteurs.pages.fetch_add(1, Ordering::Relaxed);
+        self.compteurs.suivre_pic();
     }
 
-    /// Retire de [debut, fin[ les pages des projections d'un fichier (les
-    /// copies privées comprises), comme `retirer_plage` sans rendre les
-    /// tables, par tranches de 64 pages, en prenant le verrou des tables
-    /// pour chacune et en vidant le lot entre deux, sans lui : pour qui ne
-    /// tient la mémoire qu'en lecture (la troncature d'un fichier,
-    /// appels_fichiers.rs). Les interruptions ne restent coupées que le
-    /// temps de 64 entrées, quelle que soit la plage (le `zap_pte_range` de
-    /// Linux, qui prend le verrou de chaque table de pages tour à tour, et
-    /// le rend pour vider son lot quand il est plein), et le vidage des TLB
-    /// des autres processeurs, qui attend leurs réponses, ne se fait jamais
-    /// sous le verrou (voir l'en-tête). 64 : ce que le lot garde de cadres
-    /// sans grandir.
-    pub fn retirer_par_tranches(espace: &crate::verrou::Verrou<EspaceUtilisateur>, debut: u64, fin: u64) {
+    /// Retire les pages de [debut, fin[ (alignés), comme `retirer_plage`,
+    /// par tranches de 64 pages, en prenant le verrou des tables pour
+    /// chacune, et en vidant le lot, sans lui, dès qu'il n'a plus la place
+    /// d'une tranche : pour qui ne tient la mémoire qu'en LECTURE (munmap et
+    /// madvise depuis 6j, la troncature d'un fichier, appels_fichiers.rs)
+    /// comme pour qui la tient en écriture. Les interruptions ne restent
+    /// coupées que le temps de 64 entrées, quelle que soit la plage (le
+    /// `zap_pte_range` de Linux, qui prend le verrou de chaque table de
+    /// pages tour à tour, et le rend pour vider son lot quand il est
+    /// plein), et le vidage des TLB des autres processeurs, qui attend
+    /// leurs réponses, ne se fait jamais sous le verrou (voir l'en-tête).
+    /// Avec `rendre_tables`, les tables devenues vides sont rendues aussi.
+    /// `reserve` : combien de cadres garder avant de vider (un munmap de
+    /// 2 Gio viderait sinon les TLB de tous les processeurs tous les 64
+    /// cadres : memoire::GRAND_LOT pour lui) ; sans mémoire pour cela, le
+    /// lot vide tous les huit cadres, ceux qu'il a en place.
+    pub fn retirer_par_tranches(espace: &crate::verrou::Verrou<EspaceUtilisateur>, debut: u64, fin: u64, rendre_tables: bool, reserve: usize) {
         const TRANCHE: u64 = PAGE * CADRES_DU_LOT as u64;
         let mut lot = Lot::new(&espace.verrouiller());
+        // Jamais plus que de pages à retirer : un munmap d'une page ne
+        // réserve pas 32 Kio du tas.
+        lot.reserver(reserve.min(((fin - debut) / PAGE) as usize));
+        // Un retrait de plus en cours (voir `MasqueProcesseurs::retraits`).
+        lot.masque.retraits.fetch_add(1, Ordering::SeqCst);
         let mut a = debut;
         while a < fin {
-            let b = ((a / TRANCHE + 1) * TRANCHE).min(fin);
-            espace.verrouiller().retirer_plage(a, b, false, &mut lot);
-            lot.vider();
+            // Jamais plus de pages sous le verrou que le lot n'en peut
+            // recevoir, leurs tables comprises ; vidé d'abord s'il est près
+            // du bord (il retrouve alors au moins ses cadres en place).
+            if lot.place() < CADRES_EN_PLACE + TABLES_PAR_TRANCHE {
+                lot.vider();
+            }
+            let pages = (lot.place() - TABLES_PAR_TRANCHE).min(CADRES_DU_LOT) as u64;
+            let b = ((a / TRANCHE + 1) * TRANCHE).min(fin).min(a + pages * PAGE);
+            espace.verrouiller().retirer_plage(a, b, rendre_tables, &mut lot);
             a = b;
         }
+        // Le dernier vidage : un autre retrait en cours a peut-être effacé
+        // avant nous des entrées de la plage, dont les traductions sont
+        // dans son lot, pas vidé : on vide tout, même un lot vide.
+        if lot.masque.retraits.load(Ordering::SeqCst) > 1 {
+            lot.tout = true;
+        }
+        lot.vider();
+        lot.masque.retraits.fetch_sub(1, Ordering::SeqCst);
     }
 
     /// Retire les pages de [debut, fin[ (alignés) et rend leurs cadres :
@@ -718,9 +792,9 @@ impl EspaceUtilisateur {
                 }
             }
         });
-        self.pages -= pages;
-        self.pages_fichier -= pages_fichier;
-        self.tables -= tables;
+        self.compteurs.pages.fetch_sub(pages, Ordering::Relaxed);
+        self.compteurs.pages_fichier.fetch_sub(pages_fichier, Ordering::Relaxed);
+        self.compteurs.tables.fetch_sub(tables, Ordering::Relaxed);
     }
 
     /// Donne les droits `droits` à toutes les pages projetées de [debut,
@@ -889,9 +963,25 @@ fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl F
 /// traductions dont on a vraiment besoin.
 const PLAFOND_INVLPG: usize = 33;
 
-/// Le nombre de cadres qu'un lot garde sans grandir : ce que remplit une
-/// tranche de `retirer_par_tranches`, sous le verrou des tables.
+/// Le plus de pages qu'une tranche de `retirer_par_tranches` retire sous le
+/// verrou des tables (les interruptions restent coupées le temps de 64
+/// entrées, quelle que soit la plage), et ce que le lot garde de cadres
+/// quand on lui a réservé de la place.
 const CADRES_DU_LOT: usize = 64;
+/// Les cadres qu'un lot garde EN PLACE, sans rien demander au tas : sous le
+/// verrou des tables, il ne peut ni se vider (vider attend les autres
+/// processeurs) ni échouer (sans mémoire, il faudrait pourtant rendre la
+/// page) ; une tranche ne dépasse donc jamais ce que le lot peut recevoir.
+/// Huit, comme les pages de la `mmu_gather` de Linux elle-même (ses lots de
+/// 509, `mmu_gather_batch`, viennent du tas quand il peut) : la pile du
+/// noyau porte le lot, et avec 64 cadres en place sa plus grande profondeur
+/// passait de 10,4 à 13,3 Kio sur 16 (mesuré au démarrage) ; avec huit,
+/// 10,8 Kio.
+const CADRES_EN_PLACE: usize = 8;
+/// Les tables qu'une tranche peut rendre en plus de ses pages : la sienne
+/// (une tranche tient dans une table de dernier niveau), et ses deux
+/// parentes si elles se vident (la PML4, jamais).
+const TABLES_PAR_TRANCHE: usize = 3;
 
 /// Ce qu'un parcours des tables laisse à faire : des traductions à retirer
 /// des TLB (de tous les processeurs qui ont l'espace : voir l'en-tête),
@@ -911,22 +1001,38 @@ pub struct Lot {
     nombre_pages: usize,
     /// Plus de PLAFOND_INVLPG pages : on videra tout le TLB.
     tout: bool,
-    /// Les cadres à lâcher : 64 d'emblée (`rendre` réserve au premier),
-    /// plus si l'appelant l'a demandé (`reserver` : un munmap de 2 Gio
-    /// viderait sinon les TLB de tous les processeurs tous les 64 cadres).
-    /// Linux enchaîne de même des lots de 509 pages (`mmu_gather_batch`).
+    /// Les cadres à lâcher : quelques-uns en place (CADRES_EN_PLACE, plus
+    /// les tables d'une tranche), et au-delà ce que `reserver` a obtenu du
+    /// tas.
+    locaux: [u64; CADRES_EN_PLACE + TABLES_PAR_TRANCHE],
+    nombre_locaux: usize,
     cadres: Vec<u64>,
 }
 
 impl Lot {
     pub fn new(espace: &EspaceUtilisateur) -> Lot {
-        Lot { pml4: espace.pml4, masque: espace.processeurs.clone(), pages: [0; PLAFOND_INVLPG], nombre_pages: 0, tout: false, cadres: Vec::new() }
+        Lot {
+            pml4: espace.pml4,
+            masque: espace.processeurs.clone(),
+            pages: [0; PLAFOND_INVLPG],
+            nombre_pages: 0,
+            tout: false,
+            locaux: [0; CADRES_EN_PLACE + TABLES_PAR_TRANCHE],
+            nombre_locaux: 0,
+            cadres: Vec::new(),
+        }
     }
 
-    /// Fait de la place pour `n` cadres : moins de vidages pour une grande
-    /// plage. Sans mémoire, le lot garde sa taille (il videra plus souvent).
+    /// Fait de la place pour `n` cadres de plus : moins de vidages pour une
+    /// grande plage. Sans mémoire, le lot garde sa taille (il videra plus
+    /// souvent).
     pub fn reserver(&mut self, n: usize) {
         let _ = self.cadres.try_reserve(n);
+    }
+
+    /// Combien de cadres il peut encore recevoir sans se vider.
+    pub fn place(&self) -> usize {
+        self.locaux.len() - self.nombre_locaux + (self.cadres.capacity() - self.cadres.len())
     }
 
     /// La traduction de la page `adresse` ne doit plus servir.
@@ -941,21 +1047,21 @@ impl Lot {
 
     /// Le cadre `cadre` est à lâcher, une fois les TLB vidés (il ne sera
     /// rendu que si personne d'autre ne le tient, pages.rs). Toute page qui
-    /// le désignait doit déjà avoir été passée à `invalider`. Un lot plein
-    /// se vide ; sans mémoire pour grandir d'un seul cadre, celui-ci est
-    /// lâché tout de suite, le TLB venant d'être vidé pour lui.
+    /// le désignait doit déjà avoir été passée à `invalider`. En place
+    /// d'abord, puis dans ce que `reserver` a obtenu ; un lot plein se vide,
+    /// ce qui ne peut pas arriver sous le verrou des tables (qui le tient
+    /// mesure ses tranches à `place`), et le cadre prend la première place.
     fn rendre(&mut self, cadre: u64) {
-        if self.cadres.len() == self.cadres.capacity() {
-            if !self.cadres.is_empty() {
-                self.vider();
-            }
-            if self.cadres.try_reserve(CADRES_DU_LOT).is_err() {
-                self.vider();
-                pages::lacher(cadre);
-                return;
-            }
+        if self.nombre_locaux < self.locaux.len() {
+            self.locaux[self.nombre_locaux] = cadre;
+            self.nombre_locaux += 1;
+        } else if self.cadres.len() < self.cadres.capacity() {
+            self.cadres.ajouter_dans_la_place(cadre);
+        } else {
+            self.vider();
+            self.locaux[0] = cadre;
+            self.nombre_locaux = 1;
         }
-        self.cadres.ajouter_dans_la_place(cadre);
     }
 
     /// La table `table` est à rendre ; l'entrée qui la désignait est déjà
@@ -979,9 +1085,13 @@ impl Lot {
     #[track_caller]
     pub fn vider(&mut self) {
         if self.tout || self.nombre_pages > 0 {
-            smp::vider_tlb(Some(self.pml4), Some(&self.masque.0), &self.pages[..self.nombre_pages], self.tout);
+            smp::vider_tlb(Some(self.pml4), Some(&self.masque.processeurs), &self.pages[..self.nombre_pages], self.tout);
         }
         (self.nombre_pages, self.tout) = (0, false);
+        for &c in &self.locaux[..self.nombre_locaux] {
+            pages::lacher(c);
+        }
+        self.nombre_locaux = 0;
         for c in self.cadres.drain(..) {
             pages::lacher(c);
         }
@@ -1037,7 +1147,7 @@ impl Drop for EspaceUtilisateur {
         // Plus aucun processeur n'a cette PML4 : chaque fil du processus l'a
         // quittée en mourant (tache.rs). Sinon, rendre ses tables serait
         // rendre des pages qu'un processeur traverse encore.
-        assert!(self.processeurs.0.load(core::sync::atomic::Ordering::Acquire) == 0,
+        assert!(self.processeurs.processeurs.load(core::sync::atomic::Ordering::Acquire) == 0,
                 "espace detruit alors que des processeurs l'ont encore charge");
         rendre(self.pml4, 3);
         pages::liberer(self.pml4, 0);

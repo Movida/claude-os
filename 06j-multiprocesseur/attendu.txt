@@ -45,7 +45,8 @@ rendues et recollees : ok.
 [noyau] Processeur 3 (APIC 3) en service.
 [noyau] 4 processeurs en service.
 [noyau] IPI : chaque autre processeur a recu la sienne : ok ; un appel de fonction aux 3 autres, tous repondent : ok.
-[noyau] TLB : une page retiree d'un espace que 4 processeurs ont charge : vidage demande aux 3 autres, recu par chacun : ok.
+[noyau] TLB : une page retiree d'un espace que 4 processeurs ont charge : vidage demande aux 3 autres, recu par chacun : ok ; un second retrait pendant qu'un premier n'a pas vide : vidage demande quand meme : ok.
+[noyau] Copie a l'ecriture : une marque retiree par madvise puis reposee par un autre fil n'est pas prise pour la sienne : ok.
 [noyau] ACPI : IRQ ISA remplacees : 0 -> GSI 2 ; 5 -> GSI 5 en niveau ; 9 -> GSI 9 en niveau ; 10 -> GSI 10 en niveau ; 11 -> GSI 11 en niveau ; NMI sur LINT1.
 [pci] 8 fonctions sur le bus (ports 0xCF8 et 0xCFC).
 [pci] 00:00.0 8086:1237 pont hote.
@@ -191,6 +192,7 @@ tas a partir de 0x555555555000, code en place : ok.
 [noyau] courses : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] fautes : quatre fils fautent pendant madvise, mmap, mprotect et munmap, la pile grandit : ok
 [linux] fautes : TLB perimee : 1000 fois une page retiree et reprojetee par un fil, relue par l'autre sur son processeur, jamais l'ancien cadre : ok
+[linux] fautes : munmap en lecture : pendant qu'un fil retirait 8192 pages, un autre a faute
 [noyau] fautes : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] fautes : exit_group au milieu des fautes, des madvise et des munmap des autres fils
 [noyau] fautes-fin-1 : termine, code de sortie 0 ; memoire rendue : ok.

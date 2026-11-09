@@ -3045,7 +3045,9 @@ fn retirer_projections(n: Numero, premiere: u64) {
                 continue;
             }
             let debut = z.debut + premiere.saturating_sub(projection.page) * PAGE;
-            crate::espace_utilisateur::EspaceUtilisateur::retirer_par_tranches(&m.espace, debut, z.fin);
+            // Sans les tables (la zone reste), et sans réserve : le lot vide
+            // à chaque tranche, une troncature retire peu de pages.
+            crate::espace_utilisateur::EspaceUtilisateur::retirer_par_tranches(&m.espace, debut, z.fin, false, 0);
         }
     });
 }
