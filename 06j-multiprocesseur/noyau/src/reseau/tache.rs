@@ -237,6 +237,9 @@ fn prendre_echu(maintenant: u64) -> Option<u64> {
 }
 
 fn boucle() {
+    // Sa file de `lo`, faite d'avance (boucle.rs : elle émet au nom des
+    // programmes, et vit pour toujours).
+    super::boucle::preparer_la_file();
     // Au premier tour, la table des voisins dit son échéance.
     let mut voisins = true;
     loop {

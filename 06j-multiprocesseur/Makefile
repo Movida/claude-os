@@ -267,7 +267,8 @@ boot.bin: programmes.cpio FORCE
 #     sched_getaffinity, futex, prctl) ; sur l'hôte aussi ;
 #   - processeurs : gcc -static, ce qu'un programme voit des processeurs
 #     (6j) : cpu/online et get_nprocs, sched_getaffinity, sched_setaffinity
-#     et ses refus, getcpu ; sur l'hôte aussi ;
+#     et ses refus, getcpu, des fils épinglés qui restent chacun sur son
+#     processeur ; sur l'hôte aussi ;
 #   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi ;
 #   - proc : gcc -static, /proc (maps, statm, exe, /proc/sys) et /sys
 #     (cpu/online, transparent_hugepage) ; sur l'hôte aussi ;
@@ -1082,9 +1083,14 @@ texte: boot.bin
 # disputées par des fils (fautes, quatre fois), les troncatures (3 s), un
 # programme ouvert en écriture qu'un groupe attend (1,5 s), inotify (sa
 # file pleine, ses 128 instances, ses guetteurs : 2 s d'attente) : 48 s
-# en tout, mesurées. verifier.sh le demande par `make duree` ; ne pas le
-# lancer sur une machine saturée.
-DUREE = 90
+# en tout, mesurées. En 6j, les tests du multiprocesseur au démarrage (la
+# torture : 400 000 prises d'un Verrou, 20 000 d'un Mutex, 8 000 réveils
+# croisés ; les vingt parties du tour des verrous qui dorment ; le TLB) et
+# les programmes à fils sur quatre processeurs (fautes, processeurs) : 54 s
+# en tout, mesurées (QEMU sans accélération, quatre processeurs virtuels
+# sur quatre fils de l'hôte) ; d'où 120 s, le double. verifier.sh le
+# demande par `make duree` ; ne pas le lancer sur une machine saturée.
+DUREE = 120
 
 duree:
 	@echo $(DUREE)
@@ -1210,7 +1216,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/fils | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	./$(LINUX)/fils groupe; test $$? = 7
 	./$(LINUX)/courses | tee /dev/stderr | (! grep -q ECHEC)
-	./$(LINUX)/fautes | tee /dev/stderr | grep -q "fautes : .* : ok"
+	./$(LINUX)/fautes | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/fautes fin
 	./$(LINUX)/troncature lecture 1500 /dev/shm | tee /dev/stderr | grep -q "troncature : .* : ok"
 	./$(LINUX)/troncature copie 1500 /dev/shm | tee /dev/stderr | grep -q "troncature : .* : ok"
@@ -1390,6 +1396,9 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	    n=$$(grep -cE "^\[linux\] lignes $$nom [0-9]{4} $$nom{160}$$" $$journal); \
 	    [ $$n -eq 200 ] || { echo "-cpu $$cpu : $$n lignes entieres de lignes $$nom sur 200"; exit 1; }; \
 	  done; \
+	  vus=$$(( 0x$$(sed -n 's/.*lignes a : processeurs vus : \([0-9a-f]*\).*/\1/p' $$journal | head -1) | 0x$$(sed -n 's/.*lignes b : processeurs vus : \([0-9a-f]*\).*/\1/p' $$journal | head -1) )); \
+	  c=0; m=$$vus; while [ $$m -ne 0 ]; do c=$$(( c + (m & 1) )); m=$$(( m >> 1 )); done; \
+	  [ $$c -ge 2 ] || { echo "-cpu $$cpu : les deux programmes lignes n'ont vu que $$c processeur(s) (masque $$vus)"; exit 1; }; \
 	  while IFS= read -r ligne; do \
 	    grep -qF -- "$$ligne" test-programmes-$$cpu.log || { echo "-cpu $$cpu : manque « $$ligne »"; exit 1; }; \
 	  done < tests-attendu.txt; \

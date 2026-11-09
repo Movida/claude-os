@@ -57,7 +57,8 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 # Le fichier de /proc d'un processus recueilli, gardé ouvert : ESRCH (6e).
 /bin/proc cible &
 /bin/proc autre
-# Deux programmes à la fois (6e) : lancés par `&`, ils se partagent le
+# Deux programmes à la fois (6e) : lancés par `&`, épinglés sur le
+# processeur 0 (6j : sinon chacun aurait le sien), ils se partagent le
 # processeur ; deux autres ajoutent au même fichier, sans rien perdre.
 /bin/partage a b &
 /bin/partage b a

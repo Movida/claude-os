@@ -60,19 +60,94 @@
 //! file, quel que soit son état : une tâche neuve, ou une tâche préemptée
 //! entre « je vais dormir » et son sommeil, serait sinon perdue. C'est le
 //! `!preempt && prev_state` du `__schedule` de Linux (SM_PREEMPT).
+//!
+//! UNE FILE PAR PROCESSEUR (6j, la `rq` de Linux) : chaque processeur a sa
+//! file (`FILES`), sous son propre verrou, et n'ordonnance que dans la
+//! sienne ; l'EEVDF ne change pas dans chacune, mais ce qu'il appelle « la
+//! courante » est la tâche courante DU PROCESSEUR DE LA FILE (`zone.courante`),
+//! pas celle de qui tient le verrou (un réveil met une tâche dans la file
+//! d'un autre). La place est réservée au démarrage pour le maximum de fils
+//! dans chacune : la file ne grandit jamais pendant un programme, et
+//! l'ordonnanceur n'alloue jamais (16 384 entrées de 48 octets, 768 Kio par
+//! processeur avec 2 Gio : la règle vaut ce prix).
+//!
+//! OÙ VA UNE TÂCHE (le `select_task_rq_fair` de Linux, réduit à ce qui
+//! compte sans topologie : nos processeurs virtuels n'ont ni caches
+//! partagés ni hyperthreads que QEMU décrive) :
+//!   - réveillée : son dernier processeur s'il est inactif (ses caches ont
+//!     peut-être encore ses données, le `prev_cpu`) ; sinon un processeur
+//!     inactif (`select_idle_cpu`) ; sinon le moins chargé (le moins
+//!     d'entités) parmi ceux que son masque permet ;
+//!   - neuve (clone, un programme lancé) : le moins chargé (`find_idlest_cpu`) ;
+//!   - un processeur qui n'a plus rien TIRE une tâche prête d'une autre file
+//!     (`tirer`, le `newidle_balance`) : pas une qui s'exécute
+//!     (`sur_processeur`), pas une qu'il n'a pas le droit d'exécuter ; les
+//!     deux files prises dans l'ordre des numéros, et tout revérifié sous
+//!     les verrous (le RETRY_TASK de Linux) ;
+//!   - au tic, toutes les 4 ms (le `balance_interval` d'une petite machine
+//!     chez Linux), un processeur tire de la file la plus chargée si
+//!     l'écart est d'au moins deux (le `rebalance_domains`, sans ses
+//!     domaines).
+//! Une tâche déplacée garde son retard (`retirer` le calcule, `ajouter` la
+//! place par rapport à la moyenne de la file d'arrivée) : le
+//! `migrate_task_rq_fair` puis `place_entity` de Linux. La charge de chaque
+//! file (`charge`, le `nr_running`) se lit sans son verrou : une
+//! indication, pour choisir ; la décision se vérifie ensuite sous les
+//! verrous. Deux files à la fois (tirer) : par numéro croissant
+//! (`double_rq_lock`), jamais l'inverse.
+//!
+//! RÉVEILLER L'AUTRE : une tâche mise dans la file d'un processeur inactif,
+//! ou qui devrait passer avant la courante de ce processeur (la règle de
+//! `rendre_prete`, appliquée à SA courante) : son « besoin de céder »
+//! (processeur.rs) et l'IPI de reprogrammation (smp.rs, le `resched_curr`),
+//! qui le sort de `hlt` ou qu'il voit à la sortie de l'interruption.
+//!
+//! L'AFFINITÉ (sched_setaffinity, tache.rs) : un processeur ne choisit, ne
+//! tire ni ne reçoit que des tâches qu'il a le droit d'exécuter (un masque
+//! qui ne permet plus aucun processeur en service vaut « tous » : il a été
+//! posé quand ils étaient là). Une tâche dont le masque change
+//! (`affinite_changee`) : prête dans une file dont le processeur n'est plus
+//! permis, elle en est déplacée aussitôt ; en cours sur un processeur qui
+//! ne l'est plus, elle n'est pas déplacée pendant qu'elle s'exécute (la
+//! destination pourrait la choisir avant que la source ait fini de
+//! basculer) : elle cède le processeur (« besoin de céder »), et c'est lui
+//! qui la pousse vers un processeur permis dès qu'elle l'a quitté
+//! (`pousser_si_interdite`, à la fin de sa bascule ; Linux le fait par sa
+//! tâche d'arrêt, `migration_cpu_stop`, que nous n'avons pas) ; endormie,
+//! son réveil la placera (`choisir_processeur`). Et l'équilibrage du tic
+//! tire d'abord une tâche que sa file ne peut pas exécuter (`interdites`),
+//! quelle que soit la charge : le filet, si l'un des deux premiers chemins
+//! la manquait (la relecture de 6j : jusque-là, seule une file vide la
+//! tirait, et des processeurs permis qui calculaient la laissaient attendre
+//! sans fin).
+//!
+//! LE DÉTECTEUR D'INTERBLOCAGE (attente.rs) ne tourne que sur le processeur
+//! 0, quand tous les autres sont inactifs et toutes les files vides
+//! (`machine_inactive`) : un programme qui dort et que seule une tâche en
+//! cours sur un autre processeur peut réveiller n'est pas un interblocage.
+//!
+//! Options écartées : l'équilibrage complet de Linux (`fair.c`, 13 000
+//! lignes : les domaines, les groupes, les charges moyennes PELT, les
+//! marges) : il sert des machines NUMA à centaines de cœurs ; les règles
+//! ci-dessus sont celles qu'il applique sur un portable. Le vol de travail
+//! sans équilibrage périodique : une tâche qui calcule sans dormir
+//! resterait sur un processeur surchargé tant qu'aucun autre ne se vide.
 
 use crate::faillible::VecFaillible;
 use crate::partage::Arc;
+use crate::processeur;
 use crate::tache::{self, Reveil, Tache};
 use crate::verrou::{self, Verrou};
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 
 /// La tranche de base, en nanosecondes de calcul (Linux 6.18, un
 /// processeur : 0,70 ms).
 pub const TRANCHE: u64 = 700_000;
 /// Le poids de nice 0.
 const POIDS_NICE_0: u64 = 1024;
+/// Les tics entre deux équilibrages d'un processeur.
+const TICS_EQUILIBRAGE: u64 = 4;
 
 /// Une tâche prête (ou courante), et ce que l'ordonnanceur sait d'elle.
 struct Entite {
@@ -88,7 +163,10 @@ struct Entite {
     protegee: bool,
 }
 
+/// La file des prêtes d'un processeur (voir l'en-tête).
 struct File {
+    /// Le processeur dont c'est la file.
+    numero: usize,
     entites: Vec<Entite>,
     /// L'instant (temps monotone, en ns) où le temps de calcul de la tâche
     /// courante a été compté pour la dernière fois.
@@ -96,13 +174,46 @@ struct File {
     /// La moyenne des temps virtuels quand la file s'est vidée : celle d'une
     /// file vide (le `min_vruntime` de Linux, qui ne recule jamais).
     zero: u64,
+    /// La tâche courante du processeur de cette file : celle que
+    /// `ordonnancer` a choisie, écrite SOUS ce verrou au moment du choix
+    /// (une tâche de la file, ou l'inactive ; nulle avant la première
+    /// bascule). Lue sous ce verrou, par ce processeur ou par un autre qui
+    /// tire (`compter_courante`) : une tâche ne quitte la file, et ne
+    /// meurt, que par `ordonnancer` sur son processeur, sous ce même
+    /// verrou, qui écrit alors sa remplaçante ; tant qu'on tient le verrou,
+    /// elle vit. (La relecture de 6j : jusque-là, on lisait `courante` de
+    /// la zone du processeur, publiée hors de ce verrou par la bascule, et
+    /// un autre processeur pouvait la lire morte et rendue.)
+    courante: AtomicPtr<Tache>,
 }
 
-// UNIPROCESSEUR : une seule file des prêtes ; une par processeur avec
-// plusieurs (la `rq` de Linux), et l'équilibrage des charges entre elles.
-static FILE: Verrou<File> = Verrou::new(File { entites: Vec::new(), depuis: 0, zero: 0 });
-// « La tâche courante doit céder » (le TIF_NEED_RESCHED de Linux) est
-// dans la zone du processeur (processeur.rs, `besoin_de_ceder`), depuis 6j.
+/// La file d'un processeur, et sa charge (le nombre d'entités), lisible sans
+/// le verrou (le `nr_running` de Linux : pour choisir, une indication) ;
+/// et combien de ses entités son processeur n'a pas le droit d'exécuter
+/// (leur masque a changé : voir l'en-tête, l'affinité), pour l'équilibrage.
+struct FileProcesseur {
+    file: Verrou<File>,
+    charge: AtomicUsize,
+    interdites: AtomicUsize,
+}
+
+static FILES: [FileProcesseur; processeur::MAX] = {
+    let mut f = [const {
+        FileProcesseur {
+            file: Verrou::new(File { numero: 0, entites: Vec::new(), depuis: 0, zero: 0, courante: AtomicPtr::new(core::ptr::null_mut()) }),
+            charge: AtomicUsize::new(0),
+            interdites: AtomicUsize::new(0),
+        }
+    }; processeur::MAX];
+    // Le numéro de chaque file : un champ écrit en place (une valeur
+    // entière ne détruit rien, ce qu'un `static` exige).
+    let mut i = 0;
+    while i < processeur::MAX {
+        f[i].file.get_mut().numero = i;
+        i += 1;
+    }
+    f
+};
 
 /// Le nombre de bascules, pour les tests.
 static BASCULES: AtomicU64 = AtomicU64::new(0);
@@ -112,7 +223,29 @@ fn tranche_virtuelle(poids: u64) -> u64 {
     TRANCHE * POIDS_NICE_0 / poids
 }
 
+/// La tâche `t` a-t-elle le droit de s'exécuter sur le processeur `n` ? Un
+/// masque qui ne permet plus aucun processeur en service vaut « tous » (il
+/// a été posé quand ils étaient là : la même règle que `choisir_processeur`,
+/// sinon la tâche ne serait plus jamais choisie).
+fn permise(t: &Tache, n: usize) -> bool {
+    let m = t.affinite();
+    m >> n & 1 != 0 || m & processeur::masque_en_service() == 0
+}
+
 impl File {
+    /// La tâche courante du processeur de cette file (voir le champ) : sous
+    /// le verrou.
+    fn courante(&self) -> *const Tache {
+        self.courante.load(Ordering::Relaxed)
+    }
+
+    /// Recompte ce que ce processeur n'a pas le droit d'exécuter dans sa
+    /// file (voir `FileProcesseur::interdites`), sous le verrou : à chaque
+    /// entrée, sortie, et changement de masque d'une tâche de la file.
+    fn recompter_interdites(&self) {
+        FILES[self.numero].interdites.store(self.entites.iter().filter(|e| !permise(&e.tache, self.numero)).count(), Ordering::Relaxed);
+    }
+
     /// La moyenne pondérée des temps virtuels (l'`avg_vruntime` de Linux),
     /// calculée sur 128 bits ; celle gardée quand la file s'est vidée, sans
     /// tâche.
@@ -121,7 +254,7 @@ impl File {
         if poids == 0 { self.zero } else { (somme / poids) as u64 }
     }
 
-    fn position(&self, t: &Tache) -> Option<usize> {
+    fn position(&self, t: *const Tache) -> Option<usize> {
         self.entites.iter().position(|e| core::ptr::eq(Arc::as_ptr(&e.tache), t))
     }
 
@@ -133,8 +266,15 @@ impl File {
         let maintenant = crate::temps::ns_monotone();
         let delta = maintenant.saturating_sub(self.depuis);
         self.depuis = maintenant;
-        let courante = tache::courante();
-        courante.compter_calcul(delta);
+        let courante = self.courante();
+        if courante.is_null() {
+            return false;
+        }
+        // SAFETY: écrite sous ce verrou par `ordonnancer` (une tâche de la
+        // file, ou l'inactive, qui ne meurt pas), et une tâche ne quitte la
+        // file ni ne meurt que par `ordonnancer` sur son processeur, sous
+        // ce même verrou : tant qu'on le tient, elle vit (voir le champ).
+        unsafe { &*courante }.compter_calcul(delta);
         let Some(i) = self.position(courante) else { return false };
         let e = &mut self.entites[i];
         e.vruntime += delta * POIDS_NICE_0 / e.poids;
@@ -147,24 +287,41 @@ impl File {
     }
 
     /// La tâche qui doit avoir le processeur : la courante si elle est
-    /// protégée et éligible (RUN_TO_PARITY) ; sinon, parmi les éligibles,
-    /// celle dont l'échéance est la plus proche (`pick_eevdf`) ; None si la
-    /// file est vide (la tâche inactive).
+    /// protégée et éligible (RUN_TO_PARITY) ; sinon, parmi les éligibles
+    /// que ce processeur a le droit d'exécuter, celle dont l'échéance est la
+    /// plus proche (`pick_eevdf`) ; None si la file n'en a aucune (la tâche
+    /// inactive).
     fn choisir(&self) -> Option<&Entite> {
         let moyenne = self.moyenne();
-        if let Some(i) = self.position(tache::courante())
+        let n = self.numero;
+        if let Some(i) = self.position(self.courante())
             && self.entites[i].protegee
             && self.entites[i].vruntime <= moyenne
+            && permise(&self.entites[i].tache, n)
         {
             return Some(&self.entites[i]);
         }
-        self.entites
-            .iter()
+        let permises = || self.entites.iter().filter(|e| permise(&e.tache, n));
+        permises()
             .filter(|e| e.vruntime <= moyenne)
             .min_by_key(|e| e.echeance)
             // Il y a toujours une éligible (la plus petite est sous la
             // moyenne) ; sinon, par prudence, la plus petite.
-            .or_else(|| self.entites.iter().min_by_key(|e| e.vruntime))
+            .or_else(|| permises().min_by_key(|e| e.vruntime))
+    }
+
+    /// La courante de ce processeur devrait-elle céder la place (une autre
+    /// est choisie : `check_preempt_wakeup_fair`) ? Pour la tâche inactive,
+    /// dès qu'une tâche permise est là.
+    fn doit_ceder(&self) -> bool {
+        self.choisir().is_some_and(|e| !core::ptr::eq(Arc::as_ptr(&e.tache), self.courante()))
+    }
+
+    /// Une autre tâche que la courante, que ce processeur peut exécuter,
+    /// est-elle là ?
+    fn une_autre_permise(&self) -> bool {
+        let courante = self.courante();
+        self.entites.iter().any(|e| permise(&e.tache, self.numero) && !core::ptr::eq(Arc::as_ptr(&e.tache), courante))
     }
 
     /// Ajoute `t` à la file (`place_entity`, puis `enqueue_entity`) : son
@@ -182,122 +339,321 @@ impl File {
         let tranche = if neuve { tranche_virtuelle(poids) / 2 } else { tranche_virtuelle(poids) };
         // Les deux invariants que le réveil sous verrou garantit (voir
         // `reveiller`) : jamais deux fois en file, jamais une morte.
-        assert!(!t.est_en_file(), "tache deja dans la file des pretes");
+        assert!(!t.est_en_file(), "tache deja dans une file des pretes");
         assert!(!t.est_morte(), "tache morte remise dans une file des pretes");
         // La place est réservée au démarrage (`initialiser`) : la file ne
         // grandit pas pendant un programme, et l'ordonnanceur n'appelle
         // jamais le tas (il tourne aussi dans les interruptions).
-        t.poser_en_file(true, 0);
+        t.poser_en_file(true, self.numero as u32);
         self.entites.ajouter_dans_la_place(Entite { tache: t, vruntime, echeance: vruntime + tranche, poids, protegee: false });
+        FILES[self.numero].charge.store(self.entites.len(), Ordering::Relaxed);
+        self.recompter_interdites();
     }
 
-    /// Retire `t` de la file, en gardant son retard (`update_entity_lag`) :
-    /// la moyenne moins son temps virtuel, borné à plus ou moins deux
-    /// tranches ou un tic (le plus grand), dans son temps virtuel.
-    fn retirer(&mut self, t: &Tache) {
-        let Some(i) = self.position(t) else { return };
+    /// Retire l'entité `i` de la file, en gardant le retard de sa tâche
+    /// (`update_entity_lag`) : la moyenne moins son temps virtuel, borné à
+    /// plus ou moins deux tranches ou un tic (le plus grand), dans son temps
+    /// virtuel. Rend la tâche.
+    fn retirer_entite(&mut self, i: usize) -> Arc<Tache> {
         let moyenne = self.moyenne();
         let e = self.entites.swap_remove(i);
         e.tache.poser_en_file(false, 0);
+        FILES[self.numero].charge.store(self.entites.len(), Ordering::Relaxed);
+        self.recompter_interdites();
         if self.entites.is_empty() {
             self.zero = moyenne;
         }
         let limite = (2 * TRANCHE).max(crate::horloge::nanosecondes(1)) * POIDS_NICE_0 / e.poids;
         let lag = (moyenne as i64 - e.vruntime as i64).clamp(-(limite as i64), limite as i64);
         e.tache.garder_lag(lag);
+        e.tache
+    }
+
+    /// Retire `t` de la file, si elle y est.
+    fn retirer(&mut self, t: *const Tache) {
+        if let Some(i) = self.position(t) {
+            self.retirer_entite(i);
+        }
+    }
+
+    /// Une tâche que le processeur `pour` pourrait tirer de cette file : prête
+    /// (pas en train de s'exécuter, ni de finir de quitter son processeur),
+    /// qu'il a le droit d'exécuter ; d'abord une que CE processeur n'a plus
+    /// le droit d'exécuter (voir l'en-tête : l'affinité).
+    fn a_tirer(&self, pour: usize) -> Option<usize> {
+        let tirable = |e: &Entite| !e.tache.est_sur_processeur() && permise(&e.tache, pour);
+        self.entites.iter().position(|e| tirable(e) && !permise(&e.tache, self.numero)).or_else(|| self.entites.iter().position(tirable))
     }
 }
 
-/// Réserve la file pour `max` tâches prêtes (le nombre maximal de fils) :
-/// elle ne grandira jamais pendant un programme. Au démarrage.
+/// Réserve la file du processeur 0 pour `max` tâches prêtes (le nombre
+/// maximal de fils) : elle ne grandira jamais pendant un programme. Au
+/// démarrage.
 pub fn initialiser(max: usize) {
-    let mut f = FILE.verrouiller();
-    f.entites.try_reserve_exact(max).expect("plus de memoire pour la file des taches pretes");
+    assert!(initialiser_file(0, max), "plus de memoire pour la file des taches pretes");
+}
+
+/// Réserve la file du processeur `n` (un secondaire, avant son départ :
+/// smp.rs). Faux sans mémoire : le processeur reste de côté.
+pub fn initialiser_file(n: usize, max: usize) -> bool {
+    let mut f = FILES[n].file.verrouiller();
+    if f.entites.try_reserve_exact(max).is_err() {
+        return false;
+    }
     f.depuis = crate::temps::ns_monotone();
+    true
+}
+
+/// Le processeur `p` doit regarder s'il cède : son « besoin de céder »
+/// (Release : ce qui a été mis dans sa file avant), et l'IPI de
+/// reprogrammation s'il n'est pas celui qui exécute ceci (elle le sort de
+/// `hlt`, ou il la voit à la sortie de l'interruption).
+fn faire_ceder(p: usize, moi: usize) {
+    processeur::zone(p).besoin_de_ceder.store(1, Ordering::Release);
+    if p != moi {
+        crate::smp::reprogrammer(p);
+    }
+}
+
+/// Le processeur où mettre la tâche `t` (voir l'en-tête : « où va une
+/// tâche »), parmi ceux en service que son masque permet (tous, si son
+/// masque n'en permet plus aucun : il a été posé quand ils étaient là).
+fn choisir_processeur(t: &Tache, neuve: bool) -> usize {
+    let en_service = processeur::masque_en_service();
+    let permis = match t.affinite() & en_service {
+        0 => en_service,
+        m => m,
+    };
+    let candidats = || (0..processeur::MAX).filter(move |&n| permis >> n & 1 != 0);
+    let inactif = |n: usize| processeur::zone(n).inactif.load(Ordering::Relaxed);
+    if !neuve {
+        let dernier = t.processeur() as usize;
+        if permis >> dernier & 1 != 0 && inactif(dernier) {
+            return dernier;
+        }
+        if let Some(n) = candidats().find(|&n| inactif(n)) {
+            return n;
+        }
+    }
+    candidats().min_by_key(|&n| FILES[n].charge.load(Ordering::Relaxed)).unwrap_or(0)
 }
 
 /// Réveille `t` (tache.rs, `reveiller`) : son état passe de « dort » à
-/// `pourquoi` SOUS le verrou de la file, dans la même section critique que
-/// la lecture de `en_file` (le `pi_lock` de Linux, tenu de
+/// `pourquoi` SOUS le verrou de sa dernière file, dans la même section
+/// critique que la lecture de `en_file` (le `pi_lock` de Linux, tenu de
 /// `ttwu_state_match` à `ttwu_queue` ; chez nous le verrou de la file
 /// suffit : `ordonnancer` lit l'état et retire la tâche sous ce même
 /// verrou). Un compare_exchange gagné avec `en_file` faux dit alors que la
 /// tâche s'est retirée pour CE sommeil et ne s'exécutera plus d'elle-même :
 /// personne d'autre ne peut la remettre en file, et un second réveilleur
-/// trouve un état qui ne dort plus. Rend faux si elle ne dormait pas, ou
-/// pas d'un sommeil que `pourquoi` réveille.
+/// trouve un état qui ne dort plus. Préemption coupée du début à la fin
+/// (le `guard(preempt)` de `try_to_wake_up` : « moi » ne change pas de
+/// sens). Rend faux si elle ne dormait pas, ou pas d'un sommeil que
+/// `pourquoi` réveille.
 pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) -> bool {
-    let f = FILE.verrouiller();
-    if !t.passer_a_reveillee(pourquoi) {
-        return false;
-    }
-    // Le `ttwu_runnable` de Linux : elle n'avait pas fini de s'endormir
-    // (son état, réveillé, l'y garde), ou elle est préemptée : rien à
-    // ajouter ; elle doit peut-être passer avant la courante.
-    if t.est_en_file() {
-        ceder_si_une_autre_passe(&f);
-        return true;
-    }
-    drop(f);
-    // Sortie de la file pour ce sommeil ; elle peut n'avoir pas FINI de
-    // quitter le processeur (`sur_processeur`, entre sa sortie de la file
-    // et la fin de bascule de la tâche suivante) : on attend, sans le
-    // verrou de la file (la fin de bascule n'a besoin de rien de nous,
-    // quelques centaines de cycles), puis on la met dans la file.
-    while t.est_sur_processeur() {
-        core::hint::spin_loop();
-    }
-    let mut f = FILE.verrouiller();
-    f.compter_courante();
-    f.ajouter(t, false);
-    ceder_si_une_autre_passe(&f);
-    true
+    processeur::sans_preemption(|| {
+        let moi = processeur::courant().numero as usize;
+        loop {
+            let p = t.processeur() as usize;
+            let f = FILES[p].file.verrouiller();
+            // Déplacée entre la lecture de son processeur et le verrou
+            // (tirée par un autre) : on recommence avec le bon.
+            if t.processeur() as usize != p {
+                continue;
+            }
+            if !t.passer_a_reveillee(pourquoi) {
+                return false;
+            }
+            // Le `ttwu_runnable` de Linux : elle n'avait pas fini de
+            // s'endormir (son état, réveillé, l'y garde), ou elle est
+            // préemptée : rien à ajouter ; elle doit peut-être passer avant
+            // la courante de ce processeur.
+            if t.est_en_file() {
+                if f.doit_ceder() {
+                    faire_ceder(p, moi);
+                }
+                return true;
+            }
+            drop(f);
+            // Sortie de sa file pour ce sommeil ; elle peut n'avoir pas FINI
+            // de quitter son processeur (`sur_processeur`, entre sa sortie
+            // de la file et la fin de bascule de la tâche suivante) : on
+            // attend, sans verrou (la fin de bascule n'a besoin de rien de
+            // nous, quelques centaines de cycles), puis on la place.
+            while t.est_sur_processeur() {
+                core::hint::spin_loop();
+            }
+            placer(t, false, moi);
+            return true;
+        }
+    })
 }
 
-/// Une tâche neuve (clone, un programme lancé) devient prête. Elle n'est
-/// dans la file ni sur un processeur : rien à vérifier.
+/// Une tâche neuve (clone, un programme lancé) devient prête : dans la file
+/// du processeur le moins chargé (`choisir_processeur`). Elle n'est dans
+/// aucune file : rien à vérifier, aucun verrou à prendre d'abord.
 pub fn rendre_prete(t: Arc<Tache>) {
-    let mut f = FILE.verrouiller();
+    processeur::sans_preemption(|| placer(t, true, processeur::courant().numero as usize));
+}
+
+/// Met `t` dans la file du processeur que `choisir_processeur` désigne (le
+/// `ttwu_queue` de Linux). Si elle devrait passer avant la courante de ce
+/// processeur (éligible, et d'échéance plus proche, la courante n'étant pas
+/// protégée : `check_preempt_wakeup_fair`), ce processeur cédera au
+/// prochain point de préemption (`faire_ceder`). Préemption coupée par
+/// l'appelant, qui dit son numéro (`moi`).
+fn placer(t: Arc<Tache>, neuve: bool, moi: usize) {
+    let p = choisir_processeur(&t, neuve);
+    let mut f = FILES[p].file.verrouiller();
     f.compter_courante();
-    f.ajouter(t, true);
-    ceder_si_une_autre_passe(&f);
-}
-
-/// Si une autre tâche que la courante devrait avoir le processeur
-/// (éligible, et d'échéance plus proche, la courante n'étant pas protégée :
-/// `check_preempt_wakeup_fair`), la courante cédera au prochain point de
-/// préemption.
-fn ceder_si_une_autre_passe(f: &File) {
-    let courante = tache::courante();
-    let choisie = f.choisir().map(|e| Arc::as_ptr(&e.tache));
-    if choisie.is_some_and(|c| !core::ptr::eq(c, courante)) {
-        crate::processeur::courant().besoin_de_ceder.store(1, Ordering::Relaxed);
+    f.ajouter(t, neuve);
+    if f.doit_ceder() {
+        faire_ceder(p, moi);
     }
 }
 
-/// Le tic d'horloge, interruptions coupées : le temps de la courante est
-/// compté ; si elle a fini sa tranche et qu'une autre attend, elle cédera.
+/// Le tic d'horloge de ce processeur, interruptions coupées : le temps de
+/// sa courante est compté ; si elle a fini sa tranche et qu'une autre
+/// attend (ou si c'est l'inactive et qu'une tâche est là), elle cédera.
+/// Toutes les TICS_EQUILIBRAGE : l'équilibrage (voir l'en-tête).
 pub fn tic() {
-    let mut f = FILE.verrouiller();
-    if f.compter_courante() && f.entites.len() > 1 {
-        crate::processeur::courant().besoin_de_ceder.store(1, Ordering::Relaxed);
+    let zone = processeur::courant();
+    let moi = zone.numero as usize;
+    {
+        let mut f = FILES[moi].file.verrouiller();
+        let fini = f.compter_courante();
+        let inactive = f.position(f.courante()).is_none();
+        if (fini || inactive) && f.une_autre_permise() {
+            zone.besoin_de_ceder.store(1, Ordering::Relaxed);
+        }
     }
-    // La tâche inactive, quand une tâche est prête (réveillée hors d'une
-    // interruption), cède aussitôt.
-    if f.position(tache::courante()).is_none() && !f.entites.is_empty() {
-        crate::processeur::courant().besoin_de_ceder.store(1, Ordering::Relaxed);
+    if crate::horloge::tics() % TICS_EQUILIBRAGE == moi as u64 % TICS_EQUILIBRAGE {
+        equilibrer(moi);
     }
 }
 
-/// Une autre tâche que la courante est-elle prête ?
+/// Une autre tâche que la courante, que ce processeur peut exécuter,
+/// est-elle prête dans sa file ? Interruptions coupées.
 pub fn autres_pretes() -> bool {
-    let f = FILE.verrouiller();
-    f.entites.iter().any(|e| !core::ptr::eq(Arc::as_ptr(&e.tache), tache::courante()))
+    let moi = processeur::courant().numero as usize;
+    FILES[moi].file.verrouiller().une_autre_permise()
 }
 
 /// Faut-il céder le processeur ?
 pub fn besoin_de_ceder() -> bool {
-    crate::processeur::besoin_de_ceder()
+    processeur::besoin_de_ceder()
+}
+
+/// Tire une tâche de la file `source` vers la file du processeur `moi`,
+/// s'il y en a une à tirer (`File::a_tirer`) : les deux verrous dans l'ordre
+/// des numéros, et tout revérifié sous eux. Vrai si une tâche a été
+/// déplacée. Interruptions coupées (les deux verrous le font).
+fn tirer_de(source: usize, moi: usize) -> bool {
+    if source == moi {
+        return false;
+    }
+    let (premier, second) = (source.min(moi), source.max(moi));
+    let mut a = FILES[premier].file.verrouiller();
+    let mut b = FILES[second].file.verrouiller();
+    // Des emprunts, pas les gardes elles-mêmes : `a` et `b` sont rendues
+    // dans l'ordre inverse de leur prise (la seconde d'abord), quel que soit
+    // le sens ; déplacer les gardes dans un couple les aurait rendues dans
+    // l'ordre du couple, et la première prise, celle qui a coupé les
+    // interruptions, les aurait remises pendant que la seconde est encore
+    // tenue (latent ici : les appelants les coupent déjà).
+    let (de, vers) = if source == premier { (&mut *a, &mut *b) } else { (&mut *b, &mut *a) };
+    let Some(i) = de.a_tirer(moi) else { return false };
+    let t = de.retirer_entite(i);
+    vers.compter_courante();
+    vers.ajouter(t, false);
+    true
+}
+
+/// Les processeurs en service autres que `moi`, du plus chargé au moins
+/// chargé (la charge lue sans verrou : une indication).
+fn par_charge_decroissante(moi: usize) -> impl Iterator<Item = usize> {
+    let en_service = processeur::masque_en_service();
+    let mut ordre = [0usize; processeur::MAX];
+    let mut n = 0;
+    for p in (0..processeur::MAX).filter(|&p| p != moi && en_service >> p & 1 != 0) {
+        // Une insertion triée : au plus 63 processeurs.
+        let charge = FILES[p].charge.load(Ordering::Relaxed);
+        let mut i = n;
+        while i > 0 && FILES[ordre[i - 1]].charge.load(Ordering::Relaxed) < charge {
+            ordre[i] = ordre[i - 1];
+            i -= 1;
+        }
+        ordre[i] = p;
+        n += 1;
+    }
+    ordre.into_iter().take(n)
+}
+
+/// Un processeur qui n'a plus rien tire une tâche prête de la file la plus
+/// chargée qui en ait une à donner (le `newidle_balance` de Linux). Vrai
+/// si une tâche est arrivée dans sa file. Interruptions coupées.
+fn tirer(moi: usize) -> bool {
+    par_charge_decroissante(moi).any(|source| FILES[source].charge.load(Ordering::Relaxed) > 0 && tirer_de(source, moi))
+}
+
+/// L'équilibrage du tic (voir l'en-tête) : d'abord une tâche qu'une file ne
+/// peut plus exécuter (son masque a changé pendant qu'elle y était), tirée
+/// quelle que soit la charge ; sinon, si la file la plus chargée a au moins
+/// deux entités de plus que la nôtre, on lui en tire une.
+fn equilibrer(moi: usize) {
+    if let Some(source) = par_charge_decroissante(moi).find(|&s| FILES[s].interdites.load(Ordering::Relaxed) > 0)
+        && tirer_de(source, moi)
+    {
+        return;
+    }
+    let ma_charge = FILES[moi].charge.load(Ordering::Relaxed);
+    if let Some(source) = par_charge_decroissante(moi).next()
+        && FILES[source].charge.load(Ordering::Relaxed) >= ma_charge + 2
+    {
+        tirer_de(source, moi);
+    }
+}
+
+/// Tous les autres processeurs dorment (leur boucle d'inactivité, dans
+/// `hlt`) et toutes les files sont vides : plus rien ne s'exécute nulle
+/// part, et rien ne peut mettre une tâche dans une file sinon ce
+/// processeur (les périphériques n'interrompent que le processeur 0, et
+/// un tic sur un processeur inactif ne fait rien). Pour le détecteur
+/// d'interblocage (attente.rs), sur le processeur 0, interruptions coupées.
+fn machine_inactive() -> bool {
+    let en_service = processeur::masque_en_service();
+    (0..processeur::MAX).filter(|&p| en_service >> p & 1 != 0).all(|p| {
+        (p == 0 || processeur::zone(p).inactif.load(Ordering::Acquire)) && FILES[p].charge.load(Ordering::Relaxed) == 0
+    })
+}
+
+/// La boucle de la tâche inactive de ce processeur (le code du démarrage
+/// pour le premier, main.rs ; `depart_secondaire` pour les autres, smp.rs) :
+/// elle prend le processeur quand aucune autre tâche n'est prête, tire du
+/// travail d'une autre file s'il y en a, et arrête le processeur (`sti ;
+/// hlt`) jusqu'à la prochaine interruption. Sur le processeur 0, elle
+/// regarde aussi si des programmes ne sont pas bloqués pour toujours
+/// (attente::detecter_interblocage), quand toute la machine est inactive.
+/// Une interruption qui rend une tâche prête la préempte aussitôt ; on
+/// vérifie quand même la file interruptions coupées avant de dormir (voir
+/// cpu::attendre_interruption).
+pub fn boucle_inactive() -> ! {
+    loop {
+        crate::cpu::couper_interruptions();
+        let zone = processeur::courant();
+        let moi = zone.numero as usize;
+        if autres_pretes() || tirer(moi) || (moi == 0 && machine_inactive() && crate::attente::detecter_interblocage()) {
+            crate::cpu::activer_interruptions();
+            ordonnancer(Bascule::Preemption);
+        } else {
+            // « Inactif » : Release après avoir vu la file vide ; qui lit
+            // « inactif » (le choix d'un processeur, `machine_inactive`)
+            // sait qu'il n'y avait rien ici.
+            zone.inactif.store(true, Ordering::Release);
+            crate::cpu::attendre_interruption();
+            zone.inactif.store(false, Ordering::Relaxed);
+        }
+    }
 }
 
 /// Pourquoi on appelle `ordonnancer` (voir l'en-tête).
@@ -311,27 +667,29 @@ pub enum Bascule {
     Preemption,
 }
 
-/// Donne le processeur à la tâche que choisit l'EEVDF (la tâche inactive
-/// si la file est vide), et revient quand la courante le retrouve (jamais,
-/// si elle est morte). Jamais verrou tenu : une tâche qui céderait le
-/// processeur en tenant un verrou (qui coupe les interruptions) bloquerait
-/// tout le monde.
+/// Donne le processeur à la tâche que choisit l'EEVDF dans la file de ce
+/// processeur (la tâche inactive si elle n'en a aucune), et revient quand
+/// la courante le retrouve (jamais, si elle est morte). Jamais verrou tenu :
+/// une tâche qui céderait le processeur en tenant un verrou (qui coupe les
+/// interruptions) bloquerait tout le monde.
 pub fn ordonnancer(bascule: Bascule) {
     let tenus = verrou::tenus();
     assert!(tenus == 0, "ordonnancer avec {} verrou(s) tenu(s)", tenus);
     // Ni préemption coupée, ni dans une interruption (le « scheduling while
     // atomic » de Linux) : le compte de préemption est ainsi toujours nul
     // quand on bascule, et n'a rien à sauver par tâche (processeur.rs).
-    assert!(crate::processeur::preemptible(), "ordonnancer preemption coupee ou dans une interruption");
+    assert!(processeur::preemptible(), "ordonnancer preemption coupee ou dans une interruption");
     let interruptions = crate::cpu::couper_interruptions();
-    crate::processeur::courant().besoin_de_ceder.store(0, Ordering::Relaxed);
+    let zone = processeur::courant();
+    zone.besoin_de_ceder.store(0, Ordering::Relaxed);
+    let courante = tache::courante();
     let suivante = {
-        let mut f = FILE.verrouiller();
+        let mut f = FILES[zone.numero as usize].file.verrouiller();
         f.compter_courante();
         // Un sommeil : la courante quitte la file, sauf si un réveil l'a
         // déjà changée d'avis (voir l'en-tête) ; une préemption : jamais.
-        if bascule == Bascule::Sommeil && tache::courante().quitte_la_file() {
-            f.retirer(tache::courante());
+        if bascule == Bascule::Sommeil && courante.quitte_la_file() {
+            f.retirer(courante);
         }
         // Un pointeur, pas un Arc : la file garde la tâche choisie tant
         // qu'elle est prête ou courante, et un Arc emporté par une tâche qui
@@ -342,23 +700,34 @@ pub fn ordonnancer(bascule: Bascule) {
         // s'exécute (`sur_processeur`, le `prepare_task`), dit SOUS le verrou
         // de la file, avant de basculer : un autre processeur qui la
         // tirerait de la file entre les deux la verrait en cours.
-        if let Some(i) = choisie.and_then(|c| f.entites.iter().position(|e| core::ptr::eq(Arc::as_ptr(&e.tache), c))) {
+        if let Some(i) = choisie.and_then(|c| f.position(c)) {
             f.entites[i].protegee = true;
             f.entites[i].tache.prend_le_processeur();
         } else {
             // SAFETY: l'inactive de ce processeur vit pour toujours.
             unsafe { &*tache::inactive() }.prend_le_processeur();
         }
+        // La courante de la file, sous son verrou (voir `File::courante`).
+        f.courante.store(choisie.unwrap_or_else(tache::inactive).cast_mut(), Ordering::Relaxed);
+        // La courante de la file, sous son verrou (voir `File::courante`).
+        f.courante.store(choisie.unwrap_or_else(tache::inactive).cast_mut(), Ordering::Relaxed);
         // Une bascule volontaire si la courante a quitté la file (elle
         // s'endort, ou elle meurt), forcée sinon (getrusage : `__schedule`).
-        let volontaire = f.position(tache::courante()).is_none();
+        let volontaire = f.position(courante).is_none();
         (choisie, volontaire)
     };
     let (suivante, volontaire) = suivante;
     let suivante = suivante.unwrap_or_else(tache::inactive);
-    if !core::ptr::eq(suivante, tache::courante()) {
+    if !core::ptr::eq(suivante, courante) {
+        // L'inactive qui cède (préemptée depuis `hlt` par une interruption
+        // qui a réveillé une tâche) : le processeur n'est plus inactif, et
+        // `choisir_processeur` ne doit plus le préférer (la relecture de
+        // 6j : le drapeau restait posé jusqu'à son prochain tour de boucle).
+        if core::ptr::eq(courante, tache::inactive()) {
+            zone.inactif.store(false, Ordering::Relaxed);
+        }
         BASCULES.fetch_add(1, Ordering::Relaxed);
-        tache::courante().usage().compter_bascule(volontaire);
+        courante.usage().compter_bascule(volontaire);
         // SAFETY: `suivante` est dans la file (ou l'inactive, qui ne meurt
         // pas) : elle vit au moins jusqu'à ce qu'elle quitte la file, ce
         // qu'elle seule peut faire, en s'exécutant.
@@ -375,7 +744,7 @@ pub fn ordonnancer(bascule: Bascule) {
 /// attend la réponse d'autres processeurs, ou qui tourne sur un verrou qui
 /// dort, garde son processeur).
 pub fn preempter() {
-    if besoin_de_ceder() && !crate::processeur::preemption_coupee() {
+    if besoin_de_ceder() && !processeur::preemption_coupee() {
         ordonnancer(Bascule::Preemption);
     }
 }
@@ -385,7 +754,8 @@ pub fn preempter() {
 /// passe après les autres éligibles.
 pub fn ceder() {
     {
-        let mut f = FILE.verrouiller();
+        let interruptions = crate::cpu::couper_interruptions();
+        let mut f = FILES[processeur::courant().numero as usize].file.verrouiller();
         f.compter_courante();
         let courante = tache::courante();
         if let Some(i) = f.position(courante) {
@@ -393,8 +763,77 @@ pub fn ceder() {
             e.echeance += tranche_virtuelle(e.poids);
             e.protegee = false;
         }
+        drop(f);
+        if interruptions {
+            crate::cpu::activer_interruptions();
+        }
     }
     ordonnancer(Bascule::Preemption);
+}
+
+/// Le masque de la tâche `t` vient de changer (sched_setaffinity, tache.rs ;
+/// voir l'en-tête : l'affinité), sous le verrou de sa file : prête dans une
+/// file dont le processeur n'est plus permis, elle est déplacée tout de
+/// suite ; en cours, ce processeur la fait céder, et la poussera en
+/// finissant la bascule (`pousser_si_interdite`) ; endormie, son réveil
+/// choisira. Préemption coupée du début à la fin (« moi » ne change pas).
+pub fn affinite_changee(t: &Tache) {
+    processeur::sans_preemption(|| {
+        let moi = processeur::courant().numero as usize;
+        loop {
+            let p = t.processeur() as usize;
+            let mut f = FILES[p].file.verrouiller();
+            // Déplacée entre la lecture de son processeur et le verrou.
+            if t.processeur() as usize != p {
+                continue;
+            }
+            f.recompter_interdites();
+            if permise(t, p) {
+                return;
+            }
+            if t.est_sur_processeur() {
+                drop(f);
+                faire_ceder(p, moi);
+                return;
+            }
+            let Some(i) = f.position(t) else { return };
+            let e = f.retirer_entite(i);
+            drop(f);
+            placer(e, false, moi);
+            return;
+        }
+    });
+}
+
+/// La tâche `t` vient de quitter ce processeur (la fin de sa bascule,
+/// tache.rs) : restée dans sa file (préemptée) alors que son masque n'y
+/// permet plus son exécution (`affinite_changee` l'a fait céder), elle est
+/// poussée maintenant vers un processeur permis (voir l'en-tête : Linux le
+/// fait par sa tâche d'arrêt, `migration_cpu_stop`). Les deux verrous dans
+/// l'ordre des numéros, tout revérifié sous eux. Interruptions coupées.
+pub fn pousser_si_interdite(t: &Tache) {
+    let source = processeur::courant().numero as usize;
+    if !t.est_en_file() || permise(t, source) {
+        return;
+    }
+    let dest = choisir_processeur(t, false);
+    if dest == source {
+        return;
+    }
+    let (premier, second) = (source.min(dest), source.max(dest));
+    let mut a = FILES[premier].file.verrouiller();
+    let mut b = FILES[second].file.verrouiller();
+    let (de, vers) = if source == premier { (&mut *a, &mut *b) } else { (&mut *b, &mut *a) };
+    let Some(i) = de.position(t) else { return };
+    if de.entites[i].tache.est_sur_processeur() || permise(t, source) {
+        return;
+    }
+    let e = de.retirer_entite(i);
+    vers.compter_courante();
+    vers.ajouter(e, false);
+    if vers.doit_ceder() {
+        faire_ceder(dest, source);
+    }
 }
 
 /// Le nombre de bascules depuis le démarrage.

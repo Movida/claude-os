@@ -15,11 +15,29 @@
  * Avec l'argument « fin », un fil appelle exit_group au milieu de tout cela :
  * le processus doit finir, code 0, sans rien laisser (le lanceur le dit) ;
  * un verrou de la mémoire perdu le figerait.
+ * Puis « TLB perimee » (6j) : deux fils, chacun épinglé sur son processeur
+ * (vérifié par getcpu : sur deux processeurs différents, sinon ECHEC, dès
+ * que la machine en a deux) ; A écrit une valeur dans une page, B la lit
+ * (les deux TLB gardent la traduction) ; A retire la page, prend un cadre
+ * de plus (le « puits » : le cadre que munmap vient de rendre, repris et
+ * mis à zéro par la première allocation venue, est ainsi occupé) et en
+ * reprojette une à la même adresse (MAP_FIXED) où il écrit une autre
+ * valeur ; B doit relire cette valeur-là, jamais l'ancien cadre : le noyau
+ * a fait oublier la traduction au processeur de B (le vidage des TLB entre
+ * processeurs). Mille fois, les deux fils se passant la main en TOURNANT
+ * sur un compteur, sans jamais dormir : un fil qui dort (une barrière de
+ * pthread, un futex) cède son processeur, qui charge l'espace du noyau, et
+ * recharger CR3 vide son TLB ; B ne pouvait alors plus relire une
+ * traduction périmée. Sans le puits, B relisait 0 même sans vidage : le
+ * cadre rendu était déjà repris et mis à zéro (la relecture de 6j, et deux
+ * essais en coupant le vidage à distance dans le noyau ; le troisième dit
+ * ECHEC dès le premier tour).
  * Il tourne dans notre noyau et sur l'hôte.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -137,6 +155,128 @@ static unsigned long descendre(int profondeur)
 
 /* Avec « fin » : exit_group au milieu des fautes, des madvise et des munmap
  * des autres fils. */
+/* Le test « TLB périmée » : la page, la barrière des deux fils, et ce que
+ * B a vu. */
+static volatile unsigned char *page_tlb;
+/* Le puits : une page neuve par tour, touchée par A juste après son munmap
+ * (voir l'en-tête). */
+static volatile unsigned char *puits_tlb;
+/* Le pas des deux fils, dans une AUTRE page que page_tlb : quatre par tour,
+ * A franchit les impairs, B les pairs. */
+static int pas_tlb;
+static int tlb_perimee, tlb_cpu_a = -1, tlb_cpu_b = -1;
+#define TOURS_TLB 1000
+
+static void attendre_pas(int n)
+{
+    while (__atomic_load_n(&pas_tlb, __ATOMIC_ACQUIRE) < n)
+        __builtin_ia32_pause();
+}
+
+static void franchir_pas(int n)
+{
+    __atomic_store_n(&pas_tlb, n, __ATOMIC_RELEASE);
+}
+
+static int epingler(int cpu)
+{
+    cpu_set_t c;
+    CPU_ZERO(&c);
+    CPU_SET(cpu, &c);
+    if (pthread_setaffinity_np(pthread_self(), sizeof c, &c) != 0)
+        return -1;
+    sched_yield();
+    return sched_getcpu();
+}
+
+static void *tlb_a(void *arg)
+{
+    tlb_cpu_a = epingler((int)(long)arg);
+    for (int tour = 0; tour < TOURS_TLB; tour++) {
+        int p = tour * 4;
+        page_tlb[0] = 0x42;
+        franchir_pas(p + 1); /* B lit 0x42 */
+        attendre_pas(p + 2); /* B a lu */
+        munmap((void *)page_tlb, PAGE);
+        puits_tlb[tour * PAGE] = 0x99;
+        if (mmap((void *)page_tlb, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED)
+            ecart_vu("TLB : mmap MAP_FIXED", tour);
+        page_tlb[0] = 0x24;
+        franchir_pas(p + 3); /* B relit : 0x24 */
+        attendre_pas(p + 4); /* B a relu */
+    }
+    return NULL;
+}
+
+static void *tlb_b(void *arg)
+{
+    tlb_cpu_b = epingler((int)(long)arg);
+    for (int tour = 0; tour < TOURS_TLB; tour++) {
+        int p = tour * 4;
+        attendre_pas(p + 1);
+        if (page_tlb[0] != 0x42)
+            ecart_vu("TLB : B ne lit pas ce qu'A a ecrit", page_tlb[0]);
+        franchir_pas(p + 2);
+        attendre_pas(p + 3);
+        unsigned char v = page_tlb[0];
+        if (v != 0x24) {
+            tlb_perimee++;
+            if (tlb_perimee == 1)
+                ecart_vu("TLB perimee : B ne relit pas la page neuve", v);
+        }
+        franchir_pas(p + 4);
+    }
+    return NULL;
+}
+
+/* Deux processeurs permis, s'il y en a : les deux premiers du masque. */
+static int deux_processeurs(int *a, int *b)
+{
+    cpu_set_t c;
+    if (sched_getaffinity(0, sizeof c, &c) != 0)
+        return 0;
+    *a = *b = -1;
+    for (int i = 0; i < CPU_SETSIZE; i++)
+        if (CPU_ISSET(i, &c)) {
+            if (*a < 0)
+                *a = i;
+            else if (*b < 0) {
+                *b = i;
+                return 1;
+            }
+        }
+    return 0;
+}
+
+static void tester_tlb(void)
+{
+    int a, b;
+    if (!deux_processeurs(&a, &b)) {
+        printf("[linux] fautes : TLB perimee : un seul processeur, rien a verifier\n");
+        return;
+    }
+    page_tlb = mmap(NULL, PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    puits_tlb = mmap(NULL, TOURS_TLB * PAGE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (page_tlb == MAP_FAILED || puits_tlb == MAP_FAILED) {
+        ecart_vu("TLB : mmap", 0);
+        return;
+    }
+    pthread_t fa, fb;
+    pthread_create(&fa, NULL, tlb_a, (void *)(long)a);
+    pthread_create(&fb, NULL, tlb_b, (void *)(long)b);
+    pthread_join(fa, NULL);
+    pthread_join(fb, NULL);
+    munmap((void *)page_tlb, PAGE);
+    munmap((void *)puits_tlb, TOURS_TLB * PAGE);
+    if (tlb_cpu_a != a || tlb_cpu_b != b)
+        ecart_vu("TLB : les deux fils ne sont pas chacun sur son processeur", (unsigned long)(tlb_cpu_a * 64 + tlb_cpu_b));
+    if (tlb_perimee == 0 && tlb_cpu_a == a && tlb_cpu_b == b)
+        printf("[linux] fautes : TLB perimee : %d fois une page retiree et reprojetee par un fil, relue par l'autre sur son processeur, jamais l'ancien cadre : ok\n", TOURS_TLB);
+    else
+        printf("[linux] fautes : TLB perimee : %d relectures de l'ancienne page sur %d, fils sur les processeurs %d et %d (attendus %d et %d) : ECHEC\n",
+               tlb_perimee, TOURS_TLB, tlb_cpu_a, tlb_cpu_b, a, b);
+}
+
 static void *finisseur(void *arg)
 {
     (void)arg;
@@ -189,5 +329,7 @@ int main(int argc, char **argv)
     else
         printf("[linux] fautes : %d ecarts, le premier : %s ; chacun a tourne : %s : ECHEC\n",
                ecarts, ecarts ? ecart : "aucun", assez ? "oui" : "non");
-    return ecarts != 0 || !assez;
+    int avant = ecarts;
+    tester_tlb();
+    return ecarts != 0 || !assez || avant != ecarts;
 }

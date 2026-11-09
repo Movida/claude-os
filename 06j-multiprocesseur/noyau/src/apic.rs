@@ -379,6 +379,11 @@ fn envoyer_protege(destination: u8, bas: u32) {
 /// Envoie l'interruption `vecteur` au processeur dont l'APIC est
 /// `destination` (livraison fixe, en front) : une IPI, voir l'en-tête.
 pub fn ipi(destination: u8, vecteur: u8) {
+    // Ce qui a été écrit pour le receveur (un « besoin de céder », une
+    // demande) l'est avant le message : une barrière complète (le
+    // processeur ordonne déjà une écriture de registre après les
+    // précédentes ; le compilateur, non).
+    core::sync::atomic::fence(Ordering::SeqCst);
     envoyer_protege(destination, vecteur as u32);
 }
 

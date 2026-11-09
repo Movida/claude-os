@@ -210,7 +210,7 @@ impl<T> Verrou<T> {
     /// standard). Les interruptions restent comme elles sont : celui qui
     /// tient la mémoire d'un processus en écriture touche ainsi ses tables
     /// de pages sans les couper (memoire.rs).
-    pub fn get_mut(&mut self) -> &mut T {
+    pub const fn get_mut(&mut self) -> &mut T {
         self.donnee.get_mut()
     }
 

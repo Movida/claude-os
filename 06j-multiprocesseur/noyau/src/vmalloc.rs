@@ -150,9 +150,11 @@ pub fn initialiser() -> Bilan {
     // adresse tous les 2 Mio crée toutes les tables de la zone ; la
     // première adresse de la région crée aussi la PDPT.
     let fin_piles = DEBUT + piles as u64 * CASE;
+    let tables = TABLES_NOYAU.verrouiller();
     for v in (DEBUT..fin_piles).step_by(2 << 20).chain([fin_piles - 1]) {
         pagination::preparer(pml4, v).expect("plus de memoire pour les tables de vmalloc");
     }
+    drop(tables);
     let tables = (avant - pages::libres()) as u64 * PAGE;
     let mut r = REGION.verrouiller();
     // Les numéros dans l'ordre inverse : `pop` donne d'abord la case 0. La
@@ -182,6 +184,16 @@ pub struct Pile {
 /// compter : ces cadres ne sont pas libres.
 static CACHE_PILES: Verrou<Vec<Pile>> = Verrou::new(Vec::new());
 const PILES_EN_CACHE_PAR_PROCESSEUR: usize = 2;
+
+/// Le verrou des tables de pages du noyau (le `init_mm.page_table_lock` de
+/// Linux, 6j) : deux processeurs qui projettent ou retirent des pages de la
+/// région en même temps (une pile allouée par un clone, une autre rendue par
+/// le rendeur, des registres projetés) écrivent dans les mêmes tables ;
+/// chacun sa propre entrée, mais la création d'une table qui manque
+/// (pagination::suivante) écrit l'entrée du niveau au-dessus, et deux
+/// créateurs en perdraient une. Pris le temps d'écrire les entrées, jamais
+/// pendant le vidage des TLB (qui attend les autres processeurs : smp.rs).
+static TABLES_NOYAU: Verrou<()> = Verrou::new(());
 
 /// Range la pile `p`, rendue par le rendeur (tache.rs) : dans le cache
 /// s'il a de la place, sinon vraiment rendue.
@@ -218,6 +230,7 @@ impl Pile {
         let case = REGION.verrouiller().piles_libres.pop()?;
         let pile = Pile { case };
         let pml4 = pagination::pml4_noyau();
+        let tables = TABLES_NOYAU.verrouiller();
         for v in (pile.bas()..pile.haut()).step_by(PAGE as usize) {
             // Une page qui manque : `pile` est lâchée, Drop rend celles déjà
             // projetées et la case.
@@ -226,6 +239,7 @@ impl Pile {
             pagination::projeter(pml4, v, cadre, ECRITURE | pagination::non_executable())
                 .expect("table de la zone des piles absente");
         }
+        drop(tables);
         Some(pile)
     }
 
@@ -254,6 +268,7 @@ impl Drop for Pile {
         const PAGES: usize = (TAILLE_PILE / PAGE) as usize;
         let (mut adresses, mut cadres) = ([0u64; PAGES], [0u64; PAGES]);
         let mut n = 0;
+        let tables = TABLES_NOYAU.verrouiller();
         for v in (self.bas()..self.haut()).step_by(PAGE as usize) {
             if let Some(cadre) = pagination::retirer(pml4, v) {
                 adresses[n] = v;
@@ -261,6 +276,7 @@ impl Drop for Pile {
                 n += 1;
             }
         }
+        drop(tables);
         crate::smp::vider_tlb_noyau(&adresses[..n]);
         for &c in &cadres[..n] {
             pages::liberer(c, 0);
@@ -337,12 +353,14 @@ fn projeter(physique: u64, longueur: u64, genre: Genre) -> Option<Projection> {
         Genre::Tables => pagination::non_executable(),
     };
     let pml4 = pagination::pml4_noyau();
+    let tables = TABLES_NOYAU.verrouiller();
     for i in 0..pages {
         // Une table qui manque : `p` est lâchée, Drop retire ce qui est déjà
         // projeté et rend la plage.
         pagination::projeter(pml4, debut + i * PAGE, premiere + i * PAGE, droits)?;
         p.projetees += 1;
     }
+    drop(tables);
     Some(p)
 }
 
@@ -372,10 +390,12 @@ pub fn memremap(physique: u64, longueur: u64) -> Option<Projection> {
 impl Drop for Projection {
     fn drop(&mut self) {
         let pml4 = pagination::pml4_noyau();
+        let tables = TABLES_NOYAU.verrouiller();
         for i in 0..self.projetees {
             // Les pages projetées ne sont pas à nous : rien à rendre au buddy.
             let _ = pagination::retirer(pml4, self.debut + i * PAGE);
         }
+        drop(tables);
         // Les traductions oubliées par tous les processeurs (voir
         // Pile::drop) : page par page jusqu'à 33, tout le TLB au-delà.
         let mut adresses = [0u64; 33];

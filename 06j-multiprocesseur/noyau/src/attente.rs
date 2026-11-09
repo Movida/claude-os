@@ -662,8 +662,11 @@ pub fn tic() {
     }
 }
 
-/// Le détecteur d'interblocage, appelé par la tâche inactive quand aucune
-/// tâche n'est prête, interruptions coupées. Si aucune minuterie d'un
+/// Le détecteur d'interblocage, appelé par la tâche inactive du processeur
+/// 0 quand aucune tâche n'est prête nulle part et que tous les autres
+/// processeurs dorment (ordonnanceur.rs, `machine_inactive` : une tâche
+/// en cours ailleurs pourrait réveiller qui dort), interruptions coupées.
+/// Si aucune minuterie d'un
 /// programme n'est armée, plus rien ne peut réveiller les programmes qui
 /// dorment : ni une
 /// échéance, ni une autre tâche (aucune ne s'exécute), ni un périphérique

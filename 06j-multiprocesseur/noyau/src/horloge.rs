@@ -23,9 +23,12 @@
 //!     recommence. Sans APIC (une machine sans tables ACPI : un seul
 //!     processeur), il reste l'horloge.
 //!
-//! UNIPROCESSEUR : un seul timer réglé, celui du processeur de démarrage ;
-//! avec plusieurs, chaque processeur règle le sien (son tic fait tourner
-//! sa propre file des prêtes), et le temps reste compté une seule fois.
+//! Chaque processeur règle le timer de son APIC (6j : le même décompte que
+//! le premier, `demarrer_tic_secondaire` ; les APIC partagent le bus) :
+//! son tic fait tourner sa propre file des prêtes (ordonnanceur.rs). Le
+//! TEMPS, lui, n'est compté qu'une fois, par le processeur 0 (`tic`, les
+//! minuteries d'attente.rs : le `tick_do_timer_cpu` de Linux) : les tics
+//! des autres ne comptent pas (interruptions.rs).
 //!
 //! Fréquence : 1000 Hz, un tic par milliseconde, comme le CONFIG_HZ=1000
 //! des noyaux Linux de bureau. Plus de tics = plus de réactivité (un
@@ -42,7 +45,7 @@
 
 use crate::cpu;
 use crate::port;
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const IRQ: u8 = 0;
 
@@ -60,6 +63,10 @@ pub const DIVISEUR: u16 = ((FREQUENCE_PIT + HZ / 2) / HZ) as u16;
 /// son décompte / sa fréquence mesurée).
 static NUMERATEUR: AtomicU64 = AtomicU64::new(DIVISEUR as u64);
 static DENOMINATEUR: AtomicU64 = AtomicU64::new(FREQUENCE_PIT as u64);
+/// Le décompte du timer de l'APIC pour un tic, une fois mesuré (0 : le
+/// PIT fait l'horloge, pas de timer d'APIC) : ce que règle chaque
+/// processeur secondaire.
+static DECOMPTE_APIC: AtomicU32 = AtomicU32::new(0);
 
 /// La durée de `tics` tics, en nanosecondes.
 pub fn nanosecondes(tics: u64) -> u64 {
@@ -124,6 +131,7 @@ pub fn initialiser(apic: bool) -> Source {
         let decompte = (hz / HZ as u64).max(1);
         NUMERATEUR.store(decompte, Ordering::Relaxed);
         DENOMINATEUR.store(hz, Ordering::Relaxed);
+        DECOMPTE_APIC.store(decompte as u32, Ordering::Relaxed);
         crate::apic::demarrer_timer(decompte as u32);
         // Le PIT arrêté, comme le `pit_shutdown` de Linux : le canal 0 en
         // mode 0 (un seul compte à rebours, sans recharge), décompte nul.
@@ -153,7 +161,18 @@ pub fn initialiser(apic: bool) -> Source {
     Source::Pit
 }
 
-/// Appelée à chaque tic, interruptions coupées.
+/// Démarre le timer de l'APIC d'un processeur secondaire, avec le décompte
+/// mesuré sur le premier (le `setup_secondary_APIC_clock` de Linux) : sur
+/// ce processeur, interruptions coupées (smp.rs). Rien sans APIC (une
+/// machine sans ACPI n'a qu'un processeur).
+pub fn demarrer_tic_secondaire() {
+    let decompte = DECOMPTE_APIC.load(Ordering::Relaxed);
+    if decompte != 0 {
+        crate::apic::demarrer_timer(decompte);
+    }
+}
+
+/// Appelée à chaque tic du processeur 0, interruptions coupées.
 pub fn tic() {
     // Relaxed : un simple compteur, rien d'autre à rendre visible avec lui.
     TICS.fetch_add(1, Ordering::Relaxed);

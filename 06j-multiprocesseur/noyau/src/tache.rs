@@ -333,6 +333,10 @@ pub struct Tache {
     /// leurs inscrits O_ASYNC (surveillance::Groupe::deposer), au même
     /// moment.
     pub instances_a_signaler: Verrou<Option<Arc<crate::surveillance::Groupe>>>,
+    /// Les trames qu'elle a émises par `lo` et pas encore reçues (6j,
+    /// reseau/boucle.rs : une file par tâche émettrice, le `backlog` par
+    /// processeur de Linux) ; faite à sa première émission.
+    pub file_lo: Verrou<Option<alloc::collections::VecDeque<crate::reseau::paquet::Paquet>>>,
 }
 
 /// Ce qu'un programme a de plus qu'une tâche du noyau.
@@ -463,6 +467,7 @@ impl Tache {
             fermetures: Verrou::new(None),
             tubes_fermes: Verrou::new(None),
             instances_a_signaler: Verrou::new(None),
+            file_lo: Verrou::new(None),
         }
     }
 
@@ -582,6 +587,12 @@ impl Tache {
         if oui {
             self.processeur.store(p, Ordering::Relaxed);
         }
+    }
+
+    /// Le processeur dont la file la tient, ou la tenait en dernier (voir
+    /// `processeur`) : là où elle s'exécute, si elle s'exécute.
+    pub fn processeur(&self) -> u32 {
+        self.processeur.load(Ordering::Relaxed)
     }
 
 
@@ -856,16 +867,24 @@ pub fn affinite_du_fil(tid: u32) -> Option<u64> {
 }
 
 /// Pose l'affinité du fil `tid` (sched_setaffinity) : faux s'il ne vit
-/// pas.
+/// pas. S'il s'exécute sur un processeur que le masque ne permet plus, ce
+/// processeur le fait céder (ordonnanceur.rs : le premier processeur permis
+/// qui n'a rien à faire le tirera).
 pub fn poser_affinite_du_fil(tid: u32, masque: u64) -> bool {
-    let mut trouve = false;
+    let mut trouve = None;
     pour_chaque(|t| {
         if t.tid == tid {
             t.poser_affinite(masque);
-            trouve = true;
+            trouve = Some(t.clone());
         }
     });
-    trouve
+    match trouve {
+        Some(t) => {
+            ordonnanceur::affinite_changee(&t);
+            true
+        }
+        None => false,
+    }
 }
 
 /// Exécute `f` sans qu'une faute de page dans une copie de la tâche
@@ -985,9 +1004,27 @@ fn reveillable(e: u8, pourquoi: Reveil) -> bool {
 /// Un signal vient d'être mis en attente pour le fil `t`, qui ne le bloque
 /// pas : s'il dort interruptible, il est réveillé (le `signal_wake_up` de
 /// Linux). Le compare_exchange décide seul : plus de lecture à part d'un
-/// drapeau « interruptible », qui pouvait être lu avant d'être posé.
+/// drapeau « interruptible », qui pouvait être lu avant d'être posé. S'il
+/// s'exécute sur un autre processeur, celui-ci reçoit l'IPI de
+/// reprogrammation (le `kick_process` de Linux) : le fil entre dans le
+/// noyau et voit le signal à son retour (`verifier_au_retour`), au lieu
+/// d'attendre son prochain tic ou appel système.
 pub fn reveiller_par_signal(t: Arc<Tache>) {
-    reveiller(t, Reveil::Signal);
+    if !reveiller(t.clone(), Reveil::Signal) {
+        secouer(&t);
+    }
+}
+
+/// Fait entrer dans le noyau le fil `t` s'il s'exécute sur un autre
+/// processeur (voir `reveiller_par_signal`). Préemption coupée le temps de
+/// comparer : « un autre » ne doit pas changer de sens.
+fn secouer(t: &Tache) {
+    processeur::sans_preemption(|| {
+        let p = t.processeur() as usize;
+        if t.est_sur_processeur() && p != processeur::courant().numero as usize {
+            crate::smp::reprogrammer(p);
+        }
+    });
 }
 
 /// Un signal attend la tâche courante, qui doit finir son attente
@@ -1036,9 +1073,11 @@ pub fn inactive() -> *const Tache {
 pub fn basculer_vers(nouvelle: &Tache) {
     let interruptions = cpu::couper_interruptions();
     let ancienne = courante();
-    // SAFETY: interruptions coupées, sur notre seul processeur : personne
-    // d'autre ne touche à l'état des deux tâches (UNIPROCESSEUR, voir
-    // `unsafe impl Sync for Tache`). Les registres et MSR
+    // SAFETY: interruptions coupées, et une tâche ne s'exécute que sur un
+    // processeur à la fois (`sur_processeur`, voir `unsafe impl Sync for
+    // Tache`) : personne d'autre ne touche à l'état des deux tâches
+    // (l'ancienne est encore la nôtre, la nouvelle a été choisie sous le
+    // verrou de notre file). Les registres et MSR
     // écrits sont ceux du programme de la nouvelle tâche (le noyau n'en
     // dépend pas) ; son espace a la moitié haute du noyau, on continue de
     // s'exécuter après avoir changé CR3 ; sa pile noyau est la sienne.
@@ -1200,7 +1239,12 @@ extern "C" fn fin_de_bascule(precedente: *const core::ffi::c_void) {
     let precedente = precedente as *const Tache;
     // SAFETY: la précédente vit : une tâche ne quitte son Arc que rendue par
     // le rendeur, bien après cette fin de bascule.
-    unsafe { &*precedente }.sur_processeur.store(false, Ordering::Release);
+    let precedente = unsafe { &*precedente };
+    precedente.sur_processeur.store(false, Ordering::Release);
+    // Son masque ne permet plus ce processeur (sched_setaffinity pendant
+    // qu'elle s'exécutait) : poussée vers un processeur permis maintenant
+    // qu'elle l'a quitté (ordonnanceur.rs, l'affinité).
+    ordonnanceur::pousser_si_interdite(precedente);
     let morte = processeur::courant().a_rendre.swap(core::ptr::null_mut(), Ordering::Relaxed);
     if !morte.is_null() {
         // SAFETY: `morte` vient d'Arc::into_raw dans `terminer`, rendu une
@@ -1464,8 +1508,11 @@ pub fn arreter_avec_le_groupe(t: Arc<Tache>, code: i32) {
     *t.fin.verrouiller() = Some(Fin::Sortie(code));
     // Réveillé s'il dort interruptible : le compare_exchange de son état
     // décide (un fil qui n'a pas encore posé « je vais dormir » verra sa
-    // fin prévue en la vérifiant, après l'avoir posé : attente.rs).
-    reveiller(t, Reveil::Signal);
+    // fin prévue en la vérifiant, après l'avoir posé : attente.rs) ; s'il
+    // s'exécute ailleurs, l'IPI (`secouer`).
+    if !reveiller(t.clone(), Reveil::Signal) {
+        secouer(&t);
+    }
 }
 
 /// Le nombre de tâches (sysinfo : `procs`, le `nr_threads` de Linux), les
@@ -1731,7 +1778,11 @@ pub fn tic(programme: bool) {
         t.usage.compter_tic(programme);
     }
     ordonnanceur::tic();
-    crate::attente::tic();
+    // Les échéances : par le processeur 0 seul, qui compte le temps
+    // (horloge.rs).
+    if processeur::courant().numero == 0 {
+        crate::attente::tic();
+    }
 }
 
 /// Le temps de calcul de la tâche courante, en nanosecondes
@@ -1777,11 +1828,15 @@ pub fn tuer_au_retour() {
 ///      gestionnaires s'exécutent dans l'ordre SIGWINCH, SIGUSR2, SIGUSR1).
 ///      Un cadre impossible à poser : SIGSEGV forcé (`force_sigsegv`).
 /// La décision est prise interruptions coupées, et la fonction revient
-/// interruptions coupées quand il n'y a rien à faire : rien ne peut plus
-/// arriver entre la dernière vérification et le retour (sysretq ou iretq
-/// rétablissent les interruptions du programme) ; un signal envoyé par une
-/// interruption tombée avant est vu, un autre après attend l'entrée
-/// suivante. Linux boucle ainsi jusqu'à ce qu'il n'y ait plus rien à faire :
+/// interruptions coupées quand il n'y a rien à faire : sur CE processeur,
+/// rien ne peut plus arriver entre la dernière vérification et le retour
+/// (sysretq ou iretq rétablissent les interruptions du programme) ; un
+/// signal envoyé par une interruption tombée avant est vu. Un signal envoyé
+/// par un AUTRE processeur juste après la vérification fait suivre une IPI
+/// de reprogrammation (`reveiller_par_signal`), qui attend derrière les
+/// interruptions coupées et fait rentrer le fil dans le noyau dès son
+/// retour (le `kick_process` de Linux). Linux boucle ainsi jusqu'à ce qu'il
+/// n'y ait plus rien à faire :
 /// céder le processeur si l'ordonnanceur le demande, puis tout revérifier.
 ///
 /// La limite de temps de calcul est RLIMIT_CPU, en secondes, celle de

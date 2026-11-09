@@ -11,10 +11,17 @@
  * ne laisse presque jamais passer la préemption, et les lignes ne se
  * coupent pas. Il vérifie que rien ne se perd ni ne se coupe ; sur un vrai
  * processeur, il pourrait mordre.
+ *
+ * Depuis 6j, les deux programmes tournent sur deux processeurs : chacun
+ * note (getcpu) les processeurs où il a écrit, et le dit à la fin ; make
+ * tests-qemu vérifie qu'à eux deux ils en ont vu au moins deux. Alors le
+ * test prouve le verrou des écritures : deux processeurs écrivent
+ * vraiment en même temps.
  */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 int main(int argc, char **argv)
@@ -23,12 +30,17 @@ int main(int argc, char **argv)
         return 2;
     char nom = argv[1][0], l[256];
     int n = atoi(argv[2]);
+    unsigned long vus = 0;
     for (int i = 0; i < n; i++) {
+        unsigned cpu;
+        if (syscall(SYS_getcpu, &cpu, NULL, NULL) == 0 && cpu < 64)
+            vus |= 1UL << cpu;
         int k = snprintf(l, sizeof l, "[linux] lignes %c %04d ", nom, i);
         memset(l + k, nom, 160);
         l[k + 160] = '\n';
         if (write(1, l, k + 161) != k + 161)
             return 1;
     }
+    printf("[linux] lignes %c : processeurs vus : %lx\n", nom, vus);
     return 0;
 }

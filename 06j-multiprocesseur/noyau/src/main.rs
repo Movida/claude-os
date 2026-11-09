@@ -495,9 +495,20 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // init : vérifie l'ordonnanceur, puis lance /etc/demarrage, dans sa
     // tâche.
     let init = || {
+        // Les tests de l'ordonnanceur de 6e supposent que leurs tâches se
+        // partagent UN processeur (la préemption ne se prouve pas sur
+        // deux) : init s'épingle sur le processeur 0, ses tâches héritent
+        // du masque, puis il le rend.
+        let affinite = tache::courante().affinite();
+        tache::courante().poser_affinite(1);
+        ordonnanceur::affinite_changee(tache::courante());
         tester_ordonnanceur();
         tester_sommeil();
         tester_verrou_le();
+        tache::courante().poser_affinite(affinite);
+        ordonnanceur::affinite_changee(tache::courante());
+        tester_parallele();
+        tester_torture();
         reseau::configurer();
         tester_voisins();
         reseau::autotest::lancer();
@@ -522,23 +533,13 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         afficherln!("[noyau] Pas de pile pour la tache init : rien a lancer.");
     }
 
-    // Le code du démarrage est maintenant la tâche inactive : elle prend le
-    // processeur quand aucune autre n'est prête, regarde si des programmes
-    // ne sont pas bloqués pour toujours (attente::detecter_interblocage),
-    // et arrête le processeur (sti ; hlt) jusqu'à la prochaine
-    // interruption. Une interruption qui rend une
-    // tâche prête la préempte aussitôt (ordonnanceur.rs) ; on vérifie
-    // quand même la file interruptions coupées avant de dormir (voir
-    // cpu::attendre_interruption).
-    loop {
-        cpu::couper_interruptions();
-        if ordonnanceur::autres_pretes() || attente::detecter_interblocage() {
-            cpu::activer_interruptions();
-            ordonnanceur::ordonnancer(ordonnanceur::Bascule::Preemption);
-        } else {
-            cpu::attendre_interruption();
-        }
-    }
+    // Le code du démarrage est maintenant la tâche inactive du processeur
+    // 0 : sa boucle (ordonnanceur.rs) prend le processeur quand aucune
+    // autre tâche n'est prête, tire du travail des autres files, regarde si
+    // des programmes ne sont pas bloqués pour toujours
+    // (attente::detecter_interblocage), et arrête le processeur (sti ; hlt)
+    // jusqu'à la prochaine interruption.
+    ordonnanceur::boucle_inactive()
 }
 
 /// Vérifie l'ordonnanceur et la préemption du noyau : deux tâches du noyau
@@ -609,12 +610,44 @@ fn tester_ordonnanceur() {
                 if ok { "ok" } else { "ECHEC" });
 }
 
+/// Vérifie que les processeurs travaillent ensemble (6j) : quatre tâches du
+/// noyau qui calculent 50 ms chacune finissent en moins de 150 ms quand il
+/// y a au moins deux processeurs (200 au moins l'une après l'autre) ; sur
+/// un seul, la durée est seulement dite.
+fn tester_parallele() {
+    let n = processeur::nombre();
+    let debut = temps::ns_monotone();
+    let calculer = || {
+        let debut = tache::temps_de_calcul();
+        while tache::temps_de_calcul() - debut < 50_000_000 {
+            core::hint::spin_loop();
+        }
+    };
+    let taches = [
+        tache::lancer_noyau(programmes::NomCourt::de(b"parallele-1"), calculer),
+        tache::lancer_noyau(programmes::NomCourt::de(b"parallele-2"), calculer),
+        tache::lancer_noyau(programmes::NomCourt::de(b"parallele-3"), calculer),
+        tache::lancer_noyau(programmes::NomCourt::de(b"parallele-4"), calculer),
+    ];
+    for t in taches.iter().flatten() {
+        tache::attendre(t);
+    }
+    let ms = (temps::ns_monotone() - debut) / 1_000_000;
+    let lancees = taches.iter().all(Option::is_some);
+    if n >= 2 {
+        afficherln!("[noyau] Parallele : quatre taches de 50 ms sur {} processeurs finies en {} ms : {}.", n, ms,
+                    if lancees && ms < 150 { "ok" } else { "ECHEC" });
+    } else {
+        afficherln!("[noyau] Parallele : quatre taches de 50 ms sur un processeur finies en {} ms{}.", ms, if lancees { "" } else { " : ECHEC" });
+    }
+}
+
 /// Vérifie le protocole de sommeil (attente.rs, tache.rs) : « je vais
 /// dormir » posé, une tâche PRÉEMPTÉE (elle calcule 5 ms, le tic la
 /// remplace) ne quitte pas la file des prêtes, trouve ensuite sa condition
 /// vraie et ne dort pas ; et une tâche RÉVEILLÉE entre « je vais dormir »
-/// et son sommeil (par une autre, pendant qu'elle attend ce réveil sans
-/// dormir) voit son `dormir`
+/// et son sommeil (par une autre, d'un autre processeur quand il y en a
+/// un, pendant qu'elle attend ce réveil sans dormir) voit son `dormir`
 /// revenir tout de suite, avec la raison. Les deux pannes que le protocole
 /// exclut : une tâche perdue, un réveil perdu.
 fn tester_sommeil() {
@@ -658,8 +691,12 @@ fn tester_sommeil() {
     });
     let eveilleuse = dormeuse.clone().and_then(|d| {
         tache::lancer_noyau(programmes::NomCourt::de(b"eveilleuse"), move || {
-            // Attend que la dormeuse ait posé son second « je vais dormir »,
-            // puis la réveille, et le dit.
+            // D'un autre processeur quand il y en a un : un vrai réveil
+            // croisé. Attend que la dormeuse ait posé son second « je vais
+            // dormir », puis la réveille, et le dit.
+            if processeur::nombre() >= 2 {
+                aller_sur(1);
+            }
             while !RESULTAT[0].load(Ordering::Relaxed) || d.sommeil_non_prepare() {
                 ordonnanceur::ceder();
             }
@@ -1179,6 +1216,97 @@ fn tester_remplacement() {
     drop(e);
     afficherln!("[noyau] Copie a l'ecriture : une marque retiree par madvise puis reposee par un autre fil n'est pas prise pour la sienne : {}.",
                 if lu && relu && marque_a != marque_c && a_refuse && c_finit { "ok" } else { "ECHEC" });
+}
+
+/// Se met sur le processeur `n` (ordonnanceur.rs : la tâche cède en
+/// rétablissant la préemption, le processeur `n` la tire à son prochain
+/// tic, elle revient ici sur lui). Pour les tests.
+fn aller_sur(n: u32) {
+    // Un processeur qui n'est pas en service (le scénario test-retard en
+    // abandonne un) : la tâche reste où elle veut.
+    if processeur::masque_en_service() >> n & 1 == 0 {
+        return;
+    }
+    let t = tache::courante();
+    t.poser_affinite(1 << n);
+    ordonnanceur::affinite_changee(t);
+}
+
+/// Les tests de torture du plan de 6j : un `Verrou` disputé par une tâche
+/// par processeur (100 000 prises chacune : le compte doit être exact), un
+/// `Mutex` que deux tâches de deux processeurs se repassent, et des réveils
+/// croisés (les tâches en anneau se passent un tour par une file d'attente :
+/// un réveil perdu laisserait l'anneau à l'arrêt, un réveil doublé
+/// mettrait une tâche deux fois en file, ce que `File::ajouter` refuse).
+/// Chaque attente est bornée : un réveil perdu se voit en dix secondes au
+/// lieu de figer le démarrage.
+fn tester_torture() {
+    const PAR_TACHE: u64 = 100_000;
+    const PAR_MUTEX: u64 = 10_000;
+    const TOURS: u64 = 2_000;
+    static VERROU: verrou::Verrou<u64> = verrou::Verrou::new(0);
+    static MUTEX: attente::Mutex<u64> = attente::Mutex::new(0);
+    static TOUR: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    static FILE: attente::FileAttente = attente::FileAttente::new();
+    static PERDUS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    type Taches = [Option<partage::Arc<tache::Tache>>; 4];
+    let n = processeur::nombre().min(4) as u64;
+    if n < 2 {
+        afficherln!("[noyau] Torture : un seul processeur, rien a disputer.");
+        return;
+    }
+    // `combien` tâches, la i-ième sur le processeur i, qui font `travail(i)`.
+    let lancer = |nom: &[u8], combien: u64, travail: fn(u64)| -> Taches {
+        core::array::from_fn(|i| {
+            let i = i as u64;
+            (i < combien).then(|| tache::lancer_noyau(programmes::NomCourt::de(nom), move || travail(i))).flatten()
+        })
+    };
+    let attendre_toutes = |taches: &Taches, combien: u64| -> bool {
+        let lancees = &taches[..combien as usize];
+        for t in lancees.iter().flatten() {
+            tache::attendre(t);
+        }
+        lancees.iter().all(Option::is_some)
+    };
+    // 1. Le Verrou.
+    let taches = lancer(b"torture-verrou", n, |i| {
+        aller_sur(i as u32);
+        for _ in 0..PAR_TACHE {
+            *VERROU.verrouiller() += 1;
+        }
+    });
+    let verrou_ok = attendre_toutes(&taches, n) && *VERROU.verrouiller() == n * PAR_TACHE;
+    // 2. Le Mutex.
+    let taches = lancer(b"torture-mutex", 2, |i| {
+        aller_sur(i as u32);
+        for _ in 0..PAR_MUTEX {
+            *MUTEX.verrouiller() += 1;
+        }
+    });
+    let mutex_ok = attendre_toutes(&taches, 2) && *MUTEX.verrouiller() == 2 * PAR_MUTEX;
+    // 3. Les réveils croisés.
+    static N: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+    N.store(n, Ordering::Relaxed);
+    let taches = lancer(b"torture-reveil", n, |i| {
+        aller_sur(i as u32);
+        let n = N.load(Ordering::Relaxed);
+        for _ in 0..TOURS {
+            let echeance = temps::ns_monotone() + 10_000_000_000;
+            let r = attente::attendre_que(&FILE, attente::Inscription::Ordinaire, attente::Sommeil::Ininterruptible, Some(echeance),
+                                          || TOUR.load(Ordering::SeqCst) % n == i);
+            if r == tache::Reveil::Echeance {
+                PERDUS.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            TOUR.fetch_add(1, Ordering::SeqCst);
+            FILE.reveiller_toutes();
+        }
+    });
+    let reveils_ok = attendre_toutes(&taches, n) && TOUR.load(Ordering::SeqCst) == n * TOURS && PERDUS.load(Ordering::Relaxed) == 0;
+    afficherln!("[noyau] Torture : {} taches sur {} processeurs, {} prises d'un Verrou chacune ({}) ; un Mutex repasse {} fois ({}) ; {} reveils croises, aucun perdu ({}).",
+                n, n, PAR_TACHE, if verrou_ok { "ok" } else { "ECHEC" }, 2 * PAR_MUTEX, if mutex_ok { "ok" } else { "ECHEC" },
+                n * TOURS, if reveils_ok { "ok" } else { "ECHEC" });
 }
 
 /// Vérifie le tas : des collections de Rust de toutes tailles, et un objet

@@ -23,6 +23,8 @@ mesure contre le TSC), 1000 Hz, vecteur 0xec ; PIT arrete.
 [noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : ok
 [noyau] Preemption coupee : une tache qui calcule 10 ms n'est pas remplacee, puis l'est des qu'elle la retablit : ok.
 [noyau] Sommeil : une tache preemptee entre "je vais dormir" et sa condition n'est pas perdue, un reveil venu avant son sommeil n'est pas perdu : ok.
+[noyau] Parallele : quatre taches de 50 ms sur 4 processeurs finies en 
+[noyau] Torture : 4 taches sur 4 processeurs, 100000 prises d'un Verrou chacune (ok) ; un Mutex repasse 20000 fois (ok) ; 8000 reveils croises, aucun perdu (ok).
 [noyau] Verrou qui dort en lecture et ecriture : les lecteurs passent ensemble, un ecrivain qui attend n'est pas double, retrogradation : ok (EeLLllFfMmGDNdn).
 [noyau] Carte de la memoire (E820)
 [noyau] Memoire libre : 
@@ -186,6 +188,7 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] courses : ok
 [noyau] courses : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] fautes : quatre fils fautent pendant madvise, mmap, mprotect et munmap, la pile grandit : ok
+[linux] fautes : TLB perimee : 1000 fois une page retiree et reprojetee par un fil, relue par l'autre sur son processeur, jamais l'ancien cadre : ok
 [noyau] fautes : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] fautes : exit_group au milieu des fautes, des madvise et des munmap des autres fils
 [noyau] fautes-fin-1 : termine, code de sortie 0 ; memoire rendue : ok.
@@ -205,12 +208,12 @@ tas a partir de 0x555555555000, code en place : ok.
 [linux] arbre : - 0644 1000 1000    36868 /tmp/groupe/sous-dossier/fichier-9
 [noyau] effacer : termine, code de sortie 0.
 [linux] effacer : /tmp/groupe efface : ok
-[noyau] Groupe des lignes 103 a 107 : memoire rendue : ok.
+[noyau] Groupe des lignes 104 a 108 : memoire rendue : ok.
 [linux] effacer : /tmp/fuite cree, 4 fichiers : ok
 [noyau] prog : ouvert en ecriture, ne peut pas etre execute (ETXTBSY)
 [linux] redirections : /tmp/prog tenu en ecriture : ok
 [linux] effacer : /tmp/fuite efface : ok
-[noyau] Groupe des lignes 111 a 118 : memoire rendue : ok.
+[noyau] Groupe des lignes 112 a 119 : memoire rendue : ok.
 [linux] copies : copy_file_range de trois pages et 100 octets : ok
 [linux] copies : sendfile vers une socket : ok
 [linux] copies : toutes les verifications : ok

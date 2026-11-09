@@ -51,12 +51,13 @@
 //! réécrit pour le suivant, le trampoline lui-même l'arrête, avant qu'il
 //! ne touche à une pile qui n'est plus la sienne (trampoline.rs).
 //!
-//! Un secondaire en service ne fait encore que dormir (`sti ; hlt`) : le
-//! timer de son APIC reste masqué (sans file des prêtes par processeur, un
-//! tic sur un secondaire ferait choisir dans la file commune la tâche qui
-//! s'exécute sur le premier) ; il ne reçoit que les INTERRUPTIONS ENTRE
-//! PROCESSEURS (apic.rs : les trois vecteurs). Son tic et sa file viennent
-//! avec la file des prêtes par processeur.
+//! Un secondaire en service démarre le timer de son APIC (le même décompte
+//! que le premier : les APIC partagent le bus, horloge.rs) et entre dans
+//! la boucle d'inactivité de l'ordonnanceur (ordonnanceur.rs : sa file des
+//! prêtes, celles des autres à tirer, `hlt` sinon) : il prend des tâches
+//! comme le premier. Il reçoit ses tics et les INTERRUPTIONS ENTRE
+//! PROCESSEURS (apic.rs : les trois vecteurs) ; les périphériques, eux, ne
+//! parlent qu'au premier.
 //!
 //! APPELER UNE FONCTION AILLEURS (`appeler`, le `smp_call_function_many`
 //! de Linux, avec attente) : une demande par processeur APPELANT, dans sa
@@ -231,6 +232,12 @@ fn demarrer_un(numero: usize, apic: u8) {
         *s = crate::vmalloc::garder_pour_ist(p, numero, role);
     }
     PREPARATIONS.verrouiller()[numero] = Some(PilesIst(sommets));
+    // Sa file des prêtes (ordonnanceur.rs), réservée pour autant de tâches
+    // que de piles.
+    if !crate::ordonnanceur::initialiser_file(numero, crate::vmalloc::max_threads()) {
+        afficherln!("[noyau] Processeur {} (APIC {}) : pas de memoire pour sa file des pretes : laisse de cote.", numero, apic);
+        return;
+    }
     // Sa tâche inactive est sa tâche courante dès sa première instruction
     // Rust (`tache::courante`), et le reste pour toujours : la référence
     // est gardée telle quelle (comme celle de l'inactive du premier,
@@ -477,13 +484,19 @@ extern "C" fn depart_secondaire(numero: u32) -> ! {
             _ => cpu::arreter(),
         }
     }
-    // En service. La boucle d'inactivité d'un secondaire (voir l'en-tête) :
-    // dormir jusqu'à la prochaine interruption, qui ne peut être qu'une IPI
-    // (ou un NMI), dont le gestionnaire a fait le travail ; rien à
-    // regarder entre deux (la file des prêtes par processeur viendra ici).
-    loop {
-        cpu::attendre_interruption();
-    }
+    // En service : son tic, puis la boucle d'inactivité de l'ordonnanceur
+    // (voir l'en-tête), qui prend le processeur quand sa file est vide.
+    horloge::demarrer_tic_secondaire();
+    crate::ordonnanceur::boucle_inactive()
+}
+
+/// Demande au processeur `numero` de regarder si sa tâche courante doit
+/// céder (l'IPI de reprogrammation : son gestionnaire ne fait rien, la
+/// sortie de l'interruption regarde `besoin_de_ceder` ; et s'il dort dans
+/// `hlt`, il en sort). Le `smp_send_reschedule` de Linux (ordonnanceur.rs,
+/// et le `kick_process` d'un signal, tache.rs).
+pub fn reprogrammer(numero: usize) {
+    apic::ipi(processeur::zone(numero).apic.load(Ordering::Relaxed), apic::VECTEUR_REPROGRAMMATION);
 }
 
 /// Exécute `fonction(argument)` sur chacun des processeurs en service de

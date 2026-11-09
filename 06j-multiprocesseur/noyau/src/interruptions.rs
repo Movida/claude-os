@@ -514,7 +514,12 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
             dans_une_interruption.fetch_add(1, Ordering::Relaxed);
             irq::gerer(vecteur as u8, |source| match source {
                 irq::Source::TimerApic | irq::Source::Isa(horloge::IRQ) => {
-                    horloge::tic();
+                    // Le temps n'est compté que par le processeur 0 (le
+                    // `tick_do_timer_cpu` de Linux) ; chaque processeur
+                    // fait tourner sa file des prêtes (tache::tic).
+                    if crate::processeur::courant().numero == 0 {
+                        horloge::tic();
+                    }
                     tache::tic(depuis_programme);
                 }
                 irq::Source::Isa(clavier::IRQ) => clavier::interruption(),

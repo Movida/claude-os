@@ -4,18 +4,23 @@
  * et le droit de le restreindre (sched_setaffinity), avec les refus de
  * Linux ; où il tourne (getcpu, sched_getcpu).
  *
- * Chez nous, à ce commit, sched_setaffinity est gardé mais pas encore
- * honoré : un fil peut encore tourner sur un processeur qu'il a exclu
- * (le placement des tâches vient avec la file des prêtes par processeur).
- * Sur l'hôte, il l'est : sched_getcpu dit le processeur demandé. Compilé
- * avec gcc -static ; sur l'hôte aussi (make tests-hote).
+ * Et des fils épinglés chacun sur un processeur (quatre au plus), qui
+ * calculent en vérifiant sans cesse par getcpu qu'ils y sont : l'affinité
+ * est honorée par le placement des tâches (la file des prêtes par
+ * processeur). Puis un fil déplacé par sched_setaffinity vers un
+ * processeur où un autre calcule : il doit s'y exécuter en moins de 100 ms,
+ * que ce soit lui qui change son masque pendant qu'il s'exécute (son
+ * processeur le pousse dès qu'il l'a quitté) ou un autre fil qui change le
+ * sien pendant qu'il est prêt ou en cours (la relecture de 6j l'a vu
+ * attendre que la destination n'ait plus rien à faire : 300 ms ici).
+ * Compilé avec gcc -static ; sur l'hôte aussi (make tests-hote), adapté au
+ * nombre de processeurs de la machine.
  *
  * Avec l'argument « boucle » (make tests-qemu, le scénario du NMI) : deux
- * fils qui bouclent sur getpid pour toujours (l'anneau 3, l'entrée et la
- * sortie de syscall : là où un NMI trouve la base de GS du programme active
- * dans le noyau), épinglés sur les processeurs 1 et 2 (honoré quand la file
- * des prêtes sera par processeur) ; le programme dit quand ils tournent,
- * puis attend. */
+ * fils épinglés sur les processeurs 1 et 2 qui bouclent sur getpid pour
+ * toujours (l'anneau 3, l'entrée et la sortie de syscall : là où un NMI
+ * trouve la base de GS du programme active dans le noyau), les autres
+ * processeurs inactifs ; le programme dit quand ils tournent, puis attend. */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <pthread.h>
@@ -25,10 +30,38 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/sysinfo.h>
+#include <time.h>
 #include <unistd.h>
 
 static int echecs;
 static int chez_nous;
+
+/* Un fil épinglé sur le processeur de son argument : 100 ms de calcul, et
+ * à chaque tour (un sched_yield), là où il tourne doit être ce processeur.
+ * Rend le nombre de tours où ce n'était pas le cas. */
+static void *epingle(void *arg)
+{
+    int cpu = (int)(long)arg;
+    cpu_set_t c;
+    CPU_ZERO(&c);
+    CPU_SET(cpu, &c);
+    if (pthread_setaffinity_np(pthread_self(), sizeof c, &c) != 0)
+        return (void *)-1L;
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    long fin = t.tv_sec * 1000 + t.tv_nsec / 1000000 + 100, ailleurs = 0;
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &t);
+        if (t.tv_sec * 1000 + t.tv_nsec / 1000000 >= fin)
+            break;
+        for (volatile int i = 0; i < 1000; i++)
+            ;
+        if (sched_getcpu() != cpu)
+            ailleurs++;
+        sched_yield();
+    }
+    return (void *)ailleurs;
+}
 
 static void *boucleur(void *arg)
 {
@@ -50,6 +83,84 @@ static int boucler(void)
     fflush(stdout);
     pause();
     return 0;
+}
+
+static long ms_monotone(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+static void epingler_sur(int cpu)
+{
+    cpu_set_t c;
+    CPU_ZERO(&c);
+    CPU_SET(cpu, &c);
+    pthread_setaffinity_np(pthread_self(), sizeof c, &c);
+}
+
+/* Le test du déplacement : d'où part le fil, où il doit arriver, et le
+ * temps qu'il a mis à s'y voir (-1 : jamais). */
+struct deplacement {
+    int depart, arrivee;
+    volatile long delai_ms;
+};
+
+/* Un fil qui calcule 300 ms sur le processeur de son argument : il occupe
+ * l'arrivée, ou dispute le départ. */
+static void *calculeur(void *arg)
+{
+    epingler_sur((int)(long)arg);
+    long fin = ms_monotone() + 300;
+    while (ms_monotone() < fin)
+        for (volatile int i = 0; i < 1000; i++)
+            ;
+    return NULL;
+}
+
+/* Le migrant : sur son départ, il change lui-même son masque vers
+ * l'arrivée, et mesure le temps jusqu'à s'y voir. */
+static void *migrant(void *arg)
+{
+    struct deplacement *d = arg;
+    epingler_sur(d->depart);
+    sched_yield();
+    long debut = ms_monotone();
+    epingler_sur(d->arrivee);
+    d->delai_ms = -1;
+    while (ms_monotone() - debut < 1000) {
+        for (volatile int i = 0; i < 1000; i++)
+            ;
+        if (sched_getcpu() == d->arrivee) {
+            d->delai_ms = ms_monotone() - debut;
+            break;
+        }
+    }
+    return NULL;
+}
+
+/* Le déplacé : il calcule sur son départ (qu'un rival lui dispute : il y
+ * est tantôt en cours, tantôt prêt) ; c'est le fil principal qui change
+ * son masque, et note l'instant (top_deplacement). */
+static volatile long top_deplacement;
+
+static void *deplace(void *arg)
+{
+    struct deplacement *d = arg;
+    epingler_sur(d->depart);
+    long fin = ms_monotone() + 600;
+    d->delai_ms = -1;
+    while (ms_monotone() < fin) {
+        for (volatile int i = 0; i < 1000; i++)
+            ;
+        long top = __atomic_load_n(&top_deplacement, __ATOMIC_ACQUIRE);
+        if (top && sched_getcpu() == d->arrivee) {
+            d->delai_ms = ms_monotone() - top;
+            break;
+        }
+    }
+    return NULL;
 }
 
 static void verifier(int ok, const char *quoi)
@@ -122,8 +233,10 @@ int main(int argc, char **argv)
     unsigned c = 99, noeud = 99;
     verifier(syscall(SYS_getcpu, &c, &noeud, NULL) == 0 && (int)c < n, "getcpu : un processeur de la machine");
     verifier(sched_getcpu() >= 0 && sched_getcpu() < n, "sched_getcpu : un processeur de la machine");
-    if (!chez_nous)
-        verifier(sched_yield() == 0 && sched_getcpu() == premier, "sur l'hote : sched_getcpu dit le processeur demande");
+    /* Le fil tourne là où on l'a épinglé : au plus tard après avoir cédé
+       le processeur (chez nous, le processeur permis le tire ; sur l'hôte,
+       sched_setaffinity l'y déplace lui-même). */
+    verifier(sched_yield() == 0 && sched_getcpu() == premier, "sched_getcpu dit le processeur demande");
 
     /* Les bits des processeurs absents sont gardés tels quels, et
        sched_getaffinity ne rend que ceux de la machine (Linux : cpus_mask
@@ -157,6 +270,56 @@ int main(int argc, char **argv)
     verifier(syscall(SYS_sched_setaffinity, 0, sizeof initial, &initial) == 0
                  && syscall(SYS_sched_getaffinity, 0, sizeof relu, &relu) == 8 && relu == initial,
              "le masque initial rendu");
+
+    /* Des fils épinglés, un par processeur permis (quatre au plus), qui
+       calculent 100 ms chacun : aucun ne doit se voir ailleurs. */
+    pthread_t fils[4];
+    int cpus[4], nf = 0;
+    for (int i = 0; i < 64 && nf < 4; i++)
+        if (initial >> i & 1)
+            cpus[nf++] = i;
+    for (int i = 0; i < nf; i++)
+        pthread_create(&fils[i], NULL, epingle, (void *)(long)cpus[i]);
+    long ailleurs = 0;
+    for (int i = 0; i < nf; i++) {
+        void *r;
+        pthread_join(fils[i], &r);
+        ailleurs += (long)r < 0 ? 1000000 : (long)r;
+    }
+    char quoi[96];
+    snprintf(quoi, sizeof quoi, "%d fils epingles chacun sur son processeur, 100 ms : jamais vus ailleurs", nf);
+    verifier(ailleurs == 0, quoi);
+    if (chez_nous)
+        verifier(nf == 4, "chez nous : quatre fils, un par processeur");
+
+    /* Le déplacement (voir l'en-tête) : quatre processeurs permis au moins ;
+       le calculeur occupe le troisième, le migrant part du deuxième, le
+       déplacé et son rival se disputent le quatrième. */
+    if (nf < 4) {
+        printf("[linux] processeurs : deplacement par sched_setaffinity : moins de quatre processeurs permis, rien a mesurer\n");
+    } else {
+        pthread_t calc, mig, dep, rival;
+        struct deplacement m = { cpus[1], cpus[2], 0 }, d = { cpus[3], cpus[2], 0 };
+        pthread_create(&calc, NULL, calculeur, (void *)(long)cpus[2]);
+        pthread_create(&mig, NULL, migrant, &m);
+        pthread_join(mig, NULL);
+        pthread_join(calc, NULL);
+        verifier(m.delai_ms >= 0 && m.delai_ms < 100, "un fil qui change son masque vers un processeur occupe s'y execute en moins de 100 ms");
+        pthread_create(&calc, NULL, calculeur, (void *)(long)cpus[2]);
+        pthread_create(&rival, NULL, calculeur, (void *)(long)cpus[3]);
+        pthread_create(&dep, NULL, deplace, &d);
+        struct timespec attente = { 0, 50 * 1000000 };
+        nanosleep(&attente, NULL);
+        cpu_set_t vers;
+        CPU_ZERO(&vers);
+        CPU_SET(cpus[2], &vers);
+        __atomic_store_n(&top_deplacement, ms_monotone(), __ATOMIC_RELEASE);
+        pthread_setaffinity_np(dep, sizeof vers, &vers);
+        pthread_join(dep, NULL);
+        pthread_join(rival, NULL);
+        pthread_join(calc, NULL);
+        verifier(d.delai_ms >= 0 && d.delai_ms < 100, "un fil dont un autre change le masque vers un processeur occupe s'y execute en moins de 100 ms");
+    }
 
     printf("[linux] processeurs : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
