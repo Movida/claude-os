@@ -491,6 +491,16 @@ pub fn dans_une_interruption() -> bool {
 extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     let vecteur = cadre.vecteur as usize;
     let depuis_programme = cadre.cs & 3 == 3;
+    // Pour #DB, DR6 dit pourquoi : lu et remis à son état de repos EN
+    // PREMIER, avant tout ce qui peut céder le processeur (Linux le lit en
+    // entrant dans `exc_debug`, `debug_read_clear_dr6`). Jusqu'en 6j, il
+    // était lu plus bas, après le retour des interruptions et la lecture de
+    // la mémoire du processus, un verrou qui dort : la tâche pouvait avoir
+    // été déplacée entre-temps, et lire le DR6 d'un AUTRE processeur (ou
+    // celui d'une autre tâche, dont le #DB serait passé là entre-temps : le
+    // si_code du SIGTRAP était faux). Un reste de 6f, que le
+    // multiprocesseur rend probable.
+    let dr6 = if vecteur == 1 { lire_et_effacer_dr6() } else { 0 };
     match vecteur {
         32.. => {
             // Interruptions coupées (la porte d'interruption) : la zone est
@@ -528,10 +538,6 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
             // vient du programme, rien n'est tenu.
             crate::cpu::activer_interruptions();
             let zone = processus::memoire_lue(|m| m.zone_du_code(cadre.rip));
-            // Pour #DB, DR6 dit pourquoi ; il est remis à son état de repos
-            // (Linux le lit en entrant, puis l'efface : sinon ses bits
-            // resteraient pour le #DB suivant).
-            let dr6 = if vecteur == 1 { lire_et_effacer_dr6() } else { 0 };
             let (signal, raison) = linux::signal_de_l_exception(vecteur, cadre, 0, None, zone, dr6);
             tache::forcer_par_faute(signal, raison);
         }
@@ -566,7 +572,8 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
 }
 
 /// DR6, le registre qui dit d'où vient un #DB, puis remis à sa valeur de
-/// repos (DR6_RESERVED : les bits réservés à 1, les autres à 0).
+/// repos (DR6_RESERVED : les bits réservés à 1, les autres à 0) : sinon ses
+/// bits resteraient pour le #DB suivant.
 fn lire_et_effacer_dr6() -> u64 {
     let dr6: u64;
     // SAFETY: lire et écrire DR6 en anneau 0 ne touche que ce registre.
