@@ -545,14 +545,19 @@ impl EspaceUtilisateur {
         }
         let ancien = *entree & ADRESSE;
         let c = neuve.take().expect("remplacement sans page neuve");
-        self.compter_cadre();
         pagination::poser(entree, entree_finale(c, droits));
+        // L'ancienne décomptée AVANT de compter la neuve : sinon le pic
+        // (`suivre_pic`) voyait une page de trop le temps de l'échange (un
+        // reste de 6i, où la copie faisait de même).
         if ancien != page_de_zeros() {
             if pages::drapeaux(ancien) & pages::FICHIER != 0 {
                 self.pages_fichier -= 1;
             } else {
                 self.pages -= 1;
             }
+        }
+        self.compter_cadre();
+        if ancien != page_de_zeros() {
             pages::lacher(ancien);
         }
         Ok(Servi::Fait)
