@@ -1,7 +1,8 @@
 # Sous-étape 6k : le terminal (à venir). D'abord, les soldes des étapes
 # passées, chacun dans un commit « Reste de » : les tests sur l'hôte, stricts
 # sous le Linux de référence (linux/tcp.c, unix.c, proprietaire.c,
-# copies.c, fichiers.c ; .devcontainer/linux-de-reference.sh).
+# copies.c, fichiers.c ; .devcontainer/linux-de-reference.sh) ; la glibc
+# de l'image figée (GLIBC_VERSION, $(GLIBC_PAQUETS)/.extraits).
 # De 6j : le multiprocesseur. Une zone par processeur trouvée par
 # le segment GS (noyau/src/processeur.rs), `swapgs` à chaque entrée dans le
 # noyau et à chaque sortie (appel_systeme.rs, interruptions.rs : les trois
@@ -352,8 +353,15 @@ boot.bin: programmes.cpio FORCE
 # doit lire le PT_GNU_STACK. Les tests lisent aussi ld-linux et la glibc
 # partagée de la machine, là où Ubuntu les installe.
 LINUX = linux/construits
-# La glibc partagée de la machine, copiée dans glibc/ (voir $(GLIBC)/.copiee).
-GLIBC_HOTE = /usr/lib/x86_64-linux-gnu
+# La glibc partagée de l'image, copiée dans glibc/ (voir $(GLIBC)/.copiee) :
+# celle d'Ubuntu 24.04, à une révision figée, téléchargée et vérifiée (voir
+# $(GLIBC_PAQUETS)/.extraits).
+GLIBC_VERSION = 2.39-0ubuntu8.9
+GLIBC_ADRESSE = https://launchpad.net/ubuntu/+archive/primary/+files
+GLIBC_SHA256_LIBC6 = ff5557d99b51f761c4b7c92368b9cc45565eda17df9bf9eb4b134d09825008be
+GLIBC_SHA256_LIBC_BIN = 066398a06ef1a218d4109461d4c636eafe83322ad19b179de9ef7af42b3fec58
+GLIBC_PAQUETS = $(HOME)/.cache/claude-os/glibc-$(GLIBC_VERSION)
+GLIBC_SOURCE = $(GLIBC_PAQUETS)/racine/usr/lib/x86_64-linux-gnu
 # ld-linux, la glibc, et les quatre autres bibliothèques de `claude`
 # (depuis la glibc 2.34, libpthread, libdl et librt sont des coquilles
 # presque vides : tout est dans libc.so.6, mais claude les demande).
@@ -758,45 +766,69 @@ $(LINUX)/tests/interpreteurs/gros: linux/tests/interpreteur-gros.asm
 	mkdir -p $(@D)
 	nasm -f bin $< -o $@
 
-# La glibc partagée de la machine (6c) : ld-linux, et les bibliothèques
-# que demandent nos programmes dynamiques, copiées dans glibc/racine aux
-# chemins d'Ubuntu (/usr fusionné), avec un /etc/ld.so.cache fabriqué
-# par ldconfig sur cette racine de préparation (-r : sans root ; -X : sans
-# toucher aux liens des bibliothèques), et notre libessai.so dans
-# /usr/local/lib, que le cache doit connaître aussi. Jamais commitées
-# (.gitignore) : ce sont les fichiers de la machine qui construit, copiés
-# de nouveau chaque fois que leur CONTENU change. Pas leur date : dpkg
-# garde celle de la construction du paquet, et une glibc installée par apt
-# après notre copie peut avoir une date plus ancienne qu'elle. D'où une
-# empreinte (sha256) de tout ce qui entre dans la copie, recalculée à
-# chaque construction (FORCE) et gardée dans .copiee : la copie n'est
-# refaite, et .copiee touché, que si elle a changé. Deux vérifications
-# avant de copier :
-#   - le PT_INTERP de nos programmes (/lib64/ld-linux-x86-64.so.2) mène
-#     bien, sur cette machine, au ld-linux qu'on copie ;
-#   - ldconfig est de la même version de la glibc que lui (2.39) : le
-#     format du cache en dépend. La version amont seulement, pas la
-#     révision d'Ubuntu (2.39-0ubuntu8.9) : ldconfig est dans un autre
-#     paquet (libc-bin), qu'une mise à jour de libc6 seule laisse à sa
-#     révision, sans rien changer au format.
-# (GLIBC, GLIBC_HOTE et GLIBC_FICHIERS sont définis plus haut, avec LINUX :
+# La glibc partagée de l'image (6c) : ld-linux, et les bibliothèques que
+# demandent nos programmes dynamiques, copiées dans glibc/racine aux chemins
+# d'Ubuntu (/usr fusionné), avec un /etc/ld.so.cache fabriqué par ldconfig
+# sur cette racine de préparation (-r : sans root ; -X : sans toucher aux
+# liens des bibliothèques), et notre libessai.so dans /usr/local/lib, que le
+# cache doit connaître aussi. Jamais commitées (.gitignore) : des binaires
+# que nous n'avons pas écrits.
+#
+# D'où elles viennent (choix de conception, les soldes d'avant 6k) : des
+# paquets d'Ubuntu 24.04 à une révision figée (libc6 et libc-bin,
+# GLIBC_VERSION), téléchargés depuis Launchpad, qui garde chaque version
+# publiée, et vérifiés par leur SHA-256, comme claude, wabt et QEMU. Jusqu'à
+# 6j, c'était la glibc de la machine qui construit : l'image dépendait de
+# l'Ubuntu de l'hôte, et WSL et la CI n'avaient la même que tant qu'apt les
+# mettait à jour ensemble. Écarté : une empreinte attendue de la glibc de la
+# machine (elle arrêterait la construction à chaque mise à jour de sécurité
+# d'Ubuntu, sans dire laquelle prendre). La révision figée est celle de WSL
+# et de la CI en novembre 2026 : la même libc.so.6, octet pour octet.
+# ldconfig vient de la même version de la glibc que ld-linux (libc-bin, à
+# côté de libc6 : le même paquet source), le format du cache en dépend
+# (ldconfig.real : ldconfig n'est chez Ubuntu qu'un script autour de lui).
+# Les paquets sont extraits dans un dossier à part, mis en place d'un coup
+# (deux constructions à la fois, le dossier de travail et un worktree, ne
+# voient jamais une glibc à moitié écrite), et les fichiers copiés sont
+# revérifiés à chaque construction par leurs empreintes, comme claude.
+# Ce qui reste de la machine : nos programmes de test dynamiques
+# (bonjour-c-dynamique, dynamique, libessai.so) sont compilés par son gcc
+# contre son libc6-dev ; une machine à glibc plus récente pourrait leur faire
+# demander des symboles que la 2.39 n'a pas (ld-linux le dirait au
+# lancement).
+#
+# La copie est refaite chaque fois que le CONTENU de ce qui y entre change
+# (libessai.so, ld.so.conf, ou une autre révision), pas sa date : une
+# empreinte (sha256), recalculée à chaque construction (FORCE) et gardée
+# dans .copiee.
+# (GLIBC, GLIBC_SOURCE et GLIBC_FICHIERS sont définis plus haut, avec LINUX :
 # make lit les prérequis d'une règle dès qu'il la rencontre.)
-COPIE_GLIBC = $(addprefix $(GLIBC_HOTE)/,$(GLIBC_FICHIERS)) racine/etc/ld.so.conf $(LINUX)/libessai.so
-$(GLIBC)/.copiee: $(LINUX)/libessai.so FORCE
+$(GLIBC_PAQUETS)/.extraits:
+	mkdir -p $(dir $(GLIBC_PAQUETS))
+	neuf=$$(mktemp -d $(GLIBC_PAQUETS).XXXXXX) && trap 'rm -rf "$$neuf"' EXIT && cd "$$neuf" && \
+	  curl -sSfL -o libc6.deb $(GLIBC_ADRESSE)/libc6_$(GLIBC_VERSION)_amd64.deb && \
+	  curl -sSfL -o libc-bin.deb $(GLIBC_ADRESSE)/libc-bin_$(GLIBC_VERSION)_amd64.deb && \
+	  printf '%s  libc6.deb\n%s  libc-bin.deb\n' $(GLIBC_SHA256_LIBC6) $(GLIBC_SHA256_LIBC_BIN) | sha256sum -c --quiet && \
+	  dpkg-deb -x libc6.deb racine && dpkg-deb -x libc-bin.deb racine && rm -f libc6.deb libc-bin.deb && \
+	  sha256sum $(addprefix racine/usr/lib/x86_64-linux-gnu/,$(GLIBC_FICHIERS)) racine/usr/sbin/ldconfig.real > empreintes && \
+	  touch .extraits && \
+	  { mv -T "$$neuf" $(GLIBC_PAQUETS) 2>/dev/null || true; }
+	test -f $@
+
+COPIE_GLIBC = $(addprefix $(GLIBC_SOURCE)/,$(GLIBC_FICHIERS)) racine/etc/ld.so.conf $(LINUX)/libessai.so
+$(GLIBC)/.copiee: $(GLIBC_PAQUETS)/.extraits $(LINUX)/libessai.so FORCE
+	@(cd $(GLIBC_PAQUETS) && sha256sum -c --quiet empreintes) || \
+	  { echo "$(GLIBC_PAQUETS) ne correspond plus a ses empreintes : l'effacer"; exit 1; }
 	@empreinte=$$(sha256sum $(COPIE_GLIBC) | sha256sum | cut -d ' ' -f 1); \
 	test "$$(cat $@ 2>/dev/null)" != "$$empreinte" || exit 0; \
 	set -ex; \
-	test "$$(readlink -f /lib64/ld-linux-x86-64.so.2)" = $(GLIBC_HOTE)/ld-linux-x86-64.so.2; \
-	v1=$$(/sbin/ldconfig --version | sed -n '1s/.* \([0-9][0-9.]*[0-9]\)\.\{0,1\}$$/\1/p'); \
-	v2=$$($(GLIBC_HOTE)/ld-linux-x86-64.so.2 --version | sed -n '1s/.* \([0-9][0-9.]*[0-9]\)\.\{0,1\}$$/\1/p'); \
-	test -n "$$v1" && test "$$v1" = "$$v2" || { echo "ldconfig ($$v1) et ld-linux ($$v2) : deux glibc differentes"; exit 1; }; \
 	rm -rf $(GLIBC); \
 	mkdir -p $(GLIBC)/racine/usr/lib/x86_64-linux-gnu $(GLIBC)/racine/usr/local/lib $(GLIBC)/racine/etc; \
-	cp $(addprefix $(GLIBC_HOTE)/,$(GLIBC_FICHIERS)) $(GLIBC)/racine/usr/lib/x86_64-linux-gnu/; \
+	cp $(addprefix $(GLIBC_SOURCE)/,$(GLIBC_FICHIERS)) $(GLIBC)/racine/usr/lib/x86_64-linux-gnu/; \
 	cp $(LINUX)/libessai.so $(GLIBC)/racine/usr/local/lib/; \
 	ln -s usr/lib $(GLIBC)/racine/lib; \
 	cp racine/etc/ld.so.conf $(GLIBC)/racine/etc/; \
-	/sbin/ldconfig -X -r $(GLIBC)/racine -C /etc/ld.so.cache -f /etc/ld.so.conf; \
+	$(GLIBC_PAQUETS)/racine/usr/sbin/ldconfig.real -X -r $(GLIBC)/racine -C /etc/ld.so.cache -f /etc/ld.so.conf; \
 	echo "$$empreinte" > $@
 
 # L'archive des programmes de test : sa description est fabriquée ici, une
