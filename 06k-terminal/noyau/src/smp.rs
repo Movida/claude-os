@@ -1,0 +1,736 @@
+//! Les processeurs secondaires : leur réveil par le premier (INIT, puis
+//! deux SIPI), leur première fonction Rust (`depart_secondaire`), et la
+//! poignée de main entre les deux.
+//!
+//! Au démarrage de la machine, un seul processeur exécute le micrologiciel
+//! puis notre chargeur : le « processeur de démarrage » (le BSP d'Intel).
+//! Les autres (les AP) attendent, arrêtés, qu'on leur envoie par l'APIC la
+//! séquence définie par la « MultiProcessor Specification » (1997) et
+//! toujours en vigueur : une interruption INIT (le processeur revient à son
+//! état de mise sous tension), 10 ms, puis deux SIPI (Startup IPI : « va
+//! exécuter la page N de la mémoire basse »), à 200 µs d'intervalle ; le
+//! second SIPI est pour les anciens processeurs qui rataient le premier,
+//! et un processeur déjà parti l'ignore. C'est `wakeup_secondary_cpu_via_init`
+//! de Linux (smpboot.c), un processeur à la fois, dans l'ordre de la MADT
+//! (acpi.rs), sauf le nôtre (un INIT à soi-même redémarrerait la machine).
+//! Options écartées : réveiller les processeurs en parallèle
+//! (STARTUP_PARALLEL, Linux 6.5 et plus, pour des machines à centaines de
+//! cœurs) ; sauter les 10 ms de l'INIT, comme Linux sur les Intel de
+//! famille 6 (notre Nehalem en est) : 30 ms au démarrage pour trois
+//! processeurs ne valent pas un chemin qui dépend du fabricant.
+//!
+//! Ce que le premier processeur PRÉPARE pour chacun avant son SIPI : sa
+//! zone (processeur.rs), sa tâche inactive (une `Tache` « inactive-N », sa
+//! pile de vmalloc sous sa page de garde ; elle n'entre ni dans la table des
+//! tâches ni dans une file), ses quatre piles de l'IST (gdt.rs : celles du
+//! premier sont dans la .bss, celles des secondaires viennent de vmalloc),
+//! et l'en-tête du trampoline (trampoline.rs : sa pile, sa zone, son
+//! numéro, le numéro d'APIC attendu).
+//!
+//! Ce que le secondaire fait ensuite lui-même, dans `depart_secondaire`,
+//! c'est ce que `noyau_main` fait pour le processeur et rien de ce qu'il
+//! fait pour la machine (le `cpu_init` de Linux) : sa GDT et sa TSS, l'IDT
+//! commune, les MSR de `syscall`, XCR0 ; puis il COMPARE ses CR0, CR4, EFER
+//! et XCR0 à ceux du premier, et dit ECHEC s'ils diffèrent (sans CR0.WP, par
+//! exemple, une copie du noyau vers une page en lecture seule d'un programme
+//! écrirait à travers, et la page de zéros, partagée par tous les
+//! programmes, cesserait d'être nulle sans un mot) ; son APIC local
+//! (apic.rs, `initialiser_processeur` : SVR, LVT, TPR, ESR ; la projection
+//! de la page et la lecture de la MADT restent au premier) ; puis la
+//! vérification de son TSC (tsc.rs), et sa boucle d'inactivité.
+//!
+//! LA POIGNÉE DE MAIN, dans les deux sens, par un mot de sa zone
+//! (`demarrage`, les valeurs du module `etape`) : le secondaire dit
+//! « arrivé » ; le premier attend ce mot jusqu'à 5 s (sinon il le dit,
+//! « ne repond pas », et continue avec un processeur de moins), puis mène
+//! la vérification du TSC, puis dit « en service » ; le secondaire attend
+//! ce dernier mot avant de continuer (le `cpuhp_ap_sync_alive` de Linux :
+//! un secondaire ne fait rien que le premier n'ait vu). Un secondaire en
+//! retard, que le premier a abandonné, trouve « abandonné » et s'arrête
+//! (`cli ; hlt`) ; s'il arrive après que l'en-tête du trampoline a été
+//! réécrit pour le suivant, le trampoline lui-même l'arrête, avant qu'il
+//! ne touche à une pile qui n'est plus la sienne (trampoline.rs).
+//!
+//! Un secondaire en service démarre le timer de son APIC (le même décompte
+//! que le premier : les APIC partagent le bus, horloge.rs) et entre dans
+//! la boucle d'inactivité de l'ordonnanceur (ordonnanceur.rs : sa file des
+//! prêtes, celles des autres à tirer, `hlt` sinon) : il prend des tâches
+//! comme le premier. Il reçoit ses tics et les INTERRUPTIONS ENTRE
+//! PROCESSEURS (apic.rs : les trois vecteurs) ; les périphériques, eux, ne
+//! parlent qu'au premier.
+//!
+//! APPELER UNE FONCTION AILLEURS (`appeler`, le `smp_call_function_many`
+//! de Linux, avec attente) : une demande par processeur APPELANT, dans sa
+//! zone (`Processeur::appel` : la fonction, l'argument, le masque des
+//! processeurs qui doivent répondre), l'IPI FONCTION à chacun d'eux, et
+//! l'appelant attend, en tournant, que le masque soit vide. Un receveur
+//! (`recevoir_appel`, interruptions coupées) parcourt les demandes de TOUS
+//! les processeurs en service et exécute celles qui l'attendent, puis
+//! efface son bit (Release : ce que la fonction a fait est fini pour
+//! l'appelant, qui lit en Acquire). Option écartée : la file par
+//! DESTINATAIRE de Linux (`call_single_queue`, une liste sans verrou où
+//! chaque appelant dépose son `csd`) : elle évite le parcours des zones,
+//! mais demande une liste intrusive sans verrou ; soixante-quatre lectures
+//! atomiques par IPI reçue ne coûtent rien. Trois règles, vérifiées par des
+//! `assert!` : la préemption coupée (la demande est celle de CE processeur,
+//! et « les autres que moi » ne doit pas changer de sens au milieu : le
+//! `preempt_disable` que Linux exige ; `appeler` la coupe lui-même), les
+//! interruptions ACTIVES (deux processeurs qui s'appelleraient l'un
+//! l'autre interruptions coupées s'attendraient pour toujours, aucun ne
+//! pouvant répondre : le `WARN_ON(irqs_disabled())` de Linux, chez nous
+//! une panique), aucun `Verrou` tenu (un `Verrou` coupe les
+//! interruptions ; et la règle des attentes de verrou.rs : on n'attend
+//! jamais, un verrou tenu, une chose dont la fin attend une IPI). Une
+//! attente qui dépasse une seconde est dite, avec l'endroit (le
+//! `csd_lock_wait` de débogage de Linux).
+//!
+//! LE VIDAGE DES TLB (`vider_tlb`, le `flush_tlb_mm_range` et le
+//! `flush_tlb_kernel_range` de Linux ; le pourquoi : espace_utilisateur.rs) :
+//! préemption coupée (le `get_cpu()` de Linux : « les autres que moi » ne
+//! doit pas changer de sens), une barrière complète, le masque de l'espace
+//! lu, le vidage local si ce processeur l'a, puis `appeler` sur les autres
+//! processeurs du masque ; le receveur ne vide que s'il a bien cette PML4
+//! chargée (le `f->mm != loaded_mm` de `flush_tlb_func` : il a pu la
+//! quitter depuis la lecture du masque). Une adresse du noyau (pas de PML4)
+//! se vide chez tous.
+//!
+//! LA PANIQUE (`arreter_les_autres`, le `native_stop_other_cpus` de
+//! Linux) : le processeur qui panique envoie l'IPI ARRET à tous les autres
+//! en service, attend une seconde qu'ils se disent arrêtés (`arrete`), puis
+//! envoie un NMI à ceux qui ne le sont pas (ils tournaient interruptions
+//! coupées : le gestionnaire du NMI lit « arrêt demandé » en premier,
+//! interruptions.rs, et s'arrête sans un mot), et attend encore 10 ms.
+//! Seulement alors il écrit son message : plus personne n'écrit avec lui,
+//! et personne ne tient plus le verrou de la console qu'il va forcer.
+
+use crate::gdt::PilesIst;
+use crate::verrou::Verrou;
+use crate::vmalloc::Pile;
+use crate::{acpi, apic, appel_systeme, cpu, gdt, horloge, interruptions, pagination, processeur, sse, tache, trampoline, tsc, verrou};
+use core::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+
+/// Les mots de la poignée de main (`Processeur::demarrage`).
+pub mod etape {
+    /// Le premier a envoyé le SIPI, le secondaire n'a encore rien dit.
+    pub const ATTENDU: u8 = 0;
+    /// Le secondaire est arrivé dans `depart_secondaire`, prêt pour la
+    /// vérification du TSC (écrit par lui, sur ATTENDU ou sur REESSAI, par
+    /// un compare_exchange : tout autre mot l'arrête).
+    pub const ARRIVE: u8 = 1;
+    /// Le premier mène la mesure du TSC : le secondaire y participe
+    /// (écrit par le premier).
+    pub const MESURE: u8 = 2;
+    /// La mesure du secondaire est faite, son résultat dans RECUL_CIBLE
+    /// (écrit par lui, sur MESURE).
+    pub const FINI: u8 = 3;
+    /// Le premier demande une correction de TSC_ADJUST (CORRECTION), puis
+    /// une nouvelle mesure (écrit par le premier).
+    pub const REESSAI: u8 = 4;
+    /// En service : le secondaire peut continuer (écrit par le premier).
+    pub const EN_SERVICE: u8 = 5;
+    /// Le premier a renoncé (pas venu en cinq secondes : écrit sur ATTENDU
+    /// par un compare_exchange, et un INIT le suit ; ou sa mesure du TSC
+    /// n'a pas abouti) : le secondaire s'arrête dès qu'il le lit.
+    pub const ABANDONNE: u8 = 6;
+}
+
+/// Ce que le premier processeur prépare pour un secondaire, et que celui-ci
+/// vient prendre à son départ : ses piles de l'IST (ses sommets).
+static PREPARATIONS: Verrou<[Option<PilesIst>; processeur::MAX]> = Verrou::new([const { None }; processeur::MAX]);
+
+/// Les registres de contrôle du premier processeur (CR0, CR4, EFER, XCR0),
+/// que chaque secondaire compare aux siens. Une constante du démarrage,
+/// écrite avant le premier SIPI.
+static REFERENCE: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
+
+/// La vérification du TSC : le recul vu par le secondaire (tsc.rs), s'il
+/// a TSC_ADJUST, et la correction que lui demande le premier. Écrits d'un
+/// côté, lus de l'autre, après la poignée de main (Release/Acquire sur
+/// `demarrage`).
+static RECUL_CIBLE: AtomicU64 = AtomicU64::new(0);
+static CIBLE_A_TSC_ADJUST: AtomicBool = AtomicBool::new(false);
+static CORRECTION: AtomicI64 = AtomicI64::new(0);
+
+/// Combien de temps le premier attend un secondaire : 5 s, comme Linux
+/// (`do_boot_cpu` : « 5 seconds » pour `cpu_callin_mask`). Un processeur
+/// qui ne répond pas en 5 s ne répondra plus.
+const ATTENTE_SECONDAIRE_NS: u64 = 5_000_000_000;
+/// Et une étape de la vérification du TSC : 1 s (la mesure dure 2 ms).
+const ATTENTE_MESURE_NS: u64 = 1_000_000_000;
+
+/// Démarre les processeurs secondaires que liste la MADT, un à un. Sur le
+/// premier processeur, interruptions actives, l'APIC en service, les
+/// registres de contrôle à leur valeur finale, vmalloc et les tâches en
+/// place.
+pub fn demarrer_secondaires() {
+    if !crate::irq::apic() {
+        afficherln!("[noyau] 1 processeur en service : pas d'APIC local, pas de secondaire.");
+        return;
+    }
+    // Les numéros d'APIC des autres processeurs, copiés hors du verrou des
+    // tables ACPI (on ne démarre personne sous un verrou).
+    let moi = apic::id_du_premier();
+    let mut apics = [0u8; processeur::MAX];
+    let mut n = 0;
+    let mut listes = 0;
+    acpi::avec(|c| {
+        if let Some(m) = &c.madt {
+            for &(_, a) in &m.processeurs {
+                listes += 1;
+                if a != moi && n < processeur::MAX - 1 {
+                    apics[n] = a;
+                    n += 1;
+                }
+            }
+        }
+    });
+    for numero in 1..=n {
+        processeur::declarer_possible(numero);
+    }
+    if n == 0 {
+        afficherln!("[noyau] 1 processeur en service : la MADT n'en liste pas d'autre.");
+        return;
+    }
+    if listes > processeur::MAX {
+        afficherln!("[noyau] La MADT liste {} processeurs : seuls les {} premiers seront demarres.", listes, processeur::MAX);
+    }
+    trampoline::installer(depart_secondaire);
+    for (i, r) in trampoline::registres_de_reference().into_iter().enumerate() {
+        REFERENCE[i].store(r, Ordering::Relaxed);
+    }
+    for (i, &apic) in apics[..n].iter().enumerate() {
+        demarrer_un(i + 1, apic);
+    }
+    let en_service = processeur::nombre();
+    if en_service == 1 {
+        afficherln!("[noyau] 1 processeur en service : aucun secondaire n'a repondu.");
+    } else {
+        afficherln!("[noyau] {} processeurs en service.", en_service);
+    }
+}
+
+/// Prépare le processeur `numero` (son APIC : `apic`), le réveille, et
+/// attend qu'il soit en service.
+fn demarrer_un(numero: usize, apic: u8) {
+    let zone = processeur::zone(numero);
+    zone.apic.store(apic, Ordering::Relaxed);
+    let Some(inactive) = tache::inactive_secondaire(numero) else {
+        afficherln!("[noyau] Processeur {} (APIC {}) : pas de pile pour sa tache inactive : laisse de cote.", numero, apic);
+        return;
+    };
+    // Ses piles de l'IST, de vmalloc : quatre piles de tâche (16 Kio sous
+    // leur garde), gardées pour toujours comme celles du premier dans la
+    // .bss (jamais rendues : un processeur en service ne s'arrête pas),
+    // nommées (vmalloc.rs : un débordement dit laquelle) et retranchées du
+    // nombre de fils possibles (`vmalloc::max_threads`).
+    let mut sommets = [0u64; 4];
+    for (role, s) in sommets.iter_mut().enumerate() {
+        let Some(p) = Pile::allouer() else {
+            afficherln!("[noyau] Processeur {} (APIC {}) : pas de pile pour son IST : laisse de cote.", numero, apic);
+            return;
+        };
+        *s = crate::vmalloc::garder_pour_ist(p, numero, role);
+    }
+    PREPARATIONS.verrouiller()[numero] = Some(PilesIst(sommets));
+    // Sa file des prêtes (ordonnanceur.rs), réservée pour autant de tâches
+    // que de piles.
+    if !crate::ordonnanceur::initialiser_file(numero, crate::vmalloc::max_threads()) {
+        afficherln!("[noyau] Processeur {} (APIC {}) : pas de memoire pour sa file des pretes : laisse de cote.", numero, apic);
+        return;
+    }
+    // Sa tâche inactive est sa tâche courante dès sa première instruction
+    // Rust (`tache::courante`), et le reste pour toujours : la référence
+    // est gardée telle quelle (comme celle de l'inactive du premier,
+    // tache::initialiser).
+    let t = crate::partage::Arc::into_raw(inactive) as *mut tache::Tache;
+    zone.inactive.store(t, Ordering::Relaxed);
+    zone.courante.store(t, Ordering::Relaxed);
+    zone.demarrage.store(etape::ATTENDU, Ordering::Relaxed);
+    // SAFETY: `t` vient d'un Arc gardé pour toujours.
+    let pile = unsafe { (*t).sommet_de_pile() };
+    trampoline::preparer_processeur(numero as u32, apic, pile, zone as *const processeur::Processeur as u64);
+    // Tout ce qui précède doit être en mémoire avant le SIPI (le `mb()` de
+    // `do_boot_cpu`) : l'écriture dans l'ICR est une écriture de registre,
+    // que le processeur ordonne après les précédentes, mais la barrière le
+    // dit au compilateur aussi.
+    core::sync::atomic::fence(Ordering::SeqCst);
+
+    // INIT, en niveau : posé, 10 ms, levé.
+    apic::envoyer_init(apic);
+    if !apic::attendre_envoi() {
+        afficherln!("[noyau] Processeur {} (APIC {}) : l'APIC n'envoie pas l'INIT : abandonne.", numero, apic);
+        return;
+    }
+    horloge::attendre_ms(10);
+    apic::lever_init(apic);
+    let _ = apic::attendre_envoi();
+    let _ = apic::erreurs();
+    // Deux SIPI vers la page du trampoline, 300 µs puis 200 µs (les
+    // `udelay` de Linux), l'ESR regardé après chacun.
+    for _ in 0..2 {
+        apic::envoyer_demarrage(apic, (trampoline::CODE >> 12) as u8);
+        horloge::attendre_us(300);
+        let envoye = apic::attendre_envoi();
+        horloge::attendre_us(200);
+        let erreurs = apic::erreurs();
+        if !envoye || erreurs != 0 {
+            afficherln!("[noyau] Processeur {} (APIC {}) : SIPI {} (ESR {:#x}).", numero, apic,
+                        if envoye { "refuse" } else { "pas envoye" }, erreurs);
+            break;
+        }
+    }
+
+    // La poignée de main. Chaque mot y est posé par un compare_exchange,
+    // des deux côtés : celui qui écrit vérifie que l'autre en est bien là
+    // où il le croit. Pas venu en cinq secondes : ATTENDU devient
+    // ABANDONNE ; s'il arrive à cet instant même et gagne (ARRIVE), on
+    // continue avec lui ; sinon il trouvera ABANDONNE et s'arrêtera (un
+    // simple `store` écrasait ARRIVE, et le secondaire, lui, écrivait
+    // ARRIVE sur un ABANDONNE sans le voir : la relecture de 6j). Et un
+    // INIT, pour qu'il ne s'exécute plus du tout, où qu'il en soit (en
+    // route dans le trampoline, par exemple) : Linux, lui, le laisse tourner
+    // dans `start_secondary` sans jamais l'appeler.
+    if !attendre_etape(zone, etape::ARRIVE, ATTENTE_SECONDAIRE_NS)
+        && zone.demarrage.compare_exchange(etape::ATTENDU, etape::ABANDONNE, Ordering::AcqRel, Ordering::Acquire).is_ok()
+    {
+        afficherln!("[noyau] Processeur {} (APIC {}) ne repond pas : abandonne.", numero, apic);
+        // Le scénario test-retard (voir `depart_secondaire`) veut voir le
+        // retardataire trouver ABANDONNE : pas d'INIT.
+        #[cfg(not(feature = "test-retard"))]
+        {
+            apic::envoyer_init(apic);
+            let _ = apic::attendre_envoi();
+            horloge::attendre_ms(10);
+            apic::lever_init(apic);
+            let _ = apic::attendre_envoi();
+        }
+        return;
+    }
+    if !verifier_tsc(zone, numero) {
+        // Sa mesure n'a pas abouti : abandonné là où il en est (sa prochaine
+        // lecture du mot l'arrête), jamais déclaré en service.
+        zone.demarrage.store(etape::ABANDONNE, Ordering::Release);
+        afficherln!("[noyau] Processeur {} (APIC {}) : abandonne.", numero, apic);
+        return;
+    }
+    processeur::declarer_en_service(numero);
+    zone.demarrage.store(etape::EN_SERVICE, Ordering::Release);
+    afficherln!("[noyau] Processeur {} (APIC {}) en service.", numero, apic);
+}
+
+/// Attend que `zone.demarrage` vaille `attendue`, au plus `ns`
+/// nanosecondes (interruptions actives : le temps avance par le TSC ou par
+/// les tics). Acquire : ce que le secondaire a écrit avant est visible.
+fn attendre_etape(zone: &processeur::Processeur, attendue: u8, ns: u64) -> bool {
+    let debut = crate::temps::ns_monotone();
+    while zone.demarrage.load(Ordering::Acquire) != attendue {
+        if crate::temps::ns_monotone().wrapping_sub(debut) > ns {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    true
+}
+
+/// Mène, depuis le premier processeur, la vérification de l'accord du TSC
+/// du secondaire `numero` (voir tsc.rs : `verifier_accord`) : une mesure,
+/// et si les deux TSC ne sont pas accordés, une correction par TSC_ADJUST
+/// du secondaire et une nouvelle mesure (trois fois au plus, comme les
+/// `test_runs` de Linux) ; sinon, le TSC est déclassé et l'heure revient
+/// au tic (`tsc::declasser`). Sans TSC fiable, rien à vérifier. Faux si le
+/// secondaire n'a pas suivi le protocole (pas venu mesurer, pas fini, pas
+/// revenu) : il est abandonné (jusqu'à la relecture de 6j, il était
+/// déclaré en service quand même, avec un TSC jamais comparé).
+fn verifier_tsc(zone: &processeur::Processeur, numero: usize) -> bool {
+    if tsc::khz().is_none() {
+        return true;
+    }
+    let mut essais = 0;
+    loop {
+        zone.demarrage.store(etape::MESURE, Ordering::Release);
+        let Some(recul_source) = tsc::verifier_accord(tsc::Role::Source) else {
+            afficherln!("[noyau] Processeur {} : pas venu mesurer son TSC en une seconde.", numero);
+            tsc::fin_de_verification();
+            return false;
+        };
+        if !attendre_etape(zone, etape::FINI, ATTENTE_MESURE_NS) {
+            afficherln!("[noyau] Processeur {} : sa mesure du TSC n'a pas fini en une seconde.", numero);
+            tsc::fin_de_verification();
+            return false;
+        }
+        let recul_cible = RECUL_CIBLE.load(Ordering::Acquire);
+        tsc::fin_de_verification();
+        // Le scénario de `make tests-qemu` (test-tsc) : sous QEMU, les TSC
+        // des processeurs virtuels viennent de la même horloge et sont
+        // toujours accordés ; on fait comme si le premier secondaire avait
+        // vu le sien reculer d'un million de cycles, sans TSC_ADJUST, pour
+        // passer par le déclassement.
+        #[cfg(feature = "test-tsc")]
+        let (recul_cible, a_tsc_adjust) = if numero == 1 { (1_000_000, false) } else { (recul_cible, CIBLE_A_TSC_ADJUST.load(Ordering::Relaxed)) };
+        #[cfg(not(feature = "test-tsc"))]
+        let a_tsc_adjust = CIBLE_A_TSC_ADJUST.load(Ordering::Relaxed);
+        if recul_source == 0 && recul_cible == 0 {
+            return true;
+        }
+        essais += 1;
+        // Qui est en avance ? Si le secondaire a vu l'heure reculer, c'est
+        // qu'il a lu moins que ce que le premier venait d'écrire : il est
+        // en retard, et avance de ce recul ; si c'est le premier qui l'a
+        // vu, le secondaire est en avance, et recule d'autant (le
+        // raisonnement de `check_tsc_sync_target`).
+        let correction = if recul_cible != 0 { recul_cible as i64 } else { -(recul_source as i64) };
+        if essais < 3 && a_tsc_adjust {
+            CORRECTION.store(correction, Ordering::Relaxed);
+            afficherln!("[noyau] TSC du processeur {} : recul de {} cycles vu par le processeur {} ; TSC_ADJUST corrige de {}, nouvelle mesure.",
+                        numero, correction.unsigned_abs(), if recul_cible != 0 { numero } else { 0 }, correction);
+            zone.demarrage.store(etape::REESSAI, Ordering::Release);
+            if !attendre_etape(zone, etape::ARRIVE, ATTENTE_MESURE_NS) {
+                afficherln!("[noyau] Processeur {} : pas revenu pour une nouvelle mesure du TSC en une seconde.", numero);
+                return false;
+            }
+            continue;
+        }
+        let decalage = tsc::declasser();
+        afficherln!("[noyau] TSC : le processeur {} n'est pas accorde avec le premier (recul de {} cycles{}) : l'heure au tic, decalage de {} ns.",
+                    numero, correction.unsigned_abs(), if a_tsc_adjust { ", malgre TSC_ADJUST" } else { ", pas de TSC_ADJUST" }, decalage);
+        return true;
+    }
+}
+
+/// La première fonction Rust d'un processeur secondaire, appelée par le
+/// trampoline (trampoline.rs) sur la pile de sa tâche inactive,
+/// interruptions coupées, GS_BASE sur sa zone, encore sous la PML4 du
+/// trampoline (dont la moitié haute est celle du noyau : ce code, la pile
+/// et la zone s'y trouvent). Ce que `noyau_main` fait pour un processeur
+/// (voir l'en-tête), puis la poignée de main, puis la boucle
+/// d'inactivité.
+extern "C" fn depart_secondaire(numero: u32) -> ! {
+    // D'abord la PML4 du noyau : celle du trampoline n'a servi qu'à
+    // arriver ici (le `secondary_startup_64` de Linux charge de même
+    // `init_top_pgt` en premier).
+    // SAFETY: la PML4 du noyau est complète ; ce code, la pile et la zone
+    // y sont projetés aux mêmes adresses que dans celle du trampoline.
+    unsafe { pagination::activer(pagination::pml4_noyau()) };
+    let numero = numero as usize;
+    let zone = processeur::zone(numero);
+    let piles = PREPARATIONS.verrouiller()[numero].take().expect("processeur secondaire sans piles preparees");
+    gdt::initialiser(zone, piles);
+    interruptions::charger_idt();
+    appel_systeme::initialiser();
+    sse::initialiser_secondaire();
+    // La base de GS du programme (KERNEL_GS_BASE, celle que `swapgs`
+    // rendra active au retour vers l'anneau 3) : nulle, comme à la mise
+    // sous tension ; explicite, pour ne dépendre de rien.
+    processeur::effacer_base_gs_programme();
+
+    let registres = trampoline::registres_de_reference();
+    let noms = ["CR0", "CR4", "EFER", "XCR0"];
+    for (i, r) in registres.into_iter().enumerate() {
+        let attendu = REFERENCE[i].load(Ordering::Relaxed);
+        if r != attendu {
+            afficherln!("[noyau] Processeur {} : ECHEC, {} vaut {:#x} au lieu de {:#x} (le premier processeur).", numero, noms[i], r, attendu);
+        }
+    }
+
+    acpi::avec(|c| apic::initialiser_processeur(c.madt.as_ref().expect("secondaire sans MADT"), false));
+    let id = apic::id_local();
+    if id != zone.apic.load(Ordering::Relaxed) {
+        afficherln!("[noyau] Processeur {} : ECHEC, son APIC se dit {} et la MADT disait {}.", numero, id, zone.apic.load(Ordering::Relaxed));
+        zone.apic.store(id, Ordering::Relaxed);
+    }
+    CIBLE_A_TSC_ADJUST.store(tsc::a_tsc_adjust(), Ordering::Relaxed);
+
+    // Le scénario test-retard de `make tests-qemu` : le processeur 1 tarde
+    // six secondes à se présenter ; le premier l'abandonne au bout de
+    // cinq, sans INIT, et il doit trouver ABANDONNE ci-dessous et
+    // s'arrêter sans un mot (le compare_exchange ; un `store` l'aurait
+    // déclaré arrivé dans un noyau qui ne l'attendait plus).
+    #[cfg(feature = "test-retard")]
+    if numero == 1 {
+        let khz = tsc::khz().unwrap_or(1_000_000);
+        let debut = tsc::lire();
+        while tsc::lire().wrapping_sub(debut) < khz * 6_000 {
+            core::hint::spin_loop();
+        }
+    }
+
+    // La poignée de main (voir `demarrer_un`) : chaque mot posé par un
+    // compare_exchange sur celui que le premier doit avoir écrit ; un
+    // autre mot (ABANDONNE : le premier a renoncé à nous), et on s'arrête.
+    let mut attendu = etape::ATTENDU;
+    loop {
+        if zone.demarrage.compare_exchange(attendu, etape::ARRIVE, Ordering::AcqRel, Ordering::Acquire).is_err() {
+            cpu::arreter();
+        }
+        match attendre_l_un(zone, &[etape::MESURE, etape::EN_SERVICE, etape::ABANDONNE]) {
+            etape::MESURE => {
+                // None (le premier n'est pas venu en une seconde) : rien à
+                // dire, c'est lui qui en tire la conclusion.
+                let recul = tsc::verifier_accord(tsc::Role::Cible).unwrap_or(0);
+                RECUL_CIBLE.store(recul, Ordering::Relaxed);
+                if zone.demarrage.compare_exchange(etape::MESURE, etape::FINI, Ordering::AcqRel, Ordering::Acquire).is_err() {
+                    cpu::arreter();
+                }
+                match attendre_l_un(zone, &[etape::EN_SERVICE, etape::REESSAI, etape::ABANDONNE]) {
+                    etape::EN_SERVICE => break,
+                    etape::REESSAI => {
+                        tsc::ajuster(CORRECTION.load(Ordering::Acquire));
+                        attendu = etape::REESSAI;
+                    }
+                    _ => cpu::arreter(),
+                }
+            }
+            etape::EN_SERVICE => break,
+            _ => cpu::arreter(),
+        }
+    }
+    // En service : son tic, puis la boucle d'inactivité de l'ordonnanceur
+    // (voir l'en-tête), qui prend le processeur quand sa file est vide.
+    horloge::demarrer_tic_secondaire();
+    crate::ordonnanceur::boucle_inactive()
+}
+
+/// Demande au processeur `numero` de regarder si sa tâche courante doit
+/// céder (l'IPI de reprogrammation : son gestionnaire ne fait rien, la
+/// sortie de l'interruption regarde `besoin_de_ceder` ; et s'il dort dans
+/// `hlt`, il en sort). Le `smp_send_reschedule` de Linux (ordonnanceur.rs,
+/// et le `kick_process` d'un signal, tache.rs).
+pub fn reprogrammer(numero: usize) {
+    apic::ipi(processeur::zone(numero).apic.load(Ordering::Relaxed), apic::VECTEUR_REPROGRAMMATION);
+}
+
+/// Exécute `fonction(argument)` sur chacun des processeurs en service de
+/// `masque`, sauf celui-ci, et attend que tous aient fini (voir l'en-tête ;
+/// la fonction s'exécute chez eux interruptions coupées, courte, sans
+/// verrou qui dort). Interruptions actives, aucun `Verrou` tenu.
+#[track_caller]
+pub fn appeler(masque: u64, fonction: fn(usize), argument: usize) {
+    // L'endroit de l'appel (l'attribut track_caller), lu ici, hors de la
+    // fermeture : pour les messages.
+    let lieu = core::panic::Location::caller();
+    processeur::sans_preemption(|| {
+        let zone = processeur::courant();
+        let cibles = masque & processeur::masque_en_service() & !(1 << zone.numero);
+        if cibles == 0 {
+            // Personne à appeler (un seul processeur, le démarrage) : rien
+            // à attendre, donc rien à exiger.
+            return;
+        }
+        assert!(cpu::interruptions_actives(), "appel aux autres processeurs interruptions coupees ({}:{})", lieu.file(), lieu.line());
+        assert!(verrou::tenus() == 0, "appel aux autres processeurs un verrou tenu ({}:{})", lieu.file(), lieu.line());
+        zone.appel.fonction.store(fonction as usize, Ordering::Relaxed);
+        zone.appel.argument.store(argument, Ordering::Relaxed);
+        // Release : la fonction et l'argument avant le masque, que les
+        // receveurs lisent en Acquire.
+        zone.appel.cibles.store(cibles, Ordering::Release);
+        for n in processeurs(cibles) {
+            apic::ipi(processeur::zone(n).apic.load(Ordering::Relaxed), apic::VECTEUR_FONCTION);
+        }
+        let debut = tsc::lire();
+        let mut dit = false;
+        // Acquire : ce que les receveurs ont fait avant d'effacer leur bit
+        // est visible ici.
+        while zone.appel.cibles.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
+            if !dit && tsc::khz().is_some_and(|khz| tsc::lire().wrapping_sub(debut) > khz * 1000) {
+                dit = true;
+                crate::console::urgence(format_args!(
+                    "[smp] {}:{} : le processeur {} attend depuis plus d'une seconde la reponse des processeurs {:#x}\n",
+                    lieu.file(), lieu.line(), zone.numero, zone.appel.cibles.load(Ordering::Relaxed)));
+            }
+        }
+    });
+}
+
+/// `appeler` sur tous les autres processeurs en service (le
+/// `smp_call_function` de Linux).
+#[track_caller]
+pub fn appeler_les_autres(fonction: fn(usize), argument: usize) {
+    appeler(u64::MAX, fonction, argument);
+}
+
+/// Les numéros des processeurs d'un masque.
+fn processeurs(masque: u64) -> impl Iterator<Item = usize> {
+    (0..processeur::MAX).filter(move |&n| masque >> n & 1 != 0)
+}
+
+/// L'IPI FONCTION reçue, interruptions coupées (interruptions.rs) : les
+/// demandes qui attendent ce processeur, exécutées, puis son bit effacé
+/// dans chacune (voir l'en-tête).
+pub fn recevoir_appel() {
+    let moi = 1u64 << processeur::courant().numero;
+    for n in processeurs(processeur::masque_en_service()) {
+        let appel = &processeur::zone(n).appel;
+        if appel.cibles.load(Ordering::Acquire) & moi == 0 {
+            continue;
+        }
+        let f = appel.fonction.load(Ordering::Relaxed);
+        // SAFETY: `appeler` n'y écrit que des `fn(usize)`, avant de poser
+        // le masque (Release) que nous venons de lire (Acquire).
+        let f = unsafe { core::mem::transmute::<usize, fn(usize)>(f) };
+        f(appel.argument.load(Ordering::Relaxed));
+        processeur::courant().appels_recus.fetch_add(1, Ordering::Relaxed);
+        appel.cibles.fetch_and(!moi, Ordering::Release);
+    }
+}
+
+/// Une demande de vidage des TLB, lue par les receveurs : l'espace (sa
+/// PML4 ; 0 : des adresses du noyau, pour tous), les pages, ou « tout ».
+struct DemandeVidage {
+    pml4: u64,
+    pages: *const u64,
+    nombre: usize,
+    tout: bool,
+}
+
+/// Vide les TLB de `pages` (ou de tout, `tout`) de l'espace `pml4` (None :
+/// des adresses du noyau) sur les processeurs du `masque` (None : tous ceux
+/// en service) : ici, puis chez les autres par `appeler` (voir l'en-tête).
+/// Interruptions actives, aucun verrou court tenu, si d'autres
+/// processeurs sont concernés.
+#[track_caller]
+pub fn vider_tlb(pml4: Option<u64>, masque: Option<&AtomicU64>, pages: &[u64], tout: bool) {
+    let lieu = core::panic::Location::caller();
+    processeur::sans_preemption(|| {
+        let moi = 1u64 << processeur::courant().numero;
+        // Le motif de Dekker (espace_utilisateur.rs) : les entrées des
+        // tables sont écrites ; une barrière complète avant de lire le
+        // masque, la paire du `fetch_or` de qui charge l'espace.
+        core::sync::atomic::fence(Ordering::SeqCst);
+        let cibles = match masque {
+            Some(m) => m.load(Ordering::Acquire),
+            None => processeur::masque_en_service(),
+        };
+        if cibles & moi != 0 {
+            vider_ici(pages, tout);
+        }
+        let autres = cibles & !moi & processeur::masque_en_service();
+        if autres != 0 {
+            if !cpu::interruptions_actives() {
+                let t = tache::courante();
+                let nom = t.nom();
+                crate::console::urgence(format_args!("[smp] vidage a distance interruptions coupees depuis {}:{}, tache {} (tid {}), {} verrou(s)\n",
+                    lieu.file(), lieu.line(), core::str::from_utf8(nom.octets()).unwrap_or("?"), t.tid(), verrou::tenus()));
+            }
+            let demande = DemandeVidage { pml4: pml4.unwrap_or(0), pages: pages.as_ptr(), nombre: pages.len(), tout };
+            appeler(autres, vider_a_distance, &demande as *const DemandeVidage as usize);
+        }
+    });
+}
+
+/// Vide les TLB de tous les processeurs pour des adresses du noyau
+/// (`pages` ; tout le TLB au-delà de 33 pages, comme pour un espace) : une
+/// pile de tâche rendue, une projection rendue (vmalloc.rs).
+#[track_caller]
+pub fn vider_tlb_noyau(pages: &[u64]) {
+    vider_tlb(None, None, pages, pages.len() > 33);
+}
+
+fn vider_ici(pages: &[u64], tout: bool) {
+    if tout {
+        pagination::vider_tlb();
+    } else {
+        for &p in pages {
+            pagination::invalider(p);
+        }
+    }
+}
+
+/// Le vidage demandé par un autre processeur (`recevoir_appel`,
+/// interruptions coupées) : seulement si cette PML4 est celle qu'on a
+/// chargée (ou pour des adresses du noyau).
+fn vider_a_distance(demande: usize) {
+    // SAFETY: `vider_tlb` attend la fin de l'appel avant de rendre la
+    // demande, sur sa pile ; les pages de même.
+    let d = unsafe { &*(demande as *const DemandeVidage) };
+    if d.pml4 != 0 && pagination::courante() != d.pml4 {
+        return;
+    }
+    // SAFETY: comme ci-dessus.
+    let pages = unsafe { core::slice::from_raw_parts(d.pages, d.nombre) };
+    vider_ici(pages, d.tout);
+}
+
+
+/// La panique a commencé : les autres processeurs doivent s'arrêter. Lu en
+/// tête du gestionnaire de NMI (interruptions.rs).
+static ARRET_DEMANDE: AtomicBool = AtomicBool::new(false);
+
+pub fn arret_demande() -> bool {
+    ARRET_DEMANDE.load(Ordering::SeqCst)
+}
+
+/// Arrête ce processeur pour toujours, et le dit (`arrete`) : l'IPI
+/// d'arrêt ou le NMI de la panique reçu, ou la panique perdue (console.rs).
+/// Interruptions coupées.
+pub fn s_arreter() -> ! {
+    processeur::courant().arrete.store(true, Ordering::Release);
+    cpu::arreter()
+}
+
+/// Arrête tous les autres processeurs en service (voir l'en-tête) : sur le
+/// processeur qui panique, interruptions coupées, avant d'écrire son
+/// message.
+pub fn arreter_les_autres() {
+    ARRET_DEMANDE.store(true, Ordering::SeqCst);
+    let moi = processeur::numero();
+    let autres = processeur::masque_en_service() & !(1 << moi);
+    let restants = || {
+        let mut m = 0u64;
+        for n in processeurs(autres) {
+            if !processeur::zone(n).arrete.load(Ordering::Acquire) {
+                m |= 1 << n;
+            }
+        }
+        m
+    };
+    if restants() == 0 {
+        return;
+    }
+    for n in processeurs(restants()) {
+        apic::ipi(processeur::zone(n).apic.load(Ordering::Relaxed), apic::VECTEUR_ARRET);
+    }
+    if attendre_bornee(|| restants() == 0, 1_000_000) {
+        return;
+    }
+    for n in processeurs(restants()) {
+        apic::ipi_nmi(processeur::zone(n).apic.load(Ordering::Relaxed));
+    }
+    attendre_bornee(|| restants() == 0, 10_000);
+}
+
+/// Attend que `fini` soit vrai, au plus `us` microsecondes : par le TSC
+/// s'il est fiable ; sinon un nombre de tours (cent par microseconde : une
+/// borne, pas une durée). Interruptions coupées ou non, sans l'horloge
+/// (la panique tourne interruptions coupées, les tics n'avancent plus).
+fn attendre_bornee(fini: impl Fn() -> bool, us: u64) -> bool {
+    if let Some(khz) = tsc::khz() {
+        let debut = tsc::lire();
+        while !fini() {
+            if tsc::lire().wrapping_sub(debut) > khz * us / 1000 {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        return true;
+    }
+    for _ in 0..us.saturating_mul(100) {
+        if fini() {
+            return true;
+        }
+        core::hint::spin_loop();
+    }
+    fini()
+}
+
+/// Attend que `zone.demarrage` prenne l'une des valeurs `attendues`, et la
+/// rend. Sans borne : le premier processeur, qui l'écrit, est en marche.
+fn attendre_l_un(zone: &processeur::Processeur, attendues: &[u8]) -> u8 {
+    loop {
+        let e = zone.demarrage.load(Ordering::Acquire);
+        if attendues.contains(&e) {
+            return e;
+        }
+        core::hint::spin_loop();
+    }
+}

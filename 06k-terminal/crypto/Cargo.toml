@@ -1,0 +1,16 @@
+# Les fonctions cryptographiques dont le noyau a besoin (6h) : ChaCha20,
+# le chiffrement par flot de Bernstein, dont Linux tire tous ses nombres
+# aléatoires (drivers/char/random.c) ; BLAKE2s, la fonction de hachage qui
+# mêle l'aléa recueilli dans son réservoir ; SipHash, la fonction de
+# hachage à clé qui rend imprévisibles les numéros de séquence de TCP, les
+# ports éphémères et les identifiants IP. Comme ../formats, une
+# bibliothèque sans bibliothèque standard (no_std), sans `alloc`, sans
+# `unsafe` et sans dépendance : du calcul pur, testé sur la machine hôte
+# (`make tests-hote`) avec les vecteurs officiels, puis compilé dans le
+# noyau.
+[package]
+name = "crypto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

@@ -1,0 +1,7 @@
+# La trace des appels système (make trace) : claude --version seul, dans
+# notre noyau construit avec la fonctionnalité trace. Jusqu'à 6j, la trace
+# jouait tout /etc/demarrage, ce qui prenait six minutes sous QEMU (chaque
+# appel de chaque programme écrit sur le port série) pour n'en garder que
+# les lignes de claude ; ici, dix secondes. Comme dans /etc/demarrage : sans
+# argument ni variable, il n'a rien à lire.
+/usr/local/bin/claude --version

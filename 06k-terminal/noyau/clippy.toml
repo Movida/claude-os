@@ -1,0 +1,66 @@
+# Les règles du noyau que `cargo clippy` fait respecter (make, la CI ;
+# les niveaux sont dans Cargo.toml, [lints]).
+#
+# Les allocations qui paniquent quand le tas est plein : interdites dans le
+# noyau, qui passe par leurs équivalents faillibles (src/faillible.rs, et
+# notre Arc, src/partage.rs). Chaque raison dit quoi prendre à la place.
+# Seuls src/faillible.rs (qui les appelle une fois la place réservée) et le
+# test du tas au démarrage (main.rs, tester_tas) ont le droit de les
+# appeler, par un #[allow] justifié.
+#
+# Ce que clippy ne voit pas, faute de pouvoir les distinguer : `clone()`
+# d'un Vec (le même nom que celui d'Arc, qui n'alloue pas), les
+# conversions `From` qui allouent (Box::from(&[T]), String::from...),
+# `Vec<T>` rempli par `collect` dans une bibliothèque. Le noyau n'en a pas ;
+# une relecture doit y veiller.
+disallowed-methods = [
+  { path = "alloc::boxed::Box::new", reason = "peut paniquer : faillible::boite" },
+  { path = "alloc::boxed::Box::new_uninit", reason = "peut paniquer : faillible::boite_vide" },
+  { path = "alloc::boxed::Box::pin", reason = "peut paniquer : faillible::boite, puis Box::into_pin" },
+  { path = "alloc::sync::Arc::new", reason = "peut paniquer : notre Arc (partage::Arc::new)" },
+  { path = "alloc::sync::Arc::new_cyclic", reason = "peut paniquer : notre Arc (partage::Arc::new_cyclic)" },
+  { path = "alloc::rc::Rc::new", reason = "peut paniquer : notre Arc (partage::Arc::new)" },
+  { path = "alloc::vec::Vec::with_capacity", reason = "peut paniquer : faillible::avec_capacite" },
+  { path = "alloc::vec::Vec::push", reason = "peut paniquer : VecFaillible::ajouter, ou ajouter_dans_la_place" },
+  { path = "alloc::vec::Vec::insert", reason = "peut paniquer : VecFaillible::inserer" },
+  { path = "alloc::vec::Vec::extend_from_slice", reason = "peut paniquer : VecFaillible::ajouter_tranche" },
+  { path = "alloc::vec::Vec::extend_from_within", reason = "peut paniquer : try_reserve d'abord" },
+  { path = "alloc::vec::Vec::resize", reason = "peut paniquer : VecFaillible::redimensionner, ou faillible::remplie" },
+  { path = "alloc::vec::Vec::resize_with", reason = "peut paniquer : VecFaillible::redimensionner" },
+  { path = "alloc::vec::Vec::reserve", reason = "peut paniquer : try_reserve" },
+  { path = "alloc::vec::Vec::reserve_exact", reason = "peut paniquer : try_reserve_exact" },
+  { path = "alloc::vec::Vec::append", reason = "peut paniquer : try_reserve d'abord" },
+  { path = "alloc::vec::Vec::split_off", reason = "peut paniquer : faillible::copie de la fin, puis truncate" },
+  { path = "alloc::vec::Vec::into_boxed_slice", reason = "peut paniquer (réalloue) : faillible::boite_de_tranche" },
+  { path = "alloc::vec::Vec::shrink_to_fit", reason = "peut paniquer (réalloue)" },
+  { path = "alloc::vec::Vec::shrink_to", reason = "peut paniquer (réalloue)" },
+  { path = "alloc::collections::VecDeque::push_back", reason = "peut paniquer : FileFaillible::ajouter_derriere" },
+  { path = "alloc::collections::VecDeque::push_front", reason = "peut paniquer : FileFaillible::ajouter_devant_dans_la_place" },
+  { path = "alloc::collections::VecDeque::with_capacity", reason = "peut paniquer : VecDeque::new, puis try_reserve" },
+  { path = "alloc::collections::VecDeque::reserve", reason = "peut paniquer : try_reserve" },
+  { path = "alloc::collections::VecDeque::insert", reason = "peut paniquer : try_reserve d'abord" },
+  { path = "alloc::collections::VecDeque::append", reason = "peut paniquer : FileFaillible::deplacer_dans_la_place" },
+  { path = "alloc::collections::VecDeque::resize", reason = "peut paniquer : try_reserve d'abord" },
+  { path = "alloc::collections::VecDeque::split_off", reason = "peut paniquer" },
+  { path = "alloc::collections::VecDeque::shrink_to_fit", reason = "peut paniquer (réalloue)" },
+  { path = "alloc::collections::VecDeque::shrink_to", reason = "peut paniquer (réalloue)" },
+  { path = "alloc::vec::Vec::splice", reason = "peut paniquer : try_reserve d'abord" },
+  { path = "alloc::boxed::Box::new_zeroed", reason = "peut paniquer : faillible::boite_vide" },
+  { path = "alloc::collections::BTreeMap::insert", reason = "peut paniquer (alloue un nœud)" },
+  { path = "slice::sort", reason = "peut paniquer (alloue un tampon) : sort_unstable" },
+  { path = "slice::sort_by", reason = "peut paniquer (alloue un tampon) : sort_unstable_by" },
+  { path = "slice::sort_by_key", reason = "peut paniquer (alloue un tampon) : sort_unstable_by_key" },
+  { path = "slice::sort_by_cached_key", reason = "peut paniquer (alloue)" },
+  { path = "core::iter::Extend::extend", reason = "peut paniquer : VecFaillible::ajouter_tout" },
+  { path = "core::iter::Iterator::collect", reason = "peut paniquer : VecFaillible::ajouter_tout" },
+  { path = "slice::to_vec", reason = "peut paniquer : faillible::copie" },
+  { path = "alloc::borrow::ToOwned::to_owned", reason = "peut paniquer : faillible::copie" },
+  { path = "alloc::string::ToString::to_string", reason = "peut paniquer : écrire dans un tampon (fmt::Write)" },
+  { path = "alloc::string::String::push", reason = "peut paniquer : un Vec<u8> et VecFaillible" },
+  { path = "alloc::string::String::push_str", reason = "peut paniquer : un Vec<u8> et VecFaillible" },
+  { path = "alloc::string::String::with_capacity", reason = "peut paniquer : un Vec<u8> et faillible::avec_capacite" },
+]
+disallowed-macros = [
+  { path = "alloc::vec", reason = "peut paniquer : faillible::remplie" },
+  { path = "alloc::format", reason = "peut paniquer : un type qui implémente Display, ou fmt::Write dans un tampon" },
+]

@@ -1,0 +1,10 @@
+# L'interpréteur WebAssembly : une bibliothèque sans bibliothèque standard
+# (no_std), qui n'a besoin que de `core` et `alloc` (Vec, Box, String). Elle
+# tourne donc aussi bien sur la machine hôte, pour les tests, que dans notre
+# noyau. Aucune dépendance.
+[package]
+name = "wasm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]

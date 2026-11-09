@@ -1,0 +1,10 @@
+[noyau] Lancement : /etc/demarrage, 8 commandes.
+Invalid API key · Fix external API key
+[noyau] claude : termine, code de sortie 1.
+Bonjour ! Ici la fausse API de claude-os : aucune requete n'a quitte la machine.
+[noyau] claude : termine, code de sortie 0.
+/home/utilisateur/.claude.json
+/home/utilisateur/.claude/projects/-home-utilisateur/
+[linux] effacer : /home/utilisateur vide : ok
+[linux] effacer : /tmp/claude-1000 efface : ok
+[noyau] Groupe des lignes 29 a 35 : memoire rendue : ok.
