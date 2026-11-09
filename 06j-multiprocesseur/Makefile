@@ -965,8 +965,10 @@ claude-p.bin: claude-p.cpio FORCE
 
 # Le temps que met claude -p dans QEMU sans accélération (28 s mesurées ici
 # en 6f ; 33 s en 6g, l'image construite comprise, avec le DNS et la
-# connexion refusée ; en 6i, ses deux lancements et le groupe, 19 s ; le
-# double ou plus sur une machine de la CI).
+# connexion refusée ; en 6i, ses deux lancements et le groupe, 19 s ; en 6j,
+# sur quatre processeurs, 18 s : claude -p est une boucle d'événements et
+# du réseau, peu de calcul à répartir ; le double ou plus sur une machine
+# de la CI).
 DUREE_CLAUDE_P = 240
 
 # claude -p bonjour, deux fois, dans notre noyau (racine/etc/demarrage-
@@ -1410,9 +1412,11 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	done
 
 # La trace des appels système : le noyau construit avec la fonctionnalité
-# trace (son propre dossier de compilation), l'archive ordinaire, sur la
-# machine de l'étape. Celle de claude --version dans notre noyau (elle
-# n'affiche que des nombres : les registres de chaque appel), puis les
+# trace (son propre dossier de compilation), sur la machine de l'étape, avec
+# l'archive de l'étape dont /etc/demarrage ne lance que claude --version
+# (racine/etc/demarrage-trace : depuis 6j ; jouer tout le démarrage sous la
+# trace prenait six minutes). Celle de claude --version dans notre noyau
+# (elle n'affiche que des nombres : les registres de chaque appel), puis les
 # NOMS des appels du même claude sous Linux, sur l'hôte : jamais une trace
 # de claude qui pourrait contenir un jeton. Il est lancé sans
 # environnement (env -i), avec un HOME neuf et vide : il n'a rien à lire ;
@@ -1422,8 +1426,7 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 # vDSO, sans appel système : notre trace en a de plus (pas de vDSO avant
 # 6n).
 trace: test-trace.bin $(CLAUDE)
-	-timeout $(DUREE) qemu-system-x86_64 -display none -no-reboot -drive format=raw,file=test-trace.bin,if=$(QEMU_DISQUE) \
-	  $(QEMU_OPTIONS) -serial file:trace.log
+	$(call attendre,$(QEMU_TEST) -drive format=raw$(,)file=test-trace.bin$(,)if=$(QEMU_DISQUE) $(QEMU_OPTIONS) -serial file:trace.log,trace.log,"[noyau] claude : termine",:)
 	@echo "--- dans notre noyau ---"
 	@sed -n '/claude : programme/,/claude : termine/p' trace.log | grep -E '^\[(trace|linux)\]|claude :|Claude Code'
 	@echo "--- sous Linux, sur l'hote (strace : les noms des appels seulement) ---"
@@ -1434,9 +1437,15 @@ trace: test-trace.bin $(CLAUDE)
 	rm -rf $$vide; \
 	test $$code -eq 0 || { echo "strace ou claude : code $$code (ptrace refuse ?)"; exit 1; }
 
-test-trace.bin: programmes.cpio FORCE
+test-trace.bin: trace.cpio FORCE
 	cd noyau && cargo build --release --features trace --target-dir target/test-trace 2>&1 | tee /dev/stderr | (! grep -q '^warning')
-	$(call image,noyau/target/test-trace/x86_64-unknown-none/release/noyau,programmes.cpio,test-trace)
+	$(call image,noyau/target/test-trace/x86_64-unknown-none/release/noyau,trace.cpio,test-trace)
+
+# L'archive de la trace : celle de l'étape, dont /etc/demarrage ne lance
+# que claude --version (racine/etc/demarrage-trace).
+trace.cpio: programmes.cpio racine/etc/demarrage-trace
+	{ sed 's|racine/etc/demarrage |racine/etc/demarrage-trace |' archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } \
+	  | sh archive.sh $@ -
 
 # Les statistiques des verrous (6i) : le noyau construit avec la
 # fonctionnalité verrous (son propre dossier de compilation), l'archive
@@ -1495,7 +1504,7 @@ test-%.bin: vide.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin nmi*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio nmi.cpio \
+	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin nmi*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio nmi.cpio trace.cpio \
 	  tests-demarrage.txt serial.log trace.log verrous.log \
 	  capture.log qemu.log ecran.png test-*.log claude-p.log $(MON_TESTS)
 	rm -f $(PRIVE_FICHIERS)

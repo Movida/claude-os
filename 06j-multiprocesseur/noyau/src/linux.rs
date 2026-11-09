@@ -606,15 +606,29 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         EXIT_GROUP => ("exit_group", 1),
         _ => ("?", 6),
     };
-    afficher!("[trace] {}(", nom);
-    for (i, x) in a[..n].iter().enumerate() {
-        afficher!("{}{:#x}", if i > 0 { ", " } else { "" }, x);
+    // Une ligne en UN message : avec plusieurs processeurs (6j), deux
+    // appels tracés en même temps mêlaient leurs morceaux (un `afficher!`
+    // par argument) ; un message entier passe sous le verrou des écritures.
+    struct Arguments<'a>(&'a [u64]);
+    impl core::fmt::Display for Arguments<'_> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            for (i, x) in self.0.iter().enumerate() {
+                write!(f, "{}{:#x}", if i > 0 { ", " } else { "" }, x)?;
+            }
+            Ok(())
+        }
     }
-    match resultat {
-        None => afficherln!(") = ?"),
-        Some(r) if r < 0 => afficherln!(") = -1 (errno {})", -r),
-        Some(r) => afficherln!(") = {:#x}", r),
+    struct Resultat(Option<i64>);
+    impl core::fmt::Display for Resultat {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            match self.0 {
+                None => write!(f, "?"),
+                Some(r) if r < 0 => write!(f, "-1 (errno {})", -r),
+                Some(r) => write!(f, "{:#x}", r),
+            }
+        }
     }
+    afficherln!("[trace] {}({}) = {}", nom, Arguments(&a[..n]), Resultat(resultat));
 }
 
 /// brk(adresse) : déplace la fin du tas, à l'octet près : la zone du tas
