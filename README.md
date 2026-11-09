@@ -58,7 +58,7 @@ make          # construit l'image
 make run      # démarre dans QEMU
 ```
 
-Pour vérifier toutes les étapes d'un coup, comme la CI : `./verifier.sh`.
+Pour vérifier toutes les étapes d'un coup, comme la CI : `./verifier.sh`. La CI le lance sous un Linux figé, celui dont le noyau imite le comportement (6.18.33), dans une machine virtuelle sur le système de fichiers de la machine de GitHub : `.devcontainer/linux-de-reference.sh ./verifier.sh` (sudo sans mot de passe, et KVM pour aller vite).
 
 L'étape 6d télécharge le binaire officiel de Claude Code (paquet npm, empreinte SHA-256 vérifiée) dans `~/.cache/claude-os`. Ce binaire appartient à Anthropic : il n'est ni commité ni redistribué par ce dépôt.
 

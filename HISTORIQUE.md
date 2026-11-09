@@ -472,7 +472,21 @@ Dossier `06j-multiprocesseur/`, en quinze commits d'après un plan écrit au dé
 
 **Le repli :** par la plomberie de 6i adaptée (`relecture-6j/repli/` dans le conteneur : les couches des corrections par commit visé, les instantanés par fusion à trois, la chaîne par `commit-tree`), 21 commits dont trois « Reste de » (6f : DR6 ; 6a : la barrière du compilateur ; 6i : le pic), le commit du test des vingt parties fondu dans celui des verrous qui dorment ; six conflits résolus à la main (le réveil sous le verrou de la file dans le vocabulaire d'une seule file, à c3a puis c3b ; le drapeau de céder passé dans la zone, à c6 ; l'en-tête de `processeurs.c` et son `pthread.h`, à c6 ; la barrière avant la refonte de `servir` ; un import) et un constat recentré (la courante d'une file lue par un autre processeur se corrige là où la file par processeur existe, c8, pas là où la bascule la publiait) ; chaque commit construit sans avertissement et vérifié dans QEMU (le démarrage, `make tests-hote`, `make tests-qemu`), en deux voies parallèles : vingt et une vérifications de quatre à six minutes chacune, une heure en tout ; une passe de construction de chaque commit, avant, avait trouvé deux corrections repliées trop tôt (un `aller_sur` et un masque à champs nommés qui n'existaient pas encore), remises à leur commit.
 
-## 25. Reste à faire
+## 25. Les soldes d'avant 6k (9 novembre 2026)
+
+À la place d'une relecture globale après 6j, David a demandé de s'attaquer à toutes les corrections mises de côté et de chercher une solution à chaque problème en suspens, avant le terminal. L'inventaire (`inventaire-soldes.md` dans les fichiers du projet) a croisé « Reste à faire », les rapports de relecture (la globale, les finales de 6e à 6j), les renvois du code à « plus tard » et la mémoire du projet : rien de ce que les relecteurs avaient mis de côté n'était perdu ; trois choses manquaient au registre. Il les a rangées en cinq lots : hors du noyau ; les défauts du noyau, là où il diffère de Linux ; la robustesse ; le vrai matériel, pour ce qui se vérifie sous QEMU ; les fonctions qu'aucun programme ne demande encore. Ce qui est le contenu même de 6k à 6n reste à sa place. Les commits sont au début de `06k-terminal/`, en « Reste de 6x ».
+
+**Le premier lot, hors du noyau :**
+
+- **La CI sous le Linux de référence.** Deux fois la CI était passée au rouge pour un changement du noyau de GitHub (LA57 en 6h, la limite de /sys en 6i), et cinq programmes de test avaient pris des tolérances pour « un autre noyau ». Toute la CI tourne maintenant sous un Linux figé, dans une machine virtuelle qui démarre sur le système de fichiers de la machine de GitHub (`.devcontainer/linux-de-reference.sh`, le principe de virtme-ng écrit à la main) : les mêmes programmes, le même dépôt, seul le noyau change ; KVM chez GitHub. Lequel : en essayant le dernier de la série, 6.18.62, `linux/pmtu` a échoué. La 6.18.51 a changé le MSS qu'annonce une connexion neuve (celui de l'interface, plus celui que le chemin a appris : 2640e641959, « the wrong direction entirely »). Une série à long terme change donc encore de comportement : la référence est figée à 6.18.33, la version de WSL sur laquelle tous nos tests ont été écrits, et en changer se décidera exprès, avec ce que cela change dans notre noyau. Les tolérances des tests sont retirées.
+- **verifier.sh dans l'ordre.** L'attendu.txt de 6k donne ses 285 lignes entières, dans l'ordre du démarrage (`verifier-ordre.awk`), au lieu de morceaux cherchés n'importe où, dont certains ne prouvaient rien (« [noyau] TSC : »).
+- **La glibc de l'image figée** (2.39-0ubuntu8.9, téléchargée depuis Launchpad, empreintes vérifiées), plus celle de la machine qui construit.
+- **Deux tests instables, trouvés en route** : le scénario des programmes de `make tests-qemu` n'avait que 10 % de marge (30 s pour 28 mesurées : 60 s, le double, comme DUREE) ; `linux/attente` prenait son instant de départ après avoir lancé le fil qui le réveille (un échec sous la machine de référence chargée : l'instant avant, et des nanosecondes).
+- **Le vieux worktree de la reprise de 6h**, propre et contenu dans `main`, retiré ; `actions/cache` tournait déjà sur Node 24 depuis 6i.
+
+**Relecture de fond du lot :** un relecteur indépendant, 22 constats (2 graves, 5 moyens, 15 mineurs), tous corrigés et repliés : le script de la machine commité sans son bit d'exécution (la première CI aurait échoué) ; un journal de démarrage vide qui faisait passer toute l'étape (exactement le risque de 6k, un port série cassé) ; la machine sans les réglages qu'un Ubuntu pose au démarrage (la socket de ping refusée : huit vérifications de `reseau` sautées sans bruit, désormais strictes) ; Ctrl+C qui ne l'arrêtait pas ; la racine de l'hôte partagée en écriture (en lecture seule maintenant, HOME et le dépôt à part) ; devpts sans le groupe tty ; une ligne d'un programme en arrière-plan rangée à tort ; et des messages, des cas d'erreur, des empreintes revérifiées.
+
+## 26. Reste à faire
 
 Deux listes, depuis la relecture globale (section 21) : les **dettes**, à rembourser, chacune avec l'étape qui le fera, ou ce qui la déclenchera ; puis les **écarts voulus avec Linux**, permanents, chacun justifié.
 
@@ -533,8 +547,6 @@ Deux listes, depuis la relecture globale (section 21) : les **dettes**, à rembo
 - **Le détecteur d'interblocage** épargne un programme bloqué pour toujours dès qu'une de ses sockets est dans un epoll, même que personne n'attend (épargner trop rejoint Linux, qui ne tue jamais personne) : à revoir si la boucle de Bun le montre.
 - **ICMP** : la limite des erreurs par destination (`inet_peer`) manque, seule la limite globale est faite. Les options IP ne sont pas validées une à une (`ip_options_compile`) : seules les routes sources sont jetées, sans « problème de paramètre » pour une option fausse.
 - **Une diffusion envoyée** n'est pas rendue aussi aux sockets de la machine (Linux en fait une copie par la boucle) ; ni multidiffusion, ni MSG_MORE et UDP_CORK, ni IP_OPTIONS et IP_RECVTTL (ENOPROTOOPT) ; SO_SNDBUF ne fait jamais attendre. L'interface d'IP_PKTINFO à l'envoi n'est que vérifiée (ENODEV), pas prise pour sortie.
-- **La glibc vient de la machine hôte** (`glibc/`, refaite d'après une empreinte du contenu) : le résultat dépend de l'Ubuntu de l'hôte. WSL et la CI sont tous deux en 24.04 ; une empreinte attendue, comme pour `claude`, arrêterait une construction faite avec une autre glibc, mais aussi chaque mise à jour de sécurité d'Ubuntu : à faire si les deux divergent un jour.
-- **Les tests du démarrage** : `verifier.sh` cherche chaque ligne attendue n'importe où dans le journal, sans en vérifier l'ordre (une ligne peut être satisfaite par un autre programme, plus loin), et quelques morceaux attendus sont très courts (« [noyau] TSC : »). Depuis 6h, il échoue sur tout « ECHEC » ou « PANIQUE » du journal. Vérifier l'ordre, si un test passe un jour à tort.
 
 ### Les écarts voulus avec Linux
 
@@ -550,10 +562,10 @@ Deux listes, depuis la relecture globale (section 21) : les **dettes**, à rembo
 - **Le ramasse-miettes d'AF_UNIX** numérote de vraies composantes : la forme où le `scc_index` de Linux se trompe (r → a → b → a, a → r) fuit chez lui, pas chez nous.
 - **Un message d'AF_UNIX sort de sa file pendant sa copie vers le programme** (chez Linux, le paquet y reste) : une copie peut fauter et dormir, et les octets ne se prêtent pas hors du verrou. Il revient à sa place s'il n'est pas tout lu, et un `poll` qui aurait vu la file vide entre-temps est réveillé.
 
-## 26. Questions ouvertes
+## 27. Questions ouvertes
 
-- Aucune pour l'instant.
+- **L'essai Fable 5.1** (section 24) : garder Fable 5.1 pour la suite, ou revenir à Opus 5.5. La recommandation des soldes : refaire l'essai sur 6k, avec le contexte standard, pour comparer à armes égales (6h et 6i manquent aussi au journal de pilotage).
 
-## 27. Prochaine étape
+## 28. Prochaine étape
 
 Sous-étape 6k : le port série devient un vrai terminal (termios, `/dev/tty`) : un pilote à interruptions et une file d'attente pour la console (la dette de 6k), les signaux du terminal (SIGINT, SIGTSTP et SIGCONT, le contrôle des tâches), ce que Claude Code demande à son terminal (`ioctl` TCGETS et TCSETS, TIOCGWINSZ, le mode brut). Son plan sera écrit et relu au début de son fil, avec ce que 6j a appris (`etape-06/plan.md` dans les fichiers du projet pour le découpage).
