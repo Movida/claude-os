@@ -89,6 +89,7 @@ use crate::cpu;
 use crate::faillible::{FileFaillible, VecFaillible};
 use crate::ordonnanceur;
 use crate::partage::Arc;
+use crate::processeur;
 use crate::processus::Entree;
 use crate::tache::{self, Reveil, Tache};
 use crate::verrou::Verrou;
@@ -97,6 +98,7 @@ use core::cell::{Cell, UnsafeCell};
 use core::marker::PhantomPinned;
 use core::ops::{Deref, DerefMut};
 use core::pin::Pin;
+use core::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 
 /// Ce que fait le réveil d'une entrée qui n'est pas une tâche : l'entrée
 /// d'un `poll` (sondage.rs), l'élément d'un epoll (epoll.rs).
@@ -418,6 +420,12 @@ impl FileAttente {
         let (precedente, e) = l.chercher(|e| tache_de(e).is_some_and(|t| choisir(unsafe { &*t })))?;
         // SAFETY: l'entrée trouvée est inscrite, sous le verrou de la file.
         Some(Self::sortir_tache(&mut l, precedente, unsafe { &*e }))
+    }
+
+    /// Retire de la file la première tâche, et la rend (avec l'Arc que
+    /// tenait la file), sans la réveiller : un `Mutex` la lui remet.
+    pub fn retirer_premiere(&self) -> Option<Arc<Tache>> {
+        self.retirer_si(|_| true)
     }
 
     /// Retire `t` de la file, si elle y est (réveillée par autre chose
@@ -851,72 +859,260 @@ impl<T: PorteFile + 'static> Drop for Relais<T> {
     }
 }
 
+/// TOURNER D'ABORD (6j) : une tâche qui trouve un verrou qui dort (un
+/// Mutex, ou un VerrouLE qu'elle demande en écriture) pris par une tâche
+/// qui S'EXÉCUTE EN CE MOMENT sur un autre processeur tourne,
+/// interruptions actives et préemption coupée, tant que ce détenteur
+/// s'exécute (`sur_processeur`) et tient encore le verrou, que personne
+/// n'attend dans la file et que son propre processeur n'a pas besoin de
+/// céder, et 25 µs au plus (`TOUR_AU_PLUS_NS`, mesuré) : le verrou sera
+/// rendu dans quelques microsecondes, s'endormir et
+/// être réveillé coûterait deux bascules (le `mutex_spin_on_owner` et le
+/// `rwsem_spin_on_owner` de Linux, le cœur de son « optimistic spinning »).
+/// Sans le vol de Linux : dès que quelqu'un attend, ou que le détenteur
+/// dort, on se range, et le verrou est REMIS à qui attend, dans l'ordre
+/// (pas de famine, donc pas de drapeau HANDOFF). Interruptions actives,
+/// jamais coupées : le détenteur, qui vide des TLB vers ce processeur
+/// (smp.rs), attendrait sinon notre réponse pour toujours. Le détenteur
+/// est connu de deux façons : un Arc sous le verrou de l'état (il peut
+/// rendre le verrou et mourir pendant qu'on le regarde : l'Arc le garde,
+/// comme le `rcu_read_lock` autour de l'`owner` chez Linux), et son
+/// adresse dans un atomique, lisible sans verrou, pour voir sans le
+/// prendre qu'il a changé (rendu, ou remis à un autre). Options écartées :
+/// tourner interruptions coupées (voir plus haut) ; tourner un temps fixe
+/// (on ne sait pas si le détenteur avance) ; la file MCS de Linux
+/// (`osq_lock`), qui n'en laisse tourner qu'un par verrou : nos tâches
+/// prêtes se comptent sur les doigts.
+static PRISES_EN_TOURNANT: AtomicU64 = AtomicU64::new(0);
+static SOMMEILS: AtomicU64 = AtomicU64::new(0);
+
+/// Combien de fois un verrou qui dort a été pris en tournant, et combien
+/// de fois une tâche s'est endormie dessus, depuis la dernière lecture
+/// (`make verrous`, et le test du démarrage).
+pub fn compteurs_des_verrous_qui_dorment() -> (u64, u64) {
+    (PRISES_EN_TOURNANT.swap(0, Ordering::Relaxed), SOMMEILS.swap(0, Ordering::Relaxed))
+}
+
+/// Pour `make verrous` : ces compteurs, pour `quoi` (le démarrage, un
+/// programme).
+#[cfg(feature = "verrous")]
+pub fn afficher_compteurs(quoi: impl core::fmt::Display) {
+    let (tours, sommeils) = compteurs_des_verrous_qui_dorment();
+    crate::afficherln!("[verrous] {} : verrous qui dorment pris en tournant {} fois, en dormant {} fois.", quoi, tours, sommeils);
+}
+
+/// Peut-on tourner ici (« tourner d'abord ») ? Jamais interruptions
+/// coupées, ni sur un seul processeur (le détenteur ne s'y exécute pas).
+fn peut_tourner() -> bool {
+    cpu::interruptions_actives() && processeur::nombre() > 1
+}
+
+/// Combien de temps on tourne au plus : 25 µs, le plafond de l'heuristique
+/// de Linux pour tourner sur des lecteurs (`rwsem_rspin_threshold`). Sur
+/// un détenteur, Linux ne se borne pas : il s'en remet à `need_resched` et
+/// à `vcpu_is_preempted` (l'hyperviseur lui dit si le processeur virtuel
+/// du détenteur est suspendu), que QEMU sans KVM ne fournit pas. Écart
+/// mesuré : sans borne, les programmes de `make tests-qemu` mettaient
+/// 27,5 s au lieu de 23,5 s sous QEMU (des sections critiques longues : une
+/// ligne écrite sur le port série, la copie d'une lecture de fichier,
+/// pendant lesquelles un processeur tournait au lieu d'exécuter une autre
+/// tâche prête) ; bornée à 20 µs ou à 100 µs, 23,5 s, comme sans tourner
+/// du tout. Le tour ne doit payer que les sections courtes, les seules où
+/// il gagne ses deux bascules. Sans TSC fiable, l'heure est au tic : la
+/// borne devient le prochain tic, 1 ms au plus (le `sched_clock` de Linux
+/// sur un TSC instable suit de même les jiffies).
+const TOUR_AU_PLUS_NS: u64 = 25_000;
+
+/// Tourne tant que `d`, vu tenir le verrou, le tient encore (`qui` le dit
+/// toujours), s'exécute sur un autre processeur, que personne n'attend,
+/// que ce processeur n'a pas à céder et que `TOUR_AU_PLUS_NS` n'est pas
+/// écoulé (l'horloge lue tous les 16 tours, le `!(++loop & 0xf)` de Linux).
+/// Vrai si le détenteur a changé (le verrou est peut-être libre : à revoir
+/// sous le verrou de l'état), faux s'il faut se ranger. Préemption coupée
+/// par l'appelant. Relaxed partout : des indications, la décision se prend
+/// sous le verrou de l'état.
+fn tourner_sur(d: &Tache, qui: &AtomicPtr<Tache>, attendants: &AtomicU32) -> bool {
+    let debut = crate::temps::ns_monotone();
+    let mut tours = 0u32;
+    loop {
+        if !core::ptr::eq(qui.load(Ordering::Relaxed), d) {
+            return true;
+        }
+        if !d.est_sur_processeur() || attendants.load(Ordering::Relaxed) != 0 || processeur::besoin_de_ceder() {
+            return false;
+        }
+        tours = tours.wrapping_add(1);
+        if tours & 0xf == 0 && crate::temps::ns_monotone().wrapping_sub(debut) > TOUR_AU_PLUS_NS {
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+}
+
+/// Dort jusqu'à ce que celui qui rend le verrou nous le REMETTE en nous
+/// sortant de la file (`dans_la_file` le lit sous le verrou de l'état) :
+/// tant qu'on y est, on ne l'a pas. Un sommeil ininterruptible n'a pas
+/// d'autre réveil ; revérifier ne coûte rien. « Je vais dormir » reposé à
+/// chaque tour : un réveil resté d'un tour précédent ferait sinon revenir
+/// `dormir` aussitôt, sans fin. Interruptions coupées par l'appelant.
+fn dormir_jusqu_a_la_remise(t: &Tache, dans_la_file: impl Fn() -> bool) {
+    SOMMEILS.fetch_add(1, Ordering::Relaxed);
+    loop {
+        dormir(None, Sommeil::Ininterruptible);
+        if !dans_la_file() {
+            break;
+        }
+        t.preparer_sommeil(Sommeil::Ininterruptible);
+        if !dans_la_file() {
+            break;
+        }
+    }
+    t.reveille();
+}
+
+/// On va peut-être dormir : jamais sous un verrou court, ni dans un
+/// gestionnaire d'interruption (le `might_sleep` de Linux). `ordonnancer`
+/// refuserait le premier aussi, mais plus loin, sans dire qui ; ici, la
+/// panique nomme l'appelant.
+#[track_caller]
+fn on_va_peut_etre_dormir() {
+    let tenus = crate::verrou::tenus();
+    assert!(tenus == 0, "verrou qui dort pris sous {} verrou(s) court(s)", tenus);
+    assert!(!crate::interruptions::dans_une_interruption(), "verrou qui dort pris dans un gestionnaire d'interruption");
+    // Ni entre « je vais dormir » et `dormir` : prendre un verrou qui dort
+    // remet l'état « en cours », et le sommeil prévu serait perdu (le « do
+    // not call blocking ops when !TASK_RUNNING » du `__might_sleep` de
+    // Linux ; trouvé en 6j dans `poll`).
+    assert!(tache::courante().sommeil_non_prepare(), "verrou qui dort pris entre \"je vais dormir\" et dormir");
+}
+
 /// Un verrou qui DORT (le `mutex` de Linux) : une tâche qui le trouve pris
-/// s'endort au lieu de boucler, et celui qui le rend réveille la première
-/// qui attend. Pour ce qui peut durer (écrire une ligne sur le port série),
-/// et jamais dans un gestionnaire d'interruption, ni sous un Verrou (on ne
-/// dort pas en tenant un verrou qui coupe les interruptions). Il ne coupe
-/// pas les interruptions : la tâche qui le tient peut être préemptée.
+/// tourne d'abord si le détenteur s'exécute ailleurs (voir plus haut), puis
+/// s'endort, et celui qui le rend le REMET à la première qui attend (6j ;
+/// jusque-là il le marquait libre et la réveillait, et un nouveau venu
+/// pouvait passer devant elle). Pour ce qui peut durer (écrire une ligne
+/// sur le port série), et jamais dans un gestionnaire d'interruption, ni
+/// sous un Verrou (on ne dort pas en tenant un verrou qui coupe les
+/// interruptions). Il ne coupe pas les interruptions : la tâche qui le
+/// tient peut être préemptée.
 pub struct Mutex<T> {
     etat: Verrou<EtatMutex>,
+    /// Qui le tient (nul : libre), lisible sans le verrou de l'état par qui
+    /// tourne (« tourner d'abord ») ; écrit sous lui, où `detenteur` tient
+    /// l'Arc de la même tâche.
+    qui: AtomicPtr<Tache>,
+    /// Combien attendent dans la file : qui tourne se range dès qu'il y en
+    /// a un. Écrit sous le verrou de l'état.
+    attendants: AtomicU32,
     donnee: UnsafeCell<T>,
 }
 
 struct EtatMutex {
-    pris: bool,
     file: FileAttente,
+    /// Qui le tient : l'Arc qui le garde en vie pour qui tourne dessus.
+    detenteur: Option<Arc<Tache>>,
 }
 
-// SAFETY: la donnée n'est touchée qu'à travers une GardeMutex, et `pris`
-// garantit qu'il n'en existe qu'une à la fois.
+// SAFETY: la donnée n'est touchée qu'à travers une GardeMutex, et le
+// détenteur, posé sous le verrou de l'état, garantit qu'il n'en existe
+// qu'une à la fois.
 unsafe impl<T: Send> Sync for Mutex<T> {}
 
 impl<T> Mutex<T> {
     pub const fn new(donnee: T) -> Mutex<T> {
-        Mutex { etat: Verrou::new(EtatMutex { pris: false, file: FileAttente::new() }), donnee: UnsafeCell::new(donnee) }
-    }
-
-    /// Prend le verrou, en dormant tant qu'il est pris.
-    pub fn verrouiller(&self) -> GardeMutex<'_, T> {
-        let t = tache::courante();
-        loop {
-            let interruptions = cpu::couper_interruptions();
-            // « Je vais dormir » avant de regarder (l'en-tête) : qui rend le
-            // verrou le marque libre, puis nous réveille.
-            t.preparer_sommeil(Sommeil::Ininterruptible);
-            {
-                let mut e = self.etat.verrouiller();
-                if !e.pris {
-                    e.pris = true;
-                    drop(e);
-                    t.reveille();
-                    if interruptions {
-                        cpu::activer_interruptions();
-                    }
-                    return GardeMutex { mutex: self };
-                }
-                // Exclusive : celui qui le rend n'en réveille qu'une, la
-                // première arrivée.
-                e.file.inscrire_exclusive();
-            }
-            dormir(None, Sommeil::Ininterruptible);
-            self.etat.verrouiller().file.retirer(t);
-            if interruptions {
-                cpu::activer_interruptions();
-            }
+        Mutex {
+            etat: Verrou::new(EtatMutex { file: FileAttente::new(), detenteur: None }),
+            qui: AtomicPtr::new(core::ptr::null_mut()),
+            attendants: AtomicU32::new(0),
+            donnee: UnsafeCell::new(donnee),
         }
     }
-}
 
-impl<T> Mutex<T> {
+    /// Prend le verrou : en tournant, puis en dormant, tant qu'il est pris.
+    #[track_caller]
+    pub fn verrouiller(&self) -> GardeMutex<'_, T> {
+        on_va_peut_etre_dormir();
+        let t = tache::courante();
+        if self.tourner(t) {
+            return GardeMutex { mutex: self };
+        }
+        let interruptions = cpu::couper_interruptions();
+        // « Je vais dormir » avant de regarder (l'en-tête).
+        t.preparer_sommeil(Sommeil::Ininterruptible);
+        {
+            let mut e = self.etat.verrouiller();
+            if self.qui.load(Ordering::Relaxed).is_null() {
+                self.donner(&mut e, tache::courante_arc());
+                drop(e);
+                t.reveille();
+                if interruptions {
+                    cpu::activer_interruptions();
+                }
+                return GardeMutex { mutex: self };
+            }
+            // Exclusive, en queue : celui qui le rend le remet à la première
+            // arrivée.
+            e.file.inscrire_exclusive();
+            self.attendants.fetch_add(1, Ordering::Relaxed);
+        }
+        dormir_jusqu_a_la_remise(t, || self.etat.verrouiller().file.contient(t));
+        if interruptions {
+            cpu::activer_interruptions();
+        }
+        GardeMutex { mutex: self }
+    }
+
+    /// Le donne à `a`, sous le verrou de l'état.
+    fn donner(&self, e: &mut EtatMutex, a: Arc<Tache>) {
+        self.qui.store(Arc::as_ptr(&a).cast_mut(), Ordering::Relaxed);
+        e.detenteur = Some(a);
+    }
+
+    /// Tourne tant que le détenteur s'exécute ailleurs (« tourner
+    /// d'abord »), et prend le verrou s'il est rendu pendant ce temps : vrai
+    /// alors. Faux s'il faut se ranger.
+    fn tourner(&self, moi: &Tache) -> bool {
+        if !peut_tourner() {
+            return false;
+        }
+        processeur::sans_preemption(|| {
+            let mut a_tourne = false;
+            loop {
+                let detenteur = {
+                    let mut e = self.etat.verrouiller();
+                    // Quelqu'un attend : derrière lui (remis, jamais pris).
+                    if self.attendants.load(Ordering::Relaxed) != 0 {
+                        return false;
+                    }
+                    if self.qui.load(Ordering::Relaxed).is_null() {
+                        self.donner(&mut e, tache::courante_arc());
+                        if a_tourne {
+                            PRISES_EN_TOURNANT.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return true;
+                    }
+                    e.detenteur.clone()
+                };
+                // Pris : il a un détenteur (`donner`). Nous-mêmes : un Mutex
+                // ne se reprend pas, l'interblocage se verra en dormant,
+                // nommé par le détecteur.
+                let Some(d) = detenteur else { return false };
+                if core::ptr::eq(Arc::as_ptr(&d), moi) || !tourner_sur(&d, &self.qui, &self.attendants) {
+                    return false;
+                }
+                a_tourne = true;
+            }
+        })
+    }
+
     /// Prend le verrou s'il est libre, sans dormir (le `mutex_trylock` de
     /// Linux) : possible sous un Verrou.
     pub fn essayer(&self) -> Option<GardeMutex<'_, T>> {
         let mut e = self.etat.verrouiller();
-        if e.pris {
+        if !self.qui.load(Ordering::Relaxed).is_null() {
             return None;
         }
-        e.pris = true;
+        self.donner(&mut e, tache::courante_arc());
         Some(GardeMutex { mutex: self })
     }
 }
@@ -943,9 +1139,22 @@ impl<T> DerefMut for GardeMutex<'_, T> {
 
 impl<T> Drop for GardeMutex<'_, T> {
     fn drop(&mut self) {
-        let mut e = self.mutex.etat.verrouiller();
-        e.pris = false;
-        e.file.reveiller_une();
+        let m = self.mutex;
+        let mut e = m.etat.verrouiller();
+        // Remis à la première qui attend, s'il y en a une : sortie de la
+        // file (la preuve qu'elle l'a reçu, comme au `VerrouLE`),
+        // détentrice, réveillée. Libre sinon.
+        match e.file.retirer_premiere() {
+            Some(t) => {
+                m.attendants.fetch_sub(1, Ordering::Relaxed);
+                m.donner(&mut e, t.clone());
+                tache::reveiller(t, Reveil::Reveillee);
+            }
+            None => {
+                e.detenteur = None;
+                m.qui.store(core::ptr::null_mut(), Ordering::Relaxed);
+            }
+        }
     }
 }
 
@@ -985,16 +1194,18 @@ impl<T> Drop for GardeMutex<'_, T> {
 /// autre écrivain, ou un lecteur qui arrive alors qu'il est libre) jusqu'à
 /// ce qu'il ait attendu 4 ms (RWSEM_WAIT_TIMEOUT : le drapeau HANDOFF le lui
 /// réserve alors). Le vol évite, sur plusieurs processeurs, d'attendre que
-/// la tâche réveillée soit choisie : celle qui tourne déjà continue. Sur un
-/// seul, il ne ferait gagner que la bascule vers elle, au prix d'un
-/// écrivain qui peut attendre 4 ms de plus ; la remise stricte coûte, elle,
-/// une bascule à chaque libération disputée entre écrivains (un « convoi »),
-/// et ne laisse jamais attendre personne plus que son rang. Écrit pour le
-/// relire simplement, et sans ce drapeau.
+/// la tâche réveillée soit choisie : celle qui tourne déjà continue. Chez
+/// nous, qui arrive tourne AVANT de se ranger (« tourner d'abord », avant
+/// le `Mutex`), tant que l'écrivain qui tient le verrou s'exécute : c'est
+/// là que Linux gagne l'essentiel. Une fois dans la file, la remise
+/// stricte coûte une bascule à chaque libération disputée entre écrivains
+/// (un « convoi »), et ne laisse jamais attendre personne plus que son
+/// rang. Écrit pour le relire simplement, et sans ce drapeau.
 ///
 /// Options écartées :
-///   - réveiller tout le monde et laisser chacun retenter (le `Mutex`
-///     d'ici, avec une seule passe) : les lecteurs se bousculeraient ;
+///   - réveiller et laisser retenter (ce que faisait le `Mutex` d'ici
+///     jusqu'à 6j, pour le premier de sa file) : les lecteurs se
+///     bousculeraient ;
 ///   - la priorité aux écrivains (un lecteur n'entre jamais tant qu'un
 ///     écrivain attend, même derrière des lecteurs) : ce sont alors les
 ///     lecteurs qui peuvent attendre sans fin ;
@@ -1008,23 +1219,36 @@ impl<T> Drop for GardeMutex<'_, T> {
 ///     jamais rien d'autre (pas de disque avant 6m, et une allocation qui
 ///     manque échoue au lieu d'attendre) : l'attente est toujours courte.
 ///     Avec le disque (6m).
-/// UNIPROCESSEUR : l'état est sous un `Verrou` court, et les interruptions
-/// coupées de la vérification au sommeil tiennent lieu de verrou (voir
-/// l'en-tête). Avec plusieurs processeurs, Linux fait d'abord tourner un
-/// écrivain qui arrive tant que celui qui tient le verrou s'exécute sur un
-/// autre processeur (`rwsem_optimistic_spin`) : il le prend en le volant à
-/// la libération, ce qui demande le vol et le drapeau HANDOFF de Linux à la
-/// place de la remise stricte des écrivains (6j).
+/// Un ÉCRIVAIN qui le trouve tenu par un écrivain qui s'exécute ailleurs
+/// tourne d'abord (« tourner d'abord », avant le `Mutex` : le
+/// `rwsem_optimistic_spin` de Linux, sans le vol). Un LECTEUR ne tourne
+/// pas, il se range : Linux l'a retiré en 5.11 (« locking/rwsem: Remove
+/// reader optimistic spinning » : le tour des lecteurs les favorisait aux
+/// dépens des écrivains, et ralentissait des programmes), et notre mesure
+/// le confirme : avec des lecteurs qui tournent, les programmes de test de
+/// `make tests-qemu` (dont `fautes`, quatre fils qui fautent face à deux
+/// qui changent la carte) mettaient 27,5 s au lieu de 24 s sous QEMU.
+/// L'écrivain ne tourne pas non plus sur des lecteurs (Linux, si : 10 à
+/// 25 µs, une heuristique) : ils ne sont pas notés.
 pub struct VerrouLE<T> {
     etat: Verrou<EtatLE>,
+    /// L'écrivain qui le tient (nul : aucun), lisible sans le verrou de
+    /// l'état par qui tourne ; écrit sous lui, où `detenteur` tient son
+    /// Arc. Les lecteurs qui le tiennent ne sont pas notés : nombreux,
+    /// peut-être endormis, on ne tourne pas sur eux (Linux non plus, hors
+    /// un essai borné).
+    ecrivain_qui: AtomicPtr<Tache>,
+    /// Combien attendent dans la file (écrit sous le verrou de l'état).
+    attendants: AtomicU32,
     donnee: UnsafeCell<T>,
 }
 
 struct EtatLE {
     /// Les lecteurs qui le tiennent.
     lecteurs: u32,
-    /// Un écrivain le tient.
-    ecrivain: bool,
+    /// L'écrivain qui le tient : l'Arc qui le garde en vie pour qui tourne
+    /// dessus.
+    detenteur: Option<Arc<Tache>>,
     /// Ceux qui attendent, dans l'ordre d'arrivée, marqués LECTEUR ou
     /// ECRIVAIN.
     file: FileAttente,
@@ -1047,49 +1271,103 @@ impl EtatLE {
     /// Peut-on le prendre tout de suite, pour `sorte` ? Libre pour elle, et
     /// personne qui attende (on ne passe pas devant la file).
     fn libre_pour(&self, sorte: u32) -> bool {
-        let libre = if sorte == LECTEUR { !self.ecrivain } else { !self.ecrivain && self.lecteurs == 0 };
+        let libre = self.detenteur.is_none() && (sorte == LECTEUR || self.lecteurs == 0);
         libre && !self.file.active()
     }
+}
 
-    /// Le prend pour `sorte`.
-    fn accorder(&mut self, sorte: u32) {
-        if sorte == LECTEUR {
-            self.lecteurs += 1;
-        } else {
-            self.ecrivain = true;
+impl<T> VerrouLE<T> {
+    pub const fn new(donnee: T) -> VerrouLE<T> {
+        VerrouLE {
+            etat: Verrou::new(EtatLE { lecteurs: 0, detenteur: None, file: FileAttente::new() }),
+            ecrivain_qui: AtomicPtr::new(core::ptr::null_mut()),
+            attendants: AtomicU32::new(0),
+            donnee: UnsafeCell::new(donnee),
         }
+    }
+
+    /// Le donne pour `sorte` à la tâche `a`, sous le verrou de l'état.
+    fn accorder(&self, e: &mut EtatLE, sorte: u32, a: Arc<Tache>) {
+        if sorte == LECTEUR {
+            e.lecteurs += 1;
+        } else {
+            self.ecrivain_qui.store(Arc::as_ptr(&a).cast_mut(), Ordering::Relaxed);
+            e.detenteur = Some(a);
+        }
+    }
+
+    /// L'écrivain le lâche (il le rend, ou devient lecteur).
+    fn lacher_ecriture(&self, e: &mut EtatLE) {
+        e.detenteur = None;
+        self.ecrivain_qui.store(core::ptr::null_mut(), Ordering::Relaxed);
+    }
+
+    /// Sort de la file la première tâche de marque `marque`, qui va
+    /// recevoir le verrou.
+    fn sortir(&self, e: &mut EtatLE, marque: u32) -> Option<Arc<Tache>> {
+        let t = e.file.retirer_marquee(marque)?;
+        self.attendants.fetch_sub(1, Ordering::Relaxed);
+        Some(t)
     }
 
     /// Les lecteurs qui attendent reçoivent le verrou, tous ensemble (256
     /// au plus), où qu'ils soient dans la file : comptés d'abord, réveillés
     /// ensuite (ils ne s'exécuteront qu'après nous, interruptions coupées).
-    fn remettre_aux_lecteurs(&mut self) {
+    fn remettre_aux_lecteurs(&self, e: &mut EtatLE) {
         for _ in 0..LECTEURS_PAR_REVEIL {
-            let Some(t) = self.file.retirer_marquee(LECTEUR) else { break };
-            self.lecteurs += 1;
+            let Some(t) = self.sortir(e, LECTEUR) else { break };
+            e.lecteurs += 1;
             tache::reveiller(t, Reveil::Reveillee);
         }
     }
 
     /// Le verrou vient d'être rendu par le dernier qui le tenait : il passe
     /// à la file (le `rwsem_mark_wake` de Linux, RWSEM_WAKE_ANY).
-    fn passer_la_main(&mut self) {
-        match self.file.marque_en_tete() {
+    fn passer_la_main(&self, e: &mut EtatLE) {
+        match e.file.marque_en_tete() {
             Some(ECRIVAIN) => {
-                if let Some(t) = self.file.retirer_marquee(ECRIVAIN) {
-                    self.ecrivain = true;
+                if let Some(t) = self.sortir(e, ECRIVAIN) {
+                    self.accorder(e, ECRIVAIN, t.clone());
                     tache::reveiller(t, Reveil::Reveillee);
                 }
             }
-            Some(_) => self.remettre_aux_lecteurs(),
+            Some(_) => self.remettre_aux_lecteurs(e),
             None => {}
         }
     }
-}
 
-impl<T> VerrouLE<T> {
-    pub const fn new(donnee: T) -> VerrouLE<T> {
-        VerrouLE { etat: Verrou::new(EtatLE { lecteurs: 0, ecrivain: false, file: FileAttente::new() }), donnee: UnsafeCell::new(donnee) }
+    /// Pour un écrivain : tourne tant que l'écrivain qui le tient
+    /// s'exécute ailleurs (« tourner d'abord »), et le prend s'il devient
+    /// libre pendant ce temps : vrai alors. Faux s'il faut se ranger (dont :
+    /// des lecteurs le tiennent, on ne tourne pas sur eux).
+    fn tourner(&self, sorte: u32, moi: &Tache) -> bool {
+        if !peut_tourner() {
+            return false;
+        }
+        processeur::sans_preemption(|| {
+            let mut a_tourne = false;
+            loop {
+                let detenteur = {
+                    let mut e = self.etat.verrouiller();
+                    if e.libre_pour(sorte) {
+                        self.accorder(&mut e, sorte, tache::courante_arc());
+                        if a_tourne {
+                            PRISES_EN_TOURNANT.fetch_add(1, Ordering::Relaxed);
+                        }
+                        return true;
+                    }
+                    if self.attendants.load(Ordering::Relaxed) != 0 {
+                        return false;
+                    }
+                    e.detenteur.clone()
+                };
+                let Some(d) = detenteur else { return false };
+                if core::ptr::eq(Arc::as_ptr(&d), moi) || !tourner_sur(&d, &self.ecrivain_qui, &self.attendants) {
+                    return false;
+                }
+                a_tourne = true;
+            }
+        })
     }
 
     /// Le prend en lecture, en dormant tant qu'il le faut.
@@ -1128,7 +1406,7 @@ impl<T> VerrouLE<T> {
         let mut e = self.etat.verrouiller();
         let libre = e.libre_pour(sorte);
         if libre {
-            e.accorder(sorte);
+            self.accorder(&mut e, sorte, tache::courante_arc());
         }
         libre
     }
@@ -1136,21 +1414,18 @@ impl<T> VerrouLE<T> {
     /// Le prend pour `sorte`, en dormant tant qu'il le faut.
     #[track_caller]
     fn prendre(&self, sorte: u32) {
-        // On va peut-être dormir : jamais sous un verrou court, ni dans un
-        // gestionnaire d'interruption (le `might_sleep` de Linux).
-        // `ordonnancer` refuserait le premier aussi, mais plus loin, sans
-        // dire qui ; ici, la panique nomme l'appelant.
-        let tenus = crate::verrou::tenus();
-        assert!(tenus == 0, "verrou qui dort pris sous {} verrou(s) court(s)", tenus);
-        assert!(!crate::interruptions::dans_une_interruption(), "verrou qui dort pris dans un gestionnaire d'interruption");
-        let interruptions = cpu::couper_interruptions();
+        on_va_peut_etre_dormir();
         let t = tache::courante();
+        if sorte == ECRIVAIN && self.tourner(sorte, t) {
+            return;
+        }
+        let interruptions = cpu::couper_interruptions();
         // « Je vais dormir » avant de regarder (l'en-tête).
         t.preparer_sommeil(Sommeil::Ininterruptible);
         {
             let mut e = self.etat.verrouiller();
             if e.libre_pour(sorte) {
-                e.accorder(sorte);
+                self.accorder(&mut e, sorte, tache::courante_arc());
                 drop(e);
                 t.reveille();
                 if interruptions {
@@ -1159,23 +1434,11 @@ impl<T> VerrouLE<T> {
                 return;
             }
             e.file.inscrire_marquee(sorte);
+            self.attendants.fetch_add(1, Ordering::Relaxed);
         }
         // Celui qui le rend nous le remet en nous retirant de la file
-        // (`passer_la_main`) : tant qu'on y est, on ne l'a pas. Un sommeil
-        // ininterruptible n'a pas d'autre réveil ; revérifier ne coûte rien.
-        // « Je vais dormir » reposé à chaque tour : un réveil resté d'un
-        // tour précédent ferait sinon revenir `dormir` aussitôt, sans fin.
-        loop {
-            dormir(None, Sommeil::Ininterruptible);
-            if !self.etat.verrouiller().file.contient(t) {
-                break;
-            }
-            t.preparer_sommeil(Sommeil::Ininterruptible);
-            if !self.etat.verrouiller().file.contient(t) {
-                break;
-            }
-        }
-        t.reveille();
+        // (`passer_la_main`).
+        dormir_jusqu_a_la_remise(t, || self.etat.verrouiller().file.contient(t));
         if interruptions {
             cpu::activer_interruptions();
         }
@@ -1186,15 +1449,15 @@ impl<T> VerrouLE<T> {
         let mut e = self.etat.verrouiller();
         e.lecteurs -= 1;
         if e.lecteurs == 0 {
-            e.passer_la_main();
+            self.passer_la_main(&mut e);
         }
     }
 
     /// L'écrivain le rend.
     fn rendre_ecriture(&self) {
         let mut e = self.etat.verrouiller();
-        e.ecrivain = false;
-        e.passer_la_main();
+        self.lacher_ecriture(&mut e);
+        self.passer_la_main(&mut e);
     }
 }
 
@@ -1233,10 +1496,10 @@ impl<'a, T> GardeEcriture<'a, T> {
         // son Drop, la garde de lecture prend sa place.
         core::mem::forget(self);
         let mut e = verrou.etat.verrouiller();
-        e.ecrivain = false;
+        verrou.lacher_ecriture(&mut e);
         e.lecteurs += 1;
         if e.file.marque_en_tete() == Some(LECTEUR) {
-            e.remettre_aux_lecteurs();
+            verrou.remettre_aux_lecteurs(&mut e);
         }
         GardeLecture { verrou }
     }

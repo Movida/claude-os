@@ -508,6 +508,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         tache::courante().poser_affinite(affinite);
         ordonnanceur::affinite_changee(tache::courante());
         tester_parallele();
+        tester_tourner();
         tester_torture();
         reseau::configurer();
         tester_voisins();
@@ -680,6 +681,114 @@ fn tester_parallele() {
     }
 }
 
+/// Dort `ms` millisecondes (pour les tests).
+fn dormir_ms(ms: u64) {
+    let interruptions = cpu::couper_interruptions();
+    tache::courante().preparer_sommeil(attente::Sommeil::Ininterruptible);
+    attente::dormir(Some(temps::ns_monotone() + ms * 1_000_000), attente::Sommeil::Ininterruptible);
+    tache::courante().reveille();
+    if interruptions {
+        cpu::activer_interruptions();
+    }
+}
+
+/// Vérifie « tourner d'abord » (attente.rs, 6j) : une tâche du processeur
+/// 1 tient un verrou qui dort 15 µs en calculant (moins que la borne du
+/// tour) ; une tâche du processeur 0 le demande pendant ce temps et
+/// l'obtient en tournant, sans dormir. Vingt parties, dont au moins une
+/// gagnée ainsi (sous QEMU, une interruption au mauvais moment fait manquer
+/// les 15 µs : voir plus bas). Puis le détenteur dort 2 ms en le tenant :
+/// la demandeuse s'endort (on ne tourne pas sur un détenteur qui ne
+/// s'exécute pas). Un Mutex, puis un VerrouLE tenu et demandé en écriture
+/// (un lecteur, lui, ne tourne pas : attente.rs). Les compteurs sont ceux
+/// de tous les verrous qui dorment : personne d'autre n'en dispute un
+/// pendant ce test (init attend, les programmes ne sont pas lancés). Deux
+/// processeurs au moins.
+fn tester_tourner() {
+    if processeur::nombre() < 2 {
+        afficherln!("[noyau] Verrous qui dorment : un seul processeur, pas de tour a verifier.");
+        return;
+    }
+    static M: attente::Mutex<()> = attente::Mutex::new(());
+    static V: attente::VerrouLE<()> = attente::VerrouLE::new(());
+    static TENU: AtomicBool = AtomicBool::new(false);
+    static PRETE: AtomicBool = AtomicBool::new(false);
+    /// Le détenteur : sur le processeur 1, attend que la demandeuse soit en
+    /// place (elle doit demander PENDANT qu'il tient : les deux se
+    /// déplacent au rythme des tics), prend, le dit, garde le verrou en
+    /// calculant ou en dormant, le rend.
+    fn tenir<G>(prendre: impl FnOnce() -> G, dort: bool) {
+        aller_sur(1);
+        while !PRETE.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        let garde = prendre();
+        TENU.store(true, Ordering::Release);
+        if dort {
+            dormir_ms(2);
+        } else {
+            horloge::attendre_us(15);
+        }
+        drop(garde);
+    }
+    /// La demandeuse : sur le processeur 0, attend que le détenteur tienne
+    /// le verrou, puis le demande.
+    fn demander<G>(prendre: impl FnOnce() -> G) {
+        aller_sur(0);
+        PRETE.store(true, Ordering::Release);
+        while !TENU.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        drop(prendre());
+    }
+    // Une partie : (prises en tournant, sommeils) ; None si une tâche n'a
+    // pu être lancée.
+    let jouer = |detenteur: fn(), demandeuse: fn()| -> Option<(u64, u64)> {
+        TENU.store(false, Ordering::Relaxed);
+        PRETE.store(false, Ordering::Relaxed);
+        attente::compteurs_des_verrous_qui_dorment();
+        let d = tache::lancer_noyau(programmes::NomCourt::de(b"detenteur"), detenteur);
+        let q = tache::lancer_noyau(programmes::NomCourt::de(b"demandeuse"), demandeuse);
+        for t in [&d, &q].into_iter().flatten() {
+            tache::attendre(t);
+        }
+        (d.is_some() && q.is_some()).then(attente::compteurs_des_verrous_qui_dorment)
+    };
+    // Le détenteur qui calcule : vingt parties, dont au moins une prise en
+    // tournant. Sous QEMU, une interruption (un tic : des dizaines de µs)
+    // entre « il tient » et le tour, ou pendant le tour, fait manquer les
+    // 15 µs du détenteur ou dépasser la borne du tour, et la demandeuse
+    // trouve le verrou libre (0/0) ou dort (0/1) : le hasard des
+    // interruptions, pas le mécanisme, qu'une partie sur vingt suffit à
+    // montrer (mesuré : une partie unique échouait un démarrage sur dix).
+    const PARTIES: u32 = 20;
+    let compter = |detenteur: fn(), demandeuse: fn()| -> Option<u32> {
+        let mut prises = 0;
+        for _ in 0..PARTIES {
+            if jouer(detenteur, demandeuse)? == (1, 0) {
+                prises += 1;
+            }
+        }
+        Some(prises)
+    };
+    let mutex_tours = compter(|| tenir(|| M.verrouiller(), false), || demander(|| M.verrouiller()));
+    let mutex_dort = jouer(|| tenir(|| M.verrouiller(), true), || demander(|| M.verrouiller()));
+    let le_tours = compter(|| tenir(|| V.ecrire(), false), || demander(|| V.ecrire()));
+    let le_dort = jouer(|| tenir(|| V.ecrire(), true), || demander(|| V.ecrire()));
+    // Sans TSC fiable (-cpu qemu64), l'heure est au tic : les 15 µs du
+    // détenteur et la borne du tour finissent au même tic, et la demandeuse
+    // trouve toujours le verrou libre sans avoir tourné ni dormi (0/0).
+    // Seules les parties où il dort se vérifient alors.
+    let heure_fine = tsc::khz().is_some();
+    let dort = |r: Option<(u64, u64)>| r == Some((0, 1));
+    let tourne = |n: Option<u32>| n.is_some_and(|n| n >= 1);
+    let ok = dort(mutex_dort) && dort(le_dort) && (!heure_fine || (tourne(mutex_tours) && tourne(le_tours)));
+    let (md, ld) = (mutex_dort.unwrap_or((9, 9)), le_dort.unwrap_or((9, 9)));
+    afficherln!("[noyau] Verrous qui dorment : pris en tournant quand le detenteur calcule ailleurs, en dormant quand il dort : {} (Mutex {} prises en tournant sur {} parties, puis {}/{} ; VerrouLE {} sur {}, puis {}/{}{}).",
+                if ok { "ok" } else { "ECHEC" }, mutex_tours.unwrap_or(0), PARTIES, md.0, md.1, le_tours.unwrap_or(0), PARTIES, ld.0, ld.1,
+                if heure_fine { "" } else { " ; heure au tic : le tour s'arrete au tic, non verifie" });
+}
+
 /// Vérifie le protocole de sommeil (attente.rs, tache.rs) : « je vais
 /// dormir » posé, une tâche PRÉEMPTÉE (elle calcule 5 ms, le tic la
 /// remplace) ne quitte pas la file des prêtes, trouve ensuite sa condition
@@ -784,15 +893,6 @@ fn tester_verrou_le() {
         let i = PAS.fetch_add(1, Ordering::AcqRel);
         if let Some(j) = JOURNAL.get(i) {
             j.store(lettre, Ordering::Relaxed);
-        }
-    }
-    fn dormir_ms(ms: u64) {
-        let interruptions = cpu::couper_interruptions();
-        tache::courante().preparer_sommeil(attente::Sommeil::Ininterruptible);
-        attente::dormir(Some(temps::ns_monotone() + ms * 1_000_000), attente::Sommeil::Ininterruptible);
-        tache::courante().reveille();
-        if interruptions {
-            cpu::activer_interruptions();
         }
     }
     // Attend (une seconde au plus) que `vrai` le devienne.

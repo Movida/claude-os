@@ -145,7 +145,9 @@ pub fn demarrer() {
         .count();
     afficherln!("[noyau] Lancement : {}, {} commandes.", Nom(DEMARRAGE), commandes);
     // Ce que le démarrage a fait des verrous, avant le premier programme
-    // (make verrous).
+    // (make verrous) : les verrous qui dorment, puis les courts.
+    #[cfg(feature = "verrous")]
+    crate::attente::afficher_compteurs("Demarrage");
     #[cfg(feature = "verrous")]
     crate::verrou::statistiques::afficher("Demarrage");
     let mut l = Lanceur::new(commandes);
@@ -532,7 +534,10 @@ impl Lanceur {
             afficherln!("[noyau] Programmes en parallele : memoire rendue : {}.", rendue());
         }
         // Ce que les verrous ont fait pendant ce programme (et ceux qui
-        // tournaient avec lui), depuis l'affichage précédent.
+        // tournaient avec lui), depuis l'affichage précédent : ceux qui
+        // dorment, puis les courts.
+        #[cfg(feature = "verrous")]
+        crate::attente::afficher_compteurs(&nom_du_programme);
         #[cfg(feature = "verrous")]
         crate::verrou::statistiques::afficher(nom_du_programme);
     }

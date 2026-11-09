@@ -24,7 +24,8 @@ mesure contre le TSC), 1000 Hz, vecteur 0xec ; PIT arrete.
 [noyau] Preemption coupee : une tache qui calcule 10 ms n'est pas remplacee, puis l'est des qu'elle la retablit : ok.
 [noyau] Preemption en rendant un verrou : une tache qui doit ceder cede des qu'elle rend son verrou, pas au tic suivant : ok.
 [noyau] Sommeil : une tache preemptee entre "je vais dormir" et sa condition n'est pas perdue, un reveil venu avant son sommeil n'est pas perdu : ok.
-[noyau] Parallele : quatre taches de 50 ms sur 4 processeurs finies en 
+[noyau] Parallele : quatre taches de 50 ms sur 4 processeurs finies en
+[noyau] Verrous qui dorment : pris en tournant quand le detenteur calcule ailleurs, en dormant quand il dort : ok (
 [noyau] Torture : 4 taches sur 4 processeurs, 100000 prises d'un Verrou chacune (ok) ; un Mutex repasse 20000 fois (ok) ; 8000 reveils croises, aucun perdu (ok).
 [noyau] Verrou qui dort en lecture et ecriture : les lecteurs passent ensemble, un ecrivain qui attend n'est pas double, retrogradation : ok (EeLLllFfMmGDNdn).
 [noyau] Carte de la memoire (E820)
