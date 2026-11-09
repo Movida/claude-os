@@ -577,8 +577,10 @@ fn tester_ordonnanceur() {
     // préemption coupée ne doit pas être remplacée (le compteur d'une
     // autre, prête, ne bouge pas : sur un seul processeur, l'autre n'a pas
     // d'autre moyen de s'exécuter ; avec plusieurs, les deux sont
-    // épinglées sur le même, 6j), puis l'est dès qu'elle la rétablit. Le
-    // tic, lui, passe encore (il compte le temps de calcul qui sert ici).
+    // épinglées sur le même, 6j), puis l'est dès qu'elle la rétablit :
+    // sur-le-champ, avant son pas suivant (le point de préemption de
+    // `retablir_preemption`, 6j). Le tic, lui, passe encore (il compte le
+    // temps de calcul qui sert ici).
     static TEMOIN: AtomicU64 = AtomicU64::new(0);
     static FINI: AtomicBool = AtomicBool::new(false);
     static RESULTAT: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
@@ -590,9 +592,15 @@ fn tester_ordonnanceur() {
             }
         };
         let avant = TEMOIN.load(Ordering::Relaxed);
-        processeur::sans_preemption(calculer_10_ms);
-        RESULTAT[0].store(TEMOIN.load(Ordering::Relaxed) == avant, Ordering::Relaxed);
-        calculer_10_ms();
+        // Le témoin est lu AVANT de rétablir la préemption : la rétablir
+        // cède le processeur sur-le-champ, et D aurait déjà bougé le témoin.
+        let pendant = processeur::sans_preemption(|| {
+            calculer_10_ms();
+            TEMOIN.load(Ordering::Relaxed)
+        });
+        RESULTAT[0].store(pendant == avant, Ordering::Relaxed);
+        // Dès qu'elle la rétablit : D, dont le tour est venu depuis
+        // longtemps, s'est exécutée avant que C ne fasse ce pas-ci.
         RESULTAT[1].store(TEMOIN.load(Ordering::Relaxed) != avant, Ordering::Relaxed);
         FINI.store(true, Ordering::Relaxed);
     });
@@ -608,6 +616,36 @@ fn tester_ordonnanceur() {
     let ok = c.is_some() && d.is_some() && RESULTAT.iter().all(|r| r.load(Ordering::Relaxed));
     afficherln!("[noyau] Preemption coupee : une tache qui calcule 10 ms n'est pas remplacee, puis l'est des qu'elle la retablit : {}.",
                 if ok { "ok" } else { "ECHEC" });
+
+    // Préempter en rendant un verrou (6j, verrou.rs) : une tâche dont le
+    // « besoin de céder » a été levé pendant qu'elle tenait un Verrou cède
+    // dès qu'elle le rend, pas au tic suivant (le `preempt_enable` du
+    // `spin_unlock` de Linux). Le lever sous un Verrou sans dépendre d'un
+    // choix de l'EEVDF (un réveil ne passe devant la courante que si elle
+    // n'est plus protégée, ce qui dépend de l'instant) : la tâche
+    // s'interdit son propre processeur, ce que fait un fil qui se déplace
+    // par sched_setaffinity (ordonnanceur.rs, l'affinité) ; le verrou
+    // rendu, elle doit déjà s'exécuter ailleurs (le processeur 1, inactif,
+    // la tire à son prochain tic). Deux processeurs au moins.
+    if processeur::nombre() >= 2 {
+        static VERROU: verrou::Verrou<()> = verrou::Verrou::new(());
+        static APRES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+        let e = tache::lancer_noyau(programmes::NomCourt::de(b"migre-verrou"), || {
+            let t = tache::courante();
+            let garde = VERROU.verrouiller();
+            t.poser_affinite(1 << 1);
+            ordonnanceur::affinite_changee(t);
+            drop(garde);
+            APRES.store(processeur::sans_preemption(|| processeur::courant().numero), Ordering::Relaxed);
+        });
+        if let Some(e) = &e {
+            tache::attendre(e);
+        }
+        afficherln!("[noyau] Preemption en rendant un verrou : une tache qui doit ceder cede des qu'elle rend son verrou, pas au tic suivant : {}.",
+                    if e.is_some() && APRES.load(Ordering::Relaxed) == 1 { "ok" } else { "ECHEC" });
+    } else {
+        afficherln!("[noyau] Preemption en rendant un verrou : un seul processeur, rien a deplacer.");
+    }
 }
 
 /// Vérifie que les processeurs travaillent ensemble (6j) : quatre tâches du
@@ -833,8 +871,16 @@ fn tester_verrou_le() {
     ok &= lancer(b"verrou-g", || {
         let g = V.ecrire();
         noter(b'G');
-        let g = g.retrograder();
-        noter(b'D');
+        // Rétrograder réveille N, et rendre le verrou de l'état cède le
+        // processeur sur-le-champ si N passe devant G (6j, verrou.rs) : N
+        // noterait sa lettre avant celle-ci. Préemption coupée le temps de
+        // noter : le journal garde un ordre fixe (N passe à la fin du bloc,
+        // ou au premier sommeil de G).
+        let g = processeur::sans_preemption(|| {
+            let g = g.retrograder();
+            noter(b'D');
+            g
+        });
         attendre_que(|| ENTRE.load(Ordering::Acquire));
         noter(b'd');
         RENDU.store(true, Ordering::Release);

@@ -276,6 +276,16 @@ impl<T> Drop for Garde<'_, T> {
             #[cfg(feature = "verrous")]
             statistiques::noter(&self.debut);
             cpu::activer_interruptions();
+            // Le point de préemption du `spin_unlock` de Linux (son
+            // `preempt_enable`) : une tâche réveillée sous le verrou qui
+            // devrait passer avant nous (ordonnanceur.rs a levé « besoin de
+            // céder ») prend le processeur maintenant, au lieu d'attendre le
+            // tic suivant ou le retour vers l'anneau 3 ; seulement si plus
+            // rien ne l'empêche (processeur.rs : aucun verrou, pas dans une
+            // interruption, préemption permise).
+            if processeur::besoin_de_ceder() && processeur::preemptible() {
+                crate::ordonnanceur::preempter();
+            }
         }
     }
 }

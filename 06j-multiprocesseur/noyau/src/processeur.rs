@@ -301,12 +301,20 @@ pub fn couper_preemption() {
     unsafe { asm!("add dword ptr gs:[{}], 1", const offset_of!(Processeur, preemption), options(nostack)) };
 }
 
-/// Rétablit la préemption. (Céder le processeur si une tâche l'attend, le
-/// `preempt_enable` complet de Linux : 6j, « préempter en rendant un
-/// verrou ».)
+/// Rétablit la préemption ; et si la tâche courante doit céder (un réveil
+/// fait préemption coupée a mis une tâche devant elle, un tic a fini sa
+/// tranche), que plus rien ne l'en empêche (aucun verrou, pas dans une
+/// interruption) et que les interruptions sont actives, elle cède
+/// maintenant : le point de préemption du `preempt_enable` de Linux
+/// (`preempt_schedule`). Sûr par le protocole de sommeil (attente.rs) : une
+/// préemption ne retire jamais la tâche de sa file, même entre « je vais
+/// dormir » et `dormir`.
 pub fn retablir_preemption() {
     // SAFETY: comme `couper_preemption`.
     unsafe { asm!("sub dword ptr gs:[{}], 1", const offset_of!(Processeur, preemption), options(nostack)) };
+    if besoin_de_ceder() && preemptible() && cpu::interruptions_actives() {
+        crate::ordonnanceur::preempter();
+    }
 }
 
 /// La préemption est-elle coupée sur ce processeur ? Lisible interruptions

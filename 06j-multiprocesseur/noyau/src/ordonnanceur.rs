@@ -46,10 +46,12 @@
 //! interruptions (verrou.rs) : « les interruptions étaient actives »
 //! garantit qu'aucun n'était tenu. La règle, vérifiée : ne jamais céder le
 //! processeur verrou tenu ni préemption coupée (`ordonnancer` panique,
-//! comme le « scheduling while atomic » de Linux). Écart avec Linux : il
-//! préempte aussi en rendant un verrou ; chez nous, un réveil fait dans le
-//! noyau ne prend effet qu'au retour vers l'anneau 3 ou au tic suivant
-//! (6j le reprend).
+//! comme le « scheduling while atomic » de Linux). Et, comme Linux (le
+//! `preempt_enable` de `spin_unlock`), en RENDANT le dernier `Verrou` tenu
+//! ou en rétablissant la préemption (verrou.rs, processeur.rs) : une tâche
+//! réveillée sous un verrou, qui devrait passer avant la courante, prend le
+//! processeur dès qu'il est rendu, au lieu d'attendre le tic suivant ou le
+//! retour vers l'anneau 3 (ce qu'elle faisait jusqu'à 6j).
 //!
 //! DORMIR OU ÊTRE PRÉEMPTÉE (6j) : `ordonnancer` dit pourquoi on l'appelle
 //! (`Bascule`). Pour un SOMMEIL, la tâche courante quitte la file des

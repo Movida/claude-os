@@ -22,6 +22,7 @@ mesure contre le TSC), 1000 Hz, vecteur 0xec ; PIT arrete.
 [noyau] Ordonnanceur EEVDF : tranche de 0.70 ms, preemption du noyau.
 [noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : ok
 [noyau] Preemption coupee : une tache qui calcule 10 ms n'est pas remplacee, puis l'est des qu'elle la retablit : ok.
+[noyau] Preemption en rendant un verrou : une tache qui doit ceder cede des qu'elle rend son verrou, pas au tic suivant : ok.
 [noyau] Sommeil : une tache preemptee entre "je vais dormir" et sa condition n'est pas perdue, un reveil venu avant son sommeil n'est pas perdu : ok.
 [noyau] Parallele : quatre taches de 50 ms sur 4 processeurs finies en 
 [noyau] Torture : 4 taches sur 4 processeurs, 100000 prises d'un Verrou chacune (ok) ; un Mutex repasse 20000 fois (ok) ; 8000 reveils croises, aucun perdu (ok).
