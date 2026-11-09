@@ -310,12 +310,12 @@ pub fn socket(famille: u64, sorte: u64, protocole: u64) -> i64 {
 /// mémoire.
 fn creer(p: Protocole, sorte: i32, proto: u16, uid: u32, place: ArcVide<Socket>) -> Result<Arc<Socket>, i64> {
     let s = match p {
-        Protocole::Tcp => Socket::new(p, sorte as u16, proto, uid).tcp(),
+        Protocole::Tcp => Socket::new(p, sorte as u16, proto, uid).and_then(Socket::tcp),
         Protocole::Unix => {
             let u = unix::Sorte::de(sorte as u16).ok_or(-ESOCKTNOSUPPORT)?;
-            Socket::new(p, u.linux(), proto, uid).unix(u)
+            Socket::new(p, u.linux(), proto, uid).and_then(|s| s.unix(u))
         }
-        _ => Some(Socket::new(p, sorte as u16, proto, uid)),
+        _ => Socket::new(p, sorte as u16, proto, uid),
     };
     let s = place.remplir(s.ok_or(-ENOBUFS)?);
     if p == Protocole::Unix {

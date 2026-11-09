@@ -45,7 +45,7 @@
 //! la `struct file`.
 
 use crate::appels_fichiers::{FichierTenu, installer_fichier_puis, tenir, tenir_ouvert};
-use crate::attente::{self, EntreeAttente, FileAttente, Mutex, Rappel, Sommeil};
+use crate::attente::{self, EntreeRappel, FileAttente, Mutex, Rappel, Sommeil};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur, dans_les_bornes};
 use crate::descripteurs::{Fichier, FichierOuvert, Ouverts, Prive, Sorte, Tenu};
 use crate::partage::{Arc, Weak};
@@ -57,7 +57,7 @@ use crate::{cpu, pages, signaux, temps, vfs};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering::{Relaxed, SeqCst}};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering::{Relaxed, SeqCst}};
 use fichiers::montages::Objet;
 
 const EPERM: i64 = 1;
@@ -147,15 +147,13 @@ struct Prets {
     debordement: Vec<Arc<Element>>,
 }
 
-/// Une entrée d'élément dans la file d'un fichier (l'`eppoll_entry` de
-/// Linux). Un fichier en a deux au plus (un tube : sa file de lecteurs et
-/// celle d'écrivains) : l'élément les porte, sans allocation.
-struct EntreeElement {
-    entree: EntreeAttente,
-    /// La file où elle est inscrite (le `whead`).
-    file: AtomicPtr<FileAttente>,
-    /// Son élément (le `base`).
-    element: AtomicPtr<Element>,
+/// Le rappel des entrées d'un élément dans les files de son fichier
+/// (l'`eppoll_entry` de Linux, son `base`) : l'élément, par un Weak (il
+/// est dans un Arc). Un fichier a deux files au plus (un tube : celle des
+/// lecteurs et celle des écrivains) : deux entrées par élément (attente.rs,
+/// `EntreeRappel`), dans leurs boîtes.
+struct RappelElement {
+    element: Weak<Element>,
 }
 
 /// Un élément d'epoll (l'`epitem` de Linux) : le couple (fichier ouvert,
@@ -178,7 +176,9 @@ pub struct Element {
     deborde: AtomicBool,
     /// Son fichier est fermé, ou il a été retiré : plus rien ne le touche.
     mourant: AtomicBool,
-    entrees: [EntreeElement; 2],
+    /// Ses entrées (None : la mémoire a manqué à sa création, et il n'a
+    /// pas été gardé).
+    entrees: [Option<Pin<alloc::boxed::Box<EntreeRappel<RappelElement>>>>; 2],
     inscrites: AtomicUsize,
 }
 
@@ -453,14 +453,11 @@ impl Element {
     /// Ses entrées retirées des files (`ep_unregister_pollwait`).
     fn desinscrire(&self) {
         let n = self.inscrites.swap(0, Relaxed);
-        for e in &self.entrees[..n] {
-            let file = e.file.load(Relaxed);
-            // SAFETY: la file vit tant que son fichier est ouvert, et une
-            // entrée est retirée avant qu'il ne soit fermé (à DEL, ou à sa
-            // fermeture, sous le verrou des fichiers).
-            if let Some(f) = unsafe { file.as_ref() } {
-                f.enlever(&e.entree);
-            }
+        // La file vit tant que son fichier est ouvert, et une entrée est
+        // retirée avant qu'il ne soit fermé (à DEL, ou à sa fermeture, sous
+        // le verrou des fichiers).
+        for e in self.entrees[..n].iter().flatten() {
+            e.retirer();
         }
     }
 
@@ -515,12 +512,13 @@ impl Element {
     }
 }
 
-impl Rappel for EntreeElement {
+impl Rappel for RappelElement {
     fn rappel(&self, cle: u32) -> bool {
-        // SAFETY: l'élément contient l'entrée, et vit tant qu'elle est
-        // inscrite (il est retiré des files avant d'être rendu).
-        let e = unsafe { &*self.element.load(Relaxed) };
-        e.reveil(cle)
+        // L'élément vit tant que l'entrée est inscrite (il est retiré des
+        // files avant d'être rendu : `desinscrire`, qui attend ce verrou de
+        // la file) : l'Arc pris ici n'est jamais le dernier, et le rendre
+        // ne détruit rien sous le verrou de la file.
+        self.element.upgrade().is_some_and(|e| e.reveil(cle))
     }
 }
 
@@ -534,18 +532,12 @@ struct Inscription<'a> {
 impl Inscrire for Inscription<'_> {
     fn inscrire(&mut self, file: &FileAttente, _tenu: &FichierTenu, _cle: u32) {
         let n = self.element.inscrites.load(Relaxed);
-        let Some(e) = self.element.entrees.get(n) else {
+        let Some(e) = self.element.entrees.get(n).and_then(Option::as_ref) else {
             self.echec = true;
             return;
         };
-        e.file.store(file as *const FileAttente as *mut FileAttente, Relaxed);
-        let qui: *const dyn Rappel = e;
         let exclusive = self.element.evenements.load(Relaxed) & EPOLLEXCLUSIVE != 0;
-        // SAFETY: l'entrée est dans l'élément, qui est dans un Arc (il ne
-        // bouge pas) et n'est rendu qu'après `desinscrire`.
-        unsafe { e.entree.preparer_rappel(qui, exclusive) };
-        // SAFETY: comme ci-dessus.
-        file.ajouter(unsafe { Pin::new_unchecked(&e.entree) });
+        e.as_ref().inscrire(file, exclusive);
         self.element.inscrites.store(n + 1, Relaxed);
     }
 }
@@ -791,12 +783,13 @@ fn inserer(ep: &Epoll, elements: &mut Vec<Arc<Element>>, e: &FichierTenu, cible:
         lie: AtomicBool::new(false),
         deborde: AtomicBool::new(false),
         mourant: AtomicBool::new(false),
-        entrees: [const { EntreeElement { entree: EntreeAttente::new(), file: AtomicPtr::new(core::ptr::null_mut()), element: AtomicPtr::new(core::ptr::null_mut()) } }; 2],
+        entrees: core::array::from_fn(|_| EntreeRappel::nouveau(RappelElement { element: moi.clone() })),
         inscrites: AtomicUsize::new(0),
     });
     let Ok(x) = x else { return -ENOMEM };
-    for en in &x.entrees {
-        en.element.store(Arc::as_ptr(&x) as *mut Element, Relaxed);
+    // Une boîte a manqué : l'élément (jamais inscrit) est rendu.
+    if x.entrees.iter().any(Option::is_none) {
+        return -ENOMEM;
     }
     let attache = vfs::avec_systeme(|s, _| {
         let f = s.ouverts.fichier(cible.fichier());

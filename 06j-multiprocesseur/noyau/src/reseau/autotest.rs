@@ -49,7 +49,7 @@ fn fragmentation(source: [u8; 4], destination: [u8; 4], protocole: u8, port_sour
 }
 
 fn creer(protocole: Protocole, sorte: u16, proto: u16) -> Option<Arc<Socket>> {
-    let s = Socket::new(protocole, sorte, proto, 0);
+    let s = Socket::new(protocole, sorte, proto, 0)?;
     let s = if protocole == Protocole::Tcp { s.tcp()? } else { s };
     Some(ArcVide::new().ok()?.remplir(s))
 }

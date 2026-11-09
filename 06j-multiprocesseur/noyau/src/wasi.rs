@@ -291,7 +291,7 @@ impl Ecoutes {
         const ENOBUFS_: i64 = 105;
         self.0.try_reserve(1).map_err(|_| -ENOMEM_)?;
         let place = ArcVide::new().map_err(|_| -ENFILE_)?;
-        let s = Socket::new(Protocole::Tcp, tcp::SOCK_STREAM as u16, tcp::IPPROTO_TCP as u16, qui.uid).tcp().ok_or(-ENOBUFS_)?;
+        let s = Socket::new(Protocole::Tcp, tcp::SOCK_STREAM as u16, tcp::IPPROTO_TCP as u16, qui.uid).and_then(Socket::tcp).ok_or(-ENOBUFS_)?;
         let s = place.remplir(s);
         // Liée, la socket est dans la table des ports : un refus doit la
         // fermer, pour qu'elle en sorte.

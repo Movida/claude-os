@@ -203,6 +203,17 @@ struct Liste {
 // restent à leur place tant qu'elles y sont (dans leur tâche, ou épinglées).
 unsafe impl Send for Liste {}
 
+impl Drop for FileAttente {
+    /// Une file détruite avec des entrées arrêterait le noyau plus tard,
+    /// sans dire pourquoi (une entrée de rappel qui s'en retire,
+    /// `EntreeRappel::retirer`, écrirait dans une mémoire rendue) : on
+    /// l'arrête tout de suite, en le disant. C'est ce qui rend
+    /// `EntreeRappel::inscrire` sûr (voir là).
+    fn drop(&mut self) {
+        assert!(self.liste.get_mut().tete.is_null(), "file d'attente detruite avec des entrees");
+    }
+}
+
 impl Liste {
     /// Inscrit `e` : en tête si elle est ordinaire, en queue si elle est
     /// exclusive.
@@ -772,20 +783,24 @@ pub trait PorteFile {
 /// Épinglé dans sa boîte (`nouveau` le rend ainsi) : la file le désigne par
 /// son adresse. Inscrit dans une seule file à la fois ; l'objet de cette
 /// file est tenu (son Arc) tant qu'il y est : il ne peut pas disparaître
-/// sous lui. La cible, elle, doit vivre autant que le relais : celle de
-/// l'objet qui le contient. Retiré à sa destruction. La file écoutée ne
-/// doit contenir QUE des relais (la `peer_wait` de Linux, à part de la
-/// file de l'objet) : un relais qui réveillerait une file où d'autres
-/// relais sont inscrits pourrait boucler.
+/// sous lui. La cible aussi est tenue, par un Arc (la file de l'objet qui
+/// contient le relais vit dans un Arc, reseau/socket.rs) : jusqu'à la
+/// relecture de 6j, un pointeur brut, que l'appelant devait promettre
+/// valable ; tenue, elle ne peut pas être rendue sous le rappel, et
+/// `inscrire` est sûr au sens de Rust. Retiré à sa destruction. La file
+/// écoutée ne doit contenir QUE des relais (la `peer_wait` de Linux, à
+/// part de la file de l'objet) : un relais qui réveillerait une file où
+/// d'autres relais sont inscrits pourrait boucler.
 pub struct Relais<T: PorteFile + 'static> {
     entree: EntreeAttente,
-    cible: Cell<*const FileAttente>,
+    cible: UnsafeCell<Option<Arc<FileAttente>>>,
     chez: Verrou<Option<Arc<T>>>,
 }
 
 // SAFETY: `entree` et `cible` ne sont touchées que par `inscrire` et
-// `retirer` (sous le verrou `chez`) et par le rappel (sous le verrou de la
-// file écoutée, où le relais n'est inscrit qu'entre les deux).
+// `retirer` (sous le verrou `chez`, avant d'entrer dans la file écoutée ou
+// après en être sorti) et par le rappel (sous le verrou de la file écoutée,
+// où le relais n'est inscrit qu'entre les deux) : jamais deux à la fois.
 unsafe impl<T: PorteFile + Send + Sync> Sync for Relais<T> {}
 // SAFETY: voir ci-dessus.
 unsafe impl<T: PorteFile + Send + Sync> Send for Relais<T> {}
@@ -793,14 +808,14 @@ unsafe impl<T: PorteFile + Send + Sync> Send for Relais<T> {}
 impl<T: PorteFile + 'static> Relais<T> {
     /// Un relais neuf, pas inscrit, dans sa boîte ; None : plus de mémoire.
     pub fn nouveau() -> Option<Pin<alloc::boxed::Box<Relais<T>>>> {
-        let r = Relais { entree: EntreeAttente::new(), cible: Cell::new(core::ptr::null()), chez: Verrou::new(None) };
+        let r = Relais { entree: EntreeAttente::new(), cible: UnsafeCell::new(None), chez: Verrou::new(None) };
         crate::faillible::boite(r).ok().map(alloc::boxed::Box::into_pin)
     }
 
     /// Inscrit le relais dans la file de `chez`, pour réveiller `cible`
-    /// (une file de l'objet qui contient le relais). Déjà inscrit chez lui :
-    /// rien ; ailleurs : retiré d'abord.
-    pub fn inscrire(self: Pin<&Self>, chez: &Arc<T>, cible: &FileAttente) {
+    /// (une file de l'objet qui contient le relais, tenue tant qu'il y est
+    /// inscrit). Déjà inscrit chez lui : rien ; ailleurs : retiré d'abord.
+    pub fn inscrire(self: Pin<&Self>, chez: &Arc<T>, cible: &Arc<FileAttente>) {
         let ancien = {
             let mut c = self.chez.verrouiller();
             if c.as_ref().is_some_and(|a| Arc::ptr_eq(a, chez)) {
@@ -810,7 +825,8 @@ impl<T: PorteFile + 'static> Relais<T> {
             if let Some(a) = &ancien {
                 a.file_ecoutee().enlever(&self.entree);
             }
-            self.cible.set(cible);
+            // SAFETY: sous `chez`, hors de toute file (voir `Sync`).
+            unsafe { *self.cible.get() = Some(cible.clone()) };
             let qui: *const dyn Rappel = &*self;
             // SAFETY: le relais est épinglé (il ne bougera pas), et il se
             // retire de la file avant d'être détruit (`Drop`).
@@ -827,15 +843,20 @@ impl<T: PorteFile + 'static> Relais<T> {
 
     /// Retire le relais de la file où il est inscrit, s'il l'est.
     pub fn retirer(&self) {
-        let ancien = {
+        let (ancien, cible) = {
             let mut c = self.chez.verrouiller();
             let ancien = c.take();
             if let Some(a) = &ancien {
                 a.file_ecoutee().enlever(&self.entree);
             }
-            ancien
+            // SAFETY: sous `chez`, sorti de la file (voir `Sync`).
+            let cible = unsafe { (*self.cible.get()).take() };
+            (ancien, cible)
         };
+        // Rendus hors du verrou (le dernier Arc de l'un ou de l'autre
+        // pourrait le détruire).
         drop(ancien);
+        drop(cible);
     }
 }
 
@@ -843,10 +864,9 @@ impl<T: PorteFile + 'static> Rappel for Relais<T> {
     /// La file écoutée est réveillée : la cible l'est à son tour, avec la
     /// même clé.
     fn rappel(&self, cle: u32) -> bool {
-        let c = self.cible.get();
-        // SAFETY: la cible est une file de l'objet qui contient le relais,
-        // posée avant l'inscription, et qui vit autant que lui.
-        if let Some(c) = unsafe { c.as_ref() } {
+        // SAFETY: sous le verrou de la file écoutée, où le relais est inscrit
+        // (voir `Sync`) : `cible` a été posée avant, et ne bouge plus.
+        if let Some(c) = unsafe { (*self.cible.get()).as_ref() } {
             c.reveiller(cle, 0);
         }
         false
@@ -854,6 +874,80 @@ impl<T: PorteFile + 'static> Rappel for Relais<T> {
 }
 
 impl<T: PorteFile + 'static> Drop for Relais<T> {
+    fn drop(&mut self) {
+        self.retirer();
+    }
+}
+
+/// Une entrée de rappel SÛRE (6j) : elle porte son rappel `R` et sait dans
+/// quelle file elle est ; `inscrire` l'y met, `retirer` ou sa disparition
+/// (`Drop`) l'en sort. Dans sa boîte, épinglée (`nouveau`) : la file la
+/// désigne par son adresse. Sûre au sens de Rust : aucun usage, même
+/// maladroit, ne peut en faire un comportement indéfini.
+///   - `R: 'static` : ce que `R` désigne vit au moins autant qu'elle, même
+///     oubliée (`mem::forget` d'une boîte épinglée ne rend jamais sa
+///     mémoire : l'entrée reste dans la file, valable, une fuite et rien
+///     de plus) ; `R` ne porte que des Arc ou des Weak (epoll.rs ;
+///     sondage.rs met son `Attente` dans un Arc). Un emprunt plus court
+///     aurait pu pendre après un `forget` (la relecture de 6j).
+///   - la file vit tant que l'entrée y est : le possesseur tient son
+///     fichier (sondage.rs, dans `R`) ou retire ses entrées avant qu'il ne
+///     se ferme (epoll.rs) ; et une file détruite avec des entrées arrête
+///     le noyau (`FileAttente::drop`) au lieu de laisser une entrée désigner
+///     une mémoire rendue.
+/// Ainsi epoll.rs et sondage.rs n'ont plus d'`unsafe` (jusqu'à 6j, ils
+/// inscrivaient leurs entrées par des pointeurs bruts) : ce qu'il faut
+/// vérifier est ici, en un seul endroit. Option écartée : des entrées
+/// rangées par blocs de seize dans leur possesseur (le `poll_table_page` de
+/// Linux, ce que faisait sondage.rs) : il faudrait projeter l'épinglage du
+/// bloc sur chacune de ses entrées (ce que fait la crate `pin-project`), et
+/// une boîte par entrée est plus simple à relire ; par blocs si une mesure
+/// le demande (`claude` sonde par epoll, dont les éléments durent).
+pub struct EntreeRappel<R: Rappel + 'static> {
+    entree: EntreeAttente,
+    /// La file où elle est inscrite (nulle : aucune). Un atomique : epoll
+    /// retire les entrées d'un élément depuis la fermeture de son fichier,
+    /// une autre tâche que celle qui les inscrit.
+    file: AtomicPtr<FileAttente>,
+    rappel: R,
+}
+
+impl<R: Rappel + 'static> EntreeRappel<R> {
+    /// Une entrée neuve, pas inscrite, dans sa boîte ; None : plus de
+    /// mémoire.
+    pub fn nouveau(rappel: R) -> Option<Pin<alloc::boxed::Box<EntreeRappel<R>>>> {
+        let e = EntreeRappel { entree: EntreeAttente::new(), file: AtomicPtr::new(core::ptr::null_mut()), rappel };
+        crate::faillible::boite(e).ok().map(alloc::boxed::Box::into_pin)
+    }
+
+    /// L'inscrit dans `file`, exclusive ou non (voir `FileAttente`) ; déjà
+    /// inscrite ailleurs : retirée d'abord.
+    pub fn inscrire(self: Pin<&Self>, file: &FileAttente, exclusive: bool) {
+        self.retirer();
+        let qui: *const (dyn Rappel + 'static) = &self.rappel;
+        // SAFETY: le rappel est dans l'entrée, épinglée (elle ne bougera
+        // pas), qui se retire de sa file avant de disparaître (`Drop`), ou
+        // n'en disparaît jamais si elle est oubliée ; et `R: 'static` : la
+        // file ne désignera jamais un rappel mort.
+        unsafe { self.entree.preparer_rappel(qui, exclusive) };
+        self.file.store(core::ptr::from_ref(file).cast_mut(), Ordering::Relaxed);
+        // SAFETY: l'entrée est un champ d'une valeur épinglée (`self`), que
+        // rien ne déplace.
+        file.ajouter(unsafe { Pin::new_unchecked(&self.entree) });
+    }
+
+    /// La retire de sa file, si elle y est.
+    pub fn retirer(&self) {
+        let file = self.file.swap(core::ptr::null_mut(), Ordering::Relaxed);
+        // SAFETY: la file est celle d'un fichier que le possesseur tient
+        // tant que l'entrée y est (voir le type) : elle existe encore.
+        if let Some(f) = unsafe { file.as_ref() } {
+            f.enlever(&self.entree);
+        }
+    }
+}
+
+impl<R: Rappel + 'static> Drop for EntreeRappel<R> {
     fn drop(&mut self) {
         self.retirer();
     }

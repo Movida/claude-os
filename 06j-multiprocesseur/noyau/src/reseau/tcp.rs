@@ -1730,11 +1730,12 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             // La place de la socket neuve d'abord : sans mémoire, la fille
             // reste dans la file, pour un prochain accept (ENFILE, comme le
             // `sock_alloc` de `do_accept`).
-            let (Ok(place_flux), Ok(place_socket), Ok(retenue)) = (faillible::boite_vide(), ArcVide::new(), Arc::new(Retenue::new(filles[i].numero))) else { return Err(-ENFILE) };
+            let (Ok(place_flux), Ok(place_socket), Ok(retenue), Some(enfant)) =
+                (faillible::boite_vide(), ArcVide::new(), Arc::new(Retenue::new(filles[i].numero)), Socket::new(Protocole::Tcp, SOCK_STREAM as u16, IPPROTO_TCP as u16, s.uid))
+            else { return Err(-ENFILE) };
             let f = filles.remove(i).expect("la fille");
             let (port, distante, port_distant, locale) = (f.tcb.port_local, f.distante, f.tcb.port_distant, f.locale);
             let numero = f.numero;
-            let enfant = Socket::new(Protocole::Tcp, SOCK_STREAM as u16, IPPROTO_TCP as u16, s.uid);
             let enfant = enfant.avec_numero(numero);
             // Une fille fermée avant l'accept (un RST) a déjà quitté la
             // table : sa lecture dira son erreur.

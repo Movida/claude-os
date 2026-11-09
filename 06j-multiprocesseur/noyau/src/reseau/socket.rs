@@ -287,8 +287,10 @@ pub struct Socket {
     pub proto: u16,
     /// L'utilisateur qui l'a créée (SO_REUSEPORT ; un port privilégié).
     pub uid: u32,
-    /// Qui attend : `recv`, `poll`, epoll (le `sk_wq`).
-    pub attente: FileAttente,
+    /// Qui attend : `recv`, `poll`, epoll (le `sk_wq`). Dans un Arc : le
+    /// relais d'une socket AF_UNIX (unix.rs, attente.rs) la tient comme
+    /// cible tant qu'il est inscrit chez son pair.
+    pub attente: Arc<FileAttente>,
     pub reception: Verrou<Reception>,
     pub appels: Mutex<Inet>,
     /// SO_RCVBUF et SO_SNDBUF (lus par la tâche du réseau sans le Mutex).
@@ -322,12 +324,13 @@ pub struct Socket {
 }
 
 impl Socket {
-    /// Une socket neuve, sans port.
-    pub fn new(protocole: Protocole, sorte: u16, proto: u16, uid: u32) -> Socket {
-        Socket {
+    /// Une socket neuve, sans port ; None : plus de mémoire (pour sa file
+    /// d'attente).
+    pub fn new(protocole: Protocole, sorte: u16, proto: u16, uid: u32) -> Option<Socket> {
+        Some(Socket {
             numero: NUMEROS.fetch_add(1, Ordering::Relaxed),
             protocole, sorte, proto, uid,
-            attente: FileAttente::new(),
+            attente: Arc::new(FileAttente::new()).ok()?,
             reception: Verrou::new(Reception { file: VecDeque::new(), erreurs: VecDeque::new(), octets: 0, erreur: 0, arret: 0 }),
             appels: Mutex::new(Inet {
                 lie: false, adresse: [0; 4], port: 0, port_choisi: false, adresse_choisie: false, connecte: false,
@@ -344,7 +347,7 @@ impl Socket {
             suivante: Verrou::new(None),
             flux: None,
             unix: None,
-        }
+        })
     }
 
     /// La liste O_ASYNC de la socket : celle qui suit la réception (`socket_wq`).

@@ -753,7 +753,7 @@ pub fn ecouter(s: &Socket, backlog: i32) -> Result<(), i64> {
 /// ou l'autre bout d'une paire) ; inscrite.
 fn neuve(s: &Socket, sorte: Sorte) -> Result<Arc<Socket>, i64> {
     let place = crate::partage::ArcVide::new().map_err(|_| -ENOBUFS)?;
-    let n = Socket::new(super::socket::Protocole::Unix, sorte.linux(), s.proto, s.uid).unix(sorte).ok_or(-ENOBUFS)?;
+    let n = Socket::new(super::socket::Protocole::Unix, sorte.linux(), s.proto, s.uid).ok_or(-ENOBUFS)?.unix(sorte).ok_or(-ENOBUFS)?;
     let n = place.remplir(n);
     inscrire(&n)?;
     Ok(n)

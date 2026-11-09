@@ -116,19 +116,12 @@ mod copie_utilisateur;
 // liées (des listes intrusives), les valeurs partagées.
 #[allow(unsafe_code)]
 mod attente;
-// epoll.rs et sondage.rs : leurs entrées de rappel dans les files
-// d'attente ; une interface sûre dans attente.rs les sortira d'ici, avec
-// 6j (« Reste à faire »).
-#[allow(unsafe_code)]
-mod epoll;
 #[allow(unsafe_code)]
 mod irq;
 #[allow(unsafe_code)]
 mod ordonnanceur;
 #[allow(unsafe_code)]
 mod partage;
-#[allow(unsafe_code)]
-mod sondage;
 #[allow(unsafe_code)]
 mod verrou;
 
@@ -145,6 +138,7 @@ mod cadre_signal;
 mod carte_memoire;
 mod chargeur_elf;
 mod descripteurs;
+mod epoll;
 mod espace;
 mod evenements;
 mod faute_de_page;
@@ -160,6 +154,7 @@ mod reprise;
 mod reseau;
 mod rusage;
 mod signaux;
+mod sondage;
 mod surveillance;
 mod sysfs;
 mod tube;

@@ -36,7 +36,7 @@
 //! rendent ERESTARTNOHAND, et leur délai restant est déjà écrit.
 
 use crate::appels_fichiers::{FichierTenu, tenir};
-use crate::attente::{self, EntreeAttente, FileAttente, Rappel, Sommeil};
+use crate::attente::{self, EntreeRappel, FileAttente, Rappel, Sommeil};
 use crate::faillible::{self, VecFaillible};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::descripteurs::Sorte;
@@ -155,89 +155,53 @@ struct Attente {
     declenchee: core::sync::atomic::AtomicBool,
 }
 
-/// Une entrée de sondage (la `poll_table_entry` de Linux), inscrite dans la
-/// file d'un fichier.
-struct EntreeSondage {
-    entree: EntreeAttente,
-    /// La file où elle est inscrite (le `wait_address`).
-    file: *const FileAttente,
-    /// Ce qu'elle attend (le `key`).
+/// Le rappel d'une entrée de sondage (la `poll_table_entry` de Linux),
+/// inscrite dans la file d'un fichier : ce qu'elle attend (le `key`), le
+/// fichier, tenu tant qu'elle est inscrite (sa file ne disparaît pas), et
+/// l'attente dont elle fait partie, par un Arc : une entrée oubliée ne
+/// désignerait jamais une attente rendue (`R: 'static`, attente.rs).
+struct RappelSondage {
     cle: u32,
-    /// Le fichier, tenu tant qu'elle est inscrite : sa file ne disparaît pas.
     _tenu: FichierTenu,
-    /// L'attente dont elle fait partie.
-    attente: *const Attente,
+    attente: Arc<Attente>,
 }
 
-impl Rappel for EntreeSondage {
+impl Rappel for RappelSondage {
     /// Le `pollwake` de Linux : rien si la clé ne l'intéresse pas ; sinon
     /// l'attente est déclenchée, et sa tâche réveillée.
     fn rappel(&self, cle: u32) -> bool {
         if cle != 0 && cle & self.cle == 0 {
             return false;
         }
-        // SAFETY: l'attente vit plus longtemps que ses entrées (`Entrees`
-        // l'emprunte, et retire ses entrées avant de la rendre).
-        let a = unsafe { &*self.attente };
-        a.declenchee.store(true, core::sync::atomic::Ordering::SeqCst);
-        tache::reveiller(a.tache.clone(), Reveil::Reveillee)
+        self.attente.declenchee.store(true, core::sync::atomic::Ordering::SeqCst);
+        tache::reveiller(self.attente.tache.clone(), Reveil::Reveillee)
     }
 }
 
-/// Les entrées par bloc : un bloc de 16 tient dans un objet du tas de 2 Kio.
-const PAR_BLOC: usize = 16;
-
-/// Les entrées d'une attente, par blocs alloués au besoin (comme les pages de
-/// `poll_table_page` de Linux). Un bloc a sa capacité dès sa création et
-/// n'est jamais agrandi : une entrée inscrite y reste à sa place.
-struct Entrees<'a> {
-    attente: &'a Attente,
-    blocs: Vec<Vec<EntreeSondage>>,
+/// Les entrées d'une attente, chacune dans sa boîte épinglée (attente.rs,
+/// `EntreeRappel` : pourquoi pas par blocs). Quand elles disparaissent,
+/// chacune se retire de sa file, puis rend son fichier (le `poll_freewait`
+/// de Linux).
+struct Entrees {
+    attente: Arc<Attente>,
+    entrees: Vec<Pin<alloc::boxed::Box<EntreeRappel<RappelSondage>>>>,
     /// Plus de mémoire pour une entrée (le `error` de Linux) : ENOMEM si
     /// rien n'est prêt, plutôt qu'une attente qui ne serait pas réveillée.
     erreur: bool,
 }
 
-impl Entrees<'_> {
-    /// Le bloc où mettre l'entrée suivante.
-    fn place(&mut self) -> Option<&mut Vec<EntreeSondage>> {
-        if self.blocs.last().is_none_or(|b| b.len() == b.capacity()) {
-            let b = faillible::avec_capacite(PAR_BLOC).ok()?;
-            self.blocs.ajouter(b).ok()?;
-        }
-        self.blocs.last_mut()
-    }
-}
-
-impl Inscrire for Entrees<'_> {
+impl Inscrire for Entrees {
     /// Le `__pollwait` de Linux.
     fn inscrire(&mut self, file: &FileAttente, tenu: &FichierTenu, cle: u32) {
-        let attente: *const Attente = self.attente;
-        let Some(bloc) = self.place() else {
+        let Some(e) = EntreeRappel::nouveau(RappelSondage { cle, _tenu: tenu.dupliquer(), attente: self.attente.clone() }) else {
             self.erreur = true;
             return;
         };
-        // Dans la place du bloc : il ne grandit jamais (ses entrées, liées
-        // dans les files d'attente, ne doivent pas bouger).
-        bloc.ajouter_dans_la_place(EntreeSondage { entree: EntreeAttente::new(), file, cle, _tenu: tenu.dupliquer(), attente });
-        let Some(e) = bloc.last() else { return };
-        let qui: *const dyn Rappel = e;
-        // SAFETY: l'entrée est dans `e`, qui ne bouge plus (son bloc n'est
-        // jamais agrandi) et n'est rendu qu'après qu'elle a été retirée
-        // (`drop`).
-        unsafe { e.entree.preparer_rappel(qui, false) };
-        // SAFETY: comme ci-dessus.
-        file.ajouter(unsafe { Pin::new_unchecked(&e.entree) });
-    }
-}
-
-impl Drop for Entrees<'_> {
-    /// Le `poll_freewait` de Linux : chaque entrée retirée de sa file ; ses
-    /// fichiers rendus ensuite, avec les blocs.
-    fn drop(&mut self) {
-        for e in self.blocs.iter().flatten() {
-            // SAFETY: la file vit tant que l'entrée tient son fichier.
-            unsafe { (*e.file).enlever(&e.entree) };
+        e.as_ref().inscrire(file, false);
+        // Sans place dans la liste, l'entrée est rendue : elle se retire de
+        // la file en disparaissant.
+        if self.entrees.ajouter(e).is_err() {
+            self.erreur = true;
         }
     }
 }
@@ -293,8 +257,10 @@ pub fn delai_timespec(adresse: u64) -> Result<Delai, i64> {
 /// ce qui est prêt passe avant le signal). Un délai nul ne dort ni
 /// n'inscrit rien.
 pub fn attendre_prets(delai: Delai, mut tour: impl FnMut(&mut Table) -> usize) -> Result<usize, i64> {
-    let attente = Attente { tache: tache::courante_arc(), declenchee: core::sync::atomic::AtomicBool::new(false) };
-    let mut entrees = Entrees { attente: &attente, blocs: Vec::new(), erreur: false };
+    let Ok(attente) = Arc::new(Attente { tache: tache::courante_arc(), declenchee: core::sync::atomic::AtomicBool::new(false) }) else {
+        return Err(-ENOMEM);
+    };
+    let mut entrees = Entrees { attente: attente.clone(), entrees: Vec::new(), erreur: false };
     let mut fini = matches!(delai, Delai::Nul);
     let mut premier = !fini;
     let t = tache::courante();
