@@ -41,14 +41,24 @@ for etape in [0-9][0-9]*-*/; do
     # $options sans guillemets : plusieurs mots, un argument chacun.
     timeout "$duree" qemu-system-x86_64 -drive format=raw,file="$etape/boot.bin$disque" $options \
         -display none -no-reboot -serial file:"$etape/serial.log" 2>/dev/null
-    while IFS= read -r ligne; do
-        if grep -qF -- "$ligne" "$etape/serial.log"; then
-            echo "OK     $etape : $ligne"
-        else
-            echo "ECHEC  $etape : $ligne"
-            echec=1
-        fi
-    done < "$etape/attendu.txt"
+    # Chaque ligne attendue, cherchée telle quelle n'importe où dans le
+    # journal ; ou, depuis 6k, quand attendu.txt commence par « # Dans
+    # l'ordre », chacune après la précédente (voir verifier-ordre.awk : les
+    # commentaires, les lignes qui peuvent venir n'importe où, les parties
+    # qui changent d'un démarrage à l'autre). Les étapes d'avant gardent
+    # leur fichier, et la première façon.
+    if head -n 1 "$etape/attendu.txt" | grep -q "^# Dans l'ordre"; then
+        LC_ALL=C awk -v etape="$etape" -f verifier-ordre.awk "$etape/serial.log" "$etape/attendu.txt" || echec=1
+    else
+        while IFS= read -r ligne; do
+            if grep -qF -- "$ligne" "$etape/serial.log"; then
+                echo "OK     $etape : $ligne"
+            else
+                echo "ECHEC  $etape : $ligne"
+                echec=1
+            fi
+        done < "$etape/attendu.txt"
+    fi
     # Et aucun échec : le noyau dit « ok » ou « ECHEC » pour chacune de ses
     # vérifications, et « PANIQUE » s'il s'arrête. Une ligne attendue
     # trouvée n'importe où ne prouve pas qu'aucune autre n'a échoué
