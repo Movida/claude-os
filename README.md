@@ -8,7 +8,7 @@ Un OS x86 écrit de zéro, brique par brique, pour apprendre comment tout foncti
 
 ## Où en est le projet
 
-Claude répond : le binaire officiel de Claude Code, un ELF x86_64 dynamique chargé avec ld-linux et la glibc de la machine, sans aucune modification, répond à `claude -p bonjour` dans notre noyau, avec l'abonnement de David. Il passe par notre pile TCP/IP, y fait son TLS, surveille ses réglages par inotify et copie ses fichiers par `copy_file_range`. `claude --version` y tourne depuis 6d. La prochaine étape : le multiprocesseur (6j).
+Claude répond : le binaire officiel de Claude Code, un ELF x86_64 dynamique chargé avec ld-linux et la glibc de la machine, sans aucune modification, répond à `claude -p bonjour` dans notre noyau, avec l'abonnement de David. Il passe par notre pile TCP/IP, y fait son TLS, surveille ses réglages par inotify et copie ses fichiers par `copy_file_range`. `claude --version` y tourne depuis 6d. Depuis 6j, le noyau tourne sur quatre processeurs (une zone par processeur et `swapgs`, des verrous qui attendent vraiment, le vidage des TLB par IPI, une file des prêtes par processeur), et `claude -p` y répond en 18 s sous QEMU. La prochaine étape : le terminal (6k).
 
 ```
 [16 bits] Noyau lu sur le disque, recopie a 1 Mio en mode irreel.
@@ -44,8 +44,9 @@ Chaque étape est un dossier autonome avec son propre `Makefile`, et un tag `eta
 | `06g-reseau/` | PCI, virtio-net, Ethernet, IPv4, UDP, ICMP, DNS |
 | `06h-tcp/` | Le générateur aléatoire de Linux, TCP, AF_UNIX, les sockets de WASI |
 | `06i-claude-p/` | La première réponse de Claude : la mémoire sous un verrou qui dort, `sendfile` et `copy_file_range`, inotify |
+| `06j-multiprocesseur/` | Le multiprocesseur : les processeurs secondaires, `swapgs`, des verrous qui attendent vraiment, le vidage des TLB, une file des prêtes par processeur |
 
-La feuille de route complète (le multiprocesseur, le terminal, le shell, le disque…) est dans [`CLAUDE.md`](CLAUDE.md), et le récit des décisions dans [`HISTORIQUE.md`](HISTORIQUE.md).
+La feuille de route complète (le terminal, le shell, le disque…) est dans [`CLAUDE.md`](CLAUDE.md), et le récit des décisions dans [`HISTORIQUE.md`](HISTORIQUE.md).
 
 ## Essayer
 
