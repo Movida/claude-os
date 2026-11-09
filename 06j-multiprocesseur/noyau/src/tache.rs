@@ -1193,8 +1193,11 @@ fn quitter_espace() {
 /// appel système, qui ne voit rien de ce qui descend et remonte entre deux.
 const MOTIF_PILE: u64 = 0x5A5A_5A5A_5A5A_5A5A;
 
-/// La pile qui est descendue le plus bas, parmi celles des tâches finies.
+/// La pile qui est descendue le plus bas, parmi celles des tâches finies,
+/// et le nom de sa tâche (pour savoir quel chemin creuser quand la marge
+/// manque, 6j).
 static PILE_LA_PLUS_PROFONDE: AtomicUsize = AtomicUsize::new(0);
+static NOM_LA_PLUS_PROFONDE: Verrou<Option<NomCourt>> = Verrou::new(None);
 
 fn marquer_pile(p: &Pile) {
     // SAFETY: la pile vient d'être allouée, projetée tout entière, et à personne d'autre.
@@ -1215,9 +1218,10 @@ fn profondeur(p: &Pile) -> usize {
 /// La pile la plus profonde, parmi les tâches finies et la courante. Une tâche encore en
 /// vie n'est pas lue : son chemin (la tâche du réseau) est plus court que celui d'un appel
 /// système, qui passe aussi par le réseau.
-pub fn plus_grande_profondeur() -> usize {
+pub fn plus_grande_profondeur() -> (usize, Option<NomCourt>) {
     let ici = courante().pile.verrouiller().as_ref().map_or(0, profondeur);
-    PILE_LA_PLUS_PROFONDE.load(Ordering::Relaxed).max(ici)
+    let (finie, nom) = (PILE_LA_PLUS_PROFONDE.load(Ordering::Relaxed), *NOM_LA_PLUS_PROFONDE.verrouiller());
+    if ici > finie { (ici, Some(courante().nom())) } else { (finie, nom) }
 }
 
 /// La fin d'une bascule, dans la tâche qui reprend (ou démarre), avec la
@@ -1290,7 +1294,11 @@ fn rendeur() {
             // tout le corps).
             let pile = t.pile.verrouiller().take();
             if let Some(p) = pile {
-                PILE_LA_PLUS_PROFONDE.fetch_max(profondeur(&p), Ordering::Relaxed);
+                let profondeur = profondeur(&p);
+                if PILE_LA_PLUS_PROFONDE.fetch_max(profondeur, Ordering::Relaxed) < profondeur {
+                    let nom = t.nom();
+                    *NOM_LA_PLUS_PROFONDE.verrouiller() = Some(nom);
+                }
                 crate::vmalloc::ranger_pile(p);
             }
             // Un fil de programme : sa tâche rendue (si rien d'autre ne la

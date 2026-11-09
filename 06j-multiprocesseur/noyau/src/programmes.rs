@@ -235,9 +235,10 @@ pub fn demarrer() {
     crate::reseau::socket::fermer_les_differees();
     // La pile de 16 Kio a-t-elle encore de la marge ? Ce qu'elle a vu de pire, une fois tout
     // fait. Un quart de réserve, pour les chemins que ces programmes n'ont pas pris.
-    let (profondeur, taille) = (tache::plus_grande_profondeur(), crate::vmalloc::TAILLE_PILE as usize);
+    let ((profondeur, tache), taille) = (tache::plus_grande_profondeur(), crate::vmalloc::TAILLE_PILE as usize);
     let marge = if profondeur <= taille / 4 * 3 { "ok" } else { "ECHEC" };
-    afficherln!("[noyau] Piles du noyau : {} octets au plus, sur {}, il reste de la marge : {}.", profondeur, taille, marge);
+    afficherln!("[noyau] Piles du noyau : {} octets au plus ({}), sur {}, il reste de la marge : {}.", profondeur,
+                tache.unwrap_or(NomCourt::de(b"?")), taille, marge);
 }
 
 /// Lâche un dossier tenu par le lanceur (un inode du tmpfs).
@@ -1092,17 +1093,19 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     });
     let (pml4, depart) = (programme.memoire.tables().pml4(), programme.depart);
     let pid = processus::numero_neuf();
-    let entree = processus::ajouter(processus::Processus {
-        pid,
-        dossier: lancement.dossier,
-        racine: Objet::Tmpfs(racine),
-        umask: 0o022,
-        identite,
-        limites: processus::limites_par_defaut(),
-        signaux: crate::signaux::Signaux::new(),
-        fils: Vec::new(),
-        fin_de_groupe: None,
-    }, descripteurs, programme.memoire, nom);
+    let entree = crate::signaux::Signaux::new().and_then(|signaux| {
+        processus::ajouter(processus::Processus {
+            pid,
+            dossier: lancement.dossier,
+            racine: Objet::Tmpfs(racine),
+            umask: 0o022,
+            identite,
+            limites: processus::limites_par_defaut(),
+            signaux,
+            fils: Vec::new(),
+            fin_de_groupe: None,
+        }, descripteurs, programme.memoire, nom)
+    });
     // Son exécutable, pour /proc/<pid>/exe (procfs.rs fabrique son dossier
     // d'après la table des processus) : son chemin, et son inode, tenu par
     // le lancement, puis par le lanceur jusqu'au recueil.

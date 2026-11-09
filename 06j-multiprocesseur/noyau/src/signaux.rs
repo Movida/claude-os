@@ -360,7 +360,13 @@ const MINSIGSTKSZ: u64 = 2048;
 /// signal, et ceux envoyés au processus.
 pub struct Signaux {
     /// L'action de chaque signal (l'indice : le signal moins 1).
-    actions: [Action; NSIG as usize],
+    /// Les 64 actions (2 Kio), dans leur boîte : un `Processus` passe par
+    /// valeur de main en main à sa création (programmes.rs, puis
+    /// processus::ajouter, puis l'Arc de l'entrée), et chaque main en
+    /// gardait une copie sur la pile d'init, 4 Kio pour le lanceur, 3 Kio
+    /// pour l'ajout : la pile du noyau d'init atteignait 11,7 Kio sur 16
+    /// (mesuré, 6j) ; en boîte, 8,5.
+    actions: alloc::boxed::Box<[Action]>,
     /// Ceux qui attendent d'être livrés, envoyés au processus (le
     /// `shared_pending` de Linux).
     attente: EnAttente,
@@ -418,8 +424,13 @@ pub enum Destinataire {
 impl Signaux {
     /// Ceux d'un programme neuf : toutes les actions par défaut, rien en
     /// attente.
-    pub fn new() -> Signaux {
-        Signaux { actions: [Action::default(); NSIG as usize], attente: EnAttente::default() }
+    pub fn new() -> Option<Signaux> {
+        // Copiée d'une constante (en lecture seule dans l'image), jamais
+        // construite sur la pile.
+        const DEFAUT: Action = Action { gestionnaire: SIG_DFL, drapeaux: 0, restaurateur: 0, masque: 0 };
+        static PAR_DEFAUT: [Action; NSIG as usize] = [DEFAUT; NSIG as usize];
+        let actions = crate::faillible::boite_de_tranche(&PAR_DEFAUT).ok()?;
+        Some(Signaux { actions, attente: EnAttente::default() })
     }
 
     fn action(&self, sig: u64) -> &Action {
