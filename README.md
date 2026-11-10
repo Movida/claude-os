@@ -8,7 +8,7 @@ Un OS x86 écrit de zéro, brique par brique, pour apprendre comment tout foncti
 
 ## Où en est le projet
 
-Claude répond : le binaire officiel de Claude Code, un ELF x86_64 dynamique chargé avec ld-linux et la glibc de la machine, sans aucune modification, répond à `claude -p bonjour` dans notre noyau, avec l'abonnement de David. Il passe par notre pile TCP/IP, y fait son TLS, surveille ses réglages par inotify et copie ses fichiers par `copy_file_range`. `claude --version` y tourne depuis 6d. Depuis 6j, le noyau tourne sur quatre processeurs (une zone par processeur et `swapgs`, des verrous qui attendent vraiment, le vidage des TLB par IPI, une file des prêtes par processeur), et `claude -p` y répond en 18 s sous QEMU. La prochaine étape : le terminal (6k).
+Claude répond : le binaire officiel de Claude Code, un ELF x86_64 dynamique chargé avec ld-linux et la glibc de la machine, sans aucune modification, répond à `claude -p bonjour` dans notre noyau, avec l'abonnement de David. Il passe par notre pile TCP/IP, y fait son TLS, surveille ses réglages par inotify et copie ses fichiers par `copy_file_range`. `claude --version` y tourne depuis 6d. Depuis 6j, le noyau tourne sur quatre processeurs (une zone par processeur et `swapgs`, des verrous qui attendent vraiment, le vidage des TLB par IPI, une file des prêtes par processeur), et `claude -p` y répond en 18 s sous QEMU. La prochaine étape : le terminal (6k). Avant elle, les « soldes » ont réglé ce qui avait été mis de côté (la CI sous un Linux figé, les derniers écarts avec Linux, les allocations qui paniquaient encore, le vrai matériel vérifié sous QEMU) : leurs commits ouvrent `06k-terminal/`.
 
 ```
 [16 bits] Noyau lu sur le disque, recopie a 1 Mio en mode irreel.
