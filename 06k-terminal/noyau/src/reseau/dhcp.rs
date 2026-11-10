@@ -155,14 +155,55 @@ pub fn recu(i: &'static Interface, message: &[u8]) {
     }
 }
 
+/// La plus longue attente de la porteuse (`CONF_CARRIER_TIMEOUT`, le
+/// `carrier_timeout` de Linux : 120 s), et l'écart entre deux messages qui
+/// disent l'attente (20 s).
+const PORTEUSE_MAX: u64 = 120_000_000_000;
+const PORTEUSE_MESSAGE: u64 = 20_000_000_000;
+
+/// Attend que la carte `i` ait son lien (sa porteuse), comme `ic_open_devs`
+/// : par tranches d'une milliseconde (son `msleep(1)`), 120 s au plus, en
+/// disant toutes les 20 s combien il reste ; le lien qui revient est vu par
+/// l'interruption de configuration de la carte, dans la tâche du réseau
+/// (virtio_net.rs). Le début de l'attente est dit aussi (Linux ne dit rien
+/// avant 20 s) : `make tests-qemu` attend ce message pour rebrancher le
+/// câble.
+fn attendre_la_porteuse(i: &Interface) {
+    use core::sync::atomic::Ordering::Relaxed;
+    if i.lien.load(Relaxed) {
+        return;
+    }
+    afficherln!("[reseau] {} : lien coupe, attente de la porteuse ({} s au plus).", i.nom, PORTEUSE_MAX / 1_000_000_000);
+    let debut = temps::ns_monotone();
+    let mut message = debut + PORTEUSE_MESSAGE;
+    while !i.lien.load(Relaxed) {
+        let maintenant = temps::ns_monotone();
+        if maintenant >= debut + PORTEUSE_MAX {
+            return afficherln!("[reseau] {} : toujours pas de lien : le DHCP essaie quand meme.", i.nom);
+        }
+        if maintenant >= message {
+            afficherln!("[reseau] Attente du reseau : encore {} s au plus.",
+                        (PORTEUSE_MAX - (maintenant - debut) + 500_000_000) / 1_000_000_000);
+            message = maintenant + PORTEUSE_MESSAGE;
+        }
+        let interruptions = cpu::couper_interruptions();
+        tache::courante().preparer_sommeil(Sommeil::Ininterruptible);
+        attente::dormir(Some(maintenant + 1_000_000), Sommeil::Ininterruptible);
+        tache::courante().reveille();
+        if interruptions {
+            cpu::activer_interruptions();
+        }
+    }
+}
+
 /// Configure la première interface (eth0) par DHCP, et attend la fin :
 /// l'adresse obtenue, ou l'abandon. Dans la tâche du lanceur, avant
-/// /etc/demarrage. Sans interface, ou son câble débranché : rien.
+/// /etc/demarrage. Sans interface : rien. Son câble débranché : la porteuse
+/// d'abord, puis le DHCP, qu'elle soit venue ou non (Linux aussi : ses essais
+/// resteront alors sans réponse).
 pub fn configurer() {
     let Some(i) = interface::premiere_carte() else { return };
-    if !i.lien.load(core::sync::atomic::Ordering::Relaxed) {
-        return afficherln!("[reseau] {} : lien coupe, pas de DHCP.", i.nom);
-    }
+    attendre_la_porteuse(i);
     let mut hasard = [0u8; 12];
     aleatoire::obtenir(&mut hasard);
     let xid = u32::from_le_bytes([hasard[0], hasard[1], hasard[2], hasard[3]]);

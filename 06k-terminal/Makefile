@@ -1371,6 +1371,10 @@ $(WAST2JSON):
 #   - le câble débranché puis rebranché au moniteur (set_link) : chaque
 #     fois, l'interruption de configuration de la carte, par MSI-X, et le
 #     noyau le dit (6g) ;
+#   - le câble débranché avant le démarrage (QEMU arrêté par -S le temps
+#     de set_link), rebranché quand le noyau dit attendre la porteuse : le
+#     DHCP passe ensuite, comme celui de Linux (`ic_open_devs`, les soldes
+#     d'avant 6k) ;
 #   - une machine sans carte (-nic none : sans cette option, QEMU ajoute
 #     une e1000), et `passerelle sans-reseau` : le DNS de la glibc échoue
 #     vite, EAI_AGAIN (6g) ;
@@ -1478,6 +1482,16 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	ligne "eth0 : lien coupe" && echo "set_link n0 on" | nc -U -q1 $(MON_TESTS) >/dev/null && \
 	ligne "eth0 : lien retabli"; r=$$?; kill $$q 2>/dev/null; wait $$q 2>/dev/null; \
 	grep -F "eth0 : " test-lien.log; exit $$r
+	rm -f test-porteuse.log $(MON_TESTS); \
+	$(QEMU_TEST) -S -netdev user,id=n0 -device virtio-net-pci,netdev=n0 $(QEMU_ALEA) -drive format=raw,file=vide.bin \
+	  -serial file:test-porteuse.log -monitor unix:$(MON_TESTS),server,nowait & q=$$!; \
+	for i in $$(seq 50); do [ -S $(MON_TESTS) ] && break; sleep 0.1; done; \
+	printf 'set_link n0 off\ncont\n' | nc -U -q1 $(MON_TESTS) >/dev/null; \
+	ligne() { for i in $$(seq $$(( $(DUREE) * 10 ))); do grep -qF -- "$$1" test-porteuse.log 2>/dev/null && return 0; \
+	  kill -0 $$q 2>/dev/null || return 1; sleep 0.1; done; return 1; }; \
+	ligne "eth0 : lien coupe, attente de la porteuse" && sleep 1 && echo "set_link n0 on" | nc -U -q1 $(MON_TESTS) >/dev/null && \
+	ligne "[reseau] eth0 : 10.0.2.15/24"; r=$$?; kill $$q 2>/dev/null; wait $$q 2>/dev/null; \
+	grep -F "eth0 : " test-porteuse.log; exit $$r
 	command -v nc >/dev/null || { echo "nc manque (paquet netcat-openbsd) : la touche de dort ne pourrait pas etre envoyee"; exit 1; }
 	for cpu in qemu64 max EPYC; do \
 	  journal=test-programmes-$$cpu.log; rm -f $$journal $(MON_TESTS); \
