@@ -52,7 +52,7 @@ use crate::descripteurs::{Descripteur, Fichier, FichierOuvert, Lecture, Prive, R
 use crate::faillible::{self, VecFaillible};
 use crate::processus::Processus;
 use crate::vfs::{self, CadresDuNoyau, Systeme};
-use crate::{aleatoire, console, evenements, pages, processus, procfs, surveillance, tache, temps};
+use crate::{aleatoire, console, evenements, pages, processus, procfs, signaux, surveillance, tache, temps};
 use fichiers::chemins::{Arbre, Depart, Dernier, Fin, PATH_MAX, Suivre};
 use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_tmpfs};
 use crate::vfs::Montage;
@@ -71,6 +71,9 @@ const EFAULT: i64 = 14;
 const EBUSY: i64 = 16;
 const EINVAL: i64 = 22;
 const EMFILE: i64 = 24;
+const EFBIG: i64 = 27;
+/// Une écriture au-delà de RLIMIT_FSIZE (`generic_write_check_limits`).
+const SIGXFSZ: u64 = 25;
 const ENOTTY: i64 = 25;
 const ENOSPC: i64 = 28;
 const EXDEV: i64 = 18;
@@ -1264,7 +1267,7 @@ fn lire_pages(n: Numero, position: u64, tampon: u64, longueur: u64) -> Result<u6
 /// comptés (le fichier les a : les taire mentirait), EFAULT si aucun ; les
 /// pages créées pour rien sont rendues (Tmpfs::rogner).
 fn ecrire_pages(n: Numero, position: u64, tampon: u64, longueur: u64) -> Result<u64, i64> {
-    let longueur = limite_ecriture(position, longueur as usize).map_err(errno)? as u64;
+    let longueur = limites_d_ecriture(position, longueur as usize)? as u64;
     let mut ecrits = 0;
     let mut faute = false;
     while ecrits < longueur {
@@ -1512,7 +1515,7 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
             let ici = if o.drapeaux as u64 & O_APPEND != 0 { fin } else { ici };
             // La limite (EFBIG), puis les bits setuid et setgid, avant
             // d'écrire (`generic_write_checks`, puis `file_remove_privs`).
-            limite_ecriture(ici, longueur as usize).map_err(errno)?;
+            limites_d_ecriture(ici, longueur as usize)?;
             if longueur > 0 {
                 retirer_les_privileges(o.numero(), o.fichier);
             }
@@ -1742,9 +1745,28 @@ fn vecteur_tenu(o: &FichierTenu, adresse: u64, nombre: u64, ecrire: bool) -> i64
     // Les verrous tenus sur tous les morceaux : chacun part de la position
     // où s'est arrêté le précédent, sans qu'un autre fil s'intercale.
     let _verrous = verrous(o, true, ecrire);
+    // Un fichier ordinaire s'écrit en un seul `write_iter` chez Linux
+    // (`do_iter_readv_writev`) : ses limites (`generic_write_checks`) se
+    // vérifient une fois, sur le total, à la position de départ (la fin pour
+    // O_APPEND). SIGXFSZ seulement si elle est déjà à RLIMIT_FSIZE ; sinon,
+    // les morceaux sont coupés au total permis, et aucun ne part de la
+    // limite (morceau par morceau, le suivant enverrait SIGXFSZ, qui tue).
+    let mut permis = u64::MAX;
+    if ecrire && o.sorte == Sorte::Fichier {
+        let total = morceaux.iter().fold(0u64, |t, m| t.saturating_add(m.1));
+        let depart = if o.drapeaux as u64 & O_APPEND != 0 { vfs::avec(|fs, _| fs.attributs(o.numero()).taille) } else { o.position() };
+        permis = match limites_d_ecriture(depart, total.min(isize::MAX as u64) as usize) {
+            Ok(n) => n as u64,
+            Err(e) => return e,
+        };
+    }
     let mut total = 0u64;
     for (base, longueur) in morceaux {
+        let longueur = longueur.min(permis - total);
         if longueur == 0 {
+            if total == permis {
+                break;
+            }
             continue;
         }
         let r = if ecrire { ecrire_ouvert(o, None, base, longueur) } else { lire_ouvert(o, None, base, longueur) };
@@ -3003,6 +3025,13 @@ pub fn fchdir(fd: u64) -> i64 {
 /// la mémoire reste sûre) et y lit l'ancien contenu au lieu d'un SIGBUS :
 /// un écart, noté dans « Reste à faire ».
 fn tronquer(n: Numero, taille: u64, par: Fichier) -> i64 {
+    // Agrandir au-delà de RLIMIT_FSIZE : SIGXFSZ et EFBIG (`inode_newsize_ok`) ;
+    // raccourcir est toujours permis.
+    let limite = processus::essayer_avec(|p| p.courante(processus::RLIMIT_FSIZE)).unwrap_or(u64::MAX);
+    if taille > limite && taille > vfs::avec(|fs, _| fs.attributs(n).taille) {
+        signaux::au_fil_courant(SIGXFSZ);
+        return -EFBIG;
+    }
     let _ecriture = verrou_d_ecriture(n);
     retirer_projections(n, taille.div_ceil(PAGE));
     let qui = processus::essayer_avec(|p| p.identite).unwrap_or(Identite::ROOT);
@@ -3127,6 +3156,38 @@ pub fn syncfs(fd: u64) -> i64 {
         Ok(_) => -EBADF,
         Err(e) => e,
     }
+}
+
+/// Combien des `longueur` octets à écrire à `position` d'un fichier peuvent
+/// l'être (`generic_write_check_limits`) : rien à écrire, rien à vérifier ;
+/// puis RLIMIT_FSIZE du programme, à partir de laquelle SIGXFSZ (au fil
+/// courant) et EFBIG, et en deçà de laquelle l'écriture est coupée à elle ;
+/// puis la plus grande taille de fichier (`limite_ecriture`). Pour tous les
+/// chemins qui écrivent dans un fichier : write et ses voisins, et ce que le
+/// noyau y écrit pour le programme (sendfile, copy_file_range). Sans
+/// processus (une tâche du noyau) : pas de RLIMIT_FSIZE.
+fn limites_d_ecriture(position: u64, longueur: usize) -> Result<usize, i64> {
+    if longueur == 0 {
+        return Ok(0);
+    }
+    let longueur = limite_du_programme(position, longueur as u64)? as usize;
+    limite_ecriture(position, longueur).map_err(errno)
+}
+
+/// RLIMIT_FSIZE du programme (la première moitié de
+/// `generic_write_check_limits`) : à partir d'elle, SIGXFSZ (au fil
+/// courant) et EFBIG ; en deçà, `longueur` coupée à elle. Sans processus
+/// (une tâche du noyau) : pas de limite.
+fn limite_du_programme(position: u64, longueur: u64) -> Result<u64, i64> {
+    let limite = processus::essayer_avec(|p| p.courante(processus::RLIMIT_FSIZE)).unwrap_or(u64::MAX);
+    if limite == u64::MAX {
+        return Ok(longueur);
+    }
+    if position >= limite {
+        signaux::au_fil_courant(SIGXFSZ);
+        return Err(-EFBIG);
+    }
+    Ok(longueur.min(limite - position))
 }
 
 /// umask(masque) : le nouveau masque (ses 9 bits de droits), rend
@@ -3543,7 +3604,7 @@ fn ecrire_pour_le_noyau(o: &FichierTenu, position: u64, octets: &[u8], plus_a_ve
         // Chaque ronde est un write (`vfs_iter_write`) : la limite, puis les
         // bits setuid et setgid (voir `ecrire_ouvert`).
         Sorte::Fichier => {
-            limite_ecriture(position, octets.len()).map_err(errno)?;
+            limites_d_ecriture(position, octets.len())?;
             if !octets.is_empty() {
                 retirer_les_privileges(o.numero(), o.fichier);
             }
@@ -3588,7 +3649,7 @@ fn ecrire_pour_le_noyau(o: &FichierTenu, position: u64, octets: &[u8], plus_a_ve
 /// après des octets écrits : leur nombre, avant : ENOSPC ; au-delà de la
 /// plus grande taille de fichier : EFBIG).
 fn ecrire_pages_noyau(n: Numero, position: u64, octets: &[u8]) -> Result<usize, i64> {
-    let longueur = limite_ecriture(position, octets.len()).map_err(errno)?;
+    let longueur = limites_d_ecriture(position, octets.len())?;
     let mut ecrits = 0;
     while ecrits < longueur {
         let ici = position + ecrits as u64;
@@ -3835,6 +3896,15 @@ pub fn copy_file_range(fd_entree: u64, adresse_entree: u64, fd_sortie: u64, adre
     }
     let taille = vfs::avec(|fs, _| fs.attributs(entree.numero()).taille);
     let longueur = if depuis as i64 >= taille as i64 { 0 } else { longueur.min(taille.wrapping_sub(depuis)) };
+    // RLIMIT_FSIZE, d'avance (`generic_copy_file_checks` appelle
+    // `generic_write_check_limits`, même pour 0 octet) : à la limite, SIGXFSZ
+    // et EFBIG ; en deçà, la copie coupée à elle, et aucune ronde de
+    // `transferer` ne part de la limite (sendfile, lui, n'a pas cette coupe :
+    // sa ronde suivante envoie SIGXFSZ, comme chez Linux).
+    let longueur = match limite_du_programme(vers, longueur) {
+        Ok(l) => l,
+        Err(e) => return e,
+    };
     let max = fichiers::tmpfs::TAILLE_MAX;
     if vers as i64 >= max as i64 {
         return errno(Erreur::EFBIG);

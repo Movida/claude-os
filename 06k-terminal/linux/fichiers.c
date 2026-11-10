@@ -22,6 +22,7 @@
 #include <sys/file.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <signal.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -892,6 +893,54 @@ static void programme_en_cours(const char *moi)
     verifier(ERREUR(open(moi, O_WRONLY), ETXTBSY), "ouvrir en ecriture le programme en cours : ETXTBSY");
 }
 
+static volatile int xfsz_recus;
+
+static void compter_xfsz(int sig)
+{
+    (void)sig;
+    xfsz_recus++;
+}
+
+/* RLIMIT_FSIZE (`generic_write_check_limits`, `inode_newsize_ok`) : une écriture coupée à la
+ * limite ; à partir d'elle, SIGXFSZ et EFBIG ; agrandir par ftruncate au-delà, de même ;
+ * raccourcir, toujours permis. writev, coupé d'avance sur le total : à cheval sur la limite,
+ * une écriture courte, sans signal (mesuré sous Linux 6.18 ; copy_file_range : copies.c). */
+static void limite_de_taille(void)
+{
+    struct sigaction sa = { .sa_handler = compter_xfsz }, ancienne;
+    sigaction(SIGXFSZ, &sa, &ancienne);
+    struct rlimit avant, l;
+    getrlimit(RLIMIT_FSIZE, &avant);
+    char chemin[64], t[8192] = { 0 };
+    snprintf(chemin, sizeof chemin, "/tmp/fichiers-fsize.%d", getpid());
+    int fd = open(chemin, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    l = (struct rlimit){ 4096, avant.rlim_max };
+    setrlimit(RLIMIT_FSIZE, &l);
+    long a = write(fd, t, sizeof t);
+    int vus = xfsz_recus;
+    long b = write(fd, t, 1);
+    int e = errno;
+    verifier(a == 4096 && vus == 0 && b == -1 && e == EFBIG && xfsz_recus == 1,
+             "RLIMIT_FSIZE : une ecriture coupee a la limite, puis SIGXFSZ et EFBIG");
+    verifier(write(fd, t, 0) == 0 && xfsz_recus == 1, "RLIMIT_FSIZE : 0 octet a la limite, sans signal");
+    verifier(ERREUR(ftruncate(fd, 8192), EFBIG) && xfsz_recus == 2 && ftruncate(fd, 100) == 0,
+             "RLIMIT_FSIZE : ftruncate au-dela, SIGXFSZ et EFBIG ; en deca, permis");
+    /* writev de 4096 puis 1 octet, depuis 0 : 4096, sans signal ; depuis la limite : SIGXFSZ. */
+    struct iovec v[2] = { { t, 4096 }, { t, 1 } };
+    lseek(fd, 0, SEEK_SET);
+    long c = writev(fd, v, 2);
+    vus = xfsz_recus;
+    long d = writev(fd, v, 2);
+    e = errno;
+    verifier(c == 4096 && vus == 2 && d == -1 && e == EFBIG && xfsz_recus == 3,
+             "RLIMIT_FSIZE : writev a cheval sur la limite, coupe sans signal ; depuis elle, SIGXFSZ et EFBIG");
+
+    setrlimit(RLIMIT_FSIZE, &avant);
+    sigaction(SIGXFSZ, &ancienne, NULL);
+    close(fd);
+    unlink(chemin);
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -906,6 +955,7 @@ int main(int argc, char **argv)
     arborescence_bornes();
     projections();
     sticky();
+    limite_de_taille();
     struct stat st;
     verifier(unlink(nom_a) == 0 && stat(nom_a, &st) == -1 && errno == ENOENT, "effacer le fichier");
     printf("[linux] fichiers : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");

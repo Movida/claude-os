@@ -129,6 +129,7 @@ pub fn numero_neuf() -> u32 {
 /// Le nombre de limites de ressources de Linux (RLIM_NLIMITS).
 pub const LIMITES: usize = 16;
 pub const RLIMIT_CPU: usize = 0;
+pub const RLIMIT_FSIZE: usize = 1;
 pub const RLIMIT_DATA: usize = 2;
 pub const RLIMIT_STACK: usize = 3;
 pub const RLIMIT_AS: usize = 9;

@@ -27,6 +27,7 @@
 #include <sys/eventfd.h>
 #include <sys/inotify.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -525,6 +526,44 @@ static void sockets(void)
     close(a);
 }
 
+static volatile int xfsz;
+
+static void compter_xfsz(int sig)
+{
+    (void)sig;
+    xfsz++;
+}
+
+/* RLIMIT_FSIZE (`generic_copy_file_checks`, puis `generic_write_check_limits`) : la copie
+ * coupée d'avance à la limite, sans signal, quand sendfile, ronde par ronde, en envoie un ;
+ * depuis la limite, même pour 0 octet à copier : SIGXFSZ et EFBIG (mesuré sous Linux 6.18,
+ * dans un tmpfs). */
+static void limite_de_taille(void)
+{
+    struct sigaction sa = { .sa_handler = compter_xfsz }, ancienne;
+    sigaction(SIGXFSZ, &sa, &ancienne);
+    struct rlimit avant, l;
+    getrlimit(RLIMIT_FSIZE, &avant);
+    static char t[8192];
+    int s = open(A, O_RDWR | O_TRUNC), d = open(C, O_RDWR | O_CREAT | O_TRUNC, 0600);
+    int remplie = s >= 0 && d >= 0;
+    for (int k = 0; remplie && k < 16; k++)
+        remplie = write(s, t, sizeof t) == sizeof t;
+    l = (struct rlimit){ 65536, avant.rlim_max };
+    setrlimit(RLIMIT_FSIZE, &l);
+    loff_t de = 0, vers = 0;
+    long f = cfr(s, &de, d, &vers, 131072, 0);
+    int vus = xfsz;
+    de = 131072;
+    long g = cfr(s, &de, d, &vers, 4096, 0);
+    verifier(remplie && f == 65536 && vers == 65536 && vus == 0 && g == -EFBIG && xfsz == 1,
+             "copy_file_range et RLIMIT_FSIZE : coupee d'avance, sans signal ; depuis la limite, 0 octet compris, SIGXFSZ et EFBIG");
+    setrlimit(RLIMIT_FSIZE, &avant);
+    sigaction(SIGXFSZ, &ancienne, NULL);
+    close(s);
+    close(d);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -630,6 +669,7 @@ int main(int argc, char **argv)
     positions();
     cases();
     sockets();
+    limite_de_taille();
     unlink(A);
     unlink(B);
     unlink(C);
