@@ -136,6 +136,21 @@ E820_LIBRE     equ 1            ; Type d'une zone de mémoire vive libre.
 ;  1er ÉTAGE : 512 octets, signature comprise
 ; =============================================================================
 start:
+    ; --- La place d'un BPB ---------------------------------------------------------
+    ; Pour une clé USB, certains BIOS « émulent » une disquette ou un disque
+    ; FAT : ils croient trouver au début du secteur 0 un BPB (BIOS Parameter
+    ; Block, la description d'un système de fichiers FAT) et RÉÉCRIVENT ses
+    ; octets 3 à 0x59 avec leurs propres valeurs (la géométrie, le numéro du
+    ; lecteur), ce qui écraserait notre code. Comme tous les secteurs de
+    ; démarrage qui veulent passer partout (syslinux, GRUB, le secteur
+    ; d'amorçage de Linux d'autrefois) : un saut court par-dessus, `nop`,
+    ; puis la place d'un BPB de FAT32 (jusqu'à 0x5A), laissée à zéro, que le
+    ; BIOS peut écrire. Vérifié par `make tests-qemu` : une image dont ces
+    ; octets sont abîmés exprès démarre pareil (test-bpb).
+    jmp short .apres_bpb
+    nop
+    times 0x5A - ($ - $$) db 0
+.apres_bpb:
     ; --- État connu -------------------------------------------------------------
     cli
     jmp 0x0000:.cs_ok   ; Certains BIOS arrivent en 07C0:0000 : on fixe CS = 0.

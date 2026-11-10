@@ -1374,6 +1374,8 @@ $(WAST2JSON):
 #     marche, l'heure revient au tic sans sauter, le démarrage continue
 #     (6j : sous QEMU, les TSC sont toujours accordés, ce chemin ne se
 #     verrait jamais autrement) ;
+#   - le secteur 0 d'une image aux octets du BPB abîmés (test-bpb) : le
+#     démarrage va au bout pareil ;
 #   test-garde, test-gros, le démarrage sans ACPI et celui du pont ne
 #   s'éteignent pas : QEMU est arrêté dès que la ligne cherchée est venue
 #   (`attendre`), au lieu d'attendre DUREE.
@@ -1390,9 +1392,17 @@ MON_TESTS = mon-tests.sock
 QEMU_PROGRAMMES = timeout 60 qemu-system-x86_64 -display none -no-reboot $(QEMU_SMP) $(QEMU_RESEAU) \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
-tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-retard.bin vide.bin nmi.bin sans-reseau.bin claude-p
+# Le secteur 0 d'une image, ses octets 3 à 0x59 abîmés exprès : ce qu'y
+# écrit un BIOS qui démarre sur une clé USB en croyant y trouver un BPB
+# (boot.asm, « La place d'un BPB ») ; le démarrage doit aller au bout pareil.
+test-bpb.bin: vide.bin
+	cp vide.bin $@
+	printf '%87s' '' | tr ' ' '\245' | dd of=$@ bs=1 seek=3 conv=notrunc status=none
+
+tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-retard.bin vide.bin test-bpb.bin nmi.bin sans-reseau.bin claude-p
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
 	$(call attendre,$(QEMU_TEST_1) -smp 1 $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=vide.bin -serial file:test-smp1.log,test-smp1.log,"[noyau] 1 processeur en service : la MADT n'en liste pas d'autre.",:)
+	$(call attendre,$(QEMU_TEST_1) -smp 1 $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-bpb.bin -serial file:test-bpb.log,test-bpb.log,"[noyau] 1 processeur en service : la MADT n'en liste pas d'autre.",:)
 	$(call attendre,$(QEMU_TEST) -cpu Nehalem $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-tsc.bin -serial file:test-tsc.log,test-tsc.log,"[noyau] Heure (UTC)",:)
 	grep -F "[noyau] TSC : le processeur 1 n'est pas accorde avec le premier (recul de 1000000 cycles, pas de TSC_ADJUST) : l'heure au tic, decalage de " test-tsc.log
 	grep -F "[noyau] 4 processeurs en service." test-tsc.log
