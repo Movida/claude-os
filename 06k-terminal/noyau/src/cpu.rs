@@ -119,6 +119,62 @@ pub fn lire_efer() -> u64 {
 /// d'exécution » (TLS : errno, entre autres), lu par `mov rax, fs:[...]`.
 const FS_BASE: u32 = 0xC000_0100;
 
+/// Le processeur a-t-il le défaut de SYSRET des AMD (et des Hygon, leurs
+/// cousins) : `sysretq` y charge le sélecteur de SS sans en refaire les
+/// attributs (le `X86_BUG_SYSRET_SS_ATTRS` de Linux, posé d'après le
+/// fabricant, `init_amd`). En mode long, une interruption venue de l'anneau 3
+/// laisse un SS nul ; si la tâche qui revient ensuite au programme par
+/// `sysretq` hérite de ce SS (une bascule entre les deux), le programme
+/// repart avec un SS inutilisable. Lu une fois (CPUID 0, le nom du
+/// fabricant), puis gardé.
+pub fn bogue_sysret_ss() -> bool {
+    use core::sync::atomic::{AtomicU8, Ordering::Relaxed};
+    static CONNU: AtomicU8 = AtomicU8::new(0);
+    match CONNU.load(Relaxed) {
+        1 => false,
+        2 => true,
+        _ => {
+            let c = core::arch::x86_64::__cpuid(0);
+            let mut nom = [0u8; 12];
+            nom[..4].copy_from_slice(&c.ebx.to_le_bytes());
+            nom[4..8].copy_from_slice(&c.edx.to_le_bytes());
+            nom[8..].copy_from_slice(&c.ecx.to_le_bytes());
+            let amd = &nom == b"AuthenticAMD" || &nom == b"HygonGenuine";
+            CONNU.store(if amd { 2 } else { 1 }, Relaxed);
+            amd
+        }
+    }
+}
+
+/// Le contournement de Linux pour ce défaut (`__switch_to`) : à chaque
+/// bascule, si SS n'est pas celui des données du noyau, le recharger ; la
+/// tâche qui reviendra au programme par `sysretq` part alors d'un SS valide.
+pub fn ss_du_noyau() {
+    let ss: u16;
+    // SAFETY: lire SS n'a aucun effet ; y charger le sélecteur des données
+    // du noyau (présent, écrivable, DPL 0, dans la GDT du processeur) est ce
+    // que fait toute entrée dans le noyau, et ne change rien à la pile.
+    unsafe {
+        asm!("mov {0:x}, ss", out(reg) ss, options(nomem, nostack, preserves_flags));
+        if ss != crate::gdt::DONNEES_NOYAU {
+            asm!("mov ss, {0:x}", in(reg) crate::gdt::DONNEES_NOYAU, options(nostack, preserves_flags));
+        }
+    }
+    if ss != crate::gdt::DONNEES_NOYAU {
+        SS_RECHARGES.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Les bascules où SS n'était pas celui du noyau (le plus souvent nul,
+/// après une interruption venue de l'anneau 3), et a été rechargé : la
+/// preuve que le contournement sert (make tests-qemu, sous -cpu EPYC).
+static SS_RECHARGES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Le nombre de ces rechargements.
+pub fn ss_recharges() -> u64 {
+    SS_RECHARGES.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 /// Fixe la base de FS du programme en cours.
 pub fn ecrire_base_fs(base: u64) {
     // SAFETY: le MSR existe sur tout processeur 64 bits ; le noyau ne se

@@ -308,6 +308,9 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     appel_systeme::initialiser();
     afficherln!("[noyau] Processeur 0 : GDT, TSS et IDT en place, sa zone dans GS ; syscall pret (swapgs) ; {} processeur en service.",
                 processeur::nombre());
+    if cpu::bogue_sysret_ss() {
+        afficherln!("[noyau] Processeur AMD : SS recharge a chaque bascule, pour sysretq (X86_BUG_SYSRET_SS_ATTRS).");
+    }
 
     // Test volontaire : int3 déclenche l'exception 3. Si l'IDT est fausse,
     // c'est une triple faute et QEMU redémarre ; sinon, on revient ici.
@@ -510,6 +513,9 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         tester_voisins();
         reseau::autotest::lancer();
         programmes::demarrer();
+        if cpu::bogue_sysret_ss() {
+            afficherln!("[noyau] Processeur AMD : SS recharge a {} bascules, pour sysretq.", cpu::ss_recharges());
+        }
         // Le scénario des programmes de test de `make tests-qemu` : une
         // fois l'archive exécutée, éteindre QEMU par son périphérique
         // isa-debug-exit (présent seulement si on le demande à QEMU, à ce

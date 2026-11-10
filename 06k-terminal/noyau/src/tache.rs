@@ -1073,6 +1073,11 @@ pub fn inactive() -> *const Tache {
 pub fn basculer_vers(nouvelle: &Tache) {
     let interruptions = cpu::couper_interruptions();
     let ancienne = courante();
+    // AMD : un SS valide pour le `sysretq` de la tâche suivante (cpu.rs,
+    // `bogue_sysret_ss`).
+    if cpu::bogue_sysret_ss() {
+        cpu::ss_du_noyau();
+    }
     // SAFETY: interruptions coupées, et une tâche ne s'exécute que sur un
     // processeur à la fois (`sur_processeur`, voir `unsafe impl Sync for
     // Tache`) : personne d'autre ne touche à l'état des deux tâches

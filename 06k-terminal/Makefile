@@ -1326,11 +1326,15 @@ $(WAST2JSON):
 #     chaque programme fautif et continuer, puis éteindre QEMU (le
 #     périphérique isa-debug-exit : QEMU sort avec le code 2 x valeur + 1).
 #     Chaque ligne de tests-attendu.txt doit être dans ce qu'il affiche.
-#     Deux fois : avec le processeur par défaut (qemu64), puis avec toutes
-#     les fonctions que QEMU sait imiter (-cpu max : SMEP, SMAP, UMIP...),
-#     pour passer aussi par les chemins « si le processeur l'a » ; avec, en
+#     Trois fois : avec le processeur par défaut (qemu64), avec toutes les
+#     fonctions que QEMU sait imiter (-cpu max : SMEP, SMAP, UMIP...), pour
+#     passer aussi par les chemins « si le processeur l'a », et avec un
+#     processeur AMD (-cpu EPYC, les soldes d'avant 6k) : le contournement
+#     de SYSRET (cpu.rs, `bogue_sysret_ss`) reconnu, et SS rechargé à au
+#     moins une bascule (le noyau compte ces rechargements, et le dit à la
+#     fin) ; TCG n'imite pas le défaut lui-même, le chemin, si. Avec, en
 #     plus, les lignes propres à chacun (tests-attendu-qemu64.txt,
-#     tests-attendu-max.txt). Rien des lignes d'un groupe refusé (6i : elles
+#     tests-attendu-max.txt, tests-attendu-EPYC.txt). Rien des lignes d'un groupe refusé (6i : elles
 #     lancent lecteur.wasm avec l'argument « groupe-refuse », qu'il
 #     afficherait). Et aucun ECHEC dans le journal (depuis 6e :
 #     « memoire rendue » de plusieurs groupes de programmes en parallèle
@@ -1442,7 +1446,7 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	ligne "eth0 : lien retabli"; r=$$?; kill $$q 2>/dev/null; wait $$q 2>/dev/null; \
 	grep -F "eth0 : " test-lien.log; exit $$r
 	command -v nc >/dev/null || { echo "nc manque (paquet netcat-openbsd) : la touche de dort ne pourrait pas etre envoyee"; exit 1; }
-	for cpu in qemu64 max; do \
+	for cpu in qemu64 max EPYC; do \
 	  journal=test-programmes-$$cpu.log; rm -f $$journal $(MON_TESTS); \
 	  ( for i in $$(seq 300); do grep -qF "[linux] Test : dort" $$journal 2>/dev/null && break; sleep 0.1; done; \
 	    echo "sendkey k" | nc -U -q1 $(MON_TESTS) >/dev/null 2>&1 ) & \
@@ -1462,6 +1466,8 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	  while IFS= read -r ligne; do \
 	    grep -qF -- "$$ligne" test-programmes-$$cpu.log || { echo "-cpu $$cpu : manque « $$ligne »"; exit 1; }; \
 	  done < tests-attendu-$$cpu.txt; \
+	  [ $$cpu != EPYC ] || grep -qE '^\[noyau\] Processeur AMD : SS recharge a [1-9][0-9]* bascules' $$journal \
+	    || { echo "-cpu EPYC : SS jamais recharge a une bascule"; exit 1; }; \
 	  ! grep -n groupe-refuse $$journal || { echo "-cpu $$cpu : une ligne d'un groupe refuse a ete lancee"; exit 1; }; \
 	  ! grep -n ECHEC $$journal || { echo "-cpu $$cpu : un ECHEC dans le journal"; exit 1; }; \
 	done

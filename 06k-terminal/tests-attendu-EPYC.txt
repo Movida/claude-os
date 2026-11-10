@@ -1,0 +1,10 @@
+[noyau] Processeur AMD : SS recharge a chaque bascule, pour sysretq (X86_BUG_SYSRET_SS_ATTRS).
+[alea] pret (RDSEED).
+[noyau] Protections contre les programmes : SMEP oui, SMAP oui, UMIP non (absent du processeur).
+[noyau] SMAP verifie : une lecture directe de la memoire d'un programme fait faute.
+[linux] sgdt permis : le processeur n'a pas UMIP.
+[noyau] sgdt : termine, code de sortie 0 ; memoire rendue : ok.
+[noyau] SSE pour les programmes : XSAVE (x87, SSE, AVX), 832 octets par tache.
+[linux] avx a : YMM0-YMM15, MXCSR et x87 intacts apres 300 sched_yield : ok
+[linux] avx b : YMM0-YMM15, MXCSR et x87 intacts apres 300 sched_yield : ok
+[linux] gestionnaires : processeur : XSAVE et AVX
