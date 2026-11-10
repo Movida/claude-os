@@ -186,11 +186,51 @@ static void surveillance(void)
     close(e4); close(q); close(e); close(e2); close(p);
 }
 
+/* Les chemins de réveil vers un même fichier (`reverse_path_check`) : un
+ * eventfd surveillé par n epolls, chacun sous une chaîne de `etages` epolls
+ * jusqu'à un sommet commun. Rend le rang de l'ajout refusé (EINVAL), -1 si
+ * aucun ne l'est, -2 pour un autre échec. `ordre` : l'eventfd ajouté à
+ * chaque epoll avant (0) ou après (1) que celui-ci soit sous le sommet. */
+static int chemins(int etages, int n, int ordre)
+{
+    struct epoll_event ev = { .events = EPOLLIN };
+    int f = eventfd(0, 0), t = epoll_create1(0), refus = -1;
+    int ouverts[5 * 600], k = 0;
+    for (int i = 0; i < n && refus == -1; i++) {
+        int e = epoll_create1(0), bas = e;
+        ouverts[k++] = e;
+        if (ordre == 0 && epoll_ctl(e, EPOLL_CTL_ADD, f, &ev) != 0)
+            refus = -2;
+        for (int j = 1; j < etages && refus == -1; j++) {
+            int m = epoll_create1(0);
+            ouverts[k++] = m;
+            if (epoll_ctl(m, EPOLL_CTL_ADD, bas, &ev) != 0)
+                refus = -2;
+            bas = m;
+        }
+        if (refus == -1 && epoll_ctl(t, EPOLL_CTL_ADD, bas, &ev) != 0)
+            refus = errno == EINVAL ? i : -2;
+        if (refus == -1 && ordre == 1 && epoll_ctl(e, EPOLL_CTL_ADD, f, &ev) != 0)
+            refus = errno == EINVAL ? i : -2;
+    }
+    while (k > 0)
+        close(ouverts[--k]);
+    close(t);
+    close(f);
+    return refus;
+}
+
 int main(void)
 {
     compteurs();
     fichier_anonyme();
     surveillance();
+    /* Le 501e epoll intermédiaire est refusé, le 101e d'une chaîne de deux,
+     * le 51e de trois, le 11e de quatre (mesuré sous Linux 6.18) ; que
+     * l'eventfd soit ajouté avant ou après l'emboîtement. */
+    verifier(chemins(1, 600, 0) == 500 && chemins(1, 600, 1) == 500, "chemins de reveil : 500 par un epoll intermediaire, puis EINVAL");
+    verifier(chemins(2, 200, 0) == 100 && chemins(3, 100, 0) == 50 && chemins(4, 50, 1) == 10,
+             "chemins de reveil : 100, 50, 10 par deux, trois, quatre epolls");
     printf("[linux] evenements : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

@@ -552,10 +552,112 @@ fn reserver<T>(d: &mut VecDeque<T>, n: usize) -> bool {
 /// du tour (`loop_check_gen`).
 static EMBOITEMENTS: Mutex<u64> = Mutex::new(0);
 
+/// Le numéro du tour, lisible sans `EMBOITEMENTS` (le `READ_ONCE` de
+/// `loop_check_gen`) : pendant une vérification, les epolls qu'elle a
+/// parcourus ont ce numéro, et un ajout à l'un d'eux, qui le lit sous le
+/// Mutex de cet epoll, fait la vérification complète à son tour : il
+/// attend la première (sans quoi, ajouté pendant qu'elle compte, il lui
+/// échapperait).
+static DERNIER_TOUR: AtomicU64 = AtomicU64::new(0);
+
+/// Un tour de vérification, `EMBOITEMENTS` tenu : son numéro avance au
+/// début, et de nouveau à la fin, quelle que soit l'issue (le
+/// `loop_check_gen++` d'avant les parcours, et celui
+/// d'`error_tgt_fput`) : après, aucun epoll ne garde le numéro courant. Un
+/// seul numéro pour les parcours vers le bas et vers le haut, comme Linux :
+/// sans boucle, ils ne se croisent pas.
+struct Tour(attente::GardeMutex<'static, u64>);
+
+impl Tour {
+    fn prendre() -> Tour {
+        let mut g = EMBOITEMENTS.verrouiller();
+        *g += 1;
+        DERNIER_TOUR.store(*g, Relaxed);
+        Tour(g)
+    }
+
+    fn numero(&self) -> u64 {
+        *self.0
+    }
+}
+
+impl Drop for Tour {
+    fn drop(&mut self) {
+        *self.0 += 1;
+        DERNIER_TOUR.store(*self.0, Relaxed);
+    }
+}
+
+/// Le nombre de chemins de réveil permis vers un même fichier, selon le
+/// nombre d'epolls entre lui et l'epoll du sommet (`path_limits` de Linux) :
+/// directement (aucun entre eux), autant qu'on veut ; puis 500, 100, 50, 10.
+/// Mesuré sous Linux 6.18 : le 501e epoll intermédiaire est refusé (EINVAL),
+/// le 101e d'une chaîne de deux, le 51e de trois, le 11e de quatre.
+const LIMITES_DES_CHEMINS: [u32; EP_MAX_NESTS as usize + 1] = [u32::MAX, 500, 100, 50, 10];
+
+/// Les fichiers dont il faut compter les chemins de réveil après un ajout (la
+/// `tfile_check_list` de Linux) ; `manque` : l'un d'eux n'a pas trouvé sa
+/// place (ENOMEM).
+struct AVerifier {
+    liste: Vec<Fichier>,
+    manque: bool,
+}
+
+impl AVerifier {
+    fn noter(&mut self, f: Fichier) {
+        if !self.liste.contains(&f) && self.liste.ajouter(f).is_err() {
+            self.manque = true;
+        }
+    }
+}
+
+/// Le fichier ouvert `f` est-il surveillé par un epoll (le `f_ep` de
+/// Linux) ? Sous le verrou des fichiers.
+fn surveille(ouverts: &mut Ouverts, f: Fichier) -> bool {
+    ouverts.peut_etre(f).is_some_and(|o| o.surveillants.iter().any(|e| !e.mourant.load(Relaxed)))
+}
+
+/// Compte les chemins de réveil du fichier `f` vers les epolls que rien ne
+/// surveille (`reverse_path_check_proc`), dans `compte`, par étage : `etage`
+/// epolls entre `f` et celui qu'on regarde. Err(EINVAL) au-delà d'une limite
+/// ou d'EP_MAX_NESTS étages ; Err(ENOMEM) si la liste d'un étage manque de
+/// place. Chaque élément compte (un epoll qui surveille deux fois le même
+/// fichier, par deux numéros, fait deux chemins), comme les `epitem` de
+/// Linux. Sous le verrou des fichiers.
+fn chemins_de_reveil(ouverts: &mut Ouverts, f: Fichier, etage: u32, compte: &mut [u32; EP_MAX_NESTS as usize + 1])
+                     -> Result<(), i64> {
+    if etage > EP_MAX_NESTS {
+        return Err(-EINVAL);
+    }
+    let mut dessus: Vec<Arc<Epoll>> = Vec::new();
+    if let Some(o) = ouverts.peut_etre(f) {
+        for e in o.surveillants.iter().filter(|e| !e.mourant.load(Relaxed)) {
+            if let Some(x) = e.epoll.upgrade() {
+                dessus.ajouter(x).map_err(|_| -ENOMEM)?;
+            }
+        }
+    }
+    for x in &dessus {
+        let fx = Fichier::de(x.fichier.load(Relaxed));
+        if surveille(ouverts, fx) {
+            chemins_de_reveil(ouverts, fx, etage + 1, compte)?;
+        } else {
+            let c = &mut compte[etage as usize];
+            *c = c.saturating_add(1);
+            if *c > LIMITES_DES_CHEMINS[etage as usize] {
+                return Err(-EINVAL);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Le nombre d'étages d'epoll sous `ep` (`ep_loop_check_proc`), ou
-/// u32::MAX si l'on y retrouve `cible` (une boucle) ou trop d'étages. Sous
-/// `EMBOITEMENTS` ; chaque epoll n'est parcouru qu'une fois par tour.
-fn etages_dessous(ep: &Epoll, cible: &Epoll, profondeur: u32, tour: u64) -> u32 {
+/// u32::MAX si l'on y retrouve `cible` (une boucle) ou trop d'étages ; les
+/// fichiers ordinaires qu'il y trouve sont notés dans `a_verifier` (leurs
+/// chemins de réveil, après l'ajout). Sous `EMBOITEMENTS` ; chaque epoll
+/// n'est parcouru qu'une fois par tour.
+fn etages_dessous(ep: &Epoll, cible: &Epoll, profondeur: u32, tour: u64, a_verifier: &mut AVerifier) -> u32 {
     if ep.generation.load(Relaxed) == tour {
         return ep.profondeur_vue.load(Relaxed);
     }
@@ -565,13 +667,14 @@ fn etages_dessous(ep: &Epoll, cible: &Epoll, profondeur: u32, tour: u64) -> u32 
     for e in elements.iter() {
         let Some(tenu) = e.tenir() else { continue };
         if tenu.sorte != Sorte::Epoll {
+            a_verifier.noter(e.fichier);
             continue;
         }
         let dessous = tenu.epoll();
         r = if core::ptr::eq(dessous, cible) || profondeur > EP_MAX_NESTS {
             u32::MAX
         } else {
-            r.max(etages_dessous(dessous, cible, profondeur + 1, tour).saturating_add(1))
+            r.max(etages_dessous(dessous, cible, profondeur + 1, tour, a_verifier).saturating_add(1))
         };
         if r > EP_MAX_NESTS {
             break;
@@ -661,10 +764,11 @@ pub fn epoll_create(taille: u64) -> i64 {
 ///      une autre (EINVAL). ADD et MOD ajoutent toujours EPOLLERR et
 ///      EPOLLHUP.
 /// La « struct epoll_event » est tassée sur x86_64 : 4 octets
-/// d'événements, puis 8 de donnée. Linux vérifie aussi que l'ajout ne crée
-/// pas trop de chemins de réveil vers un même fichier (plus de 1000
-/// epolls qui le surveillent directement, `reverse_path_check`) ; pas
-/// nous, pas encore.
+/// d'événements, puis 8 de donnée. Après un ajout vérifié en entier (le 7,
+/// ou un ajout à un epoll surveillé), pas trop de chemins de réveil vers un
+/// même fichier (`reverse_path_check`, LIMITES_DES_CHEMINS : 500 par un epoll
+/// intermédiaire, 100 par deux...) : sinon l'ajout est défait, EINVAL (les
+/// soldes d'avant 6k ; jusque-là, aucune limite).
 pub fn epoll_ctl(epfd: u64, operation: u64, fd: u64, evenement: u64) -> i64 {
     let operation = operation as u32 as u64;
     let a_un_evenement = operation != EPOLL_CTL_DEL;
@@ -699,28 +803,46 @@ pub fn epoll_ctl(epfd: u64, operation: u64, fd: u64, evenement: u64) -> i64 {
         return -EINVAL;
     }
     let ep = e.epoll();
-    // Un epoll ajouté à un epoll : la recherche de boucles, puis l'ajout,
-    // un seul à la fois.
+    // La vérification complète (`full_check`), un ajout à la fois : pour un
+    // epoll ajouté à un epoll (la recherche de boucles et d'étages), pour un
+    // ajout à un epoll déjà surveillé, ou qu'un tour en cours a parcouru ;
+    // puis, après l'ajout, les chemins de réveil des fichiers ordinaires en
+    // jeu (`reverse_path_check`) : le fichier ajouté, ou ceux qu'on trouve
+    // sous l'epoll ajouté. La condition se lit sous le Mutex de l'epoll, gardé
+    // jusqu'à l'ajout s'il n'y a rien à vérifier (Linux : sous `ep->mtx`) ;
+    // sinon il est rendu avant `EMBOITEMENTS`, l'ordre des verrous.
     let mut emboitements = None;
-    if operation == EPOLL_CTL_ADD && cible.sorte == Sorte::Epoll {
-        let mut tour = EMBOITEMENTS.verrouiller();
-        *tour += 1;
-        let dessous = etages_dessous(cible.epoll(), ep, 0, *tour);
-        if dessous > EP_MAX_NESTS {
-            return -ELOOP;
+    let mut a_verifier = AVerifier { liste: Vec::new(), manque: false };
+    let mut elements = ep.verrouiller();
+    if operation == EPOLL_CTL_ADD
+        && (cible.sorte == Sorte::Epoll
+            || ep.generation.load(Relaxed) == DERNIER_TOUR.load(Relaxed)
+            || vfs::avec_systeme(|s, _| surveille(&mut s.ouverts, e.fichier())))
+    {
+        drop(elements);
+        let tour = Tour::prendre();
+        let t = tour.numero();
+        if cible.sorte == Sorte::Epoll {
+            let dessous = etages_dessous(cible.epoll(), ep, 0, t, &mut a_verifier);
+            if dessous > EP_MAX_NESTS {
+                return -ELOOP;
+            }
+            let dessus = vfs::avec_systeme(|s, _| etages_dessus(&mut s.ouverts, ep, t));
+            if dessous + 1 + dessus > EP_MAX_NESTS {
+                return -ELOOP;
+            }
+        } else {
+            a_verifier.noter(cible.fichier());
         }
-        *tour += 1;
-        let t = *tour;
-        let dessus = vfs::avec_systeme(|s, _| etages_dessus(&mut s.ouverts, ep, t));
-        if dessous + 1 + dessus > EP_MAX_NESTS {
-            return -ELOOP;
+        if a_verifier.manque {
+            return -ENOMEM;
         }
         emboitements = Some(tour);
+        elements = ep.verrouiller();
     }
-    let mut elements = ep.verrouiller();
     let ici = elements.iter().position(|x| x.fichier == cible.fichier() && x.fd == fd as u32);
     let evenements = lu.0 | POLLERR | POLLHUP;
-    let r = match (operation, ici) {
+    let mut r = match (operation, ici) {
         (EPOLL_CTL_ADD, None) => inserer(ep, &mut elements, &e, &cible, fd as u32, evenements, lu.1),
         (EPOLL_CTL_ADD, Some(_)) => -EEXIST,
         (EPOLL_CTL_DEL, Some(i)) => {
@@ -749,6 +871,21 @@ pub fn epoll_ctl(epfd: u64, operation: u64, fd: u64, evenement: u64) -> i64 {
         (EPOLL_CTL_DEL | EPOLL_CTL_MOD, None) => -ENOENT,
         _ => -EINVAL,
     };
+    // Trop de chemins de réveil vers un fichier : l'ajout est défait
+    // (`ep_remove_safe`), EINVAL. Chaque fichier compte de zéro
+    // (`path_count_init`).
+    if r == 0 && emboitements.is_some() && !a_verifier.liste.is_empty() {
+        let verdict = vfs::avec_systeme(|s, _| {
+            a_verifier.liste.iter().try_for_each(|&f| chemins_de_reveil(&mut s.ouverts, f, 0, &mut [0; EP_MAX_NESTS as usize + 1]))
+        });
+        if let Err(erreur) = verdict {
+            if let Some(i) = elements.iter().position(|x| x.fichier == cible.fichier() && x.fd == fd as u32) {
+                let x = elements.remove(i);
+                retirer(ep, &x);
+            }
+            r = erreur;
+        }
+    }
     drop(elements);
     drop(emboitements);
     r
