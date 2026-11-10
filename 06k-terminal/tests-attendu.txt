@@ -138,7 +138,7 @@ mesure contre le PIT), 1000 Hz, vecteur 0xec ; PIT arrete.
 [noyau] eventfd-bloque : plus rien ne peut le reveiller (interblocage) (SIGKILL)
 [noyau] eventfd-bloque : termine, code de sortie 137 ; memoire rendue : ok.
 [noyau] wx : programme Linux refuse : segment 0 : inscriptible et executable (W+X)
-[noyau] derniere-page : programme Linux refuse : segment 0 : hors des adresses permises
+[noyau] derniere-page : programme Linux refuse : segment 1 : hors des adresses permises
 [noyau] et-dyn : programme Linux (ELF ET_DYN), 
 [noyau] et-dyn : termine, code de sortie 42 ; memoire rendue : ok.
 [noyau] tronque : programme Linux refuse : fichier ELF tronque

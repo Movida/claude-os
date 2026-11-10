@@ -580,6 +580,16 @@ pub fn lire_entetes<'a>(entete: &Entete, table: &'a [u8], taille_fichier: u64) -
             Some(f) if f <= taille_fichier => f,
             _ => return refus(HORS_FICHIER),
         };
+        // Son adresse dans le fichier (relative pour un ET_DYN, avant tout
+        // décalage) et sa taille sous TASK_SIZE, comme Linux
+        // (load_elf_binary : « set_brk can never work », EINVAL), même si
+        // l'image posée tiendrait (jusqu'aux soldes d'avant 6k, un écart
+        // écrit ici), et même pour un segment vide : Linux compare chaque
+        // PT_LOAD. Où l'image ira, `placer` le vérifie ensuite.
+        const TASK_SIZE: u64 = 0x7fff_ffff_f000;
+        if e.adresse >= TASK_SIZE || e.taille_memoire > TASK_SIZE || TASK_SIZE - e.taille_memoire < e.adresse {
+            return refus(HORS_PERMISES);
+        }
         if e.taille_memoire == 0 {
             continue;
         }
@@ -590,12 +600,6 @@ pub fn lire_entetes<'a>(entete: &Entete, table: &'a [u8], taille_fichier: u64) -
         if e.taille_fichier > 0 && e.adresse % PAGE != e.position % PAGE {
             return refus(CONGRUENCE);
         }
-        // La fin de sa dernière page doit tenir dans les adresses : pas de
-        // débordement. Où l'image ira, `placer` le vérifie. (Linux, lui,
-        // refuse aussi un ET_DYN dont un `p_vaddr` relatif dépasse
-        // TASK_SIZE, avant tout décalage : load_elf_binary, EINVAL. Ici,
-        // seules comptent les adresses absolues de l'image posée : un
-        // écart voulu, sans danger, puisque `placer` les vérifie toutes.)
         let premiere_page = e.adresse / PAGE * PAGE;
         let Some(fin) = e.adresse.checked_add(e.taille_memoire).and_then(|f| f.checked_next_multiple_of(PAGE)) else {
             return refus(HORS_PERMISES);
@@ -890,13 +894,15 @@ mod tests {
             let s: Vec<_> = x.segments().collect();
             assert_eq!((s[1].adresse, s[1].taille, s[1].position, s[1].taille_fichier), (0x402000, 0x100, 0, 0));
         }
-        // Un PT_LOAD de taille nulle en mémoire n'occupe rien : omis, où
-        // qu'il prétende être.
+        // Un PT_LOAD de taille nulle en mémoire n'occupe rien : omis ; mais
+        // au-delà de TASK_SIZE, refusé, comme tout PT_LOAD chez Linux.
         let mut o = exemple();
-        entete(&mut o, 1, PT_LOAD, 7, 0x2000, 0xffff_8000_0000_0000, 0, 0);
+        entete(&mut o, 1, PT_LOAD, 7, 0x2000, 0x50_0000, 0, 0);
         let x = placer(&o).unwrap();
         assert_eq!(x.segments().count(), 1);
         assert_eq!(x.etendue(), (0x401000, 0x402000));
+        entete(&mut o, 1, PT_LOAD, 7, 0x2000, 0xffff_8000_0000_0000, 0, 0);
+        assert_eq!(lire(&o).map(|_| ()), Err(Erreur::Segment { numero: 1, raison: HORS_PERMISES }));
     }
 
     #[test]
@@ -992,6 +998,22 @@ mod tests {
                    Err(Erreur::Segment { numero: 2, raison: HORS_PERMISES }));
         assert!(matches!(x.placer(u64::MAX / PAGE * PAGE, PERMISES), Err(Erreur::Segment { .. })));
         assert_eq!(x.placer(0, PERMISES).map(|_| ()), Err(Erreur::Segment { numero: 0, raison: HORS_PERMISES }));
+        // Un segment qui, à son adresse relative, dépasse TASK_SIZE :
+        // refusé comme Linux, même si l'image posée à la base tiendrait.
+        let mut haut = exemple_dyn();
+        haut[24..32].copy_from_slice(&0x7fff_ffff_d004u64.to_le_bytes());
+        entete(&mut haut, 0, PT_LOAD, 4, 0, 0x7fff_ffff_c000, 0x200, 0x200);
+        entete(&mut haut, 1, PT_LOAD, 5, 0x1000, 0x7fff_ffff_d000, 16, 16);
+        entete(&mut haut, 2, PT_LOAD, 6, 0x2000, 0x7fff_ffff_e000, 8, 0x1001);
+        assert_eq!(lire(&haut).map(|_| ()), Err(Erreur::Segment { numero: 2, raison: HORS_PERMISES }));
+        entete(&mut haut, 2, PT_LOAD, 6, 0x2000, 0x7fff_ffff_e000, 8, 0x1000);
+        assert!(lire(&haut).is_ok_and(|x| x.placer(0x5555_5555_4000, PERMISES).is_ok()));
+        // Un segment vide à TASK_SIZE : refusé aussi (Linux compare chaque
+        // PT_LOAD, `elf_load` d'un segment vide rendant son adresse à
+        // BAD_ADDR).
+        let mut vide = haut.clone();
+        entete(&mut vide, 2, PT_LOAD, 6, 0, 0x7fff_ffff_f000, 0, 0);
+        assert_eq!(lire(&vide).map(|_| ()), Err(Erreur::Segment { numero: 2, raison: HORS_PERMISES }));
         // Une base qui n'est pas une adresse de page : une erreur du noyau.
         assert_eq!(x.placer(0x5555_5555_4010, PERMISES).map(|_| ()), Err(Erreur::Placement));
         // Un ET_EXEC ne va qu'à ses adresses.
