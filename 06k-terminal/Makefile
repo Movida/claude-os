@@ -1350,6 +1350,9 @@ $(WAST2JSON):
 #     BIOS lui a donné (depuis 6g) ;
 #   - une carte virtio-net sans MSI-X (vectors=0) : le pilote la laisse
 #     éteinte, et le dit (6g) ;
+#   - une carte virtio-net à deux entrées MSI-X (vectors=2) : une pour la
+#     configuration, une pour les deux files, et le DHCP passe par elle
+#     (les soldes d'avant 6k) ;
 #   - une carte sur un réseau sans serveur DHCP (-netdev hubport, un
 #     concentrateur relié à rien) : le DHCP abandonne au bout de 12 à 17 s,
 #     et le démarrage continue (6g) ;
@@ -1435,6 +1438,9 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	  -serial file:test-sans-dhcp.log,test-sans-dhcp.log,"[reseau] eth0 : pas de reponse DHCP (3 essais) : pas d'adresse.",:)
 	$(call attendre,$(QEMU_TEST) -netdev user$(,)id=n0 -device virtio-net-pci$(,)netdev=n0$(,)vectors=0 -drive format=raw$(,)file=vide.bin \
 	  -serial file:test-sans-msix.log,test-sans-msix.log,"[virtio] 00:03.0 : pas de MSI-X : carte laissee eteinte.",:)
+	$(call attendre,$(QEMU_TEST) -netdev user$(,)id=n0 -device virtio-net-pci$(,)netdev=n0$(,)vectors=2 -drive format=raw$(,)file=vide.bin \
+	  -serial file:test-deux-vecteurs.log,test-deux-vecteurs.log,"[reseau] eth0 : 10.0.2.15/24",:)
+	grep -qF "une pour les deux files" test-deux-vecteurs.log
 	$(call attendre,$(QEMU_TEST) -nic none $(QEMU_ALEA) -drive format=raw$(,)file=sans-reseau.bin -serial file:test-sans-reseau.log,test-sans-reseau.log,"[noyau] passerelle : termine",:)
 	grep -F "[linux] passerelle : toutes les verifications (sans reseau) : ok" test-sans-reseau.log
 	rm -f test-lien.log $(MON_TESTS); \

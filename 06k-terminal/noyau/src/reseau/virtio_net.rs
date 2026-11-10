@@ -64,13 +64,18 @@ const LIEN_ACTIF: u16 = 1;
 /// octets de la MAC).
 const STATUS: u64 = 6;
 /// Les entrées MSI-X : la configuration (Linux prend aussi la première,
-/// `vp_request_msix_vectors`), puis une par file. Une carte qui en a moins
-/// de trois est laissée éteinte ; Linux se replie alors sur un vecteur
-/// partagé par les files (`vp_find_vqs`), puis sur INTx : un écart, aucune
-/// carte de QEMU n'en a moins (sauf demandé, `vectors=`).
+/// `vp_request_msix_vectors`), puis une par file. Une carte qui n'en a que
+/// deux : la configuration, puis une seule pour les deux files, comme le
+/// repli de Linux (`vp_find_vqs`, « shared » : un vecteur pour toutes les
+/// files) ; son gestionnaire fait le travail des deux. Moins de deux : la
+/// carte reste éteinte ; Linux se replierait encore sur INTx, dont la
+/// ligne se lit dans la table `_PRT` de l'ACPI (l'AML), que nous ne lisons
+/// pas (avec les pilotes du vrai matériel).
 const ENTREE_CONFIGURATION: u16 = 0;
 const ENTREE_RECEPTION: u16 = 1;
 const ENTREE_EMISSION: u16 = 2;
+/// L'entrée des deux files, quand elles la partagent.
+const ENTREE_FILES: u16 = 1;
 /// Les numéros des files : la paire 0 (réception 0, émission 1).
 const FILE_RECEPTION: u16 = 0;
 const FILE_EMISSION: u16 = 1;
@@ -172,6 +177,13 @@ fn interruption_emission(argument: usize) {
     super::tache::signaler_interface(c.interface.load(Ordering::Relaxed));
 }
 
+/// L'interruption des deux files, quand elles partagent une entrée MSI-X
+/// (`vp_vring_interrupt` de Linux : toutes les files, chacune ce qu'elle a).
+fn interruption_files(argument: usize) {
+    interruption_reception(argument);
+    interruption_emission(argument);
+}
+
 /// Les noms des fonctionnalités négociées, pour le journal.
 fn nommer(v: &Virtio) -> impl core::fmt::Display + '_ {
     struct Noms<'a>(&'a Virtio);
@@ -201,6 +213,9 @@ pub fn sonder() {
         Err(e) => return afficherln!("[virtio] {} : {} : carte laissee eteinte.", f.adresse, e),
     };
     afficherln!("[virtio] {} : reseau, fonctionnalites {}, {} files.", c.adresse, nommer(&c.virtio), c.virtio.nb_files());
+    if c.virtio.msix.entrees() < 3 {
+        afficherln!("[virtio] {} : deux entrees MSI-X : une pour la configuration, une pour les deux files.", c.adresse);
+    }
     let Some(i) = interface::ajouter("eth0", mac, 1500, lien, Materiel::VirtioNet(c)) else {
         return afficherln!("[reseau] plus de place pour une interface.");
     };
@@ -296,11 +311,13 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
     // Les files d'abord, puis leurs interruptions : la carte est dans le
     // tas (son adresse, l'argument des gestionnaires, ne bouge plus), et
     // n'y est laissée pour toujours qu'une fois en service.
-    let rx_notifieur = match v.installer_file(FILE_RECEPTION, &rx, ENTREE_RECEPTION) {
+    let partage = v.msix.entrees() < 3;
+    let (entree_rx, entree_tx) = if partage { (ENTREE_FILES, ENTREE_FILES) } else { (ENTREE_RECEPTION, ENTREE_EMISSION) };
+    let rx_notifieur = match v.installer_file(FILE_RECEPTION, &rx, entree_rx) {
         Ok(n) => n,
         Err(e) => return Err(renoncer(v, e)),
     };
-    let tx_notifieur = match v.installer_file(FILE_EMISSION, &tx, ENTREE_EMISSION) {
+    let tx_notifieur = match v.installer_file(FILE_EMISSION, &tx, entree_tx) {
         Ok(n) => n,
         Err(e) => return Err(renoncer(v, e)),
     };
@@ -320,11 +337,13 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
     // champs) ; sans DRIVER_OK, elle n'a encore rien envoyé.
     let mut vecteurs = [None; 3];
     let rendre = |vecteurs: [Option<u8>; 3]| vecteurs.into_iter().flatten().for_each(irq::liberer);
-    for (k, (entree, gestionnaire)) in [
+    let separees = [
         (ENTREE_CONFIGURATION, interruption_configuration as fn(usize)),
         (ENTREE_RECEPTION, interruption_reception),
         (ENTREE_EMISSION, interruption_emission),
-    ].into_iter().enumerate() {
+    ];
+    let partagees = [(ENTREE_CONFIGURATION, interruption_configuration as fn(usize)), (ENTREE_FILES, interruption_files)];
+    for (k, &(entree, gestionnaire)) in if partage { &partagees[..] } else { &separees[..] }.iter().enumerate() {
         let Some(vecteur) = irq::allouer(gestionnaire, argument) else {
             rendre(vecteurs);
             return Err(carte.virtio.echouer(virtio::Refus::Vecteur));
