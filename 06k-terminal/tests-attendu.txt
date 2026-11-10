@@ -210,3 +210,9 @@ mesure contre le PIT), 1000 Hz, vecteur 0xec ; PIT arrete.
 [linux] passerelle : ping avec IP_RECVERR : EHOSTUNREACH, ICMP 3/1 de 10.0.2.15 : ok
 [linux] passerelle : connectee sans IP_RECVERR : rien (l'hote injoignable n'est pas fatal) : ok
 [linux] passerelle : toutes les verifications (muet) : ok
+Mio touches, j'attends
+[noyau] plus de memoire : oom-gros (
+) tue, le plus gros : anonyme 
+[noyau] oom-gros : arrete par un signal (SIGKILL)
+[linux] oom-petit : plus de pages que la memoire libre, touchees apres la mort du plus gros : ok
+[noyau] oom-petit : termine, code de sortie 0.

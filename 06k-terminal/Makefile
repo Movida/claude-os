@@ -634,8 +634,11 @@ $(LINUX)/dynamique: linux/dynamique.c
 # une cible qui dort 10 s et un programme qui lui envoie SIGTERM
 # (signaler), qui doit la réveiller ; deux qui remplissent leurs registres
 # vectoriels (YMM avec AVX, XMM sinon), MXCSR et x87, se préemptent, et
-# doivent les retrouver intacts (avx).
-TESTS_PARALLELES = lignes cible signaler avx
+# doivent les retrouver intacts (avx) ; et, quand la mémoire manque, un
+# gros qui la tient (oom-gros) et un petit qui en demande plus qu'il n'en
+# reste (oom-petit) : le tueur OOM doit choisir le gros, et laisser finir le
+# petit (les soldes d'avant 6k).
+TESTS_PARALLELES = lignes cible signaler avx oom-gros oom-petit
 TESTS_LINUX = mmx-ecrit mmx-lit pointeurs tas mprotect ecrire-code executer-pile lire-noyau lire-zero hlt int80 icebp pas-a-pas mov-ss sgdt \
               zero grande-pile pile-executable recursion oom boucle brk-boucle calcul-long limite-egale \
               sig-term sig-abort sig-gestion sig-faute sig-refaute sig-restorer sig-pile-perdue sig-mxcsr sig-secours \
@@ -915,6 +918,9 @@ tests-demarrage.txt: Makefile
 	  echo "wait"; \
 	  echo "/bin/avx a b &"; \
 	  echo "/bin/avx b a &"; \
+	  echo "wait"; \
+	  echo "/bin/oom-gros &"; \
+	  echo "/bin/oom-petit"; \
 	  echo "wait"; \
 	  echo "/bin/fils faute"; \
 	  echo "/bin/courses"; \

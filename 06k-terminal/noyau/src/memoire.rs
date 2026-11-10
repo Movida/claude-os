@@ -33,12 +33,12 @@
 //!   - garder une RÉSERVE au noyau : les pages et les tables d'un
 //!     programme ne sont prises que s'il reste plus que min_free_kbytes
 //!     (pages.rs) ;
-//!   - quand une page manque vraiment à la faute, TUER le programme
-//!     (SIGKILL, le tueur OOM, tache::arreter_plus_de_memoire). Linux
-//!     choisit le plus gros processus ; nous, celui qui faute. Avec un seul
-//!     programme à la fois, c'était le même ; depuis que plusieurs tournent
-//!     ensemble (`&`, 6e), un petit peut payer pour un gros : un écart, noté
-//!     dans « Reste à faire ».
+//!   - quand une page manque vraiment à la faute, TUER le programme qui
+//!     occupe le plus de mémoire, comme Linux (oom.rs) : celui qui faute
+//!     s'il est le plus gros (SIGKILL au retour,
+//!     tache::arreter_plus_de_memoire), sinon le plus gros, et la faute
+//!     recommence quand il a rendu sa mémoire (depuis les soldes d'avant
+//!     6k ; avant, celui qui faute, toujours).
 //! Options écartées :
 //!   - un budget fixe par programme (celui de l'étape 5 : 256 Mio, ou la
 //!     moitié de la mémoire libre) : `claude` occupe 169 Mo à l'accueil et

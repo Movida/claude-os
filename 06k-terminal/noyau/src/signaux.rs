@@ -1047,6 +1047,18 @@ fn envoyer_a(pid: u32, sig: u64, a: Destinataire, info: Info) -> i64 {
     }
 }
 
+/// SIGKILL au processus `pid`, de la part du noyau (le tueur OOM, oom.rs :
+/// le `do_send_sig_info` de SEND_SIG_PRIV) ; faux s'il n'est plus là.
+pub fn tuer_processus(pid: u32) -> bool {
+    match processus::avec_pid(pid, |p| envoyer(p, SIGKILL, Destinataire::Processus, Info::du_noyau(SIGKILL), true)) {
+        Some(Ok(t)) => {
+            reveiller(t);
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Un signal a-t-il ses propres `si_code` (SIG_SPECIFIC_SICODES_MASK) ?
 pub fn a_ses_propres_codes(sig: u64) -> bool {
     // SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV, SIGCHLD, SIGPOLL, SIGSYS.

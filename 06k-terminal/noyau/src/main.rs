@@ -146,6 +146,7 @@ mod fil;
 mod futex;
 mod linux;
 mod memoire;
+mod oom;
 mod pile;
 mod processus;
 mod procfs;

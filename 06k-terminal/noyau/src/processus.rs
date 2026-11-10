@@ -282,6 +282,14 @@ pub struct Entree {
     /// bascule qui rend la pile du dernier fil : celui qui le recueille voit
     /// toute la mémoire rendue.
     zombie: AtomicBool,
+    /// Sa mémoire est rendue (son dernier fil l'a défaite, `fil_termine`) :
+    /// le tueur OOM ne le choisit plus (Linux saute une tâche sans mm,
+    /// `find_lock_task_mm`), même avant qu'il soit un zombie.
+    sans_memoire: AtomicBool,
+    /// Tué par le tueur OOM sans avoir rendu sa mémoire à temps : il n'est
+    /// plus choisi (le MMF_OOM_SKIP de Linux, par processus : deux victimes
+    /// bloquées ne se remplacent pas l'une l'autre sans fin).
+    mis_de_cote: AtomicBool,
     /// Qui attend sa fin (init, le lanceur : programmes.rs), réveillé quand
     /// il devient un zombie (le `do_notify_parent` de Linux).
     parent: Verrou<Option<Arc<Tache>>>,
@@ -352,6 +360,8 @@ impl Entree {
         // serait une seconde façon de dire la même chose.
         let memoire = self.memoire.ecrire().take();
         drop(memoire);
+        self.sans_memoire.store(true, Ordering::SeqCst);
+        crate::oom::memoire_rendue(self.pid);
         let descripteurs = core::mem::take(&mut *self.descripteurs.verrouiller());
         drop(descripteurs);
         drop(fini);
@@ -482,6 +492,8 @@ pub fn ajouter(processus: Processus, descripteurs: Descripteurs, mut memoire: Me
         calcul: AtomicU64::new(0),
         vivants: AtomicU32::new(0),
         zombie: AtomicBool::new(false),
+        sans_memoire: AtomicBool::new(false),
+        mis_de_cote: AtomicBool::new(false),
         parent: Verrou::new(Some(crate::tache::courante_arc())),
         nom: Verrou::new(nom),
         usage: crate::rusage::DuProcessus::new(),
@@ -732,6 +744,23 @@ pub fn memoire_du_pid<R>(pid: u32, f: impl FnOnce(&Memoire) -> R) -> Option<R> {
 /// corrompre la carte (StackRot, CVE-2023-3269, corrigée ainsi dans 6.5).
 /// Sans processus (une tâche du noyau) : None.
 pub fn servir_faute(adresse: u64, acces: Acces) -> Option<Result<(), Echec>> {
+    // Une page manque vraiment : le tueur OOM choisit (oom.rs). Si c'est un
+    // autre processus, il rend sa mémoire et la faute recommence, comme
+    // l'allocateur de Linux recommence après `out_of_memory`.
+    loop {
+        let r = servir_une_fois(adresse, acces)?;
+        if !matches!(r, Err(Echec::PlusDeMemoire)) {
+            return Some(r);
+        }
+        let moi = crate::tache::courante().processus()?.pid;
+        if matches!(crate::oom::plus_de_memoire(moi), crate::oom::Issue::Mourir) {
+            return Some(r);
+        }
+    }
+}
+
+/// Une fois, `servir_faute`.
+fn servir_une_fois(adresse: u64, acces: Acces) -> Option<Result<(), Echec>> {
     let e = crate::tache::courante().processus()?.clone();
     let _tenue = Tenue::prendre();
     let lu = e.memoire.lire();
@@ -772,6 +801,45 @@ pub fn nombre_de_descripteurs(pid: u32) -> u64 {
 pub fn pour_chaque_pid(mut f: impl FnMut(u32)) {
     for e in TABLE.verrouiller().iter() {
         f(e.pid);
+    }
+}
+
+/// Ce que le tueur OOM sait d'un candidat : son numéro, ses pages
+/// anonymes, ses pages de fichiers, ses tables, son nom.
+pub struct Candidat {
+    pub pid: u32,
+    pub pages: usize,
+    pub pages_fichier: usize,
+    pub tables: usize,
+    pub nom: NomCourt,
+}
+
+/// Le processus qui occupe le plus de mémoire (oom.rs, `oom_badness` : son
+/// RSS, pages anonymes et de fichiers (`get_mm_rss`), et ses tables, lus
+/// dans ses compteurs sans verrou), sauf ceux qui n'ont plus de mémoire
+/// (les zombies compris) et ceux que le tueur a mis de côté.
+pub fn le_plus_gros() -> Option<Candidat> {
+    let mut choisi: Option<Candidat> = None;
+    let poids = |c: &Candidat| c.pages + c.pages_fichier + c.tables;
+    for e in TABLE.verrouiller().iter() {
+        if e.est_zombie() || e.sans_memoire.load(Ordering::SeqCst) || e.mis_de_cote.load(Ordering::SeqCst) {
+            continue;
+        }
+        let c = Candidat {
+            pid: e.pid, pages: e.compteurs.pages(), pages_fichier: e.compteurs.pages_fichier(), tables: e.compteurs.tables(),
+            nom: *e.nom.verrouiller(),
+        };
+        if choisi.as_ref().is_none_or(|x| poids(&c) > poids(x)) {
+            choisi = Some(c);
+        }
+    }
+    choisi
+}
+
+/// Le tueur OOM met `pid` de côté (MMF_OOM_SKIP) : il ne le choisira plus.
+pub fn mettre_de_cote(pid: u32) {
+    if let Some(e) = TABLE.verrouiller().iter().find(|e| e.pid == pid) {
+        e.mis_de_cote.store(true, Ordering::SeqCst);
     }
 }
 
