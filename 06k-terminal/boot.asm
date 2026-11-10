@@ -452,7 +452,14 @@ etage2:
     ; --- Bascule en mode protégé ----------------------------------------------
     ; cli AVANT tout : une interruption maintenant ferait chercher au CPU une
     ; table d'interruptions 32 bits (IDT) qui n'existe pas -> triple faute.
+    ; Le NMI aussi, par le port 0x70 (voir mode_irreel), comme Linux : il
+    ; reste masqué jusqu'à ce que le noyau, son IDT en place, lise l'horloge
+    ; CMOS (temps.rs choisit chaque registre avec le bit 7 à 0, ce qui le
+    ; démasque).
     cli
+    mov al, 0x80
+    out 0x70, al
+    out 0x80, al
     lgdt [gdt_descriptor]   ; Donne au CPU l'adresse et la taille de la GDT.
 
     mov eax, cr0
@@ -527,11 +534,19 @@ a20_check:
 ; 16 bits hauts d'ECX, ESI ou EDI au milieu de `rep movsd`. L'appelant les
 ; rétablit (sti) une fois la copie faite : quelques dizaines de
 ; microsecondes d'attente pour l'horloge, sans conséquence.
-; (Le NMI, lui, ne se masque pas par cli ; Linux le masque par le port
-; 0x70 pour son passage définitif en mode protégé. Notre passage dure
-; quelques instructions : on accepte ce risque infime.)
+; Le NMI, lui, ne se masque pas par cli : comme Linux pour son passage en
+; mode protégé (`realmode_switch_hook`, arch/x86/boot/pm.c), on le masque
+; par le bit 7 du port 0x70 (l'index de l'horloge CMOS), le temps du
+; passage : un NMI au milieu trouverait une IDT de mode réel lue comme une
+; table de mode protégé. 0x80 sélectionne le registre 0 de l'horloge, NMI
+; masqué ; 0 le démasque à la fin (le registre 0, toujours). Une écriture
+; sur le port 0x80 (le port de diagnostic du POST) fait le délai que
+; demandent les vieux contrôleurs, comme `io_delay`.
 mode_irreel:
     cli
+    mov al, 0x80
+    out 0x70, al
+    out 0x80, al
     push ds
     push es
     lgdt [gdt_descriptor]
@@ -546,6 +561,9 @@ mode_irreel:
     mov cr0, eax
     pop es              ; Retour aux valeurs du mode réel (0) :
     pop ds              ; seule la base change, la limite de 4 Gio reste.
+    xor al, al          ; Le NMI démasqué : de retour en mode réel.
+    out 0x70, al
+    out 0x80, al
     ret
 
 ; charger : lit [charge_secteurs] secteurs depuis le secteur [charge_lba]
