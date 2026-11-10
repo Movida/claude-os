@@ -221,7 +221,7 @@ fn poser(memoire: &mut Memoire, image: &Image, fichier: Fichier) -> Result<(), e
             0 => debut,
             n => (segment.adresse + n).next_multiple_of(4096),
         };
-        let drapeaux = Drapeaux::default();
+        let drapeaux = Drapeaux { promise: droits.ecriture, ..Drapeaux::default() };
         if fin_fichier > debut {
             let projection = Projection { fichier: fichier.numero(), page: segment.position / 4096 };
             let zone = Zone { debut, fin: fin_fichier, droits, nature: Nature::Programme, drapeaux, fichier: Some(projection) };
@@ -229,7 +229,7 @@ fn poser(memoire: &mut Memoire, image: &Image, fichier: Fichier) -> Result<(), e
         }
         if fin > fin_fichier {
             let bss = Droits { lecture: true, ecriture: true, execution: segment.execution };
-            let zone = Zone { debut: fin_fichier, fin, droits: bss, nature: Nature::Anonyme, drapeaux, fichier: None };
+            let zone = Zone { debut: fin_fichier, fin, droits: bss, nature: Nature::Anonyme, drapeaux: Drapeaux { promise: true, ..drapeaux }, fichier: None };
             memoire.zones.inserer(zone, &mut memoire::references)?;
         }
         // padzero : la fin de la dernière page du fichier, s'il y a un .bss
@@ -295,7 +295,7 @@ pub fn charger<'a, 'b>(executable: &Executable<'a>, nom: NomCourt, fichier: Fich
         fin: sommet_pile,
         droits: Droits { lecture: true, ecriture: true, execution: executable.pile_executable() },
         nature: Nature::Pile,
-        drapeaux: Drapeaux { vers_le_bas: true, ..Drapeaux::default() },
+        drapeaux: Drapeaux { vers_le_bas: true, promise: true, ..Drapeaux::default() },
         fichier: None,
     };
     memoire.zones.inserer(pile, &mut memoire::references).map_err(espace_utilisateur::Erreur::from)?;

@@ -137,6 +137,12 @@ pub struct Drapeaux {
     /// Copiée à zéro dans l'enfant d'un fork (MADV_WIPEONFORK,
     /// VM_WIPEONFORK).
     pub effacer_au_fork: bool,
+    /// Déjà promise (VM_ACCOUNT) : comptée dans la politique de
+    /// surengagement quand elle est devenue inscriptible (par mmap, brk, le
+    /// chargeur, ou mprotect), elle ne l'est plus quand elle le redevient,
+    /// même après avoir fusionné avec d'autres (deux zones ne fusionnent
+    /// qu'avec les mêmes drapeaux).
+    pub promise: bool,
 }
 
 /// Ce que projette une zone de fichier (6b) : le fichier ouvert (son numéro
@@ -451,10 +457,9 @@ impl Zones {
     /// Réserve la place de `n` zones de plus. Comme `Vec`, la capacité
     /// double (des ajouts un à un restent en temps constant, en moyenne),
     /// mais sans dépasser le maximum : la carte entière tient alors en un
-    /// bloc de 3 Mio (65 530 zones de 48 octets), quand le doublement seul,
-    /// parti d'une page (85 zones), la porterait à 87 040 cases : 4 Mio, la
-    /// taille du plus gros bloc du tas du noyau, qu'une zone d'un octet de
-    /// plus dépasserait.
+    /// bloc de 3,5 Mio (65 530 zones de 56 octets), quand le doublement seul,
+    /// parti d'une page (73 zones), la porterait à 74 752 cases : 4 186 112
+    /// octets, à 8 Kio du plus gros bloc du tas du noyau (4 Mio).
     fn agrandir(&mut self, n: usize) -> Result<(), Erreur> {
         let besoin = self.zones.len() + n;
         if besoin <= self.zones.capacity() {
@@ -831,9 +836,13 @@ mod tests {
 
     #[test]
     fn taille_d_une_zone() {
-        // Le noyau compte sur elle pour borner sa carte : 65 530 zones de 48
-        // octets font 3 Mio (memoire.rs, espace_utilisateur.rs).
-        assert_eq!(size_of::<Zone>(), 48);
+        // Le noyau compte sur elle pour borner sa carte : 65 530 zones de 56
+        // octets font 3,5 Mio (memoire.rs, espace_utilisateur.rs). Des
+        // booléens nommés plutôt que les bits de `vm_flags` : plus lisibles.
+        // Les droits, la nature et les drapeaux prennent 9 octets d'une place
+        // de 16 (après les adresses et le fichier, 40 octets) : sept drapeaux
+        // de plus tiendraient sans la faire grandir.
+        assert_eq!(size_of::<Zone>(), 56);
     }
 
     #[test]

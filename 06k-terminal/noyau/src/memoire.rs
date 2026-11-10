@@ -567,24 +567,35 @@ impl Memoire {
     /// mprotect. Zone par zone depuis `debut`, comme Linux
     /// (`do_mprotect_pkey`) : au premier trou, NonProjetee (ENOMEM), et les
     /// zones d'avant gardent leurs nouveaux droits ; de même pour une zone
-    /// privée qui devient inscriptible, sans MAP_NORESERVE, et qui ne peut
-    /// pas être promise comme par mmap (PlusDeMemoire : plus grande à elle
-    /// seule que toute la mémoire ; Linux la marque alors VM_ACCOUNT, et ne
-    /// la recompte plus ; sans ce drapeau, on recompte une zone rendue
-    /// inscriptible deux fois, ce qui ne change rien tant qu'elle n'a pas,
-    /// entre-temps, fusionné avec d'autres au-delà de la taille de la
-    /// mémoire). Jusqu'aux soldes d'avant 6k, un trou ne laissait rien
-    /// changer : un écart sans raison.
+    /// privée qui devient inscriptible, sans MAP_NORESERVE, jamais promise,
+    /// et dont la partie changée ne peut pas l'être comme par mmap
+    /// (PlusDeMemoire : plus grande à elle seule que toute la mémoire). Une
+    /// zone promise le reste (VM_ACCOUNT, `mprotect_fixup`) : elle n'est plus
+    /// recomptée. Jusqu'aux soldes d'avant 6k, un trou ne laissait rien
+    /// changer, et une zone rendue inscriptible deux fois était recomptée
+    /// (refusée si elle avait fusionné entre-temps au-delà de la taille de la
+    /// mémoire) : deux écarts sans raison.
     pub fn proteger(&mut self, debut: u64, fin: u64, droits: Droits) -> Result<(), Erreur> {
-        let promise = |z: Zone| !droits.ecriture || z.droits.ecriture || z.drapeaux.sans_reserve || engagement_possible(z.taille());
         let mut ici = debut;
         while ici < fin {
             let z = *self.zones.trouver(ici).ok_or(Erreur::NonProjetee)?;
-            if !promise(z) {
+            let bout = z.fin.min(fin);
+            // À promettre : rendue inscriptible, jamais promise, sans
+            // MAP_NORESERVE ; la partie changée seulement (`nrpages`). Une
+            // zone promise le reste, même jamais écrite. Linux retire
+            // VM_ACCOUNT à une zone anonyme sans `anon_vma` (jamais écrite)
+            // qui perd l'écriture, et la recompte ensuite : un écart voulu,
+            // nos zones ne gardent pas la trace d'une première écriture (la
+            // faute tient la carte en lecture), et ce recompte ne refuse
+            // qu'une zone plus grande que toute la mémoire.
+            let a_promettre = droits.ecriture && !z.droits.ecriture && !z.drapeaux.promise && !z.drapeaux.sans_reserve;
+            if a_promettre && !engagement_possible(bout - ici) {
                 return Err(Erreur::PlusDeMemoire);
             }
-            let bout = z.fin.min(fin);
-            self.zones.changer(ici, bout, |z| z.droits = droits, &mut references)?;
+            self.zones.changer(ici, bout, |z| {
+                z.droits = droits;
+                z.drapeaux.promise |= a_promettre;
+            }, &mut references)?;
             self.tables().proteger_plage(ici, bout, droits);
             ici = bout;
         }

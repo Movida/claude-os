@@ -657,7 +657,7 @@ fn brk(demande: u64) -> i64 {
                 fin: pages_apres,
                 droits: Droits { lecture: true, ecriture: true, execution: false },
                 nature: Nature::Tas,
-                drapeaux: Drapeaux::default(),
+                drapeaux: Drapeaux { promise: true, ..Drapeaux::default() },
                 fichier: None,
             };
             // La zone se fond dans celle du tas.
@@ -823,7 +823,7 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage
         } else {
             m.chercher_place(taille, adresse).ok_or(-ENOMEM)?
         };
-        let drapeaux = Drapeaux { sans_reserve, ..Drapeaux::default() };
+        let drapeaux = Drapeaux { sans_reserve, promise: droits.ecriture && !sans_reserve, ..Drapeaux::default() };
         let zone = Zone { debut, fin: debut + taille, droits, nature: Nature::Anonyme, drapeaux, fichier: projection };
         m.ajouter(zone, fixe).map_err(|_| -ENOMEM)?;
         Ok(debut)

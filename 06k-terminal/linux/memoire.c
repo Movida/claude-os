@@ -320,6 +320,29 @@ static const char *droits_dans_maps(const void *a, char droits[8])
     return droits;
 }
 
+/* Une zone déjà promise (VM_ACCOUNT) n'est pas recomptée : deux projections de 1200 Mio côte
+ * à côte fusionnent (2400 Mio : plus que les 2 Gio de la machine de nos tests) ; écrites
+ * (un octet dans chacune), en lecture seule, puis inscriptibles de nouveau : accepté, comme
+ * Linux (`mprotect_fixup`). Sans les écrire, Linux retire VM_ACCOUNT à la zone en lecture
+ * seule (elle n'a pas d'`anon_vma`), et la recompte ensuite : refusée sur une machine de
+ * 2 Gio ; notre noyau la garde promise (un écart voulu, noyau/src/memoire.rs, `proteger`). */
+static void zone_promise(void)
+{
+    size_t t = (size_t)1200 << 20;
+    char *a = mmap(NULL, 2 * t, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    int ok = a != MAP_FAILED
+             && mmap(a, t, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == a
+             && mmap(a + t, t, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == a + t;
+    if (ok) {
+        a[0] = 1;
+        a[t] = 1;
+    }
+    ok = ok && mprotect(a, 2 * t, PROT_READ) == 0 && mprotect(a, 2 * t, PROT_READ | PROT_WRITE) == 0;
+    verifier(ok, "deux zones promises fusionnees, plus grandes que la memoire : rendues inscriptibles de nouveau, sans recompter");
+    if (a != MAP_FAILED)
+        munmap(a, 2 * t);
+}
+
 /* Les refus de mprotect et madvise, et les conseils sans effet. */
 static void erreurs_protections(void)
 {
@@ -380,6 +403,7 @@ int main(void)
     programme();
     populate_write();
     erreurs_protections();
+    zone_promise();
     informations();
     printf("[linux] memoire : %s\n", echecs == 0 ? "toutes les verifications : ok" : "ECHEC");
     return echecs != 0;

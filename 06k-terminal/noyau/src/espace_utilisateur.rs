@@ -119,8 +119,8 @@
 //! memoire.rs) ; le noyau ne panique jamais. Pages et tables d'un
 //! programme sont prises au-dessus de la réserve du noyau
 //! (pages::allouer_pour_programme), et comptées. Sa carte des zones, elle,
-//! vient du tas du noyau, qui peut puiser dans la réserve : 3 Mio au plus
-//! pour 65 530 zones, 5 Mio le temps de l'agrandir, l'ancienne et la
+//! vient du tas du noyau, qui peut puiser dans la réserve : 3,5 Mio au plus
+//! pour 65 530 zones, 5,5 Mio le temps de l'agrandir, l'ancienne et la
 //! nouvelle ensemble (zones/src/lib.rs, `agrandir`) (Linux, lui, prend ses
 //! vm_area_struct au-dessus du seuil ; à faire avec les allocations
 //! faillibles du noyau).
