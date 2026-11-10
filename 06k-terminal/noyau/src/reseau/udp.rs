@@ -9,8 +9,8 @@
 //! à toutes les sockets (recevoir, attendre, l'erreur en attente, l'arrêt)
 //! dans socket.rs.
 //!
-//! Ce qui manque, écrit : SO_SNDBUF ne fait jamais attendre (un datagramme part tout de suite vers
-//! la carte, ou sa petite file) ; MSG_MORE et UDP_CORK ; la multidiffusion.
+//! Ce qui manque, écrit : MSG_MORE et UDP_CORK ; la multidiffusion. (SO_SNDBUF fait attendre
+//! depuis les soldes d'avant 6k : datagramme::attendre_place.)
 
 use super::datagramme::{self, Controle};
 use super::ipv4;
@@ -111,12 +111,15 @@ pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
 ///     sort ici, EINVAL) ;
 ///   - ce que fait toute socket de datagrammes (`datagramme::preparer`) :
 ///     la route, l'adresse source, la MTU, l'erreur en attente, l'arrêt ;
+///   - la place dans SO_SNDBUF (`datagramme::attendre_place` : EAGAIN,
+///     ou l'attente) ; des morceaux au-delà de son double : ENOBUFS ;
 ///   - le paquet (ENOBUFS), la copie (EFAULT), et il part.
 ///
 /// Rend la longueur envoyée.
 pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u64, controle: Result<Controle, i64>,
                mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_OOB: u64 = 1;
+    const MSG_DONTWAIT: u64 = 0x40;
     const MSG_MORE: u64 = 0x8000;
     let mut inet = s.appels.verrouiller();
     datagramme::lier_au_besoin(s, &mut inet)?;
@@ -144,8 +147,12 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     let (chemin, envoi) = datagramme::preparer(s, &mut inet, adresse, udp::ENTETE + longueur, format_ipv4::UDP, drapeaux, &c)?;
     let adresse = envoi.destination;
     let u = udp::Udp { source: inet.port, destination: port };
+    let delai = inet.options.sndtimeo;
     drop(inet);
+    datagramme::attendre_place(s, drapeaux & MSG_DONTWAIT != 0, delai)?;
+    datagramme::morceaux_permis(s, udp::ENTETE + longueur, &envoi)?;
     let Some(mut p) = Paquet::vide(udp::ENTETE + longueur) else { return Err(-ENOBUFS) };
+    datagramme::attacher(s, &mut p);
     let Some(segment) = p.ajouter_fin(udp::ENTETE + longueur) else { return Err(-ENOBUFS) };
     remplir(0, &mut segment[udp::ENTETE..])?;
     udp::ecrire(segment, &u, envoi.source, adresse);
@@ -291,6 +298,20 @@ pub fn signaler(s: &Socket, e: &ErreurRecue, errno: i32, fatale: bool, port: u16
         }
     }
     s.signaler_erreur(errno);
+}
+
+/// La socket UDP de numéro `n`, si elle est liée (pour lui rendre sa place :
+/// datagramme::place_rendue).
+pub fn par_numero(n: u64) -> Option<Arc<Socket>> {
+    let mut trouvee = None;
+    if let Some(t) = PORTS.verrouiller().as_ref() {
+        t.pour_chaque(|s| {
+            if s.numero == n {
+                trouvee = Some(s.clone());
+            }
+        });
+    }
+    trouvee
 }
 
 /// Le nombre de sockets dont quelqu'un attend une lecture (le détecteur

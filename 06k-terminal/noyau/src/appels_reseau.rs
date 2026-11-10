@@ -1457,6 +1457,13 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         SO_SNDBUF => {
             let v = (v as u32).min(TAMPON_MAX).min(i32::MAX as u32 / 2);
             s.sndbuf.store((v * 2).max(SNDBUF_MIN), Ordering::Relaxed);
+            // La copie de la fin d'émission (paquet.rs), et ceux qui
+            // attendaient la place, s'il y en a plus (« Wake up sending tasks
+            // if we upped the value », `sk_setsockopt`).
+            if let Some(e) = &s.envois {
+                e.poser_limite((v * 2).max(SNDBUF_MIN) as usize);
+                crate::reseau::datagramme::reveiller_les_ecrivains(s);
+            }
         }
         SO_RCVBUF => {
             let v = (v as u32).min(TAMPON_MAX).min(i32::MAX as u32 / 2);

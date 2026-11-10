@@ -34,10 +34,13 @@
  *     l'erreur locale d'EMSGSIZE), les sockets de ping (l'écho de
  *     127.0.0.1, l'identifiant remplacé, les refus, MSG_OOB), SOCK_RAW
  *     (EPERM ; EPROTONOSUPPORT pour le protocole 0) ;
- *   - une seule chose sort de lo : une diffusion envoyée par la carte (son
- *     réseau lu dans /proc/net/route) revient une fois, entière, aux sockets
- *     de la machine, comme arrivée par la carte (les soldes d'avant 6k ;
- *     sautée sur une machine sans carte).
+ *   - deux choses sortent de lo (les soldes d'avant 6k ; sautées sur une
+ *     machine sans carte, le réseau de la carte lu dans /proc/net/route) :
+ *     une diffusion envoyée par la carte revient une fois, entière, aux
+ *     sockets de la machine, comme arrivée par la carte ; et SO_SNDBUF fait
+ *     attendre les envois vers une machine muette du réseau, dont les
+ *     datagrammes restent dans la file du voisin (EAGAIN, POLLOUT,
+ *     SO_SNDTIMEO).
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic du noyau : HZ = 250 sous WSL, 1000 sous le Linux de référence).
  */
@@ -1055,28 +1058,36 @@ static ssize_t recu_avec_pktinfo(int r, struct sockaddr_in *de, struct in_pktinf
     return n;
 }
 
+/* L'adresse de diffusion du réseau de la carte (dans l'ordre du réseau) :
+ * la première route sans passerelle de /proc/net/route qui ne soit pas lo.
+ * Faux : pas de carte. */
+static int diffusion_du_reseau(uint32_t *diffusion)
+{
+    FILE *f = fopen("/proc/net/route", "r");
+    char ligne[256], nom[32];
+    unsigned destination, passerelle, masque;
+    int trouve = 0;
+    while (!trouve && f && fgets(ligne, sizeof ligne, f))
+        if (sscanf(ligne, "%31s %x %x %*x %*d %*d %*d %x", nom, &destination, &passerelle, &masque) == 4 && strcmp(nom, "lo")
+            && passerelle == 0 && masque != 0 && masque != 0xffffffff) {
+            *diffusion = destination | ~masque;
+            trouve = 1;
+        }
+    if (f)
+        fclose(f);
+    return trouve;
+}
+
 /* Une diffusion envoyée par la carte revient aux sockets de la machine
  * (`ip_mc_output` : une copie par la boucle, avant tout découpage) : une
  * fois, entière (2000 octets, plus que la MTU), de notre adresse, comme
  * arrivée par la carte (IP_PKTINFO : son interface, pas lo ; la diffusion
  * pour destination ; notre adresse pour répondre) ; de même pour
- * 255.255.255.255. Le réseau de la carte : la première route sans
- * passerelle de /proc/net/route qui ne soit pas lo. */
+ * 255.255.255.255. */
 static void diffusion_de_la_carte(void)
 {
-    FILE *f = fopen("/proc/net/route", "r");
-    char ligne[256], nom[32];
-    unsigned destination, passerelle, masque, d = 0, m = 0;
-    while (f && fgets(ligne, sizeof ligne, f))
-        if (sscanf(ligne, "%31s %x %x %*x %*d %*d %*d %x", nom, &destination, &passerelle, &masque) == 4 && strcmp(nom, "lo")
-            && passerelle == 0 && masque != 0 && masque != 0xffffffff) {
-            d = destination | ~masque;
-            m = masque;
-            break;
-        }
-    if (f)
-        fclose(f);
-    if (!m) {
+    uint32_t d;
+    if (!diffusion_du_reseau(&d)) {
         verifier(1, "pas de carte : la diffusion de la carte, sautee");
         return;
     }
@@ -1110,6 +1121,82 @@ static void diffusion_de_la_carte(void)
     }
 }
 
+/* SO_SNDBUF fait attendre un envoi (les soldes d'avant 6k) : un datagramme
+ * compte dans SO_SNDBUF de sa socket (le `sk_wmem_alloc` de Linux) jusqu'à
+ * ce que la carte l'ait fini, ou qu'il soit jeté. Vers une machine muette
+ * du réseau de la carte (l'avant-dernière adresse, que personne ne prend :
+ * ni QEMU ni Docker n'y répondent), il reste dans la file du voisin jusqu'à
+ * l'échec de la résolution (trois requêtes ARP, une par seconde). Avec
+ * SO_SNDBUF au minimum : quelques envois MSG_DONTWAIT, puis EAGAIN ; poll ne
+ * dit plus POLLOUT ; un envoi bloquant attend SO_SNDTIMEO (200 ms), puis
+ * rend EAGAIN ; sans délai, un envoi (vers lo : il ne laisse rien dans la
+ * file du voisin) attend, dans un autre fil, pendant que poll attend
+ * POLLOUT : les deux reviennent à l'échec de la résolution. Le nombre
+ * d'envois avant EAGAIN n'est pas comparé : il dépend de la taille vraie des
+ * paquets, qui n'est pas la même chez nous. */
+struct envoi_bloquant {
+    int s;
+    struct sockaddr_in vers;
+    ssize_t n;
+    double duree;
+};
+
+static void *envoyer_en_attendant(void *p)
+{
+    struct envoi_bloquant *e = p;
+    static char c[100];
+    double t = maintenant();
+    e->n = sendto(e->s, c, sizeof c, 0, (struct sockaddr *)&e->vers, sizeof e->vers);
+    e->duree = maintenant() - t;
+    return NULL;
+}
+
+static void sndbuf_attend(void)
+{
+    uint32_t d;
+    if (!diffusion_du_reseau(&d)) {
+        verifier(1, "pas de carte : SO_SNDBUF vers une machine muette, saute");
+        return;
+    }
+    struct sockaddr_in a = adresse(ntohl(d) - 2, 9);
+    int s = udp(0), un = 1;
+    setsockopt(s, SOL_SOCKET, SO_SNDBUF, &un, sizeof un);
+    static char c[1000];
+    int n = 0, e = 0;
+    while (n < 20 && sendto(s, c, sizeof c, MSG_DONTWAIT, (struct sockaddr *)&a, sizeof a) == (ssize_t)sizeof c)
+        n++;
+    e = errno;
+    verifier(n >= 1 && n <= 10 && e == EAGAIN, "SO_SNDBUF au minimum, vers une machine muette : quelques envois, puis EAGAIN");
+    struct pollfd p = { .fd = s, .events = POLLOUT };
+    verifier(poll(&p, 1, 0) == 0, "la place manque : plus de POLLOUT");
+    struct timeval tv = { .tv_usec = 200000 };
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    double t = maintenant();
+    ssize_t k = sendto(s, c, sizeof c, 0, (struct sockaddr *)&a, sizeof a);
+    e = errno;
+    double duree = maintenant() - t;
+    verifier(k < 0 && e == EAGAIN && duree >= 0.19 && duree < 1, "un envoi bloquant attend SO_SNDTIMEO (200 ms), puis EAGAIN");
+    tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+    int r = udp(0);
+    struct sockaddr_in moi = adresse(INADDR_LOOPBACK, 0);
+    socklen_t l = sizeof moi;
+    bind(r, (struct sockaddr *)&moi, sizeof moi);
+    getsockname(r, (struct sockaddr *)&moi, &l);
+    struct envoi_bloquant b = { .s = s, .vers = moi };
+    pthread_t f;
+    pthread_create(&f, NULL, envoyer_en_attendant, &b);
+    t = maintenant();
+    int pr = poll(&p, 1, 10000);
+    duree = maintenant() - t;
+    pthread_join(f, NULL);
+    verifier(pr == 1 && (p.revents & POLLOUT) && duree >= 0.5 && duree <= 8,
+             "POLLOUT revient a l'echec de la resolution (de 0,5 a 8 s)");
+    verifier(b.n == 100 && b.duree >= 0.5 && b.duree <= 8, "sans delai, un envoi attend l'echec de la resolution, puis part");
+    close(r);
+    close(s);
+}
+
 int main(void)
 {
     creation();
@@ -1125,6 +1212,7 @@ int main(void)
     icmp();
     decalage_de_peek();
     diffusion_de_la_carte();
+    sndbuf_attend();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

@@ -18,6 +18,7 @@
 //! lanceur les montre quand « memoire rendue » échoue, pour qu'un écart
 //! dise tout de suite s'il vient d'une file du réseau.
 
+use crate::attente::FileAttente;
 use crate::faillible;
 use crate::partage::Arc;
 use alloc::vec::Vec;
@@ -56,11 +57,66 @@ pub struct Retenue {
     rendu: AtomicU64,
     /// Le numéro de la socket, pour la rappeler.
     socket: u64,
+    /// Pour une socket de datagrammes (UDP, ping : les soldes d'avant 6k), sa file d'attente :
+    /// une place rendue quand quelqu'un y attend (un envoi, poll, epoll) la fait rappeler
+    /// (`sock_wfree` et `sk_write_space`, voir `Proprietaire::rendre`) ; et sa limite,
+    /// SO_SNDBUF (le `sk_sndbuf`, une copie de celui de la socket, que la fin d'émission lit
+    /// sans elle).
+    attente: Option<Arc<FileAttente>>,
+    limite: AtomicUsize,
+    /// La place a manqué à un envoi, ou à `poll` (SOCKWQ_ASYNC_NOSPACE) : la place rendue
+    /// le dira aussi par SIGIO (O_ASYNC).
+    sans_place: AtomicBool,
 }
 
 impl Retenue {
     pub const fn new(socket: u64) -> Retenue {
-        Retenue { octets: AtomicUsize::new(0), etranglee: AtomicBool::new(false), a_pousser: AtomicBool::new(false), rendu: AtomicU64::new(0), socket }
+        Retenue {
+            octets: AtomicUsize::new(0), etranglee: AtomicBool::new(false), a_pousser: AtomicBool::new(false), rendu: AtomicU64::new(0),
+            socket, attente: None, limite: AtomicUsize::new(0), sans_place: AtomicBool::new(false),
+        }
+    }
+
+    /// Celle d'une socket de datagrammes de numéro `socket`, de file `attente`, et de
+    /// SO_SNDBUF `limite`.
+    pub fn pour_datagrammes(socket: u64, limite: usize, attente: Arc<FileAttente>) -> Retenue {
+        Retenue { attente: Some(attente), limite: AtomicUsize::new(limite), ..Retenue::new(socket) }
+    }
+
+    /// SO_SNDBUF.
+    pub fn limite(&self) -> usize {
+        self.limite.load(Ordering::Relaxed)
+    }
+
+    /// SO_SNDBUF a changé.
+    pub fn poser_limite(&self, limite: usize) {
+        self.limite.store(limite, Ordering::Relaxed);
+    }
+
+    /// Un envoi a de la place : moins que SO_SNDBUF en route (`sock_alloc_send_pskb`).
+    pub fn place(&self) -> bool {
+        self.octets.load(Ordering::SeqCst) < self.limite.load(Ordering::Relaxed)
+    }
+
+    /// `poll` dit POLLOUT : moins que la moitié de SO_SNDBUF en route (`sock_writeable`).
+    pub fn ecriture_possible(&self) -> bool {
+        self.octets.load(Ordering::SeqCst) < self.limite.load(Ordering::Relaxed) / 2
+    }
+
+    /// La place a manqué (SOCKWQ_ASYNC_NOSPACE) ; `encore_sans_place` le revérifie
+    /// après le drapeau (le motif de Dekker avec `Proprietaire::rendre`, voir
+    /// `etrangler`) : la place rendue entre les deux, on se rappelle soi-même.
+    pub fn marquer_sans_place(&self, encore_sans_place: impl FnOnce() -> bool) {
+        self.sans_place.store(true, Ordering::SeqCst);
+        if !encore_sans_place() && self.sans_place.swap(false, Ordering::SeqCst) {
+            super::tache::armer_precis(self.socket, 0);
+        }
+    }
+
+    /// Le rappel d'une socket de datagrammes est venu (la tâche du réseau) : le drapeau
+    /// « sans place » effacé (asynchrone.rs garde le sien, pour SIGIO).
+    pub fn rappelee(&self) {
+        self.sans_place.store(false, Ordering::Relaxed);
     }
 
     pub fn octets(&self) -> usize {
@@ -125,11 +181,22 @@ impl Proprietaire {
     /// est jeté.
     pub fn rendre(self) {
         let r = &self.retenue;
-        // SeqCst : la paire d'`etrangler` (voir là).
-        r.octets.fetch_sub(self.taille, Ordering::SeqCst);
+        // SeqCst : la paire d'`etrangler` (voir là), et de `marquer_sans_place`.
+        let reste = r.octets.fetch_sub(self.taille, Ordering::SeqCst) - self.taille;
         r.rendu.fetch_max(self.numero, Ordering::Relaxed);
         if r.etranglee.swap(false, Ordering::SeqCst) {
             r.rappeler();
+        }
+        // Une socket de datagrammes (`sock_wfree`, puis `sock_def_write_space`) : assez de
+        // place pour un progrès « significatif » (moins de la moitié de SO_SNDBUF en route),
+        // et quelqu'un attend dans sa file, ou a vu la place manquer. Le réveil lui-même dans
+        // la tâche du réseau, comme `tcp_wfree` (`rappeler`) : nous sommes sous le verrou de
+        // la carte, et SIGIO prend ceux des processus (asynchrone.rs).
+        if let Some(a) = &r.attente
+            && reste < r.limite.load(Ordering::Relaxed) / 2
+            && (r.sans_place.load(Ordering::SeqCst) || a.active())
+        {
+            super::tache::armer_precis(r.socket, 0);
         }
     }
 }
@@ -231,6 +298,11 @@ impl Paquet {
     /// Le lien passe à ce qui garde la trame (une case de la carte).
     pub fn prendre_proprietaire(&mut self) -> Option<Proprietaire> {
         self.proprietaire.take()
+    }
+
+    /// La socket qu'il tient, s'il en tient une (pour ses morceaux, ipv4::fragmenter).
+    pub fn retenue(&self) -> Option<&Arc<Retenue>> {
+        self.proprietaire.as_ref().map(|p| &p.retenue)
     }
 }
 

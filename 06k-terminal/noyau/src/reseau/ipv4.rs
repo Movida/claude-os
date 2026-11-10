@@ -486,6 +486,11 @@ fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
         let reste = donnees.len() - debut;
         let n = if reste > place { place } else { reste };
         let Some(mut q) = Paquet::vide(n) else { return };
+        // Chaque morceau compte dans le SO_SNDBUF de la socket, comme le
+        // paquet entier (`__ip_append_data` les lui attache un à un).
+        if let Some(r) = p.retenue() {
+            q.attacher(r, 0);
+        }
         let Some(o) = q.ajouter_fin(n) else { return };
         o.copy_from_slice(&donnees[debut..debut + n]);
         envoyer(c, e, q, (debut / 8) as u16, n < reste);

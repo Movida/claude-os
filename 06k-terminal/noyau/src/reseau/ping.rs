@@ -102,6 +102,7 @@ pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
 pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u64, controle: Result<Controle, i64>,
                mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_OOB: u64 = 1;
+    const MSG_DONTWAIT: u64 = 0x40;
     let mut inet = s.appels.verrouiller();
     datagramme::lier_au_besoin(s, &mut inet)?;
     if longueur > 0xFFFF {
@@ -132,8 +133,13 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     let c = controle?;
     let (chemin, envoi) = datagramme::preparer(s, &mut inet, adresse, longueur, format_ipv4::ICMP, drapeaux, &c)?;
     let ident = inet.port;
+    let delai = inet.options.sndtimeo;
     drop(inet);
+    // SO_SNDBUF, comme UDP (`ping_v4_sendmsg` passe par `ip_append_data`).
+    datagramme::attendre_place(s, drapeaux & MSG_DONTWAIT != 0, delai)?;
+    datagramme::morceaux_permis(s, longueur, &envoi)?;
     let Some(mut p) = Paquet::vide(longueur) else { return Err(-ENOBUFS) };
+    datagramme::attacher(s, &mut p);
     let Some(m) = p.ajouter_fin(longueur) else { return Err(-ENOBUFS) };
     remplir(icmp::ENTETE, &mut m[icmp::ENTETE..])?;
     let numero = u16::from_be_bytes([entete[6], entete[7]]);
@@ -183,6 +189,19 @@ pub fn erreur(e: &ErreurRecue) {
         },
     };
     super::udp::signaler(&s, e, errno, fatale, 0, 0);
+}
+
+/// La socket de ping de numéro `n`, si elle est liée (datagramme::place_rendue).
+pub fn par_numero(n: u64) -> Option<Arc<Socket>> {
+    let mut trouvee = None;
+    if let Some(t) = IDENTS.verrouiller().as_ref() {
+        t.pour_chaque(|s| {
+            if s.numero == n {
+                trouvee = Some(s.clone());
+            }
+        });
+    }
+    trouvee
 }
 
 /// Le nombre de sockets de ping dont quelqu'un attend une lecture.

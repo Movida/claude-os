@@ -306,6 +306,12 @@ impl ListeAsync {
         }
     }
 
+    /// SOCKWQ_ASYNC_NOSPACE effacé : un écrivain va attendre dans l'appel,
+    /// la place rendue ne doit pas lui envoyer SIGIO (`sock_wait_for_wmem`).
+    pub fn oublier_sans_place(&self) {
+        self.sans_place.store(false, Ordering::SeqCst);
+    }
+
     /// SOCK_WAKE_IO.
     pub fn evenement(&self, raison: Raison) {
         self.tuer(SIGIO, raison);

@@ -268,9 +268,10 @@ fn boucle() {
                 voisins = true;
             } else if objet == OBJET_FRAGMENTS {
                 super::ipv4::fragments_echus();
-            } else {
-                // Une connexion TCP, ou une entrée de TIME_WAIT.
-                super::tcp::echeance(objet);
+            } else if !super::tcp::echeance(objet) {
+                // Ni une connexion TCP, ni une entrée de TIME_WAIT : une
+                // socket de datagrammes, sa place rendue (paquet.rs).
+                super::datagramme::place_rendue(objet);
             }
         }
         if core::mem::take(&mut voisins) {

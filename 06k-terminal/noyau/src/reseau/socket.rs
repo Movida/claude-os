@@ -321,16 +321,28 @@ pub struct Socket {
     pub flux: Option<alloc::boxed::Box<crate::attente::Possession<super::tcp::Partie>>>,
     /// La partie d'une socket AF_UNIX (unix.rs).
     pub unix: Option<alloc::boxed::Box<super::unix::Unix>>,
+    /// Ce qu'une socket de datagrammes (UDP, ping) a encore en route, compté dans
+    /// SO_SNDBUF (le `sk_wmem_alloc`, paquet.rs ; les soldes d'avant 6k : jusque-là, un
+    /// envoi n'attendait jamais). TCP a la sienne, dans son flux.
+    pub envois: Option<Arc<super::paquet::Retenue>>,
 }
 
 impl Socket {
     /// Une socket neuve, sans port ; None : plus de mémoire (pour sa file
     /// d'attente).
     pub fn new(protocole: Protocole, sorte: u16, proto: u16, uid: u32) -> Option<Socket> {
+        let numero = NUMEROS.fetch_add(1, Ordering::Relaxed);
+        let attente = Arc::new(FileAttente::new()).ok()?;
+        let envois = match protocole {
+            Protocole::Udp | Protocole::Ping => {
+                Some(Arc::new(super::paquet::Retenue::pour_datagrammes(numero, TAMPON_DEFAUT as usize, attente.clone())).ok()?)
+            }
+            Protocole::Tcp | Protocole::Unix => None,
+        };
         Some(Socket {
-            numero: NUMEROS.fetch_add(1, Ordering::Relaxed),
+            numero,
             protocole, sorte, proto, uid,
-            attente: Arc::new(FileAttente::new()).ok()?,
+            attente,
             reception: Verrou::new(Reception { file: VecDeque::new(), erreurs: VecDeque::new(), octets: 0, erreur: 0, arret: 0 }),
             appels: Mutex::new(Inet {
                 lie: false, adresse: [0; 4], port: 0, port_choisi: false, adresse_choisie: false, connecte: false,
@@ -347,6 +359,7 @@ impl Socket {
             suivante: Verrou::new(None),
             flux: None,
             unix: None,
+            envois,
         })
     }
 
@@ -502,8 +515,9 @@ impl Socket {
     /// Ce qu'on peut faire de la socket sans attendre (le `datagram_poll`
     /// de Linux) : une erreur en attente ou en file (POLLERR), l'arrêt de la lecture (POLLRDHUP,
     /// et POLLIN : un recv rendra 0), les deux arrêts (POLLHUP), un
-    /// datagramme en file (POLLIN), et toujours l'écriture (nos envois ne
-    /// comptent pas dans SO_SNDBUF : « Reste à faire »).
+    /// datagramme en file (POLLIN), et l'écriture si moins de la moitié de
+    /// SO_SNDBUF est en route (`sock_writeable` ; sinon, la place a manqué :
+    /// SOCKWQ_ASYNC_NOSPACE, pour SIGIO).
     pub fn sonder(&self, table: &mut Table, tenu: &FichierTenu) -> u32 {
         if let Some(f) = &self.flux {
             table.attendre(&f.file, tenu);
@@ -514,8 +528,16 @@ impl Socket {
             return super::unix::sonder(self);
         }
         table.attendre(&self.attente, tenu);
+        let ecriture = match &self.envois {
+            Some(e) if !e.ecriture_possible() => {
+                self.asynchrone.marquer_sans_place(|| !e.ecriture_possible());
+                e.marquer_sans_place(|| !e.ecriture_possible());
+                0
+            }
+            _ => POLLOUT | POLLWRNORM | POLLWRBAND,
+        };
         let r = self.reception.verrouiller();
-        let mut m = POLLOUT | POLLWRNORM | POLLWRBAND;
+        let mut m = ecriture;
         if r.erreur != 0 || !r.erreurs.is_empty() {
             m |= POLLERR;
         }

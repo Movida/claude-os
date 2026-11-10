@@ -6,7 +6,11 @@
 //! d'un envoi et d'une arrivée est dans le sien (udp.rs, ping.rs).
 
 use super::ipv4;
+use super::paquet::{self, Paquet};
 use super::socket::{self, AF_INET, AF_UNSPEC, Inet, Protocole, Socket};
+use crate::attente::{self, Sommeil};
+use crate::sondage::{POLLOUT, POLLWRBAND, POLLWRNORM};
+use crate::tache::Reveil;
 use crate::partage::Arc;
 use core::sync::atomic::Ordering;
 use formats::reseau::ipv4 as format_ipv4;
@@ -312,4 +316,100 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
         source, destination, protocole, ttl: c.ttl.or(inet.options.ttl).unwrap_or(64), tos: c.tos.unwrap_or(inet.options.tos),
         identifiant, ne_pas_fragmenter, mtu, confirmer: drapeaux & MSG_CONFIRM != 0,
     }))
+}
+
+// --- SO_SNDBUF (les soldes d'avant 6k) ---
+
+/// Attend qu'un envoi de la socket `s` ait de la place, dans l'ordre de
+/// `sock_alloc_send_pskb` : une erreur en attente, prise et rendue ;
+/// l'écriture arrêtée : EPIPE ; moins que SO_SNDBUF en route : la place ;
+/// MSG_DONTWAIT (ou O_NONBLOCK) : EAGAIN ; sinon attendre, au plus jusqu'à
+/// l'échéance de SO_SNDTIMEO (puis EAGAIN), un signal : ERESTARTSYS, ou
+/// EINTR avec un délai (`sock_intr_errno`), et revoir tout cela. Le
+/// `Mutex` de la socket n'est pas tenu (Linux ne prend pas son verrou pour
+/// un envoi sans bouchon) : un autre fil peut l'utiliser pendant l'attente.
+pub fn attendre_place(s: &Socket, non_bloquant: bool, delai: Option<u64>) -> Result<(), i64> {
+    const EPIPE: i64 = 32;
+    const EINTR: i64 = 4;
+    let Some(r) = &s.envois else { return Ok(()) };
+    let echeance = delai.map(|d| crate::temps::ns_monotone().saturating_add(d));
+    let arretee = || s.reception.verrouiller().arret & socket::ARRET_ECRITURE != 0;
+    loop {
+        let erreur = s.prendre_erreur();
+        if erreur != 0 {
+            return Err(-(erreur as i64));
+        }
+        if arretee() {
+            return Err(-EPIPE);
+        }
+        if r.place() {
+            return Ok(());
+        }
+        // SOCKWQ_ASYNC_NOSPACE et SOCK_NOSPACE : la place revue derrière
+        // chaque drapeau (asynchrone.rs, paquet.rs).
+        s.asynchrone.marquer_sans_place(|| !r.place());
+        r.marquer_sans_place(|| !r.place());
+        if non_bloquant {
+            return Err(-EAGAIN);
+        }
+        // Qui attend dans l'appel n'a pas de SIGIO à la place rendue :
+        // SOCKWQ_ASYNC_NOSPACE effacé avant d'attendre (`sock_wait_for_wmem`).
+        s.asynchrone.oublier_sans_place();
+        let pret = || r.place() || arretee() || s.reception.verrouiller().erreur != 0;
+        match attente::attendre_que(&s.attente, attente::Inscription::Ordinaire, Sommeil::Interruptible, echeance, pret) {
+            Reveil::Reveillee => {}
+            Reveil::Echeance => return Err(-EAGAIN),
+            Reveil::Signal => return Err(if delai.is_some() { -EINTR } else { -crate::reprise::ERESTARTSYS }),
+        }
+    }
+}
+
+/// Un datagramme de `charge` octets (après l'en-tête IPv4) qui sera
+/// découpé en morceaux pour la MTU `mtu` : ses morceaux, comptés à leur
+/// taille vraie, ne doivent pas mener ce qui est en route au-delà du double
+/// de SO_SNDBUF (le `wmem_alloc_delta <= 2 * sk_sndbuf` de
+/// `__ip_append_data`) : ENOBUFS. Sans découpage, ou avec DF (le paquet ne
+/// partira pas), rien à compter.
+pub fn morceaux_permis(s: &Socket, charge: usize, envoi: &ipv4::Envoi) -> Result<(), i64> {
+    const ENOBUFS: i64 = 105;
+    let Some(r) = &s.envois else { return Ok(()) };
+    if charge + format_ipv4::ENTETE <= envoi.mtu as usize || envoi.ne_pas_fragmenter {
+        return Ok(());
+    }
+    let place = (envoi.mtu as usize - format_ipv4::ENTETE) & !7;
+    let morceaux = charge.div_ceil(place);
+    let taille = morceaux * (paquet::MARGE + place + paquet::SURCOUT);
+    if r.octets() + taille > 2 * r.limite() {
+        return Err(-ENOBUFS);
+    }
+    Ok(())
+}
+
+/// Le paquet `p` d'une socket de datagrammes compte dans son SO_SNDBUF
+/// jusqu'à ce que la carte l'ait fini (`skb_set_owner_w`).
+pub fn attacher(s: &Socket, p: &mut Paquet) {
+    if let Some(r) = &s.envois {
+        p.attacher(r, 0);
+    }
+}
+
+/// La place rendue d'une socket de datagrammes, dans la tâche du réseau
+/// (rappelée par `Proprietaire::rendre`, paquet.rs ; la socket de numéro
+/// `n`, si elle est encore liée) : `sock_def_write_space`, s'il y a encore
+/// de quoi progresser, réveille qui attend (POLLOUT), et SIGIO pour qui a
+/// vu la place manquer. Vrai si c'était une socket de datagrammes.
+pub fn place_rendue(n: u64) -> bool {
+    let Some(s) = super::udp::par_numero(n).or_else(|| super::ping::par_numero(n)) else { return false };
+    reveiller_les_ecrivains(&s);
+    true
+}
+
+/// `sk_write_space` : aussi quand SO_SNDBUF grandit (setsockopt).
+pub fn reveiller_les_ecrivains(s: &Socket) {
+    let Some(r) = &s.envois else { return };
+    r.rappelee();
+    if r.ecriture_possible() {
+        s.attente.reveiller(POLLOUT | POLLWRNORM | POLLWRBAND, 0);
+        s.asynchrone.place();
+    }
 }
