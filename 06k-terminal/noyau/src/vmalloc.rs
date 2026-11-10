@@ -48,7 +48,7 @@
 
 use crate::pagination::{self, ECRITURE, SANS_CACHE};
 use crate::faillible::VecFaillible;
-use crate::pages;
+use crate::{cpu, pages};
 use crate::verrou::Verrou;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -332,6 +332,15 @@ impl Projection {
 /// des pages entières qui la couvrent. None : plus de place, ou plus de
 /// mémoire pour une table (rien ne reste alors).
 fn projeter(physique: u64, longueur: u64, genre: Genre) -> Option<Projection> {
+    // Une adresse que le processeur ne sait pas former (au-delà de
+    // MAXPHYADDR : une table de l'ACPI abîmée, une BAR mal lue) : refusée,
+    // comme le `phys_addr_valid` de `__ioremap_caller` (Linux le dit, et
+    // rend NULL). La projeter ferait poser des bits réservés dans une
+    // entrée de table : une faute à la première lecture.
+    if physique >> cpu::bits_physiques() != 0 {
+        afficherln!("[noyau] projection refusee : {:#x} est au-dela des {} bits d'adresse physique.", physique, cpu::bits_physiques());
+        return None;
+    }
     let premiere = physique / PAGE * PAGE;
     let fin = physique.checked_add(longueur.max(1))?.next_multiple_of(PAGE);
     let pages = (fin - premiere) / PAGE;

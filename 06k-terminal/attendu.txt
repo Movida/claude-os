@@ -22,7 +22,7 @@
 [noyau] Pages allouees : … (… Kio), … (… Kio), … (… Kio) ; prise deux fois, rendue au second lacher : ok ; rendues et recollees : ok.
 [noyau] Tas : Vec de 1000 carres (somme 332833500), Box, String, 1 Mio d'un bloc (1048576 octets a 1) : ok ; pages vides rendues : ok.
 [noyau] Adresses du noyau a la demande (vmalloc) : … piles de … Kio sous leur page de garde, tables faites d'avance (… Kio).
-[noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : ok ; garde sans projection : ok ; rendue : ok ; memoire video projetee sans cache : ok ; BIOS projete en lecture seule : ok, memoire vive refusee : ok.
+[noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : ok ; garde sans projection : ok ; rendue : ok ; memoire video projetee sans cache : ok ; BIOS projete en lecture seule : ok, memoire vive refusee : ok ; au-dela des … bits d'adresse physique, refusee : ok.
 [noyau] Espace d'un programme : page 0x400000 ecrite par son adresse (copie protegee), relue par le cadre … ; memoire rendue : ok.
 [noyau] ACPI : RSDP v0 (BOCHS), RSDT : FACP APIC HPET WAET.
 [noyau] ACPI : 4 processeurs, APIC local a 0xfee00000, IO-APIC 0 a 0xfec00000 (GSI a partir de 0), 8259 present.

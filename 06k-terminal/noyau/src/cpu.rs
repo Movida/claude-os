@@ -175,6 +175,16 @@ pub fn ss_recharges() -> u64 {
     SS_RECHARGES.load(core::sync::atomic::Ordering::Relaxed)
 }
 
+/// Le nombre de bits d'une adresse physique (MAXPHYADDR) : CPUID
+/// 0x80000008, comme `get_cpu_address_sizes` de Linux ; 36 si le
+/// processeur n'a pas cette feuille (la valeur de Linux pour x86_64).
+pub fn bits_physiques() -> u32 {
+    if core::arch::x86_64::__cpuid(0x8000_0000).eax < 0x8000_0008 {
+        return 36;
+    }
+    core::arch::x86_64::__cpuid(0x8000_0008).eax & 0xFF
+}
+
 /// Fixe la base de FS du programme en cours.
 pub fn ecrire_base_fs(base: u64) {
     // SAFETY: le MSR existe sur tout processeur 64 bits ; le noyau ne se

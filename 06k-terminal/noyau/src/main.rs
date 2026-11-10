@@ -1209,9 +1209,13 @@ fn tester_vmalloc() {
         pages::liberer(c, 0);
         refusee
     }) == Some(true);
+    // Une adresse au-delà de MAXPHYADDR : refusée, pour des registres comme
+    // pour une table (vmalloc::projeter).
+    let bits = cpu::bits_physiques();
+    let au_dela = vmalloc::ioremap(1 << bits, 8).is_none() && vmalloc::memremap(1 << bits, 8).is_none();
     let ok = |b: bool| if b { "ok" } else { "ECHEC" };
-    afficherln!("[noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : {} ; garde sans projection : {} ; rendue : {} ; memoire video projetee sans cache : {} ; BIOS projete en lecture seule : {}, memoire vive refusee : {}.",
-                ok(ecrite), ok(garde), ok(rendue), ok(video), ok(bios), ok(vive));
+    afficherln!("[noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : {} ; garde sans projection : {} ; rendue : {} ; memoire video projetee sans cache : {} ; BIOS projete en lecture seule : {}, memoire vive refusee : {} ; au-dela des {} bits d'adresse physique, refusee : {}.",
+                ok(ecrite), ok(garde), ok(rendue), ok(video), ok(bios), ok(vive), bits, ok(au_dela));
 }
 
 /// Vérifie les vecteurs donnés à la demande : un vecteur donné, une IPI à
