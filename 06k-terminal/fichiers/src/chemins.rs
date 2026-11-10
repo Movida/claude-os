@@ -45,6 +45,7 @@
 
 use crate::{EXECUTER, Erreur, Identite, S_IFDIR, S_IFLNK, S_IFMT, permis};
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// La plus longue chaîne de chemin acceptée, zéro final compris : un
 /// chemin de 4096 octets ou plus est refusé (ENAMETOOLONG), comme Linux.
@@ -255,7 +256,7 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
     };
     let mut pile: Vec<Morceau<'a>> = Vec::new();
     pile.try_reserve(4).map_err(|_| Erreur::ENOMEM)?;
-    pile.push(Morceau { texte: Texte::Emprunte(chemin), position: 0, barre: false });
+    pile.ajouter_dans_la_place(Morceau { texte: Texte::Emprunte(chemin), position: 0, barre: false });
     let mut liens = 0u32;
     loop {
         // Les morceaux finis (des barres, puis rien) cèdent la place à
@@ -332,17 +333,13 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
                 if let Some(cible) = arbre.saut(lien) {
                     compter_lien(&mut liens)?;
                     sauter_sous(depart)?;
-                    let mut copie = Vec::new();
-                    copie.try_reserve_exact(nom.len()).map_err(|_| Erreur::ENOMEM)?;
-                    copie.extend_from_slice(nom);
+                    let copie = faillible::copie(nom)?;
                     return Ok(Fin { dossier: courant, nom: copie, objet: Some(cible), dernier: Dernier::Nom, barre });
                 }
                 courant = suivre_lien(arbre, depart, lien, &mut liens, &mut pile, barre, courant)?;
                 continue;
             }
-            let mut copie = Vec::new();
-            copie.try_reserve_exact(nom.len()).map_err(|_| Erreur::ENOMEM)?;
-            copie.extend_from_slice(nom);
+            let copie = faillible::copie(nom)?;
             return Ok(Fin { dossier: courant, nom: copie, objet, dernier: Dernier::Nom, barre });
         }
         let Some(objet) = objet else {
@@ -400,7 +397,7 @@ fn suivre_lien<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, lien: A::O
         courant
     };
     pile.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
-    pile.push(Morceau { texte: cible, position: 0, barre });
+    pile.ajouter_dans_la_place(Morceau { texte: cible, position: 0, barre });
     Ok(depuis)
 }
 

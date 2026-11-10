@@ -33,6 +33,7 @@ use crate::chemins::{Arbre, Dernier, Fin, PATH_MAX, Texte};
 use crate::tmpfs::{Attributs, Numero, RENAME_EXCHANGE, RENAME_NOREPLACE, Tmpfs};
 use crate::{Erreur, Identite, S_IFDIR, S_IFMT, S_IFREG};
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// Le numéro d'un système monté : sa place dans la table des montages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -332,7 +333,7 @@ impl<'a, M: Monte> Vue<'a, M> {
                 return Err(Erreur::ENAMETOOLONG);
             }
             noms.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
-            noms.push(m.nom(n));
+            noms.ajouter_dans_la_place(m.nom(n));
             n = m.parent(n);
         }
         chemin.try_reserve_exact(longueur - chemin.len()).map_err(|_| Erreur::ENOMEM)?;
@@ -340,11 +341,11 @@ impl<'a, M: Monte> Vue<'a, M> {
             chemin.clear();
         }
         for nom in noms.iter().rev() {
-            chemin.push(b'/');
-            chemin.extend_from_slice(nom);
+            chemin.ajouter_dans_la_place(b'/');
+            chemin.ajouter_tranche(nom)?;
         }
         if chemin.is_empty() {
-            chemin.push(b'/');
+            chemin.ajouter(b'/')?;
         }
         Ok(chemin)
     }
@@ -367,9 +368,9 @@ impl<'a, M: Monte> Vue<'a, M> {
         }
         chemin.try_reserve_exact(barre as usize + fin.nom.len()).map_err(|_| Erreur::ENOMEM)?;
         if barre {
-            chemin.push(b'/');
+            chemin.ajouter_dans_la_place(b'/');
         }
-        chemin.extend_from_slice(&fin.nom);
+        chemin.ajouter_tranche(&fin.nom)?;
         Ok(chemin)
     }
 

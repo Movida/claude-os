@@ -64,6 +64,7 @@ use crate::{
     S_ISVTX, Temps, permis,
 };
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// Ce qui fournit les pages des fichiers : le noyau (des cadres de la
 /// mémoire physique), ou les tests (des tableaux). Une page est désignée
@@ -247,7 +248,9 @@ fn rendre_la_place(entrees: &mut Vec<Entree>) {
     } else if place > 4 && entrees.len() <= place / 2 {
         let mut neuve = Vec::new();
         if neuve.try_reserve_exact(place / 2).is_ok() {
-            neuve.extend(entrees.drain(..));
+            for e in entrees.drain(..) {
+                neuve.ajouter_dans_la_place(e);
+            }
             *entrees = neuve;
         }
     }
@@ -364,10 +367,7 @@ fn reserver<T>(v: &mut Vec<T>, n: usize) -> Result<(), Erreur> {
 }
 
 fn copie(octets: &[u8]) -> Result<Vec<u8>, Erreur> {
-    let mut v = Vec::new();
-    v.try_reserve_exact(octets.len()).map_err(|_| Erreur::ENOMEM)?;
-    v.extend_from_slice(octets);
-    Ok(v)
+    Ok(faillible::copie(octets)?)
 }
 
 impl Tmpfs {
@@ -451,9 +451,11 @@ impl Tmpfs {
         if self.non_plein == self.blocs.len() {
             let mut cases = Vec::new();
             cases.try_reserve_exact(PAR_BLOC).map_err(|_| Erreur::ENOMEM)?;
-            cases.resize_with(PAR_BLOC, || None);
+            for _ in 0..PAR_BLOC {
+                cases.ajouter_dans_la_place(None);
+            }
             reserver(&mut self.blocs, 1)?;
-            self.blocs.push(Bloc { cases, prises: 0 });
+            self.blocs.ajouter_dans_la_place(Bloc { cases, prises: 0 });
         }
         let b = self.non_plein;
         let bloc = &mut self.blocs[b];
@@ -702,7 +704,8 @@ impl Tmpfs {
         let d = d.dossier_mut();
         let cookie = d.prochain;
         d.prochain += 1;
-        d.entrees.push(Entree { nom, numero, cookie });
+        // Sa place est prise par l'appelant, avant de rien changer.
+        d.entrees.ajouter_dans_la_place(Entree { nom, numero, cookie });
     }
 
     /// Retire l'entrée `nom` du dossier. Avec `rendre`, un dossier vidé rend
@@ -1407,17 +1410,17 @@ impl Tmpfs {
                 return Err(Erreur::ENAMETOOLONG);
             }
             reserver(&mut noms, 1)?;
-            noms.push(&e.nom);
+            noms.ajouter_dans_la_place(&e.nom);
             courant = parent;
         }
         let mut chemin = Vec::new();
         chemin.try_reserve_exact(longueur.max(1)).map_err(|_| Erreur::ENOMEM)?;
         for nom in noms.iter().rev() {
-            chemin.push(b'/');
-            chemin.extend_from_slice(nom);
+            chemin.ajouter_dans_la_place(b'/');
+            chemin.ajouter_tranche(nom)?;
         }
         if chemin.is_empty() {
-            chemin.push(b'/');
+            chemin.ajouter_dans_la_place(b'/');
         }
         Ok(chemin)
     }
@@ -1559,8 +1562,9 @@ impl Tmpfs {
     /// de pages sont justes ; un inode sans nom est tenu (sinon il aurait
     /// dû disparaître) ; pas de bloc vide en fin de table.
     pub fn invariants(&self) -> Result<(), &'static str> {
-        let mut noms = Vec::new();
-        noms.resize(self.blocs.len() * PAR_BLOC + 1, 0u32);
+        let Ok(mut noms) = faillible::remplie(self.blocs.len() * PAR_BLOC + 1, 0u32) else {
+            return Err("plus de memoire pour verifier");
+        };
         let (mut inodes, mut pages) = (0u32, 0u64);
         for (b, bloc) in self.blocs.iter().enumerate() {
             if bloc.prises != bloc.cases.iter().filter(|c| c.is_some()).count() {

@@ -29,6 +29,7 @@ use crate::montages::{Interne, Monte};
 use crate::tmpfs::{Attributs, DT_DIR, DT_LNK, DT_REG};
 use crate::{ECRIRE, EXECUTER, Erreur, Identite, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Temps, permis};
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// Le genre du système : ce qu'il répond (voir l'en-tête).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -109,7 +110,7 @@ impl NoyauFs {
     pub fn new(genre: Genre, peripherique: (u32, u32), mode: u32, maintenant: Temps) -> Result<NoyauFs, Erreur> {
         let mut entrees = Vec::new();
         entrees.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
-        entrees.push(Entree {
+        entrees.ajouter_dans_la_place(Entree {
             numero: RACINE,
             nom: Vec::new(),
             parent: RACINE,
@@ -158,11 +159,9 @@ impl NoyauFs {
         };
         let numero = self.prochain;
         let prochain = numero.checked_add(1).ok_or(Erreur::ENOSPC)?;
-        let mut copie = Vec::new();
-        copie.try_reserve_exact(nom.len()).map_err(|_| Erreur::ENOMEM)?;
-        copie.extend_from_slice(nom);
+        let copie = faillible::copie(nom)?;
         self.entrees.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
-        self.entrees.push(Entree {
+        self.entrees.ajouter_dans_la_place(Entree {
             numero,
             nom: copie,
             parent,
@@ -552,7 +551,7 @@ impl Sequence {
         if !reste.is_empty() {
             let n = reste.len().min(longueur);
             sortie.try_reserve_exact(n).map_err(|_| Erreur::ENOMEM)?;
-            sortie.extend_from_slice(&reste[..n]);
+            sortie.ajouter_tranche(&reste[..n])?;
             self.rendu += n;
             self.position += n as u64;
             if self.rendu < self.tampon.len() || sortie.len() == longueur {
@@ -589,13 +588,12 @@ impl Sequence {
             if self.tampon.len() + e.len() >= self.taille {
                 break;
             }
-            self.tampon.try_reserve(e.len()).map_err(|_| Erreur::ENOMEM)?;
-            self.tampon.extend_from_slice(&e);
+            self.tampon.ajouter_tranche(&e)?;
             self.curseur = suivant;
         }
         let n = self.tampon.len().min(longueur - sortie.len());
         sortie.try_reserve_exact(n).map_err(|_| Erreur::ENOMEM)?;
-        sortie.extend_from_slice(&self.tampon[..n]);
+        sortie.ajouter_tranche(&self.tampon[..n])?;
         self.rendu = n;
         self.position += n as u64;
         Ok(sortie)

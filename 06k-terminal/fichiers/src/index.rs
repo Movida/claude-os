@@ -43,6 +43,7 @@
 //! rang dans un tableau). C'est son propriétaire qui les prend et les rend.
 
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// Le nombre de cases d'un nœud.
 pub const BRANCHES: usize = 512;
@@ -342,9 +343,7 @@ impl IndexPages {
 
     /// Un nœud neuf, à zéro (son rang + 1).
     fn nouveau_noeud(&mut self) -> Result<u32, ()> {
-        let mut cases = Vec::new();
-        cases.try_reserve_exact(BRANCHES).map_err(|_| ())?;
-        cases.resize(BRANCHES, 0);
+        let cases = faillible::remplie(BRANCHES, 0).map_err(|_| ())?;
         if let Some(place) = self.libres.pop() {
             self.noeuds[place as usize] = cases;
             return Ok(place + 1);
@@ -353,14 +352,15 @@ impl IndexPages {
         // sans rien demander (voir `libres`).
         self.noeuds.try_reserve(1).map_err(|_| ())?;
         self.libres.try_reserve(self.noeuds.len() + 1 - self.libres.len()).map_err(|_| ())?;
-        self.noeuds.push(cases);
+        self.noeuds.ajouter_dans_la_place(cases);
         Ok(self.noeuds.len() as u32)
     }
 
     /// Rend le nœud `noeud` (rang + 1) : ses 4 Kio retournent au tas.
     fn liberer_noeud(&mut self, noeud: u32) {
         self.noeuds[noeud as usize - 1] = Vec::new();
-        self.libres.push(noeud - 1);
+        // La place est prise quand le nœud est créé (`nouveau_noeud`).
+        self.libres.ajouter_dans_la_place(noeud - 1);
     }
 
     /// Ramène l'arbre à sa hauteur : tant que la racine ne mène qu'à sa
