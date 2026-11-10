@@ -3092,6 +3092,15 @@ pub fn fchdir(fd: u64) -> i64 {
 /// la mémoire reste sûre) et y lit l'ancien contenu au lieu d'un SIGBUS :
 /// un écart, noté dans « Reste à faire ».
 fn tronquer(n: Numero, taille: u64, par: Fichier) -> i64 {
+    let qui = processus::essayer_avec(|p| p.identite).unwrap_or(Identite::ROOT);
+    tronquer_par(n, taille, par, qui)
+}
+
+/// `tronquer`, pour `qui` : aussi l'O_TRUNC de `path_open` d'un programme
+/// WebAssembly (wasi.rs), qui n'est pas un processus et a sa propre
+/// identité (les soldes d'avant 6k : il vidait le fichier sous le seul
+/// verrou des fichiers, sans le verrou d'écriture de l'inode).
+pub fn tronquer_par(n: Numero, taille: u64, par: Fichier, qui: Identite) -> i64 {
     // Agrandir au-delà de RLIMIT_FSIZE : SIGXFSZ et EFBIG (`inode_newsize_ok`) ;
     // raccourcir est toujours permis.
     let limite = processus::essayer_avec(|p| p.courante(processus::RLIMIT_FSIZE)).unwrap_or(u64::MAX);
@@ -3101,7 +3110,6 @@ fn tronquer(n: Numero, taille: u64, par: Fichier) -> i64 {
     }
     let _ecriture = verrou_d_ecriture(n);
     retirer_projections(n, taille.div_ceil(PAGE));
-    let qui = processus::essayer_avec(|p| p.identite).unwrap_or(Identite::ROOT);
     // IN_MODIFY, au dossier et au nom qu'a l'objet à ce moment
     // (`fsnotify_change` d'ATTR_SIZE), par le fichier qui le tient ; avec
     // IN_ATTRIB, d'un seul événement, si les bits setuid et setgid tombent

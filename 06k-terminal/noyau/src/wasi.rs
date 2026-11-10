@@ -1443,7 +1443,7 @@ impl Wasi {
                     let fichier = s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| ENOMEM)?;
                     s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, objet));
                     crate::surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), crate::surveillance::IN_OPEN);
-                    return Ok(fichier);
+                    return Ok((fichier, None));
                 }
             };
             let ouvert = s.fs.ouvrir(qui, &fin, &o, maintenant).map_err(errno)?;
@@ -1468,12 +1468,6 @@ impl Wasi {
                     return Err(EIO);
                 }
             };
-            // O_TRUNC : vidé, et ses bits setuid et setgid tombent
-            // (`do_truncate`).
-            let attrib = ouvert.tronquer && {
-                let _ = s.fs.tronquer(ouvert.numero, 0, maintenant, cadres);
-                s.fs.retirer_les_privileges(qui, ouvert.numero, maintenant)
-            };
             let fichier = s.ouverts
                 .ajouter(FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, drapeaux, &chemin).avec_chemin(complet))
                 .map_err(|_| {
@@ -1481,18 +1475,27 @@ impl Wasi {
                     ENOMEM
                 })?;
             // Ce qu'en voit inotify, comme d'un open d'un programme Linux :
-            // la création, l'ouverture, puis la troncature (O_TRUNC).
-            use crate::surveillance::{IN_CREATE, IN_MODIFY, IN_OPEN};
+            // la création, l'ouverture, puis la troncature (O_TRUNC, plus
+            // bas).
+            use crate::surveillance::{IN_CREATE, IN_OPEN};
             s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, Objet::Tmpfs(ouvert.numero)));
             if ouvert.cree {
                 crate::surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_CREATE, false, 0);
             }
             crate::surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
-            if ouvert.tronquer {
-                let attrib = if attrib { crate::surveillance::IN_ATTRIB } else { 0 };
-                crate::surveillance::changement(&s.fs, s.ouverts.fichier(fichier), IN_MODIFY | attrib);
+            Ok((fichier, ouvert.tronquer.then_some(ouvert.numero)))
+        });
+        // O_TRUNC, hors du verrou des fichiers et sous le verrou d'écriture
+        // de l'inode, comme pour un programme Linux (appels_fichiers::
+        // tronquer : vidé, ses bits setuid et setgid tombent, IN_MODIFY) :
+        // un programme qui écrit dans le même fichier en même temps ne voit
+        // pas son écriture coupée au milieu. Le fichier est ouvert : vider
+        // ne peut plus échouer.
+        let ouvert = ouvert.map(|(f, tronquer)| {
+            if let Some(n) = tronquer {
+                crate::appels_fichiers::tronquer_par(n, 0, f, qui);
             }
-            Ok(fichier)
+            f
         });
         let fichier = match ouvert {
             Ok(f) => f,
