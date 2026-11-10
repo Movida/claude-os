@@ -11,3 +11,10 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+
+# Les règles du noyau (../clippy.toml) : aucune allocation qui panique (les
+# soldes d'avant 6k).
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+disallowed_methods = "deny"
+disallowed_macros = "deny"

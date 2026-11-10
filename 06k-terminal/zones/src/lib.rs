@@ -73,6 +73,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// La taille d'une page : toutes les bornes de zones y sont alignées.
 pub const PAGE: u64 = 4096;
@@ -432,7 +433,7 @@ impl Zones {
                 self.zones[i] = Zone { fin: self.zones[i].fin, ..zone };
                 compter(-1);
             }
-            (false, false) => self.zones.insert(i, zone),
+            (false, false) => self.zones.inserer_dans_la_place(i, zone),
         }
         Ok(())
     }
@@ -497,7 +498,7 @@ impl Zones {
             self.place_pour(1)?;
             retire(&premiere.coupe(debut, fin));
             self.zones[i].fin = debut;
-            self.zones.insert(i + 1, premiere.coupe(fin, premiere.fin));
+            self.zones.inserer_dans_la_place(i + 1, premiere.coupe(fin, premiere.fin));
             if let Some(p) = premiere.fichier {
                 references(p.fichier, 1);
             }
@@ -606,7 +607,7 @@ impl Zones {
         if coupe_fin {
             let z = self.zones[j - 1];
             self.zones[j - 1].fin = fin;
-            self.zones.insert(j, z.coupe(fin, z.fin));
+            self.zones.inserer_dans_la_place(j, z.coupe(fin, z.fin));
             if let Some(p) = z.fichier {
                 references(p.fichier, 1);
             }
@@ -614,7 +615,7 @@ impl Zones {
         if coupe_debut {
             let z = self.zones[i];
             self.zones[i].fin = debut;
-            self.zones.insert(i + 1, z.coupe(debut, z.fin));
+            self.zones.inserer_dans_la_place(i + 1, z.coupe(debut, z.fin));
             if let Some(p) = z.fichier {
                 references(p.fichier, 1);
             }

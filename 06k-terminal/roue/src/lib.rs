@@ -39,6 +39,7 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// Plus de place : la réserve est pleine (elle a sa taille définitive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,19 +116,15 @@ pub struct Roue {
 impl Roue {
     /// Une roue pour `max` objets à la fois. None : plus de mémoire.
     pub fn new(max: usize) -> Option<Roue> {
-        let mut tetes = Vec::new();
-        tetes.try_reserve_exact(CASES + 1).ok()?;
-        tetes.resize(CASES + 1, RIEN);
+        let tetes = faillible::remplie(CASES + 1, RIEN).ok()?;
         let mut entrees = Vec::new();
         entrees.try_reserve_exact(max).ok()?;
         for k in 0..max {
             let suivant = if k + 1 < max { k as u32 + 1 } else { RIEN };
-            entrees.push(Entree { objet: 0, expire: 0, echeance: 0, suivant, precedent: RIEN, case: 0 });
+            entrees.ajouter_dans_la_place(Entree { objet: 0, expire: 0, echeance: 0, suivant, precedent: RIEN, case: 0 });
         }
         let taille = (2 * max).max(2).next_power_of_two();
-        let mut places = Vec::new();
-        places.try_reserve_exact(taille).ok()?;
-        places.resize(taille, RIEN);
+        let places = faillible::remplie(taille, RIEN).ok()?;
         Some(Roue {
             tetes,
             occupees: [0; NIVEAUX],
