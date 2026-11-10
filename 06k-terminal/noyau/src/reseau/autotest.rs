@@ -5,6 +5,14 @@
 //! (`icmp::recevoir`), pour des connexions de `lo` vers des adresses à lui, comme
 //! `linux/pmtu.c` le fait sur l'hôte avec une socket brute. Les valeurs attendues sont
 //! celles qu'y donne Linux. Ce qu'on a appris est oublié à la fin.
+//!
+//! Les options IP d'un paquet reçu (les soldes d'avant 6k), de même : le noyau s'envoie par
+//! `lo` des datagrammes à options, comme si une de ses sockets les avait écrits, et la
+//! réception les lit comme tout paquet qui arrive. Trois cas de
+//! formats/tests/reseau/options-ip.txt (que `linux/options-ip.c` vérifie sur Linux) : une
+//! option fausse (son « problème de paramètre » revient à la socket, qui le voit dans sa
+//! file d'erreurs avec l'octet fautif), une route source (jetée sans un mot), une route
+//! notée (livrée).
 
 use super::boucle;
 use super::paquet::Paquet;
@@ -148,10 +156,85 @@ fn tcp_mtu() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Envoie par `lo`, comme s'il venait de `source`:`port_source`, un datagramme UDP d'un
+/// octet vers `destination`:`port_destination`, aux options `options` (un multiple de 4
+/// octets) : la réception le lit avant que l'envoi ne rende la main (boucle.rs).
+fn datagramme_a_options(source: [u8; 4], port_source: u16, destination: [u8; 4], port_destination: u16, options: &[u8]) -> Option<()> {
+    let lo = boucle::interface()?;
+    let entete = fipv4::ENTETE + options.len();
+    let mut p = Paquet::vide(entete + 9)?;
+    let o = p.ajouter_fin(entete + 9)?;
+    {
+        let e: &mut [u8; fipv4::ENTETE] = (&mut o[..fipv4::ENTETE]).try_into().ok()?;
+        fipv4::ecrire(e, &fipv4::Ipv4 {
+            tos: 0, longueur: (entete + 9) as u16, identifiant: 3, ne_pas_fragmenter: false, fragments_suivants: false, decalage: 0, ttl: 64,
+            protocole: fipv4::UDP, source, destination, longueur_entete: entete,
+        });
+    }
+    // `ecrire` n'écrit pas d'options : la longueur de l'en-tête et sa somme, refaites.
+    o[0] = 0x40 | (entete / 4) as u8;
+    o[fipv4::ENTETE..entete].copy_from_slice(options);
+    o[10..12].fill(0);
+    let somme = formats::reseau::plier(formats::reseau::somme(&o[..entete], 0));
+    o[10..12].copy_from_slice(&somme.to_be_bytes());
+    let u = &mut o[entete..];
+    u[..2].copy_from_slice(&port_source.to_be_bytes());
+    u[2..4].copy_from_slice(&port_destination.to_be_bytes());
+    u[4..6].copy_from_slice(&9u16.to_be_bytes());
+    u[8] = b'x';
+    super::ethernet::emettre(lo, [0; 6], formats::reseau::ethernet::IPV4, p);
+    Some(())
+}
+
+/// Les options IP d'un paquet reçu : une fausse, une route source, une route notée (voir
+/// l'en-tête du module).
+fn options() -> Result<(), &'static str> {
+    const D: [u8; 4] = [127, 0, 0, 79];
+    const ETAPE: &str = "options : la mise en place";
+    const EPROTO: i32 = 71;
+    let s = creer(Protocole::Udp, SOCK_DGRAM, 17).ok_or(ETAPE)?;
+    let r = creer(Protocole::Udp, SOCK_DGRAM, 17).ok_or(ETAPE)?;
+    datagramme::connecter(&s, &adresse(D, 9)).map_err(|_| ETAPE)?;
+    datagramme::lier(&r, &adresse(D, 40079)).map_err(|_| ETAPE)?;
+    s.recverr.store(true, core::sync::atomic::Ordering::Relaxed);
+    let (source, port) = {
+        let i = s.appels.verrouiller();
+        (i.source, i.port)
+    };
+    // « route-courte » : une route notée de 2 octets ; l'octet 21 (sa longueur) est fautif.
+    // La socket connectée voit EPROTO (SO_ERROR, qui laisse la file), puis la file dit
+    // l'octet (la lire efface SO_ERROR, comme `sock_dequeue_err_skb`).
+    datagramme_a_options(source, port, D, 9, &[7, 2, 0, 0]).ok_or(ETAPE)?;
+    if s.prendre_erreur() != EPROTO {
+        return Err("une option fausse : EPROTO pour la socket connectee");
+    }
+    match s.prendre_en_file() {
+        Some(e) if e.errno == EPROTO && e.genre == ficmp::PARAMETRE && e.code == 0 && e.info == 21 => {}
+        _ => return Err("une option fausse : le probleme de parametre, octet 21"),
+    }
+    // « route-source-lache » : jetée, sans un mot.
+    datagramme_a_options(source, port, D, 9, &[0x83, 7, 4, 10, 0, 0, 2, 0]).ok_or(ETAPE)?;
+    if s.prendre_en_file().is_some() || s.prendre_erreur() != 0 {
+        return Err("une route source : jetee sans rien dire");
+    }
+    // « route-notee » : livrée.
+    datagramme_a_options(source, port, D, 40079, &[7, 7, 4, 0, 0, 0, 0, 0]).ok_or(ETAPE)?;
+    if r.reception.verrouiller().file.len() != 1 {
+        return Err("une route notee : livree");
+    }
+    super::socket::fermer(&s);
+    super::socket::fermer(&r);
+    Ok(())
+}
+
 /// Tout, avant les programmes.
 pub fn lancer() {
     match udp().and_then(|()| tcp_mtu()) {
         Ok(()) => afficherln!("[reseau] la MTU du chemin, par un ICMP recu : ok."),
         Err(e) => afficherln!("[reseau] la MTU du chemin : {} : ECHEC", e),
+    }
+    match options() {
+        Ok(()) => afficherln!("[reseau] les options IP d'un paquet recu, comme Linux : ok."),
+        Err(e) => afficherln!("[reseau] les options IP : {} : ECHEC", e),
     }
 }

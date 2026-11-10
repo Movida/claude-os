@@ -536,6 +536,10 @@ $(LINUX)/pmtu: linux/pmtu.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
+$(LINUX)/options-ip: linux/options-ip.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
 $(LINUX)/passerelle: linux/passerelle.c
 	mkdir -p $(LINUX)
 	gcc $(CFLAGS_LINUX) $< -o $@
@@ -1289,8 +1293,9 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 # La MTU du chemin sur l'hôte : le seul test qui demande root (une socket brute forge
 # l'ICMP vers lo). Ce qu'il pose sur la route ne vise qu'une adresse 127.x.y.z tirée au
 # hasard, et expire en 10 min. `tests-hote` le lance quand `sudo -n` marche.
-tests-hote-root: $(LINUX)/pmtu
+tests-hote-root: $(LINUX)/pmtu $(LINUX)/options-ip
 	sudo -n timeout 60 ./$(LINUX)/pmtu | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	sudo -n timeout 60 ./$(LINUX)/options-ip formats/tests/reseau/options-ip.txt | tee /dev/stderr | grep -q "toutes les verifications : ok"
 
 suite: $(SUITE)/.convertie
 

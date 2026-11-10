@@ -151,11 +151,16 @@ fn ipv4_abime() {
         let s = reseau::plier(reseau::somme(&o[..20], 0));
         o[10..12].copy_from_slice(&s.to_be_bytes());
         assert_eq!(ipv4::lire(&o), Err(attendu));
-        // L'en-tête seul (d'un paquet dont on n'a que le début) : une
+        // L'en-tête cité (d'un paquet dont on n'a que le début) : une
         // longueur au-delà de ce qu'on a passe, pas une trop courte.
         let seul = if attendu == Erreur::Tronque { Ok(longueur) } else { Err(attendu) };
-        assert_eq!(ipv4::lire_entete(&o).map(|h| h.longueur), seul);
+        assert_eq!(ipv4::lire_cite(&o).map(|h| h.longueur), seul);
     }
+    // La somme fausse : refusée à la réception, pas dans l'en-tête cité
+    // (les options notées depuis l'arrivée, sans refaire la somme).
+    let mut o = ip.to_vec();
+    o[8] ^= 1;
+    assert_eq!(ipv4::lire_cite(&o).map(|h| h.ttl), Ok(ip[8] ^ 1));
     // Du bourrage après la longueur totale : ôté de la charge.
     let mut o = ip.to_vec();
     o.extend_from_slice(&[0; 10]);
@@ -222,6 +227,70 @@ fn masques() {
     assert_eq!((ipv4::prefixe([0; 4]), ipv4::prefixe([255; 4])), (Some(0), Some(32)));
     assert!(ipv4::dans([10, 0, 2, 99], [10, 0, 2, 0], 24) && !ipv4::dans([10, 0, 3, 1], [10, 0, 2, 0], 24));
     assert!(ipv4::multidiffusion([224, 0, 0, 1]) && !ipv4::multidiffusion([10, 0, 2, 2]));
+}
+
+/// Les options d'un paquet reçu, lues par `compiler_options` comme Linux les
+/// lit : les cas de tests/reseau/options-ip.txt, que linux/options-ip.c
+/// vérifie sur le vrai Linux. L'adresse notée est 127.0.0.1, comme pour un
+/// paquet de lo ; l'heure, 01020304 (les « .. » du fichier).
+#[test]
+fn options_comme_linux() {
+    let chemin = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/reseau/options-ip.txt");
+    let texte = std::fs::read_to_string(&chemin).unwrap();
+    let hex = |h: &str| -> Vec<u8> { (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let unicast = |a: [u8; 4]| !(a[0] == 127 || a[0] == 0 || a == ipv4::DIFFUSION || ipv4::multidiffusion(a));
+    let ici = ipv4::Ici { adresse: [127, 0, 0, 1], heure: 0x0102_0304, unicast: &unicast };
+    let mut vus = 0;
+    for ligne in texte.lines().filter(|l| !l.starts_with('#') && !l.trim().is_empty()) {
+        let mots: Vec<&str> = ligne.split_whitespace().collect();
+        let (nom, options, issue) = (mots[0], hex(mots[1]), mots[2]);
+        let mut entete = vec![0u8; ipv4::ENTETE];
+        entete.extend_from_slice(&options);
+        let lu = ipv4::compiler_options(&mut entete, &ici);
+        match issue {
+            "parametre" | "cipso" => assert_eq!(lu, Err(mots[3].parse().unwrap()), "{nom}"),
+            "jete" => assert!(lu.is_ok_and(|o| o.route_source != 0), "{nom} : {lu:?}"),
+            "livre" | "muet" => {
+                let o = lu.unwrap_or_else(|e| panic!("{nom} : refusé à l'octet {e}"));
+                assert_eq!(o.route_source, 0, "{nom}");
+                assert_eq!(entete[ipv4::ENTETE..], hex(&mots[3].replace("........", "01020304"))[..], "{nom}");
+                assert_eq!(o.modifiees, mots[1] != mots[3], "{nom}");
+            }
+            _ => panic!("{nom} : issue inconnue {issue}"),
+        }
+        vus += 1;
+    }
+    assert!(vus >= 30, "{vus} cas seulement");
+    // Ce que notent les options lues : la place de chacune.
+    let mut e = vec![0u8; ipv4::ENTETE];
+    e.extend_from_slice(&hex("010707040000000044040500940400008903040000000000"));
+    let o = ipv4::compiler_options(&mut e, &ici).unwrap();
+    assert_eq!((o.route_notee, o.horodatage, o.alerte, o.route_source, o.stricte), (21, 28, 32, 36, true));
+    // Des options au hasard (des genres connus le plus souvent, des
+    // longueurs et des pointeurs proches des bords) : jamais de panique, une
+    // faute désigne un octet des options, et rien ne change hors d'elles.
+    let mut h = Hasard(0x0123_4567_89ab_cdef);
+    let genres = [0u8, 1, 7, 68, 130, 131, 134, 136, 137, 148];
+    let mut fautes = 0;
+    for _ in 0..200_000 {
+        let n = 4 * (1 + h.suivant() as usize % 10);
+        let mut e = vec![0x45u8; ipv4::ENTETE];
+        for _ in 0..n {
+            let x = h.suivant();
+            e.push(match x % 4 {
+                0 => genres[(x >> 8) as usize % genres.len()],
+                1 => (x >> 8) as u8 % 16,
+                _ => (x >> 8) as u8,
+            });
+        }
+        let avant = e.clone();
+        if let Err(place) = ipv4::compiler_options(&mut e, &ici) {
+            assert!((ipv4::ENTETE..e.len()).contains(&(place as usize)), "{avant:02x?} : {place}");
+            fautes += 1;
+        }
+        assert_eq!((e.len(), &e[..ipv4::ENTETE]), (avant.len(), &avant[..ipv4::ENTETE]));
+    }
+    assert!(fautes > 10_000 && fautes < 190_000, "{fautes} fautes : le hasard ne couvre plus les deux issues");
 }
 
 /// Un générateur à graine fixe (xorshift64*), pour des mutations qui se
@@ -308,9 +377,9 @@ fn mutations() {
             let s = reseau::plier(reseau::somme(&ip[..ihl], 0));
             ip[10..12].copy_from_slice(&s.to_be_bytes());
         }
-        // L'en-tête seul : tout entier présent ; le même que celui de `lire`
+        // L'en-tête cité : tout entier présent ; le même que celui de `lire`
         // quand `lire` l'accepte.
-        let seul = ipv4::lire_entete(&ip);
+        let seul = ipv4::lire_cite(&ip);
         if let Ok(e) = seul {
             assert!(e.longueur_entete >= 20 && e.longueur_entete <= ip.len());
         }

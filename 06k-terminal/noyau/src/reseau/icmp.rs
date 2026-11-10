@@ -110,8 +110,9 @@ fn consommer() {
     CREDIT.verrouiller().credit -= crate::aleatoire::u32_sous(3) as i32;
 }
 
-/// Les millisecondes depuis minuit, temps universel (`inet_current_timestamp`).
-fn horodatage() -> u32 {
+/// Les millisecondes depuis minuit, temps universel (`inet_current_timestamp`) :
+/// la réponse à l'horodatage, et l'option d'horodatage d'IP (ipv4.rs).
+pub fn horodatage() -> u32 {
     let t = crate::temps::maintenant();
     ((t.secondes.rem_euclid(86_400) as u64) * 1000 + t.nanosecondes as u64 / 1_000_000) as u32
 }
@@ -228,7 +229,7 @@ fn repondre(h: &format_ipv4::Ipv4, reponse: &Icmp, morceaux: &[&[u8]]) {
 /// UDP coupé à sa longueur UDP (`__udp4_lib_rcv` le coupe aussi), dont
 /// seul l'en-tête IPv4 est relu.
 pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bool, pour_nous: bool, trame_diffusee: bool) {
-    let Ok(h) = format_ipv4::lire_entete(origine) else { return };
+    let Ok(h) = format_ipv4::lire_cite(origine) else { return };
     if trame_diffusee || h.decalage != 0 {
         return;
     }

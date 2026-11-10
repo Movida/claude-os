@@ -161,6 +161,18 @@ impl Table {
         a == ipv4::DIFFUSION || self.adresses_de(interface).any(|x| x.prefixe < 31 && x.diffusion() == a)
     }
 
+    /// `a` est-elle l'adresse de quelqu'un d'autre (`inet_addr_type` de
+    /// Linux, RTN_UNICAST) : ni à nous (le réseau de lo compris), ni une
+    /// diffusion (d'un de nos réseaux, la limitée, ou 0.0.0.0/8, que Linux
+    /// compte aussi comme diffusion), ni une multidiffusion ?
+    pub fn est_unicast(&self, a: [u8; 4]) -> bool {
+        !(a[0] == 0
+            || a == ipv4::DIFFUSION
+            || ipv4::multidiffusion(a)
+            || self.est_a_nous(a)
+            || self.adresses.iter().any(|x| x.prefixe < 31 && x.diffusion() == a))
+    }
+
     /// La route de la table principale au plus long préfixe qui contient
     /// `destination`.
     fn meilleure(&self, destination: [u8; 4]) -> Option<&Route> {

@@ -3,7 +3,9 @@
 //! type de service, la longueur totale du paquet, l'identifiant et les
 //! drapeaux de fragmentation, la durée de vie (TTL), le protocole de ce qui
 //! suit (1 ICMP, 6 TCP, 17 UDP), la somme de contrôle de l'en-tête, et les
-//! adresses de la source et de la destination.
+//! adresses de la source et de la destination. Les options d'un paquet
+//! reçu se vérifient comme chez Linux (`compiler_options`) ; nous n'en
+//! écrivons pas.
 
 use super::{Erreur, adresse, mot16, plier, somme};
 
@@ -58,19 +60,27 @@ impl Ipv4 {
 /// présent, sa somme, puis une longueur totale qui tient dans ce qui a été
 /// reçu et couvre l'en-tête.
 pub fn lire(o: &[u8]) -> Result<(Ipv4, &[u8]), Erreur> {
-    let h = lire_entete(o)?;
+    let h = entete(o, true)?;
     if (h.longueur as usize) > o.len() {
         return Err(Erreur::Tronque);
     }
     Ok((h, &o[h.longueur_entete..h.longueur as usize]))
 }
 
-/// L'en-tête seul, sans exiger que la longueur totale tienne dans `o` :
-/// celui d'un paquet dont on n'a que le début (celui que porte une erreur
-/// ICMP qu'on va envoyer, que `__icmp_send` ne relit pas en entier). Les
-/// mêmes vérifications que `lire`, sauf celle-là (et une longueur totale
-/// plus courte que l'en-tête reste refusée).
-pub fn lire_entete(o: &[u8]) -> Result<Ipv4, Erreur> {
+/// L'en-tête d'un paquet qu'on cite dans une erreur ICMP qu'on va envoyer
+/// (`__icmp_send` ne le relit pas en entier, ni sa somme) : les mêmes
+/// vérifications que `lire`, sauf la longueur totale, qui peut dépasser ce
+/// qu'on a (une longueur plus courte que l'en-tête reste refusée), et la
+/// somme : elle était juste à l'arrivée, mais la lecture des options a pu
+/// changer l'en-tête depuis sans la refaire (`compiler_options`), comme
+/// chez Linux.
+pub fn lire_cite(o: &[u8]) -> Result<Ipv4, Erreur> {
+    entete(o, false)
+}
+
+/// L'en-tête au début de `o`, dans l'ordre d'`ip_rcv_core` ; sa somme
+/// vérifiée si `somme_verifiee`.
+fn entete(o: &[u8], somme_verifiee: bool) -> Result<Ipv4, Erreur> {
     let debut = o.get(..ENTETE).ok_or(Erreur::Tronque)?;
     let ihl = (debut[0] & 0x0F) as usize;
     if debut[0] >> 4 != 4 || ihl < 5 {
@@ -78,7 +88,7 @@ pub fn lire_entete(o: &[u8]) -> Result<Ipv4, Erreur> {
     }
     let longueur_entete = ihl * 4;
     let entete = o.get(..longueur_entete).ok_or(Erreur::Tronque)?;
-    if plier(somme(entete, 0)) != 0 {
+    if somme_verifiee && plier(somme(entete, 0)) != 0 {
         return Err(Erreur::Somme);
     }
     let longueur = mot16(entete, 2).ok_or(Erreur::Tronque)?;
@@ -161,4 +171,227 @@ pub fn prefixe(masque: [u8; 4]) -> Option<u8> {
 pub fn dans(a: [u8; 4], reseau: [u8; 4], bits: u8) -> bool {
     let m = u32::from_be_bytes(masque(bits));
     u32::from_be_bytes(a) & m == u32::from_be_bytes(reseau) & m
+}
+
+/// Les genres d'options (RFC 791 et suivantes), comme Linux les nomme
+/// (`IPOPT_*`).
+pub mod option {
+    pub const FIN: u8 = 0;
+    pub const BOURRAGE: u8 = 1;
+    /// La route notée (« record route ») : chaque machine y écrit son adresse.
+    pub const ROUTE_NOTEE: u8 = 7;
+    /// L'horodatage : chaque machine y écrit l'heure (et son adresse).
+    pub const HORODATAGE: u8 = 68;
+    pub const SECURITE: u8 = 130;
+    /// Les routes sources : lâche (LSRR) et stricte (SSRR).
+    pub const ROUTE_SOURCE_LACHE: u8 = 131;
+    pub const CIPSO: u8 = 134;
+    pub const FLUX: u8 = 136;
+    pub const ROUTE_SOURCE_STRICTE: u8 = 137;
+    /// L'alerte aux routeurs (RFC 2113).
+    pub const ALERTE: u8 = 148;
+    /// Les drapeaux de l'horodatage : l'heure seule, l'heure et l'adresse,
+    /// l'heure aux adresses données d'avance.
+    pub const HEURE_SEULE: u8 = 0;
+    pub const HEURE_ET_ADRESSE: u8 = 1;
+    pub const ADRESSES_DONNEES: u8 = 3;
+}
+
+/// Ce que disent les options d'un paquet reçu, une fois vérifiées (le
+/// `struct ip_options` de Linux) : la place de chacune dans l'en-tête,
+/// comptée depuis son premier octet (0 : absente).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Options {
+    pub route_source: u8,
+    /// La route source est stricte (SSRR).
+    pub stricte: bool,
+    pub route_notee: u8,
+    pub horodatage: u8,
+    pub alerte: u8,
+    /// Des octets de l'en-tête ont changé (`is_changed`).
+    pub modifiees: bool,
+}
+
+/// Ce que le paquet reçu laisse dans ses options, comme Linux : son
+/// adresse pour nous joindre (`spec_dst`, celle qu'écrivent la route notée
+/// et l'horodatage avec adresse), l'heure (`inet_current_timestamp` : les
+/// millisecondes depuis minuit, temps universel), et ce qui dit si une
+/// adresse donnée d'avance est quelqu'un d'autre (`inet_addr_type` ==
+/// RTN_UNICAST : ni à nous, ni une diffusion, ni une multidiffusion).
+pub struct Ici<'a> {
+    pub adresse: [u8; 4],
+    pub heure: u32,
+    pub unicast: &'a dyn Fn([u8; 4]) -> bool,
+}
+
+/// Les options de l'en-tête reçu `entete` (en entier, ses 20 premiers
+/// octets compris), vérifiées une à une et complétées sur place comme
+/// `__ip_options_compile` de Linux (net/ipv4/ip_options.c) pour un paquet
+/// reçu. Une option fausse : `Err(place)`, l'octet fautif compté depuis le
+/// début de l'en-tête, que dira le « problème de paramètre » (ICMP 12) ;
+/// le paquet est jeté.
+///
+/// Les règles, option par option :
+/// - la fin (0) : tout ce qui la suit devient 0 ; le bourrage (1) : un
+///   octet ;
+/// - les autres : un octet de genre, un de longueur (au moins 2, et pas
+///   plus que ce qui reste), puis leur contenu ;
+/// - les routes sources : au moins 3 octets, le pointeur (le troisième) à
+///   4 au moins, une seule par paquet (la RFC 1812, 5.2.4.1) ;
+/// - la route notée : une seule ; au moins 3 octets, pointeur à 4 au
+///   moins ; s'il reste la place d'une adresse, la nôtre y est écrite et le
+///   pointeur avance de 4 ;
+/// - l'horodatage : un seul ; au moins 4 octets, pointeur à 5 au moins ;
+///   s'il reste de la place : l'heure (drapeau 0), l'adresse et l'heure
+///   (1), l'heure si l'adresse donnée d'avance n'est pas quelqu'un d'autre
+///   (3) ; un autre drapeau est accepté tel quel. Sans place : le compteur
+///   de débordement (les 4 bits forts du quatrième octet) augmente ; à 15,
+///   c'est une erreur ;
+/// - l'alerte aux routeurs : au moins 4 octets ; notée si sa valeur est 0 ;
+/// - CIPSO (une étiquette de sécurité) : jamais acceptée, faute de domaine
+///   connu (Linux n'en a aucun tant que netlabelctl n'en définit pas :
+///   `cipso_v4_validate` refuse alors le troisième octet, le début du
+///   domaine, ou le deuxième, la longueur, si l'option a moins de 8
+///   octets) ;
+/// - les autres (sécurité, identifiant de flux, inconnues) : acceptées
+///   telles quelles (Linux ne les refuse qu'à l'envoi, sans CAP_NET_RAW).
+///
+/// La somme de l'en-tête n'est pas refaite : Linux ne la refait que pour
+/// un paquet qu'il fait suivre, et une erreur ICMP en recopie l'en-tête
+/// tel qu'il est alors (options notées, ancienne somme).
+pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, u8> {
+    use option::*;
+    let mut opt = Options::default();
+    let mut k = ENTETE;
+    let fin = entete.len();
+    // Une place dans l'en-tête, comme Linux la rend dans `info`.
+    let place = |k: usize| k as u8;
+    while k < fin {
+        match entete[k] {
+            FIN => {
+                for o in &mut entete[k + 1..] {
+                    if *o != FIN {
+                        *o = FIN;
+                        opt.modifiees = true;
+                    }
+                }
+                return Ok(opt);
+            }
+            BOURRAGE => {
+                k += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let reste = fin - k;
+        if reste < 2 {
+            return Err(place(k));
+        }
+        let longueur = entete[k + 1] as usize;
+        if longueur < 2 || longueur > reste {
+            return Err(place(k));
+        }
+        let o = &mut entete[k..k + longueur];
+        match o[0] {
+            ROUTE_SOURCE_LACHE | ROUTE_SOURCE_STRICTE => {
+                if longueur < 3 {
+                    return Err(place(k + 1));
+                }
+                if o[2] < 4 {
+                    return Err(place(k + 2));
+                }
+                if opt.route_source != 0 {
+                    return Err(place(k));
+                }
+                opt.stricte = o[0] == ROUTE_SOURCE_STRICTE;
+                opt.route_source = place(k);
+            }
+            ROUTE_NOTEE => {
+                if opt.route_notee != 0 {
+                    return Err(place(k));
+                }
+                if longueur < 3 {
+                    return Err(place(k + 1));
+                }
+                let pointeur = o[2] as usize;
+                if pointeur < 4 {
+                    return Err(place(k + 2));
+                }
+                if pointeur <= longueur {
+                    if pointeur + 3 > longueur {
+                        return Err(place(k + 2));
+                    }
+                    o[pointeur - 1..pointeur + 3].copy_from_slice(&ici.adresse);
+                    o[2] += 4;
+                    opt.modifiees = true;
+                }
+                opt.route_notee = place(k);
+            }
+            HORODATAGE => {
+                if opt.horodatage != 0 {
+                    return Err(place(k));
+                }
+                if longueur < 4 {
+                    return Err(place(k + 1));
+                }
+                let pointeur = o[2] as usize;
+                if pointeur < 5 {
+                    return Err(place(k + 2));
+                }
+                let drapeau = o[3] & 0xF;
+                if pointeur <= longueur {
+                    if pointeur + 3 > longueur {
+                        return Err(place(k + 2));
+                    }
+                    // Où écrire l'heure, s'il le faut.
+                    let heure = match drapeau {
+                        HEURE_SEULE => {
+                            o[2] += 4;
+                            Some(pointeur - 1)
+                        }
+                        HEURE_ET_ADRESSE | ADRESSES_DONNEES => {
+                            if pointeur + 7 > longueur {
+                                return Err(place(k + 2));
+                            }
+                            let a = [o[pointeur - 1], o[pointeur], o[pointeur + 1], o[pointeur + 2]];
+                            if drapeau == ADRESSES_DONNEES && (ici.unicast)(a) {
+                                None
+                            } else {
+                                if drapeau == HEURE_ET_ADRESSE {
+                                    o[pointeur - 1..pointeur + 3].copy_from_slice(&ici.adresse);
+                                }
+                                o[2] += 8;
+                                Some(pointeur + 3)
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(h) = heure {
+                        o[h..h + 4].copy_from_slice(&ici.heure.to_be_bytes());
+                        opt.modifiees = true;
+                    }
+                } else if drapeau != ADRESSES_DONNEES {
+                    let debordement = o[3] >> 4;
+                    if debordement == 15 {
+                        return Err(place(k + 3));
+                    }
+                    o[3] = drapeau | ((debordement + 1) << 4);
+                    opt.modifiees = true;
+                }
+                opt.horodatage = place(k);
+            }
+            ALERTE => {
+                if longueur < 4 {
+                    return Err(place(k + 1));
+                }
+                if o[2] == 0 && o[3] == 0 {
+                    opt.alerte = place(k);
+                }
+            }
+            CIPSO => return Err(place(if longueur < 8 { k + 1 } else { k + 2 })),
+            _ => {}
+        }
+        k += longueur;
+    }
+    Ok(opt)
 }

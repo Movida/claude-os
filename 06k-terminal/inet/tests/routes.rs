@@ -85,3 +85,17 @@ fn boucle() {
     assert_eq!((t.interface_de([10, 0, 2, 15]), t.interface_de([127, 0, 0, 1]), t.interface_de([127, 1, 2, 3])), (Some(ETH0), Some(9), None));
     assert_eq!(t.principales().count(), 2);
 }
+
+/// Quelqu'un d'autre (`inet_addr_type` == RTN_UNICAST) : ni nos adresses
+/// (127/8 compris), ni une diffusion, ni 0/8, ni une multidiffusion.
+#[test]
+fn unicast() {
+    let mut t = slirp();
+    t.ajouter_adresse(Adresse { interface: 9, adresse: [127, 0, 0, 1], prefixe: 8, boucle: true }).unwrap();
+    for a in [[10, 0, 2, 2], [10, 0, 2, 3], [8, 8, 8, 8], [10, 0, 3, 255]] {
+        assert!(t.est_unicast(a), "{a:?}");
+    }
+    for a in [[10, 0, 2, 15], [127, 0, 0, 1], [127, 9, 9, 9], [127, 255, 255, 255], [10, 0, 2, 255], [255; 4], [0; 4], [0, 1, 2, 3], [224, 0, 0, 1]] {
+        assert!(!t.est_unicast(a), "{a:?}");
+    }
+}

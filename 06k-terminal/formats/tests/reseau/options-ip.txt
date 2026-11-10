@@ -1,0 +1,61 @@
+# Les options IP d'un paquet reçu, et ce qu'en fait Linux 6.18 : vérifié sur
+# l'hôte par linux/options-ip.c (sous sudo, make tests-hote-root), relu par le
+# test de `compiler_options` (formats/tests/reseau.rs, cas_de_linux).
+#
+# Une ligne : le nom du cas, ses options (en hexadécimal, un multiple de 4
+# octets), puis l'issue :
+#   parametre N : un « problème de paramètre » qui désigne l'octet N de
+#                 l'en-tête (les options commencent à 20) ;
+#   livre HEX   : le paquet passe ; ses options sont alors HEX (Linux y a noté
+#                 son adresse, 127.0.0.1, et l'heure : « .. », un octet qui
+#                 change) ;
+#   jete        : une route source, jetée sans rien dire ;
+#   cipso N     : un « problème de paramètre » (octet N) pour une étiquette
+#                 CIPSO, qui ne revient pas par lo : Linux y recopie les options
+#                 du paquet fautif (`ip_options_echo`), et la recopie est jetée
+#                 à son arrivée (linux/options-ip.c le voit à ses compteurs) ;
+#   muet HEX    : le paquet passe (ses options sont alors HEX), mais Linux ne
+#                 répond pas au port fermé : il ne saurait pas renvoyer ces
+#                 options (`ip_options_echo`), et se tait.
+#
+# La fin et le bourrage.
+bourrage-fin              01010000                    livre 01010000
+fin-puis-octets           00070101                    livre 00000000
+reste-un-octet            01010107                    parametre 23
+longueur-1                07010000                    parametre 20
+longueur-trop-grande      07090400                    parametre 20
+# La route notée.
+route-courte              07020000                    parametre 21
+route-pointeur-3          0707030000000000            parametre 22
+route-notee               0707040000000000            livre 0707087f00000100
+route-pleine              0707080000000000            livre 0707080000000000
+route-sans-place          0707050000000000            parametre 22
+route-deux-fois           0703040703040000            parametre 23
+route-longue              070b04000000000000000000    livre 070b087f0000010000000000
+route-longueur-9          070904000000000000000000    muet 0709087f0000010000000000
+# L'horodatage.
+heure                     440c05000000000000000000    livre 440c0900........00000000
+heure-adresse             440c05010000000000000000    livre 440c0d017f000001........
+adresses-donnees-autre    440c05030a09090900000000    livre 440c05030a09090900000000
+adresses-donnees-nous     440c05037f00000100000000    livre 440c0d037f000001........
+heure-debordement         44040500                    livre 44040510
+heure-debordement-15      440405f0                    parametre 23
+heure-pleine-donnees      44040503                    livre 44040503
+heure-drapeau-inconnu     4408050200000000            livre 4408050200000000
+heure-courte              44030500                    parametre 21
+heure-pointeur-4          4408040000000000            parametre 22
+heure-adresse-sans-place  4408050100000000            parametre 22
+heure-deux-fois           4404050044040500            parametre 24
+# L'alerte aux routeurs, CIPSO, et les autres.
+alerte                    94040000                    livre 94040000
+alerte-courte             94030000                    parametre 21
+cipso-court               8606000000000000            cipso 21
+cipso                     8608000000010000            cipso 22
+securite                  820b00000000000000000000    livre 820b00000000000000000000
+inconnue                  9e040000                    livre 9e040000
+# Les routes sources.
+route-source-lache        8307040a00000200            jete
+route-source-stricte      8907040a00000200            jete
+route-source-pointeur-3   8307030a00000200            parametre 22
+route-source-deux-fois    8303048903040000            parametre 23
+route-source-puis-faute   8303040701000000            parametre 23

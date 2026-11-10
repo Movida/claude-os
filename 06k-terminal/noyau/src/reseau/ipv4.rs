@@ -17,15 +17,17 @@
 //! (ce que dit l'hôte), et Linux le jette. Puis la destination : une de nos
 //! adresses, ou une diffusion de l'interface ; sinon, le paquet n'est pas
 //! pour nous (pas de routage entre interfaces : nous ne sommes pas un
-//! routeur, `ip_forward` = 0). Un fragment va au réassemblage
-//! (inet::fragments). Les options : un paquet à route source (LSRR, SSRR)
-//! est jeté, comme Linux par défaut (`accept_source_route` à 0), et un
-//! en-tête dont les options ne se lisent pas aussi ; les autres sont
-//! sautées (Linux les vérifie une à une, `ip_options_compile`, et répond à
-//! une option fausse par un « problème de paramètre » : un écart). Avant
-//! la configuration, les réponses au client DHCP (port 68) lui sont
-//! passées quelle que soit leur destination (le `ic_bootp_recv` de Linux,
-//! branché avant ce tri).
+//! routeur, `ip_forward` = 0). Les options, entre les deux comme chez
+//! Linux (`ip_rcv_options`, après la route d'entrée, que Linux fait aussi
+//! pour un paquet qui n'est pas pour lui) : vérifiées une à une et notées
+//! sur place (`compiler_options`, l'`ip_options_compile` de Linux) ; une
+//! option fausse reçoit un « problème de paramètre » qui dit son octet, et
+//! le paquet est jeté ; un paquet à route source (LSRR, SSRR) est jeté sans
+//! rien dire, comme Linux par défaut (`accept_source_route` à 0). Un
+//! fragment va au réassemblage (inet::fragments). Avant la configuration,
+//! les réponses au client DHCP (port 68) lui sont passées quelle que soit
+//! leur destination (le `ic_bootp_recv` de Linux, branché avant ce tri,
+//! qui ne prend qu'un paquet entier, sans options).
 //! Puis le protocole : UDP (udp.rs), ICMP (icmp.rs) ; un autre, ou un
 //! datagramme UDP sans socket, reçoit l'erreur ICMP de Linux.
 //!
@@ -71,11 +73,13 @@ impl Morceau for Paquet {
 }
 
 /// Les paquets jetés à l'entrée (les compteurs d'`/proc/net/snmp` de Linux,
-/// pas encore montrés) : en-tête faux, martiens, pas pour nous.
+/// pas encore montrés) : en-tête faux, martiens, pas pour nous, une option
+/// fausse (`InHdrErrors`), une route source.
 static ENTETES_FAUX: AtomicU64 = AtomicU64::new(0);
 static MARTIENS: AtomicU64 = AtomicU64::new(0);
 static PAS_POUR_NOUS: AtomicU64 = AtomicU64::new(0);
 static OPTIONS: AtomicU64 = AtomicU64::new(0);
+static ROUTES_SOURCES: AtomicU64 = AtomicU64::new(0);
 
 /// Les identifiants des paquets qui en demandent un sans être d'une
 /// socket connectée (voir `identifiant`) : 2048 compteurs (`ip_idents`),
@@ -131,31 +135,32 @@ fn martien(i: &Interface, h: &ipv4::Ipv4, table: &Table) -> bool {
         || (carte && table.est_a_nous(h.source))
 }
 
-/// Les options de l'en-tête `entete` (au-delà des 20 octets) se lisent-elles,
-/// sans route source (`ip_rcv_options` : LSRR 131, SSRR 137) ? Chaque
-/// option : un octet de genre, puis (sauf la fin, 0, et le bourrage, 1)
-/// un octet de longueur, qui couvre ces deux octets et tient dans l'en-tête.
-fn options_acceptees(entete: &[u8]) -> bool {
-    const FIN: u8 = 0;
-    const BOURRAGE: u8 = 1;
-    const LSRR: u8 = 131;
-    const SSRR: u8 = 137;
-    let mut o = entete.get(ipv4::ENTETE..).unwrap_or(&[]);
-    while let Some(&genre) = o.first() {
-        match genre {
-            FIN => return true,
-            BOURRAGE => o = &o[1..],
-            LSRR | SSRR => return false,
-            _ => {
-                let Some(&longueur) = o.get(1) else { return false };
-                if longueur < 2 || longueur as usize > o.len() {
-                    return false;
-                }
-                o = &o[longueur as usize..];
-            }
-        }
-    }
-    true
+/// Les options du paquet reçu `p` par `i` (son en-tête : `h`), vérifiées
+/// et notées sur place (`ip_options_compile`), sous le verrou de la table :
+/// ce qu'elles notent de nous est l'adresse par laquelle l'émetteur nous
+/// joint (`fib_compute_spec_dst`) : la destination si elle est à nous (pas
+/// une diffusion), sinon la source de la route vers l'émetteur, sinon une
+/// adresse de l'interface (de son réseau d'abord : `inet_select_addr`).
+/// None : pas de table.
+fn lire_options(i: &Interface, h: &ipv4::Ipv4, p: &mut Paquet) -> Option<Result<ipv4::Options, u8>> {
+    let garde = TABLE.verrouiller();
+    let t = garde.as_ref()?;
+    let de_l_interface = || {
+        t.adresses_de(i.index)
+            .find(|x| ipv4::dans(h.source, x.reseau(), x.prefixe))
+            .or_else(|| t.adresses_de(i.index).next())
+            .map_or(ipv4::AUCUNE, |x| x.adresse)
+    };
+    let adresse = if t.est_a_nous(h.destination) {
+        h.destination
+    } else if h.source[0] != 0 {
+        t.chercher(h.source).map_or_else(de_l_interface, |c| source(&c))
+    } else {
+        de_l_interface()
+    };
+    let ici = ipv4::Ici { adresse, heure: super::icmp::horodatage(), unicast: &|a| t.est_unicast(a) };
+    let entete = p.donnees_mut().get_mut(..h.longueur_entete)?;
+    Some(ipv4::compiler_options(entete, &ici))
 }
 
 /// Un paquet IPv4 (sans son en-tête Ethernet) reçu par `i`, dans la tâche
@@ -165,32 +170,51 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
     let Ok((h, charge)) = ipv4::lire(p.donnees()) else { return compter(&ENTETES_FAUX) };
     // Le client DHCP d'abord, avant le tri des destinations : l'interface
     // n'a pas encore d'adresse.
-    if h.protocole == ipv4::UDP && !h.est_un_fragment() && super::dhcp::en_cours(i.index) {
+    if h.protocole == ipv4::UDP && !h.est_un_fragment() && h.longueur_entete == ipv4::ENTETE && super::dhcp::en_cours(i.index) {
         if let Ok((u, message)) = udp::lire(charge, h.source, h.destination) {
             if u.source == format_dhcp::PORT_SERVEUR && u.destination == format_dhcp::PORT_CLIENT {
                 return super::dhcp::recu(i, message);
             }
         }
     }
-    let pour_nous = TABLE.verrouiller().as_ref().map(|t| {
+    // Le tri de la route d'entrée : un martien, ou pour nous (à une de nos
+    // adresses, ou en diffusion), ou pas.
+    let tri = TABLE.verrouiller().as_ref().map(|t| {
         if martien(i, &h, t) {
-            Err(&MARTIENS)
-        } else if t.est_a_nous(h.destination) || t.est_diffusion(i.index, h.destination) || de_rien_a_rien(&h) {
-            Ok(())
+            None
         } else {
-            Err(&PAS_POUR_NOUS)
+            let diffusion = t.est_diffusion(i.index, h.destination) || de_rien_a_rien(&h);
+            Some((t.est_a_nous(h.destination) || diffusion, diffusion))
         }
     });
-    match pour_nous {
-        Some(Ok(())) => {}
-        Some(Err(c)) => return compter(c),
+    let (pour_nous, diffusion) = match tri {
+        Some(Some(x)) => x,
+        Some(None) => return compter(&MARTIENS),
         None => return,
+    };
+    let mut p = p;
+    if h.longueur_entete > ipv4::ENTETE {
+        match lire_options(i, &h, &mut p) {
+            None => return,
+            // Une option fausse : le « problème de paramètre » dit son
+            // octet, dans les 8 bits forts de ses 4 octets (`icmp_send`
+            // d'`ip_options_compile`) ; jamais pour une diffusion.
+            Some(Err(place)) => {
+                compter(&OPTIONS);
+                if !diffusion {
+                    super::icmp::envoyer_erreur(icmp::PARAMETRE, 0, (place as u32) << 24, p.donnees(), i.boucle(), pour_nous, trame_diffusee);
+                }
+                return;
+            }
+            Some(Ok(o)) if o.route_source != 0 => return compter(&ROUTES_SOURCES),
+            Some(Ok(_)) => {}
+        }
     }
-    if !options_acceptees(&p.donnees()[..h.longueur_entete]) {
-        return compter(&OPTIONS);
+    if !pour_nous {
+        return compter(&PAS_POUR_NOUS);
     }
     // Un morceau : ce qui suit ne voit que des paquets entiers (`ip_local_deliver`).
-    let (h, p) = if h.est_un_fragment() {
+    let (h, mut p) = if h.est_un_fragment() {
         match recoller(i, &h, p) {
             Some(x) => x,
             None => return,
@@ -200,8 +224,6 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
     };
     // Une diffusion (la limitée, ou celle d'un réseau de l'interface) va à
     // chaque socket qui l'accepte.
-    let diffusion = TABLE.verrouiller().as_ref().is_some_and(|t| t.est_diffusion(i.index, h.destination)) || de_rien_a_rien(&h);
-    let mut p = p;
     let longueur = h.longueur as usize - h.longueur_entete;
     let _ = p.retirer_entete(h.longueur_entete);
     p.couper(longueur);
