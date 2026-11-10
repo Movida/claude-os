@@ -35,10 +35,21 @@
 //!     pourtant à 0,3 % près. Et Linux garde le plus petit essai ; mais un
 //!     retard au bord d'un essai (juste après l'armement du canal, ou juste
 //!     avant de voir sa fin) le raccourcit : le plus petit serait celui-là.
-//! Linux affine ensuite la fréquence une seconde plus tard, contre le
-//! HPET ou le timer d'ACPI, dont nous n'avons pas les pilotes : nos dix
-//! millisecondes, sur un PIT lu à la microseconde, donnent la fréquence à
-//! un dix-millième près (moins de 9 secondes par jour).
+//! Puis, comme Linux, la fréquence est AFFINÉE sur une seconde au moins
+//! (`tsc_refine_calibration_work`), sans retarder le démarrage : un
+//! échantillon dès que l'ACPI est lue, un second avant le premier programme
+//! (`commencer_affinage`, `finir_affinage`) ; sauf si plus de quatre secondes
+//! les séparent (le PM timer de 24 bits fait le tour en 4,7 s) : la seconde
+//! de mesure est alors reprise, et le démarrage attend une seconde de plus
+//! (Linux, lui, mesure dans un travail différé, à une seconde) : nos dix millisecondes, sur un PIT lu à la
+//! microseconde, la donnent à un dix-millième près (jusqu'à 9 secondes par
+//! jour) ; une seconde du PM timer de l'ACPI (3,58 MHz, son port dans la
+//! FADT), à quelques millionièmes. Linux prend le HPET quand il a son
+//! pilote, le PM timer sinon ; nous n'avons que le second, aussi juste pour
+//! cette mesure. Une fréquence affinée à plus de 1 % de la première est
+//! rejetée (une mesure dérangée), comme chez Linux. Le temps ne saute
+//! pas : la nouvelle fréquence part de l'heure de l'ancienne à l'instant du
+//! changement (le DÉCALAGE, voir SEQUENCE).
 //!
 //! La conversion en nanosecondes ne fait pas de division à chaque lecture :
 //! ns = (cycles × mult) >> 32, avec mult = 10^6 × 2^32 / fréquence en kHz
@@ -70,10 +81,12 @@ use core::sync::atomic::{AtomicI64, AtomicU32, AtomicU64, Ordering};
 
 /// Les paramètres de l'horloge du TSC : la fréquence mesurée en kHz (0 :
 /// pas de TSC fiable, ou déclassé), le facteur de conversion en
-/// nanosecondes (voir l'en-tête), le TSC à l'instant pris pour origine du
-/// temps du noyau, et le DÉCALAGE à ajouter au temps des tics quand le TSC
-/// est déclassé (`declasser`, 0 sinon). Écrits ensemble par l'étalonnage,
-/// puis au plus une fois par le déclassement ; lus par tous les
+/// nanosecondes (voir l'en-tête), le TSC à l'instant pris pour origine, et
+/// le DÉCALAGE : tant que le TSC sert, l'heure du noyau à cette origine (0
+/// à l'étalonnage, celle de l'instant où la fréquence a été affinée
+/// ensuite) ; une fois le TSC déclassé (`declasser`), ce qu'on ajoute au
+/// temps des tics. Écrits ensemble par l'étalonnage, puis au plus une fois
+/// par l'affinage et une fois par le déclassement ; lus par tous les
 /// processeurs à chaque lecture de l'heure. Un SEQLOCK les publie (le
 /// `tk_core.seq` de Linux) : l'écrivain rend le compteur impair, écrit les
 /// quatre mots, le rend pair ; un lecteur lit le compteur, les quatre mots,
@@ -88,6 +101,41 @@ static KHZ: AtomicU64 = AtomicU64::new(0);
 static MULT: AtomicU64 = AtomicU64::new(0);
 static ORIGINE: AtomicU64 = AtomicU64::new(0);
 static DECALAGE: AtomicI64 = AtomicI64::new(0);
+
+/// Les quatre paramètres et le TSC, lus dans une même fenêtre du compteur
+/// (Linux lit son horloge dans la boucle du seqcount, `timekeeping_get_ns`) :
+/// un TSC lu après, par un lecteur retardé (une interruption), compterait
+/// avec d'anciens paramètres un instant d'après leur changement (l'affinage,
+/// pendant que les autres processeurs lisent l'heure), et l'heure pourrait
+/// reculer à la lecture suivante (la relecture des soldes).
+fn lire_parametres_et_tsc() -> ((u64, u64, u64, i64), u64) {
+    loop {
+        // Acquire : les lectures viennent après celle du compteur.
+        let s1 = SEQUENCE.load(Ordering::Acquire);
+        if s1 & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+        let p = (KHZ.load(Ordering::Relaxed), MULT.load(Ordering::Relaxed), ORIGINE.load(Ordering::Relaxed),
+                 DECALAGE.load(Ordering::Relaxed));
+        let tsc = lire_dans_l_ordre();
+        core::sync::atomic::fence(Ordering::Acquire);
+        if SEQUENCE.load(Ordering::Relaxed) == s1 {
+            return (p, tsc);
+        }
+    }
+}
+
+/// Le TSC, comme `lire`, mais sans `nomem` : le compilateur ne peut pas le
+/// sortir de la fenêtre du compteur (`lire_parametres_et_tsc`) ; LFENCE
+/// l'ordonne pour le processeur (le `rdtsc_ordered` de Linux).
+fn lire_dans_l_ordre() -> u64 {
+    let (bas, haut): (u32, u32);
+    // SAFETY: LFENCE et RDTSC ne font que lire ; RDTSC est permis en
+    // anneau 0 quel que soit CR4.TSD.
+    unsafe { asm!("lfence", "rdtsc", out("eax") bas, out("edx") haut, options(nostack, preserves_flags)) };
+    (haut as u64) << 32 | bas as u64
+}
 
 /// Les quatre paramètres, d'un même état (voir SEQUENCE) : kHz, mult,
 /// origine, décalage.
@@ -113,7 +161,8 @@ fn lire_parametres() -> (u64, u64, u64, i64) {
 
 /// Publie de nouveaux paramètres (voir SEQUENCE). Un seul écrivain à la
 /// fois : l'étalonnage, puis le déclassement, tous deux sur le premier
-/// processeur, pendant le démarrage.
+/// processeur pendant le démarrage, puis l'affinage, après eux, sous
+/// AFFINAGE (que le déclassement prend aussi).
 fn publier(khz: u64, mult: u64, origine: u64, decalage: i64) {
     let s = SEQUENCE.load(Ordering::Relaxed);
     SEQUENCE.store(s.wrapping_add(1), Ordering::Relaxed);
@@ -283,30 +332,37 @@ pub fn khz() -> Option<u64> {
     Some(lire_parametres().0).filter(|&k| k != 0)
 }
 
-/// Des cycles du TSC en nanosecondes. Le facteur ne change plus après
-/// l'étalonnage (le déclassement le garde : des durées mesurées sur un seul
-/// processeur, comme l'attente d'un verrou, se convertissent encore) :
-/// lisible sans le seqlock.
+/// Des cycles du TSC en nanosecondes. Le facteur ne change qu'une fois
+/// après l'étalonnage, de moins de 1 % (l'affinage ; le déclassement le
+/// garde : des durées mesurées sur un seul processeur, comme l'attente d'un
+/// verrou, se convertissent encore) : lisible sans le seqlock.
 pub fn en_nanosecondes(cycles: u64) -> u64 {
     ((cycles as u128 * MULT.load(Ordering::Relaxed) as u128) >> 32) as u64
 }
 
-/// Les nanosecondes depuis l'origine (l'étalonnage), si le TSC sert
-/// d'horloge. L'origine est soustraite sans passer en dessous : un
-/// secondaire dont le TSC serait d'un cycle en retard sur l'origine (lue
-/// sur le premier) rendrait sinon un temps énorme.
+/// Les nanosecondes depuis l'étalonnage, si le TSC sert d'horloge :
+/// l'heure à l'origine (le décalage), plus le temps depuis. L'origine est
+/// soustraite sans passer en dessous : un secondaire dont le TSC serait
+/// d'un cycle en retard sur l'origine (lue sur un autre) rendrait sinon un
+/// temps énorme.
 pub fn nanosecondes() -> Option<u64> {
-    let (khz, mult, origine, _) = lire_parametres();
+    let ((khz, mult, origine, decalage), tsc) = lire_parametres_et_tsc();
     if khz == 0 {
         return None;
     }
-    Some(((lire().saturating_sub(origine) as u128 * mult as u128) >> 32) as u64)
+    Some(heure(mult, origine, decalage, tsc))
 }
 
-/// Le décalage à ajouter au temps des tics (temps.rs) : nul tant que le TSC
-/// n'est pas déclassé.
+/// L'heure du TSC `tsc` selon les paramètres donnés (voir `nanosecondes`).
+fn heure(mult: u64, origine: u64, decalage: i64, tsc: u64) -> u64 {
+    (decalage as u64).saturating_add(((tsc.saturating_sub(origine) as u128 * mult as u128) >> 32) as u64)
+}
+
+/// Le décalage à ajouter au temps des tics (temps.rs), quand le TSC ne sert
+/// pas : nul s'il n'a jamais servi, celui du déclassement sinon.
 pub fn decalage() -> i64 {
-    lire_parametres().3
+    let (khz, _, _, decalage) = lire_parametres();
+    if khz == 0 { decalage } else { 0 }
 }
 
 /// Déclasse le TSC (voir l'en-tête) : l'heure revient au tic, comme sans
@@ -317,12 +373,13 @@ pub fn decalage() -> i64 {
 /// premier processeur, interruptions actives (les tics avancent), au plus
 /// une fois (smp.rs).
 pub fn declasser() -> i64 {
-    let (khz, mult, origine, _) = lire_parametres();
+    let _seul = AFFINAGE.verrouiller();
+    let (khz, mult, origine, base) = lire_parametres();
     assert!(khz != 0, "TSC declasse sans etre en service");
     // Les deux heures lues au même instant : interruptions coupées, un tic
     // ne tombe pas entre les deux.
     let interruptions = crate::cpu::couper_interruptions();
-    let ns_tsc = ((lire().saturating_sub(origine) as u128 * mult as u128) >> 32) as i64;
+    let ns_tsc = heure(mult, origine, base, lire()) as i64;
     let ns_tics = crate::horloge::nanosecondes(crate::horloge::tics()) as i64;
     let decalage = ns_tsc - ns_tics;
     publier(0, mult, origine, decalage);
@@ -330,6 +387,159 @@ pub fn declasser() -> i64 {
         crate::cpu::activer_interruptions();
     }
     decalage
+}
+
+/// L'affinage et le déclassement, l'un après l'autre : chacun lit les
+/// paramètres puis les publie (voir SEQUENCE).
+static AFFINAGE: Verrou<()> = Verrou::new(());
+
+/// Le PM timer de l'ACPI : un compteur de 24 bits (Linux n'en garde que 24
+/// bits même quand la FADT le dit de 32, `ACPI_PM_MASK`) à 3 579 545 Hz.
+const PM_HZ: u64 = 3_579_545;
+const PM_MASQUE: u32 = 0xFF_FFFF;
+
+/// Lit le PM timer comme `acpi_pm_read_verified` : trois lectures de suite,
+/// recommencées tant que la deuxième n'est pas entre ses voisines (des
+/// chipsets, ICH4 et PIIX4, ne figent pas le compteur pendant sa lecture,
+/// et une lecture peut être fausse), et rend la deuxième.
+fn lire_pm(port: u16) -> u32 {
+    loop {
+        // SAFETY: le port du PM timer que donne la FADT (acpi.rs) ; le lire
+        // ne change rien.
+        let (a, b, c) = unsafe { (port::lire32(port) & PM_MASQUE, port::lire32(port) & PM_MASQUE, port::lire32(port) & PM_MASQUE) };
+        if !((a > b && a < c) || (b > c && b < a) || (c > a && c < b)) {
+            return b;
+        }
+    }
+}
+
+/// Le TSC et le PM timer lus au même instant (`tsc_read_refs`) : le PM timer
+/// entre deux lectures du TSC distantes de moins de 1/32 de milliseconde
+/// (`tsc_khz >> 5` cycles) ; plus, une interruption ou une préemption les a
+/// séparées, et l'échantillon est refait, cinq fois au plus.
+fn references(port: u16, khz: u64) -> Option<(u64, u32)> {
+    for _ in 0..5 {
+        let t1 = lire();
+        let pm = lire_pm(port);
+        let t2 = lire();
+        if t2.wrapping_sub(t1) < khz >> 5 {
+            return Some((t2, pm));
+        }
+    }
+    None
+}
+
+/// Un sommeil de `ns` nanosecondes, sans file : « je vais dormir », puis
+/// dormir jusqu'à l'échéance.
+fn dormir(ns: u64) {
+    use crate::attente::{self, Sommeil};
+    let interruptions = crate::cpu::couper_interruptions();
+    crate::tache::courante().preparer_sommeil(Sommeil::Ininterruptible);
+    attente::dormir(Some(crate::temps::ns_monotone() + ns), Sommeil::Ininterruptible);
+    crate::tache::courante().reveille();
+    if interruptions {
+        crate::cpu::activer_interruptions();
+    }
+}
+
+/// Le premier échantillon de l'affinage : le port du PM timer, le TSC et le
+/// PM timer lus ensemble (`commencer_affinage`).
+static DEPART: Verrou<Option<(u16, u64, u32)>> = Verrou::new(None);
+
+/// La seconde que dure au moins l'affinage (le HZ de Linux), et la plus
+/// longue fenêtre permise : le PM timer fait le tour de ses 24 bits en 4,7 s,
+/// au-delà le compte serait ambigu.
+const AFFINAGE_MIN_MS: u64 = 1000;
+const AFFINAGE_MAX_MS: u64 = 4000;
+
+/// Ce que l'affinage a donné, pour l'afficher.
+pub enum Affinage {
+    /// La nouvelle fréquence, en kHz, et l'ancienne.
+    Fait { khz: u64, avant: u64 },
+    /// À plus de 1 % de la première : gardée la première.
+    Rejete { khz: u64, avant: u64 },
+    /// Le TSC ne sert plus (déclassé entre-temps), ou le PM timer ne bouge
+    /// pas : rien.
+    Abandonne,
+}
+
+/// Le premier échantillon de l'affinage, contre le PM timer du port
+/// `port`, si le TSC sert (le premier passage de `tsc_refine_calibration_work`
+/// de Linux) ; un échantillon dérangé (`references`) : aucun, et
+/// `finir_affinage` en reprendra un.
+pub fn commencer_affinage(port: u16) {
+    if let Some(khz) = khz() {
+        let (tsc, pm) = references(port, khz).unwrap_or((0, 0));
+        *DEPART.verrouiller() = Some((port, tsc, pm));
+    }
+}
+
+/// Le second échantillon, au moins une seconde après le premier (le sommeil
+/// qui manque, s'il en manque), et la fréquence qu'ils donnent : les cycles
+/// du TSC sur les nanosecondes du PM timer (`calc_pmtimer_ref`, le PM timer
+/// pouvant avoir fait un tour de ses 24 bits) ; publiée si elle est à 1 % de
+/// la première, avec pour origine l'instant du changement et pour décalage
+/// l'heure qu'y donnait l'ancienne : le temps continue sans sauter. Un
+/// échantillon dérangé, ou une fenêtre trop longue pour le PM timer, fait
+/// recommencer la seconde (le `goto restart` de Linux). None : pas
+/// d'affinage commencé (pas de TSC, ou pas de PM timer).
+pub fn finir_affinage() -> Option<Affinage> {
+    let (port, mut tsc1, mut pm1) = DEPART.verrouiller().take()?;
+    // Un échantillon dérangé se reprend, trois fois au plus, 10 ms plus
+    // tard : sur une machine où chaque lecture du port sort vers
+    // l'hyperviseur (KVM imbriqué), il pourrait l'être toujours, et le
+    // démarrage ne doit jamais attendre l'affinage pour toujours (Linux le
+    // reprend dans un travail différé, qui ne bloque rien).
+    let mut essais = 0;
+    let mut encore = || {
+        essais += 1;
+        dormir(10_000_000);
+        essais <= 3
+    };
+    loop {
+        let Some(avant) = khz() else { return Some(Affinage::Abandonne) };
+        let ecoule = lire().wrapping_sub(tsc1) / avant;
+        if tsc1 == 0 || ecoule > AFFINAGE_MAX_MS {
+            let Some(r) = references(port, avant) else {
+                if encore() {
+                    continue;
+                }
+                return Some(Affinage::Abandonne);
+            };
+            (tsc1, pm1) = r;
+            dormir(AFFINAGE_MIN_MS * 1_000_000);
+        } else if ecoule < AFFINAGE_MIN_MS {
+            dormir((AFFINAGE_MIN_MS - ecoule) * 1_000_000);
+        }
+        let _seul = AFFINAGE.verrouiller();
+        let Some(avant) = khz() else { return Some(Affinage::Abandonne) };
+        let Some((tsc2, pm2)) = references(port, avant) else {
+            drop(_seul);
+            if !encore() {
+                return Some(Affinage::Abandonne);
+            }
+            tsc1 = 0;
+            continue;
+        };
+        if pm1 == pm2 {
+            return Some(Affinage::Abandonne);
+        }
+        let ticks = (pm2.wrapping_sub(pm1) & PM_MASQUE) as u64;
+        let ns = ticks * 1_000_000_000 / PM_HZ;
+        let khz = (tsc2.wrapping_sub(tsc1) as u128 * 1_000_000 / ns as u128) as u64;
+        if khz.abs_diff(avant) > avant / 100 {
+            return Some(Affinage::Rejete { khz, avant });
+        }
+        let interruptions = crate::cpu::couper_interruptions();
+        let (_, mult, origine, decalage) = lire_parametres();
+        let maintenant = lire();
+        let base = heure(mult, origine, decalage, maintenant);
+        publier(khz, ((1_000_000u128 << 32) / khz as u128) as u64, maintenant, base as i64);
+        if interruptions {
+            crate::cpu::activer_interruptions();
+        }
+        return Some(Affinage::Fait { khz, avant });
+    }
 }
 
 /// Quel côté de la vérification de l'accord des TSC on tient : le premier

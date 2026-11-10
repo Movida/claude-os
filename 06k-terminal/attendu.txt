@@ -67,6 +67,7 @@
 [reseau] eth0 : la passerelle et le DNS resolus par ARP : ok.
 [reseau] la MTU du chemin, par un ICMP recu : ok.
 [reseau] les options IP d'un paquet recu, comme Linux : ok.
+[noyau] TSC affine contre le PM timer de l'ACPI : … MHz (… ppm de la premiere mesure).
 [noyau] Archive de programmes : … octets a ….
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.

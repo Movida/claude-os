@@ -39,6 +39,8 @@ pub struct Configuration {
     pub madt: Option<ConfigurationMadt>,
     /// Le registre du siècle de l'horloge CMOS (FADT).
     pub siecle: Option<u8>,
+    /// Le port du PM timer (FADT), pour affiner le TSC (tsc.rs).
+    pub timer_pm: Option<u16>,
 }
 
 /// Ce que dit la MADT.
@@ -165,7 +167,7 @@ pub fn initialiser() -> Result<(), Absence> {
     })
     .and_then(|a| a.ok_or(acpi::Erreur::Signature))
     .map_err(|e| Absence::Racine(racine, e))?;
-    let mut c = Configuration { revision: rsdp.revision, oem: rsdp.oem, signatures: Vec::new(), xsdt: larges, madt: None, siecle: None };
+    let mut c = Configuration { revision: rsdp.revision, oem: rsdp.oem, signatures: Vec::new(), xsdt: larges, madt: None, siecle: None, timer_pm: None };
     for a in adresses {
         // Une table illisible est sautée : les autres peuvent servir.
         let _ = avec_table(a, |t| {
@@ -173,7 +175,10 @@ pub fn initialiser() -> Result<(), Absence> {
             match &t.signature {
                 // La première de chaque, comme Linux.
                 b"APIC" if c.madt.is_none() => c.madt = lire_madt(t),
-                b"FACP" if c.siecle.is_none() => c.siecle = acpi::registre_du_siecle(t),
+                b"FACP" if c.siecle.is_none() && c.timer_pm.is_none() => {
+                    c.siecle = acpi::registre_du_siecle(t);
+                    c.timer_pm = acpi::port_du_timer_pm(t);
+                }
                 _ => {}
             }
         });
@@ -190,6 +195,11 @@ pub fn avec<R>(f: impl FnOnce(&Configuration) -> R) -> Option<R> {
 /// Le registre du siècle de l'horloge CMOS, s'il y en a un.
 pub fn registre_du_siecle() -> Option<u8> {
     avec(|c| c.siecle).flatten()
+}
+
+/// Le port du PM timer, s'il y en a un.
+pub fn port_du_timer_pm() -> Option<u16> {
+    avec(|c| c.timer_pm).flatten()
 }
 
 /// Affiche ce que disent les tables (au démarrage).

@@ -459,6 +459,12 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // L'heure aussi distingue ce démarrage d'un autre : versée au
     // générateur, sans crédit (le `random_init` de Linux).
     aleatoire::melanger(&temps::maintenant().secondes.to_le_bytes());
+    // La fréquence du TSC, affinée contre le PM timer de l'ACPI sur au
+    // moins une seconde : le premier échantillon ici, le second avant le
+    // premier programme (tsc.rs, `finir_affinage`).
+    if let Some(port) = acpi::port_du_timer_pm() {
+        tsc::commencer_affinage(port);
+    }
 
     // Le scénario de panne de `make tests-qemu` : déborder exprès de la
     // pile, que la page de garde doit arrêter net. Dans une tâche du noyau,
@@ -512,6 +518,16 @@ extern "C" fn noyau_main(infos: u64) -> ! {
         reseau::configurer();
         tester_voisins();
         reseau::autotest::lancer();
+        match tsc::finir_affinage() {
+            Some(tsc::Affinage::Fait { khz, avant }) => afficherln!(
+                "[noyau] TSC affine contre le PM timer de l'ACPI : {}.{:03} MHz ({} ppm de la premiere mesure).",
+                khz / 1000, khz % 1000, (khz as i64 - avant as i64) * 1_000_000 / avant as i64),
+            Some(tsc::Affinage::Rejete { khz, avant }) => afficherln!(
+                "[noyau] TSC : l'affinage donne {}.{:03} MHz, a plus de 1 % des {}.{:03} mesures : garde.",
+                khz / 1000, khz % 1000, avant / 1000, avant % 1000),
+            Some(tsc::Affinage::Abandonne) => afficherln!("[noyau] TSC : pas d'affinage (le TSC ne sert plus, ou le PM timer ne bouge pas)."),
+            None => {}
+        }
         programmes::demarrer();
         if cpu::bogue_sysret_ss() {
             afficherln!("[noyau] Processeur AMD : SS recharge a {} bascules, pour sysretq.", cpu::ss_recharges());

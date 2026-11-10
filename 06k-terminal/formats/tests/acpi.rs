@@ -30,7 +30,7 @@ fn a(zone: &(u64, Vec<u8>), adresse: u64) -> &[u8] {
 }
 
 /// Ce que la machine `machine` doit montrer, comme le noyau le lit.
-fn verifier_machine(machine: &str, signatures: &[&[u8; 4]], revision_fadt: u8, siecle: Option<u8>) {
+fn verifier_machine(machine: &str, signatures: &[&[u8; 4]], revision_fadt: u8, siecle: Option<u8>, timer_pm: Option<u16>) {
     let rsdp_page = capture(machine, "rsdp");
     let tables = capture(machine, "tables");
     let i = acpi::chercher_rsdp(&rsdp_page.1).expect("RSDP introuvable");
@@ -64,6 +64,7 @@ fn verifier_machine(machine: &str, signatures: &[&[u8; 4]], revision_fadt: u8, s
             b"FACP" => {
                 assert_eq!(t.revision, revision_fadt, "{machine} : la révision de la FADT");
                 assert_eq!(acpi::registre_du_siecle(&t), siecle, "{machine} : le siècle");
+                assert_eq!(acpi::port_du_timer_pm(&t), timer_pm, "{machine} : le PM timer");
             }
             _ => {}
         }
@@ -74,12 +75,12 @@ fn verifier_machine(machine: &str, signatures: &[&[u8; 4]], revision_fadt: u8, s
 fn qemu_pc() {
     // FADT de révision 1 : son registre du siècle (0x32) n'est pas pris,
     // comme sous Linux.
-    verifier_machine("pc", &[b"FACP", b"APIC", b"HPET", b"WAET"], 1, None);
+    verifier_machine("pc", &[b"FACP", b"APIC", b"HPET", b"WAET"], 1, None, Some(0x608));
 }
 
 #[test]
 fn qemu_q35() {
-    verifier_machine("q35", &[b"FACP", b"APIC", b"HPET", b"MCFG", b"WAET"], 3, Some(0x32));
+    verifier_machine("q35", &[b"FACP", b"APIC", b"HPET", b"MCFG", b"WAET"], 3, Some(0x32), Some(0x608));
 }
 
 /// Rend nulle la somme des octets de `o`, en changeant l'octet `i`.
@@ -239,6 +240,27 @@ fn siecle() {
     assert_eq!(acpi::registre_du_siecle(&acpi::lire_table(&courte).unwrap()), None);
     corps[108 - acpi::TAILLE_ENTETE] = 0;
     assert_eq!(acpi::registre_du_siecle(&acpi::lire_table(&table(b"FACP", 3, &corps)).unwrap()), None);
+}
+
+/// Le PM timer : le champ étendu d'abord (révision 2 et plus), s'il est un
+/// port ; le champ de 32 bits à défaut d'adresse, ou pour une révision 1.
+#[test]
+fn timer_pm() {
+    let mut corps = vec![0u8; 244 - acpi::TAILLE_ENTETE];
+    corps[76 - acpi::TAILLE_ENTETE..80 - acpi::TAILLE_ENTETE].copy_from_slice(&0x608u32.to_le_bytes());
+    let lire = |revision, corps: &[u8]| acpi::port_du_timer_pm(&acpi::lire_table(&table(b"FACP", revision, corps)).unwrap());
+    assert_eq!(lire(1, &corps), Some(0x608));
+    // Révision 3, le champ étendu nul : celui de 32 bits, un port, quel que
+    // soit le genre du champ étendu (ACPICA le remplit ainsi).
+    assert_eq!(lire(3, &corps), Some(0x608));
+    // Une adresse étendue : seulement si c'est un port (genre 1).
+    corps[212 - acpi::TAILLE_ENTETE..220 - acpi::TAILLE_ENTETE].copy_from_slice(&0xb008u64.to_le_bytes());
+    assert_eq!(lire(3, &corps), None);
+    corps[208 - acpi::TAILLE_ENTETE] = 1;
+    assert_eq!((lire(3, &corps), lire(1, &corps)), (Some(0xb008), Some(0x608)));
+    // Rien ; une table trop courte pour le champ étendu : celui de 32 bits.
+    assert_eq!(lire(1, &[0; 80]), None);
+    assert_eq!(lire(3, &corps[..100]), Some(0x608));
 }
 
 /// Un générateur à graine fixe (xorshift64*), pour des mutations qui se

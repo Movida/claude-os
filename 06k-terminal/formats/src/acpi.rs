@@ -295,6 +295,33 @@ impl Iterator for Entrees<'_> {
     }
 }
 
+/// Le port d'E/S du timer de gestion de l'énergie (le « PM timer », un
+/// compteur de 24 bits à 3,579545 MHz), d'après la FADT, comme
+/// `acpi_parse_fadt` de Linux (son `pmtmr_ioport`) : pour une FADT de
+/// révision 2 au moins, le champ étendu X_PM_TMR_BLK (une adresse
+/// générique à l'octet 208 : son genre, puis l'adresse à l'octet 212), qui
+/// doit être dans l'espace des ports (genre 1 ; sinon, pas de PM timer) ;
+/// une adresse étendue nulle, ou une révision 1, prend le champ de 32 bits
+/// PM_TMR_BLK (l'octet 76), un port : ce que fait ACPICA en convertissant
+/// la FADT (`acpi_tb_convert_fadt`, « Address32 non-zero, Address64 zero »),
+/// avant que Linux ne la lise. Un champ hors d'une table trop courte compte
+/// pour nul (`acpi_tb_create_local_fadt` met à zéro ce qui manque). None :
+/// pas de PM timer.
+pub fn port_du_timer_pm(fadt: &Table) -> Option<u16> {
+    if &fadt.signature != b"FACP" {
+        return None;
+    }
+    let octets = |debut: usize, n: usize| fadt.corps.get(debut - TAILLE_ENTETE..debut - TAILLE_ENTETE + n);
+    let ancien = octets(76, 4).map_or(0, |o| u32::from_le_bytes([o[0], o[1], o[2], o[3]]) as u64);
+    let etendu = if fadt.revision >= 2 { octets(212, 8).map_or(0, |o| u64::from_le_bytes(o.try_into().unwrap_or([0; 8]))) } else { 0 };
+    let port = match etendu {
+        0 => ancien,
+        x if octets(208, 1).map_or(0, |o| o[0]) == 1 => x,
+        _ => return None,
+    };
+    u16::try_from(port).ok().filter(|&p| p != 0)
+}
+
 /// Le registre du siècle de l'horloge CMOS, d'après la FADT (signature
 /// « FACP ») : son numéro est l'octet 108 de la table. Comme Linux
 /// (`mc146818_get_time`), seulement pour une FADT de révision 3 au moins
