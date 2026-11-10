@@ -320,6 +320,8 @@ impl Ouverts {
         }
         let mut ferme = self.cases[f.0 as usize].take();
         if let Some(o) = ferme.as_mut() {
+            // Ses verrous OFD et son flock (`locks_remove_file`).
+            crate::verrous_de_fichiers::derniere_fermeture(f);
             crate::epoll::fichier_ferme(self, o);
             crate::tube::fichier_ferme(o, f);
             crate::reseau::socket::fichier_ferme(o, f);

@@ -72,8 +72,8 @@
 [noyau] Archive de programmes : … octets a ….
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 65, liens symboliques 6, liens physiques 4 ; archive rendue (… Kio).
-[noyau] Lancement : /etc/demarrage, 94 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 66, liens symboliques 6, liens physiques 4 ; archive rendue (… Kio).
+[noyau] Lancement : /etc/demarrage, 98 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -228,6 +228,12 @@
 [linux] copies : copy_file_range de trois pages et 100 octets : ok
 [linux] copies : toutes les verifications : ok
 [noyau] copies : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] verrous : toutes les verifications : ok
+[noyau] verrous : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] verrous b : F_SETLKW sur l'octet 0 alors que a attend l'octet 1 : EDEADLK : ok
+~ [linux] verrous a : toutes les verifications : ok
+[linux] verrous b : toutes les verifications : ok
+[noyau] Programmes en parallele : memoire rendue : ok.
 [linux] surveillance : trois write : six evenements, sans fusion (seulement avec le dernier) : ok
 [linux] surveillance : rmdir d'un dossier dont un fichier est encore ouvert : il attend : ok
 [linux] surveillance : le close du fichier : le dossier finit : ok

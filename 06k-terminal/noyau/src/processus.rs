@@ -369,6 +369,9 @@ impl Entree {
         crate::oom::memoire_rendue(self.pid);
         let descripteurs = core::mem::take(&mut *self.descripteurs.verrouiller());
         drop(descripteurs);
+        // Ses verrous POSIX : ses descripteurs fermés, chacun l'aurait fait
+        // (verrous_de_fichiers.rs).
+        crate::verrous_de_fichiers::fin_du_processus(self.pid);
         drop(fini);
     }
 

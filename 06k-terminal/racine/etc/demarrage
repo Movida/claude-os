@@ -119,6 +119,12 @@ wait
 }
 # Les transferts dans le noyau (6i) : copy_file_range, sendfile, fadvise64.
 /bin/copies
+# Les verrous de fichiers (les soldes d'avant 6k) : OFD, POSIX et flock dans
+# un processus ; puis deux, ensemble (F_GETLK, EDEADLK, la fin de l'un).
+/bin/verrous /tmp
+/bin/verrous /tmp a &
+/bin/verrous /tmp b
+wait
 # inotify (6i) : chaque événement, dans l'ordre de Linux. Puis, vus par un
 # guetteur lancé avant eux (et le temps de poser sa surveillance), en
 # O_ASYNC (SIGIO) : un programme lancé par le lanceur ; un fichier lu par un

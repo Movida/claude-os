@@ -163,6 +163,7 @@ mod sondage;
 mod surveillance;
 mod sysfs;
 mod tube;
+mod verrous_de_fichiers;
 mod wasi;
 
 use core::arch::asm;

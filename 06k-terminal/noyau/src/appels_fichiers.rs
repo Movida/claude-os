@@ -970,8 +970,23 @@ pub fn creat(adresse: u64, mode: u64) -> i64 {
 /// de moins.
 fn fermer_descripteur(fd: u64) -> Result<(), i64> {
     let d = processus::descripteurs(|d| d.retirer(fd)).ok_or(-EBADF)?;
-    vfs::avec_systeme(|s, cadres| s.lacher(d.fichier, cadres));
+    lacher_par_le_processus(d.fichier);
     Ok(())
+}
+
+/// Le processus courant lâche le fichier ouvert `f`, qu'un de ses
+/// descripteurs désignait (close, dup2 par-dessus, close_range : le
+/// `filp_close` de Linux) : ses verrous POSIX sur son objet tombent d'abord
+/// (`locks_remove_posix`, verrous_de_fichiers.rs), puis le fichier est
+/// tenu une fois de moins.
+fn lacher_par_le_processus(f: Fichier) {
+    let pid = processus::avec(|p| p.pid);
+    vfs::avec_systeme(|s, cadres| {
+        if let Some(o) = s.ouverts.voir(f) {
+            crate::verrous_de_fichiers::fermeture(pid, o.objet());
+        }
+        s.lacher(f, cadres)
+    });
 }
 
 /// Ce fichier a-t-il de quoi retenir O_ASYNC (un `fasync`) ?
@@ -2089,7 +2104,7 @@ fn installer_copie(ancien: u64, nouveau: u64, fermer_a_l_exec: bool) -> i64 {
     match r {
         Ok(remplace) => {
             if let Some(ancien) = remplace {
-                vfs::avec_systeme(|s, cadres| s.lacher(ancien.fichier, cadres));
+                lacher_par_le_processus(ancien.fichier);
             }
             nouveau as i64
         }
@@ -2142,9 +2157,7 @@ pub fn dup2(ancien: u64, nouveau: u64) -> i64 {
 ///     seuls O_APPEND, O_NONBLOCK, O_ASYNC (asynchrone.rs, sur ce qui a une liste) (et O_DIRECT, O_NOATIME, sans
 ///     effet ici) changent, le reste est ignoré, comme Linux ;
 ///   - F_GETLK, F_SETLK, F_SETLKW et leurs versions « OFD » : les verrous
-///     de fichiers (`verrou_posix`). Ils ne sont pas encore tenus : poser
-///     réussit toujours, et F_GETLK répond « rien ne bloque » (l_type =
-///     F_UNLCK), une fois la demande vérifiée ;
+///     de fichiers (`verrou_posix`, verrous_de_fichiers.rs) ;
 ///   - F_GETPIPE_SZ, F_SETPIPE_SZ : la capacité d'un tube (tube.rs) ; d'un
 ///     autre fichier : EBADF (mesuré) ;
 ///   - le reste : EINVAL.
@@ -2218,10 +2231,10 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
         F_GETOWNER_UIDS => asynchrone::f_getowner_uids(d.fichier, argument),
         F_GETSIG => asynchrone::f_getsig(d.fichier),
         F_SETSIG => asynchrone::f_setsig(d.fichier, argument as u32 as i32),
-        F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => {
-            verrou_posix(fd, argument, false, matches!(commande, F_OFD_SETLK | F_OFD_SETLKW))
-        }
-        F_GETLK | F_OFD_GETLK => verrou_posix(fd, argument, true, commande == F_OFD_GETLK),
+        F_SETLK | F_SETLKW | F_OFD_SETLK | F_OFD_SETLKW => verrou_posix(
+            fd, argument, false, matches!(commande, F_OFD_SETLK | F_OFD_SETLKW), matches!(commande, F_SETLKW | F_OFD_SETLKW),
+        ),
+        F_GETLK | F_OFD_GETLK => verrou_posix(fd, argument, true, commande == F_OFD_GETLK, false),
         // La capacité d'un tube (`pipe_fcntl`) ; un autre fichier : EBADF.
         F_SETPIPE_SZ | F_GETPIPE_SZ if d.sorte != Sorte::Tube => -EBADF,
         F_GETPIPE_SZ => d.tube().capacite(),
@@ -2243,12 +2256,15 @@ pub fn fcntl(fd: u64, commande: u64, argument: u64) -> i64 {
 ///   - poser un verrou de lecture sur un descripteur qui ne lit pas, ou
 ///     d'écriture sur un qui n'écrit pas : EBADF ;
 ///   - pour la version OFD, l_pid doit valoir 0 (EINVAL).
-/// Puis : poser réussit, F_GETLK répond F_UNLCK (le reste de la structure
-/// inchangé, comme Linux). Un écart, depuis que deux programmes peuvent
-/// tourner en même temps (`&`, 6e) : deux verrous d'écriture sur le même
-/// fichier ne s'excluent pas ; les vrais verrous viendront avec le premier
-/// programme qui en aura besoin (noté dans « Reste à faire »).
-fn verrou_posix(fd: u64, adresse: u64, demander: bool, ofd: bool) -> i64 {
+/// Puis la table des verrous (verrous_de_fichiers.rs ; jusqu'aux soldes
+/// d'avant 6k, poser réussissait toujours) : F_GETLK répond le premier
+/// verrou qui empêcherait la demande (son genre, SEEK_SET, son début, sa
+/// longueur, 0 s'il va jusqu'au bout, et le pid de son processus, -1 pour
+/// un OFD : `posix_lock_to_flock`), ou F_UNLCK (le reste de la structure
+/// inchangé, comme Linux) ; F_SETLK pose ou rend la plage (EAGAIN en
+/// conflit), F_SETLKW attend (`attendre` ; EDEADLK, ERESTARTSYS).
+fn verrou_posix(fd: u64, adresse: u64, demander: bool, ofd: bool, attendre: bool) -> i64 {
+    use crate::verrous_de_fichiers::{self as verrous, Plage, Proprietaire, POSITION_MAX};
     const F_RDLCK: i16 = 0;
     const F_WRLCK: i16 = 1;
     const F_UNLCK: i16 = 2;
@@ -2265,7 +2281,9 @@ fn verrou_posix(fd: u64, adresse: u64, demander: bool, ofd: bool) -> i64 {
     let long = |i: usize| i64::from_le_bytes(flock[i..i + 8].try_into().unwrap_or([0; 8]));
     let (genre, depuis, debut, longueur) = (mot(0), mot(2), long(8), long(16));
     let pid = i32::from_le_bytes(flock[24..28].try_into().unwrap_or([0; 4]));
-    let genre_permis = matches!(genre, F_RDLCK | F_WRLCK) || (genre == F_UNLCK && !demander);
+    // F_UNLCK pour poser, et pour F_OFD_GETLK depuis Linux 6.10 (le verrou
+    // de la même description : `fcntl_getlk`).
+    let genre_permis = matches!(genre, F_RDLCK | F_WRLCK) || (genre == F_UNLCK && (!demander || ofd));
     if demander && !genre_permis {
         return -EINVAL;
     }
@@ -2294,15 +2312,58 @@ fn verrou_posix(fd: u64, adresse: u64, demander: bool, ofd: bool) -> i64 {
     if ofd && pid != 0 {
         return -EINVAL;
     }
-    if demander && copier_vers_utilisateur(adresse, &F_UNLCK.to_le_bytes()).is_err() {
+    // La plage, fin comprise (`flock_to_posix_lock`).
+    let (debut, fin) = match longueur {
+        0 => (debut as u64, POSITION_MAX),
+        l if l > 0 => (debut as u64, (debut + (l - 1)) as u64),
+        l => ((debut + l) as u64, debut as u64 - 1),
+    };
+    let proprietaire = if ofd { Proprietaire::Fichier(o.fichier()) } else { Proprietaire::Processus(processus::avec(|p| p.pid)) };
+    let plage = Plage { objet: o.objet, proprietaire, ecriture: genre == F_WRLCK, debut, fin };
+    if !demander {
+        let pose = (genre != F_UNLCK).then_some(genre == F_WRLCK);
+        if let Err(e) = verrous::poser(&plage, pose, attendre) {
+            return e;
+        }
+        // La course close/fcntl (`fcntl_setlk`) : un autre fil a fermé le
+        // descripteur pendant qu'on posait un verrou POSIX ; sa fermeture
+        // a pu passer avant : le verrou, que plus rien ne rendrait, est
+        // rendu, et EBADF. Pas pour F_UNLCK, ni pour un OFD (sa description
+        // les rend à sa fin).
+        if pose.is_some() && !ofd && processus::descripteurs(|t| t.get(fd).map(|d| d.fichier)) != Some(o.fichier()) {
+            let _ = verrous::poser(&plage, None, false);
+            return -EBADF;
+        }
+        return 0;
+    }
+    let reponse = match verrous::tester(&plage, genre == F_UNLCK) {
+        None => copier_vers_utilisateur(adresse, &F_UNLCK.to_le_bytes()),
+        Some(c) => {
+            let mut s = flock;
+            s[0..2].copy_from_slice(&(if c.ecriture { F_WRLCK } else { F_RDLCK }).to_le_bytes());
+            s[2..4].copy_from_slice(&0i16.to_le_bytes());
+            s[8..16].copy_from_slice(&(c.debut as i64).to_le_bytes());
+            let longueur = if c.fin == POSITION_MAX { 0 } else { (c.fin - c.debut + 1) as i64 };
+            s[16..24].copy_from_slice(&longueur.to_le_bytes());
+            let pid = match c.proprietaire {
+                Proprietaire::Processus(p) => p as i32,
+                Proprietaire::Fichier(_) => -1,
+            };
+            s[24..28].copy_from_slice(&pid.to_le_bytes());
+            copier_vers_utilisateur(adresse, &s)
+        }
+    };
+    if reponse.is_err() {
         return -EFAULT;
     }
     0
 }
 
-/// flock(fd, opération) : un verrou sur tout le fichier. Toujours accordé,
-/// comme ceux de fcntl (voir `verrou_posix`, le même écart). Une opération
-/// inconnue : EINVAL ; un descripteur O_PATH : EBADF.
+/// flock(fd, opération) : un verrou sur tout le fichier, à la description
+/// ouverte (verrous_de_fichiers.rs ; jusqu'aux soldes d'avant 6k, toujours
+/// accordé). Une opération inconnue : EINVAL ; un descripteur O_PATH :
+/// EBADF ; LOCK_NB en conflit : EWOULDBLOCK ; sinon l'attente
+/// (ERESTARTSYS sur un signal).
 pub fn flock(fd: u64, operation: u64) -> i64 {
     const LOCK_SH: u64 = 1;
     const LOCK_EX: u64 = 2;
@@ -2315,9 +2376,15 @@ pub fn flock(fd: u64, operation: u64) -> i64 {
     if o.sorte == Sorte::Chemin {
         return -EBADF;
     }
-    match operation & !LOCK_NB {
-        LOCK_SH | LOCK_EX | LOCK_UN => 0,
-        _ => -EINVAL,
+    let genre = match operation & !LOCK_NB {
+        LOCK_SH => Some(false),
+        LOCK_EX => Some(true),
+        LOCK_UN => None,
+        _ => return -EINVAL,
+    };
+    match crate::verrous_de_fichiers::flock(o.objet, o.fichier(), genre, operation & LOCK_NB == 0) {
+        Ok(()) => 0,
+        Err(e) => e,
     }
 }
 
