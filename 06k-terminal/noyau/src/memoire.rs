@@ -564,24 +564,30 @@ impl Memoire {
     }
 
     /// Donne les droits `droits` à [debut, fin[ (alignés, non vide) :
-    /// mprotect. Toute la plage doit être dans des zones, sinon rien ne
-    /// change (Linux rend alors ENOMEM). Une zone privée qui devient
-    /// inscriptible, sans MAP_NORESERVE, est promise comme par mmap : refusée
-    /// si elle est à elle seule plus grande que toute la mémoire (Linux la
-    /// marque alors VM_ACCOUNT, et ne la recompte plus ; sans ce drapeau, on
-    /// recompte une zone rendue inscriptible deux fois, ce qui ne change
-    /// rien tant qu'elle n'a pas, entre-temps, fusionné avec d'autres au-delà
-    /// de la taille de la mémoire).
+    /// mprotect. Zone par zone depuis `debut`, comme Linux
+    /// (`do_mprotect_pkey`) : au premier trou, NonProjetee (ENOMEM), et les
+    /// zones d'avant gardent leurs nouveaux droits ; de même pour une zone
+    /// privée qui devient inscriptible, sans MAP_NORESERVE, et qui ne peut
+    /// pas être promise comme par mmap (PlusDeMemoire : plus grande à elle
+    /// seule que toute la mémoire ; Linux la marque alors VM_ACCOUNT, et ne
+    /// la recompte plus ; sans ce drapeau, on recompte une zone rendue
+    /// inscriptible deux fois, ce qui ne change rien tant qu'elle n'a pas,
+    /// entre-temps, fusionné avec d'autres au-delà de la taille de la
+    /// mémoire). Jusqu'aux soldes d'avant 6k, un trou ne laissait rien
+    /// changer : un écart sans raison.
     pub fn proteger(&mut self, debut: u64, fin: u64, droits: Droits) -> Result<(), Erreur> {
-        if !self.zones.couverte(debut, fin) {
-            return Err(Erreur::NonProjetee);
-        }
         let promise = |z: Zone| !droits.ecriture || z.droits.ecriture || z.drapeaux.sans_reserve || engagement_possible(z.taille());
-        if !self.zones.morceaux(debut, fin).all(promise) {
-            return Err(Erreur::PlusDeMemoire);
+        let mut ici = debut;
+        while ici < fin {
+            let z = *self.zones.trouver(ici).ok_or(Erreur::NonProjetee)?;
+            if !promise(z) {
+                return Err(Erreur::PlusDeMemoire);
+            }
+            let bout = z.fin.min(fin);
+            self.zones.changer(ici, bout, |z| z.droits = droits, &mut references)?;
+            self.tables().proteger_plage(ici, bout, droits);
+            ici = bout;
         }
-        self.zones.changer(debut, fin, |z| z.droits = droits, &mut references)?;
-        self.tables().proteger_plage(debut, fin, droits);
         Ok(())
     }
 

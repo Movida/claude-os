@@ -898,13 +898,12 @@ fn munmap(adresse: u64, longueur: u64) -> i64 {
 ///     la plage, qui doit grandir vers le bas (la pile), sinon EINVAL ;
 ///   - PROT_GROWSUP : aucune zone ne grandit vers le haut sur x86 :
 ///     EINVAL ;
-///   - un trou dans la plage : ENOMEM, et rien ne change. (Linux change
-///     les zones d'avant le trou, puis rend ENOMEM ; POSIX ne dit rien de
-///     l'état après une erreur, aucun programme ne compte sur l'état
-///     partiel, et tout ou rien est plus simple à garantir) ;
+///   - zone par zone depuis le début : un trou, ENOMEM, et les zones
+///     d'avant le trou gardent leurs nouveaux droits (comme Linux, depuis
+///     les soldes d'avant 6k ; jusque-là rien ne changeait) ;
 ///   - rendre inscriptible une zone privée qui ne l'était pas, sans
 ///     MAP_NORESERVE, et plus grande que toute la mémoire : ENOMEM (le
-///     surengagement, comme pour mmap).
+///     surengagement, comme pour mmap), les zones d'avant changées aussi.
 fn mprotect(adresse: u64, longueur: u64, prot: u64) -> i64 {
     // Sans effet sur x86 : Linux l'accepte et l'ignore.
     const PROT_SEM: u64 = 8;

@@ -303,6 +303,23 @@ static void populate_write(void)
     munmap(p, 8 * PAGE);
 }
 
+/* Les droits de la zone qui contient `a`, lus dans /proc/self/maps (« rw-p »), ou "" si aucune. */
+static const char *droits_dans_maps(const void *a, char droits[8])
+{
+    FILE *f = fopen("/proc/self/maps", "r");
+    char ligne[512];
+    unsigned long debut, fin;
+    droits[0] = 0;
+    while (f && fgets(ligne, sizeof ligne, f)) {
+        if (sscanf(ligne, "%lx-%lx %7s", &debut, &fin, droits) == 3 && debut <= (uintptr_t)a && (uintptr_t)a < fin)
+            break;
+        droits[0] = 0;
+    }
+    if (f)
+        fclose(f);
+    return droits;
+}
+
 /* Les refus de mprotect et madvise, et les conseils sans effet. */
 static void erreurs_protections(void)
 {
@@ -317,7 +334,9 @@ static void erreurs_protections(void)
     verifier(mprotect(pile, PAGE, PROT_READ | PROT_WRITE | PROT_GROWSDOWN) == 0, "PROT_GROWSDOWN sur la pile : accepte");
     verifier(erreur_de(mprotect(p, (size_t)-PAGE, PROT_READ)) == ENOMEM, "mprotect qui deborde : ENOMEM");
     munmap(p + PAGE, PAGE);
-    verifier(erreur_de(mprotect(p, 2 * PAGE, PROT_READ)) == ENOMEM, "mprotect avec un trou : ENOMEM");
+    char droits[8];
+    verifier(erreur_de(mprotect(p, 2 * PAGE, PROT_READ)) == ENOMEM && strncmp(droits_dans_maps(p, droits), "r--", 3) == 0,
+             "mprotect avec un trou : ENOMEM, et la zone d'avant le trou en lecture seule");
     verifier(erreur_de(madvise(p + 1, PAGE, MADV_DONTNEED)) == EINVAL, "madvise non aligne : EINVAL");
     verifier(erreur_de(madvise(p, PAGE, 9999)) == EINVAL, "madvise, conseil inconnu : EINVAL");
     verifier(erreur_de(madvise(p, 0, 9999)) == EINVAL && madvise(p, 0, MADV_DONTNEED) == 0,
