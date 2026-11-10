@@ -48,16 +48,17 @@ jobs:
         with:
           path: ~/.cache/claude-os/linux-6.18.33
           key: linux-de-reference-${{ hashFiles('.devcontainer/linux-de-reference.sh') }}
-      # Sous le Linux de référence (6.18), pas celui de la machine de GitHub
-      # (7.0 en novembre 2026, et il changera encore) : nos tests sur l'hôte
-      # comparent notre noyau à celui dont nous lisons les sources
-      # (.devcontainer/linux-de-reference.sh ; KVM, que QEMU ouvre sous
-      # root). La machine a les quatre processeurs de celle de GitHub et 10
-      # de ses 16 Gio.
+      # Les démarrages et les scénarios de QEMU sur la machine de GitHub ; ses
+      # tests sur l'hôte, eux, sous le Linux de référence (6.18), pas celui de
+      # la machine (7.0 en novembre 2026, et il changera encore) : ils
+      # comparent notre noyau à celui dont nous lisons les sources. verifier.sh
+      # les y lance, étape par étape (.devcontainer/linux-de-reference.sh ;
+      # KVM, que QEMU ouvre sous root). Cette machine-là a les quatre
+      # processeurs de celle de GitHub et 10 de ses 16 Gio.
       - name: Tester chaque etape
         run: |
           set -o pipefail
-          MEMOIRE=10G PROCESSEURS=4 .devcontainer/linux-de-reference.sh ./verifier.sh 2>&1 | tee verifier.log
+          MEMOIRE=10G PROCESSEURS=4 ./verifier.sh 2>&1 | tee verifier.log
       # Les journaux d'une action demandent les droits d'administrateur du
       # dépôt ; ses annotations se lisent sans jeton, par l'API de GitHub
       # (/check-runs/<id>/annotations). Chaque échec y est dit une fois, le

@@ -68,11 +68,26 @@ for etape in [0-9][0-9]*-*/; do
         echec=1
     fi
 done
+# Les tests sur l'hôte (`tests-hote`) dépendent du noyau de la machine : ils
+# tournent sous le Linux de référence (6.18.33, CLAUDE.md), dans sa machine
+# virtuelle quand la machine en a un autre (la CI de GitHub), sur elle sinon
+# (WSL, sous le conteneur). Les démarrages et `tests-qemu` ne dépendent que de
+# QEMU : sur la machine même. Pendant un jour (10 novembre 2026), toute la CI
+# tournait dans la machine virtuelle : QEMU sans KVM y émulait deux fois plus
+# lentement (64 min au lieu de 29), et des tests de temps des anciennes étapes
+# y échouaient (le démarrage coupé par sa durée, une limite de temps de
+# calcul atteinte).
+case "$(uname -r)" in
+    6.18.33*) reference= ;;
+    *) reference=.devcontainer/linux-de-reference.sh ;;
+esac
 for etape in [0-9][0-9]*-*/; do
     etape=${etape%/}
     for cible in tests-hote tests-qemu; do
         grep -q "^$cible:" "$etape/Makefile" 2>/dev/null || continue
-        if sortie=$(make -C "$etape" "$cible" 2>&1); then
+        lanceur=
+        [ "$cible" = tests-hote ] && lanceur=$reference
+        if sortie=$($lanceur make -C "$etape" "$cible" 2>&1); then
             echo "OK     $etape : make $cible"
         else
             echo "$sortie"
