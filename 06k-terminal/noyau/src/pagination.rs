@@ -281,6 +281,49 @@ pub fn traduire(pml4: u64, virtuelle: u64) -> Option<u64> {
     (e & PRESENTE != 0).then_some(e & ADRESSE)
 }
 
+/// Rend la page `virtuelle` ABSENTE en gardant l'adresse de son cadre dans
+/// son entrée : le processeur ignore tous les autres bits d'une entrée
+/// dont le bit « présente » est nul (manuel d'Intel, vol. 3A, 4.5), elle
+/// peut donc servir de note. vmalloc.rs rend ainsi un grand bloc en deux
+/// temps : ses pages absentes, un seul vidage des TLB de tous les
+/// processeurs, puis ses cadres relus dans les entrées (`oublier_suspendue`)
+/// et rendus ; sans tenir à part la liste de ses cadres (le
+/// `vm_struct->pages` de Linux). Faux : la page n'était pas projetée. Les
+/// tables restent.
+pub fn suspendre(pml4: u64, virtuelle: u64) -> bool {
+    let Some(e) = entree_existante(pml4, virtuelle) else { return false };
+    if *e & PRESENTE == 0 {
+        return false;
+    }
+    *e &= !PRESENTE;
+    true
+}
+
+/// Remet à zéro l'entrée de la page `virtuelle` suspendue par `suspendre`,
+/// et rend le cadre qu'elle notait (None : elle n'était pas suspendue).
+pub fn oublier_suspendue(pml4: u64, virtuelle: u64) -> Option<u64> {
+    let e = entree_existante(pml4, virtuelle)?;
+    let ancienne = core::mem::replace(e, 0);
+    (ancienne & PRESENTE == 0 && ancienne & ADRESSE != 0).then_some(ancienne & ADRESSE)
+}
+
+/// Le nombre de tables qui manquent pour projeter la page `virtuelle` : 0
+/// à 3 (la PDPT, le PD, la PT). vmalloc.rs compte ainsi les tables qu'il
+/// crée.
+pub fn tables_manquantes(pml4: u64, virtuelle: u64) -> u32 {
+    let mut t = pml4;
+    for niveau in (1..=3).rev() {
+        // SAFETY: `t` est une de nos tables (la PML4, puis ce que ses
+        // entrées présentes désignent).
+        let e = unsafe { table(t) }[index(virtuelle, niveau)];
+        if e & PRESENTE == 0 {
+            return niveau;
+        }
+        t = e & ADRESSE;
+    }
+    0
+}
+
 /// Les droits « non exécutable » : le bit NX s'il est en service, rien
 /// sinon (sans lui, une page présente est toujours exécutable).
 pub fn non_executable() -> u64 {

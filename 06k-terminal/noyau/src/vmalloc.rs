@@ -18,7 +18,12 @@
 //!     lecture et chaque écriture atteigne vraiment le périphérique ;
 //!   - les TABLES du micrologiciel (ACPI, 6e), dans une étendue que la
 //!     carte E820 dit « réservée » : projetées avec cache, en lecture
-//!     seule (`memremap`).
+//!     seule (`memremap`) ;
+//!   - les GRANDS BLOCS du tas (les soldes d'avant 6k) : au-delà de 4 Mio,
+//!     le plus grand bloc d'un seul tenant de l'allocateur de pages, des
+//!     pages éparses projetées d'un seul tenant (le `vmalloc` de Linux) ;
+//!     et en secours, quand la mémoire est trop morcelée pour donner un
+//!     bloc de plusieurs pages (le `kvmalloc` de Linux, voir tas.rs).
 //!
 //! La région commence à l'adresse de Linux (VMALLOC_START sur x86_64 à
 //! quatre niveaux, 0xffffc90000000000) et tient dans UNE entrée de la PML4
@@ -38,19 +43,23 @@
 //!     rendue pendant un programme ne laisse aucune table derrière elle (le
 //!     contrôle « memoire rendue » des programmes le verrait), et la
 //!     création d'un fil n'a jamais à en allouer ;
-//!   - la zone des PROJECTIONS (ioremap, memremap), des plages de taille
-//!     quelconque, chacune suivie d'une page de garde, prises dans une
-//!     liste triée de plages libres (la première qui convient : le
-//!     vmap_area de Linux, sans son arbre). Elles servent au démarrage,
-//!     quelques-unes ; une liste suffit.
+//!   - la zone des PROJECTIONS (ioremap, memremap) et des grands blocs du
+//!     tas, des plages de taille quelconque, chacune suivie d'une page de
+//!     garde, prises dans une liste triée de plages libres (la première
+//!     qui convient : le vmap_area de Linux, sans son arbre). Les
+//!     projections servent au démarrage, quelques-unes ; les grands blocs
+//!     sont des mémoires de programmes WebAssembly, quelques-uns à la
+//!     fois : une liste suffit (Linux, qui en tient des milliers, a deux
+//!     arbres : les plages par adresse, et les libres par taille).
 //! Les cases de taille fixe rendent la recherche d'une pile immédiate, et
 //! disent sans calcul à quelle pile appartient une garde touchée.
 
 use crate::pagination::{self, ECRITURE, SANS_CACHE};
 use crate::faillible::VecFaillible;
-use crate::{cpu, pages};
+use crate::{cpu, espace, pages};
 use crate::verrou::Verrou;
 use alloc::vec::Vec;
+use core::ptr::null_mut;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 const PAGE: u64 = 4096;
@@ -344,18 +353,8 @@ fn projeter(physique: u64, longueur: u64, genre: Genre) -> Option<Projection> {
     let premiere = physique / PAGE * PAGE;
     let fin = physique.checked_add(longueur.max(1))?.next_multiple_of(PAGE);
     let pages = (fin - premiere) / PAGE;
-    let debut = {
-        let mut r = REGION.verrouiller();
-        // La place des pages, plus une page de garde après elles.
-        let taille = (pages + 1) * PAGE;
-        let i = r.plages.iter().position(|&(d, f)| f - d >= taille)?;
-        let debut = r.plages[i].0;
-        r.plages[i].0 += taille;
-        if r.plages[i].0 == r.plages[i].1 {
-            r.plages.remove(i);
-        }
-        debut
-    };
+    // La place des pages, plus une page de garde après elles.
+    let debut = prendre_plage(pages + 1)?;
     let mut p = Projection { debut, reservees: pages, projetees: 0, adresse: debut + physique % PAGE };
     let droits = match genre {
         Genre::Registres => ECRITURE | SANS_CACHE | pagination::non_executable(),
@@ -366,7 +365,7 @@ fn projeter(physique: u64, longueur: u64, genre: Genre) -> Option<Projection> {
     for i in 0..pages {
         // Une table qui manque : `p` est lâchée, Drop retire ce qui est déjà
         // projeté et rend la plage.
-        pagination::projeter(pml4, debut + i * PAGE, premiere + i * PAGE, droits)?;
+        projeter_en_comptant(pml4, debut + i * PAGE, premiere + i * PAGE, droits)?;
         p.projetees += 1;
     }
     drop(tables);
@@ -417,26 +416,334 @@ impl Drop for Projection {
         } else {
             crate::smp::vider_tlb_noyau(&adresses[..n]);
         }
-        // La plage et sa garde reviennent à la liste, recollées à leurs
-        // voisines.
-        let (debut, fin) = (self.debut, self.debut + (self.reservees + 1) * PAGE);
-        let mut r = REGION.verrouiller();
-        let i = r.plages.partition_point(|&(d, _)| d < debut);
-        let colle_avant = i > 0 && r.plages[i - 1].1 == debut;
-        let colle_apres = i < r.plages.len() && r.plages[i].0 == fin;
-        match (colle_avant, colle_apres) {
-            (true, true) => {
-                r.plages[i - 1].1 = r.plages[i].1;
-                r.plages.remove(i);
+        // La plage et sa garde reviennent à la liste.
+        rendre_plage(self.debut, self.debut + (self.reservees + 1) * PAGE);
+    }
+}
+
+/// Prend `pages` pages d'adresses (la garde comprise) dans la zone des
+/// projections : au début de la première plage libre assez grande (la
+/// première qui convient). None : plus de place. N'alloue rien : appelable
+/// de partout, comme le tas qui s'en sert.
+fn prendre_plage(pages: u64) -> Option<u64> {
+    let taille = pages.checked_mul(PAGE)?;
+    let mut r = REGION.verrouiller();
+    let i = r.plages.iter().position(|&(d, f)| f - d >= taille)?;
+    let debut = r.plages[i].0;
+    r.plages[i].0 += taille;
+    if r.plages[i].0 == r.plages[i].1 {
+        r.plages.remove(i);
+    }
+    Some(debut)
+}
+
+/// Rend la plage [debut, fin[ à la liste, recollée à ses voisines. Hors de
+/// tout verrou court (la liste peut devoir grandir) : par le rendeur, ou
+/// une projection rendue. La liste grandit HORS de son verrou, puis
+/// l'échange, comme Linux prépare d'avance le nœud d'une plage
+/// (`preload_this_cpu_lock`, mm/vmalloc.c) : la nouvelle liste pourrait
+/// elle-même être un grand bloc (`prendre_plage`, qui prend REGION). Sans
+/// mémoire pour elle, la plage est perdue : des adresses seulement (la
+/// zone en a des centaines de Gio), pas de la mémoire ; et on le dit.
+fn rendre_plage(debut: u64, fin: u64) {
+    loop {
+        let capacite = {
+            let mut r = REGION.verrouiller();
+            let i = r.plages.partition_point(|&(d, _)| d < debut);
+            let colle_avant = i > 0 && r.plages[i - 1].1 == debut;
+            let colle_apres = i < r.plages.len() && r.plages[i].0 == fin;
+            match (colle_avant, colle_apres) {
+                (true, true) => {
+                    r.plages[i - 1].1 = r.plages[i].1;
+                    r.plages.remove(i);
+                    return;
+                }
+                (true, false) => {
+                    r.plages[i - 1].1 = fin;
+                    return;
+                }
+                (false, true) => {
+                    r.plages[i].0 = debut;
+                    return;
+                }
+                (false, false) if r.plages.len() < r.plages.capacity() => {
+                    r.plages.inserer_dans_la_place(i, (debut, fin));
+                    return;
+                }
+                (false, false) => r.plages.capacity(),
             }
-            (true, false) => r.plages[i - 1].1 = fin,
-            (false, true) => r.plages[i].0 = debut,
-            // La liste a toujours de la place : elle a été réservée pour 16
-            // plages, et le noyau en garde bien moins à la fois. Sinon, la
-            // plage est perdue (des adresses seulement), pas la mémoire.
-            (false, false) => {
-                let _ = r.plages.inserer(i, (debut, fin));
+        };
+        let Ok(mut neuve) = crate::faillible::avec_capacite::<(u64, u64)>(capacite * 2) else {
+            afficherln!("[noyau] vmalloc : plus de memoire pour la liste des plages, {} Kio d'adresses perdus.", (fin - debut) >> 10);
+            return;
+        };
+        // Échangée si personne ne l'a fait grandir entre-temps ; l'ancienne
+        // (ou la neuve, inutile) rendue hors du verrou.
+        let a_rendre = {
+            let mut r = REGION.verrouiller();
+            if r.plages.capacity() == capacite {
+                for &p in r.plages.iter() {
+                    neuve.ajouter_dans_la_place(p);
+                }
+                core::mem::swap(&mut r.plages, &mut neuve);
             }
+            neuve
+        };
+        drop(a_rendre);
+    }
+}
+
+// ---------------------------------------------------------------------
+// Les grands blocs du tas : vmalloc et vfree (les soldes d'avant 6k).
+//
+// Jusque-là, un bloc du tas ne dépassait pas 4 Mio (pages::ORDRE_MAX) : un
+// programme WebAssembly ne pouvait avoir ni plus de 4 Mio de mémoire, ni un
+// module plus gros. Au-delà, le tas (tas.rs) demande ici des pages
+// éparses, projetées d'un seul tenant dans la zone des projections, chaque
+// bloc suivi d'une page de garde (un débordement y fait faute, au lieu
+// d'écrire chez le voisin).
+//
+// Prendre un bloc ne demande rien aux autres processeurs : des adresses
+// qui n'étaient pas projetées n'ont de traduction dans aucun TLB. Le
+// rendre, si : chacun peut garder la traduction d'une de ses pages. Linux
+// rend les pages AUSSITÔT, sans vider les TLB (`vfree` : seul le réemploi
+// des ADRESSES attend un vidage groupé) : il compte sur ce que plus aucun
+// code n'y accède, et une traduction restée mène alors à un cadre donné à
+// un autre. Nous gardons les cadres jusqu'au vidage, comme nos piles : une
+// traduction restée ne mène jamais qu'au bloc d'avant, un écart plus
+// strict, au prix de la mémoire du bloc gardée jusqu'au passage du rendeur
+// (une milliseconde). Or le tas rend ses blocs de partout, sous un verrou
+// court, interruptions coupées, où l'on ne peut pas attendre les autres
+// processeurs (smp.rs). Un bloc rendu est donc DIFFÉRÉ, comme par le
+// `vfree_atomic` de Linux (qui, lui, diffère tout) : une note,
+// écrite dans son premier cadre (le bloc ne sert plus à personne), va dans
+// une liste sans verrou, que le rendeur (tache.rs) vide, interruptions
+// actives : les pages de tous les blocs de la liste rendues absentes, un
+// seul vidage des TLB de tous les processeurs pour tous (Linux rassemble
+// de même les siens, `__purge_vmap_area_lazy`), puis leurs cadres et leurs
+// adresses rendus. Le tas ne réveille pas le rendeur lui-même : un réveil
+// prend les verrous de l'ordonnanceur, qu'un `dealloc` peut tenir ; le tic
+// suivant du processeur 0 s'en charge (une milliseconde au plus). Option
+// écartée : vider les TLB depuis le tas ; deux processeurs qui rendraient
+// chacun un bloc, interruptions coupées, attendraient chacun la réponse de
+// l'autre, pour toujours.
+//
+// Les cadres d'un bloc ne sont notés nulle part ailleurs que dans ses
+// entrées de table : chaque entrée est d'abord rendue absente en gardant
+// l'adresse de son cadre (pagination::suspendre), relue après le vidage.
+// Linux tient un tableau des cadres de chaque bloc (`vm_struct->pages`),
+// qu'il faudrait ici allouer... dans le tas qu'on est en train de servir.
+//
+// Les tables créées pour la zone restent, comme chez Linux : un bloc pris
+// plus tard aux mêmes adresses les retrouve. Elles sont comptées
+// (`tables_gardees`), et « memoire rendue » (programmes.rs) les compte
+// avec les pages libres.
+
+/// Les tables de la zone des projections créées depuis le démarrage, en
+/// pages (voir plus haut).
+static TABLES_GARDEES: AtomicUsize = AtomicUsize::new(0);
+
+pub fn tables_gardees() -> usize {
+    TABLES_GARDEES.load(Ordering::Relaxed)
+}
+
+/// Projette la page `virtuelle` de la zone des projections sur `physique`,
+/// en comptant les tables créées (TABLES_GARDEES). Sous TABLES_NOYAU :
+/// personne d'autre n'en crée pendant ce temps.
+fn projeter_en_comptant(pml4: u64, virtuelle: u64, physique: u64, droits: u64) -> Option<()> {
+    let manquantes = pagination::tables_manquantes(pml4, virtuelle);
+    let r = pagination::projeter(pml4, virtuelle, physique, droits);
+    let creees = manquantes - pagination::tables_manquantes(pml4, virtuelle);
+    TABLES_GARDEES.fetch_add(creees as usize, Ordering::Relaxed);
+    r
+}
+
+/// La note d'un bloc différé, écrite dans son premier cadre (vu par la
+/// projection directe) : la liste des blocs à rendre passe par elles.
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct Note {
+    /// La note suivante (son adresse dans la projection directe), 0 à la
+    /// fin.
+    suivante: u64,
+    debut: u64,
+    /// Les pages d'adresses réservées (sans la garde), et celles projetées :
+    /// un bloc dont la projection a échoué en chemin n'en a projeté qu'une
+    /// partie.
+    reservees: u64,
+    projetees: u64,
+    /// Le cadre de la note : rendu à part s'il n'a pas été projeté.
+    cadre: u64,
+}
+
+/// Les notes des blocs à rendre (l'adresse de la première, 0 : aucune) :
+/// une pile sans verrou, où l'on ne fait qu'empiler, et que le rendeur
+/// prend tout entière (`swap`). Sans retrait d'un seul élément, pas de
+/// problème ABA.
+static A_RENDRE: AtomicU64 = AtomicU64::new(0);
+/// Les blocs différés pas encore tout à fait rendus (dans la liste, ou en
+/// train de l'être) : « memoire rendue » attend qu'il soit nul.
+static EN_ATTENTE: AtomicUsize = AtomicUsize::new(0);
+
+/// Vrai si des blocs attendent le rendeur (le tic du processeur 0 le
+/// réveille alors, tache.rs).
+pub fn a_rendre() -> bool {
+    A_RENDRE.load(Ordering::Relaxed) != 0
+}
+
+/// Les blocs différés pas encore rendus.
+pub fn en_attente() -> usize {
+    EN_ATTENTE.load(Ordering::Acquire)
+}
+
+/// Empile la note `note` (dans son cadre, `note.cadre`).
+fn differer(note: Note) {
+    EN_ATTENTE.fetch_add(1, Ordering::Relaxed);
+    let adresse = espace::virtuelle(note.cadre);
+    let mut tete = A_RENDRE.load(Ordering::Relaxed);
+    loop {
+        // SAFETY: le cadre de la note est à nous : le premier d'un bloc que
+        // personne n'utilise plus (ou jamais projeté), vu par la projection
+        // directe, aligné sur sa page.
+        unsafe { (adresse as *mut Note).write(Note { suivante: tete, ..note }) };
+        // Release : la note écrite avant que le rendeur la voie.
+        match A_RENDRE.compare_exchange_weak(tete, adresse, Ordering::Release, Ordering::Relaxed) {
+            Ok(_) => return,
+            Err(t) => tete = t,
         }
     }
+}
+
+/// La note d'adresse `adresse` (une copie).
+fn lire_note(adresse: u64) -> Note {
+    // SAFETY: une note écrite par `differer`, dans un cadre que seul le
+    // rendeur rendra, après l'avoir lue.
+    unsafe { (adresse as *const Note).read() }
+}
+
+/// Un grand bloc du tas : `taille` octets en pages éparses, projetées d'un
+/// seul tenant, suivies d'une page de garde (le `vmalloc` de Linux). Aligné
+/// sur une page : un alignement plus grand est refusé (personne ne le
+/// demande ; un bloc du buddy, aligné sur sa taille, le donne jusqu'à
+/// 4 Mio). Null : plus de mémoire, ou plus d'adresses ; rien ne reste alors
+/// (les pages déjà projetées passent par le rendeur, comme un bloc
+/// rendu). Appelable de partout, comme le tas : rien n'y attend.
+pub fn allouer(taille: usize, alignement: usize) -> *mut u8 {
+    if alignement > PAGE as usize || taille == 0 {
+        return null_mut();
+    }
+    let pages = (taille as u64).div_ceil(PAGE);
+    // Plus que la mémoire : refusé d'emblée, comme Linux (`totalram_pages`,
+    // `__vmalloc_node_range`) ; et plus que ce qui est libre aussi : le
+    // prendre cadre par cadre jusqu'à l'échec viderait toute la mémoire,
+    // réserve du noyau comprise, jusqu'au passage du rendeur (Linux rend
+    // aussitôt ce qu'il avait pris ; nous, au vidage).
+    if pages > pages::total() as u64 || pages > pages::libres() as u64 {
+        return null_mut();
+    }
+    // Le premier cadre avant les adresses : s'il manque, rien n'est pris.
+    // Il porte la note du bloc si la projection échoue en chemin.
+    let Some(premier) = pages::allouer(0) else { return null_mut() };
+    let Some(debut) = prendre_plage(pages + 1) else {
+        pages::liberer(premier, 0);
+        return null_mut();
+    };
+    let pml4 = pagination::pml4_noyau();
+    let droits = ECRITURE | pagination::non_executable();
+    let mut projetees = 0;
+    while projetees < pages {
+        let cadre = match projetees {
+            0 => premier,
+            _ => match pages::allouer(0) {
+                Some(c) => c,
+                None => break,
+            },
+        };
+        // Le verrou des tables page par page : tenu pour toute une
+        // projection de plusieurs Mio, il couperait les interruptions des
+        // millisecondes.
+        let tables = TABLES_NOYAU.verrouiller();
+        let projetee = projeter_en_comptant(pml4, debut + projetees * PAGE, cadre, droits).is_some();
+        drop(tables);
+        if !projetee {
+            // Une table qui manque : ce cadre n'a jamais été projeté, rendu
+            // tout de suite (sauf le premier, qui porte la note).
+            if projetees > 0 {
+                pages::liberer(cadre, 0);
+            }
+            break;
+        }
+        projetees += 1;
+    }
+    if projetees < pages {
+        differer(Note { suivante: 0, debut, reservees: pages, projetees, cadre: premier });
+        return null_mut();
+    }
+    debut as *mut u8
+}
+
+/// Vrai si `adresse` est dans la région : pour le tas, un grand bloc (il
+/// ne reçoit jamais d'autres adresses de la région).
+pub fn contient(adresse: u64) -> bool {
+    (DEBUT..DEBUT + TAILLE).contains(&adresse)
+}
+
+/// Rend le grand bloc `debut`, de `taille` octets : différé (voir plus
+/// haut). Appelable de partout, comme le tas.
+///
+/// # Safety
+/// Le bloc vient d'`allouer`, avec cette taille, et ne sert plus.
+pub unsafe fn rendre(debut: u64, taille: usize) {
+    let pages = (taille as u64).div_ceil(PAGE);
+    let tables = TABLES_NOYAU.verrouiller();
+    let premier = pagination::traduire(pagination::pml4_noyau(), debut);
+    drop(tables);
+    let premier = premier.expect("grand bloc du tas sans sa premiere page");
+    differer(Note { suivante: 0, debut, reservees: pages, projetees: pages, cadre: premier });
+}
+
+/// Rend les grands blocs différés : leurs pages absentes, un seul vidage
+/// des TLB de tous les processeurs, puis leurs cadres et leurs adresses.
+/// Par le rendeur (tache.rs) ; au démarrage, par son test. Interruptions
+/// actives et aucun verrou court tenu, si d'autres processeurs sont en
+/// service (le vidage les attend). Vrai si un bloc a été rendu.
+pub fn purger() -> bool {
+    // Acquire : les notes écrites avant d'être empilées.
+    let premiere = A_RENDRE.swap(0, Ordering::Acquire);
+    if premiere == 0 {
+        return false;
+    }
+    let pml4 = pagination::pml4_noyau();
+    // 1. Chaque page absente, l'adresse de son cadre gardée dans son entrée.
+    let mut n = premiere;
+    while n != 0 {
+        let note = lire_note(n);
+        for i in 0..note.projetees {
+            let tables = TABLES_NOYAU.verrouiller();
+            pagination::suspendre(pml4, note.debut + i * PAGE);
+            drop(tables);
+        }
+        n = note.suivante;
+    }
+    // 2. Un seul vidage, de tout le TLB (Linux aussi, au-delà de 33 pages).
+    crate::smp::vider_tlb(None, None, &[], true);
+    // 3. Les cadres, relus dans les entrées, puis les adresses.
+    let mut n = premiere;
+    while n != 0 {
+        // Une copie : son cadre est rendu avec les autres.
+        let note = lire_note(n);
+        for i in 0..note.projetees {
+            let tables = TABLES_NOYAU.verrouiller();
+            let cadre = pagination::oublier_suspendue(pml4, note.debut + i * PAGE);
+            drop(tables);
+            pages::liberer(cadre.expect("page d'un grand bloc rendu sans cadre"), 0);
+        }
+        if note.projetees == 0 {
+            pages::liberer(note.cadre, 0);
+        }
+        rendre_plage(note.debut, note.debut + (note.reservees + 1) * PAGE);
+        EN_ATTENTE.fetch_sub(1, Ordering::Release);
+        n = note.suivante;
+    }
+    true
 }

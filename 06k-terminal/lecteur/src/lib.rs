@@ -6,7 +6,9 @@
 //! d'en sortir (le noyau refuse « .. » au-dessus du dossier, et un lien
 //! symbolique absolu). Il lit /etc/bonjour.txt, directement puis par un
 //! lien, liste /etc, écrit puis relit un fichier dans /tmp, et vérifie
-//! qu'il ne peut pas s'échapper. Chaque ligne affichée dit ce qu'il a vu.
+//! qu'il ne peut pas s'échapper. Puis il attend (poll_oneoff), et porte sa
+//! mémoire au-delà de 4 Mio (les soldes d'avant 6k). Chaque ligne affichée
+//! dit ce qu'il a vu.
 //! Lancé sans `--dir=`, il n'a aucun dossier, le dit, et s'arrête.
 
 #![no_std]
@@ -319,8 +321,41 @@ pub extern "C" fn _start() {
     let _ = writeln!(s, "[wasm] lecteur : le 3 ferme puis repris n'est plus pre-ouvert : {}", if ferme { "ok" } else { "ECHEC" });
     ok &= ferme;
     ok &= attendre(&mut s);
+    ok &= grande_memoire(&mut s);
     // SAFETY : proc_exit ne revient pas.
     unsafe { proc_exit(if ok { 0 } else { 1 }) }
+}
+
+/// Une mémoire de plus de 4 Mio, le plus grand bloc d'un seul tenant de
+/// l'allocateur de pages du noyau (au-delà, des pages éparses, depuis les
+/// soldes d'avant 6k ; jusque-là, memory.grow rendait -1) : portée à 12 Mio,
+/// un mot écrit à la fin de chaque nouvelle page de 64 Kio, puis relu.
+/// Puis 20 Mio, au-delà du budget que le noyau donne au programme (16 Mio
+/// pour ses tables et sa mémoire) : memory.grow rend -1, la mémoire reste
+/// à 12 Mio.
+fn grande_memoire(s: &mut Sortie) -> bool {
+    use core::arch::wasm32::{memory_grow, memory_size};
+    const PAGE: usize = 64 << 10;
+    let avant = memory_size(0);
+    let voulues = (12 << 20) / PAGE;
+    let grandie = avant < voulues && memory_grow(0, voulues - avant) == avant && memory_size(0) == voulues;
+    let mot = |p: usize| (p * PAGE + PAGE - 8) as *mut u64;
+    let mut relue = grandie;
+    if grandie {
+        for p in avant..voulues {
+            // SAFETY : la dernière place de la page `p`, dans notre mémoire
+            // qui vient de grandir ; personne d'autre ne s'en sert.
+            unsafe { mot(p).write_volatile(p as u64 * 0x0101_0101) };
+        }
+        for p in avant..voulues {
+            // SAFETY : comme ci-dessus.
+            relue &= unsafe { mot(p).read_volatile() } == p as u64 * 0x0101_0101;
+        }
+    }
+    let refusee = memory_grow(0, (20 << 20) / PAGE - voulues) == usize::MAX && memory_size(0) == voulues;
+    let _ = writeln!(s, "[wasm] lecteur : memoire portee a 12 Mio, ecrite et relue : {} ; a 20 Mio, au-dela du budget : -1 : {}",
+                     if relue { "ok" } else { "ECHEC" }, if refusee { "ok" } else { "ECHEC" });
+    relue && refusee
 }
 
 /// Une panique termine le programme, avec un code reconnaissable.

@@ -21,9 +21,10 @@
 //!     2 Gio de cases ;
 //!   - un `Vec` trié de couples (numéro, page), en dichotomie : compact pour
 //!     un fichier creux, mais une insertion au milieu d'un fichier de 291 Mo
-//!     (`claude`, 71 000 pages) déplacerait plus d'1 Mio, et ce `Vec` ne
-//!     tiendrait plus dans un bloc du tas du noyau (4 Mio au plus) au-delà
-//!     de 260 000 pages ;
+//!     (`claude`, 71 000 pages) déplacerait plus d'1 Mio, et ce `Vec`, au-delà
+//!     de 260 000 pages, dépasserait le plus gros bloc d'un seul tenant de
+//!     l'allocateur de pages (4 Mio) : des pages éparses (vmalloc.rs), à
+//!     recopier à chaque doublement ;
 //!   - l'xarray de Linux, à 64 branches : des nœuds de 576 octets, pensés
 //!     pour être lus sans verrou (RCU) par plusieurs processeurs pendant
 //!     qu'un autre écrit. Sans RCU, des nœuds d'une page sont plus simples,

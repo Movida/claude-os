@@ -460,7 +460,9 @@ impl Zones {
     /// mais sans dépasser le maximum : la carte entière tient alors en un
     /// bloc de 3,5 Mio (65 530 zones de 56 octets), quand le doublement seul,
     /// parti d'une page (73 zones), la porterait à 74 752 cases : 4 186 112
-    /// octets, à 8 Kio du plus gros bloc du tas du noyau (4 Mio).
+    /// octets, à 8 Kio du plus gros bloc d'un seul tenant de l'allocateur de
+    /// pages (4 Mio ; au-delà, des pages éparses, plus lentes à prendre et à
+    /// rendre : vmalloc.rs).
     fn agrandir(&mut self, n: usize) -> Result<(), Erreur> {
         let besoin = self.zones.len() + n;
         if besoin <= self.zones.capacity() {

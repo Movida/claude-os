@@ -8,8 +8,9 @@
 # noyau et ses bibliothèques, qui passent par leurs équivalents faillibles
 # (la bibliothèque faillible/, avec notre Arc, faillible::partage). Chaque
 # raison dit quoi prendre à la place. Seuls faillible/ (qui les appelle une
-# fois la place réservée) et le test du tas au démarrage (main.rs,
-# tester_tas) ont le droit de les appeler, par un #[allow] justifié.
+# fois la place réservée) et les tests du tas au démarrage (main.rs,
+# tester_tas et tester_grands_blocs) ont le droit de les appeler, par un
+# #[allow] justifié.
 #
 # Ce que clippy ne voit pas, faute de pouvoir les distinguer : `clone()`
 # d'un Vec (le même nom que celui d'Arc, qui n'alloue pas), les

@@ -45,15 +45,26 @@
 //!     pages en compte 700). Un cache par processeur devant lui quand une
 //!     mesure le demandera.
 //!
-//! Un seul bloc ne dépasse pas 4 Mio (pages::ORDRE_MAX) : au-delà, une
-//! allocation échoue. `try_reserve` le dit proprement (memory.grow d'un
-//! programme WebAssembly rend alors -1) ; une allocation ordinaire, elle,
-//! fait paniquer le noyau. Pour aller plus loin, il faudra projeter des
-//! pages éparses d'un seul tenant dans l'espace virtuel (vmalloc dans
-//! Linux).
+//! Les GRANDS BLOCS (les soldes d'avant 6k) : l'allocateur de pages ne
+//! donne pas plus de 4 Mio d'un seul tenant (pages::ORDRE_MAX). Au-delà, le
+//! tas prend des pages éparses, projetées d'un seul tenant dans la région
+//! des adresses à la demande (vmalloc.rs) ; jusque-là, l'allocation
+//! échouait (memory.grow d'un programme WebAssembly rendait -1 à 4 Mio). Et
+//! de même en secours, quand l'allocateur de pages n'a plus de bloc d'un
+//! seul tenant de la taille voulue (la mémoire morcelée), comme le
+//! `kvmalloc` de Linux : un bloc de pages d'abord (plus rapide à prendre et
+//! à rendre, sans vidage des TLB), des pages éparses s'il manque. Linux
+//! laisse ce choix à chaque appelant (kmalloc ou kvmalloc), parce que
+//! certains donnent leur mémoire à un périphérique (le DMA), qui la veut
+//! d'un seul tenant en mémoire physique ; ici, aucune mémoire du tas ne va
+//! à un périphérique (les tampons de virtio sont des pages, virtio_net.rs),
+//! tout le tas peut donc s'en servir. Rien en secours pour une seule page :
+//! s'il n'y en a plus une, il n'y en a pas plusieurs éparses non plus. Un
+//! bloc est rendu à vmalloc.rs ou à l'allocateur de pages selon son
+//! adresse (Linux : `kvfree`, par `is_vmalloc_addr`).
 
 use crate::verrou::Verrou;
-use crate::{espace, pages};
+use crate::{espace, pages, vmalloc};
 use core::alloc::{GlobalAlloc, Layout};
 use core::ptr::null_mut;
 
@@ -199,18 +210,30 @@ impl Tas {
 }
 
 // SAFETY: les blocs rendus sont à nous jusqu'à leur libération, alignés
-// comme demandé (voir `classe` et `ordre`), et le verrou empêche deux
-// allocations de se croiser, même depuis une interruption.
+// comme demandé (voir `classe`, `ordre`, et vmalloc::allouer, qui refuse
+// plus d'une page d'alignement), et les verrous empêchent deux allocations
+// de se croiser, même depuis une interruption.
 unsafe impl GlobalAlloc for Allocateur {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        match classe(layout) {
-            Some(c) => TAS.verrouiller().allouer(c),
-            None if ordre(layout) > pages::ORDRE_MAX => null_mut(),
-            None => pages::allouer(ordre(layout)).map_or(null_mut(), |p| espace::virtuelle(p) as *mut u8),
-        }
+        let Some(c) = classe(layout) else {
+            let ordre = ordre(layout);
+            if ordre <= pages::ORDRE_MAX
+                && let Some(p) = pages::allouer(ordre)
+            {
+                return espace::virtuelle(p) as *mut u8;
+            }
+            // Plus de 4 Mio, ou plus de bloc de cet ordre (voir l'en-tête).
+            return if ordre == 0 { null_mut() } else { vmalloc::allouer(layout.size(), layout.align()) };
+        };
+        TAS.verrouiller().allouer(c)
     }
 
     unsafe fn dealloc(&self, objet: *mut u8, layout: Layout) {
+        if vmalloc::contient(objet as u64) {
+            // SAFETY: un grand bloc, de vmalloc::allouer avec cette taille
+            // (contrat de GlobalAlloc), que l'appelant n'utilise plus.
+            return unsafe { vmalloc::rendre(objet as u64, layout.size()) };
+        }
         match classe(layout) {
             // SAFETY: `objet` vient de `alloc` avec ce `layout` (contrat de
             // GlobalAlloc), donc de cette classe.

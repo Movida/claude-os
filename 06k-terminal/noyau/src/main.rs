@@ -102,6 +102,9 @@ mod pages;
 mod pagination;
 #[allow(unsafe_code)]
 mod tas;
+// Les notes des grands blocs rendus, écrites dans leur premier cadre.
+#[allow(unsafe_code)]
+mod vmalloc;
 // vfs.rs : les pages des fichiers, que le tmpfs désigne par leur numéro de
 // cadre ; un type qui les possède les sortira d'ici, avec la couche VFS de
 // 6m (« Reste à faire »).
@@ -160,7 +163,6 @@ mod sondage;
 mod surveillance;
 mod sysfs;
 mod tube;
-mod vmalloc;
 mod wasi;
 
 use core::arch::asm;
@@ -381,6 +383,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     afficherln!("[noyau] Adresses du noyau a la demande (vmalloc) : {} piles de {} Kio sous leur page de garde, tables faites d'avance ({} Kio).",
                 bilan.piles, vmalloc::TAILLE_PILE >> 10, bilan.tables >> 10);
     tester_vmalloc();
+    tester_grands_blocs();
     // Le code en cours devient la tâche inactive (tache.rs) ; la file des
     // tâches prêtes, réservée pour autant de tâches que de piles.
     tache::initialiser();
@@ -1233,6 +1236,51 @@ fn tester_vmalloc() {
     let ok = |b: bool| if b { "ok" } else { "ECHEC" };
     afficherln!("[noyau] vmalloc : pile ecrite par son adresse, relue par la projection directe : {} ; garde sans projection : {} ; rendue : {} ; memoire video projetee sans cache : {} ; BIOS projete en lecture seule : {}, memoire vive refusee : {} ; au-dela des {} bits d'adresse physique, refusee : {}.",
                 ok(ecrite), ok(garde), ok(rendue), ok(video), ok(bios), ok(vive), bits, ok(au_dela));
+}
+
+/// Vérifie les grands blocs du tas (vmalloc.rs, les soldes d'avant 6k) : un
+/// Vec de 6 Mio, plus que le plus grand bloc d'un seul tenant de
+/// l'allocateur de pages (4 Mio), est dans la région des adresses à la
+/// demande, écrit à ses deux bouts, relu par la projection directe de ses
+/// cadres, et suivi de sa garde. Rendu, il reste projeté jusqu'au passage
+/// du rendeur (`purger`, ici à la main : aucune tâche n'existe encore),
+/// puis toute sa mémoire revient. Puis trois pages prises directement par
+/// vmalloc::allouer (le secours du tas quand la mémoire est morcelée), et
+/// un alignement de plus d'une page, refusé.
+#[allow(clippy::disallowed_macros, unsafe_code)]
+fn tester_grands_blocs() {
+    use alloc::vec;
+    const TAILLE: usize = 6 << 20;
+    let pml4 = pagination::pml4_noyau();
+    let libres = || pages::libres() + vmalloc::tables_gardees();
+    let avant = libres();
+    let relu = |v: u64| {
+        pagination::traduire(pml4, v / 4096 * 4096)
+            // SAFETY: un cadre d'un bloc à nous, vu par la projection
+            // directe.
+            .map(|c| unsafe { (espace::virtuelle(c + v % 4096) as *const u8).read_volatile() })
+    };
+    let grand = vec![3u8; TAILLE];
+    let debut = grand.as_ptr() as u64;
+    let ecrit = vmalloc::contient(debut) && relu(debut) == Some(3) && relu(debut + TAILLE as u64 - 1) == Some(3);
+    let garde = pagination::traduire(pml4, debut + TAILLE as u64).is_none();
+    drop(grand);
+    let differe = vmalloc::en_attente() == 1 && pagination::traduire(pml4, debut).is_some();
+    vmalloc::purger();
+    let rendu = vmalloc::en_attente() == 0 && pagination::traduire(pml4, debut).is_none() && libres() == avant;
+    let p = vmalloc::allouer(3 * 4096 - 100, 8) as u64;
+    let petit = p != 0 && relu(p + 2 * 4096).is_some() && pagination::traduire(pml4, p + 3 * 4096).is_none();
+    if p != 0 {
+        // SAFETY: le bloc vient d'allouer, avec cette taille ; personne ne
+        // s'en sert.
+        unsafe { vmalloc::rendre(p, 3 * 4096 - 100) };
+    }
+    vmalloc::purger();
+    let petit = petit && libres() == avant;
+    let aligne = vmalloc::allouer(4096, 8192).is_null();
+    let ok = |b: bool| if b { "ok" } else { "ECHEC" };
+    afficherln!("[noyau] vmalloc : un Vec de 6 Mio en pages eparses, ecrit et relu : {} ; sa garde : {} ; rendu apres le vidage des TLB, pas avant : {}, {} ; 3 pages : {} ; alignement de 8 Kio refuse : {}.",
+                ok(ecrit), ok(garde), ok(differe), ok(rendu), ok(petit), ok(aligne));
 }
 
 /// Vérifie les vecteurs donnés à la demande : un vecteur donné, une IPI à

@@ -1283,11 +1283,16 @@ static RENDU_ATTENTE: crate::attente::FileAttente = crate::attente::FileAttente:
 /// tout à fait disparu (`fil_disparu`, qui fait du processus un zombie au
 /// dernier). Une pile rendue va d'abord dans un cache (vmalloc.rs) : reprise
 /// pour un fil neuf, aux mêmes adresses et sur les mêmes cadres, elle ne
-/// demande rien à personne.
+/// demande rien à personne. Il rend aussi les grands blocs du tas
+/// (vmalloc.rs, `purger`), pour la même raison : les rendre demande un
+/// vidage des TLB de tous les processeurs.
 fn rendeur() {
     loop {
         crate::attente::attendre_que(&RENDEUR_ATTENTE, crate::attente::Inscription::Ordinaire, crate::attente::Sommeil::Ininterruptible, None,
-                                     || !MORTES.verrouiller().is_empty());
+                                     || !MORTES.verrouiller().is_empty() || crate::vmalloc::a_rendre());
+        if crate::vmalloc::purger() {
+            RENDU_ATTENTE.reveiller_toutes();
+        }
         loop {
             // La garde de MORTES rendue à la fin de cette ligne : dans un
             // `while let`, un temporaire du motif vivrait tout le corps, et
@@ -1327,12 +1332,12 @@ pub fn lancer_rendeur() {
     }
 }
 
-/// Attend que le rendeur ait rendu toutes les tâches mortes : avant de
-/// compter la mémoire rendue (programmes.rs), et de vider le cache des
-/// piles (vmalloc.rs).
+/// Attend que le rendeur ait rendu toutes les tâches mortes et tous les
+/// grands blocs du tas : avant de compter la mémoire rendue
+/// (programmes.rs), et de vider le cache des piles (vmalloc.rs).
 pub fn attendre_le_rendeur() {
     crate::attente::attendre_que(&RENDU_ATTENTE, crate::attente::Inscription::Ordinaire, crate::attente::Sommeil::Ininterruptible, None,
-                                 || A_RENDRE_AU_RENDEUR.load(Ordering::SeqCst) == 0);
+                                 || A_RENDRE_AU_RENDEUR.load(Ordering::SeqCst) == 0 && crate::vmalloc::en_attente() == 0);
 }
 
 /// Attend la fin de la tâche `t` : la tâche courante dort jusqu'à ce que
@@ -1793,9 +1798,13 @@ pub fn tic(programme: bool) {
     }
     ordonnanceur::tic();
     // Les échéances : par le processeur 0 seul, qui compte le temps
-    // (horloge.rs).
+    // (horloge.rs). Et des grands blocs du tas rendus qui attendent le
+    // rendeur : le tas ne peut pas le réveiller lui-même (vmalloc.rs).
     if processeur::courant().numero == 0 {
         crate::attente::tic();
+        if crate::vmalloc::a_rendre() {
+            RENDEUR_ATTENTE.reveiller_toutes();
+        }
     }
 }
 

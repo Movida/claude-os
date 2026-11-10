@@ -162,7 +162,7 @@ pub fn demarrer() {
         // de son début.
         if l.en_cours == 0 && l.groupe.is_none() {
             attendre_le_repos();
-            l.libres = pages::libres();
+            l.libres = pages_libres();
             l.paralleles = false;
         }
         // Le tampon de la ligne et ce que `lancer` prend pour elle sont
@@ -424,7 +424,7 @@ impl Lanceur {
         let mesure = self.en_cours == 0;
         if mesure {
             attendre_le_repos();
-            self.libres = pages::libres();
+            self.libres = pages_libres();
             self.paralleles = false;
         }
         self.groupe = Some(Groupe { debut, fin, mesure });
@@ -438,7 +438,7 @@ impl Lanceur {
         if g.mesure && self.en_cours == 0 {
             attendre_le_repos();
             afficherln!("[noyau] Groupe des lignes {} a {} : memoire rendue : {}.", g.debut, g.fin,
-                        Rendue(self.libres, pages::libres(), crate::signaux::en_file(), crate::reseau::paquet::vivants()));
+                        Rendue(self.libres, pages_libres(), crate::signaux::en_file(), crate::reseau::paquet::vivants()));
         } else {
             afficherln!("[noyau] Groupe des lignes {} a {} : termine (des programmes tournaient deja : pas de mesure).", g.debut, g.fin);
         }
@@ -522,7 +522,7 @@ impl Lanceur {
         if self.en_cours == 0 {
             attendre_le_repos();
         }
-        let rendue = || Rendue(self.libres, pages::libres(), crate::signaux::en_file(), crate::reseau::paquet::vivants());
+        let rendue = || Rendue(self.libres, pages_libres(), crate::signaux::en_file(), crate::reseau::paquet::vivants());
         let groupe = self.groupe.is_some();
         match fin {
             Some((nom, code)) if self.en_cours == 0 && !self.paralleles && !groupe => {
@@ -552,6 +552,14 @@ impl Lanceur {
             tache::dormir_tant_que(|| !fond.is_empty() && !fond.iter().any(Tache::fini));
         }
     }
+}
+
+/// Les pages libres, pour « memoire rendue », avec les tables de la zone
+/// des grands blocs du tas : créées pour un bloc, elles restent, comme
+/// chez Linux (vmalloc.rs, `tables_gardees`) ; une table perdue ailleurs se
+/// voit toujours.
+fn pages_libres() -> usize {
+    pages::libres() + crate::vmalloc::tables_gardees()
 }
 
 /// Ce que dit « memoire rendue » : ok, ou ECHEC avec l'écart, en pages
@@ -1254,9 +1262,9 @@ fn executer_wasm(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancemen
         }};
     }
     // L'interpréteur veut le module d'un seul tenant : il est lu dans un
-    // bloc du tas, qui fait au plus 4 Mio (tas.rs) ; un module plus gros est
-    // refusé, jusqu'à ce que le noyau sache projeter des pages éparses d'un
-    // seul tenant (vmalloc).
+    // bloc du tas (au-delà de 4 Mio, des pages éparses projetées d'un seul
+    // tenant, tas.rs ; jusqu'aux soldes d'avant 6k, un module plus gros
+    // était refusé).
     let taille = vfs::avec(|fs, _| fs.attributs(n).taille) as usize;
     let Ok(mut octets) = faillible::remplie(taille, 0) else {
         refus!("[noyau] {} : module WebAssembly de {} octets, trop gros pour le tas", nom, taille);
@@ -1336,8 +1344,10 @@ fn executer_module(nom: NomCourt, octets: Vec<u8>, arguments: &[&[u8]], environn
         Err(e) => return afficherln!("[noyau] {} : programme WebAssembly refuse : {}", nom, e),
     };
     afficherln!("[noyau] {} : programme WebAssembly, {} octets, decode et valide.", nom, taille);
-    // Son budget de mémoire : 16 Mio pour ses tables et sa mémoire, chacune
-    // d'au plus 4 Mio (un bloc du tas, voir tas.rs).
+    // Son budget de mémoire : 16 Mio pour ses tables et sa mémoire (au-delà
+    // de 4 Mio, des pages éparses, tas.rs ; jusqu'aux soldes d'avant 6k,
+    // chacune d'au plus 4 Mio). Un budget fixe : un programme WebAssembly
+    // n'est pas un processus, le tueur OOM ne le connaît pas.
     let mut magasin = Magasin::avec_budget(16 << 20);
     tache::courante().marquer_webassembly();
     // Ses descripteurs : la console, les dossiers pré-ouverts de sa ligne et
