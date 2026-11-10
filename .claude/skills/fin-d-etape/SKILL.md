@@ -801,3 +801,29 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   « demarrage : N s » de `verifier.sh` est le timeout, pas une durée ;
   mesurer le moment de la dernière ligne attendue (`chrono.sh`, 54 s en 6j)
   et mettre DUREE à son double.
+
+## Pièges rencontrés pendant les soldes d'avant 6k (9 et 10 novembre 2026)
+
+- **Un outil de repli sans chemin prend toute la copie de travail** :
+  `git add -A --` sans chemin ajoute tout ; un repli « message seul » a ainsi
+  fait entrer les docs en cours dans un commit du noyau, et tous ses suivants.
+  Un outil qui prend des chemins n'ajoute RIEN quand il n'en a pas ; et
+  vérifier ce que touche chaque commit (`git log --stat BASE..`) avant de
+  signer.
+- **Replier une correction dans un commit déjà vérifié** change l'arbre de ce
+  commit et de tous ses suivants : leur vérification est à refaire. Replier
+  toutes les corrections d'une relecture d'abord, puis vérifier la chaîne une
+  fois.
+- **Signer demande une fenêtre VS Code ouverte sur le conteneur** : c'est elle
+  qui fait suivre l'agent SSH de 1Password (`/tmp/vscode-ssh-auth-*.sock`) ;
+  après un redémarrage du PC, aucune prise ne répond tant qu'elle n'est pas
+  ouverte (`ssh-add -l` : code 2).
+- **Une chaîne en partie poussée** : la suite se repose sur la partie signée
+  (mêmes arbres, autres parents) avant le moindre repli, sinon les outils qui
+  rejouent depuis l'ancienne base refont les commits poussés, sans signature.
+- **Le journal d'un démarrage en échec** se garde (la voie est effacée au
+  commit suivant) : sans lui, un échec isolé ne se comprend plus.
+- **Un relecteur trouve ce que la vérification ne voit pas** : les deux
+  relectures des soldes ont trouvé un réveil perdu (une course entre `connect`
+  et `poll`), une copie qui paniquait encore, un signal sans personne pour le
+  prendre ; aucun test ne les montrait.
