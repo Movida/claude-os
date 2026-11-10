@@ -83,10 +83,12 @@ static PILES: AtomicUsize = AtomicUsize::new(0);
 /// kernel/fork.c) : que les piles noyau de tous les fils ne prennent pas
 /// plus d'un huitième de la mémoire, soit mémoire / (8 × 16 Kio) ; au
 /// moins 20 (MIN_THREADS). 1024 pour 128 Mio, 16 384 pour 2 Gio ; moins
-/// les piles que les processeurs secondaires ont prises pour toujours pour
-/// leur IST (`garder_pour_ist`, quatre chacun), qu'aucun fil n'aura.
+/// les piles que les processeurs ont prises pour toujours, qu'aucun fil
+/// n'aura : celles de l'IST des secondaires (`garder_pour_ist`, quatre
+/// chacun), et la pile d'interruption de chacun (`garder_pour_interruptions`).
 pub fn max_threads() -> usize {
-    PILES.load(Ordering::Relaxed) - IST.iter().filter(|c| c.load(Ordering::Relaxed) != 0).count()
+    let gardees = IST.iter().chain(&INTERRUPTIONS).filter(|c| c.load(Ordering::Relaxed) != 0).count();
+    PILES.load(Ordering::Relaxed) - gardees
 }
 
 /// Les piles de tâche prises pour toujours par les piles de l'IST des
@@ -97,6 +99,18 @@ pub fn max_threads() -> usize {
 static IST: [AtomicU64; 4 * crate::processeur::MAX] = [const { AtomicU64::new(0) }; 4 * crate::processeur::MAX];
 /// Les quatre rôles, dans l'ordre des piles de l'IST (gdt.rs).
 const ROLES_IST: [&str; 4] = ["double faute", "NMI", "debogage", "verification machine"];
+/// De même, la pile d'interruption de chaque processeur (interruptions.rs) :
+/// le numéro de sa case plus un.
+static INTERRUPTIONS: [AtomicU64; crate::processeur::MAX] = [const { AtomicU64::new(0) }; crate::processeur::MAX];
+
+/// Donne la pile `p` pour toujours au processeur `processeur`, pour ses
+/// interruptions ; rend son sommet.
+pub fn garder_pour_interruptions(p: Pile, processeur: usize) -> u64 {
+    INTERRUPTIONS[processeur].store(p.case as u64 + 1, Ordering::Relaxed);
+    let haut = p.haut();
+    core::mem::forget(p);
+    haut
+}
 
 /// Donne la pile `p` pour toujours à la pile de l'IST de rôle `role` (0 à
 /// 3) du processeur `processeur` ; rend son sommet. Jamais rendue : un
@@ -109,10 +123,12 @@ pub fn garder_pour_ist(p: Pile, processeur: usize, role: usize) -> u64 {
 }
 
 /// Ce que garde une page de garde de la zone des piles : la pile d'une
-/// tâche, ou une pile de l'IST d'un processeur secondaire.
+/// tâche, une pile de l'IST d'un processeur secondaire, ou la pile
+/// d'interruption d'un processeur.
 pub enum GardePile {
     Tache,
     Ist { processeur: usize, role: &'static str },
+    Interruptions { processeur: usize },
 }
 
 impl core::fmt::Display for GardePile {
@@ -120,6 +136,7 @@ impl core::fmt::Display for GardePile {
         match self {
             GardePile::Tache => write!(f, "la pile noyau d'une tache"),
             GardePile::Ist { processeur, role } => write!(f, "la pile IST ({}) du processeur {}", role, processeur),
+            GardePile::Interruptions { processeur } => write!(f, "la pile d'interruption du processeur {}", processeur),
         }
     }
 }
@@ -303,9 +320,11 @@ pub fn garde_touchee(adresse: u64) -> Option<GardePile> {
     }
     let case = (adresse - DEBUT) / CASE + 1;
     let ist = IST.iter().position(|c| c.load(Ordering::Relaxed) == case);
-    Some(match ist {
-        Some(i) => GardePile::Ist { processeur: i / 4, role: ROLES_IST[i % 4] },
-        None => GardePile::Tache,
+    let interruptions = INTERRUPTIONS.iter().position(|c| c.load(Ordering::Relaxed) == case);
+    Some(match (ist, interruptions) {
+        (Some(i), _) => GardePile::Ist { processeur: i / 4, role: ROLES_IST[i % 4] },
+        (None, Some(processeur)) => GardePile::Interruptions { processeur },
+        (None, None) => GardePile::Tache,
     })
 }
 

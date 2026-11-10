@@ -115,6 +115,10 @@ pub struct Processeur {
     /// Le nombre d'interruptions matérielles en cours de traitement
     /// (interruptions.rs, la part HARDIRQ du `preempt_count`).
     pub dans_une_interruption: AtomicU32,
+    /// Le sommet de sa pile d'interruption (interruptions.rs, le
+    /// `hardirq_stack_ptr` de Linux) ; 0 tant qu'il n'en a pas (le premier,
+    /// au tout début du démarrage).
+    pub pile_irq: AtomicU64,
     /// Le compte de préemption (voir l'en-tête) : écrit par `add gs:[...]`
     /// et `sub gs:[...]` seulement (`couper_preemption`,
     /// `retablir_preemption`), lu par `gs:[...]`.
@@ -185,6 +189,7 @@ impl Processeur {
             demarrage: AtomicU8::new(0),
             tenus: AtomicU32::new(0),
             dans_une_interruption: AtomicU32::new(0),
+            pile_irq: AtomicU64::new(0),
             preemption: UnsafeCell::new(0),
             besoin_de_ceder: AtomicU32::new(0),
             appel: Appel { fonction: AtomicUsize::new(0), argument: AtomicUsize::new(0), cibles: AtomicU64::new(0) },

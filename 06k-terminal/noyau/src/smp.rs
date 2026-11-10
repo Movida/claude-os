@@ -232,6 +232,11 @@ fn demarrer_un(numero: usize, apic: u8) {
         *s = crate::vmalloc::garder_pour_ist(p, numero, role);
     }
     PREPARATIONS.verrouiller()[numero] = Some(PilesIst(sommets));
+    // Sa pile d'interruption (interruptions.rs), de même.
+    if !crate::interruptions::donner_une_pile(numero) {
+        afficherln!("[noyau] Processeur {} (APIC {}) : pas de pile pour ses interruptions : laisse de cote.", numero, apic);
+        return;
+    }
     // Sa file des prêtes (ordonnanceur.rs), réservée pour autant de tâches
     // que de piles.
     if !crate::ordonnanceur::initialiser_file(numero, crate::vmalloc::max_threads()) {

@@ -1205,20 +1205,30 @@ const MOTIF_PILE: u64 = 0x5A5A_5A5A_5A5A_5A5A;
 static PILE_LA_PLUS_PROFONDE: AtomicUsize = AtomicUsize::new(0);
 static NOM_LA_PLUS_PROFONDE: Verrou<Option<NomCourt>> = Verrou::new(None);
 
-fn marquer_pile(p: &Pile) {
+/// Pose le motif sur toute la pile `p` (aussi la pile d'interruption de
+/// chaque processeur, interruptions.rs).
+pub fn marquer_pile(p: &Pile) {
     // SAFETY: la pile vient d'être allouée, projetée tout entière, et à personne d'autre.
     unsafe { core::slice::from_raw_parts_mut(p.bas() as *mut u64, ((p.haut() - p.bas()) / 8) as usize) }.fill(MOTIF_PILE);
 }
 
 /// Combien d'octets la pile `p` a servi, au plus.
 fn profondeur(p: &Pile) -> usize {
-    let mut v = p.bas();
-    // SAFETY: la pile est projetée tout entière ; sa partie basse n'est écrite que par
-    // sa tâche, finie ou qui nous exécute, et un mot lu à part n'a pas à être cohérent.
-    while v < p.haut() && unsafe { (v as *const u64).read_volatile() } == MOTIF_PILE {
+    profondeur_entre(p.bas(), p.haut())
+}
+
+/// Combien d'octets la pile [bas, haut[, marquée par `marquer_pile`, a
+/// servi, au plus.
+pub fn profondeur_entre(bas: u64, haut: u64) -> usize {
+    let mut v = bas;
+    // SAFETY: une pile de vmalloc, projetée tout entière (l'appelant) ; sa
+    // partie basse n'est écrite que par sa tâche, finie ou qui nous
+    // exécute, ou par les interruptions de son processeur, et un mot lu à
+    // part n'a pas à être cohérent.
+    while v < haut && unsafe { (v as *const u64).read_volatile() } == MOTIF_PILE {
         v += 8;
     }
-    (p.haut() - v) as usize
+    (haut - v) as usize
 }
 
 /// La pile la plus profonde, parmi les tâches finies et la courante. Une tâche encore en

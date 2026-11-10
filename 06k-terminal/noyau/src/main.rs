@@ -384,6 +384,9 @@ extern "C" fn noyau_main(infos: u64) -> ! {
                 bilan.piles, vmalloc::TAILLE_PILE >> 10, bilan.tables >> 10);
     tester_vmalloc();
     tester_grands_blocs();
+    // La pile des interruptions du premier processeur, avant qu'il les
+    // rétablisse (interruptions.rs).
+    assert!(interruptions::donner_une_pile(0), "pas de pile pour les interruptions");
     // Le code en cours devient la tâche inactive (tache.rs) ; la file des
     // tâches prêtes, réservée pour autant de tâches que de piles.
     tache::initialiser();
@@ -1292,7 +1295,9 @@ fn tester_grands_blocs() {
 fn tester_vecteurs() {
     use core::sync::atomic::AtomicUsize;
     static RECU: AtomicUsize = AtomicUsize::new(0);
+    static SUR_SA_PILE: AtomicBool = AtomicBool::new(false);
     fn gestionnaire(argument: usize) {
+        SUR_SA_PILE.store(interruptions::sur_sa_pile(), Ordering::Relaxed);
         RECU.store(argument, Ordering::Relaxed);
     }
     let ok = |b: bool| if b { "ok" } else { "ECHEC" };
@@ -1309,8 +1314,8 @@ fn tester_vecteurs() {
             }
             let recu = RECU.load(Ordering::Relaxed) == 0x6789;
             irq::liberer(v);
-            afficherln!("[noyau] Vecteurs a la demande : {:#x} donne, IPI a soi-meme recue par son gestionnaire : {} ; rendu : {}.",
-                        v, ok(recu), ok(irq::libres() == libres));
+            afficherln!("[noyau] Vecteurs a la demande : {:#x} donne, IPI a soi-meme recue par son gestionnaire : {}, sur la pile d'interruption : {} ; rendu : {}.",
+                        v, ok(recu), ok(SUR_SA_PILE.load(Ordering::Relaxed)), ok(irq::libres() == libres));
         }
         None => afficherln!("[noyau] Vecteurs a la demande : pas d'APIC local, pas de vecteur."),
     }
@@ -1321,8 +1326,12 @@ fn tester_vecteurs() {
     if processeur::nombre() > 1 {
         use core::sync::atomic::{AtomicU32, AtomicU64};
         static RECUS: AtomicU64 = AtomicU64::new(0);
+        static SUR_LEUR_PILE: AtomicU64 = AtomicU64::new(0);
         static REPONSES: AtomicU32 = AtomicU32::new(0);
         fn noter(_: usize) {
+            if interruptions::sur_sa_pile() {
+                SUR_LEUR_PILE.fetch_or(1 << processeur::courant().numero, Ordering::Relaxed);
+            }
             RECUS.fetch_or(1 << processeur::courant().numero, Ordering::Relaxed);
         }
         fn repondre(_: usize) {
@@ -1341,8 +1350,9 @@ fn tester_vecteurs() {
             }
             irq::liberer(v);
             smp::appeler_les_autres(repondre, 0);
-            afficherln!("[noyau] IPI : chaque autre processeur a recu la sienne : {} ; un appel de fonction aux {} autres, tous repondent : {}.",
-                        ok(RECUS.load(Ordering::Relaxed) == autres), processeur::nombre() - 1,
+            afficherln!("[noyau] IPI : chaque autre processeur a recu la sienne : {}, sur sa pile d'interruption : {} ; un appel de fonction aux {} autres, tous repondent : {}.",
+                        ok(RECUS.load(Ordering::Relaxed) == autres), ok(SUR_LEUR_PILE.load(Ordering::Relaxed) == autres),
+                        processeur::nombre() - 1,
                         ok(REPONSES.load(Ordering::Relaxed) as usize == processeur::nombre() - 1));
         }
     }

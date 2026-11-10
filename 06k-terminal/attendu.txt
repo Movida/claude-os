@@ -41,8 +41,8 @@
 [noyau] Processeur 3 (APIC 3) en service.
 [noyau] 4 processeurs en service.
 [noyau] 100 ms plus tard : … tics comptes.
-[noyau] Vecteurs a la demande : 0x40 donne, IPI a soi-meme recue par son gestionnaire : ok ; rendu : ok.
-[noyau] IPI : chaque autre processeur a recu la sienne : ok ; un appel de fonction aux 3 autres, tous repondent : ok.
+[noyau] Vecteurs a la demande : 0x40 donne, IPI a soi-meme recue par son gestionnaire : ok, sur la pile d'interruption : ok ; rendu : ok.
+[noyau] IPI : chaque autre processeur a recu la sienne : ok, sur sa pile d'interruption : ok ; un appel de fonction aux 3 autres, tous repondent : ok.
 [noyau] MSI-X de 00:03.0 : 4 entrees, entree 1 programmee et relue : ok.
 [noyau] TLB : une page retiree d'un espace que 4 processeurs ont charge : vidage demande aux 3 autres, recu par chacun : ok ; un second retrait pendant qu'un premier n'a pas vide : vidage demande quand meme : ok.
 [noyau] Copie a l'ecriture : une marque retiree par madvise puis reposee par un autre fil n'est pas prise pour la sienne : ok.
@@ -292,3 +292,4 @@
 2.1.310 (Claude Code)
 [noyau] claude : termine, code de sortie 0 ; memoire rendue : ok.
 [noyau] Piles du noyau : … octets au plus (…), sur 16384, il reste de la marge : ok.
+[noyau] Piles d'interruption : … octets au plus (processeur …), sur 16384, il reste de la marge : ok.

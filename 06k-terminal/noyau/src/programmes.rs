@@ -239,6 +239,12 @@ pub fn demarrer() {
     let marge = if profondeur <= taille / 4 * 3 { "ok" } else { "ECHEC" };
     afficherln!("[noyau] Piles du noyau : {} octets au plus ({}), sur {}, il reste de la marge : {}.", profondeur,
                 tache.unwrap_or(NomCourt::de(b"?")), taille, marge);
+    // Celles des interruptions (une par processeur, interruptions.rs), de
+    // même.
+    let (profondeur, processeur) = crate::interruptions::profondeur_des_piles();
+    let marge = if profondeur <= taille / 4 * 3 { "ok" } else { "ECHEC" };
+    afficherln!("[noyau] Piles d'interruption : {} octets au plus (processeur {}), sur {}, il reste de la marge : {}.", profondeur,
+                processeur, taille, marge);
 }
 
 /// Lâche un dossier tenu par le lanceur (un inode du tmpfs).

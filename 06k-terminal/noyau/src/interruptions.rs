@@ -18,6 +18,12 @@
 //!   4. Au retour, il restaure les registres et exécute `iretq`, qui
 //!      dépile RIP, CS, RFLAGS, RSP, SS : le code interrompu reprend.
 //!
+//! Les interruptions des périphériques, de l'APIC et des autres
+//! processeurs (les vecteurs 32 et au-delà) s'exécutent sur la PILE
+//! D'INTERRUPTION du processeur (les soldes d'avant 6k, voir
+//! `sur_la_pile_d_interruption`), les exceptions sur la pile de la tâche
+//! (ou leur pile de l'IST).
+//!
 //! C'est la même organisation que Linux (arch/x86/entry/entry_64.S). On
 //! n'utilise pas l'ABI `extern "x86-interrupt"` de Rust : elle n'existe que
 //! dans la version expérimentale (nightly) du compilateur, et elle cache ce
@@ -510,32 +516,18 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
         32.. => {
             // Interruptions coupées (la porte d'interruption) : la zone est
             // celle de ce processeur.
-            let dans_une_interruption = &crate::processeur::courant().dans_une_interruption;
-            dans_une_interruption.fetch_add(1, Ordering::Relaxed);
-            irq::gerer(vecteur as u8, |source| match source {
-                irq::Source::TimerApic | irq::Source::Isa(horloge::IRQ) => {
-                    // Le temps n'est compté que par le processeur 0 (le
-                    // `tick_do_timer_cpu` de Linux) ; chaque processeur
-                    // fait tourner sa file des prêtes (tache::tic).
-                    if crate::processeur::courant().numero == 0 {
-                        horloge::tic();
-                    }
-                    tache::tic(depuis_programme);
-                }
-                irq::Source::Isa(clavier::IRQ) => clavier::interruption(),
-                irq::Source::Isa(_) => {}
-                irq::Source::Fonction => crate::smp::recevoir_appel(),
-                // Rien à faire : la sortie de l'interruption regarde si la
-                // tâche courante doit céder (plus bas), et un processeur
-                // endormi dans `hlt` est réveillé par l'interruption même.
-                irq::Source::Reprogrammation => {}
-                irq::Source::Arret => crate::smp::s_arreter(),
-            });
-            // L'instant d'une interruption de périphérique, pour le
-            // générateur aléatoire (le `add_interrupt_randomness` que
-            // Linux appelle de `handle_irq_event_percpu`).
-            if irq::est_un_peripherique(vecteur as u8) {
-                crate::aleatoire::ajouter_interruption(vecteur as u64, cadre.rip);
+            let zone = crate::processeur::courant();
+            let dans_une_interruption = &zone.dans_une_interruption;
+            let premiere = dans_une_interruption.fetch_add(1, Ordering::Relaxed) == 0;
+            let rip = cadre.rip;
+            let mut corps = || gerer_un_vecteur(vecteur, depuis_programme, rip);
+            // Sur la pile d'interruption, sauf venue de l'anneau 3 (la pile
+            // de la tâche est vide), déjà dessus (une interruption imbriquée :
+            // aucun gestionnaire ne rétablit les interruptions aujourd'hui,
+            // mais rien ne l'interdit) ou un processeur qui n'en a pas encore.
+            match zone.pile_irq.load(Ordering::Relaxed) {
+                sommet if premiere && sommet != 0 && !depuis_programme => sur_la_pile_d_interruption(sommet, &mut corps),
+                _ => corps(),
             }
             // Avant la préemption éventuelle (plus bas) : la tâche suivante
             // ne doit pas hériter du compte (Linux : `irq_exit`, avant
@@ -591,12 +583,132 @@ extern "C" fn gerer_interruption(cadre: &mut Cadre) {
     // l'interruption l'a trouvé interruptions actives, donc sans verrou
     // (ordonnanceur.rs) : après l'EOI, déjà envoyé par irq::gerer. Jamais
     // après une exception à pile IST : les interruptions des périphériques
-    // n'en ont pas.
+    // n'en ont pas. Ni depuis une interruption imbriquée, qui s'exécute sur
+    // la pile d'interruption : la bascule la laisserait à une tâche endormie
+    // (le `preempt_count` de Linux compte les interruptions en cours ; la
+    // relecture des soldes).
     if depuis_programme {
         tache::verifier_au_retour(cadre);
-    } else if vecteur >= 32 && cadre.rflags & 1 << 9 != 0 {
+    } else if vecteur >= 32 && cadre.rflags & 1 << 9 != 0 && !dans_une_interruption() {
         ordonnanceur::preempter();
     }
+}
+
+/// Ce que fait une interruption des vecteurs 32 et au-delà, sur la pile
+/// d'interruption du processeur (`gerer_interruption`) : rien qui dorme ni
+/// qui cède le processeur (la préemption attend le retour sur la pile de
+/// la tâche).
+fn gerer_un_vecteur(vecteur: usize, depuis_programme: bool, rip: u64) {
+    irq::gerer(vecteur as u8, |source| match source {
+        irq::Source::TimerApic | irq::Source::Isa(horloge::IRQ) => {
+            // Le temps n'est compté que par le processeur 0 (le
+            // `tick_do_timer_cpu` de Linux) ; chaque processeur fait tourner
+            // sa file des prêtes (tache::tic).
+            if crate::processeur::courant().numero == 0 {
+                horloge::tic();
+            }
+            tache::tic(depuis_programme);
+        }
+        irq::Source::Isa(clavier::IRQ) => clavier::interruption(),
+        irq::Source::Isa(_) => {}
+        irq::Source::Fonction => crate::smp::recevoir_appel(),
+        // Rien à faire : la sortie de l'interruption regarde si la tâche
+        // courante doit céder (gerer_interruption), et un processeur endormi
+        // dans `hlt` est réveillé par l'interruption même.
+        irq::Source::Reprogrammation => {}
+        irq::Source::Arret => crate::smp::s_arreter(),
+    });
+    // L'instant d'une interruption de périphérique, pour le générateur
+    // aléatoire (le `add_interrupt_randomness` que Linux appelle de
+    // `handle_irq_event_percpu`).
+    if irq::est_un_peripherique(vecteur as u8) {
+        crate::aleatoire::ajouter_interruption(vecteur as u64, rip);
+    }
+}
+
+/// Exécute `corps` sur la pile d'interruption de ce processeur, de sommet
+/// `sommet`, puis revient sur la pile courante (le `call_on_irqstack` de
+/// Linux). Interruptions coupées.
+///
+/// Pourquoi une pile à part (les soldes d'avant 6k) : sans elle, chaque
+/// interruption s'empile sur la pile de la tâche qu'elle interrompt, au
+/// pire au plus profond d'un appel système ; la pile de chaque tâche doit
+/// alors garder la place du pire gestionnaire d'interruption (8,5 Kio
+/// mesurés au plus en 6j, interruptions comprises, sur 16). Avec elle, une
+/// seule pile par processeur la garde (Linux : IRQ_STACK_SIZE, 16 Kio, sous
+/// une page de garde comme les nôtres). Les exceptions restent sur la pile
+/// de la tâche : une faute de page sert la tâche, et peut dormir. Une
+/// interruption venue de l'anneau 3 reste aussi sur la pile de la tâche,
+/// comme chez Linux (`call_on_irqstack_cond` ne bascule pas pour elle) :
+/// cette pile n'a alors que le cadre, toute sa place est libre.
+///
+/// Le passage se fait ici, en Rust, plutôt que dans l'assembleur de
+/// l'entrée : seuls les vecteurs des périphériques changent de pile, et la
+/// préemption, à la sortie, doit se faire de retour sur la pile de la tâche
+/// (une bascule de tâche depuis la pile d'interruption la laisserait à
+/// une tâche endormie). L'ancien RSP est gardé dans R12, que la fonction
+/// appelée préserve (l'ABI) ; le sommet est aligné sur 16 octets (une
+/// page), comme l'ABI le veut avant un `call`.
+fn sur_la_pile_d_interruption(sommet: u64, corps: &mut dyn FnMut()) {
+    extern "C" fn appeler(corps: *mut &mut dyn FnMut()) {
+        // SAFETY: `corps` désigne la référence ci-dessous, vivante pendant
+        // tout l'appel.
+        unsafe { (*corps)() }
+    }
+    let mut corps = corps;
+    // SAFETY: `sommet` est le sommet d'une pile de 16 Kio projetée, à ce
+    // processeur seul, et inutilisée (le compte des interruptions en cours
+    // était nul : `gerer_interruption`) ; RSP est rétabli avant la fin du
+    // bloc ; le noyau n'a pas de zone rouge (la cible x86_64-unknown-none),
+    // rien sous RSP n'est donc écrasé par le `call`.
+    unsafe {
+        asm!(
+            "mov r12, rsp",
+            "mov rsp, {sommet}",
+            "call {appeler}",
+            "mov rsp, r12",
+            sommet = in(reg) sommet,
+            appeler = sym appeler,
+            in("rdi") &mut corps as *mut &mut dyn FnMut(),
+            out("r12") _,
+            clobber_abi("C"),
+        );
+    }
+}
+
+/// Donne au processeur `numero` sa pile d'interruption : une pile de tâche
+/// (16 Kio sous sa garde, vmalloc.rs), marquée pour mesurer ce qu'elle a
+/// servi (`profondeur_des_piles`), gardée pour toujours, et nommée par sa
+/// garde. Pour le premier au démarrage, avant qu'il rétablisse les
+/// interruptions ; pour un secondaire avant son réveil (smp.rs). Faux :
+/// plus de pile.
+pub fn donner_une_pile(numero: usize) -> bool {
+    let Some(p) = crate::vmalloc::Pile::allouer() else { return false };
+    tache::marquer_pile(&p);
+    let sommet = crate::vmalloc::garder_pour_interruptions(p, numero);
+    crate::processeur::zone(numero).pile_irq.store(sommet, Ordering::Release);
+    true
+}
+
+/// Vrai si ceci s'exécute sur la pile d'interruption de ce processeur (pour
+/// les tests du démarrage). Interruptions coupées.
+pub fn sur_sa_pile() -> bool {
+    let ici = 0u8;
+    let adresse = core::hint::black_box(&ici) as *const u8 as u64;
+    let sommet = crate::processeur::courant().pile_irq.load(Ordering::Relaxed);
+    sommet != 0 && adresse < sommet && adresse >= sommet - crate::vmalloc::TAILLE_PILE
+}
+
+/// La pile d'interruption descendue le plus bas, parmi celles des
+/// processeurs : ce qu'elle a servi, en octets, et son processeur.
+pub fn profondeur_des_piles() -> (usize, usize) {
+    (0..crate::processeur::MAX)
+        .filter_map(|n| match crate::processeur::zone(n).pile_irq.load(Ordering::Acquire) {
+            0 => None,
+            sommet => Some((tache::profondeur_entre(sommet - crate::vmalloc::TAILLE_PILE, sommet), n)),
+        })
+        .max()
+        .unwrap_or((0, 0))
 }
 
 /// DR6, le registre qui dit d'où vient un #DB, puis remis à sa valeur de
