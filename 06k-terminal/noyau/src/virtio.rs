@@ -90,7 +90,10 @@ pub const ETAT_DRIVER: u8 = 2;
 pub const ETAT_DRIVER_OK: u8 = 4;
 pub const ETAT_FEATURES_OK: u8 = 8;
 /// Le pilote abandonne la carte. (0x40, DEVICE_NEEDS_RESET, est la carte
-/// qui demande à être remise à zéro : pas encore suivi.)
+/// qui demande à être remise à zéro : comme Linux 6.18, dont ni le cœur de
+/// virtio, ni le transport PCI, ni virtio-net ne le lisent, nous ne le
+/// suivons pas ; une carte qui le pose se tait, et le pilote le voit à ses
+/// délais.)
 pub const ETAT_FAILED: u8 = 0x80;
 
 /// Les fonctionnalités communes à toutes les sortes (virtio_config.h,
