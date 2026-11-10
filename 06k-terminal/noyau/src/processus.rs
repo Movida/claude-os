@@ -334,11 +334,16 @@ impl Entree {
         let fini = {
             let mut garde = self.processus.verrouiller();
             let Some(p) = garde.as_mut() else { return };
+            let a_reconfier = p.fil(tid).and_then(|f| f.signaux.a_reconfier());
             p.fils.retain(|f| f.tid != tid);
             if !p.fils.is_empty() {
                 // Les signaux du processus qui l'attendaient vont à un
-                // autre fil (`exit_signals` de Linux).
-                crate::signaux::reconfier(p, u64::MAX);
+                // autre fil, s'il en avait été prévenu : ceux qu'il ne
+                // bloquait pas (`exit_signals` de Linux, seulement avec
+                // TIF_SIGPENDING).
+                if let Some(ensemble) = a_reconfier {
+                    crate::signaux::reconfier(p, ensemble);
+                }
                 return;
             }
             self.code.store(p.fin_de_groupe.unwrap_or(code), Ordering::Relaxed);

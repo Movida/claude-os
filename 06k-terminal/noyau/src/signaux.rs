@@ -370,6 +370,10 @@ pub struct Signaux {
     /// Ceux qui attendent d'être livrés, envoyés au processus (le
     /// `shared_pending` de Linux).
     attente: EnAttente,
+    /// Le fil d'où partir pour choisir celui qui prendra un signal du
+    /// processus, quand le principal n'en veut pas (le `curr_target` de
+    /// Linux : le dernier choisi, pour répartir) ; 0 au départ.
+    cible: u32,
 }
 
 /// Les signaux d'un fil : son masque, ceux envoyés à lui seul (le `pending`
@@ -396,6 +400,13 @@ pub struct SignauxDuFil {
     /// rt_sigreturn le rétablira ; sinon il est remis au retour, une fois
     /// l'appel interrompu repris (tache.rs).
     masque_sauve: Option<u64>,
+    /// Prévenu des signaux du processus qu'il ne bloque pas (le
+    /// TIF_SIGPENDING de Linux, pour leur part) : posé sur le fil que
+    /// `prevenir` choisit, et recalculé par le fil lui-même quand son masque
+    /// change ou qu'il prend un signal (`recalculer`). Seul un fil prévenu
+    /// prend un signal du processus en revenant vers l'anneau 3 : pas le
+    /// premier qui passe, comme avant les soldes d'avant 6k.
+    prevenu: bool,
 }
 
 impl SignauxDuFil {
@@ -409,6 +420,7 @@ impl SignauxDuFil {
             attente: EnAttente::default(),
             pile: PileDeSecours::default(),
             masque_sauve: None,
+            prevenu: false,
         }
     }
 }
@@ -430,7 +442,7 @@ impl Signaux {
         const DEFAUT: Action = Action { gestionnaire: SIG_DFL, drapeaux: 0, restaurateur: 0, masque: 0 };
         static PAR_DEFAUT: [Action; NSIG as usize] = [DEFAUT; NSIG as usize];
         let actions = crate::faillible::boite_de_tranche(&PAR_DEFAUT).ok()?;
-        Some(Signaux { actions, attente: EnAttente::default() })
+        Some(Signaux { actions, attente: EnAttente::default(), cible: 0 })
     }
 
     fn action(&self, sig: u64) -> &Action {
@@ -594,34 +606,76 @@ pub fn envoyer(p: &mut Processus, sig: u64, a: Destinataire, info: Info, special
             let f = p.fil(tid).expect("le fil vient d'etre trouve");
             (f.signaux.bloques & bit(sig) == 0).then(|| f.tache.upgrade()).flatten()
         }
-        Destinataire::Processus => choisir_fil(p, sig),
+        Destinataire::Processus => prevenir(p, sig),
     })
 }
 
-/// Le fil qui prendra un signal envoyé au processus (le `complete_signal` de
-/// Linux) : le principal s'il le veut, sinon le premier qui le veut ; le
-/// veut un fil qui ne le bloque pas et dont la fin n'est pas prévue (le
-/// `wants_signal` de Linux, qui écarte les fils PF_EXITING) ; aucun s'ils
-/// le bloquent tous (il attendra qu'un fil le débloque, et le verra en
-/// revenant de rt_sigprocmask).
-fn choisir_fil(p: &Processus, sig: u64) -> Option<Arc<Tache>> {
-    let veut = |f: &fil::Fil| {
-        (f.signaux.bloques & bit(sig) == 0).then(|| f.tache.upgrade()).flatten().filter(|t| !t.fin_prevue())
-    };
-    p.fils.iter().find(|f| f.tid == p.pid).and_then(veut).or_else(|| p.fils.iter().find_map(veut))
+/// Le fil `f` veut-il le signal `sig` du processus (le `wants_signal` de
+/// Linux) ? Il ne le bloque pas, sa fin n'est pas prévue (PF_EXITING) ; et,
+/// sauf pour SIGKILL, il s'exécute en ce moment, ou n'a pas déjà un signal
+/// à prendre (TIF_SIGPENDING) : un fil occupé à en prendre un n'en reçoit
+/// pas un second, un autre s'en charge.
+fn veut(f: &fil::Fil, sig: u64) -> Option<Arc<Tache>> {
+    let s = &f.signaux;
+    if s.bloques & bit(sig) != 0 {
+        return None;
+    }
+    let t = f.tache.upgrade().filter(|t| !t.fin_prevue())?;
+    let deja = s.prevenu || s.attente.ensemble & !s.bloques != 0;
+    (sig == SIGKILL || t.est_sur_processeur() || !deja).then_some(t)
+}
+
+/// Choisit le fil qui prendra le signal `sig` envoyé au processus, le
+/// prévient et le rend, à réveiller (le `complete_signal` de Linux) : le
+/// principal s'il le veut ; sinon le premier qui le veut, en partant du
+/// dernier choisi (`cible`), pour répartir ; aucun si aucun ne le veut (il
+/// attendra qu'un fil le débloque, ou finisse ce qu'il prenait :
+/// `recalculer`, `reconfier`).
+fn prevenir(p: &mut Processus, sig: u64) -> Option<Arc<Tache>> {
+    let n = p.fils.len();
+    let principal = p.fils.iter().position(|f| f.tid == p.pid);
+    let choix = principal.and_then(|i| veut(&p.fils[i], sig).map(|t| (i, t))).or_else(|| {
+        let depart = p.fils.iter().position(|f| f.tid == p.signaux.cible).unwrap_or(0);
+        let (i, t) = (0..n).map(|k| (depart + k) % n).find_map(|i| veut(&p.fils[i], sig).map(|t| (i, t)))?;
+        p.signaux.cible = p.fils[i].tid;
+        Some((i, t))
+    });
+    let (i, t) = choix?;
+    p.fils[i].signaux.prevenu = true;
+    Some(t)
+}
+
+/// Le fil `tid` recalcule s'il est prévenu des signaux du processus (le
+/// `recalc_sigpending` de Linux, pour leur part) : oui s'il en attend un
+/// qu'il ne bloque pas. Après un changement de son masque, ou un signal
+/// pris.
+fn recalculer(p: &mut Processus, tid: u32) {
+    let commun = p.signaux.attente.ensemble;
+    if let Some(f) = p.fil(tid) {
+        f.signaux.prevenu = commun & !f.signaux.bloques != 0;
+    }
 }
 
 /// Les signaux de `ensemble`, envoyés au processus et en attente, que le
 /// fil qui devait les prendre ne prendra pas (il vient de les bloquer, ou
 /// il finit) : chacun est confié à un autre fil qui le veut, réveillé (le
 /// `retarget_shared_pending` de Linux). Sous le verrou du processus, comme
+
+impl SignauxDuFil {
+    /// Ce qu'un fil qui finit doit confier à un autre (`exit_signals`) :
+    /// les signaux qu'il ne bloquait pas, s'il avait été prévenu.
+    pub fn a_reconfier(&self) -> Option<u64> {
+        self.prevenu.then_some(!self.bloques)
+    }
+}
+
 /// chez Linux sous le `siglock`.
-pub fn reconfier(p: &Processus, ensemble: u64) {
+pub fn reconfier(p: &mut Processus, ensemble: u64) {
     let mut reste = ensemble & p.signaux.attente.ensemble;
     while reste != 0 {
         let sig = reste.trailing_zeros() as u64 + 1;
         reste &= !bit(sig);
-        reveiller(choisir_fil(p, sig));
+        reveiller(prevenir(p, sig));
     }
 }
 
@@ -637,8 +691,18 @@ pub fn reveiller(t: Option<Arc<Tache>>) {
 /// interruptible finit alors : attente.rs.) Un signal ignoré n'est jamais
 /// en attente : il est jeté à l'envoi (`envoyer`), ou en devenant ignoré.
 pub fn en_attente_non_bloque(p: &mut Processus, tid: u32) -> bool {
-    let (attente, masque) = attente_et_masque(p, tid);
-    attente & !masque != 0
+    let commun = p.signaux.attente.ensemble;
+    p.fil(tid).is_some_and(|f| {
+        let s = &mut f.signaux;
+        let oui = (s.attente.ensemble | if s.prevenu { commun } else { 0 }) & !s.bloques != 0;
+        // Rien à prendre : un « prévenu » qui resterait serait périmé (le
+        // signal pris par un autre fil) ; effacé avant de dormir, comme
+        // `recalc_sigpending` (un fil prévenu ne dort pas chez Linux).
+        if !oui {
+            s.prevenu = false;
+        }
+        oui
+    })
 }
 
 /// Le prochain signal à livrer, s'il y en a un qui arrête le programme :
@@ -766,6 +830,7 @@ pub fn apres_livraison(p: &mut Processus, tid: u32, sig: u64, action: &Action) {
             f.signaux.pile = PileDeSecours { adresse: 0, taille: 0, drapeaux: SS_DISABLE };
         }
     }
+    recalculer(p, tid);
     reconfier(p, bloques);
 }
 
@@ -777,6 +842,7 @@ pub fn poser_masque(p: &mut Processus, tid: u32, masque: u64) {
     let Some(f) = p.fil(tid) else { return };
     let nouveaux = masque & !f.signaux.bloques;
     f.signaux.bloques = masque;
+    recalculer(p, tid);
     reconfier(p, nouveaux);
 }
 
@@ -807,13 +873,30 @@ fn prendre_parmi(p: &mut Processus, tid: u32, voulus: u64) -> Option<(u64, Info)
     let s = &mut p.signaux;
     let f = &mut p.fils.iter_mut().find(|f| f.tid == tid)?.signaux;
     let permis = if voulus == !0 { !f.bloques } else { voulus };
-    let attente = match (f.attente.ensemble & permis, s.attente.ensemble & permis) {
-        (0, 0) => return None,
-        (0, _) => &mut s.attente,
-        _ => &mut f.attente,
+    // Au retour vers l'anneau 3, ceux du processus seulement pour un fil
+    // prévenu ; rt_sigtimedwait les regarde toujours (`do_sigtimedwait`).
+    let commun = if voulus != !0 || f.prevenu { s.attente.ensemble } else { 0 };
+    let attente = match (f.attente.ensemble & permis, commun & permis) {
+        (0, 0) => None,
+        (0, _) => Some(&mut s.attente),
+        _ => Some(&mut f.attente),
     };
-    let sig = EnAttente::suivant(attente.ensemble & permis);
-    Some((sig, attente.prendre(sig)))
+    let pris = attente.map(|a| {
+        let sig = EnAttente::suivant(a.ensemble & permis);
+        (sig, a.prendre(sig))
+    });
+    // Recalculé même quand rien n'est pris, comme `dequeue_signal` : un fil
+    // prévenu d'un signal qu'un autre a pris entre-temps (ou que sigaction a
+    // effacé) ne doit pas le rester, sinon `veut` l'écarterait des signaux
+    // suivants (la relecture des soldes). Seulement pour un fil prévenu, ou
+    // qui a pris un signal : Linux n'appelle `dequeue_signal` qu'avec
+    // TIF_SIGPENDING, et nous regardons à CHAQUE retour vers l'anneau 3 ;
+    // recalculer un fil qui n'était pas prévenu le préviendrait, et il
+    // prendrait le signal d'un autre (le test `fil_choisi` l'a vu).
+    if pris.is_some() || p.fil(tid).is_some_and(|f| f.signaux.prevenu) {
+        recalculer(p, tid);
+    }
+    pris
 }
 
 /// rt_sigaction(signal, action, ancienne, taille du masque). Dans l'ordre
@@ -900,6 +983,7 @@ pub fn rt_sigprocmask(comment: u64, ensemble: u64, ancien: u64, taille: u64) -> 
             };
         }
         let bloques = f.bloques & !avant;
+        recalculer(p, tid);
         reconfier(p, bloques);
         Ok(avant)
     });
@@ -1374,6 +1458,7 @@ pub fn rt_sigtimedwait(uthese: u64, uinfo: u64, delai: u64, taille: u64) -> i64 
             let rebloques = avant & !f.bloques;
             f.bloques = avant;
             f.bloques_reels = 0;
+            recalculer(p, tid);
             reconfier(p, rebloques);
             prendre_parmi(p, tid, ensemble)
         });

@@ -619,6 +619,64 @@ static void fil_neuf(void)
     signal(SIGUSR2, SIG_DFL);
 }
 
+/* ---- Un signal du processus : le fil que Linux choisit ---- */
+
+/* kill() au processus : Linux choisit le fil qui le prendra et le prévient
+ * (`complete_signal`, TIF_SIGPENDING) : le principal s'il le veut, même endormi,
+ * et pas l'envoyeur, qui revient pourtant le premier vers l'anneau 3 (puis
+ * sans cesse : getppid). Le principal le bloquant, un autre fil. */
+static volatile long tid_pris;
+static volatile int envoyeur_fini;
+
+static void noter_le_fil(int sig)
+{
+    (void)sig;
+    tid_pris = syscall(SYS_gettid);
+}
+
+static void *envoyeur(void *debloquer)
+{
+    /* Un fil neuf hérite du masque de son créateur : il débloque SIGUSR2 si on le lui dit. */
+    if (debloquer) {
+        sigset_t b;
+        sigemptyset(&b);
+        sigaddset(&b, SIGUSR2);
+        pthread_sigmask(SIG_UNBLOCK, &b, NULL);
+    }
+    struct timespec d = { 0, 50000000 };
+    nanosleep(&d, NULL);
+    kill(getpid(), SIGUSR2);
+    for (int k = 0; k < 20000 && !tid_pris; k++)
+        syscall(SYS_getppid);
+    envoyeur_fini = 1;
+    return NULL;
+}
+
+static void fil_choisi(void)
+{
+    signal(SIGUSR2, noter_le_fil);
+    tid_pris = 0;
+    pthread_t f;
+    pthread_create(&f, NULL, envoyeur, NULL);
+    struct timespec d = { 2, 0 };
+    int r = nanosleep(&d, NULL);
+    pthread_join(f, NULL);
+    verifier(r == -1 && errno == EINTR && tid_pris == syscall(SYS_gettid),
+             "kill au processus : pris par le fil principal endormi, pas par l'envoyeur qui revient sans cesse vers l'anneau 3");
+    /* Le principal le bloque : l'envoyeur le prend lui-même. */
+    sigset_t b, avant;
+    sigemptyset(&b);
+    sigaddset(&b, SIGUSR2);
+    pthread_sigmask(SIG_BLOCK, &b, &avant);
+    tid_pris = 0;
+    pthread_create(&f, NULL, envoyeur, (void *)1);
+    pthread_join(f, NULL);
+    long principal = syscall(SYS_gettid);
+    verifier(tid_pris != 0 && tid_pris != principal, "le principal le bloque : un autre fil le prend");
+    pthread_sigmask(SIG_SETMASK, &avant, NULL);
+    signal(SIGUSR2, SIG_DFL);
+}
+
 /* ---- Les fautes livrées à leur gestionnaire ---- */
 
 static sigjmp_buf apres_faute;
@@ -875,6 +933,7 @@ int main(void)
     plusieurs();
     abandonner();
     fil_neuf();
+    fil_choisi();
     fautes();
     printf("[linux] gestionnaires : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
