@@ -38,6 +38,7 @@
 
 use alloc::boxed::Box;
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 use crate::instructions::{Acces as GenreAcces, Instruction, lire_instruction};
 use crate::lecteur::Lecteur;
@@ -122,11 +123,15 @@ impl Magasin {
         {
             return Err(Piege::ValeursIncoherentes);
         }
+        let mut pile = faillible::avec_capacite(arguments.len()).map_err(|_| Piege::PlusDeMemoire)?;
+        for v in arguments {
+            pile.ajouter_dans_la_place(v.en_case());
+        }
         Ok(Execution {
-            pile: arguments.iter().map(|v| v.en_case()).collect(),
+            pile,
             cadres: Vec::new(),
             a_appeler: Some(fonction),
-            resultats: t.resultats.clone(),
+            resultats: faillible::boite_de_tranche(&t.resultats).map_err(|_| Piege::PlusDeMemoire)?,
             dette: 0,
             piege: None,
         })
@@ -223,7 +228,10 @@ impl Execution {
         if !fini || self.dette > 0 {
             return Ok(Etat::Interrompue);
         }
-        let resultats = self.resultats.iter().zip(&self.pile).map(|(&t, &c)| Valeur::depuis_case(t, c)).collect();
+        let mut resultats = faillible::avec_capacite(self.resultats.len()).map_err(|_| Piege::PlusDeMemoire)?;
+        for (&t, &c) in self.resultats.iter().zip(&self.pile) {
+            resultats.ajouter_dans_la_place(Valeur::depuis_case(t, c));
+        }
         Ok(Etat::Terminee(resultats))
     }
 
@@ -262,13 +270,16 @@ impl Execution {
         match &m.fonctions[f as usize] {
             InstanceFonction::Hote { type_fonction, numero } => {
                 let debut = self.pile.len() - type_fonction.parametres.len();
-                let arguments: Vec<Valeur> = type_fonction
-                    .parametres
-                    .iter()
-                    .zip(&self.pile[debut..])
-                    .map(|(&t, &case)| Valeur::depuis_case(t, case))
-                    .collect();
-                let mut resultats: Vec<Valeur> = type_fonction.resultats.iter().map(|&t| Valeur::defaut(t)).collect();
+                let mut arguments: Vec<Valeur> =
+                    faillible::avec_capacite(type_fonction.parametres.len()).map_err(|_| Piege::PlusDeMemoire)?;
+                for (&t, &case) in type_fonction.parametres.iter().zip(&self.pile[debut..]) {
+                    arguments.ajouter_dans_la_place(Valeur::depuis_case(t, case));
+                }
+                let mut resultats: Vec<Valeur> =
+                    faillible::avec_capacite(type_fonction.resultats.len()).map_err(|_| Piege::PlusDeMemoire)?;
+                for &t in type_fonction.resultats.iter() {
+                    resultats.ajouter_dans_la_place(Valeur::defaut(t));
+                }
                 self.pile.truncate(debut);
                 let memoire = memoire.map(|a| &mut m.memoires[a as usize].octets[..]);
                 // Le travail de l'hôte s'ajoute à la dette (voir Execution).
@@ -278,7 +289,7 @@ impl Execution {
                     if v.type_valeur() != t || matches!(v, Valeur::FuncRef(Some(a)) if a as usize >= m.fonctions.len()) {
                         return Err(Piege::ValeursIncoherentes);
                     }
-                    self.pile.push(v.en_case());
+                    self.pile.ajouter(v.en_case()).map_err(|_| Piege::PlusDeMemoire)?;
                 }
                 Ok(false)
             }
@@ -293,9 +304,11 @@ impl Execution {
                     return Err(Piege::PileEpuisee);
                 }
                 self.dette += cout(code.locales as u64 * 8);
-                self.pile.resize(locales, 0);
-                self.pile.reserve(code.hauteur_max as usize);
-                self.cadres.push(Cadre { fonction: f, base, ip: debut_code, stp: 0 });
+                // Sans mémoire, l'appel s'arrête là (un piège), au lieu
+                // d'arrêter la machine.
+                self.pile.redimensionner(locales, 0).map_err(|_| Piege::PlusDeMemoire)?;
+                self.pile.try_reserve(code.hauteur_max as usize).map_err(|_| Piege::PlusDeMemoire)?;
+                self.cadres.ajouter(Cadre { fonction: f, base, ip: debut_code, stp: 0 }).map_err(|_| Piege::PlusDeMemoire)?;
                 Ok(true)
             }
         }
@@ -427,12 +440,12 @@ impl Execution {
                     }
 
                     // Références
-                    RefNull(_) => self.pile.push(0),
+                    RefNull(_) => self.pile.ajouter_dans_la_place(0),
                     RefIsNull => {
                         let r = self.sommet();
                         *r = (*r == 0) as u64;
                     }
-                    RefFunc(x) => self.pile.push(adresse!(fonctions, x) as u64 + 1),
+                    RefFunc(x) => self.pile.ajouter_dans_la_place(adresse!(fonctions, x) as u64 + 1),
 
                     // Paramétriques
                     Drop => {
@@ -447,7 +460,7 @@ impl Execution {
                     }
 
                     // Variables
-                    LocalGet(x) => self.pile.push(self.pile[base + x as usize]),
+                    LocalGet(x) => self.pile.ajouter_dans_la_place(self.pile[base + x as usize]),
                     LocalSet(x) => {
                         let v = self.depiler();
                         self.pile[base + x as usize] = v;
@@ -456,7 +469,7 @@ impl Execution {
                         let v = *self.sommet();
                         self.pile[base + x as usize] = v;
                     }
-                    GlobalGet(x) => self.pile.push(m.globales[adresse!(globales, x)].valeur),
+                    GlobalGet(x) => self.pile.ajouter_dans_la_place(m.globales[adresse!(globales, x)].valeur),
                     GlobalSet(x) => {
                         let v = self.depiler();
                         m.globales[adresse!(globales, x)].valeur = v;
@@ -466,7 +479,7 @@ impl Execution {
                     TableGet(x) => {
                         let i = self.depiler32() as usize;
                         let v = *m.tables[adresse!(tables, x)].elements.get(i).ok_or(Piege::AccesTableHorsLimites)?;
-                        self.pile.push(v);
+                        self.pile.ajouter_dans_la_place(v);
                     }
                     TableSet(x) => {
                         let v = self.depiler();
@@ -474,7 +487,7 @@ impl Execution {
                         let case = m.tables[adresse!(tables, x)].elements.get_mut(i).ok_or(Piege::AccesTableHorsLimites)?;
                         *case = v;
                     }
-                    TableSize(x) => self.pile.push(m.tables[adresse!(tables, x)].elements.len() as u64),
+                    TableSize(x) => self.pile.ajouter_dans_la_place(m.tables[adresse!(tables, x)].elements.len() as u64),
                     TableGrow(x) => {
                         let n = self.depiler32();
                         let v = self.depiler();
@@ -482,7 +495,7 @@ impl Execution {
                         if ancienne.is_some() {
                             self.dette += cout(n as u64 * 8);
                         }
-                        self.pile.push(ancienne.unwrap_or(u32::MAX) as u64);
+                        self.pile.ajouter_dans_la_place(ancienne.unwrap_or(u32::MAX) as u64);
                     }
                     TableFill(x) => {
                         let n = self.depiler32();
@@ -548,7 +561,7 @@ impl Execution {
                             // Les lectures plus courtes que la valeur
                             // complètent par des zéros (ce qu'on a fait) ou
                             // par le signe (_s).
-                            self.pile.push(match acces {
+                            self.pile.ajouter_dans_la_place(match acces {
                                 GenreAcces::I32Load8S => brut as u8 as i8 as i32 as u32 as u64,
                                 GenreAcces::I32Load16S => brut as u16 as i16 as i32 as u32 as u64,
                                 GenreAcces::I64Load8S => brut as u8 as i8 as i64 as u64,
@@ -558,14 +571,14 @@ impl Execution {
                             });
                         }
                     }
-                    MemorySize => self.pile.push(m.memoires[memoire.expect(VALIDE) as usize].pages() as u64),
+                    MemorySize => self.pile.ajouter_dans_la_place(m.memoires[memoire.expect(VALIDE) as usize].pages() as u64),
                     MemoryGrow => {
                         let n = self.depiler32();
                         let anciennes = m.memoires[memoire.expect(VALIDE) as usize].grandir(n, &mut m.budget);
                         if anciennes.is_some() {
                             self.dette += cout(n as u64 * PAGE as u64);
                         }
-                        self.pile.push(anciennes.unwrap_or(u32::MAX) as u64);
+                        self.pile.ajouter_dans_la_place(anciennes.unwrap_or(u32::MAX) as u64);
                     }
                     MemoryInit(x) => {
                         let n = self.depiler32();
@@ -606,10 +619,10 @@ impl Execution {
                     }
 
                     // Constantes et opérations numériques
-                    I32Const(v) => self.pile.push(v as u32 as u64),
-                    I64Const(v) => self.pile.push(v as u64),
-                    F32Const(bits) => self.pile.push(bits as u64),
-                    F64Const(bits) => self.pile.push(bits),
+                    I32Const(v) => self.pile.ajouter_dans_la_place(v as u32 as u64),
+                    I64Const(v) => self.pile.ajouter_dans_la_place(v as u64),
+                    F32Const(bits) => self.pile.ajouter_dans_la_place(bits as u64),
+                    F64Const(bits) => self.pile.ajouter_dans_la_place(bits),
                     Op(op) => operation(op, &mut self.pile)?,
                 }
             }
@@ -622,7 +635,7 @@ impl Execution {
 mod tests {
     extern crate std;
     use super::*;
-    use alloc::sync::Arc;
+    use crate::Arc;
     use alloc::vec;
 
     struct SansHote;
@@ -656,7 +669,7 @@ mod tests {
     fn instancier(octets: &[u8]) -> (Magasin, u32) {
         let module = crate::decoder(octets).and_then(crate::valider).unwrap();
         let mut m = Magasin::new();
-        let instance = m.instancier(Arc::new(module), &[]).unwrap().instance;
+        let instance = m.instancier(Arc::new(module).unwrap(), &[]).unwrap().instance;
         let Some(Externe::Fonction(f)) = m.exporte(instance, "f") else { panic!("export f") };
         (m, f)
     }
@@ -754,8 +767,8 @@ mod tests {
         let module = crate::decoder(&octets).and_then(crate::valider).unwrap();
         let mut m = Magasin::new();
         let t = crate::module::TypeFonction { parametres: Box::new([]), resultats: Box::new([]) };
-        let h = m.ajouter_fonction_hote(t, 0);
-        let instance = m.instancier(Arc::new(module), &[h]).unwrap().instance;
+        let h = m.ajouter_fonction_hote(t, 0).unwrap();
+        let instance = m.instancier(Arc::new(module).unwrap(), &[h]).unwrap().instance;
         let Some(Externe::Fonction(f)) = m.exporte(instance, "f") else { panic!("export f") };
         // call et end : deux instructions, plus les 1000 unités de l'hôte.
         let mut carburant = u64::MAX;

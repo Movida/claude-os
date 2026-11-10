@@ -517,7 +517,8 @@ pub fn imports<'a>(magasin: &mut Magasin, module: &'a ModuleValide) -> Result<Ve
         // une fonction autrement.
         let boite = |types: &[TypeValeur]| faillible::boite_de_tranche(types).map_err(|_| RefusImports::PlusDeMemoire);
         let t = TypeFonction { parametres: boite(parametres)?, resultats: boite(resultats)? };
-        externes.ajouter(magasin.ajouter_fonction_hote(t, numero)).map_err(|_| RefusImports::PlusDeMemoire)?;
+        let externe = magasin.ajouter_fonction_hote(t, numero).ok_or(RefusImports::PlusDeMemoire)?;
+        externes.ajouter(externe).map_err(|_| RefusImports::PlusDeMemoire)?;
     }
     Ok(externes)
 }

@@ -15,7 +15,8 @@
 //! sans conséquence ici : le noyau donnera à chaque programme son propre
 //! magasin, libéré d'un coup à la fin du programme.
 
-use alloc::sync::Arc;
+use crate::Arc;
+use faillible::VecFaillible;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -112,6 +113,9 @@ pub enum Piege {
     /// Plus de place sur la pile des valeurs ou des appels (voir
     /// limites.rs).
     PileEpuisee,
+    /// Le tas du noyau n'a pas pu donner la mémoire d'un appel (ses
+    /// variables, sa pile), ou de ses résultats (les soldes d'avant 6k).
+    PlusDeMemoire,
     /// L'environnement a donné ou rendu des valeurs d'un autre type que
     /// celui de la fonction (une erreur de l'hôte, pas du programme).
     ValeursIncoherentes,
@@ -133,6 +137,7 @@ impl fmt::Display for Piege {
             Piege::DebordementEntier => write!(f, "debordement entier"),
             Piege::ConversionInvalide => write!(f, "conversion d'un NaN en entier"),
             Piege::PileEpuisee => write!(f, "pile epuisee"),
+            Piege::PlusDeMemoire => write!(f, "plus de memoire"),
             Piege::ValeursIncoherentes => write!(f, "valeurs de l'hote d'un type inattendu"),
             Piege::Hote(code) => write!(f, "arret demande par l'hote (code {code})"),
         }
@@ -215,7 +220,7 @@ impl InstanceTable {
             return None;
         }
         self.elements.try_reserve_exact(n as usize).ok()?;
-        self.elements.resize(nouvelle as usize, valeur);
+        self.elements.redimensionner(nouvelle as usize, valeur).ok()?;
         *budget -= octets;
         Some(ancienne)
     }
@@ -249,7 +254,7 @@ impl InstanceMemoire {
         // machine manque, memory.grow échoue proprement au lieu d'arrêter
         // le noyau.
         self.octets.try_reserve_exact(octets).ok()?;
-        self.octets.resize(nouvelles as usize * PAGE, 0);
+        self.octets.redimensionner(nouvelles as usize * PAGE, 0).ok()?;
         *budget -= octets;
         Some(anciennes)
     }
@@ -332,25 +337,28 @@ impl Magasin {
         }
     }
 
-    /// Une fonction de l'hôte (voir `Hote`), à donner en import.
-    pub fn ajouter_fonction_hote(&mut self, type_fonction: TypeFonction, numero: u32) -> Externe {
-        self.fonctions.push(InstanceFonction::Hote { type_fonction, numero });
-        Externe::Fonction(self.fonctions.len() as u32 - 1)
+    /// Une fonction de l'hôte (voir `Hote`), à donner en import ; None si
+    /// la mémoire manque.
+    pub fn ajouter_fonction_hote(&mut self, type_fonction: TypeFonction, numero: u32) -> Option<Externe> {
+        self.fonctions.ajouter(InstanceFonction::Hote { type_fonction, numero }).ok()?;
+        Some(Externe::Fonction(self.fonctions.len() as u32 - 1))
     }
 
     /// Une table vide (pleine de références nulles), créée par l'hôte, ou
     /// None si elle dépasse nos limites ou la mémoire disponible.
     pub fn ajouter_table(&mut self, type_table: TypeTable) -> Option<Externe> {
+        self.tables.try_reserve(1).ok()?;
         let table = nouvelle_table(type_table, &mut self.budget)?;
-        self.tables.push(table);
+        self.tables.ajouter_dans_la_place(table);
         Some(Externe::Table(self.tables.len() as u32 - 1))
     }
 
     /// Une mémoire mise à zéro, créée par l'hôte, ou None (voir
     /// `ajouter_table`).
     pub fn ajouter_memoire(&mut self, limites: Limites) -> Option<Externe> {
+        self.memoires.try_reserve(1).ok()?;
         let memoire = nouvelle_memoire(limites, &mut self.budget)?;
-        self.memoires.push(memoire);
+        self.memoires.ajouter_dans_la_place(memoire);
         Some(Externe::Memoire(self.memoires.len() as u32 - 1))
     }
 
@@ -360,7 +368,7 @@ impl Magasin {
         if !self.valeur_acceptable(valeur, type_globale.valeur) {
             return None;
         }
-        self.globales.push(InstanceGlobale { type_globale, valeur: valeur.en_case() });
+        self.globales.ajouter(InstanceGlobale { type_globale, valeur: valeur.en_case() }).ok()?;
         Some(Externe::Globale(self.globales.len() as u32 - 1))
     }
 

@@ -19,7 +19,7 @@ mod json;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use wasm::Arc;
 
 use json::Valeur;
 use wasm::erreur::Genre;
@@ -77,7 +77,7 @@ fn spectest(m: &mut Magasin) -> BTreeMap<&'static str, Externe> {
     ];
     for (nom, parametres) in fonctions {
         let t = TypeFonction { parametres: parametres.into(), resultats: Box::new([]) };
-        s.insert(nom, m.ajouter_fonction_hote(t, 0));
+        s.insert(nom, m.ajouter_fonction_hote(t, 0).expect("plus de memoire"));
     }
     let globales = [
         ("global_i32", ValeurWasm::I32(666)),
@@ -192,7 +192,7 @@ impl Banc {
             _ => Verdict::Echoue(format!("refuse a tort : {e}")),
         })?;
         verifier_branchements(&module).map_err(Verdict::Echoue)?;
-        Ok(Arc::new(module))
+        Ok(Arc::new(module).expect("plus de memoire pour le module"))
     }
 
     /// Ce que le banc, qui joue l'environnement, donne aux imports d'un

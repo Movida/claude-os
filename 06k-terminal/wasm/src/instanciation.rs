@@ -21,7 +21,8 @@
 //! tout autre appel (voir interpreteur.rs). Aucun code WebAssembly ne
 //! s'exécute donc jamais sans limite.
 
-use alloc::sync::Arc;
+use crate::Arc;
+use faillible::VecFaillible;
 use alloc::vec::Vec;
 use core::fmt;
 
@@ -142,69 +143,93 @@ impl Magasin {
         // mutation of the store ») ; sinon, des fonctions déjà ajoutées
         // resteraient attachées au numéro d'instance, que la prochaine
         // instanciation reprendrait : elles verraient sa mémoire.
+        // Toute la place que prendra l'instance dans le magasin aussi (ses
+        // fonctions, tables, mémoires, globales, segments, et ses listes
+        // d'adresses), réservée ici : un manque n'arrive qu'avant le premier
+        // changement (les soldes d'avant 6k ; jusque-là, un `push` sur un
+        // tas plein arrêtait la machine).
+        let ressources = ErreurInstanciation::Ressources;
         let mut budget = self.budget;
-        let tables: Option<Vec<InstanceTable>> = md.tables.iter().map(|&t| nouvelle_table(t, &mut budget)).collect();
-        let tables = tables.ok_or(ErreurInstanciation::Ressources)?;
-        let memoires: Option<Vec<InstanceMemoire>> =
-            md.memoires.iter().map(|&l| nouvelle_memoire(l, &mut budget)).collect();
-        let memoires = memoires.ok_or(ErreurInstanciation::Ressources)?;
-        self.budget = budget;
-
-        // Puis les imports, d'abord dans chaque espace d'index.
-        let numero = self.instances.len();
+        let mut tables: Vec<InstanceTable> = faillible::avec_capacite(md.tables.len()).map_err(|_| ressources)?;
+        for &t in &md.tables {
+            tables.ajouter_dans_la_place(nouvelle_table(t, &mut budget).ok_or(ressources)?);
+        }
+        let mut memoires: Vec<InstanceMemoire> = faillible::avec_capacite(md.memoires.len()).map_err(|_| ressources)?;
+        for &l in &md.memoires {
+            memoires.ajouter_dans_la_place(nouvelle_memoire(l, &mut budget).ok_or(ressources)?);
+        }
+        // Les références de chaque segment d'éléments, à remplir plus loin.
+        let mut references: Vec<Vec<u64>> = faillible::avec_capacite(md.elements.len()).map_err(|_| ressources)?;
+        for segment in &md.elements {
+            references.ajouter_dans_la_place(faillible::avec_capacite(segment.elements.len()).map_err(|_| ressources)?);
+        }
+        let compte = |genre: fn(&Externe) -> bool| imports.iter().filter(|e| genre(e)).count();
         let mut instance = InstanceModule {
             module: module.clone(),
-            fonctions: Vec::new(),
-            tables: Vec::new(),
-            memoires: Vec::new(),
-            globales: Vec::new(),
-            elements: Vec::new(),
-            donnees: Vec::new(),
+            fonctions: faillible::avec_capacite(compte(|e| matches!(e, Externe::Fonction(_))) + md.fonctions.len())
+                .map_err(|_| ressources)?,
+            tables: faillible::avec_capacite(compte(|e| matches!(e, Externe::Table(_))) + md.tables.len()).map_err(|_| ressources)?,
+            memoires: faillible::avec_capacite(compte(|e| matches!(e, Externe::Memoire(_))) + md.memoires.len())
+                .map_err(|_| ressources)?,
+            globales: faillible::avec_capacite(compte(|e| matches!(e, Externe::Globale(_))) + md.globales.len())
+                .map_err(|_| ressources)?,
+            elements: faillible::avec_capacite(md.elements.len()).map_err(|_| ressources)?,
+            donnees: faillible::avec_capacite(md.donnees.len()).map_err(|_| ressources)?,
         };
+        self.fonctions.try_reserve(md.fonctions.len()).map_err(|_| ressources)?;
+        self.tables.try_reserve(md.tables.len()).map_err(|_| ressources)?;
+        self.memoires.try_reserve(md.memoires.len()).map_err(|_| ressources)?;
+        self.globales.try_reserve(md.globales.len()).map_err(|_| ressources)?;
+        self.elements.try_reserve(md.elements.len()).map_err(|_| ressources)?;
+        self.donnees.try_reserve(md.donnees.len()).map_err(|_| ressources)?;
+        self.instances.try_reserve(1).map_err(|_| ressources)?;
+        self.budget = budget;
+
+        // Puis les imports, d'abord dans chaque espace d'index ; la place
+        // de chacun est prise plus haut.
+        let numero = self.instances.len();
         for &externe in imports {
             match externe {
-                Externe::Fonction(a) => instance.fonctions.push(a),
-                Externe::Table(a) => instance.tables.push(a),
-                Externe::Memoire(a) => instance.memoires.push(a),
-                Externe::Globale(a) => instance.globales.push(a),
+                Externe::Fonction(a) => instance.fonctions.ajouter_dans_la_place(a),
+                Externe::Table(a) => instance.tables.ajouter_dans_la_place(a),
+                Externe::Memoire(a) => instance.memoires.ajouter_dans_la_place(a),
+                Externe::Globale(a) => instance.globales.ajouter_dans_la_place(a),
             }
         }
         for index in 0..md.fonctions.len() as u32 {
-            instance.fonctions.push(self.fonctions.len() as u32);
-            self.fonctions.push(InstanceFonction::Wasm { module: module.clone(), instance: numero as u32, index });
+            instance.fonctions.ajouter_dans_la_place(self.fonctions.len() as u32);
+            self.fonctions.ajouter_dans_la_place(InstanceFonction::Wasm { module: module.clone(), instance: numero as u32, index });
         }
         for table in tables {
-            instance.tables.push(self.tables.len() as u32);
-            self.tables.push(table);
+            instance.tables.ajouter_dans_la_place(self.tables.len() as u32);
+            self.tables.ajouter_dans_la_place(table);
         }
         for memoire in memoires {
-            instance.memoires.push(self.memoires.len() as u32);
-            self.memoires.push(memoire);
+            instance.memoires.ajouter_dans_la_place(self.memoires.len() as u32);
+            self.memoires.ajouter_dans_la_place(memoire);
         }
         // L'instance entre dans le magasin dès maintenant : les expressions
         // constantes qui suivent y lisent ses fonctions et ses globales
         // importées (les seules qu'elles ont le droit de lire).
-        self.instances.push(instance);
+        self.instances.ajouter_dans_la_place(instance);
         for g in &md.globales {
             let valeur = self.constante(numero, g.init);
-            self.instances[numero].globales.push(self.globales.len() as u32);
-            self.globales.push(InstanceGlobale { type_globale: g.type_globale, valeur });
+            self.instances[numero].globales.ajouter_dans_la_place(self.globales.len() as u32);
+            self.globales.ajouter_dans_la_place(InstanceGlobale { type_globale: g.type_globale, valeur });
         }
-        for segment in &md.elements {
-            let references = segment
-                .elements
-                .iter()
-                .map(|e| match *e {
+        for (segment, mut references) in md.elements.iter().zip(references) {
+            for e in &segment.elements {
+                references.ajouter_dans_la_place(match *e {
                     Element::Fonction(x) => self.instances[numero].fonctions[x as usize] as u64 + 1,
                     Element::Expression(plage) => self.constante(numero, plage),
-                })
-                .collect();
-            self.instances[numero].elements.push(self.elements.len() as u32);
-            self.elements.push(InstanceElements { references });
+                });
+            }
+            self.instances[numero].elements.ajouter_dans_la_place(self.elements.len() as u32);
+            self.elements.ajouter_dans_la_place(InstanceElements { references });
         }
         for segment in &md.donnees {
-            self.instances[numero].donnees.push(self.donnees.len() as u32);
-            self.donnees.push(InstanceDonnees { module: module.clone(), plage: segment.octets });
+            self.instances[numero].donnees.ajouter_dans_la_place(self.donnees.len() as u32);
+            self.donnees.ajouter_dans_la_place(InstanceDonnees { module: module.clone(), plage: segment.octets });
         }
 
         // 3. L'initialisation, puis l'appel du démarrage, que l'appelant
@@ -266,7 +291,7 @@ mod tests {
     }
 
     fn valide(octets: &[u8]) -> Arc<ModuleValide> {
-        Arc::new(crate::decoder(octets).and_then(crate::valider).unwrap())
+        Arc::new(crate::decoder(octets).and_then(crate::valider).unwrap()).unwrap()
     }
 
     /// (module (memory 20000) (func (export "f") (result i32) (i32.const 7)))

@@ -58,6 +58,10 @@ pub enum Genre {
     SectionDeNombreDeDonneesRequise,
     /// Bien formé, mais hors de ce que l'interpréteur sait faire (SIMD).
     NonPrisEnCharge,
+    /// Le tas du noyau n'a pas pu donner la mémoire de la lecture (les
+    /// soldes d'avant 6k : jusque-là, un module assez gros arrêtait la
+    /// machine).
+    PlusDeMemoire,
     /// Au-delà d'une limite de notre implémentation (limites.rs).
     LimiteDepassee(Limite),
 
@@ -160,6 +164,7 @@ impl fmt::Display for Genre {
             Genre::NombreDeDonneesIncoherent => write!(f, "nombre de segments de donnees incoherent"),
             Genre::SectionDeNombreDeDonneesRequise => write!(f, "section du nombre de donnees requise"),
             Genre::NonPrisEnCharge => write!(f, "fonctionnalite non prise en charge (SIMD)"),
+            Genre::PlusDeMemoire => write!(f, "plus de memoire"),
             Genre::LimiteDepassee(limite) => write!(f, "limite de l'interpreteur depassee : {limite}"),
             Genre::IndexInconnu(espace, index) => write!(f, "index {index} inconnu ({espace})"),
             Genre::TypeInattendu { attendu, trouve } => write!(f, "{attendu} attendu, {trouve} trouve"),

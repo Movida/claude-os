@@ -225,6 +225,7 @@ boot.bin: programmes.cpio FORCE
 	cd zones && cargo clippy --release --target x86_64-unknown-none
 	cd crypto && cargo clippy --release --target x86_64-unknown-none
 	cd roue && cargo clippy --release --target x86_64-unknown-none
+	cd wasm && cargo clippy --release --target x86_64-unknown-none
 	cd noyau && cargo clippy --release --all-features
 	cd noyau && cargo build --release
 	$(call image,$(NOYAU_ELF),programmes.cpio,boot)

@@ -6,7 +6,7 @@
 #
 # Les allocations qui paniquent quand le tas est plein : interdites dans le
 # noyau et ses bibliothèques, qui passent par leurs équivalents faillibles
-# (la bibliothèque faillible/, et notre Arc, noyau/src/partage.rs). Chaque
+# (la bibliothèque faillible/, avec notre Arc, faillible::partage). Chaque
 # raison dit quoi prendre à la place. Seuls faillible/ (qui les appelle une
 # fois la place réservée) et le test du tas au démarrage (main.rs,
 # tester_tas) ont le droit de les appeler, par un #[allow] justifié.

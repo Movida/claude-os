@@ -1282,7 +1282,7 @@ fn executer_wasm(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancemen
         let (Some(a), Some(e), Some(d)) = (tranches(&arguments), tranches(&environnement), tranches(&dossiers)) else {
             return afficherln!("[noyau] {} : plus de memoire pour ses arguments", nom);
         };
-        executer_module(nom, &octets, &a, &e, &d, ecoutes)
+        executer_module(nom, octets, &a, &e, &d, ecoutes)
     });
     match lancee {
         Some(t) => {
@@ -1313,22 +1313,29 @@ fn tranches(v: &[Vec<u8>]) -> Option<Vec<&[u8]>> {
 
 /// Le corps d'un programme WebAssembly, dans sa tâche (voir
 /// `executer_wasm`).
-fn executer_module(nom: NomCourt, octets: &[u8], arguments: &[&[u8]], environnement: &[&[u8]], dossiers: &[&[u8]],
+fn executer_module(nom: NomCourt, octets: Vec<u8>, arguments: &[&[u8]], environnement: &[&[u8]], dossiers: &[&[u8]],
                    ecoutes: wasi::Ecoutes) {
     use wasm::{Etat, Externe, Magasin, Piege};
 
     const TRANCHE: u64 = 1000;
 
-    let module = match wasm::decoder(octets).and_then(wasm::valider) {
-        // La bibliothèque wasm prend son module dans l'Arc de alloc (son
-        // interface, testée aussi sur l'hôte) : une allocation qui peut
-        // encore faire paniquer le noyau, comme celles de la bibliothèque
-        // elle-même (une dette, dans « Reste à faire »).
-        #[allow(clippy::disallowed_methods)]
-        Ok(m) => alloc::sync::Arc::new(m),
+    // Le module validé se partage dans l'Arc faillible (wasm::Arc, celui de
+    // faillible/, comme tout le noyau ; jusqu'aux soldes d'avant 6k, l'Arc
+    // de alloc, qui pouvait faire paniquer). Ses octets lui sont DONNÉS
+    // (`decoder_possede`) : le bloc lu, à sa taille exacte (`remplie`), sans
+    // seconde copie.
+    let taille = octets.len();
+    let Ok(octets) = faillible::en_boite(octets) else {
+        return afficherln!("[noyau] {} : programme WebAssembly refuse : plus de memoire", nom);
+    };
+    let module = match wasm::decoder_possede(octets).and_then(wasm::valider) {
+        Ok(m) => match wasm::Arc::new(m) {
+            Ok(m) => m,
+            Err(_) => return afficherln!("[noyau] {} : programme WebAssembly refuse : plus de memoire", nom),
+        },
         Err(e) => return afficherln!("[noyau] {} : programme WebAssembly refuse : {}", nom, e),
     };
-    afficherln!("[noyau] {} : programme WebAssembly, {} octets, decode et valide.", nom, octets.len());
+    afficherln!("[noyau] {} : programme WebAssembly, {} octets, decode et valide.", nom, taille);
     // Son budget de mémoire : 16 Mio pour ses tables et sa mémoire, chacune
     // d'au plus 4 Mio (un bloc du tas, voir tas.rs).
     let mut magasin = Magasin::avec_budget(16 << 20);

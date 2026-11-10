@@ -55,6 +55,9 @@
 
 extern crate alloc;
 
+#[allow(unsafe_code)]
+pub mod partage;
+
 use alloc::alloc::{Layout, alloc};
 use alloc::boxed::Box;
 use alloc::collections::{TryReserveError, VecDeque};
@@ -138,6 +141,31 @@ pub fn boite_de_tranche<T: Clone>(tranche: &[T]) -> Result<Box<[T]>, PlusDeMemoi
     // réallouer (il ne le fait que pour rendre une place en trop).
     #[allow(clippy::disallowed_methods)]
     Ok(copie(tranche)?.into_boxed_slice())
+}
+
+/// Un `Vec` en `Box<[T]>`, sans paniquer : `into_boxed_slice` réalloue à la
+/// taille exacte quand la capacité dépasse la longueur, et panique si le tas
+/// refuse ; ici, les éléments passent d'abord dans un `Vec` à la place
+/// exacte, pris sans paniquer (PlusDeMemoire sinon), puis la conversion n'a
+/// plus rien à réallouer.
+pub fn en_boite<T>(v: Vec<T>) -> Result<Box<[T]>, PlusDeMemoire> {
+    let v = if v.len() == v.capacity() {
+        v
+    } else {
+        let mut exacte = avec_capacite(v.len())?;
+        for e in v {
+            exacte.ajouter_dans_la_place(e);
+        }
+        exacte
+    };
+    // `try_reserve_exact` ne promet que « au moins » : une place en trop
+    // ferait réallouer la conversion. Jamais vu (Vec prend ce qu'il
+    // demande) ; si cela arrivait, un refus plutôt qu'une panique.
+    if v.len() != v.capacity() {
+        return Err(PlusDeMemoire);
+    }
+    #[allow(clippy::disallowed_methods)]
+    Ok(v.into_boxed_slice())
 }
 
 /// Un `Vec` vide qui a déjà la place de `n` éléments

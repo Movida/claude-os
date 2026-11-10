@@ -120,7 +120,8 @@ mod attente;
 mod irq;
 #[allow(unsafe_code)]
 mod ordonnanceur;
-#[allow(unsafe_code)]
+// L'Arc faillible, dans la bibliothèque faillible/ (les soldes d'avant 6k) :
+// son `unsafe` y est.
 mod partage;
 #[allow(unsafe_code)]
 mod verrou;

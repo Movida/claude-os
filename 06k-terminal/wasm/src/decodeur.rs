@@ -15,7 +15,8 @@
 //! distingue (assert_malformed et assert_invalid).
 
 use alloc::boxed::Box;
-use alloc::string::ToString;
+use alloc::string::String;
+use faillible::VecFaillible;
 use alloc::vec::Vec;
 
 use crate::erreur::{Erreur, Genre};
@@ -24,12 +25,30 @@ use crate::lecteur::Lecteur;
 use crate::limites::{Limite, TAILLE_CORPS_MAX, TAILLE_MODULE_MAX};
 use crate::module::*;
 
-/// Lit un module complet.
+/// Lit un module complet, d'une copie de `octets` que le module garde (une
+/// copie faillible : « plus de memoire » si le tas ne peut pas la donner).
 pub fn decoder(octets: &[u8]) -> Result<Module, Erreur> {
     if octets.len() > TAILLE_MODULE_MAX {
         return Err(Erreur { position: 0, genre: Genre::LimiteDepassee(Limite::TailleModule) });
     }
-    let mut module = Module { octets: octets.into(), ..Module::default() };
+    let copie = faillible::boite_de_tranche(octets).map_err(|_| Erreur { position: 0, genre: Genre::PlusDeMemoire })?;
+    decoder_possede(copie)
+}
+
+/// Lit un module complet, dont l'appelant DONNE les octets, que le module
+/// garde : sans seconde copie (le noyau les a déjà lus dans un bloc à lui :
+/// un module de N octets n'en prend que N, pas 2N).
+pub fn decoder_possede(octets: Box<[u8]>) -> Result<Module, Erreur> {
+    if octets.len() > TAILLE_MODULE_MAX {
+        return Err(Erreur { position: 0, genre: Genre::LimiteDepassee(Limite::TailleModule) });
+    }
+    let mut module = Module::default();
+    lire_module(&mut module, &octets)?;
+    module.octets = octets;
+    Ok(module)
+}
+
+fn lire_module(module: &mut Module, octets: &[u8]) -> Result<(), Erreur> {
     let mut l = Lecteur::new(octets);
 
     if l.octets(4).ok() != Some(b"\0asm".as_slice()) {
@@ -115,7 +134,7 @@ pub fn decoder(octets: &[u8]) -> Result<Module, Erreur> {
             return Err(l.erreur(Genre::NombreDeDonneesIncoherent));
         }
     }
-    Ok(module)
+    Ok(())
 }
 
 /// Un vecteur : un nombre, puis autant d'éléments.
@@ -131,7 +150,8 @@ fn vecteur<'a, T>(
     // un seul élément. Le Vec grandit avec ce qui est réellement lu.
     let mut v = Vec::new();
     for _ in 0..n {
-        v.push(lire(l)?);
+        let e = lire(l)?;
+        v.ajouter(e).map_err(|_| l.erreur(Genre::PlusDeMemoire))?;
     }
     Ok(v)
 }
@@ -140,8 +160,11 @@ fn lire_type_fonction(l: &mut Lecteur) -> Result<TypeFonction, Erreur> {
     if l.octet()? != 0x60 {
         return Err(Erreur { position: l.position() - 1, genre: Genre::TypeDeFonctionAttendu });
     }
-    let parametres: Box<[TypeValeur]> = vecteur(l, lire_type_valeur)?.into();
-    let resultats: Box<[TypeValeur]> = vecteur(l, lire_type_valeur)?.into();
+    // En boîte sans paniquer (`into_boxed_slice` réalloue à la taille
+    // exacte, et panique si le tas refuse : faillible::en_boite).
+    let manque = |l: &Lecteur| l.erreur(Genre::PlusDeMemoire);
+    let parametres = faillible::en_boite(vecteur(l, lire_type_valeur)?).map_err(|_| manque(l))?;
+    let resultats = faillible::en_boite(vecteur(l, lire_type_valeur)?).map_err(|_| manque(l))?;
     Ok(TypeFonction { parametres, resultats })
 }
 
@@ -174,8 +197,10 @@ fn lire_type_globale(l: &mut Lecteur) -> Result<TypeGlobale, Erreur> {
 }
 
 fn lire_import(l: &mut Lecteur) -> Result<Import, Erreur> {
-    let module = l.nom()?.to_string();
-    let nom = l.nom()?.to_string();
+    let module = l.nom()?;
+    let module = chaine(l, module)?;
+    let nom = l.nom()?;
+    let nom = chaine(l, nom)?;
     let description = match l.octet()? {
         0 => DescriptionImport::Fonction(l.u32()?),
         1 => DescriptionImport::Table(lire_type_table(l)?),
@@ -186,8 +211,15 @@ fn lire_import(l: &mut Lecteur) -> Result<Import, Erreur> {
     Ok(Import { module, nom, description })
 }
 
+/// Une copie de `s` dans une `String` neuve, sans paniquer (`to_string`).
+fn chaine(l: &Lecteur, s: &str) -> Result<String, Erreur> {
+    let octets = faillible::copie(s.as_bytes()).map_err(|_| l.erreur(Genre::PlusDeMemoire))?;
+    String::from_utf8(octets).map_err(|_| l.erreur(Genre::Utf8Invalide))
+}
+
 fn lire_export(l: &mut Lecteur) -> Result<Export, Erreur> {
-    let nom = l.nom()?.to_string();
+    let nom = l.nom()?;
+    let nom = chaine(l, nom)?;
     let description = match l.octet()? {
         0 => DescriptionExport::Fonction(l.u32()?),
         1 => DescriptionExport::Table(l.u32()?),
@@ -306,14 +338,16 @@ fn lire_corps(l: &mut Lecteur, utilise_donnees: &mut bool) -> Result<Corps, Erre
         if total > u32::MAX as u64 {
             return Err(c.erreur(Genre::TropDeVariablesLocales));
         }
-        locales.push((nombre, lire_type_valeur(&mut c)?));
+        let t = lire_type_valeur(&mut c)?;
+        locales.ajouter((nombre, t)).map_err(|_| c.erreur(Genre::PlusDeMemoire))?;
     }
     let code = lire_expression(&mut c, utilise_donnees)?;
     // Le `end` final doit être le dernier octet du corps.
     if !c.fini() {
         return Err(c.erreur(Genre::FinDeFonctionAttendue));
     }
-    Ok(Corps { locales: locales.into(), code })
+    let locales = faillible::en_boite(locales).map_err(|_| c.erreur(Genre::PlusDeMemoire))?;
+    Ok(Corps { locales, code })
 }
 
 /// Les cas que la suite officielle ne couvre pas.

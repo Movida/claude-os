@@ -45,7 +45,7 @@
 //! remplit pour chaque fonction une table annexe (voir `Branchement`).
 
 use alloc::boxed::Box;
-use alloc::vec;
+use faillible::VecFaillible;
 use alloc::vec::Vec;
 
 use crate::erreur::{Erreur, Espace, Genre};
@@ -170,13 +170,15 @@ pub fn valider(module: Module) -> Result<ModuleValide, Erreur> {
     }
     let code = {
         let contexte = Contexte::construire(&module)?;
-        let mut code = Vec::with_capacity(module.corps.len());
+        let mut code = faillible::avec_capacite(module.corps.len())
+            .map_err(|_| erreur(module.sections[10] as usize, Genre::PlusDeMemoire))?;
         for (corps, &type_fonction) in module.corps.iter().zip(&module.fonctions) {
             let type_fonction = &module.types[type_fonction as usize];
-            code.push(Validateur::valider(&contexte, type_fonction, corps)?);
+            code.ajouter_dans_la_place(Validateur::valider(&contexte, type_fonction, corps)?);
         }
         code
     };
+    // `into` ne réalloue pas : la capacité est exactement la longueur.
     Ok(ModuleValide { module, code: code.into() })
 }
 
@@ -265,33 +267,33 @@ impl<'m> Contexte<'m> {
             match import.description {
                 DescriptionImport::Fonction(t) => {
                     c.type_fonction(t, section(2))?;
-                    c.fonctions.push(t);
+                    c.fonctions.ajouter(t).map_err(|_| erreur(section(2), Genre::PlusDeMemoire))?;
                 }
                 DescriptionImport::Table(t) => {
                     verifier_table(t, section(2))?;
-                    c.tables.push(t);
+                    c.tables.ajouter(t).map_err(|_| erreur(section(2), Genre::PlusDeMemoire))?;
                 }
                 DescriptionImport::Memoire(limites) => {
                     verifier_limites(limites, true, section(2))?;
-                    c.memoires.push(limites);
+                    c.memoires.ajouter(limites).map_err(|_| erreur(section(2), Genre::PlusDeMemoire))?;
                 }
-                DescriptionImport::Globale(g) => c.globales.push(g),
+                DescriptionImport::Globale(g) => c.globales.ajouter(g).map_err(|_| erreur(section(2), Genre::PlusDeMemoire))?,
             }
         }
         c.globales_importees = c.globales.len();
 
         for &t in &module.fonctions {
             c.type_fonction(t, section(3))?;
-            c.fonctions.push(t);
+            c.fonctions.ajouter(t).map_err(|_| erreur(section(3), Genre::PlusDeMemoire))?;
         }
-        c.declarees = vec![false; c.fonctions.len()];
+        c.declarees = faillible::remplie(c.fonctions.len(), false).map_err(|_| erreur(section(3), Genre::PlusDeMemoire))?;
         for t in &module.tables {
             verifier_table(*t, section(4))?;
-            c.tables.push(*t);
+            c.tables.ajouter(*t).map_err(|_| erreur(section(4), Genre::PlusDeMemoire))?;
         }
         for &limites in &module.memoires {
             verifier_limites(limites, true, section(5))?;
-            c.memoires.push(limites);
+            c.memoires.ajouter(limites).map_err(|_| erreur(section(5), Genre::PlusDeMemoire))?;
         }
         // Une seule mémoire en 2.0 : les instructions d'accès n'ont pas de
         // place pour un index de mémoire (proposition « multi-memory »).
@@ -302,7 +304,7 @@ impl<'m> Contexte<'m> {
 
         for g in &module.globales {
             c.constante(g.init, g.type_globale.valeur)?;
-            c.globales.push(g.type_globale);
+            c.globales.ajouter(g.type_globale).map_err(|_| erreur(section(6), Genre::PlusDeMemoire))?;
         }
 
         for segment in &module.elements {
@@ -361,7 +363,10 @@ impl<'m> Contexte<'m> {
         // que deux noms égaux se retrouvent côte à côte : n log n, au lieu
         // de comparer chaque nom à tous les autres.
         let mut noms: Vec<(&str, usize)> =
-            module.exports.iter().enumerate().map(|(i, e)| (e.nom.as_str(), i)).collect();
+            faillible::avec_capacite(module.exports.len()).map_err(|_| erreur(section(7), Genre::PlusDeMemoire))?;
+        for (i, e) in module.exports.iter().enumerate() {
+            noms.ajouter_dans_la_place((e.nom.as_str(), i));
+        }
         noms.sort_unstable();
         if let Some(paire) = noms.windows(2).find(|paire| paire[0].0 == paire[1].0) {
             return Err(erreur(section(7), Genre::ExportEnDouble(paire[1].1 as u32)));
@@ -587,9 +592,15 @@ impl<'c, 'm> Validateur<'c, 'm> {
         if type_fonction.parametres.len() as u64 + declarees > LOCALES_MAX as u64 {
             return Err(erreur(corps.code.debut as usize, Genre::LimiteDepassee(Limite::Locales)));
         }
-        let mut locales = type_fonction.parametres.to_vec();
+        // Au plus LOCALES_MAX en tout (vérifié juste avant) : toute la place
+        // d'un coup.
+        let manque = erreur(corps.code.debut as usize, Genre::PlusDeMemoire);
+        let mut locales = faillible::copie(&type_fonction.parametres).map_err(|_| manque.clone())?;
+        locales.try_reserve_exact(declarees as usize).map_err(|_| manque)?;
         for &(nombre, t) in corps.locales.iter() {
-            locales.extend(core::iter::repeat_n(t, nombre as usize));
+            for _ in 0..nombre {
+                locales.ajouter_dans_la_place(t);
+            }
         }
         let mut v = Validateur {
             contexte,
@@ -604,7 +615,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
         // Le corps de la fonction est un bloc implicite, qui doit laisser
         // les résultats de la fonction ; brancher vers lui équivaut à
         // `return`.
-        v.ouvrir(GenreCadre::Fonction, &[], &type_fonction.resultats);
+        v.ouvrir(GenreCadre::Fonction, &[], &type_fonction.resultats)?;
 
         let octets = jusqua(contexte.module, corps.code)?;
         let mut l = Lecteur::a_partir(octets, corps.code.debut as usize);
@@ -631,7 +642,8 @@ impl<'c, 'm> Validateur<'c, 'm> {
         if !l.fini() {
             return Err(erreur(l.position(), Genre::FinDeFonctionAttendue));
         }
-        Ok(CodeValide { branchements: v.table.into(), locales: declarees as u32, hauteur_max: v.hauteur_max as u32 })
+        let branchements = faillible::en_boite(v.table).map_err(|_| erreur(l.position(), Genre::PlusDeMemoire))?;
+        Ok(CodeValide { branchements, locales: declarees as u32, hauteur_max: v.hauteur_max as u32 })
     }
 
     fn erreur(&self, genre: Genre) -> Erreur {
@@ -644,12 +656,17 @@ impl<'c, 'm> Validateur<'c, 'm> {
         self.cadres.last().expect("pile des cadres vide")
     }
 
-    fn empiler(&mut self, t: Option<TypeValeur>) {
-        self.pile.push(t);
+    /// Empile un type ; ENOMEM (PlusDeMemoire) si le tas est plein.
+    fn empiler(&mut self, t: Option<TypeValeur>) -> Result<(), Erreur> {
+        self.pile.ajouter(t).map_err(|_| self.erreur(Genre::PlusDeMemoire))
     }
 
-    fn empiler_types(&mut self, types: &[TypeValeur]) {
-        self.pile.extend(types.iter().map(|&t| Some(t)));
+    fn empiler_types(&mut self, types: &[TypeValeur]) -> Result<(), Erreur> {
+        self.pile.try_reserve(types.len()).map_err(|_| self.erreur(Genre::PlusDeMemoire))?;
+        for &t in types {
+            self.pile.ajouter_dans_la_place(Some(t));
+        }
+        Ok(())
     }
 
     /// Dépile un type, quel qu'il soit (pop_val).
@@ -685,9 +702,9 @@ impl<'c, 'm> Validateur<'c, 'm> {
         Ok(())
     }
 
-    fn ouvrir(&mut self, genre: GenreCadre, entree: &'m [TypeValeur], sortie: &'m [TypeValeur]) {
+    fn ouvrir(&mut self, genre: GenreCadre, entree: &'m [TypeValeur], sortie: &'m [TypeValeur]) -> Result<(), Erreur> {
         let hauteur = self.pile.len();
-        self.cadres.push(Cadre {
+        let cadre = Cadre {
             genre,
             entree,
             sortie,
@@ -698,8 +715,9 @@ impl<'c, 'm> Validateur<'c, 'm> {
             debut_table: 0,
             attente: 0,
             saut_si: 0,
-        });
-        self.empiler_types(entree);
+        };
+        self.cadres.ajouter(cadre).map_err(|_| self.erreur(Genre::PlusDeMemoire))?;
+        self.empiler_types(entree)
     }
 
     /// Ferme le bloc courant : il doit laisser exactement ses types de
@@ -724,7 +742,9 @@ impl<'c, 'm> Validateur<'c, 'm> {
     /// Ajoute à la table annexe l'entrée d'un branchement vers l'étiquette du
     /// cadre `index`, pris avec la pile telle qu'elle est maintenant (la
     /// condition d'un `br_if`, l'index d'un `br_table` déjà dépilés).
-    fn branchement(&mut self, index: usize) {
+    fn branchement(&mut self, index: usize) -> Result<(), Erreur> {
+        // La place d'abord : rien ne change si elle manque.
+        self.table.try_reserve(1).map_err(|_| self.erreur(Genre::PlusDeMemoire))?;
         let numero = self.table.len();
         let cadre = &mut self.cadres[index];
         let gardees = cadre.etiquette().len();
@@ -741,14 +761,17 @@ impl<'c, 'm> Validateur<'c, 'm> {
             entree.cible = cadre.attente;
             cadre.attente = numero as u32 + 1;
         }
-        self.table.push(entree);
+        self.table.ajouter_dans_la_place(entree);
+        Ok(())
     }
 
     /// Ajoute l'entrée d'un `if` ou d'un `else`, qui ne déplace aucune
     /// valeur, et rend son index : sa cible sera complétée plus loin.
-    fn saut(&mut self) -> u32 {
-        self.table.push(Branchement { cible: 0, suite: 0, gardees: 0, retirees: 0 });
-        self.table.len() as u32 - 1
+    fn saut(&mut self) -> Result<u32, Erreur> {
+        self.table
+            .ajouter(Branchement { cible: 0, suite: 0, gardees: 0, retirees: 0 })
+            .map_err(|_| self.erreur(Genre::PlusDeMemoire))?;
+        Ok(self.table.len() as u32 - 1)
     }
 
     /// Ajoute l'entrée `numero` à la chaîne `attente` (voir `Cadre`), et
@@ -814,7 +837,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 let (entree, sortie) = self.types_bloc(type_bloc)?;
                 self.depiler_types(entree)?;
                 let genre = if matches!(instruction, Block(_)) { GenreCadre::Bloc } else { GenreCadre::Boucle };
-                self.ouvrir(genre, entree, sortie);
+                self.ouvrir(genre, entree, sortie)?;
                 if genre == GenreCadre::Boucle {
                     let debut_table = self.table.len() as u32;
                     let boucle = self.cadres.last_mut().expect("boucle ouverte");
@@ -829,8 +852,8 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 // Si la condition est fausse, on saute la branche « alors ».
                 // Les paramètres du bloc restent sur la pile, pour la
                 // branche « sinon » : rien à déplacer.
-                let saut_si = self.saut();
-                self.ouvrir(GenreCadre::Si, entree, sortie);
+                let saut_si = self.saut()?;
+                self.ouvrir(GenreCadre::Si, entree, sortie)?;
                 self.cadres.last_mut().expect("if ouvert").saut_si = saut_si;
             }
             Else => {
@@ -848,7 +871,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 // elle saute à la fin. La pile contient exactement les
                 // résultats (`fermer` vient de le vérifier) : rien à
                 // déplacer.
-                let saut_else = self.saut();
+                let saut_else = self.saut()?;
                 // Si la condition est fausse, la branche « sinon » commence
                 // juste après le `else` (l'entrée du `if` est seule dans sa
                 // chaîne).
@@ -856,7 +879,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 // Les branchements vers la fin du `if` mènent à la fin du
                 // `else` : c'est la même. Leur chaîne passe au `else`.
                 let attente = self.chainer(si.attente, saut_else);
-                self.ouvrir(GenreCadre::Sinon, si.entree, si.sortie);
+                self.ouvrir(GenreCadre::Sinon, si.entree, si.sortie)?;
                 self.cadres.last_mut().expect("else ouvert").attente = attente;
             }
             End => {
@@ -867,7 +890,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 if self.cadre().genre == GenreCadre::Si {
                     let si = self.fermer()?;
                     let attente = self.chainer(si.attente, si.saut_si);
-                    self.ouvrir(GenreCadre::Sinon, si.entree, si.sortie);
+                    self.ouvrir(GenreCadre::Sinon, si.entree, si.sortie)?;
                     self.cadres.last_mut().expect("else ouvert").attente = attente;
                 }
                 let cadre = self.fermer()?;
@@ -878,21 +901,21 @@ impl<'c, 'm> Validateur<'c, 'm> {
                     return Ok(true);
                 }
                 self.completer(cadre.attente, apres);
-                self.empiler_types(cadre.sortie);
+                self.empiler_types(cadre.sortie)?;
             }
             Br(profondeur) => {
                 let cible = self.etiquette(profondeur)?;
-                self.branchement(cible);
+                self.branchement(cible)?;
                 self.depiler_types(self.cadres[cible].etiquette())?;
                 self.inaccessible();
             }
             BrIf(profondeur) => {
                 let cible = self.etiquette(profondeur)?;
                 self.depiler_type(I32)?;
-                self.branchement(cible);
+                self.branchement(cible)?;
                 let types = self.cadres[cible].etiquette();
                 self.depiler_types(types)?;
-                self.empiler_types(types);
+                self.empiler_types(types)?;
             }
             BrTable { nombre, cibles } => {
                 self.depiler_type(I32)?;
@@ -913,7 +936,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
                     if types.len() != arite {
                         return Err(self.erreur(Genre::CiblesIncompatibles));
                     }
-                    self.branchement(cible);
+                    self.branchement(cible)?;
                     // Dépiler les types de la cible, puis rempiler ceux
                     // qu'on a TROUVÉS (push_vals(pop_vals(...))) : dans du
                     // code inaccessible, des inconnus restent des inconnus,
@@ -930,13 +953,14 @@ impl<'c, 'm> Validateur<'c, 'm> {
                     self.cadres[cible].verifiee_par = p;
                     trouves.clear();
                     for &t in types.iter().rev() {
-                        trouves.push(self.depiler_type(t)?);
+                        let trouve = self.depiler_type(t)?;
+                        trouves.ajouter(trouve).map_err(|_| self.erreur(Genre::PlusDeMemoire))?;
                     }
                     for &t in trouves.iter().rev() {
-                        self.empiler(t);
+                        self.empiler(t)?;
                     }
                 }
-                self.branchement(defaut);
+                self.branchement(defaut)?;
                 self.depiler_types(self.cadres[defaut].etiquette())?;
                 self.inaccessible();
             }
@@ -947,7 +971,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
             Call(x) => {
                 let t = c.fonction(x, p)?;
                 self.depiler_types(&t.parametres)?;
-                self.empiler_types(&t.resultats);
+                self.empiler_types(&t.resultats)?;
             }
             CallIndirect { type_fonction, table } => {
                 let table = c.table(table, p)?;
@@ -957,25 +981,25 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 let t = c.type_fonction(type_fonction, p)?;
                 self.depiler_type(I32)?;
                 self.depiler_types(&t.parametres)?;
-                self.empiler_types(&t.resultats);
+                self.empiler_types(&t.resultats)?;
             }
 
             // Références
-            RefNull(t) => self.empiler(Some(t)),
+            RefNull(t) => self.empiler(Some(t))?,
             RefIsNull => {
                 if let Some(t) = self.depiler()? {
                     if !t.est_reference() {
                         return Err(self.erreur(Genre::ReferenceRequise(t)));
                     }
                 }
-                self.empiler(Some(I32));
+                self.empiler(Some(I32))?;
             }
             RefFunc(x) => {
                 c.fonction(x, p)?;
                 if !c.declarees[x as usize] {
                     return Err(self.erreur(Genre::ReferenceNonDeclaree(x)));
                 }
-                self.empiler(Some(FuncRef));
+                self.empiler(Some(FuncRef))?;
             }
 
             // Paramétriques
@@ -1002,7 +1026,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
                         return Err(self.erreur(Genre::TypeInattendu { attendu: a, trouve: b }));
                     }
                 }
-                self.empiler(t1.or(t2));
+                self.empiler(t1.or(t2))?;
             }
             SelectT { nombre, premier } => {
                 // Une liste de types, pour une future extension où `select`
@@ -1014,13 +1038,13 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 self.depiler_type(I32)?;
                 self.depiler_type(t)?;
                 self.depiler_type(t)?;
-                self.empiler(Some(t));
+                self.empiler(Some(t))?;
             }
 
             // Variables
             LocalGet(x) => {
                 let t = self.locale(x)?;
-                self.empiler(Some(t));
+                self.empiler(Some(t))?;
             }
             LocalSet(x) => {
                 let t = self.locale(x)?;
@@ -1029,11 +1053,11 @@ impl<'c, 'm> Validateur<'c, 'm> {
             LocalTee(x) => {
                 let t = self.locale(x)?;
                 self.depiler_type(t)?;
-                self.empiler(Some(t));
+                self.empiler(Some(t))?;
             }
             GlobalGet(x) => {
                 let g = c.globale(x, p)?;
-                self.empiler(Some(g.valeur));
+                self.empiler(Some(g.valeur))?;
             }
             GlobalSet(x) => {
                 let g = c.globale(x, p)?;
@@ -1049,7 +1073,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
             TableGet(x) => {
                 let t = c.table(x, p)?;
                 self.depiler_type(I32)?;
-                self.empiler(Some(t.element));
+                self.empiler(Some(t.element))?;
             }
             TableSet(x) => {
                 let t = c.table(x, p)?;
@@ -1080,11 +1104,11 @@ impl<'c, 'm> Validateur<'c, 'm> {
                 let t = c.table(x, p)?;
                 self.depiler_type(I32)?;
                 self.depiler_type(t.element)?;
-                self.empiler(Some(I32));
+                self.empiler(Some(I32))?;
             }
             TableSize(x) => {
                 c.table(x, p)?;
-                self.empiler(Some(I32));
+                self.empiler(Some(I32))?;
             }
             TableFill(x) => {
                 // [début, valeur, nombre]
@@ -1110,17 +1134,17 @@ impl<'c, 'm> Validateur<'c, 'm> {
                     self.depiler_type(I32)?;
                 } else {
                     self.depiler_type(I32)?;
-                    self.empiler(Some(t));
+                    self.empiler(Some(t))?;
                 }
             }
             MemorySize => {
                 c.memoire(0, p)?;
-                self.empiler(Some(I32));
+                self.empiler(Some(I32))?;
             }
             MemoryGrow => {
                 c.memoire(0, p)?;
                 self.depiler_type(I32)?;
-                self.empiler(Some(I32));
+                self.empiler(Some(I32))?;
             }
             MemoryInit(x) => {
                 c.memoire(0, p)?;
@@ -1134,14 +1158,14 @@ impl<'c, 'm> Validateur<'c, 'm> {
             }
 
             // Constantes et opérations numériques
-            I32Const(_) => self.empiler(Some(I32)),
-            I64Const(_) => self.empiler(Some(I64)),
-            F32Const(_) => self.empiler(Some(F32)),
-            F64Const(_) => self.empiler(Some(F64)),
+            I32Const(_) => self.empiler(Some(I32))?,
+            I64Const(_) => self.empiler(Some(I64))?,
+            F32Const(_) => self.empiler(Some(F32))?,
+            F64Const(_) => self.empiler(Some(F64))?,
             Op(op) => {
                 let (entrees, sortie) = op.signature();
                 self.depiler_types(entrees)?;
-                self.empiler(Some(sortie));
+                self.empiler(Some(sortie))?;
             }
         }
         Ok(false)
@@ -1152,6 +1176,7 @@ impl<'c, 'm> Validateur<'c, 'm> {
 /// quelques recoins de l'algorithme. Les modules sont assemblés à la main.
 #[cfg(test)]
 mod tests {
+    use alloc::vec;
     use super::*;
     use crate::decoder;
 

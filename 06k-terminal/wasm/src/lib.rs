@@ -38,10 +38,13 @@ pub mod module;
 mod numerique;
 pub mod validateur;
 
-pub use decodeur::decoder;
+pub use decodeur::{decoder, decoder_possede};
 pub use erreur::Erreur;
 pub use instanciation::{ErreurInstanciation, Instanciation};
 pub use interpreteur::{Etat, Execution};
 pub use magasin::{Externe, Hote, Magasin, Piege, Valeur};
 pub use module::Module;
 pub use validateur::{ModuleValide, valider};
+/// Le module validé se partage dans l'Arc faillible (faillible::partage),
+/// pas dans celui de `alloc`, dont `new` panique quand le tas est plein.
+pub use faillible::partage::Arc;
