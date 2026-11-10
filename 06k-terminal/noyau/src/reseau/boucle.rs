@@ -40,6 +40,12 @@
 //! reçue et émise (son `dev_lstats_add` sert aux deux sens), sans son
 //! en-tête Ethernet (que `eth_type_trans` a déjà retiré) ; jetée, elle ne
 //! compte que dans « drop » de la réception (`enqueue_to_backlog`).
+//!
+//! La même file porte la copie d'une diffusion que la machine envoie par
+//! une carte (ipv4.rs) : Linux la rend aux sockets de la machine par le
+//! même chemin (`ip_mc_output`, `dev_loopback_xmit`, puis `netif_rx` : le
+//! `backlog`), livrée comme arrivée par la carte, sans compter ni pour la
+//! carte ni pour `lo`.
 
 use super::interface::{self, Compteurs, Interface, Materiel};
 use super::paquet::Paquet;
@@ -52,6 +58,13 @@ use inet::routes::Adresse;
 
 /// La borne de la file (`netdev_max_backlog`).
 const MAX: usize = 1000;
+
+/// Ce qu'attend la file : une trame émise par `lo` (avec son en-tête
+/// Ethernet), ou la copie d'un paquet IPv4 diffusé par la carte `copie_de`.
+pub struct Trame {
+    pub paquet: Paquet,
+    pub copie_de: Option<&'static Interface>,
+}
 /// La MTU de `lo` (celle de Linux depuis 3.7).
 pub const MTU: u32 = 65_536;
 /// Son adresse et son réseau.
@@ -85,27 +98,49 @@ pub fn emettre(i: &Interface, mut p: Paquet) {
     // Rien n'attend ici (`loopback_xmit` : `skb_orphan`).
     p.orpheliner();
     let longueur = p.longueur().saturating_sub(ethernet::ENTETE) as u64;
-    {
-        let mut file = tache::courante().file_lo.verrouiller();
-        // La file de la tâche, faite à sa première trame, avec la place de
-        // MAX trames : déposer n'alloue plus rien ensuite.
-        let f = file.get_or_insert_with(VecDeque::new);
-        if f.capacity() == 0 && f.try_reserve_exact(MAX).is_err() {
-            drop(file);
-            return Compteurs::compter(&i.compteurs.jetes_reception, 1);
-        }
-        if f.len() >= MAX {
-            drop(file);
-            return Compteurs::compter(&i.compteurs.jetes_reception, 1);
-        }
-        f.ajouter_derriere_dans_la_place(p);
+    if !deposer(Trame { paquet: p, copie_de: None }) {
+        return Compteurs::compter(&i.compteurs.jetes_reception, 1);
     }
     for (paquets, octets) in [(&i.compteurs.recus, &i.compteurs.octets_recus), (&i.compteurs.emis, &i.compteurs.octets_emis)] {
         Compteurs::compter(paquets, 1);
         Compteurs::compter(octets, longueur);
     }
-    // Dans le contexte réseau (une réception, un verrou court de TCP) :
-    // seulement déposée, livrée quand le contexte finit (contexte.rs).
+    livrer_bientot();
+}
+
+/// Rend aux sockets de la machine la copie `p` (un paquet IPv4 entier,
+/// son en-tête devant) d'une diffusion envoyée par la carte `i`
+/// (`dev_loopback_xmit`) : par la file, livrée comme arrivée par `i`.
+/// Jetée si la file est pleine, et comptée parmi les trames que la carte
+/// a jetées en réception (`netif_rx`, `enqueue_to_backlog` :
+/// `dev_core_stats_rx_dropped_inc` de la carte de la copie).
+pub fn rendre_la_diffusion(i: &'static Interface, mut p: Paquet) {
+    p.orpheliner();
+    if deposer(Trame { paquet: p, copie_de: Some(i) }) {
+        livrer_bientot();
+    } else {
+        super::interface::Compteurs::compter(&i.compteurs.jetes_reception, 1);
+    }
+}
+
+/// Dépose `t` dans la file de la tâche courante ; false : jetée (plus de
+/// mémoire pour la faire, ou pleine).
+fn deposer(t: Trame) -> bool {
+    let mut file = tache::courante().file_lo.verrouiller();
+    // La file de la tâche, faite à sa première trame, avec la place de
+    // MAX trames : déposer n'alloue plus rien ensuite.
+    let f = file.get_or_insert_with(VecDeque::new);
+    if (f.capacity() == 0 && f.try_reserve_exact(MAX).is_err()) || f.len() >= MAX {
+        return false;
+    }
+    f.ajouter_derriere_dans_la_place(t);
+    true
+}
+
+/// Dans le contexte réseau (une réception, un verrou court de TCP) :
+/// seulement déposée, livrée quand le contexte finit (contexte.rs) ;
+/// sinon, tout de suite.
+fn livrer_bientot() {
     if !super::contexte::actif() {
         vider_en_attente();
     }
@@ -125,7 +160,7 @@ pub fn preparer_la_file() {
 }
 
 /// La prochaine trame de la file de la tâche courante, s'il y en a une.
-fn prochaine() -> Option<Paquet> {
+fn prochaine() -> Option<Trame> {
     tache::courante().file_lo.verrouiller().as_mut().and_then(VecDeque::pop_front)
 }
 
@@ -138,8 +173,11 @@ pub fn vider_en_attente() {
     let Some(lo) = interface() else { return };
     super::contexte::pendant(|| {
         // Prise sous le verrou, reçue sans lui.
-        while let Some(p) = prochaine() {
-            super::recevoir(lo, p);
+        while let Some(t) = prochaine() {
+            match t.copie_de {
+                None => super::recevoir(lo, t.paquet),
+                Some(i) => super::ipv4::recevoir_la_diffusion(i, t.paquet),
+            }
         }
     });
 }

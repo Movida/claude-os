@@ -35,9 +35,12 @@
 //! l'en-tête, puis l'interface : `lo` pour une de nos adresses (Linux
 //! aussi : la route locale passe par `lo`), la diffusion d'Ethernet pour
 //! une diffusion, le voisin (ARP) pour le reste. Un paquet plus grand que la MTU
-//! part en fragments, sauf DF (`ip_do_fragment`). Une diffusion envoyée n'est pas rendue aussi aux sockets de la
-//! machine (Linux en fait toujours une copie par la boucle, `ip_mc_output` ;
-//! IP_MULTICAST_LOOP ne règle que la multidiffusion) : un écart écrit.
+//! part en fragments, sauf DF (`ip_do_fragment`). Une diffusion envoyée par une
+//! carte est aussi rendue aux sockets de la machine, comme chez Linux, qui en fait
+//! toujours une copie par la boucle (`ip_mc_output` ; IP_MULTICAST_LOOP ne règle que
+//! la multidiffusion) : le paquet entier, avant tout découpage, livré comme arrivé
+//! par la carte (boucle.rs, `rendre_la_diffusion`). Par `lo`, la diffusion de `lo`
+//! (127.255.255.255) n'arrive qu'une fois, comme chez Linux (mesuré).
 
 use super::interface::{self, Interface};
 use super::paquet::Paquet;
@@ -213,6 +216,22 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
     if !pour_nous {
         return compter(&PAS_POUR_NOUS);
     }
+    livrer(i, h, p, diffusion, trame_diffusee);
+}
+
+/// La copie `p` d'une diffusion que nous avons envoyée par la carte `i`
+/// (boucle.rs, `rendre_la_diffusion`) : livrée comme arrivée par `i`, sans le
+/// tri de l'entrée (Linux garde la route de la sortie, `skb_dst` : la source,
+/// qui est à nous, n'est pas un martien) ni d'options (nous n'en écrivons
+/// pas).
+pub fn recevoir_la_diffusion(i: &'static Interface, p: Paquet) {
+    let Ok((h, _)) = ipv4::lire(p.donnees()) else { return };
+    livrer(i, h, p, true, false);
+}
+
+/// Livre aux protocoles le paquet `p` pour nous (son en-tête : `h`) arrivé par
+/// `i` (`ip_local_deliver`) ; `diffusion` : sa destination est une diffusion.
+fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, diffusion: bool, trame_diffusee: bool) {
     // Un morceau : ce qui suit ne voit que des paquets entiers (`ip_local_deliver`).
     let (h, mut p) = if h.est_un_fragment() {
         match recoller(i, &h, p) {
@@ -436,6 +455,12 @@ pub fn identifiant(destination: [u8; 4], source: [u8; 4], protocole: u8) -> u16 
 /// `dev_queue_xmit` de Linux). Rien ne revient : un paquet perdu en route
 /// (file pleine, voisin muet) l'est sans le dire, comme sur un câble.
 pub fn emettre(c: Chemin, e: &Envoi, p: Paquet) {
+    if let Chemin::Diffusion { interface, .. } = c
+        && let Some(i) = interface::par_index(interface)
+        && !i.boucle()
+    {
+        rendre_une_copie(i, e, &p);
+    }
     if p.longueur() + ipv4::ENTETE > e.mtu as usize {
         return fragmenter(c, e, p);
     }
@@ -466,6 +491,21 @@ fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
         envoyer(c, e, q, (debut / 8) as u16, n < reste);
         debut += n;
     }
+}
+
+/// La copie du paquet diffusé `p` (sa charge), pour les sockets de la machine
+/// (`ip_mc_output`) : le paquet entier, son en-tête devant (même plus grand que
+/// la MTU : Linux copie avant `ip_fragment`). Sans mémoire, pas de copie (le
+/// `skb_clone` qui échoue).
+fn rendre_une_copie(i: &'static Interface, e: &Envoi, p: &Paquet) {
+    let total = p.longueur() + ipv4::ENTETE;
+    let Some(mut q) = Paquet::vide(total) else { return };
+    let Some(o) = q.ajouter_fin(total) else { return };
+    let (entete, charge) = o.split_at_mut(ipv4::ENTETE);
+    let Ok(entete) = <&mut [u8; ipv4::ENTETE]>::try_from(entete) else { return };
+    ipv4::ecrire(entete, &en_tete(e, total as u16, 0, false));
+    charge.copy_from_slice(p.donnees());
+    super::boucle::rendre_la_diffusion(i, q);
 }
 
 /// L'en-tête d'un paquet ou d'un morceau de l'envoi `e`.

@@ -335,8 +335,9 @@ pub struct Tache {
     pub instances_a_signaler: Verrou<Option<Arc<crate::surveillance::Groupe>>>,
     /// Les trames qu'elle a émises par `lo` et pas encore reçues (6j,
     /// reseau/boucle.rs : une file par tâche émettrice, le `backlog` par
-    /// processeur de Linux) ; faite à sa première émission.
-    pub file_lo: Verrou<Option<alloc::collections::VecDeque<crate::reseau::paquet::Paquet>>>,
+    /// processeur de Linux), et les copies des diffusions qu'elle a
+    /// envoyées par une carte ; faite à sa première émission.
+    pub file_lo: Verrou<Option<alloc::collections::VecDeque<crate::reseau::boucle::Trame>>>,
 }
 
 /// Ce qu'un programme a de plus qu'une tâche du noyau.

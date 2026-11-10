@@ -33,7 +33,11 @@
  *     d'erreurs (MSG_ERRQUEUE, sock_extended_err, IP_PKTINFO d'une erreur,
  *     l'erreur locale d'EMSGSIZE), les sockets de ping (l'écho de
  *     127.0.0.1, l'identifiant remplacé, les refus, MSG_OOB), SOCK_RAW
- *     (EPERM ; EPROTONOSUPPORT pour le protocole 0).
+ *     (EPERM ; EPROTONOSUPPORT pour le protocole 0) ;
+ *   - une seule chose sort de lo : une diffusion envoyée par la carte (son
+ *     réseau lu dans /proc/net/route) revient une fois, entière, aux sockets
+ *     de la machine, comme arrivée par la carte (les soldes d'avant 6k ;
+ *     sautée sur une machine sans carte).
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic du noyau : HZ = 250 sous WSL, 1000 sous le Linux de référence).
  */
@@ -1032,6 +1036,80 @@ static void decalage_de_peek(void)
     }
 }
 
+/* Le datagramme reçu par `r` dans la seconde : sa taille (-1 : rien), qui l'a
+ * envoyé, et son IP_PKTINFO. */
+static ssize_t recu_avec_pktinfo(int r, struct sockaddr_in *de, struct in_pktinfo *pi, int ms)
+{
+    struct pollfd f = { .fd = r, .events = POLLIN };
+    if (poll(&f, 1, ms) != 1)
+        return -1;
+    static char o[4096];
+    char c[CMSG_SPACE(sizeof(struct in_pktinfo))];
+    struct iovec v = { o, sizeof o };
+    struct msghdr m = { .msg_name = de, .msg_namelen = sizeof *de, .msg_iov = &v, .msg_iovlen = 1, .msg_control = c, .msg_controllen = sizeof c };
+    ssize_t n = recvmsg(r, &m, MSG_DONTWAIT);
+    memset(pi, 0, sizeof *pi);
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h))
+        if (h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_PKTINFO)
+            memcpy(pi, CMSG_DATA(h), sizeof *pi);
+    return n;
+}
+
+/* Une diffusion envoyée par la carte revient aux sockets de la machine
+ * (`ip_mc_output` : une copie par la boucle, avant tout découpage) : une
+ * fois, entière (2000 octets, plus que la MTU), de notre adresse, comme
+ * arrivée par la carte (IP_PKTINFO : son interface, pas lo ; la diffusion
+ * pour destination ; notre adresse pour répondre) ; de même pour
+ * 255.255.255.255. Le réseau de la carte : la première route sans
+ * passerelle de /proc/net/route qui ne soit pas lo. */
+static void diffusion_de_la_carte(void)
+{
+    FILE *f = fopen("/proc/net/route", "r");
+    char ligne[256], nom[32];
+    unsigned destination, passerelle, masque, d = 0, m = 0;
+    while (f && fgets(ligne, sizeof ligne, f))
+        if (sscanf(ligne, "%31s %x %x %*x %*d %*d %*d %x", nom, &destination, &passerelle, &masque) == 4 && strcmp(nom, "lo")
+            && passerelle == 0 && masque != 0 && masque != 0xffffffff) {
+            d = destination | ~masque;
+            m = masque;
+            break;
+        }
+    if (f)
+        fclose(f);
+    if (!m) {
+        verifier(1, "pas de carte : la diffusion de la carte, sautee");
+        return;
+    }
+    int un = 1;
+    for (int k = 0; k < 2; k++) {
+        uint32_t vers = k == 0 ? d : htonl(0xffffffff);
+        int r = udp(0), s = udp(0), c = udp(0);
+        struct sockaddr_in a = adresse(0, 0), moi, de;
+        socklen_t l = sizeof a;
+        bind(r, (struct sockaddr *)&a, sizeof a);
+        getsockname(r, (struct sockaddr *)&a, &l);
+        setsockopt(r, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+        setsockopt(s, SOL_SOCKET, SO_BROADCAST, &un, sizeof un);
+        setsockopt(c, SOL_SOCKET, SO_BROADCAST, &un, sizeof un);
+        a.sin_addr.s_addr = vers;
+        /* Notre adresse : celle que prend une socket connectée à la diffusion. */
+        l = sizeof moi;
+        int pret = connect(c, (struct sockaddr *)&a, sizeof a) == 0 && getsockname(c, (struct sockaddr *)&moi, &l) == 0;
+        static char gros[2000];
+        pret = pret && sendto(s, gros, sizeof gros, 0, (struct sockaddr *)&a, sizeof a) == (ssize_t)sizeof gros;
+        struct in_pktinfo pi;
+        ssize_t n = recu_avec_pktinfo(r, &de, &pi, 1000);
+        int ok = pret && n == (ssize_t)sizeof gros && de.sin_addr.s_addr == moi.sin_addr.s_addr && pi.ipi_ifindex > 1
+                 && pi.ipi_addr.s_addr == vers && pi.ipi_spec_dst.s_addr == moi.sin_addr.s_addr;
+        ok = ok && recu_avec_pktinfo(r, &de, &pi, 200) == -1;
+        verifier(ok, k == 0 ? "la diffusion de la carte revient une fois, entiere, comme arrivee par la carte"
+                            : "255.255.255.255 revient une fois, entiere, comme arrivee par la carte");
+        close(r);
+        close(s);
+        close(c);
+    }
+}
+
 int main(void)
 {
     creation();
@@ -1046,6 +1124,7 @@ int main(void)
     routes_et_messages();
     icmp();
     decalage_de_peek();
+    diffusion_de_la_carte();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }
