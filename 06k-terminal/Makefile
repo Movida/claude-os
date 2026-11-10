@@ -51,8 +51,9 @@
 # exécute des binaires Linux et garde l'interpréteur WebAssembly de
 # l'étape 4 (wasm/) ; il est lancé par notre chargeur (boot.asm), qui le
 # lit par morceaux, en mode irréel.
-#   make        -> vérifie les règles du noyau (cargo clippy : aucune
-#                  allocation qui panique, noyau/clippy.toml), compile le
+#   make        -> vérifie les règles du noyau et de ses bibliothèques
+#                  (cargo clippy : aucune allocation qui panique,
+#                  clippy.toml), compile le
 #                  noyau et les programmes, fabrique l'archive, assemble
 #                  le chargeur, colle les trois dans boot.bin
 #   make run    -> démarre dans QEMU avec une fenêtre (port série dans le terminal)
@@ -217,6 +218,7 @@ endef
 # (les fonctionnalités des noyaux de test comprises) ; une règle enfreinte
 # est une erreur, et arrête make.
 boot.bin: programmes.cpio FORCE
+	cd faillible && cargo clippy --release --target x86_64-unknown-none
 	cd noyau && cargo clippy --release --all-features
 	cd noyau && cargo build --release
 	$(call image,$(NOYAU_ELF),programmes.cpio,boot)
@@ -1631,5 +1633,6 @@ clean:
 	cd inet && cargo clean
 	cd crypto && cargo clean
 	cd roue && cargo clean
+	cd faillible && cargo clean
 
 .PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace verrous verrous-claude-p tests-hote tests-hote-root tests-qemu claude-p jeton claude-bonjour suite clean FORCE

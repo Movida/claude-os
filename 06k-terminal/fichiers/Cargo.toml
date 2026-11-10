@@ -11,3 +11,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+# Les allocations qui peuvent échouer (les soldes d'avant 6k).
+faillible = { path = "../faillible" }

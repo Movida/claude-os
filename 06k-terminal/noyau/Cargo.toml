@@ -28,6 +28,9 @@ crypto = { path = "../crypto" }
 # La roue des minuteurs de Linux (6h), notre propre bibliothèque, sans
 # unsafe, testée sur l'hôte contre un modèle naïf.
 roue = { path = "../roue" }
+# Les allocations qui peuvent échouer (les soldes d'avant 6k), partagées
+# avec les bibliothèques.
+faillible = { path = "../faillible" }
 
 # Les scénarios de `make tests-qemu` : des versions du noyau qui
 # provoquent exprès une situation à tester (voir src/main.rs).

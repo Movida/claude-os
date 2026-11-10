@@ -1,0 +1,8 @@
+# Même version de Rust que le noyau (../noyau) : la bibliothèque est
+# compilée dans le noyau et dans ses bibliothèques. clippy y vérifie les
+# mêmes règles (../clippy.toml), d'où le composant.
+[toolchain]
+channel = "1.99.1"
+profile = "minimal"
+components = ["clippy"]
+targets = ["x86_64-unknown-none"]

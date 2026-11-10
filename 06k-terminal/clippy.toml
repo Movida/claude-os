@@ -1,12 +1,15 @@
-# Les règles du noyau que `cargo clippy` fait respecter (make, la CI ;
-# les niveaux sont dans Cargo.toml, [lints]).
+# Les règles du noyau et de ses bibliothèques que `cargo clippy` fait
+# respecter (make, la CI ; les niveaux sont dans le Cargo.toml de chacun,
+# [lints]). Ici, à la racine de l'étape : clippy le cherche du dossier de
+# chaque bibliothèque vers ses parents (jusqu'aux soldes d'avant 6k, il était
+# dans noyau/, pour le noyau seul).
 #
 # Les allocations qui paniquent quand le tas est plein : interdites dans le
-# noyau, qui passe par leurs équivalents faillibles (src/faillible.rs, et
-# notre Arc, src/partage.rs). Chaque raison dit quoi prendre à la place.
-# Seuls src/faillible.rs (qui les appelle une fois la place réservée) et le
-# test du tas au démarrage (main.rs, tester_tas) ont le droit de les
-# appeler, par un #[allow] justifié.
+# noyau et ses bibliothèques, qui passent par leurs équivalents faillibles
+# (la bibliothèque faillible/, et notre Arc, noyau/src/partage.rs). Chaque
+# raison dit quoi prendre à la place. Seuls faillible/ (qui les appelle une
+# fois la place réservée) et le test du tas au démarrage (main.rs,
+# tester_tas) ont le droit de les appeler, par un #[allow] justifié.
 #
 # Ce que clippy ne voit pas, faute de pouvoir les distinguer : `clone()`
 # d'un Vec (le même nom que celui d'Arc, qui n'alloue pas), les

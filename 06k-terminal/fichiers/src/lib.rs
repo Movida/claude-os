@@ -149,6 +149,13 @@ pub enum Erreur {
     EOPNOTSUPP,
 }
 
+/// Une allocation qui échoue : ENOMEM, avec `?` (faillible/).
+impl From<faillible::PlusDeMemoire> for Erreur {
+    fn from(_: faillible::PlusDeMemoire) -> Self {
+        Erreur::ENOMEM
+    }
+}
+
 impl Erreur {
     /// Le numéro de l'erreur pour Linux.
     pub fn errno(self) -> i64 {

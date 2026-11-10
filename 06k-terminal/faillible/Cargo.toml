@@ -1,0 +1,15 @@
+# Les allocations qui peuvent échouer (les soldes d'avant 6k) : le module
+# faillible du noyau, devenu une bibliothèque, pour qu'inet, fichiers,
+# formats, zones et wasm s'en servent aussi. Sans dépendance : `alloc` seul.
+[package]
+name = "faillible"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+disallowed_methods = "deny"
+disallowed_macros = "deny"
+undocumented_unsafe_blocks = "deny"

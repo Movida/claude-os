@@ -7,8 +7,15 @@ name = "crypto"
 version = "0.1.0"
 
 [[package]]
+name = "faillible"
+version = "0.1.0"
+
+[[package]]
 name = "fichiers"
 version = "0.1.0"
+dependencies = [
+ "faillible",
+]
 
 [[package]]
 name = "formats"
@@ -26,6 +33,7 @@ name = "noyau"
 version = "0.1.0"
 dependencies = [
  "crypto",
+ "faillible",
  "fichiers",
  "formats",
  "inet",
