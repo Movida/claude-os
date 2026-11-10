@@ -41,6 +41,7 @@
 
 use super::{ACK_POUSSE, ACK_POUSSE2, Charge, ECHELLE_MAX, FENETRE_MAX, MSS_DEFAUT, MSS_MIN, Memoire, TS_ALIGNE, Tcb, Tcp, apres};
 use formats::reseau::tcp;
+use faillible::{FileFaillible, VecFaillible};
 
 /// Le rapport de départ (TCP_DEFAULT_SCALING_RATIO), sur 256 (TCP_RMEM_TO_WIN_SCALE).
 pub(super) const RATIO_DEFAUT: u8 = 128;
@@ -490,7 +491,7 @@ impl<P: Charge> Tcb<P> {
                 (i, decalage) = (j, d);
                 break;
             }
-            neuves.push(neuve);
+            neuves.ajouter_dans_la_place(neuve);
             reste -= n;
         }
         if neuves.is_empty() || self.reception.try_reserve(neuves.len()).is_err() {
@@ -506,7 +507,7 @@ impl<P: Charge> Tcb<P> {
         }
         for (k, p) in neuves.into_iter().enumerate() {
             self.taille_vraie_reception += p.taille_vraie();
-            self.reception.insert(premier + k, p);
+            self.reception.inserer_dans_la_place(premier + k, p);
         }
     }
 

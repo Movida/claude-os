@@ -18,6 +18,7 @@
 use super::{Charge, apres, avant};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use faillible::{FileFaillible, VecFaillible};
 
 pub struct HorsOrdre<P> {
     /// (numéro du premier octet, charge), triées, sans recouvrement.
@@ -115,7 +116,7 @@ impl<P: Charge> HorsOrdre<P> {
         }
         self.taille_vraie += charge.taille_vraie();
         // La place est prise plus haut.
-        self.file.insert(i, (seq, charge));
+        self.file.inserer_dans_la_place(i, (seq, charge));
         Ok(doublon)
     }
 
@@ -230,7 +231,7 @@ impl<P: Charge> HorsOrdre<P> {
                     decalage = 0;
                 }
             }
-            neuves.push((seq, neuve));
+            neuves.ajouter_dans_la_place((seq, neuve));
             seq = seq.wrapping_add(n as u32);
             reste -= n;
         }
@@ -239,7 +240,7 @@ impl<P: Charge> HorsOrdre<P> {
         }
         for (n, e) in neuves.into_iter().enumerate() {
             self.taille_vraie += e.1.taille_vraie();
-            self.file.insert(premier + n, e);
+            self.file.inserer_dans_la_place(premier + n, e);
         }
     }
 

@@ -16,3 +16,11 @@ edition = "2024"
 
 [dependencies]
 formats = { path = "../formats" }
+# Les allocations qui peuvent échouer (les soldes d'avant 6k).
+faillible = { path = "../faillible" }
+
+# Les règles du noyau (../clippy.toml) : aucune allocation qui panique.
+[lints.clippy]
+all = { level = "allow", priority = -1 }
+disallowed_methods = "deny"
+disallowed_macros = "deny"

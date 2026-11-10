@@ -182,6 +182,9 @@ pub trait VecFaillible<T> {
     /// qui rend la valeur.)
     #[track_caller]
     fn ajouter_dans_la_place(&mut self, valeur: T);
+    /// `insert` dans la place déjà réservée, comme `ajouter_dans_la_place`.
+    #[track_caller]
+    fn inserer_dans_la_place(&mut self, indice: usize, valeur: T);
 }
 
 // Les méthodes de Vec appelées ici ne peuvent plus allouer : la place est
@@ -241,6 +244,11 @@ impl<T> VecFaillible<T> for Vec<T> {
     fn ajouter_dans_la_place(&mut self, valeur: T) {
         assert!(self.len() < self.capacity(), "Vec sans la place reservee");
         self.push(valeur);
+    }
+
+    fn inserer_dans_la_place(&mut self, indice: usize, valeur: T) {
+        assert!(self.len() < self.capacity(), "inserer_dans_la_place : pas de place reservee");
+        self.insert(indice, valeur);
     }
 }
 

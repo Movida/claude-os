@@ -86,6 +86,7 @@
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use formats::reseau::tcp::{self, Tcp};
+use faillible::{FileFaillible, VecFaillible};
 
 pub mod attente;
 mod carte;
@@ -1650,18 +1651,16 @@ impl<P: Charge> Tcb<P> {
                 if b.try_reserve_exact((n - fait).min(BLOC)).is_err() {
                     break;
                 }
-                if self.envoi.try_reserve(1).is_err() {
+                if self.envoi.ajouter_derriere(b).is_err() {
                     break;
                 }
-                self.envoi.push_back(b);
             }
             let b = self.envoi.back_mut().expect("un bloc");
             let m = (BLOC - b.len()).min(n - fait);
-            if b.try_reserve(m).is_err() {
+            let debut = b.len();
+            if b.redimensionner(debut + m, 0).is_err() {
                 break;
             }
-            let debut = b.len();
-            b.resize(debut + m, 0);
             if let Err(e) = remplir(&mut b[debut..]) {
                 b.truncate(debut);
                 if b.is_empty() {
@@ -2897,7 +2896,7 @@ impl<P: Charge> Tcb<P> {
         self.octets_reception += n;
         self.rcv_nxt = self.rcv_nxt.wrapping_add(n as u32);
         self.mesures.octets_recus += n as u64;
-        self.reception.push_back(charge);
+        self.reception.ajouter_derriere_dans_la_place(charge);
         true
     }
 
@@ -3512,7 +3511,7 @@ impl<P: Charge> Tcb<P> {
         // Une sonde de fin de rafale armée laisse la place au RTO (`tcp_event_new_data_sent`).
         let rearmer = self.file.is_empty() || (self.t_xmit.is_some() && self.t_sorte == Minuteur::SondeDePerte);
         let tx = self.debit_parti(maintenant);
-        self.file.push_back(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, tx, numero));
+        self.file.ajouter_derriere_dans_la_place(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, tx, numero));
         self.tri_ajouter(self.snd_nxt, maintenant);
         self.snd_nxt = fin_segment;
         if rearmer {

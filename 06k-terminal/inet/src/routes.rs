@@ -22,6 +22,7 @@
 
 use alloc::vec::Vec;
 use formats::reseau::ipv4;
+use faillible::VecFaillible;
 
 /// Une adresse d'interface : l'interface, l'adresse, la longueur du préfixe
 /// de son réseau (le `in_ifaddr` de Linux).
@@ -122,7 +123,7 @@ impl Table {
                 self.ajouter_route(r)?;
             }
         }
-        self.adresses.push(a);
+        self.adresses.ajouter_dans_la_place(a);
         Ok(())
     }
 
@@ -134,7 +135,7 @@ impl Table {
         if self.routes.len() >= self.max {
             return Err(Refus::Plein);
         }
-        self.routes.push(r);
+        self.routes.ajouter_dans_la_place(r);
         Ok(())
     }
 
@@ -209,7 +210,9 @@ impl Table {
     pub fn principales(&self) -> impl Iterator<Item = Route> + '_ {
         let mut ordre: [usize; MAX] = core::array::from_fn(|i| i);
         let n = self.routes.len();
-        ordre[..n].sort_by_key(|&i| (u32::from_be_bytes(self.routes[i].reseau), u8::MAX - self.routes[i].prefixe));
+        // Sans tampon (`sort_unstable`), et l'indice en dernier pour garder
+        // l'ordre d'ajout de deux routes de même clé, comme un tri stable.
+        ordre[..n].sort_unstable_by_key(|&i| (u32::from_be_bytes(self.routes[i].reseau), u8::MAX - self.routes[i].prefixe, i));
         (0..n).map(move |k| self.routes[ordre[k]])
     }
 }

@@ -12,6 +12,7 @@
 //! modèle naïf.
 
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// Plus de place : la liste est pleine (elle a sa taille définitive).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -44,7 +45,8 @@ impl Echeances {
             self.entrees.remove(i);
         }
         let i = self.entrees.partition_point(|&(e, _)| e <= echeance);
-        self.entrees.insert(i, (echeance, objet));
+        // La place de `max` entrées est prise à la création (`new`).
+        self.entrees.inserer_dans_la_place(i, (echeance, objet));
         Ok(())
     }
 

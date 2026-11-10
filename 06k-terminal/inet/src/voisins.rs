@@ -45,6 +45,7 @@
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
+use faillible::{FileFaillible, VecFaillible};
 
 const SECONDE: u64 = 1_000_000_000;
 /// Les réglages de Linux pour ARP.
@@ -165,7 +166,7 @@ impl<T> Table<T> {
             mis_a_jour: maintenant, attente: VecDeque::new(), octets: 0,
         };
         if self.voisins.len() < MAX {
-            self.voisins.push(v);
+            self.voisins.ajouter_dans_la_place(v);
             return Some(self.voisins.len() - 1);
         }
         let i = self.voisins.iter().enumerate().filter(|(_, v)| v.attente.is_empty()).min_by_key(|(_, v)| v.utilise).map(|(i, _)| i)?;
@@ -240,7 +241,7 @@ impl<T> Table<T> {
         if v.attente.try_reserve(1).is_err() {
             return faire(Action::Jeter { paquet, echec: false });
         }
-        v.attente.push_back((paquet, taille));
+        v.attente.ajouter_derriere_dans_la_place((paquet, taille));
         v.octets += taille;
     }
 

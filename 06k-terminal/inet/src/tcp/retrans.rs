@@ -37,6 +37,7 @@ use super::rtt::RTO_MAX;
 use super::sack::{JIFFY, MIN_RTT_FENETRE, en_jiffies};
 use super::{Charge, Effets, Etat, Sortant, Tcb, apres, avant, reculer};
 use formats::reseau::tcp;
+use faillible::FileFaillible;
 
 // Les drapeaux d'un ACK (les FLAG_ de net/ipv4/tcp_input.c).
 pub(super) const FLAG_DATA: u32 = 0x01;
@@ -911,12 +912,12 @@ impl<P: Charge> Tcb<P> {
         if e.marques & PERDU != 0 {
             self.lost_out += 1;
         }
-        self.file.insert(i + 1, suite);
+        self.file.inserer_dans_la_place(i + 1, suite);
         // Sa place dans l'ordre d'envoi : juste après l'autre moitié.
         if let Some(k) = self.tri.iter().position(|&x| x == (e.seq, e.envoi))
             && self.tri.try_reserve(1).is_ok()
         {
-            self.tri.insert(k + 1, (suite.seq, suite.envoi));
+            self.tri.inserer_dans_la_place(k + 1, (suite.seq, suite.envoi));
         }
         true
     }

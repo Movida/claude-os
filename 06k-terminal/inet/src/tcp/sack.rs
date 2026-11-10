@@ -34,6 +34,7 @@ use super::retrans::{DEJA_RENVOYE, EN_RENVOI, EtatSack, FLAG_DATA_SACKED, FLAG_D
 use super::rtt::{RTO_INITIAL, RTO_MIN};
 use super::{Charge, Sortant, Tcb, Tcp, apres, avant};
 use formats::reseau::tcp::BLOCS_MAX;
+use faillible::FileFaillible;
 
 /// Les blocs qu'un segment attend de trouver sans ACK à part (TCP_SACK_BLOCKS_EXPECTED).
 const BLOCS_ATTENDUS: usize = 2;
@@ -629,9 +630,7 @@ impl<P: Charge> Tcb<P> {
                 file.get(i).is_some_and(|e| e.seq == s && e.envoi == t)
             });
         }
-        if self.tri.try_reserve(1).is_ok() {
-            self.tri.push_back((seq, envoi));
-        }
+        let _ = self.tri.ajouter_derriere((seq, envoi));
     }
 }
 

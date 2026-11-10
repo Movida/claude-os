@@ -24,6 +24,7 @@
 //! socket et un objet `T` (la socket du noyau).
 
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// La taille de la table.
 pub const MAX: usize = 1024;
@@ -89,7 +90,7 @@ impl<T: Clone> Table<T> {
             }
             ident
         };
-        self.entrees.push(Entree { numero, ident, adresse, reutilise, objet });
+        self.entrees.ajouter_dans_la_place(Entree { numero, ident, adresse, reutilise, objet });
         Ok(ident)
     }
 

@@ -31,6 +31,7 @@
 //! qui recopie le paquet complet).
 
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// Le temps qu'une file peut attendre (`IP_FRAG_TIME`, 30 s).
 pub const DELAI: u64 = 30_000_000_000;
@@ -186,7 +187,7 @@ impl<M: Morceau> Reassemblage<M> {
                 if self.files.len() == self.files.capacity() {
                     return Issue::Jete;
                 }
-                self.files.push(File::new(cle, maintenant));
+                self.files.ajouter_dans_la_place(File::new(cle, maintenant));
                 self.files.len() - 1
             }
         };
@@ -231,7 +232,7 @@ impl<M: Morceau> Reassemblage<M> {
                     return Issue::Jete;
                 }
                 let v = charge.taille_vraie();
-                f.morceaux.insert(place, (decalage, charge));
+                f.morceaux.inserer_dans_la_place(place, (decalage, charge));
                 f.vraie += v;
                 self.memoire += v;
             }
@@ -264,7 +265,9 @@ impl<M: Morceau> Reassemblage<M> {
             if morceaux.try_reserve_exact(f.morceaux.len()).is_err() {
                 return Issue::Jete;
             }
-            morceaux.extend(f.morceaux.into_iter().map(|(_, m)| m));
+            for (_, m) in f.morceaux {
+                morceaux.ajouter_dans_la_place(m);
+            }
             return Issue::Complet { morceaux, longueur, entete, ecn };
         }
         Issue::EnCours
@@ -294,14 +297,14 @@ fn inserer<M: Morceau>(f: &mut File<M>, debut: u32, fin: u32) -> Insertion {
     }
     let bout = f.morceaux.last().map(|(d, m)| *d + m.octets().len() as u32);
     match bout {
-        None => f.suites.push(Suite { debut, fin }),
+        None => f.suites.ajouter_dans_la_place(Suite { debut, fin }),
         Some(b) if b < fin => {
             if debut < b {
                 return Insertion::Chevauchement;
             }
             match f.suites.last_mut() {
                 Some(s) if debut == b => s.fin = fin,
-                _ => f.suites.push(Suite { debut, fin }),
+                _ => f.suites.ajouter_dans_la_place(Suite { debut, fin }),
             }
             return Insertion::Ok(f.morceaux.len());
         }
@@ -317,7 +320,7 @@ fn inserer<M: Morceau>(f: &mut File<M>, debut: u32, fin: u32) -> Insertion {
                 }
                 return if debut >= s.debut && fin <= s.fin { Insertion::Double } else { Insertion::Chevauchement };
             }
-            f.suites.insert(place, Suite { debut, fin });
+            f.suites.inserer_dans_la_place(place, Suite { debut, fin });
             return Insertion::Ok(f.morceaux.partition_point(|(d, _)| *d < debut));
         }
     }

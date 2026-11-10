@@ -30,6 +30,7 @@
 //! (la socket du noyau).
 
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// La taille de la table.
 pub const MAX: usize = 1024;
@@ -112,7 +113,7 @@ impl<T: Clone> Table<T> {
         } else {
             self.ephemere(numero, &lien, hasard).ok_or(Refus::Pris)?
         };
-        self.entrees.push(Entree { numero, lien: Lien { port, ..lien }, objet });
+        self.entrees.ajouter_dans_la_place(Entree { numero, lien: Lien { port, ..lien }, objet });
         Ok(port)
     }
 

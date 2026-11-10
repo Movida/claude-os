@@ -38,6 +38,7 @@
 //! Linux hache : « Reste à faire » si une mesure le demande.
 
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// La plage des ports éphémères (`ip_local_port_range`).
 pub const EPHEMERE_MIN: u16 = 32768;
@@ -170,7 +171,7 @@ impl<T: Clone> Table<T> {
         } else {
             self.ephemere_de_bind(numero, &lien, hasard).ok_or(Refus::Pris)?
         };
-        self.entrees.push(Entree { numero, lien: Lien { port, ..lien }, objet: Some(objet) });
+        self.entrees.ajouter_dans_la_place(Entree { numero, lien: Lien { port, ..lien }, objet: Some(objet) });
         Ok(port)
     }
 
@@ -281,7 +282,7 @@ impl<T: Clone> Table<T> {
                 // hasard) : le prochain départ ne se devine pas.
                 let saut = i.max((hasard % 8) * 2) + 2;
                 self.perturbation[index] = self.perturbation[index].wrapping_add(saut);
-                self.entrees.push(Entree {
+                self.entrees.ajouter_dans_la_place(Entree {
                     numero,
                     lien: Lien { sorte: Sorte::Connectee, adresse: locale, port, distante, port_distant, par_connect: true, ..lien },
                     objet: Some(objet),
@@ -298,7 +299,7 @@ impl<T: Clone> Table<T> {
         if self.entrees.len() >= self.max {
             return Err(Refus::Plein);
         }
-        self.entrees.push(Entree { numero, lien: Lien { sorte: Sorte::Connectee, ..lien }, objet: Some(objet) });
+        self.entrees.ajouter_dans_la_place(Entree { numero, lien: Lien { sorte: Sorte::Connectee, ..lien }, objet: Some(objet) });
         Ok(())
     }
 

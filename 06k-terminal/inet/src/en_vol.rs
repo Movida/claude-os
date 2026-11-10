@@ -36,6 +36,7 @@
 
 use alloc::collections::TryReserveError;
 use alloc::vec::Vec;
+use faillible::VecFaillible;
 
 /// Un exemplaire d'une socket en vol (`unix_edge`).
 #[derive(Clone, Copy, Debug)]
@@ -75,7 +76,7 @@ pub fn mortes(aretes: &[Arete], references: impl Fn(u32) -> u32) -> Result<Vec<u
     let mut sommets: Vec<Sommet> = Vec::new();
     sommets.try_reserve_exact(aretes.len())?;
     for a in aretes {
-        sommets.push(Sommet { numero: a.envolee, fichier: a.fichier, premier: 0, degre: 0, index: PAS_VU, bas: 0, sur_pile: false, composante: 0 });
+        sommets.ajouter_dans_la_place(Sommet { numero: a.envolee, fichier: a.fichier, premier: 0, degre: 0, index: PAS_VU, bas: 0, sur_pile: false, composante: 0 });
     }
     sommets.sort_unstable_by_key(|s| s.numero);
     sommets.dedup_by_key(|s| s.numero);
@@ -84,7 +85,7 @@ pub fn mortes(aretes: &[Arete], references: impl Fn(u32) -> u32) -> Result<Vec<u
     let mut liens: Vec<(u32, u32)> = Vec::new();
     liens.try_reserve_exact(aretes.len())?;
     for a in aretes {
-        liens.push((indice(a.envolee), indice(a.ecoute.unwrap_or(a.receveuse))));
+        liens.ajouter_dans_la_place((indice(a.envolee), indice(a.ecoute.unwrap_or(a.receveuse))));
     }
     liens.sort_unstable();
     for (k, &(source, _)) in liens.iter().enumerate() {
@@ -107,7 +108,7 @@ pub fn mortes(aretes: &[Arete], references: impl Fn(u32) -> u32) -> Result<Vec<u
         if sommets[depart as usize].index != PAS_VU {
             continue;
         }
-        appels.push((depart, 0));
+        appels.ajouter_dans_la_place((depart, 0));
         while let Some(&(v, rang)) = appels.last() {
             let vi = v as usize;
             if rang == 0 {
@@ -115,7 +116,7 @@ pub fn mortes(aretes: &[Arete], references: impl Fn(u32) -> u32) -> Result<Vec<u
                 sommets[vi].bas = ordre;
                 sommets[vi].sur_pile = true;
                 ordre += 1;
-                pile.push(v);
+                pile.ajouter_dans_la_place(v);
             }
             if rang < sommets[vi].degre {
                 if let Some(a) = appels.last_mut() {
@@ -128,7 +129,7 @@ pub fn mortes(aretes: &[Arete], references: impl Fn(u32) -> u32) -> Result<Vec<u
                 let c = sommets[cible as usize];
                 if c.index == PAS_VU {
                     // `appels` ne porte chaque sommet qu'une fois : sa place est réservée.
-                    appels.push((cible, 0));
+                    appels.ajouter_dans_la_place((cible, 0));
                 } else if c.sur_pile {
                     sommets[vi].bas = sommets[vi].bas.min(c.index);
                 }
@@ -160,7 +161,9 @@ pub fn mortes(aretes: &[Arete], references: impl Fn(u32) -> u32) -> Result<Vec<u
             });
             if morte {
                 mortes.try_reserve(pile.len() - debut)?;
-                mortes.extend(pile[debut..].iter().map(|&m| sommets[m as usize].numero));
+                for &m in &pile[debut..] {
+                    mortes.ajouter_dans_la_place(sommets[m as usize].numero);
+                }
             }
             pile.truncate(debut);
         }
