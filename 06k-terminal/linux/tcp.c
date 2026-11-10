@@ -2043,21 +2043,34 @@ static void herites(void)
     close(c);
     close(f);
     close(l);
-    /* TCP_QUICKACK relu : l'état vivant ; une conversation entre dans le ping-pong. */
-    int port;
-    l = ecoute(&port, 4);
-    paire_sur(l, port, &c, &f);
-    verifier(option(c, IPPROTO_TCP, TCP_QUICKACK) == 1, "TCP_QUICKACK d'un client neuf : 1");
+    /* TCP_QUICKACK relu : l'état vivant ; une conversation entre dans le ping-pong :
+     * une réponse envoyée moins d'un `ato` (40 ms au départ, TCP_ATO_MIN) après la
+     * réception (`tcp_event_data_sent`). Sur une machine chargée (le Linux de
+     * référence sous TCG, deux vérifications à la fois), les deux attentes de 4 ms
+     * peuvent durer plus : l'échange est refait, vingt fois au plus, jusqu'à un
+     * aller-retour de moins de 30 ms, le seul qui prouve quelque chose. */
+    int port, client_neuf = 1, pingpong = 0, rapide = 0;
     char o[100] = { 0 };
-    send(f, o, 100, 0);
-    attendre_ms(4);
-    recv(c, o, 100, 0);
-    send(c, o, 100, 0);
-    attendre_ms(4);
-    verifier(option(c, IPPROTO_TCP, TCP_QUICKACK) == 0, "TCP_QUICKACK apres un echange : le ping-pong");
-    close(c);
-    close(f);
-    close(l);
+    for (int essai = 0; essai < 20 && !rapide; essai++) {
+        l = ecoute(&port, 4);
+        paire_sur(l, port, &c, &f);
+        client_neuf &= option(c, IPPROTO_TCP, TCP_QUICKACK) == 1;
+        struct timespec t0, t1;
+        clock_gettime(CLOCK_MONOTONIC, &t0);
+        send(f, o, 100, 0);
+        attendre_ms(4);
+        recv(c, o, 100, 0);
+        send(c, o, 100, 0);
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        attendre_ms(4);
+        rapide = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 < 30;
+        pingpong = option(c, IPPROTO_TCP, TCP_QUICKACK) == 0;
+        close(c);
+        close(f);
+        close(l);
+    }
+    verifier(client_neuf, "TCP_QUICKACK d'un client neuf : 1");
+    verifier(rapide && pingpong, "TCP_QUICKACK apres un echange : le ping-pong");
     /* TCP_MAXSEG : ce qu'on annonce, ce qu'on envoie. */
     l = socket(AF_INET, SOCK_STREAM, 0);
     a = lo(0);
