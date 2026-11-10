@@ -103,7 +103,6 @@ use crate::verrou::Verrou;
 use crate::{processus, temps};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::pin::Pin;
 use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use inet::en_vol::{self, Arete};
 
@@ -330,7 +329,7 @@ pub struct Unix {
     /// Son propre relais, inscrit dans la `attente_pairs` de son pair
     /// quand `poll` le trouve plein (`unix_dgram_peer_wake_me`) : il
     /// réveille sa file à elle.
-    relais: Pin<alloc::boxed::Box<Relais<Socket>>>,
+    relais: Relais<Socket>,
 }
 
 impl Unix {
@@ -1899,7 +1898,7 @@ pub fn sonder(s: &Socket) -> u32 {
             !son_pair && ep.file.len() > DGRAM_QLEN
         };
         if pleine() {
-            u.relais.as_ref().inscrire(p, &s.attente);
+            u.relais.inscrire(p, &s.attente);
             ecrire = !pleine();
         }
     }
