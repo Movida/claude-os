@@ -35,10 +35,9 @@
 //! de la partie fixe ont un numéro de moins de 32 bits. Un numéro gardé (un
 //! dossier courant, un descripteur ouvert) dont le processus est parti :
 //! l'entrée garde son mode et ses liens, et passe à root (`pid_getattr`) ;
-//! ENOENT pour y chercher ou la lister, ESRCH pour lire un fichier ouvert
-//! (Linux rend ESRCH pour y chercher aussi, par la permission de
-//! traverser, `proc_pid_permission` : un écart, que nos systèmes montés ne
-//! savent pas dire). Un zombie (Linux : sans mémoire) n'a plus d'`exe`,
+//! ESRCH pour y chercher (la permission de traverser, `proc_pid_permission`,
+//! dite par `traverser` depuis les soldes d'avant 6k) ou pour lire un
+//! fichier ouvert, ENOENT pour la lister. Un zombie (Linux : sans mémoire) n'a plus d'`exe`,
 //! et ce qui n'est pas un dossier 0555 de son /proc passe à root
 //! (`task_dump_owner`) : fd/ ne se lit plus. Option écartée, celle de 6b
 //! à 6e :
@@ -339,6 +338,24 @@ impl<'a> ProcVue<'a> {
 impl Monte for ProcVue<'_> {
     fn racine(&self) -> u64 {
         self.fixe.racine()
+    }
+
+    /// Chercher dans le dossier d'un processus parti (/proc/<n>), ou dans
+    /// son task/ : ESRCH, avant les droits (le `proc_pid_permission` de
+    /// Linux, qui ne trouve plus la tâche). Seuls ces deux-là l'ont :
+    /// task/<tid> (aucune permission) cherche, et ne trouve plus rien
+    /// (ENOENT) ; fd/ a ses droits ordinaires (0500), puis ENOENT. Un écart
+    /// voulu : sous Linux, l'inode de fd/ garde le propriétaire du processus
+    /// vivant, qui passe ; nos attributs se calculent à chaque fois, et ceux
+    /// d'un processus parti sont à root : EACCES pour son ancien
+    /// propriétaire (garder l'identité de chaque processus recueilli, pour ce
+    /// seul cas, coûterait plus qu'il n'apporte). Les lister rend toujours
+    /// ENOENT (`proc_pident_readdir`).
+    fn traverser(&self, dossier: u64) -> Result<(), Erreur> {
+        if matches!(decoder(dossier).0, PROCESSUS | DOSSIER_TASK) && !self.existe(dossier) {
+            return Err(Erreur::ESRCH);
+        }
+        Ok(())
     }
 
     fn peripherique(&self) -> (u32, u32) {

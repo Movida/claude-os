@@ -130,6 +130,11 @@ pub trait Monte {
     fn saut(&self, _lien: u64) -> Option<Objet> {
         None
     }
+    /// Ce que le système a à dire avant qu'on cherche dans `dossier`
+    /// (voir `Arbre::traverser`) ; Ok par défaut.
+    fn traverser(&self, _dossier: u64) -> Result<(), Erreur> {
+        Ok(())
+    }
     /// Le chemin qu'aura ce qu'on ouvre par le lien magique `lien` : celui
     /// du fichier ouvert qu'il désigne (vide s'il n'en a pas). Linux rouvre
     /// le même `struct path` (`nd_jump_link`), dont `d_path` donne le même
@@ -696,6 +701,13 @@ impl<M: Monte> Arbre for Vue<'_, M> {
         match lien {
             Objet::Monte(s, n) => self.monte(s).saut(n),
             Objet::Tmpfs(_) | Objet::Anonyme => None,
+        }
+    }
+
+    fn traverser(&self, dossier: Objet) -> Result<(), Erreur> {
+        match dossier {
+            Objet::Monte(s, n) => self.monte(s).traverser(n),
+            Objet::Tmpfs(_) | Objet::Anonyme => Ok(()),
         }
     }
 }

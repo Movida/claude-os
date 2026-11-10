@@ -138,6 +138,7 @@ const ENXIO: u32 = 60;
 const EPERM: u32 = 63;
 const EPIPE: u32 = 64;
 const ESPIPE: u32 = 70;
+const ESRCH: u32 = 71;
 const ETIMEDOUT: u32 = 73;
 const ETXTBSY: u32 = 74;
 
@@ -147,6 +148,7 @@ fn errno(e: Erreur) -> u32 {
     match e {
         Erreur::EPERM | Erreur::EXDEV => EPERM,
         Erreur::ENOENT => ENOENT,
+        Erreur::ESRCH => ESRCH,
         Erreur::ENXIO => ENXIO,
         Erreur::ENOMEM => ENOMEM,
         Erreur::EACCES => EACCES,

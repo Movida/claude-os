@@ -633,6 +633,10 @@ static int autre(void)
     int statm = open(chemin, O_RDONLY);
     snprintf(chemin, sizeof chemin, "/proc/%d", cible);
     int dossier = open(chemin, O_RDONLY | O_DIRECTORY);
+    snprintf(chemin, sizeof chemin, "/proc/%d/task", cible);
+    int dossier_task = open(chemin, O_RDONLY | O_DIRECTORY);
+    snprintf(chemin, sizeof chemin, "/proc/%d/task/%d", cible, cible);
+    int dossier_fil = open(chemin, O_RDONLY | O_DIRECTORY);
     verifier(maps >= 0 && statm >= 0 && read(maps, tampon, sizeof tampon) > 0 && read(statm, tampon, sizeof tampon) > 0,
              "maps et statm d'un autre processus, vivant : lus");
     for (int i = 0; i < 10000 && kill(cible, 0) == 0; i++)
@@ -641,10 +645,23 @@ static int autre(void)
     lseek(statm, 0, SEEK_SET);
     verifier(kill(cible, 0) == -1 && erreur(read(maps, tampon, sizeof tampon)) == ESRCH && erreur(read(statm, tampon, sizeof tampon)) == ESRCH,
              "ses fichiers gardes ouverts, une fois recueilli : ESRCH");
-    /* Son dossier, gardé ouvert : le même mode, à root (`pid_getattr`). */
+    /* Son dossier, gardé ouvert : le même mode, à root (`pid_getattr`) ; y chercher un nom,
+     * ESRCH (la permission de traverser, `proc_pid_permission`) ; le lister, ENOENT. */
     struct stat d;
     verifier(dossier >= 0 && fstat(dossier, &d) == 0 && d.st_mode == (S_IFDIR | 0555) && d.st_uid == 0,
              "son dossier garde ouvert, une fois recueilli : le meme mode, a root");
+    char liste[256];
+    verifier(erreur(openat(dossier, "maps", O_RDONLY)) == ESRCH && erreur(fstatat(dossier, "statm", &d, 0)) == ESRCH
+             && erreur(syscall(SYS_getdents64, dossier, liste, sizeof liste)) == ENOENT,
+             "y chercher, une fois recueilli : ESRCH ; le lister : ENOENT");
+    /* Seuls lui et task/ ont cette permission ; task/<tid> (aucune) cherche, et ne trouve
+     * plus la tâche : ENOENT. (fd/ a la sienne, `proc_fd_permission` : sous Linux, son
+     * inode garde le propriétaire du processus vivant, qui passe et trouve ENOENT ; nos
+     * attributs se calculent à chaque fois, et le donnent à root : EACCES, un écart écrit
+     * dans noyau/src/procfs.rs, non vérifié ici.) */
+    verifier(dossier_task >= 0 && dossier_fil >= 0 && erreur(openat(dossier_task, "1", O_RDONLY)) == ESRCH
+             && erreur(openat(dossier_fil, "comm", O_RDONLY)) == ENOENT,
+             "dans task/, une fois recueilli : ESRCH ; dans task/<tid> : ENOENT");
     printf("[linux] proc autre : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

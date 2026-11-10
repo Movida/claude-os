@@ -131,6 +131,14 @@ pub trait Arbre {
     fn saut(&self, _lien: Self::Objet) -> Option<Self::Objet> {
         None
     }
+    /// Avant de chercher dans `dossier`, ce que son système de fichiers a à
+    /// dire en plus de ses droits (le `inode_operations->permission` de
+    /// Linux) : une erreur qui passe avant celle des droits. Le dossier de
+    /// /proc d'un processus parti : ESRCH (`proc_pid_permission`). Ok : les
+    /// droits seuls décident, d'après le mode.
+    fn traverser(&self, _dossier: Self::Objet) -> Result<(), Erreur> {
+        Ok(())
+    }
 }
 
 /// D'où part la résolution, et pour qui.
@@ -282,7 +290,9 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
         let barre = dernier && (barre_ici || barre_heritee);
 
         // Le droit de traverser le dossier, avant d'y chercher quoi que ce
-        // soit (même « . » et « .. », comme le may_lookup de Linux).
+        // soit (même « . » et « .. », comme le may_lookup de Linux) : ce
+        // qu'en dit son système de fichiers d'abord, puis son mode.
+        arbre.traverser(courant)?;
         let (uid, gid) = arbre.proprietaire(courant);
         if !permis(arbre.mode(courant), uid, gid, depart.qui, EXECUTER) {
             return Err(Erreur::EACCES);
@@ -586,6 +596,44 @@ mod tests {
         // De l1 : 41 liens à suivre, un de trop ; de l2 : 40, tout juste.
         assert_eq!(trouver(&a, &depart(DAVID), b"l1", true), Err(Erreur::ELOOP));
         assert_eq!(trouver(&a, &depart(DAVID), b"l2", true), Ok(1));
+    }
+
+    /// Un arbre dont un dossier refuse qu'on y cherche, quels que soient
+    /// ses droits (le /proc/<pid> d'un processus parti : ESRCH).
+    struct Parti(Petit, usize);
+
+    impl Arbre for Parti {
+        type Objet = usize;
+        fn mode(&self, o: usize) -> u32 {
+            self.0.mode(o)
+        }
+        fn proprietaire(&self, o: usize) -> (u32, u32) {
+            self.0.proprietaire(o)
+        }
+        fn chercher(&self, dossier: usize, nom: &[u8]) -> Option<usize> {
+            self.0.chercher(dossier, nom)
+        }
+        fn parent(&self, dossier: usize) -> usize {
+            self.0.parent(dossier)
+        }
+        fn cible(&self, lien: usize) -> Texte<'_> {
+            self.0.cible(lien)
+        }
+        fn traverser(&self, dossier: usize) -> Result<(), Erreur> {
+            if dossier == self.1 { Err(Erreur::ESRCH) } else { Ok(()) }
+        }
+    }
+
+    #[test]
+    fn ce_que_le_systeme_dit_avant_les_droits() {
+        // /prive (6) refusé par son système : ESRCH, avant EACCES, et même
+        // pour root ; le dossier lui-même se trouve encore.
+        let parti = Parti(arbre(), 6);
+        assert_eq!(trouver(&parti, &depart(DAVID), b"/prive/x", true), Err(Erreur::ESRCH));
+        assert_eq!(trouver(&parti, &depart(ROOT), b"/prive/x", true), Err(Erreur::ESRCH));
+        assert_eq!(trouver(&parti, &depart(ROOT), b"/prive/.", true), Err(Erreur::ESRCH));
+        assert_eq!(trouver(&parti, &depart(DAVID), b"/prive", true), Ok(6));
+        assert_eq!(trouver(&parti, &depart(DAVID), b"/etc/hosts", true), Ok(2));
     }
 
     #[test]

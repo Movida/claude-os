@@ -106,6 +106,9 @@ pub enum Erreur {
     EPERM,
     /// Le fichier n'existe pas.
     ENOENT,
+    /// Le processus n'existe plus (le dossier de /proc d'un processus
+    /// parti, où l'on cherche un nom).
+    ESRCH,
     /// Pas de donnée au-delà (SEEK_DATA après la fin).
     ENXIO,
     /// Plus de mémoire.
@@ -152,6 +155,7 @@ impl Erreur {
         match self {
             Erreur::EPERM => 1,
             Erreur::ENOENT => 2,
+            Erreur::ESRCH => 3,
             Erreur::ENXIO => 6,
             Erreur::ENOMEM => 12,
             Erreur::EACCES => 13,

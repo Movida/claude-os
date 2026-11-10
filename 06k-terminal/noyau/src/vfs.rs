@@ -224,6 +224,13 @@ impl Monte for Montage<'_> {
         }
     }
 
+    fn traverser(&self, dossier: u64) -> Result<(), Erreur> {
+        match self {
+            Montage::Proc(p) => p.traverser(dossier),
+            Montage::Fixe(f) => f.traverser(dossier),
+        }
+    }
+
     fn chemin_du_saut(&self, lien: u64) -> Option<Texte<'_>> {
         match self {
             Montage::Proc(p) => p.chemin_du_saut(lien),
