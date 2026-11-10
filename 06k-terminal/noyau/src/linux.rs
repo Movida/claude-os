@@ -645,9 +645,16 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
 /// processus tenue en écriture (6i : un verrou qui dort, le mmap_lock de
 /// Linux), interruptions actives.
 fn brk(demande: u64) -> i64 {
+    let limites = memoire::Limites::du_processus();
+    let max_donnees = limites.donnees.0;
     processus::memoire_ecrite(|m| {
         let actuelle = m.fin_tas as i64;
         if demande < m.debut_tas || demande >= ADRESSE_MAX {
+            return actuelle;
+        }
+        // RLIMIT_DATA, comme `check_data_rlimit` : le tas et le segment des
+        // données ensemble.
+        if max_donnees != u64::MAX && (demande - m.debut_tas).saturating_add(m.donnees.1 - m.donnees.0) > max_donnees {
             return actuelle;
         }
         let (pages_avant, pages_apres) = (m.fin_tas.next_multiple_of(PAGE), demande.next_multiple_of(PAGE));
@@ -660,8 +667,11 @@ fn brk(demande: u64) -> i64 {
                 drapeaux: Drapeaux { promise: true, ..Drapeaux::default() },
                 fichier: None,
             };
-            // La zone se fond dans celle du tas.
-            if !engagement_possible(pages_apres - pages_avant)
+            // La zone se fond dans celle du tas. RLIMIT_AS, et RLIMIT_DATA
+            // de nouveau, sur toutes les données cette fois (le
+            // `may_expand_vm` de do_brk_flags, pour une zone de données).
+            if !memoire::place_permise(m, pages_apres - pages_avant, true, limites)
+                || !engagement_possible(pages_apres - pages_avant)
                 || !m.zones.libre(pages_avant, pages_apres + PAGE, ECART_GARDE)
                 || m.zones.inserer(zone, &mut memoire::references).is_err()
             {
@@ -814,6 +824,7 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage
     if droits.ecriture && !sans_reserve && !engagement_possible(taille) {
         return -ENOMEM;
     }
+    let limites = memoire::Limites::du_processus();
     let resultat = processus::memoire_ecrite(|m| {
         let debut = if fixe {
             if drapeaux & MAP_FIXED_NOREPLACE != 0 && !m.zones.libre(adresse, adresse + taille, 0) {
@@ -824,6 +835,12 @@ fn mmap(adresse: u64, longueur: u64, prot: u64, drapeaux: u64, fd: u64, decalage
             m.chercher_place(taille, adresse).ok_or(-ENOMEM)?
         };
         let drapeaux = Drapeaux { sans_reserve, promise: droits.ecriture && !sans_reserve, ..Drapeaux::default() };
+        // RLIMIT_AS et RLIMIT_DATA (`may_expand_vm`), ce que MAP_FIXED
+        // remplace en moins.
+        let remplace = if fixe { m.deja_projete(debut, debut + taille) } else { 0 };
+        if !memoire::place_permise(m, taille - remplace, memoire::est_des_donnees(droits, drapeaux), limites) {
+            return Err(-ENOMEM);
+        }
         let zone = Zone { debut, fin: debut + taille, droits, nature: Nature::Anonyme, drapeaux, fichier: projection };
         m.ajouter(zone, fixe).map_err(|_| -ENOMEM)?;
         Ok(debut)
@@ -926,6 +943,7 @@ fn mprotect(adresse: u64, longueur: u64, prot: u64) -> i64 {
     if fin > ADRESSE_MAX {
         return -ENOMEM;
     }
+    let limites = memoire::Limites::du_processus();
     processus::memoire_ecrite(|m| {
         // La première zone de la plage.
         let Some(&premiere) = m.zones.suivante(adresse).filter(|z| z.debut < fin) else {
@@ -938,7 +956,7 @@ fn mprotect(adresse: u64, longueur: u64, prot: u64) -> i64 {
             PROT_GROWSUP => return -EINVAL,
             _ => adresse,
         };
-        match m.proteger(debut, fin, droits_de(prot)) {
+        match m.proteger(debut, fin, droits_de(prot), limites) {
             Ok(()) => 0,
             Err(_) => -ENOMEM,
         }

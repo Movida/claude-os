@@ -129,7 +129,9 @@ pub fn numero_neuf() -> u32 {
 /// Le nombre de limites de ressources de Linux (RLIM_NLIMITS).
 pub const LIMITES: usize = 16;
 pub const RLIMIT_CPU: usize = 0;
+pub const RLIMIT_DATA: usize = 2;
 pub const RLIMIT_STACK: usize = 3;
+pub const RLIMIT_AS: usize = 9;
 pub const RLIMIT_NPROC: usize = 6;
 pub const RLIMIT_NOFILE: usize = 7;
 pub const RLIMIT_SIGPENDING: usize = 11;
@@ -199,6 +201,12 @@ impl Processus {
     pub fn limite(&self, ressource: usize) -> (u64, u64) {
         assert!(ressource != RLIMIT_NOFILE, "la limite des descripteurs est avec leur table");
         self.limites[ressource]
+    }
+
+    /// La limite courante (« soft ») `ressource` : celle qu'appliquent les
+    /// appels (RLIM_INFINITY : u64::MAX).
+    pub fn courante(&self, ressource: usize) -> u64 {
+        self.limite(ressource).0
     }
 
     pub fn changer_limite(&mut self, ressource: usize, limite: (u64, u64)) {
@@ -731,8 +739,11 @@ pub fn servir_faute(adresse: u64, acces: Acces) -> Option<Result<(), Echec>> {
         return Some(m.servir(adresse, acces));
     }
     drop(lu);
+    // Les limites lues avant de prendre la mémoire en écriture (le verrou
+    // du processus n'est jamais pris sous elle).
+    let (pile_max, espace) = avec(|p| (p.courante(RLIMIT_STACK), p.courante(RLIMIT_AS)));
     let mut ecrit = e.memoire.ecrire();
-    if !ecrit.as_mut()?.etendre_pile(adresse) {
+    if !ecrit.as_mut()?.etendre_pile(adresse, pile_max, espace) {
         return Some(Err(Echec::SansZone));
     }
     let lu = ecrit.retrograder();

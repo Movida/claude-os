@@ -56,7 +56,7 @@ use crate::partage::Arc;
 use crate::verrou::Verrou;
 use crate::vfs;
 use crate::programmes::NomCourt;
-use zones::{Droits, Nature, Sens, Zone, Zones};
+use zones::{Drapeaux, Droits, Nature, Sens, Zone, Zones};
 
 const PAGE: u64 = 4096;
 
@@ -104,6 +104,46 @@ pub const fn disposition() -> Disposition {
     let ecart = PILE_MAX + ECART_GARDE;
     let ecart = if ecart < 128 << 20 { 128 << 20 } else { ecart };
     Disposition { sommet_pile, base_mmap: sommet_pile - ecart, base_pie: sommet_pile / 3 * 2 }
+}
+
+/// Une zone de ces droits et drapeaux compte-t-elle dans RLIMIT_DATA ?
+/// Inscriptible, privée (toutes le sont chez nous), et pas la pile
+/// (`is_data_mapping` : VM_WRITE sans VM_SHARED ni VM_STACK).
+pub fn est_des_donnees(droits: Droits, drapeaux: Drapeaux) -> bool {
+    droits.ecriture && !drapeaux.vers_le_bas
+}
+
+/// Les limites de la mémoire d'un programme : RLIMIT_AS (la courante), et
+/// RLIMIT_DATA (la courante et la maximale).
+#[derive(Clone, Copy)]
+pub struct Limites {
+    pub espace: u64,
+    pub donnees: (u64, u64),
+}
+
+impl Limites {
+    /// Celles du processus courant.
+    pub fn du_processus() -> Limites {
+        crate::processus::avec(|p| Limites {
+            espace: p.courante(crate::processus::RLIMIT_AS),
+            donnees: p.limites[crate::processus::RLIMIT_DATA],
+        })
+    }
+}
+
+/// La place que permettent RLIMIT_AS et RLIMIT_DATA (`may_expand_vm`) :
+/// `octets` de plus (de données si `donnees`) tiennent-ils à côté de la
+/// mémoire du programme ? Une RLIMIT_DATA à 0 laisse passer jusqu'à la
+/// limite maximale (le « Workaround for Valgrind » de Linux : Valgrind la
+/// met à 0 pour lui-même). Le même nombre pour les deux comptes : pour
+/// MAP_FIXED, ce qui s'ajoute moins TOUT ce qui est remplacé
+/// (`pglen - nr_pages`), données ou non.
+pub fn place_permise(m: &Memoire, octets: u64, donnees: bool, l: Limites) -> bool {
+    if m.taille_virtuelle().saturating_add(octets) > l.espace {
+        return false;
+    }
+    let apres = m.taille_donnees().saturating_add(octets);
+    !donnees || apres <= l.donnees.0 || (l.donnees.0 == 0 && apres <= l.donnees.1)
 }
 
 /// Une zone privée inscriptible de `octets` octets peut-elle être promise ?
@@ -252,6 +292,11 @@ pub struct Memoire {
     /// bout du fichier de ses segments exécutables (les `start_code` et
     /// `end_code` de Linux), pour /proc/<pid>/statm. (0, 0) sans code.
     pub code: (u64, u64),
+    /// Le début et la fin de ses données, comme Linux (load_elf_binary) :
+    /// `start_data` le plus grand p_vaddr de ses segments, `end_data` le
+    /// plus grand p_vaddr + p_filesz ; RLIMIT_DATA y compte, avec le tas
+    /// (`check_data_rlimit`, brk). (0, 0) avant le chargement.
+    pub donnees: (u64, u64),
 }
 
 impl Memoire {
@@ -270,7 +315,7 @@ impl Memoire {
         let zones = Zones::avec_capacite(PAGE as usize / size_of::<Zone>())?;
         let espace = EspaceUtilisateur::creer()?;
         let compteurs = espace.compteurs().clone();
-        Ok(Memoire { espace: Verrou::new(espace), compteurs, zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0) })
+        Ok(Memoire { espace: Verrou::new(espace), compteurs, zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0), donnees: (0, 0) })
     }
 
     /// Les tables de pages, sans leur verrou : qui a `&mut Memoire` (la
@@ -364,11 +409,21 @@ impl Memoire {
 
     /// Étend la pile jusqu'à la page de `adresse` (le `expand_stack` de
     /// Linux), mémoire tenue en écriture : vrai si la page est maintenant
-    /// dans la zone de la pile. Sous la pile, à moins de PILE_MAX de son
-    /// sommet, et pas à moins de l'écart de garde d'une autre zone.
-    pub fn etendre_pile(&mut self, adresse: u64) -> bool {
+    /// dans la zone de la pile. Sous la pile ; la pile pas plus grande que
+    /// `pile_max` (RLIMIT_STACK, `acct_stack_growth`), le programme pas plus
+    /// grand que `espace` (RLIMIT_AS) ; et pas à moins de l'écart de garde
+    /// d'une autre zone. (PILE_MAX, 8 Mio, la limite par défaut, ne sert
+    /// plus qu'à placer les projections sous la pile, au lancement.)
+    pub fn etendre_pile(&mut self, adresse: u64, pile_max: u64, espace: u64) -> bool {
         let page = adresse & !(PAGE - 1);
-        self.zones.trouver(page).is_some() || self.zones.etendre_pile(page, PILE_MAX, ECART_GARDE)
+        if self.zones.trouver(page).is_some() {
+            return true;
+        }
+        let Some(pile) = self.zones.suivante(page).copied() else { return false };
+        if pile.debut > page && self.taille_virtuelle().saturating_add(pile.debut - page) > espace {
+            return false;
+        }
+        self.zones.etendre_pile(page, pile_max, ECART_GARDE)
     }
 
     /// La zone qui suit `adresse` grandit-elle vers le bas (la pile) ? Une
@@ -571,15 +626,27 @@ impl Memoire {
     /// et dont la partie changée ne peut pas l'être comme par mmap
     /// (PlusDeMemoire : plus grande à elle seule que toute la mémoire). Une
     /// zone promise le reste (VM_ACCOUNT, `mprotect_fixup`) : elle n'est plus
-    /// recomptée. Jusqu'aux soldes d'avant 6k, un trou ne laissait rien
+    /// recomptée. Une zone rendue inscriptible : PlusDeMemoire si `limites`
+    /// refusent ses nouveaux droits et pas les anciens (`mprotect_fixup`,
+    /// deux `may_expand_vm`) : une zone qui devient des données au-delà de
+    /// RLIMIT_DATA, sauf si RLIMIT_AS est déjà dépassée (les deux refusent).
+    /// Jusqu'aux soldes d'avant 6k, un trou ne laissait rien
     /// changer, et une zone rendue inscriptible deux fois était recomptée
     /// (refusée si elle avait fusionné entre-temps au-delà de la taille de la
     /// mémoire) : deux écarts sans raison.
-    pub fn proteger(&mut self, debut: u64, fin: u64, droits: Droits) -> Result<(), Erreur> {
+    pub fn proteger(&mut self, debut: u64, fin: u64, droits: Droits, limites: Limites) -> Result<(), Erreur> {
         let mut ici = debut;
         while ici < fin {
             let z = *self.zones.trouver(ici).ok_or(Erreur::NonProjetee)?;
             let bout = z.fin.min(fin);
+            // Rendue inscriptible : les limites, comme `mprotect_fixup`.
+            let n = bout - ici;
+            if droits.ecriture
+                && !place_permise(self, n, est_des_donnees(droits, z.drapeaux), limites)
+                && place_permise(self, n, est_des_donnees(z.droits, z.drapeaux), limites)
+            {
+                return Err(Erreur::PlusDeMemoire);
+            }
             // À promettre : rendue inscriptible, jamais promise, sans
             // MAP_NORESERVE ; la partie changée seulement (`nrpages`). Une
             // zone promise le reste, même jamais écrite. Linux retire
@@ -641,5 +708,18 @@ impl Memoire {
     /// le total-vm de Linux).
     pub fn taille_virtuelle(&self) -> u64 {
         self.zones.zones().iter().map(Zone::taille).sum()
+    }
+
+    /// Ses données au sens de RLIMIT_DATA : les zones privées
+    /// inscriptibles qui ne sont pas la pile (`is_data_mapping` de Linux ;
+    /// le `data_vm`, recompté ici d'après la carte).
+    pub fn taille_donnees(&self) -> u64 {
+        self.zones.zones().iter().filter(|z| est_des_donnees(z.droits, z.drapeaux)).map(Zone::taille).sum()
+    }
+
+    /// Les octets de [debut, fin[ déjà dans des zones : ce que MAP_FIXED
+    /// remplacera (le `nr_pages` de `vms_gather_munmap_vmas`).
+    pub fn deja_projete(&self, debut: u64, fin: u64) -> u64 {
+        self.zones.morceaux(debut, fin).map(|z| z.taille()).sum()
     }
 }

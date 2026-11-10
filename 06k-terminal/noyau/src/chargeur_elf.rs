@@ -275,6 +275,9 @@ pub fn charger<'a, 'b>(executable: &Executable<'a>, nom: NomCourt, fichier: Fich
     if memoire.code.0 > memoire.code.1 {
         memoire.code = (0, 0);
     }
+    // Ses données, comme load_elf_binary : `start_data` le plus grand
+    // p_vaddr de ses segments, `end_data` le plus grand p_vaddr + p_filesz.
+    memoire.donnees = image.segments().fold((0, 0), |(debut, fin), s| (debut.max(s.adresse), fin.max(s.adresse + s.taille_fichier)));
     let image_interpreteur = match interpreteur {
         Some((x, f)) => {
             let i = placer_interpreteur(&memoire, x, executable.genre())?;

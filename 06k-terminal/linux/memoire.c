@@ -15,12 +15,15 @@
  */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <setjmp.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/random.h>
 #include <sys/resource.h>
+#include <sys/syscall.h>
 #include <sys/sysinfo.h>
 #include <unistd.h>
 
@@ -343,6 +346,129 @@ static void zone_promise(void)
         munmap(a, 2 * t);
 }
 
+/* La taille de la mémoire du programme (/proc/self/statm, en pages). */
+static size_t taille_virtuelle(void)
+{
+    unsigned long pages = 0;
+    FILE *f = fopen("/proc/self/statm", "r");
+    if (f) {
+        if (fscanf(f, "%lu", &pages) != 1)
+            pages = 0;
+        fclose(f);
+    }
+    return pages * PAGE;
+}
+
+static sigjmp_buf retour_de_faute;
+
+static void sur_faute(int sig)
+{
+    (void)sig;
+    siglongjmp(retour_de_faute, 1);
+}
+
+/* Toucher `octets` sous l'adresse courante de la pile, en descendant (une page à la fois,
+ * comme une fonction qui réserve un grand tableau) : 1 si une faute a arrêté avant. */
+static __attribute__((noinline)) int toucher_la_pile(size_t octets)
+{
+    /* Une adresse de la pile, par un entier : le compilateur ne la borne pas. */
+    volatile char *p = (volatile char *)(uintptr_t)__builtin_frame_address(0);
+    if (sigsetjmp(retour_de_faute, 1))
+        return 1;
+    for (size_t k = PAGE; k <= octets; k += PAGE)
+        p[-(long)k] = 1;
+    return 0;
+}
+
+/* Les limites de ressources de la mémoire, appliquées comme Linux : RLIMIT_AS à mmap
+ * (`may_expand_vm`), RLIMIT_DATA à mmap, mprotect et brk (les zones privées inscriptibles
+ * hors de la pile, et le tas avec le segment des données), RLIMIT_STACK à la croissance de
+ * la pile (`acct_stack_growth` : une faute, SIGSEGV). Chaque limite remise ensuite. */
+static void limites(void)
+{
+    struct rlimit avant, l;
+    getrlimit(RLIMIT_AS, &avant);
+    l = (struct rlimit){ taille_virtuelle() + (64 << 20), avant.rlim_max };
+    setrlimit(RLIMIT_AS, &l);
+    char *a = mmap(NULL, 128 << 20, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    char *b = mmap(NULL, 16 << 20, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    verifier(a == MAP_FAILED && errno == ENOMEM && b != MAP_FAILED, "RLIMIT_AS : 128 Mio de plus, ENOMEM ; 16 Mio, accepte");
+    /* MAP_FIXED par-dessus ce qui est déjà là : seule la différence compte (la limite
+     * rabaissée à 8 Mio de plus : sans le retrait, 16 Mio seraient refusés). */
+    l = (struct rlimit){ taille_virtuelle() + (8 << 20), avant.rlim_max };
+    setrlimit(RLIMIT_AS, &l);
+    char *c = mmap(b, 16 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    verifier(c == b, "RLIMIT_AS : MAP_FIXED sur 16 Mio deja projetes, 8 Mio de marge, accepte");
+    munmap(b, 16 << 20);
+    setrlimit(RLIMIT_AS, &avant);
+
+    getrlimit(RLIMIT_DATA, &avant);
+    l = (struct rlimit){ 32 << 20, avant.rlim_max };
+    setrlimit(RLIMIT_DATA, &l);
+    a = mmap(NULL, 64 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int e = errno;
+    b = mmap(NULL, 64 << 20, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    verifier(a == MAP_FAILED && e == ENOMEM && b != MAP_FAILED, "RLIMIT_DATA : 64 Mio inscriptibles, ENOMEM ; en lecture seule, acceptes");
+    verifier(b != MAP_FAILED && erreur_de(mprotect(b, 64 << 20, PROT_READ | PROT_WRITE)) == ENOMEM,
+             "RLIMIT_DATA : mprotect qui en fait des donnees, ENOMEM");
+    if (b != MAP_FAILED)
+        munmap(b, 64 << 20);
+    long brk0 = syscall(SYS_brk, 0);
+    long brk1 = syscall(SYS_brk, brk0 + (64 << 20));
+    verifier(brk1 == brk0, "RLIMIT_DATA : brk de 64 Mio de plus, refuse (la fin ne bouge pas)");
+    /* brk compte aussi toutes les données (`may_expand_vm` de do_brk_flags), pas seulement le
+     * tas et le segment des données (`check_data_rlimit`) : 24 Mio de mmap inscriptible, puis
+     * un brk de 16 Mio, refusé. */
+    a = mmap(NULL, 24 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    brk1 = syscall(SYS_brk, brk0 + (16 << 20));
+    verifier(a != MAP_FAILED && brk1 == brk0, "RLIMIT_DATA : brk de 16 Mio a cote de 24 Mio de mmap inscriptible, refuse");
+    if (a != MAP_FAILED)
+        munmap(a, 24 << 20);
+    /* MAP_FIXED inscriptible par-dessus 48 Mio en lecture seule : tout ce qui est remplacé
+     * compte en moins, données ou non (`pglen - nr_pages`) : accepté. */
+    b = mmap(NULL, 48 << 20, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    c = b == MAP_FAILED ? MAP_FAILED : mmap(b, 48 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    verifier(b != MAP_FAILED && c == b, "RLIMIT_DATA : MAP_FIXED inscriptible sur 48 Mio en lecture seule, accepte");
+    if (b != MAP_FAILED)
+        munmap(b, 48 << 20);
+    /* RLIMIT_AS déjà atteinte : `may_expand_vm` refuse les nouveaux droits ET les anciens,
+     * et mprotect passe, même au-delà de RLIMIT_DATA. */
+    b = mmap(NULL, 64 << 20, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    struct rlimit espace;
+    getrlimit(RLIMIT_AS, &espace);
+    l = (struct rlimit){ taille_virtuelle(), espace.rlim_max };
+    setrlimit(RLIMIT_AS, &l);
+    int p = b == MAP_FAILED ? -1 : mprotect(b, 64 << 20, PROT_READ | PROT_WRITE);
+    setrlimit(RLIMIT_AS, &espace);
+    verifier(b != MAP_FAILED && p == 0, "RLIMIT_AS atteinte : mprotect qui fait 64 Mio de donnees, accepte");
+    if (b != MAP_FAILED)
+        munmap(b, 64 << 20);
+    /* RLIMIT_DATA à 0 : permis jusqu'à la limite maximale (« Workaround for Valgrind »). */
+    l = (struct rlimit){ 0, avant.rlim_max };
+    setrlimit(RLIMIT_DATA, &l);
+    a = mmap(NULL, 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    verifier(a != MAP_FAILED, "RLIMIT_DATA a 0 : 1 Mio inscriptible, accepte jusqu'a la limite maximale");
+    if (a != MAP_FAILED)
+        munmap(a, 1 << 20);
+    setrlimit(RLIMIT_DATA, &avant);
+
+    /* La pile : une faute au-delà de RLIMIT_STACK, la place pour sa propre faute sur une
+     * pile de secours. */
+    static char secours[64 << 10];
+    stack_t ss = { .ss_sp = secours, .ss_size = sizeof secours };
+    sigaltstack(&ss, NULL);
+    struct sigaction sa = { .sa_handler = sur_faute, .sa_flags = SA_ONSTACK | SA_NODEFER }, ancienne;
+    sigaction(SIGSEGV, &sa, &ancienne);
+    getrlimit(RLIMIT_STACK, &avant);
+    l = (struct rlimit){ 1 << 20, avant.rlim_max };
+    setrlimit(RLIMIT_STACK, &l);
+    int arrete = toucher_la_pile(2 << 20);
+    setrlimit(RLIMIT_STACK, &avant);
+    int passe = !toucher_la_pile(2 << 20);
+    sigaction(SIGSEGV, &ancienne, NULL);
+    verifier(arrete && passe, "RLIMIT_STACK a 1 Mio : la pile ne grandit pas de 2 Mio (SIGSEGV) ; remise, elle grandit");
+}
+
 /* Les refus de mprotect et madvise, et les conseils sans effet. */
 static void erreurs_protections(void)
 {
@@ -404,6 +530,7 @@ int main(void)
     populate_write();
     erreurs_protections();
     zone_promise();
+    limites();
     informations();
     printf("[linux] memoire : %s\n", echecs == 0 ? "toutes les verifications : ok" : "ECHEC");
     return echecs != 0;
