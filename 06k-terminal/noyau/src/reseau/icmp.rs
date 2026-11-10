@@ -22,14 +22,18 @@
 //! injoignable sauf la fragmentation nécessaire, étouffement, temps
 //! dépassé, problème de paramètre ; un crédit consommé de 0 à 2 au hasard,
 //! pour qu'on ne devine pas ce qu'envoient les autres), sauf pour un paquet
-//! arrivé par `lo`. La limite par destination de Linux (`icmp_ratelimit`,
-//! une table des machines distantes, `inet_peer`) : un écart écrit. Le
-//! message part de l'adresse visée si elle était à nous, sinon de celle de
-//! la route ; il porte autant du paquet d'origine que tient en 576 octets
-//! (la RFC 1812).
+//! arrivé par `lo`. Puis, si la limite globale s'appliquait, la limite par
+//! destination (`icmpv4_xrlim_allow` : six d'un coup, puis une par seconde,
+//! inet::pairs), sauf sur un chemin qui part par `lo` ; c'est seulement
+//! quand elle aussi permet le message que le crédit global est consommé :
+//! une machine qu'on fait taire ne prend rien aux autres. Le message part
+//! de l'adresse visée si elle était à nous, sinon de celle de la route ; il
+//! porte autant du paquet d'origine que tient en 576 octets (la RFC 1812).
 //!
 //! Les réponses (écho, horodatage) partent de l'adresse visée, sans DF,
 //! comme toute émission de la socket ICMP de Linux (IP_PMTUDISC_DONT).
+//! Linux les fait passer par les mêmes limites (`icmp_reply`), mais leurs
+//! genres ne sont pas dans `icmp_ratemask` : aucune ne s'y applique.
 
 use super::interface::Interface;
 use super::ipv4::{self, Envoi};
@@ -38,6 +42,7 @@ use crate::verrou::Verrou;
 use core::sync::atomic::{AtomicU64, Ordering};
 use formats::reseau::icmp::{self, Icmp, Interne};
 use formats::reseau::ipv4 as format_ipv4;
+use inet::pairs::Pairs;
 
 /// Le crédit de la limite globale (`icmp_global_credit`) et l'instant où
 /// il a été rempli (`icmp_global_stamp`, en millisecondes : notre tic).
@@ -48,13 +53,20 @@ struct Credit {
 
 static CREDIT: Verrou<Credit> = Verrou::new(Credit { credit: 0, remplie: 0 });
 
+/// Les machines à qui l'on a envoyé une erreur, et leur seau (inet::pairs ;
+/// le `net->ipv4.peers` de Linux).
+static PAIRS: Verrou<Pairs> = Verrou::new(Pairs::new());
+
 /// `icmp_msgs_per_sec` et `icmp_msgs_burst`.
 const PAR_SECONDE: u64 = 1000;
 const RAFALE: i32 = 50;
 
-/// Les messages jetés (somme fausse, tronqués, refusés par la limite).
+/// Les messages jetés : somme fausse ou tronqués ; refusés par la limite
+/// globale (`ICMP_MIB_RATELIMITGLOBAL`), par celle d'une machine
+/// (`ICMP_MIB_RATELIMITHOST`).
 static FAUX: AtomicU64 = AtomicU64::new(0);
-static LIMITES: AtomicU64 = AtomicU64::new(0);
+static LIMITES_GLOBALES: AtomicU64 = AtomicU64::new(0);
+static LIMITES_PAR_MACHINE: AtomicU64 = AtomicU64::new(0);
 
 fn ms() -> u64 {
     crate::temps::ns_monotone() / 1_000_000
@@ -74,13 +86,13 @@ fn limitee(genre: u8, code: u8) -> bool {
 /// Un crédit positif : oui. Sinon, s'il s'est passé au moins 20 ms (HZ/50)
 /// depuis le dernier remplissage, le crédit gagne un message par
 /// milliseconde écoulée (au plus une seconde), sans dépasser la rafale.
-/// Puis le message consomme de 0 à 2 crédits, tirés au hasard
-/// (`icmp_global_consume`) : le crédit peut devenir négatif.
+/// Rien n'est consommé ici : seulement quand la limite par destination
+/// permet aussi le message (`consommer`).
 fn permis() -> bool {
     let mut c = CREDIT.verrouiller();
     if c.credit <= 0 {
         let maintenant = ms();
-        let ecoule = (maintenant - c.remplie).min(1000);
+        let ecoule = maintenant.saturating_sub(c.remplie).min(1000);
         if ecoule < 1000 / 50 {
             return false;
         }
@@ -88,8 +100,14 @@ fn permis() -> bool {
         c.remplie = maintenant;
         c.credit = (c.credit + gain).min(RAFALE);
     }
-    c.credit -= crate::aleatoire::u32_sous(3) as i32;
     true
+}
+
+/// Le message part : il consomme de 0 à 2 crédits, tirés au hasard
+/// (`icmp_global_consume`), pour qu'on ne devine pas ce qu'envoient les
+/// autres ; le crédit peut devenir négatif.
+fn consommer() {
+    CREDIT.verrouiller().credit -= crate::aleatoire::u32_sous(3) as i32;
 }
 
 /// Les millisecondes depuis minuit, temps universel (`inet_current_timestamp`).
@@ -224,11 +242,24 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
             _ => return,
         }
     }
-    if !par_lo && limitee(genre, code) && !permis() {
-        LIMITES.fetch_add(1, Ordering::Relaxed);
+    // La limite globale (`icmpv4_global_allow`), sauf pour un paquet arrivé
+    // par lo ; `limiter` : elle s'appliquait, et la limite par destination
+    // s'appliquera aussi (l'`apply_ratelimit` de Linux).
+    let limiter = !par_lo && limitee(genre, code);
+    if limiter && !permis() {
+        LIMITES_GLOBALES.fetch_add(1, Ordering::Relaxed);
         return;
     }
     let Ok((chemin, destination)) = ipv4::router(h.source, None) else { return };
+    // La limite par destination (`icmpv4_xrlim_allow`), sauf sur un chemin
+    // qui part par lo ; permis, le message consomme le crédit global.
+    if limiter {
+        if !ipv4::par_lo(&chemin) && !PAIRS.verrouiller().permettre(destination, crate::temps::ns_monotone()) {
+            LIMITES_PAR_MACHINE.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        consommer();
+    }
     let source = if pour_nous { h.destination } else { ipv4::source(&chemin) };
     // Autant du paquet d'origine que tient en 576 octets ; au moins un
     // en-tête IPv4, sinon le message n'aurait pas de sens.

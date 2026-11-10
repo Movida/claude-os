@@ -5,6 +5,7 @@ tests-demarrage.txt
 serial.log
 garde.log
 test-*.log
+test-*.pcap
 claude-p.log
 trace.log
 verrous.log

@@ -1353,6 +1353,13 @@ $(WAST2JSON):
 #   - une carte virtio-net à deux entrées MSI-X (vectors=2) : une pour la
 #     configuration, une pour les deux files, et le DHCP passe par elle
 #     (les soldes d'avant 6k) ;
+#   - vingt datagrammes de l'hôte, d'un coup, vers un port fermé de la
+#     machine (slirp les fait suivre, `hostfwd`, depuis 10.0.2.2) : six
+#     erreurs ICMP « port injoignable », pas plus, la limite par machine
+#     de Linux (inet::pairs) ; ce qui sort de la carte est lu dans
+#     l'enregistrement de QEMU (`filter-dump`, un fichier pcap, compté par
+#     outils/erreurs-icmp.awk). Le port de l'hôte est tiré au hasard ; s'il
+#     est pris (QEMU s'arrête aussitôt), un autre (les soldes d'avant 6k) ;
 #   - une carte sur un réseau sans serveur DHCP (-netdev hubport, un
 #     concentrateur relié à rien) : le DHCP abandonne au bout de 12 à 17 s,
 #     et le démarrage continue (6g) ;
@@ -1441,6 +1448,21 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	$(call attendre,$(QEMU_TEST) -netdev user$(,)id=n0 -device virtio-net-pci$(,)netdev=n0$(,)vectors=2 -drive format=raw$(,)file=vide.bin \
 	  -serial file:test-deux-vecteurs.log,test-deux-vecteurs.log,"[reseau] eth0 : 10.0.2.15/24",:)
 	grep -qF "une pour les deux files" test-deux-vecteurs.log
+	rm -f test-icmp.log test-icmp.pcap; n=; \
+	for essai in 1 2 3 4 5; do \
+	  port=$$(( 20000 + ($$$$ * 31 + essai * 7919) % 40000 )); \
+	  $(QEMU_TEST) -netdev user,id=n0,hostfwd=udp:127.0.0.1:$$port-:9 -device virtio-net-pci,netdev=n0 \
+	    -object filter-dump,id=f0,netdev=n0,file=test-icmp.pcap -drive format=raw,file=vide.bin -serial file:test-icmp.log & q=$$!; \
+	  etat=mort; for i in $$(seq $$(( $(DUREE) * 10 ))); do \
+	    grep -qF "[reseau] eth0 : 10.0.2.15/24" test-icmp.log 2>/dev/null && { etat=pret; break; }; \
+	    kill -0 $$q 2>/dev/null || { etat=mort; break; }; etat=lent; sleep 0.1; done; \
+	  [ $$etat = mort ] && { wait $$q 2>/dev/null; continue; }; \
+	  [ $$etat = pret ] && { bash -c 'exec 3>/dev/udp/127.0.0.1/'$$port'; for i in $$(seq 20); do printf x >&3; done'; sleep 2; \
+	    n=$$(od -An -v -tu1 test-icmp.pcap | awk -f outils/erreurs-icmp.awk); }; \
+	  kill $$q 2>/dev/null; wait $$q 2>/dev/null; break; \
+	done; \
+	[ "$$n" = 6 ] || { echo "ICMP par machine : $${n:-aucune mesure,} erreurs pour 20 datagrammes (6 attendues) : ECHEC"; exit 1; }; \
+	echo "ICMP par machine : 6 erreurs pour 20 datagrammes : ok"
 	$(call attendre,$(QEMU_TEST) -nic none $(QEMU_ALEA) -drive format=raw$(,)file=sans-reseau.bin -serial file:test-sans-reseau.log,test-sans-reseau.log,"[noyau] passerelle : termine",:)
 	grep -F "[linux] passerelle : toutes les verifications (sans reseau) : ok" test-sans-reseau.log
 	rm -f test-lien.log $(MON_TESTS); \
@@ -1573,7 +1595,7 @@ test-%.bin: vide.cpio FORCE
 clean:
 	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin nmi*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio nmi.cpio trace.cpio \
 	  tests-demarrage.txt serial.log trace.log verrous.log \
-	  capture.log qemu.log ecran.png test-*.log claude-p.log $(MON_TESTS)
+	  capture.log qemu.log ecran.png test-*.log test-*.pcap claude-p.log $(MON_TESTS)
 	rm -f $(PRIVE_FICHIERS)
 	rmdir $(PRIVE) 2>/dev/null || true
 	rm -rf $(LINUX)
