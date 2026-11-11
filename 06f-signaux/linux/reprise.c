@@ -67,13 +67,22 @@ static void dormir_ms(int ms)
  * avant, puis l'aide lui laisse 3 ms pour y dormir : sinon, sur un seul
  * processeur, le signal pourrait tomber avant l'appel), SIGUSR1 toutes les
  * millisecondes jusqu'à ce que le gestionnaire ait tourné, puis, 5 ms plus
- * tard, ce qui finit l'attente. */
+ * tard, ce qui finit l'attente. Le fil le dit (`entrer`) au plus près de
+ * l'appel système qui attend, après ce qui le prépare : epoll_create1 et
+ * epoll_ctl, clock_gettime (un appel système chez nous, sans vDSO), où un
+ * signal se livrerait aussi, trop tôt (vu une fois en 6i, sous la charge de
+ * deux vérifications : epoll_wait rendait l'événement de la fin, pas EINTR). */
 static pid_t cible;
 static int efd;
 static int tube[2];
 static uint32_t mot;
 static int fin;
 static volatile int dans_l_appel;
+
+static void entrer(void)
+{
+    dans_l_appel = 1;
+}
 
 static void *aide(void *rien)
 {
@@ -113,7 +122,6 @@ static long essayer(int sa_restart, int quoi_finit, long (*appel)(void))
     pthread_t t;
     pthread_create(&t, NULL, aide, NULL);
     errno = 0;
-    dans_l_appel = 1;
     long r = appel();
     if (r < 0)
         r = -errno;
@@ -127,23 +135,27 @@ static long essayer(int sa_restart, int quoi_finit, long (*appel)(void))
 static long lire_eventfd(void)
 {
     uint64_t v;
+    entrer();
     return read(efd, &v, 8);
 }
 
 static long lire_tube(void)
 {
     char c;
+    entrer();
     return read(tube[0], &c, 1);
 }
 
 static long futex_sans_delai(void)
 {
+    entrer();
     return syscall(SYS_futex, &mot, FUTEX_WAIT, 0, NULL, NULL, 0);
 }
 
 static long futex_delai(void)
 {
     struct timespec t = { 5, 0 };
+    entrer();
     return syscall(SYS_futex, &mot, FUTEX_WAIT, 0, &t, NULL, 0);
 }
 
@@ -152,6 +164,7 @@ static long futex_absolu(void)
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
     t.tv_sec += 5;
+    entrer();
     return syscall(SYS_futex, &mot, FUTEX_WAIT_BITSET, 0, &t, NULL, FUTEX_BITSET_MATCH_ANY);
 }
 
@@ -161,6 +174,7 @@ static long dormir_relatif(void)
 {
     struct timespec t = { 5, 0 };
     reste = (struct timespec){ 99, 0 };
+    entrer();
     return syscall(SYS_nanosleep, &t, &reste);
 }
 
@@ -168,6 +182,7 @@ static long dormir_clock_relatif(void)
 {
     struct timespec t = { 5, 0 };
     reste = (struct timespec){ 99, 0 };
+    entrer();
     return syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, 0, &t, &reste);
 }
 
@@ -177,6 +192,7 @@ static long dormir_clock_absolu(void)
     clock_gettime(CLOCK_MONOTONIC, &t);
     t.tv_sec += 5;
     reste = (struct timespec){ 99, 0 };
+    entrer();
     return syscall(SYS_clock_nanosleep, CLOCK_MONOTONIC, TIMER_ABSTIME, &t, &reste);
 }
 
@@ -191,12 +207,14 @@ static fd_set ensemble;
 static long poll_infini(void)
 {
     pfd = (struct pollfd){ efd, POLLIN, 0 };
+    entrer();
     return syscall(SYS_poll, &pfd, 1, -1);
 }
 
 static long poll_1000(void)
 {
     pfd = (struct pollfd){ efd, POLLIN, 0 };
+    entrer();
     return syscall(SYS_poll, &pfd, 1, 1000);
 }
 
@@ -204,12 +222,14 @@ static long ppoll_1s(void)
 {
     pfd = (struct pollfd){ efd, POLLIN, 0 };
     delai_ts = (struct timespec){ 1, 0 };
+    entrer();
     return syscall(SYS_ppoll, &pfd, 1, &delai_ts, NULL, 8);
 }
 
 static long ppoll_infini(void)
 {
     pfd = (struct pollfd){ efd, POLLIN, 0 };
+    entrer();
     return syscall(SYS_ppoll, &pfd, 1, NULL, NULL, 8);
 }
 
@@ -218,6 +238,7 @@ static long select_1s(void)
     FD_ZERO(&ensemble);
     FD_SET(efd, &ensemble);
     delai_tv = (struct timeval){ 1, 0 };
+    entrer();
     return syscall(SYS_select, efd + 1, &ensemble, NULL, NULL, &delai_tv);
 }
 
@@ -226,6 +247,7 @@ static long pselect6_1s(void)
     FD_ZERO(&ensemble);
     FD_SET(efd, &ensemble);
     delai_ts = (struct timespec){ 1, 0 };
+    entrer();
     return syscall(SYS_pselect6, efd + 1, &ensemble, NULL, NULL, &delai_ts, NULL);
 }
 
@@ -236,6 +258,7 @@ static long epoll_sur_efd(int quoi)
     struct epoll_event e = { .events = EPOLLIN }, evs[4];
     epoll_ctl(ep, EPOLL_CTL_ADD, efd, &e);
     struct timespec une = { 1, 0 };
+    entrer();
     long r = quoi == 0 ? syscall(SYS_epoll_wait, ep, evs, 4, -1)
            : quoi == 1 ? syscall(SYS_epoll_wait, ep, evs, 4, 1000)
                        : syscall(SYS_epoll_pwait2, ep, evs, 4, &une, NULL, 8);
@@ -269,11 +292,13 @@ static int reste_d_une_seconde(long long us)
 static long suspendre_vide(void)
 {
     uint64_t rien = 0;
+    entrer();
     return syscall(SYS_rt_sigsuspend, &rien, 8);
 }
 
 static long en_pause(void)
 {
+    entrer();
     return syscall(SYS_pause);
 }
 
@@ -417,6 +442,7 @@ static void sigsuspend_refait(void)
 static long attendre_usr2(void)
 {
     uint64_t usr2 = 1ull << (SIGUSR2 - 1);
+    entrer();
     return syscall(SYS_rt_sigtimedwait, &usr2, NULL, NULL, 8);
 }
 

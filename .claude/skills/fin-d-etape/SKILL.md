@@ -827,6 +827,13 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   relectures des soldes ont trouvé un réveil perdu (une course entre `connect`
   et `poll`), une copie qui paniquait encore, un signal sans personne pour le
   prendre ; aucun test ne les montrait.
+- **Un test instable corrigé dans l'étape courante a des copies dans les
+  étapes passées**, que la CI repasse : `linux/attente` et TCP_QUICKACK,
+  corrigés dans 6k seulement, ont rougi la CI du push suivant dans 6i et 6j ;
+  `reprise`, corrigé en 6i, est tombé en 6h. Chercher le test dans chaque
+  étape (`grep -l` sur un message du test) et corriger toutes ses copies dans
+  le même commit (l'exception de CLAUDE.md) ; puis vérifier ces étapes deux à
+  la fois : la charge montre les autres.
 - **`actions/cache` ne garde rien d'une action rouge** : un téléchargement
   fait pendant une CI qui échoue est refait à la suivante, et une panne du
   site (Launchpad, 503) la fait échouer encore. Ce qui se télécharge se garde

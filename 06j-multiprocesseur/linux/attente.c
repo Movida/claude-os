@@ -45,11 +45,13 @@ static void verifier(int ok, const char *quoi)
     echecs += !ok;
 }
 
-static long long maintenant_ms(void)
+/* En nanosecondes : les durées attendues se comparent sans arrondi (deux instants
+ * arrondis à la milliseconde peuvent dire 49 ms pour 50 écoulées). */
+static long long maintenant_ns(void)
 {
     struct timespec t;
     clock_gettime(CLOCK_MONOTONIC, &t);
-    return t.tv_sec * 1000LL + t.tv_nsec / 1000000;
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
 }
 
 static void dormir_ms(int ms)
@@ -93,13 +95,13 @@ static void sortes(void)
     errno = 0;
     r = syscall(SYS_poll, NULL, 1, 0);
     verifier(r == -1 && errno == EFAULT, "poll d'un tableau a l'adresse 0 : EFAULT");
-    long long t0 = maintenant_ms();
+    long long t0 = maintenant_ns();
     r = poll(NULL, 0, 50);
-    verifier(r == 0 && maintenant_ms() - t0 >= 50, "poll de rien pendant 50 ms : 0, apres 50 ms");
+    verifier(r == 0 && maintenant_ns() - t0 >= 50000000, "poll de rien pendant 50 ms : 0, apres 50 ms");
     struct pollfd q = { e0, POLLIN, 0 };
-    t0 = maintenant_ms();
+    t0 = maintenant_ns();
     r = poll(&q, 1, 100);
-    verifier(r == 0 && q.revents == 0 && maintenant_ms() - t0 >= 100, "poll d'un eventfd vide pendant 100 ms : 0, apres 100 ms");
+    verifier(r == 0 && q.revents == 0 && maintenant_ns() - t0 >= 100000000, "poll d'un eventfd vide pendant 100 ms : 0, apres 100 ms");
     for (unsigned i = 0; i < sizeof p / sizeof *p - 3; i++)
         close(p[i].fd);
 }
@@ -146,12 +148,14 @@ static void reveils(void)
     pthread_t t;
     cible_efd = eventfd(0, 0);
     lire_au_lieu_d_ecrire = 0;
+    /* L'instant de départ AVANT le fil : il dort 50 ms dès qu'il tourne, peut-être avant
+     * que celui-ci ne reprenne la main (vu sous QEMU chargé). */
+    long long t0 = maintenant_ns();
     pthread_create(&t, NULL, ecrire_plus_tard, NULL);
     struct pollfd q = { cible_efd, POLLIN, 0 };
-    long long t0 = maintenant_ms();
     int r = poll(&q, 1, -1);
     pthread_join(t, NULL);
-    verifier(r == 1 && q.revents == POLLIN && maintenant_ms() - t0 >= 50, "poll sans delai, un autre fil ecrit l'eventfd : reveille, POLLIN");
+    verifier(r == 1 && q.revents == POLLIN && maintenant_ns() - t0 >= 50000000, "poll sans delai, un autre fil ecrit l'eventfd : reveille, POLLIN");
     close(cible_efd);
 
     /* Le compteur au plus haut : pas de POLLOUT, jusqu'à ce qu'un autre fil
@@ -364,9 +368,9 @@ static void selects(void)
     r = brut_select(0, NULL, NULL, NULL, &tv);
     verifier(r == -1 && errno == EINVAL, "select, des microsecondes negatives : EINVAL");
     tv = (struct timeval){ -1, 1100000 };
-    long long t0 = maintenant_ms();
+    long long t0 = maintenant_ns();
     r = brut_select(0, NULL, NULL, NULL, &tv);
-    long long duree = maintenant_ms() - t0;
+    long long duree = (maintenant_ns() - t0) / 1000000;
     verifier(r == 0 && duree >= 100 && duree < 900 && tv.tv_sec == 0 && tv.tv_usec == 0,
              "select, {-1 s, 1 100 000 us} : 0,1 s (les microsecondes en trop comptent comme des secondes), le reste ecrit a zero");
 
@@ -485,9 +489,9 @@ static void epolls(void)
      * posé avant le tour, et le noyau s'arrêtait : la relecture de 6j.) */
     int ep3 = epoll_create1(0);
     struct pollfd pv = { ep3, POLLIN, 0 };
-    long long t1 = maintenant_ms();
+    long long t1 = maintenant_ns();
     n = poll(&pv, 1, 20);
-    verifier(n == 0 && maintenant_ms() - t1 >= 20, "poll d'un epoll vide pendant 20 ms : 0, apres 20 ms");
+    verifier(n == 0 && maintenant_ns() - t1 >= 20000000, "poll d'un epoll vide pendant 20 ms : 0, apres 20 ms");
     close(ep3);
 
     /* close d'un numéro qu'un dup double : l'inscription reste ; au dernier
@@ -602,12 +606,12 @@ static void attentes_epoll(void)
     epoll_ctl(ep_commun, EPOLL_CTL_ADD, ef_commun, &e);
     cible_efd = ef_commun;
     lire_au_lieu_d_ecrire = 0;
+    long long t0 = maintenant_ns();
     pthread_create(&a, NULL, ecrire_plus_tard, NULL);
     struct epoll_event r;
-    long long t0 = maintenant_ms();
     int n = epoll_wait(ep_commun, &r, 1, -1);
     pthread_join(a, NULL);
-    verifier(n == 1 && r.events == EPOLLIN && r.data.u32 == 7 && maintenant_ms() - t0 >= 50,
+    verifier(n == 1 && r.events == EPOLLIN && r.data.u32 == 7 && maintenant_ns() - t0 >= 50000000,
              "epoll_wait sans delai, un autre fil ecrit l'eventfd : reveille, la donnee rendue");
     lire(ef_commun);
     close(ep_commun);

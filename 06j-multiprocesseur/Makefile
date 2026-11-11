@@ -1342,7 +1342,12 @@ QEMU_TEST = $(QEMU_TEST_1) $(QEMU_SMP)
 # que deux vérifications en même temps (le dossier de travail et un
 # worktree de verifier-historique) ne se gênent pas.
 MON_TESTS = mon-tests.sock
-QEMU_PROGRAMMES = timeout 30 qemu-system-x86_64 -display none -no-reboot $(QEMU_SMP) $(QEMU_RESEAU) \
+# 60 s pour les programmes de test : le double des 23 à 28 s mesurées en 6j
+# sous -cpu qemu64, la règle de DUREE (6h). À 30 s, le scénario a manqué sa
+# fin sous la charge d'une autre vérification (code 124, deux fois pendant
+# les soldes d'avant 6k) : la correction de 6k, reportée ici parce qu'un test
+# qui dépend de la charge rougit la CI.
+QEMU_PROGRAMMES = timeout 60 qemu-system-x86_64 -display none -no-reboot $(QEMU_SMP) $(QEMU_RESEAU) \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 -drive format=raw,file=test-programmes.bin
 
 tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-retard.bin vide.bin nmi.bin sans-reseau.bin claude-p

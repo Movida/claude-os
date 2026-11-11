@@ -287,7 +287,7 @@ static void tester_tlb(void)
 /* Le test « munmap en lecture » : la grande zone d'A, les drapeaux, le
  * compte de B. */
 #define GRAND (32 << 20)
-static volatile int dans_munmap, b_pret;
+static volatile int dans_munmap, b_pret, munmap_fini;
 static long fautes_pendant;
 static int mu_cpu_a = -1, mu_cpu_b = -1;
 
@@ -309,6 +309,7 @@ static void *retireur(void *arg)
     if (munmap(grand, GRAND) != 0)
         ecart_vu("munmap en lecture : munmap", errno);
     __atomic_store_n(&dans_munmap, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&munmap_fini, 1, __ATOMIC_SEQ_CST);
     return NULL;
 }
 
@@ -324,7 +325,11 @@ static void *fauteur(void *arg)
     __atomic_store_n(&b_pret, 1, __ATOMIC_RELEASE);
     if (z == MAP_FAILED)
         return NULL;
-    while (!__atomic_load_n(&dans_munmap, __ATOMIC_SEQ_CST))
+    /* Le munmap d'A, ou sa fin : si le processeur de B servait autre chose
+     * pendant tout le munmap, B n'a jamais vu le drapeau levé ; il ne
+     * l'attend pas pour toujours, et l'essai suivant a lieu (0 faute pour
+     * celui-ci). */
+    while (!__atomic_load_n(&dans_munmap, __ATOMIC_SEQ_CST) && !__atomic_load_n(&munmap_fini, __ATOMIC_SEQ_CST))
         ;
     for (long i = 0; i < GRAND / PAGE && __atomic_load_n(&dans_munmap, __ATOMIC_SEQ_CST); i++) {
         z[i * PAGE] = 1;
@@ -342,18 +347,26 @@ static void tester_munmap_lecture(void)
         printf("[linux] fautes : munmap en lecture : un seul processeur, rien a mesurer\n");
         return;
     }
-    pthread_t fa, fb;
-    pthread_create(&fa, NULL, retireur, (void *)(long)a);
-    pthread_create(&fb, NULL, fauteur, (void *)(long)b);
-    pthread_join(fa, NULL);
-    pthread_join(fb, NULL);
-    if (mu_cpu_a != a || mu_cpu_b != b)
-        ecart_vu("munmap en lecture : les deux fils ne sont pas chacun sur son processeur", (unsigned long)(mu_cpu_a * 64 + mu_cpu_b));
     /* Plus de seize : une faute ou deux comptées pourraient avoir commencé
        avant qu'A ne prenne la mémoire (elles finiraient pendant, même si le
        noyau la tenait en écriture) ; des dizaines, servies pendant qu'il
        retire 8192 pages, prouvent la lecture partagée (486 mesurées dans
-       notre noyau sous QEMU). */
+       notre noyau sous QEMU). Cinq essais au plus : sur une machine chargée
+       (deux vérifications à la fois, mesuré sous Linux : une seule faute),
+       le processeur de B peut servir autre chose pendant tout le munmap ;
+       un munmap qui tiendrait la mémoire en écriture échouerait aux cinq. */
+    for (int essai = 0; essai < 5 && (essai == 0 || fautes_pendant <= 16); essai++) {
+        __atomic_store_n(&b_pret, 0, __ATOMIC_SEQ_CST);
+        __atomic_store_n(&munmap_fini, 0, __ATOMIC_SEQ_CST);
+        fautes_pendant = 0;
+        pthread_t fa, fb;
+        pthread_create(&fa, NULL, retireur, (void *)(long)a);
+        pthread_create(&fb, NULL, fauteur, (void *)(long)b);
+        pthread_join(fa, NULL);
+        pthread_join(fb, NULL);
+    }
+    if (mu_cpu_a != a || mu_cpu_b != b)
+        ecart_vu("munmap en lecture : les deux fils ne sont pas chacun sur son processeur", (unsigned long)(mu_cpu_a * 64 + mu_cpu_b));
     if (fautes_pendant <= 16)
         ecart_vu("munmap en lecture : trop peu de fautes servies pendant le munmap", fautes_pendant);
     if (ecarts == avant)
