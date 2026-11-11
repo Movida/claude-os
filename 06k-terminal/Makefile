@@ -1411,7 +1411,13 @@ $(WAST2JSON):
 #   - le processeur secondaire 1 qui tarde six secondes (test-retard, sous
 #     -cpu Nehalem pour mesurer son retard au TSC) : abandonné au bout de
 #     cinq, il trouve ABANDONNE et s'arrête sans un mot ; trois
-#     processeurs en service, et le démarrage continue (6j) ;
+#     processeurs en service, et le démarrage continue (6j) jusqu'au bout
+#     de ses tests (« Piles d'interruption », sa dernière ligne), qui
+#     doivent tous passer avec un trou dans les numéros des processeurs.
+#     Jusqu'aux soldes d'avant 6k, il s'arrêtait à « Heure (UTC) » : ce que
+#     le noyau écrivait après, avant que QEMU ne soit arrêté, était vu ou
+#     non selon l'instant, et l'ECHEC de la préemption en rendant un verrou
+#     (vers le processeur 1, absent) n'est sorti qu'une fois ;
 #   - le TSC du premier secondaire tenu pour non accordé (test-tsc, le
 #     noyau construit avec cette fonctionnalité, sous -cpu Nehalem : il
 #     faut un TSC fiable pour le déclasser) : le TSC est déclassé en
@@ -1451,7 +1457,7 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	grep -F "[noyau] TSC : le processeur 1 n'est pas accorde avec le premier (recul de 1000000 cycles, pas de TSC_ADJUST) : l'heure au tic, decalage de " test-tsc.log
 	grep -F "[noyau] 4 processeurs en service." test-tsc.log
 	grep -F "[noyau] 100 ms plus tard : " test-tsc.log
-	$(call attendre,$(QEMU_TEST) -cpu Nehalem $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-retard.bin -serial file:test-retard.log,test-retard.log,"[noyau] Heure (UTC)",:)
+	$(call attendre,$(QEMU_TEST) -cpu Nehalem $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-retard.bin -serial file:test-retard.log,test-retard.log,"[noyau] Piles d'interruption",:)
 	grep -F "[noyau] Processeur 1 (APIC 1) ne repond pas : abandonne." test-retard.log
 	grep -F "[noyau] 3 processeurs en service." test-retard.log
 	! grep -F "Processeur 1 (APIC 1) en service" test-retard.log

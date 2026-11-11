@@ -652,15 +652,23 @@ fn tester_ordonnanceur() {
     // n'est plus protégée, ce qui dépend de l'instant) : la tâche
     // s'interdit son propre processeur, ce que fait un fil qui se déplace
     // par sched_setaffinity (ordonnanceur.rs, l'affinité) ; le verrou
-    // rendu, elle doit déjà s'exécuter ailleurs (le processeur 1, inactif,
-    // la tire à son prochain tic). Deux processeurs au moins.
-    if processeur::nombre() >= 2 {
+    // rendu, elle doit déjà s'exécuter ailleurs : sur `cible`, le premier
+    // processeur en service après le 0, où init l'a épinglée (inactif, il
+    // la tire à son prochain tic). Deux processeurs en service au moins.
+    // Jusqu'aux soldes d'avant 6k, « le processeur 1 » : le scénario
+    // test-retard l'abandonne, et la tâche, interdite de tout processeur
+    // en service, était permise partout (le masque vide revient à tous,
+    // `choisir_processeur`) : elle restait sur le 0, ECHEC à chaque fois,
+    // que le scénario voyait ou non selon l'instant où il arrêtait QEMU.
+    let autres = processeur::masque_en_service() & !1;
+    if autres != 0 {
+        let cible = autres.trailing_zeros();
         static VERROU: verrou::Verrou<()> = verrou::Verrou::new(());
         static APRES: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
-        let e = tache::lancer_noyau(programmes::NomCourt::de(b"migre-verrou"), || {
+        let e = tache::lancer_noyau(programmes::NomCourt::de(b"migre-verrou"), move || {
             let t = tache::courante();
             let garde = VERROU.verrouiller();
-            t.poser_affinite(1 << 1);
+            t.poser_affinite(1 << cible);
             ordonnanceur::affinite_changee(t);
             drop(garde);
             APRES.store(processeur::sans_preemption(|| processeur::courant().numero), Ordering::Relaxed);
@@ -669,7 +677,7 @@ fn tester_ordonnanceur() {
             tache::attendre(e);
         }
         afficherln!("[noyau] Preemption en rendant un verrou : une tache qui doit ceder cede des qu'elle rend son verrou, pas au tic suivant : {}.",
-                    if e.is_some() && APRES.load(Ordering::Relaxed) == 1 { "ok" } else { "ECHEC" });
+                    if e.is_some() && APRES.load(Ordering::Relaxed) == cible { "ok" } else { "ECHEC" });
     } else {
         afficherln!("[noyau] Preemption en rendant un verrou : un seul processeur, rien a deplacer.");
     }
