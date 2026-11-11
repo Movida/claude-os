@@ -802,7 +802,7 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   mesurer le moment de la dernière ligne attendue (`chrono.sh`, 54 s en 6j)
   et mettre DUREE à son double.
 
-## Pièges rencontrés pendant les soldes d'avant 6k (9 et 10 novembre 2026)
+## Pièges rencontrés pendant les soldes d'avant 6k (du 9 au 11 novembre 2026)
 
 - **Un outil de repli sans chemin prend toute la copie de travail** :
   `git add -A --` sans chemin ajoute tout ; un repli « message seul » a ainsi
@@ -827,3 +827,8 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   relectures des soldes ont trouvé un réveil perdu (une course entre `connect`
   et `poll`), une copie qui paniquait encore, un signal sans personne pour le
   prendre ; aucun test ne les montrait.
+- **`actions/cache` ne garde rien d'une action rouge** : un téléchargement
+  fait pendant une CI qui échoue est refait à la suivante, et une panne du
+  site (Launchpad, 503) la fait échouer encore. Ce qui se télécharge se garde
+  en trois temps (`actions/cache/restore`, le téléchargement dans sa propre
+  étape, `actions/cache/save`).

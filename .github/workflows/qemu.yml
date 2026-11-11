@@ -41,13 +41,57 @@ jobs:
       # lisant le rust-toolchain.toml de l'étape).
       - name: Installer Rust
         run: cd 03-noyau-rust/noyau && rustup toolchain install
-      # Le noyau de référence et ses modules (180 Mo de paquets pour 15 Mo
-      # gardés), d'un envoi à l'autre : la clé change avec le script, qui
-      # fige leur version et leurs empreintes (revérifiées à chaque lancement).
-      - uses: actions/cache@v6
+      # Les paquets figés que téléchargent les étapes, gardés d'un envoi à
+      # l'autre : le noyau de référence et ses modules (180 Mo de paquets pour
+      # 15 Mo gardés), et la glibc de l'image (depuis 6k). Chacun en trois
+      # temps (restore, le téléchargement, save), pas actions/cache seul :
+      # celui-ci ne garde rien d'une action rouge, et un test qui échoue
+      # faisait tout retélécharger à l'envoi suivant (le 11 novembre 2026, ce
+      # fut pendant que Launchpad répondait 503). La clé est tirée des lignes
+      # dont dépend ce qui est gardé (les versions, les empreintes, les
+      # fichiers retenus), pas des fichiers entiers : un commentaire changé
+      # ne retélécharge rien. Le script et le Makefile revérifient les
+      # empreintes à chaque lancement : un cache abîmé arrête tout, il n'entre
+      # jamais dans une image. Pas claude : actions/cache se lit depuis une
+      # demande de fusion venue d'une copie du dépôt (voir le Makefile).
+      - name: Cles des paquets figes
+        id: cles
+        run: |
+          echo "linux=$(grep -E '^(VERSION|PAQUET|CONSTRUCTION|SHA256_[A-Z0-9_]+|MODULES)=' .devcontainer/linux-de-reference.sh | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "glibc=$(grep -h -E '^GLIBC_(VERSION|SHA256_[A-Z0-9_]+|FICHIERS) *=' 0*/Makefile | sort -u | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v6
+        id: linux
         with:
-          path: ~/.cache/claude-os/linux-6.18.33
-          key: linux-de-reference-${{ hashFiles('.devcontainer/linux-de-reference.sh') }}
+          path: ~/.cache/claude-os/linux-*
+          key: linux-de-reference-${{ steps.cles.outputs.linux }}
+      # Le script télécharge à son premier lancement : `true` dans la
+      # machine, qui prouve aussi qu'elle démarre, avant les tests.
+      - name: Telecharger le Linux de reference
+        if: steps.linux.outputs.cache-hit != 'true'
+        run: .devcontainer/linux-de-reference.sh true
+      - uses: actions/cache/save@v6
+        if: steps.linux.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/claude-os/linux-*
+          key: linux-de-reference-${{ steps.cles.outputs.linux }}
+      - uses: actions/cache/restore@v6
+        id: glibc
+        with:
+          path: ~/.cache/claude-os/glibc-*
+          key: glibc-${{ steps.cles.outputs.glibc }}
+      # Par chaque étape qui la fige (make glibc-figee) : la même révision
+      # n'est téléchargée qu'une fois, les suivantes trouvent ses paquets.
+      - name: Telecharger la glibc figee
+        if: steps.glibc.outputs.cache-hit != 'true'
+        run: |
+          for m in 0*/Makefile; do
+            if grep -q '^glibc-figee:' "$m"; then make -C "$(dirname "$m")" glibc-figee; fi
+          done
+      - uses: actions/cache/save@v6
+        if: steps.glibc.outputs.cache-hit != 'true'
+        with:
+          path: ~/.cache/claude-os/glibc-*
+          key: glibc-${{ steps.cles.outputs.glibc }}
       # Les démarrages et les scénarios de QEMU sur la machine de GitHub ; ses
       # tests sur l'hôte, eux, sous le Linux de référence (6.18), pas celui de
       # la machine (7.0 en novembre 2026, et il changera encore) : ils
@@ -62,8 +106,11 @@ jobs:
       # Les journaux d'une action demandent les droits d'administrateur du
       # dépôt ; ses annotations se lisent sans jeton, par l'API de GitHub
       # (/check-runs/<id>/annotations). Chaque échec y est dit une fois, le
-      # détail d'abord : GitHub en garde dix par étape.
+      # détail d'abord : GitHub en garde dix par étape. Rien quand une étape
+      # d'avant les tests a échoué (apt, un téléchargement) : pas de journal,
+      # et GitHub dit déjà laquelle.
       - name: Dire les echecs dans les annotations
         if: failure()
         run: |
+          [ -f verifier.log ] || exit 0
           grep -E ': ECHEC$|^ECHEC ' verifier.log | sort -s -t' ' -k1,1r | awk '!vu[$0]++' | sed 's/^/::error::/'

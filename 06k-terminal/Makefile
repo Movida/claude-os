@@ -370,7 +370,10 @@ LINUX = linux/construits
 # celle d'Ubuntu 24.04, à une révision figée, téléchargée et vérifiée (voir
 # $(GLIBC_PAQUETS)/.extraits).
 GLIBC_VERSION = 2.39-0ubuntu8.9
-GLIBC_ADRESSE = https://launchpad.net/ubuntu/+archive/primary/+files
+# Ses trois sources, essayées dans l'ordre (voir $(GLIBC_PAQUETS)/.extraits).
+GLIBC_ADRESSES = https://launchpad.net/ubuntu/+archive/primary/+files \
+                 https://snapshot.ubuntu.com/ubuntu/20261101T000000Z/pool/main/g/glibc \
+                 https://archive.ubuntu.com/ubuntu/pool/main/g/glibc
 GLIBC_SHA256_LIBC6 = ff5557d99b51f761c4b7c92368b9cc45565eda17df9bf9eb4b134d09825008be
 GLIBC_SHA256_LIBC_BIN = 066398a06ef1a218d4109461d4c636eafe83322ad19b179de9ef7af42b3fec58
 GLIBC_PAQUETS = $(HOME)/.cache/claude-os/glibc-$(GLIBC_VERSION)
@@ -800,8 +803,8 @@ $(LINUX)/tests/interpreteurs/gros: linux/tests/interpreteur-gros.asm
 #
 # D'où elles viennent (choix de conception, les soldes d'avant 6k) : des
 # paquets d'Ubuntu 24.04 à une révision figée (libc6 et libc-bin,
-# GLIBC_VERSION), téléchargés depuis Launchpad, qui garde chaque version
-# publiée, et vérifiés par leur SHA-256, comme claude, wabt et QEMU. Jusqu'à
+# GLIBC_VERSION), téléchargés et vérifiés par leur SHA-256, comme claude,
+# wabt et QEMU. Jusqu'à
 # 6j, c'était la glibc de la machine qui construit : l'image dépendait de
 # l'Ubuntu de l'hôte, et WSL et la CI n'avaient la même que tant qu'apt les
 # mettait à jour ensemble. Écarté : une empreinte attendue de la glibc de la
@@ -811,6 +814,26 @@ $(LINUX)/tests/interpreteurs/gros: linux/tests/interpreteur-gros.asm
 # ldconfig vient de la même version de la glibc que ld-linux (libc-bin, à
 # côté de libc6 : le même paquet source), le format du cache en dépend
 # (ldconfig.real : ldconfig n'est chez Ubuntu qu'un script autour de lui).
+#
+# Trois sources, essayées dans l'ordre (choix de conception, la CI des
+# soldes : un soir de novembre 2026, Launchpad répondait 503, et la CI
+# rougissait sans que rien de notre code n'ait changé) : Launchpad, qui
+# garde chaque version publiée ; snapshot.ubuntu.com, l'archive d'Ubuntu
+# telle qu'elle était le 1er novembre 2026, figée elle aussi, mais servie par
+# d'autres serveurs ; le pool d'archive.ubuntu.com, un réseau de miroirs à
+# part, qui retire une révision peu après qu'une autre l'a remplacée (il ne
+# sert que tant que la nôtre est la dernière). La même empreinte décide pour
+# les trois : une source qui donne un autre fichier est passée, comme une
+# source muette (c'est l'empreinte, pas https, qui garantit les octets ; apt
+# ne fait pas autrement, avec ses listes signées). curl --retry refait un
+# essai sur une erreur passagère (503 compris), pas sur un 404. Écartés :
+# une seule source avec plus d'essais (une panne de Launchpad dure des
+# heures, pas des secondes) ; les paquets dans le dépôt (des binaires que
+# nous n'avons pas écrits). Et la CI les garde dans son cache, la clé tirée
+# de GLIBC_VERSION et des empreintes (glibc-figee, plus bas, et
+# .github/workflows/qemu.yml) : elle ne les télécharge qu'à une nouvelle
+# révision, ou quand GitHub a effacé le cache (sept jours sans s'en servir).
+#
 # Les paquets sont extraits dans un dossier à part, mis en place d'un coup
 # (deux constructions à la fois, le dossier de travail et un worktree, ne
 # voient jamais une glibc à moitié écrite), et les fichiers copiés sont
@@ -830,14 +853,25 @@ $(LINUX)/tests/interpreteurs/gros: linux/tests/interpreteur-gros.asm
 $(GLIBC_PAQUETS)/.extraits:
 	mkdir -p $(dir $(GLIBC_PAQUETS))
 	neuf=$$(mktemp -d $(GLIBC_PAQUETS).XXXXXX) && trap 'rm -rf "$$neuf"' EXIT && cd "$$neuf" && \
-	  curl -sSfL -o libc6.deb $(GLIBC_ADRESSE)/libc6_$(GLIBC_VERSION)_amd64.deb && \
-	  curl -sSfL -o libc-bin.deb $(GLIBC_ADRESSE)/libc-bin_$(GLIBC_VERSION)_amd64.deb && \
-	  printf '%s  libc6.deb\n%s  libc-bin.deb\n' $(GLIBC_SHA256_LIBC6) $(GLIBC_SHA256_LIBC_BIN) | sha256sum -c --quiet && \
+	  telecharger() { \
+	    for adresse in $(GLIBC_ADRESSES); do \
+	      curl -sSfL --retry 3 -o "$$1" "$$adresse/$$2" && echo "$$3  $$1" | sha256sum -c --quiet && return 0; \
+	      echo "glibc : $$adresse/$$2 sans succes, source suivante" >&2; \
+	    done; \
+	    return 1; \
+	  } && \
+	  telecharger libc6.deb libc6_$(GLIBC_VERSION)_amd64.deb $(GLIBC_SHA256_LIBC6) && \
+	  telecharger libc-bin.deb libc-bin_$(GLIBC_VERSION)_amd64.deb $(GLIBC_SHA256_LIBC_BIN) && \
 	  dpkg-deb -x libc6.deb racine && dpkg-deb -x libc-bin.deb racine && rm -f libc6.deb libc-bin.deb && \
 	  sha256sum $(addprefix racine/usr/lib/x86_64-linux-gnu/,$(GLIBC_FICHIERS)) racine/usr/sbin/ldconfig.real > empreintes && \
 	  touch .extraits && \
 	  { mv -T "$$neuf" $(GLIBC_PAQUETS) 2>/dev/null || true; }
 	test -f $@
+
+# Les paquets seuls, sans rien construire : la CI les télécharge avant les
+# tests, pour les garder dans son cache même quand un test échoue ensuite
+# (actions/cache ne garde rien d'une action rouge).
+glibc-figee: $(GLIBC_PAQUETS)/.extraits
 
 COPIE_GLIBC = $(addprefix $(GLIBC_SOURCE)/,$(GLIBC_FICHIERS)) racine/etc/ld.so.conf $(LINUX)/libessai.so
 $(GLIBC)/.copiee: $(GLIBC_PAQUETS)/.extraits $(LINUX)/libessai.so FORCE
@@ -1660,4 +1694,4 @@ clean:
 	cd roue && cargo clean
 	cd faillible && cargo clean
 
-.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace verrous verrous-claude-p tests-hote tests-hote-root tests-qemu claude-p jeton claude-bonjour suite clean FORCE
+.PHONY: run texte test duree qemu-disque qemu-options debug capture gdb dump trace verrous verrous-claude-p tests-hote tests-hote-root tests-qemu claude-p jeton claude-bonjour suite glibc-figee clean FORCE
