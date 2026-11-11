@@ -1270,7 +1270,7 @@ extern "C" fn fin_de_bascule(precedente: *const core::ffi::c_void) {
         // SAFETY: `morte` vient d'Arc::into_raw dans `terminer`, rendu une
         // seule fois, ici ; elle ne s'exécute plus.
         let t = unsafe { Arc::from_raw(morte) };
-        A_RENDRE_AU_RENDEUR.fetch_add(1, Ordering::Release);
+        // Déjà comptée dans A_RENDRE_AU_RENDEUR, par `terminer`.
         // La place est réservée (`initialiser`) : autant de mortes au plus
         // que de piles.
         MORTES.verrouiller().ajouter_dans_la_place(t);
@@ -1279,8 +1279,9 @@ extern "C" fn fin_de_bascule(precedente: *const core::ffi::c_void) {
 }
 
 /// Les tâches mortes dont le rendeur doit rendre la pile, et leur compte
-/// (celles de la liste, et celle qu'il est en train de rendre) : « memoire
-/// rendue » (programmes.rs) attend qu'il soit nul.
+/// (celles qui meurent encore, de `terminer` à la fin de leur dernière
+/// bascule, celles de la liste, et celle qu'il est en train de rendre) :
+/// « memoire rendue » (programmes.rs) attend qu'il soit nul.
 static MORTES: Verrou<Vec<Arc<Tache>>> = Verrou::new(Vec::new());
 static A_RENDRE_AU_RENDEUR: AtomicUsize = AtomicUsize::new(0);
 /// Le rendeur y attend du travail ; qui attend que tout soit rendu attend
@@ -1609,10 +1610,33 @@ pub fn terminer(code: i32) -> ! {
     // `free_pipe_info(tsk->splice_pipe)`).
     crate::tube::rendre_le_tube_interne(t.tube_interne.swap(0, Ordering::Relaxed));
     cpu::couper_interruptions();
+    // Comptée tout de suite parmi les tâches que le rendeur doit rendre,
+    // AVANT `morte` : sa pile ne lui sera confiée qu'à la fin de sa dernière
+    // bascule (`fin_de_bascule`), mais qui l'attend peut voir `morte` et
+    // tourner avant, sur un autre processeur. Le compte pris là-bas
+    // seulement, un `attendre` suivi d'`attendre_le_rendeur` (« memoire
+    // rendue », programmes.rs) trouvait 0 et comptait les cadres avec sa
+    // pile encore prise : « -4 pages libres » (16 Kio, une pile), vu une
+    // fois après un programme Wasm, sur une machine chargée qui allongeait
+    // ce moment (la vérification des soldes d'avant 6k). Un processus Linux
+    // n'y était pas exposé : il n'est zombie qu'après `fil_disparu`, que le
+    // rendeur appelle après avoir rendu la pile de son dernier fil.
+    // L'incrément voyage avec `morte` : écrit avant le Release qui la pose,
+    // il est vu de qui la lit en Acquire, puis compte en SeqCst ; et le
+    // rendeur ne le retire qu'après l'avoir reçue par le verrou de MORTES,
+    // donc après lui : jamais de compte négatif.
+    // Écarté : un drapeau « rendue » par tâche, que `attendre` guetterait
+    // (comme `est_zombie` pour un processus) : un réveil de plus par tâche
+    // dans le rendeur, pour ce que le compte global dit déjà à qui mesure.
+    // Linux n'a pas ce contrôle : `wait` y rend la main avant que la pile ne
+    // soit rendue (`put_task_stack` dans `finish_task_switch`, ou un vfree
+    // différé) ; notre compte est plus strict, il doit donc compter les
+    // mourantes.
+    A_RENDRE_AU_RENDEUR.fetch_add(1, Ordering::Relaxed);
     // Morte : son état d'abord (plus aucun réveil ne la touche, et
     // l'ordonnanceur la retirera de la file), puis `morte`, en Release : qui
     // le lit (`attendre`, `est_morte`, en Acquire) voit tout ce qu'elle a
-    // écrit avant, son code de sortie compris.
+    // écrit avant, son code de sortie et le compte du rendeur compris.
     t.etat.store(etat::MORTE, Ordering::Relaxed);
     t.morte.store(true, Ordering::Release);
     // Une référence à elle-même, pour la fin de bascule qui rendra sa pile,
