@@ -89,10 +89,16 @@ static int ouvrir(void)
     return open(chemin, O_RDWR | O_CREAT, 0644);
 }
 
-/* Le fil qui attend un verrou : F_OFD_SETLKW, ou flock. */
+/* Le fil qui attend un verrou : F_OFD_SETLKW, ou flock. Sa durée part de
+ * `debut`, que pose celui qui le lance AVANT pthread_create : pris dans le
+ * fil, l'instant de départ arrivait après un démarrage tardif du fil (une
+ * machine chargée : la CI du 11/11/2026), et la durée mesurée tombait sous
+ * le seuil alors que l'attente était juste (le défaut de linux/attente,
+ * corrigé au lot 1 des soldes). */
 struct attente {
     int fd;
     int par_flock;
+    double debut;
     double duree;
     int resultat;
 };
@@ -100,12 +106,11 @@ struct attente {
 static void *attendre(void *p)
 {
     struct attente *a = p;
-    double t = maintenant();
     if (a->par_flock)
         a->resultat = flock(a->fd, LOCK_EX) == 0 ? 0 : errno;
     else
         a->resultat = plage(a->fd, F_OFD_SETLKW, F_WRLCK, 0, 1);
-    a->duree = maintenant() - t;
+    a->duree = maintenant() - a->debut;
     return NULL;
 }
 
@@ -113,7 +118,7 @@ static void *attendre(void *p)
  * 100 ms (`rendre`), et vérifie qu'il l'a obtenu, après au moins 90 ms. */
 static int attendu_apres_100_ms(int fd, int par_flock, void (*rendre)(void))
 {
-    struct attente a = { .fd = fd, .par_flock = par_flock };
+    struct attente a = { .fd = fd, .par_flock = par_flock, .debut = maintenant() };
     pthread_t f;
     pthread_create(&f, NULL, attendre, &a);
     dormir_ms(100);
@@ -148,7 +153,7 @@ static int signal_pendant_l_attente(int tenu)
         struct sigaction sa = { .sa_handler = rien, .sa_flags = k ? SA_RESTART : 0 };
         sigaction(SIGUSR1, &sa, NULL);
         int fd = ouvrir();
-        struct attente a = { .fd = fd };
+        struct attente a = { .fd = fd, .debut = maintenant() };
         pthread_t f;
         pthread_create(&f, NULL, attendre, &a);
         dormir_ms(100);
@@ -305,8 +310,10 @@ static void processus_a(const char *dossier)
     verifier(plage(fd, F_SETLK, F_WRLCK, 0, 1) == 0, "l'octet 0 en ecriture");
     temoin(dossier, "a0", getpid());
     attendre_temoin(dossier, "b1");
-    temoin(dossier, "a-attend", 1);
+    /* L'instant AVANT le témoin : b dort 300 ms dès qu'il le voit ; pris
+     * après, un a retardé entre les deux aurait mesuré moins. */
     double t = maintenant();
+    temoin(dossier, "a-attend", 1);
     int r = plage(fd, F_SETLKW, F_WRLCK, 1, 1);
     verifier(r == 0 && maintenant() - t >= 0.2, "F_SETLKW sur l'octet 1 : attend que b le rende, puis l'obtient");
     temoin(dossier, "a-fini", 1);
