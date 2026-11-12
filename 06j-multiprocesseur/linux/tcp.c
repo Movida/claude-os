@@ -1167,8 +1167,7 @@ static void congestion(void)
 
 /* Le débit calculé (`tcp_update_pacing_rate`, `tcpi_pacing_rate`) : l'infini sur
  * une socket neuve ; dès le premier ACK : MSS × cwnd / SRTT, à 200 % ; et de même
- * pour la fille. Les décalages, comme plus haut. SRTT lu en µs, arrondi par Linux,
- * d'où la marge. */
+ * pour la fille. Les décalages, comme plus haut. */
 static uint64_t debit_de(int s, uint32_t *srtt, uint32_t *cwnd, uint32_t *ssthresh, uint32_t *mss, uint64_t *max)
 {
     unsigned char b[248];
@@ -1184,12 +1183,19 @@ static uint64_t debit_de(int s, uint32_t *srtt, uint32_t *cwnd, uint32_t *ssthre
     return r;
 }
 
-/* MSS × cwnd × 200 % / SRTT, à 15 % près : Linux divise par SRTT × 8, que TCP_INFO
- * arrondit. */
+/* MSS × cwnd × 200 % / SRTT, dans son intervalle exact : Linux divise par
+ * `srtt_us`, le SRTT en huitièmes de µs, que TCP_INFO rend tronqué à la µs
+ * (`tcpi_rtt`, srtt_us >> 3) ; le vrai diviseur est donc entre 8 × tcpi_rtt et
+ * 8 × tcpi_rtt + 7, et le débit entre les deux quotients (des divisions entières,
+ * comme la sienne). Après connect, le SRTT est la première mesure, un nombre
+ * entier de µs : la borne haute, tout juste. Après un échange, il est lissé, et
+ * la troncature pèse d'autant plus que l'aller-retour est court. Jusqu'aux
+ * soldes d'avant 6k, une marge de 15 % : assez sur lo à 10 µs (au plus 8 % de
+ * troncature), pas sur la CI sous KVM, plus rapide (0,85 pour 5 µs). */
 static int debit_attendu(uint64_t debit, uint32_t mss, uint32_t cwnd, uint32_t srtt)
 {
-    uint64_t attendu = (uint64_t)mss * 80000 * 200 * cwnd / (8ULL * srtt);
-    return debit > attendu - attendu * 15 / 100 && debit < attendu + attendu * 15 / 100;
+    uint64_t k = (uint64_t)mss * 80000 * 200 * cwnd;
+    return debit >= k / (8ULL * srtt + 7) && debit <= k / (8ULL * srtt);
 }
 
 static void debit_calcule(void)

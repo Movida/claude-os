@@ -839,3 +839,7 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   site (Launchpad, 503) la fait échouer encore. Ce qui se télécharge se garde
   en trois temps (`actions/cache/restore`, le téléchargement dans sa propre
   étape, `actions/cache/save`).
+- **Une marge en pourcentage autour d'une valeur arrondie** dépend de la
+  taille de cette valeur : `tcp` comparait le débit calculé à 15 % près d'un
+  SRTT que TCP_INFO tronque à la µs, assez à 10 µs, pas à 5 (la CI sous
+  KVM). Calculer l'intervalle exact que l'arrondi permet.
