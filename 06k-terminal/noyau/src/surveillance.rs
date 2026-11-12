@@ -200,6 +200,15 @@ pub struct Lieu {
     pub nom: Vec<u8>,
 }
 
+/// Le cookie du lieu d'un fichier O_TMPFILE : le bit du haut, puis le
+/// numéro de son inode. Jamais celui d'une vraie entrée (ils commencent à 3
+/// et ne croissent que d'un par entrée créée), ni celui d'un autre fichier
+/// O_TMPFILE du même dossier : `Ouverts::tient_l_entree` ne les confond
+/// pas (deux dentries distincts chez Linux). Écarté : le cookie 0 pour
+/// tous, que deux fichiers O_TMPFILE ouverts dans un même dossier
+/// auraient partagé.
+const COOKIE_TEMPORAIRE: u64 = 1 << 63;
+
 /// Le lieu d'un objet qu'on va ouvrir (ou tenir), préparé avant : son nom
 /// copié, pour que rien ne puisse plus échouer une fois l'objet ouvert, ou
 /// créé. Achevé ensuite (`achever`) : le cookie de son entrée, si on ne le
@@ -232,6 +241,34 @@ impl LieuPrepare {
     pub fn du_dossier_monte(vue: &fichiers::montages::Vue<'_, vfs::Montage<'_>>, o: Objet) -> Result<Option<LieuPrepare>, PlusDeMemoire> {
         let Some((parent, nom)) = vue.dans_son_parent(o) else { return Ok(None) };
         Ok(Some(LieuPrepare { dossier: parent, cookie: Some(0), nom: faillible::copie(&nom)? }))
+    }
+
+    /// Le lieu d'un fichier O_TMPFILE qu'on va créer dans `dossier` : le
+    /// dentry « #<inode> » que lui donne Linux (`d_tmpfile`), qui n'a jamais
+    /// été une entrée du dossier. Son `d_unlinked` reste vrai, même une
+    /// fois le fichier lié ailleurs par linkat : IN_EXCL_UNLINK le tait,
+    /// /proc le dit « (deleted) » ; à sa fermeture, l'entrée meurt
+    /// (`Systeme::entree_morte`). Mesuré sous Linux 6.18 : une surveillance
+    /// du dossier reçoit IN_OPEN, IN_MODIFY, IN_CLOSE_WRITE sous le nom
+    /// « #<inode> », jamais IN_CREATE. Le numéro de l'inode n'est connu
+    /// qu'une fois le fichier créé (`nommer_temporaire`) : la place du nom
+    /// est prise ici, avant, pour que rien n'échoue après la création.
+    pub fn temporaire(dossier: Numero) -> Result<LieuPrepare, PlusDeMemoire> {
+        let mut nom = Vec::new();
+        // « # » et dix chiffres au plus.
+        nom.try_reserve_exact(11).map_err(|_| PlusDeMemoire)?;
+        Ok(LieuPrepare { dossier: Objet::Tmpfs(dossier), cookie: Some(COOKIE_TEMPORAIRE), nom })
+    }
+
+    /// Nomme le lieu d'un fichier O_TMPFILE (`temporaire`), une fois son
+    /// inode `n` créé : « #<n> », et un cookie à lui seul.
+    pub fn nommer_temporaire(&mut self, n: Numero) {
+        let mut texte = [0u8; 10];
+        self.nom.ajouter_dans_la_place(b'#');
+        for &c in vfs::decimal(n.0, &mut texte) {
+            self.nom.ajouter_dans_la_place(c);
+        }
+        self.cookie = Some(COOKIE_TEMPORAIRE | u64::from(n.0));
     }
 
     /// Le lieu d'un fichier ouvert (rouvert par /proc/self/fd/N, ou tenu

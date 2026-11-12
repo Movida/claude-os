@@ -1009,6 +1009,150 @@ static void dossier_efface(void)
     close(fd);
 }
 
+/* `chemin` est-il un point de montage en lecture seule (d'après
+ * /proc/self/mountinfo : le 5e champ, puis ses options) ? Un conteneur monte
+ * ainsi /proc/sys et /sys, qui répondent alors EROFS avant tout (le
+ * `mnt_want_write` de Linux). Notre noyau n'a pas ce fichier : non. */
+static int monte_en_lecture_seule(const char *chemin)
+{
+    FILE *f = fopen("/proc/self/mountinfo", "r");
+    if (!f)
+        return 0;
+    char ligne[1024], point[256], options[256];
+    int oui = 0;
+    while (!oui && fgets(ligne, sizeof ligne, f))
+        if (sscanf(ligne, "%*s %*s %*s %*s %255s %255s", point, options) == 2 && strcmp(point, chemin) == 0)
+            oui = strncmp(options, "ro", 2) == 0 && (options[2] == ',' || options[2] == 0);
+    fclose(f);
+    return oui;
+}
+
+/* Le O_TMPFILE seul, sans le O_DIRECTORY qu'y ajoute la glibc. */
+#define O_TMPFILE_SEUL 020000000
+
+/* O_TMPFILE : un fichier ordinaire sans nom, dans un dossier (le
+ * `do_o_tmpfile` de Linux). Mesuré sous Linux 6.18.33 : les drapeaux, le
+ * chemin (un dossier, même effacé), le fichier (nlink 0, droits sous
+ * l'umask avec les bits spéciaux, F_GETFL), son nom dans /proc (« #<inode>
+ * (deleted) », même lié), linkat (une fois, jamais avec O_EXCL), et les
+ * systèmes montés, qui ne savent pas en faire. */
+static void temporaires(void)
+{
+    char d[64], x[96], attendu[128];
+    snprintf(d, sizeof d, "%s/fichiers.%d.t", lieu, getpid());
+    verifier(mkdir(d, 0755) == 0, "O_TMPFILE : mkdir");
+    errno = 0;
+    verifier(ERREUR(open(d, O_TMPFILE_SEUL | O_RDWR, 0600), EINVAL), "O_TMPFILE sans O_DIRECTORY : EINVAL");
+    errno = 0;
+    verifier(ERREUR(open(d, O_TMPFILE | O_RDONLY, 0600), EINVAL) && ERREUR(open(d, O_TMPFILE | O_RDONLY | O_TRUNC, 0600), EINVAL),
+             "O_TMPFILE en lecture seule, meme avec O_TRUNC : EINVAL");
+    errno = 0;
+    verifier(ERREUR(open(d, O_TMPFILE | O_RDWR | O_CREAT, 0600), EINVAL), "O_TMPFILE avec O_CREAT : EINVAL");
+    int p = open(d, O_TMPFILE | O_PATH | O_RDWR, 0600);
+    struct stat st;
+    verifier(p >= 0 && fstat(p, &st) == 0 && S_ISDIR(st.st_mode) && fcntl(p, F_GETFL) == (O_PATH | O_DIRECTORY),
+             "O_PATH | O_TMPFILE : un O_PATH du dossier");
+    close(p);
+
+    /* Le chemin : un dossier, le lien final suivi sauf O_NOFOLLOW. */
+    snprintf(x, sizeof x, "%s/absent", d);
+    errno = 0;
+    verifier(ERREUR(open(x, O_TMPFILE | O_RDWR, 0600), ENOENT), "O_TMPFILE dans un dossier absent : ENOENT");
+    snprintf(x, sizeof x, "%s/f", d);
+    close(open(x, O_CREAT | O_WRONLY, 0600));
+    errno = 0;
+    verifier(ERREUR(open(x, O_TMPFILE | O_RDWR, 0600), ENOTDIR), "O_TMPFILE sur un fichier : ENOTDIR");
+    unlink(x);
+    snprintf(x, sizeof x, "%s/lien", d);
+    verifier(symlink(".", x) == 0, "O_TMPFILE : symlink");
+    int t = open(x, O_TMPFILE | O_RDWR, 0600);
+    verifier(t >= 0, "O_TMPFILE par un lien vers le dossier : suivi");
+    close(t);
+    errno = 0;
+    verifier(ERREUR(open(x, O_TMPFILE | O_RDWR | O_NOFOLLOW, 0600), ENOTDIR), "O_TMPFILE | O_NOFOLLOW sur un lien : ENOTDIR");
+    snprintf(x, sizeof x, "%s/lien/", d);
+    t = open(x, O_TMPFILE | O_RDWR | O_NOFOLLOW, 0600);
+    verifier(t >= 0, "O_TMPFILE | O_NOFOLLOW sur lien/ : suivi");
+    close(t);
+    snprintf(x, sizeof x, "%s/lien", d);
+    unlink(x);
+
+    /* Le fichier : les droits sous l'umask, bits spéciaux compris (sans
+     * setgid, que le noyau n'enlève qu'à qui n'est pas du groupe d'un
+     * dossier setgid), aucun lien, aucune entrée ; F_GETFL garde
+     * O_DIRECTORY et O_TMPFILE ; O_TRUNC est ignoré. */
+    mode_t avant = umask(022);
+    t = open(d, O_TMPFILE | O_RDWR | O_APPEND | O_TRUNC, 06777);
+    umask(avant);
+    verifier(t >= 0 && fstat(t, &st) == 0 && S_ISREG(st.st_mode) && (st.st_mode & 07777) == 06755 && st.st_nlink == 0
+                 && st.st_size == 0,
+             "O_TMPFILE : un fichier ordinaire, 06777 sous l'umask 022 : 06755, sans lien");
+    verifier(fcntl(t, F_GETFL) == (O_TMPFILE_SEUL | O_DIRECTORY | 0100000 | O_APPEND | O_RDWR), "O_TMPFILE : F_GETFL");
+    char b[8] = {0};
+    verifier(write(t, "abc", 3) == 3 && pread(t, b, sizeof b, 0) == 3 && memcmp(b, "abc", 3) == 0, "O_TMPFILE : ecrire, relire");
+    struct stat sd;
+    verifier(stat(d, &sd) == 0 && sd.st_nlink == 2, "O_TMPFILE : le dossier n'a pas d'entree de plus");
+    snprintf(attendu, sizeof attendu, "%s/#%lu (deleted)", d, (unsigned long)st.st_ino);
+    verifier(nomme(t, attendu), "O_TMPFILE : /proc/self/fd : <dossier>/#<inode> (deleted)");
+
+    /* linkat : par AT_EMPTY_PATH, une fois ; le nom de /proc ne change pas. */
+    snprintf(x, sizeof x, "%s/lie", d);
+    struct stat sl;
+    verifier(linkat(t, "", AT_FDCWD, x, AT_EMPTY_PATH) == 0 && stat(x, &sl) == 0 && sl.st_ino == st.st_ino && sl.st_nlink == 1
+                 && sl.st_size == 3,
+             "O_TMPFILE : linkat(AT_EMPTY_PATH) lui donne un nom");
+    verifier(nomme(t, attendu), "O_TMPFILE : lie, /proc/self/fd dit encore #<inode> (deleted)");
+    unlink(x);
+    errno = 0;
+    verifier(ERREUR(linkat(t, "", AT_FDCWD, x, AT_EMPTY_PATH), ENOENT), "O_TMPFILE : lie puis efface, plus de lien : ENOENT");
+    close(t);
+    /* Par /proc/self/fd/N et AT_SYMLINK_FOLLOW ; avec O_EXCL, jamais. */
+    t = open(d, O_TMPFILE | O_WRONLY, 0600);
+    char lien[32];
+    snprintf(lien, sizeof lien, "/proc/self/fd/%d", t);
+    verifier(linkat(AT_FDCWD, lien, AT_FDCWD, x, AT_SYMLINK_FOLLOW) == 0 && unlink(x) == 0,
+             "O_TMPFILE : linkat par /proc/self/fd/N (AT_SYMLINK_FOLLOW)");
+    close(t);
+    t = open(d, O_TMPFILE | O_RDWR | O_EXCL, 0600);
+    errno = 0;
+    verifier(t >= 0 && ERREUR(linkat(t, "", AT_FDCWD, x, AT_EMPTY_PATH), ENOENT), "O_TMPFILE | O_EXCL : jamais lie (ENOENT)");
+    close(t);
+
+    /* Dans un dossier effacé, tenu : permis (pas de may_create, qui
+     * refuse O_CREAT), et nommé par le dernier chemin du dossier. */
+    snprintf(x, sizeof x, "%s/sous", d);
+    mkdir(x, 0755);
+    int s = open(x, O_RDONLY | O_DIRECTORY);
+    rmdir(x);
+    errno = 0;
+    verifier(ERREUR(openat(s, "n", O_CREAT | O_RDWR, 0600), ENOENT), "dossier efface : O_CREAT : ENOENT");
+    t = openat(s, ".", O_TMPFILE | O_RDWR, 0600);
+    verifier(t >= 0 && fstat(t, &st) == 0, "dossier efface : O_TMPFILE permis");
+    snprintf(attendu, sizeof attendu, "%s/#%lu (deleted)", x, (unsigned long)st.st_ino);
+    verifier(nomme(t, attendu), "dossier efface : O_TMPFILE : <dossier>/#<inode> (deleted)");
+    close(t);
+    close(s);
+
+    /* Les droits du dossier (sauté en root), puis les systèmes montés. */
+    if (geteuid() != 0) {
+        chmod(d, 0555);
+        errno = 0;
+        verifier(ERREUR(open(d, O_TMPFILE | O_RDWR, 0600), EACCES), "O_TMPFILE sans le droit d'ecrire dans le dossier : EACCES");
+        chmod(d, 0755);
+    }
+    errno = 0;
+    verifier(ERREUR(open("/proc/self", O_TMPFILE | O_RDWR, 0600), EPERM), "O_TMPFILE dans /proc/self (immuable) : EPERM");
+    errno = 0;
+    verifier(ERREUR(open("/proc/self/fd", O_TMPFILE | O_RDWR, 0600), EOPNOTSUPP), "O_TMPFILE dans /proc/self/fd : EOPNOTSUPP");
+    errno = 0;
+    verifier(ERREUR(open("/proc/sys", O_TMPFILE | O_RDWR, 0600), monte_en_lecture_seule("/proc/sys") ? EROFS : EACCES),
+             "O_TMPFILE dans /proc/sys : EACCES (monte en lecture seule : EROFS)");
+    errno = 0;
+    verifier(ERREUR(open("/proc", O_TMPFILE | O_RDWR, 0600), geteuid() == 0 ? EOPNOTSUPP : EACCES),
+             "O_TMPFILE dans /proc : EACCES (root : EOPNOTSUPP)");
+    verifier(rmdir(d) == 0, "O_TMPFILE : le dossier est reste vide");
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -1025,6 +1169,7 @@ int main(int argc, char **argv)
     sticky();
     choisir_lieu();
     dossier_efface();
+    temporaires();
     limite_de_taille();
     struct stat st;
     verifier(unlink(nom_a) == 0 && stat(nom_a, &st) == -1 && errno == ENOENT, "effacer le fichier");

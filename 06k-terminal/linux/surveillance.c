@@ -524,6 +524,49 @@ static void echange_ouvert(void)
              "RENAME_EXCHANGE de deux fichiers ouverts : chacun ecrit sous son nouveau nom");
 }
 
+/* O_TMPFILE : un fichier sans entrée, que Linux nomme « #<inode> » (le
+ * dentry de `d_tmpfile`) : IN_OPEN, IN_MODIFY, IN_CLOSE_* à ce nom, jamais
+ * IN_CREATE ; lié par linkat, IN_CREATE au nouveau nom, et IN_ATTRIB à
+ * l'inode (surveillé par /proc/self/fd/N) ; ses événements restent ceux de
+ * « #<inode> », un nom effacé pour IN_EXCL_UNLINK, qui les tait (son
+ * `d_unlinked` reste vrai). Son lien effacé, personne ne tient ce nom-là :
+ * la fin de l'inode tout de suite (mesuré). */
+static void temporaire(void)
+{
+    int k = inotify_init1(IN_NONBLOCK);
+    inotify_add_watch(k, D, IN_ALL_EVENTS | IN_EXCL_UNLINK);
+    int fd = open(D, O_TMPFILE | O_RDWR, 0600);
+    struct stat st;
+    fstat(fd, &st);
+    char n[32];
+    snprintf(n, sizeof n, "#%lu", (unsigned long)st.st_ino);
+    char lien[32];
+    snprintf(lien, sizeof lien, "/proc/self/fd/%d", fd);
+    int wt = inotify_add_watch(in, lien, IN_ALL_EVENTS);
+    nommer(wt, "t");
+    (void)!write(fd, "x", 1);
+    (void)!linkat(fd, "", AT_FDCWD, p("t"), AT_EMPTY_PATH);
+    (void)!write(fd, "y", 1);
+    unlink(p("t"));
+    close(fd);
+    char attendu[600];
+    snprintf(attendu, sizeof attendu,
+             "d:OPEN:%s d:MODIFY:%s t:MODIFY t:ATTRIB d:CREATE:t d:MODIFY:%s t:MODIFY t:ATTRIB t:DELETE_SELF t:IGNORED "
+             "d:DELETE:t d:CLOSE_WRITE:%s",
+             n, n, n, n);
+    attendre(attendu, "O_TMPFILE : sous le nom #<inode>, sans IN_CREATE ; lie, puis efface");
+    /* Les noms des surveillances sont communs aux instances : celle-ci
+     * n'est pas nommée, seuls comptent ses événements. */
+    char lu[600];
+    lire_de(k, lu, sizeof lu);
+    char *c = strchr(lu, ':'), *e = c ? strchr(c, ' ') : NULL, *c2 = e ? strchr(e, ':') : NULL;
+    int ok = c && c2 && strncmp(c, ":CREATE:t ", 10) == 0 && strcmp(c2, ":DELETE:t") == 0;
+    if (!ok)
+        printf("[linux] surveillance : IN_EXCL_UNLINK : lu « %s »\n", lu);
+    verifier(ok, "O_TMPFILE : IN_EXCL_UNLINK tait ses evenements, pas ceux de son lien");
+    close(k);
+}
+
 /* « . » et « .. » : un dossier ouvert par eux s'annonce à son parent, sous
  * son nom. */
 static void point(void)
@@ -914,6 +957,7 @@ int main(int argc, char **argv)
     renommer();
     deux_noms();
     echange_ouvert();
+    temporaire();
     point();
     systemes_montes();
     drapeaux();

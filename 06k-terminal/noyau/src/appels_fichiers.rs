@@ -837,7 +837,8 @@ pub fn trouver_pour(qui: fichiers::Identite, chemin: &[u8]) -> Result<(Numero, V
 ///   - les drapeaux (`build_open_flags`) : O_PATH ne garde que
 ///     O_DIRECTORY, O_NOFOLLOW et O_CLOEXEC, et n'ouvre ni en lecture ni en
 ///     écriture ; O_CREAT avec O_DIRECTORY : EINVAL ; O_TMPFILE (un fichier
-///     sans nom) : pas pris en charge, EOPNOTSUPP avec un message ;
+///     sans nom, voir `ouvrir_temporaire`) sans O_DIRECTORY (le O_TMPFILE
+///     de la glibc les a tous deux) ou sans le droit d'écrire : EINVAL ;
 ///   - le chemin, copié (EFAULT, ENAMETOOLONG ; vide : ENOENT, comme
 ///     `getname`) ;
 ///   - le numéro de descripteur, réservé : plus de numéro libre, EMFILE,
@@ -872,9 +873,13 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
     if drapeaux & (O_CREAT | O_DIRECTORY) == O_CREAT | O_DIRECTORY {
         return Err(-EINVAL);
     }
-    if drapeaux & O_TMPFILE != 0 {
-        afficherln!("[noyau] open : O_TMPFILE pas pris en charge");
-        return Err(-EOPNOTSUPP);
+    // O_TMPFILE demande O_DIRECTORY : un vieux noyau, qui l'ignore, prend
+    // l'ouverture pour celle d'un dossier, et la refuse (EISDIR) au lieu de
+    // créer un fichier ailleurs. O_ACCMODE à 3 passe (il écrit) ; O_TRUNC
+    // n'est pas une écriture ici (vérifié avant qu'il en ajoute le droit).
+    let temporaire = drapeaux & O_TMPFILE != 0;
+    if temporaire && (drapeaux & O_DIRECTORY == 0 || drapeaux & O_ACCMODE == O_RDONLY) {
+        return Err(-EINVAL);
     }
     let chemin = chemin(adresse)?;
     if chemin.is_empty() {
@@ -900,6 +905,10 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
     let largefile = if chemin_seul { 0 } else { O_LARGEFILE };
     let gardes = (drapeaux & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC)) | largefile;
     let etape = avec_fin(dirfd, &chemin, suivre_pour(&o, drapeaux & O_NOFOLLOW != 0), |s, cadres, fin, depart, pid| {
+        if temporaire {
+            let liable = drapeaux & O_EXCL == 0;
+            return ouvrir_temporaire(s, cadres, &fin, depart.qui, pid, &o, liable, gardes as u32, &chemin, maintenant);
+        }
         let complet = canonique(s, pid, &fin);
         // Le lieu du fichier (inotify), préparé d'abord : une fois le
         // fichier créé ou ouvert, plus rien ne doit échouer.
@@ -1012,6 +1021,68 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
         tronquer(ouvert.numero, 0, fichier);
     }
     Ok(fd.installer(fichier, drapeaux & O_CLOEXEC != 0))
+}
+
+/// La branche O_TMPFILE d'`ouvrir` (le `do_o_tmpfile` de Linux), sous le
+/// verrou des fichiers : un fichier ordinaire sans nom, dans le dossier que
+/// désigne `fin`. Dans l'ordre de Linux :
+///   - le chemin, résolu en suivant un lien final (sauf O_NOFOLLOW : un
+///     lien n'est pas un dossier, ENOTDIR ; « lien/ » le suit), doit être
+///     un dossier : rien, ENOENT ; autre chose, ENOTDIR (`path_lookupat`
+///     avec LOOKUP_DIRECTORY) ;
+///   - dans un système monté : son refus (`Vue::refus` : /proc/self,
+///     EPERM ; /proc et /sys, EACCES ; sinon EOPNOTSUPP, aucun ne sait en
+///     faire) ;
+///   - dans le tmpfs : `Tmpfs::creer_temporaire` (le droit d'écrire dans le
+///     dossier, EACCES ; un dossier effacé convient).
+/// Le fichier n'a pas d'entrée : son lieu est « #<inode> » dans le dossier
+/// (`LieuPrepare::temporaire`), son chemin « <dossier>/#<inode> » (que
+/// /proc suit de « (deleted) », même une fois lié), et inotify voit son
+/// ouverture, sans création. O_TRUNC n'y fait rien (Linux ne passe pas par
+/// `do_open`) ; sans O_EXCL, linkat pourra lui donner un nom (`liable`),
+/// par AT_EMPTY_PATH ou par /proc/self/fd/N.
+#[allow(clippy::too_many_arguments)]
+fn ouvrir_temporaire(s: &mut Systeme, cadres: &mut CadresDuNoyau, fin: &Fin<Objet>, qui: Identite, pid: u32, o: &Ouverture,
+                     liable: bool, gardes: u32, chemin: &[u8], maintenant: fichiers::Temps) -> Result<Etape, i64> {
+    let dossier = fin.objet.ok_or(errno(Erreur::ENOENT))?;
+    if !s.avec_vue(pid, |vue| fichiers::montages::est_dossier(vue, dossier)) {
+        return Err(errno(Erreur::ENOTDIR));
+    }
+    let Objet::Tmpfs(d) = dossier else {
+        let e = refus(s, pid, qui, Modification::Temporaire(dossier));
+        return Err(if e == 0 { -EOPNOTSUPP } else { e });
+    };
+    // Tout ce qui peut échouer avant de créer le fichier : la place de son
+    // nom, et celle de « /#<inode> » au bout du chemin (dix chiffres au
+    // plus). Un chemin qui n'a pu être calculé reste vide (/proc se rabat
+    // alors sur le nom court).
+    let mut lieu = surveillance::LieuPrepare::temporaire(d).map_err(|_| -ENOMEM)?;
+    let mut complet = canonique(s, pid, fin);
+    if !complet.is_empty() {
+        complet.try_reserve_exact(12).map_err(|_| -ENOMEM)?;
+    }
+    let ouvert = s.fs.creer_temporaire(qui, d, o.mode, liable, o.ecriture, maintenant).map_err(errno)?;
+    lieu.nommer_temporaire(ouvert.numero);
+    if !complet.is_empty() {
+        if complet != b"/" {
+            complet.ajouter_dans_la_place(b'/');
+        }
+        complet.ajouter_dans_la_place(b'#');
+        let mut texte = [0u8; 10];
+        for &c in vfs::decimal(ouvert.numero.0, &mut texte) {
+            complet.ajouter_dans_la_place(c);
+        }
+    }
+    let f = FichierOuvert::new(Sorte::Fichier, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, gardes, chemin).avec_chemin(complet);
+    let fichier = s.ouverts.ajouter(f).map_err(|f| {
+        if let Tenu::Tmpfs(ouvert) = f.tenu {
+            s.fs.fermer(&ouvert, cadres);
+        }
+        -ENOMEM
+    })?;
+    s.ouverts.fichier(fichier).lieu = lieu.achever(&mut s.fs, Objet::Tmpfs(ouvert.numero));
+    surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
+    Ok(Etape::Faite(fichier, None))
 }
 
 /// Où en est une ouverture au sortir du verrou des fichiers : faite (le

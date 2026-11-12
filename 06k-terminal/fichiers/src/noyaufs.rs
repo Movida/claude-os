@@ -194,6 +194,7 @@ impl NoyauFs {
             processus: false,
             immuable: false,
             dans_proc_sys: self.dans_proc_sys(n),
+            fd_du_lecteur: false,
         }
     }
 
@@ -368,6 +369,10 @@ pub struct Proprietes {
     pub immuable: bool,
     /// /proc/sys ou dedans.
     pub dans_proc_sys: bool,
+    /// Le dossier fd/ du processus qui demande (ou d'un de ses fils) : il y
+    /// a tous les droits (le `proc_fd_permission` de Linux : `generic_permission`,
+    /// puis le même groupe de fils que la tâche courante).
+    pub fd_du_lecteur: bool,
 }
 
 /// Ce que répond un système du noyau de genre `genre` à la modification `m`
@@ -394,7 +399,16 @@ pub struct Proprietes {
 ///     dates, être le propriétaire (EPERM) ; sans effet ici ;
 ///   - truncate (d'un fichier ordinaire : `Vue::refus` a vu le reste) :
 ///     le droit d'écrire (EACCES), puis 0 (procfs ignore la taille,
-///     `proc_setattr`).
+///     `proc_setattr`) ;
+///   - un fichier O_TMPFILE (`vfs_tmpfile` : `inode_permission` du dossier
+///     pour écrire et traverser, puis l'opération absente) : un dossier
+///     immuable (/proc/self), EPERM, même pour root (`inode_permission`
+///     refuse d'écrire un inode immuable avant tout) ; /proc/sys et ses
+///     dossiers, EACCES, même pour root (`proc_sys_permission` : la racine
+///     n'est jamais à écrire, les autres suivent leurs droits sans
+///     privilège) ; fd/ du processus lui-même, permis à tous ; ailleurs,
+///     le droit d'écrire (EACCES) ; puis EOPNOTSUPP (aucun n'a
+///     d'opération `tmpfile`).
 /// Écarts pour root, écrits ici faute de pouvoir les mesurer sans
 /// écrire dans /proc (nos programmes ne sont jamais root) : Linux le
 /// laisse changer les droits de la racine de /proc (`simple_setattr`)
@@ -450,6 +464,16 @@ pub fn refus(genre: Genre, qui: Identite, m: Interne, proprietes: impl Fn(u64) -
             }
         }
         Interne::Tronquer { objet } => if droits(objet, ECRIRE) { Ok(()) } else { Err(Erreur::EACCES) },
+        Interne::Temporaire { dossier } => {
+            let e = proprietes(dossier);
+            Err(if e.immuable {
+                Erreur::EPERM
+            } else if e.dans_proc_sys || !(e.fd_du_lecteur || droits(dossier, ECRIRE | EXECUTER)) {
+                Erreur::EACCES
+            } else {
+                Erreur::EOPNOTSUPP
+            })
+        }
     }
 }
 
@@ -705,8 +729,8 @@ mod tests {
         const PID: u64 = 100;
         const MAPS: u64 = 101;
         let fabriquees = |n: u64| match n {
-            PID => Proprietes { mode: S_IFDIR | 0o555, uid: 1000, gid: 1000, parent: RACINE as u64, processus: true, immuable: true, dans_proc_sys: false },
-            MAPS => Proprietes { mode: S_IFREG | 0o444, uid: 1000, gid: 1000, parent: PID, processus: true, immuable: false, dans_proc_sys: false },
+            PID => Proprietes { mode: S_IFDIR | 0o555, uid: 1000, gid: 1000, parent: RACINE as u64, processus: true, immuable: true, dans_proc_sys: false, fd_du_lecteur: false },
+            MAPS => Proprietes { mode: S_IFREG | 0o444, uid: 1000, gid: 1000, parent: PID, processus: true, immuable: false, dans_proc_sys: false, fd_du_lecteur: false },
             n => p.proprietes(n),
         };
         let r = |qui, m| super::refus(Genre::Proc, qui, m, &fabriquees);
@@ -732,6 +756,23 @@ mod tests {
             assert_eq!(r(qui, Interne::ChangerTemps { objet: PID, maintenant: false }), Err(Erreur::EPERM));
         }
         assert_eq!(r(DAVID, Interne::ChangerProprietaire { objet: PID, uid: None, gid: None }), Ok(()));
+        // O_TMPFILE (mesuré) : /proc/self, EPERM même pour root ; fd/ du
+        // processus lui-même, EOPNOTSUPP pour tous ; /proc et /proc/sys
+        // (0555) : EACCES, et pour root, EOPNOTSUPP et EACCES (/proc/sys
+        // n'est jamais à écrire) ; /sys : EACCES, et pour root, EOPNOTSUPP.
+        const FD: u64 = 102;
+        let fd = |n: u64| match n {
+            FD => Proprietes { mode: S_IFDIR | 0o500, uid: 1000, gid: 1000, parent: PID, processus: true, immuable: false, dans_proc_sys: false, fd_du_lecteur: true },
+            n => fabriquees(n),
+        };
+        let t = |qui, dossier| super::refus(Genre::Proc, qui, Interne::Temporaire { dossier }, &fd);
+        for (qui, racine, proc_sys) in [(DAVID, Erreur::EACCES, Erreur::EACCES), (Identite::ROOT, Erreur::EOPNOTSUPP, Erreur::EACCES)] {
+            assert_eq!((t(qui, PID), t(qui, FD)), (Err(Erreur::EPERM), Err(Erreur::EOPNOTSUPP)));
+            assert_eq!((t(qui, RACINE as u64), t(qui, sys), t(qui, vm)), (Err(racine), Err(proc_sys), Err(proc_sys)));
+        }
+        let s = NoyauFs::new(Genre::Sys, (0, 22), 0o755, Temps::default()).unwrap();
+        assert_eq!(s.refuser(DAVID, Interne::Temporaire { dossier: RACINE as u64 }), Err(Erreur::EACCES));
+        assert_eq!(s.refuser(Identite::ROOT, Interne::Temporaire { dossier: RACINE as u64 }), Err(Erreur::EOPNOTSUPP));
         // La partie fixe : ni dossier de processus ni immuable ; un dossier
         // à David mais 0555 refuse d'effacer par les droits.
         assert_eq!(p.refuser(DAVID, Interne::Effacer { dossier: d, objet: f, rmdir: false }), Err(Erreur::EACCES));

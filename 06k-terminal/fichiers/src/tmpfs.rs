@@ -318,6 +318,10 @@ struct Inode {
     /// nombre d'ouvertures en écriture ; négatif, le nombre de programmes
     /// en cours qui l'exécutent (personne ne peut alors l'écrire : ETXTBSY).
     ecrivains: i32,
+    /// Un fichier O_TMPFILE ouvert sans O_EXCL, pas encore lié : linkat
+    /// peut lui donner un nom malgré ses zéro liens (l'I_LINKABLE de Linux,
+    /// qui retombe au premier lien : `lier`).
+    liable: bool,
     taille: u64,
     rdev: (u32, u32),
     atime: Temps,
@@ -452,6 +456,7 @@ impl Tmpfs {
             nlink: 0,
             refs: 0,
             ecrivains: 0,
+            liable: false,
             taille: 0,
             rdev: (0, 0),
             atime: maintenant,
@@ -712,16 +717,7 @@ impl Tmpfs {
             S_IFCHR | crate::S_IFBLK | crate::S_IFSOCK | crate::S_IFIFO => Contenu::Rien,
             _ => return Err(Erreur::EINVAL),
         };
-        let parent = self.inode(fin.dossier);
-        let herite = parent.mode & S_ISGID != 0;
-        let gid = if herite { parent.gid } else { qui.gid };
-        let mode = if herite && genre == S_IFDIR {
-            mode | S_ISGID
-        } else if herite && mode & (S_ISGID | 0o010) == S_ISGID | 0o010 && !qui.root() && qui.gid != gid {
-            mode & !S_ISGID
-        } else {
-            mode
-        };
+        let (gid, mode) = self.heritage(qui, fin.dossier, mode);
         // La place de l'entrée, puis l'inode (la seule chose qui peut encore
         // échouer, et en dernier).
         let nom = copie(&fin.nom)?;
@@ -740,6 +736,50 @@ impl Tmpfs {
             self.inode_mut(fin.dossier).nlink += 1;
         }
         Ok(n)
+    }
+
+    /// Le groupe et les droits (type compris) d'un inode que `qui` crée dans
+    /// `dossier` (l'`inode_init_owner` et le `mode_strip_sgid` de Linux) :
+    /// voir `creer`.
+    fn heritage(&self, qui: Identite, dossier: Numero, mode: u32) -> (u32, u32) {
+        let parent = self.inode(dossier);
+        let herite = parent.mode & S_ISGID != 0;
+        let gid = if herite { parent.gid } else { qui.gid };
+        let mode = if herite && mode & S_IFMT == S_IFDIR {
+            mode | S_ISGID
+        } else if herite && mode & (S_ISGID | 0o010) == S_ISGID | 0o010 && !qui.root() && qui.gid != gid {
+            mode & !S_ISGID
+        } else {
+            mode
+        };
+        (gid, mode)
+    }
+
+    /// Crée un fichier ordinaire sans nom, déjà ouvert, dans le dossier
+    /// `dossier` : open avec O_TMPFILE (le `vfs_tmpfile` de Linux, puis
+    /// `shmem_tmpfile`). Il faut le droit d'écrire dans le dossier et de le
+    /// traverser (EACCES), mais pas `may_create` : un dossier effacé, tenu
+    /// ouvert, l'accepte (mesuré : O_TMPFILE y réussit, O_CREAT y rend
+    /// ENOENT). Le fichier a les droits `mode` (umask déjà appliqué, bits
+    /// spéciaux compris), le groupe d'un dossier setgid comme `creer`,
+    /// aucun lien et une référence (l'ouverture, à rendre par `fermer`) ;
+    /// il compte parmi les écrivains avec `ecriture`. `liable` (sans
+    /// O_EXCL) : linkat pourra lui donner un nom, une fois (voir `lier`).
+    /// Le dossier ne change pas : ni entrée, ni dates. ENOSPC, ENOMEM.
+    pub fn creer_temporaire(&mut self, qui: Identite, dossier: Numero, mode: u32, liable: bool, ecriture: bool, maintenant: Temps)
+        -> Result<Ouvert, Erreur> {
+        if !self.inode(dossier).permis(qui, ECRIRE | EXECUTER) {
+            return Err(Erreur::EACCES);
+        }
+        let (gid, mode) = self.heritage(qui, dossier, S_IFREG | (mode & 0o7777));
+        let n = self.nouvel_inode(Identite { uid: qui.uid, gid }, mode, Contenu::Fichier(IndexPages::new()), maintenant)?;
+        let i = self.inode_mut(n);
+        i.liable = liable;
+        i.refs = 1;
+        if ecriture {
+            i.ecrivains = 1;
+        }
+        Ok(Ouvert { numero: n, cree: true, tronquer: false, ecrivain: ecriture })
     }
 
     /// Ajoute l'entrée (place déjà réservée).
@@ -1055,8 +1095,10 @@ impl Tmpfs {
     ///     fichiers piégés d'un autre) ne sont pas suivis : sans plusieurs
     ///     utilisateurs, ils ne protègent encore de rien ;
     ///   - les droits sur le dossier (`peut_creer`) ;
-    ///   - un dossier : EPERM ; un inode qui n'a plus de nom : ENOENT ; trop
-    ///     de liens : EMLINK.
+    ///   - un dossier : EPERM ; un inode qui n'a plus de nom : ENOENT, sauf
+    ///     un fichier O_TMPFILE liable (`creer_temporaire`), dont le premier
+    ///     lien retire ce droit (Linux retire I_LINKABLE après `link`) : lié
+    ///     puis effacé, il ne se lie plus ; trop de liens : EMLINK.
     pub fn lier(&mut self, qui: Identite, source: Numero, nouveau: &Fin<Numero>, maintenant: Temps) -> Result<(), Erreur> {
         if nouveau.dernier != Dernier::Nom || nouveau.objet.is_some() {
             return Err(Erreur::EEXIST);
@@ -1076,7 +1118,7 @@ impl Tmpfs {
         if s.est_dossier() {
             return Err(Erreur::EPERM);
         }
-        if s.nlink == 0 {
+        if s.nlink == 0 && !s.liable {
             return Err(Erreur::ENOENT);
         }
         if s.nlink == u32::MAX {
@@ -1087,6 +1129,7 @@ impl Tmpfs {
         self.ajouter_entree(nouveau.dossier, nom, source, maintenant);
         let s = self.inode_mut(source);
         s.nlink += 1;
+        s.liable = false;
         s.ctime = maintenant;
         Ok(())
     }
@@ -1704,6 +1747,9 @@ impl Tmpfs {
                 if i.nlink == 0 && i.refs == 0 {
                     return Err("inode sans nom ni reference");
                 }
+                if i.liable && (i.nlink != 0 || i.genre() != S_IFREG) {
+                    return Err("liable avec un nom, ou pas un fichier");
+                }
             }
         }
         if inodes != self.inodes || pages != self.pages {
@@ -1885,6 +1931,50 @@ mod tests {
 
     fn lecture() -> Ouverture {
         Ouverture { lecture: true, ..Default::default() }
+    }
+
+    /// O_TMPFILE : un fichier sans nom, dans un dossier où l'on peut écrire
+    /// (même effacé), lié une fois au plus, et rien sans `liable` (O_EXCL).
+    #[test]
+    fn temporaire() {
+        let mut t = T::new();
+        let tmp = t.trouver(b"/tmp").unwrap();
+        let home = t.trouver(b"/home/david").unwrap();
+        let (taille, mtime) = (t.fs.attributs(tmp).taille, t.fs.attributs(tmp).mtime);
+        assert_eq!(t.fs.creer_temporaire(DAVID, t.fs.racine(), 0o600, true, true, T0), Err(EACCES));
+        let o = t.fs.creer_temporaire(DAVID, tmp, 0o7755, true, true, T0).unwrap();
+        let a = t.fs.attributs(o.numero);
+        assert_eq!((a.mode, a.nlink, a.uid, a.gid), (S_IFREG | 0o7755, 0, 1000, 1000));
+        assert_eq!((o.cree, o.ecrivain, t.fs.attributs(tmp).taille, t.fs.attributs(tmp).mtime), (true, true, taille, mtime));
+        t.verifier();
+        // Lié une fois ; effacé, il ne se lie plus.
+        t.qui = DAVID;
+        let f = t.fin(b"/tmp/lie", Suivre::Jamais).unwrap();
+        t.fs.lier(DAVID, o.numero, &f, T0).unwrap();
+        assert_eq!(t.fs.attributs(o.numero).nlink, 1);
+        t.unlink(b"/tmp/lie").unwrap();
+        let f = t.fin(b"/tmp/encore", Suivre::Jamais).unwrap();
+        assert_eq!(t.fs.lier(DAVID, o.numero, &f, T0), Err(ENOENT));
+        t.verifier();
+        t.fs.fermer(&o, &mut t.c);
+        assert_eq!(t.c.detruits.last(), Some(&(o.numero, false)));
+        // O_EXCL : jamais liable.
+        let x = t.fs.creer_temporaire(DAVID, home, 0o600, false, false, T0).unwrap();
+        assert_eq!(t.fs.lier(DAVID, x.numero, &f, T0), Err(ENOENT));
+        t.fs.fermer(&x, &mut t.c);
+        // Un dossier effacé, tenu : accepté (pas de may_create) ; setgid, son
+        // groupe passe au fichier, et S_ISGID tombe pour qui n'en est pas.
+        let d = t.mkdir(b"/tmp/d").unwrap();
+        t.fs.changer_proprietaire(Identite::ROOT, d, None, Some(50), T0).unwrap();
+        t.fs.changer_mode(Identite::ROOT, d, 0o2777, T0).unwrap();
+        t.fs.prendre(d);
+        t.rmdir(b"/tmp/d").unwrap();
+        let y = t.fs.creer_temporaire(DAVID, d, 0o2775, true, true, T0).unwrap();
+        let a = t.fs.attributs(y.numero);
+        assert_eq!((a.mode, a.gid), (S_IFREG | 0o775, 50));
+        t.fs.fermer(&y, &mut t.c);
+        t.fs.lacher(d, &mut t.c);
+        t.verifier();
     }
 
     #[test]

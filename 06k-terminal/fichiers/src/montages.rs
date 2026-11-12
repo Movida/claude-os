@@ -186,6 +186,8 @@ pub enum Interne {
     ChangerTemps { objet: u64, maintenant: bool },
     /// truncate.
     Tronquer { objet: u64 },
+    /// Un fichier O_TMPFILE dans `dossier`.
+    Temporaire { dossier: u64 },
 }
 
 /// Ce qu'on crée : la couche commune ne répond pas de même à une barre
@@ -213,6 +215,8 @@ pub enum Modification<'a> {
     ChangerProprietaire(Objet, Option<u32>, Option<u32>),
     ChangerTemps(Objet, bool),
     Tronquer(Objet),
+    /// Un fichier O_TMPFILE dans ce dossier (déjà résolu : un dossier).
+    Temporaire(Objet),
 }
 
 /// Tous les systèmes, vus d'un processus : le tmpfs de la racine, et les
@@ -411,9 +415,18 @@ impl<'a, M: Monte> Vue<'a, M> {
     ///   - tronquer : un dossier, EISDIR ; autre chose qu'un fichier
     ///     ordinaire, EINVAL (`vfs_truncate`) ; puis le système ;
     ///   - les autres attributs (droits, propriétaire, dates) : le
-    ///     système répond.
+    ///     système répond ;
+    ///   - un fichier O_TMPFILE : le système répond (aucun ne sait en
+    ///     faire : `vfs_tmpfile` vérifie le droit d'écrire, puis ne trouve
+    ///     pas d'opération `tmpfile`).
     pub fn refus(&self, qui: Identite, m: Modification) -> Result<(), Erreur> {
         match m {
+            Modification::Temporaire(dossier) => match dossier {
+                Objet::Monte(s, d) => self.monte(s).refuser(qui, Interne::Temporaire { dossier: d }),
+                // Le tmpfs en sait faire : l'appelant ne vient pas ici.
+                Objet::Tmpfs(_) => Err(Erreur::EINVAL),
+                Objet::Anonyme => Err(Erreur::ENOTDIR),
+            },
             Modification::Creer(fin, creation) => {
                 if fin.objet.is_some() || fin.dernier != Dernier::Nom {
                     return Err(Erreur::EEXIST);

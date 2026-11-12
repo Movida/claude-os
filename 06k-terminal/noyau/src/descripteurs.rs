@@ -44,7 +44,7 @@ use crate::partage::Arc;
 use crate::programmes::NomCourt;
 use fichiers::montages::Objet;
 use fichiers::noyaufs::Sequence;
-use fichiers::tmpfs::{Numero, Ouvert};
+use fichiers::tmpfs::{Numero, Ouvert, Tmpfs};
 
 /// Ce que font les appels sur un fichier ouvert (les file_operations).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,6 +234,22 @@ impl FichierOuvert {
         match self.tenu {
             Tenu::Tmpfs(o) => Some(o.numero),
             Tenu::Noyau(_) => None,
+        }
+    }
+
+    /// Le nom qui l'a ouvert a-t-il disparu (le `d_unlinked` de son dentry,
+    /// que /proc dit « (deleted) ») ? Par son lieu, s'il en a un au tmpfs :
+    /// son entrée n'est plus, même si un autre lien physique garde l'inode,
+    /// et un fichier O_TMPFILE n'en a jamais eu, même lié ensuite par
+    /// linkat (mesuré : « /tmp/#123 (deleted) » après le lien). Sans lieu
+    /// (un dossier rouvert par « . » une fois effacé, la racine, ce
+    /// qu'ouvre le noyau), par le nombre de liens de l'inode. Un tube ou une
+    /// socket sans nom, jamais : leur inode a un lien (pipefs, sockfs).
+    pub fn efface(&self, fs: &Tmpfs) -> bool {
+        let Some(n) = self.numero() else { return false };
+        match &self.lieu {
+            Some(l) if let Objet::Tmpfs(d) = l.dossier => !fs.a_l_entree(d, l.cookie, n),
+            _ => fs.attributs(n).nlink == 0,
         }
     }
 

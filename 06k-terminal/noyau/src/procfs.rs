@@ -318,7 +318,7 @@ impl<'a> ProcVue<'a> {
     /// droits, comme dans fd/ (sa propre permission) ; pas dans task/, qui
     /// suit ses droits (mesuré : rmdir d'un task/<tid>, EACCES).
     fn proprietes(&self, i: u64) -> Proprietes {
-        let (genre, _, _) = decoder(i);
+        let (genre, n, _) = decoder(i);
         if genre == 0 {
             return self.fixe.proprietes(i);
         }
@@ -331,6 +331,9 @@ impl<'a> ProcVue<'a> {
             processus: genre != DOSSIER_TASK,
             immuable: matches!(genre, PROCESSUS | FIL) && self.existe(i),
             dans_proc_sys: false,
+            // Le processus qui demande : celui de la tâche courante.
+            fd_du_lecteur: genre == DOSSIER_FD
+                && processus_de(n).is_some_and(|p| processus_de(crate::tache::courante().tid()) == Some(p)),
         }
     }
 }
@@ -478,30 +481,27 @@ impl Monte for ProcVue<'_> {
     /// de « (deleted) » s'il n'a plus de nom (le `d_path` de Linux) ; un
     /// fichier sans nom dit ce qu'il est (anon_inode:[eventfd],
     /// pipe:[123]). Le chemin d'un fichier ouvert est celui de son
-    /// ouverture, et « (deleted) » se décide par son nombre de liens :
-    /// Linux tient le nom qui l'a ouvert (son dentry), et montre le nouveau
-    /// nom d'un fichier renommé, et « (deleted) » pour un nom effacé dont
-    /// un autre lien physique garde l'inode ; il faudrait au tmpfs ce
-    /// dentry (voir FichierOuvert::chemin, le même écart). Un zombie n'a
+    /// ouverture (Linux montre le nouveau nom d'un fichier renommé : voir
+    /// FichierOuvert::chemin, l'écart), et « (deleted) » se décide par son
+    /// lieu (`FichierOuvert::efface` : le nom qui l'a ouvert a disparu, même
+    /// si un autre lien physique garde l'inode). Un zombie n'a
     /// plus d'`exe`, un descripteur fermé plus de lien, et sans mémoire :
     /// vide (readlink rend ENOENT).
     fn cible<'b>(&'b self, lien: u64, lecteur: &'b [u8], fil: &'b [u8]) -> Texte<'b> {
-        let (chemin, inode) = match decoder(lien) {
+        let (chemin, efface) = match decoder(lien) {
             (0, _, _) => return self.fixe.cible(lien, lecteur, fil),
             (LIEN_EXE, n, _) => match processus_de(n).and_then(|p| Some((processus::chemin_exe(p)?, processus::exe(p)?))) {
-                Some((chemin, inode)) => (Texte::Long(chemin), Some(inode)),
+                Some((chemin, inode)) => (Texte::Long(chemin), self.fs.attributs(inode).nlink == 0),
                 None => return Texte::Emprunte(&[]),
             },
             (LIEN_FD, n, fd) => {
                 let Some(f) = self.ouvert(n, fd) else { return Texte::Emprunte(&[]) };
                 let chemin = if f.chemin.is_empty() { f.nom.octets() } else { &f.chemin[..] };
-                // Un tube ou une socket sans nom n'est jamais « effacé » ;
-                // un tube nommé, oui.
-                (Texte::Emprunte(chemin), f.numero().filter(|&i| !self.fs.est_tube(i) && !self.fs.est_socket(i)))
+                (Texte::Emprunte(chemin), f.efface(self.fs))
             }
             _ => return Texte::Emprunte(&[]),
         };
-        if !inode.is_some_and(|i| self.fs.attributs(i).nlink == 0) {
+        if !efface {
             return chemin;
         }
         match faillible::concatenation(&[&chemin, b" (deleted)"]) {
@@ -944,7 +944,7 @@ fn fichier_de_zone(z: &Zone) -> Result<Option<(Vec<u8>, u32, bool, u64)>, Erreur
         let source = if f.chemin.is_empty() { f.nom.octets() } else { &f.chemin[..] };
         let chemin = faillible::copie(source)?;
         let numero = f.numero();
-        let efface = numero.is_some_and(|n| s.fs.attributs(n).nlink == 0);
+        let efface = f.efface(&s.fs);
         Ok(Some((chemin, numero.map_or(0, |n| n.0), efface, projection.page * 4096)))
     })
 }
