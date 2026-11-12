@@ -317,7 +317,15 @@ impl<'a, M: Monte> Vue<'a, M> {
     /// ENOENT pour un dossier effacé, ENAMETOOLONG au-delà de PATH_MAX,
     /// comme `Tmpfs::chemin`.
     pub fn chemin(&self, o: Objet) -> Result<Vec<u8>, Erreur> {
+        self.chemin_par(o, false)
+    }
+
+    /// `chemin`, et avec `meme_efface`, celui d'un dossier effacé du tmpfs
+    /// aussi (`Tmpfs::chemin_meme_efface` : un point de montage, lui, ne
+    /// s'efface pas).
+    fn chemin_par(&self, o: Objet, meme_efface: bool) -> Result<Vec<u8>, Erreur> {
         let (s, mut n) = match o {
+            Objet::Tmpfs(n) if meme_efface => return self.fs.chemin_meme_efface(n),
             Objet::Tmpfs(n) => return self.fs.chemin(n),
             Objet::Monte(s, n) => (s, n),
             Objet::Anonyme => return Err(Erreur::ENOENT),
@@ -355,11 +363,13 @@ impl<'a, M: Monte> Vue<'a, M> {
     /// les liens y sont déjà résolus (`fin` vient d'une résolution qui les
     /// a suivis), « . » et « .. » aussi. Un nom absent (un fichier que
     /// l'appel va créer) : là où il sera. Pour « . », « .. » et la racine,
-    /// celui du dossier qu'ils désignent. ENAMETOOLONG au-delà de PATH_MAX,
-    /// ENOMEM.
+    /// celui du dossier qu'ils désignent, même effacé (on n'y arrive que
+    /// par un descripteur ou le dossier courant qui le tiennent : son
+    /// chemin est alors le dernier qu'il a eu, et /proc le suit de
+    /// « (deleted) »). ENAMETOOLONG au-delà de PATH_MAX, ENOMEM.
     pub fn chemin_de(&self, fin: &Fin<Objet>) -> Result<Vec<u8>, Erreur> {
         if fin.dernier != Dernier::Nom {
-            return self.chemin(fin.objet.unwrap_or(fin.dossier));
+            return self.chemin_par(fin.objet.unwrap_or(fin.dossier), true);
         }
         let mut chemin = self.chemin(fin.dossier)?;
         let barre = chemin != b"/";

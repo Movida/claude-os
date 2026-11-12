@@ -278,12 +278,18 @@ struct Dossier {
     /// `lire_dossier` sont « avant . », « avant .. » et « avant la plus
     /// récente » : les cookies commencent à 3.
     prochain: u64,
-    /// Le dossier parent. Un dossier effacé (encore tenu, par exemple comme
-    /// dossier courant) devient son propre parent : « .. » y reste (Linux,
-    /// lui, remonte encore à l'ancien parent ; il faudrait tenir une
-    /// référence au parent jusqu'à la fin du dossier, pour un cas sans
-    /// usage).
+    /// Le dossier parent. Un dossier effacé encore tenu (un dossier
+    /// courant, un descripteur) garde le sien, comme le `dentry` de Linux
+    /// garde son `d_parent` : « .. » y remonte encore, et son chemin se
+    /// calcule toujours (« /a/sous (deleted) » dans /proc, le dossier d'un
+    /// fichier O_TMPFILE qu'on y crée). Il tient alors une référence à ce
+    /// parent, rendue à sa fin (`detruire`) : le parent, même effacé à son
+    /// tour, vit au moins aussi longtemps que lui.
     parent: Numero,
+    /// Le dernier nom d'un dossier effacé (le `d_name` que garde son
+    /// dentry) : pris à l'entrée qu'on lui retire, sans allocation. Vide
+    /// tant qu'il est nommé.
+    nom: Vec<u8>,
 }
 
 enum Contenu {
@@ -388,7 +394,7 @@ impl Tmpfs {
         let mut blocs = Vec::new();
         blocs.try_reserve_exact((limites.inodes as usize).div_ceil(PAR_BLOC)).map_err(|_| Erreur::ENOMEM)?;
         let mut fs = Tmpfs { blocs, non_plein: 0, inodes: 0, pages: 0, limites };
-        let dossier = Dossier { entrees: Vec::new(), prochain: 3, parent: Numero(1) };
+        let dossier = Dossier { entrees: Vec::new(), prochain: 3, parent: Numero(1), nom: Vec::new() };
         let racine = fs.nouvel_inode(Identite::ROOT, S_IFDIR | 0o755, Contenu::Dossier(dossier), maintenant)?;
         debug_assert_eq!(racine, Numero(1));
         let r = fs.inode_mut(racine);
@@ -475,11 +481,36 @@ impl Tmpfs {
     }
 
     /// La fin d'un inode : ses pages sont rendues, sa case libérée, et les
-    /// blocs vides en fin de table rendus.
+    /// blocs vides en fin de table rendus. Un dossier effacé rend la
+    /// référence qu'il tenait à son ancien parent, qui peut finir à son tour
+    /// (s'il est effacé et que plus rien ne le tient) : une boucle, pas une
+    /// récursion, car une chaîne de dossiers effacés n'a pas de limite de
+    /// longueur, et la pile du noyau en a une.
     fn detruire(&mut self, n: Numero, cadres: &mut impl Cadres) {
+        let mut n = n;
+        while let Some(parent) = self.detruire_un(n, cadres) {
+            let p = self.inode_mut(parent);
+            p.refs -= 1;
+            if p.refs != 0 || p.nlink != 0 {
+                break;
+            }
+            n = parent;
+        }
+    }
+
+    /// `detruire` pour un seul inode ; rend l'ancien parent qu'il tenait, si
+    /// c'est un dossier effacé.
+    fn detruire_un(&mut self, n: Numero, cadres: &mut impl Cadres) -> Option<Numero> {
         let i = n.0 as usize - 1;
         let (b, c) = (i / PAR_BLOC, i % PAR_BLOC);
         let inode = self.blocs[b].cases[c].take().expect("tmpfs : inode deja detruit");
+        // Un dossier effacé tient son ancien parent ; la racine (nommée, son
+        // propre parent) et un dossier fini dès son effacement (voir
+        // `oublier_nom`), non.
+        let tenu = match &inode.contenu {
+            Contenu::Dossier(d) if inode.nlink == 0 && d.parent != n => Some(d.parent),
+            _ => None,
+        };
         cadres.inode_detruit(n, matches!(inode.contenu, Contenu::Tube | Contenu::Socket));
         self.blocs[b].prises -= 1;
         self.inodes -= 1;
@@ -491,6 +522,7 @@ impl Tmpfs {
         while self.blocs.last().is_some_and(|b| b.prises == 0) {
             self.blocs.pop();
         }
+        tenu
     }
 
     // ----- Ce que voit la résolution des chemins (et `stat`) -----
@@ -572,12 +604,13 @@ impl Tmpfs {
 
     /// Le parent du dossier `n`, son entrée et son nom (ce que la
     /// résolution d'un chemin ne donne pas pour « . », « .. » et la
-    /// racine) ; None pour la racine, un dossier effacé (son propre parent)
-    /// ou ce qui n'est pas un dossier.
+    /// racine) ; None pour la racine, un dossier effacé (son entrée n'est
+    /// plus : le `d_unlinked` de Linux) ou ce qui n'est pas un dossier.
     pub fn nom_du_dossier(&self, n: Numero) -> Option<(Numero, u64, &[u8])> {
-        let Contenu::Dossier(d) = &self.inode(n).contenu else { return None };
+        let i = self.inode(n);
+        let Contenu::Dossier(d) = &i.contenu else { return None };
         let parent = d.parent;
-        if parent == n {
+        if parent == n || i.nlink == 0 {
             return None;
         }
         let e = self.inode(parent).dossier().entrees.iter().find(|e| e.numero == n)?;
@@ -672,7 +705,7 @@ impl Tmpfs {
                 if self.inode(fin.dossier).nlink == u32::MAX {
                     return Err(Erreur::EMLINK);
                 }
-                Contenu::Dossier(Dossier { entrees: Vec::new(), prochain: 3, parent: fin.dossier })
+                Contenu::Dossier(Dossier { entrees: Vec::new(), prochain: 3, parent: fin.dossier, nom: Vec::new() })
             }
             S_IFLNK => Contenu::Lien(copie(cible)?),
             S_IFCHR | crate::S_IFBLK if !qui.root() && (genre, rdev) != (S_IFCHR, (0, 0)) => return Err(Erreur::EPERM),
@@ -722,19 +755,21 @@ impl Tmpfs {
         d.entrees.ajouter_dans_la_place(Entree { nom, numero, cookie });
     }
 
-    /// Retire l'entrée `nom` du dossier. Avec `rendre`, un dossier vidé rend
-    /// sa liste (sans, sa place reste pour une entrée qu'on va ajouter).
-    fn retirer_entree(&mut self, dossier: Numero, nom: &[u8], rendre: bool, maintenant: Temps) {
+    /// Retire l'entrée `nom` du dossier, et rend son nom (qu'un dossier
+    /// effacé garde). Avec `rendre`, un dossier vidé rend sa liste (sans, sa
+    /// place reste pour une entrée qu'on va ajouter).
+    fn retirer_entree(&mut self, dossier: Numero, nom: &[u8], rendre: bool, maintenant: Temps) -> Vec<u8> {
         let d = self.inode_mut(dossier);
         d.taille -= TAILLE_ENTREE;
         d.mtime = maintenant;
         d.ctime = maintenant;
         let entrees = &mut d.dossier_mut().entrees;
         let i = entrees.iter().position(|e| e.nom == nom).expect("tmpfs : entree introuvable");
-        entrees.remove(i);
+        let e = entrees.remove(i);
         if rendre {
             rendre_la_place(entrees);
         }
+        e.nom
     }
 
     // ----- Effacer -----
@@ -766,17 +801,29 @@ impl Tmpfs {
         self.inode(dossier).dossier().entrees.is_empty()
     }
 
-    /// Un nom de moins pour `victime`, qu'on vient de retirer du dossier
-    /// `dossier` : un dossier perd ses deux liens (son nom et son « . ») et
-    /// son parent un (son « .. »). L'inode disparaît s'il n'a plus ni nom ni
-    /// référence.
-    fn oublier_nom(&mut self, victime: Numero, dossier: Numero, maintenant: Temps, cadres: &mut impl Cadres) {
+    /// Un nom de moins pour `victime`, qu'on vient de retirer (sous le nom
+    /// `nom`) du dossier `dossier` : un dossier perd ses deux liens (son nom
+    /// et son « . ») et son parent un (son « .. »). L'inode disparaît s'il
+    /// n'a plus ni nom ni référence. Un dossier effacé qui reste tenu garde
+    /// son nom et son parent, qu'il tient (voir `Dossier::parent`) ; fini
+    /// aussitôt, il devient d'abord son propre parent, ce qui dit à
+    /// `detruire` qu'il ne tenait rien.
+    fn oublier_nom(&mut self, victime: Numero, dossier: Numero, nom: Vec<u8>, maintenant: Temps, cadres: &mut impl Cadres) {
         let v = self.inode_mut(victime);
         v.ctime = maintenant;
         if v.est_dossier() {
             v.nlink = 0;
-            v.dossier_mut().parent = victime;
-            self.inode_mut(dossier).nlink -= 1;
+            let tenu = v.refs > 0;
+            let d = v.dossier_mut();
+            d.nom = nom;
+            if !tenu {
+                d.parent = victime;
+            }
+            let p = self.inode_mut(dossier);
+            p.nlink -= 1;
+            if tenu {
+                p.refs += 1;
+            }
         } else {
             v.nlink -= 1;
         }
@@ -812,8 +859,8 @@ impl Tmpfs {
         if dossier && !self.vide(victime) {
             return Err(Erreur::ENOTEMPTY);
         }
-        self.retirer_entree(fin.dossier, &fin.nom, true, maintenant);
-        self.oublier_nom(victime, fin.dossier, maintenant, cadres);
+        let nom = self.retirer_entree(fin.dossier, &fin.nom, true, maintenant);
+        self.oublier_nom(victime, fin.dossier, nom, maintenant, cadres);
         Ok(())
     }
 
@@ -879,6 +926,13 @@ impl Tmpfs {
             return Err(if sans_ecraser { Erreur::EEXIST } else { Erreur::EBUSY });
         }
         let source = ancien.objet.ok_or(Erreur::ENOENT)?;
+        // Le nouveau nom ne se cherche pas dans un dossier effacé
+        // (`lookup_one_qstr_excl`, IS_DEADDIR), avant les pièges des
+        // ancêtres : un dossier effacé garde son parent (`ancetre` le
+        // remonterait).
+        if self.inode(nouveau.dossier).nlink == 0 {
+            return Err(Erreur::ENOENT);
+        }
         let cible = nouveau.objet;
         if sans_ecraser && cible.is_some() {
             return Err(Erreur::EEXIST);
@@ -948,11 +1002,11 @@ impl Tmpfs {
         // l'ancienne en dernier : dans le même dossier, la retirer avant
         // d'ajouter pourrait rendre la liste qu'on allait remplir.
         if let Some(c) = cible {
-            self.retirer_entree(nouveau.dossier, &nouveau.nom, false, maintenant);
-            self.oublier_nom(c, nouveau.dossier, maintenant, cadres);
+            let nom = self.retirer_entree(nouveau.dossier, &nouveau.nom, false, maintenant);
+            self.oublier_nom(c, nouveau.dossier, nom, maintenant, cadres);
         }
         self.ajouter_entree(nouveau.dossier, nom, source, maintenant);
-        self.retirer_entree(ancien.dossier, &ancien.nom, true, maintenant);
+        drop(self.retirer_entree(ancien.dossier, &ancien.nom, true, maintenant));
         self.inode_mut(source).ctime = maintenant;
         if deplace && dossier_source {
             self.inode_mut(source).dossier_mut().parent = nouveau.dossier;
@@ -1406,19 +1460,33 @@ impl Tmpfs {
         if self.inode(n).nlink == 0 {
             return Err(Erreur::ENOENT);
         }
+        self.chemin_meme_efface(n)
+    }
+
+    /// Le chemin du dossier `n`, même effacé (le `d_path` de Linux, que
+    /// montrent /proc/<pid>/fd et maps, suivi de « (deleted) ») : un dossier
+    /// effacé y est sous son dernier nom, dans son ancien parent (effacé
+    /// lui aussi, peut-être). getcwd, lui, refuse un dossier effacé
+    /// (`chemin`). ENAMETOOLONG comme `chemin`.
+    pub fn chemin_meme_efface(&self, n: Numero) -> Result<Vec<u8>, Erreur> {
         // Les noms, du bas vers le haut, puis retournés.
         let mut noms: Vec<&[u8]> = Vec::new();
         let mut courant = n;
         let mut longueur = 0;
         while courant != self.racine() {
-            let parent = self.inode(courant).dossier().parent;
-            let e = self.inode(parent).dossier().entrees.iter().find(|e| e.numero == courant).ok_or(Erreur::ENOENT)?;
-            longueur += e.nom.len() + 1;
+            let i = self.inode(courant);
+            let parent = i.dossier().parent;
+            let nom = if i.nlink == 0 {
+                &i.dossier().nom
+            } else {
+                &self.inode(parent).dossier().entrees.iter().find(|e| e.numero == courant).ok_or(Erreur::ENOENT)?.nom
+            };
+            longueur += nom.len() + 1;
             if longueur >= PATH_MAX {
                 return Err(Erreur::ENAMETOOLONG);
             }
             reserver(&mut noms, 1)?;
-            noms.ajouter_dans_la_place(&e.nom);
+            noms.ajouter_dans_la_place(nom);
             courant = parent;
         }
         let mut chemin = Vec::new();
@@ -1590,6 +1658,9 @@ impl Tmpfs {
                 }
                 if let Contenu::Dossier(d) = &i.contenu {
                     let n = Numero((b * PAR_BLOC + c + 1) as u32);
+                    if (i.nlink == 0) != !d.nom.is_empty() || (i.nlink == 0 && (d.parent == n || self.case(d.parent).is_none())) {
+                        return Err("dossier efface sans son nom ni son parent, ou nomme avec");
+                    }
                     if d.entrees.windows(2).any(|w| w[0].cookie >= w[1].cookie) || d.entrees.iter().any(|e| e.cookie >= d.prochain) {
                         return Err("cookies desordonnes");
                     }
@@ -2458,6 +2529,21 @@ mod tests {
         t.fs.prendre(p);
         t.fs.lacher(p, &mut t.c);
         assert_eq!(t.c.detruits, vec![(c, false), (a, false), (d, false), (p, true)]);
+        // Effacé mais tenu, un dossier garde son nom et son parent (le dentry
+        // de Linux) : « .. » y remonte, son chemin se calcule (pas pour
+        // getcwd) ; son parent, effacé à son tour, vit autant que lui.
+        let e = t.mkdir(b"/tmp/e").unwrap();
+        let f = t.mkdir(b"/tmp/e/f").unwrap();
+        t.fs.prendre(f);
+        t.rmdir(b"/tmp/e/f").unwrap();
+        assert_eq!((t.fs.parent(f), t.fs.chemin(f)), (e, Err(ENOENT)));
+        assert_eq!(t.fs.chemin_meme_efface(f).unwrap(), b"/tmp/e/f");
+        t.rmdir(b"/tmp/e").unwrap();
+        t.fs.invariants().unwrap();
+        assert_eq!(t.fs.chemin_meme_efface(f).unwrap(), b"/tmp/e/f");
+        assert_eq!(t.c.detruits.len(), 4);
+        t.fs.lacher(f, &mut t.c);
+        assert_eq!(t.c.detruits[4..], [(f, false), (e, false)]);
         t.verifier();
     }
 

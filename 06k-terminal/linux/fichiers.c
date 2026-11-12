@@ -941,6 +941,74 @@ static void limite_de_taille(void)
     unlink(chemin);
 }
 
+/* Le dossier des cas qui comparent les noms de /proc/self/fd : /dev/shm
+ * sur l'hôte (un tmpfs, comme notre /tmp : le /tmp de la machine de
+ * référence est un overlayfs, qui nomme autrement), /tmp chez nous. */
+static char lieu[32];
+
+static void choisir_lieu(void)
+{
+    snprintf(lieu, sizeof lieu, "%s", access("/dev/shm", W_OK) == 0 ? "/dev/shm" : "/tmp");
+}
+
+/* Le texte du lien /proc/self/fd/<fd> dans `lu` ; 0 si readlink échoue. */
+static int lien_fd(int fd, char *lu, size_t taille)
+{
+    char p[32];
+    snprintf(p, sizeof p, "/proc/self/fd/%d", fd);
+    ssize_t n = readlink(p, lu, taille - 1);
+    if (n < 0)
+        return 0;
+    lu[n] = 0;
+    return 1;
+}
+
+/* /proc/self/fd/<fd> dit-il exactement `attendu` ? */
+static int nomme(int fd, const char *attendu)
+{
+    char lu[256];
+    return lien_fd(fd, lu, sizeof lu) && strcmp(lu, attendu) == 0;
+}
+
+/* Un dossier effacé encore tenu garde son nom et son parent (le dentry de
+ * Linux) : « .. » y remonte encore, /proc le nomme par son dernier chemin
+ * suivi de « (deleted) », même rouvert par « . » après l'effacement ;
+ * getcwd, lui, refuse (ENOENT). */
+static void dossier_efface(void)
+{
+    char p[64], s[80], attendu[100];
+    snprintf(p, sizeof p, "%s/fichiers.%d.p", lieu, getpid());
+    snprintf(s, sizeof s, "%s/sous", p);
+    struct stat sp, st;
+    verifier(mkdir(p, 0755) == 0 && mkdir(s, 0755) == 0 && stat(p, &sp) == 0, "dossier efface : mkdir");
+    int fd = open(s, O_RDONLY | O_DIRECTORY);
+    verifier(fd >= 0 && rmdir(s) == 0, "dossier efface : rmdir d'un dossier tenu");
+    int haut = openat(fd, "..", O_RDONLY | O_DIRECTORY);
+    verifier(haut >= 0 && fstat(haut, &st) == 0 && st.st_ino == sp.st_ino, "dossier efface : .. remonte a l'ancien parent");
+    int point = openat(fd, ".", O_RDONLY | O_DIRECTORY);
+    snprintf(attendu, sizeof attendu, "%s (deleted)", s);
+    verifier(point >= 0 && nomme(fd, attendu) && nomme(point, attendu), "dossier efface : /proc/self/fd, meme rouvert par . : <chemin> (deleted)");
+    /* Y renommer son ancien parent : le nom ne se cherche pas dans un
+     * dossier mort (ENOENT), avant le piège de l'ancêtre (EINVAL). */
+    errno = 0;
+    verifier(renameat(AT_FDCWD, p, fd, "y") == -1 && errno == ENOENT, "dossier efface : y renommer son ancien parent : ENOENT");
+    /* Son parent, effacé à son tour, vit tant qu'il le tient. */
+    verifier(rmdir(p) == 0, "dossier efface : rmdir de son parent");
+    snprintf(attendu, sizeof attendu, "%s (deleted)", p);
+    int pp = openat(fd, "../..", O_RDONLY | O_DIRECTORY);
+    verifier(nomme(haut, attendu) && pp >= 0 && nomme(pp, lieu), "dossier efface : ../.. remonte encore, au-dessus du parent efface");
+    char c[64];
+    int ici = open(".", O_RDONLY | O_DIRECTORY);
+    errno = 0;
+    verifier(fchdir(fd) == 0 && getcwd(c, sizeof c) == NULL && errno == ENOENT, "dossier efface : getcwd dedans : ENOENT");
+    verifier(fchdir(ici) == 0, "dossier efface : en sortir");
+    close(ici);
+    close(pp);
+    close(point);
+    close(haut);
+    close(fd);
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -955,6 +1023,8 @@ int main(int argc, char **argv)
     arborescence_bornes();
     projections();
     sticky();
+    choisir_lieu();
+    dossier_efface();
     limite_de_taille();
     struct stat st;
     verifier(unlink(nom_a) == 0 && stat(nom_a, &st) == -1 && errno == ENOENT, "effacer le fichier");
