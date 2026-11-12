@@ -1,7 +1,8 @@
 //! Les minuteurs du noyau : une échéance qui déclenche quelque chose à son
 //! heure, sans tâche qui dorme pour elle (le `hrtimer` de Linux). Le
 //! premier client est timerfd (timerfd.rs) : un fichier qui devient lisible
-//! à l'échéance ; viendront ITIMER_REAL (SIGALRM) et timer_create.
+//! à l'échéance ; le second, ITIMER_REAL (alarmes.rs : SIGALRM) ; viendra
+//! timer_create.
 //!
 //! Jusqu'ici, seule une tâche qui dort pouvait attendre une échéance (les
 //! minuteries d'attente.rs : une par tâche, réservée au démarrage). Un
@@ -85,6 +86,8 @@ pub enum Quoi {
     /// Un timerfd : réveiller sa file (ceux qui le lisent, le sondent, les
     /// epoll qui le surveillent), avec POLLIN.
     Fichier(FileAttente),
+    /// L'ITIMER_REAL du processus de ce numéro : SIGALRM (alarmes.rs).
+    Alarme(u32),
 }
 
 /// L'état d'un minuteur, sous son verrou. Les champs `intervalle`,
@@ -239,6 +242,11 @@ impl core::ops::DerefMut for GardeMinuteur<'_> {
 }
 
 impl Etat {
+    /// Armé, l'échéance pas encore servie (`hrtimer_is_queued`).
+    pub fn arme(&self) -> bool {
+        self.en_file
+    }
+
     /// Le KTIME_MAX de sa base, en temps monotone.
     fn plafond(&self) -> i64 {
         (KTIME_MAX as i64).saturating_sub(self.decalage)
@@ -363,7 +371,10 @@ impl GardeMinuteur<'_> {
 
 /// Le tic du processeur 0, interruptions coupées : les échéances passées
 /// sont servies, une à une, chacune hors du verrou de la table (voir
-/// l'en-tête).
+/// l'en-tête). Servir une échéance, c'est la marquer servie, sous le verrou
+/// du minuteur, si son armement est toujours le même ; puis l'action de
+/// `Quoi`, hors de ce verrou. Une alarme est servie sous le verrou de son
+/// processus, pris avant celui du minuteur (alarmes.rs, `sonner`).
 pub fn tic(maintenant: u64) {
     loop {
         let (generation, coeur) = {
@@ -375,19 +386,25 @@ pub fn tic(maintenant: u64) {
             let Some((_, g, c)) = t.armes.pop() else { return };
             (g, c)
         };
-        {
+        let servir = || {
             let mut e = coeur.etat.verrouiller();
             if !e.en_file || e.generation != generation {
-                continue;
+                return false;
             }
             e.en_file = false;
             e.echu = true;
             e.echus = e.echus.saturating_add(1);
-        }
+            true
+        };
         match &coeur.quoi {
             // Comme le `wake_up_locked_poll` de `timerfd_triggered` : tous les
             // ordinaires, une exclusive (un epoll en EPOLLEXCLUSIVE).
-            Quoi::Fichier(file) => file.reveiller(POLLIN, 1),
+            Quoi::Fichier(file) => {
+                if servir() {
+                    file.reveiller(POLLIN, 1);
+                }
+            }
+            Quoi::Alarme(pid) => crate::alarmes::sonner(*pid, servir),
         }
         // Le cœur d'un minuteur que son propriétaire a lâché entre-temps
         // est rendu ici (le dernier Arc), hors de tout verrou.
@@ -396,8 +413,8 @@ pub fn tic(maintenant: u64) {
 }
 
 /// Un minuteur est-il armé ? (Le détecteur d'interblocage, attente.rs :
-/// une échéance peut encore réveiller un programme. Seuls les programmes
-/// ont des minuteurs.)
+/// une échéance peut encore réveiller un programme, par son timerfd ou par
+/// SIGALRM. Seuls les programmes ont des minuteurs.)
 pub fn un_arme() -> bool {
     !TABLE.verrouiller().armes.is_empty()
 }

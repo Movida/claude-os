@@ -1869,8 +1869,9 @@ pub fn renommer_fil(tid: u32, nom: NomCourt) -> Result<(), RefusNom> {
 /// échéances passées réveillent leurs tâches.
 pub fn tic(programme: bool) {
     let t = courante();
-    if t.processus.is_some() {
+    if let Some(p) = &t.processus {
         t.usage.compter_tic(programme);
+        p.compter_tic(programme);
     }
     ordonnanceur::tic();
     // Les échéances : par le processeur 0 seul, qui compte le temps
@@ -1895,6 +1896,12 @@ pub fn temps_de_calcul() -> u64 {
 pub fn temps_du_processus() -> u64 {
     let t = courante();
     t.processus.as_ref().map_or_else(|| t.calcul.load(Ordering::Relaxed), |p| p.temps_de_calcul())
+}
+
+/// Le temps de calcul de son processus en tics, (programme, noyau)
+/// (alarmes.rs) ; rien pour une tâche du noyau.
+pub fn tics_du_processus() -> (u64, u64) {
+    courante().processus.as_ref().map_or((0, 0), |p| p.tics())
 }
 
 /// La tâche courante sera tuée faute de mémoire à son retour vers
@@ -2057,12 +2064,20 @@ fn decider() -> Option<Arret> {
     }
     // Le temps de calcul du processus : RLIMIT_CPU compte tous ses fils.
     let calcul = t.processus.as_ref().map_or(0, |p| p.temps_de_calcul());
+    let tics = t.processus.as_ref().map_or((0, 0), |p| p.tics());
     let verifier_temps = t.temps_a_verifier.swap(false, Ordering::Relaxed);
-    let mut a_reveiller = None;
+    // Ceux qui prendront SIGPROF, SIGVTALRM et SIGXCPU.
+    let mut a_reveiller = [None, None, None];
     let arret = processus::essayer_avec(|p| {
         let (courante, dure) = p.limite(processus::RLIMIT_CPU);
         let atteinte = |secondes: u64| calcul as u128 >= secondes as u128 * 1_000_000_000;
         let mut xcpu = None;
+        if verifier_temps {
+            // Les alarmes de calcul (ITIMER_PROF, ITIMER_VIRTUAL), avant
+            // RLIMIT_CPU : l'ordre de `check_process_timers`.
+            let [prof, virt] = crate::alarmes::verifier_calcul(p, tics);
+            (a_reveiller[0], a_reveiller[1]) = (prof, virt);
+        }
         if verifier_temps && courante != processus::INFINI {
             if dure != processus::INFINI && atteinte(dure) {
                 return Some(Arret::LimiteDure(dure));
@@ -2077,7 +2092,7 @@ fn decider() -> Option<Arret> {
                 let sig = linux::SIGXCPU.numero as u64;
                 // Du noyau (SI_KERNEL) : il passe toujours, même au-delà de
                 // RLIMIT_SIGPENDING.
-                a_reveiller = signaux::envoyer(p, sig, signaux::Destinataire::Processus, signaux::Info::du_noyau(sig), true)
+                a_reveiller[2] = signaux::envoyer(p, sig, signaux::Destinataire::Processus, signaux::Info::du_noyau(sig), true)
                     .ok()
                     .flatten();
                 xcpu = Some(courante);
@@ -2099,8 +2114,10 @@ fn decider() -> Option<Arret> {
         })
     })
     .flatten();
-    if a_reveiller.as_ref().is_some_and(|a| !core::ptr::eq(Arc::as_ptr(a), t)) {
-        signaux::reveiller(a_reveiller);
+    for a in a_reveiller {
+        if a.as_ref().is_some_and(|a| !core::ptr::eq(Arc::as_ptr(a), t)) {
+            signaux::reveiller(a);
+        }
     }
     arret
 }

@@ -98,6 +98,10 @@ pub struct Processus {
     pub limites: [(u64, u64); LIMITES],
     /// Ses signaux : les actions, et ceux envoyés au processus (signaux.rs).
     pub signaux: Signaux,
+    /// Ses alarmes (setitimer, alarm : alarmes.rs), désarmées quand il
+    /// finit (le `Processus` rendu par `fil_termine` : l'`exit_itimers` de
+    /// Linux).
+    pub alarmes: crate::alarmes::Alarmes,
     /// Ses fils vivants, le principal d'abord (fil.rs).
     pub fils: Vec<Fil>,
     /// La fin du groupe, si elle a commencé (exit_group, un signal mortel) :
@@ -269,6 +273,12 @@ pub struct Entree {
     /// `sum_sched_runtime`), un parcours de plus à chaque tic qui vérifie une
     /// attente de temps de calcul.
     calcul: AtomicU64,
+    /// Son temps de calcul en tics (1 ms), dans le programme et dans le
+    /// noyau, de tous ses fils, vivants et morts, compté par le tic
+    /// (tache.rs) : celui de ses alarmes de calcul (alarmes.rs), comme les
+    /// `utime` et `stime` de la `thread_group_cputimer` de Linux.
+    tics_programme: AtomicU64,
+    tics_noyau: AtomicU64,
     /// Ses fils pas encore tout à fait finis : ceux de la liste, et ceux
     /// qui l'ont quittée mais dont la pile n'est pas encore rendue (la fin
     /// de bascule qui suit leur mort, tache.rs). Le processus n'est un
@@ -463,6 +473,18 @@ impl Entree {
         self.calcul.load(Ordering::Relaxed)
     }
 
+    /// Un tic d'horloge l'a trouvé dans l'un de ses fils, dans le programme
+    /// ou dans le noyau.
+    pub fn compter_tic(&self, programme: bool) {
+        let c = if programme { &self.tics_programme } else { &self.tics_noyau };
+        c.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Son temps de calcul en tics : (programme, noyau).
+    pub fn tics(&self) -> (u64, u64) {
+        (self.tics_programme.load(Ordering::Relaxed), self.tics_noyau.load(Ordering::Relaxed))
+    }
+
     /// Ce que ses fils morts ont consommé (getrusage).
     pub fn usage(&self) -> &crate::rusage::DuProcessus {
         &self.usage
@@ -504,6 +526,8 @@ pub fn ajouter(processus: Processus, descripteurs: Descripteurs, mut memoire: Me
         compteurs,
         code: AtomicI32::new(0),
         calcul: AtomicU64::new(0),
+        tics_programme: AtomicU64::new(0),
+        tics_noyau: AtomicU64::new(0),
         vivants: AtomicU32::new(0),
         zombie: AtomicBool::new(false),
         sans_memoire: AtomicBool::new(false),

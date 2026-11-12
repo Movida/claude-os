@@ -122,7 +122,7 @@
 #                  linux/systeme (uname, futex, prctl...),
 #                  linux/processeurs (sched_setaffinity, getcpu, 6j),
 #                  linux/evenements (eventfd, epoll), linux/minuteurs
-#                  (timerfd), linux/proc,
+#                  (timerfd ; setitimer et alarm), linux/proc,
 #                  linux/clone (clone, clone3), linux/fils et
 #                  linux/courses (des programmes à plusieurs fils),
 #                  linux/reseau (les sockets UDP et ICMP, sur lo) et
@@ -285,8 +285,8 @@ boot.bin: programmes.cpio FORCE
 #     et ses refus, getcpu, des fils épinglés qui restent chacun sur son
 #     processeur ; sur l'hôte aussi ;
 #   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi ;
-#   - minuteurs : gcc -static, timerfd (les soldes d'avant 6k) ; sur l'hôte
-#     aussi ;
+#   - minuteurs : gcc -static, timerfd ; setitimer et alarm (les soldes
+#     d'avant 6k) ; sur l'hôte aussi ;
 #   - proc : gcc -static, /proc (maps, statm, exe, /proc/sys) et /sys
 #     (cpu/online, transparent_hugepage) ; sur l'hôte aussi ;
 #   - ajout : gcc -static, deux programmes qui ajoutent au même fichier

@@ -151,6 +151,7 @@ mod futex;
 mod linux;
 mod memoire;
 mod minuteurs;
+mod alarmes;
 mod oom;
 mod pile;
 mod processus;

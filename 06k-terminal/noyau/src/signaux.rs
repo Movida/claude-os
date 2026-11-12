@@ -876,15 +876,22 @@ fn prendre_parmi(p: &mut Processus, tid: u32, voulus: u64) -> Option<(u64, Info)
     // Au retour vers l'anneau 3, ceux du processus seulement pour un fil
     // prévenu ; rt_sigtimedwait les regarde toujours (`do_sigtimedwait`).
     let commun = if voulus != !0 || f.prevenu { s.attente.ensemble } else { 0 };
+    // Et d'où il vient : vrai pour ceux du processus.
     let attente = match (f.attente.ensemble & permis, commun & permis) {
         (0, 0) => None,
-        (0, _) => Some(&mut s.attente),
-        _ => Some(&mut f.attente),
+        (0, _) => Some((&mut s.attente, true)),
+        _ => Some((&mut f.attente, false)),
     };
-    let pris = attente.map(|a| {
+    let pris = attente.map(|(a, du_processus)| {
         let sig = EnAttente::suivant(a.ensemble & permis);
-        (sig, a.prendre(sig))
+        (sig, a.prendre(sig), du_processus)
     });
+    // SIGALRM pris parmi ceux du processus : une alarme périodique repart
+    // (alarmes.rs ; le `posixtimer_rearm_itimer` de `dequeue_signal`, qui
+    // ne regarde pas les signaux du fil).
+    if pris.as_ref().is_some_and(|&(sig, _, du_processus)| du_processus && sig == crate::alarmes::SIGALRM) {
+        crate::alarmes::sigalrm_pris(&mut p.alarmes);
+    }
     // Recalculé même quand rien n'est pris, comme `dequeue_signal` : un fil
     // prévenu d'un signal qu'un autre a pris entre-temps (ou que sigaction a
     // effacé) ne doit pas le rester, sinon `veut` l'écarterait des signaux
@@ -896,7 +903,7 @@ fn prendre_parmi(p: &mut Processus, tid: u32, voulus: u64) -> Option<(u64, Info)
     if pris.is_some() || p.fil(tid).is_some_and(|f| f.signaux.prevenu) {
         recalculer(p, tid);
     }
-    pris
+    pris.map(|(sig, info, _)| (sig, info))
 }
 
 /// rt_sigaction(signal, action, ancienne, taille du masque). Dans l'ordre

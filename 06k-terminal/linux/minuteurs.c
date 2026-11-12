@@ -1,6 +1,7 @@
 /*
  * Les minuteurs (les soldes d'avant 6k) : timerfd, un minuteur derrière un
- * descripteur, qu'attend une boucle d'événements bâtie sur epoll. Il
+ * descripteur, qu'attend une boucle d'événements bâtie sur epoll ; les
+ * alarmes d'un processus (setitimer, getitimer, alarm). Il
  * tourne dans notre noyau et sur l'hôte (make tests-hote) : chaque ligne
  * doit dire « ok » des deux côtés, d'après ce qu'a mesuré Linux 6.18.
  *
@@ -12,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,6 +21,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/time.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
 #include <sys/uio.h>
@@ -311,6 +314,207 @@ static void surveillance(void)
     close(t);
 }
 
+/* --- Les alarmes : setitimer, getitimer, alarm --- */
+
+static volatile sig_atomic_t alarmes_recues, prof_recus, virt_recus, code_alarme;
+
+static void sur_alarme(int sig, siginfo_t *info, void *contexte)
+{
+    (void)sig;
+    (void)contexte;
+    alarmes_recues++;
+    code_alarme = info->si_code;
+}
+
+static void sur_calcul(int sig)
+{
+    if (sig == SIGPROF)
+        prof_recus++;
+    else
+        virt_recus++;
+}
+
+static int64_t us(struct timeval t)
+{
+    return (int64_t)t.tv_sec * 1000000 + t.tv_usec;
+}
+
+static struct itimerval iv(int64_t intervalle, int64_t valeur)
+{
+    struct itimerval v = {
+        { intervalle / 1000000, intervalle % 1000000 },
+        { valeur / 1000000, valeur % 1000000 },
+    };
+    return v;
+}
+
+static struct itimerval lire_alarme(int genre)
+{
+    struct itimerval v = iv(-1, -1);
+    getitimer(genre, &v);
+    return v;
+}
+
+static void attendre_ms(long ms)
+{
+    struct timespec d = { ms / 1000, (ms % 1000) * 1000000 };
+    while (nanosleep(&d, &d) != 0 && errno == EINTR)
+        ;
+}
+
+static void alarmes_erreurs(void)
+{
+    struct itimerval v, faux;
+    verifier(erreur(syscall(SYS_getitimer, 3, &v)) == EINVAL, "getitimer d'un genre inconnu : EINVAL");
+    verifier(erreur(syscall(SYS_getitimer, ITIMER_REAL, (void *)8)) == EFAULT,
+             "getitimer vers une adresse invalide : EFAULT");
+    faux = iv(0, 0);
+    faux.it_value.tv_usec = 1000000;
+    verifier(erreur(syscall(SYS_setitimer, ITIMER_REAL, &faux, NULL)) == EINVAL,
+             "setitimer, un million de microsecondes : EINVAL");
+    faux = iv(0, 1000);
+    faux.it_interval.tv_sec = -1;
+    verifier(erreur(syscall(SYS_setitimer, ITIMER_REAL, &faux, NULL)) == EINVAL,
+             "setitimer, une periode negative : EINVAL");
+    v = iv(0, 1000000);
+    verifier(erreur(syscall(SYS_setitimer, 3, &v, NULL)) == EINVAL, "setitimer d'un genre inconnu : EINVAL");
+    verifier(erreur(syscall(SYS_setitimer, 3, (void *)8, NULL)) == EFAULT,
+             "setitimer : la valeur lue avant le genre (EFAULT)");
+    int zero = 1;
+    for (int g = ITIMER_REAL; g <= ITIMER_PROF; g++) {
+        struct itimerval l = lire_alarme(g);
+        zero &= us(l.it_value) == 0 && us(l.it_interval) == 0;
+    }
+    verifier(zero, "au depart, les trois alarmes desarmees");
+    v = iv(0, 10000000);
+    verifier(erreur(syscall(SYS_setitimer, ITIMER_REAL, &v, (void *)8)) == EFAULT
+             && us(lire_alarme(ITIMER_REAL).it_value) > 9000000,
+             "l'ancienne valeur ne s'ecrit pas (EFAULT), l'alarme est pourtant armee");
+    struct itimerval ancienne;
+    verifier(syscall(SYS_setitimer, ITIMER_REAL, NULL, &ancienne) == 0 && us(ancienne.it_value) > 9000000
+             && us(lire_alarme(ITIMER_REAL).it_value) == 0,
+             "setitimer sans nouvelle valeur (NULL) : desarmee");
+}
+
+static void alarmes_reelles(void)
+{
+    verifier(alarm(0) == 0, "alarm(0) sans alarme : 0");
+    verifier(alarm(5) == 0, "alarm(5) : 0");
+    verifier(alarm(3) == 5, "alarm(3) : les 4,99 s qui restaient, arrondies a 5");
+    struct itimerval l = lire_alarme(ITIMER_REAL);
+    verifier(us(l.it_value) > 2000000 && us(l.it_value) <= 3000000 && us(l.it_interval) == 0,
+             "getitimer : moins de 3 s, sans periode");
+    verifier(alarm(0) == 3 && us(lire_alarme(ITIMER_REAL).it_value) == 0, "alarm(0) : 3, et desarmee");
+    struct itimerval v = iv(0, 300000);
+    setitimer(ITIMER_REAL, &v, NULL);
+    verifier(alarm(0) == 1, "alarm(0) avec moins d'une seconde a attendre : 1");
+    v = iv(0, 1600000);
+    setitimer(ITIMER_REAL, &v, NULL);
+    verifier(alarm(0) == 2, "1,6 s : arrondies a 2");
+    v = iv(0, 1400000);
+    setitimer(ITIMER_REAL, &v, NULL);
+    verifier(alarm(0) == 1, "1,4 s : arrondies a 1");
+    v = iv(1000000, 0);
+    setitimer(ITIMER_REAL, &v, NULL);
+    l = lire_alarme(ITIMER_REAL);
+    verifier(us(l.it_value) == 0 && us(l.it_interval) == 0, "ITIMER_REAL de valeur nulle : sa periode effacee");
+    struct itimerval ancienne;
+    v = iv(1000000, 2000000);
+    setitimer(ITIMER_REAL, &v, NULL);
+    v = iv(0, 0);
+    setitimer(ITIMER_REAL, &v, &ancienne);
+    verifier(us(ancienne.it_interval) == 1000000 && us(ancienne.it_value) > 1900000
+             && us(ancienne.it_value) <= 2000000, "setitimer rend l'ancienne : periode et temps restant");
+}
+
+static void alarme_periodique(void)
+{
+    struct sigaction sa = { .sa_sigaction = sur_alarme, .sa_flags = SA_SIGINFO };
+    sigaction(SIGALRM, &sa, NULL);
+    alarmes_recues = 0;
+    code_alarme = 0;
+    int64_t debut = ns(CLOCK_MONOTONIC);
+    struct itimerval v = iv(10000, 10000);
+    setitimer(ITIMER_REAL, &v, NULL);
+    while (alarmes_recues < 3 && ns(CLOCK_MONOTONIC) - debut < 2000000000)
+        poll(NULL, 0, 20);
+    int64_t duree = ns(CLOCK_MONOTONIC) - debut;
+    v = iv(0, 0);
+    setitimer(ITIMER_REAL, &v, NULL);
+    verifier(alarmes_recues >= 3 && duree >= 30000000, "ITIMER_REAL periodique : SIGALRM toutes les 10 ms");
+    verifier(code_alarme == SI_KERNEL, "son siginfo : SI_KERNEL, du noyau");
+}
+
+static void alarme_bloquee(void)
+{
+    sigset_t m;
+    sigemptyset(&m);
+    sigaddset(&m, SIGALRM);
+    sigprocmask(SIG_BLOCK, &m, NULL);
+    struct itimerval v = iv(5000, 5000);
+    setitimer(ITIMER_REAL, &v, NULL);
+    attendre_ms(30);
+    struct itimerval l = lire_alarme(ITIMER_REAL);
+    verifier(us(l.it_value) == 0 && us(l.it_interval) == 5000,
+             "periodique, SIGALRM bloque en attente : arretee (valeur nulle, periode gardee)");
+    siginfo_t si;
+    struct timespec zero = { 0, 0 };
+    verifier(sigtimedwait(&m, &si, &zero) == SIGALRM && si.si_code == SI_KERNEL, "sigtimedwait prend SIGALRM");
+    l = lire_alarme(ITIMER_REAL);
+    verifier(us(l.it_value) > 0 && us(l.it_value) <= 5000, "SIGALRM pris : l'alarme repart, pour moins d'une periode");
+    v = iv(0, 5000);
+    setitimer(ITIMER_REAL, &v, NULL);
+    attendre_ms(30);
+    l = lire_alarme(ITIMER_REAL);
+    verifier(us(l.it_value) == 0 && us(l.it_interval) == 0, "une seule fois, echue : valeur nulle");
+    verifier(sigtimedwait(&m, &si, &zero) == SIGALRM && us(lire_alarme(ITIMER_REAL).it_value) == 0,
+             "et son SIGALRM pris ne la rearme pas");
+    sigprocmask(SIG_UNBLOCK, &m, NULL);
+}
+
+static void alarme_ignoree(void)
+{
+    signal(SIGALRM, SIG_IGN);
+    struct itimerval v = iv(5000, 5000);
+    setitimer(ITIMER_REAL, &v, NULL);
+    attendre_ms(30);
+    struct itimerval l = lire_alarme(ITIMER_REAL);
+    verifier(us(l.it_value) == 0 && us(l.it_interval) == 5000,
+             "SIGALRM ignore : jete, jamais pris, la periodique s'arrete");
+    v = iv(0, 0);
+    setitimer(ITIMER_REAL, &v, NULL);
+}
+
+static void alarmes_de_calcul(void)
+{
+    signal(SIGPROF, sur_calcul);
+    signal(SIGVTALRM, sur_calcul);
+    struct itimerval v = iv(20000, 20000), ancienne;
+    setitimer(ITIMER_PROF, &v, NULL);
+    struct itimerval l = lire_alarme(ITIMER_PROF);
+    /* Un tic de plus a l'armement (1 ms ici, 4 ms sous WSL) : 30 ms au plus. */
+    verifier(us(l.it_value) > 0 && us(l.it_value) <= 30000 && us(l.it_interval) == 20000,
+             "ITIMER_PROF : la valeur, en temps de calcul");
+    setitimer(ITIMER_VIRTUAL, &v, NULL);
+    int64_t debut = ns(CLOCK_MONOTONIC);
+    volatile uint64_t x = 0;
+    while ((prof_recus < 3 || virt_recus < 3) && ns(CLOCK_MONOTONIC) - debut < 5000000000)
+        for (int i = 0; i < 100000; i++)
+            x += i;
+    v = iv(0, 0);
+    setitimer(ITIMER_VIRTUAL, &v, NULL);
+    setitimer(ITIMER_PROF, &v, &ancienne);
+    verifier(prof_recus >= 3 && virt_recus >= 3, "en calculant : SIGPROF et SIGVTALRM, toutes les 20 ms");
+    verifier(us(ancienne.it_interval) == 20000, "desarmee : sa periode rendue");
+    v = iv(1000000, 0);
+    setitimer(ITIMER_VIRTUAL, &v, NULL);
+    l = lire_alarme(ITIMER_VIRTUAL);
+    verifier(us(l.it_value) == 0 && us(l.it_interval) == 1000000,
+             "ITIMER_VIRTUAL de valeur nulle : desarmee, sa periode gardee (pas comme ITIMER_REAL)");
+    v = iv(0, 0);
+    setitimer(ITIMER_VIRTUAL, &v, NULL);
+}
+
 int main(void)
 {
     creation();
@@ -318,6 +522,15 @@ int main(void)
     periodique();
     bornes();
     surveillance();
+    alarmes_erreurs();
+    alarmes_reelles();
+    alarme_periodique();
+    alarme_bloquee();
+    alarme_ignoree();
+    alarmes_de_calcul();
+    /* Le processus finit son alarme armee : desarmee avec lui (le noyau
+     * compte ce qu'il a rendu, « memoire rendue »). */
+    alarm(3600);
     printf("[linux] minuteurs : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

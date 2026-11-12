@@ -177,6 +177,10 @@ const EVENTFD: u64 = 284;
 const PIPE: u64 = 22;
 const PIPE2: u64 = 293;
 const EVENTFD2: u64 = 290;
+// Les alarmes (les soldes d'avant 6k, alarmes.rs).
+const GETITIMER: u64 = 36;
+const ALARM: u64 = 37;
+const SETITIMER: u64 = 38;
 // timerfd (les soldes d'avant 6k, timerfd.rs).
 const TIMERFD_CREATE: u64 = 283;
 const TIMERFD_SETTIME: u64 = 286;
@@ -314,6 +318,9 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         PIPE => crate::tube::pipe(a[0]),
         PIPE2 => crate::tube::pipe2(a[0], a[1]),
         EVENTFD2 => evenements::eventfd2(a[0], a[1]),
+        GETITIMER => crate::alarmes::getitimer(a[0], a[1]),
+        ALARM => crate::alarmes::alarm(a[0]),
+        SETITIMER => crate::alarmes::setitimer(a[0], a[1], a[2]),
         TIMERFD_CREATE => crate::timerfd::timerfd_create(a[0], a[1]),
         TIMERFD_SETTIME => crate::timerfd::timerfd_settime(a[0], a[1], a[2], a[3]),
         TIMERFD_GETTIME => crate::timerfd::timerfd_gettime(a[0], a[1]),
@@ -507,6 +514,9 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         PIPE => ("pipe", 1),
         PIPE2 => ("pipe2", 2),
         EVENTFD2 => ("eventfd2", 2),
+        GETITIMER => ("getitimer", 2),
+        ALARM => ("alarm", 1),
+        SETITIMER => ("setitimer", 3),
         TIMERFD_CREATE => ("timerfd_create", 2),
         TIMERFD_SETTIME => ("timerfd_settime", 4),
         TIMERFD_GETTIME => ("timerfd_gettime", 2),

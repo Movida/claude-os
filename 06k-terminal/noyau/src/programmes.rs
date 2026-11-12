@@ -1107,7 +1107,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
     });
     let (pml4, depart) = (programme.memoire.tables().pml4(), programme.depart);
     let pid = processus::numero_neuf();
-    let entree = crate::signaux::Signaux::new().and_then(|signaux| {
+    let entree = crate::signaux::Signaux::new().zip(crate::alarmes::Alarmes::nouvelles(pid)).and_then(|(signaux, alarmes)| {
         processus::ajouter(processus::Processus {
             pid,
             dossier: lancement.dossier,
@@ -1116,6 +1116,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
             identite,
             limites: processus::limites_par_defaut(),
             signaux,
+            alarmes,
             fils: Vec::new(),
             fin_de_groupe: None,
         }, descripteurs, programme.memoire, nom)
