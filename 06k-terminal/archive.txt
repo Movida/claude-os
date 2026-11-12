@@ -45,6 +45,7 @@ file  /bin/copies          linux/construits/copies 755 0 0
 file  /bin/verrous         linux/construits/verrous 755 0 0
 file  /bin/surveillance    linux/construits/surveillance 755 0 0
 file  /bin/evenements      linux/construits/evenements 755 0 0
+file  /bin/minuteurs       linux/construits/minuteurs 755 0 0
 file  /bin/proc            linux/construits/proc 755 0 0
 file  /bin/partage         linux/construits/partage 755 0 0
 file  /bin/ajout           linux/construits/ajout 755 0 0

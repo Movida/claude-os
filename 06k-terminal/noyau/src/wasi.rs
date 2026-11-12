@@ -1121,7 +1121,7 @@ impl Wasi {
                 // Un programme WebAssembly n'a ni eventfd, ni epoll, ni
                 // tube : ce descripteur ne peut pas être à lui (une socket
                 // est passée plus haut).
-                (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify, _) => Err(EBADF),
+                (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd, _) => Err(EBADF),
                 // Un fichier de /proc ou de /sys : son contenu fabriqué à la
                 // lecture, comme pour un programme Linux (seule une mémoire
                 // qui manque peut échouer) ; il ne s'écrit pas.

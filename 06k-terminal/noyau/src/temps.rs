@@ -63,6 +63,7 @@
 //! 999 847,6 ns), et le compter pour une milliseconde ferait dériver
 //! l'heure de 13 secondes par jour.
 
+use crate::copie_utilisateur::copier_vers_utilisateur;
 use crate::verrou::Verrou;
 use crate::{horloge, port, tache};
 use core::sync::atomic::{AtomicI64, AtomicU64, Ordering};
@@ -218,6 +219,15 @@ pub fn maintenant() -> Temps {
     date(ns_monotone())
 }
 
+/// L'écart fixe entre la date (CLOCK_REALTIME, CLOCK_TAI) et le temps
+/// monotone, en nanosecondes : la date vaut le temps monotone plus lui. Il
+/// ne change pas tant que la date ne se règle pas (pas de clock_settime).
+/// Pour les minuteurs d'une horloge de la date (minuteurs.rs), comptés en
+/// temps monotone : ce que Linux garde dans la base REALTIME d'un hrtimer.
+pub fn decalage_de_la_date() -> i64 {
+    DATE_LUE.load(Ordering::Relaxed).saturating_mul(1_000_000_000).saturating_sub(INSTANT_DE_LECTURE.load(Ordering::Relaxed) as i64)
+}
+
 /// La date en nanosecondes depuis 1970 (`ktime_get_real_ns`).
 pub fn ns_calendrier() -> u64 {
     let t = maintenant();
@@ -244,6 +254,44 @@ pub fn temps_du_programme() -> Temps {
 /// Celui du fil en cours.
 pub fn temps_du_fil() -> Temps {
     depuis_nanosecondes(tache::temps_de_calcul())
+}
+
+/// La plus grande durée de Linux (KTIME_MAX : un s64 en nanosecondes, 292
+/// ans) : une durée plus grande y est ramenée (`timespec64_to_ktime`), et
+/// une échéance relative aussi (`ktime_add_safe`).
+pub const KTIME_MAX: u64 = i64::MAX as u64;
+
+const EFAULT: i64 = 14;
+
+/// Un `struct timespec` (secondes, nanosecondes) en nanosecondes : None s'il
+/// est invalide (`timespec64_valid` : secondes négatives, nanosecondes hors
+/// de [0, 10^9[) ; au-delà de KTIME_MAX, KTIME_MAX (`timespec64_to_ktime`).
+pub fn duree(secondes: i64, nanosecondes: i64) -> Option<u64> {
+    if secondes < 0 || !(0..1_000_000_000).contains(&nanosecondes) {
+        return None;
+    }
+    let secondes = secondes as u64;
+    Some(if secondes >= KTIME_MAX / 1_000_000_000 { KTIME_MAX } else { secondes * 1_000_000_000 + nanosecondes as u64 })
+}
+
+/// Un `struct itimerspec` (timerfd, timer_settime) : la période, puis la
+/// valeur, chacune en `timespec`, en nanosecondes (`duree`). None : l'une
+/// est invalide (`itimerspec64_valid`).
+pub fn lire_itimerspec(o: &[u8; 32]) -> Option<(u64, u64)> {
+    let mot = |i: usize| i64::from_le_bytes(o[i * 8..i * 8 + 8].try_into().unwrap_or([0; 8]));
+    Some((duree(mot(0), mot(1))?, duree(mot(2), mot(3))?))
+}
+
+/// Écrit un `struct itimerspec` (la période, puis le temps restant).
+pub fn ecrire_itimerspec(adresse: u64, intervalle: u64, valeur: u64) -> Result<(), i64> {
+    let mut o = [0u8; 32];
+    for (i, v) in [intervalle / 1_000_000_000, intervalle % 1_000_000_000, valeur / 1_000_000_000, valeur % 1_000_000_000]
+        .into_iter()
+        .enumerate()
+    {
+        o[i * 8..i * 8 + 8].copy_from_slice(&v.to_le_bytes());
+    }
+    copier_vers_utilisateur(adresse, &o).map_err(|_| -EFAULT)
 }
 
 // Les horloges de Linux (include/uapi/linux/time.h).

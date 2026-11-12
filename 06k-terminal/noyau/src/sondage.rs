@@ -121,6 +121,7 @@ pub fn sonder(o: &FichierTenu, table: &mut Table) -> u32 {
     match o.sorte {
         Sorte::EventFd => o.eventfd().sonder(table, o),
         Sorte::Inotify => o.inotify().expect("une instance").sonder(table, o),
+        Sorte::TimerFd => o.timerfd().sonder(table, o),
         // /dev/random : prêt à lire dès que son générateur l'est, sinon
         // « on peut écrire » (lui verser de l'aléa), réveillé à « prêt »
         // (`random_poll` : POLLIN | POLLRDNORM, 0x41 mesuré, ou POLLOUT |

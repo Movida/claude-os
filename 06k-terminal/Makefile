@@ -121,7 +121,8 @@
 #                  linux/signaux (nos codes d'erreur des signaux),
 #                  linux/systeme (uname, futex, prctl...),
 #                  linux/processeurs (sched_setaffinity, getcpu, 6j),
-#                  linux/evenements (eventfd, epoll), linux/proc,
+#                  linux/evenements (eventfd, epoll), linux/minuteurs
+#                  (timerfd), linux/proc,
 #                  linux/clone (clone, clone3), linux/fils et
 #                  linux/courses (des programmes à plusieurs fils),
 #                  linux/reseau (les sockets UDP et ICMP, sur lo) et
@@ -284,6 +285,8 @@ boot.bin: programmes.cpio FORCE
 #     et ses refus, getcpu, des fils épinglés qui restent chacun sur son
 #     processeur ; sur l'hôte aussi ;
 #   - evenements : gcc -static, eventfd et epoll ; sur l'hôte aussi ;
+#   - minuteurs : gcc -static, timerfd (les soldes d'avant 6k) ; sur l'hôte
+#     aussi ;
 #   - proc : gcc -static, /proc (maps, statm, exe, /proc/sys) et /sys
 #     (cpu/online, transparent_hugepage) ; sur l'hôte aussi ;
 #   - ajout : gcc -static, deux programmes qui ajoutent au même fichier
@@ -565,6 +568,10 @@ $(LINUX)/passerelle: linux/passerelle.c
 	gcc $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/evenements: linux/evenements.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/minuteurs: linux/minuteurs.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -1023,7 +1030,7 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/verrous $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/minuteurs $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/verrous $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -1277,7 +1284,7 @@ SHELL = /bin/bash
 .DELETE_ON_ERROR:
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
-            $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
+            $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/minuteurs $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
             $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/verrous $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/proprietaire $(LINUX)/autocode
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -1310,6 +1317,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/systeme | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/processeurs | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	./$(LINUX)/evenements | tee /dev/stderr | (! grep -q ECHEC)
+	timeout 60 ./$(LINUX)/minuteurs | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	./$(LINUX)/proc | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/clone | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/fils | tee /dev/stderr | grep -q "toutes les verifications : ok"

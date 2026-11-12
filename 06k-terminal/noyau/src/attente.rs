@@ -672,6 +672,9 @@ pub fn tic() {
         tache::reveiller(t, Reveil::Echeance);
     }
     drop(m);
+    // Les minuteurs du noyau (minuteurs.rs : les timerfd), après celles des
+    // tâches : chacun prend ses propres verrous.
+    crate::minuteurs::tic(maintenant);
     let mut a = ATTENTES_CALCUL.verrouiller();
     let mut i = 0;
     while i < a.len() {
@@ -737,7 +740,8 @@ pub fn detecter_interblocage() -> bool {
     if let Some(nom) = attend {
         panic!("interblocage : {} attend la memoire de son processus, et plus rien ne peut la rendre", nom);
     }
-    if MINUTERIES.verrouiller().iter().any(|(_, t)| t.est_programme() || t.est_webassembly()) || !ATTENTES_CALCUL.verrouiller().is_empty() {
+    if MINUTERIES.verrouiller().iter().any(|(_, t)| t.est_programme() || t.est_webassembly()) || !ATTENTES_CALCUL.verrouiller().is_empty()
+        || crate::minuteurs::un_arme() {
         return false;
     }
     if crate::reseau::attentes() > 0 && (crate::reseau::interface::une_carte_a_son_lien() || crate::reseau::minuteur_tcp_arme()) {
