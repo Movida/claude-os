@@ -76,7 +76,7 @@ pub enum Sorte {
     /// `Prive::Epoll`.
     Epoll,
     /// Un bout de tube (6f) : son objet dans `Prive::Tube`, son inode dans
-    /// le tmpfs (sans nom).
+    /// le tmpfs (sans nom ; ou celui d'un tube nommé).
     Tube,
     /// Une socket (6g) : son objet dans `Prive::Socket`, son inode dans le
     /// tmpfs (sans nom, celui de sockfs chez Linux).
@@ -149,7 +149,9 @@ pub enum Prive {
     Aucun,
     EventFd(Arc<crate::evenements::EventFd>),
     Epoll(Arc<crate::epoll::Epoll>),
-    Tube(Arc<crate::tube::Tube>),
+    /// Un bout de tube, et ce qu'il retient du compte des ouvertures en
+    /// écriture (le `f_pipe` de Linux, voir `Tube::sonder`).
+    Tube(Arc<crate::tube::Tube>, u32),
     Socket(Arc<crate::reseau::socket::Socket>),
     Inotify(Arc<crate::surveillance::Groupe>),
     TimerFd(Arc<crate::timerfd::TimerFd>),
@@ -322,6 +324,18 @@ impl Ouverts {
     /// (epoll::fichier_ferme, le `eventpoll_release` de Linux) : un élément
     /// ne tient pas son fichier, il le désigne par sa case.
     pub fn lacher(&mut self, f: Fichier) -> Option<FichierOuvert> {
+        self.lacher_en(f, true)
+    }
+
+    /// Comme `lacher`, pour le fichier d'une ouverture qui n'a pas abouti
+    /// (vfs.rs, `abandonner`) : le bout d'un tube n'est pas fermé (pas de
+    /// `pipe_release`), son compte seulement défait
+    /// (`tube::fichier_jamais_ouvert`).
+    pub fn abandonner(&mut self, f: Fichier) -> Option<FichierOuvert> {
+        self.lacher_en(f, false)
+    }
+
+    fn lacher_en(&mut self, f: Fichier, ouvert: bool) -> Option<FichierOuvert> {
         let fichier = self.fichier(f);
         fichier.references -= 1;
         if fichier.references > 0 {
@@ -332,7 +346,11 @@ impl Ouverts {
             // Ses verrous OFD et son flock (`locks_remove_file`).
             crate::verrous_de_fichiers::derniere_fermeture(f);
             crate::epoll::fichier_ferme(self, o);
-            crate::tube::fichier_ferme(o, f);
+            if ouvert {
+                crate::tube::fichier_ferme(o, f);
+            } else {
+                crate::tube::fichier_jamais_ouvert(o);
+            }
             crate::reseau::socket::fichier_ferme(o, f);
             crate::surveillance::fichier_ferme(o, f);
         }

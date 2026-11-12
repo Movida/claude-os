@@ -224,6 +224,14 @@ pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
 pub const DT_LNK: u8 = 10;
 
+/// Le type d'entrée de dossier d'un mode (`fs_umode_to_dtype`) : les DT_
+/// valent les bits du type décalés de douze (DT_FIFO 1, DT_CHR 2, DT_DIR 4,
+/// DT_BLK 6, DT_REG 8, DT_LNK 10, DT_SOCK 12), ce que Linux utilise tel
+/// quel.
+pub fn type_d_entree(mode: u32) -> u8 {
+    ((mode & S_IFMT) >> 12) as u8
+}
+
 /// La taille d'un dossier : tmpfs compte 20 octets par entrée (son
 /// BOGO_DIRENT_SIZE), « . » et « .. » compris. Linux le fait pour que des
 /// programmes qui regardent st_size d'un dossier vide (des outils de
@@ -623,11 +631,17 @@ impl Tmpfs {
     ///     existe : EEXIST ;
     ///   - une barre finale pour autre chose qu'un dossier : ENOENT ;
     ///   - dossier effacé (ENOENT), pas le droit d'y écrire (EACCES) ;
-    ///   - un périphérique, sans être root : EPERM ;
+    ///   - un périphérique (caractères ou blocs), sans être root : EPERM,
+    ///     sauf le périphérique de caractères 0:0 (le « whiteout »
+    ///     d'overlayfs, que Linux laisse créer à tous depuis 5.8 : il ne
+    ///     mène à aucun pilote) ;
     ///   - plus d'inode (ENOSPC), plus de mémoire (ENOMEM).
     /// Une socket (S_IFSOCK, 6h) : le nom d'une socket AF_UNIX liée à un
-    /// chemin (le `vfs_mknod` d'`unix_bind`), un inode sans contenu ; le
-    /// rouvrir rend ENXIO (le noyau le dit).
+    /// chemin (le `vfs_mknod` d'`unix_bind`), ou fait par mknod, un inode
+    /// sans contenu ; le rouvrir rend ENXIO (le noyau le dit). Un tube nommé
+    /// (S_IFIFO, mknod) : un inode sans contenu lui aussi ; son tube n'existe
+    /// que tant qu'un bout est ouvert, et c'est le noyau qui le tient
+    /// (tube.rs, le `i_pipe` de Linux), pas l'inode.
     /// Le nouvel inode appartient à `qui` ; son groupe est celui du dossier
     /// si le dossier a le bit S_ISGID (et un sous-dossier en hérite), comme
     /// Linux. Un fichier créé là, setgid et exécutable par le groupe, par
@@ -661,8 +675,8 @@ impl Tmpfs {
                 Contenu::Dossier(Dossier { entrees: Vec::new(), prochain: 3, parent: fin.dossier })
             }
             S_IFLNK => Contenu::Lien(copie(cible)?),
-            S_IFCHR if !qui.root() => return Err(Erreur::EPERM),
-            S_IFCHR | crate::S_IFSOCK => Contenu::Rien,
+            S_IFCHR | crate::S_IFBLK if !qui.root() && (genre, rdev) != (S_IFCHR, (0, 0)) => return Err(Erreur::EPERM),
+            S_IFCHR | crate::S_IFBLK | crate::S_IFSOCK | crate::S_IFIFO => Contenu::Rien,
             _ => return Err(Erreur::EINVAL),
         };
         let parent = self.inode(fin.dossier);
@@ -1376,13 +1390,7 @@ impl Tmpfs {
         let borne = if position <= 2 { u64::MAX } else { position };
         let fin = d.entrees.partition_point(|e| e.cookie < borne);
         for e in d.entrees[..fin].iter().rev() {
-            let genre = match self.inode(e.numero).genre() {
-                S_IFDIR => DT_DIR,
-                S_IFLNK => DT_LNK,
-                S_IFCHR => DT_CHR,
-                _ => DT_REG,
-            };
-            if !entree(&e.nom, e.numero, genre, e.cookie) {
+            if !entree(&e.nom, e.numero, type_d_entree(self.inode(e.numero).genre()), e.cookie) {
                 return Ok(());
             }
         }
@@ -1849,6 +1857,15 @@ mod tests {
         // Un périphérique, sans être root.
         let f = t.fin(b"/tmp/null", Suivre::Jamais).unwrap();
         assert_eq!(t.fs.creer(DAVID, &f, S_IFCHR | 0o666, (1, 3), &[], T0), Err(EPERM));
+        // Ni de blocs, même 0:0 ; mais le « whiteout » (caractères 0:0), et
+        // un tube nommé (mknod, mesuré).
+        assert_eq!(t.fs.creer(DAVID, &f, crate::S_IFBLK | 0o666, (7, 0), &[], T0), Err(EPERM));
+        assert_eq!(t.fs.creer(DAVID, &f, crate::S_IFBLK | 0o666, (0, 0), &[], T0), Err(EPERM));
+        let w = t.fs.creer(DAVID, &f, S_IFCHR | 0o644, (0, 0), &[], T0).unwrap();
+        let f = t.fin(b"/tmp/tube", Suivre::Jamais).unwrap();
+        let p = t.fs.creer(DAVID, &f, crate::S_IFIFO | 0o644, (0, 0), &[], T0).unwrap();
+        let (aw, ap) = (t.fs.attributs(w), t.fs.attributs(p));
+        assert_eq!((aw.mode, aw.rdev, ap.mode, ap.nlink, ap.taille), (S_IFCHR | 0o644, (0, 0), crate::S_IFIFO | 0o644, 1, 0));
         assert_eq!(t.symlink(b"", b"/tmp/vide"), Err(ENOENT));
         // Un lien vide est refusé avant de regarder le nom : ENOENT, même
         // sur un nom qui existe.
@@ -2196,6 +2213,21 @@ mod tests {
             true
         }).unwrap();
         assert_eq!(types[1], (b"..".to_vec(), tmp, DT_DIR));
+        // Ceux des autres sortes d'inodes : DT_FIFO (1), DT_CHR (2), DT_BLK
+        // (6), DT_SOCK (12).
+        let sous = t.trouver(b"/tmp/sous").unwrap();
+        for (nom, genre, rdev) in [(&b"/tmp/sous/t"[..], crate::S_IFIFO, (0, 0)), (b"/tmp/sous/c", S_IFCHR, (1, 3)),
+                                   (b"/tmp/sous/b", crate::S_IFBLK, (7, 0)), (b"/tmp/sous/s", crate::S_IFSOCK, (0, 0))] {
+            let f = t.fin(nom, Suivre::Jamais).unwrap();
+            t.fs.creer(Identite::ROOT, &f, genre | 0o644, rdev, &[], T0).unwrap();
+        }
+        let mut types = Vec::new();
+        t.fs.lire_dossier(sous, 2, |nom, _, genre, _| {
+            types.push((nom.to_vec(), genre));
+            true
+        }).unwrap();
+        types.sort();
+        assert_eq!(types, [(b"b".to_vec(), 6), (b"c".to_vec(), DT_CHR), (b"s".to_vec(), 12), (b"t".to_vec(), 1)]);
     }
 
     #[test]

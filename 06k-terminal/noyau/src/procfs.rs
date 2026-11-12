@@ -495,7 +495,9 @@ impl Monte for ProcVue<'_> {
             (LIEN_FD, n, fd) => {
                 let Some(f) = self.ouvert(n, fd) else { return Texte::Emprunte(&[]) };
                 let chemin = if f.chemin.is_empty() { f.nom.octets() } else { &f.chemin[..] };
-                (Texte::Emprunte(chemin), f.numero().filter(|_| !matches!(f.sorte, Sorte::Tube | Sorte::Socket)))
+                // Un tube ou une socket sans nom n'est jamais « effacé » ;
+                // un tube nommé, oui.
+                (Texte::Emprunte(chemin), f.numero().filter(|&i| !self.fs.est_tube(i) && !self.fs.est_socket(i)))
             }
             _ => return Texte::Emprunte(&[]),
         };

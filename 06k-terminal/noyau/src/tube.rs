@@ -29,6 +29,16 @@
 //! L'inode d'un tube est un inode sans nom du tmpfs (`Tmpfs::creer_tube`),
 //! celui de pipefs chez Linux : fstat, fchmod, fchown, futimens s'en
 //! servent ; son lien dans /proc/self/fd est « pipe:[numero] ».
+//!
+//! Un tube NOMMÉ (les soldes d'avant 6k) est un inode S_IFIFO du tmpfs,
+//! fait par mknod, sans contenu : son tube naît à la première ouverture
+//! d'un bout et meurt avec le dernier bout fermé (ce qui y restait à lire
+//! est perdu), comme le `i_pipe` de Linux ; c'est la table `TUBES` qui les
+//! associe. Ouvrir un bout attend l'autre (`fifo_open`) : un lecteur attend
+//! un écrivain, et l'inverse ; en non bloquant, un lecteur passe, un
+//! écrivain sans lecteur reçoit ENXIO ; en lecture et écriture, jamais
+//! d'attente. L'attente se fait hors du verrou des fichiers
+//! (appels_fichiers.rs, `ouvrir`).
 
 use crate::appels_fichiers::{FichierTenu, installer_paire};
 use crate::asynchrone::{self, ListeAsync, Raison};
@@ -47,6 +57,7 @@ use core::sync::atomic::{AtomicBool, AtomicU64, Ordering::{AcqRel, Relaxed, Rele
 use fichiers::tmpfs::Ouvert;
 
 const EPERM: i64 = 1;
+const ENXIO: i64 = 6;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
 const EFAULT: i64 = 14;
@@ -81,11 +92,16 @@ pub const TAILLE_MAX: u64 = 1 << 20;
 pub const PAGES_UTILISATEUR_DOUCE: u64 = 16 * 1024;
 pub const PAGES_UTILISATEUR_DURE: u64 = 0;
 
-/// Les tubes vivants, par le numéro de leur inode (pipefs) : pour en rouvrir
-/// un par /proc/<pid>/fd (Linux : `inode->i_pipe`). Un tube la quitte quand
-/// son dernier bout est fermé, avant que le tmpfs ne puisse redonner son
-/// numéro d'inode (`put_pipe_info`, qui coupe `i_pipe`) ; elle est rendue
-/// vide quand il n'y en a plus.
+/// Les tubes vivants, par le numéro de leur inode (pipefs, ou celui d'un
+/// tube nommé) : pour en rouvrir un par /proc/<pid>/fd, pour trouver celui
+/// d'un tube nommé (Linux : `inode->i_pipe`). Un tube la quitte quand son
+/// dernier bout est fermé, avant que le tmpfs ne puisse redonner son numéro
+/// d'inode (`put_pipe_info`, qui coupe `i_pipe`) ; elle est rendue vide
+/// quand il n'y en a plus. Chercher le tube d'un inode puis l'ajouter
+/// (`ouvrir`), et l'en retirer à son dernier bout (`fermer_bout`), se font
+/// sous le verrou des fichiers : ils ne font qu'un. pipe2 y ajoute, hors de
+/// lui, un inode neuf que personne ne peut encore chercher, et la fin d'un
+/// tube (`Drop`) n'en retire que des entrées mortes.
 static TUBES: Verrou<Vec<(u32, Weak<Tube>)>> = Verrou::new(Vec::new());
 
 /// Les pages de tubes de l'utilisateur (le `pipe_bufs` de sa `user_struct` :
@@ -230,6 +246,14 @@ struct Etat {
     taille: u32,
     lecteurs: u32,
     ecrivains: u32,
+    /// Combien de bouts ont été ouverts en lecture, en écriture (les
+    /// `r_counter` et `w_counter` de Linux, qui partent de 1 et font le tour
+    /// de 2^32). Qui attend l'autre bout d'un tube nommé attend que son
+    /// compte change (un écrivain venu et reparti aussitôt compte) ; et un
+    /// lecteur ouvert en non bloquant sans écrivain retient celui des
+    /// écritures : il ne verra POLLHUP qu'après la venue d'un écrivain.
+    ouvertures_lecture: u32,
+    ouvertures_ecriture: u32,
 }
 
 impl Etat {
@@ -355,10 +379,20 @@ fn attendre_en(file: &FileAttente, exclusive: bool, condition: impl FnMut() -> b
     attente::attendre_que(file, inscription, Sommeil::Interruptible, None, condition) == Reveil::Reveillee
 }
 
+/// Ce qu'une ouverture d'un tube nommé attend encore, hors du verrou des
+/// fichiers : l'autre bout (`Tube::attendre_partenaire`).
+pub struct Partenaire {
+    /// Un lecteur, qui attend un écrivain (sinon l'inverse).
+    lecteur: bool,
+    /// Le compte des ouvertures de l'autre côté, à l'ouverture.
+    compte: u32,
+}
+
 impl Tube {
-    /// Un tube neuf (`alloc_pipe_info`) : ses cases (`compter_un_tube_neuf`) ;
-    /// None au-delà de la limite dure de l'utilisateur, ou sans mémoire.
-    fn new() -> Option<Tube> {
+    /// Un tube neuf (`alloc_pipe_info`), avec ses premiers bouts : ses cases
+    /// (`compter_un_tube_neuf`) ; None au-delà de la limite dure de
+    /// l'utilisateur, ou sans mémoire.
+    fn new(lecteurs: u32, ecrivains: u32) -> Option<Tube> {
         let n = compter_un_tube_neuf()?;
         let anneau = match vides(n as usize) {
             Ok(a) => a,
@@ -369,7 +403,16 @@ impl Tube {
         };
         Some(Tube {
             anneau: Mutex::new(anneau),
-            etat: Verrou::new(Etat { tete: 0, queue: 0, max: n, taille: n, lecteurs: 1, ecrivains: 1 }),
+            etat: Verrou::new(Etat {
+                tete: 0,
+                queue: 0,
+                max: n,
+                taille: n,
+                lecteurs,
+                ecrivains,
+                ouvertures_lecture: 1,
+                ouvertures_ecriture: 1,
+            }),
             rd_wait: FileAttente::new(),
             wr_wait: FileAttente::new(),
             sonde: AtomicBool::new(false),
@@ -659,6 +702,10 @@ impl Tube {
     /// Le sondage d'un bout (`pipe_poll`) : ses files d'abord, puis l'état.
     /// Côté lecture : POLLIN s'il y a de quoi lire, POLLHUP sans écrivain ;
     /// côté écriture : POLLOUT s'il y a de la place, POLLERR sans lecteur.
+    /// POLLHUP côté lecture : sans écrivain, sauf pour un lecteur d'un tube
+    /// nommé ouvert en non bloquant quand aucun écrivain n'est venu depuis
+    /// (le `f_pipe` du bout : mesuré, poll rend 0, puis POLLIN | POLLHUP
+    /// après un écrivain qui a écrit et fermé).
     pub fn sonder(&self, table: &mut Table, tenu: &FichierTenu) -> u32 {
         self.sonde.store(true, Relaxed);
         if tenu.lecture {
@@ -673,7 +720,11 @@ impl Tube {
             if !e.vide() {
                 m |= POLLIN | POLLRDNORM;
             }
-            if e.ecrivains == 0 {
+            let vu = match tenu.prive {
+                Prive::Tube(_, vu) => vu,
+                _ => 0,
+            };
+            if e.ecrivains == 0 && vu != e.ouvertures_ecriture {
                 m |= POLLHUP;
             }
         }
@@ -762,20 +813,59 @@ impl Tube {
         n as i64 * PAGE as i64
     }
 
-    /// Un bout de plus, rouvert par /proc/<pid>/fd (le `fifo_open` d'un
-    /// tube, qui n'attend jamais l'autre bout) : un lecteur ou un écrivain
-    /// de plus ; le premier d'un côté réveille qui attend de l'autre.
-    fn ouvrir_bout(&self, lecture: bool, ecriture: bool) {
-        let premier = {
-            let mut e = self.etat.verrouiller();
-            let premier = (lecture && e.lecteurs == 0) || (ecriture && e.ecrivains == 0);
-            e.lecteurs += lecture as u32;
-            e.ecrivains += ecriture as u32;
-            premier
-        };
+    /// Un bout de plus (`fifo_open`) : un lecteur, un écrivain ou les deux,
+    /// et le compte de leurs ouvertures ; le premier d'un côté réveille qui
+    /// attend l'autre (`wake_up_partner`, dans `rd_wait`). Un tube nommé
+    /// (pas celui d'un pipe2 rouvert par /proc/<pid>/fd, qui n'attend
+    /// jamais), dans l'ordre de Linux :
+    ///   - en écriture seule, non bloquant et sans lecteur : ENXIO, rien
+    ///     n'a changé ;
+    ///   - en lecture seule sans écrivain : non bloquant, le bout retient le
+    ///     compte des écritures (pour `sonder`) ; bloquant, il attendra un
+    ///     écrivain ;
+    ///   - en écriture seule sans lecteur, bloquant : il attendra un
+    ///     lecteur ;
+    ///   - en lecture et en écriture : jamais d'attente, le bout se parle à
+    ///     lui-même.
+    /// Rend ce que retient le bout, et ce qu'il reste à attendre.
+    fn ouvrir_bout(&self, lecture: bool, ecriture: bool, nomme: bool, non_bloquant: bool)
+        -> Result<(u32, Option<Partenaire>), i64> {
+        let mut e = self.etat.verrouiller();
+        if nomme && ecriture && !lecture && non_bloquant && e.lecteurs == 0 {
+            return Err(-ENXIO);
+        }
+        let premier = (lecture && e.lecteurs == 0) || (ecriture && e.ecrivains == 0);
+        e.lecteurs += lecture as u32;
+        e.ecrivains += ecriture as u32;
+        e.ouvertures_lecture = e.ouvertures_lecture.wrapping_add(lecture as u32);
+        e.ouvertures_ecriture = e.ouvertures_ecriture.wrapping_add(ecriture as u32);
+        let (mut vu, mut partenaire) = (0, None);
+        if nomme && lecture && !ecriture && e.ecrivains == 0 {
+            if non_bloquant {
+                vu = e.ouvertures_ecriture;
+            } else {
+                partenaire = Some(Partenaire { lecteur: true, compte: e.ouvertures_ecriture });
+            }
+        } else if nomme && ecriture && !lecture && e.lecteurs == 0 {
+            partenaire = Some(Partenaire { lecteur: false, compte: e.ouvertures_lecture });
+        }
+        drop(e);
         if premier {
             self.rd_wait.reveiller_toutes();
         }
+        Ok((vu, partenaire))
+    }
+
+    /// Attend l'autre bout d'un tube nommé (`wait_for_partner`) : qu'un
+    /// bout s'ouvre de l'autre côté, ce que dit le compte de ses ouvertures.
+    /// Faux : un signal, et personne n'est venu ; à l'appelant de défaire
+    /// son bout (`vfs::Systeme::abandonner`, qui passe par
+    /// `fichier_jamais_ouvert`) et de rendre ERESTARTSYS.
+    pub fn attendre_partenaire(&self, p: &Partenaire) -> bool {
+        attendre_en(&self.rd_wait, false, || {
+            let e = self.etat();
+            p.compte != if p.lecteur { e.ouvertures_ecriture } else { e.ouvertures_lecture }
+        })
     }
 
     /// Le dernier close d'un bout (`pipe_release`), sous le verrou des
@@ -793,9 +883,9 @@ impl Tube {
             }
             ((e.lecteurs == 0) != (e.ecrivains == 0), e.lecteurs == 0 && e.ecrivains == 0)
         };
-        // Plus aucun bout : l'inode n'a plus de tube. Un O_PATH qui le tient
-        // encore ne peut plus le rouvrir (ENXIO ; Linux en fabrique un neuf,
-        // `fifo_open` : un écart, pour un cas que rien ne demande).
+        // Plus aucun bout : l'inode n'a plus de tube. La prochaine ouverture
+        // en fera un neuf (un tube nommé, ou un O_PATH qui tient encore
+        // l'inode d'un pipe2).
         if plus_aucun {
             TUBES.verrouiller().retain(|(_, t)| !core::ptr::eq(t.as_ptr(), self));
         }
@@ -804,6 +894,38 @@ impl Tube {
             self.wr_wait.reveiller_toutes();
         }
         fin
+    }
+}
+
+impl Tube {
+    /// Un bout dont l'ouverture n'a pas abouti (`err_rd` et `err_wr` de
+    /// `fifo_open` : un signal pendant l'attente de l'autre bout ; ou un
+    /// fichier jamais rangé), sous le verrou des fichiers : un lecteur ou un
+    /// écrivain de moins, sans `pipe_release`. Son côté tombé à zéro réveille
+    /// l'autre (un lecteur : un écrivain qui attend, et ceux qui sondent,
+    /// le `wake_up` de `wr_wait` ; un écrivain : tous les lecteurs, le
+    /// `wake_up_all` de `rd_wait`), mais il n'y a pas de fin à dire, ni de
+    /// SIGIO : le fichier n'a jamais été ouvert.
+    fn abandonner_bout(&self, lecture: bool, ecriture: bool) {
+        let (lecteurs, ecrivains) = {
+            let mut e = self.etat.verrouiller();
+            if lecture {
+                e.lecteurs -= 1;
+            }
+            if ecriture {
+                e.ecrivains -= 1;
+            }
+            (e.lecteurs, e.ecrivains)
+        };
+        if lecteurs == 0 && ecrivains == 0 {
+            TUBES.verrouiller().retain(|(_, t)| !core::ptr::eq(t.as_ptr(), self));
+        }
+        if lecture && lecteurs == 0 {
+            self.wr_wait.reveiller_une();
+        }
+        if ecriture && ecrivains == 0 {
+            self.rd_wait.reveiller_toutes();
+        }
     }
 }
 
@@ -871,7 +993,7 @@ impl Poseur<'_> {
 }
 
 /// Le chemin d'un bout, celui que montre /proc/self/fd : « pipe:[inode] ».
-fn chemin(numero: u32) -> Vec<u8> {
+pub fn nom(numero: u32) -> Vec<u8> {
     let mut t = [0u8; 10];
     let n = vfs::decimal(numero, &mut t);
     faillible::concatenation(&[b"pipe:[", n, b"]"]).unwrap_or_default()
@@ -891,7 +1013,7 @@ pub fn pipe2(tableau: u64, drapeaux: u64) -> i64 {
     if drapeaux & O_NOTIFICATION_PIPE != 0 {
         return -ENOPKG;
     }
-    let Some(tube) = Tube::new() else { return -ENFILE };
+    let Some(tube) = Tube::new(1, 1) else { return -ENFILE };
     let Ok(tube) = Arc::new(tube) else { return -ENFILE };
     if TUBES.verrouiller().try_reserve(1).is_err() {
         return -ENFILE;
@@ -914,8 +1036,8 @@ pub fn pipe2(tableau: u64, drapeaux: u64) -> i64 {
     let bout = |lecture: bool, ecriture: bool, etat: u32| {
         let ouvert = Ouvert { numero, cree: false, tronquer: false, ecrivain: false };
         let mut f = FichierOuvert::new(Sorte::Tube, Tenu::Tmpfs(ouvert), lecture, ecriture, etat, b"pipe");
-        f.chemin = chemin(numero.0);
-        f.prive = Prive::Tube(tube.clone());
+        f.chemin = nom(numero.0);
+        f.prive = Prive::Tube(tube.clone(), 0);
         f
     };
     let lecture = bout(true, false, (drapeaux & O_NONBLOCK) as u32);
@@ -933,13 +1055,36 @@ pub fn pipe(tableau: u64) -> i64 {
     pipe2(tableau, 0)
 }
 
-/// Rouvre le tube de l'inode `numero` (par /proc/<pid>/fd) : un bout de
-/// plus, en lecture, en écriture ou les deux ; rend son tube et le nom du
-/// bout (« pipe:[numero] »). None : plus de tube à cet inode.
-pub fn rouvrir(numero: fichiers::tmpfs::Numero, lecture: bool, ecriture: bool) -> Option<(Arc<Tube>, Vec<u8>)> {
-    let tube = TUBES.verrouiller().iter().filter(|(n, _)| *n == numero.0).find_map(|(_, t)| t.upgrade())?;
-    tube.ouvrir_bout(lecture, ecriture);
-    Some((tube, chemin(numero.0)))
+/// Ouvre un bout du tube de l'inode `numero` (`fifo_open`), sous le verrou
+/// des fichiers : un tube nommé (`nomme`), ou celui d'un pipe2 rouvert par
+/// /proc/<pid>/fd. Le tube de l'inode, s'il en a un ; sinon un tube neuf
+/// (ENOMEM sans mémoire), que trouveront les ouvertures suivantes tant
+/// qu'un bout restera ouvert. Puis `Tube::ouvrir_bout` : rend le tube, ce
+/// que retient le bout (pour `sonder`) et ce qu'il reste à attendre.
+pub fn ouvrir(numero: fichiers::tmpfs::Numero, nomme: bool, lecture: bool, ecriture: bool, non_bloquant: bool)
+    -> Result<(Arc<Tube>, u32, Option<Partenaire>), i64> {
+    let existant = TUBES.verrouiller().iter().filter(|(n, _)| *n == numero.0).find_map(|(_, t)| t.upgrade());
+    let tube = match existant {
+        Some(t) => t,
+        None => {
+            // ENXIO avant d'en fabriquer un : un tube neuf n'a pas de
+            // lecteur (Linux le fabrique, puis le défait).
+            if nomme && ecriture && !lecture && non_bloquant {
+                return Err(-ENXIO);
+            }
+            let t = Tube::new(0, 0).ok_or(-ENOMEM)?;
+            let t = Arc::new(t).map_err(|_| -ENOMEM)?;
+            // Le verrou rendu avant que `t` ne le soit : sa fin (`drop`)
+            // prend la table.
+            let place = TUBES.verrouiller().ajouter((numero.0, Arc::downgrade(&t)));
+            if place.is_err() {
+                return Err(-ENOMEM);
+            }
+            t
+        }
+    };
+    let (vu, partenaire) = tube.ouvrir_bout(lecture, ecriture, nomme, non_bloquant)?;
+    Ok((tube, vu, partenaire))
 }
 
 /// Le bout `tenu` d'un tube, fermé pour la dernière fois. Sous le verrou des fichiers : le signal
@@ -947,7 +1092,7 @@ pub fn rouvrir(numero: fichiers::tmpfs::Numero, lecture: bool, ecriture: bool) -
 /// l'appel (`signaler_les_fermes`, à côté de la fermeture des sockets) : un signal prend le verrou
 /// d'un processus, qui passe avant celui-ci. Sans allocation : la liste est chaînée par les tubes.
 pub fn fichier_ferme(ferme: &FichierOuvert, fichier: Fichier) {
-    if let Prive::Tube(t) = &ferme.prive {
+    if let Prive::Tube(t, _) = &ferme.prive {
         t.async_lecteurs.retirer(fichier);
         t.async_ecrivains.retirer(fichier);
         let fin = t.fermer_bout(ferme.lecture, ferme.ecriture);
@@ -964,11 +1109,12 @@ pub fn fichier_ferme(ferme: &FichierOuvert, fichier: Fichier) {
     }
 }
 
-/// Le bout d'un tube qui n'a jamais eu de place dans la table des fichiers : personne n'a pu s'y
-/// inscrire.
+/// Le bout d'un tube dont l'ouverture n'a pas abouti (`Tube::abandonner_bout`) : un fichier qui n'a
+/// jamais eu de place dans la table des fichiers, ou celui d'un tube nommé dont l'attente a été
+/// interrompue (`Ouverts::abandonner`). Personne n'a pu s'y inscrire.
 pub fn fichier_jamais_ouvert(ferme: &FichierOuvert) {
-    if let Prive::Tube(t) = &ferme.prive {
-        t.fermer_bout(ferme.lecture, ferme.ecriture);
+    if let Prive::Tube(t, _) = &ferme.prive {
+        t.abandonner_bout(ferme.lecture, ferme.ecriture);
     }
 }
 

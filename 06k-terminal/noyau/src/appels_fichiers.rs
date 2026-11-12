@@ -57,7 +57,7 @@ use fichiers::chemins::{Arbre, Depart, Dernier, Fin, PATH_MAX, Suivre};
 use fichiers::montages::{Creation, Modification, Objet, Vue, dans_le_tmpfs, en_tmpfs};
 use crate::vfs::Montage;
 use fichiers::tmpfs::{Attributs, Numero, Ouverture, limite_ecriture, suivre_pour};
-use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, permis};
+use fichiers::{Erreur, Identite, PAGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, permis};
 use crate::attente::{GardeMutex, Mutex};
 use crate::pages::Page;
 use crate::tube::Poseur;
@@ -229,7 +229,7 @@ impl FichierTenu {
     /// Le tube d'un bout de tube.
     pub fn tube(&self) -> &crate::tube::Tube {
         match &self.prive {
-            Prive::Tube(t) => t,
+            Prive::Tube(t, _) => t,
             _ => unreachable!("un tube sans objet"),
         }
     }
@@ -647,8 +647,8 @@ fn sorte(mode: u32, rdev: (u32, u32)) -> Result<Sorte, i64> {
     Ok(match mode & S_IFMT {
         S_IFREG => Sorte::Fichier,
         S_IFDIR => Sorte::Dossier,
-        // L'inode d'un tube, rouvert par /proc/<pid>/fd (le `fifo_open` de
-        // Linux) : son tube (tube::rouvrir).
+        // Un tube nommé, ou l'inode d'un tube rouvert par /proc/<pid>/fd (le
+        // `fifo_open` de Linux) : son tube (tube::ouvrir).
         S_IFIFO => Sorte::Tube,
         // Une socket ne se rouvre pas par son inode (`sock_no_open` : ENXIO,
         // mesuré) ; O_PATH, oui (il ne passe pas par ici).
@@ -662,6 +662,8 @@ fn sorte(mode: u32, rdev: (u32, u32)) -> Result<Sorte, i64> {
             vfs::CONSOLE => Sorte::Console,
             _ => return Err(errno(Erreur::ENXIO)),
         },
+        // Aucun pilote de disque (`blkdev_open` : ENXIO).
+        S_IFBLK => return Err(errno(Erreur::ENXIO)),
         // Un lien (O_PATH | O_NOFOLLOW) : rien d'autre à faire qu'O_PATH.
         _ => Sorte::Chemin,
     })
@@ -845,7 +847,14 @@ pub fn trouver_pour(qui: fichiers::Identite, chemin: &[u8]) -> Result<(Numero, V
 ///     par le tmpfs, qui fait les vérifications de `do_open` (voir
 ///     `Tmpfs::ouvrir`) ; les droits du fichier créé passent par l'umask ;
 ///   - O_TRUNC ramène le fichier à zéro ;
-///   - un périphérique sans pilote : ENXIO.
+///   - un périphérique sans pilote : ENXIO ;
+///   - un tube (`fifo_open`) : ni lecture ni écriture (O_ACCMODE à 3) :
+///     EINVAL ; puis ce que dit `tube::ouvrir`. Un tube nommé peut avoir à
+///     attendre l'autre bout : l'attente se fait hors du verrou des
+///     fichiers, et inotify ne voit l'ouverture qu'après (`fsnotify_open`
+///     suit `fifo_open`) ; un signal pendant l'attente rend ERESTARTSYS, le
+///     fichier défait sans rien dire à inotify (Linux ne dit la fermeture
+///     que d'un fichier FMODE_OPENED).
 /// Les drapeaux inconnus sont ignorés, comme le fait open (pas openat2).
 /// O_ACCMODE à 3 (ni lecture seule, ni écriture seule, ni les deux) est
 /// traité comme O_RDWR (Linux vérifie les deux droits, mais n'ouvre ni en
@@ -890,7 +899,7 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
     // drapeaux d'O_PATH ; pas ceux qui ne servent qu'à open.
     let largefile = if chemin_seul { 0 } else { O_LARGEFILE };
     let gardes = (drapeaux & !(O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC)) | largefile;
-    let fichier = avec_fin(dirfd, &chemin, suivre_pour(&o, drapeaux & O_NOFOLLOW != 0), |s, cadres, fin, depart, pid| {
+    let etape = avec_fin(dirfd, &chemin, suivre_pour(&o, drapeaux & O_NOFOLLOW != 0), |s, cadres, fin, depart, pid| {
         let complet = canonique(s, pid, &fin);
         // Le lieu du fichier (inotify), préparé d'abord : une fois le
         // fichier créé ou ouvert, plus rien ne doit échouer.
@@ -914,7 +923,7 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
                 let fichier = s.ouverts.ajouter(f.avec_chemin(complet)).map_err(|_| -ENOMEM)?;
                 s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, objet));
                 surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
-                return Ok((fichier, None));
+                return Ok(Etape::Faite(fichier, None));
             }
         };
         let ouvert = s.fs.ouvrir(depart.qui, &fin, &o, maintenant).map_err(errno)?;
@@ -927,15 +936,25 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
             }
         };
         let mut f = FichierOuvert::new(sorte, Tenu::Tmpfs(ouvert), o.lecture, o.ecriture, gardes as u32, &chemin).avec_chemin(complet);
+        let mut attente = None;
         if sorte == Sorte::Tube {
-            match crate::tube::rouvrir(ouvert.numero, o.lecture, o.ecriture) {
-                Some((tube, nom)) => {
-                    f.prive = Prive::Tube(tube);
-                    f.chemin = nom;
+            let nomme = !s.fs.est_tube(ouvert.numero);
+            let r = if acces == O_ACCMODE {
+                Err(-EINVAL)
+            } else {
+                crate::tube::ouvrir(ouvert.numero, nomme, o.lecture, o.ecriture, drapeaux & O_NONBLOCK != 0)
+            };
+            match r {
+                Ok((tube, vu, partenaire)) => {
+                    if !nomme {
+                        f.chemin = crate::tube::nom(ouvert.numero.0);
+                    }
+                    f.prive = Prive::Tube(tube.clone(), vu);
+                    attente = partenaire.map(|p| (tube, p));
                 }
-                None => {
+                Err(e) => {
                     s.fs.fermer(&ouvert, cadres);
-                    return Err(errno(Erreur::ENXIO));
+                    return Err(e);
                 }
             }
         }
@@ -947,16 +966,41 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
                 }
                 -ENOMEM
             })?;
+        s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, Objet::Tmpfs(ouvert.numero)));
+        // Un tube nommé qui attend son autre bout : le fichier est dans la
+        // table (il suit un renommage, il tient son entrée), mais pas
+        // encore ouvert pour inotify.
+        if let Some((tube, partenaire)) = attente {
+            return Ok(Etape::Attendre { fichier, tube, partenaire });
+        }
         // Ce qu'en voit inotify : la création (au dossier), puis
         // l'ouverture (`fsnotify_create`, puis `fsnotify_open`).
-        s.ouverts.fichier(fichier).lieu = lieu.and_then(|l| l.achever(&mut s.fs, Objet::Tmpfs(ouvert.numero)));
         if ouvert.cree {
             surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_CREATE, false, 0);
         }
         surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
-        Ok((fichier, Some(ouvert)))
+        Ok(Etape::Faite(fichier, Some(ouvert)))
     })?;
-    let (fichier, ouvert) = fichier;
+    let (fichier, ouvert) = match etape {
+        Etape::Faite(fichier, ouvert) => (fichier, ouvert),
+        Etape::Attendre { fichier, tube, partenaire } => {
+            // L'autre bout d'un tube nommé, hors du verrou des fichiers ;
+            // puis l'ouverture, que voit inotify, ou rien : un signal défait
+            // le fichier sans fermeture à dire (`abandonner`).
+            let venu = tube.attendre_partenaire(&partenaire);
+            drop(tube);
+            let fichier = vfs::avec_systeme(|s, cadres| {
+                if venu {
+                    surveillance::du_fichier(&s.fs, s.ouverts.fichier(fichier), IN_OPEN);
+                    Ok(fichier)
+                } else {
+                    s.abandonner(fichier, cadres);
+                    Err(-crate::reprise::ERESTARTSYS)
+                }
+            })?;
+            (fichier, None)
+        }
+    };
     // O_TRUNC, hors du verrou des fichiers : il faut d'abord retirer les
     // pages des projections, sous la mémoire du processus, en lecture
     // (`tronquer`). Le
@@ -968,6 +1012,15 @@ fn ouvrir(dirfd: u64, adresse: u64, drapeaux: u64, mode: u64) -> Result<u64, i64
         tronquer(ouvert.numero, 0, fichier);
     }
     Ok(fd.installer(fichier, drapeaux & O_CLOEXEC != 0))
+}
+
+/// Où en est une ouverture au sortir du verrou des fichiers : faite (le
+/// fichier, et l'inode à vider pour O_TRUNC), ou un tube nommé qui attend
+/// son autre bout (le fichier dans la table, pas encore dans un
+/// descripteur).
+enum Etape {
+    Faite(Fichier, Option<fichiers::tmpfs::Ouvert>),
+    Attendre { fichier: Fichier, tube: crate::partage::Arc<crate::tube::Tube>, partenaire: crate::tube::Partenaire },
 }
 
 /// open(chemin, drapeaux, droits) : openat depuis le dossier courant. Bun
@@ -2784,6 +2837,59 @@ pub fn mkdirat(dirfd: u64, adresse: u64, mode: u64) -> i64 {
 /// mkdir(chemin, droits).
 pub fn mkdir(adresse: u64, mode: u64) -> i64 {
     mkdirat(AT_FDCWD as u64, adresse, mode)
+}
+
+/// mknodat(dossier, chemin, mode, périphérique) (`do_mknodat`) : un inode
+/// qui n'est ni un dossier ni un lien. Un fichier ordinaire (S_IFREG, ou 0),
+/// un tube nommé (S_IFIFO, voir tube.rs), une socket (S_IFSOCK : un nom sans
+/// socket derrière, où connect rend ECONNREFUSED), un périphérique de
+/// caractères ou de blocs (S_IFCHR, S_IFBLK : root seulement, sauf le
+/// « whiteout » 0:0, voir `Tmpfs::creer` ; l'ouvrir rend ENXIO, sauf ceux
+/// qui ont un pilote : /dev/null et les autres). Dans l'ordre de Linux :
+///   - le type (`may_mknod`), avant même le chemin : un dossier, EPERM
+///     (c'est le travail de mkdir) ; un type inconnu, EINVAL ;
+///   - le chemin, résolu sans suivre le dernier composant, puis ce que
+///     vérifie `Tmpfs::creer` (EEXIST, ENOENT, EACCES, EPERM, ENOSPC) ;
+///     dans /proc ou /sys, ce que dit `refus`.
+/// Le mode est un `umode_t` (16 bits). Les droits passent par l'umask, et
+/// gardent leurs bits spéciaux (mesuré : 07777 sous l'umask 022 donne
+/// 07755). Le numéro de périphérique, 32 bits, est celui de
+/// `new_encode_dev` (le majeur dans les bits 8 à 19, le mineur dans les
+/// bits 0 à 7 et 20 à 31) ; il ne compte que pour un périphérique (mesuré :
+/// un tube ou un fichier fait par mknod a 0).
+pub fn mknodat(dirfd: u64, adresse: u64, mode: u64, dev: u64) -> i64 {
+    let mode = mode as u16 as u32;
+    let genre = match mode & S_IFMT {
+        0 => S_IFREG,
+        g @ (S_IFREG | S_IFCHR | S_IFBLK | S_IFIFO | S_IFSOCK) => g,
+        S_IFDIR => return errno(Erreur::EPERM),
+        _ => return -EINVAL,
+    };
+    let chemin = match chemin(adresse) {
+        Ok(c) => c,
+        Err(e) => return e,
+    };
+    let umask = processus::avec(|p| p.umask);
+    let droits = mode & 0o7777 & !umask;
+    let dev = dev as u32;
+    let rdev = if genre == S_IFCHR || genre == S_IFBLK { ((dev & 0xfff00) >> 8, (dev & 0xff) | ((dev >> 12) & 0xfff00)) } else { (0, 0) };
+    let r = avec_fin(dirfd, &chemin, Suivre::Jamais, |s, _, fin, depart, pid| match en_tmpfs(fin) {
+        Ok(fin) => {
+            let n = s.fs.creer(depart.qui, &fin, genre | droits, rdev, &[], temps::maintenant()).map_err(errno)?;
+            surveillance::dans_le_dossier(fin.dossier, &fin.nom, IN_CREATE, false, 0);
+            Ok(n)
+        }
+        Err(fin) => Err(refus(s, pid, depart.qui, Modification::Creer(&fin, Creation::Autre))),
+    });
+    match r {
+        Ok(_) => 0,
+        Err(e) => e,
+    }
+}
+
+/// mknod(chemin, mode, périphérique) : mknodat depuis le dossier courant.
+pub fn mknod(adresse: u64, mode: u64, dev: u64) -> i64 {
+    mknodat(AT_FDCWD as u64, adresse, mode, dev)
 }
 
 /// symlinkat(cible, dossier, chemin) : un lien symbolique de contenu

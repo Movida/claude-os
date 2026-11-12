@@ -6,11 +6,18 @@
  * capacité (F_GETPIPE_SZ, F_SETPIPE_SZ), la fin (sans écrivain : 0 ; sans
  * lecteur : EPIPE et SIGPIPE), les paquets (O_DIRECT), FIONREAD ; puis deux
  * fils qui s'envoient 10 Mo et vérifient chaque octet, poll et epoll sur un
- * tube. Sur l'hôte comme chez nous. `tubes sigpipe` écrit dans un tube sans
- * lecteur, SIGPIPE à son action par défaut : il doit mourir avec le code
- * 141 (128 + 13).
+ * tube. Puis les tubes nommés (les soldes d'avant 6k) : mknod et ses
+ * vérifications, l'ouverture qui attend l'autre bout (un fil en face, un
+ * signal qui l'interrompt, SA_RESTART qui la reprend), le non bloquant
+ * (ENXIO, POLLHUP seulement après un écrivain), un tube qui naît et meurt
+ * avec ses bouts, le tube d'un pipe2 refait par un O_PATH ; et les autres
+ * sortes de mknod (fichier, socket, « whiteout », périphériques pour
+ * root) avec leur type dans un dossier. Sur l'hôte comme chez nous.
+ * `tubes sigpipe` écrit dans un tube sans lecteur, SIGPIPE à son action par
+ * défaut : il doit mourir avec le code 141 (128 + 13).
  */
 #define _GNU_SOURCE
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -18,11 +25,17 @@
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysmacros.h>
+#include <sys/time.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 static int echecs;
@@ -138,6 +151,23 @@ static void pages(void)
     close(t[1]);
 }
 
+/* CAP_SYS_RESOURCE (24) dans les capacités effectives (CapEff de
+ * /proc/self/status) ; sans ce fichier, aucune. */
+static int sys_resource(void)
+{
+    char b[4096];
+    int f = open("/proc/self/status", O_RDONLY);
+    if (f < 0)
+        return 0;
+    long n = read(f, b, sizeof b - 1);
+    close(f);
+    if (n <= 0)
+        return 0;
+    b[n] = 0;
+    char *c = strstr(b, "\nCapEff:\t");
+    return c != NULL && (strtoull(c + 9, NULL, 16) >> 24 & 1);
+}
+
 static void capacite(void)
 {
     int t[2];
@@ -146,7 +176,14 @@ static void capacite(void)
     verifier(fcntl(t[0], F_SETPIPE_SZ, 100000) == 131072 && fcntl(t[1], F_GETPIPE_SZ) == 131072,
              "F_SETPIPE_SZ(100000) : 131072 (une puissance de deux pages), sur les deux bouts");
     verifier(fcntl(t[0], F_SETPIPE_SZ, 1) == 4096, "F_SETPIPE_SZ(1) : une page");
-    verifier(erreur(fcntl(t[0], F_SETPIPE_SZ, 2 << 20)) == EPERM, "F_SETPIPE_SZ au-dela de pipe-max-size (1 Mio), sans etre root : EPERM");
+    /* CAP_SYS_RESOURCE passe outre pipe-max-size (`pipe_set_size`), et
+     * `make tests-hote-root` lance aussi ce programme en root : le root de la
+     * machine du Linux de référence l'a, celui du devcontainer non (Docker ne
+     * la donne pas). La capacité se lit donc, pas l'identité. */
+    if (sys_resource())
+        verifier(fcntl(t[0], F_SETPIPE_SZ, 2 << 20) == 2 << 20, "F_SETPIPE_SZ au-dela de pipe-max-size (1 Mio), avec CAP_SYS_RESOURCE : permis");
+    else
+        verifier(erreur(fcntl(t[0], F_SETPIPE_SZ, 2 << 20)) == EPERM, "F_SETPIPE_SZ au-dela de pipe-max-size (1 Mio), sans CAP_SYS_RESOURCE : EPERM");
     verifier(fcntl(t[0], F_SETPIPE_SZ, 1 << 20) == 1 << 20, "F_SETPIPE_SZ(1 Mio) : permis");
     for (int i = 0; i < 3; i++)
         if (ecrire(t[1], 4096) != 4096)
@@ -304,6 +341,326 @@ static void attentes(void)
     close(t[1]);
 }
 
+/* ----- Les tubes nommés ----- */
+
+/* Leur dossier : /dev/shm sur l'hôte (un tmpfs, comme notre /tmp ; le /tmp
+ * de la machine de référence est un overlayfs, qui refuse le « whiteout »),
+ * /tmp chez nous. */
+static char dossier[64], fifo[96];
+static volatile int lecteur_ouvert, alarmes;
+
+static void *lire_le_tube(void *rien)
+{
+    (void)rien;
+    int fd = open(fifo, O_RDONLY);
+    lecteur_ouvert = 1;
+    char b[8];
+    long n = read(fd, b, sizeof b);
+    close(fd);
+    return (void *)n;
+}
+
+/* Attend trois SIGALRM (bloqués ici : ils vont au fil principal, qui attend
+ * dans open), puis ouvre l'autre bout. */
+static void *lecteur_tardif(void *rien)
+{
+    (void)rien;
+    while (alarmes < 3)
+        usleep(1000);
+    return (void *)(long)open(fifo, O_RDONLY | O_NONBLOCK);
+}
+
+static void sur_alarme(int sig)
+{
+    (void)sig;
+    alarmes++;
+}
+
+static volatile sig_atomic_t sigio_recus;
+
+static void sur_sigio(int sig)
+{
+    (void)sig;
+    sigio_recus++;
+}
+
+/* SIGALRM toutes les `us` microsecondes (0 : plus rien). */
+static void alarme(long us)
+{
+    struct itimerval t = { { 0, us }, { 0, us } };
+    setitimer(ITIMER_REAL, &t, NULL);
+}
+
+static void attendre_l_autre_bout(void)
+{
+    /* Un fil ouvre en lecture : il attend un écrivain, et inotify ne voit
+     * pas encore l'ouverture (`fsnotify_open` suit `fifo_open`). */
+    int in = inotify_init1(IN_NONBLOCK);
+    inotify_add_watch(in, dossier, IN_OPEN | IN_CLOSE);
+    char ev[256];
+    pthread_t f;
+    void *lu;
+    lecteur_ouvert = 0;
+    pthread_create(&f, NULL, lire_le_tube, NULL);
+    usleep(50000);
+    errno = 0;
+    long n = read(in, ev, sizeof ev);
+    verifier(!lecteur_ouvert && n == -1 && errno == EAGAIN, "open(O_RDONLY) attend un ecrivain, rien pour inotify");
+    int w = open(fifo, O_WRONLY);
+    verifier(w >= 0 && write(w, "abc", 3) == 3, "open(O_WRONLY) face a lui, write");
+    close(w);
+    pthread_join(f, &lu);
+    verifier(lecteur_ouvert && (long)lu == 3, "le lecteur ouvert lit les 3 octets");
+    while (read(in, ev, sizeof ev) > 0)
+        ;
+
+    /* Un signal sans SA_RESTART interrompt l'attente (EINTR), et le bout
+     * qui attendait ne compte plus : un lecteur non bloquant lit la fin (0),
+     * pas EAGAIN (un écrivain resté) ; un écrivain non bloquant reçoit ENXIO
+     * (pas de lecteur resté). */
+    struct sigaction sa = { 0 };
+    sa.sa_handler = sur_alarme;
+    sigaction(SIGALRM, &sa, NULL);
+    alarme(20000);
+    errno = 0;
+    int r = open(fifo, O_WRONLY);
+    int e = errno;
+    alarme(0);
+    verifier(r == -1 && e == EINTR, "open(O_WRONLY) sans lecteur, un signal : EINTR");
+    r = open(fifo, O_RDONLY | O_NONBLOCK);
+    char b[4];
+    verifier(read(r, b, sizeof b) == 0, "l'ecrivain interrompu ne compte plus (read : 0)");
+    close(r);
+    alarme(20000);
+    errno = 0;
+    r = open(fifo, O_RDONLY);
+    e = errno;
+    alarme(0);
+    verifier(r == -1 && e == EINTR, "open(O_RDONLY) sans ecrivain, un signal : EINTR");
+    errno = 0;
+    r = open(fifo, O_WRONLY | O_NONBLOCK);
+    verifier(r == -1 && errno == ENXIO, "le lecteur interrompu ne compte plus (ENXIO)");
+    /* Les ouvertures interrompues ou refusées ne se voient pas d'inotify :
+     * seul le lecteur non bloquant, ouvert puis fermé. */
+    n = read(in, ev, sizeof ev);
+    struct inotify_event *e1 = (struct inotify_event *)ev;
+    struct inotify_event *e2 = (struct inotify_event *)(ev + sizeof *e1 + e1->len);
+    verifier(n == (long)(2 * sizeof *e1 + e1->len + e2->len) && e1->mask == IN_OPEN && e2->mask == IN_CLOSE_NOWRITE
+             && strcmp(e1->name, "f") == 0, "inotify : IN_OPEN et IN_CLOSE_NOWRITE du seul lecteur non bloquant");
+    close(in);
+
+    /* Une ouverture interrompue ne ferme pas de bout (`err_rd`, `err_wr` de
+     * Linux, pas `pipe_release`) : ni fin à dire, ni SIGIO au bout resté
+     * en O_ASYNC ; un écrivain, puis un lecteur. */
+    struct sigaction sio = { 0 };
+    sio.sa_handler = sur_sigio;
+    sigaction(SIGIO, &sio, NULL);
+    int resultats = 1;
+    for (int lecteur = 0; lecteur < 2; lecteur++) {
+        sigio_recus = 0;
+        int lu_ = open(fifo, O_RDONLY | O_NONBLOCK);
+        int ecrit = open(fifo, O_WRONLY | O_NONBLOCK);
+        int reste = lecteur ? lu_ : ecrit;
+        fcntl(reste, F_SETOWN, getpid());
+        fcntl(reste, F_SETFL, fcntl(reste, F_GETFL) | O_ASYNC);
+        /* Le côté qui va attendre perd son seul bout : SIGIO au bout resté. */
+        close(lecteur ? ecrit : lu_);
+        usleep(10000);
+        int apres_close = sigio_recus;
+        alarme(20000);
+        errno = 0;
+        int attendu_ = open(fifo, lecteur ? O_RDONLY : O_WRONLY);
+        e = errno;
+        alarme(0);
+        usleep(10000);
+        resultats &= apres_close == 1 && attendu_ == -1 && e == EINTR && sigio_recus == 1;
+        close(reste);
+    }
+    signal(SIGIO, SIG_DFL);
+    verifier(resultats, "une ouverture interrompue : pas de SIGIO au bout reste en O_ASYNC");
+
+    /* Avec SA_RESTART, open reprend après chaque signal, jusqu'au lecteur. */
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGALRM, &sa, NULL);
+    sigset_t alrm, ancien;
+    sigemptyset(&alrm);
+    sigaddset(&alrm, SIGALRM);
+    pthread_sigmask(SIG_BLOCK, &alrm, &ancien);
+    alarmes = 0;
+    pthread_create(&f, NULL, lecteur_tardif, NULL);
+    pthread_sigmask(SIG_SETMASK, &ancien, NULL);
+    alarme(10000);
+    w = open(fifo, O_WRONLY);
+    alarme(0);
+    pthread_join(f, &lu);
+    verifier(w >= 0 && alarmes >= 3 && (long)lu >= 0, "open(O_WRONLY) repris apres trois signaux (SA_RESTART)");
+    close(w);
+    close((int)(long)lu);
+    signal(SIGALRM, SIG_IGN);
+}
+
+static void nommes(void)
+{
+    snprintf(dossier, sizeof dossier, "%s/tubes-%d", access("/dev/shm", W_OK) == 0 ? "/dev/shm" : "/tmp", getpid());
+    snprintf(fifo, sizeof fifo, "%s/f", dossier);
+    char chemin[128];
+    struct stat st;
+    mkdir(dossier, 0700);
+    mode_t umask_avant = umask(022);
+
+    /* mknod et ses vérifications : le type avant le chemin. */
+    verifier(mknod(fifo, S_IFIFO | 07777, 0) == 0 && stat(fifo, &st) == 0 && st.st_mode == (S_IFIFO | 07755)
+             && st.st_size == 0 && st.st_nlink == 1 && st.st_rdev == 0, "mknod(S_IFIFO | 07777) sous l'umask 022 : 07755");
+    errno = 0;
+    verifier(mknod(fifo, S_IFDIR | 0777, 0) == -1 && errno == EPERM, "mknod(S_IFDIR) : EPERM");
+    snprintf(chemin, sizeof chemin, "%s/absent/x", dossier);
+    errno = 0;
+    verifier(mknod(chemin, S_IFDIR | 0777, 0) == -1 && errno == EPERM, "mknod(S_IFDIR) dans un dossier absent : EPERM d'abord");
+    errno = 0;
+    verifier(mknod(chemin, 0170000 | 0777, 0) == -1 && errno == EINVAL, "mknod d'un type inconnu : EINVAL d'abord");
+    errno = 0;
+    verifier(mknod(fifo, S_IFIFO | 0644, 0) == -1 && errno == EEXIST, "mknod sur un nom pris : EEXIST");
+    int d = open(dossier, O_RDONLY | O_DIRECTORY);
+    verifier(syscall(SYS_mknodat, d, "t", S_IFIFO | 0600, 0x12345678L) == 0 && fstatat(d, "t", &st, 0) == 0
+             && st.st_mode == (S_IFIFO | 0600) && st.st_rdev == 0, "mknodat par un dossier ouvert ; le peripherique ignore");
+    unlinkat(d, "t", 0);
+    snprintf(chemin, sizeof chemin, "%s/r", dossier);
+    verifier(mknod(chemin, 0644, 99) == 0 && stat(chemin, &st) == 0 && st.st_mode == (S_IFREG | 0644) && st.st_rdev == 0,
+             "mknod sans type : un fichier ordinaire");
+
+    /* Le non bloquant : un lecteur passe et lit la fin, sans POLLHUP tant
+     * qu'aucun écrivain n'est venu ; un écrivain sans lecteur : ENXIO. */
+    errno = 0;
+    verifier(open(fifo, O_WRONLY | O_NONBLOCK) == -1 && errno == ENXIO, "O_WRONLY | O_NONBLOCK sans lecteur : ENXIO");
+    errno = 0;
+    verifier(open(fifo, O_ACCMODE) == -1 && errno == EINVAL, "O_ACCMODE (3) : EINVAL");
+    int r = open(fifo, O_RDONLY | O_NONBLOCK);
+    char b[8];
+    struct pollfd p = { r, POLLIN, 0 };
+    verifier(r >= 0 && poll(&p, 1, 0) == 0 && read(r, b, sizeof b) == 0, "O_RDONLY | O_NONBLOCK : ouvert, ni POLLHUP ni donnees, read : 0");
+    errno = 0;
+    /* F_GETFL : O_LARGEFILE (0100000 pour le noyau ; la glibc 64 bits le
+     * définit à 0). */
+    verifier(lseek(r, 0, SEEK_SET) == -1 && errno == ESPIPE && fcntl(r, F_GETPIPE_SZ) == 65536
+             && fcntl(r, F_GETFL) == (O_RDONLY | O_NONBLOCK | 0100000), "lseek : ESPIPE ; 64 Kio ; F_GETFL");
+    char lien[128] = { 0 };
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", r);
+    verifier(readlink(chemin, lien, sizeof lien - 1) > 0 && strcmp(lien, fifo) == 0, "/proc/self/fd : le chemin du tube nomme");
+    int w = open(fifo, O_WRONLY | O_NONBLOCK);
+    verifier(w >= 0 && write(w, "abc", 3) == 3 && fstat(w, &st) == 0 && S_ISFIFO(st.st_mode) && st.st_size == 0,
+             "un ecrivain, maintenant ; fstat : S_IFIFO, taille 0");
+    poll(&p, 1, 0);
+    verifier(p.revents == POLLIN, "poll : POLLIN");
+    close(w);
+    poll(&p, 1, 0);
+    verifier(p.revents == (POLLIN | POLLHUP), "l'ecrivain parti : POLLIN | POLLHUP");
+    verifier(read(r, b, sizeof b) == 3 && read(r, b, sizeof b) == 0, "read : les 3 octets, puis la fin");
+    close(r);
+
+    /* O_RDWR n'attend jamais ; ce qui reste dans le tube meurt avec le
+     * dernier bout ; un tube nommé effacé vit tant qu'il est ouvert. */
+    int x = open(fifo, O_RDWR);
+    verifier(x >= 0 && write(x, "xyz", 3) == 3, "O_RDWR, sans attendre");
+    close(x);
+    x = open(fifo, O_RDWR | O_NONBLOCK);
+    errno = 0;
+    verifier(read(x, b, sizeof b) == -1 && errno == EAGAIN, "rouvert : un tube neuf, vide");
+    unlink(fifo);
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", x);
+    memset(lien, 0, sizeof lien);
+    char efface[128];
+    snprintf(efface, sizeof efface, "%s (deleted)", fifo);
+    verifier(readlink(chemin, lien, sizeof lien - 1) > 0 && strcmp(lien, efface) == 0, "efface : /proc/self/fd le dit (deleted)");
+    verifier(write(x, "uv", 2) == 2 && read(x, b, sizeof b) == 2, "efface, il marche encore");
+    close(x);
+    mknod(fifo, S_IFIFO | 0600, 0);
+    attendre_l_autre_bout();
+    unlink(fifo);
+
+    /* Le tube d'un pipe2, refait par un O_PATH après la fermeture de ses
+     * deux bouts : un tube neuf, sans attente (ce n'est pas un tube nommé),
+     * sans écrivain : POLLHUP. */
+    int t[2];
+    tube(t, 0);
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", t[0]);
+    int o = open(chemin, O_PATH);
+    close(t[0]);
+    close(t[1]);
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", o);
+    r = open(chemin, O_RDONLY);
+    p.fd = r;
+    verifier(r >= 0 && read(r, b, sizeof b) == 0 && poll(&p, 1, 0) == 1 && p.revents == POLLHUP,
+             "un pipe2 sans bouts, rouvert par O_PATH : un tube neuf, POLLHUP");
+    w = open(chemin, O_WRONLY);
+    verifier(w >= 0 && write(w, "ab", 2) == 2 && read(r, b, sizeof b) == 2, "et son ecrivain");
+    close(w);
+    close(r);
+    close(o);
+
+    /* Une socket par mknod : un nom sans socket. */
+    snprintf(chemin, sizeof chemin, "%s/s", dossier);
+    verifier(mknod(chemin, S_IFSOCK | 0777, 0) == 0 && stat(chemin, &st) == 0 && st.st_mode == (S_IFSOCK | 0755),
+             "mknod(S_IFSOCK)");
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    strcpy(a.sun_path, chemin);
+    errno = 0;
+    verifier(connect(s, (struct sockaddr *)&a, sizeof a) == -1 && errno == ECONNREFUSED, "connect : ECONNREFUSED");
+    close(s);
+    errno = 0;
+    verifier(open(chemin, O_RDONLY) == -1 && errno == ENXIO, "open : ENXIO");
+
+    /* Le « whiteout » (caractères 0:0) se crée sans être root ; pas les
+     * autres périphériques. */
+    snprintf(chemin, sizeof chemin, "%s/w", dossier);
+    verifier(mknod(chemin, S_IFCHR | 0666, 0) == 0 && stat(chemin, &st) == 0 && st.st_mode == (S_IFCHR | 0644)
+             && st.st_rdev == 0, "mknod du whiteout (caracteres 0:0)");
+    char cn[128], bn[128];
+    snprintf(cn, sizeof cn, "%s/c", dossier);
+    snprintf(bn, sizeof bn, "%s/b", dossier);
+    if (geteuid() != 0) {
+        errno = 0;
+        verifier(mknod(cn, S_IFCHR | 0666, makedev(1, 3)) == -1 && errno == EPERM, "un peripherique sans etre root : EPERM");
+        errno = 0;
+        verifier(mknod(bn, S_IFBLK | 0666, 0) == -1 && errno == EPERM, "un disque, meme 0:0 : EPERM");
+    } else {
+        /* /dev/null refait ; un disque, sans pilote : ENXIO (EACCES dans
+         * /dev/shm, monté nodev sur l'hôte). */
+        verifier(mknod(cn, S_IFCHR | 0666, makedev(1, 3)) == 0 && stat(cn, &st) == 0 && major(st.st_rdev) == 1
+                 && minor(st.st_rdev) == 3, "root : mknod de /dev/null (1:3)");
+        verifier(mknod(bn, S_IFBLK | 0600, makedev(259, 70000)) == 0 && stat(bn, &st) == 0 && S_ISBLK(st.st_mode)
+                 && major(st.st_rdev) == 259 && minor(st.st_rdev) == 70000, "root : un disque 259:70000");
+        int nodev = strncmp(dossier, "/dev/shm", 8) == 0;
+        x = open(cn, O_RDWR);
+        verifier(nodev || (x >= 0 && write(x, "x", 1) == 1 && read(x, b, 1) == 0), "root : il se comporte comme /dev/null");
+        close(x);
+        errno = 0;
+        verifier(open(bn, O_RDONLY) == -1 && errno == (nodev ? EACCES : ENXIO), "root : le disque, sans pilote : ENXIO");
+        unlink(cn);
+        unlink(bn);
+    }
+
+    /* Leurs types dans le dossier (d_type). */
+    mknod(fifo, S_IFIFO | 0600, 0);
+    DIR *dir = fdopendir(d);
+    struct dirent *de;
+    int types = 0;
+    while ((de = readdir(dir)) != NULL) {
+        types += strcmp(de->d_name, "f") == 0 && de->d_type == DT_FIFO;
+        types += strcmp(de->d_name, "s") == 0 && de->d_type == DT_SOCK;
+        types += strcmp(de->d_name, "w") == 0 && de->d_type == DT_CHR;
+        types += strcmp(de->d_name, "r") == 0 && de->d_type == DT_REG;
+    }
+    verifier(types == 4, "d_type : DT_FIFO, DT_SOCK, DT_CHR, DT_REG");
+    closedir(dir);
+    for (const char *n = "fswr"; *n; n++) {
+        snprintf(chemin, sizeof chemin, "%s/%c", dossier, *n);
+        unlink(chemin);
+    }
+    rmdir(dossier);
+    umask(umask_avant);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -330,6 +687,7 @@ int main(int argc, char **argv)
     fins();
     dix_mega();
     attentes();
+    nommes();
     printf("[linux] tubes : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

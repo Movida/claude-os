@@ -278,8 +278,10 @@ boot.bin: programmes.cpio FORCE
 #     ppoll, select, pselect6, epoll : le sondage de chaque sorte, les
 #     délais, les masques, les réveils par un autre fil) ; sur l'hôte aussi ;
 #   - tubes : gcc -static, les tubes (pipe2, les pages et la fusion, la
-#     capacité, la fin, SIGPIPE, les paquets, 10 Mo entre deux fils) ; sur
-#     l'hôte aussi ; `tubes sigpipe` meurt de SIGPIPE (code 141) ;
+#     capacité, la fin, SIGPIPE, les paquets, 10 Mo entre deux fils), les
+#     tubes nommés et les autres sortes de mknod ; sur l'hôte aussi, et en
+#     root (`tests-hote-root` : les périphériques) ; `tubes sigpipe` meurt de
+#     SIGPIPE (code 141) ;
 #   - systeme : gcc -static, les petits appels de claude (uname,
 #     sched_getaffinity, futex, prctl) ; sur l'hôte aussi ;
 #   - processeurs : gcc -static, ce qu'un programme voit des processeurs
@@ -1359,12 +1361,15 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	  ./$(LINUX)/ajout ecrire a 500 & a=$$!; ./$(LINUX)/ajout ecrire b 500 & b=$$!; \
 	  ./$(LINUX)/ajout verifier 500 | tee /dev/stderr | (! grep -q ECHEC); r=$$?; wait $$a $$b; exit $$r
 
-# La MTU du chemin sur l'hôte : le seul test qui demande root (une socket brute forge
-# l'ICMP vers lo). Ce qu'il pose sur la route ne vise qu'une adresse 127.x.y.z tirée au
-# hasard, et expire en 10 min. `tests-hote` le lance quand `sudo -n` marche.
-tests-hote-root: $(LINUX)/pmtu $(LINUX)/options-ip
+# Les tests qui demandent root : la MTU du chemin sur l'hôte (une socket brute forge
+# l'ICMP vers lo ; ce qu'il pose sur la route ne vise qu'une adresse 127.x.y.z tirée au
+# hasard, et expire en 10 min), les options IP (une socket brute), et les tubes en root
+# (mknod des périphériques : ce que vérifient les tests de `fichiers` chez nous, où tout
+# programme tourne sous l'uid 1000). `tests-hote` les lance quand `sudo -n` marche.
+tests-hote-root: $(LINUX)/pmtu $(LINUX)/options-ip $(LINUX)/tubes
 	sudo -n timeout 60 ./$(LINUX)/pmtu | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	sudo -n timeout 60 ./$(LINUX)/options-ip formats/tests/reseau/options-ip.txt | tee /dev/stderr | grep -q "toutes les verifications : ok"
+	sudo -n timeout 60 ./$(LINUX)/tubes | tee /dev/stderr | grep -q "toutes les verifications : ok"
 
 suite: $(SUITE)/.convertie
 

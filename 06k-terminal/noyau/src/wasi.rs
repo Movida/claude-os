@@ -758,6 +758,7 @@ fn chemin(memoire: &[u8], adresse: u32, longueur: u32) -> Result<Vec<u8>, u32> {
 
 // Les types de fichiers de WASI (filetype).
 const TYPE_INCONNU: u8 = 0;
+const TYPE_BLOCS: u8 = 1;
 const TYPE_CARACTERE: u8 = 2;
 const TYPE_DOSSIER: u8 = 3;
 const TYPE_FICHIER: u8 = 4;
@@ -766,12 +767,14 @@ const TYPE_LIEN: u8 = 7;
 
 /// Le type WASI d'un mode. Une socket : SOCKET_STREAM, la seule sorte de
 /// socket d'un programme WebAssembly (TCP), et ce que rend wasmtime pour
-/// un fichier de socket (AF_UNIX) dans un dossier.
+/// un fichier de socket (AF_UNIX) dans un dossier. Un tube nommé :
+/// inconnu, WASI n'en a pas (wasmtime de même).
 fn type_wasi(mode: u32) -> u8 {
     match mode & S_IFMT {
         S_IFDIR => TYPE_DOSSIER,
         S_IFLNK => TYPE_LIEN,
         S_IFCHR => TYPE_CARACTERE,
+        fichiers::S_IFBLK => TYPE_BLOCS,
         fichiers::S_IFREG => TYPE_FICHIER,
         fichiers::S_IFSOCK => TYPE_SOCKET_STREAM,
         _ => TYPE_INCONNU,
@@ -1633,12 +1636,9 @@ impl Wasi {
                 entree[0..8].copy_from_slice(&suivante.to_le_bytes());
                 entree[8..16].copy_from_slice(&numero.to_le_bytes());
                 entree[16..20].copy_from_slice(&(nom.len() as u32).to_le_bytes());
-                entree[20] = match genre {
-                    fichiers::tmpfs::DT_DIR => TYPE_DOSSIER,
-                    fichiers::tmpfs::DT_LNK => TYPE_LIEN,
-                    fichiers::tmpfs::DT_CHR => TYPE_CARACTERE,
-                    _ => TYPE_FICHIER,
-                };
+                // Le d_type vaut le type du mode décalé de douze
+                // (`tmpfs::type_d_entree`).
+                entree[20] = type_wasi((genre as u32) << 12);
                 for morceau in [&entree[..], nom] {
                     let n = (morceau.len() as u32).min(longueur - fait);
                     let place = plage_mut(m, tampon + fait, n).expect("verifie plus haut");

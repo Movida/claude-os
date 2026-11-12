@@ -271,9 +271,25 @@ impl Systeme {
     /// le `__fput` de Linux), avant la fin de son inode et celle de son
     /// dossier, que son lieu tenait.
     pub fn lacher(&mut self, f: Fichier, cadres: &mut CadresDuNoyau) {
-        if let Some(ferme) = self.ouverts.lacher(f) {
-            let fermeture = if ferme.ecriture { surveillance::IN_CLOSE_WRITE } else { surveillance::IN_CLOSE_NOWRITE };
-            surveillance::du_fichier(&self.fs, &ferme, fermeture);
+        self.lacher_en(f, cadres, true);
+    }
+
+    /// Lâche le fichier `f` d'une ouverture qui n'a pas abouti (un tube
+    /// nommé dont l'attente de l'autre bout a été interrompue) : comme
+    /// `lacher`, sans IN_CLOSE (inotify n'en a pas vu l'ouverture ; Linux
+    /// ne dit la fermeture que d'un fichier FMODE_OPENED), et son bout de
+    /// tube défait sans être fermé (`Ouverts::abandonner`).
+    pub fn abandonner(&mut self, f: Fichier, cadres: &mut CadresDuNoyau) {
+        self.lacher_en(f, cadres, false);
+    }
+
+    fn lacher_en(&mut self, f: Fichier, cadres: &mut CadresDuNoyau, dire_la_fermeture: bool) {
+        let ferme = if dire_la_fermeture { self.ouverts.lacher(f) } else { self.ouverts.abandonner(f) };
+        if let Some(ferme) = ferme {
+            if dire_la_fermeture {
+                let fermeture = if ferme.ecriture { surveillance::IN_CLOSE_WRITE } else { surveillance::IN_CLOSE_NOWRITE };
+                surveillance::du_fichier(&self.fs, &ferme, fermeture);
+            }
             // Le dernier fichier ouvert par une entrée effacée : elle meurt.
             if let (Some(l), Some(n)) = (&ferme.lieu, ferme.numero())
                 && let Objet::Tmpfs(d) = l.dossier
