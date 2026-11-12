@@ -1,7 +1,9 @@
 /*
  * Les minuteurs (les soldes d'avant 6k) : timerfd, un minuteur derrière un
  * descripteur, qu'attend une boucle d'événements bâtie sur epoll ; les
- * alarmes d'un processus (setitimer, getitimer, alarm). Il
+ * alarmes d'un processus (setitimer, getitimer, alarm) ; les minuteurs
+ * POSIX (timer_create et les siens), sur les horloges du temps et du
+ * calcul. Il
  * tourne dans notre noyau et sur l'hôte (make tests-hote) : chaque ligne
  * doit dire « ok » des deux côtés, d'après ce qu'a mesuré Linux 6.18.
  *
@@ -21,6 +23,7 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/time.h>
 #include <sys/syscall.h>
 #include <sys/timerfd.h>
@@ -515,6 +518,386 @@ static void alarmes_de_calcul(void)
     setitimer(ITIMER_VIRTUAL, &v, NULL);
 }
 
+/* Les minuteurs POSIX, par les appels eux-mêmes (la glibc traduit les
+ * numéros de ses minuteurs SIGEV_THREAD). */
+static long tc(clockid_t h, struct sigevent *ev, int *id) { return syscall(SYS_timer_create, h, ev, id); }
+static long ts(int id, int drapeaux, const struct itimerspec *s, struct itimerspec *a)
+{
+    return syscall(SYS_timer_settime, id, drapeaux, s, a);
+}
+static long tg(int id, struct itimerspec *s) { return syscall(SYS_timer_gettime, id, s); }
+static long tover(int id) { return syscall(SYS_timer_getoverrun, id); }
+static long tdel(int id) { return syscall(SYS_timer_delete, id); }
+
+static struct sigevent sev(int notification, int sig, long valeur)
+{
+    struct sigevent e;
+    memset(&e, 0, sizeof e);
+    e.sigev_notify = notification;
+    e.sigev_signo = sig;
+    e.sigev_value.sival_ptr = (void *)valeur;
+    return e;
+}
+
+/* Le signal `sig` attend-il ? */
+static int en_attente(int sig)
+{
+    sigset_t e;
+    sigpending(&e);
+    return sigismember(&e, sig);
+}
+
+/* Prend `sig` (bloqué) s'il attend, sans attendre : 0 sinon. */
+static int prendre(int sig, siginfo_t *info)
+{
+    sigset_t e;
+    sigemptyset(&e);
+    sigaddset(&e, sig);
+    struct timespec zero = { 0, 0 };
+    return sigtimedwait(&e, info, &zero) == sig;
+}
+
+static void bloquer(int sig, int oui)
+{
+    sigset_t e;
+    sigemptyset(&e);
+    sigaddset(&e, sig);
+    sigprocmask(oui ? SIG_BLOCK : SIG_UNBLOCK, &e, NULL);
+}
+
+static void posix_erreurs(void)
+{
+    int id = -1, a, b;
+    struct sigevent e = sev(SIGEV_NONE, 0, 0);
+    verifier(erreur(tc(99, &e, &id)) == EINVAL, "timer_create, horloge inconnue : EINVAL");
+    verifier(erreur(tc(99, (void *)8, &id)) == EFAULT, "sigevent illisible (lu avant l'horloge) : EFAULT");
+    verifier(erreur(tc(CLOCK_MONOTONIC_RAW, &e, &id)) == EOPNOTSUPP
+             && erreur(tc(CLOCK_REALTIME_COARSE, &e, &id)) == EOPNOTSUPP, "MONOTONIC_RAW, REALTIME_COARSE : EOPNOTSUPP");
+    verifier(tc(CLOCK_MONOTONIC, &e, &a) == 0, "SIGEV_NONE, signal 0 : cree");
+    e = sev(3, SIGUSR1, 0);
+    verifier(erreur(tc(CLOCK_MONOTONIC, &e, &id)) == EINVAL, "sigev_notify 3 : EINVAL");
+    e = sev(SIGEV_SIGNAL, 65, 0);
+    verifier(erreur(tc(CLOCK_MONOTONIC, &e, &id)) == EINVAL, "signal 65 : EINVAL");
+    e = sev(SIGEV_THREAD_ID, SIGUSR1, 0);
+    e._sigev_un._tid = 999999;
+    verifier(erreur(tc(CLOCK_MONOTONIC, &e, &id)) == EINVAL, "SIGEV_THREAD_ID d'un fil inconnu : EINVAL");
+    e = sev(SIGEV_NONE, 0, 0);
+    verifier(erreur(tc(CLOCK_MONOTONIC, &e, (void *)8)) == EFAULT, "numero vers une adresse invalide : EFAULT");
+    verifier(erreur(tc(CLOCK_REALTIME_ALARM, &e, &id)) == EPERM, "CLOCK_REALTIME_ALARM : EPERM");
+    verifier(tc(CLOCK_MONOTONIC, &e, &b) == 0 && b == a + 6,
+             "chaque echec apres le numero le consomme : le suivant a son numero + 6");
+    struct itimerspec s = en(0, 0);
+    verifier(erreur(ts(b, 0, NULL, NULL)) == EINVAL, "timer_settime sans valeur : EINVAL");
+    verifier(erreur(ts(999, 0, (void *)8, NULL)) == EFAULT, "valeur illisible (lue avant le numero) : EFAULT");
+    s.it_value.tv_nsec = 1000000000;
+    verifier(erreur(ts(999, 0, &s, NULL)) == EINVAL && erreur(ts(b, 0, &s, NULL)) == EINVAL,
+             "nanosecondes a 10^9 : EINVAL");
+    s = en(0, 1000);
+    verifier(erreur(ts(999, 0, &s, NULL)) == EINVAL && erreur(ts(-1, 0, &s, NULL)) == EINVAL,
+             "numero inconnu, negatif : EINVAL");
+    verifier(erreur(tg(999, &s)) == EINVAL && erreur(tg(b, (void *)8)) == EFAULT,
+             "timer_gettime : numero inconnu EINVAL, adresse invalide EFAULT");
+    verifier(erreur(tover(999)) == EINVAL && tover(b) == 0, "timer_getoverrun : EINVAL, 0 avant tout signal");
+    s = en(0, 10000000000LL);
+    verifier(erreur(ts(b, 0xfe, &s, (void *)8)) == EFAULT && tg(b, &s) == 0 && en_ns(s.it_value) > 9000000000LL,
+             "ancienne valeur illisible : EFAULT, mais arme (drapeaux inconnus ignores)");
+    s.it_value.tv_sec = INT64_MAX;
+    verifier(ts(b, 0, &s, NULL) == 0 && tg(b, &s) == 0 && s.it_value.tv_sec <= 9223372036LL
+             && s.it_value.tv_sec > 9223372036LL - 100000000, "arme pour plus de 292 ans : ramene a KTIME_MAX");
+    verifier(tdel(a) == 0 && tdel(b) == 0 && erreur(tdel(a)) == EINVAL, "timer_delete, puis une seconde fois : EINVAL");
+
+    struct rlimit l, zero = { 0, 0 };
+    getrlimit(RLIMIT_SIGPENDING, &l);
+    zero.rlim_max = l.rlim_max;
+    setrlimit(RLIMIT_SIGPENDING, &zero);
+    verifier(erreur(tc(CLOCK_MONOTONIC, &e, &id)) == EAGAIN, "RLIMIT_SIGPENDING a 0 : EAGAIN (son siginfo est compte)");
+    setrlimit(RLIMIT_SIGPENDING, &l);
+}
+
+static void posix_signaux(void)
+{
+    int id;
+    siginfo_t info;
+    struct itimerspec s;
+
+    /* Sans sigevent : SIGALRM, si_value = le numéro. */
+    bloquer(SIGALRM, 1);
+    tc(CLOCK_MONOTONIC, NULL, &id);
+    s = en(0, 10000000);
+    ts(id, 0, &s, NULL);
+    attendre_ms(30);
+    verifier(prendre(SIGALRM, &info) && info.si_code == SI_TIMER && info.si_timerid == id
+             && info.si_value.sival_int == id && info.si_overrun == 0,
+             "sans sigevent : SIGALRM, SI_TIMER, si_timerid et si_value = le numero");
+    tdel(id);
+    bloquer(SIGALRM, 0);
+
+    /* Périodique, bloqué : ses échéances se fondent en un signal, comptées. */
+    int sig = SIGRTMIN + 1;
+    bloquer(sig, 1);
+    struct sigevent e = sev(SIGEV_SIGNAL, sig, 1234);
+    tc(CLOCK_MONOTONIC, &e, &id);
+    int64_t periode = 10000000, avant = ns(CLOCK_MONOTONIC);
+    s = en(periode, periode);
+    ts(id, 0, &s, NULL);
+    int64_t apres = ns(CLOCK_MONOTONIC);
+    attendre_ms(55);
+    verifier(tg(id, &s) == 0 && en_ns(s.it_value) > 0 && en_ns(s.it_value) <= periode && en_ns(s.it_interval) == periode,
+             "periodique bloque : timer_gettime dans ]0, periode]");
+    verifier(tover(id) == 0, "... timer_getoverrun 0 avant que le signal soit pris");
+    int64_t t1 = ns(CLOCK_MONOTONIC);
+    int pris = prendre(sig, &info);
+    int64_t t2 = ns(CLOCK_MONOTONIC);
+    int64_t bas = (t1 - apres - periode) / periode, haut = (t2 - avant - periode) / periode;
+    verifier(pris && info.si_value.sival_ptr == (void *)1234 && info.si_overrun >= bas && info.si_overrun <= haut
+             && tover(id) == info.si_overrun, "... pris : si_overrun compte les echeances fondues, timer_getoverrun aussi");
+    attendre_ms(25);
+    verifier(prendre(sig, &info), "... et le minuteur est reparti");
+
+    /* Un signal en attente d'un armement passé est périmé. */
+    s = en(0, 10000000);
+    ts(id, 0, &s, NULL);
+    attendre_ms(30);
+    s = en(0, 10000000000LL);
+    ts(id, 0, &s, NULL);
+    verifier(en_attente(sig) && !prendre(sig, &info), "rearme : le signal en attente est perime (sigpending le montre)");
+    s = en(0, 10000000);
+    ts(id, 0, &s, NULL);
+    attendre_ms(30);
+    tdel(id);
+    verifier(en_attente(sig) && !prendre(sig, &info), "detruit : de meme");
+    bloquer(sig, 0);
+
+    /* SIGEV_NONE : jamais de signal, on le lit. */
+    e = sev(SIGEV_NONE, 0, 0);
+    tc(CLOCK_MONOTONIC, &e, &id);
+    s = en(0, 10000000);
+    ts(id, 0, &s, NULL);
+    attendre_ms(25);
+    verifier(tg(id, &s) == 0 && en_ns(s.it_value) == 0, "SIGEV_NONE, une fois, echu : 0");
+    s = en(periode, periode);
+    ts(id, 0, &s, NULL);
+    attendre_ms(35);
+    verifier(tg(id, &s) == 0 && en_ns(s.it_value) > 0 && en_ns(s.it_value) <= periode && tover(id) == 0,
+             "SIGEV_NONE periodique : avance dans ]0, periode], aucun depassement rendu");
+    s = en(0, 10000000000LL);
+    ts(id, 0, &s, NULL);
+    s = en(0, 0);
+    ts(id, 0, &s, NULL);
+    verifier(tg(id, &s) == 0 && en_ns(s.it_value) > 9000000000LL,
+             "SIGEV_NONE desarme : il rend encore ce qui restait (son echeance est gardee)");
+    tdel(id);
+
+    /* Vers un fil : SIGEV_THREAD_ID. */
+    sig = SIGRTMIN + 2;
+    bloquer(sig, 1);
+    e = sev(SIGEV_THREAD_ID, sig, 0);
+    e._sigev_un._tid = gettid();
+    verifier(tc(CLOCK_REALTIME, &e, &id) == 0, "SIGEV_THREAD_ID vers soi-meme : cree");
+    struct timespec date;
+    clock_gettime(CLOCK_REALTIME, &date);
+    s = en(0, (int64_t)date.tv_sec * 1000000000 + date.tv_nsec + 10000000);
+    ts(id, TIMER_ABSTIME, &s, NULL);
+    attendre_ms(30);
+    verifier(prendre(sig, &info) && info.si_timerid == id, "... une echeance absolue de la date : le signal au fil");
+    tdel(id);
+    bloquer(sig, 0);
+}
+
+static volatile sig_atomic_t posix_recus;
+static void sur_posix(int sig)
+{
+    (void)sig;
+    posix_recus++;
+}
+
+/* Les périodes d'un minuteur périodique : chaque signal compte la sienne et
+ * celles qu'il a sautées (si_overrun) ; le gestionnaire note aussi le temps
+ * de calcul où il les voit (clock_gettime est sûr dans un gestionnaire). */
+static volatile sig_atomic_t posix_periodes, posix_assez;
+static volatile int64_t posix_vu;
+static clockid_t posix_horloge;
+static void sur_posix_periode(int sig, siginfo_t *i, void *c)
+{
+    (void)sig;
+    (void)c;
+    posix_periodes += 1 + i->si_overrun;
+    posix_vu = ns(posix_horloge);
+    if (posix_periodes >= 5)
+        posix_assez = 1;
+}
+
+static void posix_ignores(void)
+{
+    int id, sig = SIGRTMIN + 3;
+    struct itimerspec s;
+    struct sigaction a = { 0 };
+    a.sa_handler = SIG_IGN;
+    sigaction(sig, &a, NULL);
+    struct sigevent e = sev(SIGEV_SIGNAL, sig, 0);
+    tc(CLOCK_MONOTONIC, &e, &id);
+    s = en(10000000, 10000000);
+    ts(id, 0, &s, NULL);
+    attendre_ms(35);
+    verifier(tg(id, &s) == 0 && en_ns(s.it_value) > 0 && en_ns(s.it_value) <= 10000000 && !en_attente(sig),
+             "periodique ignore : mis de cote, rien en attente, timer_gettime dans ]0, periode]");
+    posix_recus = 0;
+    a.sa_handler = sur_posix;
+    sigaction(sig, &a, NULL);
+    /* Au moins un : livré au retour de sigaction. Pas « exactement un » : la
+     * période suivante tombe 10 ms plus tard, et une machine qui perd le
+     * processeur ce temps-là entre le retour et ce regard en livre un
+     * second (vu une fois sous le Linux de référence chargé par deux
+     * vérifications). */
+    verifier(posix_recus >= 1, "... un gestionnaire remplace SIG_IGN : son signal revient, livre tout de suite");
+    attendre_ms(35);
+    verifier(posix_recus >= 2, "... et le minuteur est reparti");
+    /* En attente (bloqué), effacé par SIG_IGN : mis de côté aussi. */
+    bloquer(sig, 1);
+    attendre_ms(25);
+    a.sa_handler = SIG_IGN;
+    sigaction(sig, &a, NULL);
+    int efface = !en_attente(sig);
+    a.sa_handler = sur_posix;
+    sigaction(sig, &a, NULL);
+    verifier(efface && en_attente(sig), "periodique en attente efface par SIG_IGN : il revient au gestionnaire suivant");
+    tdel(id);
+    bloquer(sig, 0);
+    /* Une seule fois, ignoré : perdu. */
+    a.sa_handler = SIG_IGN;
+    sigaction(sig, &a, NULL);
+    tc(CLOCK_MONOTONIC, &e, &id);
+    s = en(0, 10000000);
+    ts(id, 0, &s, NULL);
+    attendre_ms(25);
+    posix_recus = 0;
+    a.sa_handler = sur_posix;
+    sigaction(sig, &a, NULL);
+    verifier(posix_recus == 0 && tg(id, &s) == 0 && en_ns(s.it_value) == 0, "une seule fois, ignore : perdu");
+    tdel(id);
+}
+
+/* Calcule jusqu'à `fini` ou `limite` ns de calcul. */
+/* Les bases des minuteurs du temps (voir `bornes`) : un TAI relatif reste
+ * dans la sienne (KTIME_MAX moins TAI), un REALTIME relatif va dans
+ * MONOTONIC ; et une échéance absolue d'avant le démarrage compte ses
+ * périodes depuis elle : la suivante tombe à la seconde ronde de la date. */
+static void posix_bornes(void)
+{
+    const int64_t ktime_max_s = INT64_MAX / 1000000000;
+    struct sigevent e = sev(SIGEV_NONE, 0, 0);
+    struct itimerspec s = { { 0, 0 }, { INT64_MAX, 0 } }, g;
+    int id;
+    clockid_t horloges[] = { CLOCK_TAI, CLOCK_REALTIME }, bases[] = { CLOCK_TAI, CLOCK_MONOTONIC };
+    const char *noms[] = { "TAI relatif de LONG_MAX s : KTIME_MAX moins TAI", "REALTIME relatif de LONG_MAX s : KTIME_MAX moins MONOTONIC" };
+    for (int k = 0; k < 2; k++) {
+        tc(horloges[k], &e, &id);
+        ts(id, 0, &s, NULL);
+        tg(id, &g);
+        int64_t attendu = ktime_max_s - ns(bases[k]) / 1000000000;
+        verifier(g.it_value.tv_sec >= attendu - 1 && g.it_value.tv_sec <= attendu + 1, noms[k]);
+        tdel(id);
+    }
+    tc(CLOCK_REALTIME, &e, &id);
+    s = en(1000000000LL, 1000000000LL);
+    ts(id, TIMER_ABSTIME, &s, NULL);
+    struct timespec reel;
+    tg(id, &g);
+    clock_gettime(CLOCK_REALTIME, &reel);
+    int64_t ecart = (en_ns(g.it_value) - (1000000000 - reel.tv_nsec) % 1000000000 + 1000000000) % 1000000000;
+    verifier(g.it_value.tv_sec == 0 && (ecart < 20000000 || ecart > 980000000),
+             "REALTIME absolu a 1 s apres 1970, toutes les secondes : la suivante a la seconde ronde de la date");
+    tdel(id);
+}
+
+static void calculer(volatile sig_atomic_t *fini, int64_t limite, clockid_t h)
+{
+    int64_t debut = ns(h);
+    while (!*fini && ns(h) - debut < limite)
+        ;
+}
+
+static void posix_calcul(void)
+{
+    int id, sig = SIGRTMIN + 4;
+    struct itimerspec s;
+    struct sigaction a = { 0 };
+    a.sa_handler = sur_posix;
+    sigaction(sig, &a, NULL);
+    struct sigevent e = sev(SIGEV_SIGNAL, sig, 0);
+    /* Les deux horloges nommées par l'appel brut (2 et 3), puis par la
+     * glibc, qui passe -6 et -2 (le pid 0 encodé, SCHED) ; puis PROF du
+     * processus et VIRT du fil (comptées au tic), encodées à la main
+     * (posix-cpu-timers.c : le pid complémenté, décalé de trois bits, le
+     * bit 2 pour un fil, la mesure dans les bits 0 et 1). */
+    clockid_t horloges[] = { CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID, CLOCK_PROCESS_CPUTIME_ID, CLOCK_THREAD_CPUTIME_ID,
+                             (clockid_t)(~0u << 3 | 0), (clockid_t)(~0u << 3 | 4 | 1) };
+    const char *noms[] = { "CLOCK_PROCESS_CPUTIME_ID", "CLOCK_THREAD_CPUTIME_ID", "CLOCK_PROCESS_CPUTIME_ID par la glibc",
+                           "CLOCK_THREAD_CPUTIME_ID par la glibc", "PROF du processus", "VIRT du fil" };
+    for (int k = 0; k < 6; k++) {
+        char quoi[160];
+        if (k == 2 || k == 3) {
+            /* Le numéro du noyau, que la glibc rend tel quel pour
+             * SIGEV_SIGNAL. */
+            timer_t t;
+            snprintf(quoi, sizeof quoi, "%s : timer_create", noms[k]);
+            verifier(timer_create(horloges[k], &e, &t) == 0, quoi);
+            id = (int)(intptr_t)t;
+        } else {
+            tc(horloges[k], &e, &id);
+        }
+        posix_recus = 0;
+        int64_t debut = ns(horloges[k]);
+        s = en(0, 20000000);
+        ts(id, 0, &s, NULL);
+        calculer(&posix_recus, 2000000000, horloges[k]);
+        int64_t calcule = ns(horloges[k]) - debut;
+        snprintf(quoi, sizeof quoi, "%s, 20 ms de calcul : le signal, apres au moins 20 ms", noms[k]);
+        verifier(posix_recus == 1 && calcule >= 20000000, quoi);
+        snprintf(quoi, sizeof quoi, "%s : echu, une fois, plus rien (periode comprise)", noms[k]);
+        verifier(tg(id, &s) == 0 && en_ns(s.it_value) == 0, quoi);
+        /* Périodique : 10 ms de calcul. Un processeur virtuel que l'hôte
+         * suspend (une machine chargée) compte d'un coup au programme qui
+         * tournait tout le temps manqué : plusieurs périodes passent en un
+         * tic, et Linux n'en envoie qu'un signal, les autres dans si_overrun
+         * (`bump_cpu_timer`, au réarmement). Le compte qui ne dépend pas de
+         * la charge est donc celui des périodes, signaux et dépassements
+         * ensemble : on calcule jusqu'à cinq, et elles doivent suivre le
+         * temps de calcul (à une près : le départ est lu après l'armement,
+         * le gestionnaire après le réarmement). */
+        struct sigaction p = { 0 };
+        p.sa_sigaction = sur_posix_periode;
+        p.sa_flags = SA_SIGINFO;
+        posix_periodes = 0;
+        posix_assez = 0;
+        posix_horloge = horloges[k];
+        sigaction(sig, &p, NULL);
+        s = en(10000000, 10000000);
+        ts(id, 0, &s, NULL);
+        int64_t depart = ns(horloges[k]);
+        calculer(&posix_assez, 2000000000, horloges[k]);
+        int64_t rythme = (posix_vu - depart) / 10000000;
+        snprintf(quoi, sizeof quoi, "%s periodique de 10 ms : cinq periodes (signaux et si_overrun), au rythme du calcul", noms[k]);
+        verifier(posix_periodes >= 5 && posix_periodes - rythme <= 1 && rythme - posix_periodes <= 1, quoi);
+        sigaction(sig, &a, NULL);
+        /* Une échéance absolue déjà passée : tout de suite, sans calculer. */
+        bloquer(sig, 1);
+        s = en(0, 1);
+        ts(id, TIMER_ABSTIME, &s, NULL);
+        snprintf(quoi, sizeof quoi, "%s, echeance absolue passee : le signal tout de suite", noms[k]);
+        verifier(en_attente(sig), quoi);
+        siginfo_t info;
+        prendre(sig, &info);
+        bloquer(sig, 0);
+        tdel(id);
+    }
+    /* Le processus finit avec un minuteur arme : détruit avec lui. */
+    e = sev(SIGEV_NONE, 0, 0);
+    tc(CLOCK_MONOTONIC, &e, &id);
+    s = en(0, 3600000000000LL);
+    ts(id, 0, &s, NULL);
+}
+
 int main(void)
 {
     creation();
@@ -528,6 +911,11 @@ int main(void)
     alarme_bloquee();
     alarme_ignoree();
     alarmes_de_calcul();
+    posix_erreurs();
+    posix_signaux();
+    posix_ignores();
+    posix_bornes();
+    posix_calcul();
     /* Le processus finit son alarme armee : desarmee avec lui (le noyau
      * compte ce qu'il a rendu, « memoire rendue »). */
     alarm(3600);

@@ -1117,6 +1117,7 @@ fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement
             limites: processus::limites_par_defaut(),
             signaux,
             alarmes,
+            minuteurs: crate::minuteurs_posix::Minuteurs::new(),
             fils: Vec::new(),
             fin_de_groupe: None,
         }, descripteurs, programme.memoire, nom)

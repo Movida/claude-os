@@ -52,7 +52,7 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/processeurs
 # eventfd et epoll (6d) : la boucle d'événements de Bun, créée mais pas encore attendue.
 /bin/evenements
-# timerfd (les soldes d'avant 6k) : un minuteur derrière un descripteur, attendu par read, poll et epoll ; setitimer et alarm.
+# timerfd (les soldes d'avant 6k) : un minuteur derrière un descripteur, attendu par read, poll et epoll ; setitimer et alarm ; timer_create.
 /bin/minuteurs
 # /proc et /sys (6d) : ce qu'y lit Bun, maps, statm, exe, /proc/sys/vm, cpu/online.
 /bin/proc

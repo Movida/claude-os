@@ -152,6 +152,7 @@ mod linux;
 mod memoire;
 mod minuteurs;
 mod alarmes;
+mod minuteurs_posix;
 mod oom;
 mod pile;
 mod processus;

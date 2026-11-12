@@ -205,7 +205,7 @@ impl TimerFd {
         match self.minuteur.quoi() {
             Quoi::Fichier(f) => f,
             // `timerfd_create` lui donne toujours une file.
-            Quoi::Alarme(_) => unreachable!("timerfd sans file"),
+            Quoi::Alarme(_) | Quoi::Posix(..) => unreachable!("timerfd sans file"),
         }
     }
 

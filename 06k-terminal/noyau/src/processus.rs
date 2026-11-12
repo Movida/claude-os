@@ -102,6 +102,9 @@ pub struct Processus {
     /// finit (le `Processus` rendu par `fil_termine` : l'`exit_itimers` de
     /// Linux).
     pub alarmes: crate::alarmes::Alarmes,
+    /// Ses minuteurs POSIX (timer_create : minuteurs_posix.rs), détruits
+    /// avec lui.
+    pub minuteurs: crate::minuteurs_posix::Minuteurs,
     /// Ses fils vivants, le principal d'abord (fil.rs).
     pub fils: Vec<Fil>,
     /// La fin du groupe, si elle a commencé (exit_group, un signal mortel) :

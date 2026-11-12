@@ -1,8 +1,8 @@
 //! Les minuteurs du noyau : une échéance qui déclenche quelque chose à son
 //! heure, sans tâche qui dorme pour elle (le `hrtimer` de Linux). Le
 //! premier client est timerfd (timerfd.rs) : un fichier qui devient lisible
-//! à l'échéance ; le second, ITIMER_REAL (alarmes.rs : SIGALRM) ; viendra
-//! timer_create.
+//! à l'échéance ; le second, ITIMER_REAL (alarmes.rs : SIGALRM) ; le
+//! troisième, timer_create (minuteurs_posix.rs).
 //!
 //! Jusqu'ici, seule une tâche qui dort pouvait attendre une échéance (les
 //! minuteries d'attente.rs : une par tâche, réservée au démarrage). Un
@@ -88,6 +88,9 @@ pub enum Quoi {
     Fichier(FileAttente),
     /// L'ITIMER_REAL du processus de ce numéro : SIGALRM (alarmes.rs).
     Alarme(u32),
+    /// Le minuteur POSIX (processus, numéro du minuteur) : son signal
+    /// (minuteurs_posix.rs).
+    Posix(u32, i32),
 }
 
 /// L'état d'un minuteur, sous son verrou. Les champs `intervalle`,
@@ -247,6 +250,11 @@ impl Etat {
         self.en_file
     }
 
+    /// Son échéance (temps monotone, ns, signée), gardée une fois passée.
+    pub fn echeance(&self) -> i64 {
+        self.echeance
+    }
+
     /// Le KTIME_MAX de sa base, en temps monotone.
     fn plafond(&self) -> i64 {
         (KTIME_MAX as i64).saturating_sub(self.decalage)
@@ -274,8 +282,22 @@ impl Etat {
 /// périodes (le `hrtimer_forward` de Linux, ligne à ligne), ou l'échéance
 /// telle quelle et 0 si elle n'est pas passée. Une période plus courte que
 /// la nanoseconde (la résolution des hrtimer) compte pour une nanoseconde.
-/// En entiers de 128 bits : l'écart entre une échéance négative et
-/// `maintenant` dépasse un i64.
+/// Les périodes entières ne dépassent jamais `maintenant` ; la dernière
+/// s'ajoute au plus jusqu'à `plafond`, le KTIME_MAX de l'horloge
+/// (`hrtimer_add_expires`, par `ktime_add_safe`). En entiers de 128 bits :
+/// l'écart entre une échéance négative et `maintenant` dépasse un i64.
+pub fn avancer_echeance(echeance: i64, maintenant: i64, intervalle: u64, plafond: i64) -> (i64, u64) {
+    let (nouvelle, periodes) = avancer(echeance as i128, maintenant as i128, intervalle);
+    (nouvelle.min(plafond as i128) as i64, periodes)
+}
+
+/// Le même compte pour une horloge de calcul (le `bump_cpu_timer` de
+/// Linux), sans plafond : ses échéances sont des u64 que rien ne borne.
+pub fn avancer_echeance_calcul(echeance: u64, maintenant: u64, intervalle: u64) -> (u64, u64) {
+    let (nouvelle, periodes) = avancer(echeance as i128, maintenant as i128, intervalle);
+    (nouvelle.min(u64::MAX as i128) as u64, periodes)
+}
+
 fn avancer(echeance: i128, maintenant: i128, intervalle: u64) -> (i128, u64) {
     if maintenant < echeance {
         return (echeance, 0);
@@ -355,17 +377,24 @@ impl GardeMinuteur<'_> {
     }
 
     /// Avance son échéance d'autant de périodes qu'il faut pour dépasser
-    /// `maintenant`, et rend leur nombre (`avancer`, plus haut) : 0 si
-    /// l'échéance n'est pas passée, ou s'il est encore armé. La dernière
-    /// période s'ajoute au plus jusqu'au KTIME_MAX de sa base
-    /// (`hrtimer_add_expires`, par `ktime_add_safe`).
+    /// `maintenant`, et rend leur nombre (`avancer_echeance`) : 0 si
+    /// l'échéance n'est pas passée, ou s'il est encore armé.
     pub fn avancer(&mut self, maintenant: u64, intervalle: u64) -> u64 {
         if self.etat.en_file {
             return 0;
         }
-        let (echeance, periodes) = avancer(self.etat.echeance as i128, maintenant as i128, intervalle);
-        self.etat.echeance = echeance.min(self.etat.plafond() as i128) as i64;
+        let plafond = self.etat.plafond();
+        let (echeance, periodes) = avancer_echeance(self.etat.echeance, maintenant as i64, intervalle, plafond);
+        self.etat.echeance = echeance;
         periodes
+    }
+
+    /// Lui donne l'échéance `echeance` sans l'armer : un minuteur POSIX sans
+    /// signal (SIGEV_NONE) n'est jamais dans la table, on lit seulement ce
+    /// qui lui reste (`common_hrtimer_arm`, sans `hrtimer_start`).
+    pub fn poser(&mut self, echeance: i64) {
+        self.sortir();
+        self.etat.echeance = echeance;
     }
 }
 
@@ -405,6 +434,7 @@ pub fn tic(maintenant: u64) {
                 }
             }
             Quoi::Alarme(pid) => crate::alarmes::sonner(*pid, servir),
+            Quoi::Posix(pid, id) => crate::minuteurs_posix::sonner(*pid, *id, servir),
         }
         // Le cœur d'un minuteur que son propriétaire a lâché entre-temps
         // est rendu ici (le dernier Arc), hors de tout verrou.
@@ -414,7 +444,7 @@ pub fn tic(maintenant: u64) {
 
 /// Un minuteur est-il armé ? (Le détecteur d'interblocage, attente.rs :
 /// une échéance peut encore réveiller un programme, par son timerfd ou par
-/// SIGALRM. Seuls les programmes ont des minuteurs.)
+/// un signal. Seuls les programmes ont des minuteurs.)
 pub fn un_arme() -> bool {
     !TABLE.verrouiller().armes.is_empty()
 }

@@ -104,6 +104,11 @@ const PREAD64: u64 = 17;
 // Les transferts dans le noyau (6i).
 const SENDFILE: u64 = 40;
 const FADVISE64: u64 = 221;
+const TIMER_CREATE: u64 = 222;
+const TIMER_SETTIME: u64 = 223;
+const TIMER_GETTIME: u64 = 224;
+const TIMER_GETOVERRUN: u64 = 225;
+const TIMER_DELETE: u64 = 226;
 const COPY_FILE_RANGE: u64 = 326;
 const PWRITE64: u64 = 18;
 const READV: u64 = 19;
@@ -322,6 +327,11 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         ALARM => crate::alarmes::alarm(a[0]),
         SETITIMER => crate::alarmes::setitimer(a[0], a[1], a[2]),
         TIMERFD_CREATE => crate::timerfd::timerfd_create(a[0], a[1]),
+        TIMER_CREATE => crate::minuteurs_posix::timer_create(a[0], a[1], a[2]),
+        TIMER_SETTIME => crate::minuteurs_posix::timer_settime(a[0], a[1], a[2], a[3]),
+        TIMER_GETTIME => crate::minuteurs_posix::timer_gettime(a[0], a[1]),
+        TIMER_GETOVERRUN => crate::minuteurs_posix::timer_getoverrun(a[0]),
+        TIMER_DELETE => crate::minuteurs_posix::timer_delete(a[0]),
         TIMERFD_SETTIME => crate::timerfd::timerfd_settime(a[0], a[1], a[2], a[3]),
         TIMERFD_GETTIME => crate::timerfd::timerfd_gettime(a[0], a[1]),
         INOTIFY_INIT => crate::surveillance::inotify_init(),
@@ -518,6 +528,11 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         ALARM => ("alarm", 1),
         SETITIMER => ("setitimer", 3),
         TIMERFD_CREATE => ("timerfd_create", 2),
+        TIMER_CREATE => ("timer_create", 3),
+        TIMER_SETTIME => ("timer_settime", 4),
+        TIMER_GETTIME => ("timer_gettime", 2),
+        TIMER_GETOVERRUN => ("timer_getoverrun", 1),
+        TIMER_DELETE => ("timer_delete", 1),
         TIMERFD_SETTIME => ("timerfd_settime", 4),
         TIMERFD_GETTIME => ("timerfd_gettime", 2),
         INOTIFY_INIT => ("inotify_init", 0),

@@ -2103,6 +2103,12 @@ fn decider() -> Option<Arret> {
                 xcpu = Some(courante);
             }
         }
+        if verifier_temps {
+            // Les minuteurs POSIX des horloges de calcul, après les alarmes et
+            // RLIMIT_CPU : Linux envoie leurs signaux en dernier, après avoir
+            // rendu le verrou des signaux (`handle_posix_cpu_timers`).
+            crate::minuteurs_posix::verifier_calcul(p, t.tid, (calcul, tics), (t.calcul.load(Ordering::Relaxed), t.usage.tics()));
+        }
         // Plus rien à livrer, mais un masque sauvé (rt_sigsuspend) : la
         // boucle reprend l'appel, puis le rend.
         let Some(livraison) = signaux::a_livrer(p, t.tid) else {

@@ -99,6 +99,8 @@ const fn bit(sig: u64) -> u64 {
 pub const SI_USER: i32 = 0;
 pub const SI_KERNEL: i32 = 0x80;
 pub const SI_TKILL: i32 = -6;
+/// Un minuteur POSIX (timer_create).
+pub const SI_TIMER: i32 = -2;
 /// Les plus petits si_code dont Linux connaît la disposition (plus bas,
 /// sauf SI_ASYNCNL, un siginfo venu d'un programme doit être nul au-delà de
 /// ce que garde le noyau : `known_siginfo_layout`).
@@ -110,7 +112,26 @@ const SI_ASYNCNL: i32 = -60;
 /// à la sorte d'envoi). Le programme en reçoit 128, nuls au-delà (le
 /// `siginfo_t` du programme garde de la place pour plus tard).
 #[derive(Clone, Copy)]
-pub struct Info([u8; 48]);
+pub struct Info {
+    octets: [u8; 48],
+    /// Le siginfo préalloué d'un minuteur POSIX (minuteurs_posix.rs) ; None
+    /// pour un siginfo ordinaire, compté dans EN_FILE tant qu'il est en
+    /// file. Hors des octets : un programme peut envoyer lui-même un
+    /// siginfo SI_TIMER (rt_sigqueueinfo), qui reste ordinaire (le
+    /// SIGQUEUE_PREALLOC de Linux, un drapeau de la `sigqueue`).
+    prealloue: Option<Prealloue>,
+}
+
+/// Le minuteur d'un siginfo préalloué.
+#[derive(Clone, Copy)]
+struct Prealloue {
+    /// Son numéro.
+    id: i32,
+    /// Compté dans EN_FILE : son minuteur, détruit pendant qu'il était en
+    /// file, lui a passé sa place (`orpheliner`). Sinon, c'est le minuteur
+    /// qui la tient, toute sa vie.
+    compte: bool,
+}
 
 impl Info {
     /// Un siginfo de `sig`, avec son si_code, le reste à zéro.
@@ -118,7 +139,7 @@ impl Info {
         let mut o = [0u8; 48];
         o[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
         o[8..12].copy_from_slice(&code.to_le_bytes());
-        Info(o)
+        Info { octets: o, prealloue: None }
     }
 
     /// Envoyé par un programme (kill, tkill, tgkill : SI_USER, SI_TKILL),
@@ -126,8 +147,8 @@ impl Info {
     /// `_kill` : si_pid, si_uid).
     pub fn par(sig: u64, code: i32, pid: u32, uid: u32) -> Info {
         let mut i = Info::nouveau(sig, code);
-        i.0[16..20].copy_from_slice(&pid.to_le_bytes());
-        i.0[20..24].copy_from_slice(&uid.to_le_bytes());
+        i.octets[16..20].copy_from_slice(&pid.to_le_bytes());
+        i.octets[20..24].copy_from_slice(&uid.to_le_bytes());
         i
     }
 
@@ -139,8 +160,8 @@ impl Info {
     /// Celui d'une entrée-sortie (`send_sigio_to_task` : les champs `_sigpoll` : si_band, si_fd).
     pub fn entree_sortie(sig: u64, code: i32, bande: i64, fd: i32) -> Info {
         let mut i = Info::nouveau(sig, code);
-        i.0[16..24].copy_from_slice(&bande.to_le_bytes());
-        i.0[24..28].copy_from_slice(&fd.to_le_bytes());
+        i.octets[16..24].copy_from_slice(&bande.to_le_bytes());
+        i.octets[24..28].copy_from_slice(&fd.to_le_bytes());
         i
     }
 
@@ -148,7 +169,7 @@ impl Info {
     /// l'adresse en cause (les champs `_sigfault` : si_addr).
     pub fn faute(sig: u64, code: i32, adresse: u64) -> Info {
         let mut i = Info::nouveau(sig, code);
-        i.0[16..24].copy_from_slice(&adresse.to_le_bytes());
+        i.octets[16..24].copy_from_slice(&adresse.to_le_bytes());
         i
     }
 
@@ -159,18 +180,41 @@ impl Info {
         Info::nouveau(sig, SI_USER)
     }
 
+    /// Celui d'un minuteur POSIX, préalloué (minuteurs_posix.rs) : SI_TIMER,
+    /// le numéro du minuteur (si_tid), ses dépassements (si_overrun, posés à
+    /// la livraison) et la valeur de son sigevent (si_value) : les champs
+    /// `_timer`.
+    pub fn de_minuteur(sig: u64, id: i32, valeur: u64) -> Info {
+        let mut i = Info::nouveau(sig, SI_TIMER);
+        i.octets[16..20].copy_from_slice(&id.to_le_bytes());
+        i.octets[24..32].copy_from_slice(&valeur.to_le_bytes());
+        i.prealloue = Some(Prealloue { id, compte: false });
+        i
+    }
+
+    /// Les dépassements d'un minuteur, livrés avec son signal (si_overrun).
+    pub fn poser_depassement(&mut self, n: i32) {
+        self.octets[20..24].copy_from_slice(&n.to_le_bytes());
+    }
+
+    /// Compté dans EN_FILE tant qu'il est en file : tous, sauf le siginfo
+    /// préalloué d'un minuteur qui existe encore.
+    fn compte(&self) -> bool {
+        !matches!(self.prealloue, Some(Prealloue { compte: false, .. }))
+    }
+
     pub fn signal(&self) -> u64 {
-        i32::from_le_bytes([self.0[0], self.0[1], self.0[2], self.0[3]]) as u32 as u64
+        i32::from_le_bytes([self.octets[0], self.octets[1], self.octets[2], self.octets[3]]) as u32 as u64
     }
 
     pub fn code(&self) -> i32 {
-        i32::from_le_bytes([self.0[8], self.0[9], self.0[10], self.0[11]])
+        i32::from_le_bytes([self.octets[8], self.octets[9], self.octets[10], self.octets[11]])
     }
 
     /// Les 128 octets du `siginfo_t` du programme.
     pub fn octets(&self) -> [u8; 128] {
         let mut o = [0u8; 128];
-        o[..48].copy_from_slice(&self.0);
+        o[..48].copy_from_slice(&self.octets);
         o
     }
 }
@@ -196,17 +240,24 @@ pub fn en_file() -> u64 {
 /// une liste chaînée, le cherche aussi depuis le début) ; un `Vec` déplacerait
 /// toute la file à chaque retrait, et elle peut compter des milliers
 /// d'entrées (RLIMIT_SIGPENDING).
+///
+/// La file garde de la place pour les siginfo préalloués des minuteurs
+/// POSIX qui la visent (`places`, minuteurs_posix.rs) : leur envoi, dans le
+/// tic, n'alloue rien. La capacité de la file couvre toujours ses siginfo
+/// ordinaires, plus ces places (un siginfo ordinaire qui n'en trouve plus
+/// est perdu, comme faute de mémoire).
 #[derive(Default)]
 pub struct EnAttente {
     ensemble: u64,
     file: VecDeque<Info>,
+    places: usize,
 }
 
 impl EnAttente {
     /// Range un siginfo (déjà compté dans EN_FILE) : faux s'il n'y a pas la
     /// place (plus de mémoire), le compte est alors rendu.
     fn garder(&mut self, info: Info) -> bool {
-        if self.file.ajouter_derriere(info).is_err() {
+        if self.file.try_reserve(self.places + 1).is_err() || self.file.ajouter_derriere(info).is_err() {
             EN_FILE.fetch_sub(1, Ordering::Relaxed);
             return false;
         }
@@ -214,12 +265,23 @@ impl EnAttente {
     }
 
     /// Retire les signaux de `ensemble`, et leurs siginfo (le
-    /// `flush_sigqueue_mask` de Linux).
-    fn retirer(&mut self, ensemble: u64) {
+    /// `flush_sigqueue_mask` de Linux) ; `prealloue` est appelée avec le
+    /// numéro de chaque minuteur dont le siginfo est retiré
+    /// (`sigqueue_free_ignored`).
+    fn retirer(&mut self, ensemble: u64, mut prealloue: impl FnMut(i32)) {
         self.ensemble &= !ensemble;
-        let avant = self.file.len();
-        self.file.retain(|i| bit(i.signal()) & ensemble == 0);
-        EN_FILE.fetch_sub((avant - self.file.len()) as u64, Ordering::Relaxed);
+        let mut rendus = 0;
+        self.file.retain(|i| {
+            if bit(i.signal()) & ensemble == 0 {
+                return true;
+            }
+            match i.prealloue {
+                Some(Prealloue { id, compte: false }) => prealloue(id),
+                _ => rendus += 1,
+            }
+            false
+        });
+        EN_FILE.fetch_sub(rendus, Ordering::Relaxed);
     }
 
     /// Prend le signal `sig`, en attente : son premier siginfo ; le signal
@@ -233,7 +295,9 @@ impl EnAttente {
         }
         match premier.and_then(|n| self.file.remove(n)) {
             Some(i) => {
-                EN_FILE.fetch_sub(1, Ordering::Relaxed);
+                if i.compte() {
+                    EN_FILE.fetch_sub(1, Ordering::Relaxed);
+                }
                 i
             }
             None => Info::perdu(sig),
@@ -253,7 +317,7 @@ impl Drop for EnAttente {
     /// Les siginfo d'un fil qui finit, ou d'un processus, sont rendus au
     /// compte de l'utilisateur.
     fn drop(&mut self) {
-        EN_FILE.fetch_sub(self.file.len() as u64, Ordering::Relaxed);
+        EN_FILE.fetch_sub(self.file.iter().filter(|i| i.compte()).count() as u64, Ordering::Relaxed);
     }
 }
 
@@ -454,9 +518,10 @@ impl Signaux {
 /// ses fils (le `flush_sigqueue_mask` de Linux, sur le processus puis sur
 /// chaque fil).
 fn effacer(p: &mut Processus, ensemble: u64) {
-    p.signaux.attente.retirer(ensemble);
+    let minuteurs = &mut p.minuteurs;
+    p.signaux.attente.retirer(ensemble, |id| crate::minuteurs_posix::retire_de_la_file(minuteurs, id));
     for f in p.fils.iter_mut() {
-        f.signaux.attente.retirer(ensemble);
+        f.signaux.attente.retirer(ensemble, |id| crate::minuteurs_posix::retire_de_la_file(minuteurs, id));
     }
 }
 
@@ -568,12 +633,7 @@ pub enum Livraison {
 /// (`reveiller`).
 pub fn envoyer(p: &mut Processus, sig: u64, a: Destinataire, info: Info, speciale: bool)
     -> Result<Option<Arc<Tache>>, i64> {
-    if sig == SIGCONT {
-        effacer(p, bit(SIGSTOP) | bit(SIGTSTP) | bit(SIGTTIN) | bit(SIGTTOU));
-    } else if matches!(par_defaut(sig), ParDefaut::Arreter) {
-        effacer(p, bit(SIGCONT));
-    }
-    if ignore(p, sig, a) {
+    if !preparer(p, sig, a) {
         return Ok(None);
     }
     let limite = p.limite(processus::RLIMIT_SIGPENDING).0;
@@ -608,6 +668,96 @@ pub fn envoyer(p: &mut Processus, sig: u64, a: Destinataire, info: Info, special
         }
         Destinataire::Processus => prevenir(p, sig),
     })
+}
+
+/// Le premier temps d'un envoi (`prepare_signal`) : un signal qui relance
+/// (SIGCONT) efface les signaux d'arrêt en attente, des deux sortes, et
+/// l'inverse. Faux si le signal est ignoré : il est jeté.
+pub fn preparer(p: &mut Processus, sig: u64, a: Destinataire) -> bool {
+    if sig == SIGCONT {
+        effacer(p, bit(SIGSTOP) | bit(SIGTSTP) | bit(SIGTTIN) | bit(SIGTTOU));
+    } else if matches!(par_defaut(sig), ParDefaut::Arreter) {
+        effacer(p, bit(SIGCONT));
+    }
+    !ignore(p, sig, a)
+}
+
+/// La file des signaux en attente du fil `tid`, ou du processus.
+fn file_de(p: &mut Processus, a: Destinataire) -> Option<&mut EnAttente> {
+    match a {
+        Destinataire::Fil(tid) => p.fil(tid).map(|f| &mut f.signaux.attente),
+        Destinataire::Processus => Some(&mut p.signaux.attente),
+    }
+}
+
+/// Un minuteur POSIX naît (minuteurs_posix.rs) : son siginfo préalloué
+/// prend une place dans le compte des siginfo en file, pour toute sa vie
+/// (`posixtimer_init_sigqueue`). Faux au-delà de la limite `limite`
+/// (RLIMIT_SIGPENDING).
+pub fn compter_prealloue(limite: u64) -> bool {
+    if EN_FILE.fetch_add(1, Ordering::Relaxed) + 1 > limite {
+        EN_FILE.fetch_sub(1, Ordering::Relaxed);
+        return false;
+    }
+    true
+}
+
+/// Un minuteur POSIX finit : sa place dans le compte est rendue.
+pub fn rendre_prealloue() {
+    EN_FILE.fetch_sub(1, Ordering::Relaxed);
+}
+
+/// Réserve la place du siginfo préalloué d'un minuteur POSIX dans la file
+/// qu'il vise (`EnAttente::places`). Faux : plus de mémoire, ou le fil n'est
+/// plus là.
+pub fn reserver_place(p: &mut Processus, a: Destinataire) -> bool {
+    let Some(f) = file_de(p, a) else { return false };
+    if f.file.try_reserve(f.places + 1).is_err() {
+        return false;
+    }
+    f.places += 1;
+    true
+}
+
+/// Rend la place réservée par `reserver_place` (la capacité reste).
+pub fn rendre_place(p: &mut Processus, a: Destinataire) {
+    if let Some(f) = file_de(p, a) {
+        f.places = f.places.saturating_sub(1);
+    }
+}
+
+/// Le minuteur `id` est détruit pendant que son siginfo préalloué est en
+/// file : le siginfo y reste (le retrait le jettera, périmé), et prend sa
+/// place dans le compte, qu'il rendra en quittant la file. Faux s'il n'y est
+/// plus (son fil a fini) : le minuteur la rend lui-même.
+pub fn orpheliner(p: &mut Processus, a: Destinataire, id: i32) -> bool {
+    let Some(f) = file_de(p, a) else { return false };
+    match f.file.iter_mut().find(|i| matches!(i.prealloue, Some(Prealloue { id: n, compte: false }) if n == id)) {
+        Some(i) => {
+            i.prealloue = Some(Prealloue { id, compte: true });
+            true
+        }
+        None => false,
+    }
+}
+
+/// Met en file le siginfo préalloué d'un minuteur POSIX, après `preparer` :
+/// sans limite (il est compté depuis la création du minuteur) ni
+/// allocation (sa place est réservée), puis le fil qui le prendra (le
+/// `posixtimer_queue_sigqueue` de Linux, et son `complete_signal`). Rend le
+/// fil à réveiller.
+pub fn mettre_en_file_prealloue(p: &mut Processus, a: Destinataire, info: Info) -> Option<Arc<Tache>> {
+    let sig = info.signal();
+    let attente = file_de(p, a)?;
+    attente.file.ajouter_derriere_dans_la_place(info);
+    attente.ensemble |= bit(sig);
+    match a {
+        Destinataire::Fil(tid) => {
+            let f = p.fil(tid)?;
+            (f.signaux.bloques & bit(sig) == 0).then(|| f.tache.upgrade()).flatten()
+        }
+        Destinataire::Processus => prevenir(p, sig),
+    }
 }
 
 /// Le fil `f` veut-il le signal `sig` du processus (le `wants_signal` de
@@ -869,7 +1019,23 @@ pub fn forcer_au_fil(p: &mut Processus, tid: u32, sig: u64, info: Info, mortel: 
 /// pas, ou de `voulus` seulement si `voulus` n'est pas tout (rt_sigtimedwait
 /// prend aussi les bloqués) : ceux du fil d'abord, puis ceux du processus ;
 /// dans chaque sorte, `EnAttente::suivant` (le `dequeue_signal` de Linux).
+/// Le siginfo préalloué d'un minuteur POSIX passe par son minuteur
+/// (`minuteurs_posix::signal_pris`) : périmé, il est jeté, et un autre est
+/// pris (le `goto again` de `dequeue_signal`) ; sinon le minuteur repart.
 fn prendre_parmi(p: &mut Processus, tid: u32, voulus: u64) -> Option<(u64, Info)> {
+    loop {
+        let (sig, mut info) = prendre_un(p, tid, voulus)?;
+        let Some(Prealloue { id, compte }) = info.prealloue else { return Some((sig, info)) };
+        info.prealloue = None;
+        // Compté, il vient d'un minuteur détruit : périmé.
+        if !compte && crate::minuteurs_posix::signal_pris(p, id, &mut info) {
+            return Some((sig, info));
+        }
+    }
+}
+
+/// Un signal pris par `prendre_parmi`, tel qu'il était en file.
+fn prendre_un(p: &mut Processus, tid: u32, voulus: u64) -> Option<(u64, Info)> {
     let s = &mut p.signaux;
     let f = &mut p.fils.iter_mut().find(|f| f.tid == tid)?.signaux;
     let permis = if voulus == !0 { !f.bloques } else { voulus };
@@ -939,6 +1105,10 @@ pub fn rt_sigaction(sig: u64, nouvelle: u64, ancienne: u64, taille: u64) -> i64 
             p.signaux.actions[(sig - 1) as usize] = a;
             if ignore_par(a.gestionnaire, sig) {
                 effacer(p, bit(sig));
+            } else if avant.gestionnaire == SIG_IGN {
+                // Les minuteurs mis de côté pour lui reprennent (seulement
+                // depuis SIG_IGN lui-même, comme `do_sigaction`).
+                crate::minuteurs_posix::designorer(p, sig);
             }
         }
         avant
@@ -1278,9 +1448,9 @@ fn au_fil(tgid: Option<i32>, tid: i32, sig: u64, info: Info) -> i64 {
 fn lire_info(sig: u64, adresse: u64) -> Result<Info, i64> {
     let mut o = [0u8; 128];
     copier_depuis_utilisateur(&mut o[..48], adresse).map_err(|_| -EFAULT)?;
-    let mut i = Info([0; 48]);
-    i.0.copy_from_slice(&o[..48]);
-    i.0[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
+    let mut i = Info { octets: [0; 48], prealloue: None };
+    i.octets.copy_from_slice(&o[..48]);
+    i.octets[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
     let code = i.code();
     // Les si_code propres à un signal (une faute, SIGCHLD, SIGPOLL, SIGSYS),
     // jusqu'à leur nombre (NSIGILL... de Linux) ; pour les autres, ceux de
