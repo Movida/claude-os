@@ -32,9 +32,16 @@ LANG=C.UTF-8 HOME=/tmp /bin/pile un 'deux mots'
 /bin/arbre
 /bin/segments
 # Les signaux (6d) : enregistrés et rendus comme Linux, puis leur file et
-# leur siginfo (6f) ; et livrés à leurs gestionnaires (6f) : le cadre de
-# signal, rt_sigreturn, la pile de secours.
+# leur siginfo (6f), et signalfd (les soldes d'avant 6k) ; et livrés à
+# leurs gestionnaires (6f) : le cadre de signal, rt_sigreturn, la pile de
+# secours.
 /bin/signaux
+# L'epoll et le signalfd d'un processus fini, gardés par un autre : prêt
+# une fois (POLLFREE), puis plus jamais.
+/bin/signaux garder &
+/bin/signaux transmettre
+/bin/signaux relacher
+wait
 /bin/gestionnaires
 # Les appels interrompus par un gestionnaire (6f) : EINTR, ou repris ; et
 # des fils suspendus par signal, comme le fait JavaScriptCore.

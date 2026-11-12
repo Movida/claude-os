@@ -45,7 +45,7 @@
 //! la `struct file`.
 
 use crate::appels_fichiers::{FichierTenu, installer_fichier_puis, tenir, tenir_ouvert};
-use crate::attente::{self, EntreeRappel, FileAttente, Mutex, Rappel, Sommeil};
+use crate::attente::{self, EntreeRappel, FileAttente, FileVisee, Mutex, Rappel, Sommeil};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur, dans_les_bornes};
 use crate::descripteurs::{Fichier, FichierOuvert, Ouverts, Prive, Sorte, Tenu};
 use crate::partage::{Arc, Weak};
@@ -530,7 +530,7 @@ struct Inscription<'a> {
 }
 
 impl Inscrire for Inscription<'_> {
-    fn inscrire(&mut self, file: &FileAttente, _tenu: &FichierTenu, _cle: u32) {
+    fn inscrire(&mut self, file: FileVisee<'_>, _tenu: &FichierTenu, _cle: u32) {
         let n = self.element.inscrites.load(Relaxed);
         let Some(e) = self.element.entrees.get(n).and_then(Option::as_ref) else {
             self.echec = true;

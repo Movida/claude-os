@@ -259,9 +259,11 @@ boot.bin: programmes.cpio FORCE
 #   - segments : gcc -static, ses propres segments projetés depuis son
 #     fichier (MADV_DONTNEED relit le fichier) ; sur l'hôte aussi ;
 #   - signaux : gcc -static, les signaux enregistrés (rt_sigaction,
-#     rt_sigprocmask, sigaltstack, kill...) et leur file (siginfo,
-#     rt_sigqueueinfo, rt_sigtimedwait) contre ce qu'en fait Linux ; sur
-#     l'hôte aussi ;
+#     rt_sigprocmask, sigaltstack, kill...), leur file (siginfo,
+#     rt_sigqueueinfo, rt_sigtimedwait) et signalfd contre ce qu'en fait
+#     Linux ; sur l'hôte aussi. Puis « garder & », « transmettre » et
+#     « relacher » : l'epoll et le signalfd d'un processus fini, gardés
+#     par un autre ;
 #   - gestionnaires : gcc -static, les gestionnaires de signaux (le cadre de
 #     signal, rt_sigreturn, la pile de secours, les drapeaux, l'ordre, les
 #     fautes) ; sur l'hôte aussi, et dans l'archive des tests (qemu64 et
@@ -1307,7 +1309,11 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/fichiers | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/segments | tee /dev/stderr | (! grep -q ECHEC)
 	LD_LIBRARY_PATH=$(LINUX) ./$(LINUX)/dynamique | tee /dev/stderr | (! grep -q ECHEC)
-	./$(LINUX)/signaux | tee /dev/stderr | (! grep -q ECHEC)
+	timeout 60 ./$(LINUX)/signaux | tee /dev/stderr | grep -q "signaux : toutes les verifications : ok"
+	timeout 60 ./$(LINUX)/signaux garder | tee /dev/stderr | grep -q "garder : toutes les verifications : ok" & g=$$!; \
+	  timeout 30 ./$(LINUX)/signaux transmettre | tee /dev/stderr | grep -q "transmettre : toutes les verifications : ok" \
+	  && timeout 30 ./$(LINUX)/signaux relacher | tee /dev/stderr | grep -q "relacher : toutes les verifications : ok"; r=$$?; \
+	  wait $$g || r=1; exit $$r
 	timeout 60 ./$(LINUX)/gestionnaires | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/reprise | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/suspendre | tee /dev/stderr | grep -q "toutes les verifications : ok"

@@ -86,6 +86,9 @@ pub enum Sorte {
     /// Un minuteur (timerfd, les soldes d'avant 6k) : son objet dans
     /// `Prive::TimerFd`.
     TimerFd,
+    /// Des signaux lus comme un fichier (signalfd, les soldes d'avant 6k) :
+    /// son masque dans `Prive::SignalFd`.
+    SignalFd,
     /// Un fichier d'un système du noyau (/proc, /sys, 6d), dont le contenu
     /// est fabriqué à la lecture (`Donnees::Noyau`), d'une des trois façons
     /// de Linux.
@@ -119,7 +122,8 @@ impl Sorte {
     /// /dev/random et les terminaux acceptés.
     pub fn sait_attendre(self) -> bool {
         matches!(self, Sorte::Aleatoire { random: true } | Sorte::Console | Sorte::EventFd | Sorte::Epoll | Sorte::Tube
-                       | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
+                       | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd
+                       | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
     }
 }
 
@@ -149,6 +153,7 @@ pub enum Prive {
     Socket(Arc<crate::reseau::socket::Socket>),
     Inotify(Arc<crate::surveillance::Groupe>),
     TimerFd(Arc<crate::timerfd::TimerFd>),
+    SignalFd(Arc<crate::signalfd::SignalFd>),
 }
 
 /// Ce que tient un fichier ouvert : un inode du tmpfs, avec ce qu'a rendu

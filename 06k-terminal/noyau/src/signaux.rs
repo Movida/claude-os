@@ -40,10 +40,19 @@
 //! Le nombre de siginfo en file est borné par RLIMIT_SIGPENDING, compté
 //! pour l'utilisateur sur tous ses processus (`EN_FILE`), comme les
 //! `ucounts` de Linux.
+//!
+//! Depuis les soldes d'avant 6k, un signal en attente peut aussi se LIRE
+//! comme un fichier : un signalfd (signalfd.rs) prend, parmi les signaux
+//! de son masque, ceux qui attendent le fil qui le lit
+//! (`prendre_pour_signalfd`), même bloqués (c'est l'usage : bloqués, ils ne
+//! sont jamais livrés, seulement lus). Qui le lit ou le sonde attend dans
+//! une file du processus (`Signaux::file_signalfd`, le `signalfd_wqh` de
+//! la `sighand_struct`), réveillée à chaque signal mis en attente.
 
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::attente::FileAttente;
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::faillible::{FileFaillible, VecFaillible};
 use crate::fil;
@@ -82,6 +91,8 @@ const SIGURG: u64 = 23;
 const SIGXCPU: u64 = 24;
 const SIGXFSZ: u64 = 25;
 const SIGWINCH: u64 = 28;
+/// SIGIO, sous son autre nom : celui de ses si_code.
+const SIGPOLL: u64 = 29;
 const SIGSYS: u64 = 31;
 
 /// Le premier signal temps réel (SIGRTMIN du noyau ; la glibc garde les
@@ -101,6 +112,8 @@ pub const SI_KERNEL: i32 = 0x80;
 pub const SI_TKILL: i32 = -6;
 /// Un minuteur POSIX (timer_create).
 pub const SI_TIMER: i32 = -2;
+/// Une entrée-sortie (`send_sigio_to_task`, sans `si_code` propre).
+const SI_SIGIO: i32 = -5;
 /// Les plus petits si_code dont Linux connaît la disposition (plus bas,
 /// sauf SI_ASYNCNL, un siginfo venu d'un programme doit être nul au-delà de
 /// ce que garde le noyau : `known_siginfo_layout`).
@@ -217,6 +230,147 @@ impl Info {
         o[..48].copy_from_slice(&self.octets);
         o
     }
+
+    /// La disposition de ses octets propres, d'après son signal et son
+    /// si_code (le `siginfo_layout` de Linux) : un si_code positif (et
+    /// inférieur à SI_KERNEL) est propre au signal jusqu'à leur nombre
+    /// (`codes_propres`), puis, comme pour un signal qui n'en a pas, celui
+    /// de SIGPOLL jusqu'à NSIGPOLL, puis rien de connu (SIL_KILL) ; un
+    /// si_code négatif est celui d'un minuteur, d'une entrée-sortie, ou
+    /// d'un envoi par un programme (SIL_RT). Mesuré pour chaque cas
+    /// (linux/signaux.c, `signalfd_dispositions`).
+    fn disposition(&self) -> Disposition {
+        let (sig, code) = (self.signal(), self.code());
+        if code > SI_USER && code < SI_KERNEL {
+            match codes_propres(sig) {
+                // BUS_MCEERR_AR et BUS_MCEERR_AO : une erreur de la mémoire
+                // (la machine), avec le nombre de bits d'adresse en cause.
+                Some((limite, _)) if code <= limite && sig == SIGBUS && matches!(code, 4 | 5) => Disposition::FauteMce,
+                Some((limite, d)) if code <= limite => d,
+                _ if code <= NSIGPOLL => Disposition::Sondage,
+                _ => Disposition::Kill,
+            }
+        } else {
+            match code {
+                SI_TIMER => Disposition::Minuteur,
+                SI_SIGIO => Disposition::Sondage,
+                c if c < 0 => Disposition::TempsReel,
+                _ => Disposition::Kill,
+            }
+        }
+    }
+
+    /// Les 128 octets du `signalfd_siginfo` que lit un signalfd (le
+    /// `signalfd_copyinfo` de Linux) : une autre disposition que le
+    /// siginfo_t, à plat, un champ par valeur ; si_signo, si_errno et
+    /// si_code, puis les champs de sa disposition, le reste nul. Les
+    /// fautes à disposition propre (SEGV_BNDERR, SEGV_PKUERR, TRAP_PERF)
+    /// n'y donnent que leur adresse, comme Linux (« treat it as SIL_FAULT »).
+    pub fn pour_signalfd(&self) -> [u8; 128] {
+        // Les places du signalfd_siginfo (uapi/linux/signalfd.h).
+        const PID: usize = 12;
+        const UID: usize = 16;
+        const FD: usize = 20;
+        const TID: usize = 24;
+        const BAND: usize = 28;
+        const OVERRUN: usize = 32;
+        const STATUS: usize = 40;
+        const INT: usize = 44;
+        const PTR: usize = 48;
+        const UTIME: usize = 56;
+        const STIME: usize = 64;
+        const ADDR: usize = 72;
+        const ADDR_LSB: usize = 80;
+        const SYSCALL: usize = 84;
+        const CALL_ADDR: usize = 88;
+        const ARCH: usize = 96;
+        let o = &self.octets;
+        let mut s = [0u8; 128];
+        s[..12].copy_from_slice(&o[..12]);
+        // `n` octets du siginfo, depuis `de`, à la place `a`. Les champs
+        // plus étroits que leur source (ssi_band, 32 bits, d'un long ;
+        // ssi_int de la valeur) en prennent les octets de poids faible.
+        let mut poser = |a: usize, de: usize, n: usize| s[a..a + n].copy_from_slice(&o[de..de + n]);
+        match self.disposition() {
+            Disposition::Kill => {
+                poser(PID, 16, 4);
+                poser(UID, 20, 4);
+            }
+            Disposition::Minuteur => {
+                poser(TID, 16, 4);
+                poser(OVERRUN, 20, 4);
+                poser(PTR, 24, 8);
+                poser(INT, 24, 4);
+            }
+            Disposition::Sondage => {
+                poser(BAND, 16, 4);
+                poser(FD, 24, 4);
+            }
+            Disposition::Faute => poser(ADDR, 16, 8),
+            Disposition::FauteMce => {
+                poser(ADDR, 16, 8);
+                poser(ADDR_LSB, 24, 2);
+            }
+            Disposition::Enfant => {
+                poser(PID, 16, 4);
+                poser(UID, 20, 4);
+                poser(STATUS, 24, 4);
+                poser(UTIME, 32, 8);
+                poser(STIME, 40, 8);
+            }
+            Disposition::TempsReel => {
+                poser(PID, 16, 4);
+                poser(UID, 20, 4);
+                poser(PTR, 24, 8);
+                poser(INT, 24, 4);
+            }
+            Disposition::Systeme => {
+                poser(CALL_ADDR, 16, 8);
+                poser(SYSCALL, 24, 4);
+                poser(ARCH, 28, 4);
+            }
+        }
+        s
+    }
+}
+
+/// Comment se lisent les 32 octets propres d'un siginfo (les `SIL_*` de
+/// Linux) : qui l'a envoyé (`_kill`), un minuteur (`_timer`), une
+/// entrée-sortie (`_sigpoll`), une faute (`_sigfault`, et sa variante
+/// d'erreur de la mémoire), la fin d'un enfant (`_sigchld`), un envoi
+/// avec une valeur (`_rt`), un appel système refusé (`_sigsys`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Disposition {
+    Kill,
+    Minuteur,
+    Sondage,
+    Faute,
+    FauteMce,
+    Enfant,
+    TempsReel,
+    Systeme,
+}
+
+/// Les si_code de SIGPOLL (POLL_IN à POLL_HUP), qui valent aussi pour un
+/// signal sans si_code propre.
+const NSIGPOLL: i32 = 6;
+
+/// Les si_code propres à un signal (une faute, SIGCHLD, SIGPOLL, SIGSYS) :
+/// leur nombre (les NSIGILL, NSIGFPE... de Linux, 6.18) et leur
+/// disposition ; None pour un signal qui n'en a pas.
+fn codes_propres(sig: u64) -> Option<(i32, Disposition)> {
+    Some(match sig {
+        SIGILL => (11, Disposition::Faute),
+        SIGFPE => (15, Disposition::Faute),
+        SIGSEGV => (10, Disposition::Faute),
+        SIGBUS => (5, Disposition::Faute),
+        SIGTRAP => (6, Disposition::Faute),
+        SIGCHLD => (6, Disposition::Enfant),
+        SIGPOLL => (NSIGPOLL, Disposition::Sondage),
+        // SYS_SECCOMP, SYS_USER_DISPATCH.
+        SIGSYS => (2, Disposition::Systeme),
+        _ => return None,
+    })
 }
 
 /// Le nombre de siginfo en file pour l'utilisateur, sur tous ses processus
@@ -323,7 +477,7 @@ impl Drop for EnAttente {
 
 /// Ni SIGKILL ni SIGSTOP ne se bloquent, ne s'ignorent ni ne s'attrapent :
 /// Linux les retire en silence d'un masque (sigdelsetmask).
-const IMBLOQUABLES: u64 = bit(SIGKILL) | bit(SIGSTOP);
+pub const IMBLOQUABLES: u64 = bit(SIGKILL) | bit(SIGSTOP);
 
 /// Les signaux « synchrones », dus à ce que fait le programme lui-même :
 /// Linux les livre avant les autres (SYNCHRONOUS_MASK, kernel/signal.c).
@@ -438,6 +592,23 @@ pub struct Signaux {
     /// processus, quand le principal n'en veut pas (le `curr_target` de
     /// Linux : le dernier choisi, pour répartir) ; 0 au départ.
     cible: u32,
+    /// Ceux qui attendent un signal par un signalfd, en le lisant ou en le
+    /// sondant (le `signalfd_wqh` de Linux, signalfd.rs) : réveillée à
+    /// chaque signal mis en attente, d'une sorte ou de l'autre. Dans un Arc
+    /// : un epoll qui y inscrit un élément peut survivre au processus
+    /// (attente.rs, `FileVisee::Partagee`).
+    pub file_signalfd: Arc<FileAttente>,
+}
+
+impl Drop for Signaux {
+    /// Le processus finit : un dernier réveil de sa file des signalfd,
+    /// avec POLLHUP et POLLFREE (le `signalfd_cleanup` de Linux) ; un epoll
+    /// qui y attend encore (gardé par un autre processus) rend son élément
+    /// prêt, puis n'en est plus jamais réveillé (mesuré :
+    /// linux/signaux.c, `garder`).
+    fn drop(&mut self) {
+        self.file_signalfd.reveiller(crate::sondage::POLLHUP | crate::sondage::POLLFREE, 0);
+    }
 }
 
 /// Les signaux d'un fil : son masque, ceux envoyés à lui seul (le `pending`
@@ -506,7 +677,8 @@ impl Signaux {
         const DEFAUT: Action = Action { gestionnaire: SIG_DFL, drapeaux: 0, restaurateur: 0, masque: 0 };
         static PAR_DEFAUT: [Action; NSIG as usize] = [DEFAUT; NSIG as usize];
         let actions = crate::faillible::boite_de_tranche(&PAR_DEFAUT).ok()?;
-        Some(Signaux { actions, attente: EnAttente::default(), cible: 0 })
+        let file_signalfd = Arc::new(FileAttente::new()).ok()?;
+        Some(Signaux { actions, attente: EnAttente::default(), cible: 0, file_signalfd })
     }
 
     fn action(&self, sig: u64) -> &Action {
@@ -626,7 +798,9 @@ pub enum Livraison {
 ///      (sigqueue : SI_QUEUE), EAGAIN et rien n'est envoyé ; pour les
 ///      autres, le signal part sans son siginfo (Linux : « silent loss of
 ///      information »). SIGKILL n'en garde pas (il tue, sans gestionnaire) ;
-///   4. le signal en attente, et le fil qui le prendra (`complete_signal`).
+///   4. le signal en attente (ceux qui attendent un signalfd réveillés : le
+///      `signalfd_notify` de Linux), et le fil qui le prendra
+///      (`complete_signal`).
 /// Rend le fil à réveiller, s'il y en a un (son appel en cours, s'il dort
 /// interruptible, rendra EINTR ou sera refait) : à faire hors du verrou du
 /// processus
@@ -661,6 +835,7 @@ pub fn envoyer(p: &mut Processus, sig: u64, a: Destinataire, info: Info, special
         }
     }
     attente.ensemble |= bit(sig);
+    p.signaux.file_signalfd.reveiller_une();
     Ok(match a {
         Destinataire::Fil(tid) => {
             let f = p.fil(tid).expect("le fil vient d'etre trouve");
@@ -744,13 +919,14 @@ pub fn orpheliner(p: &mut Processus, a: Destinataire, id: i32) -> bool {
 /// Met en file le siginfo préalloué d'un minuteur POSIX, après `preparer` :
 /// sans limite (il est compté depuis la création du minuteur) ni
 /// allocation (sa place est réservée), puis le fil qui le prendra (le
-/// `posixtimer_queue_sigqueue` de Linux, et son `complete_signal`). Rend le
-/// fil à réveiller.
+/// `posixtimer_queue_sigqueue` de Linux, son `signalfd_notify` et son
+/// `complete_signal`). Rend le fil à réveiller.
 pub fn mettre_en_file_prealloue(p: &mut Processus, a: Destinataire, info: Info) -> Option<Arc<Tache>> {
     let sig = info.signal();
     let attente = file_de(p, a)?;
     attente.file.ajouter_derriere_dans_la_place(info);
     attente.ensemble |= bit(sig);
+    p.signaux.file_signalfd.reveiller_une();
     match a {
         Destinataire::Fil(tid) => {
             let f = p.fil(tid)?;
@@ -1032,6 +1208,23 @@ fn prendre_parmi(p: &mut Processus, tid: u32, voulus: u64) -> Option<(u64, Info)
             return Some((sig, info));
         }
     }
+}
+
+/// Pour la lecture d'un signalfd : prend, pour le fil `tid`, un signal en
+/// attente de `voulus` (le masque du signalfd), même bloqué, jamais SIGKILL
+/// ni SIGSTOP (le `dequeue_signal` de `signalfd_dequeue`) : ceux du fil,
+/// puis ceux du processus.
+pub fn prendre_pour_signalfd(p: &mut Processus, tid: u32, voulus: u64) -> Option<Info> {
+    // Sans SIGKILL ni SIGSTOP, `voulus` n'est jamais « tout », qui dirait
+    // à `prendre_parmi` de prendre les non bloqués.
+    prendre_parmi(p, tid, voulus & !IMBLOQUABLES).map(|(_, info)| info)
+}
+
+/// Pour le sondage d'un signalfd (`signalfd_poll`) : un signal de `voulus`
+/// attend-il le fil `tid`, envoyé à lui ou au processus ?
+pub fn en_attente_parmi(p: &mut Processus, tid: u32, voulus: u64) -> bool {
+    let commun = p.signaux.attente.ensemble;
+    p.fil(tid).is_some_and(|f| (f.signaux.attente.ensemble | commun) & voulus & !IMBLOQUABLES != 0)
 }
 
 /// Un signal pris par `prendre_parmi`, tel qu'il était en file.
@@ -1322,8 +1515,7 @@ pub fn tuer_processus(pid: u32) -> bool {
 
 /// Un signal a-t-il ses propres `si_code` (SIG_SPECIFIC_SICODES_MASK) ?
 pub fn a_ses_propres_codes(sig: u64) -> bool {
-    // SIGILL, SIGTRAP, SIGBUS, SIGFPE, SIGSEGV, SIGCHLD, SIGPOLL, SIGSYS.
-    matches!(sig, 4 | 5 | 7 | 8 | 11 | 17 | 29 | 31)
+    codes_propres(sig).is_some()
 }
 
 /// Le signal du propriétaire d'un fichier (asynchrone.rs : `do_send_sig_info`), si `uid`, qui l'a
@@ -1453,19 +1645,8 @@ fn lire_info(sig: u64, adresse: u64) -> Result<Info, i64> {
     i.octets[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
     let code = i.code();
     // Les si_code propres à un signal (une faute, SIGCHLD, SIGPOLL, SIGSYS),
-    // jusqu'à leur nombre (NSIGILL... de Linux) ; pour les autres, ceux de
-    // SIGPOLL (NSIGPOLL).
-    let limite = match sig {
-        4 => 11,  // SIGILL
-        8 => 15,  // SIGFPE
-        11 => 10, // SIGSEGV
-        7 => 5,   // SIGBUS
-        5 => 6,   // SIGTRAP
-        17 => 6,  // SIGCHLD
-        29 => 6,  // SIGPOLL
-        31 => 2,  // SIGSYS (SYS_SECCOMP, SYS_USER_DISPATCH)
-        _ => 6,
-    };
+    // jusqu'à leur nombre ; pour les autres, ceux de SIGPOLL (NSIGPOLL).
+    let limite = codes_propres(sig).map_or(NSIGPOLL, |(n, _)| n);
     let connue = code == SI_KERNEL || (code > SI_USER && code <= limite) || code >= SI_DETHREAD && code <= SI_USER
         || code == SI_ASYNCNL;
     if !connue {

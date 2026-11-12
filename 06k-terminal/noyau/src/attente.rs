@@ -860,7 +860,7 @@ impl<T: PorteFile + 'static> Relais<T> {
             *self.entree.rappel().0.verrouiller() = Some(cible.clone());
             // Retiré de l'ancienne file d'abord (`EntreeRappel::inscrire`),
             // que `c` tient encore.
-            self.entree.as_ref().inscrire(chez.file_ecoutee(), false);
+            self.entree.as_ref().inscrire(FileVisee::Empruntee(chez.file_ecoutee()), false);
             c.replace(chez.clone())
         };
         // L'ancien objet rendu hors du verrou (son dernier Arc pourrait le
@@ -906,9 +906,10 @@ impl<T: PorteFile + 'static> Drop for Relais<T> {
 ///     aurait pu pendre après un `forget` (la relecture de 6j).
 ///   - la file vit tant que l'entrée y est : le possesseur tient son
 ///     fichier (sondage.rs, dans `R`) ou retire ses entrées avant qu'il ne
-///     se ferme (epoll.rs) ; et une file détruite avec des entrées arrête
-///     le noyau (`FileAttente::drop`) au lieu de laisser une entrée désigner
-///     une mémoire rendue.
+///     se ferme (epoll.rs), ou bien l'entrée tient la file elle-même
+///     (`FileVisee::Partagee`, voir là) ; et une file détruite avec des
+///     entrées arrête le noyau (`FileAttente::drop`) au lieu de laisser une
+///     entrée désigner une mémoire rendue.
 /// Ainsi epoll.rs et sondage.rs n'ont plus d'`unsafe` (jusqu'à 6j, ils
 /// inscrivaient leurs entrées par des pointeurs bruts), ni le `Relais`
 /// d'AF_UNIX (depuis les soldes d'avant 6k) : ce qu'il faut vérifier est
@@ -922,9 +923,46 @@ pub struct EntreeRappel<R: Rappel + 'static> {
     entree: EntreeAttente,
     /// La file où elle est inscrite (nulle : aucune). Un atomique : epoll
     /// retire les entrées d'un élément depuis la fermeture de son fichier,
-    /// une autre tâche que celle qui les inscrit.
+    /// une autre tâche que celle qui les inscrit. Son bit de poids faible
+    /// (`TENUE`) dit que l'entrée tient la file : une référence de son Arc
+    /// (`Arc::into_raw`), rendue au retrait. Dans le même atomique que
+    /// l'adresse, pas dans un second : deux retraits qui se croisent (la
+    /// fermeture d'un fichier et `EPOLL_CTL_DEL`) prendraient l'un
+    /// l'adresse, l'autre le drapeau, et le second rendrait la référence
+    /// pendant que le premier retire encore l'entrée de la file.
     file: AtomicPtr<FileAttente>,
     rappel: R,
+}
+
+/// Le bit de `EntreeRappel::file` qui dit que l'entrée tient sa file :
+/// libre dans l'adresse d'une file, alignée sur 8 (son verrou et ses
+/// pointeurs).
+const TENUE: usize = 1;
+const _: () = assert!(core::mem::align_of::<FileAttente>() > TENUE);
+
+/// La file où inscrire une entrée de rappel (`EntreeRappel::inscrire`).
+///   - `Empruntee` : celle d'un objet que le possesseur de l'entrée garde en
+///     vie tant qu'elle y est (le fichier sondé, sa socket...) ; le cas de
+///     presque toutes les files.
+///   - `Partagee` : une file qui n'appartient pas au fichier sondé, et peut
+///     disparaître avant lui : celle des signaux d'un processus, où attend
+///     un signalfd (le `signalfd_wqh` de Linux, signalfd.rs). Un epoll qui
+///     surveille un signalfd s'inscrit dans la file du processus qui
+///     l'ajoute ; envoyé à un autre processus (SCM_RIGHTS), il peut survivre
+///     au premier. L'entrée tient alors une référence de l'Arc de la file,
+///     jusqu'à son retrait : la file vit tant qu'une entrée y est.
+///     Option écartée, celle de Linux : la file meurt avec le processus,
+///     après un dernier réveil POLLFREE qui fait sortir chaque entrée
+///     d'elle-même (`wake_up_pollfree`, et `ep_poll_callback`) ; mais un
+///     retrait qui se croise avec ce réveil peut encore lire la file, que
+///     Linux ne rend donc qu'après une période de grâce RCU (le
+///     SLAB_TYPESAFE_BY_RCU des `sighand_struct`), et nous n'avons pas de
+///     RCU. Le dernier réveil, lui, est gardé (`Signaux::drop`) : ce que
+///     voit le programme ne change pas.
+#[derive(Clone, Copy)]
+pub enum FileVisee<'a> {
+    Empruntee(&'a FileAttente),
+    Partagee(&'a Arc<FileAttente>),
 }
 
 impl<R: Rappel + 'static> EntreeRappel<R> {
@@ -937,7 +975,7 @@ impl<R: Rappel + 'static> EntreeRappel<R> {
 
     /// L'inscrit dans `file`, exclusive ou non (voir `FileAttente`) ; déjà
     /// inscrite ailleurs : retirée d'abord.
-    pub fn inscrire(self: Pin<&Self>, file: &FileAttente, exclusive: bool) {
+    pub fn inscrire(self: Pin<&Self>, file: FileVisee<'_>, exclusive: bool) {
         self.retirer();
         let qui: *const (dyn Rappel + 'static) = &self.rappel;
         // SAFETY: le rappel est dans l'entrée, épinglée (elle ne bougera
@@ -945,10 +983,15 @@ impl<R: Rappel + 'static> EntreeRappel<R> {
         // n'en disparaît jamais si elle est oubliée ; et `R: 'static` : la
         // file ne désignera jamais un rappel mort.
         unsafe { self.entree.preparer_rappel(qui, exclusive) };
-        self.file.store(core::ptr::from_ref(file).cast_mut(), Ordering::Relaxed);
+        let (f, adresse) = match file {
+            FileVisee::Empruntee(f) => (f, core::ptr::from_ref(f).cast_mut()),
+            // Une référence de l'Arc, que l'entrée tient jusqu'au retrait.
+            FileVisee::Partagee(a) => (&**a, Arc::into_raw(a.clone()).cast_mut().map_addr(|x| x | TENUE)),
+        };
+        self.file.store(adresse, Ordering::Relaxed);
         // SAFETY: l'entrée est un champ d'une valeur épinglée (`self`), que
         // rien ne déplace.
-        file.ajouter(unsafe { Pin::new_unchecked(&self.entree) });
+        f.ajouter(unsafe { Pin::new_unchecked(&self.entree) });
     }
 
     /// Son rappel.
@@ -956,13 +999,23 @@ impl<R: Rappel + 'static> EntreeRappel<R> {
         &self.rappel
     }
 
-    /// La retire de sa file, si elle y est.
+    /// La retire de sa file, si elle y est ; une file tenue est rendue
+    /// après (sa dernière référence peut la détruire : vide, puisque
+    /// chacune de ses entrées tenues en a une).
     pub fn retirer(&self) {
         let file = self.file.swap(core::ptr::null_mut(), Ordering::Relaxed);
-        // SAFETY: la file est celle d'un fichier que le possesseur tient
-        // tant que l'entrée y est (voir le type) : elle existe encore.
+        let tenue = file.addr() & TENUE != 0;
+        let file = file.map_addr(|x| x & !TENUE);
+        // SAFETY: la file est celle d'un objet que le possesseur tient tant
+        // que l'entrée y est, ou que l'entrée tient elle-même (voir le
+        // type) : elle existe encore. Le `swap` la donne à un seul retrait.
         if let Some(f) = unsafe { file.as_ref() } {
             f.enlever(&self.entree);
+        }
+        if tenue {
+            // SAFETY: l'adresse vient d'`Arc::into_raw` (`inscrire`), et la
+            // référence n'est rendue qu'une fois (le `swap`).
+            drop(unsafe { Arc::from_raw(file.cast_const()) });
         }
     }
 }

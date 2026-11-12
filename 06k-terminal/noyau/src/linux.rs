@@ -190,6 +190,9 @@ const SETITIMER: u64 = 38;
 const TIMERFD_CREATE: u64 = 283;
 const TIMERFD_SETTIME: u64 = 286;
 const TIMERFD_GETTIME: u64 = 287;
+// signalfd (les soldes d'avant 6k, signalfd.rs).
+const SIGNALFD: u64 = 282;
+const SIGNALFD4: u64 = 289;
 // inotify (6i, surveillance.rs).
 const INOTIFY_INIT: u64 = 253;
 const INOTIFY_ADD_WATCH: u64 = 254;
@@ -334,6 +337,8 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         TIMER_DELETE => crate::minuteurs_posix::timer_delete(a[0]),
         TIMERFD_SETTIME => crate::timerfd::timerfd_settime(a[0], a[1], a[2], a[3]),
         TIMERFD_GETTIME => crate::timerfd::timerfd_gettime(a[0], a[1]),
+        SIGNALFD => crate::signalfd::signalfd(a[0], a[1], a[2]),
+        SIGNALFD4 => crate::signalfd::signalfd4(a[0], a[1], a[2], a[3]),
         INOTIFY_INIT => crate::surveillance::inotify_init(),
         INOTIFY_INIT1 => crate::surveillance::inotify_init1(a[0]),
         INOTIFY_ADD_WATCH => crate::surveillance::inotify_add_watch(a[0], a[1], a[2]),
@@ -535,6 +540,8 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         TIMER_DELETE => ("timer_delete", 1),
         TIMERFD_SETTIME => ("timerfd_settime", 4),
         TIMERFD_GETTIME => ("timerfd_gettime", 2),
+        SIGNALFD => ("signalfd", 3),
+        SIGNALFD4 => ("signalfd4", 4),
         INOTIFY_INIT => ("inotify_init", 0),
         INOTIFY_INIT1 => ("inotify_init1", 1),
         INOTIFY_ADD_WATCH => ("inotify_add_watch", 3),

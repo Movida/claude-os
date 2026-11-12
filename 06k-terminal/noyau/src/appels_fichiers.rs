@@ -218,6 +218,14 @@ impl FichierTenu {
         }
     }
 
+    /// Le signalfd d'un fichier de sorte SignalFd.
+    pub fn signalfd(&self) -> &crate::signalfd::SignalFd {
+        match &self.prive {
+            Prive::SignalFd(s) => s,
+            _ => unreachable!("un signalfd sans masque"),
+        }
+    }
+
     /// Le tube d'un bout de tube.
     pub fn tube(&self) -> &crate::tube::Tube {
         match &self.prive {
@@ -1442,7 +1450,8 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
     // se lit pas (pas d'opération read : EINVAL, avant de regarder le
     // tampon).
     match o.sorte {
-        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd if position.is_some() => return Err(-ESPIPE),
+        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd
+            if position.is_some() => return Err(-ESPIPE),
         Sorte::Epoll => return Err(-EINVAL),
         _ => {}
     }
@@ -1484,6 +1493,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         Sorte::EventFd => evenements::lire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::Inotify => surveillance::lire(o.inotify().expect("une instance"), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         Sorte::TimerFd => crate::timerfd::lire_morceaux(o, &[(tampon, longueur)]),
+        Sorte::SignalFd => crate::signalfd::lire_morceaux(o, &[(tampon, longueur)]),
         Sorte::Tube => en_resultat(o.tube().lire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0)),
         Sorte::Socket => en_resultat(crate::appels_reseau::lire(o, &[(tampon, longueur)])),
         Sorte::Epoll => Err(-EINVAL),
@@ -1522,7 +1532,8 @@ pub fn verrou_d_ecriture(n: Numero) -> GardeMutex<'static, ()> {
 fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
     // Comme pour lire : ESPIPE, puis EINVAL pour un epoll.
     match o.sorte {
-        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd if position.is_some() => return Err(-ESPIPE),
+        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd
+            if position.is_some() => return Err(-ESPIPE),
         Sorte::Epoll => return Err(-EINVAL),
         _ => {}
     }
@@ -1594,7 +1605,7 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
         Sorte::Dossier | Sorte::Chemin | Sorte::Inotify => Err(-EBADF),
         Sorte::EventFd => evenements::ecrire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
         // Pas d'opération write (FMODE_CAN_WRITE manque) : EINVAL.
-        Sorte::TimerFd => Err(-EINVAL),
+        Sorte::TimerFd | Sorte::SignalFd => Err(-EINVAL),
         Sorte::Tube => en_resultat(o.tube().ecrire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0,
                                                o.drapeaux as u64 & O_DIRECT != 0)),
         Sorte::Socket => en_resultat(crate::appels_reseau::ecrire(o, &[(tampon, longueur)])),
@@ -1761,10 +1772,14 @@ fn vecteur_tenu(o: &FichierTenu, adresse: u64, nombre: u64, ecrire: bool) -> i64
     if o.sorte == Sorte::Inotify {
         return resultat(surveillance::lire_morceaux(o.inotify().expect("une instance"), o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux));
     }
-    // Un timerfd se lit d'un coup, sur tous les morceaux, et ne s'écrit pas
-    // (timerfd.rs).
-    if o.sorte == Sorte::TimerFd {
-        let r = if ecrire { Err(-EINVAL) } else { crate::timerfd::lire_morceaux(&o, &morceaux) };
+    // Un timerfd et un signalfd se lisent d'un coup, sur tous les
+    // morceaux, et ne s'écrivent pas (timerfd.rs, signalfd.rs).
+    if matches!(o.sorte, Sorte::TimerFd | Sorte::SignalFd) {
+        let r = match (ecrire, o.sorte) {
+            (true, _) => Err(-EINVAL),
+            (false, Sorte::TimerFd) => crate::timerfd::lire_morceaux(&o, &morceaux),
+            (false, _) => crate::signalfd::lire_morceaux(&o, &morceaux),
+        };
         return match r {
             Ok(n) => n as i64,
             Err(e) => e,
@@ -1859,7 +1874,7 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
         (Sorte::Console | Sorte::Tube | Sorte::Socket, _) => return -ESPIPE,
         (Sorte::Null | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. }, _) => return 0,
         // Ni position ni taille : `noop_llseek`, qui rend la position, nulle.
-        (Sorte::EventFd | Sorte::Epoll | Sorte::Inotify | Sorte::TimerFd, _) => return position as i64,
+        (Sorte::EventFd | Sorte::Epoll | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd, _) => return position as i64,
         (Sorte::Noyau { lecture }, _) => match procfs::deplacer(lecture, position, decalage, depuis) {
             p if p >= 0 => Some(p),
             e => return e,
@@ -3548,7 +3563,8 @@ pub fn fadvise64(fd: u64, _position: u64, longueur: u64, conseil: u64) -> i64 {
 /// tube, une socket, la console (`nonseekable_open`), un eventfd, un epoll,
 /// une instance d'inotify.
 fn a_des_positions(o: &FichierTenu) -> bool {
-    !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console | Sorte::EventFd | Sorte::Epoll | Sorte::Inotify | Sorte::TimerFd)
+    !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console | Sorte::EventFd | Sorte::Epoll | Sorte::Inotify | Sorte::TimerFd
+                       | Sorte::SignalFd)
 }
 
 /// Le fichier se positionne (FMODE_LSEEK, que `splice_direct_to_actor`

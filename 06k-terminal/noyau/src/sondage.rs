@@ -36,7 +36,7 @@
 //! rendent ERESTARTNOHAND, et leur délai restant est déjà écrit.
 
 use crate::appels_fichiers::{FichierTenu, tenir};
-use crate::attente::{self, EntreeRappel, FileAttente, Rappel, Sommeil};
+use crate::attente::{self, EntreeRappel, FileAttente, FileVisee, Rappel, Sommeil};
 use crate::faillible::{self, VecFaillible};
 use crate::copie_utilisateur::{copier_depuis_utilisateur, copier_vers_utilisateur};
 use crate::descripteurs::Sorte;
@@ -58,6 +58,9 @@ pub const POLLPRI: u32 = 0x002;
 pub const POLLOUT: u32 = 0x004;
 pub const POLLERR: u32 = 0x008;
 pub const POLLHUP: u32 = 0x010;
+/// Le dernier réveil d'une file qui va disparaître (la file des signaux
+/// d'un processus qui finit, `Signaux::drop`) : jamais rendu à un programme.
+pub const POLLFREE: u32 = 0x4000;
 pub const POLLNVAL: u32 = 0x020;
 pub const POLLRDNORM: u32 = 0x040;
 pub const POLLRDBAND: u32 = 0x080;
@@ -73,7 +76,7 @@ pub const PAR_DEFAUT: u32 = POLLIN | POLLOUT | POLLRDNORM | POLLWRNORM;
 pub trait Inscrire {
     /// `tenu` peut changer quand `file` est réveillée ; `cle` : ce qui
     /// intéresse.
-    fn inscrire(&mut self, file: &FileAttente, tenu: &FichierTenu, cle: u32);
+    fn inscrire(&mut self, file: FileVisee<'_>, tenu: &FichierTenu, cle: u32);
 }
 
 /// La table d'un sondage (le `poll_table` de Linux).
@@ -97,7 +100,16 @@ impl<'a> Table<'a> {
     /// le verrou des fichiers).
     pub fn attendre(&mut self, file: &FileAttente, tenu: &FichierTenu) {
         if let Some(i) = self.inscrire.as_deref_mut() {
-            i.inscrire(file, tenu, self.cle);
+            i.inscrire(FileVisee::Empruntee(file), tenu, self.cle);
+        }
+    }
+
+    /// Comme `attendre`, pour une file qui n'appartient pas au fichier
+    /// sondé : l'entrée inscrite la tiendra (`FileVisee::Partagee` : la
+    /// file des signaux d'un processus, pour un signalfd).
+    pub fn attendre_partagee(&mut self, file: &Arc<FileAttente>, tenu: &FichierTenu) {
+        if let Some(i) = self.inscrire.as_deref_mut() {
+            i.inscrire(FileVisee::Partagee(file), tenu, self.cle);
         }
     }
 
@@ -122,6 +134,7 @@ pub fn sonder(o: &FichierTenu, table: &mut Table) -> u32 {
         Sorte::EventFd => o.eventfd().sonder(table, o),
         Sorte::Inotify => o.inotify().expect("une instance").sonder(table, o),
         Sorte::TimerFd => o.timerfd().sonder(table, o),
+        Sorte::SignalFd => o.signalfd().sonder(table, o),
         // /dev/random : prêt à lire dès que son générateur l'est, sinon
         // « on peut écrire » (lui verser de l'aléa), réveillé à « prêt »
         // (`random_poll` : POLLIN | POLLRDNORM, 0x41 mesuré, ou POLLOUT |
@@ -193,7 +206,7 @@ struct Entrees {
 
 impl Inscrire for Entrees {
     /// Le `__pollwait` de Linux.
-    fn inscrire(&mut self, file: &FileAttente, tenu: &FichierTenu, cle: u32) {
+    fn inscrire(&mut self, file: FileVisee<'_>, tenu: &FichierTenu, cle: u32) {
         let Some(e) = EntreeRappel::nouveau(RappelSondage { cle, _tenu: tenu.dupliquer(), attente: self.attente.clone() }) else {
             self.erreur = true;
             return;
