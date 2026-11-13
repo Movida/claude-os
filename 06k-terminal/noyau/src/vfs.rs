@@ -59,7 +59,7 @@ use fichiers::montages::{Interne, Monte, Objet, Vue};
 use fichiers::noyaufs::NoyauFs;
 use fichiers::tmpfs::Attributs;
 use fichiers::tmpfs::{Cadres, Horodatage, Limites, Numero, RENAME_EXCHANGE, Tmpfs};
-use fichiers::{Erreur, Identite, PAGE, S_IFCHR, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG, Temps};
+use fichiers::{Erreur, Identite, PAGE, S_IFBLK, S_IFCHR, S_IFDIR, S_IFIFO, S_IFLNK, S_IFMT, S_IFREG, S_IFSOCK, Temps};
 
 /// Les pages des fichiers : des cadres de la mémoire, pris au-dessus de la
 /// réserve du noyau, lus et écrits par la projection directe. Et les
@@ -696,102 +696,206 @@ fn monter(nom: &str, chemin: &[u8], creer: fn(Temps) -> Result<NoyauFs, Erreur>)
     Ok(())
 }
 
-/// Le déballage, entrée par entrée. Une entrée refusée (un dossier parent
-/// qui manque, plus de place) est signalée, et la suite continue, comme
-/// Linux. L'archive a été vérifiée d'avance, en entier.
+/// Ce que le déballage garde d'une entrée à l'autre (les variables
+/// globales de l'init/initramfs.c de Linux).
+struct Deballage {
+    /// Le rang de l'archive en cours, dans une suite d'archives.
+    archive: usize,
+    /// Les fichiers de l'archive en cours qui ont des liens physiques : leur
+    /// clé (périphérique d'origine, inode et type, comme le `find_link` de
+    /// Linux) et leur premier nom. Le nom plutôt que notre inode : une
+    /// entrée suivante peut effacer ce nom, et l'inode avec, dont le numéro
+    /// servirait ensuite à un autre ; un nom effacé, lui, ne se trouve plus
+    /// (le lien est alors refusé, comme chez Linux).
+    liens: Vec<(((u32, u32), u32, u32), Vec<u8>)>,
+    /// Les dossiers à dater à la fin, avec leur date (le `dir_add` de
+    /// Linux) : créer ce qu'ils contiennent change leur date de
+    /// modification, qui ne garderait pas celle de l'archive.
+    dossiers: Vec<(Vec<u8>, u32)>,
+}
+
+/// Le déballage, entrée par entrée (le `unpack_to_rootfs` de Linux). Une
+/// entrée refusée (un dossier parent qui manque, plus de place) est
+/// signalée, et la suite continue, comme Linux. L'archive a été vérifiée
+/// d'avance, en entier.
 fn deballer(octets: &[u8], bilan: &mut Bilan) -> Result<(), Erreur> {
-    // Les fichiers déjà vus qui ont des liens physiques : (inode dans
-    // l'archive, inode chez nous).
-    let mut vus: Vec<(u32, Numero)> = Vec::new();
+    let mut d = Deballage { archive: 0, liens: Vec::new(), dossiers: Vec::new() };
     for entree in formats::cpio::lire(octets).flatten() {
+        // Une archive de plus, mise au bout : les liens physiques de la
+        // précédente sont oubliés (Linux, à chaque entrée de fin :
+        // `free_hash`). Deux archives faites à part numérotent leurs inodes
+        // chacune de son côté.
+        if entree.archive != d.archive {
+            d.liens.clear();
+            d.archive = entree.archive;
+        }
         if entree.nom.is_empty() || entree.nom == b"." {
             continue;
         }
         let chemin = absolu(entree.nom)?;
-        let resultat = deballer_entree(&entree, &chemin, &mut vus, bilan);
+        let resultat = deballer_entree(&entree, &chemin, &mut d, bilan);
         if let Err(e) = resultat {
             afficherln!("[noyau] archive : {} refuse (errno {})", Chemin(&chemin), e.errno());
             bilan.refusees += 1;
         }
     }
+    // Les dates des dossiers, en dernier (`dir_utime`), dans l'ordre de
+    // l'archive : un dossier que l'archive répète prend la date de sa
+    // dernière entrée, comme ses droits et son propriétaire. (Linux les pose
+    // dans l'ordre inverse, par sa liste chaînée : la première date gagne,
+    // quand les droits sont ceux de la dernière entrée ; un accident, pas un
+    // choix.) Un nom qui n'est plus un dossier (une entrée suivante l'a
+    // remplacé) est passé : Linux daterait ce qui l'a remplacé, qui a déjà
+    // la date de sa propre entrée.
+    let maintenant = temps::maintenant();
+    for (chemin, secondes) in &d.dossiers {
+        let resultat = avec(|fs, _| {
+            let racine = fs.racine();
+            let depart = Depart { racine, dossier: racine, qui: Identite::ROOT, sous: false };
+            match resoudre(fs, &depart, chemin, Suivre::Jamais)?.objet {
+                Some(n) if fs.est_un_dossier(n) => fs.changer_temps(Identite::ROOT, n, date(*secondes), date(*secondes), maintenant),
+                _ => Ok(()),
+            }
+        });
+        if let Err(e) = resultat {
+            afficherln!("[noyau] archive : {} non date (errno {})", Chemin(chemin), e.errno());
+        }
+    }
     Ok(())
 }
 
-fn deballer_entree(entree: &formats::cpio::Entree, chemin: &[u8], vus: &mut Vec<(u32, Numero)>, bilan: &mut Bilan)
+/// Ce qu'une entrée a fait de son nom.
+#[derive(Clone, Copy)]
+enum Fait {
+    /// Un inode neuf.
+    Cree(Numero),
+    /// L'inode qui avait déjà ce nom, et le même type : un dossier, un
+    /// fichier ordinaire (qu'on réécrit), un nœud de périphérique.
+    Garde(Numero),
+    /// Un lien physique vers le fichier d'un nom précédent (ou ce fichier
+    /// lui-même, si le nom le désigne déjà).
+    Lie(Numero),
+}
+
+fn deballer_entree(entree: &formats::cpio::Entree, chemin: &[u8], d: &mut Deballage, bilan: &mut Bilan)
     -> Result<(), Erreur> {
     let root = Identite::ROOT;
     let maintenant = temps::maintenant();
-    let droits = entree.mode & 0o7777;
-    let numero = avec(|fs, cadres| -> Result<Option<Numero>, Erreur> {
+    let genre = entree.mode & S_IFMT;
+    // Les types que Linux crée (`do_name`) ; il passe les autres sans rien
+    // dire, et le lecteur de l'archive les a déjà refusés (cpio.rs, avant
+    // de rien déballer) : ceci ne garde que d'une entrée faite ailleurs.
+    if !matches!(genre, S_IFREG | S_IFDIR | S_IFLNK | S_IFCHR | S_IFBLK | S_IFIFO | S_IFSOCK) {
+        return Err(Erreur::EINVAL);
+    }
+    // Les liens physiques (`maybe_link`) : tout ce qui n'est ni un dossier
+    // ni un lien symbolique, avec au moins deux liens. Le premier nom d'une
+    // clé s'inscrit, les suivants se lient à lui.
+    let premier_nom = if genre != S_IFDIR && genre != S_IFLNK && entree.liens >= 2 {
+        let cle = (entree.dev, entree.inode, genre);
+        match d.liens.iter().position(|(c, _)| *c == cle) {
+            Some(i) => Some(i),
+            None => {
+                d.liens.ajouter((cle, faillible::copie(chemin)?))?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let fait = avec(|fs, cadres| -> Result<Fait, Erreur> {
         let racine = fs.racine();
         let depart = Depart { racine, dossier: racine, qui: root, sous: false };
         let fin = resoudre(fs, &depart, chemin, Suivre::Jamais)?;
-        let genre = entree.mode & S_IFMT;
-        // Ce qui est déjà là sous ce nom : un dossier se garde (on lui
-        // applique les droits de l'archive), le reste s'efface (le
-        // `clean_path` de Linux), sauf un lien physique déjà vu.
-        if let Some(existant) = fin.objet {
-            let dossier_existant = fs.mode(existant) & S_IFMT == S_IFDIR;
-            if genre == S_IFDIR && dossier_existant {
-                proprietes(fs, existant, entree, maintenant)?;
-                return Ok(None);
+        // Ce qui est déjà là sous ce nom (`clean_path`) : effacé si son type
+        // change, pour un lien symbolique, ou pour un lien physique vers un
+        // autre fichier ; gardé sinon (un nœud de périphérique aussi : Linux
+        // n'en refait pas, son mknod échoue).
+        let premier = match premier_nom {
+            Some(i) => Some(resoudre(fs, &depart, &d.liens[i].1, Suivre::Jamais)?.objet.ok_or(Erreur::ENOENT)?),
+            None => None,
+        };
+        let fin = match fin.objet {
+            Some(n) if premier == Some(n) => return Ok(Fait::Lie(n)),
+            Some(n) if fs.mode(n) & S_IFMT != genre || genre == S_IFLNK || premier.is_some() => {
+                fs.effacer(root, &fin, fs.est_un_dossier(n), maintenant, cadres)?;
+                resoudre(fs, &depart, chemin, Suivre::Jamais)?
             }
-            fs.effacer(root, &fin, dossier_existant, maintenant, cadres)?;
-        }
-        let fin = resoudre(fs, &depart, chemin, Suivre::Jamais)?;
-        if genre == S_IFREG
-            && entree.liens >= 2
-            && let Some(&(_, premier)) = vus.iter().find(|(ino, _)| *ino == entree.inode)
-        {
+            Some(n) => return Ok(Fait::Garde(n)),
+            None => fin,
+        };
+        if let Some(premier) = premier {
             fs.lier(root, premier, &fin, maintenant)?;
             bilan.liens_physiques += 1;
-            return Ok(Some(premier));
+            return Ok(Fait::Lie(premier));
         }
+        // Un lien symbolique a toujours les droits 0777 (ceux de l'archive
+        // ne comptent pas : Linux crée le lien par symlink).
         let (mode, cible) = match genre {
-            S_IFDIR => (S_IFDIR | droits, &[][..]),
-            S_IFREG => (S_IFREG | droits, &[][..]),
-            S_IFLNK => (S_IFLNK | droits, entree.contenu),
-            S_IFCHR => (S_IFCHR | droits, &[][..]),
-            _ => return Err(Erreur::EINVAL),
+            S_IFLNK => (S_IFLNK | 0o777, entree.contenu),
+            _ => (genre | entree.mode & 0o7777, &[][..]),
         };
         let n = fs.creer(root, &fin, mode, entree.rdev, cible, maintenant)?;
         match genre {
             S_IFDIR => bilan.dossiers += 1,
-            S_IFREG => bilan.fichiers += 1,
             S_IFLNK => bilan.liens_symboliques += 1,
             _ => {}
         }
-        if genre == S_IFREG && entree.liens >= 2 {
-            vus.ajouter((entree.inode, n))?;
-        }
-        Ok(Some(n))
+        Ok(Fait::Cree(n))
     })?;
-    // (Un nom que l'archive répète : le dernier compte, comme pour Linux ;
-    // l'ancien a été effacé plus haut.)
-    let Some(n) = numero else { return Ok(()) };
-    // Le contenu d'un fichier, page à page, en rendant le verrou entre
-    // deux : copier des centaines de Mio d'un coup, interruptions coupées,
-    // ferait perdre ses tics à l'horloge (et l'heure retarderait).
-    if entree.mode & S_IFMT == S_IFREG {
-        let mut fait = 0;
-        while fait < entree.contenu.len() {
-            let morceau = &entree.contenu[fait..(fait + PAGE as usize).min(entree.contenu.len())];
-            let ecrits = avec(|fs, cadres| fs.ecrire(n, fait as u64, morceau, maintenant, cadres))?;
-            fait += ecrits;
+    let (Fait::Cree(n) | Fait::Garde(n) | Fait::Lie(n)) = fait;
+    match genre {
+        S_IFREG => {
+            // Le contenu : un fichier gardé est réécrit, vidé d'abord
+            // (O_TRUNC) ; un lien physique n'est vidé que si son entrée a un
+            // contenu (celui du fichier, dans la dernière de ses entrées),
+            // sinon il garderait la fin d'un contenu plus long.
+            let vider = match fait {
+                Fait::Cree(_) => false,
+                Fait::Garde(_) => true,
+                Fait::Lie(_) => !entree.contenu.is_empty(),
+            };
+            if vider {
+                avec(|fs, cadres| fs.tronquer(n, 0, maintenant, cadres))?;
+            }
+            if !matches!(fait, Fait::Lie(_)) {
+                bilan.fichiers += 1;
+            }
+            // Page à page, en rendant le verrou entre deux : copier des
+            // centaines de Mio d'un coup, interruptions coupées, ferait
+            // perdre ses tics à l'horloge (et l'heure retarderait).
+            let mut ecrit = 0;
+            while ecrit < entree.contenu.len() {
+                let morceau = &entree.contenu[ecrit..(ecrit + PAGE as usize).min(entree.contenu.len())];
+                ecrit += avec(|fs, cadres| fs.ecrire(n, ecrit as u64, morceau, maintenant, cadres))?;
+            }
+            avec(|fs, _| proprietes(fs, n, entree, true, maintenant))
         }
+        S_IFDIR => {
+            d.dossiers.ajouter((faillible::copie(chemin)?, entree.date))?;
+            avec(|fs, _| proprietes(fs, n, entree, false, maintenant))
+        }
+        // Un nœud lié à un nom précédent est laissé tel quel (Linux ne
+        // règle que ce qu'il crée par mknod).
+        _ if matches!(fait, Fait::Lie(_)) => Ok(()),
+        _ => avec(|fs, _| proprietes(fs, n, entree, true, maintenant)),
     }
-    avec(|fs, _| proprietes(fs, n, entree, maintenant))
 }
 
-/// Le propriétaire, les droits et la date de l'archive (dans cet ordre :
-/// changer de propriétaire fait tomber les bits setuid et setgid).
-fn proprietes(fs: &mut Tmpfs, n: Numero, entree: &formats::cpio::Entree, maintenant: Temps) -> Result<(), Erreur> {
+/// Le propriétaire, les droits (sauf pour un lien symbolique) et, avec
+/// `dater`, la date de l'archive (dans cet ordre : changer de propriétaire
+/// fait tomber les bits setuid et setgid).
+fn proprietes(fs: &mut Tmpfs, n: Numero, entree: &formats::cpio::Entree, dater: bool, maintenant: Temps)
+    -> Result<(), Erreur> {
     let root = Identite::ROOT;
     fs.changer_proprietaire(root, n, Some(entree.uid), Some(entree.gid), maintenant)?;
     if entree.mode & S_IFMT != S_IFLNK {
         fs.changer_mode(root, n, entree.mode, maintenant)?;
     }
-    fs.changer_temps(root, n, date(entree.date), date(entree.date), maintenant)
+    if dater {
+        fs.changer_temps(root, n, date(entree.date), date(entree.date), maintenant)?;
+    }
+    Ok(())
 }
 
 // Les périphériques de /dev : majeur, mineur (Documentation/admin-guide/

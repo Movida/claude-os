@@ -1044,13 +1044,25 @@ $(CLAUDE):
 # (son chemin est celui du cache, que la description ne peut pas nommer :
 # le Makefile ajoute sa ligne) : le noyau la déballe, puis lance ce que dit
 # son /etc/demarrage (voir archive.sh).
+# En deux archives mises bout à bout, comme un chargeur ajoute la sienne
+# (un microcode, des modules) à un initramfs, pour que chaque démarrage
+# vérifie aussi leur déballage (formats/src/cpio.rs, vfs.rs) : la
+# première a tout sauf claude, et à la place du vrai /etc/demarrage un
+# texte plus long qui n'en est pas un (ce Makefile) ; la seconde, claude
+# et le vrai /etc/demarrage, qui doit remplacer l'autre : le même fichier,
+# vidé puis réécrit (ce qui resterait du Makefile le rendrait trop grand
+# pour être lu : plus de 64 Kio).
 programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/minuteurs $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/verrous $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/snmp $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
 	cd lecteur && cargo build --release
 	cd bonjour-tcp && cargo build --release
-	{ cat archive.txt; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } | sh archive.sh $@ -
+	sed 's|racine/etc/demarrage |Makefile |' archive.txt | sh archive.sh programmes-1.cpio -
+	{ echo "file /etc/demarrage racine/etc/demarrage 644 0 0"; echo "file /usr/local/bin/claude $(CLAUDE) 755 0 0"; } \
+	  | sh archive.sh programmes-2.cpio -
+	cat programmes-1.cpio programmes-2.cpio > $@
+	rm -f programmes-1.cpio programmes-2.cpio
 
 # L'archive du jalon de 6f à 6i : celle de l'étape, dont /etc/demarrage ne
 # lance que claude -p, deux fois, puis la liste de ce qu'il a laissé dans
@@ -1704,7 +1716,7 @@ test-%.bin: vide.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin nmi*.bin programmes.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio nmi.cpio trace.cpio \
+	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin nmi*.bin programmes*.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio nmi.cpio trace.cpio \
 	  tests-demarrage.txt serial.log trace.log verrous.log \
 	  capture.log qemu.log ecran.png test-*.log test-*.pcap claude-p.log $(MON_TESTS)
 	rm -f $(PRIVE_FICHIERS)

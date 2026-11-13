@@ -72,7 +72,7 @@
 [noyau] Archive de programmes : … octets a ….
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 68, liens symboliques 6, liens physiques 4 ; archive rendue (… Kio).
+[noyau] Archive deballee : dossiers 12, fichiers 69, liens symboliques 6, liens physiques 4 ; archive rendue (… Kio).
 [noyau] Lancement : /etc/demarrage, 105 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
