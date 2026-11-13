@@ -44,7 +44,7 @@ fn cas_de_bord() {
 #[test]
 fn contre_un_modele() {
     for graine in 1..=20u64 {
-        let mut h = Hasard(graine * 0x9E37_79B9_7F4A_7C15);
+        let mut h = Hasard(graine.wrapping_mul(0x9E37_79B9_7F4A_7C15));
         let mut e = Echeances::new(32).unwrap();
         let mut modele: HashMap<u64, u64> = HashMap::new();
         let mut maintenant = 0u64;
