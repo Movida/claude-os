@@ -20,6 +20,8 @@
 //!   - le port éphémère de `bind(0)` et de `listen` sans `bind`
 //!     (`inet_csk_find_open_port`) : un départ au hasard, IMPAIR d'abord,
 //!     de deux en deux, puis les pairs ; sans la tolérance de SO_REUSEADDR ;
+//!     une socket qui a SO_REUSEADDR cherche d'abord dans la moitié basse de
+//!     la plage, puis dans la haute (Linux garde la haute aux autres) ;
 //!   - le port éphémère de `connect` (`__inet_hash_connect`) : PAIR d'abord
 //!     (Linux laisse les impairs à `bind`, mesuré), à partir d'un décalage
 //!     secret (`secure_ipv4_port_ephemeral`, tiré par le noyau) plus une
@@ -175,19 +177,60 @@ impl<T: Clone> Table<T> {
         Ok(port)
     }
 
-    /// `inet_csk_find_open_port` : impairs, puis pairs, d'un départ tiré.
+    /// `inet_csk_find_open_port` : dans la plage (sa moitié basse d'abord,
+    /// puis la haute, si la socket a SO_REUSEADDR : une plage de moins de
+    /// quatre ports ne se coupe pas), les impairs d'un départ tiré
+    /// (`get_random_u32_below`, ici les 16 bits bas de `hasard` pour la
+    /// première moitié, les hauts pour la seconde : une plage a au plus
+    /// 65 536 ports), de deux en deux, puis les pairs à partir du port
+    /// d'avant. Le nombre de ports essayés est pair (le dernier d'une plage
+    /// impaire n'est jamais pris : mesuré sous Linux, comme sa source).
     fn ephemere_de_bind(&self, numero: u64, lien: &Lien, hasard: u32) -> Option<u16> {
-        let (bas, haut) = (EPHEMERE_MIN as u32, EPHEMERE_MAX as u32);
-        let restant = (haut - bas + 1) & !1;
-        let depart = (hasard % restant) | 1;
-        for parite in 0..2 {
-            let mut i = 0;
-            while i < restant {
-                let port = bas + (depart + parite + i) % restant;
-                if port <= haut && self.libre(numero, port as u16, lien, false) {
-                    return Some(port as u16);
+        let moities = if lien.reuseaddr { [1, 2] } else { [0, 0] };
+        for (k, &moitie) in moities.iter().enumerate() {
+            if k == 1 && moitie == 0 {
+                break;
+            }
+            let (mut bas, haut) = (EPHEMERE_MIN as u32, EPHEMERE_MAX as u32);
+            let mut haut = haut + 1;
+            let moitie = if haut - bas < 4 { 0 } else { moitie };
+            if moitie != 0 {
+                let milieu = bas + (((haut - bas) >> 2) << 1);
+                if moitie == 1 {
+                    haut = milieu;
+                } else {
+                    bas = milieu;
                 }
-                i += 2;
+            }
+            let mut restant = haut - bas;
+            if restant > 1 {
+                restant &= !1;
+            }
+            let tire = if k == 0 { hasard & 0xFFFF } else { hasard >> 16 };
+            let mut decalage = ((tire * restant) >> 16) | 1;
+            for passe in 0..2 {
+                // Les pairs partent du port d'avant le premier impair : un seul
+                // pas en arrière, entre les deux passes (Linux décrémente aussi
+                // après la seconde, un `u32` qui peut faire le tour sans
+                // conséquence : la valeur ne sert plus).
+                if passe == 1 {
+                    decalage -= 1;
+                }
+                let mut port = bas + decalage;
+                let mut i = 0;
+                while i < restant {
+                    if port >= haut {
+                        port -= restant;
+                    }
+                    if self.libre(numero, port as u16, lien, false) {
+                        return Some(port as u16);
+                    }
+                    i += 2;
+                    port += 2;
+                }
+            }
+            if moitie != 1 {
+                break;
             }
         }
         None
@@ -256,39 +299,49 @@ impl<T: Clone> Table<T> {
         if self.entrees.len() >= self.max {
             return Err(Refus::Plein);
         }
-        let (bas, haut) = (EPHEMERE_MIN as u32, EPHEMERE_MAX as u32);
-        let restant = (haut - bas + 1) & !1;
+        let (bas, haut) = (EPHEMERE_MIN as u32, EPHEMERE_MAX as u32 + 1);
+        let pas = 2;
+        let restant = (haut - bas) & !1;
         let index = decalage as usize % PERTURBATION;
         let mut depart = self.perturbation[index].wrapping_add((decalage >> 32) as u32) % restant;
         depart &= !1;
-        for parite in 0..2u32 {
+        loop {
+            let mut port = bas + depart;
             let mut i = 0;
             while i < restant {
-                let port = (bas + (depart + parite + i) % restant) as u16;
-                i += 2;
-                if port as u32 > haut {
-                    continue;
+                if port >= haut {
+                    port -= restant;
                 }
+                let essai = port as u16;
+                let (essai_i, suivant) = (i, port + pas);
+                i += pas;
+                port = suivant;
                 // Un port pris par `bind` (ou une écoute) est sauté ; un
                 // port de `connect` se partage, si le quadruplet est neuf.
-                let du_port = |e: &&Entree<T>| e.lien.port == port;
+                let du_port = |e: &&Entree<T>| e.lien.port == essai;
                 if self.entrees.iter().filter(du_port).any(|e| !e.lien.par_connect) {
                     continue;
                 }
-                if self.quadruplet_pris(locale, port, distante, port_distant, false, &mut reprendre) {
+                if self.quadruplet_pris(locale, essai, distante, port_distant, false, &mut reprendre) {
                     continue;
                 }
-                // La perturbation avance (d'au moins deux, d'un peu plus au
-                // hasard) : le prochain départ ne se devine pas.
-                let saut = i.max((hasard % 8) * 2) + 2;
+                // La perturbation avance de l'indice du port trouvé, ou d'un
+                // peu plus au hasard (moins de huit pas), plus un pas : le
+                // prochain départ ne se devine pas.
+                let saut = essai_i.max((hasard % 8) * pas) + pas;
                 self.perturbation[index] = self.perturbation[index].wrapping_add(saut);
                 self.entrees.ajouter_dans_la_place(Entree {
                     numero,
-                    lien: Lien { sorte: Sorte::Connectee, adresse: locale, port, distante, port_distant, par_connect: true, ..lien },
+                    lien: Lien { sorte: Sorte::Connectee, adresse: locale, port: essai, distante, port_distant, par_connect: true, ..lien },
                     objet: Some(objet),
                 });
-                return Ok(port);
+                return Ok(essai);
             }
+            // Puis les impairs, une fois.
+            if depart & 1 == 1 {
+                break;
+            }
+            depart += 1;
         }
         Err(Refus::Pris)
     }

@@ -144,8 +144,9 @@ fn reprise_d_un_time_wait() {
     assert_ne!(p, q);
     t.retirer(2);
     // Acceptée : le même port, et l'entrée disparaît. (Le décalage ramène le
-    // départ du balayage sur ce port : la perturbation a avancé deux fois de 4.)
-    let retour = ((EPHEMERE_MAX as u64 - EPHEMERE_MIN as u64 + 1) & !1) - 8;
+    // départ du balayage sur ce port : la perturbation a avancé deux fois de
+    // 2, l'indice du port trouvé, 0, plus un pas.)
+    let retour = ((EPHEMERE_MAX as u64 - EPHEMERE_MIN as u64 + 1) & !1) - 4;
     let r = t.connecter(3, LO, LO, 80, lien(LO, 0), 3, retour << 32, 0, |n, _| n == 100).unwrap();
     assert_eq!(r, p);
     assert_eq!(t.nombre_temps_attente(), 0);
@@ -186,4 +187,15 @@ fn une_morte_garde_son_port() {
     assert_eq!(t.lier(3, lien(LO, 8080), 3, 0), Err(Refus::Pris));
     t.retirer(2);
     assert_eq!(t.lier(3, lien(LO, 8080), 3, 0), Ok(8080));
+}
+
+/// SO_REUSEADDR : `bind(0)` cherche d'abord dans la moitié basse de la
+/// plage (`attempt_half`), puis dans la haute.
+#[test]
+fn bind_avec_reuseaddr() {
+    let mut t = table();
+    for n in 1..=10u64 {
+        let port = t.lier(n, Lien { reuseaddr: true, ..lien(LO, 0) }, n as u32, (n * 7919) as u32).unwrap();
+        assert!(port % 2 == 1 && (EPHEMERE_MIN..32768 + 14116).contains(&port), "{}", port);
+    }
 }
