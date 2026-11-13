@@ -17,10 +17,13 @@
 //! table des processus et de leurs fils :
 //!   - /proc/<pid>/ pour chaque processus vivant ou zombie (jusqu'à ce
 //!     qu'il soit recueilli), à lui (son utilisateur), immuable : `maps`,
-//!     `statm`, `comm` (le nom de son fil principal), le lien `exe` vers son
-//!     exécutable, `task/<tid>/comm` pour chacun de ses fils (celui du fil
-//!     principal reste jusqu'au processus, comme Linux garde sa tâche), et
-//!     `fd/<n>` pour chacun de ses descripteurs ;
+//!     `statm`, `stat` et `status` (son état, ses comptes, ses signaux, sa
+//!     mémoire : ce qu'y lisent ps, top, les bibliothèques qui comptent les
+//!     fils d'un processus), `comm` (le nom de son fil principal), le lien
+//!     `exe` vers son exécutable, `task/<tid>/` pour chacun de ses fils,
+//!     avec `status`, `comm` et `stat` (celui du fil principal reste
+//!     jusqu'au processus, comme Linux garde sa tâche), et `fd/<n>` pour
+//!     chacun de ses descripteurs ;
 //!   - /proc/<tid> d'un fil qui n'est pas le principal : résolu, sans être
 //!     listé, comme Linux (mesuré) ; son `comm` est celui du fil, sa mémoire
 //!     celle de son processus.
@@ -91,6 +94,9 @@ use core::fmt::{self, Write};
 use crate::descripteurs::{Donnees, Fichier, FichierOuvert, Lecture, Ouverts, Sorte};
 use crate::espace_utilisateur::ADRESSE_MIN;
 use crate::faillible::{self, VecFaillible};
+use crate::memoire::Resume;
+use crate::partage::Arc;
+use crate::tache::Tache;
 use crate::{appels_fichiers, processus, sysfs, vfs};
 use fichiers::chemins::Texte;
 use fichiers::montages::{Interne, Monte, Objet};
@@ -111,6 +117,11 @@ const MMAP_MIN_ADDR: u32 = 4;
 const COMM: u32 = 5;
 /// /proc/version (`banniere`).
 const BANNIERE: u32 = 9;
+/// /proc/<n>/stat (le processus entier, le `whole` de Linux), task/<tid>/stat
+/// (le fil seul), et status (les deux) : l'argument est la tâche.
+const STAT: u32 = 40;
+const STAT_FIL: u32 = 41;
+const STATUS: u32 = 42;
 /// maps ouvert quand sa tâche n'avait plus de mémoire : il reste vide
 /// (Linux prend la mémoire de la tâche à l'ouverture, `proc_mem_open`, et
 /// la garde : maps ouvert avant la fin du fil principal se lit encore
@@ -238,12 +249,28 @@ const FIL_COMM: u64 = 8;
 /// y tient).
 const DOSSIER_FD: u64 = 9;
 const LIEN_FD: u64 = 10;
+const FICHIER_STATUS: u64 = 11;
+const FICHIER_STAT: u64 = 12;
+const FIL_STATUS: u64 = 13;
+const FIL_STAT: u64 = 14;
 
 /// Les entrées d'un dossier de processus, dans l'ordre où elles se
 /// listent : celui de Linux, le rang dans son tableau `tgid_base_stuff`
-/// (mesuré : task, fd, ..., comm, ..., statm, maps, ..., exe).
-const ENTREES_DU_PROCESSUS: [(&[u8], u64); 6] = [(b"task", DOSSIER_TASK), (b"fd", DOSSIER_FD), (b"comm", FICHIER_COMM),
-                                                 (b"statm", FICHIER_STATM), (b"maps", FICHIER_MAPS), (b"exe", LIEN_EXE)];
+/// (mesuré : task, fd, ..., status, ..., comm, ..., stat, statm, maps, ...,
+/// exe).
+const ENTREES_DU_PROCESSUS: [(&[u8], u64); 8] = [(b"task", DOSSIER_TASK), (b"fd", DOSSIER_FD), (b"status", FICHIER_STATUS),
+                                                 (b"comm", FICHIER_COMM), (b"stat", FICHIER_STAT), (b"statm", FICHIER_STATM),
+                                                 (b"maps", FICHIER_MAPS), (b"exe", LIEN_EXE)];
+
+/// Celles du dossier d'un fil (task/<tid>), dans l'ordre de `tid_base_stuff`.
+/// Linux y met aussi fd/, statm, maps, exe... : pas encore chez nous (aucun
+/// programme ne les y cherche).
+const ENTREES_DU_FIL: [(&[u8], u64); 3] = [(b"status", FIL_STATUS), (b"comm", FIL_COMM), (b"stat", FIL_STAT)];
+
+/// Les genres des fichiers d'un fil.
+fn est_du_fil(genre: u64) -> bool {
+    matches!(genre, FIL_COMM | FIL_STATUS | FIL_STAT)
+}
 
 /// Les droits d'un lien de fd/ : r-x pour un fichier ouvert en lecture,
 /// -wx en écriture, les deux s'il fait les deux, rien pour un O_PATH (le
@@ -333,7 +360,7 @@ impl<'a> ProcVue<'a> {
         let (genre, n, fil) = decoder(i);
         match genre {
             0 => true,
-            FIL | FIL_COMM => processus_de(n).is_some_and(|p| fil_de(p, fil)),
+            g if g == FIL || est_du_fil(g) => processus_de(n).is_some_and(|p| fil_de(p, fil)),
             LIEN_FD => self.ouvert(n, fil).is_some(),
             _ => processus_de(n).is_some(),
         }
@@ -439,7 +466,7 @@ impl Monte for ProcVue<'_> {
                 taille = 64;
                 (S_IFLNK | self.ouvert(n, decoder(i).2).map_or(0, droits_du_lien), 1)
             }
-            FICHIER_MAPS | FICHIER_STATM => (S_IFREG | 0o444, 1),
+            FICHIER_MAPS | FICHIER_STATM | FICHIER_STATUS | FICHIER_STAT | FIL_STATUS | FIL_STAT => (S_IFREG | 0o444, 1),
             FICHIER_COMM | FIL_COMM => (S_IFREG | 0o644, 1),
             LIEN_EXE => (S_IFLNK | 0o777, 1),
             DOSSIER_TASK => {
@@ -453,7 +480,7 @@ impl Monte for ProcVue<'_> {
             _ => (S_IFDIR | 0o555, 2),
         };
         // La tâche de l'entrée : le fil, sous task/<tid> ; n, ailleurs.
-        let tache = if matches!(genre, FIL | FIL_COMM) { fil } else { n };
+        let tache = if genre == FIL || est_du_fil(genre) { fil } else { n };
         let (uid, gid, date) = match vu {
             Some((_, lance)) if mode != S_IFDIR | 0o555 && !crate::tache::a_sa_memoire(tache) => (0, 0, lance),
             Some((identite, lance)) => (identite.uid, identite.gid, lance),
@@ -485,7 +512,7 @@ impl Monte for ProcVue<'_> {
                 let p = processus_de(n)?;
                 (tid < 1 << 24 && fil_de(p, tid)).then(|| numero(FIL, n, tid))
             }
-            FIL if nom == b"comm" => Some(numero(FIL_COMM, n, fil)),
+            FIL => ENTREES_DU_FIL.iter().find(|(e, _)| *e == nom).map(|&(_, g)| numero(g, n, fil)),
             DOSSIER_FD => {
                 let fd = nombre(nom)?;
                 (fd < 1 << 24 && self.ouvert(n, fd).is_some()).then(|| numero(LIEN_FD, n, fd))
@@ -500,7 +527,7 @@ impl Monte for ProcVue<'_> {
             0 => self.fixe.parent(i),
             PROCESSUS => self.fixe.racine(),
             FIL => numero(DOSSIER_TASK, n, 0),
-            FIL_COMM => numero(FIL, n, fil),
+            g if est_du_fil(g) => numero(FIL, n, fil),
             LIEN_FD => numero(DOSSIER_FD, n, 0),
             _ => numero(PROCESSUS, n, 0),
         }
@@ -512,8 +539,8 @@ impl Monte for ProcVue<'_> {
             0 => self.fixe.nom(i),
             PROCESSUS => Texte::nombre(n as u64),
             FIL | LIEN_FD => Texte::nombre(fil as u64),
-            FIL_COMM => Texte::Emprunte(b"comm"),
-            g => Texte::Emprunte(ENTREES_DU_PROCESSUS.iter().find(|&&(_, x)| x == g).map_or(&b""[..], |&(e, _)| e)),
+            g => Texte::Emprunte(ENTREES_DU_PROCESSUS.iter().chain(ENTREES_DU_FIL.iter()).find(|&&(_, x)| x == g)
+                .map_or(&b""[..], |&(e, _)| e)),
         }
     }
 
@@ -575,8 +602,8 @@ impl Monte for ProcVue<'_> {
 
     /// La racine : « . », « .. », les entrées fixes, puis les processus (à
     /// la position PREMIER_PROCESSUS + pid) ; le dossier d'un processus, ses
-    /// six entrées ; task/, ses fils (à la position 3 + tid) ; un fil, son
-    /// comm. Un dossier dont le processus est parti : ENOENT.
+    /// huit entrées ; task/, ses fils (à la position 3 + tid) ; un fil, ses
+    /// trois. Un dossier dont le processus est parti : ENOENT.
     fn lire_dossier(&self, dossier: u64, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
         -> Result<(), Erreur> {
         let (genre, n, fil) = decoder(dossier);
@@ -670,8 +697,10 @@ impl Monte for ProcVue<'_> {
                 }
             }
             _ => {
-                if position <= 2 {
-                    let _ = entree(b"comm", numero(FIL_COMM, n, fil), DT_REG, 3);
+                for (k, &(nom, g)) in ENTREES_DU_FIL.iter().enumerate().skip((position.max(2) - 2) as usize) {
+                    if !entree(nom, numero(g, n, fil), DT_REG, k as u64 + 3) {
+                        break;
+                    }
                 }
             }
         }
@@ -680,8 +709,8 @@ impl Monte for ProcVue<'_> {
 
     /// La source d'un fichier, à son ouverture, et son argument : la tâche
     /// (n, ou le fil sous task/). maps garde ce qu'il trouve à l'ouverture :
-    /// la mémoire de la tâche, ou rien (MAPS_SANS_MEMOIRE) ; statm, comm
-    /// regardent à chaque lecture.
+    /// la mémoire de la tâche, ou rien (MAPS_SANS_MEMOIRE) ; statm, stat,
+    /// status, comm regardent à chaque lecture.
     fn contenu(&self, i: u64) -> Option<(u32, u32)> {
         let (genre, n, fil) = decoder(i);
         match genre {
@@ -691,6 +720,10 @@ impl Monte for ProcVue<'_> {
             FICHIER_STATM => Some((STATM, n)),
             FICHIER_COMM => Some((COMM, n)),
             FIL_COMM => Some((COMM, fil)),
+            FICHIER_STAT => Some((STAT, n)),
+            FIL_STAT => Some((STAT_FIL, fil)),
+            FICHIER_STATUS => Some((STATUS, n)),
+            FIL_STATUS => Some((STATUS, fil)),
             _ => None,
         }
     }
@@ -708,7 +741,7 @@ pub fn lecture(source: u32) -> Lecture {
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD | RANDOM_BOOT_ID
         | RANDOM_UUID | RANDOM_ENTROPY_AVAIL | RANDOM_POOLSIZE | RANDOM_WAKEUP | RANDOM_RESEED | INOTIFY_EVENEMENTS
         | INOTIFY_INSTANCES | INOTIFY_SURVEILLANCES => Lecture::Valeur,
-        MAPS | MAPS_SANS_MEMOIRE | STATM | COMM | BANNIERE | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP | NET_UNIX => Lecture::Sequence,
+        MAPS | MAPS_SANS_MEMOIRE | STATM | COMM | STAT | STAT_FIL | STATUS | BANNIERE | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP | NET_UNIX => Lecture::Sequence,
         // Nommées une à une, sans cas par défaut : /proc/net/tcp et unix
         // (6h) y étaient tombés, et se comportaient en attributs de /sys
         // (lseek SEEK_END donnait 4096 ; Linux : EINVAL, `seq_lseek`).
@@ -761,7 +794,7 @@ pub fn lire(f: Fichier, position: u64, longueur: u64) -> Result<Vec<u8>, i64> {
     // ou d'un fil principal parti avant les autres, se lit encore (voir
     // `produire`) : Linux garde sa tâche jusqu'au recueil.
     let disparu = match source {
-        MAPS | MAPS_SANS_MEMOIRE | STATM | COMM => nom(argument).is_none(),
+        MAPS | MAPS_SANS_MEMOIRE | STATM | COMM | STAT | STAT_FIL | STATUS => nom(argument).is_none(),
         _ => false,
     };
     if disparu {
@@ -893,6 +926,8 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
         },
         STATM if curseur == 0 => statm(argument).map(|t| Some((t, u64::MAX))),
         COMM if curseur == 0 => comm(argument).map(|t| Some((t, u64::MAX))),
+        STAT | STAT_FIL if curseur == 0 => stat(argument, source == STAT).map(|t| Some((t, u64::MAX))),
+        STATUS if curseur == 0 => status(argument).map(|t| Some((t, u64::MAX))),
         BANNIERE if curseur == 0 => banniere().map(|t| Some((t, u64::MAX))),
         NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP | NET_UNIX => {
             let f = match source {
@@ -925,6 +960,264 @@ fn nom(tid: u32) -> Option<crate::programmes::NomCourt> {
 fn comm(tid: u32) -> Result<Vec<u8>, Erreur> {
     let nom = nom(tid).unwrap_or(crate::programmes::NomCourt::VIDE);
     Ok(faillible::concatenation(&[nom.octets(), b"\n"])?)
+}
+
+/// Ce que stat et status disent d'une tâche, pris verrou après verrou,
+/// jamais l'un sous l'autre (`produire` est hors du verrou des fichiers) :
+/// la tâche (son Arc, cloné sous la table des tâches ou sous l'entrée de
+/// son processus), la vue de son processus (sous son verrou), l'identité du
+/// lecteur, sa mémoire en lecture si elle l'a encore, sa table des
+/// descripteurs.
+struct DeLaTache {
+    t: Arc<Tache>,
+    pid: u32,
+    vue: processus::VueDuProcessus,
+    /// Le lecteur peut-il voir ce qui dit où en est la tâche (ses adresses,
+    /// ses registres, son statut) : le `ptrace_may_access(...,
+    /// PTRACE_MODE_READ_FSCREDS)` de Linux, c'est-à-dire le même processus,
+    /// ou root, ou le même utilisateur et le même groupe (nos programmes
+    /// n'ont ni capacités ni « dumpable » à vérifier).
+    permis: bool,
+    memoire: Option<DeLaMemoire>,
+    /// La taille de sa table des descripteurs (FDSize), 0 sans elle.
+    descripteurs: u64,
+}
+
+/// La mémoire d'une tâche, telle que la montrent stat et status (ses
+/// compteurs, lus sans verrou, et sa carte, mémoire tenue en lecture).
+struct DeLaMemoire {
+    resume: Resume,
+    /// Pages anonymes, de fichiers, le plus grand RSS, les tables.
+    anonymes: u64,
+    fichiers: u64,
+    pic_resident: u64,
+    tables: u64,
+    code: (u64, u64),
+    donnees: (u64, u64),
+    debut_tas: u64,
+    pile_de_depart: u64,
+    arguments: (u64, u64),
+    environnement: (u64, u64),
+}
+
+/// La tâche `n` (le fil principal d'un processus jusqu'à son recueil, ou un
+/// fil vivant) et tout ce qu'en disent stat et status ; None si elle vient
+/// de partir (ESRCH).
+fn de_la_tache(n: u32) -> Option<DeLaTache> {
+    let (t, pid) = match processus::principal(n) {
+        Some(t) => (t, n),
+        None => {
+            let t = crate::tache::trouver(n)?;
+            let pid = t.processus()?.pid();
+            (t, pid)
+        }
+    };
+    let vue = processus::vue(pid, n)?;
+    // Le lecteur : une tâche du noyau, sans processus, voit tout.
+    let lecteur = processus::essayer_avec(|p| (p.pid, p.identite));
+    let permis = lecteur.is_none_or(|(lp, li)| lp == pid || li.root() || (li.uid == vue.identite.uid && li.gid == vue.identite.gid));
+    let a_sa_memoire = t.a_sa_memoire();
+    let memoire = a_sa_memoire.then(|| processus::memoire_du_pid(pid, |m| {
+        let c = m.compteurs();
+        DeLaMemoire {
+            resume: m.resume(), anonymes: c.pages() as u64, fichiers: c.pages_fichier() as u64, pic_resident: c.pic() as u64,
+            tables: c.tables() as u64, code: m.code, donnees: m.donnees, debut_tas: m.debut_tas, pile_de_depart: m.pile_de_depart,
+            arguments: m.arguments, environnement: m.environnement,
+        }
+    })).flatten();
+    let descripteurs = if a_sa_memoire { processus::descripteurs_du_pid(pid, |d| d.taille_linux()).unwrap_or(0) } else { 0 };
+    Some(DeLaTache { t, pid, vue, permis, memoire, descripteurs })
+}
+
+/// La tâche est-elle « en marche » pour Linux (TASK_RUNNING : sur un
+/// processeur, ou prête, réveillée) ?
+fn en_marche(etat: u8) -> bool {
+    use crate::tache::etat::*;
+    matches!(etat, EN_COURS | REVEILLEE | ECHEANCE | SIGNAL)
+}
+
+/// La lettre et le mot de son état (`task_state_array` de Linux) : R en
+/// marche, S endormie et interruptible, D endormie sans l'être ; morte, Z
+/// pour un fil principal (un zombie jusqu'au recueil, même si d'autres fils
+/// vivent : Linux le garde ainsi), X pour un autre fil (rendu aussitôt).
+fn etat_de(t: &Tache, principal: bool) -> (char, &'static str) {
+    use crate::tache::etat::*;
+    match t.etat() {
+        DORT => ('D', "disk sleep"),
+        DORT_INTERRUPTIBLE => ('S', "sleeping"),
+        MORTE if principal => ('Z', "zombie"),
+        MORTE => ('X', "dead"),
+        _ => ('R', "running"),
+    }
+}
+
+/// Des nanosecondes en tics d'horloge de l'utilisateur (USER_HZ, 100 :
+/// `nsec_to_clock_t`).
+fn tics(ns: u64) -> u64 {
+    ns / 10_000_000
+}
+
+/// /proc/<n>/stat (`processus_entier` : le `whole` de Linux) et
+/// task/<tid>/stat : une ligne de 52 champs séparés par une espace, ceux de
+/// `do_task_stat` dans son ordre (fs/proc/array.c, relu dans 6.18 et
+/// mesuré). Ce qui n'a pas de sens chez nous y est à sa valeur de Linux
+/// sans la fonction : pas de terminal (tty 0, tpgid -1), pas de fautes
+/// majeures ni de fils recueillis (cmin_flt, cutime... 0), la priorité 20
+/// et le nice 0 de tout programme, pas de temps réel ni de délais comptés.
+/// Le processus entier somme les fautes de ses fils, morts et vivants,
+/// partage son temps comme getrusage(RUSAGE_SELF) (le même partage
+/// précédent : les deux ne reculent jamais l'un par rapport à l'autre), et
+/// donne le statut de la fin de son groupe ; un fil, les siens. Les
+/// signaux, en DÉCIMAL et sur 31 bits (« obsolète », dit Linux : status les
+/// a tous) : ceux qui attendent le fil seul, son masque, les ignorés et les
+/// attrapés du processus.
+fn stat(n: u32, processus_entier: bool) -> Result<Vec<u8>, Erreur> {
+    let d = de_la_tache(n).ok_or(Erreur::ESRCH)?;
+    let (t, v) = (&d.t, &d.vue);
+    let principal = t.tid() == d.pid;
+    let (fautes, utime, stime) = if processus_entier {
+        (v.cumul.fautes(), v.utime, v.stime)
+    } else {
+        let (c, utime, stime) = crate::rusage::du_fil(t);
+        (c.fautes(), utime, stime)
+    };
+    let mm = d.memoire.as_ref();
+    let permis = d.permis;
+    // Les registres d'une tâche dans sa sortie, sa mémoire encore là.
+    let (esp, eip) = if permis && mm.is_some() { t.registres_de_sortie() } else { (0, 0) };
+    // « wchan » n'est plus qu'un drapeau (une adresse du noyau était une
+    // fuite) : la tâche dort, ou est morte ; pour le processus entier,
+    // seulement s'il n'a qu'un fil.
+    let wchan = permis && (!processus_entier || v.fils < 2) && !en_marche(t.etat());
+    let exit_code = match (permis, processus_entier, v.fin_de_groupe) {
+        (false, _, _) => 0,
+        (true, true, Some(code)) => code,
+        _ => t.code_sortie(),
+    };
+    let reserve = |valeur: u64| if permis { valeur } else { 1 };
+    let mut e = Ecrit(Vec::new());
+    write!(e, "{} (", n).map_err(|_| Erreur::ENOMEM)?;
+    e.0.ajouter_tranche(t.nom().octets())?;
+    let r = (|| -> fmt::Result {
+        let masque = |s: u64| s & 0x7fff_ffff;
+        write!(e, ") {} 1 {} {} 0 -1 {} {} 0 0 0 {} {} 0 0 20 0 {} 0 {} {} {} {} ", etat_de(t, principal).0, d.pid, d.pid,
+               t.drapeaux(), fautes, tics(utime), tics(stime), v.fils, tics(t.debut()), mm.map_or(0, |m| m.resume.taille),
+               mm.map_or(0, |m| m.anonymes + m.fichiers), v.limite_rss)?;
+        write!(e, "{} {} {} {} {} ", mm.map_or(0, |m| reserve(m.code.0)), mm.map_or(0, |m| reserve(m.code.1)),
+               mm.filter(|_| permis).map_or(0, |m| m.pile_de_depart), esp, eip)?;
+        write!(e, "{} {} {} {} {} 0 0 {} {} 0 0 0 0 0", masque(v.attente), masque(v.masque), masque(v.ignores), masque(v.attrapes),
+               wchan as u8, if principal { 17 } else { -1 }, t.processeur())?;
+        match mm.filter(|_| permis) {
+            Some(m) => write!(e, " {} {} {} {} {} {} {}", m.donnees.0, m.donnees.1, m.debut_tas, m.arguments.0, m.arguments.1,
+                              m.environnement.0, m.environnement.1)?,
+            None => write!(e, " 0 0 0 0 0 0 0")?,
+        }
+        writeln!(e, " {}", exit_code)
+    })();
+    r.map_err(|_| Erreur::ENOMEM)?;
+    Ok(e.0)
+}
+
+/// /proc/<n>/status et task/<tid>/status : le `proc_pid_status` de Linux,
+/// ligne par ligne dans son ordre, avec ses formats (fs/proc/array.c, relus
+/// dans 6.18 ; l'ordre des lignes, mesuré). Celles d'un Linux construit
+/// sans ce que nous n'avons pas : ni espaces de noms des processus
+/// (NStgid...), ni seccomp, ni grandes pages (HugetlbPages), ni cpusets
+/// (Mems_allowed), ni pile fantôme (x86_Thread_features). Le masque du
+/// fichier n'apparaît que si la tâche a encore son dossier courant (sa
+/// mémoire, chez nous : `a_sa_memoire`), les lignes Vm* et les trois qui
+/// suivent que si elle a sa mémoire. Les capacités : toutes pour root,
+/// aucune pour un autre (comme un programme que lance root, ou un autre).
+/// Speculation_* : aucune commande de spéculation (notre prctl rend EINVAL
+/// à PR_GET_SPECULATION_CTRL, le comportement par défaut de Linux), ce que
+/// Linux écrit « unknown » pour la première et « unsupported » pour la
+/// seconde.
+fn status(n: u32) -> Result<Vec<u8>, Erreur> {
+    let d = de_la_tache(n).ok_or(Erreur::ESRCH)?;
+    let (t, v) = (&d.t, &d.vue);
+    let principal = t.tid() == d.pid;
+    let mut e = Ecrit(Vec::new());
+    // Le nom, ses sauts de ligne et ses barres obliques inverses échappés
+    // (`proc_task_name(..., true)`) ; ses autres octets tels quels.
+    e.write_str("Name:\t").map_err(|_| Erreur::ENOMEM)?;
+    for &o in t.nom().octets() {
+        match o {
+            b'\n' => e.0.ajouter_tranche(b"\\n")?,
+            b'\\' => e.0.ajouter_tranche(b"\\\\")?,
+            _ => e.0.ajouter(o)?,
+        }
+    }
+    let r = (|| -> fmt::Result {
+        writeln!(e)?;
+        if t.a_sa_memoire() {
+            writeln!(e, "Umask:\t{:04o}", v.umask)?;
+        }
+        let (lettre, mot) = etat_de(t, principal);
+        let (u, g) = (v.identite.uid, v.identite.gid);
+        writeln!(e, "State:\t{} ({})\nTgid:\t{}\nNgid:\t0\nPid:\t{}\nPPid:\t1\nTracerPid:\t0", lettre, mot, d.pid, n)?;
+        writeln!(e, "Uid:\t{u}\t{u}\t{u}\t{u}\nGid:\t{g}\t{g}\t{g}\t{g}\nFDSize:\t{}\nGroups:\t \nKthread:\t0", d.descripteurs)?;
+        if let Some(m) = &d.memoire {
+            let r = &m.resume;
+            let kio = |pages: u64| pages * 4;
+            // Le code du programme (VmExe), borné par les zones exécutables,
+            // et le reste de celles-ci (VmLib, les bibliothèques).
+            let texte = if m.code.1 > m.code.0 { m.code.1.next_multiple_of(4096) - (m.code.0 & !4095) } else { 0 }.min(r.code);
+            let resident = m.anonymes + m.fichiers;
+            for (nom, valeur) in [("VmPeak", r.pic / 1024), ("VmSize", r.taille / 1024), ("VmLck", 0), ("VmPin", 0),
+                                  ("VmHWM", kio(m.pic_resident.max(resident))), ("VmRSS", kio(resident)), ("RssAnon", kio(m.anonymes)),
+                                  ("RssFile", 0), ("RssShmem", kio(m.fichiers)), ("VmData", r.donnees / 1024), ("VmStk", r.pile / 1024),
+                                  ("VmExe", texte / 1024), ("VmLib", (r.code - texte) / 1024), ("VmPTE", kio(m.tables)), ("VmSwap", 0)] {
+                writeln!(e, "{}:\t{:>8} kB", nom, valeur)?;
+            }
+            writeln!(e, "CoreDumping:\t0\nTHP_enabled:\t1\nuntag_mask:\t0xffffffffffffffff")?;
+        }
+        writeln!(e, "Threads:\t{}\nSigQ:\t{}/{}", v.fils, crate::signaux::en_file(), v.limite_signaux)?;
+        for (nom, s) in [("SigPnd", v.attente), ("ShdPnd", v.attente_partagee), ("SigBlk", v.masque), ("SigIgn", v.ignores), ("SigCgt", v.attrapes)] {
+            writeln!(e, "{}:\t{:016x}", nom, s)?;
+        }
+        // Les capacités : CAP_LAST_CAP de 6.18, 40 (CAP_CHECKPOINT_RESTORE).
+        const TOUTES: u64 = (1 << 41) - 1;
+        let effectives = if v.identite.root() { TOUTES } else { 0 };
+        writeln!(e, "CapInh:\t{:016x}\nCapPrm:\t{:016x}\nCapEff:\t{:016x}\nCapBnd:\t{:016x}\nCapAmb:\t{:016x}", 0, effectives, effectives,
+                 TOUTES, 0)?;
+        writeln!(e, "NoNewPrivs:\t0\nSpeculation_Store_Bypass:\tunknown\nSpeculationIndirectBranch:\tunsupported")?;
+        e.write_str("Cpus_allowed:\t")?;
+        let possibles = crate::processeur::masque_possible();
+        ecrire_masque(&mut e, t.affinite() & possibles, 64 - possibles.leading_zeros())
+    })();
+    r.map_err(|_| Erreur::ENOMEM)?;
+    e.write_str("\nCpus_allowed_list:\t").map_err(|_| Erreur::ENOMEM)?;
+    e.0.ajouter_tranche(&sysfs::liste(t.affinite() & crate::processeur::masque_possible())?)?;
+    let (volontaires, forcees) = t.usage().lire().bascules();
+    writeln!(e, "voluntary_ctxt_switches:\t{}\nnonvoluntary_ctxt_switches:\t{}", volontaires, forcees).map_err(|_| Erreur::ENOMEM)?;
+    Ok(e.0)
+}
+
+/// Un masque de processeurs au format `%*pb` de Linux (`bitmap_string`) sur
+/// `bits` bits (le `nr_cpu_ids`, le plus grand numéro possible plus un) :
+/// en hexadécimal, par groupes de 32 bits du plus haut au plus bas, séparés
+/// par des virgules, chacun sur 8 chiffres sauf le premier, sur autant de
+/// chiffres que ses bits en demandent (4 processeurs : « f »).
+fn ecrire_masque(e: &mut Ecrit, masque: u64, bits: u32) -> fmt::Result {
+    let bits = bits.max(1);
+    let mut premier = bits % 32;
+    if premier == 0 {
+        premier = 32;
+    }
+    let mut i = bits.next_multiple_of(32) - 32;
+    let mut largeur = premier.div_ceil(4) as usize;
+    let mut morceau = premier;
+    loop {
+        let valeur = (masque >> i) & ((1u64 << morceau) - 1);
+        write!(e, "{:0largeur$x}", valeur, largeur = largeur)?;
+        if i == 0 {
+            return Ok(());
+        }
+        e.write_str(",")?;
+        i -= 32;
+        largeur = 8;
+        morceau = 32;
+    }
 }
 
 /// /proc/version : le `linux_proc_banner` de Linux (fs/proc/version.c), le
@@ -977,8 +1270,9 @@ pub fn ecrire(source: u32, argument: u32, octets: &[u8], longueur: u64) -> Resul
 /// les pages de fichiers ; le code (de la première à la dernière page du
 /// segment exécutable du programme : `end_code - start_code`) ; 0 (les
 /// bibliothèques, toujours 0 depuis Linux 2.6) ; les données (les zones
-/// privées inscriptibles, hors pile, plus la pile : `data_vm + stack_vm`) ;
-/// 0. Le résident vient des compteurs de l'espace, lus sans verrou (les
+/// privées inscriptibles, hors pile, plus la pile : `data_vm + stack_vm` ;
+/// jusqu'aux soldes d'avant 6k, la pile ne comptait que par sa nature, et
+/// une zone MAP_GROWSDOWN non inscriptible y manquait) ; 0. Le résident vient des compteurs de l'espace, lus sans verrou (les
 /// `rss_stat` de Linux, 6j) ; le reste est sommé sur les zones, mémoire
 /// tenue en lecture. Linux a aussi ceux-là en compteurs (`total_vm`,
 /// `data_vm`, `stack_vm`), entretenus à chaque changement de zone, et lit
@@ -990,12 +1284,9 @@ fn statm(n: u32) -> Result<Vec<u8>, Erreur> {
     let (taille, resident, partage, code, donnees) = pid.and_then(|pid| processus::memoire_du_pid(pid, |m| {
         let (debut, fin) = m.code;
         let code = if fin > debut { (fin.next_multiple_of(4096) - (debut & !4095)) / 4096 } else { 0 };
-        let donnees: u64 = m.zones.zones().iter()
-            .filter(|z| z.nature == Nature::Pile || z.droits.ecriture)
-            .map(|z| z.taille() / 4096)
-            .sum();
+        let r = m.resume();
         let c = m.compteurs();
-        (m.taille_virtuelle() / 4096, c.resident() as u64, c.pages_fichier() as u64, code, donnees)
+        (r.taille / 4096, c.resident() as u64, c.pages_fichier() as u64, code, (r.donnees + r.pile) / 4096)
     })).unwrap_or((0, 0, 0, 0, 0));
     let mut t = Ecrit(Vec::new());
     writeln!(t, "{} {} {} {} 0 {} 0", taille, resident, partage, code, donnees).map_err(|_| Erreur::ENOMEM)?;

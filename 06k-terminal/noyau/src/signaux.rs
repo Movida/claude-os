@@ -645,6 +645,18 @@ pub struct SignauxDuFil {
 }
 
 impl SignauxDuFil {
+    /// Ceux qui attendent ce fil seul (le `pending` de Linux : SigPnd de
+    /// /proc/<pid>/status, et `signal` de stat).
+    pub fn en_attente(&self) -> u64 {
+        self.attente.ensemble
+    }
+
+    /// Son masque (le `blocked` de Linux ; pendant une attente, celui
+    /// qu'elle a posé) : SigBlk, et `blocked` de stat.
+    pub fn bloques(&self) -> u64 {
+        self.bloques
+    }
+
     /// Ceux d'un fil neuf créé par ce fil (clone) : son masque, rien en
     /// attente, pas de pile de secours (`copy_process` l'efface pour un fil
     /// qui partage la mémoire sans vfork).
@@ -683,6 +695,27 @@ impl Signaux {
 
     fn action(&self, sig: u64) -> &Action {
         &self.actions[(sig - 1) as usize]
+    }
+
+    /// Les signaux ignorés (SIG_IGN) et attrapés (un gestionnaire), un bit
+    /// par signal (le bit n - 1 pour le signal n) : le
+    /// `collect_sigign_sigcatch` de /proc/<pid>/stat et status. Une action
+    /// par défaut qui ignore n'y compte pas (SIG_DFL de SIGCHLD).
+    pub fn ignores_et_attrapes(&self) -> (u64, u64) {
+        let (mut ignores, mut attrapes) = (0, 0);
+        for (i, a) in self.actions.iter().enumerate() {
+            if a.gestionnaire == SIG_IGN {
+                ignores |= 1 << i;
+            } else if a.gestionnaire != SIG_DFL {
+                attrapes |= 1 << i;
+            }
+        }
+        (ignores, attrapes)
+    }
+
+    /// Ceux qui attendent le processus (ShdPnd de /proc/<pid>/status).
+    pub fn en_attente(&self) -> u64 {
+        self.attente.ensemble
     }
 }
 

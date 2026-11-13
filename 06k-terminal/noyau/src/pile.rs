@@ -244,5 +244,17 @@ pub fn construire(programme: &mut Programme, argv: &[&[u8]], envp: &[&[u8]], nom
     if bas > sommet - PLACE_MAX {
         c.programme.memoire.retirer(sommet - PLACE_MAX, bas)?;
     }
+    // Ce que montre /proc/<pid>/stat (le `create_elf_tables` de Linux) :
+    // la pile au départ, et les chaînes, posées comme les siennes
+    // (`execfn` en haut, puis l'environnement, puis les arguments, chacun
+    // dans l'ordre en montant) : les arguments de argv[0] à envp[0] (ou à
+    // `execfn` sans environnement), l'environnement de envp[0] à `execfn`.
+    // Sans argument, leur début est leur fin.
+    let m = &mut c.programme.memoire;
+    let env_debut = adresses_envp.first().copied().unwrap_or(execfn);
+    m.pile_de_depart = rsp;
+    m.arguments = (adresses_argv.first().copied().unwrap_or(env_debut), env_debut);
+    m.environnement = (env_debut, execfn);
+    m.pic_virtuel = 0;
     Ok(rsp)
 }

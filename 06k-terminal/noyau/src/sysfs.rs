@@ -72,7 +72,7 @@ pub fn attribut(source: u32) -> Option<Result<Vec<u8>, Erreur>> {
 /// Une liste de processeurs au format de Linux (le `%*pbl` de lib/vsprintf.c,
 /// `bitmap_list_string`) : les plages de numéros consécutifs, « 0-3 »,
 /// séparées par des virgules, « 0,2-3 », et un saut de ligne.
-fn liste(masque: u64) -> Result<Vec<u8>, Erreur> {
+pub fn liste(masque: u64) -> Result<Vec<u8>, Erreur> {
     let mut v: Vec<u8> = faillible::avec_capacite(64).map_err(|_| Erreur::ENOMEM)?;
     let nombre = |v: &mut Vec<u8>, n: u32| -> Result<(), Erreur> {
         let mut texte = [0u8; 10];
@@ -89,7 +89,12 @@ fn liste(masque: u64) -> Result<Vec<u8>, Erreur> {
         while n < 64 && masque >> n & 1 == 1 {
             n += 1;
         }
-        if debut != 0 {
+        // Une virgule entre deux plages : avant chacune sauf la première
+        // (jusqu'aux soldes d'avant 6k, avant toute plage qui ne partait
+        // pas de 0 : « ,2-3 » pour un masque sans le processeur 0, que
+        // /sys ne montrait jamais, mais Cpus_allowed_list d'un fil épinglé,
+        // si).
+        if !v.is_empty() {
             v.ajouter(b',').map_err(|_| Erreur::ENOMEM)?;
         }
         nombre(&mut v, debut)?;

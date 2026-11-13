@@ -96,7 +96,7 @@ impl Compteurs {
         c.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn lire(&self) -> Cumul {
+    pub fn lire(&self) -> Cumul {
         Cumul {
             tics_programme: self.tics_programme.load(Ordering::Relaxed),
             tics_noyau: self.tics_noyau.load(Ordering::Relaxed),
@@ -119,6 +119,18 @@ pub struct Cumul {
 }
 
 impl Cumul {
+    /// Ses fautes de page (toutes mineures chez nous : le `min_flt` de
+    /// Linux).
+    pub fn fautes(&self) -> u64 {
+        self.fautes
+    }
+
+    /// Ses bascules, volontaires et forcées (les `nvcsw` et `nivcsw` de
+    /// Linux).
+    pub fn bascules(&self) -> (u64, u64) {
+        (self.volontaires, self.forcees)
+    }
+
     fn ajouter(&mut self, autre: Cumul) {
         self.tics_programme += autre.tics_programme;
         self.tics_noyau += autre.tics_noyau;
@@ -189,6 +201,35 @@ impl DuProcessus {
     pub fn garder(&self, c: &Compteurs) {
         self.morts.verrouiller().ajouter(c.lire());
     }
+
+    /// Ce qu'a consommé tout le processus : ses fils morts, plus les
+    /// vivants de `p` (sous le verrou du processus) ; sans `p` (le
+    /// processus a fini), ses fils morts, c'est-à-dire tous.
+    pub fn cumul(&self, p: Option<&processus::Processus>) -> Cumul {
+        let mut c = *self.morts.verrouiller();
+        for f in p.map_or(&[][..], |p| &p.fils[..]) {
+            if let Some(tf) = f.tache.upgrade() {
+                c.ajouter(tf.usage().lire());
+            }
+        }
+        c
+    }
+
+    /// Le partage de son temps de calcul `total` entre anneau 3 et noyau,
+    /// d'après les tics de `c` (getrusage, /proc/<pid>/stat), hors du
+    /// verrou du processus : `Precedent` a le sien.
+    pub fn partager(&self, c: &Cumul, total: u64) -> (u64, u64) {
+        self.precedent.partager(c.tics_programme, c.tics_noyau, total)
+    }
+}
+
+/// Ce qu'a consommé le fil de la tâche `t`, et le partage de son temps de
+/// calcul (utime, stime) : /proc/<pid>/task/<tid>/stat, comme
+/// RUSAGE_THREAD (le `task_cputime_adjusted` de Linux).
+pub fn du_fil(t: &tache::Tache) -> (Cumul, u64, u64) {
+    let c = t.usage().lire();
+    let (utime, stime) = t.precedent().partager(c.tics_programme, c.tics_noyau, t.calcul());
+    (c, utime, stime)
 }
 
 /// Le `struct rusage` de Linux (144 octets) : utime et stime en `timeval`,
@@ -229,18 +270,12 @@ pub fn getrusage(qui: u64, tampon: u64) -> i64 {
             if qui == RUSAGE_THREAD {
                 return (t.usage().lire(), maxrss);
             }
-            let mut c = *entree.usage().morts.verrouiller();
-            for f in p.fils.iter() {
-                if let Some(tf) = f.tache.upgrade() {
-                    c.ajouter(tf.usage().lire());
-                }
-            }
-            (c, maxrss)
+            (entree.usage().cumul(Some(p)), maxrss)
         });
         let (utime, stime) = if qui == RUSAGE_THREAD {
             t.precedent().partager(cumul.tics_programme, cumul.tics_noyau, tache::temps_de_calcul())
         } else {
-            entree.usage().precedent.partager(cumul.tics_programme, cumul.tics_noyau, entree.temps_de_calcul())
+            entree.usage().partager(&cumul, entree.temps_de_calcul())
         };
         octets(utime, stime, &cumul, maxrss)
     };

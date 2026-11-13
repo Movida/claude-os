@@ -297,6 +297,37 @@ pub struct Memoire {
     /// plus grand p_vaddr + p_filesz ; RLIMIT_DATA y compte, avec le tas
     /// (`check_data_rlimit`, brk). (0, 0) avant le chargement.
     pub donnees: (u64, u64),
+    /// La plus grande taille virtuelle qu'il ait eue avant sa dernière
+    /// baisse (le `hiwater_vm` de Linux, que `update_hiwater_vm` porte au
+    /// total avant chaque retrait : `retirer_zones`) ; VmPeak de
+    /// /proc/<pid>/status montre le plus grand des deux. Remise à 0 au
+    /// départ du programme (`pile::construire`) : la pile de 2 Mio
+    /// rétrécie au lancement n'est pas de son histoire (celle de Linux part
+    /// d'une page).
+    pub pic_virtuel: u64,
+    /// La pile au départ (le `start_stack` de Linux : l'adresse d'argc, le
+    /// RSP du premier départ), et les chaînes de ses arguments et de son
+    /// environnement, [début, fin[ (`arg_start`, `arg_end`, `env_start`,
+    /// `env_end`) : /proc/<pid>/stat. Posés par `pile::construire`.
+    pub pile_de_depart: u64,
+    pub arguments: (u64, u64),
+    pub environnement: (u64, u64),
+}
+
+/// Les tailles de la mémoire d'un programme, en octets, comptées comme
+/// celles de Linux (`vm_stat_account`) : /proc/<pid>/status et statm.
+pub struct Resume {
+    /// Toutes ses zones (total_vm), et le plus grand total qu'il ait eu
+    /// (hiwater_vm).
+    pub taille: u64,
+    pub pic: u64,
+    /// Les zones exécutables, ni inscriptibles ni de pile (exec_vm).
+    pub code: u64,
+    /// Celles qui grandissent vers le bas, la pile (stack_vm).
+    pub pile: u64,
+    /// Les inscriptibles, hors pile (data_vm : toutes nos projections
+    /// sont privées).
+    pub donnees: u64,
 }
 
 impl Memoire {
@@ -315,7 +346,10 @@ impl Memoire {
         let zones = Zones::avec_capacite(PAGE as usize / size_of::<Zone>())?;
         let espace = EspaceUtilisateur::creer()?;
         let compteurs = espace.compteurs().clone();
-        Ok(Memoire { espace: Verrou::new(espace), compteurs, zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0), donnees: (0, 0) })
+        Ok(Memoire {
+            espace: Verrou::new(espace), compteurs, zones, debut_tas: 0, fin_tas: 0, nom, code: (0, 0), donnees: (0, 0), pic_virtuel: 0,
+            pile_de_depart: 0, arguments: (0, 0), environnement: (0, 0),
+        })
     }
 
     /// Les tables de pages, sans leur verrou : qui a `&mut Memoire` (la
@@ -546,6 +580,11 @@ impl Memoire {
     /// écriture : la carte change). Dès lors, aucune faute ne peut plus y
     /// poser de page : il n'y a plus de zone, SIGSEGV.
     pub fn retirer_zones(&mut self, debut: u64, fin: u64) -> Result<(), Erreur> {
+        // Le pic d'abord (`update_hiwater_vm`), sur toute la carte : une
+        // somme de plus par retrait, que Linux évite en tenant `total_vm` à
+        // jour à chaque changement de zone ; ici la carte seule fait foi
+        // (comme pour `taille_virtuelle`), sans compteur à garder juste.
+        self.pic_virtuel = self.pic_virtuel.max(self.taille_virtuelle());
         self.zones.retirer(debut, fin, |_| (), &mut references)?;
         Ok(())
     }
@@ -708,6 +747,24 @@ impl Memoire {
     /// le total-vm de Linux).
     pub fn taille_virtuelle(&self) -> u64 {
         self.zones.zones().iter().map(Zone::taille).sum()
+    }
+
+    /// Ses tailles, comptées en un passage sur la carte (voir `Resume`).
+    pub fn resume(&self) -> Resume {
+        let mut r = Resume { taille: 0, pic: 0, code: 0, pile: 0, donnees: 0 };
+        for z in self.zones.zones() {
+            let t = z.taille();
+            r.taille += t;
+            if z.drapeaux.vers_le_bas {
+                r.pile += t;
+            } else if z.droits.ecriture {
+                r.donnees += t;
+            } else if z.droits.execution {
+                r.code += t;
+            }
+        }
+        r.pic = self.pic_virtuel.max(r.taille);
+        r
     }
 
     /// Ses données au sens de RLIMIT_DATA : les zones privées

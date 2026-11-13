@@ -197,8 +197,11 @@ pub struct MasqueProcesseurs {
 /// `rss_stat` de Linux, 6j) : les cadres anonymes à lui (MM_ANONPAGES), les
 /// pages de fichiers projetées (MM_FILEPAGES ; les deux font le RSS, que
 /// /proc/self/statm dit à part, 6d), les tables de pages de sa moitié
-/// basse, PML4 comprise (`pgtables_bytes` : elles aussi sont de la mémoire
-/// prise pour lui, 8 Gio touchés page à page en demandent 16 Mio), et le
+/// basse, sans la PML4 (`pgtables_bytes` : elles aussi sont de la mémoire
+/// prise pour lui, 8 Gio touchés page à page en demandent 16 Mio ; Linux
+/// n'y compte pas la PGD, et VmPTE de /proc/<pid>/status, comme le tueur
+/// OOM, en montrent la même valeur ; jusqu'aux soldes d'avant 6k, la PML4
+/// y comptait), et le
 /// plus grand RSS qu'il ait eu (`hiwater_rss`, le ru_maxrss de getrusage ;
 /// Linux le met à jour juste avant que le RSS baisse, ici à chaque page
 /// posée, ce qui revient au même pour un maximum, sans oublier un chemin qui
@@ -416,8 +419,8 @@ impl EspaceUtilisateur {
     /// Un espace neuf : moitié basse vide, moitié haute du noyau.
     pub fn creer() -> Result<EspaceUtilisateur, Erreur> {
         let processeurs = Arc::new(MasqueProcesseurs { processeurs: AtomicU64::new(0), retraits: AtomicU32::new(0) }).map_err(|_| Erreur::PlusDeMemoire)?;
-        // Une table déjà : la PML4.
-        let compteurs = Compteurs { pages: AtomicUsize::new(0), pages_fichier: AtomicUsize::new(0), tables: AtomicUsize::new(1), pic: AtomicUsize::new(0) };
+        // Aucune table comptée : la PML4 ne l'est pas (voir `Compteurs`).
+        let compteurs = Compteurs { pages: AtomicUsize::new(0), pages_fichier: AtomicUsize::new(0), tables: AtomicUsize::new(0), pic: AtomicUsize::new(0) };
         let compteurs = Arc::new(compteurs).map_err(|_| Erreur::PlusDeMemoire)?;
         let pml4 = pages::allouer_pour_programme().ok_or(Erreur::PlusDeMemoire)?;
         // SAFETY: `pml4` vient d'être alloué, il est à nous ; la PML4 du

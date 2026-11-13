@@ -255,6 +255,19 @@ pub struct Tache {
     /// par `terminer` : celui d'un fil de programme est le statut d'attente
     /// (`mourir`, linux.rs : exit) ; celui d'une tâche du noyau, son code.
     code_sortie: AtomicI32,
+    /// Sa naissance, en nanosecondes du temps monotone (le `start_boottime`
+    /// de Linux : notre CLOCK_BOOTTIME est le monotone) : le `starttime` de
+    /// /proc/<pid>/stat.
+    debut: u64,
+    /// Ceux des drapeaux PF_* de Linux (`task->flags`) qui ont un sens chez
+    /// nous, pour /proc/<pid>/stat : PF_FORKNOEXEC pour un fil créé par
+    /// clone ; en finissant, PF_EXITING et PF_POSTCOREDUMP (à l'entrée de
+    /// `terminer`), PF_SIGNALED (tuée par un signal, ou par la fin de son
+    /// groupe), PF_NOFREEZE (morte : le `do_task_dead` de Linux). Ni
+    /// PF_RANDOMIZE (pas d'ASLR avant 6n), ni PF_SUPERPRIV (aucun droit de
+    /// root exercé). Relaxed : des indications, posées par la tâche
+    /// elle-même et lues par /proc.
+    drapeaux: AtomicU32,
     /// Les cases de son tube interne, celui de sendfile et copy_file_range
     /// vers autre chose qu'un tube (le `splice_pipe` de Linux, 6i : voir
     /// `tube::cases_du_tube_interne`), 0 tant qu'elle n'en a pas eu besoin.
@@ -461,6 +474,8 @@ impl Tache {
             effacer_tid: AtomicU64::new(0),
             liste_robuste: AtomicU64::new(0),
             code_sortie: AtomicI32::new(0),
+            debut: crate::temps::ns_monotone(),
+            drapeaux: AtomicU32::new(0),
             tube_interne: AtomicU32::new(0),
             calcul: AtomicU64::new(0),
             lag: AtomicI64::new(0),
@@ -667,7 +682,7 @@ impl Tache {
         let remplacer = match &*fin {
             None => true,
             Some(Fin::Signal(s, _)) => signal.numero == linux::SIGKILL.numero && s.numero != linux::SIGKILL.numero,
-            Some(Fin::Sortie(_)) => false,
+            Some(Fin::Sortie(_) | Fin::Groupe(_)) => false,
         };
         if remplacer {
             *fin = Some(Fin::Signal(signal, Message::de(raison)));
@@ -792,6 +807,67 @@ impl Tache {
     /// Le dernier partage de son temps rendu par getrusage.
     pub fn precedent(&self) -> &crate::rusage::Precedent {
         &self.precedent
+    }
+
+    /// Ses drapeaux PF_* (voir le champ).
+    pub fn drapeaux(&self) -> u32 {
+        self.drapeaux.load(Ordering::Relaxed)
+    }
+
+    fn poser_drapeaux(&self, d: u32) {
+        self.drapeaux.fetch_or(d, Ordering::Relaxed);
+    }
+
+    /// Sa naissance, en nanosecondes du temps monotone.
+    pub fn debut(&self) -> u64 {
+        self.debut
+    }
+
+    /// Son état (le module `etat`), pour /proc/<pid>/stat et status : une
+    /// indication, qui peut changer aussitôt (Linux lit `__state` de même,
+    /// sans verrou).
+    pub fn etat(&self) -> u8 {
+        self.etat.load(Ordering::Relaxed)
+    }
+
+    /// Son statut de sortie (le `exit_code` de Linux) : 0 tant qu'elle vit.
+    pub fn code_sortie(&self) -> i32 {
+        self.code_sortie.load(Ordering::Relaxed)
+    }
+
+    /// A-t-elle encore la mémoire de son processus, la « mm » de /proc (voir
+    /// `a_sa_memoire`) ?
+    pub fn a_sa_memoire(&self) -> bool {
+        self.programme.is_some() && self.espace.load(Ordering::Relaxed) != pagination::pml4_noyau()
+    }
+
+    /// Les registres du programme, (rsp, rip), d'un fil DANS SA SORTIE dont
+    /// la pile du noyau est encore là : ceux du cadre de sa dernière entrée
+    /// dans le noyau, en haut de sa pile (les KSTK_ESP et KSTK_EIP de
+    /// /proc/<pid>/stat, que Linux ne lit plus que pour une tâche qui finit,
+    /// `PF_EXITING | PF_DUMPCORE | PF_POSTCOREDUMP`, sa pile tenue par
+    /// `try_get_task_stack`). (0, 0) sinon. Option écartée : les lire pour
+    /// toute tâche, comme Linux avant 4.x ; les registres d'une tâche en
+    /// marche changent pendant qu'on les lit, et ils disaient où en est un
+    /// autre processus (une fuite que Linux a fermée).
+    pub fn registres_de_sortie(&self) -> (u64, u64) {
+        if self.programme.is_none() || self.drapeaux() & (PF_EXITING | PF_POSTCOREDUMP) == 0 {
+            return (0, 0);
+        }
+        let pile = self.pile.verrouiller();
+        if pile.is_none() {
+            return (0, 0);
+        }
+        let cadre = self.cadre_du_programme();
+        // SAFETY: la pile de la tâche est tenue par son verrou (le rendeur
+        // ne la reprend, `take`, qu'après nous) et reste projetée dans la
+        // moitié du noyau de tous les espaces ; le cadre de l'entrée dans le
+        // noyau d'un fil de programme est en haut de sa pile
+        // (`cadre_du_programme`), et une tâche qui finit n'en ressort plus :
+        // deux mots lus tels quels, au pire d'un instant plus tôt.
+        let (rsp, rip) = unsafe { (core::ptr::read_volatile(&raw const (*cadre).rsp), core::ptr::read_volatile(&raw const (*cadre).rip)) };
+        drop(pile);
+        (rsp, rip)
     }
 
     /// Garde ce que reprendra `restart_syscall` (None : rien, rt_sigreturn).
@@ -1498,6 +1574,9 @@ pub fn lancer_fil(n: NouveauFil) -> Result<u32, i64> {
     })?;
     t.ecrire_tid.store(n.ecrire_tid, Ordering::Relaxed);
     t.effacer_tid.store(n.effacer_tid, Ordering::Relaxed);
+    // Créée par clone, sans exécuter de programme (un fil n'en exécute
+    // jamais : execve, 6l, effacera ce drapeau).
+    t.poser_drapeaux(PF_FORKNOEXEC);
     t.preparer(premier_depart, 0, Some(n.cadre));
     processus.attacher_fil(&t, createur).map_err(|r| match r {
         processus::RefusFil::Interrompu => -EINTR,
@@ -1566,7 +1645,7 @@ fn liberer_le_fil(t: &Tache, p: &crate::processus::Entree) {
 /// vers l'anneau 3, réveillé s'il dort interruptible (son appel rend
 /// EINTR). Sous le verrou de son processus.
 pub fn arreter_avec_le_groupe(t: Arc<Tache>, code: i32) {
-    *t.fin.verrouiller() = Some(Fin::Sortie(code));
+    *t.fin.verrouiller() = Some(Fin::Groupe(code));
     // Réveillé s'il dort interruptible : le compare_exchange de son état
     // décide (un fil qui n'a pas encore posé « je vais dormir » verra sa
     // fin prévue en la vérifiant, après l'avoir posé : attente.rs) ; s'il
@@ -1635,6 +1714,9 @@ extern "C" fn tache_noyau(f: *mut FonctionNoyau) -> ! {
 /// dernier fil est rendue (fin_de_bascule), ce qui réveille son parent.
 pub fn terminer(code: i32) -> ! {
     let t = courante();
+    // Dans sa sortie (le `exit_signals` de `do_exit`, puis
+    // `coredump_task_exit`, qui pose PF_POSTCOREDUMP même sans image).
+    t.poser_drapeaux(PF_EXITING | PF_POSTCOREDUMP);
     t.code_sortie.store(code, Ordering::Relaxed);
     if let Some(p) = &t.processus {
         liberer_le_fil(t, p);
@@ -1686,6 +1768,7 @@ pub fn terminer(code: i32) -> ! {
     // l'ordonnanceur la retirera de la file), puis `morte`, en Release : qui
     // le lit (`attendre`, `est_morte`, en Acquire) voit tout ce qu'elle a
     // écrit avant, son statut de sortie et le compte du rendeur compris.
+    t.poser_drapeaux(PF_NOFREEZE);
     t.etat.store(etat::MORTE, Ordering::Relaxed);
     t.morte.store(true, Ordering::Release);
     // Une référence à elle-même, pour la fin de bascule qui rendra sa pile,
@@ -1723,6 +1806,7 @@ pub fn terminer(code: i32) -> ! {
 /// WTERMSIG.
 fn mourir(signal: Signal, raison: impl fmt::Display) -> ! {
     afficherln!("[noyau] {} : {} ({})", courante().nom(), raison, signal.nom);
+    courante().poser_drapeaux(PF_SIGNALED);
     let code = signal.numero as i32;
     let tid = courante().tid;
     let code = processus::essayer_avec(|p| p.finir_le_groupe(code, tid)).unwrap_or(code);
@@ -1763,10 +1847,30 @@ impl fmt::Display for Message {
     }
 }
 
+// Les drapeaux PF_* de Linux que nous posons (include/linux/sched.h ; voir
+// `Tache::drapeaux`).
+/// Dans sa sortie (`do_exit`).
+pub const PF_EXITING: u32 = 0x4;
+/// Après le point où elle aurait laissé une image de sa mémoire
+/// (`coredump_task_exit`).
+pub const PF_POSTCOREDUMP: u32 = 0x8;
+/// Créée par clone, sans avoir exécuté de programme depuis.
+pub const PF_FORKNOEXEC: u32 = 0x40;
+/// Tuée par un signal.
+pub const PF_SIGNALED: u32 = 0x400;
+/// Morte : plus rien ne la gèle (`do_task_dead`).
+pub const PF_NOFREEZE: u32 = 0x8000;
+
 /// Comment le programme doit finir, à son retour vers l'anneau 3.
 enum Fin {
     /// exit ou exit_group, avec son statut (linux.rs : le code << 8).
     Sortie(i32),
+    /// La fin de son groupe, décidée par un autre fil (exit_group, une
+    /// faute, un signal mortel : `arreter_avec_le_groupe`), avec le statut
+    /// du groupe. Comme une sortie, mais le fil meurt « tué par un signal »
+    /// (PF_SIGNALED) : Linux le tue par le SIGKILL de `zap_other_threads`,
+    /// et `get_signal` pose ce drapeau avant `do_group_exit` (mesuré).
+    Groupe(i32),
     /// Un signal qu'il ne peut ni bloquer ni ignorer (une faute, SIGKILL),
     /// et ce qu'il faudra dire.
     Signal(Signal, Message),
@@ -1851,10 +1955,18 @@ pub fn a_sa_memoire(tid: u32) -> bool {
     let mut oui = false;
     pour_chaque(|t| {
         if t.tid == tid && tid != 0 {
-            oui = t.programme.is_some() && t.espace.load(Ordering::Relaxed) != pagination::pml4_noyau();
+            oui = t.a_sa_memoire();
         }
     });
     oui
+}
+
+/// La tâche du fil `tid`, s'il vit (/proc/<tid>/stat et status).
+pub fn trouver(tid: u32) -> Option<Arc<Tache>> {
+    if tid == 0 {
+        return None;
+    }
+    TOUTES.verrouiller().iter().find(|t| t.tid == tid).cloned()
 }
 
 /// Le nom du fil `tid`, s'il vit.
@@ -2049,6 +2161,10 @@ pub fn verifier_au_retour(cadre: &mut Cadre) {
     cpu::activer_interruptions();
     match arret {
         Arret::Sortie(code) => terminer(code),
+        Arret::Groupe(code) => {
+            courante().poser_drapeaux(PF_SIGNALED);
+            terminer(code)
+        }
         Arret::Force(signal, message) => mourir(signal, message),
         Arret::PlusDeMemoire => arreter_plus_de_memoire(),
         Arret::LimiteDure(secondes) => {
@@ -2091,6 +2207,7 @@ fn decider() -> Option<Arret> {
     let t = courante();
     match t.fin.verrouiller().take() {
         Some(Fin::Sortie(code)) => return Some(Arret::Sortie(code)),
+        Some(Fin::Groupe(code)) => return Some(Arret::Groupe(code)),
         Some(Fin::Signal(signal, message)) => return Some(Arret::Force(signal, message)),
         None => {}
     }
@@ -2167,6 +2284,8 @@ fn decider() -> Option<Arret> {
 enum Arret {
     /// exit, exit_group.
     Sortie(i32),
+    /// La fin du groupe, décidée par un autre fil (`Fin::Groupe`).
+    Groupe(i32),
     /// Un signal forcé, et son message.
     Force(Signal, Message),
     /// Le tueur OOM.

@@ -143,6 +143,9 @@ pub const RLIMIT_AS: usize = 9;
 pub const RLIMIT_NPROC: usize = 6;
 pub const RLIMIT_NOFILE: usize = 7;
 pub const RLIMIT_SIGPENDING: usize = 11;
+/// La limite du RSS : sans effet chez Linux depuis 2.6, mais gardée et
+/// montrée (`rsslim` de /proc/<pid>/stat).
+pub const RLIMIT_RSS: usize = 5;
 /// RLIM_INFINITY.
 pub const INFINI: u64 = u64::MAX;
 
@@ -322,6 +325,77 @@ pub struct Entree {
     identite: Identite,
     lance: fichiers::Temps,
     exe: Verrou<(Vec<u8>, Option<Numero>)>,
+    /// La tâche de son fil principal, gardée jusqu'au recueil, même morte
+    /// (Linux garde le `task_struct` du leader jusqu'à `release_task`) :
+    /// /proc/<pid>/stat et status la lisent vivante, partie avant les autres
+    /// fils, ou zombie. Posée par `attacher`, prise par `recueillir`, hors
+    /// du verrou de la table : le cycle tâche → entrée → tâche est rompu là.
+    /// Option écartée : recopier dans l'entrée, à la fin du fil principal,
+    /// ce que /proc montre de sa tâche (ses comptes, son état, ses
+    /// drapeaux...) ; deux sources pour la même chose, et une recopie à
+    /// tenir à jour à chaque champ ajouté.
+    principal: Verrou<Option<Arc<Tache>>>,
+    /// Ce que /proc montre encore du fil principal parti, ou du processus
+    /// fini (voir `Souvenir`).
+    souvenir: Verrou<Souvenir>,
+}
+
+/// Ce qui vivait dans le `Fil` du fil principal et dans le `Processus`,
+/// rendus avant le recueil, et que /proc/<pid>/stat et status montrent
+/// encore (Linux garde jusqu'au recueil les `pending` et `blocked` de la
+/// tâche du leader, le `signal_struct` et le `sighand_struct` du
+/// processus) : leurs valeurs seules.
+#[derive(Clone, Copy)]
+struct Souvenir {
+    /// À la fin du fil principal : les signaux qui l'attendaient lui seul,
+    /// et son masque.
+    attente_du_principal: u64,
+    masque_du_principal: u64,
+    /// À la fin du dernier fil : les signaux ignorés et attrapés, ceux qui
+    /// attendaient le processus, le statut de la fin du groupe, l'identité,
+    /// les limites RLIMIT_RSS et RLIMIT_SIGPENDING courantes.
+    ignores: u64,
+    attrapes: u64,
+    attente: u64,
+    fin_de_groupe: Option<i32>,
+    identite: Identite,
+    limite_rss: u64,
+    limite_signaux: u64,
+}
+
+impl Souvenir {
+    const VIDE: Souvenir = Souvenir {
+        attente_du_principal: 0, masque_du_principal: 0, ignores: 0, attrapes: 0, attente: 0, fin_de_groupe: None,
+        identite: Identite::ROOT, limite_rss: INFINI, limite_signaux: 0,
+    };
+}
+
+/// Ce que /proc/<pid>/stat et status montrent d'un processus et de l'un de
+/// ses fils (`vue`), pris sous le verrou du processus s'il vit encore,
+/// sinon de son souvenir.
+pub struct VueDuProcessus {
+    pub identite: Identite,
+    pub umask: u32,
+    /// Le nombre de ses fils (le `num_threads` de Linux) : les vivants,
+    /// plus le principal parti (Linux le compte jusqu'au recueil) ; 1 pour
+    /// un processus fini.
+    pub fils: u64,
+    pub ignores: u64,
+    pub attrapes: u64,
+    /// Les signaux qui attendent le processus, ceux qui attendent le fil
+    /// seul, et le masque du fil.
+    pub attente_partagee: u64,
+    pub attente: u64,
+    pub masque: u64,
+    pub fin_de_groupe: Option<i32>,
+    pub limite_rss: u64,
+    pub limite_signaux: u64,
+    /// Ce qu'a consommé tout le processus (ses fils morts et vivants), et le
+    /// partage de son temps de calcul, en nanosecondes (utime, stime : le
+    /// `thread_group_cputime_adjusted` de Linux, celui de getrusage).
+    pub cumul: crate::rusage::Cumul,
+    pub utime: u64,
+    pub stime: u64,
 }
 
 impl Entree {
@@ -357,6 +431,13 @@ impl Entree {
             self.usage.garder(usage);
             let Some(p) = garde.as_mut() else { return };
             let a_reconfier = p.fil(tid).and_then(|f| f.signaux.a_reconfier());
+            if tid == self.pid
+                && let Some(f) = p.fil(tid)
+            {
+                let mut s = self.souvenir.verrouiller();
+                s.attente_du_principal = f.signaux.en_attente();
+                s.masque_du_principal = f.signaux.bloques();
+            }
             p.fils.retain(|f| f.tid != tid);
             if !p.fils.is_empty() {
                 // Les signaux du processus qui l'attendaient vont à un
@@ -369,6 +450,17 @@ impl Entree {
                 return;
             }
             self.code.store(p.fin_de_groupe.unwrap_or(code), Ordering::Relaxed);
+            {
+                let (ignores, attrapes) = p.signaux.ignores_et_attrapes();
+                let mut s = self.souvenir.verrouiller();
+                s.ignores = ignores;
+                s.attrapes = attrapes;
+                s.attente = p.signaux.en_attente();
+                s.fin_de_groupe = p.fin_de_groupe;
+                s.identite = p.identite;
+                s.limite_rss = p.courante(RLIMIT_RSS);
+                s.limite_signaux = p.courante(RLIMIT_SIGPENDING);
+            }
             garde.take()
         };
         // La mémoire d'abord, puis les descripteurs, puis le dossier courant
@@ -442,6 +534,7 @@ impl Entree {
         let p = garde.as_mut().ok_or(())?;
         p.fils.ajouter(Fil::de(t)).map_err(|_| ())?;
         self.vivants.fetch_add(1, Ordering::Relaxed);
+        *self.principal.verrouiller() = Some(t.clone());
         Ok(())
     }
 
@@ -544,6 +637,8 @@ pub fn ajouter(processus: Processus, descripteurs: Descripteurs, mut memoire: Me
         identite,
         lance: crate::temps::maintenant(),
         exe: Verrou::new((Vec::new(), None)),
+        principal: Verrou::new(None),
+        souvenir: Verrou::new(Souvenir::VIDE),
     }).ok()?;
     let mut table = TABLE.verrouiller();
     if table.len() == table.capacity() {
@@ -602,7 +697,12 @@ pub fn cible_d_horloge(h: crate::temps::DeCalcul, lecture: bool) -> Option<Cible
         if h.pid == 0 || h.pid == t.tid() {
             return Some(Cible::Fil(t));
         }
-        return avec(|p| p.fil(h.pid).and_then(|f| f.tache.upgrade())).map(Cible::Fil);
+        if let Some(f) = avec(|p| p.fil(h.pid).and_then(|f| f.tache.upgrade())) {
+            return Some(Cible::Fil(f));
+        }
+        // Le fil principal parti, que Linux garde jusqu'à la fin du groupe
+        // (un zombie) : sa tâche.
+        return if h.pid == e.pid { e.principal.verrouiller().clone().map(Cible::Fil) } else { None };
     }
     if h.pid == 0 || (lecture && h.pid == t.tid()) {
         return Some(Cible::Processus(e));
@@ -661,9 +761,17 @@ pub fn pour_chaque_fil(pid: u32, mut f: impl FnMut(u32)) {
 /// Retire de la table le zombie `pid`, recueilli (programmes.rs) : son
 /// statut de sortie.
 pub fn recueillir(pid: u32) -> Option<i32> {
-    let mut table = TABLE.verrouiller();
-    let i = table.iter().position(|e| e.pid == pid)?;
-    Some(table.swap_remove(i).code())
+    let e = {
+        let mut table = TABLE.verrouiller();
+        let i = table.iter().position(|e| e.pid == pid)?;
+        table.swap_remove(i)
+    };
+    // La tâche du fil principal, lâchée hors du verrou de la table : sa
+    // dernière référence rend sa structure (et, avec elle, la sienne vers
+    // l'entrée).
+    let principal = e.principal.verrouiller().take();
+    drop(principal);
+    Some(e.code())
 }
 
 /// Exécute `f` sur le processus de la tâche courante (il y en a toujours
@@ -928,6 +1036,52 @@ pub fn mettre_de_cote(pid: u32) {
     if let Some(e) = TABLE.verrouiller().iter().find(|e| e.pid == pid) {
         e.mis_de_cote.store(true, Ordering::SeqCst);
     }
+}
+
+/// La tâche du fil principal du processus `pid`, vivante ou morte, jusqu'au
+/// recueil (/proc/<pid>/stat et status).
+pub fn principal(pid: u32) -> Option<Arc<Tache>> {
+    entree(pid)?.principal.verrouiller().clone()
+}
+
+/// Ce que /proc/<pid>/stat et status montrent du processus `pid` et de son
+/// fil `tid` (`VueDuProcessus`) : sous le verrou du processus s'il vit,
+/// sinon de son souvenir. None s'il a été recueilli.
+#[track_caller]
+pub fn vue(pid: u32, tid: u32) -> Option<VueDuProcessus> {
+    let e = entree(pid)?;
+    assert!(!vfs::tenu_ici(), "verrou d'un processus pris sous celui des fichiers");
+    let v = {
+        let garde = e.processus.verrouiller();
+        let s = *e.souvenir.verrouiller();
+        let principal = |attente: u64, masque: u64| if tid == pid { (attente, masque) } else { (0, 0) };
+        match garde.as_ref() {
+            Some(p) => {
+                let (ignores, attrapes) = p.signaux.ignores_et_attrapes();
+                let (attente, masque) = match p.fils.iter().find(|f| f.tid == tid) {
+                    Some(f) => (f.signaux.en_attente(), f.signaux.bloques()),
+                    None => principal(s.attente_du_principal, s.masque_du_principal),
+                };
+                let principal_parti = !p.fils.iter().any(|f| f.tid == pid);
+                VueDuProcessus {
+                    identite: p.identite, umask: p.umask, fils: p.fils.len() as u64 + principal_parti as u64, ignores, attrapes,
+                    attente_partagee: p.signaux.en_attente(), attente, masque, fin_de_groupe: p.fin_de_groupe,
+                    limite_rss: p.courante(RLIMIT_RSS), limite_signaux: p.courante(RLIMIT_SIGPENDING),
+                    cumul: e.usage.cumul(Some(p)), utime: 0, stime: 0,
+                }
+            }
+            None => {
+                let (attente, masque) = principal(s.attente_du_principal, s.masque_du_principal);
+                VueDuProcessus {
+                    identite: s.identite, umask: 0, fils: 1, ignores: s.ignores, attrapes: s.attrapes, attente_partagee: s.attente,
+                    attente, masque, fin_de_groupe: s.fin_de_groupe, limite_rss: s.limite_rss, limite_signaux: s.limite_signaux,
+                    cumul: e.usage.cumul(None), utime: 0, stime: 0,
+                }
+            }
+        }
+    };
+    let (utime, stime) = e.usage.partager(&v.cumul, e.temps_de_calcul());
+    Some(VueDuProcessus { utime, stime, ..v })
 }
 
 /// Le nom du fil principal du processus `pid`, s'il est dans la table

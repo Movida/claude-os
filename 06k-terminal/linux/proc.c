@@ -23,6 +23,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/auxv.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sched.h>
@@ -305,6 +306,44 @@ static long statm(long champs[7])
     return sscanf(t, "%ld %ld %ld %ld %ld %ld %ld", &champs[0], &champs[1], &champs[2], &champs[3], &champs[4], &champs[5], &champs[6]);
 }
 
+/* /proc/.../stat : les 52 champs, numérotés comme dans proc(5) (champ[1]
+ * le numéro, champ[3] l'état...), le nom à part, ses parenthèses ôtées.
+ * Rend le numéro du dernier champ lu (52 s'il y sont tous). */
+static int champs_de_stat(const char *chemin, unsigned long long champ[53], char *etat, char *nom, size_t taille)
+{
+    char t[1024];
+    if (lire_tout(chemin, t, sizeof t, sizeof t) == 0)
+        return 0;
+    char *g = strchr(t, '('), *d = strrchr(t, ')');
+    if (!g || !d || d[1] != ' ')
+        return 0;
+    snprintf(nom, taille, "%.*s", (int)(d - g - 1), g + 1);
+    champ[1] = strtoull(t, NULL, 10);
+    *etat = d[2];
+    int n = 3;
+    char *p = d + 3;
+    while (n < 52) {
+        char *fin;
+        unsigned long long v = strtoull(p, &fin, 10);
+        if (fin == p)
+            break;
+        champ[++n] = v;
+        p = fin;
+    }
+    return *p == '\n' ? n : 0;
+}
+
+/* La valeur de la ligne « nom: » de status (le premier nombre, en base
+ * `base`) ; -1 sans elle. */
+static long long ligne_de_status(const char *texte, const char *nom, int base)
+{
+    size_t k = strlen(nom);
+    for (const char *p = texte; p && *p; p = strchr(p, '\n') ? strchr(p, '\n') + 1 : NULL)
+        if (strncmp(p, nom, k) == 0 && p[k] == ':')
+            return strtoll(p + k + 1, NULL, base);
+    return -1;
+}
+
 static void memoire(void)
 {
     long avant[7], apres[7];
@@ -380,7 +419,7 @@ static void arborescence(void)
      * (`tgid_base_stuff`) ; dans /proc/sys, par les octets (`namecmp`). */
     verifier(DANS_L_ORDRE("/proc", "net", "sys", "version", "self", "thread-self", moi)
              && DANS_L_ORDRE("/proc/net", "arp", "dev", "pnp", "tcp", "unix", "route")
-             && DANS_L_ORDRE("/proc/self", "task", "fd", "comm", "statm", "maps", "exe")
+             && DANS_L_ORDRE("/proc/self", "task", "fd", "status", "comm", "stat", "statm", "maps", "exe")
              && DANS_L_ORDRE("/proc/sys", "fs", "kernel", "net", "vm")
              && DANS_L_ORDRE("/proc/sys/vm", "mmap_min_addr", "overcommit_memory")
              && DANS_L_ORDRE("/proc/sys/fs", "inotify", "pipe-max-size", "pipe-user-pages-hard", "pipe-user-pages-soft")
@@ -612,6 +651,19 @@ static void fils(void)
     while (tid_autre == 0)
         sched_yield();
     verifier(dans_task(tid_autre), "task/<tid> du nouveau fil");
+    {
+        /* Le stat d'un fil : le sien (exit_signal -1, créé par clone :
+         * PF_FORKNOEXEC, ses fautes de page parmi celles du processus). */
+        unsigned long long c[53] = { 0 }, p[53] = { 0 };
+        char etat, n2[32];
+        snprintf(chemin, sizeof chemin, "/proc/self/task/%d/stat", tid_autre);
+        int ok = champs_de_stat(chemin, c, &etat, n2, sizeof n2) == 52;
+        ok &= champs_de_stat("/proc/self/stat", p, &etat, n2, sizeof n2) == 52;
+        snprintf(chemin, sizeof chemin, "/proc/self/task/%d", tid_autre);
+        verifier(ok && c[1] == (unsigned long long)tid_autre && (long long)c[38] == -1 && (c[9] & 0x40) && c[10] <= p[10]
+                 && c[20] == 2 && DANS_L_ORDRE(chemin, "status", "comm", "stat"),
+                 "task/<tid>/stat d'un fil : le sien");
+    }
     verifier(entrees("/proc/self/task") == 2, "task : deux fils");
     verifier(pthread_setname_np(f, "autre") == 0 && pthread_getname_np(f, nom, sizeof nom) == 0 && strcmp(nom, "autre") == 0,
              "nommer un autre fil (task/<tid>/comm)");
@@ -864,6 +916,128 @@ static void descripteurs(void)
     close(m);
 }
 
+static long long tics_de(struct timeval t)
+{
+    return t.tv_sec * 100LL + t.tv_usec / 10000;
+}
+
+static void gestionnaire_vide(int sig)
+{
+    (void)sig;
+}
+
+/* stat et status (les soldes d'avant 6k) : ce qu'ils disent du processus,
+ * comparé à ce que disent les appels système. Les comptes de stat entre
+ * deux getrusage : Linux partage le temps de calcul du processus de la même
+ * façon pour les deux (`thread_group_cputime_adjusted`), qui ne reculent
+ * jamais l'un par rapport à l'autre. Les signaux : un gestionnaire de
+ * SIGUSR1 (attrapé, le bit 9), SIGUSR2 ignoré (le bit 11), SIGHUP bloqué et
+ * envoyé au fil (en attente : le bit 0). */
+static char **arguments;
+
+static void stat_et_status(void)
+{
+    char chemin[64], etat = 0, nom[64], t[4096], zone[256];
+    unsigned long long c[53] = { 0 };
+    long sm[7];
+    struct rusage r1, r2;
+    struct rlimit rss;
+    sigset_t hup, avant;
+    signal(SIGUSR1, gestionnaire_vide);
+    signal(SIGUSR2, SIG_IGN);
+    sigemptyset(&hup);
+    sigaddset(&hup, SIGHUP);
+    sigprocmask(SIG_BLOCK, &hup, &avant);
+    raise(SIGHUP);
+    snprintf(chemin, sizeof chemin, "/proc/%d/stat", getpid());
+    getrusage(RUSAGE_SELF, &r1);
+    int n = champs_de_stat(chemin, c, &etat, nom, sizeof nom);
+    getrusage(RUSAGE_SELF, &r2);
+    long pages = statm(sm) ? sm[0] : -1;
+    verifier(n == 52 && c[1] == (unsigned long long)getpid() && strcmp(nom, "proc") == 0 && etat == 'R',
+             "stat : 52 champs, le numero, le nom, R");
+    verifier(c[4] == (unsigned long long)getppid() && c[5] == (unsigned long long)getpgrp() && c[6] == (unsigned long long)getsid(0),
+             "stat : ppid, pgrp, session");
+    verifier(tics_de(r1.ru_utime) <= (long long)c[14] && (long long)c[14] <= tics_de(r2.ru_utime)
+             && tics_de(r1.ru_stime) <= (long long)c[15] && (long long)c[15] <= tics_de(r2.ru_stime)
+             && (unsigned long long)r1.ru_minflt <= c[10] && c[10] <= (unsigned long long)r2.ru_minflt,
+             "stat : utime, stime et minflt entre deux getrusage");
+    struct timespec depuis;
+    clock_gettime(CLOCK_BOOTTIME, &depuis);
+    verifier((c[9] & 0x40) == 0 && c[20] == 1 && c[22] <= (unsigned long long)depuis.tv_sec * 100 + depuis.tv_nsec / 10000000
+             && c[39] < (unsigned long long)sysconf(_SC_NPROCESSORS_CONF),
+             "stat : drapeaux, un fil, starttime, processeur");
+    getrlimit(RLIMIT_RSS, &rss);
+    lire_tout("/proc/self/maps", cartes, sizeof cartes, sizeof cartes);
+    struct ligne l;
+    verifier(pages > 0 && c[23] == (unsigned long long)pages * 4096 && c[25] == rss.rlim_cur
+             && trouver(c[28], &l, zone, sizeof zone) && strcmp(zone, "[stack]") == 0,
+             "stat : vsize (statm), rsslim, startstack dans [stack]");
+    verifier(c[48] == (unsigned long)arguments[0] && c[49] == c[50] && c[50] == (unsigned long)environ[0]
+             && c[51] == getauxval(AT_EXECFN),
+             "stat : arguments et environnement");
+    verifier((c[31] & 1) && (c[32] & 1) && (c[33] & 1 << 11) && (c[34] & 1 << 9) && c[35] == 0,
+             "stat : signaux en attente, bloques, ignores, attrapes ; wchan");
+    verifier(c[38] == 17 && c[52] == 0, "stat : exit_signal SIGCHLD, exit_code 0");
+    if (chez_nous)
+        verifier(c[7] == 0 && (long long)c[8] == -1, "stat : pas de terminal");
+    /* status, puis stat de nouveau, pour VmSize. */
+    snprintf(chemin, sizeof chemin, "/proc/%d/status", getpid());
+    lire_tout(chemin, t, sizeof t, sizeof t);
+    pages = statm(sm) ? sm[0] : -1;
+    verifier(ligne_de_status(t, "Pid", 10) == getpid() && ligne_de_status(t, "Tgid", 10) == getpid()
+             && ligne_de_status(t, "PPid", 10) == getppid() && ligne_de_status(t, "Uid", 10) == getuid()
+             && ligne_de_status(t, "Gid", 10) == getgid() && ligne_de_status(t, "Threads", 10) == 1
+             && strstr(t, "\nState:\tR (running)\n"),
+             "status : numeros, utilisateur, un fil, R (running)");
+    long long taille = ligne_de_status(t, "VmSize", 10), rss_kio = ligne_de_status(t, "VmRSS", 10);
+    verifier(taille == pages * 4 && rss_kio > 0 && ligne_de_status(t, "VmPeak", 10) >= taille
+             && ligne_de_status(t, "VmHWM", 10) >= rss_kio && strstr(t, "\nVmSize:\t") && strstr(t, " kB\nVmLck:\t"),
+             "status : VmSize (statm), VmRSS, VmPeak, VmHWM");
+    verifier((ligne_de_status(t, "SigPnd", 16) & 1) && (ligne_de_status(t, "SigBlk", 16) & 1)
+             && (ligne_de_status(t, "SigIgn", 16) & 1 << 11) && (ligne_de_status(t, "SigCgt", 16) & 1 << 9),
+             "status : SigPnd, SigBlk, SigIgn, SigCgt");
+    /* Cpus_allowed_list d'après sched_getaffinity. */
+    cpu_set_t ens;
+    char liste[256] = "", morceau[32];
+    sched_getaffinity(0, sizeof ens, &ens);
+    for (int i = 0; i < CPU_SETSIZE; i++) {
+        if (!CPU_ISSET(i, &ens))
+            continue;
+        int j = i;
+        while (j + 1 < CPU_SETSIZE && CPU_ISSET(j + 1, &ens))
+            j++;
+        snprintf(morceau, sizeof morceau, j > i ? "%s%d-%d" : "%s%d", *liste ? "," : "", i, j);
+        strncat(liste, morceau, sizeof liste - strlen(liste) - 1);
+        i = j;
+    }
+    char ligne_liste[300];
+    snprintf(ligne_liste, sizeof ligne_liste, "\nCpus_allowed_list:\t%s\n", liste);
+    verifier(strstr(t, ligne_liste) != NULL, "status : Cpus_allowed_list (sched_getaffinity)");
+    if (chez_nous) {
+        /* Chez nous, la liste exacte des lignes, dans l'ordre. */
+        static const char *const noms[] = {
+            "Name", "Umask", "State", "Tgid", "Ngid", "Pid", "PPid", "TracerPid", "Uid", "Gid", "FDSize", "Groups",
+            "Kthread", "VmPeak", "VmSize", "VmLck", "VmPin", "VmHWM", "VmRSS", "RssAnon", "RssFile", "RssShmem",
+            "VmData", "VmStk", "VmExe", "VmLib", "VmPTE", "VmSwap", "CoreDumping", "THP_enabled", "untag_mask",
+            "Threads", "SigQ", "SigPnd", "ShdPnd", "SigBlk", "SigIgn", "SigCgt", "CapInh", "CapPrm", "CapEff",
+            "CapBnd", "CapAmb", "NoNewPrivs", "Speculation_Store_Bypass", "SpeculationIndirectBranch",
+            "Cpus_allowed", "Cpus_allowed_list", "voluntary_ctxt_switches", "nonvoluntary_ctxt_switches",
+        };
+        int k = 0, bon = 1;
+        for (const char *p = t; *p && bon; p = strchr(p, '\n') + 1, k++) {
+            size_t m = strcspn(p, ":");
+            bon = k < (int)(sizeof noms / sizeof *noms) && strlen(noms[k]) == m && strncmp(p, noms[k], m) == 0;
+        }
+        verifier(bon && k == (int)(sizeof noms / sizeof *noms), "status : les lignes de Linux, dans l'ordre");
+    }
+    signal(SIGHUP, SIG_IGN); /* jette le SIGHUP en attente */
+    sigprocmask(SIG_SETMASK, &avant, NULL);
+    signal(SIGHUP, SIG_DFL);
+    signal(SIGUSR1, SIG_DFL);
+    signal(SIGUSR2, SIG_DFL);
+}
+
 /* « proc parti » (les soldes d'avant 6k) : le fil principal finit le
  * premier (pthread_exit), un autre fil regarde alors /proc/<pid>. Linux le
  * montre d'après la tâche du fil principal, qui n'a plus de mémoire ni de
@@ -889,6 +1063,27 @@ static void *apres_le_principal(void *a)
             nanosleep(&ms, NULL);
     }
     verifier(parti, "parti : exe du fil principal, ENOENT");
+    /* stat et status d'après la tâche du principal : zombie (Linux le
+     * garde jusqu'au recueil), compté parmi les fils, sans mémoire ;
+     * drapeaux : dans sa sortie, morte (PF_EXITING, PF_POSTCOREDUMP,
+     * PF_NOFREEZE). Il devient zombie un peu après avoir quitté sa
+     * mémoire : attendre. */
+    unsigned long long champ[53] = { 0 };
+    char etat = 0, nom[32];
+    snprintf(chemin, sizeof chemin, "/proc/%d/stat", pid_parti);
+    int zombie = 0;
+    for (int i = 0; i < 10000 && !zombie; i++) {
+        zombie = champs_de_stat(chemin, champ, &etat, nom, sizeof nom) == 52 && etat == 'Z' && (champ[9] & 0x8000);
+        if (!zombie)
+            nanosleep(&ms, NULL);
+    }
+    verifier(zombie && champ[20] == 2 && champ[23] == 0 && (champ[9] & 0x800C) == 0x800C && champ[52] == 0 && champ[45] == 0,
+             "parti : stat, zombie, deux fils, sans memoire, drapeaux de sa fin");
+    snprintf(chemin, sizeof chemin, "/proc/%d/status", pid_parti);
+    lire_tout(chemin, t, sizeof t, sizeof t);
+    verifier(!strstr(t, "\nUmask:") && !strstr(t, "\nVmSize:") && strstr(t, "\nFDSize:\t0\n") && strstr(t, "\nState:\tZ (zombie)\n")
+             && ligne_de_status(t, "Threads", 10) == 2,
+             "parti : status, ni masque ni memoire, zombie, deux fils");
     snprintf(chemin, sizeof chemin, "/proc/%d/maps", pid_parti);
     verifier(lire_tout(chemin, t, sizeof t, sizeof t) == 0, "parti : maps vide");
     snprintf(chemin, sizeof chemin, "/proc/%d/statm", pid_parti);
@@ -912,6 +1107,12 @@ static void *apres_le_principal(void *a)
     verifier(entre, "parti : chdir et fchdir vers fd/, permis au processus");
     close(dfd);
     close(ici);
+    /* L'horloge de calcul du fil parti se lit encore (Linux garde sa tâche
+     * jusqu'à la fin du groupe), et celle du processus. */
+    struct timespec h;
+    clockid_t fil_parti = (clockid_t)((~(unsigned)pid_parti << 3) | 4 | 2), processus_parti = (clockid_t)((~(unsigned)pid_parti << 3) | 2);
+    verifier(clock_gettime(fil_parti, &h) == 0 && clock_gettime(processus_parti, &h) == 0,
+             "parti : son horloge de calcul et celle du processus se lisent");
     /* Ce qui n'est pas un dossier 0555 passe à root, sous task/<pid> aussi. */
     snprintf(chemin, sizeof chemin, "/proc/%d/maps", pid_parti);
     int r = stat(chemin, &m);
@@ -947,6 +1148,7 @@ static int principal_parti(void)
 
 int main(int argc, char **argv)
 {
+    arguments = argv;
     if (argc == 2 && strcmp(argv[1], "cible") == 0) {
         char t[16];
         int k = snprintf(t, sizeof t, "%d", getpid());
@@ -971,6 +1173,7 @@ int main(int argc, char **argv)
     arborescence();
     modifications();
     sys();
+    stat_et_status();
     fils();
     descripteurs();
     printf("[linux] proc : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
