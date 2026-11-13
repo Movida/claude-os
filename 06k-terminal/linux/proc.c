@@ -48,6 +48,31 @@ static int erreur(long r)
     return r < 0 ? errno : 0;
 }
 
+/* Les noms de `liste` que contient le dossier `chemin` y viennent-ils dans
+ * cet ordre (getdents) ? Les autres noms n'y comptent pas ; chez nous, tous
+ * ceux de la liste doivent y être. Linux liste un dossier de /proc ou de
+ * /sys dans l'ordre de l'arbre où il range ses entrées (noyaufs.rs). */
+static int dans_l_ordre(const char *chemin, const char *const *liste, int n)
+{
+    DIR *d = opendir(chemin);
+    if (!d)
+        return 0;
+    int suivant = 0, vus = 0, ok = 1;
+    struct dirent *e;
+    while ((e = readdir(d)))
+        for (int k = 0; k < n; k++)
+            if (!strcmp(e->d_name, liste[k])) {
+                ok &= k >= suivant;
+                suivant = k + 1;
+                vus++;
+            }
+    closedir(d);
+    return ok && (!chez_nous || vus == n);
+}
+
+#define DANS_L_ORDRE(chemin, ...) \
+    dans_l_ordre(chemin, (const char *const[]){ __VA_ARGS__ }, sizeof (const char *const[]){ __VA_ARGS__ } / sizeof (char *))
+
 /* Tout un fichier, lu par morceaux de `morceau` octets. */
 static size_t lire_tout(const char *chemin, char *tampon, size_t taille, size_t morceau)
 {
@@ -346,6 +371,19 @@ static void arborescence(void)
     }
     closedir(d);
     verifier(vu_self && vu_fil && vu_moi && vu_sys && vu_net, "/proc contient self, thread-self, sys, net et le dossier du processus");
+    /* L'ordre des listes : dans /proc et /proc/net, par la longueur du nom
+     * puis ses octets (`proc_match`), self et thread-self après, puis les
+     * processus ; dans le dossier d'un processus, celui du tableau de Linux
+     * (`tgid_base_stuff`) ; dans /proc/sys, par les octets (`namecmp`). */
+    verifier(DANS_L_ORDRE("/proc", "net", "sys", "self", "thread-self", moi)
+             && DANS_L_ORDRE("/proc/net", "arp", "dev", "pnp", "tcp", "unix", "route")
+             && DANS_L_ORDRE("/proc/self", "task", "fd", "comm", "statm", "maps", "exe")
+             && DANS_L_ORDRE("/proc/sys", "fs", "kernel", "net", "vm")
+             && DANS_L_ORDRE("/proc/sys/vm", "mmap_min_addr", "overcommit_memory")
+             && DANS_L_ORDRE("/proc/sys/fs", "inotify", "pipe-max-size", "pipe-user-pages-hard", "pipe-user-pages-soft")
+             && DANS_L_ORDRE("/proc/sys/net/ipv4", "ip_default_ttl", "ip_local_port_range", "ipfrag_time", "route",
+                             "tcp_fin_timeout"),
+             "/proc liste ses dossiers dans l'ordre de Linux");
     /* Les liens de /proc : deux, un par sous-dossier fixe, et un par
      * processus (`proc_root_getattr`) ; sur l'hôte, bien plus de dossiers
      * fixes, et tous les processus de la machine. */
@@ -447,6 +485,9 @@ static void sys(void)
     lire_tout("/sys/devices/system/cpu/online", online, sizeof online, sizeof online);
     lire_tout("/sys/devices/system/cpu/possible", possible, sizeof possible, sizeof possible);
     lire_tout("/sys/devices/system/cpu/present", present, sizeof present, sizeof present);
+    /* L'ordre de kernfs : par une empreinte du nom (`kernfs_name_hash`). */
+    verifier(DANS_L_ORDRE("/sys", "kernel", "devices") && DANS_L_ORDRE("/sys/devices/system/cpu", "possible", "present", "online"),
+             "/sys liste ses dossiers dans l'ordre de Linux");
     cpu_set_t c;
     sched_getaffinity(0, sizeof c, &c);
     verifier(compter(online) >= CPU_COUNT(&c) && compter(online) == get_nprocs() && compter(possible) == get_nprocs_conf()

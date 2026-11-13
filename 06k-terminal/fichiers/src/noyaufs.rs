@@ -23,6 +23,24 @@
 //!   - sysfs : la taille des fichiers est une page (4096), la taille de
 //!     bloc aussi ; un nom absent n'y est qu'absent (créer est refusé par
 //!     les droits, EACCES, ou par EPERM pour root : rien ne sait y créer).
+//!
+//! Et par l'ordre où ils listent un dossier (getdents), qui est celui de la
+//! structure où Linux range ses entrées, un arbre rouge-noir trié (mesuré) :
+//!   - les `proc_dir_entry` de /proc (`proc_match`) : par la longueur du
+//!     nom, puis par ses octets (« net », « sys », « version ») ; /proc/self
+//!     et /proc/thread-self n'en sont pas (`proc_pid_readdir` les donne
+//!     après elles, avant les processus) ;
+//!   - les réglages de /proc/sys (`namecmp` de proc_sysctl.c) : par les
+//!     octets du nom (« fs », « kernel », « net », « vm ») ;
+//!   - les `kernfs_node` de /sys (`kernfs_name_compare`) : par une empreinte
+//!     du nom (`kernfs_name_hash`), puis par le nom (« possible »,
+//!     « present », « online »).
+//! Une entrée prend sa place parmi ses sœurs dès qu'on l'ajoute
+//! (`ajouter`) : le noyau décrit ses systèmes dans l'ordre qui se lit le
+//! mieux, et une entrée de plus ne peut pas se retrouver mal placée. Option
+//! écartée, celle d'avant les soldes de 6k : lister dans l'ordre des ajouts,
+//! que le noyau devait suivre à la main (il ne le suivait pas : « sys »
+//! avant « net », « overcommit_memory » avant « mmap_min_addr »).
 
 use crate::chemins::Texte;
 use crate::montages::{Interne, Monte};
@@ -92,10 +110,13 @@ static ABSENTE: Entree = Entree {
 pub struct NoyauFs {
     genre: Genre,
     peripherique: (u32, u32),
-    /// Les entrées, dans l'ordre de leur numéro d'inode (la racine est
-    /// l'inode 1, comme sous Linux). Un parent est toujours avant ses
-    /// enfants : il existait quand on les a ajoutés, et les numéros
-    /// croissent.
+    /// Les entrées : la racine (l'inode 1, comme sous Linux), puis les
+    /// autres, celles d'un même dossier dans l'ordre de Linux (voir
+    /// l'en-tête). Un parent est toujours avant ses enfants : il existait
+    /// quand on les a ajoutés, et une entrée ne s'insère que devant une de
+    /// ses sœurs. Les numéros d'inode croissent à chaque ajout, mais pas
+    /// dans cette table : une recherche par numéro la parcourt (quelques
+    /// dizaines d'entrées).
     entrees: Vec<Entree>,
     /// Le numéro de la prochaine entrée (ENOSPC au-delà de 32 bits).
     prochain: u32,
@@ -103,6 +124,30 @@ pub struct NoyauFs {
 
 /// La racine : l'inode 1.
 const RACINE: u32 = 1;
+
+/// L'empreinte d'un nom de sysfs, qui ordonne ses dossiers : le
+/// `kernfs_name_hash` de Linux (sans espace de noms, `ns` nul), recopié pas
+/// à pas et vérifié contre les listes de /sys sous Linux 6.18. Chaque octet
+/// s'ajoute par `partial_name_hash` ((h + (c << 4) + (c >> 4)) * 11, sur 64
+/// bits ; un `char` signé chez Linux sur x86, mais nos noms sont en ASCII),
+/// puis `end_name_hash` garde les 32 bits hauts du produit par
+/// GOLDEN_RATIO_64 (`hash_64`) ; 0, 1 et INT_MAX sont réservés aux
+/// positions spéciales d'un dossier.
+fn empreinte_kernfs(nom: &[u8]) -> u32 {
+    let mut h: u64 = 0;
+    for &c in nom {
+        let c = c as u64;
+        h = h.wrapping_add(c << 4).wrapping_add(c >> 4).wrapping_mul(11);
+    }
+    reserver_les_positions((h.wrapping_mul(0x61C8_8646_80B5_83EB) >> 32) as u32 & 0x7fff_ffff)
+}
+
+/// Les empreintes 0, 1 et INT_MAX sont réservées : les deux premières
+/// décalées de 2 (0 devient 2, 1 devient 3), la dernière ramenée juste en
+/// dessous.
+fn reserver_les_positions(h: u32) -> u32 {
+    if h < 2 { h + 2 } else { h.min(0x7fff_fffe) }
+}
 
 impl NoyauFs {
     /// Un système vide : sa racine seule, à root, de mode `mode` (0555 pour
@@ -129,7 +174,24 @@ impl NoyauFs {
 
     /// L'entrée de numéro `n`, si elle existe encore.
     fn trouver(&self, n: u32) -> Option<&Entree> {
-        self.entrees.binary_search_by_key(&n, |e| e.numero).ok().map(|i| &self.entrees[i])
+        self.entrees.iter().find(|e| e.numero == n)
+    }
+
+    /// Le nom `a` se liste-t-il avant `b` dans le dossier `dossier` ?
+    /// L'ordre de Linux pour ce dossier (voir l'en-tête) ; `lien_a` et
+    /// `lien_b` disent si l'entrée est un des deux liens du lecteur
+    /// (/proc/self, /proc/thread-self), qui viennent après les autres, entre
+    /// eux dans l'ordre de leurs ajouts (self, puis thread-self : procfs.rs).
+    fn avant(&self, dossier: u32, (a, lien_a): (&[u8], bool), (b, lien_b): (&[u8], bool)) -> bool {
+        match self.genre {
+            Genre::Sys => (empreinte_kernfs(a), a) < (empreinte_kernfs(b), b),
+            Genre::Proc if dossier != RACINE && self.dans_proc_sys(dossier) => a < b,
+            Genre::Proc => match (lien_a, lien_b) {
+                (false, false) => (a.len(), a) < (b.len(), b),
+                (false, true) => true,
+                (true, _) => false,
+            },
+        }
     }
 
     /// L'entrée de numéro `n`, ou `ABSENTE`.
@@ -160,8 +222,15 @@ impl NoyauFs {
         let numero = self.prochain;
         let prochain = numero.checked_add(1).ok_or(Erreur::ENOSPC)?;
         let copie = faillible::copie(nom)?;
+        // Sa place : devant la première de ses sœurs qui se liste après lui,
+        // sinon à la fin.
+        let lien = |c: &Contenu| matches!(c, Contenu::Lien(Cible::Lecteur | Cible::LecteurFil));
+        let place = self.entrees.iter()
+            .position(|e| e.parent == parent && e.numero != parent
+                      && self.avant(parent, (nom, lien(&contenu)), (&e.nom, lien(&e.contenu))))
+            .unwrap_or(self.entrees.len());
         self.entrees.try_reserve(1).map_err(|_| Erreur::ENOMEM)?;
-        self.entrees.ajouter_dans_la_place(Entree {
+        self.entrees.inserer_dans_la_place(place, Entree {
             numero,
             nom: copie,
             parent,
@@ -302,9 +371,11 @@ impl Monte for NoyauFs {
         })
     }
 
-    /// « . » (position 0), « .. » (1), puis les entrées dans l'ordre de leur
-    /// numéro : l'entrée `i` est à la position i + 2, et sa suivante à
-    /// i + 3. Un numéro absent : ENOENT.
+    /// « . » (position 0), « .. » (1), puis les entrées dans l'ordre de
+    /// Linux, celui de la table : l'entrée de rang `k` dans la table est à
+    /// la position k + 2, et sa suivante à k + 3 (des positions qui ne
+    /// changent pas : tout s'ajoute à la création du système, avant qu'un
+    /// programme ne puisse lister). Un numéro absent : ENOENT.
     fn lire_dossier(&self, dossier: u64, position: u64, entree: &mut dyn FnMut(&[u8], u64, u8, u64) -> bool)
         -> Result<(), Erreur> {
         let dossier = entree32(dossier);
@@ -319,7 +390,7 @@ impl Monte for NoyauFs {
             return Ok(());
         }
         let depuis = position.max(2) - 2;
-        for e in self.entrees.iter().filter(|e| e.numero as u64 >= depuis) {
+        for (k, e) in self.entrees.iter().enumerate().filter(|&(k, _)| k as u64 >= depuis) {
             if e.parent != dossier || e.numero == dossier {
                 continue;
             }
@@ -328,7 +399,7 @@ impl Monte for NoyauFs {
                 Contenu::Fichier { .. } => DT_REG,
                 Contenu::Lien(_) => DT_LNK,
             };
-            if !entree(&e.nom, e.numero as u64, genre, e.numero as u64 + 3) {
+            if !entree(&e.nom, e.numero as u64, genre, k as u64 + 3) {
                 return Ok(());
             }
         }
@@ -689,23 +760,24 @@ mod tests {
         let fil = p.ajouter(RACINE as u64, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), Temps::default()).unwrap();
         assert_eq!(p.cible(u64::from(fil), b"42", b"42/task/7"), b"42/task/7");
         assert_eq!(p.ajouter(d, b"f", 0o444, (0, 0), Contenu::Dossier, Temps::default()), Err(Erreur::EEXIST));
-        // Les entrées, dans l'ordre de leurs numéros, et la position qui
-        // suit chacune.
+        // Les entrées, dans l'ordre de /proc sous Linux (par la longueur du
+        // nom, puis ses octets ; self et thread-self après), et la position
+        // qui suit chacune.
         let mut vus = vec![];
         p.lire_dossier(RACINE as u64, 0, &mut |nom, _, _, suivante| {
             vus.push((nom.to_vec(), suivante));
             true
         })
         .unwrap();
-        assert_eq!(vus.iter().map(|(n, _)| n.as_slice()).collect::<Vec<_>>(), [&b"."[..], b"..", b"self", b"sys", b"d", b"thread-self"]);
-        let apres_d = vus[4].1;
+        assert_eq!(vus.iter().map(|(n, _)| n.as_slice()).collect::<Vec<_>>(), [&b"."[..], b"..", b"d", b"sys", b"self", b"thread-self"]);
+        let apres_d = vus[3].1;
         let mut suite = vec![];
         p.lire_dossier(RACINE as u64, apres_d, &mut |nom, _, _, _| {
             suite.push(nom.to_vec());
             true
         })
         .unwrap();
-        assert_eq!(suite, [b"thread-self".to_vec()]);
+        assert_eq!(suite, [b"self".to_vec(), b"thread-self".to_vec()]);
         // Un système de sysfs : des fichiers d'une page.
         let mut s = NoyauFs::new(Genre::Sys, (0, 22), 0o555, Temps::default()).unwrap();
         let f = s.ajouter(RACINE as u64, b"online", 0o444, (0, 0), Contenu::Fichier { source: 9, argument: 0 }, Temps::default()).unwrap();
@@ -947,5 +1019,56 @@ mod tests {
         let mut panne = |c: u64| if c == 1 { Err(Erreur::ENOMEM) } else { lignes(3)(c) };
         assert_eq!(s.lire(1, 100, &mut panne), Err(Erreur::ENOMEM));
         assert_eq!(s.lire(1, 99, lignes(3)).unwrap(), debut[1..]);
+    }
+
+    /// Les noms d'un dossier, dans l'ordre de getdents.
+    fn noms(p: &NoyauFs, dossier: u64) -> Vec<Vec<u8>> {
+        let mut vus = vec![];
+        p.lire_dossier(dossier, 2, &mut |nom, _, _, _| {
+            vus.push(nom.to_vec());
+            true
+        })
+        .unwrap();
+        vus
+    }
+
+    /// L'ordre de Linux, quel que soit celui des ajouts (mesuré sous Linux
+    /// 6.18) : /proc/sys par les octets des noms, /sys par l'empreinte de
+    /// kernfs, la racine de /proc par la longueur puis les octets.
+    #[test]
+    fn ordre_de_linux() {
+        let t = Temps::default();
+        let mut p = NoyauFs::new(Genre::Proc, (0, 21), 0o555, t).unwrap();
+        let racine = RACINE as u64;
+        p.ajouter(racine, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), t).unwrap();
+        let sys = p.ajouter(racine, b"sys", 0o555, (0, 0), Contenu::Dossier, t).unwrap();
+        for nom in [&b"vm"[..], b"fs", b"net", b"kernel"] {
+            p.ajouter(sys, nom, 0o555, (0, 0), Contenu::Dossier, t).unwrap();
+        }
+        p.ajouter(racine, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), t).unwrap();
+        p.ajouter(racine, b"version", 0o444, (0, 0), Contenu::Fichier { source: 1, argument: 0 }, t).unwrap();
+        p.ajouter(racine, b"net", 0o555, (0, 0), Contenu::Dossier, t).unwrap();
+        let vm = p.chercher(sys, b"vm").unwrap();
+        for nom in [&b"overcommit_memory"[..], b"mmap_min_addr"] {
+            p.ajouter(vm, nom, 0o644, (0, 0), Contenu::Fichier { source: 1, argument: 0 }, t).unwrap();
+        }
+        assert_eq!(noms(&p, racine), [&b"net"[..], b"sys", b"version", b"self", b"thread-self"]);
+        assert_eq!(noms(&p, sys), [&b"fs"[..], b"kernel", b"net", b"vm"]);
+        assert_eq!(noms(&p, vm), [&b"mmap_min_addr"[..], b"overcommit_memory"]);
+        // Les empreintes de kernfs (des listes de Linux 6.18 : /sys,
+        // /sys/devices/system/cpu).
+        let mut s = NoyauFs::new(Genre::Sys, (0, 22), 0o555, t).unwrap();
+        let racine = RACINE as u64;
+        for nom in [&b"devices"[..], b"kernel", b"block", b"class"] {
+            s.ajouter(racine, nom, 0o755, (0, 0), Contenu::Dossier, t).unwrap();
+        }
+        assert_eq!(noms(&s, racine), [&b"kernel"[..], b"class", b"devices", b"block"]);
+        let cpu = s.chercher(racine, b"devices").unwrap();
+        for nom in [&b"online"[..], b"possible", b"present"] {
+            s.ajouter(cpu, nom, 0o444, (0, 0), Contenu::Fichier { source: 1, argument: 0 }, t).unwrap();
+        }
+        assert_eq!(noms(&s, cpu), [&b"possible"[..], b"present", b"online"]);
+        assert_eq!(empreinte_kernfs(b""), 2);
+        assert_eq!([0, 1, 2, 0x7fff_fffe, 0x7fff_ffff].map(reserver_les_positions), [2, 3, 2, 0x7fff_fffe, 0x7fff_fffe]);
     }
 }

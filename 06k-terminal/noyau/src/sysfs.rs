@@ -37,7 +37,9 @@ pub const THP_ENABLED: u32 = 13;
 const PERIPHERIQUE: (u32, u32) = (0, 22);
 
 /// Le sysfs neuf, avec les droits de Linux (mesurés) : /sys 0555, ses
-/// dossiers 0755, les attributs 0444 (0644 pour un réglage).
+/// dossiers 0755, les attributs 0444 (0644 pour un réglage) ; chaque
+/// dossier se liste dans l'ordre de kernfs (noyaufs.rs : « kernel » avant
+/// « devices », « possible », « present », puis « online »).
 pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     let mut s = NoyauFs::new(Genre::Sys, PERIPHERIQUE, 0o555, maintenant)?;
     let racine = s.racine();

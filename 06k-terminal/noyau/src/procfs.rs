@@ -138,9 +138,12 @@ const PERIPHERIQUE: (u32, u32) = (0, 21);
 /// relit pour la suite, comme pour tout fichier).
 const LECTURE_MAX: u64 = 64 << 10;
 
-/// La partie fixe de /proc : /proc/sys, puis /proc/self et
-/// /proc/thread-self (dans l'ordre où Linux les liste : ses entrées
-/// fixes, puis ces deux liens, puis les processus).
+/// La partie fixe de /proc : /proc/sys, /proc/net, puis /proc/self et
+/// /proc/thread-self. Chaque entrée prend sa place dans l'ordre où Linux
+/// liste son dossier (noyaufs.rs : par la longueur du nom dans /proc et
+/// /proc/net, par ses octets dans /proc/sys ; self et thread-self après
+/// les autres, puis les processus) ; ces deux liens s'ajoutent en dernier,
+/// dans leur ordre.
 pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     let mut p = NoyauFs::new(Genre::Proc, PERIPHERIQUE, 0o555, maintenant)?;
     let racine = p.racine();
@@ -220,9 +223,10 @@ const DOSSIER_FD: u64 = 9;
 const LIEN_FD: u64 = 10;
 
 /// Les entrées d'un dossier de processus, dans l'ordre où elles se
-/// listent.
-const ENTREES_DU_PROCESSUS: [(&[u8], u64); 6] = [(b"maps", FICHIER_MAPS), (b"statm", FICHIER_STATM), (b"comm", FICHIER_COMM),
-                                                 (b"exe", LIEN_EXE), (b"task", DOSSIER_TASK), (b"fd", DOSSIER_FD)];
+/// listent : celui de Linux, le rang dans son tableau `tgid_base_stuff`
+/// (mesuré : task, fd, ..., comm, ..., statm, maps, ..., exe).
+const ENTREES_DU_PROCESSUS: [(&[u8], u64); 6] = [(b"task", DOSSIER_TASK), (b"fd", DOSSIER_FD), (b"comm", FICHIER_COMM),
+                                                 (b"statm", FICHIER_STATM), (b"maps", FICHIER_MAPS), (b"exe", LIEN_EXE)];
 
 /// Les droits d'un lien de fd/ : r-x pour un fichier ouvert en lecture,
 /// -wx en écriture, les deux s'il fait les deux, rien pour un O_PATH (le
