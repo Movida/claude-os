@@ -4,9 +4,14 @@
 //! l'ordre de vérification de Linux ; la table où une socket prend son
 //! port est celle de son protocole (`table`). Ce que fait chaque protocole
 //! d'un envoi et d'une arrivée est dans le sien (udp.rs, ping.rs).
+//! Deux compteurs d'IP (/proc/net/snmp) sont communs à leurs envois : pas de
+//! route (OutNoRoutes, `router` : l'ENETUNREACH d'`udp_sendmsg`, de
+//! `ping_v4_sendmsg` et d'`__ip4_datagram_connect`), et un paquet qu'on ne
+//! peut pas faire (OutDiscards, `jete` : le `error:` d'`__ip_append_data`).
 
 use super::ipv4;
 use super::paquet::{self, Paquet};
+use super::snmp::MIB;
 use super::socket::{self, AF_INET, AF_UNSPEC, Inet, Protocole, Socket};
 use crate::attente::{self, Sommeil};
 use crate::sondage::{POLLOUT, POLLWRBAND, POLLWRNORM};
@@ -16,6 +21,7 @@ use core::sync::atomic::Ordering;
 use formats::reseau::ipv4 as format_ipv4;
 use inet::ports;
 use inet::routes::Chemin;
+use inet::snmp::Ip;
 
 const EAGAIN: i64 = 11;
 const EACCES: i64 = 13;
@@ -238,7 +244,6 @@ pub struct Trajet {
 pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64) -> Result<Trajet, i64> {
     const MSG_DONTROUTE: u64 = 4;
     const ENODEV: i64 = 19;
-    const ENETUNREACH: i64 = 101;
     let demandee = c.source.filter(|&a| a != format_ipv4::AUCUNE).or_else(|| source_liee(inet));
     if demandee.is_some_and(|a| !ipv4::avec_table(|t| t.est_a_nous(a)).unwrap_or(false)) {
         return Err(-EINVAL);
@@ -246,10 +251,10 @@ pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64) ->
     if c.interface.is_some_and(|k| k != 0 && super::interface::par_index(k).is_none()) {
         return Err(-ENODEV);
     }
-    let (chemin, destination) = ipv4::router(destination, demandee)?;
+    let (chemin, destination) = ipv4::router(destination, demandee).map_err(|_| sans_route())?;
     if (inet.options.dontroute || drapeaux & MSG_DONTROUTE != 0)
         && matches!(chemin, Chemin::Unicast { prochain, .. } if prochain != destination) {
-        return Err(-ENETUNREACH);
+        return Err(sans_route());
     }
     let source = demandee.unwrap_or_else(|| ipv4::source(&chemin));
     if format_ipv4::boucle(source) && !ipv4::par_lo(&chemin) {
@@ -291,12 +296,14 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
         }
         return Err(-EMSGSIZE);
     }
+    // (Chez Linux, ces deux refus viennent de l'attente de la place, dans
+    // `__ip_append_data` : des paquets jetés.)
     let erreur = s.prendre_erreur();
     if erreur != 0 {
-        return Err(-(erreur as i64));
+        return Err(jete(-(erreur as i64)));
     }
     if s.reception.verrouiller().arret & socket::ARRET_ECRITURE != 0 {
-        return Err(-EPIPE);
+        return Err(jete(-EPIPE));
     }
     // DF avec DO et PROBE, et WANT si le paquet n'a pas à être découpé (`__ip_make_skb`) ;
     // l'identifiant comme `ip_select_ident_segs` : celui de la socket si
@@ -313,7 +320,7 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
         ipv4::identifiant(destination, source, protocole)
     };
     Ok((chemin, ipv4::Envoi {
-        source, destination, protocole, ttl: c.ttl.or(inet.options.ttl).unwrap_or(64), tos: c.tos.unwrap_or(inet.options.tos),
+        source, destination, protocole, ttl: c.ttl.or(inet.options.ttl).unwrap_or(ipv4::TTL_DEFAUT), tos: c.tos.unwrap_or(inet.options.tos),
         identifiant, ne_pas_fragmenter, mtu, confirmer: drapeaux & MSG_CONFIRM != 0,
     }))
 }
@@ -328,7 +335,12 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
 /// EINTR avec un délai (`sock_intr_errno`), et revoir tout cela. Le
 /// `Mutex` de la socket n'est pas tenu (Linux ne prend pas son verrou pour
 /// un envoi sans bouchon) : un autre fil peut l'utiliser pendant l'attente.
+/// Chaque erreur jette le paquet (OutDiscards).
 pub fn attendre_place(s: &Socket, non_bloquant: bool, delai: Option<u64>) -> Result<(), i64> {
+    attendre_la_place(s, non_bloquant, delai).map_err(jete)
+}
+
+fn attendre_la_place(s: &Socket, non_bloquant: bool, delai: Option<u64>) -> Result<(), i64> {
     const EPIPE: i64 = 32;
     const EINTR: i64 = 4;
     let Some(r) = &s.envois else { return Ok(()) };
@@ -346,9 +358,11 @@ pub fn attendre_place(s: &Socket, non_bloquant: bool, delai: Option<u64>) -> Res
             return Ok(());
         }
         // SOCKWQ_ASYNC_NOSPACE et SOCK_NOSPACE : la place revue derrière
-        // chaque drapeau (asynchrone.rs, paquet.rs).
+        // chaque drapeau (asynchrone.rs, paquet.rs) ; et SOCK_NOSPACE tel que
+        // le lit `udp_sendmsg`, qui ne s'efface pas (`place_manquee`).
         s.asynchrone.marquer_sans_place(|| !r.place());
         r.marquer_sans_place(|| !r.place());
+        s.place_manquee.store(true, Ordering::Relaxed);
         if non_bloquant {
             return Err(-EAGAIN);
         }
@@ -383,9 +397,23 @@ pub fn morceaux_permis(s: &Socket, charge: usize, envoi: &ipv4::Envoi) -> Result
     let morceaux = format_ipv4::nombre_de_fragments(charge, envoi.mtu as usize, format_ipv4::ENTETE);
     let taille = (morceaux - 1) * (paquet::MARGE + plein + paquet::SURCOUT);
     if r.octets() + taille > 2 * r.limite() {
-        return Err(-ENOBUFS);
+        return Err(jete(-ENOBUFS));
     }
     Ok(())
+}
+
+/// Pas de route : ENETUNREACH, compté (OutNoRoutes).
+fn sans_route() -> i64 {
+    const ENETUNREACH: i64 = 101;
+    MIB.ip(Ip::OutNoRoutes);
+    -ENETUNREACH
+}
+
+/// Le paquet d'un envoi ne peut pas être fait (la place, la mémoire, la copie : le
+/// `error:` d'`__ip_append_data`) : l'erreur `e`, et un paquet jeté (OutDiscards).
+pub fn jete(e: i64) -> i64 {
+    MIB.ip(Ip::OutDiscards);
+    e
 }
 
 /// Le paquet `p` d'une socket de datagrammes compte dans son SO_SNDBUF

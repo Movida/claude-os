@@ -20,6 +20,7 @@ use super::datagramme::{self, Controle};
 use super::icmp::ErreurRecue;
 use super::ipv4;
 use super::paquet::Paquet;
+use super::snmp::MIB;
 use super::socket::{self, Admission, AF_INET, Datagramme, Inet, Socket};
 use crate::partage::Arc;
 use crate::verrou::Verrou;
@@ -39,7 +40,8 @@ const ENOBUFS: i64 = 105;
 /// La table des identifiants ; faite au démarrage.
 static IDENTS: Verrou<Option<Table<Arc<Socket>>>> = Verrou::new(None);
 
-/// Les réponses jetées : sans socket, ou la file pleine.
+/// Les réponses jetées : sans socket, ou la file pleine (pas des compteurs
+/// de /proc/net/snmp, chez Linux non plus : pas montrés).
 static SANS_SOCKET: AtomicU64 = AtomicU64::new(0);
 static FILE_PLEINE: AtomicU64 = AtomicU64::new(0);
 
@@ -138,12 +140,14 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     // SO_SNDBUF, comme UDP (`ping_v4_sendmsg` passe par `ip_append_data`).
     datagramme::attendre_place(s, drapeaux & MSG_DONTWAIT != 0, delai)?;
     datagramme::morceaux_permis(s, longueur, &envoi)?;
-    let Some(mut p) = Paquet::vide(longueur) else { return Err(-ENOBUFS) };
+    let Some(mut p) = Paquet::vide(longueur) else { return Err(datagramme::jete(-ENOBUFS)) };
     datagramme::attacher(s, &mut p);
-    let Some(m) = p.ajouter_fin(longueur) else { return Err(-ENOBUFS) };
-    remplir(icmp::ENTETE, &mut m[icmp::ENTETE..])?;
+    let Some(m) = p.ajouter_fin(longueur) else { return Err(datagramme::jete(-ENOBUFS)) };
+    remplir(icmp::ENTETE, &mut m[icmp::ENTETE..]).map_err(datagramme::jete)?;
     let numero = u16::from_be_bytes([entete[6], entete[7]]);
     icmp::ecrire(m, &Icmp { genre: icmp::ECHO, code: 0, reste: icmp::reste_echo(ident, numero) });
+    // Un message ICMP qui part (`icmp_out_count`, dans `__ip_make_skb`).
+    MIB.icmp_sortie(icmp::ECHO);
     ipv4::emettre(chemin, &envoi, p);
     Ok(longueur)
 }
@@ -161,7 +165,7 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], p: Paquet
     };
     let taille = p.taille_vraie();
     let d = Datagramme { regarde: false, paquet: p, source, port: 0, destination, interface, taille };
-    if !s.deposer(d, Admission::Ordinaire) {
+    if s.deposer(d, Admission::Ordinaire).is_err() {
         FILE_PLEINE.fetch_add(1, Ordering::Relaxed);
     }
 }

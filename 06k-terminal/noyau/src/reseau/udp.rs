@@ -11,18 +11,29 @@
 //!
 //! Ce qui manque, écrit : MSG_MORE et UDP_CORK ; la multidiffusion. (SO_SNDBUF fait attendre
 //! depuis les soldes d'avant 6k : datagramme::attendre_place.)
+//!
+//! LES COMPTEURS d'UDP (/proc/net/snmp, snmp.rs), aux places de Linux : à
+//! l'arrivée, un datagramme faux (InErrors, et InCsumErrors pour sa somme),
+//! sans socket (NoPorts), une diffusion que personne n'écoute
+//! (IgnoredMulti), une file pleine (RcvbufErrors) ou sans mémoire
+//! (MemErrors), ces deux-là avec InErrors ; à la lecture, un datagramme lu
+//! (InDatagrams, socket.rs) ; à l'envoi, un datagramme parti (OutDatagrams)
+//! ou qui manque de place (SndbufErrors).
 
 use super::datagramme::{self, Controle};
 use super::ipv4;
 use super::paquet::Paquet;
 use super::icmp::ErreurRecue;
-use super::socket::{self, Admission, AF_INET, AF_UNSPEC, Datagramme, ErreurEnFile, Inet, Socket};
+use super::snmp::MIB;
+use super::socket::{self, Admission, AF_INET, AF_UNSPEC, Datagramme, ErreurEnFile, Inet, Rejet, Socket};
 use crate::aleatoire;
+use crate::attente::GardeMutex;
 use crate::partage::Arc;
 use crate::verrou::Verrou;
-use core::sync::atomic::{AtomicU64, Ordering};
-use formats::reseau::{ipv4 as format_ipv4, udp};
+use core::sync::atomic::Ordering;
+use formats::reseau::{Erreur, ipv4 as format_ipv4, udp};
 use inet::ports::{Lien, Refus, Table};
+use inet::snmp::Udp as Compteur;
 
 const EINVAL: i64 = 22;
 const EDESTADDRREQ: i64 = 89;
@@ -34,12 +45,6 @@ const ENOBUFS: i64 = 105;
 
 /// La table des ports ; faite au démarrage.
 static PORTS: Verrou<Option<Table<Arc<Socket>>>> = Verrou::new(None);
-
-/// Les datagrammes jetés à l'arrivée (les `UdpInErrors`, `RcvbufErrors`,
-/// `NoPorts` de Linux, pas encore montrés).
-static FAUX: AtomicU64 = AtomicU64::new(0);
-static FILE_PLEINE: AtomicU64 = AtomicU64::new(0);
-static SANS_SOCKET: AtomicU64 = AtomicU64::new(0);
 
 pub fn initialiser() {
     *PORTS.verrouiller() = Table::new();
@@ -115,11 +120,14 @@ pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
 ///     ou l'attente) ; des morceaux au-delà de son double : ENOBUFS ;
 ///   - le paquet (ENOBUFS), la copie (EFAULT), et il part.
 ///
-/// Rend la longueur envoyée.
+/// Rend la longueur envoyée. Une erreur après la destination (le `out:`
+/// d'`udp_sendmsg`) compte un SndbufErrors si c'est ENOBUFS, ou si la socket
+/// a déjà manqué de place (`place_manquee`, SOCK_NOSPACE) : Linux n'a pas
+/// d'autre compteur pour dire « la place a manqué » (son commentaire), même
+/// au prix d'en compter trop.
 pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u64, controle: Result<Controle, i64>,
-               mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
+               remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_OOB: u64 = 1;
-    const MSG_DONTWAIT: u64 = 0x40;
     const MSG_MORE: u64 = 0x8000;
     let mut inet = s.appels.verrouiller();
     datagramme::lier_au_besoin(s, &mut inet)?;
@@ -143,6 +151,21 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
         None if inet.connecte => (inet.distante, inet.port_distant),
         None => return Err(-EDESTADDRREQ),
     };
+    let envoye = envoyer_vers(s, inet, adresse, port, longueur, drapeaux, controle, remplir);
+    if let Err(e) = envoye
+        && (e == -ENOBUFS || s.place_manquee.load(Ordering::Relaxed))
+    {
+        MIB.udp(Compteur::SndbufErrors);
+    }
+    envoye
+}
+
+/// La suite d'`envoyer`, vers `adresse`:`port`.
+#[allow(clippy::too_many_arguments)]
+fn envoyer_vers(s: &Arc<Socket>, mut inet: GardeMutex<'_, Inet>, adresse: [u8; 4], port: u16, longueur: usize, drapeaux: u64,
+                controle: Result<Controle, i64>, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>)
+                -> Result<usize, i64> {
+    const MSG_DONTWAIT: u64 = 0x40;
     let c = controle?;
     let (chemin, envoi) = datagramme::preparer(s, &mut inet, adresse, udp::ENTETE + longueur, format_ipv4::UDP, drapeaux, &c)?;
     let adresse = envoi.destination;
@@ -151,39 +174,90 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     drop(inet);
     datagramme::attendre_place(s, drapeaux & MSG_DONTWAIT != 0, delai)?;
     datagramme::morceaux_permis(s, udp::ENTETE + longueur, &envoi)?;
-    let Some(mut p) = Paquet::vide(udp::ENTETE + longueur) else { return Err(-ENOBUFS) };
+    let Some(mut p) = Paquet::vide(udp::ENTETE + longueur) else { return Err(datagramme::jete(-ENOBUFS)) };
     datagramme::attacher(s, &mut p);
-    let Some(segment) = p.ajouter_fin(udp::ENTETE + longueur) else { return Err(-ENOBUFS) };
-    remplir(0, &mut segment[udp::ENTETE..])?;
+    let Some(segment) = p.ajouter_fin(udp::ENTETE + longueur) else { return Err(datagramme::jete(-ENOBUFS)) };
+    remplir(0, &mut segment[udp::ENTETE..]).map_err(datagramme::jete)?;
     udp::ecrire(segment, &u, envoi.source, adresse);
     ipv4::emettre(chemin, &envoi, p);
+    MIB.udp(Compteur::OutDatagrams);
     Ok(longueur)
 }
 
 /// Un datagramme UDP (`p` : le segment, en-tête compris, sans l'en-tête
 /// d'IPv4) reçu par l'interface `interface`, pour `destination`, de
 /// `source`, dans la tâche du réseau : `__udp4_lib_rcv`, la somme
-/// vérifiée (fausse : jeté, sans rien dire), puis la socket qui le reçoit ;
+/// vérifiée (fausse : jeté, sans rien dire, compté), puis la socket qui le reçoit ;
 /// une diffusion à chacune de celles du port. Sans socket, le segment est
 /// rendu, son en-tête remis, pour l'erreur ICMP « port injoignable » (que
 /// l'appelant envoie : il a l'en-tête d'IPv4).
 pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion: bool, mut p: Paquet) -> Result<(), Paquet> {
-    let Ok((u, charge)) = udp::lire(p.donnees(), source, destination) else {
-        FAUX.fetch_add(1, Ordering::Relaxed);
-        return Ok(());
+    // Choix de conception : la somme vérifiée à l'arrivée, pour tout datagramme.
+    // Linux ne la vérifie, pour un datagramme qui a une socket, qu'à sa lecture
+    // (`udp_recvmsg`, `csum_copy_err`) : elle se calcule alors pendant la copie
+    // vers le programme, une seule passe sur les données. Notre copie vers le
+    // programme (`copier`, qui peut fauter et dormir) ne calcule rien : la somme
+    // coûte une passe de plus à l'arrivée comme à la lecture. À l'arrivée, un
+    // datagramme faux ne prend pas la place de la file, et `poll` ne l'annonce
+    // pas : chez Linux, il dit « lisible », puis `recv` le jette et attend (le
+    // piège connu de select avec une socket bloquante). Les compteurs sont les
+    // mêmes, comptés plus tôt (et même si personne ne lit) : pour un datagramme
+    // pour nous seuls, ou de 76 octets au plus (CHECKSUM_BREAK : Linux le
+    // vérifie tout de suite, `udp4_csum_init`), InCsumErrors et InErrors ;
+    // une diffusion plus longue, Linux la donne sans la vérifier à chaque
+    // socket qui la prend (`__udp4_lib_mcast_deliver`), et chacune la jette à
+    // sa lecture : autant de fois InCsumErrors et InErrors ; à aucune :
+    // IgnoredMulti, comme une diffusion juste que personne n'écoute.
+    let (u, charge) = match udp::lire(p.donnees(), source, destination) {
+        Ok(x) => x,
+        // (La longueur d'UDP : `udp::lire` l'a vérifiée avant la somme.)
+        Err(Erreur::Somme) if diffusion && u16::from_be_bytes([p.donnees()[4], p.donnees()[5]]) > 76 => {
+            let o = p.donnees();
+            let ports = (u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]]));
+            let mut sockets = 0;
+            if let Some(t) = PORTS.verrouiller().as_ref() {
+                t.pour_chaque_diffusion(source, ports.0, destination, ports.1, |_| sockets += 1);
+            }
+            if sockets == 0 {
+                MIB.udp(Compteur::IgnoredMulti);
+            }
+            for _ in 0..sockets {
+                MIB.udp(Compteur::InCsumErrors);
+                MIB.udp(Compteur::InErrors);
+            }
+            return Ok(());
+        }
+        Err(e) => {
+            if e == Erreur::Somme {
+                MIB.udp(Compteur::InCsumErrors);
+            }
+            MIB.udp(Compteur::InErrors);
+            return Ok(());
+        }
     };
     let longueur = charge.len();
     let _ = p.retirer_entete(udp::ENTETE);
     p.couper(longueur);
     if diffusion {
         // Une copie pour chacune, déposée sous le verrou de la table (son
-        // ordre permet de prendre ensuite celui de la file d'une socket).
+        // ordre permet de prendre ensuite celui de la file d'une socket) ;
+        // une copie ratée (le `skb_clone` d'`__udp4_lib_mcast_deliver`) est
+        // comptée comme une file pleine. Aucune socket : IgnoredMulti.
+        let mut sockets = 0;
         if let Some(t) = PORTS.verrouiller().as_ref() {
             t.pour_chaque_diffusion(source, u.source, destination, u.destination, |s| {
-                if let Some(copie) = Paquet::copie(p.donnees()) {
-                    deposer(s, copie, source, u.source, destination, interface);
+                sockets += 1;
+                match Paquet::copie(p.donnees()) {
+                    Some(copie) => deposer(s, copie, source, u.source, destination, interface),
+                    None => {
+                        MIB.udp(Compteur::RcvbufErrors);
+                        MIB.udp(Compteur::InErrors);
+                    }
                 }
             });
+        }
+        if sockets == 0 {
+            MIB.udp(Compteur::IgnoredMulti);
         }
         return Ok(());
     }
@@ -194,7 +268,7 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion
             Ok(())
         }
         None => {
-            SANS_SOCKET.fetch_add(1, Ordering::Relaxed);
+            MIB.udp(Compteur::NoPorts);
             let _ = p.ajouter_entete(udp::ENTETE);
             Err(p)
         }
@@ -204,8 +278,10 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion
 fn deposer(s: &Socket, p: Paquet, source: [u8; 4], port: u16, destination: [u8; 4], interface: u32) {
     let taille = p.taille_vraie();
     let d = Datagramme { regarde: false, paquet: p, source, port, destination, interface, taille };
-    if !s.deposer(d, Admission::Udp) {
-        FILE_PLEINE.fetch_add(1, Ordering::Relaxed);
+    // `__udp_queue_rcv_skb`.
+    if let Err(r) = s.deposer(d, Admission::Udp) {
+        MIB.udp(if r == Rejet::Pleine { Compteur::RcvbufErrors } else { Compteur::MemErrors });
+        MIB.udp(Compteur::InErrors);
     }
 }
 
@@ -249,12 +325,13 @@ pub fn convertir(genre: u8, code: u8, pmtudisc: bool) -> Option<(i32, bool)> {
 /// datagramme reçu, les deux bouts inversés) ; sans IP_RECVERR, seule une
 /// socket connectée voit une erreur fatale (`sk_err`, le prochain appel la
 /// rend) ; avec, toute erreur va aussi dans sa file d'erreurs, avec ce que
-/// le message portait de la charge d'origine.
+/// le message portait de la charge d'origine. Sans socket, l'erreur est
+/// refusée (ICMP InErrors, comme chez Linux).
 pub fn erreur(e: &ErreurRecue) {
     let Some((port_source, port_destination)) = formats::reseau::icmp::ports(e.origine, &e.interne) else { return };
     let i = &e.interne;
     let Some(s) = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source)) else {
-        return;
+        return MIB.icmp(inet::snmp::Icmp::InErrors);
     };
     apprendre_si_mtu(e);
     let Some((errno, fatale)) = convertir(e.genre, e.code, fragmentation_dite(&s)) else { return };

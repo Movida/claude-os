@@ -7,6 +7,8 @@
 //!   - `dev` : les compteurs de chaque interface (le `dev_seq_show` de
 //!     net-procfs.c) ;
 //!   - `arp` : la table des voisins (le `arp_seq_show` d'arp.c) ;
+//!   - `snmp` : les compteurs d'IP, d'ICMP, de TCP et d'UDP (le
+//!     `snmp_seq_show` de proc.c ; les soldes d'avant 6k), en une fois ;
 //!   - `tcp` : les sockets TCP (le `tcp4_seq_show` de tcp_ipv4.c, 6h) ;
 //!   - `unix` : les sockets AF_UNIX (le `unix_seq_show` d'af_unix.c, 6h).
 //! Et /proc/sys/net (`REGLAGES`).
@@ -28,6 +30,7 @@ pub enum Fichier {
     Route,
     Dev,
     Arp,
+    Snmp,
     Tcp,
     Unix,
 }
@@ -56,6 +59,7 @@ pub fn ligne(f: Fichier, n: u64) -> Result<Option<Vec<u8>>, ()> {
         Fichier::Route => route(&mut t, n),
         Fichier::Dev => dev(&mut t, n),
         Fichier::Arp => super::arp::ligne_proc(n, &mut t),
+        Fichier::Snmp => snmp(&mut t, n),
         Fichier::Tcp => super::tcp::ligne_proc(n, &mut t),
         Fichier::Unix => super::unix::ligne_proc(n, &mut t),
     };
@@ -110,6 +114,15 @@ enum Ligne {
     Domaine,
     Dns([u8; 4]),
     Serveur([u8; 4]),
+}
+
+/// /proc/net/snmp : un seul enregistrement, tout le texte (`single_open`).
+fn snmp(t: &mut Texte, n: u64) -> Result<bool, fmt::Error> {
+    if n > 0 {
+        return Ok(false);
+    }
+    super::snmp::MIB.ecrire(super::ipv4::TTL_DEFAUT, t)?;
+    Ok(true)
 }
 
 /// Complète la ligne à 127 colonnes, puis le saut de ligne (le
@@ -208,7 +221,7 @@ pub const REGLAGES: [Reglage; 58] = [
     entier(Core, b"somaxconn", super::tcp::SOMAXCONN as i64),
     entier(Core, b"wmem_default", super::socket::TAMPON_DEFAUT as i64),
     entier(Core, b"wmem_max", super::socket::TAMPON_MAX as i64),
-    entier(Ipv4, b"ip_default_ttl", 64),
+    entier(Ipv4, b"ip_default_ttl", super::ipv4::TTL_DEFAUT as i64),
     calcule(b"ip_local_port_range", Valeur::Ports),
     entier(Ipv4, b"ip_no_pmtu_disc", 0),
     entier(Ipv4, b"ipfrag_high_thresh", inet::fragments::MEMOIRE_MAX as i64),

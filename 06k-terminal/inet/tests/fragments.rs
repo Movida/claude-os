@@ -2,6 +2,7 @@
 //! dans l'ordre, dans le désordre, en double, à cheval, faux, qui n'arrivent pas.
 
 use inet::fragments::{Cle, DELAI, Echue, Issue, MEMOIRE_MAX, Morceau, Reassemblage};
+use inet::snmp::{Ip, Mib};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Octets(Vec<u8>);
@@ -25,8 +26,12 @@ fn morceau(debut: u32, n: u32) -> Octets {
     Octets((debut..debut + n).map(|i| i as u8).collect())
 }
 
+/// Les compteurs des tables des essais (les essais tournent en même temps : seul
+/// `les_compteurs`, qui a les siens, en lit).
+static MIB: Mib = Mib::new();
+
 fn table() -> Reassemblage<Octets> {
-    Reassemblage::new().unwrap()
+    Reassemblage::new(&MIB).unwrap()
 }
 
 fn donner(r: &mut Reassemblage<Octets>, debut: u32, n: u32, suite: bool) -> Issue<Octets> {
@@ -279,4 +284,26 @@ fn la_memoire_tout_juste() {
     assert_eq!(r.memoire(), MEMOIRE_MAX);
     assert_eq!(r.recevoir(cle, decalage, true, 0, 20, morceau(0, 8), 1, 0), Issue::EnCours);
     assert_eq!(r.recevoir(cle, decalage + 8, true, 0, 20, morceau(0, 8), 1, 0), Issue::Jete);
+}
+
+/// Les compteurs de /proc/net/snmp (`ip_defrag`, `ip_frag_queue`, `ip_expire`) : chaque
+/// morceau est une demande ; un double n'est pas un échec, un chevauchement l'est (une
+/// fois, pour la file et lui), l'expiration aussi, avec ReasmTimeout ; un paquet fini
+/// n'est pas encore un succès (ReasmOKs : quand l'appelant l'a recollé).
+#[test]
+fn les_compteurs() {
+    static COMPTEURS: Mib = Mib::new();
+    let mut r = Reassemblage::new(&COMPTEURS).unwrap();
+    let v = |c| COMPTEURS.valeur_ip(c);
+    assert_eq!(donner(&mut r, 0, 16, true), Issue::EnCours);
+    assert_eq!(donner(&mut r, 0, 16, true), Issue::Jete);
+    assert_eq!((v(Ip::ReasmReqds), v(Ip::ReasmFails)), (2, 0));
+    assert_eq!(donner(&mut r, 8, 16, true), Issue::Jete);
+    assert_eq!((v(Ip::ReasmReqds), v(Ip::ReasmFails)), (3, 1));
+    assert_eq!(donner(&mut r, 0, 16, true), Issue::EnCours);
+    assert!(matches!(donner(&mut r, 16, 8, false), Issue::Complet { .. }));
+    assert_eq!((v(Ip::ReasmReqds), v(Ip::ReasmFails), v(Ip::ReasmOKs)), (5, 1, 0));
+    assert_eq!(donner(&mut r, 0, 8, true), Issue::EnCours);
+    assert!(r.prendre_echue(DELAI).is_some());
+    assert_eq!((v(Ip::ReasmReqds), v(Ip::ReasmFails), v(Ip::ReasmTimeout)), (6, 2, 1));
 }

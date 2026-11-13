@@ -72,8 +72,8 @@
 [noyau] Archive de programmes : … octets a ….
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
-[noyau] Archive deballee : dossiers 12, fichiers 67, liens symboliques 6, liens physiques 4 ; archive rendue (… Kio).
-[noyau] Lancement : /etc/demarrage, 104 commandes.
+[noyau] Archive deballee : dossiers 12, fichiers 68, liens symboliques 6, liens physiques 4 ; archive rendue (… Kio).
+[noyau] Lancement : /etc/demarrage, 105 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -258,6 +258,8 @@
 [noyau] reseau : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] dns : toutes les verifications : ok
 [noyau] dns : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] snmp : toutes les verifications : ok
+[noyau] snmp : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] aleatoire : toutes les verifications : ok
 [noyau] aleatoire : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] tcp : toutes les verifications : ok

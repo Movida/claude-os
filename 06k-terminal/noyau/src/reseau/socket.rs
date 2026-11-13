@@ -37,6 +37,7 @@
 //! tient la socket (le `fdget` de 6e) jusqu'à ce qu'un datagramme arrive.
 
 use super::paquet::Paquet;
+use super::snmp::MIB;
 use crate::appels_fichiers::FichierTenu;
 use crate::attente::{self, FileAttente, Mutex, Sommeil};
 use crate::descripteurs::{FichierOuvert, Prive};
@@ -47,6 +48,7 @@ use crate::verrou::Verrou;
 use crate::faillible::{self, FileFaillible};
 use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use inet::snmp::Udp;
 
 /// POLLRDHUP : l'autre côté a fermé (ou la lecture est arrêtée).
 pub const POLLRDHUP: u32 = 0x2000;
@@ -150,6 +152,17 @@ pub enum Admission {
     /// Celle des autres (`__sock_queue_rcv_skb`) : accepté tant que la file
     /// n'a pas atteint SO_RCVBUF, quelle que soit sa taille.
     Ordinaire,
+}
+
+/// Pourquoi un datagramme n'entre pas en file (les RcvbufErrors et
+/// MemErrors d'UDP : `__udp_queue_rcv_skb`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Rejet {
+    /// SO_RCVBUF est plein (l'ENOMEM d'`__udp_enqueue_schedule_skb`).
+    Pleine,
+    /// Plus de mémoire pour la file (la mémoire du protocole qui manque, son
+    /// ENOBUFS).
+    Memoire,
 }
 
 // D'où vient une erreur de la file d'erreurs (SO_EE_ORIGIN_*).
@@ -304,6 +317,12 @@ pub struct Socket {
     pub connectee: AtomicBool,
     pub recverr: AtomicBool,
     pub pmtudisc: AtomicU8,
+    /// Un envoi a manqué de place dans SO_SNDBUF (le bit SOCK_NOSPACE de
+    /// Linux, tel que le voit une socket de datagrammes : posé par
+    /// `sock_alloc_send_pskb`, jamais effacé, `sock_def_write_space` ne le
+    /// touche pas) : toute erreur d'un envoi UDP compte alors un
+    /// SndbufErrors (udp.rs).
+    pub place_manquee: AtomicBool,
     /// Ceux qui veulent un signal (O_ASYNC) et le propriétaire de son fichier ; pour TCP, ils sont
     /// avec sa possession : voir `liste_async`.
     pub asynchrone: crate::asynchrone::ListeAsync,
@@ -352,6 +371,7 @@ impl Socket {
             sndbuf: AtomicU32::new(TAMPON_DEFAUT),
             connectee: AtomicBool::new(false),
             recverr: AtomicBool::new(false),
+            place_manquee: AtomicBool::new(false),
             pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
             asynchrone: crate::asynchrone::ListeAsync::new(),
             inode: AtomicU32::new(0),
@@ -425,8 +445,9 @@ impl Socket {
 
     /// Dépose un datagramme reçu (dans la tâche du réseau), si la règle
     /// `admission` le permet ; puis ceux qui attendent sont réveillés (le
-    /// `sock_def_readable`). false : jeté.
-    pub fn deposer(&self, d: Datagramme, admission: Admission) -> bool {
+    /// `sock_def_readable`). Err : jeté, la file pleine (SO_RCVBUF), ou
+    /// plus de mémoire pour elle.
+    pub fn deposer(&self, d: Datagramme, admission: Admission) -> Result<(), Rejet> {
         let rcvbuf = self.rcvbuf.load(Ordering::Relaxed) as usize;
         {
             let mut r = self.reception.verrouiller();
@@ -435,17 +456,17 @@ impl Socket {
                 Admission::Ordinaire => r.octets >= rcvbuf,
             };
             if refuse {
-                return false;
+                return Err(Rejet::Pleine);
             }
             let taille = d.taille;
             if r.file.ajouter_derriere(d).is_err() {
-                return false;
+                return Err(Rejet::Memoire);
             }
             r.octets += taille;
         }
         self.attente.reveiller(POLLIN | POLLRDNORM, 1);
         self.asynchrone.lecture(crate::asynchrone::Raison::Entree);
-        true
+        Ok(())
     }
 
     /// Pose l'erreur `errno` (`sk_err`) et réveille (le `sk_error_report`).
@@ -675,7 +696,13 @@ pub fn prendre(s: &Socket, place: usize, drapeaux: u64, non_bloquant: bool, mut 
                     let d = r.file.pop_front().expect("le premier datagramme");
                     r.octets = r.octets.saturating_sub(d.taille);
                     drop(r);
-                    copier(d.paquet.donnees())?
+                    let copie = copier(d.paquet.donnees());
+                    // `udp_recvmsg` : un datagramme retiré est lu (InDatagrams), ou perdu
+                    // dans une copie qui faute (InErrors) ; MSG_PEEK ne compte rien.
+                    if s.protocole == Protocole::Udp {
+                        MIB.udp(if copie.is_ok() { Udp::InDatagrams } else { Udp::InErrors });
+                    }
+                    copie?
                 };
                 // `udp_recvmsg` : plus de place qu'il n'en reste à copier : rien de coupé, même si
                 // le décalage en a passé ; sinon, moins de place que le datagramme : coupé.

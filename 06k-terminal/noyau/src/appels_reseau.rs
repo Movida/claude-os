@@ -1765,7 +1765,7 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         _ => return Err(-ENOPROTOOPT),
     }
     // TCP émet ses segments sans le Mutex : ses copies d'IP_TTL et d'IP_TOS.
-    let (ttl, tos, pmtudisc) = (op.ttl.unwrap_or(64), op.tos, op.pmtudisc);
+    let (ttl, tos, pmtudisc) = (op.ttl.unwrap_or(crate::reseau::ipv4::TTL_DEFAUT), op.tos, op.pmtudisc);
     drop(inet);
     if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER) {
         tcp::avec_options(s, |o, _| {
@@ -1914,7 +1914,7 @@ fn lire_option_ip(s: &Socket, option: i32) -> Result<i32, i64> {
         IP_PKTINFO => op.pktinfo as i32,
         IP_RECVERR => op.recverr as i32,
         IP_TOS => op.tos as i32,
-        IP_TTL => op.ttl.unwrap_or(64) as i32,
+        IP_TTL => op.ttl.unwrap_or(crate::reseau::ipv4::TTL_DEFAUT) as i32,
         IP_MTU_DISCOVER => op.pmtudisc as i32,
         _ => return Err(-ENOPROTOOPT),
     })

@@ -414,7 +414,7 @@ impl OptionsTcp {
     pub const DEFAUT: OptionsTcp = OptionsTcp {
         nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
-        rcvbuf_fixe: false, rcvlowat: 1, ttl: 64, tos: 0, pmtudisc: 1, window_clamp: 0, controle: itcp::Controle::DEFAUT,
+        rcvbuf_fixe: false, rcvlowat: 1, ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 1, window_clamp: 0, controle: itcp::Controle::DEFAUT,
     };
 
     /// Ce que la connexion en retient (TCP_USER_TIMEOUT est en ms, les
@@ -876,7 +876,7 @@ struct Ip {
 impl Ip {
     /// Celui d'un segment sans socket (un RST, l'ACK d'une entrée de
     /// TIME_WAIT) : le TTL du système, 64.
-    const SYSTEME: Ip = Ip { ttl: 64, tos: 0, pmtudisc: 2 };
+    const SYSTEME: Ip = Ip { ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 2 };
 
     fn de(o: &OptionsTcp) -> Ip {
         Ip { ttl: o.ttl, tos: o.tos, pmtudisc: o.pmtudisc }

@@ -2,13 +2,16 @@
 //! erreur à qui a envoyé un paquet qu'on ne peut pas livrer, et rendre aux
 //! sockets les erreurs que le réseau nous dit.
 //!
-//! LA RÉCEPTION, dans l'ordre d'`icmp_rcv` : la somme, l'en-tête ; rien
-//! de ce qui arrive en diffusion (Linux n'y accepte que l'écho et
-//! l'horodatage, qu'il ignore par défaut, `icmp_echo_ignore_broadcasts` :
-//! sinon une seule trame ferait répondre tout un réseau, l'attaque
-//! « smurf »). Puis selon le genre : l'écho reçoit sa réponse ;
+//! LA RÉCEPTION, dans l'ordre d'`icmp_rcv` : la somme, l'en-tête ; l'écho
+//! étendu (PROBE) ignoré, comme Linux par défaut
+//! (`icmp_echo_enable_probe` à 0) ; rien de ce qui arrive en diffusion
+//! (Linux n'y accepte que l'écho et l'horodatage, qu'il ignore par défaut,
+//! `icmp_echo_ignore_broadcasts` : sinon une seule trame ferait répondre
+//! tout un réseau, l'attaque « smurf » ; et les demandes de masque, qu'il
+//! ignore ensuite). Puis selon le genre : la réponse à l'écho, étendu ou
+//! non, va à la socket de ping de son identifiant (ping.rs) ; un genre
+//! inconnu est jeté ; l'écho reçoit sa réponse ;
 //! l'horodatage aussi (les millisecondes depuis minuit, temps universel) ;
-//! la réponse à l'écho va à la socket de ping de son identifiant (ping.rs) ;
 //! une erreur (injoignable, étouffement, redirection, temps dépassé,
 //! problème de paramètre) va au protocole du paquet d'origine qu'elle
 //! porte (UDP, ou ICMP pour un écho : ping.rs), qui retrouve la socket qui
@@ -34,15 +37,26 @@
 //! comme toute émission de la socket ICMP de Linux (IP_PMTUDISC_DONT).
 //! Linux les fait passer par les mêmes limites (`icmp_reply`), mais leurs
 //! genres ne sont pas dans `icmp_ratemask` : aucune ne s'y applique.
+//!
+//! LES COMPTEURS (/proc/net/snmp, snmp.rs) : chaque message reçu (InMsgs),
+//! puis son genre (IcmpMsg) une fois l'en-tête lu ; une somme fausse
+//! (InCsumErrors), et tout message refusé (InErrors : trop court, en
+//! diffusion, d'un genre inconnu, une erreur qui ne cite pas un en-tête
+//! lisible, un horodatage trop court) ; chaque message envoyé, par son
+//! genre (OutMsgs et IcmpMsg, quand son paquet est fait : `icmp_out_count`),
+//! ou qu'on n'a pas pu faire (OutErrors) ; les erreurs que retient une
+//! limite (OutRateLimitGlobal, OutRateLimitHost).
 
 use super::interface::Interface;
 use super::ipv4::{self, Envoi};
 use super::paquet::Paquet;
+use super::snmp::MIB;
 use crate::verrou::Verrou;
-use core::sync::atomic::{AtomicU64, Ordering};
+use formats::reseau::Erreur;
 use formats::reseau::icmp::{self, Icmp, Interne};
 use formats::reseau::ipv4 as format_ipv4;
 use inet::pairs::Pairs;
+use inet::snmp::{Icmp as Compteur, Ip};
 
 /// Le crédit de la limite globale (`icmp_global_credit`) et l'instant où
 /// il a été rempli (`icmp_global_stamp`, en millisecondes : notre tic).
@@ -60,13 +74,6 @@ static PAIRS: Verrou<Pairs> = Verrou::new(Pairs::new());
 /// `icmp_msgs_per_sec` et `icmp_msgs_burst`.
 const PAR_SECONDE: u64 = 1000;
 const RAFALE: i32 = 50;
-
-/// Les messages jetés : somme fausse ou tronqués ; refusés par la limite
-/// globale (`ICMP_MIB_RATELIMITGLOBAL`), par celle d'une machine
-/// (`ICMP_MIB_RATELIMITHOST`).
-static FAUX: AtomicU64 = AtomicU64::new(0);
-static LIMITES_GLOBALES: AtomicU64 = AtomicU64::new(0);
-static LIMITES_PAR_MACHINE: AtomicU64 = AtomicU64::new(0);
 
 fn ms() -> u64 {
     crate::temps::ns_monotone() / 1_000_000
@@ -121,18 +128,34 @@ pub fn horodatage() -> u32 {
 /// dont voici les champs `h`), dans la tâche du réseau. `diffusion` : sa
 /// destination est une diffusion.
 pub fn recevoir(i: &'static Interface, h: &format_ipv4::Ipv4, diffusion: bool, p: Paquet) {
-    let Ok((m, donnees)) = icmp::lire(p.donnees()) else {
-        FAUX.fetch_add(1, Ordering::Relaxed);
-        return;
+    MIB.icmp(Compteur::InMsgs);
+    let (m, donnees) = match icmp::lire(p.donnees()) {
+        Ok(x) => x,
+        Err(e) => {
+            if e == Erreur::Somme {
+                MIB.icmp(Compteur::InCsumErrors);
+            }
+            return refuse();
+        }
     };
-    if m.genre > icmp::GENRE_MAX {
+    MIB.icmp_entree(m.genre);
+    if m.genre == icmp::ECHO_ETENDU {
         return;
     }
     // En diffusion, Linux n'accepte que l'écho, l'horodatage et les
-    // demandes de masque (qu'il ignore ensuite) ; et il ignore les deux
-    // premiers (`icmp_echo_ignore_broadcasts`) : rien ne passe.
+    // demandes de masque ; et il ignore les deux premiers
+    // (`icmp_echo_ignore_broadcasts`), qui sont refusés : rien ne passe.
     if diffusion {
+        if !matches!(m.genre, icmp::ADRESSE | icmp::ADRESSE_REPONSE) {
+            refuse();
+        }
         return;
+    }
+    if matches!(m.genre, icmp::ECHO_REPONSE | icmp::ECHO_ETENDU_REPONSE) {
+        return super::ping::recevoir(i.index, h.source, h.destination, p);
+    }
+    if m.genre > icmp::GENRE_MAX {
+        return refuse();
     }
     match m.genre {
         icmp::ECHO => {
@@ -142,12 +165,11 @@ pub fn recevoir(i: &'static Interface, h: &format_ipv4::Ipv4, diffusion: bool, p
         icmp::HORODATAGE => {
             // L'heure d'origine (copiée de la demande), de réception et
             // d'émission ; une demande de moins de 4 octets est jetée.
-            let Some(origine) = donnees.get(..4) else { return };
+            let Some(origine) = donnees.get(..4) else { return refuse() };
             let t = horodatage().to_be_bytes();
             let reponse = Icmp { genre: icmp::HORODATAGE_REPONSE, code: 0, ..m };
             repondre(h, &reponse, &[origine, &t, &t]);
         }
-        icmp::ECHO_REPONSE => super::ping::recevoir(i.index, h.source, h.destination, p),
         icmp::INJOIGNABLE | icmp::ETOUFFEMENT | icmp::REDIRECTION | icmp::TEMPS_DEPASSE | icmp::PARAMETRE => {
             erreur_recue(i, h, &m, donnees)
         }
@@ -173,12 +195,21 @@ pub struct ErreurRecue<'a> {
     pub interface: u32,
 }
 
-/// Une erreur reçue (`icmp_unreach`) : le paquet d'origine lisible (un
-/// en-tête d'au moins 5 mots, puis 8 octets) ; un code d'injoignable connu
-/// (au plus 15) ; un « temps dépassé » du réassemblage ignoré ; puis le
-/// protocole d'origine.
+/// Un message reçu refusé (InErrors).
+fn refuse() {
+    MIB.icmp(Compteur::InErrors);
+}
+
+/// Une erreur reçue (`icmp_unreach`, `icmp_redirect`) : un en-tête d'origine
+/// (20 octets, et au moins 5 mots, sauf pour une redirection, que Linux ne
+/// regarde pas) ; un code d'injoignable connu (au plus 15) ; un « temps
+/// dépassé » du réassemblage ignoré ; le paquet d'origine lisible (son
+/// en-tête, puis 8 octets : `icmp_socket_deliver`) ; puis son protocole.
 fn erreur_recue(i: &'static Interface, h: &format_ipv4::Ipv4, m: &Icmp, donnees: &[u8]) {
-    let Some(interne) = icmp::interne(donnees) else { return };
+    let entete = donnees.first().map_or(0, |o| (o & 0x0F) as usize * 4);
+    if donnees.len() < format_ipv4::ENTETE || (m.genre != icmp::REDIRECTION && entete < format_ipv4::ENTETE) {
+        return refuse();
+    }
     let info = match m.genre {
         icmp::INJOIGNABLE if m.code > icmp::INJOIGNABLE_MAX => return,
         icmp::INJOIGNABLE if m.code == icmp::FRAGMENTATION => u16::from_be_bytes([m.reste[2], m.reste[3]]) as u32,
@@ -186,6 +217,17 @@ fn erreur_recue(i: &'static Interface, h: &format_ipv4::Ipv4, m: &Icmp, donnees:
         icmp::REDIRECTION => u32::from_be_bytes(m.reste),
         icmp::TEMPS_DEPASSE if m.code == 1 => return,
         _ => 0,
+    };
+    let Some(interne) = icmp::interne(donnees) else {
+        // Moins que l'en-tête cité et 8 octets : refusée. Une redirection qui
+        // cite un en-tête de moins de 5 mots, Linux la passe au protocole cité,
+        // qui lit ses « ports » dans l'en-tête lui-même et n'y trouve aucune
+        // socket : UDP et TCP le comptent (`__udp4_lib_err`, `tcp_v4_err` :
+        // InErrors), ping et les autres non.
+        if donnees.len() < entete + 8 || matches!(donnees.get(9), Some(&format_ipv4::UDP | &format_ipv4::TCP)) {
+            refuse();
+        }
+        return;
     };
     let e = ErreurRecue {
         genre: m.genre, code: m.code, info, interne, origine: donnees, emetteur: h.source, destination: h.destination,
@@ -205,8 +247,8 @@ fn erreur_recue(i: &'static Interface, h: &format_ipv4::Ipv4, m: &Icmp, donnees:
 fn repondre(h: &format_ipv4::Ipv4, reponse: &Icmp, morceaux: &[&[u8]]) {
     let longueur: usize = morceaux.iter().map(|m| m.len()).sum();
     let Ok((chemin, destination)) = ipv4::router(h.source, None) else { return };
-    let Some(mut p) = Paquet::vide(icmp::ENTETE + longueur) else { return };
-    let Some(o) = p.ajouter_fin(icmp::ENTETE + longueur) else { return };
+    let Some(mut p) = Paquet::vide(icmp::ENTETE + longueur) else { return pas_de_paquet() };
+    let Some(o) = p.ajouter_fin(icmp::ENTETE + longueur) else { return pas_de_paquet() };
     let mut k = icmp::ENTETE;
     for m in morceaux {
         o[k..k + m.len()].copy_from_slice(m);
@@ -214,10 +256,18 @@ fn repondre(h: &format_ipv4::Ipv4, reponse: &Icmp, morceaux: &[&[u8]]) {
     }
     icmp::ecrire(o, reponse);
     let envoi = Envoi {
-        source: h.destination, destination, protocole: format_ipv4::ICMP, ttl: 64, tos: h.tos,
+        source: h.destination, destination, protocole: format_ipv4::ICMP, ttl: ipv4::TTL_DEFAUT, tos: h.tos,
         identifiant: ipv4::identifiant(destination, h.destination, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu_vers(&chemin, destination), confirmer: false,
     };
+    MIB.icmp_sortie(reponse.genre);
     ipv4::emettre(chemin, &envoi, p);
+}
+
+/// Un message qu'on ne peut pas faire, faute de mémoire (`icmp_push_reply` :
+/// OutErrors ; et OutDiscards d'IP, `__ip_append_data`).
+fn pas_de_paquet() {
+    MIB.icmp(Compteur::OutErrors);
+    MIB.ip(Ip::OutDiscards);
 }
 
 /// Envoie une erreur ICMP (`genre`, `code`, `info` : ses 4 octets) pour le
@@ -248,7 +298,7 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
     // s'appliquera aussi (l'`apply_ratelimit` de Linux).
     let limiter = !par_lo && limitee(genre, code);
     if limiter && !permis() {
-        LIMITES_GLOBALES.fetch_add(1, Ordering::Relaxed);
+        MIB.icmp(Compteur::OutRateLimitGlobal);
         return;
     }
     let Ok((chemin, destination)) = ipv4::router(h.source, None) else { return };
@@ -256,7 +306,7 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
     // qui part par lo ; permis, le message consomme le crédit global.
     if limiter {
         if !ipv4::par_lo(&chemin) && !PAIRS.verrouiller().permettre(destination, crate::temps::ns_monotone()) {
-            LIMITES_PAR_MACHINE.fetch_add(1, Ordering::Relaxed);
+            MIB.icmp(Compteur::OutRateLimitHost);
             return;
         }
         consommer();
@@ -269,15 +319,16 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
         return;
     }
     let n = origine.len().min(place);
-    let Some(mut p) = Paquet::vide(icmp::ENTETE + n) else { return };
-    let Some(o) = p.ajouter_fin(icmp::ENTETE + n) else { return };
+    let Some(mut p) = Paquet::vide(icmp::ENTETE + n) else { return pas_de_paquet() };
+    let Some(o) = p.ajouter_fin(icmp::ENTETE + n) else { return pas_de_paquet() };
     o[icmp::ENTETE..].copy_from_slice(&origine[..n]);
     icmp::ecrire(o, &Icmp { genre, code, reste: info.to_be_bytes() });
     // Le TOS d'origine (ses bits de type de service) et la priorité de
     // « contrôle de l'Internet » (`IPTOS_PREC_INTERNETCONTROL`).
     let envoi = Envoi {
-        source, destination, protocole: format_ipv4::ICMP, ttl: 64, tos: (h.tos & 0x1E) | 0xC0,
+        source, destination, protocole: format_ipv4::ICMP, ttl: ipv4::TTL_DEFAUT, tos: (h.tos & 0x1E) | 0xC0,
         identifiant: ipv4::identifiant(destination, source, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu_vers(&chemin, destination), confirmer: false,
     };
+    MIB.icmp_sortie(genre);
     ipv4::emettre(chemin, &envoi, p);
 }

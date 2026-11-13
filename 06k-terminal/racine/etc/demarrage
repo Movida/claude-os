@@ -158,6 +158,8 @@ wait
 # serveur du programme.
 /bin/reseau
 /bin/dns
+# Les compteurs de /proc/net/snmp (les soldes d'avant 6k), sur lo.
+/bin/snmp
 # Le générateur aléatoire (6h) : getrandom, /dev/random, /proc/sys/kernel/random.
 /bin/aleatoire
 # Les sockets TCP (6h), sur lo.

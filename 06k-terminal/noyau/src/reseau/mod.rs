@@ -11,7 +11,8 @@
 //! qu'ont en commun celles de datagrammes : datagramme.rs, et leurs appels
 //! système : ../appels_reseau.rs) ; l'interface de boucle,
 //! `lo` (boucle.rs) ; la configuration au démarrage par DHCP (dhcp.rs) ;
-//! ce qu'en montre /proc/net (proc.rs). Les règles (les routes, le client
+//! ce qu'en montre /proc/net (proc.rs), dont les compteurs de
+//! /proc/net/snmp (snmp.rs). Les règles (les routes, le client
 //! DHCP, les voisins, les ports) sont dans la bibliothèque inet, testée
 //! sur l'hôte ; les en-têtes, dans formats::reseau.
 
@@ -28,6 +29,7 @@ pub mod ipv4;
 pub mod paquet;
 pub mod ping;
 pub mod proc;
+pub mod snmp;
 pub mod socket;
 pub mod tache;
 pub mod tcp;

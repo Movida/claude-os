@@ -27,6 +27,10 @@ pub const ADRESSE: u8 = 17;
 pub const ADRESSE_REPONSE: u8 = 18;
 /// Le plus grand genre connu (NR_ICMP_TYPES).
 pub const GENRE_MAX: u8 = 18;
+/// L'écho étendu (PROBE, RFC 8335 : « cette interface est-elle là ? ») et sa
+/// réponse, au-delà de la table des genres connus.
+pub const ECHO_ETENDU: u8 = 42;
+pub const ECHO_ETENDU_REPONSE: u8 = 43;
 
 // Les codes d'INJOIGNABLE.
 pub const RESEAU: u8 = 0;

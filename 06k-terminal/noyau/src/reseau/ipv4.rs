@@ -31,6 +31,21 @@
 //! Puis le protocole : UDP (udp.rs), ICMP (icmp.rs) ; un autre, ou un
 //! datagramme UDP sans socket, reçoit l'erreur ICMP de Linux.
 //!
+//! LES COMPTEURS d'IP (/proc/net/snmp, snmp.rs), aux places de Linux :
+//! chaque paquet arrivé (InReceives), avant tout examen ; un en-tête ou une
+//! option faux (InHdrErrors), sauf un paquet plus court que ne le dit un
+//! en-tête juste (InTruncatedPkts, d'IpExt, que /proc/net/snmp ne montre
+//! pas) ; un paquet pas pour nous (InAddrErrors : `ip_error`, nous ne
+//! routons pas) ; livré à un protocole (InDelivers), ou d'un protocole
+//! inconnu (InUnknownProtos) ; le réassemblage (inet::fragments, et ReasmOKs
+//! ici). Les martiens et les routes sources ne sont pas des compteurs de
+//! snmp (Linux : /proc/net/stat/rt_cache, et un message) : les nôtres
+//! (MARTIENS, ROUTES_SOURCES) ne sont pas montrés. À la sortie : chaque
+//! paquet à émettre (OutRequests : `__ip_local_out`), chaque paquet ou
+//! morceau confié à une interface (OutTransmits : `ip_finish_output2`), le
+//! découpage (FragOKs, FragFails, FragCreates). OutNoRoutes et OutDiscards
+//! sont comptés par qui envoie (datagramme.rs, icmp.rs, tcp.rs).
+//!
 //! LA SORTIE (`ip_queue_xmit`, `ip_make_skb`) : la route (`router`), puis
 //! l'en-tête, puis l'interface : `lo` pour une de nos adresses (Linux
 //! aussi : la route locale passe par `lo`), la diffusion d'Ethernet pour
@@ -44,14 +59,20 @@
 
 use super::interface::{self, Interface};
 use super::paquet::Paquet;
+use super::snmp::MIB;
 use crate::verrou::Verrou;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use formats::reseau::{dhcp as format_dhcp, ethernet, icmp, ipv4, udp};
+use formats::reseau::{Erreur, dhcp as format_dhcp, ethernet, icmp, ipv4, udp};
 use inet::fragments::{Cle, Issue, Morceau, Reassemblage};
+use inet::snmp::Ip;
 use inet::pmtu::Exceptions;
 use inet::routes::{Chemin, Table};
 
 const ENETUNREACH: i64 = 101;
+
+/// Le TTL d'un paquet sans IP_TTL (le réglage `ip_default_ttl`, que
+/// montrent /proc/sys/net et /proc/net/snmp).
+pub const TTL_DEFAUT: u8 = 64;
 
 /// Les adresses et les routes ; faites au démarrage.
 static TABLE: Verrou<Option<Table>> = Verrou::new(None);
@@ -75,13 +96,11 @@ impl Morceau for Paquet {
     }
 }
 
-/// Les paquets jetés à l'entrée (les compteurs d'`/proc/net/snmp` de Linux,
-/// pas encore montrés) : en-tête faux, martiens, pas pour nous, une option
-/// fausse (`InHdrErrors`), une route source.
-static ENTETES_FAUX: AtomicU64 = AtomicU64::new(0);
+/// Les paquets jetés à l'entrée qui ne sont pas des compteurs de
+/// /proc/net/snmp : les martiens (le `in_martian_src` et `in_martian_dst`
+/// de /proc/net/stat/rt_cache chez Linux), les routes sources (un message,
+/// avec `log_martians`). Pas montrés.
 static MARTIENS: AtomicU64 = AtomicU64::new(0);
-static PAS_POUR_NOUS: AtomicU64 = AtomicU64::new(0);
-static OPTIONS: AtomicU64 = AtomicU64::new(0);
 static ROUTES_SOURCES: AtomicU64 = AtomicU64::new(0);
 
 /// Les identifiants des paquets qui en demandent un sans être d'une
@@ -98,7 +117,7 @@ static CLE_IDENTS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 /// Au démarrage.
 pub fn initialiser() {
     *TABLE.verrouiller() = Table::new(inet::routes::MAX);
-    *REASSEMBLAGE.verrouiller() = Reassemblage::new();
+    *REASSEMBLAGE.verrouiller() = Reassemblage::new(&MIB);
     for c in &IDENTS_COMPTEURS {
         c.store(crate::aleatoire::u32(), Ordering::Relaxed);
     }
@@ -170,9 +189,23 @@ fn lire_options(i: &Interface, h: &ipv4::Ipv4, p: &mut Paquet) -> Option<Result<
 /// du réseau ; `trame_diffusee` : sa trame allait à toutes les machines
 /// (jamais d'erreur ICMP en réponse).
 pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
-    let Ok((h, charge)) = ipv4::lire(p.donnees()) else { return compter(&ENTETES_FAUX) };
+    MIB.ip(Ip::InReceives);
+    let (h, charge) = match ipv4::lire(p.donnees()) {
+        Ok(x) => x,
+        Err(e) => {
+            if !(e == Erreur::Tronque && ipv4::lire_cite(p.donnees()).is_ok()) {
+                MIB.ip(Ip::InHdrErrors);
+            }
+            return;
+        }
+    };
     // Le client DHCP d'abord, avant le tri des destinations : l'interface
-    // n'a pas encore d'adresse.
+    // n'a pas encore d'adresse. Linux lui passe la trame à côté d'IP (deux
+    // gestionnaires de trames IPv4, `ic_bootp_recv` et `ip_rcv`) ; nous ne la
+    // passons qu'à lui : notre client peut prendre son adresse avant qu'IP
+    // ne trie la trame, qui serait alors « pour nous », vers un port 68 sans
+    // socket : une erreur ICMP partirait vers le serveur. Comptée à
+    // l'arrivée seulement.
     if h.protocole == ipv4::UDP && !h.est_un_fragment() && h.longueur_entete == ipv4::ENTETE && super::dhcp::en_cours(i.index) {
         if let Ok((u, message)) = udp::lire(charge, h.source, h.destination) {
             if u.source == format_dhcp::PORT_SERVEUR && u.destination == format_dhcp::PORT_CLIENT {
@@ -203,7 +236,7 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
             // octet, dans les 8 bits forts de ses 4 octets (`icmp_send`
             // d'`ip_options_compile`) ; jamais pour une diffusion.
             Some(Err(place)) => {
-                compter(&OPTIONS);
+                MIB.ip(Ip::InHdrErrors);
                 if !diffusion {
                     super::icmp::envoyer_erreur(icmp::PARAMETRE, 0, (place as u32) << 24, p.donnees(), i.boucle(), pour_nous, trame_diffusee);
                 }
@@ -214,7 +247,7 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
         }
     }
     if !pour_nous {
-        return compter(&PAS_POUR_NOUS);
+        return MIB.ip(Ip::InAddrErrors);
     }
     livrer(i, h, p, diffusion, trame_diffusee);
 }
@@ -223,8 +256,9 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
 /// (boucle.rs, `rendre_la_diffusion`) : livrée comme arrivée par `i`, sans le
 /// tri de l'entrée (Linux garde la route de la sortie, `skb_dst` : la source,
 /// qui est à nous, n'est pas un martien) ni d'options (nous n'en écrivons
-/// pas).
+/// pas). Elle compte comme un paquet arrivé (Linux la fait repasser par `ip_rcv`).
 pub fn recevoir_la_diffusion(i: &'static Interface, p: Paquet) {
+    MIB.ip(Ip::InReceives);
     let Ok((h, _)) = ipv4::lire(p.donnees()) else { return };
     livrer(i, h, p, true, false);
 }
@@ -256,6 +290,8 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, diffusion: bool, tram
         }
         super::icmp::envoyer_erreur(icmp::INJOIGNABLE, code, 0, p.donnees(), i.boucle(), true, trame_diffusee);
     };
+    // Livré, même jeté ensuite par le protocole (`ip_protocol_deliver_rcu`).
+    MIB.ip(if matches!(h.protocole, ipv4::UDP | ipv4::ICMP | ipv4::TCP) { Ip::InDelivers } else { Ip::InUnknownProtos });
     match h.protocole {
         ipv4::UDP => {
             if let Err(p) = super::udp::recevoir(i.index, h.source, h.destination, diffusion, p) {
@@ -281,13 +317,26 @@ fn recoller(i: &'static Interface, h: &ipv4::Ipv4, mut p: Paquet) -> Option<(ipv
     let cle = Cle { source: h.source, destination: h.destination, identifiant: h.identifiant, protocole: h.protocole };
     let (issue, echeance) = {
         let mut t = REASSEMBLAGE.verrouiller();
-        let r = t.as_mut()?;
+        let Some(r) = t.as_mut() else {
+            // Pas de table (plus de mémoire au démarrage) : le `ip_find` raté d'`ip_defrag`.
+            MIB.ip(Ip::ReasmReqds);
+            MIB.ip(Ip::ReasmFails);
+            return None;
+        };
         let issue = r.recevoir(cle, h.decalage as u32 * 8, h.fragments_suivants, h.tos, h.longueur_entete as u32, p, i.index, crate::temps::ns_monotone());
         (issue, r.echeance())
     };
     super::tache::armer(super::tache::OBJET_FRAGMENTS, echeance);
     let Issue::Complet { mut morceaux, longueur, entete, ecn } = issue else { return None };
-    let (longueur, entete) = (longueur as usize, entete as usize);
+    // La fin d'`ip_frag_reasm` : un paquet recollé (ReasmOKs), ou pas de mémoire pour lui.
+    let recolle = coller(&mut morceaux, longueur as usize, entete as usize, ecn);
+    MIB.ip(if recolle.is_some() { Ip::ReasmOKs } else { Ip::ReasmFails });
+    recolle
+}
+
+/// Les morceaux d'un paquet complet (`longueur` octets de données, derrière les `entete`
+/// octets d'en-tête du premier), recopiés en un paquet neuf ; None : plus de mémoire.
+fn coller(morceaux: &mut [Paquet], longueur: usize, entete: usize, ecn: u8) -> Option<(ipv4::Ipv4, Paquet)> {
     let mut neuf = Paquet::vide(entete + longueur)?;
     let o = neuf.ajouter_fin(entete + longueur)?;
     let tete = morceaux.first_mut()?.ajouter_entete(entete)?;
@@ -455,6 +504,7 @@ pub fn identifiant(destination: [u8; 4], source: [u8; 4], protocole: u8) -> u16 
 /// `dev_queue_xmit` de Linux). Rien ne revient : un paquet perdu en route
 /// (file pleine, voisin muet) l'est sans le dire, comme sur un câble.
 pub fn emettre(c: Chemin, e: &Envoi, p: Paquet) {
+    MIB.ip(Ip::OutRequests);
     if let Chemin::Diffusion { interface, .. } = c
         && let Some(i) = interface::par_index(interface)
         && !i.boucle()
@@ -474,6 +524,7 @@ pub fn emettre(c: Chemin, e: &Envoi, p: Paquet) {
 /// perdu.
 fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
     if e.ne_pas_fragmenter {
+        MIB.ip(Ip::FragFails);
         let total = (p.longueur() + ipv4::ENTETE) as u16;
         let Some(entete) = p.ajouter_entete(ipv4::ENTETE) else { return };
         let entete: &mut [u8; ipv4::ENTETE] = entete.try_into().expect("20 octets");
@@ -485,17 +536,19 @@ fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
     while debut < donnees.len() {
         let reste = donnees.len() - debut;
         let longueur = ipv4::taille_du_fragment(donnees.len(), debut, e.mtu as usize, ipv4::ENTETE);
-        let Some(mut q) = Paquet::vide(longueur) else { return };
+        let Some(mut q) = Paquet::vide(longueur) else { return MIB.ip(Ip::FragFails) };
         // Chaque morceau compte dans le SO_SNDBUF de la socket, comme le
         // paquet entier (`__ip_append_data` les lui attache un à un).
         if let Some(r) = p.retenue() {
             q.attacher(r, 0);
         }
-        let Some(o) = q.ajouter_fin(longueur) else { return };
+        let Some(o) = q.ajouter_fin(longueur) else { return MIB.ip(Ip::FragFails) };
         o.copy_from_slice(&donnees[debut..debut + longueur]);
         envoyer(c, e, q, (debut / 8) as u16, longueur < reste);
+        MIB.ip(Ip::FragCreates);
         debut += longueur;
     }
+    MIB.ip(Ip::FragOKs);
 }
 
 /// La copie du paquet diffusé `p` (sa charge), pour les sockets de la machine
@@ -537,6 +590,7 @@ fn envoyer(c: Chemin, e: &Envoi, mut p: Paquet, decalage: u16, suite: bool) {
     let entete: &mut [u8; ipv4::ENTETE] = entete.try_into().expect("20 octets");
     ipv4::ecrire(entete, &en_tete(e, longueur, decalage, suite));
     let Some(i) = interface_de(&c) else { return };
+    MIB.ip(Ip::OutTransmits);
     match c {
         // lo : pas de voisin (IFF_NOARP), une adresse matérielle nulle.
         Chemin::Locale { .. } => super::ethernet::emettre(i, [0; 6], ethernet::IPV4, p),
@@ -548,7 +602,7 @@ fn envoyer(c: Chemin, e: &Envoi, mut p: Paquet, decalage: u16, suite: bool) {
 /// Émet par `i` le paquet `p` (sa charge en place) en diffusion limitée
 /// (255.255.255.255), de la source `source` (0.0.0.0 avant d'avoir une
 /// adresse), pour le protocole `protocole` : le client DHCP. TTL 64 (le
-/// `ip_default_ttl` de Linux), DF (comme `ipconfig.c`), identifiant 0 (DF :
+/// `ip_default_ttl`), DF (comme `ipconfig.c`), identifiant 0 (DF :
 /// le paquet ne sera jamais fragmenté).
 pub fn emettre_en_diffusion(i: &'static Interface, source: [u8; 4], protocole: u8, mut p: Paquet) {
     let longueur = (p.longueur() + ipv4::ENTETE) as u16;
@@ -561,7 +615,7 @@ pub fn emettre_en_diffusion(i: &'static Interface, source: [u8; 4], protocole: u
         ne_pas_fragmenter: true,
         fragments_suivants: false,
         decalage: 0,
-        ttl: 64,
+        ttl: TTL_DEFAUT,
         protocole,
         source,
         destination: ipv4::DIFFUSION,

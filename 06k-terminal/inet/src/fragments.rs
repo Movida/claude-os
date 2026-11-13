@@ -30,6 +30,7 @@
 //! Ici, les règles seules, sur des morceaux que donne le noyau (noyau/src/reseau/ipv4.rs,
 //! qui recopie le paquet complet).
 
+use crate::snmp::{Ip, Mib};
 use alloc::vec::Vec;
 use faillible::VecFaillible;
 
@@ -74,7 +75,9 @@ pub enum Issue<M> {
     /// la rendait fausse.
     Jete,
     /// C'est fini : les morceaux dans l'ordre, la longueur des données, celle de l'en-tête
-    /// du premier, et les bits ECN à ajouter à son TOS (`ip_frag_ecn_table`).
+    /// du premier, et les bits ECN à ajouter à son TOS (`ip_frag_ecn_table`). L'appelant
+    /// compte ReasmOKs quand il en a fait un paquet d'un seul tenant, ReasmFails s'il ne le
+    /// peut pas (la fin d'`ip_frag_reasm`).
     Complet { morceaux: Vec<M>, longueur: u32, entete: u32, ecn: u8 },
 }
 
@@ -125,6 +128,11 @@ pub struct Echue<M> {
 pub struct Reassemblage<M> {
     files: Vec<File<M>>,
     memoire: usize,
+    /// Les compteurs de la machine (le `fqdir->net` des files de Linux) : ReasmReqds,
+    /// ReasmFails et ReasmTimeout sont comptés ici, là où les compte `ip_fragment.c` ;
+    /// ReasmOKs par l'appelant, une fois le paquet recollé d'un seul tenant (voir
+    /// `Issue::Complet`).
+    mib: &'static Mib,
 }
 
 /// `ip_frag_ecn_table` : les bits ECN d'un paquet recollé, d'après ceux de ses morceaux
@@ -140,11 +148,11 @@ fn ecn_du_paquet(vus: u8) -> Option<u8> {
 }
 
 impl<M: Morceau> Reassemblage<M> {
-    /// Fait la table, sa place prise (None : plus de mémoire).
-    pub fn new() -> Option<Reassemblage<M>> {
+    /// Fait la table, sa place prise (None : plus de mémoire), qui compte dans `mib`.
+    pub fn new(mib: &'static Mib) -> Option<Reassemblage<M>> {
         let mut files = Vec::new();
         files.try_reserve_exact(FILES_MAX).ok()?;
-        Some(Reassemblage { files, memoire: 0 })
+        Some(Reassemblage { files, memoire: 0, mib })
     }
 
     /// La mémoire que gardent les files.
@@ -157,9 +165,12 @@ impl<M: Morceau> Reassemblage<M> {
         self.files.iter().map(|f| f.echeance).min()
     }
 
-    /// Une file échue, s'il y en a une (`ip_expire`).
+    /// Une file échue, s'il y en a une (`ip_expire`), comptée : un réassemblage raté,
+    /// par le délai (une file finie n'est plus là : elle n'expire jamais).
     pub fn prendre_echue(&mut self, maintenant: u64) -> Option<Echue<M>> {
         let i = self.files.iter().position(|f| f.echeance <= maintenant)?;
+        self.mib.ip(Ip::ReasmFails);
+        self.mib.ip(Ip::ReasmTimeout);
         let f = self.files.swap_remove(i);
         self.memoire = self.memoire.saturating_sub(f.vraie);
         let (entete, interface) = (f.entete, f.interface);
@@ -169,13 +180,16 @@ impl<M: Morceau> Reassemblage<M> {
 
     /// Le morceau `charge` (sans en-tête) du paquet `cle`, à `decalage` octets du début,
     /// `suite` : MF ; `tos` : celui de son en-tête ; `entete` : la longueur de son en-tête
-    /// (`ip_defrag`, `ip_frag_queue`).
+    /// (`ip_defrag`, `ip_frag_queue`). Chaque morceau compte une demande de réassemblage
+    /// (ReasmReqds) ; un morceau ou une file jetés pour une faute, un échec (ReasmFails),
+    /// pas un double (ignoré, sans compteur chez Linux non plus).
     pub fn recevoir(&mut self, cle: Cle, decalage: u32, suite: bool, tos: u8, entete: u32, mut charge: M, interface: u32, maintenant: u64) -> Issue<M> {
+        self.mib.ip(Ip::ReasmReqds);
         // Au-delà de `ipfrag_high_thresh`, tout morceau est jeté, même d'une file déjà ouverte
-        // (`inet_frag_find` : pas de file trouvée). Sans quoi un paquet commencé avant le seuil
-        // pourrait continuer à grossir.
+        // (`inet_frag_find` : pas de file trouvée, l'échec d'`ip_defrag`). Sans quoi un paquet
+        // commencé avant le seuil pourrait continuer à grossir.
         if self.memoire > MEMOIRE_MAX {
-            return Issue::Jete;
+            return self.echec();
         }
         // Un morceau de plus de cette source : les autres files s'éloignent.
         for f in self.files.iter_mut().filter(|f| f.cle.source == cle.source) {
@@ -185,14 +199,16 @@ impl<M: Morceau> Reassemblage<M> {
             Some(i) => i,
             None => {
                 if self.files.len() == self.files.capacity() {
-                    return Issue::Jete;
+                    return self.echec();
                 }
                 self.files.ajouter_dans_la_place(File::new(cle, maintenant));
                 self.files.len() - 1
             }
         };
-        // `ip_frag_too_far`, `ip_frag_reinit` : la file repart de rien, son délai aussi.
+        // `ip_frag_too_far`, `ip_frag_reinit` : la file repart de rien, son délai aussi ; ce
+        // qu'elle avait reçu est un réassemblage raté.
         if self.files[i].ecart > ECART_MAX && !self.files[i].morceaux.is_empty() {
+            self.mib.ip(Ip::ReasmFails);
             let v = self.files[i].vraie;
             self.memoire = self.memoire.saturating_sub(v);
             self.files[i] = File::new(cle, maintenant);
@@ -204,8 +220,7 @@ impl<M: Morceau> Reassemblage<M> {
         if !suite {
             // Le dernier : rien au-delà, et une seule fin possible.
             if fin < f.longueur || (f.dernier && fin != f.longueur) {
-                self.retirer(i);
-                return Issue::Jete;
+                return self.jeter_la_file(i);
             }
             f.dernier = true;
             f.longueur = fin;
@@ -214,22 +229,19 @@ impl<M: Morceau> Reassemblage<M> {
             fin &= !7;
             if fin > f.longueur {
                 if f.dernier {
-                    self.retirer(i);
-                    return Issue::Jete;
+                    return self.jeter_la_file(i);
                 }
                 f.longueur = fin;
             }
         }
         if fin == decalage {
-            self.retirer(i);
-            return Issue::Jete;
+            return self.jeter_la_file(i);
         }
         charge.couper((fin - decalage) as usize);
         match inserer(f, decalage, fin) {
             Insertion::Ok(place) => {
                 if f.morceaux.try_reserve(1).is_err() {
-                    self.retirer(i);
-                    return Issue::Jete;
+                    return self.jeter_la_file(i);
                 }
                 let v = charge.taille_vraie();
                 f.morceaux.inserer_dans_la_place(place, (decalage, charge));
@@ -238,8 +250,7 @@ impl<M: Morceau> Reassemblage<M> {
             }
             Insertion::Double => return Issue::Jete,
             Insertion::Chevauchement => {
-                self.retirer(i);
-                return Issue::Jete;
+                return self.jeter_la_file(i);
             }
         }
         let f = &mut self.files[i];
@@ -254,16 +265,16 @@ impl<M: Morceau> Reassemblage<M> {
             let (longueur, entete, vus, v) = (f.longueur, f.entete, f.ecn, f.vraie);
             self.memoire = self.memoire.saturating_sub(v);
             let f = self.files.swap_remove(i);
-            // `ip_frag_reasm`.
-            let Some(ecn) = ecn_du_paquet(vus) else { return Issue::Jete };
+            // `ip_frag_reasm`, dont chaque échec est compté (`out_fail`).
+            let Some(ecn) = ecn_du_paquet(vus) else { return self.echec() };
             if entete + longueur > PAQUET_MAX {
-                return Issue::Jete;
+                return self.echec();
             }
             // (Pris une fois : la mémoire de la file sert encore ; en cas d'échec, tout est
             // jeté, le paquet est perdu.)
             let mut morceaux = Vec::new();
             if morceaux.try_reserve_exact(f.morceaux.len()).is_err() {
-                return Issue::Jete;
+                return self.echec();
             }
             for (_, m) in f.morceaux {
                 morceaux.ajouter_dans_la_place(m);
@@ -274,9 +285,18 @@ impl<M: Morceau> Reassemblage<M> {
     }
 
     /// `inet_frag_kill`.
-    fn retirer(&mut self, i: usize) {
+    /// Le morceau rend la file `i` fausse : elle est jetée avec lui (le `discard_qp`
+    /// d'`ip_frag_queue`), un échec.
+    fn jeter_la_file(&mut self, i: usize) -> Issue<M> {
         let f = self.files.swap_remove(i);
         self.memoire = self.memoire.saturating_sub(f.vraie);
+        self.echec()
+    }
+
+    /// Un réassemblage raté (ReasmFails) : le morceau, ou le paquet, est jeté.
+    fn echec(&self) -> Issue<M> {
+        self.mib.ip(Ip::ReasmFails);
+        Issue::Jete
     }
 }
 
