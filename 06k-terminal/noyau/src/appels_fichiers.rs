@@ -3981,7 +3981,9 @@ fn ecrire_pages_noyau(n: Numero, position: u64, octets: &[u8]) -> Result<usize, 
 /// que tiennent ses cases : autant de morceaux de pages d'un fichier
 /// ordinaire (le premier s'arrête à la fin de sa page), autant de pages du
 /// reste (une seule lecture, `copy_splice_read`) ; puis l'écrit, MSG_MORE
-/// pour une socket s'il reste à lire après elle. Jusqu'à la fin de
+/// pour une socket s'il reste à lire après elle ; l'entrée épuisée avant
+/// `longueur`, après au moins un octet, la socket l'apprend
+/// (`appels_reseau::fin_d_episse`). Jusqu'à la fin de
 /// l'entrée, une sortie qui ne prend plus tout, ou une erreur : avant tout
 /// octet, elle (une entrée sans `splice_read`, une sortie sans
 /// `splice_write` : EINVAL) ; après, ce qui est fait. Aucun signal n'arrête
@@ -4011,7 +4013,12 @@ fn transferer(entree: &FichierTenu, position: &mut u64, sortie: &FichierTenu, ve
         let n = reste.min(cases as u64 * PAGE - decalage) as usize;
         let lus = if lisible_par_le_noyau(entree) { lire_pour_le_noyau(entree, *position, &mut tampon[..n]) } else { Err(-EINVAL) };
         let lus = match lus {
-            Ok(0) => break Ok(()),
+            Ok(0) => {
+                if fait > 0 && sortie.sorte == Sorte::Socket {
+                    crate::appels_reseau::fin_d_episse(sortie);
+                }
+                break Ok(());
+            }
             Ok(l) => l,
             Err(e) if fait == 0 => break Err(e),
             Err(_) => break Ok(()),

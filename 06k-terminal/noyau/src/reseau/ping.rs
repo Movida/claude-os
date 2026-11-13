@@ -98,7 +98,8 @@ pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
 ///     qu'AF_INET : EAFNOSUPPORT (AF_UNSPEC aussi, au contraire d'UDP) ;
 ///     aucune, et pas connectée : EDESTADDRREQ ;
 ///   - les messages de contrôle, puis ce que fait toute socket de
-///     datagrammes (`datagramme::preparer`) ;
+///     datagrammes (`datagramme::preparer`) ; avec MSG_PROBE, rien de plus :
+///     la longueur, sans rien envoyer ;
 ///   - le paquet (ENOBUFS), le reste copié (EFAULT), l'identifiant de la
 ///     socket mis à la place de celui du programme, la somme, et il part.
 pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u64, controle: Result<Controle, i64>,
@@ -133,22 +134,27 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
         None => return Err(-EDESTADDRREQ),
     };
     let c = controle?;
-    let (chemin, envoi) = datagramme::preparer(s, &mut inet, adresse, longueur, format_ipv4::ICMP, drapeaux, &c)?;
+    let d = datagramme::preparer(s, &mut inet, adresse, longueur, drapeaux, &c)?;
+    // MSG_PROBE : la route seulement (`preparer`) ; rien à pousser.
+    if drapeaux & datagramme::MSG_PROBE != 0 {
+        return Ok(longueur);
+    }
     let ident = inet.port;
-    let delai = inet.options.sndtimeo;
+    let (delai, pmtudisc) = (inet.options.sndtimeo, inet.options.pmtudisc);
     drop(inet);
     // SO_SNDBUF, comme UDP (`ping_v4_sendmsg` passe par `ip_append_data`).
-    datagramme::attendre_place(s, drapeaux & MSG_DONTWAIT != 0, delai)?;
-    datagramme::morceaux_permis(s, longueur, &envoi)?;
-    let Some(mut p) = Paquet::vide(longueur) else { return Err(datagramme::jete(-ENOBUFS)) };
-    datagramme::attacher(s, &mut p);
-    let Some(m) = p.ajouter_fin(longueur) else { return Err(datagramme::jete(-ENOBUFS)) };
-    remplir(icmp::ENTETE, &mut m[icmp::ENTETE..]).map_err(datagramme::jete)?;
+    // MSG_MORE n'y change rien : ping pousse aussitôt ce qu'il a ajouté
+    // (`ping_v4_push_pending_frames`).
     let numero = u16::from_be_bytes([entete[6], entete[7]]);
-    icmp::ecrire(m, &Icmp { genre: icmp::ECHO, code: 0, reste: icmp::reste_echo(ident, numero) });
+    let p = datagramme::faire_paquet(s, &d, longueur, pmtudisc, drapeaux & MSG_DONTWAIT != 0, delai, |m| {
+        remplir(icmp::ENTETE, &mut m[icmp::ENTETE..])?;
+        icmp::ecrire(m, &Icmp { genre: icmp::ECHO, code: 0, reste: icmp::reste_echo(ident, numero) });
+        Ok(())
+    })?;
+    let envoi = d.envoi(&mut s.appels.verrouiller(), longueur, format_ipv4::ICMP);
     // Un message ICMP qui part (`icmp_out_count`, dans `__ip_make_skb`).
     MIB.icmp_sortie(icmp::ECHO);
-    ipv4::emettre(chemin, &envoi, p);
+    ipv4::emettre(d.chemin, &envoi, p);
     Ok(longueur)
 }
 

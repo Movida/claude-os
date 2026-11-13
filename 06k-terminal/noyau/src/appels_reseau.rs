@@ -78,6 +78,7 @@ const OPTMEM_MAX: u64 = 131_072;
 const SOL_IP: i32 = 0;
 const SOL_SOCKET: i32 = 1;
 const SOL_UDP: i32 = 17;
+const UDP_CORK: i32 = 1;
 const SOL_TCP: i32 = 6;
 // Les options de SOL_TCP (include/uapi/linux/tcp.h).
 const TCP_NODELAY: i32 = 1;
@@ -1366,8 +1367,10 @@ fn priorite_du_tos(tos: u8) -> u32 {
 
 /// setsockopt(fd, niveau, option, valeur, longueur) (`do_sock_setsockopt`) :
 /// une longueur négative : EINVAL ; SOL_SOCKET (`sk_setsockopt`) ; SOL_UDP
-/// (`udp_lib_setsockopt` : ENOPROTOOPT, un écart pour UDP_CORK et ses
-/// voisines) ; SOL_IP (`do_ip_setsockopt`) ; un autre niveau : ENOPROTOOPT.
+/// (`udp_lib_setsockopt` : moins de 4 octets, EINVAL ; UDP_CORK, le
+/// bouchon d'udp.rs ; ENOPROTOOPT pour les autres, un écart pour
+/// UDP_SEGMENT et ses voisines) ; SOL_IP (`do_ip_setsockopt`) ; un autre
+/// niveau : ENOPROTOOPT.
 pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64) -> i64 {
     let (niveau, option, longueur) = (niveau as i32, option as i32, longueur as i32);
     en_i64((|| {
@@ -1380,10 +1383,13 @@ pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
             SOL_SOCKET => options_socket(s, option, valeur, longueur),
             // SOL_UDP n'est pas un niveau d'une socket de ping (elle va
             // droit à IP : ENOPROTOOPT sans rien lire).
-            SOL_UDP if s.protocole == Protocole::Udp => {
-                entier(valeur, longueur)?;
-                Err(-ENOPROTOOPT)
-            }
+            SOL_UDP if s.protocole == Protocole::Udp => match (option, entier(valeur, longueur)?) {
+                (UDP_CORK, v) => {
+                    udp::boucher(s, v != 0);
+                    Ok(())
+                }
+                _ => Err(-ENOPROTOOPT),
+            },
             SOL_IP => options_ip(s, option, valeur, longueur),
             SOL_TCP if s.protocole == Protocole::Tcp => options_tcp(s, option, valeur, longueur),
             _ => Err(-ENOPROTOOPT),
@@ -1778,8 +1784,10 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
 }
 
 /// getsockopt(fd, niveau, option, valeur, longueur) (`do_sock_getsockopt`) :
-/// SOL_SOCKET (`sk_getsockopt`) ; SOL_UDP : la longueur lue (EFAULT,
-/// EINVAL), puis ENOPROTOOPT (un écart) ; un autre niveau va à IP
+/// SOL_SOCKET (`sk_getsockopt`) ; SOL_UDP (`udp_lib_getsockopt`) : la
+/// longueur lue (EFAULT, EINVAL), UDP_CORK (au plus 4 octets, la longueur
+/// écrite avant la valeur), ENOPROTOOPT pour les autres (un écart) ; un
+/// autre niveau va à IP
 /// (`do_ip_getsockopt`), qui rend EOPNOTSUPP pour ce qui n'est pas SOL_IP.
 pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64) -> i64 {
     let (niveau, option) = (niveau as i32, option as i32);
@@ -1802,8 +1810,15 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
                 Ok(0)
             }
             SOL_UDP if s.protocole == Protocole::Udp => {
-                lire_longueur(&mut l)?;
-                Err(-ENOPROTOOPT)
+                let place = lire_longueur(&mut l)?;
+                let v = match option {
+                    UDP_CORK => s.appels.verrouiller().options.udp_cork as i32,
+                    _ => return Err(-ENOPROTOOPT),
+                };
+                let n = (place as usize).min(4);
+                copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+                copier_vers_utilisateur(valeur, &v.to_le_bytes()[..n]).map_err(|_| -EFAULT)?;
+                Ok(0)
             }
             SOL_TCP if s.protocole == Protocole::Tcp => {
                 let place = lire_longueur(&mut l)?;
@@ -1847,8 +1862,7 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
         o[8..].copy_from_slice(&((tics % 1000 * 1000) as i64).to_le_bytes());
         16
     };
-    let inet = *s.appels.verrouiller();
-    let op = inet.options;
+    let op = s.appels.verrouiller().options;
     let n = match option {
         SO_DEBUG => entier(&mut o, op.debug as i32),
         SO_DONTROUTE => entier(&mut o, op.dontroute as i32),
@@ -1942,8 +1956,8 @@ pub fn ecrire(o: &FichierTenu, morceaux: &[(u64, u64)]) -> i64 {
 /// Un envoi d'octets du noyau sur une socket, une ronde de sendfile (6i :
 /// un `sock_sendmsg` de `splice_to_socket`), avec MSG_MORE s'il en vient
 /// d'autres (`plus_a_venir` : TCP attend alors pour remplir ses segments ;
-/// AF_UNIX n'en fait rien ; UDP, qui n'a pas son « bouchon » : EOPNOTSUPP,
-/// voir `udp::envoyer`) : rend ce qui est parti, ou l'erreur.
+/// AF_UNIX n'en fait rien ; UDP bouche, voir `udp::envoyer`) : rend ce qui
+/// est parti, ou l'erreur.
 pub fn ecrire_noyau(o: &FichierTenu, octets: &[u8], plus_a_venir: bool) -> i64 {
     const MSG_MORE: u64 = 0x8000;
     let remplir = |decalage: usize, d: &mut [u8]| {
@@ -1952,6 +1966,18 @@ pub fn ecrire_noyau(o: &FichierTenu, octets: &[u8], plus_a_venir: bool) -> i64 {
     };
     let drapeaux = if plus_a_venir { MSG_MORE } else { 0 };
     envoyer_avec(o, None, octets.len(), remplir, drapeaux, Ok(Controle::default()), unix::Scm::default())
+}
+
+/// La fin d'un sendfile vers la socket `o` (`sock_splice_eof`, que
+/// `splice_direct_to_actor` appelle quand l'entrée s'épuise avant la
+/// longueur demandée, après au moins un octet) : ce que MSG_MORE a retenu
+/// part (`udp_splice_eof`, `tcp_splice_eof`) ; AF_UNIX n'a rien retenu.
+pub fn fin_d_episse(o: &FichierTenu) {
+    match o.socket().protocole {
+        Protocole::Udp => udp::fin_d_episse(o.socket()),
+        Protocole::Tcp => tcp::fin_d_episse(o.socket()),
+        Protocole::Unix | Protocole::Ping => {}
+    }
 }
 
 /// La socket `o` a-t-elle un `splice_read` à elle (sendfile vers un tube,
@@ -2017,8 +2043,9 @@ pub fn lire_noyau(o: &FichierTenu, tampon: &mut [u8]) -> Result<usize, i64> {
 
 /// ioctl d'une socket, une fois passées celles de tous les fichiers
 /// (`sock_ioctl` puis `udp_ioctl`) : FIONREAD (SIOCINQ) : la longueur du
-/// PREMIER datagramme en file (pas le total) ; SIOCOUTQ : ce qui attend de
-/// partir (rien chez nous : un datagramme part tout de suite) ; une autre
+/// PREMIER datagramme en file (pas le total) ; SIOCOUTQ : ce que la socket
+/// tient encore (`sk_wmem_alloc_get`) : son bouchon, et ses datagrammes que
+/// la carte ou le voisin n'ont pas fini ; une autre
 /// (les requêtes des terminaux comprises) : ENOTTY.
 pub fn ioctl(o: &FichierTenu, requete: u64, argument: u64) -> i64 {
     const SIOCINQ: u64 = 0x541b;
@@ -2089,7 +2116,7 @@ pub fn ioctl(o: &FichierTenu, requete: u64, argument: u64) -> i64 {
     }
     let v: i32 = match requete {
         SIOCINQ => o.socket().premier() as i32,
-        SIOCOUTQ => 0,
+        SIOCOUTQ => o.socket().envois.as_ref().map_or(0, |r| r.octets()) as i32,
         _ => return -ENOTTY,
     };
     match copier_vers_utilisateur(argument, &v.to_le_bytes()) {

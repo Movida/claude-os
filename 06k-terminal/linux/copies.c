@@ -7,7 +7,9 @@
  * de fichier, en entrée et en sortie, vers un tube et ailleurs : les cases
  * d'un tube qui désignent les pages d'un fichier, les rondes du tube
  * interne (un datagramme par ronde), les sockets vers un tube, les
- * positions extrêmes.
+ * positions extrêmes. Depuis les soldes d'avant 6k, la fin du fichier
+ * avant la longueur demandée : ce que MSG_MORE retenait part aussitôt
+ * vers TCP (`tcp_splice_eof` ; pour UDP, voir linux/reseau.c).
  *
  *     copies [DOSSIER]
  *
@@ -22,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <signal.h>
 #include <sys/epoll.h>
 #include <sys/eventfd.h>
@@ -510,6 +513,14 @@ static void sockets(void)
     v = r(sendfile(tt[1], sr, NULL, 8));
     w = r(sendfile(tt[1], sr, NULL, 8));
     verifier(v == 3 && w == -EAGAIN && vider(tt[0]) == 3, "sendfile d'une socket TCP vers un tube : ce qui est arrive, puis EAGAIN");
+    /* Au-delà de la fin du fichier : la ronde de 3000 octets part avec
+     * MSG_MORE (rien n'en part), puis la fin du fichier la pousse
+     * (`tcp_splice_eof`), sans attendre la sonde de la fenêtre. */
+    v = r(sendfile(cl, a, &(off_t){197000}, 100000));
+    struct pollfd pf = { .fd = sr, .events = POLLIN };
+    int pr = poll(&pf, 1, 40);
+    l1 = r(recv(sr, lu, sizeof lu, MSG_DONTWAIT));
+    verifier(v == 3000 && pr == 1 && l1 == 3000, "sendfile vers TCP au-dela de la fin du fichier : tout part aussitot");
     close(tt[0]);
     close(tt[1]);
     close(sr);

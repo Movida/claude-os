@@ -19,7 +19,7 @@
 //! dise tout de suite s'il vient d'une file du réseau.
 
 use crate::attente::FileAttente;
-use crate::faillible;
+use crate::faillible::{self, VecFaillible};
 use crate::partage::Arc;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -245,6 +245,24 @@ impl Paquet {
         Some(&mut self.tampon[debut..fin])
     }
 
+    /// Ajoute `n` octets à la fin des données, le tampon agrandi s'il le
+    /// faut : le datagramme du bouchon d'UDP (udp.rs), qui s'assemble envoi
+    /// après envoi. None : plus de mémoire. Le tampon grandit comme un `Vec`
+    /// (`try_reserve` double sa place) : un ajout coûte en moyenne sa
+    /// longueur, quel que soit le nombre d'ajouts. (Linux ajoute des pages à
+    /// la liste de son `sk_buff`, sans rien recopier ; un tampon d'un seul
+    /// tenant garde notre émission, et le découpage d'ipv4.rs, tels quels,
+    /// pour au plus 64 Kio recopiés de temps en temps.)
+    pub fn agrandir(&mut self, n: usize) -> Option<&mut [u8]> {
+        let fin = self.fin.checked_add(n)?;
+        if fin > self.tampon.len() {
+            let avant = self.tampon.capacity();
+            self.tampon.redimensionner(fin, 0).ok()?;
+            VIVANTS.fetch_add(self.tampon.capacity() - avant, Ordering::Relaxed);
+        }
+        self.ajouter_fin(n)
+    }
+
     /// Ajoute un en-tête de `n` octets devant les données (le `skb_push`),
     /// dans la marge. None : la marge est épuisée.
     pub fn ajouter_entete(&mut self, n: usize) -> Option<&mut [u8]> {
@@ -286,6 +304,16 @@ impl Paquet {
         let taille = self.taille_vraie();
         retenue.octets.fetch_add(taille, Ordering::Relaxed);
         self.proprietaire = Some(Proprietaire { retenue: retenue.clone(), taille, numero });
+    }
+
+    /// Ce paquet, attaché, compte `n` octets de plus dans ce que tient sa
+    /// socket (le `wmem_alloc_delta` d'`__ip_append_data`, pour le bouchon
+    /// d'UDP), rendus avec le reste.
+    pub fn retenir_en_plus(&mut self, n: usize) {
+        if let Some(p) = &mut self.proprietaire {
+            p.retenue.octets.fetch_add(n, Ordering::Relaxed);
+            p.taille += n;
+        }
     }
 
     /// `skb_orphan` : il n'attendra pas (`lo`).

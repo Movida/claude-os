@@ -2416,6 +2416,18 @@ pub fn avec_options<R>(s: &Socket, f: impl FnOnce(&mut OptionsTcp, Option<&mut T
     r
 }
 
+/// La fin d'un sendfile vers la socket (`tcp_splice_eof`) : ce que la
+/// dernière ronde, envoyée avec MSG_MORE, a gardé part selon les règles
+/// ordinaires (Nagle, TCP_CORK : le `tcp_push` d'un envoi sans MSG_MORE),
+/// par le chemin d'un changement d'options qui ne change rien.
+pub fn fin_d_episse(s: &Socket) {
+    avec_options(s, |_, t| {
+        if let Some(t) = t {
+            t.plus_a_venir = false;
+        }
+    });
+}
+
 /// SO_KEEPALIVE ou SO_OOBINLINE a changé : la socket en garde la copie, et
 /// la connexion en tient compte (le keepalive armé ou arrêté).
 pub fn options_socket_changees(s: &Socket, keepalive: bool, oobinline: bool) {

@@ -40,7 +40,14 @@
  *     sockets de la machine, comme arrivée par la carte ; et SO_SNDBUF fait
  *     attendre les envois vers une machine muette du réseau, dont les
  *     datagrammes restent dans la file du voisin (EAGAIN, POLLOUT,
- *     SO_SNDTIMEO).
+ *     SO_SNDTIMEO) ;
+ *   - le bouchon d'UDP (MSG_MORE, UDP_CORK ; les soldes d'avant 6k) : les
+ *     envois s'assemblent en un datagramme, vers la destination du premier
+ *     (celles des suivants, et leurs messages de contrôle, ne comptent
+ *     pas), SIOCOUTQ le voit grandir, plus de 65 507 octets en tout le
+ *     vident (EMSGSIZE, l'erreur locale), un shutdown ne l'arrête pas, une
+ *     déconnexion lui laisse le port d'alors (0 sans nouvel envoi), close
+ *     le perd, sendfile bouche ses rondes et pousse à la fin du fichier.
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic du noyau : HZ = 250 sous WSL, 1000 sous le Linux de référence).
  */
@@ -49,8 +56,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/errqueue.h>
+#include <linux/sockios.h>
 #include <netinet/in.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/udp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -60,6 +69,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -88,6 +98,12 @@ static struct sockaddr_in adresse(uint32_t ip, uint16_t port)
 
 #define LO 0x7f000001
 
+/* MSG_PROBE : chercher la route sans rien envoyer (Linux, 0x10 ; la glibc
+ * ne le nomme que pour _GNU_SOURCE). */
+#ifndef MSG_PROBE
+#define MSG_PROBE 0x10
+#endif
+
 /* Une socket UDP, ou l'arrêt du test. */
 static int udp(int drapeaux)
 {
@@ -113,10 +129,15 @@ static int liee(uint16_t *port)
     return s;
 }
 
-static ssize_t envoyer(int s, const void *o, size_t n, uint16_t port)
+static ssize_t envoyer_drapeaux(int s, const void *o, size_t n, int drapeaux, uint16_t port)
 {
     struct sockaddr_in a = adresse(LO, port);
-    return sendto(s, o, n, 0, (struct sockaddr *)&a, sizeof a);
+    return sendto(s, o, n, drapeaux, (struct sockaddr *)&a, sizeof a);
+}
+
+static ssize_t envoyer(int s, const void *o, size_t n, uint16_t port)
+{
+    return envoyer_drapeaux(s, o, n, 0, port);
 }
 
 /* Attend que tout ce qui a été envoyé par lo avant soit arrivé : lo livre
@@ -1197,6 +1218,230 @@ static void sndbuf_attend(void)
     close(s);
 }
 
+/* Le datagramme qui attend sur r (sans attendre), dans o ; son port
+ * source dans *port. Rend sa longueur, ou -1. */
+static ssize_t datagramme_de(int r, char *o, size_t n, uint16_t *port)
+{
+    struct sockaddr_in a;
+    socklen_t l = sizeof a;
+    ssize_t k = recvfrom(r, o, n, MSG_DONTWAIT, (struct sockaddr *)&a, &l);
+    if (port)
+        *port = ntohs(a.sin_port);
+    return k;
+}
+
+static int bouchee(int s, int oui)
+{
+    return setsockopt(s, SOL_UDP, UDP_CORK, &oui, sizeof oui);
+}
+
+static int connectee_a(uint16_t port)
+{
+    int s = udp(0);
+    struct sockaddr_in a = adresse(LO, port);
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    return s;
+}
+
+static void bouchon(void)
+{
+    static char o[70000];
+    uint16_t pa, pb, de;
+    int ra = liee(&pa), rb = liee(&pb);
+    int s = udp(0);
+
+    /* MSG_MORE, puis un envoi sans : un seul datagramme. */
+    ssize_t k1 = envoyer_drapeaux(s, "ab", 2, MSG_MORE, pa);
+    int vide = datagramme_de(ra, o, sizeof o, NULL) < 0 && errno == EAGAIN;
+    ssize_t k2 = envoyer(s, "cd", 2, pa);
+    ssize_t n = datagramme_de(ra, o, sizeof o, NULL);
+    verifier(k1 == 2 && vide && k2 == 2 && n == 4 && memcmp(o, "abcd", 4) == 0 && datagramme_de(ra, o, sizeof o, NULL) < 0,
+             "MSG_MORE : rien ne part, puis un seul datagramme (abcd)");
+
+    /* UDP_CORK : l'option, SIOCOUTQ, POLLOUT, et le départ en la retirant. */
+    int v = -1;
+    socklen_t l = sizeof v;
+    getsockopt(s, SOL_UDP, UDP_CORK, &v, &l);
+    int deux = 2, r1 = setsockopt(s, SOL_UDP, UDP_CORK, &deux, sizeof deux), v2 = -1;
+    l = sizeof v2;
+    getsockopt(s, SOL_UDP, UDP_CORK, &v2, &l);
+    char c1 = 1;
+    int court = erreur(setsockopt(s, SOL_UDP, UDP_CORK, &c1, 1));
+    char un_octet = -1;
+    socklen_t l1 = 1;
+    getsockopt(s, SOL_UDP, UDP_CORK, &un_octet, &l1);
+    verifier(v == 0 && r1 == 0 && v2 == 1 && l == 4 && court == EINVAL && un_octet == 1 && l1 == 1,
+             "UDP_CORK : 0, puis 1 (pour 2) ; 1 octet : EINVAL a l'ecriture, 1 octet a la lecture");
+    int q0 = -1, q1 = -1, q2 = -1, q3 = -1;
+    ioctl(s, SIOCOUTQ, &q0);
+    envoyer(s, o, 100, pa);
+    ioctl(s, SIOCOUTQ, &q1);
+    envoyer(s, o, 1000, pa);
+    ioctl(s, SIOCOUTQ, &q2);
+    struct pollfd p = { .fd = s, .events = POLLOUT };
+    int pr = poll(&p, 1, 0);
+    vide = datagramme_de(ra, o, sizeof o, NULL) < 0;
+    bouchee(s, 0);
+    n = datagramme_de(ra, o, sizeof o, NULL);
+    ioctl(s, SIOCOUTQ, &q3);
+    verifier(q0 == 0 && q1 > 100 && q2 - q1 == 1000 && pr == 1 && vide && n == 1100 && q3 == 0,
+             "UDP_CORK : SIOCOUTQ grandit de chaque ajout, POLLOUT reste ; retire, un datagramme de 1100, SIOCOUTQ 0");
+
+    /* La destination et les messages de contrôle des envois suivants ne
+     * comptent pas (une adresse de port 0, un IP_TTL de 300) ; write ajoute
+     * aussi, sans destination. */
+    envoyer_drapeaux(s, "ab", 2, MSG_MORE, pa);
+    ssize_t k0 = envoyer_drapeaux(s, "cd", 2, MSG_MORE, 0);
+    char c[CMSG_SPACE(sizeof(int))] = { 0 };
+    struct iovec iv = { "ef", 2 };
+    struct sockaddr_in b = adresse(LO, pb);
+    struct msghdr m = { .msg_name = &b, .msg_namelen = sizeof b, .msg_iov = &iv, .msg_iovlen = 1,
+                        .msg_control = c, .msg_controllen = sizeof c };
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = IPPROTO_IP;
+    h->cmsg_type = IP_TTL;
+    h->cmsg_len = CMSG_LEN(sizeof(int));
+    *(int *)CMSG_DATA(h) = 300;
+    ssize_t kt = sendmsg(s, &m, MSG_MORE);
+    ssize_t kw = write(s, "gh", 2);
+    n = datagramme_de(ra, o, sizeof o, NULL);
+    verifier(k0 == 2 && kt == 2 && kw == 2 && n == 8 && memcmp(o, "abcdefgh", 8) == 0 && datagramme_de(rb, o, sizeof o, NULL) < 0,
+             "bouchee : le port 0, un IP_TTL de 300 et write passent ; tout va a la premiere destination");
+    verifier(erreur(sendmsg(s, &m, 0)) == EINVAL && datagramme_de(rb, o, sizeof o, NULL) < 0, "sans bouchon, l'IP_TTL de 300 : EINVAL");
+
+    /* Plus de 65 535 octets, MSG_OOB : refusés avant le bouchon, qui reste. */
+    envoyer_drapeaux(s, "ab", 2, MSG_MORE, pa);
+    int e70000 = erreur(envoyer(s, o, 70000, pa));
+    int eoob = erreur(envoyer_drapeaux(s, "cd", 2, MSG_OOB, pa));
+    envoyer(s, "ef", 2, pa);
+    n = datagramme_de(ra, o, sizeof o, NULL);
+    verifier(e70000 == EMSGSIZE && eoob == EOPNOTSUPP && n == 4 && memcmp(o, "abef", 4) == 0,
+             "bouchee : 70 000 octets (EMSGSIZE) et MSG_OOB (EOPNOTSUPP) laissent le bouchon");
+
+    /* Trop en tout : EMSGSIZE, l'erreur locale, et le bouchon vidé. */
+    int un = 1;
+    setsockopt(s, IPPROTO_IP, IP_RECVERR, &un, sizeof un);
+    ssize_t k60 = envoyer_drapeaux(s, o, 60000, MSG_MORE, pa);
+    int etrop = erreur(envoyer_drapeaux(s, o, 5508, MSG_MORE, pa));
+    struct sock_extended_err ee;
+    struct sockaddr_in offender, nom;
+    struct in_pktinfo pi;
+    int drapeaux;
+    long nl = erreur_en_file(s, o, sizeof o, &ee, &offender, &nom, &drapeaux, &pi);
+    ssize_t k5507 = envoyer(s, o, 5507, pa);
+    n = datagramme_de(ra, o, sizeof o, NULL);
+    verifier(k60 == 60000 && etrop == EMSGSIZE && nl == 0 && ee.ee_errno == EMSGSIZE && ee.ee_origin == SO_EE_ORIGIN_LOCAL
+             && ee.ee_info == 65535 && k5507 == 5507 && n == 5507,
+             "60 000 octets bouches, puis 5 508 : EMSGSIZE, l'erreur locale (ee_info 65 535), et le bouchon vide");
+    int e65508 = erreur(envoyer_drapeaux(s, o, 65508, MSG_MORE, pa));
+    envoyer(s, "y", 1, pa);
+    n = datagramme_de(ra, o, sizeof o, NULL);
+    verifier(e65508 == EMSGSIZE && n == 1, "65 508 octets avec MSG_MORE : EMSGSIZE, rien ne reste");
+    un = 0;
+    setsockopt(s, IPPROTO_IP, IP_RECVERR, &un, sizeof un);
+
+    /* Un envoi vide avec MSG_MORE bouche aussi ; close perd le bouchon. */
+    envoyer_drapeaux(s, "", 0, MSG_MORE, pa);
+    envoyer(s, "ab", 2, pa);
+    n = datagramme_de(ra, o, sizeof o, NULL);
+    verifier(n == 2 && datagramme_de(ra, o, sizeof o, NULL) < 0, "un envoi vide avec MSG_MORE, puis 2 octets : un datagramme de 2");
+    envoyer_drapeaux(s, "ab", 2, MSG_MORE, pa);
+    close(s);
+    attendre_lo();
+    verifier(datagramme_de(ra, o, sizeof o, NULL) < 0, "close perd le bouchon");
+
+    /* Un shutdown n'arrête ni l'ajout, ni le départ ; avant le premier
+     * envoi, EPIPE. */
+    s = connectee_a(pa);
+    envoyer_drapeaux(s, "ab", 2, MSG_MORE, pa);
+    shutdown(s, SHUT_WR);
+    ssize_t ks1 = send(s, "cd", 2, MSG_MORE), ks2 = send(s, "ef", 2, 0);
+    n = datagramme_de(ra, o, sizeof o, NULL);
+    int epipe = erreur(send(s, "gh", 2, MSG_MORE));
+    verifier(ks1 == 2 && ks2 == 2 && n == 6 && memcmp(o, "abcdef", 6) == 0 && epipe == EPIPE,
+             "shutdown pendant le bouchon : l'ajout et le depart passent ; puis EPIPE");
+    close(s);
+
+    /* La déconnexion rend le port éphémère : le datagramme part avec le
+     * port d'alors (un nouveau, pris par l'envoi qui pousse ; 0 si c'est
+     * UDP_CORK retiré). */
+    s = connectee_a(pa);
+    struct sockaddr_in moi;
+    l = sizeof moi;
+    getsockname(s, (struct sockaddr *)&moi, &l);
+    send(s, "ab", 2, MSG_MORE);
+    struct sockaddr_in rien = { .sin_family = AF_UNSPEC };
+    connect(s, (struct sockaddr *)&rien, sizeof rien);
+    ssize_t kd = send(s, "cd", 2, 0);
+    n = datagramme_de(ra, o, sizeof o, &de);
+    verifier(kd == 2 && n == 4 && de != 0 && de != ntohs(moi.sin_port),
+             "bouchee, deconnectee : send ajoute, et le datagramme part d'un nouveau port");
+    close(s);
+    s = connectee_a(pa);
+    bouchee(s, 1);
+    send(s, "ab", 2, 0);
+    connect(s, (struct sockaddr *)&rien, sizeof rien);
+    bouchee(s, 0);
+    n = datagramme_de(ra, o, sizeof o, &de);
+    verifier(n == 2 && de == 0, "UDP_CORK, deconnectee, puis retire : le datagramme part du port 0");
+    close(s);
+
+    /* sendfile : ses rondes bouchent ; la fin du fichier pousse, sauf
+     * UDP_CORK ; plus de 65 507 octets : EMSGSIZE. */
+    char chemin[] = "/tmp/reseau-XXXXXX";
+    int f = mkstemp(chemin);
+    unlink(chemin);
+    memset(o, 'q', 3000);
+    int ecrit = write(f, o, 3000) == 3000;
+    s = connectee_a(pa);
+    off_t pos = 0;
+    ssize_t kf = sendfile(s, f, &pos, 100000);
+    n = datagramme_de(ra, o, sizeof o, NULL);
+    verifier(ecrit && kf == 3000 && n == 3000 && datagramme_de(ra, o, sizeof o, NULL) < 0,
+             "sendfile de 100 000 octets d'un fichier de 3 000 : un datagramme de 3 000");
+    bouchee(s, 1);
+    pos = 0;
+    kf = sendfile(s, f, &pos, 100000);
+    vide = datagramme_de(ra, o, sizeof o, NULL) < 0;
+    bouchee(s, 0);
+    n = datagramme_de(ra, o, sizeof o, NULL);
+    verifier(kf == 3000 && vide && n == 3000, "avec UDP_CORK, sendfile attend qu'on le retire");
+    memset(o, 1, sizeof o);
+    ecrit = ftruncate(f, 0) == 0 && pwrite(f, o, 65536, 0) == 65536 && pwrite(f, o, 34464, 65536) == 34464;
+    pos = 0;
+    int egros = erreur(sendfile(s, f, &pos, 100000));
+    verifier(ecrit && egros == EMSGSIZE && datagramme_de(ra, o, sizeof o, NULL) < 0, "sendfile d'un fichier de 100 000 octets : EMSGSIZE");
+    close(s);
+    close(f);
+
+    /* MSG_PROBE (tracepath) : la route seulement, rien ne part, sans
+     * regarder la taille (65 508 octets passent) ; bouchée, sans MSG_MORE,
+     * il pousse le bouchon sans ses octets ; avec MSG_MORE, il ne bouche
+     * pas ; une diffusion sans SO_BROADCAST : EACCES (la route le dit). */
+    s = udp(0);
+    ssize_t kp = envoyer_drapeaux(s, "abcd", 4, MSG_PROBE, pa);
+    attendre_lo();
+    int rien_parti = datagramme_de(ra, o, sizeof o, NULL) < 0;
+    ssize_t kg = envoyer_drapeaux(s, o, 65508, MSG_PROBE, pa);
+    envoyer_drapeaux(s, "ab", 2, MSG_MORE, pa);
+    ssize_t kc = envoyer_drapeaux(s, "cd", 2, MSG_PROBE, pa);
+    int ab = datagramme_de(ra, o, sizeof o, NULL) == 2 && memcmp(o, "ab", 2) == 0;
+    envoyer_drapeaux(s, "xy", 2, MSG_PROBE | MSG_MORE, pa);
+    envoyer(s, "zz", 2, pa);
+    int zz = datagramme_de(ra, o, sizeof o, NULL) == 2 && memcmp(o, "zz", 2) == 0;
+    struct sockaddr_in tous = { .sin_family = AF_INET, .sin_port = htons(pa), .sin_addr.s_addr = htonl(INADDR_BROADCAST) };
+    int eacces = erreur(sendto(s, "a", 1, MSG_PROBE, (struct sockaddr *)&tous, sizeof tous));
+    verifier(kp == 4 && rien_parti && kg == 65508 && kc == 2 && ab && zz && eacces == EACCES,
+             "MSG_PROBE : rien ne part (65 508 octets compris), il pousse le bouchon sans ses octets, n'en pose pas ; EACCES");
+    close(s);
+
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(erreur(setsockopt(t, SOL_UDP, UDP_CORK, &deux, sizeof deux)) == ENOPROTOOPT, "UDP_CORK d'une socket TCP : ENOPROTOOPT");
+    close(t);
+    close(ra);
+    close(rb);
+}
+
 int main(void)
 {
     creation();
@@ -1213,6 +1458,7 @@ int main(void)
     decalage_de_peek();
     diffusion_de_la_carte();
     sndbuf_attend();
+    bouchon();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

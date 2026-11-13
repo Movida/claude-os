@@ -9,8 +9,9 @@
 //! à toutes les sockets (recevoir, attendre, l'erreur en attente, l'arrêt)
 //! dans socket.rs.
 //!
-//! Ce qui manque, écrit : MSG_MORE et UDP_CORK ; la multidiffusion. (SO_SNDBUF fait attendre
-//! depuis les soldes d'avant 6k : datagramme::attendre_place.)
+//! Ce qui manque, écrit : la multidiffusion. (SO_SNDBUF fait attendre
+//! depuis les soldes d'avant 6k : datagramme::attendre_place ; MSG_MORE et
+//! UDP_CORK bouchent la socket depuis les mêmes : `Bouchon`.)
 //!
 //! LES COMPTEURS d'UDP (/proc/net/snmp, snmp.rs), aux places de Linux : à
 //! l'arrivée, un datagramme faux (InErrors, et InCsumErrors pour sa somme),
@@ -20,9 +21,9 @@
 //! (InDatagrams, socket.rs) ; à l'envoi, un datagramme parti (OutDatagrams)
 //! ou qui manque de place (SndbufErrors).
 
-use super::datagramme::{self, Controle};
+use super::datagramme::{self, Controle, Depart, trop_gros};
 use super::ipv4;
-use super::paquet::Paquet;
+use super::paquet::{self, Paquet};
 use super::icmp::ErreurRecue;
 use super::snmp::MIB;
 use super::socket::{self, Admission, AF_INET, AF_UNSPEC, Datagramme, ErreurEnFile, Inet, Rejet, Socket};
@@ -100,15 +101,34 @@ pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
     }
 }
 
+/// Le « bouchon » d'UDP (MSG_MORE, UDP_CORK) : un datagramme qui
+/// s'assemble envoi après envoi, et ne part qu'avec le dernier (le `pending`
+/// d'`udp_sock`, l'`inet_cork` et la `sk_write_queue` de Linux). Dans
+/// `Inet`, sous le `Mutex` : le `lock_sock` que Linux prend pour tout envoi
+/// bouché, attente de la place et copie comprises (un autre fil qui envoie
+/// attend son tour, et ajoute derrière). Son paquet compte dans SO_SNDBUF
+/// (mesuré : SIOCOUTQ le voit grandir de chaque ajout, POLLOUT aussi).
+pub struct Bouchon {
+    /// Le segment : la place de l'en-tête UDP, puis les données.
+    paquet: Paquet,
+    /// Ce que le premier envoi a fixé (la route, les adresses, la MTU, le
+    /// TTL et le TOS de ses messages de contrôle), et le port de
+    /// destination (`fl4_dport`). Le port source est celui de la socket
+    /// quand il part (mesuré : 0 si une déconnexion l'a rendu entre-temps).
+    depart: Depart,
+    port: u16,
+}
+
 /// Envoie `longueur` octets, que `remplir` copie du programme dans le
 /// paquet, à la destination `nom` (la `sockaddr` de sendto ou de sendmsg ;
 /// None : celle de la connexion), dans l'ordre d'`inet_sendmsg` et
 /// d'`udp_sendmsg` :
 ///   - un port éphémère s'il le faut, avant tout (EAGAIN) ;
-///   - plus de 65 535 octets : EMSGSIZE ; MSG_OOB : EOPNOTSUPP ; MSG_MORE
-///     (le « bouchon » d'UDP, qui réunit plusieurs envois en un
-///     datagramme) : EOPNOTSUPP, un écart : plutôt que d'envoyer en deux
-///     datagrammes ce qui n'en fait qu'un ;
+///   - plus de 65 535 octets : EMSGSIZE ; MSG_OOB : EOPNOTSUPP ;
+///   - un bouchon déjà posé (`Bouchon`) : les octets s'y ajoutent
+///     (`ajouter`), sans regarder la destination ni les messages de
+///     contrôle (mesuré : une adresse de port 0, un IP_TTL de 300 passent,
+///     et tout part vers la destination du premier envoi) ;
 ///   - la destination : moins de 16 octets, ou le port 0 : EINVAL ; une
 ///     autre famille qu'AF_INET ou AF_UNSPEC : EAFNOSUPPORT ; aucune, et
 ///     pas connectée : EDESTADDRREQ ;
@@ -116,15 +136,16 @@ pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
 ///     sort ici, EINVAL) ;
 ///   - ce que fait toute socket de datagrammes (`datagramme::preparer`) :
 ///     la route, l'adresse source, la MTU, l'erreur en attente, l'arrêt ;
-///   - la place dans SO_SNDBUF (`datagramme::attendre_place` : EAGAIN,
-///     ou l'attente) ; des morceaux au-delà de son double : ENOBUFS ;
-///   - le paquet (ENOBUFS), la copie (EFAULT), et il part.
+///   - le paquet (`datagramme::faire_paquet`) : la place dans SO_SNDBUF,
+///     les morceaux au-delà de son double, la copie ;
+///   - avec MSG_MORE ou UDP_CORK (`corkreq`), le bouchon se pose : le
+///     paquet attend ; sinon, il part.
 ///
-/// Rend la longueur envoyée. Une erreur après la destination (le `out:`
-/// d'`udp_sendmsg`) compte un SndbufErrors si c'est ENOBUFS, ou si la socket
-/// a déjà manqué de place (`place_manquee`, SOCK_NOSPACE) : Linux n'a pas
-/// d'autre compteur pour dire « la place a manqué » (son commentaire), même
-/// au prix d'en compter trop.
+/// Rend la longueur envoyée (ou ajoutée). Une erreur après les messages de
+/// contrôle (le `out:` d'`udp_sendmsg`) compte un SndbufErrors si c'est
+/// ENOBUFS, ou si la socket a déjà manqué de place (`place_manquee`,
+/// SOCK_NOSPACE) : Linux n'a pas d'autre compteur pour dire « la place a
+/// manqué » (son commentaire), même au prix d'en compter trop.
 pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u64, controle: Result<Controle, i64>,
                remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_OOB: u64 = 1;
@@ -134,24 +155,30 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     if longueur > 0xFFFF {
         return Err(-EMSGSIZE);
     }
-    if drapeaux & (MSG_OOB | MSG_MORE) != 0 {
+    if drapeaux & MSG_OOB != 0 {
         return Err(-EOPNOTSUPP);
     }
-    let (adresse, port) = match nom {
-        Some(o) => {
-            let Some(a) = socket::lire_adresse(o) else { return Err(-EINVAL) };
-            if a.famille != AF_INET && a.famille != AF_UNSPEC {
-                return Err(-EAFNOSUPPORT);
+    let bouche = inet.options.udp_cork || drapeaux & MSG_MORE != 0;
+    let envoye = if inet.bouchon.is_some() {
+        ajouter(s, &mut inet, longueur, bouche, drapeaux & datagramme::MSG_PROBE != 0, remplir)
+    } else {
+        let (adresse, port) = match nom {
+            Some(o) => {
+                let Some(a) = socket::lire_adresse(o) else { return Err(-EINVAL) };
+                if a.famille != AF_INET && a.famille != AF_UNSPEC {
+                    return Err(-EAFNOSUPPORT);
+                }
+                if a.port == 0 {
+                    return Err(-EINVAL);
+                }
+                (a.adresse, a.port)
             }
-            if a.port == 0 {
-                return Err(-EINVAL);
-            }
-            (a.adresse, a.port)
-        }
-        None if inet.connecte => (inet.distante, inet.port_distant),
-        None => return Err(-EDESTADDRREQ),
+            None if inet.connecte => (inet.distante, inet.port_distant),
+            None => return Err(-EDESTADDRREQ),
+        };
+        let c = controle?;
+        envoyer_vers(s, inet, adresse, port, longueur, drapeaux, bouche, &c, remplir)
     };
-    let envoye = envoyer_vers(s, inet, adresse, port, longueur, drapeaux, controle, remplir);
     if let Err(e) = envoye
         && (e == -ENOBUFS || s.place_manquee.load(Ordering::Relaxed))
     {
@@ -160,28 +187,151 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     envoye
 }
 
-/// La suite d'`envoyer`, vers `adresse`:`port`.
+/// La suite d'`envoyer`, vers `adresse`:`port`, sans bouchon posé. Sans
+/// MSG_MORE ni UDP_CORK, le `Mutex` est lâché pendant l'attente de la place
+/// et la copie (le chemin « sans verrou » d'`udp_sendmsg`), et repris pour
+/// l'en-tête ; avec, il est tenu jusqu'à la pose du bouchon (`lock_sock`).
 #[allow(clippy::too_many_arguments)]
 fn envoyer_vers(s: &Arc<Socket>, mut inet: GardeMutex<'_, Inet>, adresse: [u8; 4], port: u16, longueur: usize, drapeaux: u64,
-                controle: Result<Controle, i64>, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>)
-                -> Result<usize, i64> {
+                bouche: bool, c: &Controle, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_DONTWAIT: u64 = 0x40;
-    let c = controle?;
-    let (chemin, envoi) = datagramme::preparer(s, &mut inet, adresse, udp::ENTETE + longueur, format_ipv4::UDP, drapeaux, &c)?;
-    let adresse = envoi.destination;
-    let u = udp::Udp { source: inet.port, destination: port };
-    let delai = inet.options.sndtimeo;
+    let d = datagramme::preparer(s, &mut inet, adresse, udp::ENTETE + longueur, drapeaux, c)?;
+    // MSG_PROBE : la route seulement (`preparer`) ; pas de bouchon non plus
+    // (la file de Linux reste vide : `pending` revient à 0).
+    if drapeaux & datagramme::MSG_PROBE != 0 {
+        return Ok(longueur);
+    }
+    let (delai, pmtudisc) = (inet.options.sndtimeo, inet.options.pmtudisc);
+    let non_bloquant = drapeaux & MSG_DONTWAIT != 0;
+    let copier = |segment: &mut [u8]| remplir(0, &mut segment[udp::ENTETE..]);
+    if bouche {
+        let paquet = datagramme::faire_paquet(s, &d, udp::ENTETE + longueur, pmtudisc, non_bloquant, delai, copier)?;
+        inet.bouchon = Some(Bouchon { paquet, depart: d, port });
+        return Ok(longueur);
+    }
     drop(inet);
-    datagramme::attendre_place(s, drapeaux & MSG_DONTWAIT != 0, delai)?;
-    datagramme::morceaux_permis(s, udp::ENTETE + longueur, &envoi)?;
-    let Some(mut p) = Paquet::vide(udp::ENTETE + longueur) else { return Err(datagramme::jete(-ENOBUFS)) };
-    datagramme::attacher(s, &mut p);
-    let Some(segment) = p.ajouter_fin(udp::ENTETE + longueur) else { return Err(datagramme::jete(-ENOBUFS)) };
-    remplir(0, &mut segment[udp::ENTETE..]).map_err(datagramme::jete)?;
-    udp::ecrire(segment, &u, envoi.source, adresse);
-    ipv4::emettre(chemin, &envoi, p);
-    MIB.udp(Compteur::OutDatagrams);
+    let p = datagramme::faire_paquet(s, &d, udp::ENTETE + longueur, pmtudisc, non_bloquant, delai, copier)?;
+    emettre(&mut s.appels.verrouiller(), &d, port, p);
     Ok(longueur)
+}
+
+/// Ajoute `longueur` octets au bouchon de la socket (`ip_append_data` sur
+/// une file qui n'est pas vide), sous le `Mutex` : au-delà de ce qu'on a le
+/// droit d'envoyer en tout (`Depart::permis`, avec IP_MTU_DISCOVER d'alors
+/// et la MTU du premier envoi) : `trop_gros` ; un morceau de plus à
+/// faire (le datagramme passe une MTU de plus : les `sk_buff` que Linux
+/// enchaîne pendant qu'il bouche ont la géométrie de ses fragments,
+/// `format_ipv4::nombre_de_fragments`, et chacun coûte un `alloc_skb` et
+/// sa place dans SO_SNDBUF) quand ce que tient la socket irait au-delà du
+/// double de SO_SNDBUF : ENOBUFS ;
+/// plus de mémoire : ENOBUFS pour un morceau de plus, ENOMEM sinon (les
+/// `alloc_skb` et `sk_page_frag_refill` de Linux) ; la copie : EFAULT.
+/// Ni l'attente de la place, ni l'erreur en attente, ni l'arrêt ne
+/// comptent ici (mesuré : un shutdown(SHUT_WR) n'empêche ni l'ajout, ni le
+/// départ ; seul le premier envoi passe par `sock_alloc_send_skb`). Une
+/// erreur vide le bouchon (`udp_flush_pending_frames`) : tout ce qui
+/// attendait est perdu. Sans MSG_MORE ni UDP_CORK, le datagramme part.
+/// Avec MSG_PROBE (`sonde`), rien n'est ajouté ni vérifié (`ip_append_data`
+/// rend 0 aussitôt), mais sans MSG_MORE ni UDP_CORK le bouchon part quand
+/// même, sans ces octets-là (mesuré).
+fn ajouter(s: &Socket, inet: &mut Inet, longueur: usize, bouche: bool, sonde: bool,
+           mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
+    const ENOMEM: i64 = 12;
+    let pmtudisc = inet.options.pmtudisc;
+    if sonde {
+        if !bouche {
+            pousser(inet);
+        }
+        return Ok(longueur);
+    }
+    let Some(b) = inet.bouchon.as_mut() else { return Ok(0) };
+    let avant = b.paquet.longueur();
+    let apres = avant + longueur;
+    let r = if apres + format_ipv4::ENTETE > b.depart.permis(pmtudisc) {
+        let d = b.depart;
+        Err(trop_gros(s, inet, &d))
+    } else {
+        let (entete, mtu) = (format_ipv4::ENTETE, b.depart.mtu as usize);
+        let morceaux_avant = format_ipv4::nombre_de_fragments(avant, mtu, entete);
+        let nouveaux = format_ipv4::nombre_de_fragments(apres, mtu, entete) - morceaux_avant;
+        let retenue = longueur + nouveaux * (paquet::MARGE + paquet::SURCOUT);
+        // Chaque morceau neuf, avant d'être fait, ne doit pas mener ce que
+        // tient la socket, plus ce que cet ajout y a déjà mis (les octets
+        // qui remplissent le morceau en cours, puis les morceaux neufs
+        // d'avant, pleins), au-delà du double de SO_SNDBUF (le
+        // `wmem_alloc_delta` de `__ip_append_data`) : le plus exigeant est
+        // le dernier.
+        let plein = mtu.saturating_sub(entete) & !7;
+        let remplissage = plein.saturating_sub(avant - (morceaux_avant - 1) * plein);
+        let deja = remplissage + nouveaux.saturating_sub(1) * (paquet::MARGE + plein + paquet::SURCOUT);
+        if nouveaux > 0 && s.envois.as_ref().is_some_and(|r| r.octets() + deja > 2 * r.limite()) {
+            Err(datagramme::jete(-ENOBUFS))
+        } else {
+            match b.paquet.agrandir(longueur) {
+                None => Err(datagramme::jete(if nouveaux > 0 { -ENOBUFS } else { -ENOMEM })),
+                Some(o) => match remplir(0, o) {
+                    Err(e) => Err(datagramme::jete(e)),
+                    Ok(()) => {
+                        b.paquet.retenir_en_plus(retenue);
+                        Ok(longueur)
+                    }
+                },
+            }
+        }
+    };
+    if r.is_err() {
+        inet.bouchon = None;
+    } else if !bouche {
+        pousser(inet);
+    }
+    r
+}
+
+/// Le bouchon de la socket part, s'il y en a un (`udp_push_pending_frames`) :
+/// la fin d'un envoi sans MSG_MORE ni UDP_CORK, UDP_CORK retiré, la fin
+/// d'un sendfile (`fin_d_episse`). Sous le `Mutex`.
+pub fn pousser(inet: &mut Inet) {
+    if let Some(b) = inet.bouchon.take() {
+        emettre(inet, &b.depart, b.port, b.paquet);
+    }
+}
+
+/// Le segment `p` (la place de l'en-tête UDP, puis les données) part vers
+/// `d`, au port `port` (`udp_send_skb`), sous le `Mutex` : l'en-tête IPv4
+/// d'alors (`Depart::envoi`), l'en-tête UDP (le port de la socket d'alors)
+/// et sa somme, sur tout le segment.
+fn emettre(inet: &mut Inet, d: &Depart, port: u16, mut p: Paquet) {
+    let envoi = d.envoi(inet, p.longueur(), format_ipv4::UDP);
+    udp::ecrire(p.donnees_mut(), &udp::Udp { source: inet.port, destination: port }, envoi.source, envoi.destination);
+    ipv4::emettre(d.chemin, &envoi, p);
+    MIB.udp(Compteur::OutDatagrams);
+}
+
+/// UDP_CORK (`udp_lib_setsockopt`) : posé, tout envoi bouche ; retiré, le
+/// bouchon part, s'il y en a un (son erreur n'est pas rendue).
+pub fn boucher(s: &Socket, oui: bool) {
+    let mut inet = s.appels.verrouiller();
+    inet.options.udp_cork = oui;
+    if !oui {
+        pousser(&mut inet);
+    }
+}
+
+/// La fin d'un sendfile vers la socket (`udp_splice_eof`) : sans UDP_CORK,
+/// le bouchon des rondes envoyées avec MSG_MORE part.
+pub fn fin_d_episse(s: &Socket) {
+    let mut inet = s.appels.verrouiller();
+    if !inet.options.udp_cork {
+        pousser(&mut inet);
+    }
+}
+
+/// Le dernier close (`udp_destroy_sock`) : le bouchon est perdu, et la
+/// socket quitte la table des ports.
+pub fn fermer(s: &Socket) {
+    let bouchon = s.appels.verrouiller().bouchon.take();
+    drop(bouchon);
+    liberer(s);
 }
 
 /// Un datagramme UDP (`p` : le segment, en-tête compris, sans l'en-tête

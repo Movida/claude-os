@@ -260,6 +260,8 @@ pub struct Options {
     pub recverr: bool,
     /// IP_MTU_DISCOVER (IP_PMTUDISC_WANT, 1, par défaut).
     pub pmtudisc: u8,
+    /// UDP_CORK : tout envoi bouche la socket (udp.rs, `Bouchon`).
+    pub udp_cork: bool,
 }
 
 impl Options {
@@ -267,12 +269,12 @@ impl Options {
         reuseaddr: false, reuseport: false, broadcast: false, keepalive: false, debug: false, dontroute: false,
         oobinline: false, no_check: false, priority: 0, linger: (false, 0), rcvlowat: 1,
         rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, recverr: false, pmtudisc: 1,
+        udp_cork: false,
     };
 }
 
 /// Où est la socket (l'`inet_sock` de Linux), et ses options : sous le
 /// `Mutex`.
-#[derive(Clone, Copy)]
 pub struct Inet {
     /// A-t-elle un port (dans la table des ports) ?
     pub lie: bool,
@@ -290,6 +292,8 @@ pub struct Inet {
     /// L'identifiant IP des paquets d'une socket connectée (l'`inet_id`).
     pub identifiant: u16,
     pub options: Options,
+    /// Le datagramme d'UDP qui s'assemble (MSG_MORE, UDP_CORK).
+    pub bouchon: Option<super::udp::Bouchon>,
 }
 
 pub struct Socket {
@@ -366,6 +370,7 @@ impl Socket {
             appels: Mutex::new(Inet {
                 lie: false, adresse: [0; 4], port: 0, port_choisi: false, adresse_choisie: false, connecte: false,
                 distante: [0; 4], port_distant: 0, source: [0; 4], identifiant: 0, options: Options::DEFAUT,
+                bouchon: None,
             }),
             rcvbuf: AtomicU32::new(TAMPON_DEFAUT),
             sndbuf: AtomicU32::new(TAMPON_DEFAUT),
@@ -776,7 +781,8 @@ pub fn fermer(s: &Arc<Socket>) {
     match s.protocole {
         Protocole::Tcp => super::tcp::fermer(s),
         Protocole::Unix => super::unix::fermer(s),
-        _ => super::datagramme::table::retirer(s),
+        Protocole::Udp => super::udp::fermer(s),
+        Protocole::Ping => super::datagramme::table::retirer(s),
     }
 }
 
