@@ -43,7 +43,8 @@
  *     connect(AF_UNSPEC), le connect qui suit une erreur ; les lectures sans copie
  *     ni retrait ; une connexion morte qui garde son port, le SO_REUSEADDR des filles ;
  *   - les options de SOL_IP (les soldes d'avant 6k) : IP_PKTOPTIONS, IP_MINTTL, IP_FREEBIND,
- *     IP_BIND_ADDRESS_NO_PORT, une diffusion liée, IP_LOCAL_PORT_RANGE, IP_PROTOCOL.
+ *     IP_BIND_ADDRESS_NO_PORT, une diffusion liée, IP_LOCAL_PORT_RANGE, IP_PROTOCOL ;
+ *   - getsockname après la fin d'une connexion ou d'une écoute (l'ancien port se montre).
  * Les valeurs comparées sont celles d'un Linux 6.18 à sa configuration par défaut, sur l'hôte (le
  * Linux de référence) comme chez nous. Les délais sont des multiples de 4 ms (le tic du noyau :
  * HZ = 250 sous WSL, 1000 sous le Linux de référence).
@@ -2380,9 +2381,10 @@ static void sol_ip(void)
     poser(s, IP_BIND_ADDRESS_NO_PORT, 1);
     bind(s, (void *)&b, sizeof b);
     struct sockaddr u = { .sa_family = AF_UNSPEC };
-    ok = connect(s, (void *)&x, sizeof x) == 0 && adresse_de(s, &ip) != 0 && ip == INADDR_LOOPBACK;
-    verifier(ok && connect(s, &u, sizeof u) == 0 && (adresse_de(s, &ip), ip == INADDR_LOOPBACK),
-             "IP_BIND_ADDRESS_NO_PORT : le port a connect ; deconnectee, l'adresse reste");
+    int pc = connect(s, (void *)&x, sizeof x) == 0 ? adresse_de(s, &ip) : 0;
+    ok = pc != 0 && ip == INADDR_LOOPBACK;
+    verifier(ok && connect(s, &u, sizeof u) == 0 && adresse_de(s, &ip) == pc && ip == INADDR_LOOPBACK && option(s, IPPROTO_IP, IP_PROTOCOL) == 0,
+             "IP_BIND_ADDRESS_NO_PORT : le port a connect ; deconnectee, l'adresse reste, le port se montre sans etre tenu");
     close(s);
     close(l);
 
@@ -2409,6 +2411,75 @@ static void sol_ip(void)
              "IP_LOCAL_PORT_RANGE 40002-40003 : connect prend les deux, puis EADDRNOTAVAIL");
     for (int i = 0; i < 3; i++)
         close(t[i]);
+    close(l);
+}
+
+/* Ce que montre getsockname quand une connexion ou une écoute finit (`tcp_disconnect`) :
+ * l'adresse de bind reste, une autre redevient 0.0.0.0 ; un port qui n'était pas de bind est
+ * rendu (IP_PROTOCOL, `inet_num` : 0), mais se montre encore (`inet_sport` : mesuré). */
+static void nom_apres_la_fin(void)
+{
+    int port, l = ecoute(&port, 8);
+    struct sockaddr_in x = lo(port), b = lo(0);
+    struct sockaddr u = { .sa_family = AF_UNSPEC };
+    uint32_t ip;
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    int p = connect(s, (void *)&x, sizeof x) == 0 ? port_de(s) : 0;
+    int ok = p != 0 && connect(s, &u, sizeof u) == 0 && adresse_de(s, &ip) == p && ip == 0 && option(s, IPPROTO_IP, IP_PROTOCOL) == 0;
+    verifier(ok && connect(s, (void *)&x, sizeof x) == 0 && option(s, IPPROTO_IP, IP_PROTOCOL) == port_de(s),
+             "connect, AF_UNSPEC : 0.0.0.0 et l'ancien port, sans le tenir ; reconnectee, un port tenu");
+    close(s);
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    bind(s, (void *)&b, sizeof b);
+    p = connect(s, (void *)&x, sizeof x) == 0 ? port_de(s) : 0;
+    verifier(p != 0 && connect(s, &u, sizeof u) == 0 && adresse_de(s, &ip) == p && ip == INADDR_LOOPBACK && option(s, IPPROTO_IP, IP_PROTOCOL) == 0,
+             "bind de 127.0.0.1:0, connect, AF_UNSPEC : l'adresse de bind et l'ancien port");
+    close(s);
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    p = listen(s, 1) == 0 ? port_de(s) : 0;
+    verifier(p != 0 && connect(s, &u, sizeof u) == 0 && adresse_de(s, &ip) == p && ip == 0 && option(s, IPPROTO_IP, IP_PROTOCOL) == 0,
+             "listen sans bind, AF_UNSPEC : l'ancien port se montre, sans etre tenu");
+    close(s);
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in f = lo(port_ferme());
+    verifier(connect(s, (void *)&f, sizeof f) < 0 && errno == ECONNREFUSED && adresse_de(s, &ip) != 0 && ip == 0
+                 && option(s, IPPROTO_IP, IP_PROTOCOL) == 0,
+             "un connect refuse : 0.0.0.0 et le port de l'essai, sans le tenir");
+    close(s);
+    close(l);
+
+    /* La fin d'une connexion que le programme tient encore rend aussi un port qui n'était
+     * pas de bind (`tcp_set_state`, TCP_CLOSE : `inet_put_port`) : coupée par un RST, ou
+     * passée à TIME_WAIT ; getsockname le montre encore. Un port de bind reste tenu
+     * (SOCK_BINDPORT_LOCK). */
+    l = ecoute(&port, 4);
+    x = lo(port);
+    char o;
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    p = connect(s, (void *)&x, sizeof x) == 0 ? port_de(s) : 0;
+    couper(accept(l, NULL, NULL));
+    ok = recv(s, &o, 1, 0) < 0 && errno == ECONNRESET;
+    verifier(p != 0 && ok && option(s, IPPROTO_IP, IP_PROTOCOL) == 0 && adresse_de(s, &ip) == p && ip == INADDR_LOOPBACK,
+             "coupee par un RST : le port rendu (IP_PROTOCOL 0), getsockname le montre");
+    close(s);
+    int pb = port_ferme(), un = 1;
+    for (int lier = 0; lier < 2; lier++) {
+        s = socket(AF_INET, SOCK_STREAM, 0);
+        b = lo(pb);
+        setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &un, sizeof un);
+        if (lier)
+            bind(s, (void *)&b, sizeof b);
+        p = connect(s, (void *)&x, sizeof x) == 0 ? port_de(s) : 0;
+        int a = accept(l, NULL, NULL);
+        shutdown(s, SHUT_WR);
+        ok = recv(a, &o, 1, 0) == 0;
+        close(a);
+        ok = ok && recv(s, &o, 1, 0) == 0 && etat_de(s) == TCP_CLOSE;
+        verifier(p != 0 && ok && option(s, IPPROTO_IP, IP_PROTOCOL) == (lier ? pb : 0) && adresse_de(s, &ip) == p && ip == INADDR_LOOPBACK,
+                 lier ? "en TIME_WAIT, un port de bind : encore tenu (IP_PROTOCOL)"
+                      : "en TIME_WAIT, un port ephemere : rendu (IP_PROTOCOL 0), getsockname le montre");
+        close(s);
+    }
     close(l);
 }
 
@@ -2460,6 +2531,7 @@ int main(void)
     herites();
     peek_avec_decalage();
     sol_ip();
+    nom_apres_la_fin();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

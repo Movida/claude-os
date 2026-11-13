@@ -722,7 +722,7 @@ impl Partie {
                     t.redevenir_liee(self.numero, self.adresses.source);
                 } else {
                     t.retirer(self.numero);
-                    self.hors_table = true;
+                    self.quitter_la_table();
                 }
             }
             if self.hors_table {
@@ -824,8 +824,12 @@ impl Partie {
         self.hors_table = false;
         self.etablie_un_jour = false;
         self.connexion_en_cours = false;
-        // L'adresse de `bind` reste (SOCK_BINDADDR_LOCK), avec ou sans son port.
-        self.adresses = if a.adresse_choisie { Adresses { adresse: a.adresse, adresse_choisie: true, ..Adresses::default() } } else { Adresses::default() };
+        // L'adresse de `bind` reste (SOCK_BINDADDR_LOCK), avec ou sans son port. Un port qui
+        // n'était pas de `bind` est rendu, mais getsockname le montre encore (`inet_sport`, que
+        // `inet_put_port` ne remet pas à 0 : mesuré), sans que la socket le tienne (`lie` faux :
+        // IP_PROTOCOL dit 0, et `bind`, `listen` ou `connect` en prendra un).
+        let adresse = if a.adresse_choisie { a.adresse } else { [0; 4] };
+        self.adresses = Adresses { adresse, adresse_choisie: a.adresse_choisie, port: a.port, ..Adresses::default() };
         if a.port_choisi && dans_la_table {
             self.adresses = Adresses { lie: true, adresse: a.adresse, port: a.port, port_choisi: true, ..self.adresses };
         } else if a.port_choisi {
@@ -867,9 +871,17 @@ impl Partie {
         self.redevenir_neuve(s);
     }
 
-    /// La socket ne tient plus d'entrée dans la table.
+    /// La socket ne tient plus d'entrée dans la table : une connexion finie,
+    /// ou passée à TIME_WAIT. Un port qui n'était pas de `bind` est rendu
+    /// (`tcp_set_state`, TCP_CLOSE : `inet_put_port` sans SOCK_BINDPORT_LOCK) :
+    /// IP_PROTOCOL dit 0 (`lie` faux), getsockname le montre encore (mesuré,
+    /// coupée par un RST comme en TIME_WAIT) ; un port de `bind` se dit
+    /// encore tenu (en TIME_WAIT, l'entrée de la table le tient pour elle).
     fn quitter_la_table(&mut self) {
         self.hors_table = true;
+        if !self.adresses.port_choisi {
+            self.adresses.lie = false;
+        }
         if self.orpheline {
             ORPHELINES.fetch_sub(1, Ordering::Relaxed);
         }
@@ -1916,8 +1928,9 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
     }
 }
 
-/// L'adresse locale (getsockname) et distante (getpeername ; None : pas
-/// connectée).
+/// L'adresse locale (getsockname : celle où la socket reçoit, et son port,
+/// ou le dernier qu'elle a eu, `inet_sport`) et distante (getpeername ;
+/// None : pas connectée).
 pub fn nom(s: &Socket) -> ([u8; 4], u16) {
     let mut g = flux(s).posseder();
     let a = g.donnee().adresses;
