@@ -225,13 +225,13 @@ impl TimerFd {
 /// pris avant la copie, et la copie s'arrête à la première faute : elle
 /// rend les octets écrits jusque-là, EFAULT si aucun (`copy_to_iter`, pas
 /// `copy_to_iter_full` comme eventfd et signalfd) ; le compte est perdu
-/// dans les deux cas.
-pub fn lire_morceaux(o: &FichierTenu, morceaux: &[(u64, u64)]) -> Result<u64, i64> {
+/// dans les deux cas. `non_bloquant` : O_NONBLOCK, ou RWF_NOWAIT de
+/// preadv2.
+pub fn lire_morceaux(o: &FichierTenu, morceaux: &[(u64, u64)], non_bloquant: bool) -> Result<u64, i64> {
     if morceaux.iter().fold(0u64, |t, &(_, l)| t.saturating_add(l)) < 8 {
         return Err(-EINVAL);
     }
     let t = o.timerfd();
-    let non_bloquant = o.drapeaux as u64 & O_NONBLOCK != 0;
     let compte = loop {
         {
             let mut m = t.minuteur.verrouiller();

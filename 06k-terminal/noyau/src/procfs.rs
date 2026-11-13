@@ -770,6 +770,19 @@ pub fn donnees(source: u32, argument: u32) -> Donnees {
     Donnees::Noyau { source, argument, sequence: Default::default() }
 }
 
+/// Le fichier ouvert `f` se lit-il par `read_iter` chez Linux ? Ce qui
+/// décide des drapeaux RWF_* que preadv2 y accepte (appels_fichiers.rs,
+/// `operation`). Oui pour /proc/sys (`proc_sys_read`), /sys
+/// (`kernfs_fop_read_iter`), /proc/version et /proc/net/pnp
+/// (`proc_create_single` : `seq_read_iter`) ; non pour /proc/<pid> et le
+/// reste de /proc/net (`proc_create_net*`), lus par `seq_read` (mesuré sous
+/// Linux 6.18, `linux/fichiers.c` ; pnp lu dans les sources, le Linux de
+/// WSL n'ayant pas CONFIG_IP_PNP).
+pub fn par_iter(f: Fichier) -> bool {
+    let (source, _) = source(f);
+    matches!(source, BANNIERE | NET_PNP) || lecture(source) != Lecture::Sequence
+}
+
 /// La source du fichier ouvert `f` (d'un système du noyau), et son argument.
 pub fn source(f: Fichier) -> (u32, u32) {
     vfs::avec_systeme(|s, _| match &s.ouverts.fichier(f).donnees {

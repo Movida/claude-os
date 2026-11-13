@@ -115,6 +115,12 @@ const COPY_FILE_RANGE: u64 = 326;
 const PWRITE64: u64 = 18;
 const READV: u64 = 19;
 const WRITEV: u64 = 20;
+// readv et writev à une position, et avec des drapeaux (les soldes d'avant
+// 6k).
+const PREADV: u64 = 295;
+const PWRITEV: u64 = 296;
+const PREADV2: u64 = 327;
+const PWRITEV2: u64 = 328;
 const ACCESS: u64 = 21;
 const DUP: u64 = 32;
 const DUP2: u64 = 33;
@@ -287,6 +293,10 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         PWRITE64 => f::pwrite64(a[0], a[1], a[2], a[3]),
         READV => f::readv(a[0], a[1], a[2]),
         WRITEV => f::writev(a[0], a[1], a[2]),
+        PREADV => f::preadv(a[0], a[1], a[2], a[3], a[4]),
+        PWRITEV => f::pwritev(a[0], a[1], a[2], a[3], a[4]),
+        PREADV2 => f::preadv2(a[0], a[1], a[2], a[3], a[4], a[5]),
+        PWRITEV2 => f::pwritev2(a[0], a[1], a[2], a[3], a[4], a[5]),
         ACCESS => f::access(a[0], a[1]),
         FACCESSAT => f::faccessat2(a[0], a[1], a[2], 0),
         FACCESSAT2 => f::faccessat2(a[0], a[1], a[2], a[3]),
@@ -507,6 +517,10 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         PWRITE64 => ("pwrite64", 4),
         READV => ("readv", 3),
         WRITEV => ("writev", 3),
+        PREADV => ("preadv", 5),
+        PWRITEV => ("pwritev", 5),
+        PREADV2 => ("preadv2", 6),
+        PWRITEV2 => ("pwritev2", 6),
         ACCESS => ("access", 2),
         FACCESSAT => ("faccessat", 3),
         FACCESSAT2 => ("faccessat2", 4),

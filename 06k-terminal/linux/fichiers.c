@@ -19,10 +19,16 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
 #include <sys/file.h>
+#include <sys/inotify.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <signal.h>
+#include <sys/signalfd.h>
+#include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -1153,6 +1159,203 @@ static void temporaires(void)
     verifier(rmdir(d) == 0, "O_TMPFILE : le dossier est reste vide");
 }
 
+/* Les drapeaux de preadv2 et pwritev2 (include/uapi/linux/fs.h de Linux
+ * 6.18 ; la glibc n'a pas les derniers). */
+#define V_HIPRI 0x01
+#define V_DSYNC 0x02
+#define V_SYNC 0x04
+#define V_NOWAIT 0x08
+#define V_APPEND 0x10
+#define V_NOAPPEND 0x20
+#define V_ATOMIC 0x40
+#define V_DONTCACHE 0x80
+#define V_NOSIGNAL 0x100
+
+/* preadv2 ou pwritev2 d'un seul morceau, par syscall : la position telle
+ * quelle (-1 : celle du fichier), sa moitié haute à 0. */
+static long v2(int fd, int ecrire, const void *tampon, size_t longueur, long position, int drapeaux)
+{
+    struct iovec v = {(void *)tampon, longueur};
+    errno = 0;
+    return syscall(ecrire ? SYS_pwritev2 : SYS_preadv2, fd, &v, 1, position, 0L, drapeaux);
+}
+
+static volatile sig_atomic_t sigpipes;
+
+static void compter_sigpipe(int s)
+{
+    (void)s;
+    sigpipes++;
+}
+
+/* preadv, pwritev, preadv2 et pwritev2 (les soldes d'avant 6k), mesurés sous
+ * Linux 6.18 : readv et writev à une position ; à -1 (preadv2 et pwritev2),
+ * à celle du fichier, qui avance ; et les drapeaux RWF_*, que chaque sorte
+ * de fichier accepte selon son opération (read_iter, ou read seul : RWF_HIPRI
+ * seul permis) et selon qu'elle sait ne pas attendre (FMODE_NOWAIT). */
+static void vecteurs_a_une_position(void)
+{
+    /* Dans un tmpfs, comme notre /tmp : sur l'hôte, /tmp est souvent un
+     * overlay (le conteneur, la machine de référence), qui écrit dans le
+     * fichier du dessous, ouvert avec O_APPEND : RWF_NOAPPEND n'y fait rien
+     * (mesuré). Nous n'avons pas de /dev/shm. */
+    const char *dossier = access("/dev/shm", W_OK) == 0 ? "/dev/shm" : "/tmp";
+    char n[64], f[64], lu[16] = {0};
+    snprintf(n, sizeof n, "%s/fichiers.%d.v", dossier, getpid());
+    snprintf(f, sizeof f, "%s/fichiers.%d.fifo", dossier, getpid());
+    int fd = open(n, O_CREAT | O_EXCL | O_RDWR, 0600);
+    verifier(write(fd, "0123456789", 10) == 10 && lseek(fd, 2, SEEK_SET) == 2, "preadv : un fichier de 10 octets, a la position 2");
+    char x[3], y[4];
+    struct iovec w[2] = {{x, 3}, {y, 4}};
+    /* La moitié haute de la position est ignorée sur x86_64. */
+    verifier(syscall(SYS_preadv, fd, w, 2, 1L, 0x7777L) == 7 && memcmp(x, "123", 3) == 0 && memcmp(y, "4567", 4) == 0
+             && lseek(fd, 0, SEEK_CUR) == 2, "preadv : deux morceaux a la suite, a une position, sans bouger celle du fichier");
+    struct iovec e[2] = {{"ab", 2}, {"cd", 2}};
+    verifier(syscall(SYS_pwritev, fd, e, 2, 8L, 0L) == 4 && lseek(fd, 0, SEEK_CUR) == 2 && pread(fd, lu, 16, 0) == 12
+             && memcmp(lu, "01234567abcd", 12) == 0, "pwritev : au-dela de la fin, le fichier grandit, la position reste");
+    verifier(v2(fd, 0, lu, 3, -1, 0) == 3 && memcmp(lu, "234", 3) == 0 && lseek(fd, 0, SEEK_CUR) == 5,
+             "preadv2 a -1 : a la position du fichier, qui avance");
+    verifier(v2(fd, 1, "XY", 2, -1, 0) == 2 && lseek(fd, 0, SEEK_CUR) == 7 && pread(fd, lu, 2, 5) == 2 && memcmp(lu, "XY", 2) == 0,
+             "pwritev2 a -1 : de meme");
+
+    /* Les erreurs, dans l'ordre de Linux. */
+    struct iovec un = {lu, 1};
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_preadv, fd, &un, 1, -1L, 0L), EINVAL) && ERREUR(syscall(SYS_preadv, 999, &un, 1, -1L, 0L), EINVAL),
+             "preadv a -1 : EINVAL, avant le descripteur");
+    verifier(ERREUR(v2(999, 0, lu, 1, -1, 0), EBADF) && ERREUR(v2(fd, 0, lu, 1, -2, 0), EINVAL) && ERREUR(v2(999, 0, lu, 1, -2, 0), EINVAL),
+             "preadv2 : a -1, le descripteur (EBADF) ; a -2, EINVAL avant lui");
+    int p[2];
+    verifier(pipe(p) == 0, "un tube");
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_preadv, p[0], &un, 1, 0L, 0L), ESPIPE) && ERREUR(syscall(SYS_pwritev, p[1], &un, 1, 0L, 0L), ESPIPE),
+             "preadv et pwritev d'un tube : ESPIPE");
+    int ro = open(n, O_RDONLY);
+    verifier(ERREUR(v2(ro, 1, "z", 1, 0, 0x200), EBADF), "pwritev2 d'un fichier en lecture seule : EBADF, avant les drapeaux");
+    verifier(ERREUR(v2(fd, 0, lu, 1, 0, 0x200), EOPNOTSUPP) && v2(fd, 0, lu, 0, 0, 0x200) == 0,
+             "un drapeau inconnu : EOPNOTSUPP ; rien a lire : 0, sans regarder les drapeaux");
+    struct iovec trop[1025];
+    for (int i = 0; i < 1025; i++)
+        trop[i] = (struct iovec){lu, 1};
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_preadv2, fd, trop, 1025, 0L, 0L, 0x200), EINVAL), "1025 morceaux et un drapeau inconnu : EINVAL (les morceaux d'abord)");
+    struct iovec loin[2] = {{lu, 5}, {lu, 10}};
+    errno = 0;
+    verifier(ERREUR(syscall(SYS_preadv, fd, loin, 2, INT64_MAX - 12, 0L), EINVAL) && syscall(SYS_preadv, fd, loin, 1, INT64_MAX - 12, 0L) == 0,
+             "preadv a 2^63 - 13 : 5 + 10 octets, EINVAL (le total compte) ; 5 octets, 0");
+    verifier(ERREUR(v2(fd, 1, "z", 1, 0, V_APPEND | V_NOAPPEND), EINVAL) && ERREUR(v2(fd, 0, lu, 1, 0, V_ATOMIC), EOPNOTSUPP)
+             && ERREUR(v2(fd, 1, "z", 1, 0, V_ATOMIC), EOPNOTSUPP) && ERREUR(v2(fd, 0, lu, 1, 0, V_DONTCACHE), EOPNOTSUPP),
+             "RWF_APPEND avec RWF_NOAPPEND : EINVAL ; RWF_ATOMIC et RWF_DONTCACHE : EOPNOTSUPP (tmpfs)");
+    verifier(v2(fd, 0, lu, 1, 0, V_HIPRI | V_DSYNC | V_SYNC | V_NOSIGNAL) == 1 && v2(fd, 1, "0", 1, 0, V_HIPRI | V_DSYNC | V_SYNC | V_NOSIGNAL) == 1
+             && ERREUR(v2(fd, 0, lu, 1, 0, V_NOWAIT), EOPNOTSUPP) && ERREUR(v2(fd, 1, "0", 1, 0, V_NOWAIT), EOPNOTSUPP),
+             "un fichier : RWF_HIPRI, DSYNC, SYNC et NOSIGNAL permis ; RWF_NOWAIT, EOPNOTSUPP (tmpfs)");
+
+    /* L'ajout : RWF_APPEND écrit à la fin ; RWF_NOAPPEND, sur un fichier en
+     * O_APPEND, à la position donnée (ou à celle du fichier, à -1). */
+    verifier(ftruncate(fd, 4) == 0 && lseek(fd, 1, SEEK_SET) == 1 && v2(fd, 1, "ab", 2, 0, V_APPEND) == 2 && lseek(fd, 0, SEEK_CUR) == 1
+             && v2(fd, 1, "cd", 2, -1, V_APPEND) == 2 && lseek(fd, 0, SEEK_CUR) == 8 && pread(fd, lu, 8, 0) == 8
+             && memcmp(lu, "0123abcd", 8) == 0, "RWF_APPEND : a la fin ; a -1, la position du fichier y va aussi");
+    int aj = open(n, O_RDWR | O_APPEND);
+    struct iovec ef = {"ef", 2};
+    verifier(syscall(SYS_pwritev, aj, &ef, 1, 0L, 0L) == 2 && v2(aj, 1, "GH", 2, 1, V_NOAPPEND) == 2 && lseek(aj, 0, SEEK_CUR) == 0
+             && pread(fd, lu, 10, 0) == 10 && memcmp(lu, "0GH3abcdef", 10) == 0,
+             "O_APPEND : pwritev a la fin quand meme ; avec RWF_NOAPPEND, a la position donnee");
+    verifier(lseek(aj, 4, SEEK_SET) == 4 && v2(aj, 1, "IJ", 2, -1, V_NOAPPEND) == 2 && lseek(aj, 0, SEEK_CUR) == 6
+             && pread(fd, lu, 10, 0) == 10 && memcmp(lu, "0GH3IJcdef", 10) == 0,
+             "O_APPEND et RWF_NOAPPEND a -1 : a la position du fichier, qui avance");
+
+    /* Chaque sorte de fichier. */
+    int d = open("/tmp", O_RDONLY | O_DIRECTORY);
+    verifier(ERREUR(v2(d, 0, lu, 1, 0, V_HIPRI), EISDIR) && ERREUR(v2(d, 0, lu, 1, 0, V_DSYNC), EOPNOTSUPP),
+             "un dossier (read) : RWF_HIPRI, EISDIR ; RWF_DSYNC, EOPNOTSUPP");
+    int nul = open("/dev/null", O_RDWR), plein = open("/dev/full", O_RDWR);
+    verifier(v2(nul, 0, lu, 1, -1, V_NOWAIT) == 0 && v2(nul, 1, "z", 1, -1, V_NOWAIT) == 1, "/dev/null : RWF_NOWAIT permis");
+    verifier(ERREUR(v2(plein, 0, lu, 1, -1, V_NOWAIT), EOPNOTSUPP) && v2(plein, 0, lu, 1, -1, V_DSYNC) == 1
+             && ERREUR(v2(plein, 1, "z", 1, -1, V_HIPRI), ENOSPC) && ERREUR(v2(plein, 1, "z", 1, -1, V_DSYNC), EOPNOTSUPP),
+             "/dev/full : lu par read_iter, sans RWF_NOWAIT ; ecrit par write (RWF_DSYNC : EOPNOTSUPP)");
+    verifier(ERREUR(v2(p[0], 0, lu, 1, -1, V_NOWAIT), EAGAIN) && write(p[1], "abc", 3) == 3 && v2(p[0], 0, lu, 8, -1, V_NOWAIT) == 3,
+             "tube de pipe2, bloquant : RWF_NOWAIT, EAGAIN vide, sinon ce qu'il y a");
+    char chemin[32];
+    snprintf(chemin, sizeof chemin, "/proc/self/fd/%d", p[0]);
+    int r = open(chemin, O_RDONLY | O_NONBLOCK);
+    verifier(ERREUR(v2(r, 0, lu, 1, -1, V_NOWAIT), EOPNOTSUPP) && ERREUR(v2(r, 0, lu, 1, -1, V_HIPRI), EAGAIN),
+             "le meme tube rouvert par /proc/self/fd : pas de RWF_NOWAIT (fifo_open)");
+    verifier(mkfifo(f, 0600) == 0, "un tube nomme");
+    int fi = open(f, O_RDWR);
+    verifier(ERREUR(v2(fi, 0, lu, 1, -1, V_NOWAIT), EOPNOTSUPP) && ERREUR(v2(fi, 1, "z", 1, -1, V_NOWAIT), EOPNOTSUPP)
+             && v2(fi, 1, "z", 1, -1, V_DSYNC | V_NOSIGNAL) == 1 && v2(fi, 0, lu, 1, -1, V_DSYNC) == 1,
+             "tube nomme : pas de RWF_NOWAIT, les autres permis");
+    int sp[2];
+    verifier(socketpair(AF_UNIX, SOCK_STREAM, 0, sp) == 0 && ERREUR(v2(sp[0], 0, lu, 1, -1, V_NOWAIT), EAGAIN),
+             "socket bloquante : RWF_NOWAIT, EAGAIN");
+    uint64_t compte = 1;
+    int ev = eventfd(0, 0);
+    verifier(ERREUR(v2(ev, 0, &compte, 8, -1, V_NOWAIT), EAGAIN) && ERREUR(v2(ev, 1, &compte, 8, -1, V_DSYNC), EOPNOTSUPP)
+             && v2(ev, 1, &compte, 8, -1, V_HIPRI) == 8, "eventfd : lu par read_iter (RWF_NOWAIT : EAGAIN), ecrit par write (RWF_HIPRI seul)");
+    int tf = timerfd_create(CLOCK_MONOTONIC, 0);
+    verifier(ERREUR(v2(tf, 0, &compte, 8, -1, V_NOWAIT), EAGAIN) && ERREUR(v2(tf, 1, &compte, 8, -1, 0), EINVAL),
+             "timerfd : RWF_NOWAIT, EAGAIN ; ne s'ecrit pas, EINVAL");
+    sigset_t m, avant;
+    sigemptyset(&m);
+    sigaddset(&m, SIGUSR2);
+    sigprocmask(SIG_BLOCK, &m, &avant);
+    int sf = signalfd(-1, &m, 0);
+    struct signalfd_siginfo si;
+    verifier(ERREUR(v2(sf, 0, &si, sizeof si, -1, V_NOWAIT), EAGAIN), "signalfd : RWF_NOWAIT, EAGAIN");
+    struct iovec vide = {lu, 0};
+    verifier(readv(ev, &vide, 1) == 0 && readv(tf, &vide, 1) == 0 && readv(sf, &vide, 1) == 0 && ERREUR(read(ev, lu, 0), EINVAL)
+             && ERREUR(read(tf, lu, 0), EINVAL) && ERREUR(read(sf, lu, 0), EINVAL),
+             "eventfd, timerfd, signalfd : readv de 0 octet, 0 (un read de 0 octet : EINVAL)");
+    struct iovec au_noyau = {(void *)0xffff800000000000UL, 8};
+    int ep = epoll_create1(0);
+    errno = 0;
+    verifier(ERREUR(readv(ep, &au_noyau, 1), EINVAL) && ERREUR(readv(ep, &vide, 1), EINVAL) && ERREUR(writev(tf, &au_noyau, 1), EINVAL),
+             "readv d'un epoll, writev d'un timerfd : EINVAL avant les morceaux, meme vides");
+    int in = inotify_init1(IN_NONBLOCK);
+    verifier(ERREUR(v2(in, 0, lu, 16, -1, V_NOWAIT), EOPNOTSUPP) && ERREUR(v2(in, 0, lu, 16, -1, V_HIPRI), EAGAIN),
+             "inotify (read) : RWF_HIPRI seul");
+
+    /* /proc et /sys : par read (/proc/<pid>) ou par read_iter ; aucun sans
+     * attendre ; pwrite, ESPIPE pour un seq_file (même en lecture seule),
+     * EBADF pour /proc/sys. */
+    int st = open("/proc/self/status", O_RDONLY), ve = open("/proc/version", O_RDONLY);
+    int oc = open("/proc/sys/vm/overcommit_memory", O_RDONLY), cpu = open("/sys/devices/system/cpu/online", O_RDONLY);
+    verifier(ERREUR(v2(st, 0, lu, 1, 0, V_DSYNC), EOPNOTSUPP) && v2(st, 0, lu, 1, 0, V_HIPRI) == 1 && v2(ve, 0, lu, 1, 0, V_DSYNC) == 1
+             && v2(oc, 0, lu, 1, 0, V_DSYNC) == 1 && v2(cpu, 0, lu, 1, 0, V_DSYNC) == 1,
+             "/proc/self/status par read (RWF_HIPRI seul) ; /proc/version, /proc/sys et /sys par read_iter");
+    verifier(ERREUR(v2(ve, 0, lu, 1, 0, V_NOWAIT), EOPNOTSUPP) && ERREUR(v2(oc, 0, lu, 1, 0, V_NOWAIT), EOPNOTSUPP)
+             && ERREUR(v2(cpu, 0, lu, 1, 0, V_NOWAIT), EOPNOTSUPP), "/proc et /sys : pas de RWF_NOWAIT");
+    verifier(ERREUR(pwrite(st, "x", 1, 0), ESPIPE) && ERREUR(pwrite(cpu, "x", 1, 0), ESPIPE) && ERREUR(pwrite(oc, "x", 1, 0), EBADF),
+             "pwrite : /proc/self/status et /sys, ESPIPE ; /proc/sys en lecture seule, EBADF");
+    int co = open("/proc/self/comm", O_RDWR);
+    struct iovec nouveau = {"x", 1};
+    verifier(ERREUR(pwrite(co, "x", 1, 0), ESPIPE) && ERREUR(syscall(SYS_pwritev, co, &nouveau, 1, 0L, 0L), ESPIPE),
+             "/proc/self/comm ouvert en ecriture : pwrite et pwritev, ESPIPE");
+
+    /* RWF_NOSIGNAL : EPIPE, sans SIGPIPE. */
+    struct sigaction sa = {.sa_handler = compter_sigpipe}, ancien;
+    sigaction(SIGPIPE, &sa, &ancien);
+    sigset_t tuyau;
+    sigemptyset(&tuyau);
+    sigaddset(&tuyau, SIGPIPE);
+    sigprocmask(SIG_UNBLOCK, &tuyau, NULL);
+    close(p[0]);
+    close(r);
+    sigpipes = 0;
+    verifier(ERREUR(v2(p[1], 1, "z", 1, -1, V_NOSIGNAL), EPIPE) && sigpipes == 0 && ERREUR(v2(p[1], 1, "z", 1, -1, 0), EPIPE) && sigpipes == 1,
+             "tube sans lecteur : RWF_NOSIGNAL, EPIPE sans SIGPIPE");
+    close(sp[1]);
+    sigpipes = 0;
+    verifier(ERREUR(v2(sp[0], 1, "z", 1, -1, V_NOSIGNAL), EPIPE) && sigpipes == 0 && ERREUR(v2(sp[0], 1, "z", 1, -1, 0), EPIPE)
+             && sigpipes == 1, "socket sans pair : de meme");
+    sigaction(SIGPIPE, &ancien, NULL);
+    sigprocmask(SIG_SETMASK, &avant, NULL);
+    int tous[] = {fd, ro, aj, d, nul, plein, p[1], fi, sp[0], ev, tf, sf, ep, in, st, ve, oc, cpu, co};
+    for (unsigned i = 0; i < sizeof tous / sizeof *tous; i++)
+        close(tous[i]);
+    verifier(unlink(n) == 0 && unlink(f) == 0, "preadv : effacer le fichier et le tube nomme");
+}
+
 int main(int argc, char **argv)
 {
     (void)argc;
@@ -1171,6 +1374,7 @@ int main(int argc, char **argv)
     dossier_efface();
     temporaires();
     limite_de_taille();
+    vecteurs_a_une_position();
     struct stat st;
     verifier(unlink(nom_a) == 0 && stat(nom_a, &st) == -1 && errno == ENOENT, "effacer le fichier");
     printf("[linux] fichiers : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");

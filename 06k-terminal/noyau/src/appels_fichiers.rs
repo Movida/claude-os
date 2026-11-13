@@ -161,6 +161,8 @@ pub struct FichierTenu {
     pub lecture: bool,
     pub ecriture: bool,
     pub drapeaux: u32,
+    /// RWF_NOWAIT permis (`FichierOuvert::sans_attente`).
+    pub sans_attente: bool,
     pub fermer_a_l_exec: bool,
 }
 
@@ -198,6 +200,7 @@ impl FichierTenu {
             lecture: self.lecture,
             ecriture: self.ecriture,
             drapeaux: self.drapeaux,
+            sans_attente: self.sans_attente,
             fermer_a_l_exec: self.fermer_a_l_exec,
         }
     }
@@ -304,6 +307,7 @@ pub fn tenir_ouvert(s: &mut Systeme, f: Fichier) -> FichierTenu {
         lecture: o.lecture,
         ecriture: o.ecriture,
         drapeaux: o.drapeaux,
+        sans_attente: o.sans_attente,
         fermer_a_l_exec: false,
     }
 }
@@ -1578,21 +1582,23 @@ fn verifier_transfert(tampon: u64, longueur: u64, position: u64) -> Result<u64, 
 
 /// Lire, selon la sorte du fichier, `longueur` octets à `position` (ou à
 /// la position du fichier, `None`, qui avance d'autant : l'appelant tient
-/// son verrou, voir `verrous`).
-fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
-    // Un eventfd, un epoll, un tube ou une socket n'a pas de position :
-    // pread rend ESPIPE avant tout (FMODE_PREAD n'est pas mis) ; un epoll ne
-    // se lit pas (pas d'opération read : EINVAL, avant de regarder le
-    // tampon).
-    match o.sorte {
-        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd
-            if position.is_some() => return Err(-ESPIPE),
-        Sorte::Epoll => return Err(-EINVAL),
-        _ => {}
+/// son verrou, voir `verrous`). `rwf` : les drapeaux RWF_* de preadv2, déjà
+/// vérifiés (`verifier_rwf`) ; 0 pour les autres appels.
+fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64, rwf: u64) -> Result<u64, i64> {
+    // Un fichier sans position (un tube, une socket, un terminal, un
+    // eventfd...) : pread rend ESPIPE avant tout (FMODE_PREAD n'est pas mis,
+    // `ksys_pread64`) ; un epoll ne se lit pas (pas d'opération read :
+    // EINVAL, avant de regarder le tampon).
+    if position.is_some() && !a_des_positions(o) {
+        return Err(-ESPIPE);
+    }
+    if o.sorte == Sorte::Epoll {
+        return Err(-EINVAL);
     }
     if !o.lecture {
         return Err(-EBADF);
     }
+    let non_bloquant = non_bloquant(o, rwf);
     let ici = position.unwrap_or_else(|| o.position());
     let longueur = verifier_transfert(tampon, longueur, ici)?;
     match o.sorte {
@@ -1604,7 +1610,6 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
             Ok(lus)
         }
         Sorte::Dossier => Err(errno(Erreur::EISDIR)),
-        Sorte::Console if position.is_some() => Err(-ESPIPE),
         // La console n'est pas encore un terminal (6k) : rien à lire.
         Sorte::Null | Sorte::Console => Ok(0),
         Sorte::Zero | Sorte::Plein => zeros_vers_programme(tampon, longueur),
@@ -1613,7 +1618,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         // (`random_read_iter`, `urandom_read_iter`).
         Sorte::Aleatoire { random: true } => {
             if !aleatoire::pret() {
-                if o.drapeaux as u64 & O_NONBLOCK != 0 {
+                if non_bloquant {
                     return Err(-EAGAIN);
                 }
                 aleatoire::attendre_pret()?;
@@ -1625,12 +1630,12 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
             alea_vers_programme(tampon, longueur)
         }
         Sorte::Chemin => Err(-EBADF),
-        Sorte::EventFd => evenements::lire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
-        Sorte::Inotify => surveillance::lire(o.inotify().expect("une instance"), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
-        Sorte::TimerFd => crate::timerfd::lire_morceaux(o, &[(tampon, longueur)]),
-        Sorte::SignalFd => crate::signalfd::lire_morceaux(o, &[(tampon, longueur)]),
-        Sorte::Tube => en_resultat(o.tube().lire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0)),
-        Sorte::Socket => en_resultat(crate::appels_reseau::lire(o, &[(tampon, longueur)])),
+        Sorte::EventFd => evenements::lire(o.eventfd(), non_bloquant, tampon, longueur),
+        Sorte::Inotify => surveillance::lire(o.inotify().expect("une instance"), non_bloquant, tampon, longueur),
+        Sorte::TimerFd => crate::timerfd::lire_morceaux(o, &[(tampon, longueur)], non_bloquant),
+        Sorte::SignalFd => crate::signalfd::lire_morceaux(o, &[(tampon, longueur)], non_bloquant),
+        Sorte::Tube => en_resultat(o.tube().lire(&[(tampon, longueur)], non_bloquant)),
+        Sorte::Socket => en_resultat(crate::appels_reseau::lire(o, &[(tampon, longueur)], rwf & RWF_NOWAIT != 0)),
         Sorte::Epoll => Err(-EINVAL),
         Sorte::Noyau { .. } => {
             let contenu = procfs::lire(o.fichier(), ici, longueur)?;
@@ -1664,25 +1669,28 @@ pub fn verrou_d_ecriture(n: Numero) -> GardeMutex<'static, ()> {
 /// la lecture de la fin jusqu'à la nouvelle position : deux programmes qui
 /// ajoutent au même fichier ne s'écrasent pas (l'`inode_lock` de Linux,
 /// pendant tout `generic_file_write_iter`).
-fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64) -> Result<u64, i64> {
-    // Comme pour lire : ESPIPE, puis EINVAL pour un epoll.
-    match o.sorte {
-        Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd
-            if position.is_some() => return Err(-ESPIPE),
-        Sorte::Epoll => return Err(-EINVAL),
-        _ => {}
+fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64, rwf: u64) -> Result<u64, i64> {
+    // Comme pour lire : ESPIPE (FMODE_PWRITE, qui manque aussi à /proc et
+    // /sys : `ecrit_a_une_position`), puis EINVAL pour un epoll.
+    if position.is_some() && !ecrit_a_une_position(o) {
+        return Err(-ESPIPE);
+    }
+    if o.sorte == Sorte::Epoll {
+        return Err(-EINVAL);
     }
     if !o.ecriture {
         return Err(-EBADF);
     }
+    let non_bloquant = non_bloquant(o, rwf);
     let ici = position.unwrap_or_else(|| o.position());
     let longueur = verifier_transfert(tampon, longueur, ici)?;
     match o.sorte {
         Sorte::Fichier => {
             // O_APPEND : toujours à la fin, même pour pwrite (une
-            // bizarrerie de Linux, que décrit sa page de manuel).
+            // bizarrerie de Linux, que décrit sa page de manuel), sauf
+            // RWF_NOAPPEND ; RWF_APPEND : à la fin, même sans O_APPEND.
             let fin = vfs::avec(|fs, _| fs.attributs(o.numero()).taille);
-            let ici = if o.drapeaux as u64 & O_APPEND != 0 { fin } else { ici };
+            let ici = if en_ajout(o, rwf) { fin } else { ici };
             // La limite (EFBIG), puis les bits setuid et setgid, avant
             // d'écrire (`generic_write_checks`, puis `file_remove_privs`).
             limites_d_ecriture(ici, longueur as usize)?;
@@ -1695,7 +1703,6 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
             }
             Ok(ecrits)
         }
-        Sorte::Console if position.is_some() => Err(-ESPIPE),
         Sorte::Console => {
             // Les octets du programme passent par un tampon du noyau :
             // copiés d'abord, sans rien tenir (une copie peut fauter), puis
@@ -1738,16 +1745,17 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
         Sorte::Plein => Err(-ENOSPC),
         // Une instance d'inotify ne s'ouvre qu'en lecture.
         Sorte::Dossier | Sorte::Chemin | Sorte::Inotify => Err(-EBADF),
-        Sorte::EventFd => evenements::ecrire(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, tampon, longueur),
+        Sorte::EventFd => evenements::ecrire(o.eventfd(), non_bloquant, tampon, longueur),
         // Pas d'opération write (FMODE_CAN_WRITE manque) : EINVAL.
         Sorte::TimerFd | Sorte::SignalFd => Err(-EINVAL),
-        Sorte::Tube => en_resultat(o.tube().ecrire(&[(tampon, longueur)], o.drapeaux as u64 & O_NONBLOCK != 0,
-                                               o.drapeaux as u64 & O_DIRECT != 0)),
-        Sorte::Socket => en_resultat(crate::appels_reseau::ecrire(o, &[(tampon, longueur)])),
+        Sorte::Tube => en_resultat(o.tube().ecrire(&[(tampon, longueur)], non_bloquant, o.drapeaux as u64 & O_DIRECT != 0,
+                                               rwf & RWF_NOSIGNAL != 0)),
+        Sorte::Socket => en_resultat(crate::appels_reseau::ecrire(o, &[(tampon, longueur)], rwf & RWF_NOWAIT != 0,
+                                                                  rwf & RWF_NOSIGNAL != 0)),
         Sorte::Epoll => Err(-EINVAL),
         // Un fichier du noyau qui s'écrit (procfs::ecrivable : comm) :
         // seuls ses 15 premiers octets comptent, copiés d'abord, sans rien
-        // tenir ; la position ne sert pas (`comm_write`).
+        // tenir ; pas de position (pwrite : ESPIPE, plus haut ; `comm_write`).
         Sorte::Noyau { .. } => {
             let (source, argument) = procfs::source(o.fichier());
             let mut copie = [0u8; 15];
@@ -1776,7 +1784,7 @@ fn resultat(r: Result<u64, i64>) -> i64 {
 pub fn read(fd: u64, tampon: u64, longueur: u64) -> i64 {
     resultat(tenir(fd).and_then(|o| {
         let _verrous = verrous(&o, true, false);
-        annoncer(&o, IN_ACCESS, lire_ouvert(&o, None, tampon, longueur))
+        annoncer(&o, IN_ACCESS, lire_ouvert(&o, None, tampon, longueur, 0))
     }))
 }
 
@@ -1796,7 +1804,7 @@ fn annoncer(o: &FichierTenu, masque: u32, r: Result<u64, i64>) -> Result<u64, i6
 pub fn write(fd: u64, tampon: u64, longueur: u64) -> i64 {
     resultat(tenir(fd).and_then(|o| {
         let _verrous = verrous(&o, true, true);
-        annoncer(&o, IN_MODIFY, ecrire_ouvert(&o, None, tampon, longueur))
+        annoncer(&o, IN_MODIFY, ecrire_ouvert(&o, None, tampon, longueur, 0))
     }))
 }
 
@@ -1809,7 +1817,7 @@ pub fn pread64(fd: u64, tampon: u64, longueur: u64, position: u64) -> i64 {
     }
     resultat(tenir(fd).and_then(|o| {
         let _verrous = verrous(&o, false, false);
-        annoncer(&o, IN_ACCESS, lire_ouvert(&o, Some(position), tampon, longueur))
+        annoncer(&o, IN_ACCESS, lire_ouvert(&o, Some(position), tampon, longueur, 0))
     }))
 }
 
@@ -1820,7 +1828,7 @@ pub fn pwrite64(fd: u64, tampon: u64, longueur: u64, position: u64) -> i64 {
     }
     resultat(tenir(fd).and_then(|o| {
         let _verrous = verrous(&o, false, true);
-        annoncer(&o, IN_MODIFY, ecrire_ouvert(&o, Some(position), tampon, longueur))
+        annoncer(&o, IN_MODIFY, ecrire_ouvert(&o, Some(position), tampon, longueur, 0))
     }))
 }
 
@@ -1860,15 +1868,22 @@ pub fn morceaux(adresse: u64, nombre: u64) -> Result<Vec<(u64, u64)>, i64> {
     Ok(v)
 }
 
-/// readv et writev : morceau par morceau, jusqu'au premier qui n'est pas
-/// fait en entier (une fin de fichier, une faute) ; le total transféré,
-/// ou l'erreur du premier morceau si rien ne l'a été.
-fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
+/// readv, writev et leurs variantes à une position (preadv, pwritev,
+/// preadv2, pwritev2 : `position`, et les drapeaux RWF_* `rwf`) : tout ce
+/// qui se fait d'un coup (un tube, une socket...), ou morceau par morceau,
+/// jusqu'au premier qui n'est pas fait en entier (une fin de fichier, une
+/// faute) ; le total transféré, ou l'erreur du premier morceau si rien ne
+/// l'a été. Une position donnée à un fichier qui n'en a pas : ESPIPE,
+/// avant tout le reste (`do_preadv`, `do_pwritev`).
+fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool, position: Option<u64>, rwf: u64) -> i64 {
     let o = match tenir(fd) {
         Ok(o) => o,
         Err(e) => return e,
     };
-    let r = vecteur_tenu(&o, adresse, nombre, ecrire);
+    if position.is_some() && !(if ecrire { ecrit_a_une_position(&o) } else { a_des_positions(&o) }) {
+        return -ESPIPE;
+    }
+    let r = vecteur_tenu(&o, adresse, nombre, ecrire, position, rwf);
     // Ce qu'en voit inotify : writev comme write (au moins un octet) ;
     // readv, même 0 octet, une fin de fichier ou des morceaux vides
     // (`vfs_readv` : `if (ret >= 0) fsnotify_access(file)`, mesuré).
@@ -1878,106 +1893,268 @@ fn vecteur(fd: u64, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
     r
 }
 
-/// readv ou writev de `o`.
-fn vecteur_tenu(o: &FichierTenu, adresse: u64, nombre: u64, ecrire: bool) -> i64 {
+/// Les drapeaux de preadv2 et pwritev2 (include/uapi/linux/fs.h de 6.18),
+/// ceux d'une requête plutôt que du fichier ouvert : RWF_HIPRI (attendre
+/// un disque en le sondant), RWF_DSYNC et RWF_SYNC (O_DSYNC et O_SYNC pour
+/// cette écriture), RWF_NOWAIT (O_NONBLOCK pour cette requête), RWF_APPEND
+/// et RWF_NOAPPEND (O_APPEND pour cette écriture, ou pas), RWF_ATOMIC (une
+/// écriture tout ou rien sur le disque), RWF_DONTCACHE (ne pas garder les
+/// pages lues ou écrites), RWF_NOSIGNAL (EPIPE sans SIGPIPE).
+const RWF_HIPRI: u64 = 0x1;
+pub const RWF_NOWAIT: u64 = 0x8;
+const RWF_APPEND: u64 = 0x10;
+const RWF_NOAPPEND: u64 = 0x20;
+const RWF_ATOMIC: u64 = 0x40;
+const RWF_DONTCACHE: u64 = 0x80;
+pub const RWF_NOSIGNAL: u64 = 0x100;
+const RWF_SUPPORTED: u64 = 0x1ff;
+
+/// Par quelle opération Linux lit ou écrit un fichier de cette sorte : ce
+/// qui décide des drapeaux RWF_* qu'il accepte, et de l'ordre des erreurs
+/// (mesuré sous Linux 6.18 pour chaque sorte, `linux/fichiers.c`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Operation {
+    /// `read_iter` ou `write_iter` : les drapeaux passent par
+    /// `kiocb_set_rw_flags` (`verifier_rwf`).
+    Iter,
+    /// `read` ou `write` seulement : `do_loop_readv_writev` ne permet que
+    /// RWF_HIPRI (EOPNOTSUPP pour tout autre, même RWF_APPEND avec
+    /// RWF_NOAPPEND).
+    Boucle,
+    /// Ni l'un ni l'autre (FMODE_CAN_READ ou FMODE_CAN_WRITE manque) :
+    /// EINVAL, avant même de regarder les morceaux.
+    Aucune,
+}
+
+/// L'opération de `o` pour lire, ou pour écrire. Un dossier se lit par
+/// `generic_read_dir` (EISDIR), une instance d'inotify et les fichiers de
+/// /proc faits par `seq_read` (procfs::par_iter) par `read` ; /dev/full et
+/// un eventfd s'écrivent par `write` (ils se lisent par `read_iter`). Un
+/// epoll ne se lit ni ne s'écrit ; un timerfd et un signalfd ne s'écrivent
+/// pas.
+fn operation(o: &FichierTenu, ecrire: bool) -> Operation {
+    match (o.sorte, ecrire) {
+        (Sorte::Epoll, _) | (Sorte::TimerFd | Sorte::SignalFd, true) => Operation::Aucune,
+        (Sorte::Dossier | Sorte::Inotify, false) | (Sorte::Plein | Sorte::EventFd, true) => Operation::Boucle,
+        (Sorte::Noyau { .. }, _) if !procfs::par_iter(o.fichier()) => Operation::Boucle,
+        _ => Operation::Iter,
+    }
+}
+
+/// Les drapeaux RWF_* de `rwf` sont-ils permis à `o` (`kiocb_set_rw_flags`,
+/// ou `do_loop_readv_writev`) ? Dans l'ordre de Linux : un drapeau inconnu,
+/// EOPNOTSUPP ; RWF_APPEND avec RWF_NOAPPEND, EINVAL ; RWF_NOWAIT sur un
+/// fichier qui ne sait pas ne pas attendre (`sans_attente`), EOPNOTSUPP ;
+/// RWF_ATOMIC et RWF_DONTCACHE, EOPNOTSUPP sur tous nos fichiers : le
+/// premier demande une écriture O_DIRECT d'un système qui l'a promise
+/// (FMODE_CAN_ATOMIC_WRITE : ext4, xfs), le second un système qui sait
+/// lâcher ses pages (FOP_DONTCACHE : ext4, xfs, btrfs), ce que tmpfs ne
+/// fait pas. (Linux refuse aussi RWF_NOAPPEND à un inode en ajout seul,
+/// EPERM : chattr +a, que nous n'avons pas.) RWF_HIPRI, RWF_DSYNC et
+/// RWF_SYNC sont permis et sans effet ici : pas de disque à sonder, et le
+/// tmpfs n'a rien à écrire ailleurs (son fsync ne fait rien).
+fn verifier_rwf(o: &FichierTenu, operation: Operation, rwf: u64) -> Result<(), i64> {
+    match operation {
+        _ if rwf == 0 => Ok(()),
+        Operation::Boucle if rwf & !RWF_HIPRI != 0 => Err(-EOPNOTSUPP),
+        Operation::Boucle | Operation::Aucune => Ok(()),
+        Operation::Iter if rwf & !RWF_SUPPORTED != 0 => Err(-EOPNOTSUPP),
+        Operation::Iter if rwf & RWF_APPEND != 0 && rwf & RWF_NOAPPEND != 0 => Err(-EINVAL),
+        Operation::Iter if rwf & RWF_NOWAIT != 0 && !o.sans_attente => Err(-EOPNOTSUPP),
+        Operation::Iter if rwf & (RWF_ATOMIC | RWF_DONTCACHE) != 0 => Err(-EOPNOTSUPP),
+        Operation::Iter => Ok(()),
+    }
+}
+
+/// Lire ou écrire `o` sans attendre : O_NONBLOCK, ou RWF_NOWAIT pour cette
+/// requête (`(file->f_flags & O_NONBLOCK) || (iocb->ki_flags &
+/// IOCB_NOWAIT)` chez chaque sorte qui le connaît).
+fn non_bloquant(o: &FichierTenu, rwf: u64) -> bool {
+    o.drapeaux as u64 & O_NONBLOCK != 0 || rwf & RWF_NOWAIT != 0
+}
+
+/// Écrire à la fin de `o` (l'IOCB_APPEND de Linux) : O_APPEND, sauf
+/// RWF_NOAPPEND ; ou RWF_APPEND.
+fn en_ajout(o: &FichierTenu, rwf: u64) -> bool {
+    (o.drapeaux as u64 & O_APPEND != 0 && rwf & RWF_NOAPPEND == 0) || rwf & RWF_APPEND != 0
+}
+
+/// readv ou writev de `o`, dans l'ordre de `vfs_readv` et `vfs_writev` :
+/// pas ouvert pour cela, EBADF ; sans opération, EINVAL ; les morceaux
+/// (EINVAL, EFAULT) ; rien à transférer, 0, sans regarder ni la position,
+/// ni les drapeaux, ni le fichier (`if (!tot_len) goto out` : un eventfd,
+/// un timerfd ou un signalfd rendent 0 là où un read de 0 octet rend
+/// EINVAL) ; la position (`rw_verify_area`) ; les drapeaux ; puis le
+/// transfert.
+fn vecteur_tenu(o: &FichierTenu, adresse: u64, nombre: u64, ecrire: bool, position: Option<u64>, rwf: u64) -> i64 {
     if (ecrire && !o.ecriture) || (!ecrire && !o.lecture) {
         return -EBADF;
+    }
+    let operation = operation(o, ecrire);
+    if operation == Operation::Aucune {
+        return -EINVAL;
     }
     let morceaux = match morceaux(adresse, nombre) {
         Ok(m) => m,
         Err(e) => return e,
     };
-    // Un tube se lit et s'écrit d'un coup, sur tous les morceaux (le
-    // `read_iter` et le `write_iter` de Linux : un writev de PIPE_BUF octets
-    // en plusieurs morceaux reste atomique).
-    if o.sorte == Sorte::Tube {
-        let non_bloquant = o.drapeaux as u64 & O_NONBLOCK != 0;
-        return if ecrire {
-            o.tube().ecrire(&morceaux, non_bloquant, o.drapeaux as u64 & O_DIRECT != 0)
-        } else {
-            o.tube().lire(&morceaux, non_bloquant)
-        };
+    // `morceaux` a plafonné le total à RW_MAX : la somme ne déborde pas.
+    let total: u64 = morceaux.iter().map(|m| m.1).sum();
+    if total == 0 {
+        return 0;
     }
-    // Une socket aussi : un seul datagramme, de tous les morceaux, ou dans
-    // tous les morceaux (le `sock_read_iter` et le `sock_write_iter`).
-    if o.sorte == Sorte::Socket {
-        return if ecrire { crate::appels_reseau::ecrire(o, &morceaux) } else { crate::appels_reseau::lire(o, &morceaux) };
-    }
-    // Une instance d'inotify : morceau par morceau (surveillance.rs).
-    if o.sorte == Sorte::Inotify {
-        return resultat(surveillance::lire_morceaux(o.inotify().expect("une instance"), o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux));
-    }
-    // Un timerfd et un signalfd se lisent d'un coup, sur tous les
-    // morceaux, et ne s'écrivent pas (timerfd.rs, signalfd.rs).
-    if matches!(o.sorte, Sorte::TimerFd | Sorte::SignalFd) {
-        let r = match (ecrire, o.sorte) {
-            (true, _) => Err(-EINVAL),
-            (false, Sorte::TimerFd) => crate::timerfd::lire_morceaux(&o, &morceaux),
-            (false, _) => crate::signalfd::lire_morceaux(&o, &morceaux),
+    let non_bloquant = non_bloquant(o, rwf);
+    // Les sortes sans position (FMODE_STREAM : `rw_verify_area` n'a rien à
+    // y vérifier) : les drapeaux, puis tout d'un coup.
+    let flux = matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd)
+        || (o.sorte == Sorte::EventFd && !ecrire);
+    if flux {
+        if let Err(e) = verifier_rwf(o, operation, rwf) {
+            return e;
+        }
+        let r = match o.sorte {
+            // Un tube se lit et s'écrit d'un coup, sur tous les morceaux (le
+            // `read_iter` et le `write_iter` de Linux : un writev de PIPE_BUF
+            // octets en plusieurs morceaux reste atomique).
+            Sorte::Tube if ecrire => {
+                return o.tube().ecrire(&morceaux, non_bloquant, o.drapeaux as u64 & O_DIRECT != 0, rwf & RWF_NOSIGNAL != 0);
+            }
+            Sorte::Tube => return o.tube().lire(&morceaux, non_bloquant),
+            // Une socket aussi : un seul datagramme, de tous les morceaux, ou
+            // dans tous les morceaux (le `sock_read_iter` et le
+            // `sock_write_iter`).
+            Sorte::Socket if ecrire => {
+                return crate::appels_reseau::ecrire(o, &morceaux, rwf & RWF_NOWAIT != 0, rwf & RWF_NOSIGNAL != 0);
+            }
+            Sorte::Socket => return crate::appels_reseau::lire(o, &morceaux, rwf & RWF_NOWAIT != 0),
+            // Une instance d'inotify : morceau par morceau (surveillance.rs).
+            Sorte::Inotify => surveillance::lire_morceaux(o.inotify().expect("une instance"), non_bloquant, &morceaux),
+            // Un timerfd, un signalfd et un eventfd se lisent d'un coup, sur
+            // tous les morceaux (timerfd.rs, signalfd.rs, evenements.rs).
+            Sorte::TimerFd => crate::timerfd::lire_morceaux(o, &morceaux, non_bloquant),
+            Sorte::SignalFd => crate::signalfd::lire_morceaux(o, &morceaux, non_bloquant),
+            _ => evenements::lire_morceaux(o.eventfd(), non_bloquant, &morceaux),
         };
-        return match r {
-            Ok(n) => n as i64,
-            Err(e) => e,
-        };
-    }
-    // Un eventfd se lit d'un coup, sur tous les morceaux (evenements.rs).
-    if !ecrire && o.sorte == Sorte::EventFd {
-        return match evenements::lire_morceaux(o.eventfd(), o.drapeaux as u64 & O_NONBLOCK != 0, &morceaux) {
-            Ok(n) => n as i64,
-            Err(e) => e,
-        };
+        return resultat(r);
     }
     // Les verrous tenus sur tous les morceaux : chacun part de la position
     // où s'est arrêté le précédent, sans qu'un autre fil s'intercale.
-    let _verrous = verrous(o, true, ecrire);
+    let _verrous = verrous(o, position.is_none(), ecrire);
+    let depart = position.unwrap_or_else(|| o.position());
+    if depart.saturating_add(total) > i64::MAX as u64 {
+        return -EINVAL;
+    }
+    if let Err(e) = verifier_rwf(o, operation, rwf) {
+        return e;
+    }
     // Un fichier ordinaire s'écrit en un seul `write_iter` chez Linux
     // (`do_iter_readv_writev`) : ses limites (`generic_write_checks`) se
-    // vérifient une fois, sur le total, à la position de départ (la fin pour
-    // O_APPEND). SIGXFSZ seulement si elle est déjà à RLIMIT_FSIZE ; sinon,
-    // les morceaux sont coupés au total permis, et aucun ne part de la
-    // limite (morceau par morceau, le suivant enverrait SIGXFSZ, qui tue).
+    // vérifient une fois, sur le total, à la position de départ (la fin en
+    // ajout). SIGXFSZ seulement si elle est déjà à RLIMIT_FSIZE ; sinon, les
+    // morceaux sont coupés au total permis, et aucun ne part de la limite
+    // (morceau par morceau, le suivant enverrait SIGXFSZ, qui tue).
     let mut permis = u64::MAX;
     if ecrire && o.sorte == Sorte::Fichier {
-        let total = morceaux.iter().fold(0u64, |t, m| t.saturating_add(m.1));
-        let depart = if o.drapeaux as u64 & O_APPEND != 0 { vfs::avec(|fs, _| fs.attributs(o.numero()).taille) } else { o.position() };
+        let depart = if en_ajout(o, rwf) { vfs::avec(|fs, _| fs.attributs(o.numero()).taille) } else { depart };
         permis = match limites_d_ecriture(depart, total.min(isize::MAX as u64) as usize) {
             Ok(n) => n as u64,
             Err(e) => return e,
         };
     }
-    let mut total = 0u64;
+    let mut ici = position;
+    let mut fait = 0u64;
     for (base, longueur) in morceaux {
-        let longueur = longueur.min(permis - total);
+        let longueur = longueur.min(permis - fait);
         if longueur == 0 {
-            if total == permis {
+            if fait == permis {
                 break;
             }
             continue;
         }
-        let r = if ecrire { ecrire_ouvert(o, None, base, longueur) } else { lire_ouvert(o, None, base, longueur) };
+        let r = if ecrire { ecrire_ouvert(o, ici, base, longueur, rwf) } else { lire_ouvert(o, ici, base, longueur, rwf) };
         match r {
             Ok(n) => {
-                total += n;
+                fait += n;
+                // Une position donnée avance de morceau en morceau, celle du
+                // fichier restant où elle est (pour `None`, c'est
+                // `lire_ouvert` et `ecrire_ouvert` qui l'avancent).
+                if let Some(p) = ici.as_mut() {
+                    *p += n;
+                }
                 if n < longueur {
                     break;
                 }
             }
-            Err(e) if total == 0 => return e,
+            Err(e) if fait == 0 => return e,
             Err(_) => break,
         }
     }
-    total as i64
+    fait as i64
 }
 
 /// readv(fd, morceaux, nombre).
 pub fn readv(fd: u64, adresse: u64, nombre: u64) -> i64 {
-    vecteur(fd, adresse, nombre, false)
+    vecteur(fd, adresse, nombre, false, None, 0)
 }
 
 /// writev(fd, morceaux, nombre) : la glibc s'en sert pour ses messages
 /// d'erreur fatale, et pour vider ses tampons d'un coup.
 pub fn writev(fd: u64, adresse: u64, nombre: u64) -> i64 {
-    vecteur(fd, adresse, nombre, true)
+    vecteur(fd, adresse, nombre, true, None, 0)
+}
+
+/// La position de preadv, pwritev, preadv2 et pwritev2, en deux moitiés
+/// (`pos_from_hilo`), pour qu'un programme de 32 bits la passe en deux
+/// registres. Sur x86_64, la basse est la position entière : la haute,
+/// décalée deux fois de 32 bits dans un entier de 64, disparaît (un
+/// programme peut y mettre n'importe quoi : mesuré).
+fn position_en_deux(basse: u64, _haute: u64) -> i64 {
+    basse as i64
+}
+
+/// preadv et pwritev, et preadv2 et pwritev2 à une position : négative,
+/// EINVAL, avant même de regarder le descripteur.
+fn vecteur_a(fd: u64, adresse: u64, nombre: u64, ecrire: bool, position: i64, rwf: u64) -> i64 {
+    if position < 0 {
+        return -EINVAL;
+    }
+    vecteur(fd, adresse, nombre, ecrire, Some(position as u64), rwf)
+}
+
+/// preadv(fd, morceaux, nombre, position basse, haute) : readv à une
+/// position, sans bouger celle du fichier (libuv, donc Node.js, lit ainsi
+/// les fichiers).
+pub fn preadv(fd: u64, adresse: u64, nombre: u64, basse: u64, haute: u64) -> i64 {
+    vecteur_a(fd, adresse, nombre, false, position_en_deux(basse, haute), 0)
+}
+
+/// pwritev(fd, morceaux, nombre, position basse, haute). Sur un fichier en
+/// O_APPEND, à la fin quand même, comme pwrite.
+pub fn pwritev(fd: u64, adresse: u64, nombre: u64, basse: u64, haute: u64) -> i64 {
+    vecteur_a(fd, adresse, nombre, true, position_en_deux(basse, haute), 0)
+}
+
+/// preadv2(fd, morceaux, nombre, position basse, haute, drapeaux) : preadv
+/// avec des drapeaux RWF_* ; à la position -1, celle du fichier, qui avance
+/// (un readv avec drapeaux). Bun s'en sert pour essayer une lecture sans
+/// attendre sur un descripteur bloquant (RWF_NOWAIT ; EOPNOTSUPP sur un
+/// terminal, où il fait autrement). Les drapeaux sont un `int` (rwf_t) : la
+/// moitié haute du registre ne compte pas.
+pub fn preadv2(fd: u64, adresse: u64, nombre: u64, basse: u64, haute: u64, rwf: u64) -> i64 {
+    let rwf = rwf as u32 as u64;
+    match position_en_deux(basse, haute) {
+        -1 => vecteur(fd, adresse, nombre, false, None, rwf),
+        position => vecteur_a(fd, adresse, nombre, false, position, rwf),
+    }
+}
+
+/// pwritev2(fd, morceaux, nombre, position basse, haute, drapeaux).
+pub fn pwritev2(fd: u64, adresse: u64, nombre: u64, basse: u64, haute: u64, rwf: u64) -> i64 {
+    let rwf = rwf as u32 as u64;
+    match position_en_deux(basse, haute) {
+        -1 => vecteur(fd, adresse, nombre, true, None, rwf),
+        position => vecteur_a(fd, adresse, nombre, true, position, rwf),
+    }
 }
 
 /// lseek(fd, décalage, d'où) : SEEK_SET, SEEK_CUR, SEEK_END, et pour un
@@ -3753,6 +3930,16 @@ pub fn fadvise64(fd: u64, _position: u64, longueur: u64, conseil: u64) -> i64 {
 fn a_des_positions(o: &FichierTenu) -> bool {
     !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console | Sorte::EventFd | Sorte::Epoll | Sorte::Inotify | Sorte::TimerFd
                        | Sorte::SignalFd)
+}
+
+/// Une position donnée a un sens pour écrire (FMODE_PWRITE ; sinon ESPIPE) :
+/// comme pour lire, sauf un fichier du noyau fait d'enregistrements (/proc,
+/// sauf /proc/sys, et /sys : `seq_open` retire FMODE_PWRITE, « pour des
+/// raisons historiques »), même ouvert en lecture seule (mesuré : pwrite
+/// de /proc/self/status, ESPIPE ; de /proc/sys/vm/overcommit_memory,
+/// EBADF).
+fn ecrit_a_une_position(o: &FichierTenu) -> bool {
+    a_des_positions(o) && !matches!(o.sorte, Sorte::Noyau { lecture: Lecture::Sequence | Lecture::Attribut })
 }
 
 /// Le fichier se positionne (FMODE_LSEEK, que `splice_direct_to_actor`

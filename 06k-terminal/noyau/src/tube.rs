@@ -519,8 +519,9 @@ impl Tube {
     /// SIGPIPE et EPIPE ; le reste de la longueur modulo 4096 collé à la
     /// dernière page s'il y tient, puis des pages entières ; plein, attendre
     /// un lecteur (EAGAIN en non bloquant, ERESTARTSYS sur un signal, ce qui
-    /// est écrit étant rendu). `paquets` : O_DIRECT.
-    pub fn ecrire(&self, morceaux: &[(u64, u64)], non_bloquant: bool, paquets: bool) -> i64 {
+    /// est écrit étant rendu). `paquets` : O_DIRECT. `sans_signal` :
+    /// RWF_NOSIGNAL de pwritev2, EPIPE sans SIGPIPE (IOCB_NOSIGNAL).
+    pub fn ecrire(&self, morceaux: &[(u64, u64)], non_bloquant: bool, paquets: bool, sans_signal: bool) -> i64 {
         let mut m = Morceaux { reste: morceaux, fait: 0 };
         m.avancer(0, morceaux.first().map_or(0, |&(_, l)| l));
         let total = m.restant();
@@ -541,7 +542,9 @@ impl Tube {
         'ecrire: {
             let e = self.etat();
             if e.lecteurs == 0 {
-                signaux::au_fil_courant(SIGPIPE);
+                if !sans_signal {
+                    signaux::au_fil_courant(SIGPIPE);
+                }
                 r = -EPIPE;
                 break 'ecrire;
             }
@@ -567,7 +570,9 @@ impl Tube {
             loop {
                 let e = self.etat();
                 if apres_attente && e.lecteurs == 0 {
-                    signaux::au_fil_courant(SIGPIPE);
+                    if !sans_signal {
+                        signaux::au_fil_courant(SIGPIPE);
+                    }
                     if r == 0 {
                         r = -EPIPE;
                     }
@@ -1036,6 +1041,9 @@ pub fn pipe2(tableau: u64, drapeaux: u64) -> i64 {
     let bout = |lecture: bool, ecriture: bool, etat: u32| {
         let ouvert = Ouvert { numero, cree: false, tronquer: false, ecrivain: false };
         let mut f = FichierOuvert::new(Sorte::Tube, Tenu::Tmpfs(ouvert), lecture, ecriture, etat, b"pipe");
+        // RWF_NOWAIT permis aux deux bouts d'un pipe2, et à eux seuls
+        // (`create_pipe_files` : « pipe groks IOCB_NOWAIT »).
+        f.sans_attente = true;
         f.chemin = nom(numero.0);
         f.prive = Prive::Tube(tube.clone(), 0);
         f

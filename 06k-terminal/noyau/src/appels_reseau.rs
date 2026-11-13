@@ -65,6 +65,7 @@ const SOCK_PACKET: i32 = 10;
 const MSG_OOB: u64 = 1;
 const MSG_TRUNC: u32 = 0x20;
 const MSG_DONTWAIT: u64 = 0x40;
+const MSG_NOSIGNAL: u64 = 0x4000;
 const MSG_CTRUNC: u32 = 0x08;
 const MSG_ERRQUEUE: u64 = 0x2000;
 const MSG_WAITFORONE: u64 = 0x10000;
@@ -657,7 +658,6 @@ fn envoyer_avec(o: &FichierTenu, nom: Option<&[u8]>, longueur: usize, remplir: i
         // TCP : l'adresse donnée est ignorée (mesuré) ; EPIPE envoie aussi
         // SIGPIPE, sauf MSG_NOSIGNAL (`sk_stream_error`).
         Protocole::Tcp => {
-            const MSG_NOSIGNAL: u64 = 0x4000;
             if let Err(e) = controle {
                 return e;
             }
@@ -1935,12 +1935,13 @@ fn lire_option_ip(s: &Socket, option: i32) -> Result<i32, i64> {
 }
 
 /// read et readv d'une socket (`sock_read_iter`) : rien à lire demandé :
-/// 0, sans attendre ; sinon une réception, l'émetteur oublié.
-pub fn lire(o: &FichierTenu, morceaux: &[(u64, u64)]) -> i64 {
+/// 0, sans attendre ; sinon une réception, l'émetteur oublié. `sans_attente`
+/// : RWF_NOWAIT de preadv2 (IOCB_NOWAIT), un MSG_DONTWAIT.
+pub fn lire(o: &FichierTenu, morceaux: &[(u64, u64)], sans_attente: bool) -> i64 {
     if total(morceaux) == 0 {
         return 0;
     }
-    match recevoir(o, morceaux, 0) {
+    match recevoir(o, morceaux, if sans_attente { MSG_DONTWAIT } else { 0 }) {
         Ok(r) => r.recu.longueur as i64,
         Err(e) => e,
     }
@@ -1948,9 +1949,11 @@ pub fn lire(o: &FichierTenu, morceaux: &[(u64, u64)]) -> i64 {
 
 /// write et writev d'une socket (`sock_write_iter`) : un envoi sans
 /// destination (celle de la connexion ; pas connectée : EDESTADDRREQ, même
-/// pour 0 octet).
-pub fn ecrire(o: &FichierTenu, morceaux: &[(u64, u64)]) -> i64 {
-    envoyer(o, None, morceaux, 0, Ok(Controle::default()), unix::Scm::default())
+/// pour 0 octet). RWF_NOWAIT et RWF_NOSIGNAL de pwritev2 (`sans_attente`,
+/// `sans_signal`) : MSG_DONTWAIT et MSG_NOSIGNAL.
+pub fn ecrire(o: &FichierTenu, morceaux: &[(u64, u64)], sans_attente: bool, sans_signal: bool) -> i64 {
+    let drapeaux = if sans_attente { MSG_DONTWAIT } else { 0 } | if sans_signal { MSG_NOSIGNAL } else { 0 };
+    envoyer(o, None, morceaux, drapeaux, Ok(Controle::default()), unix::Scm::default())
 }
 
 /// Un envoi d'octets du noyau sur une socket, une ronde de sendfile (6i :

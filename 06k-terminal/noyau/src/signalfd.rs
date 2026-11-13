@@ -177,15 +177,14 @@ fn prendre(s: &SignalFd, non_bloquant: bool) -> Result<Info, i64> {
 /// l'autre. Seul le premier est attendu (s'il le faut) : les suivants, s'il
 /// y en a déjà. Un signal est pris avant d'être copié : une copie qui
 /// échoue le perd, et rend EFAULT si rien n'a été écrit avant lui, sinon
-/// ce qui l'a été.
-pub fn lire_morceaux(o: &FichierTenu, morceaux: &[(u64, u64)]) -> Result<u64, i64> {
+/// ce qui l'a été. `non_bloquant` : O_NONBLOCK, ou RWF_NOWAIT de preadv2.
+pub fn lire_morceaux(o: &FichierTenu, morceaux: &[(u64, u64)], mut non_bloquant: bool) -> Result<u64, i64> {
     let total = morceaux.iter().fold(0u64, |t, &(_, l)| t.saturating_add(l));
     let mut reste = total / TAILLE;
     if reste == 0 {
         return Err(-EINVAL);
     }
     let s = o.signalfd();
-    let mut non_bloquant = o.drapeaux as u64 & O_NONBLOCK != 0;
     let mut faits = 0u64;
     while reste > 0 {
         let echec = match prendre(s, non_bloquant) {

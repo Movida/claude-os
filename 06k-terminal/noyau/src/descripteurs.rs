@@ -177,6 +177,10 @@ pub struct FichierOuvert {
     /// Les drapeaux d'état qui restent (O_APPEND, O_NONBLOCK...), comme
     /// les rend F_GETFL.
     pub drapeaux: u32,
+    /// Il sait lire et écrire sans attendre à la demande, sans O_NONBLOCK :
+    /// preadv2 et pwritev2 y acceptent RWF_NOWAIT (le FMODE_NOWAIT de Linux,
+    /// propre au fichier ouvert, pas à l'inode : voir `new`).
+    pub sans_attente: bool,
     /// La position (pour un dossier : celle de `lire_dossier`).
     pub position: u64,
     /// Ce qui est propre à sa sorte, sous le verrou des fichiers (/proc)...
@@ -211,7 +215,18 @@ pub struct FichierOuvert {
 impl FichierOuvert {
     pub fn new(sorte: Sorte, tenu: Tenu, lecture: bool, ecriture: bool, drapeaux: u32, chemin: &[u8]) -> FichierOuvert {
         let nom = NomCourt::de(chemin.rsplit(|&o| o == b'/').find(|n| !n.is_empty()).unwrap_or(chemin));
-        FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, position: 0, donnees: Donnees::Aucune, prive: Prive::Aucun,
+        // FMODE_NOWAIT, là où Linux 6.18 le met à l'ouverture (mesuré par
+        // `linux/fichiers.c`) : /dev/null, /dev/zero, /dev/random et
+        // /dev/urandom (la table `devlist` de drivers/char/mem.c ; pas
+        // /dev/full), toute socket (`sock_alloc_file`), un eventfd, un
+        // timerfd et un signalfd (`anon_inode_getfile_fmode`). Un tube
+        // seulement s'il vient de pipe2 (`create_pipe_files`) : pas un tube
+        // nommé, ni un tube rouvert par /proc/<pid>/fd, qui passent par
+        // `fifo_open` (tube.rs : `pipe2` le met lui-même). Ni un fichier du
+        // tmpfs (shmem ne le met pas), ni un terminal, ni /proc ou /sys.
+        let sans_attente = matches!(sorte, Sorte::Null | Sorte::Zero | Sorte::Aleatoire { .. } | Sorte::Socket | Sorte::EventFd
+                                           | Sorte::TimerFd | Sorte::SignalFd);
+        FichierOuvert { sorte, tenu, lecture, ecriture, drapeaux, sans_attente, position: 0, donnees: Donnees::Aucune, prive: Prive::Aucun,
                        surveillants: Vec::new(), proprietaire: None, nom, chemin: Vec::new(), lieu: None, references: 1 }
     }
 
