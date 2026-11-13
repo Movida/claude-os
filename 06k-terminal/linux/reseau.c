@@ -50,7 +50,12 @@
  *     le perd, sendfile bouche ses rondes et pousse à la fin du fichier ;
  *   - les options de SOL_IP (les soldes d'avant 6k), une à une, pour UDP et
  *     ping, puis IP_FREEBIND (et la source qui n'est pas à nous :
- *     ENETUNREACH), IP_BIND_ADDRESS_NO_PORT, IP_LOCAL_PORT_RANGE.
+ *     ENETUNREACH), IP_BIND_ADDRESS_NO_PORT, IP_LOCAL_PORT_RANGE ;
+ *   - les messages de contrôle de la réception IP (les soldes d'avant 6k),
+ *     dans l'ordre de Linux, d'un datagramme, d'une réponse de ping et
+ *     d'une erreur en file ; `reseau carte`, que lance make tests-qemu
+ *     (test-carte) : ceux de datagrammes envoyés par l'hôte, venus par la
+ *     carte (la somme d'UDP, la taille des morceaux).
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic du noyau : HZ = 250 sous WSL, 1000 sous le Linux de référence).
  */
@@ -1651,8 +1656,269 @@ static void sol_ip(void)
     close(s);
 }
 
-int main(void)
+/* Les messages de contrôle d'une réception, à la suite, en texte : pour
+ * chacun « type:longueur:octets » (le niveau, toujours IPPROTO_IP, n'est
+ * pas écrit), séparés d'une espace. */
+static void controles_en_texte(struct msghdr *m, char *t, size_t n)
 {
+    size_t k = 0;
+    t[0] = 0;
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(m); h && k + 8 < n; h = CMSG_NXTHDR(m, h)) {
+        size_t l = h->cmsg_len - CMSG_LEN(0);
+        k += snprintf(t + k, n - k, "%s%d:%zu:", k ? " " : "", h->cmsg_type, l);
+        for (size_t i = 0; i < l && k + 3 < n; i++)
+            k += snprintf(t + k, n - k, "%02x", CMSG_DATA(h)[i]);
+    }
+}
+
+/* Des octets en hexadécimal, à la suite de t. */
+static void en_hexa(char *t, const void *o, size_t n)
+{
+    t += strlen(t);
+    for (size_t i = 0; i < n; i++)
+        t += sprintf(t, "%02x", ((const unsigned char *)o)[i]);
+}
+
+/* La somme de Linux (`csum_partial` d'x86-64), que rend IP_CHECKSUM : les
+ * mots de 32 bits petit-boutistes, la fin complétée de zéros, ajoutés en
+ * complément à un. */
+static uint32_t somme_linux(const unsigned char *o, size_t n)
+{
+    uint64_t s = 0;
+    for (size_t i = 0; i < n; i += 4) {
+        uint32_t m = 0;
+        memcpy(&m, o + i, n - i < 4 ? n - i : 4);
+        s += m;
+    }
+    while (s >> 32)
+        s = (s & 0xffffffff) + (s >> 32);
+    return s;
+}
+
+/* `csum_sub` : a moins b. */
+static uint32_t somme_moins(uint32_t a, uint32_t b)
+{
+    uint32_t s = a + ~b;
+    return s + (s < ~b);
+}
+
+/* Tous les drapeaux de réception de SOL_IP. */
+static void tous_les_controles(int s)
+{
+    int drapeaux[] = { IP_PKTINFO, IP_RECVTTL, IP_RECVTOS, IP_RECVOPTS, IP_RETOPTS, IP_PASSSEC, IP_RECVORIGDSTADDR,
+                       IP_CHECKSUM, IP_RECVFRAGSIZE };
+    for (unsigned i = 0; i < sizeof drapeaux / sizeof *drapeaux; i++)
+        poser_ip(s, drapeaux[i], 1, 4);
+}
+
+/* Reçoit (drapeaux de recvmsg : `drapeaux`, place des messages de contrôle :
+ * `place`) dans o, et écrit les messages de contrôle en texte dans t. Rend
+ * la longueur, `msg_flags` dans *f et `msg_controllen` dans *l. */
+static ssize_t recevoir_controles(int s, void *o, size_t n, int drapeaux, size_t place, char *t, size_t tn, int *f, size_t *l)
+{
+    char c[512];
+    struct iovec v = { o, n };
+    struct msghdr m = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = c, .msg_controllen = place };
+    struct pollfd p = { s, drapeaux & MSG_ERRQUEUE ? 0 : POLLIN, 0 };
+    poll(&p, 1, 2000);
+    ssize_t r = recvmsg(s, &m, drapeaux | MSG_DONTWAIT);
+    *f = m.msg_flags;
+    *l = m.msg_controllen;
+    if (r >= 0)
+        controles_en_texte(&m, t, tn);
+    else
+        t[0] = 0;
+    return r;
+}
+
+/* Les messages de contrôle de la réception IP (les soldes d'avant 6k), dans
+ * l'ordre de Linux (`ip_cmsg_recv_offset`) : IP_PKTINFO, IP_TTL (un int),
+ * IP_TOS (un octet), IP_RECVOPTS et IP_RETOPTS (rien sans options),
+ * IP_PASSSEC (rien sans module de sécurité), IP_ORIGDSTADDR (la
+ * destination, et les octets 2 et 3 de l'en-tête de transport), IP_CHECKSUM
+ * (la somme complète : jamais pour UDP par lo, toujours pour ICMP),
+ * IP_RECVFRAGSIZE (rien : pas de fragments). Pour un datagramme, une
+ * réponse de ping, et une erreur de la file (ceux du message ICMP : son TTL,
+ * son TOS 0xc0 | celui d'origine, sa somme, qui se plie en 0xffff ;
+ * IP_ORIGDSTADDR seulement si la charge a 4 octets, les « ports » pris
+ * dedans ; mesuré sous Linux 6.18). */
+static void controles(void)
+{
+    uint16_t pr;
+    int r = liee(&pr), s = udp(0);
+    tous_les_controles(r);
+    poser_ip(s, IP_TTL, 33, 4);
+    poser_ip(s, IP_TOS, 0x28, 4);
+    char o[64], t[512], attendu[512];
+    int f;
+    size_t l;
+    envoyer(s, "abcd", 4, pr);
+    ssize_t n = recevoir_controles(r, o, sizeof o, 0, 512, t, sizeof t, &f, &l);
+    struct sockaddr_in a = adresse(LO, pr);
+    strcpy(attendu, "8:12:010000007f0000017f000001 2:4:21000000 1:1:28 20:16:");
+    en_hexa(attendu, &a, sizeof a);
+    verifier(n == 4 && f == 0 && l == 112 && strcmp(t, attendu) == 0, "UDP par lo : PKTINFO, TTL 33, TOS 0x28, ORIGDSTADDR ; ni somme ni options");
+    if (strcmp(t, attendu) != 0)
+        printf("[linux] reseau :   %s\n[linux] reseau :   attendu %s\n", t, attendu);
+    /* La place qui manque au quatrième : MSG_CTRUNC, la place prise toute. */
+    envoyer(s, "abcd", 4, pr);
+    n = recevoir_controles(r, o, sizeof o, 0, 74, t, sizeof t, &f, &l);
+    verifier(n == 4 && f == MSG_CTRUNC && l == 74 && strcmp(t, "8:12:010000007f0000017f000001 2:4:21000000 1:1:28") == 0,
+             "UDP par lo, 74 octets de place : trois messages, MSG_CTRUNC");
+    close(r);
+
+    /* Une réponse de ping : un IP_PKTINFO que rien n'a préparé (`ping_rcv`,
+     * comme pour une erreur : l'interface d'arrivée, 0.0.0.0), TTL 64, le TOS
+     * de la demande, ses « ports » (sa somme), et sa somme complète. */
+    int q = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (q >= 0) {
+        tous_les_controles(q);
+        poser_ip(q, IP_TOS, 0x28, 4);
+        unsigned char echo[12] = { 8, 0, 0, 0, 0, 0, 0, 7, 'p', 'i', 'n', 'g' };
+        struct sockaddr_in d = adresse(LO, 0);
+        sendto(q, echo, sizeof echo, 0, (struct sockaddr *)&d, sizeof d);
+        unsigned char rep[64];
+        n = recevoir_controles(q, rep, sizeof rep, 0, 512, t, sizeof t, &f, &l);
+        struct sockaddr_in de = adresse(LO, 0);
+        memcpy(&de.sin_port, rep + 2, 2);
+        uint32_t somme = n > 0 ? somme_linux(rep, n) : 0;
+        strcpy(attendu, "8:12:01000000000000007f000001 2:4:40000000 1:1:28 20:16:");
+        en_hexa(attendu, &de, sizeof de);
+        strcat(attendu, " 23:4:");
+        en_hexa(attendu, &somme, 4);
+        verifier(n == 12 && f == 0 && strcmp(t, attendu) == 0, "ping par lo : PKTINFO (sans adresse locale), TTL 64, TOS 0x28, ORIGDSTADDR (sa somme), CHECKSUM");
+        if (strcmp(t, attendu) != 0)
+            printf("[linux] reseau :   %s\n[linux] reseau :   attendu %s\n", t, attendu);
+        close(q);
+    }
+
+    /* Une erreur de la file : un port fermé, la charge de 3 octets, puis
+     * de 4. */
+    poser_ip(s, IP_RECVERR, 1, 4);
+    tous_les_controles(s);
+    for (int k = 3; k <= 4; k++) {
+        struct sockaddr_in d = adresse(LO, port_ferme());
+        sendto(s, "abcd", k, 0, (struct sockaddr *)&d, sizeof d);
+        attendre_erreur(s);
+        n = recevoir_controles(s, o, sizeof o, MSG_ERRQUEUE, 512, t, sizeof t, &f, &l);
+        strcpy(attendu, "8:12:01000000000000007f000001 2:4:40000000 1:1:c8");
+        if (k == 4) {
+            struct sockaddr_in de = adresse(LO, 0x6364);
+            strcat(attendu, " 20:16:");
+            en_hexa(attendu, &de, sizeof de);
+        }
+        /* La somme, que le programme ne peut pas refaire (l'identifiant
+         * de l'en-tête cité) : celle d'un message juste, qui se plie en
+         * 0xffff ; puis IP_RECVERR, pas comparé ici. */
+        char *c = strstr(t, " 23:4:"), *e = strstr(t, " 11:32:");
+        uint32_t v = 0;
+        if (c && sscanf(c + 6, "%8x", &v) == 1)
+            v = __builtin_bswap32(v);
+        uint32_t plie = (v & 0xffff) + (v >> 16);
+        plie = (plie & 0xffff) + (plie >> 16);
+        int ok = n == k && f == MSG_ERRQUEUE && c && e && e == c + 14 && plie == 0xffff;
+        if (c)
+            *c = 0;
+        ok = ok && strcmp(t, attendu) == 0;
+        verifier(ok, k == 3 ? "erreur en file, 3 octets : PKTINFO, TTL 64, TOS 0xc8, CHECKSUM (pliee : 0xffff), RECVERR"
+                            : "erreur en file, 4 octets : de plus ORIGDSTADDR, ses ports dans la charge");
+        if (!ok)
+            printf("[linux] reseau :   %s (somme %08x)\n[linux] reseau :   attendu %s\n", t, v, attendu);
+    }
+    close(s);
+}
+
+/* Ce que l'hôte envoie à la machine, par la carte (make tests-qemu,
+ * test-carte : `hostfwd` de slirp vers le port 4000) : la somme d'UDP
+ * (IP_CHECKSUM) d'un datagramme venu par une carte, et IP_RECVFRAGSIZE
+ * d'un datagramme en morceaux. slirp coupe ce qui dépasse sa MTU de 1 500
+ * octets : chaque morceau, sauf le dernier, en fait 1 500, en-tête compris.
+ * Dans l'ordre :
+ *   - « petit » (28 octets ; 36 avec son en-tête, pas plus de 76) : sa
+ *     somme est faite à l'arrivée sur tout le segment, puis celle de
+ *     l'en-tête en est ôtée ;
+ *   - 3 000 octets lus en entier : ni somme (elle attend une lecture qui
+ *     coupe ou regarde), mais RECVFRAGSIZE 1 500 ;
+ *   - 3 000 octets regardés (MSG_PEEK), puis regardés 100 octets plus loin
+ *     (SO_PEEK_OFF), puis lus : la somme des données, celle des 100
+ *     premiers octets ôtée pour le deuxième, et gardée pour la lecture ;
+ *   - 3 000 octets lus dans 10 octets : coupé, la somme.
+ * Pas de vérification sur l'hôte : sa carte vérifie les sommes elle-même. */
+static int carte(void)
+{
+    int r = udp(0);
+    struct sockaddr_in a = adresse(0, 4000);
+    if (bind(r, (struct sockaddr *)&a, sizeof a) != 0)
+        return printf("[linux] reseau carte : bind : ECHEC (%s)\n", strerror(errno)), 1;
+    tous_les_controles(r);
+    printf("[linux] reseau carte : en attente\n");
+    fflush(stdout);
+    static unsigned char o[4000];
+    char t[512];
+    int f;
+    size_t l;
+    struct sockaddr_in de;
+    socklen_t dl = sizeof de;
+    struct pollfd p = { r, POLLIN, 0 };
+    if (poll(&p, 1, 60000) != 1)
+        return printf("[linux] reseau carte : rien recu : ECHEC\n"), 1;
+    recvfrom(r, o, sizeof o, MSG_PEEK, (struct sockaddr *)&de, &dl);
+    /* Le petit : sa somme UDP, que slirp a calculée (de 10.0.2.2 vers
+     * 10.0.2.15), refaite ici pour son en-tête. */
+    ssize_t n = recevoir_controles(r, o, sizeof o, 0, 512, t, sizeof t, &f, &l);
+    unsigned char seg[8 + 64] = { 0 };
+    memcpy(seg, &de.sin_port, 2);
+    seg[2] = 4000 >> 8, seg[3] = 4000 & 0xff;
+    seg[4] = 0, seg[5] = 8 + n;
+    memcpy(seg + 8, o, n > 0 && n <= 64 ? n : 0);
+    unsigned char pseudo[12] = { 10, 0, 2, 2, 10, 0, 2, 15, 0, 17, 0, 8 + n };
+    uint32_t c = (somme_linux(pseudo, 12) + (uint64_t)somme_linux(seg, 8 + n)) % 0xffffffff;
+    c = (c & 0xffff) + (c >> 16);
+    uint16_t c16 = ~(uint16_t)((c & 0xffff) + (c >> 16));
+    memcpy(seg + 6, &c16, 2);
+    if (c16 == 0)
+        seg[6] = seg[7] = 0xff;
+    uint32_t attendue = n > 0 ? somme_moins(somme_linux(seg, 8 + n), somme_linux(seg, 8)) : 0;
+    char attendu[512] = "23:4:";
+    en_hexa(attendu, &attendue, 4);
+    int ok = n == 28 && memcmp(o, "petit datagramme de la carte", 28) == 0 && strstr(t, attendu) && !strstr(t, "25:4:");
+    verifier(ok, "carte, 28 octets : la somme faite a l'arrivee, l'en-tete ote");
+    if (!ok)
+        printf("[linux] reseau :   %zd %s\n[linux] reseau :   attendu %s\n", n, t, attendu);
+    /* 3 000 octets lus en entier. */
+    n = recevoir_controles(r, o, sizeof o, 0, 512, t, sizeof t, &f, &l);
+    verifier(n == 3000 && !strstr(t, "23:4:") && strstr(t, "25:4:dc050000"), "carte, 3 000 octets lus : pas de somme, RECVFRAGSIZE 1 500");
+    /* Regardés, regardés plus loin, lus. */
+    n = recevoir_controles(r, o, sizeof o, MSG_PEEK, 512, t, sizeof t, &f, &l);
+    uint32_t s = n == 3000 ? somme_linux(o, 3000) : 0;
+    strcpy(attendu, "23:4:");
+    en_hexa(attendu, &s, 4);
+    ok = n == 3000 && strstr(t, attendu);
+    int cent = 100;
+    setsockopt(r, SOL_SOCKET, SO_PEEK_OFF, &cent, sizeof cent);
+    n = recevoir_controles(r, o + 100, 64, MSG_PEEK, 512, t, sizeof t, &f, &l);
+    uint32_t s100 = somme_moins(s, somme_linux(o, 100));
+    strcpy(attendu, "23:4:");
+    en_hexa(attendu, &s100, 4);
+    ok = ok && n == 64 && strstr(t, attendu);
+    int moins = -1;
+    setsockopt(r, SOL_SOCKET, SO_PEEK_OFF, &moins, sizeof moins);
+    n = recevoir_controles(r, o, sizeof o, 0, 512, t, sizeof t, &f, &l);
+    strcpy(attendu, "23:4:");
+    en_hexa(attendu, &s, 4);
+    verifier(ok && n == 3000 && strstr(t, attendu), "carte, 3 000 octets regardes (et 100 plus loin), puis lus : la somme, gardee");
+    /* Coupé. */
+    n = recevoir_controles(r, o, 10, 0, 512, t, sizeof t, &f, &l);
+    verifier(n == 10 && f == MSG_TRUNC && strstr(t, "23:4:"), "carte, 3 000 octets lus dans 10 : coupe, la somme");
+    close(r);
+    printf("[linux] reseau carte : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
+    return echecs != 0;
+}
+
+int main(int argc, char **argv)
+{
+    if (argc > 1 && strcmp(argv[1], "carte") == 0)
+        return carte();
     creation();
     lier();
     filtre();
@@ -1669,6 +1935,7 @@ int main(void)
     sndbuf_attend();
     bouchon();
     sol_ip();
+    controles();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

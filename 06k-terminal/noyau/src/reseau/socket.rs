@@ -36,6 +36,7 @@
 //! dort dans un autre fil n'est pas réveillé (Linux non plus, mesuré) : il
 //! tient la socket (le `fdget` de 6e) jusqu'à ce qu'un datagramme arrive.
 
+use super::ipv4::EnteteRecu;
 use super::paquet::Paquet;
 use super::snmp::MIB;
 use crate::appels_fichiers::FichierTenu;
@@ -174,8 +175,10 @@ pub const ORIGINE_ICMP: u8 = 2;
 /// l'origine, le genre et le code du message ICMP, son `info`), la
 /// destination du paquet qui l'a causée (le `msg_name` rendu), qui l'a dite
 /// (SO_EE_OFFENDER : la source du message ICMP), où ce message est arrivé
-/// (IP_PKTINFO), et ce que lira le programme : ce que le message portait de
-/// la charge d'origine (rien pour une erreur locale).
+/// (IP_PKTINFO), ce que la réception a gardé de son en-tête et sa somme
+/// (les autres messages de contrôle IP), et ce que lira le programme : ce
+/// que le message portait de la charge d'origine (rien pour une erreur
+/// locale).
 pub struct ErreurEnFile {
     pub errno: i32,
     pub origine: u8,
@@ -187,14 +190,35 @@ pub struct ErreurEnFile {
     pub emetteur: [u8; 4],
     pub interface: u32,
     pub arrivee: [u8; 4],
+    pub entete: EnteteRecu,
+    /// La somme de tout le message ICMP (IP_CHECKSUM : `icmp_rcv` l'a
+    /// calculée en le vérifiant, CHECKSUM_COMPLETE).
+    pub somme: u32,
     pub donnees: Paquet,
     /// Sa taille vraie (elle compte dans SO_RCVBUF, avec les datagrammes).
     pub taille: usize,
 }
 
+/// La somme d'un datagramme que rendra IP_CHECKSUM (le `skb->csum` de
+/// Linux, quand il est CHECKSUM_COMPLETE) : voir udp.rs, `recevoir`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Somme {
+    /// Jamais calculée en entier.
+    Aucune,
+    /// Calculée (la valeur de `formats::reseau::somme_linux`).
+    Calculee(u32),
+    /// À calculer, sur les données, par la lecture qui coupe le datagramme
+    /// ou le regarde (MSG_PEEK) ; elle reste ensuite (`udp_recvmsg`,
+    /// `__udp_lib_checksum_complete`).
+    ALaLecture,
+}
+
 /// Un datagramme reçu, en file : sa charge (les données du paquet), qui
 /// l'a envoyé, à quelle adresse et par quelle interface il est arrivé (pour
-/// IP_PKTINFO), et sa taille vraie (ce qu'il compte dans SO_RCVBUF).
+/// IP_PKTINFO), ce que la réception a gardé de son en-tête IP, les deux
+/// octets 2 et 3 de son en-tête de transport (IP_ORIGDSTADDR : le port de
+/// destination d'UDP, la somme d'un message ICMP), sa somme, et sa taille
+/// vraie (ce qu'il compte dans SO_RCVBUF).
 pub struct Datagramme {
     /// Un datagramme vide déjà vu par MSG_PEEK (`skb->peeked`) : SO_PEEK_OFF passe au suivant.
     pub regarde: bool,
@@ -203,6 +227,9 @@ pub struct Datagramme {
     pub port: u16,
     pub destination: [u8; 4],
     pub interface: u32,
+    pub entete: EnteteRecu,
+    pub port_destination: u16,
+    pub somme: Somme,
     pub taille: usize,
 }
 
@@ -213,9 +240,36 @@ impl ErreurEnFile {
         let donnees = Paquet::vide(0)?;
         Some(ErreurEnFile {
             errno, origine: ORIGINE_LOCALE, genre: 0, code: 0, info, adresse, port, emetteur: [0; 4], interface: 0,
-            arrivee: [0; 4], taille: donnees.taille_vraie(), donnees,
+            arrivee: [0; 4], entete: EnteteRecu::AUCUN, somme: 0, taille: donnees.taille_vraie(), donnees,
         })
     }
+
+    /// Ce que diront ses messages de contrôle IP : pour une erreur venue
+    /// d'ICMP seulement (`ipv4_datagram_support_cmsg`). Les « ports »
+    /// d'IP_ORIGDSTADDR sont les octets 2 et 3 de ce que lira le programme :
+    /// Linux fait de sa charge l'en-tête de transport de l'erreur
+    /// (`ip_icmp_error`), et n'en dit rien si elle a moins de 4 octets
+    /// (mesuré : UDP « abc », aucun ; un écho, sa somme).
+    pub fn controle(&self) -> Option<ControleIp> {
+        if self.origine != ORIGINE_ICMP {
+            return None;
+        }
+        let port = self.donnees.donnees().get(..4).map(|o| u16::from_be_bytes([o[2], o[3]]));
+        Some(ControleIp { entete: self.entete, source: self.emetteur, port, somme: Some(self.somme) })
+    }
+}
+
+/// Ce que disent les messages de contrôle IP d'une réception, après
+/// IP_PKTINFO (`ip_cmsg_recv_offset`) : l'en-tête reçu et sa source (que
+/// retire l'écho d'une route source), les octets 2 et 3 de l'en-tête de
+/// transport (None : il n'y en a pas quatre), et la somme (None : pas de
+/// somme complète), déjà réduite de ce que SO_PEEK_OFF a passé.
+#[derive(Clone, Copy)]
+pub struct ControleIp {
+    pub entete: EnteteRecu,
+    pub source: [u8; 4],
+    pub port: Option<u16>,
+    pub somme: Option<u32>,
 }
 
 /// Ce que touche la tâche du réseau (sous le `Verrou`).
@@ -656,8 +710,9 @@ impl Socket {
 
 /// Ce que rend une réception : la longueur copiée (ou, avec MSG_TRUNC, la
 /// vraie), l'émetteur, l'adresse d'arrivée et son interface, si le
-/// datagramme a été coupé ; `vide` : aucun datagramme (la lecture
-/// arrêtée), donc pas d'émetteur à dire.
+/// datagramme a été coupé, et ses messages de contrôle IP (None : il n'en a
+/// pas) ; `vide` : aucun datagramme (la lecture arrêtée), donc pas
+/// d'émetteur à dire.
 pub struct Recu {
     pub vide: bool,
     pub longueur: usize,
@@ -666,6 +721,14 @@ pub struct Recu {
     pub destination: [u8; 4],
     pub interface: u32,
     pub coupe: bool,
+    pub ip: Option<ControleIp>,
+}
+
+impl Recu {
+    /// Rien de reçu, ou un flux : ni émetteur, ni messages de contrôle IP.
+    pub fn sans_emetteur(longueur: usize, coupe: bool) -> Recu {
+        Recu { vide: true, longueur, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe, ip: None }
+    }
 }
 
 /// Prend (ou lit, MSG_PEEK) le premier datagramme et le copie par `copier`
@@ -726,15 +789,39 @@ pub fn prendre(s: &Socket, place: usize, drapeaux: u64, non_bloquant: bool, mut 
                 let (source, port, destination, interface) = (premier.source, premier.port, premier.destination, premier.interface);
                 let total = premier.paquet.longueur();
                 let dispo = total - reste;
+                // La somme d'UDP qui attend une lecture qui coupe ou qui regarde
+                // (`a_sommer`) se calcule hors du `Verrou` (jusqu'à 64 Kio,
+                // interruptions coupées sinon : la tâche du réseau attendrait),
+                // sur la copie de MSG_PEEK ou sur le datagramme pris (voir
+                // `somme_lue`).
+                let etat = premier.somme;
+                let a_sommer = etat == Somme::ALaLecture && (regarder || place < total);
+                let mut ip = ControleIp { entete: premier.entete, source: premier.source, port: Some(premier.port_destination), somme: None };
                 let copie = if regarder {
                     premier.regarde |= total == 0;
-                    let v = faillible::copie(&premier.paquet.donnees()[reste..]).map_err(|_| -ENOMEM)?;
+                    // Tout le datagramme si sa somme est à faire ou à couper au
+                    // décalage (elle porte sur lui entier) ; sinon depuis le
+                    // décalage.
+                    let debut = if etat != Somme::Aucune && (a_sommer || reste > 0) { 0 } else { reste };
+                    let v = faillible::copie(&premier.paquet.donnees()[debut..]).map_err(|_| -ENOMEM)?;
                     drop(r);
-                    copier(&v)?
+                    let brute = somme_lue(etat, a_sommer, &v);
+                    // Gardée dans la file : le `Mutex` tenu, personne d'autre
+                    // ne prend de datagramme (la tâche du réseau ne fait
+                    // qu'ajouter derrière), le k-ième est toujours celui-là.
+                    if a_sommer
+                        && let Some(b) = brute
+                        && let Some(d) = s.reception.verrouiller().file.get_mut(k)
+                    {
+                        d.somme = Somme::Calculee(b);
+                    }
+                    ip.somme = brute.map(|b| sans_le_decalage(s, b, &v, reste));
+                    copier(&v[reste - debut..])?
                 } else {
                     let d = r.file.pop_front().expect("le premier datagramme");
                     r.octets = r.octets.saturating_sub(d.taille);
                     drop(r);
+                    ip.somme = somme_lue(etat, a_sommer, d.paquet.donnees());
                     let copie = copier(d.paquet.donnees());
                     // `udp_recvmsg` : un datagramme retiré est lu (InDatagrams), ou perdu
                     // dans une copie qui faute (InErrors) ; MSG_PEEK ne compte rien.
@@ -752,7 +839,7 @@ pub fn prendre(s: &Socket, place: usize, drapeaux: u64, non_bloquant: bool, mut 
                 } else {
                     s.peek_recule(longueur);
                 }
-                return Ok(Recu { vide: false, longueur, source, port, destination, interface, coupe });
+                return Ok(Recu { vide: false, longueur, source, port, destination, interface, coupe, ip: Some(ip) });
             }
         }
         // Rien en file : EAGAIN sans attendre, même après l'arrêt de la
@@ -762,9 +849,35 @@ pub fn prendre(s: &Socket, place: usize, drapeaux: u64, non_bloquant: bool, mut 
             return Err(-EAGAIN);
         }
         if s.reception.verrouiller().arret & ARRET_LECTURE != 0 {
-            return Ok(Recu { vide: true, longueur: 0, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: false });
+            return Ok(Recu::sans_emetteur(0, false));
         }
         s.attendre_lecture(echeance, deja)?;
+    }
+}
+
+/// La somme d'un datagramme lu (`etat`), pour IP_CHECKSUM, sur ses `donnees` entières :
+/// celle qui attend une lecture qui coupe ou qui regarde (`a_sommer`) est calculée là
+/// (`udp_recvmsg` : `copied < ulen || peeking`) ; Linux la calcule pour vérifier le
+/// datagramme avant de le copier, que ce soit demandé ou non, et la garde : un
+/// IP_CHECKSUM posé ensuite la verra (`prendre` la range dans la file).
+fn somme_lue(etat: Somme, a_sommer: bool, donnees: &[u8]) -> Option<u32> {
+    match etat {
+        Somme::Aucune => None,
+        Somme::Calculee(v) => Some(v),
+        Somme::ALaLecture if a_sommer => Some(formats::reseau::somme_linux(donnees)),
+        Somme::ALaLecture => None,
+    }
+}
+
+/// La somme `v` d'un datagramme regardé avec un décalage (SO_PEEK_OFF) : Linux en ôte
+/// celle des octets passés (`ip_cmsg_recv_checksum`, `csum_sub`) ; ping n'en a pas
+/// (`ip_cmsg_recv` : 0).
+fn sans_le_decalage(s: &Socket, v: u32, donnees: &[u8], decalage: usize) -> u32 {
+    use formats::reseau::{somme_linux, somme_linux_moins};
+    if decalage != 0 && s.protocole == Protocole::Udp {
+        somme_linux_moins(v, somme_linux(donnees.get(..decalage).unwrap_or(&[])))
+    } else {
+        v
     }
 }
 

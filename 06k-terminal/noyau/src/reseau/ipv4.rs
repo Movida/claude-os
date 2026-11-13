@@ -82,17 +82,75 @@ static EXCEPTIONS: Verrou<Exceptions> = Verrou::new(Exceptions::new());
 
 /// Les paquets en morceaux qui nous arrivent (inet::fragments), et ceux qu'on a pu
 /// recoller ou non : faits au démarrage.
-static REASSEMBLAGE: Verrou<Option<Reassemblage<Paquet>>> = Verrou::new(None);
+static REASSEMBLAGE: Verrou<Option<Reassemblage<Fragment>>> = Verrou::new(None);
 
-impl Morceau for Paquet {
+/// Un morceau en attente : le paquet (sans son en-tête, que garde encore son tampon), et
+/// ce que la vérification de ses options en a tiré (son `IPCB(skb)->opt` : celui du
+/// premier morceau vaut pour le paquet recollé, `ip_frag_reasm` gardant sa tête).
+struct Fragment {
+    paquet: Paquet,
+    options: ipv4::Options,
+}
+
+impl Morceau for Fragment {
     fn octets(&self) -> &[u8] {
-        self.donnees()
+        self.paquet.donnees()
     }
     fn couper(&mut self, n: usize) {
-        Paquet::couper(self, n);
+        self.paquet.couper(n);
     }
     fn taille_vraie(&self) -> usize {
-        Paquet::taille_vraie(self)
+        self.paquet.taille_vraie()
+    }
+}
+
+/// Ce que la réception garde de l'en-tête IPv4 d'un paquet pour nous, que relisent les
+/// messages de contrôle d'une réception (IP_RECVTTL, IP_RECVTOS, IP_RECVOPTS,
+/// IP_RETOPTS, IP_RECVFRAGSIZE : `ip_cmsg_recv_offset`), d'un datagramme en file ou
+/// d'une erreur ICMP en file (alors celui du message ICMP).
+///
+/// Choix de conception : une copie à part, une soixantaine d'octets avec chaque
+/// datagramme en file. Linux relit l'en-tête dans le paquet même (`ip_hdr(skb)`), et
+/// garde à côté ce que la réception en a tiré (`IPCB(skb)` : les options vérifiées,
+/// `frag_max_size`) ; ses copies d'une diffusion partagent le paquet (`skb_clone`). Les
+/// nôtres ne copient que la charge (udp.rs, `Paquet::copie`), et une erreur en file ne
+/// garde que ce que le programme lira : y garder aussi l'en-tête coûterait sa place à
+/// chaque copie, et lierait la lecture à la forme du tampon. Écarté aussi : ne garder
+/// que ce qu'ont demandé les options de la socket à l'arrivée ; Linux lit les options au
+/// moment de la lecture, un drapeau posé entre les deux vaut pour ce qui est en file.
+#[derive(Clone, Copy)]
+pub struct EnteteRecu {
+    pub ttl: u8,
+    pub tos: u8,
+    /// Les options après ce que la réception y a noté (`opt.optlen` octets, bourrage
+    /// compris), et ce qu'elle en a tiré.
+    pub options: [u8; ipv4::OPTIONS_MAX],
+    pub longueur_options: u8,
+    pub compilees: ipv4::Options,
+    /// La taille du plus grand morceau d'un paquet recollé, son en-tête compris
+    /// (`frag_max_size`) ; 0 : il n'était pas en morceaux.
+    pub fragment_max: u16,
+}
+
+impl EnteteRecu {
+    /// Rien (une erreur locale, qui n'a pas de message de contrôle IP).
+    pub const AUCUN: EnteteRecu = EnteteRecu {
+        ttl: 0, tos: 0, options: [0; ipv4::OPTIONS_MAX], longueur_options: 0, compilees: ipv4::Options::AUCUNES, fragment_max: 0,
+    };
+
+    /// Celui du paquet `paquet` (son en-tête au début), lu `h`, aux options vérifiées `o`.
+    pub fn de(h: &ipv4::Ipv4, paquet: &[u8], compilees: ipv4::Options, fragment_max: u16) -> EnteteRecu {
+        let mut options = [0; ipv4::OPTIONS_MAX];
+        let n = h.longueur_entete.saturating_sub(ipv4::ENTETE).min(ipv4::OPTIONS_MAX);
+        if let Some(o) = paquet.get(ipv4::ENTETE..ipv4::ENTETE + n) {
+            options[..n].copy_from_slice(o);
+        }
+        EnteteRecu { ttl: h.ttl, tos: h.tos, options, longueur_options: n as u8, compilees, fragment_max }
+    }
+
+    /// Les octets des options.
+    pub fn options(&self) -> &[u8] {
+        &self.options[..self.longueur_options as usize]
     }
 }
 
@@ -229,6 +287,7 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
         None => return,
     };
     let mut p = p;
+    let mut compilees = ipv4::Options::AUCUNES;
     if h.longueur_entete > ipv4::ENTETE {
         match lire_options(i, &h, &mut p) {
             None => return,
@@ -243,13 +302,30 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
                 return;
             }
             Some(Ok(o)) if o.route_source != 0 => return compter(&ROUTES_SOURCES),
-            Some(Ok(_)) => {}
+            Some(Ok(o)) => compilees = o,
         }
     }
     if !pour_nous {
         return MIB.ip(Ip::InAddrErrors);
     }
-    livrer(i, h, p, diffusion, trame_diffusee);
+    let a_verifier = !i.boucle();
+    livrer(i, h, p, compilees, Arrivee { diffusion, trame_diffusee, a_verifier });
+}
+
+/// Comment un paquet est arrivé : sa destination est une diffusion ; sa trame Ethernet
+/// allait à toutes les machines (jamais d'erreur ICMP en réponse) ; sa somme UDP reste à
+/// calculer en entier (udp.rs, IP_CHECKSUM).
+///
+/// La dernière est le `CHECKSUM_NONE` de Linux : notre virtio-net ne demande pas à la
+/// carte de vérifier les sommes (VIRTIO_NET_F_GUEST_CSUM), comme une carte sans ce
+/// réglage chez Linux. Par `lo`, Linux laisse UDP à CHECKSUM_PARTIAL (l'envoi ne l'a
+/// pas calculée : `lo` « sait » le faire) ; la copie d'une diffusion qu'il se rend
+/// est CHECKSUM_UNNECESSARY (`dev_loopback_xmit`) : aucune n'aura de somme complète.
+#[derive(Clone, Copy)]
+struct Arrivee {
+    diffusion: bool,
+    trame_diffusee: bool,
+    a_verifier: bool,
 }
 
 /// La copie `p` d'une diffusion que nous avons envoyée par la carte `i`
@@ -260,21 +336,23 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
 pub fn recevoir_la_diffusion(i: &'static Interface, p: Paquet) {
     MIB.ip(Ip::InReceives);
     let Ok((h, _)) = ipv4::lire(p.donnees()) else { return };
-    livrer(i, h, p, true, false);
+    livrer(i, h, p, ipv4::Options::AUCUNES, Arrivee { diffusion: true, trame_diffusee: false, a_verifier: false });
 }
 
-/// Livre aux protocoles le paquet `p` pour nous (son en-tête : `h`) arrivé par
-/// `i` (`ip_local_deliver`) ; `diffusion` : sa destination est une diffusion.
-fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, diffusion: bool, trame_diffusee: bool) {
+/// Livre aux protocoles le paquet `p` pour nous (son en-tête : `h`, ses options
+/// vérifiées : `compilees`) arrivé par `i` (`ip_local_deliver`).
+fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Options, a: Arrivee) {
+    let Arrivee { diffusion, trame_diffusee, a_verifier } = a;
     // Un morceau : ce qui suit ne voit que des paquets entiers (`ip_local_deliver`).
-    let (h, mut p) = if h.est_un_fragment() {
-        match recoller(i, &h, p) {
+    let (h, mut p, compilees, fragment_max) = if h.est_un_fragment() {
+        match recoller(i, &h, Fragment { paquet: p, options: compilees }) {
             Some(x) => x,
             None => return,
         }
     } else {
-        (h, p)
+        (h, p, compilees, 0)
     };
+    let entete = EnteteRecu::de(&h, p.donnees(), compilees, fragment_max);
     // Une diffusion (la limitée, ou celle d'un réseau de l'interface) va à
     // chaque socket qui l'accepte.
     let longueur = h.longueur as usize - h.longueur_entete;
@@ -294,11 +372,11 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, diffusion: bool, tram
     MIB.ip(if matches!(h.protocole, ipv4::UDP | ipv4::ICMP | ipv4::TCP) { Ip::InDelivers } else { Ip::InUnknownProtos });
     match h.protocole {
         ipv4::UDP => {
-            if let Err(p) = super::udp::recevoir(i.index, h.source, h.destination, diffusion, p) {
+            if let Err(p) = super::udp::recevoir(i.index, h.source, h.destination, &entete, diffusion, a_verifier, p) {
                 injoignable(icmp::PORT, p);
             }
         }
-        ipv4::ICMP => super::icmp::recevoir(i, &h, diffusion, p),
+        ipv4::ICMP => super::icmp::recevoir(i, &h, &entete, diffusion, p),
         // TCP : jamais d'une trame pour plusieurs machines, que `tcp_v4_rcv`
         // jette avant même InSegs (`pkt_type != PACKET_HOST` : une trame de
         // diffusion, qu'IP livre pourtant, et qu'UDP reçoit). Une destination
@@ -311,13 +389,14 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, diffusion: bool, tram
     }
 }
 
-/// Le morceau `p` du paquet que dit son en-tête `h` : gardé (None), ou le dernier : le
+/// Le morceau `f` du paquet que dit son en-tête `h` : gardé (None), ou le dernier : le
 /// paquet recopié d'un seul tenant, derrière l'en-tête de son premier morceau
-/// (`ip_defrag`, `ip_frag_reasm`). Linux enchaîne les morceaux sans les recopier ; nos
-/// paquets ont un tampon d'un seul tenant, que relisent UDP, ICMP et TCP.
-fn recoller(i: &'static Interface, h: &ipv4::Ipv4, mut p: Paquet) -> Option<(ipv4::Ipv4, Paquet)> {
-    p.retirer_entete(h.longueur_entete)?;
-    p.couper(h.longueur as usize - h.longueur_entete);
+/// (`ip_defrag`, `ip_frag_reasm`), avec les options vérifiées de celui-ci et la taille
+/// du plus grand morceau. Linux enchaîne les morceaux sans les recopier ; nos paquets
+/// ont un tampon d'un seul tenant, que relisent UDP, ICMP et TCP.
+fn recoller(i: &'static Interface, h: &ipv4::Ipv4, mut f: Fragment) -> Option<(ipv4::Ipv4, Paquet, ipv4::Options, u16)> {
+    f.paquet.retirer_entete(h.longueur_entete)?;
+    f.paquet.couper(h.longueur as usize - h.longueur_entete);
     let cle = Cle { source: h.source, destination: h.destination, identifiant: h.identifiant, protocole: h.protocole };
     let (issue, echeance) = {
         let mut t = REASSEMBLAGE.verrouiller();
@@ -327,27 +406,28 @@ fn recoller(i: &'static Interface, h: &ipv4::Ipv4, mut p: Paquet) -> Option<(ipv
             MIB.ip(Ip::ReasmFails);
             return None;
         };
-        let issue = r.recevoir(cle, h.decalage as u32 * 8, h.fragments_suivants, h.tos, h.longueur_entete as u32, p, i.index, crate::temps::ns_monotone());
+        let issue = r.recevoir(cle, h.decalage as u32 * 8, h.fragments_suivants, h.tos, h.longueur_entete as u32, f, i.index, crate::temps::ns_monotone());
         (issue, r.echeance())
     };
     super::tache::armer(super::tache::OBJET_FRAGMENTS, echeance);
-    let Issue::Complet { mut morceaux, longueur, entete, ecn } = issue else { return None };
+    let Issue::Complet { mut morceaux, longueur, entete, ecn, taille_max } = issue else { return None };
     // La fin d'`ip_frag_reasm` : un paquet recollé (ReasmOKs), ou pas de mémoire pour lui.
     let recolle = coller(&mut morceaux, longueur as usize, entete as usize, ecn);
     MIB.ip(if recolle.is_some() { Ip::ReasmOKs } else { Ip::ReasmFails });
-    recolle
+    let (h, p) = recolle?;
+    Some((h, p, morceaux.first()?.options, taille_max))
 }
 
 /// Les morceaux d'un paquet complet (`longueur` octets de données, derrière les `entete`
 /// octets d'en-tête du premier), recopiés en un paquet neuf ; None : plus de mémoire.
-fn coller(morceaux: &mut [Paquet], longueur: usize, entete: usize, ecn: u8) -> Option<(ipv4::Ipv4, Paquet)> {
+fn coller(morceaux: &mut [Fragment], longueur: usize, entete: usize, ecn: u8) -> Option<(ipv4::Ipv4, Paquet)> {
     let mut neuf = Paquet::vide(entete + longueur)?;
     let o = neuf.ajouter_fin(entete + longueur)?;
-    let tete = morceaux.first_mut()?.ajouter_entete(entete)?;
+    let tete = morceaux.first_mut()?.paquet.ajouter_entete(entete)?;
     o[..entete].copy_from_slice(tete);
     let mut k = entete;
     for (n, m) in morceaux.iter().enumerate() {
-        let d = if n == 0 { &m.donnees()[entete..] } else { m.donnees() };
+        let d = if n == 0 { &m.paquet.donnees()[entete..] } else { m.paquet.donnees() };
         o[k..k + d.len()].copy_from_slice(d);
         k += d.len();
     }
@@ -362,7 +442,7 @@ pub fn fragments_echus() {
     let maintenant = crate::temps::ns_monotone();
     loop {
         let Some(e) = REASSEMBLAGE.verrouiller().as_mut().and_then(|r| r.prendre_echue(maintenant)) else { break };
-        if let Some(mut p) = e.premier
+        if let Some(Fragment { paquet: mut p, .. }) = e.premier
             && p.ajouter_entete(e.entete as usize).is_some()
         {
             let par_lo = interface::par_index(e.interface).is_some_and(|i| i.boucle());

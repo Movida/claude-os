@@ -26,13 +26,13 @@ use super::ipv4;
 use super::paquet::{self, Paquet};
 use super::icmp::ErreurRecue;
 use super::snmp::MIB;
-use super::socket::{self, Admission, AF_INET, AF_UNSPEC, Datagramme, ErreurEnFile, Inet, Rejet, Socket};
+use super::socket::{self, Admission, AF_INET, AF_UNSPEC, Datagramme, ErreurEnFile, Inet, Rejet, Socket, Somme};
 use crate::aleatoire;
 use crate::attente::GardeMutex;
 use crate::partage::Arc;
 use crate::verrou::Verrou;
 use core::sync::atomic::Ordering;
-use formats::reseau::{Erreur, ipv4 as format_ipv4, udp};
+use formats::reseau::{Erreur, ipv4 as format_ipv4, somme_linux, somme_linux_moins, udp};
 use inet::ports::{Lien, Refus, Table};
 use inet::snmp::Udp as Compteur;
 
@@ -336,13 +336,28 @@ pub fn fermer(s: &Socket) {
 }
 
 /// Un datagramme UDP (`p` : le segment, en-tête compris, sans l'en-tête
-/// d'IPv4) reçu par l'interface `interface`, pour `destination`, de
-/// `source`, dans la tâche du réseau : `__udp4_lib_rcv`, la somme
-/// vérifiée (fausse : jeté, sans rien dire, compté), puis la socket qui le reçoit ;
-/// une diffusion à chacune de celles du port. Sans socket, le segment est
-/// rendu, son en-tête remis, pour l'erreur ICMP « port injoignable » (que
-/// l'appelant envoie : il a l'en-tête d'IPv4).
-pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion: bool, mut p: Paquet) -> Result<(), Paquet> {
+/// d'IPv4, dont la réception a gardé `entete`) reçu par l'interface
+/// `interface`, pour `destination`, de `source`, dans la tâche du réseau :
+/// `__udp4_lib_rcv`, la somme vérifiée (fausse : jeté, sans rien dire,
+/// compté), puis la socket qui le reçoit ; une diffusion à chacune de
+/// celles du port. Sans socket, le segment est rendu, son en-tête remis,
+/// pour l'erreur ICMP « port injoignable » (que l'appelant envoie : il a
+/// l'en-tête d'IPv4).
+///
+/// La somme que rendra IP_CHECKSUM (la `__wsum` de Linux) : un datagramme
+/// dont la somme reste à vérifier (`a_verifier` : venu par une carte, voir
+/// ipv4.rs, `Arrivee`) et n'est pas nulle (une somme nulle n'est pas
+/// vérifiée : `skb_checksum_init_zero_check`) l'a, calculée tout de suite
+/// pour un segment de 76 octets au plus (CHECKSUM_BREAK : Linux juge moins
+/// cher de vérifier un petit datagramme tout de suite), sur le segment
+/// entier puis réduite de celle de l'en-tête quand il est ôté
+/// (`udp_csum_pull_header`, `skb_pull_rcsum`) ; plus long, sur les données
+/// seules, par la première lecture qui le coupe ou le regarde
+/// (socket.rs, `somme_lue`). Les deux calculs ne donnent pas toujours la
+/// même valeur pour les mêmes données (des données nulles : 0xFFFFFFFF,
+/// puis 0) : comme chez Linux.
+pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], entete: &ipv4::EnteteRecu, diffusion: bool, a_verifier: bool,
+                mut p: Paquet) -> Result<(), Paquet> {
     // Choix de conception : la somme vérifiée à l'arrivée, pour tout datagramme.
     // Linux ne la vérifie, pour un datagramme qui a une socket, qu'à sa lecture
     // (`udp_recvmsg`, `csum_copy_err`) : elle se calcule alors pendant la copie
@@ -387,8 +402,17 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion
         }
     };
     let longueur = charge.len();
+    let segment = &p.donnees()[..udp::ENTETE + longueur];
+    let somme = if !a_verifier || segment[6..8] == [0, 0] {
+        Somme::Aucune
+    } else if segment.len() <= 76 {
+        Somme::Calculee(somme_linux_moins(somme_linux(segment), somme_linux(&segment[..udp::ENTETE])))
+    } else {
+        Somme::ALaLecture
+    };
     let _ = p.retirer_entete(udp::ENTETE);
     p.couper(longueur);
+    let arrivee = Arrivee { source, port: u.source, destination, port_destination: u.destination, interface, entete: *entete, somme };
     if diffusion {
         // Une copie pour chacune, déposée sous le verrou de la table (son
         // ordre permet de prendre ensuite celui de la file d'une socket) ;
@@ -399,7 +423,7 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion
             t.pour_chaque_diffusion(source, u.source, destination, u.destination, |s| {
                 sockets += 1;
                 match Paquet::copie(p.donnees()) {
-                    Some(copie) => deposer(s, copie, source, u.source, destination, interface),
+                    Some(copie) => deposer(s, copie, &arrivee),
                     None => {
                         MIB.udp(Compteur::RcvbufErrors);
                         MIB.udp(Compteur::InErrors);
@@ -415,7 +439,7 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion
     let s = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(source, u.source, destination, u.destination));
     match s {
         Some(s) => {
-            deposer(&s, p, source, u.source, destination, interface);
+            deposer(&s, p, &arrivee);
             Ok(())
         }
         None => {
@@ -426,9 +450,23 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], diffusion
     }
 }
 
-fn deposer(s: &Socket, p: Paquet, source: [u8; 4], port: u16, destination: [u8; 4], interface: u32) {
+/// D'où vient un datagramme reçu, et ce qu'en garde la file avec lui.
+struct Arrivee {
+    source: [u8; 4],
+    port: u16,
+    destination: [u8; 4],
+    port_destination: u16,
+    interface: u32,
+    entete: ipv4::EnteteRecu,
+    somme: Somme,
+}
+
+fn deposer(s: &Socket, p: Paquet, a: &Arrivee) {
     let taille = p.taille_vraie();
-    let d = Datagramme { regarde: false, paquet: p, source, port, destination, interface, taille };
+    let d = Datagramme {
+        regarde: false, paquet: p, source: a.source, port: a.port, destination: a.destination, interface: a.interface,
+        entete: a.entete, port_destination: a.port_destination, somme: a.somme, taille,
+    };
     // `__udp_queue_rcv_skb`.
     if let Err(r) = s.deposer(d, Admission::Udp) {
         MIB.udp(if r == Rejet::Pleine { Compteur::RcvbufErrors } else { Compteur::MemErrors });
@@ -521,7 +559,7 @@ pub fn signaler(s: &Socket, e: &ErreurRecue, errno: i32, fatale: bool, port: u16
             s.mettre_en_file(ErreurEnFile {
                 errno, origine: socket::ORIGINE_ICMP, genre: e.genre, code: e.code, info: e.info,
                 adresse: e.interne.destination, port, emetteur: e.emetteur, interface: e.interface,
-                arrivee: e.destination, donnees, taille,
+                arrivee: e.destination, entete: *e.entete, somme: somme_linux(e.message), donnees, taille,
             });
         }
     }

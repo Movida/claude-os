@@ -143,6 +143,8 @@ const IP_XFRM_POLICY: i32 = 17;
 const IP_PASSSEC: i32 = 18;
 const IP_TRANSPARENT: i32 = 19;
 const IP_RECVORIGDSTADDR: i32 = 20;
+/// Le message de contrôle que demande IP_RECVORIGDSTADDR (le même numéro).
+const IP_ORIGDSTADDR: i32 = IP_RECVORIGDSTADDR;
 const IP_MINTTL: i32 = 21;
 const IP_NODEFRAG: i32 = 22;
 const IP_CHECKSUM: i32 = 23;
@@ -737,7 +739,7 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let copie = copier_vers_morceaux(morceaux, e.donnees.donnees())?;
         let recu = socket::Recu {
             vide: false, longueur: copie, source: e.adresse, port: e.port, destination: e.arrivee, interface: e.interface,
-            coupe: copie < total,
+            coupe: copie < total, ip: e.controle(),
         };
         let d = if recu.coupe { MSG_TRUNC } else { 0 } | MSG_ERRQUEUE as u32;
         return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: Some(e), fichiers: Vec::new(), droits: None });
@@ -747,7 +749,7 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         // MSG_TRUNC s'il n'y avait pas de place pour lui.
         let place = total(morceaux);
         let n = tcp::recevoir_urgent(o.socket(), drapeaux, place, |octet| copier_vers_morceaux(morceaux, &[octet]).map(|_| ()))?;
-        let recu = socket::Recu { vide: true, longueur: n.unwrap_or(0), source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: false };
+        let recu = socket::Recu::sans_emetteur(n.unwrap_or(0), false);
         let d = if n.is_some() { MSG_OOB as u32 | if place == 0 { MSG_TRUNC } else { 0 } } else { 0 };
         return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: None, fichiers: Vec::new(), droits: None });
     }
@@ -758,7 +760,7 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
             let c = copier_vers_morceaux_depuis(morceaux, decalage, octets)?;
             if c < octets.len() { Err(-EFAULT) } else { Ok(c) }
         })?;
-        let recu = socket::Recu { vide: true, longueur: u.longueur, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: u.coupe };
+        let recu = socket::Recu::sans_emetteur(u.longueur, u.coupe);
         let d = if u.coupe { MSG_TRUNC } else { 0 } | if u.urgent { MSG_OOB as u32 } else { 0 };
         let droits = u.scm.then_some(u.droits);
         return Ok(Reception { recu, nom_unix: u.adresse, drapeaux: d, erreur: None, fichiers: u.fichiers, droits });
@@ -769,7 +771,7 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let n = tcp::recevoir_programme(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |decalage, octets| {
             copier_vers_morceaux_depuis(morceaux, decalage, octets)
         })?;
-        let recu = socket::Recu { vide: true, longueur: n, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe: false };
+        let recu = socket::Recu::sans_emetteur(n, false);
         return Ok(Reception { recu, nom_unix: None, drapeaux: 0, erreur: None, fichiers: Vec::new(), droits: None });
     }
     let recu = socket::prendre(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |octets| copier_vers_morceaux(morceaux, octets))?;
@@ -1116,7 +1118,8 @@ impl ControleSortant {
             *drapeaux |= MSG_CTRUNC;
             longueur = reste;
         }
-        let mut o = [0u8; CMSG_ENTETE + 32];
+        // La plus longue : les options IP (IP_RECVOPTS, IP_RETOPTS), 40 octets.
+        let mut o = [0u8; CMSG_ENTETE + 40];
         o[..8].copy_from_slice(&longueur.to_le_bytes());
         o[8..12].copy_from_slice(&niveau.to_le_bytes());
         o[12..16].copy_from_slice(&sorte.to_le_bytes());
@@ -1125,6 +1128,51 @@ impl ControleSortant {
             return;
         }
         self.utilise += (aligner(CMSG_ENTETE + donnees.len()) as u64).min(reste);
+    }
+}
+
+/// Les messages de contrôle IP d'une réception après IP_PKTINFO, dans l'ordre
+/// d'`ip_cmsg_recv_offset`, chacun si la socket le demande (`options`) : IP_TTL (un
+/// int), IP_TOS (un octet), IP_RECVOPTS (les options telles que reçues, si le paquet
+/// en a), IP_RETOPTS (leur écho défait : ce qu'on renverrait ; un écho impossible :
+/// MSG_CTRUNC, rien d'écrit), IP_PASSSEC (rien : pas de module de sécurité, comme un
+/// Linux sans LSM), IP_ORIGDSTADDR (la destination, et les octets 2 et 3 du transport),
+/// IP_CHECKSUM (la somme complète), IP_RECVFRAGSIZE (un paquet recollé).
+/// `destination` : celle du paquet.
+fn controle_ip(c: &mut ControleSortant, options: &socket::Options, ip: &socket::ControleIp, destination: [u8; 4], drapeaux: &mut u32) {
+    use formats::reseau::ipv4 as format_ipv4;
+    let e = &ip.entete;
+    if options.recvttl {
+        c.ecrire(SOL_IP, IP_TTL, &(e.ttl as i32).to_le_bytes(), drapeaux);
+    }
+    if options.recvtos {
+        c.ecrire(SOL_IP, IP_TOS, &[e.tos], drapeaux);
+    }
+    if options.recvopts && e.longueur_options != 0 {
+        c.ecrire(SOL_IP, IP_RECVOPTS, e.options(), drapeaux);
+    }
+    if options.retopts && e.longueur_options != 0 {
+        let unicast = |a| crate::reseau::ipv4::avec_table(|t| t.est_unicast(a)).unwrap_or(false);
+        match format_ipv4::options_echo(e.options(), &e.compilees, ip.source, &unicast) {
+            Ok(mut d) => {
+                d.defaire();
+                c.ecrire(SOL_IP, IP_RETOPTS, d.octets(), drapeaux);
+            }
+            Err(()) => *drapeaux |= MSG_CTRUNC,
+        }
+    }
+    if options.origdstaddr
+        && let Some(port) = ip.port
+    {
+        c.ecrire(SOL_IP, IP_ORIGDSTADDR, &socket::sockaddr_in(destination, port), drapeaux);
+    }
+    if options.checksum
+        && let Some(somme) = ip.somme
+    {
+        c.ecrire(SOL_IP, IP_CHECKSUM, &somme.to_le_bytes(), drapeaux);
+    }
+    if options.recvfragsize && e.fragment_max != 0 {
+        c.ecrire(SOL_IP, IP_RECVFRAGSIZE, &(e.fragment_max as i32).to_le_bytes(), drapeaux);
     }
 }
 
@@ -1151,20 +1199,22 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
     // MSG_CMSG_CLOEXEC demandé revient dans msg_flags (`____sys_recvmsg`).
     r.drapeaux |= (drapeaux & MSG_CMSG_CLOEXEC) as u32;
     let mut c = ControleSortant { adresse: m.controle, place: m.longueur_controle, utilise: 0 };
-    // IP_PKTINFO : pour un datagramme ; pour une erreur, seulement si elle
-    // vient d'ICMP (`ipv4_datagram_support_cmsg`), celui de son message.
-    let icmp = r.erreur.as_ref().is_none_or(|e| e.origine == socket::ORIGINE_ICMP);
-    if o.socket().appels.verrouiller().options.pktinfo && !r.recu.vide && icmp {
+    // Les messages de contrôle IP (`ip_cmsg_recv_offset`), dans l'ordre de
+    // Linux : pour un datagramme ; pour une erreur, seulement si elle vient
+    // d'ICMP (`ipv4_datagram_support_cmsg`), ceux de son message.
+    let options = o.socket().appels.verrouiller().options;
+    if r.recu.ip.is_some() && options.pktinfo {
         use crate::reseau::ipv4;
         // in_pktinfo : l'interface d'arrivée, l'adresse locale à laquelle
-        // répondre, la destination. Pour un datagramme, ce que prépare
+        // répondre, la destination. Pour un datagramme UDP, ce que prépare
         // `ipv4_pktinfo_prepare` : venu par lo à l'une de nos adresses d'une
         // carte, l'interface qui porte l'adresse ; l'adresse locale, la
         // destination, ou pour une diffusion celle qu'aurait la réponse
         // (`fib_compute_spec_dst`). Pour une erreur, `ip_recv_error` rend le
-        // contrôle du message ICMP, que rien n'a préparé : l'interface
+        // contrôle du message ICMP, que rien n'a préparé, et une réponse de
+        // ping de même (`ping_rcv` ne le prépare pas, mesuré) : l'interface
         // d'arrivée telle quelle, et 0.0.0.0 (le `faddr` de ses options IP).
-        let (interface, locale) = if r.erreur.is_some() {
+        let (interface, locale) = if r.erreur.is_some() || o.socket().protocole == Protocole::Ping {
             (r.recu.interface, [0; 4])
         } else {
             let lo = crate::reseau::boucle::interface().map(|i| i.index);
@@ -1184,6 +1234,9 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
         info[4..8].copy_from_slice(&locale);
         info[8..12].copy_from_slice(&r.recu.destination);
         c.ecrire(SOL_IP, IP_PKTINFO, &info, &mut r.drapeaux);
+    }
+    if let Some(ip) = r.recu.ip {
+        controle_ip(&mut c, &options, &ip, r.recu.destination, &mut r.drapeaux);
     }
     // L'erreur elle-même (IP_RECVERR) : sa `sock_extended_err` (errno,
     // origine, genre, code, un octet nul, info, data nul), puis

@@ -40,7 +40,7 @@ fn donner(r: &mut Reassemblage<Octets>, debut: u32, n: u32, suite: bool) -> Issu
 
 /// Le paquet que donne `Complet`.
 fn recolle(i: Issue<Octets>) -> Vec<u8> {
-    let Issue::Complet { morceaux, longueur, entete, ecn } = i else { panic!("pas complet") };
+    let Issue::Complet { morceaux, longueur, entete, ecn, .. } = i else { panic!("pas complet") };
     assert_eq!((entete, ecn), (20, 0));
     let d: Vec<u8> = morceaux.iter().flat_map(|m| m.0.iter().copied()).collect();
     assert_eq!(d.len() as u32, longueur);
@@ -71,6 +71,22 @@ fn dans_l_ordre_et_dans_le_desordre() {
         assert_eq!(d.unwrap(), attendu(1605), "{ordre:?}");
     }
     assert_eq!(r.memoire(), 0);
+}
+
+/// La taille du plus grand morceau (`frag_max_size`, que lit IP_RECVFRAGSIZE) : une
+/// fois coupé à un multiple de 8, son propre en-tête compris ; un double ne compte pas.
+#[test]
+fn le_plus_grand_morceau() {
+    let mut r = table();
+    let taille = |i: Issue<Octets>| match i {
+        Issue::Complet { taille_max, .. } => taille_max,
+        _ => panic!("pas complet"),
+    };
+    assert_eq!(r.recevoir(CLE, 0, true, 0, 24, morceau(0, 1003), 1, 0), Issue::EnCours, "1000 octets gardés, 1024 avec l'en-tête");
+    assert_eq!(r.recevoir(CLE, 0, true, 0, 60, morceau(0, 1000), 1, 0), Issue::Jete);
+    assert_eq!(taille(r.recevoir(CLE, 1000, false, 0, 20, morceau(1000, 1010), 1, 0)), 1030);
+    assert_eq!(r.recevoir(CLE, 1000, false, 0, 20, morceau(1000, 8), 1, 0), Issue::EnCours);
+    assert_eq!(taille(r.recevoir(CLE, 0, true, 0, 24, morceau(0, 1000), 1, 0)), 1024);
 }
 
 /// Deux paquets à la fois : leurs clés les séparent.

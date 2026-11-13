@@ -1085,6 +1085,15 @@ nmi.bin: nmi.cpio FORCE
 	cd noyau && cargo build --release
 	$(call image,$(NOYAU_ELF),nmi.cpio,nmi)
 
+# Le scénario de la carte (make tests-qemu, test-carte) : l'archive de l'étape, dont
+# /etc/demarrage ne lance que `reseau carte` (racine/etc/demarrage-carte).
+carte.cpio: programmes.cpio racine/etc/demarrage-carte
+	sed 's|racine/etc/demarrage |racine/etc/demarrage-carte |' archive.txt | sh archive.sh $@ -
+
+carte.bin: carte.cpio FORCE
+	cd noyau && cargo build --release
+	$(call image,$(NOYAU_ELF),carte.cpio,carte)
+
 sans-reseau.bin: sans-reseau.cpio FORCE
 	cd noyau && cargo build --release
 	$(call image,$(NOYAU_ELF),sans-reseau.cpio,sans-reseau)
@@ -1463,6 +1472,13 @@ $(WAST2JSON):
 #     l'enregistrement de QEMU (`filter-dump`, un fichier pcap, compté par
 #     outils/erreurs-icmp.awk). Le port de l'hôte est tiré au hasard ; s'il
 #     est pris (QEMU s'arrête aussitôt), un autre (les soldes d'avant 6k) ;
+#   - des datagrammes de l'hôte vers un port ouvert de la machine (slirp,
+#     `hostfwd`, carte.bin : `reseau carte`) : la somme d'UDP d'un
+#     datagramme venu par une carte (IP_CHECKSUM : faite à l'arrivée pour un
+#     petit, à la lecture qui coupe ou regarde pour un grand), et la taille
+#     du plus grand morceau d'un datagramme que slirp a coupé à sa MTU
+#     (IP_RECVFRAGSIZE : 1 500) ; ni lo, ni la carte de l'hôte (qui
+#     vérifie les sommes elle-même) ne les montrent (les soldes d'avant 6k) ;
 #   - une carte sur un réseau sans serveur DHCP (-netdev hubport, un
 #     concentrateur relié à rien) : le DHCP abandonne au bout de 12 à 17 s,
 #     et le démarrage continue (6g) ;
@@ -1526,7 +1542,7 @@ test-bpb.bin: vide.bin
 	cp vide.bin $@
 	printf '%87s' '' | tr ' ' '\245' | dd of=$@ bs=1 seek=3 conv=notrunc status=none
 
-tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-retard.bin vide.bin test-bpb.bin nmi.bin sans-reseau.bin claude-p
+tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-retard.bin vide.bin test-bpb.bin nmi.bin sans-reseau.bin carte.bin claude-p
 	$(call attendre,$(QEMU_TEST) $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-garde.bin -serial file:test-garde.log,test-garde.log,"debordement de la pile noyau d'une tache",:)
 	$(call attendre,$(QEMU_TEST_1) -smp 1 $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=vide.bin -serial file:test-smp1.log,test-smp1.log,"[noyau] 1 processeur en service : la MADT n'en liste pas d'autre.",:)
 	$(call attendre,$(QEMU_TEST_1) -smp 1 $(QEMU_RESEAU) $(QEMU_ALEA) -drive format=raw$(,)file=test-bpb.bin -serial file:test-bpb.log,test-bpb.log,"[noyau] 1 processeur en service : la MADT n'en liste pas d'autre.",:)
@@ -1576,6 +1592,23 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	done; \
 	[ "$$n" = 6 ] || { echo "ICMP par machine : $${n:-aucune mesure,} erreurs pour 20 datagrammes (6 attendues) : ECHEC"; exit 1; }; \
 	echo "ICMP par machine : 6 erreurs pour 20 datagrammes : ok"
+	rm -f test-carte.log; fin=; \
+	for essai in 1 2 3 4 5; do \
+	  port=$$(( 20000 + ($$$$ * 37 + essai * 7907) % 40000 )); \
+	  $(QEMU_TEST) -netdev user,id=n0,hostfwd=udp:127.0.0.1:$$port-:4000 -device virtio-net-pci,netdev=n0 $(QEMU_ALEA) \
+	    -drive format=raw,file=carte.bin -serial file:test-carte.log & q=$$!; \
+	  etat=mort; for i in $$(seq $$(( $(DUREE) * 10 ))); do \
+	    grep -qF "[reseau] eth0 : 10.0.2.15/24" test-carte.log 2>/dev/null && grep -qF "reseau carte : en attente" test-carte.log && { etat=pret; break; }; \
+	    kill -0 $$q 2>/dev/null || { etat=mort; break; }; etat=lent; sleep 0.1; done; \
+	  [ $$etat = mort ] && { wait $$q 2>/dev/null; continue; }; \
+	  [ $$etat = pret ] && { bash -c 'exec 3>/dev/udp/127.0.0.1/'$$port'; printf "petit datagramme de la carte" >&3; \
+	    for i in 1 2 3; do yes "claude-os, la carte " | head -c 3000 | dd bs=3000 count=1 iflag=fullblock status=none >&3; done'; \
+	    for i in $$(seq $$(( $(DUREE) * 10 ))); do \
+	      grep -qE "reseau carte : (ECHEC|toutes les verifications : ok)" test-carte.log && { fin=1; break; }; sleep 0.1; done; }; \
+	  kill $$q 2>/dev/null; wait $$q 2>/dev/null; break; \
+	done; \
+	grep -F "[linux] reseau" test-carte.log; \
+	[ -n "$$fin" ] && grep -qF "[linux] reseau carte : toutes les verifications : ok" test-carte.log || { echo "la carte : ECHEC"; exit 1; }
 	$(call attendre,$(QEMU_TEST) -nic none $(QEMU_ALEA) -drive format=raw$(,)file=sans-reseau.bin -serial file:test-sans-reseau.log,test-sans-reseau.log,"[noyau] passerelle : termine",:)
 	grep -F "[linux] passerelle : toutes les verifications (sans reseau) : ok" test-sans-reseau.log
 	rm -f test-lien.log $(MON_TESTS); \
@@ -1716,7 +1749,7 @@ test-%.bin: vide.cpio FORCE
 	$(call image,noyau/target/test-$*/x86_64-unknown-none/release/noyau,vide.cpio,test-$*)
 
 clean:
-	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin nmi*.bin programmes*.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio nmi.cpio trace.cpio \
+	rm -f boot*.bin vide*.bin test-*.bin claude-p*.bin sans-reseau*.bin nmi*.bin carte*.bin programmes*.cpio tests.cpio vide.cpio claude-p.cpio sans-reseau.cpio nmi.cpio carte.cpio trace.cpio \
 	  tests-demarrage.txt serial.log trace.log verrous.log \
 	  capture.log qemu.log ecran.png test-*.log test-*.pcap claude-p.log $(MON_TESTS)
 	rm -f $(PRIVE_FICHIERS)

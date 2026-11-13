@@ -4,8 +4,8 @@
 //! drapeaux de fragmentation, la durée de vie (TTL), le protocole de ce qui
 //! suit (1 ICMP, 6 TCP, 17 UDP), la somme de contrôle de l'en-tête, et les
 //! adresses de la source et de la destination. Les options d'un paquet
-//! reçu se vérifient comme chez Linux (`compiler_options`) ; nous n'en
-//! écrivons pas.
+//! reçu se vérifient comme chez Linux (`compiler_options`), et leur écho
+//! (`options_echo`) dit celles qu'on renverrait (IP_RETOPTS).
 
 use super::{Erreur, adresse, mot16, plier, somme};
 
@@ -228,17 +228,34 @@ pub mod option {
 
 /// Ce que disent les options d'un paquet reçu, une fois vérifiées (le
 /// `struct ip_options` de Linux) : la place de chacune dans l'en-tête,
-/// comptée depuis son premier octet (0 : absente).
+/// comptée depuis son premier octet (0 : absente), et ce que la réception
+/// y a écrit (`rr_needaddr`, `ts_needaddr`, `ts_needtime`), que relit leur
+/// écho (`options_echo`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Options {
     pub route_source: u8,
     /// La route source est stricte (SSRR).
     pub stricte: bool,
     pub route_notee: u8,
+    /// La route notée avait de la place : notre adresse y est.
+    pub route_notee_adresse: bool,
     pub horodatage: u8,
+    /// L'horodatage avait de la place : notre adresse (drapeau 1) et
+    /// l'heure (drapeaux 0 et 1, et 3 quand l'adresse donnée n'est pas
+    /// quelqu'un d'autre) y sont.
+    pub horodatage_adresse: bool,
+    pub horodatage_heure: bool,
     pub alerte: u8,
     /// Des octets de l'en-tête ont changé (`is_changed`).
     pub modifiees: bool,
+}
+
+impl Options {
+    /// Aucune option (le `Default`, utilisable dans une constante).
+    pub const AUCUNES: Options = Options {
+        route_source: 0, stricte: false, route_notee: 0, route_notee_adresse: false, horodatage: 0,
+        horodatage_adresse: false, horodatage_heure: false, alerte: 0, modifiees: false,
+    };
 }
 
 /// Ce que le paquet reçu laisse dans ses options, comme Linux : son
@@ -353,6 +370,7 @@ pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, u8> {
                     o[pointeur - 1..pointeur + 3].copy_from_slice(&ici.adresse);
                     o[2] += 4;
                     opt.modifiees = true;
+                    opt.route_notee_adresse = true;
                 }
                 opt.route_notee = place(k);
             }
@@ -376,6 +394,7 @@ pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, u8> {
                     let heure = match drapeau {
                         HEURE_SEULE => {
                             o[2] += 4;
+                            opt.horodatage_heure = true;
                             Some(pointeur - 1)
                         }
                         HEURE_ET_ADRESSE | ADRESSES_DONNEES => {
@@ -388,7 +407,9 @@ pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, u8> {
                             } else {
                                 if drapeau == HEURE_ET_ADRESSE {
                                     o[pointeur - 1..pointeur + 3].copy_from_slice(&ici.adresse);
+                                    opt.horodatage_adresse = true;
                                 }
+                                opt.horodatage_heure = true;
                                 o[2] += 8;
                                 Some(pointeur + 3)
                             }
@@ -423,4 +444,182 @@ pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, u8> {
         k += longueur;
     }
     Ok(opt)
+}
+
+/// La place des options dans un en-tête : 40 octets au plus (15 mots
+/// moins les 5 de l'en-tête fixe).
+pub const OPTIONS_MAX: usize = 40;
+
+/// Des options à envoyer (le `struct ip_options` de Linux, avec ses
+/// octets `__data`) : leurs octets (complétés de FIN jusqu'à un multiple
+/// de 4), la place de chacune comme dans `Options` (comptée depuis le début
+/// de l'en-tête), ce que l'envoi y écrira, et pour une route source, la
+/// première étape (`faddr`), où le paquet ira d'abord.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OptionsSortantes {
+    pub octets: [u8; OPTIONS_MAX],
+    pub longueur: u8,
+    pub places: Options,
+    pub premier_saut: [u8; 4],
+}
+
+impl OptionsSortantes {
+    /// Aucune option.
+    pub const AUCUNE: OptionsSortantes =
+        OptionsSortantes { octets: [0; OPTIONS_MAX], longueur: 0, places: Options::AUCUNES, premier_saut: [0; 4] };
+
+    /// Les octets des options.
+    pub fn octets(&self) -> &[u8] {
+        &self.octets[..self.longueur as usize]
+    }
+
+    /// Les remet comme avant ce que l'envoi y écrirait (`ip_options_undo`) :
+    /// la première étape d'une route source revient devant les autres, et
+    /// chaque place réservée à notre adresse ou à l'heure est rendue (le
+    /// pointeur recule, l'emplacement revient à 0). C'est ce que voit le
+    /// programme (IP_RETOPTS, et `getsockopt` d'IP_OPTIONS) : des options
+    /// qu'il peut redonner telles quelles à l'envoi.
+    pub fn defaire(&mut self) {
+        let base = |place: u8| place as usize - ENTETE;
+        let p = self.places;
+        if p.route_source != 0 {
+            let k = base(p.route_source);
+            let l = self.octets[k + 1] as usize;
+            self.octets.copy_within(k + 3..k + l - 4, k + 7);
+            self.octets[k + 3..k + 7].copy_from_slice(&self.premier_saut);
+        }
+        // Rendre l'emplacement d'avant le pointeur de l'option en `k`.
+        let rendre = |o: &mut [u8; OPTIONS_MAX], k: usize| {
+            o[k + 2] -= 4;
+            let v = o[k + 2] as usize;
+            o[k + v - 1..k + v + 3].fill(0);
+        };
+        if p.route_notee_adresse {
+            rendre(&mut self.octets, base(p.route_notee));
+        }
+        if p.horodatage != 0 {
+            let k = base(p.horodatage);
+            if p.horodatage_heure {
+                rendre(&mut self.octets, k);
+                if self.octets[k + 3] & 0xF == option::ADRESSES_DONNEES {
+                    self.octets[k + 2] -= 4;
+                }
+            }
+            if p.horodatage_adresse {
+                rendre(&mut self.octets, k);
+            }
+        }
+    }
+}
+
+/// L'écho des options d'un paquet reçu (`__ip_options_echo`) : celles d'une
+/// réponse qui doit refaire le même chemin à l'envers, ou que montre
+/// IP_RETOPTS. `options` : les options reçues (après `compiler_options`,
+/// qui a dit `o`), `source` : la source du paquet. Dans l'ordre de Linux :
+///
+/// - la route notée, recopiée ; s'il y reste la place de notre adresse
+///   (que la réception a déjà notée), l'envoi y écrira la sienne ;
+/// - l'horodatage, recopié ; s'il y reste de la place, l'envoi y écrira
+///   l'heure (et l'adresse) ; pour les adresses données d'avance, l'heure
+///   seulement si la suivante n'est pas quelqu'un d'autre ;
+/// - la route source, retournée : les étapes déjà faites, de la dernière à
+///   la première, la plus récente devenant la première étape du retour ;
+///   la source du paquet, si elle y est encore, retirée (la RFC 1812,
+///   5.2.4.1, veut qu'on répare une route qui la contient) ;
+/// - (Linux recopie aussi une étiquette CIPSO, que nous n'acceptons jamais.)
+///
+/// Une place annoncée qui ne tient pas dans l'option : `Err`, et Linux ne
+/// répond pas (une erreur ICMP, l'écho, se taisent ; IP_RETOPTS donne
+/// MSG_CTRUNC).
+pub fn options_echo(options: &[u8], o: &Options, source: [u8; 4], unicast: &dyn Fn([u8; 4]) -> bool)
+                    -> Result<OptionsSortantes, ()> {
+    let mut d = OptionsSortantes::AUCUNE;
+    if options.is_empty() {
+        return Ok(d);
+    }
+    let base = |place: u8| place as usize - ENTETE;
+    // L'option qui commence à `k` (la vérification a vu qu'elle tient).
+    let option = |k: usize| options.get(k..k + *options.get(k + 1)? as usize);
+    let mut n = 0usize;
+    if o.route_notee != 0 {
+        let s = option(base(o.route_notee)).ok_or(())?;
+        let (longueur, pointeur) = (s[1] as usize, s[2] as usize);
+        d.places.route_notee = (n + ENTETE) as u8;
+        d.octets[n..n + longueur].copy_from_slice(s);
+        if o.route_notee_adresse && pointeur <= longueur {
+            if pointeur + 3 > longueur {
+                return Err(());
+            }
+            d.octets[n + 2] = (pointeur + 4) as u8;
+            d.places.route_notee_adresse = true;
+        }
+        n += longueur;
+    }
+    if o.horodatage != 0 {
+        let s = option(base(o.horodatage)).ok_or(())?;
+        let (longueur, mut pointeur) = (s[1] as usize, s[2] as usize);
+        d.places.horodatage = (n + ENTETE) as u8;
+        d.octets[n..n + longueur].copy_from_slice(s);
+        if pointeur <= longueur {
+            if o.horodatage_adresse {
+                if pointeur + 3 > longueur {
+                    return Err(());
+                }
+                d.places.horodatage_adresse = true;
+                pointeur += 4;
+            }
+            if o.horodatage_heure {
+                if pointeur + 3 > longueur {
+                    return Err(());
+                }
+                if s[3] & 0xF != option::ADRESSES_DONNEES {
+                    d.places.horodatage_heure = true;
+                    pointeur += 4;
+                } else if pointeur + 7 <= longueur {
+                    let a = [s[pointeur - 1], s[pointeur], s[pointeur + 1], s[pointeur + 2]];
+                    if !unicast(a) {
+                        d.places.horodatage_heure = true;
+                        pointeur += 8;
+                    }
+                }
+            }
+            d.octets[n + 2] = pointeur as u8;
+        }
+        n += longueur;
+    }
+    if o.route_source != 0 {
+        let s = option(base(o.route_source)).ok_or(())?;
+        let longueur = s[1] as usize;
+        // Les étapes déjà faites : celles avant le pointeur (s'il dépasse la
+        // fin, toutes). `lu` montre (comme le pointeur, depuis 1) l'étape à
+        // recopier ; `ecrit`, la place où elle va.
+        let mut lu = (s[2] as usize).min(longueur + 1) - 4;
+        let mut ecrit = 0;
+        let mut premier_saut = [0; 4];
+        if lu > 3 {
+            premier_saut.copy_from_slice(&s[lu - 1..lu + 3]);
+            lu -= 4;
+            ecrit = 4;
+            while lu > 3 {
+                d.octets[n + ecrit - 1..n + ecrit + 3].copy_from_slice(&s[lu - 1..lu + 3]);
+                lu -= 4;
+                ecrit += 4;
+            }
+            if s[lu + 3..lu + 7] == source {
+                ecrit -= 4;
+            }
+        }
+        if ecrit > 3 {
+            d.premier_saut = premier_saut;
+            d.octets[n] = s[0];
+            d.octets[n + 1] = (ecrit + 3) as u8;
+            d.octets[n + 2] = 4;
+            d.places.route_source = (n + ENTETE) as u8;
+            d.places.stricte = o.stricte;
+            n += ecrit + 3;
+        }
+    }
+    // Complétées de FIN jusqu'à un mot entier (déjà nulles).
+    d.longueur = n.next_multiple_of(4) as u8;
+    Ok(d)
 }

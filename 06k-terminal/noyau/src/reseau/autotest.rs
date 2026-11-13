@@ -52,7 +52,8 @@ fn fragmentation(source: [u8; 4], destination: [u8; 4], protocole: u8, port_sour
         tos: 0, longueur: (fipv4::ENTETE + p.longueur()) as u16, identifiant: 2, ne_pas_fragmenter: false, fragments_suivants: false, decalage: 0, ttl: 64,
         protocole: fipv4::ICMP, source: boucle::ADRESSE, destination: boucle::ADRESSE, longueur_entete: fipv4::ENTETE,
     };
-    icmp::recevoir(lo, &h, false, p);
+    let entete = super::ipv4::EnteteRecu::de(&h, &[], fipv4::Options::AUCUNES, 0);
+    icmp::recevoir(lo, &h, &entete, false, p);
     Some(())
 }
 

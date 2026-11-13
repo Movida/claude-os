@@ -5,7 +5,7 @@
 //! bonne raison ; puis des mutations au hasard, à graine fixe : aucune
 //! panique, et ce qui est accepté reste dans les octets reçus.
 
-use formats::reseau::{self, Erreur, arp, dhcp, ethernet, icmp, ipv4, tcp, udp};
+use formats::reseau::{self, Erreur, arp, dhcp, ethernet, icmp, ipv4, plier, somme, somme_linux, somme_linux_moins, tcp, udp};
 use std::path::PathBuf;
 
 fn trame(nom: &str) -> Vec<u8> {
@@ -287,6 +287,9 @@ fn options_comme_linux() {
                 assert_eq!(o.route_source, 0, "{nom}");
                 assert_eq!(entete[ipv4::ENTETE..], hex(&mots[3].replace("........", "01020304"))[..], "{nom}");
                 assert_eq!(o.modifiees, mots[1] != mots[3], "{nom}");
+                // Muet : l'écho des options échoue (l'erreur ICMP se tait).
+                let echo = ipv4::options_echo(&entete[ipv4::ENTETE..], &o, [0; 4], &unicast);
+                assert_eq!(echo.is_ok(), issue == "livre", "{nom} : {echo:?}");
             }
             _ => panic!("{nom} : issue inconnue {issue}"),
         }
@@ -298,9 +301,11 @@ fn options_comme_linux() {
     e.extend_from_slice(&hex("010707040000000044040500940400008903040000000000"));
     let o = ipv4::compiler_options(&mut e, &ici).unwrap();
     assert_eq!((o.route_notee, o.horodatage, o.alerte, o.route_source, o.stricte), (21, 28, 32, 36, true));
+    assert_eq!((o.route_notee_adresse, o.horodatage_adresse, o.horodatage_heure), (true, false, false));
     // Des options au hasard (des genres connus le plus souvent, des
     // longueurs et des pointeurs proches des bords) : jamais de panique, une
-    // faute désigne un octet des options, et rien ne change hors d'elles.
+    // faute désigne un octet des options, et rien ne change hors d'elles ;
+    // leur écho non plus ne panique pas.
     let mut h = Hasard(0x0123_4567_89ab_cdef);
     let genres = [0u8, 1, 7, 68, 130, 131, 134, 136, 137, 148];
     let mut fautes = 0;
@@ -316,13 +321,105 @@ fn options_comme_linux() {
             });
         }
         let avant = e.clone();
-        if let Err(place) = ipv4::compiler_options(&mut e, &ici) {
-            assert!((ipv4::ENTETE..e.len()).contains(&(place as usize)), "{avant:02x?} : {place}");
-            fautes += 1;
+        match ipv4::compiler_options(&mut e, &ici) {
+            Err(place) => {
+                assert!((ipv4::ENTETE..e.len()).contains(&(place as usize)), "{avant:02x?} : {place}");
+                fautes += 1;
+            }
+            // L'écho, et défait : jamais de panique, et au plus 40 octets.
+            Ok(o) => {
+                if let Ok(mut d) = ipv4::options_echo(&e[ipv4::ENTETE..], &o, [10, 0, 0, 1], &unicast) {
+                    d.defaire();
+                    assert!(d.octets().len() <= e.len() - ipv4::ENTETE + 3, "{avant:02x?}");
+                }
+            }
         }
         assert_eq!((e.len(), &e[..ipv4::ENTETE]), (avant.len(), &avant[..ipv4::ENTETE]));
     }
     assert!(fautes > 10_000 && fautes < 190_000, "{fautes} fautes : le hasard ne couvre plus les deux issues");
+}
+
+/// L'écho des options reçues (`options_echo`), puis défait (`defaire`) :
+/// ce que rend IP_RETOPTS. Les trois premiers cas sont mesurés sous Linux
+/// 6.18, sur lo (soldes, sondes-sol-ip/cmsg.txt : les options envoyées par
+/// IP_OPTIONS, telles qu'à l'arrivée, IP_RECVOPTS, puis IP_RETOPTS).
+#[test]
+fn echo_des_options() {
+    let hex = |h: &str| -> Vec<u8> { (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let unicast = |a: [u8; 4]| !(a[0] == 127 || a[0] == 0 || a == ipv4::DIFFUSION || ipv4::multidiffusion(a));
+    let ici = ipv4::Ici { adresse: [127, 0, 0, 1], heure: 0x04c3_cc10, unicast: &unicast };
+    let source = [127, 0, 0, 1];
+    // Les options telles qu'envoyées (l'émetteur y a écrit), ce qu'elles
+    // deviennent à l'arrivée (RECVOPTS), puis l'écho défait (RETOPTS).
+    let retour = |envoyees: &str| -> (Vec<u8>, Result<Vec<u8>, ()>) {
+        let mut e = vec![0u8; ipv4::ENTETE];
+        e.extend_from_slice(&hex(envoyees));
+        let o = ipv4::compiler_options(&mut e, &ici).unwrap();
+        let echo = ipv4::options_echo(&e[ipv4::ENTETE..], &o, source, &unicast).map(|mut d| {
+            d.defaire();
+            d.octets().to_vec()
+        });
+        (e[ipv4::ENTETE..].to_vec(), echo)
+    };
+    let (recues, echo) = retour("070b087f0000010000000000");
+    assert_eq!((recues, echo), (hex("070b0c7f0000017f00000100"), Ok(hex("070b0c7f0000017f00000100"))));
+    let (recues, echo) = retour("440c0d017f00000104c3cc1001000000");
+    assert_eq!((recues, echo), (hex("440c0d117f00000104c3cc1001000000"), Ok(hex("440c0d117f00000104c3cc10"))));
+    let (recues, echo) = retour("440c0d037f00000104c3cc10");
+    assert_eq!((recues, echo), (hex("440c0d037f00000104c3cc10"), Ok(hex("440c0d037f00000104c3cc10"))));
+    // Avec de la place : l'écho la réserve (le pointeur avance), puis la
+    // rend en se défaisant ; notre adresse, notée à l'arrivée, reste.
+    assert_eq!(retour("070b04000000000000000000").1, Ok(hex("070b087f0000010000000000")));
+    assert_eq!(retour("440c05000000000000000000").1, Ok(hex("440c090004c3cc1000000000")));
+    assert_eq!(retour("4414050100000000000000000000000000000000").1, Ok(hex("44140d017f00000104c3cc100000000000000000")));
+    // Les adresses données d'avance : la nôtre (127.0.0.1) a reçu l'heure ;
+    // la suivante n'est pas quelqu'un d'autre (127.0.0.2) : sa place est
+    // réservée, puis rendue, le pointeur ramené devant elle.
+    assert_eq!(retour("441405037f000001000000007f00000200000000").1, Ok(hex("44140d037f00000104c3cc107f00000200000000")));
+    // Une place annoncée qui ne tient pas : Err.
+    assert_eq!(retour("070904000000000000000000").1, Err(()));
+    // Sans options : rien.
+    assert_eq!(ipv4::options_echo(&[], &ipv4::Options::default(), source, &unicast).map(|d| d.longueur), Ok(0));
+    // La route source (jamais livrée chez nous : seulement l'écho d'une
+    // erreur) : les étapes faites, retournées ; la source du paquet ôtée.
+    let s = [10, 0, 0, 9];
+    let mut e = vec![0u8; ipv4::ENTETE];
+    e.extend_from_slice(&hex("83130c0a0000010a0000020a0000030a00000400"));
+    let o = ipv4::compiler_options(&mut e, &ici).unwrap();
+    let d = ipv4::options_echo(&e[ipv4::ENTETE..], &o, s, &unicast).unwrap();
+    assert_eq!((d.octets(), d.premier_saut, d.places.route_source), (&hex("830b040a0000010000000000")[..], [10, 0, 0, 2], 20));
+    let mut defaite = d;
+    defaite.defaire();
+    assert_eq!(defaite.octets(), hex("830b040a0000020a00000100"));
+    // Une seule étape faite, la source elle-même : pas de route de retour.
+    let mut e = vec![0u8; ipv4::ENTETE];
+    e.extend_from_slice(&hex("830b080a0000010a00000200"));
+    let o = ipv4::compiler_options(&mut e, &ici).unwrap();
+    let d = ipv4::options_echo(&e[ipv4::ENTETE..], &o, [10, 0, 0, 1], &unicast).unwrap();
+    assert_eq!((d.longueur, d.places.route_source), (0, 0));
+}
+
+/// La somme que garde Linux (`csum_partial` d'x86-64), rendue par
+/// IP_CHECKSUM : mesurée sur la réponse d'un ping (sondes-sol-ip/erreurs.txt).
+#[test]
+fn somme_de_linux() {
+    assert_eq!(somme_linux(&[0x00, 0x00, 0x19, 0xca, 0xe6, 0x2e, 0x00, 0x07]).to_le_bytes(), [0xe6, 0x2e, 0x19, 0xd1]);
+    assert_eq!((somme_linux(&[]), somme_linux(&[0; 7]), somme_linux(&[0xff; 8])), (0, 0, 0xFFFF_FFFF));
+    // Une fin de moins de 4 octets : complétée de zéros, à sa place.
+    assert_eq!(somme_linux(&[1, 2, 3, 4, 5, 6]), 0x0403_0201 + 0x0605);
+    // Pliée, la même somme de contrôle que celle de l'Internet.
+    let o: Vec<u8> = (0..77u8).map(|i| i.wrapping_mul(37)).collect();
+    let s = somme_linux(&o);
+    let plie = |mut s: u32| {
+        while s > 0xFFFF {
+            s = (s & 0xFFFF) + (s >> 16);
+        }
+        s as u16
+    };
+    assert_eq!(plie(s).swap_bytes(), !plier(somme(&o, 0)));
+    // `csum_sub` : la somme des 8 premiers octets ôtée.
+    assert_eq!(somme_linux_moins(s, somme_linux(&o[..8])), somme_linux(&[&[0; 8][..], &o[8..]].concat()));
+    assert_eq!(somme_linux_moins(5, 5), 0xFFFF_FFFF);
 }
 
 /// Un générateur à graine fixe (xorshift64*), pour des mutations qui se

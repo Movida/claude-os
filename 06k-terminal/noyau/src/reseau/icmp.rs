@@ -127,7 +127,7 @@ pub fn horodatage() -> u32 {
 /// Un message ICMP reçu par `i` (`p` : le message, sans l'en-tête d'IPv4,
 /// dont voici les champs `h`), dans la tâche du réseau. `diffusion` : sa
 /// destination est une diffusion.
-pub fn recevoir(i: &'static Interface, h: &format_ipv4::Ipv4, diffusion: bool, p: Paquet) {
+pub fn recevoir(i: &'static Interface, h: &format_ipv4::Ipv4, entete: &ipv4::EnteteRecu, diffusion: bool, p: Paquet) {
     MIB.icmp(Compteur::InMsgs);
     let (m, donnees) = match icmp::lire(p.donnees()) {
         Ok(x) => x,
@@ -152,7 +152,7 @@ pub fn recevoir(i: &'static Interface, h: &format_ipv4::Ipv4, diffusion: bool, p
         return;
     }
     if matches!(m.genre, icmp::ECHO_REPONSE | icmp::ECHO_ETENDU_REPONSE) {
-        return super::ping::recevoir(i.index, h.source, h.destination, p);
+        return super::ping::recevoir(i.index, h.source, h.destination, entete, p);
     }
     if m.genre > icmp::GENRE_MAX {
         return refuse();
@@ -171,7 +171,7 @@ pub fn recevoir(i: &'static Interface, h: &format_ipv4::Ipv4, diffusion: bool, p
             repondre(h, &reponse, &[origine, &t, &t]);
         }
         icmp::INJOIGNABLE | icmp::ETOUFFEMENT | icmp::REDIRECTION | icmp::TEMPS_DEPASSE | icmp::PARAMETRE => {
-            erreur_recue(i, h, &m, donnees)
+            erreur_recue(i, h, entete, &m, donnees, p.donnees())
         }
         _ => {}
     }
@@ -189,10 +189,13 @@ pub struct ErreurRecue<'a> {
     pub interne: Interne,
     pub origine: &'a [u8],
     /// Qui a dit l'erreur (la source du message ICMP), où et par quelle
-    /// interface il est arrivé.
+    /// interface il est arrivé, ce que la réception a gardé de son en-tête
+    /// IP, et le message ICMP entier (sa somme, IP_CHECKSUM).
     pub emetteur: [u8; 4],
     pub destination: [u8; 4],
     pub interface: u32,
+    pub entete: &'a ipv4::EnteteRecu,
+    pub message: &'a [u8],
 }
 
 /// Un message reçu refusé (InErrors).
@@ -205,7 +208,7 @@ fn refuse() {
 /// regarde pas) ; un code d'injoignable connu (au plus 15) ; un « temps
 /// dépassé » du réassemblage ignoré ; le paquet d'origine lisible (son
 /// en-tête, puis 8 octets : `icmp_socket_deliver`) ; puis son protocole.
-fn erreur_recue(i: &'static Interface, h: &format_ipv4::Ipv4, m: &Icmp, donnees: &[u8]) {
+fn erreur_recue(i: &'static Interface, h: &format_ipv4::Ipv4, ip: &ipv4::EnteteRecu, m: &Icmp, donnees: &[u8], message: &[u8]) {
     let entete = donnees.first().map_or(0, |o| (o & 0x0F) as usize * 4);
     if donnees.len() < format_ipv4::ENTETE || (m.genre != icmp::REDIRECTION && entete < format_ipv4::ENTETE) {
         return refuse();
@@ -231,7 +234,7 @@ fn erreur_recue(i: &'static Interface, h: &format_ipv4::Ipv4, m: &Icmp, donnees:
     };
     let e = ErreurRecue {
         genre: m.genre, code: m.code, info, interne, origine: donnees, emetteur: h.source, destination: h.destination,
-        interface: i.index,
+        interface: i.index, entete: ip, message,
     };
     match interne.protocole {
         format_ipv4::UDP => super::udp::erreur(&e),

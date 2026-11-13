@@ -158,11 +158,15 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     Ok(longueur)
 }
 
-/// Une réponse à l'écho (`p` : le message ICMP entier) reçue par
-/// l'interface `interface`, de `source`, pour `destination`, dans la tâche
-/// du réseau (`ping_rcv`) : à la socket de son identifiant, telle quelle
-/// (l'en-tête ICMP compris), avec la règle ordinaire des files.
-pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], p: Paquet) {
+/// Une réponse à l'écho (`p` : le message ICMP entier, dont la réception a
+/// gardé l'en-tête IP `entete`) reçue par l'interface `interface`, de
+/// `source`, pour `destination`, dans la tâche du réseau (`ping_rcv`) : à
+/// la socket de son identifiant, telle quelle (l'en-tête ICMP compris),
+/// avec la règle ordinaire des files. Sa somme est toujours complète
+/// (`icmp_rcv` la vérifie sur tout le message : CHECKSUM_COMPLETE), et ses
+/// « ports » d'IP_ORIGDSTADDR sont les octets 2 et 3 de l'en-tête ICMP :
+/// la somme du message (mesuré).
+pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], entete: &ipv4::EnteteRecu, p: Paquet) {
     let Ok((m, _)) = icmp::lire(p.donnees()) else { return };
     let (ident, _) = m.echo();
     let Some(s) = IDENTS.verrouiller().as_ref().and_then(|t| t.trouver(ident, destination)) else {
@@ -170,7 +174,12 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], p: Paquet
         return;
     };
     let taille = p.taille_vraie();
-    let d = Datagramme { regarde: false, paquet: p, source, port: 0, destination, interface, taille };
+    let port_destination = p.donnees().get(2..4).map_or(0, |o| u16::from_be_bytes([o[0], o[1]]));
+    let somme = formats::reseau::somme_linux(p.donnees());
+    let d = Datagramme {
+        regarde: false, paquet: p, source, port: 0, destination, interface, entete: *entete, port_destination,
+        somme: socket::Somme::Calculee(somme), taille,
+    };
     if s.deposer(d, Admission::Ordinaire).is_err() {
         FILE_PLEINE.fetch_add(1, Ordering::Relaxed);
     }

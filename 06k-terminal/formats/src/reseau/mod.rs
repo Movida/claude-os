@@ -82,6 +82,36 @@ pub fn somme(o: &[u8], depart: u32) -> u32 {
     s as u32
 }
 
+/// La somme telle que Linux la garde sur x86-64 (`csum_partial`, un
+/// `__wsum`), que rend IP_CHECKSUM : les mots de 32 bits petit-boutistes
+/// (la fin complétée de zéros) ajoutés en complément à un sur 32 bits, de
+/// 1 à 0xFFFFFFFF (0 seulement si tout est nul). Ses octets en mémoire sont
+/// `to_le_bytes`. Pliée, elle donne la même somme de contrôle que `somme`
+/// (les mêmes mots de 16 bits, les octets permutés : la RFC 1071, 2.B).
+pub fn somme_linux(o: &[u8]) -> u32 {
+    let mut s = 0u64;
+    let mut mots = o.chunks_exact(4);
+    for m in &mut mots {
+        s += u32::from_le_bytes([m[0], m[1], m[2], m[3]]) as u64;
+    }
+    let mut fin = [0u8; 4];
+    fin[..mots.remainder().len()].copy_from_slice(mots.remainder());
+    s += u32::from_le_bytes(fin) as u64;
+    while s > 0xFFFF_FFFF {
+        s = (s & 0xFFFF_FFFF) + (s >> 32);
+    }
+    s as u32
+}
+
+/// `a` moins `b`, deux sommes de `somme_linux` (`csum_sub` : `a` plus le
+/// complément de `b`, la retenue rajoutée). Comme chez Linux, le résultat
+/// n'est pas toujours celui qu'aurait donné la somme des octets qui restent
+/// : un reste nul donne 0xFFFFFFFF, pas 0.
+pub fn somme_linux_moins(a: u32, b: u32) -> u32 {
+    let (s, retenue) = a.overflowing_add(!b);
+    s + retenue as u32
+}
+
 /// La somme de contrôle finale : la somme repliée sur 16 bits, en
 /// complément à un (le `csum_fold` de Linux). Un en-tête juste a une somme
 /// (somme de contrôle comprise) qui se plie en 0.

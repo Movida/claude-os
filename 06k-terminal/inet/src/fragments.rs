@@ -24,8 +24,14 @@
 //!     sans doute pas, et un identifiant de 16 bits revient vite à un fort débit : ce qui
 //!     arriverait maintenant serait d'un autre paquet.
 //!
+//! Le paquet recollé dit la taille de son plus grand morceau, en-tête compris
+//! (`frag_max_size`), que lit IP_RECVFRAGSIZE. Linux y prend le plus grand de deux
+//! maximums, celui des morceaux et celui des morceaux marqués DF (`max_df_size`) : le
+//! second ne dépasse jamais le premier, il ne sert qu'au routage.
+//!
 //! Écarté : `ip_defrag` sur le chemin de routage, nous ne routons pas ; `IPSKB_FRAG_PMTU`
-//! et `frag_max_size` : ils ne servent qu'à refragmenter ce qu'on transmet.
+//! (`max_df_size` égal au plus grand morceau) : il ne sert qu'à refragmenter ce qu'on
+//! transmet.
 //!
 //! Ici, les règles seules, sur des morceaux que donne le noyau (noyau/src/reseau/ipv4.rs,
 //! qui recopie le paquet complet).
@@ -75,10 +81,11 @@ pub enum Issue<M> {
     /// la rendait fausse.
     Jete,
     /// C'est fini : les morceaux dans l'ordre, la longueur des données, celle de l'en-tête
-    /// du premier, et les bits ECN à ajouter à son TOS (`ip_frag_ecn_table`). L'appelant
+    /// du premier, les bits ECN à ajouter à son TOS (`ip_frag_ecn_table`), et la taille
+    /// du plus grand morceau gardé, son en-tête compris (`frag_max_size`). L'appelant
     /// compte ReasmOKs quand il en a fait un paquet d'un seul tenant, ReasmFails s'il ne le
     /// peut pas (la fin d'`ip_frag_reasm`).
-    Complet { morceaux: Vec<M>, longueur: u32, entete: u32, ecn: u8 },
+    Complet { morceaux: Vec<M>, longueur: u32, entete: u32, ecn: u8, taille_max: u16 },
 }
 
 /// Une suite de morceaux sans trou reçus dans l'ordre (`frag_run_len`).
@@ -106,13 +113,15 @@ struct File<M> {
     /// La longueur de l'en-tête du premier morceau, et l'interface du dernier reçu.
     entete: u32,
     interface: u32,
+    /// Le plus grand morceau gardé, en-tête compris (`q.max_size`).
+    taille_max: u16,
     echeance: u64,
     vraie: usize,
 }
 
 impl<M> File<M> {
     fn new(cle: Cle, maintenant: u64) -> File<M> {
-        File { cle, morceaux: Vec::new(), suites: Vec::new(), longueur: 0, recu: 0, premier: false, dernier: false, ecart: 0, ecn: 0, entete: 0, interface: 0, echeance: maintenant + DELAI, vraie: 0 }
+        File { cle, morceaux: Vec::new(), suites: Vec::new(), longueur: 0, recu: 0, premier: false, dernier: false, ecart: 0, ecn: 0, entete: 0, interface: 0, taille_max: 0, echeance: maintenant + DELAI, vraie: 0 }
     }
 }
 
@@ -257,12 +266,15 @@ impl<M: Morceau> Reassemblage<M> {
         f.interface = interface;
         f.ecn |= ecn;
         f.recu += fin - decalage;
+        // Sa taille une fois coupé, son en-tête compris (`fragsize`) ; un morceau ne
+        // dépasse pas 64 Kio (sa longueur totale tient dans 16 bits).
+        f.taille_max = f.taille_max.max((fin - decalage + entete).min(u16::MAX as u32) as u16);
         if decalage == 0 {
             f.premier = true;
             f.entete = entete;
         }
         if f.premier && f.dernier && f.recu == f.longueur {
-            let (longueur, entete, vus, v) = (f.longueur, f.entete, f.ecn, f.vraie);
+            let (longueur, entete, vus, v, taille_max) = (f.longueur, f.entete, f.ecn, f.vraie, f.taille_max);
             self.memoire = self.memoire.saturating_sub(v);
             let f = self.files.swap_remove(i);
             // `ip_frag_reasm`, dont chaque échec est compté (`out_fail`).
@@ -279,7 +291,7 @@ impl<M: Morceau> Reassemblage<M> {
             for (_, m) in f.morceaux {
                 morceaux.ajouter_dans_la_place(m);
             }
-            return Issue::Complet { morceaux, longueur, entete, ecn };
+            return Issue::Complet { morceaux, longueur, entete, ecn, taille_max };
         }
         Issue::EnCours
     }
