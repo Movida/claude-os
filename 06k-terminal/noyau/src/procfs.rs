@@ -9,7 +9,8 @@
 //! du noyau tout fait (fichiers::noyaufs, monté sur /proc au démarrage,
 //! vfs.rs) : /proc/sys/vm/overcommit_memory et mmap_min_addr,
 //! /proc/sys/fs/pipe-max-size et pipe-user-pages-*, à root ; /proc/net
-//! (arp, dev, pnp, route : le réseau, 6g, reseau/proc.rs) ; /proc/self,
+//! (arp, dev, pnp, route : le réseau, 6g, reseau/proc.rs) ; /proc/version
+//! (qui est le noyau, et qui l'a construit) ; /proc/self,
 //! un lien vers le numéro du processus qui le lit, et /proc/thread-self,
 //! vers « <pid>/task/<tid> », le dossier du fil qui le lit. Le reste, la
 //! vue de /proc le fabrique le temps d'un appel (`ProcVue`), d'après la
@@ -100,6 +101,8 @@ const MMAP_MIN_ADDR: u32 = 4;
 /// Le nom d'un fil (/proc/<pid>/comm, task/<tid>/comm : l'argument est le
 /// numéro du fil, celui du processus pour son fil principal).
 const COMM: u32 = 5;
+/// /proc/version (`banniere`).
+const BANNIERE: u32 = 9;
 /// /proc/sys/fs/pipe-max-size, pipe-user-pages-soft, pipe-user-pages-hard
 /// (tube.rs).
 const PIPE_MAX_SIZE: u32 = 6;
@@ -201,6 +204,7 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     p.ajouter(net, b"route", 0o444, (0, 0), net_fichier(NET_ROUTE), maintenant)?;
     p.ajouter(net, b"tcp", 0o444, (0, 0), net_fichier(NET_TCP), maintenant)?;
     p.ajouter(net, b"unix", 0o444, (0, 0), net_fichier(NET_UNIX), maintenant)?;
+    p.ajouter(racine, b"version", 0o444, (0, 0), Contenu::Fichier { source: BANNIERE, argument: 0 }, maintenant)?;
     p.ajouter(racine, b"self", 0o777, (0, 0), Contenu::Lien(Cible::Lecteur), maintenant)?;
     p.ajouter(racine, b"thread-self", 0o777, (0, 0), Contenu::Lien(Cible::LecteurFil), maintenant)?;
     Ok(p)
@@ -669,7 +673,7 @@ pub fn lecture(source: u32) -> Lecture {
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD | RANDOM_BOOT_ID
         | RANDOM_UUID | RANDOM_ENTROPY_AVAIL | RANDOM_POOLSIZE | RANDOM_WAKEUP | RANDOM_RESEED | INOTIFY_EVENEMENTS
         | INOTIFY_INSTANCES | INOTIFY_SURVEILLANCES => Lecture::Valeur,
-        MAPS | STATM | COMM | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP | NET_UNIX => Lecture::Sequence,
+        MAPS | STATM | COMM | BANNIERE | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP | NET_UNIX => Lecture::Sequence,
         // Nommées une à une, sans cas par défaut : /proc/net/tcp et unix
         // (6h) y étaient tombés, et se comportaient en attributs de /sys
         // (lseek SEEK_END donnait 4096 ; Linux : EINVAL, `seq_lseek`).
@@ -849,6 +853,7 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
         MAPS => ligne_maps(argument, curseur),
         STATM if curseur == 0 => statm(argument).map(|t| Some((t, u64::MAX))),
         COMM if curseur == 0 => comm(argument).map(|t| Some((t, u64::MAX))),
+        BANNIERE if curseur == 0 => banniere().map(|t| Some((t, u64::MAX))),
         NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_TCP | NET_UNIX => {
             let f = match source {
                 NET_PNP => crate::reseau::proc::Fichier::Pnp,
@@ -880,6 +885,24 @@ fn nom(tid: u32) -> Option<crate::programmes::NomCourt> {
 fn comm(tid: u32) -> Result<Vec<u8>, Erreur> {
     let nom = nom(tid).unwrap_or(crate::programmes::NomCourt::VIDE);
     Ok(faillible::concatenation(&[nom.octets(), b"\n"])?)
+}
+
+/// /proc/version : le `linux_proc_banner` de Linux (fs/proc/version.c), le
+/// nom du système, sa version et sa construction, ceux d'uname
+/// (linux.rs), avec entre eux qui a construit le noyau, sur quelle machine,
+/// et avec quel compilateur (build.rs). Qui et où : Linux prend `whoami` et
+/// `hostname` à la construction, sauf quand KBUILD_BUILD_USER et
+/// KBUILD_BUILD_HOST les fixent, pour une construction reproductible ; les
+/// nôtres sont fixés, sans quoi la même image dirait autre chose construite
+/// dans la machine de David ou dans la CI. Des programmes y cherchent ce
+/// qu'uname ne dit pas toujours (Claude Code y reconnaît WSL, à
+/// « microsoft »).
+fn banniere() -> Result<Vec<u8>, Erreur> {
+    use crate::linux::{CONSTRUCTION, SYSTEME, VERSION};
+    let mut t = Ecrit(Vec::new());
+    writeln!(t, "{} version {} (claude-os@claude-os) ({}) {}", SYSTEME, VERSION, env!("COMPILATEUR"), CONSTRUCTION)
+        .map_err(|_| Erreur::ENOMEM)?;
+    Ok(t.0)
 }
 
 /// La source `source` s'écrit-elle (le fichier s'ouvre-t-il en écriture,

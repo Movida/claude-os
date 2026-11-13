@@ -1199,17 +1199,32 @@ fn prlimit64(pid: u64, ressource: u64, nouvelle: u64, ancienne: u64) -> i64 {
     0
 }
 
-/// uname(tampon) : qui est le système, en six chaînes de 65 octets (la
-/// `struct new_utsname`). On annonce la version de Linux dont on imite le
-/// comportement (6.18, celle des sondes de chaque sous-étape), suivie de
+/// Le nom du système, sa version et sa construction (uname, et
+/// /proc/version, procfs.rs). La version est celle de Linux dont on imite
+/// le comportement (6.18, celle des sondes de chaque sous-étape), suivie de
 /// qui l'a construit, comme le fait WSL (« 6.18.33.2-microsoft-standard-
-/// WSL2 », mesuré) : les programmes testent `sysname` et lisent `release`
-/// pour choisir des fonctions. Le nom de la machine et le domaine :
+/// WSL2 », mesuré) : les programmes testent le nom et lisent la version
+/// pour choisir des fonctions. La construction suit l'UTS_VERSION de
+/// Linux : son numéro, puis SMP (plusieurs processeurs, depuis 6j) et
+/// PREEMPT (le noyau se préempte, ordonnanceur.rs : « PREEMPT_DYNAMIC »
+/// chez WSL, dont le modèle se choisit au démarrage, « PREEMPT » quand il
+/// est fixé à la construction, comme le nôtre). Sans la date que Linux
+/// ajoute à la fin : celle de la construction, la seule chose qui
+/// changerait d'une construction à l'autre des mêmes sources (Linux la
+/// fige lui-même par KBUILD_BUILD_TIMESTAMP pour une construction
+/// reproductible ; la nôtre l'est sans).
+pub const SYSTEME: &str = "Linux";
+pub const VERSION: &str = "6.18.0-claude-os";
+pub const CONSTRUCTION: &str = "#1 SMP PREEMPT";
+
+/// uname(tampon) : qui est le système, en six chaînes de 65 octets (la
+/// `struct new_utsname`). Le nom de la machine et le domaine :
 /// « (none) », ceux de Linux tant que personne n'a appelé `sethostname`
 /// (UTS_NODENAME) ; notre lanceur, qui tient le rôle d'init, n'a aucune
 /// raison de le faire.
 fn uname(tampon: u64) -> i64 {
-    const CHAMPS: [&[u8]; 6] = [b"Linux", b"(none)", b"6.18.0-claude-os", b"#1", b"x86_64", b"(none)"];
+    const CHAMPS: [&[u8]; 6] =
+        [SYSTEME.as_bytes(), b"(none)", VERSION.as_bytes(), CONSTRUCTION.as_bytes(), b"x86_64", b"(none)"];
     let mut u = [0u8; 6 * 65];
     for (i, champ) in CHAMPS.iter().enumerate() {
         u[i * 65..i * 65 + champ.len()].copy_from_slice(champ);

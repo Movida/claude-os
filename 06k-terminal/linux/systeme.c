@@ -63,9 +63,25 @@ static void systeme(void)
     verifier(uname(&u) == 0 && strcmp(u.sysname, "Linux") == 0 && strcmp(u.machine, "x86_64") == 0
              && u.release[0] >= '0' && u.release[0] <= '9', "uname : Linux, x86_64, une version");
     if (chez_nous)
-        verifier(strcmp(u.release, "6.18.0-claude-os") == 0 && strcmp(u.version, "#1") == 0
+        verifier(strcmp(u.release, "6.18.0-claude-os") == 0 && strcmp(u.version, "#1 SMP PREEMPT") == 0
                  && strcmp(u.nodename, "(none)") == 0 && strcmp(u.domainname, "(none)") == 0,
-                 "uname, chez nous : 6.18.0-claude-os, #1, (none)");
+                 "uname, chez nous : 6.18.0-claude-os, #1 SMP PREEMPT, (none)");
+    /* /proc/version : « <sysname> version <release> (<qui>@<machine>)
+     * (<compilateur>) <version> » et un saut de ligne, d'une seule lecture
+     * (fs/proc/version.c) ; chez nous, qui, la machine et le compilateur
+     * aussi. */
+    char banniere[512] = { 0 }, debut[256], fin[128];
+    int fd = open("/proc/version", O_RDONLY);
+    ssize_t n = read(fd, banniere, sizeof banniere - 1);
+    close(fd);
+    snprintf(debut, sizeof debut, "%s version %s (", u.sysname, u.release);
+    snprintf(fin, sizeof fin, ") %s\n", u.version);
+    size_t l = n > 0 ? (size_t)n : 0, lf = strlen(fin);
+    verifier(strncmp(banniere, debut, strlen(debut)) == 0 && l > lf && strcmp(banniere + l - lf, fin) == 0,
+             "/proc/version : le systeme, sa version et sa construction, ceux d'uname");
+    if (chez_nous)
+        verifier(strncmp(banniere + strlen(debut), "claude-os@claude-os) (rustc 1.", 30) == 0,
+                 "/proc/version, chez nous : construit par claude-os, avec rustc");
     verifier(erreur(syscall(SYS_uname, (void *)8)) == EFAULT, "uname a une adresse invalide : EFAULT");
     verifier(sched_yield() == 0, "sched_yield : 0");
 }

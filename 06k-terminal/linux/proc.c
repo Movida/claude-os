@@ -352,7 +352,7 @@ static void arborescence(void)
     struct dirent *e;
     char moi[32];
     snprintf(moi, sizeof moi, "%d", getpid());
-    int vu_self = 0, vu_fil = 0, vu_moi = 0, vu_sys = 0, vu_net = 0, autres = 0, numeros = 0;
+    int vu_self = 0, vu_fil = 0, vu_moi = 0, vu_sys = 0, vu_net = 0, vu_version = 0, autres = 0, numeros = 0;
     while ((e = readdir(d))) {
         numeros += e->d_name[0] >= '1' && e->d_name[0] <= '9';
         if (!strcmp(e->d_name, "self"))
@@ -366,16 +366,19 @@ static void arborescence(void)
         else if (!strcmp(e->d_name, "net"))
             /* Un lien vers self/net chez Linux, un dossier chez nous (6g). */
             vu_net = e->d_type == DT_DIR || e->d_type == DT_LNK;
+        else if (!strcmp(e->d_name, "version"))
+            vu_version = e->d_type == DT_REG;
         else if (strcmp(e->d_name, ".") && strcmp(e->d_name, ".."))
             autres++;
     }
     closedir(d);
-    verifier(vu_self && vu_fil && vu_moi && vu_sys && vu_net, "/proc contient self, thread-self, sys, net et le dossier du processus");
+    verifier(vu_self && vu_fil && vu_moi && vu_sys && vu_net && vu_version,
+             "/proc contient self, thread-self, sys, net, version et le dossier du processus");
     /* L'ordre des listes : dans /proc et /proc/net, par la longueur du nom
      * puis ses octets (`proc_match`), self et thread-self après, puis les
      * processus ; dans le dossier d'un processus, celui du tableau de Linux
      * (`tgid_base_stuff`) ; dans /proc/sys, par les octets (`namecmp`). */
-    verifier(DANS_L_ORDRE("/proc", "net", "sys", "self", "thread-self", moi)
+    verifier(DANS_L_ORDRE("/proc", "net", "sys", "version", "self", "thread-self", moi)
              && DANS_L_ORDRE("/proc/net", "arp", "dev", "pnp", "tcp", "unix", "route")
              && DANS_L_ORDRE("/proc/self", "task", "fd", "comm", "statm", "maps", "exe")
              && DANS_L_ORDRE("/proc/sys", "fs", "kernel", "net", "vm")
