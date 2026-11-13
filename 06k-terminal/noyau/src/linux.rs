@@ -40,7 +40,7 @@ use crate::interruptions::Cadre;
 use crate::memoire::{self, Acces, ECART_GARDE, Echec, ZoneDuCode, engagement_possible};
 use zones::{Drapeaux, Droits, Nature, Projection, Zone};
 use crate::appels_fichiers as f;
-use crate::{aleatoire, appels_reseau, cpu, evenements, futex, pages, processus, signaux, tache, temps};
+use crate::{aleatoire, appels_reseau, cpu, evenements, futex, pages, processeur, processus, signaux, tache, temps};
 
 // Les numéros d'erreur de Linux (include/uapi/asm-generic/errno-base.h).
 const EPERM: i64 = 1;
@@ -1135,22 +1135,39 @@ fn madvise(adresse: u64, longueur: u64, conseil: u64) -> i64 {
 }
 
 /// arch_prctl(code, adresse) : la base de FS (ARCH_SET_FS, ARCH_GET_FS),
-/// où la glibc range ses variables propres au fil (TLS).
+/// où la glibc range ses variables propres au fil (TLS), et celle de GS
+/// (ARCH_SET_GS, ARCH_GET_GS), que la glibc laisse au programme : Wine y
+/// met son TEB, d'autres moteurs leur état par fil. Chaque fil a les
+/// siennes, sauvées et rétablies à chaque bascule (tache.rs), copiées par
+/// clone. Fixer une base remet aussi le sélecteur à zéro, comme Linux. Les
+/// autres codes (le vDSO, CPUID, la pile fantôme...) : EINVAL, comme un
+/// code inconnu de Linux. Le code est un int (ses 32 bits du haut
+/// ignorés), l'adresse un unsigned long.
 fn arch_prctl(code: u64, adresse: u64) -> i64 {
+    const ARCH_SET_GS: u64 = 0x1001;
     const ARCH_SET_FS: u64 = 0x1002;
     const ARCH_GET_FS: u64 = 0x1003;
-    match code {
-        // Une adresse des programmes seulement : une adresse non canonique
-        // ferait fauter wrmsr dans le noyau. Linux rend EPERM au-delà.
-        ARCH_SET_FS if adresse < ADRESSE_MAX => {
-            cpu::ecrire_base_fs(adresse);
+    const ARCH_GET_GS: u64 = 0x1004;
+    let rendre = |base: u64| match copier_vers_utilisateur(adresse, &base.to_le_bytes()) {
+        Ok(()) => 0,
+        Err(_) => -EFAULT,
+    };
+    match code as u32 as i32 as i64 as u64 {
+        // Une adresse des programmes seulement (le TASK_SIZE_MAX de Linux,
+        // qui rend EPERM au-delà) : une adresse non canonique ferait fauter
+        // wrmsr dans le noyau, et une base de GS du noyau tromperait le
+        // chemin paranoïaque des interruptions (interruptions.rs).
+        ARCH_SET_FS | ARCH_SET_GS if adresse >= ADRESSE_MAX => -EPERM,
+        ARCH_SET_FS => {
+            cpu::definir_fs(adresse);
             0
         }
-        ARCH_SET_FS => -EPERM,
-        ARCH_GET_FS => match copier_vers_utilisateur(adresse, &cpu::lire_base_fs().to_le_bytes()) {
-            Ok(()) => 0,
-            Err(_) => -EFAULT,
-        },
+        ARCH_SET_GS => {
+            processeur::definir_gs_programme(adresse);
+            0
+        }
+        ARCH_GET_FS => rendre(cpu::lire_base_fs()),
+        ARCH_GET_GS => rendre(processeur::lire_base_gs_programme()),
         _ => -EINVAL,
     }
 }

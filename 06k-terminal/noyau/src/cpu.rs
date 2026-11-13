@@ -196,6 +196,19 @@ pub fn ecrire_base_fs(base: u64) {
     }
 }
 
+/// arch_prctl(ARCH_SET_FS) : le sélecteur FS du programme à zéro, puis sa
+/// base (le `loadseg(FS, 0)` de Linux, « for symmetry with %gs » : sans
+/// lui, un sélecteur chargé avant par le programme resterait, et `mov %fs`
+/// le lui rendrait). Même condition sur `base` que pour `ecrire_base_fs`.
+/// Une bascule entre les deux garde le sélecteur nul (tache.rs le sauve) ;
+/// la base écrite ensuite l'est sur le processeur où l'on est alors.
+pub fn definir_fs(base: u64) {
+    // SAFETY: le sélecteur nul se charge toujours dans FS en mode 64 bits,
+    // sans faute ; le noyau ne se sert pas de FS.
+    unsafe { asm!("mov fs, {0:x}", in(reg) 0u16, options(nostack, preserves_flags)) };
+    ecrire_base_fs(base);
+}
+
 /// La base de FS du programme en cours.
 pub fn lire_base_fs() -> u64 {
     let (bas, haut): (u32, u32);

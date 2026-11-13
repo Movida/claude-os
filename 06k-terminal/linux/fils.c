@@ -3,7 +3,7 @@
  * écrit tout programme : créer, attendre, se partager un verrou et une
  * condition, des variables par fil, un verrou robuste dont le détenteur
  * meurt, le mode d'arrondi hérité, les masques de signaux propres à chaque
- * fil. Il tourne dans notre noyau et sur l'hôte (make tests-hote) : chaque
+ * fil, la base de GS de chacun (arch_prctl). Il tourne dans notre noyau et sur l'hôte (make tests-hote) : chaque
  * ligne doit dire « ok » des deux côtés.
  *
  * Trois façons de finir, mesurées sous Linux 6.18 :
@@ -17,10 +17,12 @@
  *     noyau porte le nom du fil.
  */
 #define _GNU_SOURCE
+#include <asm/prctl.h>
 #include <errno.h>
 #include <linux/futex.h>
 #include <fenv.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -203,6 +205,119 @@ static void a_chacun(void)
     pthread_sigmask(SIG_UNBLOCK, &m, NULL);
 }
 
+/* ----- La base de GS de chaque fil (arch_prctl) -----
+ * La glibc ne se sert pas de GS en 64 bits : elle est au programme (Wine y
+ * met son TEB). Le noyau la sauve et la rétablit à chaque bascule, et clone
+ * la copie. Fixer une base remet le sélecteur à zéro, pour GS comme pour
+ * FS (Linux : « for symmetry with %gs »). */
+
+#define BASCULES 1000
+
+static unsigned long marque_principal = 0x4c415049434e4952; /* « RINCIPAL » */
+static unsigned long marque_fil = 0x4e4f434553534c49;
+static unsigned long herite_vu;
+static int garde_fil;
+static pthread_barrier_t ensemble;
+
+static long arch_prctl_(int code, unsigned long adresse)
+{
+    return syscall(SYS_arch_prctl, code, adresse);
+}
+
+static unsigned long base_gs(void)
+{
+    unsigned long b = 1;
+    arch_prctl_(ARCH_GET_GS, (unsigned long)&b);
+    return b;
+}
+
+/* Le mot à gs:0, lu comme Wine lit son TEB. */
+static unsigned long gs0(void)
+{
+    unsigned long v;
+    __asm__ volatile("mov %%gs:0, %0" : "=r"(v));
+    return v;
+}
+
+static unsigned short selecteur_gs(void)
+{
+    unsigned short s;
+    __asm__ volatile("mov %%gs, %0" : "=r"(s));
+    return s;
+}
+
+static void *gs_du_fil(void *a)
+{
+    herite_vu = base_gs();
+    arch_prctl_(ARCH_SET_GS, (unsigned long)&marque_fil);
+    pthread_barrier_wait(&ensemble);
+    int ok = 1;
+    for (int i = 0; i < BASCULES; i++) {
+        sched_yield();
+        ok &= gs0() == marque_fil;
+    }
+    garde_fil = ok;
+    return a;
+}
+
+static void base_de_gs(void)
+{
+    verifier(base_gs() == 0 && selecteur_gs() == 0, "la base de GS : nulle au depart");
+    /* Un sélecteur chargé par le programme (celui de ses données, le même
+     * que SS), puis ARCH_SET_GS. */
+    __asm__ volatile("mov %%ss, %%ax\n\tmov %%ax, %%gs" ::: "rax");
+    int pose = arch_prctl_(ARCH_SET_GS, (unsigned long)&marque_principal) == 0;
+    verifier(pose && selecteur_gs() == 0 && base_gs() == (unsigned long)&marque_principal && gs0() == marque_principal,
+             "ARCH_SET_GS : la base lue par gs:0, le selecteur remis a zero");
+    /* Des adresses du noyau (au-delà de toute moitié basse, à quatre ou
+     * cinq niveaux de tables) : EPERM, la base ne change pas. */
+    int refus = arch_prctl_(ARCH_SET_GS, 0x8000000000000000UL) == -1 && errno == EPERM;
+    refus &= arch_prctl_(ARCH_SET_GS, 0xffffffff80000000UL) == -1 && errno == EPERM;
+    verifier(refus && gs0() == marque_principal, "ARCH_SET_GS hors des adresses des programmes : EPERM");
+    verifier(arch_prctl_(ARCH_GET_GS, 0) == -1 && errno == EFAULT, "ARCH_GET_GS vers une adresse invalide : EFAULT");
+    /* Le code est un int (`SYSCALL_DEFINE2(arch_prctl, int, ...)`) : ses
+     * 32 bits du haut sont ignorés. */
+    unsigned long lue = 0;
+    int haut = syscall(SYS_arch_prctl, 1UL << 32 | ARCH_SET_GS, (unsigned long)&marque_principal) == 0;
+    haut &= syscall(SYS_arch_prctl, 1UL << 32 | ARCH_GET_GS, (unsigned long)&lue) == 0;
+    haut &= syscall(SYS_arch_prctl, 1UL << 32 | ARCH_GET_FS, (unsigned long)&lue) == 0;
+    verifier(haut && base_gs() == (unsigned long)&marque_principal && lue != 0, "arch_prctl : les 32 bits du haut du code ignores");
+    /* Les deux fils sur un même processeur : chaque bascule entre eux sauve
+     * la base de l'un et rétablit celle de l'autre. Le fil hérite de
+     * l'affinité de son créateur. */
+    cpu_set_t avant, un;
+    sched_getaffinity(0, sizeof avant, &avant);
+    CPU_ZERO(&un);
+    CPU_SET(sched_getcpu(), &un);
+    sched_setaffinity(0, sizeof un, &un);
+    pthread_barrier_init(&ensemble, NULL, 2);
+    pthread_t f;
+    pthread_create(&f, NULL, gs_du_fil, NULL);
+    pthread_barrier_wait(&ensemble);
+    int ok = 1;
+    for (int i = 0; i < BASCULES; i++) {
+        sched_yield();
+        ok &= gs0() == marque_principal;
+    }
+    pthread_join(f, NULL);
+    pthread_barrier_destroy(&ensemble);
+    sched_setaffinity(0, sizeof avant, &avant);
+    verifier(herite_vu == (unsigned long)&marque_principal, "la base de GS heritee du createur");
+    verifier(ok && garde_fil && gs0() == marque_principal, "chaque fil garde la sienne, sur un meme processeur");
+    arch_prctl_(ARCH_SET_GS, 0);
+    /* FS : sans la glibc entre le chargement du sélecteur et l'appel (FS
+     * ne désigne plus le TLS entre les deux). */
+    unsigned long fs;
+    arch_prctl_(ARCH_GET_FS, (unsigned long)&fs);
+    long r;
+    unsigned short sel;
+    __asm__ volatile("mov %%ss, %%ax\n\tmov %%ax, %%fs\n\tmov %[nr], %%eax\n\tsyscall\n\tmov %%fs, %%dx"
+                     : "=a"(r), "=d"(sel)
+                     : [nr] "i"(SYS_arch_prctl), "D"(ARCH_SET_FS), "S"(fs)
+                     : "rcx", "r11", "memory");
+    verifier(r == 0 && sel == 0, "ARCH_SET_FS remet le selecteur de FS a zero");
+}
+
 /* ----- Un verrou robuste ----- */
 
 static pthread_mutex_t robuste;
@@ -330,6 +445,7 @@ int main(int argc, char **argv)
     un_verrou();
     une_condition();
     a_chacun();
+    base_de_gs();
     verrou_robuste();
     requeue_sur_soi();
     fflush(stdout);

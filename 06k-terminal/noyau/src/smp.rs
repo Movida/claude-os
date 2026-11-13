@@ -461,8 +461,9 @@ extern "C" fn depart_secondaire(numero: u32) -> ! {
     sse::initialiser_secondaire();
     // La base de GS du programme (KERNEL_GS_BASE, celle que `swapgs`
     // rendra active au retour vers l'anneau 3) : nulle, comme à la mise
-    // sous tension ; explicite, pour ne dépendre de rien.
-    processeur::effacer_base_gs_programme();
+    // sous tension ; explicite, pour ne dépendre de rien (la bascule vers
+    // un programme posera la sienne).
+    processeur::ecrire_base_gs_programme(0);
 
     let registres = trampoline::registres_de_reference();
     let noms = ["CR0", "CR4", "EFER", "XCR0"];

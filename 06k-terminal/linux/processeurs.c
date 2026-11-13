@@ -20,8 +20,11 @@
  * fils épinglés sur les processeurs 1 et 2 qui bouclent sur getpid pour
  * toujours (l'anneau 3, l'entrée et la sortie de syscall : là où un NMI
  * trouve la base de GS du programme active dans le noyau), les autres
- * processeurs inactifs ; le programme dit quand ils tournent, puis attend. */
+ * processeurs inactifs ; le programme dit quand ils tournent, puis attend.
+ * Chaque fil a sa propre base de GS (arch_prctl), pas nulle : le NMI doit
+ * la reconnaître pour celle du programme à son signe (interruptions.rs). */
 #define _GNU_SOURCE
+#include <asm/prctl.h>
 #include <errno.h>
 #include <pthread.h>
 #include <sched.h>
@@ -69,6 +72,8 @@ static void *boucleur(void *arg)
     CPU_ZERO(&c);
     CPU_SET((int)(long)arg, &c);
     pthread_setaffinity_np(pthread_self(), sizeof c, &c);
+    static unsigned long zones[3];
+    syscall(SYS_arch_prctl, ARCH_SET_GS, &zones[(long)arg]);
     for (;;)
         syscall(SYS_getpid);
     return NULL;

@@ -103,14 +103,9 @@ basculer:
     mov rax, rdx
     ret
 
-    /* Le premier départ d'un fil de programme : la fin de bascule, puis la
-       base de GS du programme à 0 (le MSR KERNEL_GS_BASE : dans le noyau,
-       c'est l'inactive, que swapgs rendra active au retour vers l'anneau
-       3 ; GS_BASE, l'active, est la zone du processeur, processeur.rs : on
-       n'y touche pas), pour qu'un programme ne trouve rien d'un précédent
-       (les sélecteurs, la base de FS et l'état x87/SSE, eux, sont ceux de
-       sa tâche, rétablis par basculer_vers ; un programme ne peut pas
-       changer la base de GS, arch_prctl la refuse). Puis `debut_de_fil`,
+    /* Le premier départ d'un fil de programme : la fin de bascule (les
+       sélecteurs, les bases de FS et de GS et l'état x87/SSE sont déjà
+       ceux de sa tâche, rétablis par basculer_vers). Puis `debut_de_fil`,
        la sortie ordinaire vers l'anneau 3 (le `ret_from_fork` de Linux),
        et le retour d'interruption : iretq vers le cadre préparé par
        executer() ou par clone. */
@@ -118,10 +113,6 @@ basculer:
 premier_depart:
     mov rdi, rax
     call fin_de_bascule
-    xor eax, eax
-    xor edx, edx
-    mov ecx, 0xC0000102
-    wrmsr
     call debut_de_fil
     jmp retour_interruption
 
@@ -370,20 +361,24 @@ struct EtatProgramme {
     fpu: crate::sse::ZoneFpu,
     selecteurs: [u16; 4],
     base_fs: u64,
+    /// La base de GS du programme (KERNEL_GS_BASE pendant qu'il est dans
+    /// le noyau, processeur.rs).
+    base_gs: u64,
 }
 
 impl EtatProgramme {
     /// Celui d'un programme qui commence : l'état x87/SSE initial, des
-    /// sélecteurs et une base de FS nuls. None : plus de mémoire.
+    /// sélecteurs et des bases de FS et de GS nuls. None : plus de mémoire.
     fn initial() -> Option<EtatProgramme> {
         // SAFETY: l'image de l'état initial, une constante.
         let fpu = crate::sse::ZoneFpu::neuve(unsafe { &etat_fpu_initial.0 })?;
-        Some(EtatProgramme { fpu, selecteurs: [0; 4], base_fs: 0 })
+        Some(EtatProgramme { fpu, selecteurs: [0; 4], base_fs: 0, base_gs: 0 })
     }
 
     /// Celui d'un fil neuf : une copie de celui de la tâche courante, son
-    /// créateur (son état x87/SSE, ses sélecteurs), avec la base de FS
-    /// `base_fs` (CLONE_SETTLS), ou la sienne (le `copy_thread` de Linux).
+    /// créateur (son état x87/SSE, ses sélecteurs, sa base de GS), avec la
+    /// base de FS `base_fs` (CLONE_SETTLS), ou la sienne (le `copy_thread`
+    /// de Linux).
     fn herite(base_fs: Option<u64>) -> Option<EtatProgramme> {
         let fpu = crate::sse::ZoneFpu::du_processeur()?;
         let mut selecteurs = [0u16; 4];
@@ -394,7 +389,8 @@ impl EtatProgramme {
                  out(reg) selecteurs[0], out(reg) selecteurs[1], out(reg) selecteurs[2], out(reg) selecteurs[3],
                  options(nomem, nostack, preserves_flags));
         }
-        Some(EtatProgramme { fpu, selecteurs, base_fs: base_fs.unwrap_or_else(cpu::lire_base_fs) })
+        let base_gs = crate::processeur::lire_base_gs_programme();
+        Some(EtatProgramme { fpu, selecteurs, base_fs: base_fs.unwrap_or_else(cpu::lire_base_fs), base_gs })
     }
 }
 
@@ -1200,18 +1196,21 @@ pub fn basculer_vers(nouvelle: &Tache) {
                  out(reg) p.selecteurs[0], out(reg) p.selecteurs[1], out(reg) p.selecteurs[2], out(reg) p.selecteurs[3],
                  options(nomem, nostack, preserves_flags));
             p.base_fs = cpu::lire_base_fs();
+            p.base_gs = crate::processeur::lire_base_gs_programme();
         }
         if let Some(p) = &nouvelle.programme {
             let p = &*p.get();
             p.fpu.retablir();
-            // Le sélecteur avant la base : charger FS remet sa base à celle
-            // du descripteur (comme Linux, `load_seg_legacy`). GS entre
+            // Le sélecteur avant la base : charger FS ou GS remet sa base à
+            // celle du descripteur (comme Linux, `load_seg_legacy`), et
+            // c'est la base sauvée qui compte (celle qu'avait le processeur,
+            // lue par rdmsr : ce que fait Linux avec FSGSBASE). GS entre
             // deux swapgs (le `native_load_gs_index` de Linux) : dans le
             // noyau, la base ACTIVE de GS est la zone du processeur
             // (processeur.rs) ; `mov gs` la remettrait à zéro. On rend
             // d'abord active la base du programme, on charge le sélecteur
-            // (qui remet CETTE base-là à zéro, ce que le programme attend :
-            // arch_prctl refuse ARCH_SET_GS), et on rééchange. Entre les
+            // (qui change CETTE base-là), on rééchange, puis on écrit la
+            // base du programme, l'inactive (KERNEL_GS_BASE). Entre les
             // deux, seuls un NMI, un #DB ou un #MC peuvent tomber
             // (interruptions coupées) : ils retrouvent la zone par le MSR
             // (interruptions.rs, le chemin paranoïaque). Et `mov gs` ne
@@ -1225,6 +1224,7 @@ pub fn basculer_vers(nouvelle: &Tache) {
                  in(reg) p.selecteurs[0], in(reg) p.selecteurs[1], in(reg) p.selecteurs[2], in(reg) p.selecteurs[3],
                  options(nostack, preserves_flags));
             cpu::ecrire_base_fs(p.base_fs);
+            crate::processeur::ecrire_base_gs_programme(p.base_gs);
         }
         let espace = nouvelle.espace.load(Ordering::Relaxed);
         if pagination::courante() != espace {

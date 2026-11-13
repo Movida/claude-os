@@ -187,8 +187,9 @@ interruption_commune:
           base du PROGRAMME. On ne peut pas le savoir par CS : on lit le
           MSR GS_BASE et on regarde son signe (le `paranoid_entry` de
           Linux) : une adresse du noyau est négative (la moitié haute) ; une
-          base du programme ne l'est jamais (arch_prctl refuse ARCH_SET_GS,
-          elle vaut 0). Positive : `swapgs`, et EBX = 1 pour le `swapgs`
+          base du programme ne l'est jamais (arch_prctl ne la pose que sous
+          ADRESSE_MAX, et un sélecteur que charge le programme lui donne
+          la base de son descripteur, nulle : gdt.rs, sans LDT). Positive : `swapgs`, et EBX = 1 pour le `swapgs`
           inverse à la sortie. Un #DB venu de l'anneau 3 (icebp) n'est pas
           dans ce cas : il prend le chemin 1, et la copie de son cadre sur
           la pile de la tâche, plus bas (chez Linux aussi, idtentry_mce_db :

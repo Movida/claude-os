@@ -425,15 +425,55 @@ pub fn zone(n: usize) -> &'static Processeur {
 const GS_BASE: u32 = 0xC000_0101;
 const KERNEL_GS_BASE: u32 = 0xC000_0102;
 
-/// Met à zéro la base de GS du programme (celle que `swapgs` rendra active
-/// au retour vers l'anneau 3) : l'état de la mise sous tension, que le
-/// premier processeur a hérité et qu'un secondaire pose explicitement
-/// (smp.rs). Un programme qui veut une base de GS la demande par arch_prctl,
-/// qui la refuse (tache.rs).
-pub fn effacer_base_gs_programme() {
-    // SAFETY: KERNEL_GS_BASE existe sur tout processeur 64 bits ; zéro est
-    // une adresse canonique.
-    unsafe { asm!("wrmsr", in("ecx") KERNEL_GS_BASE, in("eax") 0u32, in("edx") 0u32, options(nostack, preserves_flags)) };
+/// La base de GS du programme en cours : dans le noyau, le MSR
+/// KERNEL_GS_BASE, l'inactive, que `swapgs` rendra active au retour vers
+/// l'anneau 3 (le `x86_gsbase_read_cpu_inactive` de Linux).
+pub fn lire_base_gs_programme() -> u64 {
+    let (bas, haut): (u32, u32);
+    // SAFETY: lecture d'un MSR qui existe sur tout processeur 64 bits, sans
+    // effet.
+    unsafe {
+        asm!("rdmsr", in("ecx") KERNEL_GS_BASE, out("eax") bas, out("edx") haut, options(nomem, nostack, preserves_flags));
+    }
+    (haut as u64) << 32 | bas as u64
+}
+
+/// Fixe la base de GS du programme en cours (le MSR KERNEL_GS_BASE) : à la
+/// bascule (tache.rs), et à zéro au démarrage d'un processeur secondaire
+/// (smp.rs), l'état de la mise sous tension, que le premier a hérité.
+/// L'appelant donne une adresse des programmes (une base au-dessus ferait
+/// prendre au chemin paranoïaque d'interruptions.rs la base du programme
+/// pour celle du noyau) ; elle est donc canonique, et wrmsr ne faute pas.
+pub fn ecrire_base_gs_programme(base: u64) {
+    // SAFETY: KERNEL_GS_BASE existe sur tout processeur 64 bits ; `base` est
+    // canonique (ci-dessus). Le noyau ne lit pas cette base-là : la sienne
+    // est l'active, GS_BASE.
+    unsafe {
+        asm!("wrmsr", in("ecx") KERNEL_GS_BASE, in("eax") base as u32, in("edx") (base >> 32) as u32,
+             options(nostack, preserves_flags));
+    }
+}
+
+/// arch_prctl(ARCH_SET_GS) : le sélecteur GS du programme à zéro, puis sa
+/// base (le `loadseg(GS, 0)` puis `x86_gsbase_write_cpu_inactive` de
+/// Linux : « ARCH_SET_GS has always overwritten the index and the base »).
+/// Le sélecteur se charge entre deux `swapgs` (le `native_load_gs_index`
+/// de Linux) : `mov gs` remet à zéro la base ACTIVE, qui dans le noyau est
+/// la zone du processeur ; on rend d'abord active celle du programme.
+/// Interruptions coupées entre les deux : une interruption venue de
+/// l'anneau 0 prendrait la base du programme pour la zone (seuls le NMI,
+/// #DB et #MC la retrouvent par le MSR, interruptions.rs). Même condition
+/// sur `base` que pour `ecrire_base_gs_programme`.
+pub fn definir_gs_programme(base: u64) {
+    let actives = crate::cpu::couper_interruptions();
+    // SAFETY: interruptions coupées (ci-dessus) ; le sélecteur nul se charge
+    // toujours dans GS en mode 64 bits, sans faute ; le second `swapgs` rend
+    // au noyau sa zone avant toute autre instruction.
+    unsafe { asm!("swapgs", "mov gs, {0:x}", "swapgs", in(reg) 0u16, options(nostack, preserves_flags)) };
+    ecrire_base_gs_programme(base);
+    if actives {
+        crate::cpu::activer_interruptions();
+    }
 }
 
 /// Fait de la zone `p` celle de ce processeur : GS_BASE y pointe. Au
