@@ -12,7 +12,7 @@
 //! sched_getaffinity). Quand son dernier fil meurt, il rend lui-même la
 //! mémoire et les descripteurs du processus (le `exit_mm` et le
 //! `exit_files` de Linux, au dernier qui les tient) ; il reste un ZOMBIE :
-//! son numéro et son code de sortie, jusqu'à ce qu'init le recueille
+//! son numéro et son statut de sortie, jusqu'à ce qu'init le recueille
 //! (programmes.rs) et le retire de la table. La table est réservée au
 //! démarrage pour autant de processus que de tâches : elle ne grandit
 //! jamais pendant un programme.
@@ -108,7 +108,7 @@ pub struct Processus {
     /// Ses fils vivants, le principal d'abord (fil.rs).
     pub fils: Vec<Fil>,
     /// La fin du groupe, si elle a commencé (exit_group, un signal mortel) :
-    /// son code, que prendra le processus (le SIGNAL_GROUP_EXIT et le
+    /// son statut, que prendra le processus (le SIGNAL_GROUP_EXIT et le
     /// `group_exit_code` de Linux). La première l'emporte.
     pub fin_de_groupe: Option<i32>,
 }
@@ -239,7 +239,7 @@ impl Drop for Processus {
 }
 
 /// Un processus de la table : son numéro, ce qu'il a tant qu'il vit
-/// (None une fois son dernier fil mort), son code de sortie, et ce qui doit
+/// (None une fois son dernier fil mort), son statut de sortie, et ce qui doit
 /// se lire sans son verrou.
 pub struct Entree {
     pid: u32,
@@ -266,6 +266,9 @@ pub struct Entree {
     /// `Compteurs`), partagés avec sa mémoire : lisibles sans le verrou qui
     /// dort (getrusage, 6j).
     compteurs: Arc<crate::espace_utilisateur::Compteurs>,
+    /// Son statut de sortie, celui que rendra `wait` (6l) : (code & 0xff)
+    /// << 8 pour exit, le numéro du signal qui l'a tué sinon (tache.rs,
+    /// `mourir`). Posé par son dernier fil.
     code: AtomicI32,
     /// Son temps de calcul, en nanosecondes : celui de tous ses fils,
     /// vivants et morts, compté avec celui de chaque fil (tache.rs), sans
@@ -336,10 +339,10 @@ impl Entree {
         self.pid
     }
 
-    /// La fin du fil `tid` (sa tâche meurt, en lui laissant `code`) : il
-    /// quitte le processus. Le dernier fil emporte le processus : son code de
-    /// sortie (celui de la fin du groupe s'il y en a une, sinon le sien,
-    /// mesuré sous Linux), puis sa mémoire et ses descripteurs rendus (dans
+    /// La fin du fil `tid` (sa tâche meurt, en lui laissant le statut
+    /// `code`) : il quitte le processus. Le dernier fil emporte le
+    /// processus : son statut de sortie (celui de la fin du groupe s'il y en
+    /// a une, sinon le sien, mesuré sous Linux), puis sa mémoire et ses descripteurs rendus (dans
     /// la tâche qui meurt, interruptions actives : rendre des centaines de
     /// Mio prend du temps). Le processus devient un zombie plus tard, quand
     /// la pile de son dernier fil est rendue (`fil_disparu`). Ses comptes
@@ -406,7 +409,7 @@ impl Entree {
         // TOUS les fils, pas du seul dernier (« memoire rendue » le compte).
         if self.vivants.fetch_sub(1, Ordering::Release) == 1 {
             core::sync::atomic::fence(Ordering::Acquire);
-            // Release : le code de sortie et tout le reste sont écrits
+            // Release : le statut de sortie et tout le reste sont écrits
             // avant ; le réveil qui suit porte la barrière complète du motif
             // de Dekker (tache::reveiller), et `est_zombie` lit en SeqCst.
             self.zombie.store(true, Ordering::Release);
@@ -657,7 +660,7 @@ pub fn pour_chaque_fil(pid: u32, mut f: impl FnMut(u32)) {
 }
 
 /// Retire de la table le zombie `pid`, recueilli (programmes.rs) : son
-/// code de sortie.
+/// statut de sortie.
 pub fn recueillir(pid: u32) -> Option<i32> {
     let mut table = TABLE.verrouiller();
     let i = table.iter().position(|e| e.pid == pid)?;

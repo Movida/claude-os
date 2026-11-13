@@ -452,19 +452,22 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         GETTIMEOFDAY => gettimeofday(a[0], a[1]),
         TIME => time(a[0]),
         // Le code de sortie tient sur 8 bits : Linux ne garde que l'octet
-        // bas (exit(256) rend 0, exit(-1) rend 255), ce que verra le futur
-        // wait ; les codes 128 + N restent ceux des signaux.
+        // bas (exit(256) rend 0, exit(-1) rend 255), et le range dans le
+        // STATUT d'attente, octet du milieu : (code & 0xff) << 8, le
+        // `(error_code & 0xff) << 8` de `do_exit` et `do_group_exit`. Les
+        // signaux y ont l'octet bas (tache.rs, `mourir`) : exit(143) et une
+        // mort par SIGTERM ne s'y confondent pas.
         // La fin elle-même vient au retour vers l'anneau 3 (tache.rs) : celle
         // du fil (exit), ou de tout le groupe (exit_group, ce qu'appelle
         // l'exit de la glibc).
         EXIT => {
             tracer(numero, a, None);
-            tache::prevoir_sortie((a[0] & 0xff) as i32);
+            tache::prevoir_sortie(((a[0] & 0xff) << 8) as i32);
             return 0;
         }
         EXIT_GROUP => {
             tracer(numero, a, None);
-            tache::prevoir_sortie_du_groupe((a[0] & 0xff) as i32);
+            tache::prevoir_sortie_du_groupe(((a[0] & 0xff) << 8) as i32);
             return 0;
         }
         _ => {

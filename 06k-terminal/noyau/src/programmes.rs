@@ -378,6 +378,19 @@ enum Tache {
     Wasm(Arc<tache::Tache>),
 }
 
+/// Le code de sortie que montre un shell pour le statut d'attente `statut`
+/// d'un processus (processus.rs) : son code, s'il est sorti
+/// (WIFEXITED, puis WEXITSTATUS) ; 128 plus le signal, s'il a été tué
+/// (WTERMSIG : ce que fait bash pour `$?`). Le noyau ne garde que le
+/// statut, comme Linux ; la conversion n'a lieu qu'ici, pour le message
+/// « code de sortie » (attendu.txt n'a pas changé avec elle).
+fn code_du_shell(statut: i32) -> i32 {
+    match statut & 0x7f {
+        0 => (statut >> 8) & 0xff,
+        signal => 128 + signal,
+    }
+}
+
 /// Le lanceur (le rôle d'init) : les programmes lancés par `&` et pas
 /// encore recueillis, combien de programmes tournent, et la mémoire libre
 /// quand le premier d'entre eux a été lancé. « Memoire rendue » compare la
@@ -512,7 +525,7 @@ impl Lanceur {
                 tache::dormir_tant_que(|| !p.est_zombie());
                 let pid = p.pid();
                 drop(p);
-                let code = processus::recueillir(pid).unwrap_or(-1);
+                let code = processus::recueillir(pid).map_or(-1, code_du_shell);
                 vfs::avec(|fs, cadres| {
                     fs.permettre_ecriture(fichier);
                     fs.lacher(fichier, cadres);

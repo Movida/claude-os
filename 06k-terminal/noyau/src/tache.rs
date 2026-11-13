@@ -251,7 +251,9 @@ pub struct Tache {
     /// La tête de sa liste de verrous robustes (set_robust_list), 0 sinon
     /// (futex.rs).
     liste_robuste: AtomicU64,
-    /// Son code de sortie, posé par `terminer`.
+    /// Son statut de sortie (le `exit_code` de la tâche, chez Linux), posé
+    /// par `terminer` : celui d'un fil de programme est le statut d'attente
+    /// (`mourir`, linux.rs : exit) ; celui d'une tâche du noyau, son code.
     code_sortie: AtomicI32,
     /// Les cases de son tube interne, celui de sendfile et copy_file_range
     /// vers autre chose qu'un tube (le `splice_pipe` de Linux, 6i : voir
@@ -572,7 +574,7 @@ impl Tache {
     pub fn est_morte(&self) -> bool {
         // SeqCst (un simple `mov` sur x86) : c'est une condition de
         // sommeil lue sans verrou, après « je vais dormir » (attente.rs) ;
-        // `terminer` l'écrit en Release (son code de sortie est écrit
+        // `terminer` l'écrit en Release (son statut de sortie est écrit
         // avant), puis réveille derrière une barrière complète : le motif
         // de Dekker, que le modèle de Rust ne ferme qu'avec une lecture
         // SeqCst de ce côté-ci.
@@ -1683,7 +1685,7 @@ pub fn terminer(code: i32) -> ! {
     // Morte : son état d'abord (plus aucun réveil ne la touche, et
     // l'ordonnanceur la retirera de la file), puis `morte`, en Release : qui
     // le lit (`attendre`, `est_morte`, en Acquire) voit tout ce qu'elle a
-    // écrit avant, son code de sortie et le compte du rendeur compris.
+    // écrit avant, son statut de sortie et le compte du rendeur compris.
     t.etat.store(etat::MORTE, Ordering::Relaxed);
     t.morte.store(true, Ordering::Release);
     // Une référence à elle-même, pour la fin de bascule qui rendra sa pile,
@@ -1706,13 +1708,22 @@ pub fn terminer(code: i32) -> ! {
 
 /// Arrête le programme en cours par le signal `signal` (une exception, sa
 /// limite de temps de calcul, un signal envoyé par lui ou par un autre),
-/// en disant pourquoi : le message de Linux dans son journal, puis le code de sortie
-/// 128 + signal, pour tout le groupe (un signal mortel arrête le processus,
-/// le `do_group_exit` de `get_signal`). Seulement au retour vers l'anneau 3
-/// (`verifier_au_retour`).
+/// en disant pourquoi : le message de Linux dans son journal, puis le
+/// statut « tué par ce signal », pour tout le groupe (un signal mortel
+/// arrête le processus, le `do_group_exit(signr)` de `get_signal`).
+/// Seulement au retour vers l'anneau 3 (`verifier_au_retour`).
+///
+/// Le statut est celui de `wait` sous Linux : le numéro du signal dans
+/// l'octet bas, et 0x80 s'il a laissé une image de la mémoire (`do_coredump`
+/// le pose quand l'image est écrite ; nous n'en écrivons jamais, comme un
+/// Linux dont RLIMIT_CORE vaut 0, notre limite par défaut). Option écartée,
+/// celle des étapes 5 à 6j : le code du shell, 128 + signal, qui confondait
+/// la mort par SIGTERM et exit(143) ; le shell ne le calcule qu'à
+/// l'affichage (programmes.rs, `code_du_shell`), comme bash d'après
+/// WTERMSIG.
 fn mourir(signal: Signal, raison: impl fmt::Display) -> ! {
     afficherln!("[noyau] {} : {} ({})", courante().nom(), raison, signal.nom);
-    let code = 128 + signal.numero as i32;
+    let code = signal.numero as i32;
     let tid = courante().tid;
     let code = processus::essayer_avec(|p| p.finir_le_groupe(code, tid)).unwrap_or(code);
     terminer(code)
@@ -1754,14 +1765,14 @@ impl fmt::Display for Message {
 
 /// Comment le programme doit finir, à son retour vers l'anneau 3.
 enum Fin {
-    /// exit ou exit_group, avec son code.
+    /// exit ou exit_group, avec son statut (linux.rs : le code << 8).
     Sortie(i32),
     /// Un signal qu'il ne peut ni bloquer ni ignorer (une faute, SIGKILL),
     /// et ce qu'il faudra dire.
     Signal(Signal, Message),
 }
 
-/// exit : le fil finira au retour vers l'anneau 3, avec ce code. Elle
+/// exit : le fil finira au retour vers l'anneau 3, avec ce statut. Elle
 /// l'emporte sur tout ce qui pouvait l'attendre (sous Linux, `do_exit` part
 /// aussitôt, sans regarder les signaux). Le processus finit avec son
 /// dernier fil.
@@ -1769,8 +1780,9 @@ pub fn prevoir_sortie(code: i32) {
     *courante().fin.verrouiller() = Some(Fin::Sortie(code));
 }
 
-/// exit_group : la fin de tout le groupe, avec ce code (sauf si elle avait
-/// déjà commencé : son code l'emporte, comme le `do_group_exit` de Linux),
+/// exit_group : la fin de tout le groupe, avec ce statut (sauf si elle
+/// avait déjà commencé : son statut l'emporte, comme le `do_group_exit` de
+/// Linux),
 /// puis celle du fil, au retour vers l'anneau 3.
 pub fn prevoir_sortie_du_groupe(code: i32) {
     let tid = courante().tid;
