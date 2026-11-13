@@ -27,7 +27,7 @@ fn pour_fille(c: &C, drapeaux: u8) -> Tcp {
 
 /// L'ouverture simultanée : SYN_SENT, puis le SYN de l'autre, sans ACK : SYN_RECEIVED.
 fn simultanee() -> C {
-    let mut c: C = Tcb::connecter(80, 40000, ISS, MSS as u16, 131_072, 1 << 22, 0);
+    let mut c: C = Tcb::connecter(&MIB, 80, 40000, ISS, MSS as u16, 131_072, 1 << 22, 0);
     c.emettre(HEURE, |_| {});
     let syn = Tcp { source: 40000, destination: 80, seq: 1000, drapeaux: tcp::SYN, fenetre: 65535, ..Tcp::default() };
     c.recevoir(&syn, octets(0, 0), HEURE);

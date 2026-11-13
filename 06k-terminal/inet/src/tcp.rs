@@ -87,6 +87,7 @@ use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use formats::reseau::tcp::{self, Tcp};
 use faillible::{FileFaillible, VecFaillible};
+use crate::snmp::{self, Mib};
 
 pub mod attente;
 mod carte;
@@ -439,6 +440,93 @@ pub struct Sortant {
     /// Le numéro de cet envoi, pour suivre ce paquet dans la file de la carte
     /// (`Tcb::poser_en_file`) ; 0 : il ne tient pas la socket (un ACK pur, un RST).
     pub numero: u64,
+    /// Ce qu'il compte dans /proc/net/snmp.
+    pub compte: Compte,
+}
+
+/// Ce qu'un segment qui part ajoute aux compteurs de TCP (et d'IP) de
+/// /proc/net/snmp. Linux les compte selon le chemin que prend le segment, que
+/// seul le Tcb connaît ; le noyau les compte quand il fait le paquet, par
+/// `compter`, qui tient l'ordre de Linux entre les compteurs, la route et la
+/// mémoire. Que chaque `Sortant` dise le sien empêche d'en oublier un.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Compte {
+    /// Un segment de la connexion, neuf ou sans numéro à lui (un ACK, une
+    /// sonde de fenêtre) : OutSegs (`__tcp_transmit_skb` le compte si
+    /// `after(end_seq, snd_nxt) || seq == end_seq`).
+    Neuf,
+    /// Un segment renvoyé, SYN compris (`__tcp_retransmit_skb`) : RetransSegs,
+    /// avant même sa copie, mais après sa route (`rebuild_header`) : sans elle,
+    /// rien ; son numéro, déjà passé, n'entre pas dans OutSegs.
+    Renvoi,
+    /// Le premier SYN-ACK d'une ouverture simultanée (`tcp_send_synack`) :
+    /// rien, SND.NXT l'a déjà dépassé quand il part.
+    Aucun,
+    /// Le RST qui coupe la connexion (`tcp_send_active_reset`) : OutRsts,
+    /// avant même sa mémoire ; puis OutSegs, comme un segment de la connexion.
+    Coupure,
+    /// Le SYN-ACK d'une fille (`tcp_make_synack`) : OutSegs, et RetransSegs
+    /// s'il est renvoyé (`tcp_rtx_synack`) ; sa route est cherchée avant lui
+    /// (`inet_csk_route_req`) : sans elle, OutNoRoutes seul.
+    SynAck { renvoi: bool },
+    /// Une réponse sans socket : l'ACK ou le RST d'une fille, d'une entrée de
+    /// TIME_WAIT, ou à un segment sans connexion (`tcp_v4_send_ack`,
+    /// `tcp_v4_send_reset`) : OutSegs, et OutRsts pour un RST, comptés même
+    /// si elle ne part pas.
+    Reponse { rst: bool },
+}
+
+impl Compte {
+    /// Compte le segment, une fois sa route cherchée (`route` : trouvée) et
+    /// son paquet demandé (`paquet` : obtenu).
+    pub fn compter(self, mib: &Mib, route: bool, paquet: bool) {
+        use snmp::{Ip, Tcp};
+        match self {
+            Compte::Reponse { rst } => {
+                // `ip_send_unicast_reply` cherche la route (sans compteur), puis
+                // fait le paquet (`__ip_append_data` : OutDiscards s'il manque) ;
+                // ses appelants comptent ensuite, qu'elle soit partie ou non.
+                if route && !paquet {
+                    mib.ip(Ip::OutDiscards);
+                }
+                mib.tcp(Tcp::OutSegs);
+                if rst {
+                    mib.tcp(Tcp::OutRsts);
+                }
+            }
+            Compte::SynAck { renvoi } => {
+                if !route {
+                    mib.ip(Ip::OutNoRoutes);
+                } else if paquet {
+                    mib.tcp(Tcp::OutSegs);
+                    if renvoi {
+                        mib.tcp(Tcp::RetransSegs);
+                    }
+                }
+            }
+            // `rebuild_header` d'abord : un renvoi sans route n'est rien.
+            Compte::Renvoi if !route => {}
+            Compte::Neuf | Compte::Renvoi | Compte::Aucun | Compte::Coupure => {
+                match self {
+                    Compte::Renvoi => mib.tcp(Tcp::RetransSegs),
+                    Compte::Coupure => mib.tcp(Tcp::OutRsts),
+                    _ => {}
+                }
+                // Un segment de la connexion : sa copie d'abord (`skb_clone`,
+                // `alloc_skb`), sans laquelle rien ne part ; les compteurs ;
+                // puis la route (`ip_queue_xmit`).
+                if !paquet {
+                    return;
+                }
+                if matches!(self, Compte::Neuf | Compte::Coupure) {
+                    mib.tcp(Tcp::OutSegs);
+                }
+                if !route {
+                    mib.ip(Ip::OutNoRoutes);
+                }
+            }
+        }
+    }
 }
 
 /// Ce qu'un événement a changé, pour réveiller qui attend.
@@ -691,6 +779,9 @@ pub struct Tcb<P: Charge> {
     /// La fille d'une écoute (le `request_sock` de Linux) : ses SYN-ACK
     /// suivent `tcp_synack_retries`.
     fille: bool,
+    /// Les compteurs de /proc/net/snmp où il compte (le `sock_net(sk)->mib`
+    /// de Linux : ceux de la machine ; ceux d'un essai, sur l'hôte).
+    mib: &'static Mib,
     // L'émission (RFC 9293, 3.3.1).
     iss: u32,
     snd_una: u32,
@@ -839,6 +930,8 @@ pub struct Tcb<P: Charge> {
     pub memoire: Memoire,
     // Ce qui doit partir au prochain `emettre`.
     syn_du: bool,
+    /// Ce SYN (ou SYN-ACK) est un renvoi : il compte dans RetransSegs.
+    syn_renvoi: bool,
     /// Un RST : son numéro, son ACK, ses drapeaux ; et s'il coupe la connexion
     /// (`tcp_send_active_reset`, avec nos options), plutôt qu'il ne répond à un
     /// segment refusé (`tcp_v4_send_reset`, sans).
@@ -960,13 +1053,26 @@ pub struct Tcb<P: Charge> {
     dernier_recu: u64,
 }
 
+/// CurrEstab est une jauge : elle redescend quand une connexion établie change
+/// d'état (`passer`). Une connexion rendue encore établie la redescend aussi :
+/// un filet, pour qu'aucun chemin du noyau qui lâcherait un Tcb sans le fermer
+/// ne la laisse monter à jamais.
+impl<P: Charge> Drop for Tcb<P> {
+    fn drop(&mut self) {
+        if matches!(self.etat, Etat::Etablie | Etat::AttenteFermeture) {
+            self.mib.tcp_retirer(snmp::Tcp::CurrEstab);
+        }
+    }
+}
+
 impl<P: Charge> Tcb<P> {
-    fn vide(port_local: u16, port_distant: u16, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize) -> Tcb<P> {
+    fn vide(mib: &'static Mib, port_local: u16, port_distant: u16, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize) -> Tcb<P> {
         Tcb {
             etat: Etat::Fermee,
             port_local,
             port_distant,
             fille: false,
+            mib,
             iss,
             snd_una: iss,
             snd_nxt: iss,
@@ -1042,6 +1148,7 @@ impl<P: Charge> Tcb<P> {
             dernier_ack_invalide: None,
             memoire: Memoire::Libre,
             syn_du: false,
+            syn_renvoi: false,
             rst_du: None,
             rst_actif: false,
             ack_maintenant: false,
@@ -1125,10 +1232,13 @@ impl<P: Charge> Tcb<P> {
     }
 
     /// Une connexion qui s'ouvre (`connect`) : SYN_SENT, le SYN à envoyer ;
-    /// `echelle`, l'échelle à proposer (`echelle`).
-    pub fn connecter(port_local: u16, port_distant: u16, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize, echelle: u8)
-        -> Tcb<P> {
-        let mut t = Tcb::vide(port_local, port_distant, iss, mss_local, rcvbuf, sndbuf);
+    /// `echelle`, l'échelle à proposer (`echelle`). Elle compte dans `mib`, et
+    /// d'abord dans ActiveOpens (`tcp_connect` : le port et la route sont déjà
+    /// pris).
+    pub fn connecter(mib: &'static Mib, port_local: u16, port_distant: u16, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize,
+                     echelle: u8) -> Tcb<P> {
+        let mut t = Tcb::vide(mib, port_local, port_distant, iss, mss_local, rcvbuf, sndbuf);
+        mib.tcp(snmp::Tcp::ActiveOpens);
         t.etat = Etat::SynEnvoye;
         t.syn_du = true;
         // L'échelle est proposée, même 0 (comme Linux) ; elle ne vaudra que
@@ -1141,9 +1251,10 @@ impl<P: Charge> Tcb<P> {
     /// La fille d'une écoute, pour le SYN `syn` reçu : SYN_RECEIVED, le
     /// SYN-ACK à envoyer ; `echelle`, la nôtre, si l'autre a proposé la
     /// sienne. Les horodatages, s'il les a proposés ; le noyau pose notre
-    /// décalage par `decalage_horodatages`, avant d'émettre.
-    pub fn depuis_syn(syn: &Tcp, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Tcb<P> {
-        let mut t = Tcb::vide(syn.destination, syn.source, iss, mss_local, rcvbuf, sndbuf);
+    /// décalage par `decalage_horodatages`, avant d'émettre. Elle compte dans
+    /// `mib`.
+    pub fn depuis_syn(mib: &'static Mib, syn: &Tcp, iss: u32, mss_local: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Tcb<P> {
+        let mut t = Tcb::vide(mib, syn.destination, syn.source, iss, mss_local, rcvbuf, sndbuf);
         t.etat = Etat::SynRecu;
         t.fille = true;
         t.irs = syn.seq;
@@ -1795,7 +1906,23 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
+    /// Change d'état (`tcp_set_state`), et tient les compteurs qui en dépendent :
+    /// CurrEstab, les connexions établies, où Linux compte aussi CLOSE_WAIT
+    /// (l'autre a fermé, nous pas encore : la connexion sert encore) ;
+    /// EstabResets, une connexion établie qui se ferme d'un coup (un RST
+    /// reçu ou envoyé), sans passer par les FIN.
     fn passer(&mut self, etat: Etat, e: &mut Effets) {
+        let avant = self.etat;
+        let etablie = |x| matches!(x, Etat::Etablie | Etat::AttenteFermeture);
+        match etat {
+            Etat::Etablie if avant != Etat::Etablie => self.mib.tcp(snmp::Tcp::CurrEstab),
+            Etat::AttenteFermeture if avant == Etat::SynRecu => self.mib.tcp(snmp::Tcp::CurrEstab),
+            Etat::Fermee if etablie(avant) => self.mib.tcp(snmp::Tcp::EstabResets),
+            _ => {}
+        }
+        if etablie(avant) && !etablie(etat) {
+            self.mib.tcp_retirer(snmp::Tcp::CurrEstab);
+        }
         if self.etat != etat {
             self.etat = etat;
             e.etat = true;
@@ -1819,7 +1946,14 @@ impl<P: Charge> Tcb<P> {
     /// Une erreur qui ferme la connexion (`tcp_done_with_error`) : ce qui
     /// restait à envoyer est jeté (`tcp_write_queue_purge`) ; ce qui a été
     /// reçu se lit encore (mesuré).
+    /// Une tentative qui échoue ainsi compte dans AttemptFails : en SYN_SENT,
+    /// ou en SYN_RECEIVED d'une ouverture simultanée ; pas une fille, dont la
+    /// demande de Linux (`request_sock`) meurt sans compteur, ses SYN-ACK
+    /// échus ou sur une erreur ICMP (`tcp_req_err`).
     fn finir(&mut self, erreur: i32, e: &mut Effets) {
+        if self.etat == Etat::SynEnvoye || (self.etat == Etat::SynRecu && !self.fille) {
+            self.mib.tcp(snmp::Tcp::AttemptFails);
+        }
         self.erreur = erreur;
         self.envoi.clear();
         self.decalage_envoi = 0;
@@ -1914,6 +2048,7 @@ impl<P: Charge> Tcb<P> {
         if t.seq == self.irs && drapeaux == tcp::SYN && !rejet_paws {
             if !self.ack_invalide_limite(maintenant) {
                 self.syn_du = true;
+                self.syn_renvoi = true;
                 self.syn_envoi = None;
                 self.total_retrans += 1;
                 self.armer_rto(maintenant);
@@ -1948,6 +2083,7 @@ impl<P: Charge> Tcb<P> {
                 self.rst_du = Some(if drapeaux & tcp::ACK != 0 { (t.ack, 0, tcp::RST) } else { (0, fin_seq, tcp::RST | tcp::ACK) });
                 e.a_emettre = true;
             }
+            self.mib.tcp(snmp::Tcp::AttemptFails);
             self.passer(Etat::Fermee, e);
             return false;
         }
@@ -1966,7 +2102,18 @@ impl<P: Charge> Tcb<P> {
             ts.instant = maintenant;
         }
         self.compter_naissance(longueur_charge, maintenant);
+        self.mib.tcp(snmp::Tcp::PassiveOpens);
         true
+    }
+
+    /// Un SYN reçoit l'ACK de défi (le `syn_challenge` de `tcp_validate_incoming`,
+    /// hors de la fenêtre, dedans, ou refusé par PAWS) : une erreur reçue (InErrs),
+    /// seulement dans une connexion établie (`tcp_rcv_established` passe
+    /// `syn_inerr`, pas `tcp_rcv_state_process`).
+    fn compter_defi_syn(&self) {
+        if self.etat == Etat::Etablie {
+            self.mib.tcp(snmp::Tcp::InErrs);
+        }
     }
 
     /// Un segment refusé reçoit un ACK (`tcp_send_dupack`), limité s'il ne
@@ -2127,6 +2274,7 @@ impl<P: Charge> Tcb<P> {
                     // repart avec un ACK.
                     self.passer(Etat::SynRecu, &mut e);
                     self.syn_du = true;
+                    self.syn_renvoi = false;
                     e.a_emettre = true;
                 }
                 // Des données dans le SYN-ACK : Linux les garde ; ici
@@ -2163,6 +2311,9 @@ impl<P: Charge> Tcb<P> {
                 Desordonne::Accepte => {}
                 Desordonne::VieilAck => return e,
                 Desordonne::Refuse => {
+                    if syn {
+                        self.compter_defi_syn();
+                    }
                     self.repondre_doublon(seq, longueur, syn, maintenant, &mut e);
                     return e;
                 }
@@ -2176,6 +2327,9 @@ impl<P: Charge> Tcb<P> {
                     self.reinitialiser(&mut e);
                 }
             } else {
+                if syn {
+                    self.compter_defi_syn();
+                }
                 self.repondre_doublon(seq, longueur, syn, maintenant, &mut e);
             }
             return e;
@@ -2196,6 +2350,7 @@ impl<P: Charge> Tcb<P> {
         // 4. SYN dans une connexion synchronisée : un ACK de défi (RFC 5961,
         // 4.2).
         if syn {
+            self.compter_defi_syn();
             if !self.ack_invalide_limite(maintenant) {
                 self.ack_maintenant = true;
                 e.a_emettre = true;
@@ -2213,6 +2368,7 @@ impl<P: Charge> Tcb<P> {
                 // Un SYN-ACK qui n'était pas encore parti (l'ouverture
                 // simultanée) : notre SYN est acquitté, un ACK suffit.
                 if core::mem::take(&mut self.syn_du) {
+                    self.syn_renvoi = false;
                     self.ack_maintenant = true;
                     e.a_emettre = true;
                 }
@@ -3248,6 +3404,7 @@ impl<P: Charge> Tcb<P> {
         }
         if renvoi {
             self.syn_du = true;
+            self.syn_renvoi = true;
             self.total_retrans += 1;
             self.syn_envoi = None;
             e.a_emettre = true;
@@ -3498,7 +3655,7 @@ impl<P: Charge> Tcb<P> {
         let h = self.entete(self.snd_nxt, drapeaux);
         let numero = self.compter_envoi(n);
         self.compter_sortie(n);
-        sortir(Sortant { entete: h, debut, longueur: n, numero });
+        sortir(Sortant { entete: h, debut, longueur: n, numero, compte: Compte::Neuf });
         let fin_segment = self.snd_nxt.wrapping_add(n as u32 + u32::from(avec_fin));
         if n < self.mss_courant() as usize {
             // Un petit segment (`tcp_minshall_update`).
@@ -3545,7 +3702,8 @@ impl<P: Charge> Tcb<P> {
             if actif {
                 self.compter_sortie(0);
             }
-            sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
+            let compte = if actif { Compte::Coupure } else { Compte::Reponse { rst: true } };
+            sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0, compte });
             if self.etat == Etat::Fermee {
                 return;
             }
@@ -3582,7 +3740,15 @@ impl<P: Charge> Tcb<P> {
                 h.options.echelle = Some(self.echelle_reception);
             }
             self.compter_sortie(0);
-            sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
+            // Le SYN-ACK d'une fille part de sa demande ; celui d'une ouverture simultanée, de
+            // la socket, comme le SYN.
+            let compte = match (self.fille, core::mem::take(&mut self.syn_renvoi), drapeaux & tcp::ACK != 0) {
+                (true, renvoi, _) => Compte::SynAck { renvoi },
+                (false, true, _) => Compte::Renvoi,
+                (false, false, true) => Compte::Aucun,
+                (false, false, false) => Compte::Neuf,
+            };
+            sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0, compte });
             self.snd_nxt = self.iss.wrapping_add(1);
             // Le premier SYN est chronométré ; pas ceux qui le répètent.
             if self.retransmissions == 0 && self.total_retrans == 0 {
@@ -3604,7 +3770,9 @@ impl<P: Charge> Tcb<P> {
             if self.etat == Etat::SynRecu && self.ack_maintenant {
                 let h = self.entete(self.seq_acceptable(), tcp::ACK);
                 self.compter_sortie(0);
-                sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
+                // Celui d'une fille part de sa demande (`tcp_v4_reqsk_send_ack`).
+                let compte = if self.fille { Compte::Reponse { rst: false } } else { Compte::Neuf };
+                sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0, compte });
                 self.ack_envoye();
             }
             return;
@@ -3639,11 +3807,11 @@ impl<P: Charge> Tcb<P> {
                 if entre(self.snd_up, self.snd_una.wrapping_add(1), self.snd_una.wrapping_add(0xFFFF)) {
                     let h = self.entete(self.snd_una, tcp::ACK);
                     self.compter_sortie(0);
-                    sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
+                    sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0, compte: Compte::Neuf });
                 }
                 let h = self.entete(self.snd_una.wrapping_sub(1), tcp::ACK);
                 self.compter_sortie(0);
-                sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
+                sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0, compte: Compte::Neuf });
                 self.ack_envoye();
             }
         }
@@ -3673,7 +3841,7 @@ impl<P: Charge> Tcb<P> {
         if self.ack_maintenant {
             let h = self.entete(self.seq_acceptable(), tcp::ACK);
             self.compter_sortie(0);
-            sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0 });
+            sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0, compte: Compte::Neuf });
             self.ack_envoye();
         }
         if core::mem::take(&mut self.place_a_voir) {

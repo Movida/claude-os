@@ -52,6 +52,10 @@ fn vide() -> Octets {
 
 type Connexion = Tcb<Octets>;
 
+/// Les compteurs de /proc/net/snmp de ces essais (ceux qui les lisent ont les leurs : les
+/// essais tournent en parallèle).
+static MIB: inet::snmp::Mib = inet::snmp::Mib::new();
+
 /// Les segments que `c` a à envoyer, avec leur charge copiée.
 fn sortants(c: &mut Connexion) -> Vec<(Tcp, Vec<u8>)> {
     let mut s: Vec<Sortant> = Vec::new();
@@ -106,14 +110,14 @@ const ECHELLE: u8 = 7;
 
 /// Une connexion établie : le client (connect) et la fille de l'écoute.
 fn paire() -> (Connexion, Connexion) {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     let s = sortants(&mut c);
     assert_eq!(s.len(), 1);
     let (syn, _) = s[0];
     assert_eq!(syn.drapeaux, tcp::SYN);
     assert_eq!(syn.options.mss, Some(MSS));
     assert_eq!(c.etat(), Etat::SynEnvoye);
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     assert_eq!(f.etat(), Etat::SynRecu);
     let s = sortants(&mut f);
     assert_eq!(s[0].0.drapeaux, tcp::SYN | tcp::ACK);
@@ -218,8 +222,8 @@ fn fermeture_simultanee() {
 
 #[test]
 fn ouverture_simultanee() {
-    let mut a = Connexion::connecter(1, 2, 100, MSS, 131_072, 16_384, ECHELLE);
-    let mut b = Connexion::connecter(2, 1, 900, MSS, 131_072, 16_384, ECHELLE);
+    let mut a = Connexion::connecter(&MIB, 1, 2, 100, MSS, 131_072, 16_384, ECHELLE);
+    let mut b = Connexion::connecter(&MIB, 2, 1, 900, MSS, 131_072, 16_384, ECHELLE);
     let sa = sortants(&mut a);
     let sb = sortants(&mut b);
     a.recevoir(&sb[0].0, vide(), maintenant());
@@ -232,14 +236,14 @@ fn ouverture_simultanee() {
 #[test]
 fn refus_et_rst() {
     // Un RST qui acquitte notre SYN : ECONNREFUSED.
-    let mut c = Connexion::connecter(40000, 81, 5, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 81, 5, MSS, 131_072, 16_384, ECHELLE);
     let syn = sortants(&mut c)[0].0;
     let rst = t::reponse_sans_connexion(&syn, 0).unwrap();
     assert_eq!((rst.drapeaux, rst.ack), (tcp::RST | tcp::ACK, 6));
     let e = c.recevoir(&rst, vide(), maintenant());
     assert!(e.etat && c.etat() == Etat::Fermee && c.prendre_erreur() == t::ECONNREFUSED);
     // Un RST qui n'acquitte pas notre SYN : ignoré.
-    let mut c = Connexion::connecter(40000, 81, 5, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 81, 5, MSS, 131_072, 16_384, ECHELLE);
     sortants(&mut c);
     c.recevoir(&Tcp { drapeaux: tcp::RST, ..rst }, vide(), maintenant());
     assert_eq!(c.etat(), Etat::SynEnvoye);
@@ -313,9 +317,9 @@ fn segment_hors_ordre_garde_et_ack_duplique() {
 fn fenetre_nulle_puis_ack_apres_lecture() {
     // Un récepteur de petite mémoire : la fenêtre se ferme, puis la lecture
     // la rouvre par un ACK immédiat (`lu`).
-    let mut c = Connexion::connecter(1, 2, 0, MSS, 131_072, 1 << 20, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 1, 2, 0, MSS, 131_072, 1 << 20, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 0, MSS, 16_384, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 0, MSS, 16_384, 16_384, ECHELLE);
     calmer(&mut c, &mut f);
     let donnees = vec![7u8; 100_000];
     ecrire(&mut c, &donnees);
@@ -346,7 +350,7 @@ fn fenetre_nulle_puis_ack_apres_lecture() {
 fn erreurs_icmp() {
     // Pendant la poignée de main, toute erreur ferme la connexion (même
     // « hôte injoignable », qu'icmp_err_convert ne dit pas fatale).
-    let mut c = Connexion::connecter(1, 2, 0, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 1, 2, 0, MSS, 131_072, 16_384, ECHELLE);
     sortants(&mut c);
     c.erreur_icmp(113, 0, true, false, maintenant());
     assert_eq!((c.etat(), c.prendre_erreur()), (Etat::Fermee, 113));
@@ -376,9 +380,9 @@ fn sans_connexion() {
 #[test]
 fn mss_du_pair_borne() {
     for (offre, attendu) in [(0u16, 536usize), (1, 48)] {
-        let mut c = Connexion::connecter(40000, 80, 1000, offre, 131_072, 16_384, ECHELLE);
+        let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, offre, 131_072, 16_384, ECHELLE);
         let syn = sortants(&mut c)[0].0;
-        let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+        let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
         calmer(&mut c, &mut f);
         ecrire(&mut f, &[5u8; 1000]);
         let s = sortants(&mut f);
@@ -454,9 +458,9 @@ fn ack_des_donnees_sans_le_fin() {
 /// ne fait pas un MSS, la fenêtre ne s'ouvre pas ; ensuite, si.
 #[test]
 fn pas_de_petite_fenetre() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 65_536, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 65_536, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 16_384, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 16_384, 16_384, ECHELLE);
     calmer(&mut c, &mut f);
     // La fenêtre de départ, la moitié de SO_RCVBUF arrondie au MSS : 7300 octets,
     // envoyés tous. Elle est alors fermée.
@@ -487,7 +491,7 @@ fn echeance_suivante(c: &mut Connexion) {
 /// personne ne répond, celle de son abandon, et son erreur.
 fn syn_sans_reponse(syncnt: u32) -> (Vec<u64>, u64, i32) {
     let debut = maintenant();
-    let mut c = Connexion::connecter(1, 2, 0, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 1, 2, 0, MSS, 131_072, 16_384, ECHELLE);
     c.reglages.syn_essais = syncnt;
     let mut syn = Vec::new();
     loop {
@@ -521,7 +525,7 @@ fn syn_ack_sans_reponse() {
     // (`tcp_synack_retries`), le RTO doublé chaque fois, puis elle s'en va.
     let syn = Tcp { source: 2, destination: 1, seq: 500, drapeaux: tcp::SYN, fenetre: 65_535, ..Tcp::default() };
     let debut = maintenant();
-    let mut f = Connexion::depuis_syn(&syn, 0, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 0, MSS, 131_072, 16_384, ECHELLE);
     let mut heures = Vec::new();
     while f.etat() != Etat::Fermee {
         for (h, _) in sortants(&mut f) {
@@ -656,10 +660,10 @@ fn grandir(c: &mut Connexion, f: &mut Connexion, n: u32) {
 #[test]
 fn debit_calcule() {
     let mss = MSS as u64;
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 1 << 24, 1 << 24, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 1 << 24, 1 << 24, ECHELLE);
     assert_eq!(c.info(maintenant()).pacing, t::PACING_MAX);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 1 << 24, 1 << 24, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 1 << 24, 1 << 24, ECHELLE);
     let synack = sortants(&mut f)[0].0;
     avancer(10 * MS);
     c.recevoir(&synack, vide(), maintenant());
@@ -864,9 +868,9 @@ fn fenetre_nulle_sondes_qui_doublent_puis_abandon() {
     // Un récepteur qui ne lit pas : sa fenêtre se ferme, et l'émetteur
     // sonde, le délai doublé chaque fois ; chaque sonde a sa réponse (la
     // fenêtre, toujours nulle).
-    let mut c = Connexion::connecter(1, 2, 0, MSS, 131_072, 1 << 20, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 1, 2, 0, MSS, 131_072, 1 << 20, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 0, MSS, 16_384, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 0, MSS, 16_384, 16_384, ECHELLE);
     calmer(&mut c, &mut f);
     ecrire(&mut c, &vec![7u8; 100_000]);
     calmer(&mut c, &mut f);
@@ -911,9 +915,9 @@ fn fenetre_nulle_sondes_qui_doublent_puis_abandon() {
 fn fenetre_nulle_rouverte_par_la_lecture() {
     // L'ACK qui rouvre la fenêtre se perd : la sonde suivante la découvre,
     // et l'émetteur reprend.
-    let mut c = Connexion::connecter(1, 2, 0, MSS, 131_072, 1 << 20, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 1, 2, 0, MSS, 131_072, 1 << 20, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 0, MSS, 16_384, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 0, MSS, 16_384, 16_384, ECHELLE);
     calmer(&mut c, &mut f);
     ecrire(&mut c, &vec![9u8; 50_000]);
     calmer(&mut c, &mut f);
@@ -1076,9 +1080,9 @@ fn fin_apres_un_trou() {
 #[test]
 fn ack_hors_fenetre_limites() {
     let (mut a, _a0) = paire();
-    let mut c = Connexion::connecter(40000, 80, 2_000_000_000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 2_000_000_000, MSS, 131_072, 16_384, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut b = Connexion::depuis_syn(&syn, 3_000_000_000, MSS, 131_072, 16_384, ECHELLE);
+    let mut b = Connexion::depuis_syn(&MIB, &syn, 3_000_000_000, MSS, 131_072, 16_384, ECHELLE);
     calmer(&mut c, &mut b);
     ecrire(&mut a, b"x");
     let mut vers_b = sortants(&mut a);
@@ -1111,9 +1115,9 @@ fn ack_hors_fenetre_limites() {
 
 /// Une connexion établie aux tampons et MSS donnés.
 fn paire_avec(mss: u16, rcvbuf: usize, sndbuf: usize) -> (Connexion, Connexion) {
-    let mut c = Connexion::connecter(40000, 80, 1000, mss, rcvbuf, sndbuf, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, mss, rcvbuf, sndbuf, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, mss, rcvbuf, sndbuf, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, mss, rcvbuf, sndbuf, ECHELLE);
     calmer(&mut c, &mut f);
     assert_eq!((c.etat(), f.etat()), (Etat::Etablie, Etat::Etablie));
     (c, f)
@@ -1150,13 +1154,13 @@ fn ack_au_deuxieme_segment_plein() {
 
 /// Un SYN et un SYN-ACK : la fenêtre de chaque connexion, et ce qu'elles annoncent.
 fn poignee(mss: u16, rcvbuf: usize, echelle: u8, horodatages: bool, regler: impl Fn(&mut Connexion)) -> (Connexion, Connexion, u16, u16) {
-    let mut c = Connexion::connecter(40000, 80, 1000, mss, rcvbuf, 16_384, echelle);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, mss, rcvbuf, 16_384, echelle);
     regler(&mut c);
     if horodatages {
         c.proposer_horodatages(1);
     }
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, mss, rcvbuf, 16_384, echelle);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, mss, rcvbuf, 16_384, echelle);
     regler(&mut f);
     let s = sortants(&mut f)[0].0;
     c.recevoir(&s, vide(), maintenant());
@@ -1179,11 +1183,11 @@ fn fenetre_initiale_comme_linux() {
     let ack = sortants(&mut c)[0].0;
     assert_eq!(ack.fenetre as u32 * 128, 64_256);
     // Sans échelle chez l'autre : au plus 65 535, sur 16 bits sans décalage.
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 1 << 20, 16_384, 7);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 1 << 20, 16_384, 7);
     let mut syn = sortants(&mut c)[0].0;
     assert_eq!(syn.fenetre, 65_535);
     syn.options.echelle = None;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 1 << 20, 16_384, 7);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 1 << 20, 16_384, 7);
     let s = sortants(&mut f)[0].0;
     assert_eq!((s.fenetre, s.options.echelle), (65_535, None));
     // SO_RCVBUF fixé : sa moitié, et le plafond tient compte de l'unique segment réservé.
@@ -1479,10 +1483,10 @@ fn apres_seq(a: u32, b: u32) -> bool {
 
 /// Une connexion avec SACK, à toute heure.
 fn paire_avec_sack() -> (Connexion, Connexion) {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.proposer_sack();
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     f.proposer_sack();
     let sa = sortants(&mut f)[0].0;
     c.recevoir(&sa, vide(), maintenant());
@@ -1494,9 +1498,9 @@ fn paire_avec_sack() -> (Connexion, Connexion) {
 /// recul (`tcp_rcv_state_process` : `retrans_stamp = 0` ; `inet_csk_clone_lock`).
 #[test]
 fn une_vieille_fille_abandonne_comme_les_autres() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     let sa = sortants(&mut f)[0].0;
     c.recevoir(&sa, vide(), maintenant());
     let ack = sortants(&mut c)[0].0;
@@ -1520,10 +1524,10 @@ fn une_vieille_fille_abandonne_comme_les_autres() {
 
 /// Une connexion sans SACK, avec les horodatages.
 fn reno_avec_horodatages() -> (Connexion, Connexion) {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 1 << 22, 1 << 22, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 1 << 22, 1 << 22, ECHELLE);
     c.proposer_horodatages(1_000_000);
     let (syn, _) = sortants(&mut c)[0];
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 1 << 22, 1 << 22, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 1 << 22, 1 << 22, ECHELLE);
     f.decalage_horodatages(5_000_000);
     let s = sortants(&mut f);
     c.recevoir(&s[0].0, vide(), maintenant());
@@ -1697,7 +1701,7 @@ fn neuf_en_reprise_le_tlp_laisse_la_place_au_rto() {
 #[test]
 fn syn_renvoye_et_l_etat_de_perte() {
     for sack in [false, true] {
-        let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+        let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
         if sack {
             c.proposer_sack();
         }
@@ -1705,7 +1709,7 @@ fn syn_renvoye_et_l_etat_de_perte() {
         echeance_suivante(&mut c);
         sortants(&mut c);
         assert_eq!(c.info(maintenant()).phase, 4);
-        let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+        let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
         if sack {
             f.proposer_sack();
         }
@@ -1742,9 +1746,9 @@ fn sonde_coupee_porte_psh() {
 /// (`tcp_create_openreq_child`), et le MSS suit sa moitié (`tcp_bound_to_half_wnd`).
 #[test]
 fn la_fille_oublie_la_fenetre_de_son_syn() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, 0);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, 0);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, 0);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, 0);
     let sa = sortants(&mut f)[0].0;
     c.recevoir(&sa, vide(), maintenant());
     let mut ack = sortants(&mut c)[0].0;
@@ -1828,9 +1832,9 @@ fn sonde_qui_emporte_des_donnees() {
 /// Une fille d'une écoute avec TCP_DEFER_ACCEPT `defer`, et le client qui lui répond. Rend
 /// le client, la fille, et le dernier ACK du client.
 fn fille_differee(defer: u32) -> (Connexion, Connexion, Tcp) {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     f.reglages.defer_accept = defer;
     let synack = sortants(&mut f)[0].0;
     c.recevoir(&synack, vide(), maintenant());
@@ -1892,9 +1896,9 @@ fn defer_accept_les_instants() {
 #[test]
 fn fille_qui_meurt_en_silence() {
     let f0 = maintenant();
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     sortants(&mut f);
     let mut n = 0;
     while f.etat() != Etat::Fermee {
@@ -1946,10 +1950,10 @@ fn essais_des_filles_sous_la_charge() {
 /// ou un programme qui attend d'écrire, au plus 200 ms.
 #[test]
 fn le_client_retient_son_ack() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.ecrivains_en_attente = 1;
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     let s = sortants(&mut f)[0].0;
     c.recevoir(&s, vide(), maintenant());
     assert_eq!(c.etat(), Etat::Etablie);
@@ -2022,9 +2026,9 @@ fn envoyer_et_acquitter(c: &mut Connexion, f: &mut Connexion, octets: usize, ms:
 /// dernier échantillon s'il n'est pas limité par le programme, sinon le plus haut.
 #[test]
 fn debit_livre() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     let sa = sortants(&mut f)[0].0;
     avancer(10 * MS);
     c.recevoir(&sa, vide(), maintenant());
@@ -2072,10 +2076,10 @@ fn debit_sans_temps() {
 
 /// Une connexion établie, avec SACK, de 10 ms d'aller-retour : le client, sa fille, et son MSS.
 fn paire_mesuree() -> (Connexion, Connexion, usize) {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.proposer_sack();
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     f.proposer_sack();
     let sa = sortants(&mut f)[0].0;
     avancer(10 * MS);
@@ -2209,10 +2213,10 @@ fn pas_de_bulle() {
 /// parmi les autres, le plus récent (`tcp_rate_skb_delivered`).
 #[test]
 fn debit_livre_avec_sack() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.proposer_sack();
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     f.proposer_sack();
     let sa = sortants(&mut f)[0].0;
     avancer(10 * MS);
@@ -2299,10 +2303,10 @@ fn chronos_fenetre_qui_s_ouvre_en_restant_occupee() {
 /// la place : c'est lui qui limite (`tcp_cwnd_validate`). Jusqu'à ce que la place revienne.
 #[test]
 fn chronos_tampon_plein() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 8192, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 8192, ECHELLE);
     c.sndbuf_fixe = true;
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     calmer(&mut c, &mut f);
     assert_eq!(ecrire(&mut c, &[0; 6000]), 6000);
     c.marquer_sans_place();
@@ -2354,9 +2358,9 @@ fn info_rto() {
 /// Ce que les RTO de ses SYN-ACK laissent à la fille (`tcp_create_openreq_child`).
 #[test]
 fn info_rto_d_une_fille() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     let sa = sortants(&mut f)[0].0;
     c.recevoir(&sa, vide(), maintenant());
     let ack = sortants(&mut c)[0].0;
@@ -2376,10 +2380,10 @@ fn info_rto_d_une_fille() {
 /// toucher à la cwnd, en Perte. Ce qui repart couvre tout, sans rien de neuf.
 #[test]
 fn mtu_reduite_redecoupe_ce_qui_est_en_vol() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 1 << 20, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 1 << 20, ECHELLE);
     c.proposer_horodatages(1);
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 1 << 20, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 1 << 20, ECHELLE);
     f.decalage_horodatages(2);
     calmer(&mut c, &mut f);
     let mss_avant = c.mss() as usize;
@@ -2707,10 +2711,10 @@ fn ack_retarde_presque_echu() {
 #[test]
 fn echelle_de_fenetre() {
     // Proposée dans le SYN, rendue dans le SYN-ACK : 7 des deux côtés.
-    let mut c = Connexion::connecter(1, 2, 0, 65_000, 1 << 20, 1 << 22, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 1, 2, 0, 65_000, 1 << 20, 1 << 22, ECHELLE);
     let syn = sortants(&mut c)[0].0;
     assert_eq!(syn.options.echelle, Some(ECHELLE));
-    let mut f = Connexion::depuis_syn(&syn, 0, 65_000, 1 << 20, 1 << 22, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 0, 65_000, 1 << 20, 1 << 22, ECHELLE);
     let synack = sortants(&mut f)[0].0;
     assert_eq!(synack.options.echelle, Some(ECHELLE));
     c.recevoir(&synack, vide(), maintenant());
@@ -2729,7 +2733,7 @@ fn echelle_de_fenetre() {
     // Sans l'option dans le SYN de l'autre : pas d'échelle, ni dans le
     // SYN-ACK.
     let nu = Tcp { options: tcp::Options { echelle: None, ..syn.options }, ..syn };
-    let mut f = Connexion::depuis_syn(&nu, 0, MSS, 1 << 20, 1 << 22, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &nu, 0, MSS, 1 << 20, 1 << 22, ECHELLE);
     let synack = sortants(&mut f)[0].0;
     assert_eq!(synack.options.echelle, None);
 }
@@ -2746,11 +2750,11 @@ fn echelle_comme_linux() {
     assert_eq!(t::echelle(8 << 20, true, 32 << 20, 0), 7);
     assert_eq!(t::echelle(131_072, false, 15 << 20, 0), 8);
     assert_eq!(t::echelle(4096, true, 32 << 20, 0), 0);
-    let mut c = Connexion::connecter(1, 2, 0, MSS, 131_072, 16_384, 0);
+    let mut c = Connexion::connecter(&MIB, 1, 2, 0, MSS, 131_072, 16_384, 0);
     let syn = sortants(&mut c)[0].0;
     assert_eq!(syn.options.echelle, Some(0));
     let quinze = Tcp { options: tcp::Options { echelle: Some(15), ..syn.options }, ..syn };
-    let mut f = Connexion::depuis_syn(&quinze, 0, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &quinze, 0, MSS, 131_072, 16_384, ECHELLE);
     let synack = sortants(&mut f)[0].0;
     assert_eq!(synack.options.echelle, Some(ECHELLE));
     c.recevoir(&Tcp { options: tcp::Options { echelle: Some(15), ..synack.options }, ..synack }, vide(), maintenant());
@@ -2912,10 +2916,10 @@ fn so_sndbuf_agrandi() {
     let (c, _) = paire_avec(65_495, 131_072, 16_384);
     assert_eq!(c.sndbuf, 2_626_560);
     // SO_SNDBUF fixé par le programme : il ne bouge plus.
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.sndbuf_fixe = true;
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     calmer(&mut c, &mut f);
     assert_eq!(c.sndbuf, 16_384);
 }
@@ -2983,10 +2987,10 @@ fn memoire_de_toute_la_machine() {
     ecrire(&mut c, b"a");
     calmer(&mut c, &mut f);
     assert_eq!(c.sndbuf, depart);
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.memoire = t::Memoire::Pression;
     let syn = sortants(&mut c)[0].0;
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     calmer(&mut c, &mut f);
     assert_eq!(c.sndbuf, depart);
     // Limite : un envoi dans un tampon vide passe, puis plus rien.
@@ -3145,9 +3149,9 @@ fn apres_le_fin_doublons_acquittes() {
 #[test]
 fn fille_comme_tcp_check_req() {
     let cree = || {
-        let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+        let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
         let (syn, _) = sortants(&mut c)[0];
-        let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+        let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
         let _ = sortants(&mut f);
         (syn, f)
     };
@@ -3394,10 +3398,10 @@ fn ack_impossible_et_ack_trop_vieux() {
 
 /// Une paire qui a négocié les horodatages.
 fn paire_ts() -> (Connexion, Connexion) {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.proposer_horodatages(1_000_000);
     let (syn, _) = sortants(&mut c)[0];
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     f.decalage_horodatages(5_000_000);
     let s = sortants(&mut f);
     c.recevoir(&s[0].0, vide(), maintenant());
@@ -3414,11 +3418,11 @@ fn paire_ts() -> (Connexion, Connexion) {
 fn horodatages_negocies() {
     avancer(3 * MS);
     let ms = (maintenant() / MS) as u32;
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.proposer_horodatages(1_000_000);
     let (syn, _) = sortants(&mut c)[0];
     assert_eq!(syn.options.horodatage, Some((1_000_000 + ms, 0)));
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     f.decalage_horodatages(5_000_000);
     let (sa, _) = sortants(&mut f)[0];
     assert_eq!(sa.options.horodatage, Some((5_000_000 + ms, 1_000_000 + ms)));
@@ -3439,19 +3443,19 @@ fn horodatages_negocies() {
     assert_eq!(s[0].1.len(), MSS as usize - 12);
     assert!(s.iter().all(|x| x.0.options.horodatage.is_some()));
     // Le SYN sans l'option : jamais en service, ni l'un ni l'autre.
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     let (syn, _) = sortants(&mut c)[0];
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     let (sa, _) = sortants(&mut f)[0];
     assert_eq!(sa.options.horodatage, None);
     c.recevoir(&sa, vide(), maintenant());
     assert_eq!(c.info(maintenant()).options & 1, 0);
     // Proposés, mais pas de l'autre côté : retirés, MSS entier.
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.proposer_horodatages(1);
     let (syn, _) = sortants(&mut c)[0];
     let sans = Tcp { options: tcp::Options { horodatage: None, ..syn.options }, ..syn };
-    let mut f = Connexion::depuis_syn(&sans, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &sans, 7000, MSS, 131_072, 16_384, ECHELLE);
     let (sa, _) = sortants(&mut f)[0];
     c.recevoir(&sa, vide(), maintenant());
     let s = sortants(&mut c);
@@ -3596,12 +3600,12 @@ fn rtt_par_tsecr_seulement_apres_un_renvoi() {
 #[test]
 fn tsecr_de_la_poignee_de_main() {
     avancer(10 * MS);
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.proposer_horodatages(1_000_000);
     let (syn, _) = sortants(&mut c)[0];
     let val_syn = syn.options.horodatage.unwrap().0;
     avancer(5 * MS);
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     f.decalage_horodatages(5_000_000);
     let (sa, _) = sortants(&mut f)[0];
     let faux = Tcp { options: tcp::Options { horodatage: Some((9, val_syn.wrapping_sub(1))), ..sa.options }, ..sa };
@@ -3700,11 +3704,11 @@ fn syn_ts(s: Tcp, val: u32) -> Tcp {
 /// compris pour une fille, qui en hérite de son écoute.
 #[test]
 fn tcp_maxseg_dans_le_syn_et_a_l_envoi() {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.mss_utilisateur = 1000;
     let (syn, _) = sortants(&mut c)[0];
     assert_eq!(syn.options.mss, Some(1000));
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 131_072, 16_384, ECHELLE);
     f.poser_mss_utilisateur(800);
     let (sa, _) = sortants(&mut f)[0];
     assert_eq!(sa.options.mss, Some(800));
@@ -3715,13 +3719,13 @@ fn tcp_maxseg_dans_le_syn_et_a_l_envoi() {
 
 /// Une paire qui a négocié SACK.
 fn paire_sack(ts: bool) -> (Connexion, Connexion) {
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 1 << 20, 1 << 20, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 1 << 20, 1 << 20, ECHELLE);
     c.proposer_sack();
     if ts {
         c.proposer_horodatages(1_000_000);
     }
     let (syn, _) = sortants(&mut c)[0];
-    let mut f = Connexion::depuis_syn(&syn, 7000, MSS, 1 << 20, 1 << 20, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, MSS, 1 << 20, 1 << 20, ECHELLE);
     f.decalage_horodatages(5_000_000);
     let s = sortants(&mut f);
     c.recevoir(&s[0].0, vide(), maintenant());
@@ -3740,12 +3744,12 @@ fn blocs(h: &Tcp) -> Vec<(u32, u32)> {
 fn sack_negocie() {
     let (c, f) = paire_sack(false);
     assert_eq!((c.info(maintenant()).options & 2, f.info(maintenant()).options & 2), (2, 2));
-    let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
     c.proposer_sack();
     let (syn, _) = sortants(&mut c)[0];
     assert!(syn.options.sack_permis);
     let sans = Tcp { options: tcp::Options { sack_permis: false, ..syn.options }, ..syn };
-    let mut f = Connexion::depuis_syn(&sans, 7000, MSS, 131_072, 16_384, ECHELLE);
+    let mut f = Connexion::depuis_syn(&MIB, &sans, 7000, MSS, 131_072, 16_384, ECHELLE);
     let (sa, _) = sortants(&mut f)[0];
     assert!(!sa.options.sack_permis);
     c.recevoir(&sa, vide(), maintenant());
@@ -4277,7 +4281,7 @@ fn annulation_par_dsack() {
 fn syn_renvoye_pour_rien() {
     for (ecart, attendu) in [(0, 10), (1, 1)] {
         avancer(10 * MS);
-        let mut c = Connexion::connecter(40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
+        let mut c = Connexion::connecter(&MIB, 40000, 80, 1000, MSS, 131_072, 16_384, ECHELLE);
         c.proposer_horodatages(1000);
         let (syn, _) = sortants(&mut c)[0];
         let val = syn.options.horodatage.unwrap().0;
@@ -4296,7 +4300,7 @@ fn syn_renvoye_pour_rien() {
 /// Une fille établie, sans échange ; RCV.NXT : le second membre.
 fn fille_etablie(rcvbuf: usize) -> (Connexion, u32) {
     let syn = Tcp { source: 40000, destination: 80, seq: 1000, drapeaux: tcp::SYN, fenetre: 65535, options: tcp::Options { mss: Some(1460), sack_permis: true, echelle: Some(7), ..tcp::Options::default() }, ..Tcp::default() };
-    let mut f = Connexion::depuis_syn(&syn, 7000, 1460, rcvbuf, 16_384, 7);
+    let mut f = Connexion::depuis_syn(&MIB, &syn, 7000, 1460, rcvbuf, 16_384, 7);
     sortants(&mut f);
     f.recevoir(&Tcp { seq: 1001, ack: 7001, drapeaux: tcp::ACK, fenetre: 1000, options: tcp::Options::default(), ..syn }, vide(), maintenant());
     assert_eq!(f.etat(), Etat::Etablie);
@@ -4322,7 +4326,7 @@ fn des_donnees_apres_le_fin() {
 /// le SYN repart vite pour nettoyer ce qui reste de l'ancienne connexion.
 #[test]
 fn syn_envoye_pas_de_rst_pour_un_rst() {
-    let mut c = Connexion::connecter(40000, 80, 5000, 1460, 131_072, 16_384, 7);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 5000, 1460, 131_072, 16_384, 7);
     c.proposer_horodatages(0);
     sortants(&mut c);
     let m = Tcp { source: 80, destination: 40000, seq: 9, fenetre: 65535, ..Tcp::default() };
@@ -4341,7 +4345,7 @@ fn syn_envoye_pas_de_rst_pour_un_rst() {
 /// TCP_MAXSEG borne ce qu'on annonce, dès le SYN, et tout ce qui en découle (`tcp_mss_clamp`).
 #[test]
 fn tcp_maxseg_borne_advmss() {
-    let mut c = Connexion::connecter(40000, 80, 5000, 65_495, 131_072, 16_384, 7);
+    let mut c = Connexion::connecter(&MIB, 40000, 80, 5000, 65_495, 131_072, 16_384, 7);
     c.mss_utilisateur = 1200;
     let s = sortants(&mut c);
     assert_eq!(s[0].0.options.mss, Some(1200));
@@ -4440,7 +4444,7 @@ fn le_rst_des_donnees_non_lues() {
 fn deconnexion_selon_l_etat() {
     let (mut c, _f) = paire();
     assert_eq!(c.deconnexion(), (true, true));
-    let s = Connexion::connecter(40000, 80, 5000, 1460, 131_072, 16_384, 7);
+    let s = Connexion::connecter(&MIB, 40000, 80, 5000, 1460, 131_072, 16_384, 7);
     assert_eq!(s.deconnexion(), (false, true), "SYN_SENT : l'erreur, sans RST");
     c.avorter();
     assert_eq!(c.deconnexion(), (false, false));

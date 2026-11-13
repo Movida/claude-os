@@ -53,6 +53,7 @@
 use super::contexte;
 use super::ipv4;
 use super::paquet::{Paquet, Retenue};
+use super::snmp::MIB;
 use super::socket::{self, Protocole, Socket};
 use crate::attente::{FileAttente, Possede, Possession, Sommeil};
 use crate::faillible::{self, FileFaillible, VecFaillible};
@@ -66,9 +67,11 @@ use alloc::vec::Vec;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use formats::reseau::ipv4 as fipv4;
+use formats::reseau::Erreur;
 use formats::reseau::tcp::{self as ftcp, Tcp};
 use inet::ports_tcp::{self, Destinataire, Lien, Sorte};
-use inet::tcp::{self as itcp, Charge, Etat, Tcb};
+use inet::snmp::{Icmp as CompteurIcmp, Tcp as Compteur};
+use inet::tcp::{self as itcp, Charge, Compte, Etat, Tcb};
 
 const EINVAL: i64 = 22;
 const EAGAIN: i64 = 11;
@@ -480,6 +483,10 @@ pub struct Segment {
     charge: Paquet,
     source: [u8; 4],
     destination: [u8; 4],
+    /// Sa destination est une diffusion, dans une trame pour nous seuls (le
+    /// RTCF_BROADCAST de sa route) : une écoute de 0.0.0.0 la voit, mais n'en
+    /// fait jamais de fille.
+    diffusion: bool,
     fille: Option<u64>,
     /// Un SYN qui reprend le quadruplet d'une entrée de TIME_WAIT : le
     /// numéro initial de la fille, plus loin que tout ce que l'ancienne
@@ -893,19 +900,21 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
     let mut a_envoyer: Vec<itcp::Sortant> = Vec::new();
     t.emettre(maintenant(), |s| {
         // Sans place, le segment ne part pas : la retransmission y pourvoira, et personne ne doit
-        // le croire encore dans la carte.
-        let numero = s.numero;
-        if a_envoyer.ajouter(s).is_err()
-            && let Some(r) = retenue
-            && numero != 0
-        {
-            r.envoi_perdu(numero);
+        // le croire encore dans la carte. Il compte comme un paquet que Linux n'a pas pu faire.
+        let (numero, compte) = (s.numero, s.compte);
+        if a_envoyer.ajouter(s).is_err() {
+            compte.compter(&MIB, true, false);
+            if let Some(r) = retenue
+                && numero != 0
+            {
+                r.envoi_perdu(numero);
+            }
         }
     });
     for s in a_envoyer {
         // Un ACK pur, un RST ne tiennent pas la socket (`skb_is_tcp_pure_ack`).
         let suivi = retenue.filter(|_| s.numero != 0).map(|r| (r, s.numero));
-        envoyer_segment(&s.entete, source, distante, identifiant, ip, s.longueur, suivi, |o| t.copier_envoi(s.debut, o));
+        envoyer_segment(&s.entete, s.compte, source, distante, identifiant, ip, s.longueur, suivi, |o| t.copier_envoi(s.debut, o));
     }
     if t.prendre_etrangle()
         && let Some(r) = retenue
@@ -918,12 +927,14 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
 /// remplis par `remplir`, de `source` à `distante` (DF, TTL 64 : IPv4 de
 /// 6g). La somme n'est pas calculée par `lo` (comme Linux). Un segment
 /// qui ne part pas (plus de mémoire, pas de route) est perdu, comme sur
-/// un câble.
-fn envoyer_segment(h: &Tcp, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, longueur: usize, suivi: Option<(&Arc<Retenue>, u64)>,
-                   remplir: impl FnOnce(&mut [u8])) {
+/// un câble. Il compte dans /proc/net/snmp ce que dit `compte`.
+fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, longueur: usize,
+                   suivi: Option<(&Arc<Retenue>, u64)>, remplir: impl FnOnce(&mut [u8])) {
     let n = ftcp::longueur_entete(&h.options);
-    let prets = ipv4::router(distante, Some(source)).ok().zip(Paquet::vide(n + longueur));
-    let Some(((chemin, destination), mut p)) = prets else {
+    let route = ipv4::router(distante, Some(source));
+    let paquet = Paquet::vide(n + longueur);
+    compte.compter(&MIB, route.is_ok(), paquet.is_some());
+    let (Ok((chemin, destination)), Some(mut p)) = (route, paquet) else {
         // Il ne partira pas : personne ne le rendra.
         if let Some((r, numero)) = suivi {
             r.envoi_perdu(numero);
@@ -948,7 +959,7 @@ fn envoyer_segment(h: &Tcp, source: [u8; 4], distante: [u8; 4], identifiant: &mu
 fn repondre_rst(h: &Tcp, longueur_charge: usize, locale: [u8; 4], distante: [u8; 4]) {
     if let Some(r) = itcp::reponse_sans_connexion(h, longueur_charge) {
         let mut id = crate::aleatoire::u32() as u16;
-        envoyer_segment(&r, locale, distante, &mut id, Ip::SYSTEME, 0, None, |_| {});
+        envoyer_segment(&r, Compte::Reponse { rst: true }, locale, distante, &mut id, Ip::SYSTEME, 0, None, |_| {});
     }
 }
 
@@ -1142,13 +1153,21 @@ impl Partie {
             return;
         }
         if h.drapeaux & ftcp::ACK != 0 {
+            // Un ACK vers une diffusion : son RST n'a pas de route (sa source,
+            // la diffusion, n'est pas à nous), mais il compte, comme les
+            // réponses qui ne partent pas (`tcp_v4_send_reset`).
+            if s.diffusion {
+                Compte::Reponse { rst: true }.compter(&MIB, false, false);
+                return;
+            }
             // Un ACK pour une fille qu'on n'a plus : RST (`tcp_rcv_state_process`, TCP_LISTEN).
             repondre_rst(&h, s.charge.longueur(), s.destination, s.source);
             return;
         }
         // Ni un SYN, ni un SYN|FIN : rien, pas même un RST : ce que distinguent les balayages FIN et
-        // NULL (`TCP_FLAGS`).
-        if h.drapeaux & ftcp::SYN == 0 || h.drapeaux & ftcp::FIN != 0 {
+        // NULL (`TCP_FLAGS`). Un SYN vers une diffusion : rien non plus (`tcp_v4_conn_request`,
+        // ListenDrops).
+        if h.drapeaux & ftcp::SYN == 0 || h.drapeaux & ftcp::FIN != 0 || s.diffusion {
             return;
         }
         // Un SYN : jeté si la file d'acceptation est pleine, ou s'il y a
@@ -1209,14 +1228,14 @@ impl Partie {
 /// valeur, plus d'un Kio qui resterait sur la pile de qui l'appelle, tant qu'il dure.
 #[inline(never)]
 fn tcb_de_syn(place: Box<MaybeUninit<Tcb<Paquet>>>, h: &Tcp, iss: u32, mss: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Box<Tcb<Paquet>> {
-    Box::write(place, Tcb::depuis_syn(h, iss, mss, rcvbuf, sndbuf, echelle))
+    Box::write(place, Tcb::depuis_syn(&MIB, h, iss, mss, rcvbuf, sndbuf, echelle))
 }
 
 /// De même pour `connect`, qui dort ensuite sur sa pile, jusqu'à la fin de la poignée de main.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn tcb_de_connect(place: Box<MaybeUninit<Tcb<Paquet>>>, port: u16, port_distant: u16, iss: u32, mss: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Box<Tcb<Paquet>> {
-    Box::write(place, Tcb::connecter(port, port_distant, iss, mss, rcvbuf, sndbuf, echelle))
+    Box::write(place, Tcb::connecter(&MIB, port, port_distant, iss, mss, rcvbuf, sndbuf, echelle))
 }
 
 /// Le numéro de séquence initial d'une connexion (`secure_tcp_seq`, RFC
@@ -1286,7 +1305,13 @@ fn livrer(s: Segment) {
             vers_socket(&ecoute, Arrivee::Segment(Segment { fille: Some(n), ..s }));
         }
         Some(Destinataire::TempsAttente(n)) => temps_attente(n, s),
-        None => repondre_rst(&h, s.charge.longueur(), s.destination, s.source),
+        // Sans socket, un RST seulement pour une de nos adresses
+        // (`tcp_v4_send_reset` : la route du segment reçu doit être
+        // RTN_LOCAL) : pas pour une diffusion, sans rien compter.
+        None if ipv4::avec_table(|t| t.est_a_nous(s.destination)).unwrap_or(false) => {
+            repondre_rst(&h, s.charge.longueur(), s.destination, s.source);
+        }
+        None => {}
     }
 }
 
@@ -1313,7 +1338,13 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     let (sock, fille) = match cible {
         Some(Destinataire::Connexion(Cible::Socket(s))) => (s, None),
         Some(Destinataire::Connexion(Cible::Fille(ecoute, n))) => (ecoute, Some(n)),
-        _ => return,
+        // Une entrée de TIME_WAIT l'ignore. Sans connexion (une écoute ne compte pas :
+        // `__inet_lookup_established` ne les cherche pas), une erreur pour rien.
+        Some(Destinataire::TempsAttente(_)) => return,
+        Some(Destinataire::Ecoute(_)) | None => {
+            MIB.icmp(CompteurIcmp::InErrors);
+            return;
+        }
     };
     use formats::reseau::icmp;
     // « Fragmentation nécessaire » : la MTU du chemin, qui réduit le MSS
@@ -1374,7 +1405,7 @@ fn temps_attente(n: u64, s: Segment) {
 fn envoyer_ack_tw(e: &TempsAttente) {
     let r = e.regles.entete_ack(crate::temps::ns_monotone());
     let mut id = crate::aleatoire::u32() as u16;
-    envoyer_segment(&r, e.locale, e.distante, &mut id, Ip::SYSTEME, 0, None, |_| {});
+    envoyer_segment(&r, Compte::Reponse { rst: false }, e.locale, e.distante, &mut id, Ip::SYSTEME, 0, None, |_| {});
 }
 
 fn effacer_temps_attente(n: u64) {
@@ -1412,13 +1443,29 @@ fn par_numero(n: u64) -> Option<Arc<Socket>> {
 /// Un segment TCP reçu par `interface` (`p` : le segment, en-tête
 /// compris), de `source` pour `destination`, dans la tâche du réseau ou un
 /// vidage de `lo` (`tcp_v4_rcv`) : l'en-tête et la somme (pas pour `lo`),
-/// puis la socket. Un segment faux est jeté sans rien dire.
-pub fn recevoir(source: [u8; 4], destination: [u8; 4], par_lo: bool, mut p: Paquet) {
-    let Ok((h, charge)) = ftcp::lire(p.donnees(), source, destination, !par_lo) else { return };
+/// puis la socket. Un segment faux est jeté sans rien dire ; il compte
+/// dans InSegs comme les autres (« même mauvais », `tcp_v4_rcv`), et dans
+/// InErrs s'il a un en-tête faux (`bad_packet`) ou une somme fausse (avec
+/// InCsumErrors) ; pas s'il est trop court pour son en-tête (`discard_it`).
+/// `diffusion` : sa destination est une diffusion.
+pub fn recevoir(source: [u8; 4], destination: [u8; 4], par_lo: bool, diffusion: bool, mut p: Paquet) {
+    MIB.tcp(Compteur::InSegs);
+    let (h, charge) = match ftcp::lire(p.donnees(), source, destination, !par_lo) {
+        Ok(x) => x,
+        Err(e) => {
+            if e == Erreur::Somme {
+                MIB.tcp(Compteur::InCsumErrors);
+            }
+            if e != Erreur::Tronque {
+                MIB.tcp(Compteur::InErrs);
+            }
+            return;
+        }
+    };
     let entete = p.longueur() - charge.len();
     let _ = p.retirer_entete(entete);
     let _contexte = contexte::entrer();
-    livrer(Segment { entete: h, charge: p, source, destination, fille: None, isn: None });
+    livrer(Segment { entete: h, charge: p, source, destination, diffusion, fille: None, isn: None });
 }
 
 // --- Les appels ---
@@ -1597,7 +1644,8 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
             }
             Mode::Neuve => {
                 // La route, la source, le port.
-                let (chemin, destination) = ipv4::router(a.adresse, p.adresses.lie.then_some(p.adresses.adresse).filter(|&x| x != [0; 4]))?;
+                let (chemin, destination) = ipv4::router(a.adresse, p.adresses.lie.then_some(p.adresses.adresse).filter(|&x| x != [0; 4]))
+                    .map_err(|_| super::datagramme::sans_route())?;
                 let source = if p.adresses.lie && p.adresses.adresse != [0; 4] { p.adresses.adresse } else { ipv4::source(&chemin) };
                 if fipv4::boucle(source) && !ipv4::par_lo(&chemin) {
                     return Err(-EINVAL);
@@ -2243,10 +2291,16 @@ pub fn fermer(s: &Arc<Socket>) {
 }
 
 /// Les filles d'une écoute qui s'arrête (`inet_csk_listen_stop`) : coupées, rendues.
+/// Celles de la file d'accept reçoivent un RST (`inet_child_forget`, `tcp_disconnect`) ;
+/// pas une fille encore en SYN_RECEIVED : chez Linux, une demande, qui s'en va sans
+/// rien dire à son prochain minuteur (`reqsk_timer_handler`) ; l'ACK qui arrivera
+/// trouvera le RST d'un port fermé.
 fn arreter_les_filles(filles: &mut VecDeque<Fille>, ip: Ip) {
     for f in filles.iter_mut() {
-        f.tcb.avorter();
-        emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
+        if f.tcb.etat() != Etat::SynRecu {
+            f.tcb.avorter();
+            emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
+        }
         if let Some(t) = TABLE.verrouiller().as_mut() {
             t.retirer(f.numero);
         }

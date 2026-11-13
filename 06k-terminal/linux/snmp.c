@@ -11,7 +11,15 @@
  *     injoignable » (OutMsgs, OutDestUnreachs, IcmpMsg OutType3, puis
  *     InMsgs, InDestUnreachs, InType3), deux paquets de chaque sens ;
  *   - un écho d'une socket de ping vers 127.0.0.1 : Echos et EchoReps,
- *     envoyés et reçus, et IcmpMsg pour les genres 0 et 8.
+ *     envoyés et reçus, et IcmpMsg pour les genres 0 et 8 ;
+ *   - un connect TCP vers un port fermé : une ouverture active ratée
+ *     (ActiveOpens, AttemptFails), le SYN et le RST qui lui répond (InSegs,
+ *     OutSegs, OutRsts) ;
+ *   - une connexion TCP acceptée (ActiveOpens, PassiveOpens, CurrEstab +2,
+ *     trois segments), puis coupée par SO_LINGER à 0 : le RST, et deux
+ *     connexions établies fermées d'un coup (EstabResets +2, CurrEstab -2).
+ * Rien n'est renvoyé (RetransSegs), aucun segment n'est faux (InErrs) : sur
+ * lo, InSegs et OutSegs avancent ensemble.
  * Chaque scénario lit /proc/net/snmp avant et après, et se rejoue (cinquante
  * fois au plus) tant que InReceives et OutRequests n'ont pas avancé
  * d'exactement ce qu'il a fait : le trafic des autres programmes de la
@@ -340,6 +348,53 @@ static int echo(void)
     return ok ? 0 : -1;
 }
 
+/* Un connect TCP vers un port fermé : ECONNREFUSED, par le RST qui répond
+ * au SYN (lo le livre avant que connect ne revienne). */
+static int tcp_refuse(void)
+{
+    int f = socket(AF_INET, SOCK_STREAM, 0), c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in lo = adresse(LO, 0);
+    if (f < 0 || c < 0 || bind(f, (struct sockaddr *)&lo, sizeof lo) < 0) {
+        verifier(0, "tcp refuse : socket et bind");
+        return -1;
+    }
+    lo.sin_port = htons(port_de(f));
+    close(f);
+    int ok = connect(c, (struct sockaddr *)&lo, sizeof lo) < 0 && errno == ECONNREFUSED;
+    close(c);
+    if (!ok)
+        verifier(0, "tcp refuse : connect");
+    return ok ? 0 : -1;
+}
+
+/* Une connexion acceptée (le milieu, relevé après accept : la poignée de
+ * main est finie), puis le client la coupe (SO_LINGER à 0) ; recv de la
+ * fille attend son RST (ECONNRESET). */
+static int tcp_coupee(void)
+{
+    int e = socket(AF_INET, SOCK_STREAM, 0), c = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in lo = adresse(LO, 0);
+    if (e < 0 || c < 0 || bind(e, (struct sockaddr *)&lo, sizeof lo) < 0 || listen(e, 1) < 0) {
+        verifier(0, "tcp coupee : socket, bind, listen");
+        return -1;
+    }
+    lo.sin_port = htons(port_de(e));
+    int a = -1;
+    struct linger l = { .l_onoff = 1, .l_linger = 0 };
+    char o;
+    int ok = connect(c, (struct sockaddr *)&lo, sizeof lo) == 0 && (a = accept(e, NULL, NULL)) >= 0
+             && relever(&milieu) == 0 && setsockopt(c, SOL_SOCKET, SO_LINGER, &l, sizeof l) == 0 && close(c) == 0
+             && recv(a, &o, 1, 0) < 0 && errno == ECONNRESET;
+    if (a < 0 || !ok)
+        close(c);
+    if (a >= 0)
+        close(a);
+    close(e);
+    if (!ok)
+        verifier(0, "tcp coupee : connect, accept, close, recv");
+    return ok ? 0 : -1;
+}
+
 int main(void)
 {
     le_texte();
@@ -364,6 +419,23 @@ int main(void)
         { 0 },
     };
     jouer("un echo de ping vers 127.0.0.1", echo, ping, NULL);
+    static const struct attendu refuse[] = {
+        { "Ip", "InReceives", 2 }, { "Ip", "InDelivers", 2 }, { "Ip", "OutRequests", 2 }, { "Ip", "OutTransmits", 2 },
+        { "Tcp", "ActiveOpens", 1 }, { "Tcp", "AttemptFails", 1 }, { "Tcp", "InSegs", 2 }, { "Tcp", "OutSegs", 2 },
+        { "Tcp", "OutRsts", 1 }, { 0 },
+    };
+    jouer("un connect TCP vers un port ferme", tcp_refuse, refuse, NULL);
+    static const struct attendu etablie[] = {
+        { "Ip", "InReceives", 3 }, { "Ip", "InDelivers", 3 }, { "Ip", "OutRequests", 3 }, { "Ip", "OutTransmits", 3 },
+        { "Tcp", "ActiveOpens", 1 }, { "Tcp", "PassiveOpens", 1 }, { "Tcp", "CurrEstab", 2 }, { "Tcp", "InSegs", 3 },
+        { "Tcp", "OutSegs", 3 }, { 0 },
+    };
+    static const struct attendu coupee[] = {
+        { "Ip", "InReceives", 1 }, { "Ip", "InDelivers", 1 }, { "Ip", "OutRequests", 1 }, { "Ip", "OutTransmits", 1 },
+        { "Tcp", "EstabResets", 2 }, { "Tcp", "CurrEstab", -2 }, { "Tcp", "InSegs", 1 }, { "Tcp", "OutSegs", 1 },
+        { "Tcp", "OutRsts", 1 }, { 0 },
+    };
+    jouer("une connexion TCP acceptee, puis coupee par SO_LINGER", tcp_coupee, etablie, coupee);
     printf("[linux] snmp : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

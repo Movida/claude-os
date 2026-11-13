@@ -7,6 +7,10 @@
 use formats::reseau::tcp::{self, Options, Tcp};
 use inet::tcp::{self as t, Charge, Etat, Sortant, Tcb};
 
+/// Les compteurs de /proc/net/snmp de ces essais (ceux qui les lisent ont les leurs : les
+/// essais tournent en parallèle).
+static MIB: inet::snmp::Mib = inet::snmp::Mib::new();
+
 /// Le surcoût d'un paquet, comme dans le noyau.
 const SURCOUT: usize = 576;
 
@@ -76,7 +80,7 @@ fn essai(graine: u64) {
     let rcvbuf = [4_096usize, 16_384, 65_536, 131_072, 1_000_000][r.sous(5) as usize];
     let opt = Options { mss: Some(1460), echelle: echelle_lui, horodatage: ts.then_some((5, 0)), sack_permis: sack, ..Options::default() };
     let syn = Tcp { source: 40000, destination: 80, seq: isn, drapeaux: tcp::SYN, fenetre: 65535, options: opt, ..Tcp::default() };
-    let mut f: Tcb<K> = Tcb::depuis_syn(&syn, 7000, 1460, rcvbuf, 16_384, notre_echelle);
+    let mut f: Tcb<K> = Tcb::depuis_syn(&MIB, &syn, 7000, 1460, rcvbuf, 16_384, notre_echelle);
     f.rcvbuf_fixe = r.sous(2) == 0;
     f.rcvbuf_max = 6 << 20;
     f.attachee = r.sous(4) != 0;

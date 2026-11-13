@@ -35,7 +35,7 @@ use super::congestion::{Phase, TCP_REORDERING};
 use super::debit::{Chrono, TxDebit};
 use super::rtt::RTO_MAX;
 use super::sack::{JIFFY, MIN_RTT_FENETRE, en_jiffies};
-use super::{Charge, Effets, Etat, Sortant, Tcb, apres, avant, reculer};
+use super::{Charge, Compte, Effets, Etat, Sortant, Tcb, apres, avant, reculer};
 use formats::reseau::tcp;
 use faillible::FileFaillible;
 
@@ -998,7 +998,7 @@ impl<P: Charge> Tcb<P> {
         let h = self.entete(e.seq, e.drapeaux);
         let numero = self.compter_envoi(e.longueur() as usize);
         self.compter_sortie(e.longueur() as usize);
-        sortir(Sortant { entete: h, debut, longueur: e.longueur() as usize, numero });
+        sortir(Sortant { entete: h, debut, longueur: e.longueur() as usize, numero, compte: Compte::Renvoi });
         self.file[i].numero = numero;
         self.file[i].envoi = maintenant;
         self.file[i].marques = (self.file[i].marques | DEJA_RENVOYE) & !COMPTE;
@@ -1182,6 +1182,7 @@ impl<P: Charge> Tcb<P> {
         }
         if syn {
             self.syn_du = true;
+            self.syn_renvoi = true;
             self.total_retrans += 1;
             self.syn_envoi = None;
         } else {

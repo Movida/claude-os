@@ -3,6 +3,10 @@
 //! valeurs attendues viennent des formules de Linux (citées), pas de notre code.
 
 use super::*;
+
+/// Les compteurs de /proc/net/snmp de ces essais (ceux qui les lisent ont les leurs : les
+/// essais tournent en parallèle).
+pub(super) static MIB: Mib = Mib::new();
 use alloc::vec;
 
 /// La taille qu'une charge de test refuse de créer : la mémoire qui manque, à l'endroit voulu.
@@ -51,7 +55,7 @@ pub(super) fn etablie(sack: bool) -> C {
         options: tcp::Options { mss: Some(MSS as u16), sack_permis: sack, ..tcp::Options::default() },
         ..Tcp::default()
     };
-    let mut c: C = Tcb::depuis_syn(&syn, ISS, MSS as u16, 131_072, 1 << 22, 0);
+    let mut c: C = Tcb::depuis_syn(&MIB, &syn, ISS, MSS as u16, 131_072, 1 << 22, 0);
     c.emettre(HEURE, |_| {});
     let ack = Tcp { seq: 1001, ack: ISS + 1, drapeaux: tcp::ACK, fenetre: 65535, options: tcp::Options::default(), ..syn };
     c.recevoir(&ack, octets(0, 0), HEURE);
@@ -94,7 +98,7 @@ pub(super) fn fille(ts: bool) -> C {
         options: tcp::Options { mss: Some(MSS as u16), sack_permis: true, horodatage: ts.then_some((500, 0)), ..tcp::Options::default() },
         ..Tcp::default()
     };
-    let mut c: C = Tcb::depuis_syn(&syn, ISS, MSS as u16, 131_072, 1 << 22, 0);
+    let mut c: C = Tcb::depuis_syn(&MIB, &syn, ISS, MSS as u16, 131_072, 1 << 22, 0);
     c.emettre(HEURE, |_| {});
     assert_eq!(c.etat(), Etat::SynRecu);
     c
@@ -102,7 +106,7 @@ pub(super) fn fille(ts: bool) -> C {
 
 /// Une connexion en SYN_SENT, son SYN parti.
 pub(super) fn syn_envoye() -> C {
-    let mut c: C = Tcb::connecter(80, 40000, ISS, MSS as u16, 131_072, 1 << 22, 0);
+    let mut c: C = Tcb::connecter(&MIB, 80, 40000, ISS, MSS as u16, 131_072, 1 << 22, 0);
     c.emettre(HEURE, |_| {});
     c
 }

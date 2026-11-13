@@ -403,7 +403,7 @@ pub fn morceaux_permis(s: &Socket, charge: usize, envoi: &ipv4::Envoi) -> Result
 }
 
 /// Pas de route : ENETUNREACH, compté (OutNoRoutes).
-fn sans_route() -> i64 {
+pub(super) fn sans_route() -> i64 {
     const ENETUNREACH: i64 = 101;
     MIB.ip(Ip::OutNoRoutes);
     -ENETUNREACH

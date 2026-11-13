@@ -345,8 +345,9 @@ boot.bin: programmes.cpio FORCE
 #     /etc/hosts) ; sur l'hôte aussi ;
 #   - snmp : gcc -static, les compteurs de /proc/net/snmp (les soldes
 #     d'avant 6k), sur lo : le texte, un datagramme UDP vers soi, un port
-#     fermé et son erreur ICMP, le ping ; chaque scénario rejoué jusqu'à un
-#     tour sans autre trafic ; sur l'hôte aussi ;
+#     fermé et son erreur ICMP, le ping, un connect TCP refusé, une
+#     connexion TCP acceptée puis coupée (SO_LINGER) ; chaque scénario
+#     rejoué jusqu'à un tour sans autre trafic ; sur l'hôte aussi ;
 #   - tcp : gcc -static, les sockets TCP sur lo (les appels et leurs refus,
 #     les options, l'écoute et sa file, les fermetures, epoll par front,
 #     1 Mio en aller-retour entre deux fils) ; sur l'hôte aussi ;

@@ -62,6 +62,10 @@ impl Charge for Octets {
 
 type Connexion = Tcb<Octets>;
 
+/// Les compteurs de /proc/net/snmp de ces essais (ceux qui les lisent ont les leurs : les
+/// essais tournent en parallèle).
+static MIB: inet::snmp::Mib = inet::snmp::Mib::new();
+
 const MS: u64 = 1_000_000;
 const S: u64 = 1_000 * MS;
 const MSS: u16 = 1460;
@@ -193,7 +197,7 @@ impl Simulation {
         // Des numéros de séquence initiaux au hasard : ils font le tour
         // des 32 bits.
         let iss = alea.suivant() as u32;
-        let mut c = Connexion::connecter(40_000, 80, iss, MSS, 131_072, 65_536, ECHELLE);
+        let mut c = Connexion::connecter(&MIB, 40_000, 80, iss, MSS, 131_072, 65_536, ECHELLE);
         // Un essai sur deux avec les horodatages ; sans, le cas de slirp.
         if alea.sous(2) == 0 {
             c.proposer_horodatages(alea.suivant() as u32);
@@ -356,7 +360,7 @@ impl Simulation {
                 // B n'existe qu'au premier SYN (la fille d'une écoute).
                 if s.entete.drapeaux & (tcp::SYN | tcp::ACK) == tcp::SYN {
                     let iss = self.alea.suivant() as u32;
-                    let mut c = Connexion::depuis_syn(&s.entete, iss, MSS, 131_072, 65_536, ECHELLE);
+                    let mut c = Connexion::depuis_syn(&MIB, &s.entete, iss, MSS, 131_072, 65_536, ECHELLE);
                     c.decalage_horodatages(iss);
                     if self.alea.sous(2) == 0 {
                         c.poser_controle(t::Controle::Reno);

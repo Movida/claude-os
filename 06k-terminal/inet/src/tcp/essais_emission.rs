@@ -387,14 +387,14 @@ fn un_rst_et_la_suite() {
 /// Seul le premier SYN est chronométré ; un SYN-ACK porte un ACK, pas un SYN.
 #[test]
 fn les_syn_qui_partent() {
-    let mut c: C = Tcb::connecter(80, 40000, ISS, MSS as u16, 131_072, 1 << 22, 0);
+    let mut c: C = Tcb::connecter(&MIB, 80, 40000, ISS, MSS as u16, 131_072, 1 << 22, 0);
     c.ack.programme = true;
     sortants(&mut c, HEURE);
     assert_eq!(c.syn_envoi, Some(HEURE));
     assert_eq!(c.retrans_stamp, HEURE);
     assert!(c.ack.programme, "un SYN seul ne porte pas d'ACK");
     for (retransmissions, total) in [(1, 0), (0, 1)] {
-        let mut c: C = Tcb::connecter(80, 40000, ISS, MSS as u16, 131_072, 1 << 22, 0);
+        let mut c: C = Tcb::connecter(&MIB, 80, 40000, ISS, MSS as u16, 131_072, 1 << 22, 0);
         c.retransmissions = retransmissions;
         c.total_retrans = total;
         sortants(&mut c, HEURE);

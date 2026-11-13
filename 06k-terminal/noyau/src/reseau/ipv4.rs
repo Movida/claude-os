@@ -299,10 +299,14 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, diffusion: bool, tram
             }
         }
         ipv4::ICMP => super::icmp::recevoir(i, &h, diffusion, p),
-        // TCP : jamais pour une diffusion (`tcp_v4_rcv` jette tout ce qui
-        // n'est pas pour une seule machine).
-        ipv4::TCP if !diffusion => super::tcp::recevoir(h.source, h.destination, i.boucle(), p),
-        ipv4::TCP => {}
+        // TCP : jamais d'une trame pour plusieurs machines, que `tcp_v4_rcv`
+        // jette avant même InSegs (`pkt_type != PACKET_HOST` : une trame de
+        // diffusion, qu'IP livre pourtant, et qu'UDP reçoit). Une destination
+        // de diffusion dans une trame pour nous seuls passe (Linux trie la
+        // trame, pas l'adresse) : TCP la compte, et sait qu'elle n'ouvre rien
+        // (`diffusion`).
+        ipv4::TCP if trame_diffusee => {}
+        ipv4::TCP => super::tcp::recevoir(h.source, h.destination, i.boucle(), diffusion, p),
         _ => injoignable(icmp::PROTOCOLE, p),
     }
 }
