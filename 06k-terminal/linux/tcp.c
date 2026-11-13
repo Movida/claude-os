@@ -41,7 +41,9 @@
  *   - TCP_INFO jusqu'au bout : les compteurs, le débit livré, les chronomètres ;
  *   - les coupures : un FIN puis un RST, shutdown en SYN_SENT et d'une écoute,
  *     connect(AF_UNSPEC), le connect qui suit une erreur ; les lectures sans copie
- *     ni retrait ; une connexion morte qui garde son port, le SO_REUSEADDR des filles.
+ *     ni retrait ; une connexion morte qui garde son port, le SO_REUSEADDR des filles ;
+ *   - les options de SOL_IP (les soldes d'avant 6k) : IP_PKTOPTIONS, IP_MINTTL, IP_FREEBIND,
+ *     IP_BIND_ADDRESS_NO_PORT, une diffusion liée, IP_LOCAL_PORT_RANGE, IP_PROTOCOL.
  * Les valeurs comparées sont celles d'un Linux 6.18 à sa configuration par défaut, sur l'hôte (le
  * Linux de référence) comme chez nous. Les délais sont des multiples de 4 ms (le tic du noyau :
  * HZ = 250 sous WSL, 1000 sous le Linux de référence).
@@ -2236,6 +2238,180 @@ static void peek_avec_decalage(void)
     close(l);
 }
 
+/* Les messages de contrôle qu'IP_PKTOPTIONS doit rendre (`put_cmsg`, 80 octets) : IP_PKTINFO
+ * (l'interface, l'adresse locale deux fois), IP_TTL et IP_TOS (deux entiers) ; le bourrage
+ * de chacun n'est pas écrit (il garde 0x55). */
+static void pktoptions_attendues(unsigned char *o, int interface, int ttl, int tos)
+{
+    memset(o, 0x55, 80);
+    struct { uint64_t longueur; int niveau, sorte; } h;
+    uint32_t lo = htonl(INADDR_LOOPBACK);
+    h = (typeof(h)) { 28, IPPROTO_IP, IP_PKTINFO };
+    memcpy(o, &h, 16);
+    memcpy(o + 16, &interface, 4);
+    memcpy(o + 20, &lo, 4);
+    memcpy(o + 24, &lo, 4);
+    h = (typeof(h)) { 20, IPPROTO_IP, IP_TTL };
+    memcpy(o + 32, &h, 16);
+    memcpy(o + 48, &ttl, 4);
+    h = (typeof(h)) { 20, IPPROTO_IP, IP_TOS };
+    memcpy(o + 56, &h, 16);
+    memcpy(o + 72, &tos, 4);
+}
+
+static int poser(int s, int option, int v)
+{
+    return setsockopt(s, IPPROTO_IP, option, &v, sizeof v);
+}
+
+static int adresse_de(int s, uint32_t *ip)
+{
+    struct sockaddr_in a = { 0 };
+    socklen_t l = sizeof a;
+    getsockname(s, (void *)&a, &l);
+    *ip = ntohl(a.sin_addr.s_addr);
+    return ntohs(a.sin_port);
+}
+
+/* Les options de SOL_IP d'une socket TCP (les soldes d'avant 6k, Linux 6.18 mesuré) :
+ * IP_RECVFRAGSIZE et IP_MULTICAST_TTL refusées (un flux) ; IP_PKTOPTIONS, les messages de
+ * contrôle qu'aurait un segment reçu (le client : interface 0, TTL 1, TOS 0 ; la fille :
+ * ceux du dernier segment de sa poignée de main) ; IP_MINTTL, qui jette les SYN et les
+ * segments d'un TTL plus petit ; IP_FREEBIND, IP_BIND_ADDRESS_NO_PORT, une adresse de
+ * diffusion liée (`connect` prend la source de sa route) ; IP_LOCAL_PORT_RANGE et
+ * IP_PROTOCOL. */
+static void sol_ip(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(poser(s, IP_RECVFRAGSIZE, 1) < 0 && errno == EINVAL && poser(s, IP_MULTICAST_TTL, 2) < 0 && errno == EINVAL
+                 && option(s, IPPROTO_IP, IP_MULTICAST_TTL) == 1 && option(s, IPPROTO_IP, IP_PROTOCOL) == 0,
+             "IP_RECVFRAGSIZE et IP_MULTICAST_TTL : EINVAL (un flux) ; IP_PROTOCOL sans port : 0");
+    unsigned char o[96], attendu[80];
+    socklen_t n = sizeof o;
+    verifier(getsockopt(s, IPPROTO_IP, IP_PKTOPTIONS, o, &n) == 0 && n == 0, "IP_PKTOPTIONS sans drapeau : rien");
+    /* IP_TOS de 256 : l'octet reste 0, mais l'entier diffère de l'ancien
+     * octet (`__ip_sock_set_tos` les compare) : SO_PRIORITY suit, 0. */
+    int trois = 3;
+    setsockopt(s, SOL_SOCKET, SO_PRIORITY, &trois, sizeof trois);
+    verifier(poser(s, IP_TOS, 256) == 0 && option(s, SOL_SOCKET, SO_PRIORITY) == 0 && option(s, IPPROTO_IP, IP_TOS) == 0,
+             "IP_TOS de 256 : TOS 0, SO_PRIORITY 0 (l'entier compare)");
+    close(s);
+
+    int port, l = ecoute(&port, 4), c = socket(AF_INET, SOCK_STREAM, 0);
+    for (int i = 0; i < 2; i++) {
+        poser(i ? c : l, IP_PKTINFO, 1);
+        poser(i ? c : l, IP_RECVTTL, 1);
+        poser(i ? c : l, IP_RECVTOS, 1);
+    }
+    poser(c, IP_TTL, 40);
+    poser(c, IP_TOS, 0x20);
+    struct sockaddr_in x = lo(port);
+    connect(c, (void *)&x, sizeof x);
+    int f = accept(l, NULL, NULL);
+    memset(o, 0x55, sizeof o);
+    n = sizeof o;
+    pktoptions_attendues(attendu, 0, 1, 0);
+    int ok = getsockopt(c, IPPROTO_IP, IP_PKTOPTIONS, o, &n) == 0 && n == 80 && memcmp(o, attendu, 80) == 0;
+    memset(o, 0x55, sizeof o);
+    n = sizeof o;
+    pktoptions_attendues(attendu, 1, 40, 0x20);
+    ok = ok && getsockopt(f, IPPROTO_IP, IP_PKTOPTIONS, o, &n) == 0 && n == 80 && memcmp(o, attendu, 80) == 0;
+    n = 8;
+    verifier(ok && getsockopt(f, IPPROTO_IP, IP_PKTOPTIONS, o, &n) == 0 && n == 0 && option(f, IPPROTO_IP, IP_MULTICAST_TTL) == 40
+                 && option(c, IPPROTO_IP, IP_PROTOCOL) == port_de(c) && option(f, IPPROTO_IP, IP_PROTOCOL) == port,
+             "IP_PKTOPTIONS : client (interface 0, TTL 1, TOS 0), fille (lo, TTL 40 et TOS 0x20 de la poignee de main), "
+             "trop court : rien ; IP_PROTOCOL : le port");
+
+    /* IP_MINTTL de la fille (héritée de l'écoute, posée après) : un segment de TTL 40 est
+     * jeté ; repris à TTL 255, il passe. */
+    poser(f, IP_MINTTL, 255);
+    send(c, "x", 1, 0);
+    struct pollfd p = { f, POLLIN, 0 };
+    ok = poll(&p, 1, 300) == 0;
+    poser(c, IP_TTL, 255);
+    verifier(ok && poll(&p, 1, 3000) == 1 && option(f, IPPROTO_IP, IP_MINTTL) == 255,
+             "IP_MINTTL 255 : un segment de TTL 40 jete, sa reprise a TTL 255 passe");
+    close(c);
+    close(f);
+    /* Celle de l'écoute : ses SYN. */
+    poser(l, IP_MINTTL, 255);
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    poser(c, IP_TTL, 64);
+    connect(c, (void *)&x, sizeof x);
+    p = (struct pollfd) { c, POLLOUT, 0 };
+    ok = poll(&p, 1, 300) == 0;
+    poser(c, IP_TTL, 255);
+    verifier(ok && poll(&p, 1, 3000) == 1 && option(c, SOL_SOCKET, SO_ERROR) == 0,
+             "IP_MINTTL 255 d'une ecoute : un SYN de TTL 64 jete, sa reprise a TTL 255 passe");
+    close(c);
+    close(l);
+
+    /* IP_FREEBIND : bind d'une adresse qui n'est pas à nous ; connect depuis elle : ENETUNREACH. */
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_addr.s_addr = htonl(0xc0000201) };
+    int r = bind(s, (void *)&d, sizeof d) < 0 ? errno : 0;
+    poser(s, IP_FREEBIND, 1);
+    uint32_t ip;
+    l = ecoute(&port, 4);
+    x = lo(port);
+    verifier(r == EADDRNOTAVAIL && bind(s, (void *)&d, sizeof d) == 0 && adresse_de(s, &ip) != 0 && ip == 0xc0000201
+                 && connect(s, (void *)&x, sizeof x) < 0 && errno == ENETUNREACH,
+             "IP_FREEBIND : bind de 192.0.2.1 (EADDRNOTAVAIL sans lui), connect : ENETUNREACH");
+    close(s);
+    /* Une diffusion liée : connect prend la source de sa route, garde le port. */
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    d.sin_addr.s_addr = htonl(0xffffffff);
+    int pd = bind(s, (void *)&d, sizeof d) == 0 ? adresse_de(s, &ip) : 0;
+    ok = pd != 0 && ip == 0xffffffff;
+    verifier(ok && connect(s, (void *)&x, sizeof x) == 0 && adresse_de(s, &ip) == pd && ip == INADDR_LOOPBACK,
+             "bind de 255.255.255.255 : permis ; connect, de 127.0.0.1 et du meme port");
+    close(s);
+
+    /* IP_BIND_ADDRESS_NO_PORT : l'adresse sans port ; le port à listen, ou à connect ; la
+     * déconnexion garde l'adresse. */
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    poser(s, IP_BIND_ADDRESS_NO_PORT, 1);
+    struct sockaddr_in b = lo(0);
+    ok = bind(s, (void *)&b, sizeof b) == 0 && adresse_de(s, &ip) == 0 && ip == INADDR_LOOPBACK && bind(s, (void *)&b, sizeof b) == 0;
+    verifier(ok && listen(s, 1) == 0 && adresse_de(s, &ip) != 0 && ip == INADDR_LOOPBACK,
+             "IP_BIND_ADDRESS_NO_PORT : bind sans port (deux fois), le port a listen");
+    close(s);
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    poser(s, IP_BIND_ADDRESS_NO_PORT, 1);
+    bind(s, (void *)&b, sizeof b);
+    struct sockaddr u = { .sa_family = AF_UNSPEC };
+    ok = connect(s, (void *)&x, sizeof x) == 0 && adresse_de(s, &ip) != 0 && ip == INADDR_LOOPBACK;
+    verifier(ok && connect(s, &u, sizeof u) == 0 && (adresse_de(s, &ip), ip == INADDR_LOOPBACK),
+             "IP_BIND_ADDRESS_NO_PORT : le port a connect ; deconnectee, l'adresse reste");
+    close(s);
+    close(l);
+
+    /* IP_LOCAL_PORT_RANGE : bind(0) prend l'impair, puis le pair ; connect, chaque port. */
+    int t[3];
+    for (int i = 0; i < 3; i++) {
+        t[i] = socket(AF_INET, SOCK_STREAM, 0);
+        poser(t[i], IP_LOCAL_PORT_RANGE, 40000 | 40001 << 16);
+    }
+    b = lo(0);
+    ok = bind(t[0], (void *)&b, sizeof b) == 0 && port_de(t[0]) == 40001 && bind(t[1], (void *)&b, sizeof b) == 0 && port_de(t[1]) == 40000;
+    verifier(ok && bind(t[2], (void *)&b, sizeof b) < 0 && errno == EADDRINUSE && option(t[0], IPPROTO_IP, IP_PROTOCOL) == 40001,
+             "IP_LOCAL_PORT_RANGE 40000-40001 : bind(0) prend 40001, puis 40000, puis EADDRINUSE");
+    for (int i = 0; i < 3; i++)
+        close(t[i]);
+    l = ecoute(&port, 4);
+    x = lo(port);
+    for (int i = 0; i < 3; i++) {
+        t[i] = socket(AF_INET, SOCK_STREAM, 0);
+        poser(t[i], IP_LOCAL_PORT_RANGE, 40002 | 40003 << 16);
+    }
+    ok = connect(t[0], (void *)&x, sizeof x) == 0 && connect(t[1], (void *)&x, sizeof x) == 0 && port_de(t[0]) + port_de(t[1]) == 80005;
+    verifier(ok && connect(t[2], (void *)&x, sizeof x) < 0 && errno == EADDRNOTAVAIL,
+             "IP_LOCAL_PORT_RANGE 40002-40003 : connect prend les deux, puis EADDRNOTAVAIL");
+    for (int i = 0; i < 3; i++)
+        close(t[i]);
+    close(l);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -2283,6 +2459,7 @@ int main(void)
     morte_mais_tenue();
     herites();
     peek_avec_decalage();
+    sol_ip();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

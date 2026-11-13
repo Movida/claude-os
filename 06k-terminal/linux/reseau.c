@@ -47,7 +47,10 @@
  *     pas), SIOCOUTQ le voit grandir, plus de 65 507 octets en tout le
  *     vident (EMSGSIZE, l'erreur locale), un shutdown ne l'arrête pas, une
  *     déconnexion lui laisse le port d'alors (0 sans nouvel envoi), close
- *     le perd, sendfile bouche ses rondes et pousse à la fin du fichier.
+ *     le perd, sendfile bouche ses rondes et pousse à la fin du fichier ;
+ *   - les options de SOL_IP (les soldes d'avant 6k), une à une, pour UDP et
+ *     ping, puis IP_FREEBIND (et la source qui n'est pas à nous :
+ *     ENETUNREACH), IP_BIND_ADDRESS_NO_PORT, IP_LOCAL_PORT_RANGE.
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic du noyau : HZ = 250 sous WSL, 1000 sous le Linux de référence).
  */
@@ -776,6 +779,11 @@ static void routes_et_messages(void)
     val = 0;
     setsockopt(s, IPPROTO_IP, IP_TOS, &val, sizeof val);
     verifier(getsockopt(s, SOL_SOCKET, SO_PRIORITY, &val, &l) == 0 && val == 3, "IP_TOS sans changement : SO_PRIORITY garde 3");
+    /* IP_TOS de 256 : l'octet reste 0, mais l'entier diffère de l'ancien
+     * octet (`__ip_sock_set_tos` les compare) : SO_PRIORITY suit, 0. */
+    val = 256;
+    setsockopt(s, IPPROTO_IP, IP_TOS, &val, sizeof val);
+    verifier(getsockopt(s, SOL_SOCKET, SO_PRIORITY, &val, &l) == 0 && val == 0, "IP_TOS de 256 : SO_PRIORITY 0 (l'entier compare)");
 
     /* Les messages de contrôle : au-delà d'optmem_max, ENOBUFS ; une place
      * fautive en réception est ignorée ; MSG_CMSG_CLOEXEC rendu. */
@@ -1455,6 +1463,194 @@ static void bouchon(void)
     close(rb);
 }
 
+/* Une option de SOL_IP lue dans un entier : sa valeur, ou -1000 - errno. */
+static int lire_ip(int s, int option)
+{
+    int v = -7777;
+    socklen_t l = sizeof v;
+    if (getsockopt(s, IPPROTO_IP, option, &v, &l) != 0)
+        return -1000 - errno;
+    return v;
+}
+
+static int poser_ip(int s, int option, int v, socklen_t l)
+{
+    return erreur(setsockopt(s, IPPROTO_IP, option, &v, l));
+}
+
+/* Un envoi vers 127.0.0.1:9 depuis la source `source` d'IP_PKTINFO. */
+static int envoyer_depuis(int s, uint32_t source)
+{
+    struct sockaddr_in d = adresse(LO, 9);
+    char c[CMSG_SPACE(sizeof(struct in_pktinfo))] = { 0 };
+    struct iovec v = { "x", 1 };
+    struct msghdr m = { .msg_name = &d, .msg_namelen = sizeof d, .msg_iov = &v, .msg_iovlen = 1, .msg_control = c, .msg_controllen = sizeof c };
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = IPPROTO_IP;
+    h->cmsg_type = IP_PKTINFO;
+    h->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+    ((struct in_pktinfo *)CMSG_DATA(h))->ipi_spec_dst.s_addr = htonl(source);
+    return erreur(sendmsg(s, &m, 0));
+}
+
+static uint16_t port_local(int s, uint32_t *ip)
+{
+    struct sockaddr_in a = { 0 };
+    socklen_t l = sizeof a;
+    getsockname(s, (struct sockaddr *)&a, &l);
+    if (ip)
+        *ip = ntohl(a.sin_addr.s_addr);
+    return ntohs(a.sin_port);
+}
+
+/* Les options de SOL_IP (les soldes d'avant 6k : `do_ip_setsockopt` et
+ * `do_ip_getsockopt` de Linux 6.18, mesurés option par option, UDP et ping
+ * ensemble ; TCP dans linux/tcp.c), puis leurs effets : IP_FREEBIND et la
+ * source qui n'est pas à nous, IP_BIND_ADDRESS_NO_PORT, IP_LOCAL_PORT_RANGE,
+ * IP_PROTOCOL. */
+static void sol_ip(void)
+{
+    int racine = getuid() == 0;
+    int q = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    for (int k = 0; k < 2; k++) {
+        int s = k ? q : udp(0);
+        const char *qui = k ? "ping" : "UDP";
+        char quoi[160];
+        if (s < 0)
+            continue;
+        /* Les drapeaux : 0, puis 1 en entier, en octet ; une longueur nulle vaut 0. */
+        static const int drapeaux[] = { IP_RECVOPTS, IP_RETOPTS, IP_RECVTTL, IP_RECVTOS, IP_PASSSEC, IP_RECVORIGDSTADDR,
+                                        IP_CHECKSUM, IP_BIND_ADDRESS_NO_PORT, IP_RECVFRAGSIZE, IP_RECVERR_RFC4884, IP_FREEBIND };
+        int ok = 1;
+        for (unsigned i = 0; i < sizeof drapeaux / sizeof *drapeaux; i++) {
+            int o = drapeaux[i];
+            unsigned char un = 1;
+            ok = ok && lire_ip(s, o) == 0 && poser_ip(s, o, 1, 4) == 0 && lire_ip(s, o) == 1 && poser_ip(s, o, 0, 4) == 0
+                 && setsockopt(s, IPPROTO_IP, o, &un, 1) == 0 && lire_ip(s, o) == 1;
+            /* Longueur nulle : 0, sauf IP_FREEBIND (EINVAL, sans rien changer). */
+            int z = setsockopt(s, IPPROTO_IP, o, &un, 0) == 0 ? 0 : errno;
+            ok = ok && (o == IP_FREEBIND ? z == EINVAL && lire_ip(s, o) == 1 : z == 0 && lire_ip(s, o) == 0);
+            if (o == IP_FREEBIND)
+                poser_ip(s, o, 0, 4);
+            if (!ok) {
+                printf("[linux] reseau : %s, option %d\n", qui, o);
+                break;
+            }
+        }
+        snprintf(quoi, sizeof quoi, "%s : les drapeaux de SOL_IP, 0, poses en entier et en octet, une longueur nulle", qui);
+        verifier(ok, quoi);
+        snprintf(quoi, sizeof quoi, "%s : IP_HDRINCL et IP_NODEFRAG : ENOPROTOOPT (pas une socket brute), relus 0", qui);
+        verifier(poser_ip(s, IP_HDRINCL, 1, 4) == ENOPROTOOPT && poser_ip(s, IP_NODEFRAG, 1, 0) == ENOPROTOOPT && lire_ip(s, IP_HDRINCL) == 0
+                     && lire_ip(s, IP_NODEFRAG) == 0, quoi);
+        snprintf(quoi, sizeof quoi, "%s : IP_ROUTER_ALERT : EINVAL, meme de longueur nulle ; EFAULT avant ; relu 0", qui);
+        verifier(poser_ip(s, IP_ROUTER_ALERT, 1, 4) == EINVAL && poser_ip(s, IP_ROUTER_ALERT, 0, 0) == EINVAL
+                     && erreur(setsockopt(s, IPPROTO_IP, IP_ROUTER_ALERT, (void *)8, 4)) == EFAULT && lire_ip(s, IP_ROUTER_ALERT) == 0,
+                 quoi);
+        snprintf(quoi, sizeof quoi, "%s : IP_PKTOPTIONS : ENOPROTOOPT (TCP seul)", qui);
+        verifier(poser_ip(s, IP_PKTOPTIONS, 1, 4) == ENOPROTOOPT && lire_ip(s, IP_PKTOPTIONS) == -1000 - ENOPROTOOPT, quoi);
+        snprintf(quoi, sizeof quoi, "%s : IP_IPSEC_POLICY et IP_XFRM_POLICY : %s ; relues : ENOPROTOOPT", qui, racine ? "ENOPROTOOPT" : "EPERM");
+        int attendu = racine ? ENOPROTOOPT : EPERM;
+        verifier(poser_ip(s, IP_IPSEC_POLICY, 0, 0) == attendu && poser_ip(s, IP_XFRM_POLICY, 1, 4) == attendu
+                     && lire_ip(s, IP_IPSEC_POLICY) == -1000 - ENOPROTOOPT && lire_ip(s, IP_XFRM_POLICY) == -1000 - ENOPROTOOPT,
+                 quoi);
+        if (!racine) {
+            snprintf(quoi, sizeof quoi, "%s : IP_TRANSPARENT 1 : EPERM (avant la longueur) ; 0 : permis ; longueur nulle : EINVAL", qui);
+            verifier(poser_ip(s, IP_TRANSPARENT, 1, 4) == EPERM && poser_ip(s, IP_TRANSPARENT, 1, 0) == EINVAL
+                         && poser_ip(s, IP_TRANSPARENT, 0, 4) == 0 && lire_ip(s, IP_TRANSPARENT) == 0,
+                     quoi);
+        }
+        snprintf(quoi, sizeof quoi, "%s : IP_MINTTL : 0 a 255, longueur nulle : EINVAL", qui);
+        verifier(poser_ip(s, IP_MINTTL, 256, 4) == EINVAL && poser_ip(s, IP_MINTTL, -1, 4) == EINVAL && poser_ip(s, IP_MINTTL, 9, 0) == EINVAL
+                     && poser_ip(s, IP_MINTTL, 255, 4) == 0 && lire_ip(s, IP_MINTTL) == 255,
+                 quoi);
+        snprintf(quoi, sizeof quoi, "%s : IP_RECVERR_RFC4884 2 : EINVAL", qui);
+        verifier(poser_ip(s, IP_RECVERR_RFC4884, 2, 4) == EINVAL, quoi);
+        snprintf(quoi, sizeof quoi, "%s : IP_MULTICAST_TTL : 1, -1 le defaut, 256 et une longueur nulle : EINVAL", qui);
+        verifier(lire_ip(s, IP_MULTICAST_TTL) == 1 && poser_ip(s, IP_MULTICAST_TTL, 7, 4) == 0 && lire_ip(s, IP_MULTICAST_TTL) == 7
+                     && poser_ip(s, IP_MULTICAST_TTL, -1, 4) == 0 && lire_ip(s, IP_MULTICAST_TTL) == 1
+                     && poser_ip(s, IP_MULTICAST_TTL, 256, 4) == EINVAL && poser_ip(s, IP_MULTICAST_TTL, 3, 0) == EINVAL,
+                 quoi);
+        snprintf(quoi, sizeof quoi, "%s : IP_LOCAL_PORT_RANGE : 4 octets, bas <= haut ; relue telle quelle", qui);
+        verifier(poser_ip(s, IP_LOCAL_PORT_RANGE, 0, 1) == EINVAL && poser_ip(s, IP_LOCAL_PORT_RANGE, 0, 8) == EINVAL
+                     && poser_ip(s, IP_LOCAL_PORT_RANGE, 50000 | 40000 << 16, 4) == EINVAL
+                     && poser_ip(s, IP_LOCAL_PORT_RANGE, (int)(32770u << 16), 4) == 0 && lire_ip(s, IP_LOCAL_PORT_RANGE) == (int)0x80020000,
+                 quoi);
+        /* Le routage de la multidiffusion (MRT_INIT, 200) : EOPNOTSUPP, sans lire la longueur ni la valeur. */
+        int v;
+        snprintf(quoi, sizeof quoi, "%s : MRT_INIT : EOPNOTSUPP, avant la longueur et la valeur", qui);
+        verifier(erreur(getsockopt(s, IPPROTO_IP, 200, &v, NULL)) == EOPNOTSUPP && erreur(setsockopt(s, IPPROTO_IP, 212, NULL, 4)) == EOPNOTSUPP
+                     && lire_ip(s, 213) == -1000 - ENOPROTOOPT,
+                 quoi);
+        snprintf(quoi, sizeof quoi, "%s : une valeur fautive : EFAULT ; IP_PROTOCOL ne se pose pas", qui);
+        verifier(erreur(setsockopt(s, IPPROTO_IP, IP_RECVTTL, (void *)8, 4)) == EFAULT && poser_ip(s, IP_PROTOCOL, 17, 4) == ENOPROTOOPT, quoi);
+        if (k == 0)
+            close(s);
+    }
+
+    /* IP_FREEBIND : bind d'une adresse qui n'est pas à nous ; envoyer ou se
+     * connecter depuis elle : ENETUNREACH (sa route). */
+    int s = udp(0);
+    struct sockaddr_in a = adresse(DOC, 0), d = adresse(LO, 9);
+    int r = erreur(bind(s, (struct sockaddr *)&a, sizeof a));
+    poser_ip(s, IP_FREEBIND, 1, 4);
+    uint32_t ip;
+    verifier(r == EADDRNOTAVAIL && bind(s, (struct sockaddr *)&a, sizeof a) == 0 && port_local(s, &ip) != 0 && ip == DOC,
+             "IP_FREEBIND : bind de 192.0.2.1 (EADDRNOTAVAIL sans lui)");
+    verifier(erreur(sendto(s, "x", 1, 0, (struct sockaddr *)&d, sizeof d)) == ENETUNREACH
+                 && erreur(connect(s, (struct sockaddr *)&d, sizeof d)) == ENETUNREACH,
+             "IP_FREEBIND : sendto et connect depuis 192.0.2.1 : ENETUNREACH");
+    close(s);
+    s = udp(0);
+    verifier(envoyer_depuis(s, DOC) == ENETUNREACH && envoyer_depuis(s, 0x00010203) == ENETUNREACH && envoyer_depuis(s, 0xe0000001) == EINVAL
+                 && envoyer_depuis(s, 0xffffffff) == EINVAL && envoyer_depuis(s, LO + 1) == 0,
+             "IP_PKTINFO d'une source : pas a nous, ENETUNREACH ; multidiffusion ou diffusion, EINVAL ; 127.0.0.2, permise");
+    close(s);
+    if (q >= 0) {
+        int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        struct sockaddr_in m = adresse(0xe0000001, 0);
+        poser_ip(p, IP_FREEBIND, 1, 4);
+        verifier(bind(p, (struct sockaddr *)&m, sizeof m) < 0 && errno == EADDRNOTAVAIL && bind(p, (struct sockaddr *)&a, sizeof a) == 0,
+                 "ping et IP_FREEBIND : 192.0.2.1 permise, une multidiffusion non");
+        close(p);
+        close(q);
+    }
+
+    /* IP_BIND_ADDRESS_NO_PORT : bind sans port ; un second bind est permis ;
+     * le port vient au connect, la déconnexion le rend et garde l'adresse. */
+    s = udp(0);
+    poser_ip(s, IP_BIND_ADDRESS_NO_PORT, 1, 4);
+    a = adresse(LO, 0);
+    int ok = bind(s, (struct sockaddr *)&a, sizeof a) == 0 && port_local(s, &ip) == 0 && ip == LO && lire_ip(s, IP_PROTOCOL) == 0
+             && bind(s, (struct sockaddr *)&a, sizeof a) == 0;
+    uint16_t pc = connect(s, (struct sockaddr *)&d, sizeof d) == 0 ? port_local(s, &ip) : 0;
+    ok = ok && pc != 0 && ip == LO && lire_ip(s, IP_PROTOCOL) == pc;
+    struct sockaddr u = { .sa_family = AF_UNSPEC };
+    verifier(ok && connect(s, &u, sizeof u) == 0 && port_local(s, &ip) == 0 && ip == LO,
+             "IP_BIND_ADDRESS_NO_PORT : bind sans port (deux fois), le port au connect, rendu a la deconnexion");
+    close(s);
+
+    /* IP_LOCAL_PORT_RANGE : le port éphémère dans la plage de la socket ;
+     * une plage hors de celle du système est ignorée. */
+    int t[3];
+    for (int i = 0; i < 3; i++) {
+        t[i] = udp(0);
+        poser_ip(t[i], IP_LOCAL_PORT_RANGE, 40000 | 40001 << 16, 4);
+    }
+    a = adresse(0, 0);
+    r = erreur(bind(t[0], (struct sockaddr *)&a, sizeof a)) + erreur(bind(t[1], (struct sockaddr *)&a, sizeof a));
+    uint16_t p0 = port_local(t[0], NULL), p1 = port_local(t[1], NULL);
+    verifier(r == 0 && p0 + p1 == 80001 && erreur(bind(t[2], (struct sockaddr *)&a, sizeof a)) == EADDRINUSE
+                 && lire_ip(t[0], IP_PROTOCOL) == p0,
+             "IP_LOCAL_PORT_RANGE 40000-40001 : deux ports, puis EADDRINUSE ; IP_PROTOCOL, le port");
+    for (int i = 0; i < 3; i++)
+        close(t[i]);
+    s = udp(0);
+    poser_ip(s, IP_LOCAL_PORT_RANGE, 1000 | 2000 << 16, 4);
+    uint16_t p2 = connect(s, (struct sockaddr *)&d, sizeof d) == 0 ? port_local(s, NULL) : 0;
+    verifier(p2 >= 32768 && p2 <= 60999, "IP_LOCAL_PORT_RANGE 1000-2000 : ignoree, le port dans 32768-60999");
+    close(s);
+}
+
 int main(void)
 {
     creation();
@@ -1472,6 +1668,7 @@ int main(void)
     diffusion_de_la_carte();
     sndbuf_attend();
     bouchon();
+    sol_ip();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

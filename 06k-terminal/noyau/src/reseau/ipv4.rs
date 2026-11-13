@@ -306,7 +306,7 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, diffusion: bool, tram
         // trame, pas l'adresse) : TCP la compte, et sait qu'elle n'ouvre rien
         // (`diffusion`).
         ipv4::TCP if trame_diffusee => {}
-        ipv4::TCP => super::tcp::recevoir(h.source, h.destination, i.boucle(), diffusion, p),
+        ipv4::TCP => super::tcp::recevoir(&h, i, diffusion, p),
         _ => injoignable(icmp::PROTOCOLE, p),
     }
 }

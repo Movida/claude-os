@@ -262,6 +262,38 @@ pub struct Options {
     pub pmtudisc: u8,
     /// UDP_CORK : tout envoi bouche la socket (udp.rs, `Bouchon`).
     pub udp_cork: bool,
+    /// Les drapeaux de SOL_IP qui demandent un message de contrôle à la
+    /// réception (IP_RECVTTL, IP_RECVTOS, IP_RECVOPTS, IP_RETOPTS,
+    /// IP_PASSSEC, IP_RECVORIGDSTADDR, IP_CHECKSUM, IP_RECVFRAGSIZE), et
+    /// IP_RECVERR_RFC4884 (les extensions d'une erreur ICMP en file).
+    pub recvttl: bool,
+    pub recvtos: bool,
+    pub recvopts: bool,
+    pub retopts: bool,
+    pub passsec: bool,
+    pub origdstaddr: bool,
+    pub checksum: bool,
+    pub recvfragsize: bool,
+    pub rfc4884: bool,
+    /// IP_FREEBIND et IP_TRANSPARENT : `bind` d'une adresse qui n'est pas à
+    /// nous (`inet_can_nonlocal_bind`) ; IP_TRANSPARENT envoie aussi depuis
+    /// elle (FLOWI_FLAG_ANYSRC).
+    pub freebind: bool,
+    pub transparent: bool,
+    /// IP_BIND_ADDRESS_NO_PORT : `bind(adresse, 0)` ne prend pas de port ;
+    /// il viendra au premier envoi ou au `connect`.
+    pub bind_no_port: bool,
+    /// IP_MINTTL (TCP) : un segment reçu de TTL plus petit est jeté.
+    pub minttl: u8,
+    /// IP_LOCAL_PORT_RANGE, tel que donné (inet::ports::plage).
+    pub local_port_range: u32,
+    /// Le TTL des paquets de multidiffusion (`mc_ttl`, 1), l'index de leur
+    /// interface (`mc_index`, 0), et le TOS reçu (`rcv_tos`) : une fille de
+    /// TCP prend les trois du dernier segment de sa poignée de main
+    /// (`tcp_v4_syn_recv_sock`), que rend IP_PKTOPTIONS.
+    pub mc_ttl: u8,
+    pub mc_index: u32,
+    pub rcv_tos: u8,
 }
 
 impl Options {
@@ -269,7 +301,9 @@ impl Options {
         reuseaddr: false, reuseport: false, broadcast: false, keepalive: false, debug: false, dontroute: false,
         oobinline: false, no_check: false, priority: 0, linger: (false, 0), rcvlowat: 1,
         rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, recverr: false, pmtudisc: 1,
-        udp_cork: false,
+        udp_cork: false, recvttl: false, recvtos: false, recvopts: false, retopts: false, passsec: false,
+        origdstaddr: false, checksum: false, recvfragsize: false, rfc4884: false, freebind: false, transparent: false,
+        bind_no_port: false, minttl: 0, local_port_range: 0, mc_ttl: 1, mc_index: 0, rcv_tos: 0,
     };
 }
 

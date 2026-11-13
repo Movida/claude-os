@@ -8,7 +8,7 @@ const LO: [u8; 4] = [127, 0, 0, 1];
 const TOUT: [u8; 4] = [0; 4];
 
 fn lien(adresse: [u8; 4], port: u16) -> Lien {
-    Lien { sorte: Sorte::Liee, adresse, port, distante: TOUT, port_distant: 0, reuseaddr: false, reuseport: false, uid: 1000, par_connect: false }
+    Lien { sorte: Sorte::Liee, adresse, port, distante: TOUT, port_distant: 0, reuseaddr: false, reuseport: false, uid: 1000, par_connect: false, plage: 0 }
 }
 
 fn table() -> Table<u32> {
@@ -189,8 +189,26 @@ fn une_morte_garde_son_port() {
     assert_eq!(t.lier(3, lien(LO, 8080), 3, 0), Ok(8080));
 }
 
+/// IP_LOCAL_PORT_RANGE : `bind(0)` y prend l'impair, puis le pair ;
+/// `connect` y prend chaque port, de un en un, sans parité.
+#[test]
+fn plage_d_une_socket() {
+    let plage = 40000 | 40001 << 16;
+    let mut t = table();
+    let l = Lien { plage, ..lien(TOUT, 0) };
+    assert_eq!(t.lier(1, l, 1, 0x1234_5678), Ok(40001));
+    assert_eq!(t.lier(2, l, 2, 0x8765_4321), Ok(40000));
+    assert_eq!(t.lier(3, l, 3, 7), Err(Refus::Pris));
+    let mut t = table();
+    let a = t.connecter(1, LO, LO, 80, Lien { plage, ..lien(LO, 0) }, 1, 0x1234_5678_9abc, 3, |_, _| false).unwrap();
+    let b = t.connecter(2, LO, LO, 80, Lien { plage, ..lien(LO, 0) }, 2, 0x1234_5678_9abc, 5, |_, _| false).unwrap();
+    assert!(a != b && (40000..=40001).contains(&a) && (40000..=40001).contains(&b), "{} {}", a, b);
+    assert_eq!(t.connecter(3, LO, LO, 80, Lien { plage, ..lien(LO, 0) }, 3, 0x1234_5678_9abc, 7, |_, _| false), Err(Refus::Pris));
+}
+
 /// SO_REUSEADDR : `bind(0)` cherche d'abord dans la moitié basse de la
-/// plage (`attempt_half`), puis dans la haute.
+/// plage (`attempt_half`), puis dans la haute ; quatre ports se coupent en
+/// deux, trois non.
 #[test]
 fn bind_avec_reuseaddr() {
     let mut t = table();
@@ -198,4 +216,14 @@ fn bind_avec_reuseaddr() {
         let port = t.lier(n, Lien { reuseaddr: true, ..lien(LO, 0) }, n as u32, (n * 7919) as u32).unwrap();
         assert!(port % 2 == 1 && (EPHEMERE_MIN..32768 + 14116).contains(&port), "{}", port);
     }
+    let mut t = table();
+    let l = Lien { reuseaddr: true, plage: 40000 | 40003 << 16, ..lien(LO, 0) };
+    let ports: Vec<u16> = (1..=4u64).map(|n| t.lier(n, l, n as u32, 0xffff_ffff).unwrap()).collect();
+    assert_eq!(ports, [40001, 40000, 40003, 40002]);
+    assert_eq!(t.lier(5, l, 5, 0), Err(Refus::Pris));
+    let mut t = table();
+    let l = Lien { reuseaddr: true, plage: 40000 | 40002 << 16, ..lien(LO, 0) };
+    assert_eq!(t.lier(1, l, 1, 0), Ok(40001));
+    assert_eq!(t.lier(2, l, 2, 0), Ok(40000));
+    assert_eq!(t.lier(3, l, 3, 0), Err(Refus::Pris), "le dernier d'une plage impaire n'est pas pris");
 }

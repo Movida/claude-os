@@ -10,7 +10,8 @@
 //!     deux 0.0.0.0) est refusé (EADDRINUSE), sauf si les deux ont
 //!     SO_REUSEADDR, ou SO_REUSEPORT et le même utilisateur. Le port 0
 //!     demande un port ÉPHÉMÈRE, au hasard dans la plage (32768 à 60999,
-//!     `ip_local_port_range`), comme Linux : un premier port tiré, puis des
+//!     `ip_local_port_range`, ou celle d'IP_LOCAL_PORT_RANGE, `plage`),
+//!     comme Linux : un premier port tiré, puis des
 //!     pas d'un multiple impair et tiré de la taille de la table, dans la
 //!     même classe (modulo la taille), puis la classe suivante : tous les
 //!     ports sont essayés, dans un ordre qu'un autre ne peut pas deviner
@@ -44,6 +45,29 @@ pub const EPHEMERE_MAX: u16 = 60999;
 /// (`ip_unprivileged_port_start`).
 pub const PRIVILEGIE: u16 = 1024;
 
+/// La plage des ports éphémères d'une socket (`inet_sk_get_local_port_range`),
+/// d'après son IP_LOCAL_PORT_RANGE `reglage` (le bas dans les 16 bits bas,
+/// le haut dans les hauts ; 0 : aucun) : chaque borne n'est prise que si elle
+/// tombe dans celle du système, le bas d'abord, le haut ensuite comparé au
+/// bas déjà pris (une borne hors plage est ignorée, sans erreur : mesuré,
+/// 1000-2000 donne toute la plage, 0-32770 donne 32768-32770). Rend le bas,
+/// le haut, et si la socket a sa plage à elle (TCP en change sa façon de
+/// chercher : `__inet_hash_connect`). Partagée avec la table de TCP.
+pub fn plage(reglage: u32) -> (u32, u32, bool) {
+    let (mut bas, mut haut) = (EPHEMERE_MIN as u32, EPHEMERE_MAX as u32);
+    if reglage == 0 {
+        return (bas, haut, false);
+    }
+    let (b, h) = (reglage & 0xFFFF, reglage >> 16);
+    if (bas..=haut).contains(&b) {
+        bas = b;
+    }
+    if (bas..=haut).contains(&h) {
+        haut = h;
+    }
+    (bas, haut, true)
+}
+
 /// Où est liée une socket.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Lien {
@@ -55,6 +79,8 @@ pub struct Lien {
     pub reuseaddr: bool,
     pub reuseport: bool,
     pub uid: u32,
+    /// IP_LOCAL_PORT_RANGE de la socket (`plage`), pour son port éphémère.
+    pub plage: u32,
 }
 
 /// Pourquoi un port n'est pas donné.
@@ -119,7 +145,7 @@ impl<T: Clone> Table<T> {
 
     /// Le choix d'un port éphémère de `udp_lib_get_port` (voir plus haut).
     fn ephemere(&self, numero: u64, lien: &Lien, hasard: u32) -> Option<u16> {
-        let (bas, haut) = (EPHEMERE_MIN as u32, EPHEMERE_MAX as u32);
+        let (bas, haut, _) = plage(lien.plage);
         let restant = haut - bas + 1;
         // Le `reciprocal_scale` de Linux : le hasard ramené à [0, restant[.
         let mut premier = ((hasard as u64 * restant as u64) >> 32) as u32 + bas;

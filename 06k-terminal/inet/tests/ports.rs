@@ -10,7 +10,7 @@ const ICI: [u8; 4] = [10, 0, 2, 15];
 const TOUT: [u8; 4] = [0; 4];
 
 fn lien(adresse: [u8; 4], port: u16) -> Lien {
-    Lien { adresse, port, distante: TOUT, port_distant: 0, reuseaddr: false, reuseport: false, uid: 1000 }
+    Lien { adresse, port, distante: TOUT, port_distant: 0, reuseaddr: false, reuseport: false, uid: 1000, plage: 0 }
 }
 
 #[test]
@@ -114,4 +114,27 @@ fn ports_ephemeres() {
         t.lier(n, lien(TOUT, 0), 0, (n as u32).wrapping_mul(2_654_435_761)).unwrap();
     }
     assert_eq!(t.lier(1024, lien(TOUT, 0), 0, 1), Err(Refus::Plein));
+}
+
+/// IP_LOCAL_PORT_RANGE (`inet_sk_get_local_port_range`) : chaque borne
+/// seulement si elle tombe dans celle du système (mesures de Linux 6.18).
+#[test]
+fn plage_d_une_socket() {
+    use inet::ports::plage;
+    assert_eq!(plage(0), (32768, 60999, false));
+    assert_eq!(plage(40000 | 40001 << 16), (40000, 40001, true));
+    assert_eq!(plage(1000 | 2000 << 16), (32768, 60999, true), "hors plage : ignoree");
+    assert_eq!(plage(32770 << 16), (32768, 32770, true), "0-32770");
+    assert_eq!(plage(50000), (50000, 60999, true), "le bas seul");
+    assert_eq!(plage(70 | 40000 << 16), (32768, 40000, true), "le haut seul");
+    // Un port éphémère d'UDP reste dans la plage de sa socket, et la
+    // remplit.
+    let mut t: Table<u32> = Table::new().unwrap();
+    let l = Lien { plage: 40000 | 40001 << 16, ..lien(TOUT, 0) };
+    let a = t.lier(1, l, 1, 0x9e37_79b9).unwrap();
+    let b = t.lier(2, l, 2, 0x7f4a_7c15).unwrap();
+    assert!(a != b && (40000..=40001).contains(&a) && (40000..=40001).contains(&b), "{} {}", a, b);
+    assert_eq!(t.lier(3, l, 3, 5), Err(Refus::Pris));
+    // Une autre socket, sans plage, n'est pas gênée.
+    assert!(t.lier(4, lien(TOUT, 0), 4, 5).is_ok());
 }

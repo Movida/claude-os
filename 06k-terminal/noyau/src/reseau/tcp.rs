@@ -284,6 +284,10 @@ fn maintenant() -> u64 {
 #[derive(Clone, Copy, Default)]
 pub struct Adresses {
     pub lie: bool,
+    /// L'adresse de `bind`, gardée à la fin d'une connexion
+    /// (SOCK_BINDADDR_LOCK) ; avec IP_BIND_ADDRESS_NO_PORT, elle peut être
+    /// là sans port (`lie` faux).
+    pub adresse_choisie: bool,
     pub adresse: [u8; 4],
     pub port: u16,
     pub port_choisi: bool,
@@ -306,6 +310,10 @@ pub struct Fille {
     /// FIN avant l'accept : HTTP/1.0, une sonde de santé), ou fermée par un
     /// RST (accept la rend, sa première lecture dit ECONNRESET).
     etablie: bool,
+    /// Le TTL, le TOS et l'interface du segment qui a fini sa poignée de
+    /// main (`tcp_v4_syn_recv_sock` : `mc_ttl`, `rcv_tos`, `mc_index`), que
+    /// sa socket gardera (IP_PKTOPTIONS, IP_MULTICAST_TTL).
+    arrivee: (u8, u8, u32),
 }
 
 impl Fille {
@@ -402,6 +410,9 @@ pub struct OptionsTcp {
     pub tos: u8,
     /// La copie d'IP_MTU_DISCOVER (DF, et la MTU à suivre), pour la même raison.
     pub pmtudisc: u8,
+    /// La copie d'IP_MINTTL, pour la même raison : un segment reçu, ou une
+    /// erreur ICMP, de TTL plus petit est jeté.
+    pub minttl: u8,
     /// TCP_WINDOW_CLAMP (0 : rien), d'une socket pas encore connectée, et d'une
     /// écoute : ses filles en héritent (`tcp_openreq_init_rwin`).
     pub window_clamp: u32,
@@ -417,7 +428,7 @@ impl OptionsTcp {
     pub const DEFAUT: OptionsTcp = OptionsTcp {
         nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
-        rcvbuf_fixe: false, rcvlowat: 1, ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 1, window_clamp: 0, controle: itcp::Controle::DEFAUT,
+        rcvbuf_fixe: false, rcvlowat: 1, ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 1, minttl: 0, window_clamp: 0, controle: itcp::Controle::DEFAUT,
     };
 
     /// Ce que la connexion en retient (TCP_USER_TIMEOUT est en ms, les
@@ -471,10 +482,11 @@ pub enum Arrivee {
     Segment(Segment),
     /// L'errno (`icmp_err_convert`), le réseau ou la machine injoignables
     /// (RFC 6069), le numéro de séquence du segment d'origine (vérifié
-    /// contre ce qui est en vol), la fille visée ; IP_RECVERR de la socket.
-    Erreur { errno: i32, injoignable: bool, seq: u32, fille: Option<u64>, recverr: bool, abandon: bool },
-    /// « Fragmentation nécessaire » : la MTU qu'elle dit, et de même le numéro et la fille.
-    Mtu { info: u32, seq: u32, fille: Option<u64> },
+    /// contre ce qui est en vol), la fille visée ; IP_RECVERR de la socket ;
+    /// le TTL de l'en-tête recopié dans le message (IP_MINTTL).
+    Erreur { errno: i32, injoignable: bool, seq: u32, fille: Option<u64>, recverr: bool, abandon: bool, ttl: u8 },
+    /// « Fragmentation nécessaire » : la MTU qu'elle dit, et de même le numéro, la fille, le TTL.
+    Mtu { info: u32, seq: u32, fille: Option<u64>, ttl: u8 },
 }
 
 /// Un segment reçu, pour une socket (ou la fille d'une écoute).
@@ -483,6 +495,10 @@ pub struct Segment {
     charge: Paquet,
     source: [u8; 4],
     destination: [u8; 4],
+    /// Le TTL et le TOS de son en-tête IPv4, l'interface d'arrivée.
+    ttl: u8,
+    tos: u8,
+    interface: u32,
     /// Sa destination est une diffusion, dans une trame pour nous seuls (le
     /// RTCF_BROADCAST de sa route) : une écoute de 0.0.0.0 la voit, mais n'en
     /// fait jamais de fille.
@@ -808,18 +824,19 @@ impl Partie {
         self.hors_table = false;
         self.etablie_un_jour = false;
         self.connexion_en_cours = false;
-        self.adresses = Adresses::default();
+        // L'adresse de `bind` reste (SOCK_BINDADDR_LOCK), avec ou sans son port.
+        self.adresses = if a.adresse_choisie { Adresses { adresse: a.adresse, adresse_choisie: true, ..Adresses::default() } } else { Adresses::default() };
         if a.port_choisi && dans_la_table {
-            self.adresses = Adresses { lie: true, adresse: a.adresse, port: a.port, port_choisi: true, ..Adresses::default() };
+            self.adresses = Adresses { lie: true, adresse: a.adresse, port: a.port, port_choisi: true, ..self.adresses };
         } else if a.port_choisi {
-            let (reuseaddr, reuseport) = partage(s);
+            let op = s.appels.verrouiller().options;
             let lien = Lien {
-                sorte: Sorte::Liee, adresse: a.adresse, port: a.port, distante: [0; 4], port_distant: 0, reuseaddr, reuseport, uid: s.uid,
-                par_connect: false,
+                sorte: Sorte::Liee, adresse: a.adresse, port: a.port, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
+                reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range,
             };
             let lie = TABLE.verrouiller().as_mut().map(|t| t.lier(self.numero, lien, Cible::Socket(s.clone()), crate::aleatoire::u32()));
             if let Some(Ok(port)) = lie {
-                self.adresses = Adresses { lie: true, adresse: a.adresse, port, port_choisi: true, ..Adresses::default() };
+                self.adresses = Adresses { lie: true, adresse: a.adresse, port, port_choisi: true, ..self.adresses };
             }
         }
         // Ce qu'elle tenait est rendu : `tcp_mem` n'a plus à le compter.
@@ -1028,19 +1045,29 @@ impl Partie {
     fn traiter_arrivee(&mut self, a: Arrivee) {
         let s = match a {
             Arrivee::Segment(s) => s,
-            Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon } => {
-                self.erreur_icmp(errno, injoignable, seq, fille, recverr, abandon);
+            Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon, ttl } => {
+                if !self.ttl_trop_petit(ttl, fille) {
+                    self.erreur_icmp(errno, injoignable, seq, fille, recverr, abandon);
+                }
                 self.emettre();
                 self.apres();
                 return;
             }
-            Arrivee::Mtu { info, seq, fille } => {
-                self.mtu_reduite(info, seq, fille);
+            Arrivee::Mtu { info, seq, fille, ttl } => {
+                if !self.ttl_trop_petit(ttl, fille) {
+                    self.mtu_reduite(info, seq, fille);
+                }
                 self.emettre();
                 self.apres();
                 return;
             }
         };
+        // IP_MINTTL (`tcp_v4_rcv`, après la recherche) : une connexion, une
+        // fille établie (une socket chez Linux), une écoute (ses SYN) ; pas
+        // une fille en SYN_RECEIVED (une `request_sock`, servie avant).
+        if self.ttl_trop_petit(s.ttl, s.fille) {
+            return;
+        }
         match &mut self.mode {
             Mode::Connexion(t) => {
                 t.recevoir(&s.entete, s.charge, maintenant());
@@ -1054,6 +1081,27 @@ impl Partie {
         }
         self.emettre();
         self.apres();
+    }
+
+    /// IP_MINTTL (RFC 5082, GTSM) : un segment ou une erreur ICMP de TTL
+    /// `ttl` est-il jeté ? Oui sous le minimum, pour la socket et pour une
+    /// fille établie (elle l'a hérité), pas pour une fille dont la poignée
+    /// de main n'a pas abouti (`tcp_v4_rcv` et `tcp_v4_err` servent une
+    /// `request_sock` avant de regarder). L'erreur ICMP compare le TTL de
+    /// l'en-tête recopié, comme `tcp_v4_err` (son `iph`). Linux compte
+    /// TCPMinTTLDrop, que nous n'avons pas (pas de /proc/net/netstat).
+    fn ttl_trop_petit(&self, ttl: u8, fille: Option<u64>) -> bool {
+        if ttl >= self.options.minttl {
+            return false;
+        }
+        match (&self.mode, fille) {
+            // Une fille partie entre-temps : le segment ira à l'écoute, qui regarde.
+            (Mode::Ecoute { filles, .. }, Some(n)) => filles.iter().find(|f| f.numero == n).is_none_or(|f| f.tcb.etat() != Etat::SynRecu),
+            // Plus rien n'écoute : Linux ne la trouverait pas, et répondrait
+            // RST quel que soit le TTL.
+            (Mode::Neuve, _) => false,
+            _ => true,
+        }
     }
 
     /// « Fragmentation nécessaire » (`tcp_v4_err`, TCP_MTU_REDUCED_DEFERRED) : ignorée si
@@ -1129,7 +1177,11 @@ impl Partie {
         if let Some(n) = s.fille {
             if let Some(f) = filles.iter_mut().find(|f| f.numero == n) {
                 f.tcb.reglages.defer_accept = defer;
+                let en_poignee = f.tcb.etat() == Etat::SynRecu;
                 f.tcb.recevoir(&s.entete, s.charge, maintenant());
+                if en_poignee && f.tcb.etat() != Etat::SynRecu {
+                    f.arrivee = (s.ttl, s.tos, s.interface);
+                }
                 emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
                 ranger_filles(filles);
                 return;
@@ -1205,10 +1257,11 @@ impl Partie {
         // Elle hérite de ce que l'écoute permet (`sk_clone_lock`) : un serveur SO_REUSEADDR doit
         // pouvoir redémarrer tant que vivent ses connexions, et jusqu'en TIME_WAIT (`tw_reuse`).
         let ajoutee = TABLE.verrouiller().as_mut().is_some_and(|t| {
-            let (reuseaddr, reuseport, uid) = t.lien(numero_ecoute).map_or((false, false, 0), |l| (l.reuseaddr, l.reuseport, l.uid));
+            let (reuseaddr, reuseport, uid, plage) =
+                t.lien(numero_ecoute).map_or((false, false, 0, 0), |l| (l.reuseaddr, l.reuseport, l.uid, l.plage));
             let lien = Lien {
                 sorte: Sorte::Connectee, adresse: s.destination, port: h.destination, distante: s.source, port_distant: h.source,
-                reuseaddr, reuseport, uid, par_connect: false,
+                reuseaddr, reuseport, uid, par_connect: false, plage,
             };
             t.ajouter_fille(numero, lien, Cible::Fille(moi, numero)).is_ok()
         });
@@ -1217,6 +1270,7 @@ impl Partie {
         }
         let mut f = Fille {
             numero, tcb, locale: s.destination, distante: s.source, identifiant: crate::aleatoire::u32() as u16, etablie: false,
+            arrivee: (0, 0, 0),
         };
         emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip, None);
         // La place est prise plus haut, avant tout changement.
@@ -1334,6 +1388,8 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     let Some((port_source, port_destination)) = formats::reseau::icmp::ports(e.origine, i) else { return };
     let tcp = e.origine.get(i.longueur_entete..).unwrap_or(&[]);
     let Some(seq) = tcp.get(4..8).map(|o| u32::from_be_bytes([o[0], o[1], o[2], o[3]])) else { return };
+    // (Ses 20 premiers octets au moins sont là : `icmp::ports` les a lus.)
+    let ttl = e.origine.get(8).copied().unwrap_or(0);
     let cible = TABLE.verrouiller().as_ref().and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source));
     let (sock, fille) = match cible {
         Some(Destinataire::Connexion(Cible::Socket(s))) => (s, None),
@@ -1351,7 +1407,7 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     // (`tcp_v4_mtu_reduced`), jamais une erreur, même avec IP_RECVERR (mesuré).
     if e.genre == icmp::INJOIGNABLE && e.code == icmp::FRAGMENTATION {
         let _contexte = contexte::entrer();
-        vers_socket(&sock, Arrivee::Mtu { info: e.info, seq, fille });
+        vers_socket(&sock, Arrivee::Mtu { info: e.info, seq, fille, ttl });
         return;
     }
     let Some((errno, _)) = super::udp::convertir(e.genre, e.code, true) else { return };
@@ -1360,7 +1416,7 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     let abandon = injoignable || e.genre == icmp::TEMPS_DEPASSE || e.genre == icmp::PARAMETRE;
     let recverr = sock.recverr.load(Ordering::Relaxed);
     let _contexte = contexte::entrer();
-    vers_socket(&sock, Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon });
+    vers_socket(&sock, Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon, ttl });
 }
 
 /// Un segment pour une entrée de TIME_WAIT : ses règles disent quoi faire
@@ -1448,8 +1504,9 @@ fn par_numero(n: u64) -> Option<Arc<Socket>> {
 /// InErrs s'il a un en-tête faux (`bad_packet`) ou une somme fausse (avec
 /// InCsumErrors) ; pas s'il est trop court pour son en-tête (`discard_it`).
 /// `diffusion` : sa destination est une diffusion.
-pub fn recevoir(source: [u8; 4], destination: [u8; 4], par_lo: bool, diffusion: bool, mut p: Paquet) {
+pub fn recevoir(ip: &fipv4::Ipv4, i: &super::interface::Interface, diffusion: bool, mut p: Paquet) {
     MIB.tcp(Compteur::InSegs);
+    let (source, destination, par_lo) = (ip.source, ip.destination, i.boucle());
     let (h, charge) = match ftcp::lire(p.donnees(), source, destination, !par_lo) {
         Ok(x) => x,
         Err(e) => {
@@ -1465,7 +1522,7 @@ pub fn recevoir(source: [u8; 4], destination: [u8; 4], par_lo: bool, diffusion: 
     let entete = p.longueur() - charge.len();
     let _ = p.retirer_entete(entete);
     let _contexte = contexte::entrer();
-    livrer(Segment { entete: h, charge: p, source, destination, diffusion, fille: None, isn: None });
+    livrer(Segment { entete: h, charge: p, source, destination, ttl: ip.ttl, tos: ip.tos, interface: i.index, diffusion, fille: None, isn: None });
 }
 
 // --- Les appels ---
@@ -1487,12 +1544,6 @@ fn flux(s: &Socket) -> &Possession<Partie> {
     s.flux.as_ref().expect("une socket TCP a son flux")
 }
 
-/// Les options de partage de la socket (sous son Mutex de 6g).
-fn partage(s: &Socket) -> (bool, bool) {
-    let i = s.appels.verrouiller();
-    (i.options.reuseaddr, i.options.reuseport)
-}
-
 /// Lit une adresse d'IPv4 pour `bind` et `connect` : au moins 16 octets
 /// (EINVAL), la famille AF_INET (bind : EAFNOSUPPORT ; AF_UNSPEC permis
 /// avec 0.0.0.0, comme `__inet_bind`).
@@ -1500,13 +1551,19 @@ fn adresse(o: &[u8]) -> Result<socket::AdresseInet, i64> {
     socket::lire_adresse(o).ok_or(-EINVAL)
 }
 
-/// bind (`__inet_bind`, `inet_csk_get_port`).
+/// bind (`__inet_bind`, `inet_csk_get_port`) : l'adresse comme UDP
+/// (`datagramme::adresse_de_bind` : à nous, une diffusion ou une
+/// multidiffusion, que `connect` remplacera par celle de sa route, ou toute
+/// adresse avec IP_FREEBIND ou IP_TRANSPARENT) ; avec
+/// IP_BIND_ADDRESS_NO_PORT, le port 0 n'en prend pas : il viendra à
+/// `listen` ou à `connect`, et un second `bind` reste permis.
 pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     let a = adresse(o)?;
     if a.famille != socket::AF_INET && !(a.famille == socket::AF_UNSPEC && a.adresse == [0; 4]) {
         return Err(-EAFNOSUPPORT);
     }
-    if a.adresse != [0; 4] && !ipv4::avec_table(|t| t.est_a_nous(a.adresse)).unwrap_or(false) && !fipv4::boucle(a.adresse) {
+    let op = s.appels.verrouiller().options;
+    if !super::datagramme::adresse_de_bind(a.adresse, op.freebind || op.transparent, false) {
         return Err(-EADDRNOTAVAIL);
     }
     if a.port != 0 && a.port < ports_tcp::PRIVILEGIE && s.uid != 0 {
@@ -1517,10 +1574,13 @@ pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     if p.adresses.lie || !matches!(p.mode, Mode::Neuve) {
         return Err(-EINVAL);
     }
-    let (reuseaddr, reuseport) = partage(s);
+    if a.port == 0 && op.bind_no_port {
+        p.adresses = Adresses { adresse: a.adresse, adresse_choisie: a.adresse != [0; 4], ..p.adresses };
+        return Ok(());
+    }
     let lien = Lien {
-        sorte: Sorte::Liee, adresse: a.adresse, port: a.port, distante: [0; 4], port_distant: 0, reuseaddr, reuseport,
-        uid: s.uid, par_connect: false,
+        sorte: Sorte::Liee, adresse: a.adresse, port: a.port, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
+        reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range,
     };
     let port = match TABLE.verrouiller().as_mut() {
         Some(t) => t.lier(p.numero, lien, Cible::Socket(s.clone()), crate::aleatoire::u32()),
@@ -1530,7 +1590,7 @@ pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
         ports_tcp::Refus::Pris => -EADDRINUSE,
         ports_tcp::Refus::Plein => -ENOBUFS,
     })?;
-    p.adresses = Adresses { lie: true, adresse: a.adresse, port, port_choisi: a.port != 0, ..p.adresses };
+    p.adresses = Adresses { lie: true, adresse: a.adresse, adresse_choisie: a.adresse != [0; 4], port, port_choisi: a.port != 0, ..p.adresses };
     p.hors_table = false;
     Ok(())
 }
@@ -1558,8 +1618,12 @@ pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
     }
     let p = g.donnee();
     if !p.adresses.lie {
-        let (reuseaddr, reuseport) = partage(s);
-        let lien = Lien { sorte: Sorte::Liee, adresse: [0; 4], port: 0, distante: [0; 4], port_distant: 0, reuseaddr, reuseport, uid: s.uid, par_connect: false };
+        // L'adresse d'un `bind` sans port (IP_BIND_ADDRESS_NO_PORT), s'il y en a eu un.
+        let op = s.appels.verrouiller().options;
+        let lien = Lien {
+            sorte: Sorte::Liee, adresse: p.adresses.adresse, port: 0, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
+            reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range,
+        };
         let port = TABLE.verrouiller().as_mut().map(|t| t.lier(p.numero, lien, Cible::Socket(s.clone()), crate::aleatoire::u32()));
         match port {
             Some(Ok(port)) => p.adresses = Adresses { lie: true, port, ..p.adresses },
@@ -1643,15 +1707,28 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 }
             }
             Mode::Neuve => {
-                // La route, la source, le port.
-                let (chemin, destination) = ipv4::router(a.adresse, p.adresses.lie.then_some(p.adresses.adresse).filter(|&x| x != [0; 4]))
-                    .map_err(|_| super::datagramme::sans_route())?;
-                let source = if p.adresses.lie && p.adresses.adresse != [0; 4] { p.adresses.adresse } else { ipv4::source(&chemin) };
+                // La route, la source, le port. La source : l'adresse de
+                // `bind` (même sans port), sauf une diffusion ou une
+                // multidiffusion (`inet_saddr` à 0 : celle de la route) ;
+                // une qui n'est pas à nous (IP_FREEBIND) : ENETUNREACH, sauf
+                // avec IP_TRANSPARENT (`ip_route_connect`, comme UDP).
+                let op = s.appels.verrouiller().options;
+                let liee = Some(p.adresses.adresse).filter(|&x| x != [0; 4] && !super::datagramme::diffusion(x));
+                if let Some(x) = liee
+                    && !op.transparent
+                    && !ipv4::avec_table(|t| t.est_a_nous(x)).unwrap_or(false)
+                {
+                    return Err(super::datagramme::sans_route());
+                }
+                let (chemin, destination) = ipv4::router(a.adresse, liee).map_err(|_| super::datagramme::sans_route())?;
+                let source = liee.unwrap_or_else(|| ipv4::source(&chemin));
                 if fipv4::boucle(source) && !ipv4::par_lo(&chemin) {
                     return Err(-EINVAL);
                 }
-                let (reuseaddr, reuseport) = partage(s);
-                let lien = Lien { sorte: Sorte::Liee, adresse: source, port: 0, distante: [0; 4], port_distant: 0, reuseaddr, reuseport, uid: s.uid, par_connect: false };
+                let lien = Lien {
+                    sorte: Sorte::Liee, adresse: source, port: 0, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
+                    reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range,
+                };
                 let place = faillible::boite_vide().map_err(|_| -ENOBUFS)?;
                 let cle = cle_secrete();
                 let decalage = crypto::siphash::siphash_4u32(u32::from_ne_bytes(source), u32::from_ne_bytes(destination), a.port as u32,
@@ -1676,7 +1753,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                     Some(Err(ports_tcp::Refus::Plein)) | None => return Err(-ENOBUFS),
                     Some(Err(_)) => return Err(-EADDRNOTAVAIL),
                 };
-                p.adresses = Adresses { lie: true, adresse: p.adresses.adresse, port, port_choisi: p.adresses.port_choisi, distante: destination, port_distant: a.port, source };
+                p.adresses = Adresses { lie: true, port, distante: destination, port_distant: a.port, source, ..p.adresses };
                 p.hors_table = false;
                 let iss = reprise.map_or_else(|| numero_initial(source, destination, port, a.port), |(_, isn, _)| isn);
                 if let Some((n, _, _)) = reprise {
@@ -1783,6 +1860,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             else { return Err(-ENFILE) };
             let f = filles.remove(i).expect("la fille");
             let (port, distante, port_distant, locale) = (f.tcb.port_local, f.distante, f.tcb.port_distant, f.locale);
+            let (mc_ttl, rcv_tos, mc_index) = f.arrivee;
             let numero = f.numero;
             let enfant = enfant.avec_numero(numero);
             // Une fille fermée avant l'accept (un RST) a déjà quitté la
@@ -1795,7 +1873,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 numero, mode: Mode::Connexion(tcb),
                 // Comme ses verrous de `bind` (`sk_userlocks`, recopié) : déconnectée, elle redevient
                 // ce qu'était son écoute, liée à son port si `bind` l'a nommé.
-                adresses: Adresses { lie: true, adresse: p.adresses.adresse, port, port_choisi: p.adresses.port_choisi, distante, port_distant, source: locale },
+                adresses: Adresses { lie: true, port, distante, port_distant, source: locale, ..p.adresses },
                 identifiant: f.identifiant, orpheline: false, hors_table,
                 // Tout, sauf ce qui est propre à une écoute (`inet_csk_clone_lock`,
                 // `inet_csk_delack_init`) : la fille n'attend pas de données pour naître deux fois.
@@ -1811,7 +1889,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             enfant.recverr.store(options.recverr, Ordering::Relaxed);
             enfant.pmtudisc.store(options.pmtudisc, Ordering::Relaxed);
             enfant.peek_off.store(s.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
-            enfant.appels.verrouiller().options = options;
+            enfant.appels.verrouiller().options = socket::Options { mc_ttl, rcv_tos, mc_index, ..options };
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.changer_objet(numero, Cible::Socket(enfant.clone()));
             }
@@ -1844,6 +1922,15 @@ pub fn nom(s: &Socket) -> ([u8; 4], u16) {
     let mut g = flux(s).posseder();
     let a = g.donnee().adresses;
     (if matches!(g.donnee().mode, Mode::Connexion(_)) { a.source } else { a.adresse }, a.port)
+}
+
+/// L'adresse où la socket reçoit (`inet_rcv_saddr` : sa source si elle
+/// est connectée, l'adresse de `bind` sinon) et son port (`inet_num` : 0
+/// sans port), pour IP_PKTOPTIONS et IP_PROTOCOL.
+pub fn nom_lie(s: &Socket) -> ([u8; 4], u16) {
+    let mut g = flux(s).posseder();
+    let a = g.donnee().adresses;
+    (if matches!(g.donnee().mode, Mode::Connexion(_)) { a.source } else { a.adresse }, if a.lie { a.port } else { 0 })
 }
 
 pub fn pair(s: &Socket) -> Option<([u8; 4], u16)> {

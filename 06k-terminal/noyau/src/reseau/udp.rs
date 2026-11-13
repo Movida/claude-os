@@ -67,6 +67,7 @@ fn lien(s: &Socket, inet: &Inet, port: u16) -> Lien {
     Lien {
         adresse: inet.adresse, port, distante: inet.distante, port_distant: inet.port_distant,
         reuseaddr: inet.options.reuseaddr, reuseport: inet.options.reuseport, uid: s.uid,
+        plage: inet.options.local_port_range,
     }
 }
 

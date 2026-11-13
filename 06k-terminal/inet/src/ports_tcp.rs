@@ -23,7 +23,9 @@
 //!     une socket qui a SO_REUSEADDR cherche d'abord dans la moitié basse de
 //!     la plage, puis dans la haute (Linux garde la haute aux autres) ;
 //!   - le port éphémère de `connect` (`__inet_hash_connect`) : PAIR d'abord
-//!     (Linux laisse les impairs à `bind`, mesuré), à partir d'un décalage
+//!     (Linux laisse les impairs à `bind`, mesuré) ; avec une plage à elle
+//!     (IP_LOCAL_PORT_RANGE), de un en un, sans parité (le programme a
+//!     choisi peu de ports : tous servent) ; à partir d'un décalage
 //!     secret (`secure_ipv4_port_ephemeral`, tiré par le noyau) plus une
 //!     perturbation qui avance à chaque choix (`table_perturb` : un tiers ne
 //!     peut pas deviner le port suivant d'après le précédent) ; un port déjà
@@ -77,6 +79,9 @@ pub struct Lien {
     /// Le port a été donné par `connect` (le `fastreuse == -1` de Linux) :
     /// d'autres `connect` peuvent le partager.
     pub par_connect: bool,
+    /// IP_LOCAL_PORT_RANGE de la socket (`ports::plage`), pour son port
+    /// éphémère.
+    pub plage: u32,
 }
 
 /// Pourquoi un port n'est pas donné.
@@ -177,9 +182,9 @@ impl<T: Clone> Table<T> {
         Ok(port)
     }
 
-    /// `inet_csk_find_open_port` : dans la plage (sa moitié basse d'abord,
-    /// puis la haute, si la socket a SO_REUSEADDR : une plage de moins de
-    /// quatre ports ne se coupe pas), les impairs d'un départ tiré
+    /// `inet_csk_find_open_port` : dans la plage de la socket (sa moitié
+    /// basse d'abord, puis la haute, si elle a SO_REUSEADDR : une plage de
+    /// moins de quatre ports ne se coupe pas), les impairs d'un départ tiré
     /// (`get_random_u32_below`, ici les 16 bits bas de `hasard` pour la
     /// première moitié, les hauts pour la seconde : une plage a au plus
     /// 65 536 ports), de deux en deux, puis les pairs à partir du port
@@ -191,7 +196,7 @@ impl<T: Clone> Table<T> {
             if k == 1 && moitie == 0 {
                 break;
             }
-            let (mut bas, haut) = (EPHEMERE_MIN as u32, EPHEMERE_MAX as u32);
+            let (mut bas, haut, _) = crate::ports::plage(lien.plage);
             let mut haut = haut + 1;
             let moitie = if haut - bas < 4 { 0 } else { moitie };
             if moitie != 0 {
@@ -299,12 +304,18 @@ impl<T: Clone> Table<T> {
         if self.entrees.len() >= self.max {
             return Err(Refus::Plein);
         }
-        let (bas, haut) = (EPHEMERE_MIN as u32, EPHEMERE_MAX as u32 + 1);
-        let pas = 2;
-        let restant = (haut - bas) & !1;
+        let (bas, haut, propre) = crate::ports::plage(lien.plage);
+        let pas = if propre { 1 } else { 2 };
+        let haut = haut + 1;
+        let mut restant = haut - bas;
+        if !propre && restant > 1 {
+            restant &= !1;
+        }
         let index = decalage as usize % PERTURBATION;
         let mut depart = self.perturbation[index].wrapping_add((decalage >> 32) as u32) % restant;
-        depart &= !1;
+        if !propre {
+            depart &= !1;
+        }
         loop {
             let mut port = bas + depart;
             let mut i = 0;
@@ -337,8 +348,8 @@ impl<T: Clone> Table<T> {
                 });
                 return Ok(essai);
             }
-            // Puis les impairs, une fois.
-            if depart & 1 == 1 {
+            // Les impairs, une seule fois (sans plage à elle).
+            if propre || depart & 1 == 1 || restant <= 1 {
                 break;
             }
             depart += 1;

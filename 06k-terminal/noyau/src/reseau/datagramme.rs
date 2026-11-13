@@ -72,26 +72,52 @@ pub mod table {
     }
 }
 
+/// L'adresse `a` est-elle une diffusion ou une multidiffusion (le
+/// RTN_BROADCAST et le RTN_MULTICAST d'`inet_addr_type` : la limitée,
+/// celle d'un réseau d'une interface, une de multidiffusion) ?
+pub fn diffusion(a: [u8; 4]) -> bool {
+    a == format_ipv4::DIFFUSION
+        || format_ipv4::multidiffusion(a)
+        || ipv4::avec_table(|t| matches!(t.chercher(a), Some(Chemin::Diffusion { .. }))).unwrap_or(false)
+}
+
+/// L'adresse `a` peut-elle être celle d'un `bind` (`inet_addr_valid_or_nonlocal`) :
+/// 0.0.0.0, une adresse à nous, une diffusion ou une multidiffusion, ou
+/// toute adresse avec IP_FREEBIND ou IP_TRANSPARENT (`nonlocale`) ? Une
+/// socket de ping (`ping_check_bind_addr`) refuse les diffusions et les
+/// multidiffusions, même avec IP_FREEBIND. Partagée avec TCP, qui suit
+/// `__inet_bind` comme UDP.
+pub fn adresse_de_bind(a: [u8; 4], nonlocale: bool, ping: bool) -> bool {
+    if a == format_ipv4::AUCUNE {
+        return true;
+    }
+    let locale = ipv4::avec_table(|t| t.est_a_nous(a)).unwrap_or(false);
+    if ping {
+        return !diffusion(a) && (locale || nonlocale);
+    }
+    locale || nonlocale || diffusion(a)
+}
+
 /// bind(adresse) : la `sockaddr_in` copiée du programme, dans l'ordre
 /// d'`inet_bind` et d'`__inet_bind` : moins de 16 octets : EINVAL ; une
 /// autre famille qu'AF_INET : EAFNOSUPPORT (AF_UNSPEC accepté avec
-/// 0.0.0.0, une compatibilité de Linux) ; une adresse qui n'est pas à nous
-/// (ni 0.0.0.0, ni, pour UDP seulement, une diffusion ou une
-/// multidiffusion) : EADDRNOTAVAIL ; un port de moins de 1024 sans être
-/// root : EACCES (pour UDP) ; déjà liée : EINVAL ; le port pris :
+/// 0.0.0.0, une compatibilité de Linux) ; une adresse qui ne peut pas
+/// l'être (`adresse_de_bind`) : EADDRNOTAVAIL ; un port de moins de 1024
+/// sans être root : EACCES (pour UDP) ; déjà liée : EINVAL ; le port pris :
 /// EADDRINUSE. Une socket de ping suit le même ordre
-/// (`ping_check_bind_addr`, qui refuse diffusions et multidiffusions, puis
-/// `ping_bind`), son port étant l'identifiant de ses échos.
+/// (`ping_check_bind_addr`, puis `ping_bind`), son port étant
+/// l'identifiant de ses échos. Avec IP_BIND_ADDRESS_NO_PORT, le port 0
+/// n'en prend pas (UDP seulement : `ping_bind` l'ignore) : la socket garde
+/// son adresse, sans port, et peut être liée de nouveau (le refus de Linux
+/// regarde `inet_num`) ; son port viendra au premier envoi ou au `connect`
+/// (`lier_au_besoin`), avec cette adresse.
 pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     let Some(a) = socket::lire_adresse(o) else { return Err(-EINVAL) };
     if a.famille != AF_INET && !(a.famille == AF_UNSPEC && a.adresse == format_ipv4::AUCUNE) {
         return Err(-EAFNOSUPPORT);
     }
-    let (locale, diffusion) = ipv4::avec_table(|t| {
-        (t.est_a_nous(a.adresse), matches!(t.chercher(a.adresse), Some(Chemin::Diffusion { .. })))
-    }).unwrap_or((false, false));
-    let diffusion = diffusion || a.adresse == format_ipv4::DIFFUSION || format_ipv4::multidiffusion(a.adresse);
-    if !(a.adresse == format_ipv4::AUCUNE || locale || (diffusion && s.protocole == Protocole::Udp)) {
+    let op = s.appels.verrouiller().options;
+    if !adresse_de_bind(a.adresse, op.freebind || op.transparent, s.protocole == Protocole::Ping) {
         return Err(-EADDRNOTAVAIL);
     }
     // Un port privilégié pour UDP ; une socket de ping n'a que des
@@ -104,7 +130,8 @@ pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
         return Err(-EINVAL);
     }
     inet.adresse = a.adresse;
-    if let Err(e) = table::inscrire(s, &mut inet, a.port) {
+    let sans_port = a.port == 0 && s.protocole == Protocole::Udp && inet.options.bind_no_port;
+    if !sans_port && let Err(e) = table::inscrire(s, &mut inet, a.port) {
         inet.adresse = format_ipv4::AUCUNE;
         return Err(e);
     }
@@ -232,7 +259,12 @@ pub struct Trajet {
 
 /// La route d'un envoi ou d'une connexion vers `destination`, dans l'ordre
 /// d'`ip_route_output_flow` : une source demandée (IP_PKTINFO, celle de
-/// `bind`) qui n'est pas à nous : EINVAL ; l'interface d'IP_PKTINFO qui
+/// `bind`) de multidiffusion ou de diffusion limitée : EINVAL ; une autre
+/// qui n'est pas à nous (liée par IP_FREEBIND, ou d'IP_PKTINFO) :
+/// ENETUNREACH (`ip_route_output_key_hash_rcu`, mesuré : 0.1.2.3 aussi,
+/// `ipv4_is_zeronet` ne regarde plus que 0.0.0.0), sauf avec
+/// IP_TRANSPARENT (FLOWI_FLAG_ANYSRC), mais pas vers une diffusion ou une
+/// multidiffusion sans interface demandée ; l'interface d'IP_PKTINFO qui
 /// n'existe pas : ENODEV (Linux la prend aussi pour sortie : un écart, nos
 /// routes ne passent que par une interface) ; 0.0.0.0, la source demandée
 /// ou 127.0.0.1 (`ipv4::router`) ; pas de route : ENETUNREACH ; avec
@@ -245,8 +277,15 @@ pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64) ->
     const MSG_DONTROUTE: u64 = 4;
     const ENODEV: i64 = 19;
     let demandee = c.source.filter(|&a| a != format_ipv4::AUCUNE).or_else(|| source_liee(inet));
-    if demandee.is_some_and(|a| !ipv4::avec_table(|t| t.est_a_nous(a)).unwrap_or(false)) {
-        return Err(-EINVAL);
+    if let Some(a) = demandee {
+        if format_ipv4::multidiffusion(a) || a == format_ipv4::DIFFUSION {
+            return Err(-EINVAL);
+        }
+        let vers_diffusion = c.interface.unwrap_or(0) == 0
+            && (format_ipv4::multidiffusion(destination) || destination == format_ipv4::DIFFUSION);
+        if !ipv4::avec_table(|t| t.est_a_nous(a)).unwrap_or(false) && (!inet.options.transparent || vers_diffusion) {
+            return Err(sans_route());
+        }
     }
     if c.interface.is_some_and(|k| k != 0 && super::interface::par_index(k).is_none()) {
         return Err(-ENODEV);

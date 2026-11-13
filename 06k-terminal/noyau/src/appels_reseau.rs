@@ -126,10 +126,38 @@ const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
 const IP_TOS: i32 = 1;
 const IP_TTL: i32 = 2;
+const IP_HDRINCL: i32 = 3;
+const IP_ROUTER_ALERT: i32 = 5;
+const IP_RECVOPTS: i32 = 6;
+const IP_RETOPTS: i32 = 7;
 const IP_PKTINFO: i32 = 8;
+const IP_PKTOPTIONS: i32 = 9;
 const IP_MTU_DISCOVER: i32 = 10;
 const IP_RECVERR: i32 = 11;
+const IP_RECVTTL: i32 = 12;
+const IP_RECVTOS: i32 = 13;
 const IP_MTU: i32 = 14;
+const IP_FREEBIND: i32 = 15;
+const IP_IPSEC_POLICY: i32 = 16;
+const IP_XFRM_POLICY: i32 = 17;
+const IP_PASSSEC: i32 = 18;
+const IP_TRANSPARENT: i32 = 19;
+const IP_RECVORIGDSTADDR: i32 = 20;
+const IP_MINTTL: i32 = 21;
+const IP_NODEFRAG: i32 = 22;
+const IP_CHECKSUM: i32 = 23;
+const IP_BIND_ADDRESS_NO_PORT: i32 = 24;
+const IP_RECVFRAGSIZE: i32 = 25;
+const IP_RECVERR_RFC4884: i32 = 26;
+const IP_MULTICAST_TTL: i32 = 33;
+const IP_MULTICAST_LOOP: i32 = 34;
+const IP_UNICAST_IF: i32 = 50;
+const IP_MULTICAST_ALL: i32 = 49;
+const IP_LOCAL_PORT_RANGE: i32 = 51;
+const IP_PROTOCOL: i32 = 52;
+/// Les options du routage de la multidiffusion (MRT_INIT à MRT_FLUSH,
+/// `ip_mroute_opt`) : seulement d'une socket brute d'IGMP.
+const MRT: core::ops::RangeInclusive<i32> = 200..=212;
 const IP_PMTUDISC_OMIT: i32 = 5;
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
@@ -1732,47 +1760,96 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
     // Le reste (`tcpi_received_ce` et ceux d'ECN précis) : 0, nous n'avons pas ECN.
 }
 
-/// Les options de SOL_IP (`do_ip_setsockopt`) : la valeur lue en entier
-/// (4 octets ou plus), ou en octet (1 à 3), ou 0 (longueur nulle) ; puis
-/// l'option. IP_OPTIONS, la multidiffusion, IP_RECVTTL et les autres :
-/// ENOPROTOOPT, un écart écrit.
+/// Les options de SOL_IP (`do_ip_setsockopt`), dans son ordre : la valeur
+/// des options qui en ont une simple lue en entier (4 octets ou plus), ou
+/// en octet (1 à 3), ou 0 (longueur nulle) ; IP_ROUTER_ALERT : EINVAL
+/// (`ip_ra_control` : une socket brute seulement), même de longueur nulle ;
+/// le routage de la multidiffusion (MRT_*) : EOPNOTSUPP, sans rien lire ;
+/// puis l'option. Les drapeaux de la réception se posent ici, leurs
+/// messages de contrôle sont à la réception. IP_HDRINCL et IP_NODEFRAG
+/// sont d'une socket brute (ENOPROTOOPT) ; IP_IPSEC_POLICY et
+/// IP_XFRM_POLICY : EPERM sans root, puis ENOPROTOOPT (le `xfrm_user_policy`
+/// d'un noyau sans IPsec, CONFIG_XFRM). Les options de la multidiffusion
+/// (sauf IP_MULTICAST_TTL), IP_UNICAST_IF et IP_OPTIONS : ENOPROTOOPT, un
+/// écart.
 fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(), i64> {
-    let v = if longueur >= 4 {
+    let simple = matches!(option, IP_PKTINFO | IP_RECVTTL | IP_RECVOPTS | IP_RECVTOS | IP_RETOPTS | IP_TOS | IP_TTL
+        | IP_HDRINCL | IP_MTU_DISCOVER | IP_RECVERR | IP_ROUTER_ALERT | IP_FREEBIND | IP_PASSSEC | IP_TRANSPARENT
+        | IP_MINTTL | IP_NODEFRAG | IP_BIND_ADDRESS_NO_PORT | IP_UNICAST_IF | IP_MULTICAST_TTL | IP_MULTICAST_ALL
+        | IP_MULTICAST_LOOP | IP_RECVORIGDSTADDR | IP_CHECKSUM | IP_RECVFRAGSIZE | IP_RECVERR_RFC4884
+        | IP_LOCAL_PORT_RANGE);
+    let v = if !simple || longueur == 0 {
+        0
+    } else if longueur >= 4 {
         entier(valeur, longueur)?
-    } else if longueur >= 1 {
+    } else {
         let mut o = [0u8; 1];
         copier_depuis_utilisateur(&mut o, valeur).map_err(|_| -EFAULT)?;
         o[0] as i32
-    } else {
-        0
     };
+    if option == IP_ROUTER_ALERT {
+        return Err(-EINVAL);
+    }
+    if MRT.contains(&option) {
+        return Err(-EOPNOTSUPP);
+    }
+    // CAP_NET_RAW (ou CAP_NET_ADMIN) : un droit de qui pose l'option
+    // (`ns_capable`), pas de qui a créé la socket.
+    let root = processus::avec(|p| p.identite).root();
     let mut inet = s.appels.verrouiller();
     let op = &mut inet.options;
+    let oui = v != 0;
     match option {
-        IP_PKTINFO => op.pktinfo = v != 0,
+        IP_PKTINFO => op.pktinfo = oui,
+        IP_RECVTTL => op.recvttl = oui,
+        IP_RECVTOS => op.recvtos = oui,
+        IP_RECVOPTS => op.recvopts = oui,
+        IP_RETOPTS => op.retopts = oui,
+        IP_PASSSEC => op.passsec = oui,
+        IP_RECVORIGDSTADDR => op.origdstaddr = oui,
+        IP_CHECKSUM => op.checksum = oui,
+        // Des datagrammes seulement (SOCK_DGRAM ou SOCK_RAW) : un flux n'a
+        // pas de fragments à dire.
+        IP_RECVFRAGSIZE if s.protocole == Protocole::Tcp => return Err(-EINVAL),
+        IP_RECVFRAGSIZE => op.recvfragsize = oui,
         // Retiré, il vide la file d'erreurs (`skb_errqueue_purge`). Sa copie
         // atomique, pour la tâche du réseau.
         IP_RECVERR => {
-            op.recverr = v != 0;
-            s.recverr.store(v != 0, Ordering::Relaxed);
-            if v == 0 {
+            op.recverr = oui;
+            s.recverr.store(oui, Ordering::Relaxed);
+            if !oui {
                 s.vider_erreurs();
             }
         }
-        // La priorité ne suit que si le TOS change (`__ip_sock_set_tos`). Sur un flux, les deux bits
-        // d'ECN sont à TCP, le programme ne les touche pas.
-        IP_TOS => {
-            let tos = if s.protocole == Protocole::Tcp { (v as u8 & !3) | (op.tos & 3) } else { v as u8 };
-            if op.tos != tos {
-                op.tos = tos;
-                op.priority = priorite_du_tos(tos);
-            }
-        }
+        IP_RECVERR_RFC4884 if !(0..=1).contains(&v) => return Err(-EINVAL),
+        IP_RECVERR_RFC4884 => op.rfc4884 = oui,
+        IP_FREEBIND if longueur < 1 => return Err(-EINVAL),
+        IP_FREEBIND => op.freebind = oui,
+        IP_HDRINCL | IP_NODEFRAG => return Err(-ENOPROTOOPT),
+        // Le droit d'abord (CAP_NET_RAW ou CAP_NET_ADMIN), puis la longueur.
+        IP_TRANSPARENT if oui && !root => return Err(-EPERM),
+        IP_TRANSPARENT if longueur < 1 => return Err(-EINVAL),
+        IP_TRANSPARENT => op.transparent = oui,
+        IP_BIND_ADDRESS_NO_PORT => op.bind_no_port = oui,
         IP_TTL => {
             if longueur < 1 || (v != -1 && !(1..=255).contains(&v)) {
                 return Err(-EINVAL);
             }
             op.ttl = if v == -1 { None } else { Some(v as u8) };
+        }
+        IP_MINTTL => {
+            if longueur < 1 || !(0..=255).contains(&v) {
+                return Err(-EINVAL);
+            }
+            op.minttl = v as u8;
+        }
+        // Un flux n'envoie pas de multidiffusion ; -1 : le défaut, 1.
+        IP_MULTICAST_TTL => {
+            let v = if v == -1 { 1 } else { v };
+            if s.protocole == Protocole::Tcp || longueur < 1 || !(0..=255).contains(&v) {
+                return Err(-EINVAL);
+            }
+            op.mc_ttl = v as u8;
         }
         IP_MTU_DISCOVER => {
             if !(0..=IP_PMTUDISC_OMIT).contains(&v) {
@@ -1781,16 +1858,40 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
             op.pmtudisc = v as u8;
             s.pmtudisc.store(v as u8, Ordering::Relaxed);
         }
+        // La priorité ne suit que si le TOS change (`__ip_sock_set_tos`). Sur un flux, les deux bits
+        // d'ECN sont à TCP, le programme ne les touche pas.
+        // `__ip_sock_set_tos` : la valeur ENTIÈRE comparée à l'ancien octet
+        // (256 en diffère toujours, même si l'octet ne change pas) ; pour
+        // TCP, les deux bits d'ECN gardés.
+        IP_TOS => {
+            let val = if s.protocole == Protocole::Tcp { (v & !3) | (op.tos & 3) as i32 } else { v };
+            if op.tos as i32 != val {
+                op.tos = val as u8;
+                op.priority = priorite_du_tos(val as u8);
+            }
+        }
+        // Le bas dans les 16 bits bas, le haut dans les hauts : gardés tels
+        // quels (relus tels quels), une borne nulle ne compte pas.
+        IP_LOCAL_PORT_RANGE => {
+            let (bas, haut) = (v as u32 & 0xFFFF, v as u32 >> 16);
+            if longueur != 4 || (bas != 0 && haut != 0 && bas > haut) {
+                return Err(-EINVAL);
+            }
+            op.local_port_range = v as u32;
+        }
+        IP_IPSEC_POLICY | IP_XFRM_POLICY if !root => return Err(-EPERM),
         _ => return Err(-ENOPROTOOPT),
     }
-    // TCP émet ses segments sans le Mutex : ses copies d'IP_TTL et d'IP_TOS.
-    let (ttl, tos, pmtudisc) = (op.ttl.unwrap_or(crate::reseau::ipv4::TTL_DEFAUT), op.tos, op.pmtudisc);
+    // TCP émet ses segments et reçoit sans le Mutex : ses copies d'IP_TTL,
+    // d'IP_TOS, d'IP_MTU_DISCOVER et d'IP_MINTTL.
+    let (ttl, tos, pmtudisc, minttl) = (op.ttl.unwrap_or(crate::reseau::ipv4::TTL_DEFAUT), op.tos, op.pmtudisc, op.minttl);
     drop(inet);
-    if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER) {
+    if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER | IP_MINTTL) {
         tcp::avec_options(s, |o, _| {
             o.ttl = ttl;
             o.tos = tos;
             o.pmtudisc = pmtudisc;
+            o.minttl = minttl;
         });
     }
     Ok(())
@@ -1838,6 +1939,17 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
                 let (v, n) = lire_option_tcp(s, option)?;
                 let n = (place as usize).min(n);
                 copier_vers_utilisateur(valeur, &v[..n]).map_err(|_| -EFAULT)?;
+                copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+                Ok(0)
+            }
+            // Le routage de la multidiffusion avant la longueur (`ip_mroute_getsockopt`).
+            SOL_IP if MRT.contains(&option) => Err(-EOPNOTSUPP),
+            SOL_IP if option == IP_PKTOPTIONS => {
+                let place = lire_longueur(&mut l)?;
+                if s.protocole != Protocole::Tcp {
+                    return Err(-ENOPROTOOPT);
+                }
+                let n = pktoptions(s, valeur, place as usize)?;
                 copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
                 Ok(0)
             }
@@ -1930,21 +2042,72 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
 }
 
 /// La valeur d'une option de SOL_IP ; une inconnue : ENOPROTOOPT ; IP_MTU
-/// d'une socket non connectée : ENOTCONN.
+/// d'une socket non connectée : ENOTCONN. IP_PROTOCOL : le port local
+/// (`inet_num`, 0 sans port) ; IP_HDRINCL, IP_NODEFRAG et IP_ROUTER_ALERT,
+/// qu'une socket brute seule pose : 0.
 fn lire_option_ip(s: &Socket, option: i32) -> Result<i32, i64> {
     if option == IP_MTU {
         let m = if s.protocole == Protocole::Tcp { tcp::mtu_du_chemin(s) } else { datagramme::mtu(s) };
         return m.map(|m| m as i32).ok_or(-ENOTCONN);
     }
+    if option == IP_PROTOCOL {
+        let (_, port) = if s.protocole == Protocole::Tcp { tcp::nom_lie(s) } else { datagramme::nom(s) };
+        return Ok(port as i32);
+    }
     let op = s.appels.verrouiller().options;
     Ok(match option {
         IP_PKTINFO => op.pktinfo as i32,
+        IP_RECVTTL => op.recvttl as i32,
+        IP_RECVTOS => op.recvtos as i32,
+        IP_RECVOPTS => op.recvopts as i32,
+        IP_RETOPTS => op.retopts as i32,
+        IP_PASSSEC => op.passsec as i32,
+        IP_RECVORIGDSTADDR => op.origdstaddr as i32,
+        IP_CHECKSUM => op.checksum as i32,
+        IP_RECVFRAGSIZE => op.recvfragsize as i32,
         IP_RECVERR => op.recverr as i32,
+        IP_RECVERR_RFC4884 => op.rfc4884 as i32,
+        IP_FREEBIND => op.freebind as i32,
+        IP_TRANSPARENT => op.transparent as i32,
+        IP_BIND_ADDRESS_NO_PORT => op.bind_no_port as i32,
+        IP_HDRINCL | IP_NODEFRAG | IP_ROUTER_ALERT => 0,
         IP_TOS => op.tos as i32,
         IP_TTL => op.ttl.unwrap_or(crate::reseau::ipv4::TTL_DEFAUT) as i32,
+        IP_MINTTL => op.minttl as i32,
+        IP_MULTICAST_TTL => op.mc_ttl as i32,
         IP_MTU_DISCOVER => op.pmtudisc as i32,
+        IP_LOCAL_PORT_RANGE => op.local_port_range as i32,
         _ => return Err(-ENOPROTOOPT),
     })
+}
+
+/// IP_PKTOPTIONS d'une socket TCP (`do_ip_getsockopt`) : les messages de
+/// contrôle qu'aurait un segment reçu, écrits à `valeur` (`place` octets)
+/// comme par `put_cmsg` (`ControleSortant` : un message coupé, ou omis
+/// sans la place de son en-tête ; une faute ignorée) : IP_PKTINFO
+/// (l'interface `mc_index`, et l'adresse locale `inet_rcv_saddr` pour les
+/// deux adresses), IP_TTL (`mc_ttl`) et IP_TOS (`rcv_tos`, un entier ici,
+/// pas l'octet d'une réception), selon IP_PKTINFO, IP_RECVTTL et
+/// IP_RECVTOS. Rend la place prise.
+fn pktoptions(s: &Socket, valeur: u64, place: usize) -> Result<usize, i64> {
+    let op = s.appels.verrouiller().options;
+    let (locale, _) = tcp::nom_lie(s);
+    let mut c = ControleSortant { adresse: valeur, place: place as u64, utilise: 0 };
+    let mut drapeaux = 0;
+    if op.pktinfo {
+        let mut info = [0u8; 12];
+        info[..4].copy_from_slice(&op.mc_index.to_le_bytes());
+        info[4..8].copy_from_slice(&locale);
+        info[8..].copy_from_slice(&locale);
+        c.ecrire(SOL_IP, IP_PKTINFO, &info, &mut drapeaux);
+    }
+    if op.recvttl {
+        c.ecrire(SOL_IP, IP_TTL, &(op.mc_ttl as i32).to_le_bytes(), &mut drapeaux);
+    }
+    if op.recvtos {
+        c.ecrire(SOL_IP, IP_TOS, &(op.rcv_tos as i32).to_le_bytes(), &mut drapeaux);
+    }
+    Ok(c.utilise as usize)
 }
 
 /// read et readv d'une socket (`sock_read_iter`) : rien à lire demandé :
