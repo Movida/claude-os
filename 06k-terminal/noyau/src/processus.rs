@@ -610,10 +610,9 @@ pub fn cible_d_horloge(h: crate::temps::DeCalcul, lecture: bool) -> Option<Cible
     entree(h.pid).map(Cible::Processus)
 }
 
-/// Ce que /proc montre d'un processus : son identité, quand il a été lancé,
-/// s'il est un zombie.
-pub fn vu_de_proc(pid: u32) -> Option<(Identite, fichiers::Temps, bool)> {
-    TABLE.verrouiller().iter().find(|e| e.pid == pid).map(|e| (e.identite, e.lance, e.est_zombie()))
+/// Ce que /proc montre d'un processus : son identité, quand il a été lancé.
+pub fn vu_de_proc(pid: u32) -> Option<(Identite, fichiers::Temps)> {
+    TABLE.verrouiller().iter().find(|e| e.pid == pid).map(|e| (e.identite, e.lance))
 }
 
 /// Le nombre de processus de la table, vivants et zombies (ceux que liste

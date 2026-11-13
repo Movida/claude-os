@@ -1839,6 +1839,24 @@ fn renommer_tache(t: &Tache, nom: NomCourt) {
     }
 }
 
+/// Le fil `tid` vit-il, sa mémoire encore à lui (un programme qui n'a pas
+/// encore quitté l'espace de son processus en finissant, `terminer`) ? Sa
+/// « mm » au sens de /proc : Linux la détache dans `exit_mm`, et
+/// /proc/<tid> n'en montre plus rien (maps vide, statm à zéro, pas
+/// d'`exe`), même si d'autres fils la gardent ; un fil principal parti, ou
+/// un fil inconnu : faux. Les descripteurs et le dossier courant, que
+/// Linux détache un peu plus loin (`exit_files`, `exit_fs`), suivent la
+/// même règle (procfs.rs).
+pub fn a_sa_memoire(tid: u32) -> bool {
+    let mut oui = false;
+    pour_chaque(|t| {
+        if t.tid == tid && tid != 0 {
+            oui = t.programme.is_some() && t.espace.load(Ordering::Relaxed) != pagination::pml4_noyau();
+        }
+    });
+    oui
+}
+
 /// Le nom du fil `tid`, s'il vit.
 pub fn nom_du_fil(tid: u32) -> Option<NomCourt> {
     let mut nom = None;

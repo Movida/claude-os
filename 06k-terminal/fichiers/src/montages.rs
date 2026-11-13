@@ -136,6 +136,11 @@ pub trait Monte {
     fn traverser(&self, _dossier: u64) -> Result<(), Erreur> {
         Ok(())
     }
+    /// Les droits qu'il accorde sur `n` en plus de son mode (voir
+    /// `Arbre::permis_en_plus`) ; aucun par défaut.
+    fn permis_en_plus(&self, _n: u64, _masque: u32) -> bool {
+        false
+    }
     /// Le chemin qu'aura ce qu'on ouvre par le lien magique `lien` : celui
     /// du fichier ouvert qu'il désigne (vide s'il n'en a pas). Linux rouvre
     /// le même `struct path` (`nd_jump_link`), dont `d_path` donne le même
@@ -732,6 +737,13 @@ impl<M: Monte> Arbre for Vue<'_, M> {
         match dossier {
             Objet::Monte(s, n) => self.monte(s).traverser(n),
             Objet::Tmpfs(_) | Objet::Anonyme => Ok(()),
+        }
+    }
+
+    fn permis_en_plus(&self, o: Objet, masque: u32) -> bool {
+        match o {
+            Objet::Monte(s, n) => self.monte(s).permis_en_plus(n, masque),
+            Objet::Tmpfs(_) | Objet::Anonyme => false,
         }
     }
 }

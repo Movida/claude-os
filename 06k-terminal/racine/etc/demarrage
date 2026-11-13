@@ -66,6 +66,8 @@ wait
 # Le fichier de /proc d'un processus recueilli, gardé ouvert : ESRCH (6e).
 /bin/proc cible &
 /bin/proc autre
+# Le fil principal parti avant les autres (les soldes d'avant 6k) : son /proc/<pid> comme sous Linux.
+/bin/proc parti
 # Deux programmes à la fois (6e) : lancés par `&`, épinglés sur le
 # processeur 0 (6j : sinon chacun aurait le sien), ils se partagent le
 # processeur ; deux autres ajoutent au même fichier, sans rien perdre.

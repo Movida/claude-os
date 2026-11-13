@@ -73,7 +73,7 @@
 [noyau] procfs monte sur /proc.
 [noyau] sysfs monte sur /sys.
 [noyau] Archive deballee : dossiers 12, fichiers 67, liens symboliques 6, liens physiques 4 ; archive rendue (… Kio).
-[noyau] Lancement : /etc/demarrage, 103 commandes.
+[noyau] Lancement : /etc/demarrage, 104 commandes.
 [noyau] bonjour.wasm : programme WebAssembly, 2943 octets, decode et valide.
 [wasm] Bonjour depuis WebAssembly !
 [wasm] Nombres premiers : 2 3 5 7 11 13 17 19 23 29
@@ -189,6 +189,8 @@
 [linux] proc : son dossier garde ouvert, une fois recueilli : le meme mode, a root : ok
 [linux] proc autre : toutes les verifications : ok
 [noyau] Programmes en parallele : memoire rendue : ok.
+[linux] proc parti : toutes les verifications : ok
+[noyau] proc : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] partage b : temps reel / temps de calcul entre 1,6 et 2,6 : ok
 ~ [linux] partage a : temps reel / temps de calcul entre 1,6 et 2,6 : ok
 ~ [linux] ajout a : 300 lignes ecrites : ok
@@ -224,14 +226,14 @@
 [linux] arbre : - 0644 1000 1000    40964 /tmp/groupe/fichier-10
 [linux] arbre : - 0644 1000 1000    36868 /tmp/groupe/sous-dossier/fichier-9
 [linux] effacer : /tmp/groupe efface : ok
-[noyau] Groupe des lignes 113 a 117 : memoire rendue : ok.
+[noyau] Groupe des lignes 115 a 119 : memoire rendue : ok.
 [linux] effacer : /tmp/fuite cree, 4 fichiers : ok
 [noyau] prog : ouvert en ecriture, ne peut pas etre execute (ETXTBSY)
 # Du programme lancé par `&` juste avant : il garde /tmp/prog ouvert 1500 ms, la
 # vérification de l'ETXTBSY vient 500 ms après son départ, et cette ligne-ci à sa fin.
 [linux] redirections : /tmp/prog tenu en ecriture : ok
 [linux] effacer : /tmp/fuite efface : ok
-[noyau] Groupe des lignes 121 a 128 : memoire rendue : ok.
+[noyau] Groupe des lignes 123 a 130 : memoire rendue : ok.
 [linux] copies : sendfile vers une socket : ok
 [linux] copies : copy_file_range de trois pages et 100 octets : ok
 [linux] copies : toutes les verifications : ok

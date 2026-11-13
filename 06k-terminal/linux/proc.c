@@ -864,6 +864,87 @@ static void descripteurs(void)
     close(m);
 }
 
+/* « proc parti » (les soldes d'avant 6k) : le fil principal finit le
+ * premier (pthread_exit), un autre fil regarde alors /proc/<pid>. Linux le
+ * montre d'après la tâche du fil principal, qui n'a plus de mémoire ni de
+ * descripteurs (mesuré sous 6.18) : maps vide, statm à zéro, exe ENOENT,
+ * fd/ à root et vide ; son comm reste, et le fil vivant garde tout dans
+ * /proc/<tid>. maps, ouvert avant la fin du principal, garde la mémoire
+ * qu'il a trouvée à l'ouverture (`proc_mem_open`). */
+static pid_t pid_parti;
+static int maps_ouvert = -1;
+
+static void *apres_le_principal(void *a)
+{
+    char chemin[64], t[4096];
+    pid_t tid = syscall(SYS_gettid);
+    /* Le principal a effacé son numéro (pthread_join le guette) un peu
+     * avant de quitter sa mémoire : exe le dit. */
+    struct timespec ms = { 0, 1000000 };
+    snprintf(chemin, sizeof chemin, "/proc/%d/exe", pid_parti);
+    int parti = 0;
+    for (int i = 0; i < 10000 && !parti; i++) {
+        parti = readlink(chemin, t, sizeof t) == -1 && errno == ENOENT;
+        if (!parti)
+            nanosleep(&ms, NULL);
+    }
+    verifier(parti, "parti : exe du fil principal, ENOENT");
+    snprintf(chemin, sizeof chemin, "/proc/%d/maps", pid_parti);
+    verifier(lire_tout(chemin, t, sizeof t, sizeof t) == 0, "parti : maps vide");
+    snprintf(chemin, sizeof chemin, "/proc/%d/statm", pid_parti);
+    lire_tout(chemin, t, sizeof t, sizeof t);
+    verifier(strcmp(t, "0 0 0 0 0 0 0\n") == 0, "parti : statm a zero");
+    verifier(maps_ouvert >= 0 && read(maps_ouvert, t, sizeof t) > 0, "parti : maps ouvert avant, la memoire du processus");
+    /* fd/ passe à root (`task_dump_owner`), mais un fil du même processus
+     * le lit toujours (`proc_fd_permission`) : vide. */
+    struct stat st, m, c;
+    snprintf(chemin, sizeof chemin, "/proc/%d/fd", pid_parti);
+    verifier(stat(chemin, &st) == 0 && st.st_uid == 0 && st.st_mode == (S_IFDIR | 0500) && entrees(chemin) == 0,
+             "parti : fd/ a root, vide");
+    snprintf(chemin, sizeof chemin, "/proc/%d/fd/0", pid_parti);
+    verifier(erreur(readlink(chemin, t, sizeof t)) == ENOENT, "parti : fd/0, ENOENT");
+    /* chdir et fchdir y entrent aussi (`proc_fd_permission`, par
+     * `inode_permission`). */
+    int ici = open(".", O_RDONLY | O_DIRECTORY);
+    snprintf(chemin, sizeof chemin, "/proc/%d/fd", pid_parti);
+    int dfd = open(chemin, O_RDONLY | O_DIRECTORY);
+    int entre = chdir(chemin) == 0 && fchdir(ici) == 0 && dfd >= 0 && fchdir(dfd) == 0 && fchdir(ici) == 0;
+    verifier(entre, "parti : chdir et fchdir vers fd/, permis au processus");
+    close(dfd);
+    close(ici);
+    /* Ce qui n'est pas un dossier 0555 passe à root, sous task/<pid> aussi. */
+    snprintf(chemin, sizeof chemin, "/proc/%d/maps", pid_parti);
+    int r = stat(chemin, &m);
+    snprintf(chemin, sizeof chemin, "/proc/%d/task/%d/comm", pid_parti, pid_parti);
+    r |= stat(chemin, &c);
+    snprintf(chemin, sizeof chemin, "/proc/%d/task/%d", pid_parti, pid_parti);
+    r |= stat(chemin, &st);
+    verifier(r == 0 && m.st_uid == 0 && c.st_uid == 0 && st.st_uid == getuid(),
+             "parti : maps et task/<pid>/comm a root, task/<pid> a lui");
+    snprintf(chemin, sizeof chemin, "/proc/%d/comm", pid_parti);
+    lire_tout(chemin, t, sizeof t, sizeof t);
+    verifier(strcmp(t, "proc\n") == 0 && entrees("/proc/self/task") == 2, "parti : son comm reste, et sa place dans task/");
+    snprintf(chemin, sizeof chemin, "/proc/%d/maps", tid);
+    int carte = lire_tout(chemin, t, sizeof t, sizeof t) > 0;
+    snprintf(chemin, sizeof chemin, "/proc/%d/exe", tid);
+    verifier(carte && readlink(chemin, t, sizeof t) > 0, "parti : le fil vivant garde maps et exe");
+    printf("[linux] proc parti : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
+    exit(echecs != 0);
+    return a;
+}
+
+static int principal_parti(void)
+{
+    char chemin[64];
+    pid_parti = getpid();
+    snprintf(chemin, sizeof chemin, "/proc/%d/maps", pid_parti);
+    maps_ouvert = open(chemin, O_RDONLY);
+    pthread_t f;
+    if (pthread_create(&f, NULL, apres_le_principal, NULL) != 0)
+        return 1;
+    pthread_exit(NULL);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "cible") == 0) {
@@ -880,6 +961,8 @@ int main(int argc, char **argv)
     }
     if (argc == 2 && strcmp(argv[1], "autre") == 0)
         return autre();
+    if (argc == 2 && strcmp(argv[1], "parti") == 0)
+        return principal_parti();
     chez_nous = access("/etc/bonjour.txt", F_OK) == 0;
     printf("[linux] proc : debut\n"); /* le tampon de stdout, alloue avant de lire les cartes */
     carte();

@@ -1327,6 +1327,7 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	./$(LINUX)/evenements | tee /dev/stderr | (! grep -q ECHEC)
 	timeout 60 ./$(LINUX)/minuteurs | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	./$(LINUX)/proc | tee /dev/stderr | (! grep -q ECHEC)
+	timeout 60 ./$(LINUX)/proc parti | tee /dev/stderr | grep -q "proc parti : toutes les verifications : ok"
 	./$(LINUX)/clone | tee /dev/stderr | (! grep -q ECHEC)
 	./$(LINUX)/fils | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	./$(LINUX)/fils groupe; test $$? = 7

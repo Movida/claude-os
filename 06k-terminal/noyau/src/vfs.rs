@@ -231,6 +231,13 @@ impl Monte for Montage<'_> {
         }
     }
 
+    fn permis_en_plus(&self, n: u64, masque: u32) -> bool {
+        match self {
+            Montage::Proc(p) => p.permis_en_plus(n, masque),
+            Montage::Fixe(f) => f.permis_en_plus(n, masque),
+        }
+    }
+
     fn chemin_du_saut(&self, lien: u64) -> Option<Texte<'_>> {
         match self {
             Montage::Proc(p) => p.chemin_du_saut(lien),

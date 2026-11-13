@@ -615,7 +615,8 @@ pub fn objet_pour_surveiller(adresse: u64, suivre: bool) -> Result<(ObjetTenu, b
     let o = objet(AT_FDCWD as u64, &chemin, suivre, false)?;
     let qui = processus::avec(|p| p.identite);
     let a = attributs(o.objet());
-    Ok((o, a.mode & S_IFMT == S_IFDIR, permis(a.mode, a.uid, a.gid, qui, LIRE)))
+    let lisible = permis_objet(o.objet(), qui, LIRE);
+    Ok((o, a.mode & S_IFMT == S_IFDIR, lisible))
 }
 
 /// L'objet désigné par `chemin` depuis `dirfd`, qui doit exister (stat,
@@ -639,6 +640,16 @@ fn objet(dirfd: u64, chemin: &[u8], suivre: bool, vide_permis: bool) -> Result<O
 /// ou le noyau).
 pub fn attributs(o: Objet) -> Attributs {
     vfs::avec_systeme(|s, _| s.avec_vue(0, |vue| vue.attributs(o)))
+}
+
+/// `qui` a-t-il les droits `masque` sur l'objet `o` : ceux de son mode, ou
+/// ceux que son système de fichiers accorde en plus (`inode_permission`,
+/// chemins::Arbre::permis_en_plus) ?
+fn permis_objet(o: Objet, qui: Identite, masque: u32) -> bool {
+    vfs::avec_systeme(|s, _| s.avec_vue(0, |vue| {
+        let a = vue.attributs(o);
+        permis(a.mode, a.uid, a.gid, qui, masque) || vue.permis_en_plus(o, masque)
+    }))
 }
 
 /// La sorte d'un fichier qu'on ouvre, d'après son inode : ses opérations.
@@ -790,7 +801,7 @@ pub fn ouvrir_monte(vue: &Vue<Montage>, qui: Identite, objet: Objet, o: &Ouvertu
         return Err(Erreur::EISDIR);
     }
     let masque = if o.lecture { fichiers::LIRE } else { 0 } | if ecrire { fichiers::ECRIRE } else { 0 };
-    if !permis(a.mode, a.uid, a.gid, qui, masque) {
+    if !permis(a.mode, a.uid, a.gid, qui, masque) && !vue.permis_en_plus(objet, masque) {
         return Err(Erreur::EACCES);
     }
     if dossier {
@@ -2207,8 +2218,7 @@ pub fn faccessat2(dirfd: u64, adresse: u64, droits: u64, drapeaux: u64) -> i64 {
         Err(e) => return e,
     };
     let qui = processus::avec(|p| p.identite);
-    let a = attributs(o.objet());
-    if permis(a.mode, a.uid, a.gid, qui, droits as u32) { 0 } else { errno(Erreur::EACCES) }
+    if permis_objet(o.objet(), qui, droits as u32) { 0 } else { errno(Erreur::EACCES) }
 }
 
 /// access(chemin, droits), faccessat(dossier, chemin, droits).
@@ -3250,11 +3260,12 @@ pub fn getcwd(tampon: u64, taille: u64) -> i64 {
 /// plus, pour le processus.
 fn changer_de_dossier(o: Objet) -> i64 {
     let qui = processus::avec(|p| p.identite);
-    let a = attributs(o);
-    if a.mode & S_IFMT != S_IFDIR {
+    if attributs(o).mode & S_IFMT != S_IFDIR {
         return errno(Erreur::ENOTDIR);
     }
-    if !permis(a.mode, a.uid, a.gid, qui, fichiers::EXECUTER) {
+    // `inode_permission`, donc fd/ d'un processus dont le fil principal est
+    // parti, à root mais permis à ses fils (`proc_fd_permission`).
+    if !permis_objet(o, qui, fichiers::EXECUTER) {
         return errno(Erreur::EACCES);
     }
     if let Some(n) = o.tmpfs() {

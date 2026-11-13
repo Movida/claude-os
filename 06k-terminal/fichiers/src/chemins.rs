@@ -140,6 +140,13 @@ pub trait Arbre {
     fn traverser(&self, _dossier: Self::Objet) -> Result<(), Erreur> {
         Ok(())
     }
+    /// Les droits `masque` que son système de fichiers accorde sur `objet`
+    /// quand son mode les refuse (la fin du `inode_operations->permission`
+    /// de Linux, après `generic_permission`) : fd/ d'un processus, à tous
+    /// ses fils (`proc_fd_permission`). Faux : le mode seul décide.
+    fn permis_en_plus(&self, _objet: Self::Objet, _masque: u32) -> bool {
+        false
+    }
 }
 
 /// D'où part la résolution, et pour qui.
@@ -295,7 +302,7 @@ pub fn resoudre<'a, A: Arbre>(arbre: &'a A, depart: &Depart<A::Objet>, chemin: &
         // qu'en dit son système de fichiers d'abord, puis son mode.
         arbre.traverser(courant)?;
         let (uid, gid) = arbre.proprietaire(courant);
-        if !permis(arbre.mode(courant), uid, gid, depart.qui, EXECUTER) {
+        if !permis(arbre.mode(courant), uid, gid, depart.qui, EXECUTER) && !arbre.permis_en_plus(courant, EXECUTER) {
             return Err(Erreur::EACCES);
         }
         if longueur > NAME_MAX {
