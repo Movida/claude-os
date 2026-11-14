@@ -32,7 +32,9 @@
  *     comparé) ;
  *   - les horodatages sur lo (advmss 65 483), TCP_MAXSEG dans le SYN, et
  *     hors d'une connexion établie (SYN_SENT, refusée, défaite), et un
- *     `connect` qui reprend le quadruplet d'un TIME_WAIT.
+ *     `connect` qui reprend le quadruplet d'un TIME_WAIT ;
+ *   - IP_OPTIONS : leur place dans le MSS, la fille et l'écho de son SYN, le
+ *     RST d'un port fermé, une route source.
  *   - TCP_CONGESTION (cubic, reno, les refus, l'héritage par une fille) ;
  *     le débit calculé (`tcpi_pacing_rate`) ; SO_SNDBUF qui ne grandit que pour
  *     un programme qui attend de la place ;
@@ -1173,6 +1175,123 @@ static void maxseg_hors_connexion(void)
     getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
     verifier(i.tcpi_advmss == 65483, "defaite puis reconnectee : advmss 65 483, sans TCP_MAXSEG");
     close(a);
+    close(c);
+    close(l);
+}
+
+/* Les octets d'IP_OPTIONS de `s`, en hexadécimal dans `t` ; leur nombre. */
+static int options_ip_de(int s, char *t)
+{
+    unsigned char o[40];
+    socklen_t n = sizeof o;
+    getsockopt(s, IPPROTO_IP, IP_OPTIONS, o, &n);
+    for (unsigned k = 0; k < n; k++)
+        sprintf(t + 2 * k, "%02x", o[k]);
+    t[2 * n] = 0;
+    return n;
+}
+
+/* IP_OPTIONS sur TCP (mesuré) : la place des options dans chaque segment
+ * (`icsk_ext_hdr_len`) est ôtée du MSS, recalculé tout de suite
+ * (`tcp_sync_mss`). Sans connexion, la borne vaut 0 et le MSS tombe au
+ * plancher de 48 octets, plus 20 tant que l'en-tête TCP n'a pas de taille
+ * (68 : une socket neuve, une écoute, les options posées ou retirées), moins
+ * 12 après une connexion avec horodatages (36) ; TCP_MAXSEG posé se montre.
+ * En SYN_SENT, 512 au lieu de 524, 976 au lieu de 988. Une connexion dont le
+ * client note la route (RR) : les données passent ; la fille relit l'écho
+ * des options de son SYN (les deux adresses notées), pas celles de son
+ * écoute. Le RST d'un port fermé revient avec l'écho. Une route source :
+ * EINVAL vers 0.0.0.0 ; vers une adresse, le SYN part à la première étape, et
+ * lo le jette (`accept_source_route`) : SYN_SENT, sans réponse. */
+static void options_ip(void)
+{
+    unsigned char rr[12] = {7, 11, 4};
+    unsigned char lsrr[8] = {0x83, 7, 4, 127, 0, 0, 1};
+    int s = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(s, IPPROTO_IP, IP_OPTIONS, rr, sizeof rr);
+    int m1 = option(s, IPPROTO_TCP, TCP_MAXSEG);
+    setsockopt(s, IPPROTO_IP, IP_OPTIONS, rr, 0);
+    int m2 = option(s, IPPROTO_TCP, TCP_MAXSEG);
+    setsockopt(s, IPPROTO_TCP, TCP_MAXSEG, &(int){1000}, sizeof(int));
+    setsockopt(s, IPPROTO_IP, IP_OPTIONS, rr, sizeof rr);
+    verifier(m1 == 68 && m2 == 68 && option(s, IPPROTO_TCP, TCP_MAXSEG) == 1000,
+             "IP_OPTIONS, socket neuve : TCP_MAXSEG 68, retirees 68 ; TCP_MAXSEG 1000 pose : 1000");
+    close(s);
+    int port, l = ecoute(&port, 0);
+    struct sockaddr_in x = lo(port);
+    setsockopt(l, IPPROTO_IP, IP_OPTIONS, rr, sizeof rr);
+    verifier(option(l, IPPROTO_TCP, TCP_MAXSEG) == 68, "IP_OPTIONS, une ecoute : TCP_MAXSEG 68");
+    /* SYN_SENT, face à une file d'acceptation pleine. */
+    int c1 = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c1, (void *)&x, sizeof x);
+    int mss[3];
+    for (int k = 0; k < 2; k++) {
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        fcntl(c, F_SETFL, O_NONBLOCK);
+        if (k)
+            setsockopt(c, IPPROTO_TCP, TCP_MAXSEG, &(int){1000}, sizeof(int));
+        setsockopt(c, IPPROTO_IP, IP_OPTIONS, rr, sizeof rr);
+        connect(c, (void *)&x, sizeof x);
+        attendre_ms(50);
+        mss[k] = option(c, IPPROTO_TCP, TCP_MAXSEG);
+        setsockopt(c, IPPROTO_IP, IP_OPTIONS, rr, 0);
+        mss[2] = option(c, IPPROTO_TCP, TCP_MAXSEG);
+        close(c);
+    }
+    verifier(mss[0] == 512 && mss[1] == 976 && mss[2] == 988, "IP_OPTIONS en SYN_SENT : 512, 976 avec TCP_MAXSEG 1000 ; retirees, 988");
+    close(c1);
+    close(l);
+    /* Une connexion avec RR, et une écoute avec RR. */
+    char t[81];
+    for (int k = 0; k < 2; k++) {
+        l = ecoute(&port, 1);
+        x = lo(port);
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        setsockopt(k ? l : c, IPPROTO_IP, IP_OPTIONS, rr, sizeof rr);
+        int r = connect(c, (void *)&x, sizeof x);
+        int a = accept(l, NULL, NULL);
+        char o[3] = {0};
+        int passe = r == 0 && write(c, "abc", 3) == 3 && read(a, o, 3) == 3 && !memcmp(o, "abc", 3) && write(a, "de", 2) == 2
+                    && read(c, o, 2) == 2;
+        int n = options_ip_de(a, t);
+        if (k)
+            verifier(passe && n == 0, "IP_OPTIONS d'une ecoute : pas celles de la fille");
+        else
+            verifier(passe && n == 12 && !strcmp(t, "070b0c7f0000017f00000100"),
+                     "IP_OPTIONS d'un client (RR) : les donnees passent ; la fille relit l'echo, les deux adresses notees");
+        if (!k) {
+            /* La fin de la connexion, puis IP_OPTIONS : 36. */
+            struct sockaddr u = {.sa_family = AF_UNSPEC};
+            connect(c, &u, sizeof u);
+            setsockopt(c, IPPROTO_IP, IP_OPTIONS, rr, sizeof rr);
+            verifier(option(c, IPPROTO_TCP, TCP_MAXSEG) == 36, "IP_OPTIONS apres AF_UNSPEC : TCP_MAXSEG 36");
+        }
+        close(a);
+        close(c);
+        close(l);
+    }
+    /* Le RST d'un port fermé, avec l'écho de RR. */
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, IPPROTO_IP, IP_OPTIONS, rr, sizeof rr);
+    verifier(erreur(connect(c, (void *)&x, sizeof x)) == ECONNREFUSED, "IP_OPTIONS (RR), un port ferme : ECONNREFUSED");
+    close(c);
+    /* Une route source. */
+    l = ecoute(&port, 1);
+    x = lo(port);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    fcntl(c, F_SETFL, O_NONBLOCK);
+    setsockopt(c, IPPROTO_IP, IP_OPTIONS, lsrr, sizeof lsrr);
+    struct sockaddr_in z = lo(port);
+    z.sin_addr.s_addr = 0;
+    int e1 = erreur(connect(c, (void *)&z, sizeof z));
+    int e2 = erreur(connect(c, (void *)&x, sizeof x));
+    attendre_ms(50);
+    struct tcp_info i;
+    socklen_t li = sizeof i;
+    getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
+    int n = options_ip_de(c, t);
+    verifier(e1 == EINVAL && e2 == EINPROGRESS && i.tcpi_state == TCP_SYN_SENT && n == 8 && !strcmp(t, "830704" "7f000001" "00"),
+             "IP_OPTIONS (LSRR) : EINVAL vers 0.0.0.0 ; vers lo, SYN_SENT sans reponse ; relues defaites");
     close(c);
     close(l);
 }
@@ -2592,6 +2711,7 @@ int main(void)
     echelle();
     horodatages();
     maxseg_hors_connexion();
+    options_ip();
     reprise_time_wait();
     congestion();
     debit_calcule();

@@ -230,6 +230,36 @@ fn le_mss_hors_de_l_etablissement() {
 }
 
 #[test]
+fn les_options_ip_prennent_leur_place() {
+    // IP_OPTIONS de 12 octets (mesuré) : 512 en SYN_SENT au lieu de 524, 976 avec
+    // TCP_MAXSEG 1000 ; retirées, 988.
+    let mut c: C = Tcb::connecter(&MIB, 80, 40000, ISS, 65_495, 131_072, 1 << 22, 0);
+    c.proposer_horodatages(0);
+    c.poser_options_ip(12);
+    c.emettre(HEURE, |_| {});
+    assert_eq!(c.mss(), 512);
+    let mut c: C = Tcb::connecter(&MIB, 80, 40000, ISS, 65_495, 131_072, 1 << 22, 0);
+    c.proposer_horodatages(0);
+    c.mss_utilisateur = 1000;
+    c.poser_options_ip(12);
+    c.emettre(HEURE, |_| {});
+    assert_eq!(c.mss(), 976);
+    c.poser_options_ip(0);
+    assert_eq!(c.mss(), 988);
+    // Le plancher : 48 octets, avant les horodatages.
+    c.mss_route = 60;
+    c.poser_options_ip(40);
+    assert_eq!(c.mss, MSS_ENVOI_MIN - TS_ALIGNE);
+    // Sans connexion : 68, puis 36 après une connexion avec horodatages.
+    let mut r = MssRestant::NEUF;
+    r.synchroniser();
+    assert_eq!(r.mss, 68);
+    r.entete = 32;
+    r.synchroniser();
+    assert_eq!(r.mss, 36);
+}
+
+#[test]
 fn l_offre_bornee_par_tcp_maxseg() {
     // Le SYN-ACK n'offre rien : TCP_MAXSEG reste la borne (`tcp_parse_options` ignore
     // aussi une offre nulle) ; il offre plus : TCP_MAXSEG ; moins : l'offre.

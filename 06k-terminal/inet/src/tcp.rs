@@ -719,6 +719,17 @@ impl MssRestant {
     pub fn deconnecte(self) -> MssRestant {
         MssRestant { rcv_mss: MSS_MIN as u32, ..self }
     }
+
+    /// IP_OPTIONS posé hors d'une connexion (`tcp_sync_mss`, avec la dernière MTU
+    /// connue) : la borne (`mss_clamp`) y vaut 0, jamais posée ou effacée par
+    /// `tcp_disconnect` ; le MSS tombe donc au plancher de 48 octets, moins ce que
+    /// l'en-tête TCP a de plus que 20 octets, et plus 20 pour une socket neuve, dont
+    /// l'en-tête n'a pas encore de taille (`tcp_mtu_to_mss` soustrait en non signé).
+    /// Mesuré : 68, puis 36 après une connexion avec horodatages ; les options
+    /// elles-mêmes, leur place ou leur absence, n'y changent rien.
+    pub fn synchroniser(&mut self) {
+        self.mss = MSS_ENVOI_MIN + tcp::ENTETE as u16 - self.entete as u16;
+    }
 }
 
 impl Info {
@@ -866,6 +877,9 @@ pub struct Tcb<P: Charge> {
     /// l'autre, bornée par TCP_MAXSEG, dès qu'il en fait une ; pour qui se connecte,
     /// TCP_MAXSEG s'il est posé, en attendant la réponse (`tcp_connect_init`).
     mss_clamp: u16,
+    /// La place des options IP de chaque segment (IP_OPTIONS, ou l'écho de celles
+    /// du SYN pour une fille : `icsk_ext_hdr_len`), que le MSS leur laisse.
+    options_ip: u8,
     /// La plus grande charge que permet notre route (sa MTU moins 40).
     mss_route: u16,
     /// La charge qu'on dit pouvoir recevoir (`advmss`) : `mss_route` au départ,
@@ -1133,6 +1147,7 @@ impl<P: Charge> Tcb<P> {
             mss: MSS_DEFAUT,
             mss_offre: None,
             mss_clamp: MSS_DEFAUT,
+            options_ip: 0,
             mss_route: mss_local,
             mss_local,
             mss_utilisateur: 0,
@@ -1417,12 +1432,23 @@ impl<P: Charge> Tcb<P> {
     }
 
     /// Le MSS d'envoi (`tcp_sync_mss`, `__tcp_mtu_to_mss`) : la borne
-    /// (`mss_clamp`), au plus ce que permet notre route, jamais sous
-    /// MSS_ENVOI_MIN, moins la place des horodatages (`tcp_mtu_to_mss` : ils
-    /// sont dans chaque segment, et l'offre de l'autre compte les options).
+    /// (`mss_clamp`), au plus ce que permet notre route, moins la place des
+    /// options IP, jamais sous MSS_ENVOI_MIN, moins la place des horodatages
+    /// (`tcp_mtu_to_mss` : ils sont dans chaque segment, et l'offre de l'autre
+    /// compte les options).
     fn synchroniser_mss(&mut self) {
-        let m = self.mss_clamp.min(self.mss_route);
-        self.mss = m.max(MSS_ENVOI_MIN) - if self.ts.is_some() { TS_ALIGNE } else { 0 };
+        let m = (self.mss_clamp.min(self.mss_route) as i32 - self.options_ip as i32).max(MSS_ENVOI_MIN as i32) as u16;
+        self.mss = m - if self.ts.is_some() { TS_ALIGNE } else { 0 };
+    }
+
+    /// IP_OPTIONS posé (`do_ip_setsockopt`) : `n` octets d'options dans chaque
+    /// segment, et le MSS recalculé tout de suite, d'après la MTU qu'il connaît
+    /// (`tcp_sync_mss` avec `icsk_pmtu_cookie`) ; de même pour une fille, avec
+    /// l'écho des options de son SYN (`tcp_v4_syn_recv_sock`). Mesuré : 512 en
+    /// SYN_SENT avec 12 octets d'options, au lieu de 524.
+    pub fn poser_options_ip(&mut self, n: u8) {
+        self.options_ip = n;
+        self.synchroniser_mss();
     }
 
     /// Ce que rend TCP_MAXSEG (`do_tcp_getsockopt`) : le MSS d'envoi

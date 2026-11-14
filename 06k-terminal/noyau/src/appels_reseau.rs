@@ -1838,10 +1838,10 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
 /// sont d'une socket brute (ENOPROTOOPT) ; IP_IPSEC_POLICY et
 /// IP_XFRM_POLICY : EPERM sans root, puis ENOPROTOOPT (le `xfrm_user_policy`
 /// d'un noyau sans IPsec, CONFIG_XFRM). Les options de la multidiffusion
-/// (sauf IP_MULTICAST_TTL), IP_UNICAST_IF, et IP_OPTIONS pour TCP :
-/// ENOPROTOOPT, un écart. IP_OPTIONS : 40 octets au plus (EINVAL), copiés
-/// (EFAULT) avant de prendre le `Mutex`, vérifiés pour l'envoi
-/// (`ip_options_get` : EINVAL), aucun octet : aucune option.
+/// (sauf IP_MULTICAST_TTL) et IP_UNICAST_IF : ENOPROTOOPT, un écart.
+/// IP_OPTIONS : 40 octets au plus (EINVAL), copiés (EFAULT) avant de prendre
+/// le `Mutex`, vérifiés pour l'envoi (`ip_options_get` : EINVAL), aucun
+/// octet : aucune option ; TCP leur laisse leur place dans son MSS.
 fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(), i64> {
     let simple = matches!(option, IP_PKTINFO | IP_RECVTTL | IP_RECVOPTS | IP_RECVTOS | IP_RETOPTS | IP_TOS | IP_TTL
         | IP_HDRINCL | IP_MTU_DISCOVER | IP_RECVERR | IP_ROUTER_ALERT | IP_FREEBIND | IP_PASSSEC | IP_TRANSPARENT
@@ -1866,7 +1866,7 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
     // CAP_NET_RAW (ou CAP_NET_ADMIN) : un droit de qui pose l'option
     // (`ns_capable`), pas de qui a créé la socket.
     let root = processus::avec(|p| p.identite).root();
-    let ip_options = if option == IP_OPTIONS && s.protocole != Protocole::Tcp {
+    let ip_options = if option == IP_OPTIONS {
         if longueur as usize > format_ipv4::OPTIONS_MAX {
             return Err(-EINVAL);
         }
@@ -1965,15 +1965,25 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         _ => return Err(-ENOPROTOOPT),
     }
     // TCP émet ses segments et reçoit sans le Mutex : ses copies d'IP_TTL,
-    // d'IP_TOS, d'IP_MTU_DISCOVER et d'IP_MINTTL.
-    let (ttl, tos, pmtudisc, minttl) = (op.ttl.unwrap_or(crate::reseau::ipv4::TTL_DEFAUT), op.tos, op.pmtudisc, op.minttl);
+    // d'IP_TOS, d'IP_MTU_DISCOVER, d'IP_MINTTL et d'IP_OPTIONS.
+    let (ttl, tos, pmtudisc, minttl, options) =
+        (op.ttl.unwrap_or(crate::reseau::ipv4::TTL_DEFAUT), op.tos, op.pmtudisc, op.minttl, op.ip_options);
     drop(inet);
-    if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER | IP_MINTTL) {
-        tcp::avec_options(s, |o, _| {
+    if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER | IP_MINTTL | IP_OPTIONS) {
+        tcp::avec_options(s, |o, tcb| {
             o.ttl = ttl;
             o.tos = tos;
             o.pmtudisc = pmtudisc;
             o.minttl = minttl;
+            if option == IP_OPTIONS {
+                // Leur place dans chaque segment : le MSS est recalculé tout de
+                // suite (`icsk_ext_hdr_len`, `tcp_sync_mss`), même sans connexion.
+                o.ip_options = options;
+                match tcb {
+                    Some(t) => t.poser_options_ip(options.longueur),
+                    None => o.hors_connexion.synchroniser(),
+                }
+            }
         });
     }
     Ok(())
