@@ -177,7 +177,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     if a.famille != AF_INET {
         return Err(-EAFNOSUPPORT);
     }
-    let Trajet { destination: adresse, source, .. } = router(&inet, a.adresse, &Controle::default(), 0)?;
+    let Trajet { destination: adresse, source, .. } = router(&inet, a.adresse, &Controle::default(), 0, false)?;
     if !inet.adresse_choisie {
         inet.adresse = source;
     }
@@ -247,6 +247,9 @@ pub struct Controle {
     /// SCM_RIGHTS ou SCM_CREDENTIALS (qu'UDP ignore, et qu'AF_UNIX refuse
     /// jusqu'à 6l).
     pub droits: bool,
+    /// IP_RETOPTS : les options de cet envoi, à la place de celles de la
+    /// socket (IP_OPTIONS), même vides (l'`ipc.opt` de Linux, alors posé).
+    pub options: Option<format_ipv4::OptionsSortantes>,
 }
 
 /// Ce que donne la route d'un envoi ou d'une connexion.
@@ -269,11 +272,13 @@ pub struct Trajet {
 /// routes ne passent que par une interface) ; 0.0.0.0, la source demandée
 /// ou 127.0.0.1 (`ipv4::router`) ; pas de route : ENETUNREACH ; avec
 /// SO_DONTROUTE ou MSG_DONTROUTE, seulement une machine d'un réseau
-/// directement branché (RTO_ONLINK : ENETUNREACH par une passerelle) ; une
+/// directement branché (RTO_ONLINK : ENETUNREACH par une passerelle), de
+/// même avec une route source stricte (`stricte`, SSRR : sa première étape
+/// doit être une voisine, `is_strictroute`) ; une
 /// source de la boucle (127.0.0.0/8) qui sortirait par une carte : EINVAL
 /// (`__mkroute_output` : l'autre bout la jetterait comme un martien) ; une
 /// diffusion sans SO_BROADCAST : EACCES.
-pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64) -> Result<Trajet, i64> {
+pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64, stricte: bool) -> Result<Trajet, i64> {
     const MSG_DONTROUTE: u64 = 4;
     const ENODEV: i64 = 19;
     let demandee = c.source.filter(|&a| a != format_ipv4::AUCUNE).or_else(|| source_liee(inet));
@@ -291,7 +296,7 @@ pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64) ->
         return Err(-ENODEV);
     }
     let (chemin, destination) = ipv4::router(destination, demandee).map_err(|_| sans_route())?;
-    if (inet.options.dontroute || drapeaux & MSG_DONTROUTE != 0)
+    if (inet.options.dontroute || drapeaux & MSG_DONTROUTE != 0 || stricte)
         && matches!(chemin, Chemin::Unicast { prochain, .. } if prochain != destination) {
         return Err(sans_route());
     }
@@ -307,9 +312,10 @@ pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64) ->
 
 /// Ce que fixe un envoi quand il commence (le `flowi4` et l'`inet_cork` de
 /// Linux, `ip_setup_cork`) : la route, les adresses, la MTU où le découper
-/// (`cork->fragsize`), et ce que ses messages de contrôle demandent pour
+/// (`cork->fragsize`), ce que ses messages de contrôle demandent pour
 /// l'en-tête IPv4 (`cork->ttl`, `cork->tos` : sinon, ceux de la socket
-/// quand il part). Le bouchon d'UDP le garde d'un envoi à l'autre.
+/// quand il part), et ses options (`cork->opt`, `cork->addr`). Le bouchon
+/// d'UDP le garde d'un envoi à l'autre.
 #[derive(Clone, Copy)]
 pub struct Depart {
     pub chemin: Chemin,
@@ -320,15 +326,26 @@ pub struct Depart {
     tos: Option<u8>,
     /// MSG_CONFIRM, au premier envoi : la machine voisine est là (arp.rs).
     confirmer: bool,
+    /// Les options IP (celles d'IP_RETOPTS, sinon d'IP_OPTIONS au premier
+    /// envoi), et la vraie destination, que reçoit une route source
+    /// (`destination` est alors sa première étape).
+    options: format_ipv4::OptionsSortantes,
+    destination_finale: [u8; 4],
 }
 
 impl Depart {
+    /// La taille de l'en-tête IPv4 des paquets de cet envoi, options comprises
+    /// (le `fragheaderlen` d'`__ip_append_data`).
+    pub fn entete(&self) -> usize {
+        format_ipv4::ENTETE + self.options.longueur as usize
+    }
+
     /// Le paquet de `charge` octets (après l'en-tête IPv4) part-il avec DF
     /// (`__ip_make_skb`) ? Avec IP_PMTUDISC_DO et PROBE, et WANT s'il n'a
     /// pas à être découpé.
     pub fn ne_pas_fragmenter(&self, pmtudisc: u8, charge: usize) -> bool {
         matches!(pmtudisc, 2 | 3)
-            || (charge + format_ipv4::ENTETE <= ipv4::mtu_vers(&self.chemin, self.destination) as usize
+            || (charge + self.entete() <= ipv4::mtu_vers(&self.chemin, self.destination) as usize
                 && ipv4::ne_pas_fragmenter(pmtudisc, self.destination))
     }
 
@@ -355,6 +372,7 @@ impl Depart {
             source: self.source, destination: self.destination, protocole,
             ttl: self.ttl.or(inet.options.ttl).unwrap_or(ipv4::TTL_DEFAUT), tos: self.tos.unwrap_or(inet.options.tos),
             identifiant, ne_pas_fragmenter: self.ne_pas_fragmenter(pmtudisc, charge), mtu: self.mtu, confirmer: self.confirmer,
+            options: self.options, destination_finale: self.destination_finale,
         }
     }
 
@@ -370,11 +388,12 @@ impl Depart {
 
 /// Trop gros pour `d` (`permis`) : EMSGSIZE, et avec IP_RECVERR une erreur
 /// « locale » en file (`ip_local_error` : la destination, le port de la
-/// connexion, la MTU).
+/// connexion, la MTU moins la place des options).
 pub fn trop_gros(s: &Socket, inet: &Inet, d: &Depart) -> i64 {
     const EMSGSIZE: i64 = 90;
+    let info = d.mtu - d.options.longueur as u32;
     if inet.options.recverr
-        && let Some(e) = socket::ErreurEnFile::locale(EMSGSIZE as i32, d.mtu, d.destination, inet.port_distant)
+        && let Some(e) = socket::ErreurEnFile::locale(EMSGSIZE as i32, info, d.destination, inet.port_distant)
     {
         s.mettre_en_file(e);
     }
@@ -387,9 +406,12 @@ pub const MSG_PROBE: u64 = 0x10;
 
 /// Le début d'un envoi, une fois sa destination connue (`ip_make_skb`,
 /// `__ip_append_data`, `sock_alloc_send_pskb`), commun à UDP et ping, sous
-/// le `Mutex` : la route et ses refus (`router`) ; `charge` octets
-/// (l'en-tête du protocole compris) plus l'en-tête IPv4 au-delà de ce qu'on
-/// a le droit d'envoyer (`Depart::permis`) : `trop_gros` ; l'erreur en
+/// le `Mutex` : les options (celles d'IP_RETOPTS, sinon de la socket) ;
+/// avec une route source, une vraie destination (EINVAL pour 0.0.0.0, que
+/// `ipv4::router` remplacerait), et la route va à sa première étape ; la
+/// route et ses refus (`router`) ; `charge` octets (l'en-tête du protocole
+/// compris) plus l'en-tête IPv4, options comprises, au-delà de ce qu'on a
+/// le droit d'envoyer (`Depart::permis`) : `trop_gros` ; l'erreur en
 /// attente (lue et effacée : un ECONNREFUSED revenu après l'envoi précédent
 /// sort ici) ; l'écriture arrêtée : EPIPE, sans SIGPIPE (le signal est
 /// l'affaire de TCP). Avec MSG_PROBE, rien après la route : Linux ne fait
@@ -399,16 +421,23 @@ pub const MSG_PROBE: u64 = 0x10;
 pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize, drapeaux: u64, c: &Controle) -> Result<Depart, i64> {
     const MSG_CONFIRM: u64 = 0x800;
     const EPIPE: i64 = 32;
-    let Trajet { chemin, destination, source } = router(inet, destination, c, drapeaux)?;
+    let options = c.options.unwrap_or(inet.options.ip_options);
+    let p = options.places;
+    if p.route_source != 0 && destination == format_ipv4::AUCUNE {
+        return Err(-EINVAL);
+    }
+    let vers = if p.route_source != 0 { options.premier_saut } else { destination };
+    let Trajet { chemin, destination: premiere, source } = router(inet, vers, c, drapeaux, p.stricte)?;
     let pmtudisc = inet.options.pmtudisc;
     let d = Depart {
-        chemin, source, destination, mtu: ipv4::mtu_d_envoi(pmtudisc, &chemin, destination),
-        ttl: c.ttl, tos: c.tos, confirmer: drapeaux & MSG_CONFIRM != 0,
+        chemin, source, destination: premiere, mtu: ipv4::mtu_d_envoi(pmtudisc, &chemin, premiere),
+        ttl: c.ttl, tos: c.tos, confirmer: drapeaux & MSG_CONFIRM != 0, options,
+        destination_finale: if p.route_source != 0 { destination } else { premiere },
     };
     if drapeaux & MSG_PROBE != 0 {
         return Ok(d);
     }
-    if charge + format_ipv4::ENTETE > d.permis(pmtudisc) {
+    if charge + d.entete() > d.permis(pmtudisc) {
         return Err(trop_gros(s, inet, &d));
     }
     // (Chez Linux, ces deux refus viennent de l'attente de la place, dans
@@ -505,11 +534,11 @@ fn attendre_la_place(s: &Socket, non_bloquant: bool, delai: Option<u64>) -> Resu
 fn morceaux_permis(s: &Socket, charge: usize, d: &Depart, pmtudisc: u8) -> Result<(), i64> {
     const ENOBUFS: i64 = 105;
     let Some(r) = &s.envois else { return Ok(()) };
-    if charge + format_ipv4::ENTETE <= d.mtu as usize || d.ne_pas_fragmenter(pmtudisc, charge) {
+    if charge + d.entete() <= d.mtu as usize || d.ne_pas_fragmenter(pmtudisc, charge) {
         return Ok(());
     }
-    let plein = (d.mtu as usize - format_ipv4::ENTETE) & !7;
-    let morceaux = format_ipv4::nombre_de_fragments(charge, d.mtu as usize, format_ipv4::ENTETE);
+    let plein = (d.mtu as usize - d.entete()) & !7;
+    let morceaux = format_ipv4::nombre_de_fragments(charge, d.mtu as usize, d.entete());
     let taille = (morceaux - 1) * (paquet::MARGE + plein + paquet::SURCOUT);
     if r.octets() + taille > 2 * r.limite() {
         return Err(jete(-ENOBUFS));

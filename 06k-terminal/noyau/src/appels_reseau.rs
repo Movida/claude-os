@@ -29,6 +29,7 @@ use crate::{processus, temps, vfs};
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use fichiers::tmpfs::Ouvert;
+use formats::reseau::ipv4 as format_ipv4;
 
 const EPERM: i64 = 1;
 const EBADF: i64 = 9;
@@ -127,6 +128,7 @@ const SO_SNDTIMEO_NEW: i32 = 67;
 const IP_TOS: i32 = 1;
 const IP_TTL: i32 = 2;
 const IP_HDRINCL: i32 = 3;
+const IP_OPTIONS: i32 = 4;
 const IP_ROUTER_ALERT: i32 = 5;
 const IP_RECVOPTS: i32 = 6;
 const IP_RETOPTS: i32 = 7;
@@ -861,8 +863,12 @@ fn aligner(n: usize) -> usize {
 
 /// Les messages de contrôle d'un envoi (`ip_cmsg_send`, et
 /// `__sock_cmsg_send` pour SOL_SOCKET), déjà copiés : chacun doit tenir
-/// (`CMSG_OK` : EINVAL) ; SOL_IP : IP_PKTINFO (sa source), IP_TTL (1 à
-/// 255), IP_TOS (un entier ou un octet, 0 à 255), un autre : EINVAL ;
+/// (`CMSG_OK` : EINVAL) ; SOL_IP : IP_RETOPTS (les options de cet envoi :
+/// ses 40 premiers octets, vérifiées comme IP_OPTIONS, `root` : avec
+/// CAP_NET_RAW ; fausses : EINVAL ; le dernier compte), IP_PKTINFO (sa
+/// source), IP_TTL (1 à 255), IP_TOS (un entier ou un octet, 0 à 255),
+/// IP_PROTOCOL (un entier, 1 à 255 : sans effet pour UDP et ping, il ne
+/// sert qu'aux sockets brutes), un autre : EINVAL ;
 /// SOL_SOCKET : SCM_RIGHTS et SCM_CREDENTIALS ignorés (ceux d'AF_UNIX), un
 /// autre : EINVAL (un écart pour SO_MARK, SO_PRIORITY, l'horodatage :
 /// Linux les prend) ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
@@ -871,7 +877,7 @@ fn aligner(n: usize) -> usize {
 /// (`ip_cmsg_send`) ; ping, seulement ces deux-là (SOL_UDP est sauté) ; TCP,
 /// seulement SOL_SOCKET (`sock_cmsg_send`, dans `tcp_sendmsg_locked`) : un
 /// message d'un autre niveau, même faux, ne compte pas (mesuré).
-fn lire_controle(c: &[u8], protocole: Protocole) -> Result<Controle, i64> {
+fn lire_controle(c: &[u8], root: bool, protocole: Protocole) -> Result<Controle, i64> {
     let mut r = Controle::default();
     let mut i = 0;
     while c.len() >= i + CMSG_ENTETE {
@@ -898,6 +904,16 @@ fn lire_controle(c: &[u8], protocole: Protocole) -> Result<Controle, i64> {
             Ok(i32::from_le_bytes([d[0], d[1], d[2], d[3]]))
         };
         match (niveau, sorte) {
+            (SOL_IP, IP_RETOPTS) => {
+                let n = d.len().min(format_ipv4::OPTIONS_MAX);
+                let o = format_ipv4::options_a_envoyer(&d[..n], root, &crate::reseau::ipv4::unicast);
+                r.options = Some(o.map_err(|_| -EINVAL)?);
+            }
+            (SOL_IP, IP_PROTOCOL) => {
+                if !(1..=255).contains(&entier()?) {
+                    return Err(-EINVAL);
+                }
+            }
             (SOL_IP, IP_PKTINFO) => {
                 if d.len() != 12 {
                     return Err(-EINVAL);
@@ -1004,7 +1020,7 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
             }
             Ok(Controle::default())
         } else {
-            lire_controle(&c, o.socket().protocole)
+            lire_controle(&c, processus::avec(|p| p.identite).root(), o.socket().protocole)
         }
     } else {
         Ok(Controle::default())
@@ -1140,7 +1156,6 @@ impl ControleSortant {
 /// IP_CHECKSUM (la somme complète), IP_RECVFRAGSIZE (un paquet recollé).
 /// `destination` : celle du paquet.
 fn controle_ip(c: &mut ControleSortant, options: &socket::Options, ip: &socket::ControleIp, destination: [u8; 4], drapeaux: &mut u32) {
-    use formats::reseau::ipv4 as format_ipv4;
     let e = &ip.entete;
     if options.recvttl {
         c.ecrire(SOL_IP, IP_TTL, &(e.ttl as i32).to_le_bytes(), drapeaux);
@@ -1152,8 +1167,7 @@ fn controle_ip(c: &mut ControleSortant, options: &socket::Options, ip: &socket::
         c.ecrire(SOL_IP, IP_RECVOPTS, e.options(), drapeaux);
     }
     if options.retopts && e.longueur_options != 0 {
-        let unicast = |a| crate::reseau::ipv4::avec_table(|t| t.est_unicast(a)).unwrap_or(false);
-        match format_ipv4::options_echo(e.options(), &e.compilees, ip.source, &unicast) {
+        match format_ipv4::options_echo(e.options(), &e.compilees, ip.source, &crate::reseau::ipv4::unicast) {
             Ok(mut d) => {
                 d.defaire();
                 c.ecrire(SOL_IP, IP_RETOPTS, d.octets(), drapeaux);
@@ -1823,8 +1837,10 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
 /// sont d'une socket brute (ENOPROTOOPT) ; IP_IPSEC_POLICY et
 /// IP_XFRM_POLICY : EPERM sans root, puis ENOPROTOOPT (le `xfrm_user_policy`
 /// d'un noyau sans IPsec, CONFIG_XFRM). Les options de la multidiffusion
-/// (sauf IP_MULTICAST_TTL), IP_UNICAST_IF et IP_OPTIONS : ENOPROTOOPT, un
-/// écart.
+/// (sauf IP_MULTICAST_TTL), IP_UNICAST_IF, et IP_OPTIONS pour TCP :
+/// ENOPROTOOPT, un écart. IP_OPTIONS : 40 octets au plus (EINVAL), copiés
+/// (EFAULT) avant de prendre le `Mutex`, vérifiés pour l'envoi
+/// (`ip_options_get` : EINVAL), aucun octet : aucune option.
 fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(), i64> {
     let simple = matches!(option, IP_PKTINFO | IP_RECVTTL | IP_RECVOPTS | IP_RECVTOS | IP_RETOPTS | IP_TOS | IP_TTL
         | IP_HDRINCL | IP_MTU_DISCOVER | IP_RECVERR | IP_ROUTER_ALERT | IP_FREEBIND | IP_PASSSEC | IP_TRANSPARENT
@@ -1849,6 +1865,17 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
     // CAP_NET_RAW (ou CAP_NET_ADMIN) : un droit de qui pose l'option
     // (`ns_capable`), pas de qui a créé la socket.
     let root = processus::avec(|p| p.identite).root();
+    let ip_options = if option == IP_OPTIONS && s.protocole != Protocole::Tcp {
+        if longueur as usize > format_ipv4::OPTIONS_MAX {
+            return Err(-EINVAL);
+        }
+        let mut o = [0u8; format_ipv4::OPTIONS_MAX];
+        let o = &mut o[..longueur as usize];
+        copier_depuis_utilisateur(o, valeur).map_err(|_| -EFAULT)?;
+        Some(format_ipv4::options_a_envoyer(o, root, &crate::reseau::ipv4::unicast).map_err(|_| -EINVAL)?)
+    } else {
+        None
+    };
     let mut inet = s.appels.verrouiller();
     let op = &mut inet.options;
     let oui = v != 0;
@@ -1933,6 +1960,7 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
             op.local_port_range = v as u32;
         }
         IP_IPSEC_POLICY | IP_XFRM_POLICY if !root => return Err(-EPERM),
+        IP_OPTIONS if let Some(o) = ip_options => op.ip_options = o,
         _ => return Err(-ENOPROTOOPT),
     }
     // TCP émet ses segments et reçoit sans le Mutex : ses copies d'IP_TTL,
@@ -1997,6 +2025,17 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
             }
             // Le routage de la multidiffusion avant la longueur (`ip_mroute_getsockopt`).
             SOL_IP if MRT.contains(&option) => Err(-EOPNOTSUPP),
+            // Les options défaites (`ip_options_undo`), autant qu'il y a de
+            // place ; aucune : une longueur nulle.
+            SOL_IP if option == IP_OPTIONS => {
+                let place = lire_longueur(&mut l)?;
+                let mut o = s.appels.verrouiller().options.ip_options;
+                o.defaire();
+                let n = (place as usize).min(o.longueur as usize);
+                copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+                copier_vers_utilisateur(valeur, &o.octets()[..n]).map_err(|_| -EFAULT)?;
+                Ok(0)
+            }
             SOL_IP if option == IP_PKTOPTIONS => {
                 let place = lire_longueur(&mut l)?;
                 if s.protocole != Protocole::Tcp {

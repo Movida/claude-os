@@ -131,8 +131,11 @@ pub fn temps() {
         });
         super::tache::inscrire(super::tache::OBJET_VOISINS, t.echeance());
     }
-    for p in echecs {
-        super::icmp::envoyer_erreur(icmp::INJOIGNABLE, icmp::HOTE, 0, p.donnees(), false, false, false);
+    // L'erreur cite le paquet, ses options revues (`ipv4_send_dest_unreach`).
+    for mut p in echecs {
+        if let Some(o) = super::ipv4::options_d_un_envoi(&mut p) {
+            super::icmp::envoyer_erreur(icmp::INJOIGNABLE, icmp::HOTE, 0, p.donnees(), &o, false, false, false);
+        }
     }
 }
 

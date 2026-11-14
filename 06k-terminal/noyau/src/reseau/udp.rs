@@ -109,6 +109,15 @@ pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
 /// bouché, attente de la place et copie comprises (un autre fil qui envoie
 /// attend son tour, et ajoute derrière). Son paquet compte dans SO_SNDBUF
 /// (mesuré : SIOCOUTQ le voit grandir de chaque ajout, POLLOUT aussi).
+///
+/// Un écart voulu, avec une route source (IP_OPTIONS) : bouché, Linux
+/// adresse le datagramme à sa destination finale (le `flowi4` du bouchon
+/// garde `daddr`, pas la première étape : l'en-tête, la somme d'UDP et
+/// l'erreur locale la prennent ; mesuré), quand le même envoi sans bouchon
+/// part vers la première étape, comme le veut la route source. Un accident
+/// de `udp_sendmsg` (le chemin bouché remplit un autre `flowi4`), qu'aucun
+/// programme ne peut attendre : le nôtre part toujours vers la première
+/// étape.
 pub struct Bouchon {
     /// Le segment : la place de l'en-tête UDP, puis les données.
     paquet: Paquet,
@@ -248,11 +257,11 @@ fn ajouter(s: &Socket, inet: &mut Inet, longueur: usize, bouche: bool, sonde: bo
     let Some(b) = inet.bouchon.as_mut() else { return Ok(0) };
     let avant = b.paquet.longueur();
     let apres = avant + longueur;
-    let r = if apres + format_ipv4::ENTETE > b.depart.permis(pmtudisc) {
+    let r = if apres + b.depart.entete() > b.depart.permis(pmtudisc) {
         let d = b.depart;
         Err(trop_gros(s, inet, &d))
     } else {
-        let (entete, mtu) = (format_ipv4::ENTETE, b.depart.mtu as usize);
+        let (entete, mtu) = (b.depart.entete(), b.depart.mtu as usize);
         let morceaux_avant = format_ipv4::nombre_de_fragments(avant, mtu, entete);
         let nouveaux = format_ipv4::nombre_de_fragments(apres, mtu, entete) - morceaux_avant;
         let retenue = longueur + nouveaux * (paquet::MARGE + paquet::SURCOUT);

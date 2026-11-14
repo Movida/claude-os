@@ -348,6 +348,9 @@ pub struct Options {
     pub mc_ttl: u8,
     pub mc_index: u32,
     pub rcv_tos: u8,
+    /// IP_OPTIONS : les options de chaque envoi (`inet_opt`), vérifiées pour
+    /// l'envoi (formats, `options_a_envoyer`).
+    pub ip_options: formats::reseau::ipv4::OptionsSortantes,
 }
 
 impl Options {
@@ -358,6 +361,7 @@ impl Options {
         udp_cork: false, recvttl: false, recvtos: false, recvopts: false, retopts: false, passsec: false,
         origdstaddr: false, checksum: false, recvfragsize: false, rfc4884: false, freebind: false, transparent: false,
         bind_no_port: false, minttl: 0, local_port_range: 0, mc_ttl: 1, mc_index: 0, rcv_tos: 0,
+        ip_options: formats::reseau::ipv4::OptionsSortantes::AUCUNE,
     };
 }
 

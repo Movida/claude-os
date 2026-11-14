@@ -980,6 +980,7 @@ fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], 
     let envoi = ipv4::Envoi {
         source, destination, protocole: fipv4::TCP, ttl: ip.ttl, tos: ip.tos, identifiant: *identifiant,
         ne_pas_fragmenter: ipv4::ne_pas_fragmenter(ip.pmtudisc, destination), mtu: ipv4::mtu_d_envoi(ip.pmtudisc, &chemin, destination), confirmer: false,
+        options: fipv4::OptionsSortantes::AUCUNE, destination_finale: destination,
     };
     ipv4::emettre(chemin, &envoi, p);
 }

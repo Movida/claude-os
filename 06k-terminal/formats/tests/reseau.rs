@@ -280,10 +280,10 @@ fn options_comme_linux() {
         entete.extend_from_slice(&options);
         let lu = ipv4::compiler_options(&mut entete, &ici);
         match issue {
-            "parametre" | "cipso" => assert_eq!(lu, Err(mots[3].parse().unwrap()), "{nom}"),
+            "parametre" | "cipso" => assert_eq!(lu.map_err(|f| f.place), Err(mots[3].parse().unwrap()), "{nom}"),
             "jete" => assert!(lu.is_ok_and(|o| o.route_source != 0), "{nom} : {lu:?}"),
             "livre" | "muet" => {
-                let o = lu.unwrap_or_else(|e| panic!("{nom} : refusé à l'octet {e}"));
+                let o = lu.unwrap_or_else(|e| panic!("{nom} : refusé à l'octet {}", e.place));
                 assert_eq!(o.route_source, 0, "{nom}");
                 assert_eq!(entete[ipv4::ENTETE..], hex(&mots[3].replace("........", "01020304"))[..], "{nom}");
                 assert_eq!(o.modifiees, mots[1] != mots[3], "{nom}");
@@ -302,6 +302,12 @@ fn options_comme_linux() {
     let o = ipv4::compiler_options(&mut e, &ici).unwrap();
     assert_eq!((o.route_notee, o.horodatage, o.alerte, o.route_source, o.stricte), (21, 28, 32, 36, true));
     assert_eq!((o.route_notee_adresse, o.horodatage_adresse, o.horodatage_heure), (true, false, false));
+    // Une faute garde ce qui la précède (`IPCB(skb)->opt`), dont l'erreur
+    // ICMP fait l'écho : ici la première route notée, avec sa place prise.
+    let mut e = vec![0u8; ipv4::ENTETE];
+    e.extend_from_slice(&hex("0707040000000007030400"));
+    let f = ipv4::compiler_options(&mut e, &ici).unwrap_err();
+    assert_eq!((f.place, f.options.route_notee, f.options.route_notee_adresse), (27, 20, true));
     // Des options au hasard (des genres connus le plus souvent, des
     // longueurs et des pointeurs proches des bords) : jamais de panique, une
     // faute désigne un octet des options, et rien ne change hors d'elles ;
@@ -322,7 +328,7 @@ fn options_comme_linux() {
         }
         let avant = e.clone();
         match ipv4::compiler_options(&mut e, &ici) {
-            Err(place) => {
+            Err(ipv4::Faute { place, .. }) => {
                 assert!((ipv4::ENTETE..e.len()).contains(&(place as usize)), "{avant:02x?} : {place}");
                 fautes += 1;
             }
@@ -397,6 +403,71 @@ fn echo_des_options() {
     let o = ipv4::compiler_options(&mut e, &ici).unwrap();
     let d = ipv4::options_echo(&e[ipv4::ENTETE..], &o, [10, 0, 0, 1], &unicast).unwrap();
     assert_eq!((d.longueur, d.places.route_source), (0, 0));
+}
+
+/// Les options qu'un programme donne à ses envois (`options_a_envoyer`),
+/// relues par `getsockopt` (défaites : `defaire`), puis complétées au
+/// départ (`construire_options`, de 127.0.0.1 à 01:22:51.920, 0x04c3cc10),
+/// comme Linux 6.18 (soldes, sondes-sol-ip/cmsg.txt ; ce qui en arrive est
+/// le premier cas de chaque ligne d'`echo_des_options`).
+#[test]
+fn options_a_envoyer_comme_linux() {
+    let hex = |h: &str| -> Vec<u8> { (0..h.len() / 2).map(|i| u8::from_str_radix(&h[2 * i..2 * i + 2], 16).unwrap()).collect() };
+    let unicast = |a: [u8; 4]| !(a[0] == 127 || a[0] == 0 || a == ipv4::DIFFUSION || ipv4::multidiffusion(a));
+    let source = [127, 0, 0, 1];
+    // Donné, relu, puis tel qu'il part vers 127.0.0.3.
+    let cas = |donne: &str, racine: bool| -> Result<(Vec<u8>, Vec<u8>), ()> {
+        let o = ipv4::options_a_envoyer(&hex(donne), racine, &unicast)?;
+        let mut relu = o;
+        relu.defaire();
+        let mut e = vec![0u8; ipv4::ENTETE + o.longueur as usize];
+        ipv4::construire_options(&mut e, &o, [127, 0, 0, 3], source, 0x04c3_cc10);
+        Ok((relu.octets().to_vec(), e[ipv4::ENTETE..].to_vec()))
+    };
+    let ok = |donne: &str, relu: &str, part: &str| {
+        assert_eq!(cas(donne, false), Ok((hex(relu), hex(part))), "{donne}");
+    };
+    ok("070b040000000000000000", "070b04000000000000000000", "070b087f0000010000000000");
+    ok("440c0501000000000000000001", "440c0501000000000000000001000000", "440c0d017f00000104c3cc1001000000");
+    // Ce qui suit la fin (FIN) devient FIN.
+    ok("440c050100000000000000000001", "440c0501000000000000000000000000", "440c0d017f00000104c3cc1000000000");
+    ok("440c05010000000000000000" , "440c05010000000000000000", "440c0d017f00000104c3cc10");
+    ok("440c05037f00000100000000", "440c05037f00000100000000", "440c0d037f00000104c3cc10");
+    // Une adresse donnée d'avance qui est quelqu'un d'autre : rien à y mettre.
+    ok("440c05030a00000100000000", "440c05030a00000100000000", "440c05030a00000100000000");
+    // La route source : la première étape sort, la destination va au bout.
+    let o = ipv4::options_a_envoyer(&hex("830b047f0000017f000002"), false, &unicast).unwrap();
+    assert_eq!((o.premier_saut, o.places.route_source, o.places.stricte), ([127, 0, 0, 1], 20, false));
+    ok("830b047f0000017f000002", "830b047f0000017f00000200", "830b047f0000027f00000300");
+    ok("8307047f000001", "8307047f00000100", "8307047f00000300");
+    // Les refus (EINVAL) : deux horodatages ; une route source dont la
+    // longueur n'est pas faite de mots, au pointeur qui n'est pas 4, sans
+    // étape ; sans CAP_NET_RAW : la sécurité, un drapeau d'horodatage
+    // inconnu (avec de la place), une option inconnue ; CIPSO, toujours ;
+    // plus de 40 octets.
+    for (donne, racine) in [("440c0501000000000000000044080501", false), ("8308040102030405", false), ("83070801020304", false),
+                            ("830304", false), ("82040000", false), ("440c0502000000000000000000", false), ("fe020000", false),
+                            ("86080000000000000000", true), (&"01".repeat(41), true)] {
+        assert_eq!(cas(donne, racine), Err(()), "{donne}");
+    }
+    // Avec CAP_NET_RAW, la sécurité, le drapeau inconnu et l'option inconnue
+    // passent, telles quelles.
+    assert_eq!(cas("82040000", true), Ok((hex("82040000"), hex("82040000"))));
+    assert_eq!(cas("440c0502000000000000000000", true).map(|(r, _)| r), Ok(hex("440c0502000000000000000000000000")));
+    // Sans place, l'horodatage passe, sans compter de débordement ; l'alerte,
+    // une route notée pleine aussi.
+    ok("44040502", "44040502", "44040502");
+    ok("94040000", "94040000", "94040000");
+    ok("07070800000000", "0707080000000000", "0707080000000000");
+    ok("", "", "");
+    ok(&"01".repeat(40), &"01".repeat(40), &"01".repeat(40));
+    // Ce qu'un fragment après le premier en garde (`ip_options_fragment`) :
+    // la route notée et l'horodatage deviennent des bourrages, la route
+    // source reste.
+    let mut f = hex("070b087f0000010000000001830704" );
+    f.extend_from_slice(&hex("7f00000300"));
+    ipv4::options_de_fragment(&mut f);
+    assert_eq!(f, hex("0101010101010101010101018307047f00000300"));
 }
 
 /// La somme que garde Linux (`csum_partial` d'x86-64), rendue par

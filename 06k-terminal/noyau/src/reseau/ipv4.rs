@@ -47,7 +47,10 @@
 //! sont comptés par qui envoie (datagramme.rs, icmp.rs, tcp.rs).
 //!
 //! LA SORTIE (`ip_queue_xmit`, `ip_make_skb`) : la route (`router`), puis
-//! l'en-tête, puis l'interface : `lo` pour une de nos adresses (Linux
+//! l'en-tête, avec les options de l'envoi (IP_OPTIONS, IP_RETOPTS, l'écho de
+//! celles d'un paquet auquel on répond), complétées une fois
+//! (`ip_options_build` : notre adresse, l'heure, la vraie destination au bout
+//! d'une route source, l'en-tête allant à sa première étape), puis l'interface : `lo` pour une de nos adresses (Linux
 //! aussi : la route locale passe par `lo`), la diffusion d'Ethernet pour
 //! une diffusion, le voisin (ARP) pour le reste. Un paquet plus grand que la MTU
 //! part en fragments, sauf DF (`ip_do_fragment`). Une diffusion envoyée par une
@@ -222,7 +225,7 @@ fn martien(i: &Interface, h: &ipv4::Ipv4, table: &Table) -> bool {
 /// une diffusion), sinon la source de la route vers l'émetteur, sinon une
 /// adresse de l'interface (de son réseau d'abord : `inet_select_addr`).
 /// None : pas de table.
-fn lire_options(i: &Interface, h: &ipv4::Ipv4, p: &mut Paquet) -> Option<Result<ipv4::Options, u8>> {
+fn lire_options(i: &Interface, h: &ipv4::Ipv4, p: &mut Paquet) -> Option<Result<ipv4::Options, ipv4::Faute>> {
     let garde = TABLE.verrouiller();
     let t = garde.as_ref()?;
     let de_l_interface = || {
@@ -294,10 +297,12 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
             // Une option fausse : le « problème de paramètre » dit son
             // octet, dans les 8 bits forts de ses 4 octets (`icmp_send`
             // d'`ip_options_compile`) ; jamais pour une diffusion.
-            Some(Err(place)) => {
+            // Elle fait l'écho de ce qui précède la faute.
+            Some(Err(f)) => {
                 MIB.ip(Ip::InHdrErrors);
                 if !diffusion {
-                    super::icmp::envoyer_erreur(icmp::PARAMETRE, 0, (place as u32) << 24, p.donnees(), i.boucle(), pour_nous, trame_diffusee);
+                    super::icmp::envoyer_erreur(icmp::PARAMETRE, 0, (f.place as u32) << 24, p.donnees(), &f.options, i.boucle(),
+                                                pour_nous, trame_diffusee);
                 }
                 return;
             }
@@ -331,12 +336,26 @@ struct Arrivee {
 /// La copie `p` d'une diffusion que nous avons envoyée par la carte `i`
 /// (boucle.rs, `rendre_la_diffusion`) : livrée comme arrivée par `i`, sans le
 /// tri de l'entrée (Linux garde la route de la sortie, `skb_dst` : la source,
-/// qui est à nous, n'est pas un martien) ni d'options (nous n'en écrivons
-/// pas). Elle compte comme un paquet arrivé (Linux la fait repasser par `ip_rcv`).
+/// qui est à nous, n'est pas un martien). Elle compte comme un paquet arrivé
+/// (Linux la fait repasser par `ip_rcv`), et ses options (IP_OPTIONS) sont
+/// revues comme celles de tout paquet reçu (`ip_rcv_options`) : notées (la
+/// route notée y reçoit encore notre adresse), une route source jetée, une
+/// option fausse aussi (sans « problème de paramètre » : jamais pour une
+/// diffusion).
 pub fn recevoir_la_diffusion(i: &'static Interface, p: Paquet) {
     MIB.ip(Ip::InReceives);
     let Ok((h, _)) = ipv4::lire(p.donnees()) else { return };
-    livrer(i, h, p, ipv4::Options::AUCUNES, Arrivee { diffusion: true, trame_diffusee: false, a_verifier: false });
+    let mut p = p;
+    let mut compilees = ipv4::Options::AUCUNES;
+    if h.longueur_entete > ipv4::ENTETE {
+        match lire_options(i, &h, &mut p) {
+            None => return,
+            Some(Err(_)) => return MIB.ip(Ip::InHdrErrors),
+            Some(Ok(o)) if o.route_source != 0 => return compter(&ROUTES_SOURCES),
+            Some(Ok(o)) => compilees = o,
+        }
+    }
+    livrer(i, h, p, compilees, Arrivee { diffusion: true, trame_diffusee: false, a_verifier: false });
 }
 
 /// Livre aux protocoles le paquet `p` pour nous (son en-tête : `h`, ses options
@@ -366,7 +385,7 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Opti
         if diffusion || p.ajouter_entete(h.longueur_entete).is_none() {
             return;
         }
-        super::icmp::envoyer_erreur(icmp::INJOIGNABLE, code, 0, p.donnees(), i.boucle(), true, trame_diffusee);
+        super::icmp::envoyer_erreur(icmp::INJOIGNABLE, code, 0, p.donnees(), &compilees, i.boucle(), true, trame_diffusee);
     };
     // Livré, même jeté ensuite par le protocole (`ip_protocol_deliver_rcu`).
     MIB.ip(if matches!(h.protocole, ipv4::UDP | ipv4::ICMP | ipv4::TCP) { Ip::InDelivers } else { Ip::InUnknownProtos });
@@ -442,11 +461,11 @@ pub fn fragments_echus() {
     let maintenant = crate::temps::ns_monotone();
     loop {
         let Some(e) = REASSEMBLAGE.verrouiller().as_mut().and_then(|r| r.prendre_echue(maintenant)) else { break };
-        if let Some(Fragment { paquet: mut p, .. }) = e.premier
+        if let Some(Fragment { paquet: mut p, options }) = e.premier
             && p.ajouter_entete(e.entete as usize).is_some()
         {
             let par_lo = interface::par_index(e.interface).is_some_and(|i| i.boucle());
-            super::icmp::envoyer_erreur(icmp::TEMPS_DEPASSE, 1, 0, p.donnees(), par_lo, true, false);
+            super::icmp::envoyer_erreur(icmp::TEMPS_DEPASSE, 1, 0, p.donnees(), &options, par_lo, true, false);
         }
     }
     let prochaine = REASSEMBLAGE.verrouiller().as_ref().and_then(|r| r.echeance());
@@ -467,6 +486,12 @@ pub struct Envoi {
     pub mtu: u32,
     /// MSG_CONFIRM : la machine voisine est là (arp.rs).
     pub confirmer: bool,
+    /// Les options IP (IP_OPTIONS ou IP_RETOPTS, l'écho de celles d'un paquet
+    /// reçu pour lui répondre : l'`opt` de l'`ipcm_cookie`), et la vraie
+    /// destination, que reçoit le dernier mot d'une route source (`cork->addr` :
+    /// l'en-tête, lui, va à sa première étape).
+    pub options: ipv4::OptionsSortantes,
+    pub destination_finale: [u8; 4],
 }
 
 /// Le chemin vers `destination` (l'`ip_route_output_key` de Linux), et la
@@ -582,44 +607,80 @@ pub fn identifiant(destination: [u8; 4], source: [u8; 4], protocole: u8) -> u16 
     IDENTS_COMPTEURS[case].fetch_add(1 + pas, Ordering::Relaxed).wrapping_add(pas) as u16
 }
 
+/// Notre adresse `a` n'est-elle ni à nous, ni une diffusion, ni une
+/// multidiffusion (`inet_addr_type` == RTN_UNICAST) ? Pour les options.
+pub fn unicast(a: [u8; 4]) -> bool {
+    avec_table(|t| t.est_unicast(a)).unwrap_or(false)
+}
+
+/// Les options du paquet `p` que nous avions envoyé, revues comme à une
+/// réception pour l'erreur ICMP qui le cite, quand la voisine ne répond pas
+/// (`ipv4_send_dest_unreach` : Linux les recompile sur place, le paquet
+/// compris : la route notée y reçoit encore notre adresse, l'horodatage
+/// l'heure). Notre adresse pour lui (`fib_compute_spec_dst` d'une route de
+/// sortie) : sa source. None : un en-tête illisible, ou une option fausse
+/// (pas d'erreur ICMP).
+pub fn options_d_un_envoi(p: &mut Paquet) -> Option<ipv4::Options> {
+    let h = ipv4::lire_cite(p.donnees()).ok()?;
+    let entete = p.donnees_mut().get_mut(..h.longueur_entete)?;
+    let ici = ipv4::Ici { adresse: h.source, heure: super::icmp::horodatage(), unicast: &unicast };
+    ipv4::compiler_options(entete, &ici).ok()
+}
+
 /// Émet le paquet `p` (sa charge en place, l'en-tête du protocole
-/// compris) selon `e`, par le chemin `c` : l'en-tête IPv4 devant, puis
-/// l'interface du chemin, dans le contexte de qui envoie (le
+/// compris) selon `e`, par le chemin `c` : l'en-tête IPv4 devant, avec ses
+/// options, puis l'interface du chemin, dans le contexte de qui envoie (le
 /// `dev_queue_xmit` de Linux). Rien ne revient : un paquet perdu en route
 /// (file pleine, voisin muet) l'est sans le dire, comme sur un câble.
+/// Les options sont complétées une fois (`ip_options_build`, quand
+/// `__ip_make_skb` fait le paquet) : la copie d'une diffusion et chaque
+/// fragment reprennent les mêmes, la même heure comprise.
 pub fn emettre(c: Chemin, e: &Envoi, p: Paquet) {
     MIB.ip(Ip::OutRequests);
+    let mut entete = [0u8; ipv4::ENTETE + ipv4::OPTIONS_MAX];
+    let n = ipv4::ENTETE + e.options.longueur as usize;
+    let heure = if e.options.places.horodatage_heure { super::icmp::horodatage() } else { 0 };
+    ipv4::construire_options(&mut entete[..n], &e.options, e.destination_finale, e.source, heure);
+    let options = &entete[ipv4::ENTETE..n];
     if let Chemin::Diffusion { interface, .. } = c
         && let Some(i) = interface::par_index(interface)
         && !i.boucle()
     {
-        rendre_une_copie(i, e, &p);
+        rendre_une_copie(i, e, options, &p);
     }
-    if p.longueur() + ipv4::ENTETE > e.mtu as usize {
-        return fragmenter(c, e, p);
+    if p.longueur() + n > e.mtu as usize {
+        return fragmenter(c, e, options, p);
     }
-    envoyer(c, e, p, 0, false);
+    envoyer(c, e, options, p, 0, false);
 }
 
 /// `ip_fragment`, `ip_do_fragment` : un paquet trop grand. Avec DF, il ne passera pas :
-/// l'erreur ICMP, à nous-mêmes (« fragmentation nécessaire », avec la MTU) ; sinon, en
-/// morceaux, chacun un multiple de 8 octets sauf le dernier (`ipv4::taille_du_fragment`),
-/// sa place et MF dans son en-tête. Un morceau qu'on ne peut pas faire : le paquet est
-/// perdu.
-fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
+/// l'erreur ICMP, à nous-mêmes (« fragmentation nécessaire », avec la MTU ; l'écho de ses
+/// options, celles de l'envoi : son `IPCB(skb)->opt`) ; sinon, en morceaux, chacun un
+/// multiple de 8 octets sauf le dernier (`ipv4::taille_du_fragment`), sa place et MF dans
+/// son en-tête, qui a la taille de celui du paquet (`options` : complétées) ; après le
+/// premier, sans les options qui ne se recopient pas (`ip_options_fragment`). Un morceau
+/// qu'on ne peut pas faire : le paquet est perdu.
+fn fragmenter(c: Chemin, e: &Envoi, options: &[u8], mut p: Paquet) {
+    let n = ipv4::ENTETE + options.len();
     if e.ne_pas_fragmenter {
         MIB.ip(Ip::FragFails);
-        let total = (p.longueur() + ipv4::ENTETE) as u16;
-        let Some(entete) = p.ajouter_entete(ipv4::ENTETE) else { return };
-        let entete: &mut [u8; ipv4::ENTETE] = entete.try_into().expect("20 octets");
+        let total = (p.longueur() + n) as u16;
+        let Some(entete) = p.ajouter_entete(n) else { return };
+        entete[ipv4::ENTETE..].copy_from_slice(options);
         ipv4::ecrire(entete, &en_tete(e, total, 0, false));
-        return super::icmp::envoyer_erreur(icmp::INJOIGNABLE, icmp::FRAGMENTATION, e.mtu, p.donnees(), par_lo(&c), false, false);
+        return super::icmp::envoyer_erreur(icmp::INJOIGNABLE, icmp::FRAGMENTATION, e.mtu, p.donnees(), &e.options.places,
+                                           par_lo(&c), false, false);
     }
+    let mut suite = [0u8; ipv4::OPTIONS_MAX];
+    let suite = &mut suite[..options.len()];
+    suite.copy_from_slice(options);
+    ipv4::options_de_fragment(suite);
     let mut debut = 0;
     let donnees = p.donnees();
     while debut < donnees.len() {
         let reste = donnees.len() - debut;
-        let longueur = ipv4::taille_du_fragment(donnees.len(), debut, e.mtu as usize, ipv4::ENTETE);
+        let longueur = ipv4::taille_du_fragment(donnees.len(), debut, e.mtu as usize, n);
         let Some(mut q) = Paquet::vide(longueur) else { return MIB.ip(Ip::FragFails) };
         // Chaque morceau compte dans le SO_SNDBUF de la socket, comme le
         // paquet entier (`__ip_append_data` les lui attache un à un).
@@ -628,7 +689,7 @@ fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
         }
         let Some(o) = q.ajouter_fin(longueur) else { return MIB.ip(Ip::FragFails) };
         o.copy_from_slice(&donnees[debut..debut + longueur]);
-        envoyer(c, e, q, (debut / 8) as u16, longueur < reste);
+        envoyer(c, e, if debut == 0 { options } else { suite }, q, (debut / 8) as u16, longueur < reste);
         MIB.ip(Ip::FragCreates);
         debut += longueur;
     }
@@ -639,12 +700,13 @@ fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
 /// (`ip_mc_output`) : le paquet entier, son en-tête devant (même plus grand que
 /// la MTU : Linux copie avant `ip_fragment`). Sans mémoire, pas de copie (le
 /// `skb_clone` qui échoue).
-fn rendre_une_copie(i: &'static Interface, e: &Envoi, p: &Paquet) {
-    let total = p.longueur() + ipv4::ENTETE;
+fn rendre_une_copie(i: &'static Interface, e: &Envoi, options: &[u8], p: &Paquet) {
+    let n = ipv4::ENTETE + options.len();
+    let total = p.longueur() + n;
     let Some(mut q) = Paquet::vide(total) else { return };
     let Some(o) = q.ajouter_fin(total) else { return };
-    let (entete, charge) = o.split_at_mut(ipv4::ENTETE);
-    let Ok(entete) = <&mut [u8; ipv4::ENTETE]>::try_from(entete) else { return };
+    let (entete, charge) = o.split_at_mut(n);
+    entete[ipv4::ENTETE..].copy_from_slice(options);
     ipv4::ecrire(entete, &en_tete(e, total as u16, 0, false));
     charge.copy_from_slice(p.donnees());
     super::boucle::rendre_la_diffusion(i, q);
@@ -663,15 +725,17 @@ fn en_tete(e: &Envoi, longueur: u16, decalage: u16, suite: bool) -> ipv4::Ipv4 {
         protocole: e.protocole,
         source: e.source,
         destination: e.destination,
-        longueur_entete: ipv4::ENTETE,
+        longueur_entete: ipv4::ENTETE + e.options.longueur as usize,
     }
 }
 
-/// L'en-tête IPv4 devant `p`, puis l'interface du chemin.
-fn envoyer(c: Chemin, e: &Envoi, mut p: Paquet, decalage: u16, suite: bool) {
-    let longueur = (p.longueur() + ipv4::ENTETE) as u16;
-    let Some(entete) = p.ajouter_entete(ipv4::ENTETE) else { return };
-    let entete: &mut [u8; ipv4::ENTETE] = entete.try_into().expect("20 octets");
+/// L'en-tête IPv4 devant `p`, avec les `options` (complétées), puis
+/// l'interface du chemin.
+fn envoyer(c: Chemin, e: &Envoi, options: &[u8], mut p: Paquet, decalage: u16, suite: bool) {
+    let n = ipv4::ENTETE + options.len();
+    let longueur = (p.longueur() + n) as u16;
+    let Some(entete) = p.ajouter_entete(n) else { return };
+    entete[ipv4::ENTETE..].copy_from_slice(options);
     ipv4::ecrire(entete, &en_tete(e, longueur, decalage, suite));
     let Some(i) = interface_de(&c) else { return };
     MIB.ip(Ip::OutTransmits);

@@ -1828,6 +1828,209 @@ static void controles(void)
     close(s);
 }
 
+/* Des octets donnés en hexadécimal ; rend leur nombre. */
+static int de_hexa(const char *h, unsigned char *o)
+{
+    int n = 0;
+    for (; h[0] && h[1]; h += 2)
+        sscanf(h, "%2hhx", &o[n++]);
+    return n;
+}
+
+/* Pose IP_OPTIONS (en hexadécimal) ; rend 0 ou l'errno. */
+static int poser_options(int s, const char *h)
+{
+    unsigned char o[64];
+    int n = de_hexa(h, o);
+    return erreur(setsockopt(s, IPPROTO_IP, IP_OPTIONS, o, n));
+}
+
+/* Relit IP_OPTIONS, en hexadécimal dans t, avec `place` octets de place. */
+static void relire_options(int s, socklen_t place, char *t)
+{
+    unsigned char o[64];
+    socklen_t l = place;
+    t[0] = 0;
+    if (getsockopt(s, IPPROTO_IP, IP_OPTIONS, o, &l) != 0)
+        strcpy(t, "erreur");
+    else
+        en_hexa(t, o, l);
+}
+
+/* Remplace par des points les 8 chiffres (4 octets : l'heure d'un
+ * horodatage) qui suivent de `decalage` le texte `apres` dans t. */
+static void masquer_l_heure(char *t, const char *apres, int decalage)
+{
+    char *c = strstr(t, apres);
+    if (c && strlen(c) >= strlen(apres) + decalage + 8)
+        memset(c + strlen(apres) + decalage, '.', 8);
+}
+
+/* IP_OPTIONS et l'écho des options reçues (les soldes d'avant 6k ; mesuré
+ * sous Linux 6.18, soldes/sondes-sol-ip/cmsg.txt) :
+ *   - posées, puis relues défaites (`ip_options_undo` : une route source
+ *     retrouve sa première étape, les places réservées sont rendues),
+ *     autant qu'il y a de place ; refusées (EINVAL), les précédentes
+ *     restent : deux horodatages, une route source mal faite, plus de 40
+ *     octets, la sécurité sans CAP_NET_RAW ; aucun octet : aucune ;
+ *   - ce qui en arrive par lo (IP_RECVOPTS : l'émetteur, puis le receveur
+ *     ont noté 127.0.0.1, ou l'heure ; un horodatage sans place compte son
+ *     débordement) et leur écho défait (IP_RETOPTS) ;
+ *   - une route source part, vers sa première étape (sendto réussit ; vers
+ *     0.0.0.0 : EINVAL), mais n'arrive pas : jetée à l'arrivée ;
+ *   - le message de contrôle IP_RETOPTS d'un envoi (vide : sans les
+ *     options de la socket), IP_PROTOCOL (1 à 255, sans effet) ;
+ *   - leur place : le plus grand datagramme UDP la perd ;
+ *   - l'écho d'un ping (la réponse revient avec la route notée), et d'une
+ *     erreur ICMP (un port fermé) en file. */
+static void options_d_ip(void)
+{
+    int racine = getuid() == 0;
+    uint16_t pr;
+    int r = liee(&pr), s = udp(0);
+    char t[512], attendu[512];
+    int ok = poser_options(s, "070b040000000000000000") == 0;
+    relire_options(s, 64, t);
+    ok = ok && strcmp(t, "070b04000000000000000000") == 0;
+    relire_options(s, 5, t);
+    verifier(ok && strcmp(t, "070b040000") == 0, "IP_OPTIONS : la route notee, relue (12 octets ; 5 de place : 5)");
+    static const char *const poses[][2] = {
+        { "440c0501000000000000000001", "440c0501000000000000000001000000" },
+        { "440c05037f00000100000000", "440c05037f00000100000000" },
+        { "830b047f0000017f000002", "830b047f0000017f00000200" },
+        { "44040502", "44040502" },
+        { "94040000", "94040000" },
+        { "07070800000000", "0707080000000000" },
+        { "01010101010101010101010101010101010101010101010101010101010101010101010101010101",
+          "01010101010101010101010101010101010101010101010101010101010101010101010101010101" },
+        { "8307047f000001", "8307047f00000100" },
+    };
+    ok = 1;
+    for (unsigned i = 0; i < sizeof poses / sizeof *poses; i++) {
+        int e = poser_options(s, poses[i][0]);
+        relire_options(s, 64, t);
+        if (e != 0 || strcmp(t, poses[i][1]) != 0) {
+            printf("[linux] reseau :   %s : %d, relu %s\n", poses[i][0], e, t);
+            ok = 0;
+        }
+    }
+    static const char *const refuses[] = {
+        "440c0501000000000000000044080501", "8308040102030405", "83070801020304", "830304",
+        "0101010101010101010101010101010101010101010101010101010101010101010101010101010101",
+    };
+    for (unsigned i = 0; i < sizeof refuses / sizeof *refuses; i++) {
+        int e = poser_options(s, refuses[i]);
+        relire_options(s, 64, t);
+        if (e != EINVAL || strcmp(t, "8307047f00000100") != 0) {
+            printf("[linux] reseau :   %s : %d, relu %s\n", refuses[i], e, t);
+            ok = 0;
+        }
+    }
+    int sec = poser_options(s, "82040000");
+    relire_options(s, 64, t);
+    ok = ok && (racine ? sec == 0 && strcmp(t, "82040000") == 0 : sec == EINVAL && strcmp(t, "8307047f00000100") == 0);
+    ok = ok && poser_options(s, "") == 0;
+    relire_options(s, 64, t);
+    verifier(ok && t[0] == 0, "IP_OPTIONS : relues defaites ; refusees, les precedentes restent ; la securite (root seul) ; vides : aucune");
+
+    /* Ce qui arrive par lo, et l'écho. */
+    tous_les_controles(r);
+    struct sockaddr_in a = adresse(LO, pr);
+    char nom[40] = "";
+    en_hexa(nom, &a, sizeof a);
+    static const char *const recus[][2] = {
+        { "070b040000000000000000", "6:12:070b0c7f0000017f00000100 7:12:070b0c7f0000017f00000100" },
+        { "440c0501000000000000000001", "6:16:440c0d117f000001........01000000 7:12:440c0d117f000001........" },
+        { "440c05037f00000100000000", "6:12:440c0d037f000001........ 7:12:440c0d037f000001........" },
+    };
+    char o[64];
+    int f;
+    size_t l;
+    ok = 1;
+    for (unsigned i = 0; i < sizeof recus / sizeof *recus; i++) {
+        poser_options(s, recus[i][0]);
+        envoyer(s, "abcd", 4, pr);
+        ssize_t n = recevoir_controles(r, o, sizeof o, 0, 512, t, sizeof t, &f, &l);
+        if (i > 0) {
+            masquer_l_heure(t, " 6:", 19);
+            masquer_l_heure(t, " 7:", 19);
+        }
+        snprintf(attendu, sizeof attendu, "8:12:010000007f0000017f000001 2:4:40000000 1:1:00 %s 20:16:%s", recus[i][1], nom);
+        if (n != 4 || strcmp(t, attendu) != 0) {
+            printf("[linux] reseau :   %s\n[linux] reseau :   attendu %s\n", t, attendu);
+            ok = 0;
+        }
+    }
+    verifier(ok, "IP_OPTIONS par lo : la route notee, l'horodatage (adresses, deborde ; donnees d'avance) ; RECVOPTS, RETOPTS");
+    poser_options(s, "830b047f0000017f000002");
+    struct sockaddr_in rien = adresse(0, pr);
+    ok = envoyer(s, "abcd", 4, pr) == 4 && sendto(s, "abcd", 4, 0, (struct sockaddr *)&rien, sizeof rien) == -1 && errno == EINVAL;
+    struct pollfd p = { r, POLLIN, 0 };
+    verifier(ok && poll(&p, 1, 300) == 0, "IP_OPTIONS : une route source part (vers 0.0.0.0 : EINVAL), et n'arrive pas");
+
+    /* Les messages de contrôle d'un envoi. */
+    unsigned char cb[CMSG_SPACE(40)] = { 0 };
+    struct iovec v = { "xyz", 3 };
+    struct msghdr m = { .msg_name = &a, .msg_namelen = sizeof a, .msg_iov = &v, .msg_iovlen = 1, .msg_control = cb,
+                        .msg_controllen = sizeof cb };
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = SOL_IP;
+    h->cmsg_type = IP_RETOPTS;
+    h->cmsg_len = CMSG_LEN(11);
+    m.msg_controllen = CMSG_SPACE(11);
+    de_hexa("070b040000000000000000", CMSG_DATA(h));
+    poser_options(s, "");
+    ok = sendmsg(s, &m, 0) == 3 && recevoir_controles(r, o, sizeof o, 0, 512, t, sizeof t, &f, &l) == 3
+         && strstr(t, " 6:12:070b0c7f0000017f00000100 7:12:") != NULL;
+    poser_options(s, "070b040000000000000000");
+    h->cmsg_len = CMSG_LEN(0);
+    m.msg_controllen = CMSG_SPACE(0);
+    ok = ok && sendmsg(s, &m, 0) == 3 && recevoir_controles(r, o, sizeof o, 0, 512, t, sizeof t, &f, &l) == 3
+         && strstr(t, " 6:") == NULL;
+    int proto = 17;
+    h->cmsg_type = IP_PROTOCOL;
+    h->cmsg_len = CMSG_LEN(4);
+    m.msg_controllen = CMSG_SPACE(4);
+    memcpy(CMSG_DATA(h), &proto, 4);
+    ok = ok && sendmsg(s, &m, 0) == 3 && recevoir_controles(r, o, sizeof o, 0, 512, t, sizeof t, &f, &l) == 3;
+    proto = 0;
+    memcpy(CMSG_DATA(h), &proto, 4);
+    ok = ok && sendmsg(s, &m, 0) == -1 && errno == EINVAL;
+    verifier(ok, "IP_RETOPTS a l'envoi (vide : sans celles de la socket) ; IP_PROTOCOL 17 : sans effet ; 0 : EINVAL");
+
+    /* La place des options : 65 535 - 20 - 12 - 8 octets au plus. */
+    static char gros[65496];
+    ok = sendto(s, gros, 65496, 0, (struct sockaddr *)&a, sizeof a) == -1 && errno == EMSGSIZE
+         && sendto(s, gros, 65495, 0, (struct sockaddr *)&a, sizeof a) == 65495
+         && recevoir_controles(r, gros, sizeof gros, 0, 512, t, sizeof t, &f, &l) == 65495;
+    verifier(ok, "IP_OPTIONS de 12 octets : un datagramme UDP de 65 495 octets au plus");
+    close(r);
+
+    /* L'écho d'un ping, puis d'une erreur ICMP. */
+    int q = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (q >= 0) {
+        tous_les_controles(q);
+        poser_options(q, "070b040000000000000000");
+        unsigned char echo[12] = { 8, 0, 0, 0, 0, 0, 0, 7, 'p', 'i', 'n', 'g' };
+        struct sockaddr_in d = adresse(LO, 0);
+        sendto(q, echo, sizeof echo, 0, (struct sockaddr *)&d, sizeof d);
+        unsigned char rep[64];
+        ssize_t n = recevoir_controles(q, rep, sizeof rep, 0, 512, t, sizeof t, &f, &l);
+        verifier(n == 12 && strstr(t, " 6:12:070b0c7f0000017f00000100 7:12:070b0c7f0000017f00000100 ") != NULL,
+                 "ping avec la route notee : la reponse en fait l'echo (RECVOPTS, RETOPTS)");
+        close(q);
+    }
+    poser_ip(s, IP_RECVERR, 1, 4);
+    tous_les_controles(s);
+    struct sockaddr_in d = adresse(LO, port_ferme());
+    sendto(s, "abcd", 4, 0, (struct sockaddr *)&d, sizeof d);
+    attendre_erreur(s);
+    ssize_t n = recevoir_controles(s, o, sizeof o, MSG_ERRQUEUE, 512, t, sizeof t, &f, &l);
+    verifier(n == 4 && strstr(t, " 6:12:070b0c7f0000017f00000100 7:12:070b0c7f0000017f00000100 ") != NULL,
+             "erreur en file pour un envoi avec la route notee : l'erreur ICMP en fait l'echo");
+    close(s);
+}
+
 /* Ce que l'hôte envoie à la machine, par la carte (make tests-qemu,
  * test-carte : `hostfwd` de slirp vers le port 4000) : la somme d'UDP
  * (IP_CHECKSUM) d'un datagramme venu par une carte, et IP_RECVFRAGSIZE
@@ -1936,6 +2139,7 @@ int main(int argc, char **argv)
     bouchon();
     sol_ip();
     controles();
+    options_d_ip();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

@@ -160,7 +160,7 @@ pub fn recevoir(i: &'static Interface, h: &format_ipv4::Ipv4, entete: &ipv4::Ent
     match m.genre {
         icmp::ECHO => {
             let reponse = Icmp { genre: icmp::ECHO_REPONSE, ..m };
-            repondre(h, &reponse, &[donnees]);
+            repondre(h, entete, &reponse, &[donnees]);
         }
         icmp::HORODATAGE => {
             // L'heure d'origine (copiée de la demande), de réception et
@@ -168,7 +168,7 @@ pub fn recevoir(i: &'static Interface, h: &format_ipv4::Ipv4, entete: &ipv4::Ent
             let Some(origine) = donnees.get(..4) else { return refuse() };
             let t = horodatage().to_be_bytes();
             let reponse = Icmp { genre: icmp::HORODATAGE_REPONSE, code: 0, ..m };
-            repondre(h, &reponse, &[origine, &t, &t]);
+            repondre(h, entete, &reponse, &[origine, &t, &t]);
         }
         icmp::INJOIGNABLE | icmp::ETOUFFEMENT | icmp::REDIRECTION | icmp::TEMPS_DEPASSE | icmp::PARAMETRE => {
             erreur_recue(i, h, entete, &m, donnees, p.donnees())
@@ -244,12 +244,16 @@ fn erreur_recue(i: &'static Interface, h: &format_ipv4::Ipv4, ip: &ipv4::EnteteR
     }
 }
 
-/// Répond au message reçu `h` par le message `reponse`, dont les données
-/// sont les morceaux `morceaux` (`icmp_reply`) : de l'adresse visée, vers
-/// l'émetteur, avec son TOS.
-fn repondre(h: &format_ipv4::Ipv4, reponse: &Icmp, morceaux: &[&[u8]]) {
+/// Répond au message reçu `h` (ce que la réception en a gardé : `entete`)
+/// par le message `reponse`, dont les données sont les morceaux `morceaux`
+/// (`icmp_reply`) : de l'adresse visée, vers l'émetteur, avec son TOS et
+/// l'écho de ses options (`ip_options_echo` : s'il est impossible, pas de
+/// réponse) ; avec une route source, vers sa première étape.
+fn repondre(h: &format_ipv4::Ipv4, entete: &ipv4::EnteteRecu, reponse: &Icmp, morceaux: &[&[u8]]) {
+    let Ok(options) = format_ipv4::options_echo(entete.options(), &entete.compilees, h.source, &ipv4::unicast) else { return };
+    let vers = if options.places.route_source != 0 { options.premier_saut } else { h.source };
     let longueur: usize = morceaux.iter().map(|m| m.len()).sum();
-    let Ok((chemin, destination)) = ipv4::router(h.source, None) else { return };
+    let Ok((chemin, destination)) = ipv4::router(vers, None) else { return };
     let Some(mut p) = Paquet::vide(icmp::ENTETE + longueur) else { return pas_de_paquet() };
     let Some(o) = p.ajouter_fin(icmp::ENTETE + longueur) else { return pas_de_paquet() };
     let mut k = icmp::ENTETE;
@@ -261,6 +265,7 @@ fn repondre(h: &format_ipv4::Ipv4, reponse: &Icmp, morceaux: &[&[u8]]) {
     let envoi = Envoi {
         source: h.destination, destination, protocole: format_ipv4::ICMP, ttl: ipv4::TTL_DEFAUT, tos: h.tos,
         identifiant: ipv4::identifiant(destination, h.destination, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu_vers(&chemin, destination), confirmer: false,
+        options, destination_finale: h.source,
     };
     MIB.icmp_sortie(reponse.genre);
     ipv4::emettre(chemin, &envoi, p);
@@ -275,13 +280,18 @@ fn pas_de_paquet() {
 
 /// Envoie une erreur ICMP (`genre`, `code`, `info` : ses 4 octets) pour le
 /// paquet `origine` (son en-tête IPv4 compris), comme `__icmp_send` (voir
-/// l'en-tête du module). `par_lo` : il est arrivé par `lo` (ou en partait)
+/// l'en-tête du module). `options` : ce qu'on sait de ses options
+/// (vérifiées à son arrivée, ou celles de son envoi) ; l'erreur en fait
+/// l'écho (`__ip_options_echo` : s'il est impossible, elle se tait), et va à
+/// la première étape d'une route source. `par_lo` : il est arrivé par `lo` (ou en partait)
 /// ; `pour_nous` : il nous était destiné (sa destination devient la source
 /// de l'erreur) ; `trame_diffusee` : sa trame Ethernet allait à tous.
 /// `origine` peut être plus court que ne le dit son en-tête : un datagramme
 /// UDP coupé à sa longueur UDP (`__udp4_lib_rcv` le coupe aussi), dont
 /// seul l'en-tête IPv4 est relu.
-pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bool, pour_nous: bool, trame_diffusee: bool) {
+#[allow(clippy::too_many_arguments)]
+pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], options: &format_ipv4::Options, par_lo: bool, pour_nous: bool,
+                      trame_diffusee: bool) {
     let Ok(h) = format_ipv4::lire_cite(origine) else { return };
     if trame_diffusee || h.decalage != 0 {
         return;
@@ -304,7 +314,10 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
         MIB.icmp(Compteur::OutRateLimitGlobal);
         return;
     }
-    let Ok((chemin, destination)) = ipv4::router(h.source, None) else { return };
+    let cite = origine.get(format_ipv4::ENTETE..h.longueur_entete).unwrap_or(&[]);
+    let Ok(echo) = format_ipv4::options_echo(cite, options, h.source, &ipv4::unicast) else { return };
+    let vers = if echo.places.route_source != 0 { echo.premier_saut } else { h.source };
+    let Ok((chemin, destination)) = ipv4::router(vers, None) else { return };
     // La limite par destination (`icmpv4_xrlim_allow`), sauf sur un chemin
     // qui part par lo ; permis, le message consomme le crédit global.
     if limiter {
@@ -315,9 +328,10 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
         consommer();
     }
     let source = if pour_nous { h.destination } else { ipv4::source(&chemin) };
-    // Autant du paquet d'origine que tient en 576 octets ; au moins un
-    // en-tête IPv4, sinon le message n'aurait pas de sens.
-    let place = (ipv4::mtu_vers(&chemin, destination) as usize).min(576).saturating_sub(format_ipv4::ENTETE + icmp::ENTETE);
+    // Autant du paquet d'origine que tient en 576 octets, avec nos options ;
+    // au moins un en-tête IPv4, sinon le message n'aurait pas de sens.
+    let place = (ipv4::mtu_vers(&chemin, destination) as usize).min(576)
+        .saturating_sub(format_ipv4::ENTETE + echo.longueur as usize + icmp::ENTETE);
     if place <= format_ipv4::ENTETE {
         return;
     }
@@ -331,6 +345,7 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], par_lo: bo
     let envoi = Envoi {
         source, destination, protocole: format_ipv4::ICMP, ttl: ipv4::TTL_DEFAUT, tos: (h.tos & 0x1E) | 0xC0,
         identifiant: ipv4::identifiant(destination, source, format_ipv4::ICMP), ne_pas_fragmenter: false, mtu: ipv4::mtu_vers(&chemin, destination), confirmer: false,
+        options: echo, destination_finale: h.source,
     };
     MIB.icmp_sortie(genre);
     ipv4::emettre(chemin, &envoi, p);

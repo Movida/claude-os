@@ -5,11 +5,13 @@
 //! suit (1 ICMP, 6 TCP, 17 UDP), la somme de contrôle de l'en-tête, et les
 //! adresses de la source et de la destination. Les options d'un paquet
 //! reçu se vérifient comme chez Linux (`compiler_options`), et leur écho
-//! (`options_echo`) dit celles qu'on renverrait (IP_RETOPTS).
+//! (`options_echo`) dit celles qu'on renverrait (IP_RETOPTS) ; celles
+//! qu'un programme donne à ses envois (IP_OPTIONS, `options_a_envoyer`)
+//! se complètent au départ de chaque paquet (`construire_options`).
 
 use super::{Erreur, adresse, mot16, plier, somme};
 
-/// La taille de l'en-tête sans options (le seul que nous écrivons).
+/// La taille de l'en-tête sans options.
 pub const ENTETE: usize = 20;
 /// Les protocoles.
 pub const ICMP: u8 = 1;
@@ -123,10 +125,12 @@ pub fn finir_recollage(o: &mut [u8], longueur: u16, ecn: u8) {
     o[10..12].copy_from_slice(&s.to_be_bytes());
 }
 
-/// Écrit l'en-tête `h` (sans options : `longueur_entete` est ignoré) dans
-/// les 20 premiers octets de `o`, sa somme comprise.
-pub fn ecrire(o: &mut [u8; ENTETE], h: &Ipv4) {
-    o[0] = 0x45;
+/// Écrit l'en-tête `h` dans `o`, l'en-tête entier : ses 20 premiers
+/// octets, puis les options, déjà en place (`construire_options`) ; sa
+/// longueur (IHL) est celle de `o` (`longueur_entete` est ignoré : un
+/// multiple de 4, de 20 à 60), et sa somme couvre tout `o`.
+pub fn ecrire(o: &mut [u8], h: &Ipv4) {
+    o[0] = 0x40 | (o.len() / 4) as u8;
     o[1] = h.tos;
     o[2..4].copy_from_slice(&h.longueur.to_be_bytes());
     o[4..6].copy_from_slice(&h.identifiant.to_be_bytes());
@@ -270,12 +274,31 @@ pub struct Ici<'a> {
     pub unicast: &'a dyn Fn([u8; 4]) -> bool,
 }
 
+/// Une option fausse (`__ip_options_compile` rend -EINVAL) : l'octet
+/// fautif, compté depuis le début de l'en-tête, que dira le « problème de
+/// paramètre » (ICMP 12), et ce que la vérification avait déjà noté des
+/// options qui la précèdent : Linux le laisse dans `IPCB(skb)->opt`, et
+/// l'erreur ICMP en fait l'écho (`__icmp_send`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Faute {
+    pub place: u8,
+    pub options: Options,
+}
+
+/// Pour qui vérifie-t-on des options (le `skb` de `__ip_options_compile`,
+/// présent ou non) : un paquet reçu, où l'on note ce qu'il faut (`Ici`) ;
+/// ou un programme qui en donne à envoyer, avec ou sans CAP_NET_RAW
+/// (`racine`), et ce qui dit si une adresse est quelqu'un d'autre.
+enum Pour<'a> {
+    Reception(&'a Ici<'a>),
+    Envoi { racine: bool, unicast: &'a dyn Fn([u8; 4]) -> bool },
+}
+
 /// Les options de l'en-tête reçu `entete` (en entier, ses 20 premiers
 /// octets compris), vérifiées une à une et complétées sur place comme
 /// `__ip_options_compile` de Linux (net/ipv4/ip_options.c) pour un paquet
-/// reçu. Une option fausse : `Err(place)`, l'octet fautif compté depuis le
-/// début de l'en-tête, que dira le « problème de paramètre » (ICMP 12) ;
-/// le paquet est jeté.
+/// reçu. Une option fausse : `Err`, avec l'octet fautif et ce qui précède
+/// (`Faute`) ; le paquet est jeté.
 ///
 /// Les règles, option par option :
 /// - la fin (0) : tout ce qui la suit devient 0 ; le bourrage (1) : un
@@ -305,13 +328,52 @@ pub struct Ici<'a> {
 /// La somme de l'en-tête n'est pas refaite : Linux ne la refait que pour
 /// un paquet qu'il fait suivre, et une erreur ICMP en recopie l'en-tête
 /// tel qu'il est alors (options notées, ancienne somme).
-pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, u8> {
+pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, Faute> {
+    compiler(entete, &Pour::Reception(ici), &mut [0; 4])
+}
+
+/// Des options données par un programme pour ses envois (IP_OPTIONS, et le
+/// message de contrôle IP_RETOPTS : `ip_options_get`) : 40 octets au plus,
+/// complétées de FIN jusqu'à un mot entier, puis vérifiées comme pour un
+/// paquet reçu (`compiler_options`), avec ce qui change sans paquet
+/// (`__ip_options_compile` sans skb) : rien n'est écrit, seules les places
+/// sont réservées (le pointeur avance, et l'envoi les remplira :
+/// `construire_options`) ; le débordement de l'horodatage ne compte pas ;
+/// une route source doit avoir son pointeur à 4, au moins une étape et
+/// des mots entiers (longueur 7, 11...), et sa première étape en sort
+/// (`premier_saut` : le paquet ira là d'abord ; les autres avancent d'un
+/// mot, et le dernier recevra la vraie destination) ; sans CAP_NET_RAW
+/// (`racine`), un drapeau d'horodatage inconnu, la sécurité, l'identifiant
+/// de flux, CIPSO et une option inconnue sont refusés (CIPSO l'est
+/// toujours : aucun domaine). Une faute, ou plus de 40 octets : `Err`
+/// (EINVAL). Aucun octet : aucune option.
+pub fn options_a_envoyer(donnees: &[u8], racine: bool, unicast: &dyn Fn([u8; 4]) -> bool)
+                         -> Result<OptionsSortantes, ()> {
+    if donnees.len() > OPTIONS_MAX {
+        return Err(());
+    }
+    let longueur = donnees.len().next_multiple_of(4);
+    let mut entete = [option::FIN; ENTETE + OPTIONS_MAX];
+    entete[ENTETE..ENTETE + donnees.len()].copy_from_slice(donnees);
+    let mut premier_saut = [0; 4];
+    let places = compiler(&mut entete[..ENTETE + longueur], &Pour::Envoi { racine, unicast }, &mut premier_saut)
+        .map_err(|_| ())?;
+    let mut octets = [0; OPTIONS_MAX];
+    octets.copy_from_slice(&entete[ENTETE..]);
+    Ok(OptionsSortantes { octets, longueur: longueur as u8, places, premier_saut })
+}
+
+/// `__ip_options_compile` : voir `compiler_options` et `options_a_envoyer`.
+fn compiler(entete: &mut [u8], pour: &Pour, premier_saut: &mut [u8; 4]) -> Result<Options, Faute> {
     use option::*;
+    let (ici, interdite, unicast) = match pour {
+        Pour::Reception(ici) => (Some(*ici), false, ici.unicast),
+        Pour::Envoi { racine, unicast } => (None, !racine, *unicast),
+    };
     let mut opt = Options::default();
+    let faute = |place: usize, options: Options| -> Result<Options, Faute> { Err(Faute { place: place as u8, options }) };
     let mut k = ENTETE;
     let fin = entete.len();
-    // Une place dans l'en-tête, comme Linux la rend dans `info`.
-    let place = |k: usize| k as u8;
     while k < fin {
         match entete[k] {
             FIN => {
@@ -331,66 +393,75 @@ pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, u8> {
         }
         let reste = fin - k;
         if reste < 2 {
-            return Err(place(k));
+            return faute(k, opt);
         }
         let longueur = entete[k + 1] as usize;
         if longueur < 2 || longueur > reste {
-            return Err(place(k));
+            return faute(k, opt);
         }
         let o = &mut entete[k..k + longueur];
         match o[0] {
             ROUTE_SOURCE_LACHE | ROUTE_SOURCE_STRICTE => {
                 if longueur < 3 {
-                    return Err(place(k + 1));
+                    return faute(k + 1, opt);
                 }
                 if o[2] < 4 {
-                    return Err(place(k + 2));
+                    return faute(k + 2, opt);
                 }
                 if opt.route_source != 0 {
-                    return Err(place(k));
+                    return faute(k, opt);
+                }
+                if ici.is_none() {
+                    if o[2] != 4 || longueur < 7 || (longueur - 3) % 4 != 0 {
+                        return faute(k + 1, opt);
+                    }
+                    premier_saut.copy_from_slice(&o[3..7]);
+                    o.copy_within(7.., 3);
                 }
                 opt.stricte = o[0] == ROUTE_SOURCE_STRICTE;
-                opt.route_source = place(k);
+                opt.route_source = k as u8;
             }
             ROUTE_NOTEE => {
                 if opt.route_notee != 0 {
-                    return Err(place(k));
+                    return faute(k, opt);
                 }
                 if longueur < 3 {
-                    return Err(place(k + 1));
+                    return faute(k + 1, opt);
                 }
                 let pointeur = o[2] as usize;
                 if pointeur < 4 {
-                    return Err(place(k + 2));
+                    return faute(k + 2, opt);
                 }
                 if pointeur <= longueur {
                     if pointeur + 3 > longueur {
-                        return Err(place(k + 2));
+                        return faute(k + 2, opt);
                     }
-                    o[pointeur - 1..pointeur + 3].copy_from_slice(&ici.adresse);
+                    if let Some(ici) = ici {
+                        o[pointeur - 1..pointeur + 3].copy_from_slice(&ici.adresse);
+                        opt.modifiees = true;
+                    }
                     o[2] += 4;
-                    opt.modifiees = true;
                     opt.route_notee_adresse = true;
                 }
-                opt.route_notee = place(k);
+                opt.route_notee = k as u8;
             }
             HORODATAGE => {
                 if opt.horodatage != 0 {
-                    return Err(place(k));
+                    return faute(k, opt);
                 }
                 if longueur < 4 {
-                    return Err(place(k + 1));
+                    return faute(k + 1, opt);
                 }
                 let pointeur = o[2] as usize;
                 if pointeur < 5 {
-                    return Err(place(k + 2));
+                    return faute(k + 2, opt);
                 }
                 let drapeau = o[3] & 0xF;
                 if pointeur <= longueur {
                     if pointeur + 3 > longueur {
-                        return Err(place(k + 2));
+                        return faute(k + 2, opt);
                     }
-                    // Où écrire l'heure, s'il le faut.
+                    // Où écrire l'heure (à la réception seulement).
                     let heure = match drapeau {
                         HEURE_SEULE => {
                             o[2] += 4;
@@ -399,14 +470,16 @@ pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, u8> {
                         }
                         HEURE_ET_ADRESSE | ADRESSES_DONNEES => {
                             if pointeur + 7 > longueur {
-                                return Err(place(k + 2));
+                                return faute(k + 2, opt);
                             }
                             let a = [o[pointeur - 1], o[pointeur], o[pointeur + 1], o[pointeur + 2]];
-                            if drapeau == ADRESSES_DONNEES && (ici.unicast)(a) {
+                            if drapeau == ADRESSES_DONNEES && unicast(a) {
                                 None
                             } else {
                                 if drapeau == HEURE_ET_ADRESSE {
-                                    o[pointeur - 1..pointeur + 3].copy_from_slice(&ici.adresse);
+                                    if let Some(ici) = ici {
+                                        o[pointeur - 1..pointeur + 3].copy_from_slice(&ici.adresse);
+                                    }
                                     opt.horodatage_adresse = true;
                                 }
                                 opt.horodatage_heure = true;
@@ -414,31 +487,36 @@ pub fn compiler_options(entete: &mut [u8], ici: &Ici) -> Result<Options, u8> {
                                 Some(pointeur + 3)
                             }
                         }
+                        _ if interdite => return faute(k + 3, opt),
                         _ => None,
                     };
-                    if let Some(h) = heure {
+                    if let (Some(h), Some(ici)) = (heure, ici) {
                         o[h..h + 4].copy_from_slice(&ici.heure.to_be_bytes());
                         opt.modifiees = true;
                     }
                 } else if drapeau != ADRESSES_DONNEES {
                     let debordement = o[3] >> 4;
                     if debordement == 15 {
-                        return Err(place(k + 3));
+                        return faute(k + 3, opt);
                     }
-                    o[3] = drapeau | ((debordement + 1) << 4);
-                    opt.modifiees = true;
+                    if ici.is_some() {
+                        o[3] = drapeau | ((debordement + 1) << 4);
+                        opt.modifiees = true;
+                    }
                 }
-                opt.horodatage = place(k);
+                opt.horodatage = k as u8;
             }
             ALERTE => {
                 if longueur < 4 {
-                    return Err(place(k + 1));
+                    return faute(k + 1, opt);
                 }
                 if o[2] == 0 && o[3] == 0 {
-                    opt.alerte = place(k);
+                    opt.alerte = k as u8;
                 }
             }
-            CIPSO => return Err(place(if longueur < 8 { k + 1 } else { k + 2 })),
+            CIPSO if interdite => return faute(k, opt),
+            CIPSO => return faute(if longueur < 8 { k + 1 } else { k + 2 }, opt),
+            _ if interdite => return faute(k, opt),
             _ => {}
         }
         k += longueur;
@@ -622,4 +700,80 @@ pub fn options_echo(options: &[u8], o: &Options, source: [u8; 4], unicast: &dyn 
     // Complétées de FIN jusqu'à un mot entier (déjà nulles).
     d.longueur = n.next_multiple_of(4) as u8;
     Ok(d)
+}
+
+/// Écrit un mot de 4 octets à la place `k` de `o`, s'il y tient (des
+/// places faites par `options_a_envoyer` ou `options_echo` y tiennent
+/// toujours).
+fn ecrire_mot(o: &mut [u8], k: usize, v: [u8; 4]) {
+    if let Some(m) = o.get_mut(k..k + 4) {
+        m.copy_from_slice(&v);
+    }
+}
+
+/// Les options `o` d'un paquet qui part, mises dans son en-tête `entete`
+/// (après ses 20 premiers octets ; `entete` en a la place) et complétées
+/// comme `ip_options_build` : la vraie destination `destination` dans le
+/// dernier mot d'une route source (l'en-tête, lui, va à sa première étape) ;
+/// dans les places réservées, notre adresse `source` (celle de l'en-tête :
+/// `ip_rt_get_source` d'une route de sortie) pour la route notée et
+/// l'horodatage avec adresses, et l'heure `heure` (les millisecondes depuis
+/// minuit, temps universel). Le paquet n'est fait qu'une fois : ses
+/// fragments partagent ces options (`options_de_fragment`).
+pub fn construire_options(entete: &mut [u8], o: &OptionsSortantes, destination: [u8; 4], source: [u8; 4], heure: u32) {
+    let n = o.longueur as usize;
+    let Some(place) = entete.get_mut(ENTETE..ENTETE + n) else { return };
+    place.copy_from_slice(o.octets());
+    let p = o.places;
+    // Le pointeur de l'option en `k`, moins `recul`.
+    let avant = |e: &[u8], k: usize, recul: usize| (k + *e.get(k + 2).unwrap_or(&0) as usize).checked_sub(recul);
+    if p.route_source != 0 {
+        let k = p.route_source as usize;
+        if let Some(m) = (k + *entete.get(k + 1).unwrap_or(&0) as usize).checked_sub(4) {
+            ecrire_mot(entete, m, destination);
+        }
+    }
+    if p.route_notee_adresse
+        && let Some(m) = avant(entete, p.route_notee as usize, 5)
+    {
+        ecrire_mot(entete, m, source);
+    }
+    if p.horodatage_adresse
+        && let Some(m) = avant(entete, p.horodatage as usize, 9)
+    {
+        ecrire_mot(entete, m, source);
+    }
+    if p.horodatage_heure
+        && let Some(m) = avant(entete, p.horodatage as usize, 5)
+    {
+        ecrire_mot(entete, m, heure.to_be_bytes());
+    }
+}
+
+/// Les options d'un fragment après le premier (`ip_options_fragment`) :
+/// celles qui ne se recopient pas dans chaque fragment (le bit « copiée »,
+/// 0x80, de leur genre est nul : la route notée, l'horodatage) deviennent
+/// des bourrages ; les autres (les routes sources, la sécurité, l'alerte aux
+/// routeurs) restent. Une option mal formée arrête tout (elles viennent de
+/// nous : jamais).
+pub fn options_de_fragment(options: &mut [u8]) {
+    let mut k = 0;
+    while k < options.len() {
+        match options[k] {
+            option::FIN => return,
+            option::BOURRAGE => {
+                k += 1;
+                continue;
+            }
+            _ => {}
+        }
+        let l = options.get(k + 1).map_or(0, |&l| l as usize);
+        if l < 2 || l > options.len() - k {
+            return;
+        }
+        if options[k] & 0x80 == 0 {
+            options[k..k + l].fill(option::BOURRAGE);
+        }
+        k += l;
+    }
 }
