@@ -948,6 +948,9 @@ pub struct Tcb<P: Charge> {
     urg_seq: u32,
     /// L'autre a fermé son sens (FIN reçu et accepté).
     fin_recue: bool,
+    /// Une lecture est allée jusqu'au FIN (`found_fin_ok` : `copied_seq` le passe) : il ne
+    /// compte plus dans la file de réception de /proc/net/tcp.
+    fin_lue: bool,
     /// Les tailles des tampons (SO_RCVBUF, SO_SNDBUF, déjà doublées), et
     /// s'ils sont fixés par le programme (`SOCK_RCVBUF_LOCK`, `SOCK_SNDBUF_LOCK` :
     /// ils ne grandissent plus d'eux-mêmes), et leurs plafonds sur cette machine
@@ -1097,6 +1100,10 @@ pub struct Tcb<P: Charge> {
     /// ACK reçu (`rcv_tstamp`).
     dernier_envoi: u64,
     dernier_recu: u64,
+    /// Les files jetées par une erreur (`tcp_write_queue_purge`) : le numéro qui suivait
+    /// tout ce que le programme avait écrit (`write_seq`), que Linux garde (SIOCOUTQ et
+    /// TCP_INFO le montrent encore). None : pas jetées.
+    purgee: Option<u32>,
 }
 
 /// CurrEstab est une jauge : elle redescend quand une connexion établie change
@@ -1182,6 +1189,7 @@ impl<P: Charge> Tcb<P> {
             urgent: Urgent::Aucun,
             urg_seq: 0,
             fin_recue: false,
+            fin_lue: false,
             rcvbuf,
             sndbuf,
             rcvbuf_fixe: false,
@@ -1259,6 +1267,7 @@ impl<P: Charge> Tcb<P> {
             mesures: Mesures::new(),
             dernier_envoi: 0,
             dernier_recu: 0,
+            purgee: None,
         }
     }
 
@@ -1605,6 +1614,21 @@ impl<P: Charge> Tcb<P> {
         self.fin_recue
     }
 
+    /// Une lecture (pas MSG_PEEK) vient de finir : si plus rien n'est à lire et que le FIN
+    /// est là, elle l'a passé (`tcp_recvmsg_locked` le prend avec les données du segment
+    /// où `tcp_try_coalesce` l'a fondu, ou seul, par une lecture qui rend 0).
+    pub fn lecture_finie(&mut self) {
+        if self.fin_recue && self.octets_reception == 0 {
+            self.fin_lue = true;
+        }
+    }
+
+    /// La file de réception de /proc/net/tcp (`rcv_nxt - copied_seq`) : ce qui reste à lire,
+    /// et le FIN tant qu'aucune lecture ne l'a passé (mesuré).
+    pub fn en_reception(&self) -> u32 {
+        self.octets_reception as u32 + u32::from(self.fin_recue && !self.fin_lue)
+    }
+
     /// L'erreur en attente (0 : aucune), sans l'effacer.
     pub fn erreur(&self) -> i32 {
         self.erreur
@@ -1804,16 +1828,31 @@ impl<P: Charge> Tcb<P> {
     }
 
     /// Le numéro qui suit tout ce que le programme a écrit, FIN compris
-    /// (`write_seq`).
+    /// (`write_seq`) ; les files jetées, celui d'avant.
     fn write_seq(&self) -> u32 {
+        if let Some(w) = self.purgee {
+            return w;
+        }
         self.seq_envoi.wrapping_add(self.octets_envoi as u32).wrapping_add(u32::from(self.fin_voulue))
+    }
+
+    /// Rien en vol, rien qui attende de partir (`tcp_rtx_and_write_queues_empty`) ; les
+    /// files jetées, vides.
+    fn files_vides(&self) -> bool {
+        self.file.is_empty() && (self.purgee.is_some() || self.non_envoyes() == 0)
     }
 
     /// Les octets pas encore acquittés (SIOCOUTQ) et pas encore envoyés
     /// (SIOCOUTQNSD), FIN compris, comme `tcp_ioctl`, rien pendant la poignée
-    /// de main.
+    /// de main ; une poignée qui a échoué compte son SYN (mesuré : SIOCOUTQ 1).
     pub fn non_acquittes(&self) -> usize {
-        if !self.syn_acquitte { 0 } else { self.write_seq().wrapping_sub(self.snd_una) as usize }
+        if matches!(self.etat, Etat::SynEnvoye | Etat::SynRecu) { 0 } else { self.a_acquitter() as usize }
+    }
+
+    /// Tout ce qui attend son ACK, sans exception (`write_seq - snd_una`, la file
+    /// d'envoi de /proc/net/tcp : 1 en SYN_SENT, le SYN, mesuré).
+    pub fn a_acquitter(&self) -> u32 {
+        self.write_seq().wrapping_sub(self.snd_una)
     }
 
     pub fn non_envoyes(&self) -> usize {
@@ -2025,7 +2064,12 @@ impl<P: Charge> Tcb<P> {
 
     /// Une erreur qui ferme la connexion (`tcp_done_with_error`) : ce qui
     /// restait à envoyer est jeté (`tcp_write_queue_purge`) ; ce qui a été
-    /// reçu se lit encore (mesuré).
+    /// reçu se lit encore (mesuré). La purge regarde d'abord les files pour
+    /// arrêter le chronomètre : pleines, il court encore, sur une connexion
+    /// morte (`tcp_chrono_stop` les veut vides ; mesuré : coupée par un RST,
+    /// ses données en file, son temps « occupé » grandit toujours) ; et la
+    /// suite des numéros écrits reste (`write_seq` : SIOCOUTQ, SIOCOUTQNSD et
+    /// `tcpi_notsent_bytes` disent encore ce qui n'est pas parti).
     /// Une tentative qui échoue ainsi compte dans AttemptFails : en SYN_SENT,
     /// ou en SYN_RECEIVED d'une ouverture simultanée ; pas une fille, dont la
     /// demande de Linux (`request_sock`) meurt sans compteur, ses SYN-ACK
@@ -2035,6 +2079,10 @@ impl<P: Charge> Tcb<P> {
             self.mib.tcp(snmp::Tcp::AttemptFails);
         }
         self.erreur = erreur;
+        self.chrono_arreter(Chrono::Occupee, self.heure);
+        if self.purgee.is_none() {
+            self.purgee = Some(self.write_seq());
+        }
         self.envoi.clear();
         self.decalage_envoi = 0;
         self.octets_envoi = 0;
@@ -2044,7 +2092,6 @@ impl<P: Charge> Tcb<P> {
         self.retrans_out = 0;
         self.indice_renvoi = None;
         self.tri.clear();
-        self.chrono_arreter(Chrono::Occupee, self.heure);
         self.passer(Etat::Fermee, e);
         e.lisible = true;
         e.place = true;

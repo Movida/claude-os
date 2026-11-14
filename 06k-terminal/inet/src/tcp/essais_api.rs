@@ -655,9 +655,69 @@ fn la_place_et_ce_qui_reste() {
     let mut c = etablie(true);
     en_vol(&mut c, 1);
     assert_eq!(c.non_acquittes(), MSS as usize);
+    c.etat = Etat::SynRecu;
     c.syn_acquitte = false;
     assert_eq!(c.non_acquittes(), 0);
     assert_eq!(c.non_envoyes(), 0);
+}
+
+#[test]
+fn les_files_d_une_connexion_finie() {
+    // Une poignée de main qui échoue : SIOCOUTQ compte le SYN (mesuré : 1) ; /proc/net/tcp,
+    // dès SYN_SENT.
+    let mut c = syn_envoye();
+    assert_eq!((c.non_acquittes(), c.a_acquitter()), (0, 1));
+    c.etat = Etat::Fermee;
+    assert_eq!(c.non_acquittes(), 1);
+    // Deux segments en vol, trois qui attendent (la fenêtre de congestion), puis un RST : les
+    // files sont jetées, les numéros restent, et le chronomètre court encore.
+    let mut c = etablie(true);
+    en_vol(&mut c, 2);
+    c.cc.cwnd = 2;
+    assert_eq!(c.ecrire::<()>(3 * MSS as usize, |d| {
+        d.fill(2);
+        Ok(())
+    }), Ok(3 * MSS as usize));
+    c.emettre(HEURE, |_| {});
+    let (a, n) = (c.a_acquitter(), c.non_envoyes());
+    assert_eq!((a, n, c.non_acquittes()), (5 * MSS, 3 * MSS as usize, 5 * MSS as usize));
+    c.recevoir(&segment(&c, 0, tcp::RST), octets(0, 0), HEURE + MS);
+    assert_eq!(c.etat(), Etat::Fermee);
+    assert_eq!((c.a_acquitter(), c.non_envoyes(), c.non_acquittes(), c.file.len(), c.octets_envoi), (a, n, a as usize, 0, 0));
+    let (occupe, _, _) = c.mesures.chronos(HEURE + MS);
+    let (plus_tard, _, _) = c.mesures.chronos(HEURE + 1000 * MS);
+    assert!(plus_tard >= occupe + 900_000, "{occupe} {plus_tard}");
+    // Rien en file : le chronomètre s'arrête avec la connexion.
+    let mut c = etablie(true);
+    en_vol(&mut c, 1);
+    let ack = Tcp { ack: c.snd_nxt, ..segment(&c, 0, 0) };
+    c.recevoir(&ack, octets(0, 0), HEURE + MS);
+    c.recevoir(&segment(&c, 0, tcp::RST), octets(0, 0), HEURE + 2 * MS);
+    assert_eq!(c.mesures.chronos(HEURE + 2 * MS), c.mesures.chronos(HEURE + 1000 * MS));
+}
+
+#[test]
+fn le_fin_dans_la_file_de_reception() {
+    // /proc/net/tcp compte le FIN (`rcv_nxt - copied_seq`) jusqu'à ce qu'une lecture le passe ;
+    // MSG_PEEK ne le passe pas.
+    let mut c = etablie(true);
+    recus(&mut c, 3);
+    c.recevoir(&segment(&c, 0, tcp::FIN), octets(0, 0), HEURE);
+    assert_eq!(c.en_reception(), 4);
+    let mut debut = 0;
+    assert_eq!(lire(&mut c, &mut debut, 2, false).len(), 2);
+    c.lecture_finie();
+    assert_eq!(c.en_reception(), 2);
+    assert_eq!(lire(&mut c, &mut debut, 8, false).len(), 1);
+    c.lecture_finie();
+    assert_eq!(c.en_reception(), 0);
+    // Le FIN après les données lues : la lecture qui rend 0 le passe.
+    let mut c = etablie(true);
+    c.lecture_finie();
+    c.recevoir(&segment(&c, 0, tcp::FIN), octets(0, 0), HEURE);
+    assert_eq!(c.en_reception(), 1);
+    c.lecture_finie();
+    assert_eq!(c.en_reception(), 0);
 }
 
 /// `tcp_new_space` : SO_SNDBUF ne suit que si la cwnd n'est pas pleine.

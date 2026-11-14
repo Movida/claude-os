@@ -2348,6 +2348,7 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
                 s.peek_avance(n);
             } else {
                 s.peek_recule(n);
+                t.lecture_finie();
             }
             let _contexte = contexte::entrer();
             t.lu(n, maintenant());
@@ -2382,6 +2383,9 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
             return Err(-(e as i64));
         }
         if t.fin_recue() || arret & socket::ARRET_LECTURE != 0 || t.etat() == Etat::Fermee {
+            if !peek {
+                t.lecture_finie();
+            }
             return Ok(fait);
         }
         if matches!(t.etat(), Etat::SynEnvoye | Etat::SynRecu) && non_bloquant {
@@ -2908,7 +2912,7 @@ fn ligne_connexion(l: &mut LigneProc, t: &Tcb<Paquet>, maintenant: u64, uid: u32
     };
     let ssthresh = if i.demarrage_lent { -1 } else { i.ssthresh as i64 };
     write!(l, "{:02X} {:08X}:{:08X} {:02X}:{:08X} {:08X} {:5} {:8} {} {} {:016x} {} {} {} {} {}",
-           i.etat, t.non_acquittes(), t.lisibles(), minuteur, clock_t(quand), i.retransmissions, uid, i.sondes, inode, 1, 0,
+           i.etat, t.a_acquitter(), t.en_reception(), minuteur, clock_t(quand), i.retransmissions, uid, i.sondes, inode, 1, 0,
            clock_t(i.rto as u64 * 1000), clock_t(i.ato as u64 * 1000), i.ack_rapides << 1 | u32::from(i.pingpong), i.cwnd, ssthresh)
 }
 

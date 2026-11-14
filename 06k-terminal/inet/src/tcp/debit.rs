@@ -263,7 +263,7 @@ impl<P: Charge> Tcb<P> {
     /// `tcp_chrono_stop` : plus rien en file, plus de chrono ; sinon la cause courante cesse,
     /// reste que la connexion est occupée.
     pub(super) fn chrono_arreter(&mut self, c: Chrono, maintenant: u64) {
-        if self.file.is_empty() && self.non_envoyes() == 0 {
+        if self.files_vides() {
             self.chrono_poser(Chrono::Aucun, maintenant);
         } else if c == self.mesures.chrono {
             self.chrono_poser(Chrono::Occupee, maintenant);

@@ -42,6 +42,8 @@
  *     suit le débit, TCP_WINDOW_CLAMP, SO_RCVLOWAT ;
  *   - TCP_DEFER_ACCEPT, et /proc/sys/net ;
  *   - TCP_INFO jusqu'au bout : les compteurs, le débit livré, les chronomètres ;
+ *   - les files d'une connexion finie (SIOCOUTQ, SIOCOUTQNSD, `tcpi_notsent_bytes`, le
+ *     chronomètre qui court encore après un RST) et celles de /proc/net/tcp (le SYN, le FIN) ;
  *   - les coupures : un FIN puis un RST, shutdown en SYN_SENT et d'une écoute,
  *     connect(AF_UNSPEC), le connect qui suit une erreur ; les lectures sans copie
  *     ni retrait ; une connexion morte qui garde son port, le SO_REUSEADDR des filles ;
@@ -1905,6 +1907,105 @@ static int etat_de(int s)
     return i.tcpi_state;
 }
 
+/* La ligne de /proc/net/tcp de la socket `s` (son port local) : l'état, et ses files
+ * (`tx_queue` : write_seq - snd_una ; `rx_queue` : rcv_nxt - copied_seq). 0 : absente. */
+static int files_proc(int s, unsigned *etat, unsigned *tx, unsigned *rx)
+{
+    char ligne[256], cherche[16];
+    snprintf(cherche, sizeof cherche, ":%04X ", port_de(s));
+    FILE *f = fopen("/proc/net/tcp", "r");
+    int trouve = 0;
+    while (f && !trouve && fgets(ligne, sizeof ligne, f)) {
+        char *p = strstr(ligne, cherche);
+        trouve = p && p < ligne + 20 && sscanf(p + 20, "%x %x:%x", etat, tx, rx) == 3;
+    }
+    if (f)
+        fclose(f);
+    return trouve;
+}
+
+static int ioctl_de(int s, unsigned long requete)
+{
+    int v = -1;
+    ioctl(s, requete, &v);
+    return v;
+}
+
+/* Les files d'une connexion finie, comptées comme Linux par numéros : `write_seq` reste quand
+ * les files sont jetées (un RST), et le chronomètre qui court encore, s'il y avait de quoi
+ * envoyer (`tcp_write_queue_purge` l'arrête avant de vider, seulement vides). Une poignée de
+ * main qui échoue compte son SYN dans SIOCOUTQ. Et /proc/net/tcp : le SYN dans `tx_queue`, le
+ * FIN dans `rx_queue` tant qu'aucune lecture ne l'a passé. */
+static void files_d_une_connexion_finie(void)
+{
+    struct sockaddr_in f = lo(port_ferme());
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&f, sizeof f);
+    attendre_ms(20);
+    verifier(ioctl_de(c, SIOCOUTQ) == 1 && ioctl_de(c, SIOCOUTQNSD) == 0 && champ(c, NOTSENT) == 0,
+             "refusee : SIOCOUTQ 1 (le SYN), SIOCOUTQNSD 0, notsent 0");
+    close(c);
+    /* L'autre ne lit pas, sa fenêtre se ferme : tout reste en file, la fenêtre de l'autre
+     * chronométrée ; puis son RST. */
+    int petit = 4096, port;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in x = lo(0);
+    setsockopt(l, SOL_SOCKET, SO_RCVBUF, &petit, sizeof petit);
+    bind(l, (void *)&x, sizeof x);
+    listen(l, 4);
+    port = port_de(l);
+    x = lo(port);
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&x, sizeof x);
+    attendre_ms(20);
+    int a = accept(l, NULL, NULL);
+    static char t[1 << 16];
+    while (write(c, t, sizeof t) > 0)
+        ;
+    attendre_ms(300);
+    int q = ioctl_de(c, SIOCOUTQ), nsd = ioctl_de(c, SIOCOUTQNSD);
+    uint32_t ns = champ(c, NOTSENT);
+    int ok = q > 0 && champ64(c, RWND_LIMITED) > 0;
+    couper(a);
+    attendre_ms(20);
+    uint64_t occupe = champ64(c, BUSY), fenetre = champ64(c, RWND_LIMITED);
+    attendre_ms(300);
+    uint64_t occupe2 = champ64(c, BUSY), fenetre2 = champ64(c, RWND_LIMITED);
+    verifier(ok && etat_de(c) == TCP_CLOSE && ioctl_de(c, SIOCOUTQ) == q && ioctl_de(c, SIOCOUTQNSD) == nsd && champ(c, NOTSENT) == ns,
+             "coupee par un RST, ses donnees en file : SIOCOUTQ, SIOCOUTQNSD et notsent restent");
+    verifier(occupe2 >= occupe + 250000 && fenetre2 >= fenetre + 250000,
+             "coupee par un RST, ses donnees en file : le chronometre court encore");
+    close(c);
+    close(l);
+    /* /proc/net/tcp : en SYN_SENT (face à une écoute pleine), le SYN ; trois octets et le FIN
+     * reçus, quatre ; lus, plus rien : la lecture des trois octets passe le FIN, que Linux a
+     * fondu dans leur segment (`tcp_try_coalesce`). */
+    l = ecoute(&port, 0);
+    x = lo(port);
+    int d = socket(AF_INET, SOCK_STREAM, 0);
+    connect(d, (void *)&x, sizeof x);
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&x, sizeof x);
+    attendre_ms(20);
+    unsigned etat = 0, tx = 9, rx = 9;
+    verifier(files_proc(c, &etat, &tx, &rx) && etat == TCP_SYN_SENT && tx == 1 && rx == 0, "/proc/net/tcp, SYN_SENT : tx_queue 1, le SYN");
+    close(c);
+    a = accept(l, NULL, NULL);
+    int b = write(a, "abc", 3);
+    shutdown(a, SHUT_WR);
+    attendre_ms(20);
+    ok = b == 3 && files_proc(d, &etat, &tx, &rx) && etat == TCP_CLOSE_WAIT && tx == 0 && rx == 4;
+    char o[8];
+    long lu = recv(d, o, sizeof o, MSG_PEEK);
+    ok &= lu == 3 && files_proc(d, &etat, &tx, &rx) && rx == 4;
+    lu = read(d, o, 3);
+    verifier(ok && lu == 3 && files_proc(d, &etat, &tx, &rx) && rx == 0,
+             "/proc/net/tcp : trois octets et le FIN, rx_queue 4 (MSG_PEEK n'y change rien) ; lus par un read de 3, 0");
+    close(a);
+    close(d);
+    close(l);
+}
+
 /* Un FIN puis un RST : la fin se lit (SOCK_DONE vient avant l'erreur), SO_ERROR dit EPIPE
  * (`tcp_reset` en CLOSE_WAIT), et l'écriture EPIPE. */
 static void fin_puis_rst(void)
@@ -2855,6 +2956,7 @@ int main(void)
     defer_accept();
     reglages();
     info_complete();
+    files_d_une_connexion_finie();
     fin_puis_rst();
     arret_en_syn();
     arret_d_ecoute();
