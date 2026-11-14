@@ -47,7 +47,9 @@
  *     ni retrait ; une connexion morte qui garde son port, le SO_REUSEADDR des filles ;
  *   - les options de SOL_IP (les soldes d'avant 6k) : IP_PKTOPTIONS, IP_MINTTL, IP_FREEBIND,
  *     IP_BIND_ADDRESS_NO_PORT, une diffusion liée, IP_LOCAL_PORT_RANGE, IP_PROTOCOL ;
- *   - getsockname après la fin d'une connexion ou d'une écoute (l'ancien port se montre).
+ *   - getsockname après la fin d'une connexion ou d'une écoute (l'ancien port se montre) ;
+ *   - l'état de la socket que voient connect, listen et shutdown (SS_CONNECTING...), à côté de
+ *     celui de TCP : un connect non bloquant pas encore redit, interrompu, défait par un autre fil.
  * Les valeurs comparées sont celles d'un Linux 6.18 à sa configuration par défaut, sur l'hôte (le
  * Linux de référence) comme chez nous. Les délais sont des multiples de 4 ms (le tic du noyau :
  * HZ = 250 sous WSL, 1000 sous le Linux de référence).
@@ -1010,6 +1012,14 @@ static void info_en_time_wait(void)
     socklen_t li = sizeof i;
     getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
     verifier(i.tcpi_state == 7, "une connexion en TIME_WAIT, vue de sa socket : TCP_INFO dit TCP_CLOSE (7)");
+    /* getpeername et shutdown le voient aussi (`inet_getname`,
+     * `inet_shutdown`) : ENOTCONN ; connect, EISCONN ; send, EPIPE. */
+    struct sockaddr_in p, x = lo(4);
+    socklen_t lp = sizeof p;
+    long gp = erreur(getpeername(c, (void *)&p, &lp)), sd = erreur(shutdown(c, SHUT_RDWR)), sr = erreur(shutdown(c, SHUT_RD));
+    long cn = erreur(connect(c, (void *)&x, sizeof x)), se = erreur(send(c, "x", 1, MSG_NOSIGNAL));
+    verifier(gp == ENOTCONN && sd == ENOTCONN && sr == ENOTCONN && cn == EISCONN && se == EPIPE,
+             "en TIME_WAIT : getpeername et shutdown ENOTCONN, connect EISCONN, send EPIPE");
     close(c);
 }
 
@@ -2054,7 +2064,7 @@ static void connect_apres_erreur(void)
     verifier(connect(c, (void *)&a, sizeof a) < 0 && errno == EINPROGRESS, "connect refuse, et encore un autre : EINPROGRESS");
     close(c);
     /* Établie par un connect non bloquant jamais redit : pour `connect`, elle est encore en
-     * cours (SS_CONNECTING) : elle n'a jamais abouti, et `listen` la prend. */
+     * cours (SS_CONNECTING) ; coupée, le connect suivant voit l'échec, et `listen` la prend. */
     int port, l = ecoute(&port, 4), f;
     struct sockaddr_in x = lo(port);
     c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
@@ -2075,6 +2085,129 @@ static void connect_apres_erreur(void)
     verifier(option(c, SOL_SOCKET, SO_ERROR) == ECONNRESET, "connect bloquant, un RST : l'erreur reste");
     verifier(listen(c, 1) < 0 && errno == EINVAL, "connect bloquant, un RST : listen EINVAL");
     close(c);
+    close(l);
+}
+
+static int fil_cible, fil_sorte;
+
+static void *defaire_plus_tard(void *x)
+{
+    (void)x;
+    attendre_ms(200);
+    if (fil_sorte == 0) {
+        struct sockaddr u = { .sa_family = AF_UNSPEC };
+        connect(fil_cible, &u, sizeof u);
+    } else {
+        shutdown(fil_cible, SHUT_RDWR);
+    }
+    return NULL;
+}
+
+static void rien(int n)
+{
+    (void)n;
+}
+
+/* L'état de la socket pour connect, listen et shutdown (`sock->state` : SS_UNCONNECTED,
+ * SS_CONNECTING, SS_CONNECTED, SS_DISCONNECTING), à côté de celui de TCP : `listen` ne prend
+ * qu'une socket dont aucun connect n'est en cours à ses yeux, même refusée ; `shutdown` pendant
+ * qu'elle l'est la dit connectée (établie) ou défaite (refusée : EINVAL jusqu'à AF_UNSPEC). Un
+ * connect bloquant interrompu reste en cours. Un connect bloquant qui dort voit AF_UNSPEC d'un
+ * autre fil : EPIPE (`sk_disconnects`), l'erreur reste ; shutdown : l'erreur. */
+static void etat_de_la_socket(void)
+{
+    struct sockaddr u = { .sa_family = AF_UNSPEC };
+    struct sockaddr_in f = lo(port_ferme());
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&f, sizeof f);
+    attendre_ms(20);
+    int e1 = erreur(listen(c, 1));
+    int ok = option(c, SOL_SOCKET, SO_ERROR) == ECONNREFUSED;
+    verifier(e1 == EINVAL && ok && erreur(listen(c, 1)) == EINVAL, "connect non bloquant refuse, pas redit : listen EINVAL, meme l'erreur lue");
+    close(c);
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&f, sizeof f);
+    attendre_ms(20);
+    e1 = erreur(shutdown(c, SHUT_RDWR));
+    int e2 = erreur(shutdown(c, SHUT_RDWR));
+    int e3 = erreur(connect(c, (void *)&f, sizeof f));
+    int e4 = erreur(listen(c, 1));
+    int r1 = connect(c, &u, sizeof u);
+    verifier(e1 == ENOTCONN && e2 == ENOTCONN && e3 == EINVAL && e4 == EINVAL && r1 == 0 && listen(c, 1) == 0,
+             "refusee, shutdown : ENOTCONN ; connect et listen EINVAL ; AF_UNSPEC, puis listen");
+    close(c);
+    int port, l = ecoute(&port, 8);
+    struct sockaddr_in x = lo(port);
+    for (int sens = SHUT_RD; sens <= SHUT_WR; sens++) {
+        c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        connect(c, (void *)&x, sizeof x);
+        attendre_ms(20);
+        r1 = shutdown(c, sens);
+        verifier(r1 == 0 && erreur(connect(c, (void *)&x, sizeof x)) == EISCONN,
+                 sens == SHUT_RD ? "etablie, pas redite, SHUT_RD : connect EISCONN" : "etablie, pas redite, SHUT_WR : connect EISCONN");
+        close(c);
+        close(accept(l, NULL, NULL));
+    }
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&x, sizeof x);
+    attendre_ms(20);
+    couper(accept(l, NULL, NULL));
+    attendre_ms(20);
+    int etat = etat_de(c);
+    e1 = erreur(listen(c, 1));
+    e2 = erreur(shutdown(c, SHUT_RDWR));
+    e3 = erreur(connect(c, (void *)&x, sizeof x));
+    r1 = connect(c, &u, sizeof u);
+    e4 = erreur(connect(c, (void *)&x, sizeof x));
+    verifier(etat == TCP_CLOSE && e1 == EINVAL && e2 == ENOTCONN && e3 == EINVAL && r1 == 0 && e4 == EINPROGRESS,
+             "etablie, pas redite, un RST : listen EINVAL ; shutdown ENOTCONN, connect EINVAL ; AF_UNSPEC, et connect repart");
+    close(c);
+    close(accept(l, NULL, NULL));
+    close(l);
+    /* Une écoute pleine ne répond pas : SYN_SENT. Un connect bloquant interrompu par un signal
+     * (sans SA_RESTART) : EINTR, toujours en cours ; puis établi quand la place se libère : le
+     * connect suivant rend 0, une fois. */
+    l = ecoute(&port, 0);
+    x = lo(port);
+    int d = socket(AF_INET, SOCK_STREAM, 0);
+    connect(d, (void *)&x, sizeof x);
+    struct sigaction sa = { .sa_handler = rien }, avant;
+    sigaction(SIGALRM, &sa, &avant);
+    struct itimerval it = { .it_value = { 0, 200000 } };
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    setitimer(ITIMER_REAL, &it, NULL);
+    e1 = erreur(connect(c, (void *)&x, sizeof x));
+    sigaction(SIGALRM, &avant, NULL);
+    e2 = erreur(listen(c, 1));
+    fcntl(c, F_SETFL, O_NONBLOCK);
+    e3 = erreur(connect(c, (void *)&x, sizeof x));
+    close(accept(l, NULL, NULL));
+    for (int k = 0; k < 40 && etat_de(c) != TCP_ESTABLISHED; k++)
+        attendre_ms(100);
+    r1 = connect(c, (void *)&x, sizeof x);
+    e4 = erreur(connect(c, (void *)&x, sizeof x));
+    verifier(e1 == EINTR && e2 == EINVAL && e3 == EALREADY && r1 == 0 && e4 == EISCONN,
+             "connect bloquant interrompu : EINTR, listen EINVAL, EALREADY ; etablie : 0, puis EISCONN");
+    close(c);
+    close(accept(l, NULL, NULL));
+    /* Défait par un autre fil pendant qu'il dort. */
+    d = socket(AF_INET, SOCK_STREAM, 0);
+    connect(d, (void *)&x, sizeof x);
+    for (fil_sorte = 0; fil_sorte < 2; fil_sorte++) {
+        fil_cible = socket(AF_INET, SOCK_STREAM, 0);
+        pthread_t t;
+        pthread_create(&t, NULL, defaire_plus_tard, NULL);
+        e1 = erreur(connect(fil_cible, (void *)&x, sizeof x));
+        pthread_join(t, NULL);
+        e2 = option(fil_cible, SOL_SOCKET, SO_ERROR);
+        r1 = listen(fil_cible, 1);
+        if (fil_sorte == 0)
+            verifier(e1 == EPIPE && e2 == ECONNRESET && r1 == 0, "connect bloquant, AF_UNSPEC d'un autre fil : EPIPE, ECONNRESET en attente ; listen");
+        else
+            verifier(e1 == ECONNRESET && e2 == 0 && r1 == 0, "connect bloquant, shutdown d'un autre fil : ECONNRESET ; listen");
+        close(fil_cible);
+    }
+    close(d);
     close(l);
 }
 
@@ -2727,6 +2860,7 @@ int main(void)
     arret_d_ecoute();
     backlog_sans_signe();
     connect_apres_erreur();
+    etat_de_la_socket();
     lectures_fines();
     serveur_qui_redemarre();
     morte_mais_tenue();

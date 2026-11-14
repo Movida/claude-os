@@ -348,6 +348,34 @@ fn ranger_filles(filles: &mut VecDeque<Fille>) {
     filles.retain(|f| f.tcb.etat() != Etat::Fermee || f.etablie);
 }
 
+/// Ce que `connect`, `listen` et `shutdown` savent de la connexion (le `sock->state` de Linux,
+/// `socket_state`), à côté de l'état de TCP (`Tcb::etat`, le `sk_state`).
+///
+/// Choix de conception : deux états, comme Linux. Celui de TCP change seul, au gré des
+/// segments et des minuteurs ; celui-ci, seulement dans un appel système : il dit ce que le
+/// programme a vu. Une connexion refusée est TCP_CLOSE, que le programme ait déjà eu
+/// l'échec par `connect` ou pas encore : seul ce second état les distingue (pas vu :
+/// `listen` refuse, EINVAL ; vu, la socket est redevenue neuve). Écartés : tout tirer de
+/// l'état de TCP (ces deux cas-là s'y confondent) ; les deux booléens d'avant (« établie
+/// un jour », « connect non bloquant en cours »), qui ne savaient dire ni un `connect`
+/// bloquant interrompu par un signal (encore en cours : le suivant rend 0 quand elle est
+/// établie), ni SS_DISCONNECTING.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EtatSocket {
+    /// SS_UNCONNECTED : neuve, une écoute, ou défaite (AF_UNSPEC, `shutdown` en SYN_SENT, un
+    /// `connect` qui a vu l'échec).
+    NonConnectee,
+    /// SS_CONNECTING : un `connect` l'a lancée, et aucun ne l'a encore vue aboutir ou échouer.
+    EnConnexion,
+    /// SS_CONNECTED : un `connect` l'a vue établie (ou `shutdown`, pendant qu'elle était en
+    /// cours), ou c'est une fille rendue par `accept`.
+    Connectee,
+    /// SS_DISCONNECTING : `shutdown` pendant qu'elle était en cours sans être établie
+    /// (SYN_RECEIVED, ou déjà fermée) : `connect` et `listen` refusent (EINVAL) jusqu'à
+    /// AF_UNSPEC.
+    EnDeconnexion,
+}
+
 /// Ce qu'est la socket.
 pub enum Mode {
     Neuve,
@@ -370,11 +398,11 @@ pub struct Partie {
     hors_table: bool,
     /// Les options de SOL_TCP.
     pub options: OptionsTcp,
-    /// La connexion a été établie un jour (un second `connect` rend
-    /// EISCONN, pas EALREADY).
-    pub etablie_un_jour: bool,
-    /// Un `connect` non bloquant est en cours.
-    pub connexion_en_cours: bool,
+    /// Ce qu'en savent `connect`, `listen` et `shutdown` (`sock->state`).
+    pub etat_socket: EtatSocket,
+    /// Les déconnexions (`sk_disconnects`) : AF_UNSPEC, et un `connect` qui voit l'échec ;
+    /// un `connect` bloquant qui en voit passer une pendant qu'il dort rend EPIPE.
+    deconnexions: u32,
     /// L'échéance inscrite dans la liste du réseau pour cette socket.
     echeance_armee: Option<u64>,
     /// La mémoire que la socket a comptée dans celle de TCP (`MEMOIRE`).
@@ -821,9 +849,9 @@ impl Partie {
     /// La socket redevient neuve (TCP_CLOSE), et peut se connecter à nouveau
     /// ou écouter : après un `connect` qui n'a pas abouti (refusé, abandonné),
     /// ou `connect(AF_UNSPEC)` (`oublier_la_connexion`, qui efface aussi ce
-    /// qu'efface `tcp_disconnect`), ou avant `listen`, qui la trouve TCP_CLOSE. Son entrée de la
-    /// table est rendue ; un port choisi par `bind` est gardé
-    /// (SOCK_BINDPORT_LOCK), lié de nouveau à son adresse.
+    /// qu'efface `tcp_disconnect`). Son entrée de la table est rendue ; un
+    /// port choisi par `bind` est gardé (SOCK_BINDPORT_LOCK), lié de nouveau
+    /// à son adresse.
     fn redevenir_neuve(&mut self, s: &Arc<Socket>) {
         // Ce que les tampons sont devenus reste (`tcp_disconnect` n'y touche pas), et ce
         // que la connexion laisse du MSS.
@@ -848,8 +876,7 @@ impl Partie {
         self.desarmer();
         self.mode = Mode::Neuve;
         self.hors_table = false;
-        self.etablie_un_jour = false;
-        self.connexion_en_cours = false;
+        self.etat_socket = EtatSocket::NonConnectee;
         // L'adresse de `bind` reste (SOCK_BINDADDR_LOCK), avec ou sans son port. Un port qui
         // n'était pas de `bind` est rendu, mais getsockname le montre encore (`inet_sport`, que
         // `inet_put_port` ne remet pas à 0 : mesuré), sans que la socket le tienne (`lie` faux :
@@ -905,6 +932,13 @@ impl Partie {
         self.redevenir_neuve(s);
         self.options.maxseg = 0;
         self.options.hors_connexion = self.options.hors_connexion.deconnecte();
+    }
+
+    /// Un `connect` voit que la connexion n'a pas abouti (`sock_error`) : la socket est
+    /// défaite (`tcp_disconnect`, une déconnexion de plus), SS_UNCONNECTED.
+    fn voir_l_echec(&mut self, s: &Arc<Socket>) {
+        self.oublier_la_connexion(s);
+        self.deconnexions = self.deconnexions.wrapping_add(1);
     }
 
     /// La socket ne tient plus d'entrée dans la table : une connexion finie,
@@ -1660,7 +1694,7 @@ pub fn nouvelle(numero: u64) -> Option<Possession<Partie>> {
     SOCKETS.fetch_add(1, Ordering::Relaxed);
     let partie = Partie {
         numero, mode: Mode::Neuve, adresses: Adresses::default(), identifiant: 0, orpheline: false, hors_table: false,
-        options: OptionsTcp::DEFAUT, etablie_un_jour: false, connexion_en_cours: false, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
+        options: OptionsTcp::DEFAUT, etat_socket: EtatSocket::NonConnectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
     };
     let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
     Some(Possession::new(partie, premier))
@@ -1722,23 +1756,24 @@ pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
 }
 
 /// listen (`inet_listen`) : une socket neuve (liée, ou un port éphémère),
-/// ou qui écoute déjà (le backlog change) ; une socket connectée : EINVAL.
+/// ou qui écoute déjà (le backlog change) ; une socket connectée, ou dont un `connect`
+/// n'a pas encore vu la fin (SS_CONNECTING, même refusée) : EINVAL.
 pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
     // Comparé sans signe : un négatif, le plus grand permis (`__sys_listen_socket`).
     let backlog = (backlog as u32 as usize).min(SOMAXCONN);
     let mut g = flux(s).posseder();
     let p = g.donnee();
+    if p.etat_socket != EtatSocket::NonConnectee {
+        return Err(-EINVAL);
+    }
     match &mut p.mode {
         Mode::Ecoute { backlog: b, .. } => {
             *b = backlog;
             g.publier(|p, c| p.rafraichir(c));
             return Ok(());
         }
-        // Une connexion qui n'a jamais abouti : la socket est neuve pour
-        // Linux (TCP_CLOSE), elle peut écouter.
-        Mode::Connexion(t) if t.etat() == Etat::Fermee && !p.etablie_un_jour => {
-            p.redevenir_neuve(s);
-        }
+        // Ni CLOSE ni LISTEN (`__inet_listen_sk`) ; une connexion est toujours vue d'un
+        // `connect` (SS_CONNECTING ou après), refusée plus haut.
         Mode::Connexion(_) => return Err(-EINVAL),
         Mode::Neuve => {}
     }
@@ -1770,9 +1805,12 @@ pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
 /// connect (`inet_stream_connect`, `tcp_v4_connect`).
 pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i64> {
     if o.len() >= 2 && socket::famille(o) == Some(socket::AF_UNSPEC) {
-        // Déconnecter (`tcp_disconnect`), une connexion ou une écoute.
+        // Déconnecter (`tcp_disconnect`), une connexion ou une écoute ; un `connect` bloquant
+        // qui dort sur elle le verra (`sk_disconnects`).
         let mut g = flux(s).posseder();
-        g.donnee().deconnecter(s);
+        let p = g.donnee();
+        p.deconnecter(s);
+        p.deconnexions = p.deconnexions.wrapping_add(1);
         g.avec_court(|_, c| c.arret = 0);
         g.publier(|p, c| p.rafraichir(c));
         // Un `accept` en attente n'a pas d'état qui change à voir (`sk_error_report`).
@@ -1788,27 +1826,23 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
     let mut deja = false;
     {
         let p = g.donnee();
-        // Une connexion qui n'a jamais abouti aux yeux de `connect` (refusée, abandonnée, ou
-        // coupée avant que `connect` ne l'ait vue établie : SS_CONNECTING, TCP_CLOSE) : son erreur,
-        // ou ECONNABORTED si elle a déjà été lue (`__inet_stream_connect` : `sock_error`) ; la
-        // socket redevient neuve, et c'est le `connect` suivant qui repart.
-        if let Mode::Connexion(t) = &mut p.mode
-            && t.etat() == Etat::Fermee
-            && !p.etablie_un_jour
-        {
-            let e = t.prendre_erreur();
-            p.oublier_la_connexion(s);
-            g.publier(|p, c| p.rafraichir(c));
-            return Err(if e != 0 { -(e as i64) } else { -ECONNABORTED });
+        // Selon ce que les `connect` d'avant ont vu (`__inet_stream_connect`) : défaite par
+        // `shutdown` pendant qu'elle était en cours : EINVAL ; vue établie : EISCONN, même
+        // fermée depuis (l'erreur reste en attente, mesuré) ; une écoute : EISCONN.
+        match p.etat_socket {
+            EtatSocket::EnDeconnexion => return Err(-EINVAL),
+            EtatSocket::Connectee => return Err(-EISCONN),
+            EtatSocket::NonConnectee | EtatSocket::EnConnexion => {}
         }
-        let p = g.donnee();
-        match &p.mode {
+        match &mut p.mode {
             Mode::Ecoute { .. } => return Err(-EISCONN),
             Mode::Connexion(t) => {
-                // Le `connect` d'une connexion en cours : EALREADY (non
-                // bloquant), ou attendre encore (bloquant, refait après un
-                // signal) ; établie : EISCONN ; fermée sur une erreur :
-                // l'erreur, une fois.
+                // En cours (SS_CONNECTING) : EALREADY (non bloquant), ou attendre encore
+                // (bloquant, refait après un signal) ; établie depuis : 0, une fois (mesuré) ;
+                // fermée sans qu'un `connect` l'ait vu (refusée, abandonnée, ou coupée après
+                // l'établissement) : son erreur, ou ECONNABORTED si elle a déjà été lue
+                // (`sock_error`) ; la socket redevient neuve, et c'est le `connect` suivant
+                // qui repart.
                 match t.etat() {
                     Etat::SynEnvoye | Etat::SynRecu => {
                         if non_bloquant {
@@ -1818,17 +1852,15 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                         // si le délai passe (`inet_stream_connect`).
                         deja = true;
                     }
-                    // Vue établie, puis fermée : EISCONN (SS_CONNECTED), l'erreur reste en attente
-                    // (mesuré).
-                    Etat::Fermee => return Err(-EISCONN),
+                    Etat::Fermee => {
+                        let e = t.prendre_erreur();
+                        p.voir_l_echec(s);
+                        g.publier(|p, c| p.rafraichir(c));
+                        return Err(if e != 0 { -(e as i64) } else { -ECONNABORTED });
+                    }
                     _ => {
-                        if p.connexion_en_cours {
-                            // Le premier `connect` qui suit l'établissement
-                            // d'un `connect` non bloquant rend 0 (mesuré).
-                            p.connexion_en_cours = false;
-                            return Ok(());
-                        }
-                        return Err(-EISCONN);
+                        p.etat_socket = EtatSocket::Connectee;
+                        return Ok(());
                     }
                 }
             }
@@ -1922,7 +1954,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 }
                 p.mode = Mode::Connexion(t);
                 p.identifiant = crate::aleatoire::u32() as u16;
-                p.connexion_en_cours = non_bloquant;
+                p.etat_socket = EtatSocket::EnConnexion;
                 // Une connexion neuve repart sans erreur (`tcp_connect_init`).
                 p.erreur_seule = 0;
                 let _contexte = contexte::entrer();
@@ -1937,6 +1969,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
         }
     }
     // Attendre l'établissement ou l'erreur.
+    let deconnexions = g.donnee().deconnexions;
     let echeance = delai.map(|d| crate::temps::ns_monotone().saturating_add(d));
     let r = g.attendre(flux(s).file(), Sommeil::Interruptible, echeance, |c| !matches!(c.etat, Some(Etat::SynEnvoye | Etat::SynRecu)));
     let p = g.donnee();
@@ -1945,25 +1978,35 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
         Reveil::Echeance => return Err(if deja { -EALREADY } else { -EINPROGRESS }),
         Reveil::Signal => return Err(if delai.is_some() { -EINTR } else { -crate::reprise::ERESTARTSYS }),
     }
-    // Défaite pendant qu'on attendait (`shutdown`, AF_UNSPEC, d'un autre fil) : son erreur.
-    let Mode::Connexion(t) = &mut p.mode else {
-        let e = core::mem::take(&mut p.erreur_seule);
-        g.publier(|p, c| p.rafraichir(c));
-        return Err(if e != 0 { -(e as i64) } else { -ECONNABORTED });
-    };
-    if t.etat() == Etat::Fermee {
+    // Défaite par AF_UNSPEC d'un autre fil pendant qu'on dormait : EPIPE, et son erreur
+    // (ECONNRESET) reste en attente (mesuré).
+    if p.deconnexions != deconnexions {
+        return Err(-EPIPE);
+    }
+    match &mut p.mode {
+        // Défaite par `shutdown` d'un autre fil (en SYN_SENT : `tcp_disconnect`) : son erreur.
+        Mode::Neuve => {
+            let e = core::mem::take(&mut p.erreur_seule);
+            p.voir_l_echec(s);
+            g.publier(|p, c| p.rafraichir(c));
+            Err(if e != 0 { -(e as i64) } else { -ECONNABORTED })
+        }
         // Un connect bloquant qui échoue remet la socket à neuf
         // (`tcp_disconnect`) : elle peut se reconnecter, et poll ne dit
-        // plus que POLLOUT | POLLHUP. Son erreur déjà lue par un autre fil : ECONNABORTED
-        // (`__inet_stream_connect`).
-        let e = t.prendre_erreur();
-        p.oublier_la_connexion(s);
-        g.publier(|p, c| p.rafraichir(c));
-        return Err(if e != 0 { -(e as i64) } else { -ECONNABORTED });
+        // plus que POLLOUT | POLLHUP. Son erreur déjà lue par un autre fil : ECONNABORTED.
+        Mode::Connexion(t) if t.etat() == Etat::Fermee => {
+            let e = t.prendre_erreur();
+            p.voir_l_echec(s);
+            g.publier(|p, c| p.rafraichir(c));
+            Err(if e != 0 { -(e as i64) } else { -ECONNABORTED })
+        }
+        // Établie. Ou, défaite puis mise à l'écoute par d'autres fils avant que celui-ci ne
+        // reprenne la main : ni fermée ni en cours, Linux la dit connectée aussi, et rend 0.
+        Mode::Connexion(_) | Mode::Ecoute { .. } => {
+            p.etat_socket = EtatSocket::Connectee;
+            Ok(())
+        }
     }
-    p.etablie_un_jour = true;
-    p.connexion_en_cours = false;
-    Ok(())
 }
 
 impl Possession<Partie> {
@@ -2014,8 +2057,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 // Tout, sauf ce qui est propre à une écoute (`inet_csk_clone_lock`,
                 // `inet_csk_delack_init`) : la fille n'attend pas de données pour naître deux fois.
                 options: OptionsTcp { defer_accept: 0, quickack: true, ip_options, ..p.options },
-                etablie_un_jour: true,
-                connexion_en_cours: false, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
+                etat_socket: EtatSocket::Connectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
             };
             let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
             let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
@@ -2070,14 +2112,16 @@ pub fn nom_lie(s: &Socket) -> ([u8; 4], u16) {
     (if matches!(g.donnee().mode, Mode::Connexion(_)) { a.source } else { a.adresse }, if a.lie { a.port } else { 0 })
 }
 
+/// Le pair d'une connexion (getpeername, `inet_getname`) : ENOTCONN (None)
+/// en TCP_CLOSE et TCP_SYN_SENT ; une connexion en TIME_WAIT, Linux l'a
+/// déjà rendue à TCP_CLOSE pour sa socket (`tcp_time_wait`, `tcp_done`).
 pub fn pair(s: &Socket) -> Option<([u8; 4], u16)> {
     let mut g = flux(s).posseder();
     let p = g.donnee();
     match &p.mode {
-        Mode::Connexion(t) if !matches!(t.etat(), Etat::Fermee | Etat::SynEnvoye) || p.etablie_un_jour && t.etat() != Etat::Fermee => {
+        Mode::Connexion(t) if !matches!(t.etat(), Etat::Fermee | Etat::SynEnvoye | Etat::TempsAttente) => {
             Some((p.adresses.distante, p.adresses.port_distant))
         }
-        Mode::Connexion(t) if t.etat() == Etat::SynEnvoye => None,
         _ => None,
     }
 }
@@ -2399,11 +2443,24 @@ pub fn recevoir_urgent(s: &Arc<Socket>, drapeaux: u64, place: usize, copier: imp
 /// SYN_SENT, la connexion est défaite (`tcp_disconnect`), et ce n'est pas une erreur.
 pub fn arreter(s: &Arc<Socket>, arret: u8) -> Result<(), i64> {
     let mut g = flux(s).posseder();
-    let (ecoute, en_syn) = match &g.donnee().mode {
-        Mode::Ecoute { .. } => (true, false),
-        Mode::Connexion(t) => (false, t.etat() == Etat::SynEnvoye),
-        Mode::Neuve => (false, false),
+    let p = g.donnee();
+    let (ecoute, etat) = match &p.mode {
+        Mode::Ecoute { .. } => (true, None),
+        Mode::Connexion(t) => (false, Some(t.etat())),
+        Mode::Neuve => (false, None),
     };
+    let en_syn = etat == Some(Etat::SynEnvoye);
+    // Une connexion en cours aux yeux de `connect` : établie, elle le devient pour lui
+    // (SS_CONNECTED) ; sinon, défaite pour lui (SS_DISCONNECTING, sauf en SYN_SENT, défaite
+    // plus bas), il refusera (EINVAL) jusqu'à AF_UNSPEC (`inet_shutdown`, mesuré). Une
+    // connexion en TIME_WAIT est TCP_CLOSE pour la socket (`pair`).
+    if p.etat_socket == EtatSocket::EnConnexion {
+        p.etat_socket = if matches!(etat, Some(Etat::SynEnvoye | Etat::SynRecu | Etat::Fermee | Etat::TempsAttente)) {
+            EtatSocket::EnDeconnexion
+        } else {
+            EtatSocket::Connectee
+        };
+    }
     if en_syn || (ecoute && arret & socket::ARRET_LECTURE != 0) {
         g.donnee().deconnecter(s);
         g.avec_court(|_, c| c.arret = 0);
@@ -2414,7 +2471,8 @@ pub fn arreter(s: &Arc<Socket>, arret: u8) -> Result<(), i64> {
     if ecoute {
         return Ok(());
     }
-    let connectee = matches!(&g.donnee().mode, Mode::Connexion(t) if t.etat() != Etat::Fermee);
+    // TCP_CLOSE, TIME_WAIT compris (`pair`) : l'arrêt est noté, mais ENOTCONN.
+    let connectee = matches!(&g.donnee().mode, Mode::Connexion(t) if !matches!(t.etat(), Etat::Fermee | Etat::TempsAttente));
     g.avec_court(|_, c| c.arret |= arret);
     if arret & socket::ARRET_LECTURE != 0
         && let Mode::Connexion(t) = &mut g.donnee().mode
