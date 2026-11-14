@@ -128,3 +128,102 @@ pub fn interne(o: &[u8]) -> Option<Interne> {
 pub fn ports(o: &[u8], i: &Interne) -> Option<(u16, u16)> {
     Some((mot16(o, i.longueur_entete)?, mot16(o, i.longueur_entete + 2)?))
 }
+
+/// Les extensions d'une erreur ICMP (RFC 4884) : un message d'erreur peut
+/// porter, après la copie du paquet d'origine, des objets qui en disent
+/// plus (l'interface d'arrivée d'un routeur, RFC 5837 ; une étiquette MPLS,
+/// RFC 4950). L'octet 5 de l'en-tête dit alors la longueur de la copie, en
+/// mots de 32 bits ; elle est complétée de zéros jusqu'à 128 octets au
+/// moins, pour qu'un ancien programme qui ne connaît pas les extensions ne
+/// les prenne pas pour la fin de son datagramme.
+///
+/// Avec IP_RECVERR_RFC4884, Linux dit dans le `ee_data` de l'erreur où
+/// elles commencent dans ce que lit le programme, et si leur structure
+/// tient : le programme les lit lui-même (Linux ne les interprète pas).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Extensions {
+    /// Leur position dans ce que lit le programme (la copie, moins les
+    /// en-têtes d'origine qu'il ne voit pas).
+    pub debut: u16,
+    /// Leur structure est fausse (SO_EE_RFC4884_FLAG_INVALID) : une somme
+    /// qui ne tombe pas juste, un objet coupé ou trop court.
+    pub invalide: bool,
+}
+
+impl Extensions {
+    /// Le `ee_data` de la `sock_extended_err`, lu par le programme comme un
+    /// entier : c'est l'union `ee_rfc4884` (un u16 `len`, puis un octet
+    /// `flags` et un octet réservé), petit-boutiste sur x86-64.
+    pub fn ee_data(&self) -> u32 {
+        self.debut as u32 | (self.invalide as u32) << 16
+    }
+}
+
+/// Les extensions du message d'erreur `message` (le message ICMP entier,
+/// en-tête compris, jusqu'à la fin du paquet), quand le programme lira ce
+/// qui suit les `entetes` premiers octets de la copie d'origine (son
+/// en-tête IPv4, plus celui d'UDP qu'il ne voit pas ; IPv4 seul pour un
+/// écho, dont le programme lit l'en-tête ICMP d'origine). C'est
+/// `ipv4_icmp_error_rfc4884` puis `ip_icmp_error_rfc4884` de Linux 6.18
+/// (ip_sockglue.c, icmp.c) :
+///
+/// - seuls « destination injoignable », « temps dépassé » et « problème de
+///   paramètre » en ont (la RFC 4884 les définit pour eux trois) ;
+/// - une copie de moins de 128 octets (le minimum de la RFC), ou plus
+///   courte que les en-têtes ôtés, n'a pas d'extensions : un message
+///   d'avant la RFC a 0 à l'octet 5 (un champ « inutilisé ») ;
+/// - leur en-tête (4 octets) doit tenir dans ce que lit le programme ;
+/// - leur structure n'est vérifiée qu'en version 2 (la seule définie) :
+///   une autre version les dit valides sans les lire, comme Linux.
+///
+/// Rien n'est rendu (None) quand il n'y en a pas : le `ee_data` reste nul.
+/// Les erreurs mesurées sous Linux (une socket brute qui s'envoie les
+/// messages par lo : formats/tests/reseau.rs, `icmp_rfc4884`) : leur somme,
+/// un objet de moins de 4 octets, un objet qui dépasse la fin, et 1 à 3
+/// octets après le dernier objet.
+pub fn extensions_rfc4884(message: &[u8], entetes: usize) -> Option<Extensions> {
+    if !matches!(*message.first()?, INJOIGNABLE | TEMPS_DEPASSE | PARAMETRE) {
+        return None;
+    }
+    let longueur = *message.get(5)? as usize * 4;
+    if longueur < 128 || longueur < entetes {
+        return None;
+    }
+    let debut = longueur - entetes;
+    let charge = message.get(ENTETE + entetes..)?;
+    let extensions = charge.get(debut..).filter(|e| e.len() >= 4)?;
+    // `debut` est d'au plus 255 × 4 octets : il tient dans un u16.
+    Some(Extensions { debut: debut as u16, invalide: !extensions_valides(extensions) })
+}
+
+/// La structure des extensions `e` (au moins leur en-tête de 4 octets :
+/// une version de 4 bits, 12 bits réservés, une somme sur 16 bits) tient-elle
+/// (`ip_icmp_error_rfc4884_validate`) ? En version 2 : la somme de toutes
+/// les extensions doit tomber juste, sauf si elle est nulle (« pas de
+/// somme », permis par la RFC 4884, section 7) ; puis chaque objet a un
+/// en-tête de 4 octets (sa longueur, en-tête compris, sur 16 bits, puis sa
+/// classe et son genre), une longueur d'au moins 4, et finit dans le
+/// message.
+fn extensions_valides(e: &[u8]) -> bool {
+    if e[0] >> 4 != 2 {
+        return true;
+    }
+    if mot16(e, 2) != Some(0) && plier(somme(e, 0)) != 0 {
+        return false;
+    }
+    let mut position = 4;
+    while position < e.len() {
+        // Un en-tête d'objet coupé : `skb_header_pointer` ne le trouve pas.
+        let Some(longueur) = e.get(position..position + 4).and_then(|o| mot16(o, 0)) else {
+            return false;
+        };
+        if longueur < 4 {
+            return false;
+        }
+        position += longueur as usize;
+        if position > e.len() {
+            return false;
+        }
+    }
+    true
+}

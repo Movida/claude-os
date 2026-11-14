@@ -555,18 +555,26 @@ pub fn fragmentation_dite(s: &Socket) -> bool {
 /// Ce que fait une erreur ICMP à la socket `s` (la fin d'`__udp4_lib_err`
 /// et de `ping_err`) : voir `erreur`. `port` : celui de la destination
 /// d'origine (0 pour ping) ; `debut` : où commence, après l'en-tête IPv4
-/// de la copie, ce que lira le programme.
+/// de la copie, ce que lira le programme. Avec IP_RECVERR_RFC4884, l'erreur
+/// en file dit aussi où y commencent les extensions du message (RFC 4884,
+/// `ip_icmp_error`), comptées dans ce que lit le programme.
 pub fn signaler(s: &Socket, e: &ErreurRecue, errno: i32, fatale: bool, port: u16, debut: usize) {
     if !s.recverr.load(Ordering::Relaxed) {
         if !fatale || !s.connectee.load(Ordering::Relaxed) {
             return;
         }
     } else {
-        let charge = e.origine.get(e.interne.longueur_entete + debut..).unwrap_or(&[]);
+        let entetes = e.interne.longueur_entete + debut;
+        let charge = e.origine.get(entetes..).unwrap_or(&[]);
+        let ee_data = if s.rfc4884.load(Ordering::Relaxed) {
+            formats::reseau::icmp::extensions_rfc4884(e.message, entetes).map_or(0, |x| x.ee_data())
+        } else {
+            0
+        };
         if let Some(donnees) = Paquet::copie(charge) {
             let taille = donnees.taille_vraie();
             s.mettre_en_file(ErreurEnFile {
-                errno, origine: socket::ORIGINE_ICMP, genre: e.genre, code: e.code, info: e.info,
+                errno, origine: socket::ORIGINE_ICMP, genre: e.genre, code: e.code, info: e.info, ee_data,
                 adresse: e.interne.destination, port, emetteur: e.emetteur, interface: e.interface,
                 arrivee: e.destination, entete: *e.entete, somme: somme_linux(e.message), donnees, taille,
             });

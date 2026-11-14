@@ -1602,7 +1602,7 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	done; \
 	[ "$$n" = 6 ] || { echo "ICMP par machine : $${n:-aucune mesure,} erreurs pour 20 datagrammes (6 attendues) : ECHEC"; exit 1; }; \
 	echo "ICMP par machine : 6 erreurs pour 20 datagrammes : ok"
-	rm -f test-carte.log test-carte.pcap $(MON_TESTS); fin=; tcp=; \
+	rm -f test-carte.log test-carte.pcap $(MON_TESTS); segments=; fin=; tcp=; \
 	for essai in 1 2 3 4 5; do \
 	  port=$$(( 20000 + ($$$$ * 37 + essai * 7907) % 40000 )); \
 	  $(QEMU_TEST) -netdev user,id=u0,hostfwd=udp:127.0.0.1:$$port-:4000 -netdev hubport,id=h0,hubid=0,netdev=u0 \
@@ -1617,9 +1617,11 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	  [ $$etat = pret ] && { bash -c 'exec 3>/dev/udp/127.0.0.1/'$$port'; printf "petit datagramme de la carte" >&3; \
 	    for i in 1 2 3; do yes "claude-os, la carte " | head -c 3000 | dd bs=3000 count=1 iflag=fullblock status=none >&3; done'; \
 	    for i in $$(seq $$(( $(DUREE) * 10 ))); do \
-	      grep -qE "reseau carte : (ECHEC|toutes les verifications : ok)" test-carte.log && { fin=1; break; }; sleep 0.1; done; \
-	    [ -n "$$fin" ] && echo "set_link u0 off" | nc -U -q1 $(MON_TESTS) >/dev/null && bash outils/envoyer-segments $$(( port + 1 )) && sleep 1 && \
-	      tcp=$$(od -An -v -tu1 test-carte.pcap | awk -f outils/segments-tcp.awk | LC_ALL=C sort -u); }; \
+	      grep -qF "reseau carte : en attente des segments" test-carte.log && { segments=1; break; }; sleep 0.1; done; \
+	    [ -n "$$segments" ] && echo "set_link u0 off" | nc -U -q1 $(MON_TESTS) >/dev/null && bash outils/envoyer-segments $$(( port + 1 )) && \
+	      for i in $$(seq $$(( $(DUREE) * 10 ))); do \
+	        grep -qE "reseau carte : (ECHEC|toutes les verifications : ok)" test-carte.log && { fin=1; break; }; sleep 0.1; done; \
+	    [ -n "$$fin" ] && tcp=$$(od -An -v -tu1 test-carte.pcap | awk -f outils/segments-tcp.awk | LC_ALL=C sort -u); }; \
 	  kill $$q 2>/dev/null; wait $$q 2>/dev/null; break; \
 	done; \
 	grep -F "[linux] reseau" test-carte.log; \

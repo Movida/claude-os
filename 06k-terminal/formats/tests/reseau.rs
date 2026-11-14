@@ -545,6 +545,85 @@ fn icmp_echo_et_erreur() {
     assert_eq!(erreurs, attendues);
 }
 
+/// Un message d'erreur ICMP comme ceux de la sonde qui a mesuré Linux 6.18
+/// (une socket brute qui se les envoie par lo, pour une socket UDP
+/// connectée avec IP_RECVERR et IP_RECVERR_RFC4884) : le genre, l'octet 5
+/// (la longueur de la copie en mots de 32 bits), la copie (un en-tête IPv4
+/// de 20 octets, un en-tête UDP, puis `charge` octets), puis les
+/// extensions, en hexadécimal, avec « xxxx » à la place de leur somme,
+/// calculée (fausse si `faussee`).
+fn erreur_rfc4884(genre: u8, longueur: u8, charge: usize, extensions: &str, faussee: bool) -> Vec<u8> {
+    let mut m = vec![genre, if genre == icmp::INJOIGNABLE { icmp::PORT } else { 0 }, 0, 0, 0, longueur, 0, 0];
+    let total = (28 + charge) as u16;
+    let mut ip = [0u8; 20];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&total.to_be_bytes());
+    ip[8] = 64;
+    ip[9] = ipv4::UDP;
+    ip[12..16].copy_from_slice(&[127, 0, 0, 1]);
+    ip[16..20].copy_from_slice(&[127, 0, 0, 1]);
+    m.extend_from_slice(&ip);
+    m.extend_from_slice(&[0x9c, 0x40, 0, 9]);
+    m.extend_from_slice(&(8 + charge as u16).to_be_bytes());
+    m.extend_from_slice(&[0, 0]);
+    m.extend(std::iter::repeat_n(b'a', charge));
+    let debut = m.len();
+    let mut hexa = extensions.as_bytes().chunks(2);
+    let a_calculer = extensions.get(4..8) == Some("xxxx");
+    for (i, c) in (&mut hexa).enumerate() {
+        let c = std::str::from_utf8(c).unwrap();
+        m.push(if a_calculer && (i == 2 || i == 3) { 0 } else { u8::from_str_radix(c, 16).unwrap() });
+    }
+    if a_calculer {
+        let s = plier(somme(&m[debut..], 0)) ^ if faussee { 0x5555 } else { 0 };
+        m[debut + 2..debut + 4].copy_from_slice(&s.to_be_bytes());
+    }
+    m
+}
+
+#[test]
+fn icmp_rfc4884() {
+    // Les quinze cas mesurés (sauf le dernier, sans l'option : rien à
+    // calculer) : ce que lit le programme, et le `ee_data` de l'erreur.
+    let objet = "2000xxxx00080101deadbeef";
+    let cas: [(&str, u8, u8, usize, &str, bool, usize, u32); 14] = [
+        ("valide", 3, 32, 100, objet, false, 112, 0x64),
+        ("somme fausse", 3, 32, 100, objet, true, 112, 0x10064),
+        ("copie de 124 octets", 3, 31, 96, objet, false, 108, 0),
+        ("version 1", 3, 32, 100, "1000123400080101", false, 108, 0x64),
+        ("objet de 2 octets", 3, 32, 100, "2000000000020101", false, 108, 0x10064),
+        ("objet trop long", 3, 32, 100, "200000000010010100000000", false, 112, 0x10064),
+        ("sans extension", 3, 32, 100, "", false, 100, 0),
+        ("somme nulle", 3, 32, 100, "2000000000080101deadbeef", false, 112, 0x64),
+        ("temps depasse", 11, 32, 100, objet, false, 112, 0x64),
+        ("probleme de parametre", 12, 32, 100, objet, false, 112, 0x64),
+        ("copie au-dela de la fin", 3, 40, 100, objet, false, 112, 0),
+        ("trois octets apres la copie", 3, 32, 100, "200000", false, 103, 0),
+        ("l'en-tete des extensions seul", 3, 32, 100, "20000000", false, 104, 0x64),
+        ("un octet d'objet", 3, 32, 100, "2000000000", false, 105, 0x10064),
+    ];
+    for (nom, genre, longueur, charge, extensions, faussee, lu, ee_data) in cas {
+        let m = erreur_rfc4884(genre, longueur, charge, extensions, faussee);
+        assert_eq!(m.len() - icmp::ENTETE - 28, lu, "{nom} : ce que lit le programme");
+        let e = icmp::extensions_rfc4884(&m, 28).map_or(0, |e| e.ee_data());
+        assert_eq!(e, ee_data, "{nom}");
+    }
+    // Un écho (ping) : le programme lit l'en-tête ICMP d'origine, seul
+    // l'en-tête IPv4 est ôté (MESURÉ aussi : `rfc4884-ping`).
+    let m = erreur_rfc4884(3, 32, 100, objet, false);
+    assert_eq!(icmp::extensions_rfc4884(&m, 20).map(|e| e.ee_data()), Some(108));
+    // Les autres genres n'en ont pas, et un message coupé n'en a pas.
+    let mut m = erreur_rfc4884(3, 32, 100, objet, false);
+    m[0] = icmp::REDIRECTION;
+    assert_eq!(icmp::extensions_rfc4884(&m, 28), None);
+    assert_eq!(icmp::extensions_rfc4884(&m[..5], 28), None);
+    assert_eq!(icmp::extensions_rfc4884(&[], 28), None);
+    // Une copie plus courte que les en-têtes ôtés (des options IPv4 de
+    // 40 octets, et l'octet 5 au minimum, 32) : rien.
+    let m = erreur_rfc4884(3, 32, 100, objet, false);
+    assert_eq!(icmp::extensions_rfc4884(&m, 132), None);
+}
+
 #[test]
 fn mutations() {
     let mut h = Hasard(0x7e5e_a0de);

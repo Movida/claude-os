@@ -13,13 +13,23 @@
 #   genre    « arp » : une requête ARP de 10.0.2.77 pour 10.0.2.15, qui lui
 #            apprend où est 10.0.2.77 (`neigh_event_ns` : une requête pour
 #            nous crée l'entrée de qui la pose), sans qu'il ait à le
-#            demander ; « tcp » : un segment TCP ;
+#            demander ; « tcp » : un segment TCP ; « icmp » : une erreur
+#            ICMP pour un datagramme UDP de la machine vers 10.0.2.77 ;
 #   tos, ttl le TOS et le TTL de l'en-tête IPv4 ;
 #   options  les options IPv4, en hexadécimal (une longueur multiple de 4
 #            octets, bourrage compris) ;
 #   source, destination, seq, ack, drapeaux, donnees : les ports, les
 #            numéros, les drapeaux du segment TCP (en décimal : 2 SYN, 16
-#            ACK...), et le nombre d'octets de données (des « x »).
+#            ACK...), et le nombre d'octets de données (des « x ») ; pour
+#            icmp, les ports et la taille des données du datagramme cité ;
+#   type, code, longueur : pour icmp, le genre et le code du message, et
+#            son octet 5 (RFC 4884 : la longueur de la copie d'origine, en
+#            mots de 32 bits ; la copie est complétée de zéros jusque-là) ;
+#   extension : pour icmp, ce qui suit la copie, en hexadécimal ; « xxxx »
+#            à la place des octets 2 et 3 : la somme des extensions,
+#            calculée, fausse (la juste plus un) si faussee=1 ;
+#   ihl, cite : pour icmp, la longueur de l'en-tête cité, en mots (5 sans
+#            elle), et son protocole (17, UDP, sans lui).
 function octet(v) { o[n++] = v % 256 }
 function mot(v) { octet(int(v / 256)); octet(v) }
 function long(v) { mot(int(v / 65536)); mot(v % 65536) }
@@ -52,16 +62,30 @@ BEGIN {
     } else {
         mot(2048)
         lo = length(options) / 2
-        lt = 20 + donnees
         # IPv4 : version 4 et la longueur de l'en-tête en mots, le TOS, la
-        # longueur totale, l'identifiant, ni fragment ni DF, le TTL, TCP
-        # (6), la somme (plus bas), les adresses, les options.
+        # longueur totale (plus bas), l'identifiant, ni fragment ni DF, le
+        # TTL, ICMP (1) ou TCP (6), la somme (plus bas), les adresses, les
+        # options.
         ip = n
-        octet(64 + 5 + lo / 4); octet(tos + 0); mot(20 + lo + lt); mot(1); mot(0); octet(ttl + 0); octet(6); mot(0)
+        octet(64 + 5 + lo / 4); octet(tos + 0); mot(0); mot(1); mot(0); octet(ttl + 0); octet(genre == "icmp" ? 1 : 6); mot(0)
         adresse("10.0.2.77"); adresse("10.0.2.15")
         for (i = 0; i < lo; i++) octet(hexa(substr(options, 2 * i + 1, 1)) * 16 + hexa(substr(options, 2 * i + 2, 1)))
-        s = somme(ip, n, 0)
+        if (genre == "icmp")
+            icmp()
+        else
+            tcp()
+        # La longueur totale, puis la somme de l'en-tête.
+        o[ip + 2] = int((n - ip) / 256); o[ip + 3] = (n - ip) % 256
+        s = somme(ip, ip + 20 + lo, 0)
         o[ip + 10] = int(s / 256); o[ip + 11] = s % 256
+    }
+    # Une trame Ethernet a au moins 60 octets (sans sa somme) : des zéros.
+    while (n < 60) octet(0)
+    for (i = 0; i < n; i++) printf "\\x%02x", o[i]
+}
+# Un segment TCP, de 10.0.2.77 vers la machine.
+function tcp(t, s, i, lt) {
+        lt = 20 + donnees
         # TCP : les ports, les numéros, la longueur de l'en-tête (5 mots), les
         # drapeaux, la fenêtre, la somme (plus bas), le pointeur d'urgence.
         t = n
@@ -71,8 +95,38 @@ BEGIN {
         # la longueur du segment.
         s = somme(t, n, 10 * 256 + 0 + 2 * 256 + 77 + 10 * 256 + 0 + 2 * 256 + 15 + 6 + lt)
         o[t + 16] = int(s / 256); o[t + 17] = s % 256
-    }
-    # Une trame Ethernet a au moins 60 octets (sans sa somme) : des zéros.
-    while (n < 60) octet(0)
-    for (i = 0; i < n; i++) printf "\\x%02x", o[i]
+}
+# Une erreur ICMP de 10.0.2.77, qui cite un datagramme UDP de la machine
+# vers lui.
+function icmp(t, c, x, s, i, h) {
+        # ICMP : le genre, le code, la somme (plus bas), un octet nul, la
+        # longueur de la copie (RFC 4884), deux octets nuls.
+        t = n
+        octet(type + 0); octet(code + 0); mot(0); octet(0); octet(longueur + 0); mot(0)
+        # La copie : l'en-tête IPv4 du datagramme (de 10.0.2.15 vers
+        # 10.0.2.77, UDP, 17), son en-tête UDP (sans somme), ses données ;
+        # complétée de zéros jusqu'à la longueur dite.
+        c = n
+        octet(64 + (ihl == "" ? 5 : ihl)); octet(0); mot(28 + donnees); mot(1); mot(0); octet(64); octet(cite == "" ? 17 : cite); mot(0)
+        adresse("10.0.2.15"); adresse("10.0.2.77")
+        s = somme(c, n, 0)
+        o[c + 10] = int(s / 256); o[c + 11] = s % 256
+        mot(source + 0); mot(destination + 0); mot(8 + donnees); mot(0)
+        for (i = 0; i < donnees; i++) octet(120)
+        while (n - c < longueur * 4) octet(0)
+        # Les extensions, et leur somme. La juste plus un n'est jamais 0 (« pas
+        # de somme ») : la juste vaut au plus 0xFFFE dès qu'un octet n'est pas
+        # nul, et la version 2 en est un.
+        x = n
+        for (i = 0; i < length(extension) / 2; i++) {
+            h = substr(extension, 2 * i + 1, 2)
+            octet(h == "xx" ? 0 : hexa(substr(h, 1, 1)) * 16 + hexa(substr(h, 2, 1)))
+        }
+        if (substr(extension, 5, 4) == "xxxx") {
+            s = (somme(x, n, 0) + (faussee ? 1 : 0)) % 65536
+            o[x + 2] = int(s / 256); o[x + 3] = s % 256
+        }
+        # La somme du message entier.
+        s = somme(t, n, 0)
+        o[t + 2] = int(s / 256); o[t + 3] = s % 256
 }

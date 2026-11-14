@@ -57,7 +57,8 @@
  *     (test-carte) : ceux de datagrammes envoyés par l'hôte, venus par la
  *     carte (la somme d'UDP, la taille des morceaux) ; puis l'écoute TCP à
  *     qui le scénario envoie des segments (le Makefile vérifie les
- *     réponses).
+ *     réponses), et deux erreurs ICMP qui portent des extensions (RFC 4884 :
+ *     IP_RECVERR_RFC4884, le `ee_data` de l'erreur en file).
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic du noyau : HZ = 250 sous WSL, 1000 sous le Linux de référence).
  */
@@ -2033,6 +2034,27 @@ static void options_d_ip(void)
     close(s);
 }
 
+/* Le compteur `nom` du groupe `groupe` de /proc/net/snmp (« Udp: »,
+ * « Icmp: » : deux lignes, les noms puis les valeurs) ; -1 : pas trouvé. */
+static long compteur_snmp(const char *groupe, const char *nom)
+{
+    char noms[1024], valeurs[1024];
+    size_t g = strlen(groupe);
+    long r = -1;
+    FILE *f = fopen("/proc/net/snmp", "r");
+    while (f && fgets(noms, sizeof noms, f))
+        if (strncmp(noms, groupe, g) == 0 && fgets(valeurs, sizeof valeurs, f)) {
+            char *pn, *pv, *n = strtok_r(noms + g, " \n", &pn), *v = strtok_r(valeurs + g, " \n", &pv);
+            for (; n && v; n = strtok_r(NULL, " \n", &pn), v = strtok_r(NULL, " \n", &pv))
+                if (strcmp(n, nom) == 0)
+                    r = atol(v);
+            break;
+        }
+    if (f)
+        fclose(f);
+    return r;
+}
+
 /* Ce que l'hôte envoie à la machine, par la carte (make tests-qemu,
  * test-carte : `hostfwd` de slirp vers le port 4000) : la somme d'UDP
  * (IP_CHECKSUM) d'un datagramme venu par une carte, et IP_RECVFRAGSIZE
@@ -2066,6 +2088,16 @@ static int carte(void)
     if (setsockopt(e, IPPROTO_IP, IP_TTL, &ttl, sizeof ttl) != 0 || setsockopt(e, IPPROTO_IP, IP_TOS, &tos, sizeof tos) != 0
         || bind(e, (struct sockaddr *)&ea, sizeof ea) != 0 || listen(e, 4) != 0)
         return printf("[linux] reseau carte : l'ecoute TCP : ECHEC (%s)\n", strerror(errno)), 1;
+    /* La socket qui recevra les erreurs ICMP de 10.0.2.77 (port 4002 vers
+     * son port 9) : sa file d'erreurs, et les extensions (RFC 4884). Rien
+     * n'est envoyé : une erreur ICMP trouve la socket par ses adresses et
+     * ses ports, sans qu'on vérifie qu'elle a parlé (comme sous Linux). */
+    int x = udp(0), un = 1;
+    struct sockaddr_in xa = adresse(0, 4002), xd = adresse(0x0a00024d, 9);
+    if (bind(x, (struct sockaddr *)&xa, sizeof xa) != 0 || connect(x, (struct sockaddr *)&xd, sizeof xd) != 0
+        || setsockopt(x, IPPROTO_IP, IP_RECVERR, &un, sizeof un) != 0
+        || setsockopt(x, IPPROTO_IP, IP_RECVERR_RFC4884, &un, sizeof un) != 0)
+        return printf("[linux] reseau carte : la socket des erreurs : ECHEC (%s)\n", strerror(errno)), 1;
     printf("[linux] reseau carte : en attente\n");
     fflush(stdout);
     static unsigned char o[4000];
@@ -2126,8 +2158,47 @@ static int carte(void)
     n = recevoir_controles(r, o, 10, 0, 512, t, sizeof t, &f, &l);
     verifier(n == 10 && f == MSG_TRUNC && strstr(t, "23:4:"), "carte, 3 000 octets lus dans 10 : coupe, la somme");
     close(r);
+    /* Le scénario débranche slirp et joue 10.0.2.77 (outils/envoyer-segments) :
+     * des segments TCP vers l'écoute (le Makefile vérifie les réponses), puis
+     * deux erreurs ICMP « port injoignable » pour x, d'une copie de 128
+     * octets (la longueur que dit l'octet 5 : 32 mots), suivie d'extensions
+     * (un objet de 8 octets) : de somme juste, puis fausse. Ce que lit le
+     * programme commence après les en-têtes IPv4 et UDP de la copie : 100
+     * octets, puis les 12 des extensions. */
+    long icmp_fautes = compteur_snmp("Icmp: ", "InErrors");
+    printf("[linux] reseau carte : en attente des segments\n");
+    fflush(stdout);
+    struct sock_extended_err ee[2] = { 0 };
+    struct sockaddr_in qui, nom;
+    struct in_pktinfo pi;
+    long lu[2] = { -1, -1 };
+    int ok_ext = 1;
+    static const unsigned char objet[8] = { 0, 8, 1, 1, 0xde, 0xad, 0xbe, 0xef };
+    for (int i = 0; i < 2; i++) {
+        struct pollfd px = { x, 0, 0 };
+        if (poll(&px, 1, 60000) != 1 || !(px.revents & POLLERR))
+            break;
+        lu[i] = erreur_en_file(x, (char *)o, sizeof o, &ee[i], &qui, &nom, &f, &pi);
+        ok_ext = ok_ext && lu[i] == 112 && o[0] == 'x' && o[99] == 'x' && o[100] == 0x20 && o[101] == 0
+                 && memcmp(o + 104, objet, 8) == 0 && ee[i].ee_errno == ECONNREFUSED
+                 && ee[i].ee_origin == SO_EE_ORIGIN_ICMP && ee[i].ee_type == 3 && ee[i].ee_code == 3;
+    }
+    verifier(ok_ext && ee[0].ee_data == 0x64 && ee[1].ee_data == 0x10064,
+             "carte, RFC 4884 : deux erreurs ICMP, les extensions a 100 octets (ee_data 0x64), puis de somme fausse (0x10064)");
+    if (lu[0] != 112 || lu[1] != 112 || ee[0].ee_data != 0x64 || ee[1].ee_data != 0x10064)
+        printf("[linux] reseau :   lu %ld et %ld, ee_data %#x et %#x\n", lu[0], lu[1], ee[0].ee_data, ee[1].ee_data);
+    close(x);
+    /* Deux redirections qui citent un en-tête de 4 mots : UDP, qui n'y
+     * trouve pas de socket, la compte (Icmp InErrors) ; ping, non. */
+    icmp_fautes = compteur_snmp("Icmp: ", "InErrors") - icmp_fautes;
+    verifier(icmp_fautes == 1, "carte, redirections d'un en-tete de 4 mots : UDP compte InErrors, ping non");
+    if (icmp_fautes != 1)
+        printf("[linux] reseau :   Icmp InErrors %ld\n", icmp_fautes);
     printf("[linux] reseau carte : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     fflush(stdout);
+    /* L'écoute reste ouverte jusqu'à l'arrêt de la machine : sa fille
+     * (le SYN du scénario) ne doit rien envoyer de plus à l'enregistrement
+     * qu'il lit. */
     struct pollfd pe = { e, POLLIN, 0 };
     poll(&pe, 1, 60000);
     close(e);

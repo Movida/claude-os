@@ -185,6 +185,9 @@ pub struct ErreurEnFile {
     pub genre: u8,
     pub code: u8,
     pub info: u32,
+    /// Le `ee_data` : où commencent les extensions du message (RFC 4884),
+    /// si la socket avait IP_RECVERR_RFC4884 quand il est arrivé ; 0 sinon.
+    pub ee_data: u32,
     pub adresse: [u8; 4],
     pub port: u16,
     pub emetteur: [u8; 4],
@@ -239,7 +242,7 @@ impl ErreurEnFile {
     pub fn locale(errno: i32, info: u32, adresse: [u8; 4], port: u16) -> Option<ErreurEnFile> {
         let donnees = Paquet::vide(0)?;
         Some(ErreurEnFile {
-            errno, origine: ORIGINE_LOCALE, genre: 0, code: 0, info, adresse, port, emetteur: [0; 4], interface: 0,
+            errno, origine: ORIGINE_LOCALE, genre: 0, code: 0, info, ee_data: 0, adresse, port, emetteur: [0; 4], interface: 0,
             arrivee: [0; 4], entete: EnteteRecu::AUCUN, somme: 0, taille: donnees.taille_vraie(), donnees,
         })
     }
@@ -413,6 +416,12 @@ pub struct Socket {
     pub connectee: AtomicBool,
     pub recverr: AtomicBool,
     pub pmtudisc: AtomicU8,
+    /// IP_RECVERR_RFC4884, lu par la tâche du réseau quand elle met une
+    /// erreur ICMP en file (un bit atomique de Linux, `inet_test_bit`, lu à
+    /// ce moment-là : le poser ensuite ne change pas les erreurs déjà en
+    /// file). UDP et ping seulement : TCP n'a pas de file d'erreurs
+    /// (`tcp_v4_err` n'appelle pas `ip_icmp_error`).
+    pub rfc4884: AtomicBool,
     /// Un envoi a manqué de place dans SO_SNDBUF (le bit SOCK_NOSPACE de
     /// Linux, tel que le voit une socket de datagrammes : posé par
     /// `sock_alloc_send_pskb`, jamais effacé, `sock_def_write_space` ne le
@@ -470,6 +479,7 @@ impl Socket {
             recverr: AtomicBool::new(false),
             place_manquee: AtomicBool::new(false),
             pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
+            rfc4884: AtomicBool::new(false),
             asynchrone: crate::asynchrone::ListeAsync::new(),
             inode: AtomicU32::new(0),
             peek_off: AtomicI32::new(-1),

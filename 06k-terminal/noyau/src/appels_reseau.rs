@@ -1252,9 +1252,9 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
         controle_ip(&mut c, &options, &ip, r.recu.destination, &mut r.drapeaux);
     }
     // L'erreur elle-même (IP_RECVERR) : sa `sock_extended_err` (errno,
-    // origine, genre, code, un octet nul, info, data nul), puis
-    // SO_EE_OFFENDER, l'adresse de qui l'a dite (nulle pour une erreur
-    // locale).
+    // origine, genre, code, un octet nul, info, data : les extensions du
+    // message, RFC 4884), puis SO_EE_OFFENDER, l'adresse de qui l'a dite
+    // (nulle pour une erreur locale).
     if let Some(e) = &r.erreur {
         let mut o = [0u8; 32];
         o[..4].copy_from_slice(&e.errno.to_le_bytes());
@@ -1262,6 +1262,7 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
         o[5] = e.genre;
         o[6] = e.code;
         o[8..12].copy_from_slice(&e.info.to_le_bytes());
+        o[12..16].copy_from_slice(&e.ee_data.to_le_bytes());
         if e.origine == socket::ORIGINE_ICMP {
             o[16..32].copy_from_slice(&socket::sockaddr_in(e.emetteur, 0));
         }
@@ -1903,7 +1904,12 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
             }
         }
         IP_RECVERR_RFC4884 if !(0..=1).contains(&v) => return Err(-EINVAL),
-        IP_RECVERR_RFC4884 => op.rfc4884 = oui,
+        // Sa copie atomique, pour la tâche du réseau (elle le lit en
+        // mettant une erreur en file).
+        IP_RECVERR_RFC4884 => {
+            op.rfc4884 = oui;
+            s.rfc4884.store(oui, Ordering::Relaxed);
+        }
         IP_FREEBIND if longueur < 1 => return Err(-EINVAL),
         IP_FREEBIND => op.freebind = oui,
         IP_HDRINCL | IP_NODEFRAG => return Err(-ENOPROTOOPT),
