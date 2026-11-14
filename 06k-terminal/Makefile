@@ -1479,6 +1479,16 @@ $(WAST2JSON):
 #     du plus grand morceau d'un datagramme que slirp a coupé à sa MTU
 #     (IP_RECVFRAGSIZE : 1 500) ; ni lo, ni la carte de l'hôte (qui
 #     vérifie les sommes elle-même) ne les montrent (les soldes d'avant 6k) ;
+#     puis, dans la même machine, slirp débranché (set_link), des segments
+#     TCP d'une machine que joue l'hôte (outils/envoyer-segments, par une
+#     socket UDP de QEMU, `-netdev dgram`, qu'un concentrateur relie à la
+#     carte et à slirp) vers un port fermé et vers une écoute : les
+#     réponses sans socket (le RST d'un port fermé, celui de l'écoute, l'ACK
+#     d'une fille à un segment hors de sa fenêtre) ont le TOS du segment
+#     sans ses bits ECN, le TTL 64 et l'écho de ses options, pas ce qu'a
+#     demandé l'écoute (IP_TOS, IP_TTL), qu'a son SYN-ACK ; ce qui sort de
+#     la carte est lu dans l'enregistrement de QEMU (outils/segments-tcp.awk)
+#     (les soldes d'avant 6k) ;
 #   - une carte sur un réseau sans serveur DHCP (-netdev hubport, un
 #     concentrateur relié à rien) : le DHCP abandonne au bout de 12 à 17 s,
 #     et le démarrage continue (6g) ;
@@ -1592,11 +1602,14 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	done; \
 	[ "$$n" = 6 ] || { echo "ICMP par machine : $${n:-aucune mesure,} erreurs pour 20 datagrammes (6 attendues) : ECHEC"; exit 1; }; \
 	echo "ICMP par machine : 6 erreurs pour 20 datagrammes : ok"
-	rm -f test-carte.log; fin=; \
+	rm -f test-carte.log test-carte.pcap $(MON_TESTS); fin=; tcp=; \
 	for essai in 1 2 3 4 5; do \
 	  port=$$(( 20000 + ($$$$ * 37 + essai * 7907) % 40000 )); \
-	  $(QEMU_TEST) -netdev user,id=n0,hostfwd=udp:127.0.0.1:$$port-:4000 -device virtio-net-pci,netdev=n0 $(QEMU_ALEA) \
-	    -drive format=raw,file=carte.bin -serial file:test-carte.log & q=$$!; \
+	  $(QEMU_TEST) -netdev user,id=u0,hostfwd=udp:127.0.0.1:$$port-:4000 -netdev hubport,id=h0,hubid=0,netdev=u0 \
+	    -netdev dgram,id=d0,local.type=inet,local.host=127.0.0.1,local.port=$$(( port + 1 )),remote.type=inet,remote.host=127.0.0.1,remote.port=$$(( port + 2 )) \
+	    -netdev hubport,id=h1,hubid=0,netdev=d0 -netdev hubport,id=h2,hubid=0 -device virtio-net-pci,netdev=h2,mac=52:54:00:12:34:56 \
+	    -object filter-dump,id=f0,netdev=h2,file=test-carte.pcap $(QEMU_ALEA) \
+	    -drive format=raw,file=carte.bin -serial file:test-carte.log -monitor unix:$(MON_TESTS),server,nowait & q=$$!; \
 	  etat=mort; for i in $$(seq $$(( $(DUREE) * 10 ))); do \
 	    grep -qF "[reseau] eth0 : 10.0.2.15/24" test-carte.log 2>/dev/null && grep -qF "reseau carte : en attente" test-carte.log && { etat=pret; break; }; \
 	    kill -0 $$q 2>/dev/null || { etat=mort; break; }; etat=lent; sleep 0.1; done; \
@@ -1604,11 +1617,17 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	  [ $$etat = pret ] && { bash -c 'exec 3>/dev/udp/127.0.0.1/'$$port'; printf "petit datagramme de la carte" >&3; \
 	    for i in 1 2 3; do yes "claude-os, la carte " | head -c 3000 | dd bs=3000 count=1 iflag=fullblock status=none >&3; done'; \
 	    for i in $$(seq $$(( $(DUREE) * 10 ))); do \
-	      grep -qE "reseau carte : (ECHEC|toutes les verifications : ok)" test-carte.log && { fin=1; break; }; sleep 0.1; done; }; \
+	      grep -qE "reseau carte : (ECHEC|toutes les verifications : ok)" test-carte.log && { fin=1; break; }; sleep 0.1; done; \
+	    [ -n "$$fin" ] && echo "set_link u0 off" | nc -U -q1 $(MON_TESTS) >/dev/null && bash outils/envoyer-segments $$(( port + 1 )) && sleep 1 && \
+	      tcp=$$(od -An -v -tu1 test-carte.pcap | awk -f outils/segments-tcp.awk | LC_ALL=C sort -u); }; \
 	  kill $$q 2>/dev/null; wait $$q 2>/dev/null; break; \
 	done; \
 	grep -F "[linux] reseau" test-carte.log; \
-	[ -n "$$fin" ] && grep -qF "[linux] reseau carte : toutes les verifications : ok" test-carte.log || { echo "la carte : ECHEC"; exit 1; }
+	[ -n "$$fin" ] && grep -qF "[linux] reseau carte : toutes les verifications : ok" test-carte.log || { echo "la carte : ECHEC"; exit 1; }; \
+	attendu="23 40000 14 10 64 20|4001 40001 04 10 64 28|4001 40001 10 10 64 20|4001 40001 12 20 33 20"; \
+	[ "$$(echo "$$tcp" | tr '\n' '|')" = "$$attendu|" ] || { echo "les reponses TCP de la carte :"; echo "$$tcp"; \
+	  echo "attendu :"; echo "$$attendu" | tr '|' '\n'; echo "la carte, les reponses TCP : ECHEC"; exit 1; }; \
+	echo "la carte, les reponses TCP (le TOS du segment sans ECN, le TTL 64, l'echo de ses options) : ok"
 	$(call attendre,$(QEMU_TEST) -nic none $(QEMU_ALEA) -drive format=raw$(,)file=sans-reseau.bin -serial file:test-sans-reseau.log,test-sans-reseau.log,"[noyau] passerelle : termine",:)
 	grep -F "[linux] passerelle : toutes les verifications (sans reseau) : ok" test-sans-reseau.log
 	rm -f test-lien.log $(MON_TESTS); \

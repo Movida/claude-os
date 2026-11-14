@@ -77,6 +77,10 @@ const ENETUNREACH: i64 = 101;
 /// montrent /proc/sys/net et /proc/net/snmp).
 pub const TTL_DEFAUT: u8 = 64;
 
+/// Les deux bits ECN du TOS (`INET_ECN_MASK`, RFC 3168) : ceux de la
+/// congestion, que tient TCP ; le reste est le DSCP.
+pub const ECN: u8 = 3;
+
 /// Les adresses et les routes ; faites au démarrage.
 static TABLE: Verrou<Option<Table>> = Verrou::new(None);
 

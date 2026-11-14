@@ -1,5 +1,6 @@
 # Le scenario de la carte (make tests-qemu, test-carte) : l'hote envoie des
 # datagrammes a la machine par slirp (hostfwd vers le port 4000), et
 # `reseau carte` verifie la somme d'UDP (IP_CHECKSUM) et IP_RECVFRAGSIZE de
-# ce qui arrive par la carte.
+# ce qui arrive par la carte ; puis son ecoute TCP recoit les segments que
+# l'hote envoie par la carte (outils/envoyer-segments).
 /bin/reseau carte

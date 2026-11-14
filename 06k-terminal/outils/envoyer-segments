@@ -1,0 +1,43 @@
+#!/bin/bash
+# Joue une machine du réseau de slirp que slirp n'a pas (10.0.2.77), pour
+# test-carte (make tests-qemu) : envoie à la machine, par la socket UDP de
+# QEMU (`-netdev dgram`, reliée à la carte par un concentrateur), des
+# segments TCP auxquels elle doit répondre comme Linux répond sans socket
+# (`ip_send_unicast_reply`) : le TOS du segment sans ses bits ECN, le TTL
+# du système (64), l'écho de ses options. Le Makefile lit les réponses dans
+# l'enregistrement de la carte (outils/segments-tcp.awk).
+#   outils/envoyer-segments PORT    (PORT : le local.port de -netdev dgram)
+# slirp doit d'abord être débranché (set_link) : il prendrait les réponses
+# pour une connexion à faire suivre, et défairait la fille par un RST.
+# bash, pour /dev/udp et le \x de son printf. Chaque trame doit partir dans
+# un seul datagramme, que QEMU donne tel quel au concentrateur : le printf
+# de bash écrit par morceaux (il vide sa sortie à chaque octet 0x0a, comme
+# à une fin de ligne), dd les réunit et écrit la trame d'un coup. Une pause
+# entre deux, pour qu'elles arrivent dans l'ordre où la machine les traite.
+set -e
+cd "$(dirname "$0")"
+exec 3>/dev/udp/127.0.0.1/"$1"
+trame() {
+    printf "$(awk "$@" -f trame.awk)" | dd bs=2048 count=1 iflag=fullblock status=none >&3
+    sleep 0.2
+}
+# Où est 10.0.2.77 : la machine l'apprend de sa requête ARP.
+trame -v genre=arp
+# Un SYN vers le port 23, fermé, de TOS 0x13 (le DSCP 0x10, et les bits ECN
+# à CE) : le RST de la machine a le TOS 0x10 (`tcp_v4_send_reset`) et le
+# TTL 64.
+trame -v genre=tcp -v tos=19 -v ttl=50 -v source=40000 -v destination=23 -v seq=1000 -v drapeaux=2
+# Un SYN vers l'écoute du port 4001 : une fille, et son SYN-ACK, au TOS
+# (0x20) et au TTL (33) de l'écoute.
+trame -v genre=tcp -v tos=19 -v ttl=50 -v source=40001 -v destination=4001 -v seq=1000 -v drapeaux=2
+# Un ACK qui n'acquitte pas le SYN-ACK (le numéro de la fille est inconnu
+# ici : 12 345 n'a qu'une chance sur 2^32 d'être le bon), avec une route
+# notée d'une place (7, 7, 4, puis la place et une fin de liste) : le RST
+# de l'écoute (`tcp_rcv_state_process`), TOS 0x10, TTL 64, et l'écho de
+# l'option (un en-tête de 28 octets), pas ce qu'a demandé l'écoute.
+trame -v genre=tcp -v tos=19 -v ttl=50 -v source=40001 -v destination=4001 -v seq=1001 -v ack=12345 -v drapeaux=16 \
+      -v options=0707040000000000
+# Un octet de données loin hors de la fenêtre de la fille, sans ACK : son
+# ACK (`tcp_v4_reqsk_send_ack`), TOS 0x10 et TTL 64 aussi ; des données,
+# pour que la limite des ACK hors fenêtre ne le retienne pas.
+trame -v genre=tcp -v tos=19 -v ttl=50 -v source=40001 -v destination=4001 -v seq=501001 -v drapeaux=8 -v donnees=1

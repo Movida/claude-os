@@ -15,6 +15,12 @@ use formats::reseau::tcp::{self, Tcp};
 pub struct Issue {
     /// Répondre par l'ACK de l'entrée (`entete_ack`).
     pub ack: bool,
+    /// Cet ACK répond à un segment hors de la fenêtre ou rejeté
+    /// (`TCP_TW_ACK_OOW`) : son TOS perd ses bits ECN (`tcp_v4_timewait_ack`),
+    /// qui pourraient le faire passer par une autre file que la connexion
+    /// (L4S plutôt que classique) ; les autres (le FIN qui fait le vrai
+    /// TIME_WAIT, un SYN sans écoute) les gardent.
+    pub hors_fenetre: bool,
     /// Répondre par un RST (`tcp_v4_send_reset`).
     pub rst: bool,
     /// L'entrée disparaît.
@@ -116,6 +122,7 @@ impl Attente {
         if self.fin_attente2 {
             if rejet || !dans_la_fenetre(h.seq, fin_seq, self.rcv_nxt, self.rcv_nxt.wrapping_add(self.rcv_wnd)) {
                 r.ack = self.ack_hors_fenetre(donnees_sans_syn, maintenant);
+                r.hors_fenetre = true;
                 return r;
             }
             if rst {
@@ -168,6 +175,7 @@ impl Attente {
         if !rst {
             r.prolonger = rejet || ack;
             r.ack = self.ack_hors_fenetre(donnees_sans_syn, maintenant);
+            r.hors_fenetre = true;
         }
         r
     }
@@ -232,5 +240,25 @@ mod tests {
         assert!(!r.effacer && !r.rst);
         assert!(!a.fin_attente2);
         assert_eq!(a.rcv_nxt, 1001);
+    }
+
+    /// Quels ACK répondent hors de la fenêtre (`TCP_TW_ACK_OOW`, leur TOS
+    /// perd ses bits ECN), et lesquels non (`TCP_TW_ACK`, `TCP_TW_SYN`).
+    #[test]
+    fn les_ack_hors_fenetre_le_disent() {
+        // FIN_WAIT_2 : un segment hors de la fenêtre.
+        let r = en_fin_attente2().recevoir(&segment(5000, tcp::ACK), 10, H);
+        assert!(r.ack && r.hors_fenetre, "FIN_WAIT_2, hors de la fenetre");
+        // Le FIN qui fait le vrai TIME_WAIT : un ACK de la connexion.
+        let mut a = en_fin_attente2();
+        let r = a.recevoir(&segment(1000, tcp::ACK | tcp::FIN), 0, H);
+        assert!(r.ack && !r.hors_fenetre, "le FIN de l'autre");
+        // TIME_WAIT : le FIN renvoyé est réacquitté, hors de la fenêtre.
+        let r = a.recevoir(&segment(1000, tcp::ACK | tcp::FIN), 0, H + 1);
+        assert!(r.ack && r.hors_fenetre, "le FIN renvoye");
+        // Un SYN qui reprend le quadruplet : pas d'ACK ici (le noyau en
+        // envoie un s'il n'y a pas d'écoute, sans toucher au TOS).
+        let r = a.recevoir(&segment(2000, tcp::SYN), 0, H + 2);
+        assert!(r.reprendre.is_some() && !r.ack && !r.hors_fenetre, "un SYN");
     }
 }

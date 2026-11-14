@@ -55,7 +55,9 @@
  *     dans l'ordre de Linux, d'un datagramme, d'une réponse de ping et
  *     d'une erreur en file ; `reseau carte`, que lance make tests-qemu
  *     (test-carte) : ceux de datagrammes envoyés par l'hôte, venus par la
- *     carte (la somme d'UDP, la taille des morceaux).
+ *     carte (la somme d'UDP, la taille des morceaux) ; puis l'écoute TCP à
+ *     qui le scénario envoie des segments (le Makefile vérifie les
+ *     réponses).
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic du noyau : HZ = 250 sous WSL, 1000 sous le Linux de référence).
  */
@@ -2046,7 +2048,12 @@ static void options_d_ip(void)
  *     (SO_PEEK_OFF), puis lus : la somme des données, celle des 100
  *     premiers octets ôtée pour le deuxième, et gardée pour la lecture ;
  *   - 3 000 octets lus dans 10 octets : coupé, la somme.
- * Pas de vérification sur l'hôte : sa carte vérifie les sommes elle-même. */
+ * Pas de vérification sur l'hôte : sa carte vérifie les sommes elle-même.
+ * Puis une écoute TCP sur le port 4001 (IP_TTL 33, IP_TOS 0x20) reste
+ * ouverte une minute, sans rien accepter : le scénario lui envoie des
+ * segments par la carte, et regarde ce qui en sort (le TOS et le TTL des
+ * réponses, Makefile) ; elle est là dès le début, prête quand il le
+ * sera. */
 static int carte(void)
 {
     int r = udp(0);
@@ -2054,6 +2061,11 @@ static int carte(void)
     if (bind(r, (struct sockaddr *)&a, sizeof a) != 0)
         return printf("[linux] reseau carte : bind : ECHEC (%s)\n", strerror(errno)), 1;
     tous_les_controles(r);
+    int e = socket(AF_INET, SOCK_STREAM, 0), ttl = 33, tos = 0x20;
+    struct sockaddr_in ea = adresse(0, 4001);
+    if (setsockopt(e, IPPROTO_IP, IP_TTL, &ttl, sizeof ttl) != 0 || setsockopt(e, IPPROTO_IP, IP_TOS, &tos, sizeof tos) != 0
+        || bind(e, (struct sockaddr *)&ea, sizeof ea) != 0 || listen(e, 4) != 0)
+        return printf("[linux] reseau carte : l'ecoute TCP : ECHEC (%s)\n", strerror(errno)), 1;
     printf("[linux] reseau carte : en attente\n");
     fflush(stdout);
     static unsigned char o[4000];
@@ -2115,6 +2127,10 @@ static int carte(void)
     verifier(n == 10 && f == MSG_TRUNC && strstr(t, "23:4:"), "carte, 3 000 octets lus dans 10 : coupe, la somme");
     close(r);
     printf("[linux] reseau carte : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
+    fflush(stdout);
+    struct pollfd pe = { e, POLLIN, 0 };
+    poll(&pe, 1, 60000);
+    close(e);
     return echecs != 0;
 }
 

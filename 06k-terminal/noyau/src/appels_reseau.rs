@@ -23,7 +23,7 @@ use crate::reseau::socket::{self, Protocole, Socket, AF_INET, ARRET_ECRITURE, AR
                             IPPROTO_ICMP, IPPROTO_UDP, NPROTO, RCVBUF_MIN, SNDBUF_MIN, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_MAX,
                             SOCK_NONBLOCK, SOCK_RAW, TAMPON_MAX};
 use crate::reseau::datagramme::{self, Controle};
-use crate::reseau::{ping, tcp, udp, unix};
+use crate::reseau::{ipv4, ping, tcp, udp, unix};
 use crate::faillible::{self, VecFaillible};
 use crate::{processus, temps, vfs};
 use alloc::vec::Vec;
@@ -906,7 +906,7 @@ fn lire_controle(c: &[u8], root: bool, protocole: Protocole) -> Result<Controle,
         match (niveau, sorte) {
             (SOL_IP, IP_RETOPTS) => {
                 let n = d.len().min(format_ipv4::OPTIONS_MAX);
-                let o = format_ipv4::options_a_envoyer(&d[..n], root, &crate::reseau::ipv4::unicast);
+                let o = format_ipv4::options_a_envoyer(&d[..n], root, &ipv4::unicast);
                 r.options = Some(o.map_err(|_| -EINVAL)?);
             }
             (SOL_IP, IP_PROTOCOL) => {
@@ -1167,7 +1167,7 @@ fn controle_ip(c: &mut ControleSortant, options: &socket::Options, ip: &socket::
         c.ecrire(SOL_IP, IP_RECVOPTS, e.options(), drapeaux);
     }
     if options.retopts && e.longueur_options != 0 {
-        match format_ipv4::options_echo(e.options(), &e.compilees, ip.source, &crate::reseau::ipv4::unicast) {
+        match format_ipv4::options_echo(e.options(), &e.compilees, ip.source, &ipv4::unicast) {
             Ok(mut d) => {
                 d.defaire();
                 c.ecrire(SOL_IP, IP_RETOPTS, d.octets(), drapeaux);
@@ -1218,7 +1218,6 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
     // d'ICMP (`ipv4_datagram_support_cmsg`), ceux de son message.
     let options = o.socket().appels.verrouiller().options;
     if r.recu.ip.is_some() && options.pktinfo {
-        use crate::reseau::ipv4;
         // in_pktinfo : l'interface d'arrivée, l'adresse locale à laquelle
         // répondre, la destination. Pour un datagramme UDP, ce que prépare
         // `ipv4_pktinfo_prepare` : venu par lo à l'une de nos adresses d'une
@@ -1873,7 +1872,7 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         let mut o = [0u8; format_ipv4::OPTIONS_MAX];
         let o = &mut o[..longueur as usize];
         copier_depuis_utilisateur(o, valeur).map_err(|_| -EFAULT)?;
-        Some(format_ipv4::options_a_envoyer(o, root, &crate::reseau::ipv4::unicast).map_err(|_| -EINVAL)?)
+        Some(format_ipv4::options_a_envoyer(o, root, &ipv4::unicast).map_err(|_| -EINVAL)?)
     } else {
         None
     };
@@ -1945,7 +1944,7 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         // (256 en diffère toujours, même si l'octet ne change pas) ; pour
         // TCP, les deux bits d'ECN gardés.
         IP_TOS => {
-            let val = if s.protocole == Protocole::Tcp { (v & !3) | (op.tos & 3) as i32 } else { v };
+            let val = if s.protocole == Protocole::Tcp { (v & !(ipv4::ECN as i32)) | (op.tos & ipv4::ECN) as i32 } else { v };
             if op.tos as i32 != val {
                 op.tos = val as u8;
                 op.priority = priorite_du_tos(val as u8);
@@ -1967,7 +1966,7 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
     // TCP émet ses segments et reçoit sans le Mutex : ses copies d'IP_TTL,
     // d'IP_TOS, d'IP_MTU_DISCOVER, d'IP_MINTTL et d'IP_OPTIONS.
     let (ttl, tos, pmtudisc, minttl, options) =
-        (op.ttl.unwrap_or(crate::reseau::ipv4::TTL_DEFAUT), op.tos, op.pmtudisc, op.minttl, op.ip_options);
+        (op.ttl.unwrap_or(ipv4::TTL_DEFAUT), op.tos, op.pmtudisc, op.minttl, op.ip_options);
     drop(inet);
     if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER | IP_MINTTL | IP_OPTIONS) {
         tcp::avec_options(s, |o, tcb| {
@@ -2175,7 +2174,7 @@ fn lire_option_ip(s: &Socket, option: i32) -> Result<i32, i64> {
         IP_BIND_ADDRESS_NO_PORT => op.bind_no_port as i32,
         IP_HDRINCL | IP_NODEFRAG | IP_ROUTER_ALERT => 0,
         IP_TOS => op.tos as i32,
-        IP_TTL => op.ttl.unwrap_or(crate::reseau::ipv4::TTL_DEFAUT) as i32,
+        IP_TTL => op.ttl.unwrap_or(ipv4::TTL_DEFAUT) as i32,
         IP_MINTTL => op.minttl as i32,
         IP_MULTICAST_TTL => op.mc_ttl as i32,
         IP_MTU_DISCOVER => op.pmtudisc as i32,

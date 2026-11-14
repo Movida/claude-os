@@ -153,6 +153,9 @@ struct TempsAttente {
     locale: [u8; 4],
     distante: [u8; 4],
     regles: itcp::attente::Attente,
+    /// Le TOS de la socket quand elle y est entrée (`tw_tos`) : celui de ses
+    /// ACK.
+    tos: u8,
     /// Son échéance (/proc/net/tcp la montre).
     echeance: u64,
 }
@@ -613,8 +616,14 @@ impl Partie {
 
     /// Émet ce que la connexion a à envoyer.
     fn emettre(&mut self) {
+        self.emettre_apres(None);
+    }
+
+    /// Le même, juste après avoir reçu un segment de l'en-tête IPv4 `recu`,
+    /// auquel peut répondre la connexion (un RST).
+    fn emettre_apres(&mut self, recu: Option<&ipv4::EnteteRecu>) {
         let Mode::Connexion(t) = &mut self.mode else { return };
-        emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, Ip::de(&self.options), Some(&self.retenue));
+        emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, Ip::de(&self.options), recu, Some(&self.retenue));
     }
 
     /// Après un événement : ce que devient la connexion (`apres_l_etat`),
@@ -695,7 +704,10 @@ impl Partie {
             };
             let echeance = crate::temps::ns_monotone() + duree;
             let numero = socket::nouveau_numero();
-            let e = TempsAttente { numero, locale: self.adresses.source, distante: self.adresses.distante, regles: t.en_attente(fin_orpheline), echeance };
+            let e = TempsAttente {
+                numero, locale: self.adresses.source, distante: self.adresses.distante, regles: t.en_attente(fin_orpheline), tos: self.options.tos,
+                echeance,
+            };
             // L'entrée de TIME_WAIT prend un numéro neuf, et l'échéance
             // qui va avec ; la socket n'a plus d'entrée dans la table.
             self.desarmer();
@@ -935,13 +947,16 @@ struct Ip {
 }
 
 impl Ip {
-    /// Celui d'une réponse sans socket (un RST, l'ACK d'une entrée de
-    /// TIME_WAIT : `ip_send_unicast_reply`) au segment reçu `recu`, venu de
-    /// `source` : le TTL du système, 64, et l'écho des options du segment.
-    /// None : l'écho est impossible, et Linux ne répond pas.
-    fn reponse(recu: &ipv4::EnteteRecu, source: [u8; 4]) -> Option<Ip> {
+    /// Celui d'une réponse sans socket (un RST, l'ACK d'une fille ou d'une
+    /// entrée de TIME_WAIT : `ip_send_unicast_reply`, par la socket de
+    /// contrôle de TCP, `ipv4_tcp_sk`) au segment reçu `recu`, venu de
+    /// `source` : le TTL du système, 64 (celui de la socket de contrôle,
+    /// pas l'IP_TTL de la connexion), DF (`IP_PMTUDISC_DO`, `tcp_sk_init`),
+    /// le TOS `tos`, et l'écho des options du segment. None : l'écho est
+    /// impossible, et Linux ne répond pas.
+    fn reponse(recu: &ipv4::EnteteRecu, source: [u8; 4], tos: u8) -> Option<Ip> {
         let options = fipv4::options_echo(recu.options(), &recu.compilees, source, &ipv4::unicast).ok()?;
-        Some(Ip { ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 2, options })
+        Some(Ip { ttl: ipv4::TTL_DEFAUT, tos, pmtudisc: 2, options })
     }
 
     fn de(o: &OptionsTcp) -> Ip {
@@ -960,8 +975,11 @@ impl Ip {
     }
 }
 
-/// Émet les segments de la connexion `t`, de `source` à `distante`.
-fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, retenue: Option<&Arc<Retenue>>) {
+/// Émet les segments de la connexion `t`, de `source` à `distante`, avec ce
+/// que dit `ip` de leur en-tête IPv4 ; `recu` : l'en-tête du segment qu'elle
+/// vient de recevoir, s'il y en a un, dont ses réponses prennent le leur.
+fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, recu: Option<&ipv4::EnteteRecu>,
+               retenue: Option<&Arc<Retenue>>) {
     if let Some(r) = retenue {
         t.poser_en_file(r.octets(), r.rendu());
     }
@@ -983,6 +1001,23 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
         }
     });
     for s in a_envoyer {
+        // La réponse à un segment refusé (le RST d'une connexion ou d'une
+        // fille, l'ACK d'une fille à un segment hors de sa fenêtre) part comme
+        // celle d'un segment sans connexion, pas avec ce qu'a demandé la socket
+        // (`tcp_v4_send_reset`, `tcp_v4_reqsk_send_ack`, puis
+        // `ip_send_unicast_reply`) : le TOS du segment sans ses bits ECN,
+        // l'écho de ses options, rien si l'écho est impossible. Une réponse
+        // naît d'un segment reçu, et part juste après lui : `recu` est là.
+        let ip = match (s.compte, recu) {
+            (Compte::Reponse { .. }, Some(r)) => match Ip::reponse(r, distante, r.tos & !ipv4::ECN) {
+                Some(ip) => ip,
+                None => {
+                    s.compte.compter(&MIB, false, false);
+                    continue;
+                }
+            },
+            _ => ip,
+        };
         // Un ACK pur, un RST ne tiennent pas la socket (`skb_is_tcp_pure_ack`).
         let suivi = retenue.filter(|_| s.numero != 0).map(|r| (r, s.numero));
         envoyer_segment(&s.entete, s.compte, source, distante, identifiant, ip, s.longueur, suivi, |o| t.copier_envoi(s.debut, o));
@@ -1039,12 +1074,13 @@ fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], 
 }
 
 /// Répond à un segment sans connexion (RST), de `locale` à `distante`, avec
-/// l'écho des options du segment (`recu`). Impossible : rien ne part, mais
-/// le RST compte (`tcp_v4_send_reset` compte après `ip_send_unicast_reply`,
-/// qui s'est tue).
+/// le TOS du segment (`recu`) sans ses bits ECN (`tcp_v4_send_reset`) et
+/// l'écho de ses options. Impossible : rien ne part, mais le RST compte
+/// (`tcp_v4_send_reset` compte après `ip_send_unicast_reply`, qui s'est
+/// tue).
 fn repondre_rst(h: &Tcp, longueur_charge: usize, locale: [u8; 4], distante: [u8; 4], recu: &ipv4::EnteteRecu) {
     if let Some(r) = itcp::reponse_sans_connexion(h, longueur_charge) {
-        let Some(ip) = Ip::reponse(recu, distante) else {
+        let Some(ip) = Ip::reponse(recu, distante, recu.tos & !ipv4::ECN) else {
             return Compte::Reponse { rst: true }.compter(&MIB, false, false);
         };
         let mut id = crate::aleatoire::u32() as u16;
@@ -1100,7 +1136,7 @@ impl Possede for Partie {
                     f.tcb.reglages.syn_essais = syncnt;
                     f.tcb.reduire_essais(essais);
                     f.tcb.minuteur(maintenant);
-                    emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None);
+                    emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None, None);
                 }
                 ranger_filles(filles);
             }
@@ -1140,6 +1176,7 @@ impl Partie {
         if self.ttl_trop_petit(s.ip.ttl, s.fille) {
             return;
         }
+        let recu = s.ip;
         match &mut self.mode {
             Mode::Connexion(t) => {
                 t.recevoir(&s.entete, s.charge, maintenant());
@@ -1151,7 +1188,7 @@ impl Partie {
                 repondre_rst(&s.entete, s.charge.longueur(), s.destination, s.source, &s.ip);
             }
         }
-        self.emettre();
+        self.emettre_apres(Some(&recu));
         self.apres();
     }
 
@@ -1254,7 +1291,7 @@ impl Partie {
                 if en_poignee && f.tcb.etat() != Etat::SynRecu {
                     f.arrivee = (s.ip.ttl, s.ip.tos, s.interface);
                 }
-                emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None);
+                emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), Some(&s.ip), None);
                 ranger_filles(filles);
                 return;
             }
@@ -1352,7 +1389,7 @@ impl Partie {
             numero, tcb, locale: s.destination, distante: s.source, identifiant: crate::aleatoire::u32() as u16, etablie: false,
             arrivee: (0, 0, 0), options,
         };
-        emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None);
+        emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None, None);
         // La place est prise plus haut, avant tout changement.
         filles.ajouter_derriere_dans_la_place(f);
     }
@@ -1519,7 +1556,7 @@ fn temps_attente(n: u64, s: Segment) {
             effacer_temps_attente(n);
             livrer(Segment { isn: Some(isn), ..s });
         } else {
-            envoyer_ack_tw(&e, &s.ip);
+            envoyer_ack_tw(&e, &s.ip, false);
         }
         return;
     }
@@ -1533,16 +1570,19 @@ fn temps_attente(n: u64, s: Segment) {
         repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip);
     }
     if issue.ack {
-        envoyer_ack_tw(&e, &s.ip);
+        envoyer_ack_tw(&e, &s.ip, issue.hors_fenetre);
     }
 }
 
 /// L'ACK d'une entrée de TIME_WAIT (`tcp_v4_timewait_ack`), en réponse au
 /// segment reçu `recu` : avec l'écho de ses options ; impossible, rien ne
-/// part, mais il compte (comme un RST).
-fn envoyer_ack_tw(e: &TempsAttente, recu: &ipv4::EnteteRecu) {
+/// part, mais il compte (comme un RST). Son TOS est celui de la socket,
+/// gardé par l'entrée (`tw_tos`), sans les bits ECN s'il répond à un
+/// segment `hors_fenetre` (`TCP_TW_ACK_OOW`).
+fn envoyer_ack_tw(e: &TempsAttente, recu: &ipv4::EnteteRecu, hors_fenetre: bool) {
     let r = e.regles.entete_ack(crate::temps::ns_monotone());
-    let Some(ip) = Ip::reponse(recu, e.distante) else {
+    let tos = if hors_fenetre { e.tos & !ipv4::ECN } else { e.tos };
+    let Some(ip) = Ip::reponse(recu, e.distante, tos) else {
         return Compte::Reponse { rst: false }.compter(&MIB, false, false);
     };
     let mut id = crate::aleatoire::u32() as u16;
@@ -2483,7 +2523,7 @@ fn arreter_les_filles(filles: &mut VecDeque<Fille>, ip: Ip) {
     for f in filles.iter_mut() {
         if f.tcb.etat() != Etat::SynRecu {
             f.tcb.avorter();
-            emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None);
+            emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None, None);
         }
         if let Some(t) = TABLE.verrouiller().as_mut() {
             t.retirer(f.numero);
