@@ -2927,7 +2927,7 @@ fn so_sndbuf_agrandi() {
 /// TCP_INFO sans connexion, et d'une écoute : ce qu'en rend Linux (mesuré).
 #[test]
 fn info_sans_connexion() {
-    let i = t::Info::sans_connexion();
+    let i = t::Info::sans_connexion(&t::MssRestant::NEUF);
     assert_eq!((i.etat, i.rto, i.snd_mss, i.rttvar, i.ssthresh, i.cwnd, i.reordonnancement, i.min_rtt, i.pacing), (7, 1_000_000, 536, 250_000, SEUIL_INFINI, 10, 3, u32::MAX, u64::MAX));
     let i = t::Info::ecoute(1, 7);
     assert_eq!((i.etat, i.rto, i.snd_mss, i.non_acquittes, i.sackes, i.cwnd, i.reordonnancement, i.min_rtt, i.pacing), (10, 0, 0, 1, 7, 10, 3, 0, u64::MAX));

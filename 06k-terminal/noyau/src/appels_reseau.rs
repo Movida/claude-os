@@ -1725,7 +1725,8 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], u
         let v = match option {
             TCP_NODELAY => op.nodelay as i32,
             TCP_CORK => op.cork as i32,
-            TCP_MAXSEG => tcb.map_or(if op.maxseg != 0 { op.maxseg } else { inet::tcp::MSS_DEFAUT }, |t| t.mss()) as i32,
+            // Sans connexion (TCP_CLOSE, TCP_LISTEN) : TCP_MAXSEG lui-même s'il est posé.
+            TCP_MAXSEG => tcb.map_or(if op.maxseg != 0 { op.maxseg } else { op.hors_connexion.mss }, |t| t.mss()) as i32,
             TCP_KEEPIDLE => op.keepidle as i32,
             TCP_KEEPINTVL => op.keepintvl as i32,
             TCP_KEEPCNT => op.keepcnt as i32,
@@ -1756,7 +1757,7 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], u
                     }
                     None => match ecoute {
                         Some((pretes, file)) => ecrire_info(&mut o, &inet::tcp::Info::ecoute(pretes, file)),
-                        None => ecrire_info(&mut o, &inet::tcp::Info::sans_connexion()),
+                        None => ecrire_info(&mut o, &inet::tcp::Info::sans_connexion(&op.hors_connexion)),
                     },
                 }
                 return Ok(TAILLE_INFO);

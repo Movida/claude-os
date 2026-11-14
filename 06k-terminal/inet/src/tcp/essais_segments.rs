@@ -631,7 +631,7 @@ fn le_tampon_d_emission_grandit() {
     c.sndbuf = 1;
     c.sndbuf_max = 1 << 30;
     c.mss = 100;
-    c.mss_offre = Some(0);
+    c.mss_clamp = MSS_DEFAUT;
     c.mss_utilisateur = 0;
     c.cc.cwnd = 1;
     c.reordering = 3;
@@ -642,11 +642,13 @@ fn le_tampon_d_emission_grandit() {
     c.sndbuf = 1;
     c.mss_offre = Some(4000);
     c.mss_utilisateur = 1000;
+    c.borner_par_l_offre();
     c.agrandir_sndbuf();
     // 1000 + 640 = 1640 : 2048 + 256.
     assert_eq!(c.sndbuf, 2 * 10 * 2304);
     c.sndbuf = 1;
     c.mss_utilisateur = 0;
+    c.borner_par_l_offre();
     c.agrandir_sndbuf();
     // 4000 + 640 = 4640 : 8192 + 256.
     assert_eq!(c.sndbuf, 2 * 10 * 8448);

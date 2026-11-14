@@ -31,7 +31,8 @@
  *     d'un fil à l'autre, la somme vérifiée (le débit affiché, sans être
  *     comparé) ;
  *   - les horodatages sur lo (advmss 65 483), TCP_MAXSEG dans le SYN, et
- *     un `connect` qui reprend le quadruplet d'un TIME_WAIT.
+ *     hors d'une connexion établie (SYN_SENT, refusée, défaite), et un
+ *     `connect` qui reprend le quadruplet d'un TIME_WAIT.
  *   - TCP_CONGESTION (cubic, reno, les refus, l'héritage par une fille) ;
  *     le débit calculé (`tcpi_pacing_rate`) ; SO_SNDBUF qui ne grandit que pour
  *     un programme qui attend de la place ;
@@ -1091,6 +1092,86 @@ static void horodatages(void)
     a = accept(l, NULL, NULL);
     verifier(option(c, IPPROTO_TCP, TCP_MAXSEG) == 988 && option(a, IPPROTO_TCP, TCP_MAXSEG) == 988,
              "TCP_MAXSEG 1000 avant connect : annonce dans le SYN ; 988 lu des deux cotes, sans l'option");
+    close(a);
+    close(c);
+    close(l);
+}
+
+/* TCP_MAXSEG hors d'une connexion établie (mesuré) : le MSS d'envoi de la
+ * socket (`mss_cache`), sauf TCP_MAXSEG lui-même s'il est posé, pour une socket
+ * sans connexion (TCP_CLOSE, TCP_LISTEN). En SYN_SENT, 536 moins les
+ * horodatages (524), ou TCP_MAXSEG moins eux (988). Une connexion défaite
+ * (AF_UNSPEC, ou refusée et vue par `connect` : `tcp_disconnect`) le garde,
+ * avec la MTU et advmss (TCP_INFO), mais elle oublie TCP_MAXSEG, même posé
+ * après l'établissement (`rx_opt` effacé : la connexion suivante annonce le
+ * MSS de sa route), et `rcv_mss` revient à 88. Un SYN reste sans réponse quand la
+ * file d'acceptation d'une écoute est pleine. */
+static void maxseg_hors_connexion(void)
+{
+    int port, l = ecoute(&port, 0);
+    struct sockaddr_in x = lo(port);
+    verifier(option(l, IPPROTO_TCP, TCP_MAXSEG) == 536, "TCP_MAXSEG d'une ecoute : 536");
+    int c1 = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c1, (void *)&x, sizeof x);
+    int mss[2];
+    for (int k = 0; k < 2; k++) {
+        int c = socket(AF_INET, SOCK_STREAM, 0);
+        fcntl(c, F_SETFL, O_NONBLOCK);
+        if (k)
+            setsockopt(c, IPPROTO_TCP, TCP_MAXSEG, &(int){1000}, sizeof(int));
+        connect(c, (void *)&x, sizeof x);
+        attendre_ms(50);
+        struct tcp_info i;
+        socklen_t li = sizeof i;
+        getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
+        mss[k] = i.tcpi_state == TCP_SYN_SENT && i.tcpi_rcv_mss == 88 ? option(c, IPPROTO_TCP, TCP_MAXSEG) : -1;
+        close(c);
+    }
+    verifier(mss[0] == 524 && mss[1] == 988, "SYN_SENT : TCP_MAXSEG 524, 988 avec TCP_MAXSEG 1000 ; rcv_mss 88");
+    close(c1);
+    close(l);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, IPPROTO_TCP, TCP_MAXSEG, &(int){1000}, sizeof(int));
+    int refus = erreur(connect(c, (void *)&x, sizeof x));
+    verifier(refus == ECONNREFUSED && option(c, IPPROTO_TCP, TCP_MAXSEG) == 988, "refusee : TCP_MAXSEG 1000 oublie, 988 garde");
+    close(c);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&x, sizeof x);
+    struct tcp_info i;
+    socklen_t li = sizeof i;
+    getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
+    verifier(option(c, IPPROTO_TCP, TCP_MAXSEG) == 524 && i.tcpi_snd_mss == 524 && i.tcpi_pmtu == 65535 && i.tcpi_rcv_mss == 88,
+             "refusee : TCP_MAXSEG 524 (celui du SYN), MTU 65 535, rcv_mss 88");
+    /* Refusée sans que `connect` l'ait vu (non bloquant) : TCP_CLOSE, TCP_MAXSEG
+     * posé se montre ; le `connect` suivant dit l'erreur, et l'oublie. */
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    fcntl(c, F_SETFL, O_NONBLOCK);
+    setsockopt(c, IPPROTO_TCP, TCP_MAXSEG, &(int){1000}, sizeof(int));
+    connect(c, (void *)&x, sizeof x);
+    attendre_ms(50);
+    int avant = option(c, IPPROTO_TCP, TCP_MAXSEG);
+    refus = erreur(connect(c, (void *)&x, sizeof x));
+    verifier(avant == 1000 && refus == ECONNREFUSED && option(c, IPPROTO_TCP, TCP_MAXSEG) == 988,
+             "refusee sans attendre : 1000, puis le connect suivant l'oublie : 988");
+    close(c);
+    l = ecoute(&port, 1);
+    x = lo(port);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, IPPROTO_TCP, TCP_MAXSEG, &(int){1000}, sizeof(int));
+    connect(c, (void *)&x, sizeof x);
+    int a = accept(l, NULL, NULL);
+    setsockopt(c, IPPROTO_TCP, TCP_MAXSEG, &(int){2000}, sizeof(int));
+    struct sockaddr u = {.sa_family = AF_UNSPEC};
+    int r = connect(c, &u, sizeof u);
+    getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
+    verifier(r == 0 && option(c, IPPROTO_TCP, TCP_MAXSEG) == 988 && i.tcpi_snd_mss == 988 && i.tcpi_advmss == 988
+             && i.tcpi_pmtu == 65535 && i.tcpi_rcv_mss == 88 && i.tcpi_state == TCP_CLOSE,
+             "defaite : TCP_MAXSEG 2000 oublie, 988 garde ; advmss 988, MTU 65 535, rcv_mss 88");
+    close(a);
+    connect(c, (void *)&x, sizeof x);
+    a = accept(l, NULL, NULL);
+    getsockopt(c, IPPROTO_TCP, TCP_INFO, &i, &li);
+    verifier(i.tcpi_advmss == 65483, "defaite puis reconnectee : advmss 65 483, sans TCP_MAXSEG");
     close(a);
     close(c);
     close(l);
@@ -2510,6 +2591,7 @@ int main(void)
     info_en_time_wait();
     echelle();
     horodatages();
+    maxseg_hors_connexion();
     reprise_time_wait();
     congestion();
     debit_calcule();

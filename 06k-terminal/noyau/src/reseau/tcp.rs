@@ -419,6 +419,10 @@ pub struct OptionsTcp {
     /// TCP_CONGESTION : le contrôle de la socket, et de ses filles
     /// (`tcp_ca_openreq_child`).
     pub controle: itcp::Controle,
+    /// Ce que la socket garde de son MSS hors d'une connexion (TCP_MAXSEG et
+    /// TCP_INFO le montrent) : celui d'une socket neuve, puis ce que lui laisse
+    /// chaque connexion.
+    pub hors_connexion: itcp::MssRestant,
 }
 
 impl OptionsTcp {
@@ -429,6 +433,7 @@ impl OptionsTcp {
         nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
         rcvbuf_fixe: false, rcvlowat: 1, ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 1, minttl: 0, window_clamp: 0, controle: itcp::Controle::DEFAUT,
+        hors_connexion: itcp::MssRestant::NEUF,
     };
 
     /// Ce que la connexion en retient (TCP_USER_TIMEOUT est en ms, les
@@ -795,16 +800,19 @@ impl Partie {
         }
     }
 
-    /// La socket redevient neuve (`tcp_disconnect` : TCP_CLOSE), et peut se
-    /// connecter à nouveau ou écouter : après un `connect` qui n'a pas
-    /// abouti (refusé, abandonné), ou `connect(AF_UNSPEC)`. Son entrée de la
+    /// La socket redevient neuve (TCP_CLOSE), et peut se connecter à nouveau
+    /// ou écouter : après un `connect` qui n'a pas abouti (refusé, abandonné),
+    /// ou `connect(AF_UNSPEC)` (`oublier_la_connexion`, qui efface aussi ce
+    /// qu'efface `tcp_disconnect`), ou avant `listen`, qui la trouve TCP_CLOSE. Son entrée de la
     /// table est rendue ; un port choisi par `bind` est gardé
     /// (SOCK_BINDPORT_LOCK), lié de nouveau à son adresse.
     fn redevenir_neuve(&mut self, s: &Arc<Socket>) {
-        // Ce que les tampons sont devenus reste (`tcp_disconnect` n'y touche pas).
+        // Ce que les tampons sont devenus reste (`tcp_disconnect` n'y touche pas), et ce
+        // que la connexion laisse du MSS.
         if let Mode::Connexion(t) = &self.mode {
             s.rcvbuf.store(t.rcvbuf.min(i32::MAX as usize) as u32, Ordering::Relaxed);
             s.sndbuf.store(t.sndbuf.min(i32::MAX as usize) as u32, Ordering::Relaxed);
+            self.options.hors_connexion = t.restes();
         }
         let a = self.adresses;
         let dans_la_table = !self.hors_table;
@@ -868,7 +876,17 @@ impl Partie {
             Mode::Ecoute { filles, .. } => arreter_les_filles(filles, ip),
             Mode::Neuve => {}
         }
+        self.oublier_la_connexion(s);
+    }
+
+    /// `tcp_disconnect` : la socket redevient neuve, et oublie `rx_opt` (TCP_MAXSEG :
+    /// mesuré, la connexion suivante annonce le MSS de sa route) ; ce qu'on attend de
+    /// l'autre (`rcv_mss`) revient à 88. Ce que fait aussi `connect`, quand il voit
+    /// qu'une connexion n'a pas abouti (`__inet_stream_connect`, `sock_error`).
+    fn oublier_la_connexion(&mut self, s: &Arc<Socket>) {
         self.redevenir_neuve(s);
+        self.options.maxseg = 0;
+        self.options.hors_connexion = self.options.hors_connexion.deconnecte();
     }
 
     /// La socket ne tient plus d'entrée dans la table : une connexion finie,
@@ -1684,7 +1702,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
             && !p.etablie_un_jour
         {
             let e = t.prendre_erreur();
-            p.redevenir_neuve(s);
+            p.oublier_la_connexion(s);
             g.publier(|p, c| p.rafraichir(c));
             return Err(if e != 0 { -(e as i64) } else { -ECONNABORTED });
         }
@@ -1834,7 +1852,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
         // plus que POLLOUT | POLLHUP. Son erreur déjà lue par un autre fil : ECONNABORTED
         // (`__inet_stream_connect`).
         let e = t.prendre_erreur();
-        p.redevenir_neuve(s);
+        p.oublier_la_connexion(s);
         g.publier(|p, c| p.rafraichir(c));
         return Err(if e != 0 { -(e as i64) } else { -ECONNABORTED });
     }

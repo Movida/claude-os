@@ -47,7 +47,7 @@ fn les_constantes_de_linux() {
     assert_eq!(PAWS_MSL, 60_000_000_000);
     let r = etablie(true).reglages;
     assert_eq!((r.keepidle, r.keepintvl, r.keepcnt), (7200 * 1_000_000_000, 75 * 1_000_000_000, 9));
-    assert!(Info::sans_connexion().debit_limite);
+    assert!(Info::sans_connexion(&MssRestant::NEUF).debit_limite);
     assert_eq!(etablie(true).undo_retrans, -1);
 }
 
@@ -209,13 +209,44 @@ fn verifier_la_mtu() {
 }
 
 #[test]
-fn le_mss_demande_avant_l_etablissement() {
-    let mut c = etablie(true);
-    c.etat = Etat::SynEnvoye;
-    c.mss_utilisateur = 0;
-    assert_eq!(c.mss(), MSS_DEFAUT);
+fn le_mss_hors_de_l_etablissement() {
+    // Le SYN parti (`tcp_connect_init`) : 536 moins les horodatages, ou TCP_MAXSEG moins
+    // eux (mesuré : 524, 988) ; rien d'attendu de l'autre (88).
+    let mut c: C = Tcb::connecter(&MIB, 80, 40000, ISS, 65_495, 131_072, 1 << 22, 0);
+    c.proposer_horodatages(0);
+    c.emettre(HEURE, |_| {});
+    assert_eq!((c.mss(), c.ack.rcv_mss, c.mss_local), (524, 88, 65_495));
+    let mut c: C = Tcb::connecter(&MIB, 80, 40000, ISS, 65_495, 131_072, 1 << 22, 0);
+    c.proposer_horodatages(0);
     c.mss_utilisateur = 1000;
+    c.emettre(HEURE, |_| {});
+    assert_eq!((c.mss(), c.mss_local), (988, 1000));
+    assert_eq!(c.restes(), MssRestant { mss: 988, pmtu: 65_535, entete: 32, advmss: 1000, rcv_mss: 88 });
+    // Finie : TCP_MAXSEG lui-même, s'il est posé.
+    c.etat = Etat::Fermee;
     assert_eq!(c.mss(), 1000);
+    c.mss_utilisateur = 0;
+    assert_eq!(c.mss(), 988);
+}
+
+#[test]
+fn l_offre_bornee_par_tcp_maxseg() {
+    // Le SYN-ACK n'offre rien : TCP_MAXSEG reste la borne (`tcp_parse_options` ignore
+    // aussi une offre nulle) ; il offre plus : TCP_MAXSEG ; moins : l'offre.
+    let mut c = syn_envoye();
+    c.mss_utilisateur = 700;
+    c.mss_clamp = 700;
+    c.mss_offre = Some(0);
+    c.borner_par_l_offre();
+    assert_eq!(c.mss_clamp, 700);
+    c.mss_offre = Some(900);
+    c.borner_par_l_offre();
+    assert_eq!(c.mss_clamp, 700);
+    c.mss_offre = Some(600);
+    c.borner_par_l_offre();
+    assert_eq!(c.mss_clamp, 600);
+    c.synchroniser_mss();
+    assert_eq!(c.mss, 600 - if c.ts.is_some() { TS_ALIGNE } else { 0 });
 }
 
 /// `tcp_bound_to_half_wnd`.

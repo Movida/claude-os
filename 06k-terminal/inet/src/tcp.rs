@@ -697,15 +697,43 @@ pub struct Info {
     pub demarrage_lent: bool,
 }
 
+/// Ce qu'une socket TCP garde de son MSS hors d'une connexion : les champs de la
+/// `tcp_sock` de Linux que ni `tcp_init_sock` ni `tcp_disconnect` ne remettent
+/// (`mss_cache`, `icsk_pmtu_cookie`, `tcp_header_len`, `advmss` ; `rcv_mss`, que
+/// `tcp_disconnect` remet à 88). TCP_MAXSEG, TCP_INFO les montrent, et IP_OPTIONS les
+/// recalcule (`tcp_sync_mss`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MssRestant {
+    pub mss: u16,
+    pub pmtu: u32,
+    pub entete: u8,
+    pub advmss: u32,
+    pub rcv_mss: u32,
+}
+
+impl MssRestant {
+    /// Une socket neuve (mesuré : TCP_MAXSEG 536, le reste à 0).
+    pub const NEUF: MssRestant = MssRestant { mss: MSS_DEFAUT, pmtu: 0, entete: 0, advmss: 0, rcv_mss: 0 };
+
+    /// Après `tcp_disconnect` : ce qu'on attend de l'autre revient à 88.
+    pub fn deconnecte(self) -> MssRestant {
+        MssRestant { rcv_mss: MSS_MIN as u32, ..self }
+    }
+}
+
 impl Info {
     /// Ce que dit TCP_INFO d'une socket sans connexion (TCP_CLOSE) : les valeurs de
     /// départ de `tcp_init_sock` (mesuré ; pas les heures, que Linux y compte depuis
-    /// l'origine de ses jiffies, et qui ne disent rien).
-    pub fn sans_connexion() -> Info {
+    /// l'origine de ses jiffies, et qui ne disent rien), et ce qu'elle garde de son MSS
+    /// (`r`).
+    pub fn sans_connexion(r: &MssRestant) -> Info {
         Info {
             etat: 7,
             rto: (RTO_INITIAL / 1000) as u32,
-            snd_mss: MSS_DEFAUT as u32,
+            snd_mss: r.mss as u32,
+            rcv_mss: r.rcv_mss,
+            pmtu: r.pmtu,
+            advmss: r.advmss,
             rttvar: (RTO_INITIAL / 4 / 1000) as u32,
             ssthresh: congestion::SSTHRESH_INFINI,
             cwnd: CWND_INITIALE,
@@ -834,6 +862,10 @@ pub struct Tcb<P: Charge> {
     mss: u16,
     /// L'offre de l'autre, dans son SYN.
     mss_offre: Option<u16>,
+    /// Ce qui borne notre MSS d'envoi (`rx_opt.mss_clamp`) : 536 au départ ; l'offre de
+    /// l'autre, bornée par TCP_MAXSEG, dès qu'il en fait une ; pour qui se connecte,
+    /// TCP_MAXSEG s'il est posé, en attendant la réponse (`tcp_connect_init`).
+    mss_clamp: u16,
     /// La plus grande charge que permet notre route (sa MTU moins 40).
     mss_route: u16,
     /// La charge qu'on dit pouvoir recevoir (`advmss`) : `mss_route` au départ,
@@ -1100,6 +1132,7 @@ impl<P: Charge> Tcb<P> {
             espace: EspaceLu { octets: 0, seq: 0, temps: 0 },
             mss: MSS_DEFAUT,
             mss_offre: None,
+            mss_clamp: MSS_DEFAUT,
             mss_route: mss_local,
             mss_local,
             mss_utilisateur: 0,
@@ -1268,6 +1301,7 @@ impl<P: Charge> Tcb<P> {
         t.ts = syn.options.horodatage.map(|(val, _)| Horodatages { recent: val, instant: 0, decalage: 0 });
         t.sack_ok = syn.options.sack_permis;
         t.mss_offre = syn.options.mss;
+        t.borner_par_l_offre();
         t.synchroniser_mss();
         t.rcv_wup = t.rcv_nxt;
         t.syn_du = true;
@@ -1281,9 +1315,11 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// TCP_MAXSEG d'une fille, hérité de son écoute : il borne son MSS d'envoi.
+    /// TCP_MAXSEG d'une fille, hérité de son écoute : il borne l'offre de l'autre
+    /// (`tcp_conn_request` lit le SYN avec lui), donc son MSS d'envoi.
     pub fn poser_mss_utilisateur(&mut self, mss: u16) {
         self.mss_utilisateur = mss;
+        self.borner_par_l_offre();
         self.synchroniser_mss();
     }
 
@@ -1371,29 +1407,47 @@ impl<P: Charge> Tcb<P> {
         e
     }
 
-    /// Le MSS d'envoi (`tcp_sync_mss`, `__tcp_mtu_to_mss`) : l'offre de l'autre
-    /// (536 s'il ne dit rien, ou dit 0 : `tcp_parse_options` l'ignore), bornée
-    /// par notre route et par TCP_MAXSEG, jamais sous MSS_ENVOI_MIN, moins la
-    /// place des horodatages (`tcp_mtu_to_mss` : ils sont dans chaque segment,
-    /// et l'offre de l'autre compte les options).
-    fn synchroniser_mss(&mut self) {
-        let mut m = self.mss_offre.filter(|&o| o != 0).unwrap_or(MSS_DEFAUT).min(self.mss_route);
-        if self.mss_utilisateur != 0 {
-            m = m.min(self.mss_utilisateur);
+    /// L'offre de l'autre (`tcp_parse_options`) : elle borne désormais notre MSS, ou
+    /// TCP_MAXSEG s'il est plus petit ; une offre absente, ou nulle, ne change rien.
+    fn borner_par_l_offre(&mut self) {
+        if let Some(o) = self.mss_offre.filter(|&o| o != 0) {
+            let u = self.mss_utilisateur;
+            self.mss_clamp = if u != 0 && u < o { u } else { o };
         }
+    }
+
+    /// Le MSS d'envoi (`tcp_sync_mss`, `__tcp_mtu_to_mss`) : la borne
+    /// (`mss_clamp`), au plus ce que permet notre route, jamais sous
+    /// MSS_ENVOI_MIN, moins la place des horodatages (`tcp_mtu_to_mss` : ils
+    /// sont dans chaque segment, et l'offre de l'autre compte les options).
+    fn synchroniser_mss(&mut self) {
+        let m = self.mss_clamp.min(self.mss_route);
         self.mss = m.max(MSS_ENVOI_MIN) - if self.ts.is_some() { TS_ALIGNE } else { 0 };
     }
 
-    /// Ce que rend TCP_MAXSEG : le MSS d'envoi une fois la connexion
-    /// établie (`mss_cache`, borné à la moitié de la plus grande fenêtre de
-    /// l'autre) ; avant, ce qu'a demandé le programme, ou 536 (mesuré).
+    /// Ce que rend TCP_MAXSEG (`do_tcp_getsockopt`) : le MSS d'envoi
+    /// (`mss_cache`, borné à la moitié de la plus grande fenêtre de l'autre),
+    /// dès le SYN (mesuré : 524 en SYN_SENT, 536 moins les horodatages) ; d'une
+    /// connexion finie (TCP_CLOSE, et TIME_WAIT, qui l'est vu de la socket),
+    /// TCP_MAXSEG lui-même s'il est posé.
     pub fn mss(&self) -> u16 {
-        if self.etat.synchronise() {
-            self.mss_borne() as u16
-        } else if self.mss_utilisateur != 0 {
+        if matches!(self.etat, Etat::Fermee | Etat::TempsAttente) && self.mss_utilisateur != 0 {
             self.mss_utilisateur
         } else {
-            MSS_DEFAUT
+            self.mss_borne() as u16
+        }
+    }
+
+    /// Ce que la socket garde de son MSS quand la connexion la quitte (`tcp_disconnect`,
+    /// ou un `connect` qui a échoué) : les champs de la `tcp_sock` que Linux ne remet
+    /// pas à zéro.
+    pub fn restes(&self) -> MssRestant {
+        MssRestant {
+            mss: self.mss_borne() as u16,
+            pmtu: self.mss_route as u32 + 40,
+            entete: tcp::ENTETE as u8 + if self.ts.is_some() { TS_ALIGNE as u8 } else { 0 },
+            advmss: self.mss_local as u32,
+            rcv_mss: self.ack.rcv_mss,
         }
     }
 
@@ -2223,6 +2277,7 @@ impl<P: Charge> Tcb<P> {
                 self.rcv_lu = self.rcv_nxt;
                 self.rcv_wup = self.rcv_nxt;
                 self.mss_offre = t.options.mss;
+                self.borner_par_l_offre();
                 self.accepter_echelle(t.options.echelle);
                 self.sack_ok &= t.options.sack_permis;
                 // Les horodatages n'entrent en service que si l'autre les porte
@@ -2599,8 +2654,7 @@ impl<P: Charge> Tcb<P> {
             return;
         }
         // `max(mss_clamp, mss_cache)`, le premier sans la place des options.
-        let clamp = self.mss_offre.filter(|&o| o != 0).unwrap_or(MSS_DEFAUT).min(if self.mss_utilisateur != 0 { self.mss_utilisateur } else { u16::MAX });
-        let par_segment = (clamp.max(self.mss) as usize + 640).next_power_of_two() + 256;
+        let par_segment = (self.mss_clamp.max(self.mss) as usize + 640).next_power_of_two() + 256;
         let segments = (self.cc.cwnd.max(CWND_INITIALE).max(self.reordering + 1)) as usize;
         let voulu = (2 * segments * par_segment).min(self.sndbuf_max);
         if self.sndbuf < voulu {
@@ -3715,6 +3769,16 @@ impl<P: Charge> Tcb<P> {
             self.syn_du = false;
             let drapeaux = if self.etat == Etat::SynRecu { tcp::SYN | tcp::ACK } else { tcp::SYN };
             if !core::mem::replace(&mut self.fenetre_posee, true) {
+                // `tcp_connect_init` : TCP_MAXSEG borne le MSS d'envoi en attendant l'offre de
+                // l'autre ; ce qu'on attend de lui (`tcp_initialize_rcv_mss`, avant que la
+                // fenêtre ne soit choisie : rien, donc 88).
+                if !self.fille {
+                    if self.mss_utilisateur != 0 {
+                        self.mss_clamp = self.mss_utilisateur;
+                    }
+                    self.synchroniser_mss();
+                    self.ack.rcv_mss = MSS_MIN as u32;
+                }
                 // TCP_MAXSEG borne ce qu'on annonce, et tout ce qui en découle (`tcp_mss_clamp`).
                 self.mss_local = self.mss_annonce();
                 // `tcp_openreq_init_rwin` : les options de la fille comptent ;
