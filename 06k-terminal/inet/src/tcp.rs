@@ -686,6 +686,8 @@ pub struct Info {
     pub hors_ordre: u32,
     pub rto_reprises: u32,
     pub rto_temps: u32,
+    /// Les RTO qui ont changé le hachage du flux (`tcpi_rehash` : `timeout_rehash`).
+    pub rehash: u32,
     /// Les échéances, pour /proc/net/tcp : la retransmission (ou la sonde,
     /// `sonde`) et le keepalive, en ns depuis l'appel (None : aucune) ;
     /// les ACK rapides qui restent, et le ping-pong.
@@ -697,27 +699,103 @@ pub struct Info {
     pub demarrage_lent: bool,
 }
 
-/// Ce qu'une socket TCP garde de son MSS hors d'une connexion : les champs de la
-/// `tcp_sock` de Linux que ni `tcp_init_sock` ni `tcp_disconnect` ne remettent
-/// (`mss_cache`, `icsk_pmtu_cookie`, `tcp_header_len`, `advmss` ; `rcv_mss`, que
-/// `tcp_disconnect` remet à 88). TCP_MAXSEG, TCP_INFO les montrent, et IP_OPTIONS les
-/// recalcule (`tcp_sync_mss`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MssRestant {
+/// Ce que la socket garde d'une connexion qui la quitte (AF_UNSPEC, un `connect` qui voit
+/// l'échec : `tcp_disconnect`) : les champs de la `tcp_sock` de Linux que `tcp_disconnect` ne
+/// remet pas. Hors connexion, TCP_MAXSEG, TCP_INFO, SIOCOUTQ et SIOCOUTQNSD les montrent
+/// (IP_OPTIONS recalcule le MSS : `tcp_sync_mss`) ; la connexion suivante en reprend ce que
+/// `tcp_connect_init` ne remet pas non plus (`Tcb::reprendre`), et son numéro de départ.
+///
+/// Choix de conception : la liste de ce qui reste, prise au Tcb quand la connexion le
+/// quitte. Linux garde la même `tcp_sock` d'une connexion à l'autre, et ce qui reste est ce
+/// que ses fonctions ne remettent pas ; garder notre Tcb (plus d'un Kio) après la fin ferait
+/// de même, mais ce qui survit n'y serait écrit nulle part, et chaque champ neuf devrait se
+/// demander s'il survit. Ici, chaque survivant est nommé, avec ce qui chez Linux ne le
+/// remet pas, et mesuré (sous Linux 6.18 : TCP_INFO d'une socket déconnectée après des
+/// échanges sur lo, d'une socket refusée, et d'une socket reconnectée à côté d'une neuve).
+#[derive(Debug, Clone, Copy)]
+pub struct Restes {
+    /// Le MSS (`mss_cache`), la MTU du chemin (`icsk_pmtu_cookie`), la taille de l'en-tête TCP
+    /// (`tcp_header_len`), `advmss`, et ce qu'on attend de l'autre (`rcv_mss`).
     pub mss: u16,
     pub pmtu: u32,
     pub entete: u8,
     pub advmss: u32,
     pub rcv_mss: u32,
+    /// Les RTO de la dernière série (`icsk_retransmits` : seul `tcp_connect_init` le remet).
+    retransmissions: u32,
+    /// L'heure du dernier envoi de données (`lsndtime`) et du dernier ACK reçu (`rcv_tstamp`) ;
+    /// 0 : jamais.
+    dernier_envoi: u64,
+    dernier_ack: u64,
+    /// Ce qui bornait la fenêtre annoncée, la fenêtre de l'autre, la nôtre, le plus que le
+    /// programme ait lu en un RTT (`rcvq_space`), et le réordonnancement toléré.
+    rcv_ssthresh: u32,
+    snd_wnd: u32,
+    rcv_wnd: u32,
+    rcv_space: u32,
+    reordering: u32,
+    /// Le RTT vu du récepteur (`rcv_rtt_est` : la mesure, et la fenêtre qu'il chronométrait).
+    rcv_rtt8: u64,
+    rcv_rtt_seq: u32,
+    rcv_rtt_debut: u64,
+    /// Le débit de l'envoi (`sk_pacing_rate`), le plus petit RTT récent (`rtt_min`, que seuls
+    /// `tcp_init_sock` et la naissance d'une fille remettent), le débit livré retenu et les
+    /// chronomètres.
+    pacing: u64,
+    min_rtt: MinMax,
+    mesures: Mesures,
+    /// Les files étaient-elles vides (`tcp_rtx_and_write_queues_empty`) : ce que
+    /// `tcp_write_queue_purge` regarde avant de les vider, pour arrêter le chronomètre.
+    files_vides: bool,
+    /// Les numéros : la suite de tout ce qui a été écrit (`write_seq`), le premier non acquitté,
+    /// le prochain à envoyer ; et la plus grande fenêtre de l'autre (`max_window`).
+    write_seq: u32,
+    snd_una: u32,
+    snd_nxt: u32,
+    max_fenetre: u32,
+    /// Les RTO qui ont changé le hachage du flux (`timeout_rehash`).
+    rehash: u32,
 }
 
-impl MssRestant {
-    /// Une socket neuve (mesuré : TCP_MAXSEG 536, le reste à 0).
-    pub const NEUF: MssRestant = MssRestant { mss: MSS_DEFAUT, pmtu: 0, entete: 0, advmss: 0, rcv_mss: 0 };
+impl Restes {
+    /// Une socket neuve (`tcp_init_sock` ; mesuré : TCP_MAXSEG 536, le reste à 0, aucun débit).
+    pub const NEUF: Restes = Restes {
+        mss: MSS_DEFAUT, pmtu: 0, entete: 0, advmss: 0, rcv_mss: 0, retransmissions: 0, dernier_envoi: 0, dernier_ack: 0,
+        rcv_ssthresh: 0, snd_wnd: 0, rcv_wnd: 0, rcv_space: 0, reordering: TCP_REORDERING, rcv_rtt8: 0, rcv_rtt_seq: 0,
+        rcv_rtt_debut: 0, pacing: PACING_MAX, min_rtt: MinMax::new(), mesures: Mesures::new(), files_vides: true,
+        write_seq: 0, snd_una: 0, snd_nxt: 0, max_fenetre: 0, rehash: 0,
+    };
 
-    /// Après `tcp_disconnect` : ce qu'on attend de l'autre revient à 88.
-    pub fn deconnecte(self) -> MssRestant {
-        MssRestant { rcv_mss: MSS_MIN as u32, ..self }
+    /// `tcp_disconnect` : les files purgées (`tcp_write_queue_purge` arrête d'abord le
+    /// chronomètre, seulement s'il n'y avait rien en file : sinon il court encore, mesuré) ; ce
+    /// qu'on attend de l'autre revient à 88 ; et la suite des numéros saute de la plus grande
+    /// fenêtre de l'autre, plus 2 (jamais 0) : la connexion suivante partira de là, au-delà de
+    /// tout ce que l'autre pourrait encore attendre de la précédente (mesuré : son SYN porte
+    /// ce numéro ; deux AF_UNSPEC, deux sauts ; une écoute défaite, puis connectée : 2).
+    pub fn deconnecte(self, maintenant: u64) -> Restes {
+        let mut r = self;
+        r.mesures.arreter_chrono(Chrono::Occupee, r.files_vides, maintenant);
+        r.files_vides = true;
+        r.rcv_mss = MSS_MIN as u32;
+        let seq = r.write_seq.wrapping_add(r.max_fenetre).wrapping_add(2);
+        r.write_seq = if seq == 0 { 1 } else { seq };
+        r
+    }
+
+    /// Le numéro du SYN de la connexion suivante : `tcp_v4_connect` n'en tire un neuf que si
+    /// `write_seq` vaut 0, celui d'une socket neuve.
+    pub fn numero_de_depart(&self) -> Option<u32> {
+        (self.write_seq != 0).then_some(self.write_seq)
+    }
+
+    /// SIOCOUTQ et SIOCOUTQNSD (`tcp_ioctl`) : `write_seq` moins le premier non acquitté, et
+    /// moins le prochain à envoyer (mesuré : 3 et 2 après un refus, le SYN et le saut).
+    pub fn non_acquittes(&self) -> u32 {
+        self.write_seq.wrapping_sub(self.snd_una)
+    }
+
+    pub fn non_envoyes(&self) -> u32 {
+        self.write_seq.wrapping_sub(self.snd_nxt)
     }
 
     /// IP_OPTIONS posé hors d'une connexion (`tcp_sync_mss`, avec la dernière MTU
@@ -733,33 +811,52 @@ impl MssRestant {
 }
 
 impl Info {
-    /// Ce que dit TCP_INFO d'une socket sans connexion (TCP_CLOSE) : les valeurs de
-    /// départ de `tcp_init_sock` (mesuré ; pas les heures, que Linux y compte depuis
-    /// l'origine de ses jiffies, et qui ne disent rien), et ce qu'elle garde de son MSS
-    /// (`r`).
-    pub fn sans_connexion(r: &MssRestant) -> Info {
+    /// Ce que dit TCP_INFO d'une socket sans connexion (TCP_CLOSE) : ce qu'elle garde de la
+    /// dernière (`r` ; une socket neuve, `Restes::NEUF`), le reste comme `tcp_disconnect` le
+    /// remet (mesuré). Pas les heures que Linux compte depuis l'origine de ses jiffies (une
+    /// heure jamais posée, `lrcvtime` que remet `tcp_disconnect`), qui ne disent rien : 0.
+    pub fn sans_connexion(r: &Restes, maintenant: u64) -> Info {
+        let ms = |t: u64| if t == 0 { 0 } else { (maintenant.saturating_sub(t) / 1_000_000).min(u32::MAX as u64) as u32 };
+        let (occupe, fenetre_limitee, tampon_limite) = r.mesures.chronos(maintenant);
+        let min_rtt = r.min_rtt.valeur();
         Info {
             etat: 7,
+            retransmissions: r.retransmissions.min(255) as u8,
             rto: (RTO_INITIAL / 1000) as u32,
             snd_mss: r.mss as u32,
             rcv_mss: r.rcv_mss,
+            dernier_envoi: ms(r.dernier_envoi),
+            dernier_ack: ms(r.dernier_ack),
             pmtu: r.pmtu,
-            advmss: r.advmss,
+            rcv_ssthresh: r.rcv_ssthresh,
             rttvar: (RTO_INITIAL / 4 / 1000) as u32,
             ssthresh: congestion::SSTHRESH_INFINI,
             cwnd: CWND_INITIALE,
-            reordonnancement: TCP_REORDERING,
-            min_rtt: u32::MAX,
-            pacing: PACING_MAX,
+            advmss: r.advmss,
+            reordonnancement: r.reordering,
+            rcv_rtt: ((r.rcv_rtt8 >> 3) / 1000).min(u32::MAX as u64) as u32,
+            rcv_space: r.rcv_space,
+            pacing: r.pacing,
+            non_envoyes: (r.non_envoyes() as i32).max(0) as u32,
+            min_rtt: if min_rtt == u64::MAX { u32::MAX } else { (min_rtt / 1000).min(u32::MAX as u64) as u32 },
+            debit: r.mesures.debit(r.mss as u32),
             debit_limite: true,
+            occupe,
+            fenetre_limitee,
+            tampon_limite,
+            snd_wnd: r.snd_wnd,
+            rcv_wnd: r.rcv_wnd,
+            rehash: r.rehash,
             ..Info::default()
         }
     }
 
-    /// Et d'une écoute (`tcp_get_info`, mesuré) : presque rien ; les filles prêtes
-    /// et la longueur de sa file à la place de `tcpi_unacked` et `tcpi_sacked`.
-    pub fn ecoute(pretes: u32, file: u32) -> Info {
-        Info { etat: 10, non_acquittes: pretes, sackes: file, cwnd: CWND_INITIALE, reordonnancement: TCP_REORDERING, pacing: PACING_MAX, ..Info::default() }
+    /// Et d'une écoute (`tcp_get_info`, mesuré) : presque rien ; les filles prêtes et la
+    /// longueur de sa file à la place de `tcpi_unacked` et `tcpi_sacked`, et ce que
+    /// `tcp_get_info` montre de tous les états : le débit de l'envoi et le réordonnancement,
+    /// tels que la socket les a gardés (`r`), la fenêtre de congestion.
+    pub fn ecoute(pretes: u32, file: u32, r: &Restes) -> Info {
+        Info { etat: 10, non_acquittes: pretes, sackes: file, cwnd: CWND_INITIALE, reordonnancement: r.reordering, pacing: r.pacing, ..Info::default() }
     }
 }
 
@@ -1104,6 +1201,8 @@ pub struct Tcb<P: Charge> {
     /// tout ce que le programme avait écrit (`write_seq`), que Linux garde (SIOCOUTQ et
     /// TCP_INFO le montrent encore). None : pas jetées.
     purgee: Option<u32>,
+    /// Les RTO qui ont changé le hachage du flux (`timeout_rehash`).
+    rehash: u32,
 }
 
 /// CurrEstab est une jauge : elle redescend quand une connexion établie change
@@ -1268,6 +1367,7 @@ impl<P: Charge> Tcb<P> {
             dernier_envoi: 0,
             dernier_recu: 0,
             purgee: None,
+            rehash: 0,
         }
     }
 
@@ -1473,17 +1573,57 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// Ce que la socket garde de son MSS quand la connexion la quitte (`tcp_disconnect`,
-    /// ou un `connect` qui a échoué) : les champs de la `tcp_sock` que Linux ne remet
-    /// pas à zéro.
-    pub fn restes(&self) -> MssRestant {
-        MssRestant {
+    /// Ce que la socket garde de la connexion quand elle la quitte, tel quel : `Restes::
+    /// deconnecte` y fait ensuite ce que fait `tcp_disconnect`.
+    pub fn restes(&self) -> Restes {
+        Restes {
             mss: self.mss_borne() as u16,
             pmtu: self.mss_route as u32 + 40,
             entete: tcp::ENTETE as u8 + if self.ts.is_some() { TS_ALIGNE as u8 } else { 0 },
             advmss: self.mss_local as u32,
             rcv_mss: self.ack.rcv_mss,
+            retransmissions: self.retransmissions,
+            dernier_envoi: self.dernier_envoi,
+            dernier_ack: self.dernier_recu,
+            rcv_ssthresh: self.rcv_ssthresh,
+            snd_wnd: self.snd_wnd,
+            rcv_wnd: self.rcv_wnd,
+            rcv_space: self.espace.octets,
+            reordering: self.reordering,
+            rcv_rtt8: self.rcv_rtt8,
+            rcv_rtt_seq: self.rcv_rtt_seq,
+            rcv_rtt_debut: self.rcv_rtt_debut,
+            pacing: self.cc.pacing,
+            min_rtt: self.min_rtt,
+            mesures: self.mesures.restes(),
+            files_vides: self.files_vides(),
+            write_seq: self.write_seq(),
+            snd_una: self.snd_una,
+            snd_nxt: self.snd_nxt,
+            max_fenetre: self.max_fenetre,
+            rehash: self.rehash,
         }
+    }
+
+    /// La connexion d'une socket qui en a déjà eu une (`connect` après AF_UNSPEC ou un
+    /// échec) reprend ce que ni `tcp_disconnect` ni `tcp_connect_init` ne remettent : le plus
+    /// petit RTT (mesuré : celui d'avant, plus petit que celui d'une socket neuve sur le même
+    /// chemin), le débit livré (jusqu'au premier échantillon neuf, mesuré), les chronomètres,
+    /// `timeout_rehash`, le réordonnancement, le RTT du récepteur, le débit de l'envoi et
+    /// `rcvq_space` (jusqu'à l'établissement, qui les recalcule), les heures du dernier envoi
+    /// et du dernier ACK. Son numéro de départ : `Restes::numero_de_depart`.
+    pub fn reprendre(&mut self, r: &Restes) {
+        self.min_rtt = r.min_rtt;
+        self.mesures = r.mesures;
+        self.rehash = r.rehash;
+        self.reordering = r.reordering;
+        self.rcv_rtt8 = r.rcv_rtt8;
+        self.rcv_rtt_seq = r.rcv_rtt_seq;
+        self.rcv_rtt_debut = r.rcv_rtt_debut;
+        self.cc.pacing = r.pacing;
+        self.espace.octets = r.rcv_space;
+        self.dernier_envoi = r.dernier_envoi;
+        self.dernier_recu = r.dernier_ack;
     }
 
     /// Le MSS, sauf face à un récepteur minuscule : la moitié de la plus grande
@@ -3010,6 +3150,7 @@ impl<P: Charge> Tcb<P> {
             hors_ordre: self.mesures.hors_ordre,
             rto_reprises: self.mesures.rto_reprises,
             rto_temps: self.mesures.temps_de_rto(maintenant),
+            rehash: self.rehash,
             t_retrans: self.t_xmit.map(|t| t.saturating_sub(maintenant)),
             sonde: self.t_sorte == Minuteur::Sonde,
             t_keepalive: self.t_keepalive.map(|t| t.saturating_sub(maintenant)),

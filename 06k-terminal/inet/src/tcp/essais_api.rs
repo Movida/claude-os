@@ -47,7 +47,7 @@ fn les_constantes_de_linux() {
     assert_eq!(PAWS_MSL, 60_000_000_000);
     let r = etablie(true).reglages;
     assert_eq!((r.keepidle, r.keepintvl, r.keepcnt), (7200 * 1_000_000_000, 75 * 1_000_000_000, 9));
-    assert!(Info::sans_connexion(&MssRestant::NEUF).debit_limite);
+    assert!(Info::sans_connexion(&Restes::NEUF, 0).debit_limite);
     assert_eq!(etablie(true).undo_retrans, -1);
 }
 
@@ -221,7 +221,8 @@ fn le_mss_hors_de_l_etablissement() {
     c.mss_utilisateur = 1000;
     c.emettre(HEURE, |_| {});
     assert_eq!((c.mss(), c.mss_local), (988, 1000));
-    assert_eq!(c.restes(), MssRestant { mss: 988, pmtu: 65_535, entete: 32, advmss: 1000, rcv_mss: 88 });
+    let r = c.restes();
+    assert_eq!((r.mss, r.pmtu, r.entete, r.advmss, r.rcv_mss), (988, 65_535, 32, 1000, 88));
     // Finie : TCP_MAXSEG lui-même, s'il est posé.
     c.etat = Etat::Fermee;
     assert_eq!(c.mss(), 1000);
@@ -251,7 +252,7 @@ fn les_options_ip_prennent_leur_place() {
     c.poser_options_ip(40);
     assert_eq!(c.mss, MSS_ENVOI_MIN - TS_ALIGNE);
     // Sans connexion : 68, puis 36 après une connexion avec horodatages.
-    let mut r = MssRestant::NEUF;
+    let mut r = Restes::NEUF;
     r.synchroniser();
     assert_eq!(r.mss, 68);
     r.entete = 32;
@@ -694,6 +695,130 @@ fn les_files_d_une_connexion_finie() {
     c.recevoir(&ack, octets(0, 0), HEURE + MS);
     c.recevoir(&segment(&c, 0, tcp::RST), octets(0, 0), HEURE + 2 * MS);
     assert_eq!(c.mesures.chronos(HEURE + 2 * MS), c.mesures.chronos(HEURE + 1000 * MS));
+}
+
+#[test]
+fn ce_que_garde_une_socket_deconnectee() {
+    // Une connexion qui a échangé : deux segments acquittés (un RTT mesuré), trois octets reçus.
+    let mut c = etablie(true);
+    en_vol(&mut c, 2);
+    let ack = Tcp { ack: c.snd_nxt, ..segment(&c, 0, 0) };
+    c.recevoir(&ack, octets(0, 0), HEURE + 5 * MS);
+    recus(&mut c, 3);
+    c.reordering = 7;
+    c.retransmissions = 2;
+    c.rehash = 4;
+    let avant = c.info(HEURE + 10 * MS);
+    let w = c.write_seq();
+    let r = c.restes().deconnecte(HEURE + 10 * MS);
+    let i = Info::sans_connexion(&r, HEURE + 20 * MS);
+    // Gardé (mesuré sous Linux 6.18).
+    assert_eq!((i.retransmissions, i.reordonnancement, i.rehash), (2, 7, 4));
+    assert_eq!(
+        (i.rcv_ssthresh, i.rcv_space, i.pacing, i.snd_wnd, i.rcv_wnd, i.min_rtt, i.snd_mss, i.advmss, i.pmtu),
+        (avant.rcv_ssthresh, avant.rcv_space, avant.pacing, avant.snd_wnd, avant.rcv_wnd, avant.min_rtt, avant.snd_mss, avant.advmss, avant.pmtu)
+    );
+    assert!(i.min_rtt < u32::MAX && i.rcv_space > 0);
+    assert_eq!((i.debit, i.debit_limite), (avant.debit, true));
+    assert_eq!((i.dernier_envoi, i.dernier_ack, i.dernier_recu), (avant.dernier_envoi + 10, avant.dernier_ack + 10, 0));
+    // Remis par `tcp_disconnect`.
+    assert_eq!((i.etat, i.rcv_mss, i.rto, i.rttvar, i.cwnd, i.rtt, i.segs_out, i.total_retrans), (7, 88, 1_000_000, 250_000, CWND_INITIALE, 0, 0, 0));
+    // La suite des numéros : un saut de la plus grande fenêtre de l'autre, plus 2, à chaque fois.
+    let saut = c.max_fenetre + 2;
+    assert_eq!((r.numero_de_depart(), i.non_envoyes, r.non_acquittes(), r.non_envoyes()), (Some(w + saut), saut, saut, saut));
+    assert_eq!(r.deconnecte(HEURE + 30 * MS).numero_de_depart(), Some(w + 2 * saut));
+    // Une socket neuve : un numéro neuf ; défaite (une écoute, mesuré) : 2.
+    assert_eq!(Restes::NEUF.numero_de_depart(), None);
+    assert_eq!(Restes::NEUF.deconnecte(HEURE).numero_de_depart(), Some(2));
+    // Refusée en SYN_SENT (mesuré : SIOCOUTQ 3, SIOCOUTQNSD 2, notsent 2).
+    let mut c = syn_envoye();
+    c.recevoir(&Tcp { ack: ISS + 1, drapeaux: tcp::RST | tcp::ACK, ..Tcp::default() }, octets(0, 0), HEURE + MS);
+    assert_eq!(c.etat(), Etat::Fermee);
+    let r = c.restes().deconnecte(HEURE + MS);
+    assert_eq!((r.non_acquittes(), r.non_envoyes(), Info::sans_connexion(&r, HEURE + MS).non_envoyes), (3, 2, 2));
+    // Une écoute après : le débit de l'envoi et le réordonnancement gardés.
+    let mut r = Restes::NEUF;
+    r.pacing = 12_345;
+    r.reordering = 9;
+    let i = Info::ecoute(0, 4, &r);
+    assert_eq!((i.etat, i.pacing, i.reordonnancement, i.cwnd), (10, 12_345, 9, CWND_INITIALE));
+}
+
+#[test]
+fn le_chronometre_d_une_socket_deconnectee() {
+    // Rien en file : il s'arrête à la déconnexion.
+    let mut c = etablie(true);
+    en_vol(&mut c, 1);
+    let ack = Tcp { ack: c.snd_nxt, ..segment(&c, 0, 0) };
+    c.recevoir(&ack, octets(0, 0), HEURE + MS);
+    let r = c.restes().deconnecte(HEURE + 2 * MS);
+    assert_eq!(r.mesures.chronos(HEURE + 2 * MS), r.mesures.chronos(HEURE + 1000 * MS));
+    // Des données en vol : il court encore ; une seconde déconnexion, les files vides
+    // désormais, l'arrête.
+    let mut c = etablie(true);
+    en_vol(&mut c, 1);
+    let r = c.restes().deconnecte(HEURE + MS);
+    let (a, _, _) = r.mesures.chronos(HEURE + MS);
+    let (b, _, _) = r.mesures.chronos(HEURE + 1000 * MS);
+    assert!(b >= a + 900_000, "{a} {b}");
+    let r = r.deconnecte(HEURE + 1000 * MS);
+    assert_eq!(r.mesures.chronos(HEURE + 1000 * MS), r.mesures.chronos(HEURE + 2000 * MS));
+}
+
+#[test]
+fn la_reprise_d_une_socket() {
+    // Ce que la connexion suivante reprend (mesuré : le plus petit RTT, le débit livré, le
+    // rehachage), et ce qu'elle remet (les retransmissions).
+    let mut c = etablie(true);
+    en_vol(&mut c, 2);
+    let ack = Tcp { ack: c.snd_nxt, ..segment(&c, 0, 0) };
+    c.recevoir(&ack, octets(0, 0), HEURE + 5 * MS);
+    c.rehash = 3;
+    c.reordering = 5;
+    c.retransmissions = 2;
+    let r = c.restes().deconnecte(HEURE + 10 * MS);
+    let iss = r.numero_de_depart().unwrap();
+    let mut n: C = Tcb::connecter(&MIB, 80, 40000, iss, MSS as u16, 131_072, 1 << 22, 0);
+    n.reprendre(&r);
+    n.emettre(HEURE + 20 * MS, |_| {});
+    let i = n.info(HEURE + 20 * MS);
+    let a = Info::sans_connexion(&r, HEURE + 20 * MS);
+    assert_eq!((i.etat, i.min_rtt, i.rehash, i.reordonnancement, i.pacing, i.rcv_space, i.dernier_envoi), (2, a.min_rtt, 3, 5, a.pacing, a.rcv_space, a.dernier_envoi));
+    assert_eq!((i.debit, i.debit_limite, i.retransmissions), (r.mesures.debit(n.mss_borne()), true, 0));
+    assert!(i.min_rtt < u32::MAX && i.debit > 0);
+    assert_eq!(n.snd_una, iss);
+}
+
+#[test]
+fn le_hachage_change_a_chaque_rto() {
+    // Le SYN : chaque RTO qui n'abandonne pas (mesuré : 3 après trois SYN renvoyés).
+    let mut c = syn_envoye();
+    for k in 1..=3 {
+        let t = c.t_xmit.unwrap();
+        c.minuteur(t);
+        assert_eq!((c.rehash, c.total_rto), (k, k));
+    }
+    assert_eq!(c.info(HEURE).rehash, 3);
+    // Une fille : une requête, qui n'a pas de hachage à changer.
+    let mut c = fille(false);
+    let t = c.t_xmit.unwrap();
+    c.minuteur(t);
+    assert_eq!((c.retransmissions, c.rehash), (1, 0));
+    // Établie : de même (le RTO, pas la sonde de fin de rafale) ; la sonde d'une fenêtre
+    // fermée, non.
+    let mut c = etablie(true);
+    en_vol(&mut c, 1);
+    c.t_sorte = Minuteur::Retransmission;
+    let t = c.t_xmit.unwrap();
+    c.minuteur(t);
+    assert_eq!((c.total_rto, c.rehash), (1, 1));
+    let mut c = etablie(true);
+    en_vol(&mut c, 1);
+    c.snd_wnd = 0;
+    c.t_sorte = Minuteur::Retransmission;
+    let t = c.t_xmit.unwrap();
+    c.minuteur(t);
+    assert_eq!((c.recul, c.total_rto, c.rehash), (1, 0, 0));
 }
 
 #[test]

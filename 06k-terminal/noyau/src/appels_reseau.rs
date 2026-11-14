@@ -1755,8 +1755,8 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], u
                         ecrire_info(&mut o, &i)
                     }
                     None => match ecoute {
-                        Some((pretes, file)) => ecrire_info(&mut o, &inet::tcp::Info::ecoute(pretes, file)),
-                        None => ecrire_info(&mut o, &inet::tcp::Info::sans_connexion(&op.hors_connexion)),
+                        Some((pretes, file)) => ecrire_info(&mut o, &inet::tcp::Info::ecoute(pretes, file, &op.hors_connexion)),
+                        None => ecrire_info(&mut o, &inet::tcp::Info::sans_connexion(&op.hors_connexion, crate::temps::ns_monotone())),
                     },
                 }
                 return Ok(TAILLE_INFO);
@@ -1808,6 +1808,7 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
         (76, i.ssthresh), (80, i.cwnd), (84, i.advmss), (88, i.reordonnancement), (92, i.rcv_rtt), (96, i.rcv_space), (100, i.total_retrans), (64, i.rcv_ssthresh),
         (136, i.segs_out), (140, i.segs_in), (144, i.non_envoyes), (148, i.min_rtt), (152, i.data_segs_in), (156, i.data_segs_out),
         (192, i.livres), (224, i.hors_ordre), (244, i.rto_temps), (216, i.dsack_doublons), (220, i.reord_seen), (228, i.snd_wnd), (232, i.rcv_wnd),
+        (236, i.rehash),
     ];
     for (decalage, v) in mots {
         o[decalage..decalage + 4].copy_from_slice(&v.to_le_bytes());

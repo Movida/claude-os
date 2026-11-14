@@ -124,6 +124,42 @@ impl Mesures {
         ((stat[0] + stat[1] + stat[2]) * us, stat[1] * us, stat[2] * us)
     }
 
+    /// Ce que `tcp_disconnect` laisse des mesures, et que la connexion suivante reprend : le
+    /// débit retenu (`rate_delivered`, `rate_interval_us` : jusqu'au premier échantillon neuf)
+    /// et les chronomètres (`chrono_*`, qui peuvent courir encore). Le reste repart de zéro,
+    /// le débit limité par le programme (`rate_app_limited`, `app_limited` à ~0).
+    pub(super) fn restes(&self) -> Mesures {
+        Mesures {
+            rate_livres: self.rate_livres,
+            rate_intervalle: self.rate_intervalle,
+            chrono: self.chrono,
+            chrono_debut: self.chrono_debut,
+            chrono_stat: self.chrono_stat,
+            ..Mesures::new()
+        }
+    }
+
+    /// `tcp_chrono_set`.
+    pub(super) fn poser_chrono(&mut self, neuf: Chrono, maintenant: u64) {
+        let now = en_jiffies32(maintenant);
+        if self.chrono != Chrono::Aucun {
+            let i = self.chrono as usize - 1;
+            self.chrono_stat[i] = self.chrono_stat[i].wrapping_add(now.wrapping_sub(self.chrono_debut));
+        }
+        self.chrono_debut = now;
+        self.chrono = neuf;
+    }
+
+    /// `tcp_chrono_stop`, les files `vides` ou pas : plus rien en file, plus de chrono ; sinon
+    /// la cause courante cesse, reste que la connexion est occupée.
+    pub(super) fn arreter_chrono(&mut self, c: Chrono, vides: bool, maintenant: u64) {
+        if vides {
+            self.poser_chrono(Chrono::Aucun, maintenant);
+        } else if c == self.chrono {
+            self.poser_chrono(Chrono::Occupee, maintenant);
+        }
+    }
+
     /// Le temps des épisodes de RTO, celui qui court compris, en ms.
     pub(super) fn temps_de_rto(&self, maintenant: u64) -> u32 {
         self.rto_temps + self.rto_debut.map_or(0, |d| ms(maintenant).wrapping_sub(ms(d)))
@@ -243,14 +279,7 @@ impl<P: Charge> Tcb<P> {
 
     /// `tcp_chrono_set`.
     fn chrono_poser(&mut self, neuf: Chrono, maintenant: u64) {
-        let m = &mut self.mesures;
-        let now = en_jiffies32(maintenant);
-        if m.chrono != Chrono::Aucun {
-            let i = m.chrono as usize - 1;
-            m.chrono_stat[i] = m.chrono_stat[i].wrapping_add(now.wrapping_sub(m.chrono_debut));
-        }
-        m.chrono_debut = now;
-        m.chrono = neuf;
+        self.mesures.poser_chrono(neuf, maintenant);
     }
 
     /// `tcp_chrono_start` : la cause la plus intéressante l'emporte.
@@ -263,11 +292,8 @@ impl<P: Charge> Tcb<P> {
     /// `tcp_chrono_stop` : plus rien en file, plus de chrono ; sinon la cause courante cesse,
     /// reste que la connexion est occupée.
     pub(super) fn chrono_arreter(&mut self, c: Chrono, maintenant: u64) {
-        if self.files_vides() {
-            self.chrono_poser(Chrono::Aucun, maintenant);
-        } else if c == self.mesures.chrono {
-            self.chrono_poser(Chrono::Occupee, maintenant);
-        }
+        let vides = self.files_vides();
+        self.mesures.arreter_chrono(c, vides, maintenant);
     }
 
     /// Un RTO commence un épisode s'il est le premier de suite (`tcp_update_rto_stats`).

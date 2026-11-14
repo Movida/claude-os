@@ -455,10 +455,10 @@ pub struct OptionsTcp {
     /// TCP_CONGESTION : le contrôle de la socket, et de ses filles
     /// (`tcp_ca_openreq_child`).
     pub controle: itcp::Controle,
-    /// Ce que la socket garde de son MSS hors d'une connexion (TCP_MAXSEG et
-    /// TCP_INFO le montrent) : celui d'une socket neuve, puis ce que lui laisse
-    /// chaque connexion.
-    pub hors_connexion: itcp::MssRestant,
+    /// Ce que la socket garde d'une connexion (TCP_MAXSEG, TCP_INFO, SIOCOUTQ le
+    /// montrent hors connexion, et la suivante en reprend une part) : rien pour une
+    /// socket neuve, puis ce que lui laisse chaque connexion.
+    pub hors_connexion: itcp::Restes,
 }
 
 impl OptionsTcp {
@@ -470,7 +470,7 @@ impl OptionsTcp {
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
         rcvbuf_fixe: false, rcvlowat: 1, ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 1, minttl: 0, ip_options: fipv4::OptionsSortantes::AUCUNE, window_clamp: 0,
         controle: itcp::Controle::DEFAUT,
-        hors_connexion: itcp::MssRestant::NEUF,
+        hors_connexion: itcp::Restes::NEUF,
     };
 
     /// Ce que la connexion en retient (TCP_USER_TIMEOUT est en ms, les
@@ -925,13 +925,16 @@ impl Partie {
     }
 
     /// `tcp_disconnect` : la socket redevient neuve, et oublie `rx_opt` (TCP_MAXSEG :
-    /// mesuré, la connexion suivante annonce le MSS de sa route) ; ce qu'on attend de
-    /// l'autre (`rcv_mss`) revient à 88. Ce que fait aussi `connect`, quand il voit
-    /// qu'une connexion n'a pas abouti (`__inet_stream_connect`, `sock_error`).
+    /// mesuré, la connexion suivante annonce le MSS de sa route) ; ce qu'elle garde de la
+    /// connexion devient ce qu'en laisse `tcp_disconnect` (`Restes::deconnecte`), une fois
+    /// de plus si elle n'en avait déjà plus (AF_UNSPEC sur une socket neuve, ou défaite par un
+    /// autre fil : la suite des numéros saute encore, comme chez Linux). Ce que fait aussi
+    /// `connect`, quand il voit qu'une connexion n'a pas abouti (`__inet_stream_connect`,
+    /// `sock_error`).
     fn oublier_la_connexion(&mut self, s: &Arc<Socket>) {
         self.redevenir_neuve(s);
         self.options.maxseg = 0;
-        self.options.hors_connexion = self.options.hors_connexion.deconnecte();
+        self.options.hors_connexion = self.options.hors_connexion.deconnecte(maintenant());
     }
 
     /// Un `connect` voit que la connexion n'a pas abouti (`sock_error`) : la socket est
@@ -1922,7 +1925,13 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 };
                 p.adresses = Adresses { lie: true, port, distante: destination, port_distant: a.port, source, ..p.adresses };
                 p.hors_table = false;
-                let iss = reprise.map_or_else(|| numero_initial(source, destination, port, a.port), |(_, isn, _)| isn);
+                // Le numéro du SYN : celui que donne une connexion en TIME_WAIT reprise
+                // (`tcp_twsk_unique`), sinon celui que la socket garde d'une connexion
+                // passée, sinon un neuf (`tcp_v4_connect` : seulement si `write_seq` vaut 0).
+                let iss = reprise.map_or_else(
+                    || p.options.hors_connexion.numero_de_depart().unwrap_or_else(|| numero_initial(source, destination, port, a.port)),
+                    |(_, isn, _)| isn,
+                );
                 if let Some((n, _, _)) = reprise {
                     TW.verrouiller().retain(|e| e.numero != n);
                     super::tache::armer(n, None);
@@ -1931,6 +1940,8 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 let echelle = itcp::echelle(rcvbuf, p.options.rcvbuf_fixe, reception_max(), p.options.window_clamp);
                 let mut t = tcb_de_connect(place, port, a.port, iss, mss_vers(ip.vers(destination)), rcvbuf,
                                            s.sndbuf.load(Ordering::Relaxed) as usize, echelle);
+                // Ce que la socket garde de ses connexions passées (rien pour une neuve).
+                t.reprendre(&p.options.hors_connexion);
                 t.mss_utilisateur = p.options.maxseg;
                 t.poser_options_ip(ip.options.longueur);
                 t.window_clamp = p.options.window_clamp;
@@ -2679,7 +2690,11 @@ pub fn files(s: &Socket) -> Result<(usize, usize, usize, bool), i64> {
     match &g.donnee().mode {
         Mode::Connexion(t) => Ok((t.lisibles_fionread(), t.non_acquittes(), t.non_envoyes(), t.a_la_marque())),
         Mode::Ecoute { .. } => Err(-EINVAL),
-        Mode::Neuve => Ok((0, 0, 0, false)),
+        // Ce que la socket garde des numéros d'une connexion passée (0 pour une neuve).
+        Mode::Neuve => {
+            let r = &g.donnee().options.hors_connexion;
+            Ok((0, r.non_acquittes() as usize, r.non_envoyes() as usize, false))
+        }
     }
 }
 

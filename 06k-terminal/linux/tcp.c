@@ -44,6 +44,8 @@
  *   - TCP_INFO jusqu'au bout : les compteurs, le débit livré, les chronomètres ;
  *   - les files d'une connexion finie (SIOCOUTQ, SIOCOUTQNSD, `tcpi_notsent_bytes`, le
  *     chronomètre qui court encore après un RST) et celles de /proc/net/tcp (le SYN, le FIN) ;
+ *   - ce que la socket garde d'une connexion défaite (TCP_INFO, SIOCOUTQ), et ce que la
+ *     suivante en reprend ; `tcpi_rehash`, les RTO d'un SYN sans réponse ;
  *   - les coupures : un FIN puis un RST, shutdown en SYN_SENT et d'une écoute,
  *     connect(AF_UNSPEC), le connect qui suit une erreur ; les lectures sans copie
  *     ni retrait ; une connexion morte qui garde son port, le SO_REUSEADDR des filles ;
@@ -2006,6 +2008,100 @@ static void files_d_une_connexion_finie(void)
     close(l);
 }
 
+/* Les champs de `struct tcp_info` que lit `ce_que_garde_la_socket`, en plus de l'énumération
+ * plus haut. */
+enum { RCV_MSS = 20, LAST_DATA_RECV = 52, RCV_SSTHRESH = 64, REORDERING = 88, RCV_SPACE = 96, PACING = 104, MIN_RTT = 148,
+       SND_WND = 228, RCV_WND = 232, REHASH = 236 };
+
+static unsigned octet_info(int s, int decalage)
+{
+    unsigned char b[8];
+    socklen_t l = sizeof b;
+    getsockopt(s, IPPROTO_TCP, TCP_INFO, b, &l);
+    return b[decalage];
+}
+
+/* Ce que la socket garde d'une connexion défaite (`tcp_disconnect` ne le remet pas, mesuré sous
+ * Linux 6.18) : les retransmissions de la dernière série, la fenêtre de l'autre et la nôtre, ce qui
+ * bornait celle-ci, `rcvq_space`, le débit de l'envoi, le plus petit RTT, le débit livré (limité
+ * par le programme désormais), `timeout_rehash` ; et ce qu'elle remet (`rcv_mss` 88, l'heure de la
+ * dernière réception). La suite des numéros saute de la plus grande fenêtre de l'autre, plus 2, à
+ * chaque déconnexion (`tcpi_notsent_bytes`, SIOCOUTQ). La connexion suivante reprend le plus petit
+ * RTT. Une écoute après garde le débit de l'envoi. */
+static void ce_que_garde_la_socket(void)
+{
+    int port, l = ecoute(&port, 4);
+    struct sockaddr_in x = lo(port);
+    struct sockaddr u = { .sa_family = AF_UNSPEC };
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&x, sizeof x);
+    int a = accept(l, NULL, NULL);
+    static char t[200000];
+    int ok = 1;
+    for (int k = 0; k < 4 && ok; k++) {
+        ok = write(c, t, sizeof t) == (long)sizeof t;
+        for (size_t lu = 0; ok && lu < sizeof t;) {
+            long r = read(a, t, sizeof t - lu);
+            ok = r > 0;
+            lu += r > 0 ? r : 0;
+        }
+        ok &= write(a, t, 1000) == 1000 && recv(c, t, 1000, MSG_WAITALL) == 1000;
+    }
+    attendre_ms(50);
+    uint32_t ssthresh = champ(c, RCV_SSTHRESH), espace = champ(c, RCV_SPACE), snd_wnd = champ(c, SND_WND), rcv_wnd = champ(c, RCV_WND);
+    uint32_t min_rtt = champ(c, MIN_RTT), reord = champ(c, REORDERING);
+    uint64_t pacing = champ64(c, PACING), debit = champ64(c, DELIVERY_RATE);
+    int r = connect(c, &u, sizeof u);
+    uint32_t n1 = champ(c, NOTSENT), recu = champ(c, LAST_DATA_RECV);
+    /* L'heure de la dernière réception est remise : Linux compte alors depuis l'origine de ses
+     * jiffies (des jours, ou 2^32 ms moins 5 minutes au démarrage), ce qui ne dit rien : 0 chez
+     * nous. */
+    ok &= r == 0 && etat_de(c) == TCP_CLOSE && octet_info(c, 2) == 0 && champ(c, RCV_MSS) == 88 && (recu == 0 || recu > 100000);
+    verifier(ok && min_rtt != 0xffffffff && debit > 0 && champ(c, RCV_SSTHRESH) == ssthresh && champ(c, RCV_SPACE) == espace
+                 && champ(c, SND_WND) == snd_wnd && champ(c, RCV_WND) == rcv_wnd && champ(c, MIN_RTT) == min_rtt
+                 && champ(c, REORDERING) == reord && champ64(c, PACING) == pacing && champ64(c, DELIVERY_RATE) == debit
+                 && (octet_info(c, 7) & 1) == 1,
+             "AF_UNSPEC : les fenetres, rcv_ssthresh, rcv_space, pacing, min_rtt, le debit livre restent ; rcv_mss 88");
+    int q = ioctl_de(c, SIOCOUTQ), nsd = ioctl_de(c, SIOCOUTQNSD);
+    connect(c, &u, sizeof u);
+    verifier(n1 >= snd_wnd + 2 && q == (int)n1 && nsd == (int)n1 && champ(c, NOTSENT) == 2 * n1,
+             "AF_UNSPEC : notsent, SIOCOUTQ et SIOCOUTQNSD sautent de la plus grande fenetre et 2, a chaque fois");
+    close(a);
+    r = connect(c, (void *)&x, sizeof x);
+    a = accept(l, NULL, NULL);
+    verifier(r == 0 && champ(c, MIN_RTT) <= min_rtt, "reconnectee : le plus petit RTT d'avant, au plus");
+    pacing = champ64(c, PACING);
+    connect(c, &u, sizeof u);
+    r = listen(c, 1);
+    verifier(r == 0 && champ64(c, PACING) == pacing && champ(c, REORDERING) == 3, "une ecoute apres : le debit de l'envoi garde");
+    close(c);
+    close(a);
+    close(l);
+    struct sockaddr_in f = lo(port_ferme());
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    r = connect(c, (void *)&f, sizeof f);
+    verifier(r < 0 && ioctl_de(c, SIOCOUTQ) == 3 && ioctl_de(c, SIOCOUTQNSD) == 2 && champ(c, NOTSENT) == 2,
+             "refusee (bloquante) : SIOCOUTQ 3, SIOCOUTQNSD 2, notsent 2");
+    close(c);
+    /* Un SYN sans réponse (une écoute pleine) : chaque RTO change le hachage du flux. */
+    l = ecoute(&port, 0);
+    x = lo(port);
+    int d = socket(AF_INET, SOCK_STREAM, 0);
+    connect(d, (void *)&x, sizeof x);
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&x, sizeof x);
+    attendre_ms(1300);
+    uint32_t rehash = champ(c, REHASH);
+    unsigned rto = champ(c, TOTAL_RTO) & 0xffff, retrans = octet_info(c, 2);
+    connect(c, &u, sizeof u);
+    verifier(rehash >= 1 && rto == rehash && retrans == rehash && champ(c, REHASH) == rehash && octet_info(c, 2) == retrans
+                 && (champ(c, TOTAL_RTO) & 0xffff) == 0,
+             "SYN sans reponse : tcpi_rehash suit les RTO ; AF_UNSPEC le garde, et les retransmissions");
+    close(c);
+    close(d);
+    close(l);
+}
+
 /* Un FIN puis un RST : la fin se lit (SOCK_DONE vient avant l'erreur), SO_ERROR dit EPIPE
  * (`tcp_reset` en CLOSE_WAIT), et l'écriture EPIPE. */
 static void fin_puis_rst(void)
@@ -2957,6 +3053,7 @@ int main(void)
     reglages();
     info_complete();
     files_d_une_connexion_finie();
+    ce_que_garde_la_socket();
     fin_puis_rst();
     arret_en_syn();
     arret_d_ecoute();
