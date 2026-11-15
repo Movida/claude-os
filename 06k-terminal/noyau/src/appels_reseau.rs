@@ -1478,7 +1478,7 @@ fn priorite_du_tos(tos: u8) -> u32 {
 /// (`udp_lib_setsockopt` : moins de 4 octets, EINVAL ; UDP_CORK, le
 /// bouchon d'udp.rs ; ENOPROTOOPT pour les autres, un écart pour
 /// UDP_SEGMENT et ses voisines) ; SOL_IP (`do_ip_setsockopt`) ; un autre
-/// niveau : ENOPROTOOPT.
+/// niveau : ENOPROTOOPT. Une socket AF_UNIX n'a que SOL_SOCKET.
 pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64) -> i64 {
     let (niveau, option, longueur) = (niveau as i32, option as i32, longueur as i32);
     en_i64((|| {
@@ -1487,6 +1487,12 @@ pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
             return Err(-EINVAL);
         }
         let s = o.socket();
+        // AF_UNIX n'a que SOL_SOCKET : ses opérations n'ont pas de
+        // `setsockopt` (`do_sock_setsockopt` : EOPNOTSUPP, pour tout autre
+        // niveau, même inconnu).
+        if s.protocole == Protocole::Unix && niveau != SOL_SOCKET {
+            return Err(-EOPNOTSUPP);
+        }
         match niveau {
             SOL_SOCKET => options_socket(s, option, valeur, longueur),
             // SOL_UDP n'est pas un niveau d'une socket de ping (elle va
@@ -2001,11 +2007,17 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
 /// écrite avant la valeur), ENOPROTOOPT pour les autres (un écart) ; un
 /// autre niveau va à IP
 /// (`do_ip_getsockopt`), qui rend EOPNOTSUPP pour ce qui n'est pas SOL_IP.
+/// Une socket AF_UNIX n'a que SOL_SOCKET.
 pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64) -> i64 {
     let (niveau, option) = (niveau as i32, option as i32);
     en_i64((|| {
         let o = tenir(fd)?;
         let s = o.socket();
+        // AF_UNIX : pas de `getsockopt` hors de SOL_SOCKET, comme à
+        // l'écriture, avant de lire la longueur (`do_sock_getsockopt`).
+        if s.protocole == Protocole::Unix && niveau != SOL_SOCKET {
+            return Err(-EOPNOTSUPP);
+        }
         let mut l = [0u8; 4];
         let lire_longueur = |l: &mut [u8; 4]| -> Result<i32, i64> {
             copier_depuis_utilisateur(l, longueur).map_err(|_| -EFAULT)?;

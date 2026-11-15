@@ -1,7 +1,8 @@
 /*
  * Les sockets AF_UNIX (6h), contre ce qu'en fait Linux 6.18 (mesuré, sonde
  * unix.c du plan de 6h), dans un dossier à soi de /tmp, effacé à la fin :
- *   - les sortes (SOCK_RAW devient SOCK_DGRAM, SOCK_RDM refusée) ; une
+ *   - les sortes (SOCK_RAW devient SOCK_DGRAM, SOCK_RDM refusée), et leurs
+ *     options hors de SOL_SOCKET (EOPNOTSUPP) ; une
  *     socket neuve (son nom vide, ses tampons, poll, send, recv, accept,
  *     listen sans nom) ;
  *   - bind d'un chemin (le fichier S_IFSOCK, 0777 moins l'umask ; le nom
@@ -26,6 +27,9 @@
 #define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -118,6 +122,23 @@ static void sortes(void)
     close(s);
     verifier(erreur(socket(AF_UNIX, SOCK_RDM, 0)) == ESOCKTNOSUPPORT, "SOCK_RDM : ESOCKTNOSUPPORT");
     verifier(erreur(socket(AF_UNIX, SOCK_STREAM, 2)) == EPROTONOSUPPORT, "le protocole 2 : EPROTONOSUPPORT");
+    /* Un autre niveau que SOL_SOCKET : EOPNOTSUPP, à l'écriture comme à la
+     * lecture (`do_sock_setsockopt`, `do_sock_getsockopt` : les opérations
+     * d'AF_UNIX n'ont ni `setsockopt` ni `getsockopt`), pour les trois
+     * sortes, même un niveau qui n'existe pas. */
+    const int genres[] = { SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET };
+    const int niveaux[][2] = { { IPPROTO_IP, IP_TOS }, { IPPROTO_TCP, TCP_NODELAY }, { IPPROTO_UDP, UDP_CORK }, { 9999, 1 } };
+    int ok = 1;
+    for (int g = 0; g < 3; g++)
+        for (int n = 0; n < 4; n++) {
+            s = socket(AF_UNIX, genres[g], 0);
+            int v = 1;
+            socklen_t l = sizeof v;
+            ok = ok && erreur(setsockopt(s, niveaux[n][0], niveaux[n][1], &v, sizeof v)) == EOPNOTSUPP;
+            ok = ok && erreur(getsockopt(s, niveaux[n][0], niveaux[n][1], &v, &l)) == EOPNOTSUPP && v == 1;
+            close(s);
+        }
+    verifier(ok, "SOL_IP, SOL_TCP, SOL_UDP et 9999 : EOPNOTSUPP, a l'ecriture et a la lecture");
 }
 
 static void neuve(void)
