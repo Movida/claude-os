@@ -90,7 +90,8 @@ use crate::faillible::{FileFaillible, VecFaillible};
 use crate::ordonnanceur;
 use crate::partage::Arc;
 use crate::processeur;
-use crate::processus::Entree;
+use crate::processus::Cible;
+use crate::temps::Mesure;
 use crate::tache::{self, Reveil, Tache};
 use crate::verrou::Verrou;
 use alloc::vec::Vec;
@@ -605,10 +606,24 @@ pub fn attendre_que(file: &FileAttente, inscription: Inscription, sommeil: Somme
 
 /// Les échéances des tâches qui dorment, triées.
 static MINUTERIES: Verrou<Vec<(u64, Arc<Tache>)>> = Verrou::new(Vec::new());
-/// Les attentes du temps de calcul (clock_nanosleep sur
-/// CLOCK_PROCESS_CPUTIME_ID) : le temps de calcul à atteindre, le processus
-/// dont le temps compte (tous ses fils), la tâche qui dort.
-static ATTENTES_CALCUL: Verrou<Vec<(u64, Arc<Entree>, Arc<Tache>)>> = Verrou::new(Vec::new());
+/// Les attentes du temps de calcul (clock_nanosleep sur une horloge de
+/// calcul) : chacune retirée par la tâche qui dort, à son réveil, jamais par
+/// le tic, qui ne fait que la réveiller (`reveillee`). Elle tient ce que vise
+/// son horloge (un autre fil, un autre processus), dont la dernière
+/// référence ne doit pas se rendre dans le tic, interruptions coupées : sa
+/// pile, sa mémoire se rendent ailleurs.
+static ATTENTES_CALCUL: Verrou<Vec<AttenteCalcul>> = Verrou::new(Vec::new());
+
+struct AttenteCalcul {
+    /// Le temps à atteindre.
+    echeance: u64,
+    /// Ce que vise l'horloge, et ce qu'elle compte.
+    cible: Cible,
+    mesure: Mesure,
+    /// La tâche qui dort.
+    tache: Arc<Tache>,
+    reveillee: bool,
+}
 
 /// Réserve les minuteries pour `max` tâches : elles ne grandissent jamais
 /// pendant un programme. Au démarrage.
@@ -633,30 +648,38 @@ fn annuler(t: &Tache) {
     }
 }
 
-/// La tâche courante dort jusqu'à ce que le temps de calcul du processus
-/// `compte` atteigne `cible` (le calcul de ses autres fils), ou un signal.
-/// Interruptions coupées.
+/// La tâche courante dort jusqu'à ce que le temps de `cible` selon `mesure`
+/// (une horloge de calcul : le calcul d'un processus, ou d'un autre fil)
+/// atteigne `echeance`, ou un signal. Interruptions coupées. L'appelant
+/// tient `cible` : l'attente retirée n'en lâche jamais la dernière
+/// référence.
 #[track_caller]
-pub fn dormir_calcul(compte: Arc<Entree>, cible: u64) -> Reveil {
+pub fn dormir_calcul(cible: &Cible, mesure: Mesure, echeance: u64) -> Reveil {
     let t = tache::courante();
     // « Je vais dormir » avant tout (l'en-tête), inscrite ensuite : le tic
-    // qui verra la cible atteinte nous réveillera, ou nous la verrons.
+    // qui verra l'échéance atteinte nous réveillera, ou nous la verrons.
     t.preparer_sommeil(Sommeil::Interruptible);
     // La place est réservée pour une attente par tâche (`initialiser`).
-    ATTENTES_CALCUL.verrouiller().ajouter_dans_la_place((cible, compte.clone(), tache::courante_arc()));
+    ATTENTES_CALCUL.verrouiller().ajouter_dans_la_place(AttenteCalcul {
+        echeance,
+        cible: cible.clone(),
+        mesure,
+        tache: tache::courante_arc(),
+        reveillee: false,
+    });
     if tache::signal_en_attente() {
         t.ne_dort_pas(Reveil::Signal);
-    } else if compte.temps_de_calcul() >= cible {
+    } else if cible.temps(mesure) >= echeance {
         t.ne_dort_pas(Reveil::Echeance);
     } else {
         ordonnanceur::ordonnancer(ordonnanceur::Bascule::Sommeil);
     }
-    {
+    // Retirée, puis lâchée hors du verrou.
+    let retiree = {
         let mut a = ATTENTES_CALCUL.verrouiller();
-        if let Some(i) = a.iter().position(|(_, _, x)| core::ptr::eq(Arc::as_ptr(x), t)) {
-            a.remove(i);
-        }
-    }
+        a.iter().position(|x| core::ptr::eq(Arc::as_ptr(&x.tache), t)).map(|i| a.remove(i))
+    };
+    drop(retiree);
     let r = t.raison_du_reveil();
     t.reveille();
     r
@@ -675,14 +698,10 @@ pub fn tic() {
     // Les minuteurs du noyau (minuteurs.rs : les timerfd), après celles des
     // tâches : chacun prend ses propres verrous.
     crate::minuteurs::tic(maintenant);
-    let mut a = ATTENTES_CALCUL.verrouiller();
-    let mut i = 0;
-    while i < a.len() {
-        if a[i].1.temps_de_calcul() >= a[i].0 {
-            let (_, _, t) = a.swap_remove(i);
-            tache::reveiller(t, Reveil::Echeance);
-        } else {
-            i += 1;
+    for a in ATTENTES_CALCUL.verrouiller().iter_mut() {
+        if !a.reveillee && a.cible.temps(a.mesure) >= a.echeance {
+            a.reveillee = true;
+            tache::reveiller(a.tache.clone(), Reveil::Echeance);
         }
     }
 }

@@ -560,6 +560,50 @@ fn entree(pid: u32) -> Option<Arc<Entree>> {
     TABLE.verrouiller().iter().find(|e| e.pid == pid).cloned()
 }
 
+/// Ce que vise une horloge de calcul, trouvé (temps.rs, `DeCalcul`).
+#[derive(Clone)]
+pub enum Cible {
+    /// Un fil : sa tâche.
+    Fil(Arc<Tache>),
+    /// Un processus, tous ses fils : son entrée.
+    Processus(Arc<Entree>),
+}
+
+impl Cible {
+    /// Le temps que lit son horloge de mesure `mesure` (le
+    /// `cpu_clock_sample` de Linux pour un fil, `cpu_clock_sample_group`
+    /// pour un processus). Des compteurs atomiques, sans verrou : le tic
+    /// le lit (attente.rs).
+    pub fn temps(&self, mesure: crate::temps::Mesure) -> u64 {
+        match self {
+            Cible::Fil(t) => crate::temps::mesurer(mesure, t.calcul(), t.usage().tics()),
+            Cible::Processus(e) => crate::temps::mesurer(mesure, e.temps_de_calcul(), e.tics()),
+        }
+    }
+}
+
+/// L'horloge de calcul `h`, vue de la tâche courante (le `pid_for_clock` de
+/// Linux) : le pid 0 vise le fil ou le processus courant ; sinon, pour un
+/// fil, l'un de ceux du processus courant, par son tid
+/// (`same_thread_group`) ; pour un processus, celui du pid, zombie compris
+/// (Linux le garde jusqu'à son recueil). Pour clock_gettime (`lecture`), le
+/// tid du fil courant nomme aussi son processus. None : rien de tel
+/// (EINVAL). Jamais sous le verrou des fichiers.
+pub fn cible_d_horloge(h: crate::temps::DeCalcul, lecture: bool) -> Option<Cible> {
+    let t = crate::tache::courante_arc();
+    let e = t.processus()?.clone();
+    if h.fil {
+        if h.pid == 0 || h.pid == t.tid() {
+            return Some(Cible::Fil(t));
+        }
+        return avec(|p| p.fil(h.pid).and_then(|f| f.tache.upgrade())).map(Cible::Fil);
+    }
+    if h.pid == 0 || (lecture && h.pid == t.tid()) {
+        return Some(Cible::Processus(e));
+    }
+    entree(h.pid).map(Cible::Processus)
+}
+
 /// Ce que /proc montre d'un processus : son identité, quand il a été lancé,
 /// s'il est un zombie.
 pub fn vu_de_proc(pid: u32) -> Option<(Identite, fichiers::Temps, bool)> {

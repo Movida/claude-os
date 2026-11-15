@@ -205,7 +205,7 @@ pub fn initialiser() -> Option<(i64, i64, i64, i64, i64, i64)> {
     Some((annee, mois, jour, heure, minute, seconde))
 }
 
-fn depuis_nanosecondes(ns: u64) -> Temps {
+pub fn depuis_nanosecondes(ns: u64) -> Temps {
     Temps { secondes: (ns / 1_000_000_000) as i64, nanosecondes: (ns % 1_000_000_000) as u32 }
 }
 
@@ -306,8 +306,8 @@ pub const CLOCK_BOOTTIME: u64 = 7;
 pub const CLOCK_TAI: u64 = 11;
 
 /// L'horloge `horloge` de Linux, si on la connaît. Les horloges des alarmes
-/// (CLOCK_*_ALARM, qui réveillent une machine en veille) et celles d'un
-/// autre processus (les numéros négatifs de clock_getcpuclockid) : non.
+/// (CLOCK_*_ALARM, qui réveillent une machine en veille) : non ; les
+/// numéros négatifs non plus (les horloges de calcul encodées : `genre`).
 pub fn horloge(horloge: u64) -> Option<Temps> {
     match horloge {
         CLOCK_REALTIME | CLOCK_TAI => Some(maintenant()),
@@ -317,5 +317,103 @@ pub fn horloge(horloge: u64) -> Option<Temps> {
         CLOCK_PROCESS_CPUTIME_ID => Some(temps_du_programme()),
         CLOCK_THREAD_CPUTIME_ID => Some(temps_du_fil()),
         _ => None,
+    }
+}
+
+/// Ce que compte une horloge de calcul (le CPUCLOCK_WHICH de Linux : les
+/// deux bits du bas de son numéro).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mesure {
+    /// CPUCLOCK_PROF : le temps en anneau 3 et dans le noyau, compté au tic
+    /// (utime + stime : celui d'ITIMER_PROF).
+    Prof,
+    /// CPUCLOCK_VIRT : le temps en anneau 3, au tic (utime : celui
+    /// d'ITIMER_VIRTUAL).
+    Virt,
+    /// CPUCLOCK_SCHED : le temps de calcul exact (le `sum_exec_runtime` :
+    /// celui de CLOCK_PROCESS_CPUTIME_ID et de CLOCK_THREAD_CPUTIME_ID).
+    Sched,
+}
+
+/// Le temps que lit une horloge de mesure `mesure`, d'après le temps de
+/// calcul exact et les tics (en anneau 3, dans le noyau). Un tic compte
+/// TIC_NS, comme sous Linux avec CONFIG_TICK_CPU_ACCOUNTING
+/// (`account_process_tick`, qui ajoute TICK_NSEC à utime ou à stime).
+pub fn mesurer(mesure: Mesure, exact: u64, (programme, noyau): (u64, u64)) -> u64 {
+    match mesure {
+        Mesure::Sched => exact,
+        Mesure::Prof => programme.saturating_add(noyau).saturating_mul(TIC_NS),
+        Mesure::Virt => programme.saturating_mul(TIC_NS),
+    }
+}
+
+/// La durée d'un tic du temps compté au tic (le TICK_NSEC de Linux,
+/// `(NSEC_PER_SEC + HZ / 2) / HZ`) : un HZ de 1000 en donne une
+/// milliseconde juste, quand le tic du PIT dure un peu moins (`duree_tic`).
+pub const TIC_NS: u64 = (1_000_000_000 + horloge::HZ as u64 / 2) / horloge::HZ as u64;
+
+/// Une horloge de calcul (le posix-cpu-timers.c de Linux). Son numéro,
+/// négatif, porte le pid ou le tid visé (complémenté, décalé de trois
+/// bits : le CPUCLOCK_PID ; 0, le processus ou le fil courant), s'il vise
+/// un fil (le bit 2) et la mesure (les bits 0 et 1). C'est ce que rendent
+/// clock_getcpuclockid et pthread_getcpuclockid, et ce que la glibc passe
+/// à clock_nanosleep et à timer_create pour CLOCK_PROCESS_CPUTIME_ID et
+/// CLOCK_THREAD_CPUTIME_ID (-6 et -2 : le pid 0, SCHED ; mesuré par strace
+/// avec la glibc 2.39) ; à clock_gettime et clock_getres, elle passe 2 et
+/// 3, deux abréviations des mêmes (`posix_clocks`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct DeCalcul {
+    pub pid: u32,
+    pub fil: bool,
+    pub mesure: Mesure,
+}
+
+impl DeCalcul {
+    /// CLOCK_PROCESS_CPUTIME_ID.
+    pub const PROCESSUS: DeCalcul = DeCalcul { pid: 0, fil: false, mesure: Mesure::Sched };
+}
+
+/// Ce qu'est un numéro d'horloge, trié comme le fait `clockid_to_kclock`.
+pub enum Genre {
+    /// Positif : une horloge nommée (CLOCK_*, `horloge`), connue ou non.
+    Nommee(u64),
+    /// Négatif : une horloge de calcul ; None pour une mesure inconnue (3,
+    /// avec le bit du fil), que `pid_for_clock` refuse (EINVAL).
+    Calcul(Option<DeCalcul>),
+    /// Négatif, les trois bits du bas à 3 (CLOCKFD) : l'horloge d'un
+    /// descripteur ouvert, une horloge PTP (/dev/ptp*). Nous n'en avons pas
+    /// (aucun descripteur n'est une horloge : `get_clock_desc` rend EINVAL),
+    /// et, comme chez Linux, elles n'ont ni attente ni minuteur
+    /// (`clock_posix_dynamic` : EOPNOTSUPP).
+    Descripteur,
+}
+
+/// Le genre du numéro d'horloge `h` (un clockid_t : un int).
+pub fn genre(h: u64) -> Genre {
+    let h = h as u32 as i32;
+    if h >= 0 {
+        return Genre::Nommee(h as u64);
+    }
+    if h & 7 == 3 {
+        return Genre::Descripteur;
+    }
+    let mesure = match h & 3 {
+        0 => Mesure::Prof,
+        1 => Mesure::Virt,
+        2 => Mesure::Sched,
+        _ => return Genre::Calcul(None),
+    };
+    // Le décalage d'un nombre négatif est arithmétique : son complément va
+    // de 0 à 2^28 - 1.
+    Genre::Calcul(Some(DeCalcul { pid: !(h >> 3) as u32, fil: h & 4 != 0, mesure }))
+}
+
+/// La finesse d'une horloge de calcul (`posix_cpu_clock_getres`) : celle
+/// du temps de calcul exact pour SCHED (`resolution`), un tic pour PROF et
+/// VIRT (Linux : `(NSEC_PER_SEC + HZ - 1) / HZ`).
+pub fn resolution_du_calcul(mesure: Mesure) -> Temps {
+    match mesure {
+        Mesure::Sched => resolution(CLOCK_PROCESS_CPUTIME_ID),
+        _ => Temps { secondes: 0, nanosecondes: 1_000_000_000u32.div_ceil(horloge::HZ) },
     }
 }

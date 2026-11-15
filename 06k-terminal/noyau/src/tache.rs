@@ -503,6 +503,11 @@ impl Tache {
         self.affinite.store(masque, Ordering::Relaxed);
     }
 
+    /// Son temps de calcul, en nanosecondes (CLOCK_THREAD_CPUTIME_ID).
+    pub fn calcul(&self) -> u64 {
+        self.calcul.load(Ordering::Relaxed)
+    }
+
     /// Son numéro de fil (0 : une tâche du noyau).
     pub fn tid(&self) -> u32 {
         self.tid

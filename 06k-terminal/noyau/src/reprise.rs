@@ -52,10 +52,10 @@ const RESTART_SYSCALL: u64 = 219;
 #[derive(Clone, Copy)]
 pub enum Reprise {
     /// Un sommeil relatif (nanosleep, clock_nanosleep sans TIMER_ABSTIME),
-    /// jusqu'à son échéance devenue absolue : en temps monotone, ou en temps
-    /// de calcul du processus (`calcul`) ; le temps restant à écrire en
-    /// `reste` s'il est de nouveau interrompu.
-    Sommeil { calcul: bool, cible: u64, reste: u64 },
+    /// jusqu'à son échéance devenue absolue : en temps monotone, ou sur une
+    /// horloge de calcul (`calcul`) ; le temps restant à écrire en `reste`
+    /// s'il est de nouveau interrompu.
+    Sommeil { calcul: Option<crate::temps::DeCalcul>, cible: u64, reste: u64 },
     /// Un futex attendu avec un délai, jusqu'à son échéance absolue (sur
     /// CLOCK_REALTIME si `reelle`).
     Futex { adresse: u64, partage: bool, val: u32, reelle: bool, echeance: i128, bitset: u32 },

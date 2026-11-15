@@ -63,7 +63,7 @@ use crate::partage::Arc;
 use crate::processus::{self, Processus};
 use crate::signaux::{self, Destinataire, Info};
 use crate::tache::{self, Tache};
-use crate::temps;
+use crate::temps::{self, Mesure, TIC_NS};
 
 const EINVAL: i64 = 22;
 const EFAULT: i64 = 14;
@@ -73,8 +73,6 @@ const SIGVTALRM: u64 = 26;
 const SIGPROF: u64 = 27;
 
 const NS_PAR_S: u64 = 1_000_000_000;
-/// Une période d'horloge (le TICK_NSEC de Linux).
-const TIC_NS: u64 = NS_PAR_S / crate::horloge::HZ as u64;
 
 /// Les indices des alarmes de calcul : ceux de Linux (CPUCLOCK_PROF,
 /// CPUCLOCK_VIRT).
@@ -185,9 +183,10 @@ pub fn verifier_calcul(p: &mut Processus, tics: (u64, u64)) -> [Option<Arc<Tache
 }
 
 /// Le temps de calcul du processus, en ns, pour chaque alarme de calcul
-/// (les `samples` de Linux : PROF, programme et noyau ; VIRT, programme).
-fn echantillons((programme, noyau): (u64, u64)) -> [u64; 2] {
-    [programme.saturating_add(noyau).saturating_mul(TIC_NS), programme.saturating_mul(TIC_NS)]
+/// (les `samples` de Linux : PROF, programme et noyau ; VIRT, programme) :
+/// celui de ses horloges de calcul PROF et VIRT (temps.rs).
+fn echantillons(tics: (u64, u64)) -> [u64; 2] {
+    [temps::mesurer(Mesure::Prof, 0, tics), temps::mesurer(Mesure::Virt, 0, tics)]
 }
 
 /// La période et la valeur d'une alarme (ns) : le temps qui reste.

@@ -79,6 +79,12 @@ impl Compteurs {
         c.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Ses tics : (en anneau 3, dans le noyau). Pour ses horloges de calcul
+    /// PROF et VIRT (temps.rs).
+    pub fn tics(&self) -> (u64, u64) {
+        (self.tics_programme.load(Ordering::Relaxed), self.tics_noyau.load(Ordering::Relaxed))
+    }
+
     /// Une faute de page servie pour elle.
     pub fn compter_faute(&self) {
         self.fautes.fetch_add(1, Ordering::Relaxed);

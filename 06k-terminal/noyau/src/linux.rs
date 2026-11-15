@@ -1399,17 +1399,20 @@ fn sysinfo(info: u64) -> i64 {
 /// reste) (sur CLOCK_MONOTONIC, comme Linux) : dormir une durée, ou
 /// jusqu'à une échéance absolue (TIMER_ABSTIME), dans l'ordre de Linux
 /// (kernel/time/posix-timers.c), mesuré sur 6.18 :
-///   1. l'horloge : REALTIME, MONOTONIC, BOOTTIME, TAI et
-///      PROCESS_CPUTIME_ID dorment ; THREAD_CPUTIME_ID, MONOTONIC_RAW et
-///      les _COARSE n'ont pas d'attente (EOPNOTSUPP) ; une inconnue, EINVAL
-///      (les numéros négatifs, horloges de calcul d'un autre processus ou
-///      d'un fil, que Linux accepte : EINVAL chez nous, un écart) ;
+///   1. l'horloge : REALTIME, MONOTONIC, BOOTTIME, TAI, PROCESS_CPUTIME_ID
+///      et les horloges de calcul encodées (les numéros négatifs,
+///      `temps::genre`) dorment ; THREAD_CPUTIME_ID, MONOTONIC_RAW, les
+///      _COARSE et les horloges des descripteurs n'ont pas d'attente
+///      (EOPNOTSUPP) ; une inconnue, EINVAL ;
 ///   2. la durée lue (EFAULT), puis vérifiée (EINVAL : secondes négatives,
 ///      nanosecondes hors de [0, 10^9[) ;
 ///   3. les horloges des alarmes (REALTIME_ALARM, BOOTTIME_ALARM) : un
 ///      drapeau inconnu, EINVAL ; sinon il faudrait pouvoir réveiller la
 ///      machine (CAP_WAKE_ALARM) : EPERM. Pour les autres, les drapeaux
-///      autres que TIMER_ABSTIME sont ignorés ;
+///      autres que TIMER_ABSTIME sont ignorés. Une horloge de calcul : celle
+///      du fil lui-même, EINVAL (il ne calcule plus pendant qu'il dort :
+///      `posix_cpu_nsleep`), et celle qui ne vise personne aussi
+///      (`posix_cpu_timer_create`) ;
 ///   4. dormir, interruptible (`sommeil`) ; une échéance atteinte, même
 ///      avec un signal en attente : 0 (le sommeil a réussi, le signal sera
 ///      livré au retour : `do_nanosleep`, `do_cpu_nanosleep`). Un signal
@@ -1421,19 +1424,29 @@ fn sysinfo(info: u64) -> i64 {
 ///      rien n'est écrit, et ERESTARTNOHAND (refait tel quel sans
 ///      gestionnaire : `hrtimer_nanosleep`, reprise.rs).
 /// L'attente se fait au tic qui suit l'échéance, jamais avant (attente.rs).
-/// Sur CLOCK_PROCESS_CPUTIME_ID, on attend que le temps de calcul du
-/// processus atteigne l'échéance : un programme d'un seul fil qui dort ne
-/// calcule plus, il attend pour toujours (mesuré sous Linux).
+/// Sur une horloge de calcul, on attend que le temps de calcul de ce
+/// qu'elle vise (un processus, ou un autre fil du processus) atteigne
+/// l'échéance : un programme d'un seul fil qui dort sur
+/// CLOCK_PROCESS_CPUTIME_ID ne calcule plus, il attend pour toujours
+/// (mesuré sous Linux).
 fn clock_nanosleep(horloge: u64, drapeaux: u64, duree: u64, reste: u64) -> i64 {
     const TIMER_ABSTIME: u64 = 1;
     const CLOCK_REALTIME_ALARM: u64 = 8;
     const CLOCK_BOOTTIME_ALARM: u64 = 9;
     use temps::{CLOCK_BOOTTIME, CLOCK_MONOTONIC, CLOCK_MONOTONIC_COARSE, CLOCK_MONOTONIC_RAW, CLOCK_PROCESS_CPUTIME_ID, CLOCK_REALTIME,
                 CLOCK_REALTIME_COARSE, CLOCK_TAI, CLOCK_THREAD_CPUTIME_ID};
-    let alarme = matches!(horloge, CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM);
-    match horloge {
-        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI | CLOCK_PROCESS_CPUTIME_ID => {}
-        _ if alarme => {}
+    // L'horloge ; pour une horloge de calcul, la sienne (None : une mesure
+    // inconnue, refusée après la durée, comme chez Linux).
+    let (h, calcul) = match temps::genre(horloge) {
+        temps::Genre::Nommee(CLOCK_PROCESS_CPUTIME_ID) => (CLOCK_PROCESS_CPUTIME_ID, Some(Some(temps::DeCalcul::PROCESSUS))),
+        temps::Genre::Nommee(h) => (h, None),
+        temps::Genre::Calcul(c) => (0, Some(c)),
+        temps::Genre::Descripteur => return -EOPNOTSUPP,
+    };
+    let alarme = matches!(h, CLOCK_REALTIME_ALARM | CLOCK_BOOTTIME_ALARM);
+    match h {
+        _ if calcul.is_some() || alarme => {}
+        CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_BOOTTIME | CLOCK_TAI => {}
         CLOCK_THREAD_CPUTIME_ID | CLOCK_MONOTONIC_RAW | CLOCK_REALTIME_COARSE | CLOCK_MONOTONIC_COARSE => return -EOPNOTSUPP,
         _ => return -EINVAL,
     }
@@ -1443,46 +1456,53 @@ fn clock_nanosleep(horloge: u64, drapeaux: u64, duree: u64, reste: u64) -> i64 {
     }
     let secondes = i64::from_le_bytes(o[..8].try_into().unwrap_or([0; 8]));
     let nanosecondes = i64::from_le_bytes(o[8..].try_into().unwrap_or([0; 8]));
-    if secondes < 0 || !(0..1_000_000_000).contains(&nanosecondes) {
-        return -EINVAL;
-    }
+    // Vérifiée, puis ramenée à KTIME_MAX (`timespec64_to_ktime`).
+    let Some(demande) = temps::duree(secondes, nanosecondes) else { return -EINVAL };
     if alarme {
         return if drapeaux & !TIMER_ABSTIME != 0 { -EINVAL } else { -EPERM };
     }
-    let demande = (secondes as u128 * 1_000_000_000 + nanosecondes as u128).min(u64::MAX as u128) as u64;
     let absolue = drapeaux & TIMER_ABSTIME != 0;
-    let calcul = horloge == CLOCK_PROCESS_CPUTIME_ID;
-    let cible = if calcul {
-        if absolue { demande } else { tache::temps_du_processus().saturating_add(demande) }
-    } else {
-        // L'échéance en temps monotone : les horloges de dates (REALTIME,
-        // TAI) ne diffèrent du temps monotone que d'un écart fixe (la date
-        // ne se règle pas encore).
-        let mono = temps::ns_monotone();
-        if !absolue {
-            mono.saturating_add(demande)
-        } else if matches!(horloge, CLOCK_REALTIME | CLOCK_TAI) {
-            let reel = temps::maintenant();
-            let reel = reel.secondes as i128 * 1_000_000_000 + reel.nanosecondes as i128;
-            (demande as i128 - reel + mono as i128).clamp(0, u64::MAX as i128) as u64
-        } else {
-            demande
+    let reste = if absolue { None } else { Some(reste) };
+    if let Some(c) = calcul {
+        let Some(c) = c else { return -EINVAL };
+        if c.fil && (c.pid == 0 || c.pid == tache::courante().tid()) {
+            return -EINVAL;
         }
+        let Some(qui) = processus::cible_d_horloge(c, false) else { return -EINVAL };
+        // Une échéance relative part du temps de calcul de maintenant
+        // (`posix_cpu_timer_set`).
+        let cible = if absolue { demande } else { qui.temps(c.mesure).saturating_add(demande) };
+        return sommeil(Some((c, qui)), cible, reste);
+    }
+    // L'échéance en temps monotone : les horloges de dates (REALTIME, TAI)
+    // n'en diffèrent que d'un écart fixe (la date ne se règle pas encore).
+    // Relative, au plus le KTIME_MAX de la base de l'attente
+    // (`ktime_add_safe`) : celle de l'horloge, sauf REALTIME, qui dort dans
+    // la base MONOTONIC (minuteurs.rs, l'en-tête) ; une échéance passée est
+    // servie tout de suite.
+    let decalage = if h == CLOCK_TAI || (h == CLOCK_REALTIME && absolue) { temps::decalage_de_la_date() } else { 0 };
+    let mono = temps::ns_monotone();
+    let cible = if !absolue {
+        (mono as i64).saturating_add_unsigned(demande).min((temps::KTIME_MAX as i64).saturating_sub(decalage))
+    } else {
+        (demande as i64).saturating_sub(decalage)
     };
-    sommeil(calcul, cible, if absolue { None } else { Some(reste) })
+    let cible = cible.max(0) as u64;
+    sommeil(None, cible, reste)
 }
 
-/// Dort jusqu'à `cible` (temps monotone, ou temps de calcul du processus si
-/// `calcul`), interruptible. Un signal : pour un sommeil relatif (`reste`
-/// donné), le temps qui restait écrit (si l'adresse n'est pas nulle), et la
-/// reprise gardée pour restart_syscall : ERESTART_RESTARTBLOCK ; pour une
-/// échéance absolue, ERESTARTNOHAND.
-fn sommeil(calcul: bool, cible: u64, reste: Option<u64>) -> i64 {
+/// Dort jusqu'à `cible` : en temps monotone, ou, pour une horloge de calcul
+/// (`calcul`), le temps de ce qu'elle vise. Interruptible. Un signal : pour
+/// un sommeil relatif (`reste` donné), le temps qui restait écrit (si
+/// l'adresse n'est pas nulle), et la reprise gardée pour restart_syscall :
+/// ERESTART_RESTARTBLOCK ; pour une échéance absolue, ERESTARTNOHAND. Ce
+/// que vise l'horloge est lâché à la fin, interruptions rétablies : sa
+/// dernière référence peut rendre un fil ou un processus.
+fn sommeil(calcul: Option<(temps::DeCalcul, processus::Cible)>, cible: u64, reste: Option<u64>) -> i64 {
     let interruptions = cpu::couper_interruptions();
-    let (reveil, restant) = if calcul {
-        let compte = tache::courante().processus().cloned().expect("appel systeme sans processus");
-        let r = crate::attente::dormir_calcul(compte, cible);
-        (r, cible.saturating_sub(tache::temps_du_processus()))
+    let (reveil, restant) = if let Some((c, qui)) = &calcul {
+        let r = crate::attente::dormir_calcul(qui, c.mesure, cible);
+        (r, cible.saturating_sub(qui.temps(c.mesure)))
     } else {
         let t = tache::courante();
         let r = loop {
@@ -1516,13 +1536,22 @@ fn sommeil(calcul: bool, cible: u64, reste: Option<u64>) -> i64 {
             return -EFAULT;
         }
     }
-    crate::reprise::garder(crate::reprise::Reprise::Sommeil { calcul, cible, reste });
+    crate::reprise::garder(crate::reprise::Reprise::Sommeil { calcul: calcul.map(|(c, _)| c), cible, reste });
     -crate::reprise::ERESTART_RESTARTBLOCK
 }
 
 /// La reprise d'un sommeil relatif par restart_syscall (reprise.rs) :
 /// jusqu'à la même échéance (le `hrtimer_nanosleep_restart` de Linux).
-pub fn reprendre_sommeil(calcul: bool, cible: u64, reste: u64) -> i64 {
+/// L'horloge de calcul est cherchée de nouveau, comme le fait
+/// `posix_cpu_nsleep_restart` : ce qu'elle visait a pu finir (EINVAL).
+pub fn reprendre_sommeil(calcul: Option<temps::DeCalcul>, cible: u64, reste: u64) -> i64 {
+    let calcul = match calcul {
+        None => None,
+        Some(c) => match processus::cible_d_horloge(c, false) {
+            Some(qui) => Some((c, qui)),
+            None => return -EINVAL,
+        },
+    };
     sommeil(calcul, cible, Some(reste))
 }
 
@@ -1536,11 +1565,20 @@ fn ecrire_timespec(adresse: u64, t: fichiers::Temps) -> Result<(), ()> {
 }
 
 /// clock_gettime(horloge, temps) : l'heure d'une des horloges de Linux
-/// (temps.rs). Une horloge inconnue : EINVAL. Sous Linux, la glibc passe
-/// d'ordinaire par le vDSO, une page du noyau projetée chez le programme
-/// qui lit l'heure sans appel système ; sans vDSO (6n), elle fait l'appel.
+/// (temps.rs), ou le temps d'une horloge de calcul (`temps::genre`) : celle
+/// d'un fil du processus, ou d'un processus. Une horloge inconnue, ou qui
+/// ne vise personne : EINVAL. Sous Linux, la glibc passe d'ordinaire par
+/// le vDSO, une page du noyau projetée chez le programme qui lit l'heure
+/// sans appel système ; sans vDSO (6n), elle fait l'appel.
 fn clock_gettime(horloge: u64, adresse: u64) -> i64 {
-    let Some(t) = temps::horloge(horloge) else { return -EINVAL };
+    let t = match temps::genre(horloge) {
+        temps::Genre::Nommee(h) => temps::horloge(h),
+        temps::Genre::Calcul(Some(c)) => {
+            processus::cible_d_horloge(c, true).map(|qui| temps::depuis_nanosecondes(qui.temps(c.mesure)))
+        }
+        temps::Genre::Calcul(None) | temps::Genre::Descripteur => None,
+    };
+    let Some(t) = t else { return -EINVAL };
     match ecrire_timespec(adresse, t) {
         Ok(()) => 0,
         Err(()) => -EFAULT,
@@ -1549,16 +1587,23 @@ fn clock_gettime(horloge: u64, adresse: u64) -> i64 {
 
 /// clock_getres(horloge, resolution) : la finesse de l'horloge (Linux rend
 /// une nanoseconde pour ses horloges fines, la durée d'un tic pour les
-/// _COARSE ; voir temps::resolution). Le résultat peut ne pas être
-/// demandé (adresse nulle).
+/// _COARSE ; voir temps::resolution ; et pour les horloges de calcul,
+/// temps::resolution_du_calcul). Le résultat peut ne pas être demandé
+/// (adresse nulle) : c'est ainsi que clock_getcpuclockid de la glibc
+/// vérifie qu'un pid a une horloge (EINVAL : ESRCH pour le programme).
 fn clock_getres(horloge: u64, adresse: u64) -> i64 {
-    if temps::horloge(horloge).is_none() {
-        return -EINVAL;
-    }
+    let resolution = match temps::genre(horloge) {
+        temps::Genre::Nommee(h) => temps::horloge(h).map(|_| temps::resolution(h)),
+        temps::Genre::Calcul(Some(c)) => {
+            processus::cible_d_horloge(c, false).map(|_| temps::resolution_du_calcul(c.mesure))
+        }
+        temps::Genre::Calcul(None) | temps::Genre::Descripteur => None,
+    };
+    let Some(resolution) = resolution else { return -EINVAL };
     if adresse == 0 {
         return 0;
     }
-    match ecrire_timespec(adresse, temps::resolution(horloge)) {
+    match ecrire_timespec(adresse, resolution) {
         Ok(()) => 0,
         Err(()) => -EFAULT,
     }
