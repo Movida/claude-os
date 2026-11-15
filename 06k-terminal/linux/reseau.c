@@ -59,7 +59,8 @@
  *     qui le scénario envoie des segments (le Makefile vérifie les
  *     réponses), et deux erreurs ICMP qui portent des extensions (RFC 4884 :
  *     IP_RECVERR_RFC4884, le `ee_data` de l'erreur en file) ; le filtre
- *     de la carte (la trame d'un groupe qu'on n'a pas, jetée).
+ *     de la carte (la trame d'un groupe qu'on n'a pas, jetée), et
+ *     SO_NO_CHECK (un datagramme sans somme, lu par le Makefile).
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic du noyau : HZ = 250 sous WSL, 1000 sous le Linux de référence).
  */
@@ -3553,6 +3554,19 @@ static int carte(void)
     verifier(icmp_fautes == 1, "carte, redirections d'un en-tete de 4 mots : UDP compte InErrors, ping non");
     if (icmp_fautes != 1)
         printf("[linux] reseau :   Icmp InErrors %ld\n", icmp_fautes);
+    /* SO_NO_CHECK : deux datagrammes de 10 octets vers 10.0.2.77, port 9
+     * (la machine sait où il est), du port 4004 : sans somme (0), puis
+     * l'option retirée, avec. L'option est lue à l'envoi. Le Makefile les
+     * lit dans l'enregistrement de la carte (outils/udp.awk). */
+    int nc = udp(0);
+    struct sockaddr_in na = adresse(0, 4004), nd = adresse(0x0a00024d, 9);
+    int zero = 0;
+    ok = bind(nc, (struct sockaddr *)&na, sizeof na) == 0 && setsockopt(nc, SOL_SOCKET, SO_NO_CHECK, &un, sizeof un) == 0;
+    ok = ok && sendto(nc, "sans somme", 10, 0, (struct sockaddr *)&nd, sizeof nd) == 10;
+    ok = ok && setsockopt(nc, SOL_SOCKET, SO_NO_CHECK, &zero, sizeof zero) == 0;
+    ok = ok && sendto(nc, "avec somme", 10, 0, (struct sockaddr *)&nd, sizeof nd) == 10;
+    verifier(ok, "carte, SO_NO_CHECK : un datagramme envoye sans somme, puis un avec");
+    close(nc);
     char proc_igmp[1024];
     contenu("/proc/net/igmp", proc_igmp, sizeof proc_igmp);
     ok_mc = strstr(proc_igmp, "eth0      :     2      V2\n\t\t\t\t030201EF     1 0:00000000\t\t1\n") != NULL;

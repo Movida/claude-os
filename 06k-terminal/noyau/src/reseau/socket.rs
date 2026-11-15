@@ -301,9 +301,10 @@ pub struct Options {
     pub reuseport: bool,
     pub broadcast: bool,
     pub keepalive: bool,
-    /// SO_DEBUG (root seul), SO_OOBINLINE et SO_NO_CHECK : gardés et
-    /// relus, sans effet sur UDP ; SO_DONTROUTE : seulement les machines
-    /// d'un réseau directement branché (datagramme::router).
+    /// SO_DEBUG (root seul) et SO_OOBINLINE : gardés et relus, sans effet
+    /// sur UDP ; SO_NO_CHECK : UDP envoie sans somme (udp.rs, `emettre`) ;
+    /// SO_DONTROUTE : seulement les machines d'un réseau directement
+    /// branché (datagramme::router).
     pub debug: bool,
     pub dontroute: bool,
     pub oobinline: bool,

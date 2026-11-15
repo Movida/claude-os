@@ -193,6 +193,12 @@ fn udp_abime() {
     o[8..12].copy_from_slice(b"abcd");
     udp::ecrire(&mut o[..12], &udp::Udp { source: 1, destination: 2 }, [1, 2, 3, 4], [5, 6, 7, 8]);
     assert_eq!(udp::lire(&o, [1, 2, 3, 4], [5, 6, 7, 8]).unwrap().1, b"abcd");
+    // Sans somme (SO_NO_CHECK) : 0, lu d'où qu'il vienne.
+    let somme = [o[6], o[7]];
+    udp::ecrire_sans_somme(&mut o[..12], &udp::Udp { source: 1, destination: 2 });
+    assert_eq!((o[4..6].to_vec(), o[6..8].to_vec()), (vec![0, 12], vec![0, 0]));
+    assert_ne!(somme, [0, 0]);
+    assert_eq!(udp::lire(&o, [9, 9, 9, 9], [5, 6, 7, 8]).unwrap(), (udp::Udp { source: 1, destination: 2 }, &b"abcd"[..]));
 }
 
 #[test]

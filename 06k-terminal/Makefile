@@ -1602,7 +1602,7 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	done; \
 	[ "$$n" = 6 ] || { echo "ICMP par machine : $${n:-aucune mesure,} erreurs pour 20 datagrammes (6 attendues) : ECHEC"; exit 1; }; \
 	echo "ICMP par machine : 6 erreurs pour 20 datagrammes : ok"
-	rm -f test-carte.log test-carte.pcap $(MON_TESTS); segments=; fin=; tcp=; igmp=; \
+	rm -f test-carte.log test-carte.pcap $(MON_TESTS); segments=; fin=; tcp=; igmp=; udp=; \
 	for essai in 1 2 3 4 5; do \
 	  port=$$(( 20000 + ($$$$ * 37 + essai * 7907) % 40000 )); \
 	  $(QEMU_TEST) -netdev user,id=u0,hostfwd=udp:127.0.0.1:$$port-:4000 -netdev hubport,id=h0,hubid=0,netdev=u0 \
@@ -1622,7 +1622,8 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	      for i in $$(seq $$(( $(DUREE) * 10 ))); do \
 	        grep -qE "reseau carte : (ECHEC|toutes les verifications : ok)" test-carte.log && { fin=1; break; }; sleep 0.1; done; \
 	    [ -n "$$fin" ] && tcp=$$(od -An -v -tu1 test-carte.pcap | awk -f outils/segments-tcp.awk | LC_ALL=C sort -u) \
-	      && igmp=$$(od -An -v -tu1 test-carte.pcap | awk -f outils/igmp.awk); }; \
+	      && igmp=$$(od -An -v -tu1 test-carte.pcap | awk -f outils/igmp.awk) \
+	      && udp=$$(od -An -v -tu1 test-carte.pcap | awk -v vers=10.0.2.77 -f outils/udp.awk); }; \
 	  kill $$q 2>/dev/null; wait $$q 2>/dev/null; break; \
 	done; \
 	grep -F "[linux] reseau" test-carte.log; \
@@ -1635,7 +1636,11 @@ tests-qemu: test-garde.bin test-gros.bin test-programmes.bin test-tsc.bin test-r
 	attendu="$$v3 {4 239.1.2.3} somme juste|$$v3 {4 239.1.2.3} somme juste|$$v3 {2 239.1.2.3} somme juste|01:00:5e:01:02:03 10.0.2.15>239.1.2.3 tos c0 ttl 1 df 1 id 0 ihl 24 opt 94 04 00 00 type 16 groupe 239.1.2.3 somme juste|01:00:5e:00:00:02 10.0.2.15>224.0.0.2 tos c0 ttl 1 df 1 id 0 ihl 24 opt 94 04 00 00 type 17 groupe 239.1.2.3 somme juste"; \
 	[ "$$(echo "$$igmp" | tr '\n' '|')" = "$$attendu|" ] || { echo "les messages IGMP de la carte :"; echo "$$igmp"; \
 	  echo "attendu :"; echo "$$attendu" | tr '|' '\n'; echo "la carte, IGMP : ECHEC"; exit 1; }; \
-	echo "la carte, IGMP (deux TO_EX a l'adhesion, IS_EX a la requete v3, le rapport v2 a la requete v2, le depart v2) : ok"
+	echo "la carte, IGMP (deux TO_EX a l'adhesion, IS_EX a la requete v3, le rapport v2 a la requete v2, le depart v2) : ok"; \
+	attendu="10.0.2.15:4004>10.0.2.77:9 longueur 18 somme nulle|10.0.2.15:4004>10.0.2.77:9 longueur 18 somme juste"; \
+	[ "$$(echo "$$udp" | tr '\n' '|')" = "$$attendu|" ] || { echo "les datagrammes UDP de la carte :"; echo "$$udp"; \
+	  echo "attendu :"; echo "$$attendu" | tr '|' '\n'; echo "la carte, SO_NO_CHECK : ECHEC"; exit 1; }; \
+	echo "la carte, SO_NO_CHECK (un datagramme sans somme, puis un avec) : ok"
 	$(call attendre,$(QEMU_TEST) -nic none $(QEMU_ALEA) -drive format=raw$(,)file=sans-reseau.bin -serial file:test-sans-reseau.log,test-sans-reseau.log,"[noyau] passerelle : termine",:)
 	grep -F "[linux] passerelle : toutes les verifications (sans reseau) : ok" test-sans-reseau.log
 	rm -f test-lien.log $(MON_TESTS); \

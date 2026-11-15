@@ -321,10 +321,16 @@ pub fn pousser(inet: &mut Inet) {
 /// Le segment `p` (la place de l'en-tête UDP, puis les données) part vers
 /// `d`, au port `port` (`udp_send_skb`), sous le `Mutex` : l'en-tête IPv4
 /// d'alors (`Depart::envoi`), l'en-tête UDP (le port de la socket d'alors)
-/// et sa somme, sur tout le segment.
+/// et sa somme, sur tout le segment ; avec SO_NO_CHECK d'alors, aucune
+/// (`sk_no_check_tx` : 0, CHECKSUM_NONE ; mesuré, une socket brute).
 fn emettre(inet: &mut Inet, d: &Depart, port: u16, mut p: Paquet) {
     let envoi = d.envoi(inet, p.longueur(), format_ipv4::UDP);
-    udp::ecrire(p.donnees_mut(), &udp::Udp { source: inet.port, destination: port }, envoi.source, envoi.destination);
+    let u = udp::Udp { source: inet.port, destination: port };
+    if inet.options.no_check {
+        udp::ecrire_sans_somme(p.donnees_mut(), &u);
+    } else {
+        udp::ecrire(p.donnees_mut(), &u, envoi.source, envoi.destination);
+    }
     ipv4::emettre(d.chemin, &envoi, p);
     MIB.udp(Compteur::OutDatagrams);
 }

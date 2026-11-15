@@ -49,14 +49,23 @@ pub fn lire(o: &[u8], source: [u8; 4], destination: [u8; 4]) -> Result<(Udp, &[u
 }
 
 /// Écrit l'en-tête d'UDP au début de `o` (l'en-tête puis la charge, déjà
-/// en place), avec sa somme. `o` fait au plus 65 535 octets (l'appelant l'a
-/// vérifié).
-pub fn ecrire(o: &mut [u8], u: &Udp, source: [u8; 4], destination: [u8; 4]) {
+/// en place), sans somme : 0, que permet IPv4 (RFC 768 : « an all zero
+/// transmitted checksum value means that the transmitter generated no
+/// checksum » ; SO_NO_CHECK). `o` fait au plus 65 535 octets (l'appelant
+/// l'a vérifié).
+pub fn ecrire_sans_somme(o: &mut [u8], u: &Udp) {
     let longueur = o.len() as u16;
     o[0..2].copy_from_slice(&u.source.to_be_bytes());
     o[2..4].copy_from_slice(&u.destination.to_be_bytes());
     o[4..6].copy_from_slice(&longueur.to_be_bytes());
     o[6..8].fill(0);
+}
+
+/// Écrit l'en-tête d'UDP au début de `o`, avec sa somme, comme
+/// `ecrire_sans_somme`.
+pub fn ecrire(o: &mut [u8], u: &Udp, source: [u8; 4], destination: [u8; 4]) {
+    ecrire_sans_somme(o, u);
+    let longueur = o.len() as u16;
     // Une somme qui vaut 0 s'écrit 0xFFFF (le même nombre en complément à
     // un) : 0 voudrait dire « pas de somme ».
     let s = match plier(somme(o, pseudo(source, destination, longueur))) {
