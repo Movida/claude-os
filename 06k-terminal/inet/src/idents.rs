@@ -15,14 +15,18 @@
 //!     une réponse à l'écho ne se fabrique pas sans savoir quel écho est
 //!     parti, et seul l'émetteur le sait) ;
 //!   - TROUVER LA SOCKET d'une réponse (`ping_lookup`) : la première qui a
-//!     l'identifiant, et dont l'adresse locale est 0.0.0.0 ou la
-//!     destination de la réponse ; Linux parcourt son seau de la socket
-//!     la plus récente à la plus ancienne, nous aussi.
+//!     l'identifiant, dont l'adresse locale est 0.0.0.0 ou la destination
+//!     de la réponse, et qui n'est pas liée à une autre interface que celle
+//!     d'arrivée (SO_BINDTODEVICE ; `inet_iif`, voir `ports`) ; Linux
+//!     parcourt son seau de la socket la plus récente à la plus ancienne,
+//!     nous aussi. La liaison à une interface ne change rien au partage d'un
+//!     identifiant (`ping_get_port` ne la regarde pas).
 //!
 //! Une taille fixe, réservée d'avance (1024 sockets à la fois, comme la
 //! table des ports : un écart), et chaque entrée porte le numéro de la
 //! socket et un objet `T` (la socket du noyau).
 
+use crate::ports::voit;
 use alloc::vec::Vec;
 use faillible::VecFaillible;
 
@@ -43,6 +47,8 @@ struct Entree<T> {
     ident: u16,
     adresse: [u8; 4],
     reutilise: bool,
+    /// SO_BINDTODEVICE (0 : aucune).
+    interface: u32,
     objet: T,
 }
 
@@ -65,10 +71,11 @@ impl<T: Clone> Table<T> {
         self.entrees.iter().any(|e| e.ident == ident)
     }
 
-    /// Inscrit la socket `numero` (objet `objet`), liée à `adresse`, avec
-    /// l'identifiant `ident` (0 : le suivant libre) ; `reutilise` :
-    /// SO_REUSEADDR. Rend l'identifiant.
-    pub fn lier(&mut self, numero: u64, ident: u16, adresse: [u8; 4], reutilise: bool, objet: T) -> Result<u16, Refus> {
+    /// Inscrit la socket `numero` (objet `objet`), liée à `adresse` et à
+    /// l'interface `interface` (0 : aucune), avec l'identifiant `ident` (0 :
+    /// le suivant libre) ; `reutilise` : SO_REUSEADDR. Rend l'identifiant.
+    pub fn lier(&mut self, numero: u64, ident: u16, adresse: [u8; 4], reutilise: bool, interface: u32, objet: T)
+                -> Result<u16, Refus> {
         if self.entrees.len() >= MAX {
             return Err(Refus::Plein);
         }
@@ -90,7 +97,7 @@ impl<T: Clone> Table<T> {
             }
             ident
         };
-        self.entrees.ajouter_dans_la_place(Entree { numero, ident, adresse, reutilise, objet });
+        self.entrees.ajouter_dans_la_place(Entree { numero, ident, adresse, reutilise, interface, objet });
         Ok(ident)
     }
 
@@ -98,6 +105,14 @@ impl<T: Clone> Table<T> {
     pub fn reutiliser(&mut self, numero: u64, reutilise: bool) {
         if let Some(e) = self.entrees.iter_mut().find(|e| e.numero == numero) {
             e.reutilise = reutilise;
+        }
+    }
+
+    /// La liaison à une interface de la socket `numero` a changé
+    /// (SO_BINDTODEVICE).
+    pub fn changer_interface(&mut self, numero: u64, interface: u32) {
+        if let Some(e) = self.entrees.iter_mut().find(|e| e.numero == numero) {
+            e.interface = interface;
         }
     }
 
@@ -114,10 +129,10 @@ impl<T: Clone> Table<T> {
     }
 
     /// La socket qui reçoit une réponse d'identifiant `ident` arrivée pour
-    /// `destination` (voir plus haut).
-    pub fn trouver(&self, ident: u16, destination: [u8; 4]) -> Option<T> {
+    /// `destination` par l'interface `iif` (voir plus haut).
+    pub fn trouver(&self, ident: u16, destination: [u8; 4], iif: u32) -> Option<T> {
         self.entrees.iter().rev()
-            .find(|e| e.ident == ident && (e.adresse == [0; 4] || e.adresse == destination))
+            .find(|e| e.ident == ident && (e.adresse == [0; 4] || e.adresse == destination) && voit(e.interface, iif))
             .map(|e| e.objet.clone())
     }
 

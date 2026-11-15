@@ -968,6 +968,12 @@ impl<P: Charge> Tcb<P> {
         if avant(self.file[i].seq, self.snd_una) {
             self.file[i].seq = self.snd_una;
         }
+        // Sans route, rien ne part, rien ne compte, rien n'est marqué renvoyé
+        // (`rebuild_header` échoue : -EHOSTUNREACH, avant RetransSegs et
+        // `total_retrans`) ; `renvoyer` note quand même l'essai.
+        if self.sans_route {
+            return false;
+        }
         let e = self.file[i];
         let mss = self.mss_courant() as i64;
         let mut place = self.snd_una.wrapping_add(self.snd_wnd).wrapping_sub(e.seq) as i32 as i64;
@@ -1188,9 +1194,7 @@ impl<P: Charge> Tcb<P> {
         }
         if syn {
             self.syn_du = true;
-            self.syn_renvoi = true;
-            self.total_retrans += 1;
-            self.syn_envoi = None;
+            self.syn_renvoi = super::RenvoiSyn::Minuteur;
         } else {
             self.rto_du = true;
             if self.retrans_stamp == 0 {

@@ -52,6 +52,8 @@
  *   - les options de SOL_IP (les soldes d'avant 6k) : IP_PKTOPTIONS, IP_MINTTL, IP_FREEBIND,
  *     IP_BIND_ADDRESS_NO_PORT, une diffusion liée, IP_LOCAL_PORT_RANGE, IP_PROTOCOL ;
  *   - getsockname après la fin d'une connexion ou d'une écoute (l'ancien port se montre) ;
+ *   - les sockets liées à une interface (SO_BINDTODEVICE, les soldes d'avant 6k) : les
+ *     écoutes, leurs filles, IP_PKTOPTIONS, IP_MTU ;
  *   - l'état de la socket que voient connect, listen et shutdown (SS_CONNECTING...), à côté de
  *     celui de TCP : un connect non bloquant pas encore redit, interrompu, défait par un autre fil.
  * Les valeurs comparées sont celles d'un Linux 6.18 à sa configuration par défaut, sur l'hôte (le
@@ -3013,6 +3015,230 @@ static void nom_apres_la_fin(void)
     close(l);
 }
 
+/* L'index de la carte et notre adresse (dans l'ordre du réseau) : celle
+ * qu'une socket UDP connectée à 192.0.2.1 prend (rien ne part), et
+ * l'interface par laquelle arrive un datagramme qu'elle s'envoie (la route de
+ * notre adresse est celle de la carte). 0 : pas de carte. */
+static int carte_et_adresse(uint32_t *moi)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0), r = socket(AF_INET, SOCK_DGRAM, 0), un = 1, carte = 0;
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(0xc0000201) };
+    socklen_t l = sizeof a;
+    if (connect(s, (void *)&a, sizeof a) == 0 && getsockname(s, (void *)&a, &l) == 0) {
+        *moi = a.sin_addr.s_addr;
+        a.sin_port = 0;
+        setsockopt(r, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+        l = sizeof a;
+        if (bind(r, (void *)&a, sizeof a) == 0 && getsockname(r, (void *)&a, &l) == 0
+            && sendto(s, "x", 1, 0, (void *)&a, sizeof a) == 1) {
+            char o[4], c[CMSG_SPACE(sizeof(struct in_pktinfo))];
+            struct iovec v = { o, sizeof o };
+            struct msghdr m = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = c, .msg_controllen = sizeof c };
+            struct pollfd p = { r, POLLIN, 0 };
+            if (poll(&p, 1, 1000) == 1 && recvmsg(r, &m, 0) == 1)
+                for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h))
+                    if (h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_PKTINFO)
+                        carte = ((struct in_pktinfo *)CMSG_DATA(h))->ipi_ifindex;
+        }
+    }
+    close(s);
+    close(r);
+    return carte;
+}
+
+/* L'interface d'IP_PKTOPTIONS de la fille (son `mc_index`) : -1 sans message. */
+static int interface_pktoptions(int f)
+{
+    char o[128];
+    socklen_t n = sizeof o;
+    if (getsockopt(f, IPPROTO_IP, IP_PKTOPTIONS, o, &n) != 0)
+        return -1;
+    struct msghdr m = { .msg_control = o, .msg_controllen = n };
+    for (struct cmsghdr *h = CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h))
+        if (h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_PKTINFO)
+            return ((struct in_pktinfo *)CMSG_DATA(h))->ipi_ifindex;
+    return -1;
+}
+
+/* Une socket TCP liée à l'interface `k` (0 : non liée), puis à 0.0.0.0:`port`
+ * (0 : un port éphémère) ; elle écoute si `ecouter`. -errno si bind échoue. */
+static int liee_a(int k, int port, int ecouter)
+{
+    int s = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (k)
+        setsockopt(s, SOL_SOCKET, SO_BINDTOIFINDEX, &k, sizeof k);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port) };
+    if (bind(s, (void *)&a, sizeof a) != 0) {
+        int e = errno;
+        close(s);
+        return -e;
+    }
+    if (ecouter)
+        listen(s, 4);
+    return s;
+}
+
+/* La fille de l'écoute `l` (non bloquante), attendue au plus `ms` ms ; -1 sans. */
+static int accepter(int l, int ms)
+{
+    struct pollfd p = { l, POLLIN, 0 };
+    poll(&p, 1, ms);
+    return accept(l, NULL, NULL);
+}
+
+/* Connecte une socket neuve (liée à `k`, 0 : non) vers `vers`:`port` ; attend au
+ * plus `ms` ms. Rend la socket, son erreur (SO_ERROR, ou EINPROGRESS si rien
+ * n'est venu) dans `*e`. */
+static int connecter_par(int k, uint32_t vers, int port, int ms, int *e)
+{
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (k)
+        setsockopt(c, SOL_SOCKET, SO_BINDTOIFINDEX, &k, sizeof k);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = vers };
+    if (connect(c, (void *)&a, sizeof a) == 0) {
+        *e = 0;
+        return c;
+    }
+    *e = errno;
+    if (*e != EINPROGRESS)
+        return c;
+    struct pollfd p = { c, POLLOUT, 0 };
+    if (poll(&p, 1, ms) != 1)
+        return c;
+    socklen_t l = sizeof *e;
+    getsockopt(c, SOL_SOCKET, SO_ERROR, e, &l);
+    return c;
+}
+
+/* Les sockets TCP liées à une interface (SO_BINDTODEVICE ; les soldes d'avant 6k, mesurés
+ * sous Linux 6.18) : deux écoutes du même port, liées à lo et à la carte, coexistent, une
+ * troisième non liée non ; chacune ne voit que les connexions qui arrivent par son
+ * interface (celle de la route : notre adresse arrive par la carte), et ses filles sont
+ * liées comme elle ; un client lié à lo vers notre adresse n'aboutit jamais (le SYN-ACK
+ * revient par la carte) ; IP_PKTOPTIONS dit l'interface de la poignée de main ; IP_MTU dit
+ * ENOTCONN après la liaison, jusqu'au segment suivant qui trouve sa route ; une interface
+ * qui n'existe pas : ENODEV au connect. */
+static void liees(void)
+{
+    uint32_t moi, boucle = htonl(INADDR_LOOPBACK);
+    int carte = carte_et_adresse(&moi), e, un = 1;
+    if (!carte) {
+        verifier(1, "pas de carte : les sockets liees a une interface, sautees");
+        return;
+    }
+    int l1 = liee_a(1, 0, 1), port = port_de(l1), lc = liee_a(carte, port, 1), ln = liee_a(0, port, 0);
+    verifier(l1 >= 0 && lc >= 0 && ln == -EADDRINUSE, "deux ecoutes d'un port, liees a lo et a la carte : permis ; non liee : EADDRINUSE");
+    int c = connecter_par(0, boucle, port, 1000, &e), f = accepter(l1, 1000), g = accept(lc, NULL, NULL);
+    int ok = e == 0 && f >= 0 && g < 0 && option(f, SOL_SOCKET, SO_BINDTOIFINDEX) == 1;
+    close(c);
+    close(f);
+    c = connecter_par(0, moi, port, 1000, &e);
+    f = accepter(lc, 1000);
+    g = accept(l1, NULL, NULL);
+    verifier(ok && e == 0 && f >= 0 && g < 0 && option(f, SOL_SOCKET, SO_BINDTOIFINDEX) == carte,
+             "vers 127.0.0.1 : l'ecoute liee a lo ; vers notre adresse : celle de la carte ; chaque fille liee comme son ecoute");
+    close(c);
+    close(f);
+    close(lc);
+    c = connecter_par(0, moi, port, 1000, &e);
+    verifier(e == ECONNREFUSED, "l'ecoute de la carte fermee, vers notre adresse : ECONNREFUSED (celle de lo ne la voit pas)");
+    close(c);
+    close(l1);
+
+    /* Un client lié à lo vers notre adresse : son SYN part par lo, le SYN-ACK revient par
+     * la route de notre adresse (la carte), qu'il ne voit pas. */
+    int l = liee_a(0, 0, 1);
+    port = port_de(l);
+    c = connecter_par(1, moi, port, 500, &e);
+    verifier(e == EINPROGRESS && accept(l, NULL, NULL) < 0, "client lie a lo vers notre adresse : en cours, jamais accepte");
+    couper(c);
+
+    /* IP_PKTOPTIONS : l'interface de la poignée de main (`inet_iif`). */
+    setsockopt(l, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    int vu[3];
+    struct { int k; uint32_t vers; } cas[3] = { { 0, moi }, { 0, boucle }, { carte, moi } };
+    for (int i = 0; i < 3; i++) {
+        c = connecter_par(cas[i].k, cas[i].vers, port, 1000, &e);
+        f = accepter(l, 1000);
+        vu[i] = e == 0 && f >= 0 ? interface_pktoptions(f) : -2;
+        close(c);
+        close(f);
+    }
+    verifier(vu[0] == carte && vu[1] == 1 && vu[2] == carte,
+             "IP_PKTOPTIONS de la fille : la carte vers notre adresse, lo vers 127.0.0.1, la carte pour un client lie a elle");
+    close(l);
+
+    /* IP_MTU d'une connexion liée après coup. */
+    l = liee_a(0, 0, 1);
+    port = port_de(l);
+    c = connecter_par(0, boucle, port, 1000, &e);
+    f = accepter(l, 1000);
+    int avant = option(c, IPPROTO_IP, IP_MTU);
+    setsockopt(c, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3);
+    int apres = option(c, IPPROTO_IP, IP_MTU);
+    send(c, "abc", 3, 0);
+    struct pollfd p = { f, POLLIN, 0 };
+    ok = poll(&p, 1, 1000) == 1;
+    verifier(e == 0 && avant == 65535 && apres == -1000 - ENOTCONN && ok && option(c, IPPROTO_IP, IP_MTU) == 65535,
+             "connectee a 127.0.0.1, liee a lo : IP_MTU ENOTCONN, puis 65535 apres un envoi");
+    /* Un IP_TOS qui change l'oublie aussi (`__ip_sock_set_tos` : `sk_dst_reset`), pas un
+     * qui ne change rien. */
+    char lu[4];
+    recv(f, lu, sizeof lu, 0);
+    int tos_meme = poser(c, IP_TOS, 0) == 0 ? option(c, IPPROTO_IP, IP_MTU) : -1;
+    int tos_change = poser(c, IP_TOS, 0x10) == 0 ? option(c, IPPROTO_IP, IP_MTU) : -1;
+    send(c, "d", 1, 0);
+    ok = recv(f, lu, sizeof lu, 0) == 1;
+    verifier(tos_meme == 65535 && tos_change == -1000 - ENOTCONN && ok && option(c, IPPROTO_IP, IP_MTU) == 65535,
+             "puis IP_TOS : le meme garde la route, un autre l'oublie jusqu'au segment suivant");
+    couper(c);
+    couper(f);
+    /* Liée à la carte, une connexion de 127.0.0.1 n'a plus de route (une source de la
+     * boucle par une carte) : rien ne part, IP_MTU reste ENOTCONN. Ce qui est écrit attend
+     * (`tcp_write_xmit` s'arrête sur l'échec de son envoi) : rien en vol, rien de renvoyé ;
+     * la sonde le réessaie (`tcp_check_probe_timer`, puis `tcp_send_probe0`, après 200 ms
+     * au moins : ses essais comptés). */
+    c = connecter_par(0, boucle, port, 1000, &e);
+    f = accepter(l, 1000);
+    setsockopt(c, SOL_SOCKET, SO_BINDTOIFINDEX, &carte, sizeof carte);
+    send(c, "abc", 3, 0);
+    p.fd = f;
+    ok = poll(&p, 1, 700) == 0;
+    struct tcp_info ti;
+    socklen_t tl = sizeof ti;
+    ok = ok && getsockopt(c, IPPROTO_TCP, TCP_INFO, &ti, &tl) == 0;
+    verifier(e == 0 && ok && option(c, IPPROTO_IP, IP_MTU) == -1000 - ENOTCONN && ti.tcpi_unacked == 0 && ti.tcpi_total_retrans == 0
+                 && ti.tcpi_probes >= 1 && ioctl_de(c, SIOCOUTQNSD) == 3,
+             "connectee a 127.0.0.1, liee a la carte : rien ne part ni n'est en vol, la sonde reessaie ; IP_MTU ENOTCONN");
+    couper(c);
+    couper(f);
+    close(l);
+    /* Un SYN sans réponse (l'écoute, sa file pleine, l'ignore), puis liée à la carte : ses
+     * renvois n'ont pas de route ; ils ne partent pas et ne comptent pas
+     * (`__tcp_retransmit_skb` : `rebuild_header` d'abord), le minuteur recule quand même
+     * (le premier à 1 s). */
+    int pp, lp = ecoute(&pp, 0);
+    struct sockaddr_in xp = lo(pp);
+    int c1 = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c1, (void *)&xp, sizeof xp);
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    ok = connect(c, (void *)&xp, sizeof xp) < 0 && errno == EINPROGRESS;
+    setsockopt(c, SOL_SOCKET, SO_BINDTOIFINDEX, &carte, sizeof carte);
+    usleep(1300000);
+    tl = sizeof ti;
+    ok = ok && getsockopt(c, IPPROTO_TCP, TCP_INFO, &ti, &tl) == 0;
+    verifier(ok && ti.tcpi_state == TCP_SYN_SENT && ti.tcpi_retransmits >= 1 && ti.tcpi_total_retrans == 0,
+             "un SYN sans reponse, puis liee a la carte : ses renvois ne partent pas, ni ne comptent ; le minuteur recule");
+    close(c);
+    close(c1);
+    close(lp);
+
+    /* Une interface qui n'existe pas (SO_BINDTOIFINDEX ne le vérifie pas) : ENODEV. */
+    c = connecter_par(9999, boucle, 9, 100, &e);
+    verifier(e == ENODEV, "liee a l'index 9999 : connect ENODEV");
+    close(c);
+}
+
 int main(void)
 {
     signal(SIGPIPE, SIG_IGN);
@@ -3067,6 +3293,7 @@ int main(void)
     peek_avec_decalage();
     sol_ip();
     nom_apres_la_fin();
+    liees();
     printf("[linux] tcp : toutes les verifications : %s\n", echecs ? "ECHEC" : "ok");
     return echecs != 0;
 }

@@ -70,6 +70,18 @@ pub mod table {
             Protocole::Unix => {}
         }
     }
+
+    /// La liaison à une interface (SO_BINDTODEVICE) a changé : la table de la
+    /// socket la saura à sa prochaine recherche. (TCP la change lui-même,
+    /// avec sa copie, sous sa possession : tcp::lier_a_une_interface.)
+    pub fn interface_changee(s: &Socket, inet: &Inet) {
+        let k = inet.options.interface;
+        match s.protocole {
+            Protocole::Udp => udp::interface_changee(s, k),
+            Protocole::Ping => ping::interface_changee(s, k),
+            Protocole::Tcp | Protocole::Unix => {}
+        }
+    }
 }
 
 /// L'adresse `a` est-elle une diffusion ou une multidiffusion (le
@@ -269,11 +281,14 @@ pub struct Trajet {
 
 /// L'interface que demande un envoi (l'`oif` d'`udp_sendmsg`, de
 /// `ping_v4_sendmsg` et d'`__ip4_datagram_connect`) : celle d'IP_PKTINFO si
-/// elle n'est pas nulle ; sinon, vers une multidiffusion, IP_MULTICAST_IF
+/// elle n'est pas nulle ; sinon celle de la liaison (SO_BINDTODEVICE,
+/// `ipcm_init_sk`) ; sinon, vers une multidiffusion, IP_MULTICAST_IF
 /// (`mc_index`), vers le reste, IP_UNICAST_IF (`uc_index`) ; 0 : aucune.
+/// (Mesuré : IP_PKTINFO, puis la liaison, puis IP_UNICAST_IF.)
 fn interface_demandee(inet: &Inet, destination: [u8; 4], c: &Controle) -> u32 {
     match c.interface {
         Some(k) if k != 0 => k,
+        _ if inet.options.interface != 0 => inet.options.interface,
         _ if format_ipv4::multidiffusion(destination) => inet.options.mc_index,
         _ => inet.options.unicast_if,
     }
@@ -466,7 +481,15 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
     let garde = connectee && !c.ip && p.route_source == 0 && !inet.options.dontroute && drapeaux & MSG_DONTROUTE == 0
         && !format_ipv4::multidiffusion(destination);
     let gardee = if garde { inet.route_gardee } else { None };
-    let Trajet { chemin, destination: premiere, source, .. } = router(inet, vers, c, drapeaux, p.stricte, gardee)?;
+    let Trajet { chemin, destination: premiere, source, oif } = router(inet, vers, c, drapeaux, p.stricte, gardee)?;
+    // Une connexion sans route gardée (oubliée par SO_BINDTODEVICE,
+    // `sk_dst_reset`) garde celle-ci (`sk_dst_set` d'`udp_sendmsg`, quand
+    // `connected` : mesuré, IP_MTU la voit de nouveau après un `send`, pas
+    // après un `sendto` qui nomme la destination). Pas ping : `ping_v4_sendmsg`
+    // ne garde aucune route (`connectee` faux).
+    if garde && inet.route_gardee.is_none() {
+        inet.route_gardee = Some(oif);
+    }
     let pmtudisc = inet.options.pmtudisc;
     let d = Depart {
         chemin, source, destination: premiere, mtu: ipv4::mtu_d_envoi(pmtudisc, &chemin, premiere),

@@ -67,7 +67,7 @@ fn lien(s: &Socket, inet: &Inet, port: u16) -> Lien {
     Lien {
         adresse: inet.adresse, port, distante: inet.distante, port_distant: inet.port_distant,
         reuseaddr: inet.options.reuseaddr, reuseport: inet.options.reuseport, uid: s.uid,
-        plage: inet.options.local_port_range,
+        plage: inet.options.local_port_range, interface: inet.options.interface,
     }
 }
 
@@ -99,6 +99,13 @@ pub fn changer(s: &Socket, inet: &Inet) {
 pub fn reutilisation_changee(s: &Socket, inet: &Inet) {
     if let Some(t) = PORTS.verrouiller().as_mut() {
         t.reutiliser(s.numero, inet.options.reuseaddr, inet.options.reuseport);
+    }
+}
+
+/// La liaison à une interface a changé (SO_BINDTODEVICE, le `rehash` d'UDP).
+pub fn interface_changee(s: &Socket, interface: u32) {
+    if let Some(t) = PORTS.verrouiller().as_mut() {
+        t.changer_interface(s.numero, interface);
     }
 }
 
@@ -394,7 +401,7 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
             let ports = (u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]]));
             let mut sockets = 0;
             if let Some(t) = PORTS.verrouiller().as_ref() {
-                t.pour_chaque_diffusion(source, ports.0, destination, ports.1, |_| sockets += 1);
+                t.pour_chaque_diffusion(source, ports.0, destination, ports.1, lieu.interface, |_| sockets += 1);
             }
             if sockets == 0 {
                 MIB.udp(Compteur::IgnoredMulti);
@@ -432,7 +439,7 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
         // comptée comme une file pleine. Aucune socket : IgnoredMulti.
         let mut sockets = 0;
         if let Some(t) = PORTS.verrouiller().as_ref() {
-            t.pour_chaque_diffusion(source, u.source, destination, u.destination, |s| {
+            t.pour_chaque_diffusion(source, u.source, destination, u.destination, lieu.interface, |s| {
                 sockets += 1;
                 match Paquet::copie(p.donnees()) {
                     Some(copie) => deposer(s, copie, &arrivee),
@@ -448,7 +455,7 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
         }
         return Ok(());
     }
-    let s = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(source, u.source, destination, u.destination));
+    let s = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(source, u.source, destination, u.destination, lieu.interface));
     match s {
         Some(s) => {
             deposer(&s, p, &arrivee);
@@ -535,7 +542,11 @@ pub fn convertir(genre: u8, code: u8, pmtudisc: bool) -> Option<(i32, bool)> {
 pub fn erreur(e: &ErreurRecue) {
     let Some((port_source, port_destination)) = formats::reseau::icmp::ports(e.origine, &e.interne) else { return };
     let i = &e.interne;
-    let Some(s) = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source)) else {
+    // La socket d'une erreur : cherchée par l'interface qui l'a reçue (le
+    // `skb->dev` d'`__udp4_lib_err`), pas par celle de sa route (TCP et ping
+    // prennent celle-là).
+    let Some(s) = PORTS.verrouiller().as_ref()
+        .and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source, e.interface)) else {
         return MIB.icmp(inet::snmp::Icmp::InErrors);
     };
     apprendre_si_mtu(e);

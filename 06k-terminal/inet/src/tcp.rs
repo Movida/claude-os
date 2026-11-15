@@ -360,6 +360,16 @@ enum Minuteur {
 }
 
 /// Les états d'une connexion.
+/// Un SYN (ou un SYN-ACK) à renvoyer : non ; par le minuteur (un RTO, celui
+/// d'une fille) ; à un SYN répété (`tcp_check_req`, une fille). Ce qui suit un
+/// renvoi qui n'a pas de route en dépend (`emettre`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RenvoiSyn {
+    Non,
+    Minuteur,
+    Repete,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Etat {
     SynEnvoye,
@@ -457,7 +467,8 @@ pub enum Compte {
     Neuf,
     /// Un segment renvoyé, SYN compris (`__tcp_retransmit_skb`) : RetransSegs,
     /// avant même sa copie, mais après sa route (`rebuild_header`) : sans elle,
-    /// rien ; son numéro, déjà passé, n'entre pas dans OutSegs.
+    /// rien (le Tcb ne le rend pas, `emettre_route`) ; son numéro, déjà passé,
+    /// n'entre pas dans OutSegs.
     Renvoi,
     /// Le premier SYN-ACK d'une ouverture simultanée (`tcp_send_synack`) :
     /// rien, SND.NXT l'a déjà dépassé quand il part.
@@ -1076,8 +1087,13 @@ pub struct Tcb<P: Charge> {
     pub memoire: Memoire,
     // Ce qui doit partir au prochain `emettre`.
     syn_du: bool,
-    /// Ce SYN (ou SYN-ACK) est un renvoi : il compte dans RetransSegs.
-    syn_renvoi: bool,
+    /// Ce SYN (ou SYN-ACK) est un renvoi, et d'où il vient : il compte dans
+    /// RetransSegs et `total_retrans` s'il part.
+    syn_renvoi: RenvoiSyn,
+    /// Pendant `emettre_route` : les segments de la connexion n'ont pas de
+    /// route (le noyau l'a cherchée avant) ; rien ne part, et le Tcb fait
+    /// comme Linux quand `ip_queue_xmit` ou `rebuild_header` échoue.
+    sans_route: bool,
     /// Un RST : son numéro, son ACK, ses drapeaux ; et s'il coupe la connexion
     /// (`tcp_send_active_reset`, avec nos options), plutôt qu'il ne répond à un
     /// segment refusé (`tcp_v4_send_reset`, sans).
@@ -1303,7 +1319,8 @@ impl<P: Charge> Tcb<P> {
             dernier_ack_invalide: None,
             memoire: Memoire::Libre,
             syn_du: false,
-            syn_renvoi: false,
+            syn_renvoi: RenvoiSyn::Non,
+            sans_route: false,
             rst_du: None,
             rst_actif: false,
             ack_maintenant: false,
@@ -2310,15 +2327,13 @@ impl<P: Charge> Tcb<P> {
             rejet_paws = paws_rejet(&estime, val, drapeaux & tcp::RST != 0, maintenant);
         }
         // Le SYN répété, seul : notre SYN-ACK a dû se perdre. Il repart, le
-        // minuteur repart aussi (« comme une retransmission rapide »), sauf
-        // limite des réponses à ce qui n'a rien à faire ici.
+        // minuteur repart aussi (« comme une retransmission rapide ») s'il est
+        // parti (`emettre`), sauf limite des réponses à ce qui n'a rien à faire
+        // ici.
         if t.seq == self.irs && drapeaux == tcp::SYN && !rejet_paws {
             if !self.ack_invalide_limite(maintenant) {
                 self.syn_du = true;
-                self.syn_renvoi = true;
-                self.syn_envoi = None;
-                self.total_retrans += 1;
-                self.armer_rto(maintenant);
+                self.syn_renvoi = RenvoiSyn::Repete;
                 e.a_emettre = true;
             }
             return false;
@@ -2542,7 +2557,7 @@ impl<P: Charge> Tcb<P> {
                     // repart avec un ACK.
                     self.passer(Etat::SynRecu, &mut e);
                     self.syn_du = true;
-                    self.syn_renvoi = false;
+                    self.syn_renvoi = RenvoiSyn::Non;
                     e.a_emettre = true;
                 }
                 // Des données dans le SYN-ACK : Linux les garde ; ici
@@ -2636,7 +2651,7 @@ impl<P: Charge> Tcb<P> {
                 // Un SYN-ACK qui n'était pas encore parti (l'ouverture
                 // simultanée) : notre SYN est acquitté, un ACK suffit.
                 if core::mem::take(&mut self.syn_du) {
-                    self.syn_renvoi = false;
+                    self.syn_renvoi = RenvoiSyn::Non;
                     self.ack_maintenant = true;
                     e.a_emettre = true;
                 }
@@ -3672,9 +3687,7 @@ impl<P: Charge> Tcb<P> {
         }
         if renvoi {
             self.syn_du = true;
-            self.syn_renvoi = true;
-            self.total_retrans += 1;
-            self.syn_envoi = None;
+            self.syn_renvoi = RenvoiSyn::Minuteur;
             e.a_emettre = true;
         }
         self.retransmissions += 1;
@@ -3924,17 +3937,23 @@ impl<P: Charge> Tcb<P> {
         let numero = self.compter_envoi(n);
         self.compter_sortie(n);
         sortir(Sortant { entete: h, debut, longueur: n, numero, compte: Compte::Neuf });
-        let fin_segment = self.snd_nxt.wrapping_add(n as u32 + u32::from(avec_fin));
-        if n < self.mss_courant() as usize {
-            // Un petit segment (`tcp_minshall_update`).
-            self.snd_sml = fin_segment;
-        }
         // L'ACK d'abord, puis la donnée (`__tcp_transmit_skb`) : sortir du mode rapide remet `ato` au
         // plus bas, ce que lit le test du ping-pong. Avant que le segment ne compte comme en vol ; un
         // FIN seul n'est pas une donnée.
         self.ack_envoye();
         if n > 0 {
             self.segment_de_donnees_parti(maintenant);
+        }
+        // Sans route, il n'est pas parti : `ip_queue_xmit` échoue après ce que compte
+        // `__tcp_transmit_skb` (plus haut) ; SND.NXT n'avance pas, rien n'entre dans la file,
+        // `tcp_write_xmit` s'arrête là, et la sonde le réessaiera (`tcp_check_probe_timer`).
+        if self.sans_route {
+            return false;
+        }
+        let fin_segment = self.snd_nxt.wrapping_add(n as u32 + u32::from(avec_fin));
+        if n < self.mss_courant() as usize {
+            // Un petit segment (`tcp_minshall_update`).
+            self.snd_sml = fin_segment;
         }
         // Une sonde de fin de rafale armée laisse la place au RTO (`tcp_event_new_data_sent`).
         let rearmer = self.file.is_empty() || (self.t_xmit.is_some() && self.t_sorte == Minuteur::SondeDePerte);
@@ -3953,8 +3972,36 @@ impl<P: Charge> Tcb<P> {
     /// SYN ou le SYN-ACK, une sonde, la tête après un RTO, ce qui est marqué
     /// perdu, les données neuves que permettent la fenêtre de l'autre et celle
     /// de congestion, le FIN, et l'ACK s'il en faut un tout de suite et
-    /// qu'aucun segment ne l'a porté.
-    pub fn emettre(&mut self, maintenant: u64, mut sortir: impl FnMut(Sortant)) {
+    /// qu'aucun segment ne l'a porté. Ils ont une route.
+    pub fn emettre(&mut self, maintenant: u64, sortir: impl FnMut(Sortant)) {
+        self.emettre_route(maintenant, true, sortir);
+    }
+
+    /// Le même, `route` dit si les segments de la connexion en ont une : le
+    /// noyau la cherche une fois, avant (la même pour tous). Sans elle, rien ne
+    /// part, comme chez Linux : un renvoi ne part pas, sans rien compter
+    /// (`__tcp_retransmit_skb` : `rebuild_header` échoue avant tout) ; un
+    /// segment neuf compte (OutSegs, et OutNoRoutes au noyau) mais n'avance pas
+    /// SND.NXT (`envoyer_donnees`) ; un ACK, une sonde, un RST comptent comme
+    /// partis (leur échec ne change rien chez Linux). Une réponse à un segment
+    /// reçu cherche sa route à part (le noyau).
+    ///
+    /// Choix de conception : la route connue avant, par un booléen, plutôt
+    /// qu'un résultat rendu par `sortir` pour chaque segment. Elle est la même
+    /// pour tous les segments de la connexion (sa source, sa destination, sa
+    /// liaison ne changent pas pendant `emettre`, que le noyau appelle sous la
+    /// possession de la socket) : le Tcb sait d'avance ce qui ne partira pas,
+    /// et chaque chemin d'envoi s'arrête au même endroit que chez Linux, sans
+    /// défaire après coup ce qu'il aurait noté. Écarté : `sortir` qui rend
+    /// « parti » ; chaque appelant devrait défaire SND.NXT, la file, le RTO, ce
+    /// que Linux ne fait jamais (il échoue avant de les toucher).
+    pub fn emettre_route(&mut self, maintenant: u64, route: bool, mut sortir: impl FnMut(Sortant)) {
+        self.sans_route = !route;
+        self.emettre_sur_la_route(maintenant, &mut sortir);
+        self.sans_route = false;
+    }
+
+    fn emettre_sur_la_route(&mut self, maintenant: u64, mut sortir: impl FnMut(Sortant)) {
         self.heure = maintenant;
         if let Some((seq, ack, drapeaux)) = self.rst_du.take() {
             // Un RST qui coupe la connexion est un segment comme un autre
@@ -3981,7 +4028,33 @@ impl<P: Charge> Tcb<P> {
         }
         if self.syn_du {
             self.syn_du = false;
+            let renvoi = core::mem::replace(&mut self.syn_renvoi, RenvoiSyn::Non);
             let drapeaux = if self.etat == Etat::SynRecu { tcp::SYN | tcp::ACK } else { tcp::SYN };
+            // Un renvoi sans route : celui d'une connexion ne part pas, rien ne compte
+            // (`__tcp_retransmit_skb` : `rebuild_header` échoue d'abord) ; son minuteur, déjà
+            // réarmé, réessaiera. Le SYN-ACK d'une fille cherche sa route, et compte qu'elle
+            // manque (`tcp_rtx_synack`, `inet_csk_route_req` : OutNoRoutes) ; renvoyé par son
+            // minuteur, la demande meurt, sans bruit (`reqsk_timer_handler`) ; à un SYN répété,
+            // rien de plus (`tcp_check_req` : ni renvoi compté, ni minuteur réarmé).
+            if renvoi != RenvoiSyn::Non && self.sans_route {
+                if self.fille {
+                    let h = self.entete_avec(self.iss, drapeaux, 0);
+                    sortir(Sortant { entete: h, debut: 0, longueur: 0, numero: 0, compte: Compte::SynAck { renvoi: true } });
+                    if renvoi == RenvoiSyn::Minuteur {
+                        self.abandonner(&mut Effets::default());
+                    }
+                }
+                return;
+            }
+            // Un renvoi parti compte (`tcp_retransmit_skb`, `tcp_rtx_synack` : `num_retrans`), et
+            // ne se chronomètre pas ; à un SYN répété, le minuteur de la fille repart.
+            if renvoi != RenvoiSyn::Non {
+                self.total_retrans += 1;
+                self.syn_envoi = None;
+                if renvoi == RenvoiSyn::Repete {
+                    self.armer_rto(maintenant);
+                }
+            }
             if !core::mem::replace(&mut self.fenetre_posee, true) {
                 // `tcp_connect_init` : TCP_MAXSEG borne le MSS d'envoi en attendant l'offre de
                 // l'autre ; ce qu'on attend de lui (`tcp_initialize_rcv_mss`, avant que la
@@ -4020,7 +4093,7 @@ impl<P: Charge> Tcb<P> {
             self.compter_sortie(0);
             // Le SYN-ACK d'une fille part de sa demande ; celui d'une ouverture simultanée, de
             // la socket, comme le SYN.
-            let compte = match (self.fille, core::mem::take(&mut self.syn_renvoi), drapeaux & tcp::ACK != 0) {
+            let compte = match (self.fille, renvoi != RenvoiSyn::Non, drapeaux & tcp::ACK != 0) {
                 (true, renvoi, _) => Compte::SynAck { renvoi },
                 (false, true, _) => Compte::Renvoi,
                 (false, false, true) => Compte::Aucun,
@@ -4063,7 +4136,8 @@ impl<P: Charge> Tcb<P> {
         // fenêtre trop petite pour un segment entier ; une fenêtre nulle :
         // un segment sans données, d'un numéro déjà acquitté, que l'autre
         // ne peut qu'acquitter en redisant sa fenêtre.
-        if core::mem::take(&mut self.sonde_due) {
+        let sonde = core::mem::take(&mut self.sonde_due);
+        if sonde {
             let bord = self.snd_una.wrapping_add(self.snd_wnd);
             let debut = self.snd_nxt.wrapping_sub(self.seq_envoi) as usize;
             let reste = self.octets_envoi.saturating_sub(debut);
@@ -4115,7 +4189,11 @@ impl<P: Charge> Tcb<P> {
         if core::mem::take(&mut self.tlp_du) {
             self.envoyer_sonde_de_perte(maintenant, &mut sortir);
         }
-        self.envoyer_neuf(maintenant, &mut sortir);
+        // Sans route, la sonde a été le seul essai (`tcp_send_probe0` n'appelle que
+        // `tcp_write_wakeup`) : un second compterait deux fois.
+        if !(sonde && self.sans_route) {
+            self.envoyer_neuf(maintenant, &mut sortir);
+        }
         if self.ack_maintenant {
             let h = self.entete(self.seq_acceptable(), tcp::ACK);
             self.compter_sortie(0);

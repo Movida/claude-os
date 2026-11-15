@@ -122,6 +122,8 @@ const SO_SNDTIMEO: i32 = 21;
 const SO_ACCEPTCONN: i32 = 30;
 const SO_PROTOCOL: i32 = 38;
 const SO_PEEK_OFF: i32 = 42;
+const SO_BINDTODEVICE: i32 = 25;
+const SO_BINDTOIFINDEX: i32 = 62;
 const SO_DOMAIN: i32 = 39;
 const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
@@ -1498,14 +1500,20 @@ pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
     })())
 }
 
-/// Les options de SOL_SOCKET, dans l'ordre de `sk_setsockopt` : une valeur
-/// d'au moins 4 octets (EINVAL), lue (EFAULT), puis l'option.
+/// Les options de SOL_SOCKET, dans l'ordre de `sk_setsockopt` : SO_BINDTODEVICE
+/// (un nom, avant tout entier) ; puis une valeur d'au moins 4 octets (EINVAL),
+/// lue (EFAULT), et l'option.
 fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(), i64> {
+    if option == SO_BINDTODEVICE {
+        return lier_a_une_interface(s, interface_nommee(valeur, longueur)?);
+    }
     let v = entier(valeur, longueur)?;
     let oui = v != 0;
     // SO_PRIORITY et SO_RCVLOWAT, sans le verrou de la socket (Linux non
     // plus).
     match option {
+        // Un index, sans vérifier qu'il existe (mesuré : 9999 accepté, et relu).
+        SO_BINDTOIFINDEX => return lier_a_une_interface(s, v),
         // 0 à 6 pour tous ; au-delà, CAP_NET_ADMIN (root).
         SO_PRIORITY => {
             if !(0..=6).contains(&v) && s.uid != 0 {
@@ -1606,6 +1614,52 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         unix::changer_passrights(s, oui);
     }
     Ok(())
+}
+
+/// Le nom d'interface de SO_BINDTODEVICE (`sock_setbindtodevice`) : au plus
+/// 15 octets lus (IFNAMSIZ moins le nul final ; au-delà, coupé sans erreur),
+/// EFAULT ; un nom C, qui s'arrête au premier nul (`"lo\0zzz"` : lo). Vide
+/// (ou une longueur nulle) : 0, délier ; inconnu : ENODEV. Rend l'index.
+fn interface_nommee(valeur: u64, longueur: i32) -> Result<i32, i64> {
+    const IFNAMSIZ: usize = 16;
+    const ENODEV: i64 = 19;
+    let n = (longueur as usize).min(IFNAMSIZ - 1);
+    let mut nom = [0u8; IFNAMSIZ];
+    copier_depuis_utilisateur(&mut nom[..n], valeur).map_err(|_| -EFAULT)?;
+    let n = nom.iter().position(|&o| o == 0).unwrap_or(n);
+    if n == 0 {
+        return Ok(0);
+    }
+    crate::reseau::interface::par_nom(&nom[..n]).map(|i| i.index as i32).ok_or(-ENODEV)
+}
+
+/// Lie la socket à l'interface d'index `index` (0 : la délie), toute socket,
+/// AF_UNIX comprise (`sock_bindtoindex_locked`) : changer une liaison déjà
+/// faite (même pour la même, même pour délier) demande CAP_NET_RAW, un droit de
+/// qui pose l'option (EPERM) ; la première est libre ; un index négatif :
+/// EINVAL. Puis les tables de ports l'apprennent (le `rehash` d'UDP ; TCP lit
+/// la liaison à chaque recherche), et la route gardée est oubliée
+/// (`sk_dst_reset`) : IP_MTU dit ENOTCONN jusqu'au prochain envoi sur la
+/// connexion (mesuré), qui en cherche une par la nouvelle interface.
+fn lier_a_une_interface(s: &Socket, index: i32) -> Result<(), i64> {
+    let root = processus::avec(|p| p.identite).root();
+    let poser = |inet: &mut socket::Inet| -> Result<u32, i64> {
+        if inet.options.interface != 0 && !root {
+            return Err(-EPERM);
+        }
+        if index < 0 {
+            return Err(-EINVAL);
+        }
+        inet.options.interface = index as u32;
+        inet.route_gardee = None;
+        datagramme::table::interface_changee(s, inet);
+        Ok(index as u32)
+    };
+    match s.protocole {
+        // Sous sa possession d'abord, puis le `Mutex` (l'ordre de TCP).
+        Protocole::Tcp => tcp::lier_a_une_interface(s, poser),
+        _ => poser(&mut s.appels.verrouiller()).map(|_| ()),
+    }
 }
 
 /// Les options de SOL_TCP (`do_tcp_setsockopt`), sous la possession de la
@@ -1871,6 +1925,7 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         None
     };
     let mut inet = s.appels.verrouiller();
+    let mut route_oubliee = false;
     let op = &mut inet.options;
     let oui = v != 0;
     match option {
@@ -1919,11 +1974,17 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         // (`ntohl`), d'une longueur de 4 seulement (même 0 : EINVAL) ; 0
         // l'efface. Toute socket d'IPv4 (TCP le garde sans s'en servir).
         IP_UNICAST_IF if longueur != 4 => return Err(-EINVAL),
+        // Une socket liée à une interface (SO_BINDTODEVICE) ne peut pas en
+        // demander une : EINVAL, même la sienne (le `midx` de Linux, l'interface
+        // maîtresse d'un VRF, vaut 0 sans VRF) ; l'inverse est permis.
         IP_UNICAST_IF => {
             const EADDRNOTAVAIL: i64 = 99;
             let k = u32::from_be(v as u32);
             if k != 0 && crate::reseau::interface::par_index(k).is_none() {
                 return Err(-EADDRNOTAVAIL);
+            }
+            if k != 0 && op.interface != 0 {
+                return Err(-EINVAL);
             }
             op.unicast_if = k;
         }
@@ -1958,12 +2019,15 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         // d'ECN sont à TCP, le programme ne les touche pas.
         // `__ip_sock_set_tos` : la valeur ENTIÈRE comparée à l'ancien octet
         // (256 en diffère toujours, même si l'octet ne change pas) ; pour
-        // TCP, les deux bits d'ECN gardés.
+        // TCP, les deux bits d'ECN gardés. Un TOS qui change fait oublier la
+        // route gardée (`sk_dst_reset`, mesuré : IP_MTU dit ENOTCONN, jusqu'au
+        // prochain envoi sur la connexion).
         IP_TOS => {
             let val = if s.protocole == Protocole::Tcp { (v & !(ipv4::ECN as i32)) | (op.tos & ipv4::ECN) as i32 } else { v };
             if op.tos as i32 != val {
                 op.tos = val as u8;
                 op.priority = priorite_du_tos(val as u8);
+                route_oubliee = true;
             }
         }
         // Le bas dans les 16 bits bas, le haut dans les hauts : gardés tels
@@ -1980,16 +2044,20 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         _ => return Err(-ENOPROTOOPT),
     }
     // TCP émet ses segments et reçoit sans le Mutex : ses copies d'IP_TTL,
-    // d'IP_TOS, d'IP_MTU_DISCOVER, d'IP_MINTTL et d'IP_OPTIONS.
-    let (ttl, tos, pmtudisc, minttl, options) =
-        (op.ttl.unwrap_or(ipv4::TTL_DEFAUT), op.tos, op.pmtudisc, op.minttl, op.ip_options);
+    // d'IP_TOS, d'IP_MTU_DISCOVER, d'IP_MINTTL, d'IP_OPTIONS et d'IP_TRANSPARENT.
+    let (ttl, tos, pmtudisc, minttl, options, transparent) =
+        (op.ttl.unwrap_or(ipv4::TTL_DEFAUT), op.tos, op.pmtudisc, op.minttl, op.ip_options, op.transparent);
+    if route_oubliee {
+        inet.route_gardee = None;
+    }
     drop(inet);
-    if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER | IP_MINTTL | IP_OPTIONS) {
-        tcp::avec_options(s, |o, tcb| {
+    if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER | IP_MINTTL | IP_OPTIONS | IP_TRANSPARENT) {
+        tcp::avec_options_et_route(s, route_oubliee, |o, tcb| {
             o.ttl = ttl;
             o.tos = tos;
             o.pmtudisc = pmtudisc;
             o.minttl = minttl;
+            o.transparent = transparent;
             if option == IP_OPTIONS {
                 // Leur place dans chaque segment : le MSS est recalculé tout de
                 // suite (`icsk_ext_hdr_len`, `tcp_sync_mss`), même sans connexion.
@@ -2028,6 +2096,31 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
             if n < 0 { Err(-EINVAL) } else { Ok(n) }
         };
         match niveau {
+            // Le nom de l'interface liée (`sock_getbindtodevice`) : non liée, une
+            // longueur nulle, quelle que soit la place ; sinon une place de moins
+            // de 16 octets (IFNAMSIZ) : EINVAL ; un index qui n'existe pas (posé
+            // par SO_BINDTOIFINDEX) : ENODEV ; le nom et son nul.
+            SOL_SOCKET if option == SO_BINDTODEVICE => {
+                const ENODEV: i64 = 19;
+                let place = lire_longueur(&mut l)?;
+                let index = s.appels.verrouiller().options.interface;
+                let n = if index == 0 {
+                    0
+                } else {
+                    if place < 16 {
+                        return Err(-EINVAL);
+                    }
+                    // (Nos noms ont moins de 16 octets : `lo`, `eth0`.)
+                    let nom = crate::reseau::interface::par_index(index).ok_or(-ENODEV)?.nom.as_bytes();
+                    let mut o = [0u8; 16];
+                    let n = nom.len().min(15);
+                    o[..n].copy_from_slice(&nom[..n]);
+                    copier_vers_utilisateur(valeur, &o[..n + 1]).map_err(|_| -EFAULT)?;
+                    n + 1
+                };
+                copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+                Ok(0)
+            }
             SOL_SOCKET => {
                 let place = lire_longueur(&mut l)?;
                 let v = lire_option_socket(s, option)?;
@@ -2149,6 +2242,7 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
         }
         SO_ERROR => entier(&mut o, s.prendre_erreur()),
         SO_PRIORITY => entier(&mut o, op.priority as i32),
+        SO_BINDTOIFINDEX => entier(&mut o, op.interface as i32),
         SO_LINGER => {
             o[..4].copy_from_slice(&(op.linger.0 as i32).to_le_bytes());
             o[4..8].copy_from_slice(&op.linger.1.to_le_bytes());

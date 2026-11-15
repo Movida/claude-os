@@ -85,6 +85,11 @@ pub fn par_index(index: u32) -> Option<&'static Interface> {
     t.get((index as usize).checked_sub(1)?).copied().flatten()
 }
 
+/// L'interface de nom `nom` (`dev_get_by_name`), comparé en entier.
+pub fn par_nom(nom: &[u8]) -> Option<&'static Interface> {
+    INTERFACES.verrouiller().iter().flatten().find(|i| i.nom.as_bytes() == nom).copied()
+}
+
 /// La première carte (la première interface qui n'est pas `lo`) : `eth0`,
 /// que configure le DHCP.
 pub fn premiere_carte() -> Option<&'static Interface> {

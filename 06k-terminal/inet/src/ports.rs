@@ -8,7 +8,9 @@
 //!   - PRENDRE UN PORT (`udp_lib_get_port`) : un port pris par une autre
 //!     socket dont l'adresse locale recouvre la nôtre (égale, ou l'une des
 //!     deux 0.0.0.0) est refusé (EADDRINUSE), sauf si les deux ont
-//!     SO_REUSEADDR, ou SO_REUSEPORT et le même utilisateur. Le port 0
+//!     SO_REUSEADDR, ou SO_REUSEPORT et le même utilisateur, ou si elles
+//!     sont liées à deux interfaces différentes (SO_BINDTODEVICE : une
+//!     socket non liée gêne toutes les autres). Le port 0
 //!     demande un port ÉPHÉMÈRE, au hasard dans la plage (32768 à 60999,
 //!     `ip_local_port_range`, ou celle d'IP_LOCAL_PORT_RANGE, `plage`),
 //!     comme Linux : un premier port tiré, puis des
@@ -20,9 +22,16 @@
 //!     celles liées à l'adresse de destination, puis celles liées à
 //!     0.0.0.0 ; parmi elles, la mieux notée (`compute_score` : connectée à
 //!     l'émetteur, +4 pour l'adresse, +4 pour le port ; une socket
-//!     connectée ailleurs n'est pas candidate) ;
+//!     connectée ailleurs n'est pas candidate ; liée à l'interface
+//!     d'arrivée, +4, à une autre, pas candidate) ;
 //!   - une DIFFUSION va à chaque socket du port qui l'accepte
-//!     (`__udp4_lib_mcast_deliver`).
+//!     (`__udp4_lib_mcast_deliver`), liée à aucune interface ou à celle
+//!     d'arrivée.
+//!
+//! L'interface d'arrivée est celle de la route du paquet (`inet_iif`),
+//! pas toujours la carte qui l'a reçu : un paquet envoyé à notre propre
+//! adresse passe par lo, et arrive « par eth0 », l'interface de cette
+//! adresse.
 //!
 //! Une taille fixe, réservée d'avance (1024 sockets liées à la fois : un
 //! écart, Linux n'a d'autre limite que la mémoire) : lier une socket ne
@@ -81,6 +90,9 @@ pub struct Lien {
     pub uid: u32,
     /// IP_LOCAL_PORT_RANGE de la socket (`plage`), pour son port éphémère.
     pub plage: u32,
+    /// L'interface à laquelle la socket est liée (SO_BINDTODEVICE, son
+    /// index ; 0 : aucune).
+    pub interface: u32,
 }
 
 /// Pourquoi un port n'est pas donné.
@@ -104,11 +116,24 @@ pub struct Table<T> {
     entrees: Vec<Entree<T>>,
 }
 
-/// Deux liens se gênent-ils sur le même port ?
+/// Deux liens se gênent-ils sur le même port (`udp_lib_lport_inuse`) ?
 fn conflit(a: &Lien, b: &Lien) -> bool {
     let reutilise = (a.reuseaddr && b.reuseaddr) || (a.reuseport && b.reuseport && a.uid == b.uid);
     let recouvre = a.adresse == [0; 4] || b.adresse == [0; 4] || a.adresse == b.adresse;
-    !reutilise && recouvre
+    !reutilise && recouvre && memes_interfaces(a.interface, b.interface)
+}
+
+/// Deux liaisons à une interface peuvent-elles voir les mêmes paquets ?
+/// Oui, sauf si chacune est liée à la sienne (les tables de TCP font de même,
+/// `inet_bind_conflict`).
+pub fn memes_interfaces(a: u32, b: u32) -> bool {
+    a == 0 || b == 0 || a == b
+}
+
+/// Une socket liée à l'interface `liee` (0 : aucune) voit-elle un paquet
+/// arrivé par `iif` (`inet_bound_dev_eq`, sans VRF) ? Partagée avec TCP.
+pub fn voit(liee: u32, iif: u32) -> bool {
+    liee == 0 || liee == iif
 }
 
 impl<T: Clone> Table<T> {
@@ -176,6 +201,15 @@ impl<T: Clone> Table<T> {
         }
     }
 
+    /// Change la liaison à une interface de la socket `numero`
+    /// (SO_BINDTODEVICE) : comme SO_REUSEADDR, Linux la lit à chaque conflit
+    /// et à chaque recherche, pas à son `bind`.
+    pub fn changer_interface(&mut self, numero: u64, interface: u32) {
+        if let Some(e) = self.entrees.iter_mut().find(|e| e.numero == numero) {
+            e.lien.interface = interface;
+        }
+    }
+
     /// Change SO_REUSEADDR et SO_REUSEPORT de la socket `numero` : Linux lit
     /// l'option de chaque socket au moment du conflit, pas à son `bind`.
     pub fn reutiliser(&mut self, numero: u64, reuseaddr: bool, reuseport: bool) {
@@ -196,8 +230,8 @@ impl<T: Clone> Table<T> {
     }
 
     /// La socket qui reçoit un datagramme de `source`:`port_source` pour
-    /// `destination`:`port` (voir plus haut).
-    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16) -> Option<T> {
+    /// `destination`:`port`, arrivé par l'interface `iif` (voir plus haut).
+    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, iif: u32) -> Option<T> {
         let note = |l: &Lien, locale: [u8; 4]| -> Option<u32> {
             if l.port != port || l.adresse != locale {
                 return None;
@@ -213,6 +247,12 @@ impl<T: Clone> Table<T> {
                 if l.port_distant != port_source {
                     return None;
                 }
+                n += 4;
+            }
+            if !voit(l.interface, iif) {
+                return None;
+            }
+            if l.interface != 0 {
                 n += 4;
             }
             Some(n)
@@ -237,14 +277,16 @@ impl<T: Clone> Table<T> {
     }
 
     /// Chaque socket qui reçoit une diffusion pour `destination`:`port` de
-    /// `source`:`port_source` (`__udp_is_mcast_sock`).
-    pub fn pour_chaque_diffusion(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, mut f: impl FnMut(&T)) {
+    /// `source`:`port_source`, arrivée par `iif` (`__udp_is_mcast_sock`).
+    pub fn pour_chaque_diffusion(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, iif: u32,
+                                 mut f: impl FnMut(&T)) {
         for e in &self.entrees {
             let l = &e.lien;
             if l.port == port
                 && (l.adresse == [0; 4] || l.adresse == destination)
                 && (l.distante == [0; 4] || l.distante == source)
                 && (l.port_distant == 0 || l.port_distant == port_source)
+                && voit(l.interface, iif)
             {
                 f(&e.objet);
             }

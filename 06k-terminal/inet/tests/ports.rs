@@ -10,7 +10,7 @@ const ICI: [u8; 4] = [10, 0, 2, 15];
 const TOUT: [u8; 4] = [0; 4];
 
 fn lien(adresse: [u8; 4], port: u16) -> Lien {
-    Lien { adresse, port, distante: TOUT, port_distant: 0, reuseaddr: false, reuseport: false, uid: 1000, plage: 0 }
+    Lien { adresse, port, distante: TOUT, port_distant: 0, reuseaddr: false, reuseport: false, uid: 1000, plage: 0, interface: 0 }
 }
 
 #[test]
@@ -52,9 +52,9 @@ fn qui_recoit() {
     t.lier(1, Lien { reuseaddr: true, ..lien(TOUT, 53) }, 1, 0).unwrap();
     t.lier(2, Lien { reuseaddr: true, ..lien(LO, 53) }, 2, 0).unwrap();
     // Liée à l'adresse de destination d'abord, puis à 0.0.0.0.
-    assert_eq!(t.trouver(ICI, 4000, LO, 53), Some(2));
-    assert_eq!(t.trouver(LO, 4000, ICI, 53), Some(1));
-    assert_eq!(t.trouver(LO, 4000, LO, 54), None);
+    assert_eq!(t.trouver(ICI, 4000, LO, 53, 1), Some(2));
+    assert_eq!(t.trouver(LO, 4000, ICI, 53, 1), Some(1));
+    assert_eq!(t.trouver(LO, 4000, LO, 54, 1), None);
     // Une socket connectée à l'émetteur l'emporte sur une qui ne l'est pas ;
     // connectée ailleurs, elle n'est pas candidate.
     let mut t: Table<u32> = Table::new().unwrap();
@@ -62,14 +62,14 @@ fn qui_recoit() {
     t.lier(2, Lien { reuseaddr: true, ..lien(TOUT, 9100) }, 2, 0).unwrap();
     t.lier(3, Lien { reuseaddr: true, ..lien(TOUT, 9100) }, 3, 0).unwrap();
     t.changer(3, LO, 5555, TOUT);
-    assert_eq!(t.trouver(LO, 5555, LO, 9100), Some(3));
-    assert_eq!(t.trouver(LO, 5556, LO, 9100), Some(2));
+    assert_eq!(t.trouver(LO, 5555, LO, 9100, 1), Some(3));
+    assert_eq!(t.trouver(LO, 5556, LO, 9100, 1), Some(2));
     t.changer(2, [10, 9, 9, 9], 1, TOUT);
-    assert_eq!(t.trouver(LO, 5556, LO, 9100), None);
+    assert_eq!(t.trouver(LO, 5556, LO, 9100, 1), None);
     // Connectée à une autre adresse, même du bon port : pas candidate non
     // plus.
     t.changer(2, [10, 9, 9, 9], 5556, TOUT);
-    assert_eq!(t.trouver(LO, 5556, LO, 9100), None);
+    assert_eq!(t.trouver(LO, 5556, LO, 9100, 1), None);
     assert_eq!(t.lien(3).map(|l| (l.distante, l.port_distant)), Some((LO, 5555)));
 }
 
@@ -82,8 +82,62 @@ fn diffusion() {
     t.lier(3, Lien { adresse: ICI, ..r }, 3, 0).unwrap();
     t.lier(4, lien(TOUT, 69), 4, 0).unwrap();
     let mut vues = Vec::new();
-    t.pour_chaque_diffusion([10, 0, 2, 2], 67, [255; 4], 68, |&n| vues.push(n));
+    t.pour_chaque_diffusion([10, 0, 2, 2], 67, [255; 4], 68, 2, |&n| vues.push(n));
     assert_eq!(vues, [1, 2], "la socket liée à 10.0.2.15 n'est pas pour 255.255.255.255");
+}
+
+/// SO_BINDTODEVICE (mesuré sous Linux 6.18, `interface-suite.txt` des
+/// sondes) : une socket liée à une interface ne reçoit que ce qui arrive par
+/// elle, et l'emporte sur une non liée ; deux liaisons différentes ne se
+/// gênent pas au `bind`, une socket non liée gêne toutes les autres.
+#[test]
+fn liees_a_une_interface() {
+    const IF_LO: u32 = 1;
+    const IF_ETH0: u32 = 2;
+    let mut t: Table<u32> = Table::new().unwrap();
+    assert_eq!(t.lier(1, Lien { interface: IF_LO, ..lien(TOUT, 5000) }, 1, 0), Ok(5000));
+    assert_eq!(t.lier(2, Lien { interface: IF_ETH0, ..lien(TOUT, 5000) }, 2, 0), Ok(5000), "deux liaisons differentes");
+    assert_eq!(t.lier(3, lien(TOUT, 5000), 3, 0), Err(Refus::Pris), "non liee contre liees");
+    assert_eq!(t.lier(3, Lien { interface: IF_LO, ..lien(TOUT, 5000) }, 3, 0), Err(Refus::Pris), "la meme liaison");
+    // Chacune voit ce qui arrive par son interface, rien d'autre.
+    assert_eq!(t.trouver(LO, 4000, LO, 5000, IF_LO), Some(1));
+    assert_eq!(t.trouver(ICI, 4000, ICI, 5000, IF_ETH0), Some(2));
+    assert_eq!(t.trouver(ICI, 4000, ICI, 5000, 3), None, "une troisieme interface");
+    // Une non liée sur un autre port, plus une liée posée APRÈS le bind (Linux
+    // lit la liaison à chaque recherche et à chaque conflit).
+    let r = Lien { reuseaddr: true, ..lien(TOUT, 6000) };
+    t.lier(4, r, 4, 0).unwrap();
+    t.lier(5, r, 5, 0).unwrap();
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO), Some(4), "a egalite, la premiere");
+    t.changer_interface(5, IF_LO);
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO), Some(5), "liee : +4");
+    assert_eq!(t.trouver(ICI, 4000, ICI, 6000, IF_ETH0), Some(4));
+    // La liaison compte moins que l'adresse : une socket liée à 0.0.0.0 et à
+    // l'interface perd contre une liée à l'adresse (la première passe).
+    t.lier(6, Lien { adresse: LO, ..r }, 6, 0).unwrap();
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO), Some(6));
+    t.retirer(6);
+    // La connexion compte autant que la liaison : connectée à l'émetteur
+    // (+4 +4) l'emporte sur liée (+4).
+    t.changer(4, LO, 4000, TOUT);
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO), Some(4));
+    // Un conflit lit la liaison du moment : délier la 5 la fait gêner une
+    // nouvelle venue sans SO_REUSEADDR.
+    t.changer(4, TOUT, 0, TOUT);
+    t.retirer(4);
+    assert_eq!(t.lier(7, Lien { interface: IF_ETH0, ..lien(TOUT, 6000) }, 7, 0), Ok(6000));
+    t.retirer(7);
+    t.changer_interface(5, 0);
+    assert_eq!(t.lier(7, Lien { interface: IF_ETH0, ..lien(TOUT, 6000) }, 7, 0), Err(Refus::Pris));
+    // Une diffusion : les non liées et celles de l'interface d'arrivée.
+    let mut t: Table<u32> = Table::new().unwrap();
+    let r = Lien { reuseaddr: true, ..lien(TOUT, 68) };
+    t.lier(1, r, 1, 0).unwrap();
+    t.lier(2, Lien { interface: IF_LO, ..r }, 2, 0).unwrap();
+    t.lier(3, Lien { interface: IF_ETH0, ..r }, 3, 0).unwrap();
+    let mut vues = Vec::new();
+    t.pour_chaque_diffusion([10, 0, 2, 2], 67, [255; 4], 68, IF_ETH0, |&n| vues.push(n));
+    assert_eq!(vues, [1, 3]);
 }
 
 #[test]

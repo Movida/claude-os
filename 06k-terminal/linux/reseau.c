@@ -2242,6 +2242,275 @@ static void interface_de_sortie(void)
     close(r);
 }
 
+/* Les sockets liées à une interface (SO_BINDTODEVICE, SO_BINDTOIFINDEX ;
+ * les soldes d'avant 6k, mesurés sous Linux 6.18) : les options, toute
+ * socket (AF_UNIX comprise) ; la route gardée d'une socket connectée,
+ * oubliée par la liaison ; l'interface des envois (IP_PKTINFO, puis la
+ * liaison, puis IP_UNICAST_IF) ; la réception (une socket liée ne voit que
+ * ce qui arrive par son interface, celle de la route du paquet : notre
+ * adresse arrive par la carte, même par lo) ; les conflits de `bind` (deux
+ * liaisons différentes ne se gênent pas). Changer une liaison déjà faite
+ * demande CAP_NET_RAW : les tests tournent en utilisateur sur l'hôte, en
+ * root dans le noyau. */
+static int poser_nom(int s, const char *nom, socklen_t l)
+{
+    return erreur(setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, nom, l));
+}
+
+static int poser_index(int s, int k)
+{
+    return erreur(setsockopt(s, SOL_SOCKET, SO_BINDTOIFINDEX, &k, sizeof k));
+}
+
+/* Le nom lu (SO_BINDTODEVICE) dans une place de `place` octets : rend errno,
+ * ou 0, le nom dans `nom` et sa longueur dans `l`. */
+static int lire_nom(int s, char *nom, socklen_t place, socklen_t *l)
+{
+    memset(nom, 'x', 16);
+    *l = place;
+    return erreur(getsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, nom, l));
+}
+
+static int lire_index(int s)
+{
+    int k = -7;
+    socklen_t l = sizeof k;
+    if (getsockopt(s, SOL_SOCKET, SO_BINDTOIFINDEX, &k, &l) != 0)
+        return -1000 - errno;
+    return k;
+}
+
+static int mtu_de(int s)
+{
+    int v = 0;
+    socklen_t l = sizeof v;
+    if (getsockopt(s, IPPROTO_IP, IP_MTU, &v, &l) != 0)
+        return -errno;
+    return v;
+}
+
+static void liees(void)
+{
+    int racine = getuid() == 0, un = 1;
+    char nom[16], quoi[200];
+    socklen_t l;
+    /* Les options. */
+    int s = udp(0);
+    verifier(lire_nom(s, nom, 64, &l) == 0 && l == 0 && lire_nom(s, nom, 0, &l) == 0 && l == 0 && lire_index(s) == 0,
+             "SO_BINDTODEVICE non liee : longueur 0, quelle que soit la place ; SO_BINDTOIFINDEX 0");
+    verifier(poser_nom(s, "lo\0zzz", 6) == 0 && lire_nom(s, nom, 16, &l) == 0 && l == 3 && strcmp(nom, "lo") == 0 && lire_index(s) == 1,
+             "SO_BINDTODEVICE \"lo\\0zzz\" : lo, relu avec son nul (3 octets), index 1");
+    verifier(lire_nom(s, nom, 15, &l) == EINVAL, "SO_BINDTODEVICE lu dans 15 octets : EINVAL");
+    snprintf(quoi, sizeof quoi, "SO_BINDTODEVICE de nouveau (lo, \"\", index 1) : %s", racine ? "permis (root)" : "EPERM (CAP_NET_RAW)");
+    int attendu = racine ? 0 : EPERM;
+    verifier(poser_nom(s, "lo", 3) == attendu && poser_nom(s, "", 1) == attendu && poser_index(s, 1) == attendu, quoi);
+    close(s);
+    s = udp(0);
+    char long_nom[22] = "lo";
+    memset(long_nom + 2, 'x', 20);
+    verifier(poser_nom(s, long_nom, 22) == ENODEV && poser_nom(s, "zz0", 4) == ENODEV && lire_index(s) == 0,
+             "SO_BINDTODEVICE lo et 20 x (coupe a 15 octets), zz0 : ENODEV");
+    verifier(poser_nom(s, "", 1) == 0 && poser_nom(s, NULL, 0) == 0 && lire_index(s) == 0,
+             "SO_BINDTODEVICE \"\" ou de longueur 0 : delie, permis non liee");
+    verifier(erreur(setsockopt(s, SOL_SOCKET, SO_BINDTOIFINDEX, &un, 2)) == EINVAL && poser_index(s, -1) == EINVAL,
+             "SO_BINDTOIFINDEX de 2 octets, ou -1 : EINVAL");
+    verifier(poser_index(s, 9999) == 0 && lire_index(s) == 9999 && lire_nom(s, nom, 16, &l) == ENODEV,
+             "SO_BINDTOIFINDEX 9999 : accepte sans verifier, relu ; son nom : ENODEV");
+    close(s);
+    s = udp(0);
+    poser_nom(s, "lo", 3);
+    verifier(poser_ip(s, IP_UNICAST_IF, htonl(9999), 4) == EADDRNOTAVAIL && poser_ip(s, IP_UNICAST_IF, htonl(1), 4) == EINVAL
+                 && poser_ip(s, IP_UNICAST_IF, 0, 4) == 0,
+             "liee : IP_UNICAST_IF 9999 EADDRNOTAVAIL, lo EINVAL (meme la sienne), 0 permis");
+    close(s);
+    s = udp(0);
+    verifier(poser_ip(s, IP_UNICAST_IF, htonl(1), 4) == 0 && poser_nom(s, "lo", 3) == 0 && lire_ip(s, IP_UNICAST_IF) == (int)htonl(1),
+             "IP_UNICAST_IF puis SO_BINDTODEVICE : permis, les deux gardes");
+    close(s);
+    s = socket(AF_UNIX, SOCK_STREAM, 0);
+    verifier(poser_nom(s, "lo", 3) == 0 && lire_nom(s, nom, 16, &l) == 0 && strcmp(nom, "lo") == 0,
+             "AF_UNIX : SO_BINDTODEVICE pose et relu");
+    close(s);
+
+    /* La route gardée d'une socket connectée : oubliée par la liaison (même
+     * délier une socket non liée), retrouvée par send, pas par un sendto qui
+     * nomme la destination ; IP_UNICAST_IF ne l'oublie pas. */
+    uint16_t pr;
+    int r = liee(&pr);
+    struct sockaddr_in a = adresse(LO, pr);
+    for (int k = 0; k < 3; k++) {
+        static const char *comment[] = { "SO_BINDTODEVICE lo", "SO_BINDTOIFINDEX 1", "SO_BINDTODEVICE \"\"" };
+        s = udp(0);
+        connect(s, (struct sockaddr *)&a, sizeof a);
+        int avant = mtu_de(s);
+        int pose = k == 0 ? poser_nom(s, "lo", 3) : k == 1 ? poser_index(s, 1) : poser_nom(s, "", 1);
+        int apres = mtu_de(s);
+        int envoye = sendto(s, "x", 1, 0, (struct sockaddr *)&a, sizeof a) == 1;
+        int apres_sendto = mtu_de(s);
+        int envoye2 = send(s, "x", 1, 0) == 1;
+        snprintf(quoi, sizeof quoi, "connectee a 127.0.0.1, puis %s : IP_MTU ENOTCONN, encore apres sendto, 65535 apres send", comment[k]);
+        verifier(avant == 65535 && pose == 0 && apres == -ENOTCONN && envoye && apres_sendto == -ENOTCONN && envoye2 && mtu_de(s) == 65535, quoi);
+        close(s);
+    }
+    s = udp(0);
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    verifier(poser_ip(s, IP_UNICAST_IF, htonl(1), 4) == 0 && mtu_de(s) == 65535, "connectee, puis IP_UNICAST_IF : la route gardee");
+    close(s);
+    /* Un IP_TOS qui change l'oublie aussi (`__ip_sock_set_tos` : `sk_dst_reset`),
+     * pas un qui ne change rien. */
+    s = udp(0);
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    int tos_meme = poser_ip(s, IP_TOS, 0, 4) == 0 ? mtu_de(s) : -1;
+    int tos_change = poser_ip(s, IP_TOS, 0x10, 4) == 0 ? mtu_de(s) : -1;
+    int tos_envoye = send(s, "x", 1, 0) == 1;
+    verifier(tos_meme == 65535 && tos_change == -ENOTCONN && tos_envoye && mtu_de(s) == 65535,
+             "connectee, puis IP_TOS : le meme garde la route, un autre l'oublie jusqu'au send");
+    close(s);
+    while (recv(r, nom, sizeof nom, MSG_DONTWAIT) > 0) {
+    }
+    close(r);
+
+    /* Le reste demande la carte : notre adresse, son index (celui d'un
+     * datagramme envoyé à notre adresse, qui arrive par elle). */
+    const uint32_t ailleurs = htonl(0xc0000201); /* 192.0.2.1 */
+    uint32_t passerelle;
+    if (!passerelle_par_defaut(&passerelle)) {
+        verifier(1, "pas de carte : les sockets liees a une interface, sautees");
+        return;
+    }
+    struct sockaddr_in moi, de;
+    struct in_pktinfo pi;
+    s = udp(0);
+    a = adresse(0, 9);
+    a.sin_addr.s_addr = ailleurs;
+    l = sizeof moi;
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    getsockname(s, (struct sockaddr *)&moi, &l);
+    close(s);
+    r = udp(0);
+    a = adresse(0, 0);
+    l = sizeof a;
+    bind(r, (struct sockaddr *)&a, sizeof a);
+    getsockname(r, (struct sockaddr *)&a, &l);
+    uint16_t port = a.sin_port;
+    setsockopt(r, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    s = udp(0);
+    int carte = envoyer_par(s, "x", 1, moi.sin_addr.s_addr, port, 0) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1 ? pi.ipi_ifindex : 0;
+    close(s);
+    char nom_carte[16] = "";
+    s = udp(0);
+    verifier(carte > 1 && poser_index(s, carte) == 0 && lire_nom(s, nom_carte, 16, &l) == 0 && l == strlen(nom_carte) + 1,
+             "la carte : son index, et son nom par SO_BINDTOIFINDEX puis SO_BINDTODEVICE");
+    close(s);
+
+    /* L'interface des envois : la liaison, après IP_PKTINFO, avant
+     * IP_UNICAST_IF ; par lo, une adresse d'ailleurs est livrée ici. */
+    s = udp(0);
+    poser_nom(s, "lo", 3);
+    int ok = envoyer_par(s, "x", 1, ailleurs, port, 0) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1 && pi.ipi_addr.s_addr == ailleurs && de.sin_addr.s_addr == moi.sin_addr.s_addr,
+             "liee lo, vers 192.0.2.1 : livre ici par lo, de notre adresse");
+    ok = envoyer_par(s, "x", 1, moi.sin_addr.s_addr, port, carte) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == carte, "liee lo, IP_PKTINFO carte vers notre adresse : par la carte (IP_PKTINFO l'emporte)");
+    close(s);
+    s = udp(0);
+    poser_ip(s, IP_UNICAST_IF, htonl(1), 4);
+    poser_nom(s, nom_carte, strlen(nom_carte) + 1);
+    ok = envoyer_par(s, "x", 1, moi.sin_addr.s_addr, port, 0) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == carte, "IP_UNICAST_IF lo, liee a la carte, vers notre adresse : par la carte (la liaison l'emporte)");
+    close(s);
+    /* Liée après connect : l'envoi suivant part par la nouvelle. */
+    s = udp(0);
+    a = adresse(0, 0);
+    a.sin_addr.s_addr = passerelle;
+    a.sin_port = port;
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    int mtu_carte = mtu_de(s);
+    poser_nom(s, "lo", 3);
+    ok = send(s, "x", 1, 0) == 1 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1 && pi.ipi_addr.s_addr == passerelle && mtu_carte < 65535 && mtu_de(s) == 65535,
+             "connectee a la passerelle, puis liee lo : send livre ici par lo, IP_MTU celle de lo");
+    close(s);
+    close(r);
+
+    /* La réception : liée, une socket ne voit que son interface. */
+    int rl = udp(0), rc = udp(0), rn = udp(0);
+    poser_nom(rl, "lo", 3);
+    poser_nom(rc, nom_carte, strlen(nom_carte) + 1);
+    setsockopt(rl, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    setsockopt(rc, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    a = adresse(0, 0);
+    l = sizeof a;
+    bind(rl, (struct sockaddr *)&a, sizeof a);
+    getsockname(rl, (struct sockaddr *)&a, &l);
+    port = a.sin_port;
+    ok = bind(rc, (struct sockaddr *)&a, sizeof a) == 0 && erreur(bind(rn, (struct sockaddr *)&a, sizeof a)) == EADDRINUSE;
+    verifier(ok, "un port, liees lo et a la carte : permis ; non liee : EADDRINUSE");
+    s = udp(0);
+    ok = envoyer_par(s, "x", 1, htonl(LO), port, 0) == 0 && recu_avec_pktinfo(rl, &de, &pi, 1000) == 1 && recu_avec_pktinfo(rc, &de, &pi, 200) == -1;
+    verifier(ok, "vers 127.0.0.1 : la liee lo, pas celle de la carte");
+    ok = envoyer_par(s, "x", 1, moi.sin_addr.s_addr, port, 0) == 0 && recu_avec_pktinfo(rc, &de, &pi, 1000) == 1
+         && recu_avec_pktinfo(rl, &de, &pi, 200) == -1;
+    verifier(ok && pi.ipi_ifindex == carte, "vers notre adresse : la liee a la carte (la route de notre adresse), pas lo");
+    ok = envoyer_par(s, "x", 1, moi.sin_addr.s_addr, port, 1) == 0 && recu_avec_pktinfo(rl, &de, &pi, 1000) == 1
+         && recu_avec_pktinfo(rc, &de, &pi, 200) == -1;
+    verifier(ok && pi.ipi_ifindex == 1, "IP_PKTINFO lo vers notre adresse : la liee lo");
+    close(s);
+    close(rl);
+    close(rc);
+    /* La liaison posée après le bind compte au conflit suivant ; et une liée
+     * l'emporte sur une non liée (SO_REUSEADDR des deux). */
+    rn = udp(0);
+    a = adresse(0, 0);
+    l = sizeof a;
+    setsockopt(rn, SOL_SOCKET, SO_REUSEADDR, &un, sizeof un);
+    bind(rn, (struct sockaddr *)&a, sizeof a);
+    getsockname(rn, (struct sockaddr *)&a, &l);
+    rl = udp(0);
+    ok = erreur(bind(rl, (struct sockaddr *)&a, sizeof a)) == EADDRINUSE;
+    poser_nom(rn, "lo", 3);
+    rc = udp(0);
+    poser_nom(rc, nom_carte, strlen(nom_carte) + 1);
+    ok = ok && bind(rc, (struct sockaddr *)&a, sizeof a) == 0;
+    verifier(ok, "liee a lo apres son bind : une liee a la carte prend le meme port");
+    close(rc);
+    rc = udp(0);
+    setsockopt(rc, SOL_SOCKET, SO_REUSEADDR, &un, sizeof un);
+    bind(rc, (struct sockaddr *)&a, sizeof a);
+    s = udp(0);
+    char o[4];
+    ok = envoyer_par(s, "y", 1, htonl(LO), a.sin_port, 0) == 0 && recu_avec_pktinfo(rn, &de, &pi, 1000) == 1
+         && recv(rc, o, sizeof o, MSG_DONTWAIT) == -1;
+    verifier(ok, "liee lo et non liee, SO_REUSEADDR : vers 127.0.0.1, la liee");
+    ok = envoyer_par(s, "y", 1, moi.sin_addr.s_addr, a.sin_port, 0) == 0 && recu_avec_pktinfo(rc, &de, &pi, 1000) == 1
+         && recv(rn, o, sizeof o, MSG_DONTWAIT) == -1;
+    verifier(ok, "et vers notre adresse : la non liee");
+    close(s);
+    close(rn);
+    close(rl);
+    close(rc);
+
+    /* Ping : la réponse revient par la route de sa source ; liée ailleurs, la
+     * socket ne la voit pas. */
+    int q = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (q >= 0) {
+        struct icmphdr e = { .type = ICMP_ECHO, .un.echo = { .id = htons(0x4322), .sequence = htons(1) } };
+        struct pollfd pq = { q, POLLIN, 0 };
+        poser_nom(q, "lo", 3);
+        ok = envoyer_par(q, &e, sizeof e, htonl(LO), 0, 0) == 0 && poll(&pq, 1, 1000) == 1 && recv(q, o, sizeof o, 0) > 0;
+        verifier(ok, "ping liee lo, vers 127.0.0.1 : la reponse");
+        ok = envoyer_par(q, &e, sizeof e, moi.sin_addr.s_addr, 0, 0) == 0 && poll(&pq, 1, 300) == 0;
+        verifier(ok, "ping liee lo, vers notre adresse : pas de reponse (elle arrive par la carte)");
+        close(q);
+        q = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+        pq.fd = q;
+        poser_nom(q, nom_carte, strlen(nom_carte) + 1);
+        ok = envoyer_par(q, &e, sizeof e, moi.sin_addr.s_addr, 0, 0) == 0 && poll(&pq, 1, 1000) == 1;
+        verifier(ok, "ping liee a la carte, vers notre adresse : la reponse");
+        close(q);
+    }
+}
+
 /* Le compteur `nom` du groupe `groupe` de /proc/net/snmp (« Udp: »,
  * « Icmp: » : deux lignes, les noms puis les valeurs) ; -1 : pas trouvé. */
 static long compteur_snmp(const char *groupe, const char *nom)
@@ -2436,6 +2705,7 @@ int main(int argc, char **argv)
     controles();
     options_d_ip();
     interface_de_sortie();
+    liees();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

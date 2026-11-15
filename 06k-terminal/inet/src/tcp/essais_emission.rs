@@ -22,19 +22,74 @@ fn ecrits(c: &mut C, n: usize) {
     assert_eq!(r, Ok(n));
 }
 
-/// `reqsk_timer_handler` : un SYN-ACK de plus, le recul compté.
+/// `reqsk_timer_handler` : un SYN-ACK de plus, le recul compté ; le renvoi compte quand il part
+/// (`tcp_rtx_synack` : `num_retrans`). Sans route, il compte qu'elle manque (OutNoRoutes, au
+/// noyau), pas de renvoi, et la demande meurt.
 #[test]
 fn le_minuteur_d_une_fille() {
-    let mut c = fille(false);
-    c.rto = 1000 * MS;
-    let (r, t) = (c.total_retrans, c.total_rto);
-    let mut e = Effets::default();
-    c.minuteur_fille(HEURE, &mut e);
-    assert!(e.a_emettre && c.syn_du);
-    assert_eq!((c.recul, c.retransmissions), (1, 1));
-    assert_eq!((c.total_retrans, c.total_rto), (r + 1, t + 1));
-    assert_eq!(c.rto, 2000 * MS);
-    assert_eq!(c.t_xmit, Some(HEURE + 2000 * MS));
+    for route in [true, false] {
+        let mut c = fille(false);
+        c.rto = 1000 * MS;
+        let (r, t) = (c.total_retrans, c.total_rto);
+        let mut e = Effets::default();
+        c.minuteur_fille(HEURE, &mut e);
+        assert!(e.a_emettre && c.syn_du);
+        assert_eq!((c.recul, c.retransmissions), (1, 1));
+        assert_eq!((c.total_retrans, c.total_rto), (r, t + 1));
+        assert_eq!(c.rto, 2000 * MS);
+        assert_eq!(c.t_xmit, Some(HEURE + 2000 * MS));
+        let mut v = Vec::new();
+        c.emettre_route(HEURE, route, |s| v.push(s.compte));
+        assert_eq!(v, [Compte::SynAck { renvoi: true }]);
+        assert_eq!((c.total_retrans, c.etat()), if route { (r + 1, Etat::SynRecu) } else { (r, Etat::Fermee) });
+    }
+}
+
+/// Sans route (`emettre_route`), le SYN renvoyé ne part pas et rien ne compte
+/// (`__tcp_retransmit_skb` : `rebuild_header` échoue d'abord) ; le minuteur recule quand même
+/// (`tcp_retransmit_timer`). La route revenue, le suivant part, et compte.
+#[test]
+fn un_syn_renvoye_sans_route() {
+    let mut c = syn_envoye();
+    let t = c.t_xmit.unwrap();
+    c.minuteur(t);
+    let mut v = Vec::new();
+    c.emettre_route(t, false, |s| v.push(s.compte));
+    assert!(v.is_empty());
+    assert_eq!((c.total_retrans, c.retransmissions, c.etat()), (0, 1, Etat::SynEnvoye));
+    let t = c.t_xmit.unwrap();
+    c.minuteur(t);
+    c.emettre_route(t, true, |s| v.push(s.compte));
+    assert_eq!(v, [Compte::Renvoi]);
+    assert_eq!((c.total_retrans, c.retransmissions), (1, 2));
+}
+
+/// Sans route, le RTO ne renvoie rien, ne compte pas de renvoi, ne marque rien
+/// (`rebuild_header`) ; le recul vaut quand même, et l'essai est noté (`retrans_stamp`).
+#[test]
+fn un_rto_sans_route() {
+    let mut c = etablie(true);
+    en_vol(&mut c, 2);
+    let (r, rto) = (c.total_retrans, c.rto);
+    let mut v = Vec::new();
+    // La sonde de fin de rafale d'abord (`tcp_send_loss_probe`) : son renvoi ne part pas non plus.
+    let t = c.t_xmit.unwrap();
+    assert_eq!(c.t_sorte, Minuteur::SondeDePerte);
+    c.minuteur(t);
+    c.emettre_route(t, false, |s| v.push(s.compte));
+    assert!(v.is_empty() && c.t_sorte == Minuteur::Retransmission);
+    let t = c.t_xmit.unwrap();
+    assert!(c.minuteur(t).a_emettre);
+    c.emettre_route(t, false, |s| v.push(s.compte));
+    assert!(v.is_empty());
+    assert_eq!((c.total_retrans, c.retransmissions, c.retrans_out, c.rto), (r, 1, 0, 2 * rto));
+    assert!(c.retrans_stamp != 0 && c.file.iter().all(|e| e.marques & retrans::DEJA_RENVOYE == 0));
+    // La route revenue, le RTO suivant renvoie la tête.
+    let t = c.t_xmit.unwrap();
+    c.minuteur(t);
+    c.emettre_route(t, true, |s| v.push(s.compte));
+    assert_eq!(v.first(), Some(&Compte::Renvoi));
+    assert_eq!(c.total_retrans, r + v.len() as u32);
 }
 
 /// La socket qui naît d'une fille n'a pas le minuteur de sa demande (`inet_csk_clone_lock` :
@@ -48,6 +103,33 @@ fn une_fille_nee_sans_minuteur() {
     ecrits(&mut c, 100);
     assert!(sortants(&mut c, HEURE).is_empty());
     assert_eq!((c.t_sorte, c.t_xmit), (Minuteur::Sonde, Some(HEURE + c.rto.max(RTO_MIN))));
+}
+
+/// Sans route, un segment neuf compte (OutSegs, et OutNoRoutes au noyau), mais ne part pas :
+/// `tcp_write_xmit` s'arrête sur l'échec de `tcp_transmit_skb`, SND.NXT n'avance pas, rien n'est
+/// en vol, la sonde est armée (`tcp_check_probe_timer`). Elle le réessaie une fois, comptée, en
+/// reculant (`tcp_send_probe0`) ; la route revenue, il part.
+#[test]
+fn des_donnees_sans_route() {
+    let mut c = etablie(true);
+    c.reglages.nodelay = true;
+    ecrits(&mut c, 500);
+    let (nxt, segs) = (c.snd_nxt, c.mesures.segs_out);
+    let mut v = Vec::new();
+    c.emettre_route(HEURE, false, |s| v.push((s.longueur, s.compte)));
+    assert_eq!(v, [(500, Compte::Neuf)]);
+    assert_eq!((c.snd_nxt, c.file.len(), c.non_envoyes(), c.mesures.segs_out), (nxt, 0, 500, segs + 1));
+    assert_eq!((c.t_sorte, c.t_xmit), (Minuteur::Sonde, Some(HEURE + c.rto.max(RTO_MIN))));
+    let t = c.t_xmit.unwrap();
+    assert!(c.minuteur(t).a_emettre);
+    v.clear();
+    c.emettre_route(t, false, |s| v.push((s.longueur, s.compte)));
+    assert_eq!(v, [(500, Compte::Neuf)]);
+    assert_eq!((c.snd_nxt, c.sondes, c.recul, c.t_sorte), (nxt, 1, 1, Minuteur::Sonde));
+    v.clear();
+    c.emettre_route(t, true, |s| v.push((s.longueur, s.compte)));
+    assert_eq!(v, [(500, Compte::Neuf)]);
+    assert_eq!((c.snd_nxt, c.file.len(), c.non_envoyes()), (nxt + 500, 1, 0));
 }
 
 /// `tcp_write_timeout` : le compte de la poignée de main.

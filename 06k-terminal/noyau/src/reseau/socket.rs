@@ -323,6 +323,14 @@ pub struct Options {
     /// multidiffusion (le `uc_index` de Linux ; datagramme::router) ; 0 :
     /// aucune. TCP le garde sans s'en servir (`tcp_v4_connect` ne le lit pas).
     pub unicast_if: u32,
+    /// SO_BINDTODEVICE et SO_BINDTOIFINDEX : l'interface à laquelle la socket
+    /// est liée (`sk_bound_dev_if`, son index) ; 0 : aucune. Les tables de
+    /// ports en gardent la copie, lue à chaque recherche et à chaque conflit
+    /// (`datagramme::table::interface_changee`) ; c'est l'interface des envois
+    /// d'UDP et de ping quand IP_PKTINFO n'en donne pas (`interface_demandee`),
+    /// la seule de TCP (sa copie, `OptionsTcp::interface`). AF_UNIX la garde
+    /// sans s'en servir, comme Linux.
+    pub interface: u32,
     pub recverr: bool,
     /// IP_MTU_DISCOVER (IP_PMTUDISC_WANT, 1, par défaut).
     pub pmtudisc: u8,
@@ -369,7 +377,7 @@ impl Options {
     const DEFAUT: Options = Options {
         reuseaddr: false, reuseport: false, broadcast: false, keepalive: false, debug: false, dontroute: false,
         oobinline: false, no_check: false, priority: 0, linger: (false, 0), rcvlowat: 1,
-        rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, unicast_if: 0, recverr: false, pmtudisc: 1,
+        rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, unicast_if: 0, interface: 0, recverr: false, pmtudisc: 1,
         udp_cork: false, recvttl: false, recvtos: false, recvopts: false, retopts: false, passsec: false,
         origdstaddr: false, checksum: false, recvfragsize: false, rfc4884: false, freebind: false, transparent: false,
         bind_no_port: false, minttl: 0, local_port_range: 0, mc_ttl: 1, mc_index: 0, rcv_tos: 0,

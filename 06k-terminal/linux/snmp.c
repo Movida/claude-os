@@ -17,7 +17,10 @@
  *     OutSegs, OutRsts) ;
  *   - une connexion TCP acceptée (ActiveOpens, PassiveOpens, CurrEstab +2,
  *     trois segments), puis coupée par SO_LINGER à 0 : le RST, et deux
- *     connexions établies fermées d'un coup (EstabResets +2, CurrEstab -2).
+ *     connexions établies fermées d'un coup (EstabResets +2, CurrEstab -2) ;
+ *   - le SYN d'une socket liée à lo vers une adresse d'ailleurs, que lo nous
+ *     livre : pas de RST (il n'est pas pour une de nos adresses), rien d'autre
+ *     que le SYN (ActiveOpens, OutSegs, InSegs).
  * Rien n'est renvoyé (RetransSegs), aucun segment n'est faux (InErrs) : sur
  * lo, InSegs et OutSegs avancent ensemble.
  * Chaque scénario lit /proc/net/snmp avant et après, et se rejoue (cinquante
@@ -395,6 +398,24 @@ static int tcp_coupee(void)
     return ok ? 0 : -1;
 }
 
+/* Le SYN d'une socket liée à lo (SO_BINDTODEVICE) vers 192.0.2.1 (TEST-NET-1)
+ * part par lo, qui nous le livre : sans socket pour lui, il n'a pas de RST
+ * (`tcp_v4_send_reset` : sa route doit être RTN_LOCAL), et rien ne compte
+ * de RST. La socket est fermée avant le renvoi du SYN (1 s) : en SYN_SENT,
+ * `close` ne compte pas d'ouverture ratée. */
+static int tcp_lo_ailleurs(void)
+{
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in d = adresse(0xc0000201, 4242);
+    int ok = c >= 0 && setsockopt(c, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3) == 0
+             && connect(c, (struct sockaddr *)&d, sizeof d) < 0 && errno == EINPROGRESS;
+    if (c >= 0)
+        close(c);
+    if (!ok)
+        verifier(0, "tcp lie a lo vers ailleurs : socket, SO_BINDTODEVICE, connect");
+    return ok ? 0 : -1;
+}
+
 int main(void)
 {
     le_texte();
@@ -436,6 +457,11 @@ int main(void)
         { "Tcp", "OutRsts", 1 }, { 0 },
     };
     jouer("une connexion TCP acceptee, puis coupee par SO_LINGER", tcp_coupee, etablie, coupee);
+    static const struct attendu ailleurs[] = {
+        { "Ip", "InReceives", 1 }, { "Ip", "InDelivers", 1 }, { "Ip", "OutRequests", 1 }, { "Ip", "OutTransmits", 1 },
+        { "Tcp", "ActiveOpens", 1 }, { "Tcp", "InSegs", 1 }, { "Tcp", "OutSegs", 1 }, { 0 },
+    };
+    jouer("le SYN d'une socket liee a lo vers 192.0.2.1 : livre ici par lo, sans RST", tcp_lo_ailleurs, ailleurs, NULL);
     printf("[linux] snmp : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

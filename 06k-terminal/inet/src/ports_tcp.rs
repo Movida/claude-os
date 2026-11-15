@@ -16,7 +16,10 @@
 //!     SO_REUSEPORT et le même utilisateur (ou l'autre est en TIME_WAIT) ;
 //!     un TIME_WAIT garde le SO_REUSEADDR de sa socket. `listen` revérifie,
 //!     avec l'écoute pour nouvel état : deux sockets liées au même port par
-//!     SO_REUSEADDR ne peuvent pas écouter toutes les deux ;
+//!     SO_REUSEADDR ne peuvent pas écouter toutes les deux. Deux sockets
+//!     liées à deux interfaces différentes (SO_BINDTODEVICE) ne se gênent
+//!     jamais (deux écoutes du même port, l'une sur lo, l'autre sur eth0 :
+//!     mesuré) ; une socket non liée gêne toutes les autres ;
 //!   - le port éphémère de `bind(0)` et de `listen` sans `bind`
 //!     (`inet_csk_find_open_port`) : un départ au hasard, IMPAIR d'abord,
 //!     de deux en deux, puis les pairs ; sans la tolérance de SO_REUSEADDR ;
@@ -32,15 +35,22 @@
 //!     pris par `bind` est sauté ; un port pris par d'autres `connect` sert
 //!     encore, si le quadruplet est neuf. Un TIME_WAIT du même quadruplet
 //!     est repris s'il a des horodatages (`tcp_twsk_unique` : les règles sont
-//!     celles de la connexion, inet::tcp::attente) ;
+//!     celles de la connexion, inet::tcp::attente). Une connexion existante
+//!     liée à une autre interface que celle de qui se connecte ne compte pas
+//!     (`inet_match` : la sienne, 0 ou l'autre) ;
 //!   - un segment reçu (`__inet_lookup`) : d'abord la connexion de son
 //!     quadruplet exact (une socket connectée ou un TIME_WAIT), puis
-//!     l'écoute de son adresse de destination, puis celle de 0.0.0.0.
+//!     l'écoute de son adresse de destination, puis celle de 0.0.0.0 ; une
+//!     socket liée à une interface ne voit que ce qui arrive par elle, et
+//!     une écoute liée l'emporte sur une qui ne l'est pas (`compute_score` :
+//!     2 contre 1, la première à égalité). L'interface d'arrivée est celle
+//!     de la route du paquet (`inet_iif`, voir `ports`).
 //!
 //! Une taille fixe, réservée au démarrage (comme la table d'UDP), et des
 //! recherches en parcourant la table : quelques dizaines de sockets.
 //! Linux hache : « Reste à faire » si une mesure le demande.
 
+use crate::ports::{memes_interfaces, voit};
 use alloc::vec::Vec;
 use faillible::VecFaillible;
 
@@ -82,6 +92,11 @@ pub struct Lien {
     /// IP_LOCAL_PORT_RANGE de la socket (`ports::plage`), pour son port
     /// éphémère.
     pub plage: u32,
+    /// L'interface à laquelle la socket est liée (SO_BINDTODEVICE, son
+    /// index ; 0 : aucune). La fille d'une écoute a la sienne
+    /// (`sk_clone_lock`), un TIME_WAIT celle de sa connexion
+    /// (`tw_bound_dev_if`).
+    pub interface: u32,
 }
 
 /// Pourquoi un port n'est pas donné.
@@ -124,7 +139,7 @@ fn recouvre(a: [u8; 4], b: [u8; 4]) -> bool {
 /// (`inet_bind_conflict`) ? `tolerant` : le partage par SO_REUSEADDR est
 /// permis (un port demandé ; pas dans la recherche d'un éphémère).
 fn conflit(a: &Lien, b: &Lien, tolerant: bool) -> bool {
-    if !recouvre(a.adresse, b.adresse) {
+    if !recouvre(a.adresse, b.adresse) || !memes_interfaces(a.interface, b.interface) {
         return false;
     }
     if a.reuseaddr && b.reuseaddr && b.sorte != Sorte::Ecoute {
@@ -260,17 +275,23 @@ impl<T: Clone> Table<T> {
     }
 
     /// Le quadruplet (`locale`, `port`, `distante`, `port_distant`) est-il
-    /// pris (`__inet_check_established`) ? Par une connexion, oui ; par une
-    /// entrée de TIME_WAIT, sauf si `reprendre` la reprend (son numéro, et si le
-    /// port vient de `bind`) : l'entrée disparaît alors de la table.
-    fn quadruplet_pris(&mut self, locale: [u8; 4], port: u16, distante: [u8; 4], port_distant: u16, port_lie: bool,
-                       reprendre: &mut impl FnMut(u64, bool) -> bool) -> bool {
+    /// pris (`__inet_check_established`) pour une socket liée à `interface` ?
+    /// Par une connexion, oui ; par une entrée de TIME_WAIT, sauf si
+    /// `reprendre` la reprend (son numéro, et si le port vient de `bind`) :
+    /// l'entrée disparaît alors de la table. Une entrée liée à une autre
+    /// interface ne compte pas (`inet_match`, avec pour interface celle de la
+    /// socket qui se connecte : une entrée non liée compte toujours, une
+    /// socket non liée ne voit pas celles qui le sont).
+    #[allow(clippy::too_many_arguments)]
+    fn quadruplet_pris(&mut self, locale: [u8; 4], port: u16, distante: [u8; 4], port_distant: u16, interface: u32,
+                       port_lie: bool, reprendre: &mut impl FnMut(u64, bool) -> bool) -> bool {
         let Some(i) = self.entrees.iter().position(|e| {
             matches!(e.lien.sorte, Sorte::Connectee | Sorte::TempsAttente)
                 && e.lien.port == port
                 && e.lien.adresse == locale
                 && e.lien.distante == distante
                 && e.lien.port_distant == port_distant
+                && voit(e.lien.interface, interface)
         }) else {
             return false;
         };
@@ -293,8 +314,8 @@ impl<T: Clone> Table<T> {
     pub fn connecter(&mut self, numero: u64, locale: [u8; 4], distante: [u8; 4], port_distant: u16, lien: Lien, objet: T,
                      decalage: u64, hasard: u32, mut reprendre: impl FnMut(u64, bool) -> bool) -> Result<u16, Refus> {
         if let Some(e) = self.entrees.iter().find(|e| e.numero == numero) {
-            let port = e.lien.port;
-            if self.quadruplet_pris(locale, port, distante, port_distant, true, &mut reprendre) {
+            let (port, interface) = (e.lien.port, e.lien.interface);
+            if self.quadruplet_pris(locale, port, distante, port_distant, interface, true, &mut reprendre) {
                 return Err(Refus::Pris);
             }
             let e = self.entree(numero).expect("l'entree");
@@ -333,7 +354,7 @@ impl<T: Clone> Table<T> {
                 if self.entrees.iter().filter(du_port).any(|e| !e.lien.par_connect) {
                     continue;
                 }
-                if self.quadruplet_pris(locale, essai, distante, port_distant, false, &mut reprendre) {
+                if self.quadruplet_pris(locale, essai, distante, port_distant, lien.interface, false, &mut reprendre) {
                     continue;
                 }
                 // La perturbation avance de l'indice du port trouvé, ou d'un
@@ -393,6 +414,15 @@ impl<T: Clone> Table<T> {
         self.entrees.iter().filter(|e| e.lien.sorte == Sorte::TempsAttente).count()
     }
 
+    /// Change la liaison à une interface de l'entrée `numero`
+    /// (SO_BINDTODEVICE) : Linux la lit sur la socket à chaque conflit et à
+    /// chaque recherche, une écoute ou une connexion comprises.
+    pub fn changer_interface(&mut self, numero: u64, interface: u32) {
+        if let Some(e) = self.entree(numero) {
+            e.lien.interface = interface;
+        }
+    }
+
     /// Change SO_REUSEADDR et SO_REUSEPORT de l'entrée `numero`.
     pub fn reutiliser(&mut self, numero: u64, reuseaddr: bool, reuseport: bool) {
         if let Some(e) = self.entree(numero) {
@@ -419,8 +449,9 @@ impl<T: Clone> Table<T> {
     }
 
     /// À qui va un segment de `source`:`port_source` pour
-    /// `destination`:`port`.
-    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16) -> Option<Destinataire<T>> {
+    /// `destination`:`port`, arrivé par l'interface `iif`.
+    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, iif: u32)
+                   -> Option<Destinataire<T>> {
         for e in &self.entrees {
             let l = &e.lien;
             if matches!(l.sorte, Sorte::Connectee | Sorte::TempsAttente)
@@ -428,6 +459,7 @@ impl<T: Clone> Table<T> {
                 && l.adresse == destination
                 && l.distante == source
                 && l.port_distant == port_source
+                && voit(l.interface, iif)
             {
                 return match (&e.objet, l.sorte) {
                     (Some(o), _) => Some(Destinataire::Connexion(o.clone())),
@@ -435,14 +467,27 @@ impl<T: Clone> Table<T> {
                 };
             }
         }
-        self.ecoute(destination, port).map(Destinataire::Ecoute)
+        self.ecoute(destination, port, iif).map(Destinataire::Ecoute)
     }
 
     /// L'écoute de `destination`:`port`, ou de 0.0.0.0:`port`
-    /// (`inet_lookup_listener`).
-    pub fn ecoute(&self, destination: [u8; 4], port: u16) -> Option<T> {
+    /// (`__inet_lookup_listener`), pour un segment arrivé par `iif` : dans
+    /// chaque passe, la mieux notée (`compute_score` : liée à `iif`, 2 ; non
+    /// liée, 1 ; liée à une autre, jamais), la première à égalité.
+    pub fn ecoute(&self, destination: [u8; 4], port: u16, iif: u32) -> Option<T> {
         for locale in [destination, [0; 4]] {
-            if let Some(e) = self.entrees.iter().find(|e| e.lien.sorte == Sorte::Ecoute && e.lien.port == port && e.lien.adresse == locale) {
+            let mut meilleure: Option<(u32, &Entree<T>)> = None;
+            for e in &self.entrees {
+                let l = &e.lien;
+                if l.sorte != Sorte::Ecoute || l.port != port || l.adresse != locale || !voit(l.interface, iif) {
+                    continue;
+                }
+                let note = if l.interface != 0 { 2 } else { 1 };
+                if meilleure.is_none_or(|(m, _)| note > m) {
+                    meilleure = Some((note, e));
+                }
+            }
+            if let Some((_, e)) = meilleure {
                 return e.objet.clone();
             }
         }

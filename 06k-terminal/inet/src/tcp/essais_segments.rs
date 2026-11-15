@@ -112,15 +112,24 @@ fn la_fille_estime_l_heure_de_son_ts() {
     assert_eq!(c.mesures.segs_in, 0, "elle n'est pas née");
 }
 
-/// Le SYN répété : il compte comme une retransmission.
+/// Le SYN répété : le SYN-ACK repart, compté comme une retransmission, et le minuteur
+/// repart ; sans route, il compte qu'elle manque (au noyau), ni renvoi ni minuteur, et la
+/// fille reste (`tcp_check_req` : `tcp_rtx_synack` a échoué).
 #[test]
 fn la_fille_et_le_syn_repete() {
-    let mut c = fille(false);
-    c.total_retrans = 0;
-    let t = Tcp { seq: c.irs, drapeaux: tcp::SYN, fenetre: 65535, ..Tcp::default() };
-    let e = c.recevoir(&t, sans_charge(), HEURE);
-    assert!(e.a_emettre && c.syn_du);
-    assert_eq!(c.total_retrans, 1);
+    for route in [true, false] {
+        let mut c = fille(false);
+        c.total_retrans = 0;
+        let echeance = c.t_xmit;
+        let t = Tcp { seq: c.irs, drapeaux: tcp::SYN, fenetre: 65535, ..Tcp::default() };
+        let e = c.recevoir(&t, sans_charge(), HEURE + 10 * MS);
+        assert!(e.a_emettre && c.syn_du);
+        let mut v = alloc::vec::Vec::new();
+        c.emettre_route(HEURE + 10 * MS, route, |s| v.push(s.compte));
+        assert_eq!(v, [Compte::SynAck { renvoi: true }]);
+        assert_eq!((c.etat(), c.total_retrans), (Etat::SynRecu, u32::from(route)));
+        assert_eq!(c.t_xmit, if route { Some(HEURE + 10 * MS + c.rto) } else { echeance });
+    }
 }
 
 /// Hors de la fenêtre : un ACK, limité sauf pour des données ; jamais à un RST.

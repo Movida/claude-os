@@ -425,7 +425,7 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Opti
                 injoignable(icmp::PORT, p);
             }
         }
-        ipv4::ICMP => super::icmp::recevoir(i, &h, &entete, diffusion, p),
+        ipv4::ICMP => super::icmp::recevoir(i, interface, &h, &entete, diffusion, p),
         // TCP : jamais d'une trame pour plusieurs machines, que `tcp_v4_rcv`
         // jette avant même InSegs (`pkt_type != PACKET_HOST` : une trame de
         // diffusion, qu'IP livre pourtant, et qu'UDP reçoit). Une destination
@@ -433,7 +433,7 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Opti
         // trame, pas l'adresse) : TCP la compte, et sait qu'elle n'ouvre rien
         // (`diffusion`).
         ipv4::TCP if trame_diffusee => {}
-        ipv4::TCP => super::tcp::recevoir(&h, &entete, i, diffusion, p),
+        ipv4::TCP => super::tcp::recevoir(&h, &entete, i, interface, diffusion, p),
         _ => injoignable(icmp::PROTOCOLE, p),
     }
 }
@@ -538,6 +538,39 @@ pub fn router(destination: [u8; 4], source: Option<[u8; 4]>, oif: u32) -> Result
         return Err(-ENODEV);
     }
     TABLE.verrouiller().as_ref().and_then(|t| t.router(destination, source, oif)).ok_or(-ENETUNREACH)
+}
+
+/// Le même, pour un envoi qui part de `source` : une source de groupe ou la
+/// diffusion limitée n'a jamais de route (EINVAL), même pour `toute_source` ;
+/// une autre source qui n'est pas à nous non plus (ENETUNREACH), sauf
+/// `toute_source` (FLOWI_FLAG_ANYSRC : IP_TRANSPARENT, qui laisse partir de
+/// la diffusion d'un réseau), vérifiée sous le même verrou que la route
+/// (`ip_route_output_key_hash_rcu`, `__ip_dev_find`) ; une source de la
+/// boucle (127.0.0.0/8) qui sortirait par une carte non plus (EINVAL,
+/// `__mkroute_output` : une connexion de 127.0.0.1 liée à la carte). Pour TCP,
+/// dont chaque segment le demande. (Linux refuse la source avant l'interface ;
+/// un segment ne montre pas laquelle des erreurs l'a arrêté.)
+pub fn router_depuis(destination: [u8; 4], source: [u8; 4], oif: u32, toute_source: bool) -> Result<(Chemin, [u8; 4]), i64> {
+    const ENODEV: i64 = 19;
+    const EINVAL: i64 = 22;
+    if ipv4::multidiffusion(source) || source == ipv4::DIFFUSION {
+        return Err(-EINVAL);
+    }
+    if oif != 0 && interface::par_index(oif).is_none() {
+        return Err(-ENODEV);
+    }
+    let route = {
+        let g = TABLE.verrouiller();
+        let t = g.as_ref().ok_or(-ENETUNREACH)?;
+        if !toute_source && !t.est_a_nous(source) {
+            return Err(-ENETUNREACH);
+        }
+        t.router(destination, Some(source), oif).ok_or(-ENETUNREACH)?
+    };
+    if ipv4::boucle(source) && !par_lo(&route.0) {
+        return Err(-EINVAL);
+    }
+    Ok(route)
 }
 
 /// Le chemin `c` passe-t-il par `lo` ?

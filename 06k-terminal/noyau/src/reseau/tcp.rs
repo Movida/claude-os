@@ -70,7 +70,7 @@ use formats::reseau::ipv4 as fipv4;
 use formats::reseau::Erreur;
 use formats::reseau::tcp::{self as ftcp, Tcp};
 use inet::ports_tcp::{self, Destinataire, Lien, Sorte};
-use inet::snmp::{Icmp as CompteurIcmp, Tcp as Compteur};
+use inet::snmp::{Icmp as CompteurIcmp, Ip as CompteurIp, Tcp as Compteur};
 use inet::tcp::{self as itcp, Charge, Compte, Etat, Tcb};
 
 const EINVAL: i64 = 22;
@@ -156,6 +156,11 @@ struct TempsAttente {
     /// Le TOS de la socket quand elle y est entrée (`tw_tos`) : celui de ses
     /// ACK.
     tos: u8,
+    /// La liaison de la socket à une interface (`tw_bound_dev_if`) : celle de
+    /// ses ACK et de ses RST (sa table la garde aussi) ; et son IP_TRANSPARENT
+    /// (`tw_transparent` : leur source peut ne pas être à nous).
+    interface: u32,
+    transparent: bool,
     /// Son échéance (/proc/net/tcp la montre).
     echeance: u64,
 }
@@ -320,9 +325,28 @@ pub struct Fille {
     /// Ses options IP : l'écho de celles de son SYN (`tcp_v4_save_options`),
     /// celles de son SYN-ACK et de ses segments, que sa socket gardera.
     options: fipv4::OptionsSortantes,
+    /// La liaison de son écoute à une interface quand son SYN est arrivé (l'`ir_iif`
+    /// de sa demande, `inet_request_bound_dev_if`) : l'interface de ses segments,
+    /// et celle de sa socket (`inet_csk_clone_lock` : `sk_bound_dev_if`), même si
+    /// l'écoute en change ensuite. De même IP_TRANSPARENT de l'écoute (le
+    /// `no_srccheck` de sa demande).
+    interface: u32,
+    transparent: bool,
 }
 
 impl Fille {
+    /// Ce que ses segments mettent dans leur en-tête IPv4, d'après `ecoute`
+    /// (celui de son écoute) : ses options, sa liaison.
+    fn ip(&self, ecoute: Ip) -> Ip {
+        Ip { options: self.options, oif: self.interface, transparent: self.transparent, ..ecoute }
+    }
+
+    /// Émet ce qu'elle a à envoyer (`emettre_tcb`), avec `ecoute` (voir `ip`).
+    fn emettre(&mut self, ecoute: Ip, recu: Option<&ipv4::EnteteRecu>) {
+        let ip = self.ip(ecoute);
+        emettre_tcb(&mut self.tcb, self.locale, self.distante, &mut self.identifiant, ip, recu, None);
+    }
+
     /// Prête pour `accept` (`inet_csk_listen_poll` : la file d'acceptation
     /// n'est pas vide), la seule définition, pour poll, accept, l'admission
     /// d'un SYN et /proc/net/tcp.
@@ -412,6 +436,11 @@ pub struct Partie {
     erreur_seule: i32,
     /// Ce que la carte a encore d'elle (`sk_wmem_alloc`, TSQ).
     retenue: Arc<Retenue>,
+    /// La route de la connexion a été oubliée (`sk_dst_reset`, par SO_BINDTODEVICE
+    /// ou un IP_TOS qui change) et pas encore retrouvée : IP_MTU dit ENOTCONN
+    /// jusqu'au prochain segment qui en trouve une (`ip_queue_xmit` la regarde :
+    /// mesuré).
+    route_oubliee: bool,
 }
 
 /// Les options de SOL_TCP.
@@ -449,6 +478,13 @@ pub struct OptionsTcp {
     pub minttl: u8,
     /// La copie d'IP_OPTIONS, pour la même raison : les options de chaque segment.
     pub ip_options: fipv4::OptionsSortantes,
+    /// La copie de SO_BINDTODEVICE, pour la même raison : l'interface de la
+    /// route de chaque segment (`sk_bound_dev_if`, la seule de TCP :
+    /// IP_UNICAST_IF ne compte pas).
+    pub interface: u32,
+    /// La copie d'IP_TRANSPARENT : ses segments peuvent partir d'une adresse
+    /// qui n'est pas à nous (FLOWI_FLAG_ANYSRC, `inet_sk_flowi_flags`).
+    pub transparent: bool,
     /// TCP_WINDOW_CLAMP (0 : rien), d'une socket pas encore connectée, et d'une
     /// écoute : ses filles en héritent (`tcp_openreq_init_rwin`).
     pub window_clamp: u32,
@@ -469,7 +505,7 @@ impl OptionsTcp {
         nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
         rcvbuf_fixe: false, rcvlowat: 1, ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 1, minttl: 0, ip_options: fipv4::OptionsSortantes::AUCUNE, window_clamp: 0,
-        controle: itcp::Controle::DEFAUT,
+        controle: itcp::Controle::DEFAUT, interface: 0, transparent: false,
         hors_connexion: itcp::Restes::NEUF,
     };
 
@@ -651,7 +687,9 @@ impl Partie {
     /// auquel peut répondre la connexion (un RST).
     fn emettre_apres(&mut self, recu: Option<&ipv4::EnteteRecu>) {
         let Mode::Connexion(t) = &mut self.mode else { return };
-        emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, Ip::de(&self.options), recu, Some(&self.retenue));
+        if emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, Ip::de(&self.options), recu, Some(&self.retenue)) {
+            self.route_oubliee = false;
+        }
     }
 
     /// Après un événement : ce que devient la connexion (`apres_l_etat`),
@@ -734,7 +772,7 @@ impl Partie {
             let numero = socket::nouveau_numero();
             let e = TempsAttente {
                 numero, locale: self.adresses.source, distante: self.adresses.distante, regles: t.en_attente(fin_orpheline), tos: self.options.tos,
-                echeance,
+                interface: self.options.interface, transparent: self.options.transparent, echeance,
             };
             // L'entrée de TIME_WAIT prend un numéro neuf, et l'échéance
             // qui va avec ; la socket n'a plus d'entrée dans la table.
@@ -889,7 +927,7 @@ impl Partie {
             let op = s.appels.verrouiller().options;
             let lien = Lien {
                 sorte: Sorte::Liee, adresse: a.adresse, port: a.port, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
-                reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range,
+                reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range, interface: op.interface,
             };
             let lie = TABLE.verrouiller().as_mut().map(|t| t.lier(self.numero, lien, Cible::Socket(s.clone()), crate::aleatoire::u32()));
             if let Some(Ok(port)) = lie {
@@ -974,13 +1012,20 @@ impl Drop for Partie {
 
 /// Ce qu'une connexion met dans l'en-tête IPv4 de ses segments : IP_TTL,
 /// IP_TOS et IP_OPTIONS de sa socket (ses copies, dans les options) ; une
-/// fille, l'écho des options de son SYN.
+/// fille, l'écho des options de son SYN. Et ce que demande leur route :
+/// l'interface (`oif` : la liaison, SO_BINDTODEVICE ; 0 : aucune), et une
+/// source qui peut ne pas être à nous (`transparent` : IP_TRANSPARENT,
+/// FLOWI_FLAG_ANYSRC ; sinon, une source qui n'est pas à nous n'a pas de
+/// route, `ip_route_output_key_hash_rcu` : un segment pour une adresse
+/// d'ailleurs, livré ici par lo, ne reçoit aucune réponse).
 #[derive(Clone, Copy)]
 struct Ip {
     ttl: u8,
     tos: u8,
     pmtudisc: u8,
     options: fipv4::OptionsSortantes,
+    oif: u32,
+    transparent: bool,
 }
 
 impl Ip {
@@ -989,20 +1034,20 @@ impl Ip {
     /// contrôle de TCP, `ipv4_tcp_sk`) au segment reçu `recu`, venu de
     /// `source` : le TTL du système, 64 (celui de la socket de contrôle,
     /// pas l'IP_TTL de la connexion), DF (`IP_PMTUDISC_DO`, `tcp_sk_init`),
-    /// le TOS `tos`, et l'écho des options du segment. None : l'écho est
-    /// impossible, et Linux ne répond pas.
-    fn reponse(recu: &ipv4::EnteteRecu, source: [u8; 4], tos: u8) -> Option<Ip> {
+    /// le TOS `tos`, et l'écho des options du segment ; sa route par `oif`
+    /// (l'`arg.bound_dev_if` d'`ip_send_unicast_reply` : la liaison de la
+    /// socket qui répond, celle de son écoute pour une fille, celle d'une
+    /// entrée de TIME_WAIT ; 0 sans socket, et pour l'ACK d'une demande,
+    /// `tcp_v4_reqsk_send_ack`), une source qui n'est pas à nous permise si
+    /// cette socket est `transparent` (IP_REPLY_ARG_NOSRCCHECK). None : l'écho
+    /// est impossible, et Linux ne répond pas.
+    fn reponse(recu: &ipv4::EnteteRecu, source: [u8; 4], tos: u8, oif: u32, transparent: bool) -> Option<Ip> {
         let options = fipv4::options_echo(recu.options(), &recu.compilees, source, &ipv4::unicast).ok()?;
-        Some(Ip { ttl: ipv4::TTL_DEFAUT, tos, pmtudisc: 2, options })
+        Some(Ip { ttl: ipv4::TTL_DEFAUT, tos, pmtudisc: 2, options, oif, transparent })
     }
 
     fn de(o: &OptionsTcp) -> Ip {
-        Ip { ttl: o.ttl, tos: o.tos, pmtudisc: o.pmtudisc, options: o.ip_options }
-    }
-
-    /// Le même, avec d'autres options (celles d'une fille).
-    fn avec(self, options: fipv4::OptionsSortantes) -> Ip {
-        Ip { options, ..self }
+        Ip { ttl: o.ttl, tos: o.tos, pmtudisc: o.pmtudisc, options: o.ip_options, oif: o.interface, transparent: o.transparent }
     }
 
     /// Où vont les paquets pour `distante` : d'abord à la première étape d'une
@@ -1013,18 +1058,24 @@ impl Ip {
 }
 
 /// Émet les segments de la connexion `t`, de `source` à `distante`, avec ce
-/// que dit `ip` de leur en-tête IPv4 ; `recu` : l'en-tête du segment qu'elle
-/// vient de recevoir, s'il y en a un, dont ses réponses prennent le leur.
+/// que dit `ip` de leur en-tête IPv4 et de leur route ; `recu` : l'en-tête du
+/// segment qu'elle vient de recevoir, s'il y en a un, dont ses réponses
+/// prennent le leur. Leur route est cherchée une fois, avant (la même pour
+/// tous : `__sk_dst_check`, puis `ip_route_output_ports`) ; sa MTU vérifie
+/// le MSS, et le Tcb sait ce qui ne partira pas (`emettre_route`). Rend vrai
+/// si un de ses segments (pas une réponse) a trouvé sa route.
 fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, recu: Option<&ipv4::EnteteRecu>,
-               retenue: Option<&Arc<Retenue>>) {
+               retenue: Option<&Arc<Retenue>>) -> bool {
     if let Some(r) = retenue {
         t.poser_en_file(r.octets(), r.rendu());
     }
-    if let Ok((c, d)) = ipv4::router(ip.vers(distante), Some(source), 0) {
+    let route = route_de_segment(&ip, source, distante, false);
+    if let Some((c, d)) = route {
         t.verifier_mtu(ipv4::mtu_vers(&c, d));
     }
     let mut a_envoyer: Vec<itcp::Sortant> = Vec::new();
-    t.emettre(maintenant(), |s| {
+    let mut route_trouvee = false;
+    t.emettre_route(maintenant(), route.is_some(), |s| {
         // Sans place, le segment ne part pas : la retransmission y pourvoira, et personne ne doit
         // le croire encore dans la carte. Il compte comme un paquet que Linux n'a pas pu faire.
         let (numero, compte) = (s.numero, s.compte);
@@ -1045,8 +1096,10 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
         // `ip_send_unicast_reply`) : le TOS du segment sans ses bits ECN,
         // l'écho de ses options, rien si l'écho est impossible. Une réponse
         // naît d'un segment reçu, et part juste après lui : `recu` est là.
+        // Un RST part par la liaison de la socket (celle de l'écoute pour une
+        // fille) ; l'ACK d'une fille en SYN_RECEIVED, sans (`tcp_v4_reqsk_send_ack`).
         let ip = match (s.compte, recu) {
-            (Compte::Reponse { .. }, Some(r)) => match Ip::reponse(r, distante, r.tos & !ipv4::ECN) {
+            (Compte::Reponse { rst }, Some(r)) => match Ip::reponse(r, distante, r.tos & !ipv4::ECN, if rst { ip.oif } else { 0 }, ip.transparent) {
                 Some(ip) => ip,
                 None => {
                     s.compte.compter(&MIB, false, false);
@@ -1057,44 +1110,54 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
         };
         // Un ACK pur, un RST ne tiennent pas la socket (`skb_is_tcp_pure_ack`).
         let suivi = retenue.filter(|_| s.numero != 0).map(|r| (r, s.numero));
-        envoyer_segment(&s.entete, s.compte, source, distante, identifiant, ip, s.longueur, suivi, |o| t.copier_envoi(s.debut, o));
+        let reponse = matches!(s.compte, Compte::Reponse { .. });
+        let sa_route = if reponse { route_de_segment(&ip, source, distante, true) } else { route };
+        let routee = envoyer_segment(&s.entete, s.compte, source, distante, identifiant, ip, sa_route, s.longueur, suivi, |o| t.copier_envoi(s.debut, o));
+        route_trouvee |= routee && !reponse;
     }
     if t.prendre_etrangle()
         && let Some(r) = retenue
     {
         r.etrangler();
     }
+    route_trouvee
+}
+
+/// La route d'un segment de `source` à `distante`, avec ce que dit `ip` : par
+/// `ip.oif` (sa liaison), d'une source à nous sauf `ip.transparent`, vers la
+/// première étape d'une route source. Une route source stricte dont la
+/// première étape n'est pas une voisine : pas de route pour un segment d'une
+/// socket (`__ip_queue_xmit`, `inet_csk_route_req`) ; une réponse sans socket
+/// (`reponse`) part quand même (`ip_send_unicast_reply` ne la regarde pas).
+fn route_de_segment(ip: &Ip, source: [u8; 4], distante: [u8; 4], reponse: bool) -> Option<(inet::routes::Chemin, [u8; 4])> {
+    ipv4::router_depuis(ip.vers(distante), source, ip.oif, ip.transparent).ok().filter(|(c, d)| {
+        !ip.options.places.stricte || reponse || !matches!(c, inet::routes::Chemin::Unicast { prochain, .. } if *prochain != *d)
+    })
 }
 
 /// Écrit et émet un segment : l'en-tête `h`, `longueur` octets de charge
 /// remplis par `remplir`, de `source` à `distante`, avec ce que dit `ip`
-/// de l'en-tête IPv4. La somme n'est pas calculée par `lo` (comme Linux) ;
-/// elle prend la vraie destination (`tcp_v4_send_check` : `inet_daddr`), et
-/// l'en-tête IPv4 va à la première étape d'une route source. Une route
-/// source stricte dont la première étape n'est pas une voisine : pas de
-/// route pour un segment d'une socket (`__ip_queue_xmit`,
-/// `inet_csk_route_req`) ; une réponse sans socket part quand même
-/// (`ip_send_unicast_reply` ne la regarde pas). Un segment qui ne part pas
+/// de l'en-tête IPv4, par `route` (`route_de_segment` ; None : il n'en a
+/// pas). La somme n'est pas calculée par `lo` (comme Linux) ; elle prend la
+/// vraie destination (`tcp_v4_send_check` : `inet_daddr`), et l'en-tête IPv4
+/// va à la première étape d'une route source. Un segment qui ne part pas
 /// (plus de mémoire, pas de route) est perdu, comme sur un câble. Il compte
-/// dans /proc/net/snmp ce que dit `compte`.
-fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, longueur: usize,
-                   suivi: Option<(&Arc<Retenue>, u64)>, remplir: impl FnOnce(&mut [u8])) {
+/// dans /proc/net/snmp ce que dit `compte`. Rend vrai s'il a une route.
+fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip,
+                   route: Option<(inet::routes::Chemin, [u8; 4])>, longueur: usize, suivi: Option<(&Arc<Retenue>, u64)>,
+                   remplir: impl FnOnce(&mut [u8])) -> bool {
     let n = ftcp::longueur_entete(&h.options);
-    let route = ipv4::router(ip.vers(distante), Some(source), 0).ok().filter(|(c, d)| {
-        !ip.options.places.stricte
-            || matches!(compte, Compte::Reponse { .. })
-            || !matches!(c, inet::routes::Chemin::Unicast { prochain, .. } if *prochain != *d)
-    });
     let paquet = Paquet::vide(n + longueur);
-    compte.compter(&MIB, route.is_some(), paquet.is_some());
+    let routee = route.is_some();
+    compte.compter(&MIB, routee, paquet.is_some());
     let (Some((chemin, destination)), Some(mut p)) = (route, paquet) else {
         // Il ne partira pas : personne ne le rendra.
         if let Some((r, numero)) = suivi {
             r.envoi_perdu(numero);
         }
-        return;
+        return routee;
     };
-    let Some(o) = p.ajouter_fin(n + longueur) else { return };
+    let Some(o) = p.ajouter_fin(n + longueur) else { return routee };
     remplir(&mut o[n..]);
     let finale = if ip.options.places.route_source != 0 { distante } else { destination };
     ftcp::ecrire(o, h, source, finale, !ipv4::par_lo(&chemin));
@@ -1108,20 +1171,25 @@ fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], 
         options: ip.options, destination_finale: finale,
     };
     ipv4::emettre(chemin, &envoi, p);
+    true
 }
 
 /// Répond à un segment sans connexion (RST), de `locale` à `distante`, avec
 /// le TOS du segment (`recu`) sans ses bits ECN (`tcp_v4_send_reset`) et
-/// l'écho de ses options. Impossible : rien ne part, mais le RST compte
-/// (`tcp_v4_send_reset` compte après `ip_send_unicast_reply`, qui s'est
-/// tue).
-fn repondre_rst(h: &Tcp, longueur_charge: usize, locale: [u8; 4], distante: [u8; 4], recu: &ipv4::EnteteRecu) {
+/// l'écho de ses options, par l'interface `oif` (la liaison de la socket qui
+/// le refuse, une écoute ou une entrée de TIME_WAIT ; 0 sans socket : « When
+/// socket is gone, all binding information is lost », dit Linux), de
+/// `locale` à nous sauf pour une socket `transparent`. Impossible : rien ne
+/// part, mais le RST compte (`tcp_v4_send_reset` compte après
+/// `ip_send_unicast_reply`, qui s'est tue).
+fn repondre_rst(h: &Tcp, longueur_charge: usize, locale: [u8; 4], distante: [u8; 4], recu: &ipv4::EnteteRecu, oif: u32, transparent: bool) {
     if let Some(r) = itcp::reponse_sans_connexion(h, longueur_charge) {
-        let Some(ip) = Ip::reponse(recu, distante, recu.tos & !ipv4::ECN) else {
+        let Some(ip) = Ip::reponse(recu, distante, recu.tos & !ipv4::ECN, oif, transparent) else {
             return Compte::Reponse { rst: true }.compter(&MIB, false, false);
         };
         let mut id = crate::aleatoire::u32() as u16;
-        envoyer_segment(&r, Compte::Reponse { rst: true }, locale, distante, &mut id, ip, 0, None, |_| {});
+        let route = route_de_segment(&ip, locale, distante, true);
+        envoyer_segment(&r, Compte::Reponse { rst: true }, locale, distante, &mut id, ip, route, 0, None, |_| {});
     }
 }
 
@@ -1173,7 +1241,7 @@ impl Possede for Partie {
                     f.tcb.reglages.syn_essais = syncnt;
                     f.tcb.reduire_essais(essais);
                     f.tcb.minuteur(maintenant);
-                    emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None, None);
+                    f.emettre(ip, None);
                 }
                 ranger_filles(filles);
             }
@@ -1221,8 +1289,8 @@ impl Partie {
             Mode::Ecoute { .. } => self.traiter_ecoute(s),
             Mode::Neuve => {
                 // Plus rien n'écoute ici (un `listen` défait par un
-                // `connect` qui a échoué...) : RST.
-                repondre_rst(&s.entete, s.charge.longueur(), s.destination, s.source, &s.ip);
+                // `connect` qui a échoué...) : RST, par sa liaison.
+                repondre_rst(&s.entete, s.charge.longueur(), s.destination, s.source, &s.ip, self.options.interface, self.options.transparent);
             }
         }
         self.emettre_apres(Some(&recu));
@@ -1256,11 +1324,11 @@ impl Partie {
     /// SYN_RECEIVED (`tcp_req_err` : ses SYN-ACK sont toujours petits).
     fn mtu_reduite(&mut self, info: u32, seq: u32, fille: Option<u64>) {
         let pmtudisc = self.options.pmtudisc;
-        let (t, distante) = match (&mut self.mode, fille) {
-            (Mode::Connexion(t), None) => (t, self.adresses.distante),
+        let (t, distante, oif) = match (&mut self.mode, fille) {
+            (Mode::Connexion(t), None) => (t, self.adresses.distante, self.options.interface),
             (Mode::Ecoute { filles, .. }, Some(n)) => {
                 let Some(f) = filles.iter_mut().find(|f| f.numero == n && f.tcb.etat() != Etat::SynRecu) else { return };
-                (&mut f.tcb, f.distante)
+                (&mut f.tcb, f.distante, f.interface)
             }
             _ => return,
         };
@@ -1269,7 +1337,7 @@ impl Partie {
             return;
         }
         ipv4::apprendre_mtu(distante, info);
-        let Ok((c, d)) = ipv4::router(distante, None, 0) else { return };
+        let Ok((c, d)) = ipv4::router(distante, None, oif) else { return };
         // (`ip_sk_accept_pmtu`, et IP_PMTUDISC_DONT.)
         let suivre = !matches!(pmtudisc, 0 | 4 | 5);
         t.mtu_reduite(info, ipv4::mtu_vers(&c, d), ipv4::ne_pas_fragmenter(pmtudisc, d), suivre);
@@ -1328,7 +1396,7 @@ impl Partie {
                 if en_poignee && f.tcb.etat() != Etat::SynRecu {
                     f.arrivee = (s.ip.ttl, s.ip.tos, s.interface);
                 }
-                emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), Some(&s.ip), None);
+                f.emettre(ip, Some(&s.ip));
                 ranger_filles(filles);
                 return;
             }
@@ -1351,20 +1419,15 @@ impl Partie {
             return;
         }
         if h.drapeaux & ftcp::ACK != 0 {
-            // Un ACK vers une diffusion : son RST n'a pas de route (sa source,
-            // la diffusion, n'est pas à nous), mais il compte, comme les
-            // réponses qui ne partent pas (`tcp_v4_send_reset`).
-            if s.diffusion {
-                Compte::Reponse { rst: true }.compter(&MIB, false, false);
-                return;
-            }
-            // Un ACK pour une fille qu'on n'a plus : RST (`tcp_rcv_state_process`, TCP_LISTEN).
-            repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip);
+            // Un ACK pour une fille qu'on n'a plus : RST (`tcp_rcv_state_process`, TCP_LISTEN),
+            // par la liaison de l'écoute.
+            repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, ip.oif, ip.transparent);
             return;
         }
         // Ni un SYN, ni un SYN|FIN : rien, pas même un RST : ce que distinguent les balayages FIN et
         // NULL (`TCP_FLAGS`). Un SYN vers une diffusion : rien non plus (`tcp_v4_conn_request`,
-        // ListenDrops).
+        // ListenDrops). (Un ACK vers elle a tenté plus haut son RST : il compte, mais n'a pas de
+        // route, sauf de la diffusion d'un réseau pour une écoute IP_TRANSPARENT.)
         if h.drapeaux & ftcp::SYN == 0 || h.drapeaux & ftcp::FIN != 0 || s.diffusion {
             return;
         }
@@ -1383,8 +1446,20 @@ impl Partie {
         // première étape (`inet_csk_route_req`).
         let options = fipv4::options_echo(s.ip.options(), &s.ip.compilees, s.source, &ipv4::unicast)
             .unwrap_or(fipv4::OptionsSortantes::AUCUNE);
-        let vers = ip.avec(options).vers(s.source);
-        let mss = mss_vers(vers);
+        let ip_fille = Ip { options, ..ip };
+        // La route du SYN-ACK d'abord (`tcp_conn_request` : `route_req`,
+        // `inet_csk_route_req`) : celle de ses segments, par la liaison de
+        // l'écoute, de l'adresse visée, sa route source stricte comprise ;
+        // sans elle, pas de demande, le SYN est jeté (OutNoRoutes ; et
+        // ListenDrops, un compteur que nous n'avons pas). Ainsi une adresse
+        // d'ailleurs, livrée ici par lo, n'a pas de fille, sauf pour une
+        // écoute IP_TRANSPARENT.
+        if route_de_segment(&ip_fille, s.destination, s.source, false).is_none() {
+            MIB.ip(CompteurIp::OutNoRoutes);
+            return;
+        }
+        let vers = ip_fille.vers(s.source);
+        let mss = mss_vers(vers, ip.oif);
         let Some(moi) = par_numero(self.numero) else { return };
         // Une fille hérite des tampons de son écoute, et de SO_SNDBUF fixé
         // (`sk_clone_lock` : `sk_sndbuf`, `sk_rcvbuf`, `sk_userlocks`) :
@@ -1407,15 +1482,16 @@ impl Partie {
         tcb.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
         tcb.memoire = niveau_memoire();
         tcb.poser_controle(self.options.controle);
-        tcb.sans_file = sans_carte(vers);
+        tcb.sans_file = sans_carte(vers, ip.oif);
         // Elle hérite de ce que l'écoute permet (`sk_clone_lock`) : un serveur SO_REUSEADDR doit
-        // pouvoir redémarrer tant que vivent ses connexions, et jusqu'en TIME_WAIT (`tw_reuse`).
+        // pouvoir redémarrer tant que vivent ses connexions, et jusqu'en TIME_WAIT (`tw_reuse`) ;
+        // et de sa liaison à une interface.
         let ajoutee = TABLE.verrouiller().as_mut().is_some_and(|t| {
             let (reuseaddr, reuseport, uid, plage) =
                 t.lien(numero_ecoute).map_or((false, false, 0, 0), |l| (l.reuseaddr, l.reuseport, l.uid, l.plage));
             let lien = Lien {
                 sorte: Sorte::Connectee, adresse: s.destination, port: h.destination, distante: s.source, port_distant: h.source,
-                reuseaddr, reuseport, uid, par_connect: false, plage,
+                reuseaddr, reuseport, uid, par_connect: false, plage, interface: ip.oif,
             };
             t.ajouter_fille(numero, lien, Cible::Fille(moi, numero)).is_ok()
         });
@@ -1424,9 +1500,9 @@ impl Partie {
         }
         let mut f = Fille {
             numero, tcb, locale: s.destination, distante: s.source, identifiant: crate::aleatoire::u32() as u16, etablie: false,
-            arrivee: (0, 0, 0), options,
+            arrivee: (0, 0, 0), options, interface: ip.oif, transparent: ip.transparent,
         };
-        emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None, None);
+        f.emettre(ip, None);
         // La place est prise plus haut, avant tout changement.
         filles.ajouter_derriere_dans_la_place(f);
     }
@@ -1488,14 +1564,15 @@ fn cle_secrete() -> crypto::siphash::Cle {
 /// Le MSS qu'on annonce pour parler à `distante` : la MTU du chemin moins
 /// 40 (les en-têtes d'IPv4 et de TCP).
 /// Vers cette adresse, un paquet n'attend-il dans aucune carte (`lo`) ?
-fn sans_carte(distante: [u8; 4]) -> bool {
-    ipv4::router(distante, None, 0).is_ok_and(|(c, _)| ipv4::par_lo(&c))
+/// (Par l'interface `oif`, la liaison de la socket, comme ses segments.)
+fn sans_carte(distante: [u8; 4], oif: u32) -> bool {
+    ipv4::router(distante, None, oif).is_ok_and(|(c, _)| ipv4::par_lo(&c))
 }
 
-fn mss_vers(distante: [u8; 4]) -> u16 {
+fn mss_vers(distante: [u8; 4], oif: u32) -> u16 {
     // (`ipv4_default_advmss` : d'après la MTU du chemin, ce qu'on en a appris compris, et au
     // moins `ip_rt_min_advmss`.)
-    match ipv4::router(distante, None, 0) {
+    match ipv4::router(distante, None, oif) {
         Ok((c, d)) => (ipv4::mtu_vers(&c, d).saturating_sub(40)).clamp(256, 65_495) as u16,
         Err(_) => itcp::MSS_DEFAUT,
     }
@@ -1504,7 +1581,7 @@ fn mss_vers(distante: [u8; 4]) -> u16 {
 /// Livre un segment à sa cible, d'après la table.
 fn livrer(s: Segment) {
     let h = s.entete;
-    let cible = TABLE.verrouiller().as_ref().and_then(|t| t.trouver(s.source, h.source, s.destination, h.destination));
+    let cible = TABLE.verrouiller().as_ref().and_then(|t| t.trouver(s.source, h.source, s.destination, h.destination, s.interface));
     match cible {
         Some(Destinataire::Connexion(Cible::Socket(sock))) | Some(Destinataire::Ecoute(Cible::Socket(sock))) => {
             vers_socket(&sock, Arrivee::Segment(Segment { fille: None, ..s }));
@@ -1515,9 +1592,11 @@ fn livrer(s: Segment) {
         Some(Destinataire::TempsAttente(n)) => temps_attente(n, s),
         // Sans socket, un RST seulement pour une de nos adresses
         // (`tcp_v4_send_reset` : la route du segment reçu doit être
-        // RTN_LOCAL) : pas pour une diffusion, sans rien compter.
-        None if ipv4::avec_table(|t| t.est_a_nous(s.destination)).unwrap_or(false) => {
-            repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip);
+        // RTN_LOCAL) : pas pour une diffusion, ni pour une adresse d'ailleurs
+        // que lo nous a livrée (le SYN d'une socket liée à lo vers 192.0.2.1),
+        // sans rien compter.
+        None if ipv4::est_a_nous(s.destination) => {
+            repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, 0, false);
         }
         None => {}
     }
@@ -1544,7 +1623,8 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     let Some(seq) = tcp.get(4..8).map(|o| u32::from_be_bytes([o[0], o[1], o[2], o[3]])) else { return };
     // (Ses 20 premiers octets au moins sont là : `icmp::ports` les a lus.)
     let ttl = e.origine.get(8).copied().unwrap_or(0);
-    let cible = TABLE.verrouiller().as_ref().and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source));
+    // (Cherchée par l'interface de la route du message, `inet_iif` de `tcp_v4_err`.)
+    let cible = TABLE.verrouiller().as_ref().and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source, e.iif));
     let (sock, fille) = match cible {
         Some(Destinataire::Connexion(Cible::Socket(s))) => (s, None),
         Some(Destinataire::Connexion(Cible::Fille(ecoute, n))) => (ecoute, Some(n)),
@@ -1589,7 +1669,7 @@ fn temps_attente(n: u64, s: Segment) {
         (issue, *e)
     };
     if let Some(isn) = issue.reprendre {
-        if TABLE.verrouiller().as_ref().and_then(|t| t.ecoute(s.destination, h.destination)).is_some() {
+        if TABLE.verrouiller().as_ref().and_then(|t| t.ecoute(s.destination, h.destination, s.interface)).is_some() {
             effacer_temps_attente(n);
             livrer(Segment { isn: Some(isn), ..s });
         } else {
@@ -1604,7 +1684,7 @@ fn temps_attente(n: u64, s: Segment) {
         effacer_temps_attente(n);
     }
     if issue.rst {
-        repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip);
+        repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, e.interface, e.transparent);
     }
     if issue.ack {
         envoyer_ack_tw(&e, &s.ip, issue.hors_fenetre);
@@ -1619,11 +1699,12 @@ fn temps_attente(n: u64, s: Segment) {
 fn envoyer_ack_tw(e: &TempsAttente, recu: &ipv4::EnteteRecu, hors_fenetre: bool) {
     let r = e.regles.entete_ack(crate::temps::ns_monotone());
     let tos = if hors_fenetre { e.tos & !ipv4::ECN } else { e.tos };
-    let Some(ip) = Ip::reponse(recu, e.distante, tos) else {
+    let Some(ip) = Ip::reponse(recu, e.distante, tos, e.interface, e.transparent) else {
         return Compte::Reponse { rst: false }.compter(&MIB, false, false);
     };
     let mut id = crate::aleatoire::u32() as u16;
-    envoyer_segment(&r, Compte::Reponse { rst: false }, e.locale, e.distante, &mut id, ip, 0, None, |_| {});
+    let route = route_de_segment(&ip, e.locale, e.distante, true);
+    envoyer_segment(&r, Compte::Reponse { rst: false }, e.locale, e.distante, &mut id, ip, route, 0, None, |_| {});
 }
 
 fn effacer_temps_attente(n: u64) {
@@ -1659,7 +1740,8 @@ fn par_numero(n: u64) -> Option<Arc<Socket>> {
 }
 
 /// Un segment TCP reçu par `interface` (`p` : le segment, en-tête
-/// compris ; `recu` : ce que la réception a gardé de son en-tête IPv4),
+/// compris ; `recu` : ce que la réception a gardé de son en-tête IPv4), par
+/// la route de `iif` (`inet_iif` : par lo, celle de notre adresse visée),
 /// de `source` pour `destination`, dans la tâche du réseau ou un
 /// vidage de `lo` (`tcp_v4_rcv`) : l'en-tête et la somme (pas pour `lo`),
 /// puis la socket. Un segment faux est jeté sans rien dire ; il compte
@@ -1667,7 +1749,7 @@ fn par_numero(n: u64) -> Option<Arc<Socket>> {
 /// InErrs s'il a un en-tête faux (`bad_packet`) ou une somme fausse (avec
 /// InCsumErrors) ; pas s'il est trop court pour son en-tête (`discard_it`).
 /// `diffusion` : sa destination est une diffusion.
-pub fn recevoir(ip: &fipv4::Ipv4, recu: &ipv4::EnteteRecu, i: &super::interface::Interface, diffusion: bool, mut p: Paquet) {
+pub fn recevoir(ip: &fipv4::Ipv4, recu: &ipv4::EnteteRecu, i: &super::interface::Interface, iif: u32, diffusion: bool, mut p: Paquet) {
     MIB.tcp(Compteur::InSegs);
     let (source, destination, par_lo) = (ip.source, ip.destination, i.boucle());
     let (h, charge) = match ftcp::lire(p.donnees(), source, destination, !par_lo) {
@@ -1685,7 +1767,7 @@ pub fn recevoir(ip: &fipv4::Ipv4, recu: &ipv4::EnteteRecu, i: &super::interface:
     let entete = p.longueur() - charge.len();
     let _ = p.retirer_entete(entete);
     let _contexte = contexte::entrer();
-    livrer(Segment { entete: h, charge: p, source, destination, ip: *recu, interface: i.index, diffusion, fille: None, isn: None });
+    livrer(Segment { entete: h, charge: p, source, destination, ip: *recu, interface: iif, diffusion, fille: None, isn: None });
 }
 
 // --- Les appels ---
@@ -1698,6 +1780,7 @@ pub fn nouvelle(numero: u64) -> Option<Possession<Partie>> {
     let partie = Partie {
         numero, mode: Mode::Neuve, adresses: Adresses::default(), identifiant: 0, orpheline: false, hors_table: false,
         options: OptionsTcp::DEFAUT, etat_socket: EtatSocket::NonConnectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
+        route_oubliee: false,
     };
     let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
     Some(Possession::new(partie, premier))
@@ -1719,14 +1802,25 @@ fn adresse(o: &[u8]) -> Result<socket::AdresseInet, i64> {
 /// multidiffusion, que `connect` remplacera par celle de sa route, ou toute
 /// adresse avec IP_FREEBIND ou IP_TRANSPARENT) ; avec
 /// IP_BIND_ADDRESS_NO_PORT, le port 0 n'en prend pas : il viendra à
-/// `listen` ou à `connect`, et un second `bind` reste permis.
+/// `listen` ou à `connect`, et un second `bind` reste permis. L'adresse est
+/// vérifiée avant de prendre la socket, comme Linux (elle prend la table
+/// des routes) ; la liaison à une interface et SO_REUSEADDR sont lus et
+/// inscrits dans la table sous le `Mutex` des appels, qui les change
+/// (`lier_a_une_interface`, `reutilisation_changee`) : un SO_BINDTODEVICE
+/// qui passe pendant le `bind` est vu par la table, avant ou après lui
+/// (`__inet_bind` tient la socket, `lock_sock`, et `inet_csk_get_port` lit
+/// `sk_bound_dev_if` et `sk_reuse` sous elle). L'ordre est celui de
+/// `lier_a_une_interface` : la possession, le `Mutex`, la table.
 pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     let a = adresse(o)?;
     if a.famille != socket::AF_INET && !(a.famille == socket::AF_UNSPEC && a.adresse == [0; 4]) {
         return Err(-EAFNOSUPPORT);
     }
-    let op = s.appels.verrouiller().options;
-    if !super::datagramme::adresse_de_bind(a.adresse, op.freebind || op.transparent, false) {
+    let libre = {
+        let op = &s.appels.verrouiller().options;
+        op.freebind || op.transparent
+    };
+    if !super::datagramme::adresse_de_bind(a.adresse, libre, false) {
         return Err(-EADDRNOTAVAIL);
     }
     if a.port != 0 && a.port < ports_tcp::PRIVILEGIE && s.uid != 0 {
@@ -1737,13 +1831,15 @@ pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     if p.adresses.lie || !matches!(p.mode, Mode::Neuve) {
         return Err(-EINVAL);
     }
+    let appels = s.appels.verrouiller();
+    let op = &appels.options;
     if a.port == 0 && op.bind_no_port {
         p.adresses = Adresses { adresse: a.adresse, adresse_choisie: a.adresse != [0; 4], ..p.adresses };
         return Ok(());
     }
     let lien = Lien {
         sorte: Sorte::Liee, adresse: a.adresse, port: a.port, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
-        reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range,
+        reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range, interface: op.interface,
     };
     let port = match TABLE.verrouiller().as_mut() {
         Some(t) => t.lier(p.numero, lien, Cible::Socket(s.clone()), crate::aleatoire::u32()),
@@ -1786,7 +1882,7 @@ pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
         let op = s.appels.verrouiller().options;
         let lien = Lien {
             sorte: Sorte::Liee, adresse: p.adresses.adresse, port: 0, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
-            reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range,
+            reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range, interface: op.interface,
         };
         let port = TABLE.verrouiller().as_mut().map(|t| t.lier(p.numero, lien, Cible::Socket(s.clone()), crate::aleatoire::u32()));
         match port {
@@ -1889,7 +1985,12 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 {
                     return Err(super::datagramme::sans_route());
                 }
-                let (chemin, routee) = ipv4::router(ip.vers(a.adresse), liee, 0).map_err(|_| super::datagramme::sans_route())?;
+                // Par la liaison (`tcp_v4_connect` : `sk_bound_dev_if`, seule ;
+                // IP_UNICAST_IF ne compte pas) : une interface qui n'existe pas
+                // (SO_BINDTOIFINDEX ne le vérifie pas) : ENODEV.
+                const ENETUNREACH: i64 = 101;
+                let (chemin, routee) = ipv4::router(ip.vers(a.adresse), liee, ip.oif)
+                    .map_err(|e| if e == -ENETUNREACH { super::datagramme::sans_route() } else { e })?;
                 let destination = if srr { a.adresse } else { routee };
                 let source = liee.unwrap_or_else(|| chemin.source());
                 if fipv4::boucle(source) && !ipv4::par_lo(&chemin) {
@@ -1897,7 +1998,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 }
                 let lien = Lien {
                     sorte: Sorte::Liee, adresse: source, port: 0, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
-                    reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range,
+                    reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range, interface: op.interface,
                 };
                 let place = faillible::boite_vide().map_err(|_| -ENOBUFS)?;
                 let cle = cle_secrete();
@@ -1938,7 +2039,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 }
                 let rcvbuf = s.rcvbuf.load(Ordering::Relaxed) as usize;
                 let echelle = itcp::echelle(rcvbuf, p.options.rcvbuf_fixe, reception_max(), p.options.window_clamp);
-                let mut t = tcb_de_connect(place, port, a.port, iss, mss_vers(ip.vers(destination)), rcvbuf,
+                let mut t = tcb_de_connect(place, port, a.port, iss, mss_vers(ip.vers(destination), ip.oif), rcvbuf,
                                            s.sndbuf.load(Ordering::Relaxed) as usize, echelle);
                 // Ce que la socket garde de ses connexions passées (rien pour une neuve).
                 t.reprendre(&p.options.hors_connexion);
@@ -1953,7 +2054,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 t.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
                 t.memoire = niveau_memoire();
                 t.poser_controle(p.options.controle);
-                t.sans_file = sans_carte(ip.vers(destination));
+                t.sans_file = sans_carte(ip.vers(destination), ip.oif);
                 // TCP_QUICKACK à 0 (`inet_csk_enter_pingpong_mode`), posé avant.
                 if !p.options.quickack {
                     t.quickack(false);
@@ -2051,7 +2152,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             let f = filles.remove(i).expect("la fille");
             let (port, distante, port_distant, locale) = (f.tcb.port_local, f.distante, f.tcb.port_distant, f.locale);
             let (mc_ttl, rcv_tos, mc_index) = f.arrivee;
-            let (numero, ip_options) = (f.numero, f.options);
+            let (numero, ip_options, interface) = (f.numero, f.options, f.interface);
             let enfant = enfant.avec_numero(numero);
             // Une fille fermée avant l'accept (un RST) a déjà quitté la
             // table : sa lecture dira son erreur.
@@ -2067,8 +2168,9 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 identifiant: f.identifiant, orpheline: false, hors_table,
                 // Tout, sauf ce qui est propre à une écoute (`inet_csk_clone_lock`,
                 // `inet_csk_delack_init`) : la fille n'attend pas de données pour naître deux fois.
-                options: OptionsTcp { defer_accept: 0, quickack: true, ip_options, ..p.options },
+                options: OptionsTcp { defer_accept: 0, quickack: true, ip_options, interface, ..p.options },
                 etat_socket: EtatSocket::Connectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
+                route_oubliee: false,
             };
             let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
             let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
@@ -2078,7 +2180,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             enfant.recverr.store(options.recverr, Ordering::Relaxed);
             enfant.pmtudisc.store(options.pmtudisc, Ordering::Relaxed);
             enfant.peek_off.store(s.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
-            enfant.appels.verrouiller().options = socket::Options { mc_ttl, rcv_tos, mc_index, ip_options, ..options };
+            enfant.appels.verrouiller().options = socket::Options { mc_ttl, rcv_tos, mc_index, ip_options, interface, ..options };
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.changer_objet(numero, Cible::Socket(enfant.clone()));
             }
@@ -2596,7 +2698,7 @@ fn arreter_les_filles(filles: &mut VecDeque<Fille>, ip: Ip) {
     for f in filles.iter_mut() {
         if f.tcb.etat() != Etat::SynRecu {
             f.tcb.avorter();
-            emettre_tcb(&mut f.tcb, f.locale, f.distante, &mut f.identifiant, ip.avec(f.options), None, None);
+            f.emettre(ip, None);
         }
         if let Some(t) = TABLE.verrouiller().as_mut() {
             t.retirer(f.numero);
@@ -2702,8 +2804,16 @@ pub fn files(s: &Socket) -> Result<(usize, usize, usize, bool), i64> {
 /// le changement fait partir (TCP_NODELAY, TCP_CORK retiré), et les
 /// minuteurs (le keepalive).
 pub fn avec_options<R>(s: &Socket, f: impl FnOnce(&mut OptionsTcp, Option<&mut Tcb<Paquet>>) -> R) -> R {
+    avec_options_et_route(s, false, f)
+}
+
+/// Le même ; avec `oublier_la_route`, la route gardée de la connexion est
+/// oubliée sous la même possession (`sk_dst_reset` : un IP_TOS qui change) :
+/// IP_MTU dit ENOTCONN jusqu'au segment suivant qui en trouve une (mesuré).
+pub fn avec_options_et_route<R>(s: &Socket, oublier_la_route: bool, f: impl FnOnce(&mut OptionsTcp, Option<&mut Tcb<Paquet>>) -> R) -> R {
     let mut g = flux(s).posseder();
     let p = g.donnee();
+    p.route_oubliee |= oublier_la_route;
     let tcb = match &mut p.mode {
         Mode::Connexion(t) => Some(&mut **t),
         _ => None,
@@ -2770,14 +2880,15 @@ pub fn advmss_de(s: &Socket) -> Option<u32> {
     avec_options(s, |_, t| t.map(|t| t.info(maintenant()).advmss))
 }
 
-/// IP_MTU d'une connexion (`dst_mtu`) ; None : pas de connexion (ENOTCONN).
+/// IP_MTU d'une connexion (`dst_mtu`), par sa liaison ; None : pas de
+/// connexion, ou sa route oubliée (ENOTCONN : `sk_dst_get` nul).
 pub fn mtu_du_chemin(s: &Socket) -> Option<u32> {
     let mut g = flux(s).posseder();
     let p = g.donnee();
-    if !matches!(p.mode, Mode::Connexion(_)) {
+    if !matches!(p.mode, Mode::Connexion(_)) || p.route_oubliee {
         return None;
     }
-    ipv4::router(p.adresses.distante, None, 0).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
+    ipv4::router(p.adresses.distante, None, p.options.interface).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
 }
 
 /// SO_RCVBUF, qui grandit de même (reception.rs).
@@ -2954,6 +3065,24 @@ pub fn attentes() -> usize {
         });
     }
     n
+}
+
+/// SO_BINDTODEVICE ou SO_BINDTOIFINDEX (`sock_bindtoindex_locked`), sous la
+/// possession de la socket (le `lock_sock` de Linux), puis son `Mutex` : `poser`
+/// vérifie et pose la liaison dans ses options. Puis la table l'apprend (Linux
+/// la lit sur la socket à chaque recherche et à chaque conflit, son écoute ou
+/// sa connexion comprises), ses segments suivants partent par elle (sa copie),
+/// et sa route est oubliée (`sk_dst_reset`).
+pub fn lier_a_une_interface(s: &Socket, poser: impl FnOnce(&mut socket::Inet) -> Result<u32, i64>) -> Result<(), i64> {
+    let mut g = flux(s).posseder();
+    let p = g.donnee();
+    let k = poser(&mut s.appels.verrouiller())?;
+    if let Some(t) = TABLE.verrouiller().as_mut() {
+        t.changer_interface(p.numero, k);
+    }
+    p.options.interface = k;
+    p.route_oubliee = true;
+    Ok(())
 }
 
 /// SO_REUSEADDR ou SO_REUSEPORT a changé : la table le lit au moment des

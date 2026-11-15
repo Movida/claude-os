@@ -54,7 +54,7 @@ pub fn initialiser() {
 pub fn inscrire(s: &Arc<Socket>, inet: &mut Inet, ident: u16) -> Result<(), i64> {
     let mut g = IDENTS.verrouiller();
     let Some(t) = g.as_mut() else { return Err(-ENOBUFS) };
-    match t.lier(s.numero, ident, inet.adresse, inet.options.reuseaddr, s.clone()) {
+    match t.lier(s.numero, ident, inet.adresse, inet.options.reuseaddr, inet.options.interface, s.clone()) {
         Ok(i) => {
             inet.port = i;
             inet.lie = true;
@@ -77,6 +77,13 @@ pub fn changer(s: &Socket, inet: &Inet) {
 pub fn liberer(s: &Socket) {
     if let Some(t) = IDENTS.verrouiller().as_mut() {
         t.retirer(s.numero);
+    }
+}
+
+/// La liaison à une interface a changé (SO_BINDTODEVICE).
+pub fn interface_changee(s: &Socket, interface: u32) {
+    if let Some(t) = IDENTS.verrouiller().as_mut() {
+        t.changer_interface(s.numero, interface);
     }
 }
 
@@ -166,10 +173,10 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
 /// (`icmp_rcv` la vérifie sur tout le message : CHECKSUM_COMPLETE), et ses
 /// « ports » d'IP_ORIGDSTADDR sont les octets 2 et 3 de l'en-tête ICMP :
 /// la somme du message (mesuré).
-pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], entete: &ipv4::EnteteRecu, p: Paquet) {
+pub fn recevoir(interface: u32, iif: u32, source: [u8; 4], destination: [u8; 4], entete: &ipv4::EnteteRecu, p: Paquet) {
     let Ok((m, _)) = icmp::lire(p.donnees()) else { return };
     let (ident, _) = m.echo();
-    let Some(s) = IDENTS.verrouiller().as_ref().and_then(|t| t.trouver(ident, destination)) else {
+    let Some(s) = IDENTS.verrouiller().as_ref().and_then(|t| t.trouver(ident, destination, iif)) else {
         SANS_SOCKET.fetch_add(1, Ordering::Relaxed);
         return;
     };
@@ -198,7 +205,7 @@ pub fn erreur(e: &ErreurRecue) {
         return;
     }
     let Some(ident) = e.origine.get(debut + 4..debut + 6).map(|o| u16::from_be_bytes([o[0], o[1]])) else { return };
-    let Some(s) = IDENTS.verrouiller().as_ref().and_then(|t| t.trouver(ident, e.destination)) else { return };
+    let Some(s) = IDENTS.verrouiller().as_ref().and_then(|t| t.trouver(ident, e.destination, e.iif)) else { return };
     super::udp::apprendre_si_mtu(e);
     let (errno, fatale) = match e.genre {
         icmp::ETOUFFEMENT | icmp::REDIRECTION => (EREMOTEIO, false),
