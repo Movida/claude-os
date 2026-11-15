@@ -143,6 +143,35 @@ pub fn ecrire(o: &mut [u8; ENTETE], h: &Ipv4) {
     o[10..12].copy_from_slice(&s.to_be_bytes());
 }
 
+/// La découpe d'un paquet trop grand pour sa MTU (`ip_do_fragment` et
+/// `ip_frag_next` de Linux) : `charge` octets après un en-tête de `entete`
+/// octets (options comprises), pour la MTU `mtu`. Chaque fragment porte au
+/// plus `mtu - entete` octets, et chacun de ceux qui ne finissent pas le
+/// paquet un multiple de 8 (le décalage du suivant s'écrit en mots de 8
+/// octets) : le dernier n'est jamais arrondi, et peut porter jusqu'à 7
+/// octets de plus que les autres. La taille du fragment qui commence à
+/// `debut`.
+pub fn taille_du_fragment(charge: usize, debut: usize, mtu: usize, entete: usize) -> usize {
+    let (reste, place) = (charge.saturating_sub(debut), place_d_un_fragment(mtu, entete));
+    if reste <= place { reste } else { place & !7 }
+}
+
+/// Le nombre de fragments de cette découpe (`taille_du_fragment`) : un
+/// seul si le paquet tient. C'est aussi la géométrie des `sk_buff` que
+/// Linux enchaîne pour un datagramme (`__ip_append_data` coupe à
+/// `maxfraglen`, sauf à la fin).
+pub fn nombre_de_fragments(charge: usize, mtu: usize, entete: usize) -> usize {
+    let place = place_d_un_fragment(mtu, entete);
+    if charge <= place { 1 } else { 1 + (charge - place).div_ceil(place & !7) }
+}
+
+/// La place des données d'un fragment, au moins 8 octets : une MTU d'au
+/// moins 68 octets (le minimum d'IPv4) les laisse toujours, même avec 40
+/// octets d'options ; jamais de division par zéro.
+fn place_d_un_fragment(mtu: usize, entete: usize) -> usize {
+    mtu.saturating_sub(entete).max(8)
+}
+
 /// Une adresse de multidiffusion (224.0.0.0/4, la « classe D »).
 pub fn multidiffusion(a: [u8; 4]) -> bool {
     a[0] & 0xF0 == 0xE0

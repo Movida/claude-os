@@ -469,8 +469,9 @@ pub fn emettre(c: Chemin, e: &Envoi, p: Paquet) {
 
 /// `ip_fragment`, `ip_do_fragment` : un paquet trop grand. Avec DF, il ne passera pas :
 /// l'erreur ICMP, à nous-mêmes (« fragmentation nécessaire », avec la MTU) ; sinon, en
-/// morceaux, chacun un multiple de 8 octets sauf le dernier, sa place et MF dans son
-/// en-tête. Un morceau qu'on ne peut pas faire : le paquet est perdu.
+/// morceaux, chacun un multiple de 8 octets sauf le dernier (`ipv4::taille_du_fragment`),
+/// sa place et MF dans son en-tête. Un morceau qu'on ne peut pas faire : le paquet est
+/// perdu.
 fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
     if e.ne_pas_fragmenter {
         let total = (p.longueur() + ipv4::ENTETE) as u16;
@@ -479,22 +480,21 @@ fn fragmenter(c: Chemin, e: &Envoi, mut p: Paquet) {
         ipv4::ecrire(entete, &en_tete(e, total, 0, false));
         return super::icmp::envoyer_erreur(icmp::INJOIGNABLE, icmp::FRAGMENTATION, e.mtu, p.donnees(), par_lo(&c), false, false);
     }
-    let place = (e.mtu as usize - ipv4::ENTETE) & !7;
     let mut debut = 0;
     let donnees = p.donnees();
     while debut < donnees.len() {
         let reste = donnees.len() - debut;
-        let n = if reste > place { place } else { reste };
-        let Some(mut q) = Paquet::vide(n) else { return };
+        let longueur = ipv4::taille_du_fragment(donnees.len(), debut, e.mtu as usize, ipv4::ENTETE);
+        let Some(mut q) = Paquet::vide(longueur) else { return };
         // Chaque morceau compte dans le SO_SNDBUF de la socket, comme le
         // paquet entier (`__ip_append_data` les lui attache un à un).
         if let Some(r) = p.retenue() {
             q.attacher(r, 0);
         }
-        let Some(o) = q.ajouter_fin(n) else { return };
-        o.copy_from_slice(&donnees[debut..debut + n]);
-        envoyer(c, e, q, (debut / 8) as u16, n < reste);
-        debut += n;
+        let Some(o) = q.ajouter_fin(longueur) else { return };
+        o.copy_from_slice(&donnees[debut..debut + longueur]);
+        envoyer(c, e, q, (debut / 8) as u16, longueur < reste);
+        debut += longueur;
     }
 }
 

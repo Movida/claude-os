@@ -219,6 +219,38 @@ fn options_dhcp_abimees() {
 }
 
 #[test]
+fn fragments_comme_linux() {
+    // La découpe de `ip_frag_next` : les fragments pleins arrondis à 8,
+    // le dernier tel quel, jusqu'à `mtu - entete`. 1 480 est un multiple
+    // de 8 : rien ne change pour l'en-tête simple et une MTU de 1 500.
+    let decoupe = |charge: usize, mtu: usize, entete: usize| {
+        let mut tailles = Vec::new();
+        let mut debut = 0;
+        while debut < charge {
+            let n = ipv4::taille_du_fragment(charge, debut, mtu, entete);
+            tailles.push(n);
+            debut += n;
+        }
+        assert_eq!(tailles.len().max(1), ipv4::nombre_de_fragments(charge, mtu, entete));
+        tailles
+    };
+    assert_eq!(decoupe(1480, 1500, 20), [1480]);
+    assert_eq!(decoupe(2960, 1500, 20), [1480, 1480]);
+    assert_eq!(decoupe(2961, 1500, 20), [1480, 1480, 1]);
+    // 4 octets d'options : 1 476 de place, 1 472 pour un fragment plein ;
+    // un dernier de 1 476 tient (Linux : deux fragments, pas trois).
+    assert_eq!(decoupe(2948, 1500, 24), [1472, 1476]);
+    assert_eq!(decoupe(2949, 1500, 24), [1472, 1472, 5]);
+    // La MTU la plus petite qu'apprend Linux (552) : 532 de place, 528
+    // pour un fragment plein.
+    assert_eq!(decoupe(1060, 552, 20), [528, 532]);
+    assert_eq!(decoupe(532, 552, 20), [532]);
+    assert_eq!(ipv4::nombre_de_fragments(0, 1500, 20), 1);
+    // 68 octets et 40 d'options : 8 octets par fragment.
+    assert_eq!(decoupe(20, 68, 60), [8, 8, 4]);
+}
+
+#[test]
 fn masques() {
     assert_eq!(ipv4::masque(24), [255, 255, 255, 0]);
     assert_eq!((ipv4::masque(0), ipv4::masque(32)), ([0; 4], [255; 4]));

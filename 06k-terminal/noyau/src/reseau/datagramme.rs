@@ -365,20 +365,23 @@ pub fn attendre_place(s: &Socket, non_bloquant: bool, delai: Option<u64>) -> Res
 }
 
 /// Un datagramme de `charge` octets (après l'en-tête IPv4) qui sera
-/// découpé en morceaux pour la MTU `mtu` : ses morceaux, comptés à leur
-/// taille vraie, ne doivent pas mener ce qui est en route au-delà du double
-/// de SO_SNDBUF (le `wmem_alloc_delta <= 2 * sk_sndbuf` de
-/// `__ip_append_data`) : ENOBUFS. Sans découpage, ou avec DF (le paquet ne
-/// partira pas), rien à compter.
+/// découpé en morceaux pour la MTU `mtu` (`format_ipv4::nombre_de_fragments`) :
+/// le premier prend sa place par `attendre_place` (`sock_alloc_send_skb`) ;
+/// chacun des suivants, avant d'être fait, ne doit pas mener ce qui est en
+/// route, les morceaux d'avant de cet envoi compris (pleins, comptés à leur
+/// taille vraie), au-delà du double de SO_SNDBUF (le `wmem_alloc_delta <= 2
+/// * sk_sndbuf` de `__ip_append_data`) : ENOBUFS. Le plus exigeant est le
+/// dernier. Sans découpage, ou avec DF (le paquet ne partira pas), rien à
+/// compter.
 pub fn morceaux_permis(s: &Socket, charge: usize, envoi: &ipv4::Envoi) -> Result<(), i64> {
     const ENOBUFS: i64 = 105;
     let Some(r) = &s.envois else { return Ok(()) };
     if charge + format_ipv4::ENTETE <= envoi.mtu as usize || envoi.ne_pas_fragmenter {
         return Ok(());
     }
-    let place = (envoi.mtu as usize - format_ipv4::ENTETE) & !7;
-    let morceaux = charge.div_ceil(place);
-    let taille = morceaux * (paquet::MARGE + place + paquet::SURCOUT);
+    let plein = (envoi.mtu as usize - format_ipv4::ENTETE) & !7;
+    let morceaux = format_ipv4::nombre_de_fragments(charge, envoi.mtu as usize, format_ipv4::ENTETE);
+    let taille = (morceaux - 1) * (paquet::MARGE + plein + paquet::SURCOUT);
     if r.octets() + taille > 2 * r.limite() {
         return Err(-ENOBUFS);
     }
