@@ -1486,10 +1486,10 @@ static int poser_ip(int s, int option, int v, socklen_t l)
     return erreur(setsockopt(s, IPPROTO_IP, option, &v, l));
 }
 
-/* Un envoi vers 127.0.0.1:9 depuis la source `source` d'IP_PKTINFO. */
-static int envoyer_depuis(int s, uint32_t source)
+/* Un envoi vers 127.0.0.1:`port` depuis la source `source` d'IP_PKTINFO. */
+static int envoyer_depuis_au_port(int s, uint32_t source, uint16_t port)
 {
-    struct sockaddr_in d = adresse(LO, 9);
+    struct sockaddr_in d = adresse(LO, port);
     char c[CMSG_SPACE(sizeof(struct in_pktinfo))] = { 0 };
     struct iovec v = { "x", 1 };
     struct msghdr m = { .msg_name = &d, .msg_namelen = sizeof d, .msg_iov = &v, .msg_iovlen = 1, .msg_control = c, .msg_controllen = sizeof c };
@@ -1499,6 +1499,11 @@ static int envoyer_depuis(int s, uint32_t source)
     h->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
     ((struct in_pktinfo *)CMSG_DATA(h))->ipi_spec_dst.s_addr = htonl(source);
     return erreur(sendmsg(s, &m, 0));
+}
+
+static int envoyer_depuis(int s, uint32_t source)
+{
+    return envoyer_depuis_au_port(s, source, 9);
 }
 
 static uint16_t port_local(int s, uint32_t *ip)
@@ -1613,6 +1618,24 @@ static void sol_ip(void)
                  && envoyer_depuis(s, 0xffffffff) == EINVAL && envoyer_depuis(s, LO + 1) == 0,
              "IP_PKTINFO d'une source : pas a nous, ENETUNREACH ; multidiffusion ou diffusion, EINVAL ; 127.0.0.2, permise");
     close(s);
+    /* IP_PKTINFO remplace l'adresse liée, même par 0.0.0.0 (`ip_cmsg_send` :
+     * `ipc->addr`) : la route choisit alors la source, comme sans bind (vers
+     * 127.0.0.1 : elle-même). Sans IP_PKTINFO, l'adresse liée. */
+    {
+        uint16_t port;
+        int t = liee(&port);
+        struct sockaddr_in b = adresse(LO + 1, 0), de;
+        struct in_pktinfo pi;
+        s = udp(0);
+        int ok = bind(s, (struct sockaddr *)&b, sizeof b) == 0;
+        ok = ok && envoyer_depuis_au_port(s, 0, port) == 0 && recu_avec_pktinfo(t, &de, &pi, 1000) == 1 && de.sin_addr.s_addr == htonl(LO);
+        b = adresse(LO, port);
+        ok = ok && sendto(s, "x", 1, 0, (struct sockaddr *)&b, sizeof b) == 1 && recu_avec_pktinfo(t, &de, &pi, 1000) == 1
+             && de.sin_addr.s_addr == htonl(LO + 1);
+        verifier(ok, "IP_PKTINFO d'une source 0.0.0.0, liee a 127.0.0.2 : celle de la route (127.0.0.1)");
+        close(s);
+        close(t);
+    }
     if (q >= 0) {
         int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
         struct sockaddr_in m = adresse(0xe0000001, 0);

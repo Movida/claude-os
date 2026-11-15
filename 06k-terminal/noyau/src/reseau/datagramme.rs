@@ -298,7 +298,7 @@ fn interface_demandee(inet: &Inet, destination: [u8; 4], c: &Controle) -> u32 {
 /// La route d'un envoi ou d'une connexion vers `destination`, par
 /// l'interface demandée (`interface_demandee`, ou celle de la route gardée
 /// `gardee`), dans l'ordre d'`ip_route_output_flow` : une source demandée
-/// (IP_PKTINFO, celle de `bind`, et vers un groupe, à défaut des deux,
+/// (IP_PKTINFO, sinon celle de `bind` ; vers un groupe, à défaut des deux,
 /// l'adresse donnée à IP_MULTICAST_IF, `mc_addr` : `udp_sendmsg`,
 /// `ping_v4_sendmsg`, `__ip4_datagram_connect`) passe par
 /// `ipv4::router_depuis` : de multidiffusion ou de diffusion limitée,
@@ -325,7 +325,9 @@ pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64, st
     const MSG_DONTROUTE: u64 = 4;
     const ENETUNREACH: i64 = 101;
     let mc_addr = Some(inet.options.mc_addr).filter(|&a| a != format_ipv4::AUCUNE && format_ipv4::multidiffusion(destination));
-    let demandee = c.source.filter(|&a| a != format_ipv4::AUCUNE).or_else(|| source_liee(inet)).or(mc_addr);
+    // IP_PKTINFO remplace l'adresse liée, même par 0.0.0.0 : la route choisit
+    // alors (`ip_cmsg_send` : `ipc->addr`, mesuré).
+    let demandee = c.source.or_else(|| source_liee(inet)).filter(|&a| a != format_ipv4::AUCUNE).or(mc_addr);
     let oif = gardee.unwrap_or_else(|| interface_demandee(inet, destination, c));
     let portee = if inet.options.dontroute || drapeaux & MSG_DONTROUTE != 0 || stricte { Portee::Lien } else { Portee::Univers };
     let (chemin, destination, oif) = match demandee {
