@@ -80,7 +80,7 @@ use formats::reseau::{Erreur, dhcp as format_dhcp, ethernet, icmp, ipv4, udp};
 use inet::fragments::{Cle, Issue, Morceau, Reassemblage};
 use inet::snmp::Ip;
 use inet::pmtu::Exceptions;
-use inet::routes::{Chemin, Table};
+use inet::routes::{Chemin, Portee, Table};
 
 const ENETUNREACH: i64 = 101;
 
@@ -530,14 +530,15 @@ pub struct Envoi {
 /// machine », et devient la source demandée (`source` : celle de `bind` ou
 /// d'IP_PKTINFO), ou l'adresse que propose l'interface demandée, ou
 /// 127.0.0.1 (inet::routes, `Table::router`, comme
-/// `ip_route_output_key_hash_rcu`). Une interface qui n'existe pas : ENODEV ;
-/// pas de route : ENETUNREACH.
-pub fn router(destination: [u8; 4], source: Option<[u8; 4]>, oif: u32) -> Result<(Chemin, [u8; 4]), i64> {
+/// `ip_route_output_key_hash_rcu`), parmi les routes de portée `portee` au
+/// moins (« lien » : SO_DONTROUTE, voir inet::routes). Une interface qui
+/// n'existe pas : ENODEV ; pas de route : ENETUNREACH.
+pub fn router(destination: [u8; 4], source: Option<[u8; 4]>, oif: u32, portee: Portee) -> Result<(Chemin, [u8; 4]), i64> {
     const ENODEV: i64 = 19;
     if oif != 0 && interface::par_index(oif).is_none() {
         return Err(-ENODEV);
     }
-    TABLE.verrouiller().as_ref().and_then(|t| t.router(destination, source, oif)).ok_or(-ENETUNREACH)
+    TABLE.verrouiller().as_ref().and_then(|t| t.router(destination, source, oif, portee)).ok_or(-ENETUNREACH)
 }
 
 /// Le même, pour un envoi qui part de `source` : une source de groupe ou la
@@ -550,7 +551,8 @@ pub fn router(destination: [u8; 4], source: Option<[u8; 4]>, oif: u32) -> Result
 /// `__mkroute_output` : une connexion de 127.0.0.1 liée à la carte). Pour TCP,
 /// dont chaque segment le demande. (Linux refuse la source avant l'interface ;
 /// un segment ne montre pas laquelle des erreurs l'a arrêté.)
-pub fn router_depuis(destination: [u8; 4], source: [u8; 4], oif: u32, toute_source: bool) -> Result<(Chemin, [u8; 4]), i64> {
+pub fn router_depuis(destination: [u8; 4], source: [u8; 4], oif: u32, toute_source: bool, portee: Portee)
+                     -> Result<(Chemin, [u8; 4]), i64> {
     const ENODEV: i64 = 19;
     const EINVAL: i64 = 22;
     if ipv4::multidiffusion(source) || source == ipv4::DIFFUSION {
@@ -565,7 +567,7 @@ pub fn router_depuis(destination: [u8; 4], source: [u8; 4], oif: u32, toute_sour
         if !toute_source && !t.est_a_nous(source) {
             return Err(-ENETUNREACH);
         }
-        t.router(destination, Some(source), oif).ok_or(-ENETUNREACH)?
+        t.router(destination, Some(source), oif, portee).ok_or(-ENETUNREACH)?
     };
     if ipv4::boucle(source) && !par_lo(&route.0) {
         return Err(-EINVAL);
@@ -612,7 +614,7 @@ pub fn mtu_verrouillee(destination: [u8; 4]) -> bool {
 
 /// ICMP dit `info` vers `destination` (`__ip_rt_update_pmtu`).
 pub fn apprendre_mtu(destination: [u8; 4], info: u32) {
-    if let Ok((c, d)) = router(destination, None, 0) {
+    if let Ok((c, d)) = router(destination, None, 0, Portee::Univers) {
         EXCEPTIONS.verrouiller().apprendre(d, info, mtu(&c), crate::temps::ns_monotone());
     }
 }

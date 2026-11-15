@@ -2900,6 +2900,44 @@ static void sol_ip(void)
              "bind de 255.255.255.255 : permis ; connect, de 127.0.0.1 et du meme port");
     close(s);
 
+    /* SO_DONTROUTE : les routes de la socket sont de portée « lien »
+     * (`ip_sock_rt_scope`) : une machine d'ailleurs n'a pas de route (la route
+     * par défaut passe par une passerelle) ; lo garde la sienne (mesuré sous
+     * Linux 6.18.33). */
+    int un = 1;
+    s = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    setsockopt(s, SOL_SOCKET, SO_DONTROUTE, &un, sizeof un);
+    d.sin_addr.s_addr = htonl(0xc0000201);
+    d.sin_port = htons(9);
+    ok = connect(s, (void *)&d, sizeof d) < 0 && errno == ENETUNREACH;
+    close(s);
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(s, SOL_SOCKET, SO_DONTROUTE, &un, sizeof un);
+    verifier(ok && connect(s, (void *)&x, sizeof x) == 0, "SO_DONTROUTE : connect vers 192.0.2.1, ENETUNREACH ; vers lo, permis");
+    close(s);
+    /* Posée ou retirée, elle oublie la route gardée d'une connexion (`sk_setsockopt` :
+     * `sk_dst_reset`) : IP_MTU dit ENOTCONN jusqu'au segment suivant, qui en retrouve une
+     * (lo est de portée « lien »). */
+    int pdr, ld = ecoute(&pdr, 1);
+    struct sockaddr_in xd = lo(pdr);
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    connect(s, (void *)&xd, sizeof xd);
+    int dr = accept(ld, NULL, NULL), zero = 0;
+    char lu;
+    int dr_avant = option(s, IPPROTO_IP, IP_MTU);
+    setsockopt(s, SOL_SOCKET, SO_DONTROUTE, &un, sizeof un);
+    int dr_pose = option(s, IPPROTO_IP, IP_MTU);
+    send(s, "a", 1, 0);
+    int dr_recu = recv(dr, &lu, 1, 0) == 1;
+    int dr_apres = option(s, IPPROTO_IP, IP_MTU);
+    setsockopt(s, SOL_SOCKET, SO_DONTROUTE, &zero, sizeof zero);
+    verifier(dr_avant == 65535 && dr_pose == -1000 - ENOTCONN && dr_recu && dr_apres == 65535
+                 && option(s, IPPROTO_IP, IP_MTU) == -1000 - ENOTCONN,
+             "SO_DONTROUTE pose, puis retire : IP_MTU ENOTCONN, la route retrouvee par le segment suivant");
+    close(s);
+    close(dr);
+    close(ld);
+
     /* IP_BIND_ADDRESS_NO_PORT : l'adresse sans port ; le port à listen, ou à connect ; la
      * déconnexion garde l'adresse. */
     s = socket(AF_INET, SOCK_STREAM, 0);

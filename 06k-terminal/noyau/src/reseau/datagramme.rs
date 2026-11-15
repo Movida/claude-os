@@ -20,7 +20,7 @@ use crate::partage::Arc;
 use core::sync::atomic::Ordering;
 use formats::reseau::ipv4 as format_ipv4;
 use inet::ports;
-use inet::routes::Chemin;
+use inet::routes::{Chemin, Portee};
 use inet::snmp::Ip;
 
 const EAGAIN: i64 = 11;
@@ -90,7 +90,7 @@ pub mod table {
 pub fn diffusion(a: [u8; 4]) -> bool {
     a == format_ipv4::DIFFUSION
         || format_ipv4::multidiffusion(a)
-        || ipv4::avec_table(|t| matches!(t.chercher(a, 0), Some(Chemin::Diffusion { .. }))).unwrap_or(false)
+        || ipv4::avec_table(|t| matches!(t.chercher(a, 0, Portee::Univers), Some(Chemin::Diffusion { .. }))).unwrap_or(false)
 }
 
 /// L'adresse `a` peut-elle être celle d'un `bind` (`inet_addr_valid_or_nonlocal`) :
@@ -242,11 +242,12 @@ pub fn pair(s: &Socket) -> Option<([u8; 4], u16)> {
 }
 
 /// La MTU de la route gardée d'une socket connectée (IP_MTU : `sk_dst_get`) ;
-/// None : pas de route gardée (ENOTCONN).
+/// None : pas de route gardée (ENOTCONN). Une route gardée est de portée
+/// « univers » : SO_DONTROUTE n'en garde pas (`preparer`).
 pub fn mtu(s: &Socket) -> Option<u32> {
     let inet = s.appels.verrouiller();
     let oif = inet.route_gardee.filter(|_| inet.connecte)?;
-    ipv4::router(inet.distante, None, oif).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
+    ipv4::router(inet.distante, None, oif, Portee::Univers).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
 }
 
 /// Ce que précisent les messages de contrôle d'un envoi (`ip_cmsg_send`) :
@@ -307,11 +308,12 @@ fn interface_demandee(inet: &Inet, destination: [u8; 4], c: &Controle) -> u32 {
 /// `ipv4_is_zeronet` ne regarde plus que 0.0.0.0), sauf avec
 /// IP_TRANSPARENT (FLOWI_FLAG_ANYSRC) ; l'interface demandée qui n'existe
 /// pas : ENODEV ; 0.0.0.0, la source demandée, celle que propose
-/// l'interface, ou 127.0.0.1 (`ipv4::router`) ; pas de route : ENETUNREACH ; avec
-/// SO_DONTROUTE ou MSG_DONTROUTE, seulement une machine d'un réseau
-/// directement branché (RTO_ONLINK : ENETUNREACH par une passerelle), de
-/// même avec une route source stricte (`stricte`, SSRR : sa première étape
-/// doit être une voisine, `is_strictroute`) ; une
+/// l'interface, ou 127.0.0.1 (`ipv4::router`) ; pas de route : ENETUNREACH. Avec
+/// SO_DONTROUTE ou MSG_DONTROUTE, ou une route source stricte (`stricte`,
+/// SSRR : sa première étape doit être une voisine, `is_strictroute`), la
+/// route est de portée « lien » (`ip_sendmsg_scope`) : pas de route par une
+/// passerelle (ENETUNREACH), mais par une interface demandée, une machine
+/// d'ailleurs est sur son lien (mesuré) ; une
 /// source de la boucle (127.0.0.0/8) qui sortirait par une carte : EINVAL
 /// (`__mkroute_output` : l'autre bout la jetterait comme un martien) ; une
 /// diffusion sans SO_BROADCAST : EACCES.
@@ -334,12 +336,9 @@ pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64, st
             return Err(sans_route());
         }
     }
-    let (chemin, destination) = ipv4::router(destination, demandee, oif)
+    let portee = if inet.options.dontroute || drapeaux & MSG_DONTROUTE != 0 || stricte { Portee::Lien } else { Portee::Univers };
+    let (chemin, destination) = ipv4::router(destination, demandee, oif, portee)
         .map_err(|e| if e == -ENETUNREACH { sans_route() } else { e })?;
-    if (inet.options.dontroute || drapeaux & MSG_DONTROUTE != 0 || stricte)
-        && matches!(chemin, Chemin::Unicast { prochain, .. } if prochain != destination) {
-        return Err(sans_route());
-    }
     let source = demandee.unwrap_or_else(|| chemin.source());
     if format_ipv4::boucle(source) && !ipv4::par_lo(&chemin) {
         return Err(-EINVAL);

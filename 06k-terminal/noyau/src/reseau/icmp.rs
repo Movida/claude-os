@@ -56,6 +56,7 @@ use formats::reseau::Erreur;
 use formats::reseau::icmp::{self, Icmp, Interne};
 use formats::reseau::ipv4 as format_ipv4;
 use inet::pairs::Pairs;
+use inet::routes::Portee;
 use inet::snmp::{Icmp as Compteur, Ip};
 
 /// Le crédit de la limite globale (`icmp_global_credit`) et l'instant où
@@ -256,7 +257,7 @@ fn repondre(h: &format_ipv4::Ipv4, entete: &ipv4::EnteteRecu, reponse: &Icmp, mo
     let Ok(options) = format_ipv4::options_echo(entete.options(), &entete.compilees, h.source, &ipv4::unicast) else { return };
     let vers = if options.places.route_source != 0 { options.premier_saut } else { h.source };
     let longueur: usize = morceaux.iter().map(|m| m.len()).sum();
-    let Ok((chemin, destination)) = ipv4::router(vers, None, 0) else { return };
+    let Ok((chemin, destination)) = ipv4::router(vers, None, 0, Portee::Univers) else { return };
     // La source est l'adresse visée (`fib_compute_spec_dst`) ; la route
     // d'une réponse ne part que d'une adresse à nous (`icmp_reply`, sans
     // FLOWI_FLAG_ANYSRC) : un écho livré ici par un envoi forcé par lo, à
@@ -306,7 +307,7 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], options: &
     if trame_diffusee || h.decalage != 0 {
         return;
     }
-    let Ok((chemin_origine, _)) = ipv4::router(h.destination, None, 0) else { return };
+    let Ok((chemin_origine, _)) = ipv4::router(h.destination, None, 0, Portee::Univers) else { return };
     if matches!(chemin_origine, inet::routes::Chemin::Diffusion { .. }) || format_ipv4::multidiffusion(h.destination) {
         return;
     }
@@ -327,7 +328,7 @@ pub fn envoyer_erreur(genre: u8, code: u8, info: u32, origine: &[u8], options: &
     let cite = origine.get(format_ipv4::ENTETE..h.longueur_entete).unwrap_or(&[]);
     let Ok(echo) = format_ipv4::options_echo(cite, options, h.source, &ipv4::unicast) else { return };
     let vers = if echo.places.route_source != 0 { echo.premier_saut } else { h.source };
-    let Ok((chemin, destination)) = ipv4::router(vers, None, 0) else { return };
+    let Ok((chemin, destination)) = ipv4::router(vers, None, 0, Portee::Univers) else { return };
     // La source : la destination du paquet s'il était pour nous, sinon celle
     // de la route ; elle doit être à nous (`icmp_route_lookup`, sans
     // FLOWI_FLAG_ANYSRC) : un datagramme livré ici par un envoi forcé par lo,

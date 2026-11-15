@@ -1551,6 +1551,9 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
     match option {
         SO_DEBUG if oui && s.uid != 0 => return Err(-EACCES),
         SO_DEBUG => op.debug = oui,
+        // La route gardée oubliée, posé ou retiré (`sk_dst_reset`) : IP_MTU
+        // dit ENOTCONN ; une connexion UDP n'en garde plus tant qu'il est
+        // posé (`preparer`), TCP en retrouve une au segment suivant.
         SO_DONTROUTE => op.dontroute = oui,
         SO_OOBINLINE => op.oobinline = oui,
         SO_NO_CHECK => op.no_check = oui,
@@ -1599,13 +1602,16 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         SO_PASSCRED | SO_PASSRIGHTS => {}
         _ => return Err(-ENOPROTOOPT),
     }
-    let (keepalive, oobinline) = (inet.options.keepalive, inet.options.oobinline);
+    let (keepalive, oobinline, dontroute) = (inet.options.keepalive, inet.options.oobinline, inet.options.dontroute);
+    if option == SO_DONTROUTE {
+        inet.route_gardee = None;
+    }
     drop(inet);
     if s.protocole == Protocole::Tcp && matches!(option, SO_RCVBUF | SO_SNDBUF) {
         tcp::tampons_changes(s, option == SO_SNDBUF, option == SO_RCVBUF);
     }
-    if s.protocole == Protocole::Tcp && matches!(option, SO_KEEPALIVE | SO_OOBINLINE) {
-        tcp::options_socket_changees(s, keepalive, oobinline);
+    if s.protocole == Protocole::Tcp && matches!(option, SO_KEEPALIVE | SO_OOBINLINE | SO_DONTROUTE) {
+        tcp::options_socket_changees(s, keepalive, oobinline, dontroute, option == SO_DONTROUTE);
     }
     if s.protocole == Protocole::Unix && option == SO_PASSCRED {
         unix::changer_passcred(s, oui);

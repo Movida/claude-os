@@ -2240,6 +2240,32 @@ static void interface_de_sortie(void)
     verifier(recu_avec_pktinfo(r, &de, &pi, 200) == -1, "une fois");
     close(s);
     close(r);
+
+    /* SO_DONTROUTE et MSG_DONTROUTE : la route est de portée « lien »
+     * (`ip_sendmsg_scope`), celle par défaut ne compte plus (elle passe par
+     * une passerelle) : sans interface, ni une machine d'ailleurs ni la
+     * diffusion limitée n'ont de route ; par la carte demandée, une machine
+     * d'ailleurs est sur son lien, et le datagramme part (mesuré sous Linux
+     * 6.18.33). */
+    s = udp(0);
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &un, sizeof un);
+    setsockopt(s, SOL_SOCKET, SO_DONTROUTE, &un, sizeof un);
+    a = adresse(0xffffffff, 9);
+    ok = erreur(sendto(s, "x", 1, 0, (struct sockaddr *)&a, sizeof a)) == ENETUNREACH;
+    int k = htonl(carte);
+    setsockopt(s, IPPROTO_IP, IP_UNICAST_IF, &k, sizeof k);
+    a.sin_addr.s_addr = ailleurs;
+    ok = ok && sendto(s, "x", 1, 0, (struct sockaddr *)&a, sizeof a) == 1;
+    close(s);
+    s = udp(0);
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &un, sizeof un);
+    a = adresse(0xffffffff, 9);
+    ok = ok && erreur(sendto(s, "x", 1, MSG_DONTROUTE, (struct sockaddr *)&a, sizeof a)) == ENETUNREACH;
+    setsockopt(s, IPPROTO_IP, IP_UNICAST_IF, &k, sizeof k);
+    a.sin_addr.s_addr = ailleurs;
+    ok = ok && sendto(s, "x", 1, MSG_DONTROUTE, (struct sockaddr *)&a, sizeof a) == 1;
+    close(s);
+    verifier(ok, "SO_DONTROUTE, MSG_DONTROUTE : pas de diffusion limitee sans interface ; par la carte, une machine d'ailleurs est sur son lien");
 }
 
 /* Les sockets liées à une interface (SO_BINDTODEVICE, SO_BINDTOIFINDEX ;
@@ -2365,6 +2391,22 @@ static void liees(void)
     int tos_envoye = send(s, "x", 1, 0) == 1;
     verifier(tos_meme == 65535 && tos_change == -ENOTCONN && tos_envoye && mtu_de(s) == 65535,
              "connectee, puis IP_TOS : le meme garde la route, un autre l'oublie jusqu'au send");
+    close(s);
+    /* SO_DONTROUTE l'oublie, posé ou retiré (`sk_setsockopt` : `sk_dst_reset`) ;
+     * tant qu'il est posé, la connexion n'en garde pas (son envoi est de portée
+     * « lien », `connected` à 0). */
+    s = udp(0);
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    int zero = 0;
+    setsockopt(s, SOL_SOCKET, SO_DONTROUTE, &un, sizeof un);
+    int dr_pose = mtu_de(s);
+    int dr_envoye = send(s, "x", 1, 0) == 1;
+    int dr_apres = mtu_de(s);
+    setsockopt(s, SOL_SOCKET, SO_DONTROUTE, &zero, sizeof zero);
+    int dr_retire = mtu_de(s);
+    int dr_reenvoye = send(s, "x", 1, 0) == 1;
+    verifier(dr_pose == -ENOTCONN && dr_envoye && dr_apres == -ENOTCONN && dr_retire == -ENOTCONN && dr_reenvoye && mtu_de(s) == 65535,
+             "connectee, puis SO_DONTROUTE : IP_MTU ENOTCONN, encore apres send ; retire, ENOTCONN jusqu'au send");
     close(s);
     while (recv(r, nom, sizeof nom, MSG_DONTWAIT) > 0) {
     }
