@@ -213,6 +213,14 @@ pub trait VecFaillible<T> {
     /// `insert` dans la place déjà réservée, comme `ajouter_dans_la_place`.
     #[track_caller]
     fn inserer_dans_la_place(&mut self, indice: usize, valeur: T);
+    /// `shrink_to`, sans paniquer : un tableau qui n'occupe plus que le quart
+    /// de sa place passe dans une place du double de sa longueur (4 au moins,
+    /// la plus petite d'un Vec), ce qui garde chaque ajout et chaque retrait
+    /// en temps constant amorti. Sans mémoire pour la nouvelle place, il garde
+    /// l'ancienne. Pour une liste qui grandit et se vide au gré des programmes
+    /// (Linux en alloue chaque élément à part, et les rend un à un) : ce qu'un
+    /// programme a fait grandir est rendu quand il le défait.
+    fn rendre_la_place(&mut self);
 }
 
 // Les méthodes de Vec appelées ici ne peuvent plus allouer : la place est
@@ -277,6 +285,19 @@ impl<T> VecFaillible<T> for Vec<T> {
     fn inserer_dans_la_place(&mut self, indice: usize, valeur: T) {
         assert!(self.len() < self.capacity(), "inserer_dans_la_place : pas de place reservee");
         self.insert(indice, valeur);
+    }
+
+    fn rendre_la_place(&mut self) {
+        let voulue = (self.len() * 2).max(4);
+        if self.len() * 4 > self.capacity() || voulue >= self.capacity() {
+            return;
+        }
+        let mut neuf = Vec::new();
+        if neuf.try_reserve_exact(voulue).is_err() {
+            return;
+        }
+        neuf.extend(self.drain(..));
+        *self = neuf;
     }
 }
 

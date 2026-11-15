@@ -158,6 +158,9 @@ const NET_TCP: u32 = 24;
 const NET_UNIX: u32 = 25;
 /// /proc/net/snmp (les soldes d'avant 6k, reseau/snmp.rs).
 const NET_SNMP: u32 = 26;
+/// /proc/net/igmp et mcfilter (les soldes d'avant 6k, reseau/multidiffusion.rs).
+const NET_IGMP: u32 = 27;
+const NET_MCFILTER: u32 = 28;
 
 /// Le périphérique de procfs (un numéro anonyme, après celui du tmpfs de la
 /// racine, 0:20).
@@ -226,6 +229,8 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     let net_fichier = |source| Contenu::Fichier { source, argument: 0 };
     p.ajouter(net, b"arp", 0o444, (0, 0), net_fichier(NET_ARP), maintenant)?;
     p.ajouter(net, b"dev", 0o444, (0, 0), net_fichier(NET_DEV), maintenant)?;
+    p.ajouter(net, b"igmp", 0o444, (0, 0), net_fichier(NET_IGMP), maintenant)?;
+    p.ajouter(net, b"mcfilter", 0o444, (0, 0), net_fichier(NET_MCFILTER), maintenant)?;
     p.ajouter(net, b"pnp", 0o444, (0, 0), net_fichier(NET_PNP), maintenant)?;
     p.ajouter(net, b"route", 0o444, (0, 0), net_fichier(NET_ROUTE), maintenant)?;
     p.ajouter(net, b"snmp", 0o444, (0, 0), net_fichier(NET_SNMP), maintenant)?;
@@ -744,7 +749,8 @@ pub fn lecture(source: u32) -> Lecture {
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD | RANDOM_BOOT_ID
         | RANDOM_UUID | RANDOM_ENTROPY_AVAIL | RANDOM_POOLSIZE | RANDOM_WAKEUP | RANDOM_RESEED | INOTIFY_EVENEMENTS
         | INOTIFY_INSTANCES | INOTIFY_SURVEILLANCES => Lecture::Valeur,
-        MAPS | MAPS_SANS_MEMOIRE | STATM | COMM | STAT | STAT_FIL | STATUS | BANNIERE | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_SNMP | NET_TCP | NET_UNIX => Lecture::Sequence,
+        MAPS | MAPS_SANS_MEMOIRE | STATM | COMM | STAT | STAT_FIL | STATUS | BANNIERE | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_SNMP | NET_TCP | NET_UNIX | NET_IGMP
+        | NET_MCFILTER => Lecture::Sequence,
         // Nommées une à une, sans cas par défaut : /proc/net/tcp et unix
         // (6h) y étaient tombés, et se comportaient en attributs de /sys
         // (lseek SEEK_END donnait 4096 ; Linux : EINVAL, `seq_lseek`).
@@ -945,7 +951,7 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
         STAT | STAT_FIL if curseur == 0 => stat(argument, source == STAT).map(|t| Some((t, u64::MAX))),
         STATUS if curseur == 0 => status(argument).map(|t| Some((t, u64::MAX))),
         BANNIERE if curseur == 0 => banniere().map(|t| Some((t, u64::MAX))),
-        NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_SNMP | NET_TCP | NET_UNIX => {
+        NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_SNMP | NET_TCP | NET_UNIX | NET_IGMP | NET_MCFILTER => {
             let f = match source {
                 NET_PNP => crate::reseau::proc::Fichier::Pnp,
                 NET_ROUTE => crate::reseau::proc::Fichier::Route,
@@ -953,6 +959,8 @@ fn produire(source: u32, argument: u32, curseur: u64) -> Result<Enregistrement, 
                 NET_SNMP => crate::reseau::proc::Fichier::Snmp,
                 NET_TCP => crate::reseau::proc::Fichier::Tcp,
                 NET_UNIX => crate::reseau::proc::Fichier::Unix,
+                NET_IGMP => crate::reseau::proc::Fichier::Igmp,
+                NET_MCFILTER => crate::reseau::proc::Fichier::Mcfilter,
                 _ => crate::reseau::proc::Fichier::Arp,
             };
             match crate::reseau::proc::ligne(f, curseur) {

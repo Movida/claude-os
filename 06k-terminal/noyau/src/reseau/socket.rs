@@ -368,6 +368,12 @@ pub struct Options {
     pub mc_ttl: u8,
     pub mc_index: u32,
     pub rcv_tos: u8,
+    /// IP_MULTICAST_IF : l'adresse demandée avec l'interface (`mc_addr`), la
+    /// source d'un envoi vers un groupe qui n'en a pas d'autre ; et
+    /// IP_MULTICAST_LOOP (`MC_LOOP`, 1) : un envoi vers un groupe de la
+    /// machine lui en rend une copie.
+    pub mc_addr: [u8; 4],
+    pub mc_loop: bool,
     /// IP_OPTIONS : les options de chaque envoi (`inet_opt`), vérifiées pour
     /// l'envoi (formats, `options_a_envoyer`).
     pub ip_options: formats::reseau::ipv4::OptionsSortantes,
@@ -380,7 +386,7 @@ impl Options {
         rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, unicast_if: 0, interface: 0, recverr: false, pmtudisc: 1,
         udp_cork: false, recvttl: false, recvtos: false, recvopts: false, retopts: false, passsec: false,
         origdstaddr: false, checksum: false, recvfragsize: false, rfc4884: false, freebind: false, transparent: false,
-        bind_no_port: false, minttl: 0, local_port_range: 0, mc_ttl: 1, mc_index: 0, rcv_tos: 0,
+        bind_no_port: false, minttl: 0, local_port_range: 0, mc_ttl: 1, mc_index: 0, rcv_tos: 0, mc_addr: [0; 4], mc_loop: true,
         ip_options: formats::reseau::ipv4::OptionsSortantes::AUCUNE,
     };
 }
@@ -449,6 +455,14 @@ pub struct Socket {
     /// qu'il fait préparer (`ipv4_pktinfo_prepare`, un bit de Linux lu à ce
     /// moment-là : posé ensuite, il ne vaut que pour les suivants, mesuré).
     pub pktinfo: AtomicBool,
+    /// IP_MULTICAST_ALL (`MC_ALL`, 1), lu par la tâche du réseau à la
+    /// livraison d'un datagramme pour un groupe : sans adhésion à ce groupe,
+    /// la socket le reçoit-elle (multidiffusion.rs, `permet`) ?
+    pub mc_all: AtomicBool,
+    /// Ses adhésions à des groupes (inet::multidiffusion), sous leur verrou :
+    /// la livraison les lit sans le `Mutex`, qui dort. Une fille de TCP n'en
+    /// hérite pas.
+    pub adhesions: Verrou<inet::multidiffusion::Adhesions>,
     /// Un envoi a manqué de place dans SO_SNDBUF (le bit SOCK_NOSPACE de
     /// Linux, tel que le voit une socket de datagrammes : posé par
     /// `sock_alloc_send_pskb`, jamais effacé, `sock_def_write_space` ne le
@@ -508,6 +522,8 @@ impl Socket {
             pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
             rfc4884: AtomicBool::new(false),
             pktinfo: AtomicBool::new(false),
+            mc_all: AtomicBool::new(true),
+            adhesions: Verrou::new(inet::multidiffusion::Adhesions::new()),
             asynchrone: crate::asynchrone::ListeAsync::new(),
             inode: AtomicU32::new(0),
             peek_off: AtomicI32::new(-1),
@@ -968,6 +984,10 @@ pub fn fermer_les_differees() {
 /// elle n'a jamais eu de fichier (un `sock_accept` de WASI qui échoue après
 /// avoir pris la connexion, wasi.rs). Sans verrou tenu.
 pub fn fermer(s: &Arc<Socket>) {
+    // D'abord ses adhésions (`inet_release` : `ip_mc_drop_socket`).
+    if s.protocole != Protocole::Unix {
+        super::multidiffusion::fermer(s);
+    }
     match s.protocole {
         Protocole::Tcp => super::tcp::fermer(s),
         Protocole::Unix => super::unix::fermer(s),

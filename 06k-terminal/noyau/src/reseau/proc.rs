@@ -33,6 +33,8 @@ pub enum Fichier {
     Snmp,
     Tcp,
     Unix,
+    Igmp,
+    Mcfilter,
 }
 
 /// Un bloc du tas où écrire avec `write!`, qui échoue sans paniquer.
@@ -62,6 +64,8 @@ pub fn ligne(f: Fichier, n: u64) -> Result<Option<Vec<u8>>, ()> {
         Fichier::Snmp => snmp(&mut t, n),
         Fichier::Tcp => super::tcp::ligne_proc(n, &mut t),
         Fichier::Unix => super::unix::ligne_proc(n, &mut t),
+        Fichier::Igmp => super::multidiffusion::ligne_igmp(n, &mut t),
+        Fichier::Mcfilter => super::multidiffusion::ligne_mcfilter(n, &mut t),
     };
     match ecrite {
         Ok(true) => Ok(Some(t.0)),

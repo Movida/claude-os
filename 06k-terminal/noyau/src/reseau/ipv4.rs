@@ -580,6 +580,12 @@ pub fn par_lo(c: &Chemin) -> bool {
     interface_de(c).is_some_and(|i| i.boucle())
 }
 
+/// L'index de l'interface par où part ce qui suit le chemin `c` (le
+/// `dst.dev` de sa route : lo pour une de nos adresses).
+pub fn sortie(c: &Chemin) -> Option<u32> {
+    interface_de(c).map(|i| i.index)
+}
+
 /// `a` est-elle une de nos adresses (le réseau de lo compris, sa diffusion
 /// exceptée) ?
 pub fn est_a_nous(a: [u8; 4]) -> bool {

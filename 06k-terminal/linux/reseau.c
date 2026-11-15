@@ -2553,6 +2553,434 @@ static void liees(void)
     }
 }
 
+/* La multidiffusion (les soldes d'avant 6k ; mesurée sous Linux 6.18.33,
+ * une sonde) : les options, une à une, dans l'ordre de leurs refus ; les
+ * adhésions d'une socket (20 au plus), leurs filtres de sources (10 au
+ * plus), lus par IP_MSFILTER et MCAST_MSFILTER (qui écrivent au-delà de la
+ * place donnée) ; ce qu'en montrent /proc/net/igmp et /proc/net/mcfilter ;
+ * la fermeture, qui rend tout. Il faut une carte (la route vers les
+ * groupes) : sinon, sautée. */
+static int mc_poser(int s, int option, const void *o, socklen_t l)
+{
+    return erreur(setsockopt(s, IPPROTO_IP, option, o, l));
+}
+
+static int mc_mreq(int s, int option, const char *groupe, uint32_t adresse, int index, socklen_t l)
+{
+    struct ip_mreqn m = { .imr_address.s_addr = adresse, .imr_ifindex = index };
+    inet_pton(AF_INET, groupe, &m.imr_multiaddr);
+    return mc_poser(s, option, &m, l);
+}
+
+static int mc_source(int s, int option, const char *groupe, uint32_t interface, const char *source, socklen_t l)
+{
+    struct ip_mreq_source m = { .imr_interface.s_addr = interface };
+    inet_pton(AF_INET, groupe, &m.imr_multiaddr);
+    inet_pton(AF_INET, source, &m.imr_sourceaddr);
+    return mc_poser(s, option, &m, l);
+}
+
+static int mc_groupe(int s, int option, int index, const char *groupe, int famille, socklen_t l)
+{
+    static char o[256];
+    memset(o, 0, sizeof o);
+    struct group_req *g = (void *)o;
+    struct sockaddr_in *a = (void *)&g->gr_group;
+    g->gr_interface = index;
+    a->sin_family = famille;
+    inet_pton(AF_INET, groupe, &a->sin_addr);
+    return mc_poser(s, option, o, l);
+}
+
+static int mc_groupe_source(int s, int option, int index, const char *groupe, const char *source, int famille, socklen_t l)
+{
+    static char o[300];
+    memset(o, 0, sizeof o);
+    struct group_source_req *g = (void *)o;
+    struct sockaddr_in *a = (void *)&g->gsr_group, *b = (void *)&g->gsr_source;
+    g->gsr_interface = index;
+    a->sin_family = AF_INET;
+    b->sin_family = famille;
+    inet_pton(AF_INET, groupe, &a->sin_addr);
+    inet_pton(AF_INET, source, &b->sin_addr);
+    return mc_poser(s, option, o, l);
+}
+
+/* Une adresse de 10.x.y.z, dans l'ordre du réseau. */
+static uint32_t dix(int x, int y, int z)
+{
+    return htonl(0x0a000000 | x << 16 | y << 8 | z);
+}
+
+/* IP_MSFILTER posé : `n` sources de `sources`, dans `l` octets. */
+static int mc_msfilter(int s, const char *groupe, uint32_t interface, uint32_t mode, uint32_t n, const uint32_t *sources, socklen_t l)
+{
+    static uint32_t o[32];
+    memset(o, 0, sizeof o);
+    struct ip_msfilter *f = (void *)o;
+    inet_pton(AF_INET, groupe, &f->imsf_multiaddr);
+    f->imsf_interface.s_addr = interface;
+    f->imsf_fmode = mode;
+    f->imsf_numsrc = n;
+    memcpy(o + 4, sources, 4 * (n < 12 ? n : 12));
+    return mc_poser(s, IP_MSFILTER, o, l);
+}
+
+/* MCAST_MSFILTER posé : `n` sources de `sources` (en sockaddr_in), dans `l`
+ * octets. */
+static int mc_gsf(int s, int index, const char *groupe, uint32_t mode, uint32_t n, const uint32_t *sources, socklen_t l)
+{
+    static char o[2000];
+    memset(o, 0, sizeof o);
+    struct group_filter *f = (void *)o;
+    struct sockaddr_in *a = (void *)&f->gf_group;
+    f->gf_interface = index;
+    a->sin_family = AF_INET;
+    inet_pton(AF_INET, groupe, &a->sin_addr);
+    f->gf_fmode = mode;
+    f->gf_numsrc = n;
+    for (uint32_t k = 0; k < n && k < 12; k++) {
+        struct sockaddr_in *x = (void *)(o + 144 + 128 * k);
+        x->sin_family = AF_INET;
+        x->sin_addr.s_addr = sources[k];
+    }
+    return mc_poser(s, MCAST_MSFILTER, o, l);
+}
+
+/* IP_MSFILTER lu, `n` sources demandées, dans une place de `l` octets d'un
+ * tampon de 64 octets rempli de 0xaa : rend errno, la longueur rendue dans
+ * *rendue, le tampon dans `o`. */
+static int mc_msfget(int s, const char *groupe, uint32_t interface, uint32_t n, socklen_t l, uint32_t *o, socklen_t *rendue)
+{
+    memset(o, 0xaa, 64);
+    struct ip_msfilter *f = (void *)o;
+    inet_pton(AF_INET, groupe, &f->imsf_multiaddr);
+    f->imsf_interface.s_addr = interface;
+    f->imsf_numsrc = n;
+    *rendue = l;
+    return erreur(getsockopt(s, IPPROTO_IP, IP_MSFILTER, o, rendue));
+}
+
+/* Le contenu du fichier `chemin` dans `o` (au plus n - 1 octets), sans rien
+ * d'autre. */
+static void contenu(const char *chemin, char *o, size_t n)
+{
+    FILE *f = fopen(chemin, "r");
+    size_t lu = f ? fread(o, 1, n - 1, f) : 0;
+    o[lu] = 0;
+    if (f)
+        fclose(f);
+}
+
+/* /proc/net/igmp attendu : lo (1) puis la carte, chacune avec ses groupes
+ * (le plus récent d'abord) : « groupe/membres », séparés d'espaces. Un
+ * groupe s'y écrit comme l'entier de l'ordre du réseau, lu par une machine
+ * petit-boutiste (224.0.0.1 : 010000E0). */
+static void igmp_attendu(char *o, size_t n, const char *lo, int carte, const char *nom, const char *groupes)
+{
+    const char *x[2] = { lo, groupes };
+    int idx[2] = { 1, carte };
+    const char *noms[2] = { "lo", nom };
+    size_t p = snprintf(o, n, "Idx\tDevice    : Count Querier\tGroup    Users Timer\tReporter\n");
+    for (int i = 0; i < 2; i++) {
+        int compte = 0;
+        for (const char *c = x[i]; *c; c++)
+            compte += *c == '/';
+        p += snprintf(o + p, n - p, "%d\t%-10s: %5d %7s\n", idx[i], noms[i], compte, "V3");
+        char g[16];
+        unsigned u;
+        int lus;
+        for (const char *c = x[i]; sscanf(c, " %15[0-9.]/%u%n", g, &u, &lus) == 2; c += lus) {
+            struct in_addr a;
+            inet_pton(AF_INET, g, &a);
+            p += snprintf(o + p, n - p, "\t\t\t\t%08X %5u %d:%08X\t\t%d\n", a.s_addr, u, 0, 0, 0);
+        }
+    }
+}
+
+static void multidiffusion(void)
+{
+    uint32_t passerelle, diffusion;
+    if (!passerelle_par_defaut(&passerelle) || !diffusion_du_reseau(&diffusion)) {
+        verifier(1, "pas de carte : la multidiffusion, sautee");
+        return;
+    }
+    /* Notre adresse (celle d'une socket connectée ailleurs), l'index et le
+     * nom de la carte (l'arrivée d'un datagramme à notre adresse : IP_PKTINFO ;
+     * /proc/net/route). */
+    int s = udp(0), r = udp(0), un = 1;
+    struct sockaddr_in a = adresse(0xc0000201, 9), nous, de;
+    socklen_t l = sizeof nous;
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    getsockname(s, (struct sockaddr *)&nous, &l);
+    close(s);
+    a = adresse(0, 0);
+    l = sizeof a;
+    bind(r, (struct sockaddr *)&a, sizeof a);
+    getsockname(r, (struct sockaddr *)&a, &l);
+    setsockopt(r, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    struct in_pktinfo pi = { 0 };
+    s = udp(0);
+    envoyer_par(s, "x", 1, nous.sin_addr.s_addr, a.sin_port, 0);
+    recu_avec_pktinfo(r, &de, &pi, 1000);
+    close(s);
+    close(r);
+    const int eth = pi.ipi_ifindex;
+    const uint32_t moi = nous.sin_addr.s_addr, ailleurs = htonl(0x01020304), boucle = htonl(LO);
+    char nom[32] = "", ligne[256];
+    FILE *f = fopen("/proc/net/route", "r");
+    while (f && fgets(ligne, sizeof ligne, f))
+        if (sscanf(ligne, "%31s", nom) == 1 && strcmp(nom, "Iface") && strcmp(nom, "lo"))
+            break;
+    if (f)
+        fclose(f);
+    static char lu[4096], attendu[4096];
+    uint32_t o[16];
+    int t = socket(AF_INET, SOCK_STREAM, 0), v;
+    int ok;
+
+    /* Les valeurs de départ : IP_MULTICAST_IF lu en in_addr (au plus 4
+     * octets), TTL 1, LOOP 1, ALL 1 ; de même pour TCP. */
+    s = udp(0);
+    memset(o, 0xaa, sizeof o);
+    l = 8;
+    ok = getsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, o, &l) == 0 && l == 4 && o[0] == 0 && o[1] == 0xaaaaaaaa;
+    l = 2;
+    ok = ok && getsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, o, &l) == 0 && l == 2;
+    ok = ok && lire_ip(s, IP_MULTICAST_TTL) == 1 && lire_ip(s, IP_MULTICAST_LOOP) == 1 && lire_ip(s, IP_MULTICAST_ALL) == 1;
+    ok = ok && lire_ip(t, IP_MULTICAST_LOOP) == 1 && lire_ip(t, IP_MULTICAST_ALL) == 1;
+    verifier(ok, "multidiffusion : IF 0.0.0.0 (au plus 4 octets), TTL 1, LOOP 1, ALL 1 au depart");
+
+    /* IP_MULTICAST_IF : TCP, moins de 4 octets : EINVAL ; une adresse, une
+     * ip_mreq (le second champ), une ip_mreqn ; une adresse d'ailleurs sans
+     * index : EADDRNOTAVAIL (rien ne change), avec un index : gardée ; 0
+     * partout : tout à zéro. */
+#define LIRE_IF(s) (l = 4, getsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, o, &l) == 0 && l == 4 ? o[0] : 0xdeadbeef)
+    ok = mc_poser(t, IP_MULTICAST_IF, &moi, 4) == EINVAL && mc_poser(s, IP_MULTICAST_IF, &moi, 3) == EINVAL;
+    ok = ok && mc_poser(s, IP_MULTICAST_IF, &moi, 4) == 0 && LIRE_IF(s) == moi;
+    ok = ok && mc_poser(s, IP_MULTICAST_IF, &ailleurs, 4) == EADDRNOTAVAIL && LIRE_IF(s) == moi;
+    ok = ok && mc_mreq(s, IP_MULTICAST_IF, "0.0.0.0", 0, eth, 12) == 0 && LIRE_IF(s) == 0;
+    ok = ok && mc_mreq(s, IP_MULTICAST_IF, "0.0.0.0", ailleurs, 1, 12) == 0 && LIRE_IF(s) == ailleurs;
+    ok = ok && mc_mreq(s, IP_MULTICAST_IF, "0.0.0.0", 0, 9999, 12) == EADDRNOTAVAIL;
+    ok = ok && mc_mreq(s, IP_MULTICAST_IF, "239.1.1.1", moi, 0, 8) == 0 && LIRE_IF(s) == moi;
+    ok = ok && mc_mreq(s, IP_MULTICAST_IF, "239.1.1.1", boucle, 7, 10) == 0 && LIRE_IF(s) == boucle;
+    ok = ok && mc_mreq(s, IP_MULTICAST_IF, "0.0.0.0", 0, 0, 12) == 0 && LIRE_IF(s) == 0;
+    verifier(ok, "IP_MULTICAST_IF : in_addr, ip_mreq, ip_mreqn ; TCP, 3 octets : EINVAL ; inconnue : EADDRNOTAVAIL");
+    /* Liée à lo (SO_BINDTODEVICE, la première liaison est libre) : une
+     * autre interface : EINVAL. */
+    r = udp(0);
+    ok = setsockopt(r, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3) == 0 && mc_mreq(r, IP_MULTICAST_IF, "0.0.0.0", 0, eth, 12) == EINVAL;
+    ok = ok && mc_mreq(r, IP_MULTICAST_IF, "0.0.0.0", 0, 1, 12) == 0 && mc_poser(r, IP_MULTICAST_IF, &moi, 4) == EINVAL;
+    v = 0;
+    ok = ok && mc_poser(r, IP_MULTICAST_IF, &v, 4) == 0;
+    close(r);
+    verifier(ok, "IP_MULTICAST_IF d'une socket liee a lo : la carte, EINVAL ; lo, permis");
+
+    /* IP_MULTICAST_LOOP : non nul vaut 1, un octet lu sur 1 ; TCP permis.
+     * IP_MULTICAST_ALL : 0 ou 1. */
+    v = 5;
+    ok = mc_poser(s, IP_MULTICAST_LOOP, &v, 0) == EINVAL && mc_poser(s, IP_MULTICAST_LOOP, &v, 4) == 0 && lire_ip(s, IP_MULTICAST_LOOP) == 1;
+    v = 256;
+    ok = ok && mc_poser(s, IP_MULTICAST_LOOP, &v, 1) == 0 && lire_ip(s, IP_MULTICAST_LOOP) == 0;
+    v = -1;
+    ok = ok && mc_poser(s, IP_MULTICAST_LOOP, &v, 4) == 0 && lire_ip(s, IP_MULTICAST_LOOP) == 1;
+    v = 0;
+    ok = ok && mc_poser(t, IP_MULTICAST_LOOP, &v, 4) == 0 && lire_ip(t, IP_MULTICAST_LOOP) == 0;
+    v = 2;
+    ok = ok && mc_poser(s, IP_MULTICAST_ALL, &v, 4) == EINVAL;
+    v = 0;
+    ok = ok && mc_poser(s, IP_MULTICAST_ALL, &v, 0) == EINVAL && mc_poser(s, IP_MULTICAST_ALL, &v, 4) == 0 && lire_ip(s, IP_MULTICAST_ALL) == 0;
+    v = 257;
+    ok = ok && mc_poser(s, IP_MULTICAST_ALL, &v, 1) == 0 && lire_ip(s, IP_MULTICAST_ALL) == 1;
+    v = 0;
+    ok = ok && mc_poser(t, IP_MULTICAST_ALL, &v, 4) == 0 && lire_ip(t, IP_MULTICAST_ALL) == 0;
+    verifier(ok, "IP_MULTICAST_LOOP (non nul : 1) et IP_MULTICAST_ALL (0 ou 1), TCP compris");
+
+    /* IP_ADD_MEMBERSHIP : TCP : EPROTO ; moins de 8 octets, pas un groupe :
+     * EINVAL ; l'interface : l'index, sinon celle de l'adresse, sinon la
+     * route (la carte) ; déjà membre par elle : EADDRINUSE ; pas
+     * d'interface : ENODEV. */
+    ok = mc_mreq(t, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == EPROTO && mc_mreq(t, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == EPROTO;
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, 0, 7) == EINVAL && mc_mreq(s, IP_ADD_MEMBERSHIP, "10.0.0.1", 0, 0, 8) == EINVAL;
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "255.255.255.255", 0, 0, 8) == EINVAL;
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "224.0.0.1", 0, 0, 8) == 0 && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == 0;
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == EADDRINUSE && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, eth, 12) == EADDRINUSE;
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", moi, 0, 8) == EADDRINUSE && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, 1, 12) == 0;
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", boucle, 0, 8) == EADDRINUSE
+         && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", htonl(0x7f000002), 0, 8) == EADDRINUSE;
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.4", 0, 9999, 12) == ENODEV && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.4", ailleurs, 0, 8) == ENODEV;
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.4", ailleurs, 1, 12) == 0 && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.5", 0, 0, 9) == 0;
+    verifier(ok, "IP_ADD_MEMBERSHIP : EPROTO, EINVAL, EADDRINUSE, ENODEV, dans l'ordre de Linux");
+    contenu("/proc/net/igmp", lu, sizeof lu);
+    igmp_attendu(attendu, sizeof attendu, "239.1.2.4/1 239.1.2.3/1 224.0.0.1/1", eth, nom, "239.1.2.5/1 239.1.2.3/1 224.0.0.1/2");
+    verifier(strcmp(lu, attendu) == 0, "/proc/net/igmp : les groupes de lo et de la carte, le plus recent d'abord");
+    /* 20 adhésions par socket : 15 de plus, puis ENOBUFS. */
+    char g[20];
+    int n;
+    for (n = 0; n < 16; n++) {
+        snprintf(g, sizeof g, "239.2.0.%d", n);
+        if (mc_mreq(s, IP_ADD_MEMBERSHIP, g, 0, 0, 8) != 0)
+            break;
+    }
+    verifier(n == 15 && mc_mreq(s, IP_ADD_MEMBERSHIP, g, 0, 0, 8) == ENOBUFS, "20 adhesions, puis ENOBUFS");
+    /* IP_DROP_MEMBERSHIP : par la route, l'index, l'adresse ; pas de
+     * contrôle du groupe. */
+    ok = mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == 0 && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == EADDRNOTAVAIL;
+    ok = ok && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 9999, 12) == EADDRNOTAVAIL
+         && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", ailleurs, 0, 8) == EADDRNOTAVAIL;
+    ok = ok && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", boucle, 0, 8) == 0 && mc_mreq(s, IP_DROP_MEMBERSHIP, "10.0.0.1", 0, 0, 8) == EADDRNOTAVAIL;
+    ok = ok && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 0, 7) == EINVAL && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == 0;
+    verifier(ok, "IP_DROP_MEMBERSHIP : par la route, l'index, l'adresse ; EADDRNOTAVAIL, EINVAL");
+    /* La fermeture rend tout. */
+    close(s);
+    contenu("/proc/net/igmp", lu, sizeof lu);
+    igmp_attendu(attendu, sizeof attendu, "224.0.0.1/1", eth, nom, "224.0.0.1/1");
+    verifier(strcmp(lu, attendu) == 0, "close : chaque interface n'a plus que 224.0.0.1");
+
+    /* MCAST_JOIN_GROUP, MCAST_LEAVE_GROUP : une group_req (136 octets au
+     * moins), AF_INET ; l'index (0 : la route) ; TCP peut adhérer. */
+    s = udp(0);
+    ok = mc_groupe(s, MCAST_JOIN_GROUP, eth, "239.1.2.6", AF_INET, 135) == EINVAL && mc_groupe(s, MCAST_JOIN_GROUP, eth, "239.1.2.6", AF_INET6, 136) == EINVAL;
+    ok = ok && mc_groupe(s, MCAST_JOIN_GROUP, eth, "10.0.0.1", AF_INET, 136) == EINVAL && mc_groupe(s, MCAST_JOIN_GROUP, eth, "239.1.2.6", AF_INET, 136) == 0;
+    ok = ok && mc_groupe(s, MCAST_JOIN_GROUP, eth, "239.1.2.6", AF_INET, 200) == EADDRINUSE && mc_groupe(s, MCAST_JOIN_GROUP, 0, "239.1.2.8", AF_INET, 136) == 0;
+    ok = ok && mc_groupe(s, MCAST_JOIN_GROUP, 9999, "239.1.2.8", AF_INET, 136) == ENODEV && mc_groupe(s, MCAST_LEAVE_GROUP, 0, "239.1.2.8", AF_INET, 136) == 0;
+    ok = ok && mc_groupe(s, MCAST_LEAVE_GROUP, 0, "239.1.2.8", AF_INET, 136) == EADDRNOTAVAIL && mc_groupe(s, MCAST_LEAVE_GROUP, 0, "239.1.2.8", AF_INET6, 136) == EINVAL;
+    ok = ok && mc_groupe(t, MCAST_JOIN_GROUP, eth, "239.1.2.7", AF_INET, 136) == 0;
+    contenu("/proc/net/igmp", lu, sizeof lu);
+    igmp_attendu(attendu, sizeof attendu, "224.0.0.1/1", eth, nom, "239.1.2.7/1 239.1.2.6/1 224.0.0.1/1");
+    verifier(ok && strcmp(lu, attendu) == 0, "MCAST_JOIN_GROUP et MCAST_LEAVE_GROUP : EINVAL, EADDRINUSE, ENODEV ; TCP adhere");
+    ok = mc_groupe(t, MCAST_LEAVE_GROUP, eth, "239.1.2.7", AF_INET, 136) == 0;
+    close(s);
+    close(t);
+
+    /* Les sources (ip_mreq_source, 12 octets exactement) : EXCLUDE par
+     * IP_BLOCK_SOURCE ; pas d'adhésion, pas un groupe : EINVAL ; une liste
+     * dans l'autre mode : EINVAL ; une source absente, ou déjà là :
+     * EADDRNOTAVAIL ; 10 au plus (ENOBUFS), ajoutées en fin de liste. */
+    s = udp(0);
+    ok = ok && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.1", 12) == EINVAL && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.1", 11) == EINVAL;
+    ok = ok && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.1", 13) == EINVAL && mc_source(s, IP_BLOCK_SOURCE, "10.0.0.9", 0, "10.0.0.1", 12) == EINVAL;
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.3.3.3", 0, 0, 8) == 0 && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.3", ailleurs, "10.0.0.1", 12) == ENODEV;
+    ok = ok && mc_source(s, IP_UNBLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.1", 12) == EADDRNOTAVAIL && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.1", 12) == 0;
+    ok = ok && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.1", 12) == EADDRNOTAVAIL && mc_source(s, IP_UNBLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.2", 12) == EADDRNOTAVAIL;
+    ok = ok && mc_source(s, IP_ADD_SOURCE_MEMBERSHIP, "239.3.3.3", 0, "10.0.0.3", 12) == EINVAL && mc_source(s, IP_DROP_SOURCE_MEMBERSHIP, "239.3.3.3", 0, "10.0.0.1", 12) == EINVAL;
+    for (n = 18; n >= 10; n--) {
+        snprintf(g, sizeof g, "10.0.0.%d", n);
+        ok = ok && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.3", 0, g, 12) == 0;
+    }
+    ok = ok && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.9", 12) == ENOBUFS && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.1", 12) == ENOBUFS;
+    verifier(ok, "IP_BLOCK_SOURCE et les autres : EINVAL, ENODEV, EADDRNOTAVAIL, 10 sources puis ENOBUFS");
+    /* IP_MSFILTER lu : 16 octets au moins ; le mode, le vrai nombre de
+     * sources, et autant de sources que demandé, même au-delà de la place
+     * donnée (24 octets : 56 rendus, 40 écrits). */
+    ok = mc_msfget(s, "239.3.3.3", 0, 12, 64, o, &l) == 0 && l == 56 && o[2] == 0 && o[3] == 10 && o[4] == dix(0, 0, 1) && o[5] == dix(0, 0, 18)
+         && o[13] == dix(0, 0, 10) && o[14] == 0xaaaaaaaa;
+    ok = ok && mc_msfget(s, "239.3.3.3", 0, 2, 64, o, &l) == 0 && l == 24 && o[3] == 10 && o[6] == 0xaaaaaaaa;
+    ok = ok && mc_msfget(s, "239.3.3.3", 0, 12, 24, o, &l) == 0 && l == 56 && o[13] == dix(0, 0, 10) && o[14] == 0xaaaaaaaa;
+    ok = ok && mc_msfget(s, "239.3.3.3", 0, 12, 15, o, &l) == EINVAL && mc_msfget(s, "239.3.3.4", 0, 12, 64, o, &l) == EADDRNOTAVAIL;
+    ok = ok && mc_msfget(s, "10.0.0.1", 0, 12, 64, o, &l) == EINVAL && mc_msfget(s, "239.3.3.3", ailleurs, 12, 64, o, &l) == ENODEV;
+    verifier(ok, "IP_MSFILTER lu : le mode, 10 sources, ecrites au-dela de la place ; EINVAL, EADDRNOTAVAIL, ENODEV");
+    /* MCAST_MSFILTER lu : par l'index seul (0 : aucune adhésion), des
+     * sockaddr_storage (144 + 128 par source). */
+    static char gf[2000];
+    struct group_filter *gfl = (void *)gf;
+    struct sockaddr_in *ga = (void *)&gfl->gf_group;
+    memset(gf, 0xaa, sizeof gf);
+    gfl->gf_interface = eth;
+    ga->sin_family = AF_INET;
+    inet_pton(AF_INET, "239.3.3.3", &ga->sin_addr);
+    gfl->gf_numsrc = 3;
+    l = 144;
+    struct sockaddr_in *s0 = (void *)(gf + 144), *s2 = (void *)(gf + 144 + 256);
+    ok = getsockopt(s, IPPROTO_IP, MCAST_MSFILTER, gf, &l) == 0 && l == 528 && gfl->gf_fmode == 0 && gfl->gf_numsrc == 10
+         && s0->sin_family == AF_INET && s0->sin_port == 0 && s0->sin_addr.s_addr == dix(0, 0, 1) && s2->sin_addr.s_addr == dix(0, 0, 17)
+         && (unsigned char)gf[144 + 384] == 0xaa;
+    gfl->gf_interface = 0;
+    l = 1680;
+    ok = ok && erreur(getsockopt(s, IPPROTO_IP, MCAST_MSFILTER, gf, &l)) == EADDRNOTAVAIL;
+    l = 143;
+    ok = ok && erreur(getsockopt(s, IPPROTO_IP, MCAST_MSFILTER, gf, &l)) == EINVAL;
+    verifier(ok, "MCAST_MSFILTER lu : par l'index (0 : EADDRNOTAVAIL), des sockaddr_storage ; 143 octets : EINVAL");
+    /* /proc/net/mcfilter : chaque source, exclue par une socket. */
+    contenu("/proc/net/mcfilter", lu, sizeof lu);
+    n = snprintf(attendu, sizeof attendu, "Idx Device        MCA        SRC    INC    EXC\n");
+    for (int k = 0; k < 10; k++)
+        n += snprintf(attendu + n, sizeof attendu - n, "%3d %6.6s 0x%08x 0x%08x %6lu %6lu\n", eth, nom, 0xef030303,
+                      k == 0 ? 0x0a000001 : 0x0a000013 - k, 0ul, 1ul);
+    verifier(strcmp(lu, attendu) == 0, "/proc/net/mcfilter : les 10 sources, dans l'ordre, exclues");
+    ok = mc_source(s, IP_UNBLOCK_SOURCE, "239.3.3.3", 0, "10.0.0.1", 12) == 0 && mc_msfget(s, "239.3.3.3", 0, 12, 64, o, &l) == 0 && l == 52
+         && o[3] == 9 && o[4] == dix(0, 0, 18);
+    ok = ok && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.3.3.3", 0, 0, 8) == 0;
+    /* INCLUDE : IP_ADD_SOURCE_MEMBERSHIP adhère d'abord ; la dernière source
+     * retirée, le groupe est quitté. */
+    ok = ok && mc_source(s, IP_ADD_SOURCE_MEMBERSHIP, "239.3.3.5", 0, "10.0.0.1", 12) == 0 && mc_source(s, IP_ADD_SOURCE_MEMBERSHIP, "239.3.3.5", 0, "10.0.0.2", 12) == 0;
+    ok = ok && mc_source(s, IP_ADD_SOURCE_MEMBERSHIP, "239.3.3.5", 0, "10.0.0.2", 12) == EADDRNOTAVAIL && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.3.3.5", 0, 0, 8) == EADDRINUSE;
+    ok = ok && mc_source(s, IP_BLOCK_SOURCE, "239.3.3.5", 0, "10.0.0.3", 12) == EINVAL;
+    ok = ok && mc_msfget(s, "239.3.3.5", 0, 12, 64, o, &l) == 0 && l == 24 && o[2] == 1 && o[3] == 2 && o[5] == dix(0, 0, 2);
+    contenu("/proc/net/mcfilter", lu, sizeof lu);
+    n = snprintf(attendu, sizeof attendu, "Idx Device        MCA        SRC    INC    EXC\n");
+    for (int k = 1; k <= 2; k++)
+        n += snprintf(attendu + n, sizeof attendu - n, "%3d %6.6s 0x%08x 0x%08x %6lu %6lu\n", eth, nom, 0xef030305, 0x0a000000 + k, 1ul, 0ul);
+    ok = ok && strcmp(lu, attendu) == 0;
+    ok = ok && mc_source(s, IP_DROP_SOURCE_MEMBERSHIP, "239.3.3.5", 0, "10.0.0.1", 12) == 0 && mc_source(s, IP_DROP_SOURCE_MEMBERSHIP, "239.3.3.5", 0, "10.0.0.2", 12) == 0;
+    ok = ok && mc_msfget(s, "239.3.3.5", 0, 12, 64, o, &l) == EADDRNOTAVAIL && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.3.3.5", 0, 0, 8) == EADDRNOTAVAIL;
+    /* Une adhésion simple, sans liste, change de mode à sa première source. */
+    ok = ok && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.3.3.6", 0, 0, 8) == 0 && mc_source(s, IP_ADD_SOURCE_MEMBERSHIP, "239.3.3.6", 0, "10.0.0.1", 12) == 0;
+    ok = ok && mc_msfget(s, "239.3.3.6", 0, 12, 64, o, &l) == 0 && l == 20 && o[2] == 1 && o[3] == 1;
+    verifier(ok, "INCLUDE : IP_ADD_SOURCE_MEMBERSHIP adhere ; la derniere source retiree, le groupe quitte ; /proc/net/mcfilter");
+
+    /* IP_MSFILTER posé : 16 octets au moins ; pas un groupe, un mode
+     * inconnu, pas d'adhésion : EINVAL ; INCLUDE {} sans adhésion :
+     * EADDRNOTAVAIL ; plus de 10 sources : ENOBUFS ; pas la place : EINVAL ;
+     * pas d'interface : ENODEV ; puis la liste et le mode remplacés. */
+    uint32_t sources[12];
+    for (int k = 0; k < 12; k++)
+        sources[k] = dix(1, 1, k + 1);
+    ok = mc_msfilter(s, "239.3.3.6", 0, 0, 0, sources, 15) == EINVAL && mc_msfilter(s, "10.0.0.1", 0, 0, 0, sources, 16) == EINVAL;
+    ok = ok && mc_msfilter(s, "239.3.3.6", 0, 2, 0, sources, 16) == EINVAL && mc_msfilter(s, "239.3.3.7", 0, 0, 0, sources, 16) == EINVAL;
+    ok = ok && mc_msfilter(s, "239.3.3.7", 0, 1, 0, sources, 16) == EADDRNOTAVAIL && mc_msfilter(s, "239.3.3.6", 0, 0, 11, sources, 60) == ENOBUFS;
+    ok = ok && mc_msfilter(s, "239.3.3.6", 0, 0, 2, sources, 20) == EINVAL && mc_msfilter(s, "239.3.3.6", ailleurs, 0, 0, sources, 16) == ENODEV;
+    ok = ok && mc_msfilter(s, "239.3.3.6", 0, 0, 3, sources, 28) == 0 && mc_msfget(s, "239.3.3.6", 0, 12, 64, o, &l) == 0 && l == 28 && o[2] == 0
+         && o[3] == 3 && o[6] == sources[2];
+    ok = ok && mc_msfilter(s, "239.3.3.6", 0, 1, 2, sources, 40) == 0 && mc_msfget(s, "239.3.3.6", 0, 12, 64, o, &l) == 0 && l == 24 && o[2] == 1;
+    contenu("/proc/net/mcfilter", lu, sizeof lu);
+    n = snprintf(attendu, sizeof attendu, "Idx Device        MCA        SRC    INC    EXC\n");
+    for (int k = 0; k < 2; k++)
+        n += snprintf(attendu + n, sizeof attendu - n, "%3d %6.6s 0x%08x 0x%08x %6lu %6lu\n", eth, nom, 0xef030306, ntohl(sources[k]), 1ul, 0ul);
+    ok = ok && strcmp(lu, attendu) == 0;
+    ok = ok && mc_msfilter(s, "239.3.3.6", 0, 1, 0, sources, 16) == 0 && mc_msfget(s, "239.3.3.6", 0, 12, 64, o, &l) == EADDRNOTAVAIL;
+    verifier(ok, "IP_MSFILTER pose : EINVAL, EADDRNOTAVAIL, ENOBUFS, ENODEV ; la liste et le mode remplaces ; INCLUDE {} : le depart");
+    /* MCAST_MSFILTER posé : 144 octets au moins, 128 par source ; l'index
+     * (0 : la route). */
+    uint32_t deux[2] = { dix(2, 2, 1), dix(2, 2, 2) };
+    ok = mc_groupe(s, MCAST_JOIN_GROUP, eth, "239.3.3.8", AF_INET, 136) == 0 && mc_gsf(s, eth, "239.3.3.8", 1, 0, deux, 143) == EINVAL;
+    ok = ok && mc_gsf(s, eth, "239.3.3.8", 1, 11, deux, 1552) == ENOBUFS && mc_gsf(s, eth, "239.3.3.8", 1, 2, deux, 144) == EINVAL;
+    ok = ok && mc_gsf(s, eth, "239.3.3.8", 1, 2, deux, 400) == 0 && mc_gsf(s, 0, "239.3.3.8", 0, 1, deux, 272) == 0;
+    gfl->gf_interface = eth;
+    inet_pton(AF_INET, "239.3.3.8", &ga->sin_addr);
+    l = 1680;
+    ok = ok && getsockopt(s, IPPROTO_IP, MCAST_MSFILTER, gf, &l) == 0 && l == 272 && gfl->gf_fmode == 0 && gfl->gf_numsrc == 1
+         && s0->sin_addr.s_addr == deux[0];
+    verifier(ok, "MCAST_MSFILTER pose : EINVAL, ENOBUFS ; par l'index, puis par la route");
+    /* MCAST_*_SOURCE (une group_source_req, 264 octets exactement) : une
+     * autre famille : EADDRNOTAVAIL ; MCAST_JOIN_SOURCE_GROUP adhère par
+     * l'index (0 : la route). */
+    ok = mc_groupe_source(s, MCAST_JOIN_SOURCE_GROUP, eth, "239.3.3.9", "10.0.0.1", AF_INET, 263) == EINVAL;
+    ok = ok && mc_groupe_source(s, MCAST_JOIN_SOURCE_GROUP, eth, "239.3.3.9", "10.0.0.1", AF_INET6, 264) == EADDRNOTAVAIL;
+    ok = ok && mc_groupe_source(s, MCAST_JOIN_SOURCE_GROUP, eth, "239.3.3.9", "10.0.0.1", AF_INET, 264) == 0;
+    ok = ok && mc_groupe_source(s, MCAST_JOIN_SOURCE_GROUP, 0, "239.3.3.9", "10.0.0.2", AF_INET, 264) == 0;
+    ok = ok && mc_groupe_source(s, MCAST_BLOCK_SOURCE, eth, "239.3.3.9", "10.0.0.3", AF_INET, 264) == EINVAL;
+    ok = ok && mc_groupe_source(s, MCAST_LEAVE_SOURCE_GROUP, eth, "239.3.3.9", "10.0.0.1", AF_INET, 264) == 0;
+    contenu("/proc/net/igmp", lu, sizeof lu);
+    igmp_attendu(attendu, sizeof attendu, "224.0.0.1/1", eth, nom, "239.3.3.9/1 239.3.3.8/1 224.0.0.1/1");
+    ok = ok && strcmp(lu, attendu) == 0;
+    contenu("/proc/net/mcfilter", lu, sizeof lu);
+    snprintf(attendu, sizeof attendu, "Idx Device        MCA        SRC    INC    EXC\n%3d %6.6s 0x%08x 0x%08x %6lu %6lu\n%3d %6.6s 0x%08x 0x%08x %6lu %6lu\n",
+             eth, nom, 0xef030309, 0x0a000002, 1ul, 0ul, eth, nom, 0xef030308, 0x0a020201, 0ul, 1ul);
+    verifier(ok && strcmp(lu, attendu) == 0, "MCAST_JOIN_SOURCE_GROUP, MCAST_LEAVE_SOURCE_GROUP ; /proc/net/igmp et mcfilter");
+    close(s);
+}
+
 /* Le compteur `nom` du groupe `groupe` de /proc/net/snmp (« Udp: »,
  * « Icmp: » : deux lignes, les noms puis les valeurs) ; -1 : pas trouvé. */
 static long compteur_snmp(const char *groupe, const char *nom)
@@ -2748,6 +3176,7 @@ int main(int argc, char **argv)
     options_d_ip();
     interface_de_sortie();
     liees();
+    multidiffusion();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

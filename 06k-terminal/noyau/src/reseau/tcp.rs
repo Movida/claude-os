@@ -2193,6 +2193,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             enfant.recverr.store(options.recverr, Ordering::Relaxed);
             enfant.pmtudisc.store(options.pmtudisc, Ordering::Relaxed);
             enfant.peek_off.store(s.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
+            enfant.mc_all.store(s.mc_all.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.appels.verrouiller().options = socket::Options { mc_ttl, rcv_tos, mc_index, ip_options, interface, ..options };
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.changer_objet(numero, Cible::Socket(enfant.clone()));

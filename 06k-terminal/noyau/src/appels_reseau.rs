@@ -51,6 +51,8 @@ const EAFNOSUPPORT: i64 = 97;
 const ENOBUFS: i64 = 105;
 const ENOTCONN: i64 = 107;
 const EPIPE: i64 = 32;
+const EPROTO: i64 = 71;
+const EADDRNOTAVAIL: i64 = 99;
 
 const O_RDWR: u32 = 2;
 const O_NONBLOCK: u32 = 0o4000;
@@ -155,8 +157,34 @@ const IP_CHECKSUM: i32 = 23;
 const IP_BIND_ADDRESS_NO_PORT: i32 = 24;
 const IP_RECVFRAGSIZE: i32 = 25;
 const IP_RECVERR_RFC4884: i32 = 26;
+const IP_MULTICAST_IF: i32 = 32;
 const IP_MULTICAST_TTL: i32 = 33;
 const IP_MULTICAST_LOOP: i32 = 34;
+const IP_ADD_MEMBERSHIP: i32 = 35;
+const IP_DROP_MEMBERSHIP: i32 = 36;
+const IP_UNBLOCK_SOURCE: i32 = 37;
+const IP_BLOCK_SOURCE: i32 = 38;
+const IP_ADD_SOURCE_MEMBERSHIP: i32 = 39;
+const IP_DROP_SOURCE_MEMBERSHIP: i32 = 40;
+const IP_MSFILTER: i32 = 41;
+const MCAST_JOIN_GROUP: i32 = 42;
+const MCAST_BLOCK_SOURCE: i32 = 43;
+const MCAST_UNBLOCK_SOURCE: i32 = 44;
+const MCAST_LEAVE_GROUP: i32 = 45;
+const MCAST_JOIN_SOURCE_GROUP: i32 = 46;
+const MCAST_LEAVE_SOURCE_GROUP: i32 = 47;
+const MCAST_MSFILTER: i32 = 48;
+/// Les tailles des structures de la multidiffusion : `ip_mreq_source`,
+/// `ip_msfilter` sans ses sources (`IP_MSFILTER_SIZE(0)`), `group_req`,
+/// `group_source_req`, `group_filter` sans ses sources
+/// (`GROUP_FILTER_SIZE(0)`), et une `sockaddr_storage` (sa famille au
+/// début, l'adresse d'une `sockaddr_in` 4 octets plus loin).
+const MREQ_SOURCE: usize = 12;
+const MSFILTER: usize = 16;
+const GROUP_REQ: usize = 136;
+const GROUP_SOURCE_REQ: usize = 264;
+const GROUP_FILTER: usize = 144;
+const STOCKAGE: usize = 128;
 const IP_UNICAST_IF: i32 = 50;
 const IP_MULTICAST_ALL: i32 = 49;
 const IP_LOCAL_PORT_RANGE: i32 = 51;
@@ -1890,8 +1918,8 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
 /// messages de contrôle sont à la réception. IP_HDRINCL et IP_NODEFRAG
 /// sont d'une socket brute (ENOPROTOOPT) ; IP_IPSEC_POLICY et
 /// IP_XFRM_POLICY : EPERM sans root, puis ENOPROTOOPT (le `xfrm_user_policy`
-/// d'un noyau sans IPsec, CONFIG_XFRM). Les options de la multidiffusion
-/// (sauf IP_MULTICAST_TTL) : ENOPROTOOPT, un écart.
+/// d'un noyau sans IPsec, CONFIG_XFRM). Celles de la multidiffusion faites
+/// de structures : `options_multidiffusion`.
 /// IP_OPTIONS : 40 octets au plus (EINVAL), copiés (EFAULT) avant de prendre
 /// le `Mutex`, vérifiés pour l'envoi (`ip_options_get` : EINVAL), aucun
 /// octet : aucune option ; TCP leur laisse leur place dans son MSS.
@@ -1915,6 +1943,9 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
     }
     if MRT.contains(&option) {
         return Err(-EOPNOTSUPP);
+    }
+    if let Some(r) = options_multidiffusion(s, option, valeur, longueur) {
+        return r;
     }
     // CAP_NET_RAW (ou CAP_NET_ADMIN) : un droit de qui pose l'option
     // (`ns_capable`), pas de qui a créé la socket.
@@ -2014,6 +2045,12 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
             }
             op.mc_ttl = v as u8;
         }
+        // Toute valeur non nulle vaut 1 ; TCP accepté (mesuré).
+        IP_MULTICAST_LOOP if longueur < 1 => return Err(-EINVAL),
+        IP_MULTICAST_LOOP => op.mc_loop = oui,
+        // 0 ou 1 seulement. Atomique : la livraison le lit (multidiffusion.rs).
+        IP_MULTICAST_ALL if longueur < 1 || !(0..=1).contains(&v) => return Err(-EINVAL),
+        IP_MULTICAST_ALL => s.mc_all.store(oui, Ordering::Relaxed),
         IP_MTU_DISCOVER => {
             if !(0..=IP_PMTUDISC_OMIT).contains(&v) {
                 return Err(-EINVAL);
@@ -2076,6 +2113,275 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         });
     }
     Ok(())
+}
+
+/// Une adresse IPv4 de 4 octets lus.
+fn adresse_de(o: &[u8]) -> [u8; 4] {
+    [o[0], o[1], o[2], o[3]]
+}
+
+fn u32_de(o: &[u8]) -> u32 {
+    u32::from_le_bytes([o[0], o[1], o[2], o[3]])
+}
+
+/// Les `longueur` octets à `valeur` se lisent-ils tous (le `memdup_sockptr`
+/// de Linux, qui copie tout avant de rien regarder) ? EFAULT sinon. Lus par
+/// morceaux, sans rien garder : nous ne lisons ensuite que ce qui sert.
+fn lisible(valeur: u64, longueur: usize) -> Result<(), i64> {
+    let mut morceau = [0u8; 512];
+    let mut fait = 0;
+    while fait < longueur {
+        let n = (longueur - fait).min(morceau.len());
+        copier_depuis_utilisateur(&mut morceau[..n], valeur + fait as u64).map_err(|_| -EFAULT)?;
+        fait += n;
+    }
+    Ok(())
+}
+
+/// Les options de la multidiffusion faites de structures
+/// (`do_ip_setsockopt`, sous le `rtnl_lock` ; mesurées sous Linux 6.18.33,
+/// une sonde) ; None : pas l'une d'elles. Les règles et leurs refus sont
+/// dans inet::multidiffusion (et la colle, reseau/multidiffusion.rs) ; ici,
+/// la forme de chaque structure, dans l'ordre de ses refus :
+///   - IP_MULTICAST_IF (`multicast_if`) ;
+///   - IP_ADD_MEMBERSHIP, IP_DROP_MEMBERSHIP : TCP (une socket « à
+///     connexions », IS_ICSK) : EPROTO, avant la longueur ; moins de 8
+///     octets : EINVAL ; de 8 à 11, une `ip_mreq` (sans index), au-delà une
+///     `ip_mreqn` ;
+///   - IP_BLOCK_SOURCE et IP_UNBLOCK_SOURCE (EXCLUDE), IP_ADD_SOURCE_MEMBERSHIP
+///     et IP_DROP_SOURCE_MEMBERSHIP (INCLUDE) : une `ip_mreq_source` (le
+///     groupe, l'adresse d'une interface, la source), 12 octets exactement
+///     (EINVAL) ; IP_ADD_SOURCE_MEMBERSHIP adhère d'abord en INCLUDE (déjà
+///     membre : rien), et toute autre erreur de l'adhésion est la sienne ;
+///   - IP_MSFILTER : une `ip_msfilter` (le groupe, l'adresse d'une
+///     interface, le mode, le nombre de sources, puis elles) : moins de 16
+///     octets : EINVAL ; plus qu'`optmem_max` : ENOBUFS ; tout est lu
+///     (EFAULT) ; plus de 10 sources : ENOBUFS ; plus de sources que de
+///     place : EINVAL ;
+///   - MCAST_JOIN_GROUP, MCAST_LEAVE_GROUP : une `group_req` (l'index, puis
+///     le groupe dans une `sockaddr_storage`), 136 octets au moins (EINVAL ;
+///     au-delà, rien n'est lu), une autre famille qu'AF_INET : EINVAL ; TCP
+///     peut adhérer ainsi (mesuré) ;
+///   - MCAST_BLOCK_SOURCE, MCAST_UNBLOCK_SOURCE, MCAST_JOIN_SOURCE_GROUP,
+///     MCAST_LEAVE_SOURCE_GROUP : une `group_source_req` (l'index, le
+///     groupe, la source), 264 octets exactement (EINVAL) ; une autre
+///     famille qu'AF_INET pour l'un des deux : EADDRNOTAVAIL ;
+///     MCAST_JOIN_SOURCE_GROUP adhère d'abord en INCLUDE par l'index (0 : la
+///     route), puis la source va à l'interface trouvée ;
+///   - MCAST_MSFILTER : une `group_filter` (l'index, le groupe, le mode, le
+///     nombre de sources, puis des `sockaddr_storage`) : moins de 144
+///     octets : EINVAL ; plus qu'`optmem_max` : ENOBUFS ; tout est lu ; plus
+///     de 10 sources : ENOBUFS ; pas la place : EINVAL ; une autre famille
+///     qu'AF_INET (le groupe, puis chaque source) : EADDRNOTAVAIL.
+fn options_multidiffusion(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Option<Result<(), i64>> {
+    use crate::reseau::multidiffusion as mc;
+    use inet::multidiffusion::{Demande, MAX_SOURCES, Mode};
+    let lire = |o: &mut [u8], decalage: usize| copier_depuis_utilisateur(o, valeur + decalage as u64).map_err(|_| -EFAULT);
+    let n = longueur.max(0) as usize;
+    let famille = |o: &[u8]| u16::from_le_bytes([o[0], o[1]]);
+    let modes = |option: i32| match option {
+        IP_BLOCK_SOURCE | MCAST_BLOCK_SOURCE => (Mode::Exclure, true),
+        IP_UNBLOCK_SOURCE | MCAST_UNBLOCK_SOURCE => (Mode::Exclure, false),
+        _ => (Mode::Inclure, false),
+    };
+    let r = (|| match option {
+        IP_MULTICAST_IF => multicast_if(s, valeur, longueur),
+        IP_ADD_MEMBERSHIP | IP_DROP_MEMBERSHIP => {
+            if s.protocole == Protocole::Tcp {
+                return Err(-EPROTO);
+            }
+            if n < 8 {
+                return Err(-EINVAL);
+            }
+            let mut m = [0u8; 12];
+            lire(&mut m[..if n >= 12 { 12 } else { 8 }], 0)?;
+            let d = Demande { groupe: adresse_de(&m[..4]), adresse: adresse_de(&m[4..8]), index: u32_de(&m[8..]) };
+            if option == IP_ADD_MEMBERSHIP { mc::joindre(s, d, Mode::Exclure).map(|_| ()) } else { mc::quitter(s, d) }
+        }
+        IP_BLOCK_SOURCE | IP_UNBLOCK_SOURCE | IP_ADD_SOURCE_MEMBERSHIP | IP_DROP_SOURCE_MEMBERSHIP => {
+            if n != MREQ_SOURCE {
+                return Err(-EINVAL);
+            }
+            let mut m = [0u8; MREQ_SOURCE];
+            lire(&mut m, 0)?;
+            let d = Demande { groupe: adresse_de(&m[..4]), adresse: adresse_de(&m[4..8]), index: 0 };
+            if option == IP_ADD_SOURCE_MEMBERSHIP {
+                // Adhérer en INCLUDE, puis ajouter la source, d'un seul tenant.
+                return mc::joindre_avec_source(s, d, adresse_de(&m[8..]));
+            }
+            let (mode, ajout) = modes(option);
+            mc::source(s, ajout, mode, d, adresse_de(&m[8..]))
+        }
+        IP_MSFILTER | MCAST_MSFILTER => {
+            let entete = if option == IP_MSFILTER { MSFILTER } else { GROUP_FILTER };
+            let taille = if option == IP_MSFILTER { 4 } else { STOCKAGE };
+            if n < entete {
+                return Err(-EINVAL);
+            }
+            if n as u64 > OPTMEM_MAX {
+                return Err(-ENOBUFS);
+            }
+            lisible(valeur, n)?;
+            let mut h = [0u8; GROUP_FILTER];
+            lire(&mut h[..entete], 0)?;
+            let (fmode, numsrc) = (u32_de(&h[entete - 8..]), u32_de(&h[entete - 4..]) as usize);
+            if numsrc > MAX_SOURCES {
+                return Err(-ENOBUFS);
+            }
+            if entete + taille * numsrc > n {
+                return Err(-EINVAL);
+            }
+            let mut sources = [[0u8; 4]; MAX_SOURCES];
+            let d = if option == IP_MSFILTER {
+                for (k, x) in sources[..numsrc].iter_mut().enumerate() {
+                    lire(x, entete + 4 * k)?;
+                }
+                Demande { groupe: adresse_de(&h[..4]), adresse: adresse_de(&h[4..8]), index: 0 }
+            } else {
+                if famille(&h[8..]) != AF_INET {
+                    return Err(-EADDRNOTAVAIL);
+                }
+                for (k, x) in sources[..numsrc].iter_mut().enumerate() {
+                    let mut o = [0u8; 8];
+                    lire(&mut o, entete + STOCKAGE * k)?;
+                    if famille(&o) != AF_INET {
+                        return Err(-EADDRNOTAVAIL);
+                    }
+                    *x = adresse_de(&o[4..]);
+                }
+                Demande { groupe: adresse_de(&h[12..16]), adresse: format_ipv4::AUCUNE, index: u32_de(&h[..4]) }
+            };
+            mc::filtrer(s, d, fmode, &sources[..numsrc])
+        }
+        MCAST_JOIN_GROUP | MCAST_LEAVE_GROUP => {
+            if n < GROUP_REQ {
+                return Err(-EINVAL);
+            }
+            let mut g = [0u8; GROUP_REQ];
+            lire(&mut g, 0)?;
+            if famille(&g[8..]) != AF_INET {
+                return Err(-EINVAL);
+            }
+            let d = Demande { groupe: adresse_de(&g[12..16]), adresse: format_ipv4::AUCUNE, index: u32_de(&g[..4]) };
+            if option == MCAST_JOIN_GROUP { mc::joindre(s, d, Mode::Exclure).map(|_| ()) } else { mc::quitter(s, d) }
+        }
+        MCAST_BLOCK_SOURCE | MCAST_UNBLOCK_SOURCE | MCAST_JOIN_SOURCE_GROUP | MCAST_LEAVE_SOURCE_GROUP => {
+            if n != GROUP_SOURCE_REQ {
+                return Err(-EINVAL);
+            }
+            let mut g = [0u8; GROUP_SOURCE_REQ];
+            lire(&mut g, 0)?;
+            if famille(&g[8..]) != AF_INET || famille(&g[8 + STOCKAGE..]) != AF_INET {
+                return Err(-EADDRNOTAVAIL);
+            }
+            let d = Demande { groupe: adresse_de(&g[12..16]), adresse: format_ipv4::AUCUNE, index: u32_de(&g[..4]) };
+            let source = adresse_de(&g[12 + STOCKAGE..16 + STOCKAGE]);
+            if option == MCAST_JOIN_SOURCE_GROUP {
+                return mc::joindre_avec_source(s, d, source);
+            }
+            let (mode, ajout) = modes(option);
+            mc::source(s, ajout, mode, d, source)
+        }
+        _ => Err(0),
+    })();
+    if r == Err(0) { None } else { Some(r) }
+}
+
+/// IP_MULTICAST_IF (`do_ip_setsockopt`) : l'interface et l'adresse des envois
+/// vers un groupe. TCP (un flux) : EINVAL ; moins de 4 octets : EINVAL ; de 4
+/// à 7, une adresse ; de 8 à 11, une `ip_mreq`, dont le second champ devient
+/// l'adresse ; au-delà, une `ip_mreqn`. Sans index : l'adresse 0.0.0.0 remet
+/// tout à zéro ; sinon l'interface qui la porte (`ip_dev_find`). L'index
+/// d'une interface qui n'existe pas, ou une adresse qui n'est pas à nous :
+/// EADDRNOTAVAIL (rien ne change). Une socket liée à une interface
+/// (SO_BINDTODEVICE) n'en demande pas une autre : EINVAL. L'index et
+/// l'adresse sont gardés (`mc_index`, `mc_addr` : l'adresse telle quelle,
+/// même d'ailleurs avec un index, mesuré).
+fn multicast_if(s: &Socket, valeur: u64, longueur: i32) -> Result<(), i64> {
+    if s.protocole == Protocole::Tcp || longueur < 4 {
+        return Err(-EINVAL);
+    }
+    let mut m = [0u8; 12];
+    match longueur {
+        12.. => copier_depuis_utilisateur(&mut m, valeur),
+        8..12 => copier_depuis_utilisateur(&mut m[..8], valeur),
+        _ => copier_depuis_utilisateur(&mut m[4..8], valeur),
+    }.map_err(|_| -EFAULT)?;
+    let (adresse, mut index) = (adresse_de(&m[4..8]), u32_de(&m[8..]));
+    let mut inet = s.appels.verrouiller();
+    let op = &mut inet.options;
+    if index == 0 {
+        if adresse == format_ipv4::AUCUNE {
+            op.mc_index = 0;
+            op.mc_addr = adresse;
+            return Ok(());
+        }
+        index = ipv4::avec_table(|t| t.interface_locale(adresse)).flatten().ok_or(-EADDRNOTAVAIL)?;
+    } else if crate::reseau::interface::par_index(index).is_none() {
+        return Err(-EADDRNOTAVAIL);
+    }
+    if op.interface != 0 && index != op.interface {
+        return Err(-EINVAL);
+    }
+    op.mc_index = index;
+    op.mc_addr = adresse;
+    Ok(())
+}
+
+/// IP_MSFILTER lu (`ip_mc_msfget`) : une place de moins de 16 octets :
+/// EINVAL ; la demande lue (EFAULT) ; ses refus (inet::multidiffusion) ;
+/// puis la longueur (16, plus 4 par source rendue : autant qu'il y en a, au
+/// plus le nombre demandé), l'en-tête (le nombre de sources devient le vrai),
+/// et les sources, même au-delà de la place donnée (mesuré : Linux écrit
+/// au-delà).
+fn lire_msfilter(s: &Socket, valeur: u64, longueur: u64, place: usize) -> Result<(), i64> {
+    use inet::multidiffusion::Demande;
+    if place < MSFILTER {
+        return Err(-EINVAL);
+    }
+    let mut h = [0u8; MSFILTER];
+    copier_depuis_utilisateur(&mut h, valeur).map_err(|_| -EFAULT)?;
+    let d = Demande { groupe: adresse_de(&h[..4]), adresse: adresse_de(&h[4..8]), index: 0 };
+    let f = crate::reseau::multidiffusion::filtre(s, d)?;
+    let n = f.n.min(u32_de(&h[12..]) as usize);
+    h[8..12].copy_from_slice(&f.mode.numero().to_le_bytes());
+    h[12..].copy_from_slice(&(f.n as u32).to_le_bytes());
+    copier_vers_utilisateur(longueur, &((MSFILTER + 4 * n) as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+    copier_vers_utilisateur(valeur, &h).map_err(|_| -EFAULT)?;
+    for (k, x) in f.sources[..n].iter().enumerate() {
+        copier_vers_utilisateur(valeur + (MSFILTER + 4 * k) as u64, x).map_err(|_| -EFAULT)?;
+    }
+    Ok(())
+}
+
+/// MCAST_MSFILTER lu (`ip_get_mcast_msfilter`, `ip_mc_gsfget`) : une place
+/// de moins de 144 octets : EINVAL ; l'en-tête lu (EFAULT) ; une autre
+/// famille qu'AF_INET, ou pas un groupe : EINVAL ; l'adhésion par l'index
+/// donné, sans rien chercher (0 n'en est aucune) : EADDRNOTAVAIL ; puis
+/// chaque source rendue (autant qu'il y en a, au plus le nombre demandé),
+/// dans une `sockaddr_storage` mise à zéro, même au-delà de la place ; la
+/// longueur (144, plus 128 par source rendue), et l'en-tête.
+fn lire_group_filter(s: &Socket, valeur: u64, longueur: u64, place: usize) -> Result<(), i64> {
+    if place < GROUP_FILTER {
+        return Err(-EINVAL);
+    }
+    let mut h = [0u8; GROUP_FILTER];
+    copier_depuis_utilisateur(&mut h, valeur).map_err(|_| -EFAULT)?;
+    if u16::from_le_bytes([h[8], h[9]]) != AF_INET {
+        return Err(-EINVAL);
+    }
+    let f = crate::reseau::multidiffusion::filtre_par_index(s, adresse_de(&h[12..16]), u32_de(&h[..4]))?;
+    let n = f.n.min(u32_de(&h[140..]) as usize);
+    for (k, x) in f.sources[..n].iter().enumerate() {
+        let mut o = [0u8; STOCKAGE];
+        o[..2].copy_from_slice(&AF_INET.to_le_bytes());
+        o[4..8].copy_from_slice(x);
+        copier_vers_utilisateur(valeur + (GROUP_FILTER + STOCKAGE * k) as u64, &o).map_err(|_| -EFAULT)?;
+    }
+    h[136..140].copy_from_slice(&f.mode.numero().to_le_bytes());
+    h[140..].copy_from_slice(&(f.n as u32).to_le_bytes());
+    copier_vers_utilisateur(longueur, &((GROUP_FILTER + STOCKAGE * n) as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+    copier_vers_utilisateur(valeur, &h).map_err(|_| -EFAULT)
 }
 
 /// getsockopt(fd, niveau, option, valeur, longueur) (`do_sock_getsockopt`) :
@@ -2156,6 +2462,23 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
             }
             // Le routage de la multidiffusion avant la longueur (`ip_mroute_getsockopt`).
             SOL_IP if MRT.contains(&option) => Err(-EOPNOTSUPP),
+            // L'adresse d'IP_MULTICAST_IF (`mc_addr`), en `in_addr` : au plus 4
+            // octets, la longueur écrite d'abord.
+            SOL_IP if option == IP_MULTICAST_IF => {
+                let n = (lire_longueur(&mut l)? as usize).min(4);
+                let a = s.appels.verrouiller().options.mc_addr;
+                copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+                copier_vers_utilisateur(valeur, &a[..n]).map_err(|_| -EFAULT)?;
+                Ok(0)
+            }
+            SOL_IP if option == IP_MSFILTER => {
+                let place = lire_longueur(&mut l)? as usize;
+                lire_msfilter(s, valeur, longueur, place).map(|_| 0)
+            }
+            SOL_IP if option == MCAST_MSFILTER => {
+                let place = lire_longueur(&mut l)? as usize;
+                lire_group_filter(s, valeur, longueur, place).map(|_| 0)
+            }
             // Les options défaites (`ip_options_undo`), autant qu'il y a de
             // place ; aucune : une longueur nulle.
             SOL_IP if option == IP_OPTIONS => {
@@ -2301,6 +2624,8 @@ fn lire_option_ip(s: &Socket, option: i32) -> Result<i32, i64> {
         IP_TTL => op.ttl.unwrap_or(ipv4::TTL_DEFAUT) as i32,
         IP_MINTTL => op.minttl as i32,
         IP_MULTICAST_TTL => op.mc_ttl as i32,
+        IP_MULTICAST_LOOP => op.mc_loop as i32,
+        IP_MULTICAST_ALL => s.mc_all.load(Ordering::Relaxed) as i32,
         IP_MTU_DISCOVER => op.pmtudisc as i32,
         IP_LOCAL_PORT_RANGE => op.local_port_range as i32,
         _ => return Err(-ENOPROTOOPT),

@@ -12,7 +12,9 @@
 //! leurs identifiants (idents.rs) ; et quand la tâche du réseau doit
 //! se réveiller, et pour qui (echeances.rs, 6h), comment recoller un paquet en
 //! fragments (fragments.rs), combien d'erreurs ICMP envoyer à chaque
-//! machine (pairs.rs) ; et les compteurs de /proc/net/snmp (snmp.rs). Rien
+//! machine (pairs.rs) ; et les compteurs de /proc/net/snmp (snmp.rs) ;
+//! les groupes de multidiffusion de chaque socket et de chaque interface,
+//! et leurs filtres de sources (multidiffusion.rs). Rien
 //! ici ne lit l'horloge ni ne tire au hasard : l'heure (en nanosecondes) et
 //! le hasard sont des arguments, si bien qu'un test peut faire passer 45
 //! secondes en une ligne, et rejouer exactement un cas.
@@ -29,6 +31,7 @@ pub mod echeances;
 pub mod en_vol;
 pub mod fragments;
 pub mod idents;
+pub mod multidiffusion;
 pub mod pairs;
 pub mod pmtu;
 pub mod ports;
