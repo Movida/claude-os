@@ -2063,9 +2063,13 @@ fn vecteur_tenu(o: &FichierTenu, adresse: u64, nombre: u64, ecrire: bool, positi
     }
     let mut ici = position;
     let mut fait = 0u64;
-    for (base, longueur) in morceaux {
+    for (i, (base, longueur)) in morceaux.into_iter().enumerate() {
         let longueur = longueur.min(permis - fait);
-        if longueur == 0 {
+        // Un morceau vide est sauté (`iov_iter_advance` passe les vides),
+        // sauf le premier d'une sorte qui ne se lit ou ne s'écrit que par
+        // `read` ou `write` : `do_loop_readv_writev` le lui donne, avant
+        // tout avancement (un eventfd rend alors EINVAL ; mesuré).
+        if longueur == 0 && (i != 0 || operation != Operation::Boucle) {
             if fait == permis {
                 break;
             }

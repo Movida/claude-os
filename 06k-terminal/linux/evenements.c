@@ -110,6 +110,12 @@ static void fichier_anonyme(void)
     struct iovec huit_huit[2] = { { &seize[0], 8 }, { &seize[1], 8 } };
     verifier(erreur(write(e, seize, 16)) == EINVAL && writev(e, huit_huit, 2) == 16 && read(e, &lu, 8) == 8 && lu == 2,
              "write de 16 octets : EINVAL ; writev de 8 + 8 : 16, deux ajouts");
+    /* Un morceau vide en tête est donné à write (EINVAL : pas 8 octets) ;
+     * ailleurs, il est sauté (`do_loop_readv_writev`, mesuré). */
+    struct iovec vide_d_abord[2] = { { &seize[0], 0 }, { &seize[1], 8 } };
+    struct iovec vide_au_milieu[3] = { { &seize[0], 8 }, { &seize[0], 0 }, { &seize[1], 8 } };
+    verifier(erreur(writev(e, vide_d_abord, 2)) == EINVAL && writev(e, vide_au_milieu, 3) == 16 && read(e, &lu, 8) == 8 && lu == 2,
+             "writev d'un morceau vide puis 8 : EINVAL ; de 8, vide, 8 : 16");
     close(e);
     close(p);
 }
