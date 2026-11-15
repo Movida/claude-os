@@ -836,8 +836,12 @@ fn aligner(n: usize) -> usize {
 /// SOL_SOCKET : SCM_RIGHTS et SCM_CREDENTIALS ignorés (ceux d'AF_UNIX), un
 /// autre : EINVAL (un écart pour SO_MARK, SO_PRIORITY, l'horodatage :
 /// Linux les prend) ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
-/// niveau est ignoré.
-fn lire_controle(c: &[u8]) -> Result<Controle, i64> {
+/// niveau est ignoré. Selon qui lit (`protocole`), comme chez Linux : UDP
+/// lit SOL_UDP (`udp_cmsg_send`), puis SOL_IP et SOL_SOCKET
+/// (`ip_cmsg_send`) ; ping, seulement ces deux-là (SOL_UDP est sauté) ; TCP,
+/// seulement SOL_SOCKET (`sock_cmsg_send`, dans `tcp_sendmsg_locked`) : un
+/// message d'un autre niveau, même faux, ne compte pas (mesuré).
+fn lire_controle(c: &[u8], protocole: Protocole) -> Result<Controle, i64> {
     let mut r = Controle::default();
     let mut i = 0;
     while c.len() >= i + CMSG_ENTETE {
@@ -847,6 +851,15 @@ fn lire_controle(c: &[u8]) -> Result<Controle, i64> {
         }
         let niveau = i32::from_le_bytes(c[i + 8..i + 12].try_into().unwrap_or([0; 4]));
         let sorte = i32::from_le_bytes(c[i + 12..i + 16].try_into().unwrap_or([0; 4]));
+        let lu = match protocole {
+            Protocole::Tcp => niveau == SOL_SOCKET,
+            Protocole::Ping => niveau != SOL_UDP,
+            _ => true,
+        };
+        if !lu {
+            i += aligner(longueur);
+            continue;
+        }
         let d = &c[i + CMSG_ENTETE..i + longueur];
         let entier = || -> Result<i32, i64> {
             if d.len() != 4 {
@@ -961,7 +974,7 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
             }
             Ok(Controle::default())
         } else {
-            lire_controle(&c)
+            lire_controle(&c, o.socket().protocole)
         }
     } else {
         Ok(Controle::default())

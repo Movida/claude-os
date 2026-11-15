@@ -370,6 +370,36 @@ static void donnees(void)
 }
 
 /* listen(backlog) : combien de clients sont établis avant accept. */
+/* Les messages de contrôle d'un envoi TCP : seul SOL_SOCKET compte
+ * (`sock_cmsg_send`, dans `tcp_sendmsg_locked`) ; SOL_IP et SOL_UDP sont
+ * sautés, même faux (un IP_TTL de 0, un genre inconnu), et un genre
+ * inconnu de SOL_SOCKET rend EINVAL (mesuré). */
+static void controle_d_un_envoi(void)
+{
+    int c, a;
+    paire(&c, &a);
+    struct { int niveau, genre; long attendu; } cas[] = {
+        { IPPROTO_IP, IP_TTL, 0 }, { IPPROTO_IP, 99, 0 }, { IPPROTO_UDP, 103, 0 }, { SOL_SOCKET, 99, EINVAL },
+    };
+    int bons = 1;
+    for (unsigned k = 0; k < sizeof cas / sizeof cas[0]; k++) {
+        char o[CMSG_SPACE(sizeof(int))] = { 0 };
+        struct iovec v = { "ab", 2 };
+        struct msghdr m = { .msg_iov = &v, .msg_iovlen = 1, .msg_control = o, .msg_controllen = sizeof o };
+        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+        h->cmsg_level = cas[k].niveau;
+        h->cmsg_type = cas[k].genre;
+        h->cmsg_len = CMSG_LEN(sizeof(int));
+        bons &= erreur(sendmsg(c, &m, 0)) == cas[k].attendu;
+    }
+    char t[16];
+    attendre_ms(50);
+    verifier(bons && recv(a, t, sizeof t, MSG_DONTWAIT) == 6 && memcmp(t, "ababab", 6) == 0,
+             "sendmsg : SOL_IP et SOL_UDP sautes, meme faux ; SOL_SOCKET inconnu : EINVAL");
+    close(c);
+    close(a);
+}
+
 static int etablis(int backlog, int clients)
 {
     int port, l = ecoute(&port, backlog), cs[8], ok = 0;
@@ -2213,6 +2243,7 @@ int main(void)
     ecoutes();
     refus();
     donnees();
+    controle_d_un_envoi();
     file_d_ecoute();
     accept_sans_place();
     filles_avant_accept();

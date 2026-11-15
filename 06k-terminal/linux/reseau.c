@@ -945,6 +945,19 @@ static void icmp(void)
                  "ping : un autre genre que l'echo, ou moins de 8 octets : EINVAL");
         int f;
         verifier(ioctl(q, FIONREAD, &f) == -1 && errno == ENOTTY, "ping : FIONREAD : ENOTTY");
+        /* SOL_UDP : sauté par ping (`ip_cmsg_send` ne lit que SOL_IP et
+         * SOL_SOCKET), un genre inconnu compris ; l'écho part. */
+        char oc[CMSG_SPACE(sizeof(int))] = { 0 };
+        struct iovec iv = { m, sizeof m };
+        struct msghdr mh = { .msg_name = &d, .msg_namelen = sizeof d, .msg_iov = &iv, .msg_iovlen = 1, .msg_control = oc,
+                             .msg_controllen = sizeof oc };
+        struct cmsghdr *ch = CMSG_FIRSTHDR(&mh);
+        ch->cmsg_level = IPPROTO_UDP;
+        ch->cmsg_type = 103;
+        ch->cmsg_len = CMSG_LEN(sizeof(int));
+        long km = sendmsg(q, &mh, 0);
+        long nm = recv(q, r, sizeof r, 0);
+        verifier(km == (long)sizeof m && nm == (long)sizeof m, "ping : un message de controle de SOL_UDP est saute, l'echo part");
         /* MSG_OOB : refusé avant tout par ping, ignoré par UDP. */
         int u = udp(0);
         verifier(erreur(recv(q, r, sizeof r, MSG_OOB | MSG_DONTWAIT)) == EOPNOTSUPP
