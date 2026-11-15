@@ -44,10 +44,21 @@ trame -v genre=tcp -v tos=19 -v ttl=50 -v source=40001 -v destination=4001 -v se
 # ACK (`tcp_v4_reqsk_send_ack`), TOS 0x10 et TTL 64 aussi ; des données,
 # pour que la limite des ACK hors fenêtre ne le retienne pas.
 trame -v genre=tcp -v tos=19 -v ttl=50 -v source=40001 -v destination=4001 -v seq=501001 -v drapeaux=8 -v donnees=1
+# Un SYN vers le port 23, pour 10.0.2.15, mais dans une trame de diffusion
+# (ff:ff:ff:ff:ff:ff) : TCP le jette avant même de le compter (`tcp_v4_rcv` :
+# PACKET_HOST seulement), sans RST.
+trame -v genre=tcp -v ttl=50 -v mac=ffffffffffff -v source=40002 -v destination=23 -v seq=1000 -v drapeaux=2
+# Pour la diffusion du réseau (10.0.2.255), dans une trame pour la machine :
+# comptés ; un SYN vers le port 23 n'a pas de RST (pas pour une de nos
+# adresses) ; un ACK vers l'écoute, un RST compté qui ne part pas (sa source
+# serait la diffusion : pas de route) ; un SYN vers l'écoute, pas de fille.
+trame -v genre=tcp -v ttl=50 -v vers=10.0.2.255 -v source=40003 -v destination=23 -v seq=1000 -v drapeaux=2
+trame -v genre=tcp -v ttl=50 -v vers=10.0.2.255 -v source=40004 -v destination=4001 -v seq=1001 -v ack=12345 -v drapeaux=16
+trame -v genre=tcp -v ttl=50 -v vers=10.0.2.255 -v source=40005 -v destination=4001 -v seq=1000 -v drapeaux=2
 # La multidiffusion (`reseau carte` a adhéré à 239.1.2.3, port 4003) : un
 # datagramme de 6 octets pour le groupe, dans une trame pour son adresse
 # Ethernet (01:00:5e:01:02:03), qu'il reçoit ; un pour 239.1.2.4, qu'il n'a
-# pas : rien.
+# pas : la carte le jette (sa MAC n'est pas dans sa table, virtio_net.rs).
 trame -v genre=udp -v ttl=64 -v vers=239.1.2.3 -v mac=01005e010203 -v source=4444 -v destination=4003 -v donnees=6
 trame -v genre=udp -v ttl=64 -v vers=239.1.2.4 -v mac=01005e010204 -v source=4444 -v destination=4003 -v donnees=6
 # Deux diffusions (255.255.255.255) de somme fausse, vers un port que

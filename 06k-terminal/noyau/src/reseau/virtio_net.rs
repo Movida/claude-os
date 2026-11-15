@@ -12,14 +12,16 @@
 //! signaler à la tâche du réseau, qui relit l'état et le dit.
 //!
 //! Les fonctionnalités : on n'accepte que VERSION_1 (le transport moderne),
-//! MAC, STATUS et EVENT_IDX (moins d'interruptions, ce que négocie Linux).
-//! Jamais une offre GUEST_* ou HOST_* (le calcul des sommes de contrôle et
-//! le découpage des gros paquets par la carte) : la pile fait tout en
-//! logiciel. Une seule carte est mise en service, la première : `eth0`.
+//! MAC, STATUS, EVENT_IDX (moins d'interruptions, ce que négocie Linux), et
+//! CTRL_VQ avec CTRL_RX (la file de contrôle et le filtre des adresses, plus
+//! bas). Jamais une offre GUEST_* ou HOST_* (le calcul des sommes de
+//! contrôle et le découpage des gros paquets par la carte) : la pile fait
+//! tout en logiciel. Une seule carte est mise en service, la première :
+//! `eth0`.
 //!
-//! LES DEUX FILES (une paire, sans la file de contrôle, que nous ne
-//! négocions pas) : la file 0 reçoit, la file 1 émet, chacune avec son
-//! entrée MSI-X (1 et 2), comme Linux.
+//! LES FILES : une paire, la file 0 reçoit, la file 1 émet, chacune avec son
+//! entrée MSI-X (1 et 2), comme Linux ; puis la file de contrôle (2), sans
+//! interruption.
 //!   - Réception : 256 tampons de 2 Kio (deux par page), tous confiés à la
 //!     carte au départ. Sans VIRTIO_NET_F_MRG_RXBUF ni réception de gros
 //!     paquets, une trame tient dans un tampon : 12 octets d'en-tête de
@@ -43,6 +45,33 @@
 //! leur file et réveiller la tâche du réseau (NAPI) : `travailler` vide
 //! l'anneau de réception par lots, livre les trames, rallume, et revérifie
 //! (une trame arrivée entre les deux n'est pas perdue).
+//!
+//! LE FILTRE DES ADRESSES. Une carte remise à zéro laisse tout entrer (la
+//! promiscuité de QEMU, `virtio_net_reset`) : chaque trame de
+//! multidiffusion du réseau arrive jusqu'à IP, qui la jette si la machine
+//! n'est pas du groupe. Avec CTRL_RX, le pilote le dit à la carte par sa
+//! file de contrôle (une commande : une classe et un numéro, des données,
+//! et la réponse que la carte écrit) : pas de promiscuité, pas « toute la
+//! multidiffusion », puis la table de ses adresses (MAC_TABLE_SET) : aucune
+//! adresse individuelle de plus que la sienne, et les adresses MAC des
+//! groupes de l'interface (multidiffusion.rs, la liste `dev->mc`). La carte
+//! laisse alors entrer sa propre adresse, la diffusion, et ces groupes ; le
+//! reste ne coûte plus rien à la machine. C'est le `virtnet_rx_mode_work`
+//! de Linux, que fait la tâche du réseau à chaque changement de la liste
+//! (`tache::FILTRE`) : les trois commandes, l'une après l'autre, chacune
+//! attendue en tournant sur l'anneau utilisé (QEMU l'a faite pendant
+//! l'écriture de la notification), la file tenue par un verrou qui dort
+//! (le `cvq_lock` de Linux : la tâche reste préemptible). Comme Linux, on
+//! attend la réponse sans limite : une carte lente (une vraie, derrière
+//! vDPA) n'est pas une carte morte.
+//! Une liste plus longue que la page de commande (680 adresses) : « toute
+//! la multidiffusion » (ALLMULTI), et une table sans groupe, ce que fait
+//! un pilote dont la table de la carte déborde (QEMU lui-même passe à
+//! toute la multidiffusion au-delà de 64 adresses). Options écartées :
+//! rester en promiscuité (la pile trierait tout le réseau, et une vraie
+//! carte en promiscuité reçoit aussi les trames des autres machines) ; une
+//! table de hachage des adresses (le filtre de bien des cartes, que virtio
+//! n'a pas). Sans CTRL_VLAN, la carte laisse passer tous les VLAN.
 
 use super::interface::{self, Interface, Materiel};
 use super::paquet::{Paquet, Proprietaire};
@@ -50,6 +79,7 @@ use crate::faillible::{self, FileFaillible, VecFaillible};
 use crate::pci::{self, Fonction};
 use crate::virtio::{self, Notifieur, Virtio};
 use crate::virtqueue::{ECRIT_PAR_PERIPHERIQUE, Tampon, Virtqueue};
+use crate::attente::Mutex;
 use crate::{espace, irq, pages, verrou::Verrou};
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
@@ -58,6 +88,9 @@ use core::sync::atomic::{AtomicU32, Ordering};
 // Les fonctionnalités de virtio-net (include/uapi/linux/virtio_net.h).
 const F_MAC: u32 = 5;
 const F_STATUS: u32 = 16;
+/// La file de contrôle, et les commandes du filtre (qui la demandent).
+const F_CTRL_VQ: u32 = 17;
+const F_CTRL_RX: u32 = 18;
 /// Dans le champ `status` de la configuration : le lien est actif.
 const LIEN_ACTIF: u16 = 1;
 /// La position du champ `status` dans la configuration (après les 6
@@ -82,6 +115,32 @@ const FILE_EMISSION: u16 = 1;
 /// La taille de chaque file (celle de la carte de QEMU, et le plus que
 /// tient une page de descripteurs).
 const TAILLE_FILE: u16 = 256;
+/// La file de contrôle : après la paire.
+const FILE_CONTROLE: u16 = 2;
+/// Sa taille, au plus (celle de QEMU) ; une commande y prend jusqu'à quatre
+/// descripteurs (l'en-tête, deux tables, la réponse).
+const TAILLE_CONTROLE: u16 = 64;
+const DESCRIPTEURS_PAR_COMMANDE: usize = 4;
+// Les commandes : la classe, puis le numéro (include/uapi/linux/virtio_net.h).
+const CLASSE_RX: u8 = 0;
+const RX_PROMISC: u8 = 0;
+const RX_ALLMULTI: u8 = 1;
+const CLASSE_MAC: u8 = 1;
+const MAC_TABLE_SET: u8 = 0;
+/// La réponse de la carte à une commande faite (VIRTIO_NET_OK).
+const FAITE: u8 = 0;
+// La page de commande : l'en-tête (`virtio_net_ctrl_hdr`, classe et numéro),
+// la réponse (`virtio_net_ctrl_ack`), l'octet d'une commande RX (0 ou 1),
+// puis les deux tables de MAC_TABLE_SET (`virtio_net_ctrl_mac` : un
+// compte sur 32 bits petit-boutiste, puis les adresses) : celle des
+// adresses individuelles (vide), puis celle des groupes.
+const PAGE_ENTETE: u64 = 0;
+const PAGE_REPONSE: u64 = 2;
+const PAGE_OCTET: u64 = 3;
+const PAGE_INDIVIDUELLES: u64 = 4;
+const PAGE_GROUPES: u64 = 8;
+/// Les adresses de groupe que tient la page.
+const GROUPES_MAX: usize = (4096 - PAGE_GROUPES as usize - 4) / 6;
 /// La taille d'un tampon de réception ou d'une case d'émission.
 const TAILLE_TAMPON: u64 = 2048;
 /// L'en-tête de virtio-net devant chaque trame (`struct virtio_net_hdr`,
@@ -99,6 +158,13 @@ const LOT: usize = 16;
 struct Reception {
     file: Virtqueue,
     notifieur: Notifieur,
+}
+
+/// La file de contrôle, et sa page de commande (une commande à la fois).
+struct Controle {
+    file: Virtqueue,
+    notifieur: Notifieur,
+    page: Tampons,
 }
 
 struct Emission {
@@ -126,6 +192,8 @@ pub struct Carte {
     pages_emission: Tampons,
     reception: Verrou<Reception>,
     emission: Verrou<Emission>,
+    /// La file de contrôle, si la carte a CTRL_RX.
+    controle: Option<Mutex<Controle>>,
 }
 // Une `Carte` rendue (sa mise en service a échoué) l'est dans l'ordre de ses
 // champs : `virtio` d'abord, qui remet la carte à zéro (elle ne touche plus
@@ -190,7 +258,9 @@ fn nommer(v: &Virtio) -> impl core::fmt::Display + '_ {
     impl core::fmt::Display for Noms<'_> {
         fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
             let mut premier = true;
-            for (bit, nom) in [(virtio::F_VERSION_1, "VERSION_1"), (F_MAC, "MAC"), (F_STATUS, "STATUS"), (virtio::F_EVENT_IDX, "EVENT_IDX")] {
+            let noms = [(virtio::F_VERSION_1, "VERSION_1"), (F_MAC, "MAC"), (F_STATUS, "STATUS"), (F_CTRL_VQ, "CTRL_VQ"),
+                        (F_CTRL_RX, "CTRL_RX"), (virtio::F_EVENT_IDX, "EVENT_IDX")];
+            for (bit, nom) in noms {
                 if self.0.a(bit) {
                     write!(f, "{}{}", if premier { "" } else { " " }, nom)?;
                     premier = false;
@@ -221,6 +291,9 @@ pub fn sonder() {
     };
     c.interface.store(i.index, Ordering::Relaxed);
     *CARTE.verrouiller() = Some(c);
+    // Son filtre : l'interface a déjà 224.0.0.1 (`interface::ajouter`), et
+    // la tâche a pu chercher la carte avant qu'elle ne soit là.
+    super::tache::signaler(super::tache::FILTRE);
     afficherln!("[reseau] {} : {}, mtu {}, lien {}.", i.nom, interface::decrire(i), i.mtu(), if lien { "actif" } else { "coupe" });
     // Des trames ont pu arriver avant que l'interface n'existe (la file
     // de réception était déjà ouverte) : la tâche les prendra.
@@ -269,7 +342,13 @@ fn renoncer(v: Virtio, r: virtio::Refus) -> virtio::Refus {
 /// interruptions, DRIVER_OK. Rend la carte, sa MAC et son lien.
 fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus> {
     let mut v = Virtio::ouvrir(f)?;
-    let voulues = 1 << virtio::F_VERSION_1 | 1 << virtio::F_EVENT_IDX | 1 << F_MAC | 1 << F_STATUS;
+    let mut voulues = 1 << virtio::F_VERSION_1 | 1 << virtio::F_EVENT_IDX | 1 << F_MAC | 1 << F_STATUS;
+    // La file de contrôle ne sert qu'au filtre : les deux, ou aucune
+    // (CTRL_RX demande CTRL_VQ, 5.1.3.1).
+    let filtre = 1 << F_CTRL_VQ | 1 << F_CTRL_RX;
+    if v.offertes() & filtre == filtre {
+        voulues |= filtre;
+    }
     v.negocier(voulues)?;
     // Sans MAC donnée par la carte, Linux en tire une au hasard ; QEMU en
     // donne toujours une (52:54:00:12:34:56 par défaut).
@@ -295,6 +374,21 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
     let (Some(pages_reception), Some(pages_emission)) = (Tampons::new(n), Tampons::new(n)) else {
         return Err(renoncer(v, virtio::Refus::Memoire));
     };
+    // La file de contrôle (sa taille : celle de la carte, une puissance de 2,
+    // 64 au plus), et sa page ; sans interruption (lue en tournant).
+    let controle = if v.a(F_CTRL_VQ) {
+        let taille = v.taille_max(FILE_CONTROLE).min(TAILLE_CONTROLE);
+        if (taille as usize) < DESCRIPTEURS_PAR_COMMANDE || !taille.is_power_of_two() {
+            return Err(renoncer(v, virtio::Refus::Structure));
+        }
+        let (Some(mut file), Some(page)) = (Virtqueue::new(taille, evenements), Tampons::new(1)) else {
+            return Err(renoncer(v, virtio::Refus::Memoire));
+        };
+        file.couper();
+        Some((file, page))
+    } else {
+        None
+    };
     let mut libres = Vec::new();
     let mut attente = VecDeque::new();
     // La place de toutes les cases, et de la petite file : l'émission
@@ -313,13 +407,20 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
     // n'y est laissée pour toujours qu'une fois en service.
     let partage = v.msix.entrees() < 3;
     let (entree_rx, entree_tx) = if partage { (ENTREE_FILES, ENTREE_FILES) } else { (ENTREE_RECEPTION, ENTREE_EMISSION) };
-    let rx_notifieur = match v.installer_file(FILE_RECEPTION, &rx, entree_rx) {
+    let rx_notifieur = match v.installer_file(FILE_RECEPTION, &rx, Some(entree_rx)) {
         Ok(n) => n,
         Err(e) => return Err(renoncer(v, e)),
     };
-    let tx_notifieur = match v.installer_file(FILE_EMISSION, &tx, entree_tx) {
+    let tx_notifieur = match v.installer_file(FILE_EMISSION, &tx, Some(entree_tx)) {
         Ok(n) => n,
         Err(e) => return Err(renoncer(v, e)),
+    };
+    let controle = match controle {
+        Some((file, page)) => match v.installer_file(FILE_CONTROLE, &file, None) {
+            Ok(notifieur) => Some(Mutex::new(Controle { file, notifieur, page })),
+            Err(e) => return Err(renoncer(v, e)),
+        },
+        None => None,
     };
     let Ok(place) = faillible::boite_vide::<Carte>() else { return Err(renoncer(v, virtio::Refus::Memoire)) };
     let carte = alloc::boxed::Box::write(place, Carte {
@@ -330,6 +431,7 @@ fn ouvrir(f: &Fonction) -> Result<(&'static Carte, [u8; 6], bool), virtio::Refus
         pages_emission,
         reception: Verrou::new(Reception { file: rx, notifieur: rx_notifieur }),
         emission: Verrou::new(Emission { file: tx, notifieur: tx_notifieur, libres, attente, proprietaires, suivies: 0 }),
+        controle,
     });
     let argument = &*carte as *const Carte as usize;
     // Un échec à partir d'ici rend les vecteurs déjà donnés, puis la carte
@@ -553,6 +655,103 @@ pub fn configuration_changee() {
     let actif = c.virtio.configuration(|l| l.mot16(STATUS)).is_some_and(|s| s & LIEN_ACTIF != 0);
     if i.lien.swap(actif, Ordering::Relaxed) != actif {
         afficherln!("[reseau] {} : lien {}.", i.nom, if actif { "retabli" } else { "coupe" });
+    }
+}
+
+impl Controle {
+    /// L'adresse physique de la page, à `decalage`.
+    fn physique(&self, decalage: u64) -> u64 {
+        self.page.0[0] + decalage
+    }
+
+    /// Écrit `octets` dans la page, à `decalage`.
+    fn ecrire(&mut self, decalage: u64, octets: &[u8]) {
+        assert!(decalage as usize + octets.len() <= 4096, "hors de la page de commande");
+        // SAFETY: la page est à nous, vue par la projection directe, et
+        // l'écriture y tient (vérifié) ; entre deux commandes, la carte n'y
+        // touche pas (elle a rendu la dernière, `envoyer` l'a attendue), et
+        // `&mut self` (sous le verrou de la file) écarte tout autre écrivain.
+        unsafe {
+            core::ptr::copy_nonoverlapping(octets.as_ptr(), espace::virtuelle(self.physique(decalage)) as *mut u8, octets.len())
+        }
+    }
+
+    /// Envoie la commande (`classe`, `numero`), dont les données sont déjà
+    /// dans la page aux places `donnees` (décalage, longueur), et attend que
+    /// la carte la rende (`virtnet_send_command_reply`). Vrai : faite.
+    fn envoyer(&mut self, classe: u8, numero: u8, donnees: &[(u64, u32)]) -> bool {
+        self.ecrire(PAGE_ENTETE, &[classe, numero]);
+        // Une réponse que la carte n'écrirait pas se lit « refusée » (le
+        // `status = ~0` de Linux).
+        self.ecrire(PAGE_REPONSE, &[0xff]);
+        let mut chaine = [Tampon { physique: 0, longueur: 0, drapeaux: 0 }; DESCRIPTEURS_PAR_COMMANDE];
+        let mut n = 0;
+        let mut ajouter = |physique, longueur, drapeaux| {
+            chaine[n] = Tampon { physique, longueur, drapeaux };
+            n += 1;
+        };
+        ajouter(self.physique(PAGE_ENTETE), 2, 0);
+        for &(decalage, longueur) in donnees {
+            ajouter(self.physique(decalage), longueur, 0);
+        }
+        ajouter(self.physique(PAGE_REPONSE), 1, ECRIT_PAR_PERIPHERIQUE);
+        // La file est vide (la dernière commande a été rendue) : la chaîne y
+        // tient.
+        if !self.file.ajouter(&chaine[..n], 0) {
+            return false;
+        }
+        if self.file.faut_il_notifier() {
+            self.notifieur.notifier();
+        }
+        // Tourner, préemptible (aucun Verrou n'est tenu) : la réponse.
+        while self.file.obtenir().is_none() {
+            core::hint::spin_loop();
+        }
+        // SAFETY: l'octet de la réponse, dans notre page ; la carte l'a écrit
+        // avant de rendre la chaîne (`obtenir` lit l'index avant les entrées).
+        let reponse = unsafe { (espace::virtuelle(self.physique(PAGE_REPONSE)) as *const u8).read_volatile() };
+        reponse == FAITE
+    }
+}
+
+/// Les adresses MAC des groupes ont changé, ou la carte vient d'être mise
+/// en service : son filtre, refait (le `virtnet_rx_mode_work` de Linux) :
+/// ni promiscuité, ni toute la multidiffusion (sauf si la liste déborde de
+/// la page), puis la table : aucune adresse individuelle, et les adresses
+/// des groupes, recopiées sous le verrou des groupes. Dans la tâche du
+/// réseau, qui ne tient aucun Verrou (la file de contrôle est un verrou qui
+/// dort, pris avant les groupes). Une commande refusée est dite, et la
+/// suite essayée quand même, comme chez Linux.
+pub fn filtrer() {
+    let Some(c) = *CARTE.verrouiller() else { return };
+    let Some(controle) = &c.controle else { return };
+    let mut k = controle.verrouiller();
+    let index = c.interface.load(Ordering::Relaxed);
+    let groupes = super::multidiffusion::avec_les_macs(index, |macs| {
+        if macs.len() > GROUPES_MAX {
+            return None;
+        }
+        for (j, m) in macs.iter().enumerate() {
+            k.ecrire(PAGE_GROUPES + 4 + 6 * j as u64, &m.adresse);
+        }
+        Some(macs.len())
+    });
+    let toute = groupes.is_none();
+    let n = groupes.unwrap_or(0);
+    k.ecrire(PAGE_INDIVIDUELLES, &0u32.to_le_bytes());
+    k.ecrire(PAGE_GROUPES, &(n as u32).to_le_bytes());
+    let refus = |quoi| afficherln!("[virtio] {} : la carte refuse {}.", c.adresse, quoi);
+    k.ecrire(PAGE_OCTET, &[0]);
+    if !k.envoyer(CLASSE_RX, RX_PROMISC, &[(PAGE_OCTET, 1)]) {
+        refus("de quitter la promiscuite");
+    }
+    k.ecrire(PAGE_OCTET, &[toute as u8]);
+    if !k.envoyer(CLASSE_RX, RX_ALLMULTI, &[(PAGE_OCTET, 1)]) {
+        refus(if toute { "toute la multidiffusion" } else { "de quitter toute la multidiffusion" });
+    }
+    let tables = [(PAGE_INDIVIDUELLES, 4), (PAGE_GROUPES, 4 + 6 * n as u32)];
+    if !k.envoyer(CLASSE_MAC, MAC_TABLE_SET, &tables) {
+        refus("sa table d'adresses");
     }
 }
 

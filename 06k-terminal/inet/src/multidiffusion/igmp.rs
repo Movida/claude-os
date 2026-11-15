@@ -558,11 +558,15 @@ impl Interface {
         self.ifc = Some(au_hasard(c.h, 1));
     }
 
-    /// `igmp_group_added` : un groupe nouveau `k` s'annonce. En v1 ou v2 : un
-    /// rapport bientôt, puis un autre (`unsolicit_count`) ; en v3 : un
-    /// rapport de changement (TO_EX pour un EXCLUDE ; rien pour un
-    /// INCLUDE sans source, « IN() to IN(A) » : ses sources le diront).
+    /// `igmp_group_added` : un groupe nouveau `k` entre au filtre de la
+    /// carte, puis s'annonce. En v1 ou v2 : un rapport bientôt, puis un autre
+    /// (`unsolicit_count`) ; en v3 : un rapport de changement (TO_EX pour un
+    /// EXCLUDE ; rien pour un INCLUDE sans source, « IN() to IN(A) » : ses
+    /// sources le diront).
     pub(super) fn group_added(&mut self, k: usize, c: &Contexte) {
+        // Même un groupe qui ne s'annonce pas (224.0.0.1).
+        let adresse = self.groupes[k].adresse;
+        self.filter_add(adresse);
         let t = c.h.maintenant;
         let v3 = self.v3(t);
         let g = &mut self.groupes[k];
@@ -580,11 +584,12 @@ impl Interface {
         self.ifc_event(c);
     }
 
-    /// `__igmp_group_dropped` : le groupe `g` est parti. En v1 : rien ; en
-    /// v2 : un départ si nous avons fait le dernier rapport ; en v3 : il va
-    /// dans les tombes (`igmpv3_add_delrec`), et un rapport de changement
-    /// le dira.
+    /// `__igmp_group_dropped` : le groupe `g` est parti, il quitte le filtre
+    /// de la carte. En v1 : rien de plus ; en v2 : un départ si nous avons
+    /// fait le dernier rapport ; en v3 : il va dans les tombes
+    /// (`igmpv3_add_delrec`), et un rapport de changement le dira.
     pub(super) fn group_dropped(&mut self, mut g: Groupe, c: &mut Contexte) {
+        self.filter_del(g.adresse);
         if muet(g.adresse) {
             return;
         }

@@ -58,7 +58,8 @@
  *     carte (la somme d'UDP, la taille des morceaux) ; puis l'écoute TCP à
  *     qui le scénario envoie des segments (le Makefile vérifie les
  *     réponses), et deux erreurs ICMP qui portent des extensions (RFC 4884 :
- *     IP_RECVERR_RFC4884, le `ee_data` de l'erreur en file).
+ *     IP_RECVERR_RFC4884, le `ee_data` de l'erreur en file) ; le filtre
+ *     de la carte (la trame d'un groupe qu'on n'a pas, jetée).
  * Sur l'hôte comme chez nous. Les délais sont des multiples de 4 ms (le
  * tic du noyau : HZ = 250 sous WSL, 1000 sous le Linux de référence).
  */
@@ -2721,6 +2722,31 @@ static void igmp_attendu(char *o, size_t n, const char *lo, int carte, const cha
     }
 }
 
+/* /proc/net/dev_mcast, les adresses MAC de groupe de la carte d'index
+ * `carte` (la liste `dev->mc` que son pilote donne à son filtre) : celles
+ * d'IPv4 seulement (01:00:5e ; Linux a aussi celles d'IPv6, 33:33:..., que
+ * notre noyau n'a pas), dans l'ordre du fichier, « leurs trois derniers
+ * octets/le nombre de groupes qui y mènent », séparées d'espaces. Une ligne
+ * qui n'est pas exactement au format de Linux (`%-4d %-15s %-5d %-5d %*phN`,
+ * le deuxième nombre à 0) y ajoute un « ! ». */
+static void dev_mcast(int carte, char *o, size_t n)
+{
+    char ligne[128], refaite[128], nom[16], mac[16];
+    int index, groupes, global;
+    size_t p = 0;
+    o[0] = 0;
+    FILE *f = fopen("/proc/net/dev_mcast", "r");
+    while (f && fgets(ligne, sizeof ligne, f)) {
+        if (sscanf(ligne, "%d %15s %d %d %15s", &index, nom, &groupes, &global, mac) != 5 || index != carte
+            || strncmp(mac, "01005e", 6) != 0)
+            continue;
+        snprintf(refaite, sizeof refaite, "%-4d %-15s %-5d %-5d %s\n", index, nom, groupes, 0, mac);
+        p += snprintf(o + p, n - p, "%s%s/%d%s", p ? " " : "", mac + 6, groupes, strcmp(ligne, refaite) == 0 ? "" : "!");
+    }
+    if (f)
+        fclose(f);
+}
+
 static void multidiffusion(void)
 {
     uint32_t passerelle, diffusion;
@@ -2837,6 +2863,16 @@ static void multidiffusion(void)
     contenu("/proc/net/igmp", lu, sizeof lu);
     igmp_attendu(attendu, sizeof attendu, "239.1.2.4/1 239.1.2.3/1 224.0.0.1/1", eth, nom, "239.1.2.5/1 239.1.2.3/1 224.0.0.1/2");
     verifier(strcmp(lu, attendu) == 0, "/proc/net/igmp : les groupes de lo et de la carte, le plus recent d'abord");
+    /* /proc/net/dev_mcast : la MAC de chaque groupe de la carte (01:00:5e,
+     * puis les 23 bits bas du groupe : 239.129.2.3 a celle de 239.1.2.3),
+     * une fois, avec le nombre de ses groupes, dans l'ordre de leur venue. */
+    int q = udp(0);
+    ok = mc_mreq(q, IP_ADD_MEMBERSHIP, "239.129.2.3", 0, 0, 8) == 0;
+    dev_mcast(eth, lu, sizeof lu);
+    verifier(ok && strcmp(lu, "000001/1 010203/2 010205/1") == 0,
+             "/proc/net/dev_mcast : une MAC par groupe de la carte, dans l'ordre ; 239.129.2.3 sur celle de 239.1.2.3");
+    if (strcmp(lu, "000001/1 010203/2 010205/1") != 0)
+        printf("[linux] reseau :   %s\n", lu);
     /* 20 adhésions par socket : 15 de plus, puis ENOBUFS. */
     char g[20];
     int n;
@@ -2848,17 +2884,39 @@ static void multidiffusion(void)
     verifier(n == 15 && mc_mreq(s, IP_ADD_MEMBERSHIP, g, 0, 0, 8) == ENOBUFS, "20 adhesions, puis ENOBUFS");
     /* IP_DROP_MEMBERSHIP : par la route, l'index, l'adresse ; pas de
      * contrôle du groupe. */
-    ok = mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == 0 && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == EADDRNOTAVAIL;
+    ok = mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == 0;
+    /* Sa MAC reste à sa place : 239.129.2.3 y mène encore ; puis elle part
+     * avec lui. */
+    int k = snprintf(attendu, sizeof attendu, "000001/1 010203/1 010205/1");
+    for (int i = 0; i < 15; i++)
+        k += snprintf(attendu + k, sizeof attendu - k, " 0200%02x/1", i);
+    dev_mcast(eth, lu, sizeof lu);
+    int ok_mac = strcmp(lu, attendu) == 0;
+    ok_mac = ok_mac && mc_mreq(q, IP_DROP_MEMBERSHIP, "239.129.2.3", 0, 0, 8) == 0;
+    dev_mcast(eth, lu, sizeof lu);
+    ok_mac = ok_mac && strncmp(lu, "000001/1 010205/1 020000/1", 26) == 0 && !strstr(lu, "010203");
+    verifier(ok_mac, "/proc/net/dev_mcast : un groupe parti, sa MAC reste a sa place pour l'autre, puis part avec lui");
+    if (!ok_mac)
+        printf("[linux] reseau :   %s\n", lu);
+    close(q);
+    ok = ok && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == EADDRNOTAVAIL;
     ok = ok && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 9999, 12) == EADDRNOTAVAIL
          && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", ailleurs, 0, 8) == EADDRNOTAVAIL;
     ok = ok && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", boucle, 0, 8) == 0 && mc_mreq(s, IP_DROP_MEMBERSHIP, "10.0.0.1", 0, 0, 8) == EADDRNOTAVAIL;
     ok = ok && mc_mreq(s, IP_DROP_MEMBERSHIP, "239.1.2.3", 0, 0, 7) == EINVAL && mc_mreq(s, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, 0, 8) == 0;
     verifier(ok, "IP_DROP_MEMBERSHIP : par la route, l'index, l'adresse ; EADDRNOTAVAIL, EINVAL");
+    /* 239.1.2.3 revenu : sa MAC, à la fin. */
+    dev_mcast(eth, lu, sizeof lu);
+    k = strlen(lu);
+    verifier(k > 9 && strcmp(lu + k - 9, " 010203/1") == 0 && strncmp(lu, "000001/1 010205/1 020000/1", 26) == 0,
+             "/proc/net/dev_mcast : un groupe revenu, sa MAC a la fin");
     /* La fermeture rend tout. */
     close(s);
     contenu("/proc/net/igmp", lu, sizeof lu);
     igmp_attendu(attendu, sizeof attendu, "224.0.0.1/1", eth, nom, "224.0.0.1/1");
     verifier(strcmp(lu, attendu) == 0, "close : chaque interface n'a plus que 224.0.0.1");
+    dev_mcast(eth, lu, sizeof lu);
+    verifier(strcmp(lu, "000001/1") == 0, "close : la carte n'a plus que la MAC de 224.0.0.1");
 
     /* MCAST_JOIN_GROUP, MCAST_LEAVE_GROUP : une group_req (136 octets au
      * moins), AF_INET ; l'index (0 : la route) ; TCP peut adhérer. */
@@ -3286,6 +3344,22 @@ static long compteur_snmp(const char *groupe, const char *nom)
     return r;
 }
 
+/* Les trames reçues par l'interface `nom` (sa colonne « packets » de
+ * réception dans /proc/net/dev) ; -1 : pas trouvée. */
+static long trames_recues(const char *nom)
+{
+    char ligne[256], n[32];
+    unsigned long long octets, paquets;
+    long r = -1;
+    FILE *f = fopen("/proc/net/dev", "r");
+    while (f && fgets(ligne, sizeof ligne, f))
+        if (sscanf(ligne, " %31[^:]: %llu %llu", n, &octets, &paquets) == 3 && strcmp(n, nom) == 0)
+            r = paquets;
+    if (f)
+        fclose(f);
+    return r;
+}
+
 /* Ce que l'hôte envoie à la machine, par la carte (make tests-qemu,
  * test-carte : `hostfwd` de slirp vers le port 4000) : la somme d'UDP
  * (IP_CHECKSUM) d'un datagramme venu par une carte, et IP_RECVFRAGSIZE
@@ -3404,7 +3478,10 @@ static int carte(void)
      * octets (la longueur que dit l'octet 5 : 32 mots), suivie d'extensions
      * (un objet de 8 octets) : de somme juste, puis fausse. Ce que lit le
      * programme commence après les en-têtes IPv4 et UDP de la copie : 100
-     * octets, puis les 12 des extensions. */
+     * octets, puis les 12 des extensions. Il envoie 19 trames, et rien
+     * d'autre n'arrive : slirp a tout dit (la machine a tout lu). */
+    long avant = trames_recues("eth0");
+    long segments = compteur_snmp("Tcp: ", "InSegs"), rst = compteur_snmp("Tcp: ", "OutRsts");
     long icmp_fautes = compteur_snmp("Icmp: ", "InErrors");
     long ignorees = compteur_snmp("Udp: ", "IgnoredMulti"), sommes = compteur_snmp("Udp: ", "InCsumErrors"), fautes = compteur_snmp("Udp: ", "InErrors");
     printf("[linux] reseau carte : en attente des segments\n");
@@ -3431,8 +3508,9 @@ static int carte(void)
     close(x);
     /* Avant ces erreurs, le scénario a envoyé de la multidiffusion et des
      * requêtes d'IGMP : un datagramme de 10.0.2.77 pour 239.1.2.3 (m le
-     * reçoit), un pour 239.1.2.4 (la machine n'en est pas membre : rien) ;
-     * une requête v3 générale, puis une requête v2 (délai 0,1 s chacune) :
+     * reçoit), un pour 239.1.2.4 (la machine n'en est pas membre : la carte
+     * le jette) ; une requête v3 générale, puis une requête v2 (délai 0,1 s
+     * chacune) :
      * le routeur de la carte est noté v2, et notre rapport v2 sur 239.1.2.3
      * fait de nous le rapporteur (/proc/net/igmp ; les rapports eux-mêmes,
      * le Makefile les lit dans l'enregistrement). */
@@ -3441,6 +3519,25 @@ static int carte(void)
     int ok_mc = k == 6 && memcmp(mc, "xxxxxx", 6) == 0;
     ok_mc = ok_mc && recv(m, mc, sizeof mc, MSG_DONTWAIT) < 0 && errno == EAGAIN;
     verifier(ok_mc, "carte, multidiffusion : le datagramme pour notre groupe recu, pas celui d'un autre");
+    /* Celui d'un autre groupe, la carte l'a jeté (son filtre : la MAC de
+     * 239.1.2.4 n'est pas dans sa table) : 18 trames reçues sur 19. */
+    long apres = trames_recues("eth0");
+    verifier(avant >= 0 && apres - avant == 18, "carte, son filtre : la trame pour 239.1.2.4 jetee par la carte, 18 trames recues sur 19");
+    if (avant < 0 || apres - avant != 18)
+        printf("[linux] reseau :   %ld trames recues\n", apres - avant);
+    /* TCP : 7 segments comptés à l'arrivée (InSegs) sur 8 : celui d'une trame
+     * de diffusion est jeté avant (`tcp_v4_rcv` : PACKET_HOST seulement) ; 3
+     * RST : au SYN pour le port 23, à l'ACK pour une fille que l'écoute n'a
+     * pas, et à celui pour 10.0.2.255 (compté, sans route : sa source serait
+     * la diffusion ; le Makefile vérifie qu'il ne part pas) ; aucun au SYN
+     * pour 10.0.2.255 sans socket (`tcp_v4_send_reset` : RTN_LOCAL), ni de
+     * fille au SYN pour 10.0.2.255 vers l'écoute (`tcp_v4_conn_request`). */
+    segments = compteur_snmp("Tcp: ", "InSegs") - segments;
+    rst = compteur_snmp("Tcp: ", "OutRsts") - rst;
+    verifier(segments == 7 && rst == 3,
+             "carte, TCP : 7 segments comptes sur 8 (pas celui d'une trame de diffusion), 3 RST (dont un sans route)");
+    if (segments != 7 || rst != 3)
+        printf("[linux] reseau :   InSegs %ld, OutRsts %ld\n", segments, rst);
     /* Deux diffusions de somme fausse, que personne n'écoute : celle de 38
      * octets vérifiée à l'arrivée, celle de 208 jamais (IgnoredMulti). */
     ignorees = compteur_snmp("Udp: ", "IgnoredMulti") - ignorees;

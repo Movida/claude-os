@@ -5,13 +5,16 @@
 //! colle : le verrou de l'ensemble et l'heure qu'il donne, la recherche de
 //! l'interface d'une demande (`ip_mc_find_dev`, qui lit les interfaces et
 //! la table de routage), l'envoi des rapports et la réception des
-//! messages d'IGMP, leur minuteur dans la tâche du réseau, et
-//! /proc/net/igmp et mcfilter.
+//! messages d'IGMP, leur minuteur dans la tâche du réseau, le filtre de la
+//! carte prévenu quand les adresses MAC de ses groupes changent, et
+//! /proc/net/igmp, mcfilter et dev_mcast.
 //!
 //! LES VERROUS. `GROUPES` fait de chaque opération un tout (le `rtnl_lock`
 //! de Linux) ; les adhésions de chaque socket ont le leur (`Socket::
 //! adhesions`), que lit aussi la livraison d'un datagramme. L'ordre : la
-//! table de routage d'abord, seule (`trouver` la lit et la lâche), puis
+//! table de routage d'abord, seule (`trouver` la lit et la lâche), ou la
+//! file de contrôle de la carte (un verrou qui dort, tenu par la tâche du
+//! réseau pendant qu'elle refait le filtre : virtio_net.rs), puis
 //! `GROUPES`, puis les adhésions d'une socket, ou les échéances de la tâche
 //! du réseau (`tache::inscrire`, qui ne prend rien d'autre) ; à la
 //! livraison, la table des ports d'UDP, puis les adhésions. Jamais
@@ -27,6 +30,8 @@
 //! Pas de NETDEV_RESEND_IGMP : la carte n'annonce pas qu'elle a changé de
 //! réseau (pas de VIRTIO_NET_F_GUEST_ANNOUNCE), et nos rapports ne sont
 //! redits qu'aux requêtes.
+//! /proc/net/dev_mcast n'a pas 33:33:00:00:00:01 (l'adresse MAC du groupe
+//! de tous les nœuds d'IPv6, que Linux y montre aussi).
 
 use super::interface;
 use super::ipv4;
@@ -38,7 +43,7 @@ use crate::{aleatoire, horloge, temps};
 use core::fmt::{self, Write};
 use core::sync::atomic::Ordering;
 use formats::reseau::ipv4 as format_ipv4;
-use inet::multidiffusion::{Demande, Envoi, Groupes, MAX_SOURCES, Mode, Refus};
+use inet::multidiffusion::{Demande, Envoi, Groupes, MAX_SOURCES, Mac, Mode, Refus};
 use inet::routes::{Chemin, Portee};
 
 const EINVAL: i64 = 22;
@@ -68,14 +73,21 @@ fn groupes() -> Garde<'static, Groupes> {
 /// Après une opération sur les groupes : la prochaine échéance d'IGMP dans
 /// la tâche du réseau (sous le verrou des groupes : deux opérations sur
 /// deux processeurs ne peuvent pas s'y croiser, la dernière inscrite étant
-/// celle des groupes tels qu'elle les a laissés), puis, le verrou lâché,
-/// les rapports prêts.
+/// celle des groupes tels qu'elle les a laissés), puis, le verrou lâché, le
+/// filtre de la carte à refaire si les adresses MAC des groupes ont changé
+/// (`__dev_set_rx_mode`, qui confie la commande à une tâche : la tâche du
+/// réseau, ici, qui relira la liste telle qu'elle sera alors), et les
+/// rapports prêts.
 fn finir(mut g: Garde<'static, Groupes>) {
     let envois = g.prendre_les_envois();
+    let filtre = g.prendre_les_macs_touchees();
     let (_, plus_tot) = tache::inscrire(tache::OBJET_IGMP, g.prochaine_echeance());
     drop(g);
     if plus_tot {
         tache::reveiller();
+    }
+    if filtre {
+        tache::signaler(tache::FILTRE);
     }
     for e in envois {
         emettre(e);
@@ -165,13 +177,22 @@ fn errno(r: Refus) -> i64 {
     }
 }
 
-/// L'interface `index` monte (`ip_mc_up`) : elle adhère à 224.0.0.1. Sans
-/// mémoire, elle n'aura aucun groupe : aucune adhésion ne s'y fera
-/// (ENODEV), rien n'y entrera pour un groupe.
-pub fn monter(index: u32) {
+/// L'interface `index` monte (`ip_mc_up`) : elle adhère à 224.0.0.1.
+/// `ethernet` : une carte (ses groupes ont une adresse MAC, pour son
+/// filtre). Sans mémoire, elle n'aura aucun groupe : aucune adhésion ne s'y
+/// fera (ENODEV), rien n'y entrera pour un groupe.
+pub fn monter(index: u32, ethernet: bool) {
     let mut g = groupes();
-    let _ = g.monter(index);
+    let _ = g.monter(index, ethernet);
     finir(g);
+}
+
+/// `f` sur les adresses MAC des groupes de l'interface `index` (aucune pour
+/// lo, ou une interface sans groupes), sous le verrou des groupes : le
+/// filtre de la carte (`netdev_for_each_mc_addr`).
+pub fn avec_les_macs<T>(index: u32, f: impl FnOnce(&[Mac]) -> T) -> T {
+    let g = GROUPES.verrouiller();
+    f(g.interface(index).map_or(&[], |i| i.macs()))
 }
 
 /// L'interface que désigne la demande `d` (`ip_mc_find_dev`) : celle de son
@@ -364,6 +385,24 @@ pub fn ligne_igmp(n: u64, t: &mut dyn Write) -> Result<bool, fmt::Error> {
         None => (0, 0),
     };
     writeln!(t, "\t\t\t\t{:08X} {:>5} {}:{:08X}\t\t{}", hexa(l.groupe), l.utilisateurs, court, reste, l.rapporteur as u8)?;
+    Ok(true)
+}
+
+/// L'enregistrement `n` de /proc/net/dev_mcast (`dev_mc_seq_show`) :
+/// chaque adresse MAC de groupe de chaque interface (lo n'en a pas), dans
+/// l'ordre de leur venue, avec ses groupes ; le deuxième compte, celui des
+/// adresses « globales » (`dev_mc_add_global`, des pilotes de pont), est
+/// toujours 0. Pas d'en-tête.
+pub fn ligne_dev_mcast(n: u64, t: &mut dyn Write) -> Result<bool, fmt::Error> {
+    let ligne = {
+        let g = GROUPES.verrouiller();
+        let mut toutes = g.interfaces().flat_map(|i| i.macs().iter().map(move |m| (i.index(), *m)));
+        toutes.nth(n as usize)
+    };
+    let Some((index, m)) = ligne else { return Ok(false) };
+    let a = m.adresse;
+    writeln!(t, "{:<4} {:<15} {:<5} {:<5} {:02x}{:02x}{:02x}{:02x}{:02x}{:02x}", index, nom(index), m.groupes, 0, a[0], a[1],
+             a[2], a[3], a[4], a[5])?;
     Ok(true)
 }
 

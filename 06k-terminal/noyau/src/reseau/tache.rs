@@ -45,6 +45,9 @@ use roue::Roue;
 pub const CONFIGURATION: u32 = 1 << 0;
 /// Une échéance a été armée : recalculer le sommeil.
 const ECHEANCE: u32 = 1 << 1;
+/// Les adresses MAC des groupes ont changé : refaire le filtre de la carte
+/// (le `rx_mode_work` du pilote de Linux).
+pub const FILTRE: u32 = 1 << 2;
 /// Le travail d'une interface (sa réception, ses émissions finies) : le
 /// bit `INTERFACES << index`.
 const INTERFACES: u32 = 1 << 8;
@@ -252,6 +255,9 @@ fn boucle() {
         let travail = attendre(prochaine());
         if travail & CONFIGURATION != 0 {
             super::virtio_net::configuration_changee();
+        }
+        if travail & FILTRE != 0 {
+            super::virtio_net::filtrer();
         }
         // La réception des cartes, dans le contexte réseau : ce qu'elle
         // envoie par `lo` (une réponse) part à la fin du tour, en sortant

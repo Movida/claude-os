@@ -40,8 +40,8 @@ fn mtu(_: u32) -> u32 {
 
 fn machine() -> Groupes {
     let mut g = Groupes::new(zero, mtu);
-    g.monter(ETH).unwrap();
-    g.monter(LO).unwrap();
+    g.monter(ETH, true).unwrap();
+    g.monter(LO, false).unwrap();
     g
 }
 
@@ -379,13 +379,65 @@ fn la_place_rendue() {
     assert_eq!(v.capacity(), depart);
 }
 
+/// /proc/net/dev_mcast d'une interface : les trois derniers octets de
+/// chaque adresse MAC de groupe (01:00:5e devant), et ses groupes.
+fn macs(g: &Groupes, index: u32) -> Vec<([u8; 3], u32)> {
+    let i = g.interface(index).unwrap();
+    i.macs().iter().map(|m| {
+        assert_eq!(m.adresse[..3], [0x01, 0x00, 0x5e]);
+        ([m.adresse[3], m.adresse[4], m.adresse[5]], m.groupes)
+    }).collect()
+}
+
+/// Les adresses MAC de groupe de la carte, dans l'ordre de la sonde
+/// (`reseau.c`, mesuré sous Linux 6.18.33) : une par groupe, 239.129.2.3
+/// sur celle de 239.1.2.3 (23 bits) ; un groupe parti laisse l'adresse à
+/// sa place pour l'autre, puis elle part avec lui ; un groupe revenu la
+/// remet à la fin. lo n'en a aucune. Chaque changement de groupe touche la
+/// liste (même quand seul un compte change) ; une adhésion de plus à un
+/// groupe déjà là, non.
+#[test]
+fn adresses_mac_des_groupes() {
+    let mut g = machine();
+    assert!(g.prendre_les_macs_touchees(), "224.0.0.1 des deux interfaces");
+    assert!(!g.prendre_les_macs_touchees());
+    assert_eq!(macs(&g, ETH), vec![([0, 0, 1], 1)]);
+    assert_eq!(macs(&g, LO), vec![]);
+    let (mut s, mut q) = (Adhesions::new(), Adhesions::new());
+    let (g3, g5, g129) = ([239, 1, 2, 3], [239, 1, 2, 5], [239, 129, 2, 3]);
+    joindre(&mut s, &mut g, demande(g3, RIEN, 0), Mode::Exclure).unwrap();
+    joindre(&mut s, &mut g, demande(g3, RIEN, LO), Mode::Exclure).unwrap();
+    joindre(&mut s, &mut g, demande(g5, RIEN, 0), Mode::Exclure).unwrap();
+    joindre(&mut q, &mut g, demande(g129, RIEN, 0), Mode::Exclure).unwrap();
+    assert!(g.prendre_les_macs_touchees());
+    assert_eq!(macs(&g, ETH), vec![([0, 0, 1], 1), ([1, 2, 3], 2), ([1, 2, 5], 1)]);
+    assert_eq!(macs(&g, LO), vec![]);
+    // Un membre de plus pour un groupe déjà là : rien ne change.
+    let mut t = Adhesions::new();
+    joindre(&mut t, &mut g, demande(g3, RIEN, 0), Mode::Exclure).unwrap();
+    assert!(!g.prendre_les_macs_touchees());
+    quitter(&mut t, &mut g, demande(g3, RIEN, 0)).unwrap();
+    assert!(!g.prendre_les_macs_touchees());
+    quitter(&mut s, &mut g, demande(g3, RIEN, 0)).unwrap();
+    assert!(g.prendre_les_macs_touchees(), "seul un compte a change");
+    assert_eq!(macs(&g, ETH), vec![([0, 0, 1], 1), ([1, 2, 3], 1), ([1, 2, 5], 1)]);
+    quitter(&mut q, &mut g, demande(g129, RIEN, 0)).unwrap();
+    assert_eq!(macs(&g, ETH), vec![([0, 0, 1], 1), ([1, 2, 5], 1)]);
+    joindre(&mut s, &mut g, demande(g3, RIEN, 0), Mode::Exclure).unwrap();
+    assert_eq!(macs(&g, ETH), vec![([0, 0, 1], 1), ([1, 2, 5], 1), ([1, 2, 3], 1)]);
+    s.vider(&mut g);
+    assert!(g.prendre_les_macs_touchees());
+    assert_eq!(macs(&g, ETH), vec![([0, 0, 1], 1)]);
+    assert_eq!(macs(&g, LO), vec![]);
+}
+
 /// Une interface ne monte qu'une fois ; elles sont rangées par index.
 #[test]
 fn monter() {
     let mut g = Groupes::new(zero, mtu);
-    g.monter(3).unwrap();
-    g.monter(1).unwrap();
-    g.monter(3).unwrap();
+    g.monter(3, true).unwrap();
+    g.monter(1, false).unwrap();
+    g.monter(3, true).unwrap();
     assert_eq!(g.interfaces().map(|i| i.index()).collect::<Vec<_>>(), vec![1, 3]);
     assert_eq!(g.interface(3).unwrap().groupes().count(), 1);
 }

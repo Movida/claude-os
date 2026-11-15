@@ -116,7 +116,7 @@ function tcp(t, s, i, lt) {
         for (i = 0; i < donnees; i++) octet(120)
         # La somme TCP prend le pseudo-en-tête : les adresses, le protocole,
         # la longueur du segment.
-        s = somme(t, n, 10 * 256 + 0 + 2 * 256 + 77 + 10 * 256 + 0 + 2 * 256 + 15 + 6 + lt)
+        s = somme(t, n, pseudo("10.0.2.77") + pseudo(vers) + 6 + lt)
         o[t + 16] = int(s / 256); o[t + 17] = s % 256
 }
 # Une erreur ICMP de 10.0.2.77, qui cite un datagramme UDP de la machine

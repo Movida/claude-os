@@ -78,7 +78,7 @@ pub fn ajouter(nom: &'static str, mac: [u8; 6], mtu: u32, lien: bool, materiel: 
     t[place] = Some(i);
     drop(t);
     // Elle monte tout de suite (`ip_mc_up`) : 224.0.0.1.
-    super::multidiffusion::monter(i.index);
+    super::multidiffusion::monter(i.index, !i.boucle());
     Some(i)
 }
 

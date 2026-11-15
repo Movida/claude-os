@@ -10,7 +10,10 @@
 //!   - `snmp` : les compteurs d'IP, d'ICMP, de TCP et d'UDP (le
 //!     `snmp_seq_show` de proc.c ; les soldes d'avant 6k), en une fois ;
 //!   - `tcp` : les sockets TCP (le `tcp4_seq_show` de tcp_ipv4.c, 6h) ;
-//!   - `unix` : les sockets AF_UNIX (le `unix_seq_show` d'af_unix.c, 6h).
+//!   - `unix` : les sockets AF_UNIX (le `unix_seq_show` d'af_unix.c, 6h) ;
+//!   - `igmp`, `mcfilter` et `dev_mcast` : les groupes de multidiffusion de
+//!     chaque interface, leurs sources, et les adresses MAC de groupe des
+//!     cartes (multidiffusion.rs ; les soldes d'avant 6k).
 //! Et /proc/sys/net (`REGLAGES`).
 //! Les adresses de `route` s'écrivent comme Linux les imprime : le mot de
 //! 32 bits gros-boutiste lu comme un nombre de la machine (petit-boutiste),
@@ -35,6 +38,7 @@ pub enum Fichier {
     Unix,
     Igmp,
     Mcfilter,
+    DevMcast,
 }
 
 /// Un bloc du tas où écrire avec `write!`, qui échoue sans paniquer.
@@ -66,6 +70,7 @@ pub fn ligne(f: Fichier, n: u64) -> Result<Option<Vec<u8>>, ()> {
         Fichier::Unix => super::unix::ligne_proc(n, &mut t),
         Fichier::Igmp => super::multidiffusion::ligne_igmp(n, &mut t),
         Fichier::Mcfilter => super::multidiffusion::ligne_mcfilter(n, &mut t),
+        Fichier::DevMcast => super::multidiffusion::ligne_dev_mcast(n, &mut t),
     };
     match ecrite {
         Ok(true) => Ok(Some(t.0)),

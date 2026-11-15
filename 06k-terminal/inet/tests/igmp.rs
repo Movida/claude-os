@@ -79,9 +79,9 @@ impl Banc {
         let mut g = Groupes::new(zero, mtu);
         let t = 1_000_000_000;
         g.regler(t);
-        g.monter(ETH).unwrap();
-        g.monter(LO).unwrap();
-        g.monter(ETROITE).unwrap();
+        g.monter(ETH, true).unwrap();
+        g.monter(LO, false).unwrap();
+        g.monter(ETROITE, true).unwrap();
         assert!(g.prendre_les_envois().is_empty());
         assert_eq!(g.prochaine_echeance(), None, "224.0.0.1 ne s'annonce pas");
         Banc { g, debut: t, t, r: Adhesions::new(), c: Adhesions::new() }
@@ -209,7 +209,7 @@ fn le_hasard_des_rapports() {
     }
     let mut g = Groupes::new(max, mtu);
     g.regler(0);
-    g.monter(ETH).unwrap();
+    g.monter(ETH, true).unwrap();
     let mut a = Adhesions::new();
     let d = Demande { groupe: G3, adresse: RIEN, index: ETH };
     a.joindre(&mut g, d, Some(ETH), Mode::Exclure).unwrap();

@@ -96,7 +96,7 @@ fn ouvrir(f: &Fonction) -> Result<&'static Carte, virtio::Refus> {
     }
     let Some(file) = Virtqueue::new(TAILLE_FILE, false) else { return Err(v.echouer(virtio::Refus::Memoire)) };
     let Some(page) = pages::allouer(0) else { return Err(v.echouer(virtio::Refus::Memoire)) };
-    let notifieur = match v.installer_file(0, &file, ENTREE_FILE) {
+    let notifieur = match v.installer_file(0, &file, Some(ENTREE_FILE)) {
         Ok(n) => n,
         Err(e) => {
             pages::liberer(page, 0);

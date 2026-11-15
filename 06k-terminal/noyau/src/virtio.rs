@@ -101,7 +101,8 @@ pub const ETAT_FAILED: u8 = 0x80;
 pub const F_EVENT_IDX: u32 = 29;
 pub const F_VERSION_1: u32 = 32;
 
-/// Un vecteur MSI-X refusé par la carte (relu après l'avoir écrit).
+/// Aucun vecteur MSI-X (VIRTIO_MSI_NO_VECTOR) : écrit pour une file sans
+/// interruption, relu à la place d'un vecteur que la carte refuse.
 const SANS_VECTEUR: u16 = 0xFFFF;
 
 /// Pourquoi une carte virtio n'est pas mise en service.
@@ -355,9 +356,11 @@ impl Virtio {
     }
 
     /// Donne la file `q` comme file `i` du périphérique, ses interruptions
-    /// par l'entrée MSI-X `entree` (déjà programmée), et l'active (la
+    /// par l'entrée MSI-X `entree` (déjà programmée ; None : sans
+    /// interruption, VIRTIO_MSI_NO_VECTOR, pour une file qu'on lit en
+    /// tournant, comme celle de contrôle d'une carte réseau), et l'active (la
     /// spécification, 4.1.5.1.3). Rend de quoi la notifier.
-    pub fn installer_file(&self, i: u16, q: &Virtqueue, entree: u16) -> Result<Notifieur, Refus> {
+    pub fn installer_file(&self, i: u16, q: &Virtqueue, entree: Option<u16>) -> Result<Notifieur, Refus> {
         ecrire16(&self.commune, FILE_CHOIX, i);
         ecrire16(&self.commune, FILE_TAILLE, q.taille());
         let (d, a, u) = q.adresses();
@@ -365,8 +368,10 @@ impl Virtio {
             ecrire32(&self.commune, champ, adresse as u32);
             ecrire32(&self.commune, champ + 4, (adresse >> 32) as u32);
         }
-        ecrire16(&self.commune, FILE_VECTEUR, entree);
-        if lire16(&self.commune, FILE_VECTEUR) == SANS_VECTEUR {
+        // Le vecteur relu : la carte écrit SANS_VECTEUR à la place d'une
+        // entrée qu'elle refuse (4.1.5.1.2.1).
+        ecrire16(&self.commune, FILE_VECTEUR, entree.unwrap_or(SANS_VECTEUR));
+        if entree.is_some() && lire16(&self.commune, FILE_VECTEUR) == SANS_VECTEUR {
             return Err(Refus::Vecteur);
         }
         // L'adresse de notification de la file : son décalage, en unités du

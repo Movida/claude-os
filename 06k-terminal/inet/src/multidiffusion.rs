@@ -32,6 +32,17 @@
 //! rapports suivants. Les rapports ne partent pas d'ici : ils attendent
 //! dans `Groupes::envois`, que le noyau prend une fois son verrou lâché.
 //!
+//! Chaque interface Ethernet tient aussi les adresses MAC de ses groupes
+//! (`Interface::macs` : la liste `dev->mc` de la carte, que remplissent
+//! `ip_mc_filter_add` et `ip_mc_filter_del` quand un groupe arrive ou
+//! part), pour le filtre de sa carte, qui ne laisse entrer que les trames de
+//! multidiffusion vers l'une d'elles. Choix de conception : elle vit ici,
+//! avec les groupes, plutôt que dans le pilote : chez Linux, elle appartient
+//! à la `net_device` (IPv6 y met aussi les siennes), mais nous n'avons
+//! qu'IPv4, et la changer au même endroit et sous le même verrou que les
+//! groupes la garde juste sans rien recopier ; le pilote la lit quand on lui
+//! dit qu'elle a changé (`prendre_les_macs_touchees`).
+//!
 //! Choix de conception : les deux côtés dans une même bibliothèque. Chaque
 //! opération d'une socket change le filtre de l'interface dans un ordre
 //! précis (`ip_mc_add_src` avant `ip_mc_del_src`, pour qu'un groupe ne
@@ -57,7 +68,7 @@ mod igmp;
 
 use alloc::vec::Vec;
 use faillible::VecFaillible;
-use formats::reseau::ipv4;
+use formats::reseau::{ethernet, ipv4};
 pub use igmp::{Envoi, HZ};
 
 /// Le plus d'adhésions d'une socket (`igmp_max_memberships`).
@@ -70,6 +81,15 @@ pub const TOUS_LES_HOTES: [u8; 4] = [224, 0, 0, 1];
 /// Le protocole d'IGMP dans l'en-tête IPv4 : un paquet IGMP pour un groupe
 /// de l'interface entre toujours, quelle que soit sa source.
 pub use formats::reseau::ipv4::IGMP;
+
+/// Une adresse MAC de groupe d'une carte (une `netdev_hw_addr` de sa liste
+/// `dev->mc`), et le nombre de ses groupes qui y mènent (`refcount` : 32
+/// groupes ont la même, `ip_eth_mc_map` ne gardant que 23 bits).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Mac {
+    pub adresse: [u8; 6],
+    pub groupes: u32,
+}
 
 /// Le mode d'un filtre : ses nombres sont ceux de Linux (MCAST_EXCLUDE 0,
 /// MCAST_INCLUDE 1), qui servent aussi d'indices aux compteurs.
@@ -611,11 +631,22 @@ pub struct Interface {
     /// Le minuteur de la réponse à une requête générale v3 (`mr_gq_timer`,
     /// `mr_gq_running`).
     gq: Option<u64>,
+    /// Une carte Ethernet : ses groupes ont une adresse MAC (`arp_mc_map` ;
+    /// lo, ARPHRD_LOOPBACK, n'en a pas).
+    ethernet: bool,
+    /// Les adresses MAC de ses groupes, chacune une fois, dans l'ordre de
+    /// leur venue (une adresse déjà là garde sa place quand un autre groupe
+    /// y mène : mesuré, /proc/net/dev_mcast).
+    macs: Vec<Mac>,
+    /// La liste a été touchée depuis que le noyau l'a regardée : chaque
+    /// `dev_mc_add` et `dev_mc_del` de Linux appelle `__dev_set_rx_mode`,
+    /// même quand seul un compte change.
+    macs_touchees: bool,
 }
 
 impl Interface {
     /// `ip_mc_init_dev` et `ip_mc_reset` : une interface sans groupe.
-    fn nouvelle(index: u32) -> Interface {
+    fn nouvelle(index: u32, ethernet: bool) -> Interface {
         Interface {
             index,
             groupes: Vec::new(),
@@ -629,6 +660,9 @@ impl Interface {
             ifc: None,
             ifc_restants: 0,
             gq: None,
+            ethernet,
+            macs: Vec::new(),
+            macs_touchees: false,
         }
     }
 
@@ -651,6 +685,52 @@ impl Interface {
         self.groupes.iter().position(|g| g.adresse == groupe)
     }
 
+    /// Les adresses MAC de ses groupes (vide pour lo), dans l'ordre de
+    /// /proc/net/dev_mcast.
+    pub fn macs(&self) -> &[Mac] {
+        &self.macs
+    }
+
+    /// La place de l'adresse MAC du groupe `groupe` s'il en faut une (une
+    /// carte Ethernet, une adresse qu'aucun groupe n'a encore), prise avant
+    /// que le groupe n'entre dans la liste : `filter_add` ne peut plus échouer.
+    fn place_pour_la_mac(&mut self, groupe: [u8; 4]) -> Result<(), Refus> {
+        let mac = ethernet::de_groupe(groupe);
+        if !self.ethernet || self.macs.iter().any(|m| m.adresse == mac) {
+            return Ok(());
+        }
+        self.macs.try_reserve(1).map_err(|_| Refus::PlusDePlace)
+    }
+
+    /// `ip_mc_filter_add` (par `dev_mc_add`) : l'adresse MAC du groupe
+    /// `groupe` dans la liste de la carte, une de plus si elle y est déjà,
+    /// à la fin sinon, dans la place prise par `place_pour_la_mac`. Rien pour
+    /// lo.
+    fn filter_add(&mut self, groupe: [u8; 4]) {
+        if !self.ethernet {
+            return;
+        }
+        let mac = ethernet::de_groupe(groupe);
+        match self.macs.iter_mut().find(|m| m.adresse == mac) {
+            Some(m) => m.groupes += 1,
+            None => self.macs.ajouter_dans_la_place(Mac { adresse: mac, groupes: 1 }),
+        }
+        self.macs_touchees = true;
+    }
+
+    /// `ip_mc_filter_del` (par `dev_mc_del`) : un groupe de moins pour
+    /// l'adresse MAC de `groupe` ; plus aucun, elle quitte la liste.
+    fn filter_del(&mut self, groupe: [u8; 4]) {
+        let mac = ethernet::de_groupe(groupe);
+        let Some(k) = self.macs.iter().position(|m| m.adresse == mac) else { return };
+        self.macs[k].groupes -= 1;
+        if self.macs[k].groupes == 0 {
+            self.macs.remove(k);
+            self.macs.rendre_la_place();
+        }
+        self.macs_touchees = true;
+    }
+
     /// `____ip_mc_inc_group` : un membre de plus pour le groupe `groupe`, dans
     /// le mode `mode` sans source ; un groupe nouveau prend ce mode (plus de
     /// mémoire : ENOBUFS), reprend ce qui restait à dire de lui s'il était
@@ -660,6 +740,10 @@ impl Interface {
             self.groupes[k].utilisateurs += 1;
             return self.add_src(groupe, mode, &[], false, c);
         }
+        // Linux ignore un `dev_mc_add` sans mémoire (la carte ne laisse
+        // alors pas entrer le groupe) ; ici, comme toute allocation, il fait
+        // échouer l'adhésion.
+        self.place_pour_la_mac(groupe)?;
         self.groupes.ajouter(Groupe::nouveau(groupe, mode)).map_err(|_| Refus::PlusDePlace)?;
         let k = self.groupes.len() - 1;
         self.del_delrec(k);
@@ -806,13 +890,14 @@ impl Groupes {
     }
 
     /// L'interface `index` monte (`ip_mc_init_dev`, `ip_mc_up`) : elle
-    /// adhère à 224.0.0.1, qu'elle n'annonce jamais. Plus de mémoire :
+    /// adhère à 224.0.0.1, qu'elle n'annonce jamais. `ethernet` : une carte,
+    /// dont les groupes ont une adresse MAC (pas lo). Plus de mémoire :
     /// ENOBUFS (elle n'aura aucun groupe). Déjà montée : rien.
-    pub fn monter(&mut self, index: u32) -> Result<(), Refus> {
+    pub fn monter(&mut self, index: u32, ethernet: bool) -> Result<(), Refus> {
         if self.interface(index).is_some() {
             return Ok(());
         }
-        let mut i = Interface::nouvelle(index);
+        let mut i = Interface::nouvelle(index, ethernet);
         let mut c = Contexte { h: self.horloge, envois: &mut self.envois };
         i.inc_group(TOUS_LES_HOTES, Mode::Exclure, &mut c)?;
         let k = self.interfaces.iter().position(|x| x.index > index).unwrap_or(self.interfaces.len());
@@ -832,6 +917,17 @@ impl Groupes {
 
     pub fn interfaces(&self) -> impl Iterator<Item = &Interface> {
         self.interfaces.iter()
+    }
+
+    /// Les adresses MAC de groupe d'une interface au moins ont-elles changé
+    /// depuis le dernier appel ? Le noyau le demande après chaque opération,
+    /// et refait alors le filtre de la carte (`__dev_set_rx_mode`).
+    pub fn prendre_les_macs_touchees(&mut self) -> bool {
+        let mut touchees = false;
+        for i in &mut self.interfaces {
+            touchees |= core::mem::take(&mut i.macs_touchees);
+        }
+        touchees
     }
 
     /// Un paquet de `source` pour le groupe `groupe`, de protocole
