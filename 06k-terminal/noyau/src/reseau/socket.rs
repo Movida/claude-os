@@ -229,7 +229,12 @@ pub struct Datagramme {
     pub source: [u8; 4],
     pub port: u16,
     pub destination: [u8; 4],
-    pub interface: u32,
+    /// L'interface et l'adresse locale que rendra IP_PKTINFO (le
+    /// `PKTINFO_SKB_CB` de Linux) : ce qu'a préparé l'arrivée d'un datagramme
+    /// UDP pour une socket qui avait IP_PKTINFO, sinon 0 et 0.0.0.0 (udp.rs) ;
+    /// pour une réponse de ping, rien de préparé : l'interface qui l'a reçue
+    /// et 0.0.0.0 (ping.rs).
+    pub pktinfo: (u32, [u8; 4]),
     pub entete: EnteteRecu,
     pub port_destination: u16,
     pub somme: Somme,
@@ -314,6 +319,10 @@ pub struct Options {
     /// IP_TTL : None, celui du système (64).
     pub ttl: Option<u8>,
     pub pktinfo: bool,
+    /// IP_UNICAST_IF : l'interface des envois sans IP_PKTINFO, sauf vers une
+    /// multidiffusion (le `uc_index` de Linux ; datagramme::router) ; 0 :
+    /// aucune. TCP le garde sans s'en servir (`tcp_v4_connect` ne le lit pas).
+    pub unicast_if: u32,
     pub recverr: bool,
     /// IP_MTU_DISCOVER (IP_PMTUDISC_WANT, 1, par défaut).
     pub pmtudisc: u8,
@@ -360,7 +369,7 @@ impl Options {
     const DEFAUT: Options = Options {
         reuseaddr: false, reuseport: false, broadcast: false, keepalive: false, debug: false, dontroute: false,
         oobinline: false, no_check: false, priority: 0, linger: (false, 0), rcvlowat: 1,
-        rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, recverr: false, pmtudisc: 1,
+        rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, unicast_if: 0, recverr: false, pmtudisc: 1,
         udp_cork: false, recvttl: false, recvtos: false, recvopts: false, retopts: false, passsec: false,
         origdstaddr: false, checksum: false, recvfragsize: false, rfc4884: false, freebind: false, transparent: false,
         bind_no_port: false, minttl: 0, local_port_range: 0, mc_ttl: 1, mc_index: 0, rcv_tos: 0,
@@ -384,6 +393,12 @@ pub struct Inet {
     pub port_distant: u16,
     /// L'adresse source de la connexion (pour getsockname).
     pub source: [u8; 4],
+    /// La route qu'a gardée `connect` (le `sk_dst_cache` de Linux), dite par
+    /// l'interface qu'elle demandait (0 : aucune) : la destination et la
+    /// source sont à côté, et les routes ne changent plus après le
+    /// démarrage. Un envoi d'UDP sur la connexion la reprend
+    /// (datagramme::preparer), IP_MTU la lit. None : pas de route gardée.
+    pub route_gardee: Option<u32>,
     /// L'identifiant IP des paquets d'une socket connectée (l'`inet_id`).
     pub identifiant: u16,
     pub options: Options,
@@ -422,6 +437,10 @@ pub struct Socket {
     /// file). UDP et ping seulement : TCP n'a pas de file d'erreurs
     /// (`tcp_v4_err` n'appelle pas `ip_icmp_error`).
     pub rfc4884: AtomicBool,
+    /// IP_PKTINFO, lu par la tâche du réseau à l'arrivée d'un datagramme UDP,
+    /// qu'il fait préparer (`ipv4_pktinfo_prepare`, un bit de Linux lu à ce
+    /// moment-là : posé ensuite, il ne vaut que pour les suivants, mesuré).
+    pub pktinfo: AtomicBool,
     /// Un envoi a manqué de place dans SO_SNDBUF (le bit SOCK_NOSPACE de
     /// Linux, tel que le voit une socket de datagrammes : posé par
     /// `sock_alloc_send_pskb`, jamais effacé, `sock_def_write_space` ne le
@@ -470,7 +489,7 @@ impl Socket {
             reception: Verrou::new(Reception { file: VecDeque::new(), erreurs: VecDeque::new(), octets: 0, erreur: 0, arret: 0 }),
             appels: Mutex::new(Inet {
                 lie: false, adresse: [0; 4], port: 0, port_choisi: false, adresse_choisie: false, connecte: false,
-                distante: [0; 4], port_distant: 0, source: [0; 4], identifiant: 0, options: Options::DEFAUT,
+                distante: [0; 4], port_distant: 0, source: [0; 4], route_gardee: None, identifiant: 0, options: Options::DEFAUT,
                 bouchon: None,
             }),
             rcvbuf: AtomicU32::new(TAMPON_DEFAUT),
@@ -480,6 +499,7 @@ impl Socket {
             place_manquee: AtomicBool::new(false),
             pmtudisc: AtomicU8::new(Options::DEFAUT.pmtudisc),
             rfc4884: AtomicBool::new(false),
+            pktinfo: AtomicBool::new(false),
             asynchrone: crate::asynchrone::ListeAsync::new(),
             inode: AtomicU32::new(0),
             peek_off: AtomicI32::new(-1),
@@ -733,7 +753,8 @@ pub struct Recu {
     pub source: [u8; 4],
     pub port: u16,
     pub destination: [u8; 4],
-    pub interface: u32,
+    /// L'interface et l'adresse locale d'IP_PKTINFO (`Datagramme::pktinfo`).
+    pub pktinfo: (u32, [u8; 4]),
     pub coupe: bool,
     pub ip: Option<ControleIp>,
 }
@@ -741,7 +762,7 @@ pub struct Recu {
 impl Recu {
     /// Rien de reçu, ou un flux : ni émetteur, ni messages de contrôle IP.
     pub fn sans_emetteur(longueur: usize, coupe: bool) -> Recu {
-        Recu { vide: true, longueur, source: [0; 4], port: 0, destination: [0; 4], interface: 0, coupe, ip: None }
+        Recu { vide: true, longueur, source: [0; 4], port: 0, destination: [0; 4], pktinfo: (0, [0; 4]), coupe, ip: None }
     }
 }
 
@@ -800,7 +821,7 @@ pub fn prendre(s: &Socket, place: usize, drapeaux: u64, non_bloquant: bool, mut 
             deja = if k.is_none() { r.file.len() } else { 0 };
             if let Some(k) = k {
                 let premier = &mut r.file[k];
-                let (source, port, destination, interface) = (premier.source, premier.port, premier.destination, premier.interface);
+                let (source, port, destination, pktinfo) = (premier.source, premier.port, premier.destination, premier.pktinfo);
                 let total = premier.paquet.longueur();
                 let dispo = total - reste;
                 // La somme d'UDP qui attend une lecture qui coupe ou qui regarde
@@ -853,7 +874,7 @@ pub fn prendre(s: &Socket, place: usize, drapeaux: u64, non_bloquant: bool, mut 
                 } else {
                     s.peek_recule(longueur);
                 }
-                return Ok(Recu { vide: false, longueur, source, port, destination, interface, coupe, ip: Some(ip) });
+                return Ok(Recu { vide: false, longueur, source, port, destination, pktinfo, coupe, ip: Some(ip) });
             }
         }
         // Rien en file : EAGAIN sans attendre, même après l'arrêt de la

@@ -201,11 +201,23 @@ impl Proprietaire {
     }
 }
 
+/// La route de sortie que garde un paquet envoyé par lo (le `skb_dst` que
+/// `loopback_xmit` ne lâche pas, et que relit son arrivée, ipv4.rs) :
+/// l'interface par laquelle on le verra arrivé (le `rt_iif` de sa route, que
+/// lit `inet_iif`), et s'il est une diffusion (RTCF_BROADCAST : à toutes les
+/// sockets de son port).
+#[derive(Clone, Copy)]
+pub struct Sortie {
+    pub interface: u32,
+    pub diffusion: bool,
+}
+
 pub struct Paquet {
     tampon: Vec<u8>,
     debut: usize,
     fin: usize,
     proprietaire: Option<Proprietaire>,
+    sortie: Option<Sortie>,
 }
 
 impl Paquet {
@@ -214,14 +226,14 @@ impl Paquet {
     pub fn vide(longueur: usize) -> Option<Paquet> {
         let tampon = faillible::remplie(MARGE + longueur, 0).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: MARGE, fin: MARGE, proprietaire: None })
+        Some(Paquet { tampon, debut: MARGE, fin: MARGE, proprietaire: None, sortie: None })
     }
 
     /// Une copie de la trame `octets` (reçue), sans marge.
     pub fn copie(octets: &[u8]) -> Option<Paquet> {
         let tampon = faillible::copie(octets).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: 0, fin: octets.len(), proprietaire: None })
+        Some(Paquet { tampon, debut: 0, fin: octets.len(), proprietaire: None, sortie: None })
     }
 
     /// Les données.
@@ -331,6 +343,16 @@ impl Paquet {
     /// La socket qu'il tient, s'il en tient une (pour ses morceaux, ipv4::fragmenter).
     pub fn retenue(&self) -> Option<&Arc<Retenue>> {
         self.proprietaire.as_ref().map(|p| &p.retenue)
+    }
+
+    /// Il part par lo, et garde sa route (ipv4::envoyer).
+    pub fn marquer(&mut self, s: Sortie) {
+        self.sortie = Some(s);
+    }
+
+    /// La route qu'il a gardée, s'il est parti par lo.
+    pub fn sortie(&self) -> Option<Sortie> {
+        self.sortie
     }
 }
 

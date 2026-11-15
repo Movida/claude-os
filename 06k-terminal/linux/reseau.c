@@ -2034,6 +2034,214 @@ static void options_d_ip(void)
     close(s);
 }
 
+/* La passerelle de la route par défaut (dans l'ordre du réseau), lue dans
+ * /proc/net/route. Faux : pas de route par défaut. */
+static int passerelle_par_defaut(uint32_t *passerelle)
+{
+    FILE *f = fopen("/proc/net/route", "r");
+    char ligne[256], nom[32];
+    unsigned destination, p, masque;
+    int trouve = 0;
+    while (!trouve && f && fgets(ligne, sizeof ligne, f))
+        if (sscanf(ligne, "%31s %x %x %*x %*d %*d %*d %x", nom, &destination, &p, &masque) == 4 && destination == 0
+            && masque == 0 && p != 0) {
+            *passerelle = p;
+            trouve = 1;
+        }
+    if (f)
+        fclose(f);
+    return trouve;
+}
+
+/* Envoie les n octets o de s vers vers:port (dans l'ordre du réseau), avec
+ * un IP_PKTINFO d'interface `interface` (0 : sans message de contrôle).
+ * Rend 0, ou errno. */
+static int envoyer_par(int s, const void *o, size_t n, uint32_t vers, uint16_t port, int interface)
+{
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = port, .sin_addr.s_addr = vers };
+    char c[CMSG_SPACE(sizeof(struct in_pktinfo))] = { 0 };
+    struct iovec v = { (void *)o, n };
+    struct msghdr m = { .msg_name = &d, .msg_namelen = sizeof d, .msg_iov = &v, .msg_iovlen = 1 };
+    if (interface) {
+        m.msg_control = c;
+        m.msg_controllen = sizeof c;
+        struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+        h->cmsg_level = IPPROTO_IP;
+        h->cmsg_type = IP_PKTINFO;
+        h->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+        ((struct in_pktinfo *)CMSG_DATA(h))->ipi_ifindex = interface;
+    }
+    return erreur(sendmsg(s, &m, 0));
+}
+
+/* L'interface de sortie (les soldes d'avant 6k) : l'`ipi_ifindex`
+ * d'IP_PKTINFO, sinon IP_UNICAST_IF (sauf vers une multidiffusion :
+ * `udp_sendmsg`), choisit l'interface d'un envoi, et la route est cherchée
+ * pour elle (`ip_route_output_key_hash_rcu`) : par lo, tout est livré ici,
+ * même pour une adresse d'ailleurs, la source étant alors choisie sur une
+ * autre interface (celles de lo sont de portée « hôte ») ; l'interface vue
+ * à l'arrivée est celle de la route (`inet_iif`) ; IP_PKTINFO est préparé à
+ * l'arrivée, pour une socket qui l'avait (`ipv4_pktinfo_prepare`) ; une
+ * réponse d'ICMP ne part que d'une adresse à nous ; une socket UDP
+ * connectée garde la route de son connect (`sk_dst_cache`). Le « hack de
+ * vic/vat » : sans interface, une source liée et une diffusion limitée
+ * partent par l'interface de la source. */
+static void interface_de_sortie(void)
+{
+    const uint32_t ailleurs = htonl(0xc0000201); /* 192.0.2.1, TEST-NET-1 */
+    uint32_t passerelle, diffusion;
+    int un = 1;
+    if (!passerelle_par_defaut(&passerelle) || !diffusion_du_reseau(&diffusion)) {
+        verifier(1, "pas de carte : l'interface de sortie, sautee");
+        return;
+    }
+    /* Notre adresse : la source d'une socket connectée ailleurs. */
+    int s = udp(0), r = udp(0);
+    struct sockaddr_in a = { .sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = ailleurs }, moi, de;
+    socklen_t l = sizeof moi;
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    getsockname(s, (struct sockaddr *)&moi, &l);
+    close(s);
+    /* r écoute sur 0.0.0.0, avec IP_PKTINFO. */
+    a = adresse(0, 0);
+    l = sizeof a;
+    bind(r, (struct sockaddr *)&a, sizeof a);
+    getsockname(r, (struct sockaddr *)&a, &l);
+    uint16_t port = a.sin_port;
+    setsockopt(r, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    struct in_pktinfo pi = { 0 };
+    s = udp(0);
+    /* Vers notre adresse sans interface : arrivé par la carte (la route
+     * locale de notre adresse est la sienne). */
+    int ok = envoyer_par(s, "x", 1, moi.sin_addr.s_addr, port, 0) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    int carte = pi.ipi_ifindex;
+    verifier(ok && carte > 1 && pi.ipi_spec_dst.s_addr == moi.sin_addr.s_addr && pi.ipi_addr.s_addr == moi.sin_addr.s_addr,
+             "vers notre adresse : arrive par la carte");
+    ok = envoyer_par(s, "x", 1, moi.sin_addr.s_addr, port, carte) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == carte, "IP_PKTINFO carte vers notre adresse : arrive par la carte");
+    ok = envoyer_par(s, "x", 1, moi.sin_addr.s_addr, port, 1) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1 && pi.ipi_spec_dst.s_addr == moi.sin_addr.s_addr,
+             "IP_PKTINFO lo vers notre adresse : arrive par lo");
+    /* Par lo, une adresse d'ailleurs : livrée ici, de notre adresse. */
+    ok = envoyer_par(s, "x", 1, ailleurs, port, 1) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1 && de.sin_addr.s_addr == moi.sin_addr.s_addr && pi.ipi_spec_dst.s_addr == ailleurs
+                 && pi.ipi_addr.s_addr == ailleurs,
+             "IP_PKTINFO lo vers 192.0.2.1 : livre ici par lo, de notre adresse");
+    ok = envoyer_par(s, "x", 1, passerelle, port, 1) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1 && pi.ipi_addr.s_addr == passerelle, "IP_PKTINFO lo vers la passerelle : livre ici");
+    /* La diffusion du réseau par lo : un unicast, sans SO_BROADCAST. */
+    verifier(envoyer_par(s, "x", 1, diffusion, port, 0) == EACCES, "vers la diffusion du reseau sans SO_BROADCAST : EACCES");
+    ok = envoyer_par(s, "x", 1, diffusion, port, 1) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1 && pi.ipi_spec_dst.s_addr == diffusion,
+             "IP_PKTINFO lo vers la diffusion du reseau : un unicast, sans SO_BROADCAST");
+    verifier(envoyer_par(s, "x", 1, ailleurs, port, 9999) == ENODEV, "IP_PKTINFO 9999 : ENODEV");
+    verifier(recu_avec_pktinfo(r, &de, &pi, 0) == -1, "et rien de plus");
+    close(s);
+
+    /* Le « port injoignable » ne part que d'une adresse à nous : par lo,
+     * vers un port fermé de 192.0.2.1, rien ; de 127.0.0.1, ECONNREFUSED. */
+    s = udp(0);
+    setsockopt(s, IPPROTO_IP, IP_RECVERR, &un, sizeof un);
+    uint16_t ferme = htons(port_ferme());
+    struct pollfd pe = { s, 0, 0 };
+    ok = envoyer_par(s, "x", 1, ailleurs, ferme, 1) == 0 && poll(&pe, 1, 300) == 0;
+    verifier(ok, "IP_PKTINFO lo vers un port ferme de 192.0.2.1 : pas d'erreur ICMP (sa source n'est pas a nous)");
+    ok = envoyer_par(s, "x", 1, htonl(LO), ferme, 0) == 0 && attendre_erreur(s);
+    verifier(ok && getsockopt(s, SOL_SOCKET, SO_ERROR, &un, &(socklen_t){ sizeof un }) == 0 && un == ECONNREFUSED,
+             "vers un port ferme de 127.0.0.1 : l'erreur ICMP");
+    un = 1;
+    close(s);
+
+    /* L'écho de même : une socket de ping, par lo vers 192.0.2.1, sans réponse. */
+    int q = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    if (q >= 0) {
+        struct icmphdr e = { .type = ICMP_ECHO, .un.echo = { .id = htons(0x4321), .sequence = htons(1) } };
+        struct pollfd pq = { q, POLLIN, 0 };
+        ok = envoyer_par(q, &e, sizeof e, ailleurs, 0, 1) == 0 && poll(&pq, 1, 300) == 0;
+        verifier(ok, "ping, IP_PKTINFO lo vers 192.0.2.1 : pas de reponse (sa source n'est pas a nous)");
+        ok = envoyer_par(q, &e, sizeof e, htonl(LO), 0, 1) == 0 && poll(&pq, 1, 1000) == 1;
+        verifier(ok, "ping, IP_PKTINFO lo vers 127.0.0.1 : la reponse");
+        close(q);
+    }
+
+    /* IP_PKTINFO posé après l'arrivée : rien de préparé, l'interface 0 et
+     * l'adresse locale 0.0.0.0 (la destination reste). */
+    uint16_t pv;
+    int v = liee(&pv);
+    s = udp(0);
+    envoyer(s, "x", 1, pv);
+    setsockopt(v, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    ok = recu_avec_pktinfo(v, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 0 && pi.ipi_spec_dst.s_addr == 0 && pi.ipi_addr.s_addr == htonl(LO),
+             "IP_PKTINFO pose apres l'arrivee : interface 0, adresse locale 0.0.0.0");
+    close(v);
+    close(s);
+
+    /* IP_UNICAST_IF : l'interface d'un envoi sans IP_PKTINFO. */
+    s = udp(0);
+    verifier(poser_ip(s, IP_UNICAST_IF, htonl(1), 4) == 0 && lire_ip(s, IP_UNICAST_IF) == (int)htonl(1),
+             "IP_UNICAST_IF lo, dans l'ordre du reseau, relu");
+    ok = envoyer_par(s, "x", 1, ailleurs, port, 0) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1 && pi.ipi_addr.s_addr == ailleurs, "IP_UNICAST_IF lo vers 192.0.2.1 : livre ici par lo");
+    ok = envoyer_par(s, "x", 1, ailleurs, port, carte) == 0 && recu_avec_pktinfo(r, &de, &pi, 300) == -1;
+    verifier(ok, "IP_UNICAST_IF lo, IP_PKTINFO carte vers 192.0.2.1 : par la carte (IP_PKTINFO l'emporte)");
+    /* connect le suit : la source de notre adresse, et les envois par lo. */
+    a.sin_addr.s_addr = passerelle;
+    a.sin_port = port;
+    struct sockaddr_in nom;
+    l = sizeof nom;
+    ok = connect(s, (struct sockaddr *)&a, sizeof a) == 0 && getsockname(s, (struct sockaddr *)&nom, &l) == 0;
+    verifier(ok && nom.sin_addr.s_addr == moi.sin_addr.s_addr, "IP_UNICAST_IF lo, connect vers la passerelle : de notre adresse");
+    ok = send(s, "x", 1, 0) == 1 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1 && pi.ipi_addr.s_addr == passerelle, "et send : livre ici par lo");
+    close(s);
+    /* Une socket connectée garde la route de son connect : IP_UNICAST_IF posé
+     * après ne change rien pour send, mais sendto cherche une route. */
+    s = udp(0);
+    a.sin_addr.s_addr = ailleurs;
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    poser_ip(s, IP_UNICAST_IF, htonl(1), 4);
+    ok = send(s, "x", 1, 0) == 1 && recu_avec_pktinfo(r, &de, &pi, 300) == -1;
+    verifier(ok, "connectee a 192.0.2.1, puis IP_UNICAST_IF lo : send garde la route du connect");
+    ok = envoyer_par(s, "x", 1, ailleurs, port, 0) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1, "et sendto vers la meme adresse : une route neuve, par lo");
+    close(s);
+    /* Les valeurs : une longueur de 4 seulement, un index qui existe ; 0
+     * l'efface ; lu dans un octet, le premier de l'entier. */
+    s = udp(0);
+    verifier(poser_ip(s, IP_UNICAST_IF, htonl(1), 0) == EINVAL && poser_ip(s, IP_UNICAST_IF, htonl(1), 2) == EINVAL,
+             "IP_UNICAST_IF de longueur 0 ou 2 : EINVAL");
+    verifier(poser_ip(s, IP_UNICAST_IF, htonl(9999), 4) == EADDRNOTAVAIL && poser_ip(s, IP_UNICAST_IF, 1, 4) == EADDRNOTAVAIL,
+             "IP_UNICAST_IF 9999, ou 1 dans l'ordre de la machine : EADDRNOTAVAIL");
+    poser_ip(s, IP_UNICAST_IF, htonl(1), 4);
+    unsigned char octet = 0x55;
+    socklen_t lo = 1;
+    int lu = getsockopt(s, IPPROTO_IP, IP_UNICAST_IF, &octet, &lo);
+    verifier(lu == 0 && lo == 1 && octet == 0, "IP_UNICAST_IF lu dans un octet : le premier de l'entier");
+    long long grand = 0;
+    lo = sizeof grand;
+    lu = getsockopt(s, IPPROTO_IP, IP_UNICAST_IF, &grand, &lo);
+    verifier(lu == 0 && lo == 4 && grand == htonl(1), "IP_UNICAST_IF lu dans 8 octets : 4");
+    verifier(poser_ip(s, IP_UNICAST_IF, 0, 4) == 0 && lire_ip(s, IP_UNICAST_IF) == 0, "IP_UNICAST_IF 0 : efface");
+    close(s);
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    verifier(poser_ip(s, IP_UNICAST_IF, htonl(1), 4) == 0 && lire_ip(s, IP_UNICAST_IF) == (int)htonl(1),
+             "IP_UNICAST_IF d'une socket TCP : pose et relu");
+    close(s);
+
+    /* Le hack de vic/vat : liée à 127.0.0.1, vers 255.255.255.255, par lo. */
+    s = udp(0);
+    a = adresse(LO, 0);
+    bind(s, (struct sockaddr *)&a, sizeof a);
+    setsockopt(s, SOL_SOCKET, SO_BROADCAST, &un, sizeof un);
+    ok = envoyer_par(s, "x", 1, htonl(0xffffffff), port, 0) == 0 && recu_avec_pktinfo(r, &de, &pi, 1000) == 1;
+    verifier(ok && pi.ipi_ifindex == 1 && de.sin_addr.s_addr == htonl(LO) && pi.ipi_spec_dst.s_addr == htonl(LO),
+             "liee a 127.0.0.1, vers 255.255.255.255 : par lo (le hack de vic/vat)");
+    verifier(recu_avec_pktinfo(r, &de, &pi, 200) == -1, "une fois");
+    close(s);
+    close(r);
+}
+
 /* Le compteur `nom` du groupe `groupe` de /proc/net/snmp (« Udp: »,
  * « Icmp: » : deux lignes, les noms puis les valeurs) ; -1 : pas trouvé. */
 static long compteur_snmp(const char *groupe, const char *nom)
@@ -2227,6 +2435,7 @@ int main(int argc, char **argv)
     sol_ip();
     controles();
     options_d_ip();
+    interface_de_sortie();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

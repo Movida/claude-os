@@ -134,7 +134,7 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
         None => return Err(-EDESTADDRREQ),
     };
     let c = controle?;
-    let d = datagramme::preparer(s, &mut inet, adresse, longueur, drapeaux, &c)?;
+    let d = datagramme::preparer(s, &mut inet, adresse, longueur, drapeaux, &c, false)?;
     // MSG_PROBE : la route seulement (`preparer`) ; rien à pousser.
     if drapeaux & datagramme::MSG_PROBE != 0 {
         return Ok(longueur);
@@ -177,7 +177,7 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], entete: &
     let port_destination = p.donnees().get(2..4).map_or(0, |o| u16::from_be_bytes([o[0], o[1]]));
     let somme = formats::reseau::somme_linux(p.donnees());
     let d = Datagramme {
-        regarde: false, paquet: p, source, port: 0, destination, interface, entete: *entete, port_destination,
+        regarde: false, paquet: p, source, port: 0, destination, pktinfo: (interface, [0; 4]), entete: *entete, port_destination,
         somme: socket::Somme::Calculee(somme), taille,
     };
     if s.deposer(d, Admission::Ordinaire).is_err() {

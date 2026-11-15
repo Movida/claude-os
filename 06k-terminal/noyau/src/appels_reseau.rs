@@ -740,7 +740,7 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let total = e.donnees.longueur();
         let copie = copier_vers_morceaux(morceaux, e.donnees.donnees())?;
         let recu = socket::Recu {
-            vide: false, longueur: copie, source: e.adresse, port: e.port, destination: e.arrivee, interface: e.interface,
+            vide: false, longueur: copie, source: e.adresse, port: e.port, destination: e.arrivee, pktinfo: (e.interface, [0; 4]),
             coupe: copie < total, ip: e.controle(),
         };
         let d = if recu.coupe { MSG_TRUNC } else { 0 } | MSG_ERRQUEUE as u32;
@@ -887,6 +887,7 @@ fn lire_controle(c: &[u8], root: bool, protocole: Protocole) -> Result<Controle,
         }
         let niveau = i32::from_le_bytes(c[i + 8..i + 12].try_into().unwrap_or([0; 4]));
         let sorte = i32::from_le_bytes(c[i + 12..i + 16].try_into().unwrap_or([0; 4]));
+        r.ip |= niveau != SOL_UDP;
         let lu = match protocole {
             Protocole::Tcp => niveau == SOL_SOCKET,
             Protocole::Ping => niveau != SOL_UDP,
@@ -1219,29 +1220,14 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
     let options = o.socket().appels.verrouiller().options;
     if r.recu.ip.is_some() && options.pktinfo {
         // in_pktinfo : l'interface d'arrivée, l'adresse locale à laquelle
-        // répondre, la destination. Pour un datagramme UDP, ce que prépare
-        // `ipv4_pktinfo_prepare` : venu par lo à l'une de nos adresses d'une
-        // carte, l'interface qui porte l'adresse ; l'adresse locale, la
-        // destination, ou pour une diffusion celle qu'aurait la réponse
-        // (`fib_compute_spec_dst`). Pour une erreur, `ip_recv_error` rend le
-        // contrôle du message ICMP, que rien n'a préparé, et une réponse de
-        // ping de même (`ping_rcv` ne le prépare pas, mesuré) : l'interface
-        // d'arrivée telle quelle, et 0.0.0.0 (le `faddr` de ses options IP).
-        let (interface, locale) = if r.erreur.is_some() || o.socket().protocole == Protocole::Ping {
-            (r.recu.interface, [0; 4])
-        } else {
-            let lo = crate::reseau::boucle::interface().map(|i| i.index);
-            let interface = match ipv4::interface_de_l_adresse(r.recu.destination) {
-                Some(k) if Some(r.recu.interface) == lo => k,
-                _ => r.recu.interface,
-            };
-            let locale = if ipv4::avec_table(|t| t.est_a_nous(r.recu.destination)).unwrap_or(false) {
-                r.recu.destination
-            } else {
-                ipv4::router(r.recu.source, None).map_or([0; 4], |(c, _)| ipv4::source(&c))
-            };
-            (interface, locale)
-        };
+        // répondre, la destination. Les deux premières telles que les a
+        // préparées l'arrivée d'un datagramme UDP (`ipv4_pktinfo_prepare`,
+        // udp.rs : rien si la socket n'avait pas encore IP_PKTINFO). Pour une
+        // erreur, `ip_recv_error` rend le contrôle du message ICMP, que rien
+        // n'a préparé, et une réponse de ping de même (`ping_rcv` ne le
+        // prépare pas, mesuré) : l'interface d'arrivée telle quelle, et
+        // 0.0.0.0 (le `faddr` de ses options IP).
+        let (interface, locale) = r.recu.pktinfo;
         let mut info = [0u8; 12];
         info[..4].copy_from_slice(&(interface as i32).to_le_bytes());
         info[4..8].copy_from_slice(&locale);
@@ -1845,7 +1831,7 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
 /// sont d'une socket brute (ENOPROTOOPT) ; IP_IPSEC_POLICY et
 /// IP_XFRM_POLICY : EPERM sans root, puis ENOPROTOOPT (le `xfrm_user_policy`
 /// d'un noyau sans IPsec, CONFIG_XFRM). Les options de la multidiffusion
-/// (sauf IP_MULTICAST_TTL) et IP_UNICAST_IF : ENOPROTOOPT, un écart.
+/// (sauf IP_MULTICAST_TTL) : ENOPROTOOPT, un écart.
 /// IP_OPTIONS : 40 octets au plus (EINVAL), copiés (EFAULT) avant de prendre
 /// le `Mutex`, vérifiés pour l'envoi (`ip_options_get` : EINVAL), aucun
 /// octet : aucune option ; TCP leur laisse leur place dans son MSS.
@@ -1888,7 +1874,12 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
     let op = &mut inet.options;
     let oui = v != 0;
     match option {
-        IP_PKTINFO => op.pktinfo = oui,
+        // Sa copie atomique, pour la tâche du réseau : l'arrivée d'un
+        // datagramme le prépare (udp.rs).
+        IP_PKTINFO => {
+            op.pktinfo = oui;
+            s.pktinfo.store(oui, Ordering::Relaxed);
+        }
         IP_RECVTTL => op.recvttl = oui,
         IP_RECVTOS => op.recvtos = oui,
         IP_RECVOPTS => op.recvopts = oui,
@@ -1924,6 +1915,18 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         IP_TRANSPARENT if longueur < 1 => return Err(-EINVAL),
         IP_TRANSPARENT => op.transparent = oui,
         IP_BIND_ADDRESS_NO_PORT => op.bind_no_port = oui,
+        // L'index d'une interface qui existe, dans l'ordre du réseau
+        // (`ntohl`), d'une longueur de 4 seulement (même 0 : EINVAL) ; 0
+        // l'efface. Toute socket d'IPv4 (TCP le garde sans s'en servir).
+        IP_UNICAST_IF if longueur != 4 => return Err(-EINVAL),
+        IP_UNICAST_IF => {
+            const EADDRNOTAVAIL: i64 = 99;
+            let k = u32::from_be(v as u32);
+            if k != 0 && crate::reseau::interface::par_index(k).is_none() {
+                return Err(-EADDRNOTAVAIL);
+            }
+            op.unicast_if = k;
+        }
         IP_TTL => {
             if longueur < 1 || (v != -1 && !(1..=255).contains(&v)) {
                 return Err(-EINVAL);
@@ -2191,6 +2194,8 @@ fn lire_option_ip(s: &Socket, option: i32) -> Result<i32, i64> {
         IP_FREEBIND => op.freebind as i32,
         IP_TRANSPARENT => op.transparent as i32,
         IP_BIND_ADDRESS_NO_PORT => op.bind_no_port as i32,
+        // Dans l'ordre du réseau, comme posé (`htonl`).
+        IP_UNICAST_IF => op.unicast_if.to_be() as i32,
         IP_HDRINCL | IP_NODEFRAG | IP_ROUTER_ALERT => 0,
         IP_TOS => op.tos as i32,
         IP_TTL => op.ttl.unwrap_or(ipv4::TTL_DEFAUT) as i32,

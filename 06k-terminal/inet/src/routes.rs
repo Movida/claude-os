@@ -19,6 +19,13 @@
 //! locale (`fib_add_ifaddr` lui donne le type RTN_LOCAL) ; /proc/net/route ne la
 //! montre donc pas : il ne montre que la principale, dans l'ordre des
 //! réseaux (celui de l'arbre de Linux) : `principales`.
+//!
+//! Un envoi peut demander son interface de sortie (IP_PKTINFO, IP_UNICAST_IF,
+//! et SO_BINDTODEVICE : l'`oif` du `flowi4` de Linux) : seules comptent alors
+//! les entrées des deux tables qui passent par elle, et sans rien trouver, la
+//! destination est réputée « sur le lien » de l'interface (`chercher`).
+//! Chaque entrée locale garde son interface : celle qu'on voit à l'arrivée
+//! d'un paquet qu'elle livre par lo (le `rt_iif` de Linux, que lit IP_PKTINFO).
 
 use alloc::vec::Vec;
 use formats::reseau::ipv4;
@@ -35,7 +42,29 @@ pub struct Adresse {
     pub boucle: bool,
 }
 
+/// La portée d'une adresse (le `ifa_scope` de Linux, RT_SCOPE_*), de la plus
+/// large à la plus étroite : joignable de partout (`RT_SCOPE_UNIVERSE`, 0),
+/// du lien seulement (`RT_SCOPE_LINK`, 253), de cette machine seulement
+/// (`RT_SCOPE_HOST`, 254). L'ordre des variantes est celui des nombres de
+/// Linux : « au plus de portée p » se dit `portee <= p`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Portee {
+    Univers,
+    Lien,
+    Hote,
+}
+
+/// 127.0.0.1 (INADDR_LOOPBACK) : « cette machine » faute de mieux.
+const BOUCLE: [u8; 4] = [127, 0, 0, 1];
+
 impl Adresse {
+    /// Sa portée : « hôte » pour une adresse de 127.0.0.0/8 (celle de lo :
+    /// `inet_set_ifa`), « univers » pour les autres (celles que donne le
+    /// DHCP).
+    pub fn portee(&self) -> Portee {
+        if self.boucle { Portee::Hote } else { Portee::Univers }
+    }
+
     /// L'adresse de diffusion de son réseau (10.0.2.255 pour 10.0.2.15/24).
     pub fn diffusion(&self) -> [u8; 4] {
         let m = u32::from_be_bytes(ipv4::masque(self.prefixe));
@@ -64,14 +93,26 @@ pub struct Route {
 /// Ce que donne la recherche d'une destination.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Chemin {
-    /// Une de nos adresses : livré ici (par l'interface de boucle).
-    Locale { source: [u8; 4] },
+    /// Une de nos adresses : livré ici (par l'interface de boucle), comme
+    /// arrivé par `interface`, celle de l'entrée locale trouvée (la carte pour
+    /// son adresse, lo pour son réseau : le `FIB_RES_OIF` dont Linux fait le
+    /// `rt_iif` de la route) ; 0 : lo.
+    Locale { source: [u8; 4], interface: u32 },
     /// La diffusion d'un de nos réseaux, ou la diffusion limitée
     /// (255.255.255.255) : à toutes les machines du réseau de `interface`.
     Diffusion { interface: u32, source: [u8; 4] },
     /// Par `interface`, à la machine `prochain` (la destination elle-même,
     /// ou la passerelle), depuis `source`.
     Unicast { interface: u32, prochain: [u8; 4], source: [u8; 4] },
+}
+
+impl Chemin {
+    /// L'adresse source qu'il propose (le `prefsrc` de sa route).
+    pub fn source(&self) -> [u8; 4] {
+        match *self {
+            Chemin::Locale { source, .. } | Chemin::Diffusion { source, .. } | Chemin::Unicast { source, .. } => source,
+        }
+    }
 }
 
 /// Pourquoi une route n'est pas ajoutée.
@@ -156,6 +197,57 @@ impl Table {
         self.adresses.iter().find(|x| x.adresse == a).map(|x| x.interface)
     }
 
+    /// L'interface d'une adresse à nous (`__ip_dev_find`) : celle qui la
+    /// porte, ou lo pour une autre adresse de son réseau (Linux se rabat sur
+    /// la table locale : « local 127.0.0.0/8 dev lo »).
+    pub fn interface_locale(&self, a: [u8; 4]) -> Option<u32> {
+        self.interface_de(a).or_else(|| {
+            self.adresses.iter().find(|x| x.boucle && ipv4::dans(a, x.adresse, x.prefixe) && x.diffusion() != a).map(|x| x.interface)
+        })
+    }
+
+    /// L'adresse que propose l'interface `interface` pour parler à `vers`, de
+    /// portée `portee` au plus (`inet_select_addr`) : parmi ses adresses de
+    /// cette portée, la première dont le réseau contient `vers` (0.0.0.0 :
+    /// n'importe laquelle), sinon la première ; sinon, sur les interfaces
+    /// dans l'ordre de leur numéro (lo d'abord), la première adresse de cette
+    /// portée qui ne soit pas « du lien » (`in_dev_select_addr`). Ainsi lo,
+    /// dont l'adresse est de portée « hôte », propose pour son lien celle de
+    /// la carte (mesuré : un envoi forcé par lo vers 192.0.2.1 part de
+    /// l'adresse de la carte).
+    pub fn adresse_proposee(&self, interface: u32, vers: [u8; 4], portee: Portee) -> Option<[u8; 4]> {
+        let mut premiere = None;
+        for x in self.adresses_de(interface).filter(|x| x.portee() <= portee) {
+            if vers == ipv4::AUCUNE || ipv4::dans(vers, x.adresse, x.prefixe) {
+                return Some(x.adresse);
+            }
+            premiere = premiere.or(Some(x.adresse));
+        }
+        // `min_by_key` rend la première de plus petit numéro.
+        premiere.or_else(|| {
+            self.adresses.iter().filter(|x| x.portee() != Portee::Lien && x.portee() <= portee).min_by_key(|x| x.interface).map(|x| x.adresse)
+        })
+    }
+
+    /// L'adresse par laquelle l'émetteur `source` d'un paquet arrivé par
+    /// `interface` nous joint, quand ce paquet n'était pas pour une seule de
+    /// nos adresses (une diffusion, ou pas pour nous) : celle que propose la
+    /// route vers lui, sinon celle que propose l'interface, de portée « lien »
+    /// pour une source de 0.0.0.0/8 (`fib_compute_spec_dst` : l'adresse
+    /// locale d'IP_PKTINFO, celle que notent les options reçues). Pour un
+    /// paquet livré à une seule de nos adresses, c'est sa destination.
+    pub fn adresse_pour_repondre(&self, source: [u8; 4], interface: u32) -> [u8; 4] {
+        let portee = if source[0] != 0 {
+            if let Some(c) = self.chercher(source, 0) {
+                return c.source();
+            }
+            Portee::Univers
+        } else {
+            Portee::Lien
+        };
+        self.adresse_proposee(interface, source, portee).unwrap_or(ipv4::AUCUNE)
+    }
+
     /// `a` est-elle une adresse de diffusion pour l'interface `interface` :
     /// la diffusion limitée, ou celle d'un de ses réseaux ?
     pub fn est_diffusion(&self, interface: u32, a: [u8; 4]) -> bool {
@@ -175,33 +267,75 @@ impl Table {
     }
 
     /// La route de la table principale au plus long préfixe qui contient
-    /// `destination`.
-    fn meilleure(&self, destination: [u8; 4]) -> Option<&Route> {
-        self.routes.iter().filter(|r| ipv4::dans(destination, r.reseau, r.prefixe)).max_by_key(|r| r.prefixe)
+    /// `destination`, parmi celles de l'interface `oif` (0 : toutes).
+    fn meilleure(&self, destination: [u8; 4], oif: u32) -> Option<&Route> {
+        self.routes.iter()
+            .filter(|r| (oif == 0 || r.interface == oif) && ipv4::dans(destination, r.reseau, r.prefixe))
+            .max_by_key(|r| r.prefixe)
     }
 
-    /// Le chemin d'un paquet vers `destination` : la table locale d'abord
-    /// (nos adresses, la diffusion de nos réseaux), puis la principale.
-    /// La diffusion limitée part par l'interface de la route par défaut
-    /// (Linux : la recherche dans la principale, faute d'interface choisie).
-    pub fn chercher(&self, destination: [u8; 4]) -> Option<Chemin> {
+    /// Le chemin d'un paquet vers `destination`, par l'interface `oif` si un
+    /// envoi la demande (0 : celle de la route), comme
+    /// `ip_route_output_key_hash_rcu` une fois la source vérifiée :
+    ///   - avec une interface, la diffusion limitée part par elle, sans
+    ///     table, de l'adresse qu'elle propose pour son lien ;
+    ///   - la table locale d'abord (nos adresses, le réseau de lo, la
+    ///     diffusion de nos réseaux), puis la principale ; avec une
+    ///     interface, seules comptent ses entrées (`fib_lookup_good_nhc` :
+    ///     notre adresse de la carte n'est pas à lo, ni 127.0.0.0/8 à la
+    ///     carte : par la carte, 127.0.0.1 va à la passerelle, mesuré) ;
+    ///   - rien de trouvé avec une interface : la destination est « sur le
+    ///     lien », envoyée directement par elle, de l'adresse qu'elle propose
+    ///     (Linux : « we are allowed to send to iface even if it has NO
+    ///     routes and NO assigned addresses ») : par lo, tout est livré ici.
+    ///
+    /// Sans interface, la diffusion limitée part par celle de la route par
+    /// défaut (la principale, comme toute destination).
+    pub fn chercher(&self, destination: [u8; 4], oif: u32) -> Option<Chemin> {
+        let par = |k: u32| oif == 0 || oif == k;
+        let proposee = || self.adresse_proposee(oif, ipv4::AUCUNE, Portee::Lien).unwrap_or(ipv4::AUCUNE);
+        if oif != 0 && destination == ipv4::DIFFUSION {
+            return Some(Chemin::Diffusion { interface: oif, source: proposee() });
+        }
         // Une de nos adresses : elle-même pour source ; une autre adresse du
         // réseau de lo (127.1.2.3) : celle de lo, la `prefsrc` de sa route
         // locale (« local 127.0.0.0/8 dev lo src 127.0.0.1 »).
-        if self.adresses.iter().any(|x| x.adresse == destination) {
-            return Some(Chemin::Locale { source: destination });
+        if let Some(x) = self.adresses.iter().find(|x| x.adresse == destination && par(x.interface)) {
+            return Some(Chemin::Locale { source: destination, interface: x.interface });
         }
-        if let Some(x) = self.adresses.iter().find(|x| x.boucle && ipv4::dans(destination, x.adresse, x.prefixe) && x.diffusion() != destination) {
-            return Some(Chemin::Locale { source: x.adresse });
+        if let Some(x) = self.adresses.iter()
+            .find(|x| x.boucle && ipv4::dans(destination, x.adresse, x.prefixe) && x.diffusion() != destination && par(x.interface))
+        {
+            return Some(Chemin::Locale { source: x.adresse, interface: x.interface });
         }
-        if let Some(a) = self.adresses.iter().find(|a| a.prefixe < 31 && a.diffusion() == destination) {
+        if let Some(a) = self.adresses.iter().find(|a| a.prefixe < 31 && a.diffusion() == destination && par(a.interface)) {
             return Some(Chemin::Diffusion { interface: a.interface, source: a.adresse });
         }
-        let r = self.meilleure(destination)?;
-        if destination == ipv4::DIFFUSION {
-            return Some(Chemin::Diffusion { interface: r.interface, source: r.source });
+        match self.meilleure(destination, oif) {
+            Some(r) if destination == ipv4::DIFFUSION => Some(Chemin::Diffusion { interface: r.interface, source: r.source }),
+            Some(r) => Some(Chemin::Unicast { interface: r.interface, prochain: r.passerelle.unwrap_or(destination), source: r.source }),
+            None if oif != 0 => Some(Chemin::Unicast { interface: oif, prochain: destination, source: proposee() }),
+            None => None,
         }
-        Some(Chemin::Unicast { interface: r.interface, prochain: r.passerelle.unwrap_or(destination), source: r.source })
+    }
+
+    /// La route d'un envoi vers `destination`, de la source `source` s'il en
+    /// demande une, par l'interface `oif` s'il en demande une (0 : aucune) :
+    /// `chercher`, sauf vers 0.0.0.0, « cette machine », que Linux livre par
+    /// lo sans table (`ip_route_output_key_hash_rcu`) : la destination devient
+    /// la source demandée, sinon, avec une interface, l'adresse qu'elle
+    /// propose de portée « hôte », sinon 127.0.0.1 ; l'arrivée a lieu par
+    /// l'interface demandée (le `rt_iif` est l'`oif` d'origine), lo sans
+    /// elle. Rend aussi la destination de l'en-tête. None : pas de route.
+    pub fn router(&self, destination: [u8; 4], source: Option<[u8; 4]>, oif: u32) -> Option<(Chemin, [u8; 4])> {
+        if destination != ipv4::AUCUNE {
+            return self.chercher(destination, oif).map(|c| (c, destination));
+        }
+        let s = source.filter(|&s| s != ipv4::AUCUNE)
+            .or_else(|| if oif != 0 { self.adresse_proposee(oif, ipv4::AUCUNE, Portee::Hote) } else { None })
+            .unwrap_or(BOUCLE);
+        let lo = self.adresses.iter().find(|x| x.boucle).map_or(0, |x| x.interface);
+        Some((Chemin::Locale { source: s, interface: if oif != 0 { oif } else { lo } }, s))
     }
 
     /// Les routes de la table principale, dans l'ordre où les montre

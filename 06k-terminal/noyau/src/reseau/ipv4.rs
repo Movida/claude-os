@@ -31,6 +31,15 @@
 //! Puis le protocole : UDP (udp.rs), ICMP (icmp.rs) ; un autre, ou un
 //! datagramme UDP sans socket, reçoit l'erreur ICMP de Linux.
 //!
+//! Un paquet que nous nous sommes envoyé par lo n'a pas ce tri : comme chez
+//! Linux, il garde la route de sa sortie (`loopback_xmit` ne lâche pas son
+//! `skb_dst`, et `ip_rcv_finish_core` ne cherche pas de route d'entrée à un
+//! paquet qui en a une). Il est pour nous quelle que soit sa destination
+//! (`ip_local_deliver` : par un envoi forcé par lo, une adresse d'ailleurs
+//! aussi, mesuré), une diffusion si sa route l'était, et arrivé par
+//! l'interface de sa route (`inet_iif`) : la carte pour l'adresse de la
+//! carte, lo pour 127.0.0.0/8, l'interface demandée pour un envoi forcé.
+//!
 //! LES COMPTEURS d'IP (/proc/net/snmp, snmp.rs), aux places de Linux :
 //! chaque paquet arrivé (InReceives), avant tout examen ; un en-tête ou une
 //! option faux (InHdrErrors), sauf un paquet plus court que ne le dit un
@@ -51,8 +60,10 @@
 //! celles d'un paquet auquel on répond), complétées une fois
 //! (`ip_options_build` : notre adresse, l'heure, la vraie destination au bout
 //! d'une route source, l'en-tête allant à sa première étape), puis l'interface : `lo` pour une de nos adresses (Linux
-//! aussi : la route locale passe par `lo`), la diffusion d'Ethernet pour
-//! une diffusion, le voisin (ARP) pour le reste. Un paquet plus grand que la MTU
+//! aussi : la route locale passe par `lo`) et pour un envoi forcé par lo
+//! (IP_PKTINFO, IP_UNICAST_IF), sans voisin, le paquet marqué de sa route
+//! (`Sortie`) ; la diffusion d'Ethernet pour une diffusion, le voisin (ARP)
+//! pour le reste. Un paquet plus grand que la MTU
 //! part en fragments, sauf DF (`ip_do_fragment`). Une diffusion envoyée par une
 //! carte est aussi rendue aux sockets de la machine, comme chez Linux, qui en fait
 //! toujours une copie par la boucle (`ip_mc_output` ; IP_MULTICAST_LOOP ne règle que
@@ -61,7 +72,7 @@
 //! (127.255.255.255) n'arrive qu'une fois, comme chez Linux (mesuré).
 
 use super::interface::{self, Interface};
-use super::paquet::Paquet;
+use super::paquet::{Paquet, Sortie};
 use super::snmp::MIB;
 use crate::verrou::Verrou;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -225,26 +236,14 @@ fn martien(i: &Interface, h: &ipv4::Ipv4, table: &Table) -> bool {
 /// Les options du paquet reçu `p` par `i` (son en-tête : `h`), vérifiées
 /// et notées sur place (`ip_options_compile`), sous le verrou de la table :
 /// ce qu'elles notent de nous est l'adresse par laquelle l'émetteur nous
-/// joint (`fib_compute_spec_dst`) : la destination si elle est à nous (pas
-/// une diffusion), sinon la source de la route vers l'émetteur, sinon une
-/// adresse de l'interface (de son réseau d'abord : `inet_select_addr`).
+/// joint (`fib_compute_spec_dst`) : la destination d'un paquet pour une
+/// seule de nos adresses (`locale`), sinon celle que propose la route vers
+/// l'émetteur, ou l'interface (inet::routes, `adresse_pour_repondre`).
 /// None : pas de table.
-fn lire_options(i: &Interface, h: &ipv4::Ipv4, p: &mut Paquet) -> Option<Result<ipv4::Options, ipv4::Faute>> {
+fn lire_options(i: &Interface, h: &ipv4::Ipv4, p: &mut Paquet, locale: bool) -> Option<Result<ipv4::Options, ipv4::Faute>> {
     let garde = TABLE.verrouiller();
     let t = garde.as_ref()?;
-    let de_l_interface = || {
-        t.adresses_de(i.index)
-            .find(|x| ipv4::dans(h.source, x.reseau(), x.prefixe))
-            .or_else(|| t.adresses_de(i.index).next())
-            .map_or(ipv4::AUCUNE, |x| x.adresse)
-    };
-    let adresse = if t.est_a_nous(h.destination) {
-        h.destination
-    } else if h.source[0] != 0 {
-        t.chercher(h.source).map_or_else(de_l_interface, |c| source(&c))
-    } else {
-        de_l_interface()
-    };
+    let adresse = if locale { h.destination } else { t.adresse_pour_repondre(h.source, i.index) };
     let ici = ipv4::Ici { adresse, heure: super::icmp::horodatage(), unicast: &|a| t.est_unicast(a) };
     let entete = p.donnees_mut().get_mut(..h.longueur_entete)?;
     Some(ipv4::compiler_options(entete, &ici))
@@ -279,16 +278,20 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
         }
     }
     // Le tri de la route d'entrée : un martien, ou pour nous (à une de nos
-    // adresses, ou en diffusion), ou pas.
-    let tri = TABLE.verrouiller().as_ref().map(|t| {
-        if martien(i, &h, t) {
-            None
-        } else {
-            let diffusion = t.est_diffusion(i.index, h.destination) || de_rien_a_rien(&h);
-            Some((t.est_a_nous(h.destination) || diffusion, diffusion))
-        }
-    });
-    let (pour_nous, diffusion) = match tri {
+    // adresses, ou en diffusion), ou pas ; arrivé par `i`. Sans tri, ce que
+    // nous nous sommes envoyé par lo (voir l'en-tête) : la route de sa sortie.
+    let tri = match p.sortie() {
+        Some(s) => Some(Some((true, s.diffusion, s.interface))),
+        None => TABLE.verrouiller().as_ref().map(|t| {
+            if martien(i, &h, t) {
+                None
+            } else {
+                let diffusion = t.est_diffusion(i.index, h.destination) || de_rien_a_rien(&h);
+                Some((t.est_a_nous(h.destination) || diffusion, diffusion, i.index))
+            }
+        }),
+    };
+    let (pour_nous, diffusion, interface) = match tri {
         Some(Some(x)) => x,
         Some(None) => return compter(&MARTIENS),
         None => return,
@@ -296,7 +299,7 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
     let mut p = p;
     let mut compilees = ipv4::Options::AUCUNES;
     if h.longueur_entete > ipv4::ENTETE {
-        match lire_options(i, &h, &mut p) {
+        match lire_options(i, &h, &mut p, pour_nous && !diffusion) {
             None => return,
             // Une option fausse : le « problème de paramètre » dit son
             // octet, dans les 8 bits forts de ses 4 octets (`icmp_send`
@@ -318,12 +321,14 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
         return MIB.ip(Ip::InAddrErrors);
     }
     let a_verifier = !i.boucle();
-    livrer(i, h, p, compilees, Arrivee { diffusion, trame_diffusee, a_verifier });
+    livrer(i, h, p, compilees, Arrivee { diffusion, trame_diffusee, a_verifier, interface });
 }
 
 /// Comment un paquet est arrivé : sa destination est une diffusion ; sa trame Ethernet
 /// allait à toutes les machines (jamais d'erreur ICMP en réponse) ; sa somme UDP reste à
-/// calculer en entier (udp.rs, IP_CHECKSUM).
+/// calculer en entier (udp.rs, IP_CHECKSUM) ; l'interface par laquelle on le dit
+/// arrivé (`inet_iif` : celle qui l'a reçu, ou celle de sa route s'il est parti
+/// par lo).
 ///
 /// La dernière est le `CHECKSUM_NONE` de Linux : notre virtio-net ne demande pas à la
 /// carte de vérifier les sommes (VIRTIO_NET_F_GUEST_CSUM), comme une carte sans ce
@@ -335,6 +340,16 @@ struct Arrivee {
     diffusion: bool,
     trame_diffusee: bool,
     a_verifier: bool,
+    interface: u32,
+}
+
+/// Où un datagramme pour nous est arrivé, ce que prépare IP_PKTINFO pour une
+/// socket qui l'a (`ipv4_pktinfo_prepare`, udp.rs) : l'interface (`inet_iif`)
+/// et l'adresse par laquelle l'émetteur nous joint (`fib_compute_spec_dst`).
+#[derive(Clone, Copy)]
+pub struct Lieu {
+    pub interface: u32,
+    pub reponse: [u8; 4],
 }
 
 /// La copie `p` d'une diffusion que nous avons envoyée par la carte `i`
@@ -352,20 +367,20 @@ pub fn recevoir_la_diffusion(i: &'static Interface, p: Paquet) {
     let mut p = p;
     let mut compilees = ipv4::Options::AUCUNES;
     if h.longueur_entete > ipv4::ENTETE {
-        match lire_options(i, &h, &mut p) {
+        match lire_options(i, &h, &mut p, false) {
             None => return,
             Some(Err(_)) => return MIB.ip(Ip::InHdrErrors),
             Some(Ok(o)) if o.route_source != 0 => return compter(&ROUTES_SOURCES),
             Some(Ok(o)) => compilees = o,
         }
     }
-    livrer(i, h, p, compilees, Arrivee { diffusion: true, trame_diffusee: false, a_verifier: false });
+    livrer(i, h, p, compilees, Arrivee { diffusion: true, trame_diffusee: false, a_verifier: false, interface: i.index });
 }
 
 /// Livre aux protocoles le paquet `p` pour nous (son en-tête : `h`, ses options
 /// vérifiées : `compilees`) arrivé par `i` (`ip_local_deliver`).
 fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Options, a: Arrivee) {
-    let Arrivee { diffusion, trame_diffusee, a_verifier } = a;
+    let Arrivee { diffusion, trame_diffusee, a_verifier, interface } = a;
     // Un morceau : ce qui suit ne voit que des paquets entiers (`ip_local_deliver`).
     let (h, mut p, compilees, fragment_max) = if h.est_un_fragment() {
         match recoller(i, &h, Fragment { paquet: p, options: compilees }) {
@@ -395,7 +410,18 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Opti
     MIB.ip(if matches!(h.protocole, ipv4::UDP | ipv4::ICMP | ipv4::TCP) { Ip::InDelivers } else { Ip::InUnknownProtos });
     match h.protocole {
         ipv4::UDP => {
-            if let Err(p) = super::udp::recevoir(i.index, h.source, h.destination, &entete, diffusion, a_verifier, p) {
+            // Ce que préparera IP_PKTINFO : l'adresse par laquelle l'émetteur
+            // nous joint est la destination d'un paquet pour une seule de nos
+            // adresses (ce qui n'est pas pour nous n'arrive pas jusqu'ici),
+            // sinon celle que propose la route vers lui, ou l'interface qui a
+            // reçu le paquet (le `skb->dev` de `fib_compute_spec_dst`).
+            let reponse = if diffusion {
+                avec_table(|t| t.adresse_pour_repondre(h.source, i.index)).unwrap_or(ipv4::AUCUNE)
+            } else {
+                h.destination
+            };
+            let lieu = Lieu { interface, reponse };
+            if let Err(p) = super::udp::recevoir(lieu, h.source, h.destination, &entete, diffusion, a_verifier, p) {
                 injoignable(icmp::PORT, p);
             }
         }
@@ -498,28 +524,20 @@ pub struct Envoi {
     pub destination_finale: [u8; 4],
 }
 
-/// Le chemin vers `destination` (l'`ip_route_output_key` de Linux), et la
+/// Le chemin vers `destination` (l'`ip_route_output_key` de Linux), par
+/// l'interface `oif` si l'envoi en demande une (0 : aucune), et la
 /// destination à mettre dans l'en-tête : 0.0.0.0 veut dire « cette
-/// machine », et devient la source demandée (`source` : celle de `bind`
-/// ou d'IP_PKTINFO), ou sans elle 127.0.0.1, comme
-/// `ip_route_output_key_hash_rcu`. Pas de route : ENETUNREACH.
-pub fn router(destination: [u8; 4], source: Option<[u8; 4]>) -> Result<(Chemin, [u8; 4]), i64> {
-    let destination = if destination == ipv4::AUCUNE {
-        source.filter(|&s| s != ipv4::AUCUNE).unwrap_or(super::boucle::ADRESSE)
-    } else {
-        destination
-    };
-    match TABLE.verrouiller().as_ref().and_then(|t| t.chercher(destination)) {
-        Some(c) => Ok((c, destination)),
-        None => Err(-ENETUNREACH),
+/// machine », et devient la source demandée (`source` : celle de `bind` ou
+/// d'IP_PKTINFO), ou l'adresse que propose l'interface demandée, ou
+/// 127.0.0.1 (inet::routes, `Table::router`, comme
+/// `ip_route_output_key_hash_rcu`). Une interface qui n'existe pas : ENODEV ;
+/// pas de route : ENETUNREACH.
+pub fn router(destination: [u8; 4], source: Option<[u8; 4]>, oif: u32) -> Result<(Chemin, [u8; 4]), i64> {
+    const ENODEV: i64 = 19;
+    if oif != 0 && interface::par_index(oif).is_none() {
+        return Err(-ENODEV);
     }
-}
-
-/// L'adresse source que propose le chemin `c`.
-pub fn source(c: &Chemin) -> [u8; 4] {
-    match *c {
-        Chemin::Locale { source } | Chemin::Diffusion { source, .. } | Chemin::Unicast { source, .. } => source,
-    }
+    TABLE.verrouiller().as_ref().and_then(|t| t.router(destination, source, oif)).ok_or(-ENETUNREACH)
 }
 
 /// Le chemin `c` passe-t-il par `lo` ?
@@ -527,9 +545,10 @@ pub fn par_lo(c: &Chemin) -> bool {
     interface_de(c).is_some_and(|i| i.boucle())
 }
 
-/// L'interface qui porte notre adresse `a`, s'il y en a une.
-pub fn interface_de_l_adresse(a: [u8; 4]) -> Option<u32> {
-    avec_table(|t| t.interface_de(a)).flatten()
+/// `a` est-elle une de nos adresses (le réseau de lo compris, sa diffusion
+/// exceptée) ?
+pub fn est_a_nous(a: [u8; 4]) -> bool {
+    avec_table(|t| t.est_a_nous(a)).unwrap_or(false)
 }
 
 /// L'interface par où part ce qui suit le chemin `c`.
@@ -560,7 +579,7 @@ pub fn mtu_verrouillee(destination: [u8; 4]) -> bool {
 
 /// ICMP dit `info` vers `destination` (`__ip_rt_update_pmtu`).
 pub fn apprendre_mtu(destination: [u8; 4], info: u32) {
-    if let Ok((c, d)) = router(destination, None) {
+    if let Ok((c, d)) = router(destination, None, 0) {
         EXCEPTIONS.verrouiller().apprendre(d, info, mtu(&c), crate::temps::ns_monotone());
     }
 }
@@ -743,11 +762,25 @@ fn envoyer(c: Chemin, e: &Envoi, options: &[u8], mut p: Paquet, decalage: u16, s
     ipv4::ecrire(entete, &en_tete(e, longueur, decalage, suite));
     let Some(i) = interface_de(&c) else { return };
     MIB.ip(Ip::OutTransmits);
+    // Par lo (une de nos adresses, ou un envoi forcé par lo) : pas de voisin
+    // (IFF_NOARP), une adresse matérielle nulle ; et le paquet garde sa route
+    // (voir l'en-tête) : il sera vu arrivé par l'interface de l'entrée locale
+    // trouvée, ou par lo (le `rt_iif` d'un envoi forcé par lo est lo, celui
+    // d'un envoi à 0.0.0.0 sans interface demandée est nul, et `inet_iif`
+    // prend alors l'interface qui reçoit : lo).
+    if i.boucle() {
+        let interface = match c {
+            Chemin::Locale { interface, .. } if interface != 0 => interface,
+            _ => i.index,
+        };
+        p.marquer(Sortie { interface, diffusion: matches!(c, Chemin::Diffusion { .. }) });
+        return super::ethernet::emettre(i, [0; 6], ethernet::IPV4, p);
+    }
     match c {
-        // lo : pas de voisin (IFF_NOARP), une adresse matérielle nulle.
-        Chemin::Locale { .. } => super::ethernet::emettre(i, [0; 6], ethernet::IPV4, p),
         Chemin::Diffusion { .. } => super::ethernet::emettre(i, ethernet::DIFFUSION, ethernet::IPV4, p),
         Chemin::Unicast { prochain, .. } => super::arp::envoyer(i, prochain, p, e.confirmer),
+        // Toujours par lo (`interface_de`), plus haut.
+        Chemin::Locale { .. } => {}
     }
 }
 

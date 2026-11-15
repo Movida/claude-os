@@ -1020,7 +1020,7 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
     if let Some(r) = retenue {
         t.poser_en_file(r.octets(), r.rendu());
     }
-    if let Ok((c, d)) = ipv4::router(ip.vers(distante), Some(source)) {
+    if let Ok((c, d)) = ipv4::router(ip.vers(distante), Some(source), 0) {
         t.verifier_mtu(ipv4::mtu_vers(&c, d));
     }
     let mut a_envoyer: Vec<itcp::Sortant> = Vec::new();
@@ -1080,7 +1080,7 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
 fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, longueur: usize,
                    suivi: Option<(&Arc<Retenue>, u64)>, remplir: impl FnOnce(&mut [u8])) {
     let n = ftcp::longueur_entete(&h.options);
-    let route = ipv4::router(ip.vers(distante), Some(source)).ok().filter(|(c, d)| {
+    let route = ipv4::router(ip.vers(distante), Some(source), 0).ok().filter(|(c, d)| {
         !ip.options.places.stricte
             || matches!(compte, Compte::Reponse { .. })
             || !matches!(c, inet::routes::Chemin::Unicast { prochain, .. } if *prochain != *d)
@@ -1269,7 +1269,7 @@ impl Partie {
             return;
         }
         ipv4::apprendre_mtu(distante, info);
-        let Ok((c, d)) = ipv4::router(distante, None) else { return };
+        let Ok((c, d)) = ipv4::router(distante, None, 0) else { return };
         // (`ip_sk_accept_pmtu`, et IP_PMTUDISC_DONT.)
         let suivre = !matches!(pmtudisc, 0 | 4 | 5);
         t.mtu_reduite(info, ipv4::mtu_vers(&c, d), ipv4::ne_pas_fragmenter(pmtudisc, d), suivre);
@@ -1489,13 +1489,13 @@ fn cle_secrete() -> crypto::siphash::Cle {
 /// 40 (les en-têtes d'IPv4 et de TCP).
 /// Vers cette adresse, un paquet n'attend-il dans aucune carte (`lo`) ?
 fn sans_carte(distante: [u8; 4]) -> bool {
-    ipv4::router(distante, None).is_ok_and(|(c, _)| ipv4::par_lo(&c))
+    ipv4::router(distante, None, 0).is_ok_and(|(c, _)| ipv4::par_lo(&c))
 }
 
 fn mss_vers(distante: [u8; 4]) -> u16 {
     // (`ipv4_default_advmss` : d'après la MTU du chemin, ce qu'on en a appris compris, et au
     // moins `ip_rt_min_advmss`.)
-    match ipv4::router(distante, None) {
+    match ipv4::router(distante, None, 0) {
         Ok((c, d)) => (ipv4::mtu_vers(&c, d).saturating_sub(40)).clamp(256, 65_495) as u16,
         Err(_) => itcp::MSS_DEFAUT,
     }
@@ -1889,9 +1889,9 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 {
                     return Err(super::datagramme::sans_route());
                 }
-                let (chemin, routee) = ipv4::router(ip.vers(a.adresse), liee).map_err(|_| super::datagramme::sans_route())?;
+                let (chemin, routee) = ipv4::router(ip.vers(a.adresse), liee, 0).map_err(|_| super::datagramme::sans_route())?;
                 let destination = if srr { a.adresse } else { routee };
-                let source = liee.unwrap_or_else(|| ipv4::source(&chemin));
+                let source = liee.unwrap_or_else(|| chemin.source());
                 if fipv4::boucle(source) && !ipv4::par_lo(&chemin) {
                     return Err(-EINVAL);
                 }
@@ -2777,7 +2777,7 @@ pub fn mtu_du_chemin(s: &Socket) -> Option<u32> {
     if !matches!(p.mode, Mode::Connexion(_)) {
         return None;
     }
-    ipv4::router(p.adresses.distante, None).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
+    ipv4::router(p.adresses.distante, None, 0).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
 }
 
 /// SO_RCVBUF, qui grandit de même (reception.rs).

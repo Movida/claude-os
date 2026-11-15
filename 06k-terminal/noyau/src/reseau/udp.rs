@@ -187,7 +187,7 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
             None => return Err(-EDESTADDRREQ),
         };
         let c = controle?;
-        envoyer_vers(s, inet, adresse, port, longueur, drapeaux, bouche, &c, remplir)
+        envoyer_vers(s, inet, (adresse, port, nom.is_none()), longueur, drapeaux, bouche, &c, remplir)
     };
     if let Err(e) = envoye
         && (e == -ENOBUFS || s.place_manquee.load(Ordering::Relaxed))
@@ -197,15 +197,17 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     envoye
 }
 
-/// La suite d'`envoyer`, vers `adresse`:`port`, sans bouchon posé. Sans
-/// MSG_MORE ni UDP_CORK, le `Mutex` est lâché pendant l'attente de la place
-/// et la copie (le chemin « sans verrou » d'`udp_sendmsg`), et repris pour
-/// l'en-tête ; avec, il est tenu jusqu'à la pose du bouchon (`lock_sock`).
+/// La suite d'`envoyer`, vers `adresse`:`port` (`connectee` : ceux de la
+/// connexion, sans adresse donnée), sans bouchon posé. Sans MSG_MORE ni
+/// UDP_CORK, le `Mutex` est lâché pendant l'attente de la place et la copie
+/// (le chemin « sans verrou » d'`udp_sendmsg`), et repris pour l'en-tête ;
+/// avec, il est tenu jusqu'à la pose du bouchon (`lock_sock`).
 #[allow(clippy::too_many_arguments)]
-fn envoyer_vers(s: &Arc<Socket>, mut inet: GardeMutex<'_, Inet>, adresse: [u8; 4], port: u16, longueur: usize, drapeaux: u64,
-                bouche: bool, c: &Controle, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
+fn envoyer_vers(s: &Arc<Socket>, mut inet: GardeMutex<'_, Inet>, (adresse, port, connectee): ([u8; 4], u16, bool), longueur: usize,
+                drapeaux: u64, bouche: bool, c: &Controle, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>)
+                -> Result<usize, i64> {
     const MSG_DONTWAIT: u64 = 0x40;
-    let d = datagramme::preparer(s, &mut inet, adresse, udp::ENTETE + longueur, drapeaux, c)?;
+    let d = datagramme::preparer(s, &mut inet, adresse, udp::ENTETE + longueur, drapeaux, c, connectee)?;
     // MSG_PROBE : la route seulement (`preparer`) ; pas de bouchon non plus
     // (la file de Linux reste vide : `pending` revient à 0).
     if drapeaux & datagramme::MSG_PROBE != 0 {
@@ -345,8 +347,9 @@ pub fn fermer(s: &Socket) {
 }
 
 /// Un datagramme UDP (`p` : le segment, en-tête compris, sans l'en-tête
-/// d'IPv4, dont la réception a gardé `entete`) reçu par l'interface
-/// `interface`, pour `destination`, de `source`, dans la tâche du réseau :
+/// d'IPv4, dont la réception a gardé `entete`) arrivé là où dit `lieu`
+/// (ce que préparera IP_PKTINFO), pour `destination`, de `source`, dans la
+/// tâche du réseau :
 /// `__udp4_lib_rcv`, la somme vérifiée (fausse : jeté, sans rien dire,
 /// compté), puis la socket qui le reçoit ; une diffusion à chacune de
 /// celles du port. Sans socket, le segment est rendu, son en-tête remis,
@@ -365,7 +368,7 @@ pub fn fermer(s: &Socket) {
 /// (socket.rs, `somme_lue`). Les deux calculs ne donnent pas toujours la
 /// même valeur pour les mêmes données (des données nulles : 0xFFFFFFFF,
 /// puis 0) : comme chez Linux.
-pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], entete: &ipv4::EnteteRecu, diffusion: bool, a_verifier: bool,
+pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete: &ipv4::EnteteRecu, diffusion: bool, a_verifier: bool,
                 mut p: Paquet) -> Result<(), Paquet> {
     // Choix de conception : la somme vérifiée à l'arrivée, pour tout datagramme.
     // Linux ne la vérifie, pour un datagramme qui a une socket, qu'à sa lecture
@@ -421,7 +424,7 @@ pub fn recevoir(interface: u32, source: [u8; 4], destination: [u8; 4], entete: &
     };
     let _ = p.retirer_entete(udp::ENTETE);
     p.couper(longueur);
-    let arrivee = Arrivee { source, port: u.source, destination, port_destination: u.destination, interface, entete: *entete, somme };
+    let arrivee = Arrivee { source, port: u.source, destination, port_destination: u.destination, lieu, entete: *entete, somme };
     if diffusion {
         // Une copie pour chacune, déposée sous le verrou de la table (son
         // ordre permet de prendre ensuite celui de la file d'une socket) ;
@@ -465,15 +468,19 @@ struct Arrivee {
     port: u16,
     destination: [u8; 4],
     port_destination: u16,
-    interface: u32,
+    lieu: ipv4::Lieu,
     entete: ipv4::EnteteRecu,
     somme: Somme,
 }
 
+/// Le datagramme `p` dans la file de la socket `s`, IP_PKTINFO préparé si
+/// elle l'a à cet instant (`udp_queue_rcv_one_skb`, `ipv4_pktinfo_prepare` :
+/// posé plus tard, la lecture dira l'interface 0 et l'adresse 0.0.0.0).
 fn deposer(s: &Socket, p: Paquet, a: &Arrivee) {
     let taille = p.taille_vraie();
+    let pktinfo = if s.pktinfo.load(Ordering::Relaxed) { (a.lieu.interface, a.lieu.reponse) } else { (0, format_ipv4::AUCUNE) };
     let d = Datagramme {
-        regarde: false, paquet: p, source: a.source, port: a.port, destination: a.destination, interface: a.interface,
+        regarde: false, paquet: p, source: a.source, port: a.port, destination: a.destination, pktinfo,
         entete: a.entete, port_destination: a.port_destination, somme: a.somme, taille,
     };
     // `__udp_queue_rcv_skb`.

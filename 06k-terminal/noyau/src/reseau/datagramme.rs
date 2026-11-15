@@ -78,7 +78,7 @@ pub mod table {
 pub fn diffusion(a: [u8; 4]) -> bool {
     a == format_ipv4::DIFFUSION
         || format_ipv4::multidiffusion(a)
-        || ipv4::avec_table(|t| matches!(t.chercher(a), Some(Chemin::Diffusion { .. }))).unwrap_or(false)
+        || ipv4::avec_table(|t| matches!(t.chercher(a, 0), Some(Chemin::Diffusion { .. }))).unwrap_or(false)
 }
 
 /// L'adresse `a` peut-elle être celle d'un `bind` (`inet_addr_valid_or_nonlocal`) :
@@ -162,8 +162,9 @@ pub fn source_liee(inet: &Inet) -> Option<[u8; 4]> {
 /// la fin de la connexion (`deconnecter`) ; un port éphémère s'il le faut
 /// (AVANT de regarder le reste de l'adresse : EAGAIN) ; moins de 16
 /// octets : EINVAL ; une autre famille : EAFNOSUPPORT ; la route
-/// (`router` : ENETUNREACH, EINVAL, EACCES). Puis l'adresse source de la
-/// route devient l'adresse locale si `bind` n'en avait pas choisi ;
+/// (`router` : ENETUNREACH, EINVAL, EACCES, ENODEV). Puis l'adresse source
+/// de la route devient l'adresse locale si `bind` n'en avait pas choisi ; la
+/// route est gardée (`sk_dst_set`, voir `Inet::route_gardee`) ;
 /// l'identifiant IP de la socket est tiré (l'`inet_id`, `get_random_u16`).
 pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     let Some(famille) = socket::famille(o) else { return Err(-EINVAL) };
@@ -177,11 +178,12 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     if a.famille != AF_INET {
         return Err(-EAFNOSUPPORT);
     }
-    let Trajet { destination: adresse, source, .. } = router(&inet, a.adresse, &Controle::default(), 0, false)?;
+    let Trajet { destination: adresse, source, oif, .. } = router(&inet, a.adresse, &Controle::default(), 0, false, None)?;
     if !inet.adresse_choisie {
         inet.adresse = source;
     }
     inet.source = source;
+    inet.route_gardee = Some(oif);
     inet.distante = adresse;
     inet.port_distant = a.port;
     inet.connecte = true;
@@ -202,6 +204,7 @@ pub fn deconnecter(s: &Arc<Socket>) {
     inet.distante = format_ipv4::AUCUNE;
     inet.port_distant = 0;
     inet.source = format_ipv4::AUCUNE;
+    inet.route_gardee = None;
     if !inet.adresse_choisie {
         inet.adresse = format_ipv4::AUCUNE;
     }
@@ -226,20 +229,22 @@ pub fn pair(s: &Socket) -> Option<([u8; 4], u16)> {
     inet.connecte.then_some((inet.distante, inet.port_distant))
 }
 
-/// La MTU du chemin d'une socket connectée (IP_MTU) ; None : pas
-/// connectée (ENOTCONN).
+/// La MTU de la route gardée d'une socket connectée (IP_MTU : `sk_dst_get`) ;
+/// None : pas de route gardée (ENOTCONN).
 pub fn mtu(s: &Socket) -> Option<u32> {
     let inet = s.appels.verrouiller();
-    if !inet.connecte {
-        return None;
-    }
-    ipv4::router(inet.distante, None).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
+    let oif = inet.route_gardee.filter(|_| inet.connecte)?;
+    ipv4::router(inet.distante, None, oif).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
 }
 
 /// Ce que précisent les messages de contrôle d'un envoi (`ip_cmsg_send`) :
 /// IP_TTL, IP_TOS, et l'adresse source et l'interface d'IP_PKTINFO.
 #[derive(Clone, Copy, Default)]
 pub struct Controle {
+    /// Un message de contrôle d'un autre niveau que SOL_UDP : une socket UDP
+    /// connectée cherche alors une route neuve (`udp_cmsg_send`, puis
+    /// `connected = 0` dans `udp_sendmsg`).
+    pub ip: bool,
     pub ttl: Option<u8>,
     pub tos: Option<u8>,
     pub source: Option<[u8; 4]>,
@@ -258,19 +263,36 @@ pub struct Trajet {
     /// La destination de l'en-tête (0.0.0.0 remplacée), et la source.
     pub destination: [u8; 4],
     pub source: [u8; 4],
+    /// L'interface demandée pour la route (0 : aucune), ce que garde `connect`.
+    pub oif: u32,
 }
 
-/// La route d'un envoi ou d'une connexion vers `destination`, dans l'ordre
-/// d'`ip_route_output_flow` : une source demandée (IP_PKTINFO, celle de
-/// `bind`) de multidiffusion ou de diffusion limitée : EINVAL ; une autre
-/// qui n'est pas à nous (liée par IP_FREEBIND, ou d'IP_PKTINFO) :
-/// ENETUNREACH (`ip_route_output_key_hash_rcu`, mesuré : 0.1.2.3 aussi,
+/// L'interface que demande un envoi (l'`oif` d'`udp_sendmsg`, de
+/// `ping_v4_sendmsg` et d'`__ip4_datagram_connect`) : celle d'IP_PKTINFO si
+/// elle n'est pas nulle ; sinon, vers une multidiffusion, IP_MULTICAST_IF
+/// (`mc_index`), vers le reste, IP_UNICAST_IF (`uc_index`) ; 0 : aucune.
+fn interface_demandee(inet: &Inet, destination: [u8; 4], c: &Controle) -> u32 {
+    match c.interface {
+        Some(k) if k != 0 => k,
+        _ if format_ipv4::multidiffusion(destination) => inet.options.mc_index,
+        _ => inet.options.unicast_if,
+    }
+}
+
+/// La route d'un envoi ou d'une connexion vers `destination`, par
+/// l'interface demandée (`interface_demandee`, ou celle de la route gardée
+/// `gardee`), dans l'ordre d'`ip_route_output_flow` : une source demandée
+/// (IP_PKTINFO, celle de `bind`) de multidiffusion ou de diffusion limitée :
+/// EINVAL ; sans interface demandée, vers une multidiffusion ou la
+/// diffusion limitée, l'interface de cette source, qui doit être à nous (le
+/// « hack de vic/vat » de Linux : une socket liée à 127.0.0.1 diffuse par
+/// lo) : ENETUNREACH sinon ; vers le reste, une source qui n'est pas à nous
+/// (liée par IP_FREEBIND, ou d'IP_PKTINFO) : ENETUNREACH
+/// (`ip_route_output_key_hash_rcu`, mesuré : 0.1.2.3 aussi,
 /// `ipv4_is_zeronet` ne regarde plus que 0.0.0.0), sauf avec
-/// IP_TRANSPARENT (FLOWI_FLAG_ANYSRC), mais pas vers une diffusion ou une
-/// multidiffusion sans interface demandée ; l'interface d'IP_PKTINFO qui
-/// n'existe pas : ENODEV (Linux la prend aussi pour sortie : un écart, nos
-/// routes ne passent que par une interface) ; 0.0.0.0, la source demandée
-/// ou 127.0.0.1 (`ipv4::router`) ; pas de route : ENETUNREACH ; avec
+/// IP_TRANSPARENT (FLOWI_FLAG_ANYSRC) ; l'interface demandée qui n'existe
+/// pas : ENODEV ; 0.0.0.0, la source demandée, celle que propose
+/// l'interface, ou 127.0.0.1 (`ipv4::router`) ; pas de route : ENETUNREACH ; avec
 /// SO_DONTROUTE ou MSG_DONTROUTE, seulement une machine d'un réseau
 /// directement branché (RTO_ONLINK : ENETUNREACH par une passerelle), de
 /// même avec une route source stricte (`stricte`, SSRR : sa première étape
@@ -278,36 +300,39 @@ pub struct Trajet {
 /// source de la boucle (127.0.0.0/8) qui sortirait par une carte : EINVAL
 /// (`__mkroute_output` : l'autre bout la jetterait comme un martien) ; une
 /// diffusion sans SO_BROADCAST : EACCES.
-pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64, stricte: bool) -> Result<Trajet, i64> {
+pub fn router(inet: &Inet, destination: [u8; 4], c: &Controle, drapeaux: u64, stricte: bool, gardee: Option<u32>)
+              -> Result<Trajet, i64> {
     const MSG_DONTROUTE: u64 = 4;
-    const ENODEV: i64 = 19;
+    const ENETUNREACH: i64 = 101;
     let demandee = c.source.filter(|&a| a != format_ipv4::AUCUNE).or_else(|| source_liee(inet));
+    let mut oif = gardee.unwrap_or_else(|| interface_demandee(inet, destination, c));
     if let Some(a) = demandee {
         if format_ipv4::multidiffusion(a) || a == format_ipv4::DIFFUSION {
             return Err(-EINVAL);
         }
-        let vers_diffusion = c.interface.unwrap_or(0) == 0
-            && (format_ipv4::multidiffusion(destination) || destination == format_ipv4::DIFFUSION);
-        if !ipv4::avec_table(|t| t.est_a_nous(a)).unwrap_or(false) && (!inet.options.transparent || vers_diffusion) {
+        if oif == 0 && (format_ipv4::multidiffusion(destination) || destination == format_ipv4::DIFFUSION) {
+            // Linux : « This hack is not just for fun, it allows vic, vat
+            // and friends to work » (des outils de visioconférence, liés à
+            // lo, qui diffusaient avec un TTL nul).
+            oif = ipv4::avec_table(|t| t.interface_locale(a)).flatten().ok_or_else(sans_route)?;
+        } else if !ipv4::est_a_nous(a) && !inet.options.transparent {
             return Err(sans_route());
         }
     }
-    if c.interface.is_some_and(|k| k != 0 && super::interface::par_index(k).is_none()) {
-        return Err(-ENODEV);
-    }
-    let (chemin, destination) = ipv4::router(destination, demandee).map_err(|_| sans_route())?;
+    let (chemin, destination) = ipv4::router(destination, demandee, oif)
+        .map_err(|e| if e == -ENETUNREACH { sans_route() } else { e })?;
     if (inet.options.dontroute || drapeaux & MSG_DONTROUTE != 0 || stricte)
         && matches!(chemin, Chemin::Unicast { prochain, .. } if prochain != destination) {
         return Err(sans_route());
     }
-    let source = demandee.unwrap_or_else(|| ipv4::source(&chemin));
+    let source = demandee.unwrap_or_else(|| chemin.source());
     if format_ipv4::boucle(source) && !ipv4::par_lo(&chemin) {
         return Err(-EINVAL);
     }
     if matches!(chemin, Chemin::Diffusion { .. }) && !inet.options.broadcast {
         return Err(-EACCES);
     }
-    Ok(Trajet { chemin, destination, source })
+    Ok(Trajet { chemin, destination, source, oif })
 }
 
 /// Ce que fixe un envoi quand il commence (le `flowi4` et l'`inet_cork` de
@@ -418,8 +443,19 @@ pub const MSG_PROBE: u64 = 0x10;
 /// aucun paquet (`ip_make_skb` rend NULL, `ip_append_data` 0, avant
 /// `__ip_append_data`), donc ni la taille, ni l'erreur en attente, ni
 /// l'arrêt ne comptent ; l'envoi rend sa longueur sans rien envoyer.
-pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize, drapeaux: u64, c: &Controle) -> Result<Depart, i64> {
+///
+/// `connectee` : un envoi d'UDP sans adresse, sur la connexion. Il reprend
+/// la route qu'a gardée `connect` (`udp_sendmsg` : `sk_dst_check`), sauf
+/// avec un message de contrôle (autre que de SOL_UDP), une route source, la
+/// portée du lien (SO_DONTROUTE, MSG_DONTROUTE), ou vers une
+/// multidiffusion : IP_UNICAST_IF posé après le connect ne compte que pour
+/// un envoi avec une adresse (mesuré). Une socket de ping cherche toujours
+/// une route neuve (`ping_v4_sendmsg`).
+#[allow(clippy::too_many_arguments)]
+pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize, drapeaux: u64, c: &Controle, connectee: bool)
+                -> Result<Depart, i64> {
     const MSG_CONFIRM: u64 = 0x800;
+    const MSG_DONTROUTE: u64 = 4;
     const EPIPE: i64 = 32;
     let options = c.options.unwrap_or(inet.options.ip_options);
     let p = options.places;
@@ -427,7 +463,10 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
         return Err(-EINVAL);
     }
     let vers = if p.route_source != 0 { options.premier_saut } else { destination };
-    let Trajet { chemin, destination: premiere, source } = router(inet, vers, c, drapeaux, p.stricte)?;
+    let garde = connectee && !c.ip && p.route_source == 0 && !inet.options.dontroute && drapeaux & MSG_DONTROUTE == 0
+        && !format_ipv4::multidiffusion(destination);
+    let gardee = if garde { inet.route_gardee } else { None };
+    let Trajet { chemin, destination: premiere, source, .. } = router(inet, vers, c, drapeaux, p.stricte, gardee)?;
     let pmtudisc = inet.options.pmtudisc;
     let d = Depart {
         chemin, source, destination: premiere, mtu: ipv4::mtu_d_envoi(pmtudisc, &chemin, premiere),
