@@ -1641,8 +1641,7 @@ pub fn terminer(code: i32) -> ! {
         if interruptions {
             cpu::activer_interruptions();
         }
-        p.usage().garder(&t.usage);
-        p.fil_termine(t.tid, code);
+        p.fil_termine(t.tid, code, &t.usage);
     }
     // Ce que la tâche a différé : pour un programme, les fichiers que son
     // dernier fil vient de fermer (fil_termine), leurs sockets, maintenant

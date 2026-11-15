@@ -329,10 +329,16 @@ impl Entree {
     /// mesuré sous Linux), puis sa mémoire et ses descripteurs rendus (dans
     /// la tâche qui meurt, interruptions actives : rendre des centaines de
     /// Mio prend du temps). Le processus devient un zombie plus tard, quand
-    /// la pile de son dernier fil est rendue (`fil_disparu`).
-    pub fn fil_termine(&self, tid: u32, code: i32) {
+    /// la pile de son dernier fil est rendue (`fil_disparu`). Ses comptes
+    /// (`usage`) restent au processus au moment même où il quitte la liste,
+    /// sous le verrou du processus (le `__exit_signal` de Linux, sous
+    /// `siglock`) : `rusage::DuProcessus::cumul`, qui additionne les morts
+    /// et les fils de la liste sous ce verrou, ne le compte jamais deux
+    /// fois, ni zéro.
+    pub fn fil_termine(&self, tid: u32, code: i32, usage: &crate::rusage::Compteurs) {
         let fini = {
             let mut garde = self.processus.verrouiller();
+            self.usage.garder(usage);
             let Some(p) = garde.as_mut() else { return };
             let a_reconfier = p.fil(tid).and_then(|f| f.signaux.a_reconfier());
             p.fils.retain(|f| f.tid != tid);

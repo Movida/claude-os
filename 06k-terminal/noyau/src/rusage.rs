@@ -178,7 +178,8 @@ impl DuProcessus {
     }
 
     /// Un fil du processus finit : ses comptes restent au processus (le
-    /// `__exit_signal` de Linux).
+    /// `__exit_signal` de Linux), sous le verrou du processus
+    /// (`processus::Entree::fil_termine`).
     pub fn garder(&self, c: &Compteurs) {
         self.morts.verrouiller().ajouter(c.lire());
     }
