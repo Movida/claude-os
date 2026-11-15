@@ -296,6 +296,7 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
     // filtre refuse la source, jeté sans rien compter ; puis les martiens ;
     // pour nous, comme une diffusion (`ip_route_input_mc`). (Les groupes
     // d'abord, seuls : jamais sous le verrou de la table, multidiffusion.rs.)
+    let de_nous = p.sortie().is_some();
     let tri = match p.sortie() {
         Some(s) if !s.livre => return,
         Some(s) => Some(Some((true, s.diffusion, s.interface))),
@@ -344,7 +345,7 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
         return MIB.ip(Ip::InAddrErrors);
     }
     let a_verifier = !i.boucle();
-    livrer(i, h, p, compilees, Arrivee { diffusion, trame_diffusee, a_verifier, interface });
+    livrer(i, h, p, compilees, Arrivee { diffusion, trame_diffusee, a_verifier, interface, de_nous });
 }
 
 /// Comment un paquet est arrivé : sa destination est une diffusion ; sa trame Ethernet
@@ -364,6 +365,9 @@ struct Arrivee {
     trame_diffusee: bool,
     a_verifier: bool,
     interface: u32,
+    /// Il vient de nous : parti par lo, ou la copie d'un envoi par une
+    /// carte (sa route est celle d'une sortie, `rt_is_output_route`).
+    de_nous: bool,
 }
 
 /// Où un datagramme pour nous est arrivé, ce que prépare IP_PKTINFO pour une
@@ -398,13 +402,13 @@ pub fn recevoir_la_diffusion(i: &'static Interface, p: Paquet) {
             Some(Ok(o)) => compilees = o,
         }
     }
-    livrer(i, h, p, compilees, Arrivee { diffusion: true, trame_diffusee: false, a_verifier: false, interface: i.index });
+    livrer(i, h, p, compilees, Arrivee { diffusion: true, trame_diffusee: false, a_verifier: false, interface: i.index, de_nous: true });
 }
 
 /// Livre aux protocoles le paquet `p` pour nous (son en-tête : `h`, ses options
 /// vérifiées : `compilees`) arrivé par `i` (`ip_local_deliver`).
 fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Options, a: Arrivee) {
-    let Arrivee { diffusion, trame_diffusee, a_verifier, interface } = a;
+    let Arrivee { diffusion, trame_diffusee, a_verifier, interface, de_nous } = a;
     // Un morceau : ce qui suit ne voit que des paquets entiers (`ip_local_deliver`).
     let (h, mut p, compilees, fragment_max) = if h.est_un_fragment() {
         match recoller(i, &h, Fragment { paquet: p, options: compilees }) {
@@ -431,7 +435,7 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Opti
         super::icmp::envoyer_erreur(icmp::INJOIGNABLE, code, 0, p.donnees(), &compilees, i.boucle(), true, trame_diffusee);
     };
     // Livré, même jeté ensuite par le protocole (`ip_protocol_deliver_rcu`).
-    MIB.ip(if matches!(h.protocole, ipv4::UDP | ipv4::ICMP | ipv4::TCP) { Ip::InDelivers } else { Ip::InUnknownProtos });
+    MIB.ip(if matches!(h.protocole, ipv4::UDP | ipv4::ICMP | ipv4::TCP | ipv4::IGMP) { Ip::InDelivers } else { Ip::InUnknownProtos });
     match h.protocole {
         ipv4::UDP => {
             // Ce que préparera IP_PKTINFO : l'adresse par laquelle l'émetteur
@@ -460,6 +464,8 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Opti
         // jamais de TCP : `connect` refuse une diffusion ou un groupe.)
         ipv4::TCP if trame_diffusee => {}
         ipv4::TCP => super::tcp::recevoir(&h, &entete, i, interface, diffusion, p),
+        // Par l'interface qui l'a reçu (le `skb->dev` d'`igmp_rcv`).
+        ipv4::IGMP => super::multidiffusion::recevoir(i.index, p.donnees(), de_nous, trame_diffusee),
         _ => injoignable(icmp::PROTOCOLE, p),
     }
 }

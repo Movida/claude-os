@@ -1,5 +1,5 @@
 //! Les en-têtes des trames du réseau (6g) : Ethernet, ARP, IPv4, ICMP, UDP,
-//! et les messages de DHCP.
+//! et les messages de DHCP (puis TCP, 6h, et IGMP, les soldes d'avant 6k).
 //!
 //! Une trame reçue vient du dehors : n'importe qui sur le réseau peut
 //! l'avoir fabriquée pour faire lire le noyau hors du tampon, ou le faire
@@ -16,6 +16,7 @@ pub mod arp;
 pub mod dhcp;
 pub mod ethernet;
 pub mod icmp;
+pub mod igmp;
 pub mod ipv4;
 pub mod tcp;
 pub mod udp;

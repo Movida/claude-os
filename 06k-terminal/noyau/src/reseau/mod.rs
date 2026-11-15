@@ -79,12 +79,15 @@ pub fn minuteur_tcp_arme() -> bool {
 
 /// Le réseau est-il au repos : plus rien dans une file du noyau (celle de
 /// `lo`, la petite file d'émission d'une carte, la file d'un voisin qui se
-/// cherche), ni de travail en attente ou en cours de la tâche du réseau ?
+/// cherche), ni de travail en attente ou en cours de la tâche du réseau, ni
+/// de rapport d'IGMP à faire (les groupes qu'un programme a quittés en
+/// finissant sont annoncés pendant une seconde environ, gardés jusque-là) ?
 /// Le lanceur l'attend avant de mesurer la mémoire rendue par un
 /// programme : un paquet qu'il a envoyé peut encore être en route, et tenir
 /// de la mémoire, quand il finit.
 pub fn au_repos() -> bool {
     boucle::au_repos() && virtio_net::au_repos() && !arp::en_attente() && tache::au_repos() && tcp::orphelines() == 0
+        && multidiffusion::au_repos()
 }
 
 /// Configure le réseau par DHCP, et attend la fin : dans le lanceur, avant

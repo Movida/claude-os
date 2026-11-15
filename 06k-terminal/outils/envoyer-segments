@@ -5,9 +5,10 @@
 # segments TCP auxquels elle doit répondre comme Linux répond sans socket
 # (`ip_send_unicast_reply`) : le TOS du segment sans ses bits ECN, le TTL
 # du système (64), l'écho de ses options. Le Makefile lit les réponses dans
-# l'enregistrement de la carte (outils/segments-tcp.awk). Puis deux erreurs
-# ICMP pour la socket UDP de `reseau carte` (linux/reseau.c), qui y lit
-# leurs extensions (RFC 4884).
+# l'enregistrement de la carte (outils/segments-tcp.awk). Puis de la
+# multidiffusion et des requêtes d'IGMP, et deux erreurs ICMP pour la
+# socket UDP de `reseau carte` (linux/reseau.c), qui y lit leurs extensions
+# (RFC 4884).
 #   outils/envoyer-segments PORT    (PORT : le local.port de -netdev dgram)
 # slirp doit d'abord être débranché (set_link) : il prendrait les réponses
 # pour une connexion à faire suivre, et défairait la fille par un RST.
@@ -43,6 +44,30 @@ trame -v genre=tcp -v tos=19 -v ttl=50 -v source=40001 -v destination=4001 -v se
 # ACK (`tcp_v4_reqsk_send_ack`), TOS 0x10 et TTL 64 aussi ; des données,
 # pour que la limite des ACK hors fenêtre ne le retienne pas.
 trame -v genre=tcp -v tos=19 -v ttl=50 -v source=40001 -v destination=4001 -v seq=501001 -v drapeaux=8 -v donnees=1
+# La multidiffusion (`reseau carte` a adhéré à 239.1.2.3, port 4003) : un
+# datagramme de 6 octets pour le groupe, dans une trame pour son adresse
+# Ethernet (01:00:5e:01:02:03), qu'il reçoit ; un pour 239.1.2.4, qu'il n'a
+# pas : rien.
+trame -v genre=udp -v ttl=64 -v vers=239.1.2.3 -v mac=01005e010203 -v source=4444 -v destination=4003 -v donnees=6
+trame -v genre=udp -v ttl=64 -v vers=239.1.2.4 -v mac=01005e010204 -v source=4444 -v destination=4003 -v donnees=6
+# Deux diffusions (255.255.255.255) de somme fausse, vers un port que
+# personne n'écoute : de 38 octets, vérifiée aussitôt (CHECKSUM_BREAK : 76
+# octets), InCsumErrors et InErrors ; de 208, IgnoredMulti seulement
+# (`__udp4_lib_mcast_deliver` ne la vérifie pas). `reseau carte` lit les
+# compteurs dans /proc/net/snmp.
+trame -v genre=udp -v ttl=64 -v vers=255.255.255.255 -v mac=ffffffffffff -v source=4444 -v destination=4009 -v donnees=30 \
+      -v faussee=1
+trame -v genre=udp -v ttl=64 -v vers=255.255.255.255 -v mac=ffffffffffff -v source=4444 -v destination=4009 -v donnees=200 \
+      -v faussee=1
+# IGMP : une requête v3 générale (vers 224.0.0.1, TTL 1, l'alerte aux
+# routeurs ; délai 0,1 s, QRV 2, QQIC 125 s) : le rapport de l'état courant,
+# IS_EX {} pour 239.1.2.3 ; puis une requête v2 (8 octets, délai 0,1 s) :
+# la machine parle v2 (260 s), et son rapport v2 va au groupe. Le Makefile
+# les lit dans l'enregistrement de la carte (outils/igmp.awk), `reseau
+# carte` dans /proc/net/igmp.
+trame -v genre=igmp -v ttl=1 -v options=94040000 -v vers=224.0.0.1 -v mac=01005e000001 -v type=17 -v code=1 -v v3=1 -v qrv=2 \
+      -v qqic=125
+trame -v genre=igmp -v ttl=1 -v options=94040000 -v vers=224.0.0.1 -v mac=01005e000001 -v type=17 -v code=1
 # Deux redirections (5, 1) qui citent un en-tête de 4 mots : Linux les
 # passe au protocole cité, qui lit ses « ports » dans l'en-tête lui-même et
 # n'y trouve aucune socket ; UDP le compte (Icmp InErrors), ping non.

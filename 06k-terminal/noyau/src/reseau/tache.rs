@@ -21,7 +21,8 @@
 //! par trame.
 //!
 //! Les minuteurs du réseau : une échéance par objet (la table des voisins, arp.rs ; les
-//! sockets TCP et les entrées de TIME_WAIT, tcp.rs ; les fragments, ipv4.rs), dans la roue de Linux
+//! sockets TCP et les entrées de TIME_WAIT, tcp.rs ; les fragments, ipv4.rs ; IGMP,
+//! multidiffusion.rs), dans la roue de Linux
 //! (../roue) ; quelques-unes, qui n'attendent pas son tic, dans une liste exacte
 //! (inet::echeances). La tâche dort jusqu'à la plus proche, ou un réveil, et fait le travail
 //! des objets échus.
@@ -142,6 +143,11 @@ const MAX_PRECISES: usize = 64;
 pub const OBJET_VOISINS: u64 = u64::MAX;
 /// L'objet « files de fragments » (ipv4.rs).
 pub const OBJET_FRAGMENTS: u64 = u64::MAX - 1;
+/// L'objet « IGMP » (multidiffusion.rs) : la plus proche des échéances de
+/// toutes les interfaces. Linux a un minuteur par interface et par groupe ;
+/// ici, une échéance pour l'ensemble suffit : un seul verrou les garde tous
+/// (`GROUPES`), et il n'y a que quelques interfaces.
+pub const OBJET_IGMP: u64 = u64::MAX - 2;
 
 /// Fait les échéances. Au démarrage, avant la tâche.
 pub fn initialiser() {
@@ -268,6 +274,8 @@ fn boucle() {
                 voisins = true;
             } else if objet == OBJET_FRAGMENTS {
                 super::ipv4::fragments_echus();
+            } else if objet == OBJET_IGMP {
+                super::multidiffusion::temps();
             } else if !super::tcp::echeance(objet) {
                 // Ni une connexion TCP, ni une entrée de TIME_WAIT : une
                 // socket de datagrammes, sa place rendue (paquet.rs).

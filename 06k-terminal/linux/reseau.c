@@ -3329,6 +3329,15 @@ static int carte(void)
         || setsockopt(x, IPPROTO_IP, IP_RECVERR, &un, sizeof un) != 0
         || setsockopt(x, IPPROTO_IP, IP_RECVERR_RFC4884, &un, sizeof un) != 0)
         return printf("[linux] reseau carte : la socket des erreurs : ECHEC (%s)\n", strerror(errno)), 1;
+    /* Une adhésion à 239.1.2.3 (port 4003), par la carte (la route vers les
+     * groupes, que le DHCP a donnée avant le lancement) : la machine
+     * l'annonce aux routeurs, deux rapports IGMPv3 TO_EX {} (le Makefile les
+     * lit dans l'enregistrement de la carte, outils/igmp.awk). */
+    int m = udp(0);
+    struct sockaddr_in ma = adresse(0, 4003);
+    struct ip_mreqn mr = { .imr_multiaddr.s_addr = inet_addr("239.1.2.3") };
+    if (bind(m, (struct sockaddr *)&ma, sizeof ma) != 0 || setsockopt(m, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof mr) != 0)
+        return printf("[linux] reseau carte : l'adhesion : ECHEC (%s)\n", strerror(errno)), 1;
     printf("[linux] reseau carte : en attente\n");
     fflush(stdout);
     static unsigned char o[4000];
@@ -3397,6 +3406,7 @@ static int carte(void)
      * programme commence après les en-têtes IPv4 et UDP de la copie : 100
      * octets, puis les 12 des extensions. */
     long icmp_fautes = compteur_snmp("Icmp: ", "InErrors");
+    long ignorees = compteur_snmp("Udp: ", "IgnoredMulti"), sommes = compteur_snmp("Udp: ", "InCsumErrors"), fautes = compteur_snmp("Udp: ", "InErrors");
     printf("[linux] reseau carte : en attente des segments\n");
     fflush(stdout);
     struct sock_extended_err ee[2] = { 0 };
@@ -3419,12 +3429,42 @@ static int carte(void)
     if (lu[0] != 112 || lu[1] != 112 || ee[0].ee_data != 0x64 || ee[1].ee_data != 0x10064)
         printf("[linux] reseau :   lu %ld et %ld, ee_data %#x et %#x\n", lu[0], lu[1], ee[0].ee_data, ee[1].ee_data);
     close(x);
+    /* Avant ces erreurs, le scénario a envoyé de la multidiffusion et des
+     * requêtes d'IGMP : un datagramme de 10.0.2.77 pour 239.1.2.3 (m le
+     * reçoit), un pour 239.1.2.4 (la machine n'en est pas membre : rien) ;
+     * une requête v3 générale, puis une requête v2 (délai 0,1 s chacune) :
+     * le routeur de la carte est noté v2, et notre rapport v2 sur 239.1.2.3
+     * fait de nous le rapporteur (/proc/net/igmp ; les rapports eux-mêmes,
+     * le Makefile les lit dans l'enregistrement). */
+    char mc[16];
+    ssize_t k = recv(m, mc, sizeof mc, MSG_DONTWAIT);
+    int ok_mc = k == 6 && memcmp(mc, "xxxxxx", 6) == 0;
+    ok_mc = ok_mc && recv(m, mc, sizeof mc, MSG_DONTWAIT) < 0 && errno == EAGAIN;
+    verifier(ok_mc, "carte, multidiffusion : le datagramme pour notre groupe recu, pas celui d'un autre");
+    /* Deux diffusions de somme fausse, que personne n'écoute : celle de 38
+     * octets vérifiée à l'arrivée, celle de 208 jamais (IgnoredMulti). */
+    ignorees = compteur_snmp("Udp: ", "IgnoredMulti") - ignorees;
+    sommes = compteur_snmp("Udp: ", "InCsumErrors") - sommes;
+    fautes = compteur_snmp("Udp: ", "InErrors") - fautes;
+    verifier(ignorees == 1 && sommes == 1 && fautes == 1,
+             "carte, diffusions de somme fausse : 38 octets, InCsumErrors et InErrors ; 208 octets, IgnoredMulti");
+    if (ignorees != 1 || sommes != 1 || fautes != 1)
+        printf("[linux] reseau :   IgnoredMulti %ld, InCsumErrors %ld, InErrors %ld\n", ignorees, sommes, fautes);
     /* Deux redirections qui citent un en-tête de 4 mots : UDP, qui n'y
      * trouve pas de socket, la compte (Icmp InErrors) ; ping, non. */
     icmp_fautes = compteur_snmp("Icmp: ", "InErrors") - icmp_fautes;
     verifier(icmp_fautes == 1, "carte, redirections d'un en-tete de 4 mots : UDP compte InErrors, ping non");
     if (icmp_fautes != 1)
         printf("[linux] reseau :   Icmp InErrors %ld\n", icmp_fautes);
+    char proc_igmp[1024];
+    contenu("/proc/net/igmp", proc_igmp, sizeof proc_igmp);
+    ok_mc = strstr(proc_igmp, "eth0      :     2      V2\n\t\t\t\t030201EF     1 0:00000000\t\t1\n") != NULL;
+    verifier(ok_mc, "carte, IGMP : le routeur v2 entendu, notre rapport v2 fait (/proc/net/igmp)");
+    if (!ok_mc)
+        printf("[linux] reseau :   %s", proc_igmp);
+    /* Le départ : en v2, et rapporteur, la machine l'annonce tout de suite
+     * (vers 224.0.0.2 : le dernier message que lit le Makefile). */
+    close(m);
     printf("[linux] reseau carte : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     fflush(stdout);
     /* L'écoute reste ouverte jusqu'à l'arrêt de la machine : sa fille

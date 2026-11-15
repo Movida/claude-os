@@ -5,7 +5,7 @@
 //! bonne raison ; puis des mutations au hasard, à graine fixe : aucune
 //! panique, et ce qui est accepté reste dans les octets reçus.
 
-use formats::reseau::{self, Erreur, arp, dhcp, ethernet, icmp, ipv4, plier, somme, somme_linux, somme_linux_moins, tcp, udp};
+use formats::reseau::{self, Erreur, arp, dhcp, ethernet, icmp, igmp, ipv4, plier, somme, somme_linux, somme_linux_moins, tcp, udp};
 use std::path::PathBuf;
 
 fn trame(nom: &str) -> Vec<u8> {
@@ -809,4 +809,46 @@ fn tcp_mutations() {
         m.truncate((x >> 40) as usize % (base.len() + 1));
         let _ = tcp::lire(&m, s, d, x & 1 == 0);
     }
+}
+
+/// IGMP : un rapport v3 de Linux (le premier du cas a de la sonde, sur la
+/// carte : TO_EX {} pour 239.1.2.3), relu enregistrement par enregistrement ;
+/// les délais codés de la RFC 3376 ; les requêtes trop courtes, ou qui
+/// annoncent plus de sources qu'elles n'en portent.
+#[test]
+fn igmp() {
+    let rapport = [0x22, 0x00, 0xe8, 0xf9, 0, 0, 0, 1, 4, 0, 0, 0, 239, 1, 2, 3];
+    let m = igmp::lire(&rapport).unwrap();
+    assert_eq!(m.genre, igmp::RAPPORT_V3);
+    let e: Vec<_> = igmp::enregistrements(&rapport).unwrap().map(|x| (x.genre, x.groupe, x.sources().count())).collect();
+    assert_eq!(e, vec![(igmp::VERS_EXCLURE, [239, 1, 2, 3], 0)]);
+    // Le même, écrit par nous.
+    let mut o = igmp::RAPPORT_V3_VIDE.to_vec();
+    o.extend_from_slice(&igmp::enregistrement(igmp::VERS_EXCLURE, [239, 1, 2, 3]));
+    igmp::compter_un_enregistrement(&mut o);
+    igmp::sceller(&mut o);
+    assert_eq!(o, rapport);
+    let mut faux = rapport;
+    faux[12] ^= 1;
+    assert_eq!(igmp::lire(&faux), Err(Erreur::Somme));
+    assert_eq!(igmp::lire(&rapport[..7]), Err(Erreur::Tronque));
+    // Un enregistrement qui annonce une source de trop.
+    let mut long = rapport;
+    long[11] = 1;
+    igmp::sceller(&mut long);
+    assert!(igmp::enregistrements(&long).is_err());
+    // Les délais : tels quels sous 128, puis mantisse et exposant.
+    assert_eq!([0, 20, 127, 128, 0x8f, 0xff].map(igmp::duree), [0, 20, 127, 128, 248, 31744]);
+    // Une requête v3 générale : 12 octets, QRV dans les 3 bits bas.
+    let mut q = [0x11, 100, 0, 0, 0, 0, 0, 0, 0x0a, 125, 0, 1, 10, 0, 0, 1];
+    igmp::sceller(&mut q);
+    let r = igmp::lire_requete_v3(&q).unwrap();
+    assert_eq!((r.qrv, r.qqic, r.nombre()), (2, 125, 1));
+    assert_eq!(r.sources().collect::<Vec<_>>(), vec![[10, 0, 0, 1]]);
+    assert!(igmp::lire_requete_v3(&q[..12]).is_err());
+    assert!(igmp::lire_requete_v3(&q[..11]).is_err());
+    // Un message v2 : 8 octets, la somme juste.
+    let mut d = [0u8; igmp::ENTETE];
+    igmp::ecrire(&mut d, igmp::DEPART, [239, 9, 9, 9]);
+    assert_eq!(igmp::lire(&d).unwrap(), igmp::Igmp { genre: igmp::DEPART, code: 0, groupe: [239, 9, 9, 9] });
 }

@@ -28,8 +28,18 @@ fn demande(groupe: [u8; 4], adresse: [u8; 4], index: u32) -> Demande {
     Demande { groupe, adresse, index }
 }
 
+/// Le hasard et la MTU de la machine : sans importance ici (aucun test de
+/// ce fichier ne regarde les rapports d'IGMP, `tests/igmp.rs`).
+fn zero(_: u32) -> u32 {
+    0
+}
+
+fn mtu(_: u32) -> u32 {
+    1500
+}
+
 fn machine() -> Groupes {
-    let mut g = Groupes::new();
+    let mut g = Groupes::new(zero, mtu);
     g.monter(ETH).unwrap();
     g.monter(LO).unwrap();
     g
@@ -372,7 +382,7 @@ fn la_place_rendue() {
 /// Une interface ne monte qu'une fois ; elles sont rangées par index.
 #[test]
 fn monter() {
-    let mut g = Groupes::new();
+    let mut g = Groupes::new(zero, mtu);
     g.monter(3).unwrap();
     g.monter(1).unwrap();
     g.monter(3).unwrap();

@@ -1,7 +1,8 @@
 # Fabrique une trame Ethernet à envoyer à la machine par la socket UDP de
 # QEMU (`-netdev dgram`, make tests-qemu, test-carte), d'une machine du
 # réseau de slirp que slirp n'a pas : 10.0.2.77, d'adresse Ethernet
-# 52:54:00:00:00:4d, vers la machine (10.0.2.15, 52:54:00:12:34:56).
+# 52:54:00:00:00:4d, vers la machine (10.0.2.15, 52:54:00:12:34:56), ou
+# vers un groupe (`vers`, `mac`).
 # Écrit ses octets en \xHH, que le printf de bash rend tels quels :
 #   printf "$(awk -v genre=tcp -v seq=1000 ... -f trame.awk)" >&3
 # awk plutôt qu'un outil de plus (python, scapy) : la CI n'a que sh, awk
@@ -15,6 +16,10 @@
 #            nous crée l'entrée de qui la pose), sans qu'il ait à le
 #            demander ; « tcp » : un segment TCP ; « icmp » : une erreur
 #            ICMP pour un datagramme UDP de la machine vers 10.0.2.77 ;
+#            « udp » : un datagramme ; « igmp » : un message d'IGMP (une
+#            requête du routeur) ;
+#   vers, mac : la destination IPv4 et Ethernet (en hexadécimal, 12
+#            chiffres) : 10.0.2.15 et 52:54:00:12:34:56 sans elles ;
 #   tos, ttl le TOS et le TTL de l'en-tête IPv4 ;
 #   options  les options IPv4, en hexadécimal (une longueur multiple de 4
 #            octets, bourrage compris) ;
@@ -25,9 +30,15 @@
 #   type, code, longueur : pour icmp, le genre et le code du message, et
 #            son octet 5 (RFC 4884 : la longueur de la copie d'origine, en
 #            mots de 32 bits ; la copie est complétée de zéros jusque-là) ;
+#            pour igmp, le genre (17 : une requête) et le code (le délai de
+#            réponse, en dixièmes de seconde) ;
+#   groupe, v3, qrv, qqic : pour igmp, le groupe du message (0.0.0.0
+#            sans lui) ; v3=1 : une requête v3 (12 octets, sans source), de
+#            QRV et QQIC donnés ;
 #   extension : pour icmp, ce qui suit la copie, en hexadécimal ; « xxxx »
 #            à la place des octets 2 et 3 : la somme des extensions,
 #            calculée, fausse (la juste plus un) si faussee=1 ;
+#   faussee  pour udp aussi : sa somme fausse (la juste plus un) ;
 #   ihl, cite : pour icmp, la longueur de l'en-tête cité, en mots (5 sans
 #            elle), et son protocole (17, UDP, sans lui).
 function octet(v) { o[n++] = v % 256 }
@@ -45,17 +56,24 @@ function somme(debut, fin, depart, s, i) {
     return 65535 - s
 }
 function hexa(c) { return index("0123456789abcdef", tolower(c)) - 1 }
+# Les deux mots de 16 bits d'une adresse, additionnés (le pseudo-en-tête).
+function pseudo(a, p) { split(a, p, "."); return p[1] * 256 + p[2] + p[3] * 256 + p[4] }
 BEGIN {
     n = 0
+    if (vers == "")
+        vers = "10.0.2.15"
+    if (mac == "")
+        mac = "525400123456"
     # Ethernet : la destination, la source, le type.
-    split("52 54 00 12 34 56 52 54 00 00 00 4d", m, " ")
-    for (i = 1; i <= 12; i++) octet(hexa(substr(m[i], 1, 1)) * 16 + hexa(substr(m[i], 2, 1)))
+    for (i = 0; i < 6; i++) octet(hexa(substr(mac, 2 * i + 1, 1)) * 16 + hexa(substr(mac, 2 * i + 2, 1)))
+    split("52 54 00 00 00 4d", m, " ")
+    for (i = 1; i <= 6; i++) octet(hexa(substr(m[i], 1, 1)) * 16 + hexa(substr(m[i], 2, 1)))
     if (genre == "arp") {
         # ARP (RFC 826) : Ethernet (1), IPv4 (0x0800), 6 et 4 octets, une
         # requête (1) ; qui la pose, puis qui est cherché (adresse Ethernet
         # inconnue : des zéros).
         mot(2054); mot(1); mot(2048); octet(6); octet(4); mot(1)
-        for (i = 7; i <= 12; i++) octet(hexa(substr(m[i], 1, 1)) * 16 + hexa(substr(m[i], 2, 1)))
+        for (i = 1; i <= 6; i++) octet(hexa(substr(m[i], 1, 1)) * 16 + hexa(substr(m[i], 2, 1)))
         adresse("10.0.2.77")
         for (i = 0; i < 6; i++) octet(0)
         adresse("10.0.2.15")
@@ -64,14 +82,19 @@ BEGIN {
         lo = length(options) / 2
         # IPv4 : version 4 et la longueur de l'en-tête en mots, le TOS, la
         # longueur totale (plus bas), l'identifiant, ni fragment ni DF, le
-        # TTL, ICMP (1) ou TCP (6), la somme (plus bas), les adresses, les
-        # options.
+        # TTL, ICMP (1), IGMP (2), TCP (6) ou UDP (17), la somme (plus bas),
+        # les adresses, les options.
         ip = n
-        octet(64 + 5 + lo / 4); octet(tos + 0); mot(0); mot(1); mot(0); octet(ttl + 0); octet(genre == "icmp" ? 1 : 6); mot(0)
-        adresse("10.0.2.77"); adresse("10.0.2.15")
+        protocole = genre == "icmp" ? 1 : genre == "igmp" ? 2 : genre == "udp" ? 17 : 6
+        octet(64 + 5 + lo / 4); octet(tos + 0); mot(0); mot(1); mot(0); octet(ttl + 0); octet(protocole); mot(0)
+        adresse("10.0.2.77"); adresse(vers)
         for (i = 0; i < lo; i++) octet(hexa(substr(options, 2 * i + 1, 1)) * 16 + hexa(substr(options, 2 * i + 2, 1)))
         if (genre == "icmp")
             icmp()
+        else if (genre == "igmp")
+            igmp()
+        else if (genre == "udp")
+            udp()
         else
             tcp()
         # La longueur totale, puis la somme de l'en-tête.
@@ -127,6 +150,31 @@ function icmp(t, c, x, s, i, h) {
             o[x + 2] = int(s / 256); o[x + 3] = s % 256
         }
         # La somme du message entier.
+        s = somme(t, n, 0)
+        o[t + 2] = int(s / 256); o[t + 3] = s % 256
+}
+# Un datagramme UDP de 10.0.2.77 vers `vers`, de `donnees` octets (des
+# « x »), sa somme faite (0 s'écrit 0xFFFF : « pas de somme » sinon).
+function udp(t, s, i, lu) {
+        lu = 8 + donnees
+        t = n
+        mot(source + 0); mot(destination + 0); mot(lu); mot(0)
+        for (i = 0; i < donnees; i++) octet(120)
+        s = somme(t, n, pseudo("10.0.2.77") + pseudo(vers) + 17 + lu)
+        if (s == 0)
+            s = 65535
+        if (faussee == 1)
+            s = s % 65535 + 1
+        o[t + 6] = int(s / 256); o[t + 7] = s % 256
+}
+# Un message d'IGMP (RFC 2236 et 3376) : le genre, le code, la somme, le
+# groupe ; pour une requête v3, en plus : QRV (S nul), QQIC, aucune source.
+function igmp(t, s) {
+        t = n
+        octet(type + 0); octet(code + 0); mot(0); adresse(groupe != "" ? groupe : "0.0.0.0")
+        if (v3) {
+            octet(qrv + 0); octet(qqic + 0); mot(0)
+        }
         s = somme(t, n, 0)
         o[t + 2] = int(s / 256); o[t + 3] = s % 256
 }

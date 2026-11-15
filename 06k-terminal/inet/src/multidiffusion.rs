@@ -23,10 +23,14 @@
 //! l'adresse donnée, sinon celle de la route vers le groupe), et tient le
 //! verrou qui fait de chaque opération un tout (le `rtnl_lock` de Linux).
 //!
-//! Ce qu'ajoute IGMP (les rapports, les requêtes, l'état qu'ils demandent :
-//! le `CONFIG_IP_MULTICAST` de Linux) n'est pas encore ici : ce module est
-//! igmp.c sans lui. Un groupe n'est donc annoncé à personne, ce qui suffit
-//! au réseau local de QEMU, que le pilote laisse tout entendre.
+//! Ce qu'ajoute IGMP (les rapports aux routeurs, leurs requêtes, les
+//! minuteurs : le `CONFIG_IP_MULTICAST` de Linux) est dans le module
+//! `igmp`. Ici n'en restent que les lignes qu'il ajoute aux fonctions des
+//! filtres (`sf_markstate` et `sf_setstate` autour de chaque changement,
+//! les sources parties gardées pour les rapports), à leur place, comme
+//! chez Linux : chaque changement de filtre décide de ce que diront les
+//! rapports suivants. Les rapports ne partent pas d'ici : ils attendent
+//! dans `Groupes::envois`, que le noyau prend une fois son verrou lâché.
 //!
 //! Choix de conception : les deux côtés dans une même bibliothèque. Chaque
 //! opération d'une socket change le filtre de l'interface dans un ordre
@@ -43,11 +47,18 @@
 //! (`____ip_mc_inc_group` : la socket adhère, l'interface n'a pas le
 //! groupe), et celle d'une source ajoutée (`ip_mc_source` n'en regarde pas
 //! le résultat) : la socket et l'interface ne disent plus la même chose. Ici,
-//! la place est prise avant, puis tout est fait.
+//! la place est prise avant, puis tout est fait. Seuls les souvenirs
+//! d'IGMP (une source ou un groupe partis, que les rapports suivants
+//! annonceront) restent sans place réservée, comme chez Linux : leur
+//! allocation qui échoue fait perdre un enregistrement à un rapport, comme
+//! un paquet perdu en route, mais ce qui entre ne dépend jamais d'eux.
+
+mod igmp;
 
 use alloc::vec::Vec;
 use faillible::VecFaillible;
 use formats::reseau::ipv4;
+pub use igmp::{Envoi, HZ};
 
 /// Le plus d'adhésions d'une socket (`igmp_max_memberships`).
 pub const MAX_ADHESIONS: usize = 20;
@@ -206,8 +217,8 @@ impl Adhesions {
             return Err(Refus::PlusDePlace);
         }
         self.entrees.try_reserve(1).map_err(|_| Refus::PlusDePlace)?;
-        let i = groupes.interface_mut(k).ok_or(Refus::PasDInterface)?;
-        i.inc_group(d.groupe, mode)?;
+        let (i, mut c) = groupes.interface_mut(k).ok_or(Refus::PasDInterface)?;
+        i.inc_group(d.groupe, mode, &mut c)?;
         self.entrees.ajouter_dans_la_place(Adhesion { groupe: d.groupe, adresse: d.adresse, interface: k, mode, liste: None });
         Ok(k)
     }
@@ -244,9 +255,9 @@ impl Adhesions {
     fn retirer(&mut self, groupes: &mut Groupes, p: usize) {
         let e = self.entrees.remove(p);
         self.entrees.rendre_la_place();
-        if let Some(i) = groupes.interface_mut(e.interface) {
-            i.del_src(e.groupe, e.mode, e.sources(), false);
-            i.dec_group(e.groupe);
+        if let Some((i, mut c)) = groupes.interface_mut(e.interface) {
+            i.del_src(e.groupe, e.mode, e.sources(), false, &mut c);
+            i.dec_group(e.groupe, &mut c);
         }
     }
 
@@ -268,15 +279,15 @@ impl Adhesions {
         }
         let Some(k) = trouvee else { return Err(Refus::PasDInterface) };
         let Some(p) = self.trouver(d.groupe, k) else { return Err(Refus::Invalide) };
-        let i = groupes.interface_mut(k).ok_or(Refus::PasDInterface)?;
+        let (i, mut c) = groupes.interface_mut(k).ok_or(Refus::PasDInterface)?;
         let e = &mut self.entrees[p];
         if e.liste.is_some() {
             if e.mode != mode {
                 return Err(Refus::Invalide);
             }
         } else if e.mode != mode {
-            let _ = i.add_src(d.groupe, mode, &[], false);
-            i.del_src(d.groupe, e.mode, &[], false);
+            let _ = i.add_src(d.groupe, mode, &[], false, &mut c);
+            i.del_src(d.groupe, e.mode, &[], false, &mut c);
             e.mode = mode;
         }
         if !ajout {
@@ -287,7 +298,7 @@ impl Adhesions {
                 self.retirer(groupes, p);
                 return Ok(());
             }
-            i.del_src(d.groupe, mode, &[source], true);
+            i.del_src(d.groupe, mode, &[source], true, &mut c);
             l.sources.copy_within(j + 1..l.n, j);
             l.n -= 1;
             return Ok(());
@@ -299,7 +310,7 @@ impl Adhesions {
         if l.position(source).is_some() {
             return Err(Refus::Introuvable);
         }
-        i.add_src(d.groupe, mode, &[source], true)?;
+        i.add_src(d.groupe, mode, &[source], true, &mut c)?;
         let l = e.liste.get_or_insert(Liste::VIDE);
         l.sources[l.n] = source;
         l.n += 1;
@@ -351,10 +362,10 @@ impl Adhesions {
         if sources.len() > MAX_SOURCES {
             return Err(Refus::PlusDePlace);
         }
-        let i = groupes.interface_mut(k).ok_or(Refus::PasDInterface)?;
-        i.add_src(d.groupe, mode, sources, false)?;
+        let (i, mut c) = groupes.interface_mut(k).ok_or(Refus::PasDInterface)?;
+        i.add_src(d.groupe, mode, sources, false, &mut c)?;
         let e = &mut self.entrees[p];
-        i.del_src(d.groupe, e.mode, e.sources(), false);
+        i.del_src(d.groupe, e.mode, e.sources(), false, &mut c);
         e.liste = if sources.is_empty() { None } else { Some(Liste::de(sources)) };
         e.mode = mode;
         Ok(())
@@ -412,14 +423,26 @@ impl Adhesions {
 }
 
 /// Une source du filtre d'un groupe d'une interface (`ip_sf_list`) : les
-/// sockets qui l'incluent, et celles qui l'excluent.
+/// sockets qui l'incluent, et celles qui l'excluent ; pour IGMP, ce qu'il
+/// reste à en dire.
 #[derive(Debug, Clone, Copy)]
 pub struct Source {
     adresse: [u8; 4],
     comptes: [u32; 2],
+    /// Les rapports qui doivent encore la nommer (`sf_crcount`).
+    crcount: u8,
+    /// Elle entrait avant le changement en cours (`sf_oldin`, posé par
+    /// `markstate`).
+    avant: bool,
+    /// Une requête du routeur la nomme ; la réponse la dira (`sf_gsresp`).
+    demandee: bool,
 }
 
 impl Source {
+    fn nouvelle(adresse: [u8; 4]) -> Source {
+        Source { adresse, comptes: [0; 2], crcount: 0, avant: false, demandee: false }
+    }
+
     pub fn adresse(&self) -> [u8; 4] {
         self.adresse
     }
@@ -438,16 +461,58 @@ impl Source {
 /// Un groupe d'une interface (`ip_mc_list`) : ses membres (les adhésions des
 /// sockets, et l'interface elle-même pour 224.0.0.1), le mode de son
 /// filtre, ses sockets dans chaque mode, et ses sources, dans l'ordre où
-/// elles sont venues.
+/// elles sont venues ; pour IGMP, ses sources parties, et son minuteur.
+///
+/// Un groupe parti dont les rapports ne sont pas finis a la même forme
+/// (Linux fait de même : « Using the same structure for deleted items
+/// allows change reports to use common code »), dans les tombes de son
+/// interface.
 pub struct Groupe {
     adresse: [u8; 4],
     utilisateurs: u32,
     mode: Mode,
     comptes: [u32; 2],
     sources: Vec<Source>,
+    /// Les sources parties que les rapports doivent encore nommer
+    /// (`tomb`), la dernière partie d'abord (la tête de la liste de Linux).
+    tombe: Vec<Source>,
+    /// Les rapports qui doivent encore dire le mode du filtre (`crcount`).
+    crcount: u8,
+    /// Une requête du routeur nomme certaines de ses sources
+    /// (`gsquery`) : la réponse ne dira qu'elles.
+    demande: bool,
+    /// L'échéance de son minuteur (`timer`, `tm_running`) : un rapport v1
+    /// ou v2, ou la réponse à une requête qui le nomme.
+    minuteur: Option<u64>,
+    /// Le dernier rapport sur lui vient de nous (`reporter`) : en v2, son
+    /// départ sera annoncé.
+    rapporteur: bool,
+    /// Les rapports non sollicités qui restent à faire en v1 et v2
+    /// (`unsolicit_count`).
+    non_sollicites: u8,
 }
 
 impl Groupe {
+    /// `____ip_mc_inc_group` : un groupe nouveau, d'un membre dans le mode
+    /// `mode`, sans source.
+    fn nouveau(adresse: [u8; 4], mode: Mode) -> Groupe {
+        let mut comptes = [0; 2];
+        comptes[mode as usize] = 1;
+        Groupe {
+            adresse,
+            utilisateurs: 1,
+            mode,
+            comptes,
+            sources: Vec::new(),
+            tombe: Vec::new(),
+            crcount: 0,
+            demande: false,
+            minuteur: None,
+            rapporteur: false,
+            non_sollicites: 0,
+        }
+    }
+
     pub fn adresse(&self) -> [u8; 4] {
         self.adresse
     }
@@ -465,13 +530,23 @@ impl Groupe {
         self.sources.iter()
     }
 
+    /// L'échéance de son minuteur, s'il tourne (/proc/net/igmp : `Timer`).
+    pub fn minuteur(&self) -> Option<u64> {
+        self.minuteur
+    }
+
+    /// Le dernier rapport sur lui vient-il de nous (`Reporter`) ?
+    pub fn rapporteur(&self) -> bool {
+        self.rapporteur
+    }
+
     /// `ip_mc_add1_src` : la source `s` (nouvelle : en fin de liste ; plus
     /// de mémoire : ENOBUFS) compte une socket de plus dans le mode `mode`.
     fn add1_src(&mut self, mode: Mode, s: [u8; 4]) -> Result<(), Refus> {
         let k = match self.sources.iter().position(|x| x.adresse == s) {
             Some(k) => k,
             None => {
-                self.sources.ajouter(Source { adresse: s, comptes: [0; 2] }).map_err(|_| Refus::PlusDePlace)?;
+                self.sources.ajouter(Source::nouvelle(s)).map_err(|_| Refus::PlusDePlace)?;
                 self.sources.len() - 1
             }
         };
@@ -480,30 +555,83 @@ impl Groupe {
     }
 
     /// `ip_mc_del1_src` : la source `s` compte une socket de moins dans le
-    /// mode `mode` ; plus aucune : elle quitte la liste. Absente, ou à zéro
-    /// dans ce mode (« bug » pour Linux, qui l'ignore) : rien.
-    fn del1_src(&mut self, mode: Mode, s: [u8; 4]) {
-        let Some(k) = self.sources.iter().position(|x| x.adresse == s) else { return };
+    /// mode `mode` ; plus aucune : elle quitte la liste, et, si elle entrait
+    /// (`avant`) et que le routeur parle IGMPv3 (`v3`), va dans la tombe,
+    /// pour que `qrv` rapports annoncent son départ : vrai. Absente, ou à
+    /// zéro dans ce mode (« bug » pour Linux, qui l'ignore) : rien.
+    fn del1_src(&mut self, mode: Mode, s: [u8; 4], v3: bool, qrv: u8) -> bool {
+        let Some(k) = self.sources.iter().position(|x| x.adresse == s) else { return false };
         let c = &mut self.sources[k].comptes;
         if c[mode as usize] == 0 {
-            return;
+            return false;
         }
         c[mode as usize] -= 1;
-        if c[0] == 0 && c[1] == 0 {
-            self.sources.remove(k);
-            self.sources.rendre_la_place();
+        if c[0] != 0 || c[1] != 0 {
+            return false;
         }
+        let mut x = self.sources.remove(k);
+        self.sources.rendre_la_place();
+        if x.avant && v3 {
+            x.crcount = qrv;
+            // La tête de la tombe ; sans mémoire, un départ qu'aucun rapport
+            // ne dira (Linux ne peut pas échouer ici : il déplace la source).
+            return self.tombe.inserer(0, x).is_ok();
+        }
+        false
     }
 }
 
-/// Une interface et ses groupes (son `in_device`), dans l'ordre où ils sont
-/// venus ; /proc/net/igmp les montre le plus récent d'abord (`groupes`).
+/// Une interface, ses groupes (son `in_device`), dans l'ordre où ils sont
+/// venus (/proc/net/igmp les montre le plus récent d'abord : `groupes`), et
+/// ce qu'IGMP sait de son routeur.
 pub struct Interface {
     index: u32,
     groupes: Vec<Groupe>,
+    /// Les groupes partis que les rapports doivent encore annoncer
+    /// (`mc_tomb`), le dernier parti d'abord.
+    tombes: Vec<Groupe>,
+    /// Combien de rapports répètent un changement (`mr_qrv` : 2, ou ce
+    /// qu'a dit la dernière requête v3).
+    qrv: u8,
+    /// L'intervalle des requêtes du routeur et leur délai de réponse
+    /// (`mr_qi`, `mr_qri`), en ns.
+    qi: u64,
+    qri: u64,
+    /// Le délai de réponse de la dernière requête générale v3
+    /// (`mr_maxdelay`), en jiffies.
+    delai_max: u32,
+    /// Un routeur v1, ou v2, entendu : jusqu'à cette heure, on lui parle sa
+    /// langue (`mr_v1_seen`, `mr_v2_seen`).
+    v1_vu: Option<u64>,
+    v2_vu: Option<u64>,
+    /// Le minuteur des rapports de changement (`mr_ifc_timer`), et combien
+    /// il en reste à faire (`mr_ifc_count`).
+    ifc: Option<u64>,
+    ifc_restants: u8,
+    /// Le minuteur de la réponse à une requête générale v3 (`mr_gq_timer`,
+    /// `mr_gq_running`).
+    gq: Option<u64>,
 }
 
 impl Interface {
+    /// `ip_mc_init_dev` et `ip_mc_reset` : une interface sans groupe.
+    fn nouvelle(index: u32) -> Interface {
+        Interface {
+            index,
+            groupes: Vec::new(),
+            tombes: Vec::new(),
+            qrv: igmp::QRV,
+            qi: igmp::INTERVALLE_DES_REQUETES,
+            qri: igmp::DELAI_DE_REPONSE,
+            delai_max: 0,
+            v1_vu: None,
+            v2_vu: None,
+            ifc: None,
+            ifc_restants: 0,
+            gq: None,
+        }
+    }
+
     pub fn index(&self) -> u32 {
         self.index
     }
@@ -519,33 +647,37 @@ impl Interface {
         self.groupes.iter().find(|g| g.adresse == groupe)
     }
 
-    fn groupe_mut(&mut self, groupe: [u8; 4]) -> Option<&mut Groupe> {
-        self.groupes.iter_mut().find(|g| g.adresse == groupe)
+    fn position(&self, groupe: [u8; 4]) -> Option<usize> {
+        self.groupes.iter().position(|g| g.adresse == groupe)
     }
 
     /// `____ip_mc_inc_group` : un membre de plus pour le groupe `groupe`, dans
     /// le mode `mode` sans source ; un groupe nouveau prend ce mode (plus de
-    /// mémoire : ENOBUFS).
-    fn inc_group(&mut self, groupe: [u8; 4], mode: Mode) -> Result<(), Refus> {
-        if let Some(g) = self.groupe_mut(groupe) {
-            g.utilisateurs += 1;
-            return self.add_src(groupe, mode, &[], false);
+    /// mémoire : ENOBUFS), reprend ce qui restait à dire de lui s'il était
+    /// parti (`igmpv3_del_delrec`), et IGMP l'annonce (`igmp_group_added`).
+    fn inc_group(&mut self, groupe: [u8; 4], mode: Mode, c: &mut Contexte) -> Result<(), Refus> {
+        if let Some(k) = self.position(groupe) {
+            self.groupes[k].utilisateurs += 1;
+            return self.add_src(groupe, mode, &[], false, c);
         }
-        let mut comptes = [0; 2];
-        comptes[mode as usize] = 1;
-        self.groupes.ajouter(Groupe { adresse: groupe, utilisateurs: 1, mode, comptes, sources: Vec::new() })
-            .map_err(|_| Refus::PlusDePlace)
+        self.groupes.ajouter(Groupe::nouveau(groupe, mode)).map_err(|_| Refus::PlusDePlace)?;
+        let k = self.groupes.len() - 1;
+        self.del_delrec(k);
+        self.group_added(k, c);
+        Ok(())
     }
 
-    /// `__ip_mc_dec_group` : un membre de moins ; plus aucun : le groupe et
-    /// ses sources s'en vont (`ip_mc_clear_src`).
-    fn dec_group(&mut self, groupe: [u8; 4]) {
-        let Some(k) = self.groupes.iter().position(|g| g.adresse == groupe) else { return };
+    /// `__ip_mc_dec_group` : un membre de moins ; plus aucun : le groupe
+    /// quitte la liste, IGMP annonce son départ (`igmp_group_dropped`), et
+    /// ses sources s'en vont avec lui (`ip_mc_clear_src`).
+    fn dec_group(&mut self, groupe: [u8; 4], c: &mut Contexte) {
+        let Some(k) = self.position(groupe) else { return };
         let g = &mut self.groupes[k];
         g.utilisateurs -= 1;
         if g.utilisateurs == 0 {
-            self.groupes.remove(k);
+            let g = self.groupes.remove(k);
             self.groupes.rendre_la_place();
+            self.group_dropped(g, c);
         }
     }
 
@@ -553,31 +685,48 @@ impl Interface {
     /// `delta` : des sources ajoutées à une socket qui y est déjà), et
     /// chacune des `sources` ; une source qui ne peut pas être ajoutée
     /// (ENOBUFS) défait tout. Le mode du filtre suit : EXCLUDE dès qu'une
-    /// socket l'est, sinon INCLUDE (sans aucune socket, il reste).
-    fn add_src(&mut self, groupe: [u8; 4], mode: Mode, sources: &[[u8; 4]], delta: bool) -> Result<(), Refus> {
-        let Some(g) = self.groupe_mut(groupe) else { return Err(Refus::Introuvable) };
+    /// socket l'est, sinon INCLUDE (sans aucune socket, il reste). Pour
+    /// IGMP, ce qui entrait avant est noté (`sf_markstate`), et ce qui
+    /// change ensuite sera annoncé : le mode (`qrv` rapports le diront), ou
+    /// les sources qui entrent ou sortent (`sf_setstate`).
+    fn add_src(&mut self, groupe: [u8; 4], mode: Mode, sources: &[[u8; 4]], delta: bool, c: &mut Contexte)
+               -> Result<(), Refus> {
+        let (v3, qrv) = (self.v3(c.h.maintenant), self.qrv);
+        let Some(k) = self.position(groupe) else { return Err(Refus::Introuvable) };
+        let g = &mut self.groupes[k];
+        g.markstate();
         let exclusion = g.mode == Mode::Exclure;
         if !delta {
             g.comptes[mode as usize] += 1;
         }
-        for (k, &s) in sources.iter().enumerate() {
+        for (j, &s) in sources.iter().enumerate() {
             if let Err(e) = g.add1_src(mode, s) {
                 if !delta {
                     g.comptes[mode as usize] -= 1;
                 }
-                for &s in &sources[..k] {
-                    g.del1_src(mode, s);
+                for &s in &sources[..j] {
+                    g.del1_src(mode, s, v3, qrv);
                 }
                 return Err(e);
             }
         }
         let (inclus, exclus) = (g.comptes[Mode::Inclure as usize], g.comptes[Mode::Exclure as usize]);
-        if exclusion != (exclus != 0) {
+        let evenement = if exclusion != (exclus != 0) {
             if exclus != 0 {
                 g.mode = Mode::Exclure;
             } else if inclus != 0 {
                 g.mode = Mode::Inclure;
             }
+            // Sans socket, le mode reste celui d'avant : les rapports le
+            // diront (« else no filters; keep old mode for reports »).
+            g.changement_de_mode(qrv);
+            self.ifc_restants = qrv;
+            true
+        } else {
+            g.setstate(qrv) != 0
+        };
+        if evenement {
+            self.ifc_event(c);
         }
         Ok(())
     }
@@ -585,50 +734,87 @@ impl Interface {
     /// `ip_mc_del_src` : une socket de moins dans le mode `mode` (sauf
     /// `delta` ; déjà aucune : rien du tout, le EINVAL que personne ne lit),
     /// et chacune des `sources`. Le dernier EXCLUDE parti, avec des INCLUDE,
-    /// le filtre passe en INCLUDE.
-    fn del_src(&mut self, groupe: [u8; 4], mode: Mode, sources: &[[u8; 4]], delta: bool) {
-        let Some(g) = self.groupe_mut(groupe) else { return };
+    /// le filtre passe en INCLUDE. IGMP comme pour `add_src`, et les
+    /// sources parties qui entraient.
+    fn del_src(&mut self, groupe: [u8; 4], mode: Mode, sources: &[[u8; 4]], delta: bool, c: &mut Contexte) {
+        let (v3, qrv) = (self.v3(c.h.maintenant), self.qrv);
+        let Some(k) = self.position(groupe) else { return };
+        let g = &mut self.groupes[k];
+        g.markstate();
         if !delta {
             if g.comptes[mode as usize] == 0 {
                 return;
             }
             g.comptes[mode as usize] -= 1;
         }
+        let mut tombees = false;
         for &s in sources {
-            g.del1_src(mode, s);
+            tombees |= g.del1_src(mode, s, v3, qrv);
         }
-        if g.mode == Mode::Exclure && g.comptes[Mode::Exclure as usize] == 0 && g.comptes[Mode::Inclure as usize] != 0 {
+        let evenement = if g.mode == Mode::Exclure && g.comptes[Mode::Exclure as usize] == 0
+            && g.comptes[Mode::Inclure as usize] != 0 {
             g.mode = Mode::Inclure;
+            g.changement_de_mode(qrv);
+            self.ifc_restants = qrv;
+            true
+        } else {
+            // `sf_setstate` d'abord, toujours : il pose les comptes.
+            g.setstate(qrv) != 0 || tombees
+        };
+        if evenement {
+            self.ifc_event(c);
         }
     }
+}
+
+/// Ce dont une opération sur les groupes d'une interface a besoin pour
+/// IGMP : l'heure et le hasard, et où laisser les rapports à envoyer.
+struct Contexte<'a> {
+    h: Horloge,
+    envois: &'a mut Vec<Envoi>,
+}
+
+/// Ce que le noyau prête à la bibliothèque : l'heure (en ns, celle de ses
+/// échéances), le hasard (`get_random_u32_below` : un nombre de 0 à `n`
+/// exclu ; 0 pour 0), et la MTU d'une interface (`dev->mtu`, que le DHCP
+/// peut changer : lue à chaque rapport).
+#[derive(Clone, Copy)]
+pub struct Horloge {
+    pub maintenant: u64,
+    pub alea: fn(u32) -> u32,
+    pub mtu: fn(u32) -> u32,
 }
 
 /// Les groupes de chaque interface de la machine, dans l'ordre de leur
-/// index (celui de /proc/net/igmp).
+/// index (celui de /proc/net/igmp), et les rapports d'IGMP prêts à partir.
 pub struct Groupes {
     interfaces: Vec<Interface>,
-}
-
-impl Default for Groupes {
-    fn default() -> Self {
-        Groupes::new()
-    }
+    horloge: Horloge,
+    envois: Vec<Envoi>,
 }
 
 impl Groupes {
-    pub const fn new() -> Groupes {
-        Groupes { interfaces: Vec::new() }
+    /// Aucune interface ; le hasard et la MTU que donne le noyau.
+    pub const fn new(alea: fn(u32) -> u32, mtu: fn(u32) -> u32) -> Groupes {
+        Groupes { interfaces: Vec::new(), horloge: Horloge { maintenant: 0, alea, mtu }, envois: Vec::new() }
+    }
+
+    /// L'heure de ce qui suit (le noyau la donne à chaque prise de son
+    /// verrou : les jiffies que Linux lit).
+    pub fn regler(&mut self, maintenant: u64) {
+        self.horloge.maintenant = maintenant;
     }
 
     /// L'interface `index` monte (`ip_mc_init_dev`, `ip_mc_up`) : elle
-    /// adhère à 224.0.0.1. Plus de mémoire : ENOBUFS (elle n'aura aucun
-    /// groupe). Déjà montée : rien.
+    /// adhère à 224.0.0.1, qu'elle n'annonce jamais. Plus de mémoire :
+    /// ENOBUFS (elle n'aura aucun groupe). Déjà montée : rien.
     pub fn monter(&mut self, index: u32) -> Result<(), Refus> {
         if self.interface(index).is_some() {
             return Ok(());
         }
-        let mut i = Interface { index, groupes: Vec::new() };
-        i.inc_group(TOUS_LES_HOTES, Mode::Exclure)?;
+        let mut i = Interface::nouvelle(index);
+        let mut c = Contexte { h: self.horloge, envois: &mut self.envois };
+        i.inc_group(TOUS_LES_HOTES, Mode::Exclure, &mut c)?;
         let k = self.interfaces.iter().position(|x| x.index > index).unwrap_or(self.interfaces.len());
         self.interfaces.inserer(k, i).map_err(|_| Refus::PlusDePlace)
     }
@@ -637,8 +823,11 @@ impl Groupes {
         self.interfaces.iter().find(|i| i.index == index)
     }
 
-    fn interface_mut(&mut self, index: u32) -> Option<&mut Interface> {
-        self.interfaces.iter_mut().find(|i| i.index == index)
+    /// L'interface `index`, et de quoi faire IGMP.
+    fn interface_mut(&mut self, index: u32) -> Option<(&mut Interface, Contexte<'_>)> {
+        let h = self.horloge;
+        let i = self.interfaces.iter_mut().find(|i| i.index == index)?;
+        Some((i, Contexte { h, envois: &mut self.envois }))
     }
 
     pub fn interfaces(&self) -> impl Iterator<Item = &Interface> {
