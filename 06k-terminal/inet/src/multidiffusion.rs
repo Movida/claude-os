@@ -58,7 +58,7 @@ pub const MAX_SOURCES: usize = 10;
 pub const TOUS_LES_HOTES: [u8; 4] = [224, 0, 0, 1];
 /// Le protocole d'IGMP dans l'en-tête IPv4 : un paquet IGMP pour un groupe
 /// de l'interface entre toujours, quelle que soit sa source.
-pub const IGMP: u8 = 2;
+pub use formats::reseau::ipv4::IGMP;
 
 /// Le mode d'un filtre : ses nombres sont ceux de Linux (MCAST_EXCLUDE 0,
 /// MCAST_INCLUDE 1), qui servent aussi d'indices aux compteurs.

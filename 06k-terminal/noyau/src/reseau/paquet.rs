@@ -204,12 +204,15 @@ impl Proprietaire {
 /// La route de sortie que garde un paquet envoyé par lo (le `skb_dst` que
 /// `loopback_xmit` ne lâche pas, et que relit son arrivée, ipv4.rs) :
 /// l'interface par laquelle on le verra arrivé (le `rt_iif` de sa route, que
-/// lit `inet_iif`), et s'il est une diffusion (RTCF_BROADCAST : à toutes les
-/// sockets de son port).
+/// lit `inet_iif`), s'il est une diffusion (RTCF_BROADCAST, ou
+/// RTCF_MULTICAST : à toutes les sockets de son port), et s'il est livré ici
+/// (RTCF_LOCAL : faux pour un groupe que lo n'a pas, que sa route jette à
+/// l'arrivée, `dst_discard`).
 #[derive(Clone, Copy)]
 pub struct Sortie {
     pub interface: u32,
     pub diffusion: bool,
+    pub livre: bool,
 }
 
 pub struct Paquet {

@@ -16,12 +16,14 @@
 //! multidiffusion (MRT_*, refusés : EOPNOTSUPP). Une interface ne descend
 //! jamais (pas d'`ip_mc_down`). /proc/net/mcfilter montre toujours toutes
 //! les sources (`ligne_mcfilter`).
+//! Pas de /proc/net/netstat (InMcastPkts, OutMcastPkts…).
 
 use super::interface;
 use super::ipv4;
 use super::socket::Socket;
 use crate::verrou::Verrou;
 use core::fmt::{self, Write};
+use core::sync::atomic::Ordering;
 use formats::reseau::ipv4 as format_ipv4;
 use inet::multidiffusion::{Demande, Groupes, MAX_SOURCES, Mode, Refus};
 use inet::routes::Portee;
@@ -63,7 +65,7 @@ fn trouver(d: Demande) -> Option<u32> {
     if d.adresse != format_ipv4::AUCUNE {
         return ipv4::avec_table(|t| t.interface_locale(d.adresse)).flatten();
     }
-    ipv4::router(d.groupe, None, 0, Portee::Univers).ok().and_then(|(c, _)| ipv4::sortie(&c))
+    ipv4::router(d.groupe, 0, Portee::Univers).ok().and_then(|(c, _)| ipv4::sortie(&c))
 }
 
 /// Adhère au groupe de `d` dans le mode `mode` (`__ip_mc_join_group`) ;
@@ -139,6 +141,24 @@ pub fn fermer(s: &Socket) {
     }
     let mut g = GROUPES.verrouiller();
     s.adhesions.verrouiller().vider(&mut g);
+}
+
+/// La socket `s` prend-elle ce datagramme de `source` pour `destination`,
+/// arrivé par l'interface `dif` (`ip_mc_sf_allow`) ? Vrai pour ce qui n'est
+/// pas pour un groupe ; sinon, selon ses adhésions (et IP_MULTICAST_ALL).
+/// Lu à la livraison, sous la table des ports d'UDP.
+pub fn permet(s: &Socket, destination: [u8; 4], source: [u8; 4], dif: u32) -> bool {
+    if !format_ipv4::multidiffusion(destination) {
+        return true;
+    }
+    s.adhesions.verrouiller().permet(destination, source, dif, s.mc_all.load(Ordering::Relaxed))
+}
+
+/// Un paquet de `source` pour `groupe`, de protocole `protocole`, entre-t-il
+/// par l'interface `index` (`ip_check_mc_rcu`) ? À l'arrivée par une carte
+/// (ipv4.rs), et à l'envoi : RTCF_LOCAL (datagramme.rs).
+pub fn verifier(index: u32, groupe: [u8; 4], source: [u8; 4], protocole: u8) -> bool {
+    GROUPES.verrouiller().verifier(index, groupe, source, protocole)
 }
 
 /// Une adresse comme la montre /proc/net/igmp : l'entier de l'ordre du

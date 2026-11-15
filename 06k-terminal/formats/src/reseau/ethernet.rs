@@ -17,6 +17,13 @@ pub const TRAME_MIN: usize = 60;
 /// L'adresse de diffusion : toutes les cartes du réseau.
 pub const DIFFUSION: [u8; 6] = [0xff; 6];
 
+/// L'adresse MAC du groupe IPv4 `groupe` (`ip_eth_mc_map`, RFC 1112) :
+/// 01:00:5e, puis ses 23 bits bas. 32 groupes ont donc la même : la carte
+/// en laisse passer plus qu'on n'en a demandé, IP trie ensuite.
+pub fn de_groupe(groupe: [u8; 4]) -> [u8; 6] {
+    [0x01, 0x00, 0x5e, groupe[1] & 0x7f, groupe[2], groupe[3]]
+}
+
 /// Un en-tête Ethernet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ethernet {

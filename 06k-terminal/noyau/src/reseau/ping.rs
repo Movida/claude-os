@@ -141,7 +141,7 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
         None => return Err(-EDESTADDRREQ),
     };
     let c = controle?;
-    let d = datagramme::preparer(s, &mut inet, adresse, longueur, drapeaux, &c, false)?;
+    let d = datagramme::preparer(s, &mut inet, adresse, longueur, drapeaux, &c, false, format_ipv4::ICMP)?;
     // MSG_PROBE : la route seulement (`preparer`) ; rien à pousser.
     if drapeaux & datagramme::MSG_PROBE != 0 {
         return Ok(longueur);

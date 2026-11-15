@@ -9,9 +9,12 @@
 //! à toutes les sockets (recevoir, attendre, l'erreur en attente, l'arrêt)
 //! dans socket.rs.
 //!
-//! Ce qui manque, écrit : la multidiffusion. (SO_SNDBUF fait attendre
-//! depuis les soldes d'avant 6k : datagramme::attendre_place ; MSG_MORE et
-//! UDP_CORK bouchent la socket depuis les mêmes : `Bouchon`.)
+//! Depuis les soldes d'avant 6k, rien ne manque, écrit : SO_SNDBUF fait
+//! attendre (datagramme::attendre_place), MSG_MORE et UDP_CORK bouchent la
+//! socket (`Bouchon`), MSG_PROBE ne fait que chercher la route
+//! (datagramme::preparer), et un datagramme pour un groupe va à chaque
+//! socket que ses adhésions laissent le prendre (`recevoir`, et
+//! multidiffusion.rs).
 //!
 //! LES COMPTEURS d'UDP (/proc/net/snmp, snmp.rs), aux places de Linux : à
 //! l'arrivée, un datagramme faux (InErrors, et InCsumErrors pour sa somme),
@@ -214,7 +217,7 @@ fn envoyer_vers(s: &Arc<Socket>, mut inet: GardeMutex<'_, Inet>, (adresse, port,
                 drapeaux: u64, bouche: bool, c: &Controle, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>)
                 -> Result<usize, i64> {
     const MSG_DONTWAIT: u64 = 0x40;
-    let d = datagramme::preparer(s, &mut inet, adresse, udp::ENTETE + longueur, drapeaux, c, connectee)?;
+    let d = datagramme::preparer(s, &mut inet, adresse, udp::ENTETE + longueur, drapeaux, c, connectee, format_ipv4::UDP)?;
     // MSG_PROBE : la route seulement (`preparer`) ; pas de bouchon non plus
     // (la file de Linux reste vide : `pending` revient à 0).
     if drapeaux & datagramme::MSG_PROBE != 0 {
@@ -401,7 +404,9 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
             let ports = (u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]]));
             let mut sockets = 0;
             if let Some(t) = PORTS.verrouiller().as_ref() {
-                t.pour_chaque_diffusion(source, ports.0, destination, ports.1, lieu.interface, |_| sockets += 1);
+                t.pour_chaque_diffusion(source, ports.0, destination, ports.1, lieu.interface, |s| {
+                    sockets += super::multidiffusion::permet(s, destination, source, lieu.interface) as usize;
+                });
             }
             if sockets == 0 {
                 MIB.udp(Compteur::IgnoredMulti);
@@ -436,10 +441,16 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
         // Une copie pour chacune, déposée sous le verrou de la table (son
         // ordre permet de prendre ensuite celui de la file d'une socket) ;
         // une copie ratée (le `skb_clone` d'`__udp4_lib_mcast_deliver`) est
-        // comptée comme une file pleine. Aucune socket : IgnoredMulti.
+        // comptée comme une file pleine. Pour un groupe, seulement celles
+        // que leurs adhésions laissent le prendre, de cette source, arrivé
+        // par cette interface (`__udp_is_mcast_sock` : `ip_mc_sf_allow`).
+        // Aucune socket : IgnoredMulti.
         let mut sockets = 0;
         if let Some(t) = PORTS.verrouiller().as_ref() {
             t.pour_chaque_diffusion(source, u.source, destination, u.destination, lieu.interface, |s| {
+                if !super::multidiffusion::permet(s, destination, source, lieu.interface) {
+                    return;
+                }
                 sockets += 1;
                 match Paquet::copie(p.donnees()) {
                     Some(copie) => deposer(s, copie, &arrivee),

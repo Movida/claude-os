@@ -17,6 +17,8 @@ pub const ENTETE: usize = 20;
 pub const ICMP: u8 = 1;
 pub const TCP: u8 = 6;
 pub const UDP: u8 = 17;
+/// IGMP (RFC 3376), les adhésions aux groupes de multidiffusion.
+pub const IGMP: u8 = 2;
 /// L'adresse de diffusion limitée : tout le réseau local.
 pub const DIFFUSION: [u8; 4] = [255; 4];
 /// L'adresse « pas encore d'adresse » (la source d'un DHCP DISCOVER).
@@ -179,6 +181,13 @@ fn place_d_un_fragment(mtu: usize, entete: usize) -> usize {
 /// Une adresse de multidiffusion (224.0.0.0/4, la « classe D »).
 pub fn multidiffusion(a: [u8; 4]) -> bool {
     a[0] & 0xF0 == 0xE0
+}
+
+/// Un groupe du lien (224.0.0.0/24, `ipv4_is_local_multicast`) : jamais
+/// relayé par un routeur, quel que soit le TTL (224.0.0.1, tous les hôtes ;
+/// 224.0.0.22, les rapports d'IGMPv3 ; 224.0.0.251, mDNS).
+pub fn multidiffusion_du_lien(a: [u8; 4]) -> bool {
+    a[0] == 224 && a[1] == 0 && a[2] == 0
 }
 
 /// Une adresse de la boucle locale (127.0.0.0/8).

@@ -17,7 +17,11 @@
 //! (ce que dit l'hôte), et Linux le jette. Puis la destination : une de nos
 //! adresses, ou une diffusion de l'interface ; sinon, le paquet n'est pas
 //! pour nous (pas de routage entre interfaces : nous ne sommes pas un
-//! routeur, `ip_forward` = 0). Les options, entre les deux comme chez
+//! routeur, `ip_forward` = 0). Un paquet pour un groupe de multidiffusion
+//! est trié avant tout : jeté sans rien compter si l'interface n'a pas le
+//! groupe, ou que son filtre refuse la source (multidiffusion.rs) ; puis les
+//! martiens (une source 0.0.0.0 y est permise vers 224.0.0.0/24, et pour
+//! IGMP) ; puis il est pour nous, comme une diffusion. Les options, entre les deux comme chez
 //! Linux (`ip_rcv_options`, après la route d'entrée, que Linux fait aussi
 //! pour un paquet qui n'est pas pour lui) : vérifiées une à une et notées
 //! sur place (`compiler_options`, l'`ip_options_compile` de Linux) ; une
@@ -62,14 +66,16 @@
 //! d'une route source, l'en-tête allant à sa première étape), puis l'interface : `lo` pour une de nos adresses (Linux
 //! aussi : la route locale passe par `lo`) et pour un envoi forcé par lo
 //! (IP_PKTINFO, IP_UNICAST_IF), sans voisin, le paquet marqué de sa route
-//! (`Sortie`) ; la diffusion d'Ethernet pour une diffusion, le voisin (ARP)
+//! (`Sortie`) ; la diffusion d'Ethernet pour une diffusion, l'adresse MAC du
+//! groupe pour une multidiffusion, le voisin (ARP)
 //! pour le reste. Un paquet plus grand que la MTU
 //! part en fragments, sauf DF (`ip_do_fragment`). Une diffusion envoyée par une
 //! carte est aussi rendue aux sockets de la machine, comme chez Linux, qui en fait
 //! toujours une copie par la boucle (`ip_mc_output` ; IP_MULTICAST_LOOP ne règle que
 //! la multidiffusion) : le paquet entier, avant tout découpage, livré comme arrivé
 //! par la carte (boucle.rs, `rendre_la_diffusion`). Par `lo`, la diffusion de `lo`
-//! (127.255.255.255) n'arrive qu'une fois, comme chez Linux (mesuré).
+//! (127.255.255.255) n'arrive qu'une fois, comme chez Linux (mesuré). De même pour
+//! un groupe que la carte laisse entrer (`emettre`), sauf IP_MULTICAST_LOOP 0.
 
 use super::interface::{self, Interface};
 use super::paquet::{Paquet, Sortie};
@@ -219,15 +225,20 @@ fn de_rien_a_rien(h: &ipv4::Ipv4) -> bool {
     h.source == ipv4::AUCUNE && h.destination == ipv4::AUCUNE
 }
 
-/// Un martien (voir plus haut) ?
+/// Un martien (voir plus haut) ? Pour un groupe, les mêmes règles
+/// (`ip_mc_validate_source`), sauf la source 0.0.0.0, permise vers un groupe
+/// du lien (224.0.0.0/24) et pour IGMP (un rapport d'une machine qui n'a
+/// pas encore d'adresse, RFC 3376, 4.2.13).
 fn martien(i: &Interface, h: &ipv4::Ipv4, table: &Table) -> bool {
     let carte = !i.boucle();
     if de_rien_a_rien(h) {
         return false;
     }
+    let source_nulle_permise = h.destination == ipv4::DIFFUSION
+        || (ipv4::multidiffusion(h.destination) && (ipv4::multidiffusion_du_lien(h.destination) || h.protocole == ipv4::IGMP));
     ipv4::multidiffusion(h.source)
         || h.source == ipv4::DIFFUSION
-        || (h.source == ipv4::AUCUNE && h.destination != ipv4::DIFFUSION)
+        || (h.source == ipv4::AUCUNE && !source_nulle_permise)
         || h.destination == ipv4::AUCUNE
         || (carte && (ipv4::boucle(h.source) || ipv4::boucle(h.destination)))
         || (carte && table.est_a_nous(h.source))
@@ -279,9 +290,21 @@ pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
     }
     // Le tri de la route d'entrée : un martien, ou pour nous (à une de nos
     // adresses, ou en diffusion), ou pas ; arrivé par `i`. Sans tri, ce que
-    // nous nous sommes envoyé par lo (voir l'en-tête) : la route de sa sortie.
+    // nous nous sommes envoyé par lo (voir l'en-tête) : la route de sa sortie,
+    // qui jette sans rien compter un groupe que lo n'a pas (`dst_discard`).
+    // Un groupe (`ip_route_input_rcu`) : que l'interface n'a pas, ou dont le
+    // filtre refuse la source, jeté sans rien compter ; puis les martiens ;
+    // pour nous, comme une diffusion (`ip_route_input_mc`). (Les groupes
+    // d'abord, seuls : jamais sous le verrou de la table, multidiffusion.rs.)
     let tri = match p.sortie() {
+        Some(s) if !s.livre => return,
         Some(s) => Some(Some((true, s.diffusion, s.interface))),
+        None if ipv4::multidiffusion(h.destination) => {
+            if !super::multidiffusion::verifier(i.index, h.destination, h.source, h.protocole) {
+                return;
+            }
+            TABLE.verrouiller().as_ref().map(|t| (!martien(i, &h, t)).then_some((true, true, i.index)))
+        }
         None => TABLE.verrouiller().as_ref().map(|t| {
             if martien(i, &h, t) {
                 None
@@ -352,7 +375,8 @@ pub struct Lieu {
     pub reponse: [u8; 4],
 }
 
-/// La copie `p` d'une diffusion que nous avons envoyée par la carte `i`
+/// La copie `p` d'une diffusion (ou d'un envoi pour un groupe qu'elle a) que
+/// nous avons envoyée par la carte `i`
 /// (boucle.rs, `rendre_la_diffusion`) : livrée comme arrivée par `i`, sans le
 /// tri de l'entrée (Linux garde la route de la sortie, `skb_dst` : la source,
 /// qui est à nous, n'est pas un martien). Elle compte comme un paquet arrivé
@@ -428,10 +452,12 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Opti
         ipv4::ICMP => super::icmp::recevoir(i, interface, &h, &entete, diffusion, p),
         // TCP : jamais d'une trame pour plusieurs machines, que `tcp_v4_rcv`
         // jette avant même InSegs (`pkt_type != PACKET_HOST` : une trame de
-        // diffusion, qu'IP livre pourtant, et qu'UDP reçoit). Une destination
-        // de diffusion dans une trame pour nous seuls passe (Linux trie la
-        // trame, pas l'adresse) : TCP la compte, et sait qu'elle n'ouvre rien
-        // (`diffusion`).
+        // diffusion ou de groupe, qu'IP livre pourtant, et qu'UDP reçoit).
+        // Une destination de diffusion ou de groupe dans une trame pour nous
+        // seuls passe (Linux trie la trame, pas l'adresse) : TCP la compte,
+        // et sait qu'elle n'ouvre rien (`diffusion`). (La copie d'une
+        // diffusion que nous envoyons, PACKET_LOOPBACK chez Linux, n'est
+        // jamais de TCP : `connect` refuse une diffusion ou un groupe.)
         ipv4::TCP if trame_diffusee => {}
         ipv4::TCP => super::tcp::recevoir(&h, &entete, i, interface, diffusion, p),
         _ => injoignable(icmp::PROTOCOLE, p),
@@ -522,57 +548,95 @@ pub struct Envoi {
     /// l'en-tête, lui, va à sa première étape).
     pub options: ipv4::OptionsSortantes,
     pub destination_finale: [u8; 4],
+    /// IP_MULTICAST_LOOP (`sk_mc_loop` ; vrai pour un paquet du noyau) :
+    /// vers un groupe de la carte, une copie revient à la machine.
+    pub boucle_mc: bool,
 }
 
-/// Le chemin vers `destination` (l'`ip_route_output_key` de Linux), par
-/// l'interface `oif` si l'envoi en demande une (0 : aucune), et la
-/// destination à mettre dans l'en-tête : 0.0.0.0 veut dire « cette
-/// machine », et devient la source demandée (`source` : celle de `bind` ou
-/// d'IP_PKTINFO), ou l'adresse que propose l'interface demandée, ou
-/// 127.0.0.1 (inet::routes, `Table::router`, comme
+/// Le chemin vers `destination` d'un envoi qui ne demande pas de source
+/// (l'`ip_route_output_key` de Linux, `saddr` nul ; avec une source :
+/// `router_depuis`), par l'interface `oif` si l'envoi en demande une (0 :
+/// aucune), et la destination à mettre dans l'en-tête : 0.0.0.0 veut dire
+/// « cette machine », et devient l'adresse que propose l'interface demandée,
+/// ou 127.0.0.1 (inet::routes, `Table::router`, comme
 /// `ip_route_output_key_hash_rcu`), parmi les routes de portée `portee` au
 /// moins (« lien » : SO_DONTROUTE, voir inet::routes). Une interface qui
-/// n'existe pas : ENODEV ; pas de route : ENETUNREACH.
-pub fn router(destination: [u8; 4], source: Option<[u8; 4]>, oif: u32, portee: Portee) -> Result<(Chemin, [u8; 4]), i64> {
+/// n'existe pas : ENODEV ; pas de route : ENETUNREACH ; la source de la
+/// route, de la boucle, qui sortirait par une carte : EINVAL
+/// (`__mkroute_output`, par où passe toute route de Linux, comme
+/// `router_depuis`). Nos routes n'en donnent pas (celles du DHCP ont
+/// l'adresse de la carte, lo ne propose la sienne qu'à « cette machine »),
+/// mais la règle est ici, et pas chez chaque appelant : elle tiendra pour
+/// une route qui en aurait une (`ip route ... src`).
+pub fn router(destination: [u8; 4], oif: u32, portee: Portee) -> Result<(Chemin, [u8; 4]), i64> {
     const ENODEV: i64 = 19;
+    const EINVAL: i64 = 22;
     if oif != 0 && interface::par_index(oif).is_none() {
         return Err(-ENODEV);
     }
-    TABLE.verrouiller().as_ref().and_then(|t| t.router(destination, source, oif, portee)).ok_or(-ENETUNREACH)
+    let route = TABLE.verrouiller().as_ref().and_then(|t| t.router(destination, None, oif, portee)).ok_or(-ENETUNREACH)?;
+    if ipv4::boucle(route.0.source()) && !par_lo(&route.0) {
+        return Err(-EINVAL);
+    }
+    Ok(route)
 }
 
-/// Le même, pour un envoi qui part de `source` : une source de groupe ou la
-/// diffusion limitée n'a jamais de route (EINVAL), même pour `toute_source` ;
-/// une autre source qui n'est pas à nous non plus (ENETUNREACH), sauf
-/// `toute_source` (FLOWI_FLAG_ANYSRC : IP_TRANSPARENT, qui laisse partir de
-/// la diffusion d'un réseau), vérifiée sous le même verrou que la route
-/// (`ip_route_output_key_hash_rcu`, `__ip_dev_find`) ; une source de la
-/// boucle (127.0.0.0/8) qui sortirait par une carte non plus (EINVAL,
-/// `__mkroute_output` : une connexion de 127.0.0.1 liée à la carte). Pour TCP,
-/// dont chaque segment le demande. (Linux refuse la source avant l'interface ;
-/// un segment ne montre pas laquelle des erreurs l'a arrêté.)
+/// Le même, pour un envoi qui part d'une source demandée, `source` (celle de
+/// `bind`, d'IP_PKTINFO ou d'IP_MULTICAST_IF pour UDP et ping, celle d'une
+/// connexion TCP et de chacun de ses segments), dans l'ordre
+/// d'`ip_route_output_key_hash_rcu` : une source de groupe ou la diffusion
+/// limitée n'a jamais de route (EINVAL), même pour `toute_source` ; sans
+/// interface demandée (`oif` 0), vers un groupe ou la diffusion limitée,
+/// l'envoi part par l'interface de la source, qui doit être à nous, même
+/// pour `toute_source` (ENETUNREACH sinon) : le « hack de vic/vat » de Linux
+/// (« This hack is not just for fun, it allows vic, vat and friends to
+/// work » : des outils de visioconférence, liés à 127.0.0.1, qui diffusaient
+/// par lo avec un TTL nul) ; vers le reste, une source qui n'est pas à nous
+/// non plus (ENETUNREACH), sauf `toute_source` (FLOWI_FLAG_ANYSRC :
+/// IP_TRANSPARENT, qui laisse partir de la diffusion d'un réseau). Tout cela
+/// sous le même verrou que la route (`__ip_dev_find`) : une adresse qui
+/// change entre les deux (le DHCP) ne laisse pas partir d'une source qui
+/// n'est plus à nous. Puis comme `router` : l'interface demandée qui n'existe
+/// pas : ENODEV, pas de route : ENETUNREACH ; et une source de la boucle
+/// (127.0.0.0/8) qui sortirait par une carte : EINVAL (`__mkroute_output` :
+/// l'autre bout la jetterait comme un martien ; une connexion de 127.0.0.1
+/// liée à la carte). Rend aussi l'interface demandée, celle de la source
+/// après le hack (le `flowi4_oif` que Linux y change), que garde la route
+/// d'une socket UDP connectée.
+///
+/// Un seul chemin pour UDP, ping et TCP, comme chez Linux, où
+/// `ip_route_connect` de TCP passe par la même fonction : ainsi TCP lié à
+/// 127.0.0.1 a aussi le hack, et `connect` vers un groupe y trouve une
+/// route par lo, qu'il refuse ensuite comme groupe (ENETUNREACH), pas la
+/// route par défaut et une source de la boucle hors de lo (EINVAL).
 pub fn router_depuis(destination: [u8; 4], source: [u8; 4], oif: u32, toute_source: bool, portee: Portee)
-                     -> Result<(Chemin, [u8; 4]), i64> {
+                     -> Result<(Chemin, [u8; 4], u32), i64> {
     const ENODEV: i64 = 19;
     const EINVAL: i64 = 22;
     if ipv4::multidiffusion(source) || source == ipv4::DIFFUSION {
         return Err(-EINVAL);
     }
-    if oif != 0 && interface::par_index(oif).is_none() {
-        return Err(-ENODEV);
-    }
-    let route = {
+    let (route, oif) = {
         let g = TABLE.verrouiller();
         let t = g.as_ref().ok_or(-ENETUNREACH)?;
-        if !toute_source && !t.est_a_nous(source) {
+        let oif = if oif == 0 && (ipv4::multidiffusion(destination) || destination == ipv4::DIFFUSION) {
+            t.interface_locale(source).ok_or(-ENETUNREACH)?
+        } else if !toute_source && !t.est_a_nous(source) {
             return Err(-ENETUNREACH);
+        } else {
+            oif
+        };
+        // INTERFACES est une feuille (rien ne se prend sous elle) : la
+        // prendre sous TABLE ne peut pas croiser un autre ordre.
+        if oif != 0 && interface::par_index(oif).is_none() {
+            return Err(-ENODEV);
         }
-        t.router(destination, Some(source), oif, portee).ok_or(-ENETUNREACH)?
+        (t.router(destination, Some(source), oif, portee).ok_or(-ENETUNREACH)?, oif)
     };
     if ipv4::boucle(source) && !par_lo(&route.0) {
         return Err(-EINVAL);
     }
-    Ok(route)
+    Ok((route.0, route.1, oif))
 }
 
 /// Le chemin `c` passe-t-il par `lo` ?
@@ -596,7 +660,9 @@ pub fn est_a_nous(a: [u8; 4]) -> bool {
 fn interface_de(c: &Chemin) -> Option<&'static Interface> {
     match *c {
         Chemin::Locale { .. } => super::boucle::interface(),
-        Chemin::Diffusion { interface, .. } | Chemin::Unicast { interface, .. } => interface::par_index(interface),
+        Chemin::Diffusion { interface, .. } | Chemin::Unicast { interface, .. } | Chemin::Multidiffusion { interface, .. } => {
+            interface::par_index(interface)
+        }
     }
 }
 
@@ -620,7 +686,7 @@ pub fn mtu_verrouillee(destination: [u8; 4]) -> bool {
 
 /// ICMP dit `info` vers `destination` (`__ip_rt_update_pmtu`).
 pub fn apprendre_mtu(destination: [u8; 4], info: u32) {
-    if let Ok((c, d)) = router(destination, None, 0, Portee::Univers) {
+    if let Ok((c, d)) = router(destination, 0, Portee::Univers) {
         EXCEPTIONS.verrouiller().apprendre(d, info, mtu(&c), crate::temps::ns_monotone());
     }
 }
@@ -699,6 +765,14 @@ pub fn options_d_un_envoi(p: &mut Paquet) -> Option<ipv4::Options> {
 /// Les options sont complétées une fois (`ip_options_build`, quand
 /// `__ip_make_skb` fait le paquet) : la copie d'une diffusion et chaque
 /// fragment reprennent les mêmes, la même heure comprise.
+///
+/// Vers un groupe que la carte a, et qu'elle laisse entrer de cette source
+/// (`locale`, RTCF_LOCAL : sa route sort par `ip_mc_output`), une copie
+/// revient aux sockets de la machine, sauf IP_MULTICAST_LOOP 0 ; puis un TTL
+/// 0 ne sort pas (« Multicasts with ttl 0 must not go beyond the host » :
+/// ni OutTransmits, ni trame). Vers un autre groupe, la route sort par
+/// `ip_output`, comme l'unicast : ni copie, ni regard sur le TTL (mesuré :
+/// un TTL 0 sort).
 pub fn emettre(c: Chemin, e: &Envoi, p: Paquet) {
     MIB.ip(Ip::OutRequests);
     let mut entete = [0u8; ipv4::ENTETE + ipv4::OPTIONS_MAX];
@@ -706,11 +780,18 @@ pub fn emettre(c: Chemin, e: &Envoi, p: Paquet) {
     let heure = if e.options.places.horodatage_heure { super::icmp::horodatage() } else { 0 };
     ipv4::construire_options(&mut entete[..n], &e.options, e.destination_finale, e.source, heure);
     let options = &entete[ipv4::ENTETE..n];
-    if let Chemin::Diffusion { interface, .. } = c
-        && let Some(i) = interface::par_index(interface)
-        && !i.boucle()
-    {
-        rendre_une_copie(i, e, options, &p);
+    let carte = interface_de(&c).filter(|i| !i.boucle());
+    match (c, carte) {
+        (Chemin::Diffusion { .. }, Some(i)) => rendre_une_copie(i, e, options, &p),
+        (Chemin::Multidiffusion { locale: true, .. }, Some(i)) => {
+            if e.boucle_mc {
+                rendre_une_copie(i, e, options, &p);
+            }
+            if e.ttl == 0 {
+                return;
+            }
+        }
+        _ => {}
     }
     if p.longueur() + n > e.mtu as usize {
         return fragmenter(c, e, options, p);
@@ -808,17 +889,23 @@ fn envoyer(c: Chemin, e: &Envoi, options: &[u8], mut p: Paquet, decalage: u16, s
     // (voir l'en-tête) : il sera vu arrivé par l'interface de l'entrée locale
     // trouvée, ou par lo (le `rt_iif` d'un envoi forcé par lo est lo, celui
     // d'un envoi à 0.0.0.0 sans interface demandée est nul, et `inet_iif`
-    // prend alors l'interface qui reçoit : lo).
+    // prend alors l'interface qui reçoit : lo). Vers un groupe que lo n'a
+    // pas, la route n'est pas locale : le paquet passe par lo, puis est jeté
+    // (mesuré : personne ne le reçoit).
     if i.boucle() {
         let interface = match c {
             Chemin::Locale { interface, .. } if interface != 0 => interface,
             _ => i.index,
         };
-        p.marquer(Sortie { interface, diffusion: matches!(c, Chemin::Diffusion { .. }) });
+        let diffusion = matches!(c, Chemin::Diffusion { .. } | Chemin::Multidiffusion { .. });
+        let livre = !matches!(c, Chemin::Multidiffusion { locale: false, .. });
+        p.marquer(Sortie { interface, diffusion, livre });
         return super::ethernet::emettre(i, [0; 6], ethernet::IPV4, p);
     }
     match c {
         Chemin::Diffusion { .. } => super::ethernet::emettre(i, ethernet::DIFFUSION, ethernet::IPV4, p),
+        // Sans voisin : l'adresse MAC du groupe (`arp_mc_map`, NUD_NOARP).
+        Chemin::Multidiffusion { .. } => super::ethernet::emettre(i, ethernet::de_groupe(e.destination), ethernet::IPV4, p),
         Chemin::Unicast { prochain, .. } => super::arp::envoyer(i, prochain, p, e.confirmer),
         // Toujours par lo (`interface_de`), plus haut.
         Chemin::Locale { .. } => {}

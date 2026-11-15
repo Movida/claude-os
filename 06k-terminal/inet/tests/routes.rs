@@ -224,6 +224,34 @@ fn adresse_pour_repondre() {
     assert_eq!(sans_defaut.adresse_pour_repondre([8, 8, 8, 8], ETH0), MOI);
 }
 
+/// Vers un groupe de multidiffusion (mesuré sous Linux 6.18.33, une sonde ;
+/// linux/reseau.c, `multidiffusion_trafic`) : sans interface, par celle de
+/// la route par défaut, de sa source, jamais vers sa passerelle ; la portée
+/// du lien n'a plus de route ; par une interface demandée : par elle, de
+/// l'adresse qu'elle propose (par lo : celle de la carte), de portée « lien »
+/// pour 224.0.0.0/24. Avant le DHCP (lo seule, aucune route) : pas de route
+/// sans interface ; par lo, aucune adresse ne convient (0.0.0.0).
+#[test]
+fn multidiffusion() {
+    let t = machine();
+    let g = [239, 1, 2, 3];
+    let m = |interface, source| Some(Chemin::Multidiffusion { interface, source, locale: false });
+    assert_eq!(t.chercher(g, 0, Portee::Univers), m(ETH0, MOI));
+    assert_eq!(t.chercher([224, 0, 0, 1], 0, Portee::Univers), m(ETH0, MOI));
+    assert_eq!(t.chercher(g, 0, Portee::Lien), None);
+    assert_eq!(t.chercher(g, ETH0, Portee::Lien), m(ETH0, MOI));
+    assert_eq!(t.chercher(g, LO, Portee::Univers), m(LO, MOI));
+    assert_eq!(t.chercher([224, 0, 0, 251], LO, Portee::Univers), m(LO, MOI));
+    assert_eq!(t.router(g, None, 0, Portee::Univers), Some((m(ETH0, MOI).unwrap(), g)));
+    assert_eq!(t.router(g, Some([127, 0, 0, 1]), LO, Portee::Univers), Some((m(LO, MOI).unwrap(), g)));
+    assert_eq!(m(ETH0, [1, 2, 3, 4]).unwrap().source(), [1, 2, 3, 4]);
+    let mut t = Table::new(8).unwrap();
+    t.ajouter_adresse(Adresse { interface: LO, adresse: [127, 0, 0, 1], prefixe: 8, boucle: true }).unwrap();
+    assert_eq!(t.chercher(g, 0, Portee::Univers), None);
+    assert_eq!(t.chercher(g, LO, Portee::Univers), m(LO, [0; 4]));
+    assert_eq!(t.chercher([224, 0, 0, 1], LO, Portee::Univers), m(LO, [0; 4]));
+}
+
 /// La portée du lien (SO_DONTROUTE, MSG_DONTROUTE, une route source stricte) :
 /// la route par défaut, par une passerelle, ne compte plus (mesuré sous
 /// Linux 6.18.33 : `sendto` avec SO_DONTROUTE). Une machine d'ailleurs n'a

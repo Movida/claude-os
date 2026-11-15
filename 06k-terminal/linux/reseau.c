@@ -2981,6 +2981,267 @@ static void multidiffusion(void)
     close(s);
 }
 
+/* La multidiffusion, le trafic (les soldes d'avant 6k ; mesuré sous Linux
+ * 6.18.33, une sonde) : un envoi vers un groupe part par l'interface
+ * d'IP_MULTICAST_IF, sinon par celle de la route (la route par défaut, mais
+ * jamais vers sa passerelle) ; si cette interface a le groupe, et que son
+ * filtre laisse passer la source (RTCF_LOCAL), une copie revient aux
+ * sockets de la machine, comme arrivée par la carte, sauf avec
+ * IP_MULTICAST_LOOP 0 ; un TTL 0 ne sort pas, mais la copie revient. Par lo,
+ * il n'est livré que si lo a le groupe (224.0.0.1). Le TTL : celui d'IP_TTL
+ * en message de contrôle, sinon IP_MULTICAST_TTL (IP_TTL de la socket ne
+ * compte pas). La source : l'adresse donnée à IP_MULTICAST_IF, sinon celle
+ * de la route ; une socket liée à 127.0.0.1, sans interface, envoie par lo
+ * (le « hack de vic/vat »). À l'arrivée, une socket liée au port reçoit
+ * chaque groupe qu'a l'interface (IP_MULTICAST_ALL 1), ou seulement ceux
+ * de ses adhésions (0), selon les filtres de sources : le sien, et celui de
+ * l'interface (qui n'entre pas n'arrive à personne). SO_DONTROUTE : pas de
+ * route par défaut, ENETUNREACH sans interface. TCP : connect vers un
+ * groupe ou une diffusion, ENETUNREACH. Il faut une carte : sinon, sautée. */
+static ssize_t recu_mc(int r, struct sockaddr_in *de, struct in_pktinfo *pi, int *ttl, int ms)
+{
+    struct pollfd f = { .fd = r, .events = POLLIN };
+    memset(pi, 0, sizeof *pi);
+    *ttl = -1;
+    if (poll(&f, 1, ms) != 1)
+        return -1;
+    static char o[2048];
+    char c[CMSG_SPACE(sizeof(struct in_pktinfo)) + CMSG_SPACE(sizeof(int))];
+    struct iovec v = { o, sizeof o };
+    struct msghdr m = { .msg_name = de, .msg_namelen = sizeof *de, .msg_iov = &v, .msg_iovlen = 1, .msg_control = c,
+                        .msg_controllen = sizeof c };
+    ssize_t n = recvmsg(r, &m, MSG_DONTWAIT);
+    for (struct cmsghdr *h = n < 0 ? NULL : CMSG_FIRSTHDR(&m); h; h = CMSG_NXTHDR(&m, h)) {
+        if (h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_PKTINFO)
+            memcpy(pi, CMSG_DATA(h), sizeof *pi);
+        if (h->cmsg_level == IPPROTO_IP && h->cmsg_type == IP_TTL)
+            memcpy(ttl, CMSG_DATA(h), sizeof *ttl);
+    }
+    return n;
+}
+
+/* `r` reçoit-il un datagramme d'un octet de `de`, arrivé par l'interface
+ * `k`, pour `groupe`, notre adresse pour répondre étant `spec`, avec le TTL
+ * `ttl` (-1 : quelconque) ? */
+static int mc_recoit(int r, uint32_t de, int k, uint32_t spec, uint32_t groupe, int ttl)
+{
+    struct sockaddr_in a = { 0 };
+    struct in_pktinfo pi;
+    int t;
+    return recu_mc(r, &a, &pi, &t, 1000) == 1 && a.sin_addr.s_addr == de && pi.ipi_ifindex == k
+           && pi.ipi_spec_dst.s_addr == spec && pi.ipi_addr.s_addr == groupe && (ttl < 0 || t == ttl);
+}
+
+/* `r` ne reçoit-il rien en 200 ms ? */
+static int mc_rien(int r)
+{
+    struct sockaddr_in a;
+    struct in_pktinfo pi;
+    int t;
+    return recu_mc(r, &a, &pi, &t, 200) < 0;
+}
+
+/* Un octet vers `vers`:`port`, avec IP_TTL `ttl` en message de contrôle. */
+static int envoyer_avec_ttl(int s, uint32_t vers, uint16_t port, int ttl)
+{
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = port, .sin_addr.s_addr = vers };
+    char c[CMSG_SPACE(sizeof(int))] = { 0 };
+    struct iovec v = { (void *)"x", 1 };
+    struct msghdr m = { .msg_name = &d, .msg_namelen = sizeof d, .msg_iov = &v, .msg_iovlen = 1, .msg_control = c,
+                        .msg_controllen = sizeof c };
+    struct cmsghdr *h = CMSG_FIRSTHDR(&m);
+    h->cmsg_level = IPPROTO_IP;
+    h->cmsg_type = IP_TTL;
+    h->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(h), &ttl, sizeof ttl);
+    return erreur(sendmsg(s, &m, 0));
+}
+
+/* connect TCP vers `vers` (port 80), d'une socket liée à `source` (0 :
+ * non liée) et à l'interface d'index `interface` (0 : aucune) : son errno
+ * (0 : accepté ; -1 : bind ou SO_BINDTOIFINDEX refusé). */
+static int tcp_depuis(uint32_t source, int interface, uint32_t vers)
+{
+    int t = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    struct sockaddr_in s = { .sin_family = AF_INET, .sin_addr.s_addr = source };
+    struct sockaddr_in d = { .sin_family = AF_INET, .sin_port = htons(80), .sin_addr.s_addr = vers };
+    int e = -1;
+    if ((interface == 0 || setsockopt(t, SOL_SOCKET, SO_BINDTOIFINDEX, &interface, sizeof interface) == 0)
+        && (source == 0 || bind(t, (struct sockaddr *)&s, sizeof s) == 0))
+        e = erreur(connect(t, (struct sockaddr *)&d, sizeof d));
+    close(t);
+    return e;
+}
+
+/* La même, non liée. */
+static int tcp_vers(uint32_t vers)
+{
+    return tcp_depuis(0, 0, vers);
+}
+
+static void multidiffusion_trafic(void)
+{
+    uint32_t passerelle, diffusion;
+    if (!passerelle_par_defaut(&passerelle) || !diffusion_du_reseau(&diffusion)) {
+        verifier(1, "pas de carte : le trafic de la multidiffusion, saute");
+        return;
+    }
+    const uint32_t g = inet_addr("239.1.2.3"), tous = inet_addr("224.0.0.1"), personne = inet_addr("239.9.8.7");
+    const uint32_t boucle = htonl(LO), un_deux = inet_addr("1.2.3.4");
+    int un = 1, zero = 0, v;
+    /* Notre adresse (celle d'une socket connectée ailleurs), et l'index de
+     * la carte (l'arrivée d'un datagramme à nous : IP_PKTINFO). */
+    int s = udp(0), r = udp(0), c;
+    struct sockaddr_in a = adresse(0xc0000201, 9), nous, de;
+    socklen_t l = sizeof nous;
+    connect(s, (struct sockaddr *)&a, sizeof a);
+    getsockname(s, (struct sockaddr *)&nous, &l);
+    close(s);
+    a = adresse(0, 0);
+    l = sizeof a;
+    bind(r, (struct sockaddr *)&a, sizeof a);
+    getsockname(r, (struct sockaddr *)&a, &l);
+    setsockopt(r, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    struct in_pktinfo pi = { 0 };
+    s = udp(0);
+    envoyer_par(s, "x", 1, nous.sin_addr.s_addr, a.sin_port, 0);
+    recu_avec_pktinfo(r, &de, &pi, 1000);
+    close(s);
+    close(r);
+    const int eth = pi.ipi_ifindex;
+    const uint32_t moi = nous.sin_addr.s_addr;
+
+    /* r et c, liées au même port (SO_REUSEADDR) ; r adhère au groupe par la
+     * carte, pas c. s envoie. */
+    r = udp(0);
+    c = udp(0);
+    s = udp(0);
+    a = adresse(0, 0);
+    l = sizeof a;
+    setsockopt(r, SOL_SOCKET, SO_REUSEADDR, &un, sizeof un);
+    setsockopt(c, SOL_SOCKET, SO_REUSEADDR, &un, sizeof un);
+    bind(r, (struct sockaddr *)&a, sizeof a);
+    getsockname(r, (struct sockaddr *)&a, &l);
+    bind(c, (struct sockaddr *)&a, sizeof a);
+    const uint16_t port = a.sin_port;
+    for (int k = 0; k < 2; k++) {
+        setsockopt(k ? c : r, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+        setsockopt(k ? c : r, IPPROTO_IP, IP_RECVTTL, &un, sizeof un);
+    }
+    int ok = mc_mreq(r, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, eth, sizeof(struct ip_mreqn)) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0;
+    ok = ok && mc_recoit(r, moi, eth, moi, g, 1) && mc_recoit(c, moi, eth, moi, g, 1);
+    l = sizeof a;
+    ok = ok && getsockname(s, (struct sockaddr *)&a, &l) == 0 && a.sin_addr.s_addr == 0 && a.sin_port != 0;
+    verifier(ok, "vers un groupe de la carte : la copie revient, de nous, comme arrivee par la carte, TTL 1 ; la source reste 0.0.0.0");
+
+    /* IP_MULTICAST_LOOP 0 : pas de copie. */
+    ok = setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP, &zero, sizeof zero) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_rien(r) && mc_rien(c);
+    setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP, &un, sizeof un);
+    verifier(ok, "IP_MULTICAST_LOOP 0 : pas de copie");
+
+    /* IP_MULTICAST_ALL 0 : seulement les groupes de ses adhésions. c n'en a
+     * aucune ; r n'a pas 224.0.0.1 (que la carte a). */
+    ok = setsockopt(c, IPPROTO_IP, IP_MULTICAST_ALL, &zero, sizeof zero) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_recoit(r, moi, eth, moi, g, 1) && mc_rien(c);
+    setsockopt(c, IPPROTO_IP, IP_MULTICAST_ALL, &un, sizeof un);
+    ok = ok && setsockopt(r, IPPROTO_IP, IP_MULTICAST_ALL, &zero, sizeof zero) == 0;
+    ok = ok && envoyer_par(s, "x", 1, tous, port, 0) == 0 && mc_recoit(c, moi, eth, moi, tous, 1) && mc_rien(r);
+    setsockopt(r, IPPROTO_IP, IP_MULTICAST_ALL, &un, sizeof un);
+    /* Un groupe que personne n'a : rien. */
+    ok = ok && envoyer_par(s, "x", 1, personne, port, 0) == 0 && mc_rien(r) && mc_rien(c);
+    verifier(ok, "IP_MULTICAST_ALL 0 : seulement ses adhesions ; 224.0.0.1 ; un groupe que personne n'a");
+
+    /* Le TTL : IP_TTL de la socket ne compte pas ; IP_MULTICAST_TTL ; IP_TTL
+     * en message de contrôle ; un TTL 0 : la copie revient. */
+    v = 50;
+    ok = setsockopt(s, IPPROTO_IP, IP_TTL, &v, sizeof v) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_recoit(r, moi, eth, moi, g, 1) && mc_recoit(c, moi, eth, moi, g, 1);
+    v = 7;
+    ok = ok && setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &v, sizeof v) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_recoit(r, moi, eth, moi, g, 7) && mc_recoit(c, moi, eth, moi, g, 7);
+    ok = ok && envoyer_avec_ttl(s, g, port, 9) == 0 && mc_recoit(r, moi, eth, moi, g, 9) && mc_recoit(c, moi, eth, moi, g, 9);
+    v = 0;
+    ok = ok && setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &v, sizeof v) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_recoit(r, moi, eth, moi, g, 0) && mc_recoit(c, moi, eth, moi, g, 0);
+    v = 1;
+    setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &v, sizeof v);
+    verifier(ok, "le TTL : IP_MULTICAST_TTL, IP_TTL en message de controle, pas IP_TTL de la socket ; TTL 0, la copie revient");
+
+    /* IP_MULTICAST_IF lo : vers le groupe, personne (lo ne l'a pas) ; vers
+     * 224.0.0.1, livré par lo, de notre adresse (celles de lo sont de portée
+     * « hôte »). */
+    ok = mc_mreq(s, IP_MULTICAST_IF, "0.0.0.0", 0, 1, sizeof(struct ip_mreqn)) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_rien(r) && mc_rien(c);
+    ok = ok && envoyer_par(s, "x", 1, tous, port, 0) == 0 && mc_recoit(r, moi, 1, moi, tous, 1) && mc_recoit(c, moi, 1, moi, tous, 1);
+    /* IP_MULTICAST_IF 127.0.0.1 : par lo, de 127.0.0.1 ; notre adresse : la
+     * carte, de la nôtre. */
+    ok = ok && mc_poser(s, IP_MULTICAST_IF, &boucle, 4) == 0;
+    ok = ok && envoyer_par(s, "x", 1, tous, port, 0) == 0 && mc_recoit(r, boucle, 1, boucle, tous, 1) && mc_recoit(c, boucle, 1, boucle, tous, 1);
+    ok = ok && mc_poser(s, IP_MULTICAST_IF, &moi, 4) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_recoit(r, moi, eth, moi, g, 1) && mc_recoit(c, moi, eth, moi, g, 1);
+    ok = ok && mc_poser(s, IP_MULTICAST_IF, &zero, 4) == 0;
+    verifier(ok, "IP_MULTICAST_IF : lo (livre si lo a le groupe), 127.0.0.1 (la source), notre adresse");
+
+    /* Liée à 127.0.0.1, sans interface : par lo (vic et vat). */
+    int q = udp(0);
+    struct sockaddr_in b = adresse(LO, 0);
+    ok = bind(q, (struct sockaddr *)&b, sizeof b) == 0;
+    ok = ok && envoyer_par(q, "x", 1, tous, port, 0) == 0 && mc_recoit(r, boucle, 1, boucle, tous, 1) && mc_recoit(c, boucle, 1, boucle, tous, 1);
+    ok = ok && envoyer_par(q, "x", 1, g, port, 0) == 0 && mc_rien(r) && mc_rien(c);
+    close(q);
+    verifier(ok, "liee a 127.0.0.1 : par lo, vers 224.0.0.1 seulement");
+
+    /* SO_DONTROUTE : pas de route (la route par défaut ne compte plus) ;
+     * avec une interface, si. */
+    ok = setsockopt(s, SOL_SOCKET, SO_DONTROUTE, &un, sizeof un) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == ENETUNREACH;
+    ok = ok && mc_mreq(s, IP_MULTICAST_IF, "0.0.0.0", 0, eth, sizeof(struct ip_mreqn)) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_recoit(r, moi, eth, moi, g, 1) && mc_recoit(c, moi, eth, moi, g, 1);
+    ok = ok && mc_mreq(s, IP_MULTICAST_IF, "0.0.0.0", 0, 0, sizeof(struct ip_mreqn)) == 0;
+    setsockopt(s, SOL_SOCKET, SO_DONTROUTE, &zero, sizeof zero);
+    verifier(ok, "SO_DONTROUTE vers un groupe : ENETUNREACH sans interface, envoye avec IP_MULTICAST_IF");
+
+    /* Les filtres de sources. Celui de l'interface est l'union de ceux des
+     * adhésions : qui n'y entre pas n'arrive à personne (pas de copie), ni
+     * à r, ni à c (liée au port). INCLUDE {1.2.3.4} : r est seule membre,
+     * l'interface ne laisse entrer que 1.2.3.4 (personne) ; EXCLUDE
+     * {1.2.3.4} (les deux) ; EXCLUDE {nous} (personne) ; c adhère aussi
+     * (EXCLUDE {}) : l'interface laisse tout entrer, le filtre de r
+     * l'arrête encore. */
+    ok = mc_msfilter(r, "239.1.2.3", moi, MCAST_INCLUDE, 1, &un_deux, 20) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_rien(r) && mc_rien(c);
+    ok = ok && mc_msfilter(r, "239.1.2.3", moi, MCAST_EXCLUDE, 1, &un_deux, 20) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_recoit(r, moi, eth, moi, g, 1) && mc_recoit(c, moi, eth, moi, g, 1);
+    ok = ok && mc_msfilter(r, "239.1.2.3", moi, MCAST_EXCLUDE, 1, &moi, 20) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_rien(r) && mc_rien(c);
+    ok = ok && mc_mreq(c, IP_ADD_MEMBERSHIP, "239.1.2.3", 0, eth, sizeof(struct ip_mreqn)) == 0;
+    ok = ok && envoyer_par(s, "x", 1, g, port, 0) == 0 && mc_rien(r) && mc_recoit(c, moi, eth, moi, g, 1);
+    verifier(ok, "les filtres de sources : celui de la socket, puis celui de l'interface");
+    close(r);
+    close(c);
+    close(s);
+
+    /* TCP : ni vers un groupe, ni vers une diffusion (de la carte, ou de
+     * lo). */
+    ok = tcp_vers(g) == ENETUNREACH && tcp_vers(diffusion) == ENETUNREACH && tcp_vers(inet_addr("127.255.255.255")) == ENETUNREACH;
+    verifier(ok, "TCP : connect vers un groupe, une diffusion : ENETUNREACH");
+
+    /* Liée à 127.0.0.1 ou 127.0.0.2, sans interface : le hack de vic et vat
+     * vaut pour TCP aussi (`ip_route_connect`), la route passe par lo, et
+     * c'est le groupe ou la diffusion qui est refusé : ENETUNREACH (pas la
+     * source de la boucle hors de lo, EINVAL, par la route par défaut).
+     * Liée aussi à la carte : pas de hack, EINVAL ; à lo : ENETUNREACH. */
+    const uint32_t lo2 = htonl(LO + 1), limitee = htonl(INADDR_BROADCAST);
+    ok = tcp_depuis(boucle, 0, g) == ENETUNREACH && tcp_depuis(boucle, 0, tous) == ENETUNREACH;
+    ok = ok && tcp_depuis(boucle, 0, limitee) == ENETUNREACH && tcp_depuis(lo2, 0, g) == ENETUNREACH;
+    ok = ok && tcp_depuis(lo2, 0, limitee) == ENETUNREACH && tcp_depuis(moi, 0, g) == ENETUNREACH;
+    ok = ok && tcp_depuis(boucle, eth, g) == EINVAL && tcp_depuis(boucle, eth, limitee) == EINVAL;
+    ok = ok && tcp_depuis(boucle, 1, g) == ENETUNREACH;
+    verifier(ok, "TCP lie a 127.0.0.1 vers un groupe ou 255.255.255.255 : par lo, ENETUNREACH ; lie aussi a la carte : EINVAL");
+}
+
 /* Le compteur `nom` du groupe `groupe` de /proc/net/snmp (« Udp: »,
  * « Icmp: » : deux lignes, les noms puis les valeurs) ; -1 : pas trouvé. */
 static long compteur_snmp(const char *groupe, const char *nom)
@@ -3177,6 +3438,7 @@ int main(int argc, char **argv)
     interface_de_sortie();
     liees();
     multidiffusion();
+    multidiffusion_trafic();
     printf("[linux] reseau : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

@@ -35,6 +35,12 @@
 //! interface demandée, sur le lien de laquelle on la croit alors (mesuré).
 //! Chaque entrée locale garde son interface : celle qu'on voit à l'arrivée
 //! d'un paquet qu'elle livre par lo (le `rt_iif` de Linux, que lit IP_PKTINFO).
+//!
+//! Un groupe de multidiffusion n'est dans aucune table : il part par
+//! l'interface demandée (IP_MULTICAST_IF, IP_PKTINFO, SO_BINDTODEVICE),
+//! sinon par celle de la route qui le contient (la route par défaut), sans
+//! jamais aller à sa passerelle : toutes les machines du lien qui l'écoutent
+//! le prennent (`Chemin::Multidiffusion`).
 
 use alloc::vec::Vec;
 use formats::reseau::ipv4;
@@ -121,13 +127,25 @@ pub enum Chemin {
     /// Par `interface`, à la machine `prochain` (la destination elle-même,
     /// ou la passerelle), depuis `source`.
     Unicast { interface: u32, prochain: [u8; 4], source: [u8; 4] },
+    /// Un groupe de multidiffusion (RTN_MULTICAST) : par `interface`, à
+    /// toutes les machines du lien qui l'écoutent, depuis `source`.
+    /// `locale` : l'interface a le groupe, et son filtre laisse entrer la
+    /// source (RTCF_LOCAL, `ip_check_mc_rcu`) : par une carte, une copie en
+    /// revient aux sockets de la machine ; par lo, il n'est livré ici
+    /// qu'alors. Les groupes des interfaces vivent dans le noyau, que la
+    /// table ne voit pas : elle le laisse faux, le noyau le pose une fois la
+    /// source connue.
+    Multidiffusion { interface: u32, source: [u8; 4], locale: bool },
 }
 
 impl Chemin {
     /// L'adresse source qu'il propose (le `prefsrc` de sa route).
     pub fn source(&self) -> [u8; 4] {
         match *self {
-            Chemin::Locale { source, .. } | Chemin::Diffusion { source, .. } | Chemin::Unicast { source, .. } => source,
+            Chemin::Locale { source, .. }
+            | Chemin::Diffusion { source, .. }
+            | Chemin::Unicast { source, .. }
+            | Chemin::Multidiffusion { source, .. } => source,
         }
     }
 }
@@ -311,8 +329,12 @@ impl Table {
     ///     routes and NO assigned addresses ») : par lo, tout est livré ici.
     ///
     /// Sans interface, la diffusion limitée part par celle de la route par
-    /// défaut (la principale, comme toute destination).
+    /// défaut (la principale, comme toute destination). Un groupe de
+    /// multidiffusion a ses règles (`multidiffusion`).
     pub fn chercher(&self, destination: [u8; 4], oif: u32, portee: Portee) -> Option<Chemin> {
+        if ipv4::multidiffusion(destination) {
+            return self.multidiffusion(destination, oif, portee);
+        }
         let par = |k: u32| oif == 0 || oif == k;
         let proposee = || self.adresse_proposee(oif, ipv4::AUCUNE, Portee::Lien).unwrap_or(ipv4::AUCUNE);
         if oif != 0 && destination == ipv4::DIFFUSION {
@@ -340,6 +362,36 @@ impl Table {
             None if oif != 0 => Some(Chemin::Unicast { interface: oif, prochain: destination, source: proposee() }),
             None => None,
         }
+    }
+
+    /// Le chemin vers le groupe `groupe` (`ip_route_output_key_hash_rcu`,
+    /// puis `__mkroute_output` pour RTN_MULTICAST), qu'aucune entrée de la
+    /// table locale ne contient :
+    ///   - avec une interface : par elle, toujours, de l'adresse qu'elle
+    ///     propose, de portée « lien » pour un groupe du lien (224.0.0.0/24,
+    ///     sans regarder la table), de la portée de la recherche sinon (par
+    ///     lo, dont l'adresse est de portée « hôte » : celle de la carte,
+    ///     mesuré). Linux cherche ensuite une route par elle, qui ne
+    ///     pourrait donner que sa source (le `prefsrc`, une de nos adresses
+    ///     de portée « univers », qu'elle aurait déjà proposée), et sans
+    ///     rien trouver le croit sur son lien : rien ne change ;
+    ///   - sans interface : par celle de la route au plus long préfixe qui
+    ///     le contient (la route par défaut), de sa source, mais jamais vers
+    ///     sa passerelle (« If multicast route do not exist use default one,
+    ///     but do not gateway in this case. Yes, it is hack. » : `fi = NULL`
+    ///     pour un préfixe de moins de 4 bits ; une route de 4 bits ou plus
+    ///     vers des groupes garderait la sienne, mais seul le DHCP ajoute
+    ///     des routes ici : celle du réseau et la route par défaut). Aucune
+    ///     (avant le DHCP, ou la route par défaut ignorée par la portée du
+    ///     lien) : pas de chemin.
+    fn multidiffusion(&self, groupe: [u8; 4], oif: u32, portee: Portee) -> Option<Chemin> {
+        if oif == 0 {
+            return self.meilleure(groupe, 0, portee)
+                .map(|r| Chemin::Multidiffusion { interface: r.interface, source: r.source, locale: false });
+        }
+        let portee = if ipv4::multidiffusion_du_lien(groupe) { Portee::Lien } else { portee };
+        let source = self.adresse_proposee(oif, ipv4::AUCUNE, portee).unwrap_or(ipv4::AUCUNE);
+        Some(Chemin::Multidiffusion { interface: oif, source, locale: false })
     }
 
     /// La route d'un envoi vers `destination`, de la source `source` s'il en

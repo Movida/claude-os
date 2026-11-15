@@ -259,6 +259,12 @@ fn masques() {
     assert_eq!((ipv4::prefixe([0; 4]), ipv4::prefixe([255; 4])), (Some(0), Some(32)));
     assert!(ipv4::dans([10, 0, 2, 99], [10, 0, 2, 0], 24) && !ipv4::dans([10, 0, 3, 1], [10, 0, 2, 0], 24));
     assert!(ipv4::multidiffusion([224, 0, 0, 1]) && !ipv4::multidiffusion([10, 0, 2, 2]));
+    assert!(ipv4::multidiffusion_du_lien([224, 0, 0, 251]) && !ipv4::multidiffusion_du_lien([224, 0, 1, 1]));
+    // Les adresses MAC des groupes (mesurées sous Linux 6.18.33 : une
+    // capture AF_PACKET) : 01:00:5e et les 23 bits bas.
+    assert_eq!(ethernet::de_groupe([239, 1, 2, 3]), [0x01, 0x00, 0x5e, 0x01, 0x02, 0x03]);
+    assert_eq!(ethernet::de_groupe([224, 0, 0, 22]), [0x01, 0x00, 0x5e, 0x00, 0x00, 0x16]);
+    assert_eq!(ethernet::de_groupe([239, 129, 2, 3]), ethernet::de_groupe([224, 1, 2, 3]));
 }
 
 /// Les options d'un paquet reçu, lues par `compiler_options` comme Linux les

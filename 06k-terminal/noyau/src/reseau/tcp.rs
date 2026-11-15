@@ -581,9 +581,9 @@ pub struct Segment {
     /// options : leur écho, pour lui répondre), l'interface d'arrivée.
     ip: ipv4::EnteteRecu,
     interface: u32,
-    /// Sa destination est une diffusion, dans une trame pour nous seuls (le
-    /// RTCF_BROADCAST de sa route) : une écoute de 0.0.0.0 la voit, mais n'en
-    /// fait jamais de fille.
+    /// Sa destination est une diffusion ou un groupe, dans une trame pour
+    /// nous seuls (le RTCF_BROADCAST | RTCF_MULTICAST de sa route) : une
+    /// écoute de 0.0.0.0 la voit, mais n'en fait jamais de fille.
     diffusion: bool,
     fille: Option<u64>,
     /// Un SYN qui reprend le quadruplet d'une entrée de TIME_WAIT : le
@@ -1139,7 +1139,7 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
 /// socket (`__ip_queue_xmit`, `inet_csk_route_req`) ; une réponse sans socket
 /// (`reponse`) part quand même (`ip_send_unicast_reply` ne la regarde pas).
 fn route_de_segment(ip: &Ip, source: [u8; 4], distante: [u8; 4], reponse: bool) -> Option<(inet::routes::Chemin, [u8; 4])> {
-    ipv4::router_depuis(ip.vers(distante), source, ip.oif, ip.transparent, ip.portee).ok().filter(|(c, d)| {
+    ipv4::router_depuis(ip.vers(distante), source, ip.oif, ip.transparent, ip.portee).ok().map(|(c, d, _)| (c, d)).filter(|(c, d)| {
         !ip.options.places.stricte || reponse || !matches!(c, inet::routes::Chemin::Unicast { prochain, .. } if *prochain != *d)
     })
 }
@@ -1177,7 +1177,9 @@ fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], 
     let envoi = ipv4::Envoi {
         source, destination, protocole: fipv4::TCP, ttl: ip.ttl, tos: ip.tos, identifiant: *identifiant,
         ne_pas_fragmenter: ipv4::ne_pas_fragmenter(ip.pmtudisc, destination), mtu: ipv4::mtu_d_envoi(ip.pmtudisc, &chemin, destination), confirmer: false,
-        options: ip.options, destination_finale: finale,
+        // TCP ne parle jamais à un groupe (`connect` le refuse, un SYN pour
+        // un groupe est jeté) : IP_MULTICAST_LOOP n'a rien à régler.
+        options: ip.options, destination_finale: finale, boucle_mc: true,
     };
     ipv4::emettre(chemin, &envoi, p);
     true
@@ -1349,7 +1351,7 @@ impl Partie {
             return;
         }
         ipv4::apprendre_mtu(distante, info);
-        let Ok((c, d)) = ipv4::router(distante, None, oif, portee) else { return };
+        let Ok((c, d)) = ipv4::router(distante, oif, portee) else { return };
         // (`ip_sk_accept_pmtu`, et IP_PMTUDISC_DONT.)
         let suivre = !matches!(pmtudisc, 0 | 4 | 5);
         t.mtu_reduite(info, ipv4::mtu_vers(&c, d), ipv4::ne_pas_fragmenter(pmtudisc, d), suivre);
@@ -1437,9 +1439,10 @@ impl Partie {
             return;
         }
         // Ni un SYN, ni un SYN|FIN : rien, pas même un RST : ce que distinguent les balayages FIN et
-        // NULL (`TCP_FLAGS`). Un SYN vers une diffusion : rien non plus (`tcp_v4_conn_request`,
-        // ListenDrops). (Un ACK vers elle a tenté plus haut son RST : il compte, mais n'a pas de
-        // route, sauf de la diffusion d'un réseau pour une écoute IP_TRANSPARENT.)
+        // NULL (`TCP_FLAGS`). Un SYN vers une diffusion ou un groupe : rien non plus
+        // (`tcp_v4_conn_request`, ListenDrops). (Un ACK vers eux a tenté plus haut son RST : il
+        // compte, mais n'a pas de route, sauf de la diffusion d'un réseau pour une écoute
+        // IP_TRANSPARENT.)
         if h.drapeaux & ftcp::SYN == 0 || h.drapeaux & ftcp::FIN != 0 || s.diffusion {
             return;
         }
@@ -1577,7 +1580,7 @@ fn cle_secrete() -> crypto::siphash::Cle {
 /// (Par l'interface `oif`, la liaison de la socket, et de la portée de ses
 /// routes, comme ses segments.)
 fn sans_carte(distante: [u8; 4], oif: u32, portee: Portee) -> bool {
-    ipv4::router(distante, None, oif, portee).is_ok_and(|(c, _)| ipv4::par_lo(&c))
+    ipv4::router(distante, oif, portee).is_ok_and(|(c, _)| ipv4::par_lo(&c))
 }
 
 /// Le MSS qu'on annonce pour parler à `distante` : la MTU du chemin moins
@@ -1585,7 +1588,7 @@ fn sans_carte(distante: [u8; 4], oif: u32, portee: Portee) -> bool {
 fn mss_vers(distante: [u8; 4], oif: u32, portee: Portee) -> u16 {
     // (`ipv4_default_advmss` : d'après la MTU du chemin, ce qu'on en a appris compris, et au
     // moins `ip_rt_min_advmss`.)
-    match ipv4::router(distante, None, oif, portee) {
+    match ipv4::router(distante, oif, portee) {
         Ok((c, d)) => (ipv4::mtu_vers(&c, d).saturating_sub(40)).clamp(256, 65_495) as u16,
         Err(_) => itcp::MSS_DEFAUT,
     }
@@ -1605,9 +1608,9 @@ fn livrer(s: Segment) {
         Some(Destinataire::TempsAttente(n)) => temps_attente(n, s),
         // Sans socket, un RST seulement pour une de nos adresses
         // (`tcp_v4_send_reset` : la route du segment reçu doit être
-        // RTN_LOCAL) : pas pour une diffusion, ni pour une adresse d'ailleurs
-        // que lo nous a livrée (le SYN d'une socket liée à lo vers 192.0.2.1),
-        // sans rien compter.
+        // RTN_LOCAL) : pas pour une diffusion ou un groupe, ni pour une
+        // adresse d'ailleurs que lo nous a livrée (le SYN d'une socket liée à
+        // lo vers 192.0.2.1), sans rien compter.
         None if ipv4::est_a_nous(s.destination) => {
             repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, 0, false);
         }
@@ -1761,7 +1764,7 @@ fn par_numero(n: u64) -> Option<Arc<Socket>> {
 /// dans InSegs comme les autres (« même mauvais », `tcp_v4_rcv`), et dans
 /// InErrs s'il a un en-tête faux (`bad_packet`) ou une somme fausse (avec
 /// InCsumErrors) ; pas s'il est trop court pour son en-tête (`discard_it`).
-/// `diffusion` : sa destination est une diffusion.
+/// `diffusion` : sa destination est une diffusion ou un groupe.
 pub fn recevoir(ip: &fipv4::Ipv4, recu: &ipv4::EnteteRecu, i: &super::interface::Interface, iif: u32, diffusion: bool, mut p: Paquet) {
     MIB.tcp(Compteur::InSegs);
     let (source, destination, par_lo) = (ip.source, ip.destination, i.boucle());
@@ -1980,8 +1983,10 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 // La route, la source, le port. La source : l'adresse de
                 // `bind` (même sans port), sauf une diffusion ou une
                 // multidiffusion (`inet_saddr` à 0 : celle de la route) ;
-                // une qui n'est pas à nous (IP_FREEBIND) : ENETUNREACH, sauf
-                // avec IP_TRANSPARENT (`ip_route_connect`, comme UDP).
+                // ses contrôles et le hack de vic/vat sont ceux d'UDP
+                // (`ip_route_connect` : `ipv4::router_depuis`) ; une qui
+                // n'est pas à nous (IP_FREEBIND) : ENETUNREACH, sauf avec
+                // IP_TRANSPARENT.
                 // Une route source (`tcp_v4_connect`) : une vraie destination
                 // (EINVAL pour 0.0.0.0), gardée telle quelle ; la route va à sa
                 // première étape.
@@ -1992,22 +1997,22 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 }
                 let op = s.appels.verrouiller().options;
                 let liee = Some(p.adresses.adresse).filter(|&x| x != [0; 4] && !super::datagramme::diffusion(x));
-                if let Some(x) = liee
-                    && !op.transparent
-                    && !ipv4::avec_table(|t| t.est_a_nous(x)).unwrap_or(false)
-                {
-                    return Err(super::datagramme::sans_route());
-                }
                 // Par la liaison (`tcp_v4_connect` : `sk_bound_dev_if`, seule ;
                 // IP_UNICAST_IF ne compte pas) : une interface qui n'existe pas
                 // (SO_BINDTOIFINDEX ne le vérifie pas) : ENODEV.
                 const ENETUNREACH: i64 = 101;
-                let (chemin, routee) = ipv4::router(ip.vers(a.adresse), liee, ip.oif, ip.portee)
-                    .map_err(|e| if e == -ENETUNREACH { super::datagramme::sans_route() } else { e })?;
+                let (chemin, routee) = match liee {
+                    Some(x) => ipv4::router_depuis(ip.vers(a.adresse), x, ip.oif, op.transparent, ip.portee).map(|(c, d, _)| (c, d)),
+                    None => ipv4::router(ip.vers(a.adresse), ip.oif, ip.portee),
+                }
+                .map_err(|e| if e == -ENETUNREACH { super::datagramme::sans_route() } else { e })?;
                 let destination = if srr { a.adresse } else { routee };
                 let source = liee.unwrap_or_else(|| chemin.source());
-                if fipv4::boucle(source) && !ipv4::par_lo(&chemin) {
-                    return Err(-EINVAL);
+                // Ni une diffusion, ni un groupe (`tcp_v4_connect` :
+                // RTCF_BROADCAST, RTCF_MULTICAST) : une route trouvée, sans
+                // OutNoRoutes.
+                if matches!(chemin, inet::routes::Chemin::Diffusion { .. } | inet::routes::Chemin::Multidiffusion { .. }) {
+                    return Err(-ENETUNREACH);
                 }
                 let lien = Lien {
                     sorte: Sorte::Liee, adresse: source, port: 0, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
@@ -2905,7 +2910,7 @@ pub fn mtu_du_chemin(s: &Socket) -> Option<u32> {
     if !matches!(p.mode, Mode::Connexion(_)) || p.route_oubliee {
         return None;
     }
-    ipv4::router(p.adresses.distante, None, p.options.interface, Ip::de(&p.options).portee).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
+    ipv4::router(p.adresses.distante, p.options.interface, Ip::de(&p.options).portee).ok().map(|(c, d)| ipv4::mtu_vers(&c, d))
 }
 
 /// SO_RCVBUF, qui grandit de même (reception.rs).
