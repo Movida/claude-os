@@ -2244,8 +2244,11 @@ impl<P: Charge> Tcb<P> {
                 self.livres += 1;
             } else {
                 // La socket naît ici (`inet_csk_clone_lock`, `tcp_create_openreq_child`) : rien des
-                // échéances de la simple demande, et la fenêtre que dit ce segment.
+                // échéances de la simple demande, ni son minuteur (le RTO de son SYN-ACK : rien
+                // n'est en vol, et une sonde doit pouvoir s'armer), et la fenêtre que dit ce
+                // segment.
                 self.recul = 0;
+                self.t_xmit = None;
                 self.max_fenetre = (t.fenetre as u32) << self.echelle_envoi;
             }
             self.etablir(maintenant);

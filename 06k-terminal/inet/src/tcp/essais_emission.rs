@@ -37,6 +37,19 @@ fn le_minuteur_d_une_fille() {
     assert_eq!(c.t_xmit, Some(HEURE + 2000 * MS));
 }
 
+/// La socket qui naît d'une fille n'a pas le minuteur de sa demande (`inet_csk_clone_lock` :
+/// aucun) : le RTO de son SYN-ACK ne court plus, et une fenêtre fermée arme la sonde dès le
+/// premier envoi (`tcp_check_probe_timer`, qui ne voit rien en attente).
+#[test]
+fn une_fille_nee_sans_minuteur() {
+    let mut c = etablie(true);
+    assert_eq!(c.t_xmit, None);
+    c.snd_wnd = 0;
+    ecrits(&mut c, 100);
+    assert!(sortants(&mut c, HEURE).is_empty());
+    assert_eq!((c.t_sorte, c.t_xmit), (Minuteur::Sonde, Some(HEURE + c.rto.max(RTO_MIN))));
+}
+
 /// `tcp_write_timeout` : le compte de la poignée de main.
 #[test]
 fn abandonner_la_poignee_de_main() {
