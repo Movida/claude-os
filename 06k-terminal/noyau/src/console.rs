@@ -99,13 +99,26 @@ pub fn urgence(args: fmt::Arguments) {
 /// pas ses tics ; un message du noyau, court, est écrit d'un coup.
 static ECRITURES: Mutex<()> = Mutex::new(());
 
-/// Le verrou des écritures, quand on a le droit de dormir pour l'attendre :
-/// les tâches existent, et les interruptions sont actives (donc aucun
-/// Verrou n'est tenu, et on n'est pas dans un gestionnaire d'interruption).
-/// Sinon (le démarrage, un gestionnaire, une panique), on écrit sans lui :
-/// un message du noyau ne doit jamais attendre (comme printk).
+/// Le verrou des écritures, pour un message du noyau, qui ne doit jamais
+/// attendre là où l'on n'a pas le droit de dormir (comme printk) :
+/// - avant que les tâches existent (`tache::initialiser`), interruptions
+///   coupées (un Verrou tenu, un gestionnaire d'interruption, un
+///   secondaire qui démarre, une panique) : on écrit sans lui ;
+/// - dans la tâche inactive, qui ne dort jamais (tache.rs), et préemption
+///   coupée : on le prend s'il est libre, sans dormir (le `console_trylock`
+///   de printk), et on écrit sans lui sinon, au risque de mêler deux
+///   lignes ;
+/// - partout ailleurs, on l'attend.
+/// L'inactive du premier processeur n'écrit, interruptions actives,
+/// qu'avant d'avoir lancé init, seule (personne d'autre ne le tient).
 fn verrou_des_ecritures() -> Option<GardeMutex<'static, ()>> {
-    (crate::tache::en_service() && crate::cpu::interruptions_actives()).then(|| ECRITURES.verrouiller())
+    if !crate::tache::en_service() || !crate::cpu::interruptions_actives() {
+        return None;
+    }
+    if crate::tache::courante().est_inactive() || crate::processeur::preemption_coupee() {
+        return ECRITURES.essayer();
+    }
+    Some(ECRITURES.verrouiller())
 }
 
 /// Un message du noyau en cours de formatage : d'abord dans ce tampon,

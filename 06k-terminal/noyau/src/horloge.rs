@@ -195,9 +195,10 @@ pub fn attendre_us(us: u64) {
     }
 }
 
-/// Endort le processeur jusqu'à ce que `ms` millisecondes soient passées.
-/// `hlt` arrête le CPU jusqu'à la prochaine interruption : entre deux tics,
-/// il ne consomme presque rien (au lieu de tourner dans une boucle vide).
+/// Attend que `ms` millisecondes soient passées, le processeur arrêté par
+/// `hlt` entre deux tics : il ne consomme presque rien (au lieu de tourner
+/// dans une boucle vide). Ce n'est pas un sommeil : la tâche garde le
+/// processeur, sauf préemption (le `mdelay` de Linux, pas `msleep`).
 pub fn attendre_ms(ms: u64) {
     let fin = tics() + ms * HZ as u64 / 1000;
     loop {

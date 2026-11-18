@@ -213,8 +213,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 //
 // Ce fichier n'est pas un module d'abstraction, mais le démarrage touche
 // le matériel et la mémoire physique avant que tout soit en place : son
-// entrée, `noyau_main` et les auto-tests qui lisent la mémoire par ses
-// adresses ont chacun leur #[allow(unsafe_code)].
+// entrée, `noyau_main`, l'extinction de QEMU à la fin d'`init` (le
+// scénario des programmes de `make tests-qemu`) et les auto-tests qui
+// lisent la mémoire par ses adresses ont chacun leur #[allow(unsafe_code)].
 #[allow(unsafe_code)]
 mod entree {
     core::arch::global_asm!(
@@ -445,6 +446,70 @@ extern "C" fn noyau_main(infos: u64) -> ! {
                                                             hz / 1_000_000, hz / 1000 % 1000, etalon, horloge::HZ, apic::VECTEUR_TIMER),
         horloge::Source::Pit => afficherln!("[noyau] Horloge : PIT, {} Hz, vecteur {:#x}.", horloge::HZ, irq::vecteur(horloge::IRQ)),
     }
+    // La suite du démarrage passe dans la tâche init (le `rest_init` de
+    // Linux), et le code en cours devient pour de bon la tâche inactive du
+    // processeur 0. Il l'est depuis `tache::initialiser`, et une inactive ne
+    // dort jamais (tache.rs, le champ `inactive`) : or la suite attend, la
+    // console qu'une tâche tient (un Mutex), les tâches de ses tests, la
+    // réponse du DHCP. Le `kernel_init` de Linux fait de même `smp_init` et
+    // les initcalls (les pilotes) avant de lancer /sbin/init.
+    // Jusqu'aux soldes d'avant 6k, noyau_main faisait tout cela lui-même
+    // avant sa boucle, et dormait sur la console quand la tâche de virtio-rng
+    // l'avait : son réveil, sur un autre processeur, attendait sous le verrou
+    // du Mutex qu'il ait quitté son processeur, ce qu'une inactive qui
+    // s'exécute ne fait jamais, et noyau_main attendait ce verrou pour voir
+    // s'il était toujours en file : un interblocage, trois démarrages sur
+    // cent du scénario test-retard. Écartés : traiter l'inactive à part dans
+    // le réveil (elle dormirait encore, interruptions coupées : sur un seul
+    // processeur, une attente qui dépend d'une interruption n'y finirait
+    // jamais), ou la faire dormir par `sti ; hlt` (des cas à part de plus,
+    // pour ce que Linux ne fait pas).
+    //
+    // Le rendeur des piles des tâches mortes (tache.rs) d'abord, avant
+    // toute tâche qui puisse mourir. Lancer une tâche cède aussitôt le
+    // processeur (l'inactive cède à toute tâche prête) : noyau_main
+    // n'atteint sa boucle qu'au premier sommeil d'init, et ne tient rien
+    // entre-temps.
+    tache::lancer_rendeur();
+    if tache::lancer_detachee(programmes::NomCourt::de(b"init"), init).is_none() {
+        panic!("pas de pile pour la tache init");
+    }
+
+    // La boucle de l'inactive (ordonnanceur.rs) : elle prend le processeur
+    // quand aucune autre tâche n'est prête, tire du travail des autres
+    // files, regarde si des programmes ne sont pas bloqués pour toujours
+    // (attente::detecter_interblocage), et arrête le processeur (sti ; hlt)
+    // jusqu'à la prochaine interruption.
+    ordonnanceur::boucle_inactive()
+}
+
+/// La tâche init (le `kernel_init` de Linux) : la fin du démarrage, que
+/// l'inactive ne peut pas faire (voir la fin de `noyau_main`), puis le
+/// lanceur de /etc/demarrage (programmes.rs), et l'extinction du scénario
+/// des programmes de `make tests-qemu`. Les lignes du journal gardent
+/// l'ordre qu'elles avaient quand noyau_main en faisait la première moitié
+/// (attendu.txt est vérifié « dans l'ordre »). Les tests qu'elle appelle
+/// ne sont jamais inlinés (#[inline(never)], le `noinline_for_stack` de
+/// Linux) : appelés une seule fois, ils l'étaient tous, et leurs variables
+/// (près de 2 Kio) restaient dans le cadre d'init, sur sa pile de 16 Kio,
+/// pendant les auto-tests du réseau et tous les programmes (« Piles du
+/// noyau » : 11,4 Kio au plus, au lieu de 9,7, pour 12 permis). Les autres
+/// fonctions qu'elle n'appelle qu'une fois (le démarrage des secondaires,
+/// du réseau, des programmes) ne le sont pas aujourd'hui ; si elles le
+/// devenaient, « Piles du noyau » le dirait (ECHEC au-delà de 12 Kio).
+fn init() {
+    // Épinglée sur le processeur 0 le temps de démarrer les autres et de les
+    // vérifier : le démarrage mesure le TSC de chacun contre le sien, et les
+    // tests des IPI et des TLB visent « tous sauf le 0 ». Linux épingle de
+    // même kernel_init sur le processeur du démarrage (`rest_init`), et ne
+    // le libère qu'une fois les autres démarrés (`sched_init_smp`). Sans
+    // course : seul le 0 est en service tant qu'init n'a pas démarré les
+    // autres. Son masque d'avant (tous : une tâche détachée) est rendu
+    // ensuite ; les programmes qu'elle lancera en héritent (les tâches des
+    // pilotes, détachées, ont le leur).
+    let affinite = tache::courante().affinite();
+    tache::courante().poser_affinite(1);
+    ordonnanceur::affinite_changee(tache::courante());
     // Les processeurs secondaires (smp.rs) : maintenant que l'APIC, l'horloge,
     // vmalloc et les tâches sont en place, et que les registres de contrôle
     // du premier ont leur valeur finale, qu'ils doivent reprendre.
@@ -457,6 +522,8 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     afficherln!("[noyau] 100 ms plus tard : {} tics comptes.", horloge::tics());
     tester_vecteurs();
     tester_tlb();
+    tache::courante().poser_affinite(affinite);
+    ordonnanceur::affinite_changee(tache::courante());
     tester_remplacement();
     match temps::initialiser() {
         Some((annee, mois, jour, heure, minute, seconde)) => afficherln!(
@@ -481,7 +548,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     #[cfg(feature = "test-garde")]
     {
         afficherln!("[noyau] Test : debordement volontaire de la pile d'une tache.");
-        tache::lancer_noyau(programmes::NomCourt::de(b"test-garde"), || {
+        tache::lancer_detachee(programmes::NomCourt::de(b"test-garde"), || {
             deborder(0);
         });
     }
@@ -490,7 +557,7 @@ extern "C" fn noyau_main(infos: u64) -> ! {
     // tapée, puis l'affiche.
     match clavier::initialiser() {
         Ok(()) => {
-            tache::lancer_noyau(programmes::NomCourt::de(b"clavier"), clavier::tache);
+            tache::lancer_detachee(programmes::NomCourt::de(b"clavier"), clavier::tache);
             afficherln!("[noyau] Clavier PS/2 pret : tapez du texte.")
         }
         Err(()) => afficherln!("[noyau] Pas de controleur clavier 8042 qui reponde."),
@@ -505,74 +572,57 @@ extern "C" fn noyau_main(infos: u64) -> ! {
 
     afficherln!("[noyau] Ordonnanceur EEVDF : tranche de {}.{:02} ms, preemption du noyau.",
                 ordonnanceur::TRANCHE / 1_000_000, ordonnanceur::TRANCHE / 10_000 % 100);
-    // init : vérifie l'ordonnanceur, puis lance /etc/demarrage, dans sa
-    // tâche.
-    let init = || {
-        // Les tests de l'ordonnanceur de 6e supposent que leurs tâches se
-        // partagent UN processeur (la préemption ne se prouve pas sur
-        // deux) : init s'épingle sur le processeur 0, ses tâches héritent
-        // du masque, puis il le rend.
-        let affinite = tache::courante().affinite();
-        tache::courante().poser_affinite(1);
-        ordonnanceur::affinite_changee(tache::courante());
-        tester_ordonnanceur();
-        tester_sommeil();
-        tester_verrou_le();
-        tache::courante().poser_affinite(affinite);
-        ordonnanceur::affinite_changee(tache::courante());
-        tester_parallele();
-        tester_tourner();
-        tester_torture();
-        reseau::configurer();
-        tester_voisins();
-        reseau::autotest::lancer();
-        match tsc::finir_affinage() {
-            Some(tsc::Affinage::Fait { khz, avant }) => afficherln!(
-                "[noyau] TSC affine contre le PM timer de l'ACPI : {}.{:03} MHz ({} ppm de la premiere mesure).",
-                khz / 1000, khz % 1000, (khz as i64 - avant as i64) * 1_000_000 / avant as i64),
-            Some(tsc::Affinage::Rejete { khz, avant }) => afficherln!(
-                "[noyau] TSC : l'affinage donne {}.{:03} MHz, a plus de 1 % des {}.{:03} mesures : garde.",
-                khz / 1000, khz % 1000, avant / 1000, avant % 1000),
-            Some(tsc::Affinage::Abandonne) => afficherln!("[noyau] TSC : pas d'affinage (le TSC ne sert plus, ou le PM timer ne bouge pas)."),
-            None => {}
-        }
-        programmes::demarrer();
-        if cpu::bogue_sysret_ss() {
-            afficherln!("[noyau] Processeur AMD : SS recharge a {} bascules, pour sysretq.", cpu::ss_recharges());
-        }
-        // Le scénario des programmes de test de `make tests-qemu` : une
-        // fois l'archive exécutée, éteindre QEMU par son périphérique
-        // isa-debug-exit (présent seulement si on le demande à QEMU, à ce
-        // port-là). Jamais dans le noyau ordinaire : sur une vraie
-        // machine, ce port peut être n'importe quoi.
-        #[cfg(feature = "test-programmes")]
-        {
-            afficherln!("[noyau] Fin des tests : extinction de QEMU.");
-            // SAFETY: le port 0xf4 est celui d'isa-debug-exit dans
-            // `make tests-qemu` ; QEMU s'arrête aussitôt.
-            unsafe { port::ecrire(0xf4, 0) };
-        }
-    };
-    // Le rendeur des piles des tâches mortes (tache.rs), avant toute tâche
-    // qui puisse mourir.
-    tache::lancer_rendeur();
-    if tache::lancer_noyau(programmes::NomCourt::de(b"init"), init).is_none() {
-        afficherln!("[noyau] Pas de pile pour la tache init : rien a lancer.");
+    // Les tests de l'ordonnanceur de 6e supposent que leurs tâches se
+    // partagent UN processeur (la préemption ne se prouve pas sur deux) :
+    // init s'épingle de nouveau sur le processeur 0, ses tâches héritent du
+    // masque, puis elle le rend.
+    tache::courante().poser_affinite(1);
+    ordonnanceur::affinite_changee(tache::courante());
+    tester_ordonnanceur();
+    tester_sommeil();
+    tester_verrou_le();
+    tache::courante().poser_affinite(affinite);
+    ordonnanceur::affinite_changee(tache::courante());
+    tester_parallele();
+    tester_tourner();
+    tester_torture();
+    reseau::configurer();
+    tester_voisins();
+    reseau::autotest::lancer();
+    match tsc::finir_affinage() {
+        Some(tsc::Affinage::Fait { khz, avant }) => afficherln!(
+            "[noyau] TSC affine contre le PM timer de l'ACPI : {}.{:03} MHz ({} ppm de la premiere mesure).",
+            khz / 1000, khz % 1000, (khz as i64 - avant as i64) * 1_000_000 / avant as i64),
+        Some(tsc::Affinage::Rejete { khz, avant }) => afficherln!(
+            "[noyau] TSC : l'affinage donne {}.{:03} MHz, a plus de 1 % des {}.{:03} mesures : garde.",
+            khz / 1000, khz % 1000, avant / 1000, avant % 1000),
+        Some(tsc::Affinage::Abandonne) => afficherln!("[noyau] TSC : pas d'affinage (le TSC ne sert plus, ou le PM timer ne bouge pas)."),
+        None => {}
     }
-
-    // Le code du démarrage est maintenant la tâche inactive du processeur
-    // 0 : sa boucle (ordonnanceur.rs) prend le processeur quand aucune
-    // autre tâche n'est prête, tire du travail des autres files, regarde si
-    // des programmes ne sont pas bloqués pour toujours
-    // (attente::detecter_interblocage), et arrête le processeur (sti ; hlt)
-    // jusqu'à la prochaine interruption.
-    ordonnanceur::boucle_inactive()
+    programmes::demarrer();
+    if cpu::bogue_sysret_ss() {
+        afficherln!("[noyau] Processeur AMD : SS recharge a {} bascules, pour sysretq.", cpu::ss_recharges());
+    }
+    // Le scénario des programmes de test de `make tests-qemu` : une
+    // fois l'archive exécutée, éteindre QEMU par son périphérique
+    // isa-debug-exit (présent seulement si on le demande à QEMU, à ce
+    // port-là). Jamais dans le noyau ordinaire : sur une vraie
+    // machine, ce port peut être n'importe quoi.
+    #[cfg(feature = "test-programmes")]
+    #[allow(unsafe_code)]
+    {
+        afficherln!("[noyau] Fin des tests : extinction de QEMU.");
+        // SAFETY: le port 0xf4 est celui d'isa-debug-exit dans
+        // `make tests-qemu` ; QEMU s'arrête aussitôt.
+        unsafe { port::ecrire(0xf4, 0) };
+    }
 }
 
 /// Vérifie l'ordonnanceur et la préemption du noyau : deux tâches du noyau
 /// qui calculent chacune 20 ms, sans jamais céder d'elles-mêmes, doivent se
 /// partager le processeur : chacune voit le compteur de l'autre avancer
 /// pendant son propre calcul, ce qui n'arrive que si le tic l'a préemptée.
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_ordonnanceur() {
     use core::sync::atomic::AtomicU64;
     static COMPTEURS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -687,6 +737,7 @@ fn tester_ordonnanceur() {
 /// noyau qui calculent 50 ms chacune finissent en moins de 150 ms quand il
 /// y a au moins deux processeurs (200 au moins l'une après l'autre) ; sur
 /// un seul, la durée est seulement dite.
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_parallele() {
     let n = processeur::nombre();
     let debut = temps::ns_monotone();
@@ -738,6 +789,7 @@ fn dormir_ms(ms: u64) {
 /// de tous les verrous qui dorment : personne d'autre n'en dispute un
 /// pendant ce test (init attend, les programmes ne sont pas lancés). Deux
 /// processeurs au moins.
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_tourner() {
     if processeur::nombre() < 2 {
         afficherln!("[noyau] Verrous qui dorment : un seul processeur, pas de tour a verifier.");
@@ -831,6 +883,7 @@ fn tester_tourner() {
 /// un, pendant qu'elle attend ce réveil sans dormir) voit son `dormir`
 /// revenir tout de suite, avec la raison. Les deux pannes que le protocole
 /// exclut : une tâche perdue, un réveil perdu.
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_sommeil() {
     static CONDITION: AtomicBool = AtomicBool::new(false);
     static RESULTAT: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
@@ -911,6 +964,7 @@ fn tester_sommeil() {
 ///      l'écrivain passe, puis rétrograde (D) : le lecteur entre pendant
 ///      qu'il lit encore. L'écrivain attend de le voir entré pour rendre le
 ///      verrou (d), et le lecteur, de le voir rendu (n) : « MmGDNdn ».
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_verrou_le() {
     use core::sync::atomic::{AtomicU8, AtomicUsize};
     static V: attente::VerrouLE<()> = attente::VerrouLE::new(());
@@ -1060,6 +1114,7 @@ fn tester_verrou_le() {
 /// l'interruption de réception), puis part. Dans le noyau des tests, une
 /// adresse muette du réseau (10.0.2.99) : trois requêtes, l'échec au bout
 /// de trois secondes, et son paquet jeté. Sans adresse : rien.
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_voisins() {
     use reseau::arp;
     use inet::voisins::Etat;
@@ -1301,6 +1356,7 @@ fn tester_grands_blocs() {
 /// une, mise en service, une entrée programmée puis relue, et rendue (la
 /// table masquée, MSI-X coupé, la projection rendue). Sans APIC (le 8259
 /// de repli), ni l'un ni l'autre : on le dit.
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_vecteurs() {
     use core::sync::atomic::AtomicUsize;
     static RECU: AtomicUsize = AtomicUsize::new(0);
@@ -1390,6 +1446,7 @@ fn tester_vecteurs() {
 /// doit quand même demander le vidage aux autres (`MasqueProcesseurs::
 /// retraits`). Le mécanisme seul : les secondaires ignorent une PML4 qu'ils
 /// n'ont pas chargée.
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_tlb() {
     use espace_utilisateur::{EspaceUtilisateur, Lot};
     if processeur::nombre() < 2 {
@@ -1401,6 +1458,11 @@ fn tester_tlb() {
     let chacun_a_recu = |avant: &[u32; processeur::MAX]| {
         (1..processeur::MAX).filter(|&n| autres >> n & 1 != 0).all(|n| processeur::zone(n).appels_recus.load(Ordering::Relaxed) >= avant[n] + 1)
     };
+    // Le rendeur d'abord au repos : ses propres vidages (une pile, un grand
+    // bloc du tas rendus) font aussi monter le compte des appels reçus, et
+    // le test passerait sans que le sien soit arrivé. Plus rien ne meurt
+    // ensuite pendant le test : init est la seule tâche qui travaille.
+    tache::attendre_le_rendeur();
     let rw = zones::Droits { lecture: true, ecriture: true, execution: false };
     let e = verrou::Verrou::new(EspaceUtilisateur::creer().expect("plus de memoire"));
     let page = 0x40_0000;
@@ -1434,6 +1496,7 @@ fn tester_tlb() {
 /// Quand A revient finir, `remplacer` doit refuser (la marque n'est plus
 /// la sienne) ; C, lui, finit. Un seul processeur suffit : c'est un ABA,
 /// pas une course.
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_remplacement() {
     use espace_utilisateur::{EspaceUtilisateur, Lot, Servi};
     let rw = zones::Droits { lecture: true, ecriture: true, execution: false };
@@ -1490,6 +1553,7 @@ fn aller_sur(n: u32) {
 /// mettrait une tâche deux fois en file, ce que `File::ajouter` refuse).
 /// Chaque attente est bornée : un réveil perdu se voit en dix secondes au
 /// lieu de figer le démarrage.
+#[inline(never)] // Hors du cadre d'init (voir init).
 fn tester_torture() {
     const PAR_TACHE: u64 = 100_000;
     const PAR_MUTEX: u64 = 10_000;

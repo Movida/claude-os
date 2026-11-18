@@ -575,6 +575,7 @@ pub enum Inscription {
 /// l'échéance ou un signal qui a réveillé : la condition est revue une
 /// dernière fois, ce qui arrive en même temps se lit), Echeance ou Signal
 /// sinon. La tâche ressort de la file et de son état d'attente.
+#[track_caller]
 pub fn attendre_que(file: &FileAttente, inscription: Inscription, sommeil: Sommeil, echeance: Option<u64>,
                     mut condition: impl FnMut() -> bool) -> Reveil {
     let interruptions = cpu::couper_interruptions();
@@ -635,6 +636,7 @@ fn annuler(t: &Tache) {
 /// La tâche courante dort jusqu'à ce que le temps de calcul du processus
 /// `compte` atteigne `cible` (le calcul de ses autres fils), ou un signal.
 /// Interruptions coupées.
+#[track_caller]
 pub fn dormir_calcul(compte: Arc<Entree>, cible: u64) -> Reveil {
     let t = tache::courante();
     // « Je vais dormir » avant tout (l'en-tête), inscrite ensuite : le tic
@@ -1059,15 +1061,27 @@ fn dormir_jusqu_a_la_remise(t: &Tache, dans_la_file: impl Fn() -> bool) {
     t.reveille();
 }
 
-/// On va peut-être dormir : jamais sous un verrou court, ni dans un
-/// gestionnaire d'interruption (le `might_sleep` de Linux). `ordonnancer`
-/// refuserait le premier aussi, mais plus loin, sans dire qui ; ici, la
-/// panique nomme l'appelant.
+/// On va peut-être dormir : jamais avant que les tâches existent, sous un
+/// verrou court, préemption coupée, dans un gestionnaire d'interruption,
+/// ni dans la tâche inactive (le `might_sleep` de Linux, qui refuse de même
+/// un `preempt_count` non nul et `is_idle_task`). `ordonnancer` refuserait
+/// le verrou court et la préemption coupée aussi, mais plus loin, sans dire
+/// qui, et seulement si le verrou est disputé ; ici, la panique nomme
+/// l'appelant, même quand le verrou est libre et qu'on ne dort pas.
 #[track_caller]
 fn on_va_peut_etre_dormir() {
+    assert!(tache::en_service(), "verrou qui dort pris avant que les taches existent");
     let tenus = crate::verrou::tenus();
     assert!(tenus == 0, "verrou qui dort pris sous {} verrou(s) court(s)", tenus);
     assert!(!crate::interruptions::dans_une_interruption(), "verrou qui dort pris dans un gestionnaire d'interruption");
+    assert!(!processeur::preemption_coupee(), "verrou qui dort pris preemption coupee");
+    // L'inactive ne dort jamais (tache.rs, le champ `inactive`) : pris
+    // ailleurs, ce verrou la ferait attendre. Linux ne le vérifie qu'une
+    // fois le démarrage passé à kernel_init (`system_state`), parce que
+    // `start_kernel`, qui est sa tâche inactive, prend des mutex ; notre
+    // noyau_main n'en prend aucun (la console écrit sans le sien pour
+    // l'inactive, console.rs) : la règle vaut dès le début.
+    assert!(!tache::courante().est_inactive(), "verrou qui dort pris par la tache inactive, qui ne dort jamais");
     // Ni entre « je vais dormir » et `dormir` : prendre un verrou qui dort
     // remet l'état « en cours », et le sommeil prévu serait perdu (le « do
     // not call blocking ops when !TASK_RUNNING » du `__might_sleep` de
@@ -1702,6 +1716,7 @@ impl<T: Possede> Possession<T> {
     /// Prend la possession (le `lock_sock`), en dormant tant qu'un autre
     /// l'a (ininterruptible : comme Linux, un `lock_sock` ne s'interrompt
     /// pas ; la possession est toujours courte).
+    #[track_caller]
     pub fn posseder(&self) -> Garde<'_, T> {
         let interruptions = cpu::couper_interruptions();
         let t = tache::courante();
@@ -1867,6 +1882,7 @@ impl<'a, T: Possede> Garde<'a, T> {
     /// avec « je vais dormir » posé avant elle (l'en-tête), l'ordre
     /// n'importe plus pour les réveils. Rend la raison du réveil (Reveillee
     /// si la condition est vraie).
+    #[track_caller]
     pub fn attendre(&mut self, file: &FileAttente, sommeil: Sommeil, echeance: Option<u64>,
                     mut pret: impl FnMut(&T::Court) -> bool) -> Reveil {
         self.p.rendre();

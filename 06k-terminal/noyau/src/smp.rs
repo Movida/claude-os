@@ -158,10 +158,10 @@ const ATTENTE_SECONDAIRE_NS: u64 = 5_000_000_000;
 /// Et une étape de la vérification du TSC : 1 s (la mesure dure 2 ms).
 const ATTENTE_MESURE_NS: u64 = 1_000_000_000;
 
-/// Démarre les processeurs secondaires que liste la MADT, un à un. Sur le
-/// premier processeur, interruptions actives, l'APIC en service, les
-/// registres de contrôle à leur valeur finale, vmalloc et les tâches en
-/// place.
+/// Démarre les processeurs secondaires que liste la MADT, un à un. Dans la
+/// tâche init, épinglée sur le premier processeur (main.rs), interruptions
+/// actives, l'APIC en service, les registres de contrôle à leur valeur
+/// finale, vmalloc et les tâches en place.
 pub fn demarrer_secondaires() {
     if !crate::irq::apic() {
         afficherln!("[noyau] 1 processeur en service : pas d'APIC local, pas de secondaire.");
@@ -260,29 +260,52 @@ fn demarrer_un(numero: usize, apic: u8) {
     // dit au compilateur aussi.
     core::sync::atomic::fence(Ordering::SeqCst);
 
-    // INIT, en niveau : posé, 10 ms, levé.
-    apic::envoyer_init(apic);
-    if !apic::attendre_envoi() {
-        afficherln!("[noyau] Processeur {} (APIC {}) : l'APIC n'envoie pas l'INIT : abandonne.", numero, apic);
-        return;
+    // De l'INIT à la lecture de l'ESR après le dernier SIPI, sans
+    // préemption : init (main.rs), qui démarre les secondaires, est une
+    // tâche épinglée sur ce processeur ; une autre tâche du même processeur
+    // qui enverrait une IPI entre un SIPI et la lecture de l'ESR (un réveil,
+    // `reprogrammer`) lui ferait porter ses erreurs, l'ESR étant celui du
+    // processeur. Linux coupe de même la préemption dans
+    // `wakeup_secondary_cpu_via_init`. Les messages ensuite, hors de la
+    // section : la console peut attendre.
+    enum Envoi {
+        Fait,
+        InitPasEnvoye,
+        Sipi { envoye: bool, erreurs: u32 },
     }
-    horloge::attendre_ms(10);
-    apic::lever_init(apic);
-    let _ = apic::attendre_envoi();
-    let _ = apic::erreurs();
-    // Deux SIPI vers la page du trampoline, 300 µs puis 200 µs (les
-    // `udelay` de Linux), l'ESR regardé après chacun.
-    for _ in 0..2 {
-        apic::envoyer_demarrage(apic, (trampoline::CODE >> 12) as u8);
-        horloge::attendre_us(300);
-        let envoye = apic::attendre_envoi();
-        horloge::attendre_us(200);
-        let erreurs = apic::erreurs();
-        if !envoye || erreurs != 0 {
-            afficherln!("[noyau] Processeur {} (APIC {}) : SIPI {} (ESR {:#x}).", numero, apic,
-                        if envoye { "refuse" } else { "pas envoye" }, erreurs);
-            break;
+    let envoi = processeur::sans_preemption(|| {
+        // INIT, en niveau : posé, 10 ms, levé.
+        apic::envoyer_init(apic);
+        if !apic::attendre_envoi() {
+            return Envoi::InitPasEnvoye;
         }
+        horloge::attendre_ms(10);
+        apic::lever_init(apic);
+        let _ = apic::attendre_envoi();
+        let _ = apic::erreurs();
+        // Deux SIPI vers la page du trampoline, 300 µs puis 200 µs (les
+        // `udelay` de Linux), l'ESR regardé après chacun.
+        for _ in 0..2 {
+            apic::envoyer_demarrage(apic, (trampoline::CODE >> 12) as u8);
+            horloge::attendre_us(300);
+            let envoye = apic::attendre_envoi();
+            horloge::attendre_us(200);
+            let erreurs = apic::erreurs();
+            if !envoye || erreurs != 0 {
+                return Envoi::Sipi { envoye, erreurs };
+            }
+        }
+        Envoi::Fait
+    });
+    match envoi {
+        Envoi::Fait => {}
+        Envoi::InitPasEnvoye => {
+            afficherln!("[noyau] Processeur {} (APIC {}) : l'APIC n'envoie pas l'INIT : abandonne.", numero, apic);
+            return;
+        }
+        // Le dire, et attendre quand même : un SIPI a pu suffire.
+        Envoi::Sipi { envoye, erreurs } => afficherln!("[noyau] Processeur {} (APIC {}) : SIPI {} (ESR {:#x}).", numero, apic,
+                                                        if envoye { "refuse" } else { "pas envoye" }, erreurs),
     }
 
     // La poignée de main. Chaque mot y est posé par un compare_exchange,
@@ -352,8 +375,21 @@ fn verifier_tsc(zone: &processeur::Processeur, numero: usize) -> bool {
     }
     let mut essais = 0;
     loop {
-        zone.demarrage.store(etape::MESURE, Ordering::Release);
-        let Some(recul_source) = tsc::verifier_accord(tsc::Role::Source) else {
+        // Sans préemption, de l'appel de la cible à la fin de la mesure :
+        // init, qui démarre les secondaires, est une tâche (depuis les soldes
+        // d'avant 6k ; avant, l'inactive, que rien d'autre ne remplaçait
+        // encore). Remplacée pendant la mesure, elle laisserait la cible ne
+        // se comparer qu'à elle-même, et conclure « accordés » sans l'avoir
+        // vérifié ; entre l'appel et la mesure, elle la ferait attendre (un
+        // retard de plus d'une seconde, la cible renonce : tsc.rs,
+        // `verifier_accord`). Linux coupe même les interruptions autour de
+        // `check_tsc_sync_source` ; la préemption suffit : une interruption
+        // ne fait que retarder une lecture, comparée à la suivante.
+        let recul_source = processeur::sans_preemption(|| {
+            zone.demarrage.store(etape::MESURE, Ordering::Release);
+            tsc::verifier_accord(tsc::Role::Source)
+        });
+        let Some(recul_source) = recul_source else {
             afficherln!("[noyau] Processeur {} : pas venu mesurer son TSC en une seconde.", numero);
             tsc::fin_de_verification();
             return false;

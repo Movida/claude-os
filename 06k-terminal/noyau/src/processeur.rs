@@ -141,9 +141,10 @@ pub struct Processeur {
     /// Ce processeur s'est arrêté pour de bon (la panique, smp.rs) : celui
     /// qui panique attend que tous les autres le disent.
     pub arrete: AtomicBool,
-    /// Il dort dans sa boucle d'inactivité (`hlt`, rien dans sa file :
-    /// ordonnanceur.rs) : un réveil le préfère (ses caches sont libres), et
-    /// le détecteur d'interblocage ne tourne que si tous le sont.
+    /// Il est au repos dans sa boucle d'inactivité (arrêté par `hlt`, rien
+    /// dans sa file : ordonnanceur.rs) : un réveil le préfère (ses caches
+    /// sont libres), et le détecteur d'interblocage ne tourne que si tous le
+    /// sont.
     pub inactif: AtomicBool,
     /// Le nombre de demandes d'autres processeurs qu'il a exécutées
     /// (smp::recevoir_appel ; les « Function call interrupts » de

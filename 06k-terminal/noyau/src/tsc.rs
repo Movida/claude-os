@@ -584,7 +584,19 @@ pub fn verifier_accord(role: Role) -> Option<u64> {
     let arrivee = lire();
     while PARTICIPANTS.load(Ordering::Acquire) < 2 {
         if lire().wrapping_sub(arrivee) > khz * ATTENTE_AUTRE_MS {
-            return None;
+            // Renoncer en reprenant sa place (1 → 0) : l'autre, s'il arrive
+            // en retard, trouve le rendez-vous vide et renonce à son tour,
+            // au lieu de le passer seul et de ne se comparer qu'à lui-même
+            // (« accordés », rien comparé : trouvé par la relecture des
+            // soldes d'avant 6k, quand init, une tâche, est devenue la
+            // source). Perdu (2 : il arrive à l'instant), on mesure avec lui.
+            // Linux évite le rendez-vous périmé autrement : c'est la cible
+            // qui appelle la source (`smp_call_function_single`, depuis
+            // `check_tsc_sync_target`).
+            if PARTICIPANTS.compare_exchange(1, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                return None;
+            }
+            break;
         }
         core::hint::spin_loop();
     }

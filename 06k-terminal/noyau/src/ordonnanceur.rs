@@ -340,9 +340,13 @@ impl File {
         let vruntime = (self.moyenne() as i64).saturating_sub(lag).max(0) as u64;
         let tranche = if neuve { tranche_virtuelle(poids) / 2 } else { tranche_virtuelle(poids) };
         // Les deux invariants que le réveil sous verrou garantit (voir
-        // `reveiller`) : jamais deux fois en file, jamais une morte.
+        // `reveiller`) : jamais deux fois en file, jamais une morte. Et un
+        // troisième, que garantit le refus de « je vais dormir » (tache.rs,
+        // `preparer_sommeil`) : jamais une inactive, qui prend le processeur
+        // quand la file est vide.
         assert!(!t.est_en_file(), "tache deja dans une file des pretes");
         assert!(!t.est_morte(), "tache morte remise dans une file des pretes");
+        assert!(!t.est_inactive(), "tache inactive mise dans une file des pretes");
         // La place est réservée au démarrage (`initialiser`) : la file ne
         // grandit pas pendant un programme, et l'ordonnanceur n'appelle
         // jamais le tas (il tourne aussi dans les interruptions).
@@ -451,8 +455,12 @@ fn choisir_processeur(t: &Tache, neuve: bool) -> usize {
 /// trouve un état qui ne dort plus. Préemption coupée du début à la fin
 /// (le `guard(preempt)` de `try_to_wake_up` : « moi » ne change pas de
 /// sens). Rend faux si elle ne dormait pas, ou pas d'un sommeil que
-/// `pourquoi` réveille.
+/// `pourquoi` réveille. Jamais une inactive, qui ne dort pas (tache.rs, le
+/// champ `inactive`) : jusqu'aux soldes d'avant 6k, noyau_main dormait sur
+/// la console, et son réveil attendait plus bas, sous le verrou du Mutex
+/// qui la lui remettait, qu'il quitte son processeur, pour toujours.
 pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) -> bool {
+    assert!(!t.est_inactive(), "reveil d'une tache inactive, qui ne dort jamais");
     processeur::sans_preemption(|| {
         let moi = processeur::courant().numero as usize;
         loop {
@@ -482,8 +490,21 @@ pub fn reveiller(t: Arc<Tache>, pourquoi: Reveil) -> bool {
             // de la file et la fin de bascule de la tâche suivante) : on
             // attend, sans verrou (la fin de bascule n'a besoin de rien de
             // nous, quelques centaines de cycles), puis on la place.
+            let debut = crate::tsc::lire();
+            let mut dit = false;
             while t.est_sur_processeur() {
                 core::hint::spin_loop();
+                // Une bascule dure quelques centaines de cycles : une seconde
+                // dit un défaut, nommé ici (comme `smp::appeler`). Jusqu'aux
+                // soldes d'avant 6k, le réveil de noyau_main, l'inactive du
+                // processeur 0, attendait ici pour toujours sans un mot, et
+                // c'est le verrou du Mutex, attendu par un autre processeur,
+                // qui paniquait 30 s plus tard, loin d'ici.
+                if !dit && crate::tsc::khz().is_some_and(|khz| crate::tsc::lire().wrapping_sub(debut) > khz * 1000) {
+                    dit = true;
+                    crate::console::urgence(format_args!("[ordonnanceur] reveil de {} : encore sur le processeur {} apres une seconde\n",
+                                                         t.nom(), t.processeur()));
+                }
             }
             placer(t, false, moi);
             return true;
@@ -622,8 +643,8 @@ fn equilibrer(moi: usize) {
     }
 }
 
-/// Tous les autres processeurs dorment (leur boucle d'inactivité, dans
-/// `hlt`) et toutes les files sont vides : plus rien ne s'exécute nulle
+/// Tous les autres processeurs sont au repos (arrêtés par `hlt` dans leur
+/// boucle d'inactivité) et toutes les files sont vides : plus rien ne s'exécute nulle
 /// part, et rien ne peut mettre une tâche dans une file sinon ce
 /// processeur (les périphériques n'interrompent que le processeur 0, et
 /// un tic sur un processeur inactif ne fait rien). Pour le détecteur
@@ -636,15 +657,16 @@ fn machine_inactive() -> bool {
 }
 
 /// La boucle de la tâche inactive de ce processeur (le code du démarrage
-/// pour le premier, main.rs ; `depart_secondaire` pour les autres, smp.rs) :
-/// elle prend le processeur quand aucune autre tâche n'est prête, tire du
-/// travail d'une autre file s'il y en a, et arrête le processeur (`sti ;
-/// hlt`) jusqu'à la prochaine interruption. Sur le processeur 0, elle
-/// regarde aussi si des programmes ne sont pas bloqués pour toujours
-/// (attente::detecter_interblocage), quand toute la machine est inactive.
-/// Une interruption qui rend une tâche prête la préempte aussitôt ; on
-/// vérifie quand même la file interruptions coupées avant de dormir (voir
-/// cpu::attendre_interruption).
+/// pour le premier, une fois init lancée, main.rs ; `depart_secondaire`
+/// pour les autres, smp.rs) : elle prend le processeur quand aucune autre
+/// tâche n'est prête, tire du travail d'une autre file s'il y en a, et
+/// arrête le processeur (`sti ; hlt`) jusqu'à la prochaine interruption.
+/// Elle ne dort jamais (tache.rs, le champ `inactive`). Sur le processeur
+/// 0, elle regarde aussi si des programmes ne sont pas bloqués pour
+/// toujours (attente::detecter_interblocage), quand toute la machine est
+/// inactive. Une interruption qui rend une tâche prête la préempte
+/// aussitôt ; on vérifie quand même la file interruptions coupées avant
+/// d'arrêter le processeur (voir cpu::attendre_interruption).
 pub fn boucle_inactive() -> ! {
     loop {
         crate::cpu::couper_interruptions();
@@ -715,8 +737,6 @@ pub fn ordonnancer(bascule: Bascule) {
             // SAFETY: l'inactive de ce processeur vit pour toujours.
             unsafe { &*tache::inactive() }.prend_le_processeur();
         }
-        // La courante de la file, sous son verrou (voir `File::courante`).
-        f.courante.store(choisie.unwrap_or_else(tache::inactive).cast_mut(), Ordering::Relaxed);
         // La courante de la file, sous son verrou (voir `File::courante`).
         f.courante.store(choisie.unwrap_or_else(tache::inactive).cast_mut(), Ordering::Relaxed);
         // Une bascule volontaire si la courante a quitté la file (elle

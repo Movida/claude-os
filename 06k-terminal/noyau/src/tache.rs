@@ -5,8 +5,8 @@
 //! que prend le processeur quand le programme entre dans le noyau, par un
 //! appel système ou une interruption) et son propre état des registres.
 //! Le noyau a aussi les siennes : la tâche inactive (le `noyau_main` du
-//! démarrage, sur la pile du démarrage), init (le lanceur de
-//! /etc/demarrage, programmes.rs), une par programme WebAssembly
+//! démarrage, sur la pile du démarrage), init (la fin du démarrage, puis le
+//! lanceur de /etc/demarrage : main.rs), une par programme WebAssembly
 //! (l'interpréteur tourne dans sa tâche). Chaque tâche, sauf l'inactive, a
 //! sa pile de 16 Kio dans la région vmalloc, sous une page de garde
 //! (vmalloc.rs). On passe le processeur d'une tâche à l'autre en BASCULANT
@@ -179,7 +179,15 @@ pub struct Tache {
     tid: u32,
     /// La tâche inactive d'un processeur (celle qui prend le processeur
     /// quand aucune autre n'est prête) : elle n'entre jamais dans une file
-    /// des prêtes ni dans la table des tâches, et n'attend personne.
+    /// des prêtes ni dans la table des tâches, et n'attend personne. Elle ne
+    /// dort donc jamais (ni « je vais dormir », ni un verrou qui dort, ni un
+    /// réveil : `preparer_sommeil`, attente.rs `on_va_peut_etre_dormir`,
+    /// ordonnanceur.rs `reveiller` et `File::ajouter` le refusent) : son
+    /// sommeil ne la sortirait d'aucune file, elle « dormirait » en
+    /// tournant, interruptions coupées, et qui la réveille attendrait
+    /// qu'elle quitte son processeur, ce qu'elle ne fait jamais (le
+    /// « scheduling from the idle thread » de Linux, `dequeue_task_idle`).
+    /// Ce qui attend, au démarrage, se fait dans init (main.rs).
     inactive: bool,
     /// Son nom, pour les messages : celui du programme (le `comm` de
     /// Linux), ou celui de la tâche du noyau.
@@ -262,9 +270,11 @@ pub struct Tache {
     lag: AtomicI64,
     /// Pour une tâche du noyau, celle qui l'a créée, réveillée par
     /// `terminer` (elle attend sa fin, ou celle de l'une de ses tâches :
-    /// `attendre`, `dormir_tant_que`) ; None pour l'inactive. Un fil de
-    /// programme n'en a pas : c'est la fin de son processus qui réveille son
-    /// parent (processus::Entree::fil_disparu).
+    /// `attendre`, `dormir_tant_que`) ; None pour l'inactive et pour une
+    /// tâche détachée (`lancer_detachee` : init, le rendeur, les tâches des
+    /// pilotes), que personne n'attend. Un fil de programme n'en a pas :
+    /// c'est la fin de son processus qui réveille son parent
+    /// (processus::Entree::fil_disparu).
     attendant: Verrou<Option<Arc<Tache>>>,
     /// Son entrée de file d'attente, celle qu'elle inscrit dans la file de ce
     /// qu'elle attend (attente.rs) : une tâche n'attend qu'une chose à la
@@ -400,10 +410,10 @@ impl Tache {
     /// Une tâche, sans encore de premier départ, ni de place dans la table
     /// des tâches (`demarrer`) : jetée avant, elle rend sa pile. Ou ce qui
     /// manque : une pile (le maximum de fils), ou la mémoire de la tâche. Une
-    /// tâche du noyau attend sa créatrice (`attendant`), un fil de programme
-    /// a le numéro `tid` et l'état `programme`.
+    /// tâche du noyau attend sa créatrice (`attendant`), sauf `detachee`, un
+    /// fil de programme a le numéro `tid` et l'état `programme`.
     fn creer(nom: NomCourt, espace: u64, programme: Option<EtatProgramme>, processus: Option<Arc<crate::processus::Entree>>,
-             tid: u32) -> Result<Arc<Tache>, Manque> {
+             tid: u32, detachee: bool) -> Result<Arc<Tache>, Manque> {
         let pile = Pile::allouer().ok_or(Manque::Pile)?;
         marquer_pile(&pile);
         let haut = pile.haut();
@@ -411,11 +421,12 @@ impl Tache {
         let noyau = processus.is_none();
         // (La tâche inactive n'attend personne : elle ne doit jamais
         // quitter son rôle pour entrer dans la file des prêtes.)
-        let attendant = (noyau && en_service() && !courante().inactive).then(courante_arc);
+        let attendant = (noyau && !detachee && en_service() && !courante().inactive).then(courante_arc);
         // Les processeurs permis : ceux de son créateur (le `copy_process`
-        // de Linux copie le `cpus_mask`) ; tous, pour les premières tâches
-        // du démarrage.
-        let affinite = if en_service() { courante().affinite() } else { u64::MAX };
+        // de Linux copie le `cpus_mask`) ; tous pour une tâche détachée,
+        // comme un kthread de Linux, qui tient le sien de kthreadd et non de
+        // qui l'a demandé ; tous aussi avant la première tâche.
+        let affinite = if en_service() && !detachee { courante().affinite() } else { u64::MAX };
         Arc::new(Tache::brute(tid, false, nom, Some(pile), haut, espace, processus, programme, attendant, false, affinite))
             .map_err(|_| Manque::Memoire)
     }
@@ -476,6 +487,11 @@ impl Tache {
     /// secondaire, smp.rs : la pile de sa tâche inactive).
     pub fn sommet_de_pile(&self) -> u64 {
         self.haut
+    }
+
+    /// Est-ce la tâche inactive d'un processeur (voir `inactive`) ?
+    pub fn est_inactive(&self) -> bool {
+        self.inactive
     }
 
     /// Les processeurs où elle a le droit de s'exécuter (voir `affinite`).
@@ -678,8 +694,13 @@ impl Tache {
     /// faite avant que l'état soit visible de qui réveille. C'est le motif
     /// de Dekker (processeur.rs) : celui qui réveille pose la condition,
     /// puis lit notre état ; nous posons notre état, puis lisons la
-    /// condition ; l'un des deux voit l'autre.
+    /// condition ; l'un des deux voit l'autre. Jamais l'inactive, qui ne
+    /// dort pas (voir `inactive`) : la panique nomme l'appelant, au-delà des
+    /// fonctions d'attente qui la posent pour lui (`attendre_que`,
+    /// `dormir_tant_que`... : `#[track_caller]` elles aussi).
+    #[track_caller]
     pub fn preparer_sommeil(&self, sommeil: crate::attente::Sommeil) {
+        assert!(!self.inactive, "la tache inactive ne dort jamais");
         let e = if sommeil == crate::attente::Sommeil::Interruptible { etat::DORT_INTERRUPTIBLE } else { etat::DORT };
         self.etat.swap(e, Ordering::SeqCst);
     }
@@ -809,8 +830,9 @@ impl Tache {
 static TOUTES: Verrou<Vec<Arc<Tache>>> = Verrou::new(Vec::new());
 
 /// Fait du code en cours (noyau_main, sur la pile du démarrage) la tâche
-/// inactive du premier processeur. Avant toute autre tâche, interruptions
-/// coupées.
+/// inactive du premier processeur : ce qui suit de noyau_main ne dort pas,
+/// et lance init pour le reste du démarrage (main.rs). Avant toute autre
+/// tâche, interruptions coupées.
 pub fn initialiser() {
     // L'inactive s'exécute : c'est le code qui est en train de la créer ;
     // sans pile à elle (celle du démarrage, haut = 0 : la TSS n'en a pas
@@ -1338,7 +1360,7 @@ fn rendeur() {
 
 /// Lance le rendeur, au démarrage, dès que les tâches existent.
 pub fn lancer_rendeur() {
-    if lancer_noyau(NomCourt::de(b"rendeur"), rendeur).is_none() {
+    if lancer_detachee(NomCourt::de(b"rendeur"), rendeur).is_none() {
         panic!("pas de pile pour le rendeur");
     }
 }
@@ -1355,6 +1377,7 @@ pub fn attendre_le_rendeur() {
 /// `terminer` la réveille. Sans réveil perdu : « je vais dormir » est posé
 /// avant de regarder si elle est morte, et `terminer` pose « morte » avant
 /// de réveiller (voir `dormir_tant_que`).
+#[track_caller]
 pub fn attendre(t: &Tache) -> i32 {
     dormir_tant_que(|| !t.est_morte());
     t.code_sortie.load(Ordering::Relaxed)
@@ -1368,6 +1391,7 @@ pub fn attendre(t: &Tache) -> i32 {
 /// complète) AVANT de vérifier `encore` ; `terminer` écrit « morte » puis
 /// tente le réveil ; ou bien nous voyons « morte », ou bien le réveil nous
 /// trouve « dort » et nous ne quittons pas la file des prêtes.
+#[track_caller]
 pub fn dormir_tant_que(encore: impl Fn() -> bool) {
     let interruptions = cpu::couper_interruptions();
     let t = courante();
@@ -1402,7 +1426,7 @@ fn demarrer(t: &Arc<Tache>) {
 pub fn lancer_programme(nom: NomCourt, processus: Arc<crate::processus::Entree>, pml4: u64, entree: u64, pile: u64)
     -> Option<Arc<Tache>> {
     let tid = processus.pid();
-    let t = Tache::creer(nom, pml4, Some(EtatProgramme::initial()?), Some(processus.clone()), tid).ok()?;
+    let t = Tache::creer(nom, pml4, Some(EtatProgramme::initial()?), Some(processus.clone()), tid, false).ok()?;
     processus.attacher(&t).ok()?;
     t.preparer(premier_depart, 0, Some(Cadre {
         r15: 0, r14: 0, r13: 0, r12: 0, r11: 0, r10: 0, r9: 0, r8: 0,
@@ -1461,7 +1485,7 @@ pub fn lancer_fil(n: NouveauFil) -> Result<u32, i64> {
     }
     let tid = processus::numero_neuf();
     let espace = createur.espace.load(Ordering::Relaxed);
-    let t = Tache::creer(createur.nom(), espace, Some(etat), Some(processus.clone()), tid).map_err(|m| match m {
+    let t = Tache::creer(createur.nom(), espace, Some(etat), Some(processus.clone()), tid, false).map_err(|m| match m {
         Manque::Pile => -EAGAIN,
         Manque::Memoire => -ENOMEM,
     })?;
@@ -1554,13 +1578,32 @@ pub fn nombre() -> usize {
 /// La fonction d'une tâche du noyau.
 type FonctionNoyau = Box<dyn FnOnce() + Send>;
 
-/// Lance `f` dans une tâche du noyau nommée `nom`, prête aussitôt ; None :
-/// pas de pile pour la tâche, ou plus de mémoire.
+/// Lance `f` dans une tâche du noyau nommée `nom`, prête aussitôt, que sa
+/// créatrice peut attendre (`attendre`) et dont elle hérite les processeurs
+/// permis ; None : pas de pile pour la tâche, ou plus de mémoire.
 pub fn lancer_noyau(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> Option<Arc<Tache>> {
+    lancer(nom, f, false)
+}
+
+/// Lance `f` dans une tâche du noyau DÉTACHÉE (un `kthread_run` de Linux) :
+/// personne n'attend sa fin, et elle peut s'exécuter partout, quelle que
+/// soit sa créatrice. Pour init et le rendeur, que lance l'inactive, et
+/// les tâches des pilotes, qu'init lance au démarrage : lancées par
+/// `lancer_noyau`, celles-ci garderaient pour toujours un Arc d'init
+/// (`attendant`), qui ne les attend pas, et hériteraient de son masque du
+/// moment.
+/// Les kthreads de Linux sont de même les enfants de kthreadd, et non de
+/// qui les demande. None : pas de pile, ou plus de mémoire.
+pub fn lancer_detachee(nom: NomCourt, f: impl FnOnce() + Send + 'static) -> Option<Arc<Tache>> {
+    lancer(nom, f, true)
+}
+
+/// `lancer_noyau` et `lancer_detachee`.
+fn lancer(nom: NomCourt, f: impl FnOnce() + Send + 'static, detachee: bool) -> Option<Arc<Tache>> {
     // Un pointeur simple vers la fermeture, pour r12 : une boîte de boîte.
     let f: FonctionNoyau = faillible::boite(f).ok()?;
     let f: Box<FonctionNoyau> = faillible::boite(f).ok()?;
-    let t = Tache::creer(nom, pagination::pml4_noyau(), None, None, 0).ok()?;
+    let t = Tache::creer(nom, pagination::pml4_noyau(), None, None, 0, detachee).ok()?;
     t.preparer(depart_noyau, Box::into_raw(f) as u64, None);
     demarrer(&t);
     Some(t)

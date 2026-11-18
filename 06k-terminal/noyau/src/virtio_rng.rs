@@ -81,7 +81,7 @@ pub fn sonder() {
         Err(e) => return afficherln!("[virtio] {} : {} : generateur laisse eteint.", f.adresse, e),
     };
     afficherln!("[virtio] {} : alea.", f.adresse);
-    if tache::lancer_noyau(NomCourt::de(b"hwrng"), move || boucle(c)).is_none() {
+    if tache::lancer_detachee(NomCourt::de(b"hwrng"), move || boucle(c)).is_none() {
         afficherln!("[virtio] pas de pile pour la tache hwrng : generateur inutilise.");
     }
 }

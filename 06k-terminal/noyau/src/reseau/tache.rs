@@ -112,7 +112,7 @@ fn attendre(echeance: Option<u64>) -> u32 {
 
 /// Lance la tâche du réseau.
 pub fn lancer() {
-    if tache::lancer_noyau(NomCourt::de(b"reseau"), boucle).is_none() {
+    if tache::lancer_detachee(NomCourt::de(b"reseau"), boucle).is_none() {
         afficherln!("[reseau] pas de pile pour la tache du reseau : les cartes restent muettes.");
     }
 }

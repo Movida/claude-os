@@ -70,7 +70,12 @@ SECTIONS
         __garde = .;
         . += 4K;
         __pile_bas = .;
-        . += 64K;
+        /* 16 Kio, la pile d'une tâche (le THREAD_SIZE de l'init_task de
+           Linux) : elle ne porte plus que noyau_main jusqu'à sa boucle, puis
+           la tâche inactive du processeur 0 ; le reste du démarrage est
+           dans la tâche init depuis les soldes d'avant 6k (4,5 Kio au plus,
+           mesurés alors). 64 Kio jusque-là. */
+        . += 16K;
         __pile_haut = .;
         /* Les piles de l'IST (src/gdt.rs), chacune avec sa propre page de
            garde : la double faute (16 Kio), puis le NMI, le débogage (#DB)
