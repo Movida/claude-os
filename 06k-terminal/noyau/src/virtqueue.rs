@@ -48,7 +48,9 @@
 //! l'indice de son tampon) qu'`obtenir` lui rend.
 
 use crate::espace;
+use crate::faillible;
 use crate::pages;
+use alloc::boxed::Box;
 use core::sync::atomic::{Ordering, compiler_fence, fence};
 
 /// Le nombre maximal d'entrées d'une file (une page de descripteurs).
@@ -94,8 +96,14 @@ pub struct Virtqueue {
     evenements: bool,
     /// Les interruptions sont-elles coupées (par nous) ?
     coupees: bool,
-    /// Le jeton de chaque tête de chaîne en cours (None : libre).
-    jetons: [Option<u32>; TAILLE_MAX as usize],
+    /// Le jeton de chaque tête de chaîne en cours (None : libre), un par
+    /// entrée de la file, dans le tas (le `desc_state` de Linux, alloué à
+    /// part par `vring_alloc_state_extra_split`). Jusqu'aux soldes d'avant
+    /// 6k, un tableau de 256 dans la structure : 2 Kio que chaque `new`, puis
+    /// chaque déplacement vers la carte, recopiait de cadre en cadre ; la
+    /// sonde de virtio-net prenait 17,5 Kio de pile, plus qu'une pile de
+    /// tâche (16 Kio), et ne tenait que sur celle du démarrage.
+    jetons: Box<[Option<u32>]>,
 }
 
 // La disposition des tableaux (spécification 2.7.5 à 2.7.8).
@@ -110,6 +118,8 @@ impl Virtqueue {
     /// tableaux vides. None : plus de mémoire.
     pub fn new(taille: u16, evenements: bool) -> Option<Virtqueue> {
         debug_assert!(taille.is_power_of_two() && taille <= TAILLE_MAX);
+        // Les jetons d'abord : rien à rendre s'ils manquent.
+        let jetons = faillible::en_boite(faillible::remplie(taille as usize, None).ok()?).ok()?;
         let page_descripteurs = pages::allouer(0)?;
         let Some(page_anneaux) = pages::allouer(0) else {
             pages::liberer(page_descripteurs, 0);
@@ -128,7 +138,7 @@ impl Virtqueue {
         let mut q = Virtqueue {
             taille, page_descripteurs, page_anneaux, descripteurs, avail, used,
             premier_libre: 0, libres: taille, avail_index: 0, used_lu: 0, ajoutees: 0, evenements,
-            coupees: false, jetons: [None; TAILLE_MAX as usize],
+            coupees: false, jetons,
         };
         // Les descripteurs libres, chaînés dans l'ordre.
         for i in 0..taille {
