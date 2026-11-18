@@ -134,7 +134,7 @@
 [linux] dynamique : toutes les verifications : ok
 [noyau] dynamique : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] memoire : 8 Gio reserves (MAP_NORESERVE), trois pages ecrites loin l'une de l'autre, rendus : ok
-[linux] memoire : 64 Gio reserves puis rendus d'un seul munmap : ok
+[linux] memoire : 64 Tio reserves puis rendus d'un seul munmap, sous une garde de calcul de 10 s : ok
 [linux] memoire : toutes les verifications : ok
 [noyau] memoire : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] Memoire de claude --version rejouee : ok.

@@ -715,6 +715,16 @@ impl EspaceUtilisateur {
     /// 2 Gio viderait sinon les TLB de tous les processeurs tous les 64
     /// cadres : memoire::GRAND_LOT pour lui) ; sans mémoire pour cela, le
     /// lot vide tous les huit cadres, ceux qu'il a en place.
+    ///
+    /// Chaque tranche commence là où il y a quelque chose à faire
+    /// (`premiere_a_retirer`) : ce que les tables absentes couvrent est
+    /// sauté d'un coup, sous le même verrou, comme `parcourir` le fait dans
+    /// une tranche et Linux à chaque niveau (`pmd_none_or_clear_bad`, puis
+    /// l'entrée suivante). Jusqu'aux soldes d'avant 6k, chaque tranche
+    /// avançait de 64 pages, qu'il y ait des tables ou non : un munmap de
+    /// 64 Gio où deux pages étaient écrites prenait 262 144 fois le verrou,
+    /// une demi-seconde de calcul dans QEMU (mesuré : 7,6 ms par Gio), le
+    /// coût selon la taille de la plage que `parcourir` évite.
     pub fn retirer_par_tranches(espace: &crate::verrou::Verrou<EspaceUtilisateur>, debut: u64, fin: u64, rendre_tables: bool, reserve: usize) {
         const TRANCHE: u64 = PAGE * CADRES_DU_LOT as u64;
         let mut lot = Lot::new(&espace.verrouiller());
@@ -732,8 +742,14 @@ impl EspaceUtilisateur {
                 lot.vider();
             }
             let pages = (lot.place() - TABLES_PAR_TRANCHE).min(CADRES_DU_LOT) as u64;
+            let mut e = espace.verrouiller();
+            let Some(debut_tranche) = premiere_a_retirer(e.pml4, 3, a, fin, rendre_tables) else {
+                break;
+            };
+            a = debut_tranche;
             let b = ((a / TRANCHE + 1) * TRANCHE).min(fin).min(a + pages * PAGE);
-            espace.verrouiller().retirer_plage(a, b, rendre_tables, &mut lot);
+            e.retirer_plage(a, b, rendre_tables, &mut lot);
+            drop(e);
             a = b;
         }
         // Le dernier vidage : un autre retrait en cours a peut-être effacé
@@ -955,6 +971,43 @@ fn parcourir_table(table: u64, niveau: u32, debut: u64, fin: u64, f: &mut impl F
         }
         adresse = suivante;
     }
+}
+
+/// La première adresse de [debut, fin[ (alignés) où une tranche de
+/// `retirer_par_tranches` a quelque chose à faire, cherchée dans la table
+/// `table` de niveau `niveau` (3 : la PML4) : le début de ce que couvre une
+/// table de dernier niveau présente (ses entrées peuvent être occupées), ou,
+/// avec `rendre_tables`, une table de niveau supérieur présente mais vide,
+/// qu'une tranche rendra (une table dont la fille n'a pu être faite, faute
+/// de mémoire). None : rien à faire dans la plage. Comme `parcourir`, sans
+/// rien changer : une table absente est sautée d'un coup, et une table
+/// présente ne coûte une lecture de ses 512 entrées que si rien n'a été
+/// trouvé en elle (une plage pleine retrouve sa table en trois lectures).
+fn premiere_a_retirer(table: u64, niveau: u32, debut: u64, fin: u64, rendre_tables: bool) -> Option<u64> {
+    let couverture = PAGE << (9 * niveau);
+    let mut adresse = debut;
+    while adresse < fin {
+        let suivante = (adresse / couverture + 1) * couverture;
+        // SAFETY: comme dans `parcourir_table`, une table de cet espace que
+        // nous possédons, lue sous son verrou (celui que tient l'appelant).
+        let entree = unsafe { pagination::lire_table(table) }[pagination::index(adresse, niveau)];
+        if entree & PRESENTE != 0 {
+            if niveau == 1 {
+                return Some(adresse);
+            }
+            let fille = entree & ADRESSE;
+            if let Some(a) = premiere_a_retirer(fille, niveau - 1, adresse, suivante.min(fin), rendre_tables) {
+                return Some(a);
+            }
+            // SAFETY: `fille` est une table de cet espace, que désigne une
+            // entrée présente ; même verrou.
+            if rendre_tables && unsafe { pagination::lire_table(fille) }.iter().all(|&e| e == 0) {
+                return Some(adresse);
+            }
+        }
+        adresse = suivante;
+    }
+    None
 }
 
 /// Le plus de pages invalidées une à une (invlpg) avant de préférer vider

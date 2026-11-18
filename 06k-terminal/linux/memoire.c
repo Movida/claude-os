@@ -150,14 +150,43 @@ static void erreurs(void)
     verifier(munmap((void *)0x500000000, PAGE) == 0, "munmap ou rien n'est projete : 0");
 }
 
-/* 64 Gio réservés, une page écrite à chaque bout, puis rendus d'un seul
- * munmap. Le parcours des tables saute ce qui n'est pas projeté : page par
- * page, il ferait seize millions de tours, bien plus que la limite de
- * temps de calcul que pose main (une seconde dans QEMU, et le programme
- * serait arrêté par SIGXCPU). */
-static void soixante_quatre_gio(void)
+/* La garde de calcul du test des 64 Tio : RLIMIT_CPU, sans limite dure,
+ * posée à ce que le programme a déjà calculé (getrusage : programme et
+ * noyau, ce que compte la limite) plus `secondes` (une de plus au plus :
+ * elle se donne en secondes entières) ; 0 la lève. */
+static int garder(long secondes)
 {
-    size_t taille = 64 * GIO;
+    struct rlimit l = { RLIM_INFINITY, RLIM_INFINITY };
+    if (secondes > 0) {
+        struct rusage u;
+        getrusage(RUSAGE_SELF, &u);
+        long long us = (u.ru_utime.tv_sec + u.ru_stime.tv_sec) * 1000000LL + u.ru_utime.tv_usec + u.ru_stime.tv_usec;
+        l.rlim_cur = us / 1000000 + secondes + 1;
+    }
+    return setrlimit(RLIMIT_CPU, &l) == 0;
+}
+
+/* 64 Tio réservés, une page écrite à chaque bout, puis rendus d'un seul
+ * munmap. Le retrait saute ce qui n'est pas projeté, d'un coup à chaque
+ * niveau des tables : son coût suit les pages projetées, pas la taille
+ * (0,2 ms dans QEMU, mesuré, comme pour 8 Gio). Un retrait qui avancerait
+ * d'un pas fixe, page par page ou par tranches de 64 pages, ferait des
+ * milliards de tours : la garde de calcul de dix secondes qui entoure ce
+ * test l'arrête par SIGXCPU.
+ *
+ * Jusqu'aux soldes d'avant 6k : 64 Gio, sous une seconde de calcul pour
+ * tout le programme. Le défaut est venu quand même, en 6j (munmap par
+ * tranches de 64 pages, une demi-seconde pour 64 Gio, 7,6 ms par Gio), et
+ * ce test ne le voyait pas : seul, le programme restait sous la seconde ;
+ * deux vérifications à la fois, il la dépassait, par moments. 64 Tio mettent
+ * mille fois plus d'écart entre un bon retrait et un mauvais : huit minutes
+ * contre 0,2 ms, de part et d'autre de dix secondes, quelle que soit la
+ * charge de la machine. La garde n'entoure que ce test : le temps du
+ * programme entier grandit avec ses tests, et avec la charge. */
+static void soixante_quatre_tio(void)
+{
+    size_t taille = 64UL << 40;
+    int garde = garder(10);
     char *p = anonyme(NULL, taille, MAP_NORESERVE);
     int ok = p != MAP_FAILED;
     if (ok) {
@@ -165,7 +194,7 @@ static void soixante_quatre_gio(void)
         p[taille - 1] = 1;
         ok = munmap(p, taille) == 0;
     }
-    verifier(ok, "64 Gio reserves puis rendus d'un seul munmap");
+    verifier(ok && garde && garder(0), "64 Tio reserves puis rendus d'un seul munmap, sous une garde de calcul de 10 s");
 }
 
 /* Un munmap au milieu d'une zone la coupe en deux : les deux bouts
@@ -511,15 +540,12 @@ static void informations(void)
 
 int main(void)
 {
-    /* Une seconde de calcul au plus (RLIMIT_CPU, sans limite dure) : c'est
-     * ce qui fait mordre le test des 64 Gio. Le noyau ne limite plus le
-     * temps d'un programme par défaut, pas plus que Linux. */
-    struct rlimit une_seconde = { 1, RLIM_INFINITY };
-    verifier(setrlimit(RLIMIT_CPU, &une_seconde) == 0, "une seconde de calcul au plus (RLIMIT_CPU)");
+    /* Le noyau ne limite pas le temps d'un programme par défaut, pas plus
+     * que Linux : le test des 64 Tio pose lui-même sa garde. */
     huit_gio();
     adresses();
     erreurs();
-    soixante_quatre_gio();
+    soixante_quatre_tio();
     coupe();
     populate();
     protections();
