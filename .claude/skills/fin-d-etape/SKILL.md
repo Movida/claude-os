@@ -677,10 +677,11 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
 - **Une sonde en C** : l'ordre d'évaluation des arguments d'un `printf`
   n'est pas défini, et deux appels système passés en arguments s'y font
   dans l'ordre que choisit gcc (de droite à gauche ici) : les séquencer
-  dans des instructions à part. Et `alarm` (37) n'existe pas chez nous : une
-  limite de temps dans un test passe par `SO_RCVTIMEO`. Un test de signal
-  dit « je suis dans l'appel » juste avant l'appel système qui attend,
-  après ce qui le prépare (`epoll_create1`, `epoll_ctl`, `clock_gettime`) :
+  dans des instructions à part. Et `alarm` (37) n'existe chez nous que
+  depuis le lot 5 des soldes : avant, une limite de temps dans un test
+  passe par `SO_RCVTIMEO`. Un test de signal dit « je suis dans l'appel »
+  juste avant l'appel système qui attend, après ce qui le prépare
+  (`epoll_create1`, `epoll_ctl`, `clock_gettime`) :
   sinon un signal livré pendant la préparation arrive trop tôt, et le test
   échoue sous la charge seulement. Un délai ajouté dans une copie jetable
   rend ces courses certaines.
@@ -843,3 +844,23 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   taille de cette valeur : `tcp` comparait le débit calculé à 15 % près d'un
   SRTT que TCP_INFO tronque à la µs, assez à 10 µs, pas à 5 (la CI sous
   KVM). Calculer l'intervalle exact que l'arrondi permet.
+- **Un test qui mesure une durée de calcul suppose que le temps avance
+  régulièrement** : sous une machine chargée, QEMU perd le processeur des
+  millisecondes durant, et le tic suivant compte tout le retard à la tâche
+  courante (temps de calcul et temps virtuel de l'EEVDF). « 20 ms de
+  calcul » tiennent alors en un tic, sans que l'autre tâche soit passée, et
+  une tâche prend une avance que l'ordonnanceur lui fait rendre. Attendre
+  l'événement lui-même, borné en tics de l'horloge (QEMU saute les tics
+  manqués : figé 3 s par SIGSTOP, il n'en donne qu'un), pas en temps de
+  calcul. Simuler le retard dans une copie jetable : N ms ajoutées d'un
+  coup, dans `compter_courante`, à la première mesure d'une tâche nommée
+  (la reprise du lot 5, « Preemption coupee »).
+- **Sur WSL, l'affinage du TSC peut être refusé à bon droit** : la machine
+  hôte change le rythme de son horloge monotone (d'où vient l'heure de
+  QEMU, et le PM timer) par rapport à son TSC (que lit la machine invitée
+  sous TCG) : d'un démarrage à l'autre, le TSC mesuré va de 3 487 à
+  3 705 MHz, et une fois, dans le même démarrage, l'affinage a trouvé 2 %
+  de moins que la première mesure (« a plus de 1 % ... : garde », comme
+  Linux), et attendu.txt, qui veut « TSC affine », a échoué. Le noyau a
+  raison, et l'attendu aussi sur une vraie machine et dans la CI : relancer
+  le commit seul.
