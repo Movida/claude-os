@@ -32,7 +32,8 @@
  *   - SO_MEMINFO : neuf compteurs, coupés à la place ; ce que garde la réception (UDP,
  *     TCP), ce qu'un envoi AF_UNIX tient chez qui l'envoie jusqu'à sa lecture, la file
  *     d'envoi de TCP, la mémoire des adhésions et de leurs listes de sources (les tailles
- *     de Linux), les pertes (une file pleine d'UDP et de ping, une écoute pleine) ;
+ *     de Linux), les pertes (une file pleine d'UDP et de ping, une écoute pleine, et
+ *     en CLOSE_WAIT l'ACK de ce qu'on envoie encore : Linux ne le prend pas) ;
  *   - SO_RESERVE_MEM : sans groupe de contrôle de la mémoire (chez nous, et sous Linux
  *     dans le groupe racine) EOPNOTSUPP ; dans un groupe (un conteneur), des pages
  *     réservées pour UDP et TCP ; EINVAL pour une valeur négative.
@@ -891,6 +892,29 @@ static void memoire(void)
     for (int i = 0; i < 4; i++)
         close(cs[i]);
     close(ec);
+    /* Après le FIN de l'autre (CLOSE_WAIT), ce qui n'est pas en arrière n'est pas pris
+     * (`tcp_rcv_state_process`) : une perte, l'ACK de ce qu'on envoie encore aussi. En
+     * ESTABLISHED, un ACK n'en est pas une, ni le FIN qui y arrive. */
+    ec = socket(AF_INET, SOCK_STREAM, 0);
+    t.sin_port = 0;
+    bind(ec, (void *)&t, sizeof t);
+    listen(ec, 1);
+    getsockname(ec, (void *)&t, &tl);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&t, sizeof t);
+    f = accept(ec, NULL, NULL);
+    send(f, "a", 1, 0);
+    attendre_ms(200);
+    unsigned etablie = compteur(f, DROPS);
+    shutdown(c, SHUT_WR);
+    attendre_ms(200);
+    unsigned close_wait = compteur(f, DROPS);
+    send(f, "b", 1, 0);
+    attendre_ms(200);
+    printf("[linux] options-socket : SO_MEMINFO tcp, pertes : etablie %u, FIN %u, ACK en CLOSE_WAIT %u\n", etablie, close_wait, compteur(f, DROPS));
+    verifier(etablie == 0 && close_wait == 0 && compteur(f, DROPS) == 1,
+             "SO_MEMINFO tcp : en CLOSE_WAIT, l'ACK de ce qu'on envoie est une perte");
+    close(c), close(f), close(ec);
 
     /* La mémoire des options : une adhésion, 48 octets ; une liste de sources, 24 et 4 par
      * place (10 au départ, 10 de plus quand elle est pleine, autant que de sources pour

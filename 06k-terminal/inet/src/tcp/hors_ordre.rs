@@ -14,6 +14,14 @@
 //! la plus fréquente (le segment qui suit le dernier rangé) se range à la
 //! fin. Linux prend un arbre parce qu'une fenêtre de plusieurs Mio, avec
 //! SACK, peut y mettre des milliers de segments.
+//!
+//! Ce qui est jeté est une perte de la socket (`sk_drops`, `jetees`) : une charge
+//! toute contenue dans une autre, celles qu'une plus grande recouvre, celles qui
+//! arrivent déjà reçues quand le trou se comble, celles qu'on élague faute de
+//! mémoire. Linux fond à l'arrivée les paquets qui se suivent au bout de la file
+//! (`tcp_ooo_try_coalesce`) et ne jette qu'un paquet entier : un segment qui en
+//! recouvre une partie seulement n'y jette rien (les octets en double restent),
+//! là où nous retirons la charge recouverte. Le compte suit ce que chacun jette.
 
 use super::{Charge, apres, avant};
 use alloc::collections::VecDeque;
@@ -25,6 +33,8 @@ pub struct HorsOrdre<P> {
     file: VecDeque<(u32, P)>,
     /// La taille vraie de ce qui est rangé (compte contre SO_RCVBUF).
     pub taille_vraie: usize,
+    /// Les charges jetées depuis la dernière fois (`prendre_jetees`).
+    jetees: u32,
 }
 
 fn fin<P: Charge>(e: &(u32, P)) -> u32 {
@@ -57,7 +67,16 @@ pub(super) fn etendre_bloc(b: &mut (u32, u32), debut: u32, fin: u32) -> bool {
 
 impl<P: Charge> HorsOrdre<P> {
     pub const fn new() -> HorsOrdre<P> {
-        HorsOrdre { file: VecDeque::new(), taille_vraie: 0 }
+        HorsOrdre { file: VecDeque::new(), taille_vraie: 0, jetees: 0 }
+    }
+
+    /// Les charges jetées depuis la dernière fois, remises à zéro : des pertes.
+    pub fn prendre_jetees(&mut self) -> u32 {
+        core::mem::take(&mut self.jetees)
+    }
+
+    fn jeter(&mut self) {
+        self.jetees = self.jetees.wrapping_add(1);
     }
 
     pub fn vide(&self) -> bool {
@@ -67,7 +86,7 @@ impl<P: Charge> HorsOrdre<P> {
     /// Range `charge`, dont le premier octet porte le numéro `seq` ; rend le
     /// doublon qu'elle contenait, à dire par D-SACK (`tcp_data_queue_ofo`).
     /// Si la mémoire manque, la charge est jetée, et Err le dit : l'émetteur la renverra, pourvu
-    /// qu'on ne la lui ait pas annoncée.
+    /// qu'on ne la lui ait pas annoncée (la perte est alors à l'appelant).
     pub fn ranger(&mut self, mut seq: u32, mut charge: P) -> Result<Option<(u32, u32)>, ()> {
         let debut = seq;
         let fin_charge = seq.wrapping_add(charge.octets().len() as u32);
@@ -84,18 +103,23 @@ impl<P: Charge> HorsOrdre<P> {
             && !apres(e.0, seq)
         {
             // Elle couvre notre début : retiré ; et si elle nous couvre en
-            // entier, rien de neuf.
+            // entier, rien de neuf : la nôtre est jetée (TCP_OFOMERGE). Au
+            // même numéro, la nôtre, plus longue, la remplace (`rb_replace_node`) :
+            // c'est elle qui est jetée, par la boucle qui suit.
             let f = fin(e);
             if !apres(fin_charge, f) {
+                self.jeter();
                 return Ok(Some((debut, fin_charge)));
             }
-            doublon = Some((debut, f));
-            charge.avancer(f.wrapping_sub(seq) as usize);
-            seq = f;
-            i += 1;
+            if e.0 != seq {
+                doublon = Some((debut, f));
+                charge.avancer(f.wrapping_sub(seq) as usize);
+                seq = f;
+                i += 1;
+            }
         }
-        // Celles que nous couvrons en entier disparaissent ; celle que
-        // nous couvrons en partie perd son début.
+        // Celles que nous couvrons en entier disparaissent (des pertes) ;
+        // celle que nous couvrons en partie perd son début.
         while let Some(e) = self.file.get(i) {
             if !apres(fin(e), fin_charge) {
                 let (d, f) = (e.0, fin(e));
@@ -103,6 +127,7 @@ impl<P: Charge> HorsOrdre<P> {
                 if let Some((_, p)) = self.file.remove(i) {
                     self.taille_vraie = self.taille_vraie.saturating_sub(p.taille_vraie());
                 }
+                self.jeter();
                 continue;
             }
             if avant(e.0, fin_charge)
@@ -139,7 +164,8 @@ impl<P: Charge> HorsOrdre<P> {
             let deja = rcv_nxt.wrapping_sub(s) as usize;
             if deja >= p.octets().len() {
                 // Déjà reçue tout entière (par une retransmission plus
-                // grande) : jetée.
+                // grande) : jetée (TCP_OFO_DROP).
+                self.jeter();
                 continue;
             }
             p.avancer(deja);
@@ -164,6 +190,7 @@ impl<P: Charge> HorsOrdre<P> {
             Some((_, p)) => {
                 let v = p.taille_vraie();
                 self.taille_vraie = self.taille_vraie.saturating_sub(v);
+                self.jeter();
                 v
             }
             None => 0,
@@ -244,7 +271,8 @@ impl<P: Charge> HorsOrdre<P> {
         }
     }
 
-    /// Jette tout (la connexion se ferme).
+    /// Jette tout (la connexion se ferme ; pas des pertes : `tcp_done` purge sans
+    /// `sk_drops`).
     pub fn vider(&mut self) {
         self.file.clear();
         self.taille_vraie = 0;
@@ -362,6 +390,20 @@ mod tests {
         assert_eq!(h.file.len(), 2, "le premier reste, le second recopié");
         assert_eq!(h.file[0].1.taille_vraie(), 200);
         assert_ne!(h.file[1].1.taille_vraie(), 202);
+    }
+
+    /// Ce que la file jette lui compte, élaguée comprise ; pas ce que vide la fin.
+    #[test]
+    fn les_jetees() {
+        let mut h = HorsOrdre::new();
+        h.ranger(1000, charge(100)).unwrap();
+        h.ranger(2000, charge(100)).unwrap();
+        assert_eq!(h.prendre_jetees(), 0);
+        assert!(h.jeter_la_derniere() > 0);
+        assert_eq!(h.prendre_jetees(), 1);
+        assert_eq!(h.prendre_jetees(), 0);
+        h.vider();
+        assert_eq!(h.prendre_jetees(), 0);
     }
 
     /// La connexion se ferme : tout s'en va.

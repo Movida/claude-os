@@ -420,7 +420,8 @@ impl<P: Charge> Tcb<P> {
     /// `tcp_prune_ofo_queue` : jeter ce qui attend hors d'ordre, par la fin, un
     /// huitième de SO_RCVBUF à la fois, jusqu'à ce que le segment au numéro `seq` tienne,
     /// mais jamais ce qui le précède : il arrive pour le combler, ou le suit. Les blocs
-    /// SACK sont oubliés (comme à un RTO : l'émetteur le supporte, RFC 2018).
+    /// SACK sont oubliés (comme à un RTO : l'émetteur le supporte, RFC 2018). Chaque
+    /// charge jetée est une perte (TCP_OFO_QUEUE_PRUNE ; `jeter_la_derniere` la compte).
     fn elaguer_hors_ordre(&mut self, seq: u32, longueur: usize) -> bool {
         let mut but = (self.rcvbuf >> 3) as i64;
         let mut elague = false;

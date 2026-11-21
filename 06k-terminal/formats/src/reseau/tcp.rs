@@ -118,11 +118,18 @@ fn options(mut o: &[u8], syn: bool) -> Options {
     r
 }
 
+/// La somme du segment `o` (en-tête compris), de `source` vers `destination`,
+/// est-elle juste ? (Plus de 65 535 octets : jamais.)
+pub fn somme_juste(o: &[u8], source: [u8; 4], destination: [u8; 4]) -> bool {
+    o.len() <= u16::MAX as usize && plier(somme(o, pseudo(source, destination, o.len() as u16))) == 0
+}
+
 /// Lit le segment `o` (la charge d'un paquet IPv4 de `source` vers
 /// `destination`) : son en-tête et sa charge. La longueur de l'en-tête au
 /// moins 20 octets et dans le segment ; la somme vérifiée si `verifier`
 /// (pas pour un paquet de `lo`, comme Linux : `loopback.c` dit sa somme
-/// déjà bonne).
+/// déjà bonne ; ni pour un segment dont Linux n'achève la somme qu'une fois
+/// sa socket trouvée, `somme_juste` ensuite).
 pub fn lire(o: &[u8], source: [u8; 4], destination: [u8; 4], verifier: bool) -> Result<(Tcp, &[u8]), Erreur> {
     let e = o.get(..ENTETE).ok_or(Erreur::Tronque)?;
     let longueur_entete = (e[12] >> 4) as usize * 4;
@@ -132,7 +139,7 @@ pub fn lire(o: &[u8], source: [u8; 4], destination: [u8; 4], verifier: bool) -> 
     if longueur_entete > o.len() {
         return Err(Erreur::Tronque);
     }
-    if verifier && (o.len() > u16::MAX as usize || plier(somme(o, pseudo(source, destination, o.len() as u16))) != 0) {
+    if verifier && !somme_juste(o, source, destination) {
         return Err(Erreur::Somme);
     }
     let drapeaux = e[13];

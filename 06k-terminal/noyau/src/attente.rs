@@ -1851,6 +1851,25 @@ impl<T: Possede> Possession<T> {
         true
     }
 
+    /// Pour ce qui ne se garde pas pendant qu'un appel possède : traité tout de suite
+    /// comme par `du_reseau` si personne ne possède (None) ; sinon jeté, et ce qu'en dit
+    /// `possede`, qui lit le premier étage sous le verrou court, est rendu à l'appelant
+    /// (le segment à la somme fausse, que `tcp_add_backlog` jette au lieu de le garder).
+    pub fn du_reseau_ou<R>(&self, e: T::Element, possede: impl FnOnce(&T::Court) -> R) -> Option<R> {
+        let mut c = self.court.verrouiller();
+        if c.possede {
+            return Some(possede(&c.premier));
+        }
+        // SAFETY: comme `du_reseau` : personne ne possède, et le verrou court est tenu.
+        let d = unsafe { &mut *self.donnee.get() };
+        d.descendre(&mut c.premier);
+        d.traiter(e);
+        let m = d.publier(&mut c.premier);
+        drop(c);
+        self.reveiller(m);
+        None
+    }
+
     /// Réveille la file de la socket pour les événements `m` ; puis les signaux d'entrée-sortie
     /// (les bits A_* : ceux à qui parle `sk_wake_async`, après `wake_up`, comme Linux).
     fn reveiller(&self, m: u32) {

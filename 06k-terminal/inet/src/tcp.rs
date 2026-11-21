@@ -106,6 +106,8 @@ mod essais_ack;
 mod essais_minuteurs;
 #[cfg(test)]
 mod essais_emission;
+#[cfg(test)]
+mod essais_pertes;
 mod hors_ordre;
 mod minmax;
 mod reception;
@@ -1212,6 +1214,10 @@ pub struct Tcb<P: Charge> {
     /// et l'heure d'envoi du dernier segment acquitté (`first_tx_mstamp`).
     tri: VecDeque<(u32, u64)>,
     mesures: Mesures,
+    /// Les segments jetés depuis que le noyau les a pris (`prendre_pertes`) : le
+    /// `sk_drops` de Linux, que compte `tcp_drop_reason` (hors de la fenêtre, refusés par
+    /// PAWS, déjà reçus, sans mémoire...), et que le noyau ajoute à ceux de la socket.
+    pertes: u32,
     /// L'heure du dernier envoi de données (`lsndtime`), et du dernier
     /// ACK reçu (`rcv_tstamp`).
     dernier_envoi: u64,
@@ -1385,6 +1391,7 @@ impl<P: Charge> Tcb<P> {
             tlp_renvoi: false,
             tri: VecDeque::new(),
             mesures: Mesures::new(),
+            pertes: 0,
             dernier_envoi: 0,
             dernier_recu: 0,
             purgee: None,
@@ -2347,10 +2354,14 @@ impl<P: Charge> Tcb<P> {
                 self.syn_renvoi = RenvoiSyn::Repete;
                 e.a_emettre = true;
             }
+            self.compter_perte();
             return false;
         }
         // Un ACK qui n'acquitte pas notre SYN : pour Linux, le segment repart
-        // vers l'écoute, qui répond RST (sauf à un RST) ; la fille reste.
+        // vers l'écoute, qui répond RST (sauf à un RST) ; la fille reste. Pas
+        // une perte (`tcp_v4_do_rcv` : `reset`, puis `discard`, sans `sk_drops`) ;
+        // chacun des autres refus en est une, de l'écoute (`tcp_check_req` rend
+        // NULL : le `discard_and_relse` de `tcp_v4_rcv`).
         if drapeaux & tcp::ACK != 0 && t.ack != self.iss.wrapping_add(1) {
             if drapeaux & tcp::RST == 0 {
                 self.rst_du = Some((t.ack, 0, tcp::RST));
@@ -2365,6 +2376,7 @@ impl<P: Charge> Tcb<P> {
                 self.ack_maintenant = true;
                 e.a_emettre = true;
             }
+            self.compter_perte();
             return false;
         }
         // Le SYN d'origine dans un segment de la fenêtre (un SYN-ACK) ne
@@ -2378,9 +2390,11 @@ impl<P: Charge> Tcb<P> {
             }
             self.mib.tcp(snmp::Tcp::AttemptFails);
             self.passer(Etat::Fermee, e);
+            self.compter_perte();
             return false;
         }
         if sans_syn & tcp::ACK == 0 {
+            self.compter_perte();
             return false;
         }
         // TCP_DEFER_ACCEPT : un ACK sans rien avec lui ne fait pas naître la connexion : un
@@ -2388,6 +2402,7 @@ impl<P: Charge> Tcb<P> {
         // le prochain ACK la fait naître.
         if self.retransmissions < self.reglages.defer_accept && fin_seq == self.irs.wrapping_add(1) {
             self.ack_differe = true;
+            self.compter_perte();
             return false;
         }
         // La connexion naît (`tcp_create_openreq_child`).
@@ -2397,6 +2412,25 @@ impl<P: Charge> Tcb<P> {
         self.compter_naissance(longueur_charge, maintenant);
         self.mib.tcp(snmp::Tcp::PassiveOpens);
         true
+    }
+
+    /// Un segment jeté (`tcp_drop_reason`, `sk_drops_skbadd`) : une perte pour la socket.
+    /// Linux compte les segments que portait le paquet (`gso_segs`, que la fusion de
+    /// paquets contigus additionne, `tcp_try_coalesce`) ; chez nous, un paquet reçu est un
+    /// segment, et une charge de la file hors d'ordre aussi (rien ne les fond à
+    /// l'arrivée ; ce que `fondre` recopie compte pour un, comme les paquets de
+    /// `tcp_collapse`, qui ne reportent pas `gso_segs`). Pour une fille en SYN_RECEIVED,
+    /// c'est une perte de l'écoute (`tcp_v4_rcv` : `discard_and_relse` sur elle) : le
+    /// noyau la lui donne.
+    pub fn compter_perte(&mut self) {
+        self.pertes = self.pertes.wrapping_add(1);
+    }
+
+    /// Les pertes depuis la dernière fois, celles de la file hors d'ordre comprises,
+    /// remises à zéro : le noyau les ajoute à celles de la socket (`Socket::pertes`)
+    /// après chaque segment reçu.
+    pub fn prendre_pertes(&mut self) -> u32 {
+        core::mem::take(&mut self.pertes).wrapping_add(self.hors_ordre.prendre_jetees())
     }
 
     /// Un SYN reçoit l'ACK de défi (le `syn_challenge` de `tcp_validate_incoming`,
@@ -2501,14 +2535,20 @@ impl<P: Charge> Tcb<P> {
                     }
                     return e;
                 }
+                // Ce qui n'est pas pris est une perte (`discard_and_undo`) : un RST sans
+                // ACK, un segment sans SYN. Pas ce qui reçoit un RST (`reset_and_undo`),
+                // ni le RST qui refuse notre SYN (`consume`).
                 if rst {
                     // Un RST qui acquitte notre SYN : refusé.
                     if ack {
                         self.finir(ECONNREFUSED, &mut e);
+                    } else {
+                        self.compter_perte();
                     }
                     return e;
                 }
                 if !syn {
+                    self.compter_perte();
                     return e;
                 }
                 self.irs = t.seq;
@@ -2592,6 +2632,16 @@ impl<P: Charge> Tcb<P> {
         }
         let longueur = longueur_charge + u32::from(syn) + u32::from(fin);
         let fin_seq = seq.wrapping_add(longueur);
+        // Ni ACK, ni RST, ni SYN : jeté sans un mot, avant même le numéro de séquence
+        // (`tcp_rcv_state_process`, et le chemin lent de `tcp_rcv_established` :
+        // TCP_FLAGS). Hors de la fenêtre, il n'a donc pas d'ACK.
+        if !ack && !rst && !syn {
+            self.compter_perte();
+            return e;
+        }
+        // Tout ce qui est refusé d'ici à l'ACK est une perte (le `discard` de
+        // `tcp_validate_incoming`, puis un ACK que `tcp_ack` rejette) ; pas un RST
+        // accepté (`reset` : `tcp_reset`, sans `sk_drops`).
         // PAWS, avant tout (`tcp_validate_incoming`) : un segment dont TSval est
         // plus vieux que le dernier vu vient d'une autre époque de ces numéros.
         // Un RST passe toujours ici : c'est sa propre règle qui le jugera. Un
@@ -2603,12 +2653,16 @@ impl<P: Charge> Tcb<P> {
         {
             match self.ack_desordonne(t, val, fin_seq) {
                 Desordonne::Accepte => {}
-                Desordonne::VieilAck => return e,
+                Desordonne::VieilAck => {
+                    self.compter_perte();
+                    return e;
+                }
                 Desordonne::Refuse => {
                     if syn {
                         self.compter_defi_syn();
                     }
                     self.repondre_doublon(seq, longueur, syn, maintenant, &mut e);
+                    self.compter_perte();
                     return e;
                 }
             }
@@ -2616,16 +2670,17 @@ impl<P: Charge> Tcb<P> {
         // 1. Le numéro de séquence. Hors de la fenêtre : un ACK, tout de
         // suite (`tcp_send_dupack`).
         if !self.acceptable(seq, fin_seq) {
-            if rst {
-                if self.rst_apres_fin(t.seq) {
-                    self.reinitialiser(&mut e);
-                }
-            } else {
+            if rst && self.rst_apres_fin(t.seq) {
+                self.reinitialiser(&mut e);
+                return e;
+            }
+            if !rst {
                 if syn {
                     self.compter_defi_syn();
                 }
                 self.repondre_doublon(seq, longueur, syn, maintenant, &mut e);
             }
+            self.compter_perte();
             return e;
         }
         // 2. RST (RFC 5961 : exactement au bord gauche ; sinon, dans la
@@ -2635,10 +2690,13 @@ impl<P: Charge> Tcb<P> {
             let bord_sack = self.blocs[..self.nb_blocs as usize].iter().map(|b| b.1).reduce(|a, b| if apres(b, a) { b } else { a });
             if t.seq == self.rcv_nxt || self.rst_apres_fin(t.seq) || bord_sack == Some(t.seq) {
                 self.reinitialiser(&mut e);
-            } else if !self.ack_invalide_limite(maintenant) {
+                return e;
+            }
+            if !self.ack_invalide_limite(maintenant) {
                 self.ack_maintenant = true;
                 e.a_emettre = true;
             }
+            self.compter_perte();
             return e;
         }
         // 4. SYN dans une connexion synchronisée : un ACK de défi (RFC 5961,
@@ -2649,12 +2707,10 @@ impl<P: Charge> Tcb<P> {
                 self.ack_maintenant = true;
                 e.a_emettre = true;
             }
+            self.compter_perte();
             return e;
         }
-        // 5. ACK.
-        if !ack {
-            return e;
-        }
+        // 5. ACK (son absence, sans SYN ni RST : jeté plus haut).
         let etablissement = self.etat == Etat::SynRecu;
         if etablissement {
             if apres(t.ack, self.snd_una) && !apres(t.ack, self.snd_nxt) {
@@ -2682,6 +2738,7 @@ impl<P: Charge> Tcb<P> {
                 self.ack_maintenant = true;
                 e.a_emettre = true;
             }
+            self.compter_perte();
             return e;
         }
         if etablissement {
@@ -2736,6 +2793,13 @@ impl<P: Charge> Tcb<P> {
         }
         if recoit {
             self.recevoir_texte(t, seq, charge, fin, maintenant, &mut e);
+        } else if matches!(self.etat, Etat::AttenteFermeture | Etat::Fermeture | Etat::DernierAck) {
+            // Après le FIN de l'autre, ce qui ne revient pas en arrière n'est pas
+            // pris, et Linux le compte comme une perte (`tcp_rcv_state_process` :
+            // `if (!queued) discard`), un simple ACK aussi : en CLOSE_WAIT, chaque
+            // ACK de ce que nous envoyons encore. (L'ACK qui finit LAST_ACK, ou
+            // qui fait passer CLOSING à TIME_WAIT, est pris : `consume`.)
+            self.compter_perte();
         }
         if self.fin_hors_ordre == Some(self.rcv_nxt) && self.etat.recoit() {
             // Le trou est comblé : un ACK sans attendre, comme pour la file hors d'ordre
@@ -3217,28 +3281,35 @@ impl<P: Charge> Tcb<P> {
         }
         self.dsack = None;
         let wnd = self.fenetre_restante();
+        // Chaque segment qui n'entre pas est une perte (`tcp_data_queue` : `drop`) :
+        // fenêtre fermée (TCP_ZEROWINDOW), déjà reçu (TCP_OLD_DATA), au-delà de la
+        // fenêtre (TCP_OVERWINDOW), pas de mémoire (PROTO_MEM).
         if seq == self.rcv_nxt {
             // Dans l'ordre. Une fenêtre fermée ne laisse passer qu'un FIN
             // seul (« Some stacks are known to send bare FIN packets in a
             // loop even if we send RWIN 0 »).
             if wnd == 0 && !(n == 0 && fin) {
                 self.hors_fenetre();
+                self.compter_perte();
                 return;
             }
         } else if !apres(fin_seq, self.rcv_nxt) {
             // Déjà reçu : l'autre n'a pas eu notre ACK.
             self.poser_doublon(seq, fin_seq);
             self.hors_fenetre();
+            self.compter_perte();
             return;
         } else if !avant(seq, self.rcv_nxt.wrapping_add(wnd)) {
             // Au-delà de la fenêtre : une sonde, par exemple.
             self.hors_fenetre();
+            self.compter_perte();
             return;
         } else if avant(seq, self.rcv_nxt) {
             // Le début déjà reçu ; fenêtre fermée, la suite n'entre pas.
             self.poser_doublon(seq, self.rcv_nxt);
             if wnd == 0 {
                 self.hors_fenetre();
+                self.compter_perte();
                 return;
             }
             charge.avancer(self.rcv_nxt.wrapping_sub(seq) as usize);
@@ -3256,12 +3327,15 @@ impl<P: Charge> Tcb<P> {
             self.ack.programme = true;
             e.lisible = true;
             if !self.reception.is_empty() && n > 0 {
+                self.compter_perte();
                 return;
             }
         }
         if !charge.octets().is_empty() {
+            // (Une place de la file qui manque au noyau : jeté aussi, une perte.)
             if !self.ajouter_recu(charge) {
                 self.ack_maintenant = true;
+                self.compter_perte();
                 return;
             }
             self.donnees_recues(t, n, vraie, maintenant);
@@ -3275,6 +3349,7 @@ impl<P: Charge> Tcb<P> {
             let mut doublon = self.dsack;
             while let Some(p) = self.hors_ordre.suivante(self.rcv_nxt, haut, &mut doublon) {
                 if !self.ajouter_recu(p) {
+                    self.compter_perte();
                     break;
                 }
             }
@@ -3298,6 +3373,7 @@ impl<P: Charge> Tcb<P> {
     fn recevoir_hors_ordre(&mut self, t: &Tcp, seq: u32, charge: P, fin: bool, fin_seq: u32) {
         let n = charge.octets().len() as u32;
         if !self.reserver_reception(seq, n as usize) {
+            self.compter_perte();
             return;
         }
         let vraie = charge.taille_vraie();
@@ -3306,7 +3382,11 @@ impl<P: Charge> Tcb<P> {
         self.mesures.hors_ordre += 1;
         let premier = self.hors_ordre.vide();
         // Plus de mémoire : jeté, et surtout pas annoncé : l'émetteur le croirait arrivé.
-        let Ok(doublon) = self.hors_ordre.ranger(seq, charge) else { return };
+        // (Ce que `ranger` jette compte dans ses pertes, `prendre_jetees`.)
+        let Ok(doublon) = self.hors_ordre.ranger(seq, charge) else {
+            self.compter_perte();
+            return;
+        };
         if self.sack_ok {
             if premier {
                 self.blocs[0] = (seq, fin_seq);

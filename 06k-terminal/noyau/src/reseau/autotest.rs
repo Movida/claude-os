@@ -13,14 +13,24 @@
 //! option fausse (son « problème de paramètre » revient à la socket, qui le voit dans sa
 //! file d'erreurs avec l'octet fautif), une route source (jetée sans un mot), une route
 //! notée (livrée).
+//!
+//! La somme d'un segment TCP de plus de 76 octets (CHECKSUM_BREAK), de même : Linux ne
+//! l'achève qu'une fois sa socket trouvée, et une connexion ESTABLISHED compte alors une perte
+//! (`sk_drops`, SO_MEMINFO). `lo` ne vérifie aucune somme, et nos programmes ne peuvent pas
+//! forger de segment : le noyau donne à TCP des segments à la somme fausse comme reçus par la
+//! carte (`tcp::recevoir`, après IPv4 : des adresses de `lo` ne passeraient pas sa vérification
+//! des sources), pour une connexion de `lo`.
 
 use super::boucle;
 use super::paquet::Paquet;
 use super::socket::{Protocole, Socket};
+use super::snmp::MIB;
 use super::{datagramme, icmp, tcp};
 use crate::partage::{Arc, ArcVide};
 use formats::reseau::icmp as ficmp;
 use formats::reseau::ipv4 as fipv4;
+use formats::reseau::tcp as ftcp;
+use inet::snmp::Tcp as CompteurTcp;
 
 const SOCK_STREAM: u16 = 1;
 const SOCK_DGRAM: u16 = 2;
@@ -228,6 +238,64 @@ fn options() -> Result<(), &'static str> {
     Ok(())
 }
 
+/// Donne à TCP, comme reçu par la carte `carte`, un segment de `de` vers `vers` (adresse,
+/// port), ACK de `ack` (et SYN si `syn`), de numéro `seq`, à `n` octets de charge, la somme
+/// fausse.
+fn segment_faux(carte: &super::interface::Interface, de: ([u8; 4], u16), vers: ([u8; 4], u16), seq: u32, ack: u32, syn: bool, n: usize) -> Option<()> {
+    let mut p = Paquet::vide(ftcp::ENTETE + n)?;
+    let o = p.ajouter_fin(ftcp::ENTETE + n)?;
+    let drapeaux = ftcp::ACK | if syn { ftcp::SYN } else { 0 };
+    let t = ftcp::Tcp { source: de.1, destination: vers.1, seq, ack, drapeaux, fenetre: 65535, ..ftcp::Tcp::default() };
+    ftcp::ecrire(o, &t, de.0, vers.0, true);
+    o[16] ^= 0xff;
+    let h = fipv4::Ipv4 {
+        tos: 0, longueur: (fipv4::ENTETE + ftcp::ENTETE + n) as u16, identifiant: 4, ne_pas_fragmenter: true, fragments_suivants: false,
+        decalage: 0, ttl: 64, protocole: fipv4::TCP, source: de.0, destination: vers.0, longueur_entete: fipv4::ENTETE,
+    };
+    let recu = super::ipv4::EnteteRecu::de(&h, &[], fipv4::Options::AUCUNES, 0);
+    tcp::recevoir(&h, &recu, carte, carte.index, false, p);
+    Some(())
+}
+
+/// La somme fausse d'un segment TCP (voir l'en-tête du module) : de plus de 76 octets, une
+/// erreur et une perte pour une connexion ESTABLISHED ; une erreur seule pour une écoute, ou
+/// sans socket (et pas de RST) ; jusqu'à 76 octets, une erreur seule, vue à l'arrivée.
+fn somme_tcp() -> Result<(), &'static str> {
+    const D: [u8; 4] = [127, 0, 0, 79];
+    const ETAPE: &str = "la mise en place";
+    // Sans carte (une machine sans réseau), rien à recevoir par elle.
+    let Some(carte) = super::interface::premiere_carte() else { return Ok(()) };
+    let l = creer(Protocole::Tcp, SOCK_STREAM, 6).ok_or(ETAPE)?;
+    tcp::lier(&l, &adresse(D, 40079)).map_err(|_| ETAPE)?;
+    tcp::ecouter(&l, 2).map_err(|_| ETAPE)?;
+    l.appels.verrouiller().options.rcvtimeo = Some(5_000_000_000);
+    let c = creer(Protocole::Tcp, SOCK_STREAM, 6).ok_or(ETAPE)?;
+    let _ = tcp::connecter(&c, &adresse(D, 40079), true);
+    let (a, _, _) = tcp::accepter(&l, false).map_err(|_| "la connexion sur lo")?;
+    let (source, port, _, seq) = tcp::numeros_de(&c).ok_or(ETAPE)?;
+    let (_, _, _, ack) = tcp::numeros_de(&a).ok_or(ETAPE)?;
+    let compte = || (MIB.valeur_tcp(CompteurTcp::InCsumErrors), MIB.valeur_tcp(CompteurTcp::OutRsts), a.pertes.load(core::sync::atomic::Ordering::Relaxed), l.pertes.load(core::sync::atomic::Ordering::Relaxed));
+    // (Le SYN pour l'écoute vient d'un autre port : celui de `c` désigne `a`.)
+    let essai = |de: u16, vers: u16, syn: bool, n: usize, attendu: (u64, u64, u32, u32), message| {
+        let (e, r, pa, pl) = compte();
+        segment_faux(carte, (source, de), (D, vers), seq, ack, syn, n).ok_or(ETAPE)?;
+        let (e2, r2, pa2, pl2) = compte();
+        if (e2 - e, r2 - r, pa2 - pa, pl2 - pl) != attendu {
+            return Err(message);
+        }
+        Ok(())
+    };
+    let autre = port.wrapping_add(1);
+    let r = essai(port, 40079, false, 100, (1, 0, 1, 0), "ESTABLISHED, 120 octets : une erreur, une perte")
+        .and_then(|()| essai(port, 40079, false, 56, (1, 0, 0, 0), "ESTABLISHED, 76 octets : une erreur, sans perte"))
+        .and_then(|()| essai(autre, 40079, true, 100, (1, 0, 0, 0), "l'ecoute, un SYN de 120 octets : une erreur, sans perte"))
+        .and_then(|()| essai(port, 40080, false, 100, (1, 0, 0, 0), "sans socket, 120 octets : une erreur, sans RST"));
+    for s in [&a, &c, &l] {
+        tcp::fermer(s);
+    }
+    r
+}
+
 /// Tout, avant les programmes.
 pub fn lancer() {
     match udp().and_then(|()| tcp_mtu()) {
@@ -237,5 +305,9 @@ pub fn lancer() {
     match options() {
         Ok(()) => afficherln!("[reseau] les options IP d'un paquet recu, comme Linux : ok."),
         Err(e) => afficherln!("[reseau] les options IP : {} : ECHEC", e),
+    }
+    match somme_tcp() {
+        Ok(()) => afficherln!("[reseau] la somme TCP d'un long segment, vue par sa socket : ok."),
+        Err(e) => afficherln!("[reseau] la somme TCP d'un long segment : {} : ECHEC", e),
     }
 }

@@ -558,6 +558,8 @@ pub struct Premier {
     pub sans_place: bool,
     /// Combien de pointeurs urgents neufs vus (`tcp_check_urg` : `sk_send_sigurg`).
     pub urgents: u32,
+    /// IP_MINTTL, pour la réception quand un appel possède (`somme_fausse_vers`).
+    pub minttl: u8,
 }
 
 /// Ce qui arrive à une socket depuis le réseau : un segment, ou une
@@ -592,6 +594,11 @@ pub struct Segment {
     /// numéro initial de la fille, plus loin que tout ce que l'ancienne
     /// connexion a envoyé (RFC 1122 4.2.2.13, `tw_isn`).
     isn: Option<u32>,
+    /// Sa somme est fausse, et il a plus de 76 octets : Linux ne l'a pas encore
+    /// vu (`skb_checksum_init` ne vérifie tout de suite que jusqu'à CHECKSUM_BREAK),
+    /// et l'achève une fois la socket trouvée (`tcp_checksum_complete`) : ce
+    /// qu'il en fait dépend d'elle (`recevoir`).
+    somme_fausse: bool,
 }
 
 /// La taille vraie de ce qui arrive, pour la borne de la file `backlog`.
@@ -621,6 +628,7 @@ impl Partie {
             en_file: if let Mode::Connexion(t) = &self.mode { t.lisibles() } else { 0 },
             rcv_nxt: if let Mode::Connexion(t) = &self.mode { t.numeros().2 } else { 0 },
             urgents: if let Mode::Connexion(t) = &self.mode { t.urgents_annonces() } else { 0 },
+            minttl: self.options.minttl,
         }
     }
 
@@ -1290,14 +1298,25 @@ impl Partie {
         };
         // IP_MINTTL (`tcp_v4_rcv`, après la recherche) : une connexion, une
         // fille établie (une socket chez Linux), une écoute (ses SYN) ; pas
-        // une fille en SYN_RECEIVED (une `request_sock`, servie avant).
+        // une fille en SYN_RECEIVED (une `request_sock`, servie avant). Une
+        // perte pour elle (`discard_and_relse`).
         if self.ttl_trop_petit(s.ip.ttl, s.fille) {
+            self.perte_pour(s.fille);
+            return;
+        }
+        if s.somme_fausse && !matches!(self.mode, Mode::Ecoute { .. }) {
+            self.somme_fausse();
             return;
         }
         let recu = s.ip;
         match &mut self.mode {
             Mode::Connexion(t) => {
                 t.recevoir(&s.entete, s.charge, maintenant());
+                // Ce que la connexion a jeté : des pertes de la socket.
+                let n = t.prendre_pertes();
+                if n > 0 {
+                    perte(self.numero, n);
+                }
             }
             Mode::Ecoute { .. } => self.traiter_ecoute(s),
             Mode::Neuve => {
@@ -1308,6 +1327,34 @@ impl Partie {
         }
         self.emettre_apres(Some(&recu));
         self.apres();
+    }
+
+    /// Une perte pour qui reçoit le segment (IP_MINTTL) : la socket, ou une fille
+    /// établie (une socket à part chez Linux, qui l'emportera à l'`accept`).
+    fn perte_pour(&mut self, fille: Option<u64>) {
+        if let (Mode::Ecoute { filles, .. }, Some(n)) = (&mut self.mode, fille)
+            && let Some(f) = filles.iter_mut().find(|f| f.numero == n)
+            && f.tcb.etat() != Etat::SynRecu
+        {
+            f.tcb.compter_perte();
+            return;
+        }
+        perte(self.numero, 1);
+    }
+
+    /// Un segment à la somme fausse, de plus de 76 octets, pour une socket que personne
+    /// ne possédait (une écoute et ses filles : `traiter_ecoute`) : une erreur reçue, et
+    /// une perte seulement pour une connexion ESTABLISHED, qui achève la somme dans
+    /// `tcp_rcv_established` (`csum_error` : `tcp_drop_reason`) ; dans un autre état,
+    /// `tcp_v4_do_rcv` la jette sans la compter (`csum_err`). Une socket sans connexion,
+    /// que Linux ne trouverait pas : l'erreur seule, et pas de RST.
+    fn somme_fausse(&mut self) {
+        erreur_de_somme();
+        if let Mode::Connexion(t) = &self.mode
+            && t.etat() == Etat::Etablie
+        {
+            perte(self.numero, 1);
+        }
     }
 
     /// IP_MINTTL (RFC 5082, GTSM) : un segment ou une erreur ICMP de TTL
@@ -1406,11 +1453,33 @@ impl Partie {
         let Mode::Ecoute { backlog, filles } = &mut self.mode else { return };
         if let Some(n) = s.fille {
             if let Some(f) = filles.iter_mut().find(|f| f.numero == n) {
+                // La somme fausse d'un segment de plus de 76 octets : une erreur ;
+                // une perte pour une fille née ESTABLISHED (une socket chez Linux :
+                // `tcp_rcv_established`), pas pour une en SYN_RECEIVED (la `request_sock`
+                // de `tcp_v4_rcv` : `csum_error`).
+                if s.somme_fausse {
+                    erreur_de_somme();
+                    if f.tcb.etat() == Etat::Etablie {
+                        f.tcb.compter_perte();
+                    }
+                    return;
+                }
                 f.tcb.reglages.defer_accept = defer;
                 let en_poignee = f.tcb.etat() == Etat::SynRecu;
                 f.tcb.recevoir(&s.entete, s.charge, maintenant());
-                if en_poignee && f.tcb.etat() != Etat::SynRecu {
+                let nee = !matches!(f.tcb.etat(), Etat::SynRecu | Etat::Fermee);
+                if en_poignee && nee {
                     f.arrivee = (s.ip.ttl, s.ip.tos, s.interface);
+                }
+                // Ce qu'une fille en SYN_RECEIVED jette est une perte de l'écoute (le
+                // `discard_and_relse` de `tcp_v4_rcv`, quand `tcp_check_req` rend NULL) ;
+                // ce que jette une fille née, la sienne (une socket chez Linux, dès
+                // `tcp_v4_syn_recv_sock` : `accept` la lui donnera).
+                if en_poignee && !nee {
+                    let n = f.tcb.prendre_pertes();
+                    if n > 0 {
+                        perte(numero_ecoute, n);
+                    }
                 }
                 f.emettre(ip, Some(&s.ip));
                 ranger_filles(filles);
@@ -1425,16 +1494,26 @@ impl Partie {
             // (`du_reseau`).
             let objet = TABLE.verrouiller().as_ref().and_then(|t| t.objet(n));
             if let Some(Cible::Socket(sock)) = objet {
-                vers_socket(&sock, Arrivee::Segment(Segment { fille: None, ..s }));
+                if s.somme_fausse {
+                    somme_fausse_vers(&sock, Segment { fille: None, ..s });
+                } else {
+                    vers_socket(&sock, Arrivee::Segment(Segment { fille: None, ..s }));
+                }
                 return;
             }
             s.fille = None;
+        }
+        // La somme fausse d'un segment pour l'écoute : une erreur (`tcp_v4_do_rcv` :
+        // `csum_err`), sans perte.
+        if s.somme_fausse {
+            erreur_de_somme();
+            return;
         }
         let h = s.entete;
         // Ce que l'écoute jette est une perte pour elle (`sk_drops`) : un RST, des drapeaux
         // qui ne demandent rien (`tcp_rcv_state_process`, TCP_LISTEN : `tcp_drop_reason`),
         // un SYN qu'elle ne prend pas (`tcp_listendrop`) ; pas un ACK, qui a son RST.
-        let perdu = || perte(numero_ecoute);
+        let perdu = || perte(numero_ecoute, 1);
         if h.drapeaux & ftcp::RST != 0 {
             perdu();
             return;
@@ -1614,12 +1693,18 @@ fn livrer(s: Segment) {
     let h = s.entete;
     let cible = TABLE.verrouiller().as_ref().and_then(|t| t.trouver(s.source, h.source, s.destination, h.destination, s.interface));
     match cible {
+        Some(Destinataire::Connexion(Cible::Socket(sock))) | Some(Destinataire::Ecoute(Cible::Socket(sock))) if s.somme_fausse => {
+            somme_fausse_vers(&sock, Segment { fille: None, ..s });
+        }
         Some(Destinataire::Connexion(Cible::Socket(sock))) | Some(Destinataire::Ecoute(Cible::Socket(sock))) => {
             vers_socket(&sock, Arrivee::Segment(Segment { fille: None, ..s }));
         }
         Some(Destinataire::Connexion(Cible::Fille(ecoute, n))) | Some(Destinataire::Ecoute(Cible::Fille(ecoute, n))) => {
             vers_socket(&ecoute, Arrivee::Segment(Segment { fille: Some(n), ..s }));
         }
+        // Sans socket, ou en TIME_WAIT, la somme fausse achevée : une erreur, sans
+        // RST (`no_tcp_socket`, `do_time_wait` : `csum_error`).
+        Some(Destinataire::TempsAttente(_)) | None if s.somme_fausse => erreur_de_somme(),
         Some(Destinataire::TempsAttente(n)) => temps_attente(n, s),
         // Sans socket, un RST seulement pour une de nos adresses
         // (`tcp_v4_send_reset` : la route du segment reçu doit être
@@ -1646,10 +1731,41 @@ fn vers_socket(sock: &Arc<Socket>, a: Arrivee) {
     }
 }
 
-/// Une perte de plus pour la socket `numero` (`sk_drops`), si elle est encore là.
-fn perte(numero: u64) {
+/// Une somme fausse achevée (`csum_error`, `csum_err`) : InCsumErrors, et InErrs.
+fn erreur_de_somme() {
+    MIB.tcp(Compteur::InCsumErrors);
+    MIB.tcp(Compteur::InErrs);
+}
+
+/// `n` pertes de plus pour la socket `numero` (`sk_drops`), si elle est encore là.
+fn perte(numero: u64, n: u32) {
     if let Some(s) = par_numero(numero) {
-        s.pertes.fetch_add(1, Ordering::Relaxed);
+        s.pertes.fetch_add(n, Ordering::Relaxed);
+    }
+}
+
+/// Un segment à la somme fausse, de plus de 76 octets, pour la socket `sock`
+/// (une connexion, une écoute ; pas une fille) : traité par elle si personne ne la
+/// possède (`Partie::somme_fausse`) ; sinon jeté ici, comme `tcp_add_backlog`, qui
+/// achève la somme avant de garder quoi que ce soit : une perte et une erreur, pour
+/// une connexion dans tout état ; pour une écoute (que Linux sert sans la file
+/// `backlog`), l'erreur seule. IP_MINTTL passe avant (`tcp_v4_rcv`) : sous lui,
+/// une perte, et pas d'erreur de somme. Une socket sans connexion : l'erreur seule.
+fn somme_fausse_vers(sock: &Arc<Socket>, s: Segment) {
+    let Some(flux) = sock.flux.as_ref() else { return };
+    let ttl = s.ip.ttl;
+    let verdict = flux.du_reseau_ou(Arrivee::Segment(s), |p: &Premier| {
+        let connexion = !p.ecoute && p.etat.is_some_and(|e| e != Etat::Fermee);
+        let ttl_bas = (connexion || p.ecoute) && ttl < p.minttl;
+        (connexion || ttl_bas, !ttl_bas)
+    });
+    if let Some((perdu, erreur)) = verdict {
+        if erreur {
+            erreur_de_somme();
+        }
+        if perdu {
+            sock.pertes.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1789,11 +1905,14 @@ fn par_numero(n: u64) -> Option<Arc<Socket>> {
 /// dans InSegs comme les autres (« même mauvais », `tcp_v4_rcv`), et dans
 /// InErrs s'il a un en-tête faux (`bad_packet`) ou une somme fausse (avec
 /// InCsumErrors) ; pas s'il est trop court pour son en-tête (`discard_it`).
+/// La somme d'un segment de plus de 76 octets (CHECKSUM_BREAK) n'est vue
+/// qu'une fois sa socket trouvée, comme chez Linux (`Segment::somme_fausse`).
 /// `diffusion` : sa destination est une diffusion ou un groupe.
 pub fn recevoir(ip: &fipv4::Ipv4, recu: &ipv4::EnteteRecu, i: &super::interface::Interface, iif: u32, diffusion: bool, mut p: Paquet) {
     MIB.tcp(Compteur::InSegs);
     let (source, destination, par_lo) = (ip.source, ip.destination, i.boucle());
-    let (h, charge) = match ftcp::lire(p.donnees(), source, destination, !par_lo) {
+    let tout_de_suite = !par_lo && p.longueur() <= 76;
+    let (h, charge) = match ftcp::lire(p.donnees(), source, destination, tout_de_suite) {
         Ok(x) => x,
         Err(e) => {
             if e == Erreur::Somme {
@@ -1805,10 +1924,11 @@ pub fn recevoir(ip: &fipv4::Ipv4, recu: &ipv4::EnteteRecu, i: &super::interface:
             return;
         }
     };
+    let somme_fausse = !par_lo && !tout_de_suite && !ftcp::somme_juste(p.donnees(), source, destination);
     let entete = p.longueur() - charge.len();
     let _ = p.retirer_entete(entete);
     let _contexte = contexte::entrer();
-    livrer(Segment { entete: h, charge: p, source, destination, ip: *recu, interface: iif, diffusion, fille: None, isn: None });
+    livrer(Segment { entete: h, charge: p, source, destination, ip: *recu, interface: iif, diffusion, fille: None, isn: None, somme_fausse });
 }
 
 // --- Les appels ---
@@ -2203,6 +2323,9 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             let hors_table = f.tcb.etat() == Etat::Fermee;
             let mut tcb = f.tcb;
             tcb.attachee = true;
+            // Ce qu'elle a jeté depuis sa naissance est à elle (`sk_clone_lock` remet
+            // `sk_drops` à zéro, puis la socket fille compte les siennes).
+            let pertes = tcb.prendre_pertes();
             SOCKETS.fetch_add(1, Ordering::Relaxed);
             let partie = Partie {
                 numero, mode: Mode::Connexion(tcb),
@@ -2221,6 +2344,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             let enfant = place_socket.remplir(enfant.avec_flux(flux));
             enfant.rcvbuf.store(s.rcvbuf.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.sndbuf.store(s.sndbuf.load(Ordering::Relaxed), Ordering::Relaxed);
+            enfant.pertes.store(pertes, Ordering::Relaxed);
             enfant.recverr.store(options.recverr, Ordering::Relaxed);
             enfant.pmtudisc.store(options.pmtudisc, Ordering::Relaxed);
             enfant.peek_off.store(s.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
