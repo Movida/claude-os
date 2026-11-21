@@ -1698,6 +1698,13 @@ impl<P: Charge> Tcb<P> {
         self.taille_vraie_reception + self.hors_ordre.taille_vraie
     }
 
+    /// Ce que garde la file d'envoi (SO_MEMINFO, `sk_wmem_queued`) : les
+    /// octets écrits et pas encore acquittés, que borne SO_SNDBUF. Linux les
+    /// compte en taille vraie ; nos files d'envoi comptent les octets.
+    pub fn memoire_envoi(&self) -> usize {
+        self.octets_envoi
+    }
+
     /// La part de la file hors d'ordre.
     pub fn memoire_hors_ordre(&self) -> usize {
         self.hors_ordre.taille_vraie

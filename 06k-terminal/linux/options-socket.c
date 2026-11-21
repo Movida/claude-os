@@ -28,7 +28,14 @@
  *     un pair AF_UNIX parti reste jusqu'à l'envoi qui le découvre ;
  *   - SO_PEERGROUPS : les groupes du pair AF_UNIX, ceux de getgroups (aucun chez nous,
  *     ceux de l'utilisateur sur l'hôte) ; ENODATA sans droits gardés, ERANGE et la
- *     longueur qu'il faut pour une place trop petite.
+ *     longueur qu'il faut pour une place trop petite ;
+ *   - SO_MEMINFO : neuf compteurs, coupés à la place ; ce que garde la réception (UDP,
+ *     TCP), ce qu'un envoi AF_UNIX tient chez qui l'envoie jusqu'à sa lecture, la file
+ *     d'envoi de TCP, la mémoire des adhésions et de leurs listes de sources (les tailles
+ *     de Linux), les pertes (une file pleine d'UDP et de ping, une écoute pleine) ;
+ *   - SO_RESERVE_MEM : sans groupe de contrôle de la mémoire (chez nous, et sous Linux
+ *     dans le groupe racine) EOPNOTSUPP ; dans un groupe (un conteneur), des pages
+ *     réservées pour UDP et TCP ; EINVAL pour une valeur négative.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -62,6 +69,9 @@
 #endif
 #ifndef SO_DEVMEM_DONTNEED
 #define SO_DEVMEM_DONTNEED 80
+#endif
+#ifndef SO_RESERVE_MEM
+#define SO_RESERVE_MEM 73
 #endif
 
 static int echecs;
@@ -757,6 +767,194 @@ static void groupes(void)
     close(p[0]), close(p[1]);
 }
 
+/* SO_MEMINFO dans `place` octets : la longueur rendue (-1 : l'appel a échoué) ; m reçoit
+ * les compteurs (0x55555555 au-delà). Leurs indices : */
+enum { RMEM, RCVBUF, WMEM, SNDBUF, FWD, QUEUED, OPTMEM, BACKLOG, DROPS };
+static int meminfo(int s, socklen_t place, unsigned *m)
+{
+    memset(m, 0x55, 12 * sizeof *m);
+    socklen_t l = place;
+    return getsockopt(s, SOL_SOCKET, SO_MEMINFO, m, &l) < 0 ? -1 : (int)l;
+}
+
+static unsigned compteur(int s, int i)
+{
+    unsigned m[12];
+    meminfo(s, 36, m);
+    return m[i];
+}
+
+/* Lit sans attendre tout ce qui est en file : le nombre de messages. */
+static int vider(int s)
+{
+    char b[2048];
+    int n = 0;
+    while (recv(s, b, sizeof b, MSG_DONTWAIT) >= 0)
+        n++;
+    return n;
+}
+
+static void memoire(void)
+{
+    unsigned m[12];
+    for (int i = 0; i < SORTES; i++) {
+        int s = ouvrir(&sortes[i]);
+        int l = meminfo(s, 36, m);
+        verifier(l == 36 && m[RCVBUF] == (unsigned)lire(s, SO_RCVBUF) && m[SNDBUF] == (unsigned)lire(s, SO_SNDBUF) && m[RMEM] == 0 && m[WMEM] == 0
+                     && m[QUEUED] == 0 && m[OPTMEM] == 0 && m[BACKLOG] == 0 && m[DROPS] == 0 && m[9] == 0x55555555,
+                 dire("SO_MEMINFO %s neuve : SO_RCVBUF et SO_SNDBUF, rien de garde, 36 octets", sortes[i].nom));
+        close(s);
+    }
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    int l4 = meminfo(s, 4, m);
+    unsigned m1 = m[1];
+    int l0 = meminfo(s, 0, m);
+    unsigned z = m[0];
+    verifier(l4 == 4 && m1 == 0x55555555 && l0 == 0 && z == 0x55555555 && meminfo(s, 100, m) == 36, "SO_MEMINFO : coupe a la place, 36 octets au plus");
+    close(s);
+
+    /* UDP : ce que garde la réception, rendu à la lecture ; une file pleine perd. */
+    int r = socket(AF_INET, SOCK_DGRAM, 0), e = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t al = sizeof a;
+    bind(r, (void *)&a, sizeof a);
+    getsockname(r, (void *)&a, &al);
+    connect(e, (void *)&a, sizeof a);
+    char b[1000] = {0};
+    send(e, b, 100, 0);
+    attendre_ms(20);
+    unsigned avant = compteur(r, RMEM);
+    vider(r);
+    verifier(avant > 100 && compteur(r, RMEM) == 0, "SO_MEMINFO udp : un datagramme garde (plus que ses octets), rendu a la lecture");
+    poser(r, SO_RCVBUF, 1);
+    for (int i = 0; i < 20; i++)
+        send(e, b, sizeof b, 0);
+    attendre_ms(20);
+    unsigned pertes = compteur(r, DROPS);
+    int lus = vider(r);
+    printf("[linux] options-socket : udp, SO_RCVBUF minimal, 20 datagrammes : %d lus, %u perdus\n", lus, pertes);
+    verifier(pertes >= 1 && lus + pertes == 20, "SO_MEMINFO udp : la file pleine, chaque datagramme jete est une perte");
+    close(r), close(e);
+
+    /* ping : de même, les réponses que la file ne prend pas. */
+    int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    poser(p, SO_RCVBUF, 1);
+    struct sockaddr_in lo = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    unsigned char echo[64] = {8, 0};
+    for (int i = 0; i < 10; i++)
+        sendto(p, echo, sizeof echo, 0, (void *)&lo, sizeof lo);
+    attendre_ms(50);
+    pertes = compteur(p, DROPS);
+    lus = vider(p);
+    verifier(pertes >= 1 && lus + pertes == 10, "SO_MEMINFO ping : la file pleine, chaque reponse jetee est une perte");
+    close(p);
+
+    /* AF_UNIX : l'envoi est à qui l'envoie, jusqu'à sa lecture. */
+    int pr[2];
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, pr);
+    send(pr[0], b, 100, 0);
+    unsigned w = compteur(pr[0], WMEM), rm = compteur(pr[1], RMEM);
+    vider(pr[1]);
+    verifier(w > 100 && rm == 0 && compteur(pr[0], WMEM) == 0, "SO_MEMINFO unix : l'envoi tenu par l'emetteur jusqu'a la lecture, rien chez le recepteur");
+    close(pr[0]), close(pr[1]);
+
+    /* TCP : un récepteur qui ne lit pas ; l'émetteur remplit sa file d'envoi. */
+    int ec = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in t = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t tl = sizeof t;
+    bind(ec, (void *)&t, sizeof t);
+    listen(ec, 1);
+    getsockname(ec, (void *)&t, &tl);
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&t, sizeof t);
+    attendre_ms(20);
+    int f = accept(ec, NULL, NULL);
+    static char gros[65536];
+    while (send(c, gros, sizeof gros, 0) > 0)
+        ;
+    attendre_ms(50);
+    verifier(compteur(c, QUEUED) > 0 && compteur(f, RMEM) > 0, "SO_MEMINFO tcp : la file d'envoi pleine, la reception gardee");
+    close(c), close(f), close(ec);
+    /* Une écoute pleine perd les SYN qu'elle ne prend pas. */
+    ec = socket(AF_INET, SOCK_STREAM, 0);
+    t.sin_port = 0;
+    bind(ec, (void *)&t, sizeof t);
+    listen(ec, 0);
+    getsockname(ec, (void *)&t, &tl);
+    int cs[4];
+    for (int i = 0; i < 4; i++) {
+        cs[i] = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+        connect(cs[i], (void *)&t, sizeof t);
+    }
+    attendre_ms(100);
+    verifier(compteur(ec, DROPS) >= 3, "SO_MEMINFO tcp : une ecoute pleine, chaque SYN jete est une perte");
+    for (int i = 0; i < 4; i++)
+        close(cs[i]);
+    close(ec);
+
+    /* La mémoire des options : une adhésion, 48 octets ; une liste de sources, 24 et 4 par
+     * place (10 au départ, 10 de plus quand elle est pleine, autant que de sources pour
+     * IP_MSFILTER). */
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct ip_mreqn mr = {.imr_multiaddr.s_addr = htonl(0xe0010203), .imr_ifindex = 1};
+    setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr, sizeof mr);
+    unsigned o1 = compteur(s, OPTMEM);
+    struct ip_mreq_source ms = {.imr_multiaddr.s_addr = htonl(0xe0010205), .imr_interface.s_addr = htonl(INADDR_LOOPBACK),
+                                .imr_sourceaddr.s_addr = htonl(0x01020304)};
+    setsockopt(s, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, &ms, sizeof ms);
+    unsigned o2 = compteur(s, OPTMEM);
+    char tf[sizeof(struct ip_msfilter) + 3 * 4];
+    struct ip_msfilter *msf = (void *)tf;
+    msf->imsf_multiaddr = ms.imr_multiaddr, msf->imsf_interface = ms.imr_interface;
+    msf->imsf_fmode = MCAST_INCLUDE, msf->imsf_numsrc = 3;
+    for (int i = 0; i < 3; i++)
+        msf->imsf_slist[i].s_addr = htonl(0x05060700 + i);
+    setsockopt(s, IPPROTO_IP, IP_MSFILTER, msf, sizeof tf);
+    unsigned o3 = compteur(s, OPTMEM);
+    ms.imr_sourceaddr.s_addr = htonl(0x05060709);
+    setsockopt(s, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, &ms, sizeof ms);
+    unsigned o4 = compteur(s, OPTMEM);
+    /* INCLUDE sans source : l'adhésion s'en va (`ip_mc_msfilter`). */
+    msf->imsf_numsrc = 0;
+    setsockopt(s, IPPROTO_IP, IP_MSFILTER, msf, sizeof *msf);
+    unsigned o5 = compteur(s, OPTMEM);
+    setsockopt(s, IPPROTO_IP, IP_DROP_MEMBERSHIP, &mr, sizeof mr);
+    unsigned o6 = compteur(s, OPTMEM);
+    printf("[linux] options-socket : SO_MEMINFO, memoire des options : %u %u %u %u %u %u\n", o1, o2, o3, o4, o5, o6);
+    verifier(o1 == 48 && o2 == 48 + 112 && o3 == 48 + 84 && o4 == 48 + 124 && o5 == 48 && o6 == 0,
+             "SO_MEMINFO udp : la memoire des adhesions et de leurs listes de sources");
+    close(s);
+}
+
+/* SO_RESERVE_MEM : l'erreur de la pose, et la valeur relue dans *v. */
+static int reserver(int s, int octets, int *v)
+{
+    int e = poser(s, SO_RESERVE_MEM, octets);
+    *v = lire(s, SO_RESERVE_MEM);
+    return e;
+}
+
+static void reserve(void)
+{
+    int v, x = socket(AF_INET, SOCK_DGRAM, 0);
+    /* Un groupe de contrôle de la mémoire pour la socket : UDP accepte 0. */
+    int groupe = reserver(x, 0, &v) == 0;
+    close(x);
+    printf("[linux] options-socket : SO_RESERVE_MEM : %s\n", groupe ? "un groupe de controle de la memoire" : "sans groupe de controle de la memoire");
+    for (int i = 0; i < SORTES; i++) {
+        int s = ouvrir(&sortes[i]), ok;
+        int compte = groupe && i < 2;
+        if (compte)
+            ok = reserver(s, 1, &v) == 0 && v == 4096 && reserver(s, 4097, &v) == 0 && v == 8192 && reserver(s, 0, &v) == 0 && v == 0;
+        else
+            ok = reserver(s, 0, &v) == EOPNOTSUPP && v == 0 && reserver(s, 4096, &v) == EOPNOTSUPP && v == 0;
+        ok &= reserver(s, -1, &v) == EINVAL;
+        verifier(ok, dire(compte ? "SO_RESERVE_MEM %s : des pages, rendues par 0 ; EINVAL pour -1" : "SO_RESERVE_MEM %s : EOPNOTSUPP, rien de reserve ; EINVAL pour -1",
+                          sortes[i].nom));
+        close(s);
+    }
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -774,6 +972,8 @@ int main(void)
     txrehash();
     pair();
     groupes();
+    memoire();
+    reserve();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

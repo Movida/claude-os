@@ -1822,6 +1822,11 @@ impl<T: Possede> Possession<T> {
         f(&mut self.court.verrouiller().premier)
     }
 
+    /// La taille de ce qui attend dans la file `backlog` (`sk_backlog.len`).
+    pub fn taille_backlog(&self) -> usize {
+        self.court.verrouiller().taille
+    }
+
     /// Ce que la réception a pour la donnée : traité tout de suite sous le
     /// verrou court si personne ne possède ; sinon mis dans la file (taille
     /// `taille`, refusé au-delà de `limite` : jeté, comme `sk_add_backlog`).

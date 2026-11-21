@@ -405,13 +405,18 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
     let (u, charge) = match udp::lire(p.donnees(), source, destination) {
         Ok(x) => x,
         // (La longueur d'UDP : `udp::lire` l'a vérifiée avant la somme.)
+        // Plus long, et pour une socket, Linux le jette à la lecture, qui compte une perte pour
+        // elle (`__sk_queue_drop_skb`) : nous, à l'arrivée, comme les compteurs.
         Err(Erreur::Somme) if diffusion && u16::from_be_bytes([p.donnees()[4], p.donnees()[5]]) > 76 => {
             let o = p.donnees();
             let ports = (u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]]));
             let mut sockets = 0;
             if let Some(t) = PORTS.verrouiller().as_ref() {
                 t.pour_chaque_diffusion(source, ports.0, destination, ports.1, lieu.interface, |s| {
-                    sockets += super::multidiffusion::permet(s, destination, source, lieu.interface) as usize;
+                    if super::multidiffusion::permet(s, destination, source, lieu.interface) {
+                        sockets += 1;
+                        s.pertes.fetch_add(1, Ordering::Relaxed);
+                    }
                 });
             }
             if sockets == 0 {
@@ -426,6 +431,14 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
         Err(e) => {
             if e == Erreur::Somme {
                 MIB.udp(Compteur::InCsumErrors);
+                let o = p.donnees();
+                if u16::from_be_bytes([o[4], o[5]]) > 76 {
+                    let ports = (u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]]));
+                    let s = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(source, ports.0, destination, ports.1, lieu.interface));
+                    if let Some(s) = s {
+                        s.pertes.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
             }
             MIB.udp(Compteur::InErrors);
             return Ok(());
@@ -461,6 +474,7 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
                 match Paquet::copie(p.donnees()) {
                     Some(copie) => deposer(s, copie, &arrivee),
                     None => {
+                        s.pertes.fetch_add(1, Ordering::Relaxed);
                         MIB.udp(Compteur::RcvbufErrors);
                         MIB.udp(Compteur::InErrors);
                     }

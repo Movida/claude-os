@@ -522,6 +522,14 @@ pub struct Socket {
     /// SO_RCVBUF et SO_SNDBUF (lus par la tâche du réseau sans le Mutex).
     pub rcvbuf: AtomicU32,
     pub sndbuf: AtomicU32,
+    /// Ce qui a été jeté en arrivant pour elle (`sk_drops` : SO_MEMINFO, et
+    /// SO_RXQ_OVFL) : un datagramme que sa file ne prend pas (`deposer` :
+    /// `__udp_enqueue_schedule_skb`, `__sock_queue_rcv_skb`), la copie ratée
+    /// d'une diffusion, une somme fausse (udp.rs), un segment que la file
+    /// `backlog` de TCP ne prend pas (`tcp_add_backlog`), ce que jette une
+    /// écoute (`tcp_listendrop`, `tcp_drop_reason`). Un `atomic_t` chez Linux :
+    /// il fait le tour.
+    pub pertes: AtomicU32,
     /// Ce que la tâche du réseau doit savoir d'une socket quand une erreur
     /// ICMP arrive, sans prendre le `Mutex` : est-elle connectée (le
     /// `sk_state` de Linux) ? a-t-elle IP_RECVERR (un bit atomique de
@@ -608,6 +616,7 @@ impl Socket {
             }),
             rcvbuf: AtomicU32::new(TAMPON_DEFAUT),
             sndbuf: AtomicU32::new(TAMPON_DEFAUT),
+            pertes: AtomicU32::new(0),
             connectee: AtomicBool::new(false),
             recverr: AtomicBool::new(false),
             place_manquee: AtomicBool::new(false),
@@ -700,10 +709,12 @@ impl Socket {
                 Admission::Ordinaire => r.octets >= rcvbuf,
             };
             if refuse {
+                self.pertes.fetch_add(1, Ordering::Relaxed);
                 return Err(Rejet::Pleine);
             }
             let taille = d.taille;
             if r.file.ajouter_derriere(d).is_err() {
+                self.pertes.fetch_add(1, Ordering::Relaxed);
                 return Err(Rejet::Memoire);
             }
             r.octets += taille;

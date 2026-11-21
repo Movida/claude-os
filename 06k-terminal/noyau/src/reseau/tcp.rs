@@ -1431,7 +1431,12 @@ impl Partie {
             s.fille = None;
         }
         let h = s.entete;
+        // Ce que l'écoute jette est une perte pour elle (`sk_drops`) : un RST, des drapeaux
+        // qui ne demandent rien (`tcp_rcv_state_process`, TCP_LISTEN : `tcp_drop_reason`),
+        // un SYN qu'elle ne prend pas (`tcp_listendrop`) ; pas un ACK, qui a son RST.
+        let perdu = || perte(numero_ecoute);
         if h.drapeaux & ftcp::RST != 0 {
+            perdu();
             return;
         }
         if h.drapeaux & ftcp::ACK != 0 {
@@ -1446,15 +1451,20 @@ impl Partie {
         // compte, mais n'a pas de route, sauf de la diffusion d'un réseau pour une écoute
         // IP_TRANSPARENT.)
         if h.drapeaux & ftcp::SYN == 0 || h.drapeaux & ftcp::FIN != 0 || s.diffusion {
+            perdu();
             return;
         }
         // Un SYN : jeté si la file d'acceptation est pleine, ou s'il y a
         // déjà backlog + 1 filles (`tcp_conn_request`).
         let pretes = filles.iter().filter(|f| f.prete()).count();
         if pretes > *backlog || filles.len() > *backlog || filles.try_reserve(1).is_err() {
+            perdu();
             return;
         }
-        let Ok(place) = faillible::boite_vide() else { return };
+        let Ok(place) = faillible::boite_vide() else {
+            perdu();
+            return;
+        };
         let numero = socket::nouveau_numero();
         let iss = s.isn.unwrap_or_else(|| numero_initial(s.destination, s.source, h.destination, h.source));
         // L'écho des options du SYN (`tcp_v4_save_options` : impossible, aucune) :
@@ -1473,6 +1483,7 @@ impl Partie {
         // écoute IP_TRANSPARENT.
         if route_de_segment(&ip_fille, s.destination, s.source, false).is_none() {
             MIB.ip(CompteurIp::OutNoRoutes);
+            perdu();
             return;
         }
         let vers = ip_fille.vers(s.source);
@@ -1514,6 +1525,7 @@ impl Partie {
             t.ajouter_fille(numero, lien, Cible::Fille(moi, numero)).is_ok()
         });
         if !ajoutee {
+            perdu();
             return;
         }
         let mut f = Fille {
@@ -1623,12 +1635,22 @@ fn livrer(s: Segment) {
 
 /// Donne le segment à la socket : traité tout de suite, ou mis dans sa
 /// file `backlog` si un appel la possède (bornée comme `tcp_add_backlog` :
-/// deux fois SO_RCVBUF, plus la moitié de SO_SNDBUF, plus 64 Kio).
+/// deux fois SO_RCVBUF, plus la moitié de SO_SNDBUF, plus 64 Kio ; au-delà,
+/// une perte, `sk_drops`).
 fn vers_socket(sock: &Arc<Socket>, a: Arrivee) {
     let Some(flux) = sock.flux.as_ref() else { return };
     let limite = flux.court(|c| 2 * c.rcvbuf + c.sndbuf / 2 + 65_536);
     let t = taille(&a);
-    flux.du_reseau(a, t, limite);
+    if !flux.du_reseau(a, t, limite) {
+        sock.pertes.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Une perte de plus pour la socket `numero` (`sk_drops`), si elle est encore là.
+fn perte(numero: u64) {
+    if let Some(s) = par_numero(numero) {
+        s.pertes.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// Une erreur ICMP pour un segment TCP que nous avons envoyé (`tcp_v4_err`) :
@@ -2901,6 +2923,23 @@ pub fn sndbuf(s: &Socket) -> u32 {
         Mode::Connexion(t) => t.sndbuf.min(i32::MAX as usize) as u32,
         _ => s.sndbuf.load(Ordering::Relaxed),
     }
+}
+
+/// SO_MEMINFO d'une socket TCP (`sk_get_meminfo`) : la réception gardée, en
+/// taille vraie (les files de lecture et hors d'ordre, `sk_rmem_alloc`) ; ce
+/// que la carte n'a pas fini d'envoyer (`sk_wmem_alloc`, la `Retenue`) ; la
+/// file d'envoi (`sk_wmem_queued`, `Tcb::memoire_envoi`) ; la file `backlog`
+/// (`sk_backlog.len`), lue avant de posséder la socket, qui la viderait. Une
+/// écoute ne garde rien : ses filles sont à elles.
+pub fn memoire(s: &Socket) -> [usize; 4] {
+    let backlog = s.flux.as_ref().map_or(0, |f| f.taille_backlog());
+    let mut g = flux(s).posseder();
+    let p = g.donnee();
+    let (reception, envoi) = match &p.mode {
+        Mode::Connexion(t) => (t.memoire_reception(), t.memoire_envoi()),
+        _ => (0, 0),
+    };
+    [reception, p.retenue.octets(), envoi, backlog]
 }
 
 /// Pour l'auto-test : la source et le port, SND.UNA et SND.NXT d'une connexion.

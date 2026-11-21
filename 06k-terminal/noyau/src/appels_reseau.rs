@@ -122,6 +122,8 @@ const SO_PASSCRED: i32 = 16;
 const SO_PEERCRED: i32 = 17;
 const SO_PEERNAME: i32 = 28;
 const SO_PEERGROUPS: i32 = 59;
+const SO_MEMINFO: i32 = 55;
+const SO_RESERVE_MEM: i32 = 73;
 const SO_PASSRIGHTS: i32 = 83;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
@@ -1729,6 +1731,16 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             }
             op.verrous_tampons = v as u8;
         }
+        // De la mémoire prise d'avance pour la socket, par pages, à son groupe
+        // de contrôle de la mémoire (`sock_reserve_memory`) : sans groupe
+        // (`mem_cgroup_sk_enabled` faux, le groupe racine, ou des noyaux sans
+        // memcg), EOPNOTSUPP, même pour 0, et rien n'est réservé (relu 0). Nous
+        // n'avons pas de groupes de contrôle : la réserve n'aurait personne à
+        // qui être prise, et rien qu'elle protège. Une valeur négative :
+        // EINVAL d'abord.
+        SO_RESERVE_MEM => {
+            return Err(if v < 0 { -EINVAL } else { -EOPNOTSUPP });
+        }
         SO_LINGER => {
             if longueur < 8 {
                 return Err(-EINVAL);
@@ -2661,6 +2673,19 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
                 ecrire_longueur()?;
                 Ok(0)
             }
+            // Les neuf compteurs de la mémoire de la socket (`sk_get_meminfo`),
+            // autant qu'il y a de place (`SK_MEMINFO_VARS` u32 au plus).
+            SOL_SOCKET if option == SO_MEMINFO => {
+                let place = lire_longueur(&mut l)? as usize;
+                let mut o = [0u8; 36];
+                for (i, v) in memoire_de_la_socket(s).iter().enumerate() {
+                    o[4 * i..4 * i + 4].copy_from_slice(&(*v as u32).to_le_bytes());
+                }
+                let n = place.min(o.len());
+                copier_vers_utilisateur(valeur, &o[..n]).map_err(|_| -EFAULT)?;
+                copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+                Ok(0)
+            }
             SOL_SOCKET => {
                 let place = lire_longueur(&mut l)?;
                 let v = lire_option_socket(s, option, place as usize)?;
@@ -2747,6 +2772,38 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
     })())
 }
 
+/// SO_MEMINFO (`sk_get_meminfo`), dans l'ordre de `SK_MEMINFO_*` :
+///   - RMEM_ALLOC : ce que garde la réception, en taille vraie ;
+///   - RCVBUF, SNDBUF : comme SO_RCVBUF et SO_SNDBUF ;
+///   - WMEM_ALLOC : ce qui est envoyé et pas encore rendu (par la carte ; pour
+///     AF_UNIX, par la lecture du pair) ;
+///   - FWD_ALLOC : 0. Linux compte la mémoire de chaque protocole par pages
+///     (`sk_memory_allocated`), et garde à la socket le reste de la dernière
+///     page prise, pour ne pas toucher le compte commun à chaque paquet ; nous
+///     la comptons à l'octet, à chaque événement (tcp.rs, `MEMOIRE`), sans
+///     avance ;
+///   - WMEM_QUEUED : la file d'envoi de TCP (0 ailleurs) ;
+///   - OPTMEM : la mémoire des options (`sk_omem_alloc`) : les adhésions à des
+///     groupes et leurs listes de sources ;
+///   - BACKLOG : la file `backlog` de TCP ;
+///   - DROPS : ce qui a été jeté en arrivant pour elle (`Socket::pertes`).
+fn memoire_de_la_socket(s: &Socket) -> [usize; 9] {
+    let (reception, envoyes, file_envoi, backlog) = match s.protocole {
+        Protocole::Tcp => {
+            let [r, e, f, b] = tcp::memoire(s);
+            (r, e, f, b)
+        }
+        Protocole::Unix => (0, unix::envoyes(s), 0, 0),
+        _ => (s.reception.verrouiller().octets, s.envois.as_ref().map_or(0, |r| r.octets()), 0, 0),
+    };
+    let (rcvbuf, sndbuf) = match s.protocole {
+        Protocole::Tcp => (tcp::rcvbuf(s), tcp::sndbuf(s)),
+        _ => (s.rcvbuf.load(Ordering::Relaxed), s.sndbuf.load(Ordering::Relaxed)),
+    };
+    let options = if s.protocole == Protocole::Unix { 0 } else { s.adhesions.verrouiller().memoire() };
+    [reception, rcvbuf as usize, envoyes, sndbuf as usize, 0, file_envoi, options, backlog, s.pertes.load(Ordering::Relaxed) as usize]
+}
+
 /// La valeur d'une option de SOL_SOCKET, et sa longueur (un entier, sauf
 /// SO_LINGER, les délais, les cookies et SO_TXTIME), pour une place de
 /// `place` octets ; une inconnue : ENOPROTOOPT.
@@ -2809,6 +2866,8 @@ fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16]
             8
         }
         SO_BUF_LOCK => entier(&mut o, op.verrous_tampons as i32),
+        // Rien n'est jamais réservé (voir setsockopt).
+        SO_RESERVE_MEM => entier(&mut o, 0),
         SO_BUSY_POLL => entier(&mut o, op.busy_poll as i32),
         SO_PREFER_BUSY_POLL => entier(&mut o, op.prefer_busy_poll as i32),
         // Le numéro de la file NAPI de la carte qui a livré le dernier

@@ -139,22 +139,39 @@ pub struct Demande {
     pub index: u32,
 }
 
+/// Les places que gagne une liste de sources trop petite pour une de plus
+/// (`IP_SFBLOCK`).
+const BLOC_DE_SOURCES: usize = 10;
+/// Ce que coûtent, dans la mémoire des options d'une socket (`sk_omem_alloc`,
+/// SO_MEMINFO), une adhésion (`struct ip_mc_socklist`) et l'en-tête d'une
+/// liste de sources (`struct ip_sf_socklist`, sans ses adresses) : leurs
+/// tailles sur x86_64, que `sock_kmalloc` compte chez Linux (mesuré).
+const COUT_ADHESION: usize = 48;
+const COUT_LISTE: usize = 24;
+
 /// Les sources d'une adhésion (`ip_sf_socklist`), dans l'ordre où elles ont
 /// été données : au plus 10, d'où un tableau.
 #[derive(Debug, Clone, Copy)]
 struct Liste {
     n: usize,
     sources: [[u8; 4]; MAX_SOURCES],
+    /// Les places de la liste de Linux (`sl_max`), que compte la mémoire
+    /// des options : BLOC_DE_SOURCES pour la première source d'IP_ADD_SOURCE_
+    /// MEMBERSHIP, autant de plus quand elle est pleine (`ip_mc_source`) ;
+    /// exactement le nombre de sources d'IP_MSFILTER (`ip_mc_msfilter`). Elle
+    /// ne rétrécit pas quand une source s'en va.
+    places: usize,
 }
 
 impl Liste {
-    const VIDE: Liste = Liste { n: 0, sources: [[0; 4]; MAX_SOURCES] };
+    const VIDE: Liste = Liste { n: 0, sources: [[0; 4]; MAX_SOURCES], places: BLOC_DE_SOURCES };
 
     fn de(sources: &[[u8; 4]]) -> Liste {
         let mut l = Liste::VIDE;
         let n = sources.len().min(MAX_SOURCES);
         l.sources[..n].copy_from_slice(&sources[..n]);
         l.n = n;
+        l.places = n;
         l
     }
 
@@ -211,6 +228,12 @@ impl Adhesions {
 
     pub fn est_vide(&self) -> bool {
         self.entrees.is_empty()
+    }
+
+    /// Ce que coûtent les adhésions dans la mémoire des options de la socket
+    /// (`sk_omem_alloc`, SO_MEMINFO) : chacune, et sa liste de sources.
+    pub fn memoire(&self) -> usize {
+        self.entrees.iter().map(|e| COUT_ADHESION + e.liste.map_or(0, |l| COUT_LISTE + 4 * l.places)).sum()
     }
 
     /// L'adhésion au groupe `groupe` par l'interface `interface`, la plus
@@ -327,11 +350,23 @@ impl Adhesions {
         if l.n >= MAX_SOURCES {
             return Err(Refus::PlusDePlace);
         }
+        // Une liste pleine grandit avant que la source y soit cherchée
+        // (`ip_mc_source`) : même pour une source qui y est déjà. (Une liste
+        // qui naît est vide : la source n'y est pas.)
+        let grandir = |l: &mut Liste| {
+            if l.n == l.places {
+                l.places += BLOC_DE_SOURCES;
+            }
+        };
         if l.position(source).is_some() {
+            if let Some(l) = e.liste.as_mut() {
+                grandir(l);
+            }
             return Err(Refus::Introuvable);
         }
         i.add_src(d.groupe, mode, &[source], true, &mut c)?;
         let l = e.liste.get_or_insert(Liste::VIDE);
+        grandir(l);
         l.sources[l.n] = source;
         l.n += 1;
         Ok(())

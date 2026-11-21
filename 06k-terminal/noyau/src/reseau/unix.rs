@@ -582,6 +582,14 @@ pub fn droits_du_pair(s: &Socket) -> Option<Droits> {
     unix(s).etat.verrouiller().droits
 }
 
+/// SO_MEMINFO : ce que la socket a envoyé et que son pair n'a pas encore lu,
+/// en taille vraie (`sk_wmem_alloc` : chez Linux, un message d'AF_UNIX est à
+/// celle qui l'envoie, `skb_set_owner_w`, jusqu'à sa lecture ; la réception
+/// ne compte rien, `sk_rmem_alloc` reste à 0).
+pub fn envoyes(s: &Socket) -> usize {
+    unix(s).envoyes.load(Ordering::Relaxed)
+}
+
 /// SO_PASSRIGHTS.
 pub fn passrights(s: &Socket) -> bool {
     unix(s).etat.verrouiller().passrights
