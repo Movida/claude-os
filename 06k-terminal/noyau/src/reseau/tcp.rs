@@ -467,6 +467,8 @@ pub struct OptionsTcp {
     pub oobinline: bool,
     pub sndbuf_fixe: bool,
     pub rcvbuf_fixe: bool,
+    /// La copie de SO_TXREHASH, pour la même raison.
+    pub txrehash: bool,
     /// Les copies de SO_RCVLOWAT (le seuil de poll et de recv), d'IP_TTL et
     /// d'IP_TOS (ceux de chaque segment émis), pour la même raison.
     pub rcvlowat: u32,
@@ -508,7 +510,7 @@ impl OptionsTcp {
     pub const DEFAUT: OptionsTcp = OptionsTcp {
         nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
-        rcvbuf_fixe: false, rcvlowat: 1, ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 1, minttl: 0, ip_options: fipv4::OptionsSortantes::AUCUNE, window_clamp: 0,
+        rcvbuf_fixe: false, txrehash: true, rcvlowat: 1, ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 1, minttl: 0, ip_options: fipv4::OptionsSortantes::AUCUNE, window_clamp: 0,
         controle: itcp::Controle::DEFAUT, interface: 0, transparent: false, dontroute: false,
         hors_connexion: itcp::Restes::NEUF,
     };
@@ -1494,6 +1496,7 @@ impl Partie {
         tcb.decalage_horodatages(decalage_horodatages(s.destination, s.source));
         tcb.reglages = self.options.reglages(false);
         tcb.sndbuf_fixe = self.options.sndbuf_fixe;
+        tcb.txrehash = self.options.txrehash;
         tcb.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
         tcb.memoire = niveau_memoire();
         tcb.poser_controle(self.options.controle);
@@ -2069,6 +2072,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 t.rcvlowat = p.options.rcvlowat;
                 t.reglages = p.options.reglages(false);
                 t.sndbuf_fixe = p.options.sndbuf_fixe;
+                t.txrehash = p.options.txrehash;
                 t.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
                 t.memoire = niveau_memoire();
                 t.poser_controle(p.options.controle);
@@ -3115,6 +3119,32 @@ pub fn lier_a_une_interface(s: &Socket, poser: impl FnOnce(&mut socket::Inet) ->
 pub fn reutilisation_changee(s: &Socket, inet: &socket::Inet) {
     if let Some(t) = TABLE.verrouiller().as_mut() {
         t.reutiliser(s.numero, inet.options.reuseaddr, inet.options.reuseport);
+    }
+}
+
+/// SO_TXREHASH a changé : la connexion le suit dès son prochain RTO, une
+/// écoute le donne à ses filles (`sk_clone_lock` le recopie). Relu sous la
+/// possession, comme `options_socket_changees` : la connexion et getsockopt
+/// voient le même (Linux n'en a qu'une copie, `sk_txrehash`).
+pub fn txrehash_change(s: &Socket) {
+    avec_options(s, |op, t| {
+        let oui = s.appels.verrouiller().options.txrehash != 0;
+        op.txrehash = oui;
+        if let Some(t) = t {
+            t.txrehash = oui;
+        }
+    });
+}
+
+/// SO_CNX_ADVICE 1 (appels_reseau.rs, `conseil_negatif`) : la route de la
+/// connexion est oubliée si elle expire, c'est-à-dire si une MTU apprise
+/// mène vers le pair (`ipv4_negative_advice`) ; le segment suivant en
+/// cherche une autre.
+pub fn conseil_negatif(s: &Socket) {
+    let mut g = flux(s).posseder();
+    let p = g.donnee();
+    if matches!(p.mode, Mode::Connexion(_)) && ipv4::mtu_apprise(p.adresses.distante) {
+        p.route_oubliee = true;
     }
 }
 

@@ -1067,6 +1067,9 @@ pub struct Tcb<P: Charge> {
     pub sndbuf: usize,
     pub rcvbuf_fixe: bool,
     pub sndbuf_fixe: bool,
+    /// SO_TXREHASH (`sk_txrehash`) : un RTO change-t-il le hachage du flux
+    /// (`sk_rethink_txhash`) ? Oui par défaut ; sinon `rehash` ne compte plus.
+    pub txrehash: bool,
     pub rcvbuf_max: usize,
     pub sndbuf_max: usize,
     /// SO_RCVLOWAT (`sk_rcvlowat`), et si un programme tient cette connexion
@@ -1309,6 +1312,7 @@ impl<P: Charge> Tcb<P> {
             sndbuf,
             rcvbuf_fixe: false,
             sndbuf_fixe: false,
+            txrehash: true,
             rcvbuf_max: RCVBUF_MAX,
             sndbuf_max: SNDBUF_MAX,
             rcvlowat: 1,

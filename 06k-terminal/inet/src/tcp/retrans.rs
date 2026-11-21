@@ -1185,8 +1185,11 @@ impl<P: Charge> Tcb<P> {
             // `sk_rethink_txhash`, en service par défaut), SYN compris : un autre chemin, peut-être,
             // chez qui répartit les flux par leur hachage (ECMP). Nous n'avons qu'un chemin ;
             // reste le compte, que montre TCP_INFO (`timeout_rehash`). Pas pour la sonde d'une
-            // fenêtre fermée (plus haut), ni pour une fille (`minuteur_fille` : une requête).
-            self.rehash = self.rehash.wrapping_add(1);
+            // fenêtre fermée (plus haut), ni pour une fille (`minuteur_fille` : une requête), ni
+            // si le programme l'a refusé (SO_TXREHASH 0).
+            if self.txrehash {
+                self.rehash = self.rehash.wrapping_add(1);
+            }
             self.entrer_perte(maintenant);
             self.rto_compter(maintenant);
             self.retransmissions += 1;

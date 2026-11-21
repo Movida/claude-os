@@ -318,6 +318,32 @@ pub struct Options {
     /// et VERROU_RCVBUF, par SO_RCVBUF. TCP ne fait plus grandir de
     /// lui-même un tampon fixé (tcp.rs, `tampons_changes`).
     pub verrous_tampons: u8,
+    /// L'attente active à la réception (CONFIG_NET_RX_BUSY_POLL) :
+    /// SO_BUSY_POLL (`sk_ll_usec`), SO_PREFER_BUSY_POLL et
+    /// SO_BUSY_POLL_BUDGET, gardés et relus. Ils règlent combien de temps
+    /// un `recv` interroge la file NAPI de la carte avant de dormir ; nos
+    /// cartes réveillent toujours par interruption, et une attente active
+    /// ne changerait que le temps, jamais ce que lit le programme.
+    pub busy_poll: u32,
+    pub prefer_busy_poll: bool,
+    pub busy_poll_budget: u16,
+    /// SO_WIFI_STATUS (l'avis d'acquittement d'une trame Wi-Fi) et
+    /// SO_NOFCS (une trame sans somme de contrôle Ethernet, pour les
+    /// sockets de paquets) : gardés et relus ; seul un pilote Wi-Fi, ou
+    /// une carte qui sait le faire, s'en sert, et nous n'en avons pas.
+    pub wifi_status: bool,
+    pub nofcs: bool,
+    /// SO_TXTIME (`SOCK_TXTIME`, `sk_clockid`, ses deux drapeaux) : posé,
+    /// il ne se retire plus ; il permet SCM_TXTIME à l'envoi, l'heure de
+    /// départ voulue d'un paquet. Seuls les ordonnanceurs de file etf et fq
+    /// la lisent ; sans eux (lo, et nos cartes : une file simple), le
+    /// paquet part tout de suite, comme chez nous.
+    pub txtime: bool,
+    pub txtime_horloge: u8,
+    pub txtime_drapeaux: u8,
+    /// SO_TXREHASH de TCP (`sk_txrehash`) : 1, un RTO change le hachage du
+    /// flux (TCP_INFO le compte, `tcpi_rehash`) ; 0, jamais.
+    pub txrehash: u8,
     pub rcvlowat: u32,
     /// Les délais de réception et d'émission (SO_RCVTIMEO, SO_SNDTIMEO), en
     /// nanosecondes, déjà arrondis au tic ; None : sans délai.
@@ -415,10 +441,32 @@ pub fn appelant_privilegie() -> bool {
     crate::processus::avec(|p| p.identite).root()
 }
 
+/// Le compteur des SO_COOKIE (`sock_cookie`), le dernier donné.
+static COOKIES: AtomicU64 = AtomicU64::new(0);
+
+impl Socket {
+    /// SO_COOKIE (`sock_gen_cookie`) : celui de la socket, donné au premier
+    /// besoin ; deux appels concurrents gardent le même (le premier
+    /// `compare_exchange` gagne, comme le `atomic64_cmpxchg` de Linux).
+    pub fn cookie(&self) -> u64 {
+        let c = self.cookie.load(Ordering::Relaxed);
+        if c != 0 {
+            return c;
+        }
+        let neuf = COOKIES.fetch_add(1, Ordering::Relaxed) + 1;
+        match self.cookie.compare_exchange(0, neuf, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => neuf,
+            Err(autre) => autre,
+        }
+    }
+}
+
 impl Options {
     const DEFAUT: Options = Options {
         reuseaddr: false, reuseport: false, broadcast: false, keepalive: false, debug: false, dontroute: false,
-        oobinline: false, no_check: false, priority: 0, linger: (false, 0), verrous_tampons: 0, rcvlowat: 1,
+        oobinline: false, no_check: false, priority: 0, linger: (false, 0), verrous_tampons: 0,
+        busy_poll: 0, prefer_busy_poll: false, busy_poll_budget: 0, wifi_status: false, nofcs: false,
+        txtime: false, txtime_horloge: 0, txtime_drapeaux: 0, txrehash: 1, rcvlowat: 1,
         rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, unicast_if: 0, interface: 0, recverr: false, pmtudisc: 1,
         udp_cork: false, recvttl: false, recvtos: false, recvopts: false, retopts: false, passsec: false,
         origdstaddr: false, checksum: false, recvfragsize: false, rfc4884: false, freebind: false, transparent: false,
@@ -516,6 +564,9 @@ pub struct Socket {
     /// SO_PEEK_OFF (`sk_peek_off`) : où MSG_PEEK reprend, en octets depuis le début de ce qui est à
     /// lire ; négatif : il ne s'en sert pas, et regarde toujours la tête (-1, le défaut).
     pub peek_off: AtomicI32,
+    /// SO_COOKIE (`sk_cookie`) : un nombre propre à la socket, jamais 0,
+    /// jamais réutilisé, donné au premier qui le demande (0 : pas encore).
+    pub cookie: AtomicU64,
     /// La suivante des sockets qu'une tâche a à fermer (sa liste
     /// `Tache::fermetures`, voir `fichier_ferme`).
     suivante: Verrou<Option<Arc<Socket>>>,
@@ -568,6 +619,7 @@ impl Socket {
             asynchrone: crate::asynchrone::ListeAsync::new(),
             inode: AtomicU32::new(0),
             peek_off: AtomicI32::new(-1),
+            cookie: AtomicU64::new(0),
             suivante: Verrou::new(None),
             flux: None,
             unix: None,

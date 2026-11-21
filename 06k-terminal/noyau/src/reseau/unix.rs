@@ -305,6 +305,11 @@ struct Etat {
     passcred: bool,
     /// Elle accepte qu'on lui envoie des descripteurs (SO_PASSRIGHTS, `sk_scm_rights`).
     passrights: bool,
+    /// SO_PASSSEC (`sk_scm_security`) : gardé, relu, hérité comme ses frères. Il ajouterait
+    /// à chaque lecture l'étiquette de sécurité de l'envoyeur (SCM_SECURITY), que donne un
+    /// module de sécurité ; sans module, Linux n'en met pas (`security_secid_to_secctx`
+    /// échoue), nous non plus.
+    passsec: bool,
     /// Une fille pas encore acceptée : le numéro de l'écoute qui la tient (`u->listener`).
     ecoute: Option<u64>,
     /// L'octet urgent en file, son numéro (`u->oob_skb` ; 0 : aucun).
@@ -338,7 +343,7 @@ impl Unix {
         Some(Unix {
             sorte,
             etat: Verrou::new(Etat {
-                phase: Phase::Neuve, nom: None, pair: None, arret: 0, erreur: 0, morte: false, passcred: false, passrights: true, ecoute: None, oob: 0, droits: None,
+                phase: Phase::Neuve, nom: None, pair: None, arret: 0, erreur: 0, morte: false, passcred: false, passrights: true, passsec: false, ecoute: None, oob: 0, droits: None,
                 file: VecDeque::new(),
             }),
             envoyes: AtomicUsize::new(0),
@@ -584,6 +589,15 @@ pub fn changer_passcred(s: &Socket, oui: bool) {
     unix(s).etat.verrouiller().passcred = oui;
 }
 
+/// SO_PASSSEC.
+pub fn passsec(s: &Socket) -> bool {
+    unix(s).etat.verrouiller().passsec
+}
+
+pub fn changer_passsec(s: &Socket, oui: bool) {
+    unix(s).etat.verrouiller().passsec = oui;
+}
+
 /// SO_ERROR : l'erreur en attente, prise.
 pub fn prendre_erreur(s: &Socket) -> i32 {
     core::mem::take(&mut unix(s).etat.verrouiller().erreur)
@@ -782,13 +796,13 @@ fn connecter_flux(s: &Arc<Socket>, n: &Nom, non_bloquant: bool) -> Result<(), i6
         };
         let ua = unix(&autre);
         // L'écoute, et sa file.
-        let (ecoute, pleine, nom_ecoute, droits_ecoute, passcred_ecoute, passrights_ecoute) = {
+        let (ecoute, pleine, nom_ecoute, droits_ecoute, passcred_ecoute, passrights_ecoute, passsec_ecoute) = {
             let e = ua.etat.verrouiller();
             match e.phase {
                 Phase::Ecoute { backlog } if !e.morte && e.arret & ARRET_LECTURE == 0 => {
-                    (true, e.file.len() > backlog, e.nom, e.droits, e.passcred, e.passrights)
+                    (true, e.file.len() > backlog, e.nom, e.droits, e.passcred, e.passrights, e.passsec)
                 }
-                _ => (false, false, None, None, false, true),
+                _ => (false, false, None, None, false, true, false),
             }
         };
         if !ecoute {
@@ -825,10 +839,11 @@ fn connecter_flux(s: &Arc<Socket>, n: &Nom, non_bloquant: bool) -> Result<(), i6
             e.pair = Some(s.clone());
             e.nom = nom_ecoute.map(|n| Nom { inode: None, ..n });
             e.droits = Some(droits_courants());
-            // Les drapeaux de réception de l'écoute (SO_PASSCRED :
-            // `sk_scm_recv_flags`).
+            // Les drapeaux de réception de l'écoute (SO_PASSCRED,
+            // SO_PASSRIGHTS, SO_PASSSEC : `sk_scm_recv_flags`).
             e.passcred = passcred_ecoute;
             e.passrights = passrights_ecoute;
+            e.passsec = passsec_ecoute;
             e.ecoute = Some(autre.numero);
         }
         // Le message qui apporte la fille à l'écoute.

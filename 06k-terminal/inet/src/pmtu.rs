@@ -51,6 +51,12 @@ impl Exceptions {
         self.chercher(destination, maintenant).map_or(route, |e| e.mtu)
     }
 
+    /// Une MTU est-elle retenue vers `destination` (la route qui y mène expire :
+    /// `rt->dst.expires`) ?
+    pub fn retenue(&self, destination: [u8; 4], maintenant: u64) -> bool {
+        self.chercher(destination, maintenant).is_some()
+    }
+
     /// `ip_mtu_locked` : retenue sous le plancher ?
     pub fn verrouillee(&self, destination: [u8; 4], maintenant: u64) -> bool {
         self.chercher(destination, maintenant).is_some_and(|e| e.verrouillee)

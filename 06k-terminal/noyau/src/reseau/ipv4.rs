@@ -690,6 +690,11 @@ pub fn mtu_verrouillee(destination: [u8; 4]) -> bool {
     EXCEPTIONS.verrouiller().verrouillee(destination, crate::temps::ns_monotone())
 }
 
+/// Une MTU apprise mène-t-elle vers `destination` (une route qui expire) ?
+pub fn mtu_apprise(destination: [u8; 4]) -> bool {
+    EXCEPTIONS.verrouiller().retenue(destination, crate::temps::ns_monotone())
+}
+
 /// ICMP dit `info` vers `destination` (`__ip_rt_update_pmtu`).
 pub fn apprendre_mtu(destination: [u8; 4], info: u32) {
     if let Ok((c, d)) = router(destination, 0, Portee::Univers) {

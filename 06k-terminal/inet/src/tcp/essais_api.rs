@@ -819,6 +819,21 @@ fn le_hachage_change_a_chaque_rto() {
     let t = c.t_xmit.unwrap();
     c.minuteur(t);
     assert_eq!((c.recul, c.total_rto, c.rehash), (1, 0, 0));
+    // SO_TXREHASH 0 : les RTO se comptent, le hachage ne change plus.
+    let mut c = syn_envoye();
+    c.txrehash = false;
+    for k in 1..=2 {
+        let t = c.t_xmit.unwrap();
+        c.minuteur(t);
+        assert_eq!((c.rehash, c.total_rto), (0, k));
+    }
+    let mut c = etablie(true);
+    c.txrehash = false;
+    en_vol(&mut c, 1);
+    c.t_sorte = Minuteur::Retransmission;
+    let t = c.t_xmit.unwrap();
+    c.minuteur(t);
+    assert_eq!((c.total_rto, c.rehash), (1, 0));
 }
 
 #[test]

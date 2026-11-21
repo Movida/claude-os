@@ -128,6 +128,32 @@ const SO_BINDTODEVICE: i32 = 25;
 const SO_BINDTOIFINDEX: i32 = 62;
 const SO_DOMAIN: i32 = 39;
 const SO_BUF_LOCK: i32 = 72;
+const SO_SNDBUFFORCE: i32 = 32;
+const SO_RCVBUFFORCE: i32 = 33;
+const SO_PASSSEC: i32 = 34;
+const SO_WIFI_STATUS: i32 = 41;
+const SO_NOFCS: i32 = 43;
+const SO_BUSY_POLL: i32 = 46;
+const SO_CNX_ADVICE: i32 = 53;
+const SO_INCOMING_NAPI_ID: i32 = 56;
+const SO_COOKIE: i32 = 57;
+const SO_TXTIME: i32 = 61;
+const SCM_TXTIME: i32 = SO_TXTIME;
+const SO_PREFER_BUSY_POLL: i32 = 69;
+const SO_BUSY_POLL_BUDGET: i32 = 70;
+const SO_NETNS_COOKIE: i32 = 71;
+const SO_TXREHASH: i32 = 74;
+const SO_DEVMEM_DONTNEED: i32 = 80;
+/// Les horloges que SO_TXTIME accepte (`sockopt_validate_clockid`).
+const CLOCK_REALTIME: i32 = 0;
+const CLOCK_MONOTONIC: i32 = 1;
+const CLOCK_TAI: i32 = 11;
+/// Ses drapeaux : SOF_TXTIME_DEADLINE_MODE, SOF_TXTIME_REPORT_ERRORS.
+const SOF_TXTIME_FLAGS_MASK: u32 = 3;
+/// Le cookie de notre seul espace réseau (SO_NETNS_COOKIE, `net_cookie` :
+/// un numéro propre à l'espace, que Linux tire au démarrage pour
+/// `init_net` ; seule l'égalité a un sens).
+const NETNS_COOKIE: u64 = 1;
 const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
 const IP_TOS: i32 = 1;
@@ -900,15 +926,17 @@ fn aligner(n: usize) -> usize {
 /// source), IP_TTL (1 à 255), IP_TOS (un entier ou un octet, 0 à 255),
 /// IP_PROTOCOL (un entier, 1 à 255 : sans effet pour UDP et ping, il ne
 /// sert qu'aux sockets brutes), un autre : EINVAL ;
-/// SOL_SOCKET : SCM_RIGHTS et SCM_CREDENTIALS ignorés (ceux d'AF_UNIX), un
-/// autre : EINVAL (un écart pour SO_MARK, SO_PRIORITY, l'horodatage :
-/// Linux les prend) ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
+/// SOL_SOCKET : SCM_RIGHTS et SCM_CREDENTIALS ignorés (ceux d'AF_UNIX),
+/// SCM_TXTIME (un `u64` exactement ; seulement si SO_TXTIME est posé,
+/// `txtime`, sinon EINVAL : l'heure de départ voulue, que rien ne lit chez
+/// nous, voir socket.rs), un autre : EINVAL (un écart pour SO_MARK,
+/// SO_PRIORITY, l'horodatage : Linux les prend) ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
 /// niveau est ignoré. Selon qui lit (`protocole`), comme chez Linux : UDP
 /// lit SOL_UDP (`udp_cmsg_send`), puis SOL_IP et SOL_SOCKET
 /// (`ip_cmsg_send`) ; ping, seulement ces deux-là (SOL_UDP est sauté) ; TCP,
 /// seulement SOL_SOCKET (`sock_cmsg_send`, dans `tcp_sendmsg_locked`) : un
 /// message d'un autre niveau, même faux, ne compte pas (mesuré).
-fn lire_controle(c: &[u8], root: bool, protocole: Protocole) -> Result<Controle, i64> {
+fn lire_controle(c: &[u8], root: bool, protocole: Protocole, txtime: bool) -> Result<Controle, i64> {
     let mut r = Controle::default();
     let mut i = 0;
     while c.len() >= i + CMSG_ENTETE {
@@ -966,6 +994,7 @@ fn lire_controle(c: &[u8], root: bool, protocole: Protocole) -> Result<Controle,
             }
             (SOL_IP, _) | (SOL_UDP, _) => return Err(-EINVAL),
             (SOL_SOCKET, SCM_RIGHTS | SCM_CREDENTIALS) => r.droits = true,
+            (SOL_SOCKET, SCM_TXTIME) if txtime && d.len() == 8 => {}
             (SOL_SOCKET, _) => return Err(-EINVAL),
             _ => {}
         }
@@ -1052,7 +1081,8 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
             }
             Ok(Controle::default())
         } else {
-            lire_controle(&c, socket::appelant_privilegie(), o.socket().protocole)
+            let txtime = o.socket().appels.verrouiller().options.txtime;
+            lire_controle(&c, socket::appelant_privilegie(), o.socket().protocole, txtime)
         }
     } else {
         Ok(Controle::default())
@@ -1566,6 +1596,67 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             }
             return Ok(());
         }
+        // L'attente active (socket.rs, `Options::busy_poll`) : un délai
+        // négatif, EINVAL ; la préférer demande CAP_NET_ADMIN ; un budget
+        // plus grand que l'actuel aussi (EPERM avant EINVAL), au plus 65535.
+        SO_BUSY_POLL => {
+            if v < 0 {
+                return Err(-EINVAL);
+            }
+            s.appels.verrouiller().options.busy_poll = v as u32;
+            return Ok(());
+        }
+        SO_PREFER_BUSY_POLL => {
+            if oui && !socket::appelant_privilegie() {
+                return Err(-EPERM);
+            }
+            s.appels.verrouiller().options.prefer_busy_poll = oui;
+            return Ok(());
+        }
+        SO_BUSY_POLL_BUDGET => {
+            let mut inet = s.appels.verrouiller();
+            if v > inet.options.busy_poll_budget as i32 && !socket::appelant_privilegie() {
+                return Err(-EPERM);
+            }
+            if !(0..=u16::MAX as i32).contains(&v) {
+                return Err(-EINVAL);
+            }
+            inet.options.busy_poll_budget = v as u16;
+            return Ok(());
+        }
+        // TCP seulement ; -1 : la valeur du système (net.core.txrehash, 1).
+        SO_TXREHASH => {
+            if s.protocole != Protocole::Tcp {
+                return Err(-EOPNOTSUPP);
+            }
+            if !(-1..=1).contains(&v) {
+                return Err(-EINVAL);
+            }
+            s.appels.verrouiller().options.txrehash = (v != 0) as u8;
+            tcp::txrehash_change(s);
+            return Ok(());
+        }
+        // Rendre au pilote les pages de la mémoire d'un périphérique que des
+        // lectures TCP ont prêtées (`sock_devmem_dontneed`, devmem TCP) :
+        // TCP seulement (EBADF), des jetons de 8 octets (`dmabuf_token`), 128
+        // au plus (EINVAL), lus (EFAULT). Aucune carte ne nous en prête :
+        // aucun jeton ne désigne une page, et l'appel en rend 0.
+        SO_DEVMEM_DONTNEED => {
+            if s.protocole != Protocole::Tcp {
+                return Err(-EBADF);
+            }
+            if longueur % 8 != 0 || longueur > 8 * 128 {
+                return Err(-EINVAL);
+            }
+            let mut morceau = [0u8; 64];
+            let mut lu = 0;
+            while lu < longueur as u64 {
+                let n = (longueur as u64 - lu).min(morceau.len() as u64) as usize;
+                copier_depuis_utilisateur(&mut morceau[..n], valeur + lu).map_err(|_| -EFAULT)?;
+                lu += n as u64;
+            }
+            return Ok(());
+        }
         // Négatif : le plus grand ; 0 se relit 1.
         SO_RCVLOWAT => {
             let v = if v < 0 { i32::MAX as u32 } else { v as u32 };
@@ -1605,8 +1696,11 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         // Bornés par `wmem_max` et `rmem_max` (comparés sans signe : un
         // négatif devient le plafond), puis doublés (la place des
         // structures du noyau, dit Linux), au moins les minimums.
-        SO_SNDBUF => {
-            let v = (v as u32).min(TAMPON_MAX).min(i32::MAX as u32 / 2);
+        // FORCE : CAP_NET_ADMIN, sans le plafond, un négatif devient 0.
+        SO_SNDBUFFORCE | SO_RCVBUFFORCE if !socket::appelant_privilegie() => return Err(-EPERM),
+        SO_SNDBUF | SO_SNDBUFFORCE => {
+            let v = if option == SO_SNDBUF { (v as u32).min(TAMPON_MAX) } else { v.max(0) as u32 };
+            let v = v.min(i32::MAX as u32 / 2);
             op.verrous_tampons |= socket::VERROU_SNDBUF;
             s.sndbuf.store((v * 2).max(SNDBUF_MIN), Ordering::Relaxed);
             // La copie de la fin d'émission (paquet.rs), et ceux qui
@@ -1617,8 +1711,9 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
                 crate::reseau::datagramme::reveiller_les_ecrivains(s);
             }
         }
-        SO_RCVBUF => {
-            let v = (v as u32).min(TAMPON_MAX).min(i32::MAX as u32 / 2);
+        SO_RCVBUF | SO_RCVBUFFORCE => {
+            let v = if option == SO_RCVBUF { (v as u32).min(TAMPON_MAX) } else { v.max(0) as u32 };
+            let v = v.min(i32::MAX as u32 / 2);
             op.verrous_tampons |= socket::VERROU_RCVBUF;
             s.rcvbuf.store((v * 2).max(RCVBUF_MIN), Ordering::Relaxed);
         }
@@ -1646,19 +1741,52 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
                 op.linger = (true, if secondes >= socket::LINGER_INFINI / socket::HZ { socket::LINGER_INFINI } else { secondes * socket::HZ });
             }
         }
+        SO_WIFI_STATUS => op.wifi_status = oui,
+        SO_NOFCS => op.nofcs = oui,
+        // Un conseil : 1, la connexion va mal (`dst_negative_advice`), tout
+        // autre nombre, rien. Plus bas, une fois le Mutex rendu.
+        SO_CNX_ADVICE => {}
+        // `struct sock_txtime`, 8 octets exactement : l'horloge, puis les
+        // drapeaux (d'autres : EINVAL) ; une autre horloge que
+        // CLOCK_MONOTONIC demande CAP_NET_ADMIN (EPERM), puis d'être
+        // REALTIME, MONOTONIC ou TAI (EINVAL).
+        SO_TXTIME => {
+            if longueur != 8 {
+                return Err(-EINVAL);
+            }
+            let mut b = [0u8; 8];
+            copier_depuis_utilisateur(&mut b, valeur).map_err(|_| -EFAULT)?;
+            let horloge = i32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+            let drapeaux = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+            if drapeaux & !SOF_TXTIME_FLAGS_MASK != 0 {
+                return Err(-EINVAL);
+            }
+            if horloge != CLOCK_MONOTONIC && !socket::appelant_privilegie() {
+                return Err(-EPERM);
+            }
+            if !matches!(horloge, CLOCK_REALTIME | CLOCK_MONOTONIC | CLOCK_TAI) {
+                return Err(-EINVAL);
+            }
+            op.txtime = true;
+            op.txtime_horloge = horloge as u8;
+            op.txtime_drapeaux = drapeaux as u8;
+        }
         SO_RCVTIMEO | SO_RCVTIMEO_NEW => op.rcvtimeo = delai(valeur, longueur)?,
         SO_SNDTIMEO | SO_SNDTIMEO_NEW => op.sndtimeo = delai(valeur, longueur)?,
         // Seulement pour AF_UNIX (`sk_may_scm_recv`).
-        SO_PASSCRED | SO_PASSRIGHTS if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
-        SO_PASSCRED | SO_PASSRIGHTS => {}
+        SO_PASSCRED | SO_PASSRIGHTS | SO_PASSSEC if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
+        SO_PASSCRED | SO_PASSRIGHTS | SO_PASSSEC => {}
         _ => return Err(-ENOPROTOOPT),
     }
     if option == SO_DONTROUTE {
         inet.route_gardee = None;
     }
     drop(inet);
-    if s.protocole == Protocole::Tcp && matches!(option, SO_RCVBUF | SO_SNDBUF | SO_BUF_LOCK) {
-        tcp::tampons_changes(s, option == SO_SNDBUF, option == SO_RCVBUF);
+    if s.protocole == Protocole::Tcp && matches!(option, SO_RCVBUF | SO_SNDBUF | SO_RCVBUFFORCE | SO_SNDBUFFORCE | SO_BUF_LOCK) {
+        tcp::tampons_changes(s, matches!(option, SO_SNDBUF | SO_SNDBUFFORCE), matches!(option, SO_RCVBUF | SO_RCVBUFFORCE));
+    }
+    if option == SO_CNX_ADVICE && v == 1 {
+        conseil_negatif(s);
     }
     if s.protocole == Protocole::Tcp && matches!(option, SO_KEEPALIVE | SO_OOBINLINE | SO_DONTROUTE) {
         tcp::options_socket_changees(s, option == SO_DONTROUTE);
@@ -1669,7 +1797,32 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
     if s.protocole == Protocole::Unix && option == SO_PASSRIGHTS {
         unix::changer_passrights(s, oui);
     }
+    if s.protocole == Protocole::Unix && option == SO_PASSSEC {
+        unix::changer_passsec(s, oui);
+    }
     Ok(())
+}
+
+/// SO_CNX_ADVICE 1 (`dst_negative_advice`) : le programme dit que sa
+/// connexion va mal. Linux change alors le hachage du flux (sans le
+/// compter), et oublie la route gardée si elle n'est pas sûre
+/// (`ipv4_negative_advice` : une route périmée, redirigée, ou qui expire,
+/// celle qui porte une MTU apprise) ; une route ordinaire reste. Nous
+/// n'avons ni hachage ni redirection : la route est oubliée quand une MTU
+/// apprise mène vers le pair. Pour UDP et ping, IP_MTU dit ENOTCONN
+/// jusqu'au prochain envoi sur la connexion ; TCP en cherche une au segment
+/// suivant.
+fn conseil_negatif(s: &Socket) {
+    match s.protocole {
+        Protocole::Tcp => tcp::conseil_negatif(s),
+        Protocole::Udp | Protocole::Ping => {
+            let mut inet = s.appels.verrouiller();
+            if inet.route_gardee.is_some() && ipv4::mtu_apprise(inet.distante) {
+                inet.route_gardee = None;
+            }
+        }
+        Protocole::Unix => {}
+    }
 }
 
 /// Le nom d'interface de SO_BINDTODEVICE (`sock_setbindtodevice`) : au plus
@@ -2457,7 +2610,7 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
             }
             SOL_SOCKET => {
                 let place = lire_longueur(&mut l)?;
-                let v = lire_option_socket(s, option)?;
+                let v = lire_option_socket(s, option, place as usize)?;
                 let n = (place as usize).min(v.1);
                 copier_vers_utilisateur(valeur, &v.0[..n]).map_err(|_| -EFAULT)?;
                 copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
@@ -2542,8 +2695,9 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
 }
 
 /// La valeur d'une option de SOL_SOCKET, et sa longueur (un entier, sauf
-/// SO_LINGER et les délais) ; une inconnue : ENOPROTOOPT.
-fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64> {
+/// SO_LINGER, les délais, les cookies et SO_TXTIME), pour une place de
+/// `place` octets ; une inconnue : ENOPROTOOPT.
+fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16], usize), i64> {
     let mut o = [0u8; 16];
     let entier = |o: &mut [u8; 16], v: i32| {
         o[..4].copy_from_slice(&v.to_le_bytes());
@@ -2602,6 +2756,40 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
             8
         }
         SO_BUF_LOCK => entier(&mut o, op.verrous_tampons as i32),
+        SO_BUSY_POLL => entier(&mut o, op.busy_poll as i32),
+        SO_PREFER_BUSY_POLL => entier(&mut o, op.prefer_busy_poll as i32),
+        // Le numéro de la file NAPI de la carte qui a livré le dernier
+        // paquet : sans NAPI, 0 (ce que Linux rend pour un numéro qui
+        // n'en est pas un, `napi_id_valid`).
+        SO_INCOMING_NAPI_ID => entier(&mut o, 0),
+        SO_WIFI_STATUS => entier(&mut o, op.wifi_status as i32),
+        SO_NOFCS => entier(&mut o, op.nofcs as i32),
+        SO_PASSSEC if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
+        SO_PASSSEC => entier(&mut o, unix::passsec(s) as i32),
+        // 8 octets, au moins (sinon EINVAL), jamais coupés.
+        SO_COOKIE => {
+            if place < 8 {
+                return Err(-EINVAL);
+            }
+            o[..8].copy_from_slice(&s.cookie().to_le_bytes());
+            8
+        }
+        // 8 octets exactement.
+        SO_NETNS_COOKIE => {
+            if place != 8 {
+                return Err(-EINVAL);
+            }
+            o[..8].copy_from_slice(&NETNS_COOKIE.to_le_bytes());
+            8
+        }
+        // L'horloge et les drapeaux, posés ou non (0 et 0 au départ).
+        SO_TXTIME => {
+            o[..4].copy_from_slice(&(op.txtime_horloge as i32).to_le_bytes());
+            o[4..8].copy_from_slice(&(op.txtime_drapeaux as u32).to_le_bytes());
+            8
+        }
+        SO_TXREHASH if s.protocole != Protocole::Tcp => return Err(-EOPNOTSUPP),
+        SO_TXREHASH => entier(&mut o, op.txrehash as i32),
         SO_RCVTIMEO | SO_RCVTIMEO_NEW => timeval(&mut o, op.rcvtimeo),
         SO_SNDTIMEO | SO_SNDTIMEO_NEW => timeval(&mut o, op.sndtimeo),
         SO_RCVLOWAT => entier(&mut o, op.rcvlowat as i32),

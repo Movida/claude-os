@@ -237,6 +237,16 @@ static void udp(void)
     frag_necessaire(moi.sin_addr.s_addr, d, IPPROTO_UDP, ntohs(moi.sin_port), ntohs(a.sin_port), 0, 1000);
     entier(s, SOL_SOCKET, SO_ERROR);
     verifier(ip_mtu(s) == 552, "UDP : verrouillee a 552");
+    /* SO_CNX_ADVICE 1 : une route qui porte une MTU apprise expire (`rt->dst.expires`),
+     * elle n'est pas sûre : oubliée (`ipv4_negative_advice`). IP_MTU dit ENOTCONN
+     * jusqu'au prochain envoi, qui en reprend une (la même MTU). Une route sans MTU
+     * apprise reste (linux/options-socket). */
+    v = 1;
+    setsockopt(s, SOL_SOCKET, SO_CNX_ADVICE, &v, sizeof v);
+    verifier(ip_mtu(s) == -ENOTCONN, "UDP : SO_CNX_ADVICE, la route apprise oubliee (ENOTCONN)");
+    send(s, "a", 1, 0);
+    recv(r, t, sizeof t, 0);
+    verifier(ip_mtu(s) == 552, "UDP : et reprise au prochain envoi");
     close(s);
     close(autre);
     close(r);
