@@ -241,6 +241,15 @@ pub struct Droits {
     pub gid: u32,
 }
 
+impl Droits {
+    /// Les groupes supplémentaires du pair (SO_PEERGROUPS : le `group_info`
+    /// de ses droits) : ceux de son identité, c'est-à-dire aucun
+    /// (`Identite::groupes`) ; ils ne sont donc pas gardés ici.
+    pub fn groupes(&self) -> &'static [u32] {
+        fichiers::Identite { uid: self.uid, gid: self.gid }.groupes()
+    }
+}
+
 /// Ceux d'un message qui n'en porte pas, tels que les lit qui les demande (pas de pid, et
 /// `overflowuid` : `from_kuid_munged`, mesuré).
 const SANS_DROITS: Droits = Droits { pid: 0, uid: 65534, gid: 65534 };
@@ -564,11 +573,13 @@ pub fn pair(s: &Socket) -> Result<Nom, i64> {
 /// peut pas nommer ; ici, il n'y en a pas du tout.
 pub const PAS_DE_PAIR: Droits = Droits { pid: 0, uid: u32::MAX, gid: u32::MAX };
 
-/// SO_PEERCRED : les droits du pair, posés par `connect`, `listen` (les
-/// siens), `accept` et `socketpair` (`init_peercred`, `copy_peercred`) ;
-/// sans pair, PAS_DE_PAIR.
-pub fn droits_du_pair(s: &Socket) -> Droits {
-    unix(s).etat.verrouiller().droits.unwrap_or(PAS_DE_PAIR)
+/// SO_PEERCRED et SO_PEERGROUPS : les droits du pair, posés par `connect`,
+/// `listen` (les siens), `accept` et `socketpair` (`init_peercred`,
+/// `copy_peercred`), et gardés quand le pair s'en va (mesuré) ; None sans
+/// eux (`sk_peer_cred` nul : PAS_DE_PAIR pour SO_PEERCRED, ENODATA pour
+/// SO_PEERGROUPS).
+pub fn droits_du_pair(s: &Socket) -> Option<Droits> {
+    unix(s).etat.verrouiller().droits
 }
 
 /// SO_PASSRIGHTS.

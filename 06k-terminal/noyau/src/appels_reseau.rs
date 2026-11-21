@@ -41,6 +41,8 @@ const EINVAL: i64 = 22;
 const ENFILE: i64 = 23;
 const ENOTTY: i64 = 25;
 const EDOM: i64 = 33;
+const ERANGE: i64 = 34;
+const ENODATA: i64 = 61;
 const ENOTSOCK: i64 = 88;
 const EMSGSIZE: i64 = 90;
 const ENOPROTOOPT: i64 = 92;
@@ -118,6 +120,8 @@ const SO_RCVLOWAT: i32 = 18;
 const SO_SNDLOWAT: i32 = 19;
 const SO_PASSCRED: i32 = 16;
 const SO_PEERCRED: i32 = 17;
+const SO_PEERNAME: i32 = 28;
+const SO_PEERGROUPS: i32 = 59;
 const SO_PASSRIGHTS: i32 = 83;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
@@ -2608,6 +2612,55 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
                 copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
                 Ok(0)
             }
+            // L'adresse du pair, comme getpeername mais sans regarder l'état de
+            // TCP (`getname(..., 2)`) : pas de pair, ENOTCONN ; une place plus
+            // grande que l'adresse, EINVAL (pas coupée à sa taille, comme
+            // getpeername le ferait : mesuré) ; sinon les `place` premiers
+            // octets, et `place` pour longueur.
+            SOL_SOCKET if option == SO_PEERNAME => {
+                let place = lire_longueur(&mut l)? as usize;
+                let inet;
+                let nom_unix;
+                let a: &[u8] = match s.protocole {
+                    Protocole::Unix => {
+                        nom_unix = unix::pair(s)?;
+                        nom_unix.octets()
+                    }
+                    p => {
+                        let (adresse, port) =
+                            if p == Protocole::Tcp { tcp::pair_garde(s) } else { datagramme::pair(s) }.ok_or(-ENOTCONN)?;
+                        inet = socket::sockaddr_in(adresse, port);
+                        &inet
+                    }
+                };
+                if a.len() < place {
+                    return Err(-EINVAL);
+                }
+                copier_vers_utilisateur(valeur, &a[..place]).map_err(|_| -EFAULT)?;
+                copier_vers_utilisateur(longueur, &(place as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+                Ok(0)
+            }
+            // Les groupes supplémentaires des droits du pair (AF_UNIX seule en
+            // garde : `sk_peer_cred`) : sans eux, ENODATA, la longueur intacte ;
+            // une place trop petite, ERANGE, et la longueur qu'il faut écrite.
+            // Nos droits n'ont pas de groupes (`Identite::groupes`) : la liste
+            // est vide, et la longueur 0 quelle que soit la place.
+            SOL_SOCKET if option == SO_PEERGROUPS => {
+                let place = lire_longueur(&mut l)? as usize;
+                let droits = if s.protocole == Protocole::Unix { unix::droits_du_pair(s) } else { None };
+                let groupes = droits.ok_or(-ENODATA)?.groupes();
+                let n = groupes.len() * 4;
+                let ecrire_longueur = || copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT);
+                if place < n {
+                    ecrire_longueur()?;
+                    return Err(-ERANGE);
+                }
+                for (i, g) in groupes.iter().enumerate() {
+                    copier_vers_utilisateur(valeur + 4 * i as u64, &g.to_le_bytes()).map_err(|_| -EFAULT)?;
+                }
+                ecrire_longueur()?;
+                Ok(0)
+            }
             SOL_SOCKET => {
                 let place = lire_longueur(&mut l)?;
                 let v = lire_option_socket(s, option, place as usize)?;
@@ -2739,7 +2792,7 @@ fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16]
         SO_PASSRIGHTS => entier(&mut o, unix::passrights(s) as i32),
         // La `struct ucred` du pair : AF_UNIX seule en a un.
         SO_PEERCRED => {
-            let d = if s.protocole == Protocole::Unix { unix::droits_du_pair(s) } else { unix::PAS_DE_PAIR };
+            let d = if s.protocole == Protocole::Unix { unix::droits_du_pair(s) } else { None }.unwrap_or(unix::PAS_DE_PAIR);
             o[..4].copy_from_slice(&d.pid.to_le_bytes());
             o[4..8].copy_from_slice(&d.uid.to_le_bytes());
             o[8..12].copy_from_slice(&d.gid.to_le_bytes());

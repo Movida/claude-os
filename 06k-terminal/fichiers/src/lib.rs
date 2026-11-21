@@ -87,6 +87,17 @@ impl Identite {
     pub fn root(&self) -> bool {
         self.uid == 0
     }
+
+    /// Les groupes supplémentaires (le `group_info` des droits de Linux, que
+    /// lisent getgroups et SO_PEERGROUPS) : aucun. Rien ne les pose : ni
+    /// `setgroups`, ni `initgroups` ; nos programmes partent avec l'identité
+    /// du démarrage, sans connexion d'utilisateur. Les droits sur les
+    /// fichiers ne regardent donc que `gid` (`in_group_p`, liste vide), et
+    /// /proc/<pid>/status a une ligne « Groups: » vide. Ils entreront ici
+    /// (une liste par identité) avec le premier programme qui les change.
+    pub fn groupes(&self) -> &'static [u32] {
+        &[]
+    }
 }
 
 /// Une date : des secondes et des nanosecondes depuis le 1er janvier 1970

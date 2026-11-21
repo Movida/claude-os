@@ -2262,6 +2262,19 @@ pub fn pair(s: &Socket) -> Option<([u8; 4], u16)> {
     }
 }
 
+/// Le pair d'une connexion pour SO_PEERNAME (`inet_getname(..., 2)`) : celui
+/// que la socket garde (`inet_dport` non nul), quel que soit son état ;
+/// SYN_SENT, et TCP_CLOSE après un RST, un SYN refusé que seul un
+/// `connect` non bloquant a lancé (mesuré : SO_ERROR lu, il reste), ou la
+/// fin de la connexion, compris. Rien (ENOTCONN) une fois défaite
+/// (`tcp_disconnect` : AF_UNSPEC, ou un `connect` bloquant qui voit l'échec ;
+/// `redevenir_neuve` efface le pair), ni pour une socket neuve ou une écoute.
+pub fn pair_garde(s: &Socket) -> Option<([u8; 4], u16)> {
+    let mut g = flux(s).posseder();
+    let a = g.donnee().adresses;
+    (a.port_distant != 0).then_some((a.distante, a.port_distant))
+}
+
 /// Envoie `longueur` octets remplis par `remplir` (`tcp_sendmsg`) :
 /// attendre la place (sauf MSG_DONTWAIT : EAGAIN si rien n'a pu être
 /// écrit), SO_SNDTIMEO ; pas connectée : EPIPE (mesuré : une socket neuve

@@ -235,10 +235,13 @@ pub fn nom(s: &Socket) -> ([u8; 4], u16) {
     (inet.adresse, inet.port)
 }
 
-/// L'adresse distante (getpeername) ; None : pas connectée (ENOTCONN).
+/// L'adresse distante (getpeername, SO_PEERNAME) ; None (ENOTCONN) : pas
+/// connectée, ou connectée au port 0 (`inet_getname` ne regarde que
+/// `inet_dport` : mesuré, UDP comme ping, dont le « port » est celui de
+/// `connect`, pas l'identifiant ICMP).
 pub fn pair(s: &Socket) -> Option<([u8; 4], u16)> {
     let inet = s.appels.verrouiller();
-    inet.connecte.then_some((inet.distante, inet.port_distant))
+    (inet.connecte && inet.port_distant != 0).then_some((inet.distante, inet.port_distant))
 }
 
 /// La MTU de la route gardée d'une socket connectée (IP_MTU : `sk_dst_get`) ;

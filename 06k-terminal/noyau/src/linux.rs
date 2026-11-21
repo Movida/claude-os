@@ -138,6 +138,7 @@ const GETUID: u64 = 102;
 const GETGID: u64 = 104;
 const GETEUID: u64 = 107;
 const GETEGID: u64 = 108;
+const GETGROUPS: u64 = 115;
 const GETPPID: u64 = 110;
 const GETPGRP: u64 = 111;
 const GETPGID: u64 = 121;
@@ -455,6 +456,7 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         GETPGID | GETSID => groupe_de(a[0] as u32 as i32),
         GETUID | GETEUID => processus::avec(|p| p.identite.uid) as i64,
         GETGID | GETEGID => processus::avec(|p| p.identite.gid) as i64,
+        GETGROUPS => getgroups(a[0], a[1]),
         CLOCK_GETTIME => clock_gettime(a[0], a[1]),
         CLOCK_GETRES => clock_getres(a[0], a[1]),
         NANOSLEEP => clock_nanosleep(temps::CLOCK_MONOTONIC, 0, a[0], a[1]),
@@ -661,6 +663,7 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         GETEUID => ("geteuid", 0),
         GETGID => ("getgid", 0),
         GETEGID => ("getegid", 0),
+        GETGROUPS => ("getgroups", 2),
         CLOCK_GETTIME => ("clock_gettime", 2),
         CLOCK_GETRES => ("clock_getres", 2),
         NANOSLEEP => ("nanosleep", 2),
@@ -694,6 +697,29 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         }
     }
     afficherln!("[trace] {}({}) = {}", nom, Arguments(&a[..n]), Resultat(resultat));
+}
+
+/// getgroups(taille, liste) : les groupes supplémentaires du processus
+/// (`Identite::groupes` : aucun). Une taille négative : EINVAL ; 0 : leur
+/// nombre seul ; plus petite que leur nombre : EINVAL ; sinon la liste, et
+/// leur nombre.
+fn getgroups(taille: u64, liste: u64) -> i64 {
+    let taille = taille as i32;
+    if taille < 0 {
+        return -EINVAL;
+    }
+    let groupes = processus::avec(|p| p.identite.groupes());
+    if taille != 0 {
+        if groupes.len() > taille as usize {
+            return -EINVAL;
+        }
+        for (i, g) in groupes.iter().enumerate() {
+            if copier_vers_utilisateur(liste + 4 * i as u64, &g.to_le_bytes()).is_err() {
+                return -EFAULT;
+            }
+        }
+    }
+    groupes.len() as i64
 }
 
 /// brk(adresse) : déplace la fin du tas, à l'octet près : la zone du tas

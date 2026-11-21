@@ -21,7 +21,14 @@
  *     SCM_TXTIME, SO_DEVMEM_DONTNEED (TCP), SO_CNX_ADVICE (une route sans MTU apprise
  *     reste : pmtu, sous root, voit l'autre cas) ;
  *   - SO_TXREHASH (TCP) : un SYN sans réponse change le hachage du flux à chaque RTO
- *     (TCP_INFO, `tcpi_rehash`), plus avec SO_TXREHASH 0.
+ *     (TCP_INFO, `tcpi_rehash`), plus avec SO_TXREHASH 0 ;
+ *   - SO_PEERNAME : l'adresse du pair, coupée à la place mais jamais plus longue
+ *     qu'elle (EINVAL) ; celle que TCP garde même fermée (un RST, un SYN refusé), là
+ *     où getpeername dit ENOTCONN ; connectée au port 0 (UDP, ping) : pas de pair ;
+ *     un pair AF_UNIX parti reste jusqu'à l'envoi qui le découvre ;
+ *   - SO_PEERGROUPS : les groupes du pair AF_UNIX, ceux de getgroups (aucun chez nous,
+ *     ceux de l'utilisateur sur l'hôte) ; ENODATA sans droits gardés, ERANGE et la
+ *     longueur qu'il faut pour une place trop petite.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -31,9 +38,11 @@
 #include <stdint.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -535,6 +544,219 @@ static void txrehash(void)
     close(a), close(b), close(plein), close(e);
 }
 
+/* SO_PEERNAME dans une place de `place` octets : l'erreur (0 si l'appel réussit), la
+ * longueur rendue dans *l, les octets dans b (0x55 au-delà). */
+static int peername(int s, socklen_t place, unsigned char *b, socklen_t *l)
+{
+    memset(b, 0x55, 128);
+    *l = place;
+    return erreur(getsockopt(s, SOL_SOCKET, SO_PEERNAME, b, l));
+}
+
+/* SO_PEERNAME, dans toute la place de l'adresse, rend ce que rend getpeername ; une place
+ * plus petite la coupe ; une plus grande : EINVAL. */
+static int comme_getpeername(int s)
+{
+    struct sockaddr_storage a;
+    socklen_t al = sizeof a, l;
+    unsigned char b[128];
+    if (getpeername(s, (void *)&a, &al) < 0)
+        return 0;
+    return peername(s, al, b, &l) == 0 && l == al && memcmp(b, &a, al) == 0 && b[al] == 0x55
+        && peername(s, al - 1, b, &l) == 0 && l == al - 1 && memcmp(b, &a, al - 1) == 0 && b[al - 1] == 0x55
+        && peername(s, 0, b, &l) == 0 && l == 0 && b[0] == 0x55
+        && peername(s, al + 1, b, &l) == EINVAL && peername(s, 128, b, &l) == EINVAL;
+}
+
+/* SO_PEERNAME rend l'adresse de `a`, quand getpeername dit ENOTCONN. */
+static int garde_sans_getpeername(int s, const struct sockaddr_in *a)
+{
+    struct sockaddr_in p;
+    socklen_t pl = sizeof p, l;
+    unsigned char b[128];
+    return getpeername(s, (void *)&p, &pl) < 0 && errno == ENOTCONN && peername(s, sizeof p, b, &l) == 0
+        && l == sizeof p && memcmp(b, a, sizeof *a) == 0;
+}
+
+static void pair(void)
+{
+    unsigned char b[128];
+    socklen_t l;
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    struct sockaddr_in a0 = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    struct sockaddr_in rien = {.sin_family = AF_UNSPEC};
+    for (int i = 0; i < 3; i++) {
+        int s = ouvrir(&sortes[i]);
+        verifier(peername(s, sizeof a, b, &l) == ENOTCONN, dire("SO_PEERNAME %s neuve : ENOTCONN", sortes[i].nom));
+        close(s);
+    }
+    for (int i = 0; i < 3; i += 2) {
+        int s = ouvrir(&sortes[i]);
+        connect(s, (void *)&a, sizeof a);
+        verifier(comme_getpeername(s), dire("SO_PEERNAME %s connectee : l'adresse, coupee a la place, EINVAL au-dela", sortes[i].nom));
+        connect(s, (void *)&rien, sizeof rien);
+        verifier(peername(s, sizeof a, b, &l) == ENOTCONN, dire("SO_PEERNAME %s deconnectee : ENOTCONN", sortes[i].nom));
+        connect(s, (void *)&a0, sizeof a0);
+        struct sockaddr_in p;
+        socklen_t pl = sizeof p;
+        int e = erreur(getpeername(s, (void *)&p, &pl));
+        verifier(e == ENOTCONN && peername(s, sizeof a, b, &l) == ENOTCONN,
+                 dire("SO_PEERNAME et getpeername %s connectee au port 0 : ENOTCONN", sortes[i].nom));
+        close(s);
+    }
+
+    /* TCP : une écoute, une connexion des deux côtés, puis coupée par un RST. */
+    int ec = socket(AF_INET, SOCK_STREAM, 0), e;
+    socklen_t al = sizeof a0;
+    bind(ec, (void *)&a0, sizeof a0);
+    listen(ec, 2);
+    getsockname(ec, (void *)&a0, &al);
+    verifier(peername(ec, sizeof a0, b, &l) == ENOTCONN, "SO_PEERNAME tcp en ecoute : ENOTCONN");
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&a0, sizeof a0);
+    int f = accept(ec, NULL, NULL);
+    verifier(comme_getpeername(c) && comme_getpeername(f), "SO_PEERNAME tcp connectee et acceptee : comme getpeername");
+    struct linger lg = {1, 0};
+    setsockopt(f, SOL_SOCKET, SO_LINGER, &lg, sizeof lg);
+    close(f);
+    char x;
+    int r = read(c, &x, 1);
+    e = errno;
+    verifier(r < 0 && e == ECONNRESET && garde_sans_getpeername(c, &a0),
+             "SO_PEERNAME tcp coupee par un RST : l'adresse gardee, getpeername ENOTCONN");
+    close(c);
+    close(ec);
+    /* L'écoute fermée, le port refuse : un `connect` non bloquant garde l'adresse, même
+     * l'erreur lue ; un bloquant la défait. */
+    c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    r = connect(c, (void *)&a0, sizeof a0);
+    struct pollfd pf = {c, POLLOUT, 0};
+    poll(&pf, 1, 2000);
+    int so = 0;
+    socklen_t sol = sizeof so;
+    getsockopt(c, SOL_SOCKET, SO_ERROR, &so, &sol);
+    verifier(so == ECONNREFUSED && garde_sans_getpeername(c, &a0),
+             "SO_PEERNAME tcp refusee, connect non bloquant : l'adresse gardee, getpeername ENOTCONN");
+    close(c);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    r = connect(c, (void *)&a0, sizeof a0);
+    e = errno;
+    verifier(r < 0 && e == ECONNREFUSED && peername(c, sizeof a0, b, &l) == ENOTCONN,
+             "SO_PEERNAME tcp refusee, connect bloquant : ENOTCONN (la socket est defaite)");
+    close(c);
+
+    /* AF_UNIX : une paire n'a pas de nom (la famille seule, 2 octets) ; un nom de
+     * chemin, un nom abstrait. */
+    int p[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, p);
+    verifier(peername(p[0], 2, b, &l) == 0 && l == 2 && b[0] == AF_UNIX && b[1] == 0 && peername(p[0], 1, b, &l) == 0 && l == 1
+                 && peername(p[0], 3, b, &l) == EINVAL,
+             "SO_PEERNAME unix paire : la famille seule, EINVAL pour 3 octets");
+    close(p[0]), close(p[1]);
+    struct sockaddr_un n = {.sun_family = AF_UNIX};
+    snprintf(n.sun_path, sizeof n.sun_path, "/tmp/options-socket-%d", getpid());
+    unlink(n.sun_path);
+    int ue = socket(AF_UNIX, SOCK_STREAM, 0);
+    bind(ue, (void *)&n, sizeof n);
+    listen(ue, 1);
+    verifier(peername(ue, 2, b, &l) == ENOTCONN, "SO_PEERNAME unix en ecoute : ENOTCONN");
+    int uc = socket(AF_UNIX, SOCK_STREAM, 0);
+    connect(uc, (void *)&n, sizeof n);
+    int ua = accept(ue, NULL, NULL);
+    verifier(comme_getpeername(uc) && peername(uc, 128, b, &l) == EINVAL && comme_getpeername(ua),
+             "SO_PEERNAME unix connectee (un chemin) et acceptee : comme getpeername");
+    close(uc), close(ua), close(ue);
+    unlink(n.sun_path);
+    socklen_t nl = nom_abstrait(&n, "pair");
+    int d1 = socket(AF_UNIX, SOCK_DGRAM, 0), d2 = socket(AF_UNIX, SOCK_DGRAM, 0);
+    bind(d1, (void *)&n, nl);
+    connect(d2, (void *)&n, nl);
+    verifier(comme_getpeername(d2), "SO_PEERNAME unix datagrammes connectee (un nom abstrait) : comme getpeername");
+    close(d1);
+    verifier(peername(d2, nl, b, &l) == 0 && l == nl && memcmp(b, &n, nl) == 0, "SO_PEERNAME unix datagrammes, le pair ferme : son nom reste");
+    r = send(d2, "x", 1, 0);
+    e = errno;
+    verifier(r < 0 && e == ECONNREFUSED && peername(d2, nl, b, &l) == ENOTCONN,
+             "SO_PEERNAME unix datagrammes : l'envoi qui trouve le pair parti l'oublie (ENOTCONN)");
+    close(d2);
+}
+
+/* SO_PEERGROUPS dans une place de `place` octets : l'erreur, la longueur dans *l. */
+static int peergroups(int s, socklen_t place, gid_t *g, socklen_t *l)
+{
+    *l = place;
+    return erreur(getsockopt(s, SOL_SOCKET, SO_PEERGROUPS, g, l));
+}
+
+/* Les groupes de SO_PEERGROUPS sont ceux de ce processus (getgroups). */
+static int mes_groupes(int s)
+{
+    gid_t moi[64], g[64];
+    int n = getgroups(64, moi);
+    socklen_t l;
+    if (n < 0 || peergroups(s, sizeof g, g, &l) != 0 || l != n * sizeof(gid_t))
+        return 0;
+    return memcmp(g, moi, l) == 0;
+}
+
+static void groupes(void)
+{
+    gid_t g[64];
+    socklen_t l;
+    int n = getgroups(0, NULL);
+    printf("[linux] options-socket : %d groupes supplementaires\n", n);
+    /* Une taille négative : par l'appel lui-même (la glibc fortifiée la refuse avant).
+     * Une taille trop petite n'existe qu'à partir de deux groupes : 0 demande leur
+     * nombre (root sous sudo n'en a qu'un, le groupe 0). */
+    verifier(n >= 0 && syscall(SYS_getgroups, -1, g) < 0 && errno == EINVAL && (n <= 1 || (getgroups(n - 1, g) < 0 && errno == EINVAL))
+                 && getgroups(64, g) == n,
+             "getgroups : leur nombre, EINVAL pour une taille negative ou trop petite");
+    for (int i = 0; i < 3; i++) {
+        int s = ouvrir(&sortes[i]);
+        verifier(peergroups(s, sizeof g, g, &l) == ENODATA && l == sizeof g, dire("SO_PEERGROUPS %s : ENODATA, la longueur intacte", sortes[i].nom));
+        close(s);
+    }
+    int u = socket(AF_UNIX, SOCK_STREAM, 0);
+    verifier(peergroups(u, sizeof g, g, &l) == ENODATA, "SO_PEERGROUPS unix flux neuve : ENODATA");
+    struct sockaddr_un n_ = {.sun_family = AF_UNIX};
+    socklen_t nl = nom_abstrait(&n_, "groupes");
+    bind(u, (void *)&n_, nl);
+    listen(u, 1);
+    verifier(mes_groupes(u), "SO_PEERGROUPS unix flux en ecoute : les siens");
+    int uc = socket(AF_UNIX, SOCK_STREAM, 0);
+    connect(uc, (void *)&n_, nl);
+    int ua = accept(u, NULL, NULL);
+    verifier(mes_groupes(uc) && mes_groupes(ua), "SO_PEERGROUPS unix flux connectee et acceptee : ceux du pair");
+    close(u), close(uc), close(ua);
+    int d1 = socket(AF_UNIX, SOCK_DGRAM, 0), d2 = socket(AF_UNIX, SOCK_DGRAM, 0);
+    nl = nom_abstrait(&n_, "groupes-dgram");
+    bind(d1, (void *)&n_, nl);
+    connect(d2, (void *)&n_, nl);
+    verifier(peergroups(d2, sizeof g, g, &l) == ENODATA, "SO_PEERGROUPS unix datagrammes connectee : ENODATA");
+    close(d1), close(d2);
+    int types[3] = {SOCK_STREAM, SOCK_DGRAM, SOCK_SEQPACKET}, ok = 1;
+    for (int i = 0; i < 3; i++) {
+        int p[2];
+        socketpair(AF_UNIX, types[i], 0, p);
+        ok &= mes_groupes(p[0]) && mes_groupes(p[1]);
+        close(p[1]);
+        ok &= mes_groupes(p[0]);
+        close(p[0]);
+    }
+    verifier(ok, "SO_PEERGROUPS d'une paire (flux, datagrammes, paquets) : ceux de l'autre bout, gardes apres son depart");
+    /* La place : trop petite, ERANGE et la longueur qu'il faut (aucun groupe : rien
+     * n'est trop petit). */
+    int p[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, p);
+    int r = peergroups(p[0], 0, g, &l);
+    verifier(n == 0 ? r == 0 && l == 0 : r == ERANGE && l == n * sizeof(gid_t), "SO_PEERGROUPS dans 0 octet : ERANGE et la longueur voulue (sans groupe : 0)");
+    if (n > 0) {
+        r = peergroups(p[0], n * sizeof(gid_t) - 1, g, &l);
+        verifier(r == ERANGE && l == n * sizeof(gid_t), "SO_PEERGROUPS dans un octet de moins : ERANGE et la longueur voulue");
+    }
+    close(p[0]), close(p[1]);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -550,6 +772,8 @@ int main(void)
     devmem();
     cnx_advice();
     txrehash();
+    pair();
+    groupes();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }
