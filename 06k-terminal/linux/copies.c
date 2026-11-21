@@ -457,6 +457,12 @@ static void sockets(void)
     long v = r(sendfile(t[1], dg[0], NULL, 8));
     clock_gettime(CLOCK_MONOTONIC, &t1);
     long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    /* Un échec dit ce qu'il a vu : il est arrivé une fois, sous le Linux de
+     * référence chargé par deux vérifications (le 21 novembre 2026), et
+     * plus en neuf cents essais dans les mêmes conditions ; la ligne ne
+     * disait pas laquelle des deux conditions avait manqué. */
+    if (!(v == -EAGAIN && ms >= 90))
+        printf("[linux] copies : vu : %ld (%s), en %ld ms\n", v, v < 0 ? strerror((int)-v) : "un nombre d'octets", ms);
     verifier(v == -EAGAIN && ms >= 90, "datagrammes AF_UNIX bloquants vers un tube non bloquant : on attend (SO_RCVTIMEO)");
     delai.tv_usec = 0;
     FAIT(setsockopt(dg[0], SOL_SOCKET, SO_RCVTIMEO, &delai, sizeof delai));
