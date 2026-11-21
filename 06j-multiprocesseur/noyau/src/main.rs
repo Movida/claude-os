@@ -539,9 +539,27 @@ extern "C" fn noyau_main(infos: u64) -> ! {
 }
 
 /// Vérifie l'ordonnanceur et la préemption du noyau : deux tâches du noyau
-/// qui calculent chacune 20 ms, sans jamais céder d'elles-mêmes, doivent se
-/// partager le processeur : chacune voit le compteur de l'autre avancer
-/// pendant son propre calcul, ce qui n'arrive que si le tic l'a préemptée.
+/// qui calculent chacune 20 ms au moins, sans jamais céder d'elles-mêmes,
+/// doivent se partager le processeur : chacune voit le compteur de l'autre
+/// avancer pendant son propre calcul, ce qui n'arrive que si le tic l'a
+/// préemptée.
+///
+/// Aucun de ces tests ne dépend de l'instant. Sous une machine hôte
+/// chargée, QEMU perd le processeur des millisecondes durant, et le tic
+/// suivant compte d'un coup tout ce temps à la tâche courante (comme un
+/// noyau qui ne retranche pas le temps volé, le « steal time » de Linux) :
+/// « 20 ms de calcul » peuvent tenir en un seul tic, et une tâche peut
+/// prendre sur l'autre une avance que l'EEVDF lui fait rendre ensuite, sans
+/// que la préemption y soit pour rien. Jusqu'aux soldes d'avant 6k, chaque
+/// test supposait un temps assez long pour que l'autre tâche passe :
+/// « Preemption coupee » est tombé deux fois en une centaine de
+/// vérifications de 6k sous la charge de deux voies ; corrigé dans chaque
+/// étape qui a ces tests, que la CI repasse toutes. Maintenant, chaque tâche
+/// calcule jusqu'à ce que ce qu'elle attend soit arrivé, mille tics au
+/// plus : au-delà, ECHEC, la préemption ne fait pas son travail. Des tics
+/// de l'horloge, et non du temps de calcul : après un retard, si long
+/// soit-il, QEMU ne donne qu'un tic et saute ceux qu'il a manqués (mesuré
+/// en arrêtant QEMU 3 s par SIGSTOP : 288 tics comptés en 3,29 s).
 fn tester_ordonnanceur() {
     use core::sync::atomic::AtomicU64;
     static COMPTEURS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -550,20 +568,32 @@ fn tester_ordonnanceur() {
         move || {
             let autre_au_debut = COMPTEURS[1 - moi].load(Ordering::Relaxed);
             let debut = tache::temps_de_calcul();
-            while tache::temps_de_calcul() - debut < 20_000_000 {
+            let tic_du_debut = horloge::tics();
+            // 20 ms au moins, et jusqu'à avoir vu l'autre avancer : 20 ms
+            // comptées d'un coup par un tic en retard ne lui ont laissé
+            // aucune chance de passer.
+            loop {
                 COMPTEURS[moi].fetch_add(1, Ordering::Relaxed);
-                if COMPTEURS[1 - moi].load(Ordering::Relaxed) != autre_au_debut {
-                    VU[moi].store(true, Ordering::Relaxed);
+                let vu = COMPTEURS[1 - moi].load(Ordering::Relaxed) != autre_au_debut;
+                if (vu && tache::temps_de_calcul() - debut >= 20_000_000) || horloge::tics() - tic_du_debut >= 1000 {
+                    VU[moi].store(vu, Ordering::Relaxed);
+                    break;
                 }
             }
+            // Un dernier pas, pour l'autre : préemptée entre son pas et son
+            // regard, cette tâche a pu voir l'autre avancer sans avoir fait
+            // un pas depuis que l'autre a lu son compteur au début ; l'autre,
+            // qui calcule jusqu'à nous voir avancer, l'attendrait mille tics.
+            COMPTEURS[moi].fetch_add(1, Ordering::Relaxed);
         }
     };
     let bascules = ordonnanceur::bascules();
     let a = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-a"), calculer(0));
     let b = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-b"), calculer(1));
-    if let (Some(a), Some(b)) = (&a, &b) {
-        tache::attendre(a);
-        tache::attendre(b);
+    // Chacune attendue, même seule : elle calcule alors mille tics,
+    // épinglée sur le processeur 0, que les tests suivants partagent.
+    for t in a.iter().chain(b.iter()) {
+        tache::attendre(t);
     }
     let ok = a.is_some() && b.is_some() && VU.iter().all(|v| v.load(Ordering::Relaxed));
     afficherln!("[noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : {} ({} bascules).",
@@ -577,37 +607,69 @@ fn tester_ordonnanceur() {
     // sur-le-champ, avant son pas suivant (le point de préemption de
     // `retablir_preemption`, 6j). Le tic, lui, passe encore (il compte le
     // temps de calcul qui sert ici).
+    //
+    // Sans dépendre de l'instant (voir plus haut) :
+    // - les deux lectures du témoin, préemption coupée. Lu juste avant de
+    //   la couper (jusqu'aux soldes d'avant 6k), un tic tombé entre sa
+    //   lecture et la coupure laissait D le bouger : C se croyait remplacée
+    //   pendant son calcul ;
+    // - D lancée la première : prête pendant tout le calcul de C. Lancée
+    //   après, elle n'entrait dans la file qu'une fois init revenue la
+    //   lancer, peut-être après les 10 ms de C ;
+    // - C dort 1 ms avant chacun de ses calculs. D a pu prendre de l'avance
+    //   (un tic en retard qui lui compte 20 ms d'un coup), que l'EEVDF fait
+    //   d'abord rattraper à C, à juste titre : C garderait le processeur en
+    //   rétablissant la préemption. En dormant, C quitte la file avec un
+    //   retard borné à deux tranches (`retirer_entite`, l'`update_entity_lag`
+    //   de Linux), qu'elle retrouve grossi au réveil (`ajouter`) : au plus
+    //   2,8 ms derrière D, que ses 10 ms dépassent ;
+    // - et C recommence, trois fois au plus, si l'ordonnanceur l'a gardée :
+    //   il y faut un tic en retard tombé sur D entre le réveil de C et son
+    //   calcul, quelques instructions. Une préemption qui ne se ferait pas
+    //   en rétablissant échouerait à chaque fois, sauf si un tic tombait
+    //   entre le rétablissement et la lecture du témoin qui suit.
+    const ESSAIS: usize = 3;
     static TEMOIN: AtomicU64 = AtomicU64::new(0);
     static FINI: AtomicBool = AtomicBool::new(false);
     static RESULTAT: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
-    let c = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-c"), || {
-        let calculer_10_ms = || {
-            let debut = tache::temps_de_calcul();
-            while tache::temps_de_calcul() - debut < 10_000_000 {
-                core::hint::spin_loop();
-            }
-        };
-        let avant = TEMOIN.load(Ordering::Relaxed);
-        // Le témoin est lu AVANT de rétablir la préemption : la rétablir
-        // cède le processeur sur-le-champ, et D aurait déjà bougé le témoin.
-        let pendant = processeur::sans_preemption(|| {
-            calculer_10_ms();
-            TEMOIN.load(Ordering::Relaxed)
-        });
-        RESULTAT[0].store(pendant == avant, Ordering::Relaxed);
-        // Dès qu'elle la rétablit : D, dont le tour est venu depuis
-        // longtemps, s'est exécutée avant que C ne fasse ce pas-ci.
-        RESULTAT[1].store(TEMOIN.load(Ordering::Relaxed) != avant, Ordering::Relaxed);
-        FINI.store(true, Ordering::Relaxed);
-    });
     let d = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-d"), || {
         while !FINI.load(Ordering::Relaxed) {
             TEMOIN.fetch_add(1, Ordering::Relaxed);
         }
     });
-    if let (Some(c), Some(d)) = (&c, &d) {
-        tache::attendre(c);
-        tache::attendre(d);
+    let c = d.as_ref().and_then(|_| tache::lancer_noyau(programmes::NomCourt::de(b"calcul-c"), || {
+        let mut jamais_remplacee = true;
+        let mut remplacee = false;
+        for _ in 0..ESSAIS {
+            dormir_ms(1);
+            let (avant, pendant) = processeur::sans_preemption(|| {
+                let avant = TEMOIN.load(Ordering::Relaxed);
+                let debut = tache::temps_de_calcul();
+                while tache::temps_de_calcul() - debut < 10_000_000 {
+                    core::hint::spin_loop();
+                }
+                // Lu AVANT de rétablir la préemption : la rétablir cède le
+                // processeur sur-le-champ, et D aurait déjà bougé le témoin.
+                (avant, TEMOIN.load(Ordering::Relaxed))
+            });
+            jamais_remplacee &= pendant == avant;
+            // Dès qu'elle la rétablit : D, si son tour est venu, s'est
+            // exécutée avant que C ne fasse ce pas-ci.
+            if TEMOIN.load(Ordering::Relaxed) != pendant {
+                remplacee = true;
+                break;
+            }
+        }
+        RESULTAT[0].store(jamais_remplacee, Ordering::Relaxed);
+        RESULTAT[1].store(remplacee, Ordering::Relaxed);
+        FINI.store(true, Ordering::Relaxed);
+    }));
+    // Sans C, D tournerait pour rien jusqu'à la fin des temps.
+    if c.is_none() {
+        FINI.store(true, Ordering::Relaxed);
+    }
+    for t in c.iter().chain(d.iter()) {
+        tache::attendre(t);
     }
     let ok = c.is_some() && d.is_some() && RESULTAT.iter().all(|r| r.load(Ordering::Relaxed));
     afficherln!("[noyau] Preemption coupee : une tache qui calcule 10 ms n'est pas remplacee, puis l'est des qu'elle la retablit : {}.",

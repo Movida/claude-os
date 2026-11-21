@@ -378,9 +378,23 @@ extern "C" fn noyau_main(infos: u64) -> ! {
 }
 
 /// Vérifie l'ordonnanceur et la préemption du noyau : deux tâches du noyau
-/// qui calculent chacune 20 ms, sans jamais céder d'elles-mêmes, doivent se
-/// partager le processeur : chacune voit le compteur de l'autre avancer
-/// pendant son propre calcul, ce qui n'arrive que si le tic l'a préemptée.
+/// qui calculent chacune 20 ms au moins, sans jamais céder d'elles-mêmes,
+/// doivent se partager le processeur : chacune voit le compteur de l'autre
+/// avancer pendant son propre calcul, ce qui n'arrive que si le tic l'a
+/// préemptée.
+///
+/// Sans dépendre de l'instant (corrigé pendant les soldes d'avant 6k, dans
+/// chaque étape qui a ce test, que la CI repasse toutes). Sous une machine
+/// hôte chargée, QEMU perd le processeur des millisecondes durant, et le
+/// tic suivant compte d'un coup tout ce temps à la tâche courante (comme un
+/// noyau qui ne retranche pas le temps volé, le « steal time » de Linux) :
+/// « 20 ms de calcul » peuvent tenir en un seul tic, avant que l'autre
+/// tâche ait pu passer, sans que la préemption y soit pour rien. Chaque
+/// tâche calcule donc jusqu'à avoir vu l'autre avancer, mille tics au
+/// plus : au-delà, ECHEC, la préemption ne fait pas son travail. Des tics
+/// de l'horloge, et non du temps de calcul : après un retard, si long
+/// soit-il, QEMU ne donne qu'un tic et saute ceux qu'il a manqués (mesuré
+/// en arrêtant QEMU 3 s par SIGSTOP : 288 tics comptés en 3,29 s).
 fn tester_ordonnanceur() {
     use core::sync::atomic::AtomicU64;
     static COMPTEURS: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
@@ -389,20 +403,32 @@ fn tester_ordonnanceur() {
         move || {
             let autre_au_debut = COMPTEURS[1 - moi].load(Ordering::Relaxed);
             let debut = tache::temps_de_calcul();
-            while tache::temps_de_calcul() - debut < 20_000_000 {
+            let tic_du_debut = horloge::tics();
+            // 20 ms au moins, et jusqu'à avoir vu l'autre avancer : 20 ms
+            // comptées d'un coup par un tic en retard ne lui ont laissé
+            // aucune chance de passer.
+            loop {
                 COMPTEURS[moi].fetch_add(1, Ordering::Relaxed);
-                if COMPTEURS[1 - moi].load(Ordering::Relaxed) != autre_au_debut {
-                    VU[moi].store(true, Ordering::Relaxed);
+                let vu = COMPTEURS[1 - moi].load(Ordering::Relaxed) != autre_au_debut;
+                if (vu && tache::temps_de_calcul() - debut >= 20_000_000) || horloge::tics() - tic_du_debut >= 1000 {
+                    VU[moi].store(vu, Ordering::Relaxed);
+                    break;
                 }
             }
+            // Un dernier pas, pour l'autre : préemptée entre son pas et son
+            // regard, cette tâche a pu voir l'autre avancer sans avoir fait
+            // un pas depuis que l'autre a lu son compteur au début ; l'autre,
+            // qui calcule jusqu'à nous voir avancer, l'attendrait mille tics.
+            COMPTEURS[moi].fetch_add(1, Ordering::Relaxed);
         }
     };
     let bascules = ordonnanceur::bascules();
     let a = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-a"), calculer(0));
     let b = tache::lancer_noyau(programmes::NomCourt::de(b"calcul-b"), calculer(1));
-    if let (Some(a), Some(b)) = (&a, &b) {
-        tache::attendre(a);
-        tache::attendre(b);
+    // Chacune attendue, même seule : elle calcule alors mille tics, que les
+    // tests suivants partageraient avec elle.
+    for t in a.iter().chain(b.iter()) {
+        tache::attendre(t);
     }
     let ok = a.is_some() && b.is_some() && VU.iter().all(|v| v.load(Ordering::Relaxed));
     afficherln!("[noyau] Ordonnanceur : deux taches du noyau qui calculent 20 ms chacune se partagent le processeur : {} ({} bascules).",
