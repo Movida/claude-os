@@ -127,6 +127,7 @@ const SO_PEEK_OFF: i32 = 42;
 const SO_BINDTODEVICE: i32 = 25;
 const SO_BINDTOIFINDEX: i32 = 62;
 const SO_DOMAIN: i32 = 39;
+const SO_BUF_LOCK: i32 = 72;
 const SO_RCVTIMEO_NEW: i32 = 66;
 const SO_SNDTIMEO_NEW: i32 = 67;
 const IP_TOS: i32 = 1;
@@ -196,9 +197,9 @@ const IP_PMTUDISC_OMIT: i32 = 5;
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
 
-/// Le tic des délais des sockets (le HZ de Linux) : 1 ms, celui de notre
-/// horloge (6e).
-const TIC: u64 = 1_000_000;
+/// Le tic des délais des sockets (1 / HZ) : 1 ms, celui de notre horloge
+/// (6e).
+const TIC: u64 = 1_000_000_000 / socket::HZ;
 
 fn en_i64(r: Result<i64, i64>) -> i64 {
     r.unwrap_or_else(|e| e)
@@ -1051,7 +1052,7 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
             }
             Ok(Controle::default())
         } else {
-            lire_controle(&c, processus::avec(|p| p.identite).root(), o.socket().protocole)
+            lire_controle(&c, socket::appelant_privilegie(), o.socket().protocole)
         }
     } else {
         Ok(Controle::default())
@@ -1542,9 +1543,10 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
     match option {
         // Un index, sans vérifier qu'il existe (mesuré : 9999 accepté, et relu).
         SO_BINDTOIFINDEX => return lier_a_une_interface(s, v),
-        // 0 à 6 pour tous ; au-delà, CAP_NET_ADMIN (root).
+        // 0 à 6 pour tous ; au-delà, CAP_NET_RAW ou CAP_NET_ADMIN de qui
+        // appelle (`sk_set_prio_allowed`).
         SO_PRIORITY => {
-            if !(0..=6).contains(&v) && s.uid != 0 {
+            if !(0..=6).contains(&v) && !socket::appelant_privilegie() {
                 return Err(-EPERM);
             }
             s.appels.verrouiller().options.priority = v as u32;
@@ -1577,7 +1579,8 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
     let mut inet = s.appels.verrouiller();
     let op = &mut inet.options;
     match option {
-        SO_DEBUG if oui && s.uid != 0 => return Err(-EACCES),
+        // CAP_NET_ADMIN de qui appelle.
+        SO_DEBUG if oui && !socket::appelant_privilegie() => return Err(-EACCES),
         SO_DEBUG => op.debug = oui,
         // La route gardée oubliée, posé ou retiré (`sk_dst_reset`) : IP_MTU
         // dit ENOTCONN ; une connexion UDP n'en garde plus tant qu'il est
@@ -1586,6 +1589,9 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         SO_OOBINLINE => op.oobinline = oui,
         SO_NO_CHECK => op.no_check = oui,
         SO_BSDCOMPAT => {}
+        // SO_REUSEPORT : pour les sockets d'Internet seulement (`sk_is_inet`) ;
+        // le retirer reste permis.
+        SO_REUSEPORT if oui && s.protocole == Protocole::Unix => return Err(-EOPNOTSUPP),
         SO_REUSEADDR | SO_REUSEPORT => {
             if option == SO_REUSEADDR {
                 op.reuseaddr = oui;
@@ -1601,6 +1607,7 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         // structures du noyau, dit Linux), au moins les minimums.
         SO_SNDBUF => {
             let v = (v as u32).min(TAMPON_MAX).min(i32::MAX as u32 / 2);
+            op.verrous_tampons |= socket::VERROU_SNDBUF;
             s.sndbuf.store((v * 2).max(SNDBUF_MIN), Ordering::Relaxed);
             // La copie de la fin d'émission (paquet.rs), et ceux qui
             // attendaient la place, s'il y en a plus (« Wake up sending tasks
@@ -1612,7 +1619,16 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         }
         SO_RCVBUF => {
             let v = (v as u32).min(TAMPON_MAX).min(i32::MAX as u32 / 2);
+            op.verrous_tampons |= socket::VERROU_RCVBUF;
             s.rcvbuf.store((v * 2).max(RCVBUF_MIN), Ordering::Relaxed);
+        }
+        // Les deux verrous à la fois, posés ou retirés (un autre bit :
+        // EINVAL) ; les tailles ne changent pas.
+        SO_BUF_LOCK => {
+            if v & !((socket::VERROU_SNDBUF | socket::VERROU_RCVBUF) as i32) != 0 {
+                return Err(-EINVAL);
+            }
+            op.verrous_tampons = v as u8;
         }
         SO_LINGER => {
             if longueur < 8 {
@@ -1620,8 +1636,15 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             }
             let mut l = [0u8; 8];
             copier_depuis_utilisateur(&mut l, valeur).map_err(|_| -EFAULT)?;
-            let marche = i32::from_le_bytes([l[0], l[1], l[2], l[3]]) != 0;
-            op.linger = (marche, if marche { u32::from_le_bytes([l[4], l[5], l[6], l[7]]) } else { op.linger.1 });
+            // Retiré : le délai reste (il se relit). Posé : en tics ; un
+            // délai négatif, étendu en `unsigned long`, est énorme, et
+            // comme tout ce qui dépasse, il ne finit pas.
+            if i32::from_le_bytes([l[0], l[1], l[2], l[3]]) == 0 {
+                op.linger.0 = false;
+            } else {
+                let secondes = i32::from_le_bytes([l[4], l[5], l[6], l[7]]) as i64 as u64;
+                op.linger = (true, if secondes >= socket::LINGER_INFINI / socket::HZ { socket::LINGER_INFINI } else { secondes * socket::HZ });
+            }
         }
         SO_RCVTIMEO | SO_RCVTIMEO_NEW => op.rcvtimeo = delai(valeur, longueur)?,
         SO_SNDTIMEO | SO_SNDTIMEO_NEW => op.sndtimeo = delai(valeur, longueur)?,
@@ -1630,16 +1653,15 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         SO_PASSCRED | SO_PASSRIGHTS => {}
         _ => return Err(-ENOPROTOOPT),
     }
-    let (keepalive, oobinline, dontroute) = (inet.options.keepalive, inet.options.oobinline, inet.options.dontroute);
     if option == SO_DONTROUTE {
         inet.route_gardee = None;
     }
     drop(inet);
-    if s.protocole == Protocole::Tcp && matches!(option, SO_RCVBUF | SO_SNDBUF) {
+    if s.protocole == Protocole::Tcp && matches!(option, SO_RCVBUF | SO_SNDBUF | SO_BUF_LOCK) {
         tcp::tampons_changes(s, option == SO_SNDBUF, option == SO_RCVBUF);
     }
     if s.protocole == Protocole::Tcp && matches!(option, SO_KEEPALIVE | SO_OOBINLINE | SO_DONTROUTE) {
-        tcp::options_socket_changees(s, keepalive, oobinline, dontroute, option == SO_DONTROUTE);
+        tcp::options_socket_changees(s, option == SO_DONTROUTE);
     }
     if s.protocole == Protocole::Unix && option == SO_PASSCRED {
         unix::changer_passcred(s, oui);
@@ -1676,7 +1698,7 @@ fn interface_nommee(valeur: u64, longueur: i32) -> Result<i32, i64> {
 /// (`sk_dst_reset`) : IP_MTU dit ENOTCONN jusqu'au prochain envoi sur la
 /// connexion (mesuré), qui en cherche une par la nouvelle interface.
 fn lier_a_une_interface(s: &Socket, index: i32) -> Result<(), i64> {
-    let root = processus::avec(|p| p.identite).root();
+    let root = socket::appelant_privilegie();
     let poser = |inet: &mut socket::Inet| -> Result<u32, i64> {
         if inet.options.interface != 0 && !root {
             return Err(-EPERM);
@@ -1949,7 +1971,7 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
     }
     // CAP_NET_RAW (ou CAP_NET_ADMIN) : un droit de qui pose l'option
     // (`ns_capable`), pas de qui a créé la socket.
-    let root = processus::avec(|p| p.identite).root();
+    let root = socket::appelant_privilegie();
     let ip_options = if option == IP_OPTIONS {
         if longueur as usize > format_ipv4::OPTIONS_MAX {
             return Err(-EINVAL);
@@ -2563,7 +2585,7 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
         SO_PASSRIGHTS => entier(&mut o, unix::passrights(s) as i32),
         // La `struct ucred` du pair : AF_UNIX seule en a un.
         SO_PEERCRED => {
-            let d = if s.protocole == Protocole::Unix { unix::droits_du_pair(s) } else { unix::Droits { pid: 0, uid: 65_534, gid: 65_534 } };
+            let d = if s.protocole == Protocole::Unix { unix::droits_du_pair(s) } else { unix::PAS_DE_PAIR };
             o[..4].copy_from_slice(&d.pid.to_le_bytes());
             o[4..8].copy_from_slice(&d.uid.to_le_bytes());
             o[8..12].copy_from_slice(&d.gid.to_le_bytes());
@@ -2572,11 +2594,14 @@ fn lire_option_socket(s: &Socket, option: i32) -> Result<([u8; 16], usize), i64>
         SO_ERROR => entier(&mut o, s.prendre_erreur()),
         SO_PRIORITY => entier(&mut o, op.priority as i32),
         SO_BINDTOIFINDEX => entier(&mut o, op.interface as i32),
+        // Le délai en secondes, même retiré ; tronqué à 32 bits (`int
+        // l_linger`) : un infini se relit LINGER_INFINI / HZ ainsi coupé.
         SO_LINGER => {
             o[..4].copy_from_slice(&(op.linger.0 as i32).to_le_bytes());
-            o[4..8].copy_from_slice(&op.linger.1.to_le_bytes());
+            o[4..8].copy_from_slice(&((op.linger.1 / socket::HZ) as i32).to_le_bytes());
             8
         }
+        SO_BUF_LOCK => entier(&mut o, op.verrous_tampons as i32),
         SO_RCVTIMEO | SO_RCVTIMEO_NEW => timeval(&mut o, op.rcvtimeo),
         SO_SNDTIMEO | SO_SNDTIMEO_NEW => timeval(&mut o, op.sndtimeo),
         SO_RCVLOWAT => entier(&mut o, op.rcvlowat as i32),

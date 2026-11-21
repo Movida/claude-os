@@ -166,6 +166,9 @@ wait
 /bin/tcp
 # Les sockets AF_UNIX (6h).
 /bin/unix
+# Les options de SOL_SOCKET (les soldes d'avant 6k, le lot 6), de toutes les
+# sortes de sockets.
+/bin/options-socket
 # Le propriétaire d'un fichier : F_SETOWN, SIGURG, O_ASYNC (6h).
 /bin/proprietaire
 # Du code qui se modifie, à cheval sur deux pages (6h) : ce que le compilateur à

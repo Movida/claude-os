@@ -310,7 +310,14 @@ pub struct Options {
     pub oobinline: bool,
     pub no_check: bool,
     pub priority: u32,
-    pub linger: (bool, u32),
+    /// SO_LINGER : en marche, et le délai en tics (`sk_lingertime`, en
+    /// jiffies) : LINGER_INFINI pour un délai qui ne finit pas.
+    pub linger: (bool, u64),
+    /// Les tampons fixés par le programme (`sk_userlocks`, ses deux bits
+    /// que SO_BUF_LOCK lit et écrit) : VERROU_SNDBUF, posé par SO_SNDBUF,
+    /// et VERROU_RCVBUF, par SO_RCVBUF. TCP ne fait plus grandir de
+    /// lui-même un tampon fixé (tcp.rs, `tampons_changes`).
+    pub verrous_tampons: u8,
     pub rcvlowat: u32,
     /// Les délais de réception et d'émission (SO_RCVTIMEO, SO_SNDTIMEO), en
     /// nanosecondes, déjà arrondis au tic ; None : sans délai.
@@ -380,10 +387,38 @@ pub struct Options {
     pub ip_options: formats::reseau::ipv4::OptionsSortantes,
 }
 
+/// Le HZ de Linux, la résolution des délais des sockets : 1 000 tics par
+/// seconde, ceux de notre horloge (6e), et de la machine du Linux de
+/// référence (CONFIG_HZ=1000 ; 250 sous WSL). Il se voit : un SO_LINGER
+/// infini se relit `LINGER_INFINI / HZ`, tronqué à 32 bits.
+pub const HZ: u64 = 1_000;
+
+/// SO_LINGER d'un délai qui ne finit pas : MAX_SCHEDULE_TIMEOUT (LONG_MAX
+/// jiffies), ce que Linux garde pour un délai négatif ou trop grand.
+pub const LINGER_INFINI: u64 = i64::MAX as u64;
+
+/// Les deux bits de `sk_userlocks` que SO_BUF_LOCK expose
+/// (SOCK_SNDBUF_LOCK, SOCK_RCVBUF_LOCK) ; les verrous de `bind`
+/// (SOCK_BINDADDR_LOCK, SOCK_BINDPORT_LOCK) vivent avec les adresses.
+pub const VERROU_SNDBUF: u8 = 1;
+pub const VERROU_RCVBUF: u8 = 2;
+
+/// Le programme qui appelle a-t-il les droits d'administrer le réseau
+/// (CAP_NET_ADMIN, CAP_NET_RAW, CAP_NET_BIND_SERVICE : chez nous, root les
+/// a tous, et lui seul) ? Ceux de QUI APPELLE (`sockopt_ns_capable`,
+/// `ns_capable` dans `inet_bind`), pas de qui a créé la socket : une
+/// socket passée à un autre processus (SCM_RIGHTS), ou gardée après un
+/// changement d'identité, suit les droits de son nouvel utilisateur.
+/// `Socket::uid`, lui, reste celui du créateur (`sk_uid`), que comparent
+/// SO_REUSEPORT et /proc/net.
+pub fn appelant_privilegie() -> bool {
+    crate::processus::avec(|p| p.identite).root()
+}
+
 impl Options {
     const DEFAUT: Options = Options {
         reuseaddr: false, reuseport: false, broadcast: false, keepalive: false, debug: false, dontroute: false,
-        oobinline: false, no_check: false, priority: 0, linger: (false, 0), rcvlowat: 1,
+        oobinline: false, no_check: false, priority: 0, linger: (false, 0), verrous_tampons: 0, rcvlowat: 1,
         rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, unicast_if: 0, interface: 0, recverr: false, pmtudisc: 1,
         udp_cork: false, recvttl: false, recvtos: false, recvopts: false, retopts: false, passsec: false,
         origdstaddr: false, checksum: false, recvfragsize: false, rfc4884: false, freebind: false, transparent: false,
@@ -427,7 +462,8 @@ pub struct Socket {
     /// La sorte et le protocole demandés (SO_TYPE, SO_PROTOCOL).
     pub sorte: u16,
     pub proto: u16,
-    /// L'utilisateur qui l'a créée (SO_REUSEPORT ; un port privilégié).
+    /// L'utilisateur qui l'a créée (`sk_uid` : SO_REUSEPORT, /proc/net) ;
+    /// pas ses droits (`appelant_privilegie`).
     pub uid: u32,
     /// Qui attend : `recv`, `poll`, epoll (le `sk_wq`). Dans un Arc : le
     /// relais d'une socket AF_UNIX (unix.rs, attente.rs) la tient comme
@@ -512,7 +548,11 @@ impl Socket {
             reception: Verrou::new(Reception { file: VecDeque::new(), erreurs: VecDeque::new(), octets: 0, erreur: 0, arret: 0 }),
             appels: Mutex::new(Inet {
                 lie: false, adresse: [0; 4], port: 0, port_choisi: false, adresse_choisie: false, connecte: false,
-                distante: [0; 4], port_distant: 0, source: [0; 4], route_gardee: None, identifiant: 0, options: Options::DEFAUT,
+                distante: [0; 4], port_distant: 0, source: [0; 4], route_gardee: None, identifiant: 0,
+                // Une socket de ping naît avec SO_REUSEADDR (INET_PROTOSW_REUSE,
+                // `inet_create`, mesuré) : deux pings du même identifiant se
+                // partagent ses réponses tant qu'aucune ne l'a retiré (idents.rs).
+                options: Options { reuseaddr: protocole == Protocole::Ping, ..Options::DEFAUT },
                 bouchon: None,
             }),
             rcvbuf: AtomicU32::new(TAMPON_DEFAUT),

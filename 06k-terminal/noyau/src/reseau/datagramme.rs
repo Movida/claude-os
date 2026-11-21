@@ -134,7 +134,7 @@ pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     }
     // Un port privilégié pour UDP ; une socket de ping n'a que des
     // identifiants (`ping_bind` ne regarde pas).
-    if s.protocole == Protocole::Udp && a.port != 0 && a.port < ports::PRIVILEGIE && s.uid != 0 {
+    if s.protocole == Protocole::Udp && a.port != 0 && a.port < ports::PRIVILEGIE && !socket::appelant_privilegie() {
         return Err(-EACCES);
     }
     let mut inet = s.appels.verrouiller();

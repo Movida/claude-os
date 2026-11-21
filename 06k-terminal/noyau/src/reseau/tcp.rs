@@ -1839,7 +1839,7 @@ pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     if !super::datagramme::adresse_de_bind(a.adresse, libre, false) {
         return Err(-EADDRNOTAVAIL);
     }
-    if a.port != 0 && a.port < ports_tcp::PRIVILEGIE && s.uid != 0 {
+    if a.port != 0 && a.port < ports_tcp::PRIVILEGIE && !super::socket::appelant_privilegie() {
         return Err(-EACCES);
     }
     let mut g = flux(s).posseder();
@@ -2659,7 +2659,7 @@ pub fn fermer(s: &Arc<Socket>) {
     }
     if attendre {
         g.publier(|p, c| p.rafraichir(c));
-        let echeance = maintenant().saturating_add(linger.1 as u64 * 1_000_000_000);
+        let echeance = maintenant().saturating_add(linger.1.saturating_mul(1_000_000_000 / super::socket::HZ));
         let _ = g.attendre(flux(s).file(), Sommeil::Interruptible, Some(echeance), |c| {
             !matches!(c.etat, Some(Etat::FinAttente1 | Etat::Fermeture | Etat::DernierAck))
         });
@@ -2861,12 +2861,15 @@ pub fn fin_d_episse(s: &Socket) {
 
 /// SO_KEEPALIVE, SO_OOBINLINE ou SO_DONTROUTE a changé : la socket en garde
 /// la copie, et la connexion en tient compte (le keepalive armé ou arrêté ;
-/// la route oubliée pour SO_DONTROUTE, `oublier_la_route`).
-pub fn options_socket_changees(s: &Socket, keepalive: bool, oobinline: bool, dontroute: bool, oublier_la_route: bool) {
+/// la route oubliée pour SO_DONTROUTE, `oublier_la_route`). Les options
+/// relues sous la possession, qui range les changements : deux setsockopt
+/// à la fois ne peuvent pas y laisser le plus ancien (le dernier à posséder
+/// voit les deux ; Linux pose et applique sous le même `lock_sock`).
+pub fn options_socket_changees(s: &Socket, oublier_la_route: bool) {
     avec_options_et_route(s, oublier_la_route, |op, t| {
-        op.keepalive = keepalive;
-        op.oobinline = oobinline;
-        op.dontroute = dontroute;
+        let i = s.appels.verrouiller();
+        (op.keepalive, op.oobinline, op.dontroute) = (i.options.keepalive, i.options.oobinline, i.options.dontroute);
+        drop(i);
         if let Some(t) = t {
             t.regler(op.reglages(t.reglages.orpheline), maintenant());
         }
@@ -3115,25 +3118,32 @@ pub fn reutilisation_changee(s: &Socket, inet: &socket::Inet) {
     }
 }
 
-/// SO_RCVBUF ou SO_SNDBUF a changé : la connexion en tient compte ; un
-/// SO_SNDBUF donné par le programme ne grandit plus de lui-même
-/// (`SOCK_SNDBUF_LOCK`), un SO_RCVBUF donné borne l'échelle de fenêtre de
-/// la connexion à venir (`SOCK_RCVBUF_LOCK`).
-pub fn tampons_changes(s: &Socket, sndbuf_fixe: bool, rcvbuf_fixe: bool) {
-    let (r, e) = (s.rcvbuf.load(Ordering::Relaxed) as usize, s.sndbuf.load(Ordering::Relaxed) as usize);
+/// SO_RCVBUF, SO_SNDBUF ou SO_BUF_LOCK a changé (`sndbuf_change`,
+/// `rcvbuf_change` : les tailles qui ont changé) : la connexion suit les
+/// verrous des tampons de la socket (socket::VERROU_SNDBUF, VERROU_RCVBUF)
+/// et ses tailles, relus sous la possession, comme
+/// `options_socket_changees`. Un SO_SNDBUF verrouillé ne grandit plus de
+/// lui-même, un SO_RCVBUF verrouillé non plus, et borne l'échelle de
+/// fenêtre de la connexion à venir ; SO_BUF_LOCK peut les déverrouiller,
+/// et la connexion recommence à les faire grandir (`tcp_sndbuf_expand`,
+/// `tcp_rcvbuf_grow` regardent `sk_userlocks` à chaque fois).
+pub fn tampons_changes(s: &Socket, sndbuf_change: bool, rcvbuf_change: bool) {
     avec_options(s, |op, t| {
-        op.sndbuf_fixe |= sndbuf_fixe;
-        op.rcvbuf_fixe |= rcvbuf_fixe;
+        let verrous = s.appels.verrouiller().options.verrous_tampons;
+        let (r, e) = (s.rcvbuf.load(Ordering::Relaxed) as usize, s.sndbuf.load(Ordering::Relaxed) as usize);
+        let (sndbuf_fixe, rcvbuf_fixe) = (verrous & super::socket::VERROU_SNDBUF != 0, verrous & super::socket::VERROU_RCVBUF != 0);
+        op.sndbuf_fixe = sndbuf_fixe;
+        op.rcvbuf_fixe = rcvbuf_fixe;
         if let Some(t) = t {
-            // Seulement celui qui a changé : l'autre a pu grandir depuis.
-            if rcvbuf_fixe {
+            // Seulement la taille qui a changé : l'autre a pu grandir depuis.
+            if rcvbuf_change {
                 t.rcvbuf = r;
-                t.rcvbuf_fixe = true;
             }
-            if sndbuf_fixe {
+            if sndbuf_change {
                 t.sndbuf = e;
-                t.sndbuf_fixe = true;
             }
+            t.rcvbuf_fixe = rcvbuf_fixe;
+            t.sndbuf_fixe = sndbuf_fixe;
         }
     });
 }

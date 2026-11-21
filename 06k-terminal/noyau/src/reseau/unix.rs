@@ -552,11 +552,18 @@ pub fn pair(s: &Socket) -> Result<Nom, i64> {
     Ok(nom(&p))
 }
 
-/// SO_PEERCRED : les droits du pair ; sans pair, ceux d'aucun processus
-/// (pid 0, l'utilisateur et le groupe « hors de portée », 65534, comme
-/// Linux).
+/// SO_PEERCRED d'une socket sans pair, et de toute socket d'Internet : pas de
+/// pid, et -1 pour l'utilisateur et le groupe (`cred_to_ucred(NULL, NULL)`,
+/// mesuré). Pas `overflowuid` (65534) comme SANS_DROITS : celui-là vient d'un
+/// `from_kuid_munged`, qui traduit des droits qui existent mais qu'on ne
+/// peut pas nommer ; ici, il n'y en a pas du tout.
+pub const PAS_DE_PAIR: Droits = Droits { pid: 0, uid: u32::MAX, gid: u32::MAX };
+
+/// SO_PEERCRED : les droits du pair, posés par `connect`, `listen` (les
+/// siens), `accept` et `socketpair` (`init_peercred`, `copy_peercred`) ;
+/// sans pair, PAS_DE_PAIR.
 pub fn droits_du_pair(s: &Socket) -> Droits {
-    unix(s).etat.verrouiller().droits.unwrap_or(Droits { pid: 0, uid: 65_534, gid: 65_534 })
+    unix(s).etat.verrouiller().droits.unwrap_or(PAS_DE_PAIR)
 }
 
 /// SO_PASSRIGHTS.
