@@ -156,8 +156,23 @@ fi
 qemu=$(command -v qemu-system-x86_64)
 if $root test -w /dev/kvm 2>/dev/null; then
     machine="-accel kvm -cpu host,-la57"
+    horloge=
 else
     machine="-accel tcg -cpu max,-la57"
+    # Sous TCG, le TSC de la machine est celui de l'hôte, et ses autres
+    # horloges (HPET, PM timer) suivent l'heure de QEMU, l'horloge monotone
+    # de l'hôte : sur un hôte qui en ajuste le rythme (WSL : mesuré contre
+    # elle, le TSC y bat de 3 682 à 3 709 MHz en trente secondes), elles
+    # divergent, et le chien de garde des horloges déclare le TSC instable
+    # en pleine vérification (vers 18 s de marche, mesuré). Le noyau réécrit
+    # alors son code en marche (la clé statique de sched_clock, posée par
+    # int3, `text_poke_bp`), ce que TCG ne tient pas toujours avec plusieurs
+    # processeurs : un « Oops: int3 » dans sched_clock_cpu, la machine en
+    # panique (une fois, pendant `fautes`, le 21 novembre 2026). Déclaré
+    # instable dès le démarrage, il n'y a plus rien à réécrire ensuite ; la
+    # machine prend le HPET, ce qu'elle finissait par faire. Sous KVM, le
+    # TSC est sûr : rien à changer.
+    horloge=tsc=unstable
 fi
 processeurs=${PROCESSEURS:-$(nproc)}
 [ -n "${PROCESSEURS:-}" ] || [ "$processeurs" -le 4 ] || processeurs=4
@@ -171,7 +186,7 @@ processeurs=${PROCESSEURS:-$(nproc)}
 timeout --foreground "${DUREE_MAX:-7200}" $root "$qemu" $machine \
     -smp "$processeurs" -m "${MEMOIRE:-2G}" \
     -kernel "$cache/vmlinuz" -initrd "$travail/initramfs.cpio" \
-    -append "console=ttyS0 quiet loglevel=4 panic=-1 travail=$travail" \
+    -append "console=ttyS0 quiet loglevel=4 panic=-1 $horloge travail=$travail" \
     $partages \
     -netdev user,id=reseau -device virtio-net-pci,netdev=reseau \
     -nodefaults -display none -no-reboot -serial stdio </dev/null &
