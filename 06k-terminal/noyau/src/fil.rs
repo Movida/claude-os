@@ -145,8 +145,8 @@ struct Demande {
 /// clone(drapeaux, pile, parent_tid, child_tid, tls), dans l'ordre des
 /// arguments de x86_64. Seuls les 32 bits bas des drapeaux comptent
 /// (mesuré : `clone(SIGCHLD | 0xffffffff00000000)` crée l'enfant) ; l'octet
-/// bas est le signal de fin (CSIGNAL) ; CLONE_PIDFD rendrait son
-/// descripteur à `parent_tid` (pas encore : ENOSYS, voir `cloner`).
+/// bas est le signal de fin (CSIGNAL) ; CLONE_PIDFD rend son descripteur
+/// à `parent_tid` (un int).
 /// `cadre` : celui de l'appel du créateur.
 pub fn clone(drapeaux: u64, pile: u64, parent_tid: u64, child_tid: u64, tls: u64, cadre: &Cadre) -> i64 {
     let bas = drapeaux & 0xffff_ffff;
@@ -284,7 +284,7 @@ fn cloner(d: Demande, cadre: &Cadre) -> i64 {
     if tache::signal_en_attente() {
         return -crate::reprise::ERESTARTNOINTR;
     }
-    let geres = UN_FIL | SANS_EFFET | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID;
+    let geres = UN_FIL | SANS_EFFET | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID | CLONE_PIDFD;
     if f & UN_FIL != UN_FIL || f & !geres != 0 {
         afficherln!("[noyau] clone : seulement des fils (pthread_create) ; un processus neuf (fork, vfork) viendra en 6l");
         return -ENOSYS;
@@ -312,6 +312,9 @@ fn cloner(d: Demande, cadre: &Cadre) -> i64 {
         ecrire_tid: if f & CLONE_CHILD_SETTID != 0 { d.child_tid } else { 0 },
         effacer_tid: if f & CLONE_CHILD_CLEARTID != 0 { d.child_tid } else { 0 },
         parent_tid: if f & CLONE_PARENT_SETTID != 0 { d.parent_tid } else { 0 },
+        // Le pidfd d'un fil (depuis Linux 6.9 : un pidfd de fil,
+        // PIDFD_THREAD) ; celui d'un processus neuf viendra avec fork (6l).
+        pidfd: (f & CLONE_PIDFD != 0).then_some(d.pidfd),
     };
     match tache::lancer_fil(n) {
         Ok(tid) => tid as i64,

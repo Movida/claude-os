@@ -405,12 +405,13 @@ static NOMBRE: AtomicUsize = AtomicUsize::new(0);
 /// La clé d'un objet : les inodes du tmpfs d'abord, puis ceux des systèmes
 /// montés (leurs numéros, de 64 bits, entiers : procfs en fabrique pour
 /// chaque processus, et un numéro de processus ne resert jamais,
-/// processus::numero_neuf), puis l'inode anonyme ; les orphelines tout au
-/// bout.
+/// processus::numero_neuf), puis ceux de pidfs (au-delà de tous ceux des
+/// systèmes montés), puis l'inode anonyme ; les orphelines tout au bout.
 fn cle(o: Objet) -> u128 {
     match o {
         Objet::Tmpfs(n) => n.0 as u128,
         Objet::Monte(Montage(s), n) => ((s as u128 + 1) << 64) | n as u128,
+        Objet::Pidfs(n) => (1 << 120) | n as u128,
         Objet::Anonyme => u128::MAX - 1,
     }
 }

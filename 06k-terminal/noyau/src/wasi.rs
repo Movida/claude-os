@@ -1128,7 +1128,7 @@ impl Wasi {
                 // tube : ce descripteur ne peut pas être à lui (une socket
                 // est passée plus haut).
                 (Sorte::Chemin | Sorte::EventFd | Sorte::Epoll | Sorte::Tube | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd
-                 | Sorte::SignalFd, _) => Err(EBADF),
+                 | Sorte::SignalFd | Sorte::PidFd, _) => Err(EBADF),
                 // Un fichier de /proc ou de /sys : son contenu fabriqué à la
                 // lecture, comme pour un programme Linux (seule une mémoire
                 // qui manque peut échouer) ; il ne s'écrit pas.
@@ -1598,10 +1598,12 @@ impl Wasi {
             let depart = Depart { racine: s.racine(), dossier: base, qui, sous: true };
             s.avec_vue(0, |vue| {
                 let o = fichiers::chemins::trouver(vue, &depart, &chemin, suivre & 1 != 0)?;
-                Ok(filestat(&vue.attributs(o), vue.peripherique(o).map_or(appels_fichiers::DEV_RACINE, |(dev, _)| dev)))
+                Ok((o, vue.attributs(o), vue.peripherique(o).map_or(appels_fichiers::DEV_RACINE, |(dev, _)| dev)))
             })
         });
-        match stat {
+        // Les dates que tient le noyau (un /proc/<pid>/fd/<n> qui mène à
+        // un pidfd), hors du verrou des fichiers.
+        match stat.map(|(o, a, dev)| filestat(&appels_fichiers::dater(o, a), dev)) {
             Ok(stat) => match ecrire(m, sortie, &stat) {
                 Ok(()) => SUCCES,
                 Err(e) => e,

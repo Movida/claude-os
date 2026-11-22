@@ -316,6 +316,10 @@ boot.bin: programmes.cpio FORCE
 #     OFD, POSIX et flock dans un processus, puis deux processus (a et b,
 #     lancés ensemble) pour F_GETLK, EDEADLK et la fin d'un processus ; sur
 #     l'hôte aussi, dans /dev/shm ;
+#   - pidfd : gcc -static, les pidfd (le lot 6 des soldes) : pidfd_open,
+#     le fichier, pidfd_send_signal, PIDFD_GET_INFO, pidfd_getfd, CLONE_PIDFD,
+#     dans un processus, puis deux (a et b, lancés ensemble) pour Yama et
+#     PR_SET_PTRACER ; sur l'hôte aussi, dans /dev/shm ;
 #   - copies : gcc -static, copy_file_range, sendfile et fadvise64 (6i),
 #     leurs transferts et leurs refus, ceux de Linux, pour chaque sorte de
 #     fichier ; sur l'hôte aussi, dans /dev/shm (un tmpfs, comme notre /tmp :
@@ -526,6 +530,10 @@ $(LINUX)/copies: linux/copies.c
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
 $(LINUX)/verrous: linux/verrous.c
+	mkdir -p $(LINUX)
+	gcc -static $(CFLAGS_LINUX) $< -o $@
+
+$(LINUX)/pidfd: linux/pidfd.c
 	mkdir -p $(LINUX)
 	gcc -static $(CFLAGS_LINUX) $< -o $@
 
@@ -1060,7 +1068,7 @@ $(CLAUDE):
 # et le vrai /etc/demarrage, qui doit remplacer l'autre : le même fichier,
 # vidé puis réécrit (ce qui resterait du Makefile le rendrait trop grand
 # pour être lu : plus de 64 Kio).
-programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/minuteurs $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/verrous $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/snmp $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/options-socket $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
+programmes.cpio: $(CLAUDE) archive.sh archive.txt racine/etc/bonjour.txt racine/etc/demarrage racine/etc/ld.so.conf $(GLIBC)/.copiee $(LINUX)/bonjour-asm $(LINUX)/pile $(LINUX)/sse $(LINUX)/bonjour-c $(LINUX)/bonjour-c-pie $(LINUX)/bonjour-c-dynamique $(LINUX)/dynamique $(LINUX)/libessai.so $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/arbre $(LINUX)/segments $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/minuteurs $(LINUX)/proc $(LINUX)/partage $(LINUX)/ajout $(LINUX)/clone $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/verrous $(LINUX)/pidfd $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/snmp $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/proprietaire $(LINUX)/autocode $(LINUX)/unix $(LINUX)/options-socket $(LINUX)/client-tcp $(LINUX)/telecharger $(LINUX)/passerelle \
               racine/etc/hosts racine/etc/nsswitch.conf FORCE
 	echo "$(CLAUDE_SHA256)  $(CLAUDE)" | sha256sum -c --quiet
 	cd bonjour && cargo build --release
@@ -1328,7 +1336,7 @@ SHELL = /bin/bash
 
 tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(LINUX)/claude-version $(LINUX)/temps $(LINUX)/fichiers $(LINUX)/segments $(LINUX)/dynamique $(LINUX)/libessai.so \
             $(LINUX)/signaux $(LINUX)/gestionnaires $(LINUX)/reprise $(LINUX)/suspendre $(LINUX)/attente $(LINUX)/tubes $(LINUX)/systeme $(LINUX)/processeurs $(LINUX)/evenements $(LINUX)/minuteurs $(LINUX)/proc $(LINUX)/ajout $(LINUX)/clone \
-            $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/verrous $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/snmp $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/options-socket $(LINUX)/proprietaire $(LINUX)/autocode
+            $(LINUX)/fils $(LINUX)/courses $(LINUX)/fautes $(LINUX)/troncature $(LINUX)/redirections $(LINUX)/dossier $(LINUX)/effacer $(LINUX)/copies $(LINUX)/verrous $(LINUX)/pidfd $(LINUX)/surveillance $(LINUX)/reseau $(LINUX)/dns $(LINUX)/snmp $(LINUX)/aleatoire $(LINUX)/tcp $(LINUX)/unix $(LINUX)/options-socket $(LINUX)/proprietaire $(LINUX)/autocode
 	cd formats && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd formats && CLAUDE_BINAIRE=$(CLAUDE) cargo test --release 2>&1 | tee /dev/stderr | (! grep -q '^warning')
 	cd zones && cargo build --target x86_64-unknown-none 2>&1 | tee /dev/stderr | (! grep -q '^warning')
@@ -1388,6 +1396,10 @@ tests-hote: $(SUITE)/.convertie $(CLAUDE) $(PROGRAMMES_HOTE) $(LINUX)/memoire $(
 	rm -f /dev/shm/verrous*; timeout 60 ./$(LINUX)/verrous /dev/shm a & a=$$!; \
 	  timeout 60 ./$(LINUX)/verrous /dev/shm b | tee /dev/stderr | grep -q "verrous b : toutes les verifications : ok"; r=$$?; \
 	  wait $$a || r=1; exit $$r
+	rm -f /dev/shm/pidfd-*; timeout 60 ./$(LINUX)/pidfd /dev/shm | tee /dev/stderr | grep -q "pidfd : toutes les verifications : ok"
+	rm -f /dev/shm/pidfd-*; timeout 60 ./$(LINUX)/pidfd /dev/shm a & a=$$!; \
+	  timeout 60 ./$(LINUX)/pidfd /dev/shm b | tee /dev/stderr | grep -q "pidfd b : toutes les verifications : ok"; r=$$?; \
+	  wait $$a || r=1; rm -f /dev/shm/pidfd-*; exit $$r
 	./$(LINUX)/surveillance /dev/shm | tee /dev/stderr | grep -q "surveillance : toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/reseau | tee /dev/stderr | grep -q "toutes les verifications : ok"
 	timeout 60 ./$(LINUX)/dns | tee /dev/stderr | grep -q "toutes les verifications : ok"

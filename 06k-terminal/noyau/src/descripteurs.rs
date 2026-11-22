@@ -89,6 +89,9 @@ pub enum Sorte {
     /// Des signaux lus comme un fichier (signalfd, les soldes d'avant 6k) :
     /// son masque dans `Prive::SignalFd`.
     SignalFd,
+    /// Un processus ou un fil (pidfd, le lot 6 des soldes) : son objet dans
+    /// `Prive::PidFd`, son inode dans pidfs (`Objet::Pidfs`).
+    PidFd,
     /// Un fichier d'un système du noyau (/proc, /sys, 6d), dont le contenu
     /// est fabriqué à la lecture (`Donnees::Noyau`), d'une des trois façons
     /// de Linux.
@@ -122,7 +125,7 @@ impl Sorte {
     /// /dev/random et les terminaux acceptés.
     pub fn sait_attendre(self) -> bool {
         matches!(self, Sorte::Aleatoire { random: true } | Sorte::Console | Sorte::EventFd | Sorte::Epoll | Sorte::Tube
-                       | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd
+                       | Sorte::Socket | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd | Sorte::PidFd
                        | Sorte::Noyau { lecture: Lecture::Valeur | Lecture::Attribut })
     }
 }
@@ -156,6 +159,7 @@ pub enum Prive {
     Inotify(Arc<crate::surveillance::Groupe>),
     TimerFd(Arc<crate::timerfd::TimerFd>),
     SignalFd(Arc<crate::signalfd::SignalFd>),
+    PidFd(Arc<crate::pidfd::PidFd>),
 }
 
 /// Ce que tient un fichier ouvert : un inode du tmpfs, avec ce qu'a rendu
@@ -291,6 +295,15 @@ impl Fichier {
     }
 }
 
+/// L'inode de pidfs que tient un fichier ouvert O_PATH (`ajouter`) ; un pidfd tient le
+/// sien par son objet (`Prive::PidFd`).
+fn inode_de_pidfs(f: &FichierOuvert) -> Option<u32> {
+    match (&f.sorte, &f.tenu) {
+        (Sorte::Chemin, Tenu::Noyau(Objet::Pidfs(n))) => Some(*n),
+        _ => None,
+    }
+}
+
 /// La table des fichiers ouverts, sous le verrou du système de fichiers
 /// (vfs.rs).
 #[derive(Default)]
@@ -302,11 +315,23 @@ impl Ouverts {
     /// Range un fichier ouvert neuf (tenu une fois). ENOMEM si la table ne
     /// peut pas grandir.
     pub fn ajouter(&mut self, f: FichierOuvert) -> Result<Fichier, FichierOuvert> {
+        // Un O_PATH d'un inode de pidfs le tient tant qu'il est ouvert (pidfd.rs,
+        // INODES) : pris ici, rendu à la dernière fermeture (`lacher_en`), le seul
+        // passage de tout fichier ouvert, d'où qu'il vienne (un chemin, /proc/<pid>/fd).
+        let inode = inode_de_pidfs(&f);
+        if let Some(n) = inode
+            && crate::pidfd::tenir_inode(n).is_err()
+        {
+            return Err(f);
+        }
         if let Some(i) = self.cases.iter().position(Option::is_none) {
             self.cases[i] = Some(f);
             return Ok(Fichier(i as u32));
         }
         if let Err(Some(f)) = self.cases.ajouter_ou_rendre(Some(f)) {
+            if let Some(n) = inode {
+                crate::pidfd::lacher_inode(n);
+            }
             return Err(f);
         }
         Ok(Fichier(self.cases.len() as u32 - 1))
@@ -384,6 +409,9 @@ impl Ouverts {
             }
             crate::reseau::socket::fichier_ferme(o, f);
             crate::surveillance::fichier_ferme(o, f);
+            if let Some(n) = inode_de_pidfs(o) {
+                crate::pidfd::lacher_inode(n);
+            }
         }
         while self.cases.last().is_some_and(Option::is_none) {
             self.cases.pop();

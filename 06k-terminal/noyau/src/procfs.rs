@@ -158,6 +158,9 @@ const NET_TCP: u32 = 24;
 const NET_UNIX: u32 = 25;
 /// /proc/net/snmp (les soldes d'avant 6k, reseau/snmp.rs).
 const NET_SNMP: u32 = 26;
+/// /proc/sys/kernel/yama/ptrace_scope (le lot 6 des soldes, pidfd.rs) : 1,
+/// le réglage d'Ubuntu, que suit pidfd_getfd.
+const YAMA_PTRACE_SCOPE: u32 = 43;
 /// /proc/net/igmp, mcfilter et dev_mcast (les soldes d'avant 6k, reseau/multidiffusion.rs).
 const NET_IGMP: u32 = 27;
 const NET_MCFILTER: u32 = 28;
@@ -208,6 +211,10 @@ pub fn creer(maintenant: Temps) -> Result<NoyauFs, Erreur> {
     p.ajouter(random, b"urandom_min_reseed_secs", 0o644, (0, 0), reglage(RANDOM_RESEED), maintenant)?;
     p.ajouter(random, b"uuid", 0o444, (0, 0), reglage(RANDOM_UUID), maintenant)?;
     p.ajouter(random, b"write_wakeup_threshold", 0o644, (0, 0), reglage(RANDOM_WAKEUP), maintenant)?;
+    // Yama (security/yama/yama_lsm.c) : son réglage, en 0644 à root (nos
+    // programmes ne l'écrivent pas : EACCES).
+    let yama = p.ajouter(kernel, b"yama", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
+    p.ajouter(yama, b"ptrace_scope", 0o644, (0, 0), reglage(YAMA_PTRACE_SCOPE), maintenant)?;
     // /proc/sys/net : les réglages du réseau, 0644 à root comme chez Linux (nos programmes
     // ne sont pas root : EACCES pour y écrire, et rien n'y change).
     let net_sys = p.ajouter(sys, b"net", 0o555, (0, 0), Contenu::Dossier, maintenant)?;
@@ -750,7 +757,7 @@ pub fn lecture(source: u32) -> Lecture {
         s if s >= SYSCTL_NET => Lecture::Valeur,
         OVERCOMMIT_MEMORY | MMAP_MIN_ADDR | PIPE_MAX_SIZE | PIPE_USER_PAGES_SOFT | PIPE_USER_PAGES_HARD | RANDOM_BOOT_ID
         | RANDOM_UUID | RANDOM_ENTROPY_AVAIL | RANDOM_POOLSIZE | RANDOM_WAKEUP | RANDOM_RESEED | INOTIFY_EVENEMENTS
-        | INOTIFY_INSTANCES | INOTIFY_SURVEILLANCES => Lecture::Valeur,
+        | INOTIFY_INSTANCES | INOTIFY_SURVEILLANCES | YAMA_PTRACE_SCOPE => Lecture::Valeur,
         MAPS | MAPS_SANS_MEMOIRE | STATM | COMM | STAT | STAT_FIL | STATUS | BANNIERE | NET_PNP | NET_ROUTE | NET_DEV | NET_ARP | NET_SNMP | NET_TCP | NET_UNIX | NET_IGMP
         | NET_MCFILTER | NET_DEV_MCAST => Lecture::Sequence,
         // Nommées une à une, sans cas par défaut : /proc/net/tcp et unix
@@ -771,6 +778,17 @@ pub fn fichier_du_saut(lien: Objet) -> Option<crate::descripteurs::Fichier> {
         return None;
     }
     processus::descripteur(processus_de(n)?, fd as u64)
+}
+
+/// Le numéro du dossier /proc/<n> qu'est l'objet `o`, s'il en est un : un
+/// processus, ou un fil (/proc/<tid>, que Linux ouvre de la même façon).
+/// Un tel dossier ouvert tient lieu de pidfd du processus pour
+/// pidfd_send_signal (le `tgid_pidfd_to_pid` de Linux) ; pas
+/// /proc/<pid>/task/<tid>.
+pub fn numero_du_dossier(o: Objet) -> Option<u32> {
+    let Objet::Monte(fichiers::montages::Systeme(s), i) = o else { return None };
+    let (genre, n, _) = decoder(i);
+    (s as usize == crate::vfs::PROC && genre == PROCESSUS).then_some(n)
 }
 
 /// Les données du fichier ouvert d'une source.
@@ -919,6 +937,7 @@ fn valeur(source: u32) -> Result<Vec<u8>, Erreur> {
         RANDOM_POOLSIZE => writeln!(t, "256"),
         RANDOM_WAKEUP => writeln!(t, "256"),
         RANDOM_RESEED => writeln!(t, "60"),
+        YAMA_PTRACE_SCOPE => writeln!(t, "1"),
         INOTIFY_EVENEMENTS => writeln!(t, "{}", crate::surveillance::EVENEMENTS_MAX),
         INOTIFY_INSTANCES => writeln!(t, "{}", crate::surveillance::INSTANCES_MAX),
         INOTIFY_SURVEILLANCES => writeln!(t, "{}", crate::surveillance::surveillances_max()),

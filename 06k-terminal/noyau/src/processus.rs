@@ -339,6 +339,14 @@ pub struct Entree {
     /// Ce que /proc montre encore du fil principal parti, ou du processus
     /// fini (voir `Souvenir`).
     souvenir: Verrou<Souvenir>,
+    /// Ceux qui attendent un pidfd du processus ou de l'un de ses fils (le
+    /// `wait_pidfd` d'une `struct pid` de Linux ; une seule file pour tout
+    /// le processus : pidfd.rs), réveillés à la fin de chaque fil
+    /// (`fil_disparu`), et à son recueil.
+    file_pidfd: crate::attente::FileAttente,
+    /// Il a été recueilli (retiré de la table) : plus aucune tâche, son
+    /// statut est définitif (un pidfd le lit : POLLHUP, PIDFD_INFO_EXIT).
+    recueilli: AtomicBool,
 }
 
 /// Ce qui vivait dans le `Fil` du fil principal et dans le `Processus`,
@@ -414,6 +422,30 @@ impl Entree {
         self.pid
     }
 
+    /// À qui il est (le propriétaire de /proc/<pid>, et les droits d'un
+    /// pidfd : pidfd.rs).
+    pub fn identite(&self) -> Identite {
+        self.identite
+    }
+
+    /// La tâche de son fil principal, jusqu'au recueil, même partie avant
+    /// les autres ou zombie (la tâche que désigne un pidfd du processus).
+    pub fn principal(&self) -> Option<Arc<Tache>> {
+        self.principal.verrouiller().clone()
+    }
+
+    /// La file des pidfd du processus (pidfd.rs).
+    pub fn file_pidfd(&self) -> &crate::attente::FileAttente {
+        &self.file_pidfd
+    }
+
+    /// A-t-il été recueilli ? SeqCst : un pidfd le lit après s'être
+    /// inscrit dans `file_pidfd`, `recueillir` le pose avant de la réveiller
+    /// (le motif de attente.rs).
+    pub fn est_recueilli(&self) -> bool {
+        self.recueilli.load(Ordering::SeqCst)
+    }
+
     /// La fin du fil `tid` (sa tâche meurt, en lui laissant le statut
     /// `code`) : il quitte le processus. Le dernier fil emporte le
     /// processus : son statut de sortie (celui de la fin du groupe s'il y en
@@ -440,6 +472,12 @@ impl Entree {
                 s.masque_du_principal = f.signaux.bloques();
             }
             p.fils.retain(|f| f.tid != tid);
+            // Un fil qui n'est pas le principal est recueilli à sa mort chez
+            // Linux : les permissions de PR_SET_PTRACER qui le nomment
+            // partent avec lui (pidfd.rs ; celles du principal, au recueil).
+            if tid != self.pid {
+                crate::pidfd::oublier(tid);
+            }
             if !p.fils.is_empty() {
                 // Les signaux du processus qui l'attendaient vont à un
                 // autre fil, s'il en avait été prévenu : ceux qu'il ne
@@ -510,6 +548,11 @@ impl Entree {
                 crate::tache::reveiller(parent, crate::tache::Reveil::Reveillee);
             }
         }
+        // Ceux qui attendent un pidfd : un fil vient de mourir (sa tâche
+        // dit « morte » depuis `terminer`), ou le processus est un zombie (le
+        // `do_notify_pidfd` de Linux, POLLIN|POLLRDNORM). Après « zombie »,
+        // et la barrière complète du réveil : qui se réveille le voit.
+        self.file_pidfd.reveiller(crate::sondage::POLLIN | crate::sondage::POLLRDNORM, 0);
     }
 
     /// Le nom de son fil principal a changé.
@@ -640,6 +683,8 @@ pub fn ajouter(processus: Processus, descripteurs: Descripteurs, mut memoire: Me
         exe: Verrou::new((Vec::new(), None)),
         principal: Verrou::new(None),
         souvenir: Verrou::new(Souvenir::VIDE),
+        file_pidfd: crate::attente::FileAttente::new(),
+        recueilli: AtomicBool::new(false),
     }).ok()?;
     let mut table = TABLE.verrouiller();
     if table.len() == table.capacity() {
@@ -658,7 +703,7 @@ pub fn poser_exe(pid: u32, chemin: Vec<u8>, inode: Numero) {
 }
 
 /// L'entrée du processus `pid` (vivant ou zombie).
-fn entree(pid: u32) -> Option<Arc<Entree>> {
+pub fn entree(pid: u32) -> Option<Arc<Entree>> {
     TABLE.verrouiller().iter().find(|e| e.pid == pid).cloned()
 }
 
@@ -765,13 +810,26 @@ pub fn recueillir(pid: u32) -> Option<i32> {
     let e = {
         let mut table = TABLE.verrouiller();
         let i = table.iter().position(|e| e.pid == pid)?;
-        table.swap_remove(i)
+        let e = table.swap_remove(i);
+        // Son statut définitif, sous le verrou de la table qui le retire :
+        // qui ne le trouve plus par son numéro (ESRCH pour un signal, pour
+        // pidfd_open) trouve le statut (POLLHUP, PIDFD_GET_INFO), et
+        // inversement, comme chez Linux, où l'un et l'autre lisent `pid_task`,
+        // effacé en un seul point (`__unhash_process`), le statut posé avant
+        // (`pidfs_exit`). Puis le fil principal rendu et le réveil.
+        e.recueilli.store(true, Ordering::SeqCst);
+        e
     };
     // La tâche du fil principal, lâchée hors du verrou de la table : sa
     // dernière référence rend sa structure (et, avec elle, la sienne vers
     // l'entrée).
     let principal = e.principal.verrouiller().take();
     drop(principal);
+    // Plus aucune tâche : ceux qui attendent un pidfd voient POLLHUP (le
+    // `wake_up_all` de `__unhash_process`), les permissions de Yama qui le
+    // nomment partent (`yama_task_free`).
+    e.file_pidfd.reveiller(crate::sondage::POLLIN | crate::sondage::POLLRDNORM | crate::sondage::POLLHUP, 0);
+    crate::pidfd::oublier(pid);
     Some(e.code())
 }
 

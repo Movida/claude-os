@@ -44,12 +44,17 @@ pub struct Systeme(pub u8);
 /// anonyme : celui des fichiers ouverts qui n'ont pas de nom (eventfd,
 /// epoll), le seul inode de l'anon_inodefs de Linux (fs/anon_inodes.c),
 /// un système du noyau qui n'est monté nulle part ; jamais dans
-/// l'arborescence.
+/// l'arborescence. Ou l'inode d'un pidfd (lot 6 des soldes) : un par
+/// numéro de processus ou de fil, celui de pidfs chez Linux (fs/pidfs.c),
+/// un autre système du noyau monté nulle part ; son numéro d'inode est le
+/// numéro du processus ou du fil, jamais réutilisé chez nous (Linux en
+/// compte un à part, `pid->ino`, parce qu'il recycle les pid).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Objet {
     Tmpfs(Numero),
     Monte(Systeme, u64),
     Anonyme,
+    Pidfs(u32),
 }
 
 /// Ce que dit `stat` de l'inode anonyme (mesuré sous Linux 6.18) : ni
@@ -72,6 +77,16 @@ pub const ANONYME: Attributs = Attributs {
 
 /// Le périphérique de l'anon_inodefs (mesuré : 0:16) et sa taille de bloc.
 pub const ANONYME_PERIPHERIQUE: ((u32, u32), u64) = ((0, 16), 4096);
+
+/// Ce que dit `stat` d'un inode de pidfs (mesuré sous Linux 6.18, la sonde
+/// c11 du lot 6 des soldes) : comme l'inode anonyme (`anon_inode_getattr`,
+/// sans bits de type), mais en 0700 (`pidfs_init_inode`). Son numéro est
+/// celui du processus ou du fil ; ses dates, celles de la création de
+/// l'inode, que le noyau tient (noyau/src/pidfd.rs) : 0 ici.
+pub const PIDFS: Attributs = Attributs { mode: 0o700, ..ANONYME };
+
+/// Le périphérique de pidfs (mesuré : 0:5) et sa taille de bloc.
+pub const PIDFS_PERIPHERIQUE: ((u32, u32), u64) = ((0, 5), 4096);
 /// Le périphérique et la taille de bloc de pipefs, où vivent les inodes des
 /// tubes chez Linux (mesuré : 0:15, 4096), et chez nous dans le tmpfs
 /// (`Tmpfs::creer_tube`).
@@ -86,7 +101,7 @@ impl Objet {
     pub fn tmpfs(self) -> Option<Numero> {
         match self {
             Objet::Tmpfs(n) => Some(n),
-            Objet::Monte(..) | Objet::Anonyme => None,
+            Objet::Monte(..) | Objet::Anonyme | Objet::Pidfs(_) => None,
         }
     }
 
@@ -98,6 +113,7 @@ impl Objet {
             Objet::Tmpfs(_) => 0,
             Objet::Monte(s, _) => 1 + s.0 as u16,
             Objet::Anonyme => u16::MAX,
+            Objet::Pidfs(_) => u16::MAX - 1,
         }
     }
 }
@@ -265,6 +281,7 @@ impl<'a, M: Monte> Vue<'a, M> {
             Objet::Tmpfs(_) => None,
             Objet::Monte(s, _) => Some((self.monte(s).peripherique(), self.monte(s).taille_de_bloc())),
             Objet::Anonyme => Some(ANONYME_PERIPHERIQUE),
+            Objet::Pidfs(_) => Some(PIDFS_PERIPHERIQUE),
         }
     }
 
@@ -273,7 +290,7 @@ impl<'a, M: Monte> Vue<'a, M> {
     pub fn contenu(&self, o: Objet) -> Option<(u32, u32)> {
         match o {
             Objet::Monte(s, n) => self.monte(s).contenu(n),
-            Objet::Tmpfs(_) | Objet::Anonyme => None,
+            Objet::Tmpfs(_) | Objet::Anonyme | Objet::Pidfs(_) => None,
         }
     }
 
@@ -283,6 +300,7 @@ impl<'a, M: Monte> Vue<'a, M> {
             Objet::Tmpfs(n) => self.fs.attributs(n),
             Objet::Monte(s, n) => self.monte(s).attributs(n),
             Objet::Anonyme => ANONYME,
+            Objet::Pidfs(n) => Attributs { numero: n as u64, ..PIDFS },
         }
     }
 
@@ -296,7 +314,7 @@ impl<'a, M: Monte> Vue<'a, M> {
                 entree(nom, numero.0 as u64, genre, suivante)
             }),
             Objet::Monte(s, n) => self.monte(s).lire_dossier(n, position, &mut entree),
-            Objet::Anonyme => Err(Erreur::ENOTDIR),
+            Objet::Anonyme | Objet::Pidfs(_) => Err(Erreur::ENOTDIR),
         }
     }
 
@@ -305,7 +323,7 @@ impl<'a, M: Monte> Vue<'a, M> {
     pub fn chemin_du_saut(&self, lien: Objet) -> Option<Texte<'_>> {
         match lien {
             Objet::Monte(s, n) => self.monte(s).chemin_du_saut(n),
-            Objet::Tmpfs(_) | Objet::Anonyme => None,
+            Objet::Tmpfs(_) | Objet::Anonyme | Objet::Pidfs(_) => None,
         }
     }
 
@@ -337,7 +355,7 @@ impl<'a, M: Monte> Vue<'a, M> {
             Objet::Tmpfs(n) if meme_efface => return self.fs.chemin_meme_efface(n),
             Objet::Tmpfs(n) => return self.fs.chemin(n),
             Objet::Monte(s, n) => (s, n),
-            Objet::Anonyme => return Err(Erreur::ENOENT),
+            Objet::Anonyme | Objet::Pidfs(_) => return Err(Erreur::ENOENT),
         };
         let m = self.monte(s);
         let mut chemin = self.fs.chemin(self.point(s))?;
@@ -430,7 +448,7 @@ impl<'a, M: Monte> Vue<'a, M> {
                 Objet::Monte(s, d) => self.monte(s).refuser(qui, Interne::Temporaire { dossier: d }),
                 // Le tmpfs en sait faire : l'appelant ne vient pas ici.
                 Objet::Tmpfs(_) => Err(Erreur::EINVAL),
-                Objet::Anonyme => Err(Erreur::ENOTDIR),
+                Objet::Anonyme | Objet::Pidfs(_) => Err(Erreur::ENOTDIR),
             },
             Modification::Creer(fin, creation) => {
                 if fin.objet.is_some() || fin.dernier != Dernier::Nom {
@@ -447,7 +465,7 @@ impl<'a, M: Monte> Vue<'a, M> {
                     // touche un système monté (l'appelant ne vient pas ici).
                     // L'inode anonyme n'est pas un dossier.
                     Objet::Tmpfs(_) => Err(Erreur::EINVAL),
-                    Objet::Anonyme => Err(Erreur::ENOTDIR),
+                    Objet::Anonyme | Objet::Pidfs(_) => Err(Erreur::ENOTDIR),
                 }
             }
             Modification::Effacer(fin, rmdir) => {
@@ -484,7 +502,7 @@ impl<'a, M: Monte> Vue<'a, M> {
                 }
                 match source {
                     Objet::Monte(s, n) => self.monte(s).refuser(qui, Interne::Lier { source: n }),
-                    Objet::Tmpfs(_) | Objet::Anonyme => Err(Erreur::EINVAL),
+                    Objet::Tmpfs(_) | Objet::Anonyme | Objet::Pidfs(_) => Err(Erreur::EINVAL),
                 }
             }
             Modification::ChangerMode(o) => self.interne(qui, o, |n| Interne::ChangerMode { objet: n }),
@@ -594,7 +612,7 @@ impl<'a, M: Monte> Vue<'a, M> {
         let dans_le_tmpfs = |o: Objet| match o {
             Objet::Tmpfs(n) => Some(n),
             Objet::Monte(s, _) => Some(self.point(s)),
-            Objet::Anonyme => None,
+            Objet::Anonyme | Objet::Pidfs(_) => None,
         };
         if let (Objet::Tmpfs(d), Some(n)) = (ancien.dossier, dans_le_tmpfs(source)) {
             self.fs.peut_effacer(qui, d, n, dossier_source)?;
@@ -614,7 +632,7 @@ impl<'a, M: Monte> Vue<'a, M> {
             (Objet::Monte(s, _), Objet::Monte(_, a)) => {
                 let n = cible.and_then(|o| match o {
                     Objet::Monte(_, n) => Some(n),
-                    Objet::Tmpfs(_) | Objet::Anonyme => None,
+                    Objet::Tmpfs(_) | Objet::Anonyme | Objet::Pidfs(_) => None,
                 });
                 self.monte(s).refuser(qui, Interne::Renommer { ancien: a, nouveau: n })
             }
@@ -640,7 +658,7 @@ impl<'a, M: Monte> Vue<'a, M> {
             // par `may_setattr`, qui demande d'y écrire ou d'en être le
             // propriétaire : il est à root, en 0600 (EACCES). Tronquer ne
             // vient pas ici (pas un fichier ordinaire : EINVAL plus haut).
-            Objet::Anonyme => match m(0) {
+            Objet::Anonyme | Objet::Pidfs(_) => match m(0) {
                 Interne::ChangerTemps { maintenant: true, .. } if !qui.root() => Err(Erreur::EACCES),
                 _ => Err(Erreur::EOPNOTSUPP),
             },
@@ -685,6 +703,7 @@ impl<M: Monte> Arbre for Vue<'_, M> {
             Objet::Tmpfs(n) => self.fs.mode(n),
             Objet::Monte(s, n) => self.monte(s).attributs(n).mode,
             Objet::Anonyme => ANONYME.mode,
+            Objet::Pidfs(_) => PIDFS.mode,
         }
     }
 
@@ -696,6 +715,7 @@ impl<M: Monte> Arbre for Vue<'_, M> {
                 (a.uid, a.gid)
             }
             Objet::Anonyme => (ANONYME.uid, ANONYME.gid),
+            Objet::Pidfs(_) => (PIDFS.uid, PIDFS.gid),
         }
     }
 
@@ -703,7 +723,7 @@ impl<M: Monte> Arbre for Vue<'_, M> {
         match dossier {
             Objet::Tmpfs(d) => <Tmpfs as Arbre>::chercher(self.fs, d, nom).map(|n| self.par_dessus(n)),
             Objet::Monte(s, d) => self.monte(s).chercher(d, nom).map(|n| Objet::Monte(s, n)),
-            Objet::Anonyme => None,
+            Objet::Anonyme | Objet::Pidfs(_) => None,
         }
     }
 
@@ -714,7 +734,7 @@ impl<M: Monte> Arbre for Vue<'_, M> {
                 self.par_dessus(<Tmpfs as Arbre>::parent(self.fs, self.point(s)))
             }
             Objet::Monte(s, d) => Objet::Monte(s, self.monte(s).parent(d)),
-            Objet::Anonyme => Objet::Anonyme,
+            o @ (Objet::Anonyme | Objet::Pidfs(_)) => o,
         }
     }
 
@@ -722,28 +742,28 @@ impl<M: Monte> Arbre for Vue<'_, M> {
         match lien {
             Objet::Tmpfs(n) => <Tmpfs as Arbre>::cible(self.fs, n),
             Objet::Monte(s, n) => self.monte(s).cible(n, self.lecteur, self.fil),
-            Objet::Anonyme => Texte::Emprunte(&[]),
+            Objet::Anonyme | Objet::Pidfs(_) => Texte::Emprunte(&[]),
         }
     }
 
     fn saut(&self, lien: Objet) -> Option<Objet> {
         match lien {
             Objet::Monte(s, n) => self.monte(s).saut(n),
-            Objet::Tmpfs(_) | Objet::Anonyme => None,
+            Objet::Tmpfs(_) | Objet::Anonyme | Objet::Pidfs(_) => None,
         }
     }
 
     fn traverser(&self, dossier: Objet) -> Result<(), Erreur> {
         match dossier {
             Objet::Monte(s, n) => self.monte(s).traverser(n),
-            Objet::Tmpfs(_) | Objet::Anonyme => Ok(()),
+            Objet::Tmpfs(_) | Objet::Anonyme | Objet::Pidfs(_) => Ok(()),
         }
     }
 
     fn permis_en_plus(&self, o: Objet, masque: u32) -> bool {
         match o {
             Objet::Monte(s, n) => self.monte(s).permis_en_plus(n, masque),
-            Objet::Tmpfs(_) | Objet::Anonyme => false,
+            Objet::Tmpfs(_) | Objet::Anonyme | Objet::Pidfs(_) => false,
         }
     }
 }
@@ -908,6 +928,9 @@ mod tests {
         assert_eq!(vue.peripherique(Objet::Tmpfs(fs.racine())), None);
         assert_eq!(vue.attributs(Objet::Anonyme).mode, 0o600);
         assert!(!est_dossier(&vue, Objet::Anonyme));
+        let a = vue.attributs(Objet::Pidfs(42));
+        assert_eq!((a.numero, a.mode, a.nlink, a.uid, a.gid), (42, 0o700, 1, 0, 0));
+        assert!(!est_dossier(&vue, Objet::Pidfs(42)));
         assert!(est_dossier(&vue, Objet::Monte(p, 1)));
         let mut noms = vec![];
         vue.lire_dossier(Objet::Monte(p, 0), 0, |nom, _, _, _| {
@@ -985,6 +1008,9 @@ mod tests {
         assert_eq!(refus(&fs, DAVID, Modification::ChangerTemps(Objet::Anonyme, true)), Erreur::EACCES);
         assert_eq!(refus(&fs, Identite::ROOT, Modification::ChangerTemps(Objet::Anonyme, true)), Erreur::EOPNOTSUPP);
         assert_eq!(refus(&fs, DAVID, Modification::ChangerTemps(Objet::Anonyme, false)), Erreur::EOPNOTSUPP);
+        // L'inode de pidfs, de même (`pidfs_setattr` : `anon_inode_setattr`).
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerMode(Objet::Pidfs(42))), Erreur::EOPNOTSUPP);
+        assert_eq!(refus(&fs, DAVID, Modification::ChangerTemps(Objet::Pidfs(42), true)), Erreur::EACCES);
         assert_eq!(refus(&fs, DAVID, Modification::Lier(Objet::Anonyme, &tmp)), Erreur::EXDEV);
         assert_eq!(refus(&fs, DAVID, Modification::Tronquer(Objet::Anonyme)), Erreur::EINVAL);
         // Tronquer un dossier monté : EISDIR, avant le système.
@@ -1041,6 +1067,8 @@ mod tests {
             let vue = Vue { fs: &fs, montes: &montes, lecteur: b"42", fil: b"42/task/42" };
             assert_eq!(vue.lire_dossier(Objet::Anonyme, 0, |_, _, _, _| true), Err(Erreur::ENOTDIR));
             assert_eq!(vue.peripherique(Objet::Anonyme), Some(ANONYME_PERIPHERIQUE));
+            assert_eq!(vue.peripherique(Objet::Pidfs(7)), Some(PIDFS_PERIPHERIQUE));
+            assert_eq!(vue.lire_dossier(Objet::Pidfs(7), 0, |_, _, _, _| true), Err(Erreur::ENOTDIR));
         }
         // en_tmpfs : seulement ce qui est entièrement dans le tmpfs.
         assert!(dans_le_tmpfs(&fin(&fs, DAVID, b"/tmp/x")) && !dans_le_tmpfs(&fin(&fs, DAVID, b"/proc")));

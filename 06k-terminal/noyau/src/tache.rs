@@ -1537,6 +1537,9 @@ pub struct NouveauFil {
     pub ecrire_tid: u64,
     pub effacer_tid: u64,
     pub parent_tid: u64,
+    /// CLONE_PIDFD : où écrire le numéro du pidfd du fil (une adresse nulle
+    /// est une faute, EFAULT, comme chez Linux).
+    pub pidfd: Option<u64>,
 }
 
 /// Lance un fil neuf du processus de la tâche courante, dans l'ordre du
@@ -1544,7 +1547,9 @@ pub struct NouveauFil {
 /// créateur (ENOMEM), une pile noyau (EAGAIN : le maximum de fils,
 /// max_threads) et la tâche (ENOMEM), sa place dans le processus, sous son verrou, à condition
 /// que le créateur ne soit pas en train de finir (EINTR, tout est défait :
-/// « Let kill terminate clone/fork in the middle ») ; puis son numéro écrit
+/// « Let kill terminate clone/fork in the middle »), précédée de son pidfd
+/// s'il en demande un (CLONE_PIDFD : EMFILE, ENOMEM, EFAULT ; installé
+/// seulement une fois le fil dans son processus) ; puis son numéro écrit
 /// à CLONE_PARENT_SETTID AVANT qu'il soit prêt (un fil qui finirait aussitôt
 /// effacerait sinon son numéro avant que son créateur ne l'écrive, et
 /// `pthread_join` attendrait pour toujours ; une faute est ignorée, comme
@@ -1578,10 +1583,19 @@ pub fn lancer_fil(n: NouveauFil) -> Result<u32, i64> {
     // jamais : execve, 6l, effacera ce drapeau).
     t.poser_drapeaux(PF_FORKNOEXEC);
     t.preparer(premier_depart, 0, Some(n.cadre));
+    // Son pidfd, préparé avant qu'il rejoigne son processus, et abandonné
+    // (son numéro libéré) s'il ne le rejoint pas, comme `copy_process`.
+    let pidfd = match n.pidfd {
+        Some(adresse) => Some(crate::pidfd::pour_fil_neuf(&processus, &t, adresse)?),
+        None => None,
+    };
     processus.attacher_fil(&t, createur).map_err(|r| match r {
         processus::RefusFil::Interrompu => -EINTR,
         processus::RefusFil::PlusDeMemoire => -ENOMEM,
     })?;
+    if let Some(p) = pidfd {
+        p.installer(true);
+    }
     if n.parent_tid != 0 {
         let _ = crate::copie_utilisateur::copier_vers_utilisateur(n.parent_tid, &tid.to_le_bytes());
     }
@@ -1770,7 +1784,6 @@ pub fn terminer(code: i32) -> ! {
     // écrit avant, son statut de sortie et le compte du rendeur compris.
     t.poser_drapeaux(PF_NOFREEZE);
     t.etat.store(etat::MORTE, Ordering::Relaxed);
-    t.morte.store(true, Ordering::Release);
     // Une référence à elle-même, pour la fin de bascule qui rendra sa pile,
     // sur ce processeur.
     processeur::courant().a_rendre.store(Arc::into_raw(courante_arc()) as *mut Tache, Ordering::Relaxed);
@@ -1779,6 +1792,14 @@ pub fn terminer(code: i32) -> ! {
         if let Some(i) = toutes.iter().position(|x| core::ptr::eq(Arc::as_ptr(x), t)) {
             toutes.swap_remove(i);
         }
+        // `morte` sous le verrou de TOUTES, juste après son retrait : qui la
+        // voit morte (le POLLHUP d'un pidfd) ne la trouve plus par son numéro
+        // (ESRCH pour un signal, pour pidfd_open), et qui ne la trouve plus la
+        // voit morte, comme chez Linux, où l'un et l'autre lisent `pid_task`,
+        // effacé en un seul point (`__unhash_process`). Écarté : `morte` avant
+        // le retrait : entre les deux, un pidfd disait POLLHUP pendant qu'un
+        // signal par lui était accepté, et perdu.
+        t.morte.store(true, Ordering::Release);
     }
     // Sa créatrice, qui attend peut-être sa fin, ou celle de l'une de ses
     // tâches.
@@ -1961,7 +1982,7 @@ pub fn a_sa_memoire(tid: u32) -> bool {
     oui
 }
 
-/// La tâche du fil `tid`, s'il vit (/proc/<tid>/stat et status).
+/// La tâche du fil `tid`, s'il vit (/proc/<tid>/stat et status, pidfd_open).
 pub fn trouver(tid: u32) -> Option<Arc<Tache>> {
     if tid == 0 {
         return None;

@@ -1514,7 +1514,7 @@ pub fn sigaltstack(nouvelle: u64, ancienne: u64, sp: u64) -> i64 {
 /// dort interruptible (le `signal_wake_up` de Linux) : son appel rend
 /// EINTR ou sera refait (reprise.rs), et le signal est livré à son retour
 /// vers l'anneau 3.
-fn envoyer_a(pid: u32, sig: u64, a: Destinataire, info: Info) -> i64 {
+pub fn envoyer_a(pid: u32, sig: u64, a: Destinataire, info: Info) -> i64 {
     if !processus::existe(pid) {
         return -ESRCH;
     }
@@ -1572,8 +1572,9 @@ pub fn du_proprietaire(pid: u32, a: Destinataire, sig: u64, info: Info, uid: u32
 }
 
 /// Le siginfo d'un envoi par un programme (kill : SI_USER, tkill et tgkill :
-/// SI_TKILL), de la part du processus courant.
-fn info_de_soi(sig: u64, code: i32) -> Info {
+/// SI_TKILL ; pidfd_send_signal, l'un ou l'autre), de la part du processus
+/// courant.
+pub fn info_de_soi(sig: u64, code: i32) -> Info {
     let (pid, uid) = processus::avec(|p| (p.pid, p.identite.uid));
     Info::par(sig, code, pid, uid)
 }
@@ -1655,7 +1656,7 @@ pub fn tgkill(tgid: u64, tid: u64, sig: u64) -> i64 {
 /// (dont le numéro est celui du processus), le processus lui-même, zombie
 /// ou dont d'autres fils vivent encore (Linux garde la tâche du fil
 /// principal jusqu'à la fin du groupe) : le signal ne va alors à personne.
-fn au_fil(tgid: Option<i32>, tid: i32, sig: u64, info: Info) -> i64 {
+pub fn au_fil(tgid: Option<i32>, tid: i32, sig: u64, info: Info) -> i64 {
     let tid = tid as u32;
     let pid = tache::processus_du_fil(tid).unwrap_or(tid);
     if tgid.is_some_and(|t| t as u32 != pid) {
@@ -1664,18 +1665,23 @@ fn au_fil(tgid: Option<i32>, tid: i32, sig: u64, info: Info) -> i64 {
     envoyer_a(pid, sig as u32 as u64, Destinataire::Fil(tid), info)
 }
 
-/// Lit le siginfo qu'un programme veut envoyer (`__copy_siginfo_from_user`) :
-/// les 48 octets que garde le noyau (EFAULT), si_signo remplacé par `sig` ;
-/// pour un si_code dont le noyau ne connaît pas la disposition, le reste
-/// des 128 octets doit être nul (E2BIG : le noyau ne le garderait pas, et
-/// le destinataire ne recevrait pas ce qui a été envoyé ;
-/// `known_siginfo_layout`).
-fn lire_info(sig: u64, adresse: u64) -> Result<Info, i64> {
+/// Lit le siginfo qu'un programme veut envoyer : les 48 octets que garde le
+/// noyau (EFAULT), son si_signo remplacé par `signal` s'il est donné
+/// (rt_sigqueueinfo : `__copy_siginfo_from_user`), gardé sinon
+/// (pidfd_send_signal : `copy_siginfo_from_user`, qui le compare ensuite au
+/// signal) ; pour un si_code dont le noyau ne connaît pas la disposition
+/// avec ce si_signo, le reste des 128 octets doit être nul (E2BIG : le noyau
+/// ne le garderait pas, et le destinataire ne recevrait pas ce qui a été
+/// envoyé ; `known_siginfo_layout`).
+pub fn lire_info(signal: Option<u64>, adresse: u64) -> Result<Info, i64> {
     let mut o = [0u8; 128];
     copier_depuis_utilisateur(&mut o[..48], adresse).map_err(|_| -EFAULT)?;
     let mut i = Info { octets: [0; 48], prealloue: None };
     i.octets.copy_from_slice(&o[..48]);
-    i.octets[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
+    if let Some(sig) = signal {
+        i.octets[0..4].copy_from_slice(&(sig as i32).to_le_bytes());
+    }
+    let sig = i.signal();
     let code = i.code();
     // Les si_code propres à un signal (une faute, SIGCHLD, SIGPOLL, SIGSYS),
     // jusqu'à leur nombre ; pour les autres, ceux de SIGPOLL (NSIGPOLL).
@@ -1701,7 +1707,7 @@ fn lire_info(sig: u64, adresse: u64) -> Result<Info, i64> {
 /// l'envoi, comme kill d'un pid positif (ESRCH, EINVAL).
 pub fn rt_sigqueueinfo(pid: u64, sig: u64, uinfo: u64) -> i64 {
     let (pid, sig) = (pid as u32 as i32, sig as u32 as u64);
-    let info = match lire_info(sig, uinfo) {
+    let info = match lire_info(Some(sig), uinfo) {
         Ok(i) => i,
         Err(e) => return e,
     };
@@ -1726,7 +1732,7 @@ pub fn rt_sigqueueinfo(pid: u64, sig: u64, uinfo: u64) -> i64 {
 /// le reste ; puis l'EPERM de rt_sigqueueinfo, vis-à-vis du fil).
 pub fn rt_tgsigqueueinfo(tgid: u64, tid: u64, sig: u64, uinfo: u64) -> i64 {
     let (tgid, tid, sig) = (tgid as u32 as i32, tid as u32 as i32, sig as u32 as u64);
-    let info = match lire_info(sig, uinfo) {
+    let info = match lire_info(Some(sig), uinfo) {
         Ok(i) => i,
         Err(e) => return e,
     };

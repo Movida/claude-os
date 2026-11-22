@@ -229,6 +229,14 @@ impl FichierTenu {
         }
     }
 
+    /// Le pidfd d'un fichier de sorte PidFd.
+    pub fn pidfd(&self) -> &crate::pidfd::PidFd {
+        match &self.prive {
+            Prive::PidFd(p) => p,
+            _ => unreachable!("un pidfd sans processus"),
+        }
+    }
+
     /// Le tube d'un bout de tube.
     pub fn tube(&self) -> &crate::tube::Tube {
         match &self.prive {
@@ -292,6 +300,17 @@ pub fn tenir(fd: u64) -> Result<FichierTenu, i64> {
         Some(o)
     })
     .ok_or(-EBADF)
+}
+
+/// Tient le fichier ouvert du descripteur `fd` du processus `pid`
+/// (pidfd_getfd, le `fget_task` de Linux), comme `tenir` le fait pour le
+/// processus courant : None s'il n'est pas ouvert, ou si le processus n'a
+/// plus de descripteurs (fini).
+pub fn tenir_du_processus(pid: u32, fd: u64) -> Option<FichierTenu> {
+    vfs::avec_systeme(|s, _| {
+        let f = processus::descripteur(pid, fd)?;
+        Some(tenir_ouvert(s, f))
+    })
 }
 
 /// Tient le fichier ouvert `f`, sous le verrou des fichiers : un élément
@@ -643,7 +662,20 @@ fn objet(dirfd: u64, chemin: &[u8], suivre: bool, vide_permis: bool) -> Result<O
 /// Ce que dit `stat` de l'objet `o`, dans la vue (le processus en cours,
 /// ou le noyau).
 pub fn attributs(o: Objet) -> Attributs {
-    vfs::avec_systeme(|s, _| s.avec_vue(0, |vue| vue.attributs(o)))
+    dater(o, vfs::avec_systeme(|s, _| s.avec_vue(0, |vue| vue.attributs(o))))
+}
+
+/// Les dates d'un inode de pidfs, celles de sa création, que tient le noyau
+/// (pidfd.rs), mises dans ses attributs `a` : la bibliothèque des systèmes de
+/// fichiers n'en sait rien. Prend le verrou de pidfd.rs (`INODES`, le dernier
+/// de l'ordre) : sous le verrou des fichiers ou hors de lui.
+pub fn dater(o: Objet, mut a: Attributs) -> Attributs {
+    let date = match o {
+        Objet::Pidfs(n) => crate::pidfd::date(n),
+        _ => return a,
+    };
+    (a.atime, a.mtime, a.ctime) = (date, date, date);
+    a
 }
 
 /// `qui` a-t-il les droits `masque` sur l'objet `o` : ceux de son mode, ou
@@ -1327,6 +1359,54 @@ pub fn installer_reserve_puis(fd: NumeroReserve, f: FichierOuvert, fermer_a_l_ex
     Ok(fd.installer(fichier, fermer_a_l_exec))
 }
 
+/// Un fichier ouvert neuf rangé dans la table, avec un numéro réservé, mais
+/// pas encore installé : le `get_unused_fd` puis l'allocation du fichier
+/// de `pidfd_prepare` (CLONE_PIDFD), dont `copy_process` n'installe le
+/// descripteur qu'une fois le reste réussi (`fd_install`) : `installer`.
+/// Abandonné (sa garde rendue), le fichier est lâché et le numéro libéré.
+/// Le fichier est déjà dans la table : l'installer ne peut plus échouer.
+pub struct Prepare {
+    numero: Option<NumeroReserve>,
+    fichier: Fichier,
+}
+
+impl Prepare {
+    /// Le numéro qu'aura le descripteur.
+    pub fn numero(&self) -> u64 {
+        self.numero.as_ref().map_or(0, |n| n.0)
+    }
+
+    /// Installe le descripteur, avec FD_CLOEXEC si demandé : son numéro.
+    pub fn installer(mut self, fermer_a_l_exec: bool) -> u64 {
+        let numero = self.numero.take().expect("un descripteur prepare deux fois installe");
+        numero.installer(self.fichier, fermer_a_l_exec)
+    }
+}
+
+impl Drop for Prepare {
+    /// Jamais sous un verrou.
+    fn drop(&mut self) {
+        if self.numero.is_some() {
+            vfs::avec_systeme(|s, cadres| s.lacher(self.fichier, cadres));
+        }
+    }
+}
+
+/// Range le fichier ouvert neuf `f` dans la table (ENOMEM), au numéro déjà
+/// réservé (`reserver` : EMFILE), sans l'installer (`Prepare`). Le numéro
+/// est réservé AVANT que le fichier soit fait, comme dans `pidfd_prepare`
+/// (`get_unused_fd`, puis `pidfs_alloc_file`) : sans numéro ni mémoire,
+/// EMFILE. En cas d'échec, le fichier est rendu, et le numéro libéré.
+pub fn preparer_fichier(numero: NumeroReserve, f: FichierOuvert) -> Result<Prepare, i64> {
+    match vfs::avec_systeme(|s, _| s.ouverts.ajouter(f)) {
+        Ok(fichier) => Ok(Prepare { numero: Some(numero), fichier }),
+        Err(f) => {
+            rendre_fichier(f);
+            Err(-ENOMEM)
+        }
+    }
+}
+
 /// Un fichier ouvert neuf qui n'entrera pas dans la table : il rend son
 /// inode s'il en tient un du tmpfs (celui d'une socket, 6g). Son objet du
 /// noyau, lui, est à l'appelant (une socket se ferme comme à son dernier
@@ -1587,12 +1667,13 @@ fn verifier_transfert(tampon: u64, longueur: u64, position: u64) -> Result<u64, 
 fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u64, rwf: u64) -> Result<u64, i64> {
     // Un fichier sans position (un tube, une socket, un terminal, un
     // eventfd...) : pread rend ESPIPE avant tout (FMODE_PREAD n'est pas mis,
-    // `ksys_pread64`) ; un epoll ne se lit pas (pas d'opération read :
-    // EINVAL, avant de regarder le tampon).
+    // `ksys_pread64`) ; un epoll et un pidfd ne se lisent pas (pas
+    // d'opération read : EINVAL, avant de regarder le tampon ; un pidfd
+    // garde FMODE_PREAD, pread y rend EINVAL aussi).
     if position.is_some() && !a_des_positions(o) {
         return Err(-ESPIPE);
     }
-    if o.sorte == Sorte::Epoll {
+    if matches!(o.sorte, Sorte::Epoll | Sorte::PidFd) {
         return Err(-EINVAL);
     }
     if !o.lecture {
@@ -1636,7 +1717,7 @@ fn lire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: u6
         Sorte::SignalFd => crate::signalfd::lire_morceaux(o, &[(tampon, longueur)], non_bloquant),
         Sorte::Tube => en_resultat(o.tube().lire(&[(tampon, longueur)], non_bloquant)),
         Sorte::Socket => en_resultat(crate::appels_reseau::lire(o, &[(tampon, longueur)], rwf & RWF_NOWAIT != 0)),
-        Sorte::Epoll => Err(-EINVAL),
+        Sorte::Epoll | Sorte::PidFd => Err(-EINVAL),
         Sorte::Noyau { .. } => {
             let contenu = procfs::lire(o.fichier(), ici, longueur)?;
             let copies = copier_vers_utilisateur_partiel(tampon, &contenu) as u64;
@@ -1747,7 +1828,7 @@ fn ecrire_ouvert(o: &FichierTenu, position: Option<u64>, tampon: u64, longueur: 
         Sorte::Dossier | Sorte::Chemin | Sorte::Inotify => Err(-EBADF),
         Sorte::EventFd => evenements::ecrire(o.eventfd(), non_bloquant, tampon, longueur),
         // Pas d'opération write (FMODE_CAN_WRITE manque) : EINVAL.
-        Sorte::TimerFd | Sorte::SignalFd => Err(-EINVAL),
+        Sorte::TimerFd | Sorte::SignalFd | Sorte::PidFd => Err(-EINVAL),
         Sorte::Tube => en_resultat(o.tube().ecrire(&[(tampon, longueur)], non_bloquant, o.drapeaux as u64 & O_DIRECT != 0,
                                                rwf & RWF_NOSIGNAL != 0)),
         Sorte::Socket => en_resultat(crate::appels_reseau::ecrire(o, &[(tampon, longueur)], rwf & RWF_NOWAIT != 0,
@@ -1930,11 +2011,11 @@ enum Operation {
 /// `generic_read_dir` (EISDIR), une instance d'inotify et les fichiers de
 /// /proc faits par `seq_read` (procfs::par_iter) par `read` ; /dev/full et
 /// un eventfd s'écrivent par `write` (ils se lisent par `read_iter`). Un
-/// epoll ne se lit ni ne s'écrit ; un timerfd et un signalfd ne s'écrivent
-/// pas.
+/// epoll et un pidfd ne se lisent ni ne s'écrivent ; un timerfd et un
+/// signalfd ne s'écrivent pas.
 fn operation(o: &FichierTenu, ecrire: bool) -> Operation {
     match (o.sorte, ecrire) {
-        (Sorte::Epoll, _) | (Sorte::TimerFd | Sorte::SignalFd, true) => Operation::Aucune,
+        (Sorte::Epoll | Sorte::PidFd, _) | (Sorte::TimerFd | Sorte::SignalFd, true) => Operation::Aucune,
         (Sorte::Dossier | Sorte::Inotify, false) | (Sorte::Plein | Sorte::EventFd, true) => Operation::Boucle,
         (Sorte::Noyau { .. }, _) if !procfs::par_iter(o.fichier()) => Operation::Boucle,
         _ => Operation::Iter,
@@ -2187,7 +2268,7 @@ pub fn lseek(fd: u64, decalage: u64, depuis: u64) -> i64 {
     let position = o.position();
     let nouvelle = match (o.sorte, depuis) {
         (Sorte::Chemin, _) => return -EBADF,
-        (Sorte::Console | Sorte::Tube | Sorte::Socket, _) => return -ESPIPE,
+        (Sorte::Console | Sorte::Tube | Sorte::Socket | Sorte::PidFd, _) => return -ESPIPE,
         (Sorte::Null | Sorte::Zero | Sorte::Plein | Sorte::Aleatoire { .. }, _) => return 0,
         // Ni position ni taille : `noop_llseek`, qui rend la position, nulle.
         (Sorte::EventFd | Sorte::Epoll | Sorte::Inotify | Sorte::TimerFd | Sorte::SignalFd, _) => return position as i64,
@@ -2824,6 +2905,7 @@ pub fn ioctl(fd: u64, requete: u64, argument: u64) -> i64 {
         _ if o.sorte == Sorte::Socket => crate::appels_reseau::ioctl(&o, requete as u32 as u64, argument),
         _ if o.sorte == Sorte::Inotify => surveillance::ioctl(o.inotify().expect("une instance"), requete as u32 as u64, argument),
         _ if o.sorte == Sorte::TimerFd => crate::timerfd::ioctl(&o, requete as u32 as u64, argument),
+        _ if o.sorte == Sorte::PidFd => crate::pidfd::ioctl(&o, requete as u32 as u64, argument),
         _ if matches!(o.sorte, Sorte::Aleatoire { .. }) => ioctl_aleatoire(requete as u32 as u64, argument),
         _ => -ENOTTY,
     }
@@ -3601,6 +3683,13 @@ pub fn ftruncate(fd: u64, taille: u64) -> i64 {
     if o.sorte == Sorte::Chemin {
         return -EBADF;
     }
+    // Un pidfd (ouvert en lecture et écriture) : son inode est en interne
+    // un fichier ordinaire (S_IFREG, montré sans type par
+    // `anon_inode_getattr`), qui passe le test de `do_ftruncate`, puis pidfs
+    // refuse de le changer (`anon_inode_setattr` : EOPNOTSUPP, mesuré).
+    if o.sorte == Sorte::PidFd {
+        return -EOPNOTSUPP;
+    }
     if o.sorte != Sorte::Fichier || !o.ecriture {
         return -EINVAL;
     }
@@ -3949,9 +4038,10 @@ fn ecrit_a_une_position(o: &FichierTenu) -> bool {
 /// Le fichier se positionne (FMODE_LSEEK, que `splice_direct_to_actor`
 /// demande à l'entrée d'un transfert qui ne va pas vers un tube, même de 0
 /// octet) : tout ce qui a un llseek, `noop_llseek` compris (un eventfd, un
-/// epoll, inotify : mesuré) ; pas un tube, une socket, la console.
+/// epoll, inotify : mesuré) ; pas un tube, une socket, la console, un
+/// pidfd (pidfs n'en a pas : lseek y rend ESPIPE, mesuré).
 fn se_positionne(o: &FichierTenu) -> bool {
-    !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console)
+    !matches!(o.sorte, Sorte::Tube | Sorte::Socket | Sorte::Console | Sorte::PidFd)
 }
 
 /// L'entrée a un `splice_read` : un fichier ordinaire (ses pages),

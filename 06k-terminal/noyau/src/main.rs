@@ -165,6 +165,7 @@ mod signaux;
 mod sondage;
 mod surveillance;
 mod sysfs;
+mod pidfd;
 mod signalfd;
 mod timerfd;
 mod tube;

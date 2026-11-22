@@ -202,6 +202,9 @@ const TIMERFD_GETTIME: u64 = 287;
 // signalfd (les soldes d'avant 6k, signalfd.rs).
 const SIGNALFD: u64 = 282;
 const SIGNALFD4: u64 = 289;
+const PIDFD_SEND_SIGNAL: u64 = 424;
+const PIDFD_OPEN: u64 = 434;
+const PIDFD_GETFD: u64 = 438;
 // inotify (6i, surveillance.rs).
 const INOTIFY_INIT: u64 = 253;
 const INOTIFY_ADD_WATCH: u64 = 254;
@@ -352,6 +355,9 @@ pub fn appel(numero: u64, a: [u64; 6], cadre: &mut Cadre) -> i64 {
         TIMERFD_GETTIME => crate::timerfd::timerfd_gettime(a[0], a[1]),
         SIGNALFD => crate::signalfd::signalfd(a[0], a[1], a[2]),
         SIGNALFD4 => crate::signalfd::signalfd4(a[0], a[1], a[2], a[3]),
+        PIDFD_OPEN => crate::pidfd::pidfd_open(a[0], a[1]),
+        PIDFD_SEND_SIGNAL => crate::pidfd::pidfd_send_signal(a[0], a[1], a[2], a[3]),
+        PIDFD_GETFD => crate::pidfd::pidfd_getfd(a[0], a[1], a[2]),
         INOTIFY_INIT => crate::surveillance::inotify_init(),
         INOTIFY_INIT1 => crate::surveillance::inotify_init1(a[0]),
         INOTIFY_ADD_WATCH => crate::surveillance::inotify_add_watch(a[0], a[1], a[2]),
@@ -565,6 +571,9 @@ fn tracer(numero: u64, a: [u64; 6], resultat: Option<i64>) {
         TIMERFD_GETTIME => ("timerfd_gettime", 2),
         SIGNALFD => ("signalfd", 3),
         SIGNALFD4 => ("signalfd4", 4),
+        PIDFD_OPEN => ("pidfd_open", 2),
+        PIDFD_SEND_SIGNAL => ("pidfd_send_signal", 4),
+        PIDFD_GETFD => ("pidfd_getfd", 3),
         INOTIFY_INIT => ("inotify_init", 0),
         INOTIFY_INIT1 => ("inotify_init1", 1),
         INOTIFY_ADD_WATCH => ("inotify_add_watch", 3),
@@ -1400,6 +1409,8 @@ fn getcpu(processeur: u64, noeud: u64) -> i64 {
 ///     claude --version, qui continue sans) ; il faudrait un nom par zone
 ///     dans zones/, comparé à chaque fusion : utile au débogage, pas à
 ///     claude.
+///   - PR_SET_PTRACER (Yama : qui peut accéder au processus comme un
+///     traceur ; pidfd.rs, que suit pidfd_getfd).
 /// Le reste : EINVAL, comme Linux pour une option qu'il ne connaît pas, et
 /// un message.
 fn prctl(option: u64, argument: u64) -> i64 {
@@ -1429,6 +1440,7 @@ fn prctl(option: u64, argument: u64) -> i64 {
             }
         }
         PR_SET_VMA => -EINVAL,
+        crate::pidfd::PR_SET_PTRACER => crate::pidfd::pr_set_ptracer(argument),
         o => {
             afficherln!("[noyau] prctl : option {:#x} pas prise en charge", o);
             -EINVAL

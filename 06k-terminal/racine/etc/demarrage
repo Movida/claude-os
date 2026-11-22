@@ -136,6 +136,12 @@ wait
 /bin/verrous /tmp a &
 /bin/verrous /tmp b
 wait
+# Les pidfd (le lot 6 des soldes) : dans un processus ; puis deux, ensemble
+# (pidfd_getfd refusé par Yama, puis permis par PR_SET_PTRACER).
+/bin/pidfd /tmp
+/bin/pidfd /tmp a &
+/bin/pidfd /tmp b
+wait
 # inotify (6i) : chaque événement, dans l'ordre de Linux. Puis, vus par un
 # guetteur lancé avant eux (et le temps de poser sa surveillance), en
 # O_ASYNC (SIGIO) : un programme lancé par le lanceur ; un fichier lu par un
