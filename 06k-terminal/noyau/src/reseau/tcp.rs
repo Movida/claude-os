@@ -1353,8 +1353,7 @@ impl Partie {
         if dans_la_table
             && let Some(t) = TABLE.verrouiller().as_mut()
         {
-            // Le port de `bind` n'a jamais été rendu (une fille d'une écoute à port nommé : l'écoute
-            // le tient aussi, ce qui ne se heurte pas).
+            // Le port de `bind` n'a jamais été rendu (une fille n'en a pas : voir `accepter`).
             if a.port_choisi {
                 t.redevenir_liee(self.numero, a.adresse);
             } else {
@@ -3214,9 +3213,13 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             SOCKETS.fetch_add(1, Ordering::Relaxed);
             let partie = Partie {
                 numero, mode: Mode::Connexion(tcb),
-                // Comme ses verrous de `bind` (`sk_userlocks`, recopié) : déconnectée, elle redevient
-                // ce qu'était son écoute, liée à son port si `bind` l'a nommé.
-                adresses: Adresses { lie: true, port, distante, port_distant, source: locale, ..p.adresses },
+                // Ses verrous de `bind` sont ceux de son écoute (`sk_userlocks`, recopié), sauf
+                // celui du port (`sk_clone_lock` : `& ~SOCK_BINDPORT_LOCK`) : déconnectée (AF_UNSPEC,
+                // un RST, la fin), elle garde l'adresse que `bind` a nommée, mais rend le port,
+                // que l'écoute tient (mesuré : l'écoute fermée, un `bind` de ce port est permis,
+                // la fille ouverte). Écarté : le lui laisser tenir : un serveur relancé ne
+                // retrouverait pas son port tant qu'une connexion finie garde son descripteur.
+                adresses: Adresses { lie: true, port, distante, port_distant, source: locale, port_choisi: false, ..p.adresses },
                 identifiant: f.identifiant, orpheline: false, hors_table,
                 // Celles de son écoute à sa naissance (`Heritage`, `Fille::naitre`).
                 options: OptionsTcp { rythme_interne, ..h.tcp },

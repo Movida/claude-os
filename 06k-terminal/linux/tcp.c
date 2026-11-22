@@ -2258,7 +2258,10 @@ static void arret_d_ecoute(void)
     verifier(connect(c, (void *)&x, sizeof x) < 0 && errno == ECONNREFUSED, "connect(AF_UNSPEC) d'une ecoute : un client est refuse");
     close(c);
     close(l);
-    /* Un port nommé par bind reste à elle, et avec lui une fille : déconnectées, liées. */
+    /* Un port nommé par bind reste à elle ; pas à ses filles, que `sk_clone_lock` ne lie pas
+     * au port (SOCK_BINDPORT_LOCK n'est pas recopié) : déconnectée, par AF_UNSPEC ou par un
+     * RST, une fille le rend (getsockname le montre encore) ; l'écoute fermée, il est libre,
+     * même les filles ouvertes. */
     l = ecoute(&port, 4);
     close(l);
     l = ecoute_sur(port, 0);
@@ -2266,12 +2269,20 @@ static void arret_d_ecoute(void)
         shutdown(l, SHUT_RD);
         listen(l, 4);
         verifier(port_de(l) == port, "une ecoute a un port nomme, SHUT_RD : elle le garde");
-        int cf, ff;
-        paire_sur(l, port, &cf, &ff);
-        verifier(connect(ff, &u, sizeof u) == 0 && port_de(ff) == port, "sa fille, AF_UNSPEC : le port de bind reste");
-        close(cf);
-        close(ff);
+        int cf[2], ff[2];
+        paire_sur(l, port, &cf[0], &ff[0]);
+        paire_sur(l, port, &cf[1], &ff[1]);
+        verifier(connect(ff[0], &u, sizeof u) == 0 && port_de(ff[0]) == port, "sa fille, AF_UNSPEC : getsockname montre son port");
+        couper(cf[1]);
+        attendre_ms(40);
+        close(cf[0]);
         close(l);
+        int n = ecoute_sur(port, 0);
+        verifier(etat_de(ff[1]) == TCP_CLOSE && n >= 0,
+                 "ses filles, deconnectees par AF_UNSPEC et par un RST : l'ecoute fermee, le port est libre");
+        close(n);
+        close(ff[0]);
+        close(ff[1]);
     }
     /* Une connexion établie : RST, l'erreur reste à lire. */
     int f;
