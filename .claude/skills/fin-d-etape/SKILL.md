@@ -864,3 +864,98 @@ sinon, de nouveaux commits de correction. Mêmes étapes que A, avec en plus :
   Linux), et attendu.txt, qui veut « TSC affine », a échoué. Le noyau a
   raison, et l'attendu aussi sur une vraie machine et dans la CI : relancer
   le commit seul.
+
+## Pièges rencontrés au lot 6 des soldes (22 novembre 2026)
+
+- **Un `edit` qui conflicte ne s'arrête toujours qu'une fois** (le piège
+  de 6g, revu) : préparer les arrêts du rebase en sachant lesquels auront
+  un conflit, et y faire la correction voulue à l'arrêt du conflit.
+- **Une correction faite à un arrêt se propage en silence** dans les
+  commits suivants quand ils ne touchent pas ses lignes : un changement
+  voulu pour un seul commit (rétablir la forme qu'avait un commit à son
+  origine) devient celui de toute la suite. Après chaque arrêt, comparer
+  le fichier du commit suivant à son origine (`diff <(git show
+  <commit d'origine>:f) f`) : il ne doit montrer que les fixups repliés
+  jusque-là.
+- **Une résolution « ours, puis theirs » d'un bloc** peut perdre une
+  accolade commune aux deux côtés : compiler à chaque conflit résolu
+  (clippy, les tests d'inet, les programmes C), pas seulement à la fin.
+- **Un script de contrôle qui ne s'arrête pas sur une erreur de gcc** a
+  laissé passer une fois des marqueurs de conflit dans un programme C
+  (rattrapé au suivant) : `set -e` et un `grep -rn '^<<<<<<<\|^>>>>>>>'`
+  à chaque arrêt.
+- **Un test qui lit un état de toute la machine** (la clé des horodatages,
+  `netstamp_needed_key`, que tient tout programme qui a demandé l'heure
+  de ses paquets) échoue quand un autre programme le change en même
+  temps : 3 fois sur 7 pendant que d'autres tests tournaient. Attendre
+  qu'il revienne à son état de départ (jusqu'à 30 s : le voir revenu une
+  fois suffit, tant que le test ne touche à rien pendant l'attente ; sur
+  WSL, un programme hors du conteneur tient la clé 15 s certaines fois),
+  et sauter en le disant si un autre programme le tient dès le départ.
+  Il s'ALLUME aussi en différé (5 ms au repos, jusqu'à 33 ms les cœurs
+  de l'hôte occupés : 50 ms fixes ont échoué une fois sur quatre sous la
+  charge d'une vérification à deux voies) : attendre qu'il le soit, et
+  qu'il le reste 200 ms (l'extinction différée d'un cas précédent peut le
+  montrer allumé un instant de trop), jamais un temps fixe.
+- **L'horloge murale de WSL saute** : la synchronisation avec Windows la
+  recule toutes les 30 s (0,1 s le 23/11, 1,5 s le 7/11). Un test qui
+  mesure l'âge d'une heure du noyau (toujours murale) à travers un saut
+  se trompe d'autant : voir le saut à l'écart entre la murale et la
+  monotone, et ne pas juger cet âge, en le disant. Une durée se mesure à
+  l'horloge monotone.
+- **Un port libre pour UDP ne l'est pas pour TCP** : une écoute liée au
+  port qu'une socket UDP a reçu puis rendu échoue (EADDRINUSE) quand une
+  connexion TCP en TIME_WAIT le tient (les cas précédents en laissent des
+  centaines, pour 60 s) ; listen la lie ailleurs, et l'accept attend pour
+  toujours (une fois sur douze passages). Lier l'écoute elle-même au port 0
+  de TCP. Un programme de test pendu se voit à un `timeout` qui expire,
+  pas à un ECHEC : compter les codes 124. Corriger toute la famille, pas
+  un motif : la première correction (`lier_tcp`, là où `udp_lie` précédait
+  un `bind`) en avait laissé une sous un autre nom (`rp_libre`, des
+  écoutes SO_REUSEPORT), et un port deviné (celui d'une autre socket plus
+  un) ; chercher chaque port qu'un test choisit autrement que par le
+  port 0 du protocole même qui s'y lie.
+- **Un échec rare que rien n'explique** (un passage sur 70) : guetter en
+  continu l'état partagé que le test lit, plutôt que relancer le test.
+  Au lot 6, une sonde de la clé des horodatages toutes les 20 ms, muette
+  pendant les tests de la machine (elle lit leur verrou dans
+  /proc/locks), notant l'heure et la durée de chaque période allumée et
+  les sauts de l'horloge murale, a montré en vingt secondes ce que
+  soixante-dix passages ne disaient pas : la clé tenue 15 s par un
+  programme hors du conteneur. Puis reproduire l'échec en simulant la
+  cause (une socket qui tient la clé 15 s, lancée au bon moment) : la
+  même ligne d'ECHEC et le même allongement du passage le prouvent ; la
+  correction se vérifie sous la même simulation. Piège : la forme
+  `flock FD` rend la main une fois le verrou pris, et Linux ne montre
+  pas dans /proc/locks le verrou d'un processus fini ; tenir le verrou
+  par `flock FICHIER commande`, vivant tout du long.
+- **Un scénario qui pend sans rien dire** (le NMI, une fois en cent) : le
+  rejouer en boucle, et au premier qui pend, prendre au moniteur de QEMU
+  les registres de tous les processeurs avant de l'arrêter (`info
+  registers -a`), puis symboliser chaque RIP sur l'ELF du noyau (`nm -C
+  --numeric-sort`) : au lot 6, l'un attendait dans `arreter_les_autres`,
+  deux tournaient sur le même verrou (même adresse, tickets qui se
+  suivent : le détenteur était le troisième). Pour la pile, la même idée :
+  une sonde jetable qui lit, au fond de la pile d'une tâche, les adresses
+  de retour qu'y a laissées son passage le plus profond.
+- **Une session sans réveil est détachée** : le serveur Remote Control
+  détache une session inactive (« session idle » dans son journal), et
+  une vérification lancée à part (`setsid`) ne peut plus la réveiller en
+  finissant. Toute attente se fait par une tâche de fond de la session
+  (une boucle qui guette le résumé des voies), jamais en finissant le tour
+  sans elle (24/11 : la vérification a fini à 12 h 12, vue à 19 h 45).
+- **Une attente bornée par un nombre de tours n'est pas une durée** :
+  sous QEMU sans accélération, une seconde comptée en tours en durait des
+  minutes. Mesurer le temps à une horloge qui avance interruptions
+  coupées (le TSC fiable, sinon le timer de l'APIC).
+- **Une correction d'un seul fichier, à porter dans toute la chaîne** :
+  la plomberie plutôt qu'un rebase (soldes/lot6-66 : `git merge-file` de
+  la version corrigée du commit précédent vers celle du commit, puis la
+  correction propre au commit, et `commit-tree` sur l'arbre d'origine où
+  seul ce fichier change) ; la vérification est exacte (`git diff
+  --name-only` de chaque ancien commit au nouveau ne montre que lui), et
+  aucun arrêt de rebase ne se propage en silence.
+- **Le filtre seccomp du conteneur refuse des appels récents**
+  (pidfd_getfd, comme clone3 avant) : sur l'hôte, le test les saute en
+  le disant ; c'est le Linux de référence (`programmes-sur-l-hote.sh`)
+  qui les vérifie.
