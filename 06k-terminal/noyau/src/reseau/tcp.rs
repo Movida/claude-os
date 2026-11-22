@@ -3344,12 +3344,18 @@ pub fn pair_garde(s: &Socket) -> Option<([u8; 4], u16)> {
 /// urgent (`tcp_mark_urg`) ; MSG_MORE : le dernier segment, incomplet,
 /// attend la suite (sauf quand l'envoi attend la place : ce qui est écrit
 /// part). `tx` : les drapeaux TX_* de SO_TIMESTAMPING de l'envoi (ceux de la
-/// socket, ou de son message de contrôle) ; tout envoi qui écrit demande ainsi
+/// socket, ou de son message de contrôle), ou le refus de ce message
+/// (EINVAL, EPERM), que Linux garde (`sockc_err` de `tcp_sendmsg_locked`) et
+/// ne rend qu'après l'avis de MSG_ZEROCOPY et l'attente de la connexion :
+/// pas connectée, ou l'écriture fermée, EPIPE d'abord ; établie ou
+/// CLOSE_WAIT, lui, avant toute erreur de la connexion (mesuré). Tout envoi
+/// qui écrit demande ainsi
 /// l'horodatage de son dernier octet (`Partie::demander_horodatage`) : avant
 /// d'émettre ce qu'il a écrit en dernier, ou en rendant moins que voulu
 /// (le `out:` de `tcp_sendmsg_locked` : ce qui est déjà parti ne portera la
 /// demande qu'à son renvoi). Rend ce qui a été écrit.
-pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, tx: u32, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
+pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, tx: Result<u32, i64>, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>)
+               -> Result<usize, i64> {
     const MSG_OOB: u64 = 1;
     const MSG_DONTWAIT: u64 = 0x40;
     const MSG_MORE: u64 = 0x8000;
@@ -3360,6 +3366,10 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, tx: u32, mut rem
     // L'avis de MSG_ZEROCOPY d'abord, avant même l'état de la connexion
     // (`tcp_sendmsg_locked`) ; rendu, et son numéro, si rien n'est écrit.
     let mut avis = if drapeaux & zerocopie::MSG_ZEROCOPY != 0 { g.donnee().avis_de_l_envoi(s, longueur)? } else { None };
+    let (tx, refus) = match tx {
+        Ok(tx) => (tx, None),
+        Err(e) => (0, Some(e)),
+    };
     let mut fait = 0;
     let mut demandee = false;
     {
@@ -3378,6 +3388,14 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, tx: u32, mut rem
             g.publier(|p, c| p.rafraichir(c));
             return Err(if e != 0 { -(e as i64) } else { -EPIPE });
         };
+        // Établie ou CLOSE_WAIT, la poignée de main finie (`sk_stream_wait_connect`) :
+        // le refus du message de contrôle, avant l'erreur de la connexion.
+        if let Some(e) = refus
+            && arret & socket::ARRET_ECRITURE == 0
+            && matches!(t.etat(), Etat::Etablie | Etat::AttenteFermeture)
+        {
+            return Err(e);
+        }
         // Des octets déjà pris : rendus ; l'erreur attend l'appel suivant (`do_error`).
         if t.erreur() != 0 {
             if fait > 0 {

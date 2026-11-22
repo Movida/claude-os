@@ -799,15 +799,13 @@ fn envoyer_avec(o: &FichierTenu, nom: Option<&[u8]>, longueur: usize, remplir: i
         Protocole::Udp => udp::envoyer(o.socket(), nom, longueur, drapeaux, controle, remplir),
         Protocole::Ping => ping::envoyer(o.socket(), nom, longueur, drapeaux, controle, remplir),
         // TCP : l'adresse donnée est ignorée (mesuré) ; EPIPE envoie aussi
-        // SIGPIPE, sauf MSG_NOSIGNAL (`sk_stream_error`).
+        // SIGPIPE, sauf MSG_NOSIGNAL (`sk_stream_error`). Un message de
+        // contrôle refusé ne se dit qu'une fois la connexion attendue
+        // (`tcp::envoyer`).
         Protocole::Tcp => {
-            let c = match controle {
-                Ok(c) => c,
-                Err(e) => return e,
-            };
             // Les drapeaux d'émission de SO_TIMESTAMPING : ceux du message de
             // contrôle, sinon ceux de la socket (`sockcm_init`).
-            let tx = c.horodatage.unwrap_or(o.socket().tsflags.load(Ordering::Relaxed)) & socket::SOF_TX_RECORD_MASK;
+            let tx = controle.map(|c| c.horodatage.unwrap_or(o.socket().tsflags.load(Ordering::Relaxed)) & socket::SOF_TX_RECORD_MASK);
             let r = tcp::envoyer(o.socket(), longueur, drapeaux, tx, remplir);
             if r == Err(-EPIPE) && drapeaux & MSG_NOSIGNAL == 0 {
                 crate::signaux::au_fil_courant(13);

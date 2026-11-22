@@ -132,6 +132,8 @@
  *     (SO_BINDTOIFINDEX, TCP_WINDOW_CLAMP, le MSS d'envoi) ; jamais SO_PRIORITY, ni
  *     IP_OPTIONS ; SO_RCVBUF et TCP_MAXSEG de sa naissance règlent sa fenêtre et son
  *     advmss (TCP_INFO) ; morte avant l'`accept`, elle rend sa part de la clé des heures.
+ *   - le refus d'un message de contrôle de TCP, dit après l'attente de la connexion
+ *     (pas connectée, ou l'écriture fermée : EPIPE d'abord), l'avis de MSG_ZEROCOPY rendu.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -3032,6 +3034,49 @@ static void zerocopie_tcp(void)
     verifier(ok, "MSG_ZEROCOPY : ignore par AF_UNIX et ping");
 }
 
+/* Un octet envoyé par `s` avec `drapeaux`, et SO_TIMESTAMPING de valeur `v` en
+ * message de contrôle : 0, ou l'errno. */
+static int envoyer_horodate(int s, int v, int drapeaux)
+{
+    char ctl[CMSG_SPACE(sizeof(int))];
+    memset(ctl, 0, sizeof ctl);
+    struct iovec io = {"x", 1};
+    struct msghdr m = {NULL, 0, &io, 1, ctl, sizeof ctl, 0};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET, c->cmsg_type = TSG_OLD, c->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(c), &v, sizeof v);
+    return erreur(sendmsg(s, &m, drapeaux));
+}
+
+/* TCP ne dit le refus d'un message de contrôle qu'après l'avis de MSG_ZEROCOPY et
+ * l'attente de la connexion (`tcp_sendmsg_locked` le garde, `sockc_err`) : pas
+ * connectée, ou l'écriture fermée, EPIPE (le SIGPIPE de `sk_stream_error`, sauf
+ * MSG_NOSIGNAL) ; établie ou CLOSE_WAIT, le refus ; l'avis rendu, et son numéro. */
+static void controle_tcp(void)
+{
+    const int faux = 1 << 20;
+    struct entree e[2];
+    int n = socket(AF_INET, SOCK_STREAM, 0);
+    poser(n, SO_ZEROCOPY, 1);
+    int ok = envoyer_horodate(n, faux, MSG_NOSIGNAL) == EPIPE && envoyer_horodate(n, faux, MSG_NOSIGNAL | MSG_ZEROCOPY) == EPIPE
+             && lire_entree(n, &e[0], 64) == -EAGAIN;
+    close(n);
+    int c, d;
+    tcp_connectee(&c, &d);
+    poser(c, SO_ZEROCOPY, 1);
+    ok &= envoyer_horodate(c, faux, MSG_NOSIGNAL) == EINVAL && envoyer_horodate(c, faux, MSG_NOSIGNAL | MSG_ZEROCOPY) == EINVAL
+          && send(c, "y", 1, MSG_ZEROCOPY) == 1;
+    attendre_ms(20);
+    ok &= entrees(c, e, 1) && avis_ok(&e[0], 0, 0);
+    shutdown(d, SHUT_WR);
+    attendre_ms(20);
+    ok &= envoyer_horodate(c, faux, MSG_NOSIGNAL) == EINVAL;
+    shutdown(c, SHUT_WR);
+    ok &= envoyer_horodate(c, faux, MSG_NOSIGNAL) == EPIPE;
+    close(c), close(d);
+    verifier(ok, "TCP : le refus d'un message de controle apres l'attente de la connexion (pas connectee, ecriture fermee : EPIPE ; CLOSE_WAIT, le refus) ; l'avis de MSG_ZEROCOPY rendu, et son numero");
+}
+
 /* SO_MAX_PACING_RATE dans une place de `place` octets (0xaa au-delà de ce qui est écrit) :
  * la valeur lue, la longueur rendue dans *l. */
 static uint64_t rythme_lu(int s, socklen_t place, socklen_t *l)
@@ -4400,6 +4445,7 @@ int main(void)
     zerocopie_option();
     zerocopie_udp();
     zerocopie_tcp();
+    controle_tcp();
     rythme_max();
     filtres_options();
     filtres_memoire();

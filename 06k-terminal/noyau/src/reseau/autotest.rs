@@ -139,7 +139,7 @@ fn tcp_mtu() -> Result<(), &'static str> {
     if tcp::mtu_du_chemin(&c) != Some(65_535) {
         return Err("TCP : FRAG hors du vol : rien, pas meme la route");
     }
-    tcp::envoyer(&c, 1000, 0, 0, |_, o| {
+    tcp::envoyer(&c, 1000, 0, Ok(0), |_, o| {
         o.fill(0);
         Ok(())
     }).map_err(|_| "TCP : l'envoi")?;
