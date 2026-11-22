@@ -1003,13 +1003,14 @@ impl<P: Charge> Tcb<P> {
         let debut = e.seq.wrapping_sub(self.seq_envoi) as usize;
         let h = self.entete(e.seq, e.drapeaux);
         let numero = self.compter_envoi(e.longueur() as usize);
-        self.compter_sortie(e.longueur() as usize);
+        let prevu = self.compter_sortie(e.longueur() as usize);
         sortir(Sortant { entete: h, debut, longueur: e.longueur() as usize, numero, compte: Compte::Renvoi });
         self.file[i].numero = numero;
         self.file[i].envoi = maintenant;
         self.file[i].marques = (self.file[i].marques | DEJA_RENVOYE) & !COMPTE;
         self.file[i].tx = self.debit_parti(maintenant);
         self.tri_ajouter(e.seq, maintenant);
+        self.avancer_le_depart(e.longueur() as usize, prevu);
         // L'ACK d'abord : sortir du mode rapide remet `ato` au plus bas, ce que lit le test du
         // ping-pong (`__tcp_transmit_skb`).
         self.ack_envoye();
@@ -1052,8 +1053,8 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// Les segments marqués perdus, dans la limite de la cwnd
-    /// (`tcp_xmit_retransmit_queue`) ; la tête renvoyée fait repartir le RTO.
+    /// Les segments marqués perdus, dans la limite de la cwnd et à l'heure du rythme
+    /// interne (`tcp_xmit_retransmit_queue`) ; la tête renvoyée fait repartir le RTO.
     pub(super) fn renvoyer_perdus(&mut self, maintenant: u64, sortir: &mut impl FnMut(Sortant)) {
         if self.file.is_empty() {
             return;
@@ -1062,6 +1063,9 @@ impl<P: Charge> Tcb<P> {
         let mut trou = false;
         let mut rearmer = false;
         while i < self.file.len() {
+            if self.retenu_par_le_rythme() {
+                break;
+            }
             if !trou {
                 self.indice_renvoi = Some(self.file[i].seq);
             }
@@ -1098,7 +1102,7 @@ impl<P: Charge> Tcb<P> {
             i += 1;
         }
         if rearmer {
-            self.armer_rto(maintenant);
+            self.armer_xmit_au_rythme(super::Minuteur::Retransmission, self.rto, maintenant);
         }
     }
 
@@ -1118,8 +1122,8 @@ impl<P: Charge> Tcb<P> {
         self.t_sorte = sorte;
     }
 
-    /// `tcp_rearm_rto` : après un progrès, le RTO repart de maintenant ; plus
-    /// rien en file : il s'arrête.
+    /// `tcp_rearm_rto` : après un progrès, le RTO repart de maintenant, plus ce qui reste
+    /// avant le prochain départ au rythme interne ; plus rien en file : il s'arrête.
     pub(super) fn rearmer_rto(&mut self, maintenant: u64) {
         let Some(tete) = self.file.front().copied() else {
             self.t_xmit = None;
@@ -1127,12 +1131,12 @@ impl<P: Charge> Tcb<P> {
         };
         // Le temps déjà passé compte, si l'échéance en cours n'était pas un RTO
         // (`tcp_rto_delta_us`).
-        if matches!(self.t_sorte, super::Minuteur::Reordonnancement | super::Minuteur::SondeDePerte) {
-            let d = (tete.envoi + self.rto).saturating_sub(maintenant).max(1);
-            self.armer_xmit(super::Minuteur::Retransmission, d, maintenant);
+        let d = if matches!(self.t_sorte, super::Minuteur::Reordonnancement | super::Minuteur::SondeDePerte) {
+            (tete.envoi + self.rto).saturating_sub(maintenant).max(1)
         } else {
-            self.armer_rto(maintenant);
-        }
+            self.rto
+        };
+        self.armer_xmit_au_rythme(super::Minuteur::Retransmission, d, maintenant);
     }
 
     /// `tcp_ld_RTO_revert` (RFC 6069) : un cran de recul de moins, et

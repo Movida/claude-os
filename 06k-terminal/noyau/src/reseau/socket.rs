@@ -833,6 +833,11 @@ pub struct Socket {
     /// SO_COOKIE (`sk_cookie`) : un nombre propre à la socket, jamais 0,
     /// jamais réutilisé, donné au premier qui le demande (0 : pas encore).
     pub cookie: AtomicU64,
+    /// SO_MAX_PACING_RATE (`sk_max_pacing_rate`) : le plafond du débit de ses envois,
+    /// en octets par seconde, l'infini au départ (`sock_init_data`). Seul TCP s'en sert,
+    /// par son rythme interne (inet, tcp/rythme.rs) ; les autres le gardent pour le
+    /// relire : sans la file `fq`, que nous n'avons pas, rien ne rythme un datagramme.
+    pub rythme_max: AtomicU64,
     /// La suivante des sockets qu'une tâche a à fermer (sa liste
     /// `Tache::fermetures`, voir `fichier_ferme`).
     suivante: Verrou<Option<Arc<Socket>>>,
@@ -898,6 +903,7 @@ impl Socket {
             inode: AtomicU32::new(0),
             peek_off: AtomicI32::new(-1),
             cookie: AtomicU64::new(0),
+            rythme_max: AtomicU64::new(u64::MAX),
             suivante: Verrou::new(None),
             flux: None,
             compte_tcp: None,

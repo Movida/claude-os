@@ -113,6 +113,7 @@ mod minmax;
 mod reception;
 mod retrans;
 mod rtt;
+mod rythme;
 mod sack;
 
 use attente::Attente;
@@ -768,6 +769,9 @@ pub struct Restes {
     max_fenetre: u32,
     /// Les RTO qui ont changé le hachage du flux (`timeout_rehash`).
     rehash: u32,
+    /// L'heure au plus tôt du prochain segment, au rythme interne (`tcp_wstamp_ns`, que
+    /// `tcp_disconnect` ne remet pas : rythme.rs).
+    depart: u64,
 }
 
 impl Restes {
@@ -776,7 +780,7 @@ impl Restes {
         mss: MSS_DEFAUT, pmtu: 0, entete: 0, advmss: 0, rcv_mss: 0, retransmissions: 0, dernier_envoi: 0, dernier_ack: 0,
         rcv_ssthresh: 0, snd_wnd: 0, rcv_wnd: 0, rcv_space: 0, reordering: TCP_REORDERING, rcv_rtt8: 0, rcv_rtt_seq: 0,
         rcv_rtt_debut: 0, pacing: PACING_MAX, min_rtt: MinMax::new(), mesures: Mesures::new(), files_vides: true,
-        write_seq: 0, snd_una: 0, snd_nxt: 0, max_fenetre: 0, rehash: 0,
+        write_seq: 0, snd_una: 0, snd_nxt: 0, max_fenetre: 0, rehash: 0, depart: 0,
     };
 
     /// `tcp_disconnect` : les files purgées (`tcp_write_queue_purge` arrête d'abord le
@@ -793,6 +797,12 @@ impl Restes {
         let seq = r.write_seq.wrapping_add(r.max_fenetre).wrapping_add(2);
         r.write_seq = if seq == 0 { 1 } else { seq };
         r
+    }
+
+    /// SO_MAX_PACING_RATE sur une socket sans connexion : le débit qu'elle garde (TCP_INFO
+    /// le montre), borné aussitôt (`sk_setsockopt`).
+    pub fn plafonner(&mut self, max: u64) {
+        self.pacing = self.pacing.min(max);
     }
 
     /// Le numéro du SYN de la connexion suivante : `tcp_v4_connect` n'en tire un neuf que si
@@ -1205,6 +1215,10 @@ pub struct Tcb<P: Charge> {
     comprime_rcv_nxt: u32,
     ack_dupliques: u32,
     t_comprime: Option<u64>,
+    /// Le rythme interne (rythme.rs) : l'heure au plus tôt du prochain segment
+    /// (`tcp_wstamp_ns`), et le minuteur qui l'attend (`pacing_timer`).
+    depart: u64,
+    t_rythme: Option<u64>,
     /// Ce qu'on sait de l'autre : le plus haut SACKé, les doublons qu'il a dits
     /// (`dsack_dups`), et s'il a oublié des SACK (`is_sack_reneg`).
     fack: u32,
@@ -1389,6 +1403,8 @@ impl<P: Charge> Tcb<P> {
             comprime_rcv_nxt: 0,
             ack_dupliques: 0,
             t_comprime: None,
+            depart: 0,
+            t_rythme: None,
             fack: iss,
             dsack_doublons: 0,
             sack_renie: false,
@@ -1637,6 +1653,7 @@ impl<P: Charge> Tcb<P> {
             snd_nxt: self.snd_nxt,
             max_fenetre: self.max_fenetre,
             rehash: self.rehash,
+            depart: self.depart,
         }
     }
 
@@ -1646,8 +1663,10 @@ impl<P: Charge> Tcb<P> {
     /// chemin), le débit livré (jusqu'au premier échantillon neuf, mesuré), les chronomètres,
     /// `timeout_rehash`, le réordonnancement, le RTT du récepteur, le débit de l'envoi et
     /// `rcvq_space` (jusqu'à l'établissement, qui les recalcule), les heures du dernier envoi
-    /// et du dernier ACK. Son numéro de départ : `Restes::numero_de_depart`.
+    /// et du dernier ACK, et celle du prochain départ au rythme interne. Son numéro de
+    /// départ : `Restes::numero_de_depart`.
     pub fn reprendre(&mut self, r: &Restes) {
+        self.depart = r.depart;
         self.min_rtt = r.min_rtt;
         self.mesures = r.mesures;
         self.rehash = r.rehash;
@@ -2277,6 +2296,7 @@ impl<P: Charge> Tcb<P> {
             self.t_keepalive = None;
             self.ack.t = None;
             self.t_comprime = None;
+            self.t_rythme = None;
             self.hors_ordre.vider();
             self.fin_hors_ordre = None;
             self.nb_blocs = 0;
@@ -3694,16 +3714,17 @@ impl<P: Charge> Tcb<P> {
 
     /// La prochaine échéance de la connexion (None : aucune).
     pub fn echeance(&self) -> Option<u64> {
-        [self.t_xmit, self.t_keepalive, self.ack.t, self.t_comprime].into_iter().flatten().min()
+        [self.t_xmit, self.t_keepalive, self.ack.t, self.t_comprime, self.t_rythme].into_iter().flatten().min()
     }
 
-    /// Celle qui ne peut pas attendre un tic de la roue, s'il y en a une : un hrtimer chez Linux.
+    /// Celle qui ne peut pas attendre un tic de la roue, s'il y en a une : un hrtimer chez
+    /// Linux (la compression des SACK, le rythme interne).
     pub fn echeance_fine(&self) -> Option<u64> {
-        self.t_comprime
+        [self.t_comprime, self.t_rythme].into_iter().flatten().min()
     }
 
     /// Fait ce qui est échu à l'heure `maintenant` : l'ACK retardé, la
-    /// retransmission, la sonde de fenêtre.
+    /// retransmission, la sonde de fenêtre, le rythme interne.
     pub fn minuteur(&mut self, maintenant: u64) -> Effets {
         let mut e = Effets::default();
         self.heure = maintenant;
@@ -3734,6 +3755,10 @@ impl<P: Charge> Tcb<P> {
         if self.t_keepalive.is_some_and(|t| t <= maintenant) {
             self.t_keepalive = None;
             self.minuteur_keepalive(maintenant, &mut e);
+        }
+        if self.t_rythme.is_some_and(|t| t <= maintenant) {
+            self.t_rythme = None;
+            self.minuteur_rythme(&mut e);
         }
         e
     }
@@ -3940,7 +3965,7 @@ impl<P: Charge> Tcb<P> {
             }
         } else {
             let d = self.borne_sonde(maintenant, self.delai_sonde());
-            self.armer_xmit(Minuteur::Sonde, d, maintenant);
+            self.armer_xmit_au_rythme(Minuteur::Sonde, d, maintenant);
         }
     }
 
@@ -3997,7 +4022,7 @@ impl<P: Charge> Tcb<P> {
             self.recul += 1;
         }
         let d = self.borne_sonde(maintenant, self.delai_sonde());
-        self.armer_xmit(Minuteur::Sonde, d, maintenant);
+        self.armer_xmit_au_rythme(Minuteur::Sonde, d, maintenant);
         e.a_emettre = true;
     }
 
@@ -4073,7 +4098,7 @@ impl<P: Charge> Tcb<P> {
         }
         let h = self.entete(self.snd_nxt, drapeaux);
         let numero = self.compter_envoi(n);
-        self.compter_sortie(n);
+        let prevu = self.compter_sortie(n);
         sortir(Sortant { entete: h, debut, longueur: n, numero, compte: Compte::Neuf });
         // L'ACK d'abord, puis la donnée (`__tcp_transmit_skb`) : sortir du mode rapide remet `ato` au
         // plus bas, ce que lit le test du ping-pong. Avant que le segment ne compte comme en vol ; un
@@ -4098,6 +4123,7 @@ impl<P: Charge> Tcb<P> {
         let tx = self.debit_parti(maintenant);
         self.file.ajouter_derriere_dans_la_place(Envoye::neuf(self.snd_nxt, fin_segment, maintenant, drapeaux, tx, numero));
         self.tri_ajouter(self.snd_nxt, maintenant);
+        self.avancer_le_depart(n, prevu);
         self.snd_nxt = fin_segment;
         if rearmer {
             self.rearmer_rto(maintenant);
@@ -4346,7 +4372,8 @@ impl<P: Charge> Tcb<P> {
     /// Les données neuves, et le FIN (`tcp_write_xmit`), tant que la fenêtre
     /// de congestion a de la place : un segment entier dans la fenêtre de
     /// l'autre (`tcp_snd_wnd_test` : on attend plutôt que de le couper) ; sauf ce
-    /// que l'autocork retient (carte.rs), et tant que la carte n'en garde pas trop.
+    /// que l'autocork retient (carte.rs), tant que la carte n'en garde pas trop, et
+    /// à l'heure du rythme interne (rythme.rs).
     fn envoyer_neuf(&mut self, maintenant: u64, sortir: &mut impl FnMut(Sortant)) {
         let retenu = self.autocork();
         let mut sortis = 0;
@@ -4360,6 +4387,9 @@ impl<P: Charge> Tcb<P> {
                 break;
             }
             if retenu > 0 && reste <= retenu {
+                break;
+            }
+            if self.retenu_par_le_rythme() {
                 break;
             }
             if self.paquets_en_vol() >= self.cc.cwnd {
@@ -4425,7 +4455,7 @@ impl<P: Charge> Tcb<P> {
         // les laisse pas passer, ou TCP_CORK les retient) : la sonde
         // (`tcp_check_probe_timer`), qui les poussera au plus tard.
         if self.file.is_empty() && self.prochain_segment().is_some() && self.t_xmit.is_none() {
-            self.armer_xmit(Minuteur::Sonde, self.rto.max(RTO_MIN), maintenant);
+            self.armer_xmit_au_rythme(Minuteur::Sonde, self.rto.max(RTO_MIN), maintenant);
         }
     }
 }

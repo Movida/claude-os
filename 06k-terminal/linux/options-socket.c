@@ -95,6 +95,11 @@
  *     bouchon d'UDP ; l'avis après SND (UDP) ou après ACK (TCP), avant l'erreur ICMP ;
  *     sa mémoire dans celle des options (SO_MEMINFO), la limite (ENOBUFS), et
  *     RLIMIT_MEMLOCK ; la taille du contrôle de sendmsg face à cette mémoire.
+ *   - SO_MAX_PACING_RATE : pour toutes les sortes, un entier (-1 : l'infini) ou 8 octets,
+ *     relu sur 8 octets s'il y a leur place, sinon sur 4 (au plus ~0U) ; TCP_INFO (le
+ *     débit borné aussitôt, le plafond) ; la fille d'une écoute a celui de sa naissance ;
+ *     et le rythme interne de TCP sur lo : 2 Mo à 2 Mo/s, les dix premiers segments
+ *     sans attendre, contre bien moins sans plafond, ou à 0.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -2983,6 +2988,160 @@ static void zerocopie_tcp(void)
     verifier(ok, "MSG_ZEROCOPY : ignore par AF_UNIX et ping");
 }
 
+/* SO_MAX_PACING_RATE dans une place de `place` octets (0xaa au-delà de ce qui est écrit) :
+ * la valeur lue, la longueur rendue dans *l. */
+static uint64_t rythme_lu(int s, socklen_t place, socklen_t *l)
+{
+    unsigned char b[16];
+    memset(b, 0xaa, sizeof b);
+    *l = place;
+    if (getsockopt(s, SOL_SOCKET, SO_MAX_PACING_RATE, b, l) < 0)
+        return 0x1000 + errno;
+    uint64_t v = 0;
+    memcpy(&v, b, 8);
+    return v;
+}
+
+static int rythme_pose(int s, uint64_t v, socklen_t longueur)
+{
+    return erreur(setsockopt(s, SOL_SOCKET, SO_MAX_PACING_RATE, &v, longueur));
+}
+
+static uint64_t rythme(int s)
+{
+    socklen_t l;
+    return rythme_lu(s, 8, &l);
+}
+
+/* Le débit et le plafond de TCP_INFO (`tcpi_pacing_rate`, `tcpi_max_pacing_rate`). */
+static uint64_t info64(int s, int decalage)
+{
+    unsigned char b[256] = {0};
+    socklen_t l = sizeof b;
+    uint64_t v = 0;
+    getsockopt(s, IPPROTO_TCP, TCP_INFO, b, &l);
+    memcpy(&v, b + decalage, 8);
+    return v;
+}
+
+struct lecteur {
+    int f;
+    long total, lu;
+};
+
+/* Lit `total` octets de la fille (combien : `lu`), puis répond un octet. */
+static void *lire_tout(void *p)
+{
+    static char z[1 << 16];
+    struct lecteur *l = p;
+    ssize_t n;
+    while (l->lu < l->total && (n = read(l->f, z, sizeof z)) > 0)
+        l->lu += n;
+    if (write(l->f, "f", 1) != 1)
+        l->lu = -1;
+    return NULL;
+}
+
+/* `total` octets par une connexion sur lo au plafond `max` (-1 : sans), lus par un fil : la
+ * durée jusqu'à la fin de la lecture, en secondes (un milliard si tout n'est pas passé), et
+ * le MSS de l'envoi dans *mss. */
+static double transfert(long max, long total, unsigned *mss)
+{
+    static char d[1 << 16];
+    int c, f;
+    tcp_connectee(&c, &f);
+    if (max >= 0)
+        rythme_pose(c, max, 8);
+    struct lecteur l = {f, total, 0};
+    pthread_t t;
+    pthread_create(&t, NULL, lire_tout, &l);
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+    long ecrit = 0;
+    ssize_t k;
+    while (ecrit < total && (k = write(c, d, total - ecrit < (long)sizeof d ? total - ecrit : (long)sizeof d)) > 0)
+        ecrit += k;
+    char x;
+    int fin = read(c, &x, 1) == 1;
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    *mss = info(c, 16);
+    pthread_join(t, NULL);
+    close(c), close(f);
+    if (!fin || ecrit != total || l.lu != total)
+        return 1e9;
+    return (t1.tv_sec - t0.tv_sec) + (t1.tv_nsec - t0.tv_nsec) / 1e9;
+}
+
+static void rythme_max(void)
+{
+    const uint64_t INFINI = ~0ull;
+    for (int i = 0; i < SORTES; i++) {
+        int s = ouvrir(&sortes[i]);
+        socklen_t l16, l7, l2, l0;
+        int ok = rythme_lu(s, 16, &l16) == INFINI && l16 == 8 && rythme_lu(s, 7, &l7) == 0xaaaaaaaaffffffffull && l7 == 4
+            && rythme_lu(s, 2, &l2) == 0xaaaaaaaaaaaaffffull && l2 == 2 && rythme_lu(s, 0, &l0) == 0xaaaaaaaaaaaaaaaaull && l0 == 0;
+        ok &= rythme_pose(s, 1000, 3) == EINVAL && rythme(s) == INFINI && rythme_pose(s, 1000, 4) == 0 && rythme(s) == 1000;
+        ok &= rythme_pose(s, 1ull << 32, 8) == 0 && rythme(s) == 1ull << 32 && rythme_lu(s, 4, &l7) == 0xaaaaaaaaffffffffull;
+        ok &= rythme_pose(s, 0xffffffff, 4) == 0 && rythme(s) == INFINI;
+        ok &= rythme_pose(s, 0x80000000, 4) == 0 && rythme(s) == 0x80000000;
+        ok &= rythme_pose(s, 0x100000005ull, 6) == 0 && rythme(s) == 5;
+        ok &= rythme_pose(s, 0xffffffff, 8) == 0 && rythme(s) == 0xffffffff;
+        ok &= rythme_pose(s, 0, 4) == 0 && rythme(s) == 0;
+        close(s);
+        verifier(ok, dire("SO_MAX_PACING_RATE (%s) : un entier (-1 l'infini) ou 8 octets, relu sur 8 ou sur 4 (au plus ~0U)", sortes[i].nom));
+    }
+    /* TCP_INFO : le débit borné tout de suite ; le plafond levé, il reste borné jusqu'à
+     * l'ACK suivant. */
+    int n = socket(AF_INET, SOCK_STREAM, 0);
+    int ok = info64(n, 104) == INFINI && info64(n, 112) == INFINI;
+    rythme_pose(n, 5000, 8);
+    ok &= info64(n, 104) == 5000 && info64(n, 112) == 5000;
+    rythme_pose(n, INFINI, 8);
+    ok &= info64(n, 104) == 5000 && info64(n, 112) == INFINI;
+    close(n);
+    int c, f;
+    char b[4];
+    tcp_connectee(&c, &f);
+    rythme_pose(c, 123456, 8);
+    ok &= info64(c, 104) == 123456 && info64(c, 112) == 123456;
+    ok &= write(c, "abc", 3) == 3 && read(f, b, 3) == 3 && write(f, "d", 1) == 1 && read(c, b, 1) == 1;
+    attendre_ms(50);
+    ok &= info64(c, 104) == 123456;
+    rythme_pose(c, INFINI, 8);
+    ok &= info64(c, 104) == 123456 && info64(c, 112) == INFINI;
+    ok &= write(c, "abc", 3) == 3 && read(f, b, 3) == 3;
+    attendre_ms(50);
+    ok &= info64(c, 104) > 123456 && info64(c, 104) != INFINI;
+    close(c), close(f);
+    verifier(ok, "SO_MAX_PACING_RATE : TCP_INFO, le debit borne aussitot ; le plafond leve, borne jusqu'a l'ACK suivant");
+    /* L'héritage : le plafond de l'écoute à la naissance de la fille. */
+    struct sockaddr_in t;
+    int e = socket(AF_INET, SOCK_STREAM, 0);
+    lier_tcp(e, &t), listen(e, 2);
+    rythme_pose(e, 12345, 8);
+    ok = info64(e, 104) == 12345 && info64(e, 112) == 12345;
+    int c1 = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c1, (void *)&t, sizeof t);
+    attendre_ms(50);
+    rythme_pose(e, 777, 8);
+    int f1 = accept(e, NULL, NULL);
+    ok &= rythme(f1) == 12345 && info64(f1, 104) == 12345 && info64(f1, 112) == 12345;
+    int c2 = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c2, (void *)&t, sizeof t);
+    int f2 = accept(e, NULL, NULL);
+    ok &= rythme(f2) == 777 && info64(f2, 104) == 777;
+    close(c1), close(c2), close(f1), close(f2), close(e);
+    verifier(ok, "SO_MAX_PACING_RATE : la fille a le plafond de l'ecoute a sa naissance, pas a l'accept");
+    /* Le rythme interne : 2 Mo à 2 Mo/s. Les dix premiers segments partent sans attendre,
+     * chacun des autres attend sa durée au débit, moins le retard pris (au plus la moitié) :
+     * au moins (2 Mo - 10 MSS) / 4 Mo/s. Sans plafond, ou à 0 : bien plus vite. */
+    unsigned mss, mss_sans, mss_nul;
+    double avec = transfert(2000000, 2000000, &mss), sans = transfert(-1, 2000000, &mss_sans), nul = transfert(0, 2000000, &mss_nul);
+    printf("[linux] options-socket : 2 Mo a 2 Mo/s en %.3f s (MSS %u), sans plafond %.3f s, a 0 %.3f s\n", avec, mss, sans, nul);
+    verifier(avec >= (2000000.0 - 10 * mss) / 4000000 && avec <= 3 && sans < avec / 2 && nul < avec / 2,
+             "SO_MAX_PACING_RATE : le rythme interne de TCP, dix segments sans attendre puis au debit ; sans plafond, ou a 0, rien n'attend");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -3026,6 +3185,7 @@ int main(void)
     zerocopie_option();
     zerocopie_udp();
     zerocopie_tcp();
+    rythme_max();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

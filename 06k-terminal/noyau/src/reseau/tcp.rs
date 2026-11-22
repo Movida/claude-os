@@ -482,8 +482,9 @@ pub struct Partie {
     /// Les déconnexions (`sk_disconnects`) : AF_UNSPEC, et un `connect` qui voit l'échec ;
     /// un `connect` bloquant qui en voit passer une pendant qu'il dort rend EPIPE.
     deconnexions: u32,
-    /// L'échéance inscrite dans la liste du réseau pour cette socket.
-    echeance_armee: Option<u64>,
+    /// L'échéance inscrite dans la liste du réseau pour cette socket, et si elle est servie à
+    /// l'instant dit (`armer_precis`) plutôt qu'au tic de la roue.
+    echeance_armee: Option<(u64, bool)>,
     /// La mémoire que la socket a comptée dans celle de TCP (`MEMOIRE`).
     memoire_comptee: usize,
     /// L'erreur d'une socket redevenue neuve (`sk_err`, après `tcp_disconnect`) : plus de connexion
@@ -629,6 +630,11 @@ pub struct OptionsTcp {
     /// TCP_CONGESTION : le contrôle de la socket, et de ses filles
     /// (`tcp_ca_openreq_child`).
     pub controle: itcp::Controle,
+    /// Le rythme interne (`sk_pacing_status` à SK_PACING_NEEDED) : SO_MAX_PACING_RATE
+    /// a posé un plafond fini, une fois au moins ; il reste, même revenu à l'infini.
+    /// Pour les connexions à venir, et les filles (le plafond est dans la socket :
+    /// `Socket::rythme_max`).
+    pub rythme_interne: bool,
     /// Ce que la socket garde d'une connexion (TCP_MAXSEG, TCP_INFO, SIOCOUTQ le
     /// montrent hors connexion, et la suivante en reprend une part) : rien pour une
     /// socket neuve, puis ce que lui laisse chaque connexion.
@@ -643,7 +649,7 @@ impl OptionsTcp {
         nodelay: false, cork: false, keepidle: 7200, keepintvl: 75, keepcnt: 9, syncnt: 0, linger2: 60, maxseg: 0,
         quickack: true, defer_accept: 0, user_timeout: 0, keepalive: false, oobinline: false, sndbuf_fixe: false,
         rcvbuf_fixe: false, txrehash: true, rcvlowat: 1, ttl: ipv4::TTL_DEFAUT, tos: 0, pmtudisc: 1, minttl: 0, ip_options: fipv4::OptionsSortantes::AUCUNE, window_clamp: 0,
-        controle: itcp::Controle::DEFAUT, interface: 0, transparent: false, dontroute: false,
+        controle: itcp::Controle::DEFAUT, interface: 0, transparent: false, dontroute: false, rythme_interne: false,
         hors_connexion: itcp::Restes::NEUF,
     };
 
@@ -1104,17 +1110,28 @@ impl Partie {
         // Une fin d'émission a rappelé la socket, sans passer par ici : son échéance à
         // elle (tout de suite) tient jusqu'à ce qu'elle tombe.
         let e = if self.retenue.a_pousser() { Some(0) } else { e };
-        if e == self.echeance_armee {
-            return;
-        }
-        // La seule à ne pas attendre le tic de la roue : la compression des SACK, moins d'une
-        // milliseconde (`compressed_ack_timer`, un hrtimer).
+        // Celles qui n'attendent pas le tic de la roue (`echeance_fine`) : la compression des
+        // SACK, moins d'une milliseconde (`compressed_ack_timer`), et le rythme interne
+        // (`pacing_timer`) : deux hrtimer chez Linux.
         let fine = match &self.mode {
             Mode::Connexion(t) => t.echeance_fine(),
             Mode::Ecoute { filles, .. } => filles.iter().filter_map(|f| f.tcb.echeance_fine()).min(),
             Mode::Neuve => None,
         };
-        match (self.echeance_armee, e) {
+        // Une seule échéance inscrite par socket, la plus proche. Quand une fine attend derrière
+        // elle (un ACK retardé, puis le rythme), la plus proche est servie à l'instant dit, elle
+        // aussi : servie au tic de la roue, elle y entraînerait la fine (jusqu'à un tic de retard
+        // pour le rythme, le débit voulu non tenu). Elle ne prend pas de place de plus dans la
+        // liste précise : un objet n'est que dans l'une des deux, et celui-ci y serait juste
+        // après. La même heure, inscrite autrement (une fine vient d'apparaître derrière elle),
+        // se réinscrit. Écarté : deux échéances par socket, comme Linux a deux minuteurs (la roue
+        // et un hrtimer) : deux inscriptions à tenir pour chaque connexion, pour ce que ceci
+        // règle.
+        let armee = e.map(|t| (t, t == 0 || fine.is_some()));
+        if armee == self.echeance_armee {
+            return;
+        }
+        match (self.echeance_armee, armee) {
             (None, Some(_)) => {
                 MINUTEURS.fetch_add(1, Ordering::Relaxed);
             }
@@ -1123,9 +1140,9 @@ impl Partie {
             }
             _ => {}
         }
-        self.echeance_armee = e;
-        match e {
-            Some(t) if t == 0 || fine == e => {
+        self.echeance_armee = armee;
+        match armee {
+            Some((t, true)) => {
                 super::tache::armer_precis(self.numero, t);
             }
             _ => {
@@ -2102,6 +2119,7 @@ impl Partie {
         tcb.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
         tcb.memoire = niveau_memoire();
         tcb.poser_controle(self.options.controle);
+        tcb.poser_rythme(moi.rythme_max.load(Ordering::Relaxed), self.options.rythme_interne);
         tcb.sans_file = sans_carte(vers, ip.oif, ip.portee);
         // Elle hérite de ce que l'écoute permet (`sk_clone_lock`) : un serveur SO_REUSEADDR doit
         // pouvoir redémarrer tant que vivent ses connexions, et jusqu'en TIME_WAIT (`tw_reuse`) ;
@@ -2759,6 +2777,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
                 t.sndbuf_max = ENVOI_MAX.load(Ordering::Relaxed);
                 t.memoire = niveau_memoire();
                 t.poser_controle(p.options.controle);
+                t.poser_rythme(s.rythme_max.load(Ordering::Relaxed), p.options.rythme_interne);
                 t.sans_file = sans_carte(ip.vers(destination), ip.oif, ip.portee);
                 // TCP_QUICKACK à 0 (`inet_csk_enter_pingpong_mode`), posé avant.
                 if !p.options.quickack {
@@ -2865,6 +2884,10 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             let hors_table = f.tcb.etat() == Etat::Fermee;
             let mut tcb = f.tcb;
             tcb.attachee = true;
+            // Son plafond et son rythme interne : ceux de l'écoute à sa naissance (`sk_clone_lock`),
+            // pas ceux d'aujourd'hui (mesuré : posé sur l'écoute entre la poignée de main et
+            // l'accept, il ne vaut que pour les suivantes).
+            let (rythme_max, rythme_interne) = tcb.rythme();
             // Ce qu'elle a jeté depuis sa naissance est à elle (`sk_clone_lock` remet
             // `sk_drops` à zéro, puis la socket fille compte les siennes).
             let pertes = tcb.prendre_pertes();
@@ -2877,7 +2900,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 identifiant: f.identifiant, orpheline: false, hors_table,
                 // Tout, sauf ce qui est propre à une écoute (`inet_csk_clone_lock`,
                 // `inet_csk_delack_init`) : la fille n'attend pas de données pour naître deux fois.
-                options: OptionsTcp { defer_accept: 0, quickack: true, ip_options, interface, ..p.options },
+                options: OptionsTcp { defer_accept: 0, quickack: true, ip_options, interface, rythme_interne, ..p.options },
                 etat_socket: EtatSocket::Connectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
                 compte: compte.clone(), route_oubliee: false, horodatage, demandes: VecDeque::new(), avis: VecDeque::new(),
             };
@@ -2895,6 +2918,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             // et d'horodatage ; le processeur de sa naissance.
             enfant.heriter_de(s);
             enfant.processeur.store(processeur, Ordering::Relaxed);
+            enfant.rythme_max.store(rythme_max, Ordering::Relaxed);
             enfant.appels.verrouiller().options = socket::Options { mc_ttl, rcv_tos, mc_index, ip_options, interface, ..options };
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.changer_objet(numero, Cible::Socket(enfant.clone()));
@@ -3923,6 +3947,29 @@ pub fn txrehash_change(s: &Socket) {
             t.txrehash = oui;
         }
     });
+}
+
+/// SO_MAX_PACING_RATE (`sk_setsockopt`) : le plafond `max` (déjà dans la socket) vaut
+/// pour la connexion, qui borne aussitôt son débit et le suit au segment suivant ; pour
+/// les filles pas encore nées d'une écoute (des demandes chez Linux, dont la socket
+/// copiera celle de l'écoute au dernier segment de la poignée de main) ; sans connexion,
+/// pour le débit que la socket garde (TCP_INFO le montre). Un plafond fini allume le rythme
+/// interne, pour toujours.
+pub fn plafonner_le_rythme(s: &Socket, max: u64) {
+    let mut g = flux(s).posseder();
+    let p = g.donnee();
+    p.options.rythme_interne |= max != itcp::PACING_MAX;
+    let interne = p.options.rythme_interne;
+    match &mut p.mode {
+        Mode::Connexion(t) => t.poser_rythme(max, interne),
+        Mode::Ecoute { filles, .. } => {
+            for f in filles.iter_mut().filter(|f| f.tcb.etat() == Etat::SynRecu) {
+                f.tcb.poser_rythme(max, interne);
+            }
+            p.options.hors_connexion.plafonner(max);
+        }
+        Mode::Neuve => p.options.hors_connexion.plafonner(max),
+    }
 }
 
 /// SO_CNX_ADVICE 1 (appels_reseau.rs, `conseil_negatif`) : la route de la

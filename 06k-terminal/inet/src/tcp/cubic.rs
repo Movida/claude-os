@@ -45,7 +45,8 @@
 //!     de 12,5 % (entre 4 et 16 ms) : une file se forme quelque part.
 //! La cwnd reste alors où elle est, qui devient le seuil.
 //!
-//! Le débit de `pacing` n'entre ici que dans le seuil du train d'ACK. Écarté :
+//! Le débit de `pacing` n'entre ici que dans le seuil du train d'ACK, comme le rythme
+//! interne (`sk_pacing_status`). Écarté :
 //! `hystart_detect` et les autres paramètres du module : ce sont leurs valeurs
 //! par défaut, écrites en constantes, un module de Linux ne se règle qu'en
 //! root, et rien chez nous ne le demande.
@@ -173,8 +174,10 @@ pub(super) struct Acquittement {
     pub ssthresh: u32,
     pub snd_una: u32,
     pub snd_nxt: u32,
-    /// Le débit calculé (`sk_pacing_rate`), en octets par seconde.
+    /// Le débit calculé (`sk_pacing_rate`), en octets par seconde, et le rythme
+    /// interne (`sk_pacing_status` différent de SK_PACING_NONE).
     pub pacing: u64,
+    pub rythme: bool,
     pub maintenant: u64,
 }
 
@@ -336,11 +339,16 @@ impl Cubic {
             return false;
         }
         let now = en_us(a.maintenant);
-        // Le train d'ACK. Le seuil est divisé par deux : sans pacing, une rafale
-        // entière part d'un coup (`sk_pacing_status` à SK_PACING_NONE).
+        // Le train d'ACK. Le seuil est divisé par deux, sauf au rythme interne : sans
+        // lui, une rafale entière part d'un coup (`sk_pacing_status` à SK_PACING_NONE) ;
+        // avec lui, des segments espacés peuvent avoir pris jusqu'à un demi-RTT de retard
+        // pendant le démarrage lent, que le seuil entier leur laisse.
         if now.wrapping_sub(self.dernier_ack) as i32 <= HYSTART_ECART_ACK {
             self.dernier_ack = now;
-            let seuil = (self.delai_min + Self::marge_train(a.pacing)) >> 1;
+            let mut seuil = self.delai_min + Self::marge_train(a.pacing);
+            if !a.rythme {
+                seuil >>= 1;
+            }
             // (Une comparaison non signée chez Linux aussi : s32 contre u32.)
             if now.wrapping_sub(self.debut_tour) > seuil {
                 self.trouve = true;
@@ -561,7 +569,7 @@ mod tests {
     }
 
     fn acquit(cwnd: u32, t: u64) -> Acquittement {
-        Acquittement { cwnd, ssthresh: u32::MAX, snd_una: 100, snd_nxt: 200, pacing: 0, maintenant: t }
+        Acquittement { cwnd, ssthresh: u32::MAX, snd_una: 100, snd_nxt: 200, pacing: 0, rythme: false, maintenant: t }
     }
 
     /// HyStart, le train : à partir de 16 segments, des ACK à moins de 2 ms qui
@@ -716,6 +724,24 @@ mod tests {
         };
         assert!(!prete().acquitte(10_000, &acquit(20, 205 * MS)));
         assert!(prete().acquitte(10_000, &acquit(20, 205 * MS + 1000)));
+    }
+
+    /// Au rythme interne (SO_MAX_PACING_RATE), le train doit durer tout `delay_min` :
+    /// des segments espacés arrivent espacés, sans que le chemin soit plein.
+    #[test]
+    fn hystart_train_au_rythme() {
+        let prete = |dernier| {
+            let mut c = Cubic::new();
+            c.initialiser(200, 100 * MS);
+            c.delai_min = 10_000;
+            c.debut_tour = 200_000;
+            c.dernier_ack = dernier;
+            c
+        };
+        let rythme = |t| Acquittement { rythme: true, ..acquit(20, t) };
+        assert!(!prete(204_999).acquitte(10_000, &rythme(205 * MS + 1000)));
+        assert!(!prete(209_999).acquitte(10_000, &rythme(210 * MS)));
+        assert!(prete(209_999).acquitte(10_000, &rythme(210 * MS + 1000)));
     }
 
     /// `tcp_in_slow_start` : à la cwnd tout juste au seuil, ce n'est plus le démarrage lent.

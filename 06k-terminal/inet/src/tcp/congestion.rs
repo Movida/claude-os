@@ -45,8 +45,10 @@
 //! mesuré (`tcp_rate.c`) et le pacing réel : Linux ne les prend pas par défaut.
 //!
 //! LE PACING (`sk_pacing_rate`) : un débit calculé à chaque ACK (`maj_pacing`), lu
-//! par TCP_INFO et par HyStart. Rien ne s'envoie à ce rythme (par défaut, Linux non
-//! plus : seuls `fq` et BBR l'appliquent).
+//! par TCP_INFO, par HyStart et par TSQ (carte.rs), borné par SO_MAX_PACING_RATE
+//! (`pacing_max`). Rien ne s'envoie à ce rythme, sauf quand le programme a posé
+//! SO_MAX_PACING_RATE : alors le rythme interne (rythme.rs). Linux non plus, par
+//! défaut : seuls `fq`, BBR et ce plafond l'appliquent.
 
 use super::avant;
 use super::cubic::{Acquittement, Cubic};
@@ -142,6 +144,13 @@ pub struct Congestion {
     /// Le débit calculé, en octets par seconde (`sk_pacing_rate`) ; l'infini
     /// tant qu'aucune mesure ne l'a calculé (`sock_init_data`).
     pub pacing: u64,
+    /// Son plafond, SO_MAX_PACING_RATE (`sk_max_pacing_rate`, l'infini par
+    /// défaut), et le rythme interne : le programme a posé un plafond, une fois
+    /// au moins (`sk_pacing_status` passé de SK_PACING_NONE à SK_PACING_NEEDED,
+    /// pour toujours). Ce sont des champs de la socket chez Linux ; ici, avec le
+    /// débit qu'ils bornent (la socket les donne à chaque connexion : `poser_rythme`).
+    pub pacing_max: u64,
+    pub rythme_interne: bool,
 }
 
 impl Congestion {
@@ -159,7 +168,18 @@ impl Congestion {
             utilisee: 0,
             instant: 0,
             pacing: PACING_MAX,
+            pacing_max: PACING_MAX,
+            rythme_interne: false,
         }
+    }
+
+    /// SO_MAX_PACING_RATE (`sk_setsockopt`) : le plafond, qui borne aussitôt le
+    /// débit ; un plafond fini allume le rythme interne, qu'aucun autre ne
+    /// rééteint (`cmpxchg` de SK_PACING_NONE à SK_PACING_NEEDED).
+    pub fn plafonner(&mut self, max: u64) {
+        self.pacing_max = max;
+        self.rythme_interne |= max != PACING_MAX;
+        self.pacing = self.pacing.min(max);
     }
 
     /// Le contrôle en service.
@@ -270,7 +290,9 @@ impl Congestion {
     /// décider de quitter le démarrage lent : le seuil devient la cwnd.
     pub fn segments_acquittes(&mut self, rtt: Option<u64>, snd_una: u32, snd_nxt: u32, maintenant: u64) {
         let (Algo::Cubic(c), Some(rtt)) = (&mut self.algo, rtt) else { return };
-        let a = Acquittement { cwnd: self.cwnd, ssthresh: self.ssthresh, snd_una, snd_nxt, pacing: self.pacing, maintenant };
+        let a = Acquittement {
+            cwnd: self.cwnd, ssthresh: self.ssthresh, snd_una, snd_nxt, pacing: self.pacing, rythme: self.rythme_interne, maintenant,
+        };
         if c.acquitte((rtt / 1000) as u32, &a) {
             self.ssthresh = self.cwnd;
         }
@@ -280,13 +302,14 @@ impl Congestion {
     /// démarrage lent (la cwnd double à chaque aller-retour : `tcp_pacing_ss_ratio`),
     /// à 120 % ensuite (`tcp_pacing_ca_ratio`). `srtt8_us`, SRTT × 8 en µs, le
     /// `srtt_us` de Linux ; sans mesure, le calcul reste sans division, comme le sien.
+    /// Au plus le plafond de SO_MAX_PACING_RATE.
     pub fn maj_pacing(&mut self, mss: u32, sortis: u32, srtt8_us: u64) {
         let ratio = if self.cwnd < self.ssthresh / 2 { PACING_SS } else { PACING_CA };
         let mut debit = mss as u64 * ((1_000_000 / 100) << 3) * ratio * self.cwnd.max(sortis) as u64;
         if srtt8_us != 0 {
             debit /= srtt8_us;
         }
-        self.pacing = debit;
+        self.pacing = debit.min(self.pacing_max);
     }
 
     /// Le compte vers le prochain segment repart de zéro.
@@ -531,6 +554,32 @@ mod tests {
         assert_eq!(c.pacing, 1000 * (10_000 << 3) * 200 * 30 / 8000);
         c.maj_pacing(1000, 0, 0);
         assert_eq!(c.pacing, 1000 * (10_000 << 3) * 200 * 9);
+    }
+
+    /// SO_MAX_PACING_RATE : le débit borné tout de suite, puis à chaque calcul ; un
+    /// plafond fini allume le rythme interne, l'infini ne l'éteint pas, et le débit
+    /// déjà borné le reste jusqu'au calcul suivant (mesuré : TCP_INFO d'une socket
+    /// neuve, 5000 puis ~0 : `tcpi_pacing_rate` 5000).
+    #[test]
+    fn le_plafond_du_debit() {
+        let mut c = reno();
+        c.cwnd = 10;
+        c.ssthresh = 20;
+        assert!(!c.rythme_interne);
+        c.plafonner(5000);
+        assert_eq!((c.pacing, c.pacing_max, c.rythme_interne), (5000, 5000, true));
+        c.maj_pacing(1000, 0, 8000);
+        assert_eq!(c.pacing, 5000);
+        c.plafonner(PACING_MAX);
+        assert_eq!((c.pacing, c.rythme_interne), (5000, true));
+        c.maj_pacing(1000, 0, 8000);
+        assert_eq!(c.pacing, 1000 * (10_000 << 3) * 120 * 10 / 8000);
+        // Un plafond plus haut que le débit ne le change pas.
+        c.plafonner(u64::MAX - 1);
+        assert_eq!(c.pacing, 1000 * (10_000 << 3) * 120 * 10 / 8000);
+        // 0 : le débit aussi (et le rythme interne ne fait alors rien, rythme.rs).
+        c.plafonner(0);
+        assert_eq!(c.pacing, 0);
     }
 
     #[test]

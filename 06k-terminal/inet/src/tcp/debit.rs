@@ -180,18 +180,19 @@ fn ms(maintenant: u64) -> u32 {
 }
 
 impl<P: Charge> Tcb<P> {
-    /// Un segment de `n` octets part (`__tcp_transmit_skb`). Le SYN-ACK et les ACK d'une
-    /// fille ne comptent pas : chez Linux, ils partent d'une simple demande, qui n'a pas de
-    /// compteurs.
-    pub(super) fn compter_sortie(&mut self, n: usize) {
+    /// Un segment de `n` octets part (`__tcp_transmit_skb`), à son heure (rythme.rs) : rend
+    /// celle qui était prévue. Le SYN-ACK et les ACK d'une fille ne comptent pas : chez
+    /// Linux, ils partent d'une simple demande, qui n'a ni compteurs ni heure.
+    pub(super) fn compter_sortie(&mut self, n: usize) -> u64 {
         if self.fille && self.etat == Etat::SynRecu {
-            return;
+            return self.depart;
         }
         self.mesures.segs_out += 1;
         if n > 0 {
             self.mesures.data_segs_out += 1;
             self.mesures.octets_envoyes += n as u64;
         }
+        self.partir_a_l_heure()
     }
 
     /// Un segment part (`tcp_rate_skb_sent`) : ce qu'il doit retenir. Sans rien en vol, une

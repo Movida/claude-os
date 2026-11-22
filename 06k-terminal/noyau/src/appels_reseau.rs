@@ -153,6 +153,7 @@ const SO_NETNS_COOKIE: i32 = 71;
 const SO_TXREHASH: i32 = 74;
 const SO_DEVMEM_DONTNEED: i32 = 80;
 const SO_ZEROCOPY: i32 = 60;
+const SO_MAX_PACING_RATE: i32 = 47;
 /// La réception : l'horodatage, sous ses quatre formes
 /// (_OLD : `timeval` et `timespec` de 64 bits sur x86_64, comme les _NEW ; seul
 /// le numéro du message de contrôle les distingue), les pertes, la marque et
@@ -2026,6 +2027,23 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             s.poser_drapeau(socket::ZEROCOPIE, oui);
             return Ok(());
         }
+        // Le plafond du débit de l'envoi (`sk_max_pacing_rate`), pour toutes les sortes :
+        // l'entier déjà lu (-1, ~0U : l'infini ; un autre négatif, pris sans signe), ou
+        // 8 octets s'il y en a au moins autant (EFAULT) ; 6 octets lisent l'entier seul
+        // (mesuré). TCP s'y rythme (`tcp::plafonner_le_rythme`).
+        SO_MAX_PACING_RATE => {
+            let mut max = if v == -1 { u64::MAX } else { v as u32 as u64 };
+            if longueur >= 8 {
+                let mut o = [0u8; 8];
+                copier_depuis_utilisateur(&mut o, valeur).map_err(|_| -EFAULT)?;
+                max = u64::from_le_bytes(o);
+            }
+            s.rythme_max.store(max, Ordering::Relaxed);
+            if s.protocole == Protocole::Tcp {
+                tcp::plafonner_le_rythme(s, max);
+            }
+            return Ok(());
+        }
         // TCP seulement ; -1 : la valeur du système (net.core.txrehash, 1).
         SO_TXREHASH => {
             if s.protocole != Protocole::Tcp {
@@ -2388,6 +2406,7 @@ const TAILLE_INFO: usize = 280;
 fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], usize), i64> {
     let mut o = [0u8; TAILLE_INFO];
     let ecoute = tcp::ecoute(s).then(|| tcp::file_d_ecoute(s));
+    let rythme_max = s.rythme_max.load(Ordering::Relaxed);
     let n = tcp::avec_options(s, |op, tcb| {
         let v = match option {
             TCP_NODELAY => op.nodelay as i32,
@@ -2420,11 +2439,11 @@ fn lire_option_tcp(s: &Arc<Socket>, option: i32) -> Result<([u8; TAILLE_INFO], u
                         if t.etat() == inet::tcp::Etat::TempsAttente {
                             i.etat = 7;
                         }
-                        ecrire_info(&mut o, &i)
+                        ecrire_info(&mut o, &i, rythme_max)
                     }
                     None => match ecoute {
-                        Some((pretes, file)) => ecrire_info(&mut o, &inet::tcp::Info::ecoute(pretes, file, &op.hors_connexion)),
-                        None => ecrire_info(&mut o, &inet::tcp::Info::sans_connexion(&op.hors_connexion, crate::temps::ns_monotone())),
+                        Some((pretes, file)) => ecrire_info(&mut o, &inet::tcp::Info::ecoute(pretes, file, &op.hors_connexion), rythme_max),
+                        None => ecrire_info(&mut o, &inet::tcp::Info::sans_connexion(&op.hors_connexion, crate::temps::ns_monotone()), rythme_max),
                     },
                 }
                 return Ok(TAILLE_INFO);
@@ -2468,7 +2487,7 @@ fn essais_en_secondes(essais: u32) -> i32 {
 /// La `struct tcp_info` de Linux 6.18 (280 octets) : les champs que nous tenons,
 /// zéro ailleurs (dont `tcpi_fackets` et `tcpi_last_ack_sent`, que Linux laisse
 /// aussi à 0).
-fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
+fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info, rythme_max: u64) {
     o[..8].copy_from_slice(&[i.etat, i.phase, i.retransmissions, i.sondes, i.recul, i.options, i.echelle_envoi | i.echelle_reception << 4, u8::from(i.debit_limite)]);
     let mots = [
         (8, i.rto), (12, i.ato), (16, i.snd_mss), (20, i.rcv_mss), (24, i.non_acquittes), (28, i.sackes), (32, i.perdus), (36, i.retransmis),
@@ -2482,8 +2501,8 @@ fn ecrire_info(o: &mut [u8; TAILLE_INFO], i: &inet::tcp::Info) {
         o[decalage..decalage + 4].copy_from_slice(&v.to_le_bytes());
     }
     o[104..112].copy_from_slice(&i.pacing.to_le_bytes());
-    // SO_MAX_PACING_RATE n'existe pas chez nous : aucune limite (`~0ULL`).
-    o[112..120].copy_from_slice(&inet::tcp::PACING_MAX.to_le_bytes());
+    // SO_MAX_PACING_RATE, celui de la socket (`tcpi_max_pacing_rate`).
+    o[112..120].copy_from_slice(&rythme_max.to_le_bytes());
     let longs = [
         (120, i.octets_acquittes), (128, i.octets_recus), (160, i.debit), (168, i.occupe), (176, i.fenetre_limitee), (184, i.tampon_limite),
         (200, i.octets_envoyes), (208, i.octets_renvoyes),
@@ -3323,6 +3342,17 @@ fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16]
         SO_RCVPRIORITY => entier(&mut o, s.drapeau(socket::RCVPRIORITY) as i32),
         SO_SELECT_ERR_QUEUE => entier(&mut o, s.drapeau(socket::SELECT_ERR_QUEUE) as i32),
         SO_ZEROCOPY => entier(&mut o, s.drapeau(socket::ZEROCOPIE) as i32),
+        // 8 octets s'il y a leur place ; sinon un entier, au plus ~0U (`sk_getsockopt`), dont
+        // une place plus petite prend les premiers octets (mesuré).
+        SO_MAX_PACING_RATE => {
+            let max = s.rythme_max.load(Ordering::Relaxed);
+            if place >= 8 {
+                o[..8].copy_from_slice(&max.to_le_bytes());
+                8
+            } else {
+                entier(&mut o, max.min(u32::MAX as u64) as u32 as i32)
+            }
+        }
         // Les drapeaux, puis `bind_phc` (0 : BIND_PHC ne passe jamais) ; la forme
         // _NEW ne les dit que si la dernière forme posée était une _NEW (sinon des
         // zéros, sans erreur).

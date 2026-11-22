@@ -560,7 +560,7 @@ impl<P: Charge> Tcb<P> {
         if rto > 0 {
             d = d.min(en_jiffies(rto as u64));
         }
-        self.armer_xmit(super::Minuteur::SondeDePerte, d, maintenant);
+        self.armer_xmit_au_rythme(super::Minuteur::SondeDePerte, d, maintenant);
         true
     }
 
@@ -579,8 +579,11 @@ impl<P: Charge> Tcb<P> {
                 let reste = self.octets_envoi.saturating_sub(debut);
                 let n = reste.min(self.mss_courant() as usize);
                 let avec_fin = self.fin_seq().is_some_and(|f| !apres(self.snd_nxt, f)) && n == reste;
-                // `tcp_write_xmit` (`push_one` à 2) : TSQ a son mot à dire, et ce qui part compte.
-                partie = !self.carte_trop_pleine(n, 0) && self.envoyer_donnees(n, avec_fin, maintenant, false, sortir);
+                // `tcp_write_xmit` (`push_one` à 2) : le rythme interne et TSQ ont leur mot à
+                // dire, et ce qui part compte.
+                partie = !self.retenu_par_le_rythme()
+                    && !self.carte_trop_pleine(n, 0)
+                    && self.envoyer_donnees(n, avec_fin, maintenant, false, sortir);
                 if partie {
                     self.apres_xmit(1, maintenant);
                 }

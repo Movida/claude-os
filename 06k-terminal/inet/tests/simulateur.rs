@@ -161,6 +161,8 @@ struct Simulation {
     renvois: u64,
     /// Le plus loin envoyé par A et par B.
     plus_loin: [Option<u32>; 2],
+    /// Le plafond de SO_MAX_PACING_RATE de A, en octets par seconde (0 : aucun).
+    rythme: u64,
 }
 
 impl Simulation {
@@ -210,17 +212,27 @@ impl Simulation {
         if alea.sous(2) == 0 {
             c.poser_controle(t::Controle::Reno);
         }
+        // Un essai sur quatre, le rythme interne chez A (SO_MAX_PACING_RATE, de 64 Kio/s à
+        // 8 Mio/s) : ses envois et ses renvois attendent leur heure, que réveille le
+        // minuteur du rythme.
+        let rythme = if alea.sous(4) == 0 { (64 << 10) << alea.sous(8) } else { 0 };
+        if rythme != 0 {
+            c.poser_rythme(rythme, false);
+        }
         a.tcb = Some(c);
-        Simulation { graine, alea, lien, heure: 0, ordre: 0, en_route: Vec::new(), a, b, segments: 0, perdus: 0, renvois: 0, plus_loin: [None; 2] }
+        Simulation {
+            graine, alea, lien, heure: 0, ordre: 0, en_route: Vec::new(), a, b, segments: 0, perdus: 0, renvois: 0, plus_loin: [None; 2],
+            rythme,
+        }
     }
 
     /// Ce que dit un échec : de quoi rejouer l'essai.
     fn contexte(&self) -> String {
         format!(
-            "graine {} : pertes {} ‰, duplications {} ‰, délai {} ms, gigue {} ms, {} et {} octets, heure {} ms, \
-             A {:?} (lus {}, erreur {}), B {:?} (lus {}, erreur {})",
+            "graine {} : pertes {} ‰, duplications {} ‰, délai {} ms, gigue {} ms, {} et {} octets, rythme {} o/s, \
+             heure {} ms, A {:?} (lus {}, erreur {}), B {:?} (lus {}, erreur {})",
             self.graine, self.lien.perte, self.lien.duplication, self.lien.delai / MS, self.lien.gigue / MS,
-            self.a.total, self.b.total, self.heure / MS,
+            self.a.total, self.b.total, self.rythme, self.heure / MS,
             self.a.tcb.as_ref().map(|c| c.etat()), self.a.lus, self.a.erreur,
             self.b.tcb.as_ref().map(|c| c.etat()), self.b.lus, self.b.erreur,
         )
@@ -494,7 +506,7 @@ fn simulateur() {
         Ok(g) => vec![g.parse().expect("une graine")],
         Err(_) => (1..=std::env::var("SIMULATEUR_ESSAIS").map_or(200, |n| n.parse().expect("un nombre"))).collect(),
     };
-    let (mut pertes, mut segments, mut erreurs, mut octets, mut renvois) = (0, 0, 0, 0, 0);
+    let (mut pertes, mut segments, mut erreurs, mut octets, mut renvois, mut rythmes) = (0, 0, 0, 0, 0, 0);
     for g in graines {
         let mut s = Simulation::nouvelle(g);
         s.jouer();
@@ -504,11 +516,18 @@ fn simulateur() {
         segments += s.segments;
         octets += s.a.lus + s.b.lus;
         erreurs += u64::from(s.a.erreur != 0 || s.b.erreur != 0);
+        rythmes += u64::from(s.rythme != 0 && s.a.total > 0);
     }
     // Une seule graine, rejouée : ce qu'elle exerce est son affaire. Toutes : elles doivent exercer
     // ce pour quoi elles sont là.
     if std::env::var("SIMULATEUR_GRAINE").is_err() {
-        assert!(pertes > 0 && renvois > 0 && octets > 0, "le simulateur n'exerce plus rien : {pertes} pertes, {renvois} renvois");
+        assert!(
+            pertes > 0 && renvois > 0 && octets > 0 && rythmes > 0,
+            "le simulateur n'exerce plus rien : {pertes} pertes, {renvois} renvois, {rythmes} rythmés"
+        );
     }
-    eprintln!("[simulateur] {segments} segments, {pertes} perdus, {renvois} renvoyés, {octets} octets livrés, {erreurs} abandons");
+    eprintln!(
+        "[simulateur] {segments} segments, {pertes} perdus, {renvois} renvoyés, {octets} octets livrés, {erreurs} abandons, \
+         {rythmes} rythmés"
+    );
 }
