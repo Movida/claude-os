@@ -146,7 +146,11 @@ pub fn temps() {
 
 /// Un message ARP reçu par `i` (la charge de la trame), dans la tâche du
 /// réseau ; `trame_diffusee` : sa trame allait à toutes les machines (une
-/// réponse diffusée ne prouve pas que son émetteur nous entend).
+/// réponse diffusée ne prouve pas que son émetteur nous entend). Jamais dans
+/// le cadre d'`ethernet::recevoir`, que traverse chaque paquet IPv4 reçu, sur
+/// le chemin le plus profond du réseau : le compilateur l'y a mis une fois
+/// (64 octets de plus pour IPv4, pour un message rare).
+#[inline(never)]
 pub fn recevoir(i: &'static Interface, a: &[u8], trame_diffusee: bool) {
     let Ok(a) = arp::lire(a) else { return };
     if a.operation != arp::REQUETE && a.operation != arp::REPONSE {

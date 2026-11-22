@@ -603,6 +603,57 @@ impl Reglages {
     };
 }
 
+/// Ce qu'une fille prend de son écoute quand elle naît, à la fin de sa poignée de main, et
+/// que sa connexion garde : les réglages de l'écoute À CE MOMENT-LÀ. Linux ne crée la socket
+/// d'une fille qu'à sa naissance (`tcp_check_req` → `tcp_v4_syn_recv_sock`) : `sk_clone_lock`
+/// y copie la socket de l'écoute telle qu'elle est alors ; ce que l'écoute change ensuite ne
+/// la touche plus, même avant l'`accept` (mesuré, sondes c10h et c10j : l'option posée sur
+/// l'écoute entre la naissance et l'`accept` ne vaut que pour les filles suivantes ; posée
+/// entre le SYN et la naissance, retardée par TCP_DEFER_ACCEPT, elle vaut pour celle-ci).
+///
+/// Ce qui vient de la demande reste celui du SYN (sa `request_sock`, faite au SYN) : le MSS de
+/// l'autre borné par le TCP_MAXSEG d'alors (`req->mss`, d'où notre MSS d'envoi), la fenêtre
+/// annoncée et son échelle, TCP_WINDOW_CLAMP (`tcp_openreq_init_rwin`) ; mesuré aussi.
+///
+/// Le noyau la donne avec chaque segment d'une fille encore en SYN_RECEIVED
+/// (`recevoir_fille`) ; celui qui la fait naître la prend (`verifier_fille`), avant
+/// l'établissement (`tcp_init_transfer` : `tcp_init_buffer_space` fait grandir SO_SNDBUF et
+/// borne la fenêtre d'après SO_RCVBUF, le contrôle de congestion démarre, le keepalive
+/// s'arme). Choix de conception : le noyau la redonne à chaque segment, prête, plutôt que la
+/// bibliothèque ne la demande au moment voulu (un rappel vers le noyau au milieu de
+/// `recevoir`) ; une fille ne voit qu'un ou deux segments avant de naître. Prêtée, pas
+/// gardée dans le `Tcb` : plus de 90 octets de plus à chaque connexion, et dans les cadres
+/// qui en construisent une par valeur (`depuis_syn`, `connecter`), sur les chemins les plus
+/// profonds du noyau. Écartés : la poser au SYN, puis renvoyer à chaque fille en
+/// SYN_RECEIVED chaque réglage que l'écoute change (chaque option devrait y penser) ; et la
+/// prendre à l'`accept` (trop tard : l'écoute a pu changer depuis la naissance, et la
+/// connexion est déjà établie).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Heritage {
+    /// SO_RCVBUF et SO_SNDBUF (déjà doublés), et s'ils sont fixés (`sk_userlocks`).
+    pub rcvbuf: usize,
+    pub sndbuf: usize,
+    pub rcvbuf_fixe: bool,
+    pub sndbuf_fixe: bool,
+    /// TCP_MAXSEG (`rx_opt.user_mss`), et le MSS que permet la route de la fille (son
+    /// `dst_metric_advmss`, d'après la MTU du chemin) : ce qu'elle dit pouvoir recevoir,
+    /// l'advmss, est le plus petit des deux (`tcp_mss_clamp`) ; son MSS d'envoi, lui, reste
+    /// celui de la demande.
+    pub mss_utilisateur: u16,
+    pub mss_route: u16,
+    /// SO_KEEPALIVE, SO_OOBINLINE, TCP_NODELAY, TCP_CORK, les délais... (TCP_DEFER_ACCEPT à
+    /// 0 : il est à la file d'acceptation de l'écoute, que `inet_csk_clone_lock` remet à zéro).
+    pub reglages: Reglages,
+    pub controle: Controle,
+    pub txrehash: bool,
+    pub rcvlowat: u32,
+    /// SO_MAX_PACING_RATE, et le rythme interne.
+    pub pacing_max: u64,
+    pub rythme_interne: bool,
+    /// TCP_QUICKACK à 0 (`icsk_ack.pingpong`, copié avec le reste : mesuré).
+    pub ping_pong: bool,
+}
+
 /// L'octet urgent reçu (le `urg_data` de Linux).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Urgent {
@@ -1758,6 +1809,26 @@ impl<P: Charge> Tcb<P> {
         self.depart = r.depart;
     }
 
+    /// La fille naît (`sk_clone_lock`, `tcp_create_openreq_child`, `tcp_v4_syn_recv_sock`) :
+    /// elle prend les réglages de son écoute, avant l'établissement qui en dépend. L'advmss
+    /// part de la route, borné par le TCP_MAXSEG d'alors (celui du SYN-ACK pouvait être un
+    /// autre : mesuré, il change TCP_INFO et la fenêtre, pas le MSS d'envoi) ; l'établissement
+    /// retire ensuite la place des horodatages.
+    fn heriter(&mut self, h: &Heritage) {
+        self.rcvbuf = h.rcvbuf;
+        self.sndbuf = h.sndbuf;
+        self.rcvbuf_fixe = h.rcvbuf_fixe;
+        self.sndbuf_fixe = h.sndbuf_fixe;
+        self.mss_utilisateur = h.mss_utilisateur;
+        self.mss_local = if h.mss_utilisateur != 0 { h.mss_route.min(h.mss_utilisateur) } else { h.mss_route };
+        self.reglages = h.reglages;
+        self.txrehash = h.txrehash;
+        self.rcvlowat = h.rcvlowat;
+        self.poser_controle(h.controle);
+        self.poser_rythme(h.pacing_max, h.rythme_interne);
+        self.ack.pingpong = u8::from(h.ping_pong);
+    }
+
     /// Le MSS, sauf face à un récepteur minuscule : la moitié de la plus grande
     /// fenêtre qu'il ait annoncée (`tcp_bound_to_half_wnd`, au moins 68 octets
     /// d'IP moins les en-têtes de TCP) : sinon un segment plein ne tiendrait
@@ -2471,7 +2542,7 @@ impl<P: Charge> Tcb<P> {
     /// dans son ordre, qui n'est pas celui d'une connexion). Rend vrai si la
     /// poignée de main est finie : ce segment la fait entrer dans ESTABLISHED
     /// et continue comme tout segment.
-    fn verifier_fille(&mut self, t: &Tcp, longueur_charge: u32, maintenant: u64, e: &mut Effets) -> bool {
+    fn verifier_fille(&mut self, t: &Tcp, longueur_charge: u32, maintenant: u64, naissance: Option<&Heritage>, e: &mut Effets) -> bool {
         let drapeaux = t.drapeaux & (tcp::RST | tcp::SYN | tcp::ACK);
         let (syn, fin) = (t.drapeaux & tcp::SYN != 0, t.drapeaux & tcp::FIN != 0);
         let fin_seq = t.seq.wrapping_add(longueur_charge + u32::from(syn) + u32::from(fin));
@@ -2550,7 +2621,10 @@ impl<P: Charge> Tcb<P> {
             self.compter_perte();
             return false;
         }
-        // La connexion naît (`tcp_create_openreq_child`).
+        // La connexion naît (`tcp_create_openreq_child`), copie de son écoute d'alors.
+        if let Some(h) = naissance {
+            self.heriter(h);
+        }
         if let Some(ts) = self.ts.as_mut() {
             ts.instant = maintenant;
         }
@@ -2631,6 +2705,16 @@ impl<P: Charge> Tcb<P> {
     /// données), à l'heure `maintenant`, dans l'ordre de la RFC 9293
     /// (3.10.7) et de `tcp_rcv_state_process`.
     pub fn recevoir(&mut self, t: &Tcp, charge: P, maintenant: u64) -> Effets {
+        self.recevoir_et_naitre(t, charge, maintenant, None)
+    }
+
+    /// De même pour une fille en SYN_RECEIVED, avec ce qu'elle prendra de son écoute si ce
+    /// segment la fait naître (`Heritage`).
+    pub fn recevoir_fille(&mut self, t: &Tcp, charge: P, maintenant: u64, naissance: &Heritage) -> Effets {
+        self.recevoir_et_naitre(t, charge, maintenant, Some(naissance))
+    }
+
+    fn recevoir_et_naitre(&mut self, t: &Tcp, charge: P, maintenant: u64, naissance: Option<&Heritage>) -> Effets {
         let mut e = Effets::default();
         self.heure = maintenant;
         self.place_a_voir = true;
@@ -2763,7 +2847,7 @@ impl<P: Charge> Tcb<P> {
             _ => {}
         }
         // La fille d'une écoute a ses propres règles jusqu'au troisième ACK.
-        if self.etat == Etat::SynRecu && self.fille && !self.verifier_fille(t, longueur_charge, maintenant, &mut e) {
+        if self.etat == Etat::SynRecu && self.fille && !self.verifier_fille(t, longueur_charge, maintenant, naissance, &mut e) {
             return e;
         }
         // L'ouverture simultanée, et la fille : en SYN_RECEIVED, le SYN-ACK

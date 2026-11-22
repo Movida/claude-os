@@ -367,13 +367,132 @@ pub struct Fille {
     /// (`sk_clone_lock` : une copie, comptée dans sa mémoire des options) : celui
     /// qui a jugé le segment qui l'a fait naître (`traiter_ecoute`).
     filtre: Option<Arc<Filtre>>,
+    /// SO_MARK de son écoute quand son SYN est arrivé (l'`ir_mark` de sa demande,
+    /// `inet_request_mark`), que sa socket gardera (`inet_csk_clone_lock` : `sk_mark`) :
+    /// mesuré, une marque posée sur l'écoute ensuite ne compte pas, même avant la naissance.
+    marque: u32,
+    /// Ce que sa socket prendra de son écoute, tel qu'à sa naissance (`Heritage`) : la
+    /// place est prise à son SYN, le contenu écrit à sa naissance (`naitre`).
+    heritage: Box<Heritage>,
+}
+
+/// Ce que la socket d'une fille prend de son écoute, tel qu'à sa naissance : `sk_clone_lock`
+/// y copie toute la socket de l'écoute (inet::tcp::Heritage dit pourquoi à ce moment-là, et ce
+/// qu'en prend la connexion elle-même) ; ce que l'écoute change ensuite ne vaut que pour les
+/// filles suivantes. Les options de la socket (`socket`, d'après le miroir de l'écoute,
+/// `Mode::Ecoute`), celles de SOL_TCP (`tcp`), ses drapeaux, ses compteurs et ses tampons ;
+/// déjà corrigés de ce que la naissance remet ou prend ailleurs (`naitre`), tels que sa socket
+/// les aura. Une fille née est déjà une socket chez Linux : jusqu'à l'`accept`, ses segments
+/// (`Fille::ip`), IP_MINTTL, ses erreurs ICMP et la MTU de son chemin suivent ces réglages-là,
+/// pas ceux de l'écoute.
+///
+/// Dans le tas, à part : plus de 300 octets, qui ne doivent ni grossir chaque `Fille` que
+/// déplacent la file des filles et l'`accept`, ni manquer à la naissance, qui arrive dans le
+/// contexte du réseau, au milieu d'un segment que la poignée de main a déjà accepté (Linux,
+/// dont la copie se fait là, `GFP_ATOMIC`, oublie l'ACK si elle échoue et attend que l'autre
+/// le redise : notre connexion est déjà établie quand on le sait). La place est donc prise au
+/// SYN, avec celle de la connexion (`traiter_ecoute`), comme un SYN sans place est jeté.
+struct Heritage {
+    /// Ce que sa connexion prendra de son écoute (inet::tcp::Heritage), redit avant chaque
+    /// segment de sa poignée de main (`preparer_naissance`), et prêté à celui-ci.
+    connexion: itcp::Heritage,
+    socket: socket::Options,
+    tcp: OptionsTcp,
+    /// Les drapeaux de réception et SO_TIMESTAMPING (`Socket::drapeaux`, `tsflags`), le
+    /// compteur des clés d'OPT_ID ; SO_RCVBUF et SO_SNDBUF ; SO_PEEK_OFF ; IP_MULTICAST_ALL.
+    drapeaux: u16,
+    tsflags: u32,
+    cle_emission: u32,
+    rcvbuf: u32,
+    sndbuf: u32,
+    peek_off: i32,
+    mc_all: bool,
+    /// La part de la clé des horodatages qu'elle compte depuis sa naissance, que sa socket
+    /// reprend à l'`accept`, et qu'une fille morte avant rend en disparaissant.
+    part: socket::PartDeCle,
+}
+
+impl Heritage {
+    /// Ce qu'elle a avant de naître : rien ne s'en sert encore.
+    const AVANT: Heritage = Heritage {
+        connexion: itcp::Heritage {
+            rcvbuf: 0, sndbuf: 0, rcvbuf_fixe: false, sndbuf_fixe: false, mss_utilisateur: 0, mss_route: itcp::MSS_DEFAUT,
+            reglages: itcp::Reglages::DEFAUT, controle: itcp::Controle::DEFAUT, txrehash: true, rcvlowat: 1,
+            pacing_max: itcp::PACING_MAX, rythme_interne: false, ping_pong: false,
+        },
+        socket: socket::Options::DEFAUT, tcp: OptionsTcp::DEFAUT, drapeaux: 0, tsflags: 0, cle_emission: 0, rcvbuf: 0, sndbuf: 0,
+        peek_off: -1, mc_all: true, part: socket::PartDeCle::AUCUNE,
+    };
+}
+
+/// La place de l'héritage d'une fille, prise à son SYN (`Heritage`) ; écrite à part, comme
+/// `tcb_de_syn` : plus de 300 octets qui ne doivent pas passer par la pile de qui l'appelle.
+#[inline(never)]
+fn heritage_avant(place: Box<MaybeUninit<Heritage>>) -> Box<Heritage> {
+    Box::write(place, Heritage::AVANT)
 }
 
 impl Fille {
-    /// Ce que ses segments mettent dans leur en-tête IPv4, d'après `ecoute`
-    /// (celui de son écoute) : ses options, sa liaison.
+    /// Ce que ses segments mettent dans leur en-tête IPv4 : ses options (l'écho de celles de
+    /// son SYN) et sa liaison (celle de son écoute à son SYN) ; le reste, d'après `ecoute`
+    /// (celui de son écoute) avant sa naissance (sa demande, chez Linux, n'a pas de réglages à
+    /// elle : son SYN-ACK prend ceux de l'écoute, et IP_TRANSPARENT de son SYN), puis d'après
+    /// les siens (`Heritage`).
     fn ip(&self, ecoute: Ip) -> Ip {
-        Ip { options: self.options, oif: self.interface, transparent: self.transparent, ..ecoute }
+        if self.etablie {
+            Ip::de(&self.heritage.tcp)
+        } else {
+            Ip { options: self.options, oif: self.interface, transparent: self.transparent, ..ecoute }
+        }
+    }
+
+    /// Ce que sa connexion prendra de son écoute si le segment qui arrive la fait naître
+    /// (inet::tcp::Heritage, dans le sien) : l'écoute `ecoute`, ses options de SOL_TCP `tcp` ; le MSS de
+    /// la route de sa socket à naître (celle de ses segments, par sa liaison et la portée de
+    /// l'écoute, `inet_csk_route_child_sock`). Hors de `traiter_ecoute`, qui est sur le
+    /// chemin le plus profond du réseau.
+    #[inline(never)]
+    fn preparer_naissance(&mut self, ecoute: &Socket, tcp: &OptionsTcp) {
+        let ip = self.ip(Ip::de(tcp));
+        let reglages = OptionsTcp { defer_accept: 0, ..*tcp }.reglages(false);
+        self.heritage.connexion = itcp::Heritage {
+            rcvbuf: ecoute.rcvbuf.load(Ordering::Relaxed) as usize, sndbuf: ecoute.sndbuf.load(Ordering::Relaxed) as usize,
+            rcvbuf_fixe: tcp.rcvbuf_fixe, sndbuf_fixe: tcp.sndbuf_fixe, mss_utilisateur: tcp.maxseg,
+            mss_route: mss_vers(ip.vers(self.distante), ip.oif, ip.portee), reglages, controle: tcp.controle,
+            txrehash: tcp.txrehash, rcvlowat: tcp.rcvlowat, pacing_max: ecoute.rythme_max.load(Ordering::Relaxed),
+            rythme_interne: tcp.rythme_interne, ping_pong: !tcp.quickack,
+        };
+    }
+
+    /// Elle naît : son héritage (`Heritage`) est la copie de son écoute `ecoute` (None : une
+    /// écoute qui se ferme, que personne n'acceptera plus ; ses compteurs restent ceux d'avant),
+    /// de ses options de SOL_TCP `tcp` et du miroir de celles de sa socket, `miroir` ; sauf ce
+    /// que la naissance remet : SO_PRIORITY à 0 (`sk_clone_lock`, mesuré), TCP_DEFER_ACCEPT
+    /// (à la file d'acceptation, vidée par `inet_csk_clone_lock`), la clé de MSG_ZEROCOPY (voir
+    /// `Socket::heriter`) ; et ce qu'elle tient d'ailleurs : sa marque et sa liaison de son SYN,
+    /// ses options IP (l'écho de son SYN, `ireq_opt`), le TTL, le TOS et l'interface du segment
+    /// qui l'a fait naître (IP_MULTICAST_TTL, IP_PKTOPTIONS : `tcp_v4_syn_recv_sock`). Ses
+    /// segments suivent désormais ses réglages (`ip`) : elle est établie, dans la file
+    /// d'acceptation.
+    #[inline(never)]
+    fn naitre(&mut self, ecoute: Option<&Socket>, tcp: &OptionsTcp, miroir: &socket::Options) {
+        let (mc_ttl, rcv_tos, mc_index) = self.arrivee;
+        let (ip_options, interface) = (self.options, self.interface);
+        let h = &mut *self.heritage;
+        h.socket = socket::Options { priority: 0, mark: self.marque, interface, ip_options, mc_ttl, rcv_tos, mc_index, ..*miroir };
+        h.tcp = OptionsTcp { defer_accept: 0, ip_options, interface, ..*tcp };
+        if let Some(e) = ecoute {
+            let d = e.drapeaux.load(Ordering::Relaxed);
+            h.drapeaux = d;
+            h.tsflags = e.tsflags.load(Ordering::Relaxed);
+            h.cle_emission = e.cle_emission.load(Ordering::Relaxed);
+            h.rcvbuf = e.rcvbuf.load(Ordering::Relaxed);
+            h.sndbuf = e.sndbuf.load(Ordering::Relaxed);
+            h.peek_off = e.peek_off.load(Ordering::Relaxed);
+            h.mc_all = e.mc_all.load(Ordering::Relaxed);
+            h.part = socket::PartDeCle::de(d);
+        }
+        self.etablie = true;
     }
 
     /// Émet ce qu'elle a à envoyer (`emettre_tcb`), avec `ecoute` (voir `ip`). Le RST qui
@@ -439,10 +558,23 @@ pub enum EtatSocket {
     EnDeconnexion,
 }
 
+/// Ce que garde une écoute, à côté de ses filles : la longueur de sa file (`listen`), et le
+/// miroir des options de sa socket (`socket::Options`, sous le `Mutex` de ses appels, qui
+/// dort) : ce que ses filles en copient à leur naissance, dans le contexte du réseau, qui ne
+/// peut pas le prendre (`Fille::naitre`). Le miroir suit chaque changement : sous la
+/// possession qui pose la copie de TCP pour une option qui en a une (`copies_changees`,
+/// `txrehash_change`), après l'option pour les autres (`options_changees`). Dans le tas : plus de 150 octets qui ne doivent pas grossir chaque
+/// `Partie`, que des cadres du chemin le plus profond du réseau construisent ou copient.
+pub struct Ecoute {
+    backlog: usize,
+    miroir: socket::Options,
+}
+
 /// Ce qu'est la socket.
 pub enum Mode {
     Neuve,
-    Ecoute { backlog: usize, filles: VecDeque<Fille> },
+    /// Une écoute : ses filles, et le reste (`Ecoute`).
+    Ecoute { filles: VecDeque<Fille>, ecoute: Box<Ecoute> },
     /// Dans le tas, comme la `tcp_sock` de Linux (`sk_prot_alloc`) : plus d'un Kio qui ne doit
     /// ni passer par la pile de 16 Kio de qui la manipule, ni grossir chaque `Partie`.
     Connexion(Box<Tcb<Paquet>>),
@@ -794,7 +926,7 @@ impl Partie {
             _ => (None, 0, false, self.erreur_seule, sndbuf, sndbuf, rcvbuf, false, false),
         };
         let (ecoute, pretes, file) = match &self.mode {
-            Mode::Ecoute { filles, backlog } => (true, filles.iter().filter(|f| f.prete()).count(), *backlog),
+            Mode::Ecoute { filles, ecoute } => (true, filles.iter().filter(|f| f.prete()).count(), ecoute.backlog),
             _ => (false, 0, 0),
         };
         Premier {
@@ -1806,14 +1938,18 @@ impl Possede for Partie {
                     t.fin_d_emission();
                 }
             }
-            Mode::Ecoute { filles, backlog } => {
+            Mode::Ecoute { filles, ecoute } => {
                 let embryons = filles.iter().filter(|f| f.tcb.etat() == Etat::SynRecu);
                 let qlen = embryons.clone().count() as u32;
                 let jeunes = embryons.filter(|f| f.tcb.fille_jeune()).count() as u32;
-                let essais = itcp::essais_de_filles(syncnt, qlen, jeunes, *backlog as u32);
+                let essais = itcp::essais_de_filles(syncnt, qlen, jeunes, ecoute.backlog as u32);
                 for f in filles.iter_mut() {
-                    f.tcb.reglages.defer_accept = defer;
-                    f.tcb.reglages.syn_essais = syncnt;
+                    // Une demande suit son écoute (`reqsk_timer_handler` lit les siens) ; une
+                    // fille née a les siens (`Heritage`).
+                    if f.tcb.etat() == Etat::SynRecu {
+                        f.tcb.reglages.defer_accept = defer;
+                        f.tcb.reglages.syn_essais = syncnt;
+                    }
                     f.tcb.reduire_essais(essais);
                     f.tcb.minuteur(maintenant);
                     f.emettre(ip, None, hachage_ecoute);
@@ -1924,23 +2060,25 @@ impl Partie {
     }
 
     /// IP_MINTTL (RFC 5082, GTSM) : un segment ou une erreur ICMP de TTL
-    /// `ttl` est-il jeté ? Oui sous le minimum, pour la socket et pour une
-    /// fille établie (elle l'a hérité), pas pour une fille dont la poignée
-    /// de main n'a pas abouti (`tcp_v4_rcv` et `tcp_v4_err` servent une
-    /// `request_sock` avant de regarder). L'erreur ICMP compare le TTL de
-    /// l'en-tête recopié, comme `tcp_v4_err` (son `iph`). Linux compte
-    /// TCPMinTTLDrop, que nous n'avons pas (pas de /proc/net/netstat).
+    /// `ttl` est-il jeté ? Oui sous le minimum, pour la socket, et pour une
+    /// fille née sous le sien (celui de son écoute à sa naissance, `Heritage`) ;
+    /// pas pour une fille dont la poignée de main n'a pas abouti (`tcp_v4_rcv`
+    /// et `tcp_v4_err` servent une `request_sock` avant de regarder). L'erreur
+    /// ICMP compare le TTL de l'en-tête recopié, comme `tcp_v4_err` (son
+    /// `iph`). Linux compte TCPMinTTLDrop, que nous n'avons pas (pas de
+    /// /proc/net/netstat).
     fn ttl_trop_petit(&self, ttl: u8, fille: Option<u64>) -> bool {
-        if ttl >= self.options.minttl {
-            return false;
-        }
         match (&self.mode, fille) {
-            // Une fille partie entre-temps : le segment ira à l'écoute, qui regarde.
-            (Mode::Ecoute { filles, .. }, Some(n)) => filles.iter().find(|f| f.numero == n).is_none_or(|f| f.tcb.etat() != Etat::SynRecu),
+            (Mode::Ecoute { filles, .. }, Some(n)) => match filles.iter().find(|f| f.numero == n) {
+                Some(f) if f.tcb.etat() == Etat::SynRecu => false,
+                Some(f) => ttl < f.heritage.tcp.minttl,
+                // Une fille partie entre-temps : le segment ira à l'écoute, qui regarde.
+                None => ttl < self.options.minttl,
+            },
             // Plus rien n'écoute : Linux ne la trouverait pas, et répondrait
             // RST quel que soit le TTL.
             (Mode::Neuve, _) => false,
-            _ => true,
+            _ => ttl < self.options.minttl,
         }
     }
 
@@ -1949,18 +2087,17 @@ impl Partie {
     /// sinon la route la retient, et la connexion suit. Ni une écoute, ni une fille en
     /// SYN_RECEIVED (`tcp_req_err` : ses SYN-ACK sont toujours petits).
     fn mtu_reduite(&mut self, info: u32, seq: u32, fille: Option<u64>) {
-        let pmtudisc = self.options.pmtudisc;
-        // La portée de la socket : celle de l'écoute pour une fille pas encore
-        // acceptée (elle en a hérité SO_DONTROUTE).
-        let portee = Ip::de(&self.options).portee;
-        let (t, distante, oif) = match (&mut self.mode, fille) {
-            (Mode::Connexion(t), None) => (t, self.adresses.distante, self.options.interface),
+        // IP_MTU_DISCOVER et la portée de la socket (SO_DONTROUTE) : ceux d'une fille née
+        // pas encore acceptée sont les siens (`Heritage`).
+        let (t, distante, ip) = match (&mut self.mode, fille) {
+            (Mode::Connexion(t), None) => (t, self.adresses.distante, Ip::de(&self.options)),
             (Mode::Ecoute { filles, .. }, Some(n)) => {
                 let Some(f) = filles.iter_mut().find(|f| f.numero == n && f.tcb.etat() != Etat::SynRecu) else { return };
-                (&mut f.tcb, f.distante, f.interface)
+                (&mut f.tcb, f.distante, Ip::de(&f.heritage.tcp))
             }
             _ => return,
         };
+        let (pmtudisc, portee, oif) = (ip.pmtudisc, ip.portee, ip.oif);
         let (una, nxt, _) = t.numeros();
         if itcp::avant(seq, una) || itcp::apres(seq, nxt) {
             return;
@@ -2000,8 +2137,9 @@ impl Partie {
                     }
                 } else if en_vol(&f.tcb) {
                     // Une fille établie, en attente d'accept : une connexion
-                    // comme une autre (chez Linux, déjà une socket).
-                    f.tcb.erreur_icmp(errno, seq, injoignable, recverr, maintenant());
+                    // comme une autre (chez Linux, déjà une socket), sous son
+                    // IP_RECVERR à elle (`Heritage`), pas celui de l'écoute.
+                    f.tcb.erreur_icmp(errno, seq, injoignable, f.heritage.socket.recverr, maintenant());
                     ranger_filles(filles);
                 }
             }
@@ -2017,7 +2155,8 @@ impl Partie {
         let defer = self.options.defer_accept;
         let numero_ecoute = self.numero;
         let hachage_ecoute = self.options.hors_connexion.hachage;
-        let Mode::Ecoute { backlog, filles } = &mut self.mode else { return };
+        let Mode::Ecoute { filles, ecoute: e } = &mut self.mode else { return };
+        let (backlog, miroir) = (e.backlog, &e.miroir);
         if let Some(n) = s.fille {
             if let Some(f) = filles.iter_mut().find(|f| f.numero == n) {
                 // La somme fausse d'un segment de plus de 76 octets : une erreur ;
@@ -2044,21 +2183,34 @@ impl Partie {
                     }
                     return;
                 }
-                f.tcb.reglages.defer_accept = defer;
                 let en_poignee = f.tcb.etat() == Etat::SynRecu;
                 // Une fille en SYN_RECEIVED, une demande : le filtre de l'écoute, après
                 // la somme (`tcp_v4_rcv`, TCP_NEW_SYN_RECV : `tcp_filter` avec l'écoute) ;
                 // ce qu'il jette est une perte de l'écoute. Le segment qui la fait naître
-                // lui en laisse une copie (`sk_clone_lock`).
-                let filtre = if en_poignee { par_numero(numero_ecoute).and_then(|e| filtre::de(&e)) } else { None };
+                // lui en laisse une copie (`sk_clone_lock`), avec tout le reste de l'écoute
+                // d'alors.
+                let ecoute = if en_poignee { par_numero(numero_ecoute) } else { None };
+                let filtre = ecoute.as_ref().and_then(|e| filtre::de(e));
                 if let Some(filtre) = &filtre
                     && !filtrer(filtre, &mut s)
                 {
                     perte(numero_ecoute, 1);
                     return;
                 }
+                // Une demande suit son écoute ; ce qu'elle en prendra si ce segment la fait
+                // naître, sa connexion le prend avant de s'établir (inet::tcp::Heritage).
+                if en_poignee {
+                    f.tcb.reglages.defer_accept = defer;
+                    if let Some(e) = &ecoute {
+                        f.preparer_naissance(e, &self.options);
+                    }
+                }
                 let (avant, heure) = (f.tcb.lisibles_dans_le_flux(), s.charge.contexte().horodatage);
-                f.tcb.recevoir(&s.entete, s.charge, maintenant());
+                if en_poignee && ecoute.is_some() {
+                    f.tcb.recevoir_fille(&s.entete, s.charge, maintenant(), &f.heritage.connexion);
+                } else {
+                    f.tcb.recevoir(&s.entete, s.charge, maintenant());
+                }
                 if f.tcb.lisibles_dans_le_flux() > avant {
                     f.horodatage = heure;
                 }
@@ -2067,6 +2219,12 @@ impl Partie {
                     f.arrivee = (s.ip.ttl, s.ip.tos, s.interface);
                     f.processeur = s.processeur;
                     f.filtre = filtre;
+                    f.naitre(ecoute.as_ref().map(|e| &**e), &self.options, miroir);
+                    // Sa place dans la table permet ce que permet sa socket (`sk_reuse`,
+                    // `sk_reuseport`, copiés : un `bind` les compare).
+                    if let Some(t) = TABLE.verrouiller().as_mut() {
+                        t.reutiliser(f.numero, f.heritage.socket.reuseaddr, f.heritage.socket.reuseport);
+                    }
                 }
                 // Ce qu'une fille en SYN_RECEIVED jette est une perte de l'écoute (le
                 // `discard_and_relse` de `tcp_v4_rcv`, quand `tcp_check_req` rend NULL) ;
@@ -2139,11 +2297,13 @@ impl Partie {
         // Un SYN : jeté si la file d'acceptation est pleine, ou s'il y a
         // déjà backlog + 1 filles (`tcp_conn_request`).
         let pretes = filles.iter().filter(|f| f.prete()).count();
-        if pretes > *backlog || filles.len() > *backlog || filles.try_reserve(1).is_err() {
+        if pretes > backlog || filles.len() > backlog || filles.try_reserve(1).is_err() {
             perdu();
             return;
         }
-        let Ok(place) = faillible::boite_vide() else {
+        // La place de sa connexion, et celle de ce que sa socket prendra de l'écoute à sa
+        // naissance (`Heritage`).
+        let (Ok(place), Ok(place_heritage)) = (faillible::boite_vide(), faillible::boite_vide()) else {
             perdu();
             return;
         };
@@ -2217,6 +2377,7 @@ impl Partie {
         let mut f = Fille {
             numero, tcb, locale: s.destination, distante: s.source, identifiant: crate::aleatoire::u32() as u16, etablie: false,
             arrivee: (0, 0, 0), options, interface: ip.oif, transparent: ip.transparent, processeur: -1, horodatage: 0, filtre: None,
+            marque: miroir.mark, heritage: heritage_avant(place_heritage),
         };
         f.emettre(ip, None, hachage_ecoute);
         // La place est prise plus haut, avant tout changement.
@@ -2738,8 +2899,8 @@ pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
         return Err(-EINVAL);
     }
     match &mut p.mode {
-        Mode::Ecoute { backlog: b, .. } => {
-            *b = backlog;
+        Mode::Ecoute { ecoute, .. } => {
+            ecoute.backlog = backlog;
             g.publier(|p, c| p.rafraichir(c));
             return Ok(());
         }
@@ -2748,10 +2909,15 @@ pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
         Mode::Connexion(_) => return Err(-EINVAL),
         Mode::Neuve => {}
     }
+    // La place de ce que garde l'écoute d'abord (`Ecoute` : sa file, le miroir de ses options),
+    // avant tout changement : sans mémoire, ENOMEM, comme le groupe SO_REUSEPORT plus bas. Le
+    // miroir est lu sous la possession, comme à chaque changement qui le suivra
+    // (`options_changees`) : aucun ne peut passer entre deux.
+    let op = s.appels.verrouiller().options;
+    let Ok(ecoute) = faillible::boite(Ecoute { backlog, miroir: op }) else { return Err(-ENOMEM) };
     let p = g.donnee();
     if !p.adresses.lie {
         // L'adresse d'un `bind` sans port (IP_BIND_ADDRESS_NO_PORT), s'il y en a eu un.
-        let op = s.appels.verrouiller().options;
         let lien = Lien {
             sorte: Sorte::Liee, adresse: p.adresses.adresse, port: 0, distante: [0; 4], port_distant: 0, reuseaddr: op.reuseaddr,
             reuseport: op.reuseport, uid: s.uid, par_connect: false, plage: op.local_port_range, interface: op.interface,
@@ -2770,7 +2936,7 @@ pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
         Some(Err(ports_tcp::Refus::Memoire)) => return Err(-ENOMEM),
         _ => return Err(-EADDRINUSE),
     }
-    p.mode = Mode::Ecoute { backlog, filles: VecDeque::new() };
+    p.mode = Mode::Ecoute { filles: VecDeque::new(), ecoute };
     // `inet_csk_listen_start` efface l'état des ACK : TCP_QUICKACK à 0 ne survit pas à `listen`.
     p.options.quickack = true;
     g.publier(|p, c| p.rafraichir(c));
@@ -3012,11 +3178,9 @@ impl Possession<Partie> {
 /// socket ; rien : EAGAIN (non bloquant), ou attendre. Rend la socket
 /// neuve et l'adresse du pair.
 pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8; 4], u16), i64> {
-    // Les options de l'écoute, que la socket neuve hérite (`sk_clone_lock`
-    // recopie la socket entière : SO_LINGER, SO_RCVTIMEO, SO_SNDTIMEO,
-    // SO_KEEPALIVE, SO_OOBINLINE, IP_TTL...), lues une fois, avant d'attendre.
-    let options = s.appels.verrouiller().options;
-    let delai = options.rcvtimeo;
+    // SO_RCVTIMEO de l'écoute borne l'attente. (La socket neuve, elle, prend les options de
+    // l'écoute telles qu'à la naissance de sa fille : `Heritage`.)
+    let delai = s.appels.verrouiller().options.rcvtimeo;
     let echeance = delai.map(|d| crate::temps::ns_monotone().saturating_add(d));
     let mut g = flux(s).posseder();
     loop {
@@ -3032,9 +3196,8 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             else { return Err(-ENFILE) };
             let f = filles.remove(i).expect("la fille");
             let (port, distante, port_distant, locale) = (f.tcb.port_local, f.distante, f.tcb.port_distant, f.locale);
-            let (mc_ttl, rcv_tos, mc_index) = f.arrivee;
-            let (numero, ip_options, interface, processeur, horodatage) = (f.numero, f.options, f.interface, f.processeur, f.horodatage);
-            let filtre = f.filtre;
+            let (numero, processeur, horodatage) = (f.numero, f.processeur, f.horodatage);
+            let (filtre, mut h) = (f.filtre, f.heritage);
             let enfant = enfant.avec_numero(numero);
             // Une fille fermée avant l'accept (un RST) a déjà quitté la
             // table : sa lecture dira son erreur.
@@ -3055,32 +3218,32 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 // ce qu'était son écoute, liée à son port si `bind` l'a nommé.
                 adresses: Adresses { lie: true, port, distante, port_distant, source: locale, ..p.adresses },
                 identifiant: f.identifiant, orpheline: false, hors_table,
-                // Tout, sauf ce qui est propre à une écoute (`inet_csk_clone_lock`,
-                // `inet_csk_delack_init`) : la fille n'attend pas de données pour naître deux fois.
-                options: OptionsTcp { defer_accept: 0, quickack: true, ip_options, interface, rythme_interne, ..p.options },
+                // Celles de son écoute à sa naissance (`Heritage`, `Fille::naitre`).
+                options: OptionsTcp { rythme_interne, ..h.tcp },
                 etat_socket: EtatSocket::Connectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
                 compte: compte.clone(), route_oubliee: false, horodatage, demandes: VecDeque::new(), avis: VecDeque::new(),
             };
             let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
             let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
             let enfant = place_socket.remplir(enfant.avec_flux(flux, compte));
-            enfant.rcvbuf.store(s.rcvbuf.load(Ordering::Relaxed), Ordering::Relaxed);
-            enfant.sndbuf.store(s.sndbuf.load(Ordering::Relaxed), Ordering::Relaxed);
+            // Une copie de l'écoute à sa naissance (`sk_clone_lock`) : ses tampons, ses
+            // drapeaux de réception et d'horodatage, avec la part de la clé que la fille
+            // compte depuis ; le processeur de son dernier segment.
+            enfant.rcvbuf.store(h.rcvbuf, Ordering::Relaxed);
+            enfant.sndbuf.store(h.sndbuf, Ordering::Relaxed);
             enfant.pertes.store(pertes, Ordering::Relaxed);
-            enfant.recverr.store(options.recverr, Ordering::Relaxed);
-            enfant.pmtudisc.store(options.pmtudisc, Ordering::Relaxed);
-            enfant.peek_off.store(s.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
-            enfant.mc_all.store(s.mc_all.load(Ordering::Relaxed), Ordering::Relaxed);
-            // Une copie de l'écoute (`sk_clone_lock`) : ses drapeaux de réception
-            // et d'horodatage ; le processeur de sa naissance.
-            enfant.heriter_de(s);
+            enfant.recverr.store(h.socket.recverr, Ordering::Relaxed);
+            enfant.pmtudisc.store(h.socket.pmtudisc, Ordering::Relaxed);
+            enfant.peek_off.store(h.peek_off, Ordering::Relaxed);
+            enfant.mc_all.store(h.mc_all, Ordering::Relaxed);
+            enfant.heriter(h.drapeaux, h.tsflags, h.cle_emission, &mut h.part);
             enfant.processeur.store(processeur, Ordering::Relaxed);
             // Le filtre de l'écoute à sa naissance, compté dans sa mémoire des options
             // (`sk_clone_lock` : `sk_filter_charge`, qui passe toujours : la socket neuve
             // n'y compte rien encore, et l'écoute l'a déjà fait tenir sous OPTMEM_MAX).
             *enfant.filtre.verrouiller() = filtre;
             enfant.rythme_max.store(rythme_max, Ordering::Relaxed);
-            enfant.appels.verrouiller().options = socket::Options { mc_ttl, rcv_tos, mc_index, ip_options, interface, ..options };
+            enfant.appels.verrouiller().options = h.socket;
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.changer_objet(numero, Cible::Socket(enfant.clone()));
             }
@@ -3796,14 +3959,23 @@ pub fn avec_options<R>(s: &Socket, f: impl FnOnce(&mut OptionsTcp, Option<&mut T
 /// retiré, un IP_TOS qui change) : IP_MTU dit ENOTCONN jusqu'au segment
 /// suivant qui en trouve une (mesuré).
 pub fn avec_options_et_route<R>(s: &Socket, oublier_la_route: bool, f: impl FnOnce(&mut OptionsTcp, Option<&mut Tcb<Paquet>>) -> R) -> R {
+    posseder_les_options(s, oublier_la_route, |op, t, _| f(op, t))
+}
+
+/// Le corps d'`avec_options_et_route` et de `copies_changees` : `f` reçoit aussi le miroir
+/// d'une écoute.
+fn posseder_les_options<R>(s: &Socket, oublier_la_route: bool,
+                           f: impl FnOnce(&mut OptionsTcp, Option<&mut Tcb<Paquet>>, Option<&mut socket::Options>) -> R)
+                           -> R {
     let mut g = flux(s).posseder();
     let p = g.donnee();
     p.route_oubliee |= oublier_la_route;
-    let tcb = match &mut p.mode {
-        Mode::Connexion(t) => Some(&mut **t),
-        _ => None,
+    let (tcb, miroir) = match &mut p.mode {
+        Mode::Connexion(t) => (Some(&mut **t), None),
+        Mode::Ecoute { ecoute, .. } => (None, Some(&mut ecoute.miroir)),
+        Mode::Neuve => (None, None),
     };
-    let r = f(&mut p.options, tcb);
+    let r = f(&mut p.options, tcb, miroir);
     let _contexte = contexte::entrer();
     p.emettre();
     p.apres();
@@ -3824,21 +3996,52 @@ pub fn fin_d_episse(s: &Socket) {
     });
 }
 
-/// SO_KEEPALIVE, SO_OOBINLINE ou SO_DONTROUTE a changé : la socket en garde
-/// la copie, et la connexion en tient compte (le keepalive armé ou arrêté ;
-/// la route oubliée pour SO_DONTROUTE, `oublier_la_route`). Les options
-/// relues sous la possession, qui range les changements : deux setsockopt
-/// à la fois ne peuvent pas y laisser le plus ancien (le dernier à posséder
-/// voit les deux ; Linux pose et applique sous le même `lock_sock`).
+/// Une option de SOL_SOCKET ou de SOL_IP dont TCP garde une copie a changé (TCP émet et
+/// reçoit sans le `Mutex` des appels) : `f` pose cette copie d'après les options de la
+/// socket `o`, lues sous la possession, qui range les changements : deux setsockopt à la
+/// fois ne peuvent pas y laisser le plus ancien (le dernier à posséder voit les deux ; Linux
+/// pose et applique sous le même `lock_sock`). Le miroir d'une écoute est pris de la même
+/// lecture, sous la même possession, où naissent aussi ses filles : chacune copie les deux
+/// d'avant ou les deux d'après. Écarté : laisser le miroir à `options_changees`, après le
+/// retour de l'option, dans une autre possession : une fille née entre les deux garderait
+/// toute sa vie la copie de TCP nouvelle et le miroir ancien (getsockopt(SO_KEEPALIVE) à 0
+/// pendant que ses sondes partent) ; Linux n'en a qu'une, que `sk_clone_lock` prend d'un coup.
+/// Ordre : la possession, puis le `Mutex` (celui de TCP) ; les appelants l'ont rendu.
+pub fn copies_changees(s: &Socket, oublier_la_route: bool, f: impl FnOnce(&socket::Options, &mut OptionsTcp, Option<&mut Tcb<Paquet>>)) {
+    posseder_les_options(s, oublier_la_route, |op, t, miroir| {
+        let o = s.appels.verrouiller().options;
+        f(&o, op, t);
+        if let Some(m) = miroir {
+            *m = o;
+        }
+    });
+}
+
+/// SO_KEEPALIVE, SO_OOBINLINE ou SO_DONTROUTE a changé : la connexion en
+/// tient compte (le keepalive armé ou arrêté ; la route oubliée pour
+/// SO_DONTROUTE, `oublier_la_route`).
 pub fn options_socket_changees(s: &Socket, oublier_la_route: bool) {
-    avec_options_et_route(s, oublier_la_route, |op, t| {
-        let i = s.appels.verrouiller();
-        (op.keepalive, op.oobinline, op.dontroute) = (i.options.keepalive, i.options.oobinline, i.options.dontroute);
-        drop(i);
+    copies_changees(s, oublier_la_route, |o, op, t| {
+        (op.keepalive, op.oobinline, op.dontroute) = (o.keepalive, o.oobinline, o.dontroute);
         if let Some(t) = t {
             t.regler(op.reglages(t.reglages.orpheline), maintenant());
         }
     });
+}
+
+/// Une option de SOL_SOCKET ou de SOL_IP a pu changer (setsockopt, appels_reseau.rs) : une
+/// écoute en garde le miroir (`Mode::Ecoute`), que copient ses filles à leur naissance (celles
+/// dont TCP garde une copie l'ont déjà mis à jour : `copies_changees`). Relu
+/// sous la possession, qui range les changements : deux setsockopt à la fois ne peuvent pas
+/// y laisser le plus ancien (chacun relit après le sien, le dernier à posséder voit les deux).
+/// Linux n'en a pas besoin : `sk_clone_lock` copie la socket elle-même, sous le verrou de
+/// l'écoute que prend aussi son setsockopt (`lock_sock`) ; nos options sont sous un `Mutex`
+/// qui dort, que le contexte du réseau ne peut pas prendre.
+pub fn options_changees(s: &Socket) {
+    let mut g = flux(s).posseder();
+    if let Mode::Ecoute { ecoute, .. } = &mut g.donnee().mode {
+        ecoute.miroir = s.appels.verrouiller().options;
+    }
 }
 
 /// SO_SNDBUF de la connexion, qui grandit (`tcp_sndbuf_expand`) ; sans
@@ -4138,11 +4341,14 @@ pub fn detacher_programme(s: &Socket, inet: &socket::Inet) -> Result<Arc<Filtre>
 pub fn txrehash_change(s: &Socket) {
     let mut g = flux(s).posseder();
     let p = g.donnee();
-    let oui = s.appels.verrouiller().options.txrehash != 0;
+    let o = s.appels.verrouiller().options;
+    let oui = o.txrehash != 0;
     p.options.txrehash = oui;
     match &mut p.mode {
         Mode::Connexion(t) => t.txrehash = oui,
-        Mode::Ecoute { filles, .. } => {
+        Mode::Ecoute { filles, ecoute } => {
+            // Le miroir de la même lecture (voir `copies_changees`).
+            ecoute.miroir = o;
             for f in filles.iter_mut().filter(|f| f.tcb.etat() == Etat::SynRecu) {
                 f.tcb.txrehash = oui;
             }
@@ -4152,11 +4358,10 @@ pub fn txrehash_change(s: &Socket) {
 }
 
 /// SO_MAX_PACING_RATE (`sk_setsockopt`) : le plafond `max` (déjà dans la socket) vaut
-/// pour la connexion, qui borne aussitôt son débit et le suit au segment suivant ; pour
-/// les filles pas encore nées d'une écoute (des demandes chez Linux, dont la socket
-/// copiera celle de l'écoute au dernier segment de la poignée de main) ; sans connexion,
-/// pour le débit que la socket garde (TCP_INFO le montre). Un plafond fini allume le rythme
-/// interne, pour toujours.
+/// pour la connexion, qui borne aussitôt son débit et le suit au segment suivant ; sans
+/// connexion, pour le débit que la socket garde (TCP_INFO le montre). Les filles d'une
+/// écoute le prennent à leur naissance (inet::tcp::Heritage). Un plafond fini allume le
+/// rythme interne, pour toujours.
 pub fn plafonner_le_rythme(s: &Socket, max: u64) {
     let mut g = flux(s).posseder();
     let p = g.donnee();
@@ -4164,13 +4369,7 @@ pub fn plafonner_le_rythme(s: &Socket, max: u64) {
     let interne = p.options.rythme_interne;
     match &mut p.mode {
         Mode::Connexion(t) => t.poser_rythme(max, interne),
-        Mode::Ecoute { filles, .. } => {
-            for f in filles.iter_mut().filter(|f| f.tcb.etat() == Etat::SynRecu) {
-                f.tcb.poser_rythme(max, interne);
-            }
-            p.options.hors_connexion.plafonner(max);
-        }
-        Mode::Neuve => p.options.hors_connexion.plafonner(max),
+        Mode::Ecoute { .. } | Mode::Neuve => p.options.hors_connexion.plafonner(max),
     }
 }
 
@@ -4201,15 +4400,14 @@ pub fn conseil_negatif(s: &Socket) {
 /// SO_RCVBUF, SO_SNDBUF ou SO_BUF_LOCK a changé (`sndbuf_change`,
 /// `rcvbuf_change` : les tailles qui ont changé) : la connexion suit les
 /// verrous des tampons de la socket (socket::VERROU_SNDBUF, VERROU_RCVBUF)
-/// et ses tailles, relus sous la possession, comme
-/// `options_socket_changees`. Un SO_SNDBUF verrouillé ne grandit plus de
+/// et ses tailles, relus sous la possession (`copies_changees`). Un SO_SNDBUF verrouillé ne grandit plus de
 /// lui-même, un SO_RCVBUF verrouillé non plus, et borne l'échelle de
 /// fenêtre de la connexion à venir ; SO_BUF_LOCK peut les déverrouiller,
 /// et la connexion recommence à les faire grandir (`tcp_sndbuf_expand`,
 /// `tcp_rcvbuf_grow` regardent `sk_userlocks` à chaque fois).
 pub fn tampons_changes(s: &Socket, sndbuf_change: bool, rcvbuf_change: bool) {
-    avec_options(s, |op, t| {
-        let verrous = s.appels.verrouiller().options.verrous_tampons;
+    copies_changees(s, false, |o, op, t| {
+        let verrous = o.verrous_tampons;
         let (r, e) = (s.rcvbuf.load(Ordering::Relaxed) as usize, s.sndbuf.load(Ordering::Relaxed) as usize);
         let (sndbuf_fixe, rcvbuf_fixe) = (verrous & super::socket::VERROU_SNDBUF != 0, verrous & super::socket::VERROU_RCVBUF != 0);
         op.sndbuf_fixe = sndbuf_fixe;

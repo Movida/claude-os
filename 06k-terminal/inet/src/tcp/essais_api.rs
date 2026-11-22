@@ -803,6 +803,43 @@ fn la_fille_d_une_ecoute_qui_a_ete_une_connexion() {
 }
 
 #[test]
+fn la_fille_prend_son_ecoute_a_sa_naissance() {
+    const S: u64 = 1_000_000_000;
+    let h = Heritage {
+        rcvbuf: 40_000, sndbuf: 60_000, rcvbuf_fixe: true, sndbuf_fixe: true, mss_utilisateur: 600, mss_route: MSS as u16,
+        reglages: Reglages { keepalive: true, keepidle: 100 * S, nodelay: true, ..Reglages::DEFAUT },
+        controle: Controle::Reno, txrehash: false, rcvlowat: 7, pacing_max: 1_000_000, rythme_interne: true, ping_pong: true,
+    };
+    let pour = |c: &C, drapeaux: u8, n: usize| (Tcp { seq: c.rcv_nxt, ack: ISS + 1, drapeaux, fenetre: 65535, ..Tcp::default() }, octets(n, 576 + n));
+    // TCP_DEFER_ACCEPT : l'ACK nu ne la fait pas naître ; elle ne prend rien.
+    let mut f = fille(false);
+    f.reglages.defer_accept = 1;
+    let (t, o) = pour(&f, tcp::ACK, 0);
+    f.recevoir_fille(&t, o, HEURE, &h);
+    assert_eq!(f.etat(), Etat::SynRecu);
+    assert_eq!((f.rcvbuf, f.rcvbuf_fixe, f.mss_utilisateur, f.controle()), (131_072, false, 0, Controle::DEFAUT));
+    // Ses données la font naître : elle prend tout, avant l'établissement, qui en dépend.
+    let (t, o) = pour(&f, tcp::ACK, 3);
+    f.recevoir_fille(&t, o, HEURE + MS, &h);
+    assert_eq!(f.etat(), Etat::Etablie);
+    // Les tampons fixés : SO_SNDBUF ne grandit pas ; la fenêtre bornée par SO_RCVBUF
+    // (`tcp_init_buffer_space`), l'advmss par TCP_MAXSEG (son MSS d'envoi reste celui de la demande).
+    assert_eq!((f.rcvbuf, f.sndbuf, f.rcvbuf_fixe, f.sndbuf_fixe), (40_000, 60_000, true, true));
+    assert_eq!((f.mss_utilisateur, f.mss_local, f.mss), (600, 600, MSS as u16));
+    assert!(f.window_clamp <= f.espace_plein() as u32);
+    assert_eq!((f.reglages, f.txrehash, f.rcvlowat, f.controle()), (h.reglages, false, 7, Controle::Reno));
+    assert_eq!(f.rythme(), (1_000_000, true));
+    assert!(!f.hors_du_ping_pong());
+    assert_eq!(f.t_keepalive, Some(HEURE + MS + 100 * S));
+    // Sans héritage (`recevoir`) : rien ne change.
+    let mut g = fille(false);
+    let (t, o) = pour(&g, tcp::ACK, 0);
+    g.recevoir(&t, o, HEURE);
+    assert_eq!((g.etat(), g.rcvbuf, g.mss_local, g.controle()), (Etat::Etablie, 131_072, MSS as u16, Controle::DEFAUT));
+    assert!(g.hors_du_ping_pong());
+}
+
+#[test]
 fn la_reprise_d_une_socket() {
     // Ce que la connexion suivante reprend (mesuré : le plus petit RTT, le débit livré, le
     // rehachage), et ce qu'elle remet (les retransmissions).

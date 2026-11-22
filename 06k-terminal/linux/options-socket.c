@@ -125,6 +125,12 @@
  *     un groupe en tête rend sa membre sans voir une socket mieux notée, sauf une membre
  *     connectée un jour) ; former un groupe (pas avec un groupe à soi, sauf par
  *     SO_REUSEADDR, qui perd son programme ; SO_REUSEPORT posé après `bind`).
+ *   - la naissance d'une fille TCP : elle prend les options de son écoute (SOL_SOCKET,
+ *     SOL_IP, SOL_TCP) telles qu'à la fin de sa poignée de main, pas à l'`accept` ; née
+ *     plus tard par TCP_DEFER_ACCEPT, celles d'alors, sauf ce que décide son SYN
+ *     (SO_BINDTOIFINDEX, TCP_WINDOW_CLAMP, le MSS d'envoi) ; jamais SO_PRIORITY, ni
+ *     IP_OPTIONS ; SO_RCVBUF et TCP_MAXSEG de sa naissance règlent sa fenêtre et son
+ *     advmss (TCP_INFO) ; morte avant l'`accept`, elle rend sa part de la clé des heures.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -4159,6 +4165,187 @@ static void reuseport_tcp(void)
     close(l[1]);
 }
 
+/* --- La naissance d'une fille. --- */
+
+/* Une option, sa valeur (au plus 16 octets), et quand la fille la prend : HERITE, à sa
+ * naissance ; SYN, à son SYN ; JAMAIS (ni SO_PRIORITY, ni IP_OPTIONS, que la naissance
+ * remet). */
+enum quand { HERITE, SYN, JAMAIS };
+struct option_fille { const char *nom; int niveau, option; unsigned char v[16]; int n; enum quand quand; };
+
+#define NF_ENTIER(x) {(x) & 0xff, ((x) >> 8) & 0xff, ((x) >> 16) & 0xff, ((unsigned)(x) >> 24) & 0xff}, 4
+
+/* Sa valeur relue, en octets (sa longueur, ou -errno). */
+static int nf_lire(int s, const struct option_fille *o, unsigned char *b)
+{
+    socklen_t l = 16;
+    memset(b, 0, 16);
+    if (o->niveau == SOL_SOCKET && (o->option == SO_RCVBUF || o->option == SO_SNDBUF))
+        l = 4;
+    return getsockopt(s, o->niveau, o->option, b, &l) < 0 ? -errno : (int)l;
+}
+
+/* Une écoute sur lo (avec TCP_DEFER_ACCEPT : ses filles ne naissent qu'avec des données),
+ * et un client qui s'y connecte. */
+static int nf_ecoute(int differee)
+{
+    int l = socket(AF_INET, SOCK_STREAM, 0), d = 10;
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    bind(l, (void *)&a, sizeof a);
+    if (differee)
+        setsockopt(l, IPPROTO_TCP, TCP_DEFER_ACCEPT, &d, sizeof d);
+    listen(l, 8);
+    return l;
+}
+
+static int nf_client(int l)
+{
+    struct sockaddr_in a;
+    socklen_t n = sizeof a;
+    getsockname(l, (void *)&a, &n);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&a, sizeof a);
+    return c;
+}
+
+/* accept, sans attendre plus d'une seconde (-1 : rien). */
+static int nf_accepter(int l)
+{
+    struct pollfd p = {l, POLLIN, 0};
+    return poll(&p, 1, 1000) == 1 ? accept(l, NULL, NULL) : -1;
+}
+
+/* advmss, rcv_ssthresh (TCP_INFO) et TCP_WINDOW_CLAMP : ce que la naissance a calculé. */
+static void nf_fenetre(int s, unsigned *advmss, unsigned *ssthresh, int *clamp)
+{
+    struct tcp_info i;
+    socklen_t l = sizeof i, lc = sizeof *clamp;
+    memset(&i, 0, sizeof i);
+    getsockopt(s, IPPROTO_TCP, TCP_INFO, &i, &l);
+    getsockopt(s, IPPROTO_TCP, TCP_WINDOW_CLAMP, clamp, &lc);
+    *advmss = i.tcpi_advmss, *ssthresh = i.tcpi_rcv_ssthresh;
+}
+
+static void naissance_fille(void)
+{
+    static const struct option_fille t[] = {
+        {"SO_TIMESTAMP", SOL_SOCKET, SO_TIMESTAMP, NF_ENTIER(1), HERITE},
+        {"SO_RXQ_OVFL", SOL_SOCKET, SO_RXQ_OVFL, NF_ENTIER(1), HERITE},
+        {"SO_LOCK_FILTER", SOL_SOCKET, SO_LOCK_FILTER, NF_ENTIER(1), HERITE},
+        {"SO_ZEROCOPY", SOL_SOCKET, SO_ZEROCOPY, NF_ENTIER(1), HERITE},
+        {"SO_TIMESTAMPING", SOL_SOCKET, TSG_OLD, NF_ENTIER(TSF_RX_SOFTWARE | TSF_SOFTWARE), HERITE},
+        {"SO_RCVPRIORITY", SOL_SOCKET, SO_RCVPRIORITY, NF_ENTIER(1), HERITE},
+        {"SO_KEEPALIVE", SOL_SOCKET, SO_KEEPALIVE, NF_ENTIER(1), HERITE},
+        {"SO_RCVLOWAT", SOL_SOCKET, SO_RCVLOWAT, NF_ENTIER(7), HERITE},
+        {"SO_PRIORITY", SOL_SOCKET, SO_PRIORITY, NF_ENTIER(3), JAMAIS},
+        {"SO_REUSEADDR", SOL_SOCKET, SO_REUSEADDR, NF_ENTIER(1), HERITE},
+        {"SO_DONTROUTE", SOL_SOCKET, SO_DONTROUTE, NF_ENTIER(1), HERITE},
+        {"SO_OOBINLINE", SOL_SOCKET, SO_OOBINLINE, NF_ENTIER(1), HERITE},
+        {"SO_LINGER", SOL_SOCKET, SO_LINGER, {1, 0, 0, 0, 7}, 8, HERITE},
+        {"SO_RCVTIMEO", SOL_SOCKET, SO_RCVTIMEO, {3}, 16, HERITE},
+        {"SO_BUSY_POLL", SOL_SOCKET, SO_BUSY_POLL, NF_ENTIER(9), HERITE},
+        {"SO_TXREHASH", SOL_SOCKET, SO_TXREHASH, NF_ENTIER(0), HERITE},
+        {"SO_RCVBUF", SOL_SOCKET, SO_RCVBUF, NF_ENTIER(20000), HERITE},
+        {"SO_SNDBUF", SOL_SOCKET, SO_SNDBUF, NF_ENTIER(30000), HERITE},
+        {"SO_PEEK_OFF", SOL_SOCKET, SO_PEEK_OFF, NF_ENTIER(5), HERITE},
+        {"SO_TXTIME", SOL_SOCKET, SO_TXTIME, {CLOCK_MONOTONIC}, 8, HERITE},
+        {"SO_MAX_PACING_RATE", SOL_SOCKET, SO_MAX_PACING_RATE, NF_ENTIER(1000000), HERITE},
+        {"SO_BINDTOIFINDEX", SOL_SOCKET, SO_BINDTOIFINDEX, NF_ENTIER(1), SYN},
+        {"IP_TOS", IPPROTO_IP, IP_TOS, NF_ENTIER(0x10), HERITE},
+        {"IP_TTL", IPPROTO_IP, IP_TTL, NF_ENTIER(33), HERITE},
+        {"IP_RECVERR", IPPROTO_IP, IP_RECVERR, NF_ENTIER(1), HERITE},
+        {"IP_MTU_DISCOVER", IPPROTO_IP, IP_MTU_DISCOVER, NF_ENTIER(IP_PMTUDISC_DO), HERITE},
+        {"IP_UNICAST_IF", IPPROTO_IP, IP_UNICAST_IF, {0, 0, 0, 1}, 4, HERITE},
+        {"IP_RECVTTL", IPPROTO_IP, IP_RECVTTL, NF_ENTIER(1), HERITE},
+        {"IP_FREEBIND", IPPROTO_IP, IP_FREEBIND, NF_ENTIER(1), HERITE},
+        {"IP_MINTTL", IPPROTO_IP, IP_MINTTL, NF_ENTIER(2), HERITE},
+        {"IP_MULTICAST_LOOP", IPPROTO_IP, IP_MULTICAST_LOOP, NF_ENTIER(0), HERITE},
+        {"IP_OPTIONS", IPPROTO_IP, IP_OPTIONS, {1, 1, 1, 0}, 4, JAMAIS},
+        {"TCP_NODELAY", IPPROTO_TCP, TCP_NODELAY, NF_ENTIER(1), HERITE},
+        {"TCP_KEEPIDLE", IPPROTO_TCP, TCP_KEEPIDLE, NF_ENTIER(100), HERITE},
+        {"TCP_SYNCNT", IPPROTO_TCP, TCP_SYNCNT, NF_ENTIER(3), HERITE},
+        {"TCP_LINGER2", IPPROTO_TCP, TCP_LINGER2, NF_ENTIER(30), HERITE},
+        {"TCP_QUICKACK", IPPROTO_TCP, TCP_QUICKACK, NF_ENTIER(0), HERITE},
+        {"TCP_USER_TIMEOUT", IPPROTO_TCP, TCP_USER_TIMEOUT, NF_ENTIER(5000), HERITE},
+        {"TCP_WINDOW_CLAMP", IPPROTO_TCP, TCP_WINDOW_CLAMP, NF_ENTIER(5000), SYN},
+        {"TCP_CONGESTION", IPPROTO_TCP, TCP_CONGESTION, "reno", 4, HERITE},
+    };
+    int ok = 1;
+    for (unsigned i = 0; i < sizeof t / sizeof *t; i++) {
+        const struct option_fille *o = &t[i];
+        /* Une fille née avant l'option, une après ; une différée, dont le client a fini sa
+         * poignée de main avant l'option, et envoie ses données après. */
+        int l = nf_ecoute(0), d = nf_ecoute(1);
+        int c1 = nf_client(l), c3 = nf_client(d);
+        attendre_ms(30);
+        int r = erreur(setsockopt(l, o->niveau, o->option, o->v, o->n)) | erreur(setsockopt(d, o->niveau, o->option, o->v, o->n));
+        int c2 = nf_client(l);
+        send(c3, "x", 1, 0);
+        attendre_ms(30);
+        int f1 = nf_accepter(l), f2 = nf_accepter(l), f3 = nf_accepter(d);
+        unsigned char e[16], a[16], p[16], df[16];
+        int ne = nf_lire(l, o, e), na = nf_lire(f1, o, a), np = nf_lire(f2, o, p), nd = nf_lire(f3, o, df);
+        int vaut = r == 0 && ne > 0 && na == ne && np == ne && nd == ne;
+        switch (o->quand) {
+        case HERITE:
+            vaut &= memcmp(a, e, ne) != 0 && memcmp(p, e, ne) == 0 && memcmp(df, e, ne) == 0;
+            break;
+        case SYN:
+            vaut &= memcmp(a, e, ne) != 0 && memcmp(p, e, ne) == 0 && memcmp(df, a, ne) == 0;
+            break;
+        case JAMAIS:
+            /* SO_PRIORITY se relit 0 ; IP_OPTIONS, vide (l'écho de celles du SYN). */
+            vaut = r == 0 && memcmp(a, p, 16) == 0 && memcmp(p, df, 16) == 0 && na == np && np == nd
+                   && (o->option == IP_OPTIONS ? na == 0 : a[0] == 0);
+            break;
+        }
+        if (!vaut)
+            printf("[linux] options-socket : naissance %s : pose %d, longueurs %d %d %d %d\n", o->nom, r, ne, na, np, nd);
+        ok &= vaut;
+        if (o->niveau == SOL_SOCKET && o->option == SO_RCVBUF) {
+            /* La fenêtre : bornée à la naissance d'après SO_RCVBUF (`tcp_init_buffer_space`). */
+            unsigned m[3], s3[3];
+            int k[3];
+            nf_fenetre(f1, &m[0], &s3[0], &k[0]);
+            nf_fenetre(f2, &m[1], &s3[1], &k[1]);
+            nf_fenetre(f3, &m[2], &s3[2], &k[2]);
+            ok &= k[0] > 20000 && k[1] == 20000 && k[2] == 20000 && s3[1] == 20000 && s3[2] == 20000;
+        }
+        close(f1), close(f2), close(f3), close(c1), close(c2), close(c3), close(l), close(d);
+    }
+    verifier(ok, "naissance d'une fille tcp : les options de son ecoute a la fin de sa poignee de main, pas a l'accept");
+    /* TCP_MAXSEG : le MSS d'envoi vient du SYN (l'offre de l'autre bornée par lui, et le
+     * SYN-ACK l'a annoncé) ; l'advmss, de la naissance. */
+    int l = nf_ecoute(0), d = nf_ecoute(1), m = 1000;
+    int c1 = nf_client(l), c3 = nf_client(d);
+    attendre_ms(30);
+    setsockopt(l, IPPROTO_TCP, TCP_MAXSEG, &m, sizeof m);
+    setsockopt(d, IPPROTO_TCP, TCP_MAXSEG, &m, sizeof m);
+    int c2 = nf_client(l);
+    send(c3, "x", 1, 0);
+    attendre_ms(30);
+    int f1 = nf_accepter(l), f2 = nf_accepter(l), f3 = nf_accepter(d), k;
+    unsigned a1, a2, a3, s;
+    nf_fenetre(f1, &a1, &s, &k);
+    nf_fenetre(f2, &a2, &s, &k);
+    nf_fenetre(f3, &a3, &s, &k);
+    int x1 = 0, x3 = 0;
+    socklen_t lx = sizeof x1;
+    getsockopt(f1, IPPROTO_TCP, TCP_MAXSEG, &x1, &lx);
+    getsockopt(f3, IPPROTO_TCP, TCP_MAXSEG, &x3, &lx);
+    verifier(a1 > 1000 && a2 == 988 && a3 == 988 && x3 == x1 && x1 > 1000,
+             "naissance d'une fille tcp : TCP_MAXSEG de sa naissance borne son advmss, celui de son SYN son MSS d'envoi");
+    close(f1), close(f2), close(f3), close(c1), close(c2), close(c3), close(l), close(d);
+    /* La clé des heures : une fille née d'une écoute qui la compte, morte sans accept (son
+     * écoute fermée), rend sa part ; une socket qui ne demande que SOFTWARE n'a plus d'heure. */
+    l = nf_ecoute(0);
+    poser(l, TSG_OLD, TSF_RX_SOFTWARE | TSF_SOFTWARE);
+    c1 = nf_client(l);
+    attendre_ms(30);
+    close(l), close(c1);
+    verifier(sans_cle(), "naissance d'une fille tcp : morte avant l'accept, elle rend sa part de la cle des heures");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -4214,6 +4401,7 @@ int main(void)
     groupe_processeur_non_compte();
     reuseport_udp();
     reuseport_tcp();
+    naissance_fille();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

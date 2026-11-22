@@ -1832,7 +1832,7 @@ pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
         if s.protocole == Protocole::Unix && niveau != SOL_SOCKET {
             return Err(-EOPNOTSUPP);
         }
-        match niveau {
+        let r = match niveau {
             SOL_SOCKET => options_socket(s, option, valeur, longueur),
             // SOL_UDP n'est pas un niveau d'une socket de ping (elle va
             // droit à IP : ENOPROTOOPT sans rien lire).
@@ -1846,8 +1846,13 @@ pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
             SOL_IP => options_ip(s, option, valeur, longueur),
             SOL_TCP if s.protocole == Protocole::Tcp => options_tcp(s, option, valeur, longueur),
             _ => Err(-ENOPROTOOPT),
+        };
+        // Le miroir d'une écoute (ce que ses filles copient à leur naissance) suit ses
+        // options, même après un échec : certaines ont pu changer avant lui.
+        if s.protocole == Protocole::Tcp && matches!(niveau, SOL_SOCKET | SOL_IP) {
+            tcp::options_changees(s);
         }
-        .map(|()| 0)
+        r.map(|()| 0)
     })())
 }
 
@@ -2824,27 +2829,26 @@ fn options_ip(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result<(),
         IP_OPTIONS if let Some(o) = ip_options => op.ip_options = o,
         _ => return Err(-ENOPROTOOPT),
     }
-    // TCP émet ses segments et reçoit sans le Mutex : ses copies d'IP_TTL,
-    // d'IP_TOS, d'IP_MTU_DISCOVER, d'IP_MINTTL, d'IP_OPTIONS et d'IP_TRANSPARENT.
-    let (ttl, tos, pmtudisc, minttl, options, transparent) =
-        (op.ttl.unwrap_or(ipv4::TTL_DEFAUT), op.tos, op.pmtudisc, op.minttl, op.ip_options, op.transparent);
     if route_oubliee {
         inet.route_gardee = None;
     }
     drop(inet);
     if s.protocole == Protocole::Tcp && matches!(option, IP_TTL | IP_TOS | IP_MTU_DISCOVER | IP_MINTTL | IP_OPTIONS | IP_TRANSPARENT) {
-        tcp::avec_options_et_route(s, route_oubliee, |o, tcb| {
-            o.ttl = ttl;
-            o.tos = tos;
-            o.pmtudisc = pmtudisc;
-            o.minttl = minttl;
-            o.transparent = transparent;
+        // TCP émet ses segments et reçoit sans le Mutex : ses copies d'IP_TTL,
+        // d'IP_TOS, d'IP_MTU_DISCOVER, d'IP_MINTTL, d'IP_OPTIONS et d'IP_TRANSPARENT,
+        // relues sous sa possession (`copies_changees`).
+        tcp::copies_changees(s, route_oubliee, |i, o, tcb| {
+            o.ttl = i.ttl.unwrap_or(ipv4::TTL_DEFAUT);
+            o.tos = i.tos;
+            o.pmtudisc = i.pmtudisc;
+            o.minttl = i.minttl;
+            o.transparent = i.transparent;
             if option == IP_OPTIONS {
                 // Leur place dans chaque segment : le MSS est recalculé tout de
                 // suite (`icsk_ext_hdr_len`, `tcp_sync_mss`), même sans connexion.
-                o.ip_options = options;
+                o.ip_options = i.ip_options;
                 match tcb {
-                    Some(t) => t.poser_options_ip(options.longueur),
+                    Some(t) => t.poser_options_ip(i.ip_options.longueur),
                     None => o.hors_connexion.synchroniser(),
                 }
             }

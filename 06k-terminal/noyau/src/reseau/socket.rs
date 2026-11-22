@@ -576,6 +576,36 @@ pub const SOF_TX_RECORD_MASK: u32 = SOF_TX_HARDWARE | SOF_TX_SOFTWARE | SOF_TX_S
 /// socket, qui ne saurait pas que la pile en prend pour une autre.
 static HORODATAGES: AtomicUsize = AtomicUsize::new(0);
 
+/// La part de la clé des horodatages que compte une fille d'une écoute de TCP, de sa
+/// naissance à son `accept` : `sk_clone_lock` copie l'écoute, et compte la copie
+/// (`net_enable_timestamp`) si l'écoute comptait ; la fille vit ensuite sans programme
+/// jusqu'à l'`accept`. Sa socket la reprend alors (`Socket::heriter`), et sa fermeture la
+/// rendra ; une fille qui meurt avant (un RST, son écoute fermée) la rend ici. Sans cela,
+/// la clé resterait allumée pour une socket qui n'est plus, ou la fermeture de la socket
+/// ôterait une part qu'elle n'avait pas mise.
+pub struct PartDeCle(bool);
+
+impl PartDeCle {
+    pub const AUCUNE: PartDeCle = PartDeCle(false);
+
+    /// Celle d'une copie de drapeaux `drapeaux` : une part si l'original comptait.
+    pub fn de(drapeaux: u16) -> PartDeCle {
+        let compte = drapeaux & CLE_HORODATAGE != 0;
+        if compte {
+            HORODATAGES.fetch_add(1, Ordering::Relaxed);
+        }
+        PartDeCle(compte)
+    }
+}
+
+impl Drop for PartDeCle {
+    fn drop(&mut self) {
+        if self.0 {
+            HORODATAGES.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+}
+
 /// L'heure d'arrivée d'un paquet qui entre dans la pile : celle de la date si
 /// la clé est allumée, 0 sinon (`net_timestamp_check`, `__net_timestamp`).
 pub fn heure_d_arrivee() -> u64 {
@@ -655,22 +685,17 @@ impl Socket {
         if self.drapeau(SELECT_ERR_QUEUE) { POLLPRI } else { 0 }
     }
 
-    /// La fille `self` d'une écoute de TCP reprend ce que `sk_clone_lock` copie
-    /// de l'écoute : ses drapeaux de réception (SO_TIMESTAMP, SO_RXQ_OVFL...,
-    /// et SO_ZEROCOPY), SO_TIMESTAMPING et le compteur de ses clés (pas celui
-    /// de MSG_ZEROCOPY, qui repart de 0 : `sk_clone_lock`, même quand l'écoute
-    /// a été une connexion qui en a envoyé) ; elle compte à son tour dans la clé des
-    /// horodatages si l'écoute y comptait (`net_enable_timestamp` pour la
-    /// copie : sans cela, sa fermeture ôterait de la clé une part qu'elle n'y
-    /// avait pas mise).
-    pub fn heriter_de(&self, ecoute: &Socket) {
-        let d = ecoute.drapeaux.load(Ordering::Relaxed);
-        self.drapeaux.store(d, Ordering::Relaxed);
-        self.tsflags.store(ecoute.tsflags.load(Ordering::Relaxed), Ordering::Relaxed);
-        self.cle_emission.store(ecoute.cle_emission.load(Ordering::Relaxed), Ordering::Relaxed);
-        if d & CLE_HORODATAGE != 0 {
-            HORODATAGES.fetch_add(1, Ordering::Relaxed);
-        }
+    /// La socket d'une fille d'une écoute de TCP, à son `accept`, prend ce que `sk_clone_lock`
+    /// a copié de l'écoute à sa naissance (tcp.rs, `Heritage`) : ses drapeaux de réception
+    /// (SO_TIMESTAMP, SO_RXQ_OVFL..., et SO_ZEROCOPY), SO_TIMESTAMPING et le compteur de ses
+    /// clés ; et la part de la clé des horodatages que la fille compte depuis (`part`), que sa
+    /// fermeture rendra (son drapeau CLE_HORODATAGE). Le compteur de MSG_ZEROCOPY reste à 0
+    /// (`sk_clone_lock` : `sk_zckey`), même quand l'écoute a été une connexion qui en a envoyé.
+    pub fn heriter(&self, drapeaux: u16, tsflags: u32, cle_emission: u32, part: &mut PartDeCle) {
+        self.drapeaux.store(drapeaux, Ordering::Relaxed);
+        self.tsflags.store(tsflags, Ordering::Relaxed);
+        self.cle_emission.store(cle_emission, Ordering::Relaxed);
+        part.0 = false;
     }
 
     /// Un paquet arrive pour elle sur ce processeur (`sk_incoming_cpu_update`).
@@ -695,7 +720,7 @@ impl Socket {
 }
 
 impl Options {
-    const DEFAUT: Options = Options {
+    pub const DEFAUT: Options = Options {
         reuseaddr: false, reuseport: false, broadcast: false, keepalive: false, debug: false, dontroute: false,
         oobinline: false, no_check: false, priority: 0, mark: 0, linger: (false, 0), verrous_tampons: 0,
         busy_poll: 0, prefer_busy_poll: false, busy_poll_budget: 0, wifi_status: false, nofcs: false,
