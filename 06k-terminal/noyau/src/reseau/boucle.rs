@@ -55,7 +55,7 @@
 
 use super::horodatage::{self, Entree};
 use super::interface::{self, Compteurs, Interface, Materiel};
-use super::paquet::Paquet;
+use super::paquet::{Contexte, Paquet};
 use super::zerocopie::Avis;
 use crate::faillible::FileFaillible;
 use crate::tache;
@@ -139,6 +139,8 @@ pub fn emettre(i: &Interface, mut p: Paquet) {
 /// `dev_core_stats_rx_dropped_inc` de la carte de la copie).
 pub fn rendre_la_diffusion(i: &'static Interface, mut p: Paquet) {
     p.orpheliner();
+    // PACKET_LOOPBACK : ce que dit d'elle SKF_AD_PKTTYPE (paquet.rs, `Contexte`).
+    p.poser_contexte(Contexte { genre: super::paquet::BOUCLE, ..p.contexte() });
     if deposer(Trame::Copie(p, i)).is_ok() {
         livrer_bientot();
     } else {

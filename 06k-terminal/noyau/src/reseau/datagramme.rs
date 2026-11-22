@@ -176,8 +176,9 @@ pub fn source_liee(inet: &Inet) -> Option<[u8; 4]> {
 /// octets : EINVAL ; une autre famille : EAFNOSUPPORT ; la route
 /// (`router` : ENETUNREACH, EINVAL, EACCES, ENODEV). Puis l'adresse source
 /// de la route devient l'adresse locale si `bind` n'en avait pas choisi ; la
-/// route est gardée (`sk_dst_set`, voir `Inet::route_gardee`) ;
-/// l'identifiant IP de la socket est tiré (l'`inet_id`, `get_random_u16`).
+/// route est gardée (`sk_dst_set`, voir `Inet::route_gardee`) ; le hachage
+/// de son flux est tiré (`sk_set_txhash`, socket.rs : `Socket::hachage`), puis
+/// l'identifiant IP de la socket (l'`inet_id`, `get_random_u16`).
 pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     let Some(famille) = socket::famille(o) else { return Err(-EINVAL) };
     if famille == AF_UNSPEC {
@@ -200,6 +201,8 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     inet.port_distant = a.port;
     inet.connecte = true;
     s.connectee.store(true, Ordering::Relaxed);
+    // Jamais 0 (`net_tx_rndhash`), qui dirait « pas de hachage ».
+    s.hachage.store(crate::aleatoire::u32().max(1), Ordering::Relaxed);
     inet.identifiant = crate::aleatoire::u32() as u16;
     table::changer(s, &inet);
     Ok(())
@@ -564,7 +567,7 @@ fn faire_le_paquet(s: &Arc<Socket>, d: &Depart, charge: usize, pmtudisc: u8, non
     attendre_place(s, non_bloquant, delai)?;
     morceaux_permis(s, charge, d, pmtudisc)?;
     let Some(mut p) = Paquet::vide(charge) else { return Err(jete(-ENOBUFS)) };
-    p.poser_contexte(Contexte { marque: d.marque, priorite: d.priorite, ..Contexte::default() });
+    p.poser_contexte(Contexte { marque: d.marque, priorite: d.priorite, hachage: s.hachage.load(Ordering::Relaxed), ..Contexte::default() });
     attacher(s, &mut p);
     let Some(segment) = p.ajouter_fin(charge) else { return Err(jete(-ENOBUFS)) };
     remplir(segment).map_err(jete)?;

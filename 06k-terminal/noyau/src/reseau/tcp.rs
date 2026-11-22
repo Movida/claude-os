@@ -53,7 +53,8 @@
 use super::contexte;
 use super::horodatage;
 use super::ipv4;
-use super::paquet::{Paquet, Retenue};
+use super::filtre::{self, Filtre, Verdict};
+use super::paquet::{Contexte, Paquet, Retenue};
 use super::snmp::MIB;
 use super::zerocopie::{self, Avis};
 use super::socket::{self, Protocole, Socket};
@@ -166,6 +167,8 @@ struct TempsAttente {
     transparent: bool,
     /// Son échéance (/proc/net/tcp la montre).
     echeance: u64,
+    /// Le hachage du flux de la connexion (`tw_txhash`) : celui de ses ACK et de ses RST.
+    hachage: u32,
 }
 
 static TABLE: Verrou<Option<ports_tcp::Table<Cible>>> = Verrou::new(None);
@@ -341,6 +344,10 @@ pub struct Fille {
     /// `Partie::horodatage`).
     processeur: i32,
     horodatage: u64,
+    /// Le filtre de son écoute quand elle est née, que sa socket gardera
+    /// (`sk_clone_lock` : une copie, comptée dans sa mémoire des options) : celui
+    /// qui a jugé le segment qui l'a fait naître (`traiter_ecoute`).
+    filtre: Option<Arc<Filtre>>,
 }
 
 impl Fille {
@@ -350,10 +357,14 @@ impl Fille {
         Ip { options: self.options, oif: self.interface, transparent: self.transparent, ..ecoute }
     }
 
-    /// Émet ce qu'elle a à envoyer (`emettre_tcb`), avec `ecoute` (voir `ip`).
-    fn emettre(&mut self, ecoute: Ip, recu: Option<&ipv4::EnteteRecu>) {
+    /// Émet ce qu'elle a à envoyer (`emettre_tcb`), avec `ecoute` (voir `ip`). Le RST qui
+    /// répond à un segment, avant sa naissance, est celui de l'écoute (`tcp_check_req` :
+    /// `send_reset` avec la socket de l'écoute), et porte son hachage, `hachage_ecoute` ;
+    /// tout le reste, celui de la fille (sa demande, `tcp_rsk(req)->txhash`, puis sa socket).
+    fn emettre(&mut self, ecoute: Ip, recu: Option<&ipv4::EnteteRecu>, hachage_ecoute: u32) {
         let ip = self.ip(ecoute);
-        emettre_tcb(&mut self.tcb, self.locale, self.distante, &mut self.identifiant, ip, recu, None, None);
+        let rst = (!self.etablie).then_some(hachage_ecoute);
+        emettre_tcb(&mut self.tcb, self.locale, self.distante, &mut self.identifiant, ip, recu, None, None, rst);
     }
 
     /// Prête pour `accept` (`inet_csk_listen_poll` : la file d'acceptation
@@ -740,6 +751,10 @@ pub struct Segment {
     /// Le processeur qui l'a reçu (SO_INCOMING_CPU), noté à son arrivée : une
     /// file `backlog` le fait traiter plus tard, ailleurs.
     processeur: i32,
+    /// La carte qui l'a reçu, et la longueur de son en-tête TCP, retiré de
+    /// `charge` : ce que voit un filtre (`filtrer`).
+    carte: inet::filtre::Carte,
+    longueur_entete: u8,
 }
 
 /// La taille vraie de ce qui arrive, pour la borne de la file `backlog`.
@@ -849,7 +864,7 @@ impl Partie {
     fn emettre_apres(&mut self, recu: Option<&ipv4::EnteteRecu>) {
         let Mode::Connexion(t) = &mut self.mode else { return };
         let ip = Ip::de(&self.options);
-        if emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, ip, recu, Some(&self.retenue), Some(&mut self.demandes)) {
+        if emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, ip, recu, Some(&self.retenue), Some(&mut self.demandes), None) {
             self.route_oubliee = false;
         }
     }
@@ -1044,7 +1059,7 @@ impl Partie {
             let numero = socket::nouveau_numero();
             let e = TempsAttente {
                 numero, locale: self.adresses.source, distante: self.adresses.distante, regles: t.en_attente(fin_orpheline), tos: self.options.tos,
-                interface: self.options.interface, transparent: self.options.transparent, echeance,
+                interface: self.options.interface, transparent: self.options.transparent, echeance, hachage: t.hachage(),
             };
             // L'entrée de TIME_WAIT prend un numéro neuf, et l'échéance
             // qui va avec ; la socket n'a plus d'entrée dans la table.
@@ -1244,7 +1259,7 @@ impl Partie {
                     self.emettre();
                 }
             }
-            Mode::Ecoute { filles, .. } => arreter_les_filles(filles, ip),
+            Mode::Ecoute { filles, .. } => arreter_les_filles(filles, ip, self.options.hors_connexion.hachage),
             Mode::Neuve => {}
         }
         self.oublier_la_connexion(s);
@@ -1364,8 +1379,9 @@ impl Ip {
 /// recopie pas la demande), un hasard de sa mémoire, que rien ne fixe ici :
 /// chaque renvoi la porte. Rend vrai si un de ses segments (pas une réponse)
 /// a trouvé sa route.
+#[allow(clippy::too_many_arguments)]
 fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, recu: Option<&ipv4::EnteteRecu>,
-               retenue: Option<&Arc<Retenue>>, mut demandes: Option<&mut VecDeque<DemandeTx>>) -> bool {
+               retenue: Option<&Arc<Retenue>>, mut demandes: Option<&mut VecDeque<DemandeTx>>, hachage_rst: Option<u32>) -> bool {
     if let Some(r) = retenue {
         t.poser_en_file(r.octets(), r.rendu());
     }
@@ -1414,7 +1430,13 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
         let reponse = matches!(s.compte, Compte::Reponse { .. });
         let sa_route = if reponse { route_de_segment(&ip, source, distante, true) } else { route };
         let demande = demandes.as_deref_mut().and_then(|d| demande_du_segment(d, t, &a_envoyer, k, heure));
-        let routee = envoyer_segment(&s.entete, s.compte, source, distante, identifiant, ip, sa_route, s.longueur, suivi, demande, |o| {
+        // Son hachage, celui de la connexion (`skb_set_hash_from_sk`, `tcp_v4_send_reset`), sauf
+        // le RST d'une fille pas née (voir `Fille::emettre`).
+        let hachage = match (s.compte, hachage_rst) {
+            (Compte::Reponse { rst: true }, Some(h)) => h,
+            _ => t.hachage(),
+        };
+        let routee = envoyer_segment(&s.entete, s.compte, source, distante, identifiant, ip, sa_route, s.longueur, suivi, demande, hachage, |o| {
             t.copier_envoi(s.debut, o)
         });
         route_trouvee |= routee && !reponse;
@@ -1664,9 +1686,10 @@ fn route_de_segment(ip: &Ip, source: [u8; 4], distante: [u8; 4], reponse: bool) 
 /// (plus de mémoire, pas de route) est perdu, comme sur un câble. Il compte
 /// dans /proc/net/snmp ce que dit `compte`. Il porte la `demande`
 /// d'horodatage, s'il en a une. Rend vrai s'il a une route.
+#[allow(clippy::too_many_arguments)]
 fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip,
                    route: Option<(inet::routes::Chemin, [u8; 4])>, longueur: usize, suivi: Option<(&Arc<Retenue>, u64)>,
-                   demande: Option<Box<horodatage::Demande>>, remplir: impl FnOnce(&mut [u8])) -> bool {
+                   demande: Option<Box<horodatage::Demande>>, hachage: u32, remplir: impl FnOnce(&mut [u8])) -> bool {
     let n = ftcp::longueur_entete(&h.options);
     let paquet = Paquet::vide(n + longueur);
     let routee = route.is_some();
@@ -1678,6 +1701,8 @@ fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], 
         }
         return routee;
     };
+    // Le hachage du flux, que lo garde jusqu'à l'arrivée (paquet.rs, `Contexte`).
+    p.poser_contexte(Contexte { hachage, ..Contexte::default() });
     let Some(o) = p.ajouter_fin(n + longueur) else { return routee };
     remplir(&mut o[n..]);
     let finale = if ip.options.places.route_source != 0 { distante } else { destination };
@@ -1708,14 +1733,16 @@ fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], 
 /// `locale` à nous sauf pour une socket `transparent`. Impossible : rien ne
 /// part, mais le RST compte (`tcp_v4_send_reset` compte après
 /// `ip_send_unicast_reply`, qui s'est tue).
-fn repondre_rst(h: &Tcp, longueur_charge: usize, locale: [u8; 4], distante: [u8; 4], recu: &ipv4::EnteteRecu, oif: u32, transparent: bool) {
+#[allow(clippy::too_many_arguments)]
+fn repondre_rst(h: &Tcp, longueur_charge: usize, locale: [u8; 4], distante: [u8; 4], recu: &ipv4::EnteteRecu, oif: u32, transparent: bool,
+                hachage: u32) {
     if let Some(r) = itcp::reponse_sans_connexion(h, longueur_charge) {
         let Some(ip) = Ip::reponse(recu, distante, recu.tos & !ipv4::ECN, oif, transparent) else {
             return Compte::Reponse { rst: true }.compter(&MIB, false, false);
         };
         let mut id = crate::aleatoire::u32() as u16;
         let route = route_de_segment(&ip, locale, distante, true);
-        envoyer_segment(&r, Compte::Reponse { rst: true }, locale, distante, &mut id, ip, route, 0, None, None, |_| {});
+        envoyer_segment(&r, Compte::Reponse { rst: true }, locale, distante, &mut id, ip, route, 0, None, None, hachage, |_| {});
     }
 }
 
@@ -1751,7 +1778,7 @@ impl Possede for Partie {
         self.oublier_echeance();
         let maintenant = maintenant();
         let ip = Ip::de(&self.options);
-        let (defer, syncnt) = (self.options.defer_accept, self.options.syncnt);
+        let (defer, syncnt, hachage_ecoute) = (self.options.defer_accept, self.options.syncnt, self.options.hors_connexion.hachage);
         let pousse = self.retenue.pousse();
         match &mut self.mode {
             Mode::Connexion(t) => {
@@ -1770,7 +1797,7 @@ impl Possede for Partie {
                     f.tcb.reglages.syn_essais = syncnt;
                     f.tcb.reduire_essais(essais);
                     f.tcb.minuteur(maintenant);
-                    f.emettre(ip, None);
+                    f.emettre(ip, None, hachage_ecoute);
                 }
                 ranger_filles(filles);
             }
@@ -1841,7 +1868,8 @@ impl Partie {
             Mode::Neuve => {
                 // Plus rien n'écoute ici (un `listen` défait par un
                 // `connect` qui a échoué...) : RST, par sa liaison.
-                repondre_rst(&s.entete, s.charge.longueur(), s.destination, s.source, &s.ip, self.options.interface, self.options.transparent);
+                repondre_rst(&s.entete, s.charge.longueur(), s.destination, s.source, &s.ip, self.options.interface, self.options.transparent,
+                             self.options.hors_connexion.hachage);
             }
         }
         self.emettre_apres(Some(&recu));
@@ -1969,6 +1997,7 @@ impl Partie {
         let ip = Ip::de(&self.options);
         let defer = self.options.defer_accept;
         let numero_ecoute = self.numero;
+        let hachage_ecoute = self.options.hors_connexion.hachage;
         let Mode::Ecoute { backlog, filles } = &mut self.mode else { return };
         if let Some(n) = s.fille {
             if let Some(f) = filles.iter_mut().find(|f| f.numero == n) {
@@ -1977,7 +2006,16 @@ impl Partie {
                 // `tcp_rcv_established`), pas pour une en SYN_RECEIVED (la `request_sock`
                 // de `tcp_v4_rcv` : `csum_error`).
                 let deja_nee = !matches!(f.tcb.etat(), Etat::SynRecu | Etat::Fermee);
+                // Une fille née, une socket chez Linux : le filtre qu'elle a pris de
+                // l'écoute à sa naissance (une perte pour elle), puis le processeur,
+                // puis sa somme (`vers_la_socket`).
                 if deja_nee {
+                    if let Some(filtre) = &f.filtre
+                        && !filtrer(filtre, &mut s)
+                    {
+                        f.tcb.compter_perte();
+                        return;
+                    }
                     f.processeur = s.processeur;
                 }
                 if s.somme_fausse {
@@ -1989,6 +2027,17 @@ impl Partie {
                 }
                 f.tcb.reglages.defer_accept = defer;
                 let en_poignee = f.tcb.etat() == Etat::SynRecu;
+                // Une fille en SYN_RECEIVED, une demande : le filtre de l'écoute, après
+                // la somme (`tcp_v4_rcv`, TCP_NEW_SYN_RECV : `tcp_filter` avec l'écoute) ;
+                // ce qu'il jette est une perte de l'écoute. Le segment qui la fait naître
+                // lui en laisse une copie (`sk_clone_lock`).
+                let filtre = if en_poignee { par_numero(numero_ecoute).and_then(|e| filtre::de(&e)) } else { None };
+                if let Some(filtre) = &filtre
+                    && !filtrer(filtre, &mut s)
+                {
+                    perte(numero_ecoute, 1);
+                    return;
+                }
                 let (avant, heure) = (f.tcb.lisibles_dans_le_flux(), s.charge.contexte().horodatage);
                 f.tcb.recevoir(&s.entete, s.charge, maintenant());
                 if f.tcb.lisibles_dans_le_flux() > avant {
@@ -1998,6 +2047,7 @@ impl Partie {
                 if en_poignee && nee {
                     f.arrivee = (s.ip.ttl, s.ip.tos, s.interface);
                     f.processeur = s.processeur;
+                    f.filtre = filtre;
                 }
                 // Ce qu'une fille en SYN_RECEIVED jette est une perte de l'écoute (le
                 // `discard_and_relse` de `tcp_v4_rcv`, quand `tcp_check_req` rend NULL) ;
@@ -2009,7 +2059,7 @@ impl Partie {
                         perte(numero_ecoute, n);
                     }
                 }
-                f.emettre(ip, Some(&s.ip));
+                f.emettre(ip, Some(&s.ip), hachage_ecoute);
                 ranger_filles(filles);
                 return;
             }
@@ -2022,15 +2072,20 @@ impl Partie {
             // (`du_reseau`).
             let objet = TABLE.verrouiller().as_ref().and_then(|t| t.objet(n));
             if let Some(Cible::Socket(sock)) = objet {
-                sock.processeur.store(s.processeur, Ordering::Relaxed);
-                if s.somme_fausse {
-                    somme_fausse_vers(&sock, Segment { fille: None, ..s });
-                } else {
-                    vers_socket(&sock, Arrivee::Segment(Segment { fille: None, ..s }));
-                }
+                vers_la_socket(&sock, Segment { fille: None, ..s }, true);
                 return;
             }
             s.fille = None;
+            // Comme un segment de l'écoute (`tcp_v4_rcv` la retrouve, par sa recherche ou
+            // `req_stolen`) : son filtre aussi, avant la somme, une perte pour elle s'il le
+            // jette (IP_MINTTL l'a déjà regardé, `ttl_trop_petit`). La table l'avait livré à la
+            // fille, sans le filtre (`vers_socket`).
+            if let Some(filtre) = par_numero(numero_ecoute).and_then(|e| filtre::de(&e))
+                && !filtrer(&filtre, &mut s)
+            {
+                perte(numero_ecoute, 1);
+                return;
+            }
         }
         // La somme fausse d'un segment pour l'écoute : une erreur (`tcp_v4_do_rcv` :
         // `csum_err`), sans perte.
@@ -2050,7 +2105,7 @@ impl Partie {
         if h.drapeaux & ftcp::ACK != 0 {
             // Un ACK pour une fille qu'on n'a plus : RST (`tcp_rcv_state_process`, TCP_LISTEN),
             // par la liaison de l'écoute.
-            repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, ip.oif, ip.transparent);
+            repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, ip.oif, ip.transparent, hachage_ecoute);
             return;
         }
         // Ni un SYN, ni un SYN|FIN : rien, pas même un RST : ce que distinguent les balayages FIN et
@@ -2142,9 +2197,9 @@ impl Partie {
         }
         let mut f = Fille {
             numero, tcb, locale: s.destination, distante: s.source, identifiant: crate::aleatoire::u32() as u16, etablie: false,
-            arrivee: (0, 0, 0), options, interface: ip.oif, transparent: ip.transparent, processeur: -1, horodatage: 0,
+            arrivee: (0, 0, 0), options, interface: ip.oif, transparent: ip.transparent, processeur: -1, horodatage: 0, filtre: None,
         };
-        f.emettre(ip, None);
+        f.emettre(ip, None, hachage_ecoute);
         // La place est prise plus haut, avant tout changement.
         filles.ajouter_derriere_dans_la_place(f);
     }
@@ -2154,14 +2209,20 @@ impl Partie {
 /// valeur, plus d'un Kio qui resterait sur la pile de qui l'appelle, tant qu'il dure.
 #[inline(never)]
 fn tcb_de_syn(place: Box<MaybeUninit<Tcb<Paquet>>>, h: &Tcp, iss: u32, mss: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Box<Tcb<Paquet>> {
-    Box::write(place, Tcb::depuis_syn(&MIB, h, iss, mss, rcvbuf, sndbuf, echelle))
+    let mut t = Box::write(place, Tcb::depuis_syn(&MIB, h, iss, mss, rcvbuf, sndbuf, echelle));
+    // Le hachage de son flux, celui de sa demande (`tcp_conn_request` : `net_tx_rndhash`).
+    t.poser_hachage(crate::aleatoire::u32());
+    t
 }
 
 /// De même pour `connect`, qui dort ensuite sur sa pile, jusqu'à la fin de la poignée de main.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn tcb_de_connect(place: Box<MaybeUninit<Tcb<Paquet>>>, port: u16, port_distant: u16, iss: u32, mss: u16, rcvbuf: usize, sndbuf: usize, echelle: u8) -> Box<Tcb<Paquet>> {
-    Box::write(place, Tcb::connecter(&MIB, port, port_distant, iss, mss, rcvbuf, sndbuf, echelle))
+    let mut t = Box::write(place, Tcb::connecter(&MIB, port, port_distant, iss, mss, rcvbuf, sndbuf, echelle));
+    // Le hachage de son flux (`tcp_v4_connect` : `sk_set_txhash`).
+    t.poser_hachage(crate::aleatoire::u32());
+    t
 }
 
 /// Le numéro de séquence initial d'une connexion (`secure_tcp_seq`, RFC
@@ -2227,30 +2288,16 @@ fn de_ce_processeur(c: &Cible, p: i32) -> bool {
     matches!(c, Cible::Socket(s) if s.processeur.load(Ordering::Relaxed) == p)
 }
 
-/// Livre un segment à sa cible, d'après la table. Une connexion (pas une
-/// écoute) note le processeur qui l'a reçu, après IP_MINTTL, une somme
-/// fausse comprise (`tcp_v4_rcv` : `sk_incoming_cpu_update`) ; une fille, à
-/// sa naissance puis à chaque segment (`traiter_ecoute`).
+/// Livre un segment à sa cible, d'après la table : à une socket
+/// (`vers_la_socket`), ou à une fille, par son écoute (`traiter_ecoute`).
 fn livrer(s: Segment) {
     let h = s.entete;
     let cible = TABLE.verrouiller().as_ref().and_then(|t| {
         t.trouver(s.source, h.source, s.destination, h.destination, s.interface, |c| de_ce_processeur(c, s.processeur))
     });
-    // Une connexion (pas une écoute) note le processeur qui l'a reçu, après
-    // IP_MINTTL, mais avant la somme (`tcp_v4_rcv` : `sk_incoming_cpu_update`
-    // suit les examens de `process:`, précède `tcp_v4_do_rcv` et `tcp_add_backlog`).
-    if let Some(Destinataire::Connexion(Cible::Socket(sock))) = &cible
-        && sock.flux.as_ref().is_none_or(|f| s.ip.ttl >= f.court(|c| c.minttl))
-    {
-        sock.processeur.store(s.processeur, Ordering::Relaxed);
-    }
     match cible {
-        Some(Destinataire::Connexion(Cible::Socket(sock))) | Some(Destinataire::Ecoute(Cible::Socket(sock))) if s.somme_fausse => {
-            somme_fausse_vers(&sock, Segment { fille: None, ..s });
-        }
-        Some(Destinataire::Connexion(Cible::Socket(sock))) | Some(Destinataire::Ecoute(Cible::Socket(sock))) => {
-            vers_socket(&sock, Arrivee::Segment(Segment { fille: None, ..s }));
-        }
+        Some(Destinataire::Connexion(Cible::Socket(sock))) => vers_la_socket(&sock, Segment { fille: None, ..s }, true),
+        Some(Destinataire::Ecoute(Cible::Socket(sock))) => vers_la_socket(&sock, Segment { fille: None, ..s }, false),
         Some(Destinataire::Connexion(Cible::Fille(ecoute, n))) | Some(Destinataire::Ecoute(Cible::Fille(ecoute, n))) => {
             vers_socket(&ecoute, Arrivee::Segment(Segment { fille: Some(n), ..s }));
         }
@@ -2264,10 +2311,69 @@ fn livrer(s: Segment) {
         // adresse d'ailleurs que lo nous a livrée (le SYN d'une socket liée à
         // lo vers 192.0.2.1), sans rien compter.
         None if ipv4::est_a_nous(s.destination) => {
-            repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, 0, false);
+            repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, 0, false, 0);
         }
         None => {}
     }
+}
+
+/// Le segment `s` pour la socket `sock` (une `connexion`, ou une écoute), dans
+/// l'ordre de `tcp_v4_rcv` : IP_MINTTL (qui jette plus tard, `Partie::traiter`) ;
+/// son filtre (`tcp_filter`), qui jette (une perte pour elle) ou coupe ; puis une
+/// connexion note le processeur qui l'a reçu (`sk_incoming_cpu_update` : pas pour
+/// ce que ces deux-là jettent, ni pour une écoute) ; puis sa somme, achevée
+/// (`somme_fausse_vers`), ou la socket (`vers_socket`). Dans le cadre de qui
+/// l'appelle : sur le chemin le plus profond du réseau, un cadre de plus garderait
+/// une copie du segment sous toute la suite.
+#[inline(always)]
+fn vers_la_socket(sock: &Arc<Socket>, mut s: Segment, connexion: bool) {
+    let ttl_bas = sock.flux.as_ref().is_some_and(|f| f.court(|p| ttl_bas(p, s.ip.ttl)));
+    if !ttl_bas {
+        if let Some(f) = filtre::de(sock)
+            && !filtrer(&f, &mut s)
+        {
+            sock.pertes.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if connexion {
+            sock.processeur.store(s.processeur, Ordering::Relaxed);
+        }
+    }
+    if s.somme_fausse {
+        somme_fausse_vers(sock, s);
+    } else {
+        vers_socket(sock, Arrivee::Segment(s));
+    }
+}
+
+/// Le filtre `f` sur le segment `s` (`tcp_filter`, `sk_filter_trim_cap`, filtre.rs) :
+/// au moins son en-tête, la charge après lui. Faux : jeté ; sinon sa charge,
+/// peut-être coupée (le reste reviendra par une retransmission). Sa somme a été
+/// vérifiée sur le segment entier (`recevoir`) : chez Linux, un segment d'une carte
+/// qui ne vérifie pas les sommes, de plus de 76 octets, la vérifie après le filtre,
+/// sur le segment coupé, et la trouve fausse (`skb->csum` garde le pseudo-en-tête
+/// de sa longueur d'avant) ; virtio-net la vérifie pour Linux
+/// (VIRTIO_NET_HDR_F_DATA_VALID), et lo ne la vérifie jamais : ce cas n'arrive pas
+/// à un Linux sous QEMU, et nous n'en faisons pas une règle. À part : le programme
+/// tourne au plus profond du réseau (lo reçoit sur la pile de qui émet), et son
+/// cadre ne doit pas rester sous la suite du chemin.
+#[inline(never)]
+fn filtrer(f: &Filtre, s: &mut Segment) -> bool {
+    let h = s.longueur_entete as usize;
+    match filtre::passer_ip(f, &s.charge, h, h, s.carte, h as u32) {
+        Verdict::Jeter => false,
+        Verdict::Garder(n) => {
+            s.charge.couper(n - h);
+            true
+        }
+    }
+}
+
+/// IP_MINTTL jette-t-il un segment de TTL `ttl` pour la socket que décrit `p` ?
+/// Une connexion, ou une écoute (voir `Partie::ttl_trop_petit`).
+fn ttl_bas(p: &Premier, ttl: u8) -> bool {
+    let connexion = !p.ecoute && p.etat.is_some_and(|e| e != Etat::Fermee);
+    (connexion || p.ecoute) && ttl < p.minttl
 }
 
 /// Donne le segment à la socket : traité tout de suite, ou mis dans sa
@@ -2308,7 +2414,7 @@ fn somme_fausse_vers(sock: &Arc<Socket>, s: Segment) {
     let ttl = s.ip.ttl;
     let verdict = flux.du_reseau_ou(Arrivee::Segment(s), |p: &Premier| {
         let connexion = !p.ecoute && p.etat.is_some_and(|e| e != Etat::Fermee);
-        let ttl_bas = (connexion || p.ecoute) && ttl < p.minttl;
+        let ttl_bas = ttl_bas(p, ttl);
         (connexion || ttl_bas, !ttl_bas)
     });
     if let Some((perdu, erreur)) = verdict {
@@ -2399,7 +2505,7 @@ fn temps_attente(n: u64, s: Segment) {
         effacer_temps_attente(n);
     }
     if issue.rst {
-        repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, e.interface, e.transparent);
+        repondre_rst(&h, s.charge.longueur(), s.destination, s.source, &s.ip, e.interface, e.transparent, e.hachage);
     }
     if issue.ack {
         envoyer_ack_tw(&e, &s.ip, issue.hors_fenetre);
@@ -2419,7 +2525,7 @@ fn envoyer_ack_tw(e: &TempsAttente, recu: &ipv4::EnteteRecu, hors_fenetre: bool)
     };
     let mut id = crate::aleatoire::u32() as u16;
     let route = route_de_segment(&ip, e.locale, e.distante, true);
-    envoyer_segment(&r, Compte::Reponse { rst: false }, e.locale, e.distante, &mut id, ip, route, 0, None, None, |_| {});
+    envoyer_segment(&r, Compte::Reponse { rst: false }, e.locale, e.distante, &mut id, ip, route, 0, None, None, e.hachage, |_| {});
 }
 
 fn effacer_temps_attente(n: u64) {
@@ -2488,7 +2594,7 @@ pub fn recevoir(ip: &fipv4::Ipv4, recu: &ipv4::EnteteRecu, i: &super::interface:
     let _contexte = contexte::entrer();
     livrer(Segment {
         entete: h, charge: p, source, destination, ip: *recu, interface: iif, diffusion, fille: None, isn: None, somme_fausse,
-        processeur: crate::processeur::numero() as i32,
+        processeur: crate::processeur::numero() as i32, carte: filtre::carte(i), longueur_entete: entete as u8,
     });
 }
 
@@ -2881,6 +2987,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             let (port, distante, port_distant, locale) = (f.tcb.port_local, f.distante, f.tcb.port_distant, f.locale);
             let (mc_ttl, rcv_tos, mc_index) = f.arrivee;
             let (numero, ip_options, interface, processeur, horodatage) = (f.numero, f.options, f.interface, f.processeur, f.horodatage);
+            let filtre = f.filtre;
             let enfant = enfant.avec_numero(numero);
             // Une fille fermée avant l'accept (un RST) a déjà quitté la
             // table : sa lecture dira son erreur.
@@ -2921,6 +3028,10 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             // et d'horodatage ; le processeur de sa naissance.
             enfant.heriter_de(s);
             enfant.processeur.store(processeur, Ordering::Relaxed);
+            // Le filtre de l'écoute à sa naissance, compté dans sa mémoire des options
+            // (`sk_clone_lock` : `sk_filter_charge`, qui passe toujours : la socket neuve
+            // n'y compte rien encore, et l'écoute l'a déjà fait tenir sous OPTMEM_MAX).
+            *enfant.filtre.verrouiller() = filtre;
             enfant.rythme_max.store(rythme_max, Ordering::Relaxed);
             enfant.appels.verrouiller().options = socket::Options { mc_ttl, rcv_tos, mc_index, ip_options, interface, ..options };
             if let Some(t) = TABLE.verrouiller().as_mut() {
@@ -3474,7 +3585,7 @@ pub fn fermer(s: &Arc<Socket>) {
             p.hors_table = true;
         }
         Mode::Ecoute { filles, .. } => {
-            arreter_les_filles(filles, ip);
+            arreter_les_filles(filles, ip, p.options.hors_connexion.hachage);
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.retirer(p.numero);
             }
@@ -3511,11 +3622,11 @@ pub fn fermer(s: &Arc<Socket>) {
 /// pas une fille encore en SYN_RECEIVED : chez Linux, une demande, qui s'en va sans
 /// rien dire à son prochain minuteur (`reqsk_timer_handler`) ; l'ACK qui arrivera
 /// trouvera le RST d'un port fermé.
-fn arreter_les_filles(filles: &mut VecDeque<Fille>, ip: Ip) {
+fn arreter_les_filles(filles: &mut VecDeque<Fille>, ip: Ip, hachage_ecoute: u32) {
     for f in filles.iter_mut() {
         if f.tcb.etat() != Etat::SynRecu {
             f.tcb.avorter();
-            f.emettre(ip, None);
+            f.emettre(ip, None, hachage_ecoute);
         }
         if let Some(t) = TABLE.verrouiller().as_mut() {
             t.retirer(f.numero);
@@ -3941,15 +4052,24 @@ pub fn reutilisation_changee(s: &Socket, inet: &socket::Inet) {
 /// SO_TXREHASH a changé : la connexion le suit dès son prochain RTO, une
 /// écoute le donne à ses filles (`sk_clone_lock` le recopie). Relu sous la
 /// possession, comme `options_socket_changees` : la connexion et getsockopt
-/// voient le même (Linux n'en a qu'une copie, `sk_txrehash`).
+/// voient le même (Linux n'en a qu'une copie, `sk_txrehash`). Une demande
+/// (une fille en SYN_RECEIVED) n'en a pas à elle : son SYN-ACK renvoyé suit
+/// celui de l'écoute au moment du renvoi (`tcp_rtx_synack` lit
+/// `sk_txrehash` de l'écoute) ; une fille née garde le sien.
 pub fn txrehash_change(s: &Socket) {
-    avec_options(s, |op, t| {
-        let oui = s.appels.verrouiller().options.txrehash != 0;
-        op.txrehash = oui;
-        if let Some(t) = t {
-            t.txrehash = oui;
+    let mut g = flux(s).posseder();
+    let p = g.donnee();
+    let oui = s.appels.verrouiller().options.txrehash != 0;
+    p.options.txrehash = oui;
+    match &mut p.mode {
+        Mode::Connexion(t) => t.txrehash = oui,
+        Mode::Ecoute { filles, .. } => {
+            for f in filles.iter_mut().filter(|f| f.tcb.etat() == Etat::SynRecu) {
+                f.tcb.txrehash = oui;
+            }
         }
-    });
+        Mode::Neuve => {}
+    }
 }
 
 /// SO_MAX_PACING_RATE (`sk_setsockopt`) : le plafond `max` (déjà dans la socket) vaut
@@ -3975,13 +4095,25 @@ pub fn plafonner_le_rythme(s: &Socket, max: u64) {
     }
 }
 
-/// SO_CNX_ADVICE 1 (appels_reseau.rs, `conseil_negatif`) : la route de la
-/// connexion est oubliée si elle expire, c'est-à-dire si une MTU apprise
-/// mène vers le pair (`ipv4_negative_advice`) ; le segment suivant en
-/// cherche une autre.
+/// SO_CNX_ADVICE 1 (appels_reseau.rs, `conseil_negatif`) : d'abord un autre
+/// hachage du flux (`sk_rethink_txhash`), s'il en a un et que SO_TXREHASH le
+/// permet : celui de la connexion (inet), ou, sans connexion, celui que la
+/// socket garde de la dernière (ses RST d'écoute le portent), tiré au hasard
+/// comme chez Linux (`net_tx_rndhash`). Puis la route de la connexion est
+/// oubliée si elle expire, c'est-à-dire si une MTU apprise mène vers le pair
+/// (`ipv4_negative_advice`) ; le segment suivant en cherche une autre.
 pub fn conseil_negatif(s: &Socket) {
     let mut g = flux(s).posseder();
     let p = g.donnee();
+    match &mut p.mode {
+        Mode::Connexion(t) => t.conseil_negatif(),
+        Mode::Ecoute { .. } | Mode::Neuve => {
+            let h = &mut p.options.hors_connexion.hachage;
+            if *h != 0 && p.options.txrehash {
+                *h = crate::aleatoire::u32().max(1);
+            }
+        }
+    }
     if matches!(p.mode, Mode::Connexion(_)) && ipv4::mtu_apprise(p.adresses.distante) {
         p.route_oubliee = true;
     }

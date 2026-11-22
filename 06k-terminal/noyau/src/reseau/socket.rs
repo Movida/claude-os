@@ -519,6 +519,9 @@ pub const CLE_HORODATAGE: u16 = 512;
 /// SO_ZEROCOPY (SOCK_ZEROCOPY) : MSG_ZEROCOPY y vaut quelque chose
 /// (zerocopie.rs) ; TCP et UDP seulement.
 pub const ZEROCOPIE: u16 = 1024;
+/// SO_LOCK_FILTER (SOCK_FILTER_LOCKED) : son filtre ne se change plus, ni ne
+/// s'enlève (filtre.rs), et le verrou ne s'ouvre plus.
+pub const FILTRE_VERROUILLE: u16 = 2048;
 
 /// Les drapeaux de SO_TIMESTAMPING que la réception regarde (`sk_tsflags`,
 /// include/uapi/linux/net_tstamp.h) : RX_SOFTWARE fait prendre l'heure
@@ -838,6 +841,17 @@ pub struct Socket {
     /// par son rythme interne (inet, tcp/rythme.rs) ; les autres le gardent pour le
     /// relire : sans la file `fq`, que nous n'avons pas, rien ne rythme un datagramme.
     pub rythme_max: AtomicU64,
+    /// Le hachage du flux d'une socket de datagrammes (UDP, ping), son `sk_txhash` : tiré à
+    /// chaque `connect` réussi (`ip4_datagram_connect` : `sk_set_txhash`), gardé après la
+    /// déconnexion, et porté par chacun de ses datagrammes, même envoyé par `sendto` à un
+    /// autre (`skb_set_hash_from_sk`, paquet.rs ; tout mesuré, sonde c10g du lot 6 des
+    /// soldes) ; 0 : jamais connectée, ses datagrammes n'en ont pas. Une connexion TCP a le
+    /// sien (inet, `Tcb::hachage`) ; AF_UNIX n'en a jamais.
+    pub hachage: AtomicU32,
+    /// Son filtre (SO_ATTACH_FILTER, filtre.rs). Linux le lit sous RCU à chaque paquet ;
+    /// ici, sous un verrou court, le temps d'en prendre une référence (l'`Arc`) : le
+    /// programme tourne hors de lui, et un nouveau filtre peut se poser pendant ce temps.
+    pub filtre: Verrou<Option<Arc<super::filtre::Filtre>>>,
     /// La suivante des sockets qu'une tâche a à fermer (sa liste
     /// `Tache::fermetures`, voir `fichier_ferme`).
     suivante: Verrou<Option<Arc<Socket>>>,
@@ -904,6 +918,8 @@ impl Socket {
             peek_off: AtomicI32::new(-1),
             cookie: AtomicU64::new(0),
             rythme_max: AtomicU64::new(u64::MAX),
+            hachage: AtomicU32::new(0),
+            filtre: Verrou::new(None),
             suivante: Verrou::new(None),
             flux: None,
             compte_tcp: None,
@@ -1066,11 +1082,18 @@ impl Socket {
     }
 
     /// La mémoire de ses options (`sk_omem_alloc`, SO_MEMINFO) : ses
-    /// adhésions à des groupes et leurs listes de sources, et ses avis de
-    /// MSG_ZEROCOPY.
+    /// adhésions à des groupes et leurs listes de sources, ses avis de
+    /// MSG_ZEROCOPY, et son filtre.
     pub fn memoire_des_options(&self) -> usize {
         let adhesions = if self.protocole == Protocole::Unix { 0 } else { self.adhesions.verrouiller().memoire() };
-        adhesions + self.memoire_avis.load(Ordering::Relaxed)
+        adhesions + self.memoire_hors_adhesions()
+    }
+
+    /// La mémoire de ses options, ses adhésions à part : ses avis de MSG_ZEROCOPY et son
+    /// filtre (ce qui borne les adhésions, multidiffusion.rs).
+    pub fn memoire_hors_adhesions(&self) -> usize {
+        let filtre = self.filtre.verrouiller().as_ref().map_or(0, |f| f.taille());
+        self.memoire_avis.load(Ordering::Relaxed) + filtre
     }
 
     /// La file où attendent `poll` et epoll : celle du flux pour TCP (où

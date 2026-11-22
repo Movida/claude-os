@@ -23,7 +23,7 @@ use crate::reseau::socket::{self, Protocole, Socket, AF_INET, ARRET_ECRITURE, AR
                             IPPROTO_ICMP, IPPROTO_UDP, NPROTO, RCVBUF_MIN, SNDBUF_MIN, SOCK_CLOEXEC, SOCK_DGRAM, SOCK_MAX,
                             SOCK_NONBLOCK, SOCK_RAW, TAMPON_MAX};
 use crate::reseau::datagramme::{self, Controle};
-use crate::reseau::{ipv4, ping, tcp, udp, unix};
+use crate::reseau::{filtre, ipv4, ping, tcp, udp, unix};
 use crate::faillible::{self, VecFaillible};
 use crate::{processus, temps, vfs};
 use alloc::vec::Vec;
@@ -154,6 +154,14 @@ const SO_TXREHASH: i32 = 74;
 const SO_DEVMEM_DONTNEED: i32 = 80;
 const SO_ZEROCOPY: i32 = 60;
 const SO_MAX_PACING_RATE: i32 = 47;
+/// Les filtres (reseau/filtre.rs) : SO_GET_FILTER est
+/// SO_ATTACH_FILTER relu, et SO_DETACH_BPF vaut SO_DETACH_FILTER.
+const SO_ATTACH_FILTER: i32 = 26;
+const SO_DETACH_FILTER: i32 = 27;
+const SO_GET_FILTER: i32 = SO_ATTACH_FILTER;
+const SO_LOCK_FILTER: i32 = 44;
+const SO_BPF_EXTENSIONS: i32 = 48;
+const SO_ATTACH_BPF: i32 = 50;
 /// La réception : l'horodatage, sous ses quatre formes
 /// (_OLD : `timeval` et `timespec` de 64 bits sur x86_64, comme les _NEW ; seul
 /// le numéro du message de contrôle les distingue), les pertes, la marque et
@@ -2077,6 +2085,62 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             }
             return Ok(());
         }
+        // Un programme de BPF classique (`sock_fprog` : sa longueur, en u16, puis
+        // l'adresse de ses instructions, 16 octets exactement, EINVAL ; EFAULT),
+        // dans l'ordre de `sk_attach_filter` : verrouillé, EPERM ; pas d'adresse,
+        // 0 instruction ou plus de 4096, EINVAL ; elles, lues (EFAULT) ; refusé
+        // par la vérification, EINVAL ; puis la mémoire des options (ENOMEM,
+        // filtre.rs). Sous le `Mutex` des appels (le `lock_sock` de Linux), comme
+        // les trois suivantes.
+        SO_ATTACH_FILTER => {
+            if longueur != 16 {
+                return Err(-EINVAL);
+            }
+            let mut o = [0u8; 16];
+            copier_depuis_utilisateur(&mut o, valeur).map_err(|_| -EFAULT)?;
+            let n = u16::from_le_bytes([o[0], o[1]]) as usize;
+            let adresse = u64::from_le_bytes([o[8], o[9], o[10], o[11], o[12], o[13], o[14], o[15]]);
+            let _appels = s.appels.verrouiller();
+            if s.drapeau(socket::FILTRE_VERROUILLE) {
+                return Err(-EPERM);
+            }
+            if adresse == 0 || n == 0 || n > inet::filtre::MAX_INSTRUCTIONS {
+                return Err(-EINVAL);
+            }
+            let mut octets: Vec<u8> = faillible::remplie(n * inet::filtre::Instruction::TAILLE, 0).map_err(|_| -ENOMEM)?;
+            copier_depuis_utilisateur(&mut octets, adresse).map_err(|_| -EFAULT)?;
+            let f = filtre::faire(&octets)?;
+            drop(octets);
+            return filtre::attacher(s, f);
+        }
+        SO_DETACH_FILTER => {
+            let _appels = s.appels.verrouiller();
+            return filtre::detacher(s);
+        }
+        // Le verrou ne s'ouvre plus (EPERM), mais se repose.
+        SO_LOCK_FILTER => {
+            let _appels = s.appels.verrouiller();
+            if s.drapeau(socket::FILTRE_VERROUILLE) && !oui {
+                return Err(-EPERM);
+            }
+            s.poser_drapeau(socket::FILTRE_VERROUILLE, oui);
+            return Ok(());
+        }
+        // Un programme d'eBPF, par le descripteur que rend l'appel `bpf` : un
+        // u32 exactement (EINVAL), puis (`sk_attach_bpf`) verrouillé, EPERM ; un
+        // descripteur fermé, EBADF ; sinon ce n'est pas un programme
+        // (`bpf_prog_get_type`) : EINVAL, toujours ici, sans appel `bpf`.
+        SO_ATTACH_BPF => {
+            if longueur != 4 {
+                return Err(-EINVAL);
+            }
+            let _appels = s.appels.verrouiller();
+            if s.drapeau(socket::FILTRE_VERROUILLE) {
+                return Err(-EPERM);
+            }
+            tenir_fichier(v as u32 as u64)?;
+            return Err(-EINVAL);
+        }
         // Négatif : le plus grand ; 0 se relit 1.
         SO_RCVLOWAT => {
             let v = if v < 0 { i32::MAX as u32 } else { v as u32 };
@@ -2234,19 +2298,25 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
 }
 
 /// SO_CNX_ADVICE 1 (`dst_negative_advice`) : le programme dit que sa
-/// connexion va mal. Linux change alors le hachage du flux (sans le
-/// compter), et oublie la route gardée si elle n'est pas sûre
-/// (`ipv4_negative_advice` : une route périmée, redirigée, ou qui expire,
-/// celle qui porte une MTU apprise) ; une route ordinaire reste. Nous
-/// n'avons ni hachage ni redirection : la route est oubliée quand une MTU
-/// apprise mène vers le pair. Pour UDP et ping, IP_MTU dit ENOTCONN
-/// jusqu'au prochain envoi sur la connexion ; TCP en cherche une au segment
-/// suivant.
+/// connexion va mal. Linux change alors le hachage du flux, s'il en a un
+/// (`sk_rethink_txhash` : pas sans SO_TXREHASH pour TCP ; UDP et ping ont
+/// toujours `net.core.txrehash`, 1), sans le compter ; nous aussi (mesuré :
+/// une socket UDP jamais connectée garde 0). Puis il oublie la route gardée
+/// si elle n'est pas sûre (`ipv4_negative_advice` : une route périmée,
+/// redirigée, ou qui expire, celle qui porte une MTU apprise) ; une route
+/// ordinaire reste. Nous n'avons pas de redirection : la route est oubliée
+/// quand une MTU apprise mène vers le pair. Pour UDP et ping, IP_MTU dit
+/// ENOTCONN jusqu'au prochain envoi sur la connexion ; TCP en cherche une au
+/// segment suivant.
 fn conseil_negatif(s: &Socket) {
     match s.protocole {
         Protocole::Tcp => tcp::conseil_negatif(s),
         Protocole::Udp | Protocole::Ping => {
+            // Sous le verrou de la socket, comme `connect` qui le tire (`sk_set_txhash`).
             let mut inet = s.appels.verrouiller();
+            if s.hachage.load(Ordering::Relaxed) != 0 {
+                s.hachage.store(crate::aleatoire::u32().max(1), Ordering::Relaxed);
+            }
             if inet.route_gardee.is_some() && ipv4::mtu_apprise(inet.distante) {
                 inet.route_gardee = None;
             }
@@ -3088,6 +3158,30 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
                 ecrire_longueur()?;
                 Ok(0)
             }
+            // Le programme du filtre, tel que posé (`sk_get_filter`), et sa
+            // longueur EN INSTRUCTIONS à la place de la longueur : sans filtre, 0 ;
+            // une place nulle, la longueur seule ; une place plus petite que le
+            // nombre d'instructions (comparée à lui, pas aux octets qu'il faut :
+            // Linux compare ainsi), EINVAL ; sinon tout est écrit, 8 octets par
+            // instruction, même au-delà de la place dite (mesuré : une place de 10
+            // pour 3 instructions, 24 octets écrits).
+            SOL_SOCKET if option == SO_GET_FILTER => {
+                let place = lire_longueur(&mut l)? as usize;
+                let n = match filtre::de(s) {
+                    None => 0,
+                    Some(f) if place == 0 => f.programme().len(),
+                    Some(f) if place < f.programme().len() => return Err(-EINVAL),
+                    Some(f) => {
+                        for (k, i) in f.programme().iter().enumerate() {
+                            copier_vers_utilisateur(valeur + (k * inet::filtre::Instruction::TAILLE) as u64, &i.octets())
+                                .map_err(|_| -EFAULT)?;
+                        }
+                        f.programme().len()
+                    }
+                };
+                copier_vers_utilisateur(longueur, &(n as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+                Ok(0)
+            }
             // Les neuf compteurs de la mémoire de la socket (`sk_get_meminfo`),
             // autant qu'il y a de place (`SK_MEMINFO_VARS` u32 au plus).
             SOL_SOCKET if option == SO_MEMINFO => {
@@ -3338,6 +3432,10 @@ fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16]
             entier(&mut o, oui as i32)
         }
         SO_RXQ_OVFL => entier(&mut o, s.drapeau(socket::RXQ_OVFL) as i32),
+        SO_LOCK_FILTER => entier(&mut o, s.drapeau(socket::FILTRE_VERROUILLE) as i32),
+        // Les extensions que connaissent les filtres (`bpf_tell_extensions` :
+        // SKF_AD_MAX, inet::filtre).
+        SO_BPF_EXTENSIONS => entier(&mut o, inet::filtre::EXTENSIONS as i32),
         SO_RCVMARK => entier(&mut o, s.drapeau(socket::RCVMARK) as i32),
         SO_RCVPRIORITY => entier(&mut o, s.drapeau(socket::RCVPRIORITY) as i32),
         SO_SELECT_ERR_QUEUE => entier(&mut o, s.drapeau(socket::SELECT_ERR_QUEUE) as i32),

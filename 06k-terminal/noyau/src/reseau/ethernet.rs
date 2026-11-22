@@ -3,7 +3,7 @@
 //! eux-mêmes sont lus et écrits par formats::reseau::ethernet.
 
 use super::interface::{Compteurs, Interface};
-use super::paquet::Paquet;
+use super::paquet::{self, Contexte, Paquet};
 use formats::reseau::ethernet::{self, Ethernet};
 
 /// Une trame reçue par `i` : gardée si elle est pour nous (notre adresse
@@ -24,6 +24,15 @@ pub fn recevoir(i: &'static Interface, mut p: Paquet) {
     if e.destination != i.mac && !groupe {
         return;
     }
+    // À qui allait la trame (`eth_type_trans` : `pkt_type`), et où commence son
+    // en-tête : ce que voit le filtre d'une socket (paquet.rs, `Contexte`).
+    let genre = match e.destination {
+        [0xff, 0xff, 0xff, 0xff, 0xff, 0xff] => paquet::DIFFUSEE,
+        _ if groupe => paquet::GROUPE,
+        _ => paquet::HOTE,
+    };
+    p.poser_contexte(Contexte { genre, ..p.contexte() });
+    p.noter_liaison();
     let _ = p.retirer_entete(ethernet::ENTETE);
     match e.genre {
         ethernet::IPV4 => super::ipv4::recevoir(i, p, groupe),

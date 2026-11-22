@@ -212,6 +212,10 @@ impl Adhesion {
 /// nous la parcourons à l'envers.
 pub struct Adhesions {
     entrees: Vec<Adhesion>,
+    /// La mémoire des options de la socket que lui laissent ses autres options
+    /// (`borner`) : chaque adhésion, chaque liste de sources neuve ou plus
+    /// grande, doit y tenir (sans limite tant que rien n'est posé).
+    place: usize,
 }
 
 impl Default for Adhesions {
@@ -223,7 +227,22 @@ impl Default for Adhesions {
 impl Adhesions {
     /// Aucune adhésion (et aucune allocation : la place vient à la première).
     pub const fn new() -> Adhesions {
-        Adhesions { entrees: Vec::new() }
+        Adhesions { entrees: Vec::new(), place: usize::MAX }
+    }
+
+    /// La mémoire des options de la socket, `optmem_max`, moins ce qu'y comptent
+    /// ses autres options (son filtre, ses avis de MSG_ZEROCOPY) : posée par le
+    /// noyau avant chaque changement. Une adhésion, une liste de sources neuve ou
+    /// plus grande, n'est prise que si les adhésions, avec elle, restent
+    /// strictement en dessous (`sock_kmalloc` : `omem + taille < optmem_max`), la
+    /// liste qu'elle remplace encore comptée ; sinon ENOBUFS.
+    pub fn borner(&mut self, place: usize) {
+        self.place = place;
+    }
+
+    /// `taille` octets de plus tiennent-ils (`borner`) ?
+    fn peut_prendre(&self, taille: usize) -> bool {
+        self.memoire().saturating_add(taille) < self.place
     }
 
     pub fn est_vide(&self) -> bool {
@@ -246,7 +265,8 @@ impl Adhesions {
     /// et sans source (`__ip_mc_join_group` : EXCLUDE pour IP_ADD_MEMBERSHIP
     /// et MCAST_JOIN_GROUP, INCLUDE avant d'ajouter une source,
     /// `ip_mc_join_group_ssm`) : pas un groupe : EINVAL ; pas d'interface :
-    /// ENODEV ; déjà membre par elle : EADDRINUSE ; 20 adhésions : ENOBUFS.
+    /// ENODEV ; déjà membre par elle : EADDRINUSE ; 20 adhésions, ou plus la place
+    /// dans la mémoire des options (`borner`) : ENOBUFS.
     /// L'interface gagne un membre du groupe. Rend son index.
     pub fn joindre(&mut self, groupes: &mut Groupes, d: Demande, trouvee: Option<u32>, mode: Mode) -> Result<u32, Refus> {
         if !ipv4::multidiffusion(d.groupe) {
@@ -256,7 +276,7 @@ impl Adhesions {
         if self.trouver(d.groupe, k).is_some() {
             return Err(Refus::DejaMembre);
         }
-        if self.entrees.len() >= MAX_ADHESIONS {
+        if self.entrees.len() >= MAX_ADHESIONS || !self.peut_prendre(COUT_ADHESION) {
             return Err(Refus::PlusDePlace);
         }
         self.entrees.try_reserve(1).map_err(|_| Refus::PlusDePlace)?;
@@ -323,6 +343,7 @@ impl Adhesions {
         let Some(k) = trouvee else { return Err(Refus::PasDInterface) };
         let Some(p) = self.trouver(d.groupe, k) else { return Err(Refus::Invalide) };
         let (i, mut c) = groupes.interface_mut(k).ok_or(Refus::PasDInterface)?;
+        let (memoire, place) = (self.memoire(), self.place);
         let e = &mut self.entrees[p];
         if e.liste.is_some() {
             if e.mode != mode {
@@ -348,6 +369,16 @@ impl Adhesions {
         }
         let l = e.liste.unwrap_or(Liste::VIDE);
         if l.n >= MAX_SOURCES {
+            return Err(Refus::PlusDePlace);
+        }
+        // La liste neuve, ou plus grande (voir `grandir`), doit tenir dans la mémoire
+        // des options, l'ancienne encore comptée (`borner`).
+        let neuve = match e.liste {
+            None => Some(l.places),
+            Some(l) if l.n == l.places => Some(l.places + BLOC_DE_SOURCES),
+            Some(_) => None,
+        };
+        if neuve.is_some_and(|places| memoire.saturating_add(COUT_LISTE + 4 * places) >= place) {
             return Err(Refus::PlusDePlace);
         }
         // Une liste pleine grandit avant que la source y soit cherchée
@@ -414,7 +445,8 @@ impl Adhesions {
             return self.quitter(groupes, Demande { index: k, ..d }, Some(k));
         }
         let Some(p) = self.trouver(d.groupe, k) else { return Err(Refus::Invalide) };
-        if sources.len() > MAX_SOURCES {
+        // La liste neuve (`borner`), l'ancienne encore comptée.
+        if sources.len() > MAX_SOURCES || (!sources.is_empty() && !self.peut_prendre(COUT_LISTE + 4 * sources.len())) {
             return Err(Refus::PlusDePlace);
         }
         let (i, mut c) = groupes.interface_mut(k).ok_or(Refus::PasDInterface)?;

@@ -25,6 +25,7 @@ pub mod contexte;
 pub mod datagramme;
 pub mod dhcp;
 pub mod ethernet;
+pub mod filtre;
 pub mod horodatage;
 pub mod icmp;
 pub mod interface;

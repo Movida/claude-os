@@ -153,7 +153,7 @@ pub fn recevoir(i: &'static Interface, iif: u32, h: &format_ipv4::Ipv4, entete: 
         return;
     }
     if matches!(m.genre, icmp::ECHO_REPONSE | icmp::ECHO_ETENDU_REPONSE) {
-        return super::ping::recevoir(i.index, iif, h.source, h.destination, entete, p);
+        return super::ping::recevoir(i, iif, h.source, h.destination, entete, p);
     }
     if m.genre > icmp::GENRE_MAX {
         return refuse();

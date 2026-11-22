@@ -772,6 +772,11 @@ pub struct Restes {
     /// L'heure au plus tôt du prochain segment, au rythme interne (`tcp_wstamp_ns`, que
     /// ni `tcp_disconnect` ni la naissance d'une fille ne remettent : rythme.rs).
     depart: u64,
+    /// Le hachage du flux (`sk_txhash`), que ni `tcp_disconnect` ni `listen` n'effacent : celui
+    /// que portent les RST d'une écoute qui a été une connexion, pour ses filles en
+    /// SYN_RECEIVED (`tcp_v4_send_reset` : celui de l'écoute, pas de la demande). Une
+    /// connexion neuve en tire un autre (`sk_set_txhash`).
+    pub hachage: u32,
 }
 
 impl Restes {
@@ -780,7 +785,7 @@ impl Restes {
         mss: MSS_DEFAUT, pmtu: 0, entete: 0, advmss: 0, rcv_mss: 0, retransmissions: 0, dernier_envoi: 0, dernier_ack: 0,
         rcv_ssthresh: 0, snd_wnd: 0, rcv_wnd: 0, rcv_space: 0, reordering: TCP_REORDERING, rcv_rtt8: 0, rcv_rtt_seq: 0,
         rcv_rtt_debut: 0, pacing: PACING_MAX, min_rtt: MinMax::new(), mesures: Mesures::new(), files_vides: true,
-        write_seq: 0, snd_una: 0, snd_nxt: 0, max_fenetre: 0, rehash: 0, depart: 0,
+        write_seq: 0, snd_una: 0, snd_nxt: 0, max_fenetre: 0, rehash: 0, depart: 0, hachage: 0,
     };
 
     /// `tcp_disconnect` : les files purgées (`tcp_write_queue_purge` arrête d'abord le
@@ -1248,6 +1253,9 @@ pub struct Tcb<P: Charge> {
     purgee: Option<u32>,
     /// Les RTO qui ont changé le hachage du flux (`timeout_rehash`).
     rehash: u32,
+    /// Le hachage du flux (`sk_txhash`), que portent ses segments (`skb_set_hash_from_sk`) :
+    /// voir `poser_hachage`. 0 tant que le noyau ne l'a pas posé.
+    hachage: u32,
 }
 
 /// CurrEstab est une jauge : elle redescend quand une connexion établie change
@@ -1419,6 +1427,7 @@ impl<P: Charge> Tcb<P> {
             dernier_recu: 0,
             purgee: None,
             rehash: 0,
+            hachage: 0,
         }
     }
 
@@ -1481,6 +1490,52 @@ impl<P: Charge> Tcb<P> {
         t.rcv_wup = t.rcv_nxt;
         t.syn_du = true;
         t
+    }
+
+    /// Le hachage du flux, tiré au hasard par le noyau à la naissance de la connexion
+    /// (`sk_set_txhash` de `tcp_v4_connect`, ou celui de la demande d'une fille,
+    /// `tcp_conn_request`, que reprend sa socket : `tcp_create_openreq_child`) ; jamais 0
+    /// (`net_tx_rndhash`), qui dirait « pas de hachage ».
+    ///
+    /// Choix de conception : ensuite, un nouveau hachage (`rehacher`) se déduit du
+    /// précédent, par un mélange sans perte des 32 bits, pas par un nouveau tirage. Linux
+    /// en tire un neuf à chaque fois (`net_tx_rndhash`) ; inet ne tire rien au hasard (ses
+    /// tests rejouent tout), et le seul usage du hachage, choisir un chemin chez qui
+    /// répartit les flux (ECMP), ou le lire par un filtre (SKF_AD_RXHASH), demande des
+    /// valeurs qui changent et qu'on ne devine pas sans la première, ce que donne le
+    /// mélange d'une valeur tirée. Écarté : demander un tirage au noyau à chaque RTO
+    /// (inet devrait l'appeler, ou chaque minuteur rendre un effet de plus).
+    pub fn poser_hachage(&mut self, graine: u32) {
+        self.hachage = graine.max(1);
+    }
+
+    /// Le hachage du flux, que portent ses segments (`sk_txhash`).
+    pub fn hachage(&self) -> u32 {
+        self.hachage
+    }
+
+    /// Un autre hachage du flux (`sk_rethink_txhash`, `tcp_rtx_synack`) : le précédent
+    /// mélangé (`lowbias32` de Chris Wellons : chaque étape se défait, le mélange est une
+    /// permutation des 32 bits, où seul 0 donne 0 : jamais 0, comme le neuf de Linux).
+    /// Rien sans hachage posé (Linux non plus : `sk_rethink_txhash`).
+    fn rehacher(&mut self) {
+        let mut x = self.hachage;
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7feb_352d);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846c_a68b);
+        x ^= x >> 16;
+        self.hachage = x;
+    }
+
+    /// SO_CNX_ADVICE 1 : le programme dit que la connexion va mal (`dst_negative_advice`, qui
+    /// commence par `sk_rethink_txhash`) : un autre hachage du flux, s'il en a un et que
+    /// SO_TXREHASH le permet, sans le compter (`rehash` ne compte que les RTO,
+    /// `timeout_rehash`). La route, c'est le noyau qui l'oublie.
+    pub fn conseil_negatif(&mut self) {
+        if self.hachage != 0 && self.txrehash {
+            self.rehacher();
+        }
     }
 
     /// Le décalage de nos horodatages, pour une fille (`tcp_v4_init_ts_off`).
@@ -1654,6 +1709,7 @@ impl<P: Charge> Tcb<P> {
             max_fenetre: self.max_fenetre,
             rehash: self.rehash,
             depart: self.depart,
+            hachage: self.hachage,
         }
     }
 
@@ -4222,6 +4278,12 @@ impl<P: Charge> Tcb<P> {
             // manque (`tcp_rtx_synack`, `inet_csk_route_req` : OutNoRoutes) ; renvoyé par son
             // minuteur, la demande meurt, sans bruit (`reqsk_timer_handler`) ; à un SYN répété,
             // rien de plus (`tcp_check_req` : ni renvoi compté, ni minuteur réarmé).
+            // Le SYN-ACK renvoyé d'une fille prend un autre hachage, avant de chercher sa
+            // route (`tcp_rtx_synack`, si l'écoute le permet : SO_TXREHASH) ; celui d'une
+            // connexion change à son RTO (`retrans.rs`).
+            if renvoi != RenvoiSyn::Non && self.fille && self.txrehash {
+                self.rehacher();
+            }
             if renvoi != RenvoiSyn::Non && self.sans_route {
                 if self.fille {
                     let h = self.entete_avec(self.iss, drapeaux, 0);

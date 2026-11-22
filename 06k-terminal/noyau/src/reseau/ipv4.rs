@@ -263,8 +263,10 @@ fn lire_options(i: &Interface, h: &ipv4::Ipv4, p: &mut Paquet, locale: bool) -> 
 /// Un paquet IPv4 (sans son en-tête Ethernet) reçu par `i`, dans la tâche
 /// du réseau ; `trame_diffusee` : sa trame allait à toutes les machines
 /// (jamais d'erreur ICMP en réponse).
-pub fn recevoir(i: &'static Interface, p: Paquet, trame_diffusee: bool) {
+pub fn recevoir(i: &'static Interface, mut p: Paquet, trame_diffusee: bool) {
     MIB.ip(Ip::InReceives);
+    // Où commence son en-tête (`ip_rcv_core` : `skb_reset_network_header`).
+    p.noter_reseau();
     let (h, charge) = match ipv4::lire(p.donnees()) {
         Ok(x) => x,
         Err(e) => {
@@ -372,11 +374,15 @@ struct Arrivee {
 
 /// Où un datagramme pour nous est arrivé, ce que prépare IP_PKTINFO pour une
 /// socket qui l'a (`ipv4_pktinfo_prepare`, udp.rs) : l'interface (`inet_iif`)
-/// et l'adresse par laquelle l'émetteur nous joint (`fib_compute_spec_dst`).
+/// et l'adresse par laquelle l'émetteur nous joint (`fib_compute_spec_dst`) ;
+/// et la carte qui l'a reçu (`skb->dev` : lo pour tout ce que nous nous
+/// envoyons, même à l'adresse d'une autre carte, que dit pourtant `interface`),
+/// ce que voit un filtre (filtre.rs).
 #[derive(Clone, Copy)]
 pub struct Lieu {
     pub interface: u32,
     pub reponse: [u8; 4],
+    pub carte: inet::filtre::Carte,
 }
 
 /// La copie `p` d'une diffusion (ou d'un envoi pour un groupe qu'elle a) que
@@ -389,10 +395,13 @@ pub struct Lieu {
 /// route notée y reçoit encore notre adresse), une route source jetée, une
 /// option fausse aussi (sans « problème de paramètre » : jamais pour une
 /// diffusion).
-pub fn recevoir_la_diffusion(i: &'static Interface, p: Paquet) {
+pub fn recevoir_la_diffusion(i: &'static Interface, mut p: Paquet) {
     MIB.ip(Ip::InReceives);
+    // Sans en-tête de liaison : celui de réseau en tient lieu (`dev_loopback_xmit` :
+    // `skb_reset_mac_header` sur l'en-tête IPv4).
+    p.noter_reseau();
+    p.noter_liaison();
     let Ok((h, _)) = ipv4::lire(p.donnees()) else { return };
-    let mut p = p;
     let mut compilees = ipv4::Options::AUCUNES;
     if h.longueur_entete > ipv4::ENTETE {
         match lire_options(i, &h, &mut p, false) {
@@ -448,7 +457,7 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Opti
             } else {
                 h.destination
             };
-            let lieu = Lieu { interface, reponse };
+            let lieu = Lieu { interface, reponse, carte: super::filtre::carte(i) };
             if let Err(p) = super::udp::recevoir(lieu, h.source, h.destination, &entete, diffusion, a_verifier, p) {
                 injoignable(icmp::PORT, p);
             }
@@ -510,6 +519,9 @@ fn recoller(i: &'static Interface, h: &ipv4::Ipv4, mut f: Fragment) -> Option<(i
 /// octets d'en-tête du premier), recopiés en un paquet neuf ; None : plus de mémoire.
 fn coller(morceaux: &mut [Fragment], longueur: usize, entete: usize, ecn: u8) -> Option<(ipv4::Ipv4, Paquet)> {
     let mut neuf = Paquet::vide(entete + longueur)?;
+    // La tête du premier morceau, son en-tête de liaison compris (`ip_frag_reasm`
+    // la réutilise) : ce que lit le filtre d'une socket (paquet.rs).
+    neuf.poser_liaison(morceaux.first()?.paquet.entete_de_liaison());
     let o = neuf.ajouter_fin(entete + longueur)?;
     let tete = morceaux.first_mut()?.paquet.ajouter_entete(entete)?;
     o[..entete].copy_from_slice(tete);

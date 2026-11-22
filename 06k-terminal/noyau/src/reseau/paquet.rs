@@ -244,8 +244,19 @@ pub struct Sortie {
 
 pub struct Paquet {
     tampon: Vec<u8>,
-    debut: usize,
-    fin: usize,
+    /// Les bornes des données dans `tampon`. En u32 : un paquet tient dans
+    /// 64 Kio et sa marge, et la place gagnée paie `liaison` et `reseau` (voir
+    /// la taille, plus bas).
+    debut: u32,
+    fin: u32,
+    /// Où commencent dans `tampon` ses en-têtes de liaison (Ethernet) et de
+    /// réseau (IPv4), notés à la réception (le `mac_header` et le
+    /// `network_header` du `sk_buff`), que les étages suivants ont retirés des
+    /// données : ce que lit le filtre de sa socket (SKF_LL_OFF, SKF_NET_OFF,
+    /// filtre.rs). AUCUN : pas noté (un paquet à émettre, une copie de la
+    /// charge seule).
+    liaison: u16,
+    reseau: u16,
     proprietaire: Option<Proprietaire>,
     sortie: Option<Sortie>,
     /// Son contexte (`Contexte`), que gardent ses copies et ses morceaux.
@@ -274,18 +285,45 @@ pub struct Paquet {
 ///     marque choisirait une route par des règles (`ip rule`), la priorité
 ///     une file de la carte (`pfifo_fast`), et nous n'avons ni l'une ni
 ///     l'autre ; reçu du dehors, un paquet n'en a pas (0).
+///   - `hachage` : le hachage de son flux (`hash`), celui que pose la socket
+///     qui l'envoie (`skb_set_hash_from_sk` : son `sk_txhash`, une connexion
+///     TCP, un datagramme d'une socket connectée un jour, socket.rs), que lo
+///     garde jusqu'à l'arrivée ; 0 sinon, et pour tout ce que livre une carte
+///     (virtio-net ne nous le calcule pas). Seul un filtre le lit
+///     (SKF_AD_RXHASH) ;
+///   - `genre` : à qui allait la trame (`pkt_type`), posé à son arrivée par
+///     Ethernet (`eth_type_trans`) : à nous (HOTE), à toutes les machines
+///     (DIFFUSEE), à un groupe (GROUPE), ou la copie d'une diffusion que nous
+///     avons envoyée (BOUCLE, `dev_loopback_xmit`). Seul un filtre le lit
+///     (SKF_AD_PKTTYPE) : IP et UDP trient par l'adresse, pas par la trame.
 #[derive(Clone, Copy, Default)]
 pub struct Contexte {
     pub horodatage: u64,
     pub marque: u32,
     pub priorite: u32,
+    pub hachage: u32,
+    pub genre: u8,
 }
+
+/// Les genres de trame (`Contexte::genre`, PACKET_* de linux/if_packet.h).
+pub const HOTE: u8 = 0;
+pub const DIFFUSEE: u8 = 1;
+pub const GROUPE: u8 = 2;
+pub const BOUCLE: u8 = 5;
+
+/// Un en-tête pas noté (`Paquet::liaison`, `Paquet::reseau`).
+const AUCUN: u16 = u16::MAX;
+
+/// La taille d'un `Paquet`, que tout chemin du réseau garde dans ses cadres de
+/// pile (lo reçoit sur la pile de qui émet : le plus profond va jusqu'à TCP,
+/// sous 12 Kio) : 112 octets, au plus.
+const _: () = assert!(core::mem::size_of::<Paquet>() <= 112);
 
 impl Paquet {
     /// Un paquet sans octets ni place, qui n'alloue rien (les données d'un
     /// avis de MSG_ZEROCOPY, socket.rs).
     pub fn rien() -> Paquet {
-        Paquet { tampon: Vec::new(), debut: 0, fin: 0, proprietaire: None, sortie: None, contexte: Contexte::default(), demande: None }
+        Paquet::de(Vec::new(), 0, 0)
     }
 
     /// Un paquet vide, avec la marge pour ses en-têtes et la place pour
@@ -293,34 +331,52 @@ impl Paquet {
     pub fn vide(longueur: usize) -> Option<Paquet> {
         let tampon = faillible::remplie(MARGE + longueur, 0).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: MARGE, fin: MARGE, proprietaire: None, sortie: None, contexte: Contexte::default(), demande: None })
+        Some(Paquet::de(tampon, MARGE, MARGE))
     }
 
     /// Une copie de la trame `octets` (reçue), sans marge.
     pub fn copie(octets: &[u8]) -> Option<Paquet> {
         let tampon = faillible::copie(octets).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: 0, fin: octets.len(), proprietaire: None, sortie: None, contexte: Contexte::default(), demande: None })
+        Some(Paquet::de(tampon, 0, octets.len()))
+    }
+
+    /// Un paquet de ce tampon, ses données entre `debut` et `fin` (qui tiennent
+    /// en 32 bits : le tampon vient d'être fait, au plus 64 Kio et la marge).
+    fn de(tampon: Vec<u8>, debut: usize, fin: usize) -> Paquet {
+        Paquet {
+            tampon, debut: debut as u32, fin: fin as u32, liaison: AUCUN, reseau: AUCUN, proprietaire: None, sortie: None,
+            contexte: Contexte::default(), demande: None,
+        }
+    }
+
+    fn debut(&self) -> usize {
+        self.debut as usize
+    }
+
+    fn fin(&self) -> usize {
+        self.fin as usize
     }
 
     /// Les données.
     pub fn donnees(&self) -> &[u8] {
-        &self.tampon[self.debut..self.fin]
+        &self.tampon[self.debut()..self.fin()]
     }
 
     pub fn donnees_mut(&mut self) -> &mut [u8] {
-        &mut self.tampon[self.debut..self.fin]
+        let (d, f) = (self.debut(), self.fin());
+        &mut self.tampon[d..f]
     }
 
     pub fn longueur(&self) -> usize {
-        self.fin - self.debut
+        (self.fin - self.debut) as usize
     }
 
     /// Ajoute `n` octets à la fin des données (le `skb_put`) : la place
     /// réservée à la création. None : il n'y en a plus.
     pub fn ajouter_fin(&mut self, n: usize) -> Option<&mut [u8]> {
-        let fin = self.fin.checked_add(n).filter(|&f| f <= self.tampon.len())?;
-        let debut = core::mem::replace(&mut self.fin, fin);
+        let fin = self.fin().checked_add(n).filter(|&f| f <= self.tampon.len())?;
+        let debut = core::mem::replace(&mut self.fin, fin as u32) as usize;
         Some(&mut self.tampon[debut..fin])
     }
 
@@ -333,7 +389,7 @@ impl Paquet {
     /// tenant garde notre émission, et le découpage d'ipv4.rs, tels quels,
     /// pour au plus 64 Kio recopiés de temps en temps.)
     pub fn agrandir(&mut self, n: usize) -> Option<&mut [u8]> {
-        let fin = self.fin.checked_add(n)?;
+        let fin = self.fin().checked_add(n).filter(|&f| f <= u32::MAX as usize)?;
         if fin > self.tampon.len() {
             let avant = self.tampon.capacity();
             self.tampon.redimensionner(fin, 0).ok()?;
@@ -345,8 +401,9 @@ impl Paquet {
     /// Ajoute un en-tête de `n` octets devant les données (le `skb_push`),
     /// dans la marge. None : la marge est épuisée.
     pub fn ajouter_entete(&mut self, n: usize) -> Option<&mut [u8]> {
-        self.debut = self.debut.checked_sub(n)?;
-        Some(&mut self.tampon[self.debut..self.debut + n])
+        let debut = self.debut().checked_sub(n)?;
+        self.debut = debut as u32;
+        Some(&mut self.tampon[debut..debut + n])
     }
 
     /// La taille vraie du paquet (le `truesize` de Linux) : son tampon, plus
@@ -362,8 +419,8 @@ impl Paquet {
         if n > self.longueur() {
             return None;
         }
-        let debut = self.debut;
-        self.debut += n;
+        let debut = self.debut();
+        self.debut += n as u32;
         Some(&self.tampon[debut..debut + n])
     }
 
@@ -372,7 +429,57 @@ impl Paquet {
     /// (le bourrage d'une trame Ethernet trop courte). Plus que la
     /// longueur : rien ne change.
     pub fn couper(&mut self, n: usize) {
-        self.fin = self.fin.min(self.debut + n);
+        self.fin = self.fin().min(self.debut() + n) as u32;
+    }
+
+    /// Le début des données est celui de l'en-tête de liaison (`skb_reset_mac_header`,
+    /// à l'arrivée d'une trame), ou de réseau (`skb_reset_network_header`, à celle
+    /// d'un paquet IPv4).
+    pub fn noter_liaison(&mut self) {
+        self.liaison = u16::try_from(self.debut).unwrap_or(AUCUN);
+    }
+
+    pub fn noter_reseau(&mut self) {
+        self.reseau = u16::try_from(self.debut).unwrap_or(AUCUN);
+    }
+
+    /// Son en-tête de liaison, tel qu'arrivé : de son début à celui de l'en-tête
+    /// de réseau (vide pour la copie d'une diffusion, qui n'en a pas : elle
+    /// commence à son en-tête IPv4).
+    pub fn entete_de_liaison(&self) -> &[u8] {
+        match (self.liaison, self.reseau) {
+            (AUCUN, _) | (_, AUCUN) => &[],
+            (l, r) => self.tampon.get(l as usize..r as usize).unwrap_or(&[]),
+        }
+    }
+
+    /// Met `entete` (un en-tête de liaison, `entete_de_liaison`) devant les
+    /// données, dans la marge, et note les deux en-têtes : celui de réseau au
+    /// début des données (le paquet recollé de ses morceaux, ipv4.rs, qui garde
+    /// la tête du premier, en-tête Ethernet compris : `ip_frag_reasm`). Sans la
+    /// place : rien de noté.
+    pub fn poser_liaison(&mut self, entete: &[u8]) {
+        self.noter_reseau();
+        if let Some(o) = self.ajouter_entete(entete.len()) {
+            o.copy_from_slice(entete);
+            self.noter_liaison();
+            self.debut += entete.len() as u32;
+        }
+    }
+
+    /// Ce que voit un filtre (filtre.rs) : les octets du premier en-tête noté
+    /// (de liaison, ou de réseau) à la fin des données, et où y commencent les
+    /// données, reculées des `recul` octets déjà retirés (l'en-tête de
+    /// transport, d'où compte un filtre), l'en-tête de réseau et celui de
+    /// liaison. None : les en-têtes ne sont pas notés (jamais pour un paquet
+    /// arrivé par IPv4), ou le recul sort du tampon.
+    pub fn pour_filtre(&self, recul: usize) -> Option<(&[u8], usize, usize, Option<usize>)> {
+        let donnees = self.debut().checked_sub(recul)?;
+        let reseau = (self.reseau != AUCUN).then_some(self.reseau as usize).filter(|&r| r <= donnees)?;
+        let liaison = (self.liaison != AUCUN).then_some(self.liaison as usize).filter(|&l| l <= reseau);
+        let premier = liaison.unwrap_or(reseau);
+        let octets = self.tampon.get(premier..self.fin())?;
+        Some((octets, donnees - premier, reseau - premier, liaison.map(|l| l - premier)))
     }
 }
 

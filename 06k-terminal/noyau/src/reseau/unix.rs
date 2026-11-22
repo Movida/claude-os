@@ -91,6 +91,7 @@
 //! qui oublie l'octet urgent sauté (il dit 1, la file vide, pour toujours) : pas un comportement sur
 //! lequel un programme peut compter.
 
+use super::filtre::{self, Verdict};
 use super::socket::{Protocole, Socket, ARRET_ECRITURE, ARRET_LECTURE, POLLRDHUP};
 use crate::asynchrone::Raison;
 use crate::appels_fichiers::FichierTenu;
@@ -1261,6 +1262,10 @@ fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dr
 /// nom, ou le pair ; SEQPACKET : le pair seul, ENOTCONN sans) ; il en a un
 /// autre que nous : EPERM ; fermé : ECONNREFUSED (ou EPIPE pour SEQPACKET) ;
 /// sa file pleine (un DGRAM qui n'est pas son pair) : attendre, ou EAGAIN.
+/// Le filtre du destinataire passe avant ces trois-là (`sk_filter`, dès qu'il
+/// est trouvé ; filtre.rs) : ce qu'il jette est perdu sans erreur, l'envoi
+/// réussit ; sa coupe raccourcit le message, pas sa taille vraie (`pskb_trim`
+/// ne change pas `truesize`).
 fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, drapeaux: u64, scm: Scm,
                    mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_DONTWAIT: u64 = 0x40;
@@ -1297,6 +1302,12 @@ fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize,
     let mut m = message(s, longueur, 0, &mut remplir)?;
     m.fichiers = scm.fichiers;
     m.droits = scm.droits;
+    if let Some(f) = filtre::de(&autre) {
+        match filtre::passer_unix(&f, &m.octets) {
+            Verdict::Jeter => return Ok(longueur),
+            Verdict::Garder(n) => m.octets.truncate(n),
+        }
+    }
     loop {
         let ua = unix(&autre);
         let (morte, son_pair_ok, pleine) = {

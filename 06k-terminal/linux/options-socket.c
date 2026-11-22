@@ -100,11 +100,24 @@
  *     débit borné aussitôt, le plafond) ; la fille d'une écoute a celui de sa naissance ;
  *     et le rythme interne de TCP sur lo : 2 Mo à 2 Mo/s, les dix premiers segments
  *     sans attendre, contre bien moins sans plafond, ou à 0.
+ *   - les filtres (SO_ATTACH_FILTER : le BPF classique) : ce que refusent la pose (la
+ *     longueur, le programme, le verrou, la mémoire des options : le nouveau compté avant
+ *     que l'ancien ne parte, et les adhésions derrière lui), SO_GET_FILTER (la place
+ *     comptée en instructions), SO_DETACH_FILTER, SO_LOCK_FILTER, SO_ATTACH_BPF sans
+ *     programme eBPF, SO_BPF_EXTENSIONS ; puis ce que voit un filtre et ce qu'il fait du
+ *     paquet : les coupes (jamais sous l'en-tête d'UDP ni de TCP, ni sous un octet) et
+ *     ce que compte un paquet jeté, pour UDP, ping, TCP (l'écoute, la connexion, la
+ *     fille qui hérite du filtre de son écoute) et AF_UNIX (pas en flux) ; les octets
+ *     des en-têtes (SKF_NET_OFF, SKF_LL_OFF) et les extensions (le protocole, le genre
+ *     de la trame, la carte, la charge, le processeur, le hachage du flux : celui d'une
+ *     socket UDP connectée, gardé après la déconnexion, neuf à chaque connexion, et
+ *     après SO_CNX_ADVICE 1, d'UDP comme de TCP, sauf SO_TXREHASH 0).
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
 #include <errno.h>
 #include <limits.h>
+#include <linux/filter.h>
 #include <linux/net_tstamp.h>
 #include <stdint.h>
 #include <netinet/in.h>
@@ -113,6 +126,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -3142,6 +3156,476 @@ static void rythme_max(void)
              "SO_MAX_PACING_RATE : le rythme interne de TCP, dix segments sans attendre puis au debit ; sans plafond, ou a 0, rien n'attend");
 }
 
+/* --- Les filtres --- */
+
+#define F(c, k) ((struct sock_filter){(unsigned short)(c), 0, 0, (unsigned)(k)})
+#define RET_A F(BPF_RET | BPF_A, 0)
+#define RET_K(k) F(BPF_RET | BPF_K, k)
+
+static int filtre(int s, struct sock_filter *f, unsigned short n)
+{
+    struct sock_fprog p = {n, f};
+    return erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &p, sizeof p));
+}
+
+static int filtre_k(int s, unsigned k)
+{
+    struct sock_filter f[1] = {RET_K(k)};
+    return filtre(s, f, 1);
+}
+
+/* Un compteur de /proc/net/snmp (`proto` : Udp, Tcp...), -1 s'il manque. */
+static long snmp(const char *proto, const char *champ)
+{
+    FILE *f = fopen("/proc/net/snmp", "r");
+    char a[1024], b[1024];
+    long v = -1;
+    while (f && fgets(a, sizeof a, f) && fgets(b, sizeof b, f)) {
+        if (strncmp(a, proto, strlen(proto)) || a[strlen(proto)] != ':')
+            continue;
+        char *sa, *sb, *ta = strtok_r(a, " \n", &sa), *tb = strtok_r(b, " \n", &sb);
+        while ((ta = strtok_r(NULL, " \n", &sa)) && (tb = strtok_r(NULL, " \n", &sb)))
+            if (!strcmp(ta, champ))
+                v = atol(tb);
+    }
+    if (f)
+        fclose(f);
+    return v;
+}
+
+static void filtres_options(void)
+{
+    struct sock_filter trois[3] = {F(BPF_LD | BPF_W | BPF_ABS, 0), F(BPF_ALU | BPF_ADD | BPF_K, 1), RET_A};
+    for (int i = 0; i < SORTES; i++) {
+        const struct sorte *so = &sortes[i];
+        int s = ouvrir(so), v = 1;
+        socklen_t l = 0;
+        struct sock_fprog p = {1, trois};
+        /* La pose : au moins un entier, puis une `sock_fprog` exactement ; une adresse,
+         * de 1 à 4096 instructions, un programme juste ; lisibles. */
+        verifier(erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &p, 2)) == EINVAL
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &p, 8)) == EINVAL
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, NULL, sizeof p)) == EFAULT,
+                 dire("%s : SO_ATTACH_FILTER, une sock_fprog de 16 octets (EINVAL, EFAULT)", so->nom));
+        struct sock_fprog nul = {1, NULL}, vide = {0, trois}, trop = {4097, trois}, loin = {1, (void *)8};
+        struct sock_filter sans_ret[1] = {F(BPF_LD | BPF_W | BPF_ABS, 0)}, div0[2] = {F(BPF_ALU | BPF_DIV | BPF_K, 0), RET_A};
+        verifier(erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &nul, sizeof nul)) == EINVAL
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &vide, sizeof vide)) == EINVAL
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &trop, sizeof trop)) == EINVAL
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_FILTER, &loin, sizeof loin)) == EFAULT
+                 && filtre(s, sans_ret, 1) == EINVAL && filtre(s, div0, 2) == EINVAL,
+                 dire("%s : SO_ATTACH_FILTER refuse un programme absent, vide, trop long, illisible ou faux", so->nom));
+        /* Relu : sans filtre, 0 ; la place comptée en instructions ; tout écrit. */
+        verifier(getsockopt(s, SOL_SOCKET, SO_GET_FILTER, NULL, &l) == 0 && l == 0,
+                 dire("%s : SO_GET_FILTER sans filtre : 0", so->nom));
+        struct sock_filter relu[4];
+        memset(relu, 0x77, sizeof relu);
+        verifier(filtre(s, trois, 3) == 0 && getsockopt(s, SOL_SOCKET, SO_GET_FILTER, NULL, &l) == 0 && l == 3
+                 && (l = 2, erreur(getsockopt(s, SOL_SOCKET, SO_GET_FILTER, relu, &l))) == EINVAL
+                 && (l = 3, getsockopt(s, SOL_SOCKET, SO_GET_FILTER, relu, &l)) == 0 && l == 3
+                 && !memcmp(relu, trois, sizeof trois) && relu[3].code == 0x7777,
+                 dire("%s : SO_GET_FILTER : la longueur, EINVAL sous elle, le programme", so->nom));
+        /* Enlevé, puis plus rien à enlever. */
+        verifier(erreur(setsockopt(s, SOL_SOCKET, SO_DETACH_FILTER, &v, sizeof v)) == 0
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_DETACH_FILTER, &v, sizeof v)) == ENOENT
+                 && getsockopt(s, SOL_SOCKET, SO_GET_FILTER, NULL, &l) == 0 && l == 0,
+                 dire("%s : SO_DETACH_FILTER, puis ENOENT", so->nom));
+        /* Un descripteur qui n'est pas un programme d'eBPF. */
+        int fd = -1;
+        verifier(erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_BPF, &fd, 8)) == EINVAL
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_BPF, &fd, 4)) == EBADF
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_BPF, &s, 4)) == EINVAL,
+                 dire("%s : SO_ATTACH_BPF : EINVAL, EBADF, EINVAL", so->nom));
+        verifier(lire(s, SO_BPF_EXTENSIONS) == 64 && poser(s, SO_BPF_EXTENSIONS, 1) == ENOPROTOOPT,
+                 dire("%s : SO_BPF_EXTENSIONS : 64, en lecture seule", so->nom));
+        /* Le verrou : posé, il ne s'ouvre plus ; le filtre ne change plus. */
+        verifier(filtre(s, trois, 3) == 0 && lire(s, SO_LOCK_FILTER) == 0 && poser(s, SO_LOCK_FILTER, 2) == 0
+                 && lire(s, SO_LOCK_FILTER) == 1 && poser(s, SO_LOCK_FILTER, 0) == EPERM && poser(s, SO_LOCK_FILTER, 1) == 0
+                 && filtre(s, trois, 3) == EPERM && filtre(s, sans_ret, 1) == EPERM
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_DETACH_FILTER, &v, sizeof v)) == EPERM
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_BPF, &fd, 4)) == EPERM
+                 && getsockopt(s, SOL_SOCKET, SO_GET_FILTER, NULL, &l) == 0 && l == 3,
+                 dire("%s : SO_LOCK_FILTER : EPERM pour l'ouvrir, changer ou enlever le filtre", so->nom));
+        close(s);
+    }
+}
+
+/* Un programme de `n` instructions, des lectures longues (ld [40000] : 16 instructions
+ * d'eBPF, 128 octets), puis ret a. */
+static int longues(int s, int n)
+{
+    static struct sock_filter f[4096];
+    for (int i = 0; i < n - 1; i++)
+        f[i] = F(BPF_LD | BPF_W | BPF_ABS, 40000);
+    f[n - 1] = RET_A;
+    return filtre(s, f, n);
+}
+
+static void filtres_memoire(void)
+{
+    /* Ce qu'un filtre compte dans la mémoire des options : celle de sa traduction. */
+    int s = socket(AF_INET, SOCK_DGRAM, 0), v = 1;
+    struct sock_filter un[1] = {RET_A}, deux[2] = {F(BPF_LD | BPF_W | BPF_ABS, 0), RET_A};
+    verifier(filtre(s, un, 1) == 0 && compteur(s, OPTMEM) == 128 && filtre(s, deux, 2) == 0 && compteur(s, OPTMEM) == 264
+             && setsockopt(s, SOL_SOCKET, SO_DETACH_FILTER, &v, sizeof v) == 0 && compteur(s, OPTMEM) == 0,
+             "un filtre dans SO_MEMINFO : 128 octets (ret a), 264 (ld [0] ; ret a), 0 enleve");
+    /* La limite : le nouveau compté avant que l'ancien ne parte (ENOMEM). */
+    verifier(longues(s, 1023) == 0 && compteur(s, OPTMEM) == 130976 && longues(s, 1024) == ENOMEM
+             && filtre(s, deux, 2) == ENOMEM && compteur(s, OPTMEM) == 130976
+             && setsockopt(s, SOL_SOCKET, SO_DETACH_FILTER, &v, sizeof v) == 0 && filtre(s, deux, 2) == 0,
+             "un filtre trop grand pour la memoire des options : ENOMEM, l'ancien encore compte");
+    /* Derrière lui, les adhésions : un groupe tient (48 octets), pas deux (ENOBUFS) ;
+     * derrière 130848, un groupe et sa liste de sources (64). */
+    struct ip_mreq m = {{htonl(0xef010001)}, {htonl(INADDR_LOOPBACK)}};
+    struct ip_mreq_source ms = {{htonl(0xef010003)}, {htonl(INADDR_LOOPBACK)}, {htonl(0x0a000001)}};
+    verifier(setsockopt(s, SOL_SOCKET, SO_DETACH_FILTER, &v, sizeof v) == 0 && longues(s, 1023) == 0
+             && erreur(setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m)) == 0 && compteur(s, OPTMEM) == 131024
+             && (m.imr_multiaddr.s_addr = htonl(0xef010002), erreur(setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &m, sizeof m))) == ENOBUFS
+             && compteur(s, OPTMEM) == 131024,
+             "derriere un filtre, les adhesions tiennent dans la memoire des options (ENOBUFS)");
+    close(s);
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    verifier(longues(s, 1022) == 0 && compteur(s, OPTMEM) == 130848
+             && erreur(setsockopt(s, IPPROTO_IP, IP_ADD_SOURCE_MEMBERSHIP, &ms, sizeof ms)) == 0 && compteur(s, OPTMEM) == 130960,
+             "derriere un filtre, un groupe et sa liste de sources");
+    close(s);
+}
+
+/* Envoie `n` octets (le motif a, b, c...) de `tx` à `a` (NULL : connectée), puis la
+ * longueur reçue par `rx` (-1 : rien en 200 ms). */
+static int un_envoi(int tx, int rx, struct sockaddr_in *a, int n)
+{
+    char m[700];
+    for (int i = 0; i < n; i++)
+        m[i] = 'a' + i % 26;
+    if (a)
+        sendto(tx, m, n, 0, (void *)a, sizeof *a);
+    else
+        send(tx, m, n, 0);
+    struct pollfd p = {rx, POLLIN, 0};
+    if (poll(&p, 1, 200) <= 0)
+        return -1;
+    return recv(rx, texte, sizeof texte, MSG_DONTWAIT | MSG_TRUNC);
+}
+
+/* Ce que vaut A au bout de `f` (n instructions) pour un datagramme UDP de 600 octets
+ * de `tx` (vers `a`, NULL : connectée), lu par la longueur reçue : le filtre finit par
+ * « add #8 ; ret a », et garde l'en-tête et A octets de charge. Pour A sous 600 ; -1 :
+ * jeté, -1000 : refusé. */
+static int vu(int tx, int rx, struct sockaddr_in *a, struct sock_filter *f, int n)
+{
+    struct sock_filter g[8];
+    memcpy(g, f, n * sizeof *f);
+    g[n] = F(BPF_ALU | BPF_ADD | BPF_K, 8);
+    g[n + 1] = RET_A;
+    if (filtre(rx, g, n + 2))
+        return -1000;
+    return un_envoi(tx, rx, a, 600);
+}
+
+/* Le hachage du flux des datagrammes de `tx` (vers `a`, NULL : connectée), lu par le filtre de
+ * `rx` (SKF_AD_RXHASH : lo garde celui de l'émetteur) en quatre octets, un datagramme chacun. */
+static unsigned hachage_udp(int tx, int rx, struct sockaddr_in *a)
+{
+    unsigned h = 0;
+    for (int o = 0; o < 4; o++) {
+        struct sock_filter g[3] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_RXHASH), F(BPF_ALU | BPF_RSH | BPF_K, 8 * o),
+                                   F(BPF_ALU | BPF_AND | BPF_K, 0xff)};
+        h |= (unsigned)vu(tx, rx, a, g, 3) << (8 * o);
+    }
+    return h;
+}
+
+static void filtres_udp(void)
+{
+    cpu_set_t avant, zero;
+    sched_getaffinity(0, sizeof avant, &avant);
+    CPU_ZERO(&zero);
+    CPU_SET(0, &zero);
+    sched_setaffinity(0, sizeof zero, &zero);
+    struct sockaddr_in a;
+    int rx = udp_lie(&a), tx = socket(AF_INET, SOCK_DGRAM, 0);
+    /* Les coupes : jamais sous l'en-tête (8) ; 0 jette, une perte et une erreur d'UDP. */
+    long e = snmp("Udp", "InErrors");
+    unsigned p = compteur(rx, DROPS);
+    verifier(filtre_k(rx, 0) == 0 && un_envoi(tx, rx, &a, 100) == -1 && compteur(rx, DROPS) == p + 1
+             && snmp("Udp", "InErrors") == e + 1,
+             "udp : un filtre qui rend 0 jette le datagramme (une perte, InErrors)");
+    unsigned ks[] = {1, 8, 9, 30, 100000}, attendus[] = {0, 0, 1, 22, 100};
+    int ok = 1;
+    for (int i = 0; i < 5; i++)
+        ok &= filtre_k(rx, ks[i]) == 0 && un_envoi(tx, rx, &a, 100) == (int)attendus[i];
+    verifier(ok && compteur(rx, DROPS) == p + 1, "udp : coupe, jamais sous l'en-tete (0, 0, 1, 22, 100 octets)");
+    /* Ce qu'il voit : les données à l'en-tête UDP, les en-têtes IP et Ethernet (nul par lo)
+     * derrière, et les extensions. Une valeur V se lit en recevant V octets de charge. */
+    struct sock_filter longueur[2] = {F(BPF_LD | BPF_W | BPF_LEN, 0), F(BPF_ALU | BPF_SUB | BPF_K, 600)},
+        net0[1] = {F(BPF_LD | BPF_B | BPF_ABS, SKF_NET_OFF)},
+        net9[1] = {F(BPF_LD | BPF_B | BPF_ABS, SKF_NET_OFF + 9)},
+        ll0[1] = {F(BPF_LD | BPF_B | BPF_ABS, SKF_LL_OFF)},
+        ll12[2] = {F(BPF_LD | BPF_H | BPF_ABS, SKF_LL_OFF + 12), F(BPF_ALU | BPF_SUB | BPF_K, 0x800)},
+        msh[2] = {F(BPF_LDX | BPF_B | BPF_MSH, SKF_NET_OFF), F(BPF_MISC | BPF_TXA, 0)};
+    verifier(vu(tx, rx, &a, longueur, 2) == 8 && vu(tx, rx, &a, net0, 1) == 0x45 && vu(tx, rx, &a, net9, 1) == IPPROTO_UDP
+             && vu(tx, rx, &a, ll0, 1) == 0 && vu(tx, rx, &a, ll12, 2) == 0 && vu(tx, rx, &a, msh, 2) == 20,
+             "udp : la longueur (en-tete compris), l'en-tete IP (SKF_NET_OFF), l'en-tete Ethernet nul de lo (SKF_LL_OFF)");
+    /* Chaque extension, moins ce qu'elle doit valoir : 0 octet de charge (au-delà de
+     * 600, une valeur se verrait mal). */
+    static const unsigned attendu[16] = {
+        [SKF_AD_PROTOCOL / 4] = 0x800, [SKF_AD_IFINDEX / 4] = 1, [SKF_AD_HATYPE / 4] = 772, [SKF_AD_PAY_OFFSET / 4] = 8,
+    };
+    struct sock_filter ext[2];
+    int ok_ext = 1;
+    for (int k = 0; k < 16; k++) {
+        ext[0] = F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + 4 * k);
+        ext[1] = F(BPF_ALU | BPF_SUB | BPF_K, attendu[k]);
+        if (k != SKF_AD_RANDOM / 4 && k != SKF_AD_NLATTR / 4 && k != SKF_AD_NLATTR_NEST / 4 && k != SKF_AD_ALU_XOR_X / 4)
+            ok_ext &= vu(tx, rx, &a, ext, 2) == 0;
+    }
+    verifier(ok_ext,
+             "udp : les extensions par lo (protocole, genre, carte 1 de type 772, charge a 8, processeur 0)");
+    /* Lire hors du paquet, ou diviser par X nul : jeté. Sous SKF_AD_OFF : refusé. */
+    struct sock_filter hors[1] = {F(BPF_LD | BPF_B | BPF_ABS, 620)}, div[3] = {F(BPF_LDX | BPF_IMM, 0), F(BPF_ALU | BPF_DIV | BPF_X, 0), RET_A},
+        moins8[2] = {F(BPF_LD | BPF_B | BPF_ABS, -8), RET_A};
+    verifier(vu(tx, rx, &a, hors, 1) == -1 && filtre(rx, div, 3) == 0 && un_envoi(tx, rx, &a, 10) == -1
+             && filtre(rx, moins8, 2) == EINVAL,
+             "udp : une lecture hors du paquet, une division par zero : jete ; un decalage sous SKF_AD_OFF refuse");
+    /* Le hachage du flux : 0 pour une socket jamais connectée ; celui d'une connectée, le
+     * même d'un datagramme à l'autre, gardé après la déconnexion, neuf à la connexion. */
+    struct sock_filter h[1] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_RXHASH)};
+    int c = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in u = {.sin_family = AF_UNSPEC};
+    connect(c, (void *)&a, sizeof a);
+    unsigned hc[3];
+    for (int fois = 0; fois < 3; fois++) {
+        if (fois == 1)
+            connect(c, (void *)&u, sizeof u);
+        if (fois == 2)
+            connect(c, (void *)&a, sizeof a);
+        hc[fois] = hachage_udp(c, rx, fois == 1 ? &a : NULL);
+    }
+    struct sock_filter bas[2] = {h[0], F(BPF_ALU | BPF_AND | BPF_K, 0xff)};
+    verifier(vu(tx, rx, &a, bas, 2) == 0 && hc[0] != 0 && hc[1] == hc[0] && hc[2] != hc[0] && hc[2] != 0,
+             "udp : le hachage du flux d'une socket connectee, garde apres la deconnexion, neuf a la connexion");
+    /* SO_CNX_ADVICE 1 : un autre (`dst_negative_advice` : `sk_rethink_txhash`) ; 0 n'y touche
+     * pas ; une socket jamais connectée garde 0 (mesuré : sonde cnx du lot 6 des soldes). */
+    int non = 0, oui = 1;
+    setsockopt(c, SOL_SOCKET, SO_CNX_ADVICE, &oui, sizeof oui);
+    unsigned conseil = hachage_udp(c, rx, NULL);
+    setsockopt(c, SOL_SOCKET, SO_CNX_ADVICE, &non, sizeof non);
+    unsigned sans = hachage_udp(c, rx, NULL);
+    setsockopt(tx, SOL_SOCKET, SO_CNX_ADVICE, &oui, sizeof oui);
+    verifier(conseil != hc[2] && conseil != 0 && sans == conseil && vu(tx, rx, &a, bas, 2) == 0,
+             "udp : SO_CNX_ADVICE 1 change le hachage du flux, 0 non ; jamais connectee, il reste 0");
+    close(c);
+    /* La diffusion par lo (127.255.255.255) : une copie, à nous (PACKET_HOST). La socket
+     * qui la reçoit est liée à toute adresse (une liée à 127.0.0.1 ne la recevrait pas),
+     * au port que le noyau choisit : un port deviné (celui de rx plus un) peut être tenu
+     * par une autre socket, et son bind échouerait sans rien dire. */
+    int d = socket(AF_INET, SOCK_DGRAM, 0), un = 1;
+    setsockopt(tx, SOL_SOCKET, SO_BROADCAST, &un, sizeof un);
+    struct sockaddr_in b = {.sin_family = AF_INET};
+    socklen_t bl = sizeof b;
+    bind(d, (void *)&b, sizeof b);
+    getsockname(d, (void *)&b, &bl);
+    b.sin_addr.s_addr = htonl(0x7fffffff);
+    struct sock_filter genre[3] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_PKTTYPE), F(BPF_ALU | BPF_ADD | BPF_K, 8 + 5), RET_A};
+    filtre(d, genre, 3);
+    sendto(tx, "0123456789", 10, 0, (void *)&b, sizeof b);
+    attendre_ms(100);
+    int n = recv(d, texte, sizeof texte, MSG_DONTWAIT), encore = recv(d, texte, sizeof texte, MSG_DONTWAIT);
+    verifier(n == 5 && encore < 0, "udp : la diffusion par lo, une copie, PACKET_HOST");
+    close(d), close(rx), close(tx);
+    sched_setaffinity(0, sizeof avant, &avant);
+}
+
+static void filtres_ping_unix(void)
+{
+    /* ping : le message ICMP entier, au moins un octet, la charge à 8 ; jeté sans rien
+     * compter. */
+    int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    struct sockaddr_in lo = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    char echo[100] = {8};
+    unsigned pertes = compteur(p, DROPS);
+    long e = snmp("Icmp", "InErrors");
+    int r[4], i = 0;
+    unsigned ks[] = {0, 1, 5, 100000};
+    for (int k = 0; k < 4; k++) {
+        filtre_k(p, ks[k]);
+        sendto(p, echo, sizeof echo, 0, (void *)&lo, sizeof lo);
+        struct pollfd q = {p, POLLIN, 0};
+        r[i++] = poll(&q, 1, 200) > 0 ? recv(p, texte, sizeof texte, MSG_DONTWAIT | MSG_TRUNC) : -1;
+    }
+    struct sock_filter charge[3] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_PAY_OFFSET), F(BPF_ALU | BPF_ADD | BPF_K, 3), RET_A},
+        ldb0[3] = {F(BPF_LD | BPF_B | BPF_ABS, 0), F(BPF_ALU | BPF_ADD | BPF_K, 1), RET_A};
+    filtre(p, charge, 3);
+    sendto(p, echo, sizeof echo, 0, (void *)&lo, sizeof lo);
+    struct pollfd q = {p, POLLIN, 0};
+    int c = poll(&q, 1, 200) > 0 ? recv(p, texte, sizeof texte, MSG_DONTWAIT | MSG_TRUNC) : -1;
+    filtre(p, ldb0, 3);
+    sendto(p, echo, sizeof echo, 0, (void *)&lo, sizeof lo);
+    int z = poll(&q, 1, 200) > 0 ? recv(p, texte, sizeof texte, MSG_DONTWAIT | MSG_TRUNC) : -1;
+    verifier(r[0] == -1 && r[1] == 1 && r[2] == 5 && r[3] == 100 && c == 11 && z == 1 && compteur(p, DROPS) == pertes
+             && snmp("Icmp", "InErrors") == e,
+             "ping : coupe a un octet au moins, la charge a 8, la reponse (type 0) ; jete sans rien compter");
+    close(p);
+    /* AF_UNIX : le message, au moins un octet ; jeté, l'envoi réussit ; pas de carte
+     * (l'extension rend A tel quel, et le programme s'arrête) ; un flux n'a pas de filtre. */
+    for (int sorte = 0; sorte < 3; sorte++) {
+        int v[2];
+        socketpair(AF_UNIX, sorte == 0 ? SOCK_DGRAM : sorte == 1 ? SOCK_SEQPACKET : SOCK_STREAM, 0, v);
+        filtre_k(v[0], 0);
+        int envoye = send(v[1], "abcdefghij", 10, 0);
+        struct pollfd w = {v[0], POLLIN, 0};
+        int recu = poll(&w, 1, 100) > 0 ? recv(v[0], texte, sizeof texte, MSG_DONTWAIT) : -1;
+        struct sock_filter sans_carte[4] = {F(BPF_LD | BPF_IMM, 4), F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_IFINDEX),
+                                            F(BPF_LD | BPF_IMM, 0), RET_A};
+        filtre(v[0], sans_carte, 4);
+        send(v[1], "abcdefghij", 10, 0);
+        int quatre = poll(&w, 1, 100) > 0 ? recv(v[0], texte, sizeof texte, MSG_DONTWAIT) : -1;
+        struct sock_filter net[2] = {F(BPF_LD | BPF_B | BPF_ABS, SKF_NET_OFF + 2), RET_A};
+        filtre(v[0], net, 2);
+        send(v[1], "ab\007defghij", 10, 0);
+        int sept = poll(&w, 1, 100) > 0 ? recv(v[0], texte, sizeof texte, MSG_DONTWAIT) : -1;
+        if (sorte < 2)
+            verifier(envoye == 10 && recu == -1 && quatre == 4 && sept == 7,
+                     sorte == 0 ? "unix datagrammes : jete sans erreur d'envoi, A rendu sans carte, SKF_NET_OFF au message"
+                                : "unix paquets : jete sans erreur d'envoi, A rendu sans carte, SKF_NET_OFF au message");
+        else
+            verifier(envoye == 10 && recu == 10, "unix flux : pas de filtre");
+        close(v[0]), close(v[1]);
+    }
+}
+
+static void filtres_tcp(void)
+{
+    /* Une écoute qui jette tout : le SYN, une perte pour elle ; puis la fille hérite du
+     * filtre de son écoute (relu, compté) et de son verrou. */
+    struct sockaddr_in t;
+    int un = 1;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    lier_tcp(l, &t), listen(l, 4);
+    filtre_k(l, 0);
+    int c = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    connect(c, (void *)&t, sizeof t);
+    struct pollfd p = {c, POLLOUT, 0};
+    verifier(poll(&p, 1, 300) == 0 && compteur(l, DROPS) == 1, "tcp : une ecoute filtree jette le SYN (une perte)");
+    close(c);
+    filtre_k(l, 0xffffffff);
+    setsockopt(l, SOL_SOCKET, SO_LOCK_FILTER, &un, sizeof un);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&t, sizeof t);
+    int f = accept(l, NULL, NULL);
+    socklen_t n = 0;
+    verifier(getsockopt(f, SOL_SOCKET, SO_GET_FILTER, NULL, &n) == 0 && n == 1 && lire(f, SO_LOCK_FILTER) == 1
+             && compteur(f, OPTMEM) == 136,
+             "tcp : la fille herite du filtre de son ecoute, compte, et de son verrou");
+    close(f), close(c), close(l);
+    /* Une connexion : jeté, une perte ; coupé à trois octets de charge, le reste revient par
+     * les retransmissions, coupées à leur tour. */
+    int d;
+    tcp_connectee(&c, &d);
+    filtre_k(d, 0);
+    send(c, "abcdefghij", 10, 0);
+    attendre_ms(100);
+    int jete = recv(d, texte, sizeof texte, MSG_DONTWAIT) == -1 && errno == EAGAIN && compteur(d, DROPS) >= 1;
+    struct sock_filter trois[3] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_PAY_OFFSET), F(BPF_ALU | BPF_ADD | BPF_K, 3), RET_A};
+    filtre(d, trois, 3);
+    char recu[16] = {0};
+    int tout = 0;
+    for (int essai = 0; essai < 60 && tout < 10; essai++) {
+        struct pollfd q = {d, POLLIN, 0};
+        if (poll(&q, 1, 100) > 0) {
+            int r = recv(d, recu + tout, sizeof recu - 1 - tout, MSG_DONTWAIT);
+            tout += r > 0 ? r : 0;
+        }
+    }
+    verifier(jete && tout == 10 && !strcmp(recu, "abcdefghij"),
+             "tcp : une connexion filtree jette (une perte), ou coupe a trois octets : tout arrive, dans l'ordre");
+    close(c), close(d);
+}
+
+/* Garde, d'un segment TCP, l'octet `o` du hachage de son flux plus un octets de charge
+ * (SKF_AD_RXHASH : lo garde celui de l'émetteur ; SKF_AD_PAY_OFFSET : le début de la charge). */
+static void filtre_octet_du_hachage(int d, int o)
+{
+    struct sock_filter f[8] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_RXHASH), F(BPF_ALU | BPF_RSH | BPF_K, 8 * o),
+                               F(BPF_ALU | BPF_AND | BPF_K, 0xff), F(BPF_ALU | BPF_ADD | BPF_K, 1), F(BPF_MISC | BPF_TAX, 0),
+                               F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_PAY_OFFSET), F(BPF_ALU | BPF_ADD | BPF_X, 0), RET_A};
+    filtre(d, f, 8);
+}
+
+/* Le hachage du flux des segments de `c`, lu par le filtre de `d` (connectées) : un envoi de
+ * 1100 octets (plus que quatre octets du hachage plus un) ; chaque octet coupe le segment, puis
+ * chacune de ses retransmissions, à sa valeur plus un ; le filtre enlevé, le reste arrive. Un
+ * peu plus de quatre RTO (200 ms sur lo) : sous SO_TXREHASH 0 seulement, sans quoi chacun
+ * change le hachage (`tcp_write_timeout`). 0 si quelque chose manque (un hachage ne l'est
+ * jamais). */
+static unsigned hachage_tcp(int c, int d)
+{
+    static char b[1100];
+    unsigned h = 0;
+    int lu = 0, ok = 1;
+    for (int o = 0; o < 4 && ok; o++) {
+        filtre_octet_du_hachage(d, o);
+        if (o == 0)
+            ok = send(c, b, sizeof b, 0) == (long)sizeof b;
+        struct pollfd q = {d, POLLIN, 0};
+        int r = poll(&q, 1, 3000) == 1 ? recv(d, b, sizeof b, MSG_DONTWAIT) : -1;
+        ok &= r >= 1 && r <= 256;
+        h |= (unsigned)(r - 1) << (8 * o);
+        lu += r > 0 ? r : 0;
+    }
+    int rien = 0;
+    setsockopt(d, SOL_SOCKET, SO_DETACH_FILTER, &rien, sizeof rien);
+    while (ok && lu < (int)sizeof b) {
+        struct pollfd q = {d, POLLIN, 0};
+        int r = poll(&q, 1, 3000) == 1 ? recv(d, b, sizeof b, MSG_DONTWAIT) : -1;
+        ok = r > 0;
+        lu += r > 0 ? r : 0;
+    }
+    return ok && lu == (int)sizeof b ? h : 0;
+}
+
+/* Un envoi de `c` passe-t-il le filtre de `d` qui ne garde que les segments dont le hachage
+ * vaut `h` (`egal`), ou ceux dont il ne le vaut pas ? Jeté, la retransmission passe une fois
+ * le filtre enlevé. */
+static int passe_si(int c, int d, unsigned h, int egal)
+{
+    struct sock_filter f[3] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_RXHASH),
+                               {BPF_JMP | BPF_JEQ | BPF_K, egal ? 0 : 1, egal ? 1 : 0, h}, F(BPF_RET | BPF_K, 0xffff)};
+    struct sock_filter g[4] = {f[0], f[1], f[2], F(BPF_RET | BPF_K, 0)};
+    filtre(d, g, 4);
+    send(c, "0123456789", 10, 0);
+    struct pollfd q = {d, POLLIN, 0};
+    int passe = poll(&q, 1, 300) == 1 && recv(d, texte, sizeof texte, MSG_DONTWAIT) == 10;
+    int rien = 0;
+    setsockopt(d, SOL_SOCKET, SO_DETACH_FILTER, &rien, sizeof rien);
+    if (!passe) {
+        struct pollfd r = {d, POLLIN, 0};
+        if (poll(&r, 1, 3000) == 1)
+            recv(d, texte, sizeof texte, MSG_DONTWAIT);
+    }
+    return passe;
+}
+
+/* SO_CNX_ADVICE 1 d'une connexion TCP : un autre hachage du flux (`sk_rethink_txhash`), sauf
+ * SO_TXREHASH 0 (mesuré : sonde cnx du lot 6 des soldes). Le hachage lu sous SO_TXREHASH 0 ;
+ * tout acquitté ensuite, plus de RTO : l'envoi qui suit chaque conseil part avec le hachage
+ * que le conseil a laissé. */
+static void conseil_tcp(void)
+{
+    int c, d, oui = 1;
+    tcp_connectee(&c, &d);
+    poser(c, SO_TXREHASH, 0);
+    unsigned h = hachage_tcp(c, d);
+    setsockopt(c, SOL_SOCKET, SO_CNX_ADVICE, &oui, sizeof oui);
+    int garde = passe_si(c, d, h, 1);
+    poser(c, SO_TXREHASH, 1);
+    setsockopt(c, SOL_SOCKET, SO_CNX_ADVICE, &oui, sizeof oui);
+    int change = passe_si(c, d, h, 0);
+    verifier(h != 0 && garde && change, "tcp : SO_CNX_ADVICE 1 change le hachage du flux, sauf SO_TXREHASH 0");
+    close(c), close(d);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -3186,6 +3670,12 @@ int main(void)
     zerocopie_udp();
     zerocopie_tcp();
     rythme_max();
+    filtres_options();
+    filtres_memoire();
+    filtres_udp();
+    filtres_ping_unix();
+    filtres_tcp();
+    conseil_tcp();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

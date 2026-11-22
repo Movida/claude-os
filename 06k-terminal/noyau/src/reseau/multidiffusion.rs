@@ -36,7 +36,7 @@
 use super::interface;
 use super::ipv4;
 use super::paquet::Paquet;
-use super::socket::Socket;
+use super::socket::{self, Socket};
 use super::tache;
 use crate::verrou::{Garde, Verrou};
 use crate::{aleatoire, horloge, temps};
@@ -209,12 +209,29 @@ fn trouver(d: Demande) -> Option<u32> {
     ipv4::router(d.groupe, 0, Portee::Univers).ok().and_then(|(c, _)| ipv4::sortie(&c))
 }
 
+/// La place que les autres options de `s` laissent à ses adhésions dans la mémoire
+/// de ses options (`Adhesions::borner` : son filtre, ses avis de MSG_ZEROCOPY). Les
+/// changements qui en prennent la lisent, puis s'y tiennent, sous le `Mutex` des
+/// appels de `s` (le `lock_sock` de Linux), comme SO_ATTACH_FILTER (filtre.rs) :
+/// un filtre ne se pose pas entre les deux. (Un avis de MSG_ZEROCOPY peut venir :
+/// Linux non plus ne le retient pas, `sock_omalloc` ne prend pas le verrou.)
+fn place(s: &Socket) -> usize {
+    socket::OPTMEM_MAX.saturating_sub(s.memoire_hors_adhesions())
+}
+
 /// Adhère au groupe de `d` dans le mode `mode` (`__ip_mc_join_group`) ;
 /// rend l'index de l'interface.
 pub fn joindre(s: &Socket, d: Demande, mode: Mode) -> Result<u32, i64> {
     let trouvee = trouver(d);
+    let appels = s.appels.verrouiller();
+    let place = place(s);
     let mut g = groupes();
-    let r = s.adhesions.verrouiller().joindre(&mut g, d, trouvee, mode).map_err(errno);
+    let r = {
+        let mut a = s.adhesions.verrouiller();
+        a.borner(place);
+        a.joindre(&mut g, d, trouvee, mode).map_err(errno)
+    };
+    drop(appels);
     finir(g);
     r
 }
@@ -231,8 +248,15 @@ pub fn quitter(s: &Socket, d: Demande) -> Result<(), i64> {
 /// Ajoute ou retire une source du filtre de mode `mode` (`ip_mc_source`).
 pub fn source(s: &Socket, ajout: bool, mode: Mode, d: Demande, source: [u8; 4]) -> Result<(), i64> {
     let trouvee = trouver(d);
+    let appels = s.appels.verrouiller();
+    let place = place(s);
     let mut g = groupes();
-    let r = s.adhesions.verrouiller().source(&mut g, ajout, mode, d, trouvee, source).map_err(errno);
+    let r = {
+        let mut a = s.adhesions.verrouiller();
+        a.borner(place);
+        a.source(&mut g, ajout, mode, d, trouvee, source).map_err(errno)
+    };
+    drop(appels);
     finir(g);
     r
 }
@@ -243,8 +267,15 @@ pub fn source(s: &Socket, ajout: bool, mode: Mode, d: Demande, source: [u8; 4]) 
 /// `Adhesions::joindre_avec_source`).
 pub fn joindre_avec_source(s: &Socket, d: Demande, source: [u8; 4]) -> Result<(), i64> {
     let trouvee = trouver(d);
+    let appels = s.appels.verrouiller();
+    let place = place(s);
     let mut g = groupes();
-    let r = s.adhesions.verrouiller().joindre_avec_source(&mut g, d, trouvee, source).map_err(errno);
+    let r = {
+        let mut a = s.adhesions.verrouiller();
+        a.borner(place);
+        a.joindre_avec_source(&mut g, d, trouvee, source).map_err(errno)
+    };
+    drop(appels);
     finir(g);
     r
 }
@@ -252,8 +283,15 @@ pub fn joindre_avec_source(s: &Socket, d: Demande, source: [u8; 4]) -> Result<()
 /// Remplace le filtre (`ip_mc_msfilter`).
 pub fn filtrer(s: &Socket, d: Demande, fmode: u32, sources: &[[u8; 4]]) -> Result<(), i64> {
     let trouvee = trouver(d);
+    let appels = s.appels.verrouiller();
+    let place = place(s);
     let mut g = groupes();
-    let r = s.adhesions.verrouiller().filtrer(&mut g, d, trouvee, fmode, sources).map_err(errno);
+    let r = {
+        let mut a = s.adhesions.verrouiller();
+        a.borner(place);
+        a.filtrer(&mut g, d, trouvee, fmode, sources).map_err(errno)
+    };
+    drop(appels);
     finir(g);
     r
 }

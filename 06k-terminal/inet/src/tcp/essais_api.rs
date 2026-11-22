@@ -836,7 +836,8 @@ fn le_hachage_change_a_chaque_rto() {
         assert_eq!((c.rehash, c.total_rto), (k, k));
     }
     assert_eq!(c.info(HEURE).rehash, 3);
-    // Une fille : une requête, qui n'a pas de hachage à changer.
+    // Une fille : une requête, dont le SYN-ACK renvoyé ne compte pas (son hachage change
+    // pourtant : `le_hachage_du_flux`).
     let mut c = fille(false);
     let t = c.t_xmit.unwrap();
     c.minuteur(t);
@@ -871,6 +872,62 @@ fn le_hachage_change_a_chaque_rto() {
     let t = c.t_xmit.unwrap();
     c.minuteur(t);
     assert_eq!((c.total_rto, c.rehash), (1, 0));
+}
+
+#[test]
+fn le_hachage_du_flux() {
+    // Pas posé : 0, et un RTO n'y change rien (`sk_rethink_txhash` : rien sans hachage).
+    let mut c = syn_envoye();
+    let t = c.t_xmit.unwrap();
+    c.minuteur(t);
+    assert_eq!((c.hachage(), c.rehash), (0, 1));
+    // Posé, jamais 0 (`net_tx_rndhash`) ; un autre à chaque RTO, jamais 0 non plus.
+    let mut c = syn_envoye();
+    c.poser_hachage(0);
+    assert_eq!(c.hachage(), 1);
+    c.poser_hachage(0x1234_5678);
+    let mut vus = vec![c.hachage()];
+    for _ in 0..3 {
+        let t = c.t_xmit.unwrap();
+        c.minuteur(t);
+        assert!(c.hachage() != 0 && !vus.contains(&c.hachage()));
+        vus.push(c.hachage());
+    }
+    // SO_TXREHASH 0 : il reste.
+    let mut c = etablie(true);
+    c.poser_hachage(99);
+    c.txrehash = false;
+    en_vol(&mut c, 1);
+    c.t_sorte = Minuteur::Retransmission;
+    let t = c.t_xmit.unwrap();
+    c.minuteur(t);
+    assert_eq!((c.total_rto, c.hachage()), (1, 99));
+    // SO_CNX_ADVICE 1 : un autre, sans le compter ; rien sans SO_TXREHASH, ni sans hachage
+    // (mesuré sous Linux 6.18, sonde cnx du lot 6 des soldes).
+    let mut c = etablie(true);
+    c.poser_hachage(99);
+    c.conseil_negatif();
+    assert!(c.hachage() != 99 && c.hachage() != 0 && c.rehash == 0);
+    let h = c.hachage();
+    c.txrehash = false;
+    c.conseil_negatif();
+    assert_eq!(c.hachage(), h);
+    let mut c = etablie(true);
+    c.conseil_negatif();
+    assert_eq!(c.hachage(), 0);
+    // Le SYN-ACK renvoyé d'une fille, par son minuteur (`tcp_rtx_synack`) : un autre, au
+    // départ du renvoi ; sans SO_TXREHASH, le même.
+    for permis in [true, false] {
+        let mut c = fille(false);
+        c.poser_hachage(99);
+        c.txrehash = permis;
+        let t = c.t_xmit.unwrap();
+        c.minuteur(t);
+        assert_eq!(c.hachage(), 99);
+        let mut renvoyes = 0;
+        c.emettre(t, |_| renvoyes += 1);
+        assert_eq!((renvoyes, c.hachage() != 99, c.rehash), (1, permis, 0));
+    }
 }
 
 #[test]

@@ -25,6 +25,7 @@
 //! ou qui manque de place (SndbufErrors).
 
 use super::datagramme::{self, Controle, Depart, trop_gros};
+use super::filtre::{self, Verdict};
 use super::ipv4;
 use super::paquet::{self, Paquet};
 use super::icmp::ErreurRecue;
@@ -492,11 +493,17 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
                     return;
                 }
                 sockets += 1;
+                // La copie d'abord, puis le filtre de la socket, sur l'original :
+                // la copie n'a que la charge, sans les en-têtes qu'il peut lire.
                 match Paquet::copie(p.donnees()) {
-                    Some(mut copie) => {
-                        copie.poser_contexte(p.contexte());
-                        deposer(s, copie, &arrivee)
-                    }
+                    Some(mut copie) => match filtrer(s, &p, lieu.carte, arrivee.somme) {
+                        Some((n, somme)) => {
+                            copie.poser_contexte(p.contexte());
+                            copie.couper(n);
+                            deposer(s, copie, &Arrivee { somme, ..arrivee })
+                        }
+                        None => jete_par_le_filtre(s),
+                    },
                     None => {
                         s.pertes.fetch_add(1, Ordering::Relaxed);
                         MIB.udp(Compteur::RcvbufErrors);
@@ -516,7 +523,13 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
     });
     match s {
         Some(s) => {
-            deposer(&s, p, &arrivee);
+            match filtrer(&s, &p, lieu.carte, arrivee.somme) {
+                Some((n, somme)) => {
+                    p.couper(n);
+                    deposer(&s, p, &Arrivee { somme, ..arrivee });
+                }
+                None => jete_par_le_filtre(&s),
+            }
             Ok(())
         }
         None => {
@@ -533,7 +546,43 @@ fn de_ce_processeur(s: &Arc<Socket>, ici: i32) -> bool {
     s.processeur.load(Ordering::Relaxed) == ici
 }
 
+/// Le filtre de la socket `s` (filtre.rs), s'il en a un, sur le datagramme `p`
+/// (sa charge, son en-tête juste devant) arrivé par la carte `carte`
+/// (`udp_queue_rcv_one_skb`, `sk_filter_trim_cap` : au moins l'en-tête, 8 octets ;
+/// la charge commence après lui) : None, jeté ; sinon les octets de charge
+/// gardés, et sa somme (voir `recevoir`). Avec un filtre, Linux l'achève avant lui
+/// (`udp_lib_checksum_complete`), sur le segment entier, et la coupe ne la change
+/// pas (`pskb_trim` ne touche pas à `skb->csum`) : celle d'un datagramme qui
+/// l'aurait eue à la lecture (`Somme::ALaLecture`) est calculée ici, comme celle
+/// d'un petit datagramme. Avant de le déposer, donc avant que la socket ne note le
+/// processeur qui l'a reçu (`__udp_queue_rcv_skb`, après le filtre). À part, comme
+/// celui de TCP (tcp.rs, `filtrer`).
+#[inline(never)]
+fn filtrer(s: &Socket, p: &Paquet, carte: inet::filtre::Carte, somme: Somme) -> Option<(usize, Somme)> {
+    let Some(f) = filtre::de(s) else { return Some((p.longueur(), somme)) };
+    let somme = match somme {
+        Somme::ALaLecture => {
+            let (o, d, ..) = p.pour_filtre(udp::ENTETE)?;
+            let segment = &o[d..];
+            Somme::Calculee(somme_linux_moins(somme_linux(segment), somme_linux(&segment[..udp::ENTETE])))
+        }
+        autre => autre,
+    };
+    match filtre::passer_ip(&f, p, udp::ENTETE, udp::ENTETE, carte, udp::ENTETE as u32) {
+        Verdict::Jeter => None,
+        Verdict::Garder(n) => Some((n - udp::ENTETE, somme)),
+    }
+}
+
+/// Un datagramme que le filtre de `s` a jeté : une perte pour elle, une erreur
+/// d'UDP (mesuré).
+fn jete_par_le_filtre(s: &Socket) {
+    s.pertes.fetch_add(1, Ordering::Relaxed);
+    MIB.udp(Compteur::InErrors);
+}
+
 /// D'où vient un datagramme reçu, et ce qu'en garde la file avec lui.
+#[derive(Clone, Copy)]
 struct Arrivee {
     source: [u8; 4],
     port: u16,

@@ -441,3 +441,41 @@ fn monter() {
     assert_eq!(g.interfaces().map(|i| i.index()).collect::<Vec<_>>(), vec![1, 3]);
     assert_eq!(g.interface(3).unwrap().groupes().count(), 1);
 }
+
+#[test]
+fn la_memoire_des_options() {
+    // Ce que les autres options laissent (`borner`) : chaque adhésion (48 octets), chaque
+    // liste de sources neuve (64, ses dix places) ou plus grande, l'ancienne encore comptée,
+    // y tient strictement (mesuré : derrière un filtre de 130976 octets, il reste 96 : un
+    // groupe passe, le second non ; derrière 130848, 224 : un groupe et sa liste).
+    let mut g = machine();
+    let mut a = Adhesions::new();
+    a.borner(131_072 - 130_976);
+    assert_eq!(joindre(&mut a, &mut g, demande([239, 2, 0, 1], RIEN, 0), Mode::Exclure), Ok(ETH));
+    assert_eq!(a.memoire(), 48);
+    assert_eq!(joindre(&mut a, &mut g, demande([239, 2, 0, 2], RIEN, 0), Mode::Exclure), Err(Refus::PlusDePlace));
+    let mut a = Adhesions::new();
+    a.borner(131_072 - 130_848);
+    for n in 1..=4 {
+        assert_eq!(ajouter_source(&mut a, &mut g, [239, 3, 0, 1], dix(n)), Ok(()));
+    }
+    assert_eq!(a.memoire(), 48 + 64);
+    // Un filtre de trois sources (une liste de trois places, 36), puis une quatrième : la
+    // liste grandit de dix places (76), l'ancienne encore comptée.
+    let mut a = Adhesions::new();
+    let d = demande([239, 4, 0, 1], RIEN, 0);
+    assert_eq!(joindre(&mut a, &mut g, d, Mode::Exclure), Ok(ETH));
+    assert_eq!(a.filtrer(&mut g, d, trouver(d), 0, &[dix(1), dix(2), dix(3)]), Ok(()));
+    assert_eq!(a.memoire(), 48 + 36);
+    a.borner(48 + 36 + 76);
+    assert_eq!(source(&mut a, &mut g, true, Mode::Exclure, [239, 4, 0, 1], dix(4)), Err(Refus::PlusDePlace));
+    a.borner(48 + 36 + 77);
+    assert_eq!(source(&mut a, &mut g, true, Mode::Exclure, [239, 4, 0, 1], dix(4)), Ok(()));
+    assert_eq!(a.memoire(), 48 + 76);
+    // IP_MSFILTER : la liste neuve, l'ancienne encore comptée.
+    a.borner(48 + 76 + 24 + 8);
+    assert_eq!(a.filtrer(&mut g, d, trouver(d), 1, &[dix(1), dix(2)]), Err(Refus::PlusDePlace));
+    a.borner(48 + 76 + 24 + 9);
+    assert_eq!(a.filtrer(&mut g, d, trouver(d), 1, &[dix(1), dix(2)]), Ok(()));
+    assert_eq!(a.memoire(), 48 + 32);
+}

@@ -17,6 +17,8 @@
 //! datagramme.rs et socket.rs.
 
 use super::datagramme::{self, Controle};
+use super::filtre::{self, Verdict};
+use super::interface::Interface;
 use super::icmp::ErreurRecue;
 use super::ipv4;
 use super::paquet::Paquet;
@@ -172,8 +174,12 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
 /// avec la règle ordinaire des files. Sa somme est toujours complète
 /// (`icmp_rcv` la vérifie sur tout le message : CHECKSUM_COMPLETE), et ses
 /// « ports » d'IP_ORIGDSTADDR sont les octets 2 et 3 de l'en-tête ICMP :
-/// la somme du message (mesuré).
-pub fn recevoir(interface: u32, iif: u32, source: [u8; 4], destination: [u8; 4], entete: &ipv4::EnteteRecu, p: Paquet) {
+/// la somme du message (mesuré). Le filtre de la socket passe d'abord
+/// (`sock_queue_rcv_skb_reason`, filtre.rs : au moins un octet, la charge
+/// après les 8 de l'en-tête) : ce qu'il jette ne compte nulle part (mesuré),
+/// et sa coupe ne change pas la somme, calculée avant lui.
+pub fn recevoir(i: &Interface, iif: u32, source: [u8; 4], destination: [u8; 4], entete: &ipv4::EnteteRecu, mut p: Paquet) {
+    let interface = i.index;
     let Ok((m, _)) = icmp::lire(p.donnees()) else { return };
     let (ident, _) = m.echo();
     let Some(s) = IDENTS.verrouiller().as_ref().and_then(|t| t.trouver(ident, destination, iif)) else {
@@ -183,6 +189,12 @@ pub fn recevoir(interface: u32, iif: u32, source: [u8; 4], destination: [u8; 4],
     let taille = p.taille_vraie();
     let port_destination = p.donnees().get(2..4).map_or(0, |o| u16::from_be_bytes([o[0], o[1]]));
     let somme = formats::reseau::somme_linux(p.donnees());
+    if let Some(f) = filtre::de(&s) {
+        match filtre::passer_ip(&f, &p, 0, 1, filtre::carte(i), icmp::ENTETE as u32) {
+            Verdict::Jeter => return,
+            Verdict::Garder(n) => p.couper(n),
+        }
+    }
     let d = Datagramme {
         regarde: false, paquet: p, source, port: 0, destination, pktinfo: (interface, [0; 4]), entete: *entete, port_destination,
         somme: socket::Somme::Calculee(somme), taille, pertes: 0,
