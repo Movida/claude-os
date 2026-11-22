@@ -518,8 +518,9 @@ pub struct Partie {
 /// connexion garde jusqu'à l'ACK de son dernier octet : les drapeaux TX_*
 /// de l'envoi, le numéro de ce dernier octet (le `tskey` de Linux, la clé
 /// d'OPT_ID une fois rendue relative), le premier numéro du segment qui l'a
-/// porté en dernier (None : pas encore parti) et sa socket (un lien faible :
-/// horodatage.rs, `Demande`).
+/// porté en dernier (None : pas encore parti) et l'heure de ce départ (en
+/// temps monotone : le `skb_mstamp_ns` que dit OPT_STATS), et sa socket (un
+/// lien faible : horodatage.rs, `Demande`).
 ///
 /// LE MODÈLE. Linux pose la demande sur le `sk_buff` qui finit l'envoi (la
 /// queue de la file d'émission, ou à défaut le dernier en vol) ; un envoi
@@ -548,6 +549,7 @@ struct DemandeTx {
     dernier: u32,
     tx: u32,
     debut: Option<(u32, u32)>,
+    depart: u64,
     socket: Weak<Socket>,
 }
 
@@ -852,22 +854,23 @@ impl Partie {
         }
         // Le `sk_buff` qu'elle prend : celui qui attend de partir (il commence
         // à SND.NXT), sinon le dernier en vol.
-        let (debut, borne) = if itcp::apres(ecrit, nxt) {
-            (None, nxt)
+        // Le dernier en vol est déjà parti : l'heure de ce départ (EDT).
+        let (debut, borne, depart) = if itcp::apres(ecrit, nxt) {
+            (None, nxt, 0)
         } else {
             let v = t.dernier_en_vol();
-            (v, v.map_or(una, |(seq, _)| seq))
+            (v.map(|(seq, fin, _)| (seq, fin)), v.map_or(una, |(seq, _, _)| seq), v.map_or(0, |(_, _, heure)| heure))
         };
         let dernier = ecrit.wrapping_sub(1);
         if let Some(d) = self.demandes.back_mut()
             && !itcp::avant(d.dernier, borne)
         {
             // Le même `sk_buff` : elle remplace la précédente.
-            *d = DemandeTx { dernier, tx: d.tx | tx, debut, socket: Arc::downgrade(s) };
+            *d = DemandeTx { dernier, tx: d.tx | tx, debut, depart: d.depart, socket: Arc::downgrade(s) };
             return;
         }
         // Plus de mémoire : la demande est perdue (aucune entrée ne viendra).
-        let _ = self.demandes.ajouter_derriere(DemandeTx { dernier, tx, debut, socket: Arc::downgrade(s) });
+        let _ = self.demandes.ajouter_derriere(DemandeTx { dernier, tx, debut, depart, socket: Arc::downgrade(s) });
     }
 
     /// La mémoire de la socket, comptée dans `MEMOIRE` (la différence avec
@@ -1260,7 +1263,8 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
     }
     let mut a_envoyer: Vec<itcp::Sortant> = Vec::new();
     let mut route_trouvee = false;
-    t.emettre_route(maintenant(), route.is_some(), |s| {
+    let heure = maintenant();
+    t.emettre_route(heure, route.is_some(), |s| {
         // Sans place, le segment ne part pas : la retransmission y pourvoira, et personne ne doit
         // le croire encore dans la carte. Il compte comme un paquet que Linux n'a pas pu faire.
         let (numero, compte) = (s.numero, s.compte);
@@ -1273,7 +1277,7 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
             }
         }
     });
-    for s in a_envoyer {
+    for (k, &s) in a_envoyer.iter().enumerate() {
         // La réponse à un segment refusé (le RST d'une connexion ou d'une
         // fille, l'ACK d'une fille à un segment hors de sa fenêtre) part comme
         // celle d'un segment sans connexion, pas avec ce qu'a demandé la socket
@@ -1297,7 +1301,7 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
         let suivi = retenue.filter(|_| s.numero != 0).map(|r| (r, s.numero));
         let reponse = matches!(s.compte, Compte::Reponse { .. });
         let sa_route = if reponse { route_de_segment(&ip, source, distante, true) } else { route };
-        let demande = demandes.as_deref_mut().and_then(|d| demande_du_segment(d, s.entete.seq, s.longueur));
+        let demande = demandes.as_deref_mut().and_then(|d| demande_du_segment(d, t, &a_envoyer, k, heure));
         let routee = envoyer_segment(&s.entete, s.compte, source, distante, identifiant, ip, sa_route, s.longueur, suivi, demande, |o| {
             t.copier_envoi(s.debut, o)
         });
@@ -1316,11 +1320,15 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
 /// en porte plusieurs, elles n'en font plus qu'une, la dernière, aux
 /// drapeaux de toutes (le `sk_buff` qu'elles partageraient chez Linux :
 /// `DemandeTx`) ; elle note où commence et finit ce segment (ce que copiera
-/// son ACK). À part : `emettre_tcb` est sur le chemin le plus profond du
-/// réseau (lo reçoit sur la pile de qui émet), et son cadre n'a pas à garder
-/// la place de ce travail.
+/// son ACK), et l'heure de ce départ, `heure`. Le segment est le `k`-ième du lot `lot`
+/// que vient de faire la connexion `t` : ses statistiques, si sa socket les
+/// veut (`stats_du_segment`). À part : `emettre_tcb` est sur le chemin le
+/// plus profond du réseau (lo reçoit sur la pile de qui émet), et son cadre
+/// n'a pas à garder la place de ce travail.
 #[inline(never)]
-fn demande_du_segment(demandes: &mut VecDeque<DemandeTx>, seq: u32, longueur: usize) -> Option<Box<horodatage::Demande>> {
+fn demande_du_segment(demandes: &mut VecDeque<DemandeTx>, t: &Tcb<Paquet>, lot: &[itcp::Sortant], k: usize, heure: u64)
+                      -> Option<Box<horodatage::Demande>> {
+    let (seq, longueur) = (lot[k].entete.seq, lot[k].longueur);
     let dans = |d: &DemandeTx| (d.dernier.wrapping_sub(seq) as usize) < longueur;
     let premiere = demandes.iter().position(dans)?;
     let derniere = premiere + demandes.iter().skip(premiere + 1).take_while(|d| dans(d)).count();
@@ -1329,29 +1337,86 @@ fn demande_du_segment(demandes: &mut VecDeque<DemandeTx>, seq: u32, longueur: us
     let d = &mut demandes[premiere];
     d.tx = tx;
     d.debut = Some((seq, seq.wrapping_add(longueur as u32)));
-    horodatage::demande(&d.socket, d.tx, d.dernier)
+    d.depart = heure;
+    let demande = horodatage::demande(&d.socket, d.tx, d.dernier)?;
+    Some(if demande.veut_stats() { demande.avec_stats(stats_du_segment(t, lot, k, heure)) } else { demande })
 }
 
-/// Les copies que voudront les entrées ACK (horodatage.rs, `acquitte`) des
-/// demandes TX_ACK de `demandes` que le segment reçu `h` va passer, si la
-/// connexion `t` le prend (un ACK au-delà de SND.UNA, pas au-delà de
-/// SND.NXT) : les octets de leur segment (de son début, ou de SND.UNA s'il
-/// est déjà acquitté en partie, comme le `sk_buff` que rogne
-/// `tcp_trim_head`, jusqu'à sa fin : `DemandeTx`), que l'ACK va retirer du
-/// tampon. Rien pour une socket qui a OPT_TSONLY (l'entrée sera vide).
+/// Ce que dit OPT_STATS (horodatage.rs, `StatsTcp`) quand le segment `k` du
+/// lot `lot` passe SCHED et SND, à l'heure `heure`. Linux le lit à ce passage,
+/// ce segment déjà compté (`__tcp_transmit_skb` : `data_segs_out`,
+/// `bytes_sent`, et pour un renvoi `total_retrans` et `bytes_retrans`), mais
+/// SND.NXT pas encore avancé pour lui (`tcp_event_new_data_sent`, après :
+/// mesuré, 3 octets envoyés, BYTES_NOTSENT 3 au passage). Notre connexion a
+/// compté tout le lot avant qu'en parte le premier : ce que comptent les
+/// segments d'après `k` est retiré, et ce qu'apportent de neuf `k` et les
+/// suivants est remis dans ce qui n'est pas parti. Dans le tas (None : plus de
+/// mémoire), et faites à part, pour la même raison que `demande_du_segment`.
+#[inline(never)]
+fn stats_du_segment(t: &Tcb<Paquet>, lot: &[itcp::Sortant], k: usize, heure: u64) -> Option<Box<horodatage::StatsTcp>> {
+    let mut info = t.info(heure);
+    for (j, s) in lot.iter().enumerate().skip(k) {
+        let n = s.longueur as u64;
+        if n == 0 {
+            continue;
+        }
+        if s.compte == Compte::Neuf {
+            info.non_envoyes = info.non_envoyes.saturating_add(n as u32);
+        }
+        if j > k {
+            info.data_segs_out = info.data_segs_out.saturating_sub(1);
+            info.octets_envoyes = info.octets_envoyes.saturating_sub(n);
+            if s.compte == Compte::Renvoi {
+                info.total_retrans = info.total_retrans.saturating_sub(1);
+                info.octets_renvoyes = info.octets_renvoyes.saturating_sub(n);
+            }
+        }
+    }
+    faillible::boite(horodatage::StatsTcp { info, en_file: t.a_acquitter(), depart: heure, ttl: None }).ok()
+}
+
+/// Ce que voudront les entrées ACK (horodatage.rs, `acquitte`) de ce qu'était
+/// la connexion juste avant l'ACK qui les fait (`avant_l_ack`) : les copies
+/// des octets des demandes qu'il va passer, et ce que dit TCP_INFO (dans le
+/// tas : `recevoir_avec_demandes` est sur le chemin le plus profond du
+/// réseau quand une connexion a des demandes).
+struct AvantAck {
+    copies: Vec<(u32, Paquet)>,
+    info: Option<Box<itcp::Info>>,
+}
+
+/// Ce que voudront les entrées ACK des demandes TX_ACK de `demandes` que le
+/// segment reçu `h` va passer, si la connexion `t` le prend (un ACK au-delà
+/// de SND.UNA, pas au-delà de SND.NXT), pris avant qu'il ne la change :
+/// - les octets de leur segment (de son début, ou de SND.UNA s'il est déjà
+///   acquitté en partie, comme le `sk_buff` que rogne `tcp_trim_head`,
+///   jusqu'à sa fin : `DemandeTx`), que l'ACK va retirer du tampon ; rien pour
+///   une socket qui a OPT_TSONLY (l'entrée sera vide). Les copier ici plutôt
+///   que de les garder depuis l'émission : rien n'est tenu pour une demande
+///   qui attend son ACK. Plus de mémoire : pas de copie (et pas d'entrée, le
+///   `skb_clone` qui échoue) ;
+/// - pour une socket qui veut les statistiques (OPT_STATS), TCP_INFO d'avant
+///   l'ACK (`acquitter_les_demandes` dit ce qu'il en garde).
+///
 /// `acquitter_les_demandes` dira, une fois l'ACK vu, lesquelles servent.
-/// Les copier avant plutôt que de les garder depuis l'émission : rien n'est
-/// tenu pour une demande qui attend son ACK. Plus de mémoire : pas de copie
-/// (et pas d'entrée, le `skb_clone` qui échoue).
-fn copies_pour_l_ack(demandes: &VecDeque<DemandeTx>, t: &Tcb<Paquet>, h: &Tcp) -> Vec<(u32, Paquet)> {
-    let mut copies = Vec::new();
+fn avant_l_ack(demandes: &VecDeque<DemandeTx>, t: &Tcb<Paquet>, h: &Tcp) -> AvantAck {
+    let mut avant = AvantAck { copies: Vec::new(), info: None };
     let (una, nxt, _) = t.numeros();
-    if demandes.is_empty() || h.drapeaux & ftcp::ACK == 0 || !itcp::apres(h.ack, una) || itcp::apres(h.ack, nxt) {
-        return copies;
+    if h.drapeaux & ftcp::ACK == 0 || !itcp::apres(h.ack, una) || itcp::apres(h.ack, nxt) {
+        return avant;
     }
     for d in demandes.iter().take_while(|d| itcp::avant(d.dernier, h.ack)) {
         let Some(s) = d.socket.upgrade() else { continue };
-        if d.tx & socket::SOF_TX_ACK == 0 || s.tsflags.load(Ordering::Relaxed) & socket::SOF_OPT_TSONLY != 0 {
+        if d.tx & socket::SOF_TX_ACK == 0 {
+            continue;
+        }
+        if horodatage::veut_stats(&s) {
+            if avant.info.is_none() {
+                avant.info = info_en_boite(t);
+            }
+            continue;
+        }
+        if s.tsflags.load(Ordering::Relaxed) & socket::SOF_OPT_TSONLY != 0 {
             continue;
         }
         let (debut, fin) = match d.debut {
@@ -1362,42 +1427,72 @@ fn copies_pour_l_ack(demandes: &VecDeque<DemandeTx>, t: &Tcb<Paquet>, h: &Tcp) -
         let Some(mut p) = Paquet::vide(n) else { continue };
         let Some(o) = p.ajouter_fin(n) else { continue };
         if t.copier_depuis_le_numero(debut, o) {
-            let _ = copies.ajouter((d.dernier, p));
+            let _ = avant.copies.ajouter((d.dernier, p));
         }
     }
-    copies
+    avant
 }
 
-/// L'ACK a fait passer SND.UNA de `avant` à `una` : chaque demande dont le
-/// dernier octet est passé s'en va (le `sk_buff` libéré), et fait son entrée
-/// ACK si elle a TX_ACK (`tcp_ack_tstamp`), avec sa copie de `copies`.
-fn acquitter_les_demandes(demandes: &mut VecDeque<DemandeTx>, avant: u32, una: u32, mut copies: Vec<(u32, Paquet)>) {
+/// L'ACK de TTL `ttl` a fait passer SND.UNA de la connexion `t` de `una` à
+/// sa valeur : chaque demande dont le dernier octet est passé s'en va (le
+/// `sk_buff` libéré), et fait son entrée ACK si elle a TX_ACK
+/// (`tcp_ack_tstamp`), avec sa copie, ou les statistiques d'OPT_STATS, de
+/// `avant`. Linux les lit au milieu de l'ACK, dans `tcp_clean_rtx_queue` :
+/// SND.UNA avancé, les segments livrés comptés, les blocs SACK lus (les
+/// D-SACK, le réordonnancement), les renvois de la retransmission oubliés
+/// (`icsk_retransmits`) ; mais le RTT, la fenêtre de congestion, son seuil et
+/// sa phase, le rythme et le débit pas encore revus par cet ACK (mesuré : le
+/// débit à 0 au premier ACK) : ceux-là, et les temps d'envoi, sont pris de
+/// TCP_INFO d'avant l'ACK, le reste d'après.
+fn acquitter_les_demandes(demandes: &mut VecDeque<DemandeTx>, una: u32, t: &Tcb<Paquet>, ttl: u8, mut avant: AvantAck) {
+    let apres = t.numeros().0;
     while let Some(d) = demandes.front()
-        && itcp::avant(d.dernier, una)
+        && itcp::avant(d.dernier, apres)
     {
         let Some(d) = demandes.pop_front() else { break };
         if d.tx & socket::SOF_TX_ACK != 0
-            && !itcp::avant(d.dernier, avant)
+            && !itcp::avant(d.dernier, una)
             && let Some(s) = d.socket.upgrade()
         {
-            let octets = copies.iter().position(|c| c.0 == d.dernier).map(|i| copies.swap_remove(i).1);
-            horodatage::acquitte(s, octets, d.dernier);
+            let octets = avant.copies.iter().position(|c| c.0 == d.dernier).map(|i| avant.copies.swap_remove(i).1);
+            horodatage::acquitte(s, octets, d.dernier, || stats_de_l_ack(t, avant.info.as_deref(), d.depart, ttl));
         }
     }
 }
 
 /// La connexion `t`, qui a des `demandes` d'horodatage, reçoit le segment
-/// d'en-tête `h` et de charge `charge` : ce que voudront les entrées ACK
-/// (`copies_pour_l_ack`), le segment, puis les demandes qu'il a passées
+/// d'en-tête `h` et de charge `charge`, de TTL `ttl` : ce que voudront les
+/// entrées ACK (`avant_l_ack`), le segment, puis les demandes qu'il a passées
 /// (`acquitter_les_demandes`). À part : `traiter_arrivee` est sur le chemin
 /// le plus profond du réseau (lo reçoit sur la pile de qui émet), et son
 /// cadre n'a pas à garder la place de ce travail, que ne fait pas une
 /// connexion sans demande.
 #[inline(never)]
-fn recevoir_avec_demandes(demandes: &mut VecDeque<DemandeTx>, t: &mut Tcb<Paquet>, h: &Tcp, charge: Paquet) {
-    let (una, copies) = (t.numeros().0, copies_pour_l_ack(demandes, t, h));
+fn recevoir_avec_demandes(demandes: &mut VecDeque<DemandeTx>, t: &mut Tcb<Paquet>, h: &Tcp, charge: Paquet, ttl: u8) {
+    let (una, avant) = (t.numeros().0, avant_l_ack(demandes, t, h));
     t.recevoir(h, charge, maintenant());
-    acquitter_les_demandes(demandes, una, t.numeros().0, copies);
+    acquitter_les_demandes(demandes, una, t, ttl, avant);
+}
+
+/// TCP_INFO de la connexion `t`, dans le tas (None : plus de mémoire).
+#[inline(never)]
+fn info_en_boite(t: &Tcb<Paquet>) -> Option<Box<itcp::Info>> {
+    faillible::boite(t.info(maintenant())).ok()
+}
+
+/// Les attributs d'OPT_STATS d'une entrée ACK (voir `acquitter_les_demandes`) :
+/// TCP_INFO de la connexion `t` après l'ACK, ce qu'il n'a pas encore revu pris
+/// de celui d'avant, `avant` ; `depart`, l'heure du dernier départ du segment ;
+/// `ttl`, celui de l'ACK. À part, pour la même raison que `stats_du_segment`.
+#[inline(never)]
+fn stats_de_l_ack(t: &Tcb<Paquet>, avant: Option<&itcp::Info>, depart: u64, ttl: u8) -> Option<Paquet> {
+    let mut info = t.info(maintenant());
+    if let Some(a) = avant {
+        (info.occupe, info.fenetre_limitee, info.tampon_limite) = (a.occupe, a.fenetre_limitee, a.tampon_limite);
+        (info.rtt, info.min_rtt, info.cwnd, info.ssthresh, info.phase) = (a.rtt, a.min_rtt, a.cwnd, a.ssthresh, a.phase);
+        (info.pacing, info.debit, info.debit_limite) = (a.pacing, a.debit, a.debit_limite);
+    }
+    horodatage::StatsTcp { info, en_file: t.a_acquitter(), depart, ttl: Some(ttl) }.attributs()
 }
 
 /// La route d'un segment de `source` à `distante`, avec ce que dit `ip` : par
@@ -1580,7 +1675,7 @@ impl Partie {
                 if self.demandes.is_empty() {
                     t.recevoir(&s.entete, s.charge, maintenant());
                 } else {
-                    recevoir_avec_demandes(&mut self.demandes, t, &s.entete, s.charge);
+                    recevoir_avec_demandes(&mut self.demandes, t, &s.entete, s.charge, recu.ttl);
                 }
                 if t.lisibles_dans_le_flux() > avant {
                     self.horodatage = heure;

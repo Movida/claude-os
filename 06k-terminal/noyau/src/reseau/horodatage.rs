@@ -28,13 +28,16 @@
 //! la connexion garde (tcp.rs, `DemandeTx`) ; chaque segment qui porte cet
 //! octet, à chaque envoi, reçoit la `Demande` de SCHED et SND, avec le numéro
 //! de cet octet pour clé ; l'ACK qui le passe fait l'entrée ACK
-//! (`acquitte`), une seule fois.
+//! (`acquitte`), une seule fois. Avec OPT_TSONLY et OPT_STATS, l'entrée porte
+//! à la place des octets les statistiques de la connexion à ce point
+//! (`StatsTcp`).
 //!
 //! LA MÉMOIRE : une entrée compte dans la réception de sa socket (SO_RCVBUF,
 //! SO_MEMINFO) la taille vraie de son `sk_buff` chez Linux : la copie d'un
 //! datagramme, celle du paquet (`Paquet::taille_vraie`, son `skb_clone`) ;
 //! une entrée sans octets (OPT_TSONLY), un `sk_buff` vide
-//! (`paquet::TAILLE_VIDE`) ; celle d'un segment de TCP, la tête vide et ses
+//! (`paquet::TAILLE_VIDE`), avec OPT_STATS aussi (ses attributs, moins de
+//! 300 octets, tiennent dans la petite tête : mesuré, la même mémoire) ; celle d'un segment de TCP, la tête vide et ses
 //! octets de données (les `sk_buff` de TCP gardent leurs octets dans des
 //! pages ; mesuré : 960 + n pour SCHED, SND et ACK). Pour TCP, la file
 //! d'erreurs compte avec ce que la connexion a reçu, sous le même SO_RCVBUF
@@ -59,6 +62,7 @@
 use super::ipv4::EnteteRecu;
 use super::paquet::{Paquet, TAILLE_VIDE};
 use alloc::boxed::Box;
+use inet::tcp as itcp;
 use super::socket::{self, ErreurEnFile, Protocole, Socket};
 use crate::partage::{Arc, Weak};
 use core::sync::atomic::Ordering;
@@ -85,6 +89,91 @@ pub struct Demande {
     socket: Weak<Socket>,
     points: u8,
     cle: u32,
+    /// Les statistiques d'OPT_STATS au passage du segment de TCP qui la porte
+    /// (`StatsTcp`), faites quand il part, si sa socket les voulait alors.
+    stats: Option<Box<StatsTcp>>,
+}
+
+impl Demande {
+    /// Sa socket veut-elle les statistiques de TCP (OPT_TSONLY et OPT_STATS,
+    /// TCP : `__skb_tstamp_tx`) ?
+    pub fn veut_stats(&self) -> bool {
+        self.socket.upgrade().is_some_and(|s| veut_stats(&s))
+    }
+
+    /// La même, avec les statistiques `stats` (None : plus de mémoire).
+    pub fn avec_stats(mut self: Box<Self>, stats: Option<Box<StatsTcp>>) -> Box<Demande> {
+        self.stats = stats;
+        self
+    }
+}
+
+/// La socket `s` veut-elle les statistiques de TCP à la place des octets ?
+pub fn veut_stats(s: &Socket) -> bool {
+    let ts = s.tsflags.load(Ordering::Relaxed);
+    s.protocole == Protocole::Tcp && ts & socket::SOF_OPT_TSONLY != 0 && ts & socket::SOF_OPT_STATS != 0
+}
+
+/// Ce que dit OPT_STATS d'une connexion de TCP à un point
+/// (`tcp_get_timestamping_opt_stats`, net/ipv4/tcp.c) : ce que rend TCP_INFO
+/// (`info`), ce qui attend son ACK (`write_seq - snd_una`), l'heure de départ
+/// du segment (`skb_mstamp_ns`, en temps monotone) et, pour ACK, le TTL du
+/// segment qui acquitte. Ses champs viennent de ceux de TCP_INFO : les
+/// mêmes écarts (le temps occupé, en µs chez nous, que Linux compte en
+/// tics : 0 sur lo, mesuré), et DELIVERED_CE toujours 0 (pas d'ECN chez
+/// nous), PLB jamais (REHASH : les seuls RTO).
+pub struct StatsTcp {
+    pub info: itcp::Info,
+    pub en_file: u32,
+    pub depart: u64,
+    pub ttl: Option<u8>,
+}
+
+impl StatsTcp {
+    /// Ses attributs de netlink, dans l'ordre où Linux les écrit (chacun : sa
+    /// longueur et son numéro, `TCP_NLA_*` d'include/uapi/linux/tcp.h, sur
+    /// deux octets, puis sa valeur, complétée à 4 octets ; les 64 bits sans
+    /// attribut de bourrage sur x86_64, qui lit sans aligner) : 248 octets, 256
+    /// avec le TTL (mesuré). None : plus de mémoire. À part (son tampon n'a
+    /// pas à peser sur le cadre de qui l'appelle, au fond du réseau).
+    #[inline(never)]
+    pub fn attributs(&self) -> Option<Paquet> {
+        let i = &self.info;
+        let mut o = [0u8; 256];
+        let mut n = 0;
+        let mut mettre = |sorte: u16, v: &[u8]| {
+            o[n..n + 2].copy_from_slice(&(4 + v.len() as u16).to_le_bytes());
+            o[n + 2..n + 4].copy_from_slice(&sorte.to_le_bytes());
+            o[n + 4..n + 4 + v.len()].copy_from_slice(v);
+            n += (4 + v.len()).next_multiple_of(4);
+        };
+        for (sorte, v) in [(1, i.occupe), (2, i.fenetre_limitee), (3, i.tampon_limite), (4, i.data_segs_out as u64), (5, i.total_retrans as u64),
+                           (6, i.pacing), (7, i.debit)] {
+            mettre(sorte, &v.to_le_bytes());
+        }
+        for (sorte, v) in [(8, i.cwnd), (9, i.reordonnancement), (10, i.min_rtt)] {
+            mettre(sorte, &v.to_le_bytes());
+        }
+        mettre(11, &[i.retransmissions]);
+        mettre(12, &[u8::from(i.debit_limite)]);
+        for (sorte, v) in [(15, i.ssthresh), (16, i.livres), (17, 0), (13, self.en_file.min(i32::MAX as u32))] {
+            mettre(sorte, &v.to_le_bytes());
+        }
+        mettre(14, &[i.phase]);
+        mettre(18, &i.octets_envoyes.to_le_bytes());
+        mettre(19, &i.octets_renvoyes.to_le_bytes());
+        for (sorte, v) in [(20, i.dsack_doublons), (21, i.reord_seen), (22, i.rtt)] {
+            mettre(sorte, &v.to_le_bytes());
+        }
+        mettre(23, &(i.rehash as u16).to_le_bytes());
+        mettre(24, &i.non_envoyes.min(i32::MAX as u32).to_le_bytes());
+        mettre(25, &self.depart.to_le_bytes());
+        if let Some(ttl) = self.ttl {
+            mettre(26, &[ttl]);
+        }
+        mettre(27, &i.rehash.to_le_bytes());
+        Paquet::copie(&o[..n])
+    }
 }
 
 /// Une entrée faite, pour la file d'erreurs de sa socket : ce qu'attend la
@@ -119,8 +208,7 @@ pub fn demander_datagramme(s: &Arc<Socket>, p: &mut Paquet, tx: u32, ts_opt_id: 
 }
 
 /// Pose sur `p` la demande des drapeaux d'émission `tx` pour la socket `s`,
-/// de clé `cle`, s'il y a un point à dire (`__sock_tx_timestamp`) ; plus de
-/// mémoire : rien ne sera dit de ce paquet.
+/// de clé `cle`, s'il y a un point à dire (`__sock_tx_timestamp`).
 pub fn demander(s: &Arc<Socket>, p: &mut Paquet, tx: u32, cle: u32) {
     if let Some(d) = demande(&Arc::downgrade(s), tx, cle) {
         p.poser_demande(d);
@@ -137,7 +225,7 @@ pub fn demande(socket: &Weak<Socket>, tx: u32, cle: u32) -> Option<Box<Demande>>
     if points == 0 {
         return None;
     }
-    crate::faillible::boite(Demande { socket: socket.clone(), points, cle }).ok()
+    crate::faillible::boite(Demande { socket: socket.clone(), points, cle, stats: None }).ok()
 }
 
 /// Le paquet `p` passe le point `point` (`SCHED` ou `PILOTE`) de l'interface
@@ -151,7 +239,7 @@ pub fn passer(p: &Paquet, point: u8, interface: u32) {
     }
     let Some(s) = d.socket.upgrade() else { return };
     let info = if point == SCHED { SCM_TSTAMP_SCHED } else { SCM_TSTAMP_SND };
-    if let Some(erreur) = entree(&s, p.donnees(), p.taille_vraie(), info, d.cle, interface) {
+    if let Some(erreur) = entree(&s, p.donnees(), p.taille_vraie(), info, d.cle, interface, d.stats.as_deref()) {
         deposer(s, erreur);
     }
 }
@@ -178,10 +266,13 @@ fn deposer(s: Arc<Socket>, erreur: ErreurEnFile) {
 /// OPT_TSONLY, ou quand la copie a manqué de mémoire (rien alors, comme le
 /// `skb_clone` qui échoue). Aucune interface : ce `sk_buff` n'est jamais
 /// passé par une carte (`skb->dev` nul), d'où ni IP_PKTINFO ni
-/// SO_EE_OFFENDER avec OPT_CMSG (`ipv4_datagram_support_cmsg`).
-pub fn acquitte(s: Arc<Socket>, octets: Option<Paquet>, cle: u32) {
+/// SO_EE_OFFENDER avec OPT_CMSG (`ipv4_datagram_support_cmsg`). Avec
+/// OPT_STATS, les attributs des statistiques que fait `stats`, à la place.
+pub fn acquitte(s: Arc<Socket>, octets: Option<Paquet>, cle: u32, stats: impl FnOnce() -> Option<Paquet>) {
     let tsonly = s.tsflags.load(Ordering::Relaxed) & socket::SOF_OPT_TSONLY != 0;
+    let avec_stats = veut_stats(&s);
     let (donnees, taille) = match (tsonly, octets) {
+        _ if avec_stats => (stats(), TAILLE_VIDE),
         (true, _) => (Paquet::copie(&[]), TAILLE_VIDE),
         (false, o) => {
             let n = o.as_ref().map_or(0, Paquet::longueur);
@@ -189,7 +280,7 @@ pub fn acquitte(s: Arc<Socket>, octets: Option<Paquet>, cle: u32) {
         }
     };
     if let Some(donnees) = donnees {
-        let erreur = faire(&s, donnees, &[], taille, SCM_TSTAMP_ACK, cle, 0);
+        let erreur = faire(&s, donnees, &[], taille, SCM_TSTAMP_ACK, cle, 0, avec_stats);
         deposer(s, erreur);
     }
 }
@@ -207,21 +298,30 @@ pub fn acquitte(s: Arc<Socket>, octets: Option<Paquet>, cle: u32) {
 /// messages de contrôle IP (`ipv4_datagram_support_cmsg`) : l'en-tête du
 /// paquet (son TTL, son TOS ; jamais d'options : Linux efface le `cb` du
 /// paquet, où elles étaient notées), sa source (SO_EE_OFFENDER, et
-/// l'adresse locale d'IP_PKTINFO) et sa destination. None : plus de
-/// mémoire (le `skb_clone` qui échoue : rien). À part de `passer`, que
-/// traverse chaque paquet émis, au fond du réseau : son cadre n'a pas à
-/// garder la place de ce travail quand le paquet ne demande rien.
+/// l'adresse locale d'IP_PKTINFO) et sa destination. Avec OPT_TSONLY et
+/// OPT_STATS, pour TCP, les statistiques `stats` à la place des octets,
+/// faites quand le segment est parti (tcp.rs, `emettre_tcb`) ; sans elles
+/// (plus de mémoire alors, ou OPT_STATS posé depuis), rien, comme
+/// l'`alloc_skb` qui échoue. None : plus de mémoire (le `skb_clone` qui
+/// échoue : rien). À part de `passer`, que traverse chaque paquet émis, au
+/// fond du réseau : son cadre n'a pas à garder la place de ce travail quand
+/// le paquet ne demande rien.
 #[inline(never)]
-pub fn entree(s: &Socket, trame: &[u8], taille: usize, info: u32, cle: u32, interface: u32) -> Option<ErreurEnFile> {
+pub fn entree(s: &Socket, trame: &[u8], taille: usize, info: u32, cle: u32, interface: u32, stats: Option<&StatsTcp>) -> Option<ErreurEnFile> {
     let tsonly = s.tsflags.load(Ordering::Relaxed) & socket::SOF_OPT_TSONLY != 0;
-    let donnees = Paquet::copie(if tsonly { &[] } else { trame })?;
+    let avec_stats = veut_stats(s);
+    let donnees = match () {
+        _ if avec_stats => stats?.attributs()?,
+        _ if tsonly => Paquet::copie(&[])?,
+        _ => Paquet::copie(trame)?,
+    };
     let ip = if tsonly { &[][..] } else { trame.get(ethernet::ENTETE..).unwrap_or(&[]) };
     let taille = match () {
         _ if tsonly => TAILLE_VIDE,
         _ if s.protocole == Protocole::Tcp => TAILLE_VIDE + charge_tcp(ip),
         _ => taille,
     };
-    Some(faire(s, donnees, ip, taille, info, cle, if tsonly { 0 } else { interface }))
+    Some(faire(s, donnees, ip, taille, info, cle, if tsonly { 0 } else { interface }, avec_stats))
 }
 
 /// Les octets de données du segment de TCP dont `ip` est le paquet IPv4
@@ -234,8 +334,9 @@ fn charge_tcp(ip: &[u8]) -> usize {
 
 /// L'entrée elle-même : ses octets `donnees`, qui comptent `taille` dans
 /// SO_RCVBUF ; `ip`, l'en-tête IPv4 du paquet (vide : il n'en a pas) ;
-/// l'interface `interface` (0 : aucune).
-fn faire(s: &Socket, donnees: Paquet, ip: &[u8], taille: usize, info: u32, cle: u32, interface: u32) -> ErreurEnFile {
+/// l'interface `interface` (0 : aucune) ; `stats` : ses octets sont des
+/// statistiques (`StatsTcp`).
+fn faire(s: &Socket, donnees: Paquet, ip: &[u8], taille: usize, info: u32, cle: u32, interface: u32, stats: bool) -> ErreurEnFile {
     let ts = s.tsflags.load(Ordering::Relaxed);
     let adresse = |i: usize| ip.get(i..i + 4).map_or([0; 4], |o| [o[0], o[1], o[2], o[3]]);
     let entete = EnteteRecu { tos: ip.get(1).copied().unwrap_or(0), ttl: ip.get(8).copied().unwrap_or(0), ..EnteteRecu::AUCUN };
@@ -247,7 +348,7 @@ fn faire(s: &Socket, donnees: Paquet, ip: &[u8], taille: usize, info: u32, cle: 
     ErreurEnFile {
         errno: ENOMSG, origine: socket::ORIGINE_HORODATAGE, genre: 0, code: 0, info, ee_data, adresse: [0; 4], port: 0,
         emetteur: adresse(12), interface, arrivee: adresse(16), entete, somme: 0, horodatage: crate::temps::ns_calendrier(), taille,
-        donnees,
+        donnees, stats,
     }
 }
 

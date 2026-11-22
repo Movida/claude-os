@@ -208,6 +208,9 @@ pub struct ErreurEnFile {
     pub donnees: Paquet,
     /// Sa taille vraie (elle compte dans SO_RCVBUF, avec les datagrammes).
     pub taille: usize,
+    /// Ses octets sont les statistiques de TCP d'OPT_STATS (`opt_stats` de la
+    /// `sock_exterr_skb`) : la lecture les redit en SCM_TIMESTAMPING_OPT_STATS.
+    pub stats: bool,
 }
 
 /// La somme d'un datagramme que rendra IP_CHECKSUM (le `skb->csum` de
@@ -260,7 +263,7 @@ impl ErreurEnFile {
         let donnees = Paquet::vide(0)?;
         Some(ErreurEnFile {
             errno, origine: ORIGINE_LOCALE, genre: 0, code: 0, info, ee_data: 0, adresse, port, emetteur: [0; 4], interface: 0,
-            arrivee: [0; 4], entete: EnteteRecu::AUCUN, somme: 0, horodatage: 0, taille: donnees.taille_vraie(), donnees,
+            arrivee: [0; 4], entete: EnteteRecu::AUCUN, somme: 0, horodatage: 0, taille: donnees.taille_vraie(), donnees, stats: false,
         })
     }
 
@@ -500,6 +503,7 @@ pub const SOF_TX_SCHED: u32 = 1 << 8;
 pub const SOF_TX_ACK: u32 = 1 << 9;
 pub const SOF_OPT_CMSG: u32 = 1 << 10;
 pub const SOF_OPT_TSONLY: u32 = 1 << 11;
+pub const SOF_OPT_STATS: u32 = 1 << 12;
 pub const SOF_TX_COMPLETION: u32 = 1 << 18;
 pub const SOF_TX_RECORD_MASK: u32 = SOF_TX_HARDWARE | SOF_TX_SOFTWARE | SOF_TX_SCHED | SOF_TX_ACK | SOF_TX_COMPLETION;
 

@@ -82,7 +82,12 @@
  *     SND.UNA, ou depuis tout ce qui est écrit avec OPT_ID_TCP ; deux envois dans le
  *     même segment (TCP_CORK) n'en font qu'un, le dernier, aux drapeaux des deux ;
  *     OPT_TSONLY ; OPT_CMSG (IP_PKTINFO pour SND, rien pour ACK) ; POLLERR seul, même
- *     avec SO_SELECT_ERR_QUEUE, et le réveil de qui attend dans poll.
+ *     avec SO_SELECT_ERR_QUEUE, et le réveil de qui attend dans poll ;
+ *   - OPT_STATS (TCP, avec OPT_TSONLY) : à la place des octets, les attributs de
+ *     netlink de la connexion (248 octets, 256 avec le TTL de l'ACK), redits en
+ *     SCM_TIMESTAMPING_OPT_STATS avec l'heure seulement ; au passage du segment, ce
+ *     qui est compté de lui et ce qui n'est pas encore parti ; à l'ACK, ce qui est
+ *     livré, et le débit d'avant lui ; rien pour UDP.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -161,6 +166,7 @@
 #define TSF_TX_ACK (1 << 9)
 #define TSF_OPT_CMSG (1 << 10)
 #define SCM_TS_OPT_ID_ 81
+#define SCM_TIMESTAMPING_OPT_STATS_ 54
 #define SIOCGSTAMP_OLD_ 0x8906
 #define SIOCGSTAMPNS_OLD_ 0x8907
 
@@ -1889,12 +1895,13 @@ static void horodatages_fille(void)
 /* Une entrée de la file d'erreurs : ce que rend recvmsg (ou -errno), msg_flags,
  * msg_namelen, ses messages de contrôle dans l'ordre (niveau * 1000 + sorte), et ce
  * qu'ils disent : l'heure (SCM_TIMESTAMPING récent), IP_PKTINFO, un entier IP (TTL),
- * un octet (TOS), le port d'IP_ORIGDSTADDR, la sock_extended_err et SO_EE_OFFENDER. */
+ * un octet (TOS), le port d'IP_ORIGDSTADDR, la sock_extended_err et SO_EE_OFFENDER,
+ * SCM_TIMESTAMPING_OPT_STATS (sa longueur, ses octets). */
 struct entree {
-    int r, flags, nom, n, sortes[8], heure, ttl, tos, port;
+    int r, flags, nom, n, sortes[8], heure, ttl, tos, port, stats;
     struct in_pktinfo pkt;
     unsigned ee_errno, ee_origin, ee_info, ee_data, famille, offender;
-    unsigned char o[128];
+    unsigned char o[256], st[256];
 };
 
 static int lire_entree(int s, struct entree *e, size_t place)
@@ -1918,6 +1925,9 @@ static int lire_entree(int s, struct entree *e, size_t place)
             for (int i = 16; i < l && i < 48; i++)
                 v.reste |= d[i];
             e->heure = heures_ok(&v, TSG_OLD, 0, 5000);
+        } else if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_TIMESTAMPING_OPT_STATS_) {
+            e->stats = l;
+            memcpy(e->st, d, l < 256 ? l : 256);
         } else if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_PKTINFO) {
             memcpy(&e->pkt, d, sizeof e->pkt);
         } else if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_TTL) {
@@ -2341,14 +2351,14 @@ static int segment_ok(const struct entree *e, const char *d, int n)
         && e->o[23] == IPPROTO_TCP && e->o[46] == 0x80 && !memcmp(e->o + e->r - n, d, n);
 }
 
-/* Lit `n` entrées de la file d'erreurs de `s` dans `e` (128 octets au plus chacune) ;
+/* Lit `n` entrées de la file d'erreurs de `s` dans `e` (256 octets au plus chacune) ;
  * la suivante doit manquer (EAGAIN). */
 static int entrees(int s, struct entree *e, int n)
 {
     for (int i = 0; i < n; i++)
-        lire_entree(s, &e[i], 128);
+        lire_entree(s, &e[i], sizeof e[i].o);
     struct entree fin;
-    return lire_entree(s, &fin, 128) == -EAGAIN;
+    return lire_entree(s, &fin, sizeof fin.o) == -EAGAIN;
 }
 
 /* La mémoire d'une entrée OPT_TSONLY d'UDP : la tête vide d'un paquet. */
@@ -2535,6 +2545,130 @@ static void horodatages_emission_tcp(void)
     horodatages_memoire_tcp();
 }
 
+/* OPT_STATS : les attributs de `a` (n octets) sont-ils ceux de Linux 6.18, dans son
+ * ordre et de leurs longueurs (le TTL seulement pour ACK) ? */
+static int attributs_ok(const unsigned char *a, int n, int ack)
+{
+    static const int ordre[][2] = {{1, 12}, {2, 12}, {3, 12}, {4, 12}, {5, 12}, {6, 12}, {7, 12}, {8, 8}, {9, 8}, {10, 8},
+                                   {11, 5}, {12, 5}, {15, 8}, {16, 8}, {17, 8}, {13, 8}, {14, 5}, {18, 12}, {19, 12},
+                                   {20, 8}, {21, 8}, {22, 8}, {23, 6}, {24, 8}, {25, 12}, {26, 5}, {27, 8}};
+    int i = 0;
+    for (unsigned k = 0; k < sizeof ordre / sizeof ordre[0]; k++) {
+        if (ordre[k][0] == 26 && !ack)
+            continue;
+        uint16_t l, t;
+        if (i + 4 > n)
+            return 0;
+        memcpy(&l, a + i, 2), memcpy(&t, a + i + 2, 2);
+        if (t != ordre[k][0] || l != ordre[k][1])
+            return 0;
+        i += (l + 3) & ~3;
+    }
+    return i == n;
+}
+
+/* La valeur de l'attribut `sorte` d'OPT_STATS dans `a` (n octets) ; -1 s'il n'y est pas. */
+static long long attribut(const unsigned char *a, int n, int sorte)
+{
+    for (int i = 0; i + 4 <= n;) {
+        uint16_t l, t;
+        memcpy(&l, a + i, 2), memcpy(&t, a + i + 2, 2);
+        if (t == sorte) {
+            unsigned long long v = 0;
+            memcpy(&v, a + i + 4, l - 4 > 8 ? 8 : l - 4);
+            return v;
+        }
+        i += (l + 3) & ~3;
+    }
+    return -1;
+}
+
+/* Les compteurs que dit OPT_STATS de l'entrée `e` : DATA_SEGS_OUT, BYTES_SENT,
+ * SNDQ_SIZE, BYTES_NOTSENT, DELIVERED, et les constantes d'une connexion neuve sans
+ * perte (CWND 10, REORDERING 3, SSTHRESH infini, rien de renvoyé, CA_STATE Open) ;
+ * l'heure de départ (EDT, temps monotone) de moins de 5 s. */
+static int stats_ok(const struct entree *e, int segs, int envoyes, int en_file, int pas_partis, int livres)
+{
+    const unsigned char *a = e->o;
+    long long edt = attribut(a, e->r, 25);
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    long long age = t.tv_sec * 1000000000LL + t.tv_nsec - edt;
+    return attribut(a, e->r, 4) == segs && attribut(a, e->r, 18) == envoyes && attribut(a, e->r, 13) == en_file
+        && attribut(a, e->r, 24) == pas_partis && attribut(a, e->r, 16) == livres && attribut(a, e->r, 8) == 10
+        && attribut(a, e->r, 9) == 3 && attribut(a, e->r, 15) == 0x7fffffff && attribut(a, e->r, 5) == 0
+        && attribut(a, e->r, 19) == 0 && attribut(a, e->r, 11) == 0 && attribut(a, e->r, 14) == 0
+        && attribut(a, e->r, 17) == 0 && attribut(a, e->r, 27) == 0 && age >= 0 && age < 5000000000LL;
+}
+
+static void horodatages_stats_tcp(void)
+{
+    struct entree e[3];
+    int c, d;
+    tcp_connectee(&c, &d);
+    /* SCHED, SND, ACK : les attributs, en octets et en message de contrôle, après
+     * l'heure ; ce qui est compté du segment, ce qui n'est pas parti (pas encore lui),
+     * ce qui est livré (le SYN compte) ; le débit d'avant l'ACK (0 au premier) ; le TTL. */
+    int ok = poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_SCHED | TSF_TX_ACK | TSF_SOFTWARE | TSF_OPT_ID | TSF_OPT_TSONLY | TSF_OPT_STATS) == 0;
+    send(c, "abc", 3, 0);
+    attendre_ms(50);
+    /* Leurs attributs tiennent dans la tête vide d'un paquet : chacune compte comme une
+     * entrée OPT_TSONLY. */
+    unsigned vide = entree_vide(), trois = compteur(c, RMEM);
+    printf("[linux] options-socket : OPT_STATS TCP, memoire : %u pour SCHED, SND, ACK (%u par entree vide)\n", trois, vide);
+    ok &= trois == 3 * vide && entrees(c, e, 3);
+    for (int i = 0; i < 3; i++)
+        ok &= horodatage_ok(&e[i], i < 2 ? 248 : 256, i < 2 ? 1 - i : 2, 2) && e[i].heure
+            && sortes_ok(&e[i], 3, (int[]){S_TS, SOL_SOCKET * 1000 + SCM_TIMESTAMPING_OPT_STATS_, S_ERR}) && e[i].stats == e[i].r
+            && !memcmp(e[i].st, e[i].o, e[i].r) && attributs_ok(e[i].o, e[i].r, i == 2);
+    ok &= stats_ok(&e[0], 1, 3, 3, 3, 1) && stats_ok(&e[1], 1, 3, 3, 3, 1) && stats_ok(&e[2], 1, 3, 0, 0, 2)
+        && attribut(e[2].o, 256, 7) == 0 && attribut(e[2].o, 256, 26) == 64;
+    verifier(ok, "OPT_STATS TCP : les attributs de SCHED, SND et ACK (248 et 256 octets), au passage du segment et au milieu de l'ACK ; chacune compte comme une entree vide");
+    /* Un deuxième envoi ; sans SOFTWARE, les attributs sans message de contrôle. */
+    send(c, "defgh", 5, 0);
+    attendre_ms(50);
+    ok = entrees(c, e, 3) && stats_ok(&e[1], 2, 8, 5, 5, 2) && stats_ok(&e[2], 2, 8, 0, 0, 3) && attribut(e[2].o, 256, 7) > 0;
+    poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_ACK | TSF_OPT_TSONLY | TSF_OPT_STATS);
+    send(c, "i", 1, 0);
+    attendre_ms(50);
+    ok &= entrees(c, e, 2) && e[0].r == 248 && sortes_ok(&e[0], 1, (int[]){S_ERR}) && attributs_ok(e[0].o, 248, 0)
+        && e[1].r == 256 && sortes_ok(&e[1], 1, (int[]){S_ERR}) && attributs_ok(e[1].o, 256, 1);
+    verifier(ok, "OPT_STATS TCP : un deuxieme envoi, le debit du premier ACK ; sans SOFTWARE, les attributs sans message de controle");
+    close(c);
+    char z[64];
+    while (recv(d, z, sizeof z, MSG_DONTWAIT) > 0)
+        ;
+    close(d);
+    /* Un envoi qui rend moins que voulu (non bloquant, SO_SNDBUF plein), dont tout ce
+     * qu'il a écrit est déjà parti : sa demande va au dernier segment en vol
+     * (`skb_rb_last`), et l'entrée ACK dit l'heure de son départ (EDT). */
+    tcp_connectee(&c, &d);
+    int petit = 4096;
+    setsockopt(c, SOL_SOCKET, SO_SNDBUF, &petit, sizeof petit);
+    poser(c, TSG_OLD, TSF_TX_ACK | TSF_OPT_TSONLY | TSF_OPT_STATS);
+    static char gros[1 << 20];
+    long envoye = send(c, gros, sizeof gros, MSG_DONTWAIT);
+    attendre_ms(50);
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    long long edt = entrees(c, e, 1) ? attribut(e[0].o, e[0].r, 25) : -1, age = t.tv_sec * 1000000000LL + t.tv_nsec - edt;
+    char q[160];
+    snprintf(q, sizeof q, "OPT_STATS TCP : un envoi qui rend moins que voulu (%ld octets), tout parti : l'heure de depart (EDT) du dernier segment en vol", envoye);
+    verifier(envoye > 0 && envoye < (long)sizeof gros && edt > 0 && age >= 0 && age < 5000000000LL, q);
+    close(c);
+    while (recv(d, gros, sizeof gros, MSG_DONTWAIT) > 0)
+        ;
+    close(d);
+    /* UDP : rien (OPT_STATS ne vaut que pour TCP). */
+    struct sockaddr_in a;
+    int r = udp_lie(&a), u = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(u, TSG_OLD, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_TSONLY | TSF_OPT_STATS);
+    sendto(u, "u", 1, 0, (void *)&a, sizeof a);
+    ok = entrees(u, e, 1) && horodatage_ok(&e[0], 0, 0, 0) && sortes_ok(&e[0], 2, (int[]){S_TS, S_ERR});
+    verifier(ok, "OPT_STATS UDP : une entree vide, sans attributs");
+    close(u), close(r);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -2573,6 +2707,7 @@ int main(void)
     horodatages_emission_ping();
     horodatages_purge();
     horodatages_emission_tcp();
+    horodatages_stats_tcp();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

@@ -969,7 +969,7 @@ fn copier_par_numero_et_dernier_en_vol() {
     c.emettre(HEURE, |_| {});
     assert!(c.file.len() > 1);
     let dernier = c.file.back().unwrap();
-    assert_eq!(c.dernier_en_vol(), Some((dernier.seq, dernier.fin_seq)));
+    assert_eq!(c.dernier_en_vol(), Some((dernier.seq, dernier.fin_seq, HEURE)));
     assert_eq!(c.dernier_en_vol().map(|v| v.0), Some(debut(c.file.len() as u32 - 1)));
     assert_eq!(c.dernier_en_vol().map(|v| v.1), Some(c.fin_des_donnees()));
     // Dix octets acquittés : ils ne sont plus là, la suite oui.

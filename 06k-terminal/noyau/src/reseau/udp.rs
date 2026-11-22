@@ -648,6 +648,7 @@ pub fn signaler(s: &Socket, e: &ErreurRecue, errno: i32, fatale: bool, port: u16
                 errno, origine: socket::ORIGINE_ICMP, genre: e.genre, code: e.code, info: e.info, ee_data,
                 adresse: e.interne.destination, port, emetteur: e.emetteur, interface: e.interface,
                 arrivee: e.destination, entete: *e.entete, somme: somme_linux(e.message), horodatage: e.horodatage, donnees, taille,
+                stats: false,
             });
         }
     }

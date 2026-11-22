@@ -148,6 +148,8 @@ const SO_TXTIME: i32 = 61;
 const SCM_TXTIME: i32 = SO_TXTIME;
 /// La clé d'OPT_ID d'un envoi, à la place de celle du compteur.
 const SCM_TS_OPT_ID: i32 = 81;
+/// Les statistiques de TCP d'une entrée d'horodatage (OPT_STATS, horodatage.rs).
+const SCM_TIMESTAMPING_OPT_STATS: i32 = 54;
 const SO_PREFER_BUSY_POLL: i32 = 69;
 const SO_BUSY_POLL_BUDGET: i32 = 70;
 const SO_NETNS_COOKIE: i32 = 71;
@@ -178,7 +180,6 @@ const SO_SELECT_ERR_QUEUE: i32 = 45;
 const SO_TIMESTAMPING_OLD: i32 = 37;
 const SO_TIMESTAMPING_NEW: i32 = 65;
 const SOF_MASK: u32 = (1 << 19) - 1;
-const SOF_OPT_STATS: u32 = 1 << 12;
 const SOF_BIND_PHC: u32 = 1 << 15;
 const SOF_OPT_ID_TCP: u32 = 1 << 16;
 /// Les horloges que SO_TXTIME accepte (`sockopt_validate_clockid`).
@@ -828,7 +829,8 @@ struct Reception {
 /// lecture (elle tient à jour l'heure que rend SIOCGSTAMP) et qu'écrit
 /// `recvmsg` : SO_TIMESTAMP sous la forme posée (son numéro et ses 16
 /// octets), SCM_TIMESTAMPING (`Horodatages`), SO_RXQ_OVFL, SO_MARK,
-/// SO_PRIORITY, et SCM_INQ (AF_UNIX en flux).
+/// SO_PRIORITY, SCM_INQ (AF_UNIX en flux), et SCM_TIMESTAMPING_OPT_STATS
+/// (une entrée de la file d'erreurs qui porte les statistiques de TCP).
 /// Qui en dit quoi, comme Linux (mesuré) : UDP, tout (`sock_recv_cmsgs`) ;
 /// ping et la file d'erreurs, l'heure seule (`sock_recv_timestamp`) ;
 /// AF_UNIX, l'heure d'un DGRAM ou d'un SEQPACKET (`__sock_recv_timestamp`),
@@ -841,6 +843,7 @@ struct ControleSocket {
     marque: Option<u32>,
     priorite: Option<u32>,
     inq: Option<i32>,
+    stats: bool,
 }
 
 /// SO_TIMESTAMP de la socket `s`, si elle l'a, pour l'heure `ns` (de la date,
@@ -965,7 +968,10 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         };
         let d = if recu.coupe { MSG_TRUNC } else { 0 } | MSG_ERRQUEUE as u32;
         let (horodatage, horodatages) = heure_lue(s, e.horodatage, true);
-        let socket = ControleSocket { horodatage, horodatages, ..Default::default() };
+        // Ses statistiques (OPT_STATS), après l'heure et seulement avec elle
+        // (`__sock_recv_timestamp`), entières même si la place les a coupées.
+        let stats = e.stats && horodatages.is_some() && total > 0;
+        let socket = ControleSocket { horodatage, horodatages, stats, ..Default::default() };
         return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: Some(e), fichiers: Vec::new(), droits: None, socket });
     }
     if o.socket().protocole == Protocole::Tcp && drapeaux & MSG_OOB != 0 {
@@ -1522,6 +1528,11 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
     if let Some((sorte, o)) = &r.socket.horodatages {
         c.ecrire(SOL_SOCKET, *sorte, o, &mut r.drapeaux);
     }
+    if r.socket.stats
+        && let Some(e) = &r.erreur
+    {
+        c.ecrire(SOL_SOCKET, SCM_TIMESTAMPING_OPT_STATS, e.donnees.donnees(), &mut r.drapeaux);
+    }
     for (sorte, v) in [(SO_RXQ_OVFL, r.socket.pertes), (SO_MARK, r.socket.marque), (SO_PRIORITY, r.socket.priorite)] {
         if let Some(v) = v {
             c.ecrire(SOL_SOCKET, sorte, &v.to_le_bytes(), &mut r.drapeaux);
@@ -1846,7 +1857,7 @@ fn horodatages(s: &Socket, option: i32, d: u32) -> Result<(), i64> {
         let cle = if s.protocole == Protocole::Tcp { tcp::cle_opt_id(s, d & SOF_OPT_ID_TCP != 0).ok_or(-EINVAL)? } else { 0 };
         s.cle_emission.store(cle, Ordering::Relaxed);
     }
-    if d & SOF_OPT_STATS != 0 && d & socket::SOF_OPT_TSONLY == 0 {
+    if d & socket::SOF_OPT_STATS != 0 && d & socket::SOF_OPT_TSONLY == 0 {
         return Err(-EINVAL);
     }
     if d & SOF_BIND_PHC != 0 {

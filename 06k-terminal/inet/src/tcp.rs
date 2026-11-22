@@ -2139,11 +2139,12 @@ impl<P: Charge> Tcb<P> {
     /// Le dernier segment en vol, s'il y en a un (la queue de la file de
     /// retransmission, le `skb_rb_last(&sk->tcp_rtx_queue)` de Linux) : où le
     /// noyau pose la demande d'horodatage d'un envoi dont tout est déjà parti
-    /// (`tcp_tx_timestamp`). Son premier numéro, et la fin de ses données (son
-    /// FIN n'est pas un octet que l'entrée ACK copiera).
-    pub fn dernier_en_vol(&self) -> Option<(u32, u32)> {
+    /// (`tcp_tx_timestamp`). Son premier numéro, la fin de ses données (son
+    /// FIN n'est pas un octet que l'entrée ACK copiera), et l'heure de son
+    /// dernier envoi (`skb_mstamp_ns`, que dit TCP_NLA_EDT).
+    pub fn dernier_en_vol(&self) -> Option<(u32, u32, u64)> {
         let donnees = self.fin_des_donnees();
-        self.file.back().map(|e| (e.seq, if apres(e.fin_seq, donnees) { donnees } else { e.fin_seq }))
+        self.file.back().map(|e| (e.seq, if apres(e.fin_seq, donnees) { donnees } else { e.fin_seq }, e.envoi))
     }
 
     /// Retire `n` octets acquittés du début du tampon d'émission.
