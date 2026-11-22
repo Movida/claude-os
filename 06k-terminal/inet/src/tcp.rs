@@ -770,7 +770,7 @@ pub struct Restes {
     /// Les RTO qui ont changé le hachage du flux (`timeout_rehash`).
     rehash: u32,
     /// L'heure au plus tôt du prochain segment, au rythme interne (`tcp_wstamp_ns`, que
-    /// `tcp_disconnect` ne remet pas : rythme.rs).
+    /// ni `tcp_disconnect` ni la naissance d'une fille ne remettent : rythme.rs).
     depart: u64,
 }
 
@@ -1678,6 +1678,28 @@ impl<P: Charge> Tcb<P> {
         self.espace.octets = r.rcv_space;
         self.dernier_envoi = r.dernier_envoi;
         self.dernier_recu = r.dernier_ack;
+    }
+
+    /// Une fille naît de son écoute (`tcp_create_openreq_child`) : `sk_clone_lock` a copié
+    /// toute la `tcp_sock` de l'écoute, et la naissance n'en remet qu'une part. Une écoute
+    /// neuve n'a que les valeurs de `tcp_init_sock`, celles de `Tcb::vide` ; une écoute qui a
+    /// été une connexion (`connect`, AF_UNSPEC, puis `listen`) donne à ses filles ce que
+    /// celle-ci lui a laissé (`r`) et que la naissance ne remet pas : le réordonnancement, le
+    /// RTT vu du récepteur (la mesure, et la fenêtre chronométrée, d'une autre suite de
+    /// numéros : elle ne mesurera plus rien de juste avant d'en recommencer une, chez Linux
+    /// aussi), le débit livré retenu et les chronomètres, `timeout_rehash`, et l'heure du
+    /// prochain départ au rythme interne. Mesuré : la fille d'une telle écoute dit le
+    /// `tcpi_rcv_rtt`, le `tcpi_rehash`, le temps occupé et le débit livré (à son MSS) de la
+    /// connexion d'avant. Pas le plus petit RTT ni l'heure du dernier envoi (remis par la
+    /// naissance), ni le débit de l'envoi et `rcvq_space` (recalculés à l'établissement).
+    pub fn naitre_de(&mut self, r: &Restes) {
+        self.reordering = r.reordering;
+        self.rcv_rtt8 = r.rcv_rtt8;
+        self.rcv_rtt_seq = r.rcv_rtt_seq;
+        self.rcv_rtt_debut = r.rcv_rtt_debut;
+        self.mesures.heriter(&r.mesures);
+        self.rehash = r.rehash;
+        self.depart = r.depart;
     }
 
     /// Le MSS, sauf face à un récepteur minuscule : la moitié de la plus grande

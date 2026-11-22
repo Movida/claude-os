@@ -766,6 +766,43 @@ fn le_chronometre_d_une_socket_deconnectee() {
 }
 
 #[test]
+fn la_fille_d_une_ecoute_qui_a_ete_une_connexion() {
+    // La connexion d'avant : un RTT du récepteur, du temps occupé et un débit livré, des RTO
+    // qui ont changé le hachage, le réordonnancement, le rythme interne.
+    let mut c = etablie(true);
+    en_vol(&mut c, 2);
+    let ack = Tcp { ack: c.snd_nxt, ..segment(&c, 0, 0) };
+    c.recevoir(&ack, octets(0, 0), HEURE + 100 * MS);
+    c.rcv_rtt8 = 8 * 43_000;
+    c.rcv_rtt_seq = 12_345;
+    c.rehash = 2;
+    c.reordering = 6;
+    c.depart = HEURE + 500 * MS;
+    let r = c.restes().deconnecte(HEURE + 200 * MS);
+    let a = Info::sans_connexion(&r, HEURE + 300 * MS);
+    // Sa fille, comparée à celle d'une écoute neuve.
+    let neuve = fille(false);
+    let mut f = fille(false);
+    f.naitre_de(&r);
+    let (i, n) = (f.info(HEURE + 300 * MS), neuve.info(HEURE + 300 * MS));
+    assert_eq!((i.rcv_rtt, i.rehash, i.reordonnancement, i.occupe), (a.rcv_rtt, 2, 6, a.occupe));
+    assert!(i.rcv_rtt > 0 && i.occupe > 0);
+    assert_eq!(i.debit, r.mesures.debit(f.mss_borne()));
+    assert!(i.debit > 0);
+    assert_eq!((f.rcv_rtt_seq, f.depart), (12_345, HEURE + 500 * MS));
+    // Ce que la naissance remet, ou ce qui est à elle : comme la fille d'une écoute neuve.
+    assert_eq!(
+        (i.min_rtt, i.dernier_envoi, i.pacing, i.rcv_space, i.retransmissions, i.segs_out, i.total_retrans),
+        (n.min_rtt, n.dernier_envoi, n.pacing, n.rcv_space, n.retransmissions, n.segs_out, n.total_retrans)
+    );
+    // D'une écoute neuve : rien ne change.
+    let mut g = fille(false);
+    g.naitre_de(&Restes::NEUF.deconnecte(HEURE));
+    let j = g.info(HEURE + 300 * MS);
+    assert_eq!((j.rcv_rtt, j.rehash, j.reordonnancement, j.occupe, j.debit, g.depart), (0, 0, n.reordonnancement, 0, 0, 0));
+}
+
+#[test]
 fn la_reprise_d_une_socket() {
     // Ce que la connexion suivante reprend (mesuré : le plus petit RTT, le débit livré, le
     // rehachage), et ce qu'elle remet (les retransmissions).

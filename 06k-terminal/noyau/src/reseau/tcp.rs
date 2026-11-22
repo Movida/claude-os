@@ -2104,6 +2104,9 @@ impl Partie {
         let rcvbuf = moi.rcvbuf.load(Ordering::Relaxed) as usize;
         let echelle = itcp::echelle(rcvbuf, self.options.rcvbuf_fixe, reception_max(), self.options.window_clamp);
         let mut tcb = tcb_de_syn(place, &h, iss, mss, rcvbuf, moi.sndbuf.load(Ordering::Relaxed) as usize, echelle);
+        // Ce que l'écoute garde d'une connexion passée, s'il y en a eu une (`sk_clone_lock`
+        // copie sa `tcp_sock`, et la naissance n'en remet qu'une part).
+        tcb.naitre_de(&self.options.hors_connexion);
         tcb.poser_mss_utilisateur(self.options.maxseg);
         tcb.poser_options_ip(options.longueur);
         tcb.window_clamp = self.options.window_clamp;

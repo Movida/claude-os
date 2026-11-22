@@ -44,8 +44,9 @@
  *   - TCP_INFO jusqu'au bout : les compteurs, le débit livré, les chronomètres ;
  *   - les files d'une connexion finie (SIOCOUTQ, SIOCOUTQNSD, `tcpi_notsent_bytes`, le
  *     chronomètre qui court encore après un RST) et celles de /proc/net/tcp (le SYN, le FIN) ;
- *   - ce que la socket garde d'une connexion défaite (TCP_INFO, SIOCOUTQ), et ce que la
- *     suivante en reprend ; `tcpi_rehash`, les RTO d'un SYN sans réponse ;
+ *   - ce que la socket garde d'une connexion défaite (TCP_INFO, SIOCOUTQ), ce que la
+ *     suivante en reprend, et ce qu'en ont les filles d'une écoute faite après ;
+ *     `tcpi_rehash`, les RTO d'un SYN sans réponse ;
  *   - les coupures : un FIN puis un RST, shutdown en SYN_SENT et d'une écoute,
  *     connect(AF_UNSPEC), le connect qui suit une erreur ; les lectures sans copie
  *     ni retrait ; une connexion morte qui garde son port, le SO_REUSEADDR des filles ;
@@ -2012,8 +2013,8 @@ static void files_d_une_connexion_finie(void)
 
 /* Les champs de `struct tcp_info` que lit `ce_que_garde_la_socket`, en plus de l'énumération
  * plus haut. */
-enum { RCV_MSS = 20, LAST_DATA_RECV = 52, RCV_SSTHRESH = 64, REORDERING = 88, RCV_SPACE = 96, PACING = 104, MIN_RTT = 148,
-       SND_WND = 228, RCV_WND = 232, REHASH = 236 };
+enum { RCV_MSS = 20, LAST_DATA_RECV = 52, RCV_SSTHRESH = 64, REORDERING = 88, RCV_RTT = 92, RCV_SPACE = 96, PACING = 104,
+       MIN_RTT = 148, SND_WND = 228, RCV_WND = 232, REHASH = 236 };
 
 static unsigned octet_info(int s, int decalage)
 {
@@ -2023,13 +2024,25 @@ static unsigned octet_info(int s, int decalage)
     return b[decalage];
 }
 
+/* Une fille de l'écoute `l` (un client neuf, qui reste dans *client). */
+static int fille_de(int l, int *client)
+{
+    struct sockaddr_in x = lo(port_de(l));
+    *client = socket(AF_INET, SOCK_STREAM, 0);
+    connect(*client, (void *)&x, sizeof x);
+    return accept(l, NULL, NULL);
+}
+
 /* Ce que la socket garde d'une connexion défaite (`tcp_disconnect` ne le remet pas, mesuré sous
  * Linux 6.18) : les retransmissions de la dernière série, la fenêtre de l'autre et la nôtre, ce qui
  * bornait celle-ci, `rcvq_space`, le débit de l'envoi, le plus petit RTT, le débit livré (limité
  * par le programme désormais), `timeout_rehash` ; et ce qu'elle remet (`rcv_mss` 88, l'heure de la
  * dernière réception). La suite des numéros saute de la plus grande fenêtre de l'autre, plus 2, à
  * chaque déconnexion (`tcpi_notsent_bytes`, SIOCOUTQ). La connexion suivante reprend le plus petit
- * RTT. Une écoute après garde le débit de l'envoi. */
+ * RTT. Une écoute après garde le débit de l'envoi ; ses filles naissent avec ce que la connexion
+ * d'avant lui a laissé et que `tcp_create_openreq_child` ne remet pas (`sk_clone_lock` copie la
+ * `tcp_sock` de l'écoute) : le RTT vu du récepteur, le temps occupé, le débit livré,
+ * `timeout_rehash`. */
 static void ce_que_garde_la_socket(void)
 {
     int port, l = ecoute(&port, 4);
@@ -2099,8 +2112,52 @@ static void ce_que_garde_la_socket(void)
     verifier(rehash >= 1 && rto == rehash && retrans == rehash && champ(c, REHASH) == rehash && octet_info(c, 2) == retrans
                  && (champ(c, TOTAL_RTO) & 0xffff) == 0,
              "SYN sans reponse : tcpi_rehash suit les RTO ; AF_UNSPEC le garde, et les retransmissions");
+    fcntl(c, F_SETFL, 0);
+    listen(c, 1);
+    int client, nee = fille_de(c, &client);
+    verifier(nee >= 0 && champ(nee, REHASH) == rehash && octet_info(nee, 2) == 0,
+             "la fille d'une ecoute qui a ete une connexion : son tcpi_rehash, pas ses retransmissions");
+    close(nee);
+    close(client);
     close(c);
     close(d);
+    close(l);
+    /* Une connexion qui a eu de quoi s'occuper (des mégaoctets dans un sens, que l'autre tarde
+     * à lire : du temps occupé ; des réponses : un débit livré, un RTT vu du récepteur), défaite,
+     * puis une écoute : sa fille les a, celle d'une écoute neuve non. L'attente vient entre
+     * l'écriture et la lecture : le chronomètre compte en jiffies entiers (`tcp_chrono_set`), et
+     * sur lo un mégaoctet lu aussitôt passe en moins d'un tic (4 ms à HZ=250) ; 30 ms où la
+     * fenêtre de l'autre retient les données comptent sûrement (`TCP_CHRONO_RWND_LIMITED`). La
+     * file d'envoi les tient toutes sans lecteur (2 626 560 octets sur lo, `tcp_sndbuf_expand`). */
+    l = ecoute(&port, 4);
+    x = lo(port);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&x, sizeof x);
+    a = accept(l, NULL, NULL);
+    static char m[1 << 20];
+    ok = 1;
+    for (int k = 0; k < 4 && ok; k++) {
+        ok = write(c, m, sizeof m) == (long)sizeof m;
+        attendre_ms(30);
+        ok &= recv(a, m, sizeof m, MSG_WAITALL) == (long)sizeof m && write(a, m, 200000) == 200000
+              && recv(c, m, 200000, MSG_WAITALL) == 200000;
+    }
+    connect(c, &u, sizeof u);
+    uint64_t occupe = champ64(c, BUSY);
+    uint32_t rcv_rtt = champ(c, RCV_RTT);
+    listen(c, 1);
+    int client_neuve, nee_neuve = fille_de(l, &client_neuve);
+    nee = fille_de(c, &client);
+    verifier(ok && nee >= 0 && occupe > 0 && rcv_rtt > 0 && champ64(nee, BUSY) == occupe && champ(nee, RCV_RTT) == rcv_rtt
+                 && champ64(nee, DELIVERY_RATE) > 0 && champ64(nee_neuve, BUSY) == 0 && champ64(nee_neuve, DELIVERY_RATE) == 0
+                 && champ(nee_neuve, RCV_RTT) == 0,
+             "la fille d'une ecoute qui a ete une connexion : son temps occupe, son debit livre, son RTT du recepteur");
+    close(nee);
+    close(client);
+    close(nee_neuve);
+    close(client_neuve);
+    close(a);
+    close(c);
     close(l);
 }
 

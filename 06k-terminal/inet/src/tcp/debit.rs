@@ -124,6 +124,17 @@ impl Mesures {
         ((stat[0] + stat[1] + stat[2]) * us, stat[1] * us, stat[2] * us)
     }
 
+    /// Une fille naît d'une écoute qui a été une connexion (`Tcb::naitre_de`) : de ses
+    /// mesures, ce que la déconnexion a laissé (`restes`), que la naissance ne remet pas ;
+    /// ses compteurs à elle restent.
+    pub(super) fn heriter(&mut self, r: &Mesures) {
+        self.rate_livres = r.rate_livres;
+        self.rate_intervalle = r.rate_intervalle;
+        self.chrono = r.chrono;
+        self.chrono_debut = r.chrono_debut;
+        self.chrono_stat = r.chrono_stat;
+    }
+
     /// Ce que `tcp_disconnect` laisse des mesures, et que la connexion suivante reprend : le
     /// débit retenu (`rate_delivered`, `rate_interval_us` : jusqu'au premier échantillon neuf)
     /// et les chronomètres (`chrono_*`, qui peuvent courir encore). Le reste repart de zéro,
