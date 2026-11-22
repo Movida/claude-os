@@ -66,7 +66,16 @@
  *     pas une socket AF_UNIX), sauf avec OPT_RX_FILTER (la file d'erreurs, si) ; un
  *     datagramme arrivé quand personne ne voulait d'heure n'en a pas : SO_TIMESTAMP le
  *     dit à l'heure de sa lecture, et SCM_TIMESTAMPING avec elle ; la fille d'une
- *     écoute TCP en hérite, et compte dans la clé (toutes fermées, plus d'heure).
+ *     écoute TCP en hérite, et compte dans la clé (toutes fermées, plus d'heure) ;
+ *   - SO_TIMESTAMPING, à l'émission d'UDP et de ping : une entrée par point demandé
+ *     (SCHED puis SND), dans la file d'erreurs dès le retour de l'envoi par lo (POLLERR
+ *     seul), avec la trame entière (en-tête Ethernet nul de lo, puis IP), sans
+ *     adresse, l'heure avec SOFTWARE ; OPT_ID (une clé par envoi qui demande un point,
+ *     TX_HARDWARE et TX_COMPLETION compris, pas TX_ACK ; remise à zéro quand OPT_ID se
+ *     pose), OPT_TSONLY (sans octets), OPT_CMSG (IP_PKTINFO, IP_TTL, IP_TOS,
+ *     IP_ORIGDSTADDR du paquet, et sa source comme SO_EE_OFFENDER) ; le bouchon garde
+ *     les drapeaux de son premier envoi ; les messages de contrôle SO_TIMESTAMPING et
+ *     SCM_TS_OPT_ID (et leurs refus) ; MSG_TRUNC ; SO_RCVBUF borne la file.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -139,6 +148,12 @@
 #define TSF_OPT_ID_TCP (1 << 16)
 #define TSF_OPT_RX_FILTER (1 << 17)
 #define TSF_TX_COMPLETION (1 << 18)
+#define TSF_TX_HARDWARE (1 << 0)
+#define TSF_TX_SOFTWARE (1 << 1)
+#define TSF_TX_SCHED (1 << 8)
+#define TSF_TX_ACK (1 << 9)
+#define TSF_OPT_CMSG (1 << 10)
+#define SCM_TS_OPT_ID_ 81
 #define SIOCGSTAMP_OLD_ 0x8906
 #define SIOCGSTAMPNS_OLD_ 0x8907
 
@@ -1862,6 +1877,289 @@ static void horodatages_fille(void)
     verifier(ok, "SO_TIMESTAMPING d'une ecoute TCP : sa fille l'herite, et compte dans la cle (toutes fermees, plus d'heure)");
 }
 
+/* --- L'émission horodatée. --- */
+
+/* Une entrée de la file d'erreurs : ce que rend recvmsg (ou -errno), msg_flags,
+ * msg_namelen, ses messages de contrôle dans l'ordre (niveau * 1000 + sorte), et ce
+ * qu'ils disent : l'heure (SCM_TIMESTAMPING récent), IP_PKTINFO, un entier IP (TTL),
+ * un octet (TOS), le port d'IP_ORIGDSTADDR, la sock_extended_err et SO_EE_OFFENDER. */
+struct entree {
+    int r, flags, nom, n, sortes[8], heure, ttl, tos, port;
+    struct in_pktinfo pkt;
+    unsigned ee_errno, ee_origin, ee_info, ee_data, famille, offender;
+    unsigned char o[128];
+};
+
+static int lire_entree(int s, struct entree *e, size_t place)
+{
+    char ctl[512];
+    struct sockaddr_in a;
+    memset(e, 0, sizeof *e);
+    struct iovec io = {e->o, place};
+    struct msghdr m = {&a, sizeof a, &io, 1, ctl, sizeof ctl, 0};
+    e->r = recvmsg(s, &m, MSG_ERRQUEUE | MSG_DONTWAIT);
+    if (e->r < 0)
+        return e->r = -errno;
+    e->flags = m.msg_flags, e->nom = m.msg_namelen;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c && e->n < 8; c = CMSG_NXTHDR(&m, c)) {
+        unsigned char *d = CMSG_DATA(c);
+        int l = c->cmsg_len - CMSG_LEN(0);
+        e->sortes[e->n++] = c->cmsg_level * 1000 + c->cmsg_type;
+        if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == TSG_OLD) {
+            struct vu v = {SOL_SOCKET, TSG_OLD, l, 0, 0, 0};
+            memcpy(&v.a, d, 8), memcpy(&v.b, d + 8, 8);
+            for (int i = 16; i < l && i < 48; i++)
+                v.reste |= d[i];
+            e->heure = heures_ok(&v, TSG_OLD, 0, 5000);
+        } else if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_PKTINFO) {
+            memcpy(&e->pkt, d, sizeof e->pkt);
+        } else if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_TTL) {
+            memcpy(&e->ttl, d, 4);
+        } else if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_TOS) {
+            e->tos = d[0];
+        } else if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_ORIGDSTADDR) {
+            e->port = ntohs(((struct sockaddr_in *)d)->sin_port);
+        } else if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_RECVERR) {
+            uint32_t w[4];
+            memcpy(w, d, 16);
+            e->ee_errno = w[0], e->ee_origin = d[4], e->ee_info = w[2], e->ee_data = w[3];
+            struct sockaddr_in f;
+            memcpy(&f, d + 16, sizeof f);
+            e->famille = f.sin_family, e->offender = f.sin_addr.s_addr;
+        }
+    }
+    return e->r;
+}
+
+/* Les messages de contrôle de `e` sont-ils, dans l'ordre, les `n` de `sortes` ? */
+static int sortes_ok(const struct entree *e, int n, const int *sortes)
+{
+    if (e->n != n)
+        return 0;
+    for (int i = 0; i < n; i++)
+        if (e->sortes[i] != sortes[i])
+            return 0;
+    return 1;
+}
+
+#define S_TS (SOL_SOCKET * 1000 + TSG_OLD)
+#define S_PKT IP_PKTINFO
+#define S_ERR IP_RECVERR
+
+/* Une entrée d'horodatage : sa longueur `r`, sans adresse, MSG_ERRQUEUE, ENOMSG
+ * d'origine SO_EE_ORIGIN_TIMESTAMPING, son point `info`, sa clé `data`. */
+static int horodatage_ok(const struct entree *e, int r, unsigned info, unsigned data)
+{
+    return e->r == r && e->nom == 0 && e->flags == MSG_ERRQUEUE && e->ee_errno == ENOMSG && e->ee_origin == 4
+        && e->ee_info == info && e->ee_data == data;
+}
+
+/* La trame de lo d'un datagramme UDP de données `d` (n octets) : 12 octets nuls, le
+ * type IPv4, l'en-tête IP, les données à la fin. */
+static int trame_ok(const struct entree *e, const char *d, int n)
+{
+    static const unsigned char nul[12];
+    return e->r == 14 + 20 + 8 + n && !memcmp(e->o, nul, 12) && e->o[12] == 8 && e->o[13] == 0 && e->o[14] == 0x45
+        && e->o[23] == IPPROTO_UDP && !memcmp(e->o + e->r - n, d, n);
+}
+
+/* Un envoi « abc » puis « defg » vers `a` par une socket UDP neuve aux drapeaux `f`
+ * (et `options` IP à 1, une liste finie par 0) ; ce que poll dit de POLLIN|POLLPRI. */
+static int udp_horodatee(const struct sockaddr_in *a, int f, const int *options, short *poll_vu)
+{
+    struct sockaddr_in b;
+    int s = udp_lie(&b), un = 1;
+    for (; options && *options; options++)
+        setsockopt(s, IPPROTO_IP, *options, &un, sizeof un);
+    poser(s, TSG_OLD, f);
+    sendto(s, "abc", 3, 0, (void *)a, sizeof *a);
+    sendto(s, "defg", 4, 0, (void *)a, sizeof *a);
+    struct pollfd p = {s, POLLIN | POLLPRI, 0};
+    poll(&p, 1, 0);
+    *poll_vu = p.revents;
+    return s;
+}
+
+static void horodatages_emission_udp(void)
+{
+    struct sockaddr_in a;
+    struct entree e[4];
+    short p;
+    int r = udp_lie(&a);
+    /* SND, avec et sans SOFTWARE : là dès le retour de sendto. */
+    int s = udp_horodatee(&a, TSF_TX_SOFTWARE | TSF_SOFTWARE, NULL, &p);
+    int ok = p == POLLERR;
+    for (int i = 0; i < 3; i++)
+        lire_entree(s, &e[i], 128);
+    ok &= horodatage_ok(&e[0], 45, 0, 0) && trame_ok(&e[0], "abc", 3) && e[0].heure && sortes_ok(&e[0], 2, (int[]){S_TS, S_ERR})
+        && e[0].famille == 0 && horodatage_ok(&e[1], 46, 0, 0) && trame_ok(&e[1], "defg", 4) && e[2].r == -EAGAIN;
+    close(s);
+    s = udp_horodatee(&a, TSF_TX_SOFTWARE, NULL, &p);
+    lire_entree(s, &e[0], 128);
+    ok &= p == POLLERR && horodatage_ok(&e[0], 45, 0, 0) && sortes_ok(&e[0], 1, (int[]){S_ERR});
+    close(s);
+    verifier(ok, "SO_TIMESTAMPING TX_SOFTWARE UDP : SND des le retour de sendto (POLLERR), la trame de lo, sans adresse, l'heure avec SOFTWARE");
+    /* SCHED puis SND, OPT_ID ; OPT_TSONLY. */
+    s = udp_horodatee(&a, TSF_TX_SOFTWARE | TSF_TX_SCHED | TSF_SOFTWARE | TSF_OPT_ID, NULL, &p);
+    for (int i = 0; i < 4; i++)
+        lire_entree(s, &e[i], 128);
+    ok = horodatage_ok(&e[0], 45, 1, 0) && horodatage_ok(&e[1], 45, 0, 0) && !memcmp(e[0].o, e[1].o, 45)
+        && horodatage_ok(&e[2], 46, 1, 1) && horodatage_ok(&e[3], 46, 0, 1) && lire_entree(s, &e[0], 128) == -EAGAIN;
+    close(s);
+    s = udp_horodatee(&a, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_ID | TSF_OPT_TSONLY, NULL, &p);
+    lire_entree(s, &e[0], 128), lire_entree(s, &e[1], 128);
+    ok &= horodatage_ok(&e[0], 0, 0, 0) && e[0].heure && horodatage_ok(&e[1], 0, 0, 1);
+    close(s);
+    verifier(ok, "SO_TIMESTAMPING UDP : SCHED puis SND, la meme trame ; OPT_ID, une cle par envoi ; OPT_TSONLY, sans octets");
+    /* OPT_CMSG : les messages IP du paquet, sa source comme SO_EE_OFFENDER ; rien avec OPT_TSONLY. */
+    int tous[] = {IP_PKTINFO, IP_RECVTTL, IP_RECVTOS, IP_RECVORIGDSTADDR, IP_CHECKSUM, IP_RECVOPTS, IP_RETOPTS, IP_RECVFRAGSIZE, 0};
+    struct sockaddr_in b;
+    s = udp_lie(&b);
+    int tos = 0x10, un = 1;
+    setsockopt(s, IPPROTO_IP, IP_TOS, &tos, sizeof tos);
+    for (int *o = tous; *o; o++)
+        setsockopt(s, IPPROTO_IP, *o, &un, sizeof un);
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_CMSG);
+    sendto(s, "abc", 3, 0, (void *)&a, sizeof a);
+    lire_entree(s, &e[0], 128);
+    ok = horodatage_ok(&e[0], 45, 0, 0) && sortes_ok(&e[0], 6, (int[]){S_TS, S_PKT, IP_TTL, IP_TOS, IP_ORIGDSTADDR, S_ERR})
+        && e[0].pkt.ipi_ifindex == 1 && e[0].pkt.ipi_spec_dst.s_addr == htonl(INADDR_LOOPBACK)
+        && e[0].pkt.ipi_addr.s_addr == htonl(INADDR_LOOPBACK) && e[0].ttl == 64 && e[0].tos == 0x10
+        && e[0].port == ntohs(a.sin_port) && e[0].famille == AF_INET && e[0].offender == htonl(INADDR_LOOPBACK);
+    close(s);
+    s = udp_horodatee(&a, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_CMSG, NULL, &p);
+    lire_entree(s, &e[0], 128);
+    ok &= sortes_ok(&e[0], 2, (int[]){S_TS, S_ERR}) && e[0].famille == AF_INET;
+    close(s);
+    s = udp_horodatee(&a, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_CMSG | TSF_OPT_TSONLY, (int[]){IP_PKTINFO, 0}, &p);
+    lire_entree(s, &e[0], 128);
+    ok &= horodatage_ok(&e[0], 0, 0, 0) && sortes_ok(&e[0], 2, (int[]){S_TS, S_ERR}) && e[0].famille == 0;
+    close(s);
+    verifier(ok, "SO_TIMESTAMPING OPT_CMSG UDP : IP_PKTINFO, IP_TTL, IP_TOS, IP_ORIGDSTADDR du paquet, sa source en SO_EE_OFFENDER ; rien avec OPT_TSONLY");
+    /* TX_ACK ne vaut pas pour UDP ; les clés : TX_HARDWARE et TX_COMPLETION en prennent,
+     * pas TX_ACK ni SOFTWARE seul ; OPT_ID qui se pose les remet à zéro. */
+    s = udp_horodatee(&a, TSF_TX_ACK | TSF_SOFTWARE, NULL, &p);
+    ok = p == 0 && lire_entree(s, &e[0], 128) == -EAGAIN;
+    close(s);
+    s = udp_lie(&b);
+    int suite[] = {TSF_TX_HARDWARE, TSF_TX_HARDWARE, TSF_TX_COMPLETION, TSF_TX_ACK, TSF_SOFTWARE, TSF_TX_SOFTWARE | TSF_OPT_TSONLY};
+    for (int i = 0; i < 6; i++) {
+        poser(s, TSG_OLD, suite[i] | TSF_OPT_ID);
+        sendto(s, "a", 1, 0, (void *)&a, sizeof a);
+    }
+    lire_entree(s, &e[0], 128);
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_OPT_TSONLY);
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_OPT_TSONLY | TSF_OPT_ID);
+    sendto(s, "a", 1, 0, (void *)&a, sizeof a);
+    lire_entree(s, &e[1], 128);
+    ok &= horodatage_ok(&e[0], 0, 0, 3) && horodatage_ok(&e[1], 0, 0, 0) && lire_entree(s, &e[2], 128) == -EAGAIN;
+    close(s);
+    verifier(ok, "SO_TIMESTAMPING UDP : TX_ACK sans effet ; les cles d'OPT_ID (TX_HARDWARE, TX_COMPLETION en prennent), remises a zero");
+    /* Le bouchon : les drapeaux de son premier envoi, ses octets ensemble ; MSG_TRUNC. */
+    s = udp_lie(&b);
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_ID);
+    sendto(s, "abc", 3, MSG_MORE, (void *)&a, sizeof a);
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_SCHED | TSF_SOFTWARE | TSF_OPT_ID);
+    sendto(s, "de", 2, 0, (void *)&a, sizeof a);
+    sendto(s, "f", 1, 0, (void *)&a, sizeof a);
+    for (int i = 0; i < 4; i++)
+        lire_entree(s, &e[i], i == 0 ? 128 : 10);
+    ok = horodatage_ok(&e[0], 47, 0, 0) && trame_ok(&e[0], "abcde", 5) && e[1].r == 10 && e[1].flags == (MSG_ERRQUEUE | MSG_TRUNC)
+        && e[1].ee_info == 1 && e[1].ee_data == 1 && e[2].r == 10 && e[2].ee_info == 0 && e[3].r == -EAGAIN;
+    close(s);
+    verifier(ok, "SO_TIMESTAMPING UDP : le bouchon garde les drapeaux de son premier envoi ; MSG_TRUNC");
+    /* SO_RCVBUF borne la file (sock_queue_err_skb) : de douze entrées, quelques-unes. */
+    s = udp_lie(&b);
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_SCHED);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &un, sizeof un);
+    for (int i = 0; i < 6; i++)
+        sendto(s, "abc", 3, 0, (void *)&a, sizeof a);
+    int n = 0;
+    while (lire_entree(s, &e[0], 128) > 0)
+        n++;
+    close(s);
+    char quoi[96];
+    snprintf(quoi, sizeof quoi, "SO_TIMESTAMPING UDP : SO_RCVBUF borne la file, %d entrees de 12", n);
+    verifier(n >= 1 && n <= 3, quoi);
+    /* Une entrée sans octets (OPT_TSONLY) : la même mémoire pour chacune (la tête vide
+     * d'un paquet), rendue à la lecture ; SO_RCVBUF en garde ce qui y tient. */
+    s = udp_lie(&b);
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_TSONLY);
+    sendto(s, "abc", 3, 0, (void *)&a, sizeof a);
+    unsigned une = compteur(s, RMEM);
+    sendto(s, "abc", 3, 0, (void *)&a, sizeof a);
+    sendto(s, "abc", 3, 0, (void *)&a, sizeof a);
+    unsigned trois = compteur(s, RMEM);
+    n = 0;
+    while (lire_entree(s, &e[0], 128) == 0)
+        n++;
+    ok = une > 0 && trois == 3 * une && n == 3 && compteur(s, RMEM) == 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &un, sizeof un);
+    int rcvbuf = compteur(s, RCVBUF), tenues = 0;
+    for (int i = 0; i < 12; i++)
+        sendto(s, "abc", 3, 0, (void *)&a, sizeof a);
+    while (lire_entree(s, &e[0], 128) == 0)
+        tenues++;
+    close(s);
+    printf("[linux] options-socket : SO_TIMESTAMPING UDP, OPT_TSONLY : %u octets par entree, %d gardees sous SO_RCVBUF %d\n", une, tenues, rcvbuf);
+    verifier(ok && tenues == (rcvbuf - 1) / (int)une,
+             "SO_TIMESTAMPING UDP : une entree OPT_TSONLY compte la tete vide d'un paquet, rendue a la lecture, sous SO_RCVBUF");
+    /* Les messages de contrôle : SO_TIMESTAMPING (_OLD ou _NEW, les drapeaux d'émission
+     * seulement, 4 octets) et SCM_TS_OPT_ID (4 octets, OPT_ID posé, pas TCP). */
+    s = udp_lie(&b);
+    poser(s, TSG_OLD, TSF_SOFTWARE | TSF_OPT_ID | TSF_OPT_TSONLY);
+    int deux[2] = {TSF_TX_SOFTWARE, 0};
+    char ctl[2 * CMSG_SPACE(4)];
+    memset(ctl, 0, sizeof ctl);
+    struct iovec io = {"x", 1};
+    struct msghdr m = {&a, sizeof a, &io, 1, ctl, sizeof ctl, 0};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+    c->cmsg_level = SOL_SOCKET, c->cmsg_type = TSG_NEW, c->cmsg_len = CMSG_LEN(4);
+    memcpy(CMSG_DATA(c), &deux[0], 4);
+    c = CMSG_NXTHDR(&m, c);
+    c->cmsg_level = SOL_SOCKET, c->cmsg_type = SCM_TS_OPT_ID_, c->cmsg_len = CMSG_LEN(4);
+    memcpy(CMSG_DATA(c), &(int){1234}, 4);
+    ok = sendmsg(s, &m, 0) == 1;
+    ok &= envoyer_avec(s, &a, SOL_SOCKET, TSG_OLD, TSF_TX_SOFTWARE) == 0;
+    ok &= envoyer_avec(s, &a, SOL_SOCKET, TSG_OLD, TSF_TX_ACK | TSF_TX_COMPLETION | TSF_TX_HARDWARE) == 0;
+    ok &= envoyer_avec(s, &a, SOL_SOCKET, TSG_OLD, TSF_SOFTWARE) == EINVAL;
+    ok &= envoyer_avec(s, &a, -1, 0, 0) == 0;
+    lire_entree(s, &e[0], 128), lire_entree(s, &e[1], 128);
+    ok &= horodatage_ok(&e[0], 0, 0, 1234) && horodatage_ok(&e[1], 0, 0, 0) && lire_entree(s, &e[2], 128) == -EAGAIN;
+    poser(s, TSG_OLD, TSF_SOFTWARE);
+    ok &= envoyer_avec(s, &a, SOL_SOCKET, SCM_TS_OPT_ID_, 5) == EINVAL;
+    close(s);
+    int l = socket(AF_INET, SOCK_STREAM, 0), t = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in la;
+    lier_tcp(l, &la), listen(l, 1), connect(t, (void *)&la, sizeof la);
+    poser(t, TSG_OLD, TSF_SOFTWARE | TSF_OPT_ID);
+    ok &= envoyer_avec(t, NULL, SOL_SOCKET, SCM_TS_OPT_ID_, 5) == EINVAL;
+    close(t), close(l);
+    verifier(ok, "SO_TIMESTAMPING a l'envoi : son message de controle (les drapeaux d'emission seuls) et SCM_TS_OPT_ID (OPT_ID pose, pas TCP)");
+    while (recv(r, (char[64]){0}, 64, MSG_DONTWAIT) > 0)
+        ;
+    close(r);
+}
+
+/* Ping : SND, la trame de l'écho. */
+static void horodatages_emission_ping(void)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP), un = 1;
+    struct entree e[2];
+    setsockopt(s, IPPROTO_IP, IP_RECVORIGDSTADDR, &un, sizeof un);
+    setsockopt(s, IPPROTO_IP, IP_RECVTTL, &un, sizeof un);
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_ID | TSF_OPT_CMSG);
+    unsigned char echo[8] = {8, 0, 0, 0, 0, 0, 0, 1};
+    struct sockaddr_in l = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    sendto(s, echo, 8, 0, (void *)&l, sizeof l);
+    lire_entree(s, &e[0], 128);
+    int ok = horodatage_ok(&e[0], 42, 0, 0) && e[0].o[23] == IPPROTO_ICMP && e[0].o[34] == 8
+        && sortes_ok(&e[0], 4, (int[]){S_TS, IP_TTL, IP_ORIGDSTADDR, S_ERR}) && e[0].port == (e[0].o[36] << 8 | e[0].o[37])
+        && lire_entree(s, &e[1], 128) == -EAGAIN;
+    close(s);
+    verifier(ok, "SO_TIMESTAMPING ping : SND, la trame de l'echo, OPT_ID, OPT_CMSG (IP_ORIGDSTADDR : la somme de l'ICMP)");
+}
+
 /* Ce que poll dit prêt, sans attendre. */
 static int pret(int s)
 {
@@ -1879,6 +2177,25 @@ static int udp_refusee(int recverr, int select_err_queue)
     poser(s, SO_SELECT_ERR_QUEUE, select_err_queue);
     connect(s, (void *)&a, sizeof a);
     return s;
+}
+
+/* IP_RECVERR remis à 0 vide la file d'erreurs, sauf les horodatages
+ * (`skb_errqueue_purge`) : l'erreur ICMP part, l'entrée SND reste, et l'erreur en
+ * attente aussi. */
+static void horodatages_purge(void)
+{
+    int s = udp_refusee(1, 0), zero = 0, err = 0;
+    socklen_t l = sizeof err;
+    struct entree e[2];
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_TSONLY);
+    int ok = send(s, "b", 1, 0) == 1;
+    usleep(20000);
+    setsockopt(s, IPPROTO_IP, IP_RECVERR, &zero, sizeof zero);
+    lire_entree(s, &e[0], 64);
+    ok &= horodatage_ok(&e[0], 0, 0, 0) && lire_entree(s, &e[1], 64) == -EAGAIN;
+    ok &= getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &l) == 0 && err == ECONNREFUSED;
+    close(s);
+    verifier(ok, "IP_RECVERR remis a 0 : l'erreur ICMP partie, l'horodatage SND garde, SO_ERROR encore ECONNREFUSED");
 }
 
 /* Le fil qui envoie 200 ms plus tard, pendant l'attente de l'autre : l'erreur arrive
@@ -2030,6 +2347,9 @@ int main(void)
     horodatages_option();
     horodatages_reception();
     horodatages_fille();
+    horodatages_emission_udp();
+    horodatages_emission_ping();
+    horodatages_purge();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

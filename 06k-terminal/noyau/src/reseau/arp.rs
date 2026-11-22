@@ -86,6 +86,10 @@ fn faire(a: Action<Paquet>) {
 /// `confirmer` : MSG_CONFIRM, la machine est là.
 pub fn envoyer(i: &'static Interface, prochain: [u8; 4], p: Paquet, confirmer: bool) {
     let taille = p.taille_vraie();
+    // Le contexte réseau autour du verrou des voisins : ce que l'émission y
+    // laisse pour les sockets (les entrées d'horodatage, horodatage.rs) ne
+    // leur est livré qu'après lui.
+    let contexte = super::contexte::entrer();
     let mut v = VOISINS.verrouiller();
     // Une résolution a pu commencer : la tâche du réseau saura quand y
     // revenir (ses échéances, tache.rs). L'échéance de la table s'inscrit
@@ -100,6 +104,7 @@ pub fn envoyer(i: &'static Interface, prochain: [u8; 4], p: Paquet, confirmer: b
         None => return faire(Action::Jeter { paquet: p, echec: false }),
     };
     drop(v);
+    drop(contexte);
     if plus_tot {
         super::tache::reveiller();
     }

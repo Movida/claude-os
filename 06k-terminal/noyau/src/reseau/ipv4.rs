@@ -840,6 +840,7 @@ fn fragmenter(c: Chemin, e: &Envoi, options: &[u8], mut p: Paquet) {
     suite.copy_from_slice(options);
     ipv4::options_de_fragment(suite);
     let mut debut = 0;
+    let mut demande = p.prendre_demande();
     let donnees = p.donnees();
     while debut < donnees.len() {
         let reste = donnees.len() - debut;
@@ -848,9 +849,14 @@ fn fragmenter(c: Chemin, e: &Envoi, options: &[u8], mut p: Paquet) {
         // La marque et la priorité du paquet (`ip_copy_metadata`).
         q.poser_contexte(p.contexte());
         // Chaque morceau compte dans le SO_SNDBUF de la socket, comme le
-        // paquet entier (`__ip_append_data` les lui attache un à un).
+        // paquet entier (`__ip_append_data` les lui attache un à un) ; seul
+        // le premier est horodaté (« only the initial fragment is time
+        // stamped »).
         if let Some(r) = p.retenue() {
             q.attacher(r, 0);
+        }
+        if let Some(d) = demande.take() {
+            q.poser_demande(d);
         }
         let Some(o) = q.ajouter_fin(longueur) else { return MIB.ip(Ip::FragFails) };
         o.copy_from_slice(&donnees[debut..debut + longueur]);

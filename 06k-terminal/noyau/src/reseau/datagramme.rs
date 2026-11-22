@@ -275,6 +275,11 @@ pub struct Controle {
     /// à la place de ceux de la socket ; IP_TOS donne aussi la priorité.
     pub marque: Option<u32>,
     pub priorite: Option<u32>,
+    /// SO_TIMESTAMPING de cet envoi : ses drapeaux d'émission, à la place de
+    /// ceux de la socket (le `sockc.tsflags` de son `ipcm_cookie`) ; et
+    /// SCM_TS_OPT_ID, sa clé (horodatage.rs).
+    pub horodatage: Option<u32>,
+    pub ts_opt_id: Option<u32>,
 }
 
 /// Ce que donne la route d'un envoi ou d'une connexion.
@@ -375,6 +380,11 @@ pub struct Depart {
     /// (`ip_setup_cork`), qui garde son `Depart`.
     marque: u32,
     priorite: u32,
+    /// Les drapeaux d'émission de SO_TIMESTAMPING (ceux de la socket, ou de
+    /// son message de contrôle) et la clé de SCM_TS_OPT_ID : ceux du premier
+    /// envoi d'un bouchon aussi (`ip_setup_cork`, `sock_tx_timestamp`).
+    horodatage: u32,
+    ts_opt_id: Option<u32>,
 }
 
 impl Depart {
@@ -511,6 +521,7 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
         ttl: c.ttl, tos: c.tos, confirmer: drapeaux & MSG_CONFIRM != 0, options,
         destination_finale: if p.route_source != 0 { destination } else { premiere },
         marque: c.marque.unwrap_or(inet.options.mark), priorite: c.priorite.unwrap_or(inet.options.priority),
+        horodatage: c.horodatage.unwrap_or(s.tsflags.load(Ordering::Relaxed)) & socket::SOF_TX_RECORD_MASK, ts_opt_id: c.ts_opt_id,
     };
     if drapeaux & MSG_PROBE != 0 {
         return Ok(d);
@@ -534,8 +545,9 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
 /// `remplir` y copie ceux du programme), commun à UDP et ping : la place
 /// dans SO_SNDBUF (`attendre_place`), les morceaux au-delà de son double
 /// (`morceaux_permis`), le paquet (ENOBUFS) attaché à la socket, la copie
-/// (EFAULT). Chaque refus jette le paquet (OutDiscards).
-pub fn faire_paquet(s: &Socket, d: &Depart, charge: usize, pmtudisc: u8, non_bloquant: bool, delai: Option<u64>,
+/// (EFAULT), puis ce qu'il demande d'horodater, et sa clé. Chaque refus jette
+/// le paquet (OutDiscards).
+pub fn faire_paquet(s: &Arc<Socket>, d: &Depart, charge: usize, pmtudisc: u8, non_bloquant: bool, delai: Option<u64>,
                     remplir: impl FnOnce(&mut [u8]) -> Result<(), i64>) -> Result<Paquet, i64> {
     const ENOBUFS: i64 = 105;
     attendre_place(s, non_bloquant, delai)?;
@@ -545,6 +557,7 @@ pub fn faire_paquet(s: &Socket, d: &Depart, charge: usize, pmtudisc: u8, non_blo
     attacher(s, &mut p);
     let Some(segment) = p.ajouter_fin(charge) else { return Err(jete(-ENOBUFS)) };
     remplir(segment).map_err(jete)?;
+    super::horodatage::demander_datagramme(s, &mut p, d.horodatage, d.ts_opt_id);
     Ok(p)
 }
 

@@ -532,13 +532,18 @@ impl Carte {
     }
 
     /// Copie `p` dans une case libre, derrière un en-tête nul, et la confie
-    /// à la carte, avec le lien à sa socket. false : pas de case libre.
+    /// à la carte, avec le lien à sa socket. false : pas de case libre. Le
+    /// pilote prend la trame : son horodatage s'il le demande, avant l'anneau
+    /// (`skb_tx_timestamp` dans `start_xmit`) ; dans le contexte réseau
+    /// (l'émission de l'interface, ou la tâche du réseau qui vide la petite
+    /// file), où l'entrée attend que le verrou de la carte soit rendu.
     fn poser(&self, e: &mut Emission, p: &mut Paquet) -> bool {
         let donnees = p.donnees();
         if donnees.len() > TAILLE_TAMPON as usize - ENTETE || e.file.libres() == 0 {
             return false;
         }
         let Some(case) = e.libres.pop() else { return false };
+        super::horodatage::passer(p, super::horodatage::PILOTE, self.interface.load(Ordering::Relaxed));
         let physique = self.pages_emission.adresse(case);
         // SAFETY: la case est à nous (libre, pas dans l'anneau), 2 Kio dans
         // une page vue par la projection directe ; la trame y tient (vérifié).

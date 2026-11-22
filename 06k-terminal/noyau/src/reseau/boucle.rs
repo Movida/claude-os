@@ -46,12 +46,20 @@
 //! même chemin (`ip_mc_output`, `dev_loopback_xmit`, puis `netif_rx` : le
 //! `backlog`), livrée comme arrivée par la carte, sans compter ni pour la
 //! carte ni pour `lo`.
+//!
+//! Elle porte aussi les entrées des horodatages d'émission (SO_TIMESTAMPING,
+//! horodatage.rs), faites sous le verrou de la carte ou des voisins et mises
+//! dans la file d'erreurs de leur socket au vidage, hors de tout verrou :
+//! c'est le travail qu'un softirq de Linux ferait au `local_bh_enable`. Elles
+//! ne comptent pour aucune interface.
 
+use super::horodatage::{self, Entree};
 use super::interface::{self, Compteurs, Interface, Materiel};
 use super::paquet::Paquet;
 use crate::faillible::FileFaillible;
 use crate::tache;
 use crate::verrou::Verrou;
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use formats::reseau::ethernet;
 use inet::routes::Adresse;
@@ -59,11 +67,14 @@ use inet::routes::Adresse;
 /// La borne de la file (`netdev_max_backlog`).
 const MAX: usize = 1000;
 
-/// Ce qu'attend la file : une trame émise par `lo` (avec son en-tête
-/// Ethernet), ou la copie d'un paquet IPv4 diffusé par la carte `copie_de`.
-pub struct Trame {
-    pub paquet: Paquet,
-    pub copie_de: Option<&'static Interface>,
+/// Ce qu'attend la file.
+pub enum Trame {
+    /// Une trame émise par `lo`, avec son en-tête Ethernet.
+    Emise(Paquet),
+    /// La copie d'un paquet IPv4 diffusé par la carte qui l'accompagne.
+    Copie(Paquet, &'static Interface),
+    /// L'entrée d'un horodatage d'émission (horodatage.rs).
+    Horodatage(Box<Entree>),
 }
 /// La MTU de `lo` (celle de Linux depuis 3.7).
 pub const MTU: u32 = 65_536;
@@ -95,10 +106,13 @@ pub fn interface() -> Option<&'static Interface> {
 /// contexte de qui l'envoie. Sans aucun verrou tenu : la réception en
 /// prendra.
 pub fn emettre(i: &Interface, mut p: Paquet) {
-    // Rien n'attend ici (`loopback_xmit` : `skb_orphan`).
+    // Le pilote prend la trame (`loopback_xmit` : `skb_tx_timestamp`
+    // d'abord), puis la lâche : rien n'attend ici (`skb_orphan`), et le
+    // paquet reçu ne demande plus rien.
+    horodatage::passer(&p, horodatage::PILOTE, i.index);
     p.orpheliner();
     let longueur = p.longueur().saturating_sub(ethernet::ENTETE) as u64;
-    if !deposer(Trame { paquet: p, copie_de: None }) {
+    if !deposer(Trame::Emise(p)) {
         return Compteurs::compter(&i.compteurs.jetes_reception, 1);
     }
     for (paquets, octets) in [(&i.compteurs.recus, &i.compteurs.octets_recus), (&i.compteurs.emis, &i.compteurs.octets_emis)] {
@@ -116,11 +130,19 @@ pub fn emettre(i: &Interface, mut p: Paquet) {
 /// `dev_core_stats_rx_dropped_inc` de la carte de la copie).
 pub fn rendre_la_diffusion(i: &'static Interface, mut p: Paquet) {
     p.orpheliner();
-    if deposer(Trame { paquet: p, copie_de: Some(i) }) {
+    if deposer(Trame::Copie(p, i)) {
         livrer_bientot();
     } else {
         super::interface::Compteurs::compter(&i.compteurs.jetes_reception, 1);
     }
+}
+
+/// Dépose l'entrée d'horodatage `e` dans la file de la tâche courante, où elle
+/// attend la fin du contexte réseau (horodatage.rs) ; la file pleine, ou plus
+/// de mémoire pour la faire : perdue, comme quand Linux ne peut pas copier le
+/// paquet (`skb_clone` en GFP_ATOMIC).
+pub fn deposer_entree(e: Box<Entree>) {
+    deposer(Trame::Horodatage(e));
 }
 
 /// Dépose `t` dans la file de la tâche courante ; false : jetée (plus de
@@ -192,18 +214,22 @@ pub fn vider_en_attente() {
 
 /// Le vidage lui-même (`vider_en_attente`), sur la pile d'interruption.
 fn vider_ici() {
-    let Some(lo) = interface() else { return };
+    let lo = interface();
     super::contexte::pendant(|| {
         // Prise sous le verrou, reçue sans lui.
         while let Some(t) = prochaine() {
-            match t.copie_de {
-                None => super::recevoir(lo, t.paquet),
-                Some(i) => {
+            match t {
+                Trame::Emise(p) => {
+                    if let Some(lo) = lo {
+                        super::recevoir(lo, p);
+                    }
+                }
+                Trame::Copie(mut p, i) => {
                     // La copie d'une diffusion arrive à son tour (`netif_rx`).
-                    let mut p = t.paquet;
                     p.horodater(super::socket::heure_d_arrivee());
                     super::ipv4::recevoir_la_diffusion(i, p)
                 }
+                Trame::Horodatage(e) => horodatage::livrer(e),
             }
         }
     });

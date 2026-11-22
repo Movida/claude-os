@@ -18,9 +18,11 @@
 //! lanceur les montre quand « memoire rendue » échoue, pour qu'un écart
 //! dise tout de suite s'il vient d'une file du réseau.
 
+use super::horodatage::Demande;
 use crate::attente::FileAttente;
 use crate::faillible::{self, VecFaillible};
 use crate::partage::Arc;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
@@ -41,6 +43,15 @@ pub const MARGE: usize = 96;
 /// d'un paquet, celle que comptent ses files (celle des voisins, celles des
 /// sockets) : son `sk_buff` (256 octets) et sa `skb_shared_info` (320).
 pub const SURCOUT: usize = 576;
+
+/// La taille vraie d'un `sk_buff` de Linux sans données (`alloc_skb(0)`) :
+/// sa tête vient du petit cache `skb_small_head_cache` (dont la taille,
+/// `SKB_SMALL_HEAD_CACHE_SIZE`, dépend de la configuration : 704 octets,
+/// `skb_shared_info` comprise, dans le noyau de référence), plus le `sk_buff`
+/// (256) : 960, mesuré (SO_MEMINFO). Pas `SURCOUT` : Linux ne fait jamais de
+/// tête plus petite que ce cache. C'est ce que compte une entrée d'horodatage
+/// sans octets (OPT_TSONLY, horodatage.rs).
+pub const TAILLE_VIDE: usize = 960;
 
 /// Ce qu'une socket a encore dans les files d'en bas (la file de la carte, celle des
 /// voisins) : le `sk_wmem_alloc` de Linux et ses TSQ_THROTTLED, partagés avec ses
@@ -223,6 +234,12 @@ pub struct Paquet {
     sortie: Option<Sortie>,
     /// Son contexte (`Contexte`), que gardent ses copies et ses morceaux.
     contexte: Contexte,
+    /// Ce qu'il demande d'horodater en partant (SO_TIMESTAMPING,
+    /// horodatage.rs) : ni ses copies, ni ses morceaux après le premier.
+    /// Dans le tas : peu de paquets en ont une, et chaque `Paquet` du réseau,
+    /// jusque dans les cadres de son chemin le plus profond, n'en paie ainsi
+    /// qu'un pointeur.
+    demande: Option<Box<Demande>>,
 }
 
 /// Ce qu'un paquet porte avec lui, hors de ses octets (trois champs du
@@ -254,14 +271,14 @@ impl Paquet {
     pub fn vide(longueur: usize) -> Option<Paquet> {
         let tampon = faillible::remplie(MARGE + longueur, 0).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: MARGE, fin: MARGE, proprietaire: None, sortie: None, contexte: Contexte::default() })
+        Some(Paquet { tampon, debut: MARGE, fin: MARGE, proprietaire: None, sortie: None, contexte: Contexte::default(), demande: None })
     }
 
     /// Une copie de la trame `octets` (reçue), sans marge.
     pub fn copie(octets: &[u8]) -> Option<Paquet> {
         let tampon = faillible::copie(octets).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: 0, fin: octets.len(), proprietaire: None, sortie: None, contexte: Contexte::default() })
+        Some(Paquet { tampon, debut: 0, fin: octets.len(), proprietaire: None, sortie: None, contexte: Contexte::default(), demande: None })
     }
 
     /// Les données.
@@ -356,11 +373,27 @@ impl Paquet {
         }
     }
 
-    /// `skb_orphan` : il n'attendra pas (`lo`).
+    /// `skb_orphan` : il n'attendra pas (`lo`) ; sans socket, il n'a plus
+    /// d'horodatage à demander (`__skb_tstamp_tx` ne fait rien sans `sk`).
     pub fn orpheliner(&mut self) {
+        self.demande = None;
         if let Some(p) = self.proprietaire.take() {
             p.rendre();
         }
+    }
+
+    /// Il demande à être horodaté en partant (horodatage.rs).
+    pub fn poser_demande(&mut self, d: Box<Demande>) {
+        self.demande = Some(d);
+    }
+
+    pub fn demande(&self) -> Option<&Demande> {
+        self.demande.as_deref()
+    }
+
+    /// Sa demande passe au premier morceau (ipv4::fragmenter).
+    pub fn prendre_demande(&mut self) -> Option<Box<Demande>> {
+        self.demande.take()
     }
 
     /// Le lien passe à ce qui garde la trame (une case de la carte).

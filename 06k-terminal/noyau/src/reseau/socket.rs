@@ -169,9 +169,13 @@ pub enum Rejet {
 // D'où vient une erreur de la file d'erreurs (SO_EE_ORIGIN_*).
 pub const ORIGINE_LOCALE: u8 = 1;
 pub const ORIGINE_ICMP: u8 = 2;
+/// Un horodatage d'émission (horodatage.rs).
+pub const ORIGINE_HORODATAGE: u8 = 4;
 
 /// Une erreur dans la file d'erreurs (la `sk_error_queue` de Linux, avec
-/// IP_RECVERR), lue par MSG_ERRQUEUE : sa `sock_extended_err` (l'errno,
+/// IP_RECVERR ; ou l'entrée d'un horodatage d'émission, avec
+/// SO_TIMESTAMPING, voir horodatage.rs pour ce que disent alors ses champs),
+/// lue par MSG_ERRQUEUE : sa `sock_extended_err` (l'errno,
 /// l'origine, le genre et le code du message ICMP, son `info`), la
 /// destination du paquet qui l'a causée (le `msg_name` rendu), qui l'a dite
 /// (SO_EE_OFFENDER : la source du message ICMP), où ce message est arrivé
@@ -260,18 +264,29 @@ impl ErreurEnFile {
         })
     }
 
-    /// Ce que diront ses messages de contrôle IP : pour une erreur venue
-    /// d'ICMP seulement (`ipv4_datagram_support_cmsg`). Les « ports »
-    /// d'IP_ORIGDSTADDR sont les octets 2 et 3 de ce que lira le programme :
-    /// Linux fait de sa charge l'en-tête de transport de l'erreur
-    /// (`ip_icmp_error`), et n'en dit rien si elle a moins de 4 octets
-    /// (mesuré : UDP « abc », aucun ; un écho, sa somme).
-    pub fn controle(&self) -> Option<ControleIp> {
-        if self.origine != ORIGINE_ICMP {
-            return None;
-        }
-        let port = self.donnees.donnees().get(..4).map(|o| u16::from_be_bytes([o[2], o[3]]));
-        Some(ControleIp { entete: self.entete, source: self.emetteur, port, somme: Some(self.somme) })
+    /// Ce que diront ses messages de contrôle IP, pour une socket de
+    /// drapeaux SO_TIMESTAMPING `tsflags` (`ipv4_datagram_support_cmsg`) :
+    /// une erreur venue d'ICMP, toujours ; un horodatage d'émission, avec
+    /// OPT_CMSG et s'il a une interface (pas avec OPT_TSONLY : il n'a pas de
+    /// paquet), ceux du paquet parti ; une erreur locale, jamais. Les « ports »
+    /// d'IP_ORIGDSTADDR sont les octets 2 et 3 de l'en-tête de transport : pour
+    /// une erreur, de ce que lira le programme (Linux fait de sa charge
+    /// l'en-tête de transport de l'erreur, `ip_icmp_error`, et n'en dit rien si
+    /// elle a moins de 4 octets : mesuré, UDP « abc », aucun ; un écho, sa
+    /// somme) ; pour un horodatage, du paquet, après ses en-têtes Ethernet et
+    /// IP. La somme : celle d'un message ICMP reçu (IP_CHECKSUM) ; un paquet
+    /// qui part n'en a pas de complète (CHECKSUM_PARTIAL).
+    pub fn controle(&self, tsflags: u32) -> Option<ControleIp> {
+        let (port, somme) = match self.origine {
+            ORIGINE_ICMP => (self.donnees.donnees().get(..4).map(|o| u16::from_be_bytes([o[2], o[3]])), Some(self.somme)),
+            ORIGINE_HORODATAGE if tsflags & SOF_OPT_CMSG != 0 && self.interface != 0 => {
+                let ip = self.donnees.donnees().get(formats::reseau::ethernet::ENTETE..).unwrap_or(&[]);
+                let entete = ip.first().map_or(0, |o| (o & 0xf) as usize * 4);
+                (ip.get(entete..entete + 4).map(|o| u16::from_be_bytes([o[2], o[3]])), None)
+            }
+            _ => return None,
+        };
+        Some(ControleIp { entete: self.entete, source: self.emetteur, port, somme })
     }
 }
 
@@ -471,6 +486,23 @@ pub const SOF_SOFTWARE: u32 = 1 << 4;
 pub const SOF_RAW_HARDWARE: u32 = 1 << 6;
 pub const SOF_OPT_RX_FILTER: u32 = 1 << 17;
 
+/// Ceux de l'émission (horodatage.rs) : les points demandés, TX_SOFTWARE (le
+/// pilote prend la trame), TX_SCHED (l'interface), TX_ACK (TCP : l'autre côté
+/// a acquitté), et TX_HARDWARE, TX_COMPLETION, que rien ne dit chez nous ;
+/// ensemble, TX_RECORD_MASK, les seuls qu'un message de contrôle d'envoi
+/// peut changer. Et la forme des entrées : OPT_ID (une clé par envoi),
+/// OPT_CMSG (les messages de contrôle IP du paquet), OPT_TSONLY (sans ses
+/// octets).
+pub const SOF_TX_HARDWARE: u32 = 1 << 0;
+pub const SOF_TX_SOFTWARE: u32 = 1 << 1;
+pub const SOF_OPT_ID: u32 = 1 << 7;
+pub const SOF_TX_SCHED: u32 = 1 << 8;
+pub const SOF_TX_ACK: u32 = 1 << 9;
+pub const SOF_OPT_CMSG: u32 = 1 << 10;
+pub const SOF_OPT_TSONLY: u32 = 1 << 11;
+pub const SOF_TX_COMPLETION: u32 = 1 << 18;
+pub const SOF_TX_RECORD_MASK: u32 = SOF_TX_HARDWARE | SOF_TX_SOFTWARE | SOF_TX_SCHED | SOF_TX_ACK | SOF_TX_COMPLETION;
+
 /// La clé des horodatages (le `netstamp_needed_key` de Linux) : combien de
 /// sockets d'Internet veulent l'heure d'arrivée des paquets, par
 /// SOCK_TIMESTAMP (toute SO_TIMESTAMP, SIOCGSTAMP) ou par
@@ -577,7 +609,7 @@ impl Socket {
 
     /// La fille `self` d'une écoute de TCP reprend ce que `sk_clone_lock` copie
     /// de l'écoute : ses drapeaux de réception (SO_TIMESTAMP, SO_RXQ_OVFL...),
-    /// et SO_TIMESTAMPING ; elle compte à son tour dans la clé des
+    /// SO_TIMESTAMPING et le compteur de ses clés ; elle compte à son tour dans la clé des
     /// horodatages si l'écoute y comptait (`net_enable_timestamp` pour la
     /// copie : sans cela, sa fermeture ôterait de la clé une part qu'elle n'y
     /// avait pas mise).
@@ -585,6 +617,7 @@ impl Socket {
         let d = ecoute.drapeaux.load(Ordering::Relaxed);
         self.drapeaux.store(d, Ordering::Relaxed);
         self.tsflags.store(ecoute.tsflags.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.cle_emission.store(ecoute.cle_emission.load(Ordering::Relaxed), Ordering::Relaxed);
         if d & CLE_HORODATAGE != 0 {
             HORODATAGES.fetch_add(1, Ordering::Relaxed);
         }
@@ -687,6 +720,10 @@ pub struct Socket {
     /// SO_TIMESTAMPING (`sk_tsflags`) : ses drapeaux SOF_TIMESTAMPING_*, tels
     /// que posés (voir `SOF_SOFTWARE` et la suite).
     pub tsflags: AtomicU32,
+    /// Le compteur des clés d'OPT_ID (`sk_tskey`), remis à zéro quand OPT_ID
+    /// se pose : la clé du prochain datagramme horodaté
+    /// (`horodatage::demander_datagramme`).
+    pub cle_emission: AtomicU32,
     /// L'heure du dernier datagramme lu (`sk_stamp`), que rend SIOCGSTAMP
     /// (appels_reseau.rs, `heure_du_dernier` ; la lecture l'écrit :
     /// `heure_lue`, `controle_udp`) : HORODATAGE_AUCUN tant que rien n'a été
@@ -786,6 +823,7 @@ impl Socket {
             pertes: AtomicU32::new(0),
             drapeaux: AtomicU16::new(0),
             tsflags: AtomicU32::new(0),
+            cle_emission: AtomicU32::new(0),
             horodatage: AtomicI64::new(HORODATAGE_AUCUN),
             processeur: AtomicI32::new(-1),
             connectee: AtomicBool::new(false),
@@ -948,12 +986,16 @@ impl Socket {
         Some(e)
     }
 
-    /// Vide la file d'erreurs (IP_RECVERR remis à 0).
+    /// Vide la file d'erreurs (IP_RECVERR remis à 0, `skb_errqueue_purge`),
+    /// sauf les horodatages d'émission : ils ne viennent pas d'IP_RECVERR
+    /// (mesuré : l'entrée SND reste, l'erreur ICMP part, et l'erreur en
+    /// attente aussi, SO_ERROR la rend encore).
     pub fn vider_erreurs(&self) {
         let mut r = self.reception.verrouiller();
-        let rendus: usize = r.erreurs.iter().map(|e| e.taille).sum();
+        let gardee = |e: &ErreurEnFile| e.origine == ORIGINE_HORODATAGE;
+        let rendus: usize = r.erreurs.iter().filter(|e| !gardee(e)).map(|e| e.taille).sum();
         r.octets = r.octets.saturating_sub(rendus);
-        r.erreurs.clear();
+        r.erreurs.retain(gardee);
     }
 
     /// Prend l'erreur en attente (le `sock_error` : lue et effacée).
@@ -1050,6 +1092,8 @@ impl Socket {
 /// pas) ; `vide` : aucun datagramme (la lecture arrêtée), donc pas
 /// d'émetteur à dire.
 pub struct Recu {
+    /// Pas d'émetteur à rendre : rien de reçu (la lecture arrêtée), un flux,
+    /// ou l'entrée d'un horodatage d'émission.
     pub vide: bool,
     pub longueur: usize,
     pub source: [u8; 4],

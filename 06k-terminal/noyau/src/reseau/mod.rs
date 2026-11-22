@@ -8,7 +8,8 @@
 //! interface (interface.rs) ; ce qui circule : des paquets (paquet.rs).
 //! Les étages : Ethernet (ethernet.rs), ARP (arp.rs), IPv4 (ipv4.rs), ICMP
 //! (icmp.rs), UDP (udp.rs), les sockets de ping (ping.rs), les groupes de
-//! multidiffusion (multidiffusion.rs) ; les sockets, ce qu'en voient les programmes (socket.rs, ce
+//! multidiffusion (multidiffusion.rs) ; les horodatages d'émission
+//! (horodatage.rs) ; les sockets, ce qu'en voient les programmes (socket.rs, ce
 //! qu'ont en commun celles de datagrammes : datagramme.rs, et leurs appels
 //! système : ../appels_reseau.rs) ; l'interface de boucle,
 //! `lo` (boucle.rs) ; la configuration au démarrage par DHCP (dhcp.rs) ;
@@ -24,6 +25,7 @@ pub mod contexte;
 pub mod datagramme;
 pub mod dhcp;
 pub mod ethernet;
+pub mod horodatage;
 pub mod icmp;
 pub mod interface;
 pub mod ipv4;

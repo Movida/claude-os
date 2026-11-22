@@ -128,8 +128,15 @@ impl Interface {
 
     /// Émet la trame `p` (le `dev_queue_xmit` de Linux), dans le contexte
     /// de qui l'envoie. Lien coupé, ou file d'émission pleine : jetée, et
-    /// comptée.
+    /// comptée. Avant tout, l'horodatage SCHED s'il est demandé
+    /// (`__dev_queue_xmit` le prend en entrant : même une trame que le lien
+    /// coupé jette l'a eu). Dans le contexte réseau : les entrées
+    /// d'horodatage faites ici et par le pilote (sous son verrou) vont aux
+    /// files d'erreurs de leurs sockets en sortant (horodatage.rs), et une
+    /// trame de `lo` est livrée à ce moment-là aussi (boucle.rs).
     pub fn emettre(&self, p: Paquet) {
+        let _contexte = super::contexte::entrer();
+        super::horodatage::passer(&p, super::horodatage::SCHED, self.index);
         if !self.lien.load(Ordering::Relaxed) {
             Compteurs::compter(&self.compteurs.jetes_emission, 1);
             return;

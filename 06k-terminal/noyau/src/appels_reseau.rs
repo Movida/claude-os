@@ -146,6 +146,8 @@ const SO_INCOMING_NAPI_ID: i32 = 56;
 const SO_COOKIE: i32 = 57;
 const SO_TXTIME: i32 = 61;
 const SCM_TXTIME: i32 = SO_TXTIME;
+/// La clé d'OPT_ID d'un envoi, à la place de celle du compteur.
+const SCM_TS_OPT_ID: i32 = 81;
 const SO_PREFER_BUSY_POLL: i32 = 69;
 const SO_BUSY_POLL_BUDGET: i32 = 70;
 const SO_NETNS_COOKIE: i32 = 71;
@@ -176,8 +178,6 @@ const SO_SELECT_ERR_QUEUE: i32 = 45;
 const SO_TIMESTAMPING_OLD: i32 = 37;
 const SO_TIMESTAMPING_NEW: i32 = 65;
 const SOF_MASK: u32 = (1 << 19) - 1;
-const SOF_OPT_ID: u32 = 1 << 7;
-const SOF_OPT_TSONLY: u32 = 1 << 11;
 const SOF_OPT_STATS: u32 = 1 << 12;
 const SOF_BIND_PHC: u32 = 1 << 15;
 const SOF_OPT_ID_TCP: u32 = 1 << 16;
@@ -945,15 +945,22 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
     }
     // AF_UNIX n'a pas de file d'erreurs, et ne regarde pas ce drapeau.
     if drapeaux & MSG_ERRQUEUE != 0 && o.socket().protocole != Protocole::Unix {
-        let e = o.socket().prendre_en_file().ok_or(-EAGAIN)?;
+        let s = o.socket();
+        let e = s.prendre_en_file().ok_or(-EAGAIN)?;
         let total = e.donnees.longueur();
         let copie = copier_vers_morceaux(morceaux, e.donnees.donnees())?;
+        // Un horodatage n'a pas d'adresse à rendre (`ipv4_datagram_support_addr` :
+        // ni ICMP, ni locale, ni port) ; son IP_PKTINFO dit l'adresse locale, sa
+        // source (`ipv4_datagram_support_cmsg` la pose), quand celui d'une erreur
+        // ICMP dit 0.0.0.0 (rien ne l'a préparé).
+        let horodatage = e.origine == socket::ORIGINE_HORODATAGE;
         let recu = socket::Recu {
-            vide: false, longueur: copie, source: e.adresse, port: e.port, destination: e.arrivee, pktinfo: (e.interface, [0; 4]),
-            coupe: copie < total, ip: e.controle(), contexte: Default::default(), pertes: 0,
+            vide: horodatage, longueur: copie, source: e.adresse, port: e.port, destination: e.arrivee,
+            pktinfo: (e.interface, if horodatage { e.emetteur } else { [0; 4] }), coupe: copie < total,
+            ip: e.controle(s.tsflags.load(Ordering::Relaxed)), contexte: Default::default(), pertes: 0,
         };
         let d = if recu.coupe { MSG_TRUNC } else { 0 } | MSG_ERRQUEUE as u32;
-        let (horodatage, horodatages) = heure_lue(o.socket(), e.horodatage, true);
+        let (horodatage, horodatages) = heure_lue(s, e.horodatage, true);
         let socket = ControleSocket { horodatage, horodatages, ..Default::default() };
         return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: Some(e), fichiers: Vec::new(), droits: None, socket });
     }
@@ -1121,14 +1128,18 @@ fn aligner(n: usize) -> usize {
 /// (sa priorité : un `u32`, EINVAL, puis 0 à 6 sans droits, EPERM), et
 /// IP_TOS donne aussi sa priorité (`rt_tos2priority`) : de ces deux-là, le
 /// dernier compte, dans l'ordre des messages (mesuré : IP_TOS 0x10, la
-/// priorité 6) ; un autre : EINVAL (un écart pour l'horodatage de
-/// l'émission, SO_TIMESTAMPING et SCM_TS_OPT_ID) ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
+/// priorité 6), SO_TIMESTAMPING (_OLD ou _NEW : un `u32` de drapeaux
+/// d'émission seulement, TX_RECORD_MASK, sinon EINVAL ; ils remplacent ceux
+/// de la socket pour cet envoi, le dernier compte), SCM_TS_OPT_ID (la clé de
+/// cet envoi : pas pour TCP, et seulement si la socket a OPT_ID dans
+/// `tsflags`, ses drapeaux à cet instant ; un `u32` ; EINVAL) ; un autre :
+/// EINVAL ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
 /// niveau est ignoré. Selon qui lit (`protocole`), comme chez Linux : UDP
 /// lit SOL_UDP (`udp_cmsg_send`), puis SOL_IP et SOL_SOCKET
 /// (`ip_cmsg_send`) ; ping, seulement ces deux-là (SOL_UDP est sauté) ; TCP,
 /// seulement SOL_SOCKET (`sock_cmsg_send`, dans `tcp_sendmsg_locked`) : un
 /// message d'un autre niveau, même faux, ne compte pas (mesuré).
-fn lire_controle(c: &[u8], root: bool, protocole: Protocole, txtime: bool) -> Result<Controle, i64> {
+fn lire_controle(c: &[u8], root: bool, protocole: Protocole, txtime: bool, tsflags: u32) -> Result<Controle, i64> {
     let mut r = Controle::default();
     let mut i = 0;
     while c.len() >= i + CMSG_ENTETE {
@@ -1200,6 +1211,19 @@ fn lire_controle(c: &[u8], root: bool, protocole: Protocole, txtime: bool) -> Re
                     return Err(-EPERM);
                 }
                 r.priorite = Some(v as u32);
+            }
+            (SOL_SOCKET, SO_TIMESTAMPING_OLD | SO_TIMESTAMPING_NEW) => {
+                let v = entier()? as u32;
+                if v & !socket::SOF_TX_RECORD_MASK != 0 {
+                    return Err(-EINVAL);
+                }
+                r.horodatage = Some(v);
+            }
+            (SOL_SOCKET, SCM_TS_OPT_ID) => {
+                if protocole == Protocole::Tcp || tsflags & socket::SOF_OPT_ID == 0 {
+                    return Err(-EINVAL);
+                }
+                r.ts_opt_id = Some(entier()? as u32);
             }
             (SOL_SOCKET, _) => return Err(-EINVAL),
             _ => {}
@@ -1287,8 +1311,9 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
             }
             Ok(Controle::default())
         } else {
-            let txtime = o.socket().appels.verrouiller().options.txtime;
-            lire_controle(&c, socket::appelant_privilegie(), o.socket().protocole, txtime)
+            let s = o.socket();
+            let txtime = s.appels.verrouiller().options.txtime;
+            lire_controle(&c, socket::appelant_privilegie(), s.protocole, txtime, s.tsflags.load(Ordering::Relaxed))
         }
     } else {
         Ok(Controle::default())
@@ -1499,8 +1524,9 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
         }
     }
     // Les messages de contrôle IP (`ip_cmsg_recv_offset`), dans l'ordre de
-    // Linux : pour un datagramme ; pour une erreur, seulement si elle vient
-    // d'ICMP (`ipv4_datagram_support_cmsg`), ceux de son message.
+    // Linux : pour un datagramme ; pour une entrée de la file d'erreurs, si
+    // `ipv4_datagram_support_cmsg` le permet (une erreur d'ICMP ; un
+    // horodatage d'émission avec OPT_CMSG et une interface), ceux de son paquet.
     let options = o.socket().appels.verrouiller().options;
     if r.recu.ip.is_some() && options.pktinfo {
         // in_pktinfo : l'interface d'arrivée, l'adresse locale à laquelle
@@ -1510,7 +1536,9 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
         // erreur, `ip_recv_error` rend le contrôle du message ICMP, que rien
         // n'a préparé, et une réponse de ping de même (`ping_rcv` ne le
         // prépare pas, mesuré) : l'interface d'arrivée telle quelle, et
-        // 0.0.0.0 (le `faddr` de ses options IP).
+        // 0.0.0.0 (le `faddr` de ses options IP) ; pour un horodatage
+        // d'émission, l'interface de départ et la source du paquet
+        // (`ipv4_datagram_support_cmsg` les pose).
         let (interface, locale) = r.recu.pktinfo;
         let mut info = [0u8; 12];
         info[..4].copy_from_slice(&(interface as i32).to_le_bytes());
@@ -1523,8 +1551,10 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
     }
     // L'erreur elle-même (IP_RECVERR) : sa `sock_extended_err` (errno,
     // origine, genre, code, un octet nul, info, data : les extensions du
-    // message, RFC 4884), puis SO_EE_OFFENDER, l'adresse de qui l'a dite
-    // (nulle pour une erreur locale).
+    // message, RFC 4884, ou la clé d'un horodatage), puis SO_EE_OFFENDER,
+    // l'adresse de qui l'a dite quand elle a des messages de contrôle IP
+    // (`ipv4_datagram_support_cmsg` : une erreur ICMP, l'émetteur du message ;
+    // un horodatage avec OPT_CMSG, la source du paquet) ; sinon nulle.
     if let Some(e) = &r.erreur {
         let mut o = [0u8; 32];
         o[..4].copy_from_slice(&e.errno.to_le_bytes());
@@ -1533,7 +1563,7 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
         o[6] = e.code;
         o[8..12].copy_from_slice(&e.info.to_le_bytes());
         o[12..16].copy_from_slice(&e.ee_data.to_le_bytes());
-        if e.origine == socket::ORIGINE_ICMP {
+        if r.recu.ip.is_some() {
             o[16..32].copy_from_slice(&socket::sockaddr_in(e.emetteur, 0));
         }
         c.ecrire(SOL_IP, IP_RECVERR, &o, &mut r.drapeaux);
@@ -1794,19 +1824,26 @@ pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
 /// EINVAL sinon, aucune des nôtres n'en a). Puis les drapeaux, la forme des
 /// messages (SOCK_TSTAMP_NEW, partagé avec SO_TIMESTAMP : la dernière posée
 /// décide pour les deux), et la clé des horodatages (RX_SOFTWARE).
+/// OPT_ID qui se pose remet le compteur des clés à zéro (`sk_tskey`), avant
+/// les deux derniers refus, comme Linux (sans effet visible : sans OPT_ID,
+/// le compteur ne sert pas, et il repartira de zéro quand OPT_ID se posera) ;
+/// reposé, il le garde.
 /// Les drapeaux du matériel (TX_HARDWARE, RX_HARDWARE, RAW_HARDWARE,
 /// SYS_HARDWARE, OPT_PKTINFO, OPT_TX_SWHW) et TX_COMPLETION se gardent sans
 /// effet visible : aucune de nos cartes ne donne d'heure, et seul Bluetooth
 /// dit la fin d'un envoi.
 fn horodatages(s: &Socket, option: i32, d: u32) -> Result<(), i64> {
     let avant = s.tsflags.load(Ordering::Relaxed);
-    if d & !SOF_MASK != 0 || (d & SOF_OPT_ID_TCP != 0 && d & SOF_OPT_ID == 0) {
+    if d & !SOF_MASK != 0 || (d & SOF_OPT_ID_TCP != 0 && d & socket::SOF_OPT_ID == 0) {
         return Err(-EINVAL);
     }
-    if d & SOF_OPT_ID != 0 && avant & SOF_OPT_ID == 0 && s.protocole == Protocole::Tcp && tcp::fermee_ou_ecoute(s) {
-        return Err(-EINVAL);
+    if d & socket::SOF_OPT_ID != 0 && avant & socket::SOF_OPT_ID == 0 {
+        if s.protocole == Protocole::Tcp && tcp::fermee_ou_ecoute(s) {
+            return Err(-EINVAL);
+        }
+        s.cle_emission.store(0, Ordering::Relaxed);
     }
-    if d & SOF_OPT_STATS != 0 && d & SOF_OPT_TSONLY == 0 {
+    if d & SOF_OPT_STATS != 0 && d & socket::SOF_OPT_TSONLY == 0 {
         return Err(-EINVAL);
     }
     if d & SOF_BIND_PHC != 0 {
