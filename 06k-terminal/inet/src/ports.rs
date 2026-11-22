@@ -335,13 +335,16 @@ impl<T: Clone, P> Table<T, P> {
     }
 
     /// La fin de la connexion de la socket `numero`, son port gardé
-    /// (`__udp_disconnect`) : plus de destination ; son adresse locale
-    /// oubliée, si `bind` ne l'avait pas choisie (`oublier_adresse`, et
-    /// `rehacher`).
+    /// (`__udp_disconnect`) : plus de destination, plus d'interface (sans
+    /// ré-hacher pour elle : son groupe SO_REUSEPORT est gardé, `rehash` ne
+    /// vient qu'après, pour l'adresse) ; son
+    /// adresse locale oubliée, si `bind` ne l'avait pas choisie
+    /// (`oublier_adresse`, et `rehacher`).
     pub fn deconnecter(&mut self, numero: u64, oublier_adresse: bool) {
         let Some(e) = self.entrees.iter_mut().find(|e| e.numero == numero) else { return };
         e.lien.distante = [0; 4];
         e.lien.port_distant = 0;
+        e.lien.interface = 0;
         if oublier_adresse {
             self.rehacher(numero, [0; 4]);
         }

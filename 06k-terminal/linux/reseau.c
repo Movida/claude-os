@@ -2407,6 +2407,22 @@ static void liees(void)
     connect(s, (struct sockaddr *)&a, sizeof a);
     verifier(poser_ip(s, IP_UNICAST_IF, htonl(1), 4) == 0 && mtu_de(s) == 65535, "connectee, puis IP_UNICAST_IF : la route gardee");
     close(s);
+    /* La fin d'une connexion (connect AF_UNSPEC, `__udp_disconnect`) délie une socket
+     * d'UDP ou de ping de son interface ; pas une socket TCP (`tcp_disconnect`). */
+    for (int k = 0; k < 3; k++) {
+        static const char *sorte[] = { "udp", "ping", "tcp (refusee)" };
+        s = k == 2 ? socket(AF_INET, SOCK_STREAM, 0) : socket(AF_INET, SOCK_DGRAM, k == 1 ? IPPROTO_ICMP : 0);
+        struct sockaddr_in z = adresse(LO, 9);
+        struct sockaddr u = { .sa_family = AF_UNSPEC };
+        char nom[16];
+        socklen_t l;
+        int pose = poser_nom(s, "lo", 3), connecte = connect(s, (struct sockaddr *)&z, sizeof z) == 0;
+        int fin = connect(s, &u, sizeof u), lu = lire_nom(s, nom, sizeof nom, &l);
+        int attendu = k == 2 ? l == 3 && !strcmp(nom, "lo") : l == 0;
+        snprintf(quoi, sizeof quoi, "%s liee a lo, connectee, puis AF_UNSPEC : %s", sorte[k], k == 2 ? "toujours liee" : "deliee");
+        verifier(pose == 0 && connecte == (k != 2) && fin == 0 && lu == 0 && attendu, quoi);
+        close(s);
+    }
     /* Un IP_TOS qui change l'oublie aussi (`__ip_sock_set_tos` : `sk_dst_reset`),
      * pas un qui ne change rien. */
     s = udp(0);

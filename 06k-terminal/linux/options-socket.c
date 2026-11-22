@@ -3979,24 +3979,33 @@ static void reuseport_udp(void)
             close(s[i]);
     /* AF_UNSPEC d'une membre jamais connectée : port choisi, liée à 0.0.0.0, elle quitte
      * le groupe et garde son port ; liée à 127.0.0.1, elle reste ; port éphémère, elle le
-     * rend. Et SO_BINDTODEVICE, qui la ré-hache : elle quitte. */
+     * rend. Et SO_BINDTODEVICE, qui la ré-hache : elle quitte. Liée à lo avant `bind`,
+     * AF_UNSPEC oublie l'interface sans la ré-hacher (`__udp_disconnect`) : elle reste. */
     struct sockaddr_in rien = {.sin_family = AF_UNSPEC};
     const char *cas[] = {"AF_UNSPEC, 0.0.0.0, port choisi : quitte, garde son port", "AF_UNSPEC, 127.0.0.1, port choisi : reste",
-                         "AF_UNSPEC, port ephemere : rend son port", "SO_BINDTODEVICE : quitte"};
-    for (int k = 0; k < 4; k++) {
-        int d[3], adresse = k == 0 ? 0 : LOCALE;
-        d[0] = rp_udp(adresse, k == 2 ? 0 : rp_libre(), 1, 0);
-        port = rp_port(d[0]);
-        d[1] = rp_udp(adresse, port, 1, 0);
-        d[2] = rp_udp(adresse, port, 1, 0);
+                         "AF_UNSPEC, port ephemere : rend son port", "SO_BINDTODEVICE : quitte",
+                         "AF_UNSPEC, 127.0.0.1, port choisi, liee a lo : reste, sans interface"};
+    for (int k = 0; k < 5; k++) {
+        int d[3], adresse = k == 0 ? 0 : LOCALE, reste = k == 1 || k == 4;
+        for (int i = 0; i < 3; i++) {
+            d[i] = socket(AF_INET, SOCK_DGRAM, 0);
+            poser(d[i], SO_REUSEPORT, 1);
+            if (k == 4)
+                setsockopt(d[i], SOL_SOCKET, SO_BINDTODEVICE, "lo", 3);
+            rp_lier(d[i], adresse, i > 0 ? port : k == 2 ? 0 : rp_libre());
+            port = rp_port(d[0]);
+        }
         rp_index(d[1], 0);
         if (k == 3)
             setsockopt(d[0], SOL_SOCKET, SO_BINDTODEVICE, "lo", 3);
         else
             connect(d[0], (struct sockaddr *)&rien, sizeof rien);
         int garde = rp_port(d[0]) == port, qui = rp_qui(d, 3, LOCALE, port);
-        int attendu = k == 1 ? 0 : 2;
-        verifier(qui == attendu && garde == (k != 2) && rp_detacher(d[0]) == (k == 1 ? 0 : ENOENT),
+        char nom[16];
+        socklen_t n = sizeof nom;
+        getsockopt(d[0], SOL_SOCKET, SO_BINDTODEVICE, nom, &n);
+        verifier(qui == (reste ? 0 : 2) && garde == (k != 2) && rp_detacher(d[0]) == (reste ? 0 : ENOENT)
+                 && n == (k == 3 ? 3 : 0),
                  dire("SO_REUSEPORT udp : %s", cas[k]));
         for (int i = 0; i < 3; i++)
             close(d[i]);

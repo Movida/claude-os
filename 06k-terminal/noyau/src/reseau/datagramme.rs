@@ -58,12 +58,16 @@ pub mod table {
         }
     }
 
-    /// La fin de la connexion, le port gardé ; `oublier_adresse` : l'adresse
-    /// locale n'était pas de `bind` (UDP la ré-hache : `udp_lib_rehash`).
+    /// La fin de la connexion, le port gardé, sans interface ;
+    /// `oublier_adresse` : l'adresse locale n'était pas de `bind` (UDP la
+    /// ré-hache : `udp_lib_rehash`).
     pub fn deconnecter(s: &Socket, inet: &Inet, oublier_adresse: bool) {
         match s.protocole {
             Protocole::Udp => udp::deconnecter(s, oublier_adresse),
-            Protocole::Ping => ping::changer(s, inet),
+            Protocole::Ping => {
+                ping::changer(s, inet);
+                ping::interface_changee(s, inet.options.interface);
+            }
             Protocole::Tcp | Protocole::Unix => {}
         }
     }
@@ -241,10 +245,12 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
 }
 
 /// La fin de la connexion (connect AF_UNSPEC, `__udp_disconnect`) : plus
-/// de destination ; l'adresse locale oubliée si `bind` ne l'avait pas
-/// choisie, et le port rendu s'il était éphémère (mesuré : getsockname
-/// rend ensuite 0.0.0.0:0). Même sans connexion : une socket UDP liée à
-/// 0.0.0.0 quitte ainsi son groupe SO_REUSEPORT (inet::ports, mesuré).
+/// de destination, ni d'interface (SO_BINDTODEVICE oublié, mesuré : UDP et
+/// ping, que Linux déconnecte de la même façon ; pas TCP) ; l'adresse locale
+/// oubliée si `bind` ne l'avait pas choisie, et le port rendu s'il était
+/// éphémère (mesuré : getsockname rend ensuite 0.0.0.0:0). Même sans
+/// connexion : une socket UDP liée à 0.0.0.0 quitte ainsi son groupe
+/// SO_REUSEPORT (inet::ports, mesuré).
 pub fn deconnecter(s: &Arc<Socket>) {
     let mut inet = s.appels.verrouiller();
     inet.connecte = false;
@@ -253,6 +259,7 @@ pub fn deconnecter(s: &Arc<Socket>) {
     inet.port_distant = 0;
     inet.source = format_ipv4::AUCUNE;
     inet.route_gardee = None;
+    inet.options.interface = 0;
     if !inet.adresse_choisie {
         inet.adresse = format_ipv4::AUCUNE;
     }

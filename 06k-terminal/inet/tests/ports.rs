@@ -332,6 +332,16 @@ fn quitter_un_groupe() {
     t.attacher_programme(1, 0, true, -1).unwrap();
     t.deconnecter(1, false);
     assert_eq!(t.trouver(ICI, 1, LO, 7000, 1, &PROGRAMME), Some(1));
+    // La fin d'une connexion délie de l'interface, sans ré-hacher : liée à une
+    // interface, elle reste dans son groupe (sortie, la 5, liée à celle d'arrivée,
+    // l'emporterait).
+    let i = Lien { reuseport: true, interface: 1, ..lien(LO, 7300) };
+    t.lier(4, i, 4, 0).unwrap();
+    t.lier(5, i, 5, 0).unwrap();
+    t.attacher_programme(5, 0, true, -1).unwrap();
+    t.deconnecter(4, false);
+    assert_eq!(t.lien(4).map(|l| l.interface), Some(0));
+    assert_eq!(t.trouver(ICI, 1, LO, 7300, 1, &PROGRAMME), Some(4), "restee dans son groupe");
     // SO_BINDTODEVICE.
     t.changer_interface(1, 1);
     assert_eq!(t.trouver(ICI, 1, LO, 7000, 2, &PROGRAMME), Some(3));
