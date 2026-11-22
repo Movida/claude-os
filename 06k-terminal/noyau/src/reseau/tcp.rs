@@ -2412,8 +2412,8 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             enfant.peek_off.store(s.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.mc_all.store(s.mc_all.load(Ordering::Relaxed), Ordering::Relaxed);
             // Une copie de l'écoute (`sk_clone_lock`) : ses drapeaux de réception
-            // (SO_TIMESTAMP, SO_RXQ_OVFL...) ; le processeur de sa naissance.
-            enfant.drapeaux.store(s.drapeaux.load(Ordering::Relaxed), Ordering::Relaxed);
+            // et d'horodatage ; le processeur de sa naissance.
+            enfant.heriter_de(s);
             enfant.processeur.store(processeur, Ordering::Relaxed);
             enfant.appels.verrouiller().options = socket::Options { mc_ttl, rcv_tos, mc_index, ip_options, interface, ..options };
             if let Some(t) = TABLE.verrouiller().as_mut() {
@@ -2471,6 +2471,17 @@ pub fn pair(s: &Socket) -> Option<([u8; 4], u16)> {
             Some((p.adresses.distante, p.adresses.port_distant))
         }
         _ => None,
+    }
+}
+
+/// La socket est-elle en TCP_CLOSE ou en TCP_LISTEN (SOF_TIMESTAMPING_OPT_ID
+/// les refuse) : neuve, une écoute, ou une connexion finie (TIME_WAIT
+/// compris : la socket, elle, est déjà fermée, voir `pair`).
+pub fn fermee_ou_ecoute(s: &Socket) -> bool {
+    let mut g = flux(s).posseder();
+    match &g.donnee().mode {
+        Mode::Connexion(t) => matches!(t.etat(), Etat::Fermee | Etat::TempsAttente),
+        _ => true,
     }
 }
 

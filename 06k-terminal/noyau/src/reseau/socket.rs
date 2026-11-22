@@ -48,7 +48,7 @@ use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::faillible::{self, FileFaillible};
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use inet::snmp::Udp;
 
 /// POLLRDHUP : l'autre côté a fermé (ou la lecture est arrêtée).
@@ -458,6 +458,49 @@ pub const RCVMARK: u16 = 32;
 pub const RCVPRIORITY: u16 = 64;
 pub const INQ: u16 = 128;
 pub const SELECT_ERR_QUEUE: u16 = 256;
+/// La socket compte dans la clé des horodatages (`HORODATAGES`).
+pub const CLE_HORODATAGE: u16 = 512;
+
+/// Les drapeaux de SO_TIMESTAMPING que la réception regarde (`sk_tsflags`,
+/// include/uapi/linux/net_tstamp.h) : RX_SOFTWARE fait prendre l'heure
+/// d'arrivée (il allume la clé), SOFTWARE la dit (SCM_TIMESTAMPING), et
+/// OPT_RX_FILTER ne la dit que si la socket l'a fait prendre ;
+/// RAW_HARDWARE dirait celle d'une carte, qu'aucune des nôtres ne donne.
+pub const SOF_RX_SOFTWARE: u32 = 1 << 3;
+pub const SOF_SOFTWARE: u32 = 1 << 4;
+pub const SOF_RAW_HARDWARE: u32 = 1 << 6;
+pub const SOF_OPT_RX_FILTER: u32 = 1 << 17;
+
+/// La clé des horodatages (le `netstamp_needed_key` de Linux) : combien de
+/// sockets d'Internet veulent l'heure d'arrivée des paquets, par
+/// SOCK_TIMESTAMP (toute SO_TIMESTAMP, SIOCGSTAMP) ou par
+/// SOF_TIMESTAMPING_RX_SOFTWARE (`sock_enable_timestamp`) ; AF_UNIX ne
+/// compte pas (`sock_needs_netstamp` : ses messages prennent l'heure à
+/// l'envoi, pour qui la veut). Chacune compte une fois, de la première
+/// demande à sa fermeture ou à la fin de la dernière (SOCK_TIMESTAMP ne
+/// s'enlève pas ; RX_SOFTWARE, si).
+///
+/// Choix de conception : l'heure n'est prise à l'entrée de la pile que si
+/// la clé est allumée (`heure_d_arrivee`), comme Linux : SCM_TIMESTAMPING
+/// dit l'heure d'un paquet « s'il en a une » (SOF_TIMESTAMPING_SOFTWARE
+/// sans RX_SOFTWARE : l'heure qu'une autre socket a fait prendre, la
+/// documentation le dit, et OPT_RX_FILTER existe pour l'écarter) ; une
+/// heure toujours prise la dirait toujours. Un datagramme arrivé avant la
+/// clé n'en a donc pas : SO_TIMESTAMP le lit à l'heure de sa lecture
+/// (`__sock_recv_timestamp`, `false_tstamp`), TCP n'en dit rien (mesuré).
+/// Sans la course de Linux : sa clé statique s'allume en différé (une
+/// tâche de fond, `netstamp_work`), et le premier paquet qui suit
+/// SO_TIMESTAMP peut arriver sans heure (vu sur l'hôte) ; la nôtre est un
+/// compteur, allumé avant le retour de l'appel. Écartés : l'heure toujours
+/// prise (le choix d'avant), qui ne distingue pas ces cas ; une clé par
+/// socket, qui ne saurait pas que la pile en prend pour une autre.
+static HORODATAGES: AtomicUsize = AtomicUsize::new(0);
+
+/// L'heure d'arrivée d'un paquet qui entre dans la pile : celle de la date si
+/// la clé est allumée, 0 sinon (`net_timestamp_check`, `__net_timestamp`).
+pub fn heure_d_arrivee() -> u64 {
+    if HORODATAGES.load(Ordering::Relaxed) > 0 { crate::temps::ns_calendrier() } else { 0 }
+}
 
 /// `sk_stamp` avant toute lecture (SK_DEFAULT_STAMP : -1 s).
 pub const HORODATAGE_AUCUN: i64 = -1_000_000_000;
@@ -492,6 +535,25 @@ impl Socket {
         }
     }
 
+    /// Met à jour sa part de la clé des horodatages après un changement de
+    /// SOCK_TIMESTAMP ou de `tsflags` (`sock_enable_timestamp`,
+    /// `sock_disable_timestamp`). Sous le verrou de ses appels, comme Linux
+    /// sous celui de la socket : deux changements à la fois ne la comptent
+    /// pas de travers (le dernier à le prendre voit les deux).
+    pub fn revoir_cle(&self) {
+        let _appels = self.appels.verrouiller();
+        let veut = self.unix.is_none()
+            && (self.drapeau(TIMESTAMP) || self.tsflags.load(Ordering::Relaxed) & SOF_RX_SOFTWARE != 0);
+        if veut != self.drapeau(CLE_HORODATAGE) {
+            self.poser_drapeau(CLE_HORODATAGE, veut);
+            if veut {
+                HORODATAGES.fetch_add(1, Ordering::Relaxed);
+            } else {
+                HORODATAGES.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+
     /// Ce que SO_SELECT_ERR_QUEUE ajoute à POLLERR : POLLPRI, que `select`
     /// range dans ses exceptions (POLLEX_SET), pour attendre les erreurs sans
     /// être réveillé par les données. Pour les datagrammes d'Internet (UDP,
@@ -511,6 +573,21 @@ impl Socket {
     /// et fait de même.
     pub fn erreur_prioritaire(&self) -> u32 {
         if self.drapeau(SELECT_ERR_QUEUE) { POLLPRI } else { 0 }
+    }
+
+    /// La fille `self` d'une écoute de TCP reprend ce que `sk_clone_lock` copie
+    /// de l'écoute : ses drapeaux de réception (SO_TIMESTAMP, SO_RXQ_OVFL...),
+    /// et SO_TIMESTAMPING ; elle compte à son tour dans la clé des
+    /// horodatages si l'écoute y comptait (`net_enable_timestamp` pour la
+    /// copie : sans cela, sa fermeture ôterait de la clé une part qu'elle n'y
+    /// avait pas mise).
+    pub fn heriter_de(&self, ecoute: &Socket) {
+        let d = ecoute.drapeaux.load(Ordering::Relaxed);
+        self.drapeaux.store(d, Ordering::Relaxed);
+        self.tsflags.store(ecoute.tsflags.load(Ordering::Relaxed), Ordering::Relaxed);
+        if d & CLE_HORODATAGE != 0 {
+            HORODATAGES.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
     /// Un paquet arrive pour elle sur ce processeur (`sk_incoming_cpu_update`).
@@ -607,6 +684,9 @@ pub struct Socket {
     /// tiennent, atomiques comme eux : la tâche du réseau et l'envoi
     /// d'AF_UNIX les lisent sans le `Mutex`) : voir `RCVTSTAMP` et la suite.
     pub drapeaux: AtomicU16,
+    /// SO_TIMESTAMPING (`sk_tsflags`) : ses drapeaux SOF_TIMESTAMPING_*, tels
+    /// que posés (voir `SOF_SOFTWARE` et la suite).
+    pub tsflags: AtomicU32,
     /// L'heure du dernier datagramme lu (`sk_stamp`), que rend SIOCGSTAMP
     /// (appels_reseau.rs, `heure_du_dernier` ; la lecture l'écrit :
     /// `heure_lue`, `controle_udp`) : HORODATAGE_AUCUN tant que rien n'a été
@@ -705,6 +785,7 @@ impl Socket {
             sndbuf: AtomicU32::new(TAMPON_DEFAUT),
             pertes: AtomicU32::new(0),
             drapeaux: AtomicU16::new(0),
+            tsflags: AtomicU32::new(0),
             horodatage: AtomicI64::new(HORODATAGE_AUCUN),
             processeur: AtomicI32::new(-1),
             connectee: AtomicBool::new(false),
@@ -1206,4 +1287,14 @@ pub fn fermer(s: &Arc<Socket>) {
 /// Un numéro de socket neuf (la fille d'une écoute en prend un).
 pub fn nouveau_numero() -> u64 {
     NUMEROS.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Une socket fermée ne compte plus dans la clé des horodatages
+/// (`sk_destruct` : `sock_disable_timestamp`).
+impl Drop for Socket {
+    fn drop(&mut self) {
+        if self.drapeau(CLE_HORODATAGE) {
+            HORODATAGES.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
 }

@@ -48,7 +48,7 @@ use paquet::Paquet;
 /// lo, dans le contexte de qui l'a envoyée) : son heure d'arrivée d'abord
 /// (`net_timestamp_check`, voir paquet::Contexte).
 pub fn recevoir(i: &'static Interface, mut p: Paquet) {
-    p.horodater(crate::temps::ns_calendrier());
+    p.horodater(socket::heure_d_arrivee());
     ethernet::recevoir(i, p);
 }
 

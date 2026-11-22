@@ -230,16 +230,11 @@ pub struct Paquet {
 ///   - `horodatage` : l'heure de son arrivée (`tstamp`), en nanosecondes de
 ///     la date (CLOCK_REALTIME), posée à l'entrée de la pile (`recevoir`,
 ///     reseau/mod.rs : le `net_timestamp_check` de `netif_receive_skb`, et
-///     de `netif_rx` pour lo) ; 0 : jamais arrivé. Linux ne la prend que si
-///     une socket de la machine en veut (une clé statique,
-///     `netstamp_needed_key`, qu'allume SO_TIMESTAMP et qu'éteint la
-///     fermeture de la dernière) ; nous, toujours : le prix d'une lecture
-///     du TSC par paquet, contre une course que Linux a et que nous
-///     n'aurions pas à imiter (un datagramme arrivé juste après
-///     SO_TIMESTAMP, la clé pas encore allumée, se lit à l'heure de sa
-///     lecture : vu sur l'hôte). Un paquet que lo renvoie n'en garde
-///     aucune de son départ (`loopback_xmit` : `skb_clear_tstamp`) : celle
-///     de SO_TXTIME ne passe pas ;
+///     de `netif_rx` pour lo) si une socket de la machine veut des heures
+///     (la clé des horodatages, socket.rs, `heure_d_arrivee`) ; 0 : sans
+///     heure. Un paquet que lo renvoie n'en garde aucune de son départ
+///     (`loopback_xmit` : `skb_clear_tstamp`) : celle de SO_TXTIME ne
+///     passe pas ;
 ///   - `marque` (`mark`, SO_MARK) et `priorite` (`priority`, SO_PRIORITY) :
 ///     ceux de l'envoi, que lo garde jusqu'au datagramme reçu (SO_RCVMARK,
 ///     SO_RCVPRIORITY : mesuré). Rien d'autre ne les lit chez nous : la
@@ -400,7 +395,7 @@ impl Paquet {
         self.contexte = c;
     }
 
-    /// Il arrive dans la pile, à l'heure `ns` de la date.
+    /// Il arrive dans la pile, à l'heure `ns` de la date (0 : sans heure).
     pub fn horodater(&mut self, ns: u64) {
         self.contexte.horodatage = ns;
     }

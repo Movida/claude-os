@@ -56,7 +56,17 @@
  *     paquets, pas pour TCP ni un flux AF_UNIX ; et qui une erreur venue pendant
  *     l'attente réveille : poll et epoll qui n'attendent que POLLPRI, select qui
  *     attend aussi la lecture, mais pas un select qui n'attend que les exceptions (le
- *     réveil ne dit que POLLERR) : il ne la voit qu'à son échéance.
+ *     réveil ne dit que POLLERR) : il ne la voit qu'à son échéance ;
+ *   - SO_TIMESTAMPING, à la réception : ce qu'elle refuse (un drapeau inconnu, OPT_ID_TCP
+ *     sans OPT_ID, OPT_ID d'une socket TCP neuve ou qui écoute, OPT_STATS sans
+ *     OPT_TSONLY, BIND_PHC sans horloge), ce qu'elle relit (sa forme _NEW seulement
+ *     posée par une _NEW) ; SCM_TIMESTAMPING pour UDP, TCP, ping, la file d'erreurs, et
+ *     AF_UNIX seulement avec SO_TIMESTAMP ; SOFTWARE sans RX_SOFTWARE dit l'heure
+ *     qu'une autre socket a fait prendre (SO_TIMESTAMP, même retirée, ou RX_SOFTWARE ;
+ *     pas une socket AF_UNIX), sauf avec OPT_RX_FILTER (la file d'erreurs, si) ; un
+ *     datagramme arrivé quand personne ne voulait d'heure n'en a pas : SO_TIMESTAMP le
+ *     dit à l'heure de sa lecture, et SCM_TIMESTAMPING avec elle ; la fille d'une
+ *     écoute TCP en hérite, et compte dans la clé (toutes fermées, plus d'heure).
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -115,6 +125,20 @@
 #define TSNS_OLD 35
 #define TS_NEW 63
 #define TSNS_NEW 64
+#define TSG_OLD 37
+#define TSG_NEW 65
+/* Les drapeaux de SO_TIMESTAMPING de Linux 6.18 que les en-têtes de la glibc 2.39
+ * n'ont pas tous. */
+#define TSF_RX_SOFTWARE (1 << 3)
+#define TSF_SOFTWARE (1 << 4)
+#define TSF_MATERIEL 0x65 /* TX_HARDWARE, RX_HARDWARE, SYS_HARDWARE, RAW_HARDWARE */
+#define TSF_OPT_ID (1 << 7)
+#define TSF_OPT_TSONLY (1 << 11)
+#define TSF_OPT_STATS (1 << 12)
+#define TSF_BIND_PHC (1 << 15)
+#define TSF_OPT_ID_TCP (1 << 16)
+#define TSF_OPT_RX_FILTER (1 << 17)
+#define TSF_TX_COMPLETION (1 << 18)
 #define SIOCGSTAMP_OLD_ 0x8906
 #define SIOCGSTAMPNS_OLD_ 0x8907
 
@@ -1030,6 +1054,7 @@ static void reserve(void)
 struct vu {
     int niveau, sorte, longueur;
     long long a, b;
+    int reste; /* SCM_TIMESTAMPING : ses deux autres heures ne sont pas nulles */
 };
 
 /* recvmsg de `s` avec `drapeaux`, une place de contrôle `place` : rend ce que rend
@@ -1049,7 +1074,9 @@ static ssize_t controles(int s, int drapeaux, size_t place, struct vu *v, int *n
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c && *n < 8; c = CMSG_NXTHDR(&m, c)) {
         struct vu *x = &v[(*n)++];
         x->niveau = c->cmsg_level, x->sorte = c->cmsg_type, x->longueur = c->cmsg_len - CMSG_LEN(0);
-        x->a = x->b = 0;
+        x->a = x->b = x->reste = 0;
+        for (int i = 16; i < x->longueur && i < 48; i++)
+            x->reste |= CMSG_DATA(c)[i];
         if (x->longueur == 4) {
             int e;
             memcpy(&e, CMSG_DATA(c), 4);
@@ -1145,6 +1172,15 @@ static int heure_ok(const struct vu *v, int sorte, int min, int max)
     return age_dans(maintenant_ns() - (v->a * 1000000000LL + v->b * (ns ? 1 : 1000)), min, max);
 }
 
+/* SCM_TIMESTAMPING de la forme `sorte` : l'heure logicielle, d'âge entre `min` et
+ * `max` millisecondes, les deux autres nulles. */
+static int heures_ok(const struct vu *v, int sorte, int min, int max)
+{
+    if (v->niveau != SOL_SOCKET || v->sorte != sorte || v->longueur != 48 || v->reste || v->b < 0 || v->b >= 1000000000)
+        return 0;
+    return age_dans(maintenant_ns() - (v->a * 1000000000LL + v->b), min, max);
+}
+
 static int entier_vu(const struct vu *v, int niveau, int sorte, long long valeur)
 {
     return v->niveau == niveau && v->sorte == sorte && v->longueur == 4 && v->a == valeur;
@@ -1168,6 +1204,22 @@ static int udp_lie(struct sockaddr_in *a)
     bind(s, (void *)a, sizeof *a);
     getsockname(s, (void *)a, &l);
     return s;
+}
+
+/* Lie la socket TCP `s` à lo, au port que le noyau choisit (0), et le rend dans `a`.
+ * Pas un port pris par `udp_lie` puis rendu : libre pour UDP, il peut être celui
+ * d'une connexion TCP en TIME_WAIT (les cas précédents en laissent des centaines,
+ * pour 60 s), et l'écoute qui s'y lie échoue (EADDRINUSE) ; listen la lie alors
+ * ailleurs, et l'accept qui suit attend pour toujours (vu une fois sur douze
+ * passages, sur l'hôte comme sous le Linux de référence). Le port 0 de TCP n'en
+ * choisit pas un que tient une connexion (`inet_csk_find_open_port`). */
+static int lier_tcp(int s, struct sockaddr_in *a)
+{
+    *a = (struct sockaddr_in){.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t l = sizeof *a;
+    int r = bind(s, (void *)a, sizeof *a);
+    getsockname(s, (void *)a, &l);
+    return r;
 }
 
 /* Attendre que la clé des horodatages de la machine (`netstamp_needed_key`) soit
@@ -1533,6 +1585,283 @@ static void reception_processeur(void)
     sched_setaffinity(0, sizeof avant, &avant);
 }
 
+/* SO_TIMESTAMPING relue sous la forme `forme` : 0 si ce sont `drapeaux` et un
+ * `bind_phc` nul, sur 8 octets. */
+static int tsg(int s, int forme, int drapeaux)
+{
+    int t[2] = {-7, -7};
+    socklen_t l = sizeof t;
+    return getsockopt(s, SOL_SOCKET, forme, t, &l) == 0 && l == 8 && t[0] == drapeaux && t[1] == 0;
+}
+
+static void horodatages_option(void)
+{
+    for (int i = 0; i < SORTES; i++) {
+        int s = ouvrir(&sortes[i]), tcp = sortes[i].type == SOCK_STREAM && sortes[i].famille == AF_INET;
+        int ok = tsg(s, TSG_OLD, 0) && tsg(s, TSG_NEW, 0) && poser(s, TSG_OLD, 1 << 19) == EINVAL
+                 && poser(s, TSG_OLD, -1) == EINVAL && poser(s, TSG_OLD, TSF_OPT_ID_TCP) == EINVAL
+                 && poser(s, TSG_OLD, TSF_OPT_STATS) == EINVAL && tsg(s, TSG_OLD, 0)
+                 && poser(s, TSG_OLD, TSF_OPT_STATS | TSF_OPT_TSONLY) == 0 && tsg(s, TSG_OLD, TSF_OPT_STATS | TSF_OPT_TSONLY)
+                 && poser(s, TSG_OLD, TSF_MATERIEL | TSF_TX_COMPLETION) == 0 && tsg(s, TSG_OLD, TSF_MATERIEL | TSF_TX_COMPLETION)
+                 && poser(s, TSG_OLD, TSF_OPT_ID) == (tcp ? EINVAL : 0) && poser(s, TSG_OLD, TSF_BIND_PHC) == EOPNOTSUPP;
+        verifier(ok, dire("SO_TIMESTAMPING %s : les drapeaux refuses (OPT_ID : TCP neuve), les autres relus", sortes[i].nom));
+        struct {
+            int drapeaux, bind_phc;
+        } st = {TSF_SOFTWARE, 5};
+        short court = 1;
+        int quatre = -7;
+        socklen_t l = 4;
+        ok = erreur(setsockopt(s, SOL_SOCKET, TSG_NEW, &st, sizeof st)) == 0 && tsg(s, TSG_OLD, TSF_SOFTWARE)
+             && tsg(s, TSG_NEW, TSF_SOFTWARE) && poser(s, TSG_OLD, TSF_SOFTWARE) == 0 && tsg(s, TSG_NEW, 0)
+             && tsg(s, TSG_OLD, TSF_SOFTWARE) && getsockopt(s, SOL_SOCKET, TSG_OLD, &quatre, &l) == 0 && l == 4
+             && quatre == TSF_SOFTWARE && erreur(setsockopt(s, SOL_SOCKET, TSG_OLD, &court, 2)) == EINVAL;
+        verifier(ok, dire("SO_TIMESTAMPING %s : la so_timestamping, la forme _NEW relue seulement posee par elle", sortes[i].nom));
+        close(s);
+    }
+    struct sockaddr_in a;
+    int s = udp_lie(&a), l = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3);
+    bind(l, (void *)&a, sizeof a);
+    close(s);
+    listen(l, 1);
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(s, SOL_SOCKET, SO_BINDTODEVICE, "lo", 3);
+    verifier(poser(s, TSG_OLD, TSF_BIND_PHC) == EINVAL && poser(l, TSG_OLD, TSF_OPT_ID) == EINVAL,
+             "SO_TIMESTAMPING : BIND_PHC liee a lo (sans horloge PTP) EINVAL ; OPT_ID d'une ecoute EINVAL");
+    close(s), close(l);
+}
+
+/* Le premier message de contrôle d'une lecture de `s` (sans attendre), et leur nombre. */
+static int lire_controles(int s, int drapeaux, struct vu *v)
+{
+    int n, f;
+    memset(v, 0, 3 * sizeof *v);
+    return controles(s, drapeaux | MSG_DONTWAIT, 512, v, &n, &f) < 0 ? -1 : n;
+}
+
+/* La clé des horodatages (`netstamp_needed_key`) est celle de TOUTE la machine : un
+ * autre programme qui demande l'heure d'arrivée des paquets (SO_TIMESTAMP,
+ * RX_SOFTWARE : un démon de l'heure, un autre test) l'allume pour tous. Les
+ * vérifications qui la veulent éteinte l'attendent donc (`cle_eteinte` : un
+ * datagramme toutes les 70 ms, lu par une socket qui n'a que SOFTWARE, jusqu'à un
+ * sans heure). La voir éteinte une fois suffit : pendant l'attente, ce programme
+ * n'ouvre ni ne ferme rien de ce qui compte, et la part d'une socket qu'il garde ne
+ * s'en va pas toute seule ; un seul datagramme sans heure prouve qu'aucune n'en tient,
+ * et que celles qu'il a fermées ont rendu la leur. Celle d'un autre programme, elle,
+ * finit par partir : il suffit de l'attendre. Sur WSL, un programme hors du
+ * conteneur (invisible d'ici ; toutes les 30 s, à l'instant où l'horloge murale
+ * saute : la synchronisation de l'heure) la tient d'ordinaire 20 à 100 ms, et
+ * parfois 15 s (guetté le 23/11/2026 : 15,09 s). L'attente va jusqu'à 30 s : le
+ * double de cette plus longue, et sous les 60 s que `make tests-hote` laisse à tout
+ * le programme (22 s d'ordinaire) même quand deux d'entre elles tombent dans un
+ * passage. Elle ne coûte qu'à une clé tenue : éteinte, la première ronde rend. Une
+ * part jamais rendue échoue toujours, et l'attente échue se dit. Tenue par un autre
+ * dès le départ (mesuré au début, avant que ce programme n'y touche :
+ * `cle_tenue_ailleurs`), elles sont sautées, en le disant. Linux l'éteint en
+ * différé, comme il l'allume (`cle_allumee`) : 31 ms mesurés à côté d'un QEMU,
+ * 44 ms les cœurs de l'hôte occupés ; une socket UDP liée ne rend même sa part
+ * qu'après un délai de grâce de RCU (`SOCK_RCU_FREE` : 30 à 56 ms de plus, mesuré).
+ * Le témoin d'ici n'a que SOFTWARE : il ne compte pas dans la clé, et ne la retient
+ * donc pas ; celui de `cle_allumee` la demande (SO_TIMESTAMPNS), là où une socket du
+ * cas la tient déjà, et sa part s'en va avec lui, après le délai de RCU, que
+ * `cle_eteinte` attend comme les autres. Écartés : rejouer la vérification échouée
+ * (la même attente, et le code de chaque cas en double) ; la sauter sur une machine
+ * partagée (WSL, où se font les vérifications de David, ne la jugerait plus). */
+static int cle_tenue_ailleurs;
+
+static int cle_eteinte(void)
+{
+    struct sockaddr_in a, b;
+    struct vu v[8];
+    int r = udp_lie(&a), e = udp_lie(&b), eteinte = 0;
+    poser(r, TSG_OLD, TSF_SOFTWARE);
+    for (int i = 0; i < 430 && !eteinte; i++) {
+        attendre_ms(50);
+        sendto(e, "abc", 3, 0, (void *)&a, sizeof a);
+        attendre_ms(20);
+        eteinte = lire_controles(r, 0, v) == 0;
+    }
+    close(r), close(e);
+    if (!eteinte)
+        printf("[linux] options-socket : la cle des horodatages encore allumee apres 30 s\n");
+    return eteinte;
+}
+
+/* Une vérification qui veut la clé éteinte : vraie si elle l'est (dans les 30 s), ou
+ * si un autre programme la tenait dès le départ (sautée). */
+static int sans_cle(void)
+{
+    return cle_tenue_ailleurs || cle_eteinte();
+}
+
+static void horodatages_reception(void)
+{
+    struct sockaddr_in a, b;
+    struct vu v[8];
+    int r = udp_lie(&a), e = udp_lie(&b), n;
+    /* La socket qui allume la clé (celle qui lit, ou une autre) l'attend allumée
+     * (`cle_allumee`), une fois, juste après sa demande. */
+#define ENVOYER_LIRE(rr) (sendto(e, "abc", 3, 0, (void *)&a, sizeof a), attendre_ms(20), lire_controles(rr, 0, v))
+    poser(r, TSG_OLD, TSF_RX_SOFTWARE | TSF_SOFTWARE);
+    cle_allumee();
+    n = ENVOYER_LIRE(r);
+    int ok = n == 1 && heures_ok(&v[0], TSG_OLD, 0, 5000);
+    poser(r, TSG_NEW, TSF_RX_SOFTWARE | TSF_SOFTWARE);
+    n = ENVOYER_LIRE(r);
+    ok &= n == 1 && heures_ok(&v[0], TSG_NEW, 0, 5000);
+    poser(r, TSNS_OLD, 1);
+    n = ENVOYER_LIRE(r);
+    ok &= n == 2 && v[0].sorte == TSNS_OLD && heures_ok(&v[1], TSG_OLD, 0, 5000);
+    poser(r, TSNS_OLD, 0);
+    poser(r, TSG_OLD, TSF_RX_SOFTWARE);
+    ok &= ENVOYER_LIRE(r) == 0;
+    verifier(ok, "SCM_TIMESTAMPING UDP : RX_SOFTWARE et SOFTWARE, _OLD ou _NEW (la derniere forme posee, SO_TIMESTAMPNS compris), apres SO_TIMESTAMP ; RX_SOFTWARE seul, rien");
+    /* Une socket neuve : celle-là garde SOCK_TIMESTAMP, et la clé, jusqu'à sa fermeture. */
+    close(r);
+    r = udp_lie(&a);
+    poser(r, TSG_OLD, TSF_SOFTWARE);
+    ok = sans_cle();
+    int autre = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(autre, TSG_OLD, TSF_RX_SOFTWARE);
+    cle_allumee();
+    n = ENVOYER_LIRE(r);
+    ok &= n == 1 && heures_ok(&v[0], TSG_OLD, 0, 5000);
+    poser(r, TSG_OLD, TSF_SOFTWARE | TSF_OPT_RX_FILTER);
+    ok &= ENVOYER_LIRE(r) == 0;
+    close(autre);
+    poser(r, TSG_OLD, TSF_SOFTWARE);
+    ok &= sans_cle();
+    autre = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(autre, TS_OLD, 1), poser(autre, TS_OLD, 0);
+    cle_allumee();
+    n = ENVOYER_LIRE(r);
+    ok &= n == 1 && heures_ok(&v[0], TSG_OLD, 0, 5000);
+    close(autre);
+    int u[2];
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, u);
+    poser(u[0], TS_OLD, 1);
+    ok &= sans_cle();
+    close(u[0]), close(u[1]);
+    verifier(ok, "SCM_TIMESTAMPING UDP, SOFTWARE seul : l'heure qu'une autre socket fait prendre (RX_SOFTWARE, SO_TIMESTAMP meme retiree ; pas AF_UNIX), sauf OPT_RX_FILTER");
+    /* Une lecture qui ne dit pas l'heure (SO_RXQ_OVFL seul, ping) la laisse
+     * quand même à SIOCGSTAMP, sans SOCK_TIMESTAMP (`sock_recv_timestamp`) :
+     * celle du paquet quand une autre socket a allumé la clé. */
+    close(r);
+    r = udp_lie(&a);
+    poser(r, SO_RXQ_OVFL, 1);
+    int ping = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    autre = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(autre, TSG_OLD, TSF_RX_SOFTWARE);
+    cle_allumee();
+    ok = ENVOYER_LIRE(r) == 0;
+    unsigned char demande[8] = {8, 0, 0, 0, 0, 0, 0, 2};
+    struct sockaddr_in lo = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    sendto(ping, demande, sizeof demande, 0, (void *)&lo, sizeof lo);
+    attendre_ms(20);
+    ok &= lire_controles(ping, 0, v) == 0;
+    close(autre);
+    attendre_ms(300);
+    long long age_udp = -1, age_ping = -1;
+    ok &= siocgstamp(r, &age_udp) == 0 && age_dans(age_udp * 1000000LL, 250, 4999);
+    ok &= siocgstamp(ping, &age_ping) == 0 && age_dans(age_ping * 1000000LL, 250, 4999);
+    char q[160];
+    snprintf(q, sizeof q, "SIOCGSTAMP apres une lecture qui ne dit pas l'heure (SO_RXQ_OVFL seul, ping), la cle allumee par une autre : celle du paquet (%lld et %lld ms)", age_udp, age_ping);
+    verifier(ok, q);
+    close(ping);
+    /* Un datagramme arrivé sans clé : SO_TIMESTAMP le dit à l'heure de la lecture,
+     * SCM_TIMESTAMPING avec elle ; sans SO_TIMESTAMP, rien. La clé qu'un autre
+     * programme allumerait pendant l'envoi : cinq essais (voir `cle_eteinte`). */
+    close(r);
+    ok = cle_tenue_ailleurs;
+    for (int essai = 0; essai < 5 && !ok; essai++) {
+        r = udp_lie(&a);
+        cle_eteinte();
+        sendto(e, "abc", 3, 0, (void *)&a, sizeof a);
+        sendto(e, "abc", 3, 0, (void *)&a, sizeof a);
+        attendre_ms(300);
+        poser(r, TSG_OLD, TSF_RX_SOFTWARE | TSF_SOFTWARE);
+        ok = lire_controles(r, 0, v) == 0;
+        poser(r, TS_OLD, 1);
+        n = lire_controles(r, 0, v);
+        ok &= n == 2 && heure_ok(&v[0], TS_OLD, 0, 200) && heures_ok(&v[1], TSG_OLD, 0, 200);
+        close(r);
+    }
+    verifier(ok, "un datagramme arrive sans cle : SO_TIMESTAMP a l'heure de la lecture, SCM_TIMESTAMPING avec elle ; sans SO_TIMESTAMP, rien");
+    /* La file d'erreurs : SOFTWARE et OPT_RX_FILTER n'y filtrent rien. */
+    int s = socket(AF_INET, SOCK_DGRAM, 0), un = 1;
+    setsockopt(s, IPPROTO_IP, IP_RECVERR, &un, sizeof un);
+    poser(s, TSG_OLD, TSF_SOFTWARE | TSF_OPT_RX_FILTER);
+    autre = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(autre, TSG_OLD, TSF_RX_SOFTWARE);
+    cle_allumee();
+    connect(s, (void *)&a, sizeof a);
+    send(s, "h", 1, 0);
+    attendre_ms(50);
+    n = lire_controles(s, MSG_ERRQUEUE, v);
+    verifier(n == 2 && heures_ok(&v[0], TSG_OLD, 0, 5000) && v[1].niveau == IPPROTO_IP && v[1].sorte == IP_RECVERR,
+             "SCM_TIMESTAMPING de la file d'erreurs : SOFTWARE et OPT_RX_FILTER, puis IP_RECVERR");
+    close(s), close(autre), close(e);
+    /* TCP, ping, AF_UNIX. */
+    s = socket(AF_INET, SOCK_STREAM, 0);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    lier_tcp(s, &a);
+    listen(s, 1);
+    connect(c, (void *)&a, sizeof a);
+    int d = accept(s, NULL, NULL);
+    poser(d, TSG_OLD, TSF_RX_SOFTWARE | TSF_SOFTWARE);
+    cle_allumee();
+    send(c, "rx", 2, 0);
+    attendre_ms(20);
+    n = lire_controles(d, 0, v);
+    verifier(n == 1 && heures_ok(&v[0], TSG_OLD, 0, 5000), "SCM_TIMESTAMPING TCP");
+    close(c), close(d), close(s);
+    int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    poser(p, TSG_NEW, TSF_RX_SOFTWARE | TSF_SOFTWARE);
+    cle_allumee();
+    unsigned char echo[8] = {8, 0, 0, 0, 0, 0, 0, 1};
+    a.sin_port = 0;
+    sendto(p, echo, sizeof echo, 0, (void *)&a, sizeof a);
+    attendre_ms(50);
+    n = lire_controles(p, 0, v);
+    verifier(n == 1 && heures_ok(&v[0], TSG_NEW, 0, 5000), "SCM_TIMESTAMPING ping");
+    close(p);
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, u);
+    poser(u[1], TSG_OLD, TSF_RX_SOFTWARE | TSF_SOFTWARE);
+    send(u[0], "a", 1, 0);
+    ok = lire_controles(u[1], 0, v) == 0;
+    poser(u[1], TS_OLD, 1);
+    send(u[0], "b", 1, 0);
+    n = lire_controles(u[1], 0, v);
+    verifier(ok && n == 2 && heure_ok(&v[0], TS_OLD, 0, 5000) && heures_ok(&v[1], TSG_OLD, 0, 5000),
+             "SCM_TIMESTAMPING AF_UNIX : seulement avec SO_TIMESTAMP, apres lui");
+    close(u[0]), close(u[1]);
+#undef ENVOYER_LIRE
+}
+
+/* La fille d'une écoute TCP hérite de SO_TIMESTAMPING (`sk_clone_lock`), et compte à
+ * son tour dans la clé des horodatages : toutes fermées, la clé s'éteint, et une
+ * socket qui n'a que SOFTWARE ne voit plus d'heure. */
+static void horodatages_fille(void)
+{
+    struct sockaddr_in t;
+    struct vu v[8];
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    lier_tcp(l, &t);
+    poser(l, TSG_OLD, TSF_RX_SOFTWARE | TSF_SOFTWARE);
+    listen(l, 1);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&t, sizeof t);
+    int d = accept(l, NULL, NULL);
+    int ok = lire(d, TSG_OLD) == (TSF_RX_SOFTWARE | TSF_SOFTWARE);
+    cle_allumee();
+    send(c, "ab", 2, 0);
+    attendre_ms(20);
+    ok &= lire_controles(d, 0, v) == 1 && heures_ok(&v[0], TSG_OLD, 0, 5000);
+    close(c), close(d), close(l);
+    ok &= sans_cle();
+    verifier(ok, "SO_TIMESTAMPING d'une ecoute TCP : sa fille l'herite, et compte dans la cle (toutes fermees, plus d'heure)");
+}
+
 /* Ce que poll dit prêt, sans attendre. */
 static int pret(int s)
 {
@@ -1670,6 +1999,10 @@ static void select_err_queue(void)
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    cle_tenue_ailleurs = !cle_eteinte();
+    if (cle_tenue_ailleurs)
+        printf("[linux] options-socket : la cle des horodatages de la machine est tenue par un autre programme : "
+               "les verifications qui la veulent eteinte sont sautees\n");
     peercred();
     reuseport();
     ping_reuseaddr();
@@ -1694,6 +2027,9 @@ int main(void)
     reception_tcp();
     reception_processeur();
     select_err_queue();
+    horodatages_option();
+    horodatages_reception();
+    horodatages_fille();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

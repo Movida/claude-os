@@ -201,7 +201,7 @@ fn vider_ici() {
                 Some(i) => {
                     // La copie d'une diffusion arrive à son tour (`netif_rx`).
                     let mut p = t.paquet;
-                    p.horodater(crate::temps::ns_calendrier());
+                    p.horodater(super::socket::heure_d_arrivee());
                     super::ipv4::recevoir_la_diffusion(i, p)
                 }
             }

@@ -169,6 +169,18 @@ const SO_INQ: i32 = 84;
 const SCM_INQ: i32 = SO_INQ;
 /// POLLPRI avec POLLERR (`Socket::erreur_prioritaire`).
 const SO_SELECT_ERR_QUEUE: i32 = 45;
+/// SO_TIMESTAMPING, sous ses deux formes, qui sont aussi
+/// les numéros de son message de contrôle (SCM_TIMESTAMPING), et les drapeaux
+/// SOF_TIMESTAMPING_* que la réception ne regarde pas (socket.rs a les siens) :
+/// les 19 connus (MASK), OPT_ID, OPT_TSONLY, OPT_STATS, BIND_PHC, OPT_ID_TCP.
+const SO_TIMESTAMPING_OLD: i32 = 37;
+const SO_TIMESTAMPING_NEW: i32 = 65;
+const SOF_MASK: u32 = (1 << 19) - 1;
+const SOF_OPT_ID: u32 = 1 << 7;
+const SOF_OPT_TSONLY: u32 = 1 << 11;
+const SOF_OPT_STATS: u32 = 1 << 12;
+const SOF_BIND_PHC: u32 = 1 << 15;
+const SOF_OPT_ID_TCP: u32 = 1 << 16;
 /// Les horloges que SO_TXTIME accepte (`sockopt_validate_clockid`).
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -811,7 +823,8 @@ struct Reception {
 /// Les messages de contrôle de SOL_SOCKET d'une réception, que calcule toute
 /// lecture (elle tient à jour l'heure que rend SIOCGSTAMP) et qu'écrit
 /// `recvmsg` : SO_TIMESTAMP sous la forme posée (son numéro et ses 16
-/// octets), SO_RXQ_OVFL, SO_MARK, SO_PRIORITY, et SCM_INQ (AF_UNIX en flux).
+/// octets), SCM_TIMESTAMPING (`Horodatages`), SO_RXQ_OVFL, SO_MARK,
+/// SO_PRIORITY, et SCM_INQ (AF_UNIX en flux).
 /// Qui en dit quoi, comme Linux (mesuré) : UDP, tout (`sock_recv_cmsgs`) ;
 /// ping et la file d'erreurs, l'heure seule (`sock_recv_timestamp`) ;
 /// AF_UNIX, l'heure d'un DGRAM ou d'un SEQPACKET (`__sock_recv_timestamp`),
@@ -819,6 +832,7 @@ struct Reception {
 #[derive(Default)]
 struct ControleSocket {
     horodatage: Option<(i32, [u8; 16])>,
+    horodatages: Option<Horodatages>,
     pertes: Option<u32>,
     marque: Option<u32>,
     priorite: Option<u32>,
@@ -849,28 +863,65 @@ fn heure_demandee(s: &Socket, ns: u64) -> Option<(i32, [u8; 16])> {
     Some((sorte, o))
 }
 
-/// L'heure d'une lecture de ping ou de la file d'erreurs (`sock_recv_timestamp`) :
-/// SO_TIMESTAMP la dit ; sinon, elle devient celle que rendra SIOCGSTAMP
-/// (`sock_write_timestamp`, 0 pour une erreur locale : SIOCGSTAMP prendra la
-/// sienne).
-fn heure_lue(s: &Socket, ns: u64) -> Option<(i32, [u8; 16])> {
-    let h = heure_demandee(s, ns);
-    if h.is_none() {
-        s.horodatage.store(ns as i64, Ordering::Relaxed);
+/// SCM_TIMESTAMPING : son numéro (la forme posée, _NEW ou _OLD) et ses trois
+/// `timespec` (les mêmes 48 octets sur x86_64) : l'heure logicielle, un champ
+/// d'autrefois toujours nul, et celle de la carte, qu'aucune des nôtres ne
+/// donne (SOF_TIMESTAMPING_RAW_HARDWARE n'y trouve jamais rien).
+type Horodatages = (i32, [u8; 48]);
+
+/// Ce que dit une lecture de l'heure `ns` d'un paquet (`__sock_recv_timestamp`) :
+/// SO_TIMESTAMP si la socket l'a (une heure nulle, un paquet arrivé sans clé,
+/// devient celle de la lecture, et vaut alors pour la suite : le
+/// `false_tstamp`) ; SCM_TIMESTAMPING si elle a SOF_TIMESTAMPING_SOFTWARE et
+/// que le paquet a une heure, prise pour elle (RX_SOFTWARE), ou pour une
+/// autre si elle n'a pas OPT_RX_FILTER, ou que c'est une entrée de la file
+/// d'erreurs (`file_erreurs`).
+fn heures_dites(s: &Socket, ns: u64, file_erreurs: bool) -> (Option<(i32, [u8; 16])>, Option<Horodatages>) {
+    let ns = if ns == 0 && s.drapeau(socket::RCVTSTAMP) { crate::temps::ns_calendrier() } else { ns };
+    let ts = s.tsflags.load(Ordering::Relaxed);
+    let dites = ts & socket::SOF_SOFTWARE != 0
+        && (ts & socket::SOF_RX_SOFTWARE != 0 || file_erreurs || ts & socket::SOF_OPT_RX_FILTER == 0)
+        && ns != 0;
+    let horodatages = dites.then(|| {
+        let mut o = [0u8; 48];
+        o[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+        o[8..16].copy_from_slice(&(ns % 1_000_000_000).to_le_bytes());
+        (if s.drapeau(socket::TSTAMP_NEW) { SO_TIMESTAMPING_NEW } else { SO_TIMESTAMPING_OLD }, o)
+    });
+    (heure_demandee(s, ns), horodatages)
+}
+
+/// L'heure d'une lecture d'UDP, de ping ou de la file d'erreurs
+/// (`sock_recv_timestamp`) : dite (`heures_dites`) si la socket a SO_TIMESTAMP,
+/// SOF_TIMESTAMPING_RX_SOFTWARE, ou SOFTWARE et que le paquet a une heure ;
+/// sinon, elle devient celle que rendra SIOCGSTAMP (`sock_write_timestamp`),
+/// même sans SOCK_TIMESTAMP : un paquet qui a une heure (la clé allumée par
+/// une autre socket) la laisse à SIOCGSTAMP ; un paquet sans heure y met 0, et
+/// SIOCGSTAMP prendra la sienne. (La lecture d'UDP sans aucun drapeau, elle,
+/// suit l'autre branche de `sock_recv_cmsgs` : `controle_udp`.)
+fn heure_lue(s: &Socket, ns: u64, file_erreurs: bool) -> (Option<(i32, [u8; 16])>, Option<Horodatages>) {
+    let ts = s.tsflags.load(Ordering::Relaxed);
+    if s.drapeau(socket::RCVTSTAMP) || ts & socket::SOF_RX_SOFTWARE != 0 || (ns != 0 && ts & socket::SOF_SOFTWARE != 0) {
+        return heures_dites(s, ns, file_erreurs);
     }
-    h
+    s.horodatage.store(ns as i64, Ordering::Relaxed);
+    (None, None)
 }
 
 /// Ce que dit la lecture d'un datagramme UDP (`sock_recv_cmsgs`) : si la socket
-/// a l'un de ses quatre drapeaux, l'heure (`heure_lue`), les pertes d'avant lui
+/// a l'un de ses quatre drapeaux, ou SOF_TIMESTAMPING_SOFTWARE ou RAW_HARDWARE
+/// (SOCK_TIMESTAMPING_ANY), l'heure (`heure_lue`), les pertes d'avant lui
 /// s'il y en a eu, sa marque, sa priorité ; sinon, avec SOCK_TIMESTAMP
 /// (SIOCGSTAMP l'a demandé), l'heure gardée pour SIOCGSTAMP ; sinon, la
 /// première lecture garde 0 (SIOCGSTAMP prendra la sienne, plus ENOENT).
 fn controle_udp(s: &Socket, r: &socket::Recu) -> ControleSocket {
     let d = s.drapeaux.load(Ordering::Relaxed);
+    let ts = s.tsflags.load(Ordering::Relaxed);
     let mut c = ControleSocket::default();
-    if d & (socket::RXQ_OVFL | socket::RCVTSTAMP | socket::RCVMARK | socket::RCVPRIORITY) != 0 {
-        c.horodatage = heure_lue(s, r.contexte.horodatage);
+    if d & (socket::RXQ_OVFL | socket::RCVTSTAMP | socket::RCVMARK | socket::RCVPRIORITY) != 0
+        || ts & (socket::SOF_SOFTWARE | socket::SOF_RAW_HARDWARE) != 0
+    {
+        (c.horodatage, c.horodatages) = heure_lue(s, r.contexte.horodatage, false);
         c.pertes = (d & socket::RXQ_OVFL != 0 && r.pertes != 0).then_some(r.pertes);
         c.marque = (d & socket::RCVMARK != 0).then_some(r.contexte.marque);
         c.priorite = (d & socket::RCVPRIORITY != 0).then_some(r.contexte.priorite);
@@ -902,7 +953,8 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
             coupe: copie < total, ip: e.controle(), contexte: Default::default(), pertes: 0,
         };
         let d = if recu.coupe { MSG_TRUNC } else { 0 } | MSG_ERRQUEUE as u32;
-        let socket = ControleSocket { horodatage: heure_lue(o.socket(), e.horodatage), ..Default::default() };
+        let (horodatage, horodatages) = heure_lue(o.socket(), e.horodatage, true);
+        let socket = ControleSocket { horodatage, horodatages, ..Default::default() };
         return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: Some(e), fichiers: Vec::new(), droits: None, socket });
     }
     if o.socket().protocole == Protocole::Tcp && drapeaux & MSG_OOB != 0 {
@@ -924,13 +976,18 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let recu = socket::Recu::sans_emetteur(u.longueur, u.coupe);
         let d = if u.coupe { MSG_TRUNC } else { 0 } | if u.urgent { MSG_OOB as u32 } else { 0 };
         let droits = u.scm.then_some(u.droits);
-        // L'heure d'un message lu (un DGRAM, un SEQPACKET) ; ce qui reste à lire
-        // d'un flux, après toute lecture qui réussit, même vide (la fin) ou
-        // MSG_PEEK, mais pas l'octet urgent (`unix_stream_read_generic`).
+        // L'heure d'un message lu (un DGRAM, un SEQPACKET), seulement avec
+        // SO_TIMESTAMP (`unix_dgram_recvmsg` : SO_TIMESTAMPING seule n'en dit
+        // rien) ; ce qui reste à lire d'un flux, après toute lecture qui
+        // réussit, même vide (la fin) ou MSG_PEEK, mais pas l'octet urgent
+        // (`unix_stream_read_generic`).
         let s = o.socket();
         let flux = s.sorte == unix::SOCK_STREAM;
+        let (horodatage, horodatages) =
+            if !flux && u.scm && s.drapeau(socket::RCVTSTAMP) { heures_dites(s, u.horodatage, false) } else { (None, None) };
         let socket = ControleSocket {
-            horodatage: if !flux && u.scm { heure_demandee(s, u.horodatage) } else { None },
+            horodatage,
+            horodatages,
             inq: if flux && !u.urgent && s.drapeau(socket::INQ) { unix::a_lire(s).ok().map(|n| n as i32) } else { None },
             ..Default::default()
         };
@@ -943,9 +1000,14 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
             copier_vers_morceaux_depuis(morceaux, decalage, octets)
         })?;
         let recu = socket::Recu::sans_emetteur(n, false);
-        // Une heure seulement si la lecture a touché des octets reçus, et jamais
-        // la sienne (`tcp_recv_timestamp` : une heure nulle ne dit rien).
-        let socket = ControleSocket { horodatage: heure.filter(|&h| h != 0).and_then(|h| heure_demandee(o.socket(), h)), ..Default::default() };
+        // Une heure seulement si la lecture a touché des octets reçus avec une
+        // heure, et jamais la sienne (`tcp_recv_timestamp` : une heure nulle ne
+        // dit rien) ; SCM_TIMESTAMPING sans regarder la file d'erreurs.
+        let (horodatage, horodatages) = match heure.filter(|&h| h != 0) {
+            Some(h) => heures_dites(o.socket(), h, false),
+            None => (None, None),
+        };
+        let socket = ControleSocket { horodatage, horodatages, ..Default::default() };
         return Ok(Reception { recu, nom_unix: None, drapeaux: 0, erreur: None, fichiers: Vec::new(), droits: None, socket });
     }
     let recu = socket::prendre(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |octets| copier_vers_morceaux(morceaux, octets))?;
@@ -955,7 +1017,10 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
     let socket = match s.protocole {
         _ if recu.vide => ControleSocket::default(),
         Protocole::Udp => controle_udp(s, &recu),
-        _ => ControleSocket { horodatage: heure_lue(s, recu.contexte.horodatage), ..Default::default() },
+        _ => {
+            let (horodatage, horodatages) = heure_lue(s, recu.contexte.horodatage, false);
+            ControleSocket { horodatage, horodatages, ..Default::default() }
+        }
     };
     Ok(Reception { recu, nom_unix: None, drapeaux, erreur: None, fichiers: Vec::new(), droits: None, socket })
 }
@@ -1056,8 +1121,8 @@ fn aligner(n: usize) -> usize {
 /// (sa priorité : un `u32`, EINVAL, puis 0 à 6 sans droits, EPERM), et
 /// IP_TOS donne aussi sa priorité (`rt_tos2priority`) : de ces deux-là, le
 /// dernier compte, dans l'ordre des messages (mesuré : IP_TOS 0x10, la
-/// priorité 6) ; un autre : EINVAL (un écart pour l'horodatage,
-/// SO_TIMESTAMPING) ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
+/// priorité 6) ; un autre : EINVAL (un écart pour l'horodatage de
+/// l'émission, SO_TIMESTAMPING et SCM_TS_OPT_ID) ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
 /// niveau est ignoré. Selon qui lit (`protocole`), comme chez Linux : UDP
 /// lit SOL_UDP (`udp_cmsg_send`), puis SOL_IP et SOL_SOCKET
 /// (`ip_cmsg_send`) ; ping, seulement ces deux-là (SOL_UDP est sauté) ; TCP,
@@ -1337,13 +1402,17 @@ impl ControleSortant {
             *drapeaux |= MSG_CTRUNC;
             longueur = reste;
         }
-        // La plus longue : les options IP (IP_RECVOPTS, IP_RETOPTS), 40 octets.
-        let mut o = [0u8; CMSG_ENTETE + 40];
+        // L'en-tête, puis les données, coupées à la place qui reste (sans copie
+        // intermédiaire : SCM_TIMESTAMPING a 48 octets, et rien ne borne ce que
+        // dira un message à venir).
+        let mut o = [0u8; CMSG_ENTETE];
         o[..8].copy_from_slice(&longueur.to_le_bytes());
         o[8..12].copy_from_slice(&niveau.to_le_bytes());
         o[12..16].copy_from_slice(&sorte.to_le_bytes());
-        o[16..16 + donnees.len()].copy_from_slice(donnees);
-        if copier_vers_utilisateur(self.adresse + self.utilise, &o[..longueur as usize]).is_err() {
+        let corps = &donnees[..longueur as usize - CMSG_ENTETE];
+        if copier_vers_utilisateur(self.adresse + self.utilise, &o).is_err()
+            || copier_vers_utilisateur(self.adresse + self.utilise + CMSG_ENTETE as u64, corps).is_err()
+        {
             return;
         }
         self.utilise += (aligner(CMSG_ENTETE + donnees.len()) as u64).min(reste);
@@ -1419,6 +1488,9 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
     // Ceux de SOL_SOCKET d'abord (`sock_recv_cmsgs`, avant les adresses et IP ;
     // l'heure d'AF_UNIX avant ses droits), dans l'ordre de `__sock_recv_cmsgs`.
     if let Some((sorte, o)) = &r.socket.horodatage {
+        c.ecrire(SOL_SOCKET, *sorte, o, &mut r.drapeaux);
+    }
+    if let Some((sorte, o)) = &r.socket.horodatages {
         c.ecrire(SOL_SOCKET, *sorte, o, &mut r.drapeaux);
     }
     for (sorte, v) in [(SO_RXQ_OVFL, r.socket.pertes), (SO_MARK, r.socket.marque), (SO_PRIORITY, r.socket.priorite)] {
@@ -1714,6 +1786,38 @@ pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
     })())
 }
 
+/// SO_TIMESTAMPING (`sock_set_timestamping`), dans l'ordre de Linux : un drapeau
+/// inconnu (EINVAL) ; OPT_ID_TCP sans OPT_ID (EINVAL) ; OPT_ID nouveau pour une
+/// socket TCP fermée ou qui écoute (EINVAL : son compteur partirait d'un numéro
+/// de séquence qu'elle n'a pas encore) ; OPT_STATS sans OPT_TSONLY (EINVAL) ;
+/// BIND_PHC (une horloge PTP de la carte liée : EOPNOTSUPP sans carte liée,
+/// EINVAL sinon, aucune des nôtres n'en a). Puis les drapeaux, la forme des
+/// messages (SOCK_TSTAMP_NEW, partagé avec SO_TIMESTAMP : la dernière posée
+/// décide pour les deux), et la clé des horodatages (RX_SOFTWARE).
+/// Les drapeaux du matériel (TX_HARDWARE, RX_HARDWARE, RAW_HARDWARE,
+/// SYS_HARDWARE, OPT_PKTINFO, OPT_TX_SWHW) et TX_COMPLETION se gardent sans
+/// effet visible : aucune de nos cartes ne donne d'heure, et seul Bluetooth
+/// dit la fin d'un envoi.
+fn horodatages(s: &Socket, option: i32, d: u32) -> Result<(), i64> {
+    let avant = s.tsflags.load(Ordering::Relaxed);
+    if d & !SOF_MASK != 0 || (d & SOF_OPT_ID_TCP != 0 && d & SOF_OPT_ID == 0) {
+        return Err(-EINVAL);
+    }
+    if d & SOF_OPT_ID != 0 && avant & SOF_OPT_ID == 0 && s.protocole == Protocole::Tcp && tcp::fermee_ou_ecoute(s) {
+        return Err(-EINVAL);
+    }
+    if d & SOF_OPT_STATS != 0 && d & SOF_OPT_TSONLY == 0 {
+        return Err(-EINVAL);
+    }
+    if d & SOF_BIND_PHC != 0 {
+        return Err(if s.appels.verrouiller().options.interface == 0 { -EOPNOTSUPP } else { -EINVAL });
+    }
+    s.tsflags.store(d, Ordering::Relaxed);
+    s.poser_drapeau(socket::TSTAMP_NEW, option == SO_TIMESTAMPING_NEW);
+    s.revoir_cle();
+    Ok(())
+}
+
 /// Les options de SOL_SOCKET, dans l'ordre de `sk_setsockopt` : SO_BINDTODEVICE
 /// (un nom, avant tout entier) ; puis une valeur d'au moins 4 octets (EINVAL),
 /// lue (EFAULT), et l'option.
@@ -1755,8 +1859,21 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             if oui {
                 s.poser_drapeau(socket::TSTAMP_NEW, matches!(option, SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW));
                 s.poser_drapeau(socket::TIMESTAMP, true);
+                s.revoir_cle();
             }
             return Ok(());
+        }
+        // Un entier, ou la `so_timestamping` entière (exactement 8 octets : les
+        // drapeaux, puis `bind_phc`, qui ne sert qu'avec BIND_PHC).
+        SO_TIMESTAMPING_OLD | SO_TIMESTAMPING_NEW => {
+            let drapeaux = if longueur == 8 {
+                let mut st = [0u8; 8];
+                copier_depuis_utilisateur(&mut st, valeur).map_err(|_| -EFAULT)?;
+                u32::from_le_bytes([st[0], st[1], st[2], st[3]])
+            } else {
+                v as u32
+            };
+            return horodatages(s, option, drapeaux);
         }
         // Des drapeaux, pour toutes les sortes : seule la lecture d'UDP se sert
         // des trois premiers (`sock_recv_cmsgs` : ping, AF_UNIX et TCP
@@ -3135,6 +3252,15 @@ fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16]
         SO_RCVMARK => entier(&mut o, s.drapeau(socket::RCVMARK) as i32),
         SO_RCVPRIORITY => entier(&mut o, s.drapeau(socket::RCVPRIORITY) as i32),
         SO_SELECT_ERR_QUEUE => entier(&mut o, s.drapeau(socket::SELECT_ERR_QUEUE) as i32),
+        // Les drapeaux, puis `bind_phc` (0 : BIND_PHC ne passe jamais) ; la forme
+        // _NEW ne les dit que si la dernière forme posée était une _NEW (sinon des
+        // zéros, sans erreur).
+        SO_TIMESTAMPING_OLD | SO_TIMESTAMPING_NEW => {
+            if option == SO_TIMESTAMPING_OLD || s.drapeau(socket::TSTAMP_NEW) {
+                o[..4].copy_from_slice(&s.tsflags.load(Ordering::Relaxed).to_le_bytes());
+            }
+            8
+        }
         SO_INCOMING_CPU => entier(&mut o, s.processeur.load(Ordering::Relaxed)),
         SO_MARK => entier(&mut o, op.mark as i32),
         _ => return Err(-ENOPROTOOPT),
@@ -3338,6 +3464,7 @@ fn heure_du_dernier(s: &Socket, ns: bool, argument: u64) -> i64 {
         return -ENOTTY;
     }
     s.poser_drapeau(socket::TIMESTAMP, true);
+    s.revoir_cle();
     let mut t = s.horodatage.load(Ordering::Relaxed);
     if t == socket::HORODATAGE_AUCUN {
         return -ENOENT;
