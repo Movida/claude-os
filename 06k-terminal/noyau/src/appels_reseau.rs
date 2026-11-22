@@ -167,6 +167,8 @@ const SO_RCVMARK: i32 = 75;
 const SO_RCVPRIORITY: i32 = 82;
 const SO_INQ: i32 = 84;
 const SCM_INQ: i32 = SO_INQ;
+/// POLLPRI avec POLLERR (`Socket::erreur_prioritaire`).
+const SO_SELECT_ERR_QUEUE: i32 = 45;
 /// Les horloges que SO_TXTIME accepte (`sockopt_validate_clockid`).
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -1756,14 +1758,17 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             }
             return Ok(());
         }
-        // Des drapeaux, pour toutes les sortes ; seule la lecture d'UDP s'en
-        // sert (`sock_recv_cmsgs` : ping, AF_UNIX et TCP n'appellent que
-        // l'horodatage, ou rien ; mesuré).
-        SO_RXQ_OVFL | SO_RCVMARK | SO_RCVPRIORITY => {
+        // Des drapeaux, pour toutes les sortes : seule la lecture d'UDP se sert
+        // des trois premiers (`sock_recv_cmsgs` : ping, AF_UNIX et TCP
+        // n'appellent que l'horodatage, ou rien ; mesuré), et seul poll des
+        // datagrammes et des paquets du dernier (TCP et un flux AF_UNIX le
+        // gardent sans effet : `Socket::erreur_prioritaire`).
+        SO_RXQ_OVFL | SO_RCVMARK | SO_RCVPRIORITY | SO_SELECT_ERR_QUEUE => {
             let d = match option {
                 SO_RXQ_OVFL => socket::RXQ_OVFL,
                 SO_RCVMARK => socket::RCVMARK,
-                _ => socket::RCVPRIORITY,
+                SO_RCVPRIORITY => socket::RCVPRIORITY,
+                _ => socket::SELECT_ERR_QUEUE,
             };
             s.poser_drapeau(d, oui);
             return Ok(());
@@ -3129,6 +3134,7 @@ fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16]
         SO_RXQ_OVFL => entier(&mut o, s.drapeau(socket::RXQ_OVFL) as i32),
         SO_RCVMARK => entier(&mut o, s.drapeau(socket::RCVMARK) as i32),
         SO_RCVPRIORITY => entier(&mut o, s.drapeau(socket::RCVPRIORITY) as i32),
+        SO_SELECT_ERR_QUEUE => entier(&mut o, s.drapeau(socket::SELECT_ERR_QUEUE) as i32),
         SO_INCOMING_CPU => entier(&mut o, s.processeur.load(Ordering::Relaxed)),
         SO_MARK => entier(&mut o, op.mark as i32),
         _ => return Err(-ENOPROTOOPT),

@@ -43,7 +43,7 @@ use crate::appels_fichiers::FichierTenu;
 use crate::attente::{self, FileAttente, Mutex, Sommeil};
 use crate::descripteurs::{FichierOuvert, Prive};
 use crate::partage::Arc;
-use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLRDNORM, POLLWRBAND, POLLWRNORM, Table};
+use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRBAND, POLLWRNORM, Table};
 use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::faillible::{self, FileFaillible};
@@ -447,7 +447,8 @@ pub const VERROU_RCVBUF: u8 = 2;
 /// son datagramme pour SIOCGSTAMP, posé par SIOCGSTAMP lui-même et par
 /// toute forme de SO_TIMESTAMP, et jamais retiré (`sock_enable_timestamp`) ;
 /// RXQ_OVFL, RCVMARK, RCVPRIORITY : leurs options ; INQ : SO_INQ d'AF_UNIX
-/// (le `recvmsg_inq` de son `unix_sock`).
+/// (le `recvmsg_inq` de son `unix_sock`) ; SELECT_ERR_QUEUE
+/// (SOCK_SELECT_ERR_QUEUE) : poll rend POLLPRI avec POLLERR, voir `sonder`.
 pub const RCVTSTAMP: u16 = 1;
 pub const RCVTSTAMPNS: u16 = 2;
 pub const TSTAMP_NEW: u16 = 4;
@@ -456,6 +457,7 @@ pub const RXQ_OVFL: u16 = 16;
 pub const RCVMARK: u16 = 32;
 pub const RCVPRIORITY: u16 = 64;
 pub const INQ: u16 = 128;
+pub const SELECT_ERR_QUEUE: u16 = 256;
 
 /// `sk_stamp` avant toute lecture (SK_DEFAULT_STAMP : -1 s).
 pub const HORODATAGE_AUCUN: i64 = -1_000_000_000;
@@ -488,6 +490,27 @@ impl Socket {
         } else {
             self.drapeaux.fetch_and(!d, Ordering::Relaxed);
         }
+    }
+
+    /// Ce que SO_SELECT_ERR_QUEUE ajoute à POLLERR : POLLPRI, que `select`
+    /// range dans ses exceptions (POLLEX_SET), pour attendre les erreurs sans
+    /// être réveillé par les données. Pour les datagrammes d'Internet (UDP,
+    /// ping), et les datagrammes et paquets d'AF_UNIX (`datagram_poll`,
+    /// `unix_dgram_poll`) ; ni TCP
+    /// (`tcp_poll`), ni un flux AF_UNIX (`unix_poll`), qui l'acceptent sans
+    /// effet (mesuré, sonde c6).
+    ///
+    /// Le réveil n'en dit rien : une erreur réveille avec la clé POLLERR seule
+    /// (`sock_def_error_report`, depuis que « skbuff: Fix not waking
+    /// applications when errors are enqueued », 2018, a remplacé le
+    /// `sk_data_ready` qui réveillait avec POLLPRI). Un `select` qui n'attend
+    /// que les exceptions n'écoute pas POLLERR : il ne se réveille pas, et ne
+    /// voit l'erreur qu'à son échéance, à son dernier tour (mesuré sous Linux ;
+    /// poll et epoll, qui écoutent toujours POLLERR, se réveillent). Notre
+    /// `select` filtre les réveils par la même clé (sondage.rs, `table.cle`),
+    /// et fait de même.
+    pub fn erreur_prioritaire(&self) -> u32 {
+        if self.drapeau(SELECT_ERR_QUEUE) { POLLPRI } else { 0 }
     }
 
     /// Un paquet arrive pour elle sur ce processeur (`sk_incoming_cpu_update`).
@@ -858,7 +881,8 @@ impl Socket {
     }
 
     /// Ce qu'on peut faire de la socket sans attendre (le `datagram_poll`
-    /// de Linux) : une erreur en attente ou en file (POLLERR), l'arrêt de la lecture (POLLRDHUP,
+    /// de Linux) : une erreur en attente ou en file (POLLERR ; et POLLPRI
+    /// avec SO_SELECT_ERR_QUEUE), l'arrêt de la lecture (POLLRDHUP,
     /// et POLLIN : un recv rendra 0), les deux arrêts (POLLHUP), un
     /// datagramme en file (POLLIN), et l'écriture si moins de la moitié de
     /// SO_SNDBUF est en route (`sock_writeable` ; sinon, la place a manqué :
@@ -884,7 +908,7 @@ impl Socket {
         let r = self.reception.verrouiller();
         let mut m = ecriture;
         if r.erreur != 0 || !r.erreurs.is_empty() {
-            m |= POLLERR;
+            m |= POLLERR | self.erreur_prioritaire();
         }
         if r.arret & ARRET_LECTURE != 0 {
             m |= POLLRDHUP | POLLIN | POLLRDNORM;

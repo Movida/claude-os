@@ -50,7 +50,13 @@
  *     n'est pas exigée : un datagramme arrivé juste après la première SO_TIMESTAMP de
  *     la machine n'a pas d'heure (la clé `netstamp_needed_key` s'allume en différé, de
  *     5 à 33 ms mesurés selon la charge) : chaque cas qui veut l'heure de l'arrivée
- *     attend que la clé soit allumée (`cle_allumee`), jamais un temps fixe.
+ *     attend que la clé soit allumée (`cle_allumee`), jamais un temps fixe ;
+ *   - SO_SELECT_ERR_QUEUE : poll rend POLLPRI avec POLLERR (une erreur ICMP en file,
+ *     ou l'erreur en attente seule) pour UDP et AF_UNIX en datagrammes et en
+ *     paquets, pas pour TCP ni un flux AF_UNIX ; et qui une erreur venue pendant
+ *     l'attente réveille : poll et epoll qui n'attendent que POLLPRI, select qui
+ *     attend aussi la lecture, mais pas un select qui n'attend que les exceptions (le
+ *     réveil ne dit que POLLERR) : il ne la voit qu'à son échéance.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -61,10 +67,13 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
@@ -1524,6 +1533,140 @@ static void reception_processeur(void)
     sched_setaffinity(0, sizeof avant, &avant);
 }
 
+/* Ce que poll dit prêt, sans attendre. */
+static int pret(int s)
+{
+    struct pollfd p = {s, POLLIN | POLLPRI | POLLOUT, 0};
+    return poll(&p, 1, 0) < 0 ? -1 : p.revents;
+}
+
+/* Une socket UDP connectée au port 9 de lo, où personne n'écoute (chaque envoi
+ * revient en erreur ICMP), avec IP_RECVERR si `recverr`, et SO_SELECT_ERR_QUEUE. */
+static int udp_refusee(int recverr, int select_err_queue)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    setsockopt(s, IPPROTO_IP, IP_RECVERR, &recverr, sizeof recverr);
+    poser(s, SO_SELECT_ERR_QUEUE, select_err_queue);
+    connect(s, (void *)&a, sizeof a);
+    return s;
+}
+
+/* Le fil qui envoie 200 ms plus tard, pendant l'attente de l'autre : l'erreur arrive
+ * alors qu'il dort. */
+static void *envoyer_plus_tard(void *p)
+{
+    attendre_ms(200);
+    send(*(int *)p, "x", 1, 0);
+    return NULL;
+}
+
+static void select_err_queue(void)
+{
+    const int erreurs = POLLERR | POLLPRI;
+    for (int i = 0; i < SORTES; i++) {
+        int s = ouvrir(&sortes[i]), v = 1;
+        verifier(lire(s, SO_SELECT_ERR_QUEUE) == 0 && poser(s, SO_SELECT_ERR_QUEUE, 7) == 0
+                     && lire(s, SO_SELECT_ERR_QUEUE) == 1 && poser(s, SO_SELECT_ERR_QUEUE, 0) == 0
+                     && lire(s, SO_SELECT_ERR_QUEUE) == 0
+                     && erreur(setsockopt(s, SOL_SOCKET, SO_SELECT_ERR_QUEUE, &v, 2)) == EINVAL,
+                 dire("SO_SELECT_ERR_QUEUE %s : 0, puis relue 1", sortes[i].nom));
+        close(s);
+    }
+    char o[64], c[256];
+    for (int avec = 0; avec < 2; avec++) {
+        int s = udp_refusee(1, avec);
+        int vide = pret(s);
+        send(s, "x", 1, 0);
+        attendre_ms(50);
+        int en_file = pret(s);
+        struct msghdr m = {.msg_iov = &(struct iovec){o, sizeof o}, .msg_iovlen = 1, .msg_control = c, .msg_controllen = sizeof c};
+        recvmsg(s, &m, MSG_ERRQUEUE | MSG_DONTWAIT);
+        int lue = pret(s);
+        verifier((vide & erreurs) == 0 && (en_file & erreurs) == (avec ? erreurs : POLLERR) && (lue & erreurs) == 0,
+                 avec ? "SO_SELECT_ERR_QUEUE UDP : une erreur en file, POLLPRI avec POLLERR, jusqu'a sa lecture"
+                      : "UDP sans SO_SELECT_ERR_QUEUE : une erreur en file, POLLERR seul");
+        close(s);
+    }
+    int s = udp_refusee(0, 1);
+    send(s, "x", 1, 0);
+    attendre_ms(50);
+    int avant = pret(s), e = lire(s, SO_ERROR), apres = pret(s);
+    verifier((avant & erreurs) == erreurs && e == ECONNREFUSED && (apres & erreurs) == 0,
+             "SO_SELECT_ERR_QUEUE UDP sans IP_RECVERR : l'erreur en attente seule, POLLPRI jusqu'a SO_ERROR");
+    close(s);
+    s = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    poser(s, SO_SELECT_ERR_QUEUE, 1);
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    connect(s, (void *)&a, sizeof a);
+    attendre_ms(50);
+    verifier((pret(s) & erreurs) == POLLERR, "SO_SELECT_ERR_QUEUE TCP : une connexion refusee, POLLERR seul");
+    close(s);
+    /* AF_UNIX : le pair parti sans avoir lu ce qu'on lui envoyait (ECONNRESET). */
+    for (int i = 3; i < SORTES; i++) {
+        if (sortes[i].type == SOCK_DGRAM)
+            continue;
+        int p[2];
+        socketpair(AF_UNIX, sortes[i].type, 0, p);
+        poser(p[0], SO_SELECT_ERR_QUEUE, 1);
+        send(p[0], "ab", 2, 0);
+        close(p[1]);
+        int r = pret(p[0]);
+        verifier(lire(p[0], SO_ERROR) == ECONNRESET && (r & erreurs) == (sortes[i].type == SOCK_STREAM ? POLLERR : erreurs),
+                 dire("SO_SELECT_ERR_QUEUE %s : le pair parti sans lire, POLLPRI pour les paquets seulement", sortes[i].nom));
+        close(p[0]);
+    }
+    /* AF_UNIX en datagrammes : le pair se déconnecte en laissant un message non lu
+     * (`unix_dgram_disconnected` : ECONNRESET pour l'autre bout). */
+    int d[2];
+    struct sockaddr_un rien = {.sun_family = AF_UNSPEC};
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, d);
+    poser(d[1], SO_SELECT_ERR_QUEUE, 1);
+    send(d[1], "z", 1, 0);
+    connect(d[0], (void *)&rien, sizeof(sa_family_t));
+    int r = pret(d[1]);
+    verifier((r & erreurs) == erreurs && lire(d[1], SO_ERROR) == ECONNRESET && (pret(d[1]) & erreurs) == 0,
+             "SO_SELECT_ERR_QUEUE unix datagrammes : le pair deconnecte, POLLPRI avec POLLERR jusqu'a SO_ERROR");
+    close(d[0]), close(d[1]);
+    /* Les réveils : l'erreur arrive 200 ms après le début de l'attente. */
+    for (int k = 0; k < 4; k++) {
+        s = udp_refusee(1, 1);
+        pthread_t f;
+        pthread_create(&f, NULL, envoyer_plus_tard, &s);
+        int ok = 0;
+        if (k == 0) {
+            struct pollfd q = {s, POLLPRI, 0};
+            struct timespec d = {3, 0};
+            ok = ppoll(&q, 1, &d, NULL) == 1 && q.revents == erreurs && (d.tv_sec || d.tv_nsec);
+        } else if (k == 1) {
+            int ep = epoll_create1(0);
+            struct epoll_event ev = {.events = EPOLLPRI};
+            epoll_ctl(ep, EPOLL_CTL_ADD, s, &ev);
+            ok = epoll_wait(ep, &ev, 1, 3000) == 1 && ev.events == (EPOLLPRI | EPOLLERR);
+            close(ep);
+        } else {
+            /* Avec la lecture, réveillé ; sans elle, rien ne le réveille : l'échéance
+             * (une seconde), où son dernier tour voit l'erreur. */
+            fd_set lu, ex;
+            FD_ZERO(&lu);
+            FD_ZERO(&ex);
+            FD_SET(s, &lu);
+            FD_SET(s, &ex);
+            struct timeval d = {k == 2 ? 3 : 1, 0};
+            int r = select(s + 1, k == 2 ? &lu : NULL, NULL, &ex, &d);
+            ok = k == 2 ? r == 2 && FD_ISSET(s, &lu) && FD_ISSET(s, &ex) && (d.tv_sec || d.tv_usec)
+                        : r == 1 && FD_ISSET(s, &ex) && d.tv_sec == 0 && d.tv_usec == 0;
+        }
+        pthread_join(f, NULL);
+        const char *quoi[] = {"poll qui n'attend que POLLPRI : reveille, POLLPRI et POLLERR",
+                              "epoll qui n'attend que EPOLLPRI : reveille, EPOLLPRI et EPOLLERR",
+                              "select en lecture et en exceptions : reveille, les deux",
+                              "select en exceptions seules : pas reveille, l'erreur vue a l'echeance"};
+        verifier(ok, dire("SO_SELECT_ERR_QUEUE, une erreur pendant l'attente : %s", quoi[k]));
+        close(s);
+    }
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -1550,6 +1693,7 @@ int main(void)
     reception_unix();
     reception_tcp();
     reception_processeur();
+    select_err_queue();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

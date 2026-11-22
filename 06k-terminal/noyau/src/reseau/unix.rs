@@ -1912,7 +1912,8 @@ fn fermer_avec(s: &Socket, embryon: bool) {
 // --- Ce qu'on peut faire sans attendre, et les files ---
 
 /// poll (`unix_poll` pour un flux, `unix_dgram_poll` pour les autres) :
-/// POLLERR (une erreur), POLLHUP (les deux sens arrêtés ; ou, avec
+/// POLLERR (une erreur ; et POLLPRI avec SO_SELECT_ERR_QUEUE, sauf pour un
+/// flux : `Socket::erreur_prioritaire`), POLLHUP (les deux sens arrêtés ; ou, avec
 /// connexion, pas connectée), POLLIN (un message, ou la lecture arrêtée,
 /// avec POLLRDHUP), POLLOUT (pas une écoute, et pas plus d'un quart de
 /// SO_SNDBUF en route ; un DGRAM connecté dont le pair a sa file pleine
@@ -1929,6 +1930,9 @@ pub fn sonder(s: &Socket) -> u32 {
     }
     if erreur != 0 {
         m |= POLLERR;
+        if u.sorte != Sorte::Flux {
+            m |= s.erreur_prioritaire();
+        }
     }
     if arret == ARRET_LECTURE | ARRET_ECRITURE {
         m |= POLLHUP;
