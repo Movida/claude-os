@@ -1482,7 +1482,7 @@ pub fn fermer(s: &Arc<Socket>) {
         Protocole::Tcp => super::tcp::fermer(s),
         Protocole::Unix => super::unix::fermer(s),
         Protocole::Udp => super::udp::fermer(s),
-        Protocole::Ping => super::datagramme::table::retirer(s),
+        Protocole::Ping => super::ping::fermer(s),
     }
 }
 

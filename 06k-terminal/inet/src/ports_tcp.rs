@@ -43,13 +43,31 @@
 //!     l'écoute de son adresse de destination, puis celle de 0.0.0.0 ; une
 //!     socket liée à une interface ne voit que ce qui arrive par elle, et
 //!     une écoute liée l'emporte sur une qui ne l'est pas (`compute_score` :
-//!     2 contre 1, la première à égalité). L'interface d'arrivée est celle
-//!     de la route du paquet (`inet_iif`, voir `ports`).
+//!     3 contre 2, et un point de plus pour celle qui dit, par
+//!     SO_INCOMING_CPU, le processeur qui cherche : une écoute non liée de ce
+//!     processeur égale une liée qui ne l'est pas ; la plus récente à
+//!     égalité) ; la première qui passe en tête et a un groupe SO_REUSEPORT
+//!     rend aussitôt la membre que choisit le groupe. L'interface d'arrivée
+//!     est celle de la route du paquet (`inet_iif`, voir `ports`).
+//!
+//! LES GROUPES SO_REUSEPORT (groupes.rs) : une socket qui a SO_REUSEPORT
+//! entre à son `listen` (`inet_reuseport_add_sock`) dans le groupe de la plus
+//! récente écoute du même port, de la même adresse, de la même interface,
+//! qui a SO_REUSEPORT et le même utilisateur (ou dans un groupe neuf, ou
+//! dans celui qu'elle s'est fait avant, par un programme), et en sort quand
+//! elle cesse d'écouter (`inet_unhash`, `reuseport_stop_listen_sock`) : une
+//! fille n'est jamais dans un groupe (`sk_clone_lock`). Une socket qui a
+//! déjà un groupe ne partage pas un port par SO_REUSEPORT (le
+//! `reuseport_cb_ok` d'`inet_bind_conflict` : EADDRINUSE au `bind`, ou au
+//! `listen`, mesuré). L'ordre de la table est celui de la liste des écoutes
+//! de Linux (la plus récente en tête) : `listen` met l'entrée à la fin, et la
+//! recherche parcourt la table à l'envers.
 //!
 //! Une taille fixe, réservée au démarrage (comme la table d'UDP), et des
 //! recherches en parcourant la table : quelques dizaines de sockets.
 //! Linux hache : « Reste à faire » si une mesure le demande.
 
+use crate::groupes::{Choix, Groupes, Refus as RefusDeGroupe};
 use crate::ports::{memes_interfaces, voit};
 use alloc::vec::Vec;
 use faillible::VecFaillible;
@@ -107,6 +125,8 @@ pub enum Refus {
     Pris,
     /// La table est pleine (ENOBUFS : un écart).
     Plein,
+    /// Plus de mémoire pour un groupe SO_REUSEPORT (ENOMEM).
+    Memoire,
 }
 
 /// À qui va un segment.
@@ -123,11 +143,16 @@ struct Entree<T> {
     objet: Option<T>,
 }
 
-/// La table.
-pub struct Table<T> {
+/// La table. `P` : le programme des groupes SO_REUSEPORT (filtre.rs, dans le
+/// noyau).
+pub struct Table<T, P = ()> {
     entrees: Vec<Entree<T>>,
     max: usize,
     perturbation: [u32; PERTURBATION],
+    groupes: Groupes<P>,
+    /// Le processeur que dit une socket (SO_INCOMING_CPU, -1 : aucun), lu à son entrée dans
+    /// un groupe et à sa sortie (le compte du groupe, groupes.rs).
+    processeur: fn(&T) -> i32,
 }
 
 /// Deux adresses locales se recouvrent-elles ?
@@ -135,28 +160,45 @@ fn recouvre(a: [u8; 4], b: [u8; 4]) -> bool {
     a == [0; 4] || b == [0; 4] || a == b
 }
 
-/// L'entrée `a` (qui veut le port) est-elle gênée par `b`
-/// (`inet_bind_conflict`) ? `tolerant` : le partage par SO_REUSEADDR est
-/// permis (un port demandé ; pas dans la recherche d'un éphémère).
-fn conflit(a: &Lien, b: &Lien, tolerant: bool) -> bool {
+/// L'entrée `a` (qui veut le port ; `a_groupe` : elle a un groupe
+/// SO_REUSEPORT) est-elle gênée par `b` (`inet_bind_conflict`) ?
+/// `tolerant` : le partage par SO_REUSEADDR est permis (un port demandé ; pas
+/// dans la recherche d'un éphémère).
+fn conflit(a: &Lien, b: &Lien, tolerant: bool, a_groupe: bool) -> bool {
     if !recouvre(a.adresse, b.adresse) || !memes_interfaces(a.interface, b.interface) {
         return false;
     }
     if a.reuseaddr && b.reuseaddr && b.sorte != Sorte::Ecoute {
         return !tolerant;
     }
-    // SO_REUSEPORT : seulement pour un port demandé (`reuseport_ok`).
-    let reuseport = a.reuseport && b.reuseport && (b.sorte == Sorte::TempsAttente || a.uid == b.uid);
+    // SO_REUSEPORT : seulement pour un port demandé (`reuseport_ok`), et pas
+    // pour une socket qui a déjà un groupe (`reuseport_cb_ok`).
+    let reuseport = a.reuseport && b.reuseport && !a_groupe && (b.sorte == Sorte::TempsAttente || a.uid == b.uid);
     !(tolerant && reuseport)
 }
 
-impl<T: Clone> Table<T> {
+impl<T: Clone, P> Table<T, P> {
     /// Une table pour `max` entrées, sa place réservée ; `hasard` remplit la
     /// table de perturbation. None : plus de mémoire.
-    pub fn new(max: usize, mut hasard: impl FnMut() -> u32) -> Option<Table<T>> {
+    pub fn new(max: usize, mut hasard: impl FnMut() -> u32) -> Option<Table<T, P>> {
         let mut entrees = Vec::new();
         entrees.try_reserve_exact(max).ok()?;
-        Some(Table { entrees, max, perturbation: core::array::from_fn(|_| hasard()) })
+        Some(Table { entrees, max, perturbation: core::array::from_fn(|_| hasard()), groupes: Groupes::new(), processeur: |_| -1 })
+    }
+
+    /// Le processeur de ses sockets (`Choix::processeur`) ; sans, aucune n'en dit.
+    pub fn avec_processeur(self, processeur: fn(&T) -> i32) -> Table<T, P> {
+        Table { processeur, ..self }
+    }
+
+    /// La socket `numero` dit-elle un processeur ?
+    fn dit(&self, numero: u64) -> bool {
+        self.entrees.iter().find(|e| e.numero == numero).and_then(|e| e.objet.as_ref()).is_some_and(|o| (self.processeur)(o) >= 0)
+    }
+
+    /// Son SO_INCOMING_CPU passe de `ancien` à `nouveau` (groupes.rs).
+    pub fn processeur_change(&mut self, numero: u64, ancien: i32, nouveau: i32) {
+        self.groupes.processeur_change(numero, ancien >= 0, nouveau >= 0);
     }
 
     fn entree(&mut self, numero: u64) -> Option<&mut Entree<T>> {
@@ -175,7 +217,8 @@ impl<T: Clone> Table<T> {
 
     /// Le port `port` est-il libre pour `lien` (hors l'entrée `numero`) ?
     fn libre(&self, numero: u64, port: u16, lien: &Lien, tolerant: bool) -> bool {
-        !self.entrees.iter().any(|e| e.numero != numero && e.lien.port == port && conflit(lien, &e.lien, tolerant))
+        let a_groupe = self.groupes.a_un_groupe(numero);
+        !self.entrees.iter().any(|e| e.numero != numero && e.lien.port == port && conflit(lien, &e.lien, tolerant, a_groupe))
     }
 
     /// Lie la socket `numero` selon `lien` (`bind`, ou `listen` sans
@@ -256,21 +299,40 @@ impl<T: Clone> Table<T> {
         None
     }
 
-    /// La socket `numero`, liée, écoute (`listen`) : refusé si une autre
-    /// socket du port l'en empêche maintenant qu'elle écoute.
+    /// La socket `numero`, liée, écoute (`listen`, `inet_csk_listen_start`) :
+    /// refusé si une autre socket du port l'en empêche maintenant qu'elle
+    /// écoute (EADDRINUSE) ; puis, avec SO_REUSEPORT, elle entre dans un
+    /// groupe (`inet_hash`, voir plus haut ; sans mémoire, ENOMEM) ; puis elle
+    /// passe en tête de la liste des écoutes (ici, à la fin de la table).
     pub fn ecouter(&mut self, numero: u64) -> Result<(), Refus> {
-        let Some(l) = self.lien(numero) else { return Err(Refus::Pris) };
-        let lien = Lien { sorte: Sorte::Ecoute, ..l };
+        let Some(i) = self.entrees.iter().position(|e| e.numero == numero) else { return Err(Refus::Pris) };
+        let lien = Lien { sorte: Sorte::Ecoute, ..self.entrees[i].lien };
         // Le conflit vu de la socket qui écoute, comme `inet_csk_get_port`
         // rappelé par `inet_csk_listen_start` : une autre qui écoute déjà
         // la gêne malgré SO_REUSEADDR.
-        let gene = self.entrees.iter().any(|e| e.numero != numero && e.lien.port == lien.port && conflit(&lien, &e.lien, true));
+        let a_groupe = self.groupes.a_un_groupe(numero);
+        let gene = self.entrees.iter()
+            .any(|e| e.numero != numero && e.lien.port == lien.port && conflit(&lien, &e.lien, true, a_groupe));
         if gene {
             return Err(Refus::Pris);
         }
-        if let Some(e) = self.entree(numero) {
-            e.lien.sorte = Sorte::Ecoute;
+        if lien.reuseport {
+            let autre = self.entrees.iter().rev()
+                .find(|e| {
+                    let l = &e.lien;
+                    e.numero != numero && l.sorte == Sorte::Ecoute && l.port == lien.port && l.adresse == lien.adresse
+                        && l.interface == lien.interface && l.reuseport && l.uid == lien.uid
+                })
+                .map(|e| e.numero);
+            let entree = match autre {
+                Some(autre) => self.groupes.ajouter(numero, self.dit(numero), autre, self.dit(autre)),
+                None => self.groupes.allouer(numero, self.dit(numero)),
+            };
+            entree.map_err(|_| Refus::Memoire)?;
         }
+        let mut e = self.entrees.remove(i);
+        e.lien.sorte = Sorte::Ecoute;
+        self.entrees.ajouter_dans_la_place(e);
         Ok(())
     }
 
@@ -435,6 +497,7 @@ impl<T: Clone> Table<T> {
     /// port (SOCK_BINDPORT_LOCK), sans repasser par les conflits : elle ne l'a jamais rendu.
     /// `adresse` : celle qu'elle garde (`tcp_disconnect` efface celle que `bind` n'a pas nommée).
     pub fn redevenir_liee(&mut self, numero: u64, adresse: [u8; 4]) {
+        self.quitter_l_ecoute(numero);
         if let Some(e) = self.entree(numero) {
             e.lien.sorte = Sorte::Liee;
             e.lien.adresse = adresse;
@@ -443,16 +506,52 @@ impl<T: Clone> Table<T> {
         }
     }
 
+    /// Une écoute qui cesse d'écouter quitte son groupe (`inet_unhash`,
+    /// `reuseport_stop_listen_sock`) ; les autres entrées gardent le leur
+    /// (une connexion qui avait un programme avant `connect` : mesuré).
+    fn quitter_l_ecoute(&mut self, numero: u64) {
+        if self.lien(numero).is_some_and(|l| l.sorte == Sorte::Ecoute) {
+            let dit = self.dit(numero);
+            self.groupes.detacher(numero, dit);
+        }
+    }
+
     /// Retire l'entrée `numero` (son port est rendu).
     pub fn retirer(&mut self, numero: u64) {
+        self.quitter_l_ecoute(numero);
         self.entrees.retain(|e| e.numero != numero);
     }
 
+    /// La socket `numero` est détruite (son dernier close, `sk_destruct`) :
+    /// elle quitte son groupe, même sans entrée (un programme posé avant
+    /// `bind`). Son entrée, si sa connexion continue sans elle, reste.
+    pub fn detruire(&mut self, numero: u64) {
+        let dit = self.dit(numero);
+        self.groupes.detacher(numero, dit);
+    }
+
+    /// SO_ATTACH_REUSEPORT_CBPF (groupes.rs, `attacher_programme`) : une
+    /// socket TCP est « dans la table » quand elle écoute ou se connecte (une
+    /// socket liée seulement ne l'est pas, `sk_unhashed`) ; `reuseport` : son
+    /// SO_REUSEPORT. Rend l'ancien programme.
+    /// `processeur` : celui que dit la socket (SO_INCOMING_CPU), compté dans un groupe fait pour
+    /// elle.
+    pub fn attacher_programme(&mut self, numero: u64, programme: P, reuseport: bool, processeur: i32)
+                              -> Result<Option<P>, RefusDeGroupe> {
+        let hachee = self.lien(numero).is_some_and(|l| matches!(l.sorte, Sorte::Ecoute | Sorte::Connectee));
+        self.groupes.attacher_programme(numero, programme, hachee, reuseport, processeur >= 0)
+    }
+
+    /// SO_DETACH_REUSEPORT_BPF (groupes.rs, `detacher_programme`).
+    pub fn detacher_programme(&mut self, numero: u64, reuseport: bool) -> Result<P, RefusDeGroupe> {
+        self.groupes.detacher_programme(numero, reuseport)
+    }
+
     /// À qui va un segment de `source`:`port_source` pour
-    /// `destination`:`port`, arrivé par l'interface `iif` ; `ici` : voir
+    /// `destination`:`port`, arrivé par l'interface `iif` ; `c` : voir
     /// `ecoute`.
-    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, iif: u32,
-                   ici: impl Fn(&T) -> bool) -> Option<Destinataire<T>> {
+    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, iif: u32, c: &Choix<T, P>)
+                   -> Option<Destinataire<T>> {
         for e in &self.entrees {
             let l = &e.lien;
             if matches!(l.sorte, Sorte::Connectee | Sorte::TempsAttente)
@@ -468,29 +567,41 @@ impl<T: Clone> Table<T> {
                 };
             }
         }
-        self.ecoute(destination, port, iif, ici).map(Destinataire::Ecoute)
+        self.ecoute(destination, port, iif, c).map(Destinataire::Ecoute)
     }
 
     /// L'écoute de `destination`:`port`, ou de 0.0.0.0:`port`
-    /// (`__inet_lookup_listener`), pour un segment arrivé par `iif` : dans
-    /// chaque passe, la mieux notée (`compute_score` : liée à `iif`, 2 ; non
-    /// liée, 1 ; liée à une autre, jamais ; un point de plus si elle dit, par
-    /// SO_INCOMING_CPU, le processeur qui cherche : `ici`), la première à
-    /// égalité.
-    pub fn ecoute(&self, destination: [u8; 4], port: u16, iif: u32, ici: impl Fn(&T) -> bool) -> Option<T> {
+    /// (`__inet_lookup_listener`, `inet_lhash2_lookup`), pour un segment
+    /// arrivé par `iif` : dans chaque passe, de la plus récente à la plus
+    /// ancienne, la mieux notée (`compute_score` : liée à `iif`, 2 ; non
+    /// liée, 1 ; liée à une autre, jamais ; un point d'IPv4 ; un point de plus
+    /// si elle dit, par SO_INCOMING_CPU, le processeur qui cherche) ; la
+    /// première qui passe en tête et a un groupe rend la membre qu'il choisit
+    /// (`inet_lookup_reuseport`, groupes.rs ; `c` : de quoi choisir).
+    pub fn ecoute(&self, destination: [u8; 4], port: u16, iif: u32, c: &Choix<T, P>) -> Option<T> {
+        let objet = |m: u64| self.entrees.iter().find(|e| e.numero == m).and_then(|e| e.objet.clone());
         for locale in [destination, [0; 4]] {
-            let mut meilleure: Option<(u32, &Entree<T>)> = None;
-            for e in &self.entrees {
+            let (mut resultat, mut meilleure): (Option<&Entree<T>>, u32) = (None, 0);
+            for e in self.entrees.iter().rev() {
                 let l = &e.lien;
                 if l.sorte != Sorte::Ecoute || l.port != port || l.adresse != locale || !voit(l.interface, iif) {
                     continue;
                 }
-                let note = 2 * if l.interface != 0 { 2 } else { 1 } + e.objet.as_ref().is_some_and(&ici) as u32;
-                if meilleure.is_none_or(|(m, _)| note > m) {
-                    meilleure = Some((note, e));
+                let note = if l.interface != 0 { 2 } else { 1 } + 1 + e.objet.as_ref().is_some_and(|o| c.ici(o)) as u32;
+                if note <= meilleure {
+                    continue;
                 }
+                if l.reuseport {
+                    // Un groupe n'a que des écoutes : toutes valides.
+                    let processeur = |m: u64| objet(m).map_or(-1, |o| (c.processeur)(&o));
+                    if let Some(o) = self.groupes.choisir(e.numero, c, |_| true, processeur).and_then(objet) {
+                        return Some(o);
+                    }
+                }
+                resultat = Some(e);
+                meilleure = note;
             }
-            if let Some((_, e)) = meilleure {
+            if let Some(e) = resultat {
                 return e.objet.clone();
             }
         }

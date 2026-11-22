@@ -25,7 +25,13 @@
 //! Une taille fixe, réservée d'avance (1024 sockets à la fois, comme la
 //! table des ports : un écart), et chaque entrée porte le numéro de la
 //! socket et un objet `T` (la socket du noyau).
+//!
+//! Les groupes SO_REUSEPORT (groupes.rs) : ping n'en fait aucun (`ping_get_port`
+//! ignore SO_REUSEPORT) ; mais un programme posé avant `bind`
+//! (SO_ATTACH_REUSEPORT_CBPF) fait un groupe à la socket seule, que rien ne
+//! lit, et qui reste jusqu'à sa destruction : SO_DETACH_REUSEPORT_BPF le voit.
 
+use crate::groupes::{Groupes, Refus as RefusDeGroupe};
 use crate::ports::voit;
 use alloc::vec::Vec;
 use faillible::VecFaillible;
@@ -52,19 +58,20 @@ struct Entree<T> {
     objet: T,
 }
 
-/// La table.
-pub struct Table<T> {
+/// La table. `P` : le programme des groupes SO_REUSEPORT.
+pub struct Table<T, P = ()> {
     entrees: Vec<Entree<T>>,
     /// Le dernier identifiant donné pour une demande de 0.
     dernier: u16,
+    groupes: Groupes<P>,
 }
 
-impl<T: Clone> Table<T> {
+impl<T: Clone, P> Table<T, P> {
     /// Une table vide, sa place réservée. None : plus de mémoire.
-    pub fn new() -> Option<Table<T>> {
+    pub fn new() -> Option<Table<T, P>> {
         let mut entrees = Vec::new();
         entrees.try_reserve_exact(MAX).ok()?;
-        Some(Table { entrees, dernier: 0 })
+        Some(Table { entrees, dernier: 0, groupes: Groupes::new() })
     }
 
     fn pris(&self, ident: u16) -> bool {
@@ -123,9 +130,33 @@ impl<T: Clone> Table<T> {
         }
     }
 
-    /// Retire la socket `numero` (son identifiant est rendu).
+    /// Retire la socket `numero` (son identifiant est rendu ; `ping_unhash`
+    /// ne touche pas à son groupe).
     pub fn retirer(&mut self, numero: u64) {
         self.entrees.retain(|e| e.numero != numero);
+    }
+
+    /// La socket `numero` est détruite : son identifiant, et son groupe
+    /// (`sk_destruct`).
+    pub fn oublier(&mut self, numero: u64) {
+        self.retirer(numero);
+        // Ping ne forme pas de groupe : le sien n'a qu'elle, son compte part avec lui.
+        self.groupes.detacher(numero, false);
+    }
+
+    /// SO_ATTACH_REUSEPORT_CBPF (groupes.rs) : la socket est « dans la table »
+    /// quand elle a un identifiant. Rend l'ancien programme.
+    /// `processeur` : celui que dit la socket (SO_INCOMING_CPU), compté dans un groupe fait pour
+    /// elle.
+    pub fn attacher_programme(&mut self, numero: u64, programme: P, reuseport: bool, processeur: i32)
+                              -> Result<Option<P>, RefusDeGroupe> {
+        let hachee = self.entrees.iter().any(|e| e.numero == numero);
+        self.groupes.attacher_programme(numero, programme, hachee, reuseport, processeur >= 0)
+    }
+
+    /// SO_DETACH_REUSEPORT_BPF (groupes.rs).
+    pub fn detacher_programme(&mut self, numero: u64, reuseport: bool) -> Result<P, RefusDeGroupe> {
+        self.groupes.detacher_programme(numero, reuseport)
     }
 
     /// La socket qui reçoit une réponse d'identifiant `ident` arrivée pour

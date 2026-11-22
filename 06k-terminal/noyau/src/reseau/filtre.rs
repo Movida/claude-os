@@ -155,14 +155,55 @@ pub fn passer_ip(f: &Filtre, p: &Paquet, recul: usize, cap: usize, carte: Carte,
     // Un paquet arrivé par IPv4 a toujours ses en-têtes notés, et son en-tête de
     // transport juste avant ses données (ipv4.rs) : sans eux, ce serait une
     // faute du noyau, et un filtre ne laisse pas passer ce qu'il n'a pas vu.
-    let Some((octets, donnees, reseau, liaison)) = p.pour_filtre(recul) else { return Verdict::Jeter };
+    match vue_ip(p, recul, carte, |_| charge) {
+        Some(v) => passer(f, &v, cap),
+        None => Verdict::Jeter,
+    }
+}
+
+/// Le paquet `p` arrivé par IPv4 par la carte `carte`, tel que le voit un
+/// programme, ses données reculées de `recul` octets (voir `passer_ip`) ;
+/// `charge` : où commence sa charge, d'après ses données.
+fn vue_ip(p: &Paquet, recul: usize, carte: Carte, charge: impl FnOnce(&[u8]) -> u32) -> Option<Vue<'_>> {
+    let (octets, donnees, reseau, liaison) = p.pour_filtre(recul)?;
     let c = p.contexte();
-    let v = Vue {
+    Some(Vue {
         octets, donnees, reseau, liaison, protocole: ETH_P_IP, genre: c.genre, carte: Some(carte), marque: c.marque,
         file: (carte.genre == ARPHRD_ETHER && c.genre != paquet::BOUCLE) as u16, hachage: c.hachage,
-        processeur: crate::processeur::numero(), charge,
+        processeur: crate::processeur::numero(), charge: charge(&octets[donnees..]),
+    })
+}
+
+/// Le programme d'un groupe SO_REUSEPORT (SO_ATTACH_REUSEPORT_CBPF,
+/// inet::groupes) sur le paquet `p` arrivé par IPv4 par la carte `carte` :
+/// l'index qu'il rend (`run_bpf_filter`). Linux retire l'en-tête de
+/// transport le temps du programme (`pskb_pull(skb, hdr_len)`) : ses données
+/// commencent après lui, comme celles de `p` (son en-tête de transport, de
+/// `entete` octets, déjà retiré), et ses en-têtes de réseau et de liaison se
+/// lisent toujours (mesuré, sonde c10f du lot 6 des soldes). Ce qu'il voit
+/// d'autre est ce que voit un filtre (`passer_ip`), sauf sa charge
+/// (SKF_AD_PAY_OFFSET, `skb_get_poff`) : le dissecteur de Linux part de
+/// l'en-tête de réseau, AVANT les données, et compte le début du transport
+/// en 16 bits sans signe, borné par la longueur des données (`min_t(u16,
+/// nhoff, skb->len)` : -8 devient 65 528, au-delà de toute longueur) ; la
+/// charge commence donc 8 octets après la fin d'un datagramme UDP (mesuré :
+/// 28 pour 20 octets), et à la fin d'un segment TCP (dont l'en-tête se lirait
+/// 12 octets plus loin, hors du paquet : 0 pour un SYN, mesuré). `tcp` : le
+/// paquet est un segment TCP. Un paquet sans ses en-têtes notés (jamais, voir
+/// `passer_ip`) rend un index trop grand : le hachage choisit.
+pub fn index_ip(f: &Filtre, p: &Paquet, entete: usize, tcp: bool, carte: Carte) -> u32 {
+    let charge = |donnees: &[u8]| {
+        let debut = (entete as u16).wrapping_neg().min(donnees.len() as u16) as u32;
+        match (tcp, donnees.get(debut as usize + 12)) {
+            (true, Some(&doff)) => debut + 20.max((doff as u32 & 0xF0) >> 2),
+            (true, None) => debut,
+            (false, _) => debut + 8,
+        }
     };
-    passer(f, &v, cap)
+    match vue_ip(p, 0, carte, charge) {
+        Some(v) => cbpf::executer(&f.programme, &v, &mut crate::aleatoire::u32),
+        None => u32::MAX,
+    }
 }
 
 /// Passe le filtre `f` sur le message `octets` d'AF_UNIX : ses données sont le

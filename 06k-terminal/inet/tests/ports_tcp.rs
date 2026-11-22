@@ -1,7 +1,10 @@
 //! La table des ports de TCP : les règles de `inet_bind_conflict`, les
 //! ports éphémères de `bind` (impairs) et de `connect` (pairs), un
-//! quadruplet jamais pris deux fois, la recherche d'un segment.
+//! quadruplet jamais pris deux fois, la recherche d'un segment, les groupes
+//! SO_REUSEPORT des écoutes (mesurés sous Linux, sonde c10f du lot 6 des
+//! soldes).
 
+use inet::groupes::{Choix, Refus as RefusDeGroupe};
 use inet::ports_tcp::{Destinataire, Lien, Refus, Sorte, Table, EPHEMERE_MAX, EPHEMERE_MIN};
 
 const LO: [u8; 4] = [127, 0, 0, 1];
@@ -11,7 +14,26 @@ fn lien(adresse: [u8; 4], port: u16) -> Lien {
     Lien { sorte: Sorte::Liee, adresse, port, distante: TOUT, port_distant: 0, reuseaddr: false, reuseport: false, uid: 1000, par_connect: false, plage: 0, interface: 0 }
 }
 
-fn table() -> Table<u32> {
+fn aucun_processeur(_: &u32) -> i32 {
+    -1
+}
+
+fn hachage_nul() -> u32 {
+    0
+}
+
+/// Une recherche sur le processeur 0, sans programme ni processeur dit, d'un
+/// flux de hachage nul (le premier index d'un groupe).
+const AUCUN: Choix<'static, u32, u32> = Choix { ici: 0, processeur: &aucun_processeur, hachage: &hachage_nul, programme: None };
+
+/// Le programme « rend son propre nombre ».
+fn programme(k: &u32) -> u32 {
+    *k
+}
+
+const PROGRAMME: Choix<'static, u32, u32> = Choix { programme: Some(&programme), ..AUCUN };
+
+fn table() -> Table<u32, u32> {
     let mut x = 7u32;
     Table::new(64, || {
         x = x.wrapping_mul(1_103_515_245).wrapping_add(12345);
@@ -97,7 +119,7 @@ fn quadruplet_et_temps_attente() {
     // La connexion passe en TIME_WAIT, sous un numéro à elle : le
     // quadruplet reste pris, sans objet, et le numéro de la socket est libre.
     t.temps_attente(2, 20);
-    assert_eq!(t.trouver(LO, 80, LO, 5001, 1, |_| false), Some(Destinataire::TempsAttente(20)));
+    assert_eq!(t.trouver(LO, 80, LO, 5001, 1, &AUCUN), Some(Destinataire::TempsAttente(20)));
     assert_eq!(t.connecter(3, LO, LO, 80, r, 3, 0, 0, |_, _| false), Err(Refus::Pris));
     assert_eq!((t.nombre_temps_attente(), t.objet(2), t.lien(2).is_none()), (1, None, true));
     t.retirer(20);
@@ -110,22 +132,22 @@ fn recherche_d_un_segment() {
     t.lier(1, lien(TOUT, 80), 10, 0).unwrap();
     t.ecouter(1).unwrap();
     t.lier(2, lien(LO, 80), 20, 0).unwrap_err();
-    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1, |_| false), Some(Destinataire::Ecoute(10)));
+    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1, &AUCUN), Some(Destinataire::Ecoute(10)));
     // Une fille de l'écoute : son quadruplet d'abord.
     t.ajouter_fille(3, Lien { adresse: LO, distante: [1, 2, 3, 4], port_distant: 999, ..lien(LO, 80) }, 30).unwrap();
-    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1, |_| false), Some(Destinataire::Connexion(30)));
-    assert_eq!(t.trouver([1, 2, 3, 4], 998, LO, 80, 1, |_| false), Some(Destinataire::Ecoute(10)));
+    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1, &AUCUN), Some(Destinataire::Connexion(30)));
+    assert_eq!(t.trouver([1, 2, 3, 4], 998, LO, 80, 1, &AUCUN), Some(Destinataire::Ecoute(10)));
     t.changer_objet(3, 31);
-    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1, |_| false), Some(Destinataire::Connexion(31)));
-    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 81, 1, |_| false), None);
+    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1, &AUCUN), Some(Destinataire::Connexion(31)));
+    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 81, 1, &AUCUN), None);
     // Une écoute liée à l'adresse exacte passe avant celle de 0.0.0.0.
     let mut t = table();
     t.lier(1, Lien { reuseport: true, ..lien(TOUT, 80) }, 10, 0).unwrap();
     t.ecouter(1).unwrap();
     t.lier(2, Lien { reuseport: true, ..lien(LO, 80) }, 20, 0).unwrap();
     t.ecouter(2).unwrap();
-    assert_eq!(t.trouver([9, 9, 9, 9], 1, LO, 80, 1, |_| false), Some(Destinataire::Ecoute(20)));
-    assert_eq!(t.trouver([9, 9, 9, 9], 1, [10, 0, 2, 15], 80, 1, |_| false), Some(Destinataire::Ecoute(10)));
+    assert_eq!(t.trouver([9, 9, 9, 9], 1, LO, 80, 1, &AUCUN), Some(Destinataire::Ecoute(20)));
+    assert_eq!(t.trouver([9, 9, 9, 9], 1, [10, 0, 2, 15], 80, 1, &AUCUN), Some(Destinataire::Ecoute(10)));
 }
 
 /// SO_BINDTODEVICE (mesuré sous Linux 6.18, `interface-suite.txt` des
@@ -143,35 +165,45 @@ fn liees_a_une_interface() {
     t.lier(2, Lien { interface: IF_ETH0, ..lien(TOUT, 80) }, 20, 0).unwrap();
     t.ecouter(2).unwrap();
     assert_eq!(t.lier(3, lien(TOUT, 80), 30, 0), Err(Refus::Pris));
-    assert_eq!(t.trouver(LO, 4000, LO, 80, IF_LO, |_| false), Some(Destinataire::Ecoute(10)));
-    assert_eq!(t.trouver(ICI, 4000, ICI, 80, IF_ETH0, |_| false), Some(Destinataire::Ecoute(20)));
-    assert_eq!(t.trouver(ICI, 4000, ICI, 80, 3, |_| false), None, "aucune ecoute pour une troisieme interface");
-    // Une écoute non liée et une liée sur un port partagé (SO_REUSEPORT) :
-    // la liée d'abord, par son interface ; la non liée pour les autres.
+    assert_eq!(t.trouver(LO, 4000, LO, 80, IF_LO, &AUCUN), Some(Destinataire::Ecoute(10)));
+    assert_eq!(t.trouver(ICI, 4000, ICI, 80, IF_ETH0, &AUCUN), Some(Destinataire::Ecoute(20)));
+    assert_eq!(t.trouver(ICI, 4000, ICI, 80, 3, &AUCUN), None, "aucune ecoute pour une troisieme interface");
+    // Une écoute non liée et une liée sur un port partagé (SO_REUSEPORT), dans
+    // deux groupes (un groupe n'a qu'une interface) : la liée d'abord, par son
+    // interface ; la non liée pour les autres.
     let mut t = table();
     let p = Lien { reuseport: true, ..lien(TOUT, 81) };
     t.lier(1, p, 10, 0).unwrap();
     t.ecouter(1).unwrap();
-    t.lier(2, p, 20, 0).unwrap();
+    t.lier(2, Lien { interface: IF_LO, ..p }, 20, 0).unwrap();
     t.ecouter(2).unwrap();
-    assert_eq!(t.ecoute(LO, 81, IF_LO, |_| false), Some(10), "a egalite, la premiere");
-    t.changer_interface(2, IF_LO);
-    assert_eq!(t.ecoute(LO, 81, IF_LO, |_| false), Some(20));
-    assert_eq!(t.ecoute(ICI, 81, IF_ETH0, |_| false), Some(10));
+    assert_eq!(t.ecoute(LO, 81, IF_LO, &AUCUN), Some(20));
+    assert_eq!(t.ecoute(ICI, 81, IF_ETH0, &AUCUN), Some(10));
+    // SO_INCOMING_CPU : la non liée qui dit ce processeur égale la liée (3
+    // contre 3) : la plus récente ; sinon, la liée.
+    let dix = |&o: &u32| if o == 10 { 0 } else { -1 };
+    let de_10 = Choix { processeur: &dix, ..AUCUN };
+    assert_eq!(t.ecoute(LO, 81, IF_LO, &de_10), Some(20), "a egalite, la plus recente");
+    t.redevenir_liee(1, TOUT);
+    t.ecouter(1).unwrap();
+    assert_eq!(t.ecoute(LO, 81, IF_LO, &de_10), Some(10), "a egalite, la plus recente : listen la met en tete");
+    // Et même moins bien notée : la plus récente, en tête avec un groupe, rend sa
+    // membre sans voir la liée (mesuré).
+    assert_eq!(t.ecoute(LO, 81, IF_LO, &AUCUN), Some(10));
     // L'adresse avant la liaison : une écoute de l'adresse exacte, non liée,
     // passe avant une de 0.0.0.0 liée.
     t.lier(3, Lien { adresse: LO, ..p }, 30, 0).unwrap();
     t.ecouter(3).unwrap();
-    assert_eq!(t.ecoute(LO, 81, IF_LO, |_| false), Some(30));
+    assert_eq!(t.ecoute(LO, 81, IF_LO, &AUCUN), Some(30));
     // La fille est liée comme son écoute : elle ne voit que son interface,
     // son TIME_WAIT aussi.
     let fille = Lien { sorte: Sorte::Connectee, adresse: LO, distante: LO, port_distant: 5000, interface: IF_LO, ..p };
     t.ajouter_fille(4, fille, 40).unwrap();
-    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_LO, |_| false), Some(Destinataire::Connexion(40)));
-    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_ETH0, |_| false), Some(Destinataire::Ecoute(30)), "par eth0 : pas la fille, l'ecoute non liee");
+    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_LO, &AUCUN), Some(Destinataire::Connexion(40)));
+    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_ETH0, &AUCUN), Some(Destinataire::Ecoute(30)), "par eth0 : pas la fille, l'ecoute non liee");
     t.temps_attente(4, 41);
-    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_LO, |_| false), Some(Destinataire::TempsAttente(41)));
-    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_ETH0, |_| false), Some(Destinataire::Ecoute(30)));
+    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_LO, &AUCUN), Some(Destinataire::TempsAttente(41)));
+    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_ETH0, &AUCUN), Some(Destinataire::Ecoute(30)));
     // Le quadruplet d'un `connect` (`__inet_check_established`) : une entrée
     // liée ailleurs ne le prend pas ; une entrée non liée le prend toujours.
     let mut t = table();
@@ -182,7 +214,7 @@ fn liees_a_une_interface() {
         l.interface = interface;
         (n, l)
     };
-    let lier = |t: &mut Table<u32>, (n, l): (u64, Lien)| {
+    let lier = |t: &mut Table<u32, u32>, (n, l): (u64, Lien)| {
         t.lier(n, Lien { reuseaddr: true, ..l }, n as u32, 0).unwrap();
         t.connecter(n, LO, ICI, 80, l, n as u32, 0, 0, |_, _| false)
     };
@@ -241,11 +273,11 @@ fn une_morte_garde_son_port() {
     t.ecouter(1).unwrap();
     let fille = Lien { sorte: Sorte::Connectee, distante: [10, 0, 2, 2], port_distant: 40000, ..l };
     t.ajouter_fille(2, fille, 2).unwrap();
-    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080, 1, |_| false), Some(Destinataire::Connexion(2)));
+    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080, 1, &AUCUN), Some(Destinataire::Connexion(2)));
     t.redevenir_liee(2, LO);
     assert_eq!(t.lien(2).map(|x| (x.sorte, x.distante, x.port_distant)), Some((Sorte::Liee, TOUT, 0)));
     // Le segment suivant du même client va à l'écoute.
-    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080, 1, |_| false), Some(Destinataire::Ecoute(1)));
+    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080, 1, &AUCUN), Some(Destinataire::Ecoute(1)));
     t.retirer(1);
     // L'écoute partie, le port reste pris par elle.
     assert_eq!(t.lier(3, lien(LO, 8080), 3, 0), Err(Refus::Pris));
@@ -290,4 +322,75 @@ fn bind_avec_reuseaddr() {
     assert_eq!(t.lier(1, l, 1, 0), Ok(40001));
     assert_eq!(t.lier(2, l, 2, 0), Ok(40000));
     assert_eq!(t.lier(3, l, 3, 0), Err(Refus::Pris), "le dernier d'une plage impaire n'est pas pris");
+}
+
+/// Un groupe d'écoutes : l'ordre de `listen`, le programme et son index, le
+/// départ d'une écoute, les refus (mesurés).
+#[test]
+fn groupe_d_ecoutes() {
+    let mut t = table();
+    let p = Lien { reuseport: true, ..lien(LO, 90) };
+    // Un programme posé sur une socket liée (pas encore dans la table de
+    // Linux) : un groupe à elle, que `listen` garde.
+    t.lier(1, p, 10, 0).unwrap();
+    assert_eq!(t.attacher_programme(1, 2, false, -1), Err(RefusDeGroupe::Invalide), "sans SO_REUSEPORT");
+    assert_eq!(t.attacher_programme(1, 2, true, -1), Ok(None));
+    for k in 1..=3 {
+        if k > 1 {
+            t.lier(k, p, 10 * k as u32, 0).unwrap();
+        }
+        assert_eq!(t.ecouter(k), Ok(()));
+    }
+    assert_eq!(t.ecoute(LO, 90, 1, &PROGRAMME), Some(30));
+    for k in 0..3 {
+        t.attacher_programme(2, k, true, -1).unwrap();
+        assert_eq!(t.ecoute(LO, 90, 1, &PROGRAMME), Some(10 * (k + 1)));
+    }
+    // Une 4e, liée au port du groupe : permis ; son groupe à elle (un programme),
+    // puis `listen` : EADDRINUSE. Un groupe avant `bind` : EADDRINUSE au `bind`.
+    t.lier(4, p, 40, 0).unwrap();
+    t.attacher_programme(4, 0, true, -1).unwrap();
+    assert_eq!(t.ecouter(4), Err(Refus::Pris));
+    t.retirer(4);
+    t.detruire(4);
+    t.attacher_programme(5, 0, true, -1).unwrap();
+    assert_eq!(t.lier(5, p, 50, 0), Err(Refus::Pris));
+    t.detruire(5);
+    // La 1 cesse d'écouter : la 3 prend sa place.
+    t.redevenir_liee(1, LO);
+    t.attacher_programme(2, 0, true, -1).unwrap();
+    assert_eq!(t.ecoute(LO, 90, 1, &PROGRAMME), Some(30));
+    assert_eq!(t.detacher_programme(1, true), Err(RefusDeGroupe::Absent), "hors du groupe");
+    // SO_BINDTODEVICE ne fait pas quitter le groupe (pas de `rehash` pour TCP) :
+    // l'index 1 du groupe [3, 2] rend la 2 ; sortie, la 3 l'emporterait seule
+    // (la plus récente, et liée à l'interface d'arrivée).
+    t.attacher_programme(2, 1, true, -1).unwrap();
+    t.changer_interface(3, 1);
+    assert_eq!(t.ecoute(LO, 90, 1, &PROGRAMME), Some(20));
+    // Fermée : elle quitte son groupe (restée, elle en retirerait le programme).
+    t.retirer(3);
+    assert_eq!(t.detacher_programme(3, true), Err(RefusDeGroupe::Absent));
+    assert_eq!(t.ecoute(LO, 90, 1, &PROGRAMME), Some(20));
+    // Une écoute sans groupe (SO_REUSEPORT après `listen`) : EINVAL ; une autre
+    // la rejoint, et un groupe est fait pour elle.
+    let mut t = table();
+    t.lier(1, lien(LO, 91), 10, 0).unwrap();
+    t.ecouter(1).unwrap();
+    t.reutiliser(1, false, true);
+    assert_eq!(t.attacher_programme(1, 1, true, -1), Err(RefusDeGroupe::Invalide));
+    t.lier(2, Lien { reuseport: true, ..lien(LO, 91) }, 20, 0).unwrap();
+    t.ecouter(2).unwrap();
+    assert_eq!(t.attacher_programme(1, 1, true, -1), Ok(None));
+    assert_eq!(t.ecoute(LO, 91, 1, &PROGRAMME), Some(20));
+    // Une connexion : dans la table, sans groupe ; avec le sien d'avant
+    // `connect`, gardé jusqu'à sa destruction.
+    let c = Lien { sorte: Sorte::Connectee, distante: LO, port_distant: 91, ..lien(LO, 92) };
+    t.ajouter_fille(3, c, 30).unwrap();
+    assert_eq!(t.attacher_programme(3, 0, true, -1), Err(RefusDeGroupe::Invalide));
+    t.attacher_programme(4, 0, true, -1).unwrap();
+    t.ajouter_fille(4, Lien { port: 93, ..c }, 40).unwrap();
+    t.retirer(4);
+    assert_eq!(t.detacher_programme(4, true), Ok(0));
+    t.detruire(4);
+    assert_eq!(t.attacher_programme(4, 0, true, -1), Ok(None), "detruite : un groupe neuf");
 }

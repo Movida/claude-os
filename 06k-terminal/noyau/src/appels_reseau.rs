@@ -33,6 +33,7 @@ use formats::reseau::ipv4 as format_ipv4;
 
 const EPERM: i64 = 1;
 const ENOENT: i64 = 2;
+const EBUSY: i64 = 16;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
@@ -162,6 +163,11 @@ const SO_GET_FILTER: i32 = SO_ATTACH_FILTER;
 const SO_LOCK_FILTER: i32 = 44;
 const SO_BPF_EXTENSIONS: i32 = 48;
 const SO_ATTACH_BPF: i32 = 50;
+/// Les groupes SO_REUSEPORT (inet::groupes) : leur
+/// programme, de BPF classique ou d'eBPF ; aucun ne se relit (ENOPROTOOPT).
+const SO_ATTACH_REUSEPORT_CBPF: i32 = 51;
+const SO_ATTACH_REUSEPORT_EBPF: i32 = 52;
+const SO_DETACH_REUSEPORT_BPF: i32 = 68;
 /// La réception : l'horodatage, sous ses quatre formes
 /// (_OLD : `timeval` et `timespec` de 64 bits sur x86_64, comme les _NEW ; seul
 /// le numéro du message de contrôle les distingue), les pertes, la marque et
@@ -1883,6 +1889,29 @@ fn horodatages(s: &Socket, option: i32, d: u32) -> Result<(), i64> {
     Ok(())
 }
 
+/// Pose le programme `f` sur le groupe SO_REUSEPORT de `s`, selon son
+/// protocole (inet::groupes) ; rend l'ancien. Sous le `Mutex` des appels
+/// (`inet`). AF_UNIX n'a ni SO_REUSEPORT ni groupe : EINVAL.
+fn attacher_au_groupe(s: &Socket, inet: &socket::Inet, f: Arc<filtre::Filtre>) -> Result<Option<Arc<filtre::Filtre>>, i64> {
+    match s.protocole {
+        Protocole::Tcp => tcp::attacher_programme(s, inet, f),
+        Protocole::Udp | Protocole::Ping => datagramme::table::attacher_programme(s, inet, f),
+        Protocole::Unix => Err(inet::groupes::Refus::Invalide),
+    }
+    .map_err(errno_de_groupe)
+}
+
+/// L'errno d'un refus d'un groupe SO_REUSEPORT.
+fn errno_de_groupe(r: inet::groupes::Refus) -> i64 {
+    use inet::groupes::Refus;
+    match r {
+        Refus::Memoire => -ENOMEM,
+        Refus::Occupe => -EBUSY,
+        Refus::Invalide => -EINVAL,
+        Refus::Absent => -ENOENT,
+    }
+}
+
 /// Les options de SOL_SOCKET, dans l'ordre de `sk_setsockopt` : SO_BINDTODEVICE
 /// (un nom, avant tout entier) ; puis une valeur d'au moins 4 octets (EINVAL),
 /// lue (EFAULT), et l'option.
@@ -1956,9 +1985,15 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             return Ok(());
         }
         // Toute valeur, relue telle quelle (mesuré : -5, 100000) ; la
-        // réception suivante la remplace (socket.rs, `processeur`).
+        // réception suivante la remplace (socket.rs, `processeur`). Le
+        // groupe SO_REUSEPORT compte celles qui en disent un : changée sous
+        // le verrou de la table de son protocole (ping ne fait pas de groupe).
         SO_INCOMING_CPU => {
-            s.processeur.store(v, Ordering::Relaxed);
+            match s.protocole {
+                Protocole::Udp => udp::processeur_change(s, v),
+                Protocole::Tcp => tcp::processeur_change(s, v),
+                Protocole::Ping | Protocole::Unix => s.processeur.store(v, Ordering::Relaxed),
+            }
             return Ok(());
         }
         // CAP_NET_RAW ou CAP_NET_ADMIN de qui appelle (EPERM, même pour 0) :
@@ -2091,8 +2126,14 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         // 0 instruction ou plus de 4096, EINVAL ; elles, lues (EFAULT) ; refusé
         // par la vérification, EINVAL ; puis la mémoire des options (ENOMEM,
         // filtre.rs). Sous le `Mutex` des appels (le `lock_sock` de Linux), comme
-        // les trois suivantes.
-        SO_ATTACH_FILTER => {
+        // les suivantes.
+        //
+        // Le même programme pour le groupe SO_REUSEPORT de la socket
+        // (`sk_reuseport_attach_filter`) : plus grand qu'OPTMEM_MAX, ENOMEM, mais il
+        // ne compte pas dans la mémoire des options ; puis le groupe
+        // (`reuseport_attach_prog`, inet::groupes : EINVAL sans SO_REUSEPORT ou
+        // sans groupe). L'ancien est rendu hors du verrou.
+        SO_ATTACH_FILTER | SO_ATTACH_REUSEPORT_CBPF => {
             if longueur != 16 {
                 return Err(-EINVAL);
             }
@@ -2100,7 +2141,7 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             copier_depuis_utilisateur(&mut o, valeur).map_err(|_| -EFAULT)?;
             let n = u16::from_le_bytes([o[0], o[1]]) as usize;
             let adresse = u64::from_le_bytes([o[8], o[9], o[10], o[11], o[12], o[13], o[14], o[15]]);
-            let _appels = s.appels.verrouiller();
+            let inet = s.appels.verrouiller();
             if s.drapeau(socket::FILTRE_VERROUILLE) {
                 return Err(-EPERM);
             }
@@ -2111,7 +2152,27 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
             copier_depuis_utilisateur(&mut octets, adresse).map_err(|_| -EFAULT)?;
             let f = filtre::faire(&octets)?;
             drop(octets);
-            return filtre::attacher(s, f);
+            if option == SO_ATTACH_FILTER {
+                return filtre::attacher(s, f);
+            }
+            if f.taille() > socket::OPTMEM_MAX {
+                return Err(-ENOMEM);
+            }
+            let ancien = attacher_au_groupe(s, &inet, f)?;
+            drop(inet);
+            drop(ancien);
+            return Ok(());
+        }
+        SO_DETACH_REUSEPORT_BPF => {
+            let inet = s.appels.verrouiller();
+            let ancien = match s.protocole {
+                Protocole::Tcp => tcp::detacher_programme(s, &inet),
+                Protocole::Udp | Protocole::Ping => datagramme::table::detacher_programme(s, &inet),
+                // Sans SO_REUSEPORT (AF_UNIX ne le prend pas) ni groupe.
+                Protocole::Unix => Err(inet::groupes::Refus::Invalide),
+            };
+            drop(inet);
+            return ancien.map(drop).map_err(errno_de_groupe);
         }
         SO_DETACH_FILTER => {
             let _appels = s.appels.verrouiller();
@@ -2129,8 +2190,9 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         // Un programme d'eBPF, par le descripteur que rend l'appel `bpf` : un
         // u32 exactement (EINVAL), puis (`sk_attach_bpf`) verrouillé, EPERM ; un
         // descripteur fermé, EBADF ; sinon ce n'est pas un programme
-        // (`bpf_prog_get_type`) : EINVAL, toujours ici, sans appel `bpf`.
-        SO_ATTACH_BPF => {
+        // (`bpf_prog_get_type`) : EINVAL, toujours ici, sans appel `bpf`. De même
+        // pour le groupe SO_REUSEPORT (`sk_reuseport_attach_bpf`).
+        SO_ATTACH_BPF | SO_ATTACH_REUSEPORT_EBPF => {
             if longueur != 4 {
                 return Err(-EINVAL);
             }

@@ -112,6 +112,19 @@
  *     de la trame, la carte, la charge, le processeur, le hachage du flux : celui d'une
  *     socket UDP connectée, gardé après la déconnexion, neuf à chaque connexion, et
  *     après SO_CNX_ADVICE 1, d'UDP comme de TCP, sauf SO_TXREHASH 0).
+ *   - les groupes SO_REUSEPORT et leur programme (SO_ATTACH_REUSEPORT_CBPF et _EBPF,
+ *     SO_DETACH_REUSEPORT_BPF) : les refus (une socket sans SO_REUSEPORT, une liée sans
+ *     groupe, une écoute ou une connexion TCP sans groupe, AF_UNIX ; le verrou des
+ *     filtres) ; l'ordre des membres (celui des `bind` ou des `listen` ; une qui part,
+ *     remplacée par la dernière), que choisit le programme par son index (trop grand :
+ *     le hachage, qui répartit les flux et garde chacun à sa socket), ce qu'il voit
+ *     (les données après l'en-tête de transport, les en-têtes, la charge à la fin, le
+ *     processeur), SO_INCOMING_CPU dans un groupe ; ce qui fait quitter un groupe d'UDP
+ *     (`connect`, AF_UNSPEC qui oublie l'adresse, SO_BINDTODEVICE, le port rendu) et
+ *     pas une écoute TCP (SO_BINDTODEVICE) ; la recherche (la plus récente à égalité ;
+ *     un groupe en tête rend sa membre sans voir une socket mieux notée, sauf une membre
+ *     connectée un jour) ; former un groupe (pas avec un groupe à soi, sauf par
+ *     SO_REUSEADDR, qui perd son programme ; SO_REUSEPORT posé après `bind`).
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -3626,6 +3639,517 @@ static void conseil_tcp(void)
     close(c), close(d);
 }
 
+/* Les groupes SO_REUSEPORT (mesurés : sonde c10f du lot 6 des soldes). */
+#ifndef SO_ATTACH_REUSEPORT_CBPF
+#define SO_ATTACH_REUSEPORT_CBPF 51
+#define SO_ATTACH_REUSEPORT_EBPF 52
+#endif
+#ifndef SO_DETACH_REUSEPORT_BPF
+#define SO_DETACH_REUSEPORT_BPF 68
+#endif
+#define LOCALE 0x7f000001u
+
+static int rp_attacher(int s, struct sock_filter *f, unsigned short n)
+{
+    struct sock_fprog p = {n, f};
+    return erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF, &p, sizeof p));
+}
+
+/* Le programme « ret k » : l'index k. */
+static int rp_index(int s, unsigned k)
+{
+    struct sock_filter f[1] = {F(BPF_RET | BPF_K, k)};
+    return rp_attacher(s, f, 1);
+}
+
+static int rp_detacher(int s)
+{
+    int v = 0;
+    return erreur(setsockopt(s, SOL_SOCKET, SO_DETACH_REUSEPORT_BPF, &v, sizeof v));
+}
+
+static int rp_lier(int s, unsigned a, int port)
+{
+    struct sockaddr_in x = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(a)};
+    return erreur(bind(s, (struct sockaddr *)&x, sizeof x));
+}
+
+static int rp_port(int s)
+{
+    struct sockaddr_in x;
+    socklen_t l = sizeof x;
+    getsockname(s, (struct sockaddr *)&x, &l);
+    return ntohs(x.sin_port);
+}
+
+/* Une socket UDP (SO_REUSEPORT, et SO_REUSEADDR si `ra`) liée à a:port ; -1 si refusé. */
+static int rp_udp(unsigned a, int port, int rp, int ra)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(s, SO_REUSEPORT, rp);
+    poser(s, SO_REUSEADDR, ra);
+    if (rp_lier(s, a, port)) {
+        close(s);
+        return -1;
+    }
+    return s;
+}
+
+/* Un port libre de 127.0.0.1 (choisi ensuite : un port éphémère se rend). */
+static int rp_libre(void)
+{
+    int s = rp_udp(LOCALE, 0, 0, 0), p = rp_port(s);
+    close(s);
+    return p;
+}
+
+/* Un port libre de 127.0.0.1 pour TCP, choisi par TCP lui-même (le port 0 d'une socket
+ * TCP, qui le rend à sa fermeture : ni écoute, ni connexion, pas de TIME_WAIT). Pas
+ * celui de `rp_libre` : libre pour UDP, il peut être celui d'une connexion TCP en
+ * TIME_WAIT (les cas précédents en laissent des centaines, pour 60 s), et une écoute
+ * qui s'y lie échoue (EADDRINUSE) ; mesuré, 500 TIME_WAIT sur lo : 35 ports d'UDP sur
+ * 2000 refusés, aucun de TCP (`inet_csk_find_open_port` n'en choisit pas un que tient
+ * une connexion). Écarté : la première écoute liée au port 0, et les autres au sien
+ * (sans `SOCK_BINDPORT_LOCK`, l'écoute arrêtée par shutdown rend son port, et
+ * `listen` l'en lierait à un autre). */
+static int rp_libre_tcp(void)
+{
+    int s = socket(AF_INET, SOCK_STREAM, 0), p = rp_lier(s, LOCALE, 0) ? -1 : rp_port(s);
+    close(s);
+    return p;
+}
+
+/* Un datagramme d'une socket neuve (un flux neuf) vers a:port : l'index de celle de
+ * `s` qui l'a, livré par lo quand sendto revient (-1 : aucune). */
+static int rp_qui(int *s, int n, unsigned a, int port)
+{
+    char m[20] = {3}, b[sizeof m];
+    struct sockaddr_in x = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(a)};
+    int tx = socket(AF_INET, SOCK_DGRAM, 0), r = -1;
+    sendto(tx, m, sizeof m, 0, (struct sockaddr *)&x, sizeof x);
+    close(tx);
+    for (int i = 0; i < n; i++)
+        if (s[i] >= 0 && recv(s[i], b, sizeof b, MSG_DONTWAIT) >= 0 && r < 0)
+            r = i;
+    return r;
+}
+
+/* `fois` flux neufs : chacune de `s` en a-t-elle eu au moins un ? Sinon, -1 ; la seule qui
+ * en a eu (si une seule), son index. */
+static int rp_repartis(int *s, int n, unsigned a, int port, int fois)
+{
+    int vus[8] = {0}, nombre = 0, seule = -1;
+    for (int i = 0; i < fois; i++) {
+        int r = rp_qui(s, n, a, port);
+        if (r >= 0)
+            vus[r]++;
+    }
+    for (int i = 0; i < n; i++)
+        if (vus[i]) {
+            nombre++;
+            seule = i;
+        }
+    return nombre == n ? n : nombre == 1 ? seule : -1;
+}
+
+static void rp_processeur(int c)
+{
+    cpu_set_t e;
+    CPU_ZERO(&e);
+    CPU_SET(c, &e);
+    sched_setaffinity(0, sizeof e, &e);
+}
+
+static void reuseport_options(void)
+{
+    struct sock_fprog p = {1, NULL};
+    int s = socket(AF_INET, SOCK_DGRAM, 0), v = 0;
+    verifier(rp_index(s, 0) == EINVAL && rp_detacher(s) == EINVAL, "SO_REUSEPORT : sans lui, EINVAL pour poser et retirer un programme");
+    poser(s, SO_REUSEPORT, 1);
+    verifier(rp_detacher(s) == ENOENT && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF, &p, 8)) == EINVAL
+             && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF, &p, sizeof p)) == EINVAL
+             && erreur(setsockopt(s, SOL_SOCKET, SO_DETACH_REUSEPORT_BPF, &v, 2)) == EINVAL,
+             "SO_REUSEPORT : sans groupe ENOENT ; une sock_fprog de 16 octets, un programme, un entier");
+    verifier(rp_index(s, 0) == 0 && rp_index(s, 1) == 0 && rp_detacher(s) == 0 && rp_detacher(s) == ENOENT && rp_index(s, 2) == 0,
+             "SO_REUSEPORT : non liee, un groupe a elle ; poser, remplacer, retirer, ENOENT");
+    verifier(rp_lier(s, LOCALE, 0) == 0 && rp_index(s, 0) == 0 && rp_detacher(s) == 0,
+             "SO_REUSEPORT : son groupe garde par bind");
+    close(s);
+    s = rp_udp(LOCALE, 0, 0, 0);
+    poser(s, SO_REUSEPORT, 1);
+    verifier(rp_index(s, 0) == EINVAL && rp_detacher(s) == ENOENT, "SO_REUSEPORT : liee sans groupe (pose apres bind), EINVAL");
+    verifier(poser(s, SO_LOCK_FILTER, 1) == 0 && rp_index(s, 0) == EPERM && rp_detacher(s) == ENOENT,
+             "SO_REUSEPORT : SO_LOCK_FILTER, EPERM pour poser (pas pour retirer)");
+    close(s);
+    s = socket(AF_INET, SOCK_DGRAM, 0);
+    int fd = 999;
+    verifier(erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_REUSEPORT_EBPF, &p, 8)) == EINVAL
+             && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_REUSEPORT_EBPF, &fd, 4)) == EBADF
+             && erreur(setsockopt(s, SOL_SOCKET, SO_ATTACH_REUSEPORT_EBPF, &s, 4)) == EINVAL,
+             "SO_ATTACH_REUSEPORT_EBPF : EINVAL, EBADF, EINVAL");
+    socklen_t l = sizeof v;
+    verifier(erreur(getsockopt(s, SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF, &v, &l)) == ENOPROTOOPT
+             && erreur(getsockopt(s, SOL_SOCKET, SO_ATTACH_REUSEPORT_EBPF, &v, &l)) == ENOPROTOOPT
+             && erreur(getsockopt(s, SOL_SOCKET, SO_DETACH_REUSEPORT_BPF, &v, &l)) == ENOPROTOOPT,
+             "SO_ATTACH_REUSEPORT : rien a relire (ENOPROTOOPT)");
+    close(s);
+    s = socket(AF_UNIX, SOCK_DGRAM, 0);
+    verifier(rp_index(s, 0) == EINVAL && rp_detacher(s) == EINVAL, "SO_REUSEPORT : AF_UNIX, EINVAL");
+    close(s);
+    /* TCP : liée (pas encore dans la table), un groupe ; une écoute ou une connexion sans
+     * groupe, EINVAL ; celui d'avant `connect` reste. */
+    int t = socket(AF_INET, SOCK_STREAM, 0);
+    poser(t, SO_REUSEPORT, 1);
+    verifier(rp_index(t, 0) == 0 && rp_lier(t, LOCALE, 0) == 0 && rp_index(t, 1) == 0 && listen(t, 4) == 0
+             && rp_index(t, 2) == 0 && rp_detacher(t) == 0 && rp_detacher(t) == ENOENT,
+             "SO_REUSEPORT tcp : neuve, liee, puis ecoute : son groupe");
+    int e = socket(AF_INET, SOCK_STREAM, 0);
+    rp_lier(e, LOCALE, 0);
+    listen(e, 4);
+    poser(e, SO_REUSEPORT, 1);
+    verifier(rp_index(e, 0) == EINVAL && rp_detacher(e) == ENOENT, "SO_REUSEPORT tcp : une ecoute sans groupe, EINVAL");
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(rp_port(e)), .sin_addr.s_addr = htonl(LOCALE)};
+    int c = socket(AF_INET, SOCK_STREAM, 0), d = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (struct sockaddr *)&a, sizeof a);
+    poser(c, SO_REUSEPORT, 1);
+    poser(d, SO_REUSEPORT, 1);
+    rp_index(d, 0);
+    connect(d, (struct sockaddr *)&a, sizeof a);
+    verifier(rp_index(c, 0) == EINVAL && rp_detacher(c) == ENOENT && rp_detacher(d) == 0 && rp_detacher(d) == ENOENT
+             && rp_index(d, 0) == 0,
+             "SO_REUSEPORT tcp : une connexion sans groupe, EINVAL ; avec celui d'avant connect, garde");
+    /* Un programme posé avant `shutdown` : ENOENT ne vient alors que d'une écoute sortie de
+     * son groupe (restée, elle le retirerait : 0). Sans lui, ENOENT dans les deux cas. */
+    verifier(rp_index(t, 3) == 0 && shutdown(t, SHUT_RDWR) == 0 && rp_detacher(t) == ENOENT,
+             "SO_REUSEPORT tcp : une ecoute arretee quitte son groupe");
+    close(t);
+    close(e);
+    close(c);
+    close(d);
+}
+
+/* Deux sockets UDP liées au même port (SO_REUSEADDR), connectées au même émetteur : la plus
+ * récemment connectée reçoit (`udp4_lib_lookup4`), dans les deux ordres ; une connectée
+ * ailleurs d'abord, reconnectée ensuite, non : son premier quadruplet reste le sien (mesuré :
+ * sondes r4a et r4b de la relecture du lot 6 des soldes). */
+static void recherche_des_connectees(void)
+{
+    /* Les deux `connect` vers l'émetteur, dans l'ordre, et celle qui reçoit : la seconde liée
+     * puis la première ; l'inverse ; la seconde connectée ailleurs avant tout. */
+    static const int ordre[3][2] = {{1, 0}, {0, 1}, {0, 1}}, recoit[3] = {0, 1, 0};
+    int ok = 1;
+    for (int cas = 0; cas < 3; cas++) {
+        int s[2], e = rp_udp(LOCALE, 0, 0, 0), ailleurs = rp_udp(LOCALE, 0, 0, 0);
+        s[0] = rp_udp(LOCALE, 0, 0, 1);
+        s[1] = rp_udp(LOCALE, rp_port(s[0]), 0, 1);
+        struct sockaddr_in q = {.sin_family = AF_INET, .sin_port = htons(rp_port(e)), .sin_addr.s_addr = htonl(LOCALE)},
+                           q2 = {.sin_family = AF_INET, .sin_port = htons(rp_port(ailleurs)), .sin_addr.s_addr = htonl(LOCALE)},
+                           p = {.sin_family = AF_INET, .sin_port = htons(rp_port(s[0])), .sin_addr.s_addr = htonl(LOCALE)};
+        if (cas == 2)
+            connect(s[1], (void *)&q2, sizeof q2);
+        connect(s[ordre[cas][0]], (void *)&q, sizeof q);
+        connect(s[ordre[cas][1]], (void *)&q, sizeof q);
+        sendto(e, "x", 1, 0, (void *)&p, sizeof p);
+        attendre_ms(20);
+        char o[4];
+        int r[2] = {recv(s[0], o, sizeof o, MSG_DONTWAIT), recv(s[1], o, sizeof o, MSG_DONTWAIT)};
+        ok &= r[recoit[cas]] == 1 && r[1 - recoit[cas]] < 0;
+        close(s[0]), close(s[1]), close(e), close(ailleurs);
+    }
+    verifier(ok, "udp : deux connectees au meme emetteur, la plus recemment connectee recoit ; une reconnectee, non");
+}
+
+/* Le compte des membres qui disent un processeur (`incoming_cpu`) d'un groupe UDP : s2, liée
+ * et connectée, entre dans le groupe que fait s1 en se liant après elle (sans processeur, pas
+ * comptée) ; elle reçoit, connectée, ce qui lui donne le processeur 1 hors du compte ; puis
+ * AF_UNSPEC l'y laisse (adresse et port de `bind`). Le compte nul, le hachage répartit les
+ * envois de 64 ports entre les deux, même cherchés depuis le processeur 1 (mesuré : sonde r4c
+ * de la relecture du lot 6 des soldes). */
+static void groupe_processeur_non_compte(void)
+{
+    cpu_set_t avant, un;
+    sched_getaffinity(0, sizeof avant, &avant);
+    CPU_ZERO(&un);
+    CPU_SET(1, &un);
+    sched_setaffinity(0, sizeof un, &un);
+    /* Un port nommé (SOCK_BINDPORT_LOCK) : AF_UNSPEC rendrait un port éphémère, et le groupe. */
+    int s2 = rp_udp(LOCALE, rp_libre(), 1, 0), c = rp_udp(LOCALE, 0, 0, 0);
+    struct sockaddr_in q = {.sin_family = AF_INET, .sin_port = htons(rp_port(c)), .sin_addr.s_addr = htonl(LOCALE)},
+                       p = {.sin_family = AF_INET, .sin_port = htons(rp_port(s2)), .sin_addr.s_addr = htonl(LOCALE)};
+    connect(s2, (void *)&q, sizeof q);
+    int s1 = rp_udp(LOCALE, rp_port(s2), 1, 0);
+    sendto(c, "x", 1, 0, (void *)&p, sizeof p);
+    attendre_ms(20);
+    char o[4];
+    int recu = recv(s2, o, sizeof o, MSG_DONTWAIT), cpu2 = lire(s2, SO_INCOMING_CPU), cpu1 = lire(s1, SO_INCOMING_CPU);
+    struct sockaddr u = {.sa_family = AF_UNSPEC};
+    connect(s2, &u, sizeof u);
+    int n1 = 0, n2 = 0;
+    for (int k = 0; k < 64; k++) {
+        int e = rp_udp(LOCALE, 0, 0, 0);
+        sendto(e, "y", 1, 0, (void *)&p, sizeof p);
+        close(e);
+    }
+    attendre_ms(50);
+    while (recv(s1, o, sizeof o, MSG_DONTWAIT) == 1)
+        n1++;
+    while (recv(s2, o, sizeof o, MSG_DONTWAIT) == 1)
+        n2++;
+    verifier(recu == 1 && cpu2 == 1 && cpu1 == -1 && n1 > 0 && n2 > 0 && n1 + n2 == 64,
+             "SO_REUSEPORT udp : un processeur que la reception donne ne compte pas dans le groupe (le hachage)");
+    close(s1), close(s2), close(c);
+    sched_setaffinity(0, sizeof avant, &avant);
+}
+
+static void reuseport_udp(void)
+{
+    /* L'ordre des `bind` ; le programme posé avant `bind` par la première, ou par
+     * n'importe laquelle ensuite ; trop grand, le hachage. */
+    int s[4], ok = 1;
+    s[0] = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(s[0], SO_REUSEPORT, 1);
+    rp_index(s[0], 1);
+    rp_lier(s[0], LOCALE, 0);
+    int port = rp_port(s[0]);
+    for (int i = 1; i < 4; i++)
+        s[i] = rp_udp(LOCALE, port, 1, 0);
+    ok &= rp_qui(s, 4, LOCALE, port) == 1;
+    for (int k = 0; k < 4; k++)
+        ok &= rp_index(s[3], k) == 0 && rp_qui(s, 4, LOCALE, port) == k;
+    verifier(ok, "SO_REUSEPORT udp : l'index du programme, dans l'ordre des bind");
+    rp_index(s[0], 7);
+    verifier(rp_repartis(s, 4, LOCALE, port, 64) == 4, "SO_REUSEPORT udp : un index trop grand, le hachage");
+    rp_detacher(s[0]);
+    char m[20] = {3}, b[sizeof m];
+    struct sockaddr_in x = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(LOCALE)};
+    int tx = socket(AF_INET, SOCK_DGRAM, 0), premiere = -1;
+    ok = 1;
+    for (int i = 0; i < 8; i++) {
+        sendto(tx, m, sizeof m, 0, (struct sockaddr *)&x, sizeof x);
+        for (int k = 0; k < 4; k++)
+            if (recv(s[k], b, sizeof b, MSG_DONTWAIT) >= 0) {
+                ok &= premiere < 0 || premiere == k;
+                premiere = k;
+            }
+    }
+    close(tx);
+    verifier(ok && rp_repartis(s, 4, LOCALE, port, 64) == 4, "SO_REUSEPORT udp : sans programme, les flux repartis, chacun a sa socket");
+    /* Ce que voit le programme : la charge après l'en-tête d'UDP, l'en-tête IP et celui
+     * de lo, la longueur, la charge à la fin plus 8, le processeur. */
+    struct sock_filter premier[2] = {F(BPF_LD | BPF_B | BPF_ABS, 0), RET_A},
+                       reseau[3] = {F(BPF_LD | BPF_B | BPF_ABS, SKF_NET_OFF + 9), F(BPF_ALU | BPF_SUB | BPF_K, 15), RET_A},
+                       liaison[3] = {F(BPF_LD | BPF_H | BPF_ABS, SKF_LL_OFF + 12), F(BPF_ALU | BPF_SUB | BPF_K, 0x7fe), RET_A},
+                       longueur[3] = {F(BPF_LD | BPF_W | BPF_LEN, 0), F(BPF_ALU | BPF_SUB | BPF_K, 17), RET_A},
+                       charge[3] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_PAY_OFFSET), F(BPF_ALU | BPF_SUB | BPF_K, 26), RET_A},
+                       cpu[2] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_CPU), RET_A};
+    verifier(rp_attacher(s[0], premier, 2) == 0 && rp_qui(s, 4, LOCALE, port) == 3 && rp_attacher(s[0], reseau, 3) == 0
+             && rp_qui(s, 4, LOCALE, port) == 2 && rp_attacher(s[0], liaison, 3) == 0 && rp_qui(s, 4, LOCALE, port) == 2
+             && rp_attacher(s[0], longueur, 3) == 0 && rp_qui(s, 4, LOCALE, port) == 3
+             && rp_attacher(s[0], charge, 3) == 0 && rp_qui(s, 4, LOCALE, port) == 2,
+             "SO_REUSEPORT udp : le programme voit la charge, les en-tetes, la longueur, SKF_AD_PAY_OFFSET");
+    ok = rp_attacher(s[0], cpu, 2) == 0;
+    for (int c = 0; c < 4; c++) {
+        rp_processeur(c);
+        ok &= rp_qui(s, 4, LOCALE, port) == c;
+    }
+    rp_processeur(0);
+    verifier(ok, "SO_REUSEPORT udp : le programme voit le processeur");
+    /* SO_INCOMING_CPU : la membre du processeur qui cherche ; aucune, le hachage. */
+    rp_detacher(s[0]);
+    poser(s[2], SO_INCOMING_CPU, 1);
+    rp_processeur(1);
+    int depuis_1 = rp_repartis(s, 4, LOCALE, port, 16);
+    rp_processeur(3);
+    int depuis_3 = rp_repartis(s, 4, LOCALE, port, 64);
+    rp_processeur(0);
+    poser(s[2], SO_INCOMING_CPU, -1);
+    verifier(depuis_1 == 2 && depuis_3 == 4, "SO_REUSEPORT udp : SO_INCOMING_CPU, la membre de ce processeur");
+    /* La 1 part : la dernière prend sa place. Puis la 0 (liée à 127.0.0.1) se connecte :
+     * elle quitte le groupe. */
+    close(s[1]);
+    s[1] = -1;
+    verifier(rp_index(s[2], 1) == 0 && rp_qui(s, 4, LOCALE, port) == 3 && rp_index(s[2], 2) == 0 && rp_qui(s, 4, LOCALE, port) == 2,
+             "SO_REUSEPORT udp : une membre partie, la derniere prend sa place");
+    struct sockaddr_in ailleurs = {.sin_family = AF_INET, .sin_port = htons(9), .sin_addr.s_addr = htonl(LOCALE)};
+    connect(s[0], (struct sockaddr *)&ailleurs, sizeof ailleurs);
+    verifier(rp_index(s[2], 0) == 0 && rp_qui(s, 4, LOCALE, port) == 2 && rp_index(s[0], 0) == EINVAL,
+             "SO_REUSEPORT udp : une membre qui se connecte quitte le groupe");
+    for (int i = 0; i < 4; i++)
+        if (s[i] >= 0)
+            close(s[i]);
+    /* AF_UNSPEC d'une membre jamais connectée : port choisi, liée à 0.0.0.0, elle quitte
+     * le groupe et garde son port ; liée à 127.0.0.1, elle reste ; port éphémère, elle le
+     * rend. Et SO_BINDTODEVICE, qui la ré-hache : elle quitte. */
+    struct sockaddr_in rien = {.sin_family = AF_UNSPEC};
+    const char *cas[] = {"AF_UNSPEC, 0.0.0.0, port choisi : quitte, garde son port", "AF_UNSPEC, 127.0.0.1, port choisi : reste",
+                         "AF_UNSPEC, port ephemere : rend son port", "SO_BINDTODEVICE : quitte"};
+    for (int k = 0; k < 4; k++) {
+        int d[3], adresse = k == 0 ? 0 : LOCALE;
+        d[0] = rp_udp(adresse, k == 2 ? 0 : rp_libre(), 1, 0);
+        port = rp_port(d[0]);
+        d[1] = rp_udp(adresse, port, 1, 0);
+        d[2] = rp_udp(adresse, port, 1, 0);
+        rp_index(d[1], 0);
+        if (k == 3)
+            setsockopt(d[0], SOL_SOCKET, SO_BINDTODEVICE, "lo", 3);
+        else
+            connect(d[0], (struct sockaddr *)&rien, sizeof rien);
+        int garde = rp_port(d[0]) == port, qui = rp_qui(d, 3, LOCALE, port);
+        int attendu = k == 1 ? 0 : 2;
+        verifier(qui == attendu && garde == (k != 2) && rp_detacher(d[0]) == (k == 1 ? 0 : ENOENT),
+                 dire("SO_REUSEPORT udp : %s", cas[k]));
+        for (int i = 0; i < 3; i++)
+            close(d[i]);
+    }
+    /* La recherche : une socket liée à lo, plus ancienne que le groupe, ne reçoit rien ;
+     * une membre connectée un jour (has_conns), et elle reçoit tout. */
+    int r[3];
+    r[0] = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(r[0], SO_REUSEPORT, 1);
+    setsockopt(r[0], SOL_SOCKET, SO_BINDTODEVICE, "lo", 3);
+    rp_lier(r[0], LOCALE, 0);
+    port = rp_port(r[0]);
+    r[1] = rp_udp(LOCALE, port, 1, 0);
+    r[2] = rp_udp(LOCALE, port, 1, 0);
+    int avant = rp_repartis(r, 3, LOCALE, port, 32);
+    connect(r[1], (struct sockaddr *)&ailleurs, sizeof ailleurs);
+    int apres = rp_repartis(r, 3, LOCALE, port, 16);
+    verifier(avant == -1 && apres == 0, "SO_REUSEPORT udp : un groupe en tete l'emporte sur une liee a lo, sauf has_conns");
+    for (int i = 0; i < 3; i++)
+        close(r[i]);
+    /* SO_REUSEADDR seul : la plus récente. */
+    int e[2];
+    e[0] = rp_udp(LOCALE, 0, 0, 1);
+    port = rp_port(e[0]);
+    e[1] = rp_udp(LOCALE, port, 0, 1);
+    verifier(rp_qui(e, 2, LOCALE, port) == 1, "SO_REUSEADDR udp : la plus recemment liee recoit");
+    close(e[0]);
+    close(e[1]);
+    /* Former un groupe : avec un groupe à elle, pas par SO_REUSEPORT (EADDRINUSE) ; par
+     * SO_REUSEADDR, si, et son programme est perdu ; SO_REUSEPORT posé après `bind`. */
+    int f[2];
+    f[0] = rp_udp(LOCALE, 0, 1, 0);
+    port = rp_port(f[0]);
+    f[1] = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(f[1], SO_REUSEPORT, 1);
+    rp_index(f[1], 0);
+    verifier(rp_lier(f[1], LOCALE, port) == EADDRINUSE && rp_lier(f[1], LOCALE, 0) == 0,
+             "SO_REUSEPORT udp : un groupe a elle, pas le port d'un autre groupe");
+    close(f[0]);
+    close(f[1]);
+    f[0] = rp_udp(LOCALE, 0, 1, 1);
+    port = rp_port(f[0]);
+    rp_index(f[0], 0);
+    f[1] = socket(AF_INET, SOCK_DGRAM, 0);
+    poser(f[1], SO_REUSEPORT, 1);
+    poser(f[1], SO_REUSEADDR, 1);
+    rp_index(f[1], 1);
+    verifier(rp_lier(f[1], LOCALE, port) == 0 && rp_qui(f, 2, LOCALE, port) == 0 && rp_detacher(f[1]) == 0 && rp_detacher(f[0]) == ENOENT,
+             "SO_REUSEPORT udp : SO_REUSEADDR, le groupe de l'autre et son programme");
+    close(f[0]);
+    close(f[1]);
+    f[0] = rp_udp(LOCALE, 0, 0, 0);
+    port = rp_port(f[0]);
+    poser(f[0], SO_REUSEPORT, 1);
+    f[1] = rp_udp(LOCALE, port, 1, 0);
+    verifier(f[1] >= 0 && rp_index(f[0], 1) == 0 && rp_qui(f, 2, LOCALE, port) == 1,
+             "SO_REUSEPORT udp : pose apres bind, un groupe fait quand une autre arrive");
+    close(f[0]);
+    close(f[1]);
+}
+
+/* Une écoute TCP de 127.0.0.1:port avec SO_REUSEPORT, sans attendre à accept. */
+static int rp_ecoute(int port, const char *interface)
+{
+    int l = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    poser(l, SO_REUSEPORT, 1);
+    if (interface)
+        setsockopt(l, SOL_SOCKET, SO_BINDTODEVICE, interface, strlen(interface) + 1);
+    if (rp_lier(l, LOCALE, port) || listen(l, 64)) {
+        close(l);
+        return -1;
+    }
+    return l;
+}
+
+/* Une connexion à 127.0.0.1:port : l'index de l'écoute de `l` qui l'accepte. */
+static int rp_accepte(int *l, int n, int port)
+{
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = htonl(LOCALE)};
+    int c = socket(AF_INET, SOCK_STREAM, 0), r = -1;
+    connect(c, (struct sockaddr *)&a, sizeof a);
+    for (int i = 0; i < n; i++) {
+        int f = l[i] < 0 ? -1 : accept(l[i], NULL, NULL);
+        if (f >= 0) {
+            close(f);
+            if (r < 0)
+                r = i;
+        }
+    }
+    close(c);
+    return r;
+}
+
+static void reuseport_tcp(void)
+{
+    int l[3], ok = 1, port = rp_libre_tcp();
+    for (int i = 0; i < 3; i++)
+        l[i] = rp_ecoute(port, NULL);
+    for (int k = 0; k < 3; k++)
+        ok &= rp_index(l[1], k) == 0 && rp_accepte(l, 3, port) == k;
+    verifier(ok, "SO_REUSEPORT tcp : l'index du programme, dans l'ordre des listen");
+    struct sock_filter charge[3] = {F(BPF_LD | BPF_W | BPF_ABS, SKF_AD_OFF + SKF_AD_PAY_OFFSET), F(BPF_ALU | BPF_ADD | BPF_K, 1), RET_A},
+                       longueur[3] = {F(BPF_LD | BPF_W | BPF_LEN, 0), F(BPF_ALU | BPF_ADD | BPF_K, 2), RET_A};
+    verifier(rp_attacher(l[0], charge, 3) == 0 && rp_accepte(l, 3, port) == 1 && rp_attacher(l[0], longueur, 3) == 0
+             && rp_accepte(l, 3, port) == 2,
+             "SO_REUSEPORT tcp : un SYN, sans charge, vu par le programme");
+    rp_detacher(l[0]);
+    int vus[3] = {0};
+    for (int i = 0; i < 48; i++) {
+        int r = rp_accepte(l, 3, port);
+        if (r >= 0)
+            vus[r]++;
+    }
+    verifier(vus[0] && vus[1] && vus[2], "SO_REUSEPORT tcp : sans programme, les connexions reparties");
+    rp_index(l[0], 1);
+    close(l[0]);
+    l[0] = -1;
+    verifier(rp_accepte(l, 3, port) == 1 && rp_index(l[1], 0) == 0 && rp_accepte(l, 3, port) == 2,
+             "SO_REUSEPORT tcp : une ecoute fermee, la derniere prend sa place");
+    int m = socket(AF_INET, SOCK_STREAM, 0);
+    poser(m, SO_REUSEPORT, 1);
+    verifier(rp_lier(m, LOCALE, port) == 0 && rp_index(m, 0) == 0 && erreur(listen(m, 4)) == EADDRINUSE,
+             "SO_REUSEPORT tcp : un groupe a elle, pas d'ecoute sur le port d'un autre groupe");
+    close(m);
+    m = socket(AF_INET, SOCK_STREAM, 0);
+    poser(m, SO_REUSEPORT, 1);
+    rp_index(m, 0);
+    verifier(rp_lier(m, LOCALE, port) == EADDRINUSE, "SO_REUSEPORT tcp : un groupe avant bind, pas le port d'un autre groupe");
+    close(m);
+    /* Le groupe est [l2, l1]. L'index 1 : seule une l2 restée dans le groupe rend l1 ;
+     * sortie, l2 l'emporterait seule (la plus récente, et liée à lo : mieux notée). */
+    rp_index(l[1], 1);
+    setsockopt(l[2], SOL_SOCKET, SO_BINDTODEVICE, "lo", 3);
+    verifier(rp_accepte(l, 3, port) == 1, "SO_REUSEPORT tcp : SO_BINDTODEVICE ne fait pas quitter le groupe");
+    /* L'index 0 : une l2 restée dans le groupe serait choisie sans écouter. */
+    rp_index(l[1], 0);
+    shutdown(l[2], SHUT_RD);
+    verifier(rp_accepte(l, 3, port) == 1, "SO_REUSEPORT tcp : une ecoute arretee par shutdown quitte le groupe");
+    close(l[1]);
+    close(l[2]);
+    /* Deux groupes (une écoute liée à lo) : la plus récente en tête avec son groupe
+     * l'emporte, même moins bien notée. */
+    port = rp_libre_tcp();
+    l[0] = rp_ecoute(port, NULL);
+    l[1] = rp_ecoute(port, "lo");
+    int avant = rp_accepte(l, 2, port);
+    shutdown(l[0], SHUT_RD);
+    listen(l[0], 8);
+    verifier(avant == 1 && rp_accepte(l, 2, port) == 0, "SO_REUSEPORT tcp : la plus recente ecoute en tete, avec son groupe");
+    close(l[0]);
+    close(l[1]);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -3676,6 +4200,11 @@ int main(void)
     filtres_ping_unix();
     filtres_tcp();
     conseil_tcp();
+    reuseport_options();
+    recherche_des_connectees();
+    groupe_processeur_non_compte();
+    reuseport_udp();
+    reuseport_tcp();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

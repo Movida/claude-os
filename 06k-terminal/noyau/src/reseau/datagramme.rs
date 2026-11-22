@@ -31,11 +31,14 @@ const EADDRNOTAVAIL: i64 = 99;
 
 /// La table du protocole de la socket : y inscrire une socket à un port (0
 /// : éphémère), récrire son lien, l'en retirer, lui dire que SO_REUSEADDR
-/// ou SO_REUSEPORT a changé. Sous le `Mutex` de la socket.
+/// ou SO_REUSEPORT a changé, poser le programme de son groupe SO_REUSEPORT.
+/// Sous le `Mutex` de la socket.
 pub mod table {
+    use super::super::filtre::Filtre;
     use super::super::socket::{Inet, Protocole, Socket};
     use super::super::{ping, udp};
     use crate::partage::Arc;
+    use inet::groupes::Refus;
 
     pub fn inscrire(s: &Arc<Socket>, inet: &mut Inet, port: u16) -> Result<(), i64> {
         match s.protocole {
@@ -46,9 +49,20 @@ pub mod table {
         }
     }
 
-    pub fn changer(s: &Socket, inet: &Inet) {
+    /// `connect` : la destination, et l'adresse locale qu'elle a pu donner.
+    pub fn connecter(s: &Socket, inet: &Inet) {
         match s.protocole {
-            Protocole::Udp => udp::changer(s, inet),
+            Protocole::Udp => udp::connecter(s, inet),
+            Protocole::Ping => ping::changer(s, inet),
+            Protocole::Tcp | Protocole::Unix => {}
+        }
+    }
+
+    /// La fin de la connexion, le port gardé ; `oublier_adresse` : l'adresse
+    /// locale n'était pas de `bind` (UDP la ré-hache : `udp_lib_rehash`).
+    pub fn deconnecter(s: &Socket, inet: &Inet, oublier_adresse: bool) {
+        match s.protocole {
+            Protocole::Udp => udp::deconnecter(s, oublier_adresse),
             Protocole::Ping => ping::changer(s, inet),
             Protocole::Tcp | Protocole::Unix => {}
         }
@@ -59,6 +73,24 @@ pub mod table {
             Protocole::Udp => udp::liberer(s),
             Protocole::Ping => ping::liberer(s),
             Protocole::Tcp | Protocole::Unix => {}
+        }
+    }
+
+    /// SO_ATTACH_REUSEPORT_CBPF (inet::groupes) : rend l'ancien programme.
+    pub fn attacher_programme(s: &Socket, inet: &Inet, f: Arc<Filtre>) -> Result<Option<Arc<Filtre>>, Refus> {
+        match s.protocole {
+            Protocole::Udp => udp::attacher_programme(s, inet, f),
+            Protocole::Ping => ping::attacher_programme(s, inet, f),
+            Protocole::Tcp | Protocole::Unix => Err(Refus::Invalide),
+        }
+    }
+
+    /// SO_DETACH_REUSEPORT_BPF (inet::groupes).
+    pub fn detacher_programme(s: &Socket, inet: &Inet) -> Result<Arc<Filtre>, Refus> {
+        match s.protocole {
+            Protocole::Udp => udp::detacher_programme(s, inet),
+            Protocole::Ping => ping::detacher_programme(s, inet),
+            Protocole::Tcp | Protocole::Unix => Err(Refus::Invalide),
         }
     }
 
@@ -204,14 +236,15 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     // Jamais 0 (`net_tx_rndhash`), qui dirait « pas de hachage ».
     s.hachage.store(crate::aleatoire::u32().max(1), Ordering::Relaxed);
     inet.identifiant = crate::aleatoire::u32() as u16;
-    table::changer(s, &inet);
+    table::connecter(s, &inet);
     Ok(())
 }
 
 /// La fin de la connexion (connect AF_UNSPEC, `__udp_disconnect`) : plus
 /// de destination ; l'adresse locale oubliée si `bind` ne l'avait pas
 /// choisie, et le port rendu s'il était éphémère (mesuré : getsockname
-/// rend ensuite 0.0.0.0:0).
+/// rend ensuite 0.0.0.0:0). Même sans connexion : une socket UDP liée à
+/// 0.0.0.0 quitte ainsi son groupe SO_REUSEPORT (inet::ports, mesuré).
 pub fn deconnecter(s: &Arc<Socket>) {
     let mut inet = s.appels.verrouiller();
     inet.connecte = false;
@@ -228,7 +261,7 @@ pub fn deconnecter(s: &Arc<Socket>) {
         inet.lie = false;
         inet.port = 0;
     } else {
-        table::changer(s, &inet);
+        table::deconnecter(s, &inet, !inet.adresse_choisie);
     }
 }
 

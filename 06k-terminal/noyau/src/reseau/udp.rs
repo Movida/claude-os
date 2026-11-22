@@ -25,7 +25,7 @@
 //! ou qui manque de place (SndbufErrors).
 
 use super::datagramme::{self, Controle, Depart, trop_gros};
-use super::filtre::{self, Verdict};
+use super::filtre::{self, Filtre, Verdict};
 use super::ipv4;
 use super::paquet::{self, Paquet};
 use super::icmp::ErreurRecue;
@@ -36,8 +36,9 @@ use crate::aleatoire;
 use crate::attente::GardeMutex;
 use crate::partage::Arc;
 use crate::verrou::Verrou;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicU64, Ordering};
 use formats::reseau::{Erreur, ipv4 as format_ipv4, somme_linux, somme_linux_moins, udp};
+use inet::groupes::{Choix, Refus as RefusDeGroupe};
 use inet::ports::{Lien, Refus, Table};
 use inet::snmp::Udp as Compteur;
 
@@ -49,18 +50,44 @@ const EADDRINUSE: i64 = 98;
 const EAFNOSUPPORT: i64 = 97;
 const ENOBUFS: i64 = 105;
 
-/// La table des ports ; faite au démarrage.
-static PORTS: Verrou<Option<Table<Arc<Socket>>>> = Verrou::new(None);
+/// La table des ports ; faite au démarrage. Ses groupes SO_REUSEPORT
+/// (inet::groupes) gardent leur programme (filtre.rs).
+static PORTS: Verrou<Option<Table<Arc<Socket>, Arc<Filtre>>>> = Verrou::new(None);
+
+/// La clé secrète du hachage des flux qui choisit dans un groupe SO_REUSEPORT
+/// (`udp_ehash_secret`) : un tiers qui la connaîtrait choisirait la socket
+/// qui reçoit ses datagrammes.
+static CLE_GROUPES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
 pub fn initialiser() {
-    *PORTS.verrouiller() = Table::new();
+    *PORTS.verrouiller() = Table::new().map(|t| t.avec_processeur(processeur_de));
+    for k in &CLE_GROUPES {
+        k.store(aleatoire::u64(), Ordering::Relaxed);
+    }
+}
+
+/// Le hachage du flux de `distante`:`port_distant` vers `locale`:`port`
+/// (`udp_ehashfn`) : SipHash sous la clé secrète. Linux prend jhash, plus
+/// rapide et assez sûr avec sa clé ; SipHash est celui que nous avons déjà
+/// (ipv4.rs, les identifiants).
+fn hachage_du_flux(locale: [u8; 4], port: u16, distante: [u8; 4], port_distant: u16) -> u32 {
+    let cle = [CLE_GROUPES[0].load(Ordering::Relaxed), CLE_GROUPES[1].load(Ordering::Relaxed)];
+    let ports = (port as u32) << 16 | port_distant as u32;
+    crypto::siphash::siphash_3u32(u32::from_ne_bytes(locale), u32::from_ne_bytes(distante), ports, &cle) as u32
+}
+
+/// Le processeur que dit une socket (SO_INCOMING_CPU).
+fn processeur_de(s: &Arc<Socket>) -> i32 {
+    s.processeur.load(Ordering::Relaxed)
 }
 
 fn hasard() -> u32 {
     aleatoire::u32()
 }
 
-/// Retire la socket `s` de la table des ports (son dernier close).
+/// Retire la socket `s` de la table des ports, et de son groupe SO_REUSEPORT
+/// (`udp_lib_unhash`) : la fin d'une connexion qui rend son port éphémère. (Le
+/// dernier close : `fermer`.)
 pub fn liberer(s: &Socket) {
     if let Some(t) = PORTS.verrouiller().as_mut() {
         t.retirer(s.numero);
@@ -92,10 +119,49 @@ pub fn inscrire(s: &Arc<Socket>, inet: &mut Inet, port: u16) -> Result<(), i64> 
     }
 }
 
-/// Récrit le lien de `s` dans la table (connect, ou sa fin).
-pub fn changer(s: &Socket, inet: &Inet) {
+/// `s` s'est connectée (`connect`) : sa destination, et son adresse locale,
+/// dans la table ; elle quitte son groupe SO_REUSEPORT (inet::ports).
+pub fn connecter(s: &Socket, inet: &Inet) {
     if let Some(t) = PORTS.verrouiller().as_mut() {
-        t.changer(s.numero, inet.distante, inet.port_distant, inet.adresse);
+        t.connecter(s.numero, inet.distante, inet.port_distant, inet.adresse);
+    }
+}
+
+/// La fin de la connexion de `s`, son port gardé ; `oublier_adresse` : son
+/// adresse locale n'était pas de `bind` (inet::ports, `deconnecter`).
+pub fn deconnecter(s: &Socket, oublier_adresse: bool) {
+    if let Some(t) = PORTS.verrouiller().as_mut() {
+        t.deconnecter(s.numero, oublier_adresse);
+    }
+}
+
+/// SO_INCOMING_CPU (`reuseport_update_incoming_cpu`) : le processeur que dit
+/// la socket `s` devient `v`, sous le verrou de la table, que prend aussi
+/// chaque entrée dans un groupe ou sortie : son groupe compte celles qui en
+/// disent un (inet::groupes).
+pub fn processeur_change(s: &Socket, v: i32) {
+    let mut t = PORTS.verrouiller();
+    let ancien = s.processeur.swap(v, Ordering::Relaxed);
+    if let Some(t) = t.as_mut() {
+        t.processeur_change(s.numero, ancien, v);
+    }
+}
+
+/// SO_ATTACH_REUSEPORT_CBPF : le programme `f` pour le groupe de `s`
+/// (inet::groupes, `attacher_programme` : EINVAL, ENOMEM), et rend l'ancien,
+/// à rendre hors du verrou. Sous le `Mutex` de la socket.
+pub fn attacher_programme(s: &Socket, inet: &Inet, f: Arc<Filtre>) -> Result<Option<Arc<Filtre>>, RefusDeGroupe> {
+    match PORTS.verrouiller().as_mut() {
+        Some(t) => t.attacher_programme(s.numero, f, inet.options.reuseport, s.processeur.load(Ordering::Relaxed)),
+        None => Err(RefusDeGroupe::Invalide),
+    }
+}
+
+/// SO_DETACH_REUSEPORT_BPF (inet::groupes, `detacher_programme`).
+pub fn detacher_programme(s: &Socket, inet: &Inet) -> Result<Arc<Filtre>, RefusDeGroupe> {
+    match PORTS.verrouiller().as_mut() {
+        Some(t) => t.detacher_programme(s.numero, inet.options.reuseport),
+        None => Err(RefusDeGroupe::Invalide),
     }
 }
 
@@ -374,11 +440,14 @@ pub fn fin_d_episse(s: &Socket) {
 }
 
 /// Le dernier close (`udp_destroy_sock`) : le bouchon est perdu, et la
-/// socket quitte la table des ports.
+/// socket quitte la table des ports, et son groupe SO_REUSEPORT même sans
+/// port (`sk_destruct`).
 pub fn fermer(s: &Socket) {
     let bouchon = s.appels.verrouiller().bouchon.take();
     drop(bouchon);
-    liberer(s);
+    if let Some(t) = PORTS.verrouiller().as_mut() {
+        t.oublier(s.numero);
+    }
 }
 
 /// Un datagramme UDP (`p` : le segment, en-tête compris, sans l'en-tête
@@ -403,6 +472,11 @@ pub fn fermer(s: &Socket) {
 /// (socket.rs, `somme_lue`). Les deux calculs ne donnent pas toujours la
 /// même valeur pour les mêmes données (des données nulles : 0xFFFFFFFF,
 /// puis 0) : comme chez Linux.
+///
+/// Jamais dans le cadre de qui l'appelle (`ipv4::livrer`) : il grossirait de ses
+/// variables, et un segment TCP, qui passe par lui, les porterait sous toute sa
+/// suite (les piles du noyau : 112 octets, mesuré au lot 6 des soldes).
+#[inline(never)]
 pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete: &ipv4::EnteteRecu, diffusion: bool, a_verifier: bool,
                 mut p: Paquet) -> Result<(), Paquet> {
     // Choix de conception : la somme vérifiée à l'arrivée, pour tout datagramme.
@@ -451,12 +525,17 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
             if e == Erreur::Somme {
                 MIB.udp(Compteur::InCsumErrors);
                 let o = p.donnees();
-                if u16::from_be_bytes([o[4], o[5]]) > 76 {
+                let longueur = u16::from_be_bytes([o[4], o[5]]) as usize;
+                if longueur > 76 {
                     let ports = (u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]]));
-                    let ici = crate::processeur::numero() as i32;
-                    let s = PORTS.verrouiller().as_ref().and_then(|t| {
-                        t.trouver(source, ports.0, destination, ports.1, lieu.interface, |s| de_ce_processeur(s, ici))
-                    });
+                    // La recherche de Linux, avec le paquet : le programme d'un groupe
+                    // le voit sans son en-tête, coupé à la longueur d'UDP comme le
+                    // chemin ordinaire (`pskb_trim_rcsum`, avant la somme) : sans les
+                    // octets que le paquet IP porte après lui. (`udp::lire` a vérifié
+                    // la longueur avant la somme : au moins l'en-tête, au plus le paquet.)
+                    let _ = p.retirer_entete(udp::ENTETE);
+                    p.couper(longueur - udp::ENTETE);
+                    let s = trouver(&p, source, ports.0, destination, ports.1, lieu);
                     if let Some(s) = s {
                         s.pertes.fetch_add(1, Ordering::Relaxed);
                     }
@@ -517,10 +596,7 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
         }
         return Ok(());
     }
-    let ici = crate::processeur::numero() as i32;
-    let s = PORTS.verrouiller().as_ref().and_then(|t| {
-        t.trouver(source, u.source, destination, u.destination, lieu.interface, |s| de_ce_processeur(s, ici))
-    });
+    let s = trouver(&p, source, u.source, destination, u.destination, lieu);
     match s {
         Some(s) => {
             match filtrer(&s, &p, lieu.carte, arrivee.somme) {
@@ -540,10 +616,17 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
     }
 }
 
-/// La socket dit-elle (SO_INCOMING_CPU) le processeur `ici`, celui qui cherche ?
-/// À note égale, elle l'emporte (`compute_score`, inet::ports).
-fn de_ce_processeur(s: &Arc<Socket>, ici: i32) -> bool {
-    s.processeur.load(Ordering::Relaxed) == ici
+/// La socket qui reçoit le datagramme `p` (sa charge, son en-tête retiré) de
+/// `source`:`port_source` pour `destination`:`port`, arrivé là où dit `lieu`
+/// (`__udp4_lib_lookup_skb`, inet::ports) : le programme d'un groupe
+/// SO_REUSEPORT le voit (filtre.rs, `index_ip`), et le hachage du flux ne
+/// se calcule que s'il sert.
+fn trouver(p: &Paquet, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, lieu: ipv4::Lieu)
+           -> Option<Arc<Socket>> {
+    let hachage = || hachage_du_flux(destination, port, source, port_source);
+    let programme = |f: &Arc<Filtre>| filtre::index_ip(f, p, udp::ENTETE, false, lieu.carte);
+    let c = Choix { ici: crate::processeur::numero() as i32, processeur: &processeur_de, hachage: &hachage, programme: Some(&programme) };
+    PORTS.verrouiller().as_ref().and_then(|t| t.trouver(source, port_source, destination, port, lieu.interface, &c))
 }
 
 /// Le filtre de la socket `s` (filtre.rs), s'il en a un, sur le datagramme `p`
@@ -664,9 +747,13 @@ pub fn erreur(e: &ErreurRecue) {
     // La socket d'une erreur : cherchée par l'interface qui l'a reçue (le
     // `skb->dev` d'`__udp4_lib_err`), pas par celle de sa route (TCP et ping
     // prennent celle-là).
-    let ici = crate::processeur::numero() as i32;
+    // Sans le paquet (`__udp4_lib_err` : `skb` nul) : le programme d'un groupe
+    // n'est pas passé, le hachage choisit.
+    let (locale, distante) = (i.source, i.destination);
+    let hachage = || hachage_du_flux(locale, port_source, distante, port_destination);
+    let c = Choix { ici: crate::processeur::numero() as i32, processeur: &processeur_de, hachage: &hachage, programme: None };
     let Some(s) = PORTS.verrouiller().as_ref()
-        .and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source, e.interface, |s| de_ce_processeur(s, ici))) else {
+        .and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source, e.interface, &c)) else {
         return MIB.icmp(inet::snmp::Icmp::InErrors);
     };
     apprendre_si_mtu(e);

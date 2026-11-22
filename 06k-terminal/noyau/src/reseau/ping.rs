@@ -17,7 +17,7 @@
 //! datagramme.rs et socket.rs.
 
 use super::datagramme::{self, Controle};
-use super::filtre::{self, Verdict};
+use super::filtre::{self, Filtre, Verdict};
 use super::interface::Interface;
 use super::icmp::ErreurRecue;
 use super::ipv4;
@@ -29,6 +29,7 @@ use crate::verrou::Verrou;
 use core::sync::atomic::{AtomicU64, Ordering};
 use formats::reseau::icmp::{self, Icmp};
 use formats::reseau::ipv4 as format_ipv4;
+use inet::groupes::Refus as RefusDeGroupe;
 use inet::idents::{Refus, Table};
 
 const EINVAL: i64 = 22;
@@ -40,7 +41,7 @@ const EADDRINUSE: i64 = 98;
 const ENOBUFS: i64 = 105;
 
 /// La table des identifiants ; faite au démarrage.
-static IDENTS: Verrou<Option<Table<Arc<Socket>>>> = Verrou::new(None);
+static IDENTS: Verrou<Option<Table<Arc<Socket>, Arc<Filtre>>>> = Verrou::new(None);
 
 /// Les réponses jetées : sans socket, ou la file pleine (pas des compteurs
 /// de /proc/net/snmp, chez Linux non plus : pas montrés).
@@ -74,11 +75,35 @@ pub fn changer(s: &Socket, inet: &Inet) {
     }
 }
 
-/// Retire `s` de la table (son dernier close, ou la fin d'une connexion
-/// qui rend son identifiant).
+/// Retire `s` de la table (la fin d'une connexion qui rend son identifiant).
 pub fn liberer(s: &Socket) {
     if let Some(t) = IDENTS.verrouiller().as_mut() {
         t.retirer(s.numero);
+    }
+}
+
+/// Le dernier close : `s` quitte la table, et son groupe SO_REUSEPORT
+/// (`sk_destruct`, inet::idents).
+pub fn fermer(s: &Socket) {
+    if let Some(t) = IDENTS.verrouiller().as_mut() {
+        t.oublier(s.numero);
+    }
+}
+
+/// SO_ATTACH_REUSEPORT_CBPF (inet::idents) : rend l'ancien programme, à rendre
+/// hors du verrou.
+pub fn attacher_programme(s: &Socket, inet: &Inet, f: Arc<Filtre>) -> Result<Option<Arc<Filtre>>, RefusDeGroupe> {
+    match IDENTS.verrouiller().as_mut() {
+        Some(t) => t.attacher_programme(s.numero, f, inet.options.reuseport, s.processeur.load(Ordering::Relaxed)),
+        None => Err(RefusDeGroupe::Invalide),
+    }
+}
+
+/// SO_DETACH_REUSEPORT_BPF (inet::idents).
+pub fn detacher_programme(s: &Socket, inet: &Inet) -> Result<Arc<Filtre>, RefusDeGroupe> {
+    match IDENTS.verrouiller().as_mut() {
+        Some(t) => t.detacher_programme(s.numero, inet.options.reuseport),
+        None => Err(RefusDeGroupe::Invalide),
     }
 }
 

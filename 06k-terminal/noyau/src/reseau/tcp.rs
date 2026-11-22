@@ -68,10 +68,11 @@ use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use formats::reseau::ipv4 as fipv4;
 use formats::reseau::Erreur;
 use formats::reseau::tcp::{self as ftcp, Tcp};
+use inet::groupes::{Choix, Refus as RefusDeGroupe};
 use inet::ports_tcp::{self, Destinataire, Lien, Sorte};
 use inet::routes::Portee;
 use inet::snmp::{Icmp as CompteurIcmp, Ip as CompteurIp, Tcp as Compteur};
@@ -91,6 +92,7 @@ const ENOTCONN: i64 = 107;
 const EALREADY: i64 = 114;
 const EINPROGRESS: i64 = 115;
 const ENOBUFS: i64 = 105;
+const ENOMEM: i64 = 12;
 const ECONNABORTED: i64 = 103;
 
 /// SOCK_STREAM, et le protocole d'IPv4.
@@ -171,7 +173,21 @@ struct TempsAttente {
     hachage: u32,
 }
 
-static TABLE: Verrou<Option<ports_tcp::Table<Cible>>> = Verrou::new(None);
+/// La table des ports ; ses groupes SO_REUSEPORT (inet::groupes) gardent leur
+/// programme (filtre.rs).
+static TABLE: Verrou<Option<ports_tcp::Table<Cible, Arc<Filtre>>>> = Verrou::new(None);
+
+/// La clé secrète du hachage des flux qui choisit dans un groupe SO_REUSEPORT
+/// (`inet_ehash_secret`), comme celle d'UDP (udp.rs).
+static CLE_GROUPES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+
+/// Le hachage du flux de `distante`:`port_distant` vers `locale`:`port`
+/// (`inet_ehashfn`), comme celui d'UDP (udp.rs).
+fn hachage_du_flux(locale: [u8; 4], port: u16, distante: [u8; 4], port_distant: u16) -> u32 {
+    let cle = [CLE_GROUPES[0].load(Ordering::Relaxed), CLE_GROUPES[1].load(Ordering::Relaxed)];
+    let ports = (port as u32) << 16 | port_distant as u32;
+    crypto::siphash::siphash_3u32(u32::from_ne_bytes(locale), u32::from_ne_bytes(distante), ports, &cle) as u32
+}
 
 /// La mémoire de TCP de toute la machine (le `tcp_memory_allocated` de
 /// Linux), en octets : ce que gardent les connexions, en réception (taille
@@ -272,7 +288,10 @@ pub fn initialiser() {
     let par_socket = libres * 4096 / 128;
     RECEPTION_MAX.store(par_socket.min(32 << 20).max(131_072), Ordering::Relaxed);
     ENVOI_MAX.store(par_socket.min(itcp::SNDBUF_MAX).max(64 << 10), Ordering::Relaxed);
-    *TABLE.verrouiller() = ports_tcp::Table::new(MAX_PORTS, crate::aleatoire::u32);
+    *TABLE.verrouiller() = ports_tcp::Table::new(MAX_PORTS, crate::aleatoire::u32).map(|t| t.avec_processeur(processeur_de));
+    for k in &CLE_GROUPES {
+        k.store(crate::aleatoire::u64(), Ordering::Relaxed);
+    }
     let mut tw = TW.verrouiller();
     if TABLE.verrouiller().is_none() || tw.try_reserve_exact(MAX_TW).is_err() {
         afficherln!("[reseau] plus de memoire pour les tables de TCP.");
@@ -2282,19 +2301,34 @@ fn mss_vers(distante: [u8; 4], oif: u32, portee: Portee) -> u16 {
     }
 }
 
-/// La cible dit-elle (SO_INCOMING_CPU) le processeur `p` ? Une écoute ainsi
-/// l'emporte à note égale (`compute_score`, ports_tcp).
-fn de_ce_processeur(c: &Cible, p: i32) -> bool {
-    matches!(c, Cible::Socket(s) if s.processeur.load(Ordering::Relaxed) == p)
+/// Le processeur que dit la cible (SO_INCOMING_CPU) : une écoute qui dit celui
+/// qui cherche l'emporte à note égale, et choisit dans son groupe SO_REUSEPORT
+/// (ports_tcp, inet::groupes) ; une fille n'en dit aucun.
+fn processeur_de(c: &Cible) -> i32 {
+    match c {
+        Cible::Socket(s) => s.processeur.load(Ordering::Relaxed),
+        Cible::Fille(..) => -1,
+    }
+}
+
+/// À qui va le segment `s`, d'après la table (ports_tcp) : le programme d'un groupe
+/// SO_REUSEPORT le voit sans son en-tête (filtre.rs, `index_ip`) ; le hachage du flux
+/// ne se calcule que s'il sert. Jamais dans le cadre de `livrer` : il le grossirait de
+/// ce que la recherche demande, sous toute la suite (les piles du noyau).
+#[inline(never)]
+fn destinataire(s: &Segment) -> Option<Destinataire<Cible>> {
+    let h = s.entete;
+    let hachage = || hachage_du_flux(s.destination, h.destination, s.source, h.source);
+    let programme = |f: &Arc<Filtre>| filtre::index_ip(f, &s.charge, s.longueur_entete as usize, true, s.carte);
+    let c = Choix { ici: s.processeur, processeur: &processeur_de, hachage: &hachage, programme: Some(&programme) };
+    TABLE.verrouiller().as_ref().and_then(|t| t.trouver(s.source, h.source, s.destination, h.destination, s.interface, &c))
 }
 
 /// Livre un segment à sa cible, d'après la table : à une socket
 /// (`vers_la_socket`), ou à une fille, par son écoute (`traiter_ecoute`).
 fn livrer(s: Segment) {
     let h = s.entete;
-    let cible = TABLE.verrouiller().as_ref().and_then(|t| {
-        t.trouver(s.source, h.source, s.destination, h.destination, s.interface, |c| de_ce_processeur(c, s.processeur))
-    });
+    let cible = destinataire(&s);
     match cible {
         Some(Destinataire::Connexion(Cible::Socket(sock))) => vers_la_socket(&sock, Segment { fille: None, ..s }, true),
         Some(Destinataire::Ecoute(Cible::Socket(sock))) => vers_la_socket(&sock, Segment { fille: None, ..s }, false),
@@ -2439,10 +2473,10 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     // (Ses 20 premiers octets au moins sont là : `icmp::ports` les a lus.)
     let ttl = e.origine.get(8).copied().unwrap_or(0);
     // (Cherchée par l'interface de la route du message, `inet_iif` de `tcp_v4_err`.)
-    let ici = crate::processeur::numero() as i32;
-    let cible = TABLE.verrouiller().as_ref().and_then(|t| {
-        t.trouver(i.destination, port_destination, i.source, port_source, e.iif, |c| de_ce_processeur(c, ici))
-    });
+    // (Sans le paquet : une écoute, et donc un groupe, n'y sert pas.)
+    let hachage = || hachage_du_flux(i.source, port_source, i.destination, port_destination);
+    let c = Choix { ici: crate::processeur::numero() as i32, processeur: &processeur_de, hachage: &hachage, programme: None };
+    let cible = TABLE.verrouiller().as_ref().and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source, e.iif, &c));
     let (sock, fille) = match cible {
         Some(Destinataire::Connexion(Cible::Socket(s))) => (s, None),
         Some(Destinataire::Connexion(Cible::Fille(ecoute, n))) => (ecoute, Some(n)),
@@ -2471,6 +2505,17 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     vers_socket(&sock, Arrivee::Erreur { errno, injoignable, seq, fille, recverr, abandon, ttl });
 }
 
+/// Le segment `s` a-t-il une écoute ? `livrer` la choisira (dans son groupe
+/// SO_REUSEPORT, par son programme : une seule fois). Jamais dans le cadre de
+/// `livrer`, où `temps_attente` entre (voir `destinataire`).
+#[inline(never)]
+fn a_une_ecoute(s: &Segment) -> bool {
+    let h = s.entete;
+    let hachage = || hachage_du_flux(s.destination, h.destination, s.source, h.source);
+    let c = Choix { ici: s.processeur, processeur: &processeur_de, hachage: &hachage, programme: None };
+    TABLE.verrouiller().as_ref().and_then(|t| t.ecoute(s.destination, h.destination, s.interface, &c)).is_some()
+}
+
 /// Un segment pour une entrée de TIME_WAIT : ses règles disent quoi faire
 /// (inet::tcp::attente). Un SYN qui reprend le quadruplet va à l'écoute,
 /// s'il y en a une ; sinon, l'entrée lui répond par un ACK.
@@ -2487,10 +2532,7 @@ fn temps_attente(n: u64, s: Segment) {
         (issue, *e)
     };
     if let Some(isn) = issue.reprendre {
-        let ecoute = TABLE.verrouiller().as_ref().and_then(|t| {
-            t.ecoute(s.destination, h.destination, s.interface, |c| de_ce_processeur(c, s.processeur))
-        });
-        if ecoute.is_some() {
+        if a_une_ecoute(&s) {
             effacer_temps_attente(n);
             livrer(Segment { isn: Some(isn), ..s });
         } else {
@@ -2677,6 +2719,7 @@ pub fn lier(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
     let port = port.map_err(|e| match e {
         ports_tcp::Refus::Pris => -EADDRINUSE,
         ports_tcp::Refus::Plein => -ENOBUFS,
+        ports_tcp::Refus::Memoire => -ENOMEM,
     })?;
     p.adresses = Adresses { lie: true, adresse: a.adresse, adresse_choisie: a.adresse != [0; 4], port, port_choisi: a.port != 0, ..p.adresses };
     p.hors_table = false;
@@ -2720,8 +2763,12 @@ pub fn ecouter(s: &Arc<Socket>, backlog: i32) -> Result<(), i64> {
         }
     }
     p.hors_table = false;
-    if TABLE.verrouiller().as_mut().is_none_or(|t| t.ecouter(p.numero).is_err()) {
-        return Err(-EADDRINUSE);
+    // Le conflit d'un port partagé (EADDRINUSE), puis le groupe SO_REUSEPORT
+    // (`inet_hash` : ENOMEM).
+    match TABLE.verrouiller().as_mut().map(|t| t.ecouter(p.numero)) {
+        Some(Ok(())) => {}
+        Some(Err(ports_tcp::Refus::Memoire)) => return Err(-ENOMEM),
+        _ => return Err(-EADDRINUSE),
     }
     p.mode = Mode::Ecoute { backlog, filles: VecDeque::new() };
     // `inet_csk_listen_start` efface l'état des ACK : TCP_QUICKACK à 0 ne survit pas à `listen`.
@@ -3613,6 +3660,11 @@ pub fn fermer(s: &Arc<Socket>) {
             }
         }
     }
+    // La socket n'a plus de descripteur : son groupe SO_REUSEPORT est oublié, même
+    // si sa connexion continue (`sk_destruct` ; plus personne ne peut le lire).
+    if let Some(t) = TABLE.verrouiller().as_mut() {
+        t.detruire(p.numero);
+    }
     drop(_contexte);
     g.publier(|p, c| p.rafraichir(c));
 }
@@ -4046,6 +4098,33 @@ pub fn lier_a_une_interface(s: &Socket, poser: impl FnOnce(&mut socket::Inet) ->
 pub fn reutilisation_changee(s: &Socket, inet: &socket::Inet) {
     if let Some(t) = TABLE.verrouiller().as_mut() {
         t.reutiliser(s.numero, inet.options.reuseaddr, inet.options.reuseport);
+    }
+}
+
+/// SO_INCOMING_CPU (`reuseport_update_incoming_cpu`) : comme pour UDP
+/// (udp.rs, `processeur_change`), sous le verrou de la table.
+pub fn processeur_change(s: &Socket, v: i32) {
+    let mut t = TABLE.verrouiller();
+    let ancien = s.processeur.swap(v, Ordering::Relaxed);
+    if let Some(t) = t.as_mut() {
+        t.processeur_change(s.numero, ancien, v);
+    }
+}
+
+/// SO_ATTACH_REUSEPORT_CBPF (ports_tcp, inet::groupes) : rend l'ancien
+/// programme, à rendre hors du verrou. Sous le `Mutex` des appels.
+pub fn attacher_programme(s: &Socket, inet: &socket::Inet, f: Arc<Filtre>) -> Result<Option<Arc<Filtre>>, RefusDeGroupe> {
+    match TABLE.verrouiller().as_mut() {
+        Some(t) => t.attacher_programme(s.numero, f, inet.options.reuseport, s.processeur.load(Ordering::Relaxed)),
+        None => Err(RefusDeGroupe::Invalide),
+    }
+}
+
+/// SO_DETACH_REUSEPORT_BPF (ports_tcp, inet::groupes).
+pub fn detacher_programme(s: &Socket, inet: &socket::Inet) -> Result<Arc<Filtre>, RefusDeGroupe> {
+    match TABLE.verrouiller().as_mut() {
+        Some(t) => t.detacher_programme(s.numero, inet.options.reuseport),
+        None => Err(RefusDeGroupe::Invalide),
     }
 }
 
