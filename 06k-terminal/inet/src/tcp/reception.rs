@@ -397,7 +397,9 @@ impl<P: Charge> Tcb<P> {
     /// `tcp_prune_queue` : faire de la place pour un segment de `longueur` octets (au
     /// numéro `seq`). Faux : il faudra le jeter.
     fn elaguer(&mut self, seq: u32, longueur: usize) -> bool {
-        if self.memoire_reception() == 0 {
+        // (Rien à élaguer dans les files du flux : la file d'erreurs, qui
+        // compte dans sa mémoire, n'est pas à lui.)
+        if self.memoire_du_flux() == 0 {
             return false;
         }
         if !self.peut_recevoir(longueur) {
@@ -1203,6 +1205,31 @@ mod tests {
         assert_eq!(c.rcv_ssthresh, 5000);
         c.poser_fenetre_max(1);
         assert_eq!(c.window_clamp, FENETRE_MAX_MIN);
+    }
+
+    /// La file d'erreurs de la socket compte dans `sk_rmem_alloc` : la place libre
+    /// (`tcp_space`) et ce qui peut entrer (`tcp_can_ingest`) la voient ; mais elle
+    /// n'est pas au flux, rien à y élaguer, ni au compte de `tcp_mem`
+    /// (`sock_queue_err_skb` ne la charge pas).
+    #[test]
+    fn la_file_d_erreurs_compte() {
+        let mut c = cas();
+        c.rcvbuf = 10_000;
+        c.rcvbuf_fixe = true;
+        let base = c.rcv_nxt;
+        let libre = c.espace_libre();
+        let memoire = c.memoire();
+        c.memoire_erreurs = 4000;
+        assert_eq!(c.memoire_reception(), 4000);
+        assert_eq!(c.memoire_du_flux(), 0);
+        assert_eq!(c.memoire(), memoire);
+        assert_eq!(c.espace_libre(), c.fenetre_de(6000));
+        assert!(c.espace_libre() < libre);
+        assert!(c.peut_recevoir(6000));
+        assert!(!c.peut_recevoir(6001));
+        assert!(!c.elaguer(base, 7000));
+        c.memoire_erreurs = 0;
+        assert_eq!(c.espace_libre(), libre);
     }
 
     /// `tcp_prune_queue` et `tcp_try_rmem_schedule`.

@@ -50,7 +50,8 @@ pub const SURCOUT: usize = 576;
 /// `skb_shared_info` comprise, dans le noyau de référence), plus le `sk_buff`
 /// (256) : 960, mesuré (SO_MEMINFO). Pas `SURCOUT` : Linux ne fait jamais de
 /// tête plus petite que ce cache. C'est ce que compte une entrée d'horodatage
-/// sans octets (OPT_TSONLY, horodatage.rs).
+/// sans octets (OPT_TSONLY, horodatage.rs), et la tête de tout `sk_buff` de
+/// TCP, dont les octets sont dans des pages à part.
 pub const TAILLE_VIDE: usize = 960;
 
 /// Ce qu'une socket a encore dans les files d'en bas (la file de la carte, celle des

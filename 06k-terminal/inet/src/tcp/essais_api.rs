@@ -941,6 +941,50 @@ fn acquitter_un_bloc_en_deux_fois() {
     assert_eq!((c.decalage_envoi, c.octets_envoi, c.envoi.len()), (0, 0, 0));
 }
 
+/// La copie par numéro (les horodatages SCM_TSTAMP_ACK du noyau) : ce qui est
+/// encore dans le tampon, par-dessus les blocs ; rien de ce qui est acquitté ou
+/// pas écrit. Le dernier segment en vol : son premier numéro.
+#[test]
+fn copier_par_numero_et_dernier_en_vol() {
+    let mut c = etablie(true);
+    assert_eq!(c.dernier_en_vol(), None);
+    assert_eq!(c.write_seq(), ISS + 1);
+    let n = BLOC + 20;
+    assert_eq!(c.ecrire::<()>(n, |d| {
+        for (i, o) in d.iter_mut().enumerate() {
+            *o = i as u8;
+        }
+        Ok(())
+    }), Ok(n));
+    assert_eq!(c.write_seq(), ISS + 1 + n as u32);
+    assert_eq!(c.fin_des_donnees(), ISS + 1 + n as u32);
+    let mut o = [0u8; 15];
+    assert!(c.copier_depuis_le_numero(ISS + 1 + BLOC as u32 - 5, &mut o));
+    assert_eq!(&o[..5], &[(BLOC - 5) as u8, (BLOC - 4) as u8, (BLOC - 3) as u8, (BLOC - 2) as u8, (BLOC - 1) as u8]);
+    assert_eq!(&o[5..], &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    assert!(c.copier_depuis_le_numero(ISS + 1 + n as u32 - 15, &mut o));
+    assert!(!c.copier_depuis_le_numero(ISS + 1 + n as u32 - 14, &mut o), "un octet pas encore écrit");
+    assert!(!c.copier_depuis_le_numero(ISS, &mut o), "avant le tampon");
+    c.reglages.nodelay = true;
+    c.emettre(HEURE, |_| {});
+    assert!(c.file.len() > 1);
+    let dernier = c.file.back().unwrap();
+    assert_eq!(c.dernier_en_vol(), Some((dernier.seq, dernier.fin_seq)));
+    assert_eq!(c.dernier_en_vol().map(|v| v.0), Some(debut(c.file.len() as u32 - 1)));
+    assert_eq!(c.dernier_en_vol().map(|v| v.1), Some(c.fin_des_donnees()));
+    // Dix octets acquittés : ils ne sont plus là, la suite oui.
+    let ack = Tcp { source: 40000, destination: 80, seq: 1001, ack: ISS + 11, drapeaux: tcp::ACK, fenetre: 65535, ..Tcp::default() };
+    c.recevoir(&ack, octets(0, 0), HEURE + MS);
+    assert_eq!(c.numeros().0, ISS + 11);
+    assert!(!c.copier_depuis_le_numero(ISS + 1, &mut o), "acquitté");
+    assert!(c.copier_depuis_le_numero(ISS + 11, &mut o));
+    assert_eq!(o[0], 10);
+    // Le FIN voulu compte dans `write_seq`, pas dans la fin des données.
+    c.fermer_envoi();
+    assert_eq!(c.write_seq(), ISS + 2 + n as u32);
+    assert_eq!(c.fin_des_donnees(), ISS + 1 + n as u32);
+}
+
 /// `close` en SYN_SENT : rien n'est parti que le SYN : fermée, sans FIN.
 #[test]
 fn fermer_avant_la_reponse() {

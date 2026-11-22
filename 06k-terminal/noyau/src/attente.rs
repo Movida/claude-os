@@ -1723,9 +1723,10 @@ pub trait Possede {
     /// Recopie le premier étage, sous le verrou court ; rend les
     /// événements à réveiller dans la file de la possession (0 : rien).
     fn publier(&self, court: &mut Self::Court) -> u32;
-    /// Le sens inverse : ce que `poll`, qui ne possède pas, a laissé au
-    /// premier étage pour la donnée (SOCK_NOSPACE), pris juste avant de traiter
-    /// ce qui arrive.
+    /// Le sens inverse : ce que d'autres, qui ne possèdent pas, ont laissé
+    /// pour la donnée (`poll` au premier étage : SOCK_NOSPACE ; la mémoire
+    /// de la file d'erreurs de TCP), pris par quiconque prend la donnée :
+    /// avant de traiter ce qui arrive ou un minuteur, et par la possession.
     fn descendre(&mut self, court: &mut Self::Court);
 }
 
@@ -1803,6 +1804,9 @@ impl<T: Possede> Possession<T> {
                 let mut c = self.court.verrouiller();
                 if !c.possede {
                     c.possede = true;
+                    // SAFETY: nous possédons désormais, sous le verrou court :
+                    // nul autre ne touche la donnée.
+                    unsafe { &mut *self.donnee.get() }.descendre(&mut c.premier);
                     break;
                 }
                 self.attente.inscrire_exclusive();
@@ -1892,6 +1896,7 @@ impl<T: Possede> Possession<T> {
         }
         // SAFETY: comme `du_reseau`.
         let d = unsafe { &mut *self.donnee.get() };
+        d.descendre(&mut c.premier);
         d.minuteur();
         let m = d.publier(&mut c.premier);
         drop(c);

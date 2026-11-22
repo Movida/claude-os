@@ -1046,6 +1046,12 @@ pub struct Tcb<P: Charge> {
     octets_reception: usize,
     taille_vraie_reception: usize,
     hors_ordre: HorsOrdre<P>,
+    /// La mémoire de la file d'erreurs de la socket (ses horodatages
+    /// d'émission, SO_TIMESTAMPING), que Linux compte dans le même
+    /// `sk_rmem_alloc` que la réception : ses fenêtres et ses limites la
+    /// voient. La file est au noyau, pas au moteur : il en pose ici la
+    /// mémoire chaque fois qu'il prend la connexion (`Possede::descendre`).
+    pub memoire_erreurs: usize,
     /// Le numéro du FIN de l'autre, arrivé après un trou.
     fin_hors_ordre: Option<u32>,
     /// Le numéro du prochain octet que lira le programme (`copied_seq`).
@@ -1307,6 +1313,7 @@ impl<P: Charge> Tcb<P> {
             octets_reception: 0,
             taille_vraie_reception: 0,
             hors_ordre: HorsOrdre::new(),
+            memoire_erreurs: 0,
             fin_hors_ordre: None,
             rcv_lu: 0,
             urgents_annonces: 0,
@@ -1698,10 +1705,16 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// La mémoire que garde la réception, en taille vraie : la file de
-    /// lecture et la file hors d'ordre (bornées ensemble à SO_RCVBUF par
-    /// `tcp_try_rmem_schedule`, tcp/reception.rs).
+    /// La mémoire que garde la réception, en taille vraie (`sk_rmem_alloc`) :
+    /// la file de lecture et la file hors d'ordre (bornées ensemble à
+    /// SO_RCVBUF par `tcp_try_rmem_schedule`, tcp/reception.rs), et la file
+    /// d'erreurs de la socket (`memoire_erreurs`).
     pub fn memoire_reception(&self) -> usize {
+        self.memoire_du_flux() + self.memoire_erreurs
+    }
+
+    /// La part du flux seul : la file de lecture et la file hors d'ordre.
+    pub fn memoire_du_flux(&self) -> usize {
         self.taille_vraie_reception + self.hors_ordre.taille_vraie
     }
 
@@ -1995,20 +2008,30 @@ impl<P: Charge> Tcb<P> {
         }
     }
 
-    /// La mémoire que garde la connexion, en octets : la réception (en
-    /// taille vraie) et ce qui attend d'être acquitté (le compte de
-    /// `tcp_mem`).
+    /// La mémoire que garde la connexion, en octets : la réception du flux
+    /// (en taille vraie) et ce qui attend d'être acquitté : le compte de
+    /// `tcp_mem`, sans la file d'erreurs de la socket, que Linux n'y charge
+    /// pas (`sock_queue_err_skb`). (La juste part d'une socket sous pression,
+    /// elle, la compte : `sk_rmem_alloc`, le noyau l'ajoute.)
     pub fn memoire(&self) -> usize {
-        self.memoire_reception() + self.octets_envoi
+        self.memoire_du_flux() + self.octets_envoi
     }
 
     /// Le numéro qui suit tout ce que le programme a écrit, FIN compris
     /// (`write_seq`) ; les files jetées, celui d'avant.
-    fn write_seq(&self) -> u32 {
+    pub fn write_seq(&self) -> u32 {
         if let Some(w) = self.purgee {
             return w;
         }
         self.seq_envoi.wrapping_add(self.octets_envoi as u32).wrapping_add(u32::from(self.fin_voulue))
+    }
+
+    /// Le numéro qui suit le dernier octet de données écrit (`write_seq` sans le
+    /// FIN) : le dernier octet d'un envoi, que demande un horodatage (le
+    /// `tskey` de `tcp_tx_timestamp`, `seq + len - 1` de son `sk_buff`, que le
+    /// FIN ne compte pas).
+    pub fn fin_des_donnees(&self) -> u32 {
+        self.seq_envoi.wrapping_add(self.octets_envoi as u32)
     }
 
     /// Rien en vol, rien qui attende de partir (`tcp_rtx_and_write_queues_empty`) ; les
@@ -2098,6 +2121,29 @@ impl<P: Charge> Tcb<P> {
                 break;
             }
         }
+    }
+
+    /// Copie dans `o` les octets du tampon d'émission à partir de celui de
+    /// numéro `seq` (les horodatages SCM_TSTAMP_ACK du noyau, qui copient un
+    /// segment juste avant que son ACK ne le retire) ; faux s'ils n'y sont
+    /// pas tous : déjà acquittés, ou jamais écrits.
+    pub fn copier_depuis_le_numero(&self, seq: u32, o: &mut [u8]) -> bool {
+        let debut = seq.wrapping_sub(self.seq_envoi) as usize;
+        if debut > self.octets_envoi || o.len() > self.octets_envoi - debut {
+            return false;
+        }
+        self.copier_envoi(debut, o);
+        true
+    }
+
+    /// Le dernier segment en vol, s'il y en a un (la queue de la file de
+    /// retransmission, le `skb_rb_last(&sk->tcp_rtx_queue)` de Linux) : où le
+    /// noyau pose la demande d'horodatage d'un envoi dont tout est déjà parti
+    /// (`tcp_tx_timestamp`). Son premier numéro, et la fin de ses données (son
+    /// FIN n'est pas un octet que l'entrée ACK copiera).
+    pub fn dernier_en_vol(&self) -> Option<(u32, u32)> {
+        let donnees = self.fin_des_donnees();
+        self.file.back().map(|e| (e.seq, if apres(e.fin_seq, donnees) { donnees } else { e.fin_seq }))
     }
 
     /// Retire `n` octets acquittés du début du tampon d'émission.

@@ -784,10 +784,14 @@ fn envoyer_avec(o: &FichierTenu, nom: Option<&[u8]>, longueur: usize, remplir: i
         // TCP : l'adresse donnée est ignorée (mesuré) ; EPIPE envoie aussi
         // SIGPIPE, sauf MSG_NOSIGNAL (`sk_stream_error`).
         Protocole::Tcp => {
-            if let Err(e) = controle {
-                return e;
-            }
-            let r = tcp::envoyer(o.socket(), longueur, drapeaux, remplir);
+            let c = match controle {
+                Ok(c) => c,
+                Err(e) => return e,
+            };
+            // Les drapeaux d'émission de SO_TIMESTAMPING : ceux du message de
+            // contrôle, sinon ceux de la socket (`sockcm_init`).
+            let tx = c.horodatage.unwrap_or(o.socket().tsflags.load(Ordering::Relaxed)) & socket::SOF_TX_RECORD_MASK;
+            let r = tcp::envoyer(o.socket(), longueur, drapeaux, tx, remplir);
             if r == Err(-EPIPE) && drapeaux & MSG_NOSIGNAL == 0 {
                 crate::signaux::au_fil_courant(13);
             }
@@ -1824,10 +1828,11 @@ pub fn setsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
 /// EINVAL sinon, aucune des nôtres n'en a). Puis les drapeaux, la forme des
 /// messages (SOCK_TSTAMP_NEW, partagé avec SO_TIMESTAMP : la dernière posée
 /// décide pour les deux), et la clé des horodatages (RX_SOFTWARE).
-/// OPT_ID qui se pose remet le compteur des clés à zéro (`sk_tskey`), avant
-/// les deux derniers refus, comme Linux (sans effet visible : sans OPT_ID,
-/// le compteur ne sert pas, et il repartira de zéro quand OPT_ID se posera) ;
-/// reposé, il le garde.
+/// OPT_ID qui se pose remet le compteur des clés à zéro (`sk_tskey`), pour TCP
+/// à SND.UNA, ou au numéro qui suit ce qui est écrit avec OPT_ID_TCP
+/// (`tcp::cle_opt_id`), avant les deux derniers refus, comme Linux (sans
+/// effet visible : sans OPT_ID, le compteur ne sert pas, et il repartira
+/// quand OPT_ID se posera) ; reposé, il le garde.
 /// Les drapeaux du matériel (TX_HARDWARE, RX_HARDWARE, RAW_HARDWARE,
 /// SYS_HARDWARE, OPT_PKTINFO, OPT_TX_SWHW) et TX_COMPLETION se gardent sans
 /// effet visible : aucune de nos cartes ne donne d'heure, et seul Bluetooth
@@ -1838,10 +1843,8 @@ fn horodatages(s: &Socket, option: i32, d: u32) -> Result<(), i64> {
         return Err(-EINVAL);
     }
     if d & socket::SOF_OPT_ID != 0 && avant & socket::SOF_OPT_ID == 0 {
-        if s.protocole == Protocole::Tcp && tcp::fermee_ou_ecoute(s) {
-            return Err(-EINVAL);
-        }
-        s.cle_emission.store(0, Ordering::Relaxed);
+        let cle = if s.protocole == Protocole::Tcp { tcp::cle_opt_id(s, d & SOF_OPT_ID_TCP != 0).ok_or(-EINVAL)? } else { 0 };
+        s.cle_emission.store(cle, Ordering::Relaxed);
     }
     if d & SOF_OPT_STATS != 0 && d & socket::SOF_OPT_TSONLY == 0 {
         return Err(-EINVAL);
@@ -3138,7 +3141,8 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
 }
 
 /// SO_MEMINFO (`sk_get_meminfo`), dans l'ordre de `SK_MEMINFO_*` :
-///   - RMEM_ALLOC : ce que garde la réception, en taille vraie ;
+///   - RMEM_ALLOC : ce que garde la réception, en taille vraie, la file
+///     d'erreurs comprise ;
 ///   - RCVBUF, SNDBUF : comme SO_RCVBUF et SO_SNDBUF ;
 ///   - WMEM_ALLOC : ce qui est envoyé et pas encore rendu (par la carte ; pour
 ///     AF_UNIX, par la lecture du pair) ;
@@ -3155,8 +3159,9 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
 fn memoire_de_la_socket(s: &Socket) -> [usize; 9] {
     let (reception, envoyes, file_envoi, backlog) = match s.protocole {
         Protocole::Tcp => {
+            // La réception du flux, et la file d'erreurs : un seul `sk_rmem_alloc`.
             let [r, e, f, b] = tcp::memoire(s);
-            (r, e, f, b)
+            (r + s.reception.verrouiller().octets, e, f, b)
         }
         Protocole::Unix => (0, unix::envoyes(s), 0, 0),
         _ => (s.reception.verrouiller().octets, s.envois.as_ref().map_or(0, |r| r.octets()), 0, 0),

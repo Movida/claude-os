@@ -51,13 +51,14 @@
 //! ce qui part par `lo` y est déposé, livré à la fin.
 
 use super::contexte;
+use super::horodatage;
 use super::ipv4;
 use super::paquet::{Paquet, Retenue};
 use super::snmp::MIB;
 use super::socket::{self, Protocole, Socket};
 use crate::attente::{FileAttente, Possede, Possession, Sommeil};
 use crate::faillible::{self, FileFaillible, VecFaillible};
-use crate::partage::{Arc, ArcVide};
+use crate::partage::{Arc, ArcVide, Weak};
 use crate::sondage::{POLLERR, POLLHUP, POLLIN, POLLOUT, POLLPRI, POLLRDNORM, POLLWRNORM};
 use crate::tache::Reveil;
 use crate::verrou::Verrou;
@@ -351,7 +352,7 @@ impl Fille {
     /// Émet ce qu'elle a à envoyer (`emettre_tcb`), avec `ecoute` (voir `ip`).
     fn emettre(&mut self, ecoute: Ip, recu: Option<&ipv4::EnteteRecu>) {
         let ip = self.ip(ecoute);
-        emettre_tcb(&mut self.tcb, self.locale, self.distante, &mut self.identifiant, ip, recu, None);
+        emettre_tcb(&mut self.tcb, self.locale, self.distante, &mut self.identifiant, ip, recu, None, None);
     }
 
     /// Prête pour `accept` (`inet_csk_listen_poll` : la file d'acceptation
@@ -416,6 +417,52 @@ pub enum Mode {
     Connexion(Box<Tcb<Paquet>>),
 }
 
+/// Ce que la file d'erreurs d'une socket TCP (ses horodatages d'émission,
+/// horodatage.rs) et sa connexion savent l'une de l'autre : Linux les compte
+/// dans le même `sk_rmem_alloc`, que borne SO_RCVBUF quand une entrée arrive
+/// (`sock_queue_err_skb`) et que voient les fenêtres de la connexion
+/// (`tcp_space`, `tcp_can_ingest`...). Partagé par la socket et sa `Partie`,
+/// en atomiques : une entrée entre dans la file à la sortie du contexte
+/// réseau, qui peut tomber pendant que la réception tient le verrou court de
+/// cette socket même (le vidage de `lo`, `Possede::traiter`) ; elle ne peut
+/// donc ni le prendre, ni posséder. Écarté : le premier étage (`Premier`),
+/// sous ce verrou court.
+pub struct CompteReception {
+    /// Ce que garde la connexion (sa file de lecture et sa file hors
+    /// d'ordre, `Tcb::memoire_du_flux`) et son SO_RCVBUF (qui grandit), tels
+    /// qu'à la fin du dernier événement (`Partie::rafraichir`) ; SO_RCVBUF à
+    /// 0 : pas de connexion, celui de la socket.
+    flux: AtomicUsize,
+    rcvbuf: AtomicUsize,
+    /// La mémoire de la file d'erreurs, posée par la socket à chaque
+    /// changement, sous le verrou de sa réception ; la connexion la prend
+    /// quand on la prend (`Possede::descendre`).
+    erreurs: AtomicUsize,
+}
+
+impl CompteReception {
+    fn new() -> CompteReception {
+        CompteReception { flux: AtomicUsize::new(0), rcvbuf: AtomicUsize::new(0), erreurs: AtomicUsize::new(0) }
+    }
+
+    /// Une entrée de `taille` tient-elle dans la file d'erreurs, qui garde
+    /// déjà `erreurs` (`sock_queue_err_skb` : refusée si `sk_rmem_alloc` et
+    /// elle atteignent SO_RCVBUF) ? `rcvbuf` : celui de la socket, pour une
+    /// socket sans connexion.
+    pub fn admet(&self, erreurs: usize, taille: usize, rcvbuf: usize) -> bool {
+        let rcvbuf = match self.rcvbuf.load(Ordering::Relaxed) {
+            0 => rcvbuf,
+            r => r,
+        };
+        self.flux.load(Ordering::Relaxed) + erreurs + taille < rcvbuf
+    }
+
+    /// La file d'erreurs garde maintenant `octets`.
+    pub fn poser_erreurs(&self, octets: usize) {
+        self.erreurs.store(octets, Ordering::Relaxed);
+    }
+}
+
 /// La partie possédée.
 pub struct Partie {
     pub numero: u64,
@@ -443,6 +490,8 @@ pub struct Partie {
     erreur_seule: i32,
     /// Ce que la carte a encore d'elle (`sk_wmem_alloc`, TSQ).
     retenue: Arc<Retenue>,
+    /// Ce qu'elle partage avec sa file d'erreurs (`sk_rmem_alloc`).
+    compte: Arc<CompteReception>,
     /// La route de la connexion a été oubliée (`sk_dst_reset`, par SO_BINDTODEVICE,
     /// SO_DONTROUTE ou un IP_TOS qui change) et pas encore retrouvée : IP_MTU dit
     /// ENOTCONN jusqu'au prochain segment qui en trouve une (`ip_queue_xmit` la
@@ -459,6 +508,47 @@ pub struct Partie {
     /// lecture qui s'arrête au milieu peut chez lui dire une heure plus
     /// ancienne ; rien de ce qu'un programme demande ne le fixe.
     horodatage: u64,
+    /// Les demandes d'horodatage d'émission des envois (SO_TIMESTAMPING,
+    /// horodatage.rs), dans l'ordre de leur dernier octet, jusqu'à ce que
+    /// l'ACK passe celui-ci (`DemandeTx`).
+    demandes: VecDeque<DemandeTx>,
+}
+
+/// La demande d'horodatage d'un envoi de TCP (`tcp_tx_timestamp`), que la
+/// connexion garde jusqu'à l'ACK de son dernier octet : les drapeaux TX_*
+/// de l'envoi, le numéro de ce dernier octet (le `tskey` de Linux, la clé
+/// d'OPT_ID une fois rendue relative), le premier numéro du segment qui l'a
+/// porté en dernier (None : pas encore parti) et sa socket (un lien faible :
+/// horodatage.rs, `Demande`).
+///
+/// LE MODÈLE. Linux pose la demande sur le `sk_buff` qui finit l'envoi (la
+/// queue de la file d'émission, ou à défaut le dernier en vol) ; un envoi
+/// suivant qui s'ajoute au même `sk_buff` la remplace (son octet, et les
+/// drapeaux en OU), un découpage la passe au morceau qui porte l'octet
+/// (`tcp_fragment_tstamp`), une fusion au renvoi la fond dans le suivant
+/// (`tcp_skb_collapse_tstamp`). Nos segments ne naissent qu'à l'émission,
+/// découpés dans le flux : la demande s'y attache par son octet. Les mêmes
+/// règles en découlent : une demande qui arrive alors que la précédente
+/// n'est pas encore partie la remplace (le même `sk_buff` en attente) ; dont
+/// tout est déjà parti, elle remplace celle du dernier segment en vol ; un
+/// segment qui porte plusieurs demandes n'en garde que la dernière (`DemandeTx`
+/// fondues : `demande_du_segment`). L'écart : Linux n'ajoute au même
+/// `sk_buff` que jusqu'à sa taille visée (64 Kio sur lo, `size_goal`), et
+/// découpe le reste au pilote (GSO) ; deux demandes à plus de 64 Kio l'une de
+/// l'autre, encore en attente toutes les deux, restent chez lui deux, et
+/// fondues chez nous (rien ne le promet : la documentation de Linux,
+/// timestamping.rst, prévient qu'une demande peut en remplacer une autre).
+/// Une demande ne coûte ainsi qu'une place par segment en vol, plus une. Elle
+/// garde le segment qui l'a portée, son début et sa fin (`debut`) : son entrée
+/// ACK copie tout ce segment, comme Linux tout le `sk_buff` (`__skb_tstamp_tx`
+/// le clone), avec ce qu'un envoi sans demande d'émission y a ajouté après
+/// elle (TCP_CORK, MSG_MORE, Nagle : `tcp_tx_timestamp` ne touche alors pas à
+/// la demande, le `sk_buff` grandit).
+struct DemandeTx {
+    dernier: u32,
+    tx: u32,
+    debut: Option<(u32, u32)>,
+    socket: Weak<Socket>,
 }
 
 /// Les options de SOL_TCP.
@@ -655,6 +745,12 @@ impl Partie {
     /// Recopie le premier étage, et rend les événements qui ont changé
     /// (pour réveiller).
     fn rafraichir(&self, court: &mut Premier) -> u32 {
+        let (flux, rcvbuf) = match &self.mode {
+            Mode::Connexion(t) => (t.memoire_du_flux(), t.rcvbuf),
+            _ => (0, 0),
+        };
+        self.compte.flux.store(flux, Ordering::Relaxed);
+        self.compte.rcvbuf.store(rcvbuf, Ordering::Relaxed);
         let mut neuf = self.premier(court.arret, court.sndbuf, court.rcvbuf);
         neuf.sans_place = court.sans_place;
         let mut m = 0;
@@ -721,7 +817,8 @@ impl Partie {
     /// auquel peut répondre la connexion (un RST).
     fn emettre_apres(&mut self, recu: Option<&ipv4::EnteteRecu>) {
         let Mode::Connexion(t) = &mut self.mode else { return };
-        if emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, Ip::de(&self.options), recu, Some(&self.retenue)) {
+        let ip = Ip::de(&self.options);
+        if emettre_tcb(t, self.adresses.source, self.adresses.distante, &mut self.identifiant, ip, recu, Some(&self.retenue), Some(&mut self.demandes)) {
             self.route_oubliee = false;
         }
     }
@@ -730,23 +827,64 @@ impl Partie {
     /// puis sa mémoire comptée dans celle de TCP, et le niveau de celle-ci
     /// dit à la connexion (et aux filles d'une écoute) pour la suite.
     fn apres(&mut self) {
+        // Une connexion finie a jeté ses files (`tcp_write_queue_purge`, de
+        // `tcp_done`) : ses demandes d'horodatage avec, sans entrée.
+        if !self.demandes.is_empty() && !matches!(&self.mode, Mode::Connexion(t) if t.etat() != Etat::Fermee) {
+            self.demandes = VecDeque::new();
+        }
         self.apres_l_etat();
         self.compter();
     }
 
+    /// Un envoi de la socket `s` vient d'écrire (`tcp_tx_timestamp`, à la fin
+    /// de `tcp_sendmsg_locked`) : s'il demande un horodatage d'émission (`tx`,
+    /// ses drapeaux TX_* : ceux de la socket, ou de son message de contrôle),
+    /// la demande pour son dernier octet de données (voir `DemandeTx`). Rien si
+    /// tout est déjà acquitté, ou la connexion finie, ses files jetées (Linux
+    /// n'a plus de `sk_buff` où la poser).
+    fn demander_horodatage(&mut self, s: &Arc<Socket>, tx: u32) {
+        let Mode::Connexion(t) = &self.mode else { return };
+        let tx = tx & socket::SOF_TX_RECORD_MASK;
+        let (una, nxt, _) = t.numeros();
+        let ecrit = t.fin_des_donnees();
+        if tx == 0 || !itcp::apres(ecrit, una) || t.etat() == Etat::Fermee {
+            return;
+        }
+        // Le `sk_buff` qu'elle prend : celui qui attend de partir (il commence
+        // à SND.NXT), sinon le dernier en vol.
+        let (debut, borne) = if itcp::apres(ecrit, nxt) {
+            (None, nxt)
+        } else {
+            let v = t.dernier_en_vol();
+            (v, v.map_or(una, |(seq, _)| seq))
+        };
+        let dernier = ecrit.wrapping_sub(1);
+        if let Some(d) = self.demandes.back_mut()
+            && !itcp::avant(d.dernier, borne)
+        {
+            // Le même `sk_buff` : elle remplace la précédente.
+            *d = DemandeTx { dernier, tx: d.tx | tx, debut, socket: Arc::downgrade(s) };
+            return;
+        }
+        // Plus de mémoire : la demande est perdue (aucune entrée ne viendra).
+        let _ = self.demandes.ajouter_derriere(DemandeTx { dernier, tx, debut, socket: Arc::downgrade(s) });
+    }
+
     /// La mémoire de la socket, comptée dans `MEMOIRE` (la différence avec
-    /// ce qu'elle y avait déjà).
+    /// ce qu'elle y avait déjà) : sans sa file d'erreurs (`Tcb::memoire`) ;
+    /// sa juste part, elle, la compte (`__sk_mem_raise_allocated` lit
+    /// `sk_rmem_alloc`).
     fn compter(&mut self) {
         let niveau = niveau_memoire();
         let m = match &mut self.mode {
             Mode::Connexion(t) => {
-                t.memoire = niveau_pour(niveau, t.memoire());
+                t.memoire = niveau_pour(niveau, t.memoire() + t.memoire_erreurs);
                 t.memoire()
             }
             Mode::Ecoute { filles, .. } => filles
                 .iter_mut()
                 .map(|f| {
-                    f.tcb.memoire = niveau_pour(niveau, f.tcb.memoire());
+                    f.tcb.memoire = niveau_pour(niveau, f.tcb.memoire() + f.tcb.memoire_erreurs);
                     f.tcb.memoire()
                 })
                 .sum(),
@@ -947,6 +1085,7 @@ impl Partie {
         }
         self.desarmer();
         self.mode = Mode::Neuve;
+        self.demandes = VecDeque::new();
         self.hors_table = false;
         self.etat_socket = EtatSocket::NonConnectee;
         // L'adresse de `bind` reste (SOCK_BINDADDR_LOCK), avec ou sans son port. Un port qui
@@ -1101,10 +1240,17 @@ impl Ip {
 /// segment qu'elle vient de recevoir, s'il y en a un, dont ses réponses
 /// prennent le leur. Leur route est cherchée une fois, avant (la même pour
 /// tous : `__sk_dst_check`, puis `ip_route_output_ports`) ; sa MTU vérifie
-/// le MSS, et le Tcb sait ce qui ne partira pas (`emettre_route`). Rend vrai
-/// si un de ses segments (pas une réponse) a trouvé sa route.
+/// le MSS, et le Tcb sait ce qui ne partira pas (`emettre_route`). Chaque
+/// segment qui porte le dernier octet d'une des `demandes` d'horodatage (une
+/// connexion de socket ; pas une fille) la porte aussi (`demande_du_segment`),
+/// à chaque envoi : Linux la garde sur le `skb_shared_info` qu'il partage
+/// avec chaque copie qu'il émet (`skb_clone`). Sauf quand la copie d'avant
+/// est encore tenue (dans une file de la carte : `pskb_copy`, qui ne
+/// recopie pas la demande), un hasard de sa mémoire, que rien ne fixe ici :
+/// chaque renvoi la porte. Rend vrai si un de ses segments (pas une réponse)
+/// a trouvé sa route.
 fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip, recu: Option<&ipv4::EnteteRecu>,
-               retenue: Option<&Arc<Retenue>>) -> bool {
+               retenue: Option<&Arc<Retenue>>, mut demandes: Option<&mut VecDeque<DemandeTx>>) -> bool {
     if let Some(r) = retenue {
         t.poser_en_file(r.octets(), r.rendu());
     }
@@ -1151,7 +1297,10 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
         let suivi = retenue.filter(|_| s.numero != 0).map(|r| (r, s.numero));
         let reponse = matches!(s.compte, Compte::Reponse { .. });
         let sa_route = if reponse { route_de_segment(&ip, source, distante, true) } else { route };
-        let routee = envoyer_segment(&s.entete, s.compte, source, distante, identifiant, ip, sa_route, s.longueur, suivi, |o| t.copier_envoi(s.debut, o));
+        let demande = demandes.as_deref_mut().and_then(|d| demande_du_segment(d, s.entete.seq, s.longueur));
+        let routee = envoyer_segment(&s.entete, s.compte, source, distante, identifiant, ip, sa_route, s.longueur, suivi, demande, |o| {
+            t.copier_envoi(s.debut, o)
+        });
         route_trouvee |= routee && !reponse;
     }
     if t.prendre_etrangle()
@@ -1160,6 +1309,95 @@ fn emettre_tcb(t: &mut Tcb<Paquet>, source: [u8; 4], distante: [u8; 4], identifi
         r.etrangler();
     }
     route_trouvee
+}
+
+/// La demande d'horodatage que porte le segment de données [seq, seq +
+/// longueur) : celle de son dernier octet parmi `demandes`, s'il y en a. S'il
+/// en porte plusieurs, elles n'en font plus qu'une, la dernière, aux
+/// drapeaux de toutes (le `sk_buff` qu'elles partageraient chez Linux :
+/// `DemandeTx`) ; elle note où commence et finit ce segment (ce que copiera
+/// son ACK). À part : `emettre_tcb` est sur le chemin le plus profond du
+/// réseau (lo reçoit sur la pile de qui émet), et son cadre n'a pas à garder
+/// la place de ce travail.
+#[inline(never)]
+fn demande_du_segment(demandes: &mut VecDeque<DemandeTx>, seq: u32, longueur: usize) -> Option<Box<horodatage::Demande>> {
+    let dans = |d: &DemandeTx| (d.dernier.wrapping_sub(seq) as usize) < longueur;
+    let premiere = demandes.iter().position(dans)?;
+    let derniere = premiere + demandes.iter().skip(premiere + 1).take_while(|d| dans(d)).count();
+    let tx = demandes.range(premiere..=derniere).fold(0, |a, d| a | d.tx);
+    demandes.drain(premiere..derniere);
+    let d = &mut demandes[premiere];
+    d.tx = tx;
+    d.debut = Some((seq, seq.wrapping_add(longueur as u32)));
+    horodatage::demande(&d.socket, d.tx, d.dernier)
+}
+
+/// Les copies que voudront les entrées ACK (horodatage.rs, `acquitte`) des
+/// demandes TX_ACK de `demandes` que le segment reçu `h` va passer, si la
+/// connexion `t` le prend (un ACK au-delà de SND.UNA, pas au-delà de
+/// SND.NXT) : les octets de leur segment (de son début, ou de SND.UNA s'il
+/// est déjà acquitté en partie, comme le `sk_buff` que rogne
+/// `tcp_trim_head`, jusqu'à sa fin : `DemandeTx`), que l'ACK va retirer du
+/// tampon. Rien pour une socket qui a OPT_TSONLY (l'entrée sera vide).
+/// `acquitter_les_demandes` dira, une fois l'ACK vu, lesquelles servent.
+/// Les copier avant plutôt que de les garder depuis l'émission : rien n'est
+/// tenu pour une demande qui attend son ACK. Plus de mémoire : pas de copie
+/// (et pas d'entrée, le `skb_clone` qui échoue).
+fn copies_pour_l_ack(demandes: &VecDeque<DemandeTx>, t: &Tcb<Paquet>, h: &Tcp) -> Vec<(u32, Paquet)> {
+    let mut copies = Vec::new();
+    let (una, nxt, _) = t.numeros();
+    if demandes.is_empty() || h.drapeaux & ftcp::ACK == 0 || !itcp::apres(h.ack, una) || itcp::apres(h.ack, nxt) {
+        return copies;
+    }
+    for d in demandes.iter().take_while(|d| itcp::avant(d.dernier, h.ack)) {
+        let Some(s) = d.socket.upgrade() else { continue };
+        if d.tx & socket::SOF_TX_ACK == 0 || s.tsflags.load(Ordering::Relaxed) & socket::SOF_OPT_TSONLY != 0 {
+            continue;
+        }
+        let (debut, fin) = match d.debut {
+            Some((debut, fin)) => (if itcp::avant(debut, una) { una } else { debut }, fin),
+            None => (una, d.dernier.wrapping_add(1)),
+        };
+        let n = fin.wrapping_sub(debut) as usize;
+        let Some(mut p) = Paquet::vide(n) else { continue };
+        let Some(o) = p.ajouter_fin(n) else { continue };
+        if t.copier_depuis_le_numero(debut, o) {
+            let _ = copies.ajouter((d.dernier, p));
+        }
+    }
+    copies
+}
+
+/// L'ACK a fait passer SND.UNA de `avant` à `una` : chaque demande dont le
+/// dernier octet est passé s'en va (le `sk_buff` libéré), et fait son entrée
+/// ACK si elle a TX_ACK (`tcp_ack_tstamp`), avec sa copie de `copies`.
+fn acquitter_les_demandes(demandes: &mut VecDeque<DemandeTx>, avant: u32, una: u32, mut copies: Vec<(u32, Paquet)>) {
+    while let Some(d) = demandes.front()
+        && itcp::avant(d.dernier, una)
+    {
+        let Some(d) = demandes.pop_front() else { break };
+        if d.tx & socket::SOF_TX_ACK != 0
+            && !itcp::avant(d.dernier, avant)
+            && let Some(s) = d.socket.upgrade()
+        {
+            let octets = copies.iter().position(|c| c.0 == d.dernier).map(|i| copies.swap_remove(i).1);
+            horodatage::acquitte(s, octets, d.dernier);
+        }
+    }
+}
+
+/// La connexion `t`, qui a des `demandes` d'horodatage, reçoit le segment
+/// d'en-tête `h` et de charge `charge` : ce que voudront les entrées ACK
+/// (`copies_pour_l_ack`), le segment, puis les demandes qu'il a passées
+/// (`acquitter_les_demandes`). À part : `traiter_arrivee` est sur le chemin
+/// le plus profond du réseau (lo reçoit sur la pile de qui émet), et son
+/// cadre n'a pas à garder la place de ce travail, que ne fait pas une
+/// connexion sans demande.
+#[inline(never)]
+fn recevoir_avec_demandes(demandes: &mut VecDeque<DemandeTx>, t: &mut Tcb<Paquet>, h: &Tcp, charge: Paquet) {
+    let (una, copies) = (t.numeros().0, copies_pour_l_ack(demandes, t, h));
+    t.recevoir(h, charge, maintenant());
+    acquitter_les_demandes(demandes, una, t.numeros().0, copies);
 }
 
 /// La route d'un segment de `source` à `distante`, avec ce que dit `ip` : par
@@ -1181,10 +1419,11 @@ fn route_de_segment(ip: &Ip, source: [u8; 4], distante: [u8; 4], reponse: bool) 
 /// vraie destination (`tcp_v4_send_check` : `inet_daddr`), et l'en-tête IPv4
 /// va à la première étape d'une route source. Un segment qui ne part pas
 /// (plus de mémoire, pas de route) est perdu, comme sur un câble. Il compte
-/// dans /proc/net/snmp ce que dit `compte`. Rend vrai s'il a une route.
+/// dans /proc/net/snmp ce que dit `compte`. Il porte la `demande`
+/// d'horodatage, s'il en a une. Rend vrai s'il a une route.
 fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], identifiant: &mut u16, ip: Ip,
                    route: Option<(inet::routes::Chemin, [u8; 4])>, longueur: usize, suivi: Option<(&Arc<Retenue>, u64)>,
-                   remplir: impl FnOnce(&mut [u8])) -> bool {
+                   demande: Option<Box<horodatage::Demande>>, remplir: impl FnOnce(&mut [u8])) -> bool {
     let n = ftcp::longueur_entete(&h.options);
     let paquet = Paquet::vide(n + longueur);
     let routee = route.is_some();
@@ -1202,6 +1441,9 @@ fn envoyer_segment(h: &Tcp, compte: Compte, source: [u8; 4], distante: [u8; 4], 
     ftcp::ecrire(o, h, source, finale, !ipv4::par_lo(&chemin));
     if let Some((r, numero)) = suivi {
         p.attacher(r, numero);
+    }
+    if let Some(d) = demande {
+        p.poser_demande(d);
     }
     *identifiant = identifiant.wrapping_add(1);
     let envoi = ipv4::Envoi {
@@ -1230,7 +1472,7 @@ fn repondre_rst(h: &Tcp, longueur_charge: usize, locale: [u8; 4], distante: [u8;
         };
         let mut id = crate::aleatoire::u32() as u16;
         let route = route_de_segment(&ip, locale, distante, true);
-        envoyer_segment(&r, Compte::Reponse { rst: true }, locale, distante, &mut id, ip, route, 0, None, |_| {});
+        envoyer_segment(&r, Compte::Reponse { rst: true }, locale, distante, &mut id, ip, route, 0, None, None, |_| {});
     }
 }
 
@@ -1250,8 +1492,11 @@ impl Possede for Partie {
     }
 
     fn descendre(&mut self, court: &mut Premier) {
-        if core::mem::take(&mut court.sans_place) && let Mode::Connexion(t) = &mut self.mode {
-            t.marquer_sans_place();
+        if let Mode::Connexion(t) = &mut self.mode {
+            if core::mem::take(&mut court.sans_place) {
+                t.marquer_sans_place();
+            }
+            t.memoire_erreurs = self.compte.erreurs.load(Ordering::Relaxed);
         }
     }
 
@@ -1332,7 +1577,11 @@ impl Partie {
         match &mut self.mode {
             Mode::Connexion(t) => {
                 let (avant, heure) = (t.lisibles_dans_le_flux(), s.charge.contexte().horodatage);
-                t.recevoir(&s.entete, s.charge, maintenant());
+                if self.demandes.is_empty() {
+                    t.recevoir(&s.entete, s.charge, maintenant());
+                } else {
+                    recevoir_avec_demandes(&mut self.demandes, t, &s.entete, s.charge);
+                }
                 if t.lisibles_dans_le_flux() > avant {
                     self.horodatage = heure;
                 }
@@ -1920,7 +2169,7 @@ fn envoyer_ack_tw(e: &TempsAttente, recu: &ipv4::EnteteRecu, hors_fenetre: bool)
     };
     let mut id = crate::aleatoire::u32() as u16;
     let route = route_de_segment(&ip, e.locale, e.distante, true);
-    envoyer_segment(&r, Compte::Reponse { rst: false }, e.locale, e.distante, &mut id, ip, route, 0, None, |_| {});
+    envoyer_segment(&r, Compte::Reponse { rst: false }, e.locale, e.distante, &mut id, ip, route, 0, None, None, |_| {});
 }
 
 fn effacer_temps_attente(n: u64) {
@@ -1996,17 +2245,18 @@ pub fn recevoir(ip: &fipv4::Ipv4, recu: &ipv4::EnteteRecu, i: &super::interface:
 // --- Les appels ---
 
 /// Une socket TCP neuve (`tcp_v4_init_sock`) : SO_RCVBUF et SO_SNDBUF de
-/// TCP, son flux.
-pub fn nouvelle(numero: u64) -> Option<Possession<Partie>> {
+/// TCP, son flux, et ce qu'il partage avec la file d'erreurs de la socket.
+pub fn nouvelle(numero: u64) -> Option<(Possession<Partie>, Arc<CompteReception>)> {
     let retenue = Arc::new(Retenue::new(numero)).ok()?;
+    let compte = Arc::new(CompteReception::new()).ok()?;
     SOCKETS.fetch_add(1, Ordering::Relaxed);
     let partie = Partie {
         numero, mode: Mode::Neuve, adresses: Adresses::default(), identifiant: 0, orpheline: false, hors_table: false,
         options: OptionsTcp::DEFAUT, etat_socket: EtatSocket::NonConnectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
-        route_oubliee: false, horodatage: 0,
+        compte: compte.clone(), route_oubliee: false, horodatage: 0, demandes: VecDeque::new(),
     };
     let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
-    Some(Possession::new(partie, premier))
+    Some((Possession::new(partie, premier), compte))
 }
 
 fn flux(s: &Socket) -> &Possession<Partie> {
@@ -2372,8 +2622,9 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             // La place de la socket neuve d'abord : sans mémoire, la fille
             // reste dans la file, pour un prochain accept (ENFILE, comme le
             // `sock_alloc` de `do_accept`).
-            let (Ok(place_flux), Ok(place_socket), Ok(retenue), Some(enfant)) =
-                (faillible::boite_vide(), ArcVide::new(), Arc::new(Retenue::new(filles[i].numero)), Socket::new(Protocole::Tcp, SOCK_STREAM as u16, IPPROTO_TCP as u16, s.uid))
+            let (Ok(place_flux), Ok(place_socket), Ok(retenue), Ok(compte), Some(enfant)) =
+                (faillible::boite_vide(), ArcVide::new(), Arc::new(Retenue::new(filles[i].numero)), Arc::new(CompteReception::new()),
+                 Socket::new(Protocole::Tcp, SOCK_STREAM as u16, IPPROTO_TCP as u16, s.uid))
             else { return Err(-ENFILE) };
             let f = filles.remove(i).expect("la fille");
             let (port, distante, port_distant, locale) = (f.tcb.port_local, f.distante, f.tcb.port_distant, f.locale);
@@ -2399,11 +2650,11 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 // `inet_csk_delack_init`) : la fille n'attend pas de données pour naître deux fois.
                 options: OptionsTcp { defer_accept: 0, quickack: true, ip_options, interface, ..p.options },
                 etat_socket: EtatSocket::Connectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
-                route_oubliee: false, horodatage,
+                compte: compte.clone(), route_oubliee: false, horodatage, demandes: VecDeque::new(),
             };
             let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
             let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
-            let enfant = place_socket.remplir(enfant.avec_flux(flux));
+            let enfant = place_socket.remplir(enfant.avec_flux(flux, compte));
             enfant.rcvbuf.store(s.rcvbuf.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.sndbuf.store(s.sndbuf.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.pertes.store(pertes, Ordering::Relaxed);
@@ -2474,14 +2725,20 @@ pub fn pair(s: &Socket) -> Option<([u8; 4], u16)> {
     }
 }
 
-/// La socket est-elle en TCP_CLOSE ou en TCP_LISTEN (SOF_TIMESTAMPING_OPT_ID
-/// les refuse) : neuve, une écoute, ou une connexion finie (TIME_WAIT
-/// compris : la socket, elle, est déjà fermée, voir `pair`).
-pub fn fermee_ou_ecoute(s: &Socket) -> bool {
+/// Le compteur des clés d'une socket qui pose OPT_ID (`sock_set_timestamping`) :
+/// SND.UNA, ou avec OPT_ID_TCP (`depuis_l_ecrit`) le numéro qui suit tout ce
+/// qui est écrit (`write_seq`), d'où la clé d'un octet est son numéro moins
+/// celui-ci (mesuré : OPT_ID puis 10 et 5 octets, clés 9 et 14 ; OPT_ID_TCP
+/// puis 2 octets, clé 1). None en TCP_CLOSE ou en TCP_LISTEN, qui refusent
+/// OPT_ID : neuve, une écoute, ou une connexion finie (TIME_WAIT compris : la
+/// socket, elle, est déjà fermée, voir `pair`).
+pub fn cle_opt_id(s: &Socket, depuis_l_ecrit: bool) -> Option<u32> {
     let mut g = flux(s).posseder();
     match &g.donnee().mode {
-        Mode::Connexion(t) => matches!(t.etat(), Etat::Fermee | Etat::TempsAttente),
-        _ => true,
+        Mode::Connexion(t) if !matches!(t.etat(), Etat::Fermee | Etat::TempsAttente) => {
+            Some(if depuis_l_ecrit { t.write_seq() } else { t.numeros().0 })
+        }
+        _ => None,
     }
 }
 
@@ -2506,8 +2763,13 @@ pub fn pair_garde(s: &Socket) -> Option<([u8; 4], u16)> {
 /// MSG_NOSIGNAL : l'appelant). MSG_OOB : le dernier octet écrit est
 /// urgent (`tcp_mark_urg`) ; MSG_MORE : le dernier segment, incomplet,
 /// attend la suite (sauf quand l'envoi attend la place : ce qui est écrit
-/// part). Rend ce qui a été écrit.
-pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
+/// part). `tx` : les drapeaux TX_* de SO_TIMESTAMPING de l'envoi (ceux de la
+/// socket, ou de son message de contrôle) ; tout envoi qui écrit demande ainsi
+/// l'horodatage de son dernier octet (`Partie::demander_horodatage`) : avant
+/// d'émettre ce qu'il a écrit en dernier, ou en rendant moins que voulu
+/// (le `out:` de `tcp_sendmsg_locked` : ce qui est déjà parti ne portera la
+/// demande qu'à son renvoi). Rend ce qui a été écrit.
+pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, tx: u32, mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const MSG_OOB: u64 = 1;
     const MSG_DONTWAIT: u64 = 0x40;
     const MSG_MORE: u64 = 0x8000;
@@ -2516,6 +2778,7 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
     let echeance = delai.map(|d| crate::temps::ns_monotone().saturating_add(d));
     let mut g = flux(s).posseder();
     let mut fait = 0;
+    let mut demandee = false;
     {
         let p = g.donnee();
         let retenue = p.retenue.octets();
@@ -2523,7 +2786,7 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
             t.verifier_app_limite(retenue);
         }
     }
-    loop {
+    let r = (|| loop {
         let arret = g.avec_court(|_, c| c.arret);
         let p = g.donnee();
         let Mode::Connexion(t) = &mut p.mode else {
@@ -2564,6 +2827,10 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
                 t.marquer_urgent();
             }
             t.plus_a_venir = drapeaux & MSG_MORE != 0 && fait == longueur;
+            if fait == longueur && fait > 0 {
+                p.demander_horodatage(s, tx);
+                demandee = true;
+            }
             let _contexte = contexte::entrer();
             p.emettre();
             p.apres();
@@ -2616,7 +2883,11 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
             Reveil::Echeance => return Err(-EAGAIN),
             Reveil::Signal => return Err(if delai.is_some() { -EINTR } else { -crate::reprise::ERESTARTSYS }),
         }
+    })();
+    if fait > 0 && !demandee {
+        g.donnee().demander_horodatage(s, tx);
     }
+    r
 }
 
 /// Reçoit au plus `longueur` octets par `copier` (`tcp_recvmsg`) : ce qui
@@ -2982,10 +3253,14 @@ fn t_ferme(p: &Partie) -> bool {
     matches!(&p.mode, Mode::Connexion(t) if t.etat() == Etat::Fermee)
 }
 
-/// Ce qu'on peut faire de la socket sans attendre (`tcp_poll`).
+/// Ce qu'on peut faire de la socket sans attendre (`tcp_poll`) : aussi
+/// POLLERR quand sa file d'erreurs n'est pas vide (les horodatages
+/// d'émission), sauf pour une écoute (`inet_csk_listen_poll`, avant) ; jamais
+/// POLLPRI pour elle, même avec SO_SELECT_ERR_QUEUE (mesuré : 0x8).
 pub fn sonder(s: &Socket) -> u32 {
+    let file_d_erreurs = if s.reception.verrouiller().erreurs.is_empty() { 0 } else { POLLERR };
     flux(s).court(|c| {
-        let m = masque(c);
+        let m = masque(c) | if c.ecoute { 0 } else { file_d_erreurs };
         // Pas écrivable : la connexion devra le savoir (`tcp_poll`, SOCK_NOSPACE), et O_ASYNC aussi.
         if m & POLLOUT == 0 && !c.ecoute && !matches!(c.etat, Some(Etat::SynEnvoye | Etat::SynRecu)) {
             c.sans_place = true;
@@ -3138,10 +3413,11 @@ pub fn sndbuf(s: &Socket) -> u32 {
     }
 }
 
-/// SO_MEMINFO d'une socket TCP (`sk_get_meminfo`) : la réception gardée, en
-/// taille vraie (les files de lecture et hors d'ordre, `sk_rmem_alloc`) ; ce
-/// que la carte n'a pas fini d'envoyer (`sk_wmem_alloc`, la `Retenue`) ; la
-/// file d'envoi (`sk_wmem_queued`, `Tcb::memoire_envoi`) ; la file `backlog`
+/// SO_MEMINFO d'une socket TCP (`sk_get_meminfo`) : la réception gardée par
+/// le flux, en taille vraie (les files de lecture et hors d'ordre : avec la
+/// file d'erreurs, que compte l'appelant, le `sk_rmem_alloc`) ; ce que la
+/// carte n'a pas fini d'envoyer (`sk_wmem_alloc`, la `Retenue`) ; la file
+/// d'envoi (`sk_wmem_queued`, `Tcb::memoire_envoi`) ; la file `backlog`
 /// (`sk_backlog.len`), lue avant de posséder la socket, qui la viderait. Une
 /// écoute ne garde rien : ses filles sont à elles.
 pub fn memoire(s: &Socket) -> [usize; 4] {
@@ -3149,7 +3425,7 @@ pub fn memoire(s: &Socket) -> [usize; 4] {
     let mut g = flux(s).posseder();
     let p = g.donnee();
     let (reception, envoi) = match &p.mode {
-        Mode::Connexion(t) => (t.memoire_reception(), t.memoire_envoi()),
+        Mode::Connexion(t) => (t.memoire_du_flux(), t.memoire_envoi()),
         _ => (0, 0),
     };
     [reception, p.retenue.octets(), envoi, backlog]

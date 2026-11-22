@@ -722,7 +722,8 @@ pub struct Socket {
     pub tsflags: AtomicU32,
     /// Le compteur des clés d'OPT_ID (`sk_tskey`), remis à zéro quand OPT_ID
     /// se pose : la clé du prochain datagramme horodaté
-    /// (`horodatage::demander_datagramme`).
+    /// (`horodatage::demander_datagramme`) ; pour TCP, le numéro de séquence
+    /// d'où partent les clés.
     pub cle_emission: AtomicU32,
     /// L'heure du dernier datagramme lu (`sk_stamp`), que rend SIOCGSTAMP
     /// (appels_reseau.rs, `heure_du_dernier` ; la lecture l'écrit :
@@ -784,6 +785,10 @@ pub struct Socket {
     suivante: Verrou<Option<Arc<Socket>>>,
     /// Le flux d'une socket TCP (tcp.rs) : sa possession et sa connexion.
     pub flux: Option<alloc::boxed::Box<crate::attente::Possession<super::tcp::Partie>>>,
+    /// Pour TCP, ce que sa file d'erreurs partage avec sa connexion (le
+    /// `sk_rmem_alloc`, tcp.rs) : qu'elle tienne avec ce que la connexion a
+    /// reçu sous SO_RCVBUF, et que la connexion la compte.
+    pub compte_tcp: Option<Arc<super::tcp::CompteReception>>,
     /// La partie d'une socket AF_UNIX (unix.rs).
     pub unix: Option<alloc::boxed::Box<super::unix::Unix>>,
     /// Ce qu'une socket de datagrammes (UDP, ping) a encore en route, compté dans
@@ -840,6 +845,7 @@ impl Socket {
             cookie: AtomicU64::new(0),
             suivante: Verrou::new(None),
             flux: None,
+            compte_tcp: None,
             unix: None,
             envois,
         })
@@ -884,7 +890,9 @@ impl Socket {
     /// Une socket TCP : son flux, et ses tampons de départ (`tcp_rmem[1]`,
     /// `tcp_wmem[1]`). None : plus de mémoire pour le flux.
     pub fn tcp(mut self) -> Option<Socket> {
-        self.flux = Some(faillible::boite(super::tcp::nouvelle(self.numero)?).ok()?);
+        let (flux, compte) = super::tcp::nouvelle(self.numero)?;
+        self.flux = Some(faillible::boite(flux).ok()?);
+        self.compte_tcp = Some(compte);
         self.rcvbuf.store(super::tcp::RCVBUF_DEFAUT, Ordering::Relaxed);
         self.sndbuf.store(super::tcp::SNDBUF_DEFAUT, Ordering::Relaxed);
         Some(self)
@@ -892,8 +900,9 @@ impl Socket {
 
     /// La même, avec un flux déjà fait (la fille d'une écoute, à
     /// `accept`).
-    pub fn avec_flux(mut self, f: alloc::boxed::Box<crate::attente::Possession<super::tcp::Partie>>) -> Socket {
+    pub fn avec_flux(mut self, f: alloc::boxed::Box<crate::attente::Possession<super::tcp::Partie>>, compte: Arc<super::tcp::CompteReception>) -> Socket {
         self.flux = Some(f);
+        self.compte_tcp = Some(compte);
         self.rcvbuf.store(super::tcp::RCVBUF_DEFAUT, Ordering::Relaxed);
         self.sndbuf.store(super::tcp::SNDBUF_DEFAUT, Ordering::Relaxed);
         self
@@ -943,8 +952,9 @@ impl Socket {
     }
 
     /// Met l'erreur `e` dans la file d'erreurs, s'il y a la place
-    /// (`sock_queue_err_skb` : elle compte avec les datagrammes, et doit
-    /// laisser de la place sous SO_RCVBUF), et réveille. false : jetée.
+    /// (`sock_queue_err_skb` : elle compte avec les datagrammes, ou avec ce
+    /// que la connexion de TCP a reçu, et doit laisser de la place sous
+    /// SO_RCVBUF), et réveille. false : jetée.
     pub fn mettre_en_file(&self, e: ErreurEnFile) -> bool {
         // (`sock_queue_err_skb` : `sk_error_report`.)
         let raison = crate::asynchrone::Raison::Erreur;
@@ -952,14 +962,28 @@ impl Socket {
         {
             let mut r = self.reception.verrouiller();
             let taille = e.taille;
-            if r.octets + taille >= rcvbuf || r.erreurs.ajouter_derriere(e).is_err() {
+            let admise = match &self.compte_tcp {
+                Some(c) => c.admet(r.octets, taille, rcvbuf),
+                None => r.octets + taille < rcvbuf,
+            };
+            if !admise || r.erreurs.ajouter_derriere(e).is_err() {
                 return false;
             }
             r.octets += taille;
+            self.compter_erreurs(r.octets);
         }
-        self.attente.reveiller(POLLERR, 1);
-        self.asynchrone.evenement(raison);
+        self.file_de_sondage().reveiller(POLLERR, 1);
+        self.liste_async().evenement(raison);
         true
+    }
+
+    /// La file où attendent `poll` et epoll : celle du flux pour TCP (où
+    /// attendent aussi ses lectures et ses écritures), sinon `attente`.
+    fn file_de_sondage(&self) -> &crate::attente::FileAttente {
+        match &self.flux {
+            Some(f) => f.file(),
+            None => &self.attente,
+        }
     }
 
     /// Prend la première erreur de la file (`sock_dequeue_err_skb`) : l'erreur
@@ -971,6 +995,7 @@ impl Socket {
             let mut r = self.reception.verrouiller();
             let e = r.erreurs.pop_front()?;
             r.octets = r.octets.saturating_sub(e.taille);
+            self.compter_erreurs(r.octets);
             let suivante_icmp = r.erreurs.front().filter(|s| s.origine == ORIGINE_ICMP).map(|s| s.errno);
             if let Some(errno) = suivante_icmp {
                 r.erreur = errno;
@@ -980,8 +1005,8 @@ impl Socket {
             (e, !r.erreurs.is_empty())
         };
         if reste {
-            self.attente.reveiller(POLLERR, 1);
-            self.asynchrone.evenement(crate::asynchrone::Raison::Erreur);
+            self.file_de_sondage().reveiller(POLLERR, 1);
+            self.liste_async().evenement(crate::asynchrone::Raison::Erreur);
         }
         Some(e)
     }
@@ -996,6 +1021,16 @@ impl Socket {
         let rendus: usize = r.erreurs.iter().filter(|e| !gardee(e)).map(|e| e.taille).sum();
         r.octets = r.octets.saturating_sub(rendus);
         r.erreurs.retain(gardee);
+        self.compter_erreurs(r.octets);
+    }
+
+    /// Ce que garde maintenant la file d'erreurs, `octets`, pour la
+    /// connexion de TCP (`CompteReception`) ; sous le verrou de la
+    /// réception, qui ordonne ces écritures.
+    fn compter_erreurs(&self, octets: usize) {
+        if let Some(c) = &self.compte_tcp {
+            c.poser_erreurs(octets);
+        }
     }
 
     /// Prend l'erreur en attente (le `sock_error` : lue et effacée).

@@ -740,7 +740,10 @@ fn envoyer(o: &FichierTenu, v: &[(u32, u32)], m: &[u8], cout: &mut u64) -> Resul
     let place: usize = v.iter().map(|&(_, l)| l as usize).sum();
     let longueur = place.min(TRANSFERT_MAX as usize);
     let drapeaux = if o.drapeaux & O_NONBLOCK != 0 { MSG_DONTWAIT } else { 0 };
-    let n = tcp::envoyer(o.socket(), longueur, drapeaux, |decalage, d| {
+    // Les drapeaux d'émission de SO_TIMESTAMPING : ceux de la socket, comme
+    // tout envoi sans message de contrôle (WASI n'en a pas).
+    let tx = o.socket().tsflags.load(core::sync::atomic::Ordering::Relaxed);
+    let n = tcp::envoyer(o.socket(), longueur, drapeaux, tx, |decalage, d| {
         des_morceaux(m, v, decalage, d);
         Ok(())
     })

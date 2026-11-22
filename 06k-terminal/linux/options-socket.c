@@ -75,7 +75,14 @@
  *     pose), OPT_TSONLY (sans octets), OPT_CMSG (IP_PKTINFO, IP_TTL, IP_TOS,
  *     IP_ORIGDSTADDR du paquet, et sa source comme SO_EE_OFFENDER) ; le bouchon garde
  *     les drapeaux de son premier envoi ; les messages de contrôle SO_TIMESTAMPING et
- *     SCM_TS_OPT_ID (et leurs refus) ; MSG_TRUNC ; SO_RCVBUF borne la file.
+ *     SCM_TS_OPT_ID (et leurs refus) ; MSG_TRUNC ; SO_RCVBUF borne la file ;
+ *   - SO_TIMESTAMPING, à l'émission de TCP : SCHED et SND du segment qui porte le
+ *     dernier octet d'un envoi (sa trame de lo), puis ACK quand il est acquitté (ses
+ *     données seules, sans interface) ; OPT_ID, la clé de ce dernier octet depuis
+ *     SND.UNA, ou depuis tout ce qui est écrit avec OPT_ID_TCP ; deux envois dans le
+ *     même segment (TCP_CORK) n'en font qu'un, le dernier, aux drapeaux des deux ;
+ *     OPT_TSONLY ; OPT_CMSG (IP_PKTINFO pour SND, rien pour ACK) ; POLLERR seul, même
+ *     avec SO_SELECT_ERR_QUEUE, et le réveil de qui attend dans poll.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -2313,6 +2320,221 @@ static void select_err_queue(void)
     }
 }
 
+/* Une connexion TCP par lo : le client `*c`, la fille acceptée `*d`. */
+static void tcp_connectee(int *c, int *d)
+{
+    struct sockaddr_in t;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    lier_tcp(l, &t), listen(l, 1);
+    *c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(*c, (void *)&t, sizeof t);
+    *d = accept(l, NULL, NULL);
+    close(l);
+}
+
+/* La trame de lo d'un segment TCP de données `d` (n octets) : l'en-tête Ethernet nul,
+ * IP, TCP avec l'option des horodatages (32 octets), les données à la fin. */
+static int segment_ok(const struct entree *e, const char *d, int n)
+{
+    static const unsigned char nul[12];
+    return e->r == 14 + 20 + 32 + n && !memcmp(e->o, nul, 12) && e->o[12] == 8 && e->o[14] == 0x45
+        && e->o[23] == IPPROTO_TCP && e->o[46] == 0x80 && !memcmp(e->o + e->r - n, d, n);
+}
+
+/* Lit `n` entrées de la file d'erreurs de `s` dans `e` (128 octets au plus chacune) ;
+ * la suivante doit manquer (EAGAIN). */
+static int entrees(int s, struct entree *e, int n)
+{
+    for (int i = 0; i < n; i++)
+        lire_entree(s, &e[i], 128);
+    struct entree fin;
+    return lire_entree(s, &fin, 128) == -EAGAIN;
+}
+
+/* La mémoire d'une entrée OPT_TSONLY d'UDP : la tête vide d'un paquet. */
+static unsigned entree_vide(void)
+{
+    struct sockaddr_in a, b;
+    int r = udp_lie(&a), s = udp_lie(&b);
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_OPT_TSONLY);
+    sendto(s, "a", 1, 0, (void *)&a, sizeof a);
+    unsigned m = compteur(s, RMEM);
+    close(s), close(r);
+    return m;
+}
+
+/* Lit toute la file d'erreurs de `s` : combien d'entrées. */
+static int vider_entrees(int s)
+{
+    struct entree e;
+    int n = 0;
+    while (lire_entree(s, &e, sizeof e.o) >= 0)
+        n++;
+    return n;
+}
+
+/* Combien de `k` (8 au plus) ont `avant + k * une < rcvbuf` : les entrées que garde
+ * SO_RCVBUF (sock_queue_err_skb). */
+static int admises(unsigned avant, unsigned une, unsigned rcvbuf)
+{
+    int k = 0;
+    while (k < 8 && avant + (k + 1) * une < rcvbuf)
+        k++;
+    return k;
+}
+
+/* La mémoire des entrées de TCP : la tête vide (comme une entrée OPT_TSONLY d'UDP), plus
+ * les octets de données du segment pour une copie (SCHED, SND, ACK) ; comptées dans
+ * SO_MEMINFO avec ce que la connexion a reçu, sous son SO_RCVBUF. */
+static void horodatages_memoire_tcp(void)
+{
+    unsigned vide = entree_vide();
+    int c, d, un = 1;
+    tcp_connectee(&c, &d);
+    setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &un, sizeof un);
+    poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_SCHED | TSF_TX_ACK | TSF_OPT_TSONLY);
+    send(c, "abc", 3, 0);
+    attendre_ms(50);
+    unsigned m1 = compteur(c, RMEM);
+    int ok = m1 == 3 * vide && vider_entrees(c) == 3 && compteur(c, RMEM) == 0;
+    poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_SCHED | TSF_TX_ACK);
+    send(c, "abc", 3, 0);
+    attendre_ms(50);
+    unsigned m2 = compteur(c, RMEM);
+    ok &= m2 == 3 * (vide + 3) && vider_entrees(c) == 3;
+    char z[3000];
+    memset(z, 'z', sizeof z);
+    send(c, z, sizeof z, 0);
+    attendre_ms(50);
+    unsigned m3 = compteur(c, RMEM);
+    ok &= m3 == 3 * (vide + 3000) && vider_entrees(c) == 3 && compteur(c, RMEM) == 0;
+    close(c), close(d);
+    printf("[linux] options-socket : SO_TIMESTAMPING TCP, memoire : %u par entree vide ; SCHED, SND, ACK : %u, de 3 octets %u, de 3000 %u\n",
+           vide, m1, m2, m3);
+    verifier(ok, "SO_TIMESTAMPING TCP : une entree compte la tete vide d'un paquet (comme OPT_TSONLY d'UDP), plus les octets de donnees du segment");
+    /* SO_RCVBUF petit (posé avant connect : il ne grandit pas) ; ce que la connexion a
+     * reçu et pas lu compte avec la file d'erreurs. */
+    struct sockaddr_in t;
+    int petit = 2048;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    lier_tcp(l, &t), listen(l, 1);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(c, SOL_SOCKET, SO_RCVBUF, &petit, sizeof petit);
+    setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &un, sizeof un);
+    connect(c, (void *)&t, sizeof t);
+    d = accept(l, NULL, NULL);
+    close(l);
+    unsigned rcvbuf = compteur(c, RCVBUF);
+    poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_OPT_TSONLY);
+    for (int i = 0; i < 8; i++)
+        send(c, "a", 1, 0), attendre_ms(5);
+    unsigned plein = compteur(c, RMEM);
+    int n0 = vider_entrees(c);
+    send(d, "0123456789", 10, 0);
+    attendre_ms(20);
+    unsigned recu = compteur(c, RMEM);
+    for (int i = 0; i < 8; i++)
+        send(c, "a", 1, 0), attendre_ms(5);
+    unsigned apres = compteur(c, RMEM);
+    int n1 = vider_entrees(c);
+    ok = n0 == admises(0, vide, rcvbuf) && plein == n0 * vide && recu > 10 && n1 == admises(recu, vide, rcvbuf) && n1 < n0
+        && apres == recu + n1 * vide && recv(c, z, sizeof z, MSG_DONTWAIT) == 10 && compteur(c, RMEM) == 0;
+    close(c), close(d);
+    printf("[linux] options-socket : SO_TIMESTAMPING TCP, SO_RCVBUF %u : %d entrees de 8 ; %u octets recus : %d\n", rcvbuf, n0, recu, n1);
+    verifier(ok, "SO_TIMESTAMPING TCP : la file d'erreurs compte avec ce que la connexion a recu, sous son SO_RCVBUF (SO_MEMINFO : les deux)");
+}
+
+static void horodatages_emission_tcp(void)
+{
+    struct entree e[6];
+    int c, d, un = 1, zero = 0;
+    tcp_connectee(&c, &d);
+    /* SCHED, SND, ACK, OPT_ID : un envoi de 10 octets, puis un de 5. */
+    int ok = poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_SCHED | TSF_TX_ACK | TSF_SOFTWARE | TSF_OPT_ID) == 0;
+    send(c, "0123456789", 10, 0);
+    send(c, "abcde", 5, 0);
+    attendre_ms(50);
+    ok &= entrees(c, e, 6) && horodatage_ok(&e[0], 76, 1, 9) && segment_ok(&e[0], "0123456789", 10) && e[0].heure
+        && sortes_ok(&e[0], 2, (int[]){S_TS, S_ERR}) && e[0].famille == 0 && horodatage_ok(&e[1], 76, 0, 9) && !memcmp(e[0].o, e[1].o, 76)
+        && horodatage_ok(&e[2], 10, 2, 9) && !memcmp(e[2].o, "0123456789", 10) && e[2].heure && sortes_ok(&e[2], 2, (int[]){S_TS, S_ERR})
+        && horodatage_ok(&e[3], 71, 1, 14) && segment_ok(&e[3], "abcde", 5) && horodatage_ok(&e[4], 71, 0, 14)
+        && horodatage_ok(&e[5], 5, 2, 14) && !memcmp(e[5].o, "abcde", 5);
+    verifier(ok, "SO_TIMESTAMPING TCP : SCHED et SND du segment (sa trame), puis ACK (ses donnees seules) ; OPT_ID, la cle de son dernier octet depuis SND.UNA");
+    /* TCP_CORK : deux envois dans le même segment, une demande, la dernière, aux
+     * drapeaux des deux (ceux du message de contrôle, OPT_ID reposé garde la clé). */
+    poser(c, TSG_OLD, TSF_SOFTWARE | TSF_OPT_ID);
+    setsockopt(c, IPPROTO_TCP, TCP_CORK, &un, sizeof un);
+    ok = envoyer_avec(c, NULL, SOL_SOCKET, TSG_OLD, TSF_TX_SCHED | TSF_TX_ACK) == 0 && envoyer_avec(c, NULL, SOL_SOCKET, TSG_OLD, TSF_TX_SOFTWARE) == 0;
+    setsockopt(c, IPPROTO_TCP, TCP_CORK, &zero, sizeof zero);
+    attendre_ms(50);
+    ok &= entrees(c, e, 3) && horodatage_ok(&e[0], 68, 1, 16) && segment_ok(&e[0], "xx", 2) && horodatage_ok(&e[1], 68, 0, 16)
+        && horodatage_ok(&e[2], 2, 2, 16) && !memcmp(e[2].o, "xx", 2);
+    verifier(ok, "SO_TIMESTAMPING TCP : deux envois dans un segment (TCP_CORK), une demande, la derniere, aux drapeaux des deux");
+    /* OPT_TSONLY ; OPT_ID_TCP (la clé depuis tout ce qui est écrit) ; OPT_ID reposé
+     * après un retrait (depuis SND.UNA). */
+    poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_ACK | TSF_SOFTWARE | TSF_OPT_ID | TSF_OPT_TSONLY);
+    send(c, "xyz", 3, 0);
+    attendre_ms(50);
+    ok = entrees(c, e, 2) && horodatage_ok(&e[0], 0, 0, 19) && e[0].heure && horodatage_ok(&e[1], 0, 2, 19) && e[1].heure;
+    poser(c, TSG_OLD, 0);
+    ok &= poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_ID | TSF_OPT_ID_TCP | TSF_OPT_TSONLY) == 0;
+    send(c, "12", 2, 0);
+    attendre_ms(50);
+    ok &= entrees(c, e, 1) && horodatage_ok(&e[0], 0, 0, 1);
+    poser(c, TSG_OLD, 0);
+    poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_OPT_ID | TSF_OPT_TSONLY);
+    send(c, "3", 1, 0);
+    attendre_ms(50);
+    ok &= entrees(c, e, 1) && horodatage_ok(&e[0], 0, 0, 0);
+    verifier(ok, "SO_TIMESTAMPING TCP : OPT_TSONLY ; OPT_ID_TCP, la cle depuis tout ce qui est ecrit ; OPT_ID repose, depuis SND.UNA");
+    /* OPT_CMSG : IP_PKTINFO et SO_EE_OFFENDER pour SND (lo), rien pour ACK. */
+    setsockopt(c, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_ACK | TSF_SOFTWARE | TSF_OPT_CMSG);
+    send(c, "q", 1, 0);
+    attendre_ms(50);
+    ok = entrees(c, e, 2) && horodatage_ok(&e[0], 67, 0, 0) && sortes_ok(&e[0], 3, (int[]){S_TS, S_PKT, S_ERR})
+        && e[0].pkt.ipi_ifindex == 1 && e[0].pkt.ipi_spec_dst.s_addr == htonl(INADDR_LOOPBACK) && e[0].famille == AF_INET
+        && e[0].offender == htonl(INADDR_LOOPBACK) && horodatage_ok(&e[1], 1, 2, 0) && sortes_ok(&e[1], 2, (int[]){S_TS, S_ERR})
+        && e[1].famille == 0;
+    verifier(ok, "SO_TIMESTAMPING TCP : OPT_CMSG, IP_PKTINFO et SO_EE_OFFENDER pour SND, rien pour ACK (aucune interface)");
+    /* poll : POLLERR seul, même avec SO_SELECT_ERR_QUEUE ; plus rien une fois lue ; qui
+     * attend dans poll est réveillé par l'entrée. */
+    poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_SOFTWARE);
+    poser(c, SO_SELECT_ERR_QUEUE, 1);
+    send(c, "p", 1, 0);
+    attendre_ms(20);
+    ok = pret(c) == (POLLOUT | POLLERR) && entrees(c, e, 1) && pret(c) == POLLOUT;
+    pthread_t f;
+    pthread_create(&f, NULL, envoyer_plus_tard, &c);
+    struct pollfd p = {c, POLLIN, 0};
+    long long t0 = monotone_ns();
+    ok &= poll(&p, 1, 3000) == 1 && p.revents == POLLERR && monotone_ns() - t0 >= 150000000LL;
+    pthread_join(f, NULL);
+    ok &= entrees(c, e, 1) && horodatage_ok(&e[0], 67, 0, 0);
+    verifier(ok, "SO_TIMESTAMPING TCP : POLLERR seul, meme avec SO_SELECT_ERR_QUEUE, et le reveil de qui attend dans poll");
+    close(c);
+    char z[64];
+    while (recv(d, z, sizeof z, MSG_DONTWAIT) > 0)
+        ;
+    close(d);
+    /* Un envoi sans demande d'émission qui s'ajoute au segment d'une demande
+     * (TCP_CORK) : l'entrée ACK copie tout le segment (`__skb_tstamp_tx` clone
+     * le `sk_buff`), au-delà du dernier octet de la demande, dont elle garde la clé. */
+    tcp_connectee(&c, &d);
+    poser(c, TSG_OLD, TSF_SOFTWARE | TSF_OPT_ID);
+    setsockopt(c, IPPROTO_TCP, TCP_CORK, &un, sizeof un);
+    ok = envoyer_avec(c, NULL, SOL_SOCKET, TSG_OLD, TSF_TX_ACK) == 0 && send(c, "yy", 2, 0) == 2;
+    setsockopt(c, IPPROTO_TCP, TCP_CORK, &zero, sizeof zero);
+    attendre_ms(50);
+    ok &= entrees(c, e, 1) && horodatage_ok(&e[0], 3, 2, 0) && !memcmp(e[0].o, "xyy", 3);
+    verifier(ok, "SO_TIMESTAMPING TCP : un envoi sans demande ajoute au segment d'une demande (TCP_CORK), l'entree ACK copie tout le segment");
+    close(c);
+    while (recv(d, z, sizeof z, MSG_DONTWAIT) > 0)
+        ;
+    close(d);
+    horodatages_memoire_tcp();
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -2350,6 +2572,7 @@ int main(void)
     horodatages_emission_udp();
     horodatages_emission_ping();
     horodatages_purge();
+    horodatages_emission_tcp();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }
