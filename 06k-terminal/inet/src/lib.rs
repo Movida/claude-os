@@ -14,7 +14,8 @@
 //! fragments (fragments.rs), combien d'erreurs ICMP envoyer à chaque
 //! machine (pairs.rs) ; et les compteurs de /proc/net/snmp (snmp.rs) ;
 //! les groupes de multidiffusion de chaque socket et de chaque interface,
-//! et leurs filtres de sources (multidiffusion.rs). Rien
+//! et leurs filtres de sources (multidiffusion.rs) ; les filtres des
+//! sockets, le BPF classique de SO_ATTACH_FILTER (filtre.rs). Rien
 //! ici ne lit l'horloge ni ne tire au hasard : l'heure (en nanosecondes) et
 //! le hasard sont des arguments, si bien qu'un test peut faire passer 45
 //! secondes en une ligne, et rejouer exactement un cas.
@@ -29,6 +30,7 @@ extern crate alloc;
 pub mod dhcp;
 pub mod echeances;
 pub mod en_vol;
+pub mod filtre;
 pub mod fragments;
 pub mod idents;
 pub mod multidiffusion;
