@@ -42,6 +42,7 @@ pub mod unix;
 // La carte virtio-net : de la mémoire partagée avec elle (ses tampons).
 #[allow(unsafe_code)]
 pub mod virtio_net;
+pub mod zerocopie;
 
 use interface::Interface;
 use paquet::Paquet;

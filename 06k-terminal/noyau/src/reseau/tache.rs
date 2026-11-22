@@ -48,6 +48,9 @@ const ECHEANCE: u32 = 1 << 1;
 /// Les adresses MAC des groupes ont changé : refaire le filtre de la carte
 /// (le `rx_mode_work` du pilote de Linux).
 pub const FILTRE: u32 = 1 << 2;
+/// Des avis de MSG_ZEROCOPY finis hors du contexte réseau, à livrer
+/// (zerocopie.rs).
+pub const AVIS: u32 = 1 << 3;
 /// Le travail d'une interface (sa réception, ses émissions finies) : le
 /// bit `INTERFACES << index`.
 const INTERFACES: u32 = 1 << 8;
@@ -263,6 +266,9 @@ fn boucle() {
         // envoie par `lo` (une réponse) part à la fin du tour, en sortant
         // du contexte (contexte.rs).
         let contexte = super::contexte::entrer();
+        if travail & AVIS != 0 {
+            super::zerocopie::livrer_les_finis();
+        }
         for index in 1..=16u32 {
             if travail & INTERFACES << (index - 1) == 0 {
                 continue;

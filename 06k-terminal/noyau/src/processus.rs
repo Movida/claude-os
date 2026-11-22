@@ -146,6 +146,7 @@ pub const RLIMIT_SIGPENDING: usize = 11;
 /// La limite du RSS : sans effet chez Linux depuis 2.6, mais gardée et
 /// montrée (`rsslim` de /proc/<pid>/stat).
 pub const RLIMIT_RSS: usize = 5;
+pub const RLIMIT_MEMLOCK: usize = 8;
 /// RLIM_INFINITY.
 pub const INFINI: u64 = u64::MAX;
 
@@ -171,7 +172,7 @@ pub fn limites_par_defaut() -> [(u64, u64); LIMITES] {
     l[RLIMIT_STACK] = (8 << 20, INFINI);
     l[4] = (0, INFINI); // RLIMIT_CORE
     l[RLIMIT_NOFILE] = LIMITE_DESCRIPTEURS;
-    l[8] = (8 << 20, 8 << 20); // RLIMIT_MEMLOCK
+    l[RLIMIT_MEMLOCK] = (8 << 20, 8 << 20);
     let signaux = (crate::vmalloc::max_threads() / 2) as u64;
     l[RLIMIT_SIGPENDING] = (signaux, signaux);
     l[12] = (819_200, 819_200); // RLIMIT_MSGQUEUE

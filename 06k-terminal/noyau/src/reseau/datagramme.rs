@@ -469,13 +469,14 @@ pub const MSG_PROBE: u64 = 0x10;
 /// `ipv4::router` remplacerait), et la route va à sa première étape ; la
 /// route et ses refus (`router`) ; `charge` octets (l'en-tête du protocole
 /// compris) plus l'en-tête IPv4, options comprises, au-delà de ce qu'on a
-/// le droit d'envoyer (`Depart::permis`) : `trop_gros` ; l'erreur en
-/// attente (lue et effacée : un ECONNREFUSED revenu après l'envoi précédent
-/// sort ici) ; l'écriture arrêtée : EPIPE, sans SIGPIPE (le signal est
-/// l'affaire de TCP). Avec MSG_PROBE, rien après la route : Linux ne fait
-/// aucun paquet (`ip_make_skb` rend NULL, `ip_append_data` 0, avant
-/// `__ip_append_data`), donc ni la taille, ni l'erreur en attente, ni
-/// l'arrêt ne comptent ; l'envoi rend sa longueur sans rien envoyer.
+/// le droit d'envoyer (`Depart::permis`) : `trop_gros`. L'erreur en attente
+/// et l'écriture arrêtée viennent ensuite, de l'attente de la place
+/// (`faire_paquet`, `attendre_place`), après l'avis de MSG_ZEROCOPY, comme
+/// chez Linux (`sock_alloc_send_skb`, dans `__ip_append_data`). Avec
+/// MSG_PROBE, rien après la route : Linux ne fait aucun paquet
+/// (`ip_make_skb` rend NULL, `ip_append_data` 0, avant `__ip_append_data`),
+/// donc ni la taille, ni l'erreur en attente, ni l'arrêt ne comptent ;
+/// l'envoi rend sa longueur sans rien envoyer.
 ///
 /// Vers un groupe, la route dit, une fois la source connue, si l'interface
 /// a le groupe et laisse entrer cette source pour `protocole` (RTCF_LOCAL,
@@ -493,7 +494,6 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
                 protocole: u8) -> Result<Depart, i64> {
     const MSG_CONFIRM: u64 = 0x800;
     const MSG_DONTROUTE: u64 = 4;
-    const EPIPE: i64 = 32;
     let options = c.options.unwrap_or(inet.options.ip_options);
     let p = options.places;
     if p.route_source != 0 && destination == format_ipv4::AUCUNE {
@@ -529,15 +529,6 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
     if charge + d.entete() > d.permis(pmtudisc) {
         return Err(trop_gros(s, inet, &d));
     }
-    // (Chez Linux, ces deux refus viennent de l'attente de la place, dans
-    // `__ip_append_data` : des paquets jetés.)
-    let erreur = s.prendre_erreur();
-    if erreur != 0 {
-        return Err(jete(-(erreur as i64)));
-    }
-    if s.reception.verrouiller().arret & socket::ARRET_ECRITURE != 0 {
-        return Err(jete(-EPIPE));
-    }
     Ok(d)
 }
 
@@ -548,7 +539,27 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
 /// (EFAULT), puis ce qu'il demande d'horodater, et sa clé. Chaque refus jette
 /// le paquet (OutDiscards).
 pub fn faire_paquet(s: &Arc<Socket>, d: &Depart, charge: usize, pmtudisc: u8, non_bloquant: bool, delai: Option<u64>,
-                    remplir: impl FnOnce(&mut [u8]) -> Result<(), i64>) -> Result<Paquet, i64> {
+                    zerocopie: usize, remplir: impl FnOnce(&mut [u8]) -> Result<(), i64>) -> Result<Paquet, i64> {
+    // L'avis de MSG_ZEROCOPY d'abord (`__ip_append_data`) : son ENOBUFS n'est
+    // pas un paquet jeté ; une erreur ensuite le rend, et son numéro.
+    let avis = super::zerocopie::preparer(s, zerocopie)?;
+    let r = faire_le_paquet(s, d, charge, pmtudisc, non_bloquant, delai, remplir);
+    match (r, avis) {
+        (Ok(mut p), Some(a)) => {
+            p.poser_avis(a);
+            Ok(p)
+        }
+        (Err(e), Some(a)) => {
+            super::zerocopie::annuler(s, a);
+            Err(e)
+        }
+        (r, None) => r,
+    }
+}
+
+/// Le paquet de `faire_paquet`, sans son avis.
+fn faire_le_paquet(s: &Arc<Socket>, d: &Depart, charge: usize, pmtudisc: u8, non_bloquant: bool, delai: Option<u64>,
+                   remplir: impl FnOnce(&mut [u8]) -> Result<(), i64>) -> Result<Paquet, i64> {
     const ENOBUFS: i64 = 105;
     attendre_place(s, non_bloquant, delai)?;
     morceaux_permis(s, charge, d, pmtudisc)?;

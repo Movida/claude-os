@@ -88,6 +88,13 @@
  *     SCM_TIMESTAMPING_OPT_STATS avec l'heure seulement ; au passage du segment, ce
  *     qui est compté de lui et ce qui n'est pas encore parti ; à l'ACK, ce qui est
  *     livré, et le débit d'avant lui ; rien pour UDP.
+ *   - SO_ZEROCOPY (TCP et UDP, 0 ou 1 ; EOPNOTSUPP ailleurs, même 0 ; la fille de TCP
+ *     l'hérite) et MSG_ZEROCOPY : un numéro par envoi, l'avis de ses pages rendues dans
+ *     la file d'erreurs (COPIED : sur lo, Linux copie aussi), les numéros consécutifs
+ *     fondus en un ; ce qui ne prend pas de numéro (rien d'envoyé, une erreur) ; le
+ *     bouchon d'UDP ; l'avis après SND (UDP) ou après ACK (TCP), avant l'erreur ICMP ;
+ *     sa mémoire dans celle des options (SO_MEMINFO), la limite (ENOBUFS), et
+ *     RLIMIT_MEMLOCK ; la taille du contrôle de sendmsg face à cette mémoire.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -104,6 +111,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
@@ -1900,7 +1908,7 @@ static void horodatages_fille(void)
 struct entree {
     int r, flags, nom, n, sortes[8], heure, ttl, tos, port, stats;
     struct in_pktinfo pkt;
-    unsigned ee_errno, ee_origin, ee_info, ee_data, famille, offender;
+    unsigned ee_errno, ee_origin, ee_type, ee_code, ee_info, ee_data, famille, offender, ctl;
     unsigned char o[256], st[256];
 };
 
@@ -1914,7 +1922,7 @@ static int lire_entree(int s, struct entree *e, size_t place)
     e->r = recvmsg(s, &m, MSG_ERRQUEUE | MSG_DONTWAIT);
     if (e->r < 0)
         return e->r = -errno;
-    e->flags = m.msg_flags, e->nom = m.msg_namelen;
+    e->flags = m.msg_flags, e->nom = m.msg_namelen, e->ctl = m.msg_controllen;
     for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c && e->n < 8; c = CMSG_NXTHDR(&m, c)) {
         unsigned char *d = CMSG_DATA(c);
         int l = c->cmsg_len - CMSG_LEN(0);
@@ -1939,7 +1947,7 @@ static int lire_entree(int s, struct entree *e, size_t place)
         } else if (c->cmsg_level == SOL_IP && c->cmsg_type == IP_RECVERR) {
             uint32_t w[4];
             memcpy(w, d, 16);
-            e->ee_errno = w[0], e->ee_origin = d[4], e->ee_info = w[2], e->ee_data = w[3];
+            e->ee_errno = w[0], e->ee_origin = d[4], e->ee_type = d[5], e->ee_code = d[6], e->ee_info = w[2], e->ee_data = w[3];
             struct sockaddr_in f;
             memcpy(&f, d + 16, sizeof f);
             e->famille = f.sin_family, e->offender = f.sin_addr.s_addr;
@@ -2669,9 +2677,316 @@ static void horodatages_stats_tcp(void)
     close(u), close(r);
 }
 
+#ifndef SO_ZEROCOPY
+#define SO_ZEROCOPY 60
+#endif
+#ifndef MSG_ZEROCOPY
+#define MSG_ZEROCOPY 0x4000000
+#endif
+/* `optmem_max` (net.core.optmem_max), sa valeur de départ chez Linux comme chez nous. */
+#define OPTMEM_MAX 131072
+
+/* Dans notre noyau (son /etc/bonjour.txt), pas sur l'hôte. */
+static int chez_nous;
+
+/* L'avis de MSG_ZEROCOPY des envois `premier` à `dernier` : rien à lire, sans adresse,
+ * IP_RECVERR seul (48 octets), d'origine SO_EE_ORIGIN_ZEROCOPY, COPIED (sur lo, Linux
+ * copie aussi), sans erreur ni émetteur. */
+static int avis_ok(const struct entree *e, unsigned premier, unsigned dernier)
+{
+    return e->r == 0 && e->nom == 0 && e->flags == MSG_ERRQUEUE && e->ctl == 48 && sortes_ok(e, 1, (int[]){S_ERR})
+        && e->ee_errno == 0 && e->ee_origin == 5 && e->ee_type == 0 && e->ee_code == 1 && e->ee_info == premier
+        && e->ee_data == dernier && e->famille == 0;
+}
+
+/* Le processus a-t-il CAP_IPC_LOCK (le bit 14 de CapEff, /proc/self/status) ? Pas
+ * root : sous docker, root ne l'a pas. */
+static int verrouille_ses_pages(void)
+{
+    FILE *f = fopen("/proc/self/status", "r");
+    char ligne[256];
+    unsigned long long cap = 0;
+    while (f && fgets(ligne, sizeof ligne, f))
+        if (sscanf(ligne, "CapEff: %llx", &cap) == 1)
+            break;
+    if (f)
+        fclose(f);
+    return cap >> 14 & 1;
+}
+
+/* sendmsg d'un octet avec `n` octets de contrôle nuls : ce qu'il rend (errno, 0). */
+static int controle(int s, size_t n)
+{
+    static char tampon[OPTMEM_MAX + 1];
+    struct iovec io = {"x", 1};
+    struct msghdr m = {0, 0, &io, 1, tampon, n, 0};
+    return erreur(sendmsg(s, &m, 0));
+}
+
+static void zerocopie_option(void)
+{
+    static const struct { const char *nom; int dom, sorte, proto, prend; } sortes[] = {
+        {"tcp", AF_INET, SOCK_STREAM, 0, 1}, {"udp", AF_INET, SOCK_DGRAM, 0, 1}, {"ping", AF_INET, SOCK_DGRAM, IPPROTO_ICMP, 0},
+        {"unix flux", AF_UNIX, SOCK_STREAM, 0, 0}, {"unix datagrammes", AF_UNIX, SOCK_DGRAM, 0, 0},
+        {"unix paquets", AF_UNIX, SOCK_SEQPACKET, 0, 0}};
+    int ok = 1;
+    for (unsigned i = 0; i < sizeof sortes / sizeof sortes[0]; i++) {
+        int s = socket(sortes[i].dom, sortes[i].sorte, sortes[i].proto);
+        short court = 1;
+        int c = erreur(setsockopt(s, SOL_SOCKET, SO_ZEROCOPY, &court, sizeof court));
+        if (sortes[i].prend)
+            ok &= lire(s, SO_ZEROCOPY) == 0 && poser(s, SO_ZEROCOPY, 1) == 0 && lire(s, SO_ZEROCOPY) == 1 && poser(s, SO_ZEROCOPY, 2) == EINVAL
+                && poser(s, SO_ZEROCOPY, -1) == EINVAL && lire(s, SO_ZEROCOPY) == 1 && poser(s, SO_ZEROCOPY, 0) == 0 && lire(s, SO_ZEROCOPY) == 0;
+        else
+            ok &= lire(s, SO_ZEROCOPY) == 0 && poser(s, SO_ZEROCOPY, 1) == EOPNOTSUPP && poser(s, SO_ZEROCOPY, 0) == EOPNOTSUPP
+                && poser(s, SO_ZEROCOPY, -1) == EOPNOTSUPP && lire(s, SO_ZEROCOPY) == 0;
+        ok &= s >= 0 && c == EINVAL;
+        close(s);
+    }
+    verifier(ok, "SO_ZEROCOPY : TCP et UDP, 0 ou 1 (EINVAL sinon, ou trop court) ; EOPNOTSUPP pour ping et AF_UNIX, meme 0");
+}
+
+static void zerocopie_udp(void)
+{
+    struct sockaddr_in a, b;
+    struct entree e[4];
+    int r = udp_lie(&a), grand = 1 << 20, un = 1;
+    setsockopt(r, SOL_SOCKET, SO_RCVBUF, &grand, sizeof grand);
+    unsigned vide = entree_vide();
+    /* Sans l'option, MSG_ZEROCOPY ne fait rien. */
+    int s = udp_lie(&b);
+    connect(s, (void *)&a, sizeof a);
+    int ok = send(s, "abc", 3, MSG_ZEROCOPY) == 3 && lire_entree(s, &e[0], 64) == -EAGAIN;
+    close(s);
+    s = udp_lie(&b);
+    poser(s, SO_ZEROCOPY, 1);
+    connect(s, (void *)&a, sizeof a);
+    struct pollfd p = {s, POLLIN | POLLOUT | POLLPRI, 0};
+    ok &= send(s, "abc", 3, 0) == 3 && lire_entree(s, &e[0], 64) == -EAGAIN && compteur(s, OPTMEM) == 0;
+    ok &= send(s, "abc", 3, MSG_ZEROCOPY) == 3 && poll(&p, 1, 0) == 1 && p.revents == (POLLOUT | POLLERR)
+        && compteur(s, OPTMEM) == vide && compteur(s, RMEM) == 0;
+    ok &= send(s, "defg", 4, MSG_ZEROCOPY) == 4 && send(s, "h", 1, MSG_ZEROCOPY) == 1 && compteur(s, OPTMEM) == vide;
+    ok &= entrees(s, e, 1) && avis_ok(&e[0], 0, 2) && compteur(s, OPTMEM) == 0 && poll(&p, 1, 0) == 1 && p.revents == POLLOUT;
+    verifier(ok, "MSG_ZEROCOPY UDP : rien sans SO_ZEROCOPY ; un avis par envoi, les numeros consecutifs fondus, POLLERR ; "
+                 "dans la memoire des options, celle d'une entree vide, jusqu'a sa lecture");
+    /* 0 octet prend un numéro, EMSGSIZE et EFAULT non ; le bouchon : l'avis quand le
+     * datagramme part, de tous les numéros de ses envois. */
+    static char gros[70000];
+    ok = send(s, "", 0, MSG_ZEROCOPY) == 0 && erreur(send(s, gros, sizeof gros, MSG_ZEROCOPY)) == EMSGSIZE
+        && erreur(send(s, (void *)8, 10, MSG_ZEROCOPY)) == EFAULT && send(s, "i", 1, MSG_ZEROCOPY) == 1 && entrees(s, e, 1)
+        && avis_ok(&e[0], 3, 4);
+    ok &= send(s, "j", 1, MSG_ZEROCOPY | MSG_MORE) == 1 && lire_entree(s, &e[0], 64) == -EAGAIN
+        && send(s, "k", 1, MSG_ZEROCOPY | MSG_MORE) == 1 && send(s, "l", 1, MSG_ZEROCOPY) == 1 && entrees(s, e, 1) && avis_ok(&e[0], 5, 7)
+        && send(s, "m", 1, MSG_MORE) == 1 && send(s, "n", 1, MSG_ZEROCOPY) == 1 && entrees(s, e, 1) && avis_ok(&e[0], 8, 8)
+        && send(s, "o", 1, MSG_ZEROCOPY | MSG_MORE) == 1 && send(s, "p", 1, 0) == 1 && entrees(s, e, 1) && avis_ok(&e[0], 9, 9);
+    verifier(ok, "MSG_ZEROCOPY UDP : un envoi de 0 octet prend un numero, EMSGSIZE et EFAULT non ; le bouchon, l'avis au depart du datagramme");
+    /* SO_TIMESTAMP : l'heure de la lecture, devant ; vers un port fermé, avec
+     * IP_RECVERR : l'avis, puis l'erreur ICMP. */
+    poser(s, SO_TIMESTAMP, 1);
+    ok = send(s, "q", 1, MSG_ZEROCOPY) == 1 && entrees(s, e, 1) && e[0].r == 0 && e[0].ctl == 80
+        && sortes_ok(&e[0], 2, (int[]){SOL_SOCKET * 1000 + SO_TIMESTAMP, S_ERR}) && e[0].ee_origin == 5 && e[0].ee_info == 10;
+    poser(s, SO_TIMESTAMP, 0);
+    close(r);
+    setsockopt(s, IPPROTO_IP, IP_RECVERR, &un, sizeof un);
+    send(s, "r", 1, MSG_ZEROCOPY);
+    attendre_ms(20);
+    ok &= entrees(s, e, 2) && avis_ok(&e[0], 11, 11) && e[1].ee_origin == 2 && e[1].ee_errno == ECONNREFUSED;
+    close(s);
+    verifier(ok, "MSG_ZEROCOPY UDP : SO_TIMESTAMP devant l'avis ; vers un port ferme, l'avis puis l'erreur ICMP");
+    /* Horodaté (OPT_TSONLY) : SND puis l'avis, à chaque envoi (pas de fusion) ; la
+     * mémoire des options pleine (ENOBUFS), puis rendue à la lecture ; le contrôle de
+     * sendmsg (sock_kmalloc) doit tenir dans ce qu'il en reste, strictement. */
+    r = udp_lie(&a);
+    setsockopt(r, SOL_SOCKET, SO_RCVBUF, &grand, sizeof grand);
+    s = udp_lie(&b);
+    poser(s, SO_ZEROCOPY, 1);
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &grand, sizeof grand);
+    connect(s, (void *)&a, sizeof a);
+    ok = controle(s, 36) == EINVAL && controle(s, OPTMEM_MAX - 1) == EINVAL && controle(s, OPTMEM_MAX) == ENOBUFS;
+    poser(s, TSG_OLD, TSF_TX_SOFTWARE | TSF_SOFTWARE | TSF_OPT_TSONLY);
+    send(s, "a", 1, MSG_ZEROCOPY);
+    send(s, "b", 1, MSG_ZEROCOPY);
+    ok &= entrees(s, e, 4) && horodatage_ok(&e[0], 0, 0, 0) && avis_ok(&e[1], 0, 0) && horodatage_ok(&e[2], 0, 0, 0) && avis_ok(&e[3], 1, 1);
+    int n = 0;
+    unsigned avant = 0;
+    for (; n < 1000; n++) {
+        avant = compteur(s, OPTMEM);
+        if (send(s, "c", 1, MSG_ZEROCOPY) < 0)
+            break;
+    }
+    int refus = errno;
+    unsigned rm = compteur(s, RMEM);
+    ok &= controle(s, 36) == EINVAL && controle(s, 37) == EINVAL && controle(s, OPTMEM_MAX - avant - 1) == EINVAL
+        && controle(s, OPTMEM_MAX - avant) == ENOBUFS;
+    int lues = vider_entrees(s);
+    ok &= refus == ENOBUFS && n > 100 && avant == n * vide && rm == n * vide && lues == 2 * n && compteur(s, OPTMEM) == 0;
+    printf("[linux] options-socket : MSG_ZEROCOPY UDP, la memoire des options pleine apres %d avis (%u octets)\n", n, avant);
+    verifier(ok, "MSG_ZEROCOPY UDP : SND puis l'avis ; la memoire des options pleine, ENOBUFS, rendue a la lecture ; le controle de sendmsg y tient, strictement");
+    /* RLIMIT_MEMLOCK : à 0, ENOBUFS (sauf avec CAP_IPC_LOCK) ; rétablie, l'envoi passe. */
+    poser(s, TSG_OLD, 0);
+    struct rlimit avant_rl, rl;
+    getrlimit(RLIMIT_MEMLOCK, &avant_rl);
+    rl = avant_rl, rl.rlim_cur = 0;
+    setrlimit(RLIMIT_MEMLOCK, &rl);
+    int nul = erreur(send(s, "a", 1, MSG_ZEROCOPY)), sans = send(s, "a", 1, 0) == 1;
+    setrlimit(RLIMIT_MEMLOCK, &avant_rl);
+    ok = (verrouille_ses_pages() ? nul == 0 : nul == ENOBUFS) && sans && send(s, "a", 1, MSG_ZEROCOPY) == 1 && vider_entrees(s) == 1;
+    close(s), close(r);
+    verifier(ok, "MSG_ZEROCOPY : RLIMIT_MEMLOCK a 0, ENOBUFS (sauf avec CAP_IPC_LOCK), retablie, l'envoi passe");
+}
+
+static void zerocopie_tcp(void)
+{
+    struct entree e[4];
+    unsigned vide = entree_vide();
+    struct sockaddr_in t;
+    int l = socket(AF_INET, SOCK_STREAM, 0);
+    lier_tcp(l, &t), listen(l, 1);
+    poser(l, SO_ZEROCOPY, 1);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    poser(c, SO_ZEROCOPY, 1);
+    int ok = erreur(send(c, "x", 1, MSG_ZEROCOPY | MSG_NOSIGNAL)) == EPIPE && lire_entree(c, &e[0], 64) == -EAGAIN;
+    connect(c, (void *)&t, sizeof t);
+    int f = accept(l, NULL, NULL);
+    close(l);
+    ok &= lire(f, SO_ZEROCOPY) == 1 && poser(f, SO_ZEROCOPY, 0) == 0 && send(f, "abc", 3, MSG_ZEROCOPY) == 3;
+    ok &= send(c, "", 0, MSG_ZEROCOPY) == 0 && send(c, "abc", 3, MSG_ZEROCOPY) == 3 && compteur(c, OPTMEM) == vide
+        && send(c, "defg", 4, MSG_ZEROCOPY) == 4 && send(c, "h", 1, MSG_ZEROCOPY) == 1;
+    attendre_ms(20);
+    char trois[8];
+    ok &= lire_entree(f, &e[0], 64) == -EAGAIN && recv(c, trois, sizeof trois, MSG_DONTWAIT) == 3 && compteur(c, OPTMEM) == vide
+        && entrees(c, e, 1) && avis_ok(&e[0], 0, 2) && compteur(c, OPTMEM) == 0 && compteur(c, RMEM) == 0;
+    verifier(ok, "MSG_ZEROCOPY TCP : EPIPE sans connexion, sans numero ; la fille herite SO_ZEROCOPY ; 0 octet, rien ; l'avis a l'ACK, les numeros fondus");
+    /* Horodaté : SCHED, SND, ACK, puis l'avis ; un gros envoi, un numéro ; RLIMIT_MEMLOCK ;
+     * après shutdown, EPIPE sans numéro. */
+    poser(c, TSG_OLD, TSF_TX_SOFTWARE | TSF_TX_SCHED | TSF_TX_ACK | TSF_SOFTWARE | TSF_OPT_TSONLY);
+    send(c, "ij", 2, MSG_ZEROCOPY);
+    attendre_ms(20);
+    ok = entrees(c, e, 4) && horodatage_ok(&e[0], 0, 1, 0) && horodatage_ok(&e[1], 0, 0, 0) && horodatage_ok(&e[2], 0, 2, 0)
+        && avis_ok(&e[3], 3, 3);
+    poser(c, TSG_OLD, 0);
+    static char gros[200000], z[4096];
+    ssize_t g = send(c, gros, sizeof gros, MSG_ZEROCOPY | MSG_DONTWAIT), recu = 0, k;
+    for (int i = 0; i < 200 && recu < 10 + g; i++) {
+        while ((k = recv(f, z, sizeof z, MSG_DONTWAIT)) > 0)
+            recu += k;
+        attendre_ms(10);
+    }
+    attendre_ms(20);
+    ok &= g > 0 && recu == 10 + g && entrees(c, e, 1) && avis_ok(&e[0], 4, 4);
+    struct rlimit avant_rl, rl;
+    getrlimit(RLIMIT_MEMLOCK, &avant_rl);
+    rl = avant_rl, rl.rlim_cur = 0;
+    setrlimit(RLIMIT_MEMLOCK, &rl);
+    int nul = erreur(send(c, "a", 1, MSG_ZEROCOPY));
+    setrlimit(RLIMIT_MEMLOCK, &avant_rl);
+    attendre_ms(20);
+    ok &= (verrouille_ses_pages() ? nul == 0 && entrees(c, e, 1) : nul == ENOBUFS && entrees(c, e, 0));
+    shutdown(c, SHUT_WR);
+    ok &= erreur(send(c, "x", 1, MSG_ZEROCOPY | MSG_NOSIGNAL)) == EPIPE && lire_entree(c, &e[0], 64) == -EAGAIN;
+    close(c), close(f);
+    verifier(ok, "MSG_ZEROCOPY TCP : l'avis apres SCHED, SND et ACK ; un gros envoi, un numero ; RLIMIT_MEMLOCK ; EPIPE apres shutdown, sans numero");
+    /* connect(AF_UNSPEC) jette les files de la connexion (`tcp_disconnect`) : les
+     * avis qui attendaient leur ACK viennent tous, celui des envois dont rien n'est
+     * parti d'abord (la file d'émission jetée avant celle de retransmission), puis
+     * celui des 64 premiers (8 Kio chacun : un avis s'allonge jusqu'à 512 Kio), une
+     * part en vol. Le premier n'est pas COPIED chez Linux (rien n'a été copié de
+     * pages jamais parties) ; il l'est chez nous, qui copions à l'envoi (zerocopie.rs).
+     * Puis, mise à l'écoute, sa fille repart de 0 (`sk_clone_lock` : `sk_zckey`). */
+    int r = socket(AF_INET, SOCK_STREAM, 0), petit = 4096;
+    setsockopt(r, SOL_SOCKET, SO_RCVBUF, &petit, sizeof petit);
+    lier_tcp(r, &t), listen(r, 1);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    poser(c, SO_ZEROCOPY, 1);
+    connect(c, (void *)&t, sizeof t);
+    f = accept(r, NULL, NULL);
+    close(r);
+    static char bloc[8192];
+    unsigned envois = 0;
+    while (envois < 1000 && send(c, bloc, sizeof bloc, MSG_ZEROCOPY | MSG_DONTWAIT) > 0)
+        envois++;
+    attendre_ms(20);
+    struct sockaddr un_spec = {.sa_family = AF_UNSPEC};
+    ok = envois > 1 && connect(c, &un_spec, sizeof un_spec) == 0;
+    attendre_ms(20);
+    ok &= envois > 64 && entrees(c, e, 2) && avis_ok(&e[1], 0, 63) && e[0].ee_code == (unsigned)chez_nous;
+    e[0].ee_code = 1;
+    ok &= avis_ok(&e[0], 64, envois - 1);
+    close(f);
+    struct sockaddr_in b;
+    socklen_t lb = sizeof b;
+    ok &= listen(c, 1) == 0 && getsockname(c, (void *)&b, &lb) == 0;
+    int c2 = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c2, (void *)&b, sizeof b);
+    int f2 = accept(c, NULL, NULL);
+    ok &= send(f2, "z", 1, MSG_ZEROCOPY) == 1;
+    attendre_ms(20);
+    ok &= entrees(f2, e, 1) && avis_ok(&e[0], 0, 0);
+    close(f2), close(c2), close(c);
+    char q[160];
+    snprintf(q, sizeof q, "MSG_ZEROCOPY TCP : connect(AF_UNSPEC), les avis des %u envois en attente viennent ; la fille de l'ecoute qu'elle devient repart de 0", envois);
+    verifier(ok, q);
+    /* Un envoi qui s'ajoute au `sk_buff` en queue, pas encore parti, allonge son avis
+     * (`msg_zerocopy_realloc`) : rien tant que tout n'est pas acquitté, pas même pour
+     * le premier envoi, puis un seul avis. */
+    r = socket(AF_INET, SOCK_STREAM, 0);
+    setsockopt(r, SOL_SOCKET, SO_RCVBUF, &petit, sizeof petit);
+    lier_tcp(r, &t), listen(r, 1);
+    c = socket(AF_INET, SOCK_STREAM, 0);
+    int grand = 65536;
+    setsockopt(c, SOL_SOCKET, SO_SNDBUF, &grand, sizeof grand);
+    poser(c, SO_ZEROCOPY, 1);
+    connect(c, (void *)&t, sizeof t);
+    f = accept(r, NULL, NULL);
+    close(r);
+    ok = 1;
+    for (int i = 0; i < 3; i++)
+        ok &= send(c, bloc, sizeof bloc, MSG_ZEROCOPY | MSG_DONTWAIT) == (ssize_t)sizeof bloc;
+    /* Le premier envoi arrivé tout entier (lu : acquitté) ; le persist de Linux
+     * peut prendre une seconde. */
+    size_t lus = 0;
+    for (int i = 0; i < 1000 && lus < sizeof bloc; i++) {
+        ssize_t k = recv(f, z, sizeof bloc - lus < sizeof z ? sizeof bloc - lus : sizeof z, MSG_DONTWAIT);
+        if (k > 0)
+            lus += k;
+        else
+            attendre_ms(5);
+    }
+    attendre_ms(20);
+    ok &= lus == sizeof bloc && lire_entree(c, &e[0], 64) == -EAGAIN;
+    for (int i = 0; i < 1000 && lus < 3 * sizeof bloc; i++) {
+        ssize_t k = recv(f, z, sizeof z, MSG_DONTWAIT);
+        if (k > 0)
+            lus += k;
+        else
+            attendre_ms(5);
+    }
+    attendre_ms(20);
+    ok &= lus == 3 * sizeof bloc && entrees(c, e, 1) && avis_ok(&e[0], 0, 2);
+    close(c), close(f);
+    verifier(ok, "MSG_ZEROCOPY TCP : un envoi qui s'ajoute au segment pas encore parti allonge son avis, qui vient quand tout est acquitte");
+    /* AF_UNIX et ping : MSG_ZEROCOPY ignoré. */
+    int u[2];
+    socketpair(AF_UNIX, SOCK_STREAM, 0, u);
+    ok = send(u[0], "a", 1, MSG_ZEROCOPY) == 1;
+    close(u[0]), close(u[1]);
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, u);
+    ok &= send(u[0], "a", 1, MSG_ZEROCOPY) == 1;
+    close(u[0]), close(u[1]);
+    int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP);
+    struct sockaddr_in lo = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    char echo[8] = {8, 0, 0, 0, 0, 0, 0, 1};
+    ok &= sendto(p, echo, sizeof echo, MSG_ZEROCOPY, (void *)&lo, sizeof lo) == 8;
+    attendre_ms(20);
+    ok &= lire_entree(p, &e[0], 64) == -EAGAIN;
+    close(p);
+    verifier(ok, "MSG_ZEROCOPY : ignore par AF_UNIX et ping");
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    chez_nous = access("/etc/bonjour.txt", F_OK) == 0;
     cle_tenue_ailleurs = !cle_eteinte();
     if (cle_tenue_ailleurs)
         printf("[linux] options-socket : la cle des horodatages de la machine est tenue par un autre programme : "
@@ -2708,6 +3023,9 @@ int main(void)
     horodatages_purge();
     horodatages_emission_tcp();
     horodatages_stats_tcp();
+    zerocopie_option();
+    zerocopie_udp();
+    zerocopie_tcp();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

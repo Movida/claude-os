@@ -77,9 +77,6 @@ const MSG_ERRQUEUE: u64 = 0x2000;
 const MSG_WAITFORONE: u64 = 0x10000;
 const MSG_CMSG_COMPAT: u64 = 0x8000_0000;
 const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
-/// La plus grande place de messages de contrôle d'un envoi (`optmem_max`,
-/// ce que `sock_kmalloc` accepte d'allouer pour une socket).
-const OPTMEM_MAX: u64 = 131_072;
 
 // Les niveaux et les options.
 const SOL_IP: i32 = 0;
@@ -155,6 +152,7 @@ const SO_BUSY_POLL_BUDGET: i32 = 70;
 const SO_NETNS_COOKIE: i32 = 71;
 const SO_TXREHASH: i32 = 74;
 const SO_DEVMEM_DONTNEED: i32 = 80;
+const SO_ZEROCOPY: i32 = 60;
 /// La réception : l'horodatage, sous ses quatre formes
 /// (_OLD : `timeval` et `timespec` de 64 bits sur x86_64, comme les _NEW ; seul
 /// le numéro du message de contrôle les distingue), les pertes, la marque et
@@ -956,13 +954,13 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let e = s.prendre_en_file().ok_or(-EAGAIN)?;
         let total = e.donnees.longueur();
         let copie = copier_vers_morceaux(morceaux, e.donnees.donnees())?;
-        // Un horodatage n'a pas d'adresse à rendre (`ipv4_datagram_support_addr` :
+        // Un horodatage, un avis de MSG_ZEROCOPY, n'ont pas d'adresse à rendre (`ipv4_datagram_support_addr` :
         // ni ICMP, ni locale, ni port) ; son IP_PKTINFO dit l'adresse locale, sa
         // source (`ipv4_datagram_support_cmsg` la pose), quand celui d'une erreur
         // ICMP dit 0.0.0.0 (rien ne l'a préparé).
         let horodatage = e.origine == socket::ORIGINE_HORODATAGE;
         let recu = socket::Recu {
-            vide: horodatage, longueur: copie, source: e.adresse, port: e.port, destination: e.arrivee,
+            vide: horodatage || e.origine == socket::ORIGINE_ZEROCOPIE, longueur: copie, source: e.adresse, port: e.port, destination: e.arrivee,
             pktinfo: (e.interface, if horodatage { e.emetteur } else { [0; 4] }), coupe: copie < total,
             ip: e.controle(s.tsflags.load(Ordering::Relaxed)), contexte: Default::default(), pertes: 0,
         };
@@ -1294,8 +1292,11 @@ fn lire_controle_unix(c: &[u8]) -> Result<unix::Scm, i64> {
 }
 
 /// Envoie un `msghdr` déjà lu (`____sys_sendmsg`) : ses messages de
-/// contrôle copiés (plus d'`optmem_max`, 128 Kio : ENOBUFS, avant d'allouer
-/// quoi que ce soit, comme `sock_kmalloc` ; EFAULT), puis l'envoi.
+/// contrôle copiés (plus de 36 octets, la place que Linux a sur sa pile,
+/// passent par `sock_kmalloc` : avec la mémoire des options de la socket,
+/// ils doivent rester sous `optmem_max`, strictement, sinon ENOBUFS, avant
+/// d'allouer quoi que ce soit ; plus qu'INT_MAX aussi ; EFAULT), puis
+/// l'envoi.
 fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
     let nom = if m.longueur_nom > 0 {
         match copier_adresse(m.nom, m.longueur_nom as u64) {
@@ -1307,7 +1308,11 @@ fn envoyer_message(o: &FichierTenu, m: &Message, drapeaux: u64) -> i64 {
     };
     let mut scm = unix::Scm::default();
     let controle = if m.longueur_controle > 0 {
-        if m.longueur_controle > OPTMEM_MAX {
+        const SUR_LA_PILE: u64 = 36;
+        let options = o.socket().memoire_des_options() as u64;
+        if m.longueur_controle > i32::MAX as u64
+            || (m.longueur_controle > SUR_LA_PILE && options + m.longueur_controle >= socket::OPTMEM_MAX as u64)
+        {
             return -ENOBUFS;
         }
         let Ok(mut c) = faillible::remplie(m.longueur_controle as usize, 0) else { return -ENOMEM };
@@ -2007,6 +2012,18 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
                 return Err(-EINVAL);
             }
             inet.options.busy_poll_budget = v as u16;
+            return Ok(());
+        }
+        // TCP et UDP seulement (EOPNOTSUPP, même pour 0 : ping, AF_UNIX), 0 ou
+        // 1 (EINVAL) ; ce qu'il fait : zerocopie.rs.
+        SO_ZEROCOPY => {
+            if !matches!(s.protocole, Protocole::Tcp | Protocole::Udp) {
+                return Err(-EOPNOTSUPP);
+            }
+            if !(0..=1).contains(&v) {
+                return Err(-EINVAL);
+            }
+            s.poser_drapeau(socket::ZEROCOPIE, oui);
             return Ok(());
         }
         // TCP seulement ; -1 : la valeur du système (net.core.txrehash, 1).
@@ -2788,7 +2805,7 @@ fn options_multidiffusion(s: &Socket, option: i32, valeur: u64, longueur: i32) -
             if n < entete {
                 return Err(-EINVAL);
             }
-            if n as u64 > OPTMEM_MAX {
+            if n > socket::OPTMEM_MAX {
                 return Err(-ENOBUFS);
             }
             lisible(valeur, n)?;
@@ -3164,7 +3181,7 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
 ///     avance ;
 ///   - WMEM_QUEUED : la file d'envoi de TCP (0 ailleurs) ;
 ///   - OPTMEM : la mémoire des options (`sk_omem_alloc`) : les adhésions à des
-///     groupes et leurs listes de sources ;
+///     groupes et leurs listes de sources, les avis de MSG_ZEROCOPY ;
 ///   - BACKLOG : la file `backlog` de TCP ;
 ///   - DROPS : ce qui a été jeté en arrivant pour elle (`Socket::pertes`).
 fn memoire_de_la_socket(s: &Socket) -> [usize; 9] {
@@ -3181,7 +3198,7 @@ fn memoire_de_la_socket(s: &Socket) -> [usize; 9] {
         Protocole::Tcp => (tcp::rcvbuf(s), tcp::sndbuf(s)),
         _ => (s.rcvbuf.load(Ordering::Relaxed), s.sndbuf.load(Ordering::Relaxed)),
     };
-    let options = if s.protocole == Protocole::Unix { 0 } else { s.adhesions.verrouiller().memoire() };
+    let options = s.memoire_des_options();
     [reception, rcvbuf as usize, envoyes, sndbuf as usize, 0, file_envoi, options, backlog, s.pertes.load(Ordering::Relaxed) as usize]
 }
 
@@ -3305,6 +3322,7 @@ fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16]
         SO_RCVMARK => entier(&mut o, s.drapeau(socket::RCVMARK) as i32),
         SO_RCVPRIORITY => entier(&mut o, s.drapeau(socket::RCVPRIORITY) as i32),
         SO_SELECT_ERR_QUEUE => entier(&mut o, s.drapeau(socket::SELECT_ERR_QUEUE) as i32),
+        SO_ZEROCOPY => entier(&mut o, s.drapeau(socket::ZEROCOPIE) as i32),
         // Les drapeaux, puis `bind_phc` (0 : BIND_PHC ne passe jamais) ; la forme
         // _NEW ne les dit que si la dernière forme posée était une _NEW (sinon des
         // zéros, sans erreur).

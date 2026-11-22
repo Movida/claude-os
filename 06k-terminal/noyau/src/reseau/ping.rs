@@ -153,7 +153,7 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     // MSG_MORE n'y change rien : ping pousse aussitôt ce qu'il a ajouté
     // (`ping_v4_push_pending_frames`).
     let numero = u16::from_be_bytes([entete[6], entete[7]]);
-    let p = datagramme::faire_paquet(s, &d, longueur, pmtudisc, drapeaux & MSG_DONTWAIT != 0, delai, |m| {
+    let p = datagramme::faire_paquet(s, &d, longueur, pmtudisc, drapeaux & MSG_DONTWAIT != 0, delai, 0, |m| {
         remplir(icmp::ENTETE, &mut m[icmp::ENTETE..])?;
         icmp::ecrire(m, &Icmp { genre: icmp::ECHO, code: 0, reste: icmp::reste_echo(ident, numero) });
         Ok(())

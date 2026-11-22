@@ -166,11 +166,19 @@ pub enum Rejet {
     Memoire,
 }
 
+/// La mémoire des options d'une socket (`optmem_max`, net.core) : ce que
+/// `sock_kmalloc` et `sock_omalloc` lui laissent prendre en tout (ses
+/// adhésions, ses avis de MSG_ZEROCOPY, ses messages de contrôle d'un
+/// envoi le temps de les lire).
+pub const OPTMEM_MAX: usize = 131_072;
+
 // D'où vient une erreur de la file d'erreurs (SO_EE_ORIGIN_*).
 pub const ORIGINE_LOCALE: u8 = 1;
 pub const ORIGINE_ICMP: u8 = 2;
 /// Un horodatage d'émission (horodatage.rs).
 pub const ORIGINE_HORODATAGE: u8 = 4;
+/// L'avis d'envois de MSG_ZEROCOPY (zerocopie.rs).
+pub const ORIGINE_ZEROCOPIE: u8 = 5;
 
 /// Une erreur dans la file d'erreurs (la `sk_error_queue` de Linux, avec
 /// IP_RECVERR ; ou l'entrée d'un horodatage d'émission, avec
@@ -267,6 +275,32 @@ impl ErreurEnFile {
         })
     }
 
+    /// L'avis de MSG_ZEROCOPY des envois `premier` à `premier + nombre - 1`
+    /// (`__msg_zerocopy_callback`) : errno 0, ee_info et ee_data ces deux
+    /// numéros, et toujours SO_EE_CODE_ZEROCOPY_COPIED (zerocopie.rs) ;
+    /// ni adresse, ni octets, ni place dans SO_RCVBUF (Linux le met en file
+    /// sans `sock_queue_err_skb` : il compte dans la mémoire des options).
+    pub fn avis(premier: u32, nombre: u32) -> ErreurEnFile {
+        const COPIE: u8 = 1;
+        ErreurEnFile {
+            errno: 0, origine: ORIGINE_ZEROCOPIE, genre: 0, code: COPIE, info: premier, ee_data: premier.wrapping_add(nombre - 1),
+            adresse: [0; 4], port: 0, emetteur: [0; 4], interface: 0, arrivee: [0; 4], entete: EnteteRecu::AUCUN, somme: 0,
+            horodatage: 0, donnees: Paquet::rien(), taille: 0, stats: false,
+        }
+    }
+
+    /// L'avis `self`, la queue de la file, prolonge-t-il ses numéros des
+    /// `nombre` qui commencent à `premier` (`skb_zerocopy_notify_extend` :
+    /// ils le suivent, et l'intervalle tient sur 32 bits) ? Alors c'est fait.
+    fn prolonger(&mut self, premier: u32, nombre: u32) -> bool {
+        let longueur = self.ee_data.wrapping_sub(self.info) as u64 + 1 + nombre as u64;
+        if longueur >= 1 << 32 || premier != self.ee_data.wrapping_add(1) {
+            return false;
+        }
+        self.ee_data = self.ee_data.wrapping_add(nombre);
+        true
+    }
+
     /// Ce que diront ses messages de contrôle IP, pour une socket de
     /// drapeaux SO_TIMESTAMPING `tsflags` (`ipv4_datagram_support_cmsg`) :
     /// une erreur venue d'ICMP, toujours ; un horodatage d'émission, avec
@@ -318,6 +352,10 @@ pub struct Reception {
     pub erreur: i32,
     /// ARRET_LECTURE, ARRET_ECRITURE.
     pub arret: u8,
+    /// Les avis de MSG_ZEROCOPY faits et pas encore livrés (zerocopie.rs) :
+    /// la file d'erreurs leur garde chacun une place, pour qu'aucun ne se
+    /// perde faute de mémoire (Linux a fait d'avance le `sk_buff` de l'avis).
+    pub avis_en_vol: usize,
 }
 
 /// Les options d'une socket que lisent ses appels (sous le `Mutex`).
@@ -478,6 +516,9 @@ pub const INQ: u16 = 128;
 pub const SELECT_ERR_QUEUE: u16 = 256;
 /// La socket compte dans la clé des horodatages (`HORODATAGES`).
 pub const CLE_HORODATAGE: u16 = 512;
+/// SO_ZEROCOPY (SOCK_ZEROCOPY) : MSG_ZEROCOPY y vaut quelque chose
+/// (zerocopie.rs) ; TCP et UDP seulement.
+pub const ZEROCOPIE: u16 = 1024;
 
 /// Les drapeaux de SO_TIMESTAMPING que la réception regarde (`sk_tsflags`,
 /// include/uapi/linux/net_tstamp.h) : RX_SOFTWARE fait prendre l'heure
@@ -612,8 +653,10 @@ impl Socket {
     }
 
     /// La fille `self` d'une écoute de TCP reprend ce que `sk_clone_lock` copie
-    /// de l'écoute : ses drapeaux de réception (SO_TIMESTAMP, SO_RXQ_OVFL...),
-    /// SO_TIMESTAMPING et le compteur de ses clés ; elle compte à son tour dans la clé des
+    /// de l'écoute : ses drapeaux de réception (SO_TIMESTAMP, SO_RXQ_OVFL...,
+    /// et SO_ZEROCOPY), SO_TIMESTAMPING et le compteur de ses clés (pas celui
+    /// de MSG_ZEROCOPY, qui repart de 0 : `sk_clone_lock`, même quand l'écoute
+    /// a été une connexion qui en a envoyé) ; elle compte à son tour dans la clé des
     /// horodatages si l'écoute y comptait (`net_enable_timestamp` pour la
     /// copie : sans cela, sa fermeture ôterait de la clé une part qu'elle n'y
     /// avait pas mise).
@@ -729,6 +772,12 @@ pub struct Socket {
     /// (`horodatage::demander_datagramme`) ; pour TCP, le numéro de séquence
     /// d'où partent les clés.
     pub cle_emission: AtomicU32,
+    /// Le numéro du prochain envoi de MSG_ZEROCOPY (`sk_zckey`, zerocopie.rs).
+    pub cle_zerocopie: AtomicU32,
+    /// Ce que tiennent ses avis de MSG_ZEROCOPY, faits et pas encore lus,
+    /// dans la mémoire de ses options (leur part de `sk_omem_alloc`,
+    /// zerocopie.rs).
+    pub memoire_avis: AtomicUsize,
     /// L'heure du dernier datagramme lu (`sk_stamp`), que rend SIOCGSTAMP
     /// (appels_reseau.rs, `heure_du_dernier` ; la lecture l'écrit :
     /// `heure_lue`, `controle_udp`) : HORODATAGE_AUCUN tant que rien n'a été
@@ -817,7 +866,7 @@ impl Socket {
             numero,
             protocole, sorte, proto, uid,
             attente,
-            reception: Verrou::new(Reception { file: VecDeque::new(), erreurs: VecDeque::new(), octets: 0, erreur: 0, arret: 0 }),
+            reception: Verrou::new(Reception { file: VecDeque::new(), erreurs: VecDeque::new(), octets: 0, erreur: 0, arret: 0, avis_en_vol: 0 }),
             appels: Mutex::new(Inet {
                 lie: false, adresse: [0; 4], port: 0, port_choisi: false, adresse_choisie: false, connecte: false,
                 distante: [0; 4], port_distant: 0, source: [0; 4], route_gardee: None, identifiant: 0,
@@ -833,6 +882,8 @@ impl Socket {
             drapeaux: AtomicU16::new(0),
             tsflags: AtomicU32::new(0),
             cle_emission: AtomicU32::new(0),
+            cle_zerocopie: AtomicU32::new(0),
+            memoire_avis: AtomicUsize::new(0),
             horodatage: AtomicI64::new(HORODATAGE_AUCUN),
             processeur: AtomicI32::new(-1),
             connectee: AtomicBool::new(false),
@@ -958,7 +1009,8 @@ impl Socket {
     /// Met l'erreur `e` dans la file d'erreurs, s'il y a la place
     /// (`sock_queue_err_skb` : elle compte avec les datagrammes, ou avec ce
     /// que la connexion de TCP a reçu, et doit laisser de la place sous
-    /// SO_RCVBUF), et réveille. false : jetée.
+    /// SO_RCVBUF), et réveille. false : jetée. Elle laisse derrière elle la
+    /// place des avis de MSG_ZEROCOPY en vol (`Reception::avis_en_vol`).
     pub fn mettre_en_file(&self, e: ErreurEnFile) -> bool {
         // (`sock_queue_err_skb` : `sk_error_report`.)
         let raison = crate::asynchrone::Raison::Erreur;
@@ -970,15 +1022,49 @@ impl Socket {
                 Some(c) => c.admet(r.octets, taille, rcvbuf),
                 None => r.octets + taille < rcvbuf,
             };
-            if !admise || r.erreurs.ajouter_derriere(e).is_err() {
+            let place = r.avis_en_vol + 1;
+            if !admise || r.erreurs.try_reserve(place).is_err() {
                 return false;
             }
+            r.erreurs.ajouter_derriere_dans_la_place(e);
             r.octets += taille;
             self.compter_erreurs(r.octets);
         }
         self.file_de_sondage().reveiller(POLLERR, 1);
         self.liste_async().evenement(raison);
         true
+    }
+
+    /// Met en file l'avis de MSG_ZEROCOPY des envois `premier` à `premier +
+    /// nombre - 1` (zerocopie.rs, `livrer`) : fondu dans l'avis en queue de
+    /// file s'il le prolonge, sinon une entrée neuve, à la place que son
+    /// `preparer` a gardée ; puis le réveil, même fondu (`sk_error_report`).
+    /// Vrai : une entrée neuve (sa mémoire reste comptée jusqu'à sa lecture).
+    pub fn mettre_avis_en_file(&self, premier: u32, nombre: u32) -> bool {
+        let neuve = {
+            let mut r = self.reception.verrouiller();
+            r.avis_en_vol = r.avis_en_vol.saturating_sub(1);
+            if r.erreurs.back_mut().is_some_and(|q| q.origine == ORIGINE_ZEROCOPIE && q.prolonger(premier, nombre)) {
+                false
+            } else if r.erreurs.len() < r.erreurs.capacity() || r.erreurs.try_reserve(1).is_ok() {
+                r.erreurs.ajouter_derriere_dans_la_place(ErreurEnFile::avis(premier, nombre));
+                true
+            } else {
+                // La place gardée manque (rien ne la reprend pourtant) : perdu.
+                false
+            }
+        };
+        self.file_de_sondage().reveiller(POLLERR, 1);
+        self.liste_async().evenement(crate::asynchrone::Raison::Erreur);
+        neuve
+    }
+
+    /// La mémoire de ses options (`sk_omem_alloc`, SO_MEMINFO) : ses
+    /// adhésions à des groupes et leurs listes de sources, et ses avis de
+    /// MSG_ZEROCOPY.
+    pub fn memoire_des_options(&self) -> usize {
+        let adhesions = if self.protocole == Protocole::Unix { 0 } else { self.adhesions.verrouiller().memoire() };
+        adhesions + self.memoire_avis.load(Ordering::Relaxed)
     }
 
     /// La file où attendent `poll` et epoll : celle du flux pour TCP (où
@@ -1000,6 +1086,9 @@ impl Socket {
             let e = r.erreurs.pop_front()?;
             r.octets = r.octets.saturating_sub(e.taille);
             self.compter_erreurs(r.octets);
+            if e.origine == ORIGINE_ZEROCOPIE {
+                super::zerocopie::lu(self);
+            }
             let suivante_icmp = r.erreurs.front().filter(|s| s.origine == ORIGINE_ICMP).map(|s| s.errno);
             if let Some(errno) = suivante_icmp {
                 r.erreur = errno;
@@ -1016,12 +1105,13 @@ impl Socket {
     }
 
     /// Vide la file d'erreurs (IP_RECVERR remis à 0, `skb_errqueue_purge`),
-    /// sauf les horodatages d'émission : ils ne viennent pas d'IP_RECVERR
+    /// sauf les horodatages d'émission et les avis de MSG_ZEROCOPY : ils ne
+    /// viennent pas d'IP_RECVERR
     /// (mesuré : l'entrée SND reste, l'erreur ICMP part, et l'erreur en
     /// attente aussi, SO_ERROR la rend encore).
     pub fn vider_erreurs(&self) {
         let mut r = self.reception.verrouiller();
-        let gardee = |e: &ErreurEnFile| e.origine == ORIGINE_HORODATAGE;
+        let gardee = |e: &ErreurEnFile| e.origine == ORIGINE_HORODATAGE || e.origine == ORIGINE_ZEROCOPIE;
         let rendus: usize = r.erreurs.iter().filter(|e| !gardee(e)).map(|e| e.taille).sum();
         r.octets = r.octets.saturating_sub(rendus);
         r.erreurs.retain(gardee);

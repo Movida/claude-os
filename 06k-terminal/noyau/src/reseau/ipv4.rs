@@ -841,10 +841,10 @@ fn fragmenter(c: Chemin, e: &Envoi, options: &[u8], mut p: Paquet) {
     ipv4::options_de_fragment(suite);
     let mut debut = 0;
     let mut demande = p.prendre_demande();
-    let donnees = p.donnees();
-    while debut < donnees.len() {
-        let reste = donnees.len() - debut;
-        let longueur = ipv4::taille_du_fragment(donnees.len(), debut, e.mtu as usize, n);
+    let total = p.donnees().len();
+    while debut < total {
+        let reste = total - debut;
+        let longueur = ipv4::taille_du_fragment(total, debut, e.mtu as usize, n);
         let Some(mut q) = Paquet::vide(longueur) else { return MIB.ip(Ip::FragFails) };
         // La marque et la priorité du paquet (`ip_copy_metadata`).
         q.poser_contexte(p.contexte());
@@ -858,8 +858,16 @@ fn fragmenter(c: Chemin, e: &Envoi, options: &[u8], mut p: Paquet) {
         if let Some(d) = demande.take() {
             q.poser_demande(d);
         }
+        // L'avis de MSG_ZEROCOPY, au dernier : Linux en donne une référence à
+        // chaque morceau, il vient quand le dernier est fini (zerocopie.rs).
+        // Jusque-là, `p` le garde (fini avec lui s'il est jeté avant).
+        if longueur == reste
+            && let Some(a) = p.prendre_avis()
+        {
+            q.poser_avis(a);
+        }
         let Some(o) = q.ajouter_fin(longueur) else { return MIB.ip(Ip::FragFails) };
-        o.copy_from_slice(&donnees[debut..debut + longueur]);
+        o.copy_from_slice(&p.donnees()[debut..debut + longueur]);
         envoyer(c, e, if debut == 0 { options } else { suite }, q, (debut / 8) as u16, longueur < reste);
         MIB.ip(Ip::FragCreates);
         debut += longueur;

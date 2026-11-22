@@ -55,6 +55,7 @@ use super::horodatage;
 use super::ipv4;
 use super::paquet::{Paquet, Retenue};
 use super::snmp::MIB;
+use super::zerocopie::{self, Avis};
 use super::socket::{self, Protocole, Socket};
 use crate::attente::{FileAttente, Possede, Possession, Sommeil};
 use crate::faillible::{self, FileFaillible, VecFaillible};
@@ -512,6 +513,28 @@ pub struct Partie {
     /// horodatage.rs), dans l'ordre de leur dernier octet, jusqu'à ce que
     /// l'ACK passe celui-ci (`DemandeTx`).
     demandes: VecDeque<DemandeTx>,
+    /// Les avis de MSG_ZEROCOPY des envois (zerocopie.rs), dans l'ordre de
+    /// leurs octets (`AvisGarde`) : Linux lâche les pages d'un envoi quand
+    /// les `sk_buff` qui les tiennent sont acquittés, ou jetés avec les files
+    /// de la connexion.
+    avis: VecDeque<AvisGarde>,
+}
+
+/// Un avis de MSG_ZEROCOPY gardé par la connexion jusqu'à ce que ses pages
+/// soient lâchées : les numéros du premier et du dernier octet de ses envois
+/// (`debut`, `dernier` : l'ACK de celui-ci le fait venir ; celui-là dit, quand
+/// les files sont jetées, s'il est encore tout entier à partir).
+struct AvisGarde {
+    debut: u32,
+    dernier: u32,
+    avis: Box<Avis>,
+}
+
+/// L'avis de MSG_ZEROCOPY d'un envoi de TCP (`Partie::avis_de_l_envoi`) : un
+/// neuf, ou la suite de celui que garde la queue (zerocopie.rs, `suite`).
+enum AvisEnvoi {
+    Neuf(Box<Avis>),
+    Suite(Box<Avis>),
 }
 
 /// La demande d'horodatage d'un envoi de TCP (`tcp_tx_timestamp`), que la
@@ -834,6 +857,11 @@ impl Partie {
         if !self.demandes.is_empty() && !matches!(&self.mode, Mode::Connexion(t) if t.etat() != Etat::Fermee) {
             self.demandes = VecDeque::new();
         }
+        // Ses avis de MSG_ZEROCOPY, eux, viennent (les pages lâchées).
+        if !self.avis.is_empty() && !matches!(&self.mode, Mode::Connexion(t) if t.etat() != Etat::Fermee) {
+            let nxt = if let Mode::Connexion(t) = &self.mode { Some(t.numeros().1) } else { None };
+            jeter_les_avis(&mut self.avis, nxt);
+        }
         self.apres_l_etat();
         self.compter();
     }
@@ -871,6 +899,69 @@ impl Partie {
         }
         // Plus de mémoire : la demande est perdue (aucune entrée ne viendra).
         let _ = self.demandes.ajouter_derriere(DemandeTx { dernier, tx, debut, depart, socket: Arc::downgrade(s) });
+    }
+
+    /// L'avis d'un envoi de `taille` octets de la socket `s` avec
+    /// MSG_ZEROCOPY (`tcp_sendmsg_locked`) : la suite de l'avis gardé en queue
+    /// quand le `sk_buff` en queue de la file d'émission le tient
+    /// (`msg_zerocopy_realloc(sk, size, skb_zcopy(tcp_write_queue_tail(sk)))`,
+    /// zerocopie.rs), sinon un neuf ; None : sans SO_ZEROCOPY, ou 0 octet.
+    /// Notre file d'émission n'a pas de `sk_buff` : l'avis en queue tient le
+    /// sien quand son dernier octet est le dernier écrit, et pas encore parti
+    /// (une part du `sk_buff` peut être partie, l'avis le suit chez Linux
+    /// aussi). L'écart : un envoi sans MSG_ZEROCOPY qui s'est ajouté au même
+    /// `sk_buff` le laisse allongeable chez Linux ; chez nous, l'envoi
+    /// suivant fait un avis neuf (rien ne le promet : la documentation dit
+    /// que des avis peuvent se fondre, pas quand).
+    fn avis_de_l_envoi(&self, s: &Arc<Socket>, taille: usize) -> Result<Option<AvisEnvoi>, i64> {
+        if let Mode::Connexion(t) = &self.mode
+            && let Some(g) = self.avis.back()
+            && g.dernier == t.fin_des_donnees().wrapping_sub(1)
+            && !itcp::avant(g.dernier, t.numeros().1)
+            && let Some(suite) = zerocopie::suite(s, &g.avis, taille)?
+        {
+            return Ok(Some(AvisEnvoi::Suite(suite)));
+        }
+        Ok(zerocopie::preparer(s, taille)?.map(AvisEnvoi::Neuf))
+    }
+
+    /// L'envoi de MSG_ZEROCOPY qui vient d'écrire `fait` octets, jusqu'au bout
+    /// des données, garde son avis `a` jusqu'à l'ACK de son dernier octet
+    /// (`avis`) ; une suite se fond dans l'avis en queue, qui va désormais
+    /// jusque-là. Tout
+    /// déjà acquitté, ou la connexion finie (ses files jetées) : il vient tout
+    /// de suite ; plus de mémoire pour le garder aussi (plus tôt que chez
+    /// Linux, mais pas perdu).
+    fn garder_avis(&mut self, a: AvisEnvoi, fait: usize) {
+        let a = match a {
+            AvisEnvoi::Neuf(a) => a,
+            AvisEnvoi::Suite(suite) => {
+                let dernier = match &self.mode {
+                    Mode::Connexion(t) => t.fin_des_donnees().wrapping_sub(1),
+                    _ => 0,
+                };
+                let (d, q) = self.avis.back_mut().map(|g| (&mut g.dernier, &mut *g.avis)).unzip();
+                match zerocopie::fondre(q, suite) {
+                    Ok(()) => {
+                        if let Some(d) = d {
+                            *d = dernier;
+                        }
+                        return;
+                    }
+                    Err(a) => a,
+                }
+            }
+        };
+        if let Mode::Connexion(t) = &self.mode
+            && t.etat() != Etat::Fermee
+            && itcp::apres(t.fin_des_donnees(), t.numeros().0)
+            && self.avis.try_reserve(1).is_ok()
+        {
+            let fin = t.fin_des_donnees();
+            self.avis.ajouter_derriere_dans_la_place(AvisGarde { debut: fin.wrapping_sub(fait as u32), dernier: fin.wrapping_sub(1), avis: a });
+        } else {
+            zerocopie::finir(a);
+        }
     }
 
     /// La mémoire de la socket, comptée dans `MEMOIRE` (la différence avec
@@ -1066,6 +1157,7 @@ impl Partie {
     /// port choisi par `bind` est gardé (SOCK_BINDPORT_LOCK), lié de nouveau
     /// à son adresse.
     fn redevenir_neuve(&mut self, s: &Arc<Socket>) {
+        let nxt = if let Mode::Connexion(t) = &self.mode { Some(t.numeros().1) } else { None };
         // Ce que les tampons sont devenus reste (`tcp_disconnect` n'y touche pas), et ce
         // que la connexion laisse du MSS.
         if let Mode::Connexion(t) = &self.mode {
@@ -1089,6 +1181,9 @@ impl Partie {
         self.desarmer();
         self.mode = Mode::Neuve;
         self.demandes = VecDeque::new();
+        // Ses files jetées (`tcp_write_queue_purge`, de `tcp_disconnect`) lâchent les pages de
+        // ses envois de MSG_ZEROCOPY : leurs avis viennent, comme pour une connexion finie (`apres`).
+        jeter_les_avis(&mut self.avis, nxt);
         self.hors_table = false;
         self.etat_socket = EtatSocket::NonConnectee;
         // L'adresse de `bind` reste (SOCK_BINDADDR_LOCK), avec ou sans son port. Un port qui
@@ -1460,6 +1555,42 @@ fn acquitter_les_demandes(demandes: &mut VecDeque<DemandeTx>, una: u32, t: &Tcb<
     }
 }
 
+/// Les avis de MSG_ZEROCOPY dont l'ACK vient de passer le dernier octet :
+/// les pages lâchées (zerocopie.rs), après les entrées ACK des horodatages
+/// (`tcp_ack_tstamp`, avant de libérer le `sk_buff`). À part, comme
+/// `recevoir_avec_demandes`.
+#[inline(never)]
+fn acquitter_les_avis(avis: &mut VecDeque<AvisGarde>, t: &Tcb<Paquet>) {
+    let una = t.numeros().0;
+    while avis.front().is_some_and(|g| itcp::avant(g.dernier, una)) {
+        if let Some(g) = avis.pop_front() {
+            zerocopie::finir(g.avis);
+        }
+    }
+}
+
+/// Les files de la connexion jetées (`tcp_write_queue_purge`) : la file
+/// d'émission d'abord, puis celle de retransmission, chaque avis venant quand
+/// son dernier `sk_buff` est libéré. Celui dont rien n'est parti (son premier
+/// octet à SND.NXT `nxt` ou après) vient donc avant ceux qui ont une part en
+/// vol (mesuré : [64, 92], puis [0, 63] ; dans cet ordre, la file d'erreurs ne
+/// les fond pas). Sans `nxt` (plus de connexion), dans l'ordre des octets.
+fn jeter_les_avis(avis: &mut VecDeque<AvisGarde>, nxt: Option<u32>) {
+    let mut i = 0;
+    while i < avis.len() {
+        if nxt.is_some_and(|n| !itcp::avant(avis[i].debut, n))
+            && let Some(g) = avis.remove(i)
+        {
+            zerocopie::finir(g.avis);
+        } else {
+            i += 1;
+        }
+    }
+    for g in core::mem::take(avis) {
+        zerocopie::finir(g.avis);
+    }
+}
+
 /// La connexion `t`, qui a des `demandes` d'horodatage, reçoit le segment
 /// d'en-tête `h` et de charge `charge`, de TTL `ttl` : ce que voudront les
 /// entrées ACK (`avant_l_ack`), le segment, puis les demandes qu'il a passées
@@ -1676,6 +1807,9 @@ impl Partie {
                     t.recevoir(&s.entete, s.charge, maintenant());
                 } else {
                     recevoir_avec_demandes(&mut self.demandes, t, &s.entete, s.charge, recu.ttl);
+                }
+                if !self.avis.is_empty() {
+                    acquitter_les_avis(&mut self.avis, t);
                 }
                 if t.lisibles_dans_le_flux() > avant {
                     self.horodatage = heure;
@@ -2348,7 +2482,7 @@ pub fn nouvelle(numero: u64) -> Option<(Possession<Partie>, Arc<CompteReception>
     let partie = Partie {
         numero, mode: Mode::Neuve, adresses: Adresses::default(), identifiant: 0, orpheline: false, hors_table: false,
         options: OptionsTcp::DEFAUT, etat_socket: EtatSocket::NonConnectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
-        compte: compte.clone(), route_oubliee: false, horodatage: 0, demandes: VecDeque::new(),
+        compte: compte.clone(), route_oubliee: false, horodatage: 0, demandes: VecDeque::new(), avis: VecDeque::new(),
     };
     let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
     Some((Possession::new(partie, premier), compte))
@@ -2745,7 +2879,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 // `inet_csk_delack_init`) : la fille n'attend pas de données pour naître deux fois.
                 options: OptionsTcp { defer_accept: 0, quickack: true, ip_options, interface, ..p.options },
                 etat_socket: EtatSocket::Connectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
-                compte: compte.clone(), route_oubliee: false, horodatage, demandes: VecDeque::new(),
+                compte: compte.clone(), route_oubliee: false, horodatage, demandes: VecDeque::new(), avis: VecDeque::new(),
             };
             let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
             let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
@@ -2872,6 +3006,9 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, tx: u32, mut rem
     let delai = s.appels.verrouiller().options.sndtimeo;
     let echeance = delai.map(|d| crate::temps::ns_monotone().saturating_add(d));
     let mut g = flux(s).posseder();
+    // L'avis de MSG_ZEROCOPY d'abord, avant même l'état de la connexion
+    // (`tcp_sendmsg_locked`) ; rendu, et son numéro, si rien n'est écrit.
+    let mut avis = if drapeaux & zerocopie::MSG_ZEROCOPY != 0 { g.donnee().avis_de_l_envoi(s, longueur)? } else { None };
     let mut fait = 0;
     let mut demandee = false;
     {
@@ -2927,6 +3064,11 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, tx: u32, mut rem
                 demandee = true;
             }
             let _contexte = contexte::entrer();
+            if fait == longueur
+                && let Some(a) = avis.take()
+            {
+                p.garder_avis(a, fait);
+            }
             p.emettre();
             p.apres();
             drop(_contexte);
@@ -2981,6 +3123,17 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, tx: u32, mut rem
     })();
     if fait > 0 && !demandee {
         g.donnee().demander_horodatage(s, tx);
+    }
+    if let Some(a) = avis {
+        if fait > 0 {
+            let _contexte = contexte::entrer();
+            g.donnee().garder_avis(a, fait);
+        } else {
+            match a {
+                AvisEnvoi::Neuf(a) => zerocopie::annuler(s, a),
+                AvisEnvoi::Suite(a) => zerocopie::annuler_suite(s, a),
+            }
+        }
     }
     r
 }

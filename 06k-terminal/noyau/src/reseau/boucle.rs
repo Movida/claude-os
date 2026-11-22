@@ -56,6 +56,7 @@
 use super::horodatage::{self, Entree};
 use super::interface::{self, Compteurs, Interface, Materiel};
 use super::paquet::Paquet;
+use super::zerocopie::Avis;
 use crate::faillible::FileFaillible;
 use crate::tache;
 use crate::verrou::Verrou;
@@ -75,6 +76,8 @@ pub enum Trame {
     Copie(Paquet, &'static Interface),
     /// L'entrée d'un horodatage d'émission (horodatage.rs).
     Horodatage(Box<Entree>),
+    /// Un avis de MSG_ZEROCOPY fini (zerocopie.rs).
+    Avis(Box<Avis>),
 }
 /// La MTU de `lo` (celle de Linux depuis 3.7).
 pub const MTU: u32 = 65_536;
@@ -110,9 +113,15 @@ pub fn emettre(i: &Interface, mut p: Paquet) {
     // d'abord), puis la lâche : rien n'attend ici (`skb_orphan`), et le
     // paquet reçu ne demande plus rien.
     horodatage::passer(&p, horodatage::PILOTE, i.index);
+    // L'avis de MSG_ZEROCOPY de son envoi : Linux copie les pages à l'entrée
+    // de la réception (`skb_orphan_frags_rx`), avant d'y chercher une socket,
+    // donc après SND et avant tout ce que fera la trame (zerocopie.rs).
+    if let Some(a) = p.prendre_avis() {
+        deposer_avis(a).unwrap_or_else(super::zerocopie::plus_tard);
+    }
     p.orpheliner();
     let longueur = p.longueur().saturating_sub(ethernet::ENTETE) as u64;
-    if !deposer(Trame::Emise(p)) {
+    if deposer(Trame::Emise(p)).is_err() {
         return Compteurs::compter(&i.compteurs.jetes_reception, 1);
     }
     for (paquets, octets) in [(&i.compteurs.recus, &i.compteurs.octets_recus), (&i.compteurs.emis, &i.compteurs.octets_emis)] {
@@ -130,7 +139,7 @@ pub fn emettre(i: &Interface, mut p: Paquet) {
 /// `dev_core_stats_rx_dropped_inc` de la carte de la copie).
 pub fn rendre_la_diffusion(i: &'static Interface, mut p: Paquet) {
     p.orpheliner();
-    if deposer(Trame::Copie(p, i)) {
+    if deposer(Trame::Copie(p, i)).is_ok() {
         livrer_bientot();
     } else {
         super::interface::Compteurs::compter(&i.compteurs.jetes_reception, 1);
@@ -142,21 +151,31 @@ pub fn rendre_la_diffusion(i: &'static Interface, mut p: Paquet) {
 /// de mémoire pour la faire : perdue, comme quand Linux ne peut pas copier le
 /// paquet (`skb_clone` en GFP_ATOMIC).
 pub fn deposer_entree(e: Box<Entree>) {
-    deposer(Trame::Horodatage(e));
+    let _ = deposer(Trame::Horodatage(e));
 }
 
-/// Dépose `t` dans la file de la tâche courante ; false : jetée (plus de
-/// mémoire pour la faire, ou pleine).
-fn deposer(t: Trame) -> bool {
+/// Dépose l'avis de MSG_ZEROCOPY `a` dans la file de la tâche courante
+/// (zerocopie.rs) ; la file pleine, ou plus de mémoire pour la faire : il
+/// est rendu (un avis ne se perd pas).
+pub fn deposer_avis(a: Box<Avis>) -> Result<(), Box<Avis>> {
+    if let Err(Trame::Avis(a)) = deposer(Trame::Avis(a)) {
+        return Err(a);
+    }
+    Ok(())
+}
+
+/// Dépose `t` dans la file de la tâche courante ; rendue si elle n'y entre
+/// pas (plus de mémoire pour la faire, ou pleine).
+fn deposer(t: Trame) -> Result<(), Trame> {
     let mut file = tache::courante().file_lo.verrouiller();
     // La file de la tâche, faite à sa première trame, avec la place de
     // MAX trames : déposer n'alloue plus rien ensuite.
     let f = file.get_or_insert_with(VecDeque::new);
     if (f.capacity() == 0 && f.try_reserve_exact(MAX).is_err()) || f.len() >= MAX {
-        return false;
+        return Err(t);
     }
     f.ajouter_derriere_dans_la_place(t);
-    true
+    Ok(())
 }
 
 /// Dans le contexte réseau (une réception, un verrou court de TCP) :
@@ -230,6 +249,7 @@ fn vider_ici() {
                     super::ipv4::recevoir_la_diffusion(i, p)
                 }
                 Trame::Horodatage(e) => horodatage::livrer(e),
+                Trame::Avis(a) => super::zerocopie::livrer(a),
             }
         }
     });

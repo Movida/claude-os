@@ -29,6 +29,7 @@ use super::ipv4;
 use super::paquet::{self, Paquet};
 use super::icmp::ErreurRecue;
 use super::snmp::MIB;
+use super::zerocopie::{AuBouchon, MSG_ZEROCOPY};
 use super::socket::{self, Admission, AF_INET, AF_UNSPEC, Datagramme, ErreurEnFile, Inet, Rejet, Socket, Somme};
 use crate::aleatoire;
 use crate::attente::GardeMutex;
@@ -180,7 +181,7 @@ pub fn envoyer(s: &Arc<Socket>, nom: Option<&[u8]>, longueur: usize, drapeaux: u
     }
     let bouche = inet.options.udp_cork || drapeaux & MSG_MORE != 0;
     let envoye = if inet.bouchon.is_some() {
-        ajouter(s, &mut inet, longueur, bouche, drapeaux & datagramme::MSG_PROBE != 0, remplir)
+        ajouter(s, &mut inet, longueur, bouche, drapeaux & datagramme::MSG_PROBE != 0, drapeaux & MSG_ZEROCOPY != 0, remplir)
     } else {
         let (adresse, port) = match nom {
             Some(o) => {
@@ -226,13 +227,17 @@ fn envoyer_vers(s: &Arc<Socket>, mut inet: GardeMutex<'_, Inet>, (adresse, port,
     let (delai, pmtudisc) = (inet.options.sndtimeo, inet.options.pmtudisc);
     let non_bloquant = drapeaux & MSG_DONTWAIT != 0;
     let copier = |segment: &mut [u8]| remplir(0, &mut segment[udp::ENTETE..]);
+    // L'avis compte l'en-tête UDP d'un datagramme neuf (la `length`
+    // d'`__ip_append_data` : mesuré, un envoi de 0 octet prend un numéro,
+    // et RLIMIT_MEMLOCK compte ses 8 octets).
+    let zerocopie = if drapeaux & MSG_ZEROCOPY != 0 { udp::ENTETE + longueur } else { 0 };
     if bouche {
-        let paquet = datagramme::faire_paquet(s, &d, udp::ENTETE + longueur, pmtudisc, non_bloquant, delai, copier)?;
+        let paquet = datagramme::faire_paquet(s, &d, udp::ENTETE + longueur, pmtudisc, non_bloquant, delai, zerocopie, copier)?;
         inet.bouchon = Some(Bouchon { paquet, depart: d, port });
         return Ok(longueur);
     }
     drop(inet);
-    let p = datagramme::faire_paquet(s, &d, udp::ENTETE + longueur, pmtudisc, non_bloquant, delai, copier)?;
+    let p = datagramme::faire_paquet(s, &d, udp::ENTETE + longueur, pmtudisc, non_bloquant, delai, zerocopie, copier)?;
     emettre(&mut s.appels.verrouiller(), &d, port, p);
     Ok(longueur)
 }
@@ -256,7 +261,7 @@ fn envoyer_vers(s: &Arc<Socket>, mut inet: GardeMutex<'_, Inet>, (adresse, port,
 /// Avec MSG_PROBE (`sonde`), rien n'est ajouté ni vérifié (`ip_append_data`
 /// rend 0 aussitôt), mais sans MSG_MORE ni UDP_CORK le bouchon part quand
 /// même, sans ces octets-là (mesuré).
-fn ajouter(s: &Socket, inet: &mut Inet, longueur: usize, bouche: bool, sonde: bool,
+fn ajouter(s: &Arc<Socket>, inet: &mut Inet, longueur: usize, bouche: bool, sonde: bool, zerocopie: bool,
            mut remplir: impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<usize, i64> {
     const ENOMEM: i64 = 12;
     let pmtudisc = inet.options.pmtudisc;
@@ -273,31 +278,44 @@ fn ajouter(s: &Socket, inet: &mut Inet, longueur: usize, bouche: bool, sonde: bo
         let d = b.depart;
         Err(trop_gros(s, inet, &d))
     } else {
-        let (entete, mtu) = (b.depart.entete(), b.depart.mtu as usize);
-        let morceaux_avant = format_ipv4::nombre_de_fragments(avant, mtu, entete);
-        let nouveaux = format_ipv4::nombre_de_fragments(apres, mtu, entete) - morceaux_avant;
-        let retenue = longueur + nouveaux * (paquet::MARGE + paquet::SURCOUT);
-        // Chaque morceau neuf, avant d'être fait, ne doit pas mener ce que
-        // tient la socket, plus ce que cet ajout y a déjà mis (les octets
-        // qui remplissent le morceau en cours, puis les morceaux neufs
-        // d'avant, pleins), au-delà du double de SO_SNDBUF (le
-        // `wmem_alloc_delta` de `__ip_append_data`) : le plus exigeant est
-        // le dernier.
-        let plein = mtu.saturating_sub(entete) & !7;
-        let remplissage = plein.saturating_sub(avant - (morceaux_avant - 1) * plein);
-        let deja = remplissage + nouveaux.saturating_sub(1) * (paquet::MARGE + plein + paquet::SURCOUT);
-        if nouveaux > 0 && s.envois.as_ref().is_some_and(|r| r.octets() + deja > 2 * r.limite()) {
-            Err(datagramme::jete(-ENOBUFS))
-        } else {
-            match b.paquet.agrandir(longueur) {
-                None => Err(datagramme::jete(if nouveaux > 0 { -ENOBUFS } else { -ENOMEM })),
-                Some(o) => match remplir(0, o) {
-                    Err(e) => Err(datagramme::jete(e)),
-                    Ok(()) => {
-                        b.paquet.retenir_en_plus(retenue);
-                        Ok(longueur)
+        // L'avis de MSG_ZEROCOPY, après la taille, avant la place et la copie
+        // (`__ip_append_data`) ; son ENOBUFS vide le bouchon comme les autres
+        // erreurs (`udp_flush_pending_frames`).
+        let z = if zerocopie { super::zerocopie::au_bouchon(s, &mut b.paquet, longueur) } else { Ok(AuBouchon::Rien) };
+        match z {
+            Err(e) => Err(e),
+            Ok(z) => {
+                let r = (|| {
+                    let (entete, mtu) = (b.depart.entete(), b.depart.mtu as usize);
+                    let morceaux_avant = format_ipv4::nombre_de_fragments(avant, mtu, entete);
+                    let nouveaux = format_ipv4::nombre_de_fragments(apres, mtu, entete) - morceaux_avant;
+                    let retenue = longueur + nouveaux * (paquet::MARGE + paquet::SURCOUT);
+                    // Chaque morceau neuf, avant d'être fait, ne doit pas mener ce que
+                    // tient la socket, plus ce que cet ajout y a déjà mis (les octets
+                    // qui remplissent le morceau en cours, puis les morceaux neufs
+                    // d'avant, pleins), au-delà du double de SO_SNDBUF (le
+                    // `wmem_alloc_delta` de `__ip_append_data`) : le plus exigeant est
+                    // le dernier.
+                    let plein = mtu.saturating_sub(entete) & !7;
+                    let remplissage = plein.saturating_sub(avant - (morceaux_avant - 1) * plein);
+                    let deja = remplissage + nouveaux.saturating_sub(1) * (paquet::MARGE + plein + paquet::SURCOUT);
+                    if nouveaux > 0 && s.envois.as_ref().is_some_and(|r| r.octets() + deja > 2 * r.limite()) {
+                        Err(datagramme::jete(-ENOBUFS))
+                    } else {
+                        match b.paquet.agrandir(longueur) {
+                            None => Err(datagramme::jete(if nouveaux > 0 { -ENOBUFS } else { -ENOMEM })),
+                            Some(o) => match remplir(0, o) {
+                                Err(e) => Err(datagramme::jete(e)),
+                                Ok(()) => {
+                                    b.paquet.retenir_en_plus(retenue);
+                                    Ok(longueur)
+                                }
+                            },
+                        }
                     }
-                },
+                })();
+                super::zerocopie::apres_le_bouchon(s, &mut b.paquet, z, r.is_ok());
+                r
             }
         }
     };

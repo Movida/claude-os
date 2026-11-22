@@ -19,6 +19,7 @@
 //! dise tout de suite s'il vient d'une file du réseau.
 
 use super::horodatage::Demande;
+use super::zerocopie::Avis;
 use crate::attente::FileAttente;
 use crate::faillible::{self, VecFaillible};
 use crate::partage::Arc;
@@ -50,8 +51,9 @@ pub const SURCOUT: usize = 576;
 /// `skb_shared_info` comprise, dans le noyau de référence), plus le `sk_buff`
 /// (256) : 960, mesuré (SO_MEMINFO). Pas `SURCOUT` : Linux ne fait jamais de
 /// tête plus petite que ce cache. C'est ce que compte une entrée d'horodatage
-/// sans octets (OPT_TSONLY, horodatage.rs), et la tête de tout `sk_buff` de
-/// TCP, dont les octets sont dans des pages à part.
+/// sans octets (OPT_TSONLY, horodatage.rs), un avis de MSG_ZEROCOPY
+/// (zerocopie.rs), et la tête de tout `sk_buff` de TCP, dont les octets sont
+/// dans des pages à part.
 pub const TAILLE_VIDE: usize = 960;
 
 /// Ce qu'une socket a encore dans les files d'en bas (la file de la carte, celle des
@@ -181,17 +183,30 @@ impl Retenue {
 }
 
 /// Le lien d'un paquet à sa socket, jusqu'à ce que la carte l'ait fini (le `skb->sk`
-/// et son destructeur).
+/// et son destructeur) ; et l'avis de MSG_ZEROCOPY de l'envoi dont il est le
+/// datagramme (ou son dernier morceau), fini avec lui (zerocopie.rs : les
+/// pages que Linux lâche quand la carte a fini, le `ubuf_info` du
+/// `skb_shared_info`), ou quand le paquet est jeté (`Drop`).
 pub struct Proprietaire {
     retenue: Arc<Retenue>,
     taille: usize,
     numero: u64,
+    avis: Option<Box<Avis>>,
+}
+
+impl Drop for Proprietaire {
+    fn drop(&mut self) {
+        if let Some(a) = self.avis.take() {
+            super::zerocopie::finir(a);
+        }
+    }
 }
 
 impl Proprietaire {
     /// La carte a fini (`tcp_wfree`) ; ou le paquet n'attend pas (`skb_orphan`), ou il
     /// est jeté.
     pub fn rendre(self) {
+        // Son avis, après (le destructeur du `sk_buff`, puis ses pages : `Drop`).
         let r = &self.retenue;
         // SeqCst : la paire d'`etrangler` (voir là), et de `marquer_sans_place`.
         let reste = r.octets.fetch_sub(self.taille, Ordering::SeqCst) - self.taille;
@@ -267,6 +282,12 @@ pub struct Contexte {
 }
 
 impl Paquet {
+    /// Un paquet sans octets ni place, qui n'alloue rien (les données d'un
+    /// avis de MSG_ZEROCOPY, socket.rs).
+    pub fn rien() -> Paquet {
+        Paquet { tampon: Vec::new(), debut: 0, fin: 0, proprietaire: None, sortie: None, contexte: Contexte::default(), demande: None }
+    }
+
     /// Un paquet vide, avec la marge pour ses en-têtes et la place pour
     /// `longueur` octets de données. None : plus de mémoire.
     pub fn vide(longueur: usize) -> Option<Paquet> {
@@ -361,7 +382,7 @@ impl Paquet {
     pub fn attacher(&mut self, retenue: &Arc<Retenue>, numero: u64) {
         let taille = self.taille_vraie();
         retenue.octets.fetch_add(taille, Ordering::Relaxed);
-        self.proprietaire = Some(Proprietaire { retenue: retenue.clone(), taille, numero });
+        self.proprietaire = Some(Proprietaire { retenue: retenue.clone(), taille, numero, avis: None });
     }
 
     /// Ce paquet, attaché, compte `n` octets de plus dans ce que tient sa
@@ -381,6 +402,27 @@ impl Paquet {
         if let Some(p) = self.proprietaire.take() {
             p.rendre();
         }
+    }
+
+    /// L'avis de MSG_ZEROCOPY de son envoi (zerocopie.rs) : avec son lien à
+    /// sa socket ; un paquet qui n'en a pas (rien ne le tient) le finit tout
+    /// de suite.
+    pub fn poser_avis(&mut self, a: Box<Avis>) {
+        match &mut self.proprietaire {
+            Some(p) => p.avis = Some(a),
+            None => super::zerocopie::finir(a),
+        }
+    }
+
+    /// Son avis de MSG_ZEROCOPY, pris : pour le dernier morceau
+    /// (ipv4::fragmenter), ou déposé par `lo` avant la trame (boucle.rs).
+    pub fn prendre_avis(&mut self) -> Option<Box<Avis>> {
+        self.proprietaire.as_mut()?.avis.take()
+    }
+
+    /// Son avis, à allonger (le bouchon d'UDP).
+    pub fn avis_mut(&mut self) -> Option<&mut Avis> {
+        self.proprietaire.as_mut()?.avis.as_deref_mut()
     }
 
     /// Il demande à être horodaté en partant (horodatage.rs).
