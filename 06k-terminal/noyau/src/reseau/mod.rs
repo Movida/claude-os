@@ -44,8 +44,11 @@ pub mod virtio_net;
 use interface::Interface;
 use paquet::Paquet;
 
-/// Une trame reçue par l'interface `i`, dans la tâche du réseau.
-pub fn recevoir(i: &'static Interface, p: Paquet) {
+/// Une trame reçue par l'interface `i`, dans la tâche du réseau (ou, pour
+/// lo, dans le contexte de qui l'a envoyée) : son heure d'arrivée d'abord
+/// (`net_timestamp_check`, voir paquet::Contexte).
+pub fn recevoir(i: &'static Interface, mut p: Paquet) {
+    p.horodater(crate::temps::ns_calendrier());
     ethernet::recevoir(i, p);
 }
 

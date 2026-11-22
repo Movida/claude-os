@@ -32,6 +32,7 @@ use fichiers::tmpfs::Ouvert;
 use formats::reseau::ipv4 as format_ipv4;
 
 const EPERM: i64 = 1;
+const ENOENT: i64 = 2;
 const EBADF: i64 = 9;
 const EAGAIN: i64 = 11;
 const ENOMEM: i64 = 12;
@@ -150,6 +151,22 @@ const SO_BUSY_POLL_BUDGET: i32 = 70;
 const SO_NETNS_COOKIE: i32 = 71;
 const SO_TXREHASH: i32 = 74;
 const SO_DEVMEM_DONTNEED: i32 = 80;
+/// La réception : l'horodatage, sous ses quatre formes
+/// (_OLD : `timeval` et `timespec` de 64 bits sur x86_64, comme les _NEW ; seul
+/// le numéro du message de contrôle les distingue), les pertes, la marque et
+/// la priorité des datagrammes, le processeur d'arrivée, et SO_INQ
+/// d'AF_UNIX.
+const SO_TIMESTAMP_OLD: i32 = 29;
+const SO_TIMESTAMPNS_OLD: i32 = 35;
+const SO_TIMESTAMP_NEW: i32 = 63;
+const SO_TIMESTAMPNS_NEW: i32 = 64;
+const SO_MARK: i32 = 36;
+const SO_RXQ_OVFL: i32 = 40;
+const SO_INCOMING_CPU: i32 = 49;
+const SO_RCVMARK: i32 = 75;
+const SO_RCVPRIORITY: i32 = 82;
+const SO_INQ: i32 = 84;
+const SCM_INQ: i32 = SO_INQ;
 /// Les horloges que SO_TXTIME accepte (`sockopt_validate_clockid`).
 const CLOCK_REALTIME: i32 = 0;
 const CLOCK_MONOTONIC: i32 = 1;
@@ -785,6 +802,82 @@ struct Reception {
     /// Les descripteurs arrivés par AF_UNIX (SCM_RIGHTS), et ses droits s'il y en a à dire.
     fichiers: Vec<FichierTenu>,
     droits: Option<unix::Droits>,
+    /// Ce qu'en disent les messages de contrôle de SOL_SOCKET.
+    socket: ControleSocket,
+}
+
+/// Les messages de contrôle de SOL_SOCKET d'une réception, que calcule toute
+/// lecture (elle tient à jour l'heure que rend SIOCGSTAMP) et qu'écrit
+/// `recvmsg` : SO_TIMESTAMP sous la forme posée (son numéro et ses 16
+/// octets), SO_RXQ_OVFL, SO_MARK, SO_PRIORITY, et SCM_INQ (AF_UNIX en flux).
+/// Qui en dit quoi, comme Linux (mesuré) : UDP, tout (`sock_recv_cmsgs`) ;
+/// ping et la file d'erreurs, l'heure seule (`sock_recv_timestamp`) ;
+/// AF_UNIX, l'heure d'un DGRAM ou d'un SEQPACKET (`__sock_recv_timestamp`),
+/// SCM_INQ d'un flux ; TCP, l'heure (`tcp_recv_timestamp`).
+#[derive(Default)]
+struct ControleSocket {
+    horodatage: Option<(i32, [u8; 16])>,
+    pertes: Option<u32>,
+    marque: Option<u32>,
+    priorite: Option<u32>,
+    inq: Option<i32>,
+}
+
+/// SO_TIMESTAMP de la socket `s`, si elle l'a, pour l'heure `ns` (de la date,
+/// en nanosecondes ; 0 : aucune, et la lecture donne la sienne, le
+/// `false_tstamp` d'`__sock_recv_timestamp`) : un `timeval` (les
+/// microsecondes) ou, avec SO_TIMESTAMPNS, un `timespec`, et le numéro de la
+/// forme posée (_NEW ou _OLD : les mêmes 16 octets sur x86_64).
+fn heure_demandee(s: &Socket, ns: u64) -> Option<(i32, [u8; 16])> {
+    if !s.drapeau(socket::RCVTSTAMP) {
+        return None;
+    }
+    let ns = if ns == 0 { crate::temps::ns_calendrier() } else { ns };
+    let nano = s.drapeau(socket::RCVTSTAMPNS);
+    let sorte = match (nano, s.drapeau(socket::TSTAMP_NEW)) {
+        (false, false) => SO_TIMESTAMP_OLD,
+        (false, true) => SO_TIMESTAMP_NEW,
+        (true, false) => SO_TIMESTAMPNS_OLD,
+        (true, true) => SO_TIMESTAMPNS_NEW,
+    };
+    let reste = ns % 1_000_000_000;
+    let mut o = [0u8; 16];
+    o[..8].copy_from_slice(&(ns / 1_000_000_000).to_le_bytes());
+    o[8..].copy_from_slice(&(if nano { reste } else { reste / 1000 }).to_le_bytes());
+    Some((sorte, o))
+}
+
+/// L'heure d'une lecture de ping ou de la file d'erreurs (`sock_recv_timestamp`) :
+/// SO_TIMESTAMP la dit ; sinon, elle devient celle que rendra SIOCGSTAMP
+/// (`sock_write_timestamp`, 0 pour une erreur locale : SIOCGSTAMP prendra la
+/// sienne).
+fn heure_lue(s: &Socket, ns: u64) -> Option<(i32, [u8; 16])> {
+    let h = heure_demandee(s, ns);
+    if h.is_none() {
+        s.horodatage.store(ns as i64, Ordering::Relaxed);
+    }
+    h
+}
+
+/// Ce que dit la lecture d'un datagramme UDP (`sock_recv_cmsgs`) : si la socket
+/// a l'un de ses quatre drapeaux, l'heure (`heure_lue`), les pertes d'avant lui
+/// s'il y en a eu, sa marque, sa priorité ; sinon, avec SOCK_TIMESTAMP
+/// (SIOCGSTAMP l'a demandé), l'heure gardée pour SIOCGSTAMP ; sinon, la
+/// première lecture garde 0 (SIOCGSTAMP prendra la sienne, plus ENOENT).
+fn controle_udp(s: &Socket, r: &socket::Recu) -> ControleSocket {
+    let d = s.drapeaux.load(Ordering::Relaxed);
+    let mut c = ControleSocket::default();
+    if d & (socket::RXQ_OVFL | socket::RCVTSTAMP | socket::RCVMARK | socket::RCVPRIORITY) != 0 {
+        c.horodatage = heure_lue(s, r.contexte.horodatage);
+        c.pertes = (d & socket::RXQ_OVFL != 0 && r.pertes != 0).then_some(r.pertes);
+        c.marque = (d & socket::RCVMARK != 0).then_some(r.contexte.marque);
+        c.priorite = (d & socket::RCVPRIORITY != 0).then_some(r.contexte.priorite);
+    } else if d & socket::TIMESTAMP != 0 {
+        s.horodatage.store(r.contexte.horodatage as i64, Ordering::Relaxed);
+    } else {
+        let _ = s.horodatage.compare_exchange(socket::HORODATAGE_AUCUN, 0, Ordering::Relaxed, Ordering::Relaxed);
+    }
+    c
 }
 
 /// Reçoit dans les morceaux `morceaux` (le `sock_recvmsg`) : une socket de
@@ -804,10 +897,11 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let copie = copier_vers_morceaux(morceaux, e.donnees.donnees())?;
         let recu = socket::Recu {
             vide: false, longueur: copie, source: e.adresse, port: e.port, destination: e.arrivee, pktinfo: (e.interface, [0; 4]),
-            coupe: copie < total, ip: e.controle(),
+            coupe: copie < total, ip: e.controle(), contexte: Default::default(), pertes: 0,
         };
         let d = if recu.coupe { MSG_TRUNC } else { 0 } | MSG_ERRQUEUE as u32;
-        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: Some(e), fichiers: Vec::new(), droits: None });
+        let socket = ControleSocket { horodatage: heure_lue(o.socket(), e.horodatage), ..Default::default() };
+        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: Some(e), fichiers: Vec::new(), droits: None, socket });
     }
     if o.socket().protocole == Protocole::Tcp && drapeaux & MSG_OOB != 0 {
         // L'octet urgent (`tcp_recv_urg`) : MSG_OOB dans `msg_flags`, et
@@ -816,7 +910,7 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let n = tcp::recevoir_urgent(o.socket(), drapeaux, place, |octet| copier_vers_morceaux(morceaux, &[octet]).map(|_| ()))?;
         let recu = socket::Recu::sans_emetteur(n.unwrap_or(0), false);
         let d = if n.is_some() { MSG_OOB as u32 | if place == 0 { MSG_TRUNC } else { 0 } } else { 0 };
-        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: None, fichiers: Vec::new(), droits: None });
+        return Ok(Reception { recu, nom_unix: None, drapeaux: d, erreur: None, fichiers: Vec::new(), droits: None, socket: Default::default() });
     }
     if o.socket().protocole == Protocole::Unix {
         // Un morceau se copie en entier, ou pas du tout (`skb_copy_datagram_msg`) : une faute au
@@ -828,20 +922,40 @@ fn recevoir(o: &FichierTenu, morceaux: &[(u64, u64)], drapeaux: u64) -> Result<R
         let recu = socket::Recu::sans_emetteur(u.longueur, u.coupe);
         let d = if u.coupe { MSG_TRUNC } else { 0 } | if u.urgent { MSG_OOB as u32 } else { 0 };
         let droits = u.scm.then_some(u.droits);
-        return Ok(Reception { recu, nom_unix: u.adresse, drapeaux: d, erreur: None, fichiers: u.fichiers, droits });
+        // L'heure d'un message lu (un DGRAM, un SEQPACKET) ; ce qui reste à lire
+        // d'un flux, après toute lecture qui réussit, même vide (la fin) ou
+        // MSG_PEEK, mais pas l'octet urgent (`unix_stream_read_generic`).
+        let s = o.socket();
+        let flux = s.sorte == unix::SOCK_STREAM;
+        let socket = ControleSocket {
+            horodatage: if !flux && u.scm { heure_demandee(s, u.horodatage) } else { None },
+            inq: if flux && !u.urgent && s.drapeau(socket::INQ) { unix::a_lire(s).ok().map(|n| n as i32) } else { None },
+            ..Default::default()
+        };
+        return Ok(Reception { recu, nom_unix: u.adresse, drapeaux: d, erreur: None, fichiers: u.fichiers, droits, socket });
     }
     if o.socket().protocole == Protocole::Tcp {
         // Un flux : les octets à la suite dans les morceaux, sans émetteur
         // (`recvfrom` rend une adresse de longueur 0, mesuré).
-        let n = tcp::recevoir_programme(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |decalage, octets| {
+        let (n, heure) = tcp::recevoir_programme_horodate(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |decalage, octets| {
             copier_vers_morceaux_depuis(morceaux, decalage, octets)
         })?;
         let recu = socket::Recu::sans_emetteur(n, false);
-        return Ok(Reception { recu, nom_unix: None, drapeaux: 0, erreur: None, fichiers: Vec::new(), droits: None });
+        // Une heure seulement si la lecture a touché des octets reçus, et jamais
+        // la sienne (`tcp_recv_timestamp` : une heure nulle ne dit rien).
+        let socket = ControleSocket { horodatage: heure.filter(|&h| h != 0).and_then(|h| heure_demandee(o.socket(), h)), ..Default::default() };
+        return Ok(Reception { recu, nom_unix: None, drapeaux: 0, erreur: None, fichiers: Vec::new(), droits: None, socket });
     }
     let recu = socket::prendre(o.socket(), total(morceaux), drapeaux, non_bloquant(o), |octets| copier_vers_morceaux(morceaux, octets))?;
     let drapeaux = if recu.coupe { MSG_TRUNC } else { 0 };
-    Ok(Reception { recu, nom_unix: None, drapeaux, erreur: None, fichiers: Vec::new(), droits: None })
+    // Rien de lu (la lecture arrêtée) : rien à dire (`skb` nul).
+    let s = o.socket();
+    let socket = match s.protocole {
+        _ if recu.vide => ControleSocket::default(),
+        Protocole::Udp => controle_udp(s, &recu),
+        _ => ControleSocket { horodatage: heure_lue(s, recu.contexte.horodatage), ..Default::default() },
+    };
+    Ok(Reception { recu, nom_unix: None, drapeaux, erreur: None, fichiers: Vec::new(), droits: None, socket })
 }
 
 /// sendto(fd, tampon, longueur, drapeaux, adresse, longueur de l'adresse) :
@@ -935,8 +1049,13 @@ fn aligner(n: usize) -> usize {
 /// SOL_SOCKET : SCM_RIGHTS et SCM_CREDENTIALS ignorés (ceux d'AF_UNIX),
 /// SCM_TXTIME (un `u64` exactement ; seulement si SO_TXTIME est posé,
 /// `txtime`, sinon EINVAL : l'heure de départ voulue, que rien ne lit chez
-/// nous, voir socket.rs), un autre : EINVAL (un écart pour SO_MARK,
-/// SO_PRIORITY, l'horodatage : Linux les prend) ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
+/// nous, voir socket.rs), SO_MARK (la marque de cet envoi : CAP_NET_RAW ou
+/// CAP_NET_ADMIN, EPERM, avant la longueur, un `u32`, EINVAL), SO_PRIORITY
+/// (sa priorité : un `u32`, EINVAL, puis 0 à 6 sans droits, EPERM), et
+/// IP_TOS donne aussi sa priorité (`rt_tos2priority`) : de ces deux-là, le
+/// dernier compte, dans l'ordre des messages (mesuré : IP_TOS 0x10, la
+/// priorité 6) ; un autre : EINVAL (un écart pour l'horodatage,
+/// SO_TIMESTAMPING) ; SOL_UDP : EINVAL (UDP_SEGMENT : un écart) ; un autre
 /// niveau est ignoré. Selon qui lit (`protocole`), comme chez Linux : UDP
 /// lit SOL_UDP (`udp_cmsg_send`), puis SOL_IP et SOL_SOCKET
 /// (`ip_cmsg_send`) ; ping, seulement ces deux-là (SOL_UDP est sauté) ; TCP,
@@ -997,10 +1116,24 @@ fn lire_controle(c: &[u8], root: bool, protocole: Protocole, txtime: bool) -> Re
                     return Err(-EINVAL);
                 }
                 r.tos = Some(v as u8);
+                r.priorite = Some(priorite_du_tos(v as u8));
             }
             (SOL_IP, _) | (SOL_UDP, _) => return Err(-EINVAL),
             (SOL_SOCKET, SCM_RIGHTS | SCM_CREDENTIALS) => r.droits = true,
             (SOL_SOCKET, SCM_TXTIME) if txtime && d.len() == 8 => {}
+            (SOL_SOCKET, SO_MARK) => {
+                if !root {
+                    return Err(-EPERM);
+                }
+                r.marque = Some(entier()? as u32);
+            }
+            (SOL_SOCKET, SO_PRIORITY) => {
+                let v = entier()?;
+                if !(0..=6).contains(&v) && !root {
+                    return Err(-EPERM);
+                }
+                r.priorite = Some(v as u32);
+            }
             (SOL_SOCKET, _) => return Err(-EINVAL),
             _ => {}
         }
@@ -1281,6 +1414,16 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
     // MSG_CMSG_CLOEXEC demandé revient dans msg_flags (`____sys_recvmsg`).
     r.drapeaux |= (drapeaux & MSG_CMSG_CLOEXEC) as u32;
     let mut c = ControleSortant { adresse: m.controle, place: m.longueur_controle, utilise: 0 };
+    // Ceux de SOL_SOCKET d'abord (`sock_recv_cmsgs`, avant les adresses et IP ;
+    // l'heure d'AF_UNIX avant ses droits), dans l'ordre de `__sock_recv_cmsgs`.
+    if let Some((sorte, o)) = &r.socket.horodatage {
+        c.ecrire(SOL_SOCKET, *sorte, o, &mut r.drapeaux);
+    }
+    for (sorte, v) in [(SO_RXQ_OVFL, r.socket.pertes), (SO_MARK, r.socket.marque), (SO_PRIORITY, r.socket.priorite)] {
+        if let Some(v) = v {
+            c.ecrire(SOL_SOCKET, sorte, &v.to_le_bytes(), &mut r.drapeaux);
+        }
+    }
     // Les messages de contrôle IP (`ip_cmsg_recv_offset`), dans l'ordre de
     // Linux : pour un datagramme ; pour une erreur, seulement si elle vient
     // d'ICMP (`ipv4_datagram_support_cmsg`), ceux de son message.
@@ -1341,6 +1484,10 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
                 c.ecrire_descripteurs(&r.fichiers, drapeaux & MSG_CMSG_CLOEXEC != 0, &mut r.drapeaux);
             }
         }
+    }
+    // SO_INQ d'AF_UNIX en flux : ce qui reste à lire, après les droits.
+    if let Some(n) = r.socket.inq {
+        c.ecrire(SOL_SOCKET, SCM_INQ, &n.to_le_bytes(), &mut r.drapeaux);
     }
     if copier_vers_utilisateur(adresse + 48, &r.drapeaux.to_le_bytes()).is_err()
         || copier_vers_utilisateur(adresse + 40, &c.utilise.to_le_bytes()).is_err() {
@@ -1572,6 +1719,21 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
     if option == SO_BINDTODEVICE {
         return lier_a_une_interface(s, interface_nommee(valeur, longueur)?);
     }
+    // SO_INQ, la seule option qu'AF_UNIX en flux prend à part (`unix_setsockopt`,
+    // SOCK_CUSTOM_SOCKOPT) : exactement un entier (EINVAL), 0 ou 1. Les autres
+    // sortes ne la connaissent pas (ENOPROTOOPT, après la longueur), et
+    // personne ne la relit (`unix_getsockopt` n'existe pas : ENOPROTOOPT).
+    if option == SO_INQ && s.protocole == Protocole::Unix && s.sorte == unix::SOCK_STREAM {
+        if longueur != 4 {
+            return Err(-EINVAL);
+        }
+        let v = entier(valeur, longueur)?;
+        if !(0..=1).contains(&v) {
+            return Err(-EINVAL);
+        }
+        s.poser_drapeau(socket::INQ, v == 1);
+        return Ok(());
+    }
     let v = entier(valeur, longueur)?;
     let oui = v != 0;
     // SO_PRIORITY et SO_RCVLOWAT, sans le verrou de la socket (Linux non
@@ -1579,6 +1741,50 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
     match option {
         // Un index, sans vérifier qu'il existe (mesuré : 9999 accepté, et relu).
         SO_BINDTOIFINDEX => return lier_a_une_interface(s, v),
+        // L'horodatage des réceptions (socket.rs, RCVTSTAMP) : chaque forme pose
+        // les trois drapeaux ensemble, et la retirer, quelle qu'elle soit, retire
+        // l'horodatage (TSTAMP_NEW reste : il ne compte que posé avec lui) ;
+        // posée, elle allume aussi SOCK_TIMESTAMP, pour toujours
+        // (`__sock_set_timestamps`, `sock_enable_timestamp`).
+        SO_TIMESTAMP_OLD | SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_OLD | SO_TIMESTAMPNS_NEW => {
+            let ns = matches!(option, SO_TIMESTAMPNS_OLD | SO_TIMESTAMPNS_NEW);
+            s.poser_drapeau(socket::RCVTSTAMP, oui);
+            s.poser_drapeau(socket::RCVTSTAMPNS, oui && ns);
+            if oui {
+                s.poser_drapeau(socket::TSTAMP_NEW, matches!(option, SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW));
+                s.poser_drapeau(socket::TIMESTAMP, true);
+            }
+            return Ok(());
+        }
+        // Des drapeaux, pour toutes les sortes ; seule la lecture d'UDP s'en
+        // sert (`sock_recv_cmsgs` : ping, AF_UNIX et TCP n'appellent que
+        // l'horodatage, ou rien ; mesuré).
+        SO_RXQ_OVFL | SO_RCVMARK | SO_RCVPRIORITY => {
+            let d = match option {
+                SO_RXQ_OVFL => socket::RXQ_OVFL,
+                SO_RCVMARK => socket::RCVMARK,
+                _ => socket::RCVPRIORITY,
+            };
+            s.poser_drapeau(d, oui);
+            return Ok(());
+        }
+        // Toute valeur, relue telle quelle (mesuré : -5, 100000) ; la
+        // réception suivante la remplace (socket.rs, `processeur`).
+        SO_INCOMING_CPU => {
+            s.processeur.store(v, Ordering::Relaxed);
+            return Ok(());
+        }
+        // CAP_NET_RAW ou CAP_NET_ADMIN de qui appelle (EPERM, même pour 0) :
+        // la marque des paquets qu'elle envoie (paquet::Contexte). Linux
+        // oublie aussi la route gardée (`sk_dst_reset`) : la sienne peut
+        // dépendre de la marque (`ip rule fwmark`), la nôtre jamais.
+        SO_MARK => {
+            if !socket::appelant_privilegie() {
+                return Err(-EPERM);
+            }
+            s.appels.verrouiller().options.mark = v as u32;
+            return Ok(());
+        }
         // 0 à 6 pour tous ; au-delà, CAP_NET_RAW ou CAP_NET_ADMIN de qui
         // appelle (`sk_set_prio_allowed`).
         SO_PRIORITY => {
@@ -2908,6 +3114,23 @@ fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16]
         SO_SNDLOWAT => entier(&mut o, 1),
         SO_PEEK_OFF if s.protocole == Protocole::Ping => return Err(-EOPNOTSUPP),
         SO_PEEK_OFF => entier(&mut o, s.peek_off.load(Ordering::Relaxed)),
+        // `sk_getsockopt` : chaque forme se relit 1 seulement si c'est elle qui
+        // est posée (RCVTSTAMP, et ses deux autres bits).
+        SO_TIMESTAMP_OLD | SO_TIMESTAMPNS_OLD | SO_TIMESTAMP_NEW | SO_TIMESTAMPNS_NEW => {
+            let (ts, ns, new) = (s.drapeau(socket::RCVTSTAMP), s.drapeau(socket::RCVTSTAMPNS), s.drapeau(socket::TSTAMP_NEW));
+            let oui = match option {
+                SO_TIMESTAMP_OLD => ts && !new && !ns,
+                SO_TIMESTAMPNS_OLD => ns && !new,
+                SO_TIMESTAMP_NEW => ts && new,
+                _ => ns && new,
+            };
+            entier(&mut o, oui as i32)
+        }
+        SO_RXQ_OVFL => entier(&mut o, s.drapeau(socket::RXQ_OVFL) as i32),
+        SO_RCVMARK => entier(&mut o, s.drapeau(socket::RCVMARK) as i32),
+        SO_RCVPRIORITY => entier(&mut o, s.drapeau(socket::RCVPRIORITY) as i32),
+        SO_INCOMING_CPU => entier(&mut o, s.processeur.load(Ordering::Relaxed)),
+        SO_MARK => entier(&mut o, op.mark as i32),
         _ => return Err(-ENOPROTOOPT),
     };
     Ok((o, n))
@@ -3096,13 +3319,53 @@ pub fn lire_noyau(o: &FichierTenu, tampon: &mut [u8]) -> Result<usize, i64> {
     }
 }
 
+/// SIOCGSTAMP (`sock_gettstamp`, avant l'ioctl du protocole) : l'heure du
+/// dernier datagramme lu (`Socket::horodatage`), en `timeval`, ou en
+/// `timespec` (`ns`). AF_UNIX ne l'a pas (pas de `gettstamp` : ENOTTY).
+/// L'appel pose SOCK_TIMESTAMP : les lectures suivantes gardent l'heure de
+/// leur datagramme. Rien de lu encore : ENOENT ; une lecture sans heure
+/// gardée (0, et Linux regarde les secondes seules) : celle de l'appel, qui
+/// reste. TCP n'en garde jamais : toujours ENOENT (mesuré) ; ping et UDP
+/// lus avec SO_TIMESTAMP non plus (l'heure part dans le message de contrôle).
+fn heure_du_dernier(s: &Socket, ns: bool, argument: u64) -> i64 {
+    if s.protocole == Protocole::Unix {
+        return -ENOTTY;
+    }
+    s.poser_drapeau(socket::TIMESTAMP, true);
+    let mut t = s.horodatage.load(Ordering::Relaxed);
+    if t == socket::HORODATAGE_AUCUN {
+        return -ENOENT;
+    }
+    if (0..1_000_000_000).contains(&t) {
+        t = crate::temps::ns_calendrier() as i64;
+        s.horodatage.store(t, Ordering::Relaxed);
+    }
+    let reste = t % 1_000_000_000;
+    let mut o = [0u8; 16];
+    o[..8].copy_from_slice(&(t / 1_000_000_000).to_le_bytes());
+    o[8..].copy_from_slice(&(if ns { reste } else { reste / 1000 }).to_le_bytes());
+    match copier_vers_utilisateur(argument, &o) {
+        Ok(()) => 0,
+        Err(_) => -EFAULT,
+    }
+}
+
 /// ioctl d'une socket, une fois passées celles de tous les fichiers
 /// (`sock_ioctl` puis `udp_ioctl`) : FIONREAD (SIOCINQ) : la longueur du
 /// PREMIER datagramme en file (pas le total) ; SIOCOUTQ : ce que la socket
 /// tient encore (`sk_wmem_alloc_get`) : son bouchon, et ses datagrammes que
-/// la carte ou le voisin n'ont pas fini ; une autre
-/// (les requêtes des terminaux comprises) : ENOTTY.
+/// la carte ou le voisin n'ont pas fini ; SIOCGSTAMP et SIOCGSTAMPNS (voir
+/// `heure_du_dernier`) ; une autre (les requêtes des terminaux comprises) :
+/// ENOTTY.
 pub fn ioctl(o: &FichierTenu, requete: u64, argument: u64) -> i64 {
+    // _OLD et _NEW (`_IOR(0x89, 6, long long[2])`) : les mêmes 16 octets sur x86_64.
+    const SIOCGSTAMP_OLD: u64 = 0x8906;
+    const SIOCGSTAMPNS_OLD: u64 = 0x8907;
+    const SIOCGSTAMP_NEW: u64 = 0x8010_8906;
+    const SIOCGSTAMPNS_NEW: u64 = 0x8010_8907;
+    if matches!(requete, SIOCGSTAMP_OLD | SIOCGSTAMPNS_OLD | SIOCGSTAMP_NEW | SIOCGSTAMPNS_NEW) {
+        return heure_du_dernier(o.socket(), matches!(requete, SIOCGSTAMPNS_OLD | SIOCGSTAMPNS_NEW), argument);
+    }
     const SIOCINQ: u64 = 0x541b;
     const SIOCOUTQ: u64 = 0x5411;
     const SIOCOUTQNSD: u64 = 0x894b;

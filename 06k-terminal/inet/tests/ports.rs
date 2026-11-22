@@ -52,9 +52,9 @@ fn qui_recoit() {
     t.lier(1, Lien { reuseaddr: true, ..lien(TOUT, 53) }, 1, 0).unwrap();
     t.lier(2, Lien { reuseaddr: true, ..lien(LO, 53) }, 2, 0).unwrap();
     // Liée à l'adresse de destination d'abord, puis à 0.0.0.0.
-    assert_eq!(t.trouver(ICI, 4000, LO, 53, 1), Some(2));
-    assert_eq!(t.trouver(LO, 4000, ICI, 53, 1), Some(1));
-    assert_eq!(t.trouver(LO, 4000, LO, 54, 1), None);
+    assert_eq!(t.trouver(ICI, 4000, LO, 53, 1, |_| false), Some(2));
+    assert_eq!(t.trouver(LO, 4000, ICI, 53, 1, |_| false), Some(1));
+    assert_eq!(t.trouver(LO, 4000, LO, 54, 1, |_| false), None);
     // Une socket connectée à l'émetteur l'emporte sur une qui ne l'est pas ;
     // connectée ailleurs, elle n'est pas candidate.
     let mut t: Table<u32> = Table::new().unwrap();
@@ -62,14 +62,14 @@ fn qui_recoit() {
     t.lier(2, Lien { reuseaddr: true, ..lien(TOUT, 9100) }, 2, 0).unwrap();
     t.lier(3, Lien { reuseaddr: true, ..lien(TOUT, 9100) }, 3, 0).unwrap();
     t.changer(3, LO, 5555, TOUT);
-    assert_eq!(t.trouver(LO, 5555, LO, 9100, 1), Some(3));
-    assert_eq!(t.trouver(LO, 5556, LO, 9100, 1), Some(2));
+    assert_eq!(t.trouver(LO, 5555, LO, 9100, 1, |_| false), Some(3));
+    assert_eq!(t.trouver(LO, 5556, LO, 9100, 1, |_| false), Some(2));
     t.changer(2, [10, 9, 9, 9], 1, TOUT);
-    assert_eq!(t.trouver(LO, 5556, LO, 9100, 1), None);
+    assert_eq!(t.trouver(LO, 5556, LO, 9100, 1, |_| false), None);
     // Connectée à une autre adresse, même du bon port : pas candidate non
     // plus.
     t.changer(2, [10, 9, 9, 9], 5556, TOUT);
-    assert_eq!(t.trouver(LO, 5556, LO, 9100, 1), None);
+    assert_eq!(t.trouver(LO, 5556, LO, 9100, 1, |_| false), None);
     assert_eq!(t.lien(3).map(|l| (l.distante, l.port_distant)), Some((LO, 5555)));
 }
 
@@ -100,27 +100,31 @@ fn liees_a_une_interface() {
     assert_eq!(t.lier(3, lien(TOUT, 5000), 3, 0), Err(Refus::Pris), "non liee contre liees");
     assert_eq!(t.lier(3, Lien { interface: IF_LO, ..lien(TOUT, 5000) }, 3, 0), Err(Refus::Pris), "la meme liaison");
     // Chacune voit ce qui arrive par son interface, rien d'autre.
-    assert_eq!(t.trouver(LO, 4000, LO, 5000, IF_LO), Some(1));
-    assert_eq!(t.trouver(ICI, 4000, ICI, 5000, IF_ETH0), Some(2));
-    assert_eq!(t.trouver(ICI, 4000, ICI, 5000, 3), None, "une troisieme interface");
+    assert_eq!(t.trouver(LO, 4000, LO, 5000, IF_LO, |_| false), Some(1));
+    assert_eq!(t.trouver(ICI, 4000, ICI, 5000, IF_ETH0, |_| false), Some(2));
+    assert_eq!(t.trouver(ICI, 4000, ICI, 5000, 3, |_| false), None, "une troisieme interface");
     // Une non liée sur un autre port, plus une liée posée APRÈS le bind (Linux
     // lit la liaison à chaque recherche et à chaque conflit).
     let r = Lien { reuseaddr: true, ..lien(TOUT, 6000) };
     t.lier(4, r, 4, 0).unwrap();
     t.lier(5, r, 5, 0).unwrap();
-    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO), Some(4), "a egalite, la premiere");
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO, |_| false), Some(4), "a egalite, la premiere");
+    // SO_INCOMING_CPU : à note égale, celle du processeur qui cherche ; une
+    // meilleure note l'emporte quand même.
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO, |&o| o == 5), Some(5), "a egalite, celle de ce processeur");
     t.changer_interface(5, IF_LO);
-    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO), Some(5), "liee : +4");
-    assert_eq!(t.trouver(ICI, 4000, ICI, 6000, IF_ETH0), Some(4));
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO, |_| false), Some(5), "liee : +4");
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO, |&o| o == 4), Some(5), "liee : +4, plus que le processeur");
+    assert_eq!(t.trouver(ICI, 4000, ICI, 6000, IF_ETH0, |_| false), Some(4));
     // La liaison compte moins que l'adresse : une socket liée à 0.0.0.0 et à
     // l'interface perd contre une liée à l'adresse (la première passe).
     t.lier(6, Lien { adresse: LO, ..r }, 6, 0).unwrap();
-    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO), Some(6));
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO, |_| false), Some(6));
     t.retirer(6);
     // La connexion compte autant que la liaison : connectée à l'émetteur
     // (+4 +4) l'emporte sur liée (+4).
     t.changer(4, LO, 4000, TOUT);
-    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO), Some(4));
+    assert_eq!(t.trouver(LO, 4000, LO, 6000, IF_LO, |_| false), Some(4));
     // Un conflit lit la liaison du moment : délier la 5 la fait gêner une
     // nouvelle venue sans SO_REUSEADDR.
     t.changer(4, TOUT, 0, TOUT);

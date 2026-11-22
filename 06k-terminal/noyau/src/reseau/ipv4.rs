@@ -78,7 +78,7 @@
 //! un groupe que la carte laisse entrer (`emettre`), sauf IP_MULTICAST_LOOP 0.
 
 use super::interface::{self, Interface};
-use super::paquet::{Paquet, Sortie};
+use super::paquet::{Contexte, Paquet, Sortie};
 use super::snmp::MIB;
 use crate::verrou::Verrou;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -476,6 +476,9 @@ fn livrer(i: &'static Interface, h: ipv4::Ipv4, p: Paquet, compilees: ipv4::Opti
 /// du plus grand morceau. Linux enchaîne les morceaux sans les recopier ; nos paquets
 /// ont un tampon d'un seul tenant, que relisent UDP, ICMP et TCP.
 fn recoller(i: &'static Interface, h: &ipv4::Ipv4, mut f: Fragment) -> Option<(ipv4::Ipv4, Paquet, ipv4::Options, u16)> {
+    // L'heure du dernier morceau arrivé (`ip_frag_queue` : `qp->q.stamp`), que
+    // prend le paquet recollé (`ip_frag_reasm`).
+    let horodatage = f.paquet.contexte().horodatage;
     f.paquet.retirer_entete(h.longueur_entete)?;
     f.paquet.couper(h.longueur as usize - h.longueur_entete);
     let cle = Cle { source: h.source, destination: h.destination, identifiant: h.identifiant, protocole: h.protocole };
@@ -495,8 +498,12 @@ fn recoller(i: &'static Interface, h: &ipv4::Ipv4, mut f: Fragment) -> Option<(i
     // La fin d'`ip_frag_reasm` : un paquet recollé (ReasmOKs), ou pas de mémoire pour lui.
     let recolle = coller(&mut morceaux, longueur as usize, entete as usize, ecn);
     MIB.ip(if recolle.is_some() { Ip::ReasmOKs } else { Ip::ReasmFails });
-    let (h, p) = recolle?;
-    Some((h, p, morceaux.first()?.options, taille_max))
+    let (h, mut p) = recolle?;
+    // Le paquet recollé est le premier morceau chez Linux (`ip_frag_reasm`
+    // réutilise sa tête) : sa marque et sa priorité, l'heure du dernier.
+    let premier = morceaux.first()?;
+    p.poser_contexte(Contexte { horodatage, ..premier.paquet.contexte() });
+    Some((h, p, premier.options, taille_max))
 }
 
 /// Les morceaux d'un paquet complet (`longueur` octets de données, derrière les `entete`
@@ -838,6 +845,8 @@ fn fragmenter(c: Chemin, e: &Envoi, options: &[u8], mut p: Paquet) {
         let reste = donnees.len() - debut;
         let longueur = ipv4::taille_du_fragment(donnees.len(), debut, e.mtu as usize, n);
         let Some(mut q) = Paquet::vide(longueur) else { return MIB.ip(Ip::FragFails) };
+        // La marque et la priorité du paquet (`ip_copy_metadata`).
+        q.poser_contexte(p.contexte());
         // Chaque morceau compte dans le SO_SNDBUF de la socket, comme le
         // paquet entier (`__ip_append_data` les lui attache un à un).
         if let Some(r) = p.retenue() {
@@ -860,6 +869,7 @@ fn rendre_une_copie(i: &'static Interface, e: &Envoi, options: &[u8], p: &Paquet
     let n = ipv4::ENTETE + options.len();
     let total = p.longueur() + n;
     let Some(mut q) = Paquet::vide(total) else { return };
+    q.poser_contexte(p.contexte());
     let Some(o) = q.ajouter_fin(total) else { return };
     let (entete, charge) = o.split_at_mut(n);
     entete[ipv4::ENTETE..].copy_from_slice(options);

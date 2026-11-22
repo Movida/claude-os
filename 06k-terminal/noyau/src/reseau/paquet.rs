@@ -221,6 +221,36 @@ pub struct Paquet {
     fin: usize,
     proprietaire: Option<Proprietaire>,
     sortie: Option<Sortie>,
+    /// Son contexte (`Contexte`), que gardent ses copies et ses morceaux.
+    contexte: Contexte,
+}
+
+/// Ce qu'un paquet porte avec lui, hors de ses octets (trois champs du
+/// `sk_buff`) :
+///   - `horodatage` : l'heure de son arrivée (`tstamp`), en nanosecondes de
+///     la date (CLOCK_REALTIME), posée à l'entrée de la pile (`recevoir`,
+///     reseau/mod.rs : le `net_timestamp_check` de `netif_receive_skb`, et
+///     de `netif_rx` pour lo) ; 0 : jamais arrivé. Linux ne la prend que si
+///     une socket de la machine en veut (une clé statique,
+///     `netstamp_needed_key`, qu'allume SO_TIMESTAMP et qu'éteint la
+///     fermeture de la dernière) ; nous, toujours : le prix d'une lecture
+///     du TSC par paquet, contre une course que Linux a et que nous
+///     n'aurions pas à imiter (un datagramme arrivé juste après
+///     SO_TIMESTAMP, la clé pas encore allumée, se lit à l'heure de sa
+///     lecture : vu sur l'hôte). Un paquet que lo renvoie n'en garde
+///     aucune de son départ (`loopback_xmit` : `skb_clear_tstamp`) : celle
+///     de SO_TXTIME ne passe pas ;
+///   - `marque` (`mark`, SO_MARK) et `priorite` (`priority`, SO_PRIORITY) :
+///     ceux de l'envoi, que lo garde jusqu'au datagramme reçu (SO_RCVMARK,
+///     SO_RCVPRIORITY : mesuré). Rien d'autre ne les lit chez nous : la
+///     marque choisirait une route par des règles (`ip rule`), la priorité
+///     une file de la carte (`pfifo_fast`), et nous n'avons ni l'une ni
+///     l'autre ; reçu du dehors, un paquet n'en a pas (0).
+#[derive(Clone, Copy, Default)]
+pub struct Contexte {
+    pub horodatage: u64,
+    pub marque: u32,
+    pub priorite: u32,
 }
 
 impl Paquet {
@@ -229,14 +259,14 @@ impl Paquet {
     pub fn vide(longueur: usize) -> Option<Paquet> {
         let tampon = faillible::remplie(MARGE + longueur, 0).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: MARGE, fin: MARGE, proprietaire: None, sortie: None })
+        Some(Paquet { tampon, debut: MARGE, fin: MARGE, proprietaire: None, sortie: None, contexte: Contexte::default() })
     }
 
     /// Une copie de la trame `octets` (reçue), sans marge.
     pub fn copie(octets: &[u8]) -> Option<Paquet> {
         let tampon = faillible::copie(octets).ok()?;
         VIVANTS.fetch_add(tampon.capacity(), Ordering::Relaxed);
-        Some(Paquet { tampon, debut: 0, fin: octets.len(), proprietaire: None, sortie: None })
+        Some(Paquet { tampon, debut: 0, fin: octets.len(), proprietaire: None, sortie: None, contexte: Contexte::default() })
     }
 
     /// Les données.
@@ -356,6 +386,23 @@ impl Paquet {
     /// La route qu'il a gardée, s'il est parti par lo.
     pub fn sortie(&self) -> Option<Sortie> {
         self.sortie
+    }
+
+    /// Son contexte : l'heure de son arrivée, sa marque, sa priorité.
+    pub fn contexte(&self) -> Contexte {
+        self.contexte
+    }
+
+    /// Prend le contexte `c` : celui d'un envoi (sa marque et sa priorité),
+    /// ou du paquet dont il est la copie, ou le morceau (`skb_clone`,
+    /// `ip_copy_metadata`).
+    pub fn poser_contexte(&mut self, c: Contexte) {
+        self.contexte = c;
+    }
+
+    /// Il arrive dans la pile, à l'heure `ns` de la date.
+    pub fn horodater(&mut self, ns: u64) {
+        self.contexte.horodatage = ns;
     }
 }
 

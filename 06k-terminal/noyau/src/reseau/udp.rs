@@ -434,7 +434,10 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
                 let o = p.donnees();
                 if u16::from_be_bytes([o[4], o[5]]) > 76 {
                     let ports = (u16::from_be_bytes([o[0], o[1]]), u16::from_be_bytes([o[2], o[3]]));
-                    let s = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(source, ports.0, destination, ports.1, lieu.interface));
+                    let ici = crate::processeur::numero() as i32;
+                    let s = PORTS.verrouiller().as_ref().and_then(|t| {
+                        t.trouver(source, ports.0, destination, ports.1, lieu.interface, |s| de_ce_processeur(s, ici))
+                    });
                     if let Some(s) = s {
                         s.pertes.fetch_add(1, Ordering::Relaxed);
                     }
@@ -472,7 +475,10 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
                 }
                 sockets += 1;
                 match Paquet::copie(p.donnees()) {
-                    Some(copie) => deposer(s, copie, &arrivee),
+                    Some(mut copie) => {
+                        copie.poser_contexte(p.contexte());
+                        deposer(s, copie, &arrivee)
+                    }
                     None => {
                         s.pertes.fetch_add(1, Ordering::Relaxed);
                         MIB.udp(Compteur::RcvbufErrors);
@@ -486,7 +492,10 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
         }
         return Ok(());
     }
-    let s = PORTS.verrouiller().as_ref().and_then(|t| t.trouver(source, u.source, destination, u.destination, lieu.interface));
+    let ici = crate::processeur::numero() as i32;
+    let s = PORTS.verrouiller().as_ref().and_then(|t| {
+        t.trouver(source, u.source, destination, u.destination, lieu.interface, |s| de_ce_processeur(s, ici))
+    });
     match s {
         Some(s) => {
             deposer(&s, p, &arrivee);
@@ -498,6 +507,12 @@ pub fn recevoir(lieu: ipv4::Lieu, source: [u8; 4], destination: [u8; 4], entete:
             Err(p)
         }
     }
+}
+
+/// La socket dit-elle (SO_INCOMING_CPU) le processeur `ici`, celui qui cherche ?
+/// À note égale, elle l'emporte (`compute_score`, inet::ports).
+fn de_ce_processeur(s: &Arc<Socket>, ici: i32) -> bool {
+    s.processeur.load(Ordering::Relaxed) == ici
 }
 
 /// D'où vient un datagramme reçu, et ce qu'en garde la file avec lui.
@@ -513,13 +528,19 @@ struct Arrivee {
 
 /// Le datagramme `p` dans la file de la socket `s`, IP_PKTINFO préparé si
 /// elle l'a à cet instant (`udp_queue_rcv_one_skb`, `ipv4_pktinfo_prepare` :
-/// posé plus tard, la lecture dira l'interface 0 et l'adresse 0.0.0.0).
+/// posé plus tard, la lecture dira l'interface 0 et l'adresse 0.0.0.0). Une
+/// socket connectée note le processeur qui l'a reçu, même si sa file le
+/// refuse (`__udp_queue_rcv_skb` : SO_INCOMING_CPU) ; une qui ne l'est pas
+/// reçoit de tout le monde, et Linux ne le note pas (mesuré : -1).
 fn deposer(s: &Socket, p: Paquet, a: &Arrivee) {
+    if s.connectee.load(Ordering::Relaxed) {
+        s.arrivee_ici();
+    }
     let taille = p.taille_vraie();
     let pktinfo = if s.pktinfo.load(Ordering::Relaxed) { (a.lieu.interface, a.lieu.reponse) } else { (0, format_ipv4::AUCUNE) };
     let d = Datagramme {
         regarde: false, paquet: p, source: a.source, port: a.port, destination: a.destination, pktinfo,
-        entete: a.entete, port_destination: a.port_destination, somme: a.somme, taille,
+        entete: a.entete, port_destination: a.port_destination, somme: a.somme, taille, pertes: 0,
     };
     // `__udp_queue_rcv_skb`.
     if let Err(r) = s.deposer(d, Admission::Udp) {
@@ -576,8 +597,9 @@ pub fn erreur(e: &ErreurRecue) {
     // La socket d'une erreur : cherchée par l'interface qui l'a reçue (le
     // `skb->dev` d'`__udp4_lib_err`), pas par celle de sa route (TCP et ping
     // prennent celle-là).
+    let ici = crate::processeur::numero() as i32;
     let Some(s) = PORTS.verrouiller().as_ref()
-        .and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source, e.interface)) else {
+        .and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source, e.interface, |s| de_ce_processeur(s, ici))) else {
         return MIB.icmp(inet::snmp::Icmp::InErrors);
     };
     apprendre_si_mtu(e);
@@ -625,7 +647,7 @@ pub fn signaler(s: &Socket, e: &ErreurRecue, errno: i32, fatale: bool, port: u16
             s.mettre_en_file(ErreurEnFile {
                 errno, origine: socket::ORIGINE_ICMP, genre: e.genre, code: e.code, info: e.info, ee_data,
                 adresse: e.interne.destination, port, emetteur: e.emetteur, interface: e.interface,
-                arrivee: e.destination, entete: *e.entete, somme: somme_linux(e.message), donnees, taille,
+                arrivee: e.destination, entete: *e.entete, somme: somme_linux(e.message), horodatage: e.horodatage, donnees, taille,
             });
         }
     }

@@ -10,7 +10,7 @@
 //! peut pas faire (OutDiscards, `jete` : le `error:` d'`__ip_append_data`).
 
 use super::ipv4;
-use super::paquet::{self, Paquet};
+use super::paquet::{self, Contexte, Paquet};
 use super::snmp::MIB;
 use super::socket::{self, AF_INET, AF_UNSPEC, Inet, Protocole, Socket};
 use crate::attente::{self, Sommeil};
@@ -271,6 +271,10 @@ pub struct Controle {
     /// IP_RETOPTS : les options de cet envoi, à la place de celles de la
     /// socket (IP_OPTIONS), même vides (l'`ipc.opt` de Linux, alors posé).
     pub options: Option<format_ipv4::OptionsSortantes>,
+    /// SO_MARK et SO_PRIORITY de cet envoi (le `sockc` de son `ipcm_cookie`),
+    /// à la place de ceux de la socket ; IP_TOS donne aussi la priorité.
+    pub marque: Option<u32>,
+    pub priorite: Option<u32>,
 }
 
 /// Ce que donne la route d'un envoi ou d'une connexion.
@@ -366,6 +370,11 @@ pub struct Depart {
     /// (`destination` est alors sa première étape).
     options: format_ipv4::OptionsSortantes,
     destination_finale: [u8; 4],
+    /// La marque et la priorité de ses paquets (`ipcm_init_sk`, puis ses
+    /// messages de contrôle) : celles du premier envoi d'un bouchon
+    /// (`ip_setup_cork`), qui garde son `Depart`.
+    marque: u32,
+    priorite: u32,
 }
 
 impl Depart {
@@ -501,6 +510,7 @@ pub fn preparer(s: &Socket, inet: &mut Inet, destination: [u8; 4], charge: usize
         chemin, source, destination: premiere, mtu: ipv4::mtu_d_envoi(pmtudisc, &chemin, premiere),
         ttl: c.ttl, tos: c.tos, confirmer: drapeaux & MSG_CONFIRM != 0, options,
         destination_finale: if p.route_source != 0 { destination } else { premiere },
+        marque: c.marque.unwrap_or(inet.options.mark), priorite: c.priorite.unwrap_or(inet.options.priority),
     };
     if drapeaux & MSG_PROBE != 0 {
         return Ok(d);
@@ -531,6 +541,7 @@ pub fn faire_paquet(s: &Socket, d: &Depart, charge: usize, pmtudisc: u8, non_blo
     attendre_place(s, non_bloquant, delai)?;
     morceaux_permis(s, charge, d, pmtudisc)?;
     let Some(mut p) = Paquet::vide(charge) else { return Err(jete(-ENOBUFS)) };
+    p.poser_contexte(Contexte { marque: d.marque, priorite: d.priorite, ..Contexte::default() });
     attacher(s, &mut p);
     let Some(segment) = p.ajouter_fin(charge) else { return Err(jete(-ENOBUFS)) };
     remplir(segment).map_err(jete)?;

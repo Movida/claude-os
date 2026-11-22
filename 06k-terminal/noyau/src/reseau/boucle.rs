@@ -176,7 +176,12 @@ pub fn vider_en_attente() {
         while let Some(t) = prochaine() {
             match t.copie_de {
                 None => super::recevoir(lo, t.paquet),
-                Some(i) => super::ipv4::recevoir_la_diffusion(i, t.paquet),
+                Some(i) => {
+                    // La copie d'une diffusion arrive à son tour (`netif_rx`).
+                    let mut p = t.paquet;
+                    p.horodater(crate::temps::ns_calendrier());
+                    super::ipv4::recevoir_la_diffusion(i, p)
+                }
             }
         }
     });

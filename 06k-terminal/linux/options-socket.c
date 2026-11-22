@@ -36,7 +36,21 @@
  *     en CLOSE_WAIT l'ACK de ce qu'on envoie encore : Linux ne le prend pas) ;
  *   - SO_RESERVE_MEM : sans groupe de contrôle de la mémoire (chez nous, et sous Linux
  *     dans le groupe racine) EOPNOTSUPP ; dans un groupe (un conteneur), des pages
- *     réservées pour UDP et TCP ; EINVAL pour une valeur négative.
+ *     réservées pour UDP et TCP ; EINVAL pour une valeur négative ;
+ *   - la réception : SO_TIMESTAMP et SO_TIMESTAMPNS, _OLD et _NEW (qui se relisent
+ *     chacune seulement posée ; l'heure de l'arrivée, pas de la lecture), SO_RXQ_OVFL
+ *     (les pertes d'avant le datagramme), SO_RCVMARK et SO_RCVPRIORITY (la marque et la
+ *     priorité de l'envoi, par lo ; celles d'un message de contrôle de l'envoi, IP_TOS
+ *     compris ; SO_MARK demande CAP_NET_RAW), dans l'ordre de Linux et seulement pour
+ *     qui les dit : UDP tout, ping, la file d'erreurs et TCP l'heure, AF_UNIX l'heure
+ *     d'un datagramme ou d'un paquet (celle de l'envoi, ou de la lecture si l'option
+ *     est venue après) ; SIOCGSTAMP ; SO_INCOMING_CPU (-1, le processeur de la
+ *     réception d'une connexion, et la socket de ce processeur l'emporte à égalité) ;
+ *     SO_INQ d'AF_UNIX en flux (SCM_INQ : ce qui reste à lire). Une course de Linux
+ *     n'est pas exigée : un datagramme arrivé juste après la première SO_TIMESTAMP de
+ *     la machine n'a pas d'heure (la clé `netstamp_needed_key` s'allume en différé, de
+ *     5 à 33 ms mesurés selon la charge) : chaque cas qui veut l'heure de l'arrivée
+ *     attend que la clé soit allumée (`cle_allumee`), jamais un temps fixe.
  * Sur l'hôte comme chez nous.
  */
 #define _GNU_SOURCE
@@ -47,8 +61,10 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/un.h>
@@ -74,6 +90,24 @@
 #ifndef SO_RESERVE_MEM
 #define SO_RESERVE_MEM 73
 #endif
+#ifndef SO_RCVMARK
+#define SO_RCVMARK 75
+#endif
+#ifndef SO_RCVPRIORITY
+#define SO_RCVPRIORITY 82
+#endif
+#ifndef SO_INQ
+#define SO_INQ 84
+#define SCM_INQ SO_INQ
+#endif
+/* Les quatre formes de l'horodatage, par leur numéro (la glibc ne nomme SO_TIMESTAMP
+ * que selon la taille de time_t). */
+#define TS_OLD 29
+#define TSNS_OLD 35
+#define TS_NEW 63
+#define TSNS_NEW 64
+#define SIOCGSTAMP_OLD_ 0x8906
+#define SIOCGSTAMPNS_OLD_ 0x8907
 
 static int echecs;
 
@@ -979,6 +1013,517 @@ static void reserve(void)
     }
 }
 
+
+/* --- La réception. --- */
+
+/* Un message de contrôle reçu : son niveau, sa sorte, la longueur de ses données, et
+ * ses deux premiers mots de 8 octets (ou son entier, dans `a`). */
+struct vu {
+    int niveau, sorte, longueur;
+    long long a, b;
+};
+
+/* recvmsg de `s` avec `drapeaux`, une place de contrôle `place` : rend ce que rend
+ * recvmsg, et remplit `v` (au plus 8), `*n` et `*flags`. */
+static ssize_t controles(int s, int drapeaux, size_t place, struct vu *v, int *n, int *flags)
+{
+    static char ctl[512];
+    char b[2048];
+    struct iovec io = {b, sizeof b};
+    struct msghdr m = {0, 0, &io, 1, ctl, place, 0};
+    memset(ctl, 0, sizeof ctl);
+    ssize_t r = recvmsg(s, &m, drapeaux);
+    *n = 0;
+    *flags = m.msg_flags;
+    if (r < 0)
+        return r;
+    for (struct cmsghdr *c = CMSG_FIRSTHDR(&m); c && *n < 8; c = CMSG_NXTHDR(&m, c)) {
+        struct vu *x = &v[(*n)++];
+        x->niveau = c->cmsg_level, x->sorte = c->cmsg_type, x->longueur = c->cmsg_len - CMSG_LEN(0);
+        x->a = x->b = 0;
+        if (x->longueur == 4) {
+            int e;
+            memcpy(&e, CMSG_DATA(c), 4);
+            x->a = e;
+        } else if (x->longueur >= 16) {
+            memcpy(&x->a, CMSG_DATA(c), 8);
+            memcpy(&x->b, CMSG_DATA(c) + 8, 8);
+        }
+    }
+    return r;
+}
+
+static long long maintenant_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_REALTIME, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+/* L'horloge monotone : pour une durée. */
+static long long monotone_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
+/* Les sauts de l'horloge murale. Les heures du noyau sont murales (CLOCK_REALTIME),
+ * et leur âge se mesure contre elle ; mais elle peut sauter : WSL la recule toutes
+ * les 30 s pour la remettre à l'heure de Windows (mesuré le 23/11/2026 : 113 puis
+ * 138 ms en une minute ; 1,5 s le 7/11), et un démon de l'heure peut en faire autant
+ * ailleurs. Un âge mesuré à travers un saut est faux d'autant (200 ms d'attente, un
+ * recul de 138 ms : 62 ms, et le cas échoue). Le saut se voit à l'écart entre la
+ * murale et la monotone, qui ne change qu'à lui (un ajustement progressif de NTP
+ * touche les deux) : `age_dans` relève l'écart à chaque âge, et, un saut vu, ne juge
+ * plus aucun âge pendant les 5 s qui le suivent (plus le saut lui-même), en le disant
+ * une fois : une heure prise avant lui, lue après, est fausse d'autant, et plusieurs
+ * peuvent l'être (deux heures prises avant un recul de 106 ms, lues l'une après
+ * l'autre : la seconde, jugée seule, avait 214 ms au lieu de 300, vu sur WSL). Passé
+ * ce temps, une heure d'avant le saut aurait plus de 5 s, au-delà de tout âge que juge
+ * ce test : elle serait fausse pour de bon. Le saut suivant est 30 s plus loin. L'écart
+ * se lit entre deux lectures de la monotone proches (100 µs) : une tâche interrompue
+ * entre ses deux lectures y verrait un faux saut. Écartés : corriger l'âge du saut (il
+ * faudrait savoir si l'heure a été prise avant ou après lui, et les heures d'émission
+ * et d'acquittement viennent pendant nos attentes) ; la monotone pour les âges (les
+ * heures du noyau sont murales) ; une marge plus large, qu'un plus grand saut
+ * franchirait encore ; ne pas juger le seul premier âge d'après le saut (les autres
+ * heures prises avant lui restaient jugées). */
+static long long ecart_vu;
+/* Le dernier saut vu : quand (à la monotone ; -1 : aucun), et de combien (en ns). */
+static long long saut_vu_a = -1, saut_vu;
+
+static long long ecart_ns(void)
+{
+    long long m1, r, m2;
+    for (int i = 0; i < 100; i++) {
+        m1 = monotone_ns(), r = maintenant_ns(), m2 = monotone_ns();
+        if (m2 - m1 < 100000)
+            break;
+    }
+    return r - (m1 + m2) / 2;
+}
+
+__attribute__((constructor)) static void ecart_initial(void)
+{
+    ecart_vu = ecart_ns();
+}
+
+/* L'âge `age` (en ns) entre `min` et `max` millisecondes ; vrai, sans le juger, si
+ * l'horloge murale a sauté (de 2 ms ou plus : le dit) depuis moins de 5 s, plus le
+ * saut (voir plus haut). */
+static int age_dans(long long age, int min, int max)
+{
+    long long e = ecart_ns(), saut = e - ecart_vu, ici = monotone_ns();
+    ecart_vu = e;
+    if (saut <= -2000000 || saut >= 2000000) {
+        printf("[linux] options-socket : l'horloge murale a saute de %+lld ms : les ages des 5 s qui suivent ne sont pas juges\n",
+               saut / 1000000);
+        saut_vu_a = ici, saut_vu = saut;
+    }
+    if (saut_vu_a >= 0 && ici - saut_vu_a < 5000000000LL + (saut_vu < 0 ? -saut_vu : saut_vu))
+        return 1;
+    return age >= min * 1000000LL && age <= max * 1000000LL;
+}
+
+/* L'heure d'un horodatage de la sorte `sorte`, son âge entre `min` et `max`
+ * millisecondes, et sa fraction dans ses bornes. */
+static int heure_ok(const struct vu *v, int sorte, int min, int max)
+{
+    int ns = sorte == TSNS_OLD || sorte == TSNS_NEW;
+    if (v->niveau != SOL_SOCKET || v->sorte != sorte || v->longueur != 16 || v->b < 0 || v->b >= (ns ? 1000000000 : 1000000))
+        return 0;
+    return age_dans(maintenant_ns() - (v->a * 1000000000LL + v->b * (ns ? 1 : 1000)), min, max);
+}
+
+static int entier_vu(const struct vu *v, int niveau, int sorte, long long valeur)
+{
+    return v->niveau == niveau && v->sorte == sorte && v->longueur == 4 && v->a == valeur;
+}
+
+/* SIOCGSTAMP : 0 et l'âge de l'heure rendue (en ms), ou l'errno. */
+static int siocgstamp(int s, long long *age)
+{
+    struct timeval t;
+    if (ioctl(s, SIOCGSTAMP_OLD_, &t) < 0)
+        return errno;
+    *age = (maintenant_ns() - (t.tv_sec * 1000000000LL + t.tv_usec * 1000LL)) / 1000000;
+    return 0;
+}
+
+static int udp_lie(struct sockaddr_in *a)
+{
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    *a = (struct sockaddr_in){.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t l = sizeof *a;
+    bind(s, (void *)a, sizeof *a);
+    getsockname(s, (void *)a, &l);
+    return s;
+}
+
+/* Attendre que la clé des horodatages de la machine (`netstamp_needed_key`) soit
+ * allumée : 2 s au moins avant d'abandonner (les vérifications qui suivent le
+ * diront), puis 200 ms pour le confirmer. Linux ne prend l'heure d'arrivée d'un
+ * paquet que si une socket de la machine la demande, et la première demande allume
+ * la clé EN DIFFÉRÉ : `net_enable_timestamp` confie `static_branch_enable` à un
+ * travail (`netstamp_work`), qui réécrit le code et synchronise les processeurs.
+ * Mesuré (sonde des soldes, c12-cle) : 4 à 5 ms au repos, jusqu'à 33 ms quand tous
+ * les cœurs de l'hôte sont occupés. Un paquet arrivé avant n'a pas d'heure, et
+ * SO_TIMESTAMP lui donne celle de sa lecture. Un temps fixe ne tient donc pas sous
+ * la charge (50 ms : un échec sur quatre, les cœurs occupés) : on attend
+ * l'événement lui-même.
+ *
+ * Le témoin : une socket à part, avec SO_TIMESTAMPNS, s'envoie un datagramme, le
+ * laisse 20 ms en file, et le lit. Une heure prise à l'arrivée précède le début de
+ * la lecture d'au moins 20 ms ; une heure prise par la lecture le suit : l'écart
+ * (10 ms de marge, à la nanoseconde de SO_TIMESTAMPNS) ne dépend ni de la charge, ni
+ * de la finesse de l'horloge. Le témoin compte lui aussi dans la clé, mais on ne
+ * l'appelle que quand une socket du cas la tient déjà : sa fermeture ne fait alors
+ * que décompter (`net_disable_timestamp`, au-dessus de 1), sans rien éteindre.
+ *
+ * Allumée, elle doit le rester 200 ms (dix rondes d'affilée). La clé qu'un cas
+ * précédent a rendue en fermant sa dernière socket s'éteint, elle aussi, en
+ * différé : un témoin qui la voit encore allumée à ce moment-là la verrait
+ * s'éteindre juste après (vu sur WSL, juste après `reception_options`), avant que
+ * le travail suivant ne compte la part du cas et ne la rallume pour de bon. 200 ms :
+ * plus de quatre fois l'extinction la plus lente mesurée (44 ms, les cœurs
+ * occupés). Une fois confirmée, elle reste allumée tant que le cas la tient : on ne
+ * l'attend qu'après la demande qui l'allume (la première du cas), pas après les
+ * suivantes. Chez nous, l'heure de l'arrivée ne se fait pas attendre : les dix
+ * premières rondes suffisent. Écarté : un temps fixe plus long, qui recule la limite
+ * sans l'ôter, et ralentit chaque cas. */
+static void cle_allumee(void)
+{
+    struct sockaddr_in a;
+    struct vu v[8];
+    int w = udp_lie(&a), suite = 0, n, f;
+    poser(w, TSNS_OLD, 1);
+    for (int i = 0; i < 110 && suite < 10; i++) {
+        sendto(w, "t", 1, 0, (void *)&a, sizeof a);
+        struct pollfd p = {w, POLLIN, 0};
+        poll(&p, 1, 1000);
+        attendre_ms(20);
+        long long lecture = maintenant_ns();
+        int allumee = controles(w, MSG_DONTWAIT, 512, v, &n, &f) == 1 && n == 1 && v[0].sorte == TSNS_OLD
+                      && v[0].a * 1000000000LL + v[0].b < lecture - 10000000LL;
+        suite = allumee ? suite + 1 : 0;
+    }
+    close(w);
+}
+
+/* Un datagramme d'un octet vers `a`, avec un message de contrôle (niveau, sorte, entier)
+ * si `niveau` n'est pas -1 : l'errno de sendmsg, 0 s'il est parti. */
+static int envoyer_avec(int s, const struct sockaddr_in *a, int niveau, int sorte, int v)
+{
+    char ctl[CMSG_SPACE(sizeof(int))];
+    memset(ctl, 0, sizeof ctl);
+    struct iovec io = {"x", 1};
+    struct msghdr m = {(void *)a, sizeof *a, &io, 1, niveau < 0 ? NULL : ctl, niveau < 0 ? 0 : sizeof ctl, 0};
+    if (niveau >= 0) {
+        struct cmsghdr *c = CMSG_FIRSTHDR(&m);
+        c->cmsg_level = niveau, c->cmsg_type = sorte, c->cmsg_len = CMSG_LEN(sizeof(int));
+        memcpy(CMSG_DATA(c), &v, sizeof v);
+    }
+    return erreur(sendmsg(s, &m, 0));
+}
+
+static int ts4(int s, int a, int b, int c, int d)
+{
+    return lire(s, TS_OLD) == a && lire(s, TSNS_OLD) == b && lire(s, TS_NEW) == c && lire(s, TSNS_NEW) == d;
+}
+
+/* Les options de la réception, sur chaque sorte. */
+static void reception_options(void)
+{
+    for (int i = 0; i < SORTES; i++) {
+        int s = ouvrir(&sortes[i]), ok, v = 1;
+        ok = ts4(s, 0, 0, 0, 0) && poser(s, TSNS_OLD, 1) == 0 && ts4(s, 0, 1, 0, 0) && poser(s, TS_NEW, 1) == 0
+             && ts4(s, 0, 0, 1, 0) && poser(s, TS_OLD, 0) == 0 && ts4(s, 0, 0, 0, 0) && poser(s, TSNS_NEW, 5) == 0
+             && ts4(s, 0, 0, 1, 1) && poser(s, TS_OLD, 1) == 0 && ts4(s, 1, 0, 0, 0) && poser(s, TSNS_NEW, 0) == 0
+             && ts4(s, 0, 0, 0, 0);
+        verifier(ok, dire("SO_TIMESTAMP(NS) _OLD et _NEW %s : chacune relue seulement posee", sortes[i].nom));
+        ok = lire(s, SO_RXQ_OVFL) == 0 && lire(s, SO_RCVMARK) == 0 && lire(s, SO_RCVPRIORITY) == 0
+             && poser(s, SO_RXQ_OVFL, 3) == 0 && poser(s, SO_RCVMARK, 3) == 0 && poser(s, SO_RCVPRIORITY, 3) == 0
+             && lire(s, SO_RXQ_OVFL) == 1 && lire(s, SO_RCVMARK) == 1 && lire(s, SO_RCVPRIORITY) == 1;
+        verifier(ok, dire("SO_RXQ_OVFL, SO_RCVMARK, SO_RCVPRIORITY %s : relues 1", sortes[i].nom));
+        ok = lire(s, SO_MARK) == 0 && (geteuid() == 0 ? poser(s, SO_MARK, 5) == 0 && lire(s, SO_MARK) == 5 && poser(s, SO_MARK, 0) == 0
+                                                      : poser(s, SO_MARK, 0) == EPERM && lire(s, SO_MARK) == 0);
+        verifier(ok, dire("SO_MARK %s : CAP_NET_RAW, meme pour 0", sortes[i].nom));
+        ok = lire(s, SO_INCOMING_CPU) == -1 && poser(s, SO_INCOMING_CPU, -5) == 0 && lire(s, SO_INCOMING_CPU) == -5
+             && poser(s, SO_INCOMING_CPU, 100000) == 0 && lire(s, SO_INCOMING_CPU) == 100000
+             && erreur(setsockopt(s, SOL_SOCKET, SO_INCOMING_CPU, &v, 2)) == EINVAL;
+        verifier(ok, dire("SO_INCOMING_CPU %s : -1, puis toute valeur", sortes[i].nom));
+        if (sortes[i].famille == AF_UNIX && sortes[i].type == SOCK_STREAM)
+            ok = poser(s, SO_INQ, 1) == 0 && poser(s, SO_INQ, 2) == EINVAL && poser(s, SO_INQ, 0) == 0
+                 && erreur(setsockopt(s, SOL_SOCKET, SO_INQ, &v, 8)) == EINVAL;
+        else
+            ok = poser(s, SO_INQ, 1) == ENOPROTOOPT && erreur(setsockopt(s, SOL_SOCKET, SO_INQ, &v, 2)) == EINVAL;
+        ok &= lire(s, SO_INQ) == -1000 - ENOPROTOOPT;
+        verifier(ok, dire("SO_INQ %s : AF_UNIX en flux seule, jamais relue", sortes[i].nom));
+        long long age;
+        verifier(siocgstamp(s, &age) == (sortes[i].famille == AF_UNIX ? ENOTTY : ENOENT),
+                 dire("SIOCGSTAMP %s : rien de lu (AF_UNIX : ENOTTY)", sortes[i].nom));
+        close(s);
+    }
+}
+
+/* UDP par lo : l'heure, la marque, la priorité, dans l'ordre de Linux. */
+static void reception_udp(void)
+{
+    struct sockaddr_in a;
+    int r = udp_lie(&a), s = socket(AF_INET, SOCK_DGRAM, 0), un = 1, p = 5, n, f;
+    struct vu v[8];
+    long long age;
+    sendto(s, "a", 1, 0, (void *)&a, sizeof a);
+    controles(r, 0, 0, v, &n, &f);
+    verifier(siocgstamp(r, &age) == 0 && age_dans(age * 1000000LL, 0, 149), "SIOCGSTAMP udp : apres une lecture sans heure, la sienne");
+    setsockopt(s, SOL_SOCKET, SO_PRIORITY, &p, sizeof p);
+    poser(r, SO_RXQ_OVFL, 1), poser(r, SO_RCVMARK, 1), poser(r, SO_RCVPRIORITY, 1);
+    setsockopt(r, IPPROTO_IP, IP_PKTINFO, &un, sizeof un);
+    int formes[] = {TS_OLD, TSNS_OLD, TS_NEW, TSNS_NEW};
+    for (int i = 0; i < 4; i++) {
+        poser(r, formes[i], 1);
+        if (i == 0)
+            cle_allumee(); /* la première forme l'allume ; r la garde ensuite */
+        sendto(s, "b", 1, 0, (void *)&a, sizeof a);
+        attendre_ms(200);
+        struct vu w[8];
+        int m;
+        controles(r, MSG_PEEK, 512, w, &m, &f);
+        controles(r, 0, 512, v, &n, &f);
+        int ok = n == 4 && m == 4 && heure_ok(&v[0], formes[i], 150, 5000) && w[0].a == v[0].a && w[0].b == v[0].b
+                 && entier_vu(&v[1], SOL_SOCKET, SO_MARK, 0) && entier_vu(&v[2], SOL_SOCKET, SO_PRIORITY, 5)
+                 && v[3].niveau == IPPROTO_IP && v[3].sorte == IP_PKTINFO;
+        char q[96];
+        snprintf(q, sizeof q, "udp : l'heure %d (de l'arrivee, la meme par MSG_PEEK), SO_MARK, SO_PRIORITY, IP_PKTINFO", formes[i]);
+        verifier(ok, q);
+    }
+    verifier(siocgstamp(r, &age) == 0 && age_dans(age * 1000000LL, 0, 4999), "SIOCGSTAMP udp : l'heure gardee de la premiere lecture");
+    poser(r, TSNS_NEW, 0);
+    sendto(s, "c", 1, 0, (void *)&a, sizeof a);
+    controles(r, 0, 512, v, &n, &f);
+    verifier(n == 3 && entier_vu(&v[0], SOL_SOCKET, SO_MARK, 0), "udp : l'heure retiree, plus de SO_TIMESTAMP");
+    poser(r, TS_OLD, 1);
+    verifier(envoyer_avec(s, &a, SOL_SOCKET, SO_PRIORITY, 3) == 0 && controles(r, 0, 512, v, &n, &f) == 1 && n == 4
+             && entier_vu(&v[2], SOL_SOCKET, SO_PRIORITY, 3), "udp : SO_PRIORITY d'un envoi, a la place de celle de la socket");
+    verifier(envoyer_avec(s, &a, IPPROTO_IP, IP_TOS, 0x10) == 0 && controles(r, 0, 512, v, &n, &f) == 1 && n == 4
+             && entier_vu(&v[2], SOL_SOCKET, SO_PRIORITY, 6), "udp : IP_TOS 0x10 d'un envoi, la priorite 6");
+    if (geteuid() == 0) {
+        int marque = 7;
+        setsockopt(s, SOL_SOCKET, SO_MARK, &marque, sizeof marque);
+        verifier(envoyer_avec(s, &a, -1, 0, 0) == 0 && controles(r, 0, 512, v, &n, &f) == 1 && entier_vu(&v[1], SOL_SOCKET, SO_MARK, 7)
+                 && envoyer_avec(s, &a, SOL_SOCKET, SO_MARK, 9) == 0 && controles(r, 0, 512, v, &n, &f) == 1
+                 && entier_vu(&v[1], SOL_SOCKET, SO_MARK, 9), "udp : SO_MARK de la socket, puis d'un envoi, par lo");
+    } else {
+        verifier(envoyer_avec(s, &a, SOL_SOCKET, SO_MARK, 9) == EPERM && envoyer_avec(s, &a, SOL_SOCKET, SO_PRIORITY, 7) == EPERM,
+                 "udp : SO_MARK d'un envoi, et SO_PRIORITY 7, sans CAP_NET_RAW : EPERM");
+    }
+    sendto(s, "d", 1, 0, (void *)&a, sizeof a);
+    verifier(controles(r, 0, CMSG_SPACE(16) - 1, v, &n, &f) == 1 && n == 1 && v[0].sorte == TS_OLD && v[0].longueur == 15
+             && (f & MSG_CTRUNC), "udp : une place de 31 octets, l'heure coupee, MSG_CTRUNC");
+    verifier(lire(r, SO_INCOMING_CPU) == -1, "SO_INCOMING_CPU udp : pas connectee, pas notee");
+    struct sockaddr_in b;
+    socklen_t bl = sizeof b;
+    getsockname(s, (void *)&b, &bl);
+    connect(r, (void *)&b, sizeof b);
+    sendto(s, "e", 1, 0, (void *)&a, sizeof a);
+    controles(r, 0, 512, v, &n, &f);
+    int cpu = lire(r, SO_INCOMING_CPU);
+    verifier(cpu >= 0 && cpu < sysconf(_SC_NPROCESSORS_CONF), "SO_INCOMING_CPU udp : connectee, le processeur de la reception");
+    close(r), close(s);
+}
+
+/* SO_RXQ_OVFL : les pertes d'avant chaque datagramme, dites quand il y en a. */
+static void reception_pertes(void)
+{
+    struct sockaddr_in a;
+    int r = udp_lie(&a), s = socket(AF_INET, SOCK_DGRAM, 0), petit = 1, lus = 0, sans = 1, n, f;
+    struct vu v[8];
+    char gros[1000];
+    memset(gros, 'x', sizeof gros);
+    setsockopt(r, SOL_SOCKET, SO_RCVBUF, &petit, sizeof petit);
+    poser(r, SO_RXQ_OVFL, 1);
+    for (int i = 0; i < 6; i++)
+        sendto(s, gros, sizeof gros, 0, (void *)&a, sizeof a);
+    while (controles(r, MSG_DONTWAIT, 512, v, &n, &f) >= 0)
+        lus++, sans &= n == 0;
+    sendto(s, gros, sizeof gros, 0, (void *)&a, sizeof a);
+    controles(r, 0, 512, v, &n, &f);
+    verifier(lus >= 1 && lus < 6 && sans && n == 1 && entier_vu(&v[0], SOL_SOCKET, SO_RXQ_OVFL, 6 - lus),
+             "SO_RXQ_OVFL udp : rien avant la premiere perte, puis les pertes d'avant le datagramme");
+    poser(r, SO_RXQ_OVFL, 0);
+    sendto(s, gros, sizeof gros, 0, (void *)&a, sizeof a);
+    verifier(controles(r, 0, 512, v, &n, &f) == 1000 && n == 0, "SO_RXQ_OVFL udp : retiree, plus rien");
+    close(r), close(s);
+}
+
+/* Ping, la file d'erreurs : l'heure seule, avant les messages d'IP. */
+static void reception_ping_erreurs(void)
+{
+    int p = socket(AF_INET, SOCK_DGRAM, IPPROTO_ICMP), un = 1, n, f;
+    struct vu v[8];
+    long long age;
+    poser(p, TS_OLD, 1), poser(p, SO_RXQ_OVFL, 1), poser(p, SO_RCVMARK, 1), poser(p, SO_RCVPRIORITY, 1);
+    setsockopt(p, IPPROTO_IP, IP_RECVTTL, &un, sizeof un);
+    cle_allumee();
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    unsigned char echo[8] = {8, 0, 0, 0, 0, 0, 0, 1};
+    sendto(p, echo, sizeof echo, 0, (void *)&a, sizeof a);
+    attendre_ms(200);
+    verifier(controles(p, 0, 512, v, &n, &f) == 8 && n == 2 && heure_ok(&v[0], TS_OLD, 150, 5000)
+             && v[1].niveau == IPPROTO_IP && v[1].sorte == IP_TTL, "ping : l'heure seule (ni pertes, ni marque, ni priorite), puis IP_TTL");
+    verifier(siocgstamp(p, &age) == ENOENT, "SIOCGSTAMP ping : lu avec SO_TIMESTAMP, rien de garde");
+    close(p);
+    int f2 = udp_lie(&a);
+    close(f2);
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    setsockopt(s, IPPROTO_IP, IP_RECVERR, &un, sizeof un);
+    poser(s, TSNS_OLD, 1), poser(s, SO_RXQ_OVFL, 1), poser(s, SO_RCVPRIORITY, 1);
+    cle_allumee();
+    connect(s, (void *)&a, sizeof a);
+    send(s, "h", 1, 0);
+    attendre_ms(200);
+    verifier(controles(s, MSG_ERRQUEUE, 512, v, &n, &f) == 1 && n == 2 && heure_ok(&v[0], TSNS_OLD, 150, 5000)
+             && v[1].niveau == IPPROTO_IP && v[1].sorte == IP_RECVERR, "file d'erreurs : l'heure du message ICMP, puis IP_RECVERR");
+    close(s);
+}
+
+/* AF_UNIX : l'heure d'un datagramme ou d'un paquet ; SO_INQ d'un flux. */
+static void reception_unix(void)
+{
+    int d[2], un = 1, n, f;
+    struct vu v[8];
+    socketpair(AF_UNIX, SOCK_DGRAM, 0, d);
+    poser(d[1], TS_OLD, 1), poser(d[1], SO_PASSCRED, 1), poser(d[1], SO_RXQ_OVFL, 1), poser(d[1], SO_RCVPRIORITY, 1);
+    send(d[0], "i", 1, 0);
+    attendre_ms(200);
+    verifier(controles(d[1], 0, 512, v, &n, &f) == 1 && n == 2 && heure_ok(&v[0], TS_OLD, 150, 5000) && v[1].sorte == SCM_CREDENTIALS,
+             "unix datagrammes : l'heure de l'envoi, puis les droits");
+    poser(d[1], TS_OLD, 0);
+    send(d[0], "j", 1, 0);
+    attendre_ms(200);
+    poser(d[1], TSNS_OLD, 1);
+    verifier(controles(d[1], 0, 512, v, &n, &f) == 1 && n == 2 && heure_ok(&v[0], TSNS_OLD, 0, 149),
+             "unix datagrammes : envoye avant l'option, l'heure de la lecture");
+    close(d[0]), close(d[1]);
+    socketpair(AF_UNIX, SOCK_SEQPACKET, 0, d);
+    poser(d[1], TS_NEW, 1);
+    send(d[0], "k", 1, 0);
+    attendre_ms(200);
+    verifier(controles(d[1], 0, 512, v, &n, &f) == 1 && n == 1 && heure_ok(&v[0], TS_NEW, 150, 5000), "unix paquets : SO_TIMESTAMP_NEW");
+    close(d[0]), close(d[1]);
+    socketpair(AF_UNIX, SOCK_STREAM, 0, d);
+    poser(d[1], TS_OLD, 1), poser(d[1], SO_INQ, 1);
+    send(d[0], "abcdef", 6, 0);
+    send(d[0], "gh", 2, 0);
+    int ok = controles(d[1], MSG_PEEK, 512, v, &n, &f) == 8 && n == 1 && entier_vu(&v[0], SOL_SOCKET, SCM_INQ, 8);
+    struct iovec io;
+    char b[8];
+    struct msghdr m = {0, 0, &io, 1, 0, 0, 0};
+    io = (struct iovec){b, 6};
+    ok &= recvmsg(d[1], &m, 0) == 6;
+    ok &= controles(d[1], 0, 512, v, &n, &f) == 2 && n == 1 && entier_vu(&v[0], SOL_SOCKET, SCM_INQ, 0);
+    verifier(ok, "unix flux : SCM_INQ, ce qui reste a lire (MSG_PEEK compris) ; jamais d'heure");
+    /* Un message lu en partie : Linux le compte jusqu'à sa fin (l'écart d'unix.rs). */
+    send(d[0], "lm", 2, 0);
+    io = (struct iovec){b, 1};
+    char ctl[64];
+    m = (struct msghdr){0, 0, &io, 1, ctl, sizeof ctl, 0};
+    ok = recvmsg(d[1], &m, 0) == 1 && CMSG_FIRSTHDR(&m) && CMSG_FIRSTHDR(&m)->cmsg_type == SCM_INQ;
+    int reste = ok ? *(int *)CMSG_DATA(CMSG_FIRSTHDR(&m)) : -1;
+    verifier(ok && (reste == 1 || reste == 2), "unix flux : SCM_INQ apres une lecture partielle (Linux : 2, nous : 1)");
+    controles(d[1], 0, 512, v, &n, &f);
+    ok = controles(d[1], MSG_DONTWAIT, 512, v, &n, &f) < 0 && errno == EAGAIN;
+    poser(d[1], SO_PASSCRED, 1);
+    shutdown(d[0], SHUT_WR);
+    ok &= controles(d[1], 0, 512, v, &n, &f) == 0 && n == 2 && v[0].sorte == SCM_CREDENTIALS && entier_vu(&v[1], SOL_SOCKET, SCM_INQ, 0);
+    verifier(ok, "unix flux : rien sans lecture (EAGAIN) ; a la fin, les droits puis SCM_INQ 0");
+    close(d[0]), close(d[1]);
+    (void)un;
+}
+
+/* TCP : l'heure seule ; le processeur d'une connexion et de ses filles. */
+static void reception_tcp(void)
+{
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+    socklen_t al = sizeof a;
+    int l = socket(AF_INET, SOCK_STREAM, 0), n, f, cpus = sysconf(_SC_NPROCESSORS_CONF), z = 0;
+    struct vu v[8];
+    long long age;
+    bind(l, (void *)&a, sizeof a);
+    getsockname(l, (void *)&a, &al);
+    listen(l, 4);
+    poser(l, SO_RCVPRIORITY, 1);
+    int c = socket(AF_INET, SOCK_STREAM, 0);
+    connect(c, (void *)&a, sizeof a);
+    int t = accept(l, 0, 0);
+    int ce = lire(c, SO_INCOMING_CPU), ct = lire(t, SO_INCOMING_CPU);
+    verifier(lire(l, SO_INCOMING_CPU) == -1 && ce >= 0 && ce < cpus && ct >= 0 && ct < cpus,
+             "SO_INCOMING_CPU tcp : l'ecoute -1, le client et la fille, un processeur");
+    verifier(lire(t, SO_RCVPRIORITY) == 1, "tcp : la fille prend les drapeaux de son ecoute (SO_RCVPRIORITY)");
+    poser(t, TS_OLD, 1), poser(t, SO_RXQ_OVFL, 1), poser(t, SO_RCVMARK, 1);
+    cle_allumee();
+    send(c, "xy", 2, 0);
+    attendre_ms(200);
+    verifier(controles(t, MSG_PEEK, 512, v, &n, &f) == 2 && n == 1 && heure_ok(&v[0], TS_OLD, 150, 5000)
+             && controles(t, 0, 512, v, &n, &f) == 2 && n == 1 && heure_ok(&v[0], TS_OLD, 150, 5000),
+             "tcp : l'heure de l'arrivee seule (ni pertes, ni marque, ni priorite)");
+    poser(t, TSNS_NEW, 1);
+    send(c, "u", 1, MSG_OOB);
+    attendre_ms(50);
+    verifier(controles(t, MSG_OOB, 512, v, &n, &f) == 1 && n == 0, "tcp : l'octet urgent, sans heure");
+    poser(t, TSNS_NEW, 0);
+    send(c, "w", 1, 0);
+    verifier(controles(t, 0, 512, v, &n, &f) == 1 && n == 0, "tcp : l'heure retiree, plus rien");
+    verifier(siocgstamp(t, &age) == ENOENT, "SIOCGSTAMP tcp : jamais d'heure gardee");
+    close(c), close(t), close(l);
+    (void)z;
+}
+
+/* SO_INCOMING_CPU dans la recherche : épinglé sur le processeur 0, une socket qui le
+ * dit l'emporte à égalité, sans groupe comme dans un groupe SO_REUSEPORT. Trois sockets
+ * au même port, la cible au milieu : ni la plus ancienne (notre choix à égalité), ni la
+ * plus récente (celui de Linux sans groupe : `udp_lib_get_port` la met en tête) ; et un
+ * émetteur neuf à chaque envoi (un autre port source), pour que le hachage d'un groupe
+ * ne tombe pas sur elle par hasard. */
+static void reception_processeur(void)
+{
+    cpu_set_t avant, zero;
+    sched_getaffinity(0, sizeof avant, &avant);
+    CPU_ZERO(&zero);
+    CPU_SET(0, &zero);
+    if (sched_setaffinity(0, sizeof zero, &zero) < 0) {
+        verifier(0, "SO_INCOMING_CPU : epingle sur le processeur 0");
+        return;
+    }
+    for (int groupe = 0; groupe < 2; groupe++) {
+        int option = groupe ? SO_REUSEPORT : SO_REUSEADDR, n, f;
+        struct sockaddr_in a;
+        int x = socket(AF_INET, SOCK_DGRAM, 0), y = socket(AF_INET, SOCK_DGRAM, 0), z = socket(AF_INET, SOCK_DGRAM, 0);
+        struct vu v[8];
+        poser(x, option, 1), poser(y, option, 1), poser(z, option, 1);
+        a = (struct sockaddr_in){.sin_family = AF_INET, .sin_addr.s_addr = htonl(INADDR_LOOPBACK)};
+        socklen_t al = sizeof a;
+        bind(x, (void *)&a, sizeof a);
+        getsockname(x, (void *)&a, &al);
+        bind(y, (void *)&a, sizeof a);
+        bind(z, (void *)&a, sizeof a);
+        poser(y, SO_INCOMING_CPU, 0);
+        int ok = 1;
+        for (int i = 0; i < 4; i++) {
+            int s = socket(AF_INET, SOCK_DGRAM, 0);
+            sendto(s, "p", 1, 0, (void *)&a, sizeof a);
+            ok &= controles(y, MSG_DONTWAIT, 512, v, &n, &f) == 1 && controles(x, MSG_DONTWAIT, 512, v, &n, &f) < 0
+                  && controles(z, MSG_DONTWAIT, 512, v, &n, &f) < 0;
+            close(s);
+        }
+        verifier(ok, groupe ? "SO_INCOMING_CPU : dans un groupe SO_REUSEPORT, celle du processeur"
+                            : "SO_INCOMING_CPU : a egalite (SO_REUSEADDR), celle du processeur");
+        close(x), close(y), close(z);
+    }
+    sched_setaffinity(0, sizeof avant, &avant);
+}
+
 int main(void)
 {
     setvbuf(stdout, NULL, _IOLBF, 0);
@@ -998,6 +1543,13 @@ int main(void)
     groupes();
     memoire();
     reserve();
+    reception_options();
+    reception_udp();
+    reception_pertes();
+    reception_ping_erreurs();
+    reception_unix();
+    reception_tcp();
+    reception_processeur();
     printf("[linux] options-socket : %s\n", echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;
 }

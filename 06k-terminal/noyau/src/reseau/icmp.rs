@@ -172,7 +172,7 @@ pub fn recevoir(i: &'static Interface, iif: u32, h: &format_ipv4::Ipv4, entete: 
             repondre(h, entete, &reponse, &[origine, &t, &t]);
         }
         icmp::INJOIGNABLE | icmp::ETOUFFEMENT | icmp::REDIRECTION | icmp::TEMPS_DEPASSE | icmp::PARAMETRE => {
-            erreur_recue(i, iif, h, entete, &m, donnees, p.donnees())
+            erreur_recue(i, iif, h, entete, &m, donnees, p.donnees(), p.contexte().horodatage)
         }
         _ => {}
     }
@@ -199,6 +199,9 @@ pub struct ErreurRecue<'a> {
     pub iif: u32,
     pub entete: &'a ipv4::EnteteRecu,
     pub message: &'a [u8],
+    /// L'heure d'arrivée du message (paquet::Contexte), que garde l'erreur
+    /// en file (SO_TIMESTAMP de la lecture par MSG_ERRQUEUE).
+    pub horodatage: u64,
 }
 
 /// Un message reçu refusé (InErrors).
@@ -211,8 +214,9 @@ fn refuse() {
 /// regarde pas) ; un code d'injoignable connu (au plus 15) ; un « temps
 /// dépassé » du réassemblage ignoré ; le paquet d'origine lisible (son
 /// en-tête, puis 8 octets : `icmp_socket_deliver`) ; puis son protocole.
+#[allow(clippy::too_many_arguments)]
 fn erreur_recue(i: &'static Interface, iif: u32, h: &format_ipv4::Ipv4, ip: &ipv4::EnteteRecu, m: &Icmp, donnees: &[u8],
-                message: &[u8]) {
+                message: &[u8], horodatage: u64) {
     let entete = donnees.first().map_or(0, |o| (o & 0x0F) as usize * 4);
     if donnees.len() < format_ipv4::ENTETE || (m.genre != icmp::REDIRECTION && entete < format_ipv4::ENTETE) {
         return refuse();
@@ -238,7 +242,7 @@ fn erreur_recue(i: &'static Interface, iif: u32, h: &format_ipv4::Ipv4, ip: &ipv
     };
     let e = ErreurRecue {
         genre: m.genre, code: m.code, info, interne, origine: donnees, emetteur: h.source, destination: h.destination,
-        interface: i.index, iif, entete: ip, message,
+        interface: i.index, iif, entete: ip, message, horodatage,
     };
     match interne.protocole {
         format_ipv4::UDP => super::udp::erreur(&e),

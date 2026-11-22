@@ -333,6 +333,12 @@ pub struct Fille {
     /// `no_srccheck` de sa demande).
     interface: u32,
     transparent: bool,
+    /// Le processeur qui a reçu son dernier segment depuis sa naissance (-1
+    /// avant), que sa socket gardera (`sk_clone_lock`, puis `tcp_v4_rcv` :
+    /// SO_INCOMING_CPU) ; l'heure d'arrivée de ses dernières données (voir
+    /// `Partie::horodatage`).
+    processeur: i32,
+    horodatage: u64,
 }
 
 impl Fille {
@@ -442,6 +448,17 @@ pub struct Partie {
     /// ENOTCONN jusqu'au prochain segment qui en trouve une (`ip_queue_xmit` la
     /// regarde : mesuré).
     route_oubliee: bool,
+    /// L'heure d'arrivée (paquet::Contexte) du dernier segment qui a apporté
+    /// des octets à lire, à la suite : ce que rend SO_TIMESTAMP à une lecture
+    /// (`recevoir_programme_horodate`). Linux rend celle du dernier `sk_buff`
+    /// qu'a touché la lecture (`tcp_update_recv_tstamps`), et un `sk_buff`
+    /// prend celle de chaque segment qu'il absorbe (`tcp_try_coalesce`) : une
+    /// lecture de tout ce qui est là, la règle d'un flux, a donc celle du
+    /// dernier arrivé, la nôtre. Ses `sk_buff` séparent leurs segments
+    /// selon la mémoire qu'ils prennent, un détail de son allocateur : une
+    /// lecture qui s'arrête au milieu peut chez lui dire une heure plus
+    /// ancienne ; rien de ce qu'un programme demande ne le fixe.
+    horodatage: u64,
 }
 
 /// Les options de SOL_TCP.
@@ -599,6 +616,9 @@ pub struct Segment {
     /// et l'achève une fois la socket trouvée (`tcp_checksum_complete`) : ce
     /// qu'il en fait dépend d'elle (`recevoir`).
     somme_fausse: bool,
+    /// Le processeur qui l'a reçu (SO_INCOMING_CPU), noté à son arrivée : une
+    /// file `backlog` le fait traiter plus tard, ailleurs.
+    processeur: i32,
 }
 
 /// La taille vraie de ce qui arrive, pour la borne de la file `backlog`.
@@ -1311,7 +1331,11 @@ impl Partie {
         let recu = s.ip;
         match &mut self.mode {
             Mode::Connexion(t) => {
+                let (avant, heure) = (t.lisibles_dans_le_flux(), s.charge.contexte().horodatage);
                 t.recevoir(&s.entete, s.charge, maintenant());
+                if t.lisibles_dans_le_flux() > avant {
+                    self.horodatage = heure;
+                }
                 // Ce que la connexion a jeté : des pertes de la socket.
                 let n = t.prendre_pertes();
                 if n > 0 {
@@ -1457,6 +1481,10 @@ impl Partie {
                 // une perte pour une fille née ESTABLISHED (une socket chez Linux :
                 // `tcp_rcv_established`), pas pour une en SYN_RECEIVED (la `request_sock`
                 // de `tcp_v4_rcv` : `csum_error`).
+                let deja_nee = !matches!(f.tcb.etat(), Etat::SynRecu | Etat::Fermee);
+                if deja_nee {
+                    f.processeur = s.processeur;
+                }
                 if s.somme_fausse {
                     erreur_de_somme();
                     if f.tcb.etat() == Etat::Etablie {
@@ -1466,10 +1494,15 @@ impl Partie {
                 }
                 f.tcb.reglages.defer_accept = defer;
                 let en_poignee = f.tcb.etat() == Etat::SynRecu;
+                let (avant, heure) = (f.tcb.lisibles_dans_le_flux(), s.charge.contexte().horodatage);
                 f.tcb.recevoir(&s.entete, s.charge, maintenant());
+                if f.tcb.lisibles_dans_le_flux() > avant {
+                    f.horodatage = heure;
+                }
                 let nee = !matches!(f.tcb.etat(), Etat::SynRecu | Etat::Fermee);
                 if en_poignee && nee {
                     f.arrivee = (s.ip.ttl, s.ip.tos, s.interface);
+                    f.processeur = s.processeur;
                 }
                 // Ce qu'une fille en SYN_RECEIVED jette est une perte de l'écoute (le
                 // `discard_and_relse` de `tcp_v4_rcv`, quand `tcp_check_req` rend NULL) ;
@@ -1494,6 +1527,7 @@ impl Partie {
             // (`du_reseau`).
             let objet = TABLE.verrouiller().as_ref().and_then(|t| t.objet(n));
             if let Some(Cible::Socket(sock)) = objet {
+                sock.processeur.store(s.processeur, Ordering::Relaxed);
                 if s.somme_fausse {
                     somme_fausse_vers(&sock, Segment { fille: None, ..s });
                 } else {
@@ -1609,7 +1643,7 @@ impl Partie {
         }
         let mut f = Fille {
             numero, tcb, locale: s.destination, distante: s.source, identifiant: crate::aleatoire::u32() as u16, etablie: false,
-            arrivee: (0, 0, 0), options, interface: ip.oif, transparent: ip.transparent,
+            arrivee: (0, 0, 0), options, interface: ip.oif, transparent: ip.transparent, processeur: -1, horodatage: 0,
         };
         f.emettre(ip, None);
         // La place est prise plus haut, avant tout changement.
@@ -1688,10 +1722,29 @@ fn mss_vers(distante: [u8; 4], oif: u32, portee: Portee) -> u16 {
     }
 }
 
-/// Livre un segment à sa cible, d'après la table.
+/// La cible dit-elle (SO_INCOMING_CPU) le processeur `p` ? Une écoute ainsi
+/// l'emporte à note égale (`compute_score`, ports_tcp).
+fn de_ce_processeur(c: &Cible, p: i32) -> bool {
+    matches!(c, Cible::Socket(s) if s.processeur.load(Ordering::Relaxed) == p)
+}
+
+/// Livre un segment à sa cible, d'après la table. Une connexion (pas une
+/// écoute) note le processeur qui l'a reçu, après IP_MINTTL, une somme
+/// fausse comprise (`tcp_v4_rcv` : `sk_incoming_cpu_update`) ; une fille, à
+/// sa naissance puis à chaque segment (`traiter_ecoute`).
 fn livrer(s: Segment) {
     let h = s.entete;
-    let cible = TABLE.verrouiller().as_ref().and_then(|t| t.trouver(s.source, h.source, s.destination, h.destination, s.interface));
+    let cible = TABLE.verrouiller().as_ref().and_then(|t| {
+        t.trouver(s.source, h.source, s.destination, h.destination, s.interface, |c| de_ce_processeur(c, s.processeur))
+    });
+    // Une connexion (pas une écoute) note le processeur qui l'a reçu, après
+    // IP_MINTTL, mais avant la somme (`tcp_v4_rcv` : `sk_incoming_cpu_update`
+    // suit les examens de `process:`, précède `tcp_v4_do_rcv` et `tcp_add_backlog`).
+    if let Some(Destinataire::Connexion(Cible::Socket(sock))) = &cible
+        && sock.flux.as_ref().is_none_or(|f| s.ip.ttl >= f.court(|c| c.minttl))
+    {
+        sock.processeur.store(s.processeur, Ordering::Relaxed);
+    }
     match cible {
         Some(Destinataire::Connexion(Cible::Socket(sock))) | Some(Destinataire::Ecoute(Cible::Socket(sock))) if s.somme_fausse => {
             somme_fausse_vers(&sock, Segment { fille: None, ..s });
@@ -1781,7 +1834,10 @@ pub fn erreur(e: &super::icmp::ErreurRecue) {
     // (Ses 20 premiers octets au moins sont là : `icmp::ports` les a lus.)
     let ttl = e.origine.get(8).copied().unwrap_or(0);
     // (Cherchée par l'interface de la route du message, `inet_iif` de `tcp_v4_err`.)
-    let cible = TABLE.verrouiller().as_ref().and_then(|t| t.trouver(i.destination, port_destination, i.source, port_source, e.iif));
+    let ici = crate::processeur::numero() as i32;
+    let cible = TABLE.verrouiller().as_ref().and_then(|t| {
+        t.trouver(i.destination, port_destination, i.source, port_source, e.iif, |c| de_ce_processeur(c, ici))
+    });
     let (sock, fille) = match cible {
         Some(Destinataire::Connexion(Cible::Socket(s))) => (s, None),
         Some(Destinataire::Connexion(Cible::Fille(ecoute, n))) => (ecoute, Some(n)),
@@ -1826,7 +1882,10 @@ fn temps_attente(n: u64, s: Segment) {
         (issue, *e)
     };
     if let Some(isn) = issue.reprendre {
-        if TABLE.verrouiller().as_ref().and_then(|t| t.ecoute(s.destination, h.destination, s.interface)).is_some() {
+        let ecoute = TABLE.verrouiller().as_ref().and_then(|t| {
+            t.ecoute(s.destination, h.destination, s.interface, |c| de_ce_processeur(c, s.processeur))
+        });
+        if ecoute.is_some() {
             effacer_temps_attente(n);
             livrer(Segment { isn: Some(isn), ..s });
         } else {
@@ -1928,7 +1987,10 @@ pub fn recevoir(ip: &fipv4::Ipv4, recu: &ipv4::EnteteRecu, i: &super::interface:
     let entete = p.longueur() - charge.len();
     let _ = p.retirer_entete(entete);
     let _contexte = contexte::entrer();
-    livrer(Segment { entete: h, charge: p, source, destination, ip: *recu, interface: iif, diffusion, fille: None, isn: None, somme_fausse });
+    livrer(Segment {
+        entete: h, charge: p, source, destination, ip: *recu, interface: iif, diffusion, fille: None, isn: None, somme_fausse,
+        processeur: crate::processeur::numero() as i32,
+    });
 }
 
 // --- Les appels ---
@@ -1941,7 +2003,7 @@ pub fn nouvelle(numero: u64) -> Option<Possession<Partie>> {
     let partie = Partie {
         numero, mode: Mode::Neuve, adresses: Adresses::default(), identifiant: 0, orpheline: false, hors_table: false,
         options: OptionsTcp::DEFAUT, etat_socket: EtatSocket::NonConnectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
-        route_oubliee: false,
+        route_oubliee: false, horodatage: 0,
     };
     let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
     Some(Possession::new(partie, premier))
@@ -2316,7 +2378,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             let f = filles.remove(i).expect("la fille");
             let (port, distante, port_distant, locale) = (f.tcb.port_local, f.distante, f.tcb.port_distant, f.locale);
             let (mc_ttl, rcv_tos, mc_index) = f.arrivee;
-            let (numero, ip_options, interface) = (f.numero, f.options, f.interface);
+            let (numero, ip_options, interface, processeur, horodatage) = (f.numero, f.options, f.interface, f.processeur, f.horodatage);
             let enfant = enfant.avec_numero(numero);
             // Une fille fermée avant l'accept (un RST) a déjà quitté la
             // table : sa lecture dira son erreur.
@@ -2337,7 +2399,7 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
                 // `inet_csk_delack_init`) : la fille n'attend pas de données pour naître deux fois.
                 options: OptionsTcp { defer_accept: 0, quickack: true, ip_options, interface, ..p.options },
                 etat_socket: EtatSocket::Connectee, deconnexions: 0, echeance_armee: None, memoire_comptee: 0, erreur_seule: 0, retenue,
-                route_oubliee: false,
+                route_oubliee: false, horodatage,
             };
             let premier = partie.premier(0, SNDBUF_DEFAUT as usize, RCVBUF_DEFAUT as usize);
             let flux = alloc::boxed::Box::write(place_flux, Possession::new(partie, premier));
@@ -2349,6 +2411,10 @@ pub fn accepter(s: &Arc<Socket>, non_bloquant: bool) -> Result<(Arc<Socket>, [u8
             enfant.pmtudisc.store(options.pmtudisc, Ordering::Relaxed);
             enfant.peek_off.store(s.peek_off.load(Ordering::Relaxed), Ordering::Relaxed);
             enfant.mc_all.store(s.mc_all.load(Ordering::Relaxed), Ordering::Relaxed);
+            // Une copie de l'écoute (`sk_clone_lock`) : ses drapeaux de réception
+            // (SO_TIMESTAMP, SO_RXQ_OVFL...) ; le processeur de sa naissance.
+            enfant.drapeaux.store(s.drapeaux.load(Ordering::Relaxed), Ordering::Relaxed);
+            enfant.processeur.store(processeur, Ordering::Relaxed);
             enfant.appels.verrouiller().options = socket::Options { mc_ttl, rcv_tos, mc_index, ip_options, interface, ..options };
             if let Some(t) = TABLE.verrouiller().as_mut() {
                 t.changer_objet(numero, Cible::Socket(enfant.clone()));
@@ -2548,7 +2614,17 @@ pub fn envoyer(s: &Arc<Socket>, longueur: usize, drapeaux: u64, mut remplir: imp
 /// les octets ; MSG_WAITALL attend tout ; MSG_TRUNC les jette. Pas
 /// connectée : ENOTCONN.
 pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_bloquant: bool,
-                          mut copier: impl FnMut(usize, &[u8]) -> Result<usize, i64>) -> Result<usize, i64> {
+                          copier: impl FnMut(usize, &[u8]) -> Result<usize, i64>) -> Result<usize, i64> {
+    recevoir_programme_horodate(s, longueur, drapeaux, non_bloquant, copier).map(|(n, _)| n)
+}
+
+/// `recevoir_programme`, et l'heure d'arrivée qu'en dit SO_TIMESTAMP (voir
+/// `Partie::horodatage`) : celle de la connexion quand la lecture a touché
+/// des octets reçus (`tcp_recvmsg_locked` : chaque `sk_buff` qu'elle
+/// parcourt, même pour n'en sauter que l'octet urgent, puis le FIN : 0
+/// octet rendu, et l'heure quand même, mesuré) ; None sinon.
+pub fn recevoir_programme_horodate(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_bloquant: bool,
+                                   mut copier: impl FnMut(usize, &[u8]) -> Result<usize, i64>) -> Result<(usize, Option<u64>), i64> {
     const MSG_PEEK: u64 = 2;
     const MSG_TRUNC: u64 = 0x20;
     const MSG_DONTWAIT: u64 = 0x40;
@@ -2577,6 +2653,7 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
     let decalage_de_depart = if peek { s.decalage_de_peek() } else { 0 };
     let mut debut = decalage_de_depart;
     let mut lu_au_depart = None;
+    let mut heure = None;
     loop {
         let arret = g.avec_court(|_, c| c.arret);
         let p = g.donnee();
@@ -2600,7 +2677,7 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
         // le programme lise l'octet urgent avant de continuer.
         if t.a_la_marque_depuis(debut) {
             if fait > 0 {
-                return Ok(fait);
+                return Ok((fait, heure));
             }
             if crate::tache::signal_en_attente() {
                 return Err(if non_bloquant {
@@ -2618,6 +2695,7 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
         // qui suit, ou attend.
         let a_lire = if peek { t.lisibles_depuis(debut) } else { t.lisibles() };
         if a_lire > 0 {
+            heure = Some(p.horodatage);
             let lu = if drapeaux & MSG_TRUNC != 0 && peek {
                 // Rien n'est retiré, rien n'est copié : on compte (`tcp_recvmsg_locked`).
                 t.lire_depuis(&mut debut, longueur - fait, true, |o| Ok::<usize, i64>(o.len()))
@@ -2653,25 +2731,25 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
             g.publier(|p, c| p.rafraichir(c));
             match faute {
                 Some(e) if fait == 0 => return Err(e),
-                Some(_) => return Ok(fait),
+                Some(_) => return Ok((fait, heure)),
                 None => {}
             }
             if fait == longueur || fait >= cible.max(1) {
-                return Ok(fait);
+                return Ok((fait, heure));
             }
             continue;
         }
         if fait >= cible.max(1) {
-            return Ok(fait);
+            return Ok((fait, heure));
         }
         let p = g.donnee();
-        let Mode::Connexion(t) = &mut p.mode else { return Ok(fait) };
+        let Mode::Connexion(t) = &mut p.mode else { return Ok((fait, heure)) };
         // Rien de copié : le FIN d'abord (SOCK_DONE), puis l'erreur : un RST après le FIN laisse
         // lire la fin (`tcp_recvmsg_locked`), SO_ERROR dira l'erreur. Des octets copiés : ils sont
         // rendus, l'erreur attend l'appel suivant.
         if t.erreur() != 0 && !t.fin_recue() {
             if fait > 0 {
-                return Ok(fait);
+                return Ok((fait, heure));
             }
             let e = t.prendre_erreur();
             g.publier(|p, c| p.rafraichir(c));
@@ -2681,13 +2759,13 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
             if !peek {
                 t.lecture_finie();
             }
-            return Ok(fait);
+            return Ok((fait, heure));
         }
         if matches!(t.etat(), Etat::SynEnvoye | Etat::SynRecu) && non_bloquant {
             return Err(-EAGAIN);
         }
         if non_bloquant {
-            return if fait > 0 { Ok(fait) } else { Err(-EAGAIN) };
+            return if fait > 0 { Ok((fait, heure)) } else { Err(-EAGAIN) };
         }
         // Ce qui arrive de neuf, plus ce qui est déjà là (que MSG_PEEK a déjà vu).
         let vu = t.lisibles_dans_le_flux();
@@ -2699,9 +2777,9 @@ pub fn recevoir_programme(s: &Arc<Socket>, longueur: usize, drapeaux: u64, non_b
         match r {
             // Une place de 0 : un seul tour, attente comprise (le `while (len > 0)` de
             // `tcp_recvmsg_locked`), et 0 quoi qu'il en sorte, même si le délai est passé (mesuré).
-            Reveil::Reveillee | Reveil::Echeance if longueur == 0 => return Ok(0),
+            Reveil::Reveillee | Reveil::Echeance if longueur == 0 => return Ok((0, heure)),
             Reveil::Reveillee => {}
-            _ if fait > 0 => return Ok(fait),
+            _ if fait > 0 => return Ok((fait, heure)),
             Reveil::Echeance => return Err(-EAGAIN),
             Reveil::Signal => return Err(if delai.is_some() { -EINTR } else { -crate::reprise::ERESTARTSYS }),
         }

@@ -231,7 +231,13 @@ impl<T: Clone> Table<T> {
 
     /// La socket qui reçoit un datagramme de `source`:`port_source` pour
     /// `destination`:`port`, arrivé par l'interface `iif` (voir plus haut).
-    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, iif: u32) -> Option<T> {
+    /// `ici` : la socket dit-elle (SO_INCOMING_CPU) le processeur qui
+    /// cherche ? Un point de plus (`compute_score`) : à note égale, elle
+    /// l'emporte (le choix par processeur d'un groupe SO_REUSEPORT,
+    /// `reuseport_select_sock_by_hash`, revient au même : la première de ce
+    /// processeur).
+    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, iif: u32,
+                   ici: impl Fn(&T) -> bool) -> Option<T> {
         let note = |l: &Lien, locale: [u8; 4]| -> Option<u32> {
             if l.port != port || l.adresse != locale {
                 return None;
@@ -264,6 +270,7 @@ impl<T: Clone> Table<T> {
             let mut meilleure: Option<(u32, &Entree<T>)> = None;
             for e in &self.entrees {
                 if let Some(n) = note(&e.lien, locale) {
+                    let n = 2 * n + ici(&e.objet) as u32;
                     if meilleure.is_none_or(|(m, _)| n > m) {
                         meilleure = Some((n, e));
                     }

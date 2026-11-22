@@ -37,7 +37,7 @@
 //! tient la socket (le `fdget` de 6e) jusqu'à ce qu'un datagramme arrive.
 
 use super::ipv4::EnteteRecu;
-use super::paquet::Paquet;
+use super::paquet::{Contexte, Paquet};
 use super::snmp::MIB;
 use crate::appels_fichiers::FichierTenu;
 use crate::attente::{self, FileAttente, Mutex, Sommeil};
@@ -48,7 +48,7 @@ use crate::tache::{self, Reveil};
 use crate::verrou::Verrou;
 use crate::faillible::{self, FileFaillible};
 use alloc::collections::VecDeque;
-use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicU8, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use inet::snmp::Udp;
 
 /// POLLRDHUP : l'autre côté a fermé (ou la lecture est arrêtée).
@@ -197,6 +197,10 @@ pub struct ErreurEnFile {
     /// La somme de tout le message ICMP (IP_CHECKSUM : `icmp_rcv` l'a
     /// calculée en le vérifiant, CHECKSUM_COMPLETE).
     pub somme: u32,
+    /// L'heure d'arrivée du message ICMP (paquet::Contexte) ; 0 pour une
+    /// erreur locale, que Linux fait sans heure (`ip_local_error`) : la
+    /// lecture lui donne la sienne (SO_TIMESTAMP, `__sock_recv_timestamp`).
+    pub horodatage: u64,
     pub donnees: Paquet,
     /// Sa taille vraie (elle compte dans SO_RCVBUF, avec les datagrammes).
     pub taille: usize,
@@ -239,6 +243,10 @@ pub struct Datagramme {
     pub port_destination: u16,
     pub somme: Somme,
     pub taille: usize,
+    /// Les pertes de la socket quand il est arrivé, si elle avait alors
+    /// SO_RXQ_OVFL (`dropcount` : `sock_skb_set_dropcount`, et pour UDP le
+    /// même compte avant chaque lot, `__udp_enqueue_schedule_skb`) ; 0 sinon.
+    pub pertes: u32,
 }
 
 impl ErreurEnFile {
@@ -248,7 +256,7 @@ impl ErreurEnFile {
         let donnees = Paquet::vide(0)?;
         Some(ErreurEnFile {
             errno, origine: ORIGINE_LOCALE, genre: 0, code: 0, info, ee_data: 0, adresse, port, emetteur: [0; 4], interface: 0,
-            arrivee: [0; 4], entete: EnteteRecu::AUCUN, somme: 0, taille: donnees.taille_vraie(), donnees,
+            arrivee: [0; 4], entete: EnteteRecu::AUCUN, somme: 0, horodatage: 0, taille: donnees.taille_vraie(), donnees,
         })
     }
 
@@ -310,6 +318,8 @@ pub struct Options {
     pub oobinline: bool,
     pub no_check: bool,
     pub priority: u32,
+    /// SO_MARK (`sk_mark`) : la marque de ses envois (paquet::Contexte).
+    pub mark: u32,
     /// SO_LINGER : en marche, et le délai en tics (`sk_lingertime`, en
     /// jiffies) : LINGER_INFINI pour un délai qui ne finit pas.
     pub linger: (bool, u64),
@@ -429,6 +439,27 @@ pub const LINGER_INFINI: u64 = i64::MAX as u64;
 pub const VERROU_SNDBUF: u8 = 1;
 pub const VERROU_RCVBUF: u8 = 2;
 
+/// Les drapeaux de réception de `Socket::drapeaux`, ceux du `sk_flags` de
+/// Linux : SO_TIMESTAMP, SO_TIMESTAMPNS et leurs formes _NEW posent
+/// RCVTSTAMP, RCVTSTAMPNS (les nanosecondes) et TSTAMP_NEW (la forme
+/// _NEW, dite par le type du message de contrôle : les deux ont 16 octets
+/// sur x86_64) ; TIMESTAMP (SOCK_TIMESTAMP) : une lecture garde l'heure de
+/// son datagramme pour SIOCGSTAMP, posé par SIOCGSTAMP lui-même et par
+/// toute forme de SO_TIMESTAMP, et jamais retiré (`sock_enable_timestamp`) ;
+/// RXQ_OVFL, RCVMARK, RCVPRIORITY : leurs options ; INQ : SO_INQ d'AF_UNIX
+/// (le `recvmsg_inq` de son `unix_sock`).
+pub const RCVTSTAMP: u16 = 1;
+pub const RCVTSTAMPNS: u16 = 2;
+pub const TSTAMP_NEW: u16 = 4;
+pub const TIMESTAMP: u16 = 8;
+pub const RXQ_OVFL: u16 = 16;
+pub const RCVMARK: u16 = 32;
+pub const RCVPRIORITY: u16 = 64;
+pub const INQ: u16 = 128;
+
+/// `sk_stamp` avant toute lecture (SK_DEFAULT_STAMP : -1 s).
+pub const HORODATAGE_AUCUN: i64 = -1_000_000_000;
+
 /// Le programme qui appelle a-t-il les droits d'administrer le réseau
 /// (CAP_NET_ADMIN, CAP_NET_RAW, CAP_NET_BIND_SERVICE : chez nous, root les
 /// a tous, et lui seul) ? Ceux de QUI APPELLE (`sockopt_ns_capable`,
@@ -445,6 +476,25 @@ pub fn appelant_privilegie() -> bool {
 static COOKIES: AtomicU64 = AtomicU64::new(0);
 
 impl Socket {
+    /// Le drapeau de réception `d` est-il posé (`sock_flag`) ?
+    pub fn drapeau(&self, d: u16) -> bool {
+        self.drapeaux.load(Ordering::Relaxed) & d != 0
+    }
+
+    /// Pose ou retire les drapeaux `d` (`sock_valbool_flag`).
+    pub fn poser_drapeau(&self, d: u16, oui: bool) {
+        if oui {
+            self.drapeaux.fetch_or(d, Ordering::Relaxed);
+        } else {
+            self.drapeaux.fetch_and(!d, Ordering::Relaxed);
+        }
+    }
+
+    /// Un paquet arrive pour elle sur ce processeur (`sk_incoming_cpu_update`).
+    pub fn arrivee_ici(&self) {
+        self.processeur.store(crate::processeur::numero() as i32, Ordering::Relaxed);
+    }
+
     /// SO_COOKIE (`sock_gen_cookie`) : celui de la socket, donné au premier
     /// besoin ; deux appels concurrents gardent le même (le premier
     /// `compare_exchange` gagne, comme le `atomic64_cmpxchg` de Linux).
@@ -464,7 +514,7 @@ impl Socket {
 impl Options {
     const DEFAUT: Options = Options {
         reuseaddr: false, reuseport: false, broadcast: false, keepalive: false, debug: false, dontroute: false,
-        oobinline: false, no_check: false, priority: 0, linger: (false, 0), verrous_tampons: 0,
+        oobinline: false, no_check: false, priority: 0, mark: 0, linger: (false, 0), verrous_tampons: 0,
         busy_poll: 0, prefer_busy_poll: false, busy_poll_budget: 0, wifi_status: false, nofcs: false,
         txtime: false, txtime_horloge: 0, txtime_drapeaux: 0, txrehash: 1, rcvlowat: 1,
         rcvtimeo: None, sndtimeo: None, tos: 0, ttl: None, pktinfo: false, unicast_if: 0, interface: 0, recverr: false, pmtudisc: 1,
@@ -530,6 +580,20 @@ pub struct Socket {
     /// écoute (`tcp_listendrop`, `tcp_drop_reason`). Un `atomic_t` chez Linux :
     /// il fait le tour.
     pub pertes: AtomicU32,
+    /// Ses drapeaux de réception (les bits du `sk_flags` de Linux qui les
+    /// tiennent, atomiques comme eux : la tâche du réseau et l'envoi
+    /// d'AF_UNIX les lisent sans le `Mutex`) : voir `RCVTSTAMP` et la suite.
+    pub drapeaux: AtomicU16,
+    /// L'heure du dernier datagramme lu (`sk_stamp`), que rend SIOCGSTAMP
+    /// (appels_reseau.rs, `heure_du_dernier` ; la lecture l'écrit :
+    /// `heure_lue`, `controle_udp`) : HORODATAGE_AUCUN tant que rien n'a été
+    /// lu ; 0 : une lecture sans heure à garder, SIOCGSTAMP prendra la sienne.
+    pub horodatage: AtomicI64,
+    /// SO_INCOMING_CPU (`sk_incoming_cpu`) : le processeur qui a reçu son
+    /// dernier paquet (une socket UDP connectée, une connexion TCP), ou
+    /// celui que le programme a posé ; -1 au départ. Une recherche de
+    /// socket préfère, à note égale, celle de ce processeur.
+    pub processeur: AtomicI32,
     /// Ce que la tâche du réseau doit savoir d'une socket quand une erreur
     /// ICMP arrive, sans prendre le `Mutex` : est-elle connectée (le
     /// `sk_state` de Linux) ? a-t-elle IP_RECVERR (un bit atomique de
@@ -617,6 +681,9 @@ impl Socket {
             rcvbuf: AtomicU32::new(TAMPON_DEFAUT),
             sndbuf: AtomicU32::new(TAMPON_DEFAUT),
             pertes: AtomicU32::new(0),
+            drapeaux: AtomicU16::new(0),
+            horodatage: AtomicI64::new(HORODATAGE_AUCUN),
+            processeur: AtomicI32::new(-1),
             connectee: AtomicBool::new(false),
             recverr: AtomicBool::new(false),
             place_manquee: AtomicBool::new(false),
@@ -700,8 +767,10 @@ impl Socket {
     /// `admission` le permet ; puis ceux qui attendent sont réveillés (le
     /// `sock_def_readable`). Err : jeté, la file pleine (SO_RCVBUF), ou
     /// plus de mémoire pour elle.
-    pub fn deposer(&self, d: Datagramme, admission: Admission) -> Result<(), Rejet> {
+    pub fn deposer(&self, mut d: Datagramme, admission: Admission) -> Result<(), Rejet> {
         let rcvbuf = self.rcvbuf.load(Ordering::Relaxed) as usize;
+        // Les pertes d'avant lui, si la socket veut les savoir (SO_RXQ_OVFL).
+        d.pertes = if self.drapeau(RXQ_OVFL) { self.pertes.load(Ordering::Relaxed) } else { 0 };
         {
             let mut r = self.reception.verrouiller();
             let refuse = match admission {
@@ -885,12 +954,21 @@ pub struct Recu {
     pub pktinfo: (u32, [u8; 4]),
     pub coupe: bool,
     pub ip: Option<ControleIp>,
+    /// Ce que disent les messages de contrôle de SOL_SOCKET : l'heure
+    /// d'arrivée, la marque et la priorité (paquet::Contexte ; une heure 0 :
+    /// aucune, la lecture prendra la sienne), les pertes d'avant lui
+    /// (`Datagramme::pertes`).
+    pub contexte: Contexte,
+    pub pertes: u32,
 }
 
 impl Recu {
     /// Rien de reçu, ou un flux : ni émetteur, ni messages de contrôle IP.
     pub fn sans_emetteur(longueur: usize, coupe: bool) -> Recu {
-        Recu { vide: true, longueur, source: [0; 4], port: 0, destination: [0; 4], pktinfo: (0, [0; 4]), coupe, ip: None }
+        Recu {
+            vide: true, longueur, source: [0; 4], port: 0, destination: [0; 4], pktinfo: (0, [0; 4]), coupe, ip: None,
+            contexte: Contexte::default(), pertes: 0,
+        }
     }
 }
 
@@ -950,6 +1028,7 @@ pub fn prendre(s: &Socket, place: usize, drapeaux: u64, non_bloquant: bool, mut 
             if let Some(k) = k {
                 let premier = &mut r.file[k];
                 let (source, port, destination, pktinfo) = (premier.source, premier.port, premier.destination, premier.pktinfo);
+                let (contexte, pertes) = (premier.paquet.contexte(), premier.pertes);
                 let total = premier.paquet.longueur();
                 let dispo = total - reste;
                 // La somme d'UDP qui attend une lecture qui coupe ou qui regarde
@@ -1002,7 +1081,7 @@ pub fn prendre(s: &Socket, place: usize, drapeaux: u64, non_bloquant: bool, mut 
                 } else {
                     s.peek_recule(longueur);
                 }
-                return Ok(Recu { vide: false, longueur, source, port, destination, pktinfo, coupe, ip: Some(ip) });
+                return Ok(Recu { vide: false, longueur, source, port, destination, pktinfo, coupe, ip: Some(ip), contexte, pertes });
             }
         }
         // Rien en file : EAGAIN sans attendre, même après l'arrêt de la

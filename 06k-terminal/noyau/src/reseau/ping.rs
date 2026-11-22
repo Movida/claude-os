@@ -185,7 +185,7 @@ pub fn recevoir(interface: u32, iif: u32, source: [u8; 4], destination: [u8; 4],
     let somme = formats::reseau::somme_linux(p.donnees());
     let d = Datagramme {
         regarde: false, paquet: p, source, port: 0, destination, pktinfo: (interface, [0; 4]), entete: *entete, port_destination,
-        somme: socket::Somme::Calculee(somme), taille,
+        somme: socket::Somme::Calculee(somme), taille, pertes: 0,
     };
     if s.deposer(d, Admission::Ordinaire).is_err() {
         FILE_PLEINE.fetch_add(1, Ordering::Relaxed);

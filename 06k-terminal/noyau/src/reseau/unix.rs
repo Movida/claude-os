@@ -85,10 +85,11 @@
 //! précédent redevient un octet comme un autre. Lu à part, il reste en file, vide : une marque
 //! (SIOCATMARK), où s'arrête la lecture d'avant, et que jette celle d'après (`prochain_du_flux`).
 //!
-//! ÉCART : SIOCINQ dit ce qui reste à lire : Linux 6.18 tient un
-//! compte à part (`inq_len`), qui ne descend qu'à la fin d'un message (mesuré : 6 à lire, 1 lu : 6
-//! encore), et qui oublie l'octet urgent sauté (il dit 1, la file vide, pour toujours) : pas un
-//! comportement sur lequel un programme peut compter.
+//! ÉCART : SIOCINQ, et SCM_INQ (SO_INQ, le même compte après chaque lecture), disent ce qui reste à
+//! lire : Linux 6.18 tient un compte à part (`inq_len`), qui ne descend qu'à la fin d'un message
+//! (mesuré : 6 à lire, 1 lu : 6 encore ; SCM_INQ, « abcdef » et « gh », 6 lus puis 1 : 2 encore), et
+//! qui oublie l'octet urgent sauté (il dit 1, la file vide, pour toujours) : pas un comportement sur
+//! lequel un programme peut compter.
 
 use super::socket::{Protocole, Socket, ARRET_ECRITURE, ARRET_LECTURE, POLLRDHUP};
 use crate::asynchrone::Raison;
@@ -294,6 +295,12 @@ struct Message {
     numero_oob: u64,
     /// Un message vide déjà vu par MSG_PEEK (`skb->peeked`) : SO_PEEK_OFF passe au suivant.
     regarde: bool,
+    /// L'heure de son envoi (SO_TIMESTAMP), en nanosecondes de la date, si la
+    /// receveuse avait SO_TIMESTAMP quand il est arrivé dans sa file (un DGRAM
+    /// ou un SEQPACKET : `unix_dgram_sendmsg`, `__net_timestamp`) ; 0 sinon,
+    /// et la lecture qui en voudra une lui donnera la sienne (gardée par
+    /// MSG_PEEK : `__sock_recv_timestamp`). Un flux n'en a jamais.
+    horodatage: u64,
 }
 
 impl Message {
@@ -867,7 +874,7 @@ fn connecter_flux(s: &Arc<Socket>, n: &Nom, non_bloquant: bool) -> Result<(), i6
         }
         // Le message qui apporte la fille à l'écoute.
         let mut ea = ua.etat.verrouiller();
-        let deposee = !ea.morte && ea.file.ajouter_derriere(Message { regarde: false, octets: Vec::new(), lus: 0, taille: 0, emetteur: None, fichiers: Vec::new(), vol: 0, droits: None, numero_oob: 0, enfant: Some(enfant.clone()) }).is_ok();
+        let deposee = !ea.morte && ea.file.ajouter_derriere(Message { regarde: false, octets: Vec::new(), lus: 0, taille: 0, emetteur: None, fichiers: Vec::new(), vol: 0, droits: None, numero_oob: 0, horodatage: 0, enfant: Some(enfant.clone()) }).is_ok();
         drop(ea);
         if !deposee {
             // L'écoute vient de fermer, ou plus de mémoire : défaire, des deux
@@ -1095,7 +1102,7 @@ fn attendre_place(s: &Socket, non_bloquant: bool, echeance: Option<u64>, delai: 
 fn message(s: &Arc<Socket>, n: usize, decalage: usize, remplir: &mut impl FnMut(usize, &mut [u8]) -> Result<(), i64>) -> Result<Message, i64> {
     let mut octets = faillible::remplie(n, 0u8).map_err(|_| -ENOBUFS)?;
     remplir(decalage, &mut octets)?;
-    Ok(Message { regarde: false, octets, lus: 0, taille: taille_vraie(unix(s).sorte, n), emetteur: Some(s.clone()), enfant: None, fichiers: Vec::new(), vol: 0, droits: None, numero_oob: 0 })
+    Ok(Message { regarde: false, octets, lus: 0, taille: taille_vraie(unix(s).sorte, n), emetteur: Some(s.clone()), enfant: None, fichiers: Vec::new(), vol: 0, droits: None, numero_oob: 0, horodatage: 0 })
 }
 
 /// Met le message `m` dans la file de `autre` et compte sa place chez
@@ -1153,6 +1160,9 @@ fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
         if m.numero_oob != 0 {
             e.oob = m.numero_oob;
             urgent = true;
+        }
+        if unix(autre).sorte != Sorte::Flux && autre.drapeau(super::socket::RCVTSTAMP) {
+            m.horodatage = crate::temps::ns_calendrier();
         }
         EN_VOL.fetch_add(m.fichiers.len(), Ordering::Relaxed);
         if let Some(g) = &mut graphe {
@@ -1366,6 +1376,9 @@ pub struct Recu {
     pub scm: bool,
     /// C'était l'octet urgent (MSG_OOB dans `msg_flags`).
     pub urgent: bool,
+    /// L'heure du message (`Message::horodatage`), pour SO_TIMESTAMP ; 0 : un
+    /// flux, qui n'en dit pas.
+    pub horodatage: u64,
 }
 
 /// Reçoit au plus `longueur` octets par `copier` (`decalage`, octets) avec
@@ -1483,7 +1496,7 @@ fn recevoir_urgent(s: &Socket, place: usize, drapeaux: u64, mut copier: impl FnM
         liberer(m);
     }
     r.map_err(|_| -EFAULT)?;
-    Ok(Recu { longueur: 1, adresse: None, coupe: false, fichiers: Vec::new(), droits: SANS_DROITS, scm: false, urgent: true })
+    Ok(Recu { longueur: 1, adresse: None, coupe: false, fichiers: Vec::new(), droits: SANS_DROITS, scm: false, urgent: true, horodatage: 0 })
 }
 
 /// Le message suivant d'un flux, compte tenu de l'octet urgent (`manage_oob`). None : plus rien, ou
@@ -1658,7 +1671,7 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
     while let Some(m) = vus.pop_back() {
         remettre(s, m);
     }
-    r.map(|()| Recu { longueur: fait, adresse: adresse.flatten(), coupe: false, fichiers, droits, scm: true, urgent: false })
+    r.map(|()| Recu { longueur: fait, adresse: adresse.flatten(), coupe: false, fichiers, droits, scm: true, urgent: false, horodatage: 0 })
 }
 
 /// Des copies de ses descripteurs (`scm_fp_dup`) ; plus de mémoire : aucune, comme lui.
@@ -1754,11 +1767,11 @@ fn recevoir_message(s: &Socket, longueur: usize, drapeaux: u64, a: &mut Attente,
             let non_bloquant = a.non_bloquant;
             match rien_a_lire(s, a, non_bloquant, deja) {
                 Ok(Some(())) => continue,
-                Ok(None) => return Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new(), droits: SANS_DROITS, scm: false, urgent: false }),
+                Ok(None) => return Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new(), droits: SANS_DROITS, scm: false, urgent: false, horodatage: 0 }),
                 Err(e) => {
                     // SEQPACKET non bloquante, connexion défaite : 0 (la fin).
                     let fin = u.sorte == Sorte::Paquets && e == -EAGAIN && u.etat.verrouiller().arret & ARRET_LECTURE != 0;
-                    return if fin { Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new(), droits: SANS_DROITS, scm: false, urgent: false }) } else { Err(e) };
+                    return if fin { Ok(Recu { longueur: 0, adresse: None, coupe: false, fichiers: Vec::new(), droits: SANS_DROITS, scm: false, urgent: false, horodatage: 0 }) } else { Err(e) };
                 }
             }
         };
@@ -1781,6 +1794,12 @@ fn recevoir_message(s: &Socket, longueur: usize, drapeaux: u64, a: &mut Attente,
         } else {
             detacher(&mut m)
         };
+        // L'heure de SO_TIMESTAMP, si la socket le veut et que la copie a
+        // réussi : celle du message, ou maintenant, qu'il garde.
+        if r.is_ok() && s.drapeau(super::socket::RCVTSTAMP) && m.horodatage == 0 {
+            m.horodatage = crate::temps::ns_calendrier();
+        }
+        let horodatage = m.horodatage;
         if regarder {
             s.peek_avance(n);
             remettre_a(s, place, m);
@@ -1789,7 +1808,7 @@ fn recevoir_message(s: &Socket, longueur: usize, drapeaux: u64, a: &mut Attente,
             liberer(m);
         }
         let c = r?;
-        return Ok(Recu { longueur: if drapeaux & MSG_TRUNC != 0 { dispo } else { c }, adresse, coupe: n < dispo, fichiers, droits, scm: true, urgent: false });
+        return Ok(Recu { longueur: if drapeaux & MSG_TRUNC != 0 { dispo } else { c }, adresse, coupe: n < dispo, fichiers, droits, scm: true, urgent: false, horodatage });
     }
 }
 

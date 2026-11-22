@@ -97,7 +97,7 @@ fn quadruplet_et_temps_attente() {
     // La connexion passe en TIME_WAIT, sous un numéro à elle : le
     // quadruplet reste pris, sans objet, et le numéro de la socket est libre.
     t.temps_attente(2, 20);
-    assert_eq!(t.trouver(LO, 80, LO, 5001, 1), Some(Destinataire::TempsAttente(20)));
+    assert_eq!(t.trouver(LO, 80, LO, 5001, 1, |_| false), Some(Destinataire::TempsAttente(20)));
     assert_eq!(t.connecter(3, LO, LO, 80, r, 3, 0, 0, |_, _| false), Err(Refus::Pris));
     assert_eq!((t.nombre_temps_attente(), t.objet(2), t.lien(2).is_none()), (1, None, true));
     t.retirer(20);
@@ -110,22 +110,22 @@ fn recherche_d_un_segment() {
     t.lier(1, lien(TOUT, 80), 10, 0).unwrap();
     t.ecouter(1).unwrap();
     t.lier(2, lien(LO, 80), 20, 0).unwrap_err();
-    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1), Some(Destinataire::Ecoute(10)));
+    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1, |_| false), Some(Destinataire::Ecoute(10)));
     // Une fille de l'écoute : son quadruplet d'abord.
     t.ajouter_fille(3, Lien { adresse: LO, distante: [1, 2, 3, 4], port_distant: 999, ..lien(LO, 80) }, 30).unwrap();
-    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1), Some(Destinataire::Connexion(30)));
-    assert_eq!(t.trouver([1, 2, 3, 4], 998, LO, 80, 1), Some(Destinataire::Ecoute(10)));
+    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1, |_| false), Some(Destinataire::Connexion(30)));
+    assert_eq!(t.trouver([1, 2, 3, 4], 998, LO, 80, 1, |_| false), Some(Destinataire::Ecoute(10)));
     t.changer_objet(3, 31);
-    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1), Some(Destinataire::Connexion(31)));
-    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 81, 1), None);
+    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 80, 1, |_| false), Some(Destinataire::Connexion(31)));
+    assert_eq!(t.trouver([1, 2, 3, 4], 999, LO, 81, 1, |_| false), None);
     // Une écoute liée à l'adresse exacte passe avant celle de 0.0.0.0.
     let mut t = table();
     t.lier(1, Lien { reuseport: true, ..lien(TOUT, 80) }, 10, 0).unwrap();
     t.ecouter(1).unwrap();
     t.lier(2, Lien { reuseport: true, ..lien(LO, 80) }, 20, 0).unwrap();
     t.ecouter(2).unwrap();
-    assert_eq!(t.trouver([9, 9, 9, 9], 1, LO, 80, 1), Some(Destinataire::Ecoute(20)));
-    assert_eq!(t.trouver([9, 9, 9, 9], 1, [10, 0, 2, 15], 80, 1), Some(Destinataire::Ecoute(10)));
+    assert_eq!(t.trouver([9, 9, 9, 9], 1, LO, 80, 1, |_| false), Some(Destinataire::Ecoute(20)));
+    assert_eq!(t.trouver([9, 9, 9, 9], 1, [10, 0, 2, 15], 80, 1, |_| false), Some(Destinataire::Ecoute(10)));
 }
 
 /// SO_BINDTODEVICE (mesuré sous Linux 6.18, `interface-suite.txt` des
@@ -143,9 +143,9 @@ fn liees_a_une_interface() {
     t.lier(2, Lien { interface: IF_ETH0, ..lien(TOUT, 80) }, 20, 0).unwrap();
     t.ecouter(2).unwrap();
     assert_eq!(t.lier(3, lien(TOUT, 80), 30, 0), Err(Refus::Pris));
-    assert_eq!(t.trouver(LO, 4000, LO, 80, IF_LO), Some(Destinataire::Ecoute(10)));
-    assert_eq!(t.trouver(ICI, 4000, ICI, 80, IF_ETH0), Some(Destinataire::Ecoute(20)));
-    assert_eq!(t.trouver(ICI, 4000, ICI, 80, 3), None, "aucune ecoute pour une troisieme interface");
+    assert_eq!(t.trouver(LO, 4000, LO, 80, IF_LO, |_| false), Some(Destinataire::Ecoute(10)));
+    assert_eq!(t.trouver(ICI, 4000, ICI, 80, IF_ETH0, |_| false), Some(Destinataire::Ecoute(20)));
+    assert_eq!(t.trouver(ICI, 4000, ICI, 80, 3, |_| false), None, "aucune ecoute pour une troisieme interface");
     // Une écoute non liée et une liée sur un port partagé (SO_REUSEPORT) :
     // la liée d'abord, par son interface ; la non liée pour les autres.
     let mut t = table();
@@ -154,24 +154,24 @@ fn liees_a_une_interface() {
     t.ecouter(1).unwrap();
     t.lier(2, p, 20, 0).unwrap();
     t.ecouter(2).unwrap();
-    assert_eq!(t.ecoute(LO, 81, IF_LO), Some(10), "a egalite, la premiere");
+    assert_eq!(t.ecoute(LO, 81, IF_LO, |_| false), Some(10), "a egalite, la premiere");
     t.changer_interface(2, IF_LO);
-    assert_eq!(t.ecoute(LO, 81, IF_LO), Some(20));
-    assert_eq!(t.ecoute(ICI, 81, IF_ETH0), Some(10));
+    assert_eq!(t.ecoute(LO, 81, IF_LO, |_| false), Some(20));
+    assert_eq!(t.ecoute(ICI, 81, IF_ETH0, |_| false), Some(10));
     // L'adresse avant la liaison : une écoute de l'adresse exacte, non liée,
     // passe avant une de 0.0.0.0 liée.
     t.lier(3, Lien { adresse: LO, ..p }, 30, 0).unwrap();
     t.ecouter(3).unwrap();
-    assert_eq!(t.ecoute(LO, 81, IF_LO), Some(30));
+    assert_eq!(t.ecoute(LO, 81, IF_LO, |_| false), Some(30));
     // La fille est liée comme son écoute : elle ne voit que son interface,
     // son TIME_WAIT aussi.
     let fille = Lien { sorte: Sorte::Connectee, adresse: LO, distante: LO, port_distant: 5000, interface: IF_LO, ..p };
     t.ajouter_fille(4, fille, 40).unwrap();
-    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_LO), Some(Destinataire::Connexion(40)));
-    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_ETH0), Some(Destinataire::Ecoute(30)), "par eth0 : pas la fille, l'ecoute non liee");
+    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_LO, |_| false), Some(Destinataire::Connexion(40)));
+    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_ETH0, |_| false), Some(Destinataire::Ecoute(30)), "par eth0 : pas la fille, l'ecoute non liee");
     t.temps_attente(4, 41);
-    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_LO), Some(Destinataire::TempsAttente(41)));
-    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_ETH0), Some(Destinataire::Ecoute(30)));
+    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_LO, |_| false), Some(Destinataire::TempsAttente(41)));
+    assert_eq!(t.trouver(LO, 5000, LO, 81, IF_ETH0, |_| false), Some(Destinataire::Ecoute(30)));
     // Le quadruplet d'un `connect` (`__inet_check_established`) : une entrée
     // liée ailleurs ne le prend pas ; une entrée non liée le prend toujours.
     let mut t = table();
@@ -241,11 +241,11 @@ fn une_morte_garde_son_port() {
     t.ecouter(1).unwrap();
     let fille = Lien { sorte: Sorte::Connectee, distante: [10, 0, 2, 2], port_distant: 40000, ..l };
     t.ajouter_fille(2, fille, 2).unwrap();
-    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080, 1), Some(Destinataire::Connexion(2)));
+    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080, 1, |_| false), Some(Destinataire::Connexion(2)));
     t.redevenir_liee(2, LO);
     assert_eq!(t.lien(2).map(|x| (x.sorte, x.distante, x.port_distant)), Some((Sorte::Liee, TOUT, 0)));
     // Le segment suivant du même client va à l'écoute.
-    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080, 1), Some(Destinataire::Ecoute(1)));
+    assert_eq!(t.trouver([10, 0, 2, 2], 40000, LO, 8080, 1, |_| false), Some(Destinataire::Ecoute(1)));
     t.retirer(1);
     // L'écoute partie, le port reste pris par elle.
     assert_eq!(t.lier(3, lien(LO, 8080), 3, 0), Err(Refus::Pris));

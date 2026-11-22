@@ -449,9 +449,10 @@ impl<T: Clone> Table<T> {
     }
 
     /// À qui va un segment de `source`:`port_source` pour
-    /// `destination`:`port`, arrivé par l'interface `iif`.
-    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, iif: u32)
-                   -> Option<Destinataire<T>> {
+    /// `destination`:`port`, arrivé par l'interface `iif` ; `ici` : voir
+    /// `ecoute`.
+    pub fn trouver(&self, source: [u8; 4], port_source: u16, destination: [u8; 4], port: u16, iif: u32,
+                   ici: impl Fn(&T) -> bool) -> Option<Destinataire<T>> {
         for e in &self.entrees {
             let l = &e.lien;
             if matches!(l.sorte, Sorte::Connectee | Sorte::TempsAttente)
@@ -467,14 +468,16 @@ impl<T: Clone> Table<T> {
                 };
             }
         }
-        self.ecoute(destination, port, iif).map(Destinataire::Ecoute)
+        self.ecoute(destination, port, iif, ici).map(Destinataire::Ecoute)
     }
 
     /// L'écoute de `destination`:`port`, ou de 0.0.0.0:`port`
     /// (`__inet_lookup_listener`), pour un segment arrivé par `iif` : dans
     /// chaque passe, la mieux notée (`compute_score` : liée à `iif`, 2 ; non
-    /// liée, 1 ; liée à une autre, jamais), la première à égalité.
-    pub fn ecoute(&self, destination: [u8; 4], port: u16, iif: u32) -> Option<T> {
+    /// liée, 1 ; liée à une autre, jamais ; un point de plus si elle dit, par
+    /// SO_INCOMING_CPU, le processeur qui cherche : `ici`), la première à
+    /// égalité.
+    pub fn ecoute(&self, destination: [u8; 4], port: u16, iif: u32, ici: impl Fn(&T) -> bool) -> Option<T> {
         for locale in [destination, [0; 4]] {
             let mut meilleure: Option<(u32, &Entree<T>)> = None;
             for e in &self.entrees {
@@ -482,7 +485,7 @@ impl<T: Clone> Table<T> {
                 if l.sorte != Sorte::Ecoute || l.port != port || l.adresse != locale || !voit(l.interface, iif) {
                     continue;
                 }
-                let note = if l.interface != 0 { 2 } else { 1 };
+                let note = 2 * if l.interface != 0 { 2 } else { 1 } + e.objet.as_ref().is_some_and(&ici) as u32;
                 if meilleure.is_none_or(|(m, _)| note > m) {
                     meilleure = Some((note, e));
                 }
