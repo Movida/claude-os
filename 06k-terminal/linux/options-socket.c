@@ -17,7 +17,8 @@
  *   - les options qui se gardent : SO_SNDBUFFORCE et SO_RCVBUFFORCE (EPERM sans
  *     CAP_NET_ADMIN), l'attente active (SO_BUSY_POLL, SO_PREFER_BUSY_POLL,
  *     SO_BUSY_POLL_BUDGET, SO_INCOMING_NAPI_ID), SO_WIFI_STATUS, SO_NOFCS, SO_PASSSEC
- *     (AF_UNIX), SO_COOKIE et SO_NETNS_COOKIE (leurs longueurs), SO_TXTIME et
+ *     et SO_PASSPIDFD (AF_UNIX ; SO_PEERPIDFD sans pair : ENODATA, le reste est dans
+ *     pidfd), SO_COOKIE et SO_NETNS_COOKIE (leurs longueurs), SO_TXTIME et
  *     SCM_TXTIME, SO_DEVMEM_DONTNEED (TCP), SO_CNX_ADVICE (une route sans MTU apprise
  *     reste : pmtu, sous root, voit l'autre cas) ;
  *   - SO_TXREHASH (TCP) : un SYN sans réponse change le hachage du flux à chaque RTO
@@ -185,6 +186,10 @@
 #ifndef SO_INQ
 #define SO_INQ 84
 #define SCM_INQ SO_INQ
+#endif
+#ifndef SO_PASSPIDFD
+#define SO_PASSPIDFD 76
+#define SO_PEERPIDFD 77
 #endif
 /* Les quatre formes de l'horodatage, par leur numéro (la glibc ne nomme SO_TIMESTAMP
  * que selon la taille de time_t). */
@@ -535,6 +540,12 @@ static void gardees(void)
                      dire("SO_PASSSEC %s : l'acceptee le prend de l'ecoute", sortes[i].nom));
             close(e), close(c), close(a);
         }
+        if (sortes[i].famille == AF_UNIX)
+            ok = lire(s, SO_PASSPIDFD) == 0 && poser(s, SO_PASSPIDFD, 9) == 0 && lire(s, SO_PASSPIDFD) == 1;
+        else
+            ok = poser(s, SO_PASSPIDFD, 1) == EOPNOTSUPP && lire(s, SO_PASSPIDFD) == -1000 - EOPNOTSUPP;
+        verifier(ok, dire("SO_PASSPIDFD %s : AF_UNIX seule", sortes[i].nom));
+        verifier(lire(s, SO_PEERPIDFD) == -1000 - ENODATA, dire("SO_PEERPIDFD %s : sans pair, ENODATA", sortes[i].nom));
         ok = poser(s, SO_CNX_ADVICE, 1) == 0 && poser(s, SO_CNX_ADVICE, 7) == 0 && lire(s, SO_CNX_ADVICE) == -1000 - ENOPROTOOPT;
         verifier(ok, dire("SO_CNX_ADVICE %s : accepte, sans get", sortes[i].nom));
         ok = (sortes[i].type == SOCK_STREAM && sortes[i].famille == AF_INET)

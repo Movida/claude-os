@@ -137,7 +137,8 @@ wait
 /bin/verrous /tmp b
 wait
 # Les pidfd (le lot 6 des soldes) : dans un processus ; puis deux, ensemble
-# (pidfd_getfd refusé par Yama, puis permis par PR_SET_PTRACER).
+# (pidfd_getfd refusé par Yama, puis permis par PR_SET_PTRACER ; le pidfd de a
+# recueilli, par SCM_PIDFD et SO_PEERPIDFD).
 /bin/pidfd /tmp
 /bin/pidfd /tmp a &
 /bin/pidfd /tmp b

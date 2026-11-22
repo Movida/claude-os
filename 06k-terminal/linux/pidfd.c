@@ -16,11 +16,20 @@
  *       (le masque sans CGROUPID, que nous n'avons pas), les autres ioctl ;
  *       la fin du fil : POLLHUP, ESRCH, son statut ;
  *     - pidfd_getfd sur soi ; CLONE_PIDFD (clone de la glibc : le pidfd à
- *       parent_tid) ; PR_SET_PTRACER ; /proc/sys/kernel/yama/ptrace_scope.
+ *       parent_tid) ; PR_SET_PTRACER ; /proc/sys/kernel/yama/ptrace_scope ;
+ *     - AF_UNIX : SO_PASSPIDFD ; SO_PEERPIDFD (une paire, une écoute, une
+ *       connexion ; sans pair : ENODATA ; coupé à la place, mais installé) ;
+ *       SCM_PIDFD (la place qu'il lui faut, MSG_CTRUNC sinon, sans pidfd ;
+ *       après SCM_CREDENTIALS et SCM_RIGHTS ; MSG_PEEK ; EMFILE à la place du
+ *       numéro ; un datagramme, l'émetteur nommé s'il a l'option ; SO_PASSPIDFD
+ *       hérité de l'écoute).
  *   pidfd DOSSIER a &  puis  pidfd DOSSIER b : b ouvre le pidfd de a ;
  *     pidfd_getfd lui est refusé (EPERM : Yama, a ne descend pas de b) ; a
  *     permet b par PR_SET_PTRACER ; b copie alors le descripteur témoin de a
- *     et le lit ; a finit, b le voit (POLLIN).
+ *     et le lit ; a envoie un datagramme à b, s'y connecte, et finit ; b le
+ *     voit (POLLIN), puis recueilli (POLLHUP) : le SCM_PIDFD du datagramme et
+ *     le SO_PEERPIDFD de la connexion le désignent encore (son statut), le
+ *     processus parti.
  * Les numéros de descripteurs et d'inodes diffèrent de l'hôte : seuls leurs
  * rapports sont vérifiés. Un espace de noms (ioctl _IO(0xFF, n)) : Linux
  * rend un descripteur de nsfs, nous EOPNOTSUPP (aucun espace de noms) ; non
@@ -48,9 +57,12 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -68,6 +80,13 @@
 #define CLONE_PIDFD 0x1000
 #endif
 #define CGROUPID 4
+#ifndef SO_PASSPIDFD
+#define SO_PASSPIDFD 76
+#define SO_PEERPIDFD 77
+#endif
+#ifndef SCM_PIDFD
+#define SCM_PIDFD 4
+#endif
 
 struct info {
     uint64_t mask, cgroupid;
@@ -403,6 +422,229 @@ static void un_processus(void)
     verifier(date(&s) - avant >= 1.0, "rouvert apres 1,1 s : une date neuve");
 }
 
+/* Le plus petit numéro de descripteur libre : celui que prendra le prochain. */
+static int prochain(void)
+{
+    int d = dup(0);
+    close(d);
+    return d;
+}
+
+/* SO_PEERPIDFD de `s` dans `place` octets (val d'abord à `val`) : -errno, ou 0,
+ * le numéro dans *val et la longueur dans *l. */
+static long peerpidfd(int s, socklen_t place, int *val, socklen_t *l)
+{
+    *l = place;
+    return r(getsockopt(s, SOL_SOCKET, SO_PEERPIDFD, val, l));
+}
+
+/* Un pidfd de ce processus, vivant, FD_CLOEXEC, O_RDWR. */
+static int pidfd_de_moi(int p)
+{
+    struct info i;
+    return p >= 0 && fcntl(p, F_GETFD) == FD_CLOEXEC && fcntl(p, F_GETFL) == 2 && sonder(p, 0) == 0
+           && info(p, 0, 72, &i, 0) == 0 && i.mask == 3 && i.pid == (uint32_t)getpid() && i.tgid == (uint32_t)getpid();
+}
+
+/* Reçoit (sans attendre) au plus 8 octets de `s`, avec `place` octets de
+ * contrôle (0 : msg_control nul) ; rend ce que rend recvmsg (ou -errno), ses
+ * drapeaux et sa longueur de contrôle dans `m`, ses messages de contrôle dans
+ * `dit` (« sorte/longueur » à la suite : « 2/28 4/20 »), et le numéro que
+ * porte son SCM_PIDFD dans *pidfd (-1000 : aucun). */
+static long recevoir(int s, size_t place, int drapeaux, struct msghdr *m, char *dit, int *pidfd)
+{
+    static char octets[8], controle[256];
+    static struct iovec io;
+    io = (struct iovec){ octets, sizeof octets };
+    memset(m, 0, sizeof *m);
+    memset(controle, 0, sizeof controle);
+    m->msg_iov = &io;
+    m->msg_iovlen = 1;
+    m->msg_control = place ? controle : 0;
+    m->msg_controllen = place;
+    long n = r(recvmsg(s, m, MSG_DONTWAIT | drapeaux));
+    dit[0] = 0;
+    *pidfd = -1000;
+    if (n >= 0)
+        for (struct cmsghdr *c = CMSG_FIRSTHDR(m); c; c = CMSG_NXTHDR(m, c)) {
+            sprintf(dit + strlen(dit), "%s%d/%zu", dit[0] ? " " : "", c->cmsg_type, (size_t)c->cmsg_len);
+            if (c->cmsg_level == SOL_SOCKET && c->cmsg_type == SCM_PIDFD)
+                memcpy(pidfd, CMSG_DATA(c), sizeof *pidfd);
+        }
+    return n;
+}
+
+/* Un nom abstrait (un premier octet nul), et sa longueur. */
+static socklen_t nom_abstrait(struct sockaddr_un *a, const char *nom)
+{
+    memset(a, 0, sizeof *a);
+    a->sun_family = AF_UNIX;
+    snprintf(a->sun_path + 1, sizeof a->sun_path - 1, "%s", nom);
+    return sizeof(sa_family_t) + 1 + strlen(nom);
+}
+
+/* SO_PASSPIDFD, SO_PEERPIDFD et SCM_PIDFD, dans un processus : tous les pairs
+ * sont lui-même. */
+static void sockets(void)
+{
+    int un = 1, val, sp[2], pidfd;
+    socklen_t l;
+    char dit[64];
+    struct msghdr m;
+    socketpair(AF_UNIX, SOCK_STREAM, 0, sp);
+    l = sizeof val;
+    verifier(getsockopt(sp[0], SOL_SOCKET, SO_PASSPIDFD, &val, &l) == 0 && val == 0, "SO_PASSPIDFD : 0 au depart");
+    verifier(r(setsockopt(sp[0], SOL_SOCKET, SO_PASSPIDFD, &un, 2)) == -EINVAL, "SO_PASSPIDFD dans 2 octets : EINVAL");
+    l = sizeof val;
+    verifier(setsockopt(sp[0], SOL_SOCKET, SO_PASSPIDFD, &un, sizeof un) == 0
+                 && getsockopt(sp[0], SOL_SOCKET, SO_PASSPIDFD, &val, &l) == 0 && val == 1 && l == 4,
+             "SO_PASSPIDFD : pose, relu 1");
+    /* SO_PEERPIDFD : un pidfd du pair (ici, soi), installé même coupé. */
+    val = -5;
+    verifier(peerpidfd(sp[0], 8, &val, &l) == 0 && l == 4 && pidfd_de_moi(val), "SO_PEERPIDFD d'une paire : un pidfd du pair, FD_CLOEXEC");
+    close(val);
+    int avant = prochain();
+    val = 0x55555555;
+    verifier(peerpidfd(sp[0], 2, &val, &l) == 0 && l == 2 && val == (0x55550000 | avant) && pidfd_de_moi(avant),
+             "SO_PEERPIDFD dans 2 octets : coupe, mais installe");
+    close(avant);
+    verifier(peerpidfd(sp[0], 0, &val, &l) == 0 && l == 0 && pidfd_de_moi(avant), "SO_PEERPIDFD dans 0 octet : rien d'ecrit, mais installe");
+    close(avant);
+    verifier(peerpidfd(sp[0], (socklen_t)-1, &val, &l) == -EINVAL, "SO_PEERPIDFD, une longueur negative : EINVAL");
+    l = sizeof val;
+    verifier(r(getsockopt(sp[0], SOL_SOCKET, SO_PEERPIDFD, (void *)8, &l)) == -EFAULT && fcntl(avant, F_GETFD) < 0,
+             "SO_PEERPIDFD a une adresse illisible : EFAULT, rien d'installe");
+    /* Sans pair : ENODATA ; une écoute : les siens ; un DGRAM connecté : rien. */
+    int ecoute = socket(AF_UNIX, SOCK_STREAM, 0), d1 = socket(AF_UNIX, SOCK_DGRAM, 0), d2 = socket(AF_UNIX, SOCK_DGRAM, 0);
+    verifier(peerpidfd(ecoute, 4, &val, &l) == -ENODATA && peerpidfd(d1, 4, &val, &l) == -ENODATA,
+             "SO_PEERPIDFD sans pair (flux neuf, datagrammes) : ENODATA");
+    struct sockaddr_un a;
+    socklen_t al = nom_abstrait(&a, "pidfd-ecoute");
+    bind(ecoute, (void *)&a, al);
+    listen(ecoute, 2);
+    verifier(peerpidfd(ecoute, 4, &val, &l) == 0 && pidfd_de_moi(val), "SO_PEERPIDFD d'une ecoute : le sien");
+    close(val);
+    struct sockaddr_un ad;
+    socklen_t adl = nom_abstrait(&ad, "pidfd-datagrammes");
+    bind(d1, (void *)&ad, adl);
+    connect(d2, (void *)&ad, adl);
+    verifier(peerpidfd(d2, 4, &val, &l) == -ENODATA, "SO_PEERPIDFD de datagrammes connectes : ENODATA");
+    /* SCM_PIDFD : la place d'un message entier (20 octets), sinon MSG_CTRUNC et
+     * aucun pidfd. */
+    if (write(sp[1], "a", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(sp[0], 256, 0, &m, dit, &pidfd) == 1 && m.msg_flags == 0 && m.msg_controllen == 24 && !strcmp(dit, "4/20")
+                 && pidfd_de_moi(pidfd),
+             "SCM_PIDFD : un pidfd de l'emetteur, FD_CLOEXEC");
+    close(pidfd);
+    avant = prochain();
+    if (write(sp[1], "a", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(sp[0], 19, 0, &m, dit, &pidfd) == 1 && m.msg_flags == MSG_CTRUNC && m.msg_controllen == 0 && fcntl(avant, F_GETFD) < 0,
+             "SCM_PIDFD dans 19 octets : MSG_CTRUNC, aucun pidfd");
+    if (write(sp[1], "a", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(sp[0], 20, 0, &m, dit, &pidfd) == 1 && m.msg_flags == 0 && m.msg_controllen == 20 && !strcmp(dit, "4/20")
+                 && pidfd_de_moi(pidfd),
+             "SCM_PIDFD dans 20 octets : entier");
+    close(pidfd);
+    if (write(sp[1], "a", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(sp[0], 0, 0, &m, dit, &pidfd) == 1 && m.msg_flags == MSG_CTRUNC && fcntl(avant, F_GETFD) < 0,
+             "SCM_PIDFD sans place : MSG_CTRUNC");
+    int pidfd2;
+    if (write(sp[1], "p", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(sp[0], 256, MSG_PEEK, &m, dit, &pidfd) == 1 && pidfd_de_moi(pidfd)
+                 && recevoir(sp[0], 256, 0, &m, dit, &pidfd2) == 1 && pidfd_de_moi(pidfd2) && pidfd2 != pidfd,
+             "SCM_PIDFD et MSG_PEEK : un pidfd, puis un autre a la lecture");
+    close(pidfd), close(pidfd2);
+    /* Avec SO_PASSCRED : SCM_CREDENTIALS d'abord (28 octets, 32 de place). */
+    setsockopt(sp[0], SOL_SOCKET, SO_PASSCRED, &un, sizeof un);
+    if (write(sp[1], "a", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(sp[0], 256, 0, &m, dit, &pidfd) == 1 && m.msg_controllen == 56 && !strcmp(dit, "2/28 4/20") && pidfd_de_moi(pidfd),
+             "SO_PASSCRED et SO_PASSPIDFD : SCM_CREDENTIALS, puis SCM_PIDFD");
+    close(pidfd);
+    avant = prochain();
+    if (write(sp[1], "a", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(sp[0], 40, 0, &m, dit, &pidfd) == 1 && m.msg_flags == MSG_CTRUNC && m.msg_controllen == 32 && !strcmp(dit, "2/28")
+                 && fcntl(avant, F_GETFD) < 0,
+             "dans 40 octets : SCM_CREDENTIALS seul, MSG_CTRUNC, aucun pidfd");
+    if (write(sp[1], "a", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(sp[0], 52, 0, &m, dit, &pidfd) == 1 && m.msg_flags == 0 && m.msg_controllen == 52 && !strcmp(dit, "2/28 4/20"),
+             "dans 52 octets : les deux");
+    close(pidfd);
+    {   /* Avec un descripteur : SCM_CREDENTIALS, SCM_RIGHTS, SCM_PIDFD. */
+        int e = eventfd(0, 0);
+        char ce[CMSG_SPACE(sizeof e)];
+        struct iovec ie = { "r", 1 };
+        struct msghdr me = { .msg_iov = &ie, .msg_iovlen = 1, .msg_control = ce, .msg_controllen = sizeof ce };
+        struct cmsghdr *c = CMSG_FIRSTHDR(&me);
+        c->cmsg_level = SOL_SOCKET;
+        c->cmsg_type = SCM_RIGHTS;
+        c->cmsg_len = CMSG_LEN(sizeof e);
+        memcpy(CMSG_DATA(c), &e, sizeof e);
+        int d = prochain();
+        verifier(sendmsg(sp[1], &me, 0) == 1 && recevoir(sp[0], 256, 0, &m, dit, &pidfd) == 1 && m.msg_controllen == 80
+                     && !strcmp(dit, "2/28 1/20 4/20") && pidfd_de_moi(pidfd) && pidfd == d + 1,
+                 "avec SCM_RIGHTS : SCM_CREDENTIALS, SCM_RIGHTS, SCM_PIDFD");
+        close(e), close(d), close(pidfd);
+    }
+    un = 0;
+    setsockopt(sp[0], SOL_SOCKET, SO_PASSCRED, &un, sizeof un);
+    un = 1;
+    /* Plus de numéro libre : le numéro d'erreur à la place du pidfd. */
+    struct rlimit rl, rl2;
+    getrlimit(RLIMIT_NOFILE, &rl);
+    rl2 = (struct rlimit){ prochain(), rl.rlim_max };
+    setrlimit(RLIMIT_NOFILE, &rl2);
+    if (write(sp[1], "a", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(sp[0], 256, 0, &m, dit, &pidfd) == 1 && m.msg_flags == 0 && !strcmp(dit, "4/20") && pidfd == -EMFILE,
+             "SCM_PIDFD sans numero libre : -EMFILE a sa place");
+    verifier(peerpidfd(sp[0], 4, &val, &l) == -EMFILE, "SO_PEERPIDFD sans numero libre : EMFILE");
+    setrlimit(RLIMIT_NOFILE, &rl);
+    close(sp[0]), close(sp[1]);
+    /* Des datagrammes : vers une socket qui a SO_PASSPIDFD, l'émetteur sans nom
+     * le reste ; un émetteur qui l'a reçoit un nom (pour qu'on lui réponde), et
+     * qui ne l'a pas ne reçoit rien. */
+    setsockopt(d1, SOL_SOCKET, SO_PASSPIDFD, &un, sizeof un);
+    int x = socket(AF_UNIX, SOCK_DGRAM, 0);
+    struct sockaddr_un ax;
+    socklen_t axl = sizeof ax;
+    verifier(sendto(x, "d", 1, 0, (void *)&ad, adl) == 1 && recevoir(d1, 256, 0, &m, dit, &pidfd) == 1 && !strcmp(dit, "4/20")
+                 && pidfd_de_moi(pidfd) && getsockname(x, (void *)&ax, &axl) == 0 && axl == sizeof(sa_family_t),
+             "un datagramme vers SO_PASSPIDFD : le pidfd de l'emetteur, qui reste sans nom");
+    close(pidfd);
+    int y = socket(AF_UNIX, SOCK_DGRAM, 0);
+    struct sockaddr_un ay;
+    socklen_t ayl = nom_abstrait(&ay, "pidfd-y");
+    bind(y, (void *)&ay, ayl);
+    setsockopt(x, SOL_SOCKET, SO_PASSPIDFD, &un, sizeof un);
+    axl = sizeof ax;
+    verifier(sendto(x, "d", 1, 0, (void *)&ay, ayl) == 1 && getsockname(x, (void *)&ax, &axl) == 0 && axl == sizeof(sa_family_t) + 6
+                 && recevoir(y, 256, 0, &m, dit, &pidfd) == 1 && m.msg_controllen == 0 && dit[0] == 0,
+             "un emetteur qui a SO_PASSPIDFD : un nom donne ; la receveuse sans l'option, rien");
+    close(x), close(y), close(d1), close(d2);
+    /* L'écoute qui a SO_PASSPIDFD : ses filles l'ont, dès la connexion. */
+    setsockopt(ecoute, SOL_SOCKET, SO_PASSPIDFD, &un, sizeof un);
+    int c = socket(AF_UNIX, SOCK_STREAM, 0);
+    connect(c, (void *)&a, al);
+    int f = accept(ecoute, 0, 0);
+    l = sizeof val;
+    verifier(f >= 0 && getsockopt(f, SOL_SOCKET, SO_PASSPIDFD, &val, &l) == 0 && val == 1 && peerpidfd(c, 4, &pidfd, &l) == 0
+                 && pidfd_de_moi(pidfd),
+             "une fille de l'ecoute a SO_PASSPIDFD ; le client, le pidfd de l'ecoute");
+    close(pidfd);
+    if (write(c, "c", 1) != 1)
+        verifier(0, "write");
+    verifier(recevoir(f, 256, 0, &m, dit, &pidfd) == 1 && !strcmp(dit, "4/20") && pidfd_de_moi(pidfd), "la fille : SCM_PIDFD");
+    close(pidfd), close(c), close(f), close(ecoute);
+}
+
 /* Les deux processus : des fichiers témoins dans le dossier. */
 static void ecrire_temoin(const char *nom, long valeur)
 {
@@ -434,7 +676,8 @@ static long lire_temoin(const char *nom)
 }
 
 /* a : un descripteur témoin, son numéro et son pid annoncés ; il attend que
- * b demande la permission, la donne, puis attend que b ait fini. */
+ * b demande la permission, la donne, attend que b ait fait sa copie, puis
+ * lui envoie un datagramme et se connecte à lui avant de finir. */
 static void processus_a(void)
 {
     char chemin[256];
@@ -447,11 +690,25 @@ static void processus_a(void)
     long b = lire_temoin("demande");
     verifier(b > 0 && prctl(PR_SET_PTRACER, b) == 0, "PR_SET_PTRACER de b");
     ecrire_temoin("permis", 1);
-    verifier(lire_temoin("fin") == 1, "b a fini");
+    verifier(lire_temoin("fin") == 1, "b a fait sa copie");
+    /* Avant de finir : un datagramme à b, et une connexion à son écoute (qui
+     * restera dans sa file). */
+    struct sockaddr_un nd, ne;
+    socklen_t ndl = nom_abstrait(&nd, "pidfd-b"), nel = nom_abstrait(&ne, "pidfd-b-ecoute");
+    int x = socket(AF_UNIX, SOCK_DGRAM, 0), k = socket(AF_UNIX, SOCK_STREAM, 0);
+    verifier(sendto(x, "a", 1, 0, (void *)&nd, ndl) == 1 && connect(k, (void *)&ne, nel) == 0, "un datagramme et une connexion vers b");
 }
 
 static void processus_b(void)
 {
+    /* Ses sockets, avant que a ne s'en serve : un DGRAM qui a SO_PASSPIDFD, et
+     * une écoute. */
+    int un = 1, rb = socket(AF_UNIX, SOCK_DGRAM, 0), lb = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un nd, ne;
+    socklen_t ndl = nom_abstrait(&nd, "pidfd-b"), nel = nom_abstrait(&ne, "pidfd-b-ecoute");
+    verifier(bind(rb, (void *)&nd, ndl) == 0 && setsockopt(rb, SOL_SOCKET, SO_PASSPIDFD, &un, sizeof un) == 0
+                 && bind(lb, (void *)&ne, nel) == 0 && listen(lb, 1) == 0,
+             "ses sockets");
     long a = lire_temoin("a"), fa = lire_temoin("fd");
     int p = popen_(a, 0);
     verifier(p >= 0 && psig(p, 0, 0, 0) == 0, "pidfd_open de a, pidfd_send_signal 0");
@@ -470,6 +727,26 @@ static void processus_b(void)
     }
     ecrire_temoin("fin", 1);
     verifier(sonder(p, 10000) & POLLIN, "la fin de a : POLLIN");
+    /* a recueilli (par son parent) : son pidfd le dit (POLLHUP). Le SCM_PIDFD
+     * de son datagramme et le SO_PEERPIDFD de sa connexion le désignent encore
+     * (PIDFD_STALE) : son statut, mais plus de tâche. */
+    int k = 0;
+    while (!(sonder(p, 0) & POLLHUP) && k++ < 10000)
+        usleep(1000);
+    verifier(sonder(p, 0) == (POLLIN | POLLRDNORM | POLLHUP), "a recueilli : POLLHUP");
+    struct msghdr m;
+    struct info i;
+    char dit[64];
+    int q = -1, ca = accept(lb, 0, 0), qc = -1;
+    socklen_t l;
+    verifier(recevoir(rb, 256, 0, &m, dit, &q) == 1 && !strcmp(dit, "4/20") && q >= 0 && fcntl(q, F_GETFD) == FD_CLOEXEC
+                 && sonder(q, 0) == (POLLIN | POLLRDNORM | POLLHUP) && info(q, 8, 72, &i, 0) == 0 && i.mask == 8 && i.exit_code == 0
+                 && info(q, 0, 72, &i, 0) == -ESRCH,
+             "SCM_PIDFD de a recueilli : POLLHUP, son statut, ESRCH sans EXIT");
+    verifier(ca >= 0 && peerpidfd(ca, 4, &qc, &l) == 0 && sonder(qc, 0) == (POLLIN | POLLRDNORM | POLLHUP) && info(qc, 8, 72, &i, 0) == 0
+                 && i.mask == 8 && psig(qc, 0, 0, 0) == -ESRCH,
+             "SO_PEERPIDFD de a recueilli : POLLHUP, son statut, pidfd_send_signal ESRCH");
+    close(q), close(qc), close(ca), close(rb), close(lb);
     /* Les témoins effacés : chez nous, /tmp est en mémoire, et ce qui
      * resterait compterait contre « memoire rendue ». */
     const char *noms[] = { "contenu", "fd", "a", "demande", "permis", "fin" };
@@ -492,6 +769,7 @@ int main(int argc, char **argv)
             processus_b();
     } else {
         un_processus();
+        sockets();
     }
     printf("[linux] pidfd%s%s : %s\n", *role ? " " : "", role, echecs ? "ECHEC" : "toutes les verifications : ok");
     return echecs != 0;

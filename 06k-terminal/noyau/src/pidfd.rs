@@ -273,6 +273,16 @@ fn preparer(entree: Arc<Entree>, fil: Option<Arc<Tache>>, drapeaux: u32) -> Resu
     preparer_fichier(numero, f)
 }
 
+/// Le pidfd du processus `entree`, que tiennent des droits AF_UNIX
+/// (SO_PEERPIDFD, SCM_PIDFD : reseau/unix.rs, `Droits`), prêt à installer :
+/// `pidfd_prepare` avec PIDFD_STALE, sans ESRCH ni ENOENT. Le processus peut
+/// être un zombie, ou recueilli : Linux le sait inscrit dans pidfs depuis la
+/// connexion ou l'envoi (`pidfs_register_pid`), et son pidfd en dit le statut
+/// (POLLHUP, PIDFD_INFO_EXIT ; mesuré) ; chez nous, l'entrée le garde.
+pub fn preparer_pour(entree: Arc<Entree>) -> Result<Prepare, i64> {
+    preparer(entree, None, 0)
+}
+
 /// pidfd_open(pid, drapeaux), dans l'ordre de Linux : des drapeaux hors de
 /// PIDFD_NONBLOCK et PIDFD_THREAD (O_CLOEXEC aussi) : EINVAL ; un numéro nul
 /// ou négatif : EINVAL ; puis (`pidfd_prepare`) un processus de la table qui

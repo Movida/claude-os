@@ -318,8 +318,9 @@ boot.bin: programmes.cpio FORCE
 #     l'hôte aussi, dans /dev/shm ;
 #   - pidfd : gcc -static, les pidfd (le lot 6 des soldes) : pidfd_open,
 #     le fichier, pidfd_send_signal, PIDFD_GET_INFO, pidfd_getfd, CLONE_PIDFD,
-#     dans un processus, puis deux (a et b, lancés ensemble) pour Yama et
-#     PR_SET_PTRACER ; sur l'hôte aussi, dans /dev/shm ;
+#     SO_PASSPIDFD, SO_PEERPIDFD et SCM_PIDFD, dans un processus, puis deux
+#     (a et b, lancés ensemble) pour Yama, PR_SET_PTRACER, et le pidfd d'un
+#     pair recueilli ; sur l'hôte aussi, dans /dev/shm ;
 #   - copies : gcc -static, copy_file_range, sendfile et fadvise64 (6i),
 #     leurs transferts et leurs refus, ceux de Linux, pour chaque sorte de
 #     fichier ; sur l'hôte aussi, dans /dev/shm (un tmpfs, comme notre /tmp :

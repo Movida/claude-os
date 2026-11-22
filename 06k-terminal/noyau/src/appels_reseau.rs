@@ -124,6 +124,8 @@ const SO_PEERGROUPS: i32 = 59;
 const SO_MEMINFO: i32 = 55;
 const SO_RESERVE_MEM: i32 = 73;
 const SO_PASSRIGHTS: i32 = 83;
+const SO_PASSPIDFD: i32 = 76;
+const SO_PEERPIDFD: i32 = 77;
 const SO_RCVTIMEO: i32 = 20;
 const SO_SNDTIMEO: i32 = 21;
 const SO_ACCEPTCONN: i32 = 30;
@@ -273,6 +275,7 @@ const MRT: core::ops::RangeInclusive<i32> = 200..=212;
 const IP_PMTUDISC_OMIT: i32 = 5;
 const SCM_RIGHTS: i32 = 1;
 const SCM_CREDENTIALS: i32 = 2;
+const SCM_PIDFD: i32 = 4;
 
 /// Le tic des délais des sockets (1 / HZ) : 1 ms, celui de notre horloge
 /// (6e).
@@ -1296,7 +1299,8 @@ fn lire_controle_unix(c: &[u8]) -> Result<unix::Scm, i64> {
                 if !permis {
                     return Err(-EPERM);
                 }
-                scm.droits = Some(unix::Droits { pid, uid, gid });
+                // Les siens, donc : son processus, que SCM_PIDFD désignera (`find_get_pid`).
+                scm.droits = Some(unix::droits_courants());
             }
             (SOL_SOCKET, _) => return Err(-EINVAL),
             _ => {}
@@ -1443,14 +1447,42 @@ impl ControleSortant {
         }
     }
 
+    /// SCM_PIDFD (`scm_pidfd_recv`) : le pidfd du processus de l'émetteur, s'il y en a un
+    /// (un message sans droits : rien), installé avec FD_CLOEXEC, MSG_CMSG_CLOEXEC ou
+    /// non (`pidfd_prepare`). Moins de place que son message entier (20 octets) : rien,
+    /// et MSG_CTRUNC, même sans processus ; jamais coupé, donc. Un pidfd impossible
+    /// (EMFILE, ENOMEM) n'est pas une erreur de l'appel : son numéro d'erreur, négatif,
+    /// tient la place du descripteur (mesuré : -24). Une faute en écrivant le message :
+    /// le pidfd défait.
+    fn ecrire_pidfd(&mut self, d: unix::Droits, drapeaux: &mut u32) {
+        if self.place - self.utilise < (CMSG_ENTETE + 4) as u64 {
+            *drapeaux |= MSG_CTRUNC;
+            return;
+        }
+        let Some(e) = d.processus else { return };
+        match crate::pidfd::preparer_pour(e) {
+            Ok(p) => {
+                if self.ecrire(SOL_SOCKET, SCM_PIDFD, &(p.numero() as i32).to_le_bytes(), drapeaux) {
+                    p.installer(true);
+                }
+            }
+            Err(errno) => {
+                self.ecrire(SOL_SOCKET, SCM_PIDFD, &(errno as i32).to_le_bytes(), drapeaux);
+            }
+        }
+    }
+
     /// Une faute en l'écrivant ne fait rien : il n'est pas compté (Linux
     /// ignore ce que rend `put_cmsg` sur ce chemin ; l'appel réussit, la
-    /// place prise ne bouge pas).
-    fn ecrire(&mut self, niveau: i32, sorte: i32, donnees: &[u8], drapeaux: &mut u32) {
+    /// place prise ne bouge pas), mais l'appelant le sait (false), pour
+    /// défaire ce que le message donnait (SCM_PIDFD). Rend true sinon, même
+    /// omis faute de place (MSG_CTRUNC) : qui doit défaire ce que le message
+    /// donne vérifie la place d'abord (`ecrire_pidfd`, comme `scm_pidfd_recv`).
+    fn ecrire(&mut self, niveau: i32, sorte: i32, donnees: &[u8], drapeaux: &mut u32) -> bool {
         let reste = self.place - self.utilise;
         if self.adresse == 0 || reste < CMSG_ENTETE as u64 {
             *drapeaux |= MSG_CTRUNC;
-            return;
+            return true;
         }
         let mut longueur = (CMSG_ENTETE + donnees.len()) as u64;
         if reste < longueur {
@@ -1468,9 +1500,10 @@ impl ControleSortant {
         if copier_vers_utilisateur(self.adresse + self.utilise, &o).is_err()
             || copier_vers_utilisateur(self.adresse + self.utilise + CMSG_ENTETE as u64, corps).is_err()
         {
-            return;
+            return false;
         }
         self.utilise += (aligner(CMSG_ENTETE + donnees.len()) as u64).min(reste);
+        true
     }
 }
 
@@ -1603,24 +1636,27 @@ fn recevoir_message(o: &FichierTenu, adresse: u64, m: &Message, drapeaux: u64) -
         }
         c.ecrire(SOL_IP, IP_RECVERR, &o, &mut r.drapeaux);
     }
-    // Les droits et les descripteurs (`__scm_recv_common`) : sans place du tout, seulement
-    // MSG_CTRUNC.
-    if let Some(d) = r.droits {
-        let passcred = unix::passcred(o.socket());
+    // Les droits, les descripteurs et le pidfd de l'émetteur (`scm_recv_unix`) : sans place du
+    // tout, seulement MSG_CTRUNC.
+    if let Some(d) = r.droits.take() {
+        let (passcred, passpidfd) = (unix::passcred(o.socket()), unix::passpidfd(o.socket()));
         if m.controle == 0 {
-            if passcred || !r.fichiers.is_empty() {
+            if passcred || passpidfd || !r.fichiers.is_empty() {
                 r.drapeaux |= MSG_CTRUNC;
             }
         } else {
             if passcred {
                 let mut u = [0u8; 12];
-                u[..4].copy_from_slice(&d.pid.to_le_bytes());
+                u[..4].copy_from_slice(&d.pid().to_le_bytes());
                 u[4..8].copy_from_slice(&d.uid.to_le_bytes());
                 u[8..12].copy_from_slice(&d.gid.to_le_bytes());
                 c.ecrire(SOL_SOCKET, SCM_CREDENTIALS, &u, &mut r.drapeaux);
             }
             if !r.fichiers.is_empty() {
                 c.ecrire_descripteurs(&r.fichiers, drapeaux & MSG_CMSG_CLOEXEC != 0, &mut r.drapeaux);
+            }
+            if passpidfd {
+                c.ecrire_pidfd(d, &mut r.drapeaux);
             }
         }
     }
@@ -2335,8 +2371,8 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
         SO_RCVTIMEO | SO_RCVTIMEO_NEW => op.rcvtimeo = delai(valeur, longueur)?,
         SO_SNDTIMEO | SO_SNDTIMEO_NEW => op.sndtimeo = delai(valeur, longueur)?,
         // Seulement pour AF_UNIX (`sk_may_scm_recv`).
-        SO_PASSCRED | SO_PASSRIGHTS | SO_PASSSEC if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
-        SO_PASSCRED | SO_PASSRIGHTS | SO_PASSSEC => {}
+        SO_PASSCRED | SO_PASSRIGHTS | SO_PASSPIDFD | SO_PASSSEC if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
+        SO_PASSCRED | SO_PASSRIGHTS | SO_PASSPIDFD | SO_PASSSEC => {}
         _ => return Err(-ENOPROTOOPT),
     }
     if option == SO_DONTROUTE {
@@ -2357,6 +2393,9 @@ fn options_socket(s: &Socket, option: i32, valeur: u64, longueur: i32) -> Result
     }
     if s.protocole == Protocole::Unix && option == SO_PASSRIGHTS {
         unix::changer_passrights(s, oui);
+    }
+    if s.protocole == Protocole::Unix && option == SO_PASSPIDFD {
+        unix::changer_passpidfd(s, oui);
     }
     if s.protocole == Protocole::Unix && option == SO_PASSSEC {
         unix::changer_passsec(s, oui);
@@ -3224,6 +3263,23 @@ pub fn getsockopt(fd: u64, niveau: u64, option: u64, valeur: u64, longueur: u64)
                 ecrire_longueur()?;
                 Ok(0)
             }
+            // Un pidfd du processus du pair (`SO_PEERPIDFD`), celui des droits de SO_PEERCRED
+            // (une socket d'Internet n'en a pas : ENODATA), même recueilli (PIDFD_STALE, AF_UNIX
+            // seule l'a). Toujours FD_CLOEXEC. Le pidfd fait d'abord (EMFILE, ENOMEM), puis son
+            // numéro écrit dans la place, coupé à elle, même vide (mesuré : la place 2, deux
+            // octets du numéro ; 0, rien : le descripteur est installé dans les deux cas), et
+            // la longueur, 4 au plus ; une faute défait le pidfd.
+            SOL_SOCKET if option == SO_PEERPIDFD => {
+                let place = (lire_longueur(&mut l)? as usize).min(4);
+                let droits = if s.protocole == Protocole::Unix { unix::droits_du_pair(s) } else { None };
+                let e = droits.and_then(|d| d.processus).ok_or(-ENODATA)?;
+                let p = crate::pidfd::preparer_pour(e)?;
+                let numero = (p.numero() as i32).to_le_bytes();
+                copier_vers_utilisateur(valeur, &numero[..place]).map_err(|_| -EFAULT)?;
+                copier_vers_utilisateur(longueur, &(place as i32).to_le_bytes()).map_err(|_| -EFAULT)?;
+                p.installer(true);
+                Ok(0)
+            }
             // Le programme du filtre, tel que posé (`sk_get_filter`), et sa
             // longueur EN INSTRUCTIONS à la place de la longueur : sans filtre, 0 ;
             // une place nulle, la longueur seule ; une place plus petite que le
@@ -3421,13 +3477,14 @@ fn lire_option_socket(s: &Socket, option: i32, place: usize) -> Result<([u8; 16]
         // Lue et effacée (`sock_error`).
         SO_ERROR if s.protocole == Protocole::Tcp => entier(&mut o, tcp::prendre_erreur(s)),
         SO_ERROR if s.protocole == Protocole::Unix => entier(&mut o, unix::prendre_erreur(s)),
-        SO_PASSCRED | SO_PASSRIGHTS if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
+        SO_PASSCRED | SO_PASSRIGHTS | SO_PASSPIDFD if s.protocole != Protocole::Unix => return Err(-EOPNOTSUPP),
         SO_PASSCRED => entier(&mut o, unix::passcred(s) as i32),
+        SO_PASSPIDFD => entier(&mut o, unix::passpidfd(s) as i32),
         SO_PASSRIGHTS => entier(&mut o, unix::passrights(s) as i32),
         // La `struct ucred` du pair : AF_UNIX seule en a un.
         SO_PEERCRED => {
             let d = if s.protocole == Protocole::Unix { unix::droits_du_pair(s) } else { None }.unwrap_or(unix::PAS_DE_PAIR);
-            o[..4].copy_from_slice(&d.pid.to_le_bytes());
+            o[..4].copy_from_slice(&d.pid().to_le_bytes());
             o[4..8].copy_from_slice(&d.uid.to_le_bytes());
             o[8..12].copy_from_slice(&d.gid.to_le_bytes());
             12

@@ -246,11 +246,16 @@
 [linux] verrous b : toutes les verifications : ok
 [noyau] Programmes en parallele : memoire rendue : ok.
 [linux] pidfd : rouvert apres 1,1 s : une date neuve : ok
+[linux] pidfd : SO_PEERPIDFD dans 2 octets : coupe, mais installe : ok
+[linux] pidfd : avec SCM_RIGHTS : SCM_CREDENTIALS, SCM_RIGHTS, SCM_PIDFD : ok
+[linux] pidfd : SCM_PIDFD sans numero libre : -EMFILE a sa place : ok
 [linux] pidfd : toutes les verifications : ok
 [noyau] pidfd : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] pidfd b : pidfd_getfd sans permission : EPERM (Yama) : ok
 [linux] pidfd b : pidfd_getfd permis par PR_SET_PTRACER : le temoin de a : ok
 ~ [linux] pidfd a : toutes les verifications : ok
+[linux] pidfd b : SCM_PIDFD de a recueilli : POLLHUP, son statut, ESRCH sans EXIT : ok
+[linux] pidfd b : SO_PEERPIDFD de a recueilli : POLLHUP, son statut, pidfd_send_signal ESRCH : ok
 [linux] pidfd b : toutes les verifications : ok
 [noyau] Programmes en parallele : memoire rendue : ok.
 [linux] surveillance : trois write : six evenements, sans fusion (seulement avec le dernier) : ok

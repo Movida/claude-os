@@ -235,15 +235,43 @@ fn chemin(n: &Nom) -> &[u8] {
     &o[..o.iter().position(|&c| c == 0).unwrap_or(o.len())]
 }
 
-/// Les droits du pair (SO_PEERCRED : la `struct ucred`).
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Les droits d'un pair ou d'un message (SO_PEERCRED et SCM_CREDENTIALS : la
+/// `struct ucred` ; SO_PEERPIDFD et SCM_PIDFD : un pidfd de son processus).
+///
+/// Le processus est tenu par son `Entree` (processus.rs), comme Linux tient la
+/// `struct pid` (`sk_peer_pid`, `UNIXCB(skb).pid`), et non par son seul
+/// numéro : un pidfd doit pouvoir le désigner jusqu'au bout, recueilli
+/// compris (`PIDFD_STALE` : poll dit POLLHUP, PIDFD_GET_INFO son statut ;
+/// mesuré, la sonde c11). Son numéro (`pid`) en est tiré : 0, aucun
+/// processus (un message sans droits). Option écartée : garder le numéro et
+/// chercher l'entrée au besoin ; recueilli, il n'y en a plus.
+///
+/// Son dernier `drop` peut tomber sous le `Verrou` d'une socket : il ne rend
+/// que de la mémoire : la table des processus tient l'entrée jusqu'au
+/// recueil, et une entrée recueillie ne tient plus aucune tâche.
+#[derive(Clone)]
 pub struct Droits {
-    pub pid: u32,
     pub uid: u32,
     pub gid: u32,
+    pub processus: Option<Arc<processus::Entree>>,
+}
+
+/// Deux messages ont les mêmes droits (`unix_skb_scm_eq`) : le même
+/// processus (Linux compare les `struct pid` ; nos numéros ne sont jamais
+/// réutilisés, comparer les numéros revient au même), le même utilisateur et
+/// le même groupe.
+impl PartialEq for Droits {
+    fn eq(&self, autre: &Droits) -> bool {
+        (self.pid(), self.uid, self.gid) == (autre.pid(), autre.uid, autre.gid)
+    }
 }
 
 impl Droits {
+    /// Le numéro de son processus (0 : aucun).
+    pub fn pid(&self) -> u32 {
+        self.processus.as_ref().map_or(0, |e| e.pid())
+    }
+
     /// Les groupes supplémentaires du pair (SO_PEERGROUPS : le `group_info`
     /// de ses droits) : ceux de son identité, c'est-à-dire aucun
     /// (`Identite::groupes`) ; ils ne sont donc pas gardés ici.
@@ -254,7 +282,7 @@ impl Droits {
 
 /// Ceux d'un message qui n'en porte pas, tels que les lit qui les demande (pas de pid, et
 /// `overflowuid` : `from_kuid_munged`, mesuré).
-const SANS_DROITS: Droits = Droits { pid: 0, uid: 65534, gid: 65534 };
+const SANS_DROITS: Droits = Droits { uid: 65534, gid: 65534, processus: None };
 
 /// Ce que porte un envoi, en plus de ses octets (la `scm_cookie`).
 #[derive(Default)]
@@ -264,9 +292,11 @@ pub struct Scm {
     pub droits: Option<Droits>,
 }
 
-/// Ceux du processus courant (`init_peercred`).
-fn droits_courants() -> Droits {
-    processus::avec(|p| Droits { pid: p.pid, uid: p.identite.uid, gid: p.identite.gid })
+/// Ceux du processus courant (`init_peercred`, `unix_maybe_add_creds` :
+/// `task_tgid(current)`).
+pub fn droits_courants() -> Droits {
+    let (uid, gid) = processus::avec(|p| (p.identite.uid, p.identite.gid));
+    Droits { uid, gid, processus: crate::tache::courante().processus().cloned() }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -319,7 +349,14 @@ struct Etat {
     erreur: i32,
     /// Fermée (`SOCK_DEAD`) : plus rien n'y entre.
     morte: bool,
+    /// Ce qu'elle veut recevoir avec chaque message (SO_PASSCRED et SO_PASSPIDFD,
+    /// `sk_scm_credentials` et `sk_scm_pidfd`) : SCM_CREDENTIALS, SCM_PIDFD. L'un ou
+    /// l'autre (`unix_may_passcred`) : ses envois portent ses droits, une socket sans nom
+    /// en reçoit un à son envoi ou à sa connexion (pour que le receveur sache à qui
+    /// répondre), et une lecture de flux ne colle pas deux messages de droits
+    /// différents.
     passcred: bool,
+    passpidfd: bool,
     /// Elle accepte qu'on lui envoie des descripteurs (SO_PASSRIGHTS, `sk_scm_rights`).
     passrights: bool,
     /// SO_PASSSEC (`sk_scm_security`) : gardé, relu, hérité comme ses frères. Il ajouterait
@@ -334,6 +371,13 @@ struct Etat {
     /// Les droits du pair (pour une écoute, les siens, posés à `listen`).
     droits: Option<Droits>,
     file: VecDeque<Message>,
+}
+
+impl Etat {
+    /// SO_PASSCRED ou SO_PASSPIDFD (`unix_may_passcred`).
+    fn passe_droits(&self) -> bool {
+        self.passcred || self.passpidfd
+    }
 }
 
 /// La partie AF_UNIX d'une socket.
@@ -360,7 +404,7 @@ impl Unix {
         Some(Unix {
             sorte,
             etat: Verrou::new(Etat {
-                phase: Phase::Neuve, nom: None, pair: None, arret: 0, erreur: 0, morte: false, passcred: false, passrights: true, passsec: false, ecoute: None, oob: 0, droits: None,
+                phase: Phase::Neuve, nom: None, pair: None, arret: 0, erreur: 0, morte: false, passcred: false, passpidfd: false, passrights: true, passsec: false, ecoute: None, oob: 0, droits: None,
                 file: VecDeque::new(),
             }),
             envoyes: AtomicUsize::new(0),
@@ -579,7 +623,7 @@ pub fn pair(s: &Socket) -> Result<Nom, i64> {
 /// mesuré). Pas `overflowuid` (65534) comme SANS_DROITS : celui-là vient d'un
 /// `from_kuid_munged`, qui traduit des droits qui existent mais qu'on ne
 /// peut pas nommer ; ici, il n'y en a pas du tout.
-pub const PAS_DE_PAIR: Droits = Droits { pid: 0, uid: u32::MAX, gid: u32::MAX };
+pub const PAS_DE_PAIR: Droits = Droits { uid: u32::MAX, gid: u32::MAX, processus: None };
 
 /// SO_PEERCRED et SO_PEERGROUPS : les droits du pair, posés par `connect`,
 /// `listen` (les siens), `accept` et `socketpair` (`init_peercred`,
@@ -587,7 +631,7 @@ pub const PAS_DE_PAIR: Droits = Droits { pid: 0, uid: u32::MAX, gid: u32::MAX };
 /// eux (`sk_peer_cred` nul : PAS_DE_PAIR pour SO_PEERCRED, ENODATA pour
 /// SO_PEERGROUPS).
 pub fn droits_du_pair(s: &Socket) -> Option<Droits> {
-    unix(s).etat.verrouiller().droits
+    unix(s).etat.verrouiller().droits.clone()
 }
 
 /// SO_MEMINFO : ce que la socket a envoyé et que son pair n'a pas encore lu,
@@ -614,6 +658,15 @@ pub fn passcred(s: &Socket) -> bool {
 
 pub fn changer_passcred(s: &Socket, oui: bool) {
     unix(s).etat.verrouiller().passcred = oui;
+}
+
+/// SO_PASSPIDFD.
+pub fn passpidfd(s: &Socket) -> bool {
+    unix(s).etat.verrouiller().passpidfd
+}
+
+pub fn changer_passpidfd(s: &Socket, oui: bool) {
+    unix(s).etat.verrouiller().passpidfd = oui;
 }
 
 /// SO_PASSSEC.
@@ -823,13 +876,13 @@ fn connecter_flux(s: &Arc<Socket>, n: &Nom, non_bloquant: bool) -> Result<(), i6
         };
         let ua = unix(&autre);
         // L'écoute, et sa file.
-        let (ecoute, pleine, nom_ecoute, droits_ecoute, passcred_ecoute, passrights_ecoute, passsec_ecoute) = {
+        let (ecoute, pleine, nom_ecoute, droits_ecoute, drapeaux_ecoute) = {
             let e = ua.etat.verrouiller();
             match e.phase {
                 Phase::Ecoute { backlog } if !e.morte && e.arret & ARRET_LECTURE == 0 => {
-                    (true, e.file.len() > backlog, e.nom, e.droits, e.passcred, e.passrights, e.passsec)
+                    (true, e.file.len() > backlog, e.nom, e.droits.clone(), (e.passcred, e.passpidfd, e.passrights, e.passsec))
                 }
-                _ => (false, false, None, None, false, true, false),
+                _ => (false, false, None, None, (false, false, true, false)),
             }
         };
         if !ecoute {
@@ -867,10 +920,8 @@ fn connecter_flux(s: &Arc<Socket>, n: &Nom, non_bloquant: bool) -> Result<(), i6
             e.nom = nom_ecoute.map(|n| Nom { inode: None, ..n });
             e.droits = Some(droits_courants());
             // Les drapeaux de réception de l'écoute (SO_PASSCRED,
-            // SO_PASSRIGHTS, SO_PASSSEC : `sk_scm_recv_flags`).
-            e.passcred = passcred_ecoute;
-            e.passrights = passrights_ecoute;
-            e.passsec = passsec_ecoute;
+            // SO_PASSPIDFD, SO_PASSRIGHTS, SO_PASSSEC : `sk_scm_recv_flags`).
+            (e.passcred, e.passpidfd, e.passrights, e.passsec) = drapeaux_ecoute;
             e.ecoute = Some(autre.numero);
         }
         // Le message qui apporte la fille à l'écoute.
@@ -910,7 +961,7 @@ fn connecter_datagrammes(s: &Arc<Socket>, o: &[u8]) -> Result<(), i64> {
         None
     } else {
         let n = lire_nom(o)?;
-        if u.etat.verrouiller().passcred {
+        if u.etat.verrouiller().passe_droits() {
             autonommer(s)?;
         }
         let a = chercher(&n, u.sorte)?;
@@ -975,7 +1026,7 @@ pub fn connecter(s: &Arc<Socket>, o: &[u8], non_bloquant: bool) -> Result<(), i6
         return connecter_datagrammes(s, o);
     }
     let n = lire_nom(o)?;
-    if u.etat.verrouiller().passcred {
+    if u.etat.verrouiller().passe_droits() {
         autonommer(s)?;
     }
     connecter_flux(s, &n, non_bloquant)
@@ -1037,7 +1088,7 @@ pub fn paire(s: &Arc<Socket>) -> Result<Arc<Socket>, i64> {
         let mut e = unix(a).etat.verrouiller();
         e.phase = Phase::Connectee;
         e.pair = Some(b.clone());
-        e.droits = Some(droits);
+        e.droits = Some(droits.clone());
     }
     Ok(autre)
 }
@@ -1114,7 +1165,7 @@ fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
     // Les droits, si l'une des deux sockets les demande (`unix_maybe_add_creds`) : lus avant de
     // prendre le verrou de la receveuse : ni deux sockets, ni le processus, sous lui.
     let (moi, passcred) = match &m.emetteur {
-        Some(e) if m.droits.is_none() => (Some(droits_courants()), unix(e).etat.verrouiller().passcred),
+        Some(e) if m.droits.is_none() => (Some(droits_courants()), unix(e).etat.verrouiller().passe_droits()),
         _ => (None, false),
     };
     // Comptée d'abord : le destinataire peut la lire, et la rendre, dès
@@ -1155,7 +1206,7 @@ fn deposer(autre: &Socket, mut m: Message) -> Result<(), (Message, i64)> {
             compter(&m, false);
             return Err((m, errno));
         }
-        if passcred || e.passcred || e.ecoute.is_some() {
+        if passcred || e.passe_droits() || e.ecoute.is_some() {
             m.droits = m.droits.or(moi);
         }
         if m.numero_oob != 0 {
@@ -1237,7 +1288,7 @@ fn envoyer_flux(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize, dr
         // Les descripteurs : avec le premier message seulement ; sans octet, il n'y en a pas, et ils
         // sont perdus (`unix_stream_sendmsg`).
         m.fichiers = core::mem::take(&mut fichiers);
-        m.droits = droits;
+        m.droits = droits.clone();
         if urgent {
             m.numero_oob = NUMEROS_DE_MESSAGE.fetch_add(1, Ordering::Relaxed);
         }
@@ -1277,7 +1328,7 @@ fn envoyer_message(s: &Arc<Socket>, destination: Option<&[u8]>, longueur: usize,
         // SEQPACKET : l'erreur en attente d'abord (`unix_seqpacket_sendmsg` :
         // `sock_error`), ECONNRESET d'un pair fermé sans tout lire.
         let erreur = if paquets { core::mem::take(&mut e.erreur) } else { 0 };
-        (e.pair.clone(), e.phase, e.passcred, erreur)
+        (e.pair.clone(), e.phase, e.passe_droits(), erreur)
     };
     if erreur != 0 {
         return Err(-(erreur as i64));
@@ -1575,7 +1626,7 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
     let mut fichiers = Vec::new();
     // Les droits de la lecture : aucun avant le premier message (à la fin du flux, mesuré : tout à
     // zéro), puis ceux du premier, s'ils sont demandés ; et on ne colle pas ceux d'un autre.
-    let mut droits = Droits { pid: 0, uid: 0, gid: 0 };
+    let mut droits = Droits { uid: 0, gid: 0, processus: None };
     let mut droits_vus = false;
     // MSG_PEEK : les messages déjà regardés, remis en tête à la fin ; et ce que SO_PEEK_OFF veut
     // qu'on passe, sans le copier (`skip`).
@@ -1595,7 +1646,7 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
         let (m, avait, passcred) = {
             let mut e = u.etat.verrouiller();
             let avait = !e.file.is_empty();
-            (prochain_du_flux(&mut e, regarder, en_ligne, fait > 0, &mut vus, &mut jetes), avait, e.passcred)
+            (prochain_du_flux(&mut e, regarder, en_ligne, fait > 0, &mut vus, &mut jetes), avait, e.passe_droits())
         };
         for j in jetes.into_iter().flatten() {
             liberer(j);
@@ -1631,12 +1682,12 @@ fn recevoir_flux(s: &Socket, longueur: usize, drapeaux: u64, rcvlowat: usize, a:
             continue;
         }
         if droits_vus {
-            if m.droits.unwrap_or(SANS_DROITS) != droits {
+            if m.droits.as_ref().unwrap_or(&SANS_DROITS) != &droits {
                 remettre(s, m);
                 break Ok(());
             }
         } else if passcred {
-            droits = m.droits.unwrap_or(SANS_DROITS);
+            droits = m.droits.clone().unwrap_or(SANS_DROITS);
             droits_vus = true;
         }
         if adresse.is_none() {
@@ -1796,7 +1847,7 @@ fn recevoir_message(s: &Socket, longueur: usize, drapeaux: u64, a: &mut Attente,
         let n = dispo.min(longueur);
         let adresse = m.emetteur.as_ref().and_then(|e| unix(e).etat.verrouiller().nom);
         let r = copier(0, &m.restant()[saut..][..n]);
-        let droits = m.droits.unwrap_or(SANS_DROITS);
+        let droits = m.droits.clone().unwrap_or(SANS_DROITS);
         let mut m = m;
         let fichiers = if r.is_err() {
             Vec::new()
