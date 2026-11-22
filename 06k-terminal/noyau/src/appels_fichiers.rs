@@ -4274,12 +4274,35 @@ fn ecrire_pages_noyau(n: Numero, position: u64, octets: &[u8]) -> Result<usize, 
 /// fichier, ou de l'aléa. Le verrou d'écriture de la sortie est tenu tout
 /// du long (celui d'un write), jamais celui de l'entrée : deux inodes
 /// peuvent tomber dans le même des 64 verrous (`verrou_d_ecriture`), et la
-/// tâche s'y attendrait elle-même.
+/// tâche s'y attendrait elle-même. Puis, sur tous les chemins après le tube
+/// interne, même 0 octet ou une erreur, l'entrée est marquée lue
+/// (`marquer_lu`) : le `done: file_accessed(in)` de Linux, que mesure
+/// linux/copies (un fichier, un dossier).
 fn transferer(entree: &FichierTenu, position: &mut u64, sortie: &FichierTenu, vers: u64, longueur: u64) -> Result<u64, i64> {
     let cases = crate::tube::cases_du_tube_interne()?;
-    if longueur == 0 {
-        return Ok(0);
+    let r = if longueur == 0 { Ok(0) } else { rondes(entree, position, sortie, vers, longueur, cases) };
+    marquer_lu(entree);
+    r
+}
+
+/// Le `file_accessed` de Linux, pour l'entrée d'un `transferer` : son heure
+/// d'accès poussée à maintenant, au réglage de son montage : un inode du
+/// tmpfs (un fichier, un dossier, un périphérique de /dev), `relatime`
+/// (`Tmpfs::acceder`). Rien pour l'inode anonyme, /proc et /sys : leurs
+/// dates sont fabriquées à chaque stat (fichiers::montages::ANONYME,
+/// procfs.rs, sysfs.rs), sans inode qui garde une heure d'accès (Linux
+/// pousse celle de l'inode anonyme, à chaque fois, et celle d'un inode de
+/// /proc, le temps qu'il reste en mémoire ; pas celle de /proc/sys, ni de
+/// /sys, mesuré) ; ni pour un pidfd, qui n'arrive pas ici (`se_positionne`).
+fn marquer_lu(entree: &FichierTenu) {
+    if let Objet::Tmpfs(n) = entree.objet {
+        vfs::avec(|fs, _| fs.acceder(n, temps::maintenant()));
     }
+}
+
+/// Les rondes d'un `transferer` de `longueur` octets (au moins un), par
+/// `cases` cases du tube interne.
+fn rondes(entree: &FichierTenu, position: &mut u64, sortie: &FichierTenu, vers: u64, longueur: u64, cases: usize) -> Result<u64, i64> {
     let ronde = (cases as u64 * PAGE).min(longueur) as usize;
     let Ok(mut tampon) = faillible::remplie(ronde, 0u8) else { return Err(-ENOMEM) };
     let _ecriture = (sortie.sorte == Sorte::Fichier).then(|| verrou_d_ecriture(sortie.numero()));

@@ -581,6 +581,60 @@ static void limite_de_taille(void)
     close(d);
 }
 
+/* L'heure d'accès de `fd` remise à 1 s, avant ses dates de modification :
+ * relatime la poussera au prochain accès. */
+static void vieillir(int fd)
+{
+    struct timespec dates[2] = { { 1, 0 }, { 0, UTIME_OMIT } };
+    FAIT(futimens(fd, dates));
+}
+
+/* Son heure d'accès a-t-elle bougé depuis `vieillir` ? */
+static int lu_depuis(int fd)
+{
+    struct stat s;
+    return fstat(fd, &s) == 0 && s.st_atim.tv_sec != 1;
+}
+
+/* L'heure d'accès de l'entrée (relatime, celui du tmpfs) : sendfile la
+ * pousse sur tous ses chemins une fois le tube interne obtenu
+ * (`file_accessed`, à la fin de `splice_direct_to_actor`) : 0 octet, la fin
+ * du fichier, un dossier (EINVAL : pas de `splice_read`) ; pas vers O_APPEND
+ * (EINVAL avant). copy_file_range de 0 octet, ou à la fin, rend 0 avant. */
+static void heures_d_acces(const char *lieu)
+{
+    char d[256];
+    snprintf(d, sizeof d, "%s/copies-d", lieu);
+    FAIT(mkdir(d, 0700));
+    int a = open(A, O_RDONLY), b = open(B, O_RDWR | O_TRUNC), c = open(C, O_WRONLY | O_CREAT | O_APPEND, 0600);
+    int dossier = open(d, O_RDONLY | O_DIRECTORY);
+    long taille = lseek(a, 0, SEEK_END);
+    vieillir(a);
+    long z = r(sendfile(b, a, &(off_t){0}, 0));
+    int lu_z = lu_depuis(a);
+    vieillir(a);
+    long f = r(sendfile(b, a, &(off_t){taille}, 8));
+    int lu_f = lu_depuis(a);
+    vieillir(dossier);
+    long dz = r(sendfile(b, dossier, NULL, 8));
+    int lu_d = lu_depuis(dossier);
+    verifier(z == 0 && lu_z && f == 0 && lu_f && dz == -EINVAL && lu_d,
+             "sendfile, 0 octet, a la fin, d'un dossier (EINVAL) : l'heure d'acces de l'entree poussee");
+    vieillir(a);
+    long ap = r(sendfile(c, a, &(off_t){0}, 8));
+    int lu_ap = lu_depuis(a);
+    vieillir(a);
+    long cz = cfr(a, &(loff_t){0}, b, &(loff_t){0}, 0, 0), cf = cfr(a, &(loff_t){taille}, b, &(loff_t){0}, 8, 0);
+    int lu_c = lu_depuis(a);
+    verifier(ap == -EINVAL && !lu_ap && cz == 0 && cf == 0 && !lu_c,
+             "sendfile vers O_APPEND (EINVAL), copy_file_range de 0 octet et a la fin : pas d'acces");
+    close(a);
+    close(b);
+    close(c);
+    close(dossier);
+    rmdir(d);
+}
+
 int main(int argc, char **argv)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
@@ -686,6 +740,7 @@ int main(int argc, char **argv)
     positions();
     cases();
     sockets();
+    heures_d_acces(lieu);
     limite_de_taille();
     unlink(A);
     unlink(B);
