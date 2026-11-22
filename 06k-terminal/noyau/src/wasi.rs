@@ -1602,7 +1602,7 @@ impl Wasi {
             })
         });
         // Les dates que tient le noyau (un /proc/<pid>/fd/<n> qui mène à
-        // un pidfd), hors du verrou des fichiers.
+        // un eventfd, à un pidfd), hors du verrou des fichiers.
         match stat.map(|(o, a, dev)| filestat(&appels_fichiers::dater(o, a), dev)) {
             Ok(stat) => match ecrire(m, sortie, &stat) {
                 Ok(()) => SUCCES,

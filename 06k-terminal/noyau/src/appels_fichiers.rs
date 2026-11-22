@@ -665,16 +665,24 @@ pub fn attributs(o: Objet) -> Attributs {
     dater(o, vfs::avec_systeme(|s, _| s.avec_vue(0, |vue| vue.attributs(o))))
 }
 
-/// Les dates d'un inode de pidfs, celles de sa création, que tient le noyau
-/// (pidfd.rs), mises dans ses attributs `a` : la bibliothèque des systèmes de
-/// fichiers n'en sait rien. Prend le verrou de pidfd.rs (`INODES`, le dernier
-/// de l'ordre) : sous le verrou des fichiers ou hors de lui.
+/// Les dates de l'inode anonyme et de ceux de pidfs, que tient le noyau,
+/// mises dans leurs attributs `a` : la bibliothèque des systèmes de fichiers
+/// n'en sait rien. Celles de leur création (la naissance des systèmes de
+/// fichiers, vfs.rs ; pidfd.rs), sauf l'heure d'accès de l'inode anonyme,
+/// que sendfile pousse (`Systeme::acces_anonyme`). Prend le verrou des
+/// fichiers (l'inode anonyme) ou celui de pidfd.rs (pidfs : `INODES`, le
+/// dernier de l'ordre, qui vient après lui) : à appeler hors du verrou des
+/// fichiers.
 pub fn dater(o: Objet, mut a: Attributs) -> Attributs {
-    let date = match o {
-        Objet::Pidfs(n) => crate::pidfd::date(n),
+    let (acces, date) = match o {
+        Objet::Anonyme => vfs::avec_systeme(|s, _| (s.acces_anonyme, s.naissance)),
+        Objet::Pidfs(n) => {
+            let date = crate::pidfd::date(n);
+            (date, date)
+        }
         _ => return a,
     };
-    (a.atime, a.mtime, a.ctime) = (date, date, date);
+    (a.atime, a.mtime, a.ctime) = (acces, date, date);
     a
 }
 
@@ -4277,7 +4285,7 @@ fn ecrire_pages_noyau(n: Numero, position: u64, octets: &[u8]) -> Result<usize, 
 /// tâche s'y attendrait elle-même. Puis, sur tous les chemins après le tube
 /// interne, même 0 octet ou une erreur, l'entrée est marquée lue
 /// (`marquer_lu`) : le `done: file_accessed(in)` de Linux, que mesure
-/// linux/copies (un fichier, un dossier).
+/// linux/copies (un fichier, un dossier) et linux/evenements (un eventfd).
 fn transferer(entree: &FichierTenu, position: &mut u64, sortie: &FichierTenu, vers: u64, longueur: u64) -> Result<u64, i64> {
     let cases = crate::tube::cases_du_tube_interne()?;
     let r = if longueur == 0 { Ok(0) } else { rondes(entree, position, sortie, vers, longueur, cases) };
@@ -4286,17 +4294,20 @@ fn transferer(entree: &FichierTenu, position: &mut u64, sortie: &FichierTenu, ve
 }
 
 /// Le `file_accessed` de Linux, pour l'entrée d'un `transferer` : son heure
-/// d'accès poussée à maintenant, au réglage de son montage : un inode du
+/// d'accès poussée à maintenant, au réglage de son montage. Un inode du
 /// tmpfs (un fichier, un dossier, un périphérique de /dev), `relatime`
-/// (`Tmpfs::acceder`). Rien pour l'inode anonyme, /proc et /sys : leurs
-/// dates sont fabriquées à chaque stat (fichiers::montages::ANONYME,
-/// procfs.rs, sysfs.rs), sans inode qui garde une heure d'accès (Linux
-/// pousse celle de l'inode anonyme, à chaque fois, et celle d'un inode de
-/// /proc, le temps qu'il reste en mémoire ; pas celle de /proc/sys, ni de
-/// /sys, mesuré) ; ni pour un pidfd, qui n'arrive pas ici (`se_positionne`).
+/// (`Tmpfs::acceder`) ; l'inode anonyme, à chaque fois
+/// (`Systeme::acces_anonyme`). Rien pour /proc et /sys : leurs dates sont
+/// fabriquées à chaque stat (procfs.rs, sysfs.rs), sans inode qui garde une
+/// heure d'accès (Linux pousse celle d'un inode de /proc, le temps qu'il
+/// reste en mémoire ; pas celle de /proc/sys, ni de /sys, mesuré) ; ni pour
+/// un pidfd, qui n'arrive pas ici (`se_positionne`).
 fn marquer_lu(entree: &FichierTenu) {
-    if let Objet::Tmpfs(n) = entree.objet {
-        vfs::avec(|fs, _| fs.acceder(n, temps::maintenant()));
+    let maintenant = temps::maintenant();
+    match entree.objet {
+        Objet::Tmpfs(n) => vfs::avec(|fs, _| fs.acceder(n, maintenant)),
+        Objet::Anonyme => vfs::avec_systeme(|s, _| s.acces_anonyme = maintenant),
+        Objet::Monte(..) | Objet::Pidfs(_) => {}
     }
 }
 

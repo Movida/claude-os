@@ -60,7 +60,9 @@ pub enum Objet {
 /// Ce que dit `stat` de l'inode anonyme (mesuré sous Linux 6.18) : ni
 /// fichier ni dossier (mode 0600, sans bits de type), à root, un seul
 /// lien, une taille nulle. Le même pour tous les fichiers qui le
-/// tiennent : un eventfd et un epoll ont le même numéro d'inode.
+/// tiennent : un eventfd et un epoll ont le même numéro d'inode. Ses
+/// dates, que le noyau tient (noyau/src/vfs.rs : celles de sa création, au
+/// démarrage, et l'heure d'accès que pousse sendfile) : 0 ici.
 pub const ANONYME: Attributs = Attributs {
     numero: 1,
     mode: 0o600,

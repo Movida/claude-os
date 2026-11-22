@@ -15,13 +15,17 @@
 #include <sys/eventfd.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/sendfile.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 static int echecs;
+/* L'heure du début du programme (CLOCK_REALTIME). */
+static struct timespec debut;
 
 static void verifier(int ok, const char *quoi)
 {
@@ -33,6 +37,17 @@ static void verifier(int ok, const char *quoi)
 static int erreur(long r)
 {
     return r < 0 ? errno : 0;
+}
+
+/* Deux heures égales ; la première avant la seconde. */
+static int meme(struct timespec a, struct timespec b)
+{
+    return a.tv_sec == b.tv_sec && a.tv_nsec == b.tv_nsec;
+}
+
+static int avant(struct timespec a, struct timespec b)
+{
+    return a.tv_sec < b.tv_sec || (a.tv_sec == b.tv_sec && a.tv_nsec < b.tv_nsec);
 }
 
 static void compteurs(void)
@@ -91,6 +106,33 @@ static void fichier_anonyme(void)
     verifier(erreur(ioctl(p, FIONREAD, &n)) == EINVAL, "FIONREAD d'un epoll : EINVAL (il repond lui-meme)");
     verifier(erreur(fsync(e)) == EINVAL && erreur(fdatasync(p)) == EINVAL && syncfs(e) == 0,
              "fsync, fdatasync : EINVAL (pas d'operation fsync) ; syncfs : 0");
+    /* ftruncate : l'inode anonyme n'est pas un fichier ordinaire (Linux 6.18 ;
+     * celui de pidfs l'est en interne, EOPNOTSUPP : linux/pidfd). */
+    verifier(erreur(ftruncate(e, 0)) == EINVAL && erreur(ftruncate(p, 0)) == EINVAL, "ftruncate : EINVAL");
+    /* Ses dates de modification : celles de sa création, au démarrage
+     * (`anon_inode_init`) : égales, avant ce programme (pas 1970), et fixes
+     * (un write ne les change pas). Pas comparées à l'heure du démarrage que
+     * donnent les horloges : celle de WSL se règle après lui, de quelques
+     * secondes. Son heure d'accès, une pour toute la machine : au moins
+     * celle-là ; chaque sendfile qui le lit la pousse (`file_accessed`, à la
+     * fin de `splice_direct_to_actor`), même pour 0 octet ou un refus
+     * (EINVAL : il n'a pas de `splice_read`), à chaque fois (son montage
+     * interne n'a pas relatime) ; pas un read. 20 ms entre deux : l'heure
+     * des inodes de Linux avance par tics de l'horloge. */
+    uint64_t un_ = 1, repris;
+    struct stat lu_, zero_, refus_;
+    int nul = open("/dev/null", O_WRONLY);
+    verifier(write(e, &un_, 8) == 8 && read(e, &repris, 8) == 8 && fstat(e, &lu_) == 0, "un write et un read, puis fstat");
+    usleep(20000);
+    verifier(sendfile(nul, e, NULL, 0) == 0 && fstat(e, &zero_) == 0, "sendfile d'un eventfd, 0 octet : 0");
+    usleep(20000);
+    verifier(erreur(sendfile(nul, e, NULL, 8)) == EINVAL && fstat(e, &refus_) == 0, "sendfile d'un eventfd : EINVAL");
+    verifier(meme(se.st_ctim, se.st_mtim) && se.st_mtim.tv_sec > 1000000000 && avant(se.st_mtim, debut)
+                 && !avant(se.st_atim, se.st_mtim) && meme(refus_.st_mtim, se.st_mtim) && meme(refus_.st_ctim, se.st_ctim),
+             "ses dates : celles du demarrage, avant le programme, fixes");
+    verifier(meme(lu_.st_atim, se.st_atim) && avant(lu_.st_atim, zero_.st_atim) && avant(zero_.st_atim, refus_.st_atim),
+             "son heure d'acces : poussee par chaque sendfile (0 octet, EINVAL), pas par read");
+    close(nul);
     /* Ses attributs ne changent pas : EOPNOTSUPP (anon_inode_setattr),
      * sauf les dates à maintenant, refusées avant par les droits. */
     struct timespec dates[2] = { { 1, 0 }, { 1, 0 } };
@@ -228,6 +270,7 @@ static int chemins(int etages, int n, int ordre)
 
 int main(void)
 {
+    clock_gettime(CLOCK_REALTIME, &debut);
     compteurs();
     fichier_anonyme();
     surveillance();

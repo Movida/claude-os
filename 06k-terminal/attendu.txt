@@ -179,6 +179,8 @@
 [noyau] systeme : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] processeurs : toutes les verifications : ok
 [noyau] processeurs : termine, code de sortie 0 ; memoire rendue : ok.
+[linux] evenements : ses dates : celles du demarrage, avant le programme, fixes : ok
+[linux] evenements : son heure d'acces : poussee par chaque sendfile (0 octet, EINVAL), pas par read : ok
 [linux] evenements : toutes les verifications : ok
 [noyau] evenements : termine, code de sortie 0 ; memoire rendue : ok.
 [linux] minuteurs : toutes les verifications : ok

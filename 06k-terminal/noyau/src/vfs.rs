@@ -144,6 +144,22 @@ pub struct Systeme {
     pub fs: Tmpfs,
     pub ouverts: Ouverts,
     pub montes: Vec<(Numero, NoyauFs)>,
+    /// La naissance des systèmes de fichiers, au démarrage : celle du tmpfs
+    /// de la racine, et les dates de l'inode anonyme (eventfd, epoll,
+    /// timerfd, signalfd, inotify : `Objet::Anonyme`), que Linux crée au
+    /// démarrage (`anon_inode_init`, un `fs_initcall` : mesuré 1,3 s après
+    /// lui sous le Linux de référence, la sonde c11c du lot 6). Ses dates de
+    /// modification ne changent plus : son `setattr` refuse tout, et rien
+    /// d'autre ne les touche.
+    pub naissance: Temps,
+    /// L'heure d'accès de l'inode anonyme : sa naissance, puis l'heure de
+    /// chaque sendfile qui le lit (`appels_fichiers::marquer_lu`, le
+    /// `file_accessed` de `splice_direct_to_actor`), même s'il rend EINVAL
+    /// ou 0 octet. À chaque fois : le montage interne de l'anon_inodefs n'a
+    /// pas `relatime` (mesuré sous Linux 6.18 : poussée à chaque appel,
+    /// alors qu'elle est déjà plus récente que ses dates de modification).
+    /// Une seule pour toute la machine, comme l'inode.
+    pub acces_anonyme: Temps,
 }
 
 /// La place de procfs dans la table des montages (sysfs est la suivante).
@@ -659,7 +675,14 @@ impl fmt::Display for Chemin<'_> {
 pub fn initialiser(archive: Option<&[u8]>) -> Result<Bilan, Erreur> {
     let total = pages::total() as u64;
     let limites = Limites { inodes: (total / 2).min(u32::MAX as u64) as u32, pages: total / 2 };
-    *RACINE.verrouiller() = Some(Systeme { fs: Tmpfs::new(limites, temps::maintenant())?, ouverts: Ouverts::default(), montes: Vec::new() });
+    let naissance = temps::maintenant();
+    *RACINE.verrouiller() = Some(Systeme {
+        fs: Tmpfs::new(limites, naissance)?,
+        ouverts: Ouverts::default(),
+        montes: Vec::new(),
+        naissance,
+        acces_anonyme: naissance,
+    });
     let mut bilan = Bilan::default();
     if let Some(octets) = archive {
         deballer(octets, &mut bilan)?;
