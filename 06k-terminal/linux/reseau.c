@@ -1663,18 +1663,33 @@ static void sol_ip(void)
     close(s);
 
     /* IP_LOCAL_PORT_RANGE : le port éphémère dans la plage de la socket ;
-     * une plage hors de celle du système est ignorée. */
-    int t[3];
+     * une plage hors de celle du système est ignorée. La plage : deux ports
+     * libres pour UDP, P pair et P + 1, à partir de 40000, vérifiés en s'y
+     * liant ; pas d'avance : une socket d'un autre programme (ou d'un cas
+     * précédent) sur l'un d'eux ferait échouer le cas. */
+    int t[3], plage = 40000;
+    for (int q = 40000; q < 60000; q += 2) {
+        int u0 = udp(0), u1 = udp(0);
+        struct sockaddr_in x0 = adresse(0, q), x1 = adresse(0, q + 1);
+        int libres = bind(u0, (struct sockaddr *)&x0, sizeof x0) == 0 && bind(u1, (struct sockaddr *)&x1, sizeof x1) == 0;
+        close(u0), close(u1);
+        if (libres) {
+            plage = q;
+            break;
+        }
+    }
     for (int i = 0; i < 3; i++) {
         t[i] = udp(0);
-        poser_ip(t[i], IP_LOCAL_PORT_RANGE, 40000 | 40001 << 16, 4);
+        poser_ip(t[i], IP_LOCAL_PORT_RANGE, plage | (plage + 1) << 16, 4);
     }
     a = adresse(0, 0);
     r = erreur(bind(t[0], (struct sockaddr *)&a, sizeof a)) + erreur(bind(t[1], (struct sockaddr *)&a, sizeof a));
     uint16_t p0 = port_local(t[0], NULL), p1 = port_local(t[1], NULL);
-    verifier(r == 0 && p0 + p1 == 80001 && erreur(bind(t[2], (struct sockaddr *)&a, sizeof a)) == EADDRINUSE
+    char quoi_plage[100];
+    snprintf(quoi_plage, sizeof quoi_plage, "IP_LOCAL_PORT_RANGE %d-%d : deux ports, puis EADDRINUSE ; IP_PROTOCOL, le port", plage, plage + 1);
+    verifier(r == 0 && p0 + p1 == 2 * plage + 1 && erreur(bind(t[2], (struct sockaddr *)&a, sizeof a)) == EADDRINUSE
                  && lire_ip(t[0], IP_PROTOCOL) == p0,
-             "IP_LOCAL_PORT_RANGE 40000-40001 : deux ports, puis EADDRINUSE ; IP_PROTOCOL, le port");
+             quoi_plage);
     for (int i = 0; i < 3; i++)
         close(t[i]);
     s = udp(0);

@@ -2881,6 +2881,26 @@ static int adresse_de(int s, uint32_t *ip)
  * segments d'un TTL plus petit ; IP_FREEBIND, IP_BIND_ADDRESS_NO_PORT, une adresse de
  * diffusion liée (`connect` prend la source de sa route) ; IP_LOCAL_PORT_RANGE et
  * IP_PROTOCOL. */
+/* Deux ports libres pour TCP, P pair et P + 1, à partir de 40000 : P. Une plage
+ * d'IP_LOCAL_PORT_RANGE se choisit ainsi, pas d'avance : un port de la plage que tient
+ * déjà une connexion (une connexion en TIME_WAIT d'un cas précédent, sur un port
+ * éphémère que `connect` a tiré au hasard, 60 s) est sauté par bind(0), et le cas
+ * échouait (vu une fois dans notre noyau : « bind(0) prend 40001, puis 40000 »). Libre
+ * se vérifie en s'y liant, sans SO_REUSEADDR : une socket liée, ni connectée ni à
+ * l'écoute, rend son port à sa fermeture. */
+static int paire_libre(void)
+{
+    for (int p = 40000; p < 60000; p += 2) {
+        int a = socket(AF_INET, SOCK_STREAM, 0), b = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in x = lo(p), y = lo(p + 1);
+        int libres = bind(a, (void *)&x, sizeof x) == 0 && bind(b, (void *)&y, sizeof y) == 0;
+        close(a), close(b);
+        if (libres)
+            return p;
+    }
+    return 40000;
+}
+
 static void sol_ip(void)
 {
     int s = socket(AF_INET, SOCK_STREAM, 0);
@@ -3026,27 +3046,30 @@ static void sol_ip(void)
     close(s);
     close(l);
 
-    /* IP_LOCAL_PORT_RANGE : bind(0) prend l'impair, puis le pair ; connect, chaque port. */
-    int t[3];
+    /* IP_LOCAL_PORT_RANGE : bind(0) prend l'impair, puis le pair ; connect, chaque port.
+     * Chaque fois sur deux ports libres (`paire_libre`). */
+    int t[3], q = paire_libre();
+    char quoi[120];
     for (int i = 0; i < 3; i++) {
         t[i] = socket(AF_INET, SOCK_STREAM, 0);
-        poser(t[i], IP_LOCAL_PORT_RANGE, 40000 | 40001 << 16);
+        poser(t[i], IP_LOCAL_PORT_RANGE, q | (q + 1) << 16);
     }
     b = lo(0);
-    ok = bind(t[0], (void *)&b, sizeof b) == 0 && port_de(t[0]) == 40001 && bind(t[1], (void *)&b, sizeof b) == 0 && port_de(t[1]) == 40000;
-    verifier(ok && bind(t[2], (void *)&b, sizeof b) < 0 && errno == EADDRINUSE && option(t[0], IPPROTO_IP, IP_PROTOCOL) == 40001,
-             "IP_LOCAL_PORT_RANGE 40000-40001 : bind(0) prend 40001, puis 40000, puis EADDRINUSE");
+    ok = bind(t[0], (void *)&b, sizeof b) == 0 && port_de(t[0]) == q + 1 && bind(t[1], (void *)&b, sizeof b) == 0 && port_de(t[1]) == q;
+    snprintf(quoi, sizeof quoi, "IP_LOCAL_PORT_RANGE %d-%d : bind(0) prend %d, puis %d, puis EADDRINUSE", q, q + 1, q + 1, q);
+    verifier(ok && bind(t[2], (void *)&b, sizeof b) < 0 && errno == EADDRINUSE && option(t[0], IPPROTO_IP, IP_PROTOCOL) == q + 1, quoi);
     for (int i = 0; i < 3; i++)
         close(t[i]);
     l = ecoute(&port, 4);
     x = lo(port);
+    q = paire_libre();
     for (int i = 0; i < 3; i++) {
         t[i] = socket(AF_INET, SOCK_STREAM, 0);
-        poser(t[i], IP_LOCAL_PORT_RANGE, 40002 | 40003 << 16);
+        poser(t[i], IP_LOCAL_PORT_RANGE, q | (q + 1) << 16);
     }
-    ok = connect(t[0], (void *)&x, sizeof x) == 0 && connect(t[1], (void *)&x, sizeof x) == 0 && port_de(t[0]) + port_de(t[1]) == 80005;
-    verifier(ok && connect(t[2], (void *)&x, sizeof x) < 0 && errno == EADDRNOTAVAIL,
-             "IP_LOCAL_PORT_RANGE 40002-40003 : connect prend les deux, puis EADDRNOTAVAIL");
+    ok = connect(t[0], (void *)&x, sizeof x) == 0 && connect(t[1], (void *)&x, sizeof x) == 0 && port_de(t[0]) + port_de(t[1]) == 2 * q + 1;
+    snprintf(quoi, sizeof quoi, "IP_LOCAL_PORT_RANGE %d-%d : connect prend les deux, puis EADDRNOTAVAIL", q, q + 1);
+    verifier(ok && connect(t[2], (void *)&x, sizeof x) < 0 && errno == EADDRNOTAVAIL, quoi);
     for (int i = 0; i < 3; i++)
         close(t[i]);
     close(l);
