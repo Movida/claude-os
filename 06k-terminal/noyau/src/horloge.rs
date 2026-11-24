@@ -68,6 +68,12 @@ static DENOMINATEUR: AtomicU64 = AtomicU64::new(FREQUENCE_PIT as u64);
 /// processeur secondaire.
 static DECOMPTE_APIC: AtomicU32 = AtomicU32::new(0);
 
+/// Le décompte du timer de l'APIC pour un tic (0 : pas de timer d'APIC) :
+/// pour une attente bornée sans le TSC (smp.rs).
+pub fn decompte_apic() -> u32 {
+    DECOMPTE_APIC.load(Ordering::Relaxed)
+}
+
 /// La durée de `tics` tics, en nanosecondes.
 pub fn nanosecondes(tics: u64) -> u64 {
     (tics as u128 * NUMERATEUR.load(Ordering::Relaxed) as u128 * 1_000_000_000

@@ -314,6 +314,13 @@ pub fn decomptes_etalonnage() -> u64 {
     (u32::MAX - lire(TIMER_COURANT)) as u64
 }
 
+/// Où en est le timer de ce processeur : il décompte vers 0, puis recharge
+/// (en mode périodique) le décompte d'un tic. Se lit interruptions coupées
+/// aussi : il avance que ses interruptions soient servies ou non.
+pub fn timer_courant() -> u32 {
+    lire(TIMER_COURANT)
+}
+
 /// Démarre le timer en mode périodique : une interruption (vecteur 0xEC)
 /// tous les `decompte` décomptes.
 pub fn demarrer_timer(decompte: u32) {

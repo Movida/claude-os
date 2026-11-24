@@ -741,15 +741,50 @@ pub fn arreter_les_autres() {
     attendre_bornee(|| restants() == 0, 10_000);
 }
 
-/// Attend que `fini` soit vrai, au plus `us` microsecondes : par le TSC
-/// s'il est fiable ; sinon un nombre de tours (cent par microseconde : une
-/// borne, pas une durée). Interruptions coupées ou non, sans l'horloge
-/// (la panique tourne interruptions coupées, les tics n'avancent plus).
+/// Attend que `fini` soit vrai, au plus `us` microsecondes, interruptions
+/// coupées ou non, sans l'horloge (la panique tourne interruptions coupées,
+/// les tics n'avancent plus) : par le TSC s'il est fiable ; sinon par le
+/// timer de l'APIC de ce processeur, qui décompte un tic et recharge, tic
+/// après tic, que ses interruptions soient servies ou non : ses décomptes
+/// s'additionnent, rechargements compris (l'`udelay` de Linux passe de même
+/// par le TSC, puis par une boucle étalonnée contre le tic). Sans l'un ni
+/// l'autre (pas de timer d'APIC : un seul processeur, rien à attendre),
+/// un nombre de tours.
+///
+/// Jusqu'aux soldes d'avant 6k, tout ce qui n'était pas le TSC passait par
+/// ces tours, cent par microseconde : une borne, pas une durée. Sous -cpu
+/// qemu64 (un TSC que le processeur ne dit pas constant), sans
+/// accélération, la seconde d'`arreter_les_autres` en durait des minutes ;
+/// le scénario du NMI de `make tests-qemu` manquait alors sa fin quand le
+/// NMI prenait le premier processeur pendant qu'il tenait le verrou d'un
+/// processus, sur lequel ses deux fils tournaient, interruptions coupées,
+/// sans entendre l'IPI d'arrêt (un passage sur cent : les registres des
+/// quatre processeurs, pris au moniteur de QEMU). Écartés : le PM timer de
+/// l'ACPI (trois lectures de port par mesure, quand le timer de l'APIC,
+/// là dès qu'un second processeur l'est, se lit d'un accès) ; des tours
+/// étalonnés au démarrage, que le coût de `fini` fausserait.
 fn attendre_bornee(fini: impl Fn() -> bool, us: u64) -> bool {
     if let Some(khz) = tsc::khz() {
         let debut = tsc::lire();
         while !fini() {
             if tsc::lire().wrapping_sub(debut) > khz * us / 1000 {
+                return false;
+            }
+            core::hint::spin_loop();
+        }
+        return true;
+    }
+    let decompte = horloge::decompte_apic() as u64;
+    if decompte != 0 {
+        // `decompte` par tic, HZ tics par seconde. Une ronde de `fini` dure
+        // bien moins qu'un tic : aucun rechargement ne passe inaperçu.
+        let limite = us.saturating_mul(decompte).saturating_mul(horloge::HZ as u64) / 1_000_000;
+        let (mut avant, mut ecoules) = (apic::timer_courant() as u64, 0u64);
+        while !fini() {
+            let maintenant = apic::timer_courant() as u64;
+            ecoules += if maintenant <= avant { avant - maintenant } else { avant + decompte - maintenant };
+            avant = maintenant;
+            if ecoules > limite {
                 return false;
             }
             core::hint::spin_loop();
