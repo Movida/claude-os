@@ -903,6 +903,21 @@ impl Drop for Protection {
 /// `fichier` : le programme ouvert (que tiendront ses zones), lâché ici ;
 /// `protection` : sa protection contre l'écriture, que garde le lanceur
 /// s'il est lancé (rendue sinon, avec elle).
+///
+/// Jamais inlinée (#[inline(never)], le `noinline_for_stack` de Linux,
+/// comme les tests d'init, main.rs) : `executer` mène à l'un ou l'autre des
+/// deux lanceurs, et celle-ci, inlinée, laissait son cadre (2,3 Kio) dans
+/// celui d'`executer`, sous `executer_wasm` aussi, qui n'en a que faire.
+/// C'est le chemin le plus profond d'init : les écoutes de `--tcplisten`,
+/// une socket TCP neuve, sa partie, puis le tas. Mesuré sous -cpu qemu64
+/// (les programmes de test de `make tests-qemu`), quand les options de
+/// SOL_SOCKET (les soldes d'avant 6k, le lot 6) ont fait grandir la socket
+/// et la partie de TCP : 12216 octets au plus sur les 16 Kio de la pile,
+/// 72 sous le seuil des trois quarts (« Piles du noyau »), qu'une
+/// préemption à cette profondeur franchissait (12408 : ECHEC) ; 11096
+/// sans ce cadre. Écarté : relever le seuil, qui ne dit plus rien du jour
+/// où un chemin de plus le franchit.
+#[inline(never)]
 fn executer_elf(l: &mut Lanceur, nom: NomCourt, n: Numero, lancement: &Lancement, fichier: crate::descripteurs::Fichier,
                 protection: Protection) -> Option<Tache> {
     let lacher_le_programme = || vfs::avec_systeme(|s, cadres| s.lacher(fichier, cadres));
