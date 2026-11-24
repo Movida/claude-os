@@ -170,6 +170,28 @@ fn prochaine() -> Option<Trame> {
 /// son tour par `lo` (une réponse) ne fait que déposer, et ce vidage la
 /// prend au tour suivant.
 pub fn vider_en_attente() {
+    // Rien à livrer : pas de passage sur la pile d'interruption.
+    if tache::courante().file_lo.verrouiller().as_ref().is_none_or(VecDeque::is_empty) {
+        return;
+    }
+    // Sur la pile d'interruption du processeur, comme le softirq de Linux
+    // (`do_softirq_own_stack`), jamais sur celle de la tâche qui a émis : la
+    // réception d'une trame, et ce que la socket qui la reçoit émet à son tour
+    // (un ACK, des données), s'y empilaient sur l'envoi lui-même. Mesuré au
+    // démarrage, dans la tâche de bonjour-tcp.wasm : un sock_send de WASI
+    // (10,3 Kio jusqu'à `lo`), la réception par la socket du client, puis son
+    // émission (3,2 Kio de plus) : 13480 octets sur 16 Kio, au-delà des trois
+    // quarts (« Piles du noyau »), une fois en huit démarrages. Ici, plus
+    // aucune pile de tâche ne passe 10 Kio, et la pile d'interruption en prend
+    // 9 Kio au plus. Sans préemption pendant le vidage (au plus `MAX` trames,
+    // la borne de la file) : Linux non plus ne préempte pas un softirq.
+    // Écarté : des piles de tâche plus grandes (24 Kio), qui cachent la cause
+    // et coûtent à chaque fil.
+    crate::interruptions::comme_un_softirq(&mut vider_ici);
+}
+
+/// Le vidage lui-même (`vider_en_attente`), sur la pile d'interruption.
+fn vider_ici() {
     let Some(lo) = interface() else { return };
     super::contexte::pendant(|| {
         // Prise sous le verrou, reçue sans lui.

@@ -677,6 +677,37 @@ fn sur_la_pile_d_interruption(sommet: u64, corps: &mut dyn FnMut()) {
     }
 }
 
+/// Exécute `corps` comme le softirq de Linux qu'exécute `local_bh_enable`
+/// (`do_softirq_own_stack`) : sur la pile d'interruption de ce processeur,
+/// interruptions permises, sans préemption ni sommeil (le compte des
+/// interruptions en cours est monté : une interruption qui arrive reste sur
+/// cette pile, la préemption attend le retour sur celle de la tâche, et un
+/// verrou qui dort refuse de s'y endormir, attente.rs). Sur la pile courante
+/// si elle l'est déjà (une interruption en cours) ou si ce processeur n'en a
+/// pas encore. Pour le vidage de la file de `lo` (reseau/boucle.rs).
+pub fn comme_un_softirq(corps: &mut dyn FnMut()) {
+    let interruptions = crate::cpu::couper_interruptions();
+    let zone = crate::processeur::courant();
+    let premiere = zone.dans_une_interruption.fetch_add(1, Ordering::Relaxed) == 0;
+    let sommet = zone.pile_irq.load(Ordering::Relaxed);
+    let mut sur_la_pile = || {
+        if interruptions {
+            crate::cpu::activer_interruptions();
+        }
+        corps();
+        crate::cpu::couper_interruptions();
+    };
+    if premiere && sommet != 0 {
+        sur_la_pile_d_interruption(sommet, &mut sur_la_pile);
+    } else {
+        sur_la_pile();
+    }
+    zone.dans_une_interruption.fetch_sub(1, Ordering::Relaxed);
+    if interruptions {
+        crate::cpu::activer_interruptions();
+    }
+}
+
 /// Donne au processeur `numero` sa pile d'interruption : une pile de tâche
 /// (16 Kio sous sa garde, vmalloc.rs), marquée pour mesurer ce qu'elle a
 /// servi (`profondeur_des_piles`), gardée pour toujours, et nommée par sa
