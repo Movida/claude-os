@@ -178,7 +178,8 @@ int main(int argc, char **argv)
        CAP_SYS_ADMIN, comme le devcontainer) ; sinon celui de la machine, où lo est
        déjà levée : les ICMP d'autres programmes y passent aussi, triés par le port
        cité. */
-    if (unshare(CLONE_NEWNET) == 0 && lever_lo() < 0) {
+    int isole = unshare(CLONE_NEWNET) == 0;
+    if (isole && lever_lo() < 0) {
         perror("lo");
         return 2;
     }
@@ -222,12 +223,31 @@ int main(int argc, char **argv)
         } else if (!strcmp(issue, "cipso")) {
             long s = compteur("Icmp", "OutParmProbs") - sortis, e = compteur("Icmp", "InParmProbs") - entres;
             long h = compteur("Ip", "InHdrErrors") - fautes;
+            /* Sans espace réseau à lui, ses compteurs sont ceux de tous : rejoué tant
+             * qu'ils ont bougé d'autre chose (voir « muet »). */
+            for (int essai = 1; !isole && essai < 20 && genre == -1 && !(s == 1 && e == 0 && h == 2); essai++) {
+                sortis = compteur("Icmp", "OutParmProbs"), entres = compteur("Icmp", "InParmProbs"), fautes = compteur("Ip", "InHdrErrors");
+                genre = essayer(brute, icmp, opt, n, 20000 + k++, dport, &pointeur, cite, &ncite);
+                s = compteur("Icmp", "OutParmProbs") - sortis, e = compteur("Icmp", "InParmProbs") - entres;
+                h = compteur("Ip", "InHdrErrors") - fautes;
+            }
             char quoi[160];
             snprintf(quoi, sizeof quoi, "l'erreur part et ne revient pas (vu : genre %#x ; %ld parti, %ld revenu, %ld en-tetes faux)",
                      genre, s, e, h);
             verifier(genre == -1 && s == 1 && e == 0 && h == 2, nom, quoi);
         } else if (!strcmp(issue, "muet")) {
             long u = compteur("Icmp", "OutDestUnreachs") - injoignables;
+            /* Sans espace réseau à lui (unshare refusé : un conteneur sans
+             * CAP_SYS_ADMIN), OutDestUnreachs est celui de tous : le trafic d'autres
+             * programmes s'y voit (5 de plus en 300 ms, une fois, pendant les scénarios
+             * QEMU d'une vérification à côté). Rien n'étant revenu, le cas se rejoue tant
+             * que le compte a bougé, 20 fois au plus, comme `linux/snmp` : un Linux qui
+             * répondrait au port fermé le ferait à chaque fois. */
+            for (int essai = 1; !isole && essai < 20 && genre == -1 && u != 0; essai++) {
+                injoignables = compteur("Icmp", "OutDestUnreachs");
+                genre = essayer(brute, icmp, opt, n, 20000 + k++, dport, &pointeur, cite, &ncite);
+                u = compteur("Icmp", "OutDestUnreachs") - injoignables;
+            }
             char quoi[120];
             snprintf(quoi, sizeof quoi, "livre, sans reponse du port ferme (vu : genre %#x ; %ld envoyee)", genre, u);
             verifier(genre == -1 && u == 0, nom, quoi);
