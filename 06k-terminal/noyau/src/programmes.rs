@@ -179,16 +179,14 @@ pub fn demarrer() {
                     l.changer_de_dossier(numero, chemin);
                     None
                 }
-                Ok(Some(formats::commande::Ligne::DebutDeGroupe)) => {
-                    match verifier_groupe(&texte, numero) {
-                        Ok(fin) => l.commencer_groupe(numero, fin),
-                        Err((fin, raison)) => {
-                            afficherln!("[noyau] {}, lignes {} a {} : groupe refuse : {}", Nom(DEMARRAGE), numero, fin, raison);
-                            sauter = fin;
-                        }
+                Ok(Some(formats::commande::Ligne::DebutDeGroupe)) => match verifier_groupe(&texte, numero) {
+                    Ok(fin) => Some(Action::DebutDeGroupe(numero, fin)),
+                    Err((fin, raison)) => {
+                        afficherln!("[noyau] {}, lignes {} a {} : groupe refuse : {}", Nom(DEMARRAGE), numero, fin, raison);
+                        sauter = fin;
+                        None
                     }
-                    None
-                }
+                },
                 Ok(Some(formats::commande::Ligne::FinDeGroupe)) if l.groupe.is_some() => Some(Action::FinDeGroupe),
                 Ok(Some(formats::commande::Ligne::FinDeGroupe)) => {
                     afficherln!("[noyau] {}, ligne {} : refusee : }} sans {{", Nom(DEMARRAGE), numero);
@@ -224,6 +222,7 @@ pub fn demarrer() {
                 }
             }
             Some(Action::Attendre) => l.attendre_tous(),
+            Some(Action::DebutDeGroupe(debut, fin)) => l.commencer_groupe(debut, fin),
             Some(Action::FinDeGroupe) => l.finir_groupe(),
         }
         // Et ce qu'a différé le recueil d'un programme.
@@ -268,6 +267,16 @@ enum Action {
     Fond(Tache),
     /// `wait`.
     Attendre,
+    /// `{` : le début d'un groupe, de sa ligne à celle de son `}`. Mesuré
+    /// ici, après le bloc de la ligne, comme sa fin : le tampon de la ligne
+    /// est alors rendu. Jusqu'aux soldes d'avant 6k, la mesure se prenait
+    /// dans le bloc, le tampon encore tenu : rendu pendant le groupe, il
+    /// revenait à sa fin en « +1 pages libres » quand il était seul sur sa
+    /// page du tas (selon ce que le tas avait fait avant : une fois en une
+    /// vingtaine de claude -p, sous la charge d'une vérification), et à
+    /// coup sûr pour un `{` assez long pour que son tampon prenne des pages
+    /// à lui : celui de /etc/demarrage-claude-p, long exprès, le vérifie.
+    DebutDeGroupe(usize, usize),
     /// `}` : la fin d'un groupe.
     FinDeGroupe,
 }
